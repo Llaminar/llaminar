@@ -2,6 +2,7 @@
  * @file MoEGroupedFixedFP16RouterReplay.inc
  * @brief Captured small-row native FP16 router against serial M1 and dirty tails.
  */
+#include "../../utils/ROCmQFNReplayDevice.h"
 #include <cstring>
 
 extern "C" bool hipMoE_gate_logits_single_token_fp16_weights(
@@ -11,12 +12,15 @@ namespace llaminar2::test
 {
 namespace
 {
-    /** @brief Check counted fixed-row native projection and original M1 bytes. */
-    void proveFixedFP16Router(int rows)
+    /**
+     * @brief Check the MI50 fixed-row projection and original M1 bytes.
+     * @param device The participant admitted by the native MI50 dispatch table.
+     * @param rows Captured physical row capacity.
+     */
+    void proveFixedFP16Router(DeviceId device, int rows)
     {
         constexpr int hidden = 2560, experts = 512;
         constexpr float dirty = -91.5f;
-        const DeviceId device = DeviceId::rocm(0);
         auto &worker = GPUDeviceContextPool::instance().getContext(device);
         worker.submitAndWait([&] {
             auto *backend = getBackendFor(device);
@@ -101,7 +105,9 @@ namespace
 TEST(MoERouterLogits, ROCmGroupedFixedFP16RouterCapturedByteReplay)
 {
     ASSERT_TRUE(qfnGroupedFP16RouterFixedRowsOptIn());
+    const int ordinal = findQFNMI50ReplayDevice();
+    ASSERT_GE(ordinal, 0) << "Fixed-row FP16 router replay requires 60-CU gfx906 wave64";
     for (int rows = 2; rows <= 8; ++rows)
-        proveFixedFP16Router(rows);
+        proveFixedFP16Router(DeviceId::rocm(ordinal), rows);
 }
 } // namespace llaminar2::test

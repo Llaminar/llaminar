@@ -8,6 +8,7 @@
  * diagnostics use the real M1 path and independent deferred ledgers.
  */
 #include "backends/rocm/ROCmHardwareMetadata.h"
+#include "../../utils/ROCmQFNReplayDevice.h"
 #include "execution/moe/MoERuntimeTable.h"
 #include "utils/DebugEnv.h"
 #include "tensors/FP16Utils.h"
@@ -36,16 +37,16 @@ namespace
 
     /**
      * @brief Record FP32 logits from all four original router arithmetic bridges.
+     * @param device The MI50 participant used by the retained replay.
      * @return Native FP32, FP16, BF16 and signed-Q8 results from one bounded QFN geometry.
      *
      * The fixture uses generated finite native operands. It runs the original
      * projection once per policy, outside Top-K capture. Compare selection
      * from the exact same resulting FP32 bytes without toggling producer policy.
      */
-    RouterPolicyLogits recordOriginalRouterPolicyLogits()
+    RouterPolicyLogits recordOriginalRouterPolicyLogits(DeviceId device)
     {
         constexpr int hidden = 2560;
-        const DeviceId device = DeviceId::rocm(0);
         auto &context = GPUDeviceContextPool::instance().getContext(device);
         RouterPolicyLogits observations;
         context.submitAndWait([&] {
@@ -136,17 +137,18 @@ namespace
 
     /**
      * @brief Capture the production counted selection and a separate diagnostic serial oracle.
+     * @param device The same MI50 participant that produced the recorded logits.
      * @param rows Immutable graph capacity, including out-of-scope M1 and M9 controls.
      * @param counted Supply device-owned capacity changes, or exercise an original uncounted graph.
      * @param recorded Exact FP32 results from the native router policies; generated inputs cover adversarial Top-K.
      */
-    void proveGroupedRegisterTopK(int rows, bool counted, const RouterPolicyLogits &recorded)
+    void proveGroupedRegisterTopK(
+        DeviceId device, int rows, bool counted, const RouterPolicyLogits &recorded)
     {
         constexpr int experts = replay_experts, top_k = 10;
         constexpr uint32_t dirty_bits = 0x7fc01234u;
         constexpr int dirty_route = -93;
         const float dirty_value = std::bit_cast<float>(dirty_bits);
-        const DeviceId device = DeviceId::rocm(0);
         auto &context = GPUDeviceContextPool::instance().getContext(device);
         context.submitAndWait([&] {
             auto *backend = getBackendFor(device);
@@ -341,9 +343,12 @@ namespace
 TEST(MoERouterLogits, ROCmGroupedRegisterTopKCapturedByteReplay)
 {
     ASSERT_TRUE(qfnGroupedTopKRegisterOptIn()) << "Focused replay requires the registered native selector";
-    const auto recorded = recordOriginalRouterPolicyLogits();
+    const int ordinal = findQFNMI50ReplayDevice();
+    ASSERT_GE(ordinal, 0) << "Register Top-K replay requires 60-CU gfx906 wave64";
+    const DeviceId device = DeviceId::rocm(ordinal);
+    const auto recorded = recordOriginalRouterPolicyLogits(device);
     for (int rows = 1; rows <= replay_rows; ++rows)
-        proveGroupedRegisterTopK(rows, true, recorded);
-    proveGroupedRegisterTopK(4, false, recorded);
+        proveGroupedRegisterTopK(device, rows, true, recorded);
+    proveGroupedRegisterTopK(device, 4, false, recorded);
 }
 } // namespace llaminar2::test

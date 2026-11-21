@@ -15,6 +15,10 @@
  * Grouped Q8 router logits retain serial decode's 128-lane K partition while
  * omitting lanes that provably own no input blocks; this changes scheduling,
  * not the prepared-weight format, quantizer, or floating-point reduction.
+ * A separate gfx1100 wave64 WMMA entry retains that same adjacent-pair-first
+ * tree while sharing exact integer dots across rows and experts. Its capture
+ * selection borrows immutable hardware identity; both entries preserve full
+ * original expert-input publication and compact participant-owned logits.
  *
  * FP16 router gates consume hidden values rounded once to half RNE at load;
  * products, accumulation, logits and routing probabilities remain FP32. The
@@ -42,6 +46,8 @@
 #include "kernels/common/NativeTileCompletion.cuh"
 #include "kernels/rocm/common/ROCmSignedDot4.h"
 #include "kernels/rocm/moe/ROCmMoEWaveReduction.h"
+#include "kernels/rocm/moe/ROCmRouterQ8Prefill.h"
+#include "backends/rocm/ROCmHardwareMetadata.h"
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_bfloat16.h>
@@ -73,6 +79,8 @@
 #include "kernels/common/DeviceRouterHadamardQ8.h"
 #include "kernels/common/RouterQ8Launch.h"
 #include "kernels/common/MoEGroupedFloatingPrefillKernels.h"
+#include "kernels/common/MoEGroupedOffsetSlots.h"
+#include "kernels/common/MoEGroupingPackedDirectory.h"
 #include "kernels/common/DeviceMoEFloatingWarp.h"
 #include "kernels/common/DeviceRowRange.h"
 #include "kernels/common/MoERouterOwnedRows.h"
@@ -17128,6 +17136,28 @@ bool hipMoE_publish_original_hidden_q8_rows(
     return hipGetLastError() == hipSuccess;
 }
 
+/** @brief Record a successfully enqueued projection, including capture recording.
+ * @param selection Exact resolved engine and original geometry used by this submission.
+ *
+ * Retained graph replays do not execute this host function. This counter proves
+ * submitted/recorded topology, not live arithmetic or the number of GPU replays.
+ */
+static void record_rocm_router_q8_projection_submission(
+    const llaminar2::rocm::RouterQ8PrefillSelection &selection)
+{
+    using namespace llaminar2;
+    const char *name = selection.usesWmma() ? "rocm_router_q8_wmma_projection_submissions" :
+        "rocm_router_q8_dot4_projection_submissions";
+    if (!PerfStatsCollector::isRecordFamilyEnabled("kernel",name)) return;
+    const auto &shape = selection.shape();
+    PerfStatsCollector::addCounter("kernel",name,1.0,"router","rocm:" + std::to_string(selection.device()),
+        {{"capacity",std::to_string(shape.capacity)}, {"width",std::to_string(shape.width)},
+         {"experts",std::to_string(shape.experts)},
+         {"basis",shape.basis == RouterQ8Basis::Original ? "original" : "signed_hadamard32"},
+         {"ownership",shape.ownership == rocm::RouterQ8RowOwnership::WholeRows ? "whole_rows" : "compact_owned"},
+         {"k_waves",std::to_string(selection.usesWmma() ? rocm::routerQ8WaveCount(selection.nativeTile()) : 0)}});
+}
+
 /**
  * @brief Grouped Q8 router logits for batch-invariant prefill rows.
  *
@@ -17160,19 +17190,26 @@ bool hipMoE_gate_logits_q8_weights_decode_equivalent_rows(
     const int *device_effective_seq_len, llaminar2::RouterQ8Basis basis)
 {
     if (!hidden || !hidden_q8 || !hidden_scales || !gate_weights_q8 || !gate_scales || !logits ||
-        !stream || seq_len <= 0 ||
-        !stream || (basis != llaminar2::RouterQ8Basis::Original &&
+        !stream || stream == hipStreamLegacy || stream == hipStreamPerThread || seq_len <= 0 ||
+        (basis != llaminar2::RouterQ8Basis::Original &&
             basis != llaminar2::RouterQ8Basis::SignedHadamard32) ||
-            d_model <= 0 || num_experts <= 0 || (d_model % 32) != 0)
+        d_model <= 0 || num_experts <= 0 || (d_model % 32) != 0)
     {
         fprintf(stderr, "HIP MoE Q8 batch-invariant grouped gate logits invalid args\n");
         return false;
     }
 
-    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    if (llaminar2::HipDeviceGuard::setDevice(device_idx) != hipSuccess) return false;
     hipStream_t hip_stream = static_cast<hipStream_t>(stream);
+    int stream_device = -1;
+    if (hipStreamGetDevice(hip_stream, &stream_device) != hipSuccess || stream_device != device_idx)
+        return false;
     (void)hipGetLastError();
 
+    const auto selection = llaminar2::rocm::selectRouterQ8Prefill(device_idx,
+        {seq_len,d_model,num_experts,basis,llaminar2::rocm::RouterQ8RowOwnership::WholeRows},
+        device_effective_seq_len ? llaminar2::DeviceRowRange::deviceCounted(seq_len,device_effective_seq_len) :
+            llaminar2::DeviceRowRange::fullyActive(seq_len));
     const int blocks_per_row = d_model / 32;
     // Pack independent scales only when there is prefill-sized work. This is
     // launch geometry, not a different quantizer or a changed router K tree.
@@ -17204,7 +17241,15 @@ bool hipMoE_gate_logits_q8_weights_decode_equivalent_rows(
     const dim3 grid(num_experts, (seq_len + rows_per_block - 1) / rows_per_block);
     // The choice uses immutable geometry, never a live-count readback. At
     // K=3072 the second serial wave owns 32 blocks and must remain present.
-    if (blocks_per_row <= 64)
+    if (selection.usesWmma())
+    {
+        if (!llaminar2::rocm::routerQ8Prefill({
+                .hidden_codes = hidden_q8, .hidden_scales = hidden_scales,
+                .gate_codes = gate_weights_q8, .gate_scales = gate_scales, .logits = logits,
+                .capacity = seq_len, .width = d_model, .experts = num_experts,
+                .device = device_idx, .live_rows = device_effective_seq_len, .basis = basis}, selection, stream)) return false;
+    }
+    else if (blocks_per_row <= 64)
         hipLaunchKernelGGL((rocm_moe_gate_logits_q8_grouped_verifier_kernel<64>),
             grid, dim3(64), 0, hip_stream,
             hidden_q8, hidden_scales, gate_weights_q8, gate_scales, logits,
@@ -17222,6 +17267,7 @@ bool hipMoE_gate_logits_q8_weights_decode_equivalent_rows(
                 hipGetErrorString(err));
         return false;
     }
+    record_rocm_router_q8_projection_submission(selection);
     // Reuse the bank after the final router reader, retaining original expert input.
     if (basis == llaminar2::RouterQ8Basis::SignedHadamard32)
     {
@@ -19954,13 +20000,22 @@ __device__ __forceinline__ void rocm_publish_runtime_prefill_plan_block(
  * the serial implementation while parallelizing reads, rank assignment,
  * writes, and sentinel padding.
  */
+template<bool PackedOffsetSlots, bool ColumnSlots=false>
 __global__ void rocm_moe_build_active_expert_list_kernel(
     const int *__restrict__ expert_counts,
     int *__restrict__ active_expert_ids,
     int num_experts,
-    int max_active_experts)
+    int max_active_experts,
+    const int *__restrict__ expert_offsets,
+    uint32_t *__restrict__ packed_directory,
+    int total_slots)
 {
     __shared__ ActiveExpertCompactionScratch scratch;
+    // The existing initialization barrier orders all sentinel stores before
+    // any expert publishes descriptors into its disjoint original interval.
+    if constexpr (PackedOffsetSlots)
+        for (int slot = threadIdx.x; slot < total_slots; slot += blockDim.x)
+            packed_directory[slot] = UINT32_MAX;
     rocm_initialize_active_expert_compaction(scratch);
 
     for (int chunk = 0; chunk < num_experts; chunk += blockDim.x)
@@ -19968,6 +20023,18 @@ __global__ void rocm_moe_build_active_expert_list_kernel(
         const int expert = chunk + static_cast<int>(threadIdx.x);
         const bool is_active =
             expert < num_experts && expert_counts[expert] > 0;
+        if constexpr (PackedOffsetSlots)
+        {
+            if (expert < num_experts)
+            {
+                using Interval = std::conditional_t<ColumnSlots,
+                    llaminar2::moe_grouped_directory::ColumnFloor8OffsetSlots,
+                    llaminar2::moe_grouped_directory::WideFloor8OffsetSlots>;
+                const auto interval = Interval::bind(expert_counts[expert], expert_offsets[expert], total_slots);
+                for (int tile = 0; tile < interval.tiles(); ++tile)
+                    packed_directory[interval.slot(tile)] = interval.descriptor(expert, num_experts, tile);
+            }
+        }
         rocm_compact_active_expert_chunk(
             is_active,
             expert,
@@ -22509,9 +22576,9 @@ bool hipMoE_build_active_expert_list(
     llaminar2::HipDeviceGuard::setDevice(device_idx);
     (void)hipGetLastError();
 
-    hipLaunchKernelGGL(rocm_moe_build_active_expert_list_kernel,
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(rocm_moe_build_active_expert_list_kernel<false>),
         dim3(1), dim3(kActiveExpertThreads), 0, static_cast<hipStream_t>(stream),
-        expert_counts, active_expert_ids, num_experts, max_active_experts);
+        expert_counts, active_expert_ids, num_experts, max_active_experts, nullptr, nullptr, 0);
 
     hipError_t err = hipGetLastError();
     if (err != hipSuccess)
@@ -22520,6 +22587,25 @@ bool hipMoE_build_active_expert_list(
         return false;
     }
     return true;
+}
+
+/** @brief Publish raw active IDs and duplicate-safe packed work in the same grouping launch.
+ * @param binding Validated original grouping banks and exact producer stream.
+ * @return Whether the complete combined producer was accepted. */
+bool hipMoE_build_active_expert_list_with_offset_slots(const llaminar2::MoEGroupingPackedDirectory &binding)
+{
+    if (!binding.device().is_rocm()) return false;
+    llaminar2::HipDeviceGuard::setDevice(binding.device().ordinal);
+    (void)hipGetLastError();
+    const auto launch = [&]<bool Column>() {
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(rocm_moe_build_active_expert_list_kernel<true,Column>),
+            dim3(1), dim3(kActiveExpertThreads), 0, static_cast<hipStream_t>(binding.stream()),
+            binding.counts(), const_cast<int *>(binding.activeIds()), binding.experts(),
+            std::min(binding.totalSlots(), binding.experts()), binding.offsets(), binding.words(), binding.totalSlots());
+    };
+    if(binding.layout()==llaminar2::MoEGroupingPackedLayout::ColumnFloor8)launch.template operator()<true>();
+    else launch.template operator()<false>();
+    return hipGetLastError() == hipSuccess;
 }
 
 bool hipMoE_scatter_tokens(
@@ -24203,8 +24289,8 @@ namespace llaminar2::rocm
     /** @brief Share installed router arithmetic while assigning each live row once. */
     bool routeOwnedRows(const MoERouterOwnedRowsLaunch &launch, void *stream)
     {
-        if (!stream || !launch.valid() || launch.experts > kDeviceMoEMaxExperts ||
-            launch.top_k > kDeviceMoEMaxTopK)
+        if (!stream || stream == hipStreamLegacy || stream == hipStreamPerThread ||
+            !launch.valid() || launch.experts > kDeviceMoEMaxExperts || launch.top_k > kDeviceMoEMaxTopK)
             return false;
         const auto native_stream = static_cast<hipStream_t>(stream);
         const int rows = launch.partition.capacityFor(launch.capacity);
@@ -24213,6 +24299,16 @@ namespace llaminar2::rocm
         {
         case MoERouterPreparedFormat::BlockQ8:
         {
+            const auto &hardware = requireROCmCurrentHardware(
+                [](int *ordinal) { return hipGetDevice(ordinal); },
+                [](int ordinal) -> const ROCmDeviceHardware & { return rocmHardwareMetadata().at(ordinal); });
+            int stream_device = -1;
+            if (hipStreamGetDevice(native_stream, &stream_device) != hipSuccess || stream_device != hardware.ordinal)
+                return false;
+            const auto selection = selectRouterQ8Prefill(hardware.ordinal,
+                {launch.capacity,launch.width,launch.experts,launch.q8_basis,RouterQ8RowOwnership::CompactOwned},
+                launch.live_rows ? DeviceRowRange::deviceCounted(launch.capacity,launch.live_rows) :
+                    DeviceRowRange::fullyActive(launch.capacity));
             // Expert consumers still borrow ALL local hidden-Q8 rows. Row
             // ownership removes only logits/top-k duplication, not that input.
             const int groups = launch.capacity > 16 ? 8 : 1;
@@ -24231,7 +24327,16 @@ namespace llaminar2::rocm
             }
             if (hipGetLastError() != hipSuccess) return false;
             if (rows == 0) break;
-            if (launch.width / 32 <= 64)
+            if (selection.usesWmma())
+            {
+                if (!routerQ8Prefill({
+                        .hidden_codes = launch.hidden_q8, .hidden_scales = launch.hidden_scales,
+                        .gate_codes = static_cast<const int8_t *>(launch.gate), .gate_scales = launch.gate_scales,
+                        .logits = launch.logits, .capacity = launch.capacity, .width = launch.width,
+                        .experts = launch.experts, .device = hardware.ordinal,
+                        .live_rows = launch.live_rows, .partition = launch.partition, .basis = launch.q8_basis}, selection, stream)) return false;
+            }
+            else if (launch.width / 32 <= 64)
                 hipLaunchKernelGGL((rocm_moe_gate_logits_q8_grouped_verifier_kernel<64, true>),
                     grid, dim3(64), 0, native_stream, launch.hidden_q8, launch.hidden_scales,
                     static_cast<const int8_t *>(launch.gate), launch.gate_scales, launch.logits,
@@ -24242,6 +24347,7 @@ namespace llaminar2::rocm
                     static_cast<const int8_t *>(launch.gate), launch.gate_scales, launch.logits,
                     launch.capacity, launch.width, launch.experts, launch.live_rows, launch.partition);
             if (hipGetLastError() != hipSuccess) return false;
+            record_rocm_router_q8_projection_submission(selection);
             if (launch.q8_basis == RouterQ8Basis::SignedHadamard32)
             {
                 // Publish ALL live original rows for experts, including non-owned rows.

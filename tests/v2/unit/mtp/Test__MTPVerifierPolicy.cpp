@@ -14,6 +14,7 @@
 #include "execution/mtp/MTPMainForwardPolicy.h"
 #include "execution/mtp/MTPGraphOwnerPlan.h"
 #include "kernels/common/DeviceRowRange.h"
+#include "kernels/common/CapturedVerifierExtent.h"
 #include "kernels/common/FixedHalfProjectionGroup.h"
 #include "kernels/common/FixedFloatingProjectionGroup.h"
 #include "kernels/common/DeviceRowWorkGrid.h"
@@ -783,3 +784,64 @@ TEST(Test__MTPVerifierPolicy, OffAndActiveInitialPoliciesRetainActualSourceRows)
 }
 
 } // namespace llaminar2
+
+/** @test Exact admission never reads counts and rejects slices, repeats and foreign owners. */
+TEST(Test__MTPVerifierPolicy, CapturedVerifierExtentAuthenticatesOriginalRows)
+{
+    using namespace llaminar2;
+    int32_t count = 5, other_count = 5;
+    const auto device = DeviceId::rocm(0);
+    const auto rows = DeviceRowRange::deviceCounted(5, &count);
+    const auto exact = CapturedVerifierExtent::exactHostedRequest(device, rows);
+    EXPECT_FALSE(CapturedVerifierExtent{}.isExact());
+    EXPECT_FALSE(CapturedVerifierExtent{}.matches(device, rows));
+    for (int live : {5, 0, 1, 4, 5, -1, 99})
+    {
+        count = live; // Only device arithmetic interprets these values.
+        EXPECT_TRUE(exact.matches(device, rows));
+        EXPECT_EQ(exact, CapturedVerifierExtent::exactHostedRequest(device, rows));
+    }
+    EXPECT_FALSE(exact.matches(DeviceId::rocm(1), rows));
+    EXPECT_FALSE(exact.matches(DeviceId::cuda(0), rows));
+    EXPECT_FALSE(exact.matches(device, DeviceRowRange::deviceCounted(5, &other_count)));
+    EXPECT_FALSE(exact.matches(device, DeviceRowRange::deviceCounted(6, &count)));
+    EXPECT_FALSE(exact.matches(device, rows.slice(0, 4)));
+    EXPECT_FALSE(exact.matches(device, rows.slice(1, 4)));
+    EXPECT_FALSE(exact.matches(device, rows.repeatEachRow(2)));
+    EXPECT_FALSE(exact.matches(device, DeviceRowRange::fullyActive(5)));
+    EXPECT_THROW((void)CapturedVerifierExtent::exactHostedRequest(DeviceId::cpu(), rows), std::invalid_argument);
+    EXPECT_THROW((void)CapturedVerifierExtent::exactHostedRequest(device, DeviceRowRange::fullyActive(5)), std::invalid_argument);
+    EXPECT_THROW((void)CapturedVerifierExtent::exactHostedRequest(device, DeviceRowRange::deviceCounted(1, &count)), std::invalid_argument);
+    EXPECT_THROW((void)CapturedVerifierExtent::exactHostedRequest(device, rows.slice(0, 4)), std::invalid_argument);
+    EXPECT_THROW((void)CapturedVerifierExtent::exactHostedRequest(device, rows.slice(1, 4)), std::invalid_argument);
+    EXPECT_THROW((void)CapturedVerifierExtent::exactHostedRequest(device, rows.repeatEachRow(2)), std::invalid_argument);
+}
+
+/** @test Nested/throwing captures and another worker cannot inherit exact admission accidentally. */
+TEST(Test__MTPVerifierPolicy, CapturedVerifierExtentScopeRestoresWorkerPolicy)
+{
+    using namespace llaminar2;
+    int32_t count = 5;
+    const auto exact = CapturedVerifierExtent::exactHostedRequest(DeviceId::rocm(0),
+        DeviceRowRange::deviceCounted(5, &count));
+    EXPECT_FALSE(ScopedCapturedVerifierExtent::current().isExact());
+    for (int replay = 0; replay < 3; ++replay)
+    {
+        ScopedCapturedVerifierExtent outer(exact);
+        EXPECT_EQ(ScopedCapturedVerifierExtent::current(), exact);
+        try {
+            ScopedCapturedVerifierExtent inner({});
+            EXPECT_FALSE(ScopedCapturedVerifierExtent::current().isExact());
+            throw std::runtime_error("capture abort");
+        } catch (const std::runtime_error &) {}
+        EXPECT_EQ(ScopedCapturedVerifierExtent::current(), exact);
+        std::thread worker([&] {
+            EXPECT_FALSE(ScopedCapturedVerifierExtent::current().isExact());
+            { ScopedCapturedVerifierExtent bound(exact); EXPECT_EQ(ScopedCapturedVerifierExtent::current(), exact); }
+            EXPECT_FALSE(ScopedCapturedVerifierExtent::current().isExact());
+        });
+        worker.join();
+        EXPECT_EQ(ScopedCapturedVerifierExtent::current(), exact);
+    }
+    EXPECT_FALSE(ScopedCapturedVerifierExtent::current().isExact());
+}

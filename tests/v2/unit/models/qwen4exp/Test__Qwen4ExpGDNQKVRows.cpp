@@ -41,6 +41,14 @@ public:
         return gdnQKVProjectionRows(tensor, binding, layer, input.seq_len,
             input.batch_size, input.device, input.sequence_lengths_device);
     }
+    /** @brief Resolve common verifier rows under the original production invocation.
+     * @param input Complete original invocation. @return CPU's existing fully active null policy. */
+    std::optional<DeviceRowRange> siblingRows(const ForwardInput &input)
+    {
+        ForwardInputConstructionScope invocation(*this,input);
+        PrefillCollectiveRowsScope prefill(*this,input);
+        return projectionVerifierRows(input.device,input.seq_len,input.batch_size,input.sequence_lengths_device);
+    }
 };
 /** @brief One real original full native matrix, prepared once per test before row resolution. */
 struct Source final
@@ -80,6 +88,7 @@ TEST(Qwen4ExpGDNQKVRows, PreparedOriginalSourceRetainsCanonicalCompactQuery)
         std::vector<int> lengths{count};
         auto input = query(count); input.sequence_lengths = counted ? &lengths : nullptr;
         const auto rows = graph.rows(input, &source.tensor, &source.prepared.binding);
+        EXPECT_FALSE(graph.siblingRows(input));
         ASSERT_TRUE(rows);
         EXPECT_EQ(rows->physicalRows(), count);
         EXPECT_EQ(rows->countOwner(), counted ? lengths.data() : nullptr);

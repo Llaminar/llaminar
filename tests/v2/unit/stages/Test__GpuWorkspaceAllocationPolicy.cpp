@@ -962,9 +962,9 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
     using namespace llaminar2::MoEWorkspaceBuffers;
     constexpr int kModel = 2048;
     constexpr int kIntermediate = 512;
-    constexpr int kExperts = 256;
     constexpr int kTopK = 8;
 
+    for (const int kExperts : {8, 32, 256})
     for (const int rows : {1, 2, 15, 16, 17, 512, 4096, 16384})
     {
         const std::size_t slots =
@@ -977,7 +977,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
                 active + (slots + tile_rows - 1) / tile_rows);
         };
         const std::size_t expected_words =
-            2u + span_capacity(12u) + span_capacity(16u);
+            std::max(2u + span_capacity(12u) + span_capacity(16u), span_capacity(4u));
 
         EXPECT_EQ(
             rocmAdaptivePrefillDirectoryWords(slots, kExperts),

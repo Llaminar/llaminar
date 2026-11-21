@@ -11,9 +11,12 @@
  * - Bias is correctly applied when set
  * - Bias is not applied when nullptr
  * - Basic execution without bias
+ * - Original verifier bundle lifetime through success, rejection, exceptions and the following down stage
  */
 
 #include <gtest/gtest.h>
+#include <functional>
+#include "kernels/common/VerifierProjectionBundle.h"
 #include <algorithm>
 #include <cmath>
 #include <vector>
@@ -133,6 +136,7 @@ namespace llaminar2
                 const IMPIContext *,
                 DeviceWorkspaceManager *workspace) override
             {
+                EXPECT_EQ(ScopedVerifierProjectionBundle::current(),nullptr);
                 ++fused_call_count;
                 observed_fused_m.push_back(m);
                 observed_fused_k.push_back(k);
@@ -140,6 +144,32 @@ namespace llaminar2
                 last_fused_workspace = workspace;
                 return true;
             }
+
+            /** @brief Forward the exact public verifier boundary to the test observer.
+             * @param input Original activation. @param projections Original ordered role storage.
+             * @param m Physical rows. @param k Reduction. @param workspace Borrowed stage arena.
+             * @return The observer's success/failure decision; exceptions exercise scope unwinding. */
+            bool multiply_fused_verifier_rows_decode_equivalent(const TensorBase *input,
+                const std::vector<TensorProjectionDesc> &projections,int m,int k,
+                const IMPIContext *,DeviceWorkspaceManager *workspace) override
+            {
+                return verifier_observer && verifier_observer(input,projections,m,k,workspace);
+            }
+
+            /** @brief Observe actual down dispatch after the GU binding has retired.
+             * @param gate Published GU gate. @param up Published GU up. @param output Branch output.
+             * @param m Physical rows. @param n Down columns. @param k Reduction width.
+             * @param alpha Product scale. @param beta Accumulator scale. @param workspace Shared stage arena.
+             * @return The observer's decision without executing synthetic arithmetic. */
+            bool multiply_tensor_with_fused_swiglu_verifier_rows_decode_equivalent(
+                const TensorBase *gate,const TensorBase *up,TensorBase *output,int m,int n,int k,
+                float alpha,float beta,DeviceWorkspaceManager *workspace) override
+            {
+                return down_observer && down_observer(gate,up,output,m,n,k,alpha,beta,workspace);
+            }
+
+            std::function<bool(const TensorBase *,const std::vector<TensorProjectionDesc> &,int,int,DeviceWorkspaceManager *)> verifier_observer;
+            std::function<bool(const TensorBase *,const TensorBase *,TensorBase *,int,int,int,float,float,DeviceWorkspaceManager *)> down_observer;
 
             WorkspaceRequirements getWorkspaceRequirements(int m, int n = 0, int k = 0) const override
             {
@@ -644,6 +674,69 @@ namespace llaminar2
         EXPECT_EQ(gate->observed_fused_k, std::vector<int>({k_}));
         EXPECT_EQ(gate->observed_fused_projection_count, std::vector<int>({2}));
         EXPECT_EQ(up->getWorkspace(), &workspace);
+    }
+
+    /** @test The actual GU stage scopes original roles and restores the following down API. */
+    TEST_F(Test__FusedGateUpGEMMStage, VerifierBundleLifetimeBeforeDownReplay)
+    {
+        const ModelContextId model_id{9917};
+        auto down_weight=create_mock_weights(k_,n_up_,301);
+        auto output=std::make_unique<FP32Tensor>(std::vector<size_t>{size_t(m_),size_t(k_)},DeviceId::cpu());
+        PreparedWeightStore store(model_id);
+        auto gate=std::make_shared<RecordingWorkspaceGemm>("gate");
+        auto up=std::make_shared<RecordingWorkspaceGemm>("up");
+        auto down=std::make_shared<RecordingWorkspaceGemm>("down");
+        const auto gate_ref=registerRecordingGemm(store,gate,"blk.0.ffn_gate.weight",model_id,w_gate_.get());
+        const auto up_ref=registerRecordingGemm(store,up,"blk.0.ffn_up.weight",model_id,w_up_.get());
+        const auto down_ref=registerRecordingGemm(store,down,"blk.0.ffn_down.weight",model_id,down_weight.get());
+        int32_t live=m_;const auto rows=DeviceRowRange::deviceCounted(m_,&live);
+        FusedGateUpGEMMStage::Params g;g.input=input_.get();g.m=m_;g.k=k_;
+        g.w_gate=w_gate_.get();g.output_gate=output_gate_.get();g.n_gate=n_gate_;g.prepared_ref_gate=gate_ref;
+        g.w_up=w_up_.get();g.output_up=output_up_.get();g.n_up=n_up_;g.prepared_ref_up=up_ref;
+        g.prepared_store=&store;g.force_decode_equivalent_verifier_prefill=true;g.verifier_row_range=rows;
+        GEMMStage::Params d;d.A=output_up_.get();d.gate_input=output_gate_.get();d.B=down_weight.get();d.C=output.get();
+        d.m=m_;d.n=k_;d.k=n_up_;d.do_swiglu=true;d.prepared_ref=down_ref;d.prepared_store=&store;
+        d.force_decode_equivalent_verifier_prefill=true;d.verifier_row_range=rows;
+        DeviceWorkspaceManager workspace(DeviceId::cpu(),1024);
+        FusedGateUpGEMMStage gu(g);GEMMStage finish(d);gu.bindWorkspace(&workspace);finish.bindWorkspace(&workspace);
+        enum class Result {Success,Failure,Exception};Result result=Result::Success;
+        int gu_calls=0,down_calls=0;
+        gate->verifier_observer=[&](const TensorBase *input,const std::vector<ITensorGemm::TensorProjectionDesc> &members,
+            int m,int k,DeviceWorkspaceManager *arena) {
+            ++gu_calls;const auto *binding=ScopedVerifierProjectionBundle::current();
+            EXPECT_NE(binding,nullptr);EXPECT_TRUE(ITensorGemm::VerifierKernelModeScope::active());
+            if(!binding)return false;
+            EXPECT_EQ(binding->kind(),VerifierProjectionBundleKind::GateUp);
+            EXPECT_TRUE(binding->matches(DeviceId::cpu(),input,rows,k,members));
+            EXPECT_EQ(binding->projections().data(),members.data());EXPECT_EQ(members.size(),2u);
+            EXPECT_EQ(input,input_.get());EXPECT_EQ(m,m_);EXPECT_EQ(k,k_);EXPECT_EQ(arena,&workspace);
+            EXPECT_EQ(members[0].kernel,gate.get());EXPECT_EQ(members[0].output,output_gate_.get());EXPECT_EQ(members[0].n,n_gate_);
+            EXPECT_EQ(members[1].kernel,up.get());EXPECT_EQ(members[1].output,output_up_.get());EXPECT_EQ(members[1].n,n_up_);
+            if(result==Result::Exception)throw std::runtime_error("interrupted GU verifier");
+            return result==Result::Success;
+        };
+        down->down_observer=[&](const TensorBase *gate_input,const TensorBase *up_input,TensorBase *out,
+            int m,int n,int k,float alpha,float beta,DeviceWorkspaceManager *arena) {
+            ++down_calls;EXPECT_EQ(ScopedVerifierProjectionBundle::current(),nullptr);
+            EXPECT_TRUE(ITensorGemm::VerifierKernelModeScope::active());
+            EXPECT_EQ(gate_input,output_gate_.get());EXPECT_EQ(up_input,output_up_.get());EXPECT_EQ(out,output.get());
+            EXPECT_EQ(m,m_);EXPECT_EQ(n,k_);EXPECT_EQ(k,n_up_);EXPECT_EQ(alpha,1.f);EXPECT_EQ(beta,0.f);EXPECT_EQ(arena,&workspace);
+            return true;
+        };
+        for(int count:{m_,1,0,m_}) {
+            live=count;ASSERT_TRUE(gu.execute(ctx_.get()));
+            EXPECT_EQ(ScopedVerifierProjectionBundle::current(),nullptr);EXPECT_FALSE(ITensorGemm::VerifierKernelModeScope::active());
+            ASSERT_TRUE(finish.execute(ctx_.get()));EXPECT_EQ(ScopedVerifierProjectionBundle::current(),nullptr);
+            gu.resetSessionStatePreservingCapturedReplay();finish.resetSessionStatePreservingCapturedReplay();
+        }
+        EXPECT_EQ(gu_calls,4);EXPECT_EQ(down_calls,4);
+        result=Result::Failure;EXPECT_FALSE(gu.execute(ctx_.get()));EXPECT_EQ(ScopedVerifierProjectionBundle::current(),nullptr);
+        result=Result::Exception;EXPECT_THROW(gu.execute(ctx_.get()),std::runtime_error);
+        EXPECT_EQ(ScopedVerifierProjectionBundle::current(),nullptr);EXPECT_FALSE(ITensorGemm::VerifierKernelModeScope::active());
+        // Ordinary stage execution uses the existing fused API without a verifier binding.
+        g.force_decode_equivalent_verifier_prefill=false;g.verifier_row_range=std::nullopt;
+        FusedGateUpGEMMStage ordinary(g);ordinary.bindWorkspace(&workspace);ASSERT_TRUE(ordinary.execute(ctx_.get()));
+        EXPECT_EQ(gate->fused_call_count,1);EXPECT_EQ(ScopedVerifierProjectionBundle::current(),nullptr);
     }
 
     TEST_F(Test__FusedGateUpGEMMStage, ExecuteWithBiasPassesBoundWorkspaceToFusedKernel)

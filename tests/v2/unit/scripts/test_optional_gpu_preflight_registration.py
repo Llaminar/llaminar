@@ -20,6 +20,12 @@ import unittest
 
 
 SOURCE = Path(__file__).resolve().parents[4]
+sys.path.insert(0, str(SOURCE / 'scripts/ci'))
+
+from run_production_parity_campaigns import (
+    PreflightExecutionLane, PreflightRegistration, preflight_hardware_qualification,
+    preflight_optional_hardware_requirements,
+)
 
 
 def registration_source() -> str:
@@ -45,7 +51,8 @@ def registration_source() -> str:
 class OptionalGPUPreflightRegistration(unittest.TestCase):
     """Exercise the same ownership rules in both production build modes."""
 
-    def configure(self, build_type: str) -> list[dict]:
+    def configure(self, build_type: str, extra_targets: tuple[str, ...] = (),
+                  extra_registrations: str = '') -> list[dict]:
         """Generate actual CTest metadata without native tools or runtime work."""
         with tempfile.TemporaryDirectory(prefix='llaminar-optional-preflight-') as directory:
             root = Path(directory)
@@ -60,7 +67,7 @@ set(DEFAULT_LOG_LEVEL ERROR)
 set(Python3_EXECUTABLE "{sys.executable}")
 '''
             for target in ('v2_integration_rccl_unused_communicator_retirement',
-                           'v2_integration_pipeline_domain_generation'):
+                           'v2_integration_pipeline_domain_generation', *extra_targets):
                 prefix += f'add_executable({target} IMPORTED GLOBAL)\n'
                 prefix += f'set_target_properties({target} PROPERTIES IMPORTED_LOCATION "${{CMAKE_COMMAND}}")\n'
             # Release deliberately has no unit fixture targets. A direct
@@ -71,7 +78,7 @@ set(Python3_EXECUTABLE "{sys.executable}")
                                'v2_test_chat_completion_handler'):
                     prefix += f'add_executable({target} IMPORTED GLOBAL)\n'
                     prefix += f'set_target_properties({target} PROPERTIES IMPORTED_LOCATION "${{CMAKE_COMMAND}}")\n'
-            (root / 'CMakeLists.txt').write_text(prefix + registration_source())
+            (root / 'CMakeLists.txt').write_text(prefix + registration_source() + '\n' + extra_registrations)
             ninja = shutil.which('ninja')
             self.assertIsNotNone(ninja)
             configured = subprocess.run(['cmake', '-S', str(root), '-B', str(root / 'build'),
@@ -81,6 +88,88 @@ set(Python3_EXECUTABLE "{sys.executable}")
             result = subprocess.run(['ctest', '--test-dir', str(root / 'build'), '--show-only=json-v1'],
                                     text=True, capture_output=True, check=True, timeout=10)
             return json.loads(result.stdout)['tests']
+
+    def test_dense_prefill_inventory_follows_compiled_backends(self):
+        """Require all native prefill owners exactly when their backend compiles."""
+        source = (SOURCE / 'tests/v2/CMakeLists.txt').read_text()
+        start = source.index('set(V2_PRODUCTION_TEST_PREFLIGHT_TESTS\n')
+        end = source.index('\n)', start) + len('\n)')
+        inventory = source[start:end]
+        for backend in ('CUDA', 'ROCM'):
+            start = source.index(f'if(HAVE_{backend})\n    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS', end)
+            end = source.index('\nendif()', start) + len('\nendif()')
+            inventory += '\n' + source[start:end]
+
+        cuda_tests = {'V2_Integration_CUDADensePrefillDirtyReplay'}
+        rocm_tests = {
+            'V2_Integration_ROCmDensePrefillDirtyReplay',
+            'V2_Integration_ROCmNativePrefillProducerStats',
+            'V2_Integration_ROCmNativeQuantisedWmmaReplay',
+            'V2_Integration_ROCmNativeQuantisedPackedGeometry',
+            'V2_Integration_ROCmNativeQuantisedWmmaArithmeticReplay',
+        }
+        with tempfile.TemporaryDirectory(prefix='llaminar-prefill-inventory-') as directory:
+            root = Path(directory)
+            script = root / 'inventory.cmake'
+            inventory_file = root / 'inventory.txt'
+            script.write_text(inventory + '\n'
+                'file(WRITE "${OUTPUT}" "${V2_PRODUCTION_TEST_PREFLIGHT_TESTS}")\n')
+            for cuda, rocm in (('OFF', 'OFF'), ('ON', 'OFF'), ('OFF', 'ON'), ('ON', 'ON')):
+                with self.subTest(cuda=cuda, rocm=rocm):
+                    subprocess.run(['cmake', f'-DHAVE_CUDA={cuda}', f'-DHAVE_ROCM={rocm}',
+                                    f'-DOUTPUT={inventory_file}', '-P', str(script)],
+                                   check=True, capture_output=True, text=True, timeout=10)
+                    tests = set(inventory_file.read_text().split(';'))
+                    self.assertEqual(tests & cuda_tests, cuda_tests if cuda == 'ON' else set())
+                    self.assertEqual(tests & rocm_tests, rocm_tests if rocm == 'ON' else set())
+
+    def test_wmma_verifier_replays_require_gfx1100_at_original_ordinal_zero(self):
+        """Prove the real CTest filters and pre-launch qualification for mixed ROCm ISAs."""
+        source = (SOURCE / 'tests/v2/CMakeLists.txt').read_text()
+        wmma_names = (
+            'V2_Integration_GroupedVerifierRows_ROCm_WmmaReplay',
+            'V2_Integration_GroupedVerifierRows_ROCm_WmmaEpilogueReplay',
+            'V2_Integration_ROCmVerifierAttentionWmmaReplay',
+        )
+        broad_attention = 'V2_Integration_GroupedVerifierRows_ROCm_Attention'
+        definitions = []
+        for name in (*wmma_names, broad_attention):
+            start = source.index(f'    add_v2_test({name}\n')
+            end = source.index(')', start) + 1
+            definitions.append(source[start:end])
+        targets = ('v2_integration_rocm_device_counted_verifier_rows',
+                   'v2_integration_rocm_verifier_epilogue_replay',
+                   'v2_integration_rocm_flash_attention_parity')
+        tests = {test['name']: test for test in self.configure('Integration', targets, '\n'.join(definitions))}
+        registrations = []
+        for index, name in enumerate(wmma_names, start=1):
+            properties = {prop['name']: prop['value'] for prop in tests[name]['properties']}
+            labels = frozenset(properties['LABELS'])
+            self.assertIn('ProductionTestPreflight', labels)
+            self.assertNotIn('SKIP_REGULAR_EXPRESSION', properties)
+            registrations.append(PreflightRegistration(name, labels, 1, PreflightExecutionLane.ROCM_SOCKET, index))
+        requirements = preflight_optional_hardware_requirements(registrations)
+        self.assertEqual(requirements, dict.fromkeys(wmma_names, {
+            'backend': 'rocm', 'degree': 1, 'locality': 'original-numa-local-rank',
+            'ordinal': 0, 'native_isa': 'gfx1100',
+        }))
+        for isas, selected in ((('gfx906',), ()), (('gfx906', 'gfx1100'), ()),
+                               (('gfx1100:sramecc-', 'gfx906'), wmma_names)):
+            with self.subTest(isas=isas):
+                devices = [{'backend': 'cpu', 'ordinal': 0, 'numa_node': 0}]
+                devices.extend({'backend': 'rocm', 'ordinal': ordinal, 'numa_node': 0,
+                                'native_isa': isa} for ordinal, isa in enumerate(isas))
+                observed = {'qfn_source_hardware_schema': 2, 'scope': 'local-host-all-ranks', 'devices': devices}
+                result = preflight_hardware_qualification(wmma_names, requirements, observed)
+                self.assertEqual(result['selected'], list(selected))
+
+        wmma_case = 'Test__ROCmFlashAttentionParity.CapturedAppendThenAttention_WmmaLaneExact_FP16HD256'
+        native_filter = next(arg.removeprefix('--gtest_filter=') for arg in tests[wmma_names[2]]['command']
+                             if arg.startswith('--gtest_filter='))
+        broad_filter = next(arg.removeprefix('--gtest_filter=') for arg in tests[broad_attention]['command']
+                            if arg.startswith('--gtest_filter='))
+        self.assertIn(wmma_case, native_filter.split(':'))
+        self.assertEqual(broad_filter, f'Test__ROCmFlashAttentionParity.CapturedAppendThenAttention_*-{wmma_case}')
 
     def test_physical_cardinality_interface_rejects_ambiguous_declarations(self):
         """Execute the real CMake builder with local, mixed and malformed contracts."""

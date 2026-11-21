@@ -107,7 +107,7 @@ namespace llaminar2::test
         /** @brief The build-owned dependency-light loadable fixture. */
         constexpr std::string_view loadableFixture{
             LLAMINAR_NATIVE_LOADER_LOADABLE_FIXTURE};
-        /** @brief The NEEDED entry only the removed link stub provided. */
+        /** @brief The needed SONAME has no runtime file under that name. */
         constexpr std::string_view absentDependencyName{
             "libllaminar-absent-dependency.so.9"};
         /** @brief The import nothing in this tree or a system provides. */

@@ -20,7 +20,9 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import contextlib
 import csv
+import fcntl
 import hashlib
 import io
 import json
@@ -153,6 +155,22 @@ ROCM_COUNTER_GROUPS = (
     ("VALUInsts", "FlatVMemInsts"),
 )
 
+def _rocm_counter_groups(architecture_class: str) -> tuple[tuple[str, ...], ...]:
+    """Select SDK-declared counters without substituting unrelated utilization metrics.
+
+    Opaque historical architecture labels retain their historical collector
+    contract. New native target spellings must have an explicit reviewed policy.
+    Singleton RDNA passes avoid unproved cross-block scheduling assumptions.
+    """
+    if architecture_class == "gfx1100":
+        return tuple((counter,) for counter in (
+            "GPUBusy", "MemUnitBusy", "L2CacheHit", "FETCH_SIZE", "Wavefronts",
+            "LDSBankConflict", "VALUInsts"))
+    if architecture_class.startswith("gfx") and architecture_class != "gfx906":
+        raise ValueError(f"ROCm profiling has no reviewed counter policy for {architecture_class}")
+    return ROCM_COUNTER_GROUPS
+
+
 # Request only the reviewed feature schema. Section-based Nsight collection
 # exports hundreds of unrelated metrics and needs roughly 17 replay passes on
 # Ampere. These raw names cover the same required occupancy, resource, speed-
@@ -191,6 +209,7 @@ class CollectorOptions:
     cpu_avx512_binary: Path | None = None
     tool_command_prefix: tuple[str, ...] = ()
     device_ordinal: int | None = None
+    rocm_power_command_prefix: tuple[str, ...] = ()
 
 
 def _parse_cpu_set(cpu_list: str) -> set[int]:
@@ -337,9 +356,18 @@ def _tool_command(
     options: CollectorOptions,
     *arguments: str,
 ) -> list[str]:
-    """Build one authenticated profiler command with optional privilege."""
+    """Build one authenticated profiler command with optional privilege.
 
-    return [*options.tool_command_prefix, str(options.tool), *arguments]
+    PAM may inject /etc/environment after sudo accepts the prepared process
+    environment. Remove an injected ROCm ISA override after that boundary so
+    privileged profiling still observes the physical architecture.
+    """
+
+    native_environment_guard = (
+        ["env", "-u", "HSA_OVERRIDE_GFX_VERSION"]
+        if options.backend == Backend.ROCM and options.tool_command_prefix else []
+    )
+    return [*options.tool_command_prefix, *native_environment_guard, str(options.tool), *arguments]
 
 
 def _cpu_owner_command(options: CollectorOptions, binary: Path, request: ProfilerRequest) -> list[str]:
@@ -410,8 +438,8 @@ def _rocm_profile_variant(request: ProfilerRequest) -> str:
 def _profile_environment(request: ProfilerRequest, raw_dir: Path) -> dict[str, str]:
     """Build exact one-cell trainer filters from one authenticated request."""
 
-    if request.operation_kind == "ROCmNativeQ8DensePrefill":
-        from .native_q8_prefill_profiler import environment
+    if request.operation_kind == "ROCmNativeQuantisedDensePrefill":
+        from .native_prefill_profiler import environment
         return environment(request, raw_dir)
     environment = os.environ.copy()
     # Isolated one-candidate profiles are not timing tournaments.
@@ -1110,6 +1138,7 @@ def _complete_metric_inventory(
     values: Mapping[str, tuple[float, str]],
     *,
     unavailable_reason: str,
+    architecture_class: str | None = None,
 ) -> tuple[ProfilerMetric, ...]:
     """Fill every canonical metric explicitly and reject no field by omission."""
 
@@ -1120,7 +1149,7 @@ def _complete_metric_inventory(
             values.get(definition.metric_id, (None, definition.metric_id))[1],
             unavailable_reason,
         )
-        for definition in metric_definitions(backend)
+        for definition in metric_definitions(backend, architecture_class)
     )
 
 
@@ -1711,7 +1740,8 @@ def parse_rocprof_csvs(
         metrics = _complete_metric_inventory(
             Backend.ROCM,
             values,
-            unavailable_reason="rocprofiler did not expose this optional metric",
+            unavailable_reason="selected native SDK/architecture does not expose this optional metric",
+            architecture_class=request.architecture_class,
         )
         dispatch = ProfiledDispatch(
             dispatch_index=dispatch_index,
@@ -1722,7 +1752,7 @@ def parse_rocprof_csvs(
             block=block,
             metrics=metrics,
         )
-        dispatch.validate(Backend.ROCM)
+        dispatch.validate(Backend.ROCM, request.architecture_class)
         dispatches.append(dispatch)
     if not dispatches:
         raise ValueError("rocprofiler reported no kernels in the selected region")
@@ -1917,8 +1947,9 @@ def parse_rocprof_batch_csvs(
                 Backend.ROCM,
                 item.values,
                 unavailable_reason=(
-                    "rocprofiler did not expose this optional metric"
+                    "selected native SDK/architecture does not expose this optional metric"
                 ),
+                architecture_class=request.architecture_class,
             )
             dispatch = ProfiledDispatch(
                 dispatch_index=dispatch_index,
@@ -1931,7 +1962,7 @@ def parse_rocprof_batch_csvs(
                 block=item.block,
                 metrics=metrics,
             )
-            dispatch.validate(Backend.ROCM)
+            dispatch.validate(Backend.ROCM, request.architecture_class)
             dispatches.append(dispatch)
         if not dispatches:
             raise ValueError(
@@ -2621,7 +2652,124 @@ def collect_cuda_batch(
     }
 
 
+class ROCmProfilerPowerRestorationError(RuntimeError):
+    """Fatal ownership failure: stop collection when the original power policy is unproved."""
+
+
+@contextlib.contextmanager
+def _rocm_native_power_scope(
+    request: ProfilerRequest, options: CollectorOptions, raw_dir: Path,
+):
+    """Own gfx1100 perfmon-clock admission and restore its exact prior policy.
+
+    Only authenticated native PCI identity can select the physical card. AUTO
+    and already-STABLE_STD are reversible here; manual/custom clock policies
+    require their own complete restoration contract and are rejected untouched.
+    Privilege comes from the separate power-control prefix. The process-local
+    context never changes canonical timing or inference configuration.
+    """
+    if request.architecture_class != "gfx1100":
+        yield
+        return
+    participant = request.config_json.get("native_participant", {})
+    pci = participant.get("gpu_pci", "") if isinstance(participant, dict) else ""
+    if not re.fullmatch(r"[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]", pci):
+        raise ValueError("gfx1100 counter collection requires authenticated native PCI identity")
+    amd_smi = options.tool.resolve().parent / "amd-smi"
+    if not amd_smi.is_file():
+        raise RuntimeError("gfx1100 profiling requires amd-smi from the selected profiler SDK")
+    lock_path = Path(tempfile.gettempdir()) / ("llaminar-rocm-profiler-power-" + pci.replace(":", "_") + ".lock")
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        environment = dict(os.environ)
+
+        def query(label: str) -> str:
+            """Read through the owning SDK API, retaining the raw state response."""
+            command = [str(amd_smi), "metric", "--gpu", pci, "--perf-level", "--json"]
+            result = _run_command(command, environment, raw_dir / f"power-{label}.log", 30)
+            if result.returncode != 0:
+                raise RuntimeError("cannot query native profiler power policy")
+            rows = json.loads(result.stdout).get("gpu_data", [])
+            if len(rows) != 1 or not isinstance(rows[0].get("perf_level"), str):
+                raise ValueError("AMD SMI power-state query must name exactly one participant")
+            return rows[0]["perf_level"]
+
+        def select(mode: str, label: str) -> None:
+            """Change one admitted mode using the explicitly configured privilege."""
+            command = [*options.rocm_power_command_prefix, str(amd_smi), "set", "--gpu", pci, "--perf-level", mode]
+            result = _run_command(command, environment, raw_dir / f"power-{label}.log", 30)
+            if result.returncode != 0:
+                raise RuntimeError("cannot set gfx1100 profiling power state; configure --sudo-rocm-power-control or equivalent privilege")
+
+        before = query("before")
+        stable = "AMDSMI_DEV_PERF_LEVEL_STABLE_STD"
+        if before not in {"AMDSMI_DEV_PERF_LEVEL_AUTO", stable}:
+            raise ValueError(f"gfx1100 profiler cannot restore pre-existing policy {before}; state left unchanged")
+        changed = before != stable
+        during = None
+        try:
+            if changed:
+                select("STABLE_STD", "select")
+            during = query("during")
+            if during != stable:
+                raise RuntimeError("gfx1100 profiler failed to enter STABLE_STD")
+            yield
+        finally:
+            restoration_errors = []
+            if changed:
+                try:
+                    select("AUTO", "restore")
+                except Exception as error:
+                    restoration_errors.append(str(error))
+            after = None
+            try:
+                after = query("after")
+            except Exception as error:
+                restoration_errors.append(str(error))
+            if after != before:
+                restoration_errors.append(f"expected {before}, observed {after}")
+            try:
+                (raw_dir / "native-power-state.json").write_text(json.dumps({
+                    "schema": "rocm-native-profiler-power-state-v1", "gpu_pci": pci,
+                    "before": before, "during": during, "after": after,
+                    "restoration_errors": restoration_errors,
+                    "amd_smi": str(amd_smi), "amd_smi_sha256": _sha256_file(amd_smi),
+                }, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+            except Exception as error:
+                if restoration_errors:
+                    raise ROCmProfilerPowerRestorationError(
+                        f"unrestored gfx1100 policy {before} on {pci}, observed {after}; cannot retain receipt: {error}") from error
+                raise
+            if restoration_errors:
+                raise ROCmProfilerPowerRestorationError(
+                    f"gfx1100 profiler could not prove restoration for {pci}: " + "; ".join(restoration_errors))
+
+
 def _collect_rocm(
+    request: ProfilerRequest, options: CollectorOptions, raw_dir: Path,
+) -> ProfilerEvidence:
+    """Collect under an admitted counter power policy and seal restoration evidence."""
+    request.validate()
+    native = request.operation_kind == "ROCmNativeQuantisedDensePrefill"
+    if request.architecture_class == "gfx1100":
+        from .native_prefill_profiler import validate_request
+        validate_request(request)
+    if native:
+        from .native_prefill_profiler import validate_binary
+        closure = validate_binary(request, options.binary)
+        (raw_dir / "native-executable-closure.json").write_text(json.dumps({
+            "timing_build_id": request.build_id, "profiler_closure": closure},
+            sort_keys=True, indent=2) + "\n", encoding="utf-8")
+    with _rocm_native_power_scope(request, options, raw_dir):
+        evidence = _collect_rocm_admitted(request, options, raw_dir)
+        if native:
+            validate_binary(request, options.binary)
+    # The restoration receipt must be included, so seal only after scope exit.
+    return replace(evidence, raw_artifact_digest=_sha256_files(raw_dir))
+
+
+def _collect_rocm_admitted(
     request: ProfilerRequest,
     options: CollectorOptions,
     raw_dir: Path,
@@ -2725,7 +2873,7 @@ def _collect_rocm(
             return True
         return False
 
-    for pass_index, counters in enumerate(ROCM_COUNTER_GROUPS):
+    for pass_index, counters in enumerate(_rocm_counter_groups(request.architecture_class)):
         if run_counter_pass(counters, f"counters-{pass_index}"):
             continue
         # rocprofiler requires a counter set that fits one hardware pass. An
@@ -2811,6 +2959,12 @@ def _collect_rocm_batch(
         )
     if any(request.backend != Backend.ROCM for request in batch.requests):
         raise ValueError("ROCm profiler batch contains another backend")
+    if any(request.architecture_class == "gfx1100" for request in batch.requests):
+        raise ValueError("gfx1100 native profiling requires an isolated request with authenticated power-state ownership; process batching is not admitted")
+    if any(request.operation_kind == "ROCmNativeQuantisedDensePrefill" for request in batch.requests):
+        raise ValueError("native prefill profiling requires isolated executable/core identity checks; process batching is not admitted")
+    if len({request.architecture_class for request in batch.requests}) != 1:
+        raise ValueError("one ROCm profiler batch requires one architecture counter policy")
     selected_binaries = {
         _binary_for_request(request, options) for request in batch.requests
     }
@@ -2954,7 +3108,7 @@ def _collect_rocm_batch(
         successful_counter_directories.append(pass_dir)
         return True
 
-    for pass_index, counters in enumerate(ROCM_COUNTER_GROUPS):
+    for pass_index, counters in enumerate(_rocm_counter_groups(batch.requests[0].architecture_class)):
         if run_counter_pass(counters, f"counters-{pass_index}"):
             continue
         for counter_index, counter in enumerate(counters):
@@ -3028,6 +3182,10 @@ def collect_rocm_batch(
 
     try:
         return _collect_rocm_batch(batch, options)
+    except ROCmProfilerPowerRestorationError:
+        # Continuing could adopt a leaked profiling mode as the next request's
+        # original state. This failure must escape the per-request journal.
+        raise
     except subprocess.TimeoutExpired as error:
         status = ProfilerEvidenceStatus.LAUNCH_FAILED
         reason = f"profiler transaction timed out after {error.timeout} seconds"
@@ -3106,6 +3264,9 @@ def collect_request(
             raise ValueError(f"unsupported profiler backend {request.backend}")
         result.validate(request)
         return result
+    except ROCmProfilerPowerRestorationError:
+        # No later request may adopt a leaked profiling mode as its prior state.
+        raise
     except subprocess.TimeoutExpired as error:
         return _failed_evidence(
             request,
@@ -3403,6 +3564,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="launch the actual isolated counter owner (CPU trainer or GPU profiler) through sudo -n -E",
     )
+    parser.add_argument(
+        "--sudo-rocm-power-control",
+        action="store_true",
+        help="use sudo -n only for scoped AMD SMI power changes; keep the ROCm profiler's user environment",
+    )
     parser.add_argument("--cpu-list")
     parser.add_argument("--cpu-avx2-binary")
     parser.add_argument("--cpu-avx512-binary")
@@ -3488,6 +3654,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     args = build_argument_parser().parse_args(argv)
     backend = Backend(args.backend)
+    if args.sudo_rocm_power_control and backend != Backend.ROCM:
+        raise ValueError("--sudo-rocm-power-control requires the ROCm backend")
     requests = read_profiler_request_manifest(Path(args.requests))
     output = Path(args.output)
     records = _load_incremental_evidence(output, requests, args.resume)
@@ -3542,10 +3710,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         Path(args.binary) if args.binary else DEFAULT_BINARIES[backend]
     )
     tool_command_prefix: tuple[str, ...] = ()
-    if args.sudo_tool and os.geteuid() != 0:
+    rocm_power_command_prefix: tuple[str, ...] = ()
+    if (args.sudo_tool or args.sudo_rocm_power_control) and os.geteuid() != 0:
         if shutil.which("sudo") is None:
-            raise ValueError("--sudo-tool requires an executable sudo")
-        tool_command_prefix = ("sudo", "-n", "-E")
+            raise ValueError("requested profiler privilege requires an executable sudo")
+        if args.sudo_tool:
+            tool_command_prefix = ("sudo", "-n", "-E")
+        if args.sudo_rocm_power_control:
+            rocm_power_command_prefix = ("sudo", "-n")
     options = CollectorOptions(
         backend=backend,
         binary=selected_binary,
@@ -3564,6 +3736,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             else Path(args.cpu_avx512_binary)
         ),
         tool_command_prefix=tool_command_prefix,
+        rocm_power_command_prefix=rocm_power_command_prefix,
     )
     if tool is None and pending:
         for request in pending:
@@ -3611,9 +3784,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         track(request, result)
         _append_checkpoint_journal(output, requests, (result,))
 
-    if any(request.operation_kind == "ROCmNativeQ8DensePrefill" for request in pending) and args.device_lanes != 1:
+    if any(request.operation_kind == "ROCmNativeQuantisedDensePrefill" for request in pending) and args.device_lanes != 1:
         raise ValueError("native Q8 dense profiling requires one isolated original physical lane")
-    if any(request.operation_kind == "ROCmNativeQ8DensePrefill" for request in pending) and not args.disable_gpu_process_batching:
+    if any(request.operation_kind == "ROCmNativeQuantisedDensePrefill" for request in pending) and not args.disable_gpu_process_batching:
         raise ValueError("native Q8 dense profiles require --disable-gpu-process-batching; each request owns one original dense projection")
 
     if (

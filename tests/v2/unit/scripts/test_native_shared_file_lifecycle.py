@@ -5,12 +5,16 @@ Fake library bytes test only the verifier interface. Actual whole-TU native and
 literal-original execution belongs to the builder and cannot be inferred here.
 """
 import argparse
+import contextlib
 import copy
 import importlib.util
+import io
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -32,6 +36,48 @@ class NativeSharedFileProofTests(unittest.TestCase):
         self.root = Path(temporary.name)
         self.library = self.root / "native.so"
         self.library.write_bytes(b"fake verifier-only library identity")
+
+    def test_nccl_installer_preserves_dash_prefixed_architecture_arguments(self):
+        """Replay actual installer shell argv into both real parsers without building a dependency."""
+        installer = (PROOF.DOCKER / "install-nccl.sh").read_text().replace("\\\n", " ")
+        for variable, relative in (("nccl_shm_probe", "shared-file-lifecycle/proof.py"),
+                                   ("nccl_completed_probe", "native-completed-broadcast/proof.py")):
+            path = PROOF.DOCKER / relative
+            module = PROOF if variable == "nccl_shm_probe" else PROOF.load_module(path)
+            commands = [line.strip() for line in installer.splitlines()
+                        if line.startswith('python3 "${' + variable + '}" compile')]
+            self.assertEqual(len(commands), 1)
+            for architecture in (None, "-gencode=arch=compute_86,code=sm_86",
+                                 "-gencode arch=compute_80,code=sm_80 -gencode arch=compute_86,code=sm_86"):
+                with self.subTest(owner=variable, architecture=architecture):
+                    environment = dict(os.environ, nccl_build_dir=str(self.root), nccl_version="2.28.9",
+                                       CUDA_HOME="/unobserved/sdk", CXX="/unobserved/cxx", **{variable: str(path)})
+                    environment.pop("NVCC_GENCODE", None)
+                    if architecture is not None:
+                        environment["NVCC_GENCODE"] = architecture
+
+                    def shell_argv(command):
+                        """Observe the installed shell expression without invoking Python or a compiler."""
+                        result = subprocess.run(["bash", "-c", 'python3() { printf \'%s\\0\' "$@"; }\n' + command],
+                                                env=environment, capture_output=True, check=True)
+                        return result.stdout.decode().rstrip("\0").split("\0")
+
+                    compile_owner = mock.Mock()
+                    with mock.patch.object(module, "compile_report", compile_owner), \
+                            mock.patch.object(sys, "argv", shell_argv(commands[0])), \
+                            contextlib.redirect_stdout(io.StringIO()):
+                        module.main()
+                    compile_owner.assert_called_once()
+                    self.assertEqual(compile_owner.call_args.args[0].architecture, architecture or "toolkit-default")
+                    if architecture is not None and " " not in architecture:
+                        # The former separated argument loses a leading dash to argparse.
+                        original = commands[0].replace('"--architecture=${NVCC_GENCODE:-toolkit-default}"',
+                                                       '--architecture "${NVCC_GENCODE:-toolkit-default}"')
+                        with mock.patch.object(module, "compile_report"), \
+                                mock.patch.object(sys, "argv", shell_argv(original)), \
+                                contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as failed:
+                            module.main()
+                        self.assertEqual(failed.exception.code, 2)
 
     def report(self, backend):
         """Create an in-memory format-valid fixture, never an installed certificate."""

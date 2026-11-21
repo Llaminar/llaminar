@@ -158,6 +158,7 @@ namespace
         bool execute(IDeviceContext *) override
         {
             ++execute_calls_;
+            if (execution_observer_) execution_observer_();
             return execute_result_;
         }
         ComputeStageType type() const override { return stage_type_; }
@@ -205,6 +206,7 @@ namespace
         CollectiveGraphCaptureAuthority collective_authority_=CollectiveGraphCaptureAuthority::RuntimeBackend;
         int execute_calls_ = 0;
         int abort_publications_ = 0;
+        std::function<void()> execution_observer_; ///< Observe actual worker/immutable capture scope in replay regressions.
 
     private:
         bool capturable_ = true;
@@ -8997,4 +8999,113 @@ TEST(Test__ForwardGraphSignature, PipelineForwardOnlyHasDistinctZeroRoundSourceA
     auto prefill = ordinary; prefill.decode = false;
     EXPECT_EQ(graphSnapshotArenaReusePolicyForSignature(condition), graphSnapshotArenaReusePolicyForSignature(prefill));
     EXPECT_FALSE(graphSnapshotArenaReusePolicyForSignature(ordinary).shared());
+}
+
+/** @test Exact and guarded graphs with identical physical rows retain independent native identities. */
+TEST(Test__ForwardGraphSignature, CapturedVerifierExtentSeparatesRetainedIdentity)
+{
+    int32_t count = 5, foreign = 5;
+    ForwardGraphSignature guarded{.seq_len=5,.batch_size=1,.device=DeviceId::rocm(0),
+        .execution_role=ForwardExecutionRole::GroupedMTPVerifier,.decode=true,
+        .device_sequence_lengths=&count};
+    auto exact = guarded;
+    exact.captured_verifier_extent = CapturedVerifierExtent::exactHostedRequest(guarded.device,
+        DeviceRowRange::deviceCounted(5, &count));
+    EXPECT_NE(guarded, exact);
+    EXPECT_NE(ForwardGraphSignatureHash{}(guarded), ForwardGraphSignatureHash{}(exact));
+    std::unordered_map<ForwardGraphSignature,int,ForwardGraphSignatureHash> retained{{guarded,1},{exact,2}};
+    for (int live : {5,0,4,5}) {
+        count=live;
+        EXPECT_EQ(retained.at(guarded),1);
+        EXPECT_EQ(retained.at(exact),2);
+    }
+    for (auto changed : {CapturedVerifierExtent::exactHostedRequest(DeviceId::rocm(1), DeviceRowRange::deviceCounted(5,&count)),
+                         CapturedVerifierExtent::exactHostedRequest(guarded.device, DeviceRowRange::deviceCounted(6,&count)),
+                         CapturedVerifierExtent::exactHostedRequest(guarded.device, DeviceRowRange::deviceCounted(5,&foreign))}) {
+        auto other=exact;other.captured_verifier_extent=changed;
+        EXPECT_NE(exact,other);
+        EXPECT_NE(ForwardGraphSignatureHash{}(exact),ForwardGraphSignatureHash{}(other));
+        EXPECT_EQ(retained.find(other),retained.end());
+    }
+}
+
+/** @test Actual executor/controller worker entry scopes exact construction and rejects changed replay identity. */
+TEST(Test__GraphSegmentCache, CapturedVerifierExtentWorkerCaptureReplay)
+{
+    const auto device=DeviceId::cuda(0);
+    int32_t count=5, foreign_count=5;
+    const auto exact=CapturedVerifierExtent::exactHostedRequest(device,DeviceRowRange::deviceCounted(5,&count));
+    const auto foreign=CapturedVerifierExtent::exactHostedRequest(device,DeviceRowRange::deviceCounted(5,&foreign_count));
+    FakeReplayGPUContext worker;
+    BufferArena arena;
+    DeviceGraphExecutor executor;executor.setArena(&arena);
+    executor.setWorkerGPUContextResolver([&](DeviceId){return &worker;});
+    llaminar2::testing::MockDeviceContext ctx(device,ComputeBackendType::GPU_CUDA);
+    ComputeGraph graph;
+    addFakeSegmentStage(graph,"verifier",true,false,ComputeStageType::COPY,false,false,false,nullptr,device);
+    graph.setTerminalNode("verifier");
+    auto *stage=dynamic_cast<FakeSegmentStage*>(graph.getNode("verifier")->stage.get());
+    ASSERT_NE(stage,nullptr);
+    int recorded_stages=0;
+    stage->execution_observer_=[&] {
+        EXPECT_TRUE(worker.ownsCurrentThread());
+        EXPECT_EQ(ScopedCapturedVerifierExtent::current(),exact);
+        ++recorded_stages;
+    };
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    DeviceGraphExecutor::DecodeCapturePolicy policy;
+    policy.allow_cached_graph_replay=true;
+    policy.captured_verifier_extent=exact;
+    int boundaries=0;
+    policy.capture_boundary=[&](const std::string&,void*) {
+        EXPECT_TRUE(worker.ownsCurrentThread());
+        EXPECT_EQ(ScopedCapturedVerifierExtent::current(),policy.captured_verifier_extent);
+        ++boundaries;return true;
+    };
+    ScopedCapturedVerifierExtent caller(foreign);
+    const auto execute=[&](auto& owner) {
+        graph.reset();
+        return executor.executeDecodeWithCapturePolicy(graph,&ctx,&owner,worker.defaultStream(),&worker,nullptr,policy);
+    };
+    ASSERT_TRUE(execute(cache));
+    EXPECT_EQ(cache.captured_verifier_extent,exact);
+    EXPECT_EQ(ScopedCapturedVerifierExtent::current(),foreign);
+    ASSERT_EQ(boundaries,2);
+    const auto submissions=worker.worker_submissions_;
+    for(int live:{0,4,5,5}) {count=live;EXPECT_TRUE(execute(cache));}
+    EXPECT_EQ(boundaries,2);
+    EXPECT_EQ(worker.worker_submissions_,submissions);
+    policy.captured_verifier_extent={};
+    EXPECT_THROW(execute(cache),std::logic_error);
+    policy.captured_verifier_extent=foreign;
+    EXPECT_THROW(execute(cache),std::logic_error);
+    policy.captured_verifier_extent=CapturedVerifierExtent::exactHostedRequest(DeviceId::cuda(1),DeviceRowRange::deviceCounted(5,&count));
+    EXPECT_THROW(execute(cache),std::invalid_argument);
+    policy.captured_verifier_extent=exact;
+    DeviceGraphExecutor::GraphSegmentCache moved(std::move(cache));
+    EXPECT_EQ(moved.captured_verifier_extent,exact);
+    EXPECT_FALSE(cache.captured_verifier_extent.isExact());
+    EXPECT_TRUE(execute(moved));
+    DeviceGraphExecutor::GraphSegmentCache assigned;
+    assigned=std::move(moved);
+    EXPECT_EQ(assigned.captured_verifier_extent,exact);
+    EXPECT_FALSE(moved.captured_verifier_extent.isExact());
+    EXPECT_TRUE(execute(assigned));
+    const auto recorded_before=recorded_stages;
+    policy.force_recapture=true;
+    EXPECT_TRUE(execute(assigned));
+    policy.force_recapture=false;
+    EXPECT_GT(recorded_stages,recorded_before);
+    EXPECT_EQ(boundaries,4);
+    EXPECT_EQ(ScopedCapturedVerifierExtent::current(),foreign);
+    stage->execution_observer_=[&] {
+        EXPECT_TRUE(worker.ownsCurrentThread());
+        EXPECT_FALSE(ScopedCapturedVerifierExtent::current().isExact());
+    };
+    assigned.reset(DeviceGraphExecutor::GraphSegmentCache::StreamResetPolicy::Preserve);
+    EXPECT_FALSE(assigned.captured_verifier_extent.isExact());
+    policy.captured_verifier_extent={};
+    EXPECT_TRUE(execute(assigned));
+    EXPECT_EQ(boundaries,6);
+    EXPECT_EQ(ScopedCapturedVerifierExtent::current(),foreign);
 }

@@ -4811,6 +4811,46 @@ TEST_F(Test__ForwardExecutionEngine, ComposedForwardSnapshotsRetainOriginalCaptu
     EXPECT_FALSE(engine.lastExecutedForwardGraph());
 }
 
+/** @test Copied exact inputs cannot introduce bounded geometry or a foreign owner before capture. */
+TEST_F(Test__ForwardExecutionEngine, CapturedVerifierExtentRejectsContradictoryInputs)
+{
+    int32_t count=5, foreign=5;
+    const auto device=DeviceId::rocm(0);
+    ForwardInput original;
+    original.device=device;
+    original.seq_len=original.real_seq_len=5;
+    original.batch_size=1;
+    original.execution_role=ForwardExecutionRole::GroupedMTPVerifier;
+    original.execution_phase=ForwardExecutionPhase::Decode;
+    original.sequence_lengths_device=&count;
+    original.captured_verifier_extent=CapturedVerifierExtent::exactHostedRequest(device,
+        DeviceRowRange::deviceCounted(5,&count));
+    for(int mutation=0;mutation<10;++mutation) {
+        SCOPED_TRACE(mutation);
+        auto input=original;
+        switch(mutation) {
+        case 0:input.real_seq_len=4;break;
+        case 1:input.bucket_seq_len=5;break;
+        case 2:input.seq_len=6;break;
+        case 3:input.batch_size=2;break;
+        case 4:input.sequence_lengths_device=&foreign;break;
+        case 5:input.sequence_lengths_device=nullptr;break;
+        case 6:input.device=DeviceId::rocm(1);break;
+        case 7:input.execution_role=ForwardExecutionRole::MainInference;break;
+        case 8:input.execution_phase=ForwardExecutionPhase::Prefill;break;
+        case 9:input.real_seq_len=-1;break;
+        }
+        auto engine=makeEngine(true);
+        MockForwardExecutionHost host(&mock_ctx_);
+        ForwardOutput output;
+        EXPECT_THROW(engine.execute(input,output,host),std::invalid_argument);
+        EXPECT_FALSE(engine.lastExecutedForwardGraph().has_value());
+        EXPECT_EQ(host.build_forward_graph_calls,0);
+        EXPECT_EQ(host.ensure_workspace_calls,0);
+        EXPECT_EQ(host.get_worker_gpu_context_calls,0);
+    }
+}
+
 /**
  * @brief The decode-step team-fork summary publishes from the actual engine path.
  *

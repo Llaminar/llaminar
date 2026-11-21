@@ -4804,6 +4804,9 @@ namespace llaminar2
             return result;
         }
 
+        // This whole cold transaction is now on its original GPU worker.
+        // Guarded scopes deliberately hide any exact admission of an outer graph.
+        const ScopedCapturedVerifierExtent verifier_extent_scope(segment_cache.captured_verifier_extent);
         if (!segment_cache.ensureCaptureStream(gpu_ctx, ctx->deviceId()))
         {
             LOG_ERROR(
@@ -5713,6 +5716,27 @@ namespace llaminar2
             LOG_ERROR("[DeviceGraphCaptureController] Replay phase missing context");
             return result;
         }
+
+        const auto &diagnostic_config = debugEnv().execution;
+        const bool executes_diagnostic_stages = diagnostic_config.gpu_graph_verify ||
+            diagnostic_config.gpu_graph_recapture || diagnostic_config.gpu_graph_stream_only || force_recapture;
+        if (executes_diagnostic_stages && !gpu_ctx->ownsCurrentThread())
+        {
+            // Diagnostic replay may execute stages and record new native nodes.
+            // Preserve the original worker and immutable admission for that whole
+            // transaction just as cold capture does; ordinary replay submits only.
+            gpu_ctx->submitAndWait([&] {
+                if (!gpu_ctx->ownsCurrentThread())
+                    throw std::logic_error("Diagnostic graph recording did not enter its original GPU worker");
+                result = executeReplayPhase(graph, segment_cache, ctx, gpu_ctx,
+                    has_collective_nodes, collectives_graph_capturable, current_step,
+                    hooks, force_recapture, defer_final_sync);
+            });
+            return result;
+        }
+        std::optional<ScopedCapturedVerifierExtent> diagnostic_extent;
+        if (executes_diagnostic_stages)
+            diagnostic_extent.emplace(segment_cache.captured_verifier_extent);
 
         // Reset thread-local replay profiling state for this iteration
         const bool profiling =

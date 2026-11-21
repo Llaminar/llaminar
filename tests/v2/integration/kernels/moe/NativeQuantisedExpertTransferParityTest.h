@@ -81,6 +81,7 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -674,6 +675,13 @@ namespace llaminar2::test
         std::vector<QuantizedVerifierFormatCase> crossTierArithmeticFormats();
     } // namespace native_quantised_transfer_parity_detail
 
+    /** @brief Contiguous slice of the canonical expert arithmetic format inventory. */
+    struct CrossTierArithmeticFormatRange
+    {
+        std::size_t begin; ///< Original index of the first source format.
+        std::size_t end;   ///< Exclusive original index of the last source format.
+    };
+
     /**
      * @brief Prove one logical quantized expert is byte-stable across CPU/GPU.
      *
@@ -693,11 +701,13 @@ namespace llaminar2::test
      * @param backend_label Stable diagnostic backend label.
      * @param device CUDA or ROCm endpoint paired with the CPU tier.
      * @param stream Explicit non-default GPU stream.
-     * @param formats Source operands; registered gates use the complete default
-     *        inventory. A focused diagnostic can supply actual GGUF payloads.
+     * @param formats Ordered source operands. A focused diagnostic can supply
+     *        actual GGUF payloads.
      * @param input_scale Positive diagnostic amplitude multiplier. Synthetic
      *        format fixtures use one; native weights can probe larger states
      *        without overflowing the synthetic fixtures' oversized scales.
+     * @param selected_formats Optional bounded registration over original source
+     *        indices. Every index retains the full sweep's seeds and model IDs.
      */
     inline void runCPUToGPUAllFormatExpertArithmeticParity(
         const char *backend_label,
@@ -705,7 +715,8 @@ namespace llaminar2::test
         void *stream,
         const std::vector<QuantizedVerifierFormatCase> &formats =
             native_quantised_transfer_parity_detail::crossTierArithmeticFormats(),
-        float input_scale = 1.0f)
+        float input_scale = 1.0f,
+        std::optional<CrossTierArithmeticFormatRange> selected_formats = std::nullopt)
     {
         using namespace native_quantised_transfer_parity_detail;
         using CpuKernel =
@@ -722,6 +733,10 @@ namespace llaminar2::test
         IBackend *backend = getBackendFor(device);
         if (!backend)
             throw std::runtime_error("Cross-tier parity backend is unavailable");
+        const auto range = selected_formats.value_or(CrossTierArithmeticFormatRange{
+            .begin = 0, .end = formats.size()});
+        if (range.begin >= range.end || range.end > formats.size())
+            throw std::invalid_argument("Cross-tier parity format range is outside the source inventory");
 
         // Qwen3.5-122B production expert geometry. Both K widths exercise the
         // complete GPU-aligned expert tree, while M=65 crosses from the
@@ -786,8 +801,8 @@ namespace llaminar2::test
         ASSERT_NE(workspace_consumer, nullptr);
         workspace_consumer->bindWorkspace(&workspace);
 
-        for (std::size_t format_index = 0;
-             format_index < formats.size();
+        for (std::size_t format_index = range.begin;
+             format_index < range.end;
              ++format_index)
         {
             const auto &format = formats[format_index];

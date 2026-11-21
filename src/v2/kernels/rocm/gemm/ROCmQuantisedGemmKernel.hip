@@ -169,7 +169,21 @@ __global__ void applyFp32Epilogue_kernel(
     d_output[idx] = result;
 }
 
-template<class Rows>
+/**
+ * @brief Fold alpha/beta/bias or copy only rows admitted by the original owner.
+ * @tparam Rows Original prefix or request-work descriptor, with physical strides.
+ * @tparam Counted Whether row admission is required; ordinary full work compiles it out.
+ * @param d_computed Persistent producer output [M,N].
+ * @param d_output Final row-major destination, possibly mapped memory.
+ * @param d_existing Original output values when beta is nonzero.
+ * @param d_bias Optional original column bias [N].
+ * @param M Physical row capacity.
+ * @param N Physical column count.
+ * @param alpha Original computed-result multiplier.
+ * @param beta Original existing-output multiplier.
+ * @param work Borrowed original row authority; never another live-count publication.
+ */
+template<class Rows, bool Counted>
 __global__ void applyFp32CombineEpilogue_kernel(
     const float* d_computed,
     float* d_output,
@@ -178,11 +192,19 @@ __global__ void applyFp32CombineEpilogue_kernel(
     int M, int N,
     float alpha, float beta,Rows work)
 {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    const int total = M * N;
+    const unsigned idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned total = static_cast<unsigned>(M) * N;
     if (idx >= total) return;
-    if constexpr (std::is_same_v<Rows,llaminar2::ProjectionRowWork>)
+    if constexpr (Counted)
         if (!llaminar2::projectionRowIsActive(work,idx/N)) return;
+
+    // Mapped copy-only publication must preserve bits just like serial DMA,
+    // including subnormals and signed zero, without introducing a multiply.
+    if (alpha == 1.0f && beta == 0.0f && d_bias == nullptr)
+    {
+        d_output[idx] = d_computed[idx];
+        return;
+    }
 
     const int col = idx % N;
     float result = alpha * d_computed[idx];
@@ -1990,8 +2012,16 @@ extern "C"
         const float *d_bias,
         int M, int N,
         float alpha, float beta,
-        int rocm_device_id, void *stream)
+        int rocm_device_id, void *stream,
+        const llaminar2::DeviceRowRange *rows)
     {
+        const auto native = static_cast<hipStream_t>(stream);
+        if (M <= 0 || N <= 0 || M > std::numeric_limits<int>::max() / N)
+            throw std::invalid_argument("FP32 combine requires positive, INT32-safe M and N");
+        if (!native || native == hipStreamLegacy || native == hipStreamPerThread)
+            throw std::invalid_argument("FP32 combine requires an explicit non-default stream");
+        if (rows && rows->physicalRows() != M)
+            throw std::invalid_argument("FP32 combine row extent differs from physical matrix");
         if (!d_computed || !d_output)
         {
             fprintf(stderr, "[rocmQuantGemm_applyFp32CombineEpilogue] Null pointer: d_computed=%p d_output=%p\n",
@@ -2011,18 +2041,27 @@ extern "C"
 
         if (d_computed == d_output && beta == 0.0f)
         {
-            return rocmQuantGemm_applyFp32Epilogue(
-                d_output, d_bias, M, N, alpha, rocm_device_id, stream);
+            return rocmQuantGemm_applyFp32Epilogue_rows(
+                d_output, d_bias, M, N, alpha, rocm_device_id, stream, rows);
         }
 
         const int block_size = 256;
         const int total = M * N;
-        const int grid_size = (total + block_size - 1) / block_size;
-        llaminar2::dispatchProjectionRows(M,nullptr,[&](auto authority) {
-        hipLaunchKernelGGL(
-            (applyFp32CombineEpilogue_kernel<decltype(authority)>),
-            dim3(grid_size), dim3(block_size), 0, static_cast<hipStream_t>(stream),
-            d_computed, d_output, d_existing, d_bias, M, N, alpha, beta,authority);
+        const int grid_size = 1 + (total - 1) / block_size;
+        llaminar2::dispatchProjectionRows(M,rows,[&](auto authority) {
+            auto submit = [&]<bool Counted>() {
+                hipLaunchKernelGGL(
+                    (applyFp32CombineEpilogue_kernel<decltype(authority),Counted>),
+                    dim3(grid_size), dim3(block_size), 0, native,
+                    d_computed, d_output, d_existing, d_bias, M, N, alpha, beta,authority);
+            };
+            if constexpr (std::is_same_v<decltype(authority),llaminar2::ProjectionRowWork>)
+                submit.template operator()<true>();
+            else
+            {
+                if (rows && rows->countOwner()) submit.template operator()<true>();
+                else submit.template operator()<false>();
+            }
         });
 
         hipError_t err = hipGetLastError();

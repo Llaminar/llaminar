@@ -9,7 +9,8 @@
  * Native scalar decode retains the cache format even below a wavefront-wide
  * head, so grouped verification shares its query rounding and dot arithmetic.
  *
- * Target Architecture: AMD MI50 (gfx906 / Vega 20)
+ * Native targets: gfx906 ordered decode and gfx1100 ordered/WMMA producers.
+ * Grouped engine counters describe capture-time submissions, not device replay.
  *
  * @author David Sanftenberg
  * Device-specific launch plans bind immutable admitted CU/LDS limits before
@@ -20,6 +21,7 @@
 #include "backends/rocm/ROCmHardwareMetadata.h"
 #include "kernels/attention/AttentionHeadMapping.h"
 #include "ROCmFlashAttentionKernelT.h"
+#include "ROCmFlashAttentionQK.h"
 #include "ROCmFlashAttentionLaunchPolicy.h"
 #include "../../../backends/IWorkerGPUContext.h"
 #include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
@@ -29,6 +31,7 @@
 #include "../../../utils/ROCmKernelProfiler.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../utils/PerfStatsCollector.h"
+#include "ROCmVerifierAttentionWmma.h"
 #include "../../attention/AttentionDeviceParams.h"
 #include <hip/hip_runtime.h>
 #include <algorithm>
@@ -329,6 +332,47 @@ namespace llaminar2
 {
     namespace rocm
     {
+        /** @copydoc recordVerifierAttentionSubmission */
+        void recordVerifierAttentionSubmission(VerifierAttentionEngine engine,
+            const VerifierAttentionGeometry &geometry, std::string_view native_isa, int device)
+        {
+            if (!PerfStatsCollector::isRecordFamilyEnabled(
+                    "gpu_graph_inventory", "rocm_verifier_attention_kernel_submissions")) return;
+            PerfStatsCollector::addCounter("gpu_graph_inventory", "rocm_verifier_attention_kernel_submissions", 1.0,
+                "kernel_submission", "rocm:" + std::to_string(device), {
+                    {"engine",verifierAttentionEngineName(engine)}, {"native_isa",std::string(native_isa)},
+                    {"query_rows",std::to_string(geometry.rows)}, {"kv_capacity",std::to_string(geometry.kv_capacity)},
+                    {"query_heads",std::to_string(geometry.query_heads)}, {"kv_heads",std::to_string(geometry.kv_heads)},
+                    {"head_dim",std::to_string(geometry.head_dim)}, {"split_capacity",std::to_string(geometry.split_capacity)},
+                    {"head_start",std::to_string(geometry.head_start)}, {"replicated_gqa",std::to_string(geometry.replicated_gqa)},
+                    {"kv_format","fp16"}, {"row_layout","shared_kv"}});
+        }
+
+        /** @copydoc recordFlashAttentionQKSubmission */
+        void recordFlashAttentionQKSubmission(FlashAttentionQKEngine engine,
+            const attention::AttentionPrefillCaptureGeometry &geometry,
+            const fa2_policy::ROCmFA2TilePlan &tile, std::string_view native_isa, int device)
+        {
+            if (!PerfStatsCollector::isRecordFamilyEnabled(
+                    "gpu_graph_inventory", "rocm_fa2_qk_kernel_submissions")) return;
+            PerfStatsCollector::addCounter("gpu_graph_inventory", "rocm_fa2_qk_kernel_submissions", 1.0,
+                "kernel_submission", "rocm:" + std::to_string(device), {
+                    {"qk_engine",flashAttentionQKEngineName(engine)},
+                    {"qk_branch_policy",engine == FlashAttentionQKEngine::ContextAdaptive ? "device_live_prefix" : "unconditional"},
+                    {"native_isa",std::string(native_isa)},
+                    {"batch_size",std::to_string(geometry.batch_size)},
+                    {"query_rows",std::to_string(geometry.query_rows)},
+                    {"local_query_heads",std::to_string(geometry.local_query_heads)},
+                    {"visible_kv_heads",std::to_string(geometry.visible_kv_heads)},
+                    {"head_start",std::to_string(geometry.head_start)},
+                    {"replicated_gqa_n_rep",std::to_string(geometry.replicated_gqa_n_rep)},
+                    {"head_dim",std::to_string(geometry.head_dim)},
+                    {"kv_capacity",std::to_string(geometry.kv_capacity)},
+                    {"kv_format",std::to_string(static_cast<int>(geometry.native_kv_format))},
+                    {"selected_axis",fa2_policy::rocmFA2PrefillPhysicalModeName(tile.schedule)},
+                    {"score_storage",fa2_policy::rocmFA2ScoreStorageName(tile.score_storage)}});
+        }
+
         constexpr int MAX_FLASH_DECODE_SPLITS =
             attention_workspace::kMaximumDecodeSplits;
         constexpr int MIN_KV_ROWS_PER_SPLIT = 16;

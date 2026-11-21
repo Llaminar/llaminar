@@ -110,16 +110,22 @@ namespace
         /** @brief Preserve thread-local policy while collecting generic evidence. */
         ScopedDensePrefillOverlayBypass()
             : previous_(cudaNativeQuantisedPrefill_getExactOverlayEnabled()),
-              previous_staging_(cudaNativeQuantisedPrefill_getStagingSchedule())
+              previous_staging_(cudaNativeQuantisedPrefill_getStagingSchedule()),
+              previous_bk256_(cudaNativeQuantisedPrefill_getBK256Mode()),
+              previous_canonical_(cudaNativeQuantisedPrefill_getCanonicalKPartitionMode())
         {
+            cudaNativeQuantisedPrefill_getForceTile(&previous_tile_);
             cudaNativeQuantisedPrefill_setExactOverlayEnabled(false);
         }
 
-        /** @brief Restore both independent policies, including assertion unwinding. */
+        /** @brief Restore lookup and launch controls, including assertion unwinding. */
         ~ScopedDensePrefillOverlayBypass()
         {
             cudaNativeQuantisedPrefill_setStagingSchedule(previous_staging_);
             cudaNativeQuantisedPrefill_setExactOverlayEnabled(previous_);
+            cudaNativeQuantisedPrefill_setBK256Mode(previous_bk256_);
+            cudaNativeQuantisedPrefill_setCanonicalKPartitionMode(previous_canonical_);
+            cudaNativeQuantisedPrefill_setForceTile(previous_tile_);
         }
 
         ScopedDensePrefillOverlayBypass(
@@ -130,6 +136,9 @@ namespace
     private:
         bool previous_ = true;
         PrefillStagingSchedule previous_staging_;
+        int previous_bk256_ = 0;
+        bool previous_canonical_ = false;
+        int previous_tile_ = -1;
     };
 
     const llaminar2::NativeQuantisedFormatInfo &requireNativeQuantisedInfo(
@@ -1202,6 +1211,8 @@ namespace
     class PreparedSweepExecution
     {
     public:
+        /** @brief Decode probes certify output; installable prefill also certifies consumed scratch. */
+        enum class ReplayContract { Prefill, DecodeDiagnostic };
         /**
          * @brief Admit persistent buffers, exact-stream bindings, and an untimed oracle.
          * @param kernel Production GEMM whose prepared weights outlive this fixture.
@@ -1211,6 +1222,7 @@ namespace
          * @param device_id CUDA ordinal owning every retained tensor and workspace.
          * @param requirements Union of the candidates' persistent workspace contracts.
          * @param maximum_bench_runs Number of preallocated timing-event pairs.
+         * @param replay_contract Actual projection lane; decode cannot consume prefill metadata.
          * @throws std::runtime_error if admission, publication, or oracle execution fails.
          */
         PreparedSweepExecution(
@@ -1220,10 +1232,13 @@ namespace
             int k,
             int device_id,
             const WorkspaceRequirements &requirements,
-            int maximum_bench_runs)
-            : kernel_(kernel), m_(m), n_(n), k_(k), device_id_(device_id)
+            int maximum_bench_runs,
+            ReplayContract replay_contract = ReplayContract::Prefill)
+            : kernel_(kernel), m_(m), n_(n), k_(k), device_id_(device_id),
+              replay_contract_(replay_contract)
         {
             if (!kernel_ || maximum_bench_runs <= 0 ||
+                (replay_contract_ == ReplayContract::Prefill && m_ <= 1) ||
                 cudaSetDevice(device_id_) != cudaSuccess)
                 throw std::runtime_error("invalid CUDA sweep execution device");
 
@@ -1358,6 +1373,8 @@ namespace
             for (int iteration = 0; iteration < warmup_runs; ++iteration)
                 submit();
             checkStream("warmup");
+            if (graph)
+                proveDirtyReplay(*graph);
 
             for (int iteration = 0; iteration < bench_runs; ++iteration)
             {
@@ -1513,7 +1530,128 @@ namespace
             return first_byte_mismatch_;
         }
 
+        /**
+         * @brief Disable real recorded producers to prove dirty certificates fail closed.
+         * Each control starts with valid output from the complete retained graph;
+         * re-enabling its nodes must restore the same three-pattern replay proof.
+         */
+        void verifyDirtyReplayNegativeControls()
+        {
+            probeLaunch();
+            llaminar2::CUDAGraphCapture graph(stream_, device_id_);
+            llaminar2::ScopedBackendGraphCapture capture(graph, "CUDA dirty replay controls");
+            ASSERT_TRUE(capture.begin());
+            launch(m_, input_.get(), output_.get());
+            capture.finish();
+            ASSERT_TRUE(graph.instantiate());
+            size_t count = 0;
+            ASSERT_EQ(cudaGraphGetNodes(graph.graph(), nullptr, &count), cudaSuccess);
+            std::vector<cudaGraphNode_t> nodes(count);
+            ASSERT_EQ(cudaGraphGetNodes(graph.graph(), nodes.data(), &count), cudaSuccess);
+            int tile = -1, partitions = 0, bk256 = 0, canonical = 0;
+            cudaNativeQuantisedPrefill_getLastLaunchSelection(&tile, &partitions, &bk256, &canonical);
+            ASSERT_EQ(canonical, 1);
+            ASSERT_GT(partitions, 1);
+            // Mode2 retains the reducer while omitting the primary producer,
+            // proving that stale K-partials cannot pass a complete-output check.
+            for (const int omission : {0, 1, 2})
+            {
+                proveDirtyReplay(graph);
+                std::vector<cudaGraphNode_t> disabled;
+                int quantizers = 0, primaries = 0, reducers = 0;
+                for (const auto node : nodes)
+                {
+                    cudaGraphNodeType type;
+                    ASSERT_EQ(cudaGraphNodeGetType(node, &type), cudaSuccess);
+                    if (type != cudaGraphNodeTypeKernel) continue;
+                    cudaKernelNodeParams parameters{};
+                    ASSERT_EQ(cudaGraphKernelNodeGetParams(node, &parameters), cudaSuccess);
+                    ASSERT_NE(parameters.kernelParams, nullptr);
+                    ASSERT_NE(parameters.kernelParams[0], nullptr);
+                    const void *first_argument = *static_cast<void **>(parameters.kernelParams[0]);
+                    const bool quantizer = first_argument == input_->gpu_data_ptr();
+                    const bool primary = first_argument ==
+                        workspace_->getBuffer(llaminar2::GemmWorkspaceBuffers::QUANT_A);
+                    const bool reducer = first_argument == workspace_->getBuffer(
+                        llaminar2::GemmWorkspaceBuffers::CUDA_NATIVE_QUANTISED_PREFILL_CANONICAL_KPART_PARTIALS);
+                    ASSERT_TRUE(quantizer || primary || reducer) << "unrecognized captured kernel role";
+                    quantizers += quantizer; primaries += primary; reducers += reducer;
+                    if (!(omission == 0 ? !quantizer : omission == 1 ? quantizer : primary)) continue;
+                    ASSERT_EQ(cudaGraphNodeSetEnabled(graph.executable(), node, 0), cudaSuccess);
+                    disabled.push_back(node);
+                }
+                ASSERT_EQ(quantizers, 1);
+                ASSERT_EQ(primaries, 1);
+                ASSERT_EQ(reducers, 1);
+                ASSERT_FALSE(disabled.empty());
+                EXPECT_THROW(proveDirtyReplay(graph), std::runtime_error);
+                for (const auto node : disabled)
+                    ASSERT_EQ(cudaGraphNodeSetEnabled(graph.executable(), node, 1), cudaSuccess);
+                EXPECT_NO_THROW(proveDirtyReplay(graph));
+            }
+        }
+
     private:
+        /**
+         * @brief Reset exactly the current projection's consumed scratch and output.
+         * @param poison Byte pattern applied outside capture and native timing.
+         * Oracle and serial-family banks retain their independently recorded inputs.
+         */
+        void poisonProjection(int poison)
+        {
+            namespace GemmWorkspaceBuffers = llaminar2::GemmWorkspaceBuffers;
+            const auto clear = [&](void *pointer, size_t bytes) {
+                if (!pointer || cudaMemsetAsync(pointer, poison, bytes, stream_) != cudaSuccess)
+                    throw std::runtime_error("CUDA dirty replay poison failed");
+            };
+            const auto bank = [&](const char *name, size_t bytes) {
+                if (!workspace_ || workspace_->getBufferSize(name) < bytes)
+                    throw std::runtime_error("CUDA dirty replay scratch extent exceeds admission");
+                clear(workspace_->getBuffer(name), bytes);
+            };
+            const size_t output_bytes = static_cast<size_t>(m_) * n_ * sizeof(float);
+            clear(output_->gpu_data_ptr(), output_bytes);
+            // M1 and verifier diagnostics use their own GEMV scratch policy.
+            // They retain output replay certification without borrowing a stale
+            // prefill launch identity or claiming prefill workspace qualification.
+            if (replay_contract_ == ReplayContract::DecodeDiagnostic) return;
+            bank(GemmWorkspaceBuffers::QUANT_A, static_cast<size_t>(m_) * k_);
+            const size_t block_bytes = static_cast<size_t>(m_) * (k_ / 32) * sizeof(float);
+            bank(GemmWorkspaceBuffers::SCALES_A_BLOCKWISE, block_bytes);
+            llaminar2::DeviceNativeQuantisedMatrixDesc weights;
+            if (!kernel_->exportNativeQuantisedMatrixDesc(weights) || !weights.valid())
+                throw std::runtime_error("CUDA dirty replay requires native prepared weights");
+            // The public native quantizer publishes sums only for these physical
+            // correction ABIs; IQ1_M instead consumes four independently scaled K8s.
+            if (m_ > 1 && (weights.codebook_id == 5 || weights.codebook_id == 7 ||
+                weights.codebook_id == 16 || weights.codebook_id == llaminar2::kNativeQuantisedExpandedInt8MinCodebook))
+                bank(GemmWorkspaceBuffers::SUMS_A_BLOCKWISE, block_bytes);
+            int tile = -1, partitions = 0, bk256 = 0, canonical = 0;
+            cudaNativeQuantisedPrefill_getLastLaunchSelection(&tile, &partitions, &bk256, &canonical);
+            if (canonical)
+            {
+                if (partitions <= 0) throw std::runtime_error("CUDA dirty replay has invalid partition identity");
+                bank(GemmWorkspaceBuffers::CUDA_NATIVE_QUANTISED_PREFILL_CANONICAL_KPART_PARTIALS,
+                    static_cast<size_t>(partitions) * output_bytes);
+            }
+        }
+
+        /**
+         * @brief Prove the retained timed graph overwrites every consumed value.
+         * @param graph The same executable used by all subsequent native-event samples.
+         * @throws std::runtime_error On missing work or changed output bytes.
+         */
+        void proveDirtyReplay(llaminar2::CUDAGraphCapture &graph)
+        {
+            for (const int poison : {0xff, 0x55, 0x00})
+            {
+                poisonProjection(poison);
+                if (!graph.launch()) throw std::runtime_error("CUDA dirty replay launch failed");
+                if (byteMismatches() != 0)
+                    throw std::runtime_error("CUDA dirty replay changed exact-M output bytes");
+            }
+        }
+
         /**
          * @brief Submit the public production projection on its retained exact stream.
          * @param m Live physical activation rows.
@@ -1563,6 +1701,7 @@ namespace
         int n_ = 0;
         int k_ = 0;
         int device_id_ = 0;
+        ReplayContract replay_contract_ = ReplayContract::Prefill;
         std::unique_ptr<DeviceWorkspaceManager> workspace_;
         std::unique_ptr<FP32Tensor> host_input_;
         std::unique_ptr<FP32Tensor> input_;
@@ -1578,6 +1717,32 @@ namespace
         size_t last_timing_sample_count_ = 0;
         uint64_t first_byte_mismatch_ = std::numeric_limits<uint64_t>::max();
     };
+
+    /** @test Real retained graphs cannot borrow eager output or quantized scratch. */
+    TEST_F(CUDANativeQuantisedGemmPerf, DirtyCapturedReplayRejectsMissingWork)
+    {
+        constexpr int m = 64, n = 512, k = 2048;
+        ScopedDensePrefillOverlayBypass restore_policy;
+        for (const char *label : {"Q4_0", "Q4_1", "IQ4_XS", "IQ1_M", "Q8_0"})
+        {
+            SCOPED_TRACE(label);
+            const auto format = std::find_if(kFormats.begin(), kFormats.end(),
+                [&](const auto &entry) { return entry.name == label; });
+            ASSERT_NE(format, kFormats.end());
+            auto weights = format->create(n, k);
+            auto prepared = llaminar2::test::makeGpuPreparedGemm(
+                weights.get(), DeviceId::cuda(0), "cuda.dirty-captured-replay");
+            auto *consumer = dynamic_cast<IWorkspaceConsumer *>(prepared.kernel);
+            ASSERT_NE(consumer, nullptr);
+            cudaNativeQuantisedPrefill_setForceTile(2);
+            cudaNativeQuantisedPrefill_setCanonicalKPartitionMode(true);
+            const auto requirements = consumer->getWorkspaceRequirements(m, n, k);
+            PreparedSweepExecution execution(prepared.kernel, m, n, k, 0, requirements, 1);
+            cudaNativeQuantisedPrefill_setForceTile(2);
+            cudaNativeQuantisedPrefill_setCanonicalKPartitionMode(true);
+            execution.verifyDirtyReplayNegativeControls();
+        }
+    }
 
     /**
      * @brief Measure installed dispatch at explicit physical projection shapes.
@@ -1609,7 +1774,9 @@ namespace
                 for (const int m : cfg.performance_prefill_m)
                 {
                     PreparedSweepExecution execution(prepared.kernel, m, shape.n, shape.k,
-                        0, consumer->getWorkspaceRequirements(m, shape.n, shape.k), cfg.bench_runs);
+                        0, consumer->getWorkspaceRequirements(m, shape.n, shape.k), cfg.bench_runs,
+                        m == 1 ? PreparedSweepExecution::ReplayContract::DecodeDiagnostic
+                               : PreparedSweepExecution::ReplayContract::Prefill);
                     execution.measure(cfg.warmup_runs, cfg.bench_runs,
                         PreparedSweepExecution::Submission::Captured);
                     ASSERT_EQ(execution.byteMismatches(), 0u);
@@ -1790,7 +1957,9 @@ namespace
                     auto verifier = m > 1 && m <= 16
                         ? prepared.kernel->beginVerifierDecodeEquivalentScope() : nullptr;
                     PreparedSweepExecution execution(prepared.kernel, m, shape.n, shape.k,
-                        0, consumer->getWorkspaceRequirements(m, shape.n, shape.k), cfg.bench_runs);
+                        0, consumer->getWorkspaceRequirements(m, shape.n, shape.k), cfg.bench_runs,
+                        m <= 16 ? PreparedSweepExecution::ReplayContract::DecodeDiagnostic
+                                : PreparedSweepExecution::ReplayContract::Prefill);
                     const llaminar2::test::CUDACapturedKernelProbeIdentity identity{
                         .operation = shape.name, .format = format.name,
                         .m = m, .n = shape.n, .k = shape.k};

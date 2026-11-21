@@ -23,6 +23,7 @@ enum class VNNIPrefillProducer : std::uint8_t
     NativeStreaming,
     Int8BlockwiseV3,
     Int8BlockwiseV7,
+    NativeWmma,
 };
 
 /** @brief Stable diagnostic spelling used in authenticated trainer evidence. */
@@ -35,6 +36,7 @@ enum class VNNIPrefillProducer : std::uint8_t
     case VNNIPrefillProducer::NativeStreaming: return "native_streaming";
     case VNNIPrefillProducer::Int8BlockwiseV3: return "int8_blockwise_v3";
     case VNNIPrefillProducer::Int8BlockwiseV7: return "int8_blockwise_v7";
+    case VNNIPrefillProducer::NativeWmma: return "native_wmma";
     }
     return "invalid";
 }

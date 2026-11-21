@@ -101,26 +101,29 @@ namespace llaminar2::test::parity
 
     TEST(ModelParityBenchmarkProjection, StressEconomicsCannotChangeTimingPolicy)
     {
-        std::size_t exercised = 0;
+        std::size_t checked = 0;
         for (auto cell : expandModelParityDefinition(qwen36::qwen36MoECPU2NodeTPParityDefinition()))
         {
-            if (!cell.usesDynamicMTPDepth() || !cell.expert_overlay ||
-                cell.expert_overlay->movement != ModelParityExpertMovement::Dynamic)
-                continue;
-            cell.e2e_certification = ModelParityE2EProfile{};
-            ++exercised;
-            const auto expected = modelParityBenchmarkArguments(cell);
+            SCOPED_TRACE(cell.testName());
+            ASSERT_FALSE(cell.e2e_certification);
+            const auto expected = modelParityDiagnosticBenchmarkArguments(cell);
             const auto stress = modelParityServerArguments(cell);
             cell.dynamic_rebalance.window_size = 123;
             cell.dynamic_rebalance.migration_transfer_slots = 49;
             cell.dynamic_rebalance.dynamic_max_swaps_per_layer = 31;
             cell.dynamic_rebalance.device_min_maintenance_period_tokens = 1024;
             cell.moe_routed_prefill.overlay_segment_rows = 64;
-            cell.tp_allreduce_precision_override = "fp32";
             EXPECT_NE(modelParityServerArguments(cell), stress);
-            EXPECT_EQ(modelParityBenchmarkArguments(cell), expected);
+            EXPECT_EQ(modelParityDiagnosticBenchmarkArguments(cell), expected);
+            // Collective precision is declared arithmetic intent, not a stress
+            // scheduling knob; the diagnostic projection must retain it.
+            cell.tp_allreduce_precision_override = "fp32";
+            EXPECT_NE(modelParityDiagnosticBenchmarkArguments(cell), expected);
+            EXPECT_EQ(parseBenchmarkIntent(modelParityDiagnosticBenchmarkArguments(cell))
+                          .tp_allreduce_precision_override, "fp32");
+            ++checked;
         }
-        EXPECT_GT(exercised, 0u);
+        EXPECT_EQ(checked, 24u);
     }
 
     TEST(ModelParityBenchmarkProjection, OffFixedRandomAndStaticIntentIsNotRelabeled)

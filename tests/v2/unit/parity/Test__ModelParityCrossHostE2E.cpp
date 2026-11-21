@@ -20,25 +20,17 @@ namespace llaminar2::test::parity
 {
     namespace
     {
-        /** @return Model-owned canonical definition, without reading its GGUF.
-         *
-         * Release eligibility lives in the bounded six-cell release matrix, not
-         * in these legacy model definitions; the remote certification tag is
-         * constructed here so the proofs below exercise the expansion and
-         * export machinery instead of depending on a blessed model tag that
-         * `qwen36MoEParityDefinition` deliberately does not carry.
-         */
+        /** @return An explicitly tagged unit fixture, without changing model eligibility. */
         ModelParityDefinition remoteSource(GlobalDeviceAddress device = GlobalDeviceAddress::rocm(0))
         {
             auto definition = qwen36::qwen36MoEParityDefinition(
                 qwen36::qwen36SingleDeviceTopology("SourceGPU", std::move(device)),
                 "/reference", qwen36::qwen36MoESingleDeviceThresholds());
-            definition.e2e_certifiable = {{.mtp = ModelParityMTP::DynamicDepth}};
-            // Remote certification is model-owned and provider-independent.
-            // The source cell keeps its existing single-device numerical test;
-            // the E2E exporter adds both public routes for each remote pool.
-            definition.e2e_certifiable.front().remote_cpu_overlays = {
-                ModelParityRemoteCPUHosts{1}, ModelParityRemoteCPUHosts{2}};
+            // This mathematical model is deliberately outside the current RC
+            // selection. The unit fixture authors the remote expansion input.
+            EXPECT_TRUE(definition.e2e_certifiable.empty());
+            definition.e2e_certifiable = {{.mtp = ModelParityMTP::DynamicDepth,
+                .remote_cpu_overlays = {ModelParityRemoteCPUHosts{1}, ModelParityRemoteCPUHosts{2}}}};
             return definition;
         }
 
@@ -189,6 +181,7 @@ namespace llaminar2::test::parity
             ModelParityRemoteCPUHosts{1}, ModelParityRemoteCPUHosts{1}};
         EXPECT_THROW((void)expandModelParityDefinition(definition), std::invalid_argument);
         auto cpu = qwen36::qwen36MoECPU2NodeTPParityDefinition();
+        EXPECT_TRUE(cpu.e2e_certifiable.empty());
         cpu.e2e_certifiable = {{.mtp = ModelParityMTP::DynamicDepth,
             .remote_cpu_overlays = {ModelParityRemoteCPUHosts{1}}}};
         EXPECT_THROW((void)expandModelParityDefinition(cpu), std::invalid_argument);
