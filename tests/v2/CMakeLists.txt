@@ -19975,6 +19975,28 @@ add_v2_test(V2_Integration_CPUNativeQuantised_GEMV
     LABELS "V2;Integration;GEMM;GEMV;NativeQuantised;CPU;Q4_0;IQ4_NL;Decode"
     MPI_PROCS 1
 )
+# Every CPU NativeQuantised entry rejects unsealed or stale publications, on
+# each native runtime ISA of this build (NEON, AVX2, AVX512).
+set(V2_CPU_PUBLICATION_ADMISSION_ISAS ${V2_CPU_BASELINE_RUNTIME_ISA})
+if(LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
+    list(APPEND V2_CPU_PUBLICATION_ADMISSION_ISAS avx2 avx512)
+endif()
+list(REMOVE_DUPLICATES V2_CPU_PUBLICATION_ADMISSION_ISAS)
+foreach(V2_ADMISSION_ISA IN LISTS V2_CPU_PUBLICATION_ADMISSION_ISAS)
+    string(TOUPPER "${V2_ADMISSION_ISA}" V2_ADMISSION_ISA_LABEL)
+    string(REPLACE "-" "_" V2_ADMISSION_ISA_LABEL "${V2_ADMISSION_ISA_LABEL}")
+    add_v2_test(V2_Integration_CPU_NativeQuantisedPublicationAdmission_${V2_ADMISSION_ISA_LABEL}
+        COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_gemv>
+                --gtest_filter=CPUNativeQuantisedPublicationAdmission.*
+                --gtest_brief=1
+        LABELS "V2;Integration;CPU;NativeQuantised;MXFP4;Publication;${V2_ADMISSION_ISA_LABEL};ProductionTestPreflight;Regression"
+        MPI_PROCS 1
+        NO_MPI
+        NO_MODELS
+        ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_ADMISSION_ISA}")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+        V2_Integration_CPU_NativeQuantisedPublicationAdmission_${V2_ADMISSION_ISA_LABEL})
+endforeach()
 set(V2_CPU_MOVABLE_FLOATING_EXPERT_PREFLIGHT_TESTS)
 foreach(V2_FLOATING_EXPERT_ISA IN ITEMS scalar ${V2_CPU_BASELINE_RUNTIME_ISA})
     if(V2_FLOATING_EXPERT_ISA STREQUAL "scalar")

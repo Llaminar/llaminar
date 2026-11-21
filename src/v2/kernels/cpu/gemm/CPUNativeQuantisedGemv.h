@@ -3127,6 +3127,18 @@ namespace llaminar2::cpu::native_quantised
     }
 
     /**
+     * @brief Admit a packed publication before an x86 entry reads its bytes.
+     * @param packed Owner whose resident stream the entry will read.
+     * @details O(1), as on NEON: the current byte generation must carry a
+     * metadata seal covering this owner's interpretation. Unsealed or stale
+     * bytes are fatal; the entry never reads unadmitted metadata.
+     */
+    inline void requireAdmittedNativeQuantisedWeights(const CPUNativeQuantisedPackedWeights &packed)
+    {
+        (void)packed.readView();
+    }
+
+    /**
      * @brief Add one projection bias row using the selected runtime ISA.
      *
      * Fused verifier projection bundles apply bias after every grouped GEMV
@@ -3184,6 +3196,7 @@ namespace llaminar2::cpu::native_quantised
         ISAPath isa_path = ISAPath::AUTO,
         DecodeSchedulePolicy schedule_override = DecodeSchedulePolicy::Auto)
     {
+        requireAdmittedNativeQuantisedWeights(packed);
         requireNativeQuantisedISAPath(isa_path);
         const int N = packed.N;
         const int K = packed.K;
@@ -3462,6 +3475,7 @@ namespace llaminar2::cpu::native_quantised
         std::span<float> partial_storage,
         std::span<Q8_1Block> activation_storage)
     {
+        requireAdmittedNativeQuantisedWeights(packed);
         const int K = packed.K;
         const int K_blocks = packed.blocks_per_row;
 
@@ -5204,6 +5218,7 @@ namespace llaminar2::cpu::native_quantised
         int n_block_chunks_override = 0,
         const ProjectionRowWork *work = nullptr)
     {
+        requireAdmittedNativeQuantisedWeights(packed);
         requireNativeQuantisedISAPath(isa_path);
         const CPUProjectionRowGrid row_grid(M,work);
         if(!row_grid.beginWorkshare())return;
@@ -5718,6 +5733,7 @@ namespace llaminar2::cpu::native_quantised
         int full_k_n_block_chunks_override,
         const ProjectionRowWork *work)
     {
+        requireAdmittedNativeQuantisedWeights(packed);
         requireNativeQuantisedISAPath(isa_path);
         const CPUProjectionRowGrid row_grid(M,work);
         if(!row_grid.beginWorkshare())return;
@@ -7277,6 +7293,9 @@ namespace llaminar2::cpu::native_quantised
         ISAPath isa_path = ISAPath::AUTO,
         FusedOutputJobOwnership job_ownership = FusedOutputJobOwnership::Auto)
     {
+        for (int p = 0; descs && p < num_descs; ++p)
+            if (descs[p].packed)
+                requireAdmittedNativeQuantisedWeights(*descs[p].packed);
         requireNativeQuantisedISAPath(isa_path);
         constexpr int kMaxFusedVerifierProjections = NativeQuantisedFusedRowsPlan::capacity;
         if (!descs || num_descs <= 0 ||
@@ -9727,6 +9746,7 @@ namespace llaminar2::cpu::native_quantised
         int ldc,
         std::span<Q8_1Block> activation_storage)
     {
+        requireAdmittedNativeQuantisedWeights(packed);
         const int K = packed.K;
         const int K_blocks = packed.blocks_per_row;
 
@@ -9787,6 +9807,7 @@ namespace llaminar2::cpu::native_quantised
         std::span<float> partial_storage,
         const ProjectionRowWork *work = nullptr)
     {
+        requireAdmittedNativeQuantisedWeights(packed);
         if(work&&M!=1)throw std::invalid_argument("CPU ordinary work-selected projection requires its original M1 route");
         const CPUProjectionRowGrid row_grid(M,work);
         if(!row_grid.beginWorkshare())return;
@@ -9911,6 +9932,9 @@ namespace llaminar2::cpu::native_quantised
         ISAPath isa_path = ISAPath::AUTO,
         DecodeSchedulePolicy schedule_override = DecodeSchedulePolicy::Auto)
     {
+        for (int p = 0; descs && p < num_descs; ++p)
+            if (descs[p].packed)
+                requireAdmittedNativeQuantisedWeights(*descs[p].packed);
         requireNativeQuantisedISAPath(isa_path);
         constexpr int kMaxFusedDecodeProjections = NativeQuantisedFusedRowsPlan::capacity;
         if (!A_q8 || !descs || num_descs <= 0 ||
@@ -9990,6 +10014,9 @@ namespace llaminar2::cpu::native_quantised
         ISAPath isa_path = ISAPath::AUTO,
         DecodeSchedulePolicy schedule_override = DecodeSchedulePolicy::Auto)
     {
+        for (int p = 0; descs && p < num_descs; ++p)
+            if (descs[p].packed)
+                requireAdmittedNativeQuantisedWeights(*descs[p].packed);
         requireNativeQuantisedISAPath(isa_path);
         constexpr int kMaxFusedMultiInputProjections = NativeQuantisedFusedRowsPlan::capacity;
         if (!descs || num_descs <= 0 ||
