@@ -190,10 +190,13 @@ void proveMixedTensorShardedMovement(OrchestrationRunner& runner, const Observed
     ASSERT_EQ(before_movement.size(), static_cast<std::size_t>(replay_tokens));
     if (gpu_owner.devices.front().is_cuda())
     {
-        const auto publications = PerfStatsCollector::snapshot({"moe.router_selected_descriptors_enqueued"});
-        ASSERT_TRUE(std::any_of(publications.begin(), publications.end(), [](const auto &record) {
-            return record.name == "router_selected_descriptors_enqueued" && record.count > 0;
-        })) << "CUDA ordinary decode must use the router's captured descriptor publication";
+        const auto fused = PerfStatsCollector::snapshot({"kernel.cuda_moe_grouped_decode_swiglu_publication_calls"});
+        ASSERT_TRUE(std::any_of(fused.begin(), fused.end(), [](const auto &record) {
+            const auto source = record.tags.find("source");
+            return record.name == "cuda_moe_grouped_decode_swiglu_publication_calls" &&
+                   source != record.tags.end() && source->second == "runtime_intermediate_shard" &&
+                   record.count > 0;
+        })) << "CUDA ordinary decode must publish native SwiGLU from the ordered Gate/Up reducer";
     }
     // Close real routed-demand windows without injecting a histogram or
     // commanding a swap. Vary the leading token between warm-up requests.

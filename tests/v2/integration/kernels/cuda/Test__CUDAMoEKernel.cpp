@@ -22051,30 +22051,64 @@ TEST_F(Test__CUDAMoEKernel, RuntimeGroupedDecodeSwiGLUPublicationReplay)
     constexpr int seq_len = 1;
     constexpr int top_k = 8;
     constexpr int num_experts = 8;
-    constexpr int d_model = 512;
+    const char *source_probe = std::getenv("LLAMINAR_TEST_CUDA_MOE_M1_SOURCE");
+    const std::string_view source = source_probe ? source_probe : "iq2_fixture";
+    const bool model_geometry = source_probe != nullptr;
+    const int d_model = model_geometry ? 2560 : 512;
     constexpr int intermediate = 320;
     const auto device = llaminar2::DeviceId::cuda(0);
+    std::string_view gate_source = "IQ2_S", down_source = "IQ4_NL";
+    if (source == "main")
+    {
+        gate_source = "Q4_K";
+        down_source = "Q5_1";
+    }
+    else if (source == "main_q5")
+    {
+        gate_source = "Q5_K";
+        down_source = "Q8_0";
+    }
+    else if (source == "drafter")
+        gate_source = down_source = "Q8_0";
+    else
+        ASSERT_EQ(source, "iq2_fixture");
+    const auto formats = cudaMoEGroupedNativeFormats();
+    const auto format_named = [&](std::string_view name) {
+        return std::find_if(formats.begin(), formats.end(),
+            [=](const auto &candidate) { return name == candidate.label; });
+    };
+    const auto gate_format = format_named(gate_source);
+    const auto down_format = format_named(down_source);
+    ASSERT_NE(gate_format, formats.end());
+    ASSERT_NE(down_format, formats.end());
+    std::unique_ptr<llaminar2::DeviceWorkspaceManager> projection_workspace;
+    if (model_geometry)
+    {
+        const auto requirements = llaminar2::MoEWorkspaceBuffers::cudaMoE(
+            seq_len, d_model, intermediate, num_experts, top_k);
+        projection_workspace = std::make_unique<llaminar2::DeviceWorkspaceManager>(
+            device, requirements.total_bytes_with_alignment() + 4 * 1024 * 1024);
+        ASSERT_TRUE(projection_workspace->allocate(requirements));
+        cuda_kernel_->bindWorkspace(projection_workspace.get());
+    }
+    struct WorkspaceRestore
+    {
+        llaminar2::CUDAMoEKernel* kernel;
+        llaminar2::DeviceWorkspaceManager* original;
+        bool restore;
+        ~WorkspaceRestore() { if (restore) kernel->bindWorkspace(original); }
+    } restore{cuda_kernel_, workspace_.get(), model_geometry};
 
     std::vector<std::unique_ptr<llaminar2::TensorBase>> owned_weights;
     std::vector<llaminar2::test::GpuPreparedGemm> prepared_weights;
     owned_weights.reserve(static_cast<size_t>(num_experts * 3));
     prepared_weights.reserve(static_cast<size_t>(num_experts * 3));
 
-    auto add_prepared_desc = [&](int rows, int cols, int seed, const char *role, int expected_codebook)
+    auto add_prepared_desc = [&](int rows, int cols, int seed, const char *role, const CUDAMoEFormatCase &format)
     {
-        std::unique_ptr<llaminar2::TensorBase> weight;
-        if (expected_codebook == 13)
-        {
-            weight = llaminar2::test::TestTensorFactory::createIQ2_SRandom(
-                {static_cast<size_t>(rows), static_cast<size_t>(cols)},
-                static_cast<unsigned>(seed));
-        }
-        else
-        {
-            weight = llaminar2::test::TestTensorFactory::createIQ4_NLRandom(
-                {static_cast<size_t>(rows), static_cast<size_t>(cols)},
-                static_cast<unsigned>(seed));
-        }
+        auto weight = format.create(
+            {static_cast<size_t>(rows), static_cast<size_t>(cols)},
+            static_cast<unsigned>(seed));
         auto *weight_ptr = weight.get();
         owned_weights.push_back(std::move(weight));
         prepared_weights.push_back(llaminar2::test::makeGpuPreparedGemm(
@@ -22088,7 +22122,7 @@ TEST_F(Test__CUDAMoEKernel, RuntimeGroupedDecodeSwiGLUPublicationReplay)
             << "failed to export native descriptor for " << role;
         EXPECT_EQ(desc.n, rows);
         EXPECT_EQ(desc.k, cols);
-        EXPECT_EQ(desc.codebook_id, expected_codebook);
+        EXPECT_EQ(desc.codebook_id, format.codebook_id);
         return desc;
     };
 
@@ -22100,9 +22134,9 @@ TEST_F(Test__CUDAMoEKernel, RuntimeGroupedDecodeSwiGLUPublicationReplay)
     down_descs.reserve(num_experts);
     for (int expert = 0; expert < num_experts; ++expert)
     {
-        gate_descs.push_back(add_prepared_desc(intermediate, d_model, 5100 + expert, "gate", 13));
-        up_descs.push_back(add_prepared_desc(intermediate, d_model, 5200 + expert, "up", 13));
-        down_descs.push_back(add_prepared_desc(d_model, intermediate, 5300 + expert, "down", 4));
+        gate_descs.push_back(add_prepared_desc(intermediate, d_model, 5100 + expert, "gate", *gate_format));
+        up_descs.push_back(add_prepared_desc(intermediate, d_model, 5200 + expert, "up", *gate_format));
+        down_descs.push_back(add_prepared_desc(d_model, intermediate, 5300 + expert, "down", *down_format));
     }
 
     const int gateup_table = cuda_kernel_->uploadGroupedExpertGateUpDescriptorTables(
@@ -22155,8 +22189,9 @@ TEST_F(Test__CUDAMoEKernel, RuntimeGroupedDecodeSwiGLUPublicationReplay)
         }
     }
 
-    auto hidden = makeTensor({seq_len, d_model}, hidden_values);
-    auto router = makeTensor({num_experts, d_model}, router_values);
+    const auto hidden_width = static_cast<size_t>(d_model);
+    auto hidden = makeTensor({seq_len, hidden_width}, hidden_values);
+    auto router = makeTensor({num_experts, hidden_width}, router_values);
 
     auto gate0 = makeZeros({intermediate});
     auto gate1 = makeZeros({intermediate});
@@ -22180,9 +22215,9 @@ TEST_F(Test__CUDAMoEKernel, RuntimeGroupedDecodeSwiGLUPublicationReplay)
     std::array<llaminar2::ITensor *, top_k> up_outputs = {
         up0.get(), up1.get(), up2.get(), up3.get(),
         up4.get(), up5.get(), up6.get(), up7.get()};
-    auto two_step_output = makeZeros({d_model});
-    auto fused_output = makeZeros({d_model});
-    auto route_rows = makeZeros({top_k, d_model});
+    auto two_step_output = makeZeros({hidden_width});
+    auto fused_output = makeZeros({hidden_width});
+    auto route_rows = makeZeros({top_k, hidden_width});
     const auto run_fused = [&]() {
         return cuda_kernel_->groupedExpertDecodeFromRuntime(
             runtime_layer, hidden.get(), gateup_table, down_table, top_k,
@@ -22241,6 +22276,8 @@ TEST_F(Test__CUDAMoEKernel, RuntimeGroupedDecodeSwiGLUPublicationReplay)
     ASSERT_EQ(cudaGraphGetNodes(native, nodes.data(), &count), cudaSuccess);
     int fused_publications = 0;
     int direct_down_rows = 0;
+    std::vector<llaminar2::test::cuda_kernel_probe_detail::KernelLaunch> gate_sequence;
+    std::vector<llaminar2::test::cuda_kernel_probe_detail::KernelLaunch> down_sequence;
     for (auto node : nodes)
     {
         cudaGraphNodeType type{};
@@ -22258,13 +22295,18 @@ TEST_F(Test__CUDAMoEKernel, RuntimeGroupedDecodeSwiGLUPublicationReplay)
         if (name.find("grouped_native_quantised_down_decode_publish_k32_kernel") != std::string_view::npos)
         {
             ++direct_down_rows;
+            down_sequence.push_back({node, params});
             EXPECT_EQ(params.gridDim.x, static_cast<unsigned>((d_model + 63) / 64));
             EXPECT_EQ(params.gridDim.y, static_cast<unsigned>(top_k));
             EXPECT_EQ(params.gridDim.z, 1u);
+            EXPECT_EQ(params.blockDim.x, 64u);
         }
+        if (name.find("grouped_native_quantised_gate_up_kpart_decode_kernel") != std::string_view::npos)
+            gate_sequence.insert(gate_sequence.begin(), {node, params});
         if (name.find("grouped_native_quantised_gate_up_kpart_reduce_kernelILb1E") != std::string_view::npos)
         {
             ++fused_publications;
+            gate_sequence.push_back({node, params});
             EXPECT_EQ(params.gridDim.x, static_cast<unsigned>((intermediate + 63) / 64));
             EXPECT_EQ(params.gridDim.y, static_cast<unsigned>(top_k));
             EXPECT_EQ(params.blockDim.x, 64u);
@@ -22288,8 +22330,26 @@ TEST_F(Test__CUDAMoEKernel, RuntimeGroupedDecodeSwiGLUPublicationReplay)
         using namespace llaminar2::test;
         appendCUDAKernelProbeRecords(samples, probeIndependentCUDAKernels(
             native, stream_, CUDAIndependentKernelFixture::StatelessProjection,
-            {.operation = "routed_expert_decode", .format = "IQ2_S+IQ4_NL",
+            {.operation = "routed_expert_decode", .format = std::string(gate_source) + "+" + std::string(down_source),
              .m = 1, .n = d_model, .k = intermediate}));
+        using namespace llaminar2::test::cuda_kernel_probe_detail;
+        const CUDACapturedKernelProbeConfig config;
+        ASSERT_EQ(gate_sequence.size(), 2u);
+        ASSERT_EQ(down_sequence.size(), 1u);
+        const auto measure = [&](std::span<KernelLaunch> stage_nodes, const char *mode,
+                                 int n, int k, std::string_view source_format, int projections)
+        {
+            const auto durations = measureKernelSequence(stage_nodes, stream_, config);
+            const auto *source_info = llaminar2::native_quantised_formats::forQuantType(source_format);
+            if (!source_info)
+                throw std::logic_error("unknown prepared weight source in CUDA projection probe");
+            const auto packed = llaminar2::nativeQuantisedPackedRegionSizes(n, k, *source_info);
+            appendCUDAKernelProbeRecords(samples, {{{"mode", mode}, {"format", source_format}, {"n", n},
+                {"k", k}, {"routes", top_k}, {"nodes", stage_nodes.size()}, {"samples_us", durations},
+                {"logical_weight_request_bytes", packed.logicalBytes() * top_k * projections}}});
+        };
+        measure(gate_sequence, "gate_up_native_graph", intermediate, d_model, gate_source, 2);
+        measure(down_sequence, "down_native_graph", d_model, intermediate, down_source, 1);
     }
 
     expectGroupedDecodeCounter(
@@ -23349,75 +23409,6 @@ void Test__CUDAMoEKernel::proveRuntimeDecodeGraphReplayCompleteDescriptors()
     // handles an assertion or exception before this explicit successful close.
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
     graph.reset();
-
-    if constexpr (num_experts == 2)
-    {
-        using namespace llaminar2;
-        using MatrixDesc = DeviceNativeQuantisedMatrixDesc;
-        CudaAllocation logits(sizeof(float) * num_experts);
-        CudaAllocation live_count(sizeof(std::int32_t));
-        CudaAllocation assignments(sizeof(std::int32_t) * top_k);
-        const MoEDecodeDescriptorPublication publication{
-            .gate = static_cast<MatrixDesc *>(workspace_->getBuffer(MoEWorkspaceBuffers::CUDA_RUNTIME_PREFILL_GATE_DESC_TABLE)),
-            .up = static_cast<MatrixDesc *>(workspace_->getBuffer(MoEWorkspaceBuffers::CUDA_RUNTIME_PREFILL_UP_DESC_TABLE)),
-            .down = static_cast<MatrixDesc *>(workspace_->getBuffer(MoEWorkspaceBuffers::CUDA_RUNTIME_PREFILL_DOWN_DESC_TABLE)),
-            .expert_count = num_experts,
-            .projections = DeviceMoEProjectionSet::CompleteExpert};
-        ASSERT_TRUE(publication.valid());
-
-        /** @brief Bind the recorded logits to the production paired publisher. */
-        const auto record = [&] {
-            return cudaMoE_softmax_topk_decode_selected_descriptors(
-                static_cast<float *>(logits.get()), device_runtime, nullptr, nullptr,
-                num_experts, top_k, true, false, false,
-                RoutedExpertRowExecutionPolicy::ParticipantAssigned, publication,
-                device.ordinal, stream_, static_cast<const std::int32_t *>(live_count.get()));
-        };
-        ScopedCudaTestGraph paired_graph(stream_, "selected router descriptor replay");
-        ASSERT_TRUE(record());
-        ASSERT_TRUE(paired_graph.finishAndInstantiate());
-        const auto native_graph = paired_graph.nativeGraphForInspection();
-        std::size_t nodes = 0;
-        ASSERT_EQ(cudaGraphGetNodes(native_graph, nullptr, &nodes), cudaSuccess);
-        EXPECT_EQ(nodes, 1u);
-
-        const std::array<MatrixDesc *, 3> outputs{publication.gate, publication.up, publication.down};
-        // Replay the old, empty and replaced source histories in one graph.
-        const std::array<std::int32_t, 4> live_history{1, 0, 1, 1};
-        for (std::size_t replay = 0; replay < live_history.size(); ++replay)
-        {
-            const std::int32_t live = live_history[replay];
-            const std::array<float, num_experts> input_logits{-10.0f, 10.0f};
-            replay_runtime = replay < 2 ? runtime_stale : runtime_fresh;
-            replay_runtime.route_participant_ids = static_cast<std::int32_t *>(assignments.get());
-            replay_runtime.prefill_route_capacity = top_k;
-            ASSERT_EQ(cudaMemcpyAsync(device_runtime, &replay_runtime, sizeof(replay_runtime),
-                cudaMemcpyHostToDevice, stream_), cudaSuccess);
-            ASSERT_EQ(cudaMemcpyAsync(logits.get(), input_logits.data(), sizeof(input_logits),
-                cudaMemcpyHostToDevice, stream_), cudaSuccess);
-            ASSERT_EQ(cudaMemcpyAsync(live_count.get(), &live, sizeof(live),
-                cudaMemcpyHostToDevice, stream_), cudaSuccess);
-            for (auto *output : outputs)
-                ASSERT_EQ(cudaMemsetAsync(output, 0, num_experts * sizeof(MatrixDesc), stream_), cudaSuccess);
-            ASSERT_TRUE(paired_graph.launch());
-
-            std::array<std::array<MatrixDesc, num_experts>, 3> actual{};
-            for (std::size_t role = 0; role < outputs.size(); ++role)
-                ASSERT_EQ(cudaMemcpyAsync(actual[role].data(), outputs[role], sizeof(actual[role]),
-                    cudaMemcpyDeviceToHost, stream_), cudaSuccess);
-            ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
-            const auto &expert = replay_runtime.banks[0].experts[1];
-            const std::array<MatrixDesc, 3> expected{expert.gate, expert.up, expert.down};
-            for (std::size_t role = 0; role < outputs.size(); ++role)
-            {
-                EXPECT_EQ(actual[role][0].payload, nullptr);
-                if (live)
-                    EXPECT_EQ(std::memcmp(&actual[role][1], &expected[role], sizeof(MatrixDesc)), 0);
-                else
-                    EXPECT_EQ(actual[role][1].payload, nullptr);
-            }
-        }
-    }
 #endif
 }
 

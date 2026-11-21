@@ -76,6 +76,26 @@ was 167 GB/s, or 7.0–7.1% of the warm L2 reference. The earlier split-K
 projection and reducer took 2.752 and 1.600 µs in separate graphs.
 Activation and output traffic are outside the requested-weight calculation.
 
+Set `LLAMINAR_TEST_CUDA_MOE_M1_SOURCE=main`, `main_q5`, or `drafter` to
+measure the QFN geometry with hidden width 2560, local intermediate width
+320, and eight selected local routes. These cases prepare Q4_K and Q5_1,
+Q5_K and Q8_0, or Q8_0 and Q8_0 for Gate/Up and Down respectively. The probe
+records the dependent projection and publication nodes in the same timed
+sequence, with each source and its requested byte count in the JSONL.
+
+| M1 Down source and case | Split-K stage | Direct stage | Direct requested weight |
+| --- | ---: | ---: | ---: |
+| Q5_1 main | 8.704 µs | 5.440 µs | 904 GB/s |
+| Q8_0 main | 12.736 µs | 8.384 µs | 831 GB/s |
+| Q8_0 drafter | 13.056 µs | 8.192 µs | 850 GB/s |
+
+Both RTX 3090s returned the same median across 62 samples per arm and card.
+The Q5_1 Down weight footprint fits in 6 MiB L2 and reached 38.0–38.5%
+of the warm L2 reference. The drafter's Q8_0 Down footprint is larger than
+L2 and its requested-weight rate equals 96.6% of the streaming reference.
+Physical DRAM and L2 traffic for these dispatched kernels require hardware
+counters. The captured output matched the staged arithmetic at each shape.
+
 The four-row verifier regression can also time the captured Down publication
 for each available source codebook. Its JSONL records include the physical
 codebook identity and logical weight requests across the sixteen live routes.

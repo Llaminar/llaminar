@@ -2588,7 +2588,6 @@ namespace llaminar2
 
     void CUDAMoEKernel::clearWorkspaceScratchBindings() noexcept
     {
-        paired_router_descriptors_.reset();
         if(original_m1_hidden_q8_read_)
             original_m1_hidden_q8_read_lifecycle_=OriginalM1HiddenQ8ReadLifecycle::Invalidated;
         original_m1_hidden_q8_read_.reset();
@@ -5445,12 +5444,6 @@ namespace llaminar2
         const DeviceId device = deviceId();
         if (!runtime_layer || !hidden || !gate_weights)
             return false;
-        if (paired_router_descriptors_)
-        {
-            requirePairedRouterDescriptors(runtime_layer, num_experts, top_k);
-            if (row_execution_policy != RoutedExpertRowExecutionPolicy::IntermediateShardLocal)
-                throw std::logic_error("Paired CUDA descriptor router changed its original fragment policy");
-        }
         if (!requireTensorOnDevice(hidden, device, stream, "hidden") ||
             !requireTensorOnDevice(gate_weights, device, stream, "gate_weights"))
             return false;
@@ -5548,13 +5541,7 @@ namespace llaminar2
             row_execution_policy == RoutedExpertRowExecutionPolicy::ParticipantAssigned &&
             prepared_decode_resident_set_policy_ ==
             RoutedExpertResidentSetPolicy::UniqueOwner;
-        const bool route_ready = paired_router_descriptors_
-            ? cudaMoE_softmax_topk_decode_selected_descriptors(
-                d_route_logits_, runtime_layer, legacy_indices, legacy_weights,
-                num_experts, top_k, normalize_weights, write_legacy_outputs,
-                update_runtime_histogram, row_execution_policy, paired_router_descriptors_->outputs,
-                device_ordinal_, stream, active_row_count_device)
-            : unique_owner_route
+        const bool route_ready = unique_owner_route
                                      ? cudaMoE_softmax_topk_decode_unique_owner_runtime(
                                            d_route_logits_,
                                            runtime_layer,
@@ -5596,10 +5583,6 @@ namespace llaminar2
                                            active_row_count_device);
         if (!route_ready)
             return false;
-        if (paired_router_descriptors_)
-            PerfStatsCollector::addCounter("moe", "router_selected_descriptors_enqueued", 1.0,
-                "graph_capture", device.to_string(), {{"descriptor_source", "original_intermediate_shard"}});
-
         if (write_legacy_outputs)
         {
             markDeviceWritten(output_indices, device, stream);
@@ -11202,62 +11185,6 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
             canonical_route_contributions);
     }
 
-    const CUDAMoEKernel::PairedRouterDescriptors &CUDAMoEKernel::requirePairedRouterDescriptors(
-        DeviceMoELayerRuntime *runtime, int num_experts, int top_k) const
-    {
-        if (!paired_router_descriptors_ || !workspace_ ||
-            !workspace_->isAllocated())
-            throw std::logic_error("Missing prepared CUDA router descriptor outputs");
-        const auto &selected = *paired_router_descriptors_;
-        if (runtime != selected.runtime || workspace_ != selected.workspace ||
-            workspace_->id() != selected.workspace_id || getStream() != selected.stream ||
-            num_experts != selected.outputs.expert_count || top_k != selected.top_k)
-            throw std::logic_error("CUDA router descriptor publication changed stream, runtime or geometry");
-        return selected;
-    }
-
-    MoEDecodeDescriptorPublisher CUDAMoEKernel::preparePairedRouterDecodeDescriptors(
-        DeviceMoELayerRuntime *runtime, int gateup_id, int down_id, int top_k)
-    {
-        void *stream = requireStream("CUDAMoEKernel::preparePairedRouterDecodeDescriptors");
-        if (isCudaMoEDecodeCaptureActive(stream) || !workspace_ || !runtime ||
-            gateup_id < 0 || down_id < 0 || top_k <= 0 || top_k > int(kDeviceMoEMaxTopK) ||
-            gateup_id >= int(grouped_gateup_desc_tables_.size()) || down_id >= int(grouped_down_desc_tables_.size()))
-            throw std::logic_error("CUDA router descriptor publication requires its cold original graph bindings");
-        const auto &gate = grouped_gateup_desc_tables_[gateup_id];
-        const auto &down = grouped_down_desc_tables_[down_id];
-        if (!gate.valid || !gate.deviceReady() || !down.valid || !down.deviceReady() ||
-            gate.descriptor_source != MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable ||
-            down.descriptor_source != gate.descriptor_source || gate.weight_format != down.weight_format ||
-            gate.num_experts != down.num_experts || gate.d_model != down.d_model ||
-            gate.intermediate != down.intermediate || top_k > gate.num_experts ||
-            !gate.original_family.sameIdentity(down.original_family))
-            throw std::logic_error("CUDA router descriptor publication requires one original fragment family");
-        if (paired_router_descriptors_)
-        {
-            const auto &selected = requirePairedRouterDescriptors(runtime, gate.num_experts, top_k);
-            if (selected.gateup_table != gateup_id || selected.down_table != down_id)
-                throw std::logic_error("CUDA router descriptor publication changed original table handles");
-            return MoEDecodeDescriptorPublisher::Router;
-        }
-        MoEDecodeDescriptorPublication outputs{
-            .expert_count = gate.num_experts,
-            .format = gate.weight_format,
-            .projections = DeviceMoEProjectionSet::IntermediateShard};
-        if (!bindGroupedDescriptorTableSlot(MoEWorkspaceBuffers::CUDA_RUNTIME_PREFILL_GATE_DESC_TABLE,
-                gate.workspace_slot, gate.num_experts, &outputs.gate, "router gate descriptors") ||
-            !bindGroupedDescriptorTableSlot(MoEWorkspaceBuffers::CUDA_RUNTIME_PREFILL_UP_DESC_TABLE,
-                gate.workspace_slot, gate.num_experts, &outputs.up, "router up descriptors") ||
-            !bindGroupedDescriptorTableSlot(MoEWorkspaceBuffers::CUDA_RUNTIME_PREFILL_DOWN_DESC_TABLE,
-                down.workspace_slot, down.num_experts, &outputs.down, "router down descriptors") ||
-            !outputs.valid())
-            throw std::logic_error("CUDA router descriptor publication lost its admitted arena outputs");
-
-        paired_router_descriptors_ = PairedRouterDescriptors{
-            runtime, workspace_, workspace_->id(), stream, gateup_id, down_id, top_k, outputs};
-        return MoEDecodeDescriptorPublisher::Router;
-    }
-
     bool CUDAMoEKernel::prepareGroupedRuntimeDecodeLaunchState(
         int gateup_table_id,
         int down_table_id,
@@ -11740,20 +11667,7 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
                           "failed to bind graph-owned runtime descriptor slots");
                 return false;
             }
-            // Only the original paired router can replace descriptor setup.
-            // Explicit route packets retain their independent publisher.
-            if (paired_router_descriptors_ && allow_router_q8_reuse)
-            {
-                const auto &selected = requirePairedRouterDescriptors(runtime_layer, gateup_table.num_experts, top_k);
-                if (descriptor_source != MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable ||
-                    selected.gateup_table != gateup_table_id || selected.down_table != down_table_id ||
-                    selected.outputs.gate != runtime_gate_descs || selected.outputs.up != runtime_up_descs ||
-                    selected.outputs.down != runtime_down_descs || selected.outputs.format != gateup_table.weight_format ||
-                    d_expert_ids != runtimeTopKExpertIdsDevice(runtime_layer) ||
-                    d_weights != runtimeTopKWeightsDevice(runtime_layer))
-                    throw std::logic_error("CUDA projections changed the paired router descriptor publication");
-            }
-            else if (!cudaMoE_materialize_runtime_selected_decode_descriptors(
+            if (!cudaMoE_materialize_runtime_selected_decode_descriptors(
                 runtime_layer, d_expert_ids, runtime_gate_descs, runtime_up_descs,
                 runtime_down_descs, gateup_table.num_experts, top_k,
                 gateup_table.weight_format, device_ordinal_, stream,
