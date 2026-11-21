@@ -1247,11 +1247,9 @@ ctest --test-dir build_v2_integration \
   -R '^V2_Integration_StageDumpIntegrity$' --output-on-failure
 ```
 
-The registered pre-commit hook builds only `v2_unit_gate` and
-`v2_production_test_preflight_gate`, then runs the full Unit namespace and
-`ProductionTestPreflight` label on every branch. It runs no model campaigns,
-E2E, broader integration selections, or benchmarks. Register the tracked hooks
-with `git config --local core.hooksPath .githooks`; see `.githooks/README.md`.
+The registered pre-commit hook builds `v2_unit_gate` and runs the complete
+Unit namespace on every branch. Register the tracked hooks with
+`git config --local core.hooksPath .githooks`. See [the hook guide](.githooks/README.md).
 The [branch and release workflow](#branch-and-release-workflow) owns the CI
 sequence: Unit/host checks plus AVX2 hardware-qualified production preflight on feature PRs,
 build-only develop publication, then

@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
 """Exercise the real pre-commit script using device-free command recorders.
 
-The hook runs exactly two CTest suites or authenticates their explicitly
-selected prior receipt. It builds only their canonical targets, resolves the
-workspace Ninja, and stops at the first failed phase. Explicit receipt reuse
-lets the canonical validator own its build without a forced reconfigure that
-would invalidate unchanged timestamp-bound evidence. Temporary
-repositories and executable shims keep these tests out of real builds, model
-loading, Git registration, and accelerator execution.
+The hook builds the canonical Unit target, runs the complete Unit namespace,
+and stops at the first failed phase. Temporary repositories and executable
+shims exercise build selection and dependency Git identity without real builds,
+model loading, or accelerator execution.
 """
 
 from __future__ import annotations
@@ -43,10 +40,8 @@ if name == "git" and args == ["rev-parse", "--abbrev-ref", "HEAD"]:
     sys.exit(0)
 if name == "cmake":
     phase = "build" if "--build" in args else "configure"
-elif name == "ctest":
-    phase = "unit" if "-R" in args else "preflight"
-elif name == "python3":
-    phase = "reuse"
+elif name == "ctest" and args[-2:] == ["-R", "^V2_Unit_"]:
+    phase = "unit"
 else:
     sys.exit(99)
 sys.exit(17 if os.environ.get("HOOK_TEST_FAIL") == phase else 0)
@@ -116,7 +111,6 @@ sys.exit(0 if origin == 'https://example.invalid/dependency.git' else 23)
         cmake.chmod(0o755)
         environment["PATH"] = str(tools) + os.pathsep + environment["PATH"]
         environment.pop("LLAMINAR_PRECOMMIT_BUILD_DIR", None)
-        environment.pop("LLAMINAR_PRECOMMIT_PREREQUISITES", None)
         result = subprocess.run(
             ["git", "hook", "run", "pre-commit"], cwd=root, env=environment,
             capture_output=True, text=True)
@@ -131,7 +125,7 @@ sys.exit(0 if origin == 'https://example.invalid/dependency.git' else 23)
 class PreCommitHookTests(unittest.TestCase):
     """Prove selection, ordering, quoting, and fail-fast behavior end to end."""
 
-    def run_hook(self, *, fail: str = "", branch: str = "feature/example", reuse: bool = False):
+    def run_hook(self, *, fail: str = "", branch: str = "feature/example", selected_build: bool = False):
         """Run the checked-in shell script in an isolated path containing spaces."""
         with tempfile.TemporaryDirectory(prefix="llaminar-hook-") as directory:
             root = Path(directory) / "repository with spaces"
@@ -146,17 +140,16 @@ class PreCommitHookTests(unittest.TestCase):
             record = root / "commands.jsonl"
             env = dict(os.environ)
             env.pop("LLAMINAR_PRECOMMIT_BUILD_DIR", None)
-            env.pop("LLAMINAR_PRECOMMIT_PREREQUISITES", None)
-            if reuse:
+            if selected_build:
                 env["LLAMINAR_PRECOMMIT_BUILD_DIR"] = str(root / "selected integration build")
-                env["LLAMINAR_PRECOMMIT_PREREQUISITES"] = str(root / "evidence directory/prerequisites.json")
             env.update({
                 "PATH": str(tools) + os.pathsep + env["PATH"],
                 "HOOK_TEST_ROOT": str(root),
                 "HOOK_TEST_RECORD": str(record),
                 "HOOK_TEST_BRANCH": branch,
                 "HOOK_TEST_FAIL": fail,
-                # Retired knobs must not enable another gate by accident.
+                # Previous hook settings must not select additional work.
+                "LLAMINAR_PRECOMMIT_PREREQUISITES": str(root / "prior prerequisites.json"),
                 "LLAMINAR_PRECOMMIT_E2E_CONTAINER": "1",
                 "LLAMINAR_PRECOMMIT_E2E_CONTAINER_BUILD": "1",
             })
@@ -167,14 +160,14 @@ class PreCommitHookTests(unittest.TestCase):
             calls = [json.loads(line) for line in record.read_text().splitlines()]
             return result, calls, root, tools
 
-    def test_exact_two_gates_on_every_branch(self):
-        """Branch names and retired E2E knobs cannot widen the hook's scope."""
+    def test_complete_unit_gate_on_every_branch(self):
+        """Every branch builds and runs exactly the complete Unit gate."""
         for branch in ("feature/example", "develop", "master", "main"):
             with self.subTest(branch=branch):
                 result, calls, root, tools = self.run_hook(branch=branch)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual([c["tool"] for c in calls],
-                                 ["git", "git", "cmake", "cmake", "ctest", "ctest"])
+                                 ["git", "git", "cmake", "cmake", "ctest"])
                 build = str(root / "build_v2_integration")
                 self.assertEqual(calls[2]["args"], [
                     "-B", build, "-S", str(root / "src/v2"), "-G", "Ninja",
@@ -185,12 +178,11 @@ class PreCommitHookTests(unittest.TestCase):
                 ])
                 self.assertEqual(calls[3]["args"], [
                     "--build", build, "--parallel", "--target",
-                    "v2_unit_gate", "v2_production_test_preflight_gate",
+                    "v2_unit_gate",
                 ])
                 common = ["--test-dir", build, "--output-on-failure",
                           "--parallel", "--no-tests=error"]
                 self.assertEqual(calls[4]["args"], common + ["-R", "^V2_Unit_"])
-                self.assertEqual(calls[5]["args"], common + ["-L", "^ProductionTestPreflight$"])
                 for call in calls[2:]:
                     self.assertEqual(call["cwd"], str(root))
 
@@ -202,31 +194,25 @@ class PreCommitHookTests(unittest.TestCase):
         self.assertEqual(configure.count("-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"), 1)
 
     def test_each_failure_blocks_later_phases(self):
-        """Configure/build/Unit/preflight failures all propagate to Git."""
-        for phase, count in (("configure", 3), ("build", 4), ("unit", 5), ("preflight", 6)):
+        """Configure, build, and Unit failures all propagate to Git."""
+        for phase, count in (("configure", 3), ("build", 4), ("unit", 5)):
             with self.subTest(phase=phase):
                 result, calls, _, _ = self.run_hook(fail=phase)
                 self.assertEqual(result.returncode, 17, result.stdout + result.stderr)
                 self.assertEqual(len(calls), count)
-                self.assertNotIn("Unit and ProductionTestPreflight passed.", result.stdout)
+                self.assertNotIn("Unit suite passed.", result.stdout)
 
-    def test_selected_build_reuses_only_authenticated_complete_evidence(self):
-        """The validator owns reuse without an inventory-invalidating reconfigure."""
-        result, calls, root, _ = self.run_hook(reuse=True)
+    def test_selected_build_runs_complete_unit_gate(self):
+        """Configuration, Unit build and CTest agree on the selected build."""
+        result, calls, root, _ = self.run_hook(selected_build=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual([c["tool"] for c in calls], ["git", "git", "python3"])
         build = str(root / "selected integration build")
-        self.assertEqual(calls[2]["args"], [str(root / "scripts/ci/run_production_prerequisites.py"),
-            "--build-dir", build, "--reuse-report", str(root / "evidence directory/prerequisites.json")])
-        self.assertEqual(calls[2]["cwd"], str(root))
-
-    def test_rejected_receipt_blocks_commit_without_another_test_path(self):
-        """A stale or invalid explicit receipt cannot succeed or start an alternate gate."""
-        result, calls, _, _ = self.run_hook(reuse=True, fail="reuse")
-        self.assertEqual(result.returncode, 17)
-        self.assertEqual([c["tool"] for c in calls], ["git", "git", "python3"])
-        self.assertNotIn("Unit and ProductionTestPreflight passed.", result.stdout)
-
+        self.assertEqual([c["tool"] for c in calls], ["git", "git", "cmake", "cmake", "ctest"])
+        self.assertEqual(calls[2]["args"][:2], ["-B", build])
+        self.assertEqual(calls[3]["args"], ["--build", build, "--parallel", "--target", "v2_unit_gate"])
+        self.assertEqual(calls[4]["args"], [
+            "--test-dir", build, "--output-on-failure", "--parallel", "--no-tests=error", "-R", "^V2_Unit_",
+        ])
 
     def test_real_git_hook_keeps_foreign_repository_identity(self):
         """A linked-worktree hook must not redirect CMake's dependency Git calls."""

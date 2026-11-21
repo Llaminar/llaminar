@@ -6370,13 +6370,11 @@ set_tests_properties(V2_Unit_ProductionPrerequisiteReuse PROPERTIES
     LABELS "V2;Unit;Hooks;Build;Regression"
     TIMEOUT 30
 )
-# Alternate build locations and explicit receipt reuse retain the complete
-# prerequisite contract. Stale evidence must stop the commit after rebuilding.
+# The selected build directory owns both the Unit executable and test inventory.
 add_test(NAME V2_Integration_PreCommitSelectedBuild
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_precommit_hook.py
-            PreCommitHookTests.test_selected_build_reuses_only_authenticated_complete_evidence
-            PreCommitHookTests.test_rejected_receipt_blocks_commit_without_another_test_path
+            PreCommitHookTests.test_selected_build_runs_complete_unit_gate
 )
 set_tests_properties(V2_Integration_PreCommitSelectedBuild PROPERTIES
     LABELS "V2;Integration;ProductionTestPreflight;Hooks;Build;Regression;DeviceFree"

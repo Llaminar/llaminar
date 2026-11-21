@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Llaminar pre-commit gate: complete Unit and model-free production preflight.
-# CMake owns both executable inventories; CTest owns test selection, resource
-# locks, and timeouts. No model campaign, E2E server, or benchmark runs here.
+# @file pre-commit
+# @brief Build and run Llaminar's complete Unit gate before a commit.
+# CMake owns the executable inventory. CTest owns test selection, resource
+# locks, and timeouts.
 # Register with: git config --local core.hooksPath .githooks
 # An explicit `git commit --no-verify` bypasses this hook.
 set -euo pipefail
@@ -17,19 +18,6 @@ while IFS= read -r LLAMINAR_HOOK_GIT_VARIABLE; do
 done <<< "$LLAMINAR_HOOK_GIT_ENV"
 BUILD_DIR="${LLAMINAR_PRECOMMIT_BUILD_DIR:-$REPO_ROOT/build_v2_integration}"
 
-if [[ -n "${LLAMINAR_PRECOMMIT_PREREQUISITES:-}" ]]; then
-    echo '[pre-commit] Authenticating completed Unit and preflight evidence...'
-    # The canonical reuse entrypoint builds both prerequisite targets and
-    # rejects changed source, build identity or test inventory. Do not force a
-    # configure first: CMake rewrites timestamp-bound inventory files even for
-    # unchanged inputs, invalidating the very evidence selected by the caller.
-    # A stale receipt fails here; it never selects a different gate implicitly.
-    python3 "$REPO_ROOT/scripts/ci/run_production_prerequisites.py" \
-        --build-dir "$BUILD_DIR" --reuse-report "$LLAMINAR_PRECOMMIT_PREREQUISITES"
-    echo '[pre-commit] Unit and ProductionTestPreflight passed.'
-    exit 0
-fi
-
 LLAMINAR_NINJA_BIN="$(command -v ninja)"
 
 echo '[pre-commit] Configuring the Integration build...'
@@ -43,16 +31,11 @@ cmake -B "$BUILD_DIR" -S "$REPO_ROOT/src/v2" -G Ninja \
     -DCMAKE_MAKE_PROGRAM:FILEPATH="$LLAMINAR_NINJA_BIN" \
     -DLLAMINAR_BUILD_TESTS=ON -DHAVE_CUDA=ON -DHAVE_ROCM=ON
 
-echo '[pre-commit] Building only Unit and production-preflight dependencies...'
-cmake --build "$BUILD_DIR" --parallel \
-    --target v2_unit_gate v2_production_test_preflight_gate
+echo '[pre-commit] Building Unit dependencies...'
+cmake --build "$BUILD_DIR" --parallel --target v2_unit_gate
 
-echo '[pre-commit] [1/2] Running the full Unit suite...'
+echo '[pre-commit] Running the full Unit suite...'
 ctest --test-dir "$BUILD_DIR" --output-on-failure --parallel \
     --no-tests=error -R '^V2_Unit_'
 
-echo '[pre-commit] [2/2] Running the full ProductionTestPreflight suite...'
-ctest --test-dir "$BUILD_DIR" --output-on-failure --parallel \
-    --no-tests=error -L '^ProductionTestPreflight$'
-
-echo '[pre-commit] Unit and ProductionTestPreflight passed.'
+echo '[pre-commit] Unit suite passed.'

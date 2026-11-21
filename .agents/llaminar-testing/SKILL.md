@@ -533,18 +533,11 @@ ctest --test-dir build_v2_integration \
   -L '^ProductionTestPreflight$'
 ```
 
-Git pre-commit requires these two complete model-free suites on every branch.
-`LLAMINAR_PRECOMMIT_BUILD_DIR` selects an existing Integration tree.
-`LLAMINAR_PRECOMMIT_PREREQUISITES` explicitly reuses a passed canonical receipt
-only after the hook rebuilds and authenticates the unchanged complete inventory;
-source metadata also rejects later interpreted-test/policy edits. Stale or
-mismatched evidence is fatal. No raw gate-skip mode is provided.
-The hook builds their CMake-owned dependency targets and does not launch
-numerical campaigns, E2E, containers, Release builds, or benchmarks. Register
-the tracked hooks with `git config --local core.hooksPath .githooks`; see
-`.githooks/README.md`. Passing pre-commit is prerequisite evidence, not a
-numerical, HTTP, or performance certificate. Keep heavier manual/CI gates
-separate unless the user explicitly changes that policy.
+Git pre-commit builds `v2_unit_gate` and runs the complete Unit namespace on
+every branch. `LLAMINAR_PRECOMMIT_BUILD_DIR` selects an existing Integration
+tree. Register the tracked hooks with `git config --local core.hooksPath .githooks`.
+See [the hook guide](../../.githooks/README.md). Production preflight and its
+receipt validator remain part of the explicit qualification and CI workflows.
 
 For development, run the narrow affected backend or precision first. These are
 diagnostic subsets, not the final economy proof.
