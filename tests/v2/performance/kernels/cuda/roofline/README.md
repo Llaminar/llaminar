@@ -104,7 +104,8 @@ retains its separate ordered FP32 accumulator.
 
 The four-row verifier regression can also time the captured Down publication
 for each available source codebook. Its JSONL records include the physical
-codebook identity and logical weight requests across the sixteen live routes.
+codebook identity, logical weight requests and the number of adjacent
+same-expert pairs after sorting the actual routes by expert.
 
 ```sh
 LLAMINAR_TEST_CUDA_MOE_VERIFIER_DOWN_PROBE_JSONL="$PWD/moe-verifier-down.jsonl" \
@@ -119,8 +120,31 @@ Q5_1 and Q8_0 cases measured 356 GB/s and 544–553 GB/s respectively.
 Every measured Down kernel reported zero local bytes and matched the
 ordered serial output after retained replay.
 
+Set `LLAMINAR_TEST_CUDA_MOE_M4_DOWN_GEOMETRY=qfn` for N=2560, K=320,
+Q5_1 and Q8_0 Down with 32 local routes. Production preflight checks this
+geometry in `V2_Integration_CUDA_MoEVerifierQFNWidthPublicationReplay`.
+The same probe accepts `iq4` for N=2560, K=256 and both IQ4 source formats.
+
+On the QFN geometry, grouping adjacent same-expert routes to share one
+weight decode cut logical requests by 28.1%. Median Down latency rose from
+14.784 to 17.536 µs for Q5_1 and from 19.200 to 20.224–20.288 µs for Q8_0.
+Assigning two lanes to each output column raised the medians to
+26.112–26.176 and 27.008 µs respectively. Two-packet unrolling improved both
+IQ4 source formats at N=512 but slowed them at N=2560. All three alternatives
+passed retained byte comparisons on both RTX 3090 cards.
+
 For the measured SM86 Down formats, loading the activation in two 16-byte
 vectors saves 5–22% at M=4. The Q5_1 case drops from 4.864 to 4.416 µs and
 Q6_K drops from 7.552–7.616 to 5.888–5.952 µs. The QFN M1 Q5_1 case drops
 from 5.440 to 5.312 µs. The vector loads preserve the original K32 packet
 order in both paths.
+
+On SM86, the Q5_1 Down path also uses DP4A against packed signed ones to
+compute the asymmetric activation correction. The two exact integer half-dots
+and sums are joined before applying the original FP32 scale and accumulation
+order. For QFN M1, this lowers Down to 4.928 µs. At M=4 it lowers Down from
+4.416 to 4.032 µs at N=512 and from 14.784 to 14.656 µs at N=2560.
+The compiled M4 loop shrinks from 147 to 104 instructions and uses 37
+registers per thread with zero local bytes. The M1 kernel uses 40 registers
+and zero local bytes. The model-free preflight runs the captured QFN M1
+case in `V2_Integration_CUDA_MoEDecodeQFNWidthPublicationReplay`.

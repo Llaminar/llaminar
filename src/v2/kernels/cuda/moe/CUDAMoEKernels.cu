@@ -8,6 +8,8 @@
  * projection. Launch wrappers are C ABI functions consumed by CUDAMoEKernel.
  * Quantized gate/up borrows original token rows through the grouping map; it
  * never expands identical hidden activations into one copy per expert route.
+ * Narrow SM86 Q5_1 Down publishes exact K32 contributions using independent
+ * packed integer dots for the two halves and for the activation correction.
  * IQ4_XS physical format 24 preserves the original half base and raw six-bit
  * coefficient in separate 16-bit planes. Its LUT payload and source4 reduction
  * schedule are unchanged; the coefficient is storage metadata, never a minimum.
@@ -18776,6 +18778,8 @@ __global__ void softmax_topk_decode_descriptors_kernel(
      * delegates publication to the shared CUDA/cross-backend contract.
      *
      * @tparam CodebookId Canonical NativeQuantised source-policy identifier.
+     * @tparam OrderedK32 Direct Down publication uses one rounded contribution
+     *         per K32 partition in both decode and verification.
      * @param a_vals Eight packed activation groups for one 32-value K block.
      * @param packed_groups Eight decoded signed-weight groups.
      * @param payload Prepared codebook payload for IQ1_M sign extraction.
@@ -18789,7 +18793,7 @@ __global__ void softmax_topk_decode_descriptors_kernel(
      * @pre The caller has admitted the descriptor and all of its required
      *      coefficient planes before entering the K32 traversal.
      */
-    template <uint8_t CodebookId>
+    template <uint8_t CodebookId, bool OrderedK32 = false>
     __device__ __forceinline__ float moe_native_quantised_block_contribution_rn(
         const int32_t *__restrict__ a_vals,
         const int32_t *__restrict__ packed_groups,
@@ -18803,6 +18807,34 @@ __global__ void softmax_topk_decode_descriptors_kernel(
     {
         using Traits = llaminar2::cuda_native_quantised::CodebookTraits<CodebookId>;
 
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 860
+        if constexpr (OrderedK32 && CodebookId == native_formats::Q5_1.codebook_id)
+        {
+            constexpr int32_t kSignedByteOnes = 0x01010101;
+            int dot_lo = 0;
+            int dot_hi = 0;
+            int sum_lo = 0;
+            int sum_hi = 0;
+#pragma unroll
+            for (int group = 0; group < 4; ++group)
+            {
+                const int32_t lo = a_vals[group];
+                const int32_t hi = a_vals[group + 4];
+                dot_lo = __dp4a(lo, packed_groups[group], dot_lo);
+                dot_hi = __dp4a(hi, packed_groups[group + 4], dot_hi);
+                sum_lo = __dp4a(lo, kSignedByteOnes, sum_lo);
+                sum_hi = __dp4a(hi, kSignedByteOnes, sum_hi);
+            }
+
+            // Each half fits in int32. Join the exact integer terms before
+            // applying the original asymmetric scale and rounding contract.
+            return llaminar2::cuda_native_quantised::
+                native_quantised_block_contribution_from_reduced_terms_rn<CodebookId>(
+                    dot_lo + dot_hi, 0, scale_a, scale_base[linear],
+                    min_base[linear], 0u, sum_lo + sum_hi, 0, 0, 0u, 0, 0, 0, 0);
+        }
+        else
+#endif
         // IQ4 pairs share exact LUT integers, but retain independent factors.
         if constexpr (Traits::is_iq4_lut)
         {
@@ -19609,7 +19641,7 @@ __global__ void softmax_topk_decode_descriptors_kernel(
 
             const float scale_a = scales_A_blockwise[block_idx];
             const float contribution =
-                moe_native_quantised_block_contribution_rn<CodebookId>(
+                moe_native_quantised_block_contribution_rn<CodebookId, OrderedK32>(
                     a4,
                     packed_groups,
                     payload,

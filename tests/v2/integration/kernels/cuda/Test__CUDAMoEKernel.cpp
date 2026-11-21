@@ -23902,10 +23902,16 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
     cuda_moe_config.cuda_moe_router_q8 = true;
     cuda_moe_config.cuda_moe_reuse_router_q8_hidden = true;
 
-    constexpr int top_k = 4;
-    constexpr int num_experts = 8;
-    constexpr int d_model = 512;
-    constexpr int intermediate = 256;
+    // The default inventory sweeps every source format and supported verifier
+    // depth. The two wider probe shapes isolate part of that matrix at M=4.
+    const char *requested_geometry = std::getenv("LLAMINAR_TEST_CUDA_MOE_M4_DOWN_GEOMETRY");
+    const std::string_view geometry = requested_geometry ? requested_geometry : "";
+    ASSERT_TRUE(geometry.empty() || geometry == "qfn" || geometry == "iq4");
+    const bool wide_geometry = !geometry.empty();
+    const int top_k = wide_geometry ? 8 : 4;
+    const int num_experts = 2 * top_k;
+    const int d_model = wide_geometry ? 2560 : 512;
+    const int intermediate = geometry == "qfn" ? 320 : 256;
     const auto device = llaminar2::DeviceId::cuda(0);
 
     std::vector<int> row_inventory(
@@ -23918,11 +23924,19 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
      * focused integration test.
      */
     row_inventory.push_back(65);
+    if (wide_geometry)
+        row_inventory = {4};
 
     const auto formats = cudaMoEGroupedNativeFormats();
     for (size_t format_index = 0; format_index < formats.size(); ++format_index)
     {
         const auto &format = formats[format_index];
+        if (geometry == "qfn" && std::string_view(format.label) != "Q5_1" &&
+            std::string_view(format.label) != "Q8_0")
+            continue;
+        if (geometry == "iq4" && std::string_view(format.label) != "IQ4_NL" &&
+            std::string_view(format.label) != "IQ4_XS")
+            continue;
         SCOPED_TRACE(format.label);
         llaminar2::PerfStatsCollector::reset();
 
@@ -24253,6 +24267,7 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
                         ++direct_publications;
                         down_source = node;
                         down_params = params;
+                        EXPECT_EQ(params.gridDim.x, static_cast<unsigned>((d_model + 63) / 64));
                         EXPECT_EQ(params.gridDim.y, static_cast<unsigned>(seq_len * top_k));
                         EXPECT_EQ(params.gridDim.z, 1u);
                         EXPECT_EQ(params.blockDim.x, 64u);
@@ -24273,6 +24288,16 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
                 {
                     using namespace llaminar2::test;
                     using namespace llaminar2::test::cuda_kernel_probe_detail;
+                    // Retain the actual route tape for the byte-volume analysis.
+                    ASSERT_TRUE(graph.launchAndPublishOutputs({routing_indices.get()}));
+                    ASSERT_TRUE(routing_indices->ensureOnHost(stream_));
+                    std::vector<float> routes(routing_indices->data(),
+                        routing_indices->data() + seq_len * top_k);
+                    std::sort(routes.begin(), routes.end());
+                    std::size_t same_expert_pairs = 0;
+                    for (std::size_t route = 1; route < routes.size(); route += 2)
+                        same_expert_pairs += routes[route] == routes[route - 1];
+
                     GraphOwner leaf;
                     cudaGraphNode_t node = nullptr;
                     require(cudaGraphAddKernelNode(&node, leaf.graph, nullptr, 0, &down_params),
@@ -24287,8 +24312,9 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
                     ASSERT_NE(source, nullptr);
                     const auto packed = llaminar2::nativeQuantisedPackedRegionSizes(d_model, intermediate, *source);
                     ASSERT_EQ(records.size(), 1u);
+                    records.front()["paired_expert_routes"] = same_expert_pairs;
                     records.front()["logical_weight_request_bytes"] =
-                        packed.logicalBytes() * static_cast<std::size_t>(seq_len * top_k);
+                        packed.logicalBytes() * routes.size();
                     records.front()["execution_codebook"] = format.codebook_id;
                     appendCUDAKernelProbeRecords(probe_path, records);
                     ASSERT_TRUE(graph.launchAndPublishOutputs({runtime_prefill_output.get()}));

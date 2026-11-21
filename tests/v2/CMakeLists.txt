@@ -12170,11 +12170,23 @@ add_v2_test(V2_Integration_CUDA_MoERuntimeSwiGLUPublicationReplay
         --gtest_filter=Test__CUDAMoEKernel.RuntimeGroupedDecodeSwiGLUPublicationReplay:Test__CUDAMoEKernel.RuntimeDecodeGraphReplayReadsDeviceDescriptorsWithoutTableRefresh
     LABELS "V2;Integration;ProductionTestPreflight;CUDA;MoE;MTP;GraphCapture;Replay;ByteExact;Regression"
     MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+add_v2_test(V2_Integration_CUDA_MoEDecodeQFNWidthPublicationReplay
+    COMMAND $<TARGET_FILE:v2_integration_cuda_moe_kernel>
+        --gtest_filter=Test__CUDAMoEKernel.RuntimeGroupedDecodeSwiGLUPublicationReplay
+    LABELS "V2;Integration;ProductionTestPreflight;CUDA;MoE;MTP;GraphCapture;Replay;ByteExact;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 120
+    ENVIRONMENT "LLAMINAR_TEST_CUDA_MOE_M1_SOURCE=main")
 add_v2_test(V2_Integration_CUDA_MoEVerifierK32PublicationReplay
     COMMAND $<TARGET_FILE:v2_integration_cuda_moe_kernel>
         --gtest_filter=Test__CUDAMoEKernel.RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRuntimeDecodeRows
     LABELS "V2;Integration;ProductionTestPreflight;CUDA;MoE;MTP;GraphCapture;Replay;ByteExact;Regression"
     MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+add_v2_test(V2_Integration_CUDA_MoEVerifierQFNWidthPublicationReplay
+    COMMAND $<TARGET_FILE:v2_integration_cuda_moe_kernel>
+        --gtest_filter=Test__CUDAMoEKernel.RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRuntimeDecodeRows
+    LABELS "V2;Integration;ProductionTestPreflight;CUDA;MoE;MTP;GraphCapture;Replay;ByteExact;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 120
+    ENVIRONMENT "LLAMINAR_TEST_CUDA_MOE_M4_DOWN_GEOMETRY=qfn")
 add_v2_test(V2_Perf_CUDA_MoESharedRankBankPrefill
     COMMAND $<TARGET_FILE:${V2_CUDA_GROUPING_PERF_TARGET}>
         --gtest_also_run_disabled_tests
