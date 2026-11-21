@@ -10,7 +10,7 @@
  * never expands identical hidden activations into one copy per expert route.
  * Narrow SM86 Q5_1 Down publishes exact K32 contributions using independent
  * packed integer dots for the two halves and for the activation correction.
- * The SM86 verifier decodes Q2_K and Q6_K weight planes four bytes at a time.
+ * The SM86 verifier decodes selected weight planes four bytes at a time.
  * IQ4_XS physical format 24 preserves the original half base and raw six-bit
  * coefficient in separate 16-bit planes. Its LUT payload and source4 reduction
  * schedule are unchanged; the coefficient is storage metadata, never a minimum.
@@ -18778,7 +18778,7 @@ __global__ void softmax_topk_decode_descriptors_kernel(
      * @tparam CodebookId Physical payload layout admitted for the route.
      * @tparam Order Dot schedule that owns this packet.
      * @param payload Address of one prepared packet. Q2_K and Q6_K packets
-     *        start on eight-byte boundaries in the aligned payload plane.
+     *        start on eight-byte boundaries. Q3_K and Q5_0 start on four-byte boundaries.
      * @param groups Decoded operands in the original DP4A order.
      */
     template <uint8_t CodebookId, NativeMoEDotOrder Order>
@@ -18786,6 +18786,12 @@ __global__ void softmax_topk_decode_descriptors_kernel(
         const uint8_t *payload, int32_t (&groups)[8])
     {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 860
+        const auto negative_bytes = [](uint32_t bits, uint32_t mask) {
+            const uint32_t low_bits = ((bits & 0x0fu) * 0x00204081u) & 0x01010101u;
+            // Each selected byte starts at one, so scaling never carries
+            // into another lane. The mask supplies the sign-extension bits.
+            return low_bits * mask;
+        };
         if constexpr (Order == NativeMoEDotOrder::VerifierK32 &&
                       CodebookId == native_formats::Q2_K.codebook_id)
         {
@@ -18795,6 +18801,41 @@ __global__ void softmax_topk_decode_descriptors_kernel(
             {
                 groups[group] = static_cast<int32_t>((weights.x >> (2 * group)) & 0x03030303u);
                 groups[group + 4] = static_cast<int32_t>((weights.y >> (2 * group)) & 0x03030303u);
+            }
+        }
+        else if constexpr (Order == NativeMoEDotOrder::VerifierK32 &&
+                           CodebookId == native_formats::Q3_K.codebook_id)
+        {
+            const auto *words = reinterpret_cast<const uint32_t *>(payload);
+            // The missing high bit makes a centered Q3 weight negative.
+            const uint32_t negative = ~words[2];
+#pragma unroll
+            for (int half = 0; half < 2; ++half)
+            {
+                const uint32_t word = words[half];
+#pragma unroll
+                for (int part = 0; part < 4; ++part)
+                {
+                    const int group = half * 4 + part;
+                    const auto low = (word >> (2 * part)) & 0x03030303u;
+                    groups[group] = static_cast<int32_t>(
+                        low | negative_bytes(negative >> (4 * group), 0xfcu));
+                }
+            }
+        }
+        else if constexpr (Order == NativeMoEDotOrder::VerifierK32 &&
+                           CodebookId == native_formats::Q5_0.codebook_id)
+        {
+            const auto *words = reinterpret_cast<const uint32_t *>(payload);
+            const uint32_t negative = ~words[4];
+#pragma unroll
+            for (int group = 0; group < 4; ++group)
+            {
+                const uint32_t raw = words[group];
+                groups[group] = static_cast<int32_t>((raw & 0x0f0f0f0fu) |
+                    negative_bytes(negative >> (4 * group), 0xf0u));
+                groups[group + 4] = static_cast<int32_t>(((raw >> 4) & 0x0f0f0f0fu) |
+                    negative_bytes(negative >> (4 * (group + 4)), 0xf0u));
             }
         }
         else if constexpr (Order == NativeMoEDotOrder::VerifierK32 &&

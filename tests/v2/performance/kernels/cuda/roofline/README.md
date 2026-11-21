@@ -166,3 +166,11 @@ At the same wide geometry, Q2_K runs in 7.168–7.232 µs and Q6_K drops from
 21.120–21.248 to 14.016–14.080 µs. The readers use 38 and 37 registers per
 thread respectively, with zero local bytes. All 21 source formats retain
 byte equality with serial decode under capture.
+
+The SM86 Q3_K and Q5_0 verifier readers form signed bytes directly from
+the low planes and the inverted high-bit plane. A packed mask supplies the
+sign-extension bits for all four lanes together. At N=2560 and K=256,
+Q3_K drops from 11.328–11.392 to 7.360 µs and Q5_0 drops from 11.776 to
+11.648 µs on both cards. At N=512, Q3_K and Q5_0 measure 3.904 and
+4.032 µs. Their compiled readers use 36 and 39 registers respectively,
+with zero local bytes.
