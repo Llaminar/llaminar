@@ -10896,7 +10896,13 @@ namespace llaminar2
 #if !defined(HAVE_ROCM) && !defined(HAVE_CUDA)
         return false;
 #else
-        if (!params_.device_id.is_gpu())
+        // A GPU identity whose backend family is not compiled into this build
+        // has no executable route to capture. Reject it before the route
+        // branches: the plain seq_len==1 branch below only checks scratch, so
+        // an uncompiled backend would otherwise be advertised as capturable
+        // while the capture preflight correctly reports it unsupported.
+        if (!params_.device_id.is_gpu() ||
+            !supportsGroupedPrefillExecutionBackend(params_.device_id))
             return false;
 
         /*

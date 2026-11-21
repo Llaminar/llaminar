@@ -30306,6 +30306,13 @@ add_v2_test(V2_Integration_GDNCompiledCaptureSupport
         --gtest_filter=GDNPrefillGraphCapture.DecodeAlwaysCapturableRegardlessOfState
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;GDN;GraphCapture;Regression"
     MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+# A GPU identity whose backend family is not compiled must never be advertised
+# as graph-capturable; both shared-expert routes check every backend family.
+add_v2_test(V2_Integration_SharedExpertUncompiledBackendCapture
+    COMMAND $<TARGET_FILE:v2_test_prefill_graph_capturability>
+        --gtest_filter=SharedExpertFFNPrefillGraphCapture.ForcedDecodeReplayCapturesAfterGroupedPrefillWarmup:SharedExpertFFNPrefillGraphCapture.GpuNormalDecodeUsesWorkspaceBackedGroupedTableRoute
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MoE;GraphCapture;Contract;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
 add_v2_test(V2_Unit_PrefillGraphCapturability
     COMMAND $<TARGET_FILE:v2_test_prefill_graph_capturability>
     LABELS "V2;Unit;MoE;GDN;Stages;GraphCapture"
