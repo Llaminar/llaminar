@@ -3576,7 +3576,11 @@ class CrossHostRunnerTests(unittest.TestCase):
                     artifacts.write_json(directory / "runtime-import.json", {"source_image": image})
                     return {host["public_ip"]: "sha256:remote-fixture" for host in hosts}
 
-                with patch.object(remote_e2e, "AzureCLI", return_value=cli), \
+                # This device-free fixture owns its staging bytes too. Never
+                # write temporary containers into the real checkout, which may
+                # be read-only in an installed runner or shared by other work.
+                with patch.object(remote_e2e, "CROSS_HOST_CONTAINER_SCRATCH", root / "container-scratch"), \
+                     patch.object(remote_e2e, "AzureCLI", return_value=cli), \
                      patch.object(remote_e2e, "validate_local_network"), \
                      patch.object(remote_e2e, "private_mpi_connection", side_effect=connection), \
                      patch.object(remote_e2e, "image_identity", return_value=remote_runtime_identity()), \
@@ -4418,6 +4422,16 @@ class ImageIdentityTests(unittest.TestCase):
         for package in ("build-essential", "git", "jq"):
             with self.subTest(package=package):
                 self.assertIn(package, test_runner)
+        # The distro CTest lacks ownership metadata. Reuse the exact selected
+        # builder entrypoints and their package/native data below instead of
+        # independently selecting an apt CMake family in the installed runner.
+        self.assertIn(
+            "COPY --from=toolchain /usr/local/bin/cmake /usr/local/bin/ctest /usr/local/bin/cpack /usr/local/bin/",
+            test_runner,
+        )
+        apt_install = test_runner.split("apt-get install -y --no-install-recommends", 1)[1].split(
+            "&& rm -rf /var/lib/apt/lists/*", 1)[0]
+        self.assertNotIn("cmake", apt_install)
         self.assertIn(
             "COPY --from=toolchain /usr/local/bin/cmake /usr/local/bin/ctest /usr/local/bin/cpack /usr/local/bin/",
             test_runner,
@@ -4560,6 +4574,34 @@ class ImageIdentityTests(unittest.TestCase):
                 pipeline.snapshot(tree, destination)
             self.assertEqual((destination / "src/implementation.cpp").read_text(), "// source\n")
             self.assertFalse((destination / "tests/v2/integration/parity/results/run/stages.csv").exists())
+
+    def test_cuda_installer_selects_the_image_repository_and_rejects_others(self):
+        """x86 and sbsa images resolve their own NVIDIA repository; others fail closed."""
+        installer = (ROOT / "scripts/docker/install-cuda.sh").read_text(encoding="utf-8")
+        function = "cuda_repository_path() {" + installer.split(
+            "cuda_repository_path() {", 1)[1].split("\n}\n", 1)[0] + "\n}\n"
+
+        def resolve(release, architecture):
+            return subprocess.run(
+                ["bash", "-c", function + 'cuda_repository_path "$1" "$2"', "probe",
+                 release, architecture],
+                capture_output=True, text=True)
+
+        for release, architecture, expected in (
+                ("24.04", "amd64", "ubuntu2404/x86_64"),
+                ("24.04", "arm64", "ubuntu2404/sbsa"),
+                ("22.04", "arm64", "ubuntu2204/sbsa")):
+            result = resolve(release, architecture)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), expected)
+        for release, architecture in (("20.04", "amd64"), ("24.04", "armhf"), ("24.04", "")):
+            result = resolve(release, architecture)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(result.stdout, "")
+        self.assertIn('"https://developer.download.nvidia.com/compute/cuda/repos/'
+                      '${CUDA_REPOSITORY}/cuda-keyring_1.1-1_all.deb"', installer)
+        self.assertNotIn("ubuntu2404/x86_64", installer)
+        self.assertIn("full|runtime|profilers) ;;", installer)
 
     def test_cuda_installer_aligns_nccl_fatbins_with_the_application_contract(self):
         """Cold NCCL builds must not compile architectures absent from Llaminar."""
@@ -4777,7 +4819,9 @@ class ImageIdentityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "source").mkdir()
-            cache_root = root / "cache"
+            # The production owner canonicalizes the user-supplied root; on
+            # Darwin /var and /private/var can name the same owned directory.
+            cache_root = (root / "cache").resolve()
             cache_root.mkdir()
             source = {"revision": "revision", "tree": "tree", "dirty": False}
             args = argparse.Namespace(cpu_isa="AVX512")
@@ -5692,6 +5736,30 @@ class InfrastructureTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("docker buildx build", result.stdout)
 
+    def test_arm64_runtime_wrapper_preserves_admitted_context_and_registry_cache(self):
+        """Follow the actual build wrapper's ARM64 publication command planning."""
+        context = "toolchain=oci-layout:///tmp/neon@sha256:" + "a" * 64
+        registry = "type=registry,ref=ghcr.io/llaminar/llaminar:build-cache-develop-neon"
+        export = registry + ",mode=max,image-manifest=true,oci-mediatypes=true"
+        # The installed x86 test runner exports its own build flags. The ARM64
+        # publication command runs on a separate host with wrapper defaults.
+        environment = dict(pipeline.os.environ)
+        for option in ("LLAMINAR_ENABLE_CUDA", "LLAMINAR_ENABLE_ROCM",
+                       "LLAMINAR_SKIP_INTEGRATION", "LLAMINAR_CUDA_ARCHS"):
+            environment.pop(option, None)
+        output = subprocess.check_output([
+            "bash", str(ROOT / "scripts/docker/build-runtime-image.sh"), "--variant", "cuda",
+            "--cpu-isa", "NEON", "--build-context", context, "--cache-from", registry,
+            "--cache-to", export, "--dry-run"], text=True, env=environment)
+        command = shlex.split(output)
+        for option, value in (("--target", "runtime"), ("--platform", "linux/arm64"),
+                              ("--build-context", context), ("--cache-from", registry),
+                              ("--cache-to", export)):
+            self.assertEqual(command[command.index(option) + 1], value)
+        self.assertIn("LLAMINAR_ENABLE_ROCM=OFF", command)
+        self.assertIn("LLAMINAR_SKIP_INTEGRATION=1", command)
+        self.assertIn("LLAMINAR_CUDA_ARCHS=121", command)
+
     def test_official_result_commit_is_scoped_and_parented_to_tested_source(self):
         # A real private Git remote exercises the publication transaction. Docker
         # is mocked: this test is never evidence of an actual image certificate.
@@ -5831,8 +5899,13 @@ class InfrastructureTests(unittest.TestCase):
         """A smaller installed Unit image must remain an explicit scope."""
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            for name in ("CMakeCache.txt", "compile_commands.json", "build.ninja", "CTestTestfile.cmake"):
+            mpi_library = root / "usr/lib/libmpi.so"
+            mpi_library.parent.mkdir(parents=True)
+            mpi_library.write_bytes(b"fixture MPI runtime library")
+            for name in ("compile_commands.json", "build.ninja", "CTestTestfile.cmake"):
                 (root / name).write_text("fixture")
+            (root / "CMakeCache.txt").write_text(
+                f"MPI_mpi_LIBRARY:FILEPATH={mpi_library}\n")
             (root / "CMakeFiles").mkdir()
             (root / "CMakeFiles/rules.ninja").write_text("fixture")
             (root / "v2_unit").write_text("fixture executable")
@@ -5902,7 +5975,11 @@ class InfrastructureTests(unittest.TestCase):
     def test_installed_seal_allows_unbuilt_tests_outside_pipeline_gates(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)
-            (path / "CMakeCache.txt").write_text("configured")
+            mpi_library = path / "usr/lib/libmpi.so"
+            mpi_library.parent.mkdir(parents=True)
+            mpi_library.write_bytes(b"fixture MPI runtime library")
+            (path / "CMakeCache.txt").write_text(
+                f"MPI_mpi_LIBRARY:FILEPATH={mpi_library}\n")
             (path / "compile_commands.json").write_text("[]")
             (path / "build.ninja").write_text("configured")
             (path / "CMakeFiles").mkdir()

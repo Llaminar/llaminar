@@ -2,14 +2,21 @@
  * @file VectorPrimitives.cpp
  * @brief ISA-dispatched vector primitives: dot, axpy, scale
  *
- * Each operation has scalar / AVX2 / AVX-512 variants selected at runtime
- * via ISA_DISPATCH_* macros from CPUFeatures.h. Grouped dot products share
- * weight loads but retain the serial operation's independent arithmetic
- * chains and final reduction, so routing cannot change with batch size.
+ * AArch64 executes native NEON; x86 retains runtime scalar / AVX2 / AVX-512
+ * dispatch via CPUFeatures.h. Grouped dot products share weight loads but
+ * retain the serial operation's independent arithmetic chains and final fold,
+ * so routing cannot change with batch size. ARM tails use explicit FMA to
+ * prevent compiler contraction choices from changing serial/grouped bytes.
  */
 
 #include "VectorPrimitives.h"
 #include "../../../utils/CPUFeatures.h"
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#include <arm_neon.h>
+#include <array>
+#include <cmath>
+#endif
 
 #if defined(__AVX512F__) || defined(__AVX2__)
 #include <immintrin.h>
@@ -17,7 +24,106 @@
 
 namespace llaminar2::primitives
 {
+#if defined(__aarch64__) && defined(__ARM_NEON)
+    /**
+     * @brief Share NEON weight loads across a compile-time number of dot products.
+     *
+     * Each row owns two four-lane FMA chains regardless of batch size. The
+     * identical pairwise horizontal fold and explicit scalar FMA tail give
+     * grouped execution the serial call's exact arithmetic, without row replay.
+     * Eight live accumulators for four rows fit the AArch64 SIMD register file.
+     * @tparam Rows One serial row or four grouped rows.
+     * @param weights Shared n-element weight vector.
+     * @param rows First activation row, with row_stride floats between rows.
+     * @param n Number of live elements in every row.
+     * @param row_stride Activation row spacing in floats.
+     * @param output First destination scalar, with output_stride spacing.
+     * @param output_stride Destination spacing in floats.
+     */
+    template <std::size_t Rows>
+    static void vec_dot_neon_rows(
+        const float *weights, const float *rows, int n,
+        std::size_t row_stride, float *output, std::size_t output_stride)
+    {
+        static_assert(Rows == 1 || Rows == 4);
+        std::array<float32x4_t, Rows> low{}, high{};
+        int i = 0;
+        for (; i < (n & ~7); i += 8)
+        {
+            const float32x4_t w0 = vld1q_f32(weights + i);
+            const float32x4_t w1 = vld1q_f32(weights + i + 4);
+            for (std::size_t row = 0; row < Rows; ++row)
+            {
+                const float *input = rows + row * row_stride + i;
+                low[row] = vfmaq_f32(low[row], w0, vld1q_f32(input));
+                high[row] = vfmaq_f32(high[row], w1, vld1q_f32(input + 4));
+            }
+        }
+        for (std::size_t row = 0; row < Rows; ++row)
+        {
+            float value = vaddvq_f32(vaddq_f32(low[row], high[row]));
+            for (int tail = i; tail < n; ++tail)
+                value = std::fma(weights[tail], rows[row * row_stride + tail], value);
+            output[row * output_stride] = value;
+        }
+    }
 
+    float vec_dot(const float *a, const float *b, int n)
+    {
+        float value;
+        vec_dot_neon_rows<1>(a, b, n, 0, &value, 0);
+        return value;
+    }
+
+    void vec_dot_four_rows(
+        const float *weights, const float *rows, int n,
+        std::size_t row_stride, float *output, std::size_t output_stride)
+    {
+        vec_dot_neon_rows<4>(weights, rows, n, row_stride, output, output_stride);
+    }
+
+    void vec_axpy(float *y, const float *x, float alpha, int n)
+    {
+        const float32x4_t multiplier = vdupq_n_f32(alpha);
+        int i = 0;
+        for (; i < (n & ~7); i += 8)
+        {
+            const float32x4_t low = vfmaq_f32(vld1q_f32(y + i), multiplier, vld1q_f32(x + i));
+            const float32x4_t high = vfmaq_f32(vld1q_f32(y + i + 4), multiplier, vld1q_f32(x + i + 4));
+            vst1q_f32(y + i, low);
+            vst1q_f32(y + i + 4, high);
+        }
+        for (; i < n; ++i)
+            y[i] = std::fma(alpha, x[i], y[i]);
+    }
+
+    void vec_scale(float *data, float s, int n)
+    {
+        const float32x4_t multiplier = vdupq_n_f32(s);
+        int i = 0;
+        for (; i < (n & ~7); i += 8)
+        {
+            vst1q_f32(data + i, vmulq_f32(vld1q_f32(data + i), multiplier));
+            vst1q_f32(data + i + 4, vmulq_f32(vld1q_f32(data + i + 4), multiplier));
+        }
+        for (; i < n; ++i)
+            data[i] *= s;
+    }
+
+    void vec_add(float *out, const float *a, const float *b, int n)
+    {
+        int i = 0;
+        for (; i < (n & ~7); i += 8)
+        {
+            const float32x4_t low = vaddq_f32(vld1q_f32(a + i), vld1q_f32(b + i));
+            const float32x4_t high = vaddq_f32(vld1q_f32(a + i + 4), vld1q_f32(b + i + 4));
+            vst1q_f32(out + i, low);
+            vst1q_f32(out + i + 4, high);
+        }
+        for (; i < n; ++i)
+            out[i] = a[i] + b[i];
+    }
+#else
     // ========================================================================
     // vec_dot — scalar / AVX2 / AVX-512
     // ========================================================================
@@ -398,4 +504,5 @@ namespace llaminar2::primitives
         ISA_DISPATCH_VOID(vec_add, out, a, b, n);
     }
 
+#endif // AArch64 NEON / x86 runtime dispatch
 } // namespace llaminar2::primitives

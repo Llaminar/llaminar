@@ -7,6 +7,7 @@
  * depends on worker count and the original token authority is read once.
  */
 #include "Qwen4ExpBranchConcat.h"
+#include "../../utils/OpenMPUtils.h"
 #include <cstring>
 #include <omp.h>
 #include <limits>
@@ -49,6 +50,7 @@ void cpuBranchConcat(const BranchConcatArgs &a,void *stream) {
     // GNU OpenMP allocates a serialized team even for a one-worker parallel
     // region. One worker executes the identical copy loop directly instead.
     if(omp_get_max_threads()==1){for(int row=0;row<live*4;++row)copy(row);return;}
+    ::llaminar::v2::noteOpenMPTeamFork();
     #pragma omp parallel for schedule(static)
     for(int row=0;row<live*4;++row)copy(row);
 }

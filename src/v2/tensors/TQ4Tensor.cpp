@@ -4,6 +4,7 @@
  */
 
 #include "TQ4Tensor.h"
+#include "../utils/OpenMPUtils.h"
 #include "../kernels/cpu/turboquant/TurboQuantQuantizeTQ4.h"
 #include "../kernels/cpu/turboquant/TurboQuantDequantizeTQ4.h"
 #include "../kernels/cpu/turboquant/TurboQuantContext.h"
@@ -216,6 +217,7 @@ namespace llaminar2
         const size_t bpr = tensor->blocks_per_row();
         const size_t bb = tensor->block_bytes();
 
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for if (num_rows * bpr >= 32)
         for (size_t r = 0; r < num_rows; ++r)
         {
@@ -262,6 +264,7 @@ namespace llaminar2
         const size_t bpr = blocks_per_row_;
         const size_t bb = block_bytes_;
 
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for if (num_rows * bpr >= 32)
         for (size_t r = 0; r < num_rows; ++r)
         {
@@ -308,6 +311,7 @@ namespace llaminar2
         const size_t bpr = blocks_per_row_;
         const size_t bb = block_bytes_;
 
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for if (num_rows * bpr >= 32)
         for (size_t r = 0; r < num_rows; ++r)
         {

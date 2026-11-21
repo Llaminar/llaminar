@@ -5,24 +5,33 @@
  * @brief SIMD helper functions for IQ4_NL quantization decode
  * @author David Sanftenberg
  *
- * Provides AVX512/AVX2 optimized int8→float32 conversion for IQ4_NL lookup table values.
- * Functions are inline and header-only for zero-cost abstraction.
+ * Provides typed conversion, residual and quantization helpers over retained
+ * tensor storage. Native AArch64 leaves and existing AVX512/AVX2 implementations
+ * share the public dispatch contracts without emulating x86 instructions.
+ * Values remain in bounded vector tiles; scalar diagnostics and bounded tails
+ * are distinct from the production ISA routes. Typed decode/add programs retain
+ * each FP32 decode product before addition: contracting a source multiply is a
+ * different requantization program, including in the scalar diagnostic route.
  */
 
 #include "BlockStructures.h" // Must be included FIRST (defines all block structures)
+#include "../utils/OpenMPUtils.h"
 #include "IQQuantTables.h"   // Lookup tables: kvalues_iq4nl, iq2xxs_grid, etc.
 #include "../utils/CPUFeatures.h"
 #include "FP16Utils.h"
+#include "TypedBlockGeometry.h"
+#include "kernels/common/DeviceFP32NumericalContract.h"
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#include "NEONTypedTensorOps.h"
+#endif
 #include <cstdint>
 #include <cstring>
 #include <cmath>
 #include <algorithm>
 #include <stdexcept>
 
-#if defined(__AVX512F__)
-#include <immintrin.h>
-#elif defined(__AVX2__)
-#include <immintrin.h>
+#if defined(__AVX512F__) || defined(__AVX2__)
+#include "X86FP32.h"
 #endif
 
 namespace llaminar2
@@ -824,6 +833,7 @@ namespace llaminar2
             const float *col_scales,
             const float *bias)
         {
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for
             for (int r = 0; r < rows; ++r)
             {
@@ -1381,8 +1391,8 @@ namespace llaminar2
 
                 for (int i = 0; i < 32; ++i)
                 {
-                    float r = scale * static_cast<float>(block.qs[i]);
-                    block_output[i] = r + block_input[i];
+                    const float r = device_fp32_contract::multiply(scale, static_cast<float>(block.qs[i]));
+                    block_output[i] = device_fp32_contract::add(r, block_input[i]);
                 }
             }
         }
@@ -1468,6 +1478,7 @@ namespace llaminar2
         inline void fused_q8_1_residual_add(
             const Q8_1Block *residual, const float *input, float *output, size_t count)
         {
+            requireCompleteTypedBlocks(count);
             ISA_DISPATCH_VOID(fused_q8_1_residual_add, residual, input, output, count);
         }
 
@@ -1508,9 +1519,9 @@ namespace llaminar2
                 // Dequant and add
                 for (int i = 0; i < 32; ++i)
                 {
-                    float va = scale_a * static_cast<float>(block_a.qs[i]);
-                    float vb = scale_b * static_cast<float>(block_b.qs[i]);
-                    temp[i] = va + vb;
+                    const float va = device_fp32_contract::multiply(scale_a, static_cast<float>(block_a.qs[i]));
+                    const float vb = device_fp32_contract::multiply(scale_b, static_cast<float>(block_b.qs[i]));
+                    temp[i] = device_fp32_contract::add(va, vb);
                 }
 
                 // Find max_abs
@@ -1706,6 +1717,7 @@ namespace llaminar2
         inline void q8_1_add_q8_1(
             const Q8_1Block *a, const Q8_1Block *b, Q8_1Block *output, size_t count)
         {
+            requireCompleteTypedBlocks(count);
             ISA_DISPATCH_VOID(q8_1_add_q8_1, a, b, output, count);
         }
 
@@ -2368,9 +2380,9 @@ namespace llaminar2
                 // Dequant and add
                 for (int i = 0; i < 32; ++i)
                 {
-                    float va = scale_a * static_cast<float>(block_a.qs[i]);
-                    float vb = scale_b * static_cast<float>(block_b.qs[i]);
-                    temp[i] = va + vb;
+                    const float va = device_fp32_contract::multiply(scale_a, static_cast<float>(block_a.qs[i]));
+                    const float vb = device_fp32_contract::multiply(scale_b, static_cast<float>(block_b.qs[i]));
+                    temp[i] = device_fp32_contract::add(va, vb);
                 }
 
                 // Find max_abs
@@ -2432,8 +2444,8 @@ namespace llaminar2
                     __m128i qb16 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(block_b.qs + i * 8));
                     __m256i ia32 = _mm256_cvtepi16_epi32(qa16);
                     __m256i ib32 = _mm256_cvtepi16_epi32(qb16);
-                    __m256 fa = _mm256_mul_ps(_mm256_cvtepi32_ps(ia32), scale_a_vec);
-                    __m256 fb = _mm256_mul_ps(_mm256_cvtepi32_ps(ib32), scale_b_vec);
+                    __m256 fa = x86_fp32::persistRounded(_mm256_mul_ps(_mm256_cvtepi32_ps(ia32), scale_a_vec));
+                    __m256 fb = x86_fp32::persistRounded(_mm256_mul_ps(_mm256_cvtepi32_ps(ib32), scale_b_vec));
                     __m256 sum = _mm256_add_ps(fa, fb);
                     _mm256_store_ps(temp + i * 8, sum);
                 }
@@ -2501,14 +2513,14 @@ namespace llaminar2
                 // Load and dequant A (16 int16 values → 16 floats, 2 iterations for 32 elements)
                 __m256i qa_lo = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(block_a.qs));
                 __m256i qa_hi = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(block_a.qs + 16));
-                __m512 fa0 = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(qa_lo)), _mm512_set1_ps(scale_a));
-                __m512 fa1 = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(qa_hi)), _mm512_set1_ps(scale_a));
+                __m512 fa0 = x86_fp32::persistRounded(_mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(qa_lo)), _mm512_set1_ps(scale_a)));
+                __m512 fa1 = x86_fp32::persistRounded(_mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(qa_hi)), _mm512_set1_ps(scale_a)));
 
                 // Load and dequant B
                 __m256i qb_lo = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(block_b.qs));
                 __m256i qb_hi = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(block_b.qs + 16));
-                __m512 fb0 = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(qb_lo)), _mm512_set1_ps(scale_b));
-                __m512 fb1 = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(qb_hi)), _mm512_set1_ps(scale_b));
+                __m512 fb0 = x86_fp32::persistRounded(_mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(qb_lo)), _mm512_set1_ps(scale_b)));
+                __m512 fb1 = x86_fp32::persistRounded(_mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(qb_hi)), _mm512_set1_ps(scale_b)));
 
                 // Add
                 __m512 sum0 = _mm512_add_ps(fa0, fb0);
@@ -2567,6 +2579,7 @@ namespace llaminar2
         inline void q16_1_add_q16_1(
             const Q16_1Block *a, const Q16_1Block *b, Q16_1Block *output, size_t count)
         {
+            requireCompleteTypedBlocks(count);
             ISA_DISPATCH_VOID(q16_1_add_q16_1, a, b, output, count);
         }
 
@@ -2597,8 +2610,8 @@ namespace llaminar2
 
                 for (int i = 0; i < 32; ++i)
                 {
-                    float vr = scale * static_cast<float>(block.qs[i]);
-                    temp[i] = vr + delta_ptr[i];
+                    const float vr = device_fp32_contract::multiply(scale, static_cast<float>(block.qs[i]));
+                    temp[i] = device_fp32_contract::add(vr, delta_ptr[i]);
                 }
 
                 float max_abs = 0.0f;
@@ -2651,7 +2664,7 @@ namespace llaminar2
                 {
                     __m128i qr16 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(block.qs + i * 8));
                     __m256i qr32 = _mm256_cvtepi16_epi32(qr16);
-                    __m256 fr = _mm256_mul_ps(_mm256_cvtepi32_ps(qr32), scale_vec);
+                    __m256 fr = x86_fp32::persistRounded(_mm256_mul_ps(_mm256_cvtepi32_ps(qr32), scale_vec));
                     __m256 fd = _mm256_loadu_ps(delta_ptr + i * 8);
                     __m256 sum = _mm256_add_ps(fr, fd);
                     _mm256_store_ps(temp + i * 8, sum);
@@ -2716,8 +2729,8 @@ namespace llaminar2
                 // Load and dequant residual
                 __m256i qr_lo = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(block.qs));
                 __m256i qr_hi = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(block.qs + 16));
-                __m512 fr0 = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(qr_lo)), _mm512_set1_ps(scale));
-                __m512 fr1 = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(qr_hi)), _mm512_set1_ps(scale));
+                __m512 fr0 = x86_fp32::persistRounded(_mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(qr_lo)), _mm512_set1_ps(scale)));
+                __m512 fr1 = x86_fp32::persistRounded(_mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(qr_hi)), _mm512_set1_ps(scale)));
 
                 // Load delta (already FP32)
                 __m512 fd0 = _mm512_loadu_ps(delta_ptr);
@@ -2774,6 +2787,7 @@ namespace llaminar2
         inline void q16_1_add_fp32(
             Q16_1Block *residual, const float *delta, size_t count)
         {
+            requireCompleteTypedBlocks(count);
             ISA_DISPATCH_VOID(q16_1_add_fp32, residual, delta, count);
         }
 
@@ -3080,9 +3094,9 @@ namespace llaminar2
                 // Dequant and add
                 for (int i = 0; i < 32; ++i)
                 {
-                    float vr = scale_r * static_cast<float>(block_r.qs[i]);
-                    float vd = scale_d * static_cast<float>(block_d.qs[i]);
-                    temp[i] = vr + vd;
+                    const float vr = device_fp32_contract::multiply(scale_r, static_cast<float>(block_r.qs[i]));
+                    const float vd = device_fp32_contract::multiply(scale_d, static_cast<float>(block_d.qs[i]));
+                    temp[i] = device_fp32_contract::add(vr, vd);
                 }
 
                 // Find max_abs
@@ -3142,12 +3156,12 @@ namespace llaminar2
                     // Dequant Q16_1 residual
                     __m128i qr16 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(block_r.qs + i * 8));
                     __m256i qr32 = _mm256_cvtepi16_epi32(qr16);
-                    __m256 fr = _mm256_mul_ps(_mm256_cvtepi32_ps(qr32), scale_r_vec);
+                    __m256 fr = x86_fp32::persistRounded(_mm256_mul_ps(_mm256_cvtepi32_ps(qr32), scale_r_vec));
 
                     // Dequant Q8_1 delta (load 8 int8 → extend to int32 → FP32)
                     __m128i qd8 = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(block_d.qs + i * 8));
                     __m256i qd32 = _mm256_cvtepi8_epi32(qd8);
-                    __m256 fd = _mm256_mul_ps(_mm256_cvtepi32_ps(qd32), scale_d_vec);
+                    __m256 fd = x86_fp32::persistRounded(_mm256_mul_ps(_mm256_cvtepi32_ps(qd32), scale_d_vec));
 
                     __m256 sum = _mm256_add_ps(fr, fd);
                     _mm256_store_ps(temp + i * 8, sum);
@@ -3215,16 +3229,16 @@ namespace llaminar2
                 // Load and dequant residual (Q16_1: int16 → FP32)
                 __m256i qr_lo = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(block_r.qs));
                 __m256i qr_hi = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(block_r.qs + 16));
-                __m512 fr0 = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(qr_lo)), _mm512_set1_ps(scale_r));
-                __m512 fr1 = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(qr_hi)), _mm512_set1_ps(scale_r));
+                __m512 fr0 = x86_fp32::persistRounded(_mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(qr_lo)), _mm512_set1_ps(scale_r)));
+                __m512 fr1 = x86_fp32::persistRounded(_mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(qr_hi)), _mm512_set1_ps(scale_r)));
 
                 // Load and dequant delta (Q8_1: int8 → FP32)
                 __m128i qd_bytes = _mm_loadu_si128(reinterpret_cast<const __m128i *>(block_d.qs));
                 __m128i qd_bytes_hi = _mm_loadu_si128(reinterpret_cast<const __m128i *>(block_d.qs + 16));
                 __m512i qd_lo = _mm512_cvtepi8_epi32(qd_bytes);
                 __m512i qd_hi = _mm512_cvtepi8_epi32(qd_bytes_hi);
-                __m512 fd0 = _mm512_mul_ps(_mm512_cvtepi32_ps(qd_lo), _mm512_set1_ps(scale_d));
-                __m512 fd1 = _mm512_mul_ps(_mm512_cvtepi32_ps(qd_hi), _mm512_set1_ps(scale_d));
+                __m512 fd0 = x86_fp32::persistRounded(_mm512_mul_ps(_mm512_cvtepi32_ps(qd_lo), _mm512_set1_ps(scale_d)));
+                __m512 fd1 = x86_fp32::persistRounded(_mm512_mul_ps(_mm512_cvtepi32_ps(qd_hi), _mm512_set1_ps(scale_d)));
 
                 // Add
                 __m512 sum0 = _mm512_add_ps(fr0, fd0);
@@ -3277,6 +3291,7 @@ namespace llaminar2
         inline void q16_1_add_q8_1(
             Q16_1Block *residual, const Q8_1Block *delta, size_t count)
         {
+            requireCompleteTypedBlocks(count);
             ISA_DISPATCH_VOID(q16_1_add_q8_1, residual, delta, count);
         }
 
@@ -3309,7 +3324,9 @@ namespace llaminar2
         inline void q16_add_q16(const BlockType *a, const BlockType *b, BlockType *output)
         {
             constexpr size_t BLOCK_SIZE = BlockType::BLOCK_SIZE;
+#if defined(__AVX512F__) || defined(__AVX2__)
             constexpr size_t CHUNKS_32 = BLOCK_SIZE / 32;
+#endif
 
             // Dequantize both inputs to FP32, add, find max, requantize
             alignas(64) float temp[BLOCK_SIZE];
@@ -3384,9 +3401,9 @@ namespace llaminar2
             float max_abs = 0.0f;
             for (size_t i = 0; i < BLOCK_SIZE; ++i)
             {
-                float va = scale_a * static_cast<float>(a->qs[i]);
-                float vb = scale_b * static_cast<float>(b->qs[i]);
-                temp[i] = va + vb;
+                const float va = device_fp32_contract::multiply(scale_a, static_cast<float>(a->qs[i]));
+                const float vb = device_fp32_contract::multiply(scale_b, static_cast<float>(b->qs[i]));
+                temp[i] = device_fp32_contract::add(va, vb);
                 max_abs = std::max(max_abs, std::abs(temp[i]));
             }
 #endif
@@ -3429,7 +3446,9 @@ namespace llaminar2
         inline void q16_add_fp32(BlockType *block, const float *delta)
         {
             constexpr size_t BLOCK_SIZE = BlockType::BLOCK_SIZE;
+#if defined(__AVX512F__) || defined(__AVX2__)
             constexpr size_t CHUNKS_32 = BLOCK_SIZE / 32;
+#endif
 
             alignas(64) float temp[BLOCK_SIZE];
             const float scale = block->d;
@@ -3492,7 +3511,8 @@ namespace llaminar2
             float max_abs = 0.0f;
             for (size_t i = 0; i < BLOCK_SIZE; ++i)
             {
-                temp[i] = scale * static_cast<float>(block->qs[i]) + delta[i];
+                const float decoded = device_fp32_contract::multiply(scale, static_cast<float>(block->qs[i]));
+                temp[i] = device_fp32_contract::add(decoded, delta[i]);
                 max_abs = std::max(max_abs, std::abs(temp[i]));
             }
 #endif
@@ -3616,9 +3636,9 @@ namespace llaminar2
                 for (size_t i = 0; i < 32; ++i)
                 {
                     size_t idx = chunk * 32 + i;
-                    float vr = scale_r * static_cast<float>(block->qs[idx]);
-                    float vd = scale_d * static_cast<float>(block_d.qs[i]);
-                    temp[idx] = vr + vd;
+                    const float vr = device_fp32_contract::multiply(scale_r, static_cast<float>(block->qs[idx]));
+                    const float vd = device_fp32_contract::multiply(scale_d, static_cast<float>(block_d.qs[i]));
+                    temp[idx] = device_fp32_contract::add(vr, vd);
                     max_abs = std::max(max_abs, std::abs(temp[idx]));
                 }
             }
@@ -3670,7 +3690,9 @@ namespace llaminar2
             }
 
             constexpr size_t BLOCK_SIZE = BlockType::BLOCK_SIZE;
+#if defined(__AVX512F__) || defined(__AVX2__)
             constexpr size_t CHUNKS_32 = BLOCK_SIZE / 32;
+#endif
 
             alignas(64) float sum_vals[BLOCK_SIZE] = {0.0f};
 
@@ -4313,6 +4335,7 @@ namespace llaminar2
         inline void dequantize_q8_1_to_fp32(
             const Q8_1Block *src, float *dst, size_t count)
         {
+            requireCompleteTypedBlocks(count);
             ISA_DISPATCH_VOID(dequantize_q8_1_to_fp32, src, dst, count);
         }
 
@@ -4532,6 +4555,7 @@ namespace llaminar2
         inline void quantize_fp32_to_q8_1_blocks(
             const float *src, Q8_1Block *dst, size_t count)
         {
+            requireCompleteTypedBlocks(count);
             ISA_DISPATCH_VOID(quantize_fp32_to_q8_1_blocks, src, dst, count);
         }
 
@@ -4921,15 +4945,19 @@ namespace llaminar2
         /**
          * @brief Quantize a single 32-element block from FP32 to Q8_1 (auto-dispatch)
          *
-         * Dispatches to AVX-512, AVX2, or scalar based on runtime CPU detection.
-         * Handles partial blocks at row boundaries.
+         * Complete blocks use the admitted native ISA (NEON or AVX-512/AVX2).
+         * The existing bounded partial-block program retains ties-away rounding;
+         * complete SIMD blocks use ties-even. Padding is published explicitly.
          *
          * @param src Pointer to FP32 values
          * @param dst Output Q8_1 block
-         * @param valid_elements Number of valid elements (≤32), rest are zero-padded
+         * @param valid_elements Number of valid elements in [0,32]; the rest are zero-padded.
+         * @throws std::invalid_argument For an invalid logical block extent.
          */
         inline void quantize_single_block(const float *src, Q8_1Block &dst, int valid_elements = 32)
         {
+            if (valid_elements < 0 || valid_elements > 32)
+                throw std::invalid_argument("Activation Q8 block requires a live extent in [0,32]");
             // Partial blocks always use scalar (rare, at row boundaries only)
             if (valid_elements < 32)
             {
@@ -4937,11 +4965,16 @@ namespace llaminar2
                 return;
             }
 
-            // Full blocks: dispatch to best SIMD
-            static const bool has_avx512 = cpu_supports_avx512();
-            static const bool has_avx2 = cpu_supports_avx2();
-
+            // Full blocks: only compiled ISA implementations are eligible.
+#if defined(__aarch64__) && defined(__ARM_NEON)
+            cpu::ARMCPUCapabilities::native().require(cpu::ARMCPUFeature::ASIMD);
+#if defined(__ARM_FEATURE_DOTPROD)
+            cpu::ARMCPUCapabilities::native().require(cpu::ARMCPUFeature::DotProd);
+#endif
+            quantize_single_block_neon(src, dst);
+#else
 #if defined(__AVX512F__)
+            static const bool has_avx512 = cpu_supports_avx512();
             if (has_avx512)
             {
                 quantize_single_block_avx512(src, dst);
@@ -4949,6 +4982,7 @@ namespace llaminar2
             }
 #endif
 #if defined(__AVX2__)
+            static const bool has_avx2 = cpu_supports_avx2();
             if (has_avx2)
             {
                 quantize_single_block_avx2(src, dst);
@@ -4956,6 +4990,7 @@ namespace llaminar2
             }
 #endif
             quantize_single_block_scalar(src, dst, 32);
+#endif
         }
 
         // ==========================================
@@ -9199,13 +9234,13 @@ namespace llaminar2
         /**
          * @brief Unpack entire IQ1_S super-block to int8 (256 elements) - AVX512 Optimized
          */
+#if defined(__AVX512F__)
         __attribute__((always_inline)) inline void unpack_iq1_s_superblock_to_int8_avx512(
             const IQ1_SBlock &block,
             int8_t *output,
             float *scales,
             float *mins)
         {
-#if defined(__AVX512F__)
             const float d = fp16_to_fp32(block.d);
             const __m512i vmin_clamp = _mm512_set1_epi32(-127);
             const __m512i vmax_clamp = _mm512_set1_epi32(127);
@@ -9335,8 +9370,8 @@ namespace llaminar2
 
             if (mins)
                 _mm256_storeu_ps(mins, _mm256_setzero_ps());
-#endif
         }
+#endif
 
         /**
          * @brief Unpack entire IQ1_S super-block to int8 (256 elements)

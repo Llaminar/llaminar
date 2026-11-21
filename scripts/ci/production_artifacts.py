@@ -387,6 +387,19 @@ def digest(value: object) -> str:
                                      allow_nan=False).encode()).hexdigest()
 
 
+def file_digest(path: Path) -> str:
+    """Authenticate exact file bytes by streaming SHA256, without a second copy.
+
+    Large native libraries never load into memory at once: the digest streams
+    one-megabyte blocks so sealing an installed artifact stays bounded.
+    """
+    stream_digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            stream_digest.update(block)
+    return stream_digest.hexdigest()
+
+
 def write_json(path: Path, value: object) -> None:
     """Publish complete JSON atomically, retaining the prior file on failure."""
     path.parent.mkdir(parents=True, exist_ok=True)

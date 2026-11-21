@@ -17,6 +17,7 @@
  */
 
 #include <gtest/gtest.h>
+#include <bit>
 #include "tensors/Tensors.h"
 #include "tensors/SIMDHelpers.h"
 #include "tensors/FP16Utils.h"
@@ -640,6 +641,11 @@ TEST_F(Q8_0_SIMD_Accuracy_Test, ISAParity_FindMaxAbs)
     float avx2_val = q8_0_find_max_abs_avx2(blocks.data(), blocks_per_row);
     EXPECT_NEAR(ref, avx2_val, 1e-4f) << "q8_0_find_max_abs scalar vs AVX2";
 #endif
+#if LLAMINAR_COMPILED_WITH_NEON
+    EXPECT_EQ(std::bit_cast<std::uint32_t>(ref),
+              std::bit_cast<std::uint32_t>(q8_0_find_max_abs_neon(blocks.data(), blocks_per_row)))
+        << "q8_0_find_max_abs NEON must equal the scalar program exactly";
+#endif
 }
 
 TEST_F(Q8_0_SIMD_Accuracy_Test, ISAParity_Requantize)
@@ -672,6 +678,13 @@ TEST_F(Q8_0_SIMD_Accuracy_Test, ISAParity_Requantize)
     std::vector<int8_t> ref(total), avx2_out(total), avx512_out(total);
 
     q8_0_requantize_scalar(blocks.data(), blocks_per_row, inv_scale, ref.data());
+#if LLAMINAR_COMPILED_WITH_NEON
+    {
+        std::vector<int8_t> neon_out(total);
+        q8_0_requantize_neon(blocks.data(), blocks_per_row, inv_scale, neon_out.data());
+        EXPECT_EQ(ref, neon_out) << "q8_0_requantize NEON must equal the scalar program exactly";
+    }
+#endif
 
 #if defined(__AVX2__)
     q8_0_requantize_avx2(blocks.data(), blocks_per_row, inv_scale, avx2_out.data());

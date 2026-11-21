@@ -921,16 +921,6 @@ namespace llaminar
                 // ==========================================================================
 
                 /**
-                 * @brief Get or create a device-scoped RoPE kernel
-                 *
-                 * Cache key is (target_device, tensor native_type). This ensures
-                 * a single RoPE kernel instance per device+precision variant.
-                 */
-                static llaminar2::ITensorRoPE *getOrCreateRoPE(
-                    const llaminar2::TensorBase *tensor,
-                    llaminar2::DeviceId target_device);
-
-                /**
                  * @brief Get or create a device-scoped RMSNorm kernel
                  *
                  * Cache key is (target_device, tensor native_type). This ensures
@@ -1622,27 +1612,6 @@ namespace llaminar
 
                 static std::unordered_map<FusedGateUpCacheKey, std::unique_ptr<llaminar2::ITensorFusedGateUpGemm>, FusedGateUpKeyHash> fused_gate_up_cache_;
 
-                struct RoPECacheKey
-                {
-                    llaminar2::DeviceId device_id;
-                    int tensor_type{0};
-
-                    bool operator==(const RoPECacheKey &other) const
-                    {
-                        return device_id == other.device_id && tensor_type == other.tensor_type;
-                    }
-                };
-
-                struct RoPECacheKeyHash
-                {
-                    size_t operator()(const RoPECacheKey &k) const
-                    {
-                        return std::hash<int>()(static_cast<int>(k.device_id.type)) ^
-                               (std::hash<int>()(k.device_id.ordinal) << 1) ^
-                               (std::hash<int>()(k.tensor_type) << 2);
-                    }
-                };
-
                 struct RMSNormCacheKey
                 {
                     llaminar2::DeviceId device_id;
@@ -1769,7 +1738,6 @@ namespace llaminar
                     }
                 };
 
-                static std::unordered_map<RoPECacheKey, std::unique_ptr<llaminar2::ITensorRoPE>, RoPECacheKeyHash> rope_cache_;
                 static std::unordered_map<RMSNormCacheKey, std::unique_ptr<llaminar2::ITensorRMSNorm>, RMSNormCacheKeyHash> rmsnorm_cache_;
                 static std::unordered_map<SwiGLUCacheKey, std::unique_ptr<llaminar2::ITensorSwiGLU>, SwiGLUCacheKeyHash> swiglu_cache_;
                 static std::unordered_map<SoftmaxCacheKey, std::unique_ptr<llaminar2::ITensorSoftmax>, SoftmaxCacheKeyHash> softmax_cache_;

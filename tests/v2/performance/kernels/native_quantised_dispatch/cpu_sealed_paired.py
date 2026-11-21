@@ -27,6 +27,7 @@ from typing import Callable, Iterable, Mapping, Protocol, Sequence
 
 import numpy as np
 
+from .host_cores import physical_core_count
 from .certification import (
     CertificationCell,
     CertificationReport,
@@ -636,29 +637,9 @@ def write_cpu_sealed_request_shards(
 
 
 def _physical_core_count() -> int:
-    """Count physical cores in the current affinity mask.
+    """Return affinity-visible physical cores (one worker per core; see ``host_cores``)."""
 
-    Bootstrap workers are compute-heavy NumPy processes. Hyperthreads contend
-    for the same execution resources and made prior reductions slower, so the
-    default deliberately caps process parallelism at physical cores.
-    """
-
-    logical = (
-        sorted(os.sched_getaffinity(0))
-        if hasattr(os, "sched_getaffinity")
-        else list(range(os.cpu_count() or 1))
-    )
-    cores = set()
-    for cpu in logical:
-        root = Path(f"/sys/devices/system/cpu/cpu{cpu}/topology")
-        try:
-            cores.add((
-                (root / "physical_package_id").read_text().strip(),
-                (root / "core_id").read_text().strip(),
-            ))
-        except OSError:
-            return max(1, len(logical))
-    return max(1, len(cores))
+    return physical_core_count()
 
 
 def _bootstrap_cell(

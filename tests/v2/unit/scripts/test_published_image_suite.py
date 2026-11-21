@@ -1523,6 +1523,8 @@ class PublishedImageSuiteTests(unittest.TestCase):
             {"context": "Develop PR / Unit + hardware preflight (AVX2)",
              "integration_id": 15368},
             {"context": "Develop PR / Unit + host (AVX512)",
+             "integration_id": 15368},
+            {"context": "ARM64 build and Unit + host",
              "integration_id": 15368}])
         self.assertEqual(master_ruleset.proposed_develop_ruleset(proposed), proposed)
         for previous in ([], master_ruleset.RELEASE_DEPLOY_KEY_BYPASS,
@@ -1542,6 +1544,37 @@ class PublishedImageSuiteTests(unittest.TestCase):
                 proposed["bypass_actors"] = [actor]
                 with self.assertRaisesRegex(ValueError, "unrelated bypass actor"):
                     master_ruleset.proposed_develop_ruleset(proposed)
+
+    def test_develop_only_install_checks_the_live_required_contexts(self):
+        """Verify the actual ruleset readback and avoid release-policy writes."""
+        endpoint = f"repos/Llaminar/llaminar/rulesets/{master_ruleset.DEVELOP_RULESET_ID}"
+        proposed = master_ruleset.proposed_develop_ruleset({
+            "name": "develop", "target": "branch", "enforcement": "active",
+            "conditions": {"ref_name": {"include": ["refs/heads/develop"], "exclude": []}},
+            "rules": [{"type": "deletion"}, {"type": "non_fast_forward"}],
+        })
+        without_arm = deepcopy(proposed)
+        checks = next(rule["parameters"]["required_status_checks"] for rule in without_arm["rules"]
+                      if rule["type"] == "required_status_checks")
+        checks[:] = [check for check in checks if check["context"] != "ARM64 build and Unit + host"]
+        for installed in (proposed, without_arm):
+            with self.subTest(installed=installed is proposed), \
+                 patch("builtins.print"), \
+                 patch.object(master_ruleset, "github_json",
+                              side_effect=[without_arm, installed]) as request, \
+                 patch.object(master_ruleset, "require_dedicated_release_key"), \
+                 patch.object(master_ruleset.subprocess, "run") as put:
+                if installed is proposed:
+                    self.assertEqual(master_ruleset.main(["--develop-only", "--apply"]), 0)
+                else:
+                    with self.assertRaisesRegex(ValueError, "installed policy differs from develop"):
+                        master_ruleset.main(["--develop-only", "--apply"])
+                self.assertEqual([call.args for call in request.call_args_list],
+                                 [(endpoint,), (endpoint,)])
+                put.assert_called_once()
+                self.assertEqual(put.call_args.args[0],
+                                 ["gh", "api", "--method", "PUT", endpoint, "--input", "-"])
+                self.assertEqual(json.loads(put.call_args.kwargs["input"]), proposed)
 
     def test_release_bypass_rejects_any_other_writable_deploy_key(self):
         with patch.object(master_ruleset, "github_json", return_value=[

@@ -190,6 +190,9 @@ void proveCPUJointCalibrationController(DeviceId whole_device=DeviceId::cpu(),bo
 {
     FabricOriginal original(whole_device,joined_service);
     const auto initial=original.authority->snapshot();
+    // Joint calibration keys include the cuts from the original owner map.
+    const auto catalog=std::make_shared<const MoEOverlayEconomyCalibrationLayerCatalog>(
+        original.manifests,&initial->originalOwnerMap());
     const auto footprint=MoEOverlayCapacityResolver::preparedFootprints(original.manifests).front();
     auto planner=std::make_shared<MoEOverlayEconomyCalibrationPlanner>(
         MoEOverlayEconomyCalibrationPlanner::Config{.live_snapshot=initial,
@@ -235,8 +238,7 @@ void proveCPUJointCalibrationController(DeviceId whole_device=DeviceId::cpu(),bo
         std::shared_ptr<const MoERoutedTierServiceProfile> service;
         if(joined_service) {
             try {
-                service=measureJoinedGPUCPUService(original,
-                    std::make_shared<const MoEOverlayEconomyCalibrationLayerCatalog>(original.manifests),
+                service=measureJoinedGPUCPUService(original,catalog,
                     ExpertHistogramProductionTopology::uniform(1,kAllExpertHistogramProductionSources),evidence);
             } catch(const std::exception& failure) {
                 // This also covers checked declarations before the producer's
@@ -314,8 +316,7 @@ void proveCPUJointCalibrationController(DeviceId whole_device=DeviceId::cpu(),bo
         // Feed the actual sealed native corpus through production source-bound
         // expansion and the SAME typed Composer used by certification. No new
         // timing, readiness or physical observation is authored by this check.
-        const MoEOverlayEconomyCalibrationLayerCatalog catalog(original.manifests);
-        const auto expanded=catalog.expand(*sealed,initial);
+        const auto expanded=catalog->expand(*sealed,initial);
         const auto costs=MoEOverlayEconomyProfileComposer::normalizeMigrationMeasurements(expanded.rows);
         ASSERT_EQ(costs.size(),coordinates.size());
         for(size_t index=0;index<costs.size();++index) {
@@ -389,13 +390,14 @@ void proveMixedJointCalibration(DeviceId backend)
     FabricOriginal original(backend,true,true);
     try {
         const auto initial=original.authority->snapshot();
+        const auto catalog=std::make_shared<const MoEOverlayEconomyCalibrationLayerCatalog>(
+            original.manifests,&initial->originalOwnerMap());
         const auto topology=ExpertHistogramProductionTopology::uniform(1,kAllExpertHistogramProductionSources);
         auto evidence=std::make_shared<MoEOverlayMPIEconomyEvidenceExchange>(
             MoEOverlayMPIEconomyEvidenceExchange::Config{.mpi_context=original.mpi,
                 .owner_map=initial->placementOwnerMap(),.production_topology=topology,
                 .perf_device="native-gpu-cpu-joint-service"});
-        const auto profile=measureJoinedGPUCPUService(original,
-            std::make_shared<const MoEOverlayEconomyCalibrationLayerCatalog>(original.manifests),topology,evidence,true);
+        const auto profile=measureJoinedGPUCPUService(original,catalog,topology,evidence,true);
         EXPECT_EQ(profile->prepared_plan->snapshot(),initial);
         EXPECT_EQ(original.authority->snapshot(),initial);
         EXPECT_FALSE(original.authority->migrationEnabled());

@@ -1914,7 +1914,7 @@ namespace
                     : packed.codebook_id == 13 && packed.usesCompactMultiScale()
                         ? native_quantised_iq2s_scale::pack(0x71)
                         : min_fp16;
-        uint8_t *const bytes = packed.native_interleaved.data();
+        uint8_t *const bytes = packed.native_interleaved.beginRewrite().data();
 #pragma omp parallel
         {
             // First-touch every page in parallel. The index hash supplies
@@ -1983,6 +1983,7 @@ namespace
             }
         }
 
+        packed.sealPublication();
         return packed;
     }
 

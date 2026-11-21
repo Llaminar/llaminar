@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+## @file toolchain_cache.py
+#  @brief Authenticate and bind ISA-specific OCI toolchains to source image builds.
 """Admit complete, dependency-bound OCI toolchains for ephemeral cloud builders.
 
 The cache key describes only the committed dependency context and CPU ISA.
@@ -22,7 +24,9 @@ import time
 
 ROOT = Path(__file__).resolve().parents[2]
 TOOLCHAIN_ROOT_ENV = "LLAMINAR_DOCKER_TOOLCHAIN_ROOT"
-ISAS = ("AVX512", "AVX2")
+X86_ISAS = ("AVX512", "AVX2")
+ARCHITECTURES = {isa: "amd64" for isa in X86_ISAS} | {"NEON": "arm64"}
+ISAS = tuple(ARCHITECTURES)
 SCHEMA = 1
 # This is the complete available context, not merely a cache-key approximation.
 # Add dependencies here when adding a toolchain COPY outside these roots.
@@ -43,7 +47,7 @@ def git(*arguments: str) -> bytes:
 def identity(tree: str, isa: str) -> dict:
     """Bind the available dependency context, policy version and explicit ISA."""
     if isa not in ISAS:
-        raise ValueError("toolchain cache requires AVX512 or AVX2")
+        raise ValueError("toolchain cache requires AVX512, AVX2 or NEON")
     entries = git("ls-tree", "-r", "-z", tree, "--", *INPUTS).split(b"\0")
     objects = [entry.decode() for entry in entries if entry]
     paths = [entry.split("\t", 1)[1] for entry in objects]
@@ -67,7 +71,7 @@ def prepare(root: Path, isa: str, github_output: Path) -> None:
         source.extractall(context, filter="data")
     with github_output.open("a") as output:
         output.write(f"context={context}\nroot={root}\n")
-        for selected in ISAS if isa == "both" else (isa,):
+        for selected in X86_ISAS if isa == "both" else (isa,):
             admitted = identity(tree, selected)
             suffix = selected.lower()
             output.write(f"key_{suffix}=llaminar-toolchain-oci-v{SCHEMA}-{suffix}-{admitted['fingerprint']}\n")
@@ -104,7 +108,7 @@ def blob(layout: Path, descriptor: dict, *, contents: bool = True) -> bytes:
 
 
 def admit(layout: Path, expected: dict, *, verify_layers: bool = False) -> dict:
-    """Admit a single Linux/amd64 image bound to the exact dependency identity.
+    """Admit a single Linux image bound to the requested ISA and dependencies.
 
     Cache restoration validates all layer digests once. The source image driver
     rechecks the manifest/config and layer extents; BuildKit owns validation of
@@ -131,8 +135,9 @@ def admit(layout: Path, expected: dict, *, verify_layers: bool = False) -> dict:
         raise ValueError("toolchain artifact is not an OCI image manifest")
     manifest = json.loads(blob(layout, descriptor))
     config = json.loads(blob(layout, manifest["config"]))
-    if config.get("os") != "linux" or config.get("architecture") != "amd64":
-        raise ValueError("toolchain artifact must target linux/amd64")
+    architecture = ARCHITECTURES[expected["cpu_isa"]]
+    if config.get("os") != "linux" or config.get("architecture") != architecture:
+        raise ValueError(f"toolchain artifact must target linux/{architecture}")
     labels = config.get("config", {}).get("Labels", {})
     if labels.get(INPUT_LABEL) != expected["fingerprint"] or labels.get(ISA_LABEL) != expected["cpu_isa"]:
         raise ValueError("toolchain artifact does not match the admitted dependency inputs/ISA")
@@ -155,6 +160,11 @@ def admit(layout: Path, expected: dict, *, verify_layers: bool = False) -> dict:
             "layer_bytes": sum(layer["size"] for layer in layers), "layer_count": len(layers)}
 
 
+def toolchain_context(layout: Path, admitted: dict) -> str:
+    """Bind BuildKit's named toolchain context to the admitted manifest digest."""
+    return f"toolchain=oci-layout://{layout}@{admitted['manifest']}"
+
+
 def build_context_arguments(isa: str, source_tree: str) -> list[str]:
     """Require the prepared artifact whenever cloud CI declares its authority."""
     raw = os.environ.get(TOOLCHAIN_ROOT_ENV)
@@ -167,7 +177,7 @@ def build_context_arguments(isa: str, source_tree: str) -> list[str]:
     admitted = admit(layout, identity(source_tree, isa))
     print(f"[toolchain-cache] consume isa={isa} manifest={admitted['manifest']} "
           f"inputs={admitted['fingerprint']}", flush=True)
-    return ["--build-context", f"toolchain=oci-layout://{layout}@{admitted['manifest']}"]
+    return ["--build-context", toolchain_context(layout, admitted)]
 
 
 def main() -> None:
@@ -190,7 +200,11 @@ def main() -> None:
             parser.error("verify requires one explicit ISA")
         started = time.monotonic()
         tree = git("rev-parse", "HEAD^{tree}").decode().strip()
-        receipt = admit(args.root / args.cpu_isa.lower(), identity(tree, args.cpu_isa), verify_layers=True)
+        layout = args.root / args.cpu_isa.lower()
+        receipt = admit(layout, identity(tree, args.cpu_isa), verify_layers=True)
+        if args.github_output is not None:
+            with args.github_output.open("a") as output:
+                output.write(f"build_context={toolchain_context(layout, receipt)}\n")
         receipt.update(cache_restored=args.cache_hit == "true", validation_seconds=time.monotonic() - started)
         (args.root / f"{args.cpu_isa.lower()}-toolchain.json").write_text(json.dumps(receipt, indent=2) + "\n")
         print("[toolchain-cache] " + json.dumps(receipt), flush=True)

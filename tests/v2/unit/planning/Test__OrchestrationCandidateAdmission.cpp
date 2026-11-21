@@ -186,6 +186,9 @@ TEST(OrchestrationCandidateAdmission, MissingMTPWeightsAreNotCapacityExhaustion)
     }
 }
 
+// Requires a compiled CUDA/ROCm backend family: its subject prices or
+// constructs GPU-native objects that do not exist in a CPU-only build.
+#if defined(HAVE_CUDA) || defined(HAVE_ROCM)
 TEST(OrchestrationCandidateAdmission, RemoteOverlayAdmitsEveryRankAndRetainsDepthFifteen)
 {
     for (const auto format : {GGUFTensorType::F32, GGUFTensorType::F16, GGUFTensorType::BF16})
@@ -233,6 +236,7 @@ TEST(OrchestrationCandidateAdmission, RemoteOverlayAdmitsEveryRankAndRetainsDept
         }
     }
 }
+#endif // defined(HAVE_CUDA) || defined(HAVE_ROCM)
 
 /**
  * @brief Discovery-time capacity evidence must not become a fixed live quota.

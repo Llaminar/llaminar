@@ -103,6 +103,10 @@ namespace llaminar2
             int seq_len, int channels, int kernel_size,
             bool apply_silu);
 
+        /** @brief Widest causal window the SIMD prefill programs hold in registers. */
+        static constexpr int kMaxSIMDPrefillKernelSize = 8;
+
+        /** @return False, before any write, for a window the SIMD programs cannot hold. */
         bool executePrefill(
             const float *input, const float *weight, const float *bias,
             float *output, float *conv_state,

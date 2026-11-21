@@ -32,14 +32,16 @@ def proof_owner(root: Path):
 def missing_builder_inputs(dockerfile: str) -> set[str]:
     """Project literal installer inputs through the early builder COPY closure.
 
-    Only shell-form COPY instructions feeding /tmp/install-scripts are relevant.
-    Stop at the first RUN: these inputs must exist before dependency setup starts.
+    Inspect shell-form COPY instructions feeding /tmp/install-scripts in the
+    GPU SDK stage before it invokes the ROCm installer.
     Resolve directory copies to real repository files, preserving destination names.
     """
     installed = set()
     logical = dockerfile.replace('\\\n', ' ')
-    for line in logical.splitlines():
-        if line.startswith('RUN '):
+    sdk = next(stage for stage in re.split(r'^FROM ', logical, flags=re.MULTILINE)
+               if stage.partition('\n')[0].endswith(' AS gpu-sdk'))
+    for line in sdk.splitlines()[1:]:
+        if line.startswith('RUN ') and '/tmp/install-scripts/install-rocm.sh' in line:
             break
         if not line.startswith('COPY '):
             continue
@@ -55,6 +57,8 @@ def missing_builder_inputs(dockerfile: str) -> set[str]:
             elif path.is_file():
                 installed.add(str(Path(destination) / path.name)
                               if destination.endswith('/') else destination)
+    else:
+        raise ValueError('GPU SDK stage does not invoke the ROCm installer')
     installer = (ROOT / 'scripts/docker/install-rocr-helper-numa.sh').read_text()
     required = set(re.findall(r'\$\{rocr_script_dir\}/([^"\s]+)', installer))
     return {name for name in required if '/tmp/install-scripts/' + name not in installed}

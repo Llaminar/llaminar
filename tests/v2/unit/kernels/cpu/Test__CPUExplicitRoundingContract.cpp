@@ -6,10 +6,12 @@
  * codebook, then cover binary32 exponent boundaries and adversarial mantissas.
  * The oracle retains the old memory-rounding semantics independently of the
  * production helper. Q8 publication additionally checks every partial-block
- * length and complete SIMD blocks against scalar oracle bytes.
+ * length and complete SIMD blocks against scalar oracle bytes on x86 and ARM.
+ * Hardware half conversion is checked over its complete 65,536-word domain.
  */
 #include "kernels/common/DeviceFP32NumericalContract.h"
 #include "kernels/cpu/primitives/GPUAlignedExpertQ8Primitives.h"
+#include "kernels/cpu/gemm/CPUNativeQuantisedFP16.h"
 #include "utils/CPUExplicitRoundingOracle.h"
 
 #include <gtest/gtest.h>
@@ -25,6 +27,18 @@
 
 namespace llaminar2::test
 {
+/** @test Native finite half conversion and exact nonfinite payload publication agree. */
+TEST(CPUExplicitRoundingContract, NativeHalfScaleEveryEncodingIsByteExact)
+{
+    for (unsigned word = 0; word <= 0xffffu; ++word)
+    {
+        const auto bits = static_cast<std::uint16_t>(word);
+        ASSERT_EQ(std::bit_cast<std::uint32_t>(cpu::native_quantised::nativeQuantisedFP16ScaleToFP32(bits)),
+                  std::bit_cast<std::uint32_t>(fp16_to_fp32(bits)))
+            << "binary16 word=" << word;
+    }
+}
+
 /** @test Every persisted positive binary16 scale keeps the identical reciprocal. */
 TEST(CPUExplicitRoundingContract, EveryHalfScalePreservesReciprocalBits)
 {
@@ -155,8 +169,8 @@ TEST(CPUExplicitRoundingContract, ExpertQ8PackedLaneOrderAndExtremalSums)
     }
 }
 
-#if defined(LLAMINAR_Q8_SCALE_TEST_SCALAR) || defined(LLAMINAR_Q8_SCALE_TEST_AVX2) || defined(LLAMINAR_Q8_SCALE_TEST_AVX512)
-/** @test Dedicated targets compile the actual production ISA path and use real CPUID. */
+#if defined(LLAMINAR_Q8_SCALE_TEST_SCALAR) || defined(LLAMINAR_Q8_SCALE_TEST_AVX2) || defined(LLAMINAR_Q8_SCALE_TEST_AVX512) || defined(LLAMINAR_Q8_SCALE_TEST_NEON)
+/** @test Dedicated targets compile the actual production ISA without feature spoofing. */
 TEST(CPUExplicitRoundingContract, Q8FiniteScaleCompiledISAPath)
 {
 #if defined(LLAMINAR_Q8_SCALE_TEST_SCALAR)
@@ -173,6 +187,10 @@ TEST(CPUExplicitRoundingContract, Q8FiniteScaleCompiledISAPath)
     FAIL() << "AVX512 target omitted its production publication code";
 #endif
     ASSERT_TRUE(cpu_supports_avx512()) << "Actual AVX512 hardware required";
+#elif defined(LLAMINAR_Q8_SCALE_TEST_NEON)
+#if !defined(__aarch64__) || !defined(__ARM_NEON) || defined(__AVX2__) || defined(__AVX512F__)
+    FAIL() << "AArch64 NEON target omitted its native publication code";
+#endif
 #endif
 }
 #endif

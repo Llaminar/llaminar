@@ -86,7 +86,7 @@ if(TARGET v2_test_model_parity_definition)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ConsumerLocalAdaptiveLookupGeometryReplay)
 endif()
 if(TARGET v2_test_memory_planner)
-    add_v2_test(V2_Integration_GPUCacheSharedDirectoryCapacity
+    add_v2_test(V2_Integration_GPUCacheSharedDirectoryCapacity REQUIRES_BACKEND GPU
         COMMAND $<TARGET_FILE:v2_test_memory_planner>
             --gtest_filter=GPUAdaptiveImmutableLookupAdmission.SharedDirectoryPressureBalancesEveryFeasibleOwner
         LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;Qwen4Exp;Admission;Ownership;Regression"

@@ -16,14 +16,24 @@ class MPIRuntimePackagingTests(unittest.TestCase):
     """Replay actual image-inventory validation with tiny metadata-only fixtures."""
 
     def setUp(self) -> None:
-        """Create a disposable installed tree and its exact registered module operand."""
+        """Create a disposable installed tree and its exact registered operands."""
         temporary = tempfile.TemporaryDirectory(prefix="mpi-runtime-packaging-")
         self.addCleanup(temporary.cleanup)
         self.build = Path(temporary.name)
-        for name in ("CMakeCache.txt", "compile_commands.json", "build.ninja", "CMakeFiles/rules.ninja"):
+        # The exact distro-style MPI dev layout the sealed cache records: an
+        # unversioned dev link resolving to the SONAME library one level up.
+        self.mpi_library = self.build / "usr/lib/x86_64-linux-gnu/openmpi/lib/libmpi.so"
+        self.mpi_soname = self.build / "usr/lib/x86_64-linux-gnu/libmpi.so.40"
+        self.mpi_soname.parent.mkdir(parents=True)
+        self.mpi_soname.write_bytes(b"distro MPI runtime library")
+        self.mpi_library.parent.mkdir(parents=True)
+        self.mpi_library.symlink_to("../../libmpi.so.40")
+        for name in ("compile_commands.json", "build.ninja", "CMakeFiles/rules.ninja"):
             path = self.build / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("fixture")
+        (self.build / "CMakeCache.txt").write_text(
+            f"MPI_mpi_LIBRARY:FILEPATH={self.mpi_library}\n")
         self.module = self.build / "llaminar_mpi_components/mca_schizo_llaminar.so"
         self.module.parent.mkdir()
         self.module.write_bytes(b"original fixture module")
@@ -38,6 +48,83 @@ class MPIRuntimePackagingTests(unittest.TestCase):
         receipt = installed.inventory(self.build)
         entry = receipt["files"][str(self.module.relative_to(self.build))]
         self.assertEqual(entry["bytes"], self.module.stat().st_size)
+
+    def test_configured_mpi_library_is_sealed_with_its_link_identity(self) -> None:
+        receipt = installed.inventory(self.build)
+        self.assertEqual(receipt["mpi_library"], {
+            "path": str(self.mpi_library),
+            "resolved_path": str(self.mpi_soname),
+            "link_target": "../../libmpi.so.40",
+            "bytes": self.mpi_soname.stat().st_size,
+            "sha256": installed.file_digest(self.mpi_soname)})
+
+    def test_missing_configured_mpi_library_rejects_the_image(self) -> None:
+        self.mpi_library.unlink()
+        with self.assertRaisesRegex(ValueError, "configured MPI library is missing"):
+            installed.inventory(self.build)
+
+    def test_cache_without_a_configured_mpi_library_rejects_the_image(self) -> None:
+        (self.build / "CMakeCache.txt").write_text("fixture\n")
+        with self.assertRaisesRegex(ValueError, "does not record the configured MPI library"):
+            installed.inventory(self.build)
+
+    def test_same_length_replaced_library_bytes_invalidate_the_receipt(self) -> None:
+        receipt = self.build / "installed.json"
+        receipt.write_text(json.dumps({"schema": 1, "scope": "production",
+            "inventory": installed.inventory(self.build)}))
+        original = self.mpi_soname.read_bytes()
+        self.mpi_soname.write_bytes(bytes((byte + 1) % 256 for byte in original))
+        self.assertEqual(self.mpi_soname.stat().st_size, len(original))
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            installed.validate(receipt, self.build)
+
+    def test_foreign_symlink_target_invalidates_the_receipt(self) -> None:
+        for target, same_length in (("../../libmpi_impostor.so", True),
+                                    ("../../libmpi_small.so", False)):
+            with self.subTest(target=target, same_length=same_length):
+                build = self.fresh_installed_tree()
+                receipt = build / "installed.json"
+                receipt.write_text(json.dumps({"schema": 1, "scope": "production",
+                    "inventory": installed.inventory(build)}))
+                impostor = build / "usr/lib/x86_64-linux-gnu/libmpi_impostor.so"
+                impostor.write_bytes(bytes((byte + 1) % 256
+                    for byte in self.mpi_soname.read_bytes()))
+                short = build / "usr/lib/x86_64-linux-gnu/libmpi_small.so"
+                short.write_bytes(b"short")
+                library = build / "usr/lib/x86_64-linux-gnu/openmpi/lib/libmpi.so"
+                library.unlink()
+                library.symlink_to("../../libmpi_impostor.so" if same_length
+                    else "../../libmpi_small.so")
+                with self.assertRaisesRegex(ValueError, "does not match"):
+                    installed.validate(receipt, build)
+
+    def fresh_installed_tree(self) -> Path:
+        """Rebuild the complete disposable installed tree for one negative case."""
+        build = Path(tempfile.mkdtemp(prefix="mpi-runtime-packaging-"))
+        self.addCleanup(lambda: __import__("shutil").rmtree(build, ignore_errors=True))
+        soname = build / "usr/lib/x86_64-linux-gnu/libmpi.so.40"
+        soname.parent.mkdir(parents=True)
+        soname.write_bytes(b"distro MPI runtime library")
+        library = build / "usr/lib/x86_64-linux-gnu/openmpi/lib/libmpi.so"
+        library.parent.mkdir(parents=True)
+        library.symlink_to("../../libmpi.so.40")
+        for name in ("compile_commands.json", "build.ninja", "CMakeFiles/rules.ninja"):
+            path = build / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("fixture")
+        (build / "CMakeCache.txt").write_text(
+            f"MPI_mpi_LIBRARY:FILEPATH={library}\n")
+        module = build / "llaminar_mpi_components/mca_schizo_llaminar.so"
+        module.parent.mkdir()
+        module.write_bytes(b"original fixture module")
+        registration = {"tests": [{"name": "V2_Integration_MPISessionNativeDaemon",
+            "command": ["python3", "native-replay.py", "--module", str(module)],
+            "properties": [{"name": "LABELS", "value": ["ProductionTestPreflight"]}]}]}
+        query = mock.patch.object(installed.subprocess, "check_output",
+            return_value=json.dumps(registration))
+        query.start()
+        self.addCleanup(query.stop)
+        return build
 
     def test_required_missing_module_rejects_the_image(self) -> None:
         self.module.unlink()

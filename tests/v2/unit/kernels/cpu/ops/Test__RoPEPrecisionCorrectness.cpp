@@ -13,6 +13,7 @@
 #include "kernels/cpu/primitives/RoPEPrimitives.h"
 #include "tensors/SIMDHelpers.h"
 #include "tensors/FP16Utils.h"
+#include "../../../../utils/RoPEAngleTestStorage.h"
 #include <vector>
 #include <cmath>
 #include <random>
@@ -27,6 +28,9 @@ namespace llaminar2::test
     class RoPEPrecisionCorrectnessTest : public ::testing::Test
     {
     protected:
+        /// Angle planes borrowed by direct primitive calls, like a bound stage workspace.
+        test::RoPEAngleTestStorage rope_angles{4096, 256};
+
         void SetUp() override
         {
             // Use deterministic random seed for reproducible tests
@@ -754,7 +758,7 @@ namespace llaminar2::test
             seq_len, head_dim,
             q_heads, k_heads,
             n_past, freq_base,
-            nullptr);
+            rope_angles.view(seq_len, head_dim / 2));
 
         // Apply RoPE using scalar-only path (reference)
         const auto &inv_freq = primitives::get_inv_freq_cached(head_dim, freq_base);
@@ -805,7 +809,7 @@ namespace llaminar2::test
             seq_len, head_dim,
             q_heads, k_heads,
             n_past, freq_base,
-            nullptr);
+            rope_angles.view(seq_len, head_dim / 2));
 
         // Scalar reference
         const auto &inv_freq = primitives::get_inv_freq_cached(head_dim, freq_base);
@@ -923,14 +927,14 @@ namespace llaminar2::test
             primitives::apply_rope_vectorized(
                 q_token, nullptr,        // Only Q for this token
                 1, head_dim, q_heads, 0, // seq_len=1, k_heads=0 (no K)
-                position, freq_base, nullptr);
+                position, freq_base, rope_angles.view(1, head_dim / 2));
 
             // Apply to K heads for this token
             float *k_token = k_test.data() + tok * k_heads * head_dim;
             primitives::apply_rope_vectorized(
                 nullptr, k_token,        // Only K for this token
                 1, head_dim, 0, k_heads, // seq_len=1, q_heads=0 (no Q)
-                position, freq_base, nullptr);
+                position, freq_base, rope_angles.view(1, head_dim / 2));
         }
 
         // Compare: Should match reference when per-token positions are correctly applied
@@ -994,14 +998,14 @@ namespace llaminar2::test
             primitives::apply_rope_vectorized(
                 q_token, nullptr,
                 1, head_dim, q_heads, 0,
-                position, freq_base, nullptr);
+                position, freq_base, rope_angles.view(1, head_dim / 2));
 
             // Apply to K heads for this token
             float *k_token = k_test.data() + tok * k_heads * head_dim;
             primitives::apply_rope_vectorized(
                 nullptr, k_token,
                 1, head_dim, 0, k_heads,
-                position, freq_base, nullptr);
+                position, freq_base, rope_angles.view(1, head_dim / 2));
         }
 
         expectNear(q_ref, q_test, 1e-5f, "Variable length Q");
@@ -1062,7 +1066,8 @@ namespace llaminar2::test
                     1, // n_heads
                     0, // n_kv_heads
                     head_dim,
-                    rope_theta);
+                    rope_theta,
+                    rope_angles.view(seq_len, head_dim / 2));
 
                 // 5. Dequantize result
                 auto q_result_fp32 = dequantizeQ8_1(q_q8_1);

@@ -28,7 +28,8 @@ namespace
      * to hide that latency; ordinary packet kernels retain the smaller block
      * because their element grid already supplies the required concurrency.
      */
-    constexpr unsigned int kSingleRowThreads = 512u;
+    constexpr unsigned int kSingleRowThreads =
+        llaminar2::moe_activation_packet_device::kSingleRowDispatchThreads;
     /** Bounded route-slot blocks; each block walks additional slots grid-stride. */
     constexpr unsigned int kSparseRoutePayloadBlocks = 256u;
 

@@ -5,8 +5,8 @@
 
 An installed test-runner image cannot incrementally rebuild: compiler-only
 objects are deliberately absent. This receipt changes only build preparation,
-not test execution. Unit-only PR images and complete production companions
-carry distinct scopes; a Unit receipt cannot admit production preflight.
+not test execution. Production, Unit-only and ARM64 PR companions carry
+distinct receipt scopes.
 The outer CI driver pins the immutable image ID and never overlays build/source
 files, while this receipt checks its installed CTest and executable inventory.
 """
@@ -15,15 +15,17 @@ from __future__ import annotations
 import argparse
 from enum import Enum
 import json
+import os
 from pathlib import Path
+import re
 import subprocess
 
-from production_artifacts import digest, write_json
+from production_artifacts import digest, file_digest, write_json
 from run_production_parity_campaigns import (
     PRODUCTION_CAMPAIGN_NAME, PRODUCTION_TEST_PREFLIGHT_LABEL,
-    PRODUCTION_PARITY_UNIT_LABEL, PRODUCTION_PARITY_UNIT_PREFIX,
+    PRODUCTION_PARITY_UNIT_LABEL, PRODUCTION_PARITY_UNIT_PREFIX, PreflightExecutionLane,
     discover_production_test_preflight_tests,
-    discover_production_parity_unit_tests,
+    discover_production_parity_unit_tests, discover_production_test_preflight_registrations,
     _as_string_list, _property_map,
 )
 
@@ -33,11 +35,46 @@ from run_production_parity_campaigns import (
 RUNTIME_FILE_PREFIXES = ("v2_", "llaminar_", "libllaminar", "mca_schizo_llaminar")
 
 
+def _configured_mpi_library(build: Path) -> dict:
+    """Seal the builder's exact configured MPI library selection and bytes.
+
+    The native MPI ABI proof replays the CTest-recorded ``--mpi-library``
+    operand, so an installed test image must carry exactly the library path
+    CMake recorded from its toolchain. The slim runtime closure replaces the
+    unversioned MPI dev link with the distro SONAME library, so the receipt
+    seals the configured path, its link identity, the resolved artifact path
+    and a streaming SHA256 of the resolved bytes; validation fails closed
+    when a runner image omits that library, retargets the link or replaces
+    the bytes (including a same-length replacement) instead of letting the
+    ABI proof load a substitute.
+    """
+    cache = (build / "CMakeCache.txt").read_text()
+    match = re.search(r"^MPI_mpi_LIBRARY:FILEPATH=(.+?)\s*$", cache, re.MULTILINE)
+    if match is None or match.group(1).endswith("-NOTFOUND"):
+        raise ValueError("sealed CMake cache does not record the configured MPI library")
+    library = Path(match.group(1))
+    if not library.is_file():
+        raise ValueError(
+            f"configured MPI library is missing from the installed test image: {library}")
+    resolved = library.resolve(strict=True)
+    entry = {"path": str(library), "resolved_path": str(resolved),
+             "bytes": resolved.stat().st_size, "sha256": file_digest(resolved)}
+    if library.is_symlink():
+        entry["link_target"] = os.readlink(library)
+    return entry
+
+
 class InstalledTestScope(str, Enum):
     """The caller, never the receipt, owns the required executable inventory."""
 
     PRODUCTION = "production"
     UNIT = "unit"
+    ARM64_PR = "arm64-pr"
+
+    @property
+    def ctest_label(self) -> str | None:
+        """Return the additional CMake scope label, when this scope has one."""
+        return "ARM64PR" if self is InstalledTestScope.ARM64_PR else None
 
 
 def inventory(build: Path, scope: InstalledTestScope = InstalledTestScope.PRODUCTION) -> dict:
@@ -62,6 +99,11 @@ def inventory(build: Path, scope: InstalledTestScope = InstalledTestScope.PRODUC
                     or (scope is InstalledTestScope.PRODUCTION and (
                         PRODUCTION_TEST_PREFLIGHT_LABEL in labels
                         or PRODUCTION_CAMPAIGN_NAME.search(name))))
+        if scope is InstalledTestScope.ARM64_PR:
+            required = scope.ctest_label in labels
+            if required and set(labels) & {"CUDA", "ROCm", "Vulkan", "FullDeviceInventory",
+                                           "HardwareOptional"}:
+                raise ValueError(f"ARM64 PR receipt requires host-only tests: {name}")
         if not required:
             continue
         # CTest can omit the command entirely when it cannot resolve the test
@@ -78,7 +120,8 @@ def inventory(build: Path, scope: InstalledTestScope = InstalledTestScope.PRODUC
     return {"build_dir": str(build), "tests": tests,
             "files": {str(path.relative_to(build)): {"bytes": path.stat().st_size,
                        "mtime_seconds": int(path.stat().st_mtime)} for path in sorted(set(files))},
-            "registration_digest": digest([path.read_text() for path in sorted(build.rglob("CTestTestfile.cmake"))])}
+            "registration_digest": digest([path.read_text() for path in sorted(build.rglob("CTestTestfile.cmake"))]),
+            "mpi_library": _configured_mpi_library(build)}
 
 
 def validate(path: Path, build: Path,
@@ -102,10 +145,27 @@ def seal(path: Path, build: Path,
     """
     if not isinstance(scope, InstalledTestScope):
         raise TypeError("installed test sealing requires a typed scope")
-    discover_production_parity_unit_tests(build)
-    if scope is InstalledTestScope.PRODUCTION:
-        discover_production_test_preflight_tests(build)
-    write_json(path, {"schema": 1, "scope": scope.value, "inventory": inventory(build, scope)})
+    if scope is InstalledTestScope.ARM64_PR:
+        units = discover_production_parity_unit_tests(build, scope_label=scope.ctest_label)
+        registrations = discover_production_test_preflight_registrations(
+            build, scope_label=scope.ctest_label)
+        if not units or not registrations or any(
+                item.lane is not PreflightExecutionLane.HOST for item in registrations):
+            raise ValueError("ARM64 PR receipt requires nonempty Unit and host-only preflight")
+        installed = inventory(build, scope)
+        expected = set(units) | {item.name for item in registrations}
+        labeled = {
+            test["name"] for test in installed["tests"]
+            if scope.ctest_label in _as_string_list(_property_map(test).get("LABELS", []))
+        }
+        if labeled != expected:
+            raise ValueError("ARM64 PR receipt contains a registration outside Unit and host preflight")
+    else:
+        discover_production_parity_unit_tests(build)
+        if scope is InstalledTestScope.PRODUCTION:
+            discover_production_test_preflight_tests(build)
+        installed = inventory(build, scope)
+    write_json(path, {"schema": 1, "scope": scope.value, "inventory": installed})
 
 
 if __name__ == "__main__":

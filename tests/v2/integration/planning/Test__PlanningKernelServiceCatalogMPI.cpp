@@ -34,6 +34,7 @@
 #include <iostream>
 #include <set>
 #include <omp.h>
+#include <set>
 
 using namespace llaminar2;
 using namespace llaminar2::test;

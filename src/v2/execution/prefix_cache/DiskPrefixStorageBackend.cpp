@@ -2584,7 +2584,16 @@ namespace llaminar2
     bool DiskPrefixStorageBackend::requestCompaction(std::string *error)
     {
         std::lock_guard lock(mutex_);
-        return scheduleCompactionLocked(error);
+        if (!scheduleCompactionLocked(error))
+            return false;
+        // Explicit requests made during a copy require another publication.
+        // Automatic requests use the current archive's budget after publication.
+        if (compaction_status_.state == CompactionState::Copying ||
+            compaction_status_.state == CompactionState::Publishing)
+        {
+            compaction_requested_during_rewrite_ = true;
+        }
+        return true;
     }
 
     DiskPrefixStorageBackend::CompactionStatus
@@ -2643,11 +2652,15 @@ namespace llaminar2
             }
             if (stop.stop_requested())
                 break;
-            // The finite tail and writes after publication can add stale
-            // records. The current index already includes both under mutex_.
-            compaction_status_.state = outcome == CompactionOutcome::Published &&
-                exceedsCompactionThresholdLocked(scan_offset_)
-                ? CompactionState::Scheduled : CompactionState::Idle;
+            // Only our own publication can make a repeat useful. The
+            // finite tail can leave stale history even when no writer
+            // explicitly requested another rewrite during this copy.
+            const bool rewrite_again = outcome == CompactionOutcome::Published &&
+                (compaction_requested_during_rewrite_ ||
+                 exceedsCompactionThresholdLocked(scan_offset_));
+            compaction_requested_during_rewrite_ = false;
+            compaction_status_.state =
+                rewrite_again ? CompactionState::Scheduled : CompactionState::Idle;
             compaction_changed_.notify_all();
         }
         compaction_status_.state = CompactionState::Stopping;

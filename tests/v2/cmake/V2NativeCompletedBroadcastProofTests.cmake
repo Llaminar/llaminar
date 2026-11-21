@@ -152,7 +152,8 @@ list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NativeCompletedHos
 add_test(NAME V2_Integration_RCCLAddressedP2pResourceProofPackaging
     COMMAND ${Python3_EXECUTABLE} -B
         "${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_completed_broadcast_proof.py"
-        NativeCompletedProofTests.test_rccl_owned_resources_require_complete_call_free_entry_coverage)
+        NativeCompletedProofTests.test_rccl_owned_resources_require_complete_call_free_entry_coverage
+        OwnedEntryRecordPathTests)
 set_tests_properties(V2_Integration_RCCLAddressedP2pResourceProofPackaging PROPERTIES
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;BuildSystem;Replay;KernelResource;Regression" TIMEOUT 30)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_RCCLAddressedP2pResourceProofPackaging)

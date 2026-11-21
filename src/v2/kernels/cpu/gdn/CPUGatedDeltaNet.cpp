@@ -39,6 +39,9 @@
 #if defined(__AVX512F__) || defined(__AVX2__)
 #include <immintrin.h>
 #endif
+#if LLAMINAR_COMPILED_WITH_NEON
+#include "NEONGDNNormalization.h"
+#endif
 
 #include <vector>
 
@@ -531,6 +534,18 @@ namespace llaminar2
     }
 #endif
 
+#if LLAMINAR_COMPILED_WITH_NEON
+    using neon_gdn::norm_sq_avx2_program;
+    using neon_gdn::scale_rows;
+
+    /** @brief NEON in-place L2 normalization with the AVX2 reduction program. */
+    static void l2normalize_vec_neon(float *vec, int head_dim, float eps)
+    {
+        const float inv_norm = 1.0f / std::sqrt(norm_sq_avx2_program(vec, head_dim) + eps);
+        scale_rows(vec, vec, head_dim, inv_norm);
+    }
+#endif
+
 // Stubs for when ISA is unavailable at compile time
 #if !defined(__AVX2__)
     static void l2normalize_vec_avx2(float *vec, int head_dim, float eps)
@@ -653,6 +668,18 @@ namespace llaminar2
             for (; d < dim; ++d)
                 k_dst[d] = k_src[d] * inv;
         }
+    }
+#endif
+
+#if LLAMINAR_COMPILED_WITH_NEON
+    /** @brief NEON Q (fused scale) and K L2 normalization, AVX2 program. */
+    static void gdn_preprocess_qk_l2norm_neon(
+        const float *q_src, const float *k_src,
+        float *q_dst, float *k_dst,
+        int dim, float scale, float eps)
+    {
+        scale_rows(q_src, q_dst, dim, scale / std::sqrt(norm_sq_avx2_program(q_src, dim) + eps));
+        scale_rows(k_src, k_dst, dim, 1.0f / std::sqrt(norm_sq_avx2_program(k_src, dim) + eps));
     }
 #endif
 

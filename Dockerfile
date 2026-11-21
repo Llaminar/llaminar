@@ -63,6 +63,7 @@ ARG LLAMINAR_SOURCE_TREE=
 # =============================================================================
 FROM ubuntu:24.04 AS gpu-sdk
 
+ARG TARGETARCH
 ARG CUTLASS_VERSION
 ARG NINJA_VERSION
 ARG LLAMINAR_BUILD_TYPE
@@ -70,6 +71,12 @@ ARG LLAMINAR_CUDA_ARCHS
 ARG LLAMINAR_ENABLE_CUDA
 ARG LLAMINAR_ENABLE_ROCM
 ARG ROCM_RUNTIME_GPU_TARGETS
+
+# The pinned ROCm packages require an amd64 host architecture.
+RUN if [ "${TARGETARCH}:${LLAMINAR_ENABLE_ROCM}" = "arm64:ON" ]; then \
+        echo "The pinned ROCm SDK has no Linux ARM64 packages; select the CUDA or CPU build explicitly." >&2; \
+        exit 1; \
+    fi
 
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDAARCHS=${LLAMINAR_CUDA_ARCHS} \
@@ -338,6 +345,9 @@ RUN rm -rf /tmp/install-scripts
 ARG LLAMINAR_CPU_ISA
 ARG ONEDNN_GIT_REF=v3.11.3
 RUN set -e; \
+    # ARM64 builds oneDNN through its native CMake ISA/build receipt owner
+    # during application configuration.
+    if [ "${TARGETARCH}" = "arm64" ]; then exit 0; fi; \
     onednn_started_epoch="$(date +%s)"; \
     case "${LLAMINAR_CPU_ISA}" in \
         AVX512) ONEDNN_ISA_SUFFIX=avx512; ONEDNN_CPU_FLAGS="-msse4.1 -mavx -mavx2 -mfma -mf16c -mbmi -mbmi2 -mpopcnt -mavx512f -mavx512bw -mavx512dq -mavx512vl -mavx512vnni" ;; \
@@ -394,11 +404,15 @@ COPY requirements.txt ./requirements.txt
 # a build-only installer with byte-range resumption for the large CPU wheels.
 RUN --mount=type=cache,target=/root/.cache/pip \
     --mount=type=tmpfs,target=/tmp/wheel-installer \
-    python3 -m pip install --no-deps --target /tmp/wheel-installer pip==26.2.1 \
- && PYTHONPATH=/tmp/wheel-installer python3 -m pip install \
-        --resume-retries 3 --break-system-packages -r requirements.txt
+    if [ "${TARGETARCH}" != "arm64" ]; then \
+        python3 -m pip install --no-deps --target /tmp/wheel-installer pip==26.2.1 \
+        && PYTHONPATH=/tmp/wheel-installer python3 -m pip install \
+            --resume-retries 3 --break-system-packages -r requirements.txt; \
+    fi
 
 FROM toolchain AS builder
+
+ARG TARGETARCH
 
 # An admitted OCI toolchain is an external image, so build arguments must be
 # declared here rather than relying on inheritance from an in-file stage.
@@ -421,6 +435,7 @@ ARG LLAMINAR_BUILD_MODEL_PARITY_MATRICES
 ARG LLAMINAR_TEST_RUNNER_INVENTORY
 RUN case "${LLAMINAR_BUILD_MODEL_PARITY_MATRICES}:${LLAMINAR_TEST_RUNNER_INVENTORY}" in \
         ON:full-matrix|OFF:model-free|OFF:unit-only) ;; \
+        OFF:arm64-pr) test "${TARGETARCH}:${LLAMINAR_CPU_ISA}:${LLAMINAR_ENABLE_CUDA}:${LLAMINAR_ENABLE_ROCM}:${LLAMINAR_SKIP_INTEGRATION}" = "arm64:NEON:ON:OFF:0" ;; \
         *) echo "Invalid test-runner inventory: matrices=${LLAMINAR_BUILD_MODEL_PARITY_MATRICES}, inventory=${LLAMINAR_TEST_RUNNER_INVENTORY}" >&2; exit 1 ;; \
     esac
 
@@ -473,6 +488,11 @@ RUN --mount=type=cache,id=llaminar-ccache,target=/root/.ccache,sharing=locked \
         echo "==> [integration] skipped (LLAMINAR_SKIP_INTEGRATION=1)"; \
     else \
         integration_started_epoch="$(date +%s)"; \
+        arm64_cmake_args=""; \
+        if [ "${TARGETARCH}" = "arm64" ]; then \
+            export CCACHE_MAXSIZE=5G; \
+            arm64_cmake_args="-DUSE_ONNX_HEURISTIC=OFF"; \
+        fi; \
         rocm_gpu_targets="$(bash scripts/docker/rocm-image-targets.sh "${ROCM_RUNTIME_GPU_TARGETS}")" || exit 1; \
         RCCL_CMAKE_ARGS=""; \
         if [ "${LLAMINAR_ENABLE_ROCM}" = "ON" ]; then \
@@ -489,11 +509,12 @@ RUN --mount=type=cache,id=llaminar-ccache,target=/root/.ccache,sharing=locked \
             -DLLAMINAR_SHARED_CORE=ON \
             -DCMAKE_CUDA_ARCHITECTURES="${LLAMINAR_CUDA_ARCHS}" \
             -DCMAKE_HIP_ARCHITECTURES="${rocm_gpu_targets}" \
-            ${RCCL_CMAKE_ARGS} \
+            ${RCCL_CMAKE_ARGS} ${arm64_cmake_args} \
      && case "${LLAMINAR_TEST_RUNNER_INVENTORY}" in \
             full-matrix) integration_targets="v2_unit_gate v2_production_test_preflight_gate v2_model_parity_matrices" ;; \
             model-free) integration_targets="v2_unit_gate v2_production_test_preflight_gate" ;; \
             unit-only) integration_targets="v2_unit_gate" ;; \
+            arm64-pr) integration_targets="v2_arm64_pr_gate" ;; \
             *) echo "Unsupported test-runner inventory: ${LLAMINAR_TEST_RUNNER_INVENTORY}" >&2; exit 1 ;; \
         esac \
      && echo "==> [integration] cmake build (parallel; matrices=${LLAMINAR_BUILD_MODEL_PARITY_MATRICES})" \
@@ -507,12 +528,13 @@ RUN --mount=type=cache,id=llaminar-ccache,target=/root/.ccache,sharing=locked \
           | xargs -0 -r -P "$(nproc)" -n 32 strip --strip-debug 2>/dev/null || true; } \
      && echo "==> [integration] removing intermediates (.o/.d/.gch/CMakeFiles)" \
      && mv build_v2_integration/CMakeFiles/rules.ninja build_v2_integration/installed-rules.ninja \
+     # The NEON preflight re-disassembles the register-allocation witness.
      && find build_v2_integration \
+            ! -path '*/cpu_native_tile_registers/proof.o' \
             \( -name '*.o' -o -name '*.d' -o -name '*.gch' -o -name '*.cmake_pch.hxx' \) \
             -delete \
      && find build_v2_integration -depth -type d -name CMakeFiles -exec rm -rf {} + \
-     # Keep the small compiler-launcher receipt used by the build-contract
-     # Unit test. Objects remain discarded; this is evidence, not a rebuild tree.
+     # Retain the compiler-launcher rules used by the build-contract Unit test.
      && mkdir build_v2_integration/CMakeFiles \
      && mv build_v2_integration/installed-rules.ninja build_v2_integration/CMakeFiles/rules.ninja \
      && rm -rf build_v2_integration/Testing build_v2_integration/_deps/*-build/CMakeFiles \
@@ -522,8 +544,11 @@ RUN --mount=type=cache,id=llaminar-ccache,target=/root/.ccache,sharing=locked \
 # This receipt permits the campaign driver to use installed binaries without
 # reconstructing stripped objects. Its scope cannot substitute for broader gates.
 RUN if [ "${LLAMINAR_SKIP_INTEGRATION}" != "1" ]; then \
-      receipt_scope=production; \
-      if [ "${LLAMINAR_TEST_RUNNER_INVENTORY}" = "unit-only" ]; then receipt_scope=unit; fi; \
+      case "${LLAMINAR_TEST_RUNNER_INVENTORY}" in \
+          arm64-pr) receipt_scope=arm64-pr ;; \
+          unit-only) receipt_scope=unit ;; \
+          *) receipt_scope=production ;; \
+      esac; \
       python3 scripts/ci/prebuilt_test_image.py --build-dir build_v2_integration \
         --receipt /src/installed-tests.json --scope "$receipt_scope" --seal; \
     fi
@@ -532,6 +557,11 @@ RUN if [ "${LLAMINAR_SKIP_INTEGRATION}" != "1" ]; then \
 # only the llaminar2 target (skip test binaries). Same in-RUN cleanup.
 RUN --mount=type=cache,id=llaminar-ccache,target=/root/.ccache,sharing=locked \
     release_started_epoch="$(date +%s)"; \
+    arm64_cmake_args=""; \
+    if [ "${TARGETARCH}" = "arm64" ]; then \
+        export CCACHE_MAXSIZE=5G; \
+        arm64_cmake_args="-DUSE_ONNX_HEURISTIC=OFF"; \
+    fi; \
     rocm_gpu_targets="$(bash scripts/docker/rocm-image-targets.sh "${ROCM_RUNTIME_GPU_TARGETS}")" || exit 1; \
     RCCL_CMAKE_ARGS=""; \
     if [ "${LLAMINAR_ENABLE_ROCM}" = "ON" ]; then \
@@ -548,7 +578,7 @@ RUN --mount=type=cache,id=llaminar-ccache,target=/root/.ccache,sharing=locked \
         -DLLAMINAR_BUILD_TESTS=OFF \
         -DCMAKE_CUDA_ARCHITECTURES="${LLAMINAR_CUDA_ARCHS}" \
         -DCMAKE_HIP_ARCHITECTURES="${rocm_gpu_targets}" \
-        ${RCCL_CMAKE_ARGS} \
+        ${RCCL_CMAKE_ARGS} ${arm64_cmake_args} \
  && echo "==> [release] cmake build --target llaminar2 (parallel)" \
  && cmake --build build_v2_release --parallel --target llaminar2 \
  && echo "==> [release] strip --strip-debug on executables/.a/.so (parallel, $(nproc) jobs)" \
@@ -660,6 +690,7 @@ RUN set -e; \
 # =============================================================================
 FROM ubuntu:24.04 AS runtime
 
+ARG TARGETARCH
 ARG LLAMINAR_BUILD_TYPE
 ARG LLAMINAR_ENABLE_CUDA=ON
 ARG LLAMINAR_ENABLE_ROCM=ON
@@ -743,13 +774,14 @@ ARG VCS_REF
 ARG VERSION=dev
 ARG LLAMINAR_SOURCE_TREE
 LABEL org.opencontainers.image.title="Llaminar" \
-      org.opencontainers.image.description="High-performance LLM inference engine (CUDA + ROCm)" \
+      org.opencontainers.image.description="Llaminar LLM inference runtime" \
       org.opencontainers.image.source="https://github.com/llaminar/llaminar" \
       org.opencontainers.image.licenses="AGPL-3.0-only" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${VCS_REF}" \
       org.opencontainers.image.created="${BUILD_DATE}" \
       org.llaminar.image_role="runtime" \
+      org.llaminar.architecture="${TARGETARCH}" \
       org.llaminar.cpu_isa="${LLAMINAR_CPU_ISA}" \
       org.llaminar.source_tree="${LLAMINAR_SOURCE_TREE}" \
       org.llaminar.build_type="${LLAMINAR_BUILD_TYPE}" \
@@ -780,6 +812,7 @@ CMD ["--help"]
 # second independent multi-gigabyte import.
 FROM runtime AS test-runner
 
+ARG TARGETARCH
 USER root
 
 ARG LLAMINAR_BUILD_TYPE
@@ -808,6 +841,13 @@ RUN apt-get update \
       build-essential \
       git \
       jq \
+ # The NEON register proof authenticates the GCC driver, compiler, assembler \
+ # and system headers before re-disassembling the retained witness. \
+ && if [ "${TARGETARCH}" = "arm64" ]; then \
+        apt-get install -y --no-install-recommends g++-14 \
+        && update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-14 100 \
+              --slave /usr/bin/g++ g++ /usr/bin/g++-14; \
+    fi \
  && rm -rf /var/lib/apt/lists/*
 
 # The compiler-stage annotations must also resolve when sealed test binaries
@@ -837,6 +877,36 @@ COPY --from=toolchain /usr/local/bin/cmake /usr/local/bin/ctest /usr/local/bin/c
 COPY --from=test-workspace /src/ /src/
 COPY --from=builder /usr/local/lib/python3.12/dist-packages/ \
      /usr/local/lib/python3.12/dist-packages/
+
+# The sealed CTest registration replays the builder's exact configured MPI
+# library path (CMake recorded the toolchain's unversioned MPI dev link, whose
+# slim-runtime counterpart is only the distro SONAME library). Materialize
+# exactly that recorded link identity from the sealed receipt so the native
+# MPI ABI proof loads the same distro SONAME library the builder selected,
+# then verify the resolved artifact's SHA256 against the same receipt: the
+# installed image must carry the original bytes, and a same-length or retargeted
+# substitute fails the image build. A receipt that records no link identity, or
+# a target that does not resolve in this image, fails the same way instead of
+# letting a proof load a different or missing library.
+RUN set -e; \
+    if [ -f /src/installed-tests.json ]; then \
+        link_path="$(jq -r '.inventory.mpi_library.path // empty' /src/installed-tests.json)"; \
+        link_target="$(jq -r '.inventory.mpi_library.link_target // empty' /src/installed-tests.json)"; \
+        sealed_sha="$(jq -r '.inventory.mpi_library.sha256 // empty' /src/installed-tests.json)"; \
+        if [ -z "$link_path" ] || [ -z "$sealed_sha" ]; then \
+            echo "sealed receipt does not record the configured MPI library identity" >&2; exit 1; \
+        fi; \
+        if [ ! -e "$link_path" ] && [ -n "$link_target" ]; then \
+            ln -s "$link_target" "$link_path"; \
+        fi; \
+        if [ ! -e "$link_path" ]; then \
+            echo "configured MPI library does not resolve in the test runner: $link_path -> ${link_target:-regular file}" >&2; exit 1; \
+        fi; \
+        installed_sha="$(sha256sum "$(readlink -f "$link_path")" | cut -d' ' -f1)"; \
+        if [ "$installed_sha" != "$sealed_sha" ]; then \
+            echo "configured MPI library content identity mismatch: installed $installed_sha, sealed $sealed_sha" >&2; exit 1; \
+        fi; \
+    fi
 
 # Test executables carry the Integration core in their CTest-relative build
 # tree.  ``runtime`` also contains the Release core at /usr/local/lib for the

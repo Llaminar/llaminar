@@ -2219,6 +2219,67 @@ TEST(Test__WorkspaceAllocator, GraphConsumerAllocatesAndBindsCPUWorkspaceForDecl
         size_t{4096});
 }
 
+/**
+ * @brief An exact decode participant that creates generation one publishes
+ * the family's largest prefill rows.
+ *
+ * Regression: a warmup prompt that hit the prefix cache built the decode graph
+ * first; its exact M=1 preflight published one-row projection scratch. The
+ * first ordinary prefill then failed with "Serial family preflight omitted
+ * workspace capacity" (27B on GB10, intermittently, depending on cache state).
+ */
+TEST(Test__WorkspaceAllocator, CPUDecodeFirstSerialFamilyPublishesLargestPrefillRows)
+{
+    if (!hasCPUBackend())
+    {
+        initCPUBackend(-1);
+    }
+
+    WorkspaceAllocator allocator;
+    auto hints = tinyHints();
+    hints.serial_family_max_rows = 128;
+    WorkspaceBudgetConfig config;
+    config.cpu_fraction = 0.1f;
+    config.min_budget = 1 * 1024 * 1024;
+    config.max_budget = 8 * 1024 * 1024;
+
+    // Decode participant first: exact policy, one row.
+    hints.max_seq_len = 1;
+    hints.graph_family_policy =
+        WorkspaceGraphFamilyPolicy::SerialDeviceFamilyExactParticipant;
+    ComputeGraph decode_graph;
+    decode_graph.addNode("decode_projection",
+        std::make_unique<DeclaredShapeWorkspaceStage>(DeviceId::cpu(),
+            std::vector<size_t>{1, 8}, std::vector<size_t>{1, 16},
+            /*declare_decode_only_buffer=*/false, /*scale_scratch_with_m=*/true),
+        DeviceId::cpu());
+    // Production passes the decode role explicitly (ForwardExecutionEngine).
+    ASSERT_TRUE(allocator.allocateForGraphFamily(decode_graph,
+        WorkspaceGraphParticipantRole::Decode, {}, hints, {}, config));
+    auto *workspace = allocator.getDeviceWorkspace(DeviceId::cpu());
+    ASSERT_NE(workspace, nullptr);
+    EXPECT_EQ(workspace->getBufferSize("declared_shape_scratch"), size_t{128} * 256);
+    void *const address = workspace->getBuffer("declared_shape_scratch");
+    const uint64_t generation = allocator.deviceGeneration(DeviceId::cpu());
+
+    // The later prefill participant fits the published family capacity.
+    hints.max_seq_len = 8;
+    hints.graph_family_policy =
+        WorkspaceGraphFamilyPolicy::SerialDeviceFamilyLargestParticipant;
+    ComputeGraph prefill_graph;
+    auto prefill = std::make_unique<DeclaredShapeWorkspaceStage>(DeviceId::cpu(),
+        std::vector<size_t>{8, 8}, std::vector<size_t>{8, 16},
+        /*declare_decode_only_buffer=*/false, /*scale_scratch_with_m=*/true);
+    auto *prefill_ptr = prefill.get();
+    prefill_graph.addNode("prefill_projection", std::move(prefill), DeviceId::cpu());
+    ASSERT_TRUE(allocator.allocateForGraphFamily(prefill_graph,
+        WorkspaceGraphParticipantRole::Prefill, {}, hints, {}, config));
+    EXPECT_EQ(allocator.getDeviceWorkspace(DeviceId::cpu()), workspace);
+    EXPECT_EQ(allocator.deviceGeneration(DeviceId::cpu()), generation);
+    EXPECT_EQ(workspace->getBuffer("declared_shape_scratch"), address);
+    EXPECT_EQ(prefill_ptr->boundWorkspace(), workspace);
+}
+
 TEST(Test__WorkspaceAllocator, ExtraCPUConsumersUseTheSameAppendOnlyWorkspaceLifecycle)
 {
     if (!hasCPUBackend())

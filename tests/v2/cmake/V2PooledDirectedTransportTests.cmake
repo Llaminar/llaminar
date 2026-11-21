@@ -70,7 +70,7 @@ if(TARGET v2_test_qwen4exp_primitives)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PooledNoPeerNativeOwnerGeometryReplay)
 endif()
 if(TARGET v2_test_physical_memory_authority)
-    add_v2_test(V2_Integration_PooledNativeOwnerAdmissionContractReplay
+    add_v2_test(V2_Integration_PooledNativeOwnerAdmissionContractReplay REQUIRES_BACKEND GPU
         COMMAND $<TARGET_FILE:v2_test_physical_memory_authority>
             --gtest_filter=PooledImmutableDirectedOwnerProgram.NativeGeneralPreservesOriginalGeometryWithoutFlatCertificate
         LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Transfer;Memory;TraceReplay;Regression"
@@ -350,7 +350,7 @@ endif()
 # Storage ownership is independent from compute width; the original planner must
 # fit every feasible native owner while retaining exact protocol growth.
 if(TARGET v2_test_memory_planner)
-    add_v2_test(V2_Integration_PooledStorageOnlyOwnerAdmissionReplay
+    add_v2_test(V2_Integration_PooledStorageOnlyOwnerAdmissionReplay REQUIRES_BACKEND GPU
         COMMAND $<TARGET_FILE:v2_test_memory_planner>
             --gtest_filter=GPUAdaptiveImmutableLookupAdmission.SharedDirectoryPressureBalancesEveryFeasibleOwner
         LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Memory;Ownership;TraceReplay;Regression"

@@ -27,6 +27,11 @@ if(NOT V2_PERF_TESTS_ONLY)
         endforeach()
     endif()
     add_executable(v2_test_pooled_remote_graph_host unit/backends/Test__PooledRemoteGraphHostAllowance.cpp unit/backends/Test__PooledRemoteGraphHost.cpp integration/core_gtest_main.cpp)
+    # Pooled immutable sources are CUDA/ROCm-native objects (no CPU
+    # implementation); every registration requires a GPU backend family.
+    if(TARGET v2_test_pooled_remote_graph_host)
+        set_target_properties(v2_test_pooled_remote_graph_host PROPERTIES V2_TEST_REQUIRED_BACKEND GPU)
+    endif()
     if(TARGET v2_test_pooled_remote_graph_host)
         target_compile_definitions(v2_test_pooled_remote_graph_host PRIVATE LLAMINAR_POOLED_NATIVE_PROGRAM_DIAGNOSTIC=1)
         target_include_directories(v2_test_pooled_remote_graph_host PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")

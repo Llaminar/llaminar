@@ -6,8 +6,9 @@
  * adjacent residency epochs. Generic CPU Q8 helpers are intentionally tuned
  * for ordinary tensor conversion and historically used division, MXCSR
  * rounding, and a CPU-only tiny-value threshold. This file instead mirrors the
- * device contract exactly while retaining AVX2/AVX-512 max, multiply, and
- * conversion throughput. It is used only by GPU-aligned expert activation paths.
+ * device contract exactly with native AVX2/AVX-512 or AArch64 NEON max,
+ * multiply, and conversion. It is used only by GPU-aligned expert activation
+ * paths; the ISA cannot select a different persisted scale or activation byte.
  */
 
 #pragma once
@@ -26,6 +27,8 @@
 
 #if defined(__AVX512F__) || defined(__AVX2__)
 #include <immintrin.h>
+#elif defined(__aarch64__) && defined(__ARM_NEON)
+#include <arm_neon.h>
 #endif
 
 namespace llaminar2::cpu::gpu_aligned_expert_q8
@@ -47,6 +50,19 @@ namespace llaminar2::cpu::gpu_aligned_expert_q8
     {
         if (valid_elements == static_cast<int>(Q8_1Block::BLOCK_SIZE))
         {
+#if defined(__aarch64__) && defined(__ARM_NEON)
+            const uint32x4_t magnitude_mask = vdupq_n_u32(0x7fffffffu);
+            uint32x4_t maximum = vdupq_n_u32(0);
+            for (int offset = 0; offset < 32; offset += 4)
+            {
+                // Unsigned magnitude words order finite values exactly and
+                // retain subnormal bits independently of floating max modes.
+                const uint32x4_t magnitude = vandq_u32(
+                    vreinterpretq_u32_f32(vld1q_f32(source + offset)), magnitude_mask);
+                maximum = vmaxq_u32(maximum, magnitude);
+            }
+            return device_fp32_contract::floatFromBits(vmaxvq_u32(maximum));
+#endif
 #if defined(__AVX512F__)
             if (cpu_supports_avx512())
             {
@@ -197,6 +213,31 @@ namespace llaminar2::cpu::gpu_aligned_expert_q8
                 destination.sum_qs = static_cast<std::int16_t>(_mm_cvtsi128_si32(sum));
                 return;
             }
+#endif
+#if defined(__aarch64__) && defined(__ARM_NEON)
+            const float32x4_t inverse = vdupq_n_f32(inverse_scale);
+            const float32x4_t minimum = vdupq_n_f32(-127.0f);
+            const float32x4_t maximum_value = vdupq_n_f32(127.0f);
+            int32x4_t sum = vdupq_n_s32(0);
+            for (int offset = 0; offset < 32; offset += 8)
+            {
+                const float32x4_t first = vmaxq_f32(minimum, vminq_f32(maximum_value,
+                    vmulq_f32(vld1q_f32(source + offset), inverse)));
+                const float32x4_t second = vmaxq_f32(minimum, vminq_f32(maximum_value,
+                    vmulq_f32(vld1q_f32(source + offset + 4), inverse)));
+                // FCVTNS is explicitly nearest-even, rather than FPCR-selected
+                // conversion. Clamp to integer endpoints before conversion;
+                // this is identical to RNE then saturation for finite inputs.
+                const int32x4_t q0 = vcvtnq_s32_f32(first);
+                const int32x4_t q1 = vcvtnq_s32_f32(second);
+                const int8x8_t bytes = vmovn_s16(vcombine_s16(vmovn_s32(q0), vmovn_s32(q1)));
+                vst1_s8(destination.qs + offset, bytes);
+                sum = vaddq_s32(sum, vaddq_s32(q0, q1));
+            }
+            // Every lane is bounded by 8*127, and the complete sum by 32*127.
+            // Integer reduction/narrowing is exact regardless of SIMD grouping.
+            destination.sum_qs = static_cast<std::int16_t>(vaddvq_s32(sum));
+            return;
 #endif
         }
 

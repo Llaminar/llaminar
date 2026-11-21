@@ -47,6 +47,8 @@ class TestKVStateLifecyclePolicy(unittest.TestCase):
         required=re.search(r'explicit_stream_contract_files=\((.*?)\n\)',text,re.S).group(1)
         paths=re.findall(r'"([^"\n]+)"',required)
         cases=[('one.cu','kernel<<<grid,block,0>>>();'),
+            ('shard.cu.inc','kernel<<<grid,block,0>>>();'),
+            ('shard_async.cu.inc','cudaMemcpyAsync(dst,src,bytes,kind,nullptr);'),
             ('two.cpp','hipLaunchKernelGGL(kernel,grid,block,0,0,pointer);'),
             ('three.cpp','cudaMemcpyAsync(dst,src,bytes,kind,nullptr);'),
             ('four.h','void f(cudaStream_t stream = nullptr);'),

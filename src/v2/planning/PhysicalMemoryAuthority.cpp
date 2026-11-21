@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <exception>
 #include <limits>
 #include <mutex>
 #include <sstream>
@@ -203,6 +204,51 @@ namespace llaminar2
             std::mutex cpu_weight_source_mutex;
         };
 
+        /**
+         * @brief Reject a setup commitment that would over-subscribe a rank host pool.
+         *
+         * Setup-phase commitments (native preparation, opaque contexts) check
+         * their own allocator first. When that allocator is the rank CPU or a
+         * RankHostPool GPU, the same bytes also leave the physical pool the
+         * other members draw on, so the pool-wide commitment must fit the
+         * smallest pool observation. Caller holds state.mutex.
+         * @param resource_index Allocator receiving @p additional bytes.
+         * @throws PhysicalMemoryCapacityExhausted when the pool would be exceeded.
+         */
+        void requireRankHostPoolHeadroom(const PhysicalMemoryMaterializationState &state,
+                                         std::size_t resource_index, std::size_t additional)
+        {
+            const auto &target = state.observations.at(resource_index);
+            if (!target.device.is_cpu() && !target.sharesRankHostPool())
+                return;
+            std::size_t limit = std::numeric_limits<std::size_t>::max();
+            std::size_t committed = additional;
+            bool pooled = false;
+            for (std::size_t index = 0; index < state.observations.size(); ++index)
+            {
+                const auto &member = state.observations[index];
+                if (member.world_rank != target.world_rank ||
+                    !(member.device.is_cpu() || member.sharesRankHostPool()))
+                    continue;
+                if (member.sharesRankHostPool())
+                {
+                    pooled = true;
+                    limit = std::min(limit, member.pool_available_bytes);
+                }
+                const auto &claims = state.claims[index];
+                for (std::size_t owner = 0; owner < PhysicalMemoryBOM::ownerCount(); ++owner)
+                {
+                    committed = checkedAdd(committed, claims.new_allocations[owner], "pool allocations");
+                    committed = checkedAdd(committed, claims.new_reservation_capacity[owner], "pool reservations");
+                    committed = checkedAdd(committed, claims.preparation_committed[owner], "pool preparation");
+                }
+            }
+            if (pooled && committed > limit)
+                throw PhysicalMemoryCapacityExhausted(
+                    "Setup commitment over-subscribes rank host pool for " + target.id() +
+                    ": committed=" + std::to_string(committed) + " pool_available=" + std::to_string(limit));
+        }
+
         /** @brief Epoch lifecycle facts; all mutation holds authority->mutex. */
         struct PhysicalMemoryNativeSetupEpochState
         {
@@ -380,10 +426,55 @@ namespace llaminar2
 
     bool PhysicalMemoryPlan::fits() const noexcept
     {
-        return std::all_of(
-            resources_.begin(),
-            resources_.end(),
-            [](const auto &bom) { return bom.fits(); });
+        if (!std::all_of(
+                resources_.begin(),
+                resources_.end(),
+                [](const auto &bom) { return bom.fits(); }))
+            return false;
+        try
+        {
+            return !rankHostPoolViolation().has_value();
+        }
+        catch (...)
+        {
+            // Overflowing joint demand cannot fit any physical pool.
+            return false;
+        }
+    }
+
+    std::optional<std::string> PhysicalMemoryPlan::rankHostPoolViolation() const
+    {
+        // resources_ need not be sorted here (builder sorts on build), so
+        // collect ranks explicitly and report the lowest failing rank.
+        std::vector<int> ranks;
+        for (const auto &bom : resources_)
+            if (bom.resource().sharesRankHostPool())
+                ranks.push_back(bom.resource().world_rank);
+        std::sort(ranks.begin(), ranks.end());
+        ranks.erase(std::unique(ranks.begin(), ranks.end()), ranks.end());
+        for (const int rank : ranks)
+        {
+            std::size_t limit = std::numeric_limits<std::size_t>::max();
+            std::size_t demand = 0u;
+            std::ostringstream members;
+            for (const auto &bom : resources_)
+            {
+                const auto &resource = bom.resource();
+                if (resource.world_rank != rank ||
+                    !(resource.device.is_cpu() || resource.sharesRankHostPool()))
+                    continue;
+                if (resource.sharesRankHostPool())
+                    limit = std::min(limit, resource.pool_available_bytes);
+                demand = checkedAdd(demand, bom.incrementalBytes(), "rank host pool demand");
+                members << ' ' << resource.device.toString() << '=' << bom.incrementalBytes();
+            }
+            if (demand > limit)
+                return "Rank host pool over-subscribed for rank=" + std::to_string(rank) +
+                       ": incremental=" + std::to_string(demand) +
+                       " pool_available=" + std::to_string(limit) +
+                       " members:" + members.str();
+        }
+        return std::nullopt;
     }
 
     std::size_t PhysicalMemoryPlan::totalBytes() const
@@ -445,6 +536,13 @@ namespace llaminar2
                        " required=" +
                        std::to_string(
                            required_bom.resource().total_bytes);
+            }
+            if (admitted_bom->resource().backing !=
+                required_bom.resource().backing)
+            {
+                return "Physical backing changed for " + identity.toString() +
+                       ": admitted=" + std::string(toString(admitted_bom->resource().backing)) +
+                       " required=" + std::string(toString(required_bom.resource().backing));
             }
 
             for (std::size_t owner_index = 0u;
@@ -595,16 +693,19 @@ namespace llaminar2
             throw std::invalid_argument(
                 "Physical memory admission requires at least one resource");
         }
-        if (!plan_.fits())
+        const auto failed = std::find_if(
+            plan_.resources().begin(),
+            plan_.resources().end(),
+            [](const auto &bom) { return !bom.fits(); });
+        if (failed != plan_.resources().end())
         {
-            const auto failed = std::find_if(
-                plan_.resources().begin(),
-                plan_.resources().end(),
-                [](const auto &bom) { return !bom.fits(); });
             throw PhysicalMemoryCapacityExhausted(
                 "Physical memory topology admission failed: " +
                 failed->summary());
         }
+        if (const auto pool = plan_.rankHostPoolViolation())
+            throw PhysicalMemoryCapacityExhausted(
+                "Physical memory topology admission failed: " + *pool);
     }
 
     PhysicalMemoryAdmissionCertificate
@@ -692,6 +793,17 @@ namespace llaminar2
             const auto available=state.observations[reservation->resource_index].admission_available_bytes;
             if(committed>available || reservation->capacity_bytes>available-committed)
                 throw PhysicalMemoryCapacityExhausted("Qualified context commitment displaces original pending owners");
+        }
+        {
+            // Host and device parts share one physical pool on an integrated GPU.
+            std::size_t pooled=0;
+            for(const auto& reservation:result->state_->root->reservations){
+                const auto& observed=state.observations[reservation->resource_index];
+                if(observed.device.is_cpu() || observed.sharesRankHostPool())
+                    pooled=checkedAdd(pooled,reservation->capacity_bytes,"opaque pooled commitment");
+            }
+            for(const auto& reservation:result->state_->root->reservations)
+                detail::requireRankHostPoolHeadroom(state,reservation->resource_index,pooled);
         }
         if(epoch_->live_roots==std::numeric_limits<std::size_t>::max() || epoch_->unpublished_roots==std::numeric_limits<std::size_t>::max())
             throw std::overflow_error("Opaque source lifetime exhausted");
@@ -809,6 +921,7 @@ namespace llaminar2
             declaration.physical_bytes > found->admission_available_bytes - committed)
             throw PhysicalMemoryCapacityExhausted(
                 "Native source preparation exceeds original CPU0 physical observation");
+        detail::requireRankHostPoolHeadroom(state, resource, declaration.physical_bytes);
         if (epoch_->live_roots == std::numeric_limits<std::size_t>::max() ||
             epoch_->unpublished_roots == std::numeric_limits<std::size_t>::max())
             throw std::overflow_error("Preparing physical owner lifecycle exhausted");
@@ -2472,7 +2585,21 @@ namespace llaminar2
         const auto *source = admission()->plan().find(allocator);
         if (!source || source->resource().total_bytes != observed.total_bytes)
             throw std::invalid_argument("Native execution-context observation changed its physical allocator");
-        const auto pending = ledger_.unmaterializedNewBytes(allocator);
+        // On an integrated GPU the fresh driver figure is the shared host pool,
+        // so every pool member's outstanding admitted demand must be protected.
+        std::size_t pending = ledger_.unmaterializedNewBytes(allocator);
+        if (observed.sharesRankHostPool())
+            for (const auto &bom : admission()->plan().resources())
+            {
+                const auto &member = bom.resource();
+                if (member.world_rank != world_rank_ || member.device == observed.device ||
+                    !(member.device.is_cpu() || member.sharesRankHostPool()))
+                    continue;
+                pending = checkedAdd(pending,
+                    ledger_.unmaterializedNewBytes(identity(member.device)), "pooled pending demand");
+            }
+        if (source->resource().backing != observed.backing)
+            throw std::invalid_argument("Native execution-context observation changed its physical backing");
         if (pending > observed.admission_available_bytes)
             throw PhysicalMemoryCapacityExhausted("Native execution-context preparation would displace outstanding physical owners for " +
                 observed.id() + " pending_bytes=" + std::to_string(pending));
@@ -2480,6 +2607,13 @@ namespace llaminar2
         // the original plan's future allocations; lazy pool capacity must not
         // disappear just because its reservation was claimed before capture.
         observed.admission_available_bytes -= pending;
+        if (observed.sharesRankHostPool())
+        {
+            if (pending > observed.pool_available_bytes)
+                throw PhysicalMemoryCapacityExhausted("Native execution-context preparation would displace pooled owners for " +
+                    observed.id() + " pending_bytes=" + std::to_string(pending));
+            observed.pool_available_bytes -= pending;
+        }
         PhysicalMemoryPlanBuilder builder;
         builder.add(observed, PhysicalMemoryOwner::NativeExecutionContext, bytes);
         PhysicalMemoryAuthority context(

@@ -2807,6 +2807,8 @@ TEST(Perf__MoEVerifierPrefill, CUDA_AllFormatProductionPrefillCandidatesAreSpill
     if (!hasCudaDevice())
         GTEST_SKIP() << "No CUDA device available";
     ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    int sm_major = 0;
+    ASSERT_EQ(cudaDeviceGetAttribute(&sm_major, cudaDevAttrComputeCapabilityMajor, 0), cudaSuccess);
 
     std::set<uint8_t> execution_codebooks;
     for (const auto &format : llaminar2::test::quantizedVerifierFormats())
@@ -2856,9 +2858,10 @@ TEST(Perf__MoEVerifierPrefill, CUDA_AllFormatProductionPrefillCandidatesAreSpill
             EXPECT_GT(grouped_imma.registers_per_thread, 0);
             EXPECT_GT(grouped_imma.max_active_blocks_per_sm, 0);
 
-            /* The original 32-column geometry retains its stronger baseline. */
+            /* Source-scale IQ4 shares the narrow 12.x occupancy contract. */
             if (columns == llaminar2::cuda::moe::GroupedImmaColumns::Columns32 &&
-                (codebook == 4 || codebook == 13))
+                (codebook == 4 || codebook == 13 ||
+                 (sm_major >= 12 && codebook == llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook)))
             {
                 EXPECT_LE(grouped_imma.registers_per_thread, 48)
                     << "dominant codebook lost cooperative decode occupancy";

@@ -42,6 +42,7 @@ REQUIRED_CHECKS = (
 DEVELOP_REQUIRED_CHECKS = (
     "Develop PR / Unit + hardware preflight (AVX2)",
     "Develop PR / Unit + host (AVX512)",
+    "ARM64 build and Unit + host",
 )
 RELEASE_DEPLOY_KEY_TITLE = "llaminar-release-evidence"
 RELEASE_DEPLOY_KEY_BYPASS = [{"actor_id": None, "actor_type": "DeployKey",
@@ -81,7 +82,7 @@ def proposed_ruleset(current: dict) -> dict:
 
 
 def proposed_develop_ruleset(current: dict) -> dict:
-    """Require both ISA gates with explicit admin PR and release-key exceptions."""
+    """Require all develop PR gates with explicit admin PR and release-key exceptions."""
     if (current.get("target") != "branch" or current.get("name") != "develop"
             or current.get("conditions", {}).get("ref_name", {}).get("include")
             != ["refs/heads/develop"]):
@@ -179,6 +180,14 @@ def verify_policy(installed: dict, planned: dict) -> None:
         raise ValueError(f"installed policy differs from {planned['name']}")
 
 
+def install_policy(endpoint: str, planned: dict) -> None:
+    """Write a ruleset and compare the installed policy verbatim with the proposal."""
+    subprocess.run(['gh', 'api', '--method', 'PUT', endpoint, '--input', '-'],
+                   input=json.dumps(planned), text=True, check=True,
+                   stdout=subprocess.DEVNULL)
+    verify_policy(github_json(endpoint), planned)
+
+
 def owner_protection(repository: str, *, split: bool, apply: bool) -> dict:
     """Install develop review first; only remove overlap after reading it back."""
     endpoint = f'repos/{repository}/rulesets'
@@ -233,16 +242,27 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repository", default="Llaminar/llaminar")
     parser.add_argument("--apply", action="store_true")
-    parser.add_argument("--owner-auto-merge-only", action="store_true",
-                        help="Split the develop review rule for the registered llaminar-bot")
+    scope = parser.add_mutually_exclusive_group()
+    scope.add_argument("--develop-only", action="store_true",
+                       help="Update the develop CI ruleset only")
+    scope.add_argument("--owner-auto-merge-only", action="store_true",
+                       help="Split the develop review rule for the registered llaminar-bot")
     args = parser.parse_args(argv)
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", args.repository):
         parser.error("--repository requires OWNER/REPO")
+    develop_endpoint = f"repos/{args.repository}/rulesets/{DEVELOP_RULESET_ID}"
+    if args.develop_only:
+        develop = proposed_develop_ruleset(github_json(develop_endpoint))
+        print(json.dumps({"develop": develop}, indent=2, sort_keys=True))
+        if args.apply:
+            require_dedicated_release_key(args.repository)
+            install_policy(develop_endpoint, develop)
+            print("[release-ruleset] active develop policy verified", flush=True)
+        return 0
     owner = owner_protection(args.repository, split=args.owner_auto_merge_only, apply=args.apply)
     if args.owner_auto_merge_only:
         return 0
     master_endpoint = f"repos/{args.repository}/rulesets/{MASTER_RULESET_ID}"
-    develop_endpoint = f"repos/{args.repository}/rulesets/{DEVELOP_RULESET_ID}"
     master = proposed_ruleset(github_json(master_endpoint))
     develop = proposed_develop_ruleset(github_json(develop_endpoint))
     owner_endpoint = f'repos/{args.repository}/rulesets/{OWNER_RULESET_ID}'
@@ -250,16 +270,15 @@ def main(argv: list[str] | None = None) -> int:
     print(json.dumps({"master": master, "develop": develop, 'owner': owner, 'rc': rc}, indent=2, sort_keys=True))
     if args.apply:
         require_dedicated_release_key(args.repository)
-        for name, endpoint, planned, projector in (
-                ("develop", develop_endpoint, develop, proposed_develop_ruleset),
-                ("master", master_endpoint, master, proposed_ruleset)):
-            subprocess.run(["gh", "api", "--method", "PUT", endpoint, "--input", "-"],
-                           input=json.dumps(planned), text=True, check=True,
-                           stdout=subprocess.DEVNULL)
-            installed = github_json(endpoint)
-            if projector(installed) != planned or installed["enforcement"] != "active":
-                raise ValueError(f"{name} ruleset verification did not match installed policy")
-            print(f"[release-ruleset] active {name} policy verified", flush=True)
+        install_policy(develop_endpoint, develop)
+        print("[release-ruleset] active develop policy verified", flush=True)
+        subprocess.run(["gh", "api", "--method", "PUT", master_endpoint, "--input", "-"],
+                       input=json.dumps(master), text=True, check=True,
+                       stdout=subprocess.DEVNULL)
+        installed = github_json(master_endpoint)
+        if proposed_ruleset(installed) != master or installed["enforcement"] != "active":
+            raise ValueError("master ruleset verification did not match installed policy")
+        print("[release-ruleset] active master policy verified", flush=True)
         subprocess.run(['gh', 'api', '--method', 'PUT', owner_endpoint, '--input', '-'],
                        input=json.dumps(owner), text=True, check=True, stdout=subprocess.DEVNULL)
         verify_policy(github_json(owner_endpoint), owner)

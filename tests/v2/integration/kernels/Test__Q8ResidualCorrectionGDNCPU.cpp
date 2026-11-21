@@ -25,10 +25,13 @@
 #include <cstddef>
 #include <cstring>
 #include <limits>
+#include <span>
 #include <vector>
 using namespace llaminar2;
 namespace
 {
+constexpr std::array kProjectionSweepRows{1, 15, 512, 1024, 2048};
+
 /** @brief Original native Q8 blocks; preparation may pack but never requantize these source bits. */
 std::vector<uint8_t> sourceBytes(int n,int k)
 {
@@ -61,12 +64,13 @@ struct StageWorkspaceBorrow final
 /**
  * @brief Execute standalone GDN or the actual FA composer result with original-source serial-byte oracles.
  * @param fa_output Select actual FA Stage5 construction; false preserves standalone GDN coverage.
+ * @param row_counts Original invocation widths to replay, including single-row decode and grouped prefill.
  *
  * The gate is declared as the producer; execution isolates projection on already
  * gated source values. CPU construction proves a compact query, then retained
  * count changes exercise the stage API rather than advertising padded CPU graphs.
  */
-void provePreparedOutput(bool fa_output)
+void provePreparedOutput(bool fa_output, std::span<const int> row_counts)
 {
  if(!hasCPUBackend())initCPUBackend(-1);
  // Direct NativeQuantised workshares use the canonical CTest OpenMP physical-core
@@ -74,7 +78,7 @@ void provePreparedOutput(bool fa_output)
  // Timing/scaling remains a separate clean-window experiment.
  auto context=IDeviceContext::create(DeviceId::cpu());
  constexpr int n=2560,k=6144;
- for(const int m:std::array{1,15,512,1024,2048})
+ for(const int m : row_counts)
  {
   SCOPED_TRACE(::testing::Message()<<"CPU GDN M="<<m<<" N="<<n<<" K="<<k);
   auto raw=sourceBytes(n,k);Q8_0Tensor source({std::size_t(n),std::size_t(k)},raw);
@@ -201,10 +205,20 @@ void provePreparedOutput(bool fa_output)
 /** @test Existing standalone original GDN arithmetic coverage remains unchanged. */
 TEST(Q8ResidualCorrectionGDNCPU, ActualPreparedStageRetainsOriginalSourceAndLiveRows)
 {
- provePreparedOutput(false);
+ provePreparedOutput(false, kProjectionSweepRows);
 }
 /** @test Actual FA composer result executes exact serial bytes with the original compact CPU authority. */
 TEST(Q8ResidualCorrectionGDNCPU, FAActualComposerRetainsOriginalSourceAndLiveRows)
 {
- provePreparedOutput(true);
+ provePreparedOutput(true, kProjectionSweepRows);
+}
+
+/** @test Generated nonzero QFN weights exercise native decode, grouped prefill and dirty retained replays. */
+TEST(Q8ResidualCorrectionGDNCPU, QFNSmallGroupedPrefillAndDecode)
+{
+    // Keep the published matrix geometry and shorten only the request. The
+    // exact installed pack and serial byte oracle are shared with the full sweep.
+    constexpr std::array rows{1, 4, 15};
+    provePreparedOutput(false, rows);
+    provePreparedOutput(true, rows);
 }

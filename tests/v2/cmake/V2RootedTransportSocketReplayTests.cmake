@@ -3,9 +3,12 @@
 @brief Register the rooted transport socket replays only on admitted distinct sockets.
 The rooted publication transport replays drive the cross-socket UPI collective,
 whose production program admits only distinct physical CPU owners. The
-CMake host socket count owns launch eligibility. The fixture invokes this
-registration with one and two sockets and checks the emitted preflight names.
-On a qualified host each native test validates both original physical owners.
+canonical discovered-socket authority (the immutable sysfs topology receipt
+behind V2_TEST_SOCKETS) owns launch eligibility; a single-socket host records
+an explicit unqualified configure status instead of failing an ineligible
+geometry. Pure fixture callers admit an authenticated topology document
+through v2_bind_test_host_topology and exercise this same registration module;
+the genuine two-physical-owner requirement itself never changes.
 ]]
 # The replay executable and the shared registration helper come from the
 # including project; this module owns only the socket eligibility decision.

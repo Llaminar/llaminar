@@ -10,6 +10,12 @@ the installed-image inventory requires Unit names and Unit labels to agree.
 ]=]
 include_guard(DIRECTORY)
 set(V2_CPU_EXECUTION_EXACT_POLICY_PREFLIGHT_TESTS)
+# Execution-exact overlays key on the x86 build/runtime ISA pair. AArch64 NEON
+# envelopes have no execution-exact table and compile no policy fixture, so
+# they register no alias and add no explicit preflight member.
+if(LLAMINAR_CPU_ISA_UPPER MATCHES "^NEON")
+    return()
+endif()
 foreach(V2_EXECUTION_POLICY_ISA AVX2 AVX512)
     if(V2_EXECUTION_POLICY_ISA STREQUAL "AVX512" AND NOT LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
         continue()

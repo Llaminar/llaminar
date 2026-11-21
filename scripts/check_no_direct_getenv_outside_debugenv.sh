@@ -43,8 +43,11 @@ is_mpi_accessor_file()
 
 # These startup/bootstrap files intentionally read process environment directly
 # before DebugEnv is safe or appropriate to use.
+# NativeCPUPlacement authenticates original OpenMP intent before MPI or engine
+# configuration exists; its process-entry receipt cannot come from DebugEnv.
 allowed_exception_files=(
     "src/v2/app/RuntimeInitPhase.cpp"
+    "src/v2/utils/NativeCPUPlacement.cpp"
     "src/v2/utils/CPUFeatures.h"
 )
 

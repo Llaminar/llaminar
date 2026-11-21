@@ -267,6 +267,36 @@ void proveOutputAccumulation(cpu::native_quantised::CPUNativeQuantisedGemmKernel
     }
 }
 
+#if defined(__aarch64__)
+/** @test ARM native fused plans own full-K register trees and declare no shared bank. */
+TEST(CPUProjectionWorkspace, FusedPlanDeclaresNoSharedBankOnNativeARM)
+{
+    using namespace cpu::native_quantised;
+    for (const auto &format : quantizedMoEVerifierFormats())
+    {
+        SCOPED_TRACE(format.label);
+        auto first_weight = format.create({65u, 256u}, 719);
+        auto second_weight = TestTensorFactory::createQ4_0Random({193u, 256u}, 727);
+        CPUNativeQuantisedGemmKernel first(first_weight.get());
+        CPUNativeQuantisedGemmKernel second(second_weight.get(), 0, -1,
+            CPUProjectionNumericalPolicy::GPUAlignedExpert);
+        ASSERT_TRUE(first.isValid());
+        ASSERT_TRUE(second.isValid());
+        std::array<FusedVerifierRowsDesc, 2> descriptors{{
+            {.packed = &first.packedWeights(), .N = 65, .ldc = 65},
+            {.packed = &second.packedWeights(), .N = 193, .ldc = 193, .rows = 3}}};
+        for (int rows : {1, 2, 3, 15, 31})
+        for (int workers : {1, 2, 3, 7, 16, 128})
+        {
+            const auto plan = planNativeQuantisedFusedRows(descriptors, rows, workers);
+            EXPECT_EQ(plan.count, 2);
+            EXPECT_EQ(plan.rows[0], rows);
+            EXPECT_EQ(plan.rows[1], 3);
+            EXPECT_EQ(plan.sharedPartialFloats(), 0u);
+        }
+    }
+}
+#else
 /** @test Mixed-format bundle admission preserves full-K, private and shared ownership. */
 TEST(CPUProjectionWorkspace, FusedPlanPricesEveryMemberAndPreservesPrivateTrees)
 {
@@ -506,6 +536,8 @@ TEST(CPUProjectionWorkspace, FusedRetainedTeamUsesItsActualWorkerGeometry)
     }
 }
 
+#endif
+
 /** @test Mirrored terminal admission uses serial policy N but allocates physical N. */
 TEST(CPUProjectionWorkspace, MirroredHeadDeclaresSerialTreeForPhysicalOutput)
 {
@@ -537,11 +569,18 @@ TEST(CPUProjectionWorkspace, MirroredHeadDeclaresSerialTreeForPhysicalOutput)
     ASSERT_EQ(cpuNativeQuantisedSerialOutputPartitionN(), 0);
     const auto partials = std::find_if(requirements.buffers.begin(), requirements.buffers.end(),
         [](const auto &buffer) { return buffer.name == kCPUProjectionPartials; });
-    ASSERT_NE(partials, requirements.buffers.end());
     const auto scope = kernel->beginOutputPartitionEquivalenceScope(n, serial_n);
     const auto expected = nativeQuantisedProjectionPartialFloats(kernel->packedWeights(), rows);
+#if defined(__aarch64__)
+    // ARM native rows own full-K register trees: the serial policy width needs
+    // no ordered-partial bank, so none may be declared or charged.
+    EXPECT_EQ(partials, requirements.buffers.end());
+    EXPECT_EQ(expected, 0u);
+#else
+    ASSERT_NE(partials, requirements.buffers.end());
     ASSERT_GT(expected, 0u);
     EXPECT_EQ(partials->size_bytes, expected * sizeof(float));
+#endif
     CPUProjectionTestWorkspace workspace(rows, k, requirements);
     ASSERT_TRUE(kernel->multiply_tensor(input.get(), output.get(), rows, n, k,
         true, 1.f, 0.f, nullptr, nullptr, -1, workspace.get()));

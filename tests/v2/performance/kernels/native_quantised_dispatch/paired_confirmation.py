@@ -33,6 +33,7 @@ from typing import Iterable, Mapping
 
 import numpy as np
 
+from .host_cores import physical_core_count
 from .schema import P95_REGRET_BUDGET
 
 
@@ -845,29 +846,9 @@ def _bootstrap_seed(cells: Iterable[PairedCellEvidence], seed: str) -> int:
 
 
 def _physical_core_count() -> int:
-    """Return the physical cores available to this process's affinity mask.
+    """Return affinity-visible physical cores (one worker per core; see ``host_cores``)."""
 
-    Linux exposes a stable ``(package_id, core_id)`` identity for each logical
-    CPU. Counting those identities avoids scheduling two bootstrap workers on
-    sibling hyperthreads. The conservative fallback uses the logical CPU count
-    only when sysfs is unavailable, which keeps this offline tool portable.
-    """
-
-    logical_cpus = (
-        sorted(os.sched_getaffinity(0))
-        if hasattr(os, "sched_getaffinity")
-        else list(range(os.cpu_count() or 1))
-    )
-    physical_cores: set[tuple[str, str]] = set()
-    for cpu in logical_cpus:
-        topology = Path(f"/sys/devices/system/cpu/cpu{cpu}/topology")
-        try:
-            package_id = (topology / "physical_package_id").read_text().strip()
-            core_id = (topology / "core_id").read_text().strip()
-        except OSError:
-            return max(1, len(logical_cpus))
-        physical_cores.add((package_id, core_id))
-    return max(1, len(physical_cores))
+    return physical_core_count()
 
 
 def _cell_bootstrap_seed(cell: PairedCellEvidence, seed: str) -> int:
