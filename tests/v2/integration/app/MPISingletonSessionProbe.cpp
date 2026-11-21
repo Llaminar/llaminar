@@ -6,7 +6,9 @@
  * boundary. The shared Python lifecycle regression owns this probe's process,
  * observations and explicit success/error/signal cases. An external MPI parent
  * retains ownership. A singleton runs below the same ancestor owner, whose
- * roots survive finalization until every actual frontend/daemon retires.
+ * roots survive finalization until every actual frontend/daemon retires. The
+ * post-init observation carries actual rank/world membership for relocated
+ * frontend tests; a successful parent return cannot stand in for it.
  *
  * The custom entry owns one lexical native GPU lifetime without probing a
  * device. Native workers/caches retire before process exit and MPI finalization.
@@ -24,14 +26,24 @@
 #include <string>
 #include <unistd.h>
 
-/** @brief Emit bounded original directory observations outside the owned roots. */
+/**
+ * @brief Publish the initialized rank and original runtime locations atomically.
+ * @param path Observation destination outside the owned runtime roots.
+ * @param mode Requested fixture terminal behavior.
+ * @param temporary Original temporary directory observed by the rank.
+ * @param shared Original shared-memory directory observed by the rank.
+ * @param program Original frontend argv[0] after owner re-exec.
+ * @param rank Actual MPI_COMM_WORLD rank.
+ * @param world Actual MPI_COMM_WORLD size.
+ */
 static void observe(const std::filesystem::path &path, const char *mode,
-                    const std::string &temporary, const std::string &shared, const std::string &program)
+                    const std::string &temporary, const std::string &shared, const std::string &program,
+                    int rank, int world)
 {
     const auto pending=path.string()+".pending";
     std::ofstream output(pending);
     output << nlohmann::json{{"pid",::getpid()},{"mode",mode},{"temporary",temporary},
-        {"shared",shared},{"argv0",program}}.dump() << '\n';
+        {"shared",shared},{"argv0",program},{"rank",rank},{"world",world}}.dump() << '\n';
     output.close();
     if (!output) throw std::runtime_error("Cannot publish singleton observation");
     std::filesystem::rename(pending,path);
@@ -62,7 +74,7 @@ int main(int argc, char **argv)
             if(MPI_Comm_rank(MPI_COMM_WORLD,&rank)!=MPI_SUCCESS || MPI_Comm_size(MPI_COMM_WORLD,&world)!=MPI_SUCCESS)
                 throw std::runtime_error("Cannot observe actual MPI scope membership");
             const auto rank_observation=world>1 ? std::filesystem::path(observation.string()+".rank-"+std::to_string(rank)) : observation;
-            observe(rank_observation,mode.c_str(),temporary,shared,argv[0]);
+            observe(rank_observation,mode.c_str(),temporary,shared,argv[0],rank,world);
             if (mode == "throw") throw std::runtime_error("requested scoped MPI failure");
             if (mode == "wait") for (;;) ::pause();
             if (mode == "inspect") {

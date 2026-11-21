@@ -4,6 +4,9 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Callable
+from contextlib import ExitStack
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -19,6 +22,18 @@ import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "scripts/ci"))
 from mpi_session_retirement import require_retired
+
+# Test witness for the two MPISessionOwner startup directory loans.
+_DIRECTORY_LOAN_FDS = {"temporary": 6, "shared": 7}
+
+
+def _sha256(path: Path) -> str:
+    """Hash one exact native asset, not its metadata or its location."""
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for block in iter(lambda: source.read(64 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def _wait(predicate, description: str, seconds: float = 15.0):
@@ -158,7 +173,7 @@ def _child(mode: str, report: Path, outside: Path, singleton: Path | None = None
             shutil.copyfile(original / ".owner", replacement / ".owner")
             descriptor = os.open(replacement, os.O_RDONLY | os.O_DIRECTORY)
             try:
-                os.dup2(descriptor, 6 if is_temporary else 7)
+                os.dup2(descriptor, _DIRECTORY_LOAN_FDS["temporary" if is_temporary else "shared"])
             finally:
                 os.close(descriptor)
             for name, value in list(os.environ.items()):
@@ -166,7 +181,7 @@ def _child(mode: str, report: Path, outside: Path, singleton: Path | None = None
                     os.environ[name] = str(replacement)
         elif mode == "frontend-external-broken":
             os.environ["OMPI_COMM_WORLD_SIZE"] = "1"
-            os.close(6)
+            os.close(_DIRECTORY_LOAN_FDS["temporary"])
         elif mode != "frontend-reuse":
             raise AssertionError(f"Unknown exact ownership replay {mode}")
         os.execv(command[0], command)
@@ -208,8 +223,13 @@ class Replay:
         return process, directory
 
     def finish(self, process: subprocess.Popen, directory: Path, expected: int,
-               observations: list[dict], *, seconds: float = 15.0) -> None:
-        """Require original status, actual exit witnesses and both roots gone."""
+               observations: list[dict], *, seconds: float = 15.0,
+               check_retirement: Callable[[], None] | None = None) -> None:
+        """Prove the original status and all retirement checks before recording success.
+
+        A specialized case can pass a check over retained pre-release witnesses
+        instead of asking this method to inspect its observations' numeric PIDs.
+        """
         actual = process.wait(timeout=seconds)
         if actual != expected:
             raise AssertionError(f"{directory.name}: exit {actual}, expected {expected}:\n"
@@ -238,6 +258,8 @@ class Replay:
                     os.close(descriptor)
         if (self.outside / "sentinel").read_text() != "untouched":
             raise AssertionError("Cleanup changed an unrelated directory")
+        if check_retirement is not None:
+            check_retirement()
         self.results.append({"case": directory.name, "returncode": actual, "retired": True})
 
     def child(self, name: str, mode: str) -> tuple[subprocess.Popen, Path, dict]:
@@ -557,6 +579,137 @@ class Replay:
         observation = _wait(lambda: _read(report), "external rank startup")
         self.finish(process, directory, 0, [observation])
 
+    def staged_singleton(self) -> None:
+        """Require actual MPI initialization through the relocated frontend's exact sibling."""
+        original_helper = self.args.helper.resolve(strict=True)
+        component_path = Path("llaminar_mpi_components/mca_schizo_llaminar.so")
+        component = self.args.module.resolve(strict=True)
+        if not (original_helper.parent / component_path).samefile(component):
+            raise AssertionError("Staged native module is not the exact build-helper sibling")
+        # The negative case is sensitive to a PATH lookup: a usable copy of
+        # the same helper is still on PATH, just not beside the staged binary.
+        environment = {"LC_ALL": "C", "PATH": os.pathsep.join(
+            (str(original_helper.parent), os.environ.get("PATH", os.defpath)))}
+        helper_name = "llaminar_mpi_session"
+        path_helper = shutil.which(helper_name, path=environment["PATH"])
+        if path_helper is None or not original_helper.samefile(path_helper):
+            raise AssertionError("Staged fixture lacks the original PATH helper control")
+        fixture_sources = (self.args.singleton.resolve(strict=True), component)
+        fixture_digests = tuple(_sha256(source) for source in fixture_sources)
+        helper_digest = _sha256(original_helper)
+
+        for with_sibling in (True, False):
+            name = "stage-ok" if with_sibling else "stage-no-helper"
+            stage = self.root / (name + "-bin")
+            stage.mkdir(mode=0o700)
+            frontend = stage / self.args.singleton.name
+            helper = stage / helper_name
+            native_module = stage / component_path
+            native_module.parent.mkdir(mode=0o700)
+            for source, target, expected in zip(fixture_sources, (frontend, native_module), fixture_digests, strict=True):
+                shutil.copy2(source, target)
+                if _sha256(target) != expected:
+                    raise AssertionError(f"Staged native asset changed during copy: {target}")
+            if with_sibling:
+                shutil.copy2(original_helper, helper)
+                if _sha256(helper) != helper_digest:
+                    raise AssertionError("Staged sibling differs from the original PATH helper")
+            assets = {"frontend_sha256": fixture_digests[0], "module_sha256": fixture_digests[1],
+                      "module": str(native_module)}
+            report = self.root / (name + ".json")
+            process, directory = self.start(name, [str(frontend), "--observation", str(report), "inspect"],
+                                            owned=False, environment=environment)
+            if not with_sibling:
+                diagnostic = "MPI session ownership: cannot prepare exact child spawn: No such file or directory"
+
+                def require_rejection() -> None:
+                    """Do not let an unrelated loader failure or child report satisfy the negative."""
+                    if ((directory / "output.log").read_text().splitlines() != [diagnostic]
+                            or list(self.root.glob(report.name + "*")) or os.path.lexists(helper)):
+                        raise AssertionError("A missing exact sibling did not reject before MPI rank entry")
+
+                self.finish(process, directory, 125, [], check_retirement=require_rejection)
+                self.results[-1].update(exact_diagnostic=diagnostic, path_helper=path_helper,
+                                        frontend=str(frontend), **assets)
+                continue
+
+            def initialized_rank() -> dict | None:
+                if process.poll() is not None:
+                    raise AssertionError(f"Staged frontend exited before live rank observation: {process.returncode}")
+                return _read(report)
+
+            observation = _wait(initialized_rank, "staged MPI rank initialization")
+            if (observation["rank"], observation["world"], observation["mode"], observation["argv0"]) != (
+                    0, 1, "inspect", str(frontend)):
+                raise AssertionError("Staged singleton did not enter its actual rank with the original argv")
+
+            def parent(pid: int) -> int:
+                """Read the kernel parent from proc stat after the parenthesized comm field."""
+                return int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[1])
+
+            def pin(stack: ExitStack, pid: int, image: Path) -> select.poll:
+                """Retain the live process identity and verify the actual executable inode."""
+                if type(pid) is not int or pid <= 1:
+                    raise AssertionError("Invalid staged process identity")
+                descriptor = os.pidfd_open(pid)
+                stack.callback(os.close, descriptor)
+                poll = select.poll()
+                poll.register(descriptor, select.POLLIN)
+                if poll.poll(0) or not image.samefile(f"/proc/{pid}/exe") or poll.poll(0):
+                    raise AssertionError(f"Staged process is not live in its expected image: {image}")
+                return poll
+
+            # Acquire witnesses before releasing the rank. Do not reopen a
+            # numeric PID after reaping or treat a reused pathname as backing.
+            with ExitStack() as witnesses:
+                rank_pid = observation["pid"]
+                rank = pin(witnesses, rank_pid, frontend)
+                owner_pid = parent(rank_pid)
+                owner = pin(witnesses, owner_pid, helper)
+                if rank_pid == process.pid or owner_pid == process.pid or parent(owner_pid) != process.pid:
+                    raise AssertionError("Staged rank did not descend through its exact sibling guardian")
+                roots = []
+                for key, base in (("temporary", directory / "sessions"), ("shared", Path("/dev/shm"))):
+                    original = Path(observation[key])
+                    if original.parent != base or not original.name.startswith("llaminar-mpi-"):
+                        raise AssertionError("Staged rank escaped its original runtime root")
+                    fd = os.open(original, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+                    witnesses.callback(os.close, fd)
+                    info = os.fstat(fd)
+                    slot = _DIRECTORY_LOAN_FDS[key]
+                    # Follow the parked rank's procfd link, never a second pathname lookup.
+                    loan = os.open(f"/proc/{rank_pid}/fd/{slot}", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+                    witnesses.callback(os.close, loan)
+                    loan_info = os.fstat(loan)
+                    if (info.st_nlink == 0 or info.st_uid != os.geteuid() or
+                            (info.st_dev, info.st_ino, info.st_uid) !=
+                            (loan_info.st_dev, loan_info.st_ino, loan_info.st_uid)):
+                        raise AssertionError(f"Staged {key} root did not match the rank's original directory loan")
+                    roots.append((original, fd, loan, {"role": key, "path": str(original),
+                        "device": info.st_dev, "inode": info.st_ino, "uid": info.st_uid, "rank_fd": slot,
+                        "rank_device": loan_info.st_dev, "rank_inode": loan_info.st_ino, "rank_uid": loan_info.st_uid}))
+                if (rank.poll(0) or owner.poll(0) or parent(rank_pid) != owner_pid
+                        or parent(owner_pid) != process.pid or process.poll() is not None):
+                    raise AssertionError("Staged ancestry changed before releasing the exact rank")
+                def check_originals_retired() -> None:
+                    """Require both held pidfds and both original directory inodes to retire."""
+                    for poll in (rank, owner):
+                        if not any(mask & select.POLLIN for _, mask in poll.poll(0)):
+                            raise AssertionError("Staged rank or sibling guardian survived frontend exit")
+                    for path, fd, loan, receipt in roots:
+                        links = os.fstat(fd).st_nlink
+                        loan_links = os.fstat(loan).st_nlink
+                        name_present = os.path.lexists(path)
+                        if links != 0 or loan_links != 0 or name_present:
+                            raise AssertionError(f"Staged backing did not physically retire: {path}")
+                        receipt.update(held_nlink=links, rank_loan_nlink=loan_links, name_present=name_present)
+
+                report.with_suffix(report.suffix + ".release").touch(exist_ok=False)
+                self.finish(process, directory, 0, [], check_retirement=check_originals_retired)
+                self.results[-1].update(rank=observation, frontend_pid=process.pid,
+                                        guardian_pid=owner_pid, guardian=str(helper), helper_sha256=helper_digest,
+                                        original_roots=[receipt for _, _, _, receipt in roots], **assets)
+
     def identity(self) -> None:
         """Distinguish fresh frontend entry from a broken original descriptor loan."""
         for mode in ("frontend-reuse", "frontend-fresh", "frontend-missing-location",
@@ -606,20 +759,31 @@ def main() -> None:
     parser.add_argument("--helper", type=Path, required=True)
     parser.add_argument("--probe", type=Path, required=True)
     parser.add_argument("--singleton", type=Path)
+    parser.add_argument("--module", type=Path, help="Exact built native module for the staged singleton")
     parser.add_argument("--mpirun", type=Path, required=True)
-    parser.add_argument("--case", choices=("launcher", "mpi", "native_options", "stubborn", "ctest_timeout", "singleton", "identity", "retirement", "root_retirement", "root_unlink", "root_identity", "all"), default="all")
+    parser.add_argument("--case", choices=("launcher", "mpi", "native_options", "stubborn", "ctest_timeout",
+                                          "singleton", "staged_singleton", "identity", "retirement",
+                                          "root_retirement", "root_unlink", "root_identity", "all"), default="all")
     parser.add_argument("--root-side", choices=("both", "shared", "temporary"), default="both")
     parser.add_argument("--repeat", type=int, choices=range(1, 21), default=1)
     args = parser.parse_args()
-    if args.case in {"singleton", "identity", "all"} and args.singleton is None:
+    if args.case in {"singleton", "staged_singleton", "identity", "all"} and args.singleton is None:
         parser.error("Actual frontend ownership cases require --singleton")
-    root = Path(tempfile.mkdtemp(prefix="llaminar-mpi-replay-"))
+    if args.case in {"staged_singleton", "all"} and args.module is None:
+        parser.error("Staged singleton requires --module")
+    # A staged test nests another native singleton under the CTest owner.
+    # Use a short, exclusive Linux scratch tree outside its TMPDIR, both to
+    # leave room for native socket suffixes and to preserve failure evidence.
+    staging = args.case in {"staged_singleton", "all"}
+    root = Path(tempfile.mkdtemp(prefix="lm-stage-" if staging else "llaminar-mpi-replay-",
+                                 dir="/tmp" if staging else None))
     replay = Replay(args, root)
     passed = False
     failures = []
     try:
         selected = ((args.case,) if args.case != "all" else
-                    ("launcher", "mpi", "native_options", "stubborn", "ctest_timeout", "singleton", "identity"))
+                    ("launcher", "mpi", "native_options", "stubborn", "ctest_timeout", "singleton",
+                     "staged_singleton", "identity"))
         for case in selected:
             if args.case in {case, "all"}:
                 try:

@@ -232,7 +232,8 @@ namespace
     X(tp_global_degree) X(pp_degree) X(pp_split) X(cpu_layers) X(cpu_layers_first) X(default_backend) \
     X(config_file_path) X(topology_string) X(topology_file_path) X(topology_tree) X(model_path) X(shared_predictor) \
     X(max_seq_len) X(prefill_max_bucket_size) X(use_mmap) X(prompt) X(prompt_was_explicitly_provided) X(n_predict) X(batch_size) \
-    X(n_threads) X(seed) X(temperature) X(top_k) X(top_p) X(deterministic) X(chat_mode) \
+    X(n_threads) X(seed) X(serving_resident_slots) X(serving_response_leases) X(serving_queue_capacity) \
+    X(temperature) X(top_k) X(top_p) X(deterministic) X(chat_mode) \
     X(single_shot_chat) X(system_prompt) X(chat_template_override) X(benchmark_mode) \
     X(benchmark_campaign_path) X(benchmark_campaign_was_provided) X(benchmark_json_output_path) X(benchmark_prompt_file_path) X(benchmark_prompt_file_was_provided) \
     X(serve_mode) X(serve_port) X(serve_host) X(use_fused_attention) X(fused_attention_backend) \

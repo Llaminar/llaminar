@@ -13,6 +13,7 @@
 #include "OrchestrationConfig.h"
 #include "config/ActivationPrecisionPolicy.h"
 #include "config/ConfigValidator.h"
+#include "execution/config/ServingCapacity.h"
 #include "execution/parallelism_tree/ParallelismTree.h"
 #include "utils/Logger.h"
 #include <sstream>
@@ -1688,6 +1689,16 @@ namespace llaminar2
     OrchestrationConfig OrchestrationConfig::defaults()
     {
         return OrchestrationConfig{};
+    }
+
+    ServingCapacityRequest OrchestrationConfig::servingCapacityRequest() const
+    {
+        if (!hasServingCapacityIntent())
+            return ServingCapacityRequest::automatic();
+        if (!serving_resident_slots || !serving_response_leases || !serving_queue_capacity)
+            throw std::logic_error("Serving capacity axes must be authored together (all or none)");
+        return ServingCapacityRequest::authored(*serving_resident_slots, *serving_response_leases,
+                                                *serving_queue_capacity);
     }
 
 } // namespace llaminar2
