@@ -371,8 +371,8 @@ private:
     /** @brief Check the complete materialized graph family against its exact admitted owner. */
     void checkGraphMemory() const
     {
-        const auto bytes=oracle->residentMemoryBytes()+restore->residentMemoryBytes()+compute->residentMemoryBytes()+
-            (timed_parent?timed_parent->residentMemoryBytes():0);
+        const auto bytes=graphFamilyGrowth(GPUGraphMemoryContract::observationScope(memory->backing(d.device)),
+            {oracle.get(),restore.get(),compute.get(),timed_parent.get()});
         checked(GPUGraphMemoryContract::acceptsFamilyObservation(d.device,bytes,d.graph_bytes),"Recorded graph family exceeded original BOM");
     }
     /**

@@ -182,7 +182,7 @@ namespace llaminar2::hip_argument_geometry_test {
                 observed+= delta;
                 std::printf("HIP_KERNARG_GEOMETRY variant=%u,nodes=%u,declared_packet_bytes=%zu,observed_growth=%zu,family_growth=%zu,family_budget=%zu,total_memory_before=%zu,total_memory_after=%zu\n", variant, Nodes, sizeof(Packet), delta, observed, budget, total_before, total_after);
             }
-            if (!GPUGraphMemoryContract::acceptsFamilyObservation(device, observed, budget))throw std::runtime_error("Argument-heavy native family exceeds original typed PMA budget");
+            if (!GPUGraphMemoryContract::acceptsFamilyObservation(device, GPUGraphMemoryGrowth{observed}, budget))throw std::runtime_error("Argument-heavy native family exceeds original typed PMA budget");
             std::vector<std::uint32_t> actual(Nodes*Threads+16);
             for (unsigned variant = 0; variant < Variants; ++variant)for (unsigned replay = 0; replay < Replays; ++replay)
             {

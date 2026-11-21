@@ -331,7 +331,7 @@ namespace llaminar2
         PhysicalMemoryOwnerReservation graph_claim;
         std::unique_ptr<Phase> phase;
         std::vector<PlanningProjectionPhaseObservation> observations;
-        std::size_t graph_growth=0; int next=0;
+        GPUGraphMemoryGrowth graph_growth; int next=0;
         void requireOwner() const {
             require(original.worker() && original.worker()->ownsCurrentThread() && original.worker()->isInitialized(),
                 "Prepared projection requires its original owning GPU worker");
@@ -479,9 +479,8 @@ namespace llaminar2
         const int rows=owner.next==0?1:owner.prefill_rows;
         const auto begin=std::chrono::steady_clock::now();
         phase.timing->prepare(owner.memory);
-        const auto growth=phase.timing->residentMemoryBytes();
-        if(growth>std::numeric_limits<size_t>::max()-owner.graph_growth)throw std::overflow_error("Prepared projection graph-family growth overflow");
-        owner.graph_growth+=growth;
+        owner.graph_growth.add(phase.timing->residentMemoryBytes(),
+            GPUGraphMemoryContract::observationScope(owner.memory->backing(owner.device)));
         phase.graph_nodes=phase.timing->graphNodeCount();
         phase.state=Impl::PhaseState::Prepared;
         LOG_INFO("[PlanningProjectionWall] device=" << owner.device.toString() << " source=" << owner.shape.name

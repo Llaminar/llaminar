@@ -529,16 +529,17 @@ namespace llaminar2::fixed_rank_component_test
             bool complete_family_admitted = true;
             for (const auto &p : participants)
             {
-                std::size_t resident = 0;
+                GPUGraphMemoryGrowth resident;
                 Json growth = Json::array();
                 for (const auto &f : p->families)
                 {
-                    resident += f->graph->residentMemoryBytes();
+                    resident.add(f->graph->residentMemoryBytes(),
+                        GPUGraphMemoryContract::observationScope(authority->backing(p->device)));
                     growth.push_back({{"path", f->path == Path::Native ? "native_fixed_original_fold" : "mapped_fixed_local_fold"},
                         {"transactions", f->transactions}, {"pool_growth_bytes", f->graph->residentMemoryBytes()}});
                 }
                 emit({{"kind", "graph_memory"}, {"device", p->device.toString()}, {"families", growth},
-                    {"observed_pool_growth_bytes", resident}, {"admitted_family_bytes",
+                    {"observed_pool_growth_bytes", resident.bytes}, {"admitted_family_bytes",
                         family_count * GPUGraphMemoryContract::reservationBytesPerExecutable(p->device)}});
                 complete_family_admitted &= GPUGraphMemoryContract::acceptsFamilyObservation(p->device, resident,
                     family_count * GPUGraphMemoryContract::reservationBytesPerExecutable(p->device));

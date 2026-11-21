@@ -754,13 +754,15 @@ namespace
                     // Native graph pools grow in slabs. Attest the complete
                     // retained family, never attribute one slab to one slot.
                     EXPECT_TRUE(GPUGraphMemoryContract::acceptsFamilyObservation(first,
-                        first_graphs[0]->residentMemoryBytes() + first_graphs[1]->residentMemoryBytes(),
+                        graphFamilyGrowth(GPUGraphMemoryContract::observationScope(authority->backing(first)),
+                            {first_graphs[0].get(), first_graphs[1].get()}),
                         2 * GPUGraphMemoryContract::reservationBytesPerExecutable(first)))
                         << "source family observed=" << first_graphs[0]->residentMemoryBytes()
                         << "+" << first_graphs[1]->residentMemoryBytes() << " admitted="
                         << 2 * GPUGraphMemoryContract::reservationBytesPerExecutable(first);
                     EXPECT_TRUE(GPUGraphMemoryContract::acceptsFamilyObservation(second,
-                        second_graphs[0]->residentMemoryBytes() + second_graphs[1]->residentMemoryBytes(),
+                        graphFamilyGrowth(GPUGraphMemoryContract::observationScope(authority->backing(second)),
+                            {second_graphs[0].get(), second_graphs[1].get()}),
                         2 * GPUGraphMemoryContract::reservationBytesPerExecutable(second)))
                         << "peer family observed=" << second_graphs[0]->residentMemoryBytes()
                         << "+" << second_graphs[1]->residentMemoryBytes() << " admitted="

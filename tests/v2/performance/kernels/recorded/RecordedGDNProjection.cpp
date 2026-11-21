@@ -389,8 +389,8 @@ public:
 private:
     /** @brief Reject graph storage outside the exact original admitted family BOM. */
     void checkGraphMemory() const
-    {checked(GPUGraphMemoryContract::acceptsFamilyObservation(d.device,restore->residentMemoryBytes()+compute->residentMemoryBytes()+
-        (timed_parent?timed_parent->residentMemoryBytes():0),d.graph_bytes),"Recorded GDN graph family exceeds its exact admitted BOM");}
+    {checked(GPUGraphMemoryContract::acceptsFamilyObservation(d.device,graphFamilyGrowth(GPUGraphMemoryContract::observationScope(memory->backing(d.device)),
+        {restore.get(),compute.get(),timed_parent.get()}),d.graph_bytes),"Recorded GDN graph family exceeds its exact admitted BOM");}
     /** @brief Exercise distinct dirty input/output histories outside every timed interval. */
     void poison(int replay)
     {

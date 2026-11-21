@@ -16,6 +16,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <initializer_list>
 #include <memory>
 #include <span>
 #include <string>
@@ -1070,4 +1071,21 @@ namespace llaminar2
         IGPUGraphCapture &operator=(const IGPUGraphCapture &) = delete;
     };
 
+    /**
+     * @brief Accumulate the setup-only growth of a captured graph family.
+     * @param scope What the device's free-memory delta measures, from the
+     *        physical-memory authority's backing of that device.
+     * @param family Live members; null entries (absent optional graphs) are skipped.
+     * @return Summed bytes carrying @p scope.
+     */
+    [[nodiscard]] inline GPUGraphMemoryGrowth graphFamilyGrowth(
+        GPUGraphMemoryObservationScope scope,
+        std::initializer_list<const IGPUGraphCapture *> family)
+    {
+        GPUGraphMemoryGrowth growth;
+        for (const auto *graph : family)
+            if (graph)
+                growth.add(graph->residentMemoryBytes(), scope);
+        return growth;
+    }
 } // namespace llaminar2
