@@ -655,7 +655,8 @@ if(TARGET {owner})
             set_source_files_properties("${{source}}" PROPERTIES HEADER_FILE_ONLY TRUE)
         endif()
     endforeach()
-    if(NOT native_count EQUAL 2)
+    if(NOT native_count EQUAL 3 OR
+       NOT "integration/kernels/qwen4exp/CUDABranchNormOracle.cu" IN_LIST native_sources)
         message(FATAL_ERROR "Selected helper owner lost original native sources")
     endif()
 endif()
@@ -670,7 +671,8 @@ endif()
                     expected = ["v2_perf_immutable_host_lookup", "v2_perf_qwen_sparse_selection",
                                 "v2_perf_q8_residual_prepared_projection"]
                     if cuda:
-                        expected += ["v2_perf_cuda_qwen_sparse_selection",
+                        expected += ["v2_perf_cuda_decode_roofline",
+                                     "v2_perf_cuda_qwen_sparse_selection",
                                      "v2_perf_cuda_qwen_sparse_observations"]
                     if rocm:
                         expected += ["v2_perf_rocm_qwen_sparse_selection",
@@ -743,6 +745,15 @@ if(TARGET v2_perf_immutable_adaptive_lookup)
     message(FATAL_ERROR "Retired combined adaptive lookup performance entrypoint remains")
 endif()
 if(HAVE_CUDA)
+    get_target_property(cuda_probe_source v2_perf_cuda_decode_roofline SOURCES)
+    get_target_property(cuda_probe_standard v2_perf_cuda_decode_roofline CUDA_STANDARD)
+    get_target_property(cuda_probe_excluded v2_perf_cuda_decode_roofline EXCLUDE_FROM_ALL)
+    if(NOT cuda_probe_source MATCHES "/CUDADecodeRoofline[.]cu$" OR
+       NOT cuda_probe_standard EQUAL 20 OR NOT cuda_probe_excluded)
+        message(FATAL_ERROR "Lost native or explicit-build CUDA decode roofline policy")
+    endif()
+    # The device-free fixture checks the declaration without a CUDA compiler.
+    set_property(TARGET v2_perf_cuda_decode_roofline PROPERTY SOURCES "${{CMAKE_CURRENT_SOURCE_DIR}}/main.cpp")
     get_target_property(hc103_sources v2_perf_q8_residual_prepared_projection SOURCES)
     get_target_property(hc103_standard v2_perf_q8_residual_prepared_projection CUDA_STANDARD)
     if(NOT hc103_standard EQUAL 20)

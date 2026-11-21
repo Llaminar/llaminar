@@ -1198,12 +1198,6 @@ if(HAVE_CUDA OR HAVE_ROCM)
             integration/kernels/qwen4exp/PooledACKReadyCancellationCUDA.cu)
         set_target_properties(v2_test_qwen4exp_device_primitives PROPERTIES
             CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
-        add_v2_test(V2_Integration_CUDABranchNormReplay
-            COMMAND $<TARGET_FILE:v2_test_qwen4exp_device_primitives>
-                --gtest_filter=Qwen4ExpDevicePrimitives.CUDABranchNormReplay
-            LABELS "V2;Integration;ProductionTestPreflight;CUDA;Qwen4Exp;MTP;GraphCapture;ByteExact;Replay;Regression"
-            ENVIRONMENT "LLAMINAR_SKIP_CUDA_STARTUP=0;LLAMINAR_SKIP_ROCM_STARTUP=1"
-            MPI_PROCS 1 NO_MODELS TIMEOUT 60)
     endif()
     if(HAVE_ROCM AND TARGET v2_test_qwen4exp_device_primitives)
         set_source_files_properties(
@@ -1283,6 +1277,14 @@ if(HAVE_CUDA OR HAVE_ROCM)
             LABELS "V2;Integration;ProductionTestPreflight;ROCm;Qwen4Exp;Capture;ByteExact;Regression"
             ENVIRONMENT "LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=0"
             MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+    endif()
+    if(HAVE_CUDA AND TARGET v2_test_qwen4exp_device_primitives)
+        add_v2_test(V2_Integration_CUDABranchNormReplay
+            COMMAND $<TARGET_FILE:v2_test_qwen4exp_device_primitives>
+                --gtest_filter=Qwen4ExpDevicePrimitives.CUDABranchNormReplay
+            LABELS "V2;Integration;ProductionTestPreflight;CUDA;Qwen4Exp;MTP;GraphCapture;ByteExact;Replay;Regression"
+            ENVIRONMENT "LLAMINAR_SKIP_CUDA_STARTUP=0;LLAMINAR_SKIP_ROCM_STARTUP=1"
+            MPI_PROCS 1 NO_MODELS TIMEOUT 60)
     endif()
 endif()
 foreach(V2_QFN_BACKEND IN ITEMS CUDA ROCm)
