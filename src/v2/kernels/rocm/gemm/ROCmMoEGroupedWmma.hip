@@ -207,7 +207,7 @@ __global__ __launch_bounds__(BN * 4) void projection(MoEGroupedWmmaArguments v)
                 if (kb < end && n0 + col < v.n)
                 {
                     load_payload<Traits::payload_bytes>(desc.payload + linear * Traits::payload_bytes, raw);
-                    scale = static_cast<const uint16_t *>(desc.scales)[linear];
+                    scale = ::llaminar2::native_quantised_scale::loadStagedPrimary<static_cast<uint8_t>(FMT)>(static_cast<const uint16_t *>(desc.scales), linear);
                     if constexpr (Traits::needs_aux_compute) aux = static_cast<const uint16_t *>(desc.mins)[linear];
                     if constexpr (Traits::is_dual_scale_asym) emin = static_cast<const uint32_t *>(desc.emins)[linear];
                 }
@@ -445,6 +445,7 @@ bool submitMoEGroupedWmma(MoEGroupedPrefillEngine engine, uint32_t codebooks,
     MOE_WMMA_FORMAT(NATIVE_QUANTISED_GEMM_Q4_0);
     MOE_WMMA_FORMAT(NATIVE_QUANTISED_GEMM_IQ4_NL);
     MOE_WMMA_FORMAT(NATIVE_QUANTISED_GEMM_IQ4_XS_SOURCE);
+    MOE_WMMA_FORMAT(NATIVE_QUANTISED_GEMM_MXFP4);
     MOE_WMMA_FORMAT(NATIVE_QUANTISED_GEMM_Q4_1);
     MOE_WMMA_FORMAT(NATIVE_QUANTISED_GEMM_Q5_0);
     MOE_WMMA_FORMAT(NATIVE_QUANTISED_GEMM_Q5_1);
