@@ -36,7 +36,7 @@ void originalNativeReductionReplay(DeviceType family, int degree)
                 CollectiveMemoryEstimator::nativePipelineBoundaryBytes(
                     family == DeviceType::CUDA ? CollectiveBackendType::NCCL : CollectiveBackendType::RCCL));
             const auto graph_bom=RetainedParticipantGraphExecutable::generalBOM(
-                original->resource(DeviceId::cpu()),original->resource(device),1);
+                original->resource(DeviceId::cpu()),original->resource(device),NativeGraphObjectGeometry::localOwner({(original->resource(device)).world_rank,(original->resource(device)).device}),1);
             for(const auto& line:graph_bom.resources())plan.add(line);
         }
         original->admit(plan.build());

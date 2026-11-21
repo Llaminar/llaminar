@@ -243,6 +243,7 @@ namespace llaminar2
                 input.local_capacity.original_cpu_pipeline_programs=cpu_programs;
                 input.local_capacity.native_context_budgets=policy.native_context_budgets;
                 input.local_capacity.require_native_context_budgets=policy.require_native_context_budgets;
+                input.local_capacity.native_graph_objects=policy.native_graph_objects;
                 input.local_capacity.native_ordering_events=policy.native_ordering_events;
                 input.local_capacity.retained_host_services=policy.retained_host_services;
                 inputs.push_back(std::move(input.local_capacity));

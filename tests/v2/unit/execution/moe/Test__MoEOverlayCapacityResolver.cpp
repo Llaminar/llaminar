@@ -3032,7 +3032,8 @@ namespace llaminar2
                       capacity_input.host_demand_memory->allocationBytes());
         const auto graph_bom = RetainedParticipantGraphExecutable::calibrationBOM(
             dynamic_bom->resource(),
-            dynamic.physical_memory_admission->plan().find({5, DeviceId::cuda(0)})->resource());
+            dynamic.physical_memory_admission->plan().find({5, DeviceId::cuda(0)})->resource(),
+            test::NativeGraphObjectGeometryRecordedAccess::uniform()); // Same recorded owner evidence as the planner.
         EXPECT_EQ(dynamic_bom->bytes(PhysicalMemoryOwner::NativePreparationGraphExecutable) -
                       static_bom->bytes(PhysicalMemoryOwner::NativePreparationGraphExecutable),
                   graph_bom.find(cpu_identity)->bytes(PhysicalMemoryOwner::NativePreparationGraphExecutable));
@@ -4563,6 +4564,7 @@ namespace llaminar2
 #include "CPUJointSerialGeometryContract.inc"
 
 #include "PhysicalProjectionLaneDemandContract.inc"
+#include "fixtures/backends/NativeGraphObjectGeometryRecordedAccess.h"
 
 namespace llaminar2 {
 /** @test Fixed BOM and materializer share original rank/tier multiplicity independent of layer count. */

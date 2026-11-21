@@ -23,6 +23,7 @@
 #include <map>
 #include <numeric>
 #include <vector>
+#include "fixtures/backends/NativeGraphObjectGeometryRecordedAccess.h"
 
 namespace llaminar2
 {
@@ -179,6 +180,7 @@ namespace
                         .has_embedding = rank.has_embedding, .has_lm_head = rank.has_lm_head,
                         .generation_domain = declaredRankDeviceGenerationDomain(parent)},
                     .native_source_placement = CPUStoragePlacement::local()}, rows);
+                projected.local_capacity.native_graph_objects = test::NativeGraphObjectGeometryRecordedAccess::uniform();
                 result.push_back(std::move(projected.local_capacity));
             }
             return result;

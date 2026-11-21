@@ -106,7 +106,7 @@ void nativeFork(DeviceId device,bool owned,ForkProfile profile,bool originalComp
     auto worker=original.worker();
     auto* backend=getBackendFor(device);
     const auto gpu=session->resource(device),cpu=session->resource(DeviceId::cpu());
-    PhysicalMemoryPlanBuilder bom(RetainedParticipantGraphExecutable::generalBOM(cpu,gpu,1));
+    PhysicalMemoryPlanBuilder bom(RetainedParticipantGraphExecutable::generalBOM(cpu,gpu,NativeGraphObjectGeometry::localOwner({(gpu).world_rank,(gpu).device}),1));
     constexpr std::size_t GPUBytes=4*sizeof(std::uint64_t);
     bom.add(gpu,PhysicalMemoryOwner::ActivationArena,GPUBytes);
     // ready, producer input gate, service gate and diagnostic read-completion

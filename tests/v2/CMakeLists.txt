@@ -295,8 +295,9 @@ function(add_v2_test TEST_NAME)
     cmake_parse_arguments(
         ARG                             # Prefix for parsed args
         "NO_MODELS;NO_MPI"              # Explicit model/process requirements
-        "MPI_PROCS;TIMEOUT;SKIP_REGULAR_EXPRESSION;GPU_DEVICES;CUDA_DEVICES;ROCM_DEVICES;REQUIRES_BACKEND" # One-value keywords
-        "COMMAND;LABELS;RESOURCE_LOCK;ENVIRONMENT;REQUIRED_FILES"  # Multi-value keywords
+        "MPI_PROCS;TIMEOUT;SKIP_REGULAR_EXPRESSION;GPU_DEVICES;CUDA_DEVICES;ROCM_DEVICES" # One-value keywords
+        # REQUIRES_BACKEND lists every required family; cross-vendor cases name both.
+        "COMMAND;LABELS;RESOURCE_LOCK;ENVIRONMENT;REQUIRED_FILES;REQUIRES_BACKEND"  # Multi-value keywords
         ${ARGN}                         # Arguments to parse
     )
     # Release aliases are admitted only through their explicitly selected

@@ -19,6 +19,7 @@
 #include <gtest/gtest.h>
 #include <sstream>
 #include <type_traits>
+#include "backends/GPUFlatGraphStructure.h"
 namespace llaminar2::test {
 namespace {
 /** @return Complete recorded family with real original pthread geometry; never
@@ -31,7 +32,8 @@ PlanningNativeContextDeclaration recorded(DeviceId device) {
           program.guardBytes(),
           program.pageBytes(),
           64,
-          64};
+          64,
+          1024}; // Recorded owner's graph adapter size.
 }
 } // namespace
 /** @test The same key inputs price opaque commitments and original stack pages
@@ -159,7 +161,8 @@ TEST(PlanningNativeContextEvidence,
                                                key->worker_guard_bytes,
                                                program.pageBytes(),
                                                key->context_object_bytes,
-                                               key->context_object_alignment};
+                                               key->context_object_alignment,
+                                               nativeGraphCaptureObjectBytes(device)};
   PlanningGGUFFixture file;
   PlanningModelSource model(file.path());
   DevicePlanConfig cfg;

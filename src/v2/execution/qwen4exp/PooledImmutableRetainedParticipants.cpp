@@ -596,9 +596,13 @@ std::shared_ptr<PooledImmutableRetainedParticipants> PooledImmutableRetainedPart
             // before creating the first directed channel. No caller supplies a bound.
             std::visit([&](const auto& contract){
                 using Contract=std::decay_t<decltype(contract)>;
+                // The live source owns this device in this process, so its
+                // compiled adapter is the owner's published size.
+                const auto gpu=witness->source()->originalResource(owner.device());
+                const auto graphObjects=NativeGraphObjectGeometry::localOwner({gpu.world_rank,gpu.device});
                 if constexpr(std::is_same_v<Contract,PooledRemoteGraphProgram>)
-                    (void)RetainedParticipantGraphExecutable::hostBOM(contract,witness->source()->originalResource(DeviceId::cpu()),witness->source()->originalResource(owner.device()));
-                else (void)RetainedParticipantGraphExecutable::nativeStorageBOM(contract,witness->source()->originalResource(DeviceId::cpu()),witness->source()->originalResource(owner.device()));
+                    (void)RetainedParticipantGraphExecutable::hostBOM(contract,witness->source()->originalResource(DeviceId::cpu()),gpu,graphObjects);
+                else (void)RetainedParticipantGraphExecutable::nativeStorageBOM(contract,witness->source()->originalResource(DeviceId::cpu()),gpu,graphObjects);
             },program);
             programs.push_back(std::move(program));
         }

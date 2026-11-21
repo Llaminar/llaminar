@@ -131,7 +131,7 @@ void OriginalAdmissionSuite::prepare(){
     checkpoint([&]{if(original_){
         const auto host=original_->resource(DeviceId::cpu()),gpu=original_->resource(local_);PhysicalMemoryPlanBuilder bill;
         const auto add=[&](const PhysicalMemoryPlan& part){for(const auto& row:part.resources())bill.add(row);};
-        add(RetainedParticipantGraphExecutable::generalBOM(host,gpu,frames_.size()));
+        add(RetainedParticipantGraphExecutable::generalBOM(host,gpu,NativeGraphObjectGeometry::localOwner({(gpu).world_rank,(gpu).device}),frames_.size()));
         add(MoEOverlayActivationBatchResources::coldPublicationBOM(host,gpu));
         for(const auto& frame:frames_){const auto& config=frame.config;const auto& layout=config.activation_layout;
             bill.add(host,PhysicalMemoryOwner::ActivationTransportStaging,

@@ -7,6 +7,7 @@
  * separate capacity resolver. All expected cache/frame sizes come from actual
  * source-owned geometry, and every capacity decision uses complete PMA plans.
  */
+#include "fixtures/backends/NativeGraphObjectGeometryRecordedAccess.h"
 #include "planning/MemoryPlanner.h"
 #include "config/OrchestrationConfigDocument.h"
 #include "fixtures/backends/NativeContextPreparationReplayAccess.h"
@@ -37,6 +38,7 @@
 #include <iostream>
 #include <limits>
 #include <type_traits>
+#include "../../utils/CompiledGPUBackends.h"
 using namespace llaminar2;
 namespace
 {
@@ -819,7 +821,7 @@ void replayBalancedSharedCache(DeviceType backend,std::size_t count,bool constra
     }
     const auto projection=test::NativeOrderingEventGroupReplayAccess::projectionWithRemoteGraphs(devices);
     auto cfg=consumer(backend);
-    cfg.native_context_preparation=originals.source;
+    cfg.native_context_preparation=originals.source;cfg.native_graph_objects=test::NativeGraphObjectGeometryRecordedAccess::uniform();
     cfg.native_ordering_events=projection;
     cfg.ngram_gpu_peer_access=count>1?std::optional{PeerAccessCoverage::None}:std::nullopt;
     cfg.ngram_execution_policy=requested;
@@ -918,7 +920,7 @@ void replaySharedPlanning(DeviceType backend=DeviceType::ROCm,std::size_t cacheR
         auto& cfg=configs[i];cfg.device=originals.devices[i];cfg.total_shards=2;cfg.shard_index=int(1-i);
         cfg.ngram_execution_policy=requested;cfg.ngram_tp_topology=ImmutableRowTableTPTopology::HomogeneousFullMainRankLocal;
         cfg.local_tp_backend=backend==DeviceType::CUDA?CollectiveBackendType::NCCL:CollectiveBackendType::RCCL;cfg.tensor_parallel_assignment=assignment.forDevice(cfg.device);
-        cfg.native_context_preparation=originals.source;cfg.native_ordering_events=projection;cfg.ngram_gpu_peer_access=backend==DeviceType::CUDA?std::nullopt:std::optional{PeerAccessCoverage::None};
+        cfg.native_context_preparation=originals.source;cfg.native_graph_objects=test::NativeGraphObjectGeometryRecordedAccess::uniform();cfg.native_ordering_events=projection;cfg.ngram_gpu_peer_access=backend==DeviceType::CUDA?std::nullopt:std::optional{PeerAccessCoverage::None};
         cfg.ngram_reader_peer_access={{{0,devices[1]},{0,devices[0]},PeerAccessCoverage::None}};
         test::declareRecordedNgramHostServices(cfg);
     }
@@ -1040,7 +1042,7 @@ TEST(GPUAdaptiveImmutableLookupAdmission, SharedDirectoryPressureBalancesEveryFe
         ~RestoreDeathStyle(){GTEST_FLAG_SET(death_test_style,previous);}
     } restore;
     GTEST_FLAG_SET(death_test_style,"threadsafe");
-    for(const auto backend:{DeviceType::CUDA,DeviceType::ROCm})
+    for(const auto backend:test::compiledGPUTypes())
       for(const auto count:{1u,2u,4u,8u})
         for(const bool constrained:{false,true}) {
             SCOPED_TRACE(::testing::Message()<<"backend="<<static_cast<int>(backend)<<" owners="<<count<<" constrained="<<constrained);
@@ -1200,7 +1202,7 @@ TEST(GPUAdaptiveImmutableLookupAdmission, CanonicalPooledReplayMatchesCompletePh
                     auto& cfg=configs[i];cfg.device=originals.devices[i];cfg.total_shards=2;cfg.shard_index=int(i);
                     cfg.ngram_execution_policy=requested;cfg.ngram_tp_topology=ImmutableRowTableTPTopology::HomogeneousFullMainRankLocal;
                     cfg.local_tp_backend=CollectiveBackendType::RCCL;cfg.tensor_parallel_assignment=assignment.forDevice(cfg.device);
-                    cfg.native_context_preparation=originals.source;cfg.native_ordering_events=projection;
+                    cfg.native_context_preparation=originals.source;cfg.native_graph_objects=test::NativeGraphObjectGeometryRecordedAccess::uniform();cfg.native_ordering_events=projection;
                     if(requested.gpu_adaptive.placement.mode==AdaptiveGPUCachePlacementMode::DeclaredRankLocal) {
                         cfg.ngram_gpu_peer_access=PeerAccessCoverage::None;
                         cfg.ngram_reader_peer_access={{{0,DeviceId::rocm(0)},{0,DeviceId::rocm(1)},PeerAccessCoverage::None}};
@@ -1298,7 +1300,7 @@ TEST(GPUAdaptiveImmutableLookupAdmission, LocalTerminalHostBOMIsOncePerConsumerA
                         cfg.ngram_execution_policy=requested;cfg.ngram_tp_topology=ImmutableRowTableTPTopology::HomogeneousFullMainRankLocal;
                         cfg.local_tp_backend=backend==DeviceType::CUDA?CollectiveBackendType::NCCL:CollectiveBackendType::RCCL;
                         cfg.tensor_parallel_assignment=assignment.forDevice(cfg.device);
-                        cfg.native_context_preparation=originals.source;cfg.native_ordering_events=projection;
+                        cfg.native_context_preparation=originals.source;cfg.native_graph_objects=test::NativeGraphObjectGeometryRecordedAccess::uniform();cfg.native_ordering_events=projection;
                         cfg.ngram_gpu_peer_access=PeerAccessCoverage::None;
                         cfg.ngram_reader_peer_access={{{0,devices[coordinator]},{0,devices[1-coordinator]},PeerAccessCoverage::None}};
                         test::declareRecordedNgramHostServices(cfg);
@@ -1320,7 +1322,7 @@ TEST(GPUAdaptiveImmutableLookupAdmission, LocalTerminalHostBOMIsOncePerConsumerA
                     for(const auto& line:cache.resources())original.add(line);
                     const auto local_optional=geometry.localHotSlotDependentBOM(gpu,host,projection);
                     for(const auto& line:local_optional.resources())original.add(line);
-                    const auto transport=qwen4exp::PooledImmutableRetainedParticipantBudget::completeBOM(geometry,host,gpu,projection);
+                    const auto transport=qwen4exp::PooledImmutableRetainedParticipantBudget::completeBOM(geometry,host,gpu,request->input.graphObjects(),projection);
                     for(const auto& line:transport.resources())original.add(line);
                     const auto original_bom=original.build();
                     const auto source_staging=original_bom.find({0,DeviceId::cpu()})->bytes(PhysicalMemoryOwner::ImmutableLookupStaging);

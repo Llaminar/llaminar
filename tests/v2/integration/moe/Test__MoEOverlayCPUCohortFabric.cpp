@@ -328,8 +328,8 @@ struct FabricOriginal {
                     for(const auto& row:unit.resources())budget.add(row);
             }
             if(joined_service) {
-                const auto general=RetainedParticipantGraphExecutable::generalBOM(cpu,gpu);
-                const auto calibration=RetainedParticipantGraphExecutable::calibrationBOM(cpu,gpu);
+                const auto general=RetainedParticipantGraphExecutable::generalBOM(cpu,gpu,NativeGraphObjectGeometry::localOwner({(gpu).world_rank,(gpu).device}));
+                const auto calibration=RetainedParticipantGraphExecutable::calibrationBOM(cpu,gpu,NativeGraphObjectGeometry::localOwner({(gpu).world_rank,(gpu).device}));
                 for(const auto& row:general.resources())budget.add(row);
                 for(const auto& row:calibration.resources())budget.add(row);
                 const auto found=std::find_if(service_inventory.gpus.begin(),service_inventory.gpus.end(),[&](const auto& observed){

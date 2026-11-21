@@ -46,7 +46,7 @@ void nativeCompletedDecisionReplay(DeviceType family) {
             TransferEngine::mappedHostRegionAllocationBytes(snapshot_bytes));
         for (const auto device : devices) {
             plan.add(original->resource(device), PhysicalMemoryOwner::ExecutionWorkspace, sizeof(NativeDecisionReplayBank));
-            const auto graphs = RetainedParticipantGraphExecutable::generalBOM(original->resource(DeviceId::cpu()), original->resource(device), 3);
+            const auto graphs = RetainedParticipantGraphExecutable::generalBOM(original->resource(DeviceId::cpu()), original->resource(device),NativeGraphObjectGeometry::localOwner({(original->resource(device)).world_rank,(original->resource(device)).device}), 3);
             for (const auto &line : graphs.resources()) plan.add(line);
         }
         original->admit(plan.build()); auto memory = original->memory();

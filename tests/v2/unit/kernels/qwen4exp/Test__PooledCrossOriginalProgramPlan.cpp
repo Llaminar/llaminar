@@ -83,8 +83,8 @@ TEST(PooledCrossOriginalProgramPlan, SourceAndStorageRolesPriceBothChannelsBefor
         const auto bom=crossVendorReadProgramBOM(declarations);const auto* compute=bom.find({0,sourceDevice});const auto* storage=bom.find({0,ownerDevice});ASSERT_NE(compute,nullptr);ASSERT_NE(storage,nullptr);
         EXPECT_EQ(compute->bytes(PhysicalMemoryOwner::NativeGraphExecutable),6*GPUGraphMemoryContract::reservationBytesPerExecutable(sourceDevice,GPUGraphExecutableClass::General));
         EXPECT_EQ(storage->bytes(PhysicalMemoryOwner::NativeGraphExecutable),2*GPUGraphMemoryContract::reservationBytesPerExecutable(ownerDevice,GPUGraphExecutableClass::General));
-        const auto sourceGeneral=RetainedParticipantGraphExecutable::generalBOM(session->resource(DeviceId::cpu()),session->resource(sourceDevice),6);
-        const auto ownerGeneral=RetainedParticipantGraphExecutable::generalBOM(session->resource(DeviceId::cpu()),session->resource(ownerDevice),2);
+        const auto sourceGeneral=RetainedParticipantGraphExecutable::generalBOM(session->resource(DeviceId::cpu()),session->resource(sourceDevice),NativeGraphObjectGeometry::localOwner({(session->resource(sourceDevice)).world_rank,(session->resource(sourceDevice)).device}),6);
+        const auto ownerGeneral=RetainedParticipantGraphExecutable::generalBOM(session->resource(DeviceId::cpu()),session->resource(ownerDevice),NativeGraphObjectGeometry::localOwner({(session->resource(ownerDevice)).world_rank,(session->resource(ownerDevice)).device}),2);
         EXPECT_EQ(bom.find({0,DeviceId::cpu()})->bytes(PhysicalMemoryOwner::NativeGraphExecutable),
             sourceGeneral.find({0,DeviceId::cpu()})->bytes(PhysicalMemoryOwner::NativeGraphExecutable)+ownerGeneral.find({0,DeviceId::cpu()})->bytes(PhysicalMemoryOwner::NativeGraphExecutable));
         EXPECT_EQ(declarations.back().physical.owners().size(),1u);EXPECT_EQ(declarations.back().physical.owners()[0].allocator.device,ownerDevice);

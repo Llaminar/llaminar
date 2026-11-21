@@ -4,6 +4,7 @@
  * each original rank once.
  */
 #include "planning/PlanningNativeContextEvidence.h"
+#include "backends/GPUFlatGraphStructure.h"
 #include "backends/NativeContextPreparation.h"
 #include "backends/PreparedGPUWorkerThread.h"
 #include "interfaces/IMPIContext.h"
@@ -37,12 +38,13 @@ Json encode(const PlanningNativeContextDeclaration &k) {
               {"guard", k.guard_bytes},
               {"page", k.page_bytes},
               {"object", k.object_bytes},
-              {"alignment", k.object_alignment}};
+              {"alignment", k.object_alignment},
+              {"graph_object", k.graph_capture_object_bytes}};
 }
 /** @return Original rank's physical declaration; installed catalog owns all
  * opaque limits. */
 PlanningNativeContextDeclaration decode(const Json &j) {
-  if (!j.is_object() || j.size() != 8)
+  if (!j.is_object() || j.size() != 9)
     throw std::invalid_argument(
         "Native planning declaration has unexpected fields");
   PlanningNativeContextDeclaration k{
@@ -53,10 +55,14 @@ PlanningNativeContextDeclaration decode(const Json &j) {
       j.at("guard").get<size_t>(),
       j.at("page").get<size_t>(),
       j.at("object").get<size_t>(),
-      j.at("alignment").get<size_t>()};
+      j.at("alignment").get<size_t>(),
+      j.at("graph_object").get<size_t>()};
   if (k.physical_uuid.empty())
     throw std::invalid_argument(
         "Native planning declaration has no original UUID");
+  if (k.graph_capture_object_bytes == 0)
+    throw std::invalid_argument(
+        "Native planning declaration has no graph adapter size");
   (void)GPUWorkerStackProgram::planningAllocationBytes(
       k.stack_bytes, k.guard_bytes, k.page_bytes, k.object_bytes,
       k.object_alignment);
@@ -141,9 +147,12 @@ collectPlanningNativeContextBudgets(const AutomaticPlanningPreparation &c) {
           if (physical == rank_inventory.gpus.end() || physical->uuid.empty())
             throw std::invalid_argument(
                 "Native planning endpoint lacks original inventory UUID");
+          // This rank owns the device, so its compiled adapter is the
+          // authoritative size; the planning root may lack that backend.
           j.push_back(encode({device, physical->uuid, program.stackBytes(),
                               program.guardBytes(), program.pageBytes(),
-                              object.bytes(), object.alignment()}));
+                              object.bytes(), object.alignment(),
+                              nativeGraphCaptureObjectBytes(device)}));
         }
         const auto text = j.dump();
         return std::vector<std::uint8_t>(text.begin(), text.end());

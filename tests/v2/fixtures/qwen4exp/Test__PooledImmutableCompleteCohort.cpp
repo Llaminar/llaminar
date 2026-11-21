@@ -25,6 +25,7 @@
 #include "execution/qwen4exp/PooledImmutableDirectedOwnerProgram.h"
 #include "execution/qwen4exp/PooledImmutableDirectedLookupGraph.h"
 #include "execution/local_execution/graph/DeviceGraphCaptureController.h"
+#include "../../utils/CompiledGPUBackends.h"
 namespace llaminar2::test {
 /** @brief Context identity only; every data/API operation remains unavailable to this host proof. */
 class CohortContext final:public IGPUDeviceContext {
@@ -460,6 +461,7 @@ TEST(PooledImmutableCompleteCohort, ConcurrentColdBindingPublishesOneOriginalOwn
     c.binding=result[0]?result[0]:result[1];ASSERT_NE(c.binding,nullptr);c.admit(1);c.binding->launch();c.terminalJoin();
 }
 
+#if defined(HAVE_CUDA) && defined(HAVE_ROCM)
 TEST(PooledImmutableCompleteCohort, CallerRuleAndOppositeSourceBindingsUseRealQueuedWorkerIdentity) {
     CohortPrograms programs({{{2},q::adaptive_lookup::None,DeviceType::CUDA,0,1},{{2},q::adaptive_lookup::None,DeviceType::ROCm,0,1}});
     {
@@ -483,6 +485,7 @@ TEST(PooledImmutableCompleteCohort, CallerRuleAndOppositeSourceBindingsUseRealQu
         a.admit(1);a.binding->launch();a.terminalJoin();b.admit(1);b.binding->launch();b.terminalJoin();
     }
 }
+#endif // defined(HAVE_CUDA) && defined(HAVE_ROCM)
 TEST(PooledImmutableCompleteCohort, ExpiredWeakOwnerCannotReplaceOriginalRetirementInProgress) {
     CohortPrograms programs({{{2},q::adaptive_lookup::None,DeviceType::CUDA,0,2,2}});
     CohortCase c({2});c.bind();const auto births=CohortCase::capturesCreated.load();
@@ -506,6 +509,7 @@ TEST(PooledImmutableCompleteCohort, FinalOwnerCannotBlockItsOriginalParticipatin
     EXPECT_EXIT({llaminar2::test::disableIntentionalFaultCoreDump();CohortCase c({2});c.bind();auto worker=c.source.worker;worker->submitAndWait([&]{c.binding.reset();});},::testing::KilledBySignal(SIGABRT),"terminate");
 }
 
+#if defined(HAVE_CUDA) && defined(HAVE_ROCM)
 TEST(PooledImmutableCompleteCohort, QueuedOppositeSourceAdmissionsAndFailureNeverWaitForPeers) {
     CohortPrograms programs({{{2},q::adaptive_lookup::None,DeviceType::CUDA,0,1},{{2},q::adaptive_lookup::None,DeviceType::ROCm,0,1},{{2},q::adaptive_lookup::None,DeviceType::CUDA,1,1},{{2},q::adaptive_lookup::None,DeviceType::ROCm,1,1}});
     for(bool failure:{false,true}){
@@ -530,14 +534,17 @@ TEST(PooledImmutableCompleteCohort, QueuedOppositeSourceAdmissionsAndFailureNeve
         });
     }
 }
+#endif // defined(HAVE_CUDA) && defined(HAVE_ROCM)
 
 /** @brief Actual original native-role declarations seal against the pre-admission pure recipe. */
 TEST(PooledImmutableCompleteCohort, DirectedOwnerProgramSealsActualRolesAndEdgesBeforeCapture) {
     EXPECT_EXIT(([]{
         {
-            CohortPrograms programs({{{0,0},0,DeviceType::CUDA,0,0},{{0,3},0,DeviceType::CUDA,0,0},
-                {{0,0},0,DeviceType::ROCm,0,0},{{0,3},0,DeviceType::ROCm,0,0}});
-            for(const auto source:{DeviceType::CUDA,DeviceType::ROCm})for(const auto capacity:{0u,3u}){
+            // Each source family owns its directed program; only compiled families can.
+            std::vector<CohortRecipe> recipes;
+            for(const auto type:compiledGPUTypes()){recipes.push_back({{0,0},0,type,0,0});recipes.push_back({{0,3},0,type,0,0});}
+            CohortPrograms programs(std::move(recipes));
+            for(const auto source:compiledGPUTypes())for(const auto capacity:{0u,3u}){
                 auto original=programs.make({0,capacity},0,source);auto& c=*original;
                 const auto publication=q::PooledImmutableCapturedPublicationWave::bind(c.sources[1],c.memory);
                 const auto read=q::PooledImmutableCapturedReadWave::bind(publication,c.memory);

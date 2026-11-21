@@ -19,6 +19,9 @@ struct PlanningNativeContextDeclaration final {
   std::string physical_uuid;
   std::size_t stack_bytes, guard_bytes, page_bytes, object_bytes,
       object_alignment;
+  /** Owner's compiled native graph-capture adapter size; see
+   * NativeGraphObjectGeometry. Never derived from the planner's binary. */
+  std::size_t graph_capture_object_bytes;
 };
 using PlanningNativeContextBudgets =
     std::map<int, std::vector<PlanningNativeContextDeclaration>>;
