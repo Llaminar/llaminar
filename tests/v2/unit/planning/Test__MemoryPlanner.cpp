@@ -1354,12 +1354,20 @@ TEST(Test__MemoryPlanner,
         EXPECT_TRUE(
             GPUGraphMemoryContract::acceptsFamilyObservation(
                 device,
-                observed_pool_growth,
+                GPUGraphMemoryGrowth{observed_pool_growth},
                 admitted_family_bytes));
         EXPECT_FALSE(
             GPUGraphMemoryContract::acceptsFamilyObservation(
                 device,
-                admitted_family_bytes + 1u,
+                GPUGraphMemoryGrowth{admitted_family_bytes + 1u},
+                admitted_family_bytes));
+        // An integrated GPU's system-wide delta is not family evidence: it
+        // can neither certify nor refute the committed admission.
+        EXPECT_TRUE(
+            GPUGraphMemoryContract::acceptsFamilyObservation(
+                device,
+                GPUGraphMemoryGrowth{admitted_family_bytes + 1u,
+                                     GPUGraphMemoryObservationScope::SystemWide},
                 admitted_family_bytes));
     }
 }

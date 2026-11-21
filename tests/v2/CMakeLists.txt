@@ -29601,6 +29601,14 @@ add_v2_test(V2_Integration_IntegratedGPUPoolObservationMerge
     LABELS "V2;Integration;ProductionTestPreflight;Memory;PhysicalMemoryAuthority;DeviceFree;Regression"
     MPI_PROCS 1 NO_MODELS)
 
+# Integrated GPUs observe system-wide graph growth, which neither certifies
+# nor refutes the committed family admission; device pools stay bounded.
+add_v2_test(V2_Integration_GraphFamilyObservationScope
+    COMMAND $<TARGET_FILE:v2_test_memory_planner>
+        --gtest_filter=Test__MemoryPlanner.CapturedGraphPoolGrowthIsCertifiedAgainstTheCompleteFamily
+    LABELS "V2;Integration;ProductionTestPreflight;Memory;PhysicalMemoryAuthority;GraphCapture;DeviceFree;Regression"
+    MPI_PROCS 1 NO_MODELS)
+
 add_v2_test(V2_Integration_MoEProjectionTransportAccounting
     COMMAND $<TARGET_FILE:v2_test_memory_planner>
         --gtest_filter=Test__MemoryPlanner.CountedProjectionTransportHasOneCanonicalPhysicalBOM

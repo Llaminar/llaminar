@@ -1108,6 +1108,13 @@ namespace llaminar2
         [[nodiscard]] bool contains(DeviceId device) const;
 
         /**
+         * @return The admitted physical backing of @p device on this rank
+         *         (RankHostPool for an integrated GPU).
+         * @throws std::out_of_range when the device is not admitted for this rank.
+         */
+        [[nodiscard]] PhysicalMemoryBacking backing(DeviceId device) const;
+
+        /**
          * @brief Return complete planned bytes for one local owner/device.
          * @throws std::out_of_range when the device is not admitted for this rank.
          */
