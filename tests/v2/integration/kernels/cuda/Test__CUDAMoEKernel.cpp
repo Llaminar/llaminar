@@ -22128,6 +22128,13 @@ TEST_F(Test__CUDAMoEKernel, RuntimeGroupedDecodeSwiGLUPublicationReplay)
     runtime_update.expert_count = num_experts;
     runtime_update.experts.resize(num_experts);
     markAllExpertsLocalForRouting(runtime_update, num_experts);
+    for (int expert = 0; expert < num_experts; ++expert)
+    {
+        auto &entry = runtime_update.experts[expert];
+        entry.gate = gate_descs[expert];
+        entry.up = up_descs[expert];
+        entry.down = down_descs[expert];
+    }
     ASSERT_TRUE(cuda_table.prepareInactiveBank(0, runtime_update));
     ASSERT_TRUE(cuda_table.flipActiveBank(
         0, runtime_update.epoch, stream_));
@@ -22214,12 +22221,10 @@ TEST_F(Test__CUDAMoEKernel, RuntimeGroupedDecodeSwiGLUPublicationReplay)
     ASSERT_TRUE(run_fused());
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
 
-    std::vector<float> two_step_values(
-        two_step_output->data(),
-        two_step_output->data() + two_step_output->numel());
-    std::vector<float> fused_values(
-        fused_output->data(),
-        fused_output->data() + fused_output->numel());
+    const auto two_step_values = copyCudaFP32TensorToHost(two_step_output, stream_);
+    const auto fused_values = copyCudaFP32TensorToHost(fused_output, stream_);
+    ASSERT_GT(l2Norm(two_step_values.data(), two_step_values.size()), 1.0e-7);
+    ASSERT_GT(l2Norm(fused_values.data(), fused_values.size()), 1.0e-7);
     expectBitwiseFP32RowsEqual("direct SwiGLU versus staged output",
         fused_values.data(), two_step_values.data(), fused_values.size(), d_model);
 
@@ -24222,7 +24227,8 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
                 serial_values.data(),
                 grouped_values.size(),
                 static_cast<size_t>(d_model));
-            if (std::string_view(format.label) == "Q8_0" && seq_len == 4)
+            const char *probe_path = std::getenv("LLAMINAR_TEST_CUDA_MOE_VERIFIER_DOWN_PROBE_JSONL");
+            if (seq_len == 4 && (probe_path || std::string_view(format.label) == "Q8_0"))
             {
                 ScopedCudaTestGraph graph(stream_, "M4 original-route Down publication");
                 ASSERT_TRUE(run_grouped());
@@ -24236,6 +24242,8 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
                 std::vector<cudaGraphNode_t> nodes(count);
                 ASSERT_EQ(cudaGraphGetNodes(native, nodes.data(), &count), cudaSuccess);
                 int direct_publications = 0;
+                cudaGraphNode_t down_source = nullptr;
+                cudaKernelNodeParams down_params{};
                 for (auto node : nodes)
                 {
                     cudaGraphNodeType type{};
@@ -24252,16 +24260,45 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
                     if (name.find("grouped_prefill_down_canonical_publish_k32_kernel") != std::string_view::npos)
                     {
                         ++direct_publications;
+                        down_source = node;
+                        down_params = params;
                         EXPECT_EQ(params.gridDim.y, static_cast<unsigned>(seq_len * top_k));
                         EXPECT_EQ(params.gridDim.z, 1u);
                     }
                 }
-                EXPECT_EQ(direct_publications, 1);
+                ASSERT_EQ(direct_publications, 1);
                 for (int repeat = 0; repeat < 3; ++repeat)
                 {
                     ASSERT_TRUE(graph.launchAndPublishOutputs({runtime_prefill_output.get()}));
                     const auto replay = copyCudaFP32TensorToHost(runtime_prefill_output, stream_);
                     expectBitwiseFP32RowsEqual("captured M4 direct Down publication",
+                        replay.data(), serial_values.data(), replay.size(), d_model);
+                }
+                if (probe_path)
+                {
+                    using namespace llaminar2::test;
+                    using namespace llaminar2::test::cuda_kernel_probe_detail;
+                    GraphOwner leaf;
+                    cudaGraphNode_t node = nullptr;
+                    require(cudaGraphAddKernelNode(&node, leaf.graph, nullptr, 0, &down_params),
+                        "isolate original grouped Down publication");
+                    require(cudaGraphKernelNodeCopyAttributes(node, down_source),
+                        "retain original grouped Down publication attributes");
+                    auto records = probeIndependentCUDAKernels(leaf.graph, stream_,
+                        CUDAIndependentKernelFixture::StatelessProjection,
+                        {.operation = "verifier_routed_down", .format = format.label,
+                         .m = seq_len, .n = d_model, .k = intermediate});
+                    const auto *source = llaminar2::native_quantised_formats::forQuantType(format.label);
+                    ASSERT_NE(source, nullptr);
+                    const auto packed = llaminar2::nativeQuantisedPackedRegionSizes(d_model, intermediate, *source);
+                    ASSERT_EQ(records.size(), 1u);
+                    records.front()["logical_weight_request_bytes"] =
+                        packed.logicalBytes() * static_cast<std::size_t>(seq_len * top_k);
+                    records.front()["execution_codebook"] = format.codebook_id;
+                    appendCUDAKernelProbeRecords(probe_path, records);
+                    ASSERT_TRUE(graph.launchAndPublishOutputs({runtime_prefill_output.get()}));
+                    const auto replay = copyCudaFP32TensorToHost(runtime_prefill_output, stream_);
+                    expectBitwiseFP32RowsEqual("captured M4 direct Down after isolated timing",
                         replay.data(), serial_values.data(), replay.size(), d_model);
                 }
             }

@@ -67,12 +67,28 @@ LLAMINAR_TEST_CUDA_MOE_M1_PROBE_JSONL="$PWD/moe-m1-leaves.jsonl" \
     --gtest_filter=Test__CUDAMoEKernel.RuntimeGroupedDecodeSwiGLUPublicationReplay
 ```
 
-For the captured 512-column IQ4_NL Down layer, the fixed 16-partition
-projection measured 2.05 µs and its separate reducer measured 1.60 µs on
-each card. The direct K32 publication measured 1.79 µs on `3f:00.0` and
-1.73 µs on `42:00.0`, at 40 registers per lane and zero local bytes.
-Its logical weight footprint is 737,280 bytes across eight routes and ten
-K32 packets per output. Dividing that footprint by the leaf time gives
-411–427 GB/s, or 17.5–17.9% of the warm L2 requested-read reference. This
-calculation excludes activation and output traffic. The isolated leaf
-times describe separate native graphs, each with 62 samples per card.
+The replay verifies nonzero outputs from the exact prepared weights before
+measuring the captured leaves. For the 512-column IQ4_NL Down layer, the
+logical footprint is 737,280 bytes across eight routes and ten K32 packets
+per output. The direct K32 publication took 4.416 µs on both adapters, with
+40 registers per thread and zero local bytes. Its requested-weight rate
+was 167 GB/s, or 7.0–7.1% of the warm L2 reference. The earlier split-K
+projection and reducer took 2.752 and 1.600 µs in separate graphs.
+Activation and output traffic are outside the requested-weight calculation.
+
+The four-row verifier regression can also time the captured Down publication
+for each available source codebook. Its JSONL records include the physical
+codebook identity and logical weight requests across the sixteen live routes.
+
+```sh
+LLAMINAR_TEST_CUDA_MOE_VERIFIER_DOWN_PROBE_JSONL="$PWD/moe-verifier-down.jsonl" \
+    "$CMAKE_BUILD/tests/v2/v2_integration_cuda_moe_kernel" \
+    --gtest_filter=Test__CUDAMoEKernel.RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRuntimeDecodeRows
+```
+
+The four-row sweep covered 21 source formats at N=512 and K=256, with
+31 samples per format and adapter. Requested-weight rates spanned
+98–553 GB/s, equivalent to 4.1–23.5% of the warm L2 reference. The
+Q5_1 and Q8_0 cases measured 323 GB/s and 544–553 GB/s respectively.
+Every measured Down kernel reported zero local bytes and matched the
+ordered serial output after retained replay.
