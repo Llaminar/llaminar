@@ -17,6 +17,7 @@
 #include <span>
 #include "planning/WorkspaceMemoryEstimator.h"
 #include "planning/PlanningModelMetadata.h"
+#include "planning/WeightShardGeometry.h"
 #include "execution/moe/MoEExpertProjectionOwnership.h"
 #include "models/qwen4exp/Qwen4ExpPredictorProjectionGeometry.h"
 #include "models/qwen4exp/Qwen4ExpProjectionWorkspace.h"
@@ -519,7 +520,8 @@ WorkspaceLogicalInterval equalWorkspaceInterval(
 WorkspaceLogicalInterval workspaceLogicalInterval(
     WeightDimensionType dimension,
     const ModelMemoryProfile& profile,
-    const WorkspaceMemoryGeometry& geometry)
+    const WorkspaceMemoryGeometry& geometry,
+    std::optional<int> source_ffn = std::nullopt)
 {
     int total = 0;
     int start = 0;
@@ -539,7 +541,7 @@ WorkspaceLogicalInterval workspaceLogicalInterval(
         count = geometry.local_kv_heads;
         break;
     case WeightDimensionType::FFNHidden:
-        total = profile.d_ff;
+        total = source_ffn.value_or(profile.d_ff);
         start = geometry.local_d_ff_start;
         count = geometry.local_d_ff;
         break;
@@ -708,6 +710,10 @@ WorkspaceMatrixShape localWorkspaceMatrixShape(
             sharding.getModeAndDimension(tensor.name);
         if (mode != WeightShardingMode::Replicate)
         {
+            const auto source_ffn = dimension == WeightDimensionType::FFNHidden
+                ? originalSharedFFNWidth(workspaceSourceRole(tensor, profile, geometry),
+                    output_columns, input_columns, geometry.native_shared_ffn_width)
+                : std::nullopt;
             if (dimension == WeightDimensionType::FusedQKVHeads &&
                 (mode == WeightShardingMode::ColumnParallel ||
                  mode == WeightShardingMode::RowParallel))
@@ -761,7 +767,7 @@ WorkspaceMatrixShape localWorkspaceMatrixShape(
                 input_columns = workspaceAxisExtent(
                     input_columns,
                     workspaceLogicalInterval(
-                        dimension, profile, geometry),
+                        dimension, profile, geometry, source_ffn),
                     "input-parallel K axis");
             }
             else if (mode == WeightShardingMode::ColumnParallel ||
@@ -770,7 +776,7 @@ WorkspaceMatrixShape localWorkspaceMatrixShape(
                 output_columns = workspaceAxisExtent(
                     output_columns,
                     workspaceLogicalInterval(
-                        dimension, profile, geometry),
+                        dimension, profile, geometry, source_ffn),
                     "output-parallel N axis");
             }
             else if (mode != WeightShardingMode::ExpertIdApportioned)
@@ -1676,7 +1682,7 @@ size_t gpuFloatingPointWorkspaceBytes(
         {
             if (!WorkspaceMemoryEstimator::ownsProjectionSource(tensor, profile, geometry) ||
                 PreparedWeightRepresentationContract::effectiveGDNArithmetic(
-                    workspaceSourceRole(tensor,profile,geometry), tensor.name, profile.architecture,
+                    workspaceSourceRole(tensor,profile,geometry), tensor.quant_type, tensor.name, profile.architecture,
                     geometry.planning_policy.gdn_projection_arithmetic) != GDNProjectionArithmetic::FP16) continue;
             const auto shape = localWorkspaceMatrixShape(tensor, profile, geometry, sharding, false);
             if (!shape.valid()) throw std::invalid_argument("GDN half workspace has no source matrix geometry: " + tensor.name);

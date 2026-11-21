@@ -1283,11 +1283,11 @@ TEST(Test__GDNProjectionArithmetic, HalfSourceAndOperandPolicyStayScoped)
                 ModelPreparedWeightRepresentation::SourceNative);
             EXPECT_EQ(Contract::resolve(role, "F16", name, architecture, GDNProjectionArithmetic::FP16),
                 ModelPreparedWeightRepresentation::SourceNative);
-            EXPECT_EQ(Contract::operandPrecision(role, name, architecture, GDNProjectionArithmetic::Native),
+            EXPECT_EQ(Contract::operandPrecision(role, TensorType::Q6_K, name, architecture, GDNProjectionArithmetic::Native),
                 FloatingActivationOperandPrecision::Native);
-            EXPECT_EQ(Contract::operandPrecision(role, name, architecture, GDNProjectionArithmetic::FP32),
+            EXPECT_EQ(Contract::operandPrecision(role, TensorType::Q6_K, name, architecture, GDNProjectionArithmetic::FP32),
                 FloatingActivationOperandPrecision::FP32);
-            EXPECT_EQ(Contract::operandPrecision(role, name, architecture, GDNProjectionArithmetic::FP16),
+            EXPECT_EQ(Contract::operandPrecision(role, TensorType::Q6_K, name, architecture, GDNProjectionArithmetic::FP16),
                 FloatingActivationOperandPrecision::FP16RNE);
         }
     for (const auto name : {"blk.3.attn_q.weight", "blk.3.attn_output.weight", "blk.0.ffn_gate_inp.weight",
@@ -1296,10 +1296,10 @@ TEST(Test__GDNProjectionArithmetic, HalfSourceAndOperandPolicyStayScoped)
         const auto role = inferWeightRole(name);
         EXPECT_EQ(Contract::resolve(role, TensorType::Q6_K, name, "qwen35moe", GDNProjectionArithmetic::FP16),
             Contract::resolve(role, TensorType::Q6_K));
-        EXPECT_EQ(Contract::operandPrecision(role, name, "qwen35moe", GDNProjectionArithmetic::FP16),
+        EXPECT_EQ(Contract::operandPrecision(role, TensorType::Q6_K, name, "qwen35moe", GDNProjectionArithmetic::FP16),
             FloatingActivationOperandPrecision::Native);
     }
-    EXPECT_EQ(Contract::operandPrecision(WeightRole::FusedQKV, "blk.0.attn_qkv.weight", "llama",
+    EXPECT_EQ(Contract::operandPrecision(WeightRole::FusedQKV, TensorType::Q6_K, "blk.0.attn_qkv.weight", "llama",
         GDNProjectionArithmetic::FP16), FloatingActivationOperandPrecision::Native);
 }
 
@@ -1406,7 +1406,7 @@ TEST(Test__MoERouterArithmetic, OriginalSourceAndOperandPolicyAreScoped)
         const auto role = inferWeightRole(source_name);
         EXPECT_EQ(Contract::resolve(role, TensorType::Q6_K, source_name, "qwen35moe",
             GDNProjectionArithmetic::Native, MoERouterArithmetic::FP16), Contract::resolve(role, TensorType::Q6_K));
-        EXPECT_EQ(Contract::operandPrecision(role, source_name, "qwen35moe",
+        EXPECT_EQ(Contract::operandPrecision(role, TensorType::Q6_K, source_name, "qwen35moe",
             GDNProjectionArithmetic::Native, MoERouterArithmetic::FP16), FloatingActivationOperandPrecision::Native);
     }
 }
@@ -1481,7 +1481,7 @@ TEST(Test__MoERouterArithmetic, HadamardRejectsEveryQuantizedSourceAndPreservesO
         const auto role = inferWeightRole(name);
         EXPECT_EQ(C::resolve(role, TensorType::Q6_K, name, "qwen35moe", GDNProjectionArithmetic::Native, mode),
                   C::resolve(role, TensorType::Q6_K));
-        EXPECT_EQ(C::operandPrecision(role, name, "qwen35moe", GDNProjectionArithmetic::Native, mode),
+        EXPECT_EQ(C::operandPrecision(role, TensorType::Q6_K, name, "qwen35moe", GDNProjectionArithmetic::Native, mode),
                   FloatingActivationOperandPrecision::Native);
     }
 }
@@ -1495,8 +1495,8 @@ TEST(Test__GDNProjectionArithmetic, HalfAlphaBetaSelectsOnlyOriginalFloatingCont
         for (const auto name : {"blk.0.ssm_alpha.weight", "blk.12.ssm_beta.weight"})
         {
             const auto role = inferWeightRole(name);
-            EXPECT_EQ(Contract::effectiveGDNArithmetic(role, name, architecture, mode), GDNProjectionArithmetic::FP16);
-            EXPECT_EQ(Contract::operandPrecision(role, name, architecture, mode), FloatingActivationOperandPrecision::FP16RNE);
+            EXPECT_EQ(Contract::effectiveGDNArithmetic(role, TensorType::FP32, name, architecture, mode), GDNProjectionArithmetic::FP16);
+            EXPECT_EQ(Contract::operandPrecision(role, TensorType::FP32, name, architecture, mode), FloatingActivationOperandPrecision::FP16RNE);
             for (const auto type : {TensorType::FP32, TensorType::BF16})
                 EXPECT_EQ(Contract::resolve(role, type, name, architecture, mode), ModelPreparedWeightRepresentation::FP16);
             for (const auto format : {"F32", "FP32", "BF16"})
@@ -1515,17 +1515,17 @@ TEST(Test__GDNProjectionArithmetic, HalfAlphaBetaSelectsOnlyOriginalFloatingCont
                            "blk.x.ssm_alpha.weight", "blk.0.ssm_beta.weight.extra"})
     {
         const auto role = inferWeightRole(name);
-        EXPECT_EQ(Contract::effectiveGDNArithmetic(role, name, "qwen35moe", mode), GDNProjectionArithmetic::Native);
-        EXPECT_EQ(Contract::operandPrecision(role, name, "qwen35moe", mode), FloatingActivationOperandPrecision::Native);
+        EXPECT_EQ(Contract::effectiveGDNArithmetic(role, TensorType::FP32, name, "qwen35moe", mode), GDNProjectionArithmetic::Native);
+        EXPECT_EQ(Contract::operandPrecision(role, TensorType::FP32, name, "qwen35moe", mode), FloatingActivationOperandPrecision::Native);
         for (const auto type : {TensorType::FP32, TensorType::FP16, TensorType::Q6_K, TensorType::IQ3_S})
             EXPECT_EQ(Contract::resolve(role, type, name, "qwen35moe", mode), Contract::resolve(role, type));
         for (const auto format : {"F32", "F16", "Q6_K", "IQ3_S"})
             EXPECT_EQ(Contract::resolve(role, format, name, "qwen35moe", mode), Contract::resolve(role, format));
     }
     EXPECT_EQ(Contract::effectiveGDNArithmetic(WeightRole::GDNAlphaBetaProjection,
-        "blk.0.ssm_alpha.weight", "llama", mode), GDNProjectionArithmetic::Native);
+        TensorType::FP32, "blk.0.ssm_alpha.weight", "llama", mode), GDNProjectionArithmetic::Native);
     EXPECT_EQ(Contract::effectiveGDNArithmetic(WeightRole::MoERouter,
-        "blk.0.ssm_alpha.weight", "qwen35moe", mode), GDNProjectionArithmetic::Native);
+        TensorType::FP32, "blk.0.ssm_alpha.weight", "qwen35moe", mode), GDNProjectionArithmetic::Native);
 }
 
 /** @brief The default is explicitly MoE-scoped and retains original-source conversion guards. */
@@ -1537,7 +1537,7 @@ TEST(Test__GDNProjectionArithmetic, DefaultHalfMoEAlphaBetaPreservesDenseNative)
     EXPECT_EQ(parseGDNProjectionArithmetic("fp16_moe_alpha_beta"), mode);
     EXPECT_EQ(gdnProjectionArithmeticName(mode), "fp16_moe_alpha_beta");
     EXPECT_EQ(Contract::effectiveGDNArithmetic(WeightRole::MoERouter,
-        "blk.0.ssm_alpha.weight", "qwen35moe", mode), GDNProjectionArithmetic::Native);
+        TensorType::FP32, "blk.0.ssm_alpha.weight", "qwen35moe", mode), GDNProjectionArithmetic::Native);
     for (const auto architecture : {"qwen35", "qwen35moe", "llama"})
         for (const auto name : {"blk.0.ssm_alpha.weight", "blk.12.ssm_beta.weight",
                                "blk.0.attn_qkv.weight", "blk.0.attn_gate.weight", "blk.0.ssm_out.weight",
@@ -1548,9 +1548,9 @@ TEST(Test__GDNProjectionArithmetic, DefaultHalfMoEAlphaBetaPreservesDenseNative)
             const bool selected = std::string_view(architecture) == "qwen35moe" &&
                 Contract::isGDNProjectionSource(role, name, architecture) &&
                 role == WeightRole::GDNAlphaBetaProjection;
-            EXPECT_EQ(Contract::effectiveGDNArithmetic(role, name, architecture, mode),
+            EXPECT_EQ(Contract::effectiveGDNArithmetic(role, TensorType::FP32, name, architecture, mode),
                 selected ? GDNProjectionArithmetic::FP16 : GDNProjectionArithmetic::Native);
-            EXPECT_EQ(Contract::operandPrecision(role, name, architecture, mode), selected ?
+            EXPECT_EQ(Contract::operandPrecision(role, TensorType::FP32, name, architecture, mode), selected ?
                 FloatingActivationOperandPrecision::FP16RNE : FloatingActivationOperandPrecision::Native);
             for (const auto type : {TensorType::FP32, TensorType::FP16, TensorType::BF16})
                 EXPECT_EQ(Contract::resolve(role, type, name, architecture, mode), selected ?
@@ -1562,11 +1562,13 @@ TEST(Test__GDNProjectionArithmetic, DefaultHalfMoEAlphaBetaPreservesDenseNative)
                         ModelPreparedWeightRepresentation::SourceNative : ModelPreparedWeightRepresentation::FP16) :
                     Contract::resolve(role, format));
             for (const auto type : {TensorType::Q6_K, TensorType::Q8_0, TensorType::IQ3_S})
-                if (selected) { EXPECT_THROW(Contract::resolve(role, type, name, architecture, mode), std::invalid_argument); }
-                else { EXPECT_EQ(Contract::resolve(role, type, name, architecture, mode), Contract::resolve(role, type)); }
+            {
+                EXPECT_EQ(Contract::resolve(role, type, name, architecture, mode), Contract::resolve(role, type));
+                EXPECT_EQ(Contract::operandPrecision(role, type, name, architecture, mode),
+                          FloatingActivationOperandPrecision::Native);
+            }
             for (const auto format : {"Q6_K", "Q8_0", "IQ3_S"})
-                if (selected) { EXPECT_THROW(Contract::resolve(role, format, name, architecture, mode), std::invalid_argument); }
-                else { EXPECT_EQ(Contract::resolve(role, format, name, architecture, mode), Contract::resolve(role, format)); }
+                EXPECT_EQ(Contract::resolve(role, format, name, architecture, mode), Contract::resolve(role, format));
         }
 }
 
@@ -1645,10 +1647,10 @@ TEST(Test__GDNProjectionArithmetic, FlashNextMoESelectivePolicyMatchesSourceCont
 {
     using Contract = PreparedWeightRepresentationContract;
     EXPECT_EQ(Contract::effectiveGDNArithmetic(WeightRole::GDNAlphaBetaProjection,
-        "blk.0.ssm_alpha.weight", "qwen4exp", GDNProjectionArithmetic::FP16MoEAlphaBeta),
+        TensorType::FP32, "blk.0.ssm_alpha.weight", "qwen4exp", GDNProjectionArithmetic::FP16MoEAlphaBeta),
         GDNProjectionArithmetic::FP16);
     EXPECT_EQ(Contract::effectiveGDNArithmetic(WeightRole::GDNProjection,
-        "blk.0.attn_gate.weight", "qwen4exp", GDNProjectionArithmetic::FP16MoEAlphaBeta),
+        TensorType::FP32, "blk.0.attn_gate.weight", "qwen4exp", GDNProjectionArithmetic::FP16MoEAlphaBeta),
         GDNProjectionArithmetic::Native);
 }
 
@@ -1674,7 +1676,7 @@ TEST(Test__MoERouterArithmetic, QFNDefaultPlanningAndMaterializationUseOneResolv
                       Contract::resolve(role, type, name, architecture, gdn, expected));
             EXPECT_EQ(Contract::resolve(role, format, name, architecture, gdn, omitted),
                       Contract::resolve(role, type, name, architecture, gdn, expected));
-            EXPECT_EQ(Contract::operandPrecision(role, name, architecture, gdn, omitted),
+            EXPECT_EQ(Contract::operandPrecision(role, type, name, architecture, gdn, omitted),
                       expected == MoERouterArithmetic::FP16 ? FloatingActivationOperandPrecision::FP16RNE :
                           FloatingActivationOperandPrecision::Native);
             EXPECT_EQ(Contract::resolve(role, type, name, architecture, gdn, MoERouterArithmetic::Native),
@@ -1686,13 +1688,13 @@ TEST(Test__MoERouterArithmetic, QFNDefaultPlanningAndMaterializationUseOneResolv
             const auto other_role = inferWeightRole(source);
             EXPECT_EQ(Contract::resolve(other_role, TensorType::Q8_0, source, architecture, gdn, omitted),
                       Contract::resolve(other_role, TensorType::Q8_0));
-            EXPECT_EQ(Contract::operandPrecision(other_role, source, architecture, gdn, omitted),
+            EXPECT_EQ(Contract::operandPrecision(other_role, TensorType::Q8_0, source, architecture, gdn, omitted),
                       FloatingActivationOperandPrecision::Native);
         }
     }
     EXPECT_EQ(Contract::resolve(role, TensorType::FP32, name, "qwen4exp", gdn),
               ModelPreparedWeightRepresentation::FP16);
-    EXPECT_EQ(Contract::operandPrecision(role, name, "qwen4exp", gdn),
+    EXPECT_EQ(Contract::operandPrecision(role, TensorType::FP32, name, "qwen4exp", gdn),
               FloatingActivationOperandPrecision::FP16RNE);
     EXPECT_THROW(Contract::resolve(role, TensorType::FP32, name, "qwen4exp", gdn,
                                   static_cast<MoERouterArithmetic>(255)), std::invalid_argument);

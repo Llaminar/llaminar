@@ -494,6 +494,8 @@ namespace llaminar2
             int archive_fd,
             const PrefixCacheKey &key,
             std::string *error);
+        /** @brief Test the stale-history budget against the current index under mutex_. */
+        [[nodiscard]] bool exceedsCompactionThresholdLocked(uint64_t physical_bytes) const;
         /** @brief Schedule stale-history reclamation, never copy under the lock. */
         bool compactIfNeededLocked(int archive_fd, std::string *error);
         /** @brief Wake the sole worker; mutex_ must already be held. */
@@ -550,7 +552,7 @@ namespace llaminar2
         std::condition_variable_any compaction_changed_;
         CompactionStatus compaction_status_;
         /**
-         * A request arrived while this worker was copying or publishing. The
+         * An explicit request arrived while this worker was copying or publishing. The
          * copy's finite tail can carry history appended after its snapshot,
          * so that request must start one more rewrite after publication
          * instead of being absorbed by the rewrite already in flight.

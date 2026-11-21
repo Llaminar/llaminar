@@ -1529,8 +1529,8 @@ namespace llaminar2
          * quantization, and down projection into one graph-capturable launch
          * sequence. When @p canonical_route_contributions is supplied, it is
          * the sole publication target; @p output belongs to the later
-         * canonical reducer and may not yet have device storage. The producer
-         * must not require, allocate, read, or write that inactive target. The
+         * canonical reducer and may be absent. A declared dual-publication
+         * policy requires both destinations. The
          * default returns false so existing backends keep the established
          * gate/up plus down path.
          */

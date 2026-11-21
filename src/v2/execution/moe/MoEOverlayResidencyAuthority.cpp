@@ -2793,7 +2793,10 @@ namespace llaminar2
 
         no_peer_residency_ = MoEOverlayNoPeerResidency::seal(
             *initial_snapshot->placement_plan, initial_snapshot->originalOwnerMap(), config_.model_metadata);
-        economy_state_ = buildEconomyState(config_, *initial_snapshot);
+        stationary_tensor_shard_residency_ = MoEOverlayStationaryTensorShardResidency::seal(
+            *initial_snapshot->placement_plan, initial_snapshot->originalOwnerMap(), config_.model_metadata);
+        if (!stationary_tensor_shard_residency_)
+            economy_state_ = buildEconomyState(config_, *initial_snapshot);
         if (economy_state_ && config_.histogram)
             config_.histogram->activatePrecertifiedOptimizationDemand();
         economy_activation_state_.store(
@@ -3134,12 +3137,15 @@ namespace llaminar2
 
     bool MoEOverlayResidencyAuthority::observesHistogram() const noexcept
     {
-        return config_.maintenance_mode != MoERebalanceRuntimeMode::Off;
+        return config_.maintenance_mode != MoERebalanceRuntimeMode::Off &&
+            !(config_.maintenance_mode == MoERebalanceRuntimeMode::Dynamic &&
+              hasStationaryTensorShardTopology(config_.initial_plan));
     }
 
     bool MoEOverlayResidencyAuthority::migrationEnabled() const noexcept
     {
-        return config_.maintenance_mode == MoERebalanceRuntimeMode::Dynamic;
+        return config_.maintenance_mode == MoERebalanceRuntimeMode::Dynamic &&
+               !stationary_tensor_shard_residency_;
     }
 
     void MoEOverlayResidencyAuthority::
@@ -8850,6 +8856,14 @@ namespace llaminar2
                 << " crosses_rank="
                 << (migration.crossesWorldRank() ? "true" : "false"));
 
+            const auto endpoint_device = [](const MoEExpertOwner &owner) -> std::string {
+                if (!owner.shard_cohort)
+                    return owner.device.toString();
+                const auto &address = owner.shard_cohort->participants().front().address;
+                if (address.isCPU())
+                    return "cpu_cohort";
+                return address.device_type == DeviceType::ROCm ? "rocm_cohort" : "cuda_cohort";
+            };
             PerfStatsCollector::addCounter(
                 "moe_overlay_residency",
                 prepared_context_restoration
@@ -8896,8 +8910,8 @@ namespace llaminar2
                          : "unknown"},
                     {"crosses_world_rank",
                      migration.crossesWorldRank() ? "true" : "false"},
-                    {"source_device", migration.source.shard_cohort ? "cpu_cohort" : migration.source.device.toString()},
-                    {"destination_device", migration.destination.shard_cohort ? "cpu_cohort" : migration.destination.device.toString()},
+                    {"source_device", endpoint_device(migration.source)},
+                    {"destination_device", endpoint_device(migration.destination)},
                     {"estimated_weight_bytes",
                      std::to_string(migration.estimated_weight_bytes)},
                     {"activation_count", std::to_string(migration.activation_count)},

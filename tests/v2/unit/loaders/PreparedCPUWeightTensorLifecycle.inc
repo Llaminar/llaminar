@@ -6,6 +6,9 @@
  * production Store writer can create the prepared-only tensor. CPU ordinals
  * identify allocation resources; they do not claim physical socket placement.
  */
+#include "loaders/PreparedOverlaySourceRetirement.h"
+#include "loaders/WeightMetadataRegistry.h"
+#include "loaders/WeightPlan.h"
 #include "tensors/PreparedCPUWeightTensor.h"
 #include "tensors/NativeWeightSourceRange.h"
 #include "memory/CPUStorageRoot.h"
@@ -73,6 +76,19 @@ TEST(PreparedCPUWeightTensorLifecycle, StoreCommitRetainsOnlyActualPreparedRoot)
         const auto live_packed_bytes=[&]{return memory->claimedBytes(device,PhysicalMemoryOwner::PrimaryModelWeights,
             PhysicalMemoryMaterializationKind::NewAllocation);};
         EXPECT_EQ(live_packed_bytes(),packed_bytes);
+        // The metadata-only tensor owns an engine, but deliberately exposes
+        // no raw storage root even if an alias has a CPU retention policy.
+        EXPECT_THROW(metadata->transferStorageOwner(), std::logic_error);
+        {
+            auto required_alias = committed;
+            required_alias.residency.host_policy = WeightHostPolicy::RequiredForCPUExecution;
+            WeightMetadataRegistry registry;
+            EXPECT_EQ(retireMaterializedParticipantSources(
+                FrozenModelWeightSet({}, {committed}), registry), 0u);
+            EXPECT_EQ(retireMaterializedParticipantSources(
+                FrozenModelWeightSet({}, {required_alias}), registry), 0u);
+        }
+        EXPECT_EQ(live_packed_bytes(), packed_bytes);
         EXPECT_TRUE(metadata->hasPreparedDeviceState());
         CPUProjectionTestWorkspace workspace(1,64,cpuProjectionTestRequirements(1,{engine.get()}));
         FP32Tensor hidden({1,64}),before({1,3}),after({1,3});

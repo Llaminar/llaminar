@@ -791,6 +791,45 @@ namespace llaminar2
         return result;
     }
 
+    TensorParallelConfig TensorParallelConfig::withNativeSharedFFN(int columns, int group) const
+    {
+        if (group <= 0 || columns <= 0 || columns % group || columns / group < worldSize())
+            throw std::invalid_argument("Original shared expert Down source has too few complete native blocks for positive TP shards");
+        auto result = *this;
+        for (auto &assignment : result.assignments_)
+            assignment.native_shared_ffn_width = columns;
+        if (total_d_ff_ == columns && std::all_of(assignments_.begin(), assignments_.end(),
+                [group](const auto &assignment) {
+                    return assignment.d_ff_count > 0 && assignment.d_ff_count % group == 0 &&
+                        assignment.d_ff_start % group == 0;
+                }))
+            return result;
+        std::vector<float> fractions;
+        for (const auto &assignment : assignments_)
+            fractions.push_back(assignment.work_fraction);
+        auto counts = distributeProportionally(columns, fractions, group);
+        // A small workshare cannot drop a required collective participant.
+        // Move the smallest possible native extent from the largest owner.
+        for (auto &count : counts)
+        {
+            if (count != 0) continue;
+            auto largest = std::max_element(counts.begin(), counts.end());
+            *largest -= group;
+            count = group;
+        }
+        int offset = 0;
+        for (std::size_t rank = 0; rank < counts.size(); ++rank)
+        {
+            result.assignments_[rank].d_ff_start = offset;
+            result.assignments_[rank].d_ff_count = counts[rank];
+            offset += counts[rank];
+        }
+        result.total_d_ff_ = offset;
+        if (offset != columns || !result.validate())
+            throw std::logic_error("Original shared expert TP partition did not preserve complete native source coverage");
+        return result;
+    }
+
     std::string TensorParallelConfig::toString() const
     {
         std::ostringstream oss;

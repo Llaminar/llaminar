@@ -286,6 +286,11 @@ namespace llaminar2
         float *canonical_route_contributions_fp32 = nullptr;
         std::size_t route_capacity = 0u;
         std::int32_t d_model = 0;
+        MoEOverlayCanonicalRouteTicketPayload payload = MoEOverlayCanonicalRouteTicketPayload::CanonicalRows;
+
+        /** @return Whether this original contributor owns only the terminal acknowledgement. */
+        [[nodiscard]] LLAMINAR_MOE_PACKET_HD constexpr bool metadataOnly() const noexcept
+        { return payload == MoEOverlayCanonicalRouteTicketPayload::ContributorCompletion; }
 
         /** @return Whether every capture-stable mapped/device address is complete. */
         [[nodiscard]] LLAMINAR_MOE_PACKET_HD constexpr bool valid() const noexcept
@@ -293,10 +298,13 @@ namespace llaminar2
             /* `control` is a GPU alias of mapped host memory. Host launch
              * validation must not dereference that alias: the device kernel
              * acquires and authenticates the record after publication. */
-            return control && original_route_slots && compact_route_slots &&
-                   compact_preweighted_contributions_fp32 &&
-                   canonical_route_contributions_fp32 && route_capacity > 0u &&
-                   d_model > 0;
+            return control && route_capacity > 0u && d_model > 0 &&
+                (metadataOnly() ?
+                    !original_route_slots && !compact_route_slots &&
+                    !compact_preweighted_contributions_fp32 && !canonical_route_contributions_fp32 :
+                    payload == MoEOverlayCanonicalRouteTicketPayload::CanonicalRows &&
+                    original_route_slots && compact_route_slots &&
+                    compact_preweighted_contributions_fp32 && canonical_route_contributions_fp32);
         }
     };
 

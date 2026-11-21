@@ -123,7 +123,11 @@ namespace llaminar2
         /** @brief Advance at most one non-blocking transfer/profile edge. */
         void poll() noexcept;
 
-        /** @brief Stop admission and asynchronously reap owned work. */
+        /**
+         * @brief Stop process-local calibration and asynchronously reap owned work.
+         * Distributed calibration must retire its common finite schedule before
+         * the parent certification controller joins the typed topology stop vote.
+         */
         void requestStop() noexcept;
 
         /** @return Current release-published profiler state. */

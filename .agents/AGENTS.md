@@ -984,7 +984,7 @@ including a single-tier homogeneous deployment. Start with auto; use compact
 tiers only when the user needs an authored placement:
 
 ```bash
-# One homogeneous tier: no cross-tier promotion, but within-tier rebalance.
+# One authored homogeneous tier.
 ./build_v2_release/llaminar2 serve -m models/moe.gguf \
   --expert-tier 'accelerator=rocm:0,rocm:1;priority=0'
 
@@ -1017,14 +1017,17 @@ promise that every lower-priority tier eventually drains.
 
 Keep these policy axes separate:
 
-- `--moe-routed-expert-compute auto` is the default. Inventory binding selects
-  gate/up-owned, down-column-sharded compute for one homogeneous rank-local
-  multi-GPU tier. CPU, heterogeneous, multi-tier and cross-rank domains retain
-  whole-expert compute. `apportioned` explicitly assigns whole experts to
-  participants; that override is never reinterpreted. `replicated` places complete experts on every participant.
-  `tensor-sharded` means splitting each expert's tensors, not apportionment;
-  the standard Qwen3.5 MoE path currently rejects that global option as
-  unimplemented. Do not infer support from its presence in help.
+- With `--auto` and default dynamic maintenance, the planner selects
+  `tensor-sharded` for every MoE family
+  whose original weight blocks admit the requested rank-local GPU TP degree.
+  For single-request serving on one host, a GPU TP continuation and a CPU TP
+  capacity tier each shard the experts they own. Include the predictor's weight
+  geometry in admission when serving with MTP. An explicitly authored domain
+  uses its declared compute policy. `apportioned` assigns whole experts to
+  participants and `replicated` places complete experts on every participant.
+  Mapped GPU/CPU `observe` reads executed-row counts from the original
+  continuation ticket. A single stationary GPU tier needs a layout with its
+  own observation producer when observation is requested.
 - `--moe-continuation-dense-policy` changes dense/shared work, not routed expert
   placement. Prefer its resolved automatic policy. Explicit choices include
   `replicated`, `tensor-parallel`, `tensor-parallel-decode-mirrored-embedding`,
@@ -1050,9 +1053,11 @@ TP domain; cross-host overlay connects distinct hardware domains.
 `--moe-residency-maintenance dynamic` is the default, with default residency
 `rebalanced`. The sole overlay authority uses routed demand and migration
 economics for cross-tier promotion/demotion and within-tier skew reduction.
-A single tier still supports the second axis. Dynamic does not guarantee a
-move every window or a speedup over a short request; validate completed moves,
-placement epochs and amortized inference time rather than assuming them.
+Within-tier redistribution requires distinct eligible owners. A fully resident
+tensor-sharded tier has one joint owner and stays stationary. For a GPU/CPU
+deployment, verify promotions and demotions through completed physical bytes
+and committed placement epochs on the original tiers. Measure amortized
+inference time over a workload long enough for a transfer to pay off.
 
 For a new placement without an explicit residency policy,
 `--moe-residency-maintenance off` defaults residency to `static-by-id`;
@@ -1084,9 +1089,9 @@ rows are decode work, not ordinary prefill. There is no `llep` value for
 `--moe-residency-maintenance`. See `RoutedExpertPolicy.h` and domain validation
 for supported combinations rather than treating these policies as synonyms.
 
-Projection ownership is a separate physical mode and the automatic default for a native
-homogeneous multi-GPU domain, `expert_compute=gate-up-owned-down-columns`
-keeps movable gate/up pairs with their expert owner and fixes disjoint full-K
+An authored homogeneous multi-GPU domain can select projection ownership with
+`expert_compute=gate-up-owned-down-columns`. It keeps movable gate/up pairs
+with their expert owner and fixes disjoint full-K
 down-output columns on every participant. Both exchanges are graph-visible:
 proven no-P2P domains use device-counted TransferEngine channels for compact
 intermediates; enabled native P2P and completed-column publication retain

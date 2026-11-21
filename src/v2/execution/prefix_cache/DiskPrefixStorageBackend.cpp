@@ -2548,19 +2548,21 @@ namespace llaminar2
         return entries;
     }
 
+    bool DiskPrefixStorageBackend::exceedsCompactionThresholdLocked(
+        uint64_t physical_bytes) const
+    {
+        const uint64_t threshold = std::max<uint64_t>(
+            64ull * 1024ull,
+            kArchiveHeaderBytes + active_record_bytes_ * 2);
+        return physical_bytes > threshold;
+    }
+
     bool DiskPrefixStorageBackend::compactIfNeededLocked(
         int archive_fd,
         std::string *error)
     {
-        const uint64_t physical_bytes = fileSize(archive_fd);
-        const uint64_t threshold = std::max<uint64_t>(
-            64ull * 1024ull,
-            kArchiveHeaderBytes + active_record_bytes_ * 2);
-        if (physical_bytes <= threshold)
-        {
-            return true;
-        }
-        return scheduleCompactionLocked(error);
+        return !exceedsCompactionThresholdLocked(fileSize(archive_fd)) ||
+            scheduleCompactionLocked(error);
     }
 
     bool DiskPrefixStorageBackend::scheduleCompactionLocked(std::string *error)
@@ -2576,18 +2578,22 @@ namespace llaminar2
             compaction_status_.state = CompactionState::Scheduled;
             compaction_changed_.notify_all();
         }
-        else if (compaction_status_.state == CompactionState::Copying ||
-                 compaction_status_.state == CompactionState::Publishing)
-        {
-            compaction_requested_during_rewrite_ = true;
-        }
         return true;
     }
 
     bool DiskPrefixStorageBackend::requestCompaction(std::string *error)
     {
         std::lock_guard lock(mutex_);
-        return scheduleCompactionLocked(error);
+        if (!scheduleCompactionLocked(error))
+            return false;
+        // Explicit requests made during a copy require another publication.
+        // Automatic requests use the current archive's budget after publication.
+        if (compaction_status_.state == CompactionState::Copying ||
+            compaction_status_.state == CompactionState::Publishing)
+        {
+            compaction_requested_during_rewrite_ = true;
+        }
+        return true;
     }
 
     DiskPrefixStorageBackend::CompactionStatus
@@ -2646,12 +2652,12 @@ namespace llaminar2
             }
             if (stop.stop_requested())
                 break;
-            // Only this worker's own publication proves the rewrite can make
-            // progress. A peer-owned or cancelled rewrite drops the request:
-            // the owning process compacts, and retrying would spin.
-            const bool rewrite_again =
-                outcome == CompactionOutcome::Published &&
-                compaction_requested_during_rewrite_;
+            // Only our own publication can make a repeat useful. The
+            // finite tail can leave stale history even when no writer
+            // explicitly requested another rewrite during this copy.
+            const bool rewrite_again = outcome == CompactionOutcome::Published &&
+                (compaction_requested_during_rewrite_ ||
+                 exceedsCompactionThresholdLocked(scan_offset_));
             compaction_requested_during_rewrite_ = false;
             compaction_status_.state =
                 rewrite_again ? CompactionState::Scheduled : CompactionState::Idle;

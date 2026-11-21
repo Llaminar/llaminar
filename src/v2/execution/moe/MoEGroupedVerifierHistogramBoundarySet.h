@@ -3,9 +3,9 @@
  * @brief Typed discovery and resolution of per-layer MTP histogram boundaries.
  *
  * A grouped main-model verifier contains one router and exactly one routing-
- * history boundary per MoE layer.  Static placement deliberately resolves that
- * boundary without a publisher, while Observe/Dynamic placement resolves it to
- * one accepted-row publisher and one shared model-lifetime stream.  This class
+ * history boundary per MoE layer. Static placement and externally owned mapped
+ * dispatch tickets resolve without a local publisher. Native Observe/Dynamic
+ * resolves to one accepted-row publisher and a shared model-lifetime stream.  This class
  * owns that small setup-time state machine so graph orchestrators cannot rebuild
  * the lifecycle from nullable pointers and loosely related booleans.
  */
@@ -40,6 +40,22 @@ namespace llaminar2
         return collects_history
                    ? MoEGroupedVerifierHistogramRole::DeferredAcceptedRows
                    : MoEGroupedVerifierHistogramRole::StaticNoPublication;
+    }
+
+    /**
+     * @brief Declare the mapped router boundary without a local accepted publisher.
+     * @param main_verifier Whether this is a routed main verifier layer.
+     * @param collects_history Whether the external ticket collects executed rows.
+     * @return The same local role on the dispatch root and all continuation peers.
+     */
+    [[nodiscard]] constexpr MoEGroupedVerifierHistogramRole
+    selectMappedMoEVerifierHistogramRole(bool main_verifier, bool collects_history) noexcept
+    {
+        if (!main_verifier)
+            return MoEGroupedVerifierHistogramRole::NotOwner;
+        return collects_history
+            ? MoEGroupedVerifierHistogramRole::MappedTicketNoAcceptedPublication
+            : MoEGroupedVerifierHistogramRole::StaticNoPublication;
     }
 
     /**
@@ -149,10 +165,11 @@ namespace llaminar2
             switch (role)
             {
             case MoEGroupedVerifierHistogramRole::StaticNoPublication:
+            case MoEGroupedVerifierHistogramRole::MappedTicketNoAcceptedPublication:
                 if (stream)
                 {
                     return fault(
-                        "Static verifier history boundary unexpectedly owns a publication stream: " +
+                        "Publication-free verifier history boundary unexpectedly owns a publication stream: " +
                             node_name,
                         error);
                 }
@@ -241,7 +258,7 @@ namespace llaminar2
                 else if (graph_role != boundary->second.role)
                 {
                     return fault(
-                        "one verifier graph mixes Static and deferred history roles",
+                        "one verifier graph mixes Static and deferred history roles or mapped ticket ownership",
                         error);
                 }
                 if (boundary->second.role ==

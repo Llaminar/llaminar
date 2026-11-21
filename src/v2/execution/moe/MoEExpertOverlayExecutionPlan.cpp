@@ -12,6 +12,7 @@
  */
 
 #include "MoEExpertOverlayExecutionPlan.h"
+#include "MoEIntermediateShardStaticGraphAdmission.h"
 #include "planning/ObservedPeerGrouping.h"
 #include "execution/mpi_orchestration/DeviceInventory.h"
 #include "planning/RankHardwareOwnership.h"
@@ -1263,7 +1264,17 @@ namespace llaminar2
             const bool homogeneous=std::all_of(devices.begin(),devices.end(),
                 [&](auto endpoint) { return endpoint.type==devices.front().type; });
             const auto coverage=homogeneous?std::optional{ObservedPeerGrouping(original).coverage(devices)}:std::nullopt;
-            const auto selected=selectMoEOverlayDiagnosticPrefillTransportPolicy(devices,coverage,diagnostic);
+            auto selected=selectMoEOverlayDiagnosticPrefillTransportPolicy(devices,coverage,diagnostic);
+            if (hasMappedGPUCPUIntermediateShardTopology(*bound))
+            {
+                // Only the continuation root joins GPU fragments with CPU results.
+                // The mapped exchange retains the original route slots and publishes
+                // only live GPU contributions. Dense TP collectives keep their own policy.
+                using Transport = MoEOverlayNodeLocalRouteTransport;
+                if (diagnostic == Transport::NativeCollective)
+                    throw std::invalid_argument("Tensor-sharded GPU/CPU routed experts require compact mapped route publication");
+                selected = {.ordinary_prefill = Transport::MappedSparse, .decode = Transport::MappedSparse};
+            }
             if (plan.observed_route_transport && *plan.observed_route_transport!=selected)
                 throw std::invalid_argument("MoE route hardware binding changed its immutable transport policy");
             bound->observed_route_transport=selected;

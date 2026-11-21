@@ -13,6 +13,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <string>
 
@@ -66,6 +67,25 @@ namespace llaminar2
         std::string owner;      ///< Stable subsystem name, empty when trivial.
         std::string phase;      ///< Current controller phase for diagnostics.
         std::string diagnostic; ///< First fatal detail when state is Failed.
+
+        /**
+         * @brief Decide whether a polling worker has reached a new progress milestone.
+         * @param previous Last snapshot reported for this preparation.
+         * @return True on a new owner, phase, work extent, or completed milestone.
+         * The final sample may still be awaiting evidence exchange. Report it
+         * once even when the controller remains in the same phase for many polls.
+         */
+        [[nodiscard]] bool crossedProgressMilestone(const InferenceMeasurementReadiness &previous) const noexcept
+        {
+            if (owner != previous.owner || phase != previous.phase ||
+                required_work_units != previous.required_work_units)
+                return true;
+            if (completed_work_units == previous.completed_work_units)
+                return false;
+            const auto stride = std::max<std::uint64_t>(1, required_work_units / 10);
+            return completed_work_units == required_work_units ||
+                   completed_work_units / stride != previous.completed_work_units / stride;
+        }
 
         /** @return Whether timed inference may begin now. */
         [[nodiscard]] bool ready() const noexcept

@@ -673,7 +673,8 @@ namespace llaminar2
         const std::shared_ptr<IGlobalTPContext>& domain,
         const std::shared_ptr<PhysicalMemoryAuthority>& memory,
         const ModelMemoryProfile* profile,const RankInventory* inventory,
-        const ILocalTPContext* owner_domain,int owner_top_k)
+        const ILocalTPContext* owner_domain,int owner_top_k,
+        std::span<const PlanningGPUCohortServiceObservation> gpu_cohort_samples)
     {
         auto* native=domain?dynamic_cast<GlobalTPContext*>(domain.get()):nullptr;
         if(domain && (!native || !native->authenticatesOriginalCPUExpertBorrow(domain)))
@@ -694,12 +695,43 @@ namespace llaminar2
         if(original.participants()!=source_map.participants() || original.owners()!=source_map.owners())
             throw std::invalid_argument("Prepared target jobs changed the original source placement");
         std::map<MoEOverlayTargetServiceCoordinate,MoEOverlayPreparedTargetServiceTotals> samples;
+        const auto publish_sample = [&](const auto &entry, size_t phase, int expert, uint64_t duration) {
+            auto& row=samples[entry.coordinate];
+            row.coordinate=entry.coordinate;
+            if(row.sample_count[phase])
+                throw std::logic_error("Prepared target job produced duplicate phase evidence");
+            row.total_nanoseconds[phase]=duration;
+            row.sample_count[phase]=entry.measured_invocations;
+            row.activation_count[phase]=entry.sample_rows[phase]*entry.measured_invocations;
+            row.expert_ids[phase]=expert;
+        };
+        for (const auto &observation : gpu_cohort_samples)
+        {
+            const auto &entry=plan.entry({observation.target,observation.layer});
+            const auto cohort=plan.cohort(entry);
+            const auto phase=static_cast<size_t>(observation.phase);
+            if (!cohort || cohort->participants().empty() || !cohort->participants().front().address.isGPU() ||
+                entry.root_world_rank!=memory->worldRank() ||
+                phase>=kExpertHistogramProductionSourceCount || entry.sample_layers[phase]!=observation.layer ||
+                observation.expert!=plan.sampleExpert(entry,phase) ||
+                observation.participants!=cohort->participants().size() ||
+                observation.rows_per_frame!=entry.sample_rows[phase] ||
+                observation.measured_frames!=entry.measured_invocations || !observation.complete_service_nanoseconds)
+                throw std::invalid_argument("Prepared GPU cohort returned a foreign native service observation");
+            // The native root interval includes the cohort's actual production
+            // reduction. Compute-only and live/empty wire intervals have separate units.
+            publish_sample(entry,phase,observation.expert,observation.complete_service_nanoseconds);
+        }
         std::map<DeviceId,std::shared_ptr<RetainedParticipantGraphExecutable>> gpu_calibrations;
         for(const auto& entry:plan.entries())for(size_t phase=0;phase<kExpertHistogramProductionSourceCount;++phase) {
             if(entry.sample_layers[phase]!=entry.coordinate.layer)continue;
             const auto source_phase=phase==0?ExpertHistogramSource::DecodeToken:
                 phase==1?ExpertHistogramSource::PrefillChunk:ExpertHistogramSource::GroupedVerifier;
             const auto cohort=plan.cohort(entry);
+            // GPU cohort samples were measured on their exact original native
+            // context before any CPU participant entered its rooted gather.
+            if (cohort && cohort->participants().front().address.isGPU())
+                continue;
             int participant=-1;
             if(cohort)for(const auto& member:cohort->participants())
                 if(member.world_rank==memory->worldRank())participant=member.participant_id;
@@ -748,13 +780,7 @@ namespace llaminar2
                         {.domain=owner_domain,.top_k=owner_top_k,.resident_sources=bank->layerForModelLayer(entry.coordinate.layer).experts});
                 }
             }
-            auto [found,inserted]=samples.try_emplace(entry.coordinate);
-            auto& row=found->second;row.coordinate=entry.coordinate;
-            if(row.sample_count[phase])throw std::logic_error("Prepared target job produced duplicate phase evidence");
-            row.total_nanoseconds[phase]=duration;
-            row.sample_count[phase]=entry.measured_invocations;
-            row.activation_count[phase]=entry.sample_rows[phase]*entry.measured_invocations;
-            row.expert_ids[phase]=expert;
+            publish_sample(entry,phase,expert,duration);
         }
         std::vector<MoEOverlayPreparedTargetServiceTotals> result;result.reserve(samples.size());
         for(auto& [key,row]:samples)result.push_back(std::move(row));

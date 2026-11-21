@@ -174,14 +174,24 @@ namespace llaminar2
         const auto &config = candidate.config;
         if (!compiled.front().pipelineStages().empty())
         {
-            if (compiled.size() != 1)
-                throw std::logic_error("MoE local pipeline admission requires its exact process-local rank namespace");
-            if (std::any_of(compiled.front().pipelineStages().begin(), compiled.front().pipelineStages().end(),
-                    [](const auto &stage) {
-                        const auto &devices = stage.overlayExecution().currentRankPlan().local_devices;
-                        return std::any_of(devices.begin(), devices.end(), [](DeviceId device) { return device.is_gpu(); });
-                    }) && (!debugEnv().execution.gpu_graphs || !debugEnv().execution.prefill_graph_buckets))
+            if (std::any_of(compiled.begin(), compiled.end(), [](const auto &rank) {
+                    return std::any_of(rank.pipelineStages().begin(), rank.pipelineStages().end(),
+                        [](const auto &stage) {
+                            const auto &devices = stage.overlayExecution().currentRankPlan().local_devices;
+                            return std::any_of(devices.begin(), devices.end(), [](DeviceId device) { return device.is_gpu(); });
+                        });
+                }) && (!debugEnv().execution.gpu_graphs || !debugEnv().execution.prefill_graph_buckets))
                 throw std::logic_error("Automatic GPU pipeline admission requires production captured generation");
+            std::vector<MoEPipelinePlanningRankBudget> budgets;
+            budgets.reserve(ranks.size());
+            for (const auto &rank : ranks)
+            {
+                const auto native = policy.native_context_budgets.find(candidate.membership.discoveryRanks().at(rank.rank));
+                budgets.push_back({
+                    .host = projectPlanningHostServiceBudget(policy.retained_host_services, candidate.membership, rank.rank),
+                    .native_contexts = native != policy.native_context_budgets.end()
+                        ? native->second : std::vector<PlanningNativeContextDeclaration>{}});
+            }
             auto pipeline = std::make_shared<const AdmittedMoEPipelineMemory>(AdmittedMoEPipelineMemory::admit(
                 compiled.front(), model, loader, inventory, {
                     .prefill = {.bucket_rows = policy.prefill_bucket_rows,
@@ -189,14 +199,13 @@ namespace llaminar2
                         .maximum_cached_buckets = policy.maximum_cached_prefill_buckets},
                     .gpu_weight_load = {.policy = policy.weight_load, .maximum_source_bytes = weight_load.maximum_source_bytes},
                     .native_ordering_events=policy.native_ordering_events,
-                    .retained_host_services=projectPlanningHostServiceBudget(policy.retained_host_services, candidate.membership, 0),
-                    .native_context_budgets=policy.native_context_budgets.contains(candidate.membership.discoveryRanks().at(0))?policy.native_context_budgets.at(candidate.membership.discoveryRanks().at(0)):std::vector<PlanningNativeContextDeclaration>{},
                     .require_native_context_budgets=policy.require_native_context_budgets,
-                    .source_preparation=preparation}));
+                    .source_preparation=preparation,
+                    .candidate_rank_budgets=std::move(budgets)}));
             std::vector<DevicePlanConfig> devices;
             for (const auto &stage : pipeline->stages())
                 devices.insert(devices.end(), stage.devicePlans().begin(), stage.devicePlans().end());
-            ranks.front() = pipeline->rankPlan();
+            ranks = pipeline->candidateRankPlans();
             auto certificate = pipeline->physicalAdmission();
             return {std::move(candidate), std::move(ranks), std::move(devices),
                 std::move(certificate), nullptr, std::move(pipeline)};

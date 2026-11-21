@@ -1164,11 +1164,13 @@ TEST_F(Test__MoEExpertDispatchStage, FactoryCreatesDispatchStage)
 /** @test Original TP root alone publishes logical demand while every peer dispatches live work. */
 TEST_F(Test__MoEExpertDispatchStage, CapturedTicketTPHistoryHasOneOriginalPublisher)
 {
+    for (const bool retain_transactions : {false, true})
     for (const int degree : {2, 4, 8})
     for (const auto phase : {ExpertHistogramSource::PrefillChunk,
                             ExpertHistogramSource::DecodeToken,
                             ExpertHistogramSource::GroupedVerifier})
     {
+        SCOPED_TRACE(retain_transactions);
         SCOPED_TRACE(degree);
         SCOPED_TRACE(static_cast<int>(phase));
         constexpr int bucket = 16;
@@ -1179,8 +1181,11 @@ TEST_F(Test__MoEExpertDispatchStage, CapturedTicketTPHistoryHasOneOriginalPublis
         config.window_size = 32;
         config.sockets = {DeviceId::cpu()};
         config.ownership = MoELayeredExpertOwnership::uniform(5, 1, {0, 0, 0, 0});
-        admitObservedExpertDemand(config,
-            {.target_rows = 32, .max_transaction_rows = bucket, .top_k = 2}, 1);
+        // Host Observe updates marginals without allocating Dynamic's
+        // transaction-demand storage.
+        if (retain_transactions)
+            admitObservedExpertDemand(config,
+                {.target_rows = 32, .max_transaction_rows = bucket, .top_k = 2}, 1);
         DecodeExpertHistogram histogram(std::move(config));
         std::vector<std::shared_ptr<MoEOverlayDispatchTicketStorage>> tickets;
         std::vector<MoEExpertDispatchOutput> outputs(degree);
@@ -1253,6 +1258,11 @@ TEST_F(Test__MoEExpertDispatchStage, CapturedTicketTPHistoryHasOneOriginalPublis
             {
                 const auto frozen = histogram.freezeAndRotateWindow();
                 ASSERT_TRUE(frozen.valid());
+                if (!retain_transactions)
+                {
+                    EXPECT_THROW((void)frozen.validatedView().transactionDemand(), std::logic_error);
+                    continue;
+                }
                 const auto &demand = frozen.validatedView().transactionDemand();
                 ASSERT_EQ(demand.layerTransactions(4).size(), 1u);
                 EXPECT_EQ(demand.layerTransactions(4)[0].phase, phase);

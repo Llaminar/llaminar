@@ -23,6 +23,13 @@
 
 namespace llaminar2
 {
+    /** @brief Original rooted CPU reduction role of a canonical return ticket. */
+    enum class MoEOverlayCanonicalRouteTicketPayload : std::uint8_t
+    {
+        CanonicalRows, ///< Original root publishes live canonical rows.
+        ContributorCompletion, ///< Original contributor publishes only its completion sequence.
+    };
+
     /**
      * @brief Immutable interpretation of a dispatch packet's hidden matrix.
      *

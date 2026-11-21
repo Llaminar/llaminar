@@ -304,8 +304,11 @@ public:
      */
     [[nodiscard]] std::shared_ptr<const CPUSerialExpertStorageLayout> forController(DeviceId controller) const
     {
+        if (!controller.is_valid() || (controller.is_gpu() && policy_ != CPUSerialExpertFamilyPolicy::LocalPowerOfTwo))
+            throw std::invalid_argument("CPU serial controller contradicts its frozen family policy");
         return project(prefill_rows_,decode_rows_,retainedRawPrefillGraphBucketLadder(
-            inventory_,prefill_rows_,floor_,limit_),controller.is_gpu()?std::optional{controller}:std::nullopt);
+            inventory_,prefill_rows_,floor_,limit_),
+            controller.is_gpu() && (!joint_ || joint_->isRoot()) ? std::optional{controller} : std::nullopt);
     }
 private:
     DeviceId allocator_;

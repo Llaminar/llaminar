@@ -18,6 +18,7 @@
 #include <algorithm>
 
 #include "loaders/ModelLoader.h"
+#include "loaders/ModelContext.h"
 #include "execution/mtp/MTPLearnedBlockCount.h"
 #include <regex>
 #include <numeric>
@@ -536,6 +537,15 @@ namespace llaminar2
                     appendNativeTensor(profile, source.tensor);
         validateFlashNextGeometry(profile);
         return profile;
+    }
+
+    ModelMemoryProfile ModelMemoryProfile::fromOriginalModelContext(const IModelContext &context)
+    {
+        const auto *original = dynamic_cast<const ModelContext *>(&context);
+        if (!original || !context.ggufDirectory() ||
+            context.ggufDirectory() != original->concreteLoader().ggufDirectory())
+            throw std::invalid_argument("Shared expert TP requires its original sealed GGUF model context");
+        return fromLoader(original->concreteLoader());
     }
 
     ModelMemoryProfile ModelMemoryProfile::fromLoader(const ModelLoader &loader)

@@ -85,6 +85,14 @@ add_v2_test(V2_Integration_MoEOverlayPhysicalProjectionPieces
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
     ENVIRONMENT "${V2_CPU_FRAGMENT_TEST_ENV}")
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEOverlayPhysicalProjectionPieces)
+add_v2_test(V2_Integration_MoEOverlayPhysicalCalibrationClasses
+    COMMAND $<TARGET_FILE:v2_unit_moe_overlay_physical_residency_fabric>
+        --gtest_filter=MoEOverlayPhysicalCalibration.SeparatesRotatingCutsAndReusesExactPairs --gtest_brief=1
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;ExpertOverlay;SourceBinding;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "${V2_CPU_FRAGMENT_TEST_ENV}")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEOverlayPhysicalCalibrationClasses)
+
 
 add_v2_test(V2_Integration_ExpertTierDirectCPUProjection
     COMMAND $<TARGET_FILE:v2_test_expert_tier_weight_stream>
@@ -370,11 +378,21 @@ if(V2_TEST_SOCKETS AND V2_TEST_SOCKETS GREATER_EQUAL 2)
                 MPI_PROCS 2 NO_MODELS TIMEOUT 120
                 ENVIRONMENT "${_joined_other}" "OMP_NUM_THREADS=1" "OMP_DYNAMIC=false")
             list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${_joined_name})
+            set(_mixed_joined_name V2_Integration_${_joined_backend}_CPUJointPreparedGPUCohortCalibration)
+            add_v2_test(${_mixed_joined_name}
+                COMMAND $<TARGET_FILE:v2_integration_moe_overlay_residency_consensus_mpi>
+                    --gtest_filter=MoEOverlayGPUCPUJointCalibration.${_joined_backend}JoinedOriginalGPUAndCPUShardPreparedService
+                LABELS "V2;Integration;ProductionTestPreflight;${_joined_backend};CPU;MoE;MPI;Residency;Calibration;Measurement;Lifecycle;Contract"
+                MPI_PROCS 2 NO_MODELS TIMEOUT 120 GPU_DEVICES 2
+                ENVIRONMENT "${_joined_other}" "OMP_NUM_THREADS=1" "OMP_DYNAMIC=false")
+            list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${_mixed_joined_name})
+
         endif()
     endforeach()
     unset(_joined_backend)
     unset(_joined_other)
     unset(_joined_name)
+    unset(_mixed_joined_name)
 else()
     message(STATUS "CPU joint calibration controller: unqualified without two physical sockets; no MPI launch")
 endif()

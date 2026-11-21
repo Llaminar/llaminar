@@ -152,6 +152,16 @@ namespace llaminar2
             if (recurrent != model.metadata.end() && recurrent->second.data[layer] != (sparse ? 0u : 1u))
                 reject(recurrent->first, "mixer identity disagrees at block " + std::to_string(layer));
             mixers_.push_back(sparse ? Qwen4ExpMixer::SparseAttention : Qwen4ExpMixer::GatedDeltaNet);
+            retained_gdn_sources_.push_back(sparse ? Qwen4ExpRetainedGDNSources{} :
+                qwen4ExpRetainedGDNSources(layer, [&](const std::string &name, GGUFTensorType format) {
+                    const auto *source = model.findTensor(name);
+                    return source && source->type == format;
+                }));
+            retained_m1_hc_ffn_sources_.push_back(layer < main_layers_ &&
+                hasQwen4ExpRetainedM1HCFFNSources(layer, [&](const std::string &name, GGUFTensorType format) {
+                    const auto *source = model.findTensor(name);
+                    return source && source->type == format;
+                }));
             if (sparse)
             {
                 const std::string prefix = "blk." + std::to_string(layer) + ".indexer.";

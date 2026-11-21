@@ -156,8 +156,12 @@ namespace llaminar2
         const auto cpu_programs=topology.globalPipeline()
             ? originalCPUPipelinePrograms(topology.config(),*topology.globalPipeline(),inventory)
             : std::vector<OriginalCPUPipelineProgram>{};
-        const bool cross_rank=global && !cpu_programs.empty() && inventory.world_size>1;
-        const auto& original=policy.original_parent;
+        const auto &original = policy.original_parent;
+        const bool planning_candidate = !policy.candidate_rank_budgets.empty();
+        if (planning_candidate && (original || policy.native_context_preparation ||
+            policy.candidate_rank_budgets.size() != inventory.ranks.size()))
+            throw std::invalid_argument("Source-free pipeline planning requires all exact original rank budgets and no live source");
+        const bool cross_rank = global && (planning_candidate || !cpu_programs.empty()) && inventory.world_size > 1;
         if(cross_rank && original && (original->rank()!=parent.rank || original->world_size()!=inventory.world_size ||
             original->communicator()==MPI_COMM_NULL))
             throw std::invalid_argument("Pipeline capacity requires its same original parent rank/context");
@@ -215,7 +219,8 @@ namespace llaminar2
         } else (void)declare_original();
         std::vector<MoEOverlayLocalCapacityPlannerResult> selected_fixed;
         std::vector<int> selected_segments;
-        std::map<int,std::vector<std::vector<DevicePlanConfig>>> selected_source_free_groups;
+        using FixedRankInputs = std::pair<std::vector<MoEOverlayLocalCapacityPlannerResult>, std::vector<int>>;
+        std::map<int, FixedRankInputs> selected_source_free;
         std::string last_capacity_error;
         auto prefill_policy = policy.prefill;
         prefill_policy.exact_fixed_pipeline_widths = !global && parent.runtime.ngram_table_policy.isFixedHeadSharded();
@@ -241,10 +246,12 @@ namespace llaminar2
                     .native_pipeline_maintenance_budget=native_maintenance_budget,
                     .original_cpu_stage_program=original_cpu==cpu_programs.end()?nullptr:&*original_cpu}, rows);
                 input.local_capacity.original_cpu_pipeline_programs=cpu_programs;
-                input.local_capacity.native_context_budgets=policy.native_context_budgets;
+                const auto rank = owner_topology.rankPlan().rank;
+                const auto *budget = planning_candidate ? &policy.candidate_rank_budgets.at(rank) : nullptr;
+                input.local_capacity.native_context_budgets = budget ? budget->native_contexts : policy.native_context_budgets;
                 input.local_capacity.require_native_context_budgets=policy.require_native_context_budgets;
                 input.local_capacity.native_ordering_events=policy.native_ordering_events;
-                input.local_capacity.retained_host_services=policy.retained_host_services;
+                input.local_capacity.retained_host_services = budget ? budget->host : policy.retained_host_services;
                 inputs.push_back(std::move(input.local_capacity));
                 segments.push_back(input.prefill_segment_rows);
             }
@@ -255,7 +262,7 @@ namespace llaminar2
             std::vector<MoEOverlayLocalCapacityPlannerResult> fixed;
             std::vector<int> segments;
             std::optional<OriginalPipelineCapacitySendFrame> frame;
-            std::map<int,std::vector<std::vector<DevicePlanConfig>>> source_free_groups;
+            std::map<int, FixedRankInputs> source_free;
             const auto local_work=[&] {
                 auto candidate=fixed_for(topology,result.stages_,rows);
                 fixed=std::move(candidate.first);segments=std::move(candidate.second);
@@ -282,8 +289,9 @@ namespace llaminar2
                             auto target=std::find_if(complete.begin(),complete.end(),[&](const auto& entry){return entry.stage_id==stage;});
                             if(target==complete.end())throw std::logic_error("Source-free planning produced a foreign original stage");
                             target->budgets.insert(target->budgets.end(),candidate.first[index].physical_budgets.begin(),candidate.first[index].physical_budgets.end());
-                            if(rank!=parent.rank)source_free_groups[rank].push_back(std::move(candidate.first[index].device_inputs));
                         }
+                        if (rank != parent.rank)
+                            source_free.emplace(rank, std::move(candidate));
                     }
                 }
                 std::vector<MoEOverlayStageCapacityRequest> requests;
@@ -315,7 +323,7 @@ namespace llaminar2
                 catch(const PhysicalMemoryCapacityExhausted& error){selected.reset();last_capacity_error=error.what();continue;}
             }
             selected_fixed=std::move(fixed);selected_segments=std::move(segments);
-            selected_source_free_groups=std::move(source_free_groups);break;
+            selected_source_free=std::move(source_free);break;
         }
         if(!selected)
             throw PhysicalMemoryCapacityExhausted("No complete MoE pipeline graph fits: "+last_capacity_error);
@@ -327,7 +335,10 @@ namespace llaminar2
             const auto request=MemoryPlanner::immutableRowTableAdmissionRequest(profile,parent.runtime.ngram_table_policy,
                 groups,upload,ImmutableRowTableHostPlacement::fromObservedNUMANode(parent.numa_node));
             if(request)requests.push_back(*request);
-            for(const auto& [rank,rank_groups]:selected_source_free_groups) {
+            for(const auto& [rank,rank_inputs]:selected_source_free) {
+                std::vector<std::vector<DevicePlanConfig>> rank_groups;
+                for (const auto &stage : rank_inputs.first)
+                    rank_groups.push_back(stage.device_inputs);
                 const auto bindings=MemoryPlanner::immutableRowTableUploadBindings(profile,rank_groups);
                 const auto extra=MemoryPlanner::immutableRowTableAdmissionRequest(profile,parent.runtime.ngram_table_policy,
                     rank_groups,bindings,ImmutableRowTableHostPlacement::fromObservedNUMANode(compiled.at(rank).rankPlan().numa_node));
@@ -347,76 +358,89 @@ namespace llaminar2
             requests=gatherOverlayImmutableTableRequests(*table_frame,original,profile);
         } else build_table_requests();
         auto capacities=selected->admit(requests);
-        if(cross_rank) {
-            if(capacities.size()!=canonical.size())throw std::logic_error("Pipeline capacity omitted an original global stage");
-            std::vector<MoEOverlayResolvedCapacityPlan> local;
-            for(const auto& stage:result.stages_) {
-                const auto found=std::find_if(canonical.begin(),canonical.end(),
-                    [&](const auto& entry){return entry.topology_.stageId()==stage.topology_.stageId();});
-                if(found==canonical.end())throw std::logic_error("Pipeline capacity cannot project a foreign local stage");
-                local.push_back(std::move(capacities[static_cast<size_t>(found-canonical.begin())]));
-            }
-            capacities=std::move(local);
-        }
-        if(capacities.size()!=result.stages_.size())
+        const auto &declarations = cross_rank ? canonical : result.stages_;
+        if (capacities.size() != declarations.size() || capacities.empty())
             throw std::logic_error("MoE pipeline finalization lost its exact stage count");
-        for(const auto &placement:capacities.front().ngram_table_placements)
-            if(placement->worldRank()==parent.rank)
-            {
-                result.rank_plan_.runtime.ngram_table_placement=placement;
-                for(auto &stage:result.stages_)stage.rank_plan_.runtime.ngram_table_placement=placement;
-                // Device plans escape this owner for both runtime stage setup
-                // and automatic request costing. Publish the SAME final rank
-                // placement before moving those inputs into immutable stages;
-                // rebuilding a table choice in either consumer would lose the
-                // admitted cross-stage fixed-head source/owner projection.
-                for(auto &stage:selected_fixed)
-                    for(auto &device:stage.device_inputs)
-                        if(device.world_rank==placement->worldRank())
-                            device.ngram_table_placement=placement;
-            }
         result.admission_ = capacities.front().physical_memory_admission;
         if (!result.admission_)
             throw std::logic_error("MoE pipeline capacity did not publish one complete transaction");
-        for (std::size_t index = 0; index < result.stages_.size(); ++index)
+
+        // A source-free projection retains each rank's exact BOM and runtime
+        // geometry, while live admission exposes only the actual local stages.
+        const auto publish_rank = [&](RankExecutionPlan &rank, std::vector<AdmittedMoEPipelineStage> &stages,
+                                      auto &fixed, const auto &segments) {
+            if (stages.empty() || stages.size() != fixed.size() || stages.size() != segments.size())
+                throw std::logic_error("MoE pipeline admission omitted an original rank stage");
+            const auto &placements = capacities.front().ngram_table_placements;
+            const auto table = std::find_if(placements.begin(), placements.end(),
+                [&](const auto &placement) { return placement->worldRank() == rank.rank; });
+            if (table != placements.end())
+                rank.runtime.ngram_table_placement = *table;
+            for (std::size_t index = 0; index < stages.size(); ++index)
+            {
+                auto &stage = stages[index];
+                const auto found = std::find_if(declarations.begin(), declarations.end(),
+                    [&](const auto &entry) { return entry.topology_.stageId() == stage.topology_.stageId(); });
+                if (found == declarations.end())
+                    throw std::logic_error("Pipeline capacity cannot project a foreign rank stage");
+                auto capacity = capacities[static_cast<std::size_t>(found - declarations.begin())];
+                auto &local = fixed[index];
+                if (capacity.physical_memory_admission != result.admission_ ||
+                    local.resident_graph_rows != fixed.front().resident_graph_rows || segments[index] != segments.front())
+                    throw std::logic_error("MoE pipeline stages disagree on their aggregate admission or row envelope");
+                if (table != placements.end())
+                {
+                    stage.rank_plan_.runtime.ngram_table_placement = *table;
+                    for (auto &device : local.device_inputs)
+                        if (device.world_rank == rank.rank)
+                            device.ngram_table_placement = *table;
+                }
+                capacity.host_demand_memory = local.host_demand_memory;
+                capacity.activation_batch_inventory = local.activation_batch_inventory;
+                capacity.physical_gpu_lane_demand = local.physical_gpu_lane_demand;
+                capacity.cpu_serial_expert_storage = MemoryPlanner::cpuSerialExpertStorageAdmissions(local.device_inputs);
+                stage.rank_plan_.runtime.cpu_serial_expert_storage = capacity.cpu_serial_expert_storage;
+                stage.capacity_ = std::make_shared<const MoEOverlayResolvedCapacityPlan>(std::move(capacity));
+                stage.devices_ = std::move(local.device_inputs);
+                stage.rank_plan_.runtime.retained_host_services = retainedHostServicesFromInputs(stage.devices_, rank.rank);
+                stage.rank_plan_.runtime.resident_graph_rows = local.resident_graph_rows;
+                stage.rank_plan_.runtime.moe_routed_prefill.overlay_segment_rows = segments[index];
+            }
+            rank.runtime.retained_host_services = stages.front().rank_plan_.runtime.retained_host_services;
+            rank.runtime.resident_graph_rows = fixed.front().resident_graph_rows;
+            rank.runtime.moe_routed_prefill.overlay_segment_rows = segments.front();
+            std::vector<DevicePlanConfig> attention_inputs;
+            for (auto &stage : stages)
+            {
+                if (stage.rank_plan_.runtime.retained_host_services != rank.runtime.retained_host_services)
+                    throw std::logic_error("Pipeline stages lost their single original CPU service declaration session");
+                stage.rank_plan_.runtime.attention_participants =
+                    projectAdmittedQwenSparseAttentionPrograms(profile, stage.devices_, rank.rank);
+                attention_inputs.insert(attention_inputs.end(), stage.devices_.begin(), stage.devices_.end());
+            }
+            rank.runtime.attention_participants =
+                projectAdmittedQwenSparseAttentionPrograms(profile, attention_inputs, rank.rank);
+        };
+
+        publish_rank(result.rank_plan_, result.stages_, selected_fixed, selected_segments);
+        if (planning_candidate)
         {
-            if (capacities[index].physical_memory_admission != result.admission_ ||
-                selected_fixed[index].resident_graph_rows != selected_fixed.front().resident_graph_rows ||
-                selected_segments[index] != selected_segments.front())
-                throw std::logic_error("MoE pipeline stages disagree on their aggregate admission or row envelope");
-            auto &stage = result.stages_[index];
-            capacities[index].host_demand_memory = selected_fixed[index].host_demand_memory;
-            capacities[index].activation_batch_inventory = selected_fixed[index].activation_batch_inventory;
-            capacities[index].physical_gpu_lane_demand = selected_fixed[index].physical_gpu_lane_demand;
-            capacities[index].cpu_serial_expert_storage =
-                MemoryPlanner::cpuSerialExpertStorageAdmissions(selected_fixed[index].device_inputs);
-            stage.rank_plan_.runtime.cpu_serial_expert_storage = capacities[index].cpu_serial_expert_storage;
-            stage.capacity_ = std::make_shared<const MoEOverlayResolvedCapacityPlan>(std::move(capacities[index]));
-            stage.devices_ = std::move(selected_fixed[index].device_inputs);
-            stage.rank_plan_.runtime.retained_host_services = retainedHostServicesFromInputs(
-                stage.devices_, stage.rank_plan_.rank);
-            stage.rank_plan_.runtime.resident_graph_rows = selected_fixed[index].resident_graph_rows;
-            stage.rank_plan_.runtime.moe_routed_prefill.overlay_segment_rows = selected_segments[index];
+            for (int rank = 0; rank < inventory.world_size; ++rank)
+            {
+                if (rank == parent.rank)
+                {
+                    result.candidate_ranks_.push_back(result.rank_plan_);
+                    continue;
+                }
+                auto rank_plan = compiled.at(rank).rankPlan();
+                auto &stages = owned.at(rank);
+                auto &fixed = selected_source_free.at(rank);
+                publish_rank(rank_plan, stages, fixed.first, fixed.second);
+                result.candidate_ranks_.push_back(std::move(rank_plan));
+                result.stages_.insert(result.stages_.end(),
+                    std::make_move_iterator(stages.begin()), std::make_move_iterator(stages.end()));
+            }
         }
-        result.rank_plan_.runtime.retained_host_services = result.stages_.front().rank_plan_.runtime.retained_host_services;
-        for (const auto& stage : result.stages_)
-            if (stage.rank_plan_.runtime.retained_host_services != result.rank_plan_.runtime.retained_host_services)
-                throw std::logic_error("Pipeline stages lost their single original CPU service declaration session");
-        result.rank_plan_.runtime.resident_graph_rows = selected_fixed.front().resident_graph_rows;
-        result.rank_plan_.runtime.moe_routed_prefill.overlay_segment_rows = selected_segments.front();
-        std::vector<DevicePlanConfig> admitted_attention_inputs;
-        for (auto &stage : result.stages_)
-        {
-            stage.rank_plan_.runtime.attention_participants =
-                projectAdmittedQwenSparseAttentionPrograms(
-                    profile, stage.devices_, stage.rank_plan_.rank);
-            admitted_attention_inputs.insert(admitted_attention_inputs.end(),
-                                             stage.devices_.begin(),
-                                             stage.devices_.end());
-        }
-        result.rank_plan_.runtime.attention_participants =
-            projectAdmittedQwenSparseAttentionPrograms(
-                profile, admitted_attention_inputs, result.rank_plan_.rank);
         return result;
     }
 }

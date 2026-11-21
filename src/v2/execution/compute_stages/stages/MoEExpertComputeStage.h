@@ -2641,6 +2641,9 @@ namespace llaminar2
              * this invocation-local schedule from setup metadata.
              */
             MoEDomainRouteAssignmentLedger domain_route_assignment{};
+            /** Original publication semantics for the exact continuation route ledger. */
+            MoENodeLocalRouteOwnership node_local_route_ownership =
+                MoENodeLocalRouteOwnership::ExclusiveParticipant;
             /** Typed source for routes assigned outside this continuation domain. */
             MoEExternalCanonicalRouteSource external_route_source =
                 MoEExternalCanonicalRouteSource::Unspecified;
@@ -2674,6 +2677,8 @@ namespace llaminar2
         {
             return "moe_canonical_route_reduce";
         }
+        /** @return Captured sparse ownership policy, alongside base topology and buffer identity. */
+        uint64_t graphCaptureVariantSignature() const override;
         size_t estimatedFlops() const override;
         bool supportsBackend(ComputeBackendType backend) const override;
         bool isGraphCapturable() const override;

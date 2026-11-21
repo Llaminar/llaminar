@@ -25,8 +25,10 @@ namespace llaminar2
      * Every routed MoE layer in a main verifier graph selects exactly one
      * router or expert stage as its history boundary.  Static placement still
      * declares that boundary, but deliberately performs no history update.
-     * Dynamic/Observe placement retains physical verifier routes there and
-     * publishes only rows accepted by the later state transaction.  Keeping
+     * Native Dynamic/Observe placement retains physical verifier routes there
+     * and publishes only rows accepted by the later state transaction. A
+     * host-resident mapped continuation instead publishes executed row demand
+     * through the original dispatch ticket.  Keeping
      * `NotOwner` distinct from `StaticNoPublication` lets graph validation
      * reject a missing Dynamic publisher without pretending that Static needs
      * an unused stream or histogram bank.
@@ -39,6 +41,8 @@ namespace llaminar2
         StaticNoPublication,
         /** This boundary defers production history until acceptance is known. */
         DeferredAcceptedRows,
+        /** The original mapped dispatch ticket owns executed-row demand. */
+        MappedTicketNoAcceptedPublication,
     };
 
     /**

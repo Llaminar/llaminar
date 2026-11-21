@@ -376,10 +376,14 @@ include("{SOURCE}/tests/v2/cmake/V2TestTargetSelection.cmake")
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             tests = json.loads(subprocess.check_output(['ctest', '--test-dir', str(root / 'build'),
                 '--show-only=json-v1'], text=True, timeout=10))['tests']
-        self.assertEqual(len(tests), 23)
+        self.assertEqual(len(tests), 25)
         filters = set()
         local_mixed = []
         return_cases = []
+        prefill_cases = {
+            'V2_Integration_CanonicalRoutes_CUDA2_Prefill': 'CUDA',
+            'V2_Integration_CanonicalRoutes_ROCm2_Prefill': 'ROCm',
+        }
         for test in tests:
             props = {item['name']: item['value'] for item in test['properties']}
             labels = set(props['LABELS'])
@@ -406,6 +410,13 @@ include("{SOURCE}/tests/v2/cmake/V2TestTargetSelection.cmake")
                 self.assertIn('Devices1', labels)
             else:
                 self.assertIn('Devices2', labels)
+            if test['name'] in prefill_cases:
+                backend = prefill_cases.pop(test['name'])
+                self.assertIn(backend, labels)
+                self.assertEqual(props['TIMEOUT'], 120)
+                self.assertEqual(exact[0], '--gtest_filter=Test__MappedActivationPacketCUDAAndROCm.'
+                                 f'{backend}SparseCanonicalRoutesRetainPrefillBytesAcrossTwentyEpochs')
+        self.assertFalse(prefill_cases, prefill_cases)
         self.assertEqual(len(local_mixed), 2)
         self.assertEqual(len(return_cases), 8)
         self.assertNotIn('V2_Integration_MappedActivationPacket_CUDA_ROCm', {test['name'] for test in tests})

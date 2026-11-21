@@ -29,6 +29,82 @@ namespace llaminar2::test
         EXPECT_EQ(config.deltaNet().value_width, 6144u);
     }
 
+    /** @test Retained GDN requires original Q8 QKV/Z and prepared half controls. */
+    TEST(Qwen4ExpConfig, SelectsRetainedGDNPerOriginalSourcesAndArithmetic)
+    {
+        using Format = GGUFTensorType;
+        using Arithmetic = GDNProjectionArithmetic;
+        auto model = qwen4MetadataFixture();
+        const auto add = [&](int layer, const char *suffix, Format format) {
+            model.tensors.push_back({.name = "blk." + std::to_string(layer) + "." + suffix,
+                .dimensions = {128, 2560}, .type = format});
+        };
+        const auto source = [&](int layer, Format qkv, Format gate, Format alpha, Format beta) {
+            add(layer, "attn_qkv.weight", qkv);
+            add(layer, "attn_gate.weight", gate);
+            add(layer, "ssm_alpha.weight", alpha);
+            add(layer, "ssm_beta.weight", beta);
+        };
+        source(0, Format::Q8_0, Format::Q8_0, Format::F16, Format::F32);
+        source(1, Format::Q8_0, Format::IQ4_NL, Format::F16, Format::F16);
+        source(2, Format::Q6_K, Format::Q8_0, Format::F16, Format::F16);
+        source(3, Format::Q8_0, Format::Q8_0, Format::F16, Format::F16);
+        source(4, Format::Q8_0, Format::Q8_0, Format::Q8_0, Format::F16);
+        source(5, Format::Q8_0, Format::Q8_0, Format::F16, Format::Q8_0);
+        add(6, "attn_qkv.weight", Format::Q8_0);
+        add(6, "attn_gate.weight", Format::Q8_0);
+        add(6, "ssm_alpha.weight", Format::F16);
+        source(8, Format::Q8_0, Format::Q8_0, Format::BF16, Format::BF16);
+        const Qwen4ExpConfig config(model);
+        for (const auto policy : {Arithmetic::FP16MoEAlphaBeta, Arithmetic::FP16AlphaBeta})
+        {
+            EXPECT_TRUE(config.supportsRetainedGDN(0, policy));
+            EXPECT_TRUE(config.supportsRetainedGDN(8, policy));
+            for (const int layer : {1, 2, 3, 4, 5, 6})
+                EXPECT_FALSE(config.supportsRetainedGDN(layer, policy)) << layer;
+        }
+        for (const auto policy : {Arithmetic::Native, Arithmetic::FP32, Arithmetic::FP16})
+            EXPECT_FALSE(config.supportsRetainedGDN(0, policy));
+    }
+
+    /** @test Retained HC/FFN selects only complete original measured source tuples in main blocks. */
+    TEST(Qwen4ExpConfig, SelectsRetainedM1HCFFNPerOriginalSource)
+    {
+        using Format = GGUFTensorType;
+        auto model = qwen4MetadataFixture();
+        const auto add = [&](int layer, const char *role, Format format) {
+            model.tensors.push_back({.name = "blk." + std::to_string(layer) + "." + role,
+                .dimensions = {128, 2560}, .type = format});
+        };
+        const auto complete_layer = [&](int layer, Format gate, Format up, Format down,
+                                         Format shared_down = Format::Q8_0, Format hc_up = Format::Q8_0) {
+            add(layer, "hc_ffn_down.weight", Format::Q8_0);
+            add(layer, "hc_ffn_up.weight", hc_up);
+            add(layer, "ffn_gate_shexp.weight", Format::Q8_0);
+            add(layer, "ffn_up_shexp.weight", Format::Q8_0);
+            add(layer, "ffn_down_shexp.weight", shared_down);
+            add(layer, "ffn_gate_exps.weight", gate);
+            add(layer, "ffn_up_exps.weight", up);
+            add(layer, "ffn_down_exps.weight", down);
+        };
+        complete_layer(0, Format::Q4_K, Format::Q4_K, Format::Q5_1);
+        complete_layer(1, Format::Q4_K, Format::Q4_K, Format::Q8_0);
+        complete_layer(2, Format::Q5_K, Format::Q5_K, Format::Q8_0);
+        complete_layer(3, Format::IQ2_S, Format::IQ3_S, Format::IQ4_NL, Format::Q6_K);
+        complete_layer(4, Format::Q4_K, Format::Q5_K, Format::Q8_0);
+        complete_layer(5, Format::Q5_K, Format::Q5_K, Format::Q5_1);
+        complete_layer(6, Format::Q4_K, Format::Q4_K, Format::Q5_1, Format::Q6_K);
+        complete_layer(7, Format::Q4_K, Format::Q4_K, Format::Q5_1, Format::Q8_0, Format::Q6_K);
+        complete_layer(48, Format::Q4_K, Format::Q4_K, Format::Q5_1);
+        const Qwen4ExpConfig config(model);
+        for (int layer = 0; layer < 9; ++layer)
+        {
+            SCOPED_TRACE(layer);
+            EXPECT_EQ(config.hasRetainedM1HCFFNSources(layer), layer < 3);
+        }
+        EXPECT_FALSE(config.hasRetainedM1HCFFNSources(48));
+    }
+
     TEST(Qwen4ExpConfig, PreservesSparseTailAndDilatedNgramHistory)
     {
         const Qwen4ExpConfig config(qwen4MetadataFixture());

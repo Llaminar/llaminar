@@ -452,14 +452,13 @@ namespace llaminar2
             auto cohort=CPUJointExpertRouteStorageLayout::checkedSerialCohort(retained,
                 {.experts=profile.expert_count,.model_columns=profile.d_model,.intermediate_columns=profile.expert_feed_forward_length},members);
             std::vector<NativeCPUCollectiveProgram::Participant> native_members;
-            std::vector<DeviceId> devices;
             std::optional<size_t> local;
             for(size_t i=0;i<members.size();++i) {
-                native_members.push_back({members[i].world_rank,members[i].address});devices.push_back(DeviceId::cpu());
+                native_members.push_back({members[i].world_rank,members[i].address});
                 if(members[i].world_rank==input.rank_plan->rank)local=i;
             }
-            auto program=NativeCPUCollectiveProgram::expertShardRoutePartials(ordinal,
-                BackendSelector::resolve(joint->backend,devices),native_members);
+            auto program=NativeCPUCollectiveProgram::forBoundExpertShardDomain(
+                ordinal,joint->backend,native_members);
             if(input.original_cpu_stage_program) {
                 const auto& original=input.original_cpu_stage_program->nativeProgram();
                 if(original.backend()!=program.backend() || original.participants().size()!=native_members.size() ||
@@ -997,8 +996,10 @@ namespace llaminar2
                 if(profile.architecture=="qwen4exp")source=resolveProfileTPDeclaration(profile,
                     complete_main?TensorParallelMainPlacement::FullMainRankLocal:TensorParallelMainPlacement::OtherDeclared,
                     rank_plan.runtime.mtp,overlay_plan.continuation_domain_spec.effectiveDensePolicy(),devices);
-                const auto assignments=source?source->partition(devices,weights,profile.d_ff,profile.vocab_size):
+                auto assignments=source?source->partition(devices,weights,profile.d_ff,profile.vocab_size):
                     TensorParallelConfig::proportionalSplit(devices,weights,profile.n_heads,profile.n_kv_heads,profile.d_ff,profile.vocab_size);
+                if (usesNativeSharedExpertTP(&overlay_plan))
+                    assignments = bindOriginalSharedExpertTP(profile, rank_plan.runtime.mtp, assignments);
                 config.bindTensorParallelAssignment(
                     assignments.forRank(config.shard_index));
             };
@@ -1504,6 +1505,7 @@ namespace llaminar2
             const bool dynamic_gpu_service =
                 rank_plan.runtime.moe_rebalance.mode == MoERebalanceRuntimeMode::Dynamic &&
                 !MoEOverlayNoPeerResidency::hasNoPeerTopology(*input.overlay_plan) &&
+                !hasStationaryTensorShardTopology(*input.overlay_plan) &&
                 std::any_of(endpoint_devices.begin(), endpoint_devices.end(),
                     [](DeviceId device) { return device.is_gpu(); });
             if (dynamic_gpu_service)
@@ -1619,6 +1621,7 @@ namespace llaminar2
                    rank_plan.runtime.moe_rebalance.mode==MoERebalanceRuntimeMode::Dynamic &&
                    input.overlay_plan->authority_execution==MoEOverlayAuthorityExecutionKind::DeviceResident &&
                    !MoEOverlayNoPeerResidency::hasNoPeerTopology(*input.overlay_plan) &&
+                !hasStationaryTensorShardTopology(*input.overlay_plan) &&
                    input.cluster_inventory && input.cluster_inventory->world_size==1) {
                     // One original epoch arena per physical participant, shared
                     // by its serial main/MTP families. Arm/End are retained

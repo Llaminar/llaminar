@@ -806,7 +806,7 @@ class CompleteCohortMovementTests(unittest.TestCase):
     """Recorded original piece metadata complements actual source-body/native transport gates."""
 
     @staticmethod
-    def recorded(width):
+    def recorded(width, gpu=False):
         """Create a complete recorded F partition; widths4..8 assert metadata, not hardware."""
         journal = ledger("host", axis="tier_residency")
         members = []
@@ -818,9 +818,11 @@ class CompleteCohortMovementTests(unittest.TestCase):
                     first_row=64 * member if role < 2 else 0, rows=64 if role < 2 else 32,
                     first_column=0 if role < 2 else 64 * member, columns=32 if role < 2 else 64,
                     format_kind=0, codebook=0, is_superblock=False))
-            members.append(dict(participant=member + 1, world_rank=member, address=f"localhost:{member}:cpu:0",
-                                numa_node=member, projections=projections))
-        cohort = dict(kind="cpu_cohort", tier=1, layer=3, members=members)
+            rank, numa = (1, 0) if gpu else (member, member)
+            address = f"localhost:{numa}:rocm:{member}" if gpu else f"localhost:{numa}:cpu:0"
+            members.append(dict(participant=member + 1, world_rank=rank, address=address,
+                                numa_node=numa, projections=projections))
+        cohort = dict(kind="gpu_cohort" if gpu else "cpu_cohort", tier=1, layer=3, members=members)
         whole = dict(kind="whole", participant=0, device="CUDA:0", world_rank=0)
         journal["edges"][0].update(source=whole, destination=cohort)
         journal["edges"][1].update(source=copy.deepcopy(cohort), destination=copy.deepcopy(whole))
@@ -831,14 +833,14 @@ class CompleteCohortMovementTests(unittest.TestCase):
                     local = member["projections"][role]
                     full = dict(local, first_row=0, first_column=0, rows=local["source_rows"], columns=local["source_columns"])
                     source_member = whole if edge["source"]["kind"] == "whole" else member
-                    destination_member = member if edge["destination"]["kind"] == "cpu_cohort" else whole
+                    destination_member = member if edge["destination"]["kind"] != "whole" else whole
                     source = full if edge["source"]["kind"] == "whole" else local
-                    destination = local if edge["destination"]["kind"] == "cpu_cohort" else full
+                    destination = local if edge["destination"]["kind"] != "whole" else full
                     tags = dict(schema_version="1", purpose="placement_change", candidate_epoch=str(edge["candidate_epoch"]),
                         layer="3", expert=str(edge["expert"]), migration_index=str(edge["expert"] - 7),
                         piece_index=str(role * width + index), piece_count=str(3 * width),
                         source_target="0" if edge["source"]["kind"] == "whole" else "-3",
-                        destination_target="-3" if edge["destination"]["kind"] == "cpu_cohort" else "0",
+                        destination_target="-3" if edge["destination"]["kind"] != "whole" else "0",
                         source_participant=str(source_member["participant"]), destination_participant=str(destination_member["participant"]),
                         source_world_rank=str(source_member["world_rank"]), destination_world_rank=str(destination_member["world_rank"]),
                         projection=str(role), format_kind="0", codebook="0", is_superblock="false", payload_bytes="8192")
@@ -853,6 +855,17 @@ class CompleteCohortMovementTests(unittest.TestCase):
                         records.append(dict(kind="counter", phase="maintenance", domain="moe_overlay_residency", name="physical_migration_pieces_completed",
                                             value=1, rank=observer, tags=dict(tags, observer_world_rank=str(observer))))
         return journal, records
+
+    def test_gpu_cohort_preserves_same_rank_and_distinct_native_devices(self):
+        journal, records = self.recorded(2, gpu=True)
+        validate_movement_transport_mirrors(journal, records)
+        for field, foreign in (("world_rank", 2), ("address", "localhost:0:rocm:0"),
+                               ("address", "localhost:0:cuda:1")):
+            with self.subTest(field=field, foreign=foreign):
+                broken = copy.deepcopy(journal)
+                broken["edges"][0]["destination"]["members"][1][field] = foreign
+                with self.assertRaises(ValueError):
+                    validate_movement_transport_mirrors(broken, records)
 
     def test_complete_target_piece_observers_cover_every_original_member(self):
         for width in range(2, 9):

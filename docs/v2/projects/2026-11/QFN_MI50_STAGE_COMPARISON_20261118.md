@@ -162,6 +162,40 @@ LLAMINAR_BENCHMARK_ITERATIONS=2 LLAMINAR_BENCHMARK_WARMUP_ITERATIONS=1 \
 For the control, use a fresh directory and change `--moe-routed-expert-compute`
 to `gate-up-owned-down-columns`.
 
+### Serving defaults with dynamic residency enabled
+
+On four MI50s, the automatic serving layout kept all 512 experts jointly
+resident in each of the 48 main layers and the predictor. Across two measured
+Q4_K_XL generations, the placement epoch stayed at 1, with zero movement
+commands and zero transferred expert bytes. The full 256-token output and
+all 142 verifier rounds matched the earlier explicit maintenance-off control.
+The count-only planner also selected this layout with the strategy unrestricted.
+
+| Release configuration, code2048 | Prefill tok/s | Decode tok/s, 255 post-prefill tokens |
+| --- | ---: | ---: |
+| Q4_K_XL, automatic tensor sharding, dynamic maintenance | 918.20 | 79.84 |
+| Q4_K_XL, tensor sharding with maintenance off, control | 920.03 | 80.37 |
+| IQ3_XXS, automatic tensor sharding, dynamic maintenance | 874.05 | 80.23 |
+
+To reproduce the automatic arm, use the four-card visibility, Release build,
+rankfile, Q4 model, predictor and `campaign.json` created above. Each arm uses
+a fresh cache and an independent output file.
+
+```bash
+python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["prompts"][0]["text"], end="")' \
+  "$bench/campaign.json" > "$bench/code2048.txt"
+OMP_NUM_THREADS=28 OMP_PLACES=cores OMP_PROC_BIND=false OPENBLAS_NUM_THREADS=1 \
+LLAMINAR_BENCHMARK_ITERATIONS=2 LLAMINAR_BENCHMARK_WARMUP_ITERATIONS=1 \
+"$build/llaminar_mpi_session" --session-base "$bench/mpi" -- mpirun -np 2 \
+  --rankfile "$bench/rankfile" --bind-to core --report-bindings \
+  --mca mpi_leave_pinned 1 --mca orte_allowed_exit_without_sync 1 -- \
+  "$build/llaminar2" benchmark --auto --only-backends rocm --only-strategies tp \
+  --auto-device-counts rocm=4 --mpi-procs 2 -m "$model" --mtp-model "$predictor" \
+  --plan-workload 2048,256 --prefix-cache-disk-dir "$bench/auto-cache" -n 256 \
+  --temperature 0 --top-k 1 --top-p 1 --seed 42 --prompt-file "$bench/code2048.txt" \
+  --benchmark-json-output "$bench/auto-result.json"
+```
+
 ## Matched workload
 
 Both engines ran the original four UD-Q4_K_XL shards of Qwen3.8-Flash-Next

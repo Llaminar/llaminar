@@ -12,6 +12,8 @@
  */
 #include "utils/DebugEnv.h"
 #include "PlanningWeightServiceModel.h"
+#include "execution/moe/MoEOverlayCapacityResolver.h"
+#include "execution/moe/MoEExpertShardCohort.h"
 #include "AutomaticPlanningStartup.h"
 #include "tensors/NativeQuantisedFormatInfo.h"
 #include <algorithm>
@@ -94,7 +96,7 @@ namespace llaminar2
                     tensor.name, profile.architecture, debugEnv().gemm.gdn_projection_arithmetic, debugEnv().gemm.moe_router_arithmetic);
                 const auto execution_format = representation == ModelPreparedWeightRepresentation::FP32 ? std::string("F32") :
                     representation == ModelPreparedWeightRepresentation::FP16 ? std::string("F16") : tensor.quant_type;
-                const auto operand = PreparedWeightRepresentationContract::operandPrecision(role, tensor.name,
+                const auto operand = PreparedWeightRepresentationContract::operandPrecision(role, tensor.quant_type, tensor.name,
                     profile.architecture, debugEnv().gemm.gdn_projection_arithmetic, debugEnv().gemm.moe_router_arithmetic);
                 auto &entry = ordinary[{execution_format, operand}][{tensor.elements / tensor.K, tensor.K}];
                 ++entry.count;
@@ -332,8 +334,8 @@ namespace llaminar2
         const PlanningRoutedExpertWeightWork &work, size_t token_rows) const
     {
         const auto expectation = work.uniformExpectation(token_rows);
-        if (token_rows == 0 || (!work.projection_ownership && expectation.routed_rows == 0)) return 0;
-        if (work.projection_ownership && !device.is_gpu())
+        if (token_rows == 0 || ((!work.projection_ownership || work.shard_work) && expectation.routed_rows == 0)) return 0;
+        if (work.projection_ownership && !device.is_gpu() && !work.shard_work)
             throw std::invalid_argument("Projection-distributed expert service requires its admitted GPU endpoint");
         std::array<std::string, 3> formats;
         double elements = 0;
@@ -364,6 +366,13 @@ namespace llaminar2
                 if (work.projection_ownership)
                 {
                     double arithmetic = 0, traffic = 0;
+                    if (device.is_cpu())
+                    {
+                        const auto &fragment = *work.shard_work;
+                        const auto footprint = MoEOverlayCapacityResolver::preparedFootprints(
+                            {fragment.cohort->localManifest(fragment.member)}).front();
+                        traffic = footprint.cpu_live_bytes * expectation.nonempty_experts;
+                    }
                     for (const auto &operand : work.gate_up_down)
                     {
                         const auto matrix = work.projectionMatrix(operand.role);
@@ -378,8 +387,9 @@ namespace llaminar2
                         const double grouped_rows = std::max(1.0, issued.routed_rows / issued.nonempty_experts);
                         arithmetic += planningArithmeticSeconds(decode.service, prefill.rows, prefill.service,
                             grouped_rows, 2.0 * issued.routed_rows * matrix.rows * matrix.columns);
-                        traffic += gpuProjectionBytes(operand, matrix) * issued.nonempty_experts +
-                            sizeof(float) * issued.routed_rows * (matrix.rows + matrix.columns);
+                        if (device.is_gpu())
+                            traffic += gpuProjectionBytes(operand, matrix) * issued.nonempty_experts;
+                        traffic += sizeof(float) * issued.routed_rows * (matrix.rows + matrix.columns);
                     }
                     return positive(std::max(arithmetic, memorySeconds(rank, device, traffic)));
                 }

@@ -2478,18 +2478,25 @@ namespace llaminar2
                     const auto &plan = graph_config.moe.routed_expert_plan;
                     const auto *local = dynamic_cast<const ILocalTPContext *>(graph_config.tp_ctx);
                     const auto &world = graph_config.moe.overlay_mpi_ctx;
+                    const auto mode = graph_config.moe.rebalance_config.mode;
+                    const bool mapped_ticket = plan &&
+                        plan->authority_execution == MoEOverlayAuthorityExecutionKind::HostResident &&
+                        hasMappedGPUCPUIntermediateShardTopology(*plan);
                     if (!snapshot || !snapshot->valid() || !residency || !plan || !local || !world ||
-                        graph_config.moe.rebalance_config.mode != MoERebalanceRuntimeMode::Off ||
+                        !supportsGPUIntermediateShardMaintenance(mode, mapped_ticket) ||
+                        (mode == MoERebalanceRuntimeMode::Dynamic &&
+                         !authority->stationaryTensorShardResidency() && !authority->noPeerResidency() &&
+                         !mapped_ticket) ||
                         snapshot->ownershipKind() != MoEOverlayResidencyOwnershipKind::JointFragments ||
                         snapshot->originalProjectionPreparation() != residency->projectionPreparation() ||
                         &snapshot->originalOwnerMap() != &residency->initialOwnerMap() ||
                         snapshot->firstModelLayer() != graph_config.pp_layer_offset)
-                        throw std::invalid_argument("Static GPU F-shard factory lost original source preparation, registry, stage scope, or rebalance-Off policy");
+                        throw std::invalid_argument("GPU F-shard factory requires original source preparation, registry, stage scope and authenticated routed cohort ownership");
                     // Residency freezes a value copy of the authored plan.
                     // Source identity is the shared preparation and owner map
                     // above; validate the graph declaration against those exact
                     // owners below instead of comparing unrelated plan addresses.
-                    const auto &participant = requireOriginalStaticGPUIntermediateShardGraph(*plan,
+                    const auto &participant = requireOriginalGPUIntermediateShardGraph(*plan,
                         residency->initialOwnerMap(), *local, device, graph_config.tp_device_idx, world->rank(),
                         graph_config.pp_layer_offset, plan->placementLayerCapacity(graph_config.n_layers),
                         graph_config.moe.num_experts);
@@ -2698,7 +2705,7 @@ namespace llaminar2
      * @param retained_assignment Original weight-construction authority, required after materialization.
      * @param construction Explicit existing cold publication role; no missing binding selects another policy.
      * @param declared_placement Original complete local authority or an explicitly retained multi-domain family.
-     * @param original_directory Passive original format authority; required for declared QFN source selection.
+     * @param source_context Sealed source authority, including a selected paired predictor.
      * @return true if assignment succeeded, false on invalid input
      */
     static bool applyLocalTPAssignment(
@@ -2708,7 +2715,7 @@ namespace llaminar2
         const TensorParallelConfig *retained_assignment,
         TPAssignmentConstruction construction,
         TensorParallelMainPlacement declared_placement,
-        const GGUFModel *original_directory)
+        IModelContext &source_context)
     {
         const int tp_degree = local_tp_ctx->degree();
 
@@ -2722,12 +2729,38 @@ namespace llaminar2
         // Use TensorParallelConfig for consistent head/FFN/vocab distribution.
         // This ensures the graph config matches the weight slicing exactly
         // (both use distributeProportionally instead of independent std::round).
+        const bool native_shared = usesNativeSharedExpertTP(graph_config.moe.routed_expert_plan.get());
+        const auto bindShared = [&](TensorParallelConfig expected) {
+            if (!native_shared) return expected;
+            if (retained_assignment)
+            {
+                // The prepared WeightManager already owns the exact
+                // materialized shared intervals. Authenticate the unchanged
+                // native TP membership and all independent axis assignments.
+                if (retained_assignment->worldSize() != expected.worldSize() || !retained_assignment->validate())
+                    throw std::invalid_argument("Shared expert TP graph has a foreign prepared assignment");
+                for (int rank = 0; rank < expected.worldSize(); ++rank)
+                {
+                    auto original = expected.forRank(rank);
+                    const auto &prepared = retained_assignment->forRank(rank);
+                    original.d_ff_start = prepared.d_ff_start;
+                    original.d_ff_count = prepared.d_ff_count;
+                    original.native_shared_ffn_width = prepared.native_shared_ffn_width;
+                    if (original != prepared)
+                        throw std::invalid_argument("Shared expert TP graph and prepared weight assignments differ");
+                }
+                return *retained_assignment;
+            }
+            if (construction != TPAssignmentConstruction::InitialDeclarationBeforeMaterialization)
+                throw std::invalid_argument("Shared expert TP graph lacks its prepared weight assignment");
+            return bindOriginalSharedExpertTP(ModelMemoryProfile::fromOriginalModelContext(source_context),
+                graph_config.mtp, expected);
+        };
         auto tp_config = [&]
         {
             if(!graph_config.flash_next)
-                return TensorParallelConfig::fromLocalTPContext(*local_tp_ctx,graph_config.n_heads,
-                    graph_config.n_kv_heads,graph_config.d_ff,graph_config.vocab_size);
-            if(!original_directory)throw std::invalid_argument("QFN TP graph lacks original source-format directory");
+                return bindShared(TensorParallelConfig::fromLocalTPContext(
+                    *local_tp_ctx, graph_config.n_heads, graph_config.n_kv_heads, graph_config.d_ff, graph_config.vocab_size));
             std::vector<DeviceId> members;
             for(const auto &address:local_tp_ctx->devices())members.push_back(address.toLocalDeviceId());
             const bool complete_main=declared_placement==TensorParallelMainPlacement::FullMainRankLocal &&
@@ -2736,16 +2769,19 @@ namespace llaminar2
             const auto dense=graph_config.dense_tp_decode_replicated?DenseParallelPolicy::PrefillTensorParallelDecodeReplicated:
                 graph_config.dense_tp_decode_mirrored_embedding?DenseParallelPolicy::TensorParallelDecodeMirroredEmbedding:
                 graph_config.dense_tp_enabled?DenseParallelPolicy::TensorParallel:DenseParallelPolicy::Replicated;
-            auto source=resolveQfnTPDeclaration(*original_directory,
+            const auto *directory = source_context.ggufDirectory();
+            if (!directory) throw std::invalid_argument("QFN TP graph lacks original source-format directory");
+            auto source=resolveQfnTPDeclaration(*directory,
                 complete_main?TensorParallelMainPlacement::FullMainRankLocal:TensorParallelMainPlacement::OtherDeclared,
                 graph_config.mtp,dense,members);
             auto expected=source.partition(members,local_tp_ctx->weights(),graph_config.d_ff,graph_config.vocab_size);
             if(source.coverage()==KVHeadCoveragePolicy::QueryInterval && !retained_assignment &&
                 construction!=TPAssignmentConstruction::InitialDeclarationBeforeMaterialization)
                 throw std::invalid_argument("declared QFN query TP graph lacks its prepared weight assignment");
-            if(retained_assignment)
+            if (retained_assignment)
+                source.validate(*retained_assignment, members);
+            if (retained_assignment && !native_shared)
             {
-                source.validate(*retained_assignment,members);
                 for(int rank=0;rank<expected.worldSize();++rank)
                 {
                     const auto &a=expected.forRank(rank),&b=retained_assignment->forRank(rank);
@@ -2755,7 +2791,8 @@ namespace llaminar2
                 }
             }
             graph_config.tp_source_declaration=std::move(source);
-            return retained_assignment?*retained_assignment:std::move(expected);
+            return native_shared ? bindShared(std::move(expected)) :
+                (retained_assignment ? *retained_assignment : std::move(expected));
         }();
 
         const auto &assignment = tp_config.forRank(device_idx);
@@ -2979,7 +3016,7 @@ namespace llaminar2
         const std::shared_ptr<IMPIContext> &mpi_ctx,
         bool weights_sharded,
         TensorParallelMainPlacement declared_placement,
-        const GGUFModel *original_directory)
+        IModelContext &source_context)
     {
         // LOCAL TP activation: also activate if tp_config is set on WeightManager,
         // which indicates MDO configured it for TP weight slicing within a PP stage
@@ -2992,7 +3029,7 @@ namespace llaminar2
 
         if (local_tp_ctx && local_tp_ctx->degree() > 1 && (weights_sharded || local_tp_weights_configured))
         {
-            return applyLocalTPAssignment(graph_config, local_tp_ctx, tp_device_idx, tp_config,TPAssignmentConstruction::RetainedWeightOwner,declared_placement,original_directory);
+            return applyLocalTPAssignment(graph_config, local_tp_ctx, tp_device_idx, tp_config,TPAssignmentConstruction::RetainedWeightOwner,declared_placement,source_context);
         }
 
         if (tp_config && weights_sharded)
@@ -3371,7 +3408,7 @@ namespace llaminar2
                                     tp_config, mpi_ctx, weights_sharded,
                                     !config.moe_routed_expert_plan || config.moe_routed_expert_plan->domains.size()==1
                                         ?TensorParallelMainPlacement::FullMainRankLocal:TensorParallelMainPlacement::OtherDeclared,
-                                    model_ctx->ggufDirectory()))
+                                    *model_ctx))
         {
             return nullptr;
         }
@@ -4334,7 +4371,7 @@ namespace llaminar2
                     TPAssignmentConstruction::InitialDeclarationBeforeMaterialization,
                     !config.moe_routed_expert_plan || config.moe_routed_expert_plan->domains.size()==1
                         ?TensorParallelMainPlacement::FullMainRankLocal:TensorParallelMainPlacement::OtherDeclared,
-                    model_ctx->ggufDirectory()))
+                    *model_ctx))
             {
                 return nullptr;
             }

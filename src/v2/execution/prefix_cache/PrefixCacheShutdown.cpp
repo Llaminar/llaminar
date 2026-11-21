@@ -22,6 +22,7 @@
 #include <stdexcept>
 #include <tuple>
 #include <unordered_set>
+#include <utility>
 
 namespace llaminar2
 {
@@ -223,13 +224,12 @@ namespace llaminar2
             caches_.push_back(std::move(cache));
     }
 
-    /** @copydoc PrefixCacheShutdown::flush */
-    PrefixCacheShutdownResult PrefixCacheShutdown::flush(const IMPIContext *context)
+    /** @copydoc PrefixCacheShutdown::prepare */
+    void PrefixCacheShutdown::prepare(const IMPIContext *context)
     {
         if (phase_ != Phase::Collecting)
-            throw std::logic_error("prefix shutdown flush can execute only once");
-        phase_ = Phase::Flushing;
-        PrefixCacheShutdownResult result;
+            throw std::logic_error("prefix shutdown preparation can execute only once");
+        phase_ = Phase::Preparing;
         std::vector<PrefixCacheShutdownSource> sources;
         Json manifest = Json::array();
         for (const auto &cache : caches_)
@@ -240,7 +240,7 @@ namespace llaminar2
             const auto identity = source.archive->shutdownIdentity();
             Json entries = Json::array();
             for (const auto &handle : source.most_recent_first) entries.push_back(blockJson(handle));
-            result.candidates += source.most_recent_first.size();
+            result_.candidates += source.most_recent_first.size();
             manifest.push_back({{"archive", {identity.high, identity.low}},
                                 {"budget", source.archive->budgetBytes()}, {"entries", std::move(entries)}});
         }
@@ -282,18 +282,35 @@ namespace llaminar2
             }
             if (!archive || selected.empty())
                 throw std::invalid_argument("prefix shutdown planner sent an empty writer selection");
-            const auto completed = archive->flushShutdown(selected, selection);
-            result.selected += completed.selected;
-            result.written += completed.written;
-            result.reused += completed.reused;
-            result.payload_bytes_written += completed.payload_bytes_written;
+            prepared_.push_back({std::move(archive), std::move(selected), std::move(selection)});
         }
-        PerfStatsCollector::addCounter("prefix_cache", "shutdown_ram_candidates", result.candidates, "shutdown");
-        PerfStatsCollector::addCounter("prefix_cache", "shutdown_ram_selected", result.selected, "shutdown");
-        PerfStatsCollector::addCounter("prefix_cache", "shutdown_payload_writes", result.written, "shutdown");
-        PerfStatsCollector::addCounter("prefix_cache", "shutdown_backing_reuses", result.reused, "shutdown");
-        PerfStatsCollector::addCounter("prefix_cache", "shutdown_payload_bytes_written", result.payload_bytes_written, "shutdown");
+        caches_.clear();
+        phase_ = Phase::Ready;
+    }
+
+    /** @copydoc PrefixCacheShutdown::persist */
+    PrefixCacheShutdownResult PrefixCacheShutdown::persist()
+    {
+        if (phase_ != Phase::Ready)
+            throw std::logic_error("prefix shutdown persistence requires a fresh prepared selection");
+        phase_ = Phase::Persisting;
+        // The selected host backing is released on either success or failure
+        // while the original native context can still retire its pinned owner.
+        const auto prepared = std::exchange(prepared_, {});
+        for (const auto &entry : prepared)
+        {
+            const auto completed = entry.archive->flushShutdown(entry.selected, entry.plan);
+            result_.selected += completed.selected;
+            result_.written += completed.written;
+            result_.reused += completed.reused;
+            result_.payload_bytes_written += completed.payload_bytes_written;
+        }
+        PerfStatsCollector::addCounter("prefix_cache", "shutdown_ram_candidates", result_.candidates, "shutdown");
+        PerfStatsCollector::addCounter("prefix_cache", "shutdown_ram_selected", result_.selected, "shutdown");
+        PerfStatsCollector::addCounter("prefix_cache", "shutdown_payload_writes", result_.written, "shutdown");
+        PerfStatsCollector::addCounter("prefix_cache", "shutdown_backing_reuses", result_.reused, "shutdown");
+        PerfStatsCollector::addCounter("prefix_cache", "shutdown_payload_bytes_written", result_.payload_bytes_written, "shutdown");
         phase_ = Phase::Complete;
-        return result;
+        return result_;
     }
 }

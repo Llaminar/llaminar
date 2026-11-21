@@ -76,10 +76,11 @@ void Qwen4ExpGraph::postLayerComposition(ComputeGraph &graph, const LayerComposi
     const bool qualified_domain = config_.moe.routed_expert_plan &&
         config_.moe.routed_expert_plan->usesQFNMI50TP4();
 #ifdef HAVE_ROCM
-    if (usesRetainedGDNPreAttention(qfnRetainedGDNPreAttentionEnabled(qualified_domain), composition.device,
-            config_.moe.routed_compute_policy, input.execution_phase, input.execution_role,
-            input.seq_len, input.batch_size) &&
-        isGDNLayer(composition.layer))
+    if (isGDNLayer(composition.layer) && usesRetainedGDNPreAttention(
+            qfnRetainedGDNPreAttentionEnabled(qualified_domain &&
+                config_.flash_next->supportsRetainedGDN(composition.layer, debugEnv().gemm.gdn_projection_arithmetic)),
+            composition.device, config_.moe.routed_compute_policy, input.execution_phase,
+            input.execution_role, input.seq_len, input.batch_size))
     {
         lowerRetainedQwenGDNPreAttention(graph, "layer" + std::to_string(composition.layer) + "_gdn_proj",
                                          composition.input_boundary);
@@ -87,7 +88,9 @@ void Qwen4ExpGraph::postLayerComposition(ComputeGraph &graph, const LayerComposi
 #endif
     const auto &internalBoundary = composition.attention_terminal;
     const auto *boundary=graph.getNode(internalBoundary);
-    if(useQwen4ExpRetainedM1HCFFN(qfnRetainedM1HCFFNEnabled(qualified_domain),input.execution_phase,input.execution_role,input.seq_len,input.batch_size)) {
+    if(useQwen4ExpRetainedM1HCFFN(qfnRetainedM1HCFFNEnabled(qualified_domain &&
+        config_.flash_next->hasRetainedM1HCFFNSources(composition.layer)),
+        input.execution_phase,input.execution_role,input.seq_len,input.batch_size)) {
         if(!boundary || !boundary->device.is_rocm())
             throw std::invalid_argument("QFN retained full HC/FFN requires original ROCm layer composition");
         if(config_.qfn_hc_norm_q8_candidate||

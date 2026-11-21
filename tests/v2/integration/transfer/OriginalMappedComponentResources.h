@@ -29,7 +29,7 @@
 namespace llaminar2::test {
 /** @brief Existing geometry/policy for one serial component replay, declared before admission. */
 struct OriginalMappedComponentProgram final {
-    enum class Kind { Ticket, Sparse, Dense };
+    enum class Kind { Ticket, TicketCompletion, Sparse, Dense };
     Kind kind;
     std::size_t rows, width, epochs;
     bool retained=false;
@@ -38,6 +38,7 @@ struct OriginalMappedComponentProgram final {
     std::array<std::vector<std::size_t>,2> deviceBanks()const {
         const auto bytes=rows*width*sizeof(float);
         if(kind==Kind::Ticket)return {{{4096,bytes,32*4096},{}}};
+        if(kind==Kind::TicketCompletion)return {};
         if(kind==Kind::Dense)return {{{bytes},{bytes}}};
         return {{{bytes*8,rows*8*sizeof(std::int32_t),bytes,bytes*epochs,sizeof(std::int32_t),sizeof(MoENodeLocalRoutePeerDeviceBinding)},
                  {bytes*8,rows*8*sizeof(std::int32_t)}}};
@@ -74,7 +75,8 @@ public:
             if(!program.rows || !program.width || !program.epochs)throw std::invalid_argument("Original component has empty geometry");
             // This finite protocol has one ticket role or two route roles.
             // Validate that type before indexing its fixed role-bank array.
-            if(program.kind==OriginalMappedComponentProgram::Kind::Ticket) {
+            const bool completion=program.kind==OriginalMappedComponentProgram::Kind::TicketCompletion;
+            if(completion || program.kind==OriginalMappedComponentProgram::Kind::Ticket) {
                 if(devices_.size()!=1)throw std::invalid_argument("CPU ticket needs exactly its original GPU owner");
             } else if(devices_.size()!=2)
                 throw std::invalid_argument("Local route component needs its two distinct original GPUs");
@@ -89,6 +91,11 @@ public:
                     TransferEngine::mappedHostRegionAllocationBytes(32*4096));
                 const std::array requests{MappedHostTransferArena::AllocationRequest{
                     MoEOverlayCanonicalRouteReturnTicketStorage::metadataLayout(program.rows).bytes,64}};
+                temporary.add(host,PhysicalMemoryOwner::ActivationTransportStaging,MappedHostTransferArena::backingBytes(requests));
+            } else if(completion) {
+                events[0]=std::max<std::size_t>(events[0],2u);++graphs[0];
+                const std::array requests{MappedHostTransferArena::AllocationRequest{
+                    sizeof(MoEOverlayCanonicalRouteTicketControl),64}};
                 temporary.add(host,PhysicalMemoryOwner::ActivationTransportStaging,MappedHostTransferArena::backingBytes(requests));
             } else {
                 MoEOverlayNodeLocalRouteExchange::Config topology{devices_,devices_.front(),"original_component_routes"};

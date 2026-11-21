@@ -19,6 +19,20 @@ namespace llaminar2
     class WeightMetadataRegistry;
 
     /**
+     * @brief Retire transient host roots after participant graph materialization.
+     * @param weights Completed participant graph's immutable bindings.
+     * @param metadata Weight-manager host policy, including consumers outside the graph.
+     * @return Logical host bytes retired; shared bindings count once.
+     *
+     * A CPU execution requirement from any alias protects its storage root.
+     * Detached CPU engines and uploaded GPU weights can retire their sources
+     * once this graph materialization boundary has completed.
+     */
+    std::size_t retireMaterializedParticipantSources(
+        const FrozenModelWeightSet &weights,
+        const WeightMetadataRegistry &metadata);
+
+    /**
      * @brief Release owned GPU-only expert sources after complete preparation.
      *
      * Validates every selected expert's exact participant and domain ownership

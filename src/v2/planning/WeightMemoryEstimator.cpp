@@ -546,7 +546,7 @@ namespace llaminar2
             {
                 const auto type = tensorTypeFromName(t.quant_type);
                 if (!type) throw std::invalid_argument("CPU final weight estimate has unknown original source format: " + t.quant_type);
-                const auto operand = PreparedWeightRepresentationContract::operandPrecision(role,t.name,profile.architecture,
+                const auto operand = PreparedWeightRepresentationContract::operandPrecision(role,*type,t.name,profile.architecture,
                     source_policy.gdn_projection_arithmetic,source_policy.moe_router_arithmetic);
                 const auto precision = PreparedWeightRepresentationContract::resolveCPUWeightPrecision(
                     role,*type,WeightPrecision::NATIVE,prepared_representation,operand);

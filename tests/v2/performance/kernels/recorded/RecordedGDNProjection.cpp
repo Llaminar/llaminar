@@ -224,7 +224,7 @@ public:
         for(std::size_t i=0;i<4;++i)
         {
             const auto role=inferWeightRole(r.sources[i].name);
-            const auto operand=PreparedWeightRepresentationContract::operandPrecision(role,r.sources[i].name,loader.architecture(),GDNProjectionArithmetic::FP16MoEAlphaBeta);
+            const auto operand=PreparedWeightRepresentationContract::operandPrecision(role,source[i]->native_type(),r.sources[i].name,loader.architecture(),GDNProjectionArithmetic::FP16MoEAlphaBeta);
             checked(operand==(i<2?FloatingActivationOperandPrecision::Native:FloatingActivationOperandPrecision::FP16RNE),"Recorded GDN source operand policy differs from production");
             auto engine=Factory::createGemmFromGPUWeightPool(*prepared_source[i],device,pool,r.sources[i].name,0,GPUPreparedWeightPoolLayout::SourceNative,operand);
             WeightBinding binding;binding.identity=makeSourceWeightIdentity(r.sources[i].name,store->modelId());

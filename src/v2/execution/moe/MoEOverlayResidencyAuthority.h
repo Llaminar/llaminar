@@ -1280,6 +1280,12 @@ namespace llaminar2
             return no_peer_residency_;
         }
 
+        /** @return Original complete tensor-sharded residency with no alternate routed target. */
+        [[nodiscard]] const auto &stationaryTensorShardResidency() const noexcept
+        {
+            return stationary_tensor_shard_residency_;
+        }
+
         /** @brief Read the current immutable snapshot outside ticket execution. */
         std::shared_ptr<const MoEOverlayResidencySnapshot> snapshot() const;
 
@@ -1828,6 +1834,7 @@ namespace llaminar2
 
         Config config_;
         std::optional<MoEOverlayNoPeerResidency> no_peer_residency_;
+        std::optional<MoEOverlayStationaryTensorShardResidency> stationary_tensor_shard_residency_;
         MoERoutedExpertPlacementPlan planning_template_;
         /** Initial short cadence restored whenever a proposal selects movement. */
         int initial_histogram_window_tokens_ = 0;

@@ -8,6 +8,8 @@
  * MPI integration main retires collective/GPU owners after runner destruction.
  */
 #include "Qwen4ExpMTPAdmissionCases.h"
+#include "Qwen4ExpSourceAdmission.h"
+#include "../../../utils/ObservedNativeReplayOwner.h"
 #include "config/OrchestrationConfigDocument.h"
 #include "config/OrchestrationConfigParser.h"
 #include "utils/TestOrchestrationHelper.h"
@@ -16,12 +18,15 @@
 #include "config/OrchestrationStartupPolicy.h"
 #include "execution/moe/MoEPipelinePreparedPlan.h"
 #include "execution/moe/MoEOverlayPhysicalResidencyFabric.h"
+#include "execution/moe/MoEOverlayResidencyAuthority.h"
+#include "execution/runner/OrchestrationRunner.h"
 #include "tensors/TensorKernels.h"
 #include "execution/mtp/MTPWeightManifest.h"
 #include "execution/mtp/MTPStateTransaction.h"
 #include "loaders/ModelContext.h"
 #include "loaders/PreparedWeightStore.h"
 #include "models/qwen4exp/Qwen4ExpSidecarManifest.h"
+#include "planning/ObservedPeerGrouping.h"
 #include "planning/PhysicalMemoryAuthority.h"
 #include <gtest/gtest.h>
 #include <algorithm>
@@ -405,29 +410,46 @@ class Qwen4ExpMTPAdmissionTest : public ::testing::TestWithParam<Qwen4ExpMTPAdmi
 TEST_P(Qwen4ExpMTPAdmissionTest, PairedSourceInitializesWithoutReferencePack)
 { admitPairedSource(GetParam(), Qwen4ExpMTPAdmissionExecution::Active); }
 
-/** @test Replay a retained QFN MTP bridge whose absolute cache position is larger than one. */
 #ifdef HAVE_ROCM
-TEST(Qwen4ExpTensorShardedROCmTP4, Fixed3Retained3RestoredPrefixPlusOneMatchesSerialState)
+/**
+ * @brief Project the original full QFN ROCm TP4 placement to the reachable Fixed3 graphs.
+ * @param movement Explicit residency maintenance policy independent of MTP depth.
+ * @return Effective production configuration for the same model and predictor source.
+ */
+OrchestrationConfig singleTierTensorShardedFixed3Config(
+    ModelParityExpertMovement movement = ModelParityExpertMovement::Static)
 {
     const auto &cases = qwen4ExpFullROCmTP4MTPAdmissionCases();
     const auto fixed3 = std::find_if(cases.begin(), cases.end(), [](const auto &cell) {
         return cell.policy == ModelParityMTP::Depth3;
     });
-    ASSERT_NE(fixed3, cases.end());
+    if (fixed3 == cases.end())
+        throw std::logic_error("Missing the original QFN TP4 Fixed3 admission");
     auto cell = *fixed3;
+    if (!cell.main.expert_overlay)
+        throw std::logic_error("Missing the original QFN TP4 residency policy");
+    cell.main.expert_overlay->movement = movement;
     // This fixed-depth regression exercises the one-row bridge. Retaining
     // deeper, unreachable verifier graphs would dominate its setup time.
     cell.retained_depth = cell.requestedDepth();
-    ASSERT_TRUE(cell.main.topology.expert_overlay_plan);
+    if (!cell.main.topology.expert_overlay_plan)
+        throw std::logic_error("Missing the original QFN TP4 expert placement");
     auto placement = std::make_shared<MoERoutedExpertPlacementPlan>(*cell.main.topology.expert_overlay_plan);
-    ASSERT_EQ(placement->domains.size(), 1u);
-    ASSERT_EQ(placement->domains.front().participants.size(), 4u);
+    if (placement->domains.size() != 1u || placement->domains.front().participants.size() != 4u)
+        throw std::logic_error("The QFN TP4 admission requires one original four-device domain");
     placement->domains.front().routed_compute_policy = RoutedExpertComputePolicy::TensorSharded;
     placement->dense_domains = {placement->domains.front().toExecutionDomainDefinition()};
     cell.main.topology.expert_overlay_plan = std::move(placement);
     auto config = cell.config(Qwen4ExpMTPAdmissionExecution::Active,
         Qwen4ExpMTPAdmissionPurpose::ProductionServing);
     config.routed_expert_compute_policy = RoutedExpertComputePolicy::TensorSharded;
+    return config;
+}
+
+/** @test Replay a retained QFN MTP bridge whose absolute cache position is larger than one. */
+TEST(Qwen4ExpTensorShardedROCmTP4, Fixed3Retained3RestoredPrefixPlusOneMatchesSerialState)
+{
+    auto config = singleTierTensorShardedFixed3Config();
     config.prefix_cache.enabled = true;
     config.prefix_cache.storage_mode = PrefixCacheStorageMode::Ram;
     config.prefix_cache.block_size = 64;
@@ -493,6 +515,8 @@ TEST(Qwen4ExpTensorShardedROCmTP4, Fixed3Retained3RestoredPrefixPlusOneMatchesSe
     const auto comparison = compareMTPRuntimeStateSnapshots(serial, restored);
     EXPECT_TRUE(comparison) << comparison.reason;
 }
+#include "Qwen4ExpDynamicTensorShardedReplay.inc"
+#include "Qwen4ExpDynamicMixedTensorShardedReplay.inc"
 #endif
 INSTANTIATE_TEST_SUITE_P(Qwen4ExpMTPAdmission, Qwen4ExpMTPAdmissionTest,
     ::testing::ValuesIn(qwen4ExpMTPAdmissionCases()),

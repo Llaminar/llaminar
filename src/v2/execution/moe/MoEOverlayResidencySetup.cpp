@@ -57,7 +57,8 @@ namespace llaminar2
         // satisfy every exact quota. The returned copy is never a new authority.
         (void)MoEOverlayCapacityResolver::installResolvedQuotas(plan, capacity);
         const bool dynamic = rebalance.mode == MoERebalanceRuntimeMode::Dynamic;
-        const bool host_dynamic = dynamic && storage.migration_storage != MoEOverlayMigrationStorageKind::NoPeer &&
+        const bool stationary = storage.migration_storage == MoEOverlayMigrationStorageKind::StationaryTensorShard;
+        const bool host_dynamic = dynamic && !stationary && storage.migration_storage != MoEOverlayMigrationStorageKind::NoPeer &&
             plan.authority_execution == MoEOverlayAuthorityExecutionKind::HostResident;
         const bool projected = MoEExpertOwnerMap::usesJointFragments(plan) ||
             std::any_of(plan.domains.begin(), plan.domains.end(), [](const auto &domain) {
@@ -101,13 +102,13 @@ namespace llaminar2
             }
         }
         std::shared_ptr<const MoEOverlayEconomyCalibrationLayerCatalog> catalog;
-        if (dynamic)
+        if (dynamic && !stationary)
             catalog = std::make_shared<const MoEOverlayEconomyCalibrationLayerCatalog>(
                 buildMoEOverlayLayerWeightManifestFromLoader(input.loader, metadata.num_layers,
-                    metadata.num_experts, metadata.first_model_layer));
+                    metadata.num_experts, metadata.first_model_layer), joint_map.get());
 
         MoEOverlayResidencySetup result;
-        if (rebalance.mode != MoERebalanceRuntimeMode::Off)
+        if (rebalance.mode != MoERebalanceRuntimeMode::Off && !stationary)
         {
             const auto boundary = plan.lastPlacementLayerBefore(metadata.main_inference_layer_count);
             if (!boundary || *boundary < metadata.first_model_layer)

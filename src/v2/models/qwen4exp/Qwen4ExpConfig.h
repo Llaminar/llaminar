@@ -10,8 +10,10 @@
 #pragma once
 
 #include "../../loaders/ModelLoader.h"
+#include "config/GDNProjectionArithmeticPolicy.h"
 #include <array>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace llaminar2
@@ -91,6 +93,71 @@ namespace llaminar2
         uint64_t row_bytes;
     };
 
+    /** @brief Original source facts for retained ordinary GDN preattention. */
+    struct Qwen4ExpRetainedGDNSources
+    {
+        bool native_q8_pair = false;
+        bool floating_controls = false;
+
+        /**
+         * @param arithmetic Immutable preparation arithmetic used by the weight owner.
+         * @return Whether both controls bind FP16RNE while QKV and Z stay native Q8.
+         */
+        [[nodiscard]] bool supports(GDNProjectionArithmetic arithmetic) const noexcept
+        {
+            return native_q8_pair && floating_controls &&
+                (arithmetic == GDNProjectionArithmetic::FP16MoEAlphaBeta ||
+                 arithmetic == GDNProjectionArithmetic::FP16AlphaBeta);
+        }
+    };
+
+    /**
+     * @brief Classify the four original GDN projections in one recurrent layer.
+     * @param layer Absolute main model layer.
+     * @param matches Predicate for an exact original tensor name and GGUF format.
+     * @return Original source facts before arithmetic selection.
+     */
+    template<class Lookup>
+    Qwen4ExpRetainedGDNSources qwen4ExpRetainedGDNSources(int layer, Lookup matches)
+    {
+        using Format = GGUFTensorType;
+        const std::string prefix = "blk." + std::to_string(layer) + ".";
+        const auto floating = [&](const char *name) {
+            const auto source = prefix + name;
+            return matches(source, Format::F16) || matches(source, Format::BF16) || matches(source, Format::F32);
+        };
+        return {
+            .native_q8_pair = matches(prefix + "attn_qkv.weight", Format::Q8_0) &&
+                matches(prefix + "attn_gate.weight", Format::Q8_0),
+            .floating_controls = floating("ssm_alpha.weight") && floating("ssm_beta.weight")};
+    }
+
+    /**
+     * @brief Match the original quantized matrices consumed by retained M1 HC/FFN.
+     * @param layer Absolute main-model layer.
+     * @param matches Predicate for an exact original tensor name and GGUF source type.
+     * @return Whether both HC projections, the complete shared triplet and a routed
+     *         triplet supported by the retained native implementation are present.
+     */
+    template<class Lookup>
+    bool hasQwen4ExpRetainedM1HCFFNSources(int layer, Lookup matches)
+    {
+        using Format = GGUFTensorType;
+        const std::string prefix = "blk." + std::to_string(layer) + ".";
+        for (const auto *name : {"hc_ffn_down.weight", "hc_ffn_up.weight",
+                                 "ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight"})
+            if (!matches(prefix + name, Format::Q8_0))
+                return false;
+
+        const auto gate = prefix + "ffn_gate_exps.weight";
+        const auto up = prefix + "ffn_up_exps.weight";
+        const auto down = prefix + "ffn_down_exps.weight";
+        const bool down_q8 = matches(down, Format::Q8_0);
+        return (matches(gate, Format::Q4_K) && matches(up, Format::Q4_K) &&
+                    (down_q8 || matches(down, Format::Q5_1))) ||
+               (matches(gate, Format::Q5_K) && matches(up, Format::Q5_K) && down_q8);
+    }
+
     /** @brief Per-layer mixer identity; predictor blocks always use sparse attention. */
     enum class Qwen4ExpMixer : uint8_t { GatedDeltaNet, SparseAttention };
 
@@ -125,6 +192,15 @@ namespace llaminar2
         const Qwen4ExpNgramGeometry &ngrams() const noexcept { return ple_; }
         /** @brief Return mixer kinds for main blocks followed by exported predictor blocks. */
         const std::vector<Qwen4ExpMixer> &mixers() const noexcept { return mixers_; }
+        /**
+         * @param layer Original complete model layer index.
+         * @param arithmetic Effective setup request used to prepare its weights.
+         * @return Whether the original layer sources bind the retained GDN engine.
+         */
+        bool supportsRetainedGDN(std::size_t layer, GDNProjectionArithmetic arithmetic) const
+        { return retained_gdn_sources_.at(layer).supports(arithmetic); }
+        /** @return Whether the original HC/read and routed/shared sources support retained M1. */
+        bool hasRetainedM1HCFFNSources(std::size_t layer) const { return retained_m1_hc_ffn_sources_.at(layer); }
         /** @brief Return the number of main decoder blocks, excluding predictor blocks. */
         uint32_t mainLayers() const noexcept { return main_layers_; }
         /** @brief Return the exported predictor count; zero means intentionally omitted. */
@@ -152,6 +228,8 @@ namespace llaminar2
         Qwen4ExpExpertGeometry experts_{};
         Qwen4ExpNgramGeometry ple_{};
         std::vector<Qwen4ExpMixer> mixers_;
+        std::vector<Qwen4ExpRetainedGDNSources> retained_gdn_sources_; ///< Immutable GGUF source facts indexed by absolute layer.
+        std::vector<bool> retained_m1_hc_ffn_sources_; ///< Original GGUF source tuples for main blocks.
         uint32_t main_layers_ = 0;
         uint32_t predictor_layers_ = 0;
         uint32_t context_length_ = 0;

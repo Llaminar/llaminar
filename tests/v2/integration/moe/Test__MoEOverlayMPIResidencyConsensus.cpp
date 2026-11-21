@@ -2804,14 +2804,18 @@ namespace llaminar2::test
         EXPECT_EQ(authority->pendingRetirementCount(), 0u);
     }
 
+    /** @brief The point at which the replay requests a distributed shutdown. */
+    enum class EconomyCertificationStop { None, AfterIncompleteReadiness, BeforeLocalWave };
+
     /**
-     * @brief Exercise distributed certification through completion or stop.
-     * @param stop_while_peer_waits When true, stop after one shared incomplete
-     *        round while rank zero still lacks local evidence.
+     * @brief Exercise actual distributed certification through completion or stop.
+     * @param stop Replay shutdown edge relative to the original physical/evidence lanes.
      */
-    void assertDistributedEconomyCertification(
-        bool stop_while_peer_waits)
+    void assertDistributedEconomyCertification(EconomyCertificationStop stop)
     {
+        const bool stop_while_peer_waits = stop == EconomyCertificationStop::AfterIncompleteReadiness;
+        const bool stop_before_local_wave = stop == EconomyCertificationStop::BeforeLocalWave;
+        const bool stopping = stop != EconomyCertificationStop::None;
         auto context = worldContext();
         if (!requireTwoRanks(*context))
             GTEST_SKIP() << "Distributed certification requires two ranks";
@@ -3030,12 +3034,24 @@ namespace llaminar2::test
         const auto terminal_state = [&]
         {
             return certification.state() ==
-                   (stop_while_peer_waits
+                   (stopping
                         ? MoEOverlayEconomyCertificationState::Stopped
                         : MoEOverlayEconomyCertificationState::Complete);
         };
         const auto deadline =
             std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        if (stop_before_local_wave)
+        {
+            // The follower starts the first physical wave. The coordinator
+            // requests stop before its first poll and therefore before it can
+            // join the matching wave. Their first actions differ by design.
+            if (context->rank() == 1)
+                certification.poll();
+            ASSERT_EQ(calibration->stats().waves_started,
+                context->rank() == 1 ? 1u : 0u);
+            if (context->rank() == 0)
+                certification.requestStop();
+        }
         if (stop_while_peer_waits)
         {
             while ((certification.state() !=
@@ -3103,12 +3119,12 @@ namespace llaminar2::test
             << certification.failureMessage();
         ASSERT_EQ(
             certification.state(),
-            stop_while_peer_waits
+            stopping
                 ? MoEOverlayEconomyCertificationState::Stopped
                 : MoEOverlayEconomyCertificationState::Complete);
         EXPECT_EQ(
             authority->hasEconomyCertification(),
-            !stop_while_peer_waits);
+            !stopping);
         EXPECT_EQ(authority->stats().checks, 0u)
             << "Certification must precede the first histogram proposal";
         EXPECT_EQ(authority->snapshot()->epoch, initial_snapshot->epoch)
@@ -3137,16 +3153,16 @@ namespace llaminar2::test
         EXPECT_EQ(
             evidence_exchange->stats()
                 .service_readiness_exchanges_started,
-            2u);
+            stop_before_local_wave ? 1u : 2u);
         EXPECT_EQ(
             evidence_exchange->stats().service_readiness_incomplete,
-            1u);
+            stop_before_local_wave ? 0u : 1u);
         EXPECT_EQ(
             evidence_exchange->stats().service_readiness_stops,
-            stop_while_peer_waits ? 1u : 0u);
+            stopping ? 1u : 0u);
         EXPECT_EQ(
             certification.stats().certifications_installed,
-            stop_while_peer_waits ? 0u : 1u);
+            stopping ? 0u : 1u);
     }
 
     TEST(
@@ -3154,7 +3170,7 @@ namespace llaminar2::test
         DistributedEconomyCertificationUsesRealAbortOnlyMovementBeforeProposals)
     {
         assertDistributedEconomyCertification(
-            /*stop_while_peer_waits=*/false);
+            EconomyCertificationStop::None);
     }
 
     TEST(
@@ -3162,7 +3178,14 @@ namespace llaminar2::test
         DistributedEconomyCertificationPropagatesTypedStopAfterIncompleteRound)
     {
         assertDistributedEconomyCertification(
-            /*stop_while_peer_waits=*/true);
+            EconomyCertificationStop::AfterIncompleteReadiness);
+    }
+
+    TEST(
+        Test__MoEOverlayMPIResidencyConsensus,
+        DistributedColdStopRetiresPeerCalibrationBeforeReadiness)
+    {
+        assertDistributedEconomyCertification(EconomyCertificationStop::BeforeLocalWave);
     }
 
     TEST(

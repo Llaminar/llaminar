@@ -136,6 +136,16 @@ namespace llaminar2
     };
 
     /**
+     * @brief Check positive native intermediate fragments against every original routed down tensor.
+     * @param model Original model metadata and canonical tensor roles.
+     * @param degree Proposed complete participant count.
+     * @param gpu Whether original native cuts also share the GPU Q8 group alignment.
+     * @return True when the source encodings and down-K extents support this cohort.
+     */
+    [[nodiscard]] bool supportsOriginalRoutedIntermediateShardDegree(
+        const PlanningModelMetadata &model, int degree, bool gpu);
+
+    /**
      * @brief Scoped metadata-only GGUF owner for a complete automatic search.
      *
      * The loader and its process-local factory live together at stable addresses.

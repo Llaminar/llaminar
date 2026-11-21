@@ -19,12 +19,16 @@
 #include <filesystem>
 #include <fstream>
 #include <set>
+#include <type_traits>
 #include <unistd.h>
 
 using namespace llaminar2;
 
 namespace
 {
+    static_assert(!std::is_copy_constructible_v<PrefixCacheShutdown>);
+    static_assert(!std::is_copy_assignable_v<PrefixCacheShutdown>);
+
     constexpr auto kIdentity = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     /** @brief Minimal device-free participant carrying a real prefix cache through native shutdown. */
@@ -32,8 +36,12 @@ namespace
     {
     public:
         /** @brief Retain the original cache and a test-owned lifecycle observation. */
-        CacheRunner(std::shared_ptr<PrefixStateCache> cache, int &collections)
-            : cache_(std::move(cache)), collections_(collections) {}
+        CacheRunner(std::shared_ptr<PrefixStateCache> cache,
+                    std::shared_ptr<DiskPrefixStorageBackend> archive, int &collections)
+            : cache_(std::move(cache)), archive_(std::move(archive)), collections_(collections) {}
+
+        /** @brief Participant release must precede persistence of its selected RAM payload. */
+        ~CacheRunner() override { EXPECT_EQ(archive_->usedBytes(), 0u); }
         /** @brief This fixture exercises lifecycle only; no model forward is admitted. */
         bool forward(const int *, int) override { throw std::logic_error("unexpected fixture inference"); }
         /** @return No logits are owned by this lifecycle-only fixture. */
@@ -64,6 +72,7 @@ namespace
         }
     private:
         std::shared_ptr<PrefixStateCache> cache_;
+        std::shared_ptr<DiskPrefixStorageBackend> archive_;
         int &collections_;
     };
 
@@ -400,8 +409,8 @@ TEST_F(ShutdownFixture, ArchiveIdentityDistinguishesPhysicalArchivesAndRejectsPa
     EXPECT_NE(broken->initializationError().find("identity"), std::string::npos);
 }
 
-/** @test Ordinary shutdown, explicit worker retirement and destruction all flush exactly once. */
-TEST_F(ShutdownFixture, ProductionRunnerFlushesBeforeDestroyingParticipantsExactlyOnce)
+/** @test Ordinary shutdown persists only after participant retirement, exactly once. */
+TEST_F(ShutdownFixture, ProductionRunnerPersistsAfterDestroyingParticipantsExactlyOnce)
 {
     for (const bool explicit_worker_shutdown : {false, true})
     {
@@ -419,8 +428,12 @@ TEST_F(ShutdownFixture, ProductionRunnerFlushesBeforeDestroyingParticipantsExact
         plan.runtime.prefix_cache = config.prefix_cache;
         int collections = 0;
         {
-            OrchestrationRunner runner(config, plan, std::make_unique<CacheRunner>(cache, collections));
-            if (explicit_worker_shutdown) runner.shutdownMPIWorkers();
+            OrchestrationRunner runner(config, plan, std::make_unique<CacheRunner>(cache, archive, collections));
+            if (explicit_worker_shutdown)
+            {
+                runner.shutdownMPIWorkers();
+                EXPECT_EQ(archive->usedBytes(), 0u);
+            }
             runner.shutdown();
             EXPECT_EQ(collections, 1);
             EXPECT_EQ(tokens(*archive), (std::set<uint64_t>{key(1).token_hash}));

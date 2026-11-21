@@ -39,6 +39,7 @@ namespace llaminar2
             switch (kind)
             {
             case MoEOverlayMigrationStorageKind::NoPeer:
+            case MoEOverlayMigrationStorageKind::StationaryTensorShard:
             case MoEOverlayMigrationStorageKind::Disabled:
             case MoEOverlayMigrationStorageKind::DeviceTransferDirectory:
                 break;
