@@ -85,7 +85,7 @@ __device__ __forceinline__ void tile(const int8_t *a, const float *activation_sc
         if (n<p.n && kb<end_block) {
             const size_t index=static_cast<size_t>(kb)*p.n+n;
             load_payload<Traits::payload_bytes>(p.payload+index*Traits::payload_bytes,raw);
-            primary=p.scales[index];
+            primary=::llaminar2::native_quantised_scale::loadStagedPrimary<static_cast<uint8_t>(FMT)>(p.scales,index);
             if constexpr(Traits::needs_aux_compute) secondary=p.aux[index];
             if constexpr(Traits::is_dual_scale_asym) minima=p.minima[index];
         }
@@ -240,6 +240,7 @@ __device__ __forceinline__ void produce(
         LLAMINAR_VERIFIER_WMMA(NATIVE_QUANTISED_GEMM_Q4_0);
         LLAMINAR_VERIFIER_WMMA(NATIVE_QUANTISED_GEMM_IQ4_NL);
         LLAMINAR_VERIFIER_WMMA(NATIVE_QUANTISED_GEMM_IQ4_XS_SOURCE);
+        LLAMINAR_VERIFIER_WMMA(NATIVE_QUANTISED_GEMM_MXFP4);
         LLAMINAR_VERIFIER_WMMA(NATIVE_QUANTISED_GEMM_Q4_1);
         LLAMINAR_VERIFIER_WMMA(NATIVE_QUANTISED_GEMM_Q5_0);
         LLAMINAR_VERIFIER_WMMA(NATIVE_QUANTISED_GEMM_Q5_1);
@@ -311,6 +312,7 @@ void submitNativeQuantisedVerifierWmma(const NativeQuantisedVerifierWmmaArgument
         LLAMINAR_VALIDATE_VERIFIER(NATIVE_QUANTISED_GEMM_Q4_0);
         LLAMINAR_VALIDATE_VERIFIER(NATIVE_QUANTISED_GEMM_IQ4_NL);
         LLAMINAR_VALIDATE_VERIFIER(NATIVE_QUANTISED_GEMM_IQ4_XS_SOURCE);
+        LLAMINAR_VALIDATE_VERIFIER(NATIVE_QUANTISED_GEMM_MXFP4);
         LLAMINAR_VALIDATE_VERIFIER(NATIVE_QUANTISED_GEMM_Q4_1);
         LLAMINAR_VALIDATE_VERIFIER(NATIVE_QUANTISED_GEMM_Q5_0);
         LLAMINAR_VALIDATE_VERIFIER(NATIVE_QUANTISED_GEMM_Q5_1);
