@@ -263,6 +263,31 @@ This is sampled evidence: it is not exhaustive checkpoint equality. It shows tha
 the converters keep the official FP4/E8M0 expert bytes and map FP8 (128x128
 E8M0 block scales) and BF16 exactly to BF16 for the sampled tensors.
 
+## Native-layout weight storage audit (2026-11-22)
+
+Header-only BOM audit on Spark GB10 (unified-pool honest, cache-flushed) and
+per-family byte ratios (CPU prepared vs file, real UD-IQ2_XXS inventory):
+
+- GPU MXFP4 is ALREADY the native 17 B/32 layout: `nativeQuantisedScalePlaneBytes(25)==1`
+  (E8M0 byte scale plane; `CUDAVnniRepackKernels.cu` `kRepackMXFP4` keeps codes
+  verbatim + E8M0). The earlier "18 B/32" note is superseded. No GPU MXFP4 work
+  remains for storage economy.
+- CPU prepared inflation is the defect: `preparedEncodingForCodebook()` sends the
+  low-bit IQ codebooks (IQ2_XS 2.59x, IQ3_XXS 2.94x, IQ1_*) to **ExpandedInt8**
+  because they are neither nibble-LUT (IQ4_NL/IQ4_XS/Q4_0/Q4_1) nor
+  `CompactMultiScale` (Q2_K/Q3_K/Q6_K); Q4_K/Q5_K/Q6_K/Q8_0/F32/BF16/I32 stay
+  ~1.00-1.11x. Totals: 90.69 GB file -> 229.99 GB CPU prepared.
+- Fix (feature, not bug-fix-sized): a lean CPU encoding for low-bit IQ codebooks
+  (CompactMultiScale-style or native grid decode kernels), target ~1.0-1.1x.
+- Consequences: CPU-only paths for IQ models are memory-prohibitive on GB10/H100
+  CPU tiers; the 2xH100 vLLM comparison uses GPU-only TP2 (Q8), where the
+  storage is already honest (GPU weights 150.7 GB for the 162 GB file).
+
+Related BOM evidence (all fits on .79, a8eab593b+):
+- One GB10 (unified ~117-125 GB): Q8 153.3 GB (one device) -> TP2 76.7/device;
+  IQ2_XXS 127.3 -> 56.3; IQ1_M 125.6 (both still > single-node budget).
+- CPU-only: IQ2_XXS 291.8 GB / IQ1_M 160? (280.6) vs 117.2 GB.
+
 ## Cluster run requirements (pending owner decision; no GPU window authorized)
 
 Target: compare Llaminar on UD-Q8_K_XL (official-quality weights) with the
