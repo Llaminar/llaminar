@@ -85,11 +85,10 @@ TEST(CPUNativeQuantisedWeightView, CompactStrideFollowsTheDecodedPayloadWords)
     // tier-stream geometry and memory planning on one layout authority.
     struct Expected { int codebook; std::uint32_t data; std::uint32_t unit; };
     // The effective-minimum vector is reserved only for Q2_K (codebook 10),
-    // the sole consumer of chunkEffectiveMins. IQ3_XXS/IQ2_XXS store one FP16
-    // primary per 256-value group (preparedCompactGroupStride/8 per block).
+    // the sole consumer of chunkEffectiveMins.
     const Expected expected[] = {
-        {9, 768, 1024}, {10, 512, 1024}, {12, 768, 784}, {13, 768, 1024},
-        {14, 768, 1024}, {15, 512, 528}, {16, 512, 768}, {17, 512, 768},
+        {9, 768, 1024}, {10, 512, 1024}, {12, 768, 1024}, {13, 768, 1024},
+        {14, 768, 1024}, {15, 512, 768}, {16, 512, 768}, {17, 512, 768},
     };
     for (const auto &e : expected)
     {
@@ -112,11 +111,7 @@ TEST(CPUNativeQuantisedWeightView, CompactStrideFollowsTheDecodedPayloadWords)
         const auto view = fixture.view();
         EXPECT_EQ(view.data_stride, static_cast<int>(e.data));
         EXPECT_EQ(view.interleaved_block_stride, e.unit);
-        // The real resident extent follows the group layout exactly.
-        EXPECT_EQ(view.bytes().size(), std::size_t(128 / 64) *
-            (preparedCompactGroupScaleLayout(e.codebook)
-                ? std::size_t((3 + 7) / 8) * preparedCompactGroupStride(e.codebook)
-                : std::size_t(3) * e.unit));
+        EXPECT_EQ(view.bytes().size(), std::size_t(128 / 64) * 3 * e.unit);
     }
 }
 

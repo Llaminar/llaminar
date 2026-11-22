@@ -136,32 +136,6 @@ namespace llaminar2::cpu::native_quantised
      * @param encoding Physical execution encoding.
      * @param is_asymmetric Whether one FP16 minimum is stored per column.
      */
-    /** @brief Number of logical 32-value blocks sharing one compact scale group. */
-    inline constexpr int preparedCompactGroupBlocks = 8;
-
-    /** @brief Whether this compact codebook stores one FP16 scale per 256-value group.
-     * @details Only codebooks whose source packer derives the scale from
-     * superblock constants (not per-sub-block coefficients) may deduplicate:
-     * IQ3_XXS (superblock nibble, no secondary) and IQ2_XXS (superblock nibble,
-     * no secondary). IQ2_S/IQ2_XS/IQ1_S/IQ1_M derive per-sub-block coefficients
-     * and Q2_K retains its per-sub-block effective minima.
-     */
-    [[nodiscard]] constexpr bool preparedCompactGroupScaleLayout(int codebook_id) noexcept
-    {
-        return codebook_id == 12 || codebook_id == 15;
-    }
-
-    /** @brief Real resident bytes of one 64-column group (8 K-blocks) for group layouts.
-     * @return Eight payload regions plus one 128-byte FP16 primary scale vector.
-     * @throws std::logic_error In a checked build when the codebook is not group-layout.
-     */
-    [[nodiscard]] constexpr std::uint32_t preparedCompactGroupStride(int codebook_id) noexcept
-    {
-        if (!preparedCompactGroupScaleLayout(codebook_id))
-            return 0;
-        return preparedDataStride(CPUNativeQuantisedEncoding::CompactMultiScale, codebook_id) * 8u + 128u;
-    }
-
     [[nodiscard]] constexpr std::uint32_t preparedInterleavedBlockStride(
         CPUNativeQuantisedEncoding encoding,
         bool is_asymmetric,
@@ -179,39 +153,10 @@ namespace llaminar2::cpu::native_quantised
         // The compact family reserves exactly the payload words each codebook
         // decodes, plus two FP16 scale vectors. The effective-minimum vector
         // exists only for Q2_K (the sole consumer of chunkEffectiveMins).
-        // IQ3_XXS/IQ2_XXS move their single superblock-constant scale to one
-        // 64-column FP16 vector per 256-value group (preparedCompactGroupStride)
-        // and return the exact per-32-value equivalent here, so every caller
-        // that counts K blocks keeps its arithmetic unchanged.
         if (encoding == CPUNativeQuantisedEncoding::CompactMultiScale)
-        {
-            if (preparedCompactGroupScaleLayout(codebook_id))
-                return preparedCompactGroupStride(codebook_id) / preparedCompactGroupBlocks;
             return data_stride + 256u + (codebook_id == 10 ? 256u : 0u);
-        }
         return data_stride + 256u + (is_asymmetric ? 128u : 0u);
     }
-
-    /** @brief Exact resident bytes of one complete compact publication.
-     * @param codebook_id Compact codebook.
-     * @param chunks Padded 64-column chunk count.
-     * @param k_blocks Logical 32-value K block count.
-     * @details Group layouts round the K-block count up to whole 256-value
-     * groups and use the real group stride; every other compact codebook is
-     * chunks times blocks times the per-block stride.
-     */
-    [[nodiscard]] constexpr std::size_t preparedCompactResidentBytes(
-        int codebook_id, std::size_t chunks, std::size_t k_blocks) noexcept
-    {
-        if (preparedCompactGroupScaleLayout(codebook_id))
-        {
-            const std::size_t groups = (k_blocks + preparedCompactGroupBlocks - 1) / preparedCompactGroupBlocks;
-            return chunks * groups * preparedCompactGroupStride(codebook_id);
-        }
-        return chunks * k_blocks * preparedInterleavedBlockStride(
-            CPUNativeQuantisedEncoding::CompactMultiScale, false, codebook_id);
-    }
-
 
     /**
      * @brief Exact resident bytes touched by one logical NativeQuantised tile unit.

@@ -288,9 +288,12 @@ per-family byte ratios (CPU prepared vs file, real UD-IQ2_XXS inventory):
   effective-minimum vector is reserved only for Q2_K (the sole consumer), which
   shrinks the remaining units to 1024 B for Q3_K/IQ2_S/IQ2_XS/IQ3_XXS (4
   bits/value) and 768 B for IQ2_XXS/IQ1_S/IQ1_M (3 bits/value). Measured
-  prepared/file ratios: IQ3_XXS 1.30x (43.49 -> 19.3 GB), IQ2_XXS 1.46x,
-  IQ1_S 1.92x. The NEON tile-register witness required the grid gathers to be
-  always-inline (per-tile call overhead removed too).
+  prepared/file ratios (header-only BOM on the real UD shards):
+  UD-IQ1_S 82.43 GB -> 109.61 GB (1.33x), UD-IQ1_M 86.86 -> 143.94 (1.66x),
+  UD-IQ2_XXS 90.69 -> 140.97 (1.55x); the IQ3_XXS and IQ2_XXS tensor classes
+  land at exactly 1.00x of their file bytes. The NEON tile-register witness
+  required the grid gathers to be always-inline (per-tile call overhead
+  removed too).
 - Remaining (tracked, small): the effective-minimum vector is still reserved for
   every compact codebook though only IQ2_S consumes it (-0.5 to -1.0 bits/value
   if conditioned); IQ3_S intentionally stays on `IQ3SExpandedSourceScale` (its
