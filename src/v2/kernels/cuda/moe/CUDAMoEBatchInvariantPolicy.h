@@ -16,6 +16,7 @@
 #include <cstdint>
 
 #include "kernels/common/MoEProjectionNumericalContract.h"
+#include "tensors/NativeQuantisedFormatInfo.h"
 
 namespace llaminar2
 {
@@ -51,6 +52,23 @@ namespace llaminar2
         static constexpr int down_k_partitions =
             MoEProjectionNumericalContract::ordered_k_partitions;
         static constexpr int maximum_verifier_rows = 16;
+        static constexpr int qfn_gate_up_n = 320; ///< QFN local expert projection width.
+        static constexpr int qfn_gate_up_k = 2560; ///< QFN expert projection reduction width.
+
+        /**
+         * @brief Identify the packed codebooks measured with QFN's fixed K32 traversal.
+         * @param codebook Physical NativeQuantised execution codebook.
+         * @return Whether the SM86 verifier has a measured fixed-pitch packed reader.
+         */
+        static constexpr bool qfnVerifierPackedGateUp(uint8_t codebook) noexcept
+        {
+            using namespace native_quantised_formats;
+            return codebook == Q2_K.codebook_id || codebook == Q3_K.codebook_id ||
+                   codebook == Q6_K.codebook_id || codebook == IQ1_S.codebook_id ||
+                   codebook == IQ1_M.codebook_id || codebook == IQ2_S.codebook_id ||
+                   codebook == IQ2_XS.codebook_id || codebook == IQ2_XXS.codebook_id ||
+                   codebook == IQ3_S.codebook_id || codebook == IQ3_XXS.codebook_id;
+        }
 
         /**
          * @brief Select the mandatory grouped engine for a captured row bucket.

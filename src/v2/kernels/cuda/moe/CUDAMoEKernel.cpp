@@ -35,6 +35,7 @@
 #include "CUDAMoEOverlayEpochKernels.h"
 
 #include "../../../backends/BackendManager.h"
+#include "../../../backends/cuda/CUDAHardwareMetadata.h"
 #include "../gemm/CUDADeviceWorkspace.h"
 #include "../gemm/CUDAMoEGroupedPrefillKernels.h"
 #include "../gemm/CUDAMoEProductionPrefillPolicy.h"
@@ -576,6 +577,8 @@ namespace
      * 128-thread candidate from the ordinary generic value 128. Any malformed
      * selected width remains invalid and causes the production caller to fail;
      * it is never replaced after selection.
+     * @param device_ordinal The admitted capture owner. Device-free queries
+     *        omit it and use the architecture-independent policy.
      */
     CUDAMoEProductionPrefillPolicy selectCUDAMoEProductionPrefillPolicy(
         llaminar2::MoEPrefillMeasuredOperation operation,
@@ -586,7 +589,8 @@ namespace
         int expert_width,
         int expert_count,
         int top_k,
-        bool use_gateup_kpart)
+        bool use_gateup_kpart,
+        int device_ordinal = -1)
     {
         if (gateup_codebook_mask == 0 || down_codebook_mask == 0 ||
             seq_len <= 0 || hidden_size <= 0 || expert_width <= 0 ||
@@ -670,6 +674,21 @@ namespace
             {
                 policy.gateup_tile_n = exact_tile_n;
                 policy.source = "exact_overlay";
+            }
+            else if (device_ordinal >= 0 && seq_len == 4 && top_k == 10 &&
+                     hidden_size == llaminar2::CUDAMoEBatchInvariantPolicy::qfn_gate_up_k &&
+                     expert_width == llaminar2::CUDAMoEBatchInvariantPolicy::qfn_gate_up_n &&
+                     llaminar2::CUDAMoEBatchInvariantPolicy::qfnVerifierPackedGateUp(
+                         static_cast<uint8_t>(gateup_codebook)) &&
+                     gateup_codebook != llaminar2::native_quantised_formats::Q2_K.codebook_id &&
+                     gateup_codebook != llaminar2::native_quantised_formats::Q6_K.codebook_id)
+            {
+                const auto &hardware = llaminar2::cudaHardwareMetadata().at(device_ordinal);
+                if (hardware.sm_major == 8 && hardware.sm_minor == 6)
+                {
+                    policy.gateup_tile_n = 64;
+                    policy.source = "sm86_qfn_verifier";
+                }
             }
         }
 
@@ -9233,7 +9252,7 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
                 intermediate,
                 num_experts,
                 top_k,
-                use_gateup_kpart);
+                use_gateup_kpart, device_ordinal_);
         if (use_gateup_kpart &&
             !validCUDAMoEGateUpOrderedTileN(prefill_policy.gateup_tile_n))
         {
@@ -9741,7 +9760,7 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
                 intermediate,
                 num_experts,
                 top_k,
-                use_gateup_kpart);
+                use_gateup_kpart, device_ordinal_);
         if (use_gateup_kpart &&
             !validCUDAMoEGateUpOrderedTileN(prefill_policy.gateup_tile_n))
         {

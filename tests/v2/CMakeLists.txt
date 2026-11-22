@@ -12223,6 +12223,20 @@ add_v2_test(V2_Integration_CUDA_MoEVerifierQFNQ5KPublicationReplay
     MPI_PROCS 1 NO_MODELS TIMEOUT 120
     ENVIRONMENT "LLAMINAR_TEST_CUDA_MOE_M4_DOWN_GEOMETRY=qfn-main-q5"
         "LLAMINAR_TEST_CUDA_MOE_QFN_ROUTE_COUNT=10")
+add_v2_test(V2_Integration_CUDA_MoEVerifierQFNGateUpNativeFormatsPublicationReplay
+    COMMAND $<TARGET_FILE:v2_integration_cuda_moe_kernel>
+        --gtest_filter=Test__CUDAMoEKernel.RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRuntimeDecodeRows
+    LABELS "V2;Integration;ProductionTestPreflight;CUDA;MoE;MTP;GraphCapture;Replay;ByteExact;AllFormats;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 120
+    ENVIRONMENT "LLAMINAR_TEST_CUDA_MOE_M4_DOWN_GEOMETRY=qfn-all-gate"
+        "LLAMINAR_TEST_CUDA_MOE_QFN_ROUTE_COUNT=10")
+add_v2_test(V2_Integration_CUDA_MoEVerifierQFNDownNativeFormatsPublicationReplay
+    COMMAND $<TARGET_FILE:v2_integration_cuda_moe_kernel>
+        --gtest_filter=Test__CUDAMoEKernel.RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRuntimeDecodeRows
+    LABELS "V2;Integration;ProductionTestPreflight;CUDA;MoE;MTP;GraphCapture;Replay;ByteExact;AllFormats;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 120
+    ENVIRONMENT "LLAMINAR_TEST_CUDA_MOE_M4_DOWN_GEOMETRY=qfn-all-down"
+        "LLAMINAR_TEST_CUDA_MOE_QFN_ROUTE_COUNT=10")
 add_v2_test(V2_Integration_CUDA_MoEVerifierWideNativeFormatsPublicationReplay
     COMMAND $<TARGET_FILE:v2_integration_cuda_moe_kernel>
         --gtest_filter=Test__CUDAMoEKernel.RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRuntimeDecodeRows

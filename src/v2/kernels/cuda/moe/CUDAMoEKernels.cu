@@ -20490,8 +20490,8 @@ __global__ void softmax_topk_decode_descriptors_kernel(
             desc, n, A_int8, scales_A_blockwise, N, K, 0, K / 32);
     }
 
-    constexpr int kQFNDecodeGateUpN = 320;
-    constexpr int kQFNDecodeGateUpK = 2560;
+    constexpr int kQFNDecodeGateUpN = llaminar2::CUDAMoEBatchInvariantPolicy::qfn_gate_up_n;
+    constexpr int kQFNDecodeGateUpK = llaminar2::CUDAMoEBatchInvariantPolicy::qfn_gate_up_k;
     constexpr int kQFNDecodeGateUpPackets = 5;
     static_assert(kQFNDecodeGateUpK / 32 == kQFNDecodeGateUpPackets *
         llaminar2::CUDAMoEBatchInvariantPolicy::gate_up_k_partitions);
@@ -20545,7 +20545,7 @@ __global__ void softmax_topk_decode_descriptors_kernel(
         // Five independently decoded packets hide the latency of the packed
         // readers on the measured verifier tile. Larger byte streams keep
         // their shorter instruction body.
-        constexpr bool wide_packed_unroll = Pitch == 256 && Packets == 5 &&
+        constexpr bool wide_packed_unroll = (Pitch == 256 || Pitch == kQFNDecodeGateUpN) && Packets == 5 &&
             (Traits::is_iq_grid || CodebookId == native_formats::Q2_K.codebook_id ||
              CodebookId == native_formats::Q3_K.codebook_id || CodebookId == native_formats::Q5_0.codebook_id ||
              CodebookId == native_formats::Q6_K.codebook_id);
@@ -20750,7 +20750,7 @@ __global__ void softmax_topk_decode_descriptors_kernel(
 
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ == 860
     /** @brief Packed activation bytes in the two contiguous IQ4 nibble groups. */
-    struct MoEIQ4InterleavedActivation
+    struct alignas(16) MoEIQ4InterleavedActivation
     {
         int32_t first[4];
         int32_t last[4];
@@ -20893,21 +20893,47 @@ __global__ void softmax_topk_decode_descriptors_kernel(
         constexpr auto xs = llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook;
         if (!native_quantised_desc_shape_ok<Codebook>(desc, kWideVerifierDownN, kWideVerifierDownK))
             return 0.0f;
+        constexpr int packets = kWideVerifierDownK / 32;
+        constexpr bool stage_activation = Codebook == nl;
+        struct alignas(16) PreparedActivation
+        {
+            MoEIQ4InterleavedActivation codes[packets];
+            float scales[packets];
+        };
+        __shared__ PreparedActivation prepared;
+        if constexpr (stage_activation)
+        {
+            static_assert(kWideVerifierDownN % kVerifierDownTileColumns == 0);
+            static_assert(packets <= kVerifierDownTileColumns);
+            // This complete CTA owns one route. Transform each K32 activation
+            // once before the output lanes consume the shared dot operands.
+            if (threadIdx.x < packets)
+            {
+                const int packet = threadIdx.x;
+                prepared.codes[packet] = moe_iq4_interleaved_activation(codes + packet * 32);
+                prepared.scales[packet] = scales[packet];
+            }
+            __syncthreads();
+        }
         const auto evaluate = [&]<uint8_t Physical>() {
             float sum = 0.0f;
 #pragma unroll
-            for (int packet = 0; packet < kWideVerifierDownK / 32; ++packet)
+            for (int packet = 0; packet < packets; ++packet)
             {
-                const auto activation = moe_iq4_interleaved_activation(codes + packet * 32);
+                const auto activation = stage_activation ? prepared.codes[packet]
+                    : moe_iq4_interleaved_activation(codes + packet * 32);
                 const int index = packet * kWideVerifierDownN + column;
                 const float contribution = moe_iq4_interleaved_contribution<Physical>(
-                    desc, index, activation, scales[packet]);
+                    desc, index, activation, stage_activation ? prepared.scales[packet] : scales[packet]);
                 sum = moe_accumulate_rn(sum, __fadd_rn(0.0f, contribution));
             }
             return sum;
         };
-        return desc.codebook_id == xs ? evaluate.template operator()<xs>()
-                                     : evaluate.template operator()<nl>();
+        if constexpr (stage_activation)
+            return evaluate.template operator()<nl>();
+        else
+            return desc.codebook_id == xs ? evaluate.template operator()<xs>()
+                                         : evaluate.template operator()<nl>();
     }
 #endif
 
@@ -26606,11 +26632,14 @@ __attribute__((visibility("default"))) bool cudaMoE_softmax_topk_decode_selected
                 dim3 block(kTileN);
                 dim3 reduce_block(kReduceTileN);
 
-                const bool fixed_gate_geometry = kTileN == 128 &&
-                    gateup_k_partitions == llaminar2::CUDAMoEBatchInvariantPolicy::gate_up_k_partitions &&
-                    ((intermediate == kWideVerifierGateN && (d_model == 512 || d_model == kWideVerifierGateK)) ||
-                     (intermediate == kQFNDecodeGateUpN && d_model == kQFNDecodeGateUpK)) &&
-                    is_sm86_cuda_device(device_idx);
+                const bool fixed_partitions =
+                    gateup_k_partitions == llaminar2::CUDAMoEBatchInvariantPolicy::gate_up_k_partitions;
+                const bool qfn_gate_geometry = intermediate == kQFNDecodeGateUpN && d_model == kQFNDecodeGateUpK;
+                const bool use_fixed_qfn = fixed_partitions && qfn_gate_geometry &&
+                    (kTileN == 64 || kTileN == 128) && is_sm86_cuda_device(device_idx);
+                const bool fixed_gate_geometry = kTileN == 128 && (use_fixed_qfn ||
+                    (fixed_partitions && intermediate == kWideVerifierGateN &&
+                     (d_model == 512 || d_model == kWideVerifierGateK) && is_sm86_cuda_device(device_idx)));
 
                 for (int token_base = 0; token_base < seq_len; token_base += splitk_tile_rows)
                 {
@@ -26635,6 +26664,11 @@ __attribute__((visibility("default"))) bool cudaMoE_softmax_topk_decode_selected
                                     original_slot_base, tile_route_slots, intermediate, d_model, num_experts,
                                     gateup_k_partitions);
                         };
+                        if constexpr (llaminar2::CUDAMoEBatchInvariantPolicy::qfnVerifierPackedGateUp(CodebookId))
+                        {
+                            if (use_fixed_qfn)
+                                return issue.template operator()<kQFNDecodeGateUpN, kQFNDecodeGateUpPackets, packed>();
+                        }
                         if constexpr (Traits::is_iq4_lut)
                         {
                             if (fixed_gate_geometry && intermediate == kWideVerifierGateN && d_model == kWideVerifierGateK)

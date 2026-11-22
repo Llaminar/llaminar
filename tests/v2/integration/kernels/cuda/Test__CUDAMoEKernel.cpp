@@ -1618,6 +1618,7 @@ namespace
         const char *label;
         uint8_t codebook_id;
         CUDAMoEWeightCreator create;
+        bool source_is_superblock; ///< Original tensor stores 256-value blocks along K.
     };
 
     std::vector<CUDAMoEFormatCase> cudaMoEGroupedNativeFormats()
@@ -1629,7 +1630,8 @@ namespace
             formats.push_back({
                 format.label,
                 format.device_execution_codebook_id,
-                format.create});
+                format.create,
+                format.source_is_superblock});
         }
         return formats;
     }
@@ -24141,7 +24143,9 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
     const std::string_view geometry = requested_geometry ? requested_geometry : "";
     const bool qfn_main = geometry == "qfn-main";
     const bool qfn_main_q5 = geometry == "qfn-main-q5";
-    const bool qfn_width = geometry == "qfn" || qfn_main || qfn_main_q5;
+    const bool qfn_all_gate = geometry == "qfn-all-gate";
+    const bool qfn_all_down = geometry == "qfn-all-down";
+    const bool qfn_width = geometry == "qfn" || qfn_main || qfn_main_q5 || qfn_all_gate || qfn_all_down;
     const bool mixed_iq4 = geometry == "iq4-mixed";
     ASSERT_TRUE(geometry.empty() || qfn_width || geometry == "iq4" || mixed_iq4 || geometry == "wide");
     const bool wide_geometry = !geometry.empty();
@@ -24169,25 +24173,43 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
         row_inventory = {4};
 
     const auto formats = cudaMoEGroupedNativeFormats();
+    const auto q8_source = std::find_if(formats.begin(), formats.end(), [](const auto &source) {
+        return std::string_view(source.label) == "Q8_0";
+    });
+    ASSERT_NE(q8_source, formats.end());
     for (size_t format_index = 0; format_index < formats.size(); ++format_index)
     {
-        const auto &format = formats[format_index];
+        const auto &source = formats[format_index];
+        // Gate/Up has K=2560 for every source. A Down tensor with K=320
+        // requires 32-value source blocks, so use QFN's Q8 Down for the Gate/Up sweep.
+        if (qfn_all_down && source.source_is_superblock)
+            continue;
+        const auto &format = qfn_all_gate ? *q8_source : source;
         if (qfn_main && std::string_view(format.label) != "Q5_1")
             continue;
         if (qfn_main_q5 && std::string_view(format.label) != "Q8_0")
             continue;
-        if (qfn_width && std::string_view(format.label) != "Q5_1" &&
+        if (qfn_width && !qfn_all_gate && !qfn_all_down && std::string_view(format.label) != "Q5_1" &&
             std::string_view(format.label) != "Q8_0")
             continue;
         const std::string_view down_source_format{format.label};
         const bool iq4_format = down_source_format == "IQ4_NL" || down_source_format == "IQ4_XS";
         if ((geometry == "iq4" || mixed_iq4) && !iq4_format)
             continue;
-        SCOPED_TRACE(format.label);
-        const std::string_view gate_source = qfn_main ? "Q4_K" : qfn_main_q5 ? "Q5_K" : format.label;
+        SCOPED_TRACE(source.label);
+        const std::string_view gate_source = qfn_main ? "Q4_K" : qfn_main_q5 ? "Q5_K" : source.label;
         const auto gate_format = std::find_if(formats.begin(), formats.end(),
             [gate_source](const auto &candidate) { return candidate.label == gate_source; });
         ASSERT_NE(gate_format, formats.end());
+        const auto gate_reader = gate_format->codebook_id;
+        using llaminar2::CUDAMoEBatchInvariantPolicy;
+        namespace native_formats = llaminar2::native_quantised_formats;
+        const bool packed_qfn_reader = CUDAMoEBatchInvariantPolicy::qfnVerifierPackedGateUp(gate_reader);
+        const bool measured_qfn_gate_tile = sm86 && qfn_width && top_k == 10 && packed_qfn_reader &&
+            gate_reader != native_formats::Q2_K.codebook_id && gate_reader != native_formats::Q6_K.codebook_id;
+        const int expected_gate_tile = cuda_moe_config.cuda_moe_gateup_ordered_kpart_tile_n_override_active
+            ? cuda_moe_config.cuda_moe_gateup_ordered_kpart_tile_n
+            : (measured_qfn_gate_tile ? 64 : 128);
         const std::string_view up_source = mixed_iq4
             ? (gate_source == "IQ4_NL" ? "IQ4_XS" : "IQ4_NL") : gate_source;
         const auto up_format = std::find_if(formats.begin(), formats.end(),
@@ -24531,6 +24553,7 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
                         ASSERT_FALSE(gate_scatter);
                         gate_scatter = KernelLaunch{node, params};
                         constexpr int partitions = llaminar2::CUDAMoEBatchInvariantPolicy::gate_up_k_partitions;
+                        EXPECT_EQ(params.blockDim.x, static_cast<unsigned>(expected_gate_tile));
                         EXPECT_EQ(params.gridDim.x, (intermediate + params.blockDim.x - 1) / params.blockDim.x);
                         EXPECT_EQ(params.gridDim.y, static_cast<unsigned>(seq_len * top_k));
                         EXPECT_EQ(params.gridDim.z, static_cast<unsigned>(partitions));
@@ -24539,11 +24562,16 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
                         EXPECT_EQ(attributes.localSizeBytes, 0u);
                         if (!gate_weight_probe_path && !probe_path)
                         {
-                            const bool fixed_source = qfn_width ? gate_source != "Q8_0"
-                                : wide_geometry || !iq4_format;
+                            const bool fixed_qfn_tile = packed_qfn_reader &&
+                                (params.blockDim.x == 64 || params.blockDim.x == 128);
+                            const bool fixed_qfn_default = params.blockDim.x == 128 &&
+                                (gate_reader == native_formats::Q4_K.codebook_id ||
+                                 gate_reader == native_formats::Q5_K.codebook_id);
+                            const bool fixed_source = qfn_width ? fixed_qfn_tile || fixed_qfn_default
+                                : params.blockDim.x == 128 && (wide_geometry || !iq4_format);
                             const std::string fixed_schedule = "ELi" + std::to_string(intermediate) +
                                 "ELi" + std::to_string(d_model / (32 * partitions)) + "E";
-                            EXPECT_EQ(name.contains(fixed_schedule), sm86 && params.blockDim.x == 128 && fixed_source)
+                            EXPECT_EQ(name.contains(fixed_schedule), sm86 && fixed_source)
                                 << gate_source << " captured the wrong verifier Gate/Up schedule";
                         }
                     }
@@ -24593,6 +24621,8 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
                                 EXPECT_EQ(attributes.sharedSizeBytes, 512 * sizeof(uint32_t));
                             if (down_source_format == "IQ3_XXS")
                                 EXPECT_EQ(attributes.sharedSizeBytes, 256 * sizeof(uint32_t));
+                            if (down_source_format == "IQ4_NL")
+                                EXPECT_EQ(attributes.sharedSizeBytes, (256 / 32) * (32 + sizeof(float)));
                         }
                     }
                 }
@@ -24684,12 +24714,7 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
                         replay.data(), serial_values.data(), replay.size(), d_model);
                 }
             }
-            // An explicit diagnostic tile participates in both capture and
-            // PerfStats. Keep the generated-policy witness at its measured
-            // default when no diagnostic override was requested.
-            const int expected_gate_tile = cuda_moe_config.cuda_moe_gateup_ordered_kpart_tile_n_override_active
-                ? cuda_moe_config.cuda_moe_gateup_ordered_kpart_tile_n
-                : 128;
+            // The declared tile participates in both capture and PerfStats.
             expectPrefillSwiGLUPathRecord("fused", seq_len, top_k, num_experts, 0,
                                           "kpart_prefill",
                                           "ordered_kpart_prefill",

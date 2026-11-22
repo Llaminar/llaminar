@@ -329,6 +329,51 @@ The 64-column CTA uses 50 registers, zero shared and local bytes, and no
 warp synchronization. The captured replay verifies the short kernel's
 launch against the admitted output geometry.
 
+### QFN-width source coverage
+
+Set `LLAMINAR_TEST_CUDA_MOE_QFN_ROUTE_COUNT=10` for both QFN-width sweeps.
+Use `LLAMINAR_TEST_CUDA_MOE_M4_DOWN_GEOMETRY=qfn-all-gate` with
+`LLAMINAR_TEST_CUDA_MOE_VERIFIER_GATE_UP_WEIGHT_REFERENCE_JSONL` to measure
+all 21 source formats at Gate/Up N=320 and K=2560. The paired Down weights
+use QFN's Q8_0 source. Use `qfn-all-down` with
+`LLAMINAR_TEST_CUDA_MOE_VERIFIER_DOWN_WEIGHT_REFERENCE_JSONL` to measure
+the seven source formats with 32-value source blocks at Down N=2560 and
+K=320. The `wide` sweep exercises the 256-value-block Down formats at K=256.
+Both QFN-width sweeps retain all 40 routes and compare captured M=4 output
+with the serial-row oracle, including the replay after diagnostic timing.
+
+At baseline, 10 of 21 Gate/Up formats and six of seven Down formats
+reached 80% of their matched weight-only rate on both RTX 3090s. The
+remaining Down format, IQ4_NL, achieved 76.9–78.3% at 18.560–18.880 µs.
+All source formats in both sweeps matched the serial oracle byte for byte.
+
+### Fixed QFN-width Gate/Up packets
+
+The SM86 packed Gate/Up reader fixes each partition at five K32 packets.
+It loads the original activation once per packet for both projections and
+keeps the original FP32 accumulation order. For M=4 and ten routes per
+row, Q2_K and Q6_K use 128-column CTAs. The other packed readers use
+64-column CTAs, which divide the 320-column output evenly. After the
+change, 14 of 21 QFN-width Gate/Up formats reached 80% on both cards.
+
+| Source | Gate/Up with publication, µs | Matched weight rate |
+| --- | ---: | ---: |
+| Q2_K | 28.480 | 88.5% |
+| Q3_K | 29.248–29.312 | 81.4–81.6% |
+| Q6_K | 45.952–46.016 | 83.7–83.8% |
+| IQ3_S | 33.984–34.048 | 85.3–85.5% |
+| IQ3_XXS | 27.200–27.264 | 77.2–77.4% |
+| IQ2_S | 30.208–30.464 | 72.5–72.9% |
+| IQ2_XS | 29.120–29.312 | 74.3–74.9% |
+| IQ2_XXS | 24.320–24.448 | 66.5–66.6% |
+| IQ1_S | 27.840–27.968 | 59.5% |
+| IQ1_M | 29.120–29.312 | 56.8–57.8% |
+
+The compiled readers use 42–56 registers with zero shared, stack and
+local bytes. Their launch geometry permits 9 or 16 CTAs per SM. The
+captured all-format replay verifies the fixed reader, CTA width and
+serial-row output bytes.
+
 ## Route-matched verifier Gate/Up weight reference
 
 The four-row verifier fixture also measures the original Gate/Up scatter
@@ -390,6 +435,12 @@ for sixteen CTAs per SM. Both report zero stack and local bytes.
 | --- | ---: | ---: | ---: | ---: |
 | IQ4_NL | 22.272 | 81.0% | 9.024–9.088 | 78.2–78.7% |
 | IQ4_XS | 24.448 | 79.8% | 9.024 | 85.1% |
+
+The wide IQ4_NL Down reader now prepares the reordered codes and original
+scales once per CTA before entering its ordered eight-packet dot. Its
+Release medians are 8.448–8.512 µs and 80.3–80.5% on both cards. The
+64-column CTA uses 43 registers, 288 shared bytes, and one setup barrier.
+Static inspection found zero stack and local bytes.
 
 The mixed IQ4 preflight executes both Gate/Up scale orderings against the
 serial-row result. Before and after the shared lookup extraction, the
