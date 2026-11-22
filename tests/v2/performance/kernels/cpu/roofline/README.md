@@ -154,3 +154,61 @@ MPI took 11.60–14.14 µs and shared memory took 18.57–21.03 µs. At ten live
 routes the corresponding ranges were 24.94–29.54 and 41.18–46.69 µs. Both
 transports matched every output byte and live extent, including unequal and
 empty peers. The MPI path is the control for further overlap work.
+
+## NativeQuantised source matrix
+
+Use the Release `v2_perf_cpu_moe_expert_verifier_rows` fixture pinned to
+one thread per physical core of the selected socket. Its production
+GPU-aligned path compares Gate/Up, SwiGLU Q8 publication and Down against
+independent serial rows both before and after its samples. Set
+`LLAMINAR_PERF_STATS_SUMMARY=1` and `LLAMINAR_PERF_STATS_FILTER=kernel` for
+the route and ownership proof. The fixture suppresses these records inside
+the timed regions and collects a fresh proof afterward.
+
+```sh
+LLAMINAR_ISA_LEVEL=avx512 OMP_NUM_THREADS="$PHYSICAL_WORKERS" \
+OMP_PLACES=cores OMP_PROC_BIND=close OMP_DYNAMIC=false \
+LLAMINAR_PERF_STATS_SUMMARY=1 LLAMINAR_PERF_STATS_FILTER=kernel \
+LLAMINAR_CPU_MOE_EXPERT_MEASURE_POLICY=aligned \
+LLAMINAR_CPU_MOE_EXPERT_GATE_UP_OWNERSHIP=Auto \
+LLAMINAR_CPU_MOE_EXPERT_DOWN_OWNERSHIP=Auto \
+LLAMINAR_CPU_MOE_EXPERT_D_MODEL=2560 LLAMINAR_CPU_MOE_EXPERT_INTERMEDIATE=320 \
+LLAMINAR_CPU_MOE_EXPERT_ACTIVE_EXPERTS=8 LLAMINAR_CPU_MOE_EXPERT_ROUTE_ROWS=8 \
+LLAMINAR_CPU_MOE_EXPERT_PURPOSE=decode LLAMINAR_CPU_MOE_EXPERT_FORMATS=all \
+LLAMINAR_CPU_MOE_EXPERT_DOWN_FORMAT=Q8_0 \
+LLAMINAR_CPU_MOE_EXPERT_POLICY_CSV="$PWD/gate-up-m1.csv" \
+    taskset -c "$PHYSICAL_CORES" "$CMAKE_BUILD/tests/v2/v2_perf_cpu_moe_expert_verifier_rows" \
+    --gtest_filter=Perf_CPUMoEExpertVerifierRows.ProductionGeometryByteExactAndEconomical
+```
+
+At H=2560, use intermediate width 256 for all 21 original sources in both
+roles. At width 320, sweep all Gate/Up sources with Q8_0 Down. A standalone
+K=320 Down source admits seven 32-value-block formats. Sweep one, two, four
+and eight rows per expert, with eight distinct expert weights and the
+admitted ownership policy. Record the effective runtime ISA and the
+original labels even when two formats share a prepared codebook.
+For multiple rows per expert, set the purpose to `mtp` and the total route
+rows to the number of experts times the desired rows per expert.
+
+The AVX-512 sweep passed all 434 source/geometry observations on the two
+28-core sockets, including the 64-expert, width-256 M=1 cells.
+
+The first single-row pass on both 28-core sockets measured these Gate/Up
+intervals with Q8_0 Down and eight live experts. Each row contains the
+range of socket medians.
+
+| Original Gate/Up source | Gate/Up, µs | Whole persistent FFN, µs |
+| --- | ---: | ---: |
+| Q4_K | 30.75–31.35 | 63.43–69.07 |
+| Q5_K | 31.53–32.01 | 70.30–77.37 |
+| IQ3_S | 31.25–31.65 | 64.03–64.50 |
+| Q3_K | 80.19–80.86 | 122.28–125.01 |
+| IQ2_XS | 98.29–109.05 | 134.04–134.96 |
+| IQ2_S | 111.90–112.60 | 146.85–148.33 |
+| IQ1_M | 119.22–120.12 | 155.65–156.50 |
+
+The fixed expert set is reused across samples. Report these as prepared
+projection and FFN latencies. A comparison run with 64 distinct experts
+has a larger working set and still reuses its weights across samples.
+Quantify its physical reads with the memory-controller counters before
+interpreting the ratio of prepared bytes to latency as DRAM efficiency.

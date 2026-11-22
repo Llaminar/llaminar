@@ -12,6 +12,8 @@
  * Disabled paired events and event-free profile modes isolate one real bridge.
  * Optional projection references time the captured weight address pattern after
  * a byte-wise checksum of the identical prepared operand planes.
+ * Replicated drafter timing retains each participant's complete captured MoE
+ * transaction and the compiler resource inventory of its physical kernels.
  */
 #include "../../../utils/IQ2SFusedMoEGpuSourceWitness.h"
 #include <gtest/gtest.h>
@@ -22380,7 +22382,12 @@ namespace
 }
 #endif
 
-/** @test Replay recorded staged bytes through direct SwiGLU packet publication. */
+/**
+ * @test Replay recorded staged bytes through direct SwiGLU packet publication.
+ * Optional projection source overrides exercise the same publication on the
+ * 320-column QFN shard or the 256-column all-source shard. The other
+ * projection uses Q8_0 unless also selected.
+ */
 TEST_F(Test__CUDAMoEKernel, RuntimeGroupedDecodeSwiGLUPublicationReplay)
 {
 #ifndef HAVE_CUDA
@@ -22396,12 +22403,17 @@ TEST_F(Test__CUDAMoEKernel, RuntimeGroupedDecodeSwiGLUPublicationReplay)
     constexpr int num_layers = 1;
     constexpr int seq_len = 1;
     const char *source_probe = std::getenv("LLAMINAR_TEST_CUDA_MOE_M1_SOURCE");
+    const char *gate_probe = std::getenv("LLAMINAR_TEST_CUDA_MOE_M1_GATE_UP_FORMAT");
+    const char *down_probe = std::getenv("LLAMINAR_TEST_CUDA_MOE_M1_DOWN_FORMAT");
+    const char *geometry = std::getenv("LLAMINAR_TEST_CUDA_MOE_M1_GEOMETRY");
+    ASSERT_TRUE(!geometry || ((gate_probe || down_probe) && std::string_view(geometry) == "wide"))
+        << "wide geometry requires explicit M1 projection sources";
     const std::string_view source = source_probe ? source_probe : "iq2_fixture";
-    const bool model_geometry = source_probe != nullptr;
+    const bool model_geometry = source_probe || gate_probe || down_probe;
     const int top_k = qfnFixtureSelectedRoutes(model_geometry);
     const int num_experts = top_k;
     const int d_model = model_geometry ? 2560 : 512;
-    constexpr int intermediate = 320;
+    const int intermediate = geometry ? 256 : 320;
     const auto device = llaminar2::DeviceId::cuda(0);
     std::string_view gate_source = "IQ2_S", down_source = "IQ4_NL";
     if (source == "main")
@@ -22418,6 +22430,12 @@ TEST_F(Test__CUDAMoEKernel, RuntimeGroupedDecodeSwiGLUPublicationReplay)
         gate_source = down_source = "Q8_0";
     else
         ASSERT_EQ(source, "iq2_fixture");
+    if (gate_probe || down_probe)
+    {
+        ASSERT_EQ(source_probe, nullptr) << "select either a named fixture or explicit projection sources";
+        gate_source = gate_probe ? gate_probe : "Q8_0";
+        down_source = down_probe ? down_probe : "Q8_0";
+    }
     const auto formats = cudaMoEGroupedNativeFormats();
     const auto format_named = [&](std::string_view name) {
         return std::find_if(formats.begin(), formats.end(),
@@ -22427,6 +22445,8 @@ TEST_F(Test__CUDAMoEKernel, RuntimeGroupedDecodeSwiGLUPublicationReplay)
     const auto down_format = format_named(down_source);
     ASSERT_NE(gate_format, formats.end());
     ASSERT_NE(down_format, formats.end());
+    ASSERT_EQ(intermediate % (down_format->source_is_superblock ? 256 : 32), 0)
+        << "the Down reduction must contain complete source blocks";
     std::unique_ptr<llaminar2::DeviceWorkspaceManager> projection_workspace;
     if (model_geometry)
     {
@@ -22543,8 +22563,8 @@ TEST_F(Test__CUDAMoEKernel, RuntimeGroupedDecodeSwiGLUPublicationReplay)
     std::vector<llaminar2::ITensor *> gate_outputs, up_outputs;
     for (int slot = 0; slot < top_k; ++slot)
     {
-        gate_rows.push_back(makeZeros({intermediate}));
-        up_rows.push_back(makeZeros({intermediate}));
+        gate_rows.push_back(makeZeros({static_cast<size_t>(intermediate)}));
+        up_rows.push_back(makeZeros({static_cast<size_t>(intermediate)}));
         gate_outputs.push_back(gate_rows.back().get());
         up_outputs.push_back(up_rows.back().get());
     }
@@ -22615,8 +22635,12 @@ TEST_F(Test__CUDAMoEKernel, RuntimeGroupedDecodeSwiGLUPublicationReplay)
     const char *m1_samples = std::getenv("LLAMINAR_TEST_CUDA_MOE_M1_PROBE_JSONL");
     cudaDeviceProp hardware{};
     ASSERT_EQ(cudaGetDeviceProperties(&hardware, 0), cudaSuccess);
-    const bool expect_fixed_reader = model_geometry && source != "iq2_fixture" &&
-        hardware.major == 8 && hardware.minor == 6;
+    namespace native_formats = llaminar2::native_quantised_formats;
+    const auto gate_codebook = gate_format->codebook_id;
+    const bool expect_fixed_reader = model_geometry && !geometry && hardware.major == 8 && hardware.minor == 6 &&
+        (gate_codebook == native_formats::Q4_K.codebook_id ||
+         gate_codebook == native_formats::Q5_K.codebook_id ||
+         gate_codebook == native_formats::Q8_0.codebook_id);
     for (auto node : nodes)
     {
         cudaGraphNodeType type{};
@@ -22714,6 +22738,96 @@ TEST_F(Test__CUDAMoEKernel, RuntimeGroupedDecodeSwiGLUPublicationReplay)
 #endif
 }
 
+namespace
+{
+#ifdef HAVE_CUDA
+    /**
+     * @brief Time the original replicated drafter graph with native CUDA events.
+     * @param path JSONL destination for this qualified diagnostic.
+     * @param graph Retained graph after both replicas have completed warm replay.
+     * @param stream Exact capture and replay stream on @p device.
+     * @param device Physical CUDA participant owning the graph.
+     * @param format Original source format and prepared execution codebook.
+     * @param hidden Participant-local input and output width.
+     * @param intermediate Participant-local expert intermediate width.
+     * @param routes Number of live distinct routed experts.
+     */
+    void measureReplicatedDrafterMoE(const char *path, ScopedCudaTestGraph &graph,
+        cudaStream_t stream, int device, const CUDAMoEFormatCase &format,
+        int hidden, int intermediate, int routes)
+    {
+        using namespace llaminar2::test;
+        using namespace llaminar2::test::cuda_kernel_probe_detail;
+        constexpr int samples = 31;
+        require(cudaSetDevice(device), "bind replicated drafter timing participant");
+        const auto native = graph.nativeGraphForInspection();
+        size_t node_count = 0;
+        require(cudaGraphGetNodes(native, nullptr, &node_count), "count replicated drafter nodes");
+        ASSERT_GT(node_count, 0u);
+        std::vector<cudaGraphNode_t> nodes(node_count);
+        require(cudaGraphGetNodes(native, nodes.data(), &node_count), "inspect replicated drafter nodes");
+        auto kernels = nlohmann::json::array();
+        for (auto node : nodes)
+        {
+            cudaGraphNodeType type{};
+            require(cudaGraphNodeGetType(node, &type), "identify replicated drafter node");
+            if (type == cudaGraphNodeTypeMemset || type == cudaGraphNodeTypeEmpty)
+                continue;
+            ASSERT_EQ(type, cudaGraphNodeTypeKernel) << "drafter MoE capture must stay device-resident";
+            cudaKernelNodeParams params{};
+            const char *name = nullptr;
+            cudaFuncAttributes attributes{};
+            int active_blocks = 0;
+            require(cudaGraphKernelNodeGetParams(node, &params), "inspect replicated drafter launch");
+            require(cudaFuncGetName(&name, params.func), "name replicated drafter kernel");
+            ASSERT_NE(name, nullptr);
+            require(cudaFuncGetAttributes(&attributes, params.func), "inspect replicated drafter resources");
+            require(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active_blocks, params.func,
+                params.blockDim.x * params.blockDim.y * params.blockDim.z, params.sharedMemBytes),
+                "inspect replicated drafter occupancy ceiling");
+            kernels.push_back({{"kernel", name},
+                {"grid", {params.gridDim.x, params.gridDim.y, params.gridDim.z}},
+                {"block", {params.blockDim.x, params.blockDim.y, params.blockDim.z}},
+                {"registers", attributes.numRegs}, {"local_bytes", attributes.localSizeBytes},
+                {"shared_bytes", attributes.sharedSizeBytes + params.sharedMemBytes},
+                {"active_blocks_per_sm_ceiling", active_blocks}});
+        }
+        ASSERT_FALSE(kernels.empty());
+
+        // Each complete replay republishes its route and activation and advances
+        // the same histogram. Keep its scheduler edges and time one graph per
+        // sample. Observe only after the last stop event has retired.
+        std::array<TimingEvent, samples> starts, stops;
+        for (int sample = 0; sample < samples; ++sample)
+        {
+            require(cudaEventRecord(starts[sample].handle, stream), "start replicated drafter sample");
+            ASSERT_TRUE(graph.launch());
+            require(cudaEventRecord(stops[sample].handle, stream), "stop replicated drafter sample");
+        }
+        require(cudaEventSynchronize(stops.back().handle), "observe terminal replicated drafter sample");
+        std::array<double, samples> elapsed{};
+        for (int sample = 0; sample < samples; ++sample)
+        {
+            float ms = 0;
+            require(cudaEventElapsedTime(&ms, starts[sample].handle, stops[sample].handle),
+                "read replicated drafter sample");
+            elapsed[sample] = 1000.0 * ms;
+        }
+
+        const auto *source = llaminar2::native_quantised_formats::forQuantType(format.label);
+        ASSERT_NE(source, nullptr);
+        const auto gate = llaminar2::nativeQuantisedPackedRegionSizes(intermediate, hidden, *source);
+        const auto down = llaminar2::nativeQuantisedPackedRegionSizes(hidden, intermediate, *source);
+        appendCUDAKernelProbeRecords(path, {{{"diagnostic_only", true},
+            {"mode", "replicated_drafter_moe_native_graph"}, {"device_ordinal", device},
+            {"format", format.label}, {"execution_codebook", format.codebook_id},
+            {"m", 1}, {"hidden", hidden}, {"intermediate", intermediate}, {"routes", routes},
+            {"graph_nodes", node_count}, {"kernels", std::move(kernels)}, {"samples_us", elapsed},
+            {"logical_expert_weight_bytes", routes * (2 * gate.logicalBytes() + down.logicalBytes())}}});
+    }
+#endif
+}
+
 /**
  * @brief Prove replicated MTP routed experts produce identical bytes on CUDA2.
  *
@@ -22742,8 +22856,12 @@ TEST_F(Test__CUDAMoEKernel, ReplicatedMTPRoutedExpertCUDA2AllNativeFormatsAreByt
     if (device_count < 2)
         GTEST_SKIP() << "replicated MTP routed-expert regression needs two CUDA devices";
 
+    const char *timing_path = std::getenv("LLAMINAR_TEST_CUDA_MOE_REPLICATED_MTP_TIMING_JSONL");
+    const char *geometry = std::getenv("LLAMINAR_TEST_CUDA_MOE_REPLICATED_MTP_GEOMETRY");
+    ASSERT_TRUE(!geometry || std::string_view(geometry) == "qfn-hidden")
+        << "unknown replicated drafter geometry " << geometry;
     constexpr int seq_len = 1;
-    constexpr int d_model = 2048;
+    const int d_model = geometry ? 2560 : 2048;
     constexpr int intermediate = 512;
     constexpr int num_experts = 256;
     constexpr int top_k = 8;
@@ -23110,16 +23228,17 @@ TEST_F(Test__CUDAMoEKernel, ReplicatedMTPRoutedExpertCUDA2AllNativeFormatsAreByt
         ASSERT_TRUE(runtime0.flipActiveBank(0, update0.epoch, stream_));
         ASSERT_TRUE(runtime1.flipActiveBank(0, update1.epoch, stream1.get()));
 
-        auto hidden0 = makeTensor({seq_len, d_model}, hidden_values);
-        auto hidden1 = makeTensor({seq_len, d_model}, hidden_values);
-        auto router0 = makeTensor({num_experts, d_model}, router_values);
-        auto router1 = makeTensor({num_experts, d_model}, router_values);
+        const auto hidden_columns = static_cast<size_t>(d_model);
+        auto hidden0 = makeTensor({seq_len, hidden_columns}, hidden_values);
+        auto hidden1 = makeTensor({seq_len, hidden_columns}, hidden_values);
+        auto router0 = makeTensor({num_experts, hidden_columns}, router_values);
+        auto router1 = makeTensor({num_experts, hidden_columns}, router_values);
         auto route_indices0 = makeZeros({top_k});
         auto route_indices1 = makeZeros({top_k});
         auto route_weights0 = makeZeros({top_k});
         auto route_weights1 = makeZeros({top_k});
-        auto output0 = makeZeros({d_model});
-        auto output1 = makeZeros({d_model});
+        auto output0 = makeZeros({hidden_columns});
+        auto output1 = makeZeros({hidden_columns});
         auto absolute_position0 = makeZeros({1});
         auto absolute_position1 = makeZeros({1});
         ASSERT_TRUE(hidden0->ensureOnDevice(device0, stream_));
@@ -23219,6 +23338,16 @@ TEST_F(Test__CUDAMoEKernel, ReplicatedMTPRoutedExpertCUDA2AllNativeFormatsAreByt
         ASSERT_EQ(cudaSetDevice(1), cudaSuccess);
         ASSERT_EQ(cudaStreamSynchronize(stream1.get()), cudaSuccess);
 
+        std::vector<float> before_timing;
+        if (timing_path)
+        {
+            before_timing = copy_fp32_device_tensor(output0, 0, stream_);
+            ASSERT_NO_FATAL_FAILURE(measureReplicatedDrafterMoE(
+                timing_path, *graph0, stream_, 0, format, d_model, intermediate, top_k));
+            ASSERT_NO_FATAL_FAILURE(measureReplicatedDrafterMoE(
+                timing_path, *graph1, stream1.get(), 1, format, d_model, intermediate, top_k));
+        }
+
         llaminar2::DeviceMoELayerRuntime runtime0_host{};
         llaminar2::DeviceMoELayerRuntime runtime1_host{};
         ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
@@ -23292,6 +23421,9 @@ TEST_F(Test__CUDAMoEKernel, ReplicatedMTPRoutedExpertCUDA2AllNativeFormatsAreByt
                 output_values0.size() * sizeof(float)),
             0)
             << "replicated CUDA participants produced different routed-expert bytes";
+        if (timing_path)
+            expectBitwiseFP32RowsEqual("replicated drafter before and after timing",
+                output_values0.data(), before_timing.data(), output_values0.size(), d_model);
 
         const auto reuse_records = llaminar2::PerfStatsCollector::snapshot(
             {"kernel.cuda_moe_gateup_reused_router_q8_hidden_calls"});

@@ -585,6 +585,21 @@ packet publications. In the matched captures, the original ticket arrived
 1.02–2.05 µs sooner. The loaded Q4_K/Q5_1 root entry used 106 registers and
 22,148 shared bytes with zero stack and local bytes.
 
+A Release model screen compared that tree with the staged CUDA parent.
+Both arms used the new unsigned Q5 CPU kernel, the original F320/S320 plan,
+one warmup and three 256-token requests per mode. All generated token IDs
+and per-iteration MTP counts matched. The candidate stayed gated after
+the throughput difference changed sign with run order.
+
+| Arm order | Ordinary staged → candidate, tok/s | Fixed depth seven staged → candidate, tok/s |
+| --- | ---: | ---: |
+| Resident first | 30.514 → 29.744 (−2.52%) | 45.062 → 43.758 (−2.89%) |
+| Staged first | 30.317 → 30.455 (+0.45%) | 44.855 → 45.487 (+1.41%) |
+
+A low-priority fixture compiler overlapped some staged samples. These rates
+remain exploratory. The checks of generated IDs and MTP work passed in all
+measured iterations, and the driver log remained stable.
+
 ### Grouped Gate/Up packets and direct Down on SM86
 
 The grouped native program uses one 256-thread CTA per live 32-column
@@ -906,6 +921,23 @@ selected-expert count. The width-specific production preflight replays use
 that setting. The reference fixture keeps every selected route local so it
 can compare a known work volume with the identical captured launch.
 
+For an all-source sweep at this width, set
+`LLAMINAR_TEST_CUDA_MOE_M1_GATE_UP_FORMAT` to each original NativeQuantised
+source in turn and omit `LLAMINAR_TEST_CUDA_MOE_M1_SOURCE`. Use
+`LLAMINAR_TEST_CUDA_MOE_M1_DOWN_FORMAT` for the independent Down sweep.
+The unselected role uses Q8_0. Gate/Up admits all 21 original source formats
+at K=2560. Standalone Down at K=320 admits the seven sources with 32-value
+blocks. Set `LLAMINAR_TEST_CUDA_MOE_M1_GEOMETRY=wide` with the explicit
+source overrides to measure all 21 Down sources at K=256. Every selected
+source is prepared through the native loader and compared byte for byte with
+the staged projection before and after timing.
+
+The two RTX 3090s passed all 98 source/projection observations. Measured
+against the matched weight-read reference on both cards, nine of 21
+Gate/Up sources and five of seven Down sources reached 80% at width 320.
+At Down K=256, three of 21 reached 80%. The largest Gate/Up gaps at M=1
+were IQ1_M at 28.3%, IQ1_S at 29.4%, and IQ2_XXS at 32.3–32.5%.
+
 | QFN stage, ten live routes | Native stage, µs | Matched weight rate |
 | --- | ---: | ---: |
 | Main Q4_K Gate/Up | 17.344 | 84.1% |
@@ -974,6 +1006,13 @@ the seven source formats with 32-value source blocks at Down N=2560 and
 K=320. The `wide` sweep exercises the 256-value-block Down formats at K=256.
 Both QFN-width sweeps retain all 40 routes and compare captured M=4 output
 with the serial-row oracle, including the replay after diagnostic timing.
+
+The current Release sweep on both RTX 3090s cleared the 80% matched
+weight-read reference for 18 of 21 Gate/Up sources and all seven Down
+sources at width 320. The Gate/Up gaps were IQ1_M at 61.8–63.1%, IQ1_S at
+67.1–67.8%, and IQ2_XXS at 73.5–74.3%. At width 256 with 32 live routes, 14
+of 21 sources reached the threshold on both cards in each projection role.
+All sweeps matched the serial oracle byte for byte.
 
 At baseline, 10 of 21 Gate/Up formats and six of seven Down formats
 reached 80% of their matched weight-only rate on both RTX 3090s. The
@@ -1292,6 +1331,35 @@ bytes. Its graph requests 675,430,400 packed weight bytes, which puts the
 measured rate within 0.3% of the independent 879.53 GB/s streaming reference.
 This comparison uses requested bytes. The production trace measures a
 larger captured fragment that also contains the routed fold and other work.
+
+## Replicated drafter routed experts
+
+The CUDA2 replicated-MTP fixture times the original captured route and
+routed-FFN graph on each participant while checking prepared weights, route
+indices and weights, and FP32 expert outputs across both replicas. Capture
+and timing use each replica's exact stream.
+
+```sh
+LLAMINAR_TEST_CUDA_MOE_REPLICATED_MTP_GEOMETRY=qfn-hidden \
+LLAMINAR_TEST_CUDA_MOE_REPLICATED_MTP_TIMING_JSONL="$PWD/replicated-drafter.jsonl" \
+    "$CMAKE_BUILD/tests/v2/v2_integration_cuda_moe_kernel" \
+    --gtest_filter=Test__CUDAMoEKernel.ReplicatedMTPRoutedExpertCUDA2AllNativeFormatsAreByteIdentical
+```
+
+The diagnostic uses H=2560, intermediate width 512, M=1, and eight live
+experts, with all 21 original source formats legal in both projections.
+Omitting the geometry setting uses the preflight fixture's H=2048.
+Each row records 31 device-event samples, logical expert weight bytes, and
+the captured kernel symbols, launch dimensions, registers, and memory
+resources. Use these timings for the complete routed-expert transaction.
+The weight byte field excludes router weights and describes logical requests.
+The geometry provides a common all-source drafter comparison at QFN's hidden
+width. The production QFN sidecar has a separate F640 replay.
+
+Both RTX 3090s matched prepared, route and output bytes for every original
+source. All 42 device/source records captured eight graph nodes and reported
+zero kernel local bytes. The median complete transaction ranged from
+59.39–60.42 µs for IQ2_XXS to 82.94 µs for the three Q8 sources.
 
 ## QFN grouped vocabulary verification
 
