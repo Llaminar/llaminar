@@ -357,3 +357,10 @@ The low-bit IQ1, IQ2 and IQ3 formats range from 42.7% to 73.2% at the
 wide geometry. At the smaller geometry the full stage ranges from
 34.2% to 56.0%. These measurements retain the tested prepared formats
 and fully local route tape.
+
+The mixed 2×CUDA/2×CPU QFN dynamic MTP benchmark produced identical
+256-token histories and per-iteration MTP work in both run orders. With the
+tuned verifier first, median decode was 47.29 tokens/s versus 47.54 for the
+control. With the control first, medians were 47.57 and 48.02 tokens/s for
+control and tuned verifier respectively. Each arm has three measured runs.
+The throughput difference changed direction with run order.
