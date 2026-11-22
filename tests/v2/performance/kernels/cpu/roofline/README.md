@@ -56,6 +56,20 @@ screening runs with one process per width. This host approaches its saturated
 streaming rate before using all 28 physical cores. Any proposed worker count
 still needs to qualify the real projection imbalance and hybrid model timing.
 
+A separate DRAM probe run sampled all six memory-controller channels per
+socket. Over three complete 100 ms windows after first touch, the active
+node read 96.7–98.9 GB/s on node 0 and 95.0–96.7 GB/s on node 1. Each counter
+ran for the full window. The inactive peer read at most 0.30 GB/s. These
+figures describe physical traffic in the profiled run. The quiet medians in
+the table define the requested-byte reference.
+
+A Release model screen used the same 2×CUDA/2×CPU staged binary and requested
+21 workers per socket. The live ranks showed 21 physical worker placements
+each. With one warmup and three 256-token requests per cell, the screen had
+identical token histories and MTP work to the nearby 28-worker control.
+Ordinary and fixed-depth-seven decode fell 2.24% and 2.26%. Prefill fell 4.51%
+and 4.35%.
+
 ## Hybrid target and starting point
 
 The arithmetic and memory targets are 80% of the matching CPU and

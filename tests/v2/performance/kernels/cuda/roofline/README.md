@@ -548,6 +548,12 @@ kernel experiment because both model comparisons lost throughput.
 | Resident first | Fixed depth seven | 44.067 | 43.508 | −1.27% |
 | Staged first | Fixed depth seven | 43.693 | 43.399 | −0.67% |
 
+Two further schedule trials passed the same native byte checks. Assigning
+routed Gate and Up to separate CTAs increased retirement time by 0.51–1.02 µs
+across the six card/format cells. A 128-column routed Down tile improved one
+of the six cells by 1.02 µs and was flat in the other five. The original
+resident schedule retains one CTA per Gate/Up packet and 256-column Down tiles.
+
 ### Grouped Gate/Up packets and direct Down on SM86
 
 The grouped native program uses one 256-thread CTA per live 32-column
