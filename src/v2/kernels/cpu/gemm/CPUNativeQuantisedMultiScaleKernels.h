@@ -396,27 +396,31 @@ namespace llaminar2::cpu::native_quantised::multi_scale
                 dots[Rows - 1] = Ops::dot(dots[Rows - 1], second, I{} + word1);
             }
         };
-        if constexpr (Codebook == 13 || Codebook == 14 || Codebook == 17)
+        if constexpr (Codebook == 13 || Codebook == 14 || Codebook == 15 ||
+                      Codebook == 16 || Codebook == 17)
         {
             const auto quarter = [&]<int Q>() {
                 const auto word = [&](int offset) {
                     return load<I>(unit + offset * 256 + column * 4);
                 };
                 I index = (word(0) >> (Q * 8)) & 255;
-                if constexpr (Codebook == 17)
+                if constexpr (Codebook == 16)
+                    index |= ((word(1) & 0xFFFF) >> (3 * Q) & 7) << 8;
+                else if constexpr (Codebook == 17)
                     index |= ((word(1) >> ((Q / 2) * 8 + (Q % 2) * 4)) & 7) << 8;
-                else
+                else if constexpr (Codebook != 15)
                 {
                     constexpr int bits = Codebook == 13 ? 2 : 1;
                     index |= ((word(1) >> (Q * bits)) & ((1 << bits) - 1)) << 8;
                 }
-                const uint64_t *table = Codebook == 17 ? iq1s_grid
-                    : Codebook == 13 ? iq2s_grid : iq2xs_grid;
+                const uint64_t *table = (Codebook == 17 || Codebook == 16) ? iq1s_grid
+                    : Codebook == 13 ? iq2s_grid
+                    : Codebook == 15 ? iq2xxs_grid : iq2xs_grid;
                 I low, high;
                 Ops::gridPair(table, index, low, high);
-                if constexpr (Codebook != 17)
+                if constexpr (Codebook == 13 || Codebook == 14 || Codebook == 15)
                 {
-                    constexpr int sign_byte = 5 + Q;
+                    constexpr int sign_byte = Codebook == 15 ? 4 + Q : 5 + Q;
                     const I signs = Ops::template repeatByte<sign_byte % 4>(word(sign_byte / 4));
                     low = Ops::template signGrid<0>(low, signs);
                     high = Ops::template signGrid<1>(high, signs);
@@ -467,28 +471,32 @@ namespace llaminar2::cpu::native_quantised::multi_scale
         using I = typename Ops::I;
         if constexpr (usesRowPairs<Ops> && Rows >= 2)
             return dotHalfRowPairs<Codebook, Half, Lanes, Rows, Ops>(unit, column, activation, kb, dots);
-        else if constexpr (Codebook == 13 || Codebook == 14 || Codebook == 17)
+        else if constexpr (Codebook == 13 || Codebook == 14 || Codebook == 15 ||
+                           Codebook == 16 || Codebook == 17)
         {
             const auto quarter = [&]<int Q>() {
                 const auto word = [&](int offset) {
                     return load<I>(unit + offset * 256 + column * 4);
                 };
                 I index = (word(0) >> (Q * 8)) & 255;
-                if constexpr (Codebook == 17)
+                if constexpr (Codebook == 16)
+                    index |= ((word(1) & 0xFFFF) >> (3 * Q) & 7) << 8;
+                else if constexpr (Codebook == 17)
                     index |= ((word(1) >> ((Q / 2) * 8 + (Q % 2) * 4)) & 7) << 8;
-                else
+                else if constexpr (Codebook != 15)
                 {
                     constexpr int bits = Codebook == 13 ? 2 : 1;
                     index |= ((word(1) >> (Q * bits)) & ((1 << bits) - 1)) << 8;
                 }
-                const uint64_t *table = Codebook == 17 ? iq1s_grid
-                    : Codebook == 13 ? iq2s_grid : iq2xs_grid;
+                const uint64_t *table = (Codebook == 17 || Codebook == 16) ? iq1s_grid
+                    : Codebook == 13 ? iq2s_grid
+                    : Codebook == 15 ? iq2xxs_grid : iq2xs_grid;
                 I low, high;
                 Ops::gridPair(table, index, low, high);
                 I signs{};
-                if constexpr (Codebook != 17)
+                if constexpr (Codebook == 13 || Codebook == 14 || Codebook == 15)
                 {
-                    constexpr int sign_byte = 5 + Q;
+                    constexpr int sign_byte = Codebook == 15 ? 4 + Q : 5 + Q;
                     signs = Ops::template repeatByte<sign_byte % 4>(word(sign_byte / 4));
                 }
                 const auto consume = [&]<int H>(I weights) {

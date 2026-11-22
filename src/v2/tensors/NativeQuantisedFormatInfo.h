@@ -99,7 +99,8 @@ namespace llaminar2
         uint8_t codebook) noexcept
     {
         return codebook == 9 || codebook == 10 || codebook == 13 ||
-               codebook == 14 || codebook == 17;
+               codebook == 14 || codebook == 15 || codebook == 16 ||
+               codebook == 17;
     }
 
     /**
