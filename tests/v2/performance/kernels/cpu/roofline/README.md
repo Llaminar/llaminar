@@ -232,6 +232,31 @@ instructions and no vector stack operands.
 
 The 2×CUDA/2×CPU Release comparison combined the ordered CPU pairs and the
 [packed SM86 decode readers](../../cuda/roofline/README.md#route-matched-decode-weight-reference).
+
+## Gate/Up ownership and planning experiments
+
+A 28-worker AVX-512 experiment on both sockets compared the original staged
+Gate/Up and SwiGLU publication against assigning the same worker the two
+projections and its output Q8 packet. All 84 observations across the 21
+source formats matched the original Q8 bytes. The 64-column owner reduced
+the eight-expert workshare from 80 projection tasks to 40 fused tasks.
+Median latency rose by 16.8% at eight experts and 0.8% at 64 experts.
+A 32-column owner restored 80 jobs by splitting the two existing 16-column
+SIMD segments per original weight panel. All 20 observations for Q4_0,
+Q4_1, Q4_K, IQ4_NL and IQ4_XS also matched. Latency rose by a median 10.9%
+at eight experts and 13.3% at 64 experts. Production uses the staged
+ownership measured in these comparisons.
+
+A separate plan-only probe checked the same live NativeQuantised schedule
+for ten representative sources at M=1 and M=4 on both sockets. A single
+planner inside the retained team added a publication barrier and took
+3.7–22.9% longer than the current per-worker plan. Planning once before
+starting the team and adding the measured pre-admitted worker entry cost
+reduced the estimated planning phase by 17.2–39.0% across the 40 cells.
+The native plan checks cover the actual worker count, prepared codebook,
+K partitioning and output ownership. Complete transaction measurements
+must include both plans, each team completion edge and the shared SwiGLU
+publication.
 Both arms used the staged CUDA graph and identical F320/S320 sharding.
 Every arm used one warmup and three measured 256-token requests per mode.
 All generated IDs, prompts, and per-iteration MTP counts matched.
