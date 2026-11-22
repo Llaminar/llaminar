@@ -27,6 +27,7 @@
 #include "kernels/common/SamplingMath.h"
 #include "kernels/common/RouterQ8Launch.h"
 #include "kernels/common/DeviceQ8ActivationNumericalContract.h"
+#include "kernels/common/DeviceSwiGLUNumericalContract.h"
 #include "kernels/cuda/gemm/CUDAMoEGroupedPrefillKernels.h"
 #include "kernels/cuda/moe/CUDAMoEBatchInvariantPolicy.h"
 #include "kernels/cuda/moe/CUDAMoEKernel.h"
@@ -22136,6 +22137,113 @@ namespace
     }
 
     /**
+     * @brief Check the captured QFN publisher at the binary16 scale boundaries.
+     * @param launch Production reducer and its borrowed captured arguments.
+     * @param stream Owning test stream, ordered after the route-map producer.
+     * @param routes Number of live routes in this fixture.
+     * @param columns Complete output width in K32 packets.
+     * @pre The caller replays the whole graph after this check to restore
+     *      the graph-owned partial and publication buffers.
+     */
+    void verifyCapturedQFNSwiGLUScaleBoundaries(
+        const llaminar2::test::cuda_kernel_probe_detail::KernelLaunch &launch,
+        cudaStream_t stream, int routes, int columns)
+    {
+        using namespace llaminar2::test::cuda_kernel_probe_detail;
+        using namespace llaminar2::device_q8_activation_contract;
+        constexpr int packet_width = 32;
+        constexpr int partitions = llaminar2::CUDAMoEBatchInvariantPolicy::gate_up_k_partitions;
+        ASSERT_EQ(columns % packet_width, 0);
+        ASSERT_EQ(launch.params.gridDim.y, static_cast<unsigned>(routes));
+        ASSERT_NE(launch.params.kernelParams, nullptr);
+        const auto argument = [&]<typename T>(size_t index) {
+            size_t offset = 0, size = 0;
+            require(cudaFuncGetParamInfo(launch.params.func, index, &offset, &size),
+                "inspect captured SwiGLU argument");
+            if (size != sizeof(T) || !launch.params.kernelParams[index])
+                throw std::logic_error("captured SwiGLU argument has an unexpected extent");
+            T value{};
+            std::memcpy(&value, launch.params.kernelParams[index], sizeof(value));
+            return value;
+        };
+        ASSERT_EQ(argument.operator()<int>(5), 0);
+        ASSERT_EQ(argument.operator()<int>(6), routes);
+        ASSERT_EQ(argument.operator()<int>(7), columns);
+        auto *gate = argument.operator()<float *>(0);
+        auto *up = argument.operator()<float *>(1);
+        const auto *route_map = argument.operator()<const int *>(2);
+        const auto *codes = argument.operator()<const int8_t *>(3);
+        const auto *scales = argument.operator()<const float *>(4);
+        std::vector<int> grouped(routes);
+        ASSERT_EQ(cudaMemcpyAsync(grouped.data(), route_map, grouped.size() * sizeof(int),
+            cudaMemcpyDeviceToHost, stream), cudaSuccess);
+        ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+        auto sorted_routes = grouped;
+        std::sort(sorted_routes.begin(), sorted_routes.end());
+        for (int route = 0; route < routes; ++route)
+            ASSERT_EQ(sorted_routes[route], route);
+
+        const int packets = columns / packet_width;
+        const size_t elements = static_cast<size_t>(routes) * columns;
+        std::vector<float> gate_input(elements * partitions);
+        std::vector<float> up_input(elements * partitions);
+        std::vector<int8_t> expected_codes(elements), actual_codes(elements);
+        std::vector<float> expected_scales(elements / packet_width), actual_scales(elements / packet_width);
+        constexpr std::array exponents{-36, -26, -22, -14, -7, 0, 8, 24};
+        for (int route = 0; route < routes; ++route)
+        {
+            for (int packet = 0; packet < packets; ++packet)
+            {
+                std::array<float, packet_width> values{};
+                float maximum = 0.0f;
+                const auto sample = static_cast<size_t>(route * packets + packet) % (exponents.size() + 1);
+                for (int lane = 0; lane < packet_width; ++lane)
+                {
+                    const float signed_lane = static_cast<float>(lane % 2 ? -lane - 1 : lane + 1);
+                    const float input = sample == 0 ? 0.0f : std::scalbn(signed_lane, exponents[sample - 1]);
+                    const auto index = static_cast<size_t>(route) * partitions * columns +
+                        packet * packet_width + lane;
+                    gate_input[index] = 1.0f;
+                    up_input[index] = input;
+                    values[lane] = llaminar2::device_swiglu_contract::swigluValue(1.0f, input);
+                    maximum = maximumAbsoluteValue(maximum, values[lane]);
+                }
+                const float scale_value = scale(maximum);
+                const size_t output_packet = static_cast<size_t>(grouped[route]) * packets + packet;
+                expected_scales[output_packet] = scale_value;
+                for (int lane = 0; lane < packet_width; ++lane)
+                    expected_codes[output_packet * packet_width + lane] = static_cast<int8_t>(
+                        quantize(values[lane], scale_value));
+            }
+        }
+        EXPECT_TRUE(std::ranges::any_of(expected_scales, [](float value) { return value == 0x1p-24f; }));
+        EXPECT_TRUE(std::ranges::any_of(expected_scales, [](float value) {
+            return value > 0x1p-24f && value < 0x1p-14f;
+        }));
+        EXPECT_TRUE(std::ranges::any_of(expected_scales, [](float value) { return value == 65504.0f; }));
+        EXPECT_TRUE(std::ranges::any_of(expected_scales, [](float value) { return value == 1.0f; }));
+
+        GraphOwner replay;
+        cudaGraphNode_t node{};
+        ASSERT_EQ(cudaGraphAddKernelNode(&node, replay.graph, nullptr, 0, &launch.params), cudaSuccess);
+        ASSERT_EQ(cudaGraphKernelNodeCopyAttributes(node, launch.source), cudaSuccess);
+        ASSERT_EQ(cudaGraphInstantiate(&replay.executable, replay.graph, 0), cudaSuccess);
+        ASSERT_EQ(cudaMemcpyAsync(gate, gate_input.data(), gate_input.size() * sizeof(float),
+            cudaMemcpyHostToDevice, stream), cudaSuccess);
+        ASSERT_EQ(cudaMemcpyAsync(up, up_input.data(), up_input.size() * sizeof(float),
+            cudaMemcpyHostToDevice, stream), cudaSuccess);
+        ASSERT_EQ(cudaGraphLaunch(replay.executable, stream), cudaSuccess);
+        ASSERT_EQ(cudaMemcpyAsync(actual_codes.data(), codes, actual_codes.size() * sizeof(int8_t),
+            cudaMemcpyDeviceToHost, stream), cudaSuccess);
+        ASSERT_EQ(cudaMemcpyAsync(actual_scales.data(), scales, actual_scales.size() * sizeof(float),
+            cudaMemcpyDeviceToHost, stream), cudaSuccess);
+        ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+        EXPECT_EQ(actual_codes, expected_codes);
+        EXPECT_EQ(std::memcmp(actual_scales.data(), expected_scales.data(),
+            expected_scales.size() * sizeof(float)), 0);
+    }
+
+    /**
      * @brief Calibrate a captured MoE projection with its original weight arguments.
      * @param path JSONL destination for the aligned reader's native-event samples.
      * @param launch Original projection node and borrowed argument storage.
@@ -24660,6 +24768,12 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
                 ASSERT_EQ(direct_publications, 1);
                 ASSERT_TRUE(gate_scatter && gate_reduce)
                     << "the fixture must capture one ordered Gate/Up scatter and publication";
+                if (sm86 && qfn_all_gate && top_k == 10 && gate_source == "Q4_0" &&
+                    !probe_path && !weight_probe_path && !gate_weight_probe_path)
+                {
+                    ASSERT_NO_FATAL_FAILURE(verifyCapturedQFNSwiGLUScaleBoundaries(
+                        *gate_reduce, stream_, seq_len * top_k, intermediate));
+                }
                 for (int repeat = 0; repeat < 3; ++repeat)
                 {
                     ASSERT_TRUE(graph.launchAndPublishOutputs({runtime_prefill_output.get()}));

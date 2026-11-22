@@ -406,6 +406,14 @@ three paired runs per card, the IQ3_XXS stage dropped from 26.752 µs to
 cards, or 79.4–79.6% of the matched weight reference. The 80% counts
 remain 15 of 21 for Gate/Up and seven of seven for Down.
 
+The complete QFN warp now reduces unsigned FP32 magnitude bits with one
+native warp maximum and converts the bounded scale with binary16 RNE.
+The publisher retains the original ordered FP32 fold and Q8 quantizer.
+The focused replay checks output bytes for all-zero, minimum-scale,
+subnormal-scale, and saturated-scale packets. The IQ3_XXS stage went
+from 26.688 to 26.432 µs in the paired runs. The Release sweep measured
+26.432 µs on both cards, or 79.4–80.4% of the matched weight reference.
+
 Forcing the existing grouped INT8 tensor-core engine at four rows
 preserved serial output bytes on the six low-bit sources. The complete
 captured transaction, including routing and publication, ranged from

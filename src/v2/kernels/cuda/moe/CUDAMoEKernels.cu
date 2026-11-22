@@ -21121,6 +21121,8 @@ __global__ void softmax_topk_decode_descriptors_kernel(
      * FP32 gate/up scratch round trip.
      * The launch admits the fixed split-K arithmetic policy, so publication
      * can issue independent partial loads with the original ordered FP32 fold.
+     * The complete QFN warp uses an unsigned magnitude maximum and native
+     * binary16 RNE over the canonical bounded scale range.
      * @tparam FixedColumns Exact admitted QFN pitch, or zero for runtime geometry.
      * @pre The QFN launch covers every column with complete warps and uses one
      *      block for each submitted original route and K32 output group.
@@ -21178,17 +21180,30 @@ __global__ void softmax_topk_decode_descriptors_kernel(
         }
 
         const float value = active ? (silu(gate_sum) * up_sum) : 0.0f;
-        float abs_value =
-            llaminar2::device_q8_activation_contract::maximumAbsoluteValue(
-                value, 0.0f);
+        using namespace llaminar2::device_q8_activation_contract;
+        float scale;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+        if constexpr (FixedColumns > 0)
+        {
+            // Nonnegative FP32 words are ordered as unsigned integers.
+            // The native maximum preserves zero and subnormal magnitudes.
+            const uint32_t magnitude = __float_as_uint(value) & 0x7fffffffu;
+            const float maximum = __uint_as_float(__reduce_max_sync(0xffffffffu, magnitude));
+            const float bounded = boundedScale(maximum);
+            // The clamp admits binary16 subnormals but excludes underflow,
+            // overflow and signed zero. Native RNE publishes the same word.
+            scale = __half2float(__float2half_rn(bounded));
+        }
+        else
+#endif
+        {
+            float abs_value = maximumAbsoluteValue(value, 0.0f);
 #pragma unroll
-        for (int mask = 16; mask > 0; mask >>= 1)
-            abs_value =
-                llaminar2::device_q8_activation_contract::maximumAbsoluteValue(
+            for (int mask = 16; mask > 0; mask >>= 1)
+                abs_value = maximumAbsoluteValue(
                     abs_value, __shfl_xor_sync(0xffffffffu, abs_value, mask));
-
-        const float scale =
-            llaminar2::device_q8_activation_contract::scale(abs_value);
+            scale = llaminar2::device_q8_activation_contract::scale(abs_value);
+        }
         const int blocks_per_row = (N + kTileN - 1) / kTileN;
         if (lane == 0)
             swiglu_scales[static_cast<size_t>(grouped_slot) * static_cast<size_t>(blocks_per_row) +
