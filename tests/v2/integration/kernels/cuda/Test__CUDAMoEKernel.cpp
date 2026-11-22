@@ -24142,7 +24142,8 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
     const bool qfn_main = geometry == "qfn-main";
     const bool qfn_main_q5 = geometry == "qfn-main-q5";
     const bool qfn_width = geometry == "qfn" || qfn_main || qfn_main_q5;
-    ASSERT_TRUE(geometry.empty() || qfn_width || geometry == "iq4" || geometry == "wide");
+    const bool mixed_iq4 = geometry == "iq4-mixed";
+    ASSERT_TRUE(geometry.empty() || qfn_width || geometry == "iq4" || mixed_iq4 || geometry == "wide");
     const bool wide_geometry = !geometry.empty();
     const int selected_routes = qfnFixtureSelectedRoutes(qfn_width);
     const int top_k = wide_geometry ? selected_routes : 4;
@@ -24178,14 +24179,20 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
         if (qfn_width && std::string_view(format.label) != "Q5_1" &&
             std::string_view(format.label) != "Q8_0")
             continue;
-        if (geometry == "iq4" && std::string_view(format.label) != "IQ4_NL" &&
-            std::string_view(format.label) != "IQ4_XS")
+        const std::string_view down_source_format{format.label};
+        const bool iq4_format = down_source_format == "IQ4_NL" || down_source_format == "IQ4_XS";
+        if ((geometry == "iq4" || mixed_iq4) && !iq4_format)
             continue;
         SCOPED_TRACE(format.label);
         const std::string_view gate_source = qfn_main ? "Q4_K" : qfn_main_q5 ? "Q5_K" : format.label;
         const auto gate_format = std::find_if(formats.begin(), formats.end(),
             [gate_source](const auto &candidate) { return candidate.label == gate_source; });
         ASSERT_NE(gate_format, formats.end());
+        const std::string_view up_source = mixed_iq4
+            ? (gate_source == "IQ4_NL" ? "IQ4_XS" : "IQ4_NL") : gate_source;
+        const auto up_format = std::find_if(formats.begin(), formats.end(),
+            [up_source](const auto &candidate) { return candidate.label == up_source; });
+        ASSERT_NE(up_format, formats.end());
         llaminar2::PerfStatsCollector::reset();
 
         auto moe_reqs = llaminar2::MoEWorkspaceBuffers::cudaMoE(
@@ -24255,7 +24262,7 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
                                   701000u + static_cast<uint32_t>(expert),
                                   "gate");
             up_descs[static_cast<size_t>(expert)] =
-                add_prepared_desc(*gate_format, intermediate, d_model,
+                add_prepared_desc(*up_format, intermediate, d_model,
                                   702000u + static_cast<uint32_t>(expert),
                                   "up");
             down_descs[static_cast<size_t>(expert)] =
@@ -24533,7 +24540,7 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
                         if (!gate_weight_probe_path && !probe_path)
                         {
                             const bool fixed_source = qfn_width ? gate_source != "Q8_0"
-                                : gate_source != "IQ4_NL" && gate_source != "IQ4_XS";
+                                : wide_geometry || !iq4_format;
                             const std::string fixed_schedule = "ELi" + std::to_string(intermediate) +
                                 "ELi" + std::to_string(d_model / (32 * partitions)) + "E";
                             EXPECT_EQ(name.contains(fixed_schedule), sm86 && params.blockDim.x == 128 && fixed_source)
@@ -24557,7 +24564,7 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
                                 (source_format == "IQ1_S" || source_format == "IQ1_M" ||
                                  source_format == "IQ2_S" || source_format == "IQ2_XS" ||
                                  source_format == "IQ2_XXS" || source_format == "IQ3_S" ||
-                                 source_format == "IQ3_XXS");
+                                 source_format == "IQ3_XXS" || (sm86 && iq4_format));
                             // The CUDA C++ symbol encodes the captured WideGrid
                             // template argument. Timing mode also measures older
                             // libraries whose leaf predates that argument.

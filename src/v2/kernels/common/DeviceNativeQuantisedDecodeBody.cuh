@@ -356,18 +356,17 @@
     }
 
     /**
-     * @brief Expand eight IQ4_NL codes with register-only byte permutations.
+     * @brief Expand eight IQ4 codes in their existing adjacent nibble order.
      * @param w Four packed bytes, each containing a low and high nibble code.
-     * @param out_lo Four signed lookup bytes for the low nibble of each input byte.
-     * @param out_hi Four signed lookup bytes for the high nibble of each input byte.
+     * @param first Signed lookup bytes for the first four nibbles.
+     * @param last Signed lookup bytes for the last four nibbles.
      *
-     * IQ4_NL and IQ4_XS share this physical lookup after weight preparation.
-     * Decode adjacent nibbles before separating their destinations: this avoids
-     * building two packed selectors and two byte-wise blend masks. No scale,
-     * integer dot product, or FP32 reduction arithmetic changes at any caller.
+     * IQ4_NL and IQ4_XS share the register-only lookup after weight preparation.
+     * A dot product can consume this layout directly after arranging its
+     * activations in the same order.
      */
-    __device__ __forceinline__ void iq4nl_decode_word(
-        uint32_t w, uint32_t &out_lo, uint32_t &out_hi)
+    __device__ __forceinline__ void iq4nl_decode_adjacent_nibbles(
+        uint32_t w, uint32_t &first, uint32_t &last)
     {
         constexpr uint32_t kLut0 = 0xbfad9881u; // vals[0..3]
         constexpr uint32_t kLut1 = 0xf6eaddcfu; // vals[4..7]
@@ -379,16 +378,26 @@
         // use each code's bit 3 to choose the corresponding result byte.
         // 0x3210 preserves positions; OR-ing 4 selects the upper table half.
         const uint32_t halves = 0x32103210u | ((w >> 1) & 0x44444444u);
-        const uint32_t first = __byte_perm(
+        first = __byte_perm(
             __byte_perm(kLut0, kLut1, w),
             __byte_perm(kLut2, kLut3, w), halves);
-        const uint32_t last = __byte_perm(
+        last = __byte_perm(
             __byte_perm(kLut0, kLut1, w >> 16),
             __byte_perm(kLut2, kLut3, w >> 16), halves >> 16);
+    }
 
-        // The two intermediate words hold codes [0..3] and [4..7] in nibble
-        // order. Gather even codes into low bytes and odd codes into high
-        // bytes, retaining the packed dp4a operand layout used by all callers.
+    /**
+     * @brief Expand four low and four high IQ4 nibbles into separate words.
+     * @param w Four packed bytes.
+     * @param out_lo Signed lookup bytes from the four low nibbles.
+     * @param out_hi Signed lookup bytes from the four high nibbles.
+     */
+    __device__ __forceinline__ void iq4nl_decode_word(
+        uint32_t w, uint32_t &out_lo, uint32_t &out_hi)
+    {
+        uint32_t first;
+        uint32_t last;
+        iq4nl_decode_adjacent_nibbles(w, first, last);
         out_lo = __byte_perm(first, last, 0x6420);
         out_hi = __byte_perm(first, last, 0x7531);
     }

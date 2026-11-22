@@ -362,6 +362,22 @@ prepared formats and fully local route tape. The same Release build
 passes ten focused CUDA preflight tests and preserves generated tokens
 in the real 2×CUDA/2×CPU QFN movement regression.
 
+The SM86 wide IQ4 schedule uses adjacent-nibble lookup results directly.
+Gate and Up share the reordered activation and independently resolve their
+physical scales before the packet loop. Down uses the same integer program
+with the canonical ordered K32 fold. The measured Gate/Up launch has 52–54
+registers and room for nine CTAs per SM. Down has 44 registers and room
+for sixteen CTAs per SM. Both report zero stack and local bytes.
+
+| Source | Gate/Up with publication, µs | Matched rate | Down, µs | Matched rate |
+| --- | ---: | ---: | ---: | ---: |
+| IQ4_NL | 22.272 | 81.0% | 9.024–9.088 | 78.2–78.7% |
+| IQ4_XS | 24.448 | 79.8% | 9.024 | 85.1% |
+
+The mixed IQ4 preflight executes both Gate/Up scale orderings against the
+serial-row result. Before and after the shared lookup extraction, the
+compiled ROCm residual reader instruction bytes match for gfx906 and gfx1100.
+
 The mixed 2×CUDA/2×CPU QFN dynamic MTP benchmark produced identical
 256-token histories and per-iteration MTP work in both run orders. With the
 tuned verifier first, median decode was 47.29 tokens/s versus 47.54 for the
