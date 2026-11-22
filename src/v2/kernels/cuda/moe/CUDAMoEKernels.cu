@@ -15647,6 +15647,7 @@ __global__ void softmax_topk_decode_descriptors_kernel(
      * @param down_descs Compact down descriptor table to publish.
      * @param expected_format Storage format shared by the layer's projections.
      * @param expected_projections Exact movable payload required by this plan.
+     * @param gate_contract Fixed Gate/Up geometry validated before publishing both planes.
      * @return True when the expert is locally resident and compute-ready.
      */
     __device__ __forceinline__ bool publish_runtime_expert_descriptors_lane(
@@ -15659,7 +15660,8 @@ __global__ void softmax_topk_decode_descriptors_kernel(
         DeviceNativeQuantisedMatrixDesc *__restrict__ up_descs,
         DeviceNativeQuantisedMatrixDesc *__restrict__ down_descs,
         llaminar2::DeviceMoEWeightFormat expected_format,
-        llaminar2::DeviceMoEProjectionSet expected_projections)
+        llaminar2::DeviceMoEProjectionSet expected_projections,
+        llaminar2::CUDAMoERuntimeGateContract gate_contract = {})
     {
         if (expert >= num_experts)
             return false;
@@ -15679,6 +15681,17 @@ __global__ void softmax_topk_decode_descriptors_kernel(
         if (expected_format ==
             llaminar2::DeviceMoEWeightFormat::NativeQuantised)
         {
+            if (local_ready && gate_contract.enabled() &&
+                (!gate_contract.accepts(desc.gate) || !gate_contract.accepts(desc.up)))
+            {
+                printf("qfn_gate_plan_invalid expert=%d expected_codebook=%u "
+                       "gate_n=%d gate_k=%d gate_codebook=%u up_n=%d up_k=%d up_codebook=%u\n",
+                       expert, static_cast<unsigned>(gate_contract.codebook()),
+                       desc.gate.n, desc.gate.k, static_cast<unsigned>(desc.gate.codebook_id),
+                       desc.up.n, desc.up.k, static_cast<unsigned>(desc.up.codebook_id));
+                FAIL_FAST_INCOMPLETE_LLEP_TRANSFER("QFN Gate/Up runtime plan has incompatible native operands");
+                return false;
+            }
             gate_descs[expert] = local_ready
                                      ? desc.gate
                                      : DeviceNativeQuantisedMatrixDesc{};
@@ -16457,6 +16470,8 @@ __global__ void softmax_topk_decode_descriptors_kernel(
      *
      * @tparam PublishRouterInputs Whether this launch owns initial router-output
      *         conversion (`true`) or post-LLEP regrouping (`false`).
+     * @tparam PublishCompletePlan Publish the compact descriptors with the grouped routes.
+     * @param gate_contract Fixed Gate/Up validation contract or the general validation mode.
      */
     template <bool PublishRouterInputs, bool PublishCompletePlan = false>
     __global__ void prefill_group_small_runtime_kernel(
@@ -16476,7 +16491,8 @@ __global__ void softmax_topk_decode_descriptors_kernel(
         int *__restrict__ active_expert_ids,
         int max_active_experts,
         llaminar2::DeviceMoEWeightFormat expected_format,
-        llaminar2::DeviceMoEProjectionSet expected_projections)
+        llaminar2::DeviceMoEProjectionSet expected_projections,
+        llaminar2::CUDAMoERuntimeGateContract gate_contract)
     {
         // Complete-plan demand is distinct from route retention. Decode,
         // static and sidecar grouping must not count ordinary prefill.
@@ -16754,7 +16770,7 @@ __global__ void softmax_topk_decode_descriptors_kernel(
                         up_descs,
                         down_descs,
                         expected_format,
-                        expected_projections);
+                        expected_projections, gate_contract);
                 }
                 if (is_active)
                 {
@@ -20571,7 +20587,8 @@ __global__ void softmax_topk_decode_descriptors_kernel(
     constexpr int kQFNDecodeGateUpN = llaminar2::CUDAMoEBatchInvariantPolicy::qfn_gate_up_n;
     constexpr int kQFNDecodeGateUpK = llaminar2::CUDAMoEBatchInvariantPolicy::qfn_gate_up_k;
     constexpr int kQFNDecodeGateUpPackets = 5;
-    constexpr unsigned kQFNVerifierRoutesPerToken = 10;
+    constexpr unsigned kQFNVerifierRoutesPerToken =
+        llaminar2::CUDAMoEBatchInvariantPolicy::qfn_verifier_routes_per_token;
     static_assert(kQFNDecodeGateUpK / 32 == kQFNDecodeGateUpPackets *
         llaminar2::CUDAMoEBatchInvariantPolicy::gate_up_k_partitions);
 
@@ -21046,6 +21063,7 @@ __global__ void softmax_topk_decode_descriptors_kernel(
      * @tparam ExactTile Complete 64-column QFN tiles, or zero when bounds are dynamic.
      * @tparam RoutesPerToken Positive when the producer publishes original route
      *         IDs, or zero to resolve the source through the grouped map.
+     * @tparam PlanValidated The matched runtime publisher validated both plane sets.
      * @pre For a complete tile the capture submits the exact column, route and
      *      K-partition extents. Every submitted partition contains five packets.
      * @pre Direct addressing uses the runtime plan which publishes the original
@@ -21053,7 +21071,7 @@ __global__ void softmax_topk_decode_descriptors_kernel(
      */
     template <uint8_t CodebookId, int Pitch = 0, int Packets = 0,
               NativeMoEDotOrder PacketOrder = NativeMoEDotOrder::PartitionPartial,
-              int ExactTile = 0, unsigned RoutesPerToken = 0>
+              int ExactTile = 0, unsigned RoutesPerToken = 0, bool PlanValidated = false>
     __global__ void grouped_native_quantised_gate_up_ordered_kpart_scatter_kernel(
         const int8_t *__restrict__ A_int8,
         const float *__restrict__ scales_A_blockwise,
@@ -21105,7 +21123,9 @@ __global__ void softmax_topk_decode_descriptors_kernel(
 
         const DeviceNativeQuantisedMatrixDesc gate_desc = gate_descs[expert_id];
         const DeviceNativeQuantisedMatrixDesc up_desc = up_descs[expert_id];
-        if (!native_quantised_pair_shape_ok<CodebookId>(gate_desc, up_desc, N, K))
+        if constexpr (PlanValidated)
+            static_assert(ExactTile > 0);
+        else if (!native_quantised_pair_shape_ok<CodebookId>(gate_desc, up_desc, N, K))
             return;
 
         const size_t partial_index =
@@ -25045,7 +25065,7 @@ __attribute__((visibility("default"))) bool cudaMoE_softmax_topk_decode_selected
                 /*active_expert_ids=*/nullptr,
                 /*max_active_experts=*/0,
                 llaminar2::DeviceMoEWeightFormat::NativeQuantised,
-                expected_projections);
+                expected_projections, {});
             return finishGroupedPrefillLaunch(
                 "cudaMoE_prefill_group_small_runtime", cuda_stream);
         }
@@ -25102,7 +25122,8 @@ __attribute__((visibility("default"))) bool cudaMoE_softmax_topk_decode_selected
         llaminar2::DeviceMoEWeightFormat expected_format,
         int device_idx,
         void *stream,
-        llaminar2::DeviceMoEProjectionSet expected_projections)
+        llaminar2::DeviceMoEProjectionSet expected_projections,
+        llaminar2::CUDAMoERuntimeGateContract gate_contract)
     {
         const auto demand = static_cast<llaminar2::MoEGroupedPlanDemand>(grouped_demand);
         if (!llaminar2::validMoEGroupedPlanDemand(demand)) return false;
@@ -25121,6 +25142,13 @@ __attribute__((visibility("default"))) bool cudaMoE_softmax_topk_decode_selected
         {
             return false;
         }
+
+        if (gate_contract.enabled() &&
+            (expected_format != llaminar2::DeviceMoEWeightFormat::NativeQuantised ||
+             top_k != llaminar2::CUDAMoEBatchInvariantPolicy::qfn_verifier_routes_per_token ||
+             current_slots != top_k * llaminar2::CUDAMoEBatchInvariantPolicy::qfn_verifier_gate_plan_rows ||
+             max_slots != current_slots))
+            return false;
 
         cudaSetDevice(device_idx);
         cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
@@ -25146,7 +25174,7 @@ __attribute__((visibility("default"))) bool cudaMoE_softmax_topk_decode_selected
                 active_expert_ids,
                 max_active_experts,
                 expected_format,
-                expected_projections);
+                expected_projections, gate_contract);
             return finishGroupedPrefillLaunch(
                 "cudaMoE_prefill_group_and_plan_small_runtime", cuda_stream);
         }
@@ -25229,7 +25257,7 @@ __attribute__((visibility("default"))) bool cudaMoE_softmax_topk_decode_selected
                 /*active_expert_ids=*/nullptr,
                 /*max_active_experts=*/0,
                 llaminar2::DeviceMoEWeightFormat::NativeQuantised,
-                llaminar2::DeviceMoEProjectionSet::CompleteExpert);
+                llaminar2::DeviceMoEProjectionSet::CompleteExpert, {});
             return finishGroupedPrefillLaunch(
                 "cudaMoE_prefill_regroup_small_runtime", cuda_stream);
         }
@@ -25280,7 +25308,8 @@ __attribute__((visibility("default"))) bool cudaMoE_softmax_topk_decode_selected
         llaminar2::DeviceMoEWeightFormat expected_format,
         int device_idx,
         void *stream,
-        llaminar2::DeviceMoEProjectionSet expected_projections)
+        llaminar2::DeviceMoEProjectionSet expected_projections,
+        llaminar2::CUDAMoERuntimeGateContract gate_contract)
     {
         const auto demand = static_cast<llaminar2::MoEGroupedPlanDemand>(grouped_demand);
         if (!llaminar2::validMoEGroupedPlanDemand(demand)) return false;
@@ -25299,6 +25328,13 @@ __attribute__((visibility("default"))) bool cudaMoE_softmax_topk_decode_selected
         {
             return false;
         }
+
+        if (gate_contract.enabled() &&
+            (expected_format != llaminar2::DeviceMoEWeightFormat::NativeQuantised ||
+             top_k != llaminar2::CUDAMoEBatchInvariantPolicy::qfn_verifier_routes_per_token ||
+             current_slots != top_k * llaminar2::CUDAMoEBatchInvariantPolicy::qfn_verifier_gate_plan_rows ||
+             max_slots != current_slots))
+            return false;
 
         cudaSetDevice(device_idx);
         cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
@@ -25324,7 +25360,7 @@ __attribute__((visibility("default"))) bool cudaMoE_softmax_topk_decode_selected
                 active_expert_ids,
                 max_active_experts,
                 expected_format,
-                expected_projections);
+                expected_projections, gate_contract);
             return finishGroupedPrefillLaunch(
                 "cudaMoE_prefill_regroup_and_plan_small_runtime", cuda_stream);
         }
@@ -26541,6 +26577,7 @@ __attribute__((visibility("default"))) bool cudaMoE_softmax_topk_decode_selected
      * @param device_idx CUDA ordinal that owns every supplied pointer.
      * @param stream Exact non-null producer stream embedded by graph capture.
      * @param execution Phase and full-source/local-column arithmetic identity.
+     * @param gate_contract Validation contract borrowed from the ordered runtime publisher.
      * @return true after all launches have been enqueued without launch errors.
      */
     bool cudaMoE_grouped_prefill_pipeline(
@@ -26595,7 +26632,8 @@ __attribute__((visibility("default"))) bool cudaMoE_softmax_topk_decode_selected
             imma_gateup_schedule,
         int device_idx,
         void *stream,
-        const llaminar2::MoEPrefillProjectionExecution &execution)
+        const llaminar2::MoEPrefillProjectionExecution &execution,
+        llaminar2::CUDAMoERuntimeGateContract gate_contract)
     {
         // One LUT family producer handles both factor programs; each actual
         // descriptor remains untouched and selects its own source scale.
@@ -26824,9 +26862,9 @@ __attribute__((visibility("default"))) bool cudaMoE_softmax_topk_decode_selected
                             ? NativeMoEDotOrder::VerifierWideGrid : NativeMoEDotOrder::VerifierK32;
                         constexpr auto unrolled = NativeMoEDotOrder::PartitionPartial;
                         const auto issue = [&]<int Pitch, int Packets, NativeMoEDotOrder Order,
-                                               int ExactTile = 0, unsigned RoutesPerToken = 0>() {
+                                               int ExactTile = 0, unsigned RoutesPerToken = 0, bool PlanValidated = false>() {
                             grouped_native_quantised_gate_up_ordered_kpart_scatter_kernel<
-                                CodebookId, Pitch, Packets, Order, ExactTile, RoutesPerToken>
+                                CodebookId, Pitch, Packets, Order, ExactTile, RoutesPerToken, PlanValidated>
                                 <<<scatter_grid, block, 0, cuda_stream>>>(
                                     gateup_input, gateup_scales, source_rows, d_gate_desc_table, d_up_desc_table,
                                     d_original_to_grouped, d_original_expert_ids, d_gate_partials, d_up_partials,
@@ -26841,16 +26879,22 @@ __attribute__((visibility("default"))) bool cudaMoE_softmax_topk_decode_selected
                                 {
                                     if (kTileN == 64)
                                     {
+                                        const auto exact = [&]<unsigned RoutesPerToken>() {
+                                            if (gate_contract.enabled() && gate_contract.codebook() == CodebookId)
+                                                return issue.template operator()<kQFNDecodeGateUpN,
+                                                    kQFNDecodeGateUpPackets, packed, 64, RoutesPerToken, true>();
+                                            return issue.template operator()<kQFNDecodeGateUpN,
+                                                kQFNDecodeGateUpPackets, packed, 64, RoutesPerToken>();
+                                        };
                                         if constexpr (CodebookId == native_formats::IQ1_S.codebook_id ||
                                                       CodebookId == native_formats::IQ2_XXS.codebook_id)
                                         {
-                                            if (seq_len == 4 && static_cast<unsigned>(top_k) ==
-                                                kQFNVerifierRoutesPerToken && grouped_indices_are_route_slots)
-                                                return issue.template operator()<kQFNDecodeGateUpN,
-                                                    kQFNDecodeGateUpPackets, packed, 64, kQFNVerifierRoutesPerToken>();
+                                            if (seq_len == llaminar2::CUDAMoEBatchInvariantPolicy::qfn_verifier_gate_plan_rows &&
+                                                static_cast<unsigned>(top_k) == kQFNVerifierRoutesPerToken &&
+                                                grouped_indices_are_route_slots)
+                                                return exact.template operator()<kQFNVerifierRoutesPerToken>();
                                         }
-                                        return issue.template operator()<
-                                            kQFNDecodeGateUpN, kQFNDecodeGateUpPackets, packed, 64>();
+                                        return exact.template operator()<0>();
                                     }
                                 }
                                 return issue.template operator()<kQFNDecodeGateUpN, kQFNDecodeGateUpPackets, packed>();

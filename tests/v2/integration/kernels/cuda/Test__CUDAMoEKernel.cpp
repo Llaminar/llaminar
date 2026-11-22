@@ -24693,11 +24693,15 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
                             const bool direct_activation = exact_qfn_tile && top_k == 10 &&
                                 (gate_reader == native_formats::IQ1_S.codebook_id ||
                                  gate_reader == native_formats::IQ2_XXS.codebook_id);
-                            EXPECT_EQ(name.contains("ELi64ELj0EEE") || name.contains("ELi64ELj10EEE"),
+                            const bool plan_validated = exact_qfn_tile && top_k == 10;
+                            EXPECT_EQ(name.contains("ELi64ELj"),
                                 exact_qfn_tile)
                                 << gate_source << " captured the wrong QFN tile";
-                            EXPECT_EQ(name.contains("ELi64ELj10EEE"), direct_activation)
+                            EXPECT_EQ(name.contains("ELi64ELj10E"), direct_activation)
                                 << gate_source << " captured the wrong original-route address";
+                            const auto admitted_symbol = direct_activation ? "ELi64ELj10ELb1EEE" : "ELi64ELj0ELb1EEE";
+                            EXPECT_EQ(name.contains(admitted_symbol), plan_validated)
+                                << gate_source << " captured the wrong descriptor-validation owner";
                         }
                     }
                     if (name.contains("grouped_native_quantised_gate_up_ordered_kpart_reduce_swiglu_kernel"))

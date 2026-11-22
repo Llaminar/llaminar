@@ -160,6 +160,9 @@ namespace llaminar2
         /** @return The last successfully published static producer's origin. */
         [[nodiscard]] MoEPrefillRouteScope scope() const noexcept { return scope_; }
 
+        /** @return Capture-time identity revoked when any grouping replaces its bindings. */
+        [[nodiscard]] uint64_t generation() const noexcept { return generation_; }
+
         /** @brief Authenticate a consuming projection against its original grouping.
          * @param rows Actual physical projection rows, not the current live count.
          * @param top_k Original route slots per token.

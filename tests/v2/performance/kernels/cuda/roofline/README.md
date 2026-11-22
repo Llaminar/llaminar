@@ -423,6 +423,27 @@ bytes. Across six focused Release runs, Gate/Up took 27.712–27.904 µs
 for IQ2_XS and 26.304–26.368 µs for IQ3_XXS. IQ3_XXS reached 80.05–81.27%
 in those runs and 79.6–80.4% in the full-format sweep.
 
+For the six low-bit 64-column readers, the complete runtime plan now checks
+both prepared descriptor planes before publishing them. Each projection
+uses the validated publication for its exact stream and workspace. The
+compiled tiles remove six load instructions and 16–20 comparisons, with
+the same 40–62 registers and zero shared, stack, or local bytes. One full
+sweep reached 80% on both RTX 3090s for 18 of 21 Gate/Up formats. A second
+sweep reached 80% on both cards for 16 formats. IQ2_S and IQ2_XS varied
+around 80% because the matched reader timings varied between runs. All 21
+formats matched serial output bytes in both sweeps. The paired complete
+captured verifier transactions changed by less than 0.6% in either
+direction, including the plan checks.
+
+| Source | Release Gate/Up with publication, µs | Matched weight rate |
+| --- | ---: | ---: |
+| IQ1_M | 27.456–27.584 | 60.1–61.3% |
+| IQ1_S | 24.832–25.024 | 65.7–67.3% |
+| IQ2_S | 27.648–27.840 | 79.6–80.3% |
+| IQ2_XS | 27.200–27.392 | 79.0–80.9% |
+| IQ2_XXS | 22.080–22.208 | 72.9–73.7% |
+| IQ3_XXS | 26.240 | 80.2–81.0% |
+
 Forcing the existing grouped INT8 tensor-core engine at four rows
 preserved serial output bytes on the six low-bit sources. The complete
 captured transaction, including routing and publication, ranged from

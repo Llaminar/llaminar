@@ -62,6 +62,7 @@
 #include <numeric>
 #include <stdexcept>
 #include <unordered_map>
+#include <utility>
 
 extern "C" bool cudaNativeQuantisedInitIQGridTables_tuned();
 
@@ -1696,7 +1697,8 @@ extern "C"
         llaminar2::DeviceMoEWeightFormat expected_format,
         int device_idx,
         void *stream,
-        llaminar2::DeviceMoEProjectionSet expected_projections);
+        llaminar2::DeviceMoEProjectionSet expected_projections,
+        llaminar2::CUDAMoERuntimeGateContract gate_contract);
 
     bool cudaMoE_regroup_prefill_routes_runtime_assignments(
         void *runtime,
@@ -1725,7 +1727,8 @@ extern "C"
         llaminar2::DeviceMoEWeightFormat expected_format,
         int device_idx,
         void *stream,
-        llaminar2::DeviceMoEProjectionSet expected_projections);
+        llaminar2::DeviceMoEProjectionSet expected_projections,
+        llaminar2::CUDAMoERuntimeGateContract gate_contract);
 
     bool cudaMoE_commit_grouped_verifier_histograms(
         void *runtime,
@@ -1991,7 +1994,8 @@ extern "C"
             imma_gateup_schedule,
         int device_idx,
         void *stream,
-        const llaminar2::MoEPrefillProjectionExecution &execution);
+        const llaminar2::MoEPrefillProjectionExecution &execution,
+        llaminar2::CUDAMoERuntimeGateContract gate_contract = {});
 
 
     bool cudaMoE_reduce_canonical_route_contributions(
@@ -2611,6 +2615,7 @@ namespace llaminar2
             original_m1_hidden_q8_read_lifecycle_=OriginalM1HiddenQ8ReadLifecycle::Invalidated;
         original_m1_hidden_q8_read_.reset();
         grouped_prefill_grouping_.invalidate();
+        runtime_gate_plan_.reset();
         d_staging_indices_ = nullptr;
         d_staging_weights_ = nullptr;
         staging_capacity_ = 0;
@@ -3246,6 +3251,7 @@ namespace llaminar2
     void CUDAMoEKernel::resetDynamicState()
     {
         grouped_prefill_grouping_.invalidate();
+        runtime_gate_plan_.reset();
         /*
          * This hook is reached only on hard kernel-dynamic reset boundaries.
          * Replay-preserving request reset deliberately avoids
@@ -6897,6 +6903,7 @@ namespace llaminar2
                                                   int *d_grouped_token_indices, float *d_grouped_weights)
     {
         grouped_prefill_grouping_.invalidate();
+        runtime_gate_plan_.reset();
         const int total_slots = seq_len * top_k;
         void *stream = requireStream("CUDAMoEKernel::groupTokensByExpertDevice");
         // One graph node resets every publication, including padded/remote
@@ -6942,6 +6949,7 @@ namespace llaminar2
         bool retain_routes_for_deferred_commit)
     {
         grouped_prefill_grouping_.invalidate();
+        runtime_gate_plan_.reset();
         if (!runtime_layer || !routing_indices || !routing_weights)
         {
             LOG_ERROR("[CUDAMoEKernel::groupPrefillRoutes] null runtime or routing tensor");
@@ -7013,6 +7021,7 @@ namespace llaminar2
         bool retain_routes_for_deferred_commit)
     {
         grouped_prefill_grouping_.invalidate();
+        runtime_gate_plan_.reset();
         if (!runtime_layer ||
             current_tokens < 0 || max_tokens <= 0 ||
             current_tokens > max_tokens || num_experts <= 0 || top_k <= 0)
@@ -7040,6 +7049,22 @@ namespace llaminar2
             stream);
     }
 
+    CUDAMoERuntimeGateContract CUDAMoEKernel::runtimeGateContract(
+        const GroupedGateUpDescriptorTable &table, int rows, int capacity, int top_k) const
+    {
+        if (rows != CUDAMoEBatchInvariantPolicy::qfn_verifier_gate_plan_rows ||
+            capacity != rows || top_k != CUDAMoEBatchInvariantPolicy::qfn_verifier_routes_per_token ||
+            table.weight_format != DeviceMoEWeightFormat::NativeQuantised)
+            return {};
+        const auto contract = CUDAMoERuntimeGateContract::qfn(
+            table.intermediate, table.d_model, table.codebook_id);
+        if (!contract.enabled() || table.codebook_mask != (1u << contract.codebook()))
+            return {};
+        const auto &hardware = cudaHardwareMetadata().at(device_ordinal_);
+        return hardware.sm_major == 8 && hardware.sm_minor == 6
+                   ? contract : CUDAMoERuntimeGateContract{};
+    }
+
     bool CUDAMoEKernel::publishCompleteGroupedPrefillPlanFromRouter(
         DeviceMoELayerRuntime *runtime_layer,
         ITensor *routing_indices,
@@ -7055,6 +7080,7 @@ namespace llaminar2
         DeviceMoEProjectionSet expected_projections)
     {
         grouped_prefill_grouping_.invalidate();
+        runtime_gate_plan_.reset();
         if (!validMoEGroupedPlanDemand(demand) || !runtime_layer || !routing_indices || !routing_weights ||
             current_tokens < 0 || max_tokens <= 0 || current_tokens > max_tokens ||
             num_experts <= 0 || top_k <= 0 ||
@@ -7130,7 +7156,8 @@ namespace llaminar2
         const auto *device_weights =
             static_cast<const float *>(routing_weights->gpu_data_ptr());
         const int max_active_experts = std::min(max_slots, num_experts);
-        return device_indices && device_weights &&
+        const auto gate_contract = runtimeGateContract(gateup_table, current_tokens, max_tokens, top_k);
+        const bool submitted = device_indices && device_weights &&
                cudaMoE_group_prefill_routes_and_materialize_plan_runtime(
                    device_indices,
                    device_weights,
@@ -7149,7 +7176,12 @@ namespace llaminar2
                    static_cast<int>(demand),
                    gateup_table.weight_format,
                    device_ordinal_,
-                   stream, expected_projections);
+                   stream, expected_projections, gate_contract);
+        if (submitted && gate_contract.enabled())
+            runtime_gate_plan_ = RuntimeGatePlanPublication{
+                gate_contract, runtime_layer, runtime_gate_descs, runtime_up_descs,
+                d_group_original_to_grouped_, stream, grouped_prefill_grouping_.generation(), num_experts};
+        return submitted;
     }
 
     bool CUDAMoEKernel::publishCompleteGroupedPrefillPlanFromRuntimeAssignments(
@@ -7164,6 +7196,7 @@ namespace llaminar2
         DeviceMoEProjectionSet expected_projections)
     {
         grouped_prefill_grouping_.invalidate();
+        runtime_gate_plan_.reset();
         if (!validMoEGroupedPlanDemand(demand) || !runtime_layer ||
             current_tokens < 0 || max_tokens <= 0 || current_tokens > max_tokens ||
             num_experts <= 0 || top_k <= 0 ||
@@ -7229,7 +7262,8 @@ namespace llaminar2
             return false;
         }
 
-        return cudaMoE_regroup_prefill_routes_and_materialize_plan_runtime(
+        const auto gate_contract = runtimeGateContract(gateup_table, current_tokens, max_tokens, top_k);
+        const bool submitted = cudaMoE_regroup_prefill_routes_and_materialize_plan_runtime(
             static_cast<void *>(runtime_layer),
             d_group_original_to_grouped_,
             runtime_gate_descs,
@@ -7244,7 +7278,12 @@ namespace llaminar2
             static_cast<int>(demand),
             gateup_table.weight_format,
             device_ordinal_,
-            stream, expected_projections);
+            stream, expected_projections, gate_contract);
+        if (submitted && gate_contract.enabled())
+            runtime_gate_plan_ = RuntimeGatePlanPublication{
+                gate_contract, runtime_layer, runtime_gate_descs, runtime_up_descs,
+                d_group_original_to_grouped_, stream, grouped_prefill_grouping_.generation(), num_experts};
+        return submitted;
     }
 
     bool CUDAMoEKernel::commitGroupedVerifierHistograms(
@@ -9548,6 +9587,8 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
               !canonical_route_contributions)))
             return false;
 
+        const uint64_t publication_generation = grouped_prefill_grouping_.generation();
+        const auto published_gate = std::exchange(runtime_gate_plan_, std::nullopt);
         grouped_prefill_grouping_.invalidate();
         if (!device_runtime_layer)
             return false;
@@ -9923,6 +9964,24 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
          * inverse map and removes reconstruction work from every MoE layer.
          */
 
+        CUDAMoERuntimeGateContract gate_contract;
+        if (execution.executesGateUp() && published_gate)
+        {
+            const auto expected = runtimeGateContract(gateup_table, seq_len, seq_len, top_k);
+            if (published_gate->generation != publication_generation || !expected.enabled() ||
+                expected.codebook() != published_gate->contract.codebook() ||
+                published_gate->runtime != device_runtime_layer ||
+                published_gate->gate != runtime_gate_descs || published_gate->up != runtime_up_descs ||
+                published_gate->original_to_grouped != d_group_original_to_grouped_ ||
+                published_gate->stream != stream || published_gate->experts != num_experts)
+            {
+                LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillProjectionFromPublishedRuntimePlan] "
+                          "QFN Gate/Up validation belongs to a different runtime publication");
+                return false;
+            }
+            gate_contract = published_gate->contract;
+        }
+
         const bool ok = execution.overwriteOutputThenPublish(
             execution.executesDown() ? static_cast<float *>(publication_output->gpu_data_ptr()) : nullptr,
             execution.executesDown() ? publication_output->size_bytes() : 0u,
@@ -9987,7 +10046,7 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
                     prefill_policy.imma_down_columns,
                     prefill_policy.imma_gateup_schedule,
                     device_ordinal_,
-                    producer_stream, execution);
+                    producer_stream, execution, gate_contract);
             },
             [&](const EnqueuedWorkspaceRead<float> &read)
             {
@@ -11686,6 +11745,8 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
                           "failed to bind graph-owned runtime descriptor slots");
                 return false;
             }
+            // Selected decode rewrites these same compact descriptor slots.
+            runtime_gate_plan_.reset();
             if (!cudaMoE_materialize_runtime_selected_decode_descriptors(
                 runtime_layer, d_expert_ids, runtime_gate_descs, runtime_up_descs,
                 runtime_down_descs, gateup_table.num_experts, top_k,
