@@ -195,3 +195,33 @@ It uses 44 registers per thread. The four grouped readers and serial
 Q5_1 use zero local bytes. Measurements use 31 samples per arm and card.
 The wide-format replay verifies both the captured reader selection and
 byte equality with serial decode.
+
+## Route-matched Down weight reference
+
+The verifier fixture can reuse the original capture arguments to measure a
+weight-only reference. The reader retains the prepared addresses, original
+route order, grid, and output stores. It checks an aligned packet checksum
+against an independent byte-wise implementation before taking timing samples.
+The final verifier replay checks the original output bytes again after the
+diagnostic overwrites its scratch.
+
+```sh
+CUDA_VISIBLE_DEVICES=0 \
+LLAMINAR_TEST_CUDA_MOE_M4_DOWN_GEOMETRY=wide \
+LLAMINAR_TEST_CUDA_MOE_VERIFIER_DOWN_WEIGHT_REFERENCE_JSONL="$PWD/weight-reference.jsonl" \
+    "$CMAKE_BUILD/tests/v2/v2_integration_cuda_moe_kernel" \
+    --gtest_filter=Test__CUDAMoEKernel.RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRuntimeDecodeRows
+```
+
+Compare the medians for `verifier_routed_down_weight_planes` and
+`verifier_routed_down` from the same run. Both request the same logical
+weight extent. The reference time divided by the Down time estimates
+how much of the measured weight-only rate the complete leaf sustains.
+The reference includes descriptor reads and checksum stores. Kernel
+arithmetic, activation traffic, and physical DRAM and L2 counters must
+be measured separately for a whole-leaf roofline.
+
+With 31 samples per format and card, 12 of 21 source formats sustain at
+least 80% of the weight-only rate at M=4, N=2560, K=256 on both RTX 3090s.
+At N=512 and K=256 the highest rate is 77.8%. At the QFN-shaped N=2560
+and K=320, Q5_1 and Q8_0 sustain 94.8% and 96.0–96.3% respectively.

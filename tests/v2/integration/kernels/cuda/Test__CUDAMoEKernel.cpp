@@ -10,6 +10,8 @@
  * Retained original rank-bank publication guards all route/bank/guard bytes
  * at QFN prefill geometry, including nonfinite copies and dirty live prefixes.
  * Disabled paired events and event-free profile modes isolate one real bridge.
+ * An optional Down reference times the captured weight address pattern after
+ * a byte-wise checksum of the identical prepared operand planes.
  */
 #include "../../../utils/IQ2SFusedMoEGpuSourceWitness.h"
 #include <gtest/gtest.h>
@@ -54,6 +56,7 @@
 #include "utils/DebugEnv.h"
 #include "utils/PerfStatsCollector.h"
 
+#include "../../../performance/kernels/cuda/roofline/CUDAMoEDownWeightReference.h"
 #include "../../../utils/CUDACapturedKernelProbe.h"
 #include "../../../utils/GpuPreparedGemmHarness.h"
 #include "../../../utils/MoEOverlayServiceTelemetryCoverageTest.h"
@@ -24233,6 +24236,9 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
                 grouped_values.size(),
                 static_cast<size_t>(d_model));
             const char *probe_path = std::getenv("LLAMINAR_TEST_CUDA_MOE_VERIFIER_DOWN_PROBE_JSONL");
+            const char *weight_probe_path =
+                std::getenv("LLAMINAR_TEST_CUDA_MOE_VERIFIER_DOWN_WEIGHT_REFERENCE_JSONL");
+            const char *timing_path = probe_path ? probe_path : weight_probe_path;
             if (seq_len == 4)
             {
                 ScopedCudaTestGraph graph(stream_, "M4 original-route Down publication");
@@ -24296,7 +24302,7 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
                     expectBitwiseFP32RowsEqual("captured M4 direct Down publication",
                         replay.data(), serial_values.data(), replay.size(), d_model);
                 }
-                if (probe_path)
+                if (timing_path)
                 {
                     using namespace llaminar2::test;
                     using namespace llaminar2::test::cuda_kernel_probe_detail;
@@ -24328,7 +24334,49 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
                     records.front()["logical_weight_request_bytes"] =
                         packed.logicalBytes() * routes.size();
                     records.front()["execution_codebook"] = format.codebook_id;
-                    appendCUDAKernelProbeRecords(probe_path, records);
+                    appendCUDAKernelProbeRecords(timing_path, records);
+                    if (weight_probe_path)
+                    {
+                        ASSERT_EQ(d_model % 4, 0);
+                        const size_t words = canonical_route_contributions->numel();
+                        const auto *output = canonical_route_contributions->gpu_data_ptr();
+                        std::vector<uint32_t> oracle_output(words), aligned_output(words);
+                        const auto read_planes = [&](CUDAWeightPacketAccess access,
+                            GraphOwner &reader, std::vector<uint32_t> &result) {
+                            auto packet_params = down_params;
+                            packet_params.func = const_cast<void *>(
+                                cudaMoEDownWeightReferenceEntry(format.codebook_id, access));
+                            ASSERT_NE(packet_params.func, nullptr);
+                            cudaGraphNode_t packet_node{};
+                            ASSERT_EQ(cudaGraphAddKernelNode(&packet_node, reader.graph, nullptr, 0,
+                                &packet_params), cudaSuccess);
+                            ASSERT_EQ(cudaGraphKernelNodeCopyAttributes(packet_node, down_source), cudaSuccess);
+                            ASSERT_EQ(cudaGraphInstantiate(&reader.executable, reader.graph, 0), cudaSuccess);
+                            ASSERT_EQ(cudaGraphLaunch(reader.executable, stream_), cudaSuccess);
+                            ASSERT_EQ(cudaMemcpyAsync(result.data(), output, words * sizeof(uint32_t),
+                                cudaMemcpyDeviceToHost, stream_), cudaSuccess);
+                            ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+                        };
+                        // This isolated diagnostic may overwrite the captured
+                        // route output. Replay the producer below before any
+                        // later consumer observes that scratch.
+                        GraphOwner oracle, aligned;
+                        ASSERT_NO_FATAL_FAILURE(read_planes(CUDAWeightPacketAccess::ByteOracle, oracle, oracle_output));
+                        ASSERT_NO_FATAL_FAILURE(read_planes(CUDAWeightPacketAccess::Aligned, aligned, aligned_output));
+                        ASSERT_EQ(std::memcmp(oracle_output.data(), aligned_output.data(), words * sizeof(uint32_t)), 0);
+                        ASSERT_TRUE(std::any_of(aligned_output.begin(), aligned_output.end(),
+                            [](uint32_t value) { return value != 0; }));
+                        auto weight_records = probeIndependentCUDAKernels(aligned.graph, stream_,
+                            CUDAIndependentKernelFixture::StatelessProjection,
+                            {.operation = "verifier_routed_down_weight_planes", .format = format.label,
+                             .m = seq_len, .n = d_model, .k = intermediate});
+                        ASSERT_EQ(weight_records.size(), 1u);
+                        weight_records.front()["logical_weight_request_bytes"] =
+                            packed.logicalBytes() * routes.size();
+                        weight_records.front()["execution_codebook"] = format.codebook_id;
+                        weight_records.front()["checksum_matches_scalar"] = true;
+                        appendCUDAKernelProbeRecords(weight_probe_path, weight_records);
+                    }
                     ASSERT_TRUE(graph.launchAndPublishOutputs({runtime_prefill_output.get()}));
                     const auto replay = copyCudaFP32TensorToHost(runtime_prefill_output, stream_);
                     expectBitwiseFP32RowsEqual("captured M4 direct Down after isolated timing",
