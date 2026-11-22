@@ -156,6 +156,7 @@
 #include "../../backends/ComputeBackend.h"
 #include "../../planning/ClusterInventoryGatherer.h"
 #include "../../planning/ModelMemoryProfile.h"
+#include "../../models/deepseek4/DeepSeekV4VisionEncoder.h"
 #include "../../config/OrchestrationStartupPolicy.h"
 #include "../../planning/ActivationBufferSizing.h"
 #include "../../planning/RankMemoryPlanInputs.h"
@@ -22739,6 +22740,32 @@ namespace llaminar2
                 plan_.runtime.ngram_table_placement=std::move(selected.placement);
                 final_plan=std::move(selected.physical_plan);
             }
+        }
+
+        // DeepSeek-V4 vision tower: the exact host FP32 weights and the
+        // worst-case per-request encode workspace are this rank's host RAM.
+        // Admit the metadata-derived bytes into the CPU allocator envelope
+        // before the tower is loaded, so the fit check and the admission
+        // certificate cover the complete host load peak.
+        if (profile.deepseek_v4 && !config_.mmproj_path.empty())
+        {
+            const auto weights = deepseek4::DeepSeekV4VisionEncoder::mmprojHostWeightBytes(
+                config_.mmproj_path, *mpi_ctx_);
+            const auto workspace = deepseek4::visionTowerWorkspaceBytes(
+                config_.mmproj_path, *mpi_ctx_, profile.d_model);
+            const std::size_t demand = weights + workspace;
+            if (demand < weights)
+                return setError("DeepSeek-V4 vision tower host demand overflows");
+            const PhysicalMemoryResource *cpu = nullptr;
+            for (const auto &bom : final_plan.resources())
+                if (bom.resource().device.is_cpu()) { cpu = &bom.resource(); break; }
+            if (!cpu)
+                return setError("DeepSeek-V4 vision tower has no admitted CPU allocator");
+            PhysicalMemoryPlanBuilder builder(final_plan);
+            builder.add(*cpu, PhysicalMemoryOwner::VisionHostTower, demand);
+            final_plan = builder.build();
+            if (!final_plan.fits())
+                return setError("Memory plan validation failed — DeepSeek-V4 vision tower does not fit host memory");
         }
 
         if (imported_model_context_reuse_authority_)

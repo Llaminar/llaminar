@@ -203,3 +203,32 @@ TEST(DeepSeekV4VisionEncoder, MmprojFileLoadsTheSameTower)
     EXPECT_EQ(loaded->encode(img), direct.encode(img));
     EXPECT_EQ(loaded->sentinel(ImageSentinel::End), direct.sentinel(ImageSentinel::End));
 }
+
+/** @test The metadata-only admission counters equal the loaded tower exactly.
+ * Regression: the host vision tower was loaded after runner admission with
+ * only a log line; its FP32 weights and per-request workspace are now priced
+ * by the same header-only counters the physical-memory envelope admits. */
+TEST(DeepSeekV4VisionEncoder, MmprojAdmissionBytesMatchLoadedTower)
+{
+    const auto golden = nlohmann::json::parse(test::dsv4::kVisionEncoderGolden);
+    const auto t = tensors(golden);
+    char pattern[] = "/tmp/dsv4-mmproj-XXXXXX";
+    const int fd = ::mkstemp(pattern);
+    ASSERT_GE(fd, 0);
+    ::close(fd);
+    const std::string path = pattern;
+    writeMmproj(path, t, golden["layers"], golden["heads"]);
+    test::MockMPIContext mpi;
+    const std::size_t weights =
+        DeepSeekV4VisionEncoder::mmprojHostWeightBytes(path, mpi);
+    const std::size_t workspace =
+        visionTowerWorkspaceBytes(path, mpi, golden["text_dim"].get<int>());
+    std::unique_ptr<DeepSeekV4VisionEncoder> loaded;
+    ASSERT_NO_THROW(loaded = DeepSeekV4VisionEncoder::load(path, mpi, golden["text_dim"].get<int>()));
+    ::unlink(path.c_str());
+    ASSERT_TRUE(loaded);
+    EXPECT_EQ(weights, loaded->weightBytes());
+    EXPECT_EQ(workspace, loaded->encodeWorkspaceBytes());
+    EXPECT_GT(weights, 0u);
+    EXPECT_GT(workspace, 0u);
+}

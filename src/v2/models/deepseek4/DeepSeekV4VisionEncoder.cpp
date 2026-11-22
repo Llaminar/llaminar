@@ -25,6 +25,14 @@
 
 namespace llaminar2::deepseek4
 {
+/** @brief Admitted decoded-pixel bound (matches DeepSeekV4PromptImages' decode cap). */
+constexpr std::uint64_t kHostDecodedPixelBound = std::uint64_t{64} << 20;
+constexpr int kVisionMaxTokens = 384;    ///< vision_max_n_token (official, fixed).
+constexpr int kVisionDefaultMerge = 3;   ///< Llama.cpp default scale_factor.
+} // namespace llaminar2::deepseek4
+
+namespace llaminar2::deepseek4
+{
     namespace
     {
         constexpr float kNormEps = 1e-6f;
@@ -317,5 +325,96 @@ namespace llaminar2::deepseek4
             throw std::invalid_argument("DeepSeek-V4 mmproj projects to width " + std::to_string(encoder->textDim()) +
                                         " but the text model is " + std::to_string(text_dim));
         return encoder;
+    }
+
+    std::size_t DeepSeekV4VisionEncoder::mmprojHostWeightBytes(const std::string &path, const IMPIContext &mpi)
+    {
+        TensorFactory factory(mpi);
+        ModelLoader loader(&factory);
+        loader.setUseMmap(false);
+        if (!loader.loadModel(path))
+            throw std::runtime_error("Cannot read DeepSeek-V4 mmproj metadata from " + path);
+        loader.sealTensorSources();
+        // Exact directory data extents: the loader reads exactly `size_bytes`
+        // per tensor, and the tower keeps every tensor as an FP32 vector.
+        std::size_t total = 0;
+        for (const auto &info : loader.getModel().tensors)
+        {
+            if (info.size_bytes > SIZE_MAX - total)
+                throw std::overflow_error("DeepSeek-V4 mmproj host byte sum overflow");
+            total += info.size_bytes;
+        }
+        // The tower also retains its synthetic IMAGE sentinel row (T floats),
+        // which is not a file tensor (see the encoder constructor).
+        const auto mm1_shape = loader.getTensorShape("mm.1.weight");
+        if (mm1_shape && mm1_shape->size() == 2)
+            total += (*mm1_shape)[0] * sizeof(float);
+        return total;
+    }
+
+    /** @brief Shared worst-case host workspace formula (bytes); single authority. */
+    std::size_t visionTowerWorkspaceFor(std::size_t D, std::size_t I, std::size_t T,
+                                        std::size_t merge)
+    {
+        const std::size_t max_tokens = static_cast<std::size_t>(kVisionMaxTokens);
+        // L = ceil(vit / merge) <= max_tokens, so the ViT grid is <= max_tokens * merge.
+        const std::size_t vit_cells = max_tokens * merge * merge;
+        const std::size_t per_image =
+            vit_cells * D * 6u +                       // x, a, qkv(3), o
+            2u * vit_cells * I +                       // mlp_g, mlp_u
+            vit_cells * vit_cells +                    // scores (N x N)
+            max_tokens * D * merge * merge +           // aligner unfolded (L * D * r^2)
+            3u * max_tokens * T;                       // h1, h2, rows
+        // Bounded decoded-RGB staging (3 bytes per pixel, 64 Mi-pixel cap).
+        const std::size_t decode = static_cast<std::size_t>(kHostDecodedPixelBound) * 3u;
+        return (per_image + decode) * static_cast<std::size_t>(kMaxImagesPerRequest);
+    }
+
+    std::size_t DeepSeekV4VisionEncoder::encodeWorkspaceBytes() const noexcept
+    {
+        return visionTowerWorkspaceFor(static_cast<std::size_t>(dim_),
+            static_cast<std::size_t>(inter_), static_cast<std::size_t>(text_dim_),
+            static_cast<std::size_t>(config_.merge));
+    }
+
+    std::size_t visionTowerWorkspaceBytes(const std::string &path, const IMPIContext &mpi, int text_dim)
+    {
+        TensorFactory factory(mpi);
+        ModelLoader loader(&factory);
+        loader.setUseMmap(false);
+        if (!loader.loadModel(path))
+            throw std::runtime_error("Cannot read DeepSeek-V4 mmproj metadata from " + path);
+        loader.sealTensorSources();
+        // Block tensors are named per layer (v.<block>.attn_qkv.weight); the
+        // first matching directory entry carries the shared width geometry.
+        const auto find2D = [&](const std::string &needle) -> std::optional<std::vector<size_t>>
+        {
+            for (const auto &name : loader.tensorNames())
+                if (name.find(needle) != std::string::npos)
+                    return loader.getTensorShape(name);
+            return std::nullopt;
+        };
+        // Mirror the encoder's exact derivations: dim_ from the patch embedding's
+        // last axis, inter_ from ffn_gate's second axis, text_dim_ from mm.1's
+        // second axis (see DeepSeekV4VisionEncoder constructor).
+        const auto patch_shape = find2D("patch_embd.weight");
+        const auto gate_shape = find2D("ffn_gate.weight");
+        const auto mm1_shape = loader.getTensorShape("mm.1.weight");
+        const auto mm2_shape = loader.getTensorShape("mm.2.weight");
+        const std::size_t D = patch_shape && patch_shape->size() == 4 ? (*patch_shape)[3] : 0;
+        // The loader reports 2-D shapes in file (ggml) order; the encoder swaps
+        // them to host order, so the host second axis is the file first axis.
+        const std::size_t I = gate_shape && gate_shape->size() == 2 ? (*gate_shape)[0] : 0;
+        const std::size_t T = mm1_shape && mm1_shape->size() == 2 ? (*mm1_shape)[0] : 0;
+        (void)mm2_shape;
+        const std::int64_t merge_meta = loader.getInt("clip.vision.projector.scale_factor", kVisionDefaultMerge);
+        const std::size_t merge = merge_meta > 0 ? static_cast<std::size_t>(merge_meta)
+                                                 : static_cast<std::size_t>(kVisionDefaultMerge);
+        if (D == 0 || I == 0 || T == 0 || merge == 0)
+            throw std::invalid_argument("DeepSeek-V4 mmproj lacks the geometry for host workspace admission");
+        if (text_dim > 0 && T != static_cast<std::size_t>(text_dim))
+            throw std::invalid_argument("DeepSeek-V4 mmproj projects to width " + std::to_string(T) +
+                                        " but the text model is " + std::to_string(text_dim));
+        return visionTowerWorkspaceFor(D, I, T, merge);
     }
 } // namespace llaminar2::deepseek4

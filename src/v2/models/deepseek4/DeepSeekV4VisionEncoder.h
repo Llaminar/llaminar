@@ -83,6 +83,24 @@ namespace llaminar2::deepseek4
         /** @return FP32 bytes held by the tower's weights. */
         std::size_t weightBytes() const noexcept { return weight_bytes_; }
 
+        /**
+         * @brief Exact host FP32 weight bytes of a deepseek4v mmproj, metadata only.
+         *
+         * Reads only the GGUF header/tensor directory (no payload), matching the
+         * FP32 host copies the tower keeps after @ref load. Used to admit the
+         * host tower into the physical-memory envelope before loading.
+         */
+        static std::size_t mmprojHostWeightBytes(const std::string &path, const IMPIContext &mpi);
+
+        /**
+         * @brief Worst-case host workspace of one request (encode + decode), bytes.
+         *
+         * Closed form of @ref encode for the admitted request bound
+         * (kMaxImagesPerRequest images, official vision_max_n_token) plus the
+         * bounded decoded-RGB staging (kMaxDecodedPixels).
+         */
+        std::size_t encodeWorkspaceBytes() const noexcept;
+
     private:
         struct Layer
         {
@@ -95,4 +113,15 @@ namespace llaminar2::deepseek4
         std::array<std::vector<float>, kImageSentinelCount> sentinels_;
         std::size_t weight_bytes_ = 0;
     };
+
+    /**
+     * @brief Metadata-derived worst-case host request workspace (bytes) for admission.
+     *
+     * Reads only the mmproj header/tensor directory; equals
+     * `DeepSeekV4VisionEncoder::encodeWorkspaceBytes()` of the loaded tower.
+     * @param path llama.cpp deepseek4v mmproj.
+     * @param mpi Loader rank context.
+     * @param text_dim Text-model width; the projector must match (0 skips the check).
+     */
+    std::size_t visionTowerWorkspaceBytes(const std::string &path, const IMPIContext &mpi, int text_dim);
 } // namespace llaminar2::deepseek4

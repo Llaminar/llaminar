@@ -9670,6 +9670,14 @@ add_v2_test(V2_Integration_DeepSeekV4MmprojLoad
             --gtest_filter=DeepSeekV4VisionEncoder.MmprojFileLoadsTheSameTower
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;DeepSeekV4;Vision;Loaders;Regression"
     MPI_PROCS 1 NO_MODELS TIMEOUT 60)
+# Host tower admission defect: the FP32 weights and per-request workspace were
+# unadmitted (only logged). The metadata-only counters admit before load and
+# must equal the loaded tower exactly.
+add_v2_test(V2_Integration_DeepSeekV4VisionTowerAdmission
+    COMMAND $<TARGET_FILE:v2_test_deepseek4_vision_encoder>
+            --gtest_filter=DeepSeekV4VisionEncoder.MmprojAdmissionBytesMatchLoadedTower
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;DeepSeekV4;Vision;Memory;Admission;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 60)
 
 # Note: ArgParser tests removed - replaced by OrchestrationConfigParser tests
 
