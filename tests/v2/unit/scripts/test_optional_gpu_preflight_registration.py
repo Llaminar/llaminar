@@ -12,6 +12,7 @@ GPU discovery, executable launch or replacement registration helper is involved.
 """
 from pathlib import Path
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -346,11 +347,13 @@ include("{selection}")
         helper_start = source.index('function(add_v2_test TEST_NAME)')
         helper_end = source.index('endfunction()', helper_start) + len('endfunction()')
         marker = source.index('# BEGIN original mapped component cohort registration')
-        begin = source.index('    set(_original_component_cases', marker)
-        end = source.index('# END original mapped component cohort registration', begin)
-        # Source ownership is tested by the enclosing real target_sources block;
-        # imported placeholders execute only the executable registration itself.
-        registration = source[begin:end].rsplit('endif()', 1)[0]
+        end = source.index('# END original mapped component cohort registration', marker)
+        # Imported placeholders do not compile the real sources. Preserve both
+        # original backend guards and the registration code they enclose.
+        registration, source_bindings = re.subn(
+            r'^    target_sources\(v2_integration_captured_transfer_channel PRIVATE\n'
+            r'        integration/transfer/Test__\w+\.cpp\)\n', '', source[marker:end], flags=re.MULTILINE)
+        self.assertEqual(source_bindings, 2)
         self.assertNotIn('v2_integration_mapped_activation_packet_cuda_rocm', source)
         with tempfile.TemporaryDirectory(prefix='llaminar-original-components-') as directory:
             root = Path(directory)
@@ -371,11 +374,23 @@ include("{SOURCE}/tests/v2/cmake/V2TestTargetSelection.cmake")
             (root / 'CMakeLists.txt').write_text(prefix + source[helper_start:helper_end] + '\n' + registration)
             ninja = shutil.which('ninja')
             self.assertIsNotNone(ninja)
-            result = subprocess.run(['cmake', '-S', str(root), '-B', str(root / 'build'), '-G', 'Ninja',
-                '-DCMAKE_MAKE_PROGRAM=' + ninja], text=True, capture_output=True, timeout=10)
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            tests = json.loads(subprocess.check_output(['ctest', '--test-dir', str(root / 'build'),
-                '--show-only=json-v1'], text=True, timeout=10))['tests']
+            inventories = {}
+            for cuda, rocm in ((True, False), (False, True), (True, True), (False, False)):
+                build = root / f'build-{int(cuda)}-{int(rocm)}'
+                result = subprocess.run(['cmake', '-S', str(root), '-B', str(build), '-G', 'Ninja',
+                    '-DCMAKE_MAKE_PROGRAM=' + ninja, f'-DHAVE_CUDA={int(cuda)}', f'-DHAVE_ROCM={int(rocm)}'],
+                    text=True, capture_output=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                inventories[cuda, rocm] = json.loads(subprocess.check_output(['ctest', '--test-dir', str(build),
+                    '--show-only=json-v1'], text=True, timeout=10))['tests']
+        tests = inventories[True, True]
+        for selection, backend in (((True, False), 'CUDA'), ((False, True), 'ROCm')):
+            expected = {test['name'] for test in tests
+                        if backend in next(prop['value'] for prop in test['properties'] if prop['name'] == 'LABELS')
+                        and 'LocalCUDA1ROCm1' not in test['name'] and 'ReturnValidation_' not in test['name']}
+            self.assertTrue(expected)
+            self.assertEqual({test['name'] for test in inventories[selection]}, expected)
+        self.assertEqual(inventories[False, False], [])
         self.assertEqual(len(tests), 25)
         filters = set()
         local_mixed = []
