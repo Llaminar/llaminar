@@ -343,13 +343,17 @@ the scatter and reports the original launch and compiler resources.
 | Q5_K | 27.840–27.904 | 34.112–34.176 | 81.6% |
 | Q8_0 | 37.184–37.248 | 44.672–44.928 | 82.9–83.2% |
 
-With ten routes selected for each of four verifier rows, Q4_K and Q8_0
-Gate/Up reach 85.1–85.4% and 85.4–87.4% of the matched weight rate.
-Q5_K reaches 79.5–79.8%. The matching Q5_1 and Q8_0 Down replays sustain
-87.8–90.2% and 95.6–96.6% respectively on the same family of fixtures.
+With ten routes selected for each of four verifier rows, the fixed packet
+schedule lowers Q4_K Gate/Up from 34.624–34.688 to 33.408 µs and Q5_K from
+42.432–42.560 to 40.256 µs. Q5_K rises from 79.5–79.8% to 84.3% of its
+matched weight rate. Across both cards, the QFN Gate/Up cases sustain
+84.2–88.3% through publication. The QFN-width Q8_0 producer retains the
+general schedule after the comparison showed similar stage times.
 
-Across 31 samples per format and card, six of 21 wide formats sustain
-at least 80% through publication on both cards. The low-bit IQ1, IQ2 and
-IQ3 formats range from 38.8% to 68.0% at the wide geometry. At the smaller
-geometry the full stage ranges from 30.7% to 53.1%. The QFN measurements
-describe the tested prepared formats and fully local route tape.
+Across 31 samples per format and card, nine of 21 wide formats sustain
+at least 80% through publication on both cards. Q6_K drops from
+40.064–40.192 to 32.896 µs, and IQ2_XS from 27.264 to 22.848–22.912 µs.
+The low-bit IQ1, IQ2 and IQ3 formats range from 42.7% to 73.2% at the
+wide geometry. At the smaller geometry the full stage ranges from
+34.2% to 56.0%. These measurements retain the tested prepared formats
+and fully local route tape.

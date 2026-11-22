@@ -24150,6 +24150,9 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
     const int d_model = wide_geometry ? 2560 : 512;
     const int intermediate = qfn_width ? 320 : 256;
     const auto device = llaminar2::DeviceId::cuda(0);
+    cudaDeviceProp hardware{};
+    ASSERT_EQ(cudaGetDeviceProperties(&hardware, 0), cudaSuccess);
+    const bool sm86 = hardware.major == 8 && hardware.minor == 6;
 
     std::vector<int> row_inventory(
         kGroupedVerifierRuntimeRows.begin(),
@@ -24486,7 +24489,7 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
             const char *timing_path = probe_path ? probe_path : weight_probe_path;
             if (seq_len == 4)
             {
-                ScopedCudaTestGraph graph(stream_, "M4 original-route Down publication");
+                ScopedCudaTestGraph graph(stream_, "M4 original-route verifier publication");
                 ASSERT_TRUE(run_grouped());
                 ASSERT_TRUE(moe_kernel.reduceCanonicalRouteContributions(
                     canonical_route_contributions.get(), runtime_prefill_output.get(), seq_len, top_k, d_model));
@@ -24516,18 +24519,31 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
                     ASSERT_NE(symbol, nullptr);
                     const std::string_view name{symbol};
                     EXPECT_EQ(name.find("grouped_prefill_down_canonical_kpart_reduce_kernel"), std::string_view::npos);
-                    if (gate_weight_probe_path)
+                    if (name.contains("grouped_native_quantised_gate_up_ordered_kpart_scatter_kernel"))
                     {
-                        if (name.contains("grouped_native_quantised_gate_up_ordered_kpart_scatter_kernel"))
+                        ASSERT_FALSE(gate_scatter);
+                        gate_scatter = KernelLaunch{node, params};
+                        constexpr int partitions = llaminar2::CUDAMoEBatchInvariantPolicy::gate_up_k_partitions;
+                        EXPECT_EQ(params.gridDim.x, (intermediate + params.blockDim.x - 1) / params.blockDim.x);
+                        EXPECT_EQ(params.gridDim.y, static_cast<unsigned>(seq_len * top_k));
+                        EXPECT_EQ(params.gridDim.z, static_cast<unsigned>(partitions));
+                        cudaFuncAttributes attributes{};
+                        ASSERT_EQ(cudaFuncGetAttributes(&attributes, params.func), cudaSuccess);
+                        EXPECT_EQ(attributes.localSizeBytes, 0u);
+                        if (!gate_weight_probe_path && !probe_path)
                         {
-                            ASSERT_FALSE(gate_scatter);
-                            gate_scatter = KernelLaunch{node, params};
+                            const bool fixed_source = qfn_width ? gate_source != "Q8_0"
+                                : gate_source != "IQ4_NL" && gate_source != "IQ4_XS";
+                            const std::string fixed_schedule = "ELi" + std::to_string(intermediate) +
+                                "ELi" + std::to_string(d_model / (32 * partitions)) + "E";
+                            EXPECT_EQ(name.contains(fixed_schedule), sm86 && params.blockDim.x == 128 && fixed_source)
+                                << gate_source << " captured the wrong verifier Gate/Up schedule";
                         }
-                        if (name.contains("grouped_native_quantised_gate_up_ordered_kpart_reduce_swiglu_kernel"))
-                        {
-                            ASSERT_FALSE(gate_reduce);
-                            gate_reduce = KernelLaunch{node, params};
-                        }
+                    }
+                    if (name.contains("grouped_native_quantised_gate_up_ordered_kpart_reduce_swiglu_kernel"))
+                    {
+                        ASSERT_FALSE(gate_reduce);
+                        gate_reduce = KernelLaunch{node, params};
                     }
                     if (name.find("grouped_prefill_down_canonical_publish_k32_kernel") != std::string_view::npos)
                     {
@@ -24558,6 +24574,8 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
                     }
                 }
                 ASSERT_EQ(direct_publications, 1);
+                ASSERT_TRUE(gate_scatter && gate_reduce)
+                    << "the fixture must capture one ordered Gate/Up scatter and publication";
                 for (int repeat = 0; repeat < 3; ++repeat)
                 {
                     ASSERT_TRUE(graph.launchAndPublishOutputs({runtime_prefill_output.get()}));
@@ -24569,8 +24587,6 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
                 {
                     using namespace llaminar2::test;
                     using namespace llaminar2::test::cuda_kernel_probe_detail;
-                    ASSERT_TRUE(gate_scatter && gate_reduce)
-                        << "the fixture did not capture one ordered Gate/Up scatter and publication";
                     ASSERT_NE(gate_scatter->params.kernelParams, nullptr);
                     ASSERT_NE(gate_reduce->params.kernelParams, nullptr);
                     for (size_t plane = 0; plane < 2; ++plane)

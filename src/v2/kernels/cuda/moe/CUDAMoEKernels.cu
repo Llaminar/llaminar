@@ -30,6 +30,8 @@
  * and vector-loads each K32 Down activation for the measured codebooks.
  * QFN decode specializes the paired Gate/Up schedule to five K32 packets
  * per partition, with both weight streams sharing register-held activations.
+ * Ordered verifier tiles also resolve their measured pitch and packed
+ * operand readers before capture and retain the serial split-K rounding tree.
  * Wide SM86 verifier tiles expand a compact IQ1 grid and use whole-word
  * index and sign loads for IQ3. Compact IQ2 selectors combine magnitudes
  * and signs in registers. These launches resolve the physical pitch before K.
@@ -20396,6 +20398,17 @@ __global__ void softmax_topk_decode_descriptors_kernel(
     static_assert(kQFNDecodeGateUpK / 32 == kQFNDecodeGateUpPackets *
         llaminar2::CUDAMoEBatchInvariantPolicy::gate_up_k_partitions);
 
+    /**
+     * @brief Identify a measured SM86 owner from immutable physical admission.
+     * @param device Ordinal of the CUDA participant that will capture the node.
+     * @return Whether the admitted device has compute capability 8.6.
+     */
+    bool is_sm86_cuda_device(int device)
+    {
+        const auto &hardware = llaminar2::cudaHardwareMetadata().at(device);
+        return hardware.sm_major == 8 && hardware.sm_minor == 6;
+    }
+
     /** @brief Identify the prepared layouts measured with the fixed QFN schedule. */
     template <uint8_t CodebookId>
     inline constexpr bool kQFNDecodeGateUpCodebook =
@@ -20404,8 +20417,12 @@ __global__ void softmax_topk_decode_descriptors_kernel(
         CodebookId == native_formats::Q8_0.codebook_id;
 
     /**
-     * @brief Evaluate one fixed QFN Gate/Up partition with shared activation registers.
+     * @brief Evaluate one fixed Gate/Up partition with shared activation registers.
      * @tparam CodebookId Physical decoder selected before recording the kernel.
+     * @tparam Pitch Physical output-column count of each prepared K32 plane.
+     * @tparam Packets Ordered number of K32 packets per partition.
+     * @tparam PacketOrder Equivalent packed integer operand schedule, independent
+     *         of the fixed FP32 split-K publication order below.
      * @param gate Original admitted Gate planes.
      * @param up Original admitted Up planes.
      * @param activations Aligned original Q8 activation row.
@@ -20414,24 +20431,26 @@ __global__ void softmax_topk_decode_descriptors_kernel(
      * @param first_packet First K32 packet of this ordered partition.
      * @param gate_sum Receives the original ordered Gate partial.
      * @param up_sum Receives the original ordered Up partial.
-     * @pre Both weight planes are validated at the QFN pitch and each
-     *      admitted partition contains exactly five complete packets.
+     * @pre Both weight planes are validated at the captured pitch and
+     *      each admitted partition contains exactly Packets complete packets.
      */
-    template <uint8_t CodebookId>
-    __device__ __forceinline__ void qfn_decode_gate_up_fixed_partition(
+    template <uint8_t CodebookId, int Pitch, int Packets,
+              NativeMoEDotOrder PacketOrder = NativeMoEDotOrder::PartitionPartial>
+    __device__ __forceinline__ void native_quantised_gate_up_fixed_partition(
         const DeviceNativeQuantisedMatrixDesc &gate, const DeviceNativeQuantisedMatrixDesc &up,
         const int8_t *activations, const float *activation_scales,
         int column, int first_packet, float &gate_sum, float &up_sum)
     {
+        static_assert(Pitch % 4 == 0 && Packets > 0);
         constexpr int payload_bytes = llaminar2::cuda_native_quantised::CodebookTraits<CodebookId>::payload_bytes;
         const auto *a = reinterpret_cast<const int4 *>(activations + first_packet * 32);
-        const int start = first_packet * kQFNDecodeGateUpN + column;
+        const int start = first_packet * Pitch + column;
         gate_sum = 0.0f;
         up_sum = 0.0f;
-#pragma unroll
-        for (int packet = 0; packet < kQFNDecodeGateUpPackets; ++packet)
+#pragma unroll (PacketOrder == NativeMoEDotOrder::PartitionPartial ? Packets : 1)
+        for (int packet = 0; packet < Packets; ++packet)
         {
-            const int linear = start + packet * kQFNDecodeGateUpN;
+            const int linear = start + packet * Pitch;
             const int4 low = a[2 * packet];
             const int4 high = a[2 * packet + 1];
             const int32_t codes[8] = {low.x, low.y, low.z, low.w, high.x, high.y, high.z, high.w};
@@ -20439,8 +20458,8 @@ __global__ void softmax_topk_decode_descriptors_kernel(
             const auto contribution = [&](const DeviceNativeQuantisedMatrixDesc &desc) {
                 const uint8_t *payload = desc.payload + linear * payload_bytes;
                 int32_t weights[8];
-                llaminar2::cuda_native_quantised::decode_groups_vec<CodebookId>(payload, weights);
-                return moe_native_quantised_block_contribution_rn<CodebookId>(
+                decode_moe_native_quantised_packet<CodebookId, PacketOrder>(payload, weights);
+                return moe_native_quantised_block_contribution_rn<CodebookId, PacketOrder>(
                     codes, weights, payload, static_cast<const uint16_t *>(desc.scales),
                     static_cast<const uint16_t *>(desc.mins), static_cast<const uint32_t *>(desc.emins),
                     linear, scale_a);
@@ -20528,7 +20547,7 @@ __global__ void softmax_topk_decode_descriptors_kernel(
             float gate = 0.0f;
             float up = 0.0f;
             if (native_quantised_pair_shape_ok<CodebookId>(gate_desc, up_desc, N, K))
-                qfn_decode_gate_up_fixed_partition<CodebookId>(
+                native_quantised_gate_up_fixed_partition<CodebookId, kQFNDecodeGateUpN, kQFNDecodeGateUpPackets>(
                     gate_desc, up_desc, A_int8, scales_A_blockwise, n, b_start, gate, up);
             gate_partials[partial_index] = gate;
             up_partials[partial_index] = up;
@@ -20636,8 +20655,13 @@ __global__ void softmax_topk_decode_descriptors_kernel(
      * grouped slot. Consequently, a graph can certify arbitrary runtime M by
      * replaying fixed-size row tiles without allocating partial buffers in
      * proportion to the complete context or speculative depth.
+     * @tparam CodebookId Physical prepared verifier layout.
+     * @tparam Pitch Fixed prepared column pitch, or zero for runtime geometry.
+     * @tparam Packets Fixed K32 partition length, or zero for runtime geometry.
+     * @tparam PacketOrder Packed integer schedule for the fixed reader.
      */
-    template <uint8_t CodebookId>
+    template <uint8_t CodebookId, int Pitch = 0, int Packets = 0,
+              NativeMoEDotOrder PacketOrder = NativeMoEDotOrder::PartitionPartial>
     __global__ void grouped_native_quantised_gate_up_ordered_kpart_scatter_kernel(
         const int8_t *__restrict__ A_int8,
         const float *__restrict__ scales_A_blockwise,
@@ -20669,7 +20693,8 @@ __global__ void softmax_topk_decode_descriptors_kernel(
             return;
 
         const int blocks_per_row = K / 32;
-        const int blocks_per_part = (blocks_per_row + k_partitions - 1) / k_partitions;
+        const int blocks_per_part = Packets > 0 ? Packets :
+            (blocks_per_row + k_partitions - 1) / k_partitions;
         const int b_start = k_part * blocks_per_part;
         int b_end = b_start + blocks_per_part;
         if (b_end > blocks_per_row)
@@ -20698,18 +20723,17 @@ __global__ void softmax_topk_decode_descriptors_kernel(
             scales_A_blockwise + static_cast<size_t>(source_row) * blocks_per_row;
         float gate_partial = 0.0f;
         float up_partial = 0.0f;
-        native_quantised_dot_desc_pair_range<CodebookId>(
-            gate_desc,
-            up_desc,
-            n,
-            slot_A,
-            slot_scales,
-            N,
-            K,
-            b_start,
-            b_end,
-            gate_partial,
-            up_partial);
+        if constexpr (Pitch > 0)
+        {
+            native_quantised_gate_up_fixed_partition<CodebookId, Pitch, Packets, PacketOrder>(
+                gate_desc, up_desc, slot_A, slot_scales, n, b_start, gate_partial, up_partial);
+        }
+        else
+        {
+            native_quantised_dot_desc_pair_range<CodebookId>(
+                gate_desc, up_desc, n, slot_A, slot_scales, N, K,
+                b_start, b_end, gate_partial, up_partial);
+        }
         gate_partials[partial_index] = gate_partial;
         up_partials[partial_index] = up_partial;
     }
@@ -25436,8 +25460,7 @@ __attribute__((visibility("default"))) bool cudaMoE_softmax_topk_decode_selected
         const bool fixed_qfn = [&]() {
             if (!publish_swiglu || N != kQFNDecodeGateUpN || K != kQFNDecodeGateUpK)
                 return false;
-            const auto &hardware = llaminar2::cudaHardwareMetadata().at(device_idx);
-            return hardware.sm_major == 8 && hardware.sm_minor == 6;
+            return is_sm86_cuda_device(device_idx);
         }();
         const auto launch_gate = [&]<uint8_t CodebookId>() {
             const auto issue = [&]<bool FixedQFN>() {
@@ -26154,6 +26177,12 @@ __attribute__((visibility("default"))) bool cudaMoE_softmax_topk_decode_selected
                 dim3 block(kTileN);
                 dim3 reduce_block(kReduceTileN);
 
+                const bool fixed_gate_geometry = kTileN == 128 &&
+                    gateup_k_partitions == llaminar2::CUDAMoEBatchInvariantPolicy::gate_up_k_partitions &&
+                    ((intermediate == 256 && (d_model == 512 || d_model == 2560)) ||
+                     (intermediate == kQFNDecodeGateUpN && d_model == kQFNDecodeGateUpK)) &&
+                    is_sm86_cuda_device(device_idx);
+
                 for (int token_base = 0; token_base < seq_len; token_base += splitk_tile_rows)
                 {
                     const int tile_rows = std::min(splitk_tile_rows, seq_len - token_base);
@@ -26164,13 +26193,53 @@ __attribute__((visibility("default"))) bool cudaMoE_softmax_topk_decode_selected
                         tile_route_slots,
                         gateup_k_partitions);
 
-    #define LAUNCH_GROUPED_GATEUP_ORDERED_KPART(CB)                                                   \
-        grouped_native_quantised_gate_up_ordered_kpart_scatter_kernel<CB>                                  \
-            <<<scatter_grid, block, 0, cuda_stream>>>(                                                 \
-                gateup_input, gateup_scales, source_rows, d_gate_desc_table, d_up_desc_table,          \
-                d_original_to_grouped, d_original_expert_ids, d_gate_partials, d_up_partials,          \
-                original_slot_base, tile_route_slots, intermediate, d_model, num_experts,              \
-                gateup_k_partitions)
+                    const auto launch_gate = [&]<uint8_t CodebookId>() {
+                        using Traits = llaminar2::cuda_native_quantised::CodebookTraits<CodebookId>;
+                        constexpr auto packed = Traits::is_iq_grid
+                            ? NativeMoEDotOrder::VerifierWideGrid : NativeMoEDotOrder::VerifierK32;
+                        constexpr auto unrolled = NativeMoEDotOrder::PartitionPartial;
+                        const auto issue = [&]<int Pitch, int Packets, NativeMoEDotOrder Order>() {
+                            grouped_native_quantised_gate_up_ordered_kpart_scatter_kernel<
+                                CodebookId, Pitch, Packets, Order><<<scatter_grid, block, 0, cuda_stream>>>(
+                                    gateup_input, gateup_scales, source_rows, d_gate_desc_table, d_up_desc_table,
+                                    d_original_to_grouped, d_original_expert_ids, d_gate_partials, d_up_partials,
+                                    original_slot_base, tile_route_slots, intermediate, d_model, num_experts,
+                                    gateup_k_partitions);
+                        };
+                        // The IQ4 layouts may vary independently between Gate
+                        // and Up and use the general reader's per-plane admission.
+                        if constexpr (!Traits::is_iq4_lut)
+                        {
+                            if (fixed_gate_geometry)
+                            {
+                                if (intermediate == 256 && d_model == 512)
+                                    return issue.template operator()<256, 1, packed>();
+                                if (intermediate == 256 && d_model == 2560)
+                                {
+                                    constexpr bool prefer_unrolled =
+                                        CodebookId == native_formats::Q4_0.codebook_id ||
+                                        CodebookId == native_formats::Q4_K.codebook_id ||
+                                        CodebookId == native_formats::Q5_0.codebook_id ||
+                                        CodebookId == native_formats::Q5_1.codebook_id ||
+                                        CodebookId == native_formats::Q5_K.codebook_id ||
+                                        CodebookId == native_formats::Q3_K.codebook_id ||
+                                        CodebookId == native_formats::IQ3_S.codebook_id;
+                                    return issue.template operator()<256, 5, prefer_unrolled ? unrolled : packed>();
+                                }
+                                if constexpr (CodebookId == native_formats::Q4_K.codebook_id ||
+                                              CodebookId == native_formats::Q5_K.codebook_id ||
+                                              CodebookId == native_formats::Q5_1.codebook_id)
+                                {
+                                    if (intermediate == kQFNDecodeGateUpN && d_model == kQFNDecodeGateUpK)
+                                        return issue.template operator()<
+                                            kQFNDecodeGateUpN, kQFNDecodeGateUpPackets, unrolled>();
+                                }
+                            }
+                        }
+                        issue.template operator()<0, 0, unrolled>();
+                    };
+
+    #define LAUNCH_GROUPED_GATEUP_ORDERED_KPART(CB) launch_gate.template operator()<CB>()
 
                     bool launched_gateup = false;
     #define LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(CB)                                        \
