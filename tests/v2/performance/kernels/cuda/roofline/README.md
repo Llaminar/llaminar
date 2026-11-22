@@ -472,6 +472,19 @@ in the paired runs. IQ2_XS varied from a 0.064 µs gain to a 0.192 µs loss.
 The Release sweep measured IQ3_XXS at 26.112 µs on both cards and IQ2_S
 at 26.752–26.944 µs. Both cleared 80% of the matched reference on each card.
 
+The validated 64-column IQ2_XS tile extracts the high index byte and
+gathers the four sign bytes directly from the aligned words. At byte
+offset three the sign word is the entire next word, so the clamped shift
+must select that word. The prepared weight planes and the integer dot
+order are unchanged. The Release tile uses 64 registers with zero local
+or shared memory. The same route-matched reference gave 82.30% and 81.77%
+on the two RTX 3090s at 26.752 and 26.688 µs, respectively. In two paired
+orders the complete capture improved by 0.192–0.448 µs. The full sweep
+matched serial output bytes and reached 80% on both cards for 18 of 21
+Gate/Up formats and all seven K=320 Down formats. The remaining Gate/Up
+rates were 62.5–62.7% for IQ1_M, 67.5% for IQ1_S, and 73.3–73.5% for
+IQ2_XXS.
+
 Forcing the existing grouped INT8 tensor-core engine at four rows
 preserved serial output bytes on the six low-bit sources. The complete
 captured transaction, including routing and publication, ranged from

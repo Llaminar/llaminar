@@ -18926,12 +18926,13 @@ __global__ void softmax_topk_decode_descriptors_kernel(
     /**
      * @brief Gather one 9- or 13-byte IQ grid packet without byte loads.
      * @tparam IndexWords One index word for IQ2 or two for IQ3.
+     * @tparam ClampedSigns Gather the sign word with a single clamped funnel shift.
      * @param payload Original packet in its [K32][column] weight plane.
      * @return Low index words, high index byte, and four sign bytes.
      * @pre Aligned plane base and a captured column count divisible by four
      *      keep all aligned word loads within the physical packet plane.
      */
-    template <int IndexWords>
+    template <int IndexWords, bool ClampedSigns = false>
     __device__ __forceinline__ MoEOddGridPacket<IndexWords> load_moe_odd_grid_packet(const uint8_t *payload)
     {
         const unsigned offset = reinterpret_cast<uintptr_t>(payload) & 3u;
@@ -18947,9 +18948,20 @@ __global__ void softmax_topk_decode_descriptors_kernel(
             head = next;
         }
         const uint32_t last = words[IndexWords + 1];
-        const uint32_t high_and_signs = __funnelshift_r(head, last, shift);
-        packet.high_indices = high_and_signs & 0xffu;
-        packet.signs = (high_and_signs >> 8) | ((last >> shift) << 24);
+        if constexpr (ClampedSigns)
+        {
+            // The aligned head always holds the high-index byte. For offset
+            // three the sign word is the entire last word, so shift 32 must
+            // clamp to that word instead of wrapping to the head.
+            packet.high_indices = (head >> shift) & 0xffu;
+            packet.signs = __funnelshift_rc(head, last, shift + 8);
+        }
+        else
+        {
+            const uint32_t high_and_signs = __funnelshift_r(head, last, shift);
+            packet.high_indices = high_and_signs & 0xffu;
+            packet.signs = (high_and_signs >> 8) | ((last >> shift) << 24);
+        }
         return packet;
     }
 #endif
@@ -19001,11 +19013,12 @@ __global__ void softmax_topk_decode_descriptors_kernel(
     static_assert(moe_iq3_signs_are_canonical<llaminar2::iq3xxs_grid>());
 #endif
 
-    /** @brief Register schedule for the eight sign selectors of an IQ2 group. */
+    /** @brief Register schedule for extracting and expanding the IQ2 signs. */
     enum class NativeMoEIQ2SignSchedule : uint8_t
     {
         RegisterShifts,
         IndependentProducts,
+        ClampedFunnelAndIndependentProducts,
     };
 
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ == 860
@@ -19102,7 +19115,8 @@ __global__ void softmax_topk_decode_descriptors_kernel(
                 packet.signs = words.y;
             }
             else
-                packet = load_moe_odd_grid_packet<1>(payload);
+                packet = load_moe_odd_grid_packet<1,
+                    SignSchedule == NativeMoEIQ2SignSchedule::ClampedFunnelAndIndependentProducts>(payload);
 
             // Select +8,+25,+43 or -8,-25,-43 directly into each signed byte.
             constexpr uint32_t kPositive = 0x002b1908u;
@@ -19124,7 +19138,7 @@ __global__ void softmax_topk_decode_descriptors_kernel(
 
                 const uint32_t signs = (packet.signs >> (8 * group)) & 0xffu;
                 const uint32_t sign_selectors = [&] {
-                    if constexpr (SignSchedule == NativeMoEIQ2SignSchedule::IndependentProducts)
+                    if constexpr (SignSchedule != NativeMoEIQ2SignSchedule::RegisterShifts)
                         return moe_iq2_independent_sign_selectors(signs);
                     else
                     {
@@ -21168,8 +21182,15 @@ __global__ void softmax_topk_decode_descriptors_kernel(
         if constexpr (Pitch > 0)
         {
             constexpr bool split_iq1_s = ExactTile > 0 && CodebookId == native_formats::IQ1_S.codebook_id;
-            constexpr auto signs = ExactTile > 0 && CodebookId == native_formats::IQ2_XS.codebook_id
-                ? NativeMoEIQ2SignSchedule::IndependentProducts : NativeMoEIQ2SignSchedule::RegisterShifts;
+            constexpr auto signs = [] {
+                if constexpr (ExactTile > 0 && CodebookId == native_formats::IQ2_XS.codebook_id)
+                {
+                    if constexpr (PlanValidated)
+                        return NativeMoEIQ2SignSchedule::ClampedFunnelAndIndependentProducts;
+                    return NativeMoEIQ2SignSchedule::IndependentProducts;
+                }
+                return NativeMoEIQ2SignSchedule::RegisterShifts;
+            }();
             native_quantised_gate_up_fixed_partition<CodebookId, Pitch, Packets, PacketOrder, split_iq1_s, signs>(
                 gate_desc, up_desc, slot_A, slot_scales, n, b_start, gate_partial, up_partial);
         }
