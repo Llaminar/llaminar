@@ -84,9 +84,11 @@ TEST(CPUNativeQuantisedWeightView, CompactStrideFollowsTheDecodedPayloadWords)
     // Proving the exact per-codebook extents keeps packing, execution,
     // tier-stream geometry and memory planning on one layout authority.
     struct Expected { int codebook; std::uint32_t data; std::uint32_t unit; };
+    // The effective-minimum vector is reserved only for Q2_K (codebook 10),
+    // the sole consumer of chunkEffectiveMins.
     const Expected expected[] = {
-        {9, 768, 1280}, {10, 512, 1024}, {12, 768, 1280}, {13, 768, 1280},
-        {14, 768, 1280}, {15, 512, 1024}, {16, 512, 1024}, {17, 512, 1024},
+        {9, 768, 1024}, {10, 512, 1024}, {12, 768, 1024}, {13, 768, 1024},
+        {14, 768, 1024}, {15, 512, 768}, {16, 512, 768}, {17, 512, 768},
     };
     for (const auto &e : expected)
     {
