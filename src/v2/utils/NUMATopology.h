@@ -15,6 +15,7 @@
  */
 
 #pragma once
+#include <cctype>
 
 #include <string>
 #include <vector>
@@ -199,6 +200,18 @@ namespace llaminar2
          */
         static std::vector<int> getCPUsOnNode(int numa_node);
 
+        /**
+         * @brief Public observed NUMA node count (sysfs), 1 when detection fails.
+         *
+         * Integrated GPUs (e.g. GB10/APU) have no PCIe NUMA locality; callers
+         * use this to adopt the sole node on single-node hosts.
+         */
+        static inline int observedNodeCount()
+        {
+            const int count = getNumNodesViaSysfs();
+            return count > 0 ? count : 1;
+        }
+
     private:
         // Private implementation methods
 
@@ -228,7 +241,28 @@ namespace llaminar2
          *
          * @return Number of NUMA nodes or 1 if detection failed
          */
-        static int getNumNodesViaSysfs();
+        static inline int getNumNodesViaSysfs()
+        {
+            const std::string node_path = "/sys/devices/system/node";
+            if (!std::filesystem::exists(node_path))
+                return -1;
+            int count = 0;
+            try
+            {
+                for (const auto &entry : std::filesystem::directory_iterator(node_path))
+                {
+                    const std::string name = entry.path().filename().string();
+                    if (name.find("node") == 0 && name.size() > 4 && std::isdigit(name[4]))
+                        ++count;
+                }
+            }
+            catch (...)
+            {
+                return -1;
+            }
+            return count;
+        }
+
 
         /**
          * @brief Deprecated NVML detection shim; returns -1.

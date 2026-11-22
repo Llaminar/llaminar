@@ -12,6 +12,7 @@
  */
 
 #include <cuda_runtime.h>
+#include "../utils/NUMATopology.h"
 #include <vector>
 #include <string>
 #include <exception>
@@ -156,6 +157,10 @@ namespace llaminar2
             }
             fclose(f);
 
+            // Integrated GPUs (e.g. GB10) have no PCIe NUMA node; on a
+            // single-NUMA host the only possible locality is node 0.
+            if (numa_node < 0 && NUMATopology::observedNodeCount() == 1)
+                return 0;
             return numa_node;
         }
 

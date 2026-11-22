@@ -386,33 +386,6 @@ namespace llaminar2
         return -1;
     }
 
-    int NUMATopology::getNumNodesViaSysfs()
-    {
-        std::string node_path = "/sys/devices/system/node";
-        if (!std::filesystem::exists(node_path))
-        {
-            return -1;
-        }
-
-        int count = 0;
-        try
-        {
-            for (const auto &entry : std::filesystem::directory_iterator(node_path))
-            {
-                std::string name = entry.path().filename().string();
-                if (name.find("node") == 0 && std::isdigit(name[4]))
-                {
-                    ++count;
-                }
-            }
-        }
-        catch (...)
-        {
-            return -1;
-        }
-
-        return count > 0 ? count : -1;
-    }
 
     std::vector<int> NUMATopology::getCPUsOnNode(int numa_node)
     {
