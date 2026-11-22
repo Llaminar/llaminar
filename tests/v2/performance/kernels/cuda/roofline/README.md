@@ -215,7 +215,46 @@ prepared weight plane.
 IQ3_XXS varies by one 0.064 µs timing step at this width. All seven
 wide readers use 36–40 registers per thread and zero local bytes.
 
-## Route-matched Down weight reference
+## Route-matched decode weight reference
+
+The single-token QFN fixture can compare its captured Gate/Up and Down
+stages with aligned weight readers at the same geometry. The readers use
+the original prepared addresses, route slots, projection grid, and output
+stores. Gate/Up reads both weight sets and writes the original split-K
+partial buffers. Its native stage measurement also includes the ordered
+reduction and SwiGLU publication. The fixture checks both packet readers
+against a byte-wise checksum and verifies the staged output again after
+replaying the complete capture.
+
+```sh
+CUDA_VISIBLE_DEVICES=0 \
+LLAMINAR_TEST_CUDA_MOE_M1_SOURCE=drafter \
+LLAMINAR_TEST_CUDA_MOE_M1_WEIGHT_REFERENCE_JSONL="$PWD/decode-weight-reference.jsonl" \
+    "$CMAKE_BUILD/tests/v2/v2_integration_cuda_moe_kernel" \
+    --gtest_filter=Test__CUDAMoEKernel.RuntimeGroupedDecodeSwiGLUPublicationReplay
+```
+
+Repeat with `main` and `main_q5` for the other QFN format pairs. For each
+stage, divide the median time for `decode_gate_up_weight_planes` or
+`decode_down_weight_planes` by its native stage median in the same JSONL.
+The result estimates the fraction of the matched requested-weight rate
+sustained through publication.
+
+| QFN stage, eight live routes | Weight replay, µs | Native stage, µs | Matched weight rate |
+| --- | ---: | ---: | ---: |
+| Main Q4_K Gate/Up | 12.160 | 15.168 | 80.2% |
+| Main Q5_1 Down | 3.904 | 4.608–4.672 | 83.6–84.7% |
+| Main Q5_K Gate/Up | 14.272 | 17.408 | 82.0% |
+| Main Q8_0 Down | 8.000–8.064 | 8.384 | 95.4–96.2% |
+| Drafter Q8_0 Gate/Up | 18.752 | 21.504 | 87.2% |
+| Drafter Q8_0 Down | 7.680 | 8.192 | 93.8% |
+
+Each measurement contains 31 samples per card. Both original projections
+and the aligned readers report zero local bytes. These rates use logical
+requested bytes from an isolated decode fixture. The full mixed-topology
+graph and physical memory-traffic rates need their own measurements.
+
+## Route-matched verifier Down weight reference
 
 The verifier fixture can reuse the original capture arguments to measure a
 weight-only reference. The reader retains the prepared addresses, original

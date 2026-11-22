@@ -10,7 +10,7 @@
  * Retained original rank-bank publication guards all route/bank/guard bytes
  * at QFN prefill geometry, including nonfinite copies and dirty live prefixes.
  * Disabled paired events and event-free profile modes isolate one real bridge.
- * An optional Down reference times the captured weight address pattern after
+ * Optional projection references time the captured weight address pattern after
  * a byte-wise checksum of the identical prepared operand planes.
  */
 #include "../../../utils/IQ2SFusedMoEGpuSourceWitness.h"
@@ -56,7 +56,7 @@
 #include "utils/DebugEnv.h"
 #include "utils/PerfStatsCollector.h"
 
-#include "../../../performance/kernels/cuda/roofline/CUDAMoEDownWeightReference.h"
+#include "../../../performance/kernels/cuda/roofline/CUDAMoEWeightReference.h"
 #include "../../../utils/CUDACapturedKernelProbe.h"
 #include "../../../utils/GpuPreparedGemmHarness.h"
 #include "../../../utils/MoEOverlayServiceTelemetryCoverageTest.h"
@@ -22037,6 +22037,138 @@ TEST_F(Test__CUDAMoEKernel, GroupedDecodeMatchesGroupedPrefillForSingleTokenNati
 #endif
 }
 
+#ifdef HAVE_CUDA
+namespace
+{
+    /**
+     * @brief Calibrate a captured MoE projection with its original weight arguments.
+     * @param path JSONL destination for the aligned reader's native-event samples.
+     * @param launch Original projection node and borrowed argument storage.
+     * @param stream Exact stream on which the fixture warmed the captured graph.
+     * @param phase Original operation and its captured argument layout.
+     * @param codebook Physical format of the selected prepared descriptors.
+     * @param workload Original source format and measured projection geometry.
+     * @param routes Number of live routes in the retained fixture.
+     * @pre All reported routes have local prepared weights and the caller
+     *      replays the original graph before reading its output again.
+     */
+    void measureCudaMoEWeightReference(const char *path,
+        const llaminar2::test::cuda_kernel_probe_detail::KernelLaunch &launch,
+        cudaStream_t stream, llaminar2::test::CUDAMoEWeightPhase phase,
+        uint8_t codebook, const llaminar2::test::CUDACapturedKernelProbeIdentity &workload,
+        int routes)
+    {
+        using namespace llaminar2::test;
+        using namespace llaminar2::test::cuda_kernel_probe_detail;
+        ASSERT_NE(stream, nullptr);
+        ASSERT_GT(routes, 0);
+        ASSERT_EQ(workload.n % 4, 0);
+        ASSERT_NE(launch.params.kernelParams, nullptr);
+        ASSERT_EQ(launch.params.extra, nullptr);
+
+        const bool gate_up = phase == CUDAMoEWeightPhase::DecodeGateUp;
+        const bool verifier = phase == CUDAMoEWeightPhase::VerifierDown;
+        const int k_partitions = gate_up ? static_cast<int>(launch.params.gridDim.y) : 1;
+        ASSERT_EQ(gate_up ? launch.params.gridDim.z : launch.params.gridDim.y,
+            static_cast<unsigned>(routes));
+        const auto argument = [&]<typename T>(size_t index) {
+            size_t offset = 0, size = 0;
+            require(cudaFuncGetParamInfo(launch.params.func, index, &offset, &size),
+                "inspect captured MoE reference argument");
+            if (size != sizeof(T) || !launch.params.kernelParams[index])
+                throw std::logic_error("captured MoE reference argument has an unexpected extent");
+            T value{};
+            std::memcpy(&value, launch.params.kernelParams[index], sizeof(value));
+            return value;
+        };
+        const size_t n_index = verifier || gate_up ? 8 : 6;
+        ASSERT_EQ(argument.template operator()<int>(n_index), workload.n);
+        ASSERT_EQ(argument.template operator()<int>(n_index + 1), workload.k);
+        if (gate_up)
+        {
+            ASSERT_EQ(argument.template operator()<int>(7), routes);
+            ASSERT_EQ(argument.template operator()<int>(11), k_partitions);
+        }
+        if (verifier)
+            ASSERT_EQ(argument.template operator()<int>(7), 0);
+        const auto *expert_ids = argument.template operator()<const int *>(verifier || gate_up ? 4 : 3);
+        ASSERT_NE(expert_ids, nullptr);
+        const int experts = argument.template operator()<int>(gate_up ? 10 : (verifier ? 10 : 8));
+        std::vector<int> selected(routes);
+        ASSERT_EQ(cudaMemcpyAsync(selected.data(), expert_ids, selected.size() * sizeof(int),
+            cudaMemcpyDeviceToHost, stream), cudaSuccess);
+        ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+        ASSERT_TRUE(std::all_of(selected.begin(), selected.end(),
+            [experts](int expert) { return expert >= 0 && expert < experts; }));
+        if (verifier)
+        {
+            const auto *grouped = argument.template operator()<const int *>(3);
+            ASSERT_NE(grouped, nullptr);
+            ASSERT_EQ(cudaMemcpyAsync(selected.data(), grouped, selected.size() * sizeof(int),
+                cudaMemcpyDeviceToHost, stream), cudaSuccess);
+            ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+            ASSERT_TRUE(std::all_of(selected.begin(), selected.end(),
+                [routes](int slot) { return slot >= 0 && slot < routes; }));
+        }
+
+        const auto words = static_cast<size_t>(routes) * k_partitions * workload.n;
+        std::array<void *, 2> outputs{
+            argument.template operator()<void *>(verifier ? 6 : 5),
+            gate_up ? argument.template operator()<void *>(6) : nullptr};
+        const size_t output_count = gate_up ? 2 : 1;
+        const size_t arity = gate_up ? 12 : (verifier ? 11 : 9);
+        std::vector<uint32_t> oracle_output(words * output_count);
+        std::vector<uint32_t> aligned_output(words * output_count);
+        const auto read_planes = [&](CUDAWeightPacketAccess access, int poison,
+            GraphOwner &reader, std::vector<uint32_t> &result) {
+            auto params = launch.params;
+            params.func = const_cast<void *>(cudaMoEWeightReferenceEntry(phase, codebook, access));
+            ASSERT_NE(params.func, nullptr);
+            for (size_t index = 0; index < arity; ++index)
+            {
+                size_t original_offset = 0, original_bytes = 0, ref_offset = 0, ref_bytes = 0;
+                ASSERT_EQ(cudaFuncGetParamInfo(launch.params.func, index, &original_offset, &original_bytes),
+                    cudaSuccess);
+                ASSERT_EQ(cudaFuncGetParamInfo(params.func, index, &ref_offset, &ref_bytes), cudaSuccess);
+                ASSERT_EQ(original_offset, ref_offset);
+                ASSERT_EQ(original_bytes, ref_bytes);
+            }
+            cudaGraphNode_t node{};
+            ASSERT_EQ(cudaGraphAddKernelNode(&node, reader.graph, nullptr, 0, &params), cudaSuccess);
+            ASSERT_EQ(cudaGraphKernelNodeCopyAttributes(node, launch.source), cudaSuccess);
+            ASSERT_EQ(cudaGraphInstantiate(&reader.executable, reader.graph, 0), cudaSuccess);
+            for (size_t index = 0; index < output_count; ++index)
+            {
+                ASSERT_NE(outputs[index], nullptr);
+                ASSERT_EQ(cudaMemsetAsync(outputs[index], poison, words * sizeof(uint32_t), stream), cudaSuccess);
+            }
+            ASSERT_EQ(cudaGraphLaunch(reader.executable, stream), cudaSuccess);
+            for (size_t index = 0; index < output_count; ++index)
+                ASSERT_EQ(cudaMemcpyAsync(result.data() + index * words, outputs[index],
+                    words * sizeof(uint32_t), cudaMemcpyDeviceToHost, stream), cudaSuccess);
+            ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+        };
+        GraphOwner oracle, aligned;
+        ASSERT_NO_FATAL_FAILURE(read_planes(CUDAWeightPacketAccess::ByteOracle, 0x53, oracle, oracle_output));
+        ASSERT_NO_FATAL_FAILURE(read_planes(CUDAWeightPacketAccess::Aligned, 0xad, aligned, aligned_output));
+        ASSERT_EQ(std::memcmp(oracle_output.data(), aligned_output.data(), words * output_count * sizeof(uint32_t)), 0);
+        for (size_t index = 0; index < output_count; ++index)
+            ASSERT_TRUE(std::any_of(aligned_output.begin() + index * words,
+                aligned_output.begin() + (index + 1) * words, [](uint32_t value) { return value != 0; }));
+        auto records = probeIndependentCUDAKernels(aligned.graph, stream,
+            CUDAIndependentKernelFixture::StatelessProjection, workload);
+        ASSERT_EQ(records.size(), 1u);
+        const auto *source = llaminar2::native_quantised_formats::forQuantType(workload.format);
+        ASSERT_NE(source, nullptr);
+        const auto packed = llaminar2::nativeQuantisedPackedRegionSizes(workload.n, workload.k, *source);
+        records.front()["logical_weight_request_bytes"] = packed.logicalBytes() * routes * output_count;
+        records.front()["execution_codebook"] = codebook;
+        records.front()["checksum_matches_scalar"] = true;
+        appendCUDAKernelProbeRecords(path, records);
+    }
+}
+#endif
+
 /** @test Replay recorded staged bytes through direct SwiGLU packet publication. */
 TEST_F(Test__CUDAMoEKernel, RuntimeGroupedDecodeSwiGLUPublicationReplay)
 {
@@ -22328,7 +22460,9 @@ TEST_F(Test__CUDAMoEKernel, RuntimeGroupedDecodeSwiGLUPublicationReplay)
             replay_values.data(), two_step_values.data(), replay_values.size(), d_model);
     }
 
-    if (const char *samples = std::getenv("LLAMINAR_TEST_CUDA_MOE_M1_PROBE_JSONL"))
+    const char *weight_reference = std::getenv("LLAMINAR_TEST_CUDA_MOE_M1_WEIGHT_REFERENCE_JSONL");
+    const char *m1_samples = std::getenv("LLAMINAR_TEST_CUDA_MOE_M1_PROBE_JSONL");
+    if (const char *samples = m1_samples ? m1_samples : weight_reference)
     {
         using namespace llaminar2::test;
         appendCUDAKernelProbeRecords(samples, probeIndependentCUDAKernels(
@@ -22353,6 +22487,23 @@ TEST_F(Test__CUDAMoEKernel, RuntimeGroupedDecodeSwiGLUPublicationReplay)
         };
         measure(gate_sequence, "gate_up_native_graph", intermediate, d_model, gate_source, 2);
         measure(down_sequence, "down_native_graph", d_model, intermediate, down_source, 1);
+        if (weight_reference)
+        {
+            ASSERT_NO_FATAL_FAILURE(measureCudaMoEWeightReference(weight_reference,
+                gate_sequence.front(), stream_, CUDAMoEWeightPhase::DecodeGateUp,
+                gate_format->codebook_id,
+                {.operation = "decode_gate_up_weight_planes", .format = std::string(gate_source),
+                 .m = 1, .n = intermediate, .k = d_model}, top_k));
+            ASSERT_NO_FATAL_FAILURE(measureCudaMoEWeightReference(weight_reference,
+                down_sequence.front(), stream_, CUDAMoEWeightPhase::DecodeDown,
+                down_format->codebook_id,
+                {.operation = "decode_down_weight_planes", .format = std::string(down_source),
+                 .m = 1, .n = d_model, .k = intermediate}, top_k));
+            ASSERT_TRUE(graph.launchAndPublishOutputs({fused_output.get()}));
+            const auto replay = copyCudaFP32TensorToHost(fused_output, stream_);
+            expectBitwiseFP32RowsEqual("captured direct SwiGLU after weight-reference replay",
+                replay.data(), two_step_values.data(), replay.size(), d_model);
+        }
     }
 
     expectGroupedDecodeCounter(
@@ -24338,47 +24489,11 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
                     records.front()["execution_codebook"] = format.codebook_id;
                     appendCUDAKernelProbeRecords(timing_path, records);
                     if (weight_probe_path)
-                    {
-                        ASSERT_EQ(d_model % 4, 0);
-                        const size_t words = canonical_route_contributions->numel();
-                        const auto *output = canonical_route_contributions->gpu_data_ptr();
-                        std::vector<uint32_t> oracle_output(words), aligned_output(words);
-                        const auto read_planes = [&](CUDAWeightPacketAccess access,
-                            GraphOwner &reader, std::vector<uint32_t> &result) {
-                            auto packet_params = down_params;
-                            packet_params.func = const_cast<void *>(
-                                cudaMoEDownWeightReferenceEntry(format.codebook_id, access));
-                            ASSERT_NE(packet_params.func, nullptr);
-                            cudaGraphNode_t packet_node{};
-                            ASSERT_EQ(cudaGraphAddKernelNode(&packet_node, reader.graph, nullptr, 0,
-                                &packet_params), cudaSuccess);
-                            ASSERT_EQ(cudaGraphKernelNodeCopyAttributes(packet_node, down_source), cudaSuccess);
-                            ASSERT_EQ(cudaGraphInstantiate(&reader.executable, reader.graph, 0), cudaSuccess);
-                            ASSERT_EQ(cudaGraphLaunch(reader.executable, stream_), cudaSuccess);
-                            ASSERT_EQ(cudaMemcpyAsync(result.data(), output, words * sizeof(uint32_t),
-                                cudaMemcpyDeviceToHost, stream_), cudaSuccess);
-                            ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
-                        };
-                        // This isolated diagnostic may overwrite the captured
-                        // route output. Replay the producer below before any
-                        // later consumer observes that scratch.
-                        GraphOwner oracle, aligned;
-                        ASSERT_NO_FATAL_FAILURE(read_planes(CUDAWeightPacketAccess::ByteOracle, oracle, oracle_output));
-                        ASSERT_NO_FATAL_FAILURE(read_planes(CUDAWeightPacketAccess::Aligned, aligned, aligned_output));
-                        ASSERT_EQ(std::memcmp(oracle_output.data(), aligned_output.data(), words * sizeof(uint32_t)), 0);
-                        ASSERT_TRUE(std::any_of(aligned_output.begin(), aligned_output.end(),
-                            [](uint32_t value) { return value != 0; }));
-                        auto weight_records = probeIndependentCUDAKernels(aligned.graph, stream_,
-                            CUDAIndependentKernelFixture::StatelessProjection,
-                            {.operation = "verifier_routed_down_weight_planes", .format = format.label,
-                             .m = seq_len, .n = d_model, .k = intermediate});
-                        ASSERT_EQ(weight_records.size(), 1u);
-                        weight_records.front()["logical_weight_request_bytes"] =
-                            packed.logicalBytes() * routes.size();
-                        weight_records.front()["execution_codebook"] = format.codebook_id;
-                        weight_records.front()["checksum_matches_scalar"] = true;
-                        appendCUDAKernelProbeRecords(weight_probe_path, weight_records);
-                    }
+                        ASSERT_NO_FATAL_FAILURE(measureCudaMoEWeightReference(weight_probe_path,
+                            {down_source, down_params}, stream_, CUDAMoEWeightPhase::VerifierDown,
+                            format.codebook_id, {.operation = "verifier_routed_down_weight_planes",
+                             .format = format.label, .m = seq_len, .n = d_model, .k = intermediate},
+                            seq_len * top_k));
                     ASSERT_TRUE(graph.launchAndPublishOutputs({runtime_prefill_output.get()}));
                     const auto replay = copyCudaFP32TensorToHost(runtime_prefill_output, stream_);
                     expectBitwiseFP32RowsEqual("captured M4 direct Down after isolated timing",

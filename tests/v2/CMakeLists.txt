@@ -12140,7 +12140,7 @@ if(HAVE_CUDA)
 add_executable(v2_integration_cuda_moe_kernel
     integration/kernels/cuda/Test__CUDAMoEKernel.cpp
     integration/kernels/moe/CanonicalRankBankOriginalCUDA.cu
-    performance/kernels/cuda/roofline/CUDAMoEDownWeightReference.cu)
+    performance/kernels/cuda/roofline/CUDAMoEWeightReference.cu)
 target_link_libraries(v2_integration_cuda_moe_kernel v2_expert_transfer_parity_support GTest::gtest_main CUDA::cudart)
 # Release selects only performance executables. Compile the same captured
 # production fixture against the Release core so timing never mixes snapshot
@@ -12149,7 +12149,7 @@ if(V2_PERF_TESTS_ONLY)
     add_executable(v2_perf_cuda_moe_grouping
         integration/kernels/cuda/Test__CUDAMoEKernel.cpp
         integration/kernels/moe/CanonicalRankBankOriginalCUDA.cu
-        performance/kernels/cuda/roofline/CUDAMoEDownWeightReference.cu)
+        performance/kernels/cuda/roofline/CUDAMoEWeightReference.cu)
     target_link_libraries(v2_perf_cuda_moe_grouping v2_expert_transfer_parity_support GTest::gtest_main CUDA::cudart)
     set(V2_CUDA_GROUPING_PERF_TARGET v2_perf_cuda_moe_grouping)
 else()
