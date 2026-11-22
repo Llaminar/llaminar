@@ -368,3 +368,25 @@ tuned verifier first, median decode was 47.29 tokens/s versus 47.54 for the
 control. With the control first, medians were 47.57 and 48.02 tokens/s for
 control and tuned verifier respectively. Each arm has three measured runs.
 The throughput difference changed direction with run order.
+
+## QFN mirrored drafter vocabulary projection
+
+The matched topology uses a mirrored full-vocabulary head on both CUDA
+participants. The shared MTP sidecar binds the target model's `output.weight`,
+which is Q8_0 at N=248320 and K=2560 in the measured UD-Q4_K_XL model.
+The isolated Release fixture loads that tensor through the native model
+loader and captures the installed M=1 projection with the TP2 serial-policy
+width of 124160. It measures the retained quantize and projection graph and
+checks the full logits for byte-exact repeatability.
+
+| RTX 3090 PCI endpoint | Graph median, µs | GEMV median, µs | Requested weight GB/s |
+| --- | ---: | ---: | ---: |
+| `0000:3f:00.0` | 765.952–766.976 | 763.008–763.072 | 880.64–881.82 |
+| `0000:42:00.0` | 765.952 | 763.008–763.072 | 881.82 |
+
+Each range spans three process medians of 31 retained-graph samples. The
+projection records 7760 CTAs of 32 threads, 38 registers and zero local
+bytes. Its graph requests 675,430,400 packed weight bytes, which puts the
+measured rate within 0.3% of the independent 879.53 GB/s streaming reference.
+This comparison uses requested bytes. The production trace measures a
+larger captured fragment that also contains the routed fold and other work.
