@@ -4118,6 +4118,8 @@ namespace llaminar2::cpu::native_quantised
      * budget and avoids the staged microkernel's repeated call/spill prologue.
      *
      * @tparam IsAsymmetric Whether the prepared matrix carries minimum terms.
+     * @tparam Domain Original signed expansion or canonical unsigned five-bit weights.
+     *        The unsigned body consumes the original signed Q8 row and skips compensation.
      * @param packed Prepared expanded-INT8 matrix.
      * @param row0 First Q8_1 activation row.
      * @param row1 Second Q8_1 activation row.
@@ -4128,7 +4130,8 @@ namespace llaminar2::cpu::native_quantised
      * @param k_tiles Ordered K-partition count.
      * @param k_blocks_per_tile Consecutive blocks in one partition.
      */
-    template <bool IsAsymmetric>
+    template <bool IsAsymmetric,
+              CPUNativeQuantisedCoefficientDomain Domain = CPUNativeQuantisedCoefficientDomain::SignedInt8>
     inline void gemmTwoRowsExpandedAVX512OrderedPartitionsImpl(
         const CPUNativeQuantisedPackedWeights &packed,
         const Q8_1Block *row0,
@@ -4140,7 +4143,21 @@ namespace llaminar2::cpu::native_quantised
         int k_tiles,
         int k_blocks_per_tile)
     {
-        const __m512i bias_128_i32 = _mm512_set1_epi32(128);
+        constexpr bool unsigned_weights = Domain == CPUNativeQuantisedCoefficientDomain::UnsignedFiveBit;
+        static_assert(!unsigned_weights || IsAsymmetric);
+        // A five-bit product and the original biased intermediate both fit
+        // INT32 throughout K32. Only the integer operands change position.
+        const auto activation_word = [](const Q8_1Block &row, int group)
+        {
+            if constexpr (unsigned_weights)
+            {
+                int32_t word;
+                std::memcpy(&word, row.qs + group * 4, sizeof(word));
+                return word;
+            }
+            else
+                return pack_q8_1_unsigned_word(row, group * 4);
+        };
         for (int zbase = 0; zbase < 4; zbase += 2)
         {
             __m512 reduced0_0 = _mm512_setzero_ps();
@@ -4175,34 +4192,44 @@ namespace llaminar2::cpu::native_quantised
                         const __m512i weight1 = _mm512_load_si512(
                             packed.interleavedB(
                                 chunk, kb, group, zbase + 1));
-                        const __m512i a0 = _mm512_set1_epi32(
-                            pack_q8_1_unsigned_word(
-                                activation0, group * 4));
-                        const __m512i a1 = _mm512_set1_epi32(
-                            pack_q8_1_unsigned_word(
-                                activation1, group * 4));
-                        dot0_0 = _mm512_dpbusd_epi32(dot0_0, a0, weight0);
-                        dot0_1 = _mm512_dpbusd_epi32(dot0_1, a0, weight1);
-                        dot1_0 = _mm512_dpbusd_epi32(dot1_0, a1, weight0);
-                        dot1_1 = _mm512_dpbusd_epi32(dot1_1, a1, weight1);
+                        const __m512i a0 = _mm512_set1_epi32(activation_word(activation0, group));
+                        const __m512i a1 = _mm512_set1_epi32(activation_word(activation1, group));
+                        if constexpr (unsigned_weights)
+                        {
+                            dot0_0 = _mm512_dpbusd_epi32(dot0_0, weight0, a0);
+                            dot0_1 = _mm512_dpbusd_epi32(dot0_1, weight1, a0);
+                            dot1_0 = _mm512_dpbusd_epi32(dot1_0, weight0, a1);
+                            dot1_1 = _mm512_dpbusd_epi32(dot1_1, weight1, a1);
+                        }
+                        else
+                        {
+                            dot0_0 = _mm512_dpbusd_epi32(dot0_0, a0, weight0);
+                            dot0_1 = _mm512_dpbusd_epi32(dot0_1, a0, weight1);
+                            dot1_0 = _mm512_dpbusd_epi32(dot1_0, a1, weight0);
+                            dot1_1 = _mm512_dpbusd_epi32(dot1_1, a1, weight1);
+                        }
                     }
 
-                    const int16_t *compensation =
-                        packed.chunkComp(chunk, kb) + zbase * 16;
-                    const __m512i bias0 = _mm512_mullo_epi32(
-                        bias_128_i32,
-                        _mm512_cvtepi16_epi32(_mm256_load_si256(
-                            reinterpret_cast<const __m256i *>(
-                                compensation))));
-                    const __m512i bias1 = _mm512_mullo_epi32(
-                        bias_128_i32,
-                        _mm512_cvtepi16_epi32(_mm256_load_si256(
-                            reinterpret_cast<const __m256i *>(
-                                compensation + 16))));
-                    dot0_0 = _mm512_sub_epi32(dot0_0, bias0);
-                    dot0_1 = _mm512_sub_epi32(dot0_1, bias1);
-                    dot1_0 = _mm512_sub_epi32(dot1_0, bias0);
-                    dot1_1 = _mm512_sub_epi32(dot1_1, bias1);
+                    if constexpr (!unsigned_weights)
+                    {
+                        const __m512i bias_128_i32 = _mm512_set1_epi32(128);
+                        const int16_t *compensation =
+                            packed.chunkComp(chunk, kb) + zbase * 16;
+                        const __m512i bias0 = _mm512_mullo_epi32(
+                            bias_128_i32,
+                            _mm512_cvtepi16_epi32(_mm256_load_si256(
+                                reinterpret_cast<const __m256i *>(
+                                    compensation))));
+                        const __m512i bias1 = _mm512_mullo_epi32(
+                            bias_128_i32,
+                            _mm512_cvtepi16_epi32(_mm256_load_si256(
+                                reinterpret_cast<const __m256i *>(
+                                    compensation + 16))));
+                        dot0_0 = _mm512_sub_epi32(dot0_0, bias0);
+                        dot0_1 = _mm512_sub_epi32(dot0_1, bias1);
+                        dot1_0 = _mm512_sub_epi32(dot1_0, bias0);
+                        dot1_1 = _mm512_sub_epi32(dot1_1, bias1);
+                    }
 
                     const uint16_t *scales =
                         packed.chunkScales(chunk, kb) + zbase * 16;
@@ -4337,6 +4364,13 @@ namespace llaminar2::cpu::native_quantised
         {
             throw std::invalid_argument(
                 "Ordered expanded-INT8 tree received another encoding");
+        }
+        if (packed.coefficientDomain() == CPUNativeQuantisedCoefficientDomain::UnsignedFiveBit)
+        {
+            return gemmTwoRowsExpandedAVX512OrderedPartitionsImpl<
+                true, CPUNativeQuantisedCoefficientDomain::UnsignedFiveBit>(
+                packed, row0, row1, output0, output1, chunk,
+                K_blocks, k_tiles, k_blocks_per_tile);
         }
         if (packed.is_asymmetric)
         {

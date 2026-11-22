@@ -212,3 +212,44 @@ projection and FFN latencies. A comparison run with 64 distinct experts
 has a larger working set and still reuses its weights across samples.
 Quantify its physical reads with the memory-controller counters before
 interpreting the ratio of prepared bytes to latency as DRAM efficiency.
+
+### Ordered AVX-512 five-bit pairs
+
+At Gate/Up N=320 and K=2560, the two-row GPU-aligned tile uses the same
+unsigned Q5 weights and original signed Q8 activations as the single-row
+path. The tile preserves all 16 FP32 partitions and each partial's five
+K32 contributions. It skips the prepared compensation plane for Q5_1
+and Q5_K. Other formats retain their original signed operand program.
+
+The isolated projection test alternated arms on each physical socket and
+checked full and partial K trees against the original pair. The two-row
+leaf was 15.6–19.1% faster with eight distinct experts and 4.5–9.3% faster
+with 64. The production unsigned-weight lifecycle gate passed under both
+runtime ISA selections. It exercises the actual output-tile pair at
+N=320/K=2560 and checks both banks, dirty output tails, and serial bytes.
+The linked unsigned AVX-512 entry contains 64 static `vpdpbusd`
+instructions and no vector stack operands.
+
+The 2×CUDA/2×CPU Release comparison combined the ordered CPU pairs and the
+[packed SM86 decode readers](../../cuda/roofline/README.md#route-matched-decode-weight-reference).
+Both arms used the staged CUDA graph and identical F320/S320 sharding.
+Every arm used one warmup and three measured 256-token requests per mode.
+All generated IDs, prompts, and per-iteration MTP counts matched.
+
+| Arm order | Mode | Control → candidate, tok/s | Decode change |
+| --- | --- | ---: | ---: |
+| Candidate first | Ordinary | 30.836 → 30.342 | −1.60% |
+| Candidate first | Fixed depth seven | 45.589 → 45.074 | −1.13% |
+| Control first | Ordinary | 29.812 → 30.450 | +2.14% |
+| Control first | Fixed depth seven | 44.077 → 45.052 | +2.21% |
+
+The throughput change reversed with run order. These samples qualify the
+available QFN weight file's output parity. The other source formats were
+qualified in captured projection fixtures.
+
+The AVX-512 compact-grid experiment moved the integer center into the
+read-only IQ1_M, IQ2_S, and IQ2_XS lookup tables. All 30 original geometry,
+source, and socket cells remained byte-exact. IQ1_M improved in several
+grouped cells and added 4.0–5.8% to the eight-expert M=1 Gate/Up latency.
+The 64-expert M=1 Gate/Up cells also slowed for IQ2_S and IQ2_XS. The
+production grid arithmetic stays with the original tables.

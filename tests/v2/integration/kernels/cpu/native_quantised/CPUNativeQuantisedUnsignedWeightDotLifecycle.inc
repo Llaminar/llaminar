@@ -4,6 +4,8 @@
  *
  * The ordered pair additionally exercises independent low/high integer sums
  * with opposing signed extrema before the unchanged FP contribution/fold.
+ * Expanded five-bit pairs at QFN Gate/Up geometry must use the admitted
+ * output-tile route and retain the same ordered K32 publication as serial.
  * Canonical source factories and the public serial kernel own grouped-row
  * oracles. Identity-nibble and expanded-five-bit M1 additionally use an
  * independent scalar witness for the original biased integer dot. Prepared
@@ -234,6 +236,7 @@ TEST(CPUNativeQuantisedFusedCompletion, UnsignedWeightDotAllFormatByteLifecycle)
         if (source_five_bit)
         {
             geometries.push_back({65, 768});
+            geometries.push_back({320, 2560});
             if (format.source_is_superblock)
                 geometries.push_back({65, 256});
             else
@@ -420,6 +423,16 @@ TEST(CPUNativeQuantisedFusedCompletion, UnsignedWeightDotAllFormatByteLifecycle)
                                 EXPECT_EQ(plan.projections[0].effective_verifier_schedule, VerifierRowsPolicy::Pairwise);
                                 EXPECT_EQ(plan.projections[0].verifier_resolution.physical_row_tile, 2);
                             }
+#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
+                            if (source_five_bit && geometry.k == 2560 && rows > 1 &&
+                                policy == CPUProjectionNumericalPolicy::GPUAlignedExpert &&
+                                activeISALevel() >= ISALevel::AVX512)
+                            {
+                                ASSERT_EQ(plan.partial_route, NativeQuantisedFusedPartialRoute::OutputTileLocal);
+                                EXPECT_EQ(plan.projections[0].k_blocks_per_tile, 5);
+                                EXPECT_EQ(plan.projections[0].verifier_resolution.physical_row_tile, 2);
+                            }
+#endif
 #endif
                             NativeQuantisedTestPartialStorage partials(plan.sharedPartialFloats());
                             ASSERT_TRUE(gemm_native_quantised_fused_verifier_rows_preq(
