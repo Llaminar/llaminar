@@ -86,10 +86,11 @@ namespace llaminar2::cuda::moe
      * @param down Prepared routed Down execution codebook.
      * @param demand Original graph reads of retained HC intermediates.
      * @param observe Original graph's runtime histogram producer authorization.
+     * @param role Original placement policy resolved by the graph before residency admission.
      * @return Exact cooperative entry, or null when the declared source has no compiled program.
      */
     const void* retainedQFNM1Function(uint8_t gate, uint8_t down, FullNativeHCFFNOutputDemand demand,
-        bool observe);
+        bool observe, RoutedExpertRowExecutionPolicy role);
 
     /** @brief Loaded resident entry, sealed geometry and all permanent participant bindings. */
     class RetainedM1Program final

@@ -387,7 +387,8 @@ private:
                     ? nativeQuantisedCodebookMaskBit(kNativeQuantisedExpandedInt8MinCodebook) : 0u);
                 if (matches(sources[2], d, false) && down.policy_codebook_mask == down_bit &&
                     (down.execution_codebook_mask & ~compiled) == 0u &&
-                    cuda::moe::retainedQFNM1Function(g, d, output_demand_, router_.collect_device_runtime_histogram))
+                    cuda::moe::retainedQFNM1Function(g, d, output_demand_, router_.collect_device_runtime_histogram,
+                        binding_->params.row_policy))
                 {
                     gate_ = g;
                     down_ = d;

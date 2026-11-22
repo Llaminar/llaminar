@@ -14812,6 +14812,7 @@ namespace
      *         residency evidence.
 
      * @tparam PublishDescriptors Publish original arena views in the authenticated route lane.
+     * @tparam ExpertCapacity Cold-admitted original expert extent for the exact selection program.
      * @param logits Original FP32 probabilities in place.
      * @param runtime Original device-owned runtime and acquired bank.
      * @param legacy_indices Complete selected IDs when requested.
@@ -14825,7 +14826,7 @@ namespace
  */
     template <bool UpdateRuntimeHistogram,
               llaminar2::RoutedExpertRowExecutionPolicy RowPolicy = llaminar2::RoutedExpertRowExecutionPolicy::ParticipantAssigned,
-          bool PublishDescriptors = false>
+              bool PublishDescriptors = false, int ExpertCapacity = kMaxExperts>
     __device__ __forceinline__ void softmax_topk_decode_independent_body(
         float *__restrict__ logits,
         DeviceMoELayerRuntimeView *__restrict__ runtime,
@@ -14838,7 +14839,7 @@ namespace
         const int32_t *__restrict__ active_row_count_device,
         llaminar2::MoEDecodeDescriptorPublication publication)
     {
-        __shared__ float values[kMaxExperts];
+        __shared__ float values[ExpertCapacity];
         __shared__ float reductions[kThreads];
         __shared__ int red_idx[kThreads];
         __shared__ int selected[kMaxTopK];
@@ -14889,14 +14890,13 @@ namespace
         }
         __syncthreads();
 
-        moe_select_topk_probabilities_block(
-            values,
-            num_experts,
-            top_k,
-            selected,
-            selected_weights,
-            reductions,
-            red_idx);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+        if constexpr (ExpertCapacity == 512)
+            retainedTopK512(values, top_k, selected, selected_weights, reductions, red_idx);
+        else
+#endif
+            moe_select_topk_probabilities_block(
+                values, num_experts, top_k, selected, selected_weights, reductions, red_idx);
 
         static_assert(RowPolicy == llaminar2::RoutedExpertRowExecutionPolicy::ParticipantAssigned ||
                       RowPolicy == llaminar2::RoutedExpertRowExecutionPolicy::IntermediateShardLocal);
@@ -28075,28 +28075,32 @@ namespace llaminar2::cuda::moe
 
     /** @copydoc retainedQFNM1Function */
     const void* retainedQFNM1Function(uint8_t gate, uint8_t down,
-        FullNativeHCFFNOutputDemand demand, bool observe)
+        FullNativeHCFFNOutputDemand demand, bool observe, RoutedExpertRowExecutionPolicy role)
     {
         namespace formats = llaminar2::native_quantised_formats;
         const bool activated = demand.contains(FullNativeHCFFNOutputRole::HCActivated);
         const bool up = demand.contains(FullNativeHCFFNOutputRole::HCUp);
-        const auto entry = [&]<uint8_t Gate, uint8_t Down, bool Observe>() -> const void* {
+        const auto entry = [&]<uint8_t Gate, uint8_t Down, bool Observe, bool Shard>() -> const void* {
             if (activated)
-                return up ? reinterpret_cast<const void*>(retainedQFNM1HCFFNKernel<Gate, Down, Observe, true, true>)
-                          : reinterpret_cast<const void*>(retainedQFNM1HCFFNKernel<Gate, Down, Observe, true, false>);
-            return up ? reinterpret_cast<const void*>(retainedQFNM1HCFFNKernel<Gate, Down, Observe, false, true>)
-                      : reinterpret_cast<const void*>(retainedQFNM1HCFFNKernel<Gate, Down, Observe, false, false>);
+                return up ? reinterpret_cast<const void*>(retainedQFNM1HCFFNKernel<Gate, Down, Observe, true, true, Shard>)
+                          : reinterpret_cast<const void*>(retainedQFNM1HCFFNKernel<Gate, Down, Observe, true, false, Shard>);
+            return up ? reinterpret_cast<const void*>(retainedQFNM1HCFFNKernel<Gate, Down, Observe, false, true, Shard>)
+                      : reinterpret_cast<const void*>(retainedQFNM1HCFFNKernel<Gate, Down, Observe, false, false, Shard>);
         };
-        const auto select = [&]<bool Observe>() -> const void* {
+        const auto select = [&]<bool Observe, bool Shard>() -> const void* {
             if (gate == formats::Q4_K.codebook_id && down == formats::Q5_1.codebook_id)
-                return entry.template operator()<formats::Q4_K.codebook_id, formats::Q5_1.codebook_id, Observe>();
+                return entry.template operator()<formats::Q4_K.codebook_id, formats::Q5_1.codebook_id, Observe, Shard>();
             if (gate == formats::Q4_K.codebook_id && down == formats::Q8_0.codebook_id)
-                return entry.template operator()<formats::Q4_K.codebook_id, formats::Q8_0.codebook_id, Observe>();
+                return entry.template operator()<formats::Q4_K.codebook_id, formats::Q8_0.codebook_id, Observe, Shard>();
             if (gate == formats::Q5_K.codebook_id && down == formats::Q8_0.codebook_id)
-                return entry.template operator()<formats::Q5_K.codebook_id, formats::Q8_0.codebook_id, Observe>();
+                return entry.template operator()<formats::Q5_K.codebook_id, formats::Q8_0.codebook_id, Observe, Shard>();
             return nullptr;
         };
-        return observe ? select.template operator()<true>() : select.template operator()<false>();
+        if (role == RoutedExpertRowExecutionPolicy::IntermediateShardLocal)
+            return observe ? select.template operator()<true, true>() : select.template operator()<false, true>();
+        if (role == RoutedExpertRowExecutionPolicy::ParticipantAssigned || role == RoutedExpertRowExecutionPolicy::FullyReplicatedLocal)
+            return observe ? select.template operator()<true, false>() : select.template operator()<false, false>();
+        return nullptr;
     }
 
     /** @copydoc RetainedM1Program::prepare */
@@ -28164,7 +28168,7 @@ namespace llaminar2::cuda::moe
                 hc.down_fold != HCDownFold::OrderedPartitions || !hc.down_partials))
             throw std::invalid_argument("Retained QFN HC/FFN requires the original CUDA HC Down reduction geometry");
 
-        const auto* entry = retainedQFNM1Function(gate, down, demand, observe);
+        const auto* entry = retainedQFNM1Function(gate, down, demand, observe, router.local_policy);
         const auto admitted = NativeCooperativeKernelBoundary<NativeCooperativeBackend::CUDA>::prepare(
             device, entry, kThreads, 0, generation);
         auto blocks = std::min(2u * static_cast<unsigned>(hardware.sm_count),

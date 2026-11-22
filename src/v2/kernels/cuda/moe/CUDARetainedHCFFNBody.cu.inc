@@ -320,12 +320,13 @@
      * @tparam ObserveCollectives Whether the original router is the histogram publisher.
      * @tparam PublishHCActivated The graph still consumes the original activated HC row.
      * @tparam PublishHCUp The graph still consumes the original HC logits.
+     * @tparam IndependentLocalShard Assign each selected local fragment on its own lane.
      * @param args Complete original launch binding. Capture-selected publication demand is immutable.
      * @pre The native grid is resident and every CTA has real work for the active original row.
      *      The enclosing native capture selects this positive branch from the device count.
      */
     template<uint8_t GateCodebook, uint8_t DownCodebook, bool ObserveCollectives,
-             bool PublishHCActivated, bool PublishHCUp>
+             bool PublishHCActivated, bool PublishHCUp, bool IndependentLocalShard>
     __global__ __launch_bounds__(kThreads, 2) void retainedQFNM1HCFFNKernel(const __grid_constant__ RetainedM1HCFFN args)
     {
         using namespace llaminar2::cuda::moe;
@@ -366,9 +367,15 @@
 
         if (blockIdx.x == 0)
         {
-            softmax_topk_decode_runtime_body<ObserveCollectives, false, kRetainedQFNExpertCount>(router.logits, runtime, nullptr,
-                router.route_indices, router.route_weights, router.experts, router.top_k, router.normalize, true,
-                router.local_policy, router.position, nullptr, 0, nullptr, nullptr, 0, {}, nullptr, nullptr, -1, 0, nullptr);
+            if constexpr (IndependentLocalShard)
+                softmax_topk_decode_independent_body<ObserveCollectives,
+                    llaminar2::RoutedExpertRowExecutionPolicy::IntermediateShardLocal, false, kRetainedQFNExpertCount>(
+                    router.logits, runtime, router.route_indices, router.route_weights, router.experts, router.top_k,
+                    router.normalize, true, nullptr, {});
+            else
+                softmax_topk_decode_runtime_body<ObserveCollectives, false, kRetainedQFNExpertCount>(router.logits, runtime,
+                    nullptr, router.route_indices, router.route_weights, router.experts, router.top_k, router.normalize, true,
+                    router.local_policy, router.position, nullptr, 0, nullptr, nullptr, 0, {}, nullptr, nullptr, -1, 0, nullptr);
             __syncthreads();
             if (threadIdx.x == 0)
                 releaseRetainedQFNPacket(args.early_packet_ready);

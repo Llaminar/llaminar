@@ -221,6 +221,16 @@ acquire for each of the 48 layers. The follower captures 1,951 nodes. Both
 retain one executable and 49 compilation units per GPU. The real Release
 smoke matched the first 12 reference tokens on the 2×CUDA/2×CPU plan.
 
+The same paired Release workload measured the early-packet revision with
+three 256-token iterations per arm. Both run orders matched every token and
+the complete per-iteration MTP work. Ordinary decode still missed the staged
+speed gate, so the revision remains opt-in.
+
+| Run order | Ordinary control → early packet | Fixed-depth-7 control → early packet |
+| --- | ---: | ---: |
+| Candidate first | 29.089 → 28.234 tok/s (−2.94%) | 43.228 → 44.295 tok/s (+2.47%) |
+| Control first | 29.561 → 27.995 tok/s (−5.30%) | 43.753 → 43.948 tok/s (+0.45%) |
+
 `V2_Integration_CUDA_RetainedHCFFNEarlyPacketReplay` checks the actual
 native fork, both packet edges and the retirement join. It replays the
 recorded serial bytes across the three source pairs and pinned placement
@@ -229,6 +239,23 @@ The same-device acquire uses 10 registers and no local memory. The resident
 entries retain their 96–108 register allocation and zero local bytes. The
 early fork admits fully active rows. The counted replay exercises the
 separate native conditional entry, including empty rows.
+
+On the original intermediate-shard placement policy, the next revision
+resolves each selected expert on its own lane. It keeps the same 512-expert
+TopK selection and serial FP32 normalization. The fragment-routing preflight
+compared this entry with the prior serial resolver on both cards across all
+three source pairs, zero/partial/full local membership, and pinned changes.
+All 24 intermediate-shard entries used 96 registers, 22,080 shared bytes,
+and zero stack or local bytes.
+
+The isolated F320 replay measured both native branches over 64 consecutive
+replays per recorded frame and card. The QFN kernel publishes the original
+operands and the packet witness copies the hidden row and route slots inside
+the native graph. The parallel resolver brought packet completion forward
+by 13.3–63.5 µs compared with the serial resolver. Packet completion preceded
+resident retirement by 10.2–35.8 µs in every measured frame. This fixture
+times the CUDA publication and packet witness on each device. Release
+qualification measures the original mixed CPU transport and model execution.
 
 ### Grouped Gate/Up packets and direct Down on SM86
 

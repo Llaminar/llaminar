@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -254,7 +255,23 @@ void assertEarlyPacketDependencies(cudaGraph_t graph, const void* hidden, const 
 }
 
 /** @brief Select the original invocation contract under test. */
-enum class RetainedReplayRole { Counted, ActiveEarlyPacket };
+enum class RetainedReplayRole { Counted, ActiveEarlyPacket, ActiveShardEarlyPacket };
+
+/** @brief Decode the pointer-free original F640/F320 fragment record carried by the captured runtime. */
+DeviceMoEIntermediateShardBinding originalFragmentTrace()
+{
+    struct BindingRecord
+    {
+        MoEOverlayJointRouteTarget target;
+        uint32_t hidden_columns, source_columns, first_column, local_columns;
+    };
+    static_assert(sizeof(BindingRecord) == sizeof(DeviceMoEIntermediateShardBinding));
+    const BindingRecord record{MoEOverlayJointRouteTarget::fromOriginalCohort(experts, 0, 0, 0),
+        hidden, 2 * width, 0, width};
+    // Only the replay decoder reconstructs a device ABI snapshot. Serving
+    // admission still derives the binding from its authenticated source family.
+    return std::bit_cast<DeviceMoEIntermediateShardBinding>(record);
+}
 
 /** @brief Run the retained positive and empty branches through the original serial trace. */
 void replay(const TracePair& trace, int ordinal, unsigned resident_blocks, RetainedReplayRole role)
@@ -302,7 +319,8 @@ void replay(const TracePair& trace, int ordinal, unsigned resident_blocks, Retai
     Array<RetainedM1Expert> selected{top_k};
     Array<std::uint64_t> signal{1};
     Array<float> packet_hidden{hidden}, packet_route{top_k}, joined_routed{top_k * hidden};
-    const bool early = role == RetainedReplayRole::ActiveEarlyPacket;
+    const bool early = role != RetainedReplayRole::Counted;
+    const bool shard = role == RetainedReplayRole::ActiveShardEarlyPacket;
     const auto* active = early ? nullptr : live.data();
     const auto rows = early ? DeviceRowRange::fullyActive(1) : DeviceRowRange::deviceCounted(1, live.data());
     const RetainedM1HCFFN args{
@@ -319,7 +337,8 @@ void replay(const TracePair& trace, int ordinal, unsigned resident_blocks, Retai
                 primary.data(), secondary.data(), primary_scales.data(), secondary_scales.data()}, .mixed = mixed.data(),
         },
         .router = {runtime.data(), router.data(), logits.data(), route_indices.data(), route_weights.data(),
-            nullptr, experts, top_k, RoutedExpertRowExecutionPolicy::ParticipantAssigned, true},
+            nullptr, experts, top_k, shard ? RoutedExpertRowExecutionPolicy::IntermediateShardLocal
+                : RoutedExpertRowExecutionPolicy::ParticipantAssigned, true},
         .shared = shared, .selected = selected.data(), .route_order = order.data(), .routed_width = width,
         .routed_workspace = {routed_codes.data(), routed_scales.data()},
         .shared_workspace = {shared_codes.data(), shared_scales.data()},
@@ -408,6 +427,8 @@ void replay(const TracePair& trace, int ordinal, unsigned resident_blocks, Retai
         state->prefill_route_capacity = top_k;
         state->participant_id = 0;
         state->participant_count = 2;
+        if (shard)
+            state->intermediate_shard = originalFragmentTrace();
         const unsigned bank_id = trace.moved ? epoch % 2 : 0;
         if (trace.moved)
         {
@@ -424,20 +445,25 @@ void replay(const TracePair& trace, int ordinal, unsigned resident_blocks, Retai
         {
             const bool local = frame.local_routes == 2 || (frame.local_routes == 1 && expert % 2 == 0);
             auto& entry = bank.experts[expert];
-            entry.owner_participant = local ? 0 : 1;
+            entry.owner_participant = shard ? -1 : local ? 0 : 1;
             entry.logical_expert_id = expert;
             entry.local_slot = local ? expert : -1;
             bank.local_compute_mask[expert] = local;
-            bank.replica_role[expert] = uint8_t(local ? DeviceMoEReplicaRole::Primary : DeviceMoEReplicaRole::None);
-            bank.resident_participant_mask[expert] = local ? 1u : 0u;
-            bank.overlay_route_participant[expert] = entry.owner_participant;
+            bank.replica_role[expert] = uint8_t(local && !shard ? DeviceMoEReplicaRole::Primary : DeviceMoEReplicaRole::None);
+            bank.resident_participant_mask[expert] = local && !shard ? 1u : 0u;
+            bank.overlay_route_participant[expert] = shard ? MoEOverlayRouteTarget::cohort(local ? 0 : 1).word()
+                                                          : entry.owner_participant;
             if (!local) continue;
             const auto& original = (physical_moved && expert % 3 != 0 ? moved : compact)[expert % compact.size()];
             entry.gate = original.gate;
             entry.up = original.up;
             entry.down = original.down;
             entry.flags = toMoEExpertFlags(DeviceMoEExpertFlags::Valid | DeviceMoEExpertFlags::Resident |
-                DeviceMoEExpertFlags::PreferredOwner | DeviceMoEExpertFlags::LocalCompute);
+                DeviceMoEExpertFlags::LocalCompute);
+            if (shard)
+                entry.projection_set = DeviceMoEProjectionSet::IntermediateShard;
+            else
+                entry.flags |= toMoEExpertFlags(DeviceMoEExpertFlags::PreferredOwner);
         }
         if (!trace.moved)
             state->banks[1] = bank;
@@ -505,6 +531,16 @@ TEST(CUDARetainedHCFFN, RecordedEarlyPacketPublications)
     const auto blocks = std::min(2u * static_cast<unsigned>(device.sm_count), hidden / retained_hc_read_warp_channels);
     for (const auto& trace : traces)
         ASSERT_NO_THROW(replay(trace, ordinal, blocks, RetainedReplayRole::ActiveEarlyPacket));
+}
+
+/** @test Replay serial publications with independent original local fragment ownership. */
+TEST(CUDARetainedHCFFN, RecordedFragmentRouting)
+{
+    const int ordinal = selectVisibleSM86();
+    const auto& device = cudaHardwareMetadata().at(ordinal);
+    const auto blocks = std::min(2u * static_cast<unsigned>(device.sm_count), hidden / retained_hc_read_warp_channels);
+    for (const auto& trace : traces)
+        ASSERT_NO_THROW(replay(trace, ordinal, blocks, RetainedReplayRole::ActiveShardEarlyPacket));
 }
 
 #if CUDART_VERSION >= 12080
