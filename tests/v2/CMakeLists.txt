@@ -12143,6 +12143,15 @@ add_v2_test(V2_Integration_CUDA_NativeQuantised_PrefillWorkspaceEnvelope
 )
 
 if(HAVE_CUDA)
+add_executable(v2_integration_cuda_retained_hc_ffn
+    integration/kernels/cuda/Test__CUDARetainedHCFFN.cpp)
+if(TARGET v2_integration_cuda_retained_hc_ffn)
+    target_link_libraries(v2_integration_cuda_retained_hc_ffn PRIVATE llaminar2_core GTest::gtest_main CUDA::cudart)
+    add_v2_test(V2_Integration_CUDA_RetainedHCFFNCountedReplay
+        COMMAND $<TARGET_FILE:v2_integration_cuda_retained_hc_ffn>
+        LABELS "V2;Integration;ProductionTestPreflight;CUDA;MoE;Hyperconnection;GraphCapture;Replay;ByteExact;Regression;HardwareOptional;LocalHostDevices;Devices1;NativeISA-sm_86"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 120)
+endif()
 add_executable(v2_integration_cuda_moe_kernel
     integration/kernels/cuda/Test__CUDAMoEKernel.cpp
     integration/kernels/moe/CanonicalRankBankOriginalCUDA.cu
@@ -39047,6 +39056,9 @@ if(HAVE_ROCM AND TARGET v2_test_qwen4exp_device_primitives)
 endif()
 if(HAVE_CUDA AND TEST V2_Integration_CUDABranchNormReplay)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDABranchNormReplay)
+endif()
+if(HAVE_CUDA AND TEST V2_Integration_CUDA_RetainedHCFFNCountedReplay)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDA_RetainedHCFFNCountedReplay)
 endif()
 
 add_v2_test(V2_Integration_CapturedNativeAllocationOwnership

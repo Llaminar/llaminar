@@ -1,6 +1,6 @@
 /**
  * @file GPUBranchRMSNormBody.cuh
- * @brief Original256-lane HC RMS FMA/reduction/gain body with explicit task/shared storage.
+ * @brief Original HC write, 256-lane norm and ordered read arithmetic.
  *
  * Original standalone and cooperative phases share every arithmetic edge. Exactly
  *256 logical threads enter the reduction; larger physical CTAs explicitly name
@@ -8,6 +8,9 @@
  */
 #pragma once
 #include <cstdint>
+#if defined(__CUDACC__)
+#include "kernels/common/OriginalSingleQ8Block32.cuh"
+#endif
 namespace llaminar2::qwen4exp::branch_norm_native {
 /** @brief Assembly of the first two fixed tree levels. */
 enum class SquareSumPublication { SharedEdge128, WaveOwnsBothRoots };
@@ -100,6 +103,40 @@ __device__ __forceinline__ float residualGate(float logit) {
 __device__ __forceinline__ float residualValue(float residual,float gate,float block) {
  return __fadd_rn(residual,__fmul_rn(gate,block));
 }
+/**
+ * @brief Append one rounded HC read term in checkpoint branch order.
+ * @param sum FP32 accumulator after the preceding branches.
+ * @param logit Original completed Up value for this branch and channel.
+ * @param normalized Original normalized branch value at this channel.
+ * @return One original sigmoid-gated FP32 FMA.
+ */
+__device__ __forceinline__ float appendReadBranch(float sum, float logit, float normalized)
+{
+    const float gate = 1.0f / (1.0f + expf(-logit));
+    return fmaf(gate, normalized, sum);
+}
+#if defined(__CUDACC__)
+/** @brief Publish the same original CUDA norm value as FP32 and Q8. */
+struct CUDAQuantizedPublication
+{
+    float* normalized;
+    std::int8_t* codes;
+    float* scales;
+
+    /**
+     * @brief Send the rounded norm value to its prepared destinations.
+     * @param index Original branch-major output channel.
+     * @param value Exact original normalized FP32 value.
+     * @pre The owning warp participates with one full K32 block.
+     */
+    __device__ __forceinline__ void publish(std::uint64_t index, float value) const
+    {
+        const auto block = index / 32;
+        normalized[index] = value;
+        original_single_q8::publish(value, true, codes + block * 32, scales + block, nullptr, threadIdx.x % 32);
+    }
+};
+#endif
 /** @brief An existing branch's immutable values; publication is already owned. */
 struct RetainedBranchInput {
  const float* values;

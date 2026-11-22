@@ -29,6 +29,9 @@ class DeviceWorkspaceManager;
 class IDeviceContext;
 struct WorkspaceRequirements;
 namespace rocm { struct FullNativeHCFFNPrefixArgs; }
+#ifdef HAVE_CUDA
+namespace cuda::moe { struct RetainedHCPrefix; }
+#endif
 
 /** @brief Exact frozen matrix and prepared store identity validated before graph mutation. */
 class Qwen4ExpPreparedProjection final
@@ -174,6 +177,10 @@ public:
     virtual void invalidatePhaseBindings()=0;
     /** @return Exact original source kind, never inferred from nullable kernel operands. */
     virtual Qwen4ExpHCTrunkSource trunkSource() const noexcept { return Qwen4ExpHCTrunkSource::PreviousWrite; }
+#ifdef HAVE_CUDA
+    /** @return Original prepared CUDA prefix with its serial GEMV schedule and arena leases. */
+    virtual const cuda::moe::RetainedHCPrefix& cudaPrefixArguments() const=0;
+#endif
 };
 
 /** @brief Reusable graph composition with a single-use paired-write capability. */

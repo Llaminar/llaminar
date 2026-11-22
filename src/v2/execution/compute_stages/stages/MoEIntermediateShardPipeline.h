@@ -270,4 +270,11 @@ namespace llaminar2
      * @param previous_write_node Original attention write terminal.
      */
     void lowerRetainedM1HCFFNMainInference(ComputeGraph& graph,const std::string& previous_write_node);
+
+    /**
+     * @brief Close one mapped CUDA M1 region at its existing local route producer.
+     * @param graph Original composed participant graph with explicit ticket and collective nodes.
+     * @param previous_write_node Original attention residual write joined to the staged FFN read.
+     */
+    void lowerCUDAMappedRetainedM1HCFFN(ComputeGraph& graph,const std::string& previous_write_node);
 }

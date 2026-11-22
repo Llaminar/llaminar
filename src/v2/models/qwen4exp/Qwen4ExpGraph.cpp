@@ -9,6 +9,7 @@
  */
 #include "Qwen4ExpGraph.h"
 #include "execution/moe/MoERoutedExpertPlacementPlan.h"
+#include "execution/moe/MoEIntermediateShardStaticGraphAdmission.h"
 #include "Qwen4ExpEarlyCurrentInput.h"
 #include "execution/qwen4exp/PooledImmutableSourceRootBinding.h"
 #include "execution/qwen4exp/PooledImmutableRetainedParticipants.h"
@@ -88,6 +89,13 @@ void Qwen4ExpGraph::postLayerComposition(ComputeGraph &graph, const LayerComposi
 #endif
     const auto &internalBoundary = composition.attention_terminal;
     const auto *boundary=graph.getNode(internalBoundary);
+    if(composition.device.is_cuda() && config_.moe.routed_expert_plan &&
+        hasMappedGPUCPUIntermediateShardTopology(*config_.moe.routed_expert_plan) &&
+        qfnCUDAMappedRetainedM1HCFFNCandidate())
+    {
+        lowerCUDAMappedRetainedM1HCFFN(graph,internalBoundary);
+        return;
+    }
     if(useQwen4ExpRetainedM1HCFFN(qfnRetainedM1HCFFNEnabled(qualified_domain &&
         config_.flash_next->hasRetainedM1HCFFNSources(composition.layer)),
         input.execution_phase,input.execution_role,input.seq_len,input.batch_size)) {

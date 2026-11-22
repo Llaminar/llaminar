@@ -688,6 +688,15 @@ namespace llaminar2
         const cudaKernelNodeParams &params,
         const char *semantic_name)
     {
+        return appendKernel(branch, params, semantic_name, CUDACapturedKernelGrid::Ordinary);
+    }
+
+    bool CUDAActiveCaptureConditional::appendKernel(
+        CUDAActiveCaptureConditionalBranch branch,
+        const cudaKernelNodeParams &params,
+        const char *semantic_name,
+        CUDACapturedKernelGrid grid)
+    {
         const std::size_t index = branchIndex(branch);
         if (state_ != State::BuildingBranches || index >= branch_graphs_.size() ||
             (branch == CUDAActiveCaptureConditionalBranch::ElseZero &&
@@ -695,6 +704,7 @@ namespace llaminar2
             return fail(
                 "CUDA active-capture conditional branch kernel was appended out of lifecycle order");
         if (!semantic_name || semantic_name[0] == '\0' || !branch_graphs_[index] ||
+            (grid != CUDACapturedKernelGrid::Ordinary && grid != CUDACapturedKernelGrid::Cooperative) ||
             !params.func || params.gridDim.x == 0 || params.gridDim.y == 0 ||
             params.gridDim.z == 0 || params.blockDim.x == 0 ||
             params.blockDim.y == 0 || params.blockDim.z == 0 ||
@@ -717,6 +727,14 @@ namespace llaminar2
             return fail(
                 std::string("cudaGraphAddKernelNode(active branch '") +
                 semantic_name + "'): " + cudaGetErrorString(status));
+        }
+        if (grid == CUDACapturedKernelGrid::Cooperative)
+        {
+            cudaKernelNodeAttrValue attribute{};
+            attribute.cooperative = 1;
+            const auto result = cudaGraphKernelNodeSetAttribute(node, cudaKernelNodeAttributeCooperative, &attribute);
+            if (result != cudaSuccess)
+                return fail("cudaGraphKernelNodeSetAttribute(cooperative conditional kernel)", result);
         }
         branch_tails_[index] = node;
         ++branch_node_counts_[index];

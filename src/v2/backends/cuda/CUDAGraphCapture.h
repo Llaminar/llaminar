@@ -135,6 +135,13 @@ namespace llaminar2
         IfElse, ///< Non-zero and zero each own a non-empty body.
     };
 
+    /** @brief Native grid semantics for a node recorded inside a CUDA conditional body. */
+    enum class CUDACapturedKernelGrid : std::uint8_t
+    {
+        Ordinary,
+        Cooperative,
+    };
+
     /**
      * @brief Fluently append one device-selected conditional transaction to an active stream capture.
      *
@@ -264,6 +271,20 @@ namespace llaminar2
             CUDAActiveCaptureConditionalBranch branch,
             const cudaKernelNodeParams &params,
             const char *semantic_name);
+
+        /**
+         * @brief Append a kernel with its admitted native grid semantics.
+         * @param branch Device-condition branch receiving the kernel.
+         * @param params Complete immutable kernel launch parameters.
+         * @param semantic_name Stable producer role used in fatal diagnostics.
+         * @param grid Exact grid semantics of the loaded kernel.
+         * @return True when the complete native launch is bound to the branch.
+         */
+        bool appendKernel(
+            CUDAActiveCaptureConditionalBranch branch,
+            const cudaKernelNodeParams &params,
+            const char *semantic_name,
+            CUDACapturedKernelGrid grid);
 
         /**
          * @brief Seal non-empty branches and publish the conditional as the stream tail.

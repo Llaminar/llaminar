@@ -185,6 +185,22 @@ row. The mixed-format positive-row timings were 70.74–72.86 µs in the
 resident program and 87.89–90.77 µs staged. The native counted graph
 contains a 1-CTA predicate and an IF body with the 164×256 cooperative grid.
 
+The mapped CUDA candidate also admits lossless Q5_K Gate/Up promotion.
+The device packs compact and expanded descriptors into separate ranges before
+the arithmetic. Twelve native comparisons cover the three original source
+pairs on both cards with both row contracts. The two promoted pairs preserved
+the staged bytes across 72 pinned-bank changes. Every entry used 96 registers
+and zero local bytes. `V2_Integration_CUDA_RetainedHCFFNCountedReplay`
+replays the recorded staged output digests through the native counted graph.
+
+The Release candidate selected by
+`LLAMINAR_QFN_CUDA_MAPPED_RETAINED_M1_HC_FFN_CANDIDATE=1` captures the
+complete original QFN serial decode graph. At F320/S320 it reduces the
+CUDA root from 3,536 to 2,576 native nodes and the follower from 2,911 to
+1,951. Both retain 49 compilation units and one native executable each.
+The candidate matched the first 12 tokens of the existing ordinary Release
+baseline. Paired 256-token ordinary and fixed-depth-7 qualification is pending.
+
 ### CUDA peer transfers at QFN decode sizes
 
 The two QFN RTX 3090s report direct access in both directions over the

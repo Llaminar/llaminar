@@ -102,30 +102,6 @@ __global__ __launch_bounds__(kThreads, 2) void normKernel(BranchRMSNormArgs a)
     branchNormBody(a);
 
 }
-#if defined(QFN_CUDA)
-/** @brief Publish the original FP32 element and quantize it in its owning warp. */
-struct BranchNormCUDAQuantizedPublication
-{
-    float* normalized;
-    std::int8_t* codes;
-    float* scales;
-
-    /**
-     * @brief Send the same rounded value to the FP32 and Q8 destinations.
-     * @param index Original branch-major output channel.
-     * @param value Exact original normalized FP32 value.
-     * @pre The owning warp participates with one full K32 block.
-     */
-    __device__ __forceinline__ void publish(std::uint64_t index, float value) const
-    {
-        const auto lane = threadIdx.x % 32;
-        const auto block = index / 32;
-        normalized[index] = value;
-        original_single_q8::publish(value, true, codes + block * 32, scales + block, nullptr, lane);
-    }
-};
-#endif
-
 /** @brief Retain original norm producer grid and publish each branch's exact K32 blocks. */
 __global__ __launch_bounds__(kThreads,2) void normSingleQ8Kernel(BranchRMSNormSingleQ8Args args) {
  const auto a=args.norm;
@@ -135,7 +111,7 @@ __global__ __launch_bounds__(kThreads,2) void normSingleQ8Kernel(BranchRMSNormSi
  __shared__ float sums[kThreads];
  const auto task=static_cast<std::size_t>(blockIdx.x);
  branch_norm_native::taskFromInput(branch_norm_native::RetainedBranchInput{a.input + task * a.hidden},
-     a.gain, BranchNormCUDAQuantizedPublication{a.output, args.codes, args.scales},
+     a.gain, branch_norm_native::CUDAQuantizedPublication{a.output, args.codes, args.scales},
      a.hidden, a.epsilon, task, sums, threadIdx.x, true);
 #else
  branchNormBody(a);
@@ -181,7 +157,7 @@ __global__ __launch_bounds__(kThreads, 2) void readKernel(ResidualReadArgs a)
     for (int branch = 0; branch < 4; ++branch)
     {
         const auto offset = base + branch * hidden;
-        sum = fmaf(sigmoid(a.gateLogits[offset]), a.normalized[offset], sum);
+        sum = branch_norm_native::appendReadBranch(sum, a.gateLogits[offset], a.normalized[offset]);
     }
     a.output[i] = sum * 0.25f;
 }

@@ -38,6 +38,9 @@
 #include "interfaces/IWorkspaceConsumer.h"
 #include "kernels/KernelFactory.h"
 #include "kernels/common/ResidentMoEFFN.h"
+#ifdef HAVE_CUDA
+#include "kernels/cuda/moe/CUDARetainedHCFFN.h"
+#endif
 #ifdef HAVE_ROCM
 #include "kernels/rocm/moe/ROCmMoEKernel.h"
 #include "kernels/rocm/gemm/ROCmGroupedFFNFormatSelection.h"
@@ -54,6 +57,7 @@
 #include "utils/PerfStatsCollector.h"
 #include <algorithm>
 #include <array>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <utility>
@@ -659,6 +663,9 @@ namespace
 #include "MoEIntermediateShardGroupedFFNStage.inc"
 #endif
 #include "MoEIntermediateShardResidentStage.inc"
+#ifdef HAVE_CUDA
+#include "MoEIntermediateShardCUDARetainedStage.inc"
+#endif
 
     /** @brief Append only after the selected original route authority has fully validated. */
     MoEIntermediateShardLocalPartial appendLocalPhases(ComputeGraph& graph,const std::shared_ptr<Binding>& binding)
@@ -1130,19 +1137,17 @@ void lowerFullNativeHCFFN(ComputeGraph& graph,const std::string& resident_node,
     lowerFullNativeHCFFNRegion(graph,resident_node,previous_write_node,hc_read_node,false);
 }
 
-/** @brief Lower one exact retained local region with its original invocation role. */
-static void lowerRetainedM1HCFFNForRole(ComputeGraph& graph,const std::string& previous_write_node,
-    ResidentFFNGraphRole role)
+/** @brief Match the staged residual reader to its original attention write. */
+static const ComputeNode& originalM1HCRead(const ComputeGraph& graph,const std::string& previous_write_node)
 {
     using HC=Qwen4ExpPrimitiveStage;
     const auto* boundary=graph.getNode(previous_write_node);
     const auto* write=boundary?dynamic_cast<const HC*>(boundary->stage.get()):nullptr;
-    if(!write||!std::holds_alternative<HC::ResidualWrite>(write->getParams().operation)||!boundary->device.is_rocm())
-        throw std::invalid_argument("Retained M1 HC/FFN requires the original ROCm attention write boundary");
+    if(!write||!std::holds_alternative<HC::ResidualWrite>(write->getParams().operation)||!boundary->device.is_gpu())
+        throw std::invalid_argument("Retained M1 HC/FFN requires the original GPU attention write boundary");
     const auto order=graph.getExecutionOrder();
     const ComputeNode* norm=nullptr;
     const ComputeNode* read=nullptr;
-    const ComputeNode* sink=nullptr;
     const auto depends=[](const ComputeNode& node,const std::string& producer) {
         return std::find(node.dependencies.begin(),node.dependencies.end(),producer)!=node.dependencies.end();
     };
@@ -1160,17 +1165,30 @@ static void lowerRetainedM1HCFFNForRole(ComputeGraph& graph,const std::string& p
         }
     }
     if(!read)throw std::invalid_argument("Retained M1 HC/FFN requires its original staged HC read");
+    return *read;
+}
+
+/** @brief Lower one exact retained ROCm local region with its original invocation role. */
+static void lowerRetainedM1HCFFNForRole(ComputeGraph& graph,const std::string& previous_write_node,
+    ResidentFFNGraphRole role)
+{
+    const auto& read=originalM1HCRead(graph,previous_write_node);
+    const ComputeNode* sink=nullptr;
+    const auto order=graph.getExecutionOrder();
+    const auto depends=[](const ComputeNode& node,const std::string& producer) {
+        return std::find(node.dependencies.begin(),node.dependencies.end(),producer)!=node.dependencies.end();
+    };
     for(const auto& name:order) {
         const auto* node=graph.getNode(name);
         const auto* resident=dynamic_cast<const ResidentStage*>(node->stage.get());
-        if(!resident||node->device!=boundary->device)continue;
+        if(!resident||node->device!=read.device)continue;
         const auto* router=graph.getNode(resident->routerName());
-        if(!router||(!depends(*node,read->name)&&!depends(*router,read->name)))continue;
+        if(!router||(!depends(*node,read.name)&&!depends(*router,read.name)))continue;
         if(sink)throw std::invalid_argument("Retained M1 HC/FFN has multiple original local FFN sinks");
         sink=node;
     }
     if(!sink)throw std::invalid_argument("Retained M1 HC/FFN requires its original resident local FFN sink");
-    const auto sink_name=sink->name,read_name=read->name;
+    const auto sink_name=sink->name,read_name=read.name;
     lowerNativeLayoutRouterFFNForRole(graph,sink_name,role);
     lowerFullNativeHCFFNRegion(graph,sink_name,previous_write_node,read_name,true,role);
 }
@@ -1185,6 +1203,82 @@ void lowerRetainedM1HCFFN(ComputeGraph& graph,const std::string& previous_write_
 void lowerRetainedM1HCFFNMainInference(ComputeGraph& graph,const std::string& previous_write_node)
 {
     lowerRetainedM1HCFFNForRole(graph,previous_write_node,ResidentFFNGraphRole::MainInference);
+}
+
+/** @copydoc lowerCUDAMappedRetainedM1HCFFN */
+void lowerCUDAMappedRetainedM1HCFFN(ComputeGraph& graph,const std::string& previous_write_node)
+{
+#ifdef HAVE_CUDA
+    const auto& read=originalM1HCRead(graph,previous_write_node);
+    if(!read.device.is_cuda() || !requiresHeterogeneousTicketSegmentation(graph.nativeCaptureEnvelope()))
+        throw std::invalid_argument("CUDA retained QFN requires the original mapped ticket capture envelope");
+    using HC=Qwen4ExpPrimitiveStage;
+    const auto& mixed=std::get<HC::ResidualRead>(static_cast<const HC&>(*read.stage).getParams().operation).output;
+    const auto order=graph.getExecutionOrder();
+    const MoERoutingStage* router=nullptr;
+    const SharedExpertFFNStage* shared=nullptr;
+    std::string router_name,shared_name;
+    const auto depends=[](const ComputeNode& node,const std::string& producer) {
+        return std::find(node.dependencies.begin(),node.dependencies.end(),producer)!=node.dependencies.end();
+    };
+    for(const auto& name:order)
+    {
+        const auto& node=*graph.getNode(name);
+        if(node.device!=read.device || !depends(node,read.name))continue;
+        if(const auto* stage=dynamic_cast<const MoERoutingStage*>(node.stage.get());
+            stage && stage->declaration().input==mixed.tensor)
+        {
+            if(router)throw std::invalid_argument("CUDA retained QFN has multiple router readers");
+            router=stage;
+            router_name=name;
+        }
+        if(const auto* stage=dynamic_cast<const SharedExpertFFNStage*>(node.stage.get());
+            stage && stage->declaration().input==mixed.tensor)
+        {
+            if(shared)throw std::invalid_argument("CUDA retained QFN has multiple shared readers");
+            shared=stage;
+            shared_name=name;
+        }
+    }
+    std::shared_ptr<Binding> binding;
+    std::string terminal;
+    for(const auto& name:order)
+    {
+        const auto& node=*graph.getNode(name);
+        const auto* stage=dynamic_cast<const Stage*>(node.stage.get());
+        if(!stage || node.device!=read.device || stage->phase()!=Phase::Compute ||
+            stage->binding()->local_result!=LocalResult::RouteSlots ||
+            stage->binding()->params.router_node!=router_name || !depends(node,router_name))continue;
+        if(binding)throw std::invalid_argument("CUDA retained QFN has multiple route-slot publishers");
+        binding=stage->binding();
+        terminal=name;
+    }
+    if(!router || !shared || !binding || mixed.byteOffset || binding->params.hidden.id!=mixed.buffer)
+        throw std::invalid_argument("CUDA retained QFN requires the original router and local routed/shared publishers");
+    const auto region=Qwen4ExpHyperconnectionBuilder::describeFullNativeReadRegion(graph,previous_write_node,
+        read.name,Qwen4ExpHCInjectionOwnership::KeepOriginalStage);
+    auto prefix=Qwen4ExpHyperconnectionBuilder::retainFullNativeReadPhase(graph,region);
+    auto replacement=std::make_unique<CUDARetainedStage>(binding,router->declaration(),shared->declaration(),
+        std::move(prefix),terminal);
+    const std::vector members{region.previous_write,region.branch_norm,region.down,region.up,region.read,
+        router_name,shared_name,terminal};
+    std::vector<LocalRegionExport> exports;
+    for(const auto& producer:members)
+    {
+        if(producer==terminal)continue;
+        LocalRegionExport export_{.producer=producer,.consumers={}};
+        for(const auto& name:order)
+            if(std::find(members.begin(),members.end(),name)==members.end() && depends(*graph.getNode(name),producer))
+                export_.consumers.push_back(name);
+        if(!export_.consumers.empty())exports.push_back(std::move(export_));
+    }
+    graph.replaceClosedLocalRegion(members,terminal,std::move(replacement),exports,
+        LocalRegionCapturePolicy::HeterogeneousTicketLocal);
+#else
+    (void)graph;
+    (void)previous_write_node;
+    throw std::invalid_argument("CUDA retained QFN requires a compiled CUDA backend");
+#endif
 }
 
 }

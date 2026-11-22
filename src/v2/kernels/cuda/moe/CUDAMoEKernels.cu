@@ -41,6 +41,7 @@
  */
 
 #include "backends/cuda/CUDAHardwareMetadata.h"
+#include "backends/cuda/CUDAGraphCapture.h"
 #include "kernels/common/MoERuntimeDescriptorLaunch.h"
 #include "CUDARouterQ8Prefill.h"
 #include <cuda_runtime.h>
@@ -48,6 +49,9 @@
 #include <cuda_fp16.h>
 #include <cuda/std/__cccl/assert.h>
 
+#include "CUDARetainedHCFFN.h"
+#include "CUDARetainedHCPrefix.cuh"
+#include "kernels/common/NativeCooperativeKernel.cuh"
 #include "kernels/cuda/gemm/CUDANativeQuantisedDecodeCommon.cuh"
 #include "kernels/cuda/gemm/CUDAMoEGroupedPrefillKernels.h"
 #include "kernels/common/DeviceMoEFloatingMatrixDesc.h"
@@ -270,29 +274,7 @@ namespace
                op == kDeviceMoERebalancePlanResidentExpertAssignment;
     }
 
-    struct DeviceNativeQuantisedMatrixDesc
-    {
-        const uint8_t *payload = nullptr;
-        const void *scales = nullptr;
-        const void *mins = nullptr;
-        const void *emins = nullptr;
-        int n = 0;
-        int k = 0;
-        uint32_t blocks_per_row = 0;
-        uint8_t codebook_id = 0;
-        uint8_t allocation_payload_bytes_per_block = 0;
-        uint8_t allocation_has_mins = 0;
-        uint8_t allocation_has_emins = 0;
-        uint8_t source_codebook_id = 0;
-        uint8_t source_is_superblock = 0;
-        uint8_t source_identity_present = 0;
-        uint8_t reserved = 0;
-        uint32_t reserved_tail = 0;
-    };
-
-    static_assert(
-        sizeof(DeviceNativeQuantisedMatrixDesc) == 56,
-        "CUDA MoE descriptor must match the shared device ABI");
+    using llaminar2::DeviceNativeQuantisedMatrixDesc;
 
     struct DeviceMoEExpertDescriptorView
     {
@@ -3111,6 +3093,15 @@ namespace
         }
     }
 
+    /** @brief Temporary assignment state owned by the single decode route publisher. */
+    struct RuntimeDecodeDispatchScratch
+    {
+        bool local_compute_flags[kMaxTopK];
+        int assigned_participants[kMaxTopK];
+        int default_load[kDeviceMoEMaxParticipants];
+        int actual_load[kDeviceMoEMaxParticipants];
+    };
+
     __device__ __forceinline__ void runtime_resolve_decode_dispatch(
         DeviceMoELayerRuntimeView *runtime,
         uint32_t execution_bank,
@@ -3120,20 +3111,19 @@ namespace
         int32_t logical_position,
         llaminar2::RoutedExpertRowExecutionPolicy row_execution_policy,
         bool record_balance,
-        bool *local_compute_flags,
-        int *assigned_participants)
+        RuntimeDecodeDispatchScratch &scratch)
     {
         if (!runtime_shape_ok(
                 runtime, execution_bank, num_experts, top_k) ||
-            !selected_experts ||
-            !local_compute_flags ||
-            !assigned_participants)
+            !selected_experts)
         {
             return;
         }
 
         runtime_require_decode_row_policy(runtime, row_execution_policy);
 
+        auto &local_compute_flags = scratch.local_compute_flags;
+        auto &assigned_participants = scratch.assigned_participants;
         for (int slot = 0; slot < top_k; ++slot)
         {
             local_compute_flags[slot] = false;
@@ -3193,8 +3183,14 @@ namespace
             record_balance &&
             valid_participants;
 
-        int default_load[kDeviceMoEMaxParticipants] = {};
-        int actual_load[kDeviceMoEMaxParticipants] = {};
+        auto &default_load = scratch.default_load;
+        auto &actual_load = scratch.actual_load;
+#pragma unroll
+        for (int participant = 0; participant < kDeviceMoEMaxParticipants; ++participant)
+        {
+            default_load[participant] = 0;
+            actual_load[participant] = 0;
+        }
         bool eligible = false;
         bool used_remote_replica = false;
         uint64_t selected_expert_slots = 0ULL;
@@ -13586,6 +13582,57 @@ namespace
     }
 
     /**
+     * @brief Evaluate admitted half-router rows with the original FMA and warp tree.
+     * @tparam Rows The exact maximum number of rows owned by this block.
+     * @param hidden First original FP32 input row owned by the block.
+     * @param weights Original FP16 weights for this expert.
+     * @param logits First original FP32 output for this expert.
+     * @param width Number of original hidden channels.
+     * @param output_stride Number of experts separating consecutive outputs.
+     * @param live_rows Real rows owned by this block, in the range [1, Rows].
+     * @param warp_sums CTA scratch, readable after the original warp publication join.
+     * @pre Every physical lane participates in the same original dot tree.
+     */
+    template<int Rows>
+    __device__ __forceinline__ void route_logits_fp16_rows(
+        const float* hidden, const __half* weights, float* logits,
+        int width, int output_stride, int live_rows, float (&warp_sums)[Rows][32])
+    {
+        float sums[Rows]{};
+        for (int j = threadIdx.x; j < width; j += blockDim.x)
+        {
+            const float weight = __half2float(weights[j]);
+            for (int row = 0; row < live_rows; ++row)
+                sums[row] += __half2float(__float2half_rn(hidden[static_cast<size_t>(row) * width + j])) * weight;
+        }
+
+        const int lane = threadIdx.x & 31;
+        const int warp = threadIdx.x >> 5;
+        const int num_warps = blockDim.x >> 5;
+        for (int row = 0; row < live_rows; ++row)
+        {
+            float value = sums[row];
+            for (int offset = 16; offset > 0; offset >>= 1)
+                value += __shfl_down_sync(0xffffffffu, value, offset);
+            if (lane == 0)
+                warp_sums[row][warp] = value;
+        }
+        __syncthreads();
+
+        if (warp == 0)
+        {
+            for (int row = 0; row < live_rows; ++row)
+            {
+                float value = lane < num_warps ? warp_sums[row][lane] : 0.0f;
+                for (int offset = 16; offset > 0; offset >>= 1)
+                    value += __shfl_down_sync(0xffffffffu, value, offset);
+                if (lane == 0)
+                    logits[static_cast<size_t>(row) * output_stride] = value;
+            }
+        }
+    }
+
+    /**
      * @brief Actual-half router, one identical per-row dot/tree for all launch modes.
      * @tparam Partitioned Resolve device-owned row intervals before any operand load.
      * @param hidden Original FP32 hidden; register loads round RNE through half.
@@ -13624,46 +13671,11 @@ namespace
         if (tile_rows <= 0)
             return;
 
-        const __half *g = gate_weights + static_cast<size_t>(expert) * d_model;
-        float sums[kRowsPerBlock] = {0.0f, 0.0f, 0.0f, 0.0f};
-        for (int j = threadIdx.x; j < d_model; j += blockDim.x)
-        {
-            const float gv = __half2float(g[j]);
-            for (int tile_row = 0; tile_row < tile_rows; ++tile_row)
-            {
-                const int row = first_row + tile_row;
-                sums[tile_row] += __half2float(__float2half_rn(hidden[static_cast<size_t>(row) * d_model + j])) * gv;
-            }
-        }
-
-        const int lane = threadIdx.x & 31;
-        const int warp = threadIdx.x >> 5;
-        const int num_warps = blockDim.x >> 5;
         __shared__ float warp_sums[kRowsPerBlock][32];
-        for (int tile_row = 0; tile_row < tile_rows; ++tile_row)
-        {
-            float v = sums[tile_row];
-            for (int offset = 16; offset > 0; offset >>= 1)
-                v += __shfl_down_sync(0xffffffffu, v, offset);
-            if (lane == 0)
-                warp_sums[tile_row][warp] = v;
-        }
-        __syncthreads();
-
-        if (warp == 0)
-        {
-            for (int tile_row = 0; tile_row < tile_rows; ++tile_row)
-            {
-                float v = (lane < num_warps) ? warp_sums[tile_row][lane] : 0.0f;
-                for (int offset = 16; offset > 0; offset >>= 1)
-                    v += __shfl_down_sync(0xffffffffu, v, offset);
-                if (lane == 0)
-                {
-                    const int row = first_row + tile_row;
-                    logits[static_cast<size_t>(row) * num_experts + expert] = v;
-                }
-            }
-        }
+        route_logits_fp16_rows(hidden + static_cast<size_t>(first_row) * d_model,
+            gate_weights + static_cast<size_t>(expert) * d_model,
+            logits + static_cast<size_t>(first_row) * num_experts + expert,
+            d_model, num_experts, tile_rows, warp_sums);
     }
 
     /**
@@ -14299,6 +14311,79 @@ namespace
         __syncthreads();
     }
 
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    /**
+     * @brief Merge eight warp-local ordered lists in one warp.
+     * Map real nonnegative probabilities to keys above the consumed sentinel.
+     * Both reductions apply original smallest-expert tie breaking. One CTA
+     * join publishes the local lists before the final ordered merge.
+     * @param probabilities Finished nonnegative FP32 probabilities.
+     * @param top_k Number of slots in the original route ledger.
+     * @param selected Canonical expert IDs in probability and tie order.
+     * @param weights Canonical rounded probabilities before route normalization.
+     * @param warp_values Shared storage for the sorted keys of all eight warps.
+     * @param warp_experts Shared storage for the corresponding expert IDs.
+     * @pre The probability bank contains 512 original experts and the CTA has
+     *      256 lanes. Before another CTA lane reads the output, the caller
+     *      joins the warp containing the final merge.
+     */
+    __device__ __forceinline__ void retainedTopK512(const float* probabilities, int top_k,
+        int* selected, float* weights, float* warp_values, int* warp_experts)
+    {
+        constexpr unsigned lanes = 0xffffffffu;
+        constexpr int width = 256;
+        constexpr int experts = 512;
+        constexpr int warps = width / 32;
+        static_assert(warps * kMaxTopK <= width);
+        const int first = threadIdx.x;
+        const int second = first + width;
+        const int warp = first / 32;
+        const int lane = first % 32;
+        const auto order_key = [](float value) {
+            return value == 0.0f ? 1u : __float_as_uint(value) + 1u;
+        };
+        unsigned low = order_key(probabilities[first]);
+        unsigned high = order_key(probabilities[second]);
+        for (int slot = 0; slot < top_k; ++slot)
+        {
+            const bool use_second = high > low;
+            const unsigned value = use_second ? high : low;
+            const int expert = use_second ? second : first;
+            const unsigned best = __reduce_max_sync(lanes, value);
+            const int winner = __reduce_min_sync(lanes, value == best ? expert : experts);
+            if (lane == 0)
+            {
+                warp_values[slot * warps + warp] = __uint_as_float(best);
+                warp_experts[slot * warps + warp] = winner;
+            }
+            if (winner == first)
+                low = 0;
+            if (winner == second)
+                high = 0;
+        }
+        __syncthreads();
+        if (warp != 0)
+            return;
+
+        int head = 0;
+        for (int slot = 0; slot < top_k; ++slot)
+        {
+            const int address = head * warps + lane;
+            const unsigned value = lane < warps ? __float_as_uint(warp_values[address]) : 0u;
+            const int expert = lane < warps ? warp_experts[address] : experts;
+            const unsigned best = __reduce_max_sync(lanes, value);
+            const int winner = __reduce_min_sync(lanes, value == best ? expert : experts);
+            if (lane == 0)
+            {
+                selected[slot] = winner;
+                weights[slot] = probabilities[winner];
+            }
+            if (winner == expert)
+                ++head;
+        }
+    }
+#endif
+
     /**
      * @brief Publish top-k routes only for the current device-owned live prefix.
      *
@@ -14507,8 +14592,8 @@ namespace
      * these as template policies prevents a captured Static graph from paying
      * register and branch costs for maintenance pointers that are always null.
      */
-    template <bool UpdateRuntimeHistogram, bool ApplyReadyRebalance>
-    __global__ void softmax_topk_decode_runtime_kernel(
+    template <bool UpdateRuntimeHistogram, bool ApplyReadyRebalance, int ExpertCapacity = kMaxExperts>
+    __device__ __forceinline__ void softmax_topk_decode_runtime_body(
         float *__restrict__ logits,
         DeviceMoELayerRuntimeView *__restrict__ runtime,
         DeviceMoELayerRuntimeView *__restrict__ runtime_layers,
@@ -14531,11 +14616,12 @@ namespace
         uint32_t rebalance_command_buffer_count,
         const int32_t *__restrict__ active_row_count_device)
     {
-        __shared__ float values[kMaxExperts];
+        __shared__ float values[ExpertCapacity];
         __shared__ float reductions[kThreads];
         __shared__ int red_idx[kThreads];
         __shared__ int selected[kMaxTopK];
         __shared__ float selected_weights[kMaxTopK];
+        __shared__ RuntimeDecodeDispatchScratch dispatch;
 
         if constexpr (ApplyReadyRebalance)
         {
@@ -14590,8 +14676,13 @@ namespace
         }
         __syncthreads();
 
-        moe_select_topk_probabilities_block(
-            values, num_experts, top_k, selected, selected_weights, reductions, red_idx);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+        if constexpr (ExpertCapacity == 512)
+            retainedTopK512(values, top_k, selected, selected_weights, reductions, red_idx);
+        else
+#endif
+            moe_select_topk_probabilities_block(
+                values, num_experts, top_k, selected, selected_weights, reductions, red_idx);
 
         if (threadIdx.x == 0)
         {
@@ -14613,8 +14704,6 @@ namespace
             for (int k = 0; k < top_k; ++k)
                 topk_sum += selected_weights[k];
 
-            bool local_compute_flags[kMaxTopK] = {};
-            int assigned_participants[kMaxTopK] = {};
             if (shape_ok && row_active)
             {
                 runtime_resolve_decode_dispatch(
@@ -14628,8 +14717,7 @@ namespace
                         : -1,
                     row_execution_policy,
                     UpdateRuntimeHistogram,
-                    local_compute_flags,
-                    assigned_participants);
+                    dispatch);
             }
             for (int k = 0; k < top_k; ++k)
             {
@@ -14638,11 +14726,11 @@ namespace
                                          : selected_weights[k];
                 if (shape_ok)
                 {
-                    const bool local_compute = local_compute_flags[k];
+                    const bool local_compute = row_active && dispatch.local_compute_flags[k];
                     runtime->topk_expert_ids[k] = local_compute ? selected[k] : -1;
                     runtime->topk_weights[k] = local_compute ? weight : 0.0f;
                     runtime->route_participant_ids[k] =
-                        row_active ? assigned_participants[k] : -1;
+                        row_active ? dispatch.assigned_participants[k] : -1;
                 }
                 if (write_legacy_outputs)
                 {
@@ -14662,7 +14750,7 @@ namespace
                     atomicAdd(reinterpret_cast<unsigned long long *>(
                                   &runtime_selected_histogram(*runtime, 0u)[expert]),
                               static_cast<unsigned long long>(1));
-                    if (shape_ok && local_compute_flags[k])
+                    if (shape_ok && dispatch.local_compute_flags[k])
                     {
                         atomicAdd(reinterpret_cast<unsigned long long *>(
                                       &runtime_local_histogram(*runtime, 0u)[expert]),
@@ -14671,6 +14759,36 @@ namespace
                 }
             }
         }
+    }
+
+    /** @copydoc softmax_topk_decode_runtime_body */
+    template <bool UpdateRuntimeHistogram, bool ApplyReadyRebalance>
+    __global__ void softmax_topk_decode_runtime_kernel(
+        float* __restrict__ logits,
+        DeviceMoELayerRuntimeView* __restrict__ runtime,
+        DeviceMoELayerRuntimeView* __restrict__ runtime_layers,
+        float* legacy_indices, float* legacy_weights,
+        int num_experts, int top_k, bool normalize_weights, bool write_legacy_outputs,
+        llaminar2::RoutedExpertRowExecutionPolicy row_execution_policy,
+        const int32_t* __restrict__ absolute_position_ids,
+        const DeviceMoERebalancePlanEntryView* rebalance_plan_entries,
+        uint32_t rebalance_plan_capacity,
+        DeviceMoERebalanceCommandBufferHeaderView* rebalance_command_header,
+        const DeviceMoEExpertDirectoryEntryView* rebalance_local_transfer_slots,
+        uint32_t rebalance_local_transfer_slot_count,
+        DeviceMoERebalanceConfigView rebalance_config,
+        DeviceMoERebalanceApplyStatusView* rebalance_apply_status,
+        DeviceMoERebalanceGraphControllerStateView* rebalance_controller_state,
+        int rebalance_target_layer, uint32_t rebalance_command_buffer_count,
+        const int32_t* __restrict__ active_row_count_device)
+    {
+        softmax_topk_decode_runtime_body<UpdateRuntimeHistogram, ApplyReadyRebalance>(
+            logits, runtime, runtime_layers, legacy_indices, legacy_weights, num_experts,
+            top_k, normalize_weights, write_legacy_outputs, row_execution_policy,
+            absolute_position_ids, rebalance_plan_entries, rebalance_plan_capacity,
+            rebalance_command_header, rebalance_local_transfer_slots, rebalance_local_transfer_slot_count,
+            rebalance_config, rebalance_apply_status, rebalance_controller_state, rebalance_target_layer,
+            rebalance_command_buffer_count, active_row_count_device);
     }
 
     /**
@@ -14957,8 +15075,7 @@ __global__ void softmax_topk_decode_descriptors_kernel(
                 "decode route assignment ledger is absent or undersized");
             return;
         }
-        bool local_compute_flags[kMaxTopK] = {};
-        int assigned_participants[kMaxTopK] = {};
+        RuntimeDecodeDispatchScratch dispatch{};
         if (shape_ok)
         {
             runtime_resolve_decode_dispatch(
@@ -14972,8 +15089,7 @@ __global__ void softmax_topk_decode_descriptors_kernel(
                     : -1,
                 row_execution_policy,
                 update_runtime_histogram,
-                local_compute_flags,
-                assigned_participants);
+                dispatch);
         }
         for (int k = 0; k < top_k; ++k)
         {
@@ -14981,10 +15097,10 @@ __global__ void softmax_topk_decode_descriptors_kernel(
             const float weight = expert_weights[k];
             if (shape_ok)
             {
-                const bool local_compute = local_compute_flags[k];
+                const bool local_compute = dispatch.local_compute_flags[k];
                 runtime->topk_expert_ids[k] = local_compute ? expert : -1;
                 runtime->topk_weights[k] = local_compute ? weight : 0.0f;
-                runtime->route_participant_ids[k] = assigned_participants[k];
+                runtime->route_participant_ids[k] = dispatch.assigned_participants[k];
             }
             if (write_legacy_outputs)
             {
@@ -15004,7 +15120,7 @@ __global__ void softmax_topk_decode_descriptors_kernel(
                 atomicAdd(reinterpret_cast<unsigned long long *>(
                               &runtime_selected_histogram(*runtime, 0u)[expert]),
                           static_cast<unsigned long long>(1));
-                if (shape_ok && local_compute_flags[k])
+                if (shape_ok && dispatch.local_compute_flags[k])
                 {
                     atomicAdd(reinterpret_cast<unsigned long long *>(
                                   &runtime_local_histogram(*runtime, 0u)[expert]),
@@ -23018,6 +23134,8 @@ __global__ void softmax_topk_decode_descriptors_kernel(
             return 8;
         return 16;
     }
+
+#include "CUDARetainedHCFFNBody.cu.inc"
 }
 
 extern "C"
@@ -27853,5 +27971,138 @@ namespace llaminar2::cuda
         publish_router_owned_rows_kernel<<<unsigned((slots + 127) / 128), 128, 0,
             static_cast<cudaStream_t>(stream)>>>(publication, publication.layout.packetBytes());
         return finishLaunch("cudaMoE_publish_owned_rows");
+    }
+}
+
+namespace llaminar2::cuda::moe
+{
+    /** @copydoc retainedQFNM1Function */
+    const void* retainedQFNM1Function(uint8_t gate, uint8_t down,
+        FullNativeHCFFNOutputDemand demand, bool observe)
+    {
+        namespace formats = llaminar2::native_quantised_formats;
+        const bool activated = demand.contains(FullNativeHCFFNOutputRole::HCActivated);
+        const bool up = demand.contains(FullNativeHCFFNOutputRole::HCUp);
+        const auto entry = [&]<uint8_t Gate, uint8_t Down, bool Observe>() -> const void* {
+            if (activated)
+                return up ? reinterpret_cast<const void*>(retainedQFNM1HCFFNKernel<Gate, Down, Observe, true, true>)
+                          : reinterpret_cast<const void*>(retainedQFNM1HCFFNKernel<Gate, Down, Observe, true, false>);
+            return up ? reinterpret_cast<const void*>(retainedQFNM1HCFFNKernel<Gate, Down, Observe, false, true>)
+                      : reinterpret_cast<const void*>(retainedQFNM1HCFFNKernel<Gate, Down, Observe, false, false>);
+        };
+        const auto select = [&]<bool Observe>() -> const void* {
+            if (gate == formats::Q4_K.codebook_id && down == formats::Q5_1.codebook_id)
+                return entry.template operator()<formats::Q4_K.codebook_id, formats::Q5_1.codebook_id, Observe>();
+            if (gate == formats::Q4_K.codebook_id && down == formats::Q8_0.codebook_id)
+                return entry.template operator()<formats::Q4_K.codebook_id, formats::Q8_0.codebook_id, Observe>();
+            if (gate == formats::Q5_K.codebook_id && down == formats::Q8_0.codebook_id)
+                return entry.template operator()<formats::Q5_K.codebook_id, formats::Q8_0.codebook_id, Observe>();
+            return nullptr;
+        };
+        return observe ? select.template operator()<true>() : select.template operator()<false>();
+    }
+
+    /** @copydoc RetainedM1Program::prepare */
+    RetainedM1Program RetainedM1Program::prepare(DeviceId device, const RetainedM1HCFFN& arguments,
+        uint8_t gate, uint8_t down, FullNativeHCFFNOutputDemand demand, bool observe, uint64_t generation)
+    {
+        if (!device.is_cuda())
+            throw std::invalid_argument("Retained QFN HC/FFN requires its original CUDA participant");
+        const auto& hardware = cudaHardwareMetadata().at(device.ordinal);
+        if (hardware.sm_major != 8 || hardware.sm_minor != 6)
+            throw std::invalid_argument("Retained QFN HC/FFN has measured residency only on SM86");
+
+        constexpr int hidden = kQFNDecodeGateUpK;
+        constexpr int width = kQFNDecodeGateUpN;
+        const auto& hc = arguments.hc;
+        const auto& router = arguments.router;
+        const auto valid_q8 = [](const DeviceNativeQuantisedMatrixDesc& descriptor, int n, int k) {
+            return descriptor.valid() && descriptor.n == n && descriptor.k == k &&
+                descriptor.blocks_per_row == unsigned(k / 32) && descriptor.codebook_id == native_formats::Q8_0.codebook_id;
+        };
+        const auto valid_workspace = [](const RetainedM1FFNWorkspace& work) {
+            return work.down_codes && work.down_scales;
+        };
+        const auto same_row = [&](const DeviceRowRange& range) {
+            return range.capacity() == 1 && range.countOwner() == hc.norm.extent.liveRows;
+        };
+        if (hc.write.extent.rows != 1 || hc.norm.extent.rows != 1 ||
+            hc.write.extent.liveRows != hc.norm.extent.liveRows || !same_row(hc.up.rows) ||
+            !same_row(hc.down_publication.rows) || hc.norm.hidden != hidden || hc.write.hidden != hidden ||
+            arguments.routed_width != width || hc.down_publication.columns != width ||
+            router.experts != kRetainedQFNExpertCount || router.top_k <= 0 || router.top_k > kMaxTopK ||
+            !valid_q8(hc.down, width, 4 * hidden) || !valid_q8(hc.up.weights, 4 * hidden, width) ||
+            !valid_q8(arguments.shared.gate, width, hidden) || !valid_q8(arguments.shared.up, width, hidden) ||
+            !valid_q8(arguments.shared.down, hidden, width) || !std::isfinite(hc.norm.epsilon) || hc.norm.epsilon <= 0.0f)
+            throw std::invalid_argument("Retained QFN HC/FFN has a mismatched original row or projection geometry");
+
+        if (!hc.write.residual || !hc.write.block || !hc.write.gateLogits || !hc.write.output ||
+            hc.norm.input != hc.write.output || !hc.norm.gain || !hc.norm.output ||
+            !hc.norm_codes || !hc.norm_scales || !hc.raw_down || hc.up.input != hc.raw_down || !hc.mixed ||
+            !hc.up.primary || !hc.up.residual || !hc.up.primaryScales || !hc.up.residualScales ||
+            hc.up.primary != hc.down_publication.primary || hc.up.residual != hc.down_publication.residual ||
+            hc.up.primaryScales != hc.down_publication.primaryScales ||
+            hc.up.residualScales != hc.down_publication.residualScales ||
+            hc.up.quantizer != Q8ResidualQuantizerPolicy::CUDAFloatScaleNativeReciprocal ||
+            (demand.contains(FullNativeHCFFNOutputRole::HCActivated) && !hc.down_publication.activated) ||
+            (demand.contains(FullNativeHCFFNOutputRole::HCUp) && !hc.up.output) ||
+            !router.runtime || !router.weights || !router.logits || !router.route_indices || !router.route_weights ||
+            !arguments.selected || !arguments.route_order || !arguments.hidden_codes || !arguments.hidden_scales ||
+            !arguments.routed_contributions || !arguments.shared_contribution ||
+            !valid_workspace(arguments.routed_workspace) || !valid_workspace(arguments.shared_workspace))
+            throw std::invalid_argument("Retained QFN HC/FFN is missing an original graph buffer or prepared source");
+
+        if ((arguments.route_publication != RetainedM1RoutePublication::Raw &&
+             arguments.route_publication != RetainedM1RoutePublication::Preweighted) ||
+            (arguments.shared_publication != RetainedM1SharedPublication::PartialBeforeCollective &&
+             (arguments.shared_publication != RetainedM1SharedPublication::GatedComplete ||
+              !arguments.shared_gate_input || !arguments.shared_gate_factor)))
+            throw std::invalid_argument("Retained QFN HC/FFN contribution publication conflicts with its graph");
+
+        constexpr int hc_packets = (4 * hidden) / 32;
+        const auto partitions = hc.down_partitions;
+        if (partitions.count <= 0 || partitions.count > hc_packets ||
+            partitions.blocks_per_partition != (hc_packets + partitions.count - 1) / partitions.count ||
+            (hc.down_fold == HCDownFold::Direct ? partitions.count != 1 :
+                hc.down_fold != HCDownFold::OrderedPartitions || !hc.down_partials))
+            throw std::invalid_argument("Retained QFN HC/FFN requires the original CUDA HC Down reduction geometry");
+
+        const auto* entry = retainedQFNM1Function(gate, down, demand, observe);
+        const auto admitted = NativeCooperativeKernelBoundary<NativeCooperativeBackend::CUDA>::prepare(
+            device, entry, kThreads, 0, generation);
+        const auto blocks = std::min(2u * static_cast<unsigned>(hardware.sm_count),
+            hidden / retained_hc_read_warp_channels);
+        if (blocks > admitted.maximumGrid())
+            throw std::invalid_argument("Retained QFN HC/FFN entry cannot keep the measured CTA grid resident");
+        return {admitted, arguments, blocks};
+    }
+
+    /** @copydoc RetainedM1Program::launch */
+    void RetainedM1Program::launch(void* stream, uint64_t generation) const
+    {
+        const auto native = static_cast<cudaStream_t>(stream);
+        if (!native || native == cudaStreamLegacy || native == cudaStreamPerThread || generation != admission_.generation())
+            throw std::invalid_argument("Retained QFN HC/FFN received a default stream or a stale workspace generation");
+        auto arguments = arguments_;
+        void* parameters[]{&arguments};
+        const auto* count = arguments.hc.norm.extent.liveRows;
+        if (!count)
+        {
+            NativeCooperativeKernelBoundary<NativeCooperativeBackend::CUDA>::launch(
+                admission_, parameters, blocks_, native, generation);
+            return;
+        }
+
+        CUDAActiveCaptureConditional branch(native, CUDAActiveCaptureConditionalKind::IfOnly);
+        const cudaKernelNodeParams launch{.func = const_cast<void*>(admission_.function()),
+            .gridDim = dim3(blocks_), .blockDim = dim3(admission_.threads()), .sharedMemBytes = 0,
+            .kernelParams = parameters, .extra = nullptr};
+        if (!branch.publishPredicate([&](cudaGraphConditionalHandle condition) {
+                retainedQFNM1Predicate<<<1, 32, 0, native>>>(condition, count, arguments.router);
+                return cudaPeekAtLastError() == cudaSuccess;
+            }) || !branch.beginBranches() ||
+            !branch.appendKernel(CUDAActiveCaptureConditionalBranch::IfNonZero, launch,
+                "QFN retained HC/FFN", CUDACapturedKernelGrid::Cooperative) || !branch.commit())
+            throw std::runtime_error(branch.error());
     }
 }

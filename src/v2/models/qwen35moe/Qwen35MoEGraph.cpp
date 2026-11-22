@@ -37,6 +37,7 @@
 #include "execution/moe/MoEIntermediateShardDescriptorDeclaration.h"
 #include "execution/moe/MoEIntermediateShardRuntimeBinding.h"
 #include "execution/moe/MoEIntermediateShardStaticGraphAdmission.h"
+#include "models/qwen4exp/Qwen4ExpRetainedM1HCFFNPolicy.h"
 #include "execution/moe/MoEOverlayActivationBatchInventory.h"
 #include "execution/moe/MoEOverlayPreparedGraphBank.h"
 #include "execution/moe/MoEGraphOwnerProjection.h"
@@ -5270,8 +5271,13 @@ namespace llaminar2
             ? MoEOverlayServicePhaseHint::Prefill : routed_service_phase;
         const bool mapped_shard_grouped = mapped_intermediate_shards &&
             (total_tokens != 1 || mapped_shard_phase != MoEOverlayServicePhaseHint::Decode);
+        const bool mapped_cuda_retained_m1 = config_.flash_next && device.is_cuda() &&
+            mapped_intermediate_shards && !mapped_shard_grouped && !mtp_sidecar_context &&
+            forward_input_construction_ && useQwen4ExpRetainedM1HCFFN(qfnCUDAMappedRetainedM1HCFFNCandidate(),
+                forward_input_construction_->execution_phase, forward_input_construction_->execution_role,
+                total_tokens, batch_size);
         const bool mapped_decode_shared_overlap = [&] {
-            if (!config_.flash_next || !mapped_intermediate_shards || mapped_shard_grouped)
+            if (!config_.flash_next || !mapped_intermediate_shards || mapped_shard_grouped || mapped_cuda_retained_m1)
                 return false;
             // Both measured native backends use the same graph ordering at
             // the existing heterogeneous ticket boundary.
@@ -9804,6 +9810,7 @@ namespace llaminar2
                 }
 
                 std::string captured_local_expert_compute_node;
+                std::vector<std::string> retained_pre_cpu_publications;
                 std::string captured_local_expert_terminal;
                 std::string captured_overlay_ticket_wave;
                 std::string captured_overlay_outbound_wave;
@@ -9828,11 +9835,14 @@ namespace llaminar2
                         prefix + "moe_overlay_outbound_capture";
                     captured_overlay_inbound_wave =
                         prefix + "moe_overlay_inbound_capture";
-                    graph.setGraphCaptureWaveContract(
-                        prefix + "moe_routing",
-                        GraphCaptureWaveContract{
-                            .identity = captured_overlay_ticket_wave,
-                        });
+                    // The CUDA program retires this original local wave.
+                    // Its participant uses only the typed ticket-unit cutpoints.
+                    if (!mapped_cuda_retained_m1)
+                        graph.setGraphCaptureWaveContract(
+                            prefix + "moe_routing",
+                            GraphCaptureWaveContract{
+                                .identity = captured_overlay_ticket_wave,
+                            });
                     if (!canonical_route_contributions)
                     {
                         throw std::runtime_error(
@@ -10043,12 +10053,12 @@ namespace llaminar2
                             captured_local_expert_compute_node,
                             prefix + "moe_routing");
                     }
-                    GraphCaptureWaveContract local_capture_wave{
-                        .identity = captured_overlay_outbound_wave,
-                    };
-                    graph.setGraphCaptureWaveContract(
-                        captured_local_expert_compute_node,
-                        std::move(local_capture_wave));
+                    if (!mapped_cuda_retained_m1)
+                        graph.setGraphCaptureWaveContract(
+                            captured_local_expert_compute_node,
+                            GraphCaptureWaveContract{
+                                .identity = captured_overlay_outbound_wave,
+                            });
 
                     captured_local_expert_terminal =
                         captured_local_expert_compute_node;
@@ -10250,11 +10260,19 @@ namespace llaminar2
                              * must never wait for host parsing: it consumes the
                              * already-published device bytes directly.
                              */
-                            graph.addDependency(
-                                captured_local_expert_compute_node,
-                                dispatch_ticket_publish_name.empty()
-                                    ? dispatch_name
-                                    : dispatch_ticket_publish_name);
+                            if (mapped_cuda_retained_m1)
+                            {
+                                if (dispatch_ticket_publish_name.empty())
+                                    throw std::logic_error("CUDA retained QFN requires the original device ticket publisher");
+                                graph.addDependency(dispatch_ticket_publish_name, captured_local_expert_compute_node);
+                                retained_pre_cpu_publications.push_back(dispatch_ticket_publish_name);
+                            }
+                            else
+                                graph.addDependency(
+                                    captured_local_expert_compute_node,
+                                    dispatch_ticket_publish_name.empty()
+                                        ? dispatch_name
+                                        : dispatch_ticket_publish_name);
 
                             if (!dispatch_ticket_publish_name.empty() &&
                                 requiresHeterogeneousTicketSegmentation(
@@ -10521,7 +10539,7 @@ namespace llaminar2
                                 "Qwen35 MoE captured overlay continuation has no workload-correct final device route-weight publication");
                         }
                     }
-                    else if (mapped_activation_topology &&
+                    else if (!mapped_cuda_retained_m1 && mapped_activation_topology &&
                              !sparse_graph_contract
                                   .ownsDispatchAuthority())
                     {
@@ -12813,7 +12831,15 @@ namespace llaminar2
                             "Qwen35 MoE mapped activation parent produced no dispatch stage");
                     }
                     const auto &cpu_packet = mapped_activation_dispatch_nodes.back();
-                    graph.addDependency(captured_local_expert_compute_node, cpu_packet);
+                    if (mapped_cuda_retained_m1)
+                    {
+                        // The resident program owns routing and local math together.
+                        // The existing dispatch stage consumes both publications after it retires.
+                        graph.addDependency(cpu_packet, captured_local_expert_compute_node);
+                        retained_pre_cpu_publications.push_back(cpu_packet);
+                    }
+                    else
+                        graph.addDependency(captured_local_expert_compute_node, cpu_packet);
                     if (mapped_decode_shared_overlap && planned_shared_device == device)
                         shared_decode_cpu_packet = cpu_packet;
 
@@ -13348,8 +13374,16 @@ namespace llaminar2
                     // The native rooted reduction is still part of the GPU
                     // producer. Retain this frontier before CPU/follower
                     // ingress extends the ordered fold's dependencies below.
-                    const std::string captured_continuation_terminal =
+                    std::string captured_continuation_terminal =
                         ordered_reduce_dependency;
+                    if (!retained_pre_cpu_publications.empty())
+                    {
+                        if (captured_continuation_terminal == captured_local_expert_terminal)
+                            captured_continuation_terminal = retained_pre_cpu_publications.back();
+                        for (const auto& publication : retained_pre_cpu_publications)
+                            if (publication != captured_continuation_terminal)
+                                graph.addDependency(captured_continuation_terminal, publication);
+                    }
                     for (const auto &pending : pending_canonical_ticket_consumes)
                     {
                         // The native reduction also writes the canonical bank.
@@ -13375,7 +13409,7 @@ namespace llaminar2
                          * ordered reducer consumes the completed canonical bank. */
                         graph.addDependency(
                             mapped_activation_return_nodes.front(),
-                            ordered_reduce_dependency);
+                            captured_continuation_terminal);
                         ordered_reduce_dependency = last_return_reduce;
                     }
 
@@ -14547,7 +14581,7 @@ namespace llaminar2
                 (shared_gpu_table_verifier_prefill ||
                  shared_params.force_decode_equivalent_verifier_prefill ||
                  canonical_publication_lowering.usesRankBanks());
-            if (main_verifier_rows &&
+            if (main_verifier_rows && !mapped_cuda_retained_m1 &&
                 !shared_verifier_owns_branch_local_math &&
                 !ffn_terminal.empty())
             {

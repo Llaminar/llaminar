@@ -63,16 +63,17 @@ struct NativePositiveHalfScalePublication {
  * @param output Exact sealed existing activated/Q8 destinations.
  * @param offset Original physical bottleneck element; subgroup aligned to32.
  * @tparam ScalePublication Explicit scale storage policy; original backend by default.
+ * @tparam PublishActivated Materialize the rounded FP32 activation when the graph consumes it.
  * @tparam Output Existing typed output fields after phase row/ownership admission.
  * @param scale_publication Storage-only half publication with unchanged bounded scale math.
  */
-template<class ScalePublication=OriginalScalePublication,class Output>
+template<class ScalePublication=OriginalScalePublication,bool PublishActivated=true,class Output>
 __device__ __forceinline__ void publish(float raw,const Output& output,std::uint64_t offset,
  ScalePublication scale_publication={}) {
  const unsigned lane=offset%32;
  const float scaled=raw*0.25f;
  const float value=scaled*(1.0f/(1.0f+expf(-scaled)));
- output.activated[offset]=value;
+ if constexpr(PublishActivated)output.activated[offset]=value;
  if(!isfinite(value)) {
 #if defined(__HIPCC__)
  __builtin_trap();

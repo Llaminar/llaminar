@@ -26,11 +26,7 @@
 #include <stdexcept>
 #include <utility>
 #include <unordered_set>
-#ifdef HAVE_ROCM
-#include "kernels/rocm/gemm/ROCmPersistentHCRead.h"
-#include "kernels/common/VerifierDispatchTable.h"
-#include "kernels/rocm/gemm/ROCmNativeQuantisedArchitecture.h"
-#include "utils/DebugEnv.h"
+#if defined(HAVE_CUDA) || defined(HAVE_ROCM)
 #include "kernels/rocm/gemm/ROCmFullNativeHCFFN.h"
 #include "kernels/rocm/gemm/ROCmCTAOwnedHCRead.h"
 #include "transfer/TransferEngine.h"
@@ -39,12 +35,23 @@
 #include <bit>
 #include <cstring>
 #endif
+#ifdef HAVE_CUDA
+#include "kernels/cuda/moe/CUDARetainedHCPrefix.h"
+#include "kernels/cuda/gemm/CUDANativeQuantisedPrefillHostPolicy.h"
+#include "kernels/common/GPUQ8ResidualNative.h"
+#endif
+#ifdef HAVE_ROCM
+#include "kernels/rocm/gemm/ROCmPersistentHCRead.h"
+#include "kernels/common/VerifierDispatchTable.h"
+#include "kernels/rocm/gemm/ROCmNativeQuantisedArchitecture.h"
+#include "utils/DebugEnv.h"
+#endif
 
 namespace llaminar2
 {
 namespace
 {
-#ifdef HAVE_ROCM
+#if defined(HAVE_CUDA) || defined(HAVE_ROCM)
 #include "Qwen4ExpPersistentHCReadStage.inc"
 #endif
 /** @brief Fail malformed graph setup before publishing any new graph nodes. */
@@ -523,11 +530,11 @@ std::shared_ptr<Qwen4ExpHCReadPhaseOwner> Qwen4ExpHyperconnectionBuilder::retain
 std::shared_ptr<Qwen4ExpHCReadPhaseOwner> Qwen4ExpHyperconnectionBuilder::retainFullNativeReadPhase(
     ComputeGraph& graph,const Qwen4ExpFullNativeHCRegion& region,Qwen4ExpHCTrunkSource source)
 {
-#ifdef HAVE_ROCM
+#if defined(HAVE_CUDA) || defined(HAVE_ROCM)
     const auto& c=region.context;
-    require(c.device.is_rocm()&&c.rows.capacity==1&&c.arithmetic==Qwen4ExpProjectionArithmetic::Ordinary&&
+    require(c.device.is_gpu()&&c.rows.capacity==1&&c.arithmetic==Qwen4ExpProjectionArithmetic::Ordinary&&
         c.readExecution==Qwen4ExpHCReadExecution::Staged,
-        "Full native HC requires explicit original staged ROCm ordinary M1 declarations");
+        "Full native HC requires explicit original staged GPU ordinary M1 declarations");
     const auto primitive=[&](const std::string& name) {
         const auto* node=graph.getNode(name);
         const auto* stage=node?dynamic_cast<const Qwen4ExpPrimitiveStage*>(node->stage.get()):nullptr;
@@ -605,6 +612,21 @@ std::shared_ptr<Qwen4ExpHCReadPhaseOwner> Qwen4ExpHyperconnectionBuilder::retain
         if(name==region.down||name==region.up||name==region.injection)
             mergeRequirements(*static_cast<const GEMMStage*>(graph.getNode(name)->stage.get()));
     }
+#ifdef HAVE_CUDA
+    if(c.device.is_cuda()) {
+        // The ordinary GEMM quote also contains alternative prefill, side-stream
+        // and projection scratch banks. Serial-family planning is allowed to
+        // overlay those unused alternatives. The fused phase retains only the
+        // named planes its exact CUDA arguments will dereference.
+        std::erase_if(requirements.buffers,[](const WorkspaceDescriptor& bank) {
+            const std::string_view name(bank.name);
+            return name!=GemmWorkspaceBuffers::QUANT_A && name!=GemmWorkspaceBuffers::SCALES_A_BLOCKWISE &&
+                name!=GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS &&
+                name!=kGPUProjectionPrimaryQ8 && name!=kGPUProjectionResidualQ8 &&
+                name!=kGPUProjectionPrimaryQ8Scales && name!=kGPUProjectionResidualQ8Scales;
+        });
+    }
+#endif
     std::optional<Qwen4ExpFloatBinding> injection_binding;
     if(injection) {
         auto* output=dynamic_cast<TensorBase*>(injection->getParams().C);
@@ -617,7 +639,7 @@ std::shared_ptr<Qwen4ExpHCReadPhaseOwner> Qwen4ExpHyperconnectionBuilder::retain
         w?std::optional<Qwen4ExpPrimitiveStage::ResidualWrite>{*w}:std::nullopt,source);
 #else
     (void)graph;(void)region;(void)source;
-    throw std::invalid_argument("Full native HC requires the compiled ROCm backend");
+    throw std::invalid_argument("Full native HC requires a compiled GPU backend");
 #endif
 }
 bool Qwen4ExpHyperconnectionBuilder::lowerAdjacentWriteNorm(ComputeGraph &graph,const std::string &producer)
