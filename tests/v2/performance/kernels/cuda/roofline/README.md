@@ -82,7 +82,7 @@ record 82- and 164-CTA captures on each card for `dram`, `l2`, `dp4a`, `ffma`,
 ```sh
 "$PROBE" 0 ffma 82 > device0-82-ffma.csv
 "$PROBE" hc-ffn-work 2560 320 256 256 512 10 10 > family-work.csv
-"$PROBE" hc-ffn-work 2560 320 640 320 512 10 5 > overlay-work.csv
+"$PROBE" hc-ffn-work 2560 320 320 320 512 10 4 > overlay-work.csv
 python3 tests/v2/performance/kernels/cuda/roofline/score_hc_ffn.py \
     family-work.csv "$CALIBRATIONS"/*.csv > family-reference.csv
 ```
@@ -132,6 +132,24 @@ collective and the model loader were outside this diagnostic.
 | G13 | 11,448,320 | 23.73 | 102.51–103.59 |
 | G14 | 13,496,320 | 26.05 | 107.11–108.20 |
 | G15 | 12,697,600 | 25.14 | 104.18–105.57 |
+
+The real 2×CUDA/2×CPU tensor-sharded graph uses F320/S320. At four live
+local routes, 164 CTAs, and 256 threads per CTA, the standalone resident
+comparison produced these native event medians on the two RTX 3090s.
+
+| Routed Gate/Up and Down | Ideal L2 time | One DRAM stream | Staged | Resident |
+| --- | ---: | ---: | ---: | ---: |
+| Q4_K and Q5_1 | 7.85–7.98 µs | 21.17 µs | 87.42–87.64 µs | 82.94–83.00 µs |
+| Q4_K and Q8_0 | 8.28–8.41 µs | 22.33 µs | 84.61–85.02 µs | 79.74–80.25 µs |
+| Q5_K and Q8_0 | 8.63–8.76 µs | 23.25 µs | 85.98–86.36 µs | 81.96–82.36 µs |
+
+The positive-row fixture reduced 20 native nodes to one and matched the
+staged bytes in 18 states per layout and GPU, including all, partial and
+zero local routed selections. The single-stream DRAM reference is
+25.5–28.4% of the resident time. The fixture omits the mixed graph's
+CPU dispatch and collective dependencies. A device-counted variant passed
+zero/full reset and output guard checks. The conditional graph increased
+transaction time in this standalone fixture.
 
 ### CUDA peer transfers at QFN decode sizes
 

@@ -37,6 +37,14 @@ on the order of 10⁻⁵. The witness establishes that the source-aligned split
 changes the reduction tree. The model comparison also changes the continuation
 transport and prefill implementation.
 
+A frozen-history diagnostic fed both placements the same recorded prompt and
+13 successive teacher tokens through the original coordinated runners. It
+captured 14 finite full-vocabulary rows. The first row, immediately after
+prefill, differed by as much as 1.06 logits with an RMS difference of 0.204.
+At token 10, the tensor-sharded placement ranked 8385 ahead of 4087 by 0.040.
+The apportioned placement ranked 4087 ahead of 8385 by 0.523. The evidence
+establishes a prefill difference and leaves its layer-level source open.
+
 Increasing the tensor-sharded GPU expert budget from 112 to 144 produced all
 256 original tokens and identical MTP counts above. The first pair measured
 44.12 and 45.16 tokens/s at 112 and 144, respectively. The reverse order
