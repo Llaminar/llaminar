@@ -378,6 +378,26 @@ The mixed IQ4 preflight executes both Gate/Up scale orderings against the
 serial-row result. Before and after the shared lookup extraction, the
 compiled ROCm residual reader instruction bytes match for gfx906 and gfx1100.
 
+The wide Down program stages the canonical IQ3 lookup table once per
+64-column tile. The 256- and 512-entry tables consume 1 and 2 KiB of shared
+memory respectively, and the two kernels require 38 registers with zero
+local bytes. IQ1_S and IQ2_XXS instead unroll two consecutive K32 packets,
+keeping the serial accumulation order. The Release replay gives these
+31-sample median ranges across the two RTX 3090s.
+
+| Source | Wide Down, µs | Route-matched weight rate |
+| --- | ---: | ---: |
+| IQ1_S | 9.792–10.176 | 46.5–47.1% |
+| IQ2_XXS | 8.448–8.768 | 52.6–53.0% |
+| IQ3_XXS | 10.112–10.304 | 57.0–57.1% |
+| IQ3_S | 12.928–13.120 | 49.8–52.0% |
+
+The same sweep measured 13 of 21 formats at 80% or above in both wide
+leaf families on both cards. IQ4_XS is close to the Gate/Up threshold,
+and its classification varies between runs. The wide all-format
+production replay checks the two IQ3 shared-memory sizes and exact output
+bytes across repeated launches.
+
 The mixed 2×CUDA/2×CPU QFN dynamic MTP benchmark produced identical
 256-token histories and per-iteration MTP work in both run orders. With the
 tuned verifier first, median decode was 47.29 tokens/s versus 47.54 for the

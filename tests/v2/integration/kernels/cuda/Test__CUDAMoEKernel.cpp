@@ -24578,6 +24578,14 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
                         cudaFuncAttributes attributes{};
                         ASSERT_EQ(cudaFuncGetAttributes(&attributes, params.func), cudaSuccess);
                         EXPECT_EQ(attributes.localSizeBytes, 0u);
+                        if (sm86 && d_model == 2560 && intermediate == 256 &&
+                            !probe_path && !weight_probe_path && !gate_weight_probe_path)
+                        {
+                            if (down_source_format == "IQ3_S")
+                                EXPECT_EQ(attributes.sharedSizeBytes, 512 * sizeof(uint32_t));
+                            if (down_source_format == "IQ3_XXS")
+                                EXPECT_EQ(attributes.sharedSizeBytes, 256 * sizeof(uint32_t));
+                        }
                     }
                 }
                 ASSERT_EQ(direct_publications, 1);
