@@ -95,6 +95,30 @@ and one Down role for each live local route and the always-active shared
 expert. Integer MACs use four per DP4A. The named mixed and PRMT probes can
 explain instruction pressure once the exact reader instruction mix is known.
 
+The native rendezvous probe captures otherwise identical cooperative grids
+with zero, one, and six joins. Each CTA publishes one checked word. Each
+table cell is the median of 63 samples from three fresh processes with
+reversed probe order. The probe checks residency against the loaded CUDA
+entry before recording the graph.
+
+| PCI | CTAs | Zero joins, µs | One join, µs | Six joins, µs | Increment for six joins, µs |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `0000:3f:00.0` | 82 | 1.408 | 2.112 | 5.184 | 3.776 |
+| `0000:42:00.0` | 82 | 1.408 | 2.112 | 5.184 | 3.776 |
+| `0000:3f:00.0` | 164 | 1.472 | 2.176 | 5.184 | 3.712 |
+| `0000:42:00.0` | 164 | 1.536 | 2.112 | 5.184 | 3.648 |
+
+Keep these latency samples alongside the hardware rate calibration. The
+increment estimates rendezvous overhead in an otherwise idle cooperative
+grid. Work imbalance and memory visibility in the model can add to that
+time.
+
+```sh
+for mode in grid-0 grid-1 grid-6; do
+    "$PROBE" 0 "$mode" 164 > "$RENDEZVOUS/device0-164-$mode.csv"
+done
+```
+
 The 15 common tuples span 7.97–10.75 µs for ideal L2 delivery on PCI3f at
 82 CTAs, and 20.73–27.96 µs for one DRAM stream of every compulsory weight
 request. At F640/S320, the Q4_K/Q5_1/Q8_0 model tuple's streaming reference
@@ -139,17 +163,18 @@ comparison produced these native event medians on the two RTX 3090s.
 
 | Routed Gate/Up and Down | Ideal L2 time | One DRAM stream | Staged | Resident |
 | --- | ---: | ---: | ---: | ---: |
-| Q4_K and Q5_1 | 7.85–7.98 µs | 21.17 µs | 87.42–87.64 µs | 82.94–83.00 µs |
-| Q4_K and Q8_0 | 8.28–8.41 µs | 22.33 µs | 84.61–85.02 µs | 79.74–80.25 µs |
-| Q5_K and Q8_0 | 8.63–8.76 µs | 23.25 µs | 85.98–86.36 µs | 81.96–82.36 µs |
+| Q4_K and Q5_1 | 7.85–7.98 µs | 21.17 µs | 85.01–87.56 µs | 70.26–72.18 µs |
+| Q4_K and Q8_0 | 8.28–8.41 µs | 22.33 µs | 84.98–87.71 µs | 69.03–71.23 µs |
+| Q5_K and Q8_0 | 8.63–8.76 µs | 23.25 µs | 89.04–89.06 µs | 73.00–73.04 µs |
 
-The positive-row fixture reduced 20 native nodes to one and matched the
+The positive-row prototype reduced 20 native nodes to one and matched the
 staged bytes in 18 states per layout and GPU, including all, partial and
-zero local routed selections. The single-stream DRAM reference is
-25.5–28.4% of the resident time. The fixture omits the mixed graph's
-CPU dispatch and collective dependencies. A device-counted variant passed
-zero/full reset and output guard checks. The conditional graph increased
-transaction time in this standalone fixture.
+zero local routed selections. Gate/Up uses CTA-local partials and emits
+the Q8 operands for Down. The three timed entries each used 96 registers
+and zero local bytes per thread. The single-stream DRAM reference is
+29.3–32.3% of the resident time. The fixture omits the mixed graph's
+CPU dispatch and collective dependencies. The device-counted variant
+passed zero/full reset and output guard checks and took 78.36–83.66 µs.
 
 ### CUDA peer transfers at QFN decode sizes
 

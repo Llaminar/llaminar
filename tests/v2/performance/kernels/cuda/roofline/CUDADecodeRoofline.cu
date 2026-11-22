@@ -1,12 +1,13 @@
 /**
  * @file CUDADecodeRoofline.cu
- * @brief Calibrate same-device read and arithmetic issue rates for CUDA decode.
+ * @brief Calibrate read rates, arithmetic issue rates, and grid rendezvous for CUDA decode.
  *
  * The probe owns one stream and captures its timed launches before sampling.
  * Host verification observes every output lane outside the measured interval.
  * Counter collection selects the same graph and one physical kernel launch.
  */
 
+#include <cooperative_groups.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -53,7 +54,42 @@ namespace
     constexpr unsigned fmaIterations = 4096;
     constexpr unsigned fmaChains = 8;
 
-    enum class Kernel { Read, Dp4a, BytePermute, Imma, Logic, MixedInteger, Fma };
+    enum class Kernel { Read, Dp4a, BytePermute, Imma, Logic, MixedInteger, Fma, Cooperative };
+
+    /**
+     * @brief Execute the same native cooperative launch with zero or more grid joins.
+     * @tparam Joins Fixed number of grid-wide rendezvous in the measured kernel.
+     * @param output One checksum per participating CTA.
+     */
+    template<unsigned Joins>
+    __global__ __launch_bounds__(threadsPerBlock, 2) void decodeCooperativeCeiling(uint32_t* output)
+    {
+        if constexpr (Joins > 0)
+        {
+            const auto grid = cooperative_groups::this_grid();
+            #pragma unroll
+            for (unsigned join = 0; join < Joins; ++join)
+                grid.sync();
+        }
+        if (threadIdx.x == 0)
+            output[blockIdx.x] = blockIdx.x + Joins;
+    }
+
+    /**
+     * @brief Resolve the fixed cooperative calibration entry before capture.
+     * @param joins Measured join count selected by the command line.
+     * @return The exact native entry or null for an unknown calibration.
+     */
+    const void* cooperativeEntry(unsigned joins)
+    {
+        switch (joins)
+        {
+            case 0: return reinterpret_cast<const void*>(decodeCooperativeCeiling<0>);
+            case 1: return reinterpret_cast<const void*>(decodeCooperativeCeiling<1>);
+            case 6: return reinterpret_cast<const void*>(decodeCooperativeCeiling<6>);
+            default: return nullptr;
+        }
+    }
 
     /** @brief Generate distinct deterministic words for each input vector. */
     __host__ __device__ uint4 inputAt(unsigned index)
@@ -305,10 +341,13 @@ namespace
         unsigned vectors;
         unsigned passes;
         Kernel kernel;
+        unsigned joins = 0;
 
-        /** @return Requested bytes, scalar-lane instruction count, or warp IMMA count per launch. */
+        /** @return Requested bytes, instruction count, or grid joins per launch. */
         uint64_t count() const
         {
+            if (kernel == Kernel::Cooperative)
+                return joins;
             if (kernel == Kernel::Logic || kernel == Kernel::MixedInteger)
                 return uint64_t(blocks) * threadsPerBlock * issueIterations * issueChains *
                     (kernel == Kernel::MixedInteger ? 4u : 1u);
@@ -332,10 +371,13 @@ namespace
     bool measure(const Probe& probe, cudaStream_t stream)
     {
         const unsigned threads = probe.blocks * threadsPerBlock;
+        const bool cooperative = probe.kernel == Kernel::Cooperative;
+        const unsigned results = cooperative ? probe.blocks : threads;
+        const auto* entry = cooperative ? cooperativeEntry(probe.joins) : nullptr;
         uint4* input = nullptr;
         uint4* output = nullptr;
         const bool scalarOutput = probe.kernel != Kernel::Read && probe.kernel != Kernel::Imma;
-        const auto outputBytes = threads * (scalarOutput ? sizeof(uint32_t) : sizeof(uint4));
+        const auto outputBytes = results * (scalarOutput ? sizeof(uint32_t) : sizeof(uint4));
         CUDA_CHECK(cudaMalloc(&output, outputBytes));
         if (probe.kernel == Kernel::Read)
         {
@@ -367,6 +409,13 @@ namespace
                     reinterpret_cast<uint32_t*>(output));
             else if (probe.kernel == Kernel::Imma)
                 decodeImmaCeiling<<<probe.blocks, threadsPerBlock, 0, stream>>>(output);
+            else if (cooperative)
+            {
+                auto* checksums = reinterpret_cast<uint32_t*>(output);
+                void* parameters[]{&checksums};
+                CUDA_CHECK(cudaLaunchCooperativeKernel(entry,
+                    probe.blocks, threadsPerBlock, parameters, 0, stream));
+            }
             else
                 decodeReadCeiling<<<probe.blocks, threadsPerBlock, 0, stream>>>(
                     input, output, probe.vectors, probe.passes);
@@ -398,14 +447,16 @@ namespace
         bool valid = true;
         if (scalarOutput)
         {
-            std::vector<uint32_t> actual(threads);
+            std::vector<uint32_t> actual(results);
             CUDA_CHECK(cudaMemcpyAsync(actual.data(), output, outputBytes,
                                        cudaMemcpyDeviceToHost, stream));
             CUDA_CHECK(cudaStreamSynchronize(stream));
-            for (unsigned thread = 0; thread < threads; ++thread)
+            for (unsigned thread = 0; thread < results; ++thread)
             {
                 uint32_t expected = 0;
-                if (probe.kernel == Kernel::Dp4a)
+                if (cooperative)
+                    expected = thread + probe.joins;
+                else if (probe.kernel == Kernel::Dp4a)
                 {
                     constexpr unsigned sumOfCoefficients = dotChains * (dotChains + 1) / 2;
                     expected = (thread & 127U) * 4 * dotIterations * sumOfCoefficients;
@@ -466,7 +517,7 @@ namespace
                          result.z == expected.z * probe.passes && result.w == expected.w * probe.passes;
             }
         }
-        std::printf("CHECK,%s,%u\n", valid ? "pass" : "fail", threads);
+        std::printf("CHECK,%s,%u\n", valid ? "pass" : "fail", results);
         CUDA_CHECK(cudaEventDestroy(end));
         CUDA_CHECK(cudaEventDestroy(start));
         CUDA_CHECK(cudaGraphExecDestroy(executable));
@@ -486,16 +537,17 @@ int main(int argc, char** argv)
     int device = -1;
     if (argc != 3 && argc != 4)
     {
-        std::fprintf(stderr, "Usage: %s <cuda-device> <dram|l2|dp4a|prmt|imma|lop3|int-mix|ffma> [blocks]\n", argv[0]);
+        std::fprintf(stderr, "Usage: %s <cuda-device> <dram|l2|dp4a|prmt|imma|lop3|int-mix|ffma|grid-0|grid-1|grid-6> [blocks]\n", argv[0]);
         return EXIT_FAILURE;
     }
     const std::string_view ordinal(argv[1]);
     const auto parsed = std::from_chars(ordinal.data(), ordinal.data() + ordinal.size(), device);
     const std::string_view mode(argv[2]);
+    const bool cooperative = mode == "grid-0" || mode == "grid-1" || mode == "grid-6";
     if (parsed.ec != std::errc{} || parsed.ptr != ordinal.data() + ordinal.size() ||
         device < 0 || (mode != "dram" && mode != "l2" && mode != "dp4a" &&
                         mode != "prmt" && mode != "imma" && mode != "lop3" && mode != "int-mix" &&
-                        mode != "ffma"))
+                        mode != "ffma" && !cooperative))
         return EXIT_FAILURE;
 
     CUDA_CHECK(cudaSetDevice(device));
@@ -509,13 +561,15 @@ int main(int argc, char** argv)
     const auto sms = static_cast<unsigned>(properties.multiProcessorCount);
     const auto kernel = mode == "dp4a" ? Kernel::Dp4a : mode == "prmt" ? Kernel::BytePermute :
         mode == "imma" ? Kernel::Imma : mode == "lop3" ? Kernel::Logic :
-        mode == "int-mix" ? Kernel::MixedInteger : mode == "ffma" ? Kernel::Fma : Kernel::Read;
+        mode == "int-mix" ? Kernel::MixedInteger : mode == "ffma" ? Kernel::Fma :
+        cooperative ? Kernel::Cooperative : Kernel::Read;
     if (kernel == Kernel::Imma && properties.major < 8)
     {
         std::fprintf(stderr, "The dense INT8 m16n8k32 reference requires SM80 or newer\n");
         return EXIT_FAILURE;
     }
-    Probe probe{.name = mode, .blocks = 4 * sms, .vectors = 0, .passes = 1, .kernel = kernel};
+    Probe probe{.name = mode, .blocks = (cooperative ? 2 : 4) * sms,
+        .vectors = 0, .passes = 1, .kernel = kernel};
     const bool explicitBlocks = argc == 4;
     if (explicitBlocks)
     {
@@ -526,6 +580,23 @@ int main(int argc, char** argv)
             probe.blocks > std::numeric_limits<unsigned>::max() / (4 * threadsPerBlock))
         {
             std::fprintf(stderr, "Invalid native CTA count\n");
+            return EXIT_FAILURE;
+        }
+    }
+    if (cooperative)
+    {
+        probe.joins = mode == "grid-0" ? 0u : mode == "grid-1" ? 1u : 6u;
+        if (!properties.cooperativeLaunch)
+        {
+            std::fprintf(stderr, "Device cannot launch a cooperative CUDA graph kernel\n");
+            return EXIT_FAILURE;
+        }
+        int blocksPerSM = 0;
+        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &blocksPerSM, cooperativeEntry(probe.joins), threadsPerBlock, 0));
+        if (probe.blocks > static_cast<unsigned>(blocksPerSM) * sms)
+        {
+            std::fprintf(stderr, "Requested CTA count exceeds the cooperative residency limit\n");
             return EXIT_FAILURE;
         }
     }
