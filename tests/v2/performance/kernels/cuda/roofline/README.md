@@ -374,6 +374,24 @@ local bytes. Their launch geometry permits 9 or 16 CTAs per SM. The
 captured all-format replay verifies the fixed reader, CTA width and
 serial-row output bytes.
 
+### QFN-width IQ4 schedule
+
+The interleaved IQ4 reader also uses the fixed 320-column Gate/Up pitch
+and ten-packet Down traversal. Each Gate/Up descriptor resolves its native
+scale program before the packet body. The replay exercises both pairings
+of IQ4_NL and IQ4_XS scale programs at the QFN width.
+
+| Source and projection | Release stage, µs | Matched weight rate |
+| --- | ---: | ---: |
+| IQ4_NL Gate/Up | 31.872 | 81.7% |
+| IQ4_XS Gate/Up | 34.496–34.560 | 86.1–86.3% |
+| IQ4_NL Down | 16.192 | 89.3% |
+
+The Gate/Up readers use 52–54 registers and the Down reader uses 44.
+All three use zero stack, local and shared bytes. This QFN-width
+sweep passed byte parity and measured 15 of 21 Gate/Up and all seven
+admitted Down formats at 80% or above on both RTX 3090s.
+
 ## Route-matched verifier Gate/Up weight reference
 
 The four-row verifier fixture also measures the original Gate/Up scatter

@@ -24145,8 +24145,10 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
     const bool qfn_main_q5 = geometry == "qfn-main-q5";
     const bool qfn_all_gate = geometry == "qfn-all-gate";
     const bool qfn_all_down = geometry == "qfn-all-down";
-    const bool qfn_width = geometry == "qfn" || qfn_main || qfn_main_q5 || qfn_all_gate || qfn_all_down;
-    const bool mixed_iq4 = geometry == "iq4-mixed";
+    const bool qfn_mixed_iq4 = geometry == "qfn-iq4-mixed";
+    const bool qfn_width = geometry == "qfn" || qfn_main || qfn_main_q5 ||
+        qfn_all_gate || qfn_all_down || qfn_mixed_iq4;
+    const bool mixed_iq4 = geometry == "iq4-mixed" || qfn_mixed_iq4;
     ASSERT_TRUE(geometry.empty() || qfn_width || geometry == "iq4" || mixed_iq4 || geometry == "wide");
     const bool wide_geometry = !geometry.empty();
     const int selected_routes = qfnFixtureSelectedRoutes(qfn_width);
@@ -24184,7 +24186,7 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
         // requires 32-value source blocks, so use QFN's Q8 Down for the Gate/Up sweep.
         if (qfn_all_down && source.source_is_superblock)
             continue;
-        const auto &format = qfn_all_gate ? *q8_source : source;
+        const auto &format = (qfn_all_gate || qfn_mixed_iq4) ? *q8_source : source;
         if (qfn_main && std::string_view(format.label) != "Q5_1")
             continue;
         if (qfn_main_q5 && std::string_view(format.label) != "Q8_0")
@@ -24194,7 +24196,8 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
             continue;
         const std::string_view down_source_format{format.label};
         const bool iq4_format = down_source_format == "IQ4_NL" || down_source_format == "IQ4_XS";
-        if ((geometry == "iq4" || mixed_iq4) && !iq4_format)
+        if ((geometry == "iq4" || mixed_iq4) &&
+            std::string_view(source.label) != "IQ4_NL" && std::string_view(source.label) != "IQ4_XS")
             continue;
         SCOPED_TRACE(source.label);
         const std::string_view gate_source = qfn_main ? "Q4_K" : qfn_main_q5 ? "Q5_K" : source.label;
@@ -24566,7 +24569,8 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
                                 (params.blockDim.x == 64 || params.blockDim.x == 128);
                             const bool fixed_qfn_default = params.blockDim.x == 128 &&
                                 (gate_reader == native_formats::Q4_K.codebook_id ||
-                                 gate_reader == native_formats::Q5_K.codebook_id);
+                                 gate_reader == native_formats::Q5_K.codebook_id ||
+                                 llaminar2::isNativeQuantisedIQ4LUTCodebook(gate_reader));
                             const bool fixed_source = qfn_width ? fixed_qfn_tile || fixed_qfn_default
                                 : params.blockDim.x == 128 && (wide_geometry || !iq4_format);
                             const std::string fixed_schedule = "ELi" + std::to_string(intermediate) +
@@ -24593,11 +24597,11 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
                                  source_format == "IQ2_S" || source_format == "IQ2_XS" ||
                                  source_format == "IQ2_XXS" || source_format == "IQ3_S" ||
                                  source_format == "IQ3_XXS" || (sm86 && iq4_format));
-                            // The CUDA C++ symbol encodes the captured WideGrid
-                            // template argument. Timing mode also measures older
-                            // libraries whose leaf predates that argument.
-                            EXPECT_EQ(name.find("ELb1EEE") != std::string_view::npos, wide_grid_reader)
-                                << format.label << " captured the wrong Down reader";
+                            const bool qfn_iq4_reader = sm86 && qfn_width && iq4_format;
+                            EXPECT_EQ(name.contains("ELb1ELi256EEE"), wide_grid_reader)
+                                << format.label << " captured the wrong wide Down reader";
+                            EXPECT_EQ(name.contains("ELb1ELi320EEE"), qfn_iq4_reader)
+                                << format.label << " captured the wrong QFN Down reader";
                         }
                         EXPECT_EQ(params.gridDim.x, static_cast<unsigned>((d_model + 63) / 64));
                         EXPECT_EQ(params.gridDim.y, static_cast<unsigned>(seq_len * top_k));

@@ -20824,7 +20824,9 @@ __global__ void softmax_topk_decode_descriptors_kernel(
     }
 
     /**
-     * @brief Evaluate one fixed wide Gate/Up interval using a shared activation layout.
+     * @brief Evaluate one fixed Gate/Up interval using a shared activation layout.
+     * @tparam Pitch Admitted output-column pitch of each K32 weight plane.
+     * @tparam Packets Exact K32 interval in the canonical split-K tree.
      * @param gate Admitted Gate planes.
      * @param up Admitted Up planes.
      * @param codes Aligned original Q8 activation row.
@@ -20834,6 +20836,7 @@ __global__ void softmax_topk_decode_descriptors_kernel(
      * @param gate_out Receives the ordered Gate partial.
      * @param up_out Receives the ordered Up partial.
      */
+    template <int Pitch, int Packets>
     __device__ __forceinline__ void moe_iq4_interleaved_gate_up(
         const DeviceNativeQuantisedMatrixDesc &gate, const DeviceNativeQuantisedMatrixDesc &up,
         const int8_t *codes, const float *scales, int column, int first_packet,
@@ -20841,14 +20844,14 @@ __global__ void softmax_topk_decode_descriptors_kernel(
     {
         constexpr auto nl = native_formats::IQ4_NL.codebook_id;
         constexpr auto xs = llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook;
-        const int base = first_packet * kWideVerifierGateN + column;
+        const int base = first_packet * Pitch + column;
         const auto evaluate = [&]<uint8_t Gate, uint8_t Up>() {
             float gate_sum = 0.0f;
             float up_sum = 0.0f;
 #pragma unroll
-            for (int index = 0; index < kWideVerifierGatePackets; ++index)
+            for (int index = 0; index < Packets; ++index)
             {
-                const int linear = base + index * kWideVerifierGateN;
+                const int linear = base + index * Pitch;
                 const auto activation = moe_iq4_interleaved_activation(codes + (first_packet + index) * 32);
                 const float activation_scale = scales[first_packet + index];
                 gate_sum = __fadd_rn(gate_sum, moe_iq4_interleaved_contribution<Gate>(
@@ -20876,25 +20879,26 @@ __global__ void softmax_topk_decode_descriptors_kernel(
     }
 
     /**
-     * @brief Publish one wide IQ4 Down column with the original ordered K32 fold.
+     * @brief Publish one fixed-width IQ4 Down column with the original ordered K32 fold.
      * @tparam Codebook Admitted IQ4 physical family.
+     * @tparam ReductionWidth Admitted complete K32 reduction width.
      * @param desc Original Down descriptor, validated before evaluation.
      * @param codes Aligned SwiGLU activation row.
      * @param scales Original SwiGLU K32 scales.
      * @param column Output column.
      * @return Byte-equivalent final Down projection value.
      */
-    template <uint8_t Codebook>
+    template <uint8_t Codebook, int ReductionWidth>
     __device__ __forceinline__ float moe_iq4_interleaved_down(
         const DeviceNativeQuantisedMatrixDesc &desc, const int8_t *codes,
         const float *scales, int column)
     {
         constexpr auto nl = native_formats::IQ4_NL.codebook_id;
         constexpr auto xs = llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook;
-        if (!native_quantised_desc_shape_ok<Codebook>(desc, kWideVerifierDownN, kWideVerifierDownK))
+        if (!native_quantised_desc_shape_ok<Codebook>(desc, kWideVerifierDownN, ReductionWidth))
             return 0.0f;
-        constexpr int packets = kWideVerifierDownK / 32;
-        constexpr bool stage_activation = Codebook == nl;
+        constexpr int packets = ReductionWidth / 32;
+        constexpr bool stage_activation = Codebook == nl && ReductionWidth == kWideVerifierDownK;
         struct alignas(16) PreparedActivation
         {
             MoEIQ4InterleavedActivation codes[packets];
@@ -20929,7 +20933,7 @@ __global__ void softmax_topk_decode_descriptors_kernel(
             }
             return sum;
         };
-        if constexpr (stage_activation)
+        if constexpr (Codebook == nl)
             return evaluate.template operator()<nl>();
         else
             return desc.codebook_id == xs ? evaluate.template operator()<xs>()
@@ -21021,10 +21025,9 @@ __global__ void softmax_topk_decode_descriptors_kernel(
         float gate_partial = 0.0f;
         float up_partial = 0.0f;
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 860
-        if constexpr (Pitch == kWideVerifierGateN && Packets == kWideVerifierGatePackets &&
-                      llaminar2::cuda_native_quantised::CodebookTraits<CodebookId>::is_iq4_lut)
+        if constexpr (Pitch > 0 && llaminar2::cuda_native_quantised::CodebookTraits<CodebookId>::is_iq4_lut)
         {
-            moe_iq4_interleaved_gate_up(
+            moe_iq4_interleaved_gate_up<Pitch, Packets>(
                 gate_desc, up_desc, slot_A, slot_scales, n, b_start, gate_partial, up_partial);
         }
         else
@@ -21391,7 +21394,8 @@ __global__ void softmax_topk_decode_descriptors_kernel(
     /**
      * @brief Publish one narrow grouped Down row from its exact K32 partition tree.
      * @tparam CodebookId Physical reader chosen at admission or the mixed directory.
-     * @tparam WideGrid Use the measured wide reader for this captured node.
+     * @tparam WideGrid Use the fixed-pitch reader for this captured node.
+     * @tparam FixedReduction Logical K of that fixed-pitch reader.
      * @param activation_codes Graph-owned SwiGLU codes in compact grouped order.
      * @param activation_scales Graph-owned K32 scales in the same order.
      * @param descriptors Original published Down descriptors.
@@ -21404,7 +21408,7 @@ __global__ void softmax_topk_decode_descriptors_kernel(
      * @param K Narrow admitted reduction width, with one K32 block per partition.
      * @param num_experts Exact original descriptor count.
      */
-    template <uint8_t CodebookId, bool WideGrid>
+    template <uint8_t CodebookId, bool WideGrid, int FixedReduction = kWideVerifierDownK>
     __global__ void grouped_prefill_down_canonical_publish_k32_kernel(
         const int8_t *__restrict__ activation_codes,
         const float *__restrict__ activation_scales,
@@ -21421,7 +21425,7 @@ __global__ void softmax_topk_decode_descriptors_kernel(
         if constexpr (WideGrid)
         {
             N = kWideVerifierDownN;
-            K = kWideVerifierDownK;
+            K = FixedReduction;
         }
 #else
         constexpr auto order = NativeMoEDotOrder::VerifierK32;
@@ -21448,7 +21452,7 @@ __global__ void softmax_topk_decode_descriptors_kernel(
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 860
             using Traits = llaminar2::cuda_native_quantised::CodebookTraits<CodebookId>;
             if constexpr (WideGrid && Traits::is_iq4_lut)
-                sum = moe_iq4_interleaved_down<CodebookId>(descriptors[expert], codes, scales, column);
+                sum = moe_iq4_interleaved_down<CodebookId, FixedReduction>(descriptors[expert], codes, scales, column);
             else if constexpr (WideGrid && Traits::is_iq3_grid)
             {
                 static_assert(kWideVerifierDownN % kTileN == 0);
@@ -26671,6 +26675,8 @@ __attribute__((visibility("default"))) bool cudaMoE_softmax_topk_decode_selected
                         }
                         if constexpr (Traits::is_iq4_lut)
                         {
+                            if (use_fixed_qfn && kTileN == 128)
+                                return issue.template operator()<kQFNDecodeGateUpN, kQFNDecodeGateUpPackets, unrolled>();
                             if (fixed_gate_geometry && intermediate == kWideVerifierGateN && d_model == kWideVerifierGateK)
                                 return issue.template operator()<kWideVerifierGateN, kWideVerifierGatePackets, unrolled>();
                         }
@@ -26925,7 +26931,8 @@ __attribute__((visibility("default"))) bool cudaMoE_softmax_topk_decode_selected
             const int N = down_columns;
             const int K = intermediate;
             const bool wide_grid_down = N == kWideVerifierDownN && K == kWideVerifierDownK;
-            const bool interleave_iq4_down = wide_grid_down && is_sm86_cuda_device(device_idx);
+            const bool qfn_iq4_down = N == kQFNDecodeGateUpK && K == kQFNDecodeGateUpN;
+            const bool interleave_iq4_down = (wide_grid_down || qfn_iq4_down) && is_sm86_cuda_device(device_idx);
             dim3 scatter_block(kScatterTileN);
             dim3 reduce_block(kReduceTileN);
             dim3 direct_block(kDirectWarpsPerBlock * 32);
@@ -26961,8 +26968,8 @@ __attribute__((visibility("default"))) bool cudaMoE_softmax_topk_decode_selected
                             return;
                         }
                     }
-                    const auto launch = [&]<bool WideGrid>() {
-                        grouped_prefill_down_canonical_publish_k32_kernel<CodebookId, WideGrid>
+                    const auto launch = [&]<bool WideGrid, int FixedReduction = kWideVerifierDownK>() {
+                        grouped_prefill_down_canonical_publish_k32_kernel<CodebookId, WideGrid, FixedReduction>
                             <<<route_reduce_grid, reduce_block, 0, cuda_stream>>>(
                                 d_scratch_swiglu_int8, d_scratch_swiglu_scales,
                                 d_down_desc_table, d_original_to_grouped, d_original_expert_ids,
@@ -26986,7 +26993,11 @@ __attribute__((visibility("default"))) bool cudaMoE_softmax_topk_decode_selected
                     if constexpr (llaminar2::cuda_native_quantised::CodebookTraits<CodebookId>::is_iq4_lut)
                     {
                         if (interleave_iq4_down)
+                        {
+                            if (qfn_iq4_down)
+                                return launch.template operator()<true, kQFNDecodeGateUpN>();
                             return launch.template operator()<true>();
+                        }
                     }
                     launch.template operator()<false>();
                 };
