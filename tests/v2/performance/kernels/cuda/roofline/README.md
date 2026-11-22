@@ -309,8 +309,25 @@ be measured separately for a whole-leaf roofline.
 
 With 31 samples per format and card, 12 of 21 source formats sustain at
 least 80% of the weight-only rate at M=4, N=2560, K=256 on both RTX 3090s.
-At N=512 and K=256 the highest rate is 76.2%. At the QFN-shaped N=2560
-and K=320, Q5_1 and Q8_0 sustain 94.3–94.8% and 96.3% respectively.
+In that sweep at N=512 and K=256, the highest rate was 76.2%. At the
+QFN-shaped N=2560 and K=320, Q5_1 and Q8_0 sustained 94.3–94.8% and 96.3%
+respectively.
+
+For the short N=512, K=256 Q8 Down projection, SM86 uses a fixed eight-packet
+schedule. Each lane has two independent signed dot chains per K32 packet
+and the original ordered FP32 fold. A paired sweep of unroll factors one,
+two, four, and eight selected two packets per loop iteration. All three Q8
+source layouts passed the byte-exact replay.
+
+| Short Q8 source | Release Down, µs | Route-matched weight rate |
+| --- | ---: | ---: |
+| Q8_0 | 3.456 | 90.7% |
+| Q8_1 | 3.456 | 88.9–90.7% |
+| Q8_K | 3.392 | 90.6% |
+
+The 64-column CTA uses 50 registers, zero shared and local bytes, and no
+warp synchronization. The captured replay verifies the short kernel's
+launch against the admitted output geometry.
 
 ## Route-matched verifier Gate/Up weight reference
 

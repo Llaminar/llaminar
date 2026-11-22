@@ -24578,6 +24578,12 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
                         cudaFuncAttributes attributes{};
                         ASSERT_EQ(cudaFuncGetAttributes(&attributes, params.func), cudaSuccess);
                         EXPECT_EQ(attributes.localSizeBytes, 0u);
+                        if (!probe_path && !weight_probe_path && !gate_weight_probe_path)
+                        {
+                            const bool short_q8 = sm86 && d_model == 512 && intermediate == 256 &&
+                                format.codebook_id == llaminar2::native_quantised_formats::Q8_0.codebook_id;
+                            EXPECT_EQ(name.contains("canonical_publish_k32_kernel_short_q8"), short_q8);
+                        }
                         if (sm86 && d_model == 2560 && intermediate == 256 &&
                             !probe_path && !weight_probe_path && !gate_weight_probe_path)
                         {

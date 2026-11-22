@@ -18790,6 +18790,9 @@ __global__ void softmax_topk_decode_descriptors_kernel(
         llaminar2::CUDAMoEBatchInvariantPolicy::gate_up_k_partitions;
     constexpr int kWideVerifierDownN = 2560;
     constexpr int kWideVerifierDownK = 256;
+    constexpr int kShortVerifierDownN = 512;
+    constexpr int kShortVerifierDownK = 256;
+    constexpr int kVerifierDownTileColumns = 64;
     static_assert(kWideVerifierGatePackets *
         llaminar2::CUDAMoEBatchInvariantPolicy::gate_up_k_partitions * 32 == kWideVerifierGateK);
     static_assert(kWideVerifierDownN % 4 == 0);
@@ -21397,7 +21400,7 @@ __global__ void softmax_topk_decode_descriptors_kernel(
 #else
         constexpr auto order = NativeMoEDotOrder::VerifierK32;
 #endif
-        constexpr int kTileN = 64;
+        constexpr int kTileN = kVerifierDownTileColumns;
         const int column = blockIdx.x * kTileN + threadIdx.x;
         if (column >= N)
             return;
@@ -21489,6 +21492,85 @@ __global__ void softmax_topk_decode_descriptors_kernel(
         }
         route_rows[output] = grouped_weights
             ? moe_weight_route_rn(grouped_weights[grouped_slot], sum) : sum;
+    }
+
+    /**
+     * @brief Publish an SM86 short Q8 Down tile through the original ordered fold.
+     *
+     * The dispatch admits an exact eight-packet row. Each lane loads aligned
+     * operands into two independent integer dot chains. Their exact integer
+     * sum is scaled and added in the original FP32 K32 order.
+     *
+     * @param activation_codes Prepared Q8 SwiGLU rows in grouped order.
+     * @param activation_scales Original FP32 K32 activation scales.
+     * @param descriptors Published Down weight descriptors in expert ID order.
+     * @param original_to_grouped Original-to-grouped route map.
+     * @param original_experts Original expert ID for each route.
+     * @param grouped_weights Optional original route weights in grouped order.
+     * @param route_rows Output contributions in original route order.
+     * @param first_slot First original slot covered by this launch.
+     * @param column_count Admitted N in the weight-reference launch signature.
+     * @param reduction_width Admitted K in the weight-reference launch signature.
+     * @param num_experts Exact descriptor table length.
+     * @pre The dispatcher admits the complete short Q8 rectangle and supplies
+     *      its physical N and K in the standard captured argument positions.
+     */
+    __global__ void grouped_prefill_down_canonical_publish_k32_kernel_short_q8(
+        const int8_t *__restrict__ activation_codes,
+        const float *__restrict__ activation_scales,
+        const DeviceNativeQuantisedMatrixDesc *__restrict__ descriptors,
+        const int *__restrict__ original_to_grouped,
+        const int *__restrict__ original_experts,
+        const float *__restrict__ grouped_weights,
+        float *__restrict__ route_rows,
+        int first_slot, [[maybe_unused]] int column_count,
+        [[maybe_unused]] int reduction_width, int num_experts)
+    {
+        constexpr int columns = kShortVerifierDownN;
+        constexpr int packets = kShortVerifierDownK / 32;
+        constexpr auto codebook = native_formats::Q8_0.codebook_id;
+        static_assert(columns % kVerifierDownTileColumns == 0);
+        const int column = blockIdx.x * kVerifierDownTileColumns + threadIdx.x;
+        const int original = first_slot + blockIdx.y;
+        const int grouped = original_to_grouped[original];
+        const int expert = original_experts[original];
+        float sum = 0.0f;
+        if (grouped >= 0 && expert >= 0 && expert < num_experts)
+        {
+            const auto &desc = descriptors[expert];
+            if (native_quantised_desc_shape_ok<codebook>(desc, columns, kShortVerifierDownK))
+            {
+                const auto row_packet = static_cast<size_t>(grouped) * packets;
+                const auto *codes = reinterpret_cast<const int4 *>(activation_codes) + 2 * row_packet;
+                const auto *weights = reinterpret_cast<const int4 *>(desc.payload) + 2 * column;
+                const auto *weight_scales = static_cast<const uint16_t *>(desc.scales) + column;
+                const auto *scales = activation_scales + row_packet;
+#pragma unroll 2
+                for (int packet = 0; packet < packets; ++packet)
+                {
+                    const int4 a0 = codes[packet * 2];
+                    const int4 a1 = codes[packet * 2 + 1];
+                    const int4 b0 = weights[packet * columns * 2];
+                    const int4 b1 = weights[packet * columns * 2 + 1];
+                    int low = __dp4a(a0.x, b0.x, 0);
+                    int high = __dp4a(a1.x, b1.x, 0);
+                    low = __dp4a(a0.y, b0.y, low);
+                    high = __dp4a(a1.y, b1.y, high);
+                    low = __dp4a(a0.z, b0.z, low);
+                    high = __dp4a(a1.z, b1.z, high);
+                    low = __dp4a(a0.w, b0.w, low);
+                    high = __dp4a(a1.w, b1.w, high);
+                    const float scale = llaminar2::cuda_native_quantised::fp16_bits_to_float(
+                        weight_scales[packet * columns]);
+                    const float block = llaminar2::device_native_quantised_contract::singleScaleBlock(
+                        low + high, scale, scales[packet]);
+                    sum = moe_accumulate_rn(sum, __fadd_rn(0.0f, block));
+                }
+            }
+        }
+        if (grouped >= 0 && grouped_weights)
+            sum = moe_weight_route_rn(grouped_weights[grouped], sum);
+        route_rows[static_cast<size_t>(original) * columns + column] = sum;
     }
 
     /**
@@ -26803,7 +26885,7 @@ __attribute__((visibility("default"))) bool cudaMoE_softmax_topk_decode_selected
         {
             const int kScatterTileN =
                 llaminar2::debugEnv().gemm.cuda_moe_down_ordered_kpart_tile_n;
-            constexpr int kReduceTileN = 64;
+            constexpr int kReduceTileN = kVerifierDownTileColumns;
             const int kDirectWarpsPerBlock =
                 llaminar2::CUDAMoEBatchInvariantPolicy::directDownWarps(top_k);
             const int N = down_columns;
@@ -26831,6 +26913,20 @@ __attribute__((visibility("default"))) bool cudaMoE_softmax_topk_decode_selected
                 // Resolve the immutable reader geometry before recording a
                 // node. The narrow and compact variants have separate bodies.
                 const auto launch_narrow_down = [&]<uint8_t CodebookId>() {
+                    if constexpr (CodebookId == native_formats::Q8_0.codebook_id)
+                    {
+                        if (N == kShortVerifierDownN && K == kShortVerifierDownK &&
+                            is_sm86_cuda_device(device_idx))
+                        {
+                            grouped_prefill_down_canonical_publish_k32_kernel_short_q8
+                                <<<route_reduce_grid, reduce_block, 0, cuda_stream>>>(
+                                    d_scratch_swiglu_int8, d_scratch_swiglu_scales,
+                                    d_down_desc_table, d_original_to_grouped, d_original_expert_ids,
+                                    projection_weights, d_canonical_route_contributions,
+                                    original_slot_base, N, K, num_experts);
+                            return;
+                        }
+                    }
                     const auto launch = [&]<bool WideGrid>() {
                         grouped_prefill_down_canonical_publish_k32_kernel<CodebookId, WideGrid>
                             <<<route_reduce_grid, reduce_block, 0, cuda_stream>>>(
