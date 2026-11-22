@@ -484,6 +484,22 @@ the first 12 generated tokens matched the archive. The compiled math uses
 The metadata warp uses 142 registers per thread. Its native conditional
 call retains the original 56-byte linked stack frame.
 
+The independent-readiness Release bench kept the same original plan and
+captured graphs as the smoke, with native inventory disabled for timing.
+All 12 measured histories per mode matched the archived 256-token sequence.
+Each fixed-depth arm recorded 1,197 draft steps, 594 accepted tokens, 132
+rejected tokens, 171 verifier calls, and 1,368 verifier rows across its
+three measured requests.
+
+| Arm order | Mode | Staged decode, tokens/s | Resident decode, tokens/s | Difference |
+| --- | --- | ---: | ---: | ---: |
+| Resident first | Ordinary | 29.738 | 29.671 | −0.22% |
+| Staged first | Ordinary | 29.435 | 29.277 | −0.54% |
+| Resident first | Fixed depth 7 | 44.041 | 43.788 | −0.57% |
+| Staged first | Fixed depth 7 | 43.427 | 43.655 | +0.52% |
+
+The candidate remains opt-in pending a repeatable ordinary decode gain.
+
 ### Grouped Gate/Up packets and direct Down on SM86
 
 The grouped native program uses one 256-thread CTA per live 32-column
