@@ -13,6 +13,8 @@ PROBE="$CMAKE_BUILD/tests/v2/v2_perf_cuda_decode_roofline"
 "$PROBE" 0 dp4a > dp4a.csv
 "$PROBE" 0 prmt > prmt.csv
 "$PROBE" 0 imma > imma.csv
+"$PROBE" 0 lop3 > lop3.csv
+"$PROBE" 0 int-mix > int-mix.csv
 ```
 
 Every sample times 16 consecutive launches in a retained CUDA graph and reports
@@ -27,6 +29,10 @@ one instruction per active lane. Its host oracle checks the resulting byte
 rotations for every lane. This is an independent permutation-issue ceiling.
 The dense INT8 tensor-core probe counts warp-level `m16n8k32` operations, each
 consisting of 4,096 integer multiply-accumulates.
+The `lop3` and `int-mix` probes count scalar-lane instructions from independent
+chains. The mixed loop issues two LOP3, one signed DP4A and one IMAD per
+chain. It measures that instruction schedule separately from the weight
+reader and the end-to-end projection.
 
 Keep physical traffic separate from requested bytes. In a distinct profiler
 process, use `--kernel-name 'regex:decodeReadCeiling' --launch-skip 79
@@ -60,6 +66,19 @@ qualification host.
 Read rates count requested bytes. Dot-product rates count two operations per
 multiply-accumulate. The driver logged a graphics-engine assertion during
 counter attachment on this host, so these references use quiet CUDA events.
+
+The mixed instruction probes used the same 63-sample procedure.
+
+| PCI endpoint | LOP3, trillion lane instructions/s | Integer mix, trillion lane instructions/s |
+| --- | ---: | ---: |
+| `0000:3f:00.0` | 7.816 | 13.041 |
+| `0000:42:00.0` | 7.569 | 13.262 |
+
+The compiled loops use 26 and 49 registers respectively, with zero stack,
+shared, and local bytes. The mixed body contains 16 LOP3, eight DP4A and
+eight IMAD instructions per iteration, counted independently of loop
+control. The route-matched weight comparisons below retain their measured
+weight reference as the denominator.
 
 The captured M1 MoE regression can retain independent native-leaf event
 samples for its IQ2_S gate/up, IQ4_NL Down and 320-column SwiGLU geometry.

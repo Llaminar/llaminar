@@ -41,8 +41,10 @@ namespace
     constexpr unsigned permuteChains = 8;
     constexpr unsigned mmaIterations = 2048;
     constexpr unsigned mmaChains = 8;
+    constexpr unsigned issueIterations = 4097;
+    constexpr unsigned issueChains = 8;
 
-    enum class Kernel { Read, Dp4a, BytePermute, Imma };
+    enum class Kernel { Read, Dp4a, BytePermute, Imma, Logic, MixedInteger };
 
     /** @brief Generate distinct deterministic words for each input vector. */
     __host__ __device__ uint4 inputAt(unsigned index)
@@ -197,6 +199,65 @@ namespace
 #endif
     }
 
+
+    /**
+     * @brief Measure independent Ampere integer arithmetic issue.
+     * @tparam Mixed Issue two independent LOP3, a signed DP4A and an
+     *         integer multiply-add for each chain.
+     * @param output Checked modular sum of the results for each lane.
+     * @details Independent chains exercise sustained issue. The odd iteration
+     *          count leaves one XOR of each input mask in the final checksum.
+     */
+    template <bool Mixed>
+    __global__ void decodeIntegerIssueCeiling(uint32_t* output)
+    {
+        const unsigned thread = blockIdx.x * blockDim.x + threadIdx.x;
+        const uint4 seed = inputAt(thread);
+        uint32_t logic[issueChains];
+        uint32_t second[issueChains];
+        uint32_t dot[issueChains]{};
+        uint32_t product[issueChains]{};
+        const int packed = static_cast<int>(thread & 127U) * 0x01010101;
+        #pragma unroll
+        for (unsigned chain = 0; chain < issueChains; ++chain)
+        {
+            logic[chain] = seed.x + chain;
+            if constexpr (Mixed)
+                second[chain] = seed.y + chain;
+        }
+
+        #pragma unroll 1
+        for (unsigned iteration = 0; iteration < issueIterations; ++iteration)
+        {
+            #pragma unroll
+            for (unsigned chain = 0; chain < issueChains; ++chain)
+            {
+                const uint32_t c = seed.z + chain;
+                asm volatile("lop3.b32 %0, %0, %1, %2, 0x96;"
+                             : "+r"(logic[chain]) : "r"(seed.y), "r"(c));
+                if constexpr (Mixed)
+                {
+                    const int coefficient = static_cast<int>(chain + 1) * 0x01010101;
+                    asm volatile("lop3.b32 %0, %0, %1, %2, 0x96;"
+                                 : "+r"(second[chain]) : "r"(seed.x), "r"(c));
+                    asm volatile("dp4a.s32.s32 %0, %1, %2, %0;"
+                                 : "+r"(dot[chain]) : "r"(packed), "r"(coefficient));
+                    asm volatile("mad.lo.u32 %0, %1, %2, %0;"
+                                 : "+r"(product[chain]) : "r"(seed.w), "r"(c));
+                }
+            }
+        }
+        uint32_t sum = 0;
+        #pragma unroll
+        for (unsigned chain = 0; chain < issueChains; ++chain)
+        {
+            sum += logic[chain];
+            if constexpr (Mixed)
+                sum += second[chain] + dot[chain] + product[chain];
+        }
+        output[thread] = sum;
+    }
+
     /// @brief All geometry and useful work for a single probe.
     struct Probe
     {
@@ -209,6 +270,9 @@ namespace
         /** @return Requested bytes, scalar-lane instruction count, or warp IMMA count per launch. */
         uint64_t count() const
         {
+            if (kernel == Kernel::Logic || kernel == Kernel::MixedInteger)
+                return uint64_t(blocks) * threadsPerBlock * issueIterations * issueChains *
+                    (kernel == Kernel::MixedInteger ? 4u : 1u);
             if (kernel == Kernel::Dp4a)
                 return uint64_t(blocks) * threadsPerBlock * dotIterations * dotChains;
             if (kernel == Kernel::BytePermute)
@@ -229,7 +293,7 @@ namespace
         const unsigned threads = probe.blocks * threadsPerBlock;
         uint4* input = nullptr;
         uint4* output = nullptr;
-        const bool scalarOutput = probe.kernel == Kernel::Dp4a || probe.kernel == Kernel::BytePermute;
+        const bool scalarOutput = probe.kernel != Kernel::Read && probe.kernel != Kernel::Imma;
         const auto outputBytes = threads * (scalarOutput ? sizeof(uint32_t) : sizeof(uint4));
         CUDA_CHECK(cudaMalloc(&output, outputBytes));
         if (probe.kernel == Kernel::Read)
@@ -250,6 +314,12 @@ namespace
                     reinterpret_cast<uint32_t*>(output));
             else if (probe.kernel == Kernel::BytePermute)
                 decodeBytePermuteCeiling<<<probe.blocks, threadsPerBlock, 0, stream>>>(
+                    reinterpret_cast<uint32_t*>(output));
+            else if (probe.kernel == Kernel::Logic)
+                decodeIntegerIssueCeiling<false><<<probe.blocks, threadsPerBlock, 0, stream>>>(
+                    reinterpret_cast<uint32_t*>(output));
+            else if (probe.kernel == Kernel::MixedInteger)
+                decodeIntegerIssueCeiling<true><<<probe.blocks, threadsPerBlock, 0, stream>>>(
                     reinterpret_cast<uint32_t*>(output));
             else if (probe.kernel == Kernel::Imma)
                 decodeImmaCeiling<<<probe.blocks, threadsPerBlock, 0, stream>>>(output);
@@ -295,6 +365,22 @@ namespace
                 {
                     constexpr unsigned sumOfCoefficients = dotChains * (dotChains + 1) / 2;
                     expected = (thread & 127U) * 4 * dotIterations * sumOfCoefficients;
+                }
+                else if (probe.kernel == Kernel::Logic || probe.kernel == Kernel::MixedInteger)
+                {
+                    const auto seed = inputAt(thread);
+                    static_assert(issueIterations % 2 == 1);
+                    for (unsigned chain = 0; chain < issueChains; ++chain)
+                    {
+                        const uint32_t c = seed.z + chain;
+                        expected += (seed.x + chain) ^ seed.y ^ c;
+                        if (probe.kernel == Kernel::MixedInteger)
+                        {
+                            expected += (seed.y + chain) ^ seed.x ^ c;
+                            expected += (thread & 127U) * 4 * (chain + 1) * issueIterations;
+                            expected += seed.w * c * issueIterations;
+                        }
+                    }
                 }
                 else
                 {
@@ -348,14 +434,15 @@ int main(int argc, char** argv)
     int device = -1;
     if (argc != 3)
     {
-        std::fprintf(stderr, "Usage: %s <cuda-device> <dram|l2|dp4a|prmt|imma>\n", argv[0]);
+        std::fprintf(stderr, "Usage: %s <cuda-device> <dram|l2|dp4a|prmt|imma|lop3|int-mix>\n", argv[0]);
         return EXIT_FAILURE;
     }
     const std::string_view ordinal(argv[1]);
     const auto parsed = std::from_chars(ordinal.data(), ordinal.data() + ordinal.size(), device);
     const std::string_view mode(argv[2]);
     if (parsed.ec != std::errc{} || parsed.ptr != ordinal.data() + ordinal.size() ||
-        device < 0 || (mode != "dram" && mode != "l2" && mode != "dp4a" && mode != "prmt" && mode != "imma"))
+        device < 0 || (mode != "dram" && mode != "l2" && mode != "dp4a" &&
+                        mode != "prmt" && mode != "imma" && mode != "lop3" && mode != "int-mix"))
         return EXIT_FAILURE;
 
     CUDA_CHECK(cudaSetDevice(device));
@@ -368,7 +455,8 @@ int main(int argc, char** argv)
 
     const auto sms = static_cast<unsigned>(properties.multiProcessorCount);
     const auto kernel = mode == "dp4a" ? Kernel::Dp4a : mode == "prmt" ? Kernel::BytePermute :
-        mode == "imma" ? Kernel::Imma : Kernel::Read;
+        mode == "imma" ? Kernel::Imma : mode == "lop3" ? Kernel::Logic :
+        mode == "int-mix" ? Kernel::MixedInteger : Kernel::Read;
     if (kernel == Kernel::Imma && properties.major < 8)
     {
         std::fprintf(stderr, "The dense INT8 m16n8k32 reference requires SM80 or newer\n");
