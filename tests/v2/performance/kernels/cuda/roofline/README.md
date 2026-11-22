@@ -209,9 +209,26 @@ All token IDs and per-iteration MTP work match in both run orders.
 | Control first | 30.071 → 27.533 tok/s (−8.44%) | 44.394 → 43.918 tok/s (−1.07%) |
 
 The candidate stays opt-in. The fused producer publishes the router outputs
-to the explicit CPU packet stages after its local FFN completes. This places
+in the original benchmark only after its local FFN completes. This places
 the packet later on the ordinary decode path than the staged release, which
 publishes it before local FFN math.
+
+The early-packet revision releases the mixed hidden row and router outputs
+before expert arithmetic. The root records its original packet stages as a
+sibling of the resident kernel and joins both native completions before the
+ticket boundary. The root captures 2,672 nodes, including one reset and one
+acquire for each of the 48 layers. The follower captures 1,951 nodes. Both
+retain one executable and 49 compilation units per GPU. The real Release
+smoke matched the first 12 reference tokens on the 2×CUDA/2×CPU plan.
+
+`V2_Integration_CUDA_RetainedHCFFNEarlyPacketReplay` checks the actual
+native fork, both packet edges and the retirement join. It replays the
+recorded serial bytes across the three source pairs and pinned placement
+changes. Both RTX 3090s passed this replay and the original counted replay.
+The same-device acquire uses 10 registers and no local memory. The resident
+entries retain their 96–108 register allocation and zero local bytes. The
+early fork admits fully active rows. The counted replay exercises the
+separate native conditional entry, including empty rows.
 
 ### Grouped Gate/Up packets and direct Down on SM86
 

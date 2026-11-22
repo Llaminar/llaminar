@@ -14,6 +14,9 @@
 #include "execution/moe/MoEOverlayActivationBatchResources.h"
 #include "backends/GPUCaptureDependencyRoster.h"
 #include "backends/NativeContextPreparation.h"
+#ifdef HAVE_CUDA
+#include "backends/cuda/CUDAGraphCapture.h"
+#endif
 #include "execution/moe/MoEOverlaySharedDispatchSelection.h"
 
 #include "../../../backends/BackendManager.h"
@@ -1081,6 +1084,28 @@ namespace llaminar2
     }
 
     bool MoEOverlayActivationDispatchPackStage::execute(IDeviceContext *ctx)
+    {
+#ifdef HAVE_CUDA
+        if (early_route_publication_)
+            return early_route_publication_->recordConsumer(requireGPUStream(), [&] { return executePacket(ctx); });
+#endif
+        return executePacket(ctx);
+    }
+
+#ifdef HAVE_CUDA
+    /** @copydoc MoEOverlayActivationDispatchPackStage::bindEarlyRoutePublication */
+    void MoEOverlayActivationDispatchPackStage::bindEarlyRoutePublication(
+        std::shared_ptr<CUDAEarlyPacketPublication> publication, const int32_t* live_rows)
+    {
+        if (!params_.device_id.is_cuda() || params_.physical_rows != 1 || !publication || early_route_publication_ ||
+            (params_.active_row_count_device && params_.active_row_count_device != live_rows))
+            throw std::invalid_argument("Early route publication requires the original single-row CUDA activation packet");
+        params_.active_row_count_device = live_rows;
+        early_route_publication_ = std::move(publication);
+    }
+#endif
+
+    bool MoEOverlayActivationDispatchPackStage::executePacket(IDeviceContext *ctx)
     {
         if (!validateExecutionContext(ctx, params_.device_id, name().c_str()) ||
             !hasFixedContract())
@@ -2407,7 +2432,30 @@ namespace llaminar2
             "one-row dispatch batch", *params_.transaction);
     }
 
-    bool MoEOverlayActivationDispatchPackBatchStage::execute(
+    bool MoEOverlayActivationDispatchPackBatchStage::execute(IDeviceContext *ctx)
+    {
+#ifdef HAVE_CUDA
+        if (early_route_publication_)
+            return early_route_publication_->recordConsumer(requireGPUStream(), [&] { return executePacket(ctx); });
+#endif
+        return executePacket(ctx);
+    }
+
+#ifdef HAVE_CUDA
+    /** @copydoc MoEOverlayActivationDispatchPackBatchStage::bindEarlyRoutePublication */
+    void MoEOverlayActivationDispatchPackBatchStage::bindEarlyRoutePublication(
+        std::shared_ptr<CUDAEarlyPacketPublication> publication, const int32_t* live_rows)
+    {
+        if (!params_.device_id.is_cuda() || !params_.transaction || params_.transaction->physicalRows() != 1 ||
+            !publication || early_route_publication_ ||
+            (params_.active_row_count_device && params_.active_row_count_device != live_rows))
+            throw std::invalid_argument("Early route publication requires the original single-row CUDA activation batch");
+        params_.active_row_count_device = live_rows;
+        early_route_publication_ = std::move(publication);
+    }
+#endif
+
+    bool MoEOverlayActivationDispatchPackBatchStage::executePacket(
         IDeviceContext *ctx)
     {
         if (!validateExecutionContext(ctx, params_.device_id, name().c_str()) ||

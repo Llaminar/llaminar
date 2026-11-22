@@ -73,6 +73,42 @@ namespace llaminar2
         void *signal,
         std::uint64_t value) noexcept;
 
+    /**
+     * @brief Record explicit packet stages against a producer's early device publication.
+     *
+     * The producer and its packet readers record into one native graph on the
+     * admitted stream. The producer release orders only the named early data;
+     * normal graph dependencies continue to own the producer's full retirement.
+     * This object holds capture metadata only. The original stage owns the
+     * device word and each original packet stage continues to own transport.
+     */
+    class CUDAEarlyPacketPublication final
+    {
+    public:
+        /**
+         * @brief Reset the original device word and fork its acquire from the exact reset edge.
+         * @param stream Exact original native capture stream.
+         * @param signal Arena-owned signal released by the producer after the early data is complete.
+         */
+        void recordProducer(void* stream, std::uint64_t* signal);
+
+        /**
+         * @brief Record one original packet on the side of the producer and join both completions.
+         * @param stream Same active native capture and stream as the original producer.
+         * @param record Original packet stage submission. Every data input must be an early export.
+         * @return True only when the stage records and both frontiers are joined.
+         */
+        bool recordConsumer(void* stream, const std::function<bool()>& record);
+
+    private:
+        cudaGraph_t graph_ = nullptr;
+        cudaStream_t stream_ = nullptr;
+        unsigned long long capture_id_ = 0;
+        std::uint64_t* signal_ = nullptr;
+        std::vector<cudaGraphNode_t> reset_frontier_;
+        std::vector<cudaGraphNode_t> packet_frontier_;
+    };
+
 #if CUDART_VERSION >= 12030
     /**
      * @brief Bind the recording thread to a fragment of its final native timeline.

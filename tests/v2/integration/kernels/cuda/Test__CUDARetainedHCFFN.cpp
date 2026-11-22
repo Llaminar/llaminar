@@ -204,8 +204,60 @@ struct Weight
     }
 };
 
-/** @brief Run exactly one original retained program with a complete, counted positive branch. */
-void replay(const TracePair& trace, int ordinal, unsigned resident_blocks)
+/** @brief Verify exact native edges from the router's acquire through the two packet readers. */
+void assertEarlyPacketDependencies(cudaGraph_t graph, const void* hidden, const void* route, const void* retired)
+{
+    std::size_t count = 0;
+    requireCUDA(cudaGraphGetNodes(graph, nullptr, &count));
+    std::vector<cudaGraphNode_t> nodes(count);
+    requireCUDA(cudaGraphGetNodes(graph, nodes.data(), &count));
+    cudaGraphNode_t resident = nullptr, hidden_packet = nullptr, route_packet = nullptr, after_join = nullptr;
+    for (const auto node : nodes)
+    {
+        cudaGraphNodeType type{};
+        requireCUDA(cudaGraphNodeGetType(node, &type));
+        if (type == cudaGraphNodeTypeKernel)
+        {
+            cudaKernelNodeParams args{};
+            requireCUDA(cudaGraphKernelNodeGetParams(node, &args));
+            if (args.blockDim.x == 256)
+                resident = node;
+        }
+        if (type != cudaGraphNodeTypeMemcpy)
+            continue;
+        cudaMemcpy3DParms args{};
+        requireCUDA(cudaGraphMemcpyNodeGetParams(node, &args));
+        if (args.dstPtr.ptr == hidden) hidden_packet = node;
+        if (args.dstPtr.ptr == route) route_packet = node;
+        if (args.dstPtr.ptr == retired) after_join = node;
+    }
+    ASSERT_TRUE(resident && hidden_packet && route_packet && after_join);
+    const auto dependencies = [](cudaGraphNode_t node) {
+        std::size_t size = 0;
+        requireCUDA(cudaGraphNodeGetDependencies(node, nullptr, nullptr, &size));
+        std::vector<cudaGraphNode_t> dependencies(size);
+        requireCUDA(cudaGraphNodeGetDependencies(node, dependencies.data(), nullptr, &size));
+        return dependencies;
+    };
+    const auto first = dependencies(hidden_packet);
+    ASSERT_EQ(first.size(), 1u);
+    cudaGraphNodeType acquire_type{};
+    requireCUDA(cudaGraphNodeGetType(first.front(), &acquire_type));
+    EXPECT_EQ(acquire_type, cudaGraphNodeTypeKernel);
+    EXPECT_NE(first.front(), resident);
+    EXPECT_EQ(dependencies(first.front()), dependencies(resident));
+    EXPECT_EQ(dependencies(route_packet), std::vector<cudaGraphNode_t>{hidden_packet});
+    const auto joined = dependencies(after_join);
+    ASSERT_EQ(joined.size(), 2u);
+    EXPECT_NE(std::find(joined.begin(), joined.end(), resident), joined.end());
+    EXPECT_NE(std::find(joined.begin(), joined.end(), route_packet), joined.end());
+}
+
+/** @brief Select the original invocation contract under test. */
+enum class RetainedReplayRole { Counted, ActiveEarlyPacket };
+
+/** @brief Run the retained positive and empty branches through the original serial trace. */
+void replay(const TracePair& trace, int ordinal, unsigned resident_blocks, RetainedReplayRole role)
 {
     const Stream stream;
     const auto native = stream.value;
@@ -248,11 +300,15 @@ void replay(const TracePair& trace, int ordinal, unsigned resident_blocks)
     Array<DeviceMoELayerRuntime> runtime{1};
     Array<DeviceMoEOverlayEpochTicket> ticket{1};
     Array<RetainedM1Expert> selected{top_k};
-    const auto rows = DeviceRowRange::deviceCounted(1, live.data());
+    Array<std::uint64_t> signal{1};
+    Array<float> packet_hidden{hidden}, packet_route{top_k}, joined_routed{top_k * hidden};
+    const bool early = role == RetainedReplayRole::ActiveEarlyPacket;
+    const auto* active = early ? nullptr : live.data();
+    const auto rows = early ? DeviceRowRange::fullyActive(1) : DeviceRowRange::deviceCounted(1, live.data());
     const RetainedM1HCFFN args{
         .hc = {
-            .write = {{1, live.data()}, hidden, residual.data(), block.data(), write_gate.data(), written.data()},
-            .norm = {{1, live.data()}, hidden, 1.e-6f, written.data(), gain.data(), normalized.data()},
+            .write = {{1, active}, hidden, residual.data(), block.data(), write_gate.data(), written.data()},
+            .norm = {{1, active}, hidden, 1.e-6f, written.data(), gain.data(), normalized.data()},
             .down = hc_down, .down_partitions = {hc_partitions, (trunk / 32 + hc_partitions - 1) / hc_partitions},
             .down_fold = HCDownFold::OrderedPartitions,
             .norm_codes = norm_codes.data(), .norm_scales = norm_scales.data(), .down_partials = partials.data(),
@@ -271,24 +327,57 @@ void replay(const TracePair& trace, int ordinal, unsigned resident_blocks)
         .routed_contributions = routed.data(), .shared_contribution = shared_out.data(),
         .route_publication = RetainedM1RoutePublication::Raw,
         .shared_publication = RetainedM1SharedPublication::PartialBeforeCollective,
+        .early_packet_ready = early ? signal.data() : nullptr,
     };
     constexpr uint64_t generation = 1;
+    if (!early)
+    {
+        auto incomplete = args;
+        incomplete.early_packet_ready = signal.data();
+        EXPECT_THROW(RetainedM1Program::prepare(DeviceId::cuda(ordinal), incomplete, trace.gate.codebook_id,
+            trace.down.codebook_id, FullNativeHCFFNOutputDemand::all(), false, generation), std::invalid_argument);
+    }
     const auto program = RetainedM1Program::prepare(DeviceId::cuda(ordinal), args, trace.gate.codebook_id,
         trace.down.codebook_id, FullNativeHCFFNOutputDemand::all(), false, generation);
     ASSERT_EQ(program.admission().resources().private_bytes, 0u);
 
     llaminar2::CUDAGraphCapture capture(native, ordinal);
+    CUDAEarlyPacketPublication packet;
     ASSERT_TRUE(capture.beginCapture());
+    if (early)
+        packet.recordProducer(native, signal.data());
     program.launch(native, generation);
+    if (early)
+    {
+        ASSERT_TRUE(packet.recordConsumer(native, [&] {
+            return cudaMemcpyAsync(packet_hidden.data(), mixed.data(), hidden * sizeof(float),
+                cudaMemcpyDeviceToDevice, native) == cudaSuccess;
+        }));
+        ASSERT_TRUE(packet.recordConsumer(native, [&] {
+            return cudaMemcpyAsync(packet_route.data(), route_indices.data(), top_k * sizeof(float),
+                cudaMemcpyDeviceToDevice, native) == cudaSuccess;
+        }));
+        requireCUDA(cudaMemcpyAsync(joined_routed.data(), routed.data(), top_k * hidden * sizeof(float),
+            cudaMemcpyDeviceToDevice, native));
+    }
     ASSERT_TRUE(capture.endCapture());
     ASSERT_TRUE(capture.instantiate());
     std::vector<GPUGraphKernelNodeInfo> kernels;
     std::string error;
     ASSERT_TRUE(capture.inspectKernelNodes(kernels, &error)) << error;
-    ASSERT_EQ(kernels.size(), 1u);
-    EXPECT_EQ(kernels.front().grid_x, 1u);
-    EXPECT_EQ(kernels.front().block_x, 32u);
-    EXPECT_EQ(capture.nodeCount(), 2u);
+    if (early)
+    {
+        ASSERT_EQ(kernels.size(), 2u);
+        assertEarlyPacketDependencies(capture.graph(), packet_hidden.data(), packet_route.data(), joined_routed.data());
+        resident_blocks = std::min(resident_blocks, program.admission().maximumGrid() - 1u);
+    }
+    else
+    {
+        ASSERT_EQ(kernels.size(), 1u);
+        EXPECT_EQ(kernels.front().grid_x, 1u);
+        EXPECT_EQ(kernels.front().block_x, 32u);
+        EXPECT_EQ(capture.nodeCount(), 2u);
+    }
     // CUDA's public kernel-node queries stop at the conditional node. Its
     // driver DOT inventory includes the body and its actual submitted extent.
     const NativeGraphDump dump;
@@ -359,6 +448,12 @@ void replay(const TracePair& trace, int ordinal, unsigned resident_blocks)
                 &logits, &route_indices, &route_weights, &routed, &shared_out})
             actual = publication->digest(native, actual);
         EXPECT_EQ(actual, frame.expected) << "seed=" << frame.seed << " epoch=" << epoch;
+        if (early)
+        {
+            EXPECT_EQ(packet_hidden.digest(native), mixed.digest(native));
+            EXPECT_EQ(packet_route.digest(native), route_indices.digest(native));
+            EXPECT_EQ(joined_routed.digest(native), routed.digest(native));
+        }
     };
 
     for (std::size_t i = 0; i < trace.rows.size(); ++i)
@@ -369,6 +464,9 @@ void replay(const TracePair& trace, int ordinal, unsigned resident_blocks)
         publish(movement, 20, false);
         publish(movement, 21, true);
     }
+
+    if (early)
+        return;
 
     // A zero accepted extent clears stale route metadata, but owes no math or
     // stores to any activation/contribution. The following replay starts clean.
@@ -395,8 +493,18 @@ TEST(CUDARetainedHCFFN, RecordedCountedPublications)
     {
         SCOPED_TRACE(unsigned(trace.gate.codebook_id));
         SCOPED_TRACE(unsigned(trace.down.codebook_id));
-        ASSERT_NO_THROW(replay(trace, ordinal, blocks));
+        ASSERT_NO_THROW(replay(trace, ordinal, blocks, RetainedReplayRole::Counted));
     }
+}
+
+/** @test Capture the complete fully-active main model row with original sibling packet readers. */
+TEST(CUDARetainedHCFFN, RecordedEarlyPacketPublications)
+{
+    const int ordinal = selectVisibleSM86();
+    const auto& device = cudaHardwareMetadata().at(ordinal);
+    const auto blocks = std::min(2u * static_cast<unsigned>(device.sm_count), hidden / retained_hc_read_warp_channels);
+    for (const auto& trace : traces)
+        ASSERT_NO_THROW(replay(trace, ordinal, blocks, RetainedReplayRole::ActiveEarlyPacket));
 }
 
 #if CUDART_VERSION >= 12080

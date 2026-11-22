@@ -17,13 +17,14 @@ public:
      * @param router Original router, authenticated by the route-slot builder.
      * @param shared Original prepared shared projections and Down publication.
      * @param prefix Original staged post-attention HC owner.
+     * @param packet Original explicit CPU packet stages' optional early native edge.
      * @param name Existing terminal of the local routed math.
      */
     CUDARetainedStage(std::shared_ptr<Binding> binding, const MoERoutingStage::Params& router,
         const SharedExpertFFNStage::Params& shared, std::shared_ptr<Qwen4ExpHCReadPhaseOwner> prefix,
-        std::string name)
+        std::shared_ptr<CUDAEarlyPacketPublication> packet, std::string name)
         : IComputeStage(binding->device()), binding_(std::move(binding)), router_(router), shared_(shared),
-          prefix_(std::move(prefix)), name_(std::move(name))
+          prefix_(std::move(prefix)), packet_(std::move(packet)), name_(std::move(name))
     {
         const auto& p = binding_->params;
         const auto& original = binding_->original;
@@ -115,6 +116,8 @@ public:
         auto requirements = prefix_->phaseWorkspaceRequirements();
         for (const auto& bank : banks())
             MoEWorkspaceBuffers::add(requirements, bank.name, bank.bytes);
+        if (packet_)
+            MoEWorkspaceBuffers::add(requirements, packet_word_name, sizeof(std::uint64_t));
         return requirements;
     }
 
@@ -184,6 +187,7 @@ public:
             .shared_contribution = static_cast<float*>(addresses[4]),
             .route_publication = cuda::moe::RetainedM1RoutePublication::Raw,
             .shared_publication = cuda::moe::RetainedM1SharedPublication::PartialBeforeCollective,
+            .early_packet_ready = earlyPacketWord(),
         };
         auto program = cuda::moe::RetainedM1Program::prepare(device(), arguments, gate_, down_,
             output_demand_, router_.collect_device_runtime_histogram, workspace_->id());
@@ -195,6 +199,7 @@ public:
         prepared_tensors_ = addresses;
         prepared_runtime_ = runtime;
         prepared_shared_ = prepared_shared;
+        prepared_packet_word_ = arguments.early_packet_ready;
         program_.emplace(std::move(program));
         setGPUStream(stream);
         const auto& native = program_->admission();
@@ -225,13 +230,16 @@ public:
             execution.requirePreparedOutput(output.tensor);
         for (const auto& output : outputs())
             execution.requirePreparedOutput(output.tensor);
+        if (packet_)
+            packet_->recordProducer(execution.nativeStream(), prepared_packet_word_);
         program_->launch(execution.nativeStream(), prepared_workspace_id_);
         for (const auto& output : prefix_outputs_)
             execution.publish(output.tensor);
         for (const auto& output : outputs())
             execution.publish(output.tensor);
         PerfStatsCollector::addCounter("moe_resident_ffn", "cuda_mapped_local_program_enqueued", 1.,
-            "graph_capture", device().toString(), {{"layer", std::to_string(binding_->layer)}});
+            "graph_capture", device().toString(), {{"layer", std::to_string(binding_->layer)},
+                {"early_cpu_packet", packet_ ? "1" : "0"}});
         return true;
     }
 
@@ -254,6 +262,7 @@ public:
         mix(router_.norm_topk_prob); mix(router_.collect_device_runtime_histogram);
         mix(reinterpret_cast<std::uintptr_t>(router_.gate_weights));
         mix(reinterpret_cast<std::uintptr_t>(router_.absolute_position_ids_device));
+        mix(reinterpret_cast<std::uintptr_t>(packet_.get()));
         mix(reinterpret_cast<std::uintptr_t>(shared_.prepared_store));
         mix(shared_.prepared_ref_gate->binding_id); mix(shared_.prepared_ref_up->binding_id);
         mix(shared_.prepared_ref_down->binding_id); mix(shared_.intermediate);
@@ -262,6 +271,19 @@ public:
     }
 
 private:
+    static constexpr const char* packet_word_name = "cuda_retained_qfn_cpu_packet_ready";
+
+    /** @return The named arena word only for a participant with original early packet readers. */
+    std::uint64_t* earlyPacketWord() const
+    {
+        if (!packet_)
+            return nullptr;
+        auto* word = static_cast<std::uint64_t*>(workspace_->getBuffer(packet_word_name));
+        if (!word || workspace_->getBufferSize(packet_word_name) < sizeof(*word))
+            throw std::logic_error("CUDA retained QFN has no admitted early packet signal word");
+        return word;
+    }
+
     /** @brief Unambiguous index of every admitted scratch plane in the native operands. */
     enum Bank : std::size_t { RouterLogits, Descriptors, RouteOrder, HiddenCodes, HiddenScales, DownCodes, DownScales, BankCount };
     /** @brief Size of one named workspace plane. */
@@ -387,6 +409,7 @@ private:
         const auto same = [](const auto& a, const auto& b) { return std::memcmp(&a, &b, sizeof(a)) == 0; };
         if (!workspace_ || stream != prepared_stream_ || workspace_->id() != prepared_workspace_id_ ||
             tensorAddresses() != prepared_tensors_ || bankAddresses() != prepared_banks_ ||
+            earlyPacketWord() != prepared_packet_word_ ||
             binding_->params.runtime->deviceLayerState(binding_->layer) != prepared_runtime_ ||
             !same(descriptor.gate, prepared_shared_.gate) || !same(descriptor.up, prepared_shared_.up) ||
             !same(descriptor.down, prepared_shared_.down))
@@ -398,6 +421,7 @@ private:
     const MoERoutingStage::Params router_;
     const SharedExpertFFNStage::Params shared_;
     const std::shared_ptr<Qwen4ExpHCReadPhaseOwner> prefix_;
+    const std::shared_ptr<CUDAEarlyPacketPublication> packet_;
     const std::string name_;
     const FullNativeHCFFNOutputDemand output_demand_ = FullNativeHCFFNOutputDemand::all();
     std::vector<Qwen4ExpFloatBinding> prefix_inputs_, prefix_outputs_;
@@ -408,6 +432,7 @@ private:
     std::array<void*, BankCount> prepared_banks_{};
     Addresses prepared_tensors_{};
     DeviceMoELayerRuntime* prepared_runtime_ = nullptr;
+    std::uint64_t* prepared_packet_word_ = nullptr;
     DeviceMoEExpertDescriptor prepared_shared_{};
     std::uint64_t prepared_workspace_id_ = 0;
     void* prepared_stream_ = nullptr;

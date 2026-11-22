@@ -16,6 +16,13 @@
     constexpr int kRetainedRouteCounts = 2;
     static_assert(kMaxTopK <= 32, "A single original router warp compacts the QFN route slots");
 
+    /** @brief Release the original hidden and router bytes to the independent packet stage. */
+    __device__ __forceinline__ void releaseRetainedQFNPacket(std::uint64_t* signal)
+    {
+        if (signal)
+            cuda::atomic_ref<std::uint64_t, cuda::thread_scope_system>(*signal).store(1u, cuda::memory_order_release);
+    }
+
     /** @brief Select the active program and publish only the empty routing ledger on a zero row. */
     __global__ void retainedQFNM1Predicate(cudaGraphConditionalHandle condition, const int* live,
         llaminar2::cuda::moe::RetainedM1Router router)
@@ -363,6 +370,8 @@
                 router.route_indices, router.route_weights, router.experts, router.top_k, router.normalize, true,
                 router.local_policy, router.position, nullptr, 0, nullptr, nullptr, 0, {}, nullptr, nullptr, -1, 0, nullptr);
             __syncthreads();
+            if (threadIdx.x == 0)
+                releaseRetainedQFNPacket(args.early_packet_ready);
             if (args.shared_publication == RetainedM1SharedPublication::GatedComplete)
             {
                 const float factor = retainedSharedGateFactor(args.hc.mixed, args.shared_gate_input,

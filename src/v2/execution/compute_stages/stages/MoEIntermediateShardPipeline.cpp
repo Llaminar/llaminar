@@ -39,6 +39,9 @@
 #include "kernels/KernelFactory.h"
 #include "kernels/common/ResidentMoEFFN.h"
 #ifdef HAVE_CUDA
+#include "backends/cuda/CUDAGraphCapture.h"
+#include "MoEOverlayActivationPacketStages.h"
+#include "MoEOverlayTicketPublishStage.h"
 #include "kernels/cuda/moe/CUDARetainedHCFFN.h"
 #endif
 #ifdef HAVE_ROCM
@@ -61,6 +64,7 @@
 #include <limits>
 #include <stdexcept>
 #include <utility>
+#include <unordered_set>
 #include <vector>
 
 namespace llaminar2
@@ -1258,10 +1262,20 @@ void lowerCUDAMappedRetainedM1HCFFN(ComputeGraph& graph,const std::string& previ
     const auto region=Qwen4ExpHyperconnectionBuilder::describeFullNativeReadRegion(graph,previous_write_node,
         read.name,Qwen4ExpHCInjectionOwnership::KeepOriginalStage);
     auto prefix=Qwen4ExpHyperconnectionBuilder::retainFullNativeReadPhase(graph,region);
-    auto replacement=std::make_unique<CUDARetainedStage>(binding,router->declaration(),shared->declaration(),
-        std::move(prefix),terminal);
     const std::vector members{region.previous_write,region.branch_norm,region.down,region.up,region.read,
         router_name,shared_name,terminal};
+    std::unordered_set<std::string> packet_nodes;
+    for (const auto& name : order)
+    {
+        const auto& node = *graph.getNode(name);
+        const auto type = node.stage->type();
+        if ((type == ComputeStageType::MOE_OVERLAY_ACTIVATION_DISPATCH_PACK ||
+                type == ComputeStageType::MOE_OVERLAY_TICKET_PUBLISH) &&
+            std::any_of(node.dependencies.begin(), node.dependencies.end(), [&](const auto& dependency) {
+                return dependency == router_name || packet_nodes.contains(dependency);
+            }))
+            packet_nodes.insert(name);
+    }
     std::vector<LocalRegionExport> exports;
     for(const auto& producer:members)
     {
@@ -1272,6 +1286,40 @@ void lowerCUDAMappedRetainedM1HCFFN(ComputeGraph& graph,const std::string& previ
                 export_.consumers.push_back(name);
         if(!export_.consumers.empty())exports.push_back(std::move(export_));
     }
+    std::shared_ptr<CUDAEarlyPacketPublication> packet;
+    if(!packet_nodes.empty())
+    {
+        packet=std::make_shared<CUDAEarlyPacketPublication>();
+        const auto& route=router->declaration();
+        for(const auto& name:packet_nodes)
+        {
+            auto& reader=*graph.getNode(name);
+            // These readers may bypass full FFN retirement only when all of
+            // their graph inputs are the original early HC/router publication.
+            if(reader.device!=read.device || !ownsHeterogeneousTicketBoundary(graph.nativeCaptureEnvelope()) ||
+                std::any_of(reader.dependencies.begin(),reader.dependencies.end(),[&](const auto& dependency) {
+                    return dependency!=router_name && dependency!=terminal && dependency!=read.name &&
+                        !packet_nodes.contains(dependency);
+                }))
+                throw std::invalid_argument("CUDA retained QFN packet has a dependency outside its early router publication: " + name);
+            const auto bind=[&](auto& stage,const auto& declaration) {
+                if(declaration.hidden!=mixed.tensor || declaration.routing_indices!=route.output_indices ||
+                    declaration.routing_weights!=route.output_weights)
+                    throw std::invalid_argument("CUDA retained QFN packet changed its early arena source: " + name);
+                stage.bindEarlyRoutePublication(packet,route.active_row_count_device);
+            };
+            if(auto* dispatch=dynamic_cast<MoEOverlayActivationDispatchPackStage*>(reader.stage.get()))
+                bind(*dispatch,dispatch->getParams());
+            else if(auto* batch=dynamic_cast<MoEOverlayActivationDispatchPackBatchStage*>(reader.stage.get()))
+                bind(*batch,batch->getParams());
+            else if(auto* ticket=dynamic_cast<MoEOverlayTicketPublishStage*>(reader.stage.get()))
+                bind(*ticket,ticket->params());
+            else
+                throw std::invalid_argument("CUDA retained QFN has an unknown early packet stage: " + name);
+        }
+    }
+    auto replacement=std::make_unique<CUDARetainedStage>(binding,router->declaration(),shared->declaration(),
+        std::move(prefix),std::move(packet),terminal);
     graph.replaceClosedLocalRegion(members,terminal,std::move(replacement),exports,
         LocalRegionCapturePolicy::HeterogeneousTicketLocal);
 #else

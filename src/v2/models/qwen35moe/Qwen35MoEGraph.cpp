@@ -10264,6 +10264,8 @@ namespace llaminar2
                             {
                                 if (dispatch_ticket_publish_name.empty())
                                     throw std::logic_error("CUDA retained QFN requires the original device ticket publisher");
+                                // The local fusion retains the packet as an explicit reader.
+                                // Native capture substitutes its original early router edge.
                                 graph.addDependency(dispatch_ticket_publish_name, captured_local_expert_compute_node);
                                 retained_pre_cpu_publications.push_back(dispatch_ticket_publish_name);
                             }
@@ -12833,8 +12835,8 @@ namespace llaminar2
                     const auto &cpu_packet = mapped_activation_dispatch_nodes.back();
                     if (mapped_cuda_retained_m1)
                     {
-                        // The resident program owns routing and local math together.
-                        // The existing dispatch stage consumes both publications after it retires.
+                        // Keep complete retirement at the ticket unit boundary.
+                        // Native capture consumes the earlier router export for this packet.
                         graph.addDependency(cpu_packet, captured_local_expert_compute_node);
                         retained_pre_cpu_publications.push_back(cpu_packet);
                     }

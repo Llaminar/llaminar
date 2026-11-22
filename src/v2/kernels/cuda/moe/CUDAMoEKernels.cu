@@ -91,6 +91,7 @@
 #include "utils/DebugEnv.h"
 
 #include <algorithm>
+#include <cuda/atomic>
 #include <cassert>
 #include <cmath>
 #include <cstddef>
@@ -28166,10 +28167,22 @@ namespace llaminar2::cuda::moe
         const auto* entry = retainedQFNM1Function(gate, down, demand, observe);
         const auto admitted = NativeCooperativeKernelBoundary<NativeCooperativeBackend::CUDA>::prepare(
             device, entry, kThreads, 0, generation);
-        const auto blocks = std::min(2u * static_cast<unsigned>(hardware.sm_count),
+        auto blocks = std::min(2u * static_cast<unsigned>(hardware.sm_count),
             hidden / retained_hc_read_warp_channels);
         if (blocks > admitted.maximumGrid())
             throw std::invalid_argument("Retained QFN HC/FFN entry cannot keep the measured CTA grid resident");
+        if (arguments.early_packet_ready)
+        {
+            if (hc.norm.extent.liveRows)
+                throw std::invalid_argument("CUDA retained QFN early CPU packet requires the original fully-active M1 invocation");
+            int concurrent = 0;
+            if (blocks < 2u || reinterpret_cast<std::uintptr_t>(arguments.early_packet_ready) % alignof(std::uint64_t) ||
+                cudaDeviceGetAttribute(&concurrent, cudaDevAttrConcurrentKernels, int(device.ordinal)) != cudaSuccess || !concurrent)
+                throw std::invalid_argument("Retained QFN HC/FFN cannot admit its independent packet lane");
+            // Preserve room for a packet acquire CTA even when it runs before the
+            // cooperative entry. The follower retains its full arithmetic grid.
+            blocks = std::min(blocks, admitted.maximumGrid() - 1u);
+        }
         return {admitted, arguments, blocks};
     }
 
