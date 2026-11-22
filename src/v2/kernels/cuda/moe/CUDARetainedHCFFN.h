@@ -65,6 +65,7 @@ namespace llaminar2::cuda::moe
         RetainedM1Expert shared; ///< Original immutable shared FFN triplet for this participant.
         RetainedM1Expert* selected; ///< Prepared descriptors indexed by compact local route.
         int* route_order; ///< Live and canonical counts followed by original slots, grouped by physical decoder.
+        int* route_plan_ready; ///< Device-scope publication from the selector CTA to routed math CTAs.
         int routed_width; ///< Actual selected-expert fragment width admitted for this participant.
         RetainedM1FFNWorkspace routed_workspace;
         RetainedM1FFNWorkspace shared_workspace;

@@ -177,7 +177,8 @@ public:
             .shared_gate_input = nullptr,
             .shared = {prepared_shared.gate, prepared_shared.up, prepared_shared.down},
             .selected = static_cast<cuda::moe::RetainedM1Expert*>(pointers[Descriptors]),
-            .route_order = static_cast<int*>(pointers[RouteOrder]), .routed_width = width,
+            .route_order = static_cast<int*>(pointers[RouteOrder]),
+            .route_plan_ready = static_cast<int*>(pointers[RoutePlanReady]), .routed_width = width,
             .routed_workspace = {codes, scales},
             .shared_workspace = {codes + shared_offset, scales + shared_offset / 32},
             .hidden_codes = static_cast<int8_t*>(pointers[HiddenCodes]),
@@ -287,7 +288,7 @@ private:
     }
 
     /** @brief Unambiguous index of every admitted scratch plane in the native operands. */
-    enum Bank : std::size_t { RouterLogits, Descriptors, RouteOrder, HiddenCodes, HiddenScales, DownCodes, DownScales, BankCount };
+    enum Bank : std::size_t { RouterLogits, Descriptors, RouteOrder, RoutePlanReady, HiddenCodes, HiddenScales, DownCodes, DownScales, BankCount };
     /** @brief Size of one named workspace plane. */
     struct BankRequirement { const char* name; std::size_t bytes; };
     using Addresses = std::array<void*, 5>;
@@ -302,6 +303,7 @@ private:
         return {{{ROUTE_LOGITS, std::size_t(router_.num_experts) * sizeof(float)},
             {"cuda_retained_qfn_selected_descriptors", top_k * sizeof(cuda::moe::RetainedM1Expert)},
             {"cuda_retained_qfn_route_order", (2 + top_k) * sizeof(int)},
+            {"cuda_retained_qfn_route_plan_ready", sizeof(int)},
             {DECODE_HIDDEN_INT8, hidden * sizeof(int8_t)}, {DECODE_HIDDEN_SCALES, hidden / 32 * sizeof(float)},
             {DECODE_SWIGLU_INT8, channels * sizeof(int8_t)}, {DECODE_SWIGLU_SCALES, channels / 32 * sizeof(float)}}};
     }

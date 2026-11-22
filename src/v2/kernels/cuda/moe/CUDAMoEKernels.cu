@@ -28182,6 +28182,7 @@ namespace llaminar2::cuda::moe
             (demand.contains(FullNativeHCFFNOutputRole::HCUp) && !hc.up.output) ||
             !router.runtime || !router.weights || !router.logits || !router.route_indices || !router.route_weights ||
             !arguments.selected || !arguments.route_order || !arguments.hidden_codes || !arguments.hidden_scales ||
+            (router.local_policy == RoutedExpertRowExecutionPolicy::IntermediateShardLocal && !arguments.route_plan_ready) ||
             !arguments.routed_contributions || !arguments.shared_contribution ||
             !valid_workspace(arguments.routed_workspace) || !valid_workspace(arguments.shared_workspace))
             throw std::invalid_argument("Retained QFN HC/FFN is missing an original graph buffer or prepared source");
@@ -28226,9 +28227,11 @@ namespace llaminar2::cuda::moe
                     resources.static_shared_bytes > Peer::shared_bytes || resources.blocks_per_processor < Peer::blocks_per_sm)
                     throw std::invalid_argument("Retained QFN HC/FFN exceeds its co-resident original dispatch packet budget");
             }
-            // Preserve room for a packet acquire CTA even when it runs before the
-            // cooperative entry. The follower retains its full arithmetic grid.
-            blocks = std::min(blocks, admitted.maximumGrid() - 1u);
+            // Keep one measured resident CTA slot open for the early packet
+            // chain. The follower retains its full arithmetic grid.
+            const unsigned packet_grid_capacity = std::min(admitted.maximumGrid(),
+                cuda_moe_packet::ResidentDispatchPeerBudget::blocks_per_sm * unsigned(hardware.sm_count));
+            blocks = std::min(blocks, packet_grid_capacity - 1u);
         }
         return {admitted, arguments, blocks};
     }

@@ -16,6 +16,14 @@
     constexpr int kRetainedRouteCounts = 2;
     static_assert(kMaxTopK <= 32, "A single original router warp compacts the QFN route slots");
 
+    /** @brief Exact device-wide clock for the bounded in-grid route rendezvous. */
+    __device__ __forceinline__ std::uint64_t retainedRouteClock()
+    {
+        std::uint64_t tick;
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(tick));
+        return tick;
+    }
+
     /** @brief Select the active program and publish only the empty routing ledger on a zero row. */
     __global__ void retainedQFNM1Predicate(cudaGraphConditionalHandle condition, const int* live,
         llaminar2::cuda::moe::RetainedM1Router router)
@@ -343,6 +351,13 @@
         const unsigned first_thread = blockIdx.x * blockDim.x + threadIdx.x;
         const unsigned threads = gridDim.x * blockDim.x;
         const unsigned lane = threadIdx.x % 32;
+        // The first HC rendezvous orders this invocation's reset before any
+        // CTA can read the route plan. The word is private to this retained grid.
+        if constexpr (IndependentLocalShard)
+        {
+            if (blockIdx.x == 0 && threadIdx.x == 0)
+                cuda::atomic_ref<int, cuda::thread_scope_device>(*args.route_plan_ready).store(0, cuda::memory_order_relaxed);
+        }
         publishRetainedHCPrefix<PublishHCActivated, PublishHCUp>(args.hc, workspace.hc, grid);
 
         const auto* router_weights = reinterpret_cast<const __half*>(router.weights);
@@ -363,9 +378,13 @@
         {
             // Shared Gate/Up depends on the Q8 row alone. Keep its complete
             // packets on independent CTAs during route and descriptor setup.
-            if (blockIdx.x != 0)
+            // Higher CTAs handle shared math. Most routed CTAs can then begin
+            // as soon as the selector publishes the local descriptors.
+            const unsigned shared_start = gridDim.x > output_packets ? gridDim.x - output_packets : 1u;
+            if (blockIdx.x >= shared_start)
             {
-                for (unsigned packet = blockIdx.x - 1; packet < output_packets; packet += gridDim.x - 1)
+                for (unsigned packet = blockIdx.x - shared_start; packet < output_packets;
+                     packet += gridDim.x - shared_start)
                 {
                     retainedGateUpPacket<SharedCodebook, width>(args.shared, packet,
                         args.shared_workspace.down_codes, args.shared_workspace.down_scales,
@@ -458,7 +477,29 @@
                     args.route_order[kRetainedRouteCounts + local_count + slot - __popc(present & prefix)] = slot;
             }
         }
-        grid.sync();
+        if constexpr (IndependentLocalShard)
+        {
+            if (blockIdx.x == 0)
+            {
+                __syncthreads();
+                if (threadIdx.x == 0)
+                    cuda::atomic_ref<int, cuda::thread_scope_device>(*args.route_plan_ready).store(1, cuda::memory_order_release);
+            }
+            else if (threadIdx.x == 0)
+            {
+                const auto start = retainedRouteClock();
+                const cuda::atomic_ref<int, cuda::thread_scope_device> publication(*args.route_plan_ready);
+                while (publication.load(cuda::memory_order_acquire) == 0)
+                {
+                    if (retainedRouteClock() - start >= 30'000'000'000ULL)
+                        __trap();
+                    __nanosleep(64);
+                }
+            }
+            __syncthreads();
+        }
+        else
+            grid.sync();
 
         const int local_count = args.route_order[0];
         if constexpr (can_promote_gate)
@@ -500,7 +541,18 @@
 
         const bool gate_shared = args.shared_publication == RetainedM1SharedPublication::GatedComplete;
         const float shared_factor = gate_shared ? *args.shared_gate_factor : 1.0f;
-        for (unsigned column = first_thread; column < static_cast<unsigned>(hidden); column += threads)
+        unsigned first_shared_column = first_thread;
+        if constexpr (IndependentLocalShard)
+        {
+            // Keep the shared Down tiles off the lowest CTAs, which own the
+            // routed Down prefix for the active original routes.
+            constexpr unsigned shared_tiles = (hidden + kThreads - 1) / kThreads;
+            const unsigned shared_start = gridDim.x > shared_tiles ? gridDim.x - shared_tiles : 0u;
+            const unsigned tile = blockIdx.x >= shared_start ? blockIdx.x - shared_start
+                : gridDim.x - shared_start + blockIdx.x;
+            first_shared_column = tile * blockDim.x + threadIdx.x;
+        }
+        for (unsigned column = first_shared_column; column < static_cast<unsigned>(hidden); column += threads)
         {
             const float raw = retainedDown<SharedCodebook, false>(args.shared.down, column,
                 args.shared_workspace.down_codes, args.shared_workspace.down_scales);

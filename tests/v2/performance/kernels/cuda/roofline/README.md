@@ -410,6 +410,22 @@ private bytes. The table spans all three source pairs and both RTX 3090s.
 | Routed Gate/Up | 8.19–10.24 |
 | Down and native retirement | 15.86–16.38 |
 
+In the next resident candidate the selector CTA publishes its completed
+descriptor plan directly to routed CTAs. Separate CTAs run shared Gate/Up.
+With that schedule, a matched math-only replay reduced retirement by
+3.07–4.10 µs. Giving the shared Down tiles separate CTAs cut a further
+1.53–3.07 µs in the complete mapped packet and math replay. The resulting
+fragment uses 106 registers per thread and zero private bytes.
+
+| Complete mapped packet and math replay | CPU packet completion, µs | Local math retirement, µs |
+| --- | ---: | ---: |
+| Direct descriptor publication | 71.68–73.20 | 73.73–74.75 |
+| Direct publication and separate shared Down CTAs | 72.69–73.73 | 71.17–73.22 |
+
+Both RTX 3090s reproduced each of the 18 recorded-seed outputs per source
+pair. The six native tests include dirty route-ready words, alternating
+placement banks, and original packet lease acquisition by the CPU.
+
 ### Grouped Gate/Up packets and direct Down on SM86
 
 The grouped native program uses one 256-thread CTA per live 32-column

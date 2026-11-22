@@ -17,7 +17,7 @@ namespace llaminar2::cuda_moe_packet
     struct ResidentDispatchPeerBudget
     {
         static constexpr unsigned block_threads = 256;
-        static constexpr unsigned registers_per_thread = 96;
+        static constexpr unsigned registers_per_thread = 112;
         static constexpr unsigned shared_bytes = 22528;
         static constexpr unsigned blocks_per_sm = 2;
     };

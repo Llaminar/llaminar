@@ -339,7 +339,7 @@ void replay(const TracePair& trace, int ordinal, unsigned resident_blocks, Retai
             moved[expert].down = weight(hidden, width, trace.down, seed + 2, true);
     }
 
-    Array<int> live{1}, order{top_k + 2}, ledger_ids{top_k}, ledger_participants{top_k};
+    Array<int> live{1}, order{top_k + 2}, route_plan_ready{1}, ledger_ids{top_k}, ledger_participants{top_k};
     Array<float> residual{trunk}, block{hidden}, write_gate{4}, gain{trunk}, written{trunk},
         normalized{trunk}, norm_scales{trunk / 32}, partials{width * hc_partitions}, raw{width},
         activated{width}, primary_scales{width / 32}, secondary_scales{width / 32}, up{trunk}, mixed{hidden},
@@ -374,7 +374,8 @@ void replay(const TracePair& trace, int ordinal, unsigned resident_blocks, Retai
         .router = {runtime.data(), router.data(), logits.data(), route_indices.data(), route_weights.data(),
             nullptr, experts, top_k, shard ? RoutedExpertRowExecutionPolicy::IntermediateShardLocal
                 : RoutedExpertRowExecutionPolicy::ParticipantAssigned, true},
-        .shared = shared, .selected = selected.data(), .route_order = order.data(), .routed_width = width,
+        .shared = shared, .selected = selected.data(), .route_order = order.data(),
+        .route_plan_ready = route_plan_ready.data(), .routed_width = width,
         .routed_workspace = {routed_codes.data(), routed_scales.data()},
         .shared_workspace = {shared_codes.data(), shared_scales.data()},
         .hidden_codes = hidden_codes.data(), .hidden_scales = hidden_scales.data(),
@@ -453,6 +454,12 @@ void replay(const TracePair& trace, int ordinal, unsigned resident_blocks, Retai
             return __half_as_ushort(__float2half(frame.seed == 112 ? 0.f : signedValue(i, frame.seed + 661)));
         });
         live.set(native, [](std::size_t) { return 1; });
+        if (shard)
+        {
+            // The retained kernel must initialize its own publication before
+            // any worker can consume the next route plan.
+            route_plan_ready.set(native, [](std::size_t) { return 7; });
+        }
         auto state = std::make_unique<DeviceMoELayerRuntime>();
         state->active_epoch = epoch;
         state->expert_count = experts;
@@ -511,6 +518,11 @@ void replay(const TracePair& trace, int ordinal, unsigned resident_blocks, Retai
                 &logits, &route_indices, &route_weights, &routed, &shared_out})
             actual = publication->digest(native, actual);
         EXPECT_EQ(actual, frame.expected) << "seed=" << frame.seed << " epoch=" << epoch;
+        if (shard)
+        {
+            constexpr int published = 1;
+            EXPECT_EQ(route_plan_ready.digest(native), fnv1a64(&published, sizeof(published)));
+        }
         if (early)
         {
             constexpr std::uint64_t empty = 0;
