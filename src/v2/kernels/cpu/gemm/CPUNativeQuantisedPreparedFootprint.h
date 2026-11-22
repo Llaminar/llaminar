@@ -151,10 +151,10 @@ namespace llaminar2::cpu::native_quantised
         if (encoding == CPUNativeQuantisedEncoding::Q6KNativeDualScale)
             return 1792;
         // The compact family reserves exactly the payload words each codebook
-        // decodes, plus two FP16 scale vectors and the effective-minimum
-        // vector. Unused bytes are zero, not another ledger.
+        // decodes, plus two FP16 scale vectors. The effective-minimum vector
+        // exists only for Q2_K (the sole consumer of chunkEffectiveMins).
         if (encoding == CPUNativeQuantisedEncoding::CompactMultiScale)
-            return data_stride + 512u;
+            return data_stride + 256u + (codebook_id == 10 ? 256u : 0u);
         return data_stride + 256u + (is_asymmetric ? 128u : 0u);
     }
 

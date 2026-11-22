@@ -149,7 +149,7 @@ inline void appendNativeWeightGroups(const IINT8Unpackable& source,const NativeQ
                 const VnniPackContext context{.raw_bytes=nullptr,.N=1,.K=source_k,
                     .blocks_per_row=(source_k+31)/32,.payload_bytes=format.payload_bytes,
                     .payload_array=payload,.scales_array=primary,.mins_array=secondary,
-                    .emins_array=out.usesCompactMultiScale()?emins:nullptr,
+                    .emins_array=(out.usesCompactMultiScale() && out.codebook_id == 10)?emins:nullptr,
                     .destination_block_origin=input_first,.destination_block_count=count,
                     .primary_layout=out.primaryScaleLayout()};
                 for(int b=0;b<count;++b) {
@@ -171,7 +171,8 @@ inline void appendNativeWeightGroups(const IINT8Unpackable& source,const NativeQ
                         target[(byte/4)*256+column*4+byte%4]=input[byte];
                     std::memcpy(target+out.data_stride+column*2,primary+b,2);
                     std::memcpy(target+out.data_stride+128+column*2,secondary+b,2);
-                    std::memcpy(target+out.data_stride+256+column*4,emins+b,4);
+                    if (out.codebook_id == 10)
+                        std::memcpy(target+out.data_stride+256+column*4,emins+b,4);
                 } else if(out.usesQ6KNativeDualScale()) {
                     for(int g=0;g<4;++g)std::memcpy(target+g*256+column*4,input+g*4,4);
                     for(int g=0;g<8;++g) {
