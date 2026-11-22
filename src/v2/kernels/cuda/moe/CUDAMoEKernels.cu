@@ -50,6 +50,7 @@
 #include <cuda/std/__cccl/assert.h>
 
 #include "CUDARetainedHCFFN.h"
+#include "CUDARetainedGroupedFFN.h"
 #include "CUDARetainedHCPrefix.cuh"
 #include "kernels/common/NativeCooperativeKernel.cuh"
 #include "kernels/cuda/gemm/CUDANativeQuantisedDecodeCommon.cuh"
@@ -23136,6 +23137,7 @@ __global__ void softmax_topk_decode_descriptors_kernel(
     }
 
 #include "CUDARetainedHCFFNBody.cu.inc"
+#include "CUDARetainedGroupedFFNBody.cu.inc"
 }
 
 extern "C"
@@ -27976,6 +27978,100 @@ namespace llaminar2::cuda
 
 namespace llaminar2::cuda::moe
 {
+    /** @copydoc RetainedGroupedFFNProgram::prepare */
+    RetainedGroupedFFNProgram RetainedGroupedFFNProgram::prepare(DeviceId device,
+        RetainedGroupedFFNRange range, void* stream, uint64_t generation)
+    {
+#if CUDART_VERSION >= 12080
+        const auto native = static_cast<cudaStream_t>(stream);
+        if (!device.is_cuda() || !native || native == cudaStreamLegacy || native == cudaStreamPerThread ||
+            !generation || !range.rows || !range.live_rows || range.capacity <= 0 ||
+            (range.width != kQFNDecodeGateUpN && range.width != 2 * kQFNDecodeGateUpN) ||
+            (range.role != RetainedGroupedFFNRole::Routed && range.role != RetainedGroupedFFNRole::Shared))
+            throw std::invalid_argument("Retained grouped QFN requires its original CUDA geometry and workspace");
+        const auto& hardware = cudaHardwareMetadata().at(device.ordinal);
+        int current = -1, max_rows = 0;
+        if (hardware.sm_major != 8 || hardware.sm_minor != 6 || cudaGetDevice(&current) != cudaSuccess ||
+            current != static_cast<int>(device.ordinal) ||
+            cudaDeviceGetAttribute(&max_rows, cudaDevAttrMaxGridDimY, current) != cudaSuccess || range.capacity > max_rows)
+            throw std::invalid_argument("Retained grouped QFN exceeds its admitted SM86 launch capacity");
+        cudaStreamCaptureStatus capture{};
+        if (cudaStreamIsCapturing(native, &capture) != cudaSuccess || capture != cudaStreamCaptureStatusNone)
+            throw std::logic_error("Retained grouped QFN preparation must precede native capture");
+
+        const auto select = [&]<int Width>() {
+            constexpr auto q4 = native_quantised_formats::Q4_K.codebook_id;
+            constexpr auto q5 = native_quantised_formats::Q5_K.codebook_id;
+            constexpr auto q8 = native_quantised_formats::Q8_0.codebook_id;
+            constexpr auto promoted = kNativeQuantisedExpandedInt8MinCodebook;
+            const void* gate = nullptr;
+            const void* down = nullptr;
+            switch (range.gate_up_codebook)
+            {
+                case q4: gate = reinterpret_cast<const void*>(retainedQFNGroupedGateUp<q4, Width>); break;
+                case q5: gate = reinterpret_cast<const void*>(retainedQFNGroupedGateUp<q5, Width>); break;
+                case q8: gate = reinterpret_cast<const void*>(retainedQFNGroupedGateUp<q8, Width>); break;
+                case promoted: gate = reinterpret_cast<const void*>(retainedQFNGroupedGateUp<promoted, Width>); break;
+            }
+            if (range.role == RetainedGroupedFFNRole::Shared)
+            {
+                if (range.gate_up_codebook == q8 && range.down_codebook == q8)
+                    down = reinterpret_cast<const void*>(retainedQFNGroupedDown<q8, Width, RetainedGroupedFFNRole::Shared>);
+            }
+            else
+            {
+                switch (range.down_codebook)
+                {
+                    case q5: down = reinterpret_cast<const void*>(retainedQFNGroupedDown<q5, Width, RetainedGroupedFFNRole::Routed>); break;
+                    case q8: down = reinterpret_cast<const void*>(retainedQFNGroupedDown<q8, Width, RetainedGroupedFFNRole::Routed>); break;
+                    case promoted: down = reinterpret_cast<const void*>(retainedQFNGroupedDown<promoted, Width, RetainedGroupedFFNRole::Routed>); break;
+                }
+            }
+            const std::array entries{std::pair{gate, kThreads}, std::pair{down, retained_grouped_down_threads}};
+            for (const auto& [function, threads] : entries)
+            {
+                cudaFuncAttributes resources{};
+                if (!function || cudaFuncGetAttributes(&resources, function) != cudaSuccess ||
+                    resources.maxThreadsPerBlock < threads || resources.localSizeBytes)
+                    throw std::invalid_argument("Retained grouped QFN lacks a spill-free entry for its prepared decoder");
+            }
+            return RetainedGroupedFFNProgram(range, gate, down, stream, generation);
+        };
+        return range.width == kQFNDecodeGateUpN ? select.template operator()<kQFNDecodeGateUpN>()
+            : select.template operator()<2 * kQFNDecodeGateUpN>();
+#else
+        (void)device; (void)range; (void)stream; (void)generation;
+        throw std::invalid_argument("Retained grouped QFN requires CUDA device-updatable graph nodes");
+#endif
+    }
+
+    /** @copydoc RetainedGroupedFFNProgram::record */
+    void RetainedGroupedFFNProgram::record(void* stream, uint64_t generation) const
+    {
+#if CUDART_VERSION >= 12080
+        if (stream != stream_ || generation != generation_)
+            throw std::logic_error("Retained grouped QFN received a foreign stream or stale workspace");
+        const auto native = static_cast<cudaStream_t>(stream);
+        auto* rows = range_.rows;
+        void* arguments[]{&rows};
+        const std::array launches{
+            cudaKernelNodeParams{.func = const_cast<void*>(gate_), .gridDim = dim3(1), .blockDim = dim3(kThreads),
+                .kernelParams = arguments},
+            cudaKernelNodeParams{.func = const_cast<void*>(down_), .gridDim = dim3(1),
+                .blockDim = dim3(retained_grouped_down_threads),
+                .kernelParams = arguments},
+        };
+        appendCUDADeviceSizedKernels(native, launches, [&](auto handles) {
+            sizeRetainedQFNGroupedFFN<<<1, 1, 0, native>>>(handles[0], handles[1], range_.live_rows,
+                range_.capacity, range_.width / 32);
+            return cudaPeekAtLastError() == cudaSuccess;
+        });
+#else
+        (void)stream; (void)generation;
+        throw std::logic_error("Retained grouped QFN requires CUDA device-updatable graph nodes");
+#endif
+    }
+
     /** @copydoc retainedQFNM1Function */
     const void* retainedQFNM1Function(uint8_t gate, uint8_t down,
         FullNativeHCFFNOutputDemand demand, bool observe)

@@ -198,8 +198,57 @@ The Release candidate selected by
 complete original QFN serial decode graph. At F320/S320 it reduces the
 CUDA root from 3,536 to 2,576 native nodes and the follower from 2,911 to
 1,951. Both retain 49 compilation units and one native executable each.
-The candidate matched the first 12 tokens of the existing ordinary Release
-baseline. Paired 256-token ordinary and fixed-depth-7 qualification is pending.
+
+The real Release comparison used the same prompt, admitted tensor sharding
+and one warmup followed by three measured 256-token iterations per cell.
+All token IDs and per-iteration MTP work match in both run orders.
+
+| Run order | Ordinary control → candidate | Fixed-depth-7 control → candidate |
+| --- | ---: | ---: |
+| Candidate first | 29.385 → 27.538 tok/s (−6.28%) | 43.034 → 43.698 tok/s (+1.54%) |
+| Control first | 30.071 → 27.533 tok/s (−8.44%) | 44.394 → 43.918 tok/s (−1.07%) |
+
+The candidate stays opt-in. The fused producer publishes the router outputs
+to the explicit CPU packet stages after its local FFN completes. This places
+the packet later on the ordinary decode path than the staged release, which
+publishes it before local FFN math.
+
+### Grouped Gate/Up packets and direct Down on SM86
+
+The grouped native program uses one 256-thread CTA per live 32-column
+Gate/Up packet. It folds all 16 serial partitions in shared memory, applies
+SwiGLU and writes the Down Q8 codes and scales. The ordered 128-thread Down
+tiles read that publication directly. A device plan sets each grid in the
+original native executable and disables both arithmetic nodes when the live
+count is zero. There are no global Gate/Up partials or separate SwiGLU/Q8
+launches in the isolated capture.
+
+The retained packet and grid preflight tests passed on each RTX 3090. The
+packet replay cycles through live counts `6,3,0,5,1,0,6` and checks recorded
+serial CUDA Q8 and Down bytes, including both placements of promoted operands
+and poisoned inactive output. `cuobjdump` reports 64–72 registers and 4,096
+shared bytes for Gate/Up, and 46–63 registers and no shared memory for Down.
+All 16 entries use zero stack and local bytes. The smaller Down tile improved
+single-row Q8_0 timings by 3.7–6.9% across the two widths and roles. At six
+rows the change was within 1% for every measured format and role.
+
+Both cards timed captured control and math together with six independent
+prepared rows, including their format-specific weights. Percentages use
+one compulsory read of the packed weights, scales and minima at 886.17 GB/s.
+
+| Gate/Up and Down physical format | Role | F320, µs | F320 weight reference | F640, µs | F640 weight reference |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Q4_K / Q5_1 | Routed | 21.728–21.760 | 51.0–51.1% | 35.744–35.872 | 61.9–62.1% |
+| Q4_K / expanded Q5_1 | Routed | 23.904 | 55.1% | 37.344–37.408 | 70.4–70.6% |
+| Q4_K / Q8_0 | Routed | 23.840–23.872 | 53.7–53.8% | 36.608 | 70.1% |
+| Q5_K / Q8_0 | Routed | 25.248–25.344 | 56.1–56.3% | 39.200–39.232 | 72.5–72.5% |
+| Expanded Q5_K / Q8_0 | Routed | 29.056 | 63.2% | 47.584–47.680 | 77.1–77.2% |
+| Q8_0 / Q8_0 | Routed | 27.584–27.872 | 63.4–64.1% | 46.077–46.144 | 76.6–76.7% |
+| Q8_0 / Q8_0 | Shared | 28.128–28.416 | 62.2–62.9% | 45.984–46.080 | 76.7–76.9% |
+
+The isolated replay supplies prepared operands. Production verifier and
+drafter qualification also requires the original runtime route publication,
+shared-gate and collective edges, and a paired complete transaction.
 
 ### CUDA peer transfers at QFN decode sizes
 

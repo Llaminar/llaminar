@@ -184,21 +184,22 @@
      * @brief Consume the resident role's already prepared Q8 row in the original ordered Down fold.
      * @tparam Codebook Exact validated Down decoder.
      * @tparam Direct One original K32 packet per partition, with direct narrow publication.
+     * @tparam Width Exact local Down reduction width.
      * @param weight Original expert Down source.
      * @param column Original participant-local output column.
      * @param codes Complete prepared SwiGLU K32 bytes.
      * @param scales Original rounded packet scales.
      * @return Exact unweighted original route contribution for one channel.
      */
-    template<uint8_t Codebook, bool Direct>
+    template<uint8_t Codebook, bool Direct, int Width = kQFNDecodeGateUpN>
     __device__ __forceinline__ float retainedDown(const DeviceNativeQuantisedMatrixDesc& weight,
         int column, const int8_t* codes, const float* scales)
     {
-        constexpr int blocks = kQFNDecodeGateUpN / 32;
+        constexpr int blocks = Width / 32;
         constexpr int pitch = kQFNDecodeGateUpK;
         if constexpr (Direct)
         {
-            // The admitted F320 source always has ten K32 packets. Unroll two
+            // The narrow F320 source has ten K32 packets. Unroll two
             // at a time to keep the original order without growing registers.
             return native_quantised_dot_admitted_range<Codebook, NativeMoEDotOrder::DecodeK32, blocks, 2>(
                 weight, column, codes, scales, pitch, 0, blocks);

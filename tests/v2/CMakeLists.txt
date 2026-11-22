@@ -12144,13 +12144,28 @@ add_v2_test(V2_Integration_CUDA_NativeQuantised_PrefillWorkspaceEnvelope
 
 if(HAVE_CUDA)
 add_executable(v2_integration_cuda_retained_hc_ffn
-    integration/kernels/cuda/Test__CUDARetainedHCFFN.cpp)
+    integration/kernels/cuda/Test__CUDARetainedHCFFN.cpp
+    integration/kernels/cuda/CUDADeviceSizedWorkWitness.cu)
 if(TARGET v2_integration_cuda_retained_hc_ffn)
-    target_link_libraries(v2_integration_cuda_retained_hc_ffn PRIVATE llaminar2_core GTest::gtest_main CUDA::cudart)
+    set_target_properties(v2_integration_cuda_retained_hc_ffn PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+    target_link_libraries(v2_integration_cuda_retained_hc_ffn PRIVATE llaminar2_core GTest::gtest CUDA::cudart)
     add_v2_test(V2_Integration_CUDA_RetainedHCFFNCountedReplay
         COMMAND $<TARGET_FILE:v2_integration_cuda_retained_hc_ffn>
+            --gtest_filter=CUDARetainedHCFFN.RecordedCountedPublications
         LABELS "V2;Integration;ProductionTestPreflight;CUDA;MoE;Hyperconnection;GraphCapture;Replay;ByteExact;Regression;HardwareOptional;LocalHostDevices;Devices1;NativeISA-sm_86"
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 120)
+    if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL 12.8)
+        add_v2_test(V2_Integration_CUDA_GroupedLiveGridContract
+            COMMAND $<TARGET_FILE:v2_integration_cuda_retained_hc_ffn>
+                --gtest_filter=CUDARetainedHCFFN.DeviceSizedWorkContract
+            LABELS "V2;Integration;ProductionTestPreflight;CUDA;MoE;GraphCapture;Contract;Regression;HardwareOptional;LocalHostDevices;Devices1;NativeISA-sm_86"
+            MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 120)
+        add_v2_test(V2_Integration_CUDA_RetainedGroupedFFNPacketReplay
+            COMMAND $<TARGET_FILE:v2_integration_cuda_retained_hc_ffn>
+                --gtest_filter=CUDARetainedHCFFN.RecordedGroupedPacketPublications
+            LABELS "V2;Integration;ProductionTestPreflight;CUDA;MoE;MTP;GraphCapture;Replay;ByteExact;Regression;HardwareOptional;LocalHostDevices;Devices1;NativeISA-sm_86"
+            MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 120)
+    endif()
 endif()
 add_executable(v2_integration_cuda_moe_kernel
     integration/kernels/cuda/Test__CUDAMoEKernel.cpp
@@ -39059,6 +39074,12 @@ if(HAVE_CUDA AND TEST V2_Integration_CUDABranchNormReplay)
 endif()
 if(HAVE_CUDA AND TEST V2_Integration_CUDA_RetainedHCFFNCountedReplay)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDA_RetainedHCFFNCountedReplay)
+endif()
+if(HAVE_CUDA AND TEST V2_Integration_CUDA_GroupedLiveGridContract)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDA_GroupedLiveGridContract)
+endif()
+if(HAVE_CUDA AND TEST V2_Integration_CUDA_RetainedGroupedFFNPacketReplay)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDA_RetainedGroupedFFNPacketReplay)
 endif()
 
 add_v2_test(V2_Integration_CapturedNativeAllocationOwnership

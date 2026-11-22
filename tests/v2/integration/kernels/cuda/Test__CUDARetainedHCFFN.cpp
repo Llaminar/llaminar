@@ -12,6 +12,7 @@
 #include "backends/cuda/CUDAHardwareMetadata.h"
 #include "execution/moe/MoERuntimeTable.h"
 #include "kernels/cuda/moe/CUDARetainedHCFFN.h"
+#include "kernels/cuda/moe/CUDARetainedGroupedFFN.h"
 #include "tensors/NativeQuantisedFormatInfo.h"
 #include "utils/FNV1a.h"
 
@@ -69,6 +70,24 @@ void requireCUDA(cudaError_t result)
 {
     if (result != cudaSuccess)
         throw std::runtime_error(cudaGetErrorString(result));
+}
+
+/** @return The visible original SM86 ordinal selected by the native preflight contract. */
+int selectVisibleSM86()
+{
+    int count = 0;
+    requireCUDA(cudaGetDeviceCount(&count));
+    initializeCUDAHardwareMetadata();
+    for (int ordinal = 0; ordinal < count; ++ordinal)
+    {
+        const auto& device = cudaHardwareMetadata().at(ordinal);
+        if (device.sm_major == 8 && device.sm_minor == 6)
+        {
+            requireCUDA(cudaSetDevice(ordinal));
+            return ordinal;
+        }
+    }
+    throw std::runtime_error("Preflight requires a visible original SM86 device");
 }
 
 /** @brief Per-replay native stream, kept alive until the graph and all buffers retire. */
@@ -369,21 +388,8 @@ void replay(const TracePair& trace, int ordinal, unsigned resident_blocks)
 
 TEST(CUDARetainedHCFFN, RecordedCountedPublications)
 {
-    llaminar2::GPUDeviceProcessLifetime lifetime;
-    int count = 0;
-    ASSERT_EQ(cudaGetDeviceCount(&count), cudaSuccess);
-    ASSERT_GT(count, 0);
-    llaminar2::initializeCUDAHardwareMetadata();
-    int ordinal = 0;
-    for (; ordinal < count; ++ordinal)
-    {
-        const auto& device = llaminar2::cudaHardwareMetadata().at(ordinal);
-        if (device.sm_major == 8 && device.sm_minor == 6)
-            break;
-    }
-    ASSERT_LT(ordinal, count) << "preflight requires a visible original SM86 device";
-    ASSERT_EQ(cudaSetDevice(ordinal), cudaSuccess);
-    const auto& device = llaminar2::cudaHardwareMetadata().at(ordinal);
+    const int ordinal = selectVisibleSM86();
+    const auto& device = cudaHardwareMetadata().at(ordinal);
     const auto blocks = std::min(2u * static_cast<unsigned>(device.sm_count), hidden / retained_hc_read_warp_channels);
     for (const auto& trace : traces)
     {
@@ -391,4 +397,69 @@ TEST(CUDARetainedHCFFN, RecordedCountedPublications)
         SCOPED_TRACE(unsigned(trace.down.codebook_id));
         ASSERT_NO_THROW(replay(trace, ordinal, blocks));
     }
+}
+
+#if CUDART_VERSION >= 12080
+#include "CUDARetainedGroupedFFNReplay.inc"
+
+const void* cudaDeviceSizedProducerWitness();
+const void* cudaDeviceSizedConsumerWitness();
+bool cudaDeviceSizedPlannerWitness(const int* count, cudaGraphDeviceNode_t producer,
+    cudaGraphDeviceNode_t consumer, int* result, cudaStream_t stream);
+
+/** @test Actual native live grids and publication are preserved through an in-place timeline. */
+TEST(CUDARetainedHCFFN, DeviceSizedWorkContract)
+{
+    const int ordinal = selectVisibleSM86();
+
+    constexpr std::size_t capacity = 8;
+    const Stream stream;
+    Array<int> count_owner{1}, producer{capacity}, output{capacity}, plan_status{1};
+    CUDAGraphCapture parent(stream.value, ordinal);
+    auto fragment = parent.createOrderedTimelineFragment();
+    ASSERT_TRUE(fragment);
+    ASSERT_TRUE(fragment->beginCapture());
+    auto* producer_address = producer.data();
+    auto* output_address = output.data();
+    void* produce_args[]{&producer_address};
+    void* consume_args[]{&producer_address, &output_address};
+    const std::array launches{
+        cudaKernelNodeParams{.func = const_cast<void*>(cudaDeviceSizedProducerWitness()),
+            .gridDim = dim3(1), .blockDim = dim3(1), .kernelParams = produce_args},
+        cudaKernelNodeParams{.func = const_cast<void*>(cudaDeviceSizedConsumerWitness()),
+            .gridDim = dim3(1), .blockDim = dim3(1), .kernelParams = consume_args},
+    };
+    {
+        ScopedCUDAFinalTimelineRecording scope(*fragment);
+        ASSERT_NO_THROW(appendCUDADeviceSizedKernels(stream.value, launches, [&](auto handles) {
+            return cudaDeviceSizedPlannerWitness(count_owner.data(), handles[0], handles[1],
+                plan_status.data(), stream.value);
+        }));
+    }
+    ASSERT_TRUE(fragment->endCapture());
+    const std::array steps{GPUOrderedTimelineStep{.name = "live_grid", .capture = fragment.get()}};
+    ASSERT_TRUE(parent.buildOrderedTimelineTransaction(steps));
+    ASSERT_TRUE(parent.instantiate());
+
+    for (const int live : {8, 3, 0, 5, 1, 0, 8})
+    {
+        SCOPED_TRACE(live);
+        count_owner.set(stream.value, [live](std::size_t) { return live; });
+        output.set(stream.value, [](std::size_t) { return 0; });
+        ASSERT_TRUE(parent.launch());
+        constexpr int success = cudaSuccess;
+        EXPECT_EQ(plan_status.digest(stream.value), fnv1a64(&success, sizeof(success)));
+        std::array<int, capacity> expected{};
+        std::fill_n(expected.begin(), live, live * live);
+        EXPECT_EQ(output.digest(stream.value), fnv1a64(expected.data(), sizeof(expected)));
+    }
+}
+#endif
+
+/** @brief Own one CUDA process lifetime across all selected native fixtures. */
+int main(int argc, char** argv)
+{
+    GPUDeviceProcessLifetime lifetime;
+    ::testing::InitGoogleTest(&argc, argv);
+    return RUN_ALL_TESTS();
 }

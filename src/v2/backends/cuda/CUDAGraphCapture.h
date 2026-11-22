@@ -23,6 +23,8 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -102,9 +104,35 @@ namespace llaminar2
          */
         [[nodiscard]] static bool admitsConditionalOn(cudaStream_t stream) noexcept;
 
+#if CUDART_VERSION >= 12080
+        /**
+         * @brief Bind device-updatable nodes to their final, uploadable definition.
+         * @param stream Exact in-place recording stream.
+         * @return The graph that will directly own the sole executable.
+         * @throws std::logic_error For a stream whose fragment would need cloning.
+         */
+        [[nodiscard]] static cudaGraph_t requireDeviceGridOn(cudaStream_t stream);
+#endif
+
     private:
         const CUDAGraphCapture *previous_; ///< Surrounding scope on the recording thread.
     };
+
+#if CUDART_VERSION >= 12080
+    /**
+     * @brief Append arithmetic nodes whose exact live grids are set by their device plan.
+     * @param stream Exact non-default stream in the final in-place timeline.
+     * @param launches Ordered native arithmetic nodes with their immutable operands.
+     * @param publish Record the device plan using the ordered node handles. Before publishing
+     *                completion it must set each positive grid and disable each empty node.
+     * @throws std::exception If the original timeline, plan frontier or any native node is invalid.
+     * @details Nothing runs during capture. The original planner's native completion edge
+     *          gates the arithmetic, and the native executable uploads on its original stream.
+     */
+    void appendCUDADeviceSizedKernels(cudaStream_t stream,
+        std::span<const cudaKernelNodeParams> launches,
+        const std::function<bool(std::span<const cudaGraphDeviceNode_t>)>& publish);
+#endif
 
     /**
      * @brief Body identity for one native CUDA conditional transaction.

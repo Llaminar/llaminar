@@ -63,6 +63,7 @@ namespace llaminar2
         int device_ordinal = -1;
         State state = State::Open;
         std::size_t fragment_count = 0u;
+        bool requires_device_node_upload = false;
 
         /** @brief Release the definition once the last owner/view is retired. */
         ~OrderedTimelineRecording()
@@ -406,6 +407,93 @@ namespace llaminar2
         return final_timeline_capture && final_timeline_capture->native_capture_active_ &&
             final_timeline_capture->stream_ == stream;
     }
+
+#if CUDART_VERSION >= 12080
+    /** @copydoc ScopedCUDAFinalTimelineRecording::requireDeviceGridOn */
+    cudaGraph_t ScopedCUDAFinalTimelineRecording::requireDeviceGridOn(cudaStream_t stream)
+    {
+        if (!stream || stream == cudaStreamLegacy || stream == cudaStreamPerThread ||
+            !admitsConditionalOn(stream) || !final_timeline_capture->timeline_recording_ ||
+            final_timeline_capture->timeline_recording_->state !=
+                CUDAGraphCapture::OrderedTimelineRecording::State::Recording)
+            throw std::logic_error("Device-sized CUDA work requires its exact final timeline recording");
+        auto& recording = *final_timeline_capture->timeline_recording_;
+        recording.requires_device_node_upload = true;
+        return recording.graph;
+    }
+
+    /** @copydoc appendCUDADeviceSizedKernels */
+    void appendCUDADeviceSizedKernels(cudaStream_t stream,
+        std::span<const cudaKernelNodeParams> launches,
+        const std::function<bool(std::span<const cudaGraphDeviceNode_t>)>& publish)
+    {
+        if (launches.empty() || !publish ||
+            std::any_of(launches.begin(), launches.end(), [](const auto& launch) { return !launch.func; }))
+            throw std::invalid_argument("Device-sized CUDA work requires ordered native arithmetic and a plan publisher");
+        const auto graph = ScopedCUDAFinalTimelineRecording::requireDeviceGridOn(stream);
+        const auto require = [](cudaError_t status, const char* operation) {
+            if (status != cudaSuccess)
+                throw std::runtime_error(std::string(operation) + ": " + cudaGetErrorString(status));
+        };
+        cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+        unsigned long long capture = 0;
+        cudaGraph_t observed = nullptr;
+        const cudaGraphNode_t* frontier = nullptr;
+        const cudaGraphEdgeData* edges = nullptr;
+        std::size_t count = 0;
+        require(cudaStreamGetCaptureInfo(stream, &status, &capture, &observed, &frontier, &edges, &count),
+            "read device-sized CUDA capture frontier");
+        if (status != cudaStreamCaptureStatusActive || observed != graph || (count && (!frontier || !edges)))
+            throw std::logic_error("Device-sized CUDA arithmetic lost its original native capture");
+        std::vector<cudaGraphNode_t> incoming;
+        if (count)
+            incoming.assign(frontier, frontier + count);
+        std::vector<cudaGraphNode_t> nodes;
+        std::vector<cudaGraphDeviceNode_t> handles;
+        nodes.reserve(launches.size());
+        handles.reserve(launches.size());
+        for (const auto& launch : launches)
+        {
+            cudaGraphNode_t node = nullptr;
+            require(cudaGraphAddKernelNode(&node, graph, nullptr, 0, &launch), "append device-sized CUDA arithmetic");
+            cudaKernelNodeAttrValue attribute{};
+            attribute.deviceUpdatableKernelNode.deviceUpdatable = 1;
+            require(cudaGraphKernelNodeSetAttribute(node, cudaKernelNodeAttributeDeviceUpdatableKernelNode, &attribute),
+                "mark device-sized CUDA arithmetic");
+            require(cudaGraphKernelNodeGetAttribute(node, cudaKernelNodeAttributeDeviceUpdatableKernelNode, &attribute),
+                "borrow device-sized CUDA arithmetic handle");
+            if (!attribute.deviceUpdatableKernelNode.devNode)
+                throw std::logic_error("CUDA device-sized arithmetic did not publish its device node handle");
+            nodes.push_back(node);
+            handles.push_back(attribute.deviceUpdatableKernelNode.devNode);
+        }
+
+        if (!publish(handles))
+            throw std::runtime_error("Device-sized CUDA plan publisher did not record successfully");
+        unsigned long long current_capture = 0;
+        require(cudaStreamGetCaptureInfo(stream, &status, &current_capture, &observed, &frontier, &edges, &count),
+            "read device-sized CUDA plan completion");
+        if (status != cudaStreamCaptureStatusActive || current_capture != capture || observed != graph ||
+            !count || !frontier || !edges || std::equal(incoming.begin(), incoming.end(), frontier, frontier + count))
+            throw std::logic_error("Device-sized CUDA plan publisher did not produce an original completion frontier");
+        // Full-memory ordering is required because the publisher authors the
+        // arithmetic grid as well as every packed descriptor and live count.
+        for (std::size_t i = 0; i < count; ++i)
+        {
+            const auto& edge = edges[i];
+            if (edge.from_port || edge.to_port || edge.type ||
+                std::any_of(std::begin(edge.reserved), std::end(edge.reserved), [](auto byte) { return byte != 0; }))
+                throw std::logic_error("Device-sized CUDA work requires the plan's full-completion edge");
+            require(cudaGraphAddDependencies(graph, frontier + i, nodes.data(), nullptr, 1),
+                "order device-sized CUDA arithmetic after plan");
+        }
+        for (std::size_t i = 1; i < nodes.size(); ++i)
+            require(cudaGraphAddDependencies(graph, &nodes[i - 1], &nodes[i], nullptr, 1),
+                "order device-sized CUDA arithmetic phases");
+        require(cudaStreamUpdateCaptureDependencies(stream, &nodes.back(), nullptr, 1, cudaStreamSetCaptureDependencies),
+            "publish device-sized CUDA completion frontier");
+    }
+#endif
 
     CUDAActiveCaptureConditional::CUDAActiveCaptureConditional(
         cudaStream_t stream,
@@ -2360,6 +2448,18 @@ namespace llaminar2
                       << " detail='" << instantiate_log.data() << "'");
             exec_ = nullptr;
             return false;
+        }
+        if (timeline_recording_ && timeline_recording_->requires_device_node_upload)
+        {
+            err = cudaGraphUpload(exec_, stream_);
+            if (err != cudaSuccess)
+            {
+                LOG_ERROR("[CUDAGraphCapture] Cannot upload the device-updatable timeline: " << cudaGetErrorString(err));
+                if (cudaGraphExecDestroy(exec_) != cudaSuccess)
+                    std::terminate();
+                exec_ = nullptr;
+                return false;
+            }
         }
         std::size_t free_bytes_after = 0u;
         std::size_t total_bytes_after = 0u;
