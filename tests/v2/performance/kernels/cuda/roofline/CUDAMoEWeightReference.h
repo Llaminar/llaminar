@@ -15,6 +15,7 @@ namespace llaminar2::test
     enum class CUDAMoEWeightPhase : std::uint8_t
     {
         VerifierDown,
+        VerifierGateUp,
         DecodeGateUp,
         DecodeDown,
     };

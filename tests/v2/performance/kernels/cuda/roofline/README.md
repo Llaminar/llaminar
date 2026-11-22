@@ -283,3 +283,40 @@ With 31 samples per format and card, 12 of 21 source formats sustain at
 least 80% of the weight-only rate at M=4, N=2560, K=256 on both RTX 3090s.
 At N=512 and K=256 the highest rate is 76.2%. At the QFN-shaped N=2560
 and K=320, Q5_1 and Q8_0 sustain 94.3–94.8% and 96.3% respectively.
+
+## Route-matched verifier Gate/Up weight reference
+
+The four-row verifier fixture also measures the original Gate/Up scatter
+and its ordered SwiGLU publication in the same retained sequence. The
+weight-only reader has the scatter's grid and addresses and overwrites both
+partial planes. The fixture verifies exact serial-row bytes after replaying
+the original parent over the diagnostic scratch.
+
+```sh
+CUDA_VISIBLE_DEVICES=0 \
+LLAMINAR_TEST_CUDA_MOE_M4_DOWN_GEOMETRY=qfn-main \
+LLAMINAR_TEST_CUDA_MOE_VERIFIER_GATE_UP_WEIGHT_REFERENCE_JSONL="$PWD/verifier-gate-up.jsonl" \
+    "$CMAKE_BUILD/tests/v2/v2_integration_cuda_moe_kernel" \
+    --gtest_filter=Test__CUDAMoEKernel.RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRuntimeDecodeRows
+```
+
+Use `qfn-main` for Q4_K Gate/Up and Q5_1 Down, `qfn-main-q5` for Q5_K
+Gate/Up and Q8_0 Down, and `qfn` for the same-format Q8_0 and Q5_1 cases.
+`wide` measures all 21 source formats with Gate/Up N=256 and K=2560.
+Omit the geometry variable for N=256 and K=512. Divide the median
+`verifier_routed_gate_up_weight_planes` time by the median
+`verifier_gate_up_native_graph` time to include ordered publication in the
+requested-weight comparison. The `verifier_routed_gate_up` record isolates
+the scatter and reports the original launch and compiler resources.
+
+| QFN Gate/Up source, 32 live routes | Weight replay, µs | Native stage, µs | Matched weight rate |
+| --- | ---: | ---: | ---: |
+| Q4_K | 23.936–24.000 | 29.056 | 82.4–82.6% |
+| Q5_K | 27.840–27.904 | 34.112–34.176 | 81.6% |
+| Q8_0 | 37.184–37.248 | 44.672–44.928 | 82.9–83.2% |
+
+Across 31 samples per format and card, six of 21 wide formats sustain
+at least 80% through publication on both cards. The low-bit IQ1, IQ2 and
+IQ3 formats range from 38.8% to 68.0% at the wide geometry. At the smaller
+geometry the full stage ranges from 30.7% to 53.1%. The QFN measurements
+describe the tested prepared formats and fully local route tape.

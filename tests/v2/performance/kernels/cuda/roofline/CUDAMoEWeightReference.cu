@@ -4,6 +4,7 @@
  */
 #include "CUDAMoEWeightReference.h"
 #include "kernels/common/DeviceNativeQuantisedMatrixDesc.h"
+#include "kernels/common/MoEGroupedSourceRows.h"
 #include "tensors/NativeQuantisedFormatInfo.h"
 
 #include <cuda_runtime.h>
@@ -227,6 +228,89 @@ namespace llaminar2::test
         }
 
         /**
+         * @brief Read both Gate and Up planes for one admitted route partition.
+         * @tparam CodebookId Exact shared physical decoder of the weight tables.
+         * @tparam Scalar Use byte-wise checksum loads.
+         * @param gate_descs Original Gate descriptors.
+         * @param up_descs Original Up descriptors.
+         * @param expert Selected local expert descriptor index.
+         * @param n Live output column.
+         * @param N Prepared column pitch.
+         * @param K Reduction width in activation elements.
+         * @param partition Current split-K partition.
+         * @param k_partitions Number of ordered partitions.
+         * @param gate Checksum for the Gate partial store.
+         * @param up Checksum for the Up partial store.
+         */
+        template <uint8_t CodebookId, bool Scalar>
+        __device__ __forceinline__ void gateUpWeightChecksums(
+            const DeviceNativeQuantisedMatrixDesc *gate_descs,
+            const DeviceNativeQuantisedMatrixDesc *up_descs, int expert, int n, int N, int K,
+            int partition, int k_partitions, uint32_t &gate, uint32_t &up)
+        {
+            const auto &gate_desc = gate_descs[expert];
+            const auto &up_desc = up_descs[expert];
+            const int packets_per_row = K / 32;
+            const int packets_per_part = (packets_per_row + k_partitions - 1) / k_partitions;
+            const int end = min((partition + 1) * packets_per_part, packets_per_row);
+#pragma unroll 1
+            for (int packet = partition * packets_per_part; packet < end; ++packet)
+            {
+                const auto index = static_cast<size_t>(packet) * N + n;
+                gate += weightPacketChecksum<CodebookId, Scalar>(gate_desc, index);
+                up += weightPacketChecksum<CodebookId, Scalar>(up_desc, index);
+            }
+        }
+
+        /**
+         * @brief Read both Gate and Up planes in the original verifier partition grid.
+         * @tparam CodebookId Exact shared physical decoder of the fixture projections.
+         * @tparam Scalar Use byte-wise checksum loads.
+         * @param activation_codes Captured argument. The reader leaves it unread.
+         * @param activation_scales Captured argument. The reader leaves it unread.
+         * @param source_rows Captured argument. The reader leaves it unread.
+         * @param gate_descs Original Gate descriptors.
+         * @param up_descs Original Up descriptors.
+         * @param original_to_grouped Captured active-route map.
+         * @param original_experts Original route packet in submitted slot order.
+         * @param gate_partials Captured Gate checksums destination.
+         * @param up_partials Captured Up checksums destination.
+         * @param first_slot First original route in this tile.
+         * @param tile_routes Number of route slots in this tile.
+         * @param N Prepared column pitch.
+         * @param K Reduction width in activation elements.
+         * @param num_experts Exact descriptor table length.
+         * @param k_partitions Original ordered partition count.
+         */
+        template <uint8_t CodebookId, bool Scalar>
+        __global__ void moeVerifierGateUpWeightPacketRead(
+            const int8_t * /*activation_codes*/, const float * /*activation_scales*/,
+            MoEGroupedSourceRows /*source_rows*/,
+            const DeviceNativeQuantisedMatrixDesc *__restrict__ gate_descs,
+            const DeviceNativeQuantisedMatrixDesc *__restrict__ up_descs,
+            const int *__restrict__ original_to_grouped, const int *__restrict__ original_experts,
+            float *__restrict__ gate_partials, float *__restrict__ up_partials,
+            int first_slot, int tile_routes, int N, int K, int num_experts, int k_partitions)
+        {
+            const int n = blockIdx.x * blockDim.x + threadIdx.x;
+            const int local_route = blockIdx.y;
+            const int partition = blockIdx.z;
+            if (n >= N || local_route >= tile_routes || partition >= k_partitions)
+                return;
+            const int slot = first_slot + local_route;
+            const int expert = original_experts[slot];
+            if (original_to_grouped[slot] < 0 || expert < 0 || expert >= num_experts)
+                return;
+            uint32_t gate = 0;
+            uint32_t up = 0;
+            gateUpWeightChecksums<CodebookId, Scalar>(
+                gate_descs, up_descs, expert, n, N, K, partition, k_partitions, gate, up);
+            const auto offset = (static_cast<size_t>(local_route) * k_partitions + partition) * N + n;
+            gate_partials[offset] = __uint_as_float(gate);
+            up_partials[offset] = __uint_as_float(up);
+        }
+
+        /**
          * @brief Read both Gate and Up planes in the original decode partition grid.
          * @tparam CodebookId Exact shared physical decoder of the two fixture projections.
          * @tparam Scalar Use byte-wise checksum loads.
@@ -261,20 +345,8 @@ namespace llaminar2::test
             uint32_t gate = 0;
             uint32_t up = 0;
             if (expert >= 0 && expert < num_experts)
-            {
-                const auto &gate_desc = gate_descs[expert];
-                const auto &up_desc = up_descs[expert];
-                const int packets_per_row = K / 32;
-                const int packets_per_part = (packets_per_row + k_partitions - 1) / k_partitions;
-                const int end = min((partition + 1) * packets_per_part, packets_per_row);
-#pragma unroll 1
-                for (int packet = partition * packets_per_part; packet < end; ++packet)
-                {
-                    const auto index = static_cast<size_t>(packet) * N + n;
-                    gate += weightPacketChecksum<CodebookId, Scalar>(gate_desc, index);
-                    up += weightPacketChecksum<CodebookId, Scalar>(up_desc, index);
-                }
-            }
+                gateUpWeightChecksums<CodebookId, Scalar>(
+                    gate_descs, up_descs, expert, n, N, K, partition, k_partitions, gate, up);
             const auto offset = (static_cast<size_t>(slot) * k_partitions + partition) * N + n;
             gate_partials[offset] = __uint_as_float(gate);
             up_partials[offset] = __uint_as_float(up);
@@ -296,6 +368,9 @@ namespace llaminar2::test
             case CUDAMoEWeightPhase::VerifierDown:
                 return scalar ? reinterpret_cast<const void *>(moeVerifierWeightPacketRead<Codebook, true>)
                               : reinterpret_cast<const void *>(moeVerifierWeightPacketRead<Codebook, false>);
+            case CUDAMoEWeightPhase::VerifierGateUp:
+                return scalar ? reinterpret_cast<const void *>(moeVerifierGateUpWeightPacketRead<Codebook, true>)
+                              : reinterpret_cast<const void *>(moeVerifierGateUpWeightPacketRead<Codebook, false>);
             case CUDAMoEWeightPhase::DecodeGateUp:
                 return scalar ? reinterpret_cast<const void *>(moeDecodeGateUpWeightPacketRead<Codebook, true>)
                               : reinterpret_cast<const void *>(moeDecodeGateUpWeightPacketRead<Codebook, false>);

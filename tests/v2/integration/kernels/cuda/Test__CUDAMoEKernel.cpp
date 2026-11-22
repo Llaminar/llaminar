@@ -22040,6 +22040,41 @@ TEST_F(Test__CUDAMoEKernel, GroupedDecodeMatchesGroupedPrefillForSingleTokenNati
 #ifdef HAVE_CUDA
 namespace
 {
+    /** Indices of physical parameters in one captured projection ABI. */
+    struct MoEWeightReferenceArguments
+    {
+        size_t count;
+        size_t expert_ids;
+        size_t output;
+        size_t n;
+        int grouped_map = -1;
+        int first_slot = -1;
+        int route_count = -1;
+        int partitions = -1;
+        bool route_in_grid_z = false;
+    };
+
+    /** Return the exact producer ABI, in which N, K and expert count are consecutive. */
+    MoEWeightReferenceArguments weightReferenceArguments(llaminar2::test::CUDAMoEWeightPhase phase)
+    {
+        using llaminar2::test::CUDAMoEWeightPhase;
+        switch (phase)
+        {
+        case CUDAMoEWeightPhase::VerifierDown:
+            return {.count = 11, .expert_ids = 4, .output = 6, .n = 8,
+                    .grouped_map = 3, .first_slot = 7};
+        case CUDAMoEWeightPhase::VerifierGateUp:
+            return {.count = 15, .expert_ids = 6, .output = 7, .n = 11,
+                    .grouped_map = 5, .first_slot = 9, .route_count = 10, .partitions = 14};
+        case CUDAMoEWeightPhase::DecodeGateUp:
+            return {.count = 12, .expert_ids = 4, .output = 5, .n = 8,
+                    .route_count = 7, .partitions = 11, .route_in_grid_z = true};
+        case CUDAMoEWeightPhase::DecodeDown:
+            return {.count = 9, .expert_ids = 3, .output = 5, .n = 6};
+        }
+        throw std::logic_error("unknown MoE weight reference projection");
+    }
+
     /**
      * @brief Calibrate a captured MoE projection with its original weight arguments.
      * @param path JSONL destination for the aligned reader's native-event samples.
@@ -22066,11 +22101,11 @@ namespace
         ASSERT_NE(launch.params.kernelParams, nullptr);
         ASSERT_EQ(launch.params.extra, nullptr);
 
-        const bool gate_up = phase == CUDAMoEWeightPhase::DecodeGateUp;
-        const bool verifier = phase == CUDAMoEWeightPhase::VerifierDown;
-        const int k_partitions = gate_up ? static_cast<int>(launch.params.gridDim.y) : 1;
-        ASSERT_EQ(gate_up ? launch.params.gridDim.z : launch.params.gridDim.y,
-            static_cast<unsigned>(routes));
+        const auto abi = weightReferenceArguments(phase);
+        const bool gate_up = abi.partitions >= 0;
+        const auto grid = launch.params.gridDim;
+        const int k_partitions = static_cast<int>(abi.route_in_grid_z ? grid.y : grid.z);
+        ASSERT_EQ(abi.route_in_grid_z ? grid.z : grid.y, static_cast<unsigned>(routes));
         const auto argument = [&]<typename T>(size_t index) {
             size_t offset = 0, size = 0;
             require(cudaFuncGetParamInfo(launch.params.func, index, &offset, &size),
@@ -22081,28 +22116,28 @@ namespace
             std::memcpy(&value, launch.params.kernelParams[index], sizeof(value));
             return value;
         };
-        const size_t n_index = verifier || gate_up ? 8 : 6;
-        ASSERT_EQ(argument.template operator()<int>(n_index), workload.n);
-        ASSERT_EQ(argument.template operator()<int>(n_index + 1), workload.k);
+        ASSERT_EQ(argument.template operator()<int>(abi.n), workload.n);
+        ASSERT_EQ(argument.template operator()<int>(abi.n + 1), workload.k);
+        if (abi.route_count >= 0)
+            ASSERT_EQ(argument.template operator()<int>(abi.route_count), routes);
         if (gate_up)
-        {
-            ASSERT_EQ(argument.template operator()<int>(7), routes);
-            ASSERT_EQ(argument.template operator()<int>(11), k_partitions);
-        }
-        if (verifier)
-            ASSERT_EQ(argument.template operator()<int>(7), 0);
-        const auto *expert_ids = argument.template operator()<const int *>(verifier || gate_up ? 4 : 3);
+            ASSERT_EQ(argument.template operator()<int>(abi.partitions), k_partitions);
+        else
+            ASSERT_EQ(k_partitions, 1);
+        if (abi.first_slot >= 0)
+            ASSERT_EQ(argument.template operator()<int>(abi.first_slot), 0);
+        const auto *expert_ids = argument.template operator()<const int *>(abi.expert_ids);
         ASSERT_NE(expert_ids, nullptr);
-        const int experts = argument.template operator()<int>(gate_up ? 10 : (verifier ? 10 : 8));
+        const int experts = argument.template operator()<int>(abi.n + 2);
         std::vector<int> selected(routes);
         ASSERT_EQ(cudaMemcpyAsync(selected.data(), expert_ids, selected.size() * sizeof(int),
             cudaMemcpyDeviceToHost, stream), cudaSuccess);
         ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
         ASSERT_TRUE(std::all_of(selected.begin(), selected.end(),
             [experts](int expert) { return expert >= 0 && expert < experts; }));
-        if (verifier)
+        if (abi.grouped_map >= 0)
         {
-            const auto *grouped = argument.template operator()<const int *>(3);
+            const auto *grouped = argument.template operator()<const int *>(abi.grouped_map);
             ASSERT_NE(grouped, nullptr);
             ASSERT_EQ(cudaMemcpyAsync(selected.data(), grouped, selected.size() * sizeof(int),
                 cudaMemcpyDeviceToHost, stream), cudaSuccess);
@@ -22113,10 +22148,9 @@ namespace
 
         const auto words = static_cast<size_t>(routes) * k_partitions * workload.n;
         std::array<void *, 2> outputs{
-            argument.template operator()<void *>(verifier ? 6 : 5),
-            gate_up ? argument.template operator()<void *>(6) : nullptr};
+            argument.template operator()<void *>(abi.output),
+            gate_up ? argument.template operator()<void *>(abi.output + 1) : nullptr};
         const size_t output_count = gate_up ? 2 : 1;
-        const size_t arity = gate_up ? 12 : (verifier ? 11 : 9);
         std::vector<uint32_t> oracle_output(words * output_count);
         std::vector<uint32_t> aligned_output(words * output_count);
         const auto read_planes = [&](CUDAWeightPacketAccess access, int poison,
@@ -22124,7 +22158,7 @@ namespace
             auto params = launch.params;
             params.func = const_cast<void *>(cudaMoEWeightReferenceEntry(phase, codebook, access));
             ASSERT_NE(params.func, nullptr);
-            for (size_t index = 0; index < arity; ++index)
+            for (size_t index = 0; index < abi.count; ++index)
             {
                 size_t original_offset = 0, original_bytes = 0, ref_offset = 0, ref_bytes = 0;
                 ASSERT_EQ(cudaFuncGetParamInfo(launch.params.func, index, &original_offset, &original_bytes),
@@ -24060,12 +24094,15 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
     // depth. The wider probes isolate M=4 and keep the same serial oracle.
     const char *requested_geometry = std::getenv("LLAMINAR_TEST_CUDA_MOE_M4_DOWN_GEOMETRY");
     const std::string_view geometry = requested_geometry ? requested_geometry : "";
-    ASSERT_TRUE(geometry.empty() || geometry == "qfn" || geometry == "iq4" || geometry == "wide");
+    const bool qfn_main = geometry == "qfn-main";
+    const bool qfn_main_q5 = geometry == "qfn-main-q5";
+    const bool qfn_width = geometry == "qfn" || qfn_main || qfn_main_q5;
+    ASSERT_TRUE(geometry.empty() || qfn_width || geometry == "iq4" || geometry == "wide");
     const bool wide_geometry = !geometry.empty();
     const int top_k = wide_geometry ? 8 : 4;
     const int num_experts = 2 * top_k;
     const int d_model = wide_geometry ? 2560 : 512;
-    const int intermediate = geometry == "qfn" ? 320 : 256;
+    const int intermediate = qfn_width ? 320 : 256;
     const auto device = llaminar2::DeviceId::cuda(0);
 
     std::vector<int> row_inventory(
@@ -24085,13 +24122,21 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
     for (size_t format_index = 0; format_index < formats.size(); ++format_index)
     {
         const auto &format = formats[format_index];
-        if (geometry == "qfn" && std::string_view(format.label) != "Q5_1" &&
+        if (qfn_main && std::string_view(format.label) != "Q5_1")
+            continue;
+        if (qfn_main_q5 && std::string_view(format.label) != "Q8_0")
+            continue;
+        if (qfn_width && std::string_view(format.label) != "Q5_1" &&
             std::string_view(format.label) != "Q8_0")
             continue;
         if (geometry == "iq4" && std::string_view(format.label) != "IQ4_NL" &&
             std::string_view(format.label) != "IQ4_XS")
             continue;
         SCOPED_TRACE(format.label);
+        const std::string_view gate_source = qfn_main ? "Q4_K" : qfn_main_q5 ? "Q5_K" : format.label;
+        const auto gate_format = std::find_if(formats.begin(), formats.end(),
+            [gate_source](const auto &candidate) { return candidate.label == gate_source; });
+        ASSERT_NE(gate_format, formats.end());
         llaminar2::PerfStatsCollector::reset();
 
         auto moe_reqs = llaminar2::MoEWorkspaceBuffers::cudaMoE(
@@ -24118,12 +24163,13 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
         owned_weights.reserve(static_cast<size_t>(num_experts * 3));
         prepared_weights.reserve(static_cast<size_t>(num_experts * 3));
 
-        auto add_prepared_desc = [&](int rows,
+        auto add_prepared_desc = [&](const auto &source_format,
+                                     int rows,
                                      int cols,
                                      uint32_t seed,
                                      const char *role)
         {
-            auto weight = format.create(
+            auto weight = source_format.create(
                 {static_cast<size_t>(rows), static_cast<size_t>(cols)},
                 seed);
             auto *weight_ptr = weight.get();
@@ -24132,7 +24178,7 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
                 weight_ptr,
                 device,
                 std::string("test.cuda_moe.runtime_verifier_all_formats.") +
-                    format.label + "." + role + "." + std::to_string(seed),
+                    source_format.label + "." + role + "." + std::to_string(seed),
                 llaminar2::ModelContextId{
                     1500000 + static_cast<uint64_t>(format_index) * 1000u + seed}));
 
@@ -24143,8 +24189,8 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
             llaminar2::DeviceNativeQuantisedMatrixDesc desc{};
             EXPECT_TRUE(kernel->exportNativeQuantisedMatrixDesc(desc))
                 << format.label << " descriptor export for " << role;
-            EXPECT_EQ(desc.codebook_id, format.codebook_id)
-                << format.label << " must exercise the expected runtime grouped MoE codebook";
+            EXPECT_EQ(desc.codebook_id, source_format.codebook_id)
+                << source_format.label << " must exercise the expected runtime grouped MoE codebook";
             EXPECT_EQ(desc.n, rows);
             EXPECT_EQ(desc.k, cols);
             return desc;
@@ -24156,15 +24202,15 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
         for (int expert = 0; expert < num_experts; ++expert)
         {
             gate_descs[static_cast<size_t>(expert)] =
-                add_prepared_desc(intermediate, d_model,
+                add_prepared_desc(*gate_format, intermediate, d_model,
                                   701000u + static_cast<uint32_t>(expert),
                                   "gate");
             up_descs[static_cast<size_t>(expert)] =
-                add_prepared_desc(intermediate, d_model,
+                add_prepared_desc(*gate_format, intermediate, d_model,
                                   702000u + static_cast<uint32_t>(expert),
                                   "up");
             down_descs[static_cast<size_t>(expert)] =
-                add_prepared_desc(d_model, intermediate,
+                add_prepared_desc(format, d_model, intermediate,
                                   703000u + static_cast<uint32_t>(expert),
                                   "down");
         }
@@ -24389,6 +24435,8 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
             const char *probe_path = std::getenv("LLAMINAR_TEST_CUDA_MOE_VERIFIER_DOWN_PROBE_JSONL");
             const char *weight_probe_path =
                 std::getenv("LLAMINAR_TEST_CUDA_MOE_VERIFIER_DOWN_WEIGHT_REFERENCE_JSONL");
+            const char *gate_weight_probe_path =
+                std::getenv("LLAMINAR_TEST_CUDA_MOE_VERIFIER_GATE_UP_WEIGHT_REFERENCE_JSONL");
             const char *timing_path = probe_path ? probe_path : weight_probe_path;
             if (seq_len == 4)
             {
@@ -24406,6 +24454,9 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
                 int direct_publications = 0;
                 cudaGraphNode_t down_source = nullptr;
                 cudaKernelNodeParams down_params{};
+                using llaminar2::test::cuda_kernel_probe_detail::KernelLaunch;
+                std::optional<KernelLaunch> gate_scatter;
+                std::optional<KernelLaunch> gate_reduce;
                 for (auto node : nodes)
                 {
                     cudaGraphNodeType type{};
@@ -24419,6 +24470,19 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
                     ASSERT_NE(symbol, nullptr);
                     const std::string_view name{symbol};
                     EXPECT_EQ(name.find("grouped_prefill_down_canonical_kpart_reduce_kernel"), std::string_view::npos);
+                    if (gate_weight_probe_path)
+                    {
+                        if (name.contains("grouped_native_quantised_gate_up_ordered_kpart_scatter_kernel"))
+                        {
+                            ASSERT_FALSE(gate_scatter);
+                            gate_scatter = KernelLaunch{node, params};
+                        }
+                        if (name.contains("grouped_native_quantised_gate_up_ordered_kpart_reduce_swiglu_kernel"))
+                        {
+                            ASSERT_FALSE(gate_reduce);
+                            gate_reduce = KernelLaunch{node, params};
+                        }
+                    }
                     if (name.find("grouped_prefill_down_canonical_publish_k32_kernel") != std::string_view::npos)
                     {
                         ++direct_publications;
@@ -24454,6 +24518,43 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
                     const auto replay = copyCudaFP32TensorToHost(runtime_prefill_output, stream_);
                     expectBitwiseFP32RowsEqual("captured M4 direct Down publication",
                         replay.data(), serial_values.data(), replay.size(), d_model);
+                }
+                if (gate_weight_probe_path)
+                {
+                    using namespace llaminar2::test;
+                    using namespace llaminar2::test::cuda_kernel_probe_detail;
+                    ASSERT_TRUE(gate_scatter && gate_reduce)
+                        << "the fixture did not capture one ordered Gate/Up scatter and publication";
+                    ASSERT_NE(gate_scatter->params.kernelParams, nullptr);
+                    ASSERT_NE(gate_reduce->params.kernelParams, nullptr);
+                    for (size_t plane = 0; plane < 2; ++plane)
+                        ASSERT_EQ(std::memcmp(gate_scatter->params.kernelParams[7 + plane],
+                            gate_reduce->params.kernelParams[plane], sizeof(void *)), 0)
+                            << "ordered Gate/Up publication must consume the captured scatter";
+                    std::array<KernelLaunch, 2> gate_stage{*gate_scatter, *gate_reduce};
+                    const auto *source = llaminar2::native_quantised_formats::forQuantType(gate_source);
+                    ASSERT_NE(source, nullptr);
+                    const auto packed = llaminar2::nativeQuantisedPackedRegionSizes(intermediate, d_model, *source);
+                    const int routes = seq_len * top_k;
+                    appendCUDAKernelProbeRecords(gate_weight_probe_path, {{{"mode", "verifier_gate_up_native_graph"},
+                        {"format", gate_source}, {"execution_codebook", gate_format->codebook_id},
+                        {"m", seq_len}, {"n", intermediate}, {"k", d_model}, {"routes", routes},
+                        {"nodes", gate_stage.size()}, {"samples_us", measureKernelSequence(gate_stage, stream_, {})},
+                        {"logical_weight_request_bytes", packed.logicalBytes() * routes * 2}}});
+                    GraphOwner scatter;
+                    cudaGraphNode_t node = nullptr;
+                    require(cudaGraphAddKernelNode(&node, scatter.graph, nullptr, 0, &gate_scatter->params),
+                        "isolate original grouped Gate/Up scatter");
+                    require(cudaGraphKernelNodeCopyAttributes(node, gate_scatter->source),
+                        "retain original grouped Gate/Up scatter attributes");
+                    appendCUDAKernelProbeRecords(gate_weight_probe_path, probeIndependentCUDAKernels(
+                        scatter.graph, stream_, CUDAIndependentKernelFixture::StatelessProjection,
+                        {.operation = "verifier_routed_gate_up", .format = std::string(gate_source),
+                         .m = seq_len, .n = intermediate, .k = d_model}));
+                    ASSERT_NO_FATAL_FAILURE(measureCudaMoEWeightReference(gate_weight_probe_path,
+                        *gate_scatter, stream_, CUDAMoEWeightPhase::VerifierGateUp, gate_format->codebook_id,
+                        {.operation = "verifier_routed_gate_up_weight_planes", .format = std::string(gate_source),
+                         .m = seq_len, .n = intermediate, .k = d_model}, routes));
                 }
                 if (timing_path)
                 {
@@ -24494,9 +24595,12 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
                             format.codebook_id, {.operation = "verifier_routed_down_weight_planes",
                              .format = format.label, .m = seq_len, .n = d_model, .k = intermediate},
                             seq_len * top_k));
+                }
+                if (timing_path || gate_weight_probe_path)
+                {
                     ASSERT_TRUE(graph.launchAndPublishOutputs({runtime_prefill_output.get()}));
                     const auto replay = copyCudaFP32TensorToHost(runtime_prefill_output, stream_);
-                    expectBitwiseFP32RowsEqual("captured M4 direct Down after isolated timing",
+                    expectBitwiseFP32RowsEqual("captured M4 verifier after isolated projection timing",
                         replay.data(), serial_values.data(), replay.size(), d_model);
                 }
             }
