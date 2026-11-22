@@ -242,5 +242,5 @@ be measured separately for a whole-leaf roofline.
 
 With 31 samples per format and card, 12 of 21 source formats sustain at
 least 80% of the weight-only rate at M=4, N=2560, K=256 on both RTX 3090s.
-At N=512 and K=256 the highest rate is 77.8%. At the QFN-shaped N=2560
-and K=320, Q5_1 and Q8_0 sustain 94.8% and 96.0–96.3% respectively.
+At N=512 and K=256 the highest rate is 76.2%. At the QFN-shaped N=2560
+and K=320, Q5_1 and Q8_0 sustain 94.3–94.8% and 96.3% respectively.
