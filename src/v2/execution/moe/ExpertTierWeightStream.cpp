@@ -294,10 +294,10 @@ namespace llaminar2
 
             // Never trust serialized stride fields independently of encoding.
             const uint32_t expected_data_stride =
-                cpu::native_quantised::preparedDataStride(cpu.encoding);
+                cpu::native_quantised::preparedDataStride(cpu.encoding, cpu.codebook_id);
             const int expected_block_stride =
                 cpu::native_quantised::preparedInterleavedBlockStride(
-                    cpu.encoding, cpu.is_asymmetric);
+                    cpu.encoding, cpu.is_asymmetric, cpu.codebook_id);
             if (cpu.data_stride != static_cast<int>(expected_data_stride) ||
                 cpu.interleaved_block_stride != expected_block_stride)
             {
@@ -394,10 +394,10 @@ namespace llaminar2
             }
             // Strides come from the CPU encoding's single source of truth.
             cpu.data_stride = static_cast<int>(
-                cpu::native_quantised::preparedDataStride(cpu.encoding));
+                cpu::native_quantised::preparedDataStride(cpu.encoding, cpu.codebook_id));
             cpu.interleaved_block_stride =
                 cpu::native_quantised::preparedInterleavedBlockStride(
-                    cpu.encoding, cpu.is_asymmetric);
+                    cpu.encoding, cpu.is_asymmetric, cpu.codebook_id);
         }
 
         /**
@@ -594,10 +594,10 @@ namespace llaminar2
             return reject(error, "Tier stream CPU encoding is invalid");
         // Re-derive strides rather than accepting redundant wire fields on trust.
         const uint32_t expected_data_stride =
-            cpu::native_quantised::preparedDataStride(cpu_encoding);
+            cpu::native_quantised::preparedDataStride(cpu_encoding, cpu_codebook_id);
         const uint32_t expected_block_stride = static_cast<uint32_t>(
             cpu::native_quantised::preparedInterleavedBlockStride(
-                cpu_encoding, cpu_is_asymmetric != 0));
+                cpu_encoding, cpu_is_asymmetric != 0, cpu_codebook_id));
         if (cpu_data_stride != expected_data_stride ||
             cpu_block_stride != expected_block_stride)
         {
@@ -1112,10 +1112,10 @@ namespace llaminar2
         manifest.gpu_has_emins = source_format.has_emins ? 1u : 0u;
         manifest.cpu_encoding = cpu_encoding;
         manifest.cpu_data_stride =
-            cpu::native_quantised::preparedDataStride(cpu_encoding);
+            cpu::native_quantised::preparedDataStride(cpu_encoding, source_format.codebook_id);
         manifest.cpu_block_stride = static_cast<uint32_t>(
             cpu::native_quantised::preparedInterleavedBlockStride(
-                cpu_encoding, source_format.is_asymmetric));
+                cpu_encoding, source_format.is_asymmetric, source_format.codebook_id));
         return sealManifest(manifest, maximum_units_per_chunk);
     }
 

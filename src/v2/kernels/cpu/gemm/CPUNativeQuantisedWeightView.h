@@ -452,7 +452,7 @@ namespace llaminar2::cpu::native_quantised
             const std::int64_t blocks = (std::int64_t{descriptor.reduction_width} + 31) / 32;
             if (padded > std::numeric_limits<int>::max())
                 throw std::overflow_error("Native CPU padded output width exceeds its ABI");
-            const std::size_t stride = preparedInterleavedBlockStride(descriptor.encoding, descriptor.is_asymmetric);
+            const std::size_t stride = preparedInterleavedBlockStride(descriptor.encoding, descriptor.is_asymmetric, descriptor.source.codebook_id);
             const std::size_t chunks = static_cast<std::size_t>(padded / 64);
             if (chunks > std::numeric_limits<std::size_t>::max() / static_cast<std::size_t>(blocks) / stride)
                 throw std::overflow_error("Native CPU weight stream extent overflow");
@@ -479,8 +479,8 @@ namespace llaminar2::cpu::native_quantised
                   d.encoding == CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale ? 32 : source.payload_bytes),
               source_payload_bytes(source.payload_bytes), codebook_id(source.codebook_id),
               is_asymmetric(d.is_asymmetric), is_superblock(source.is_superblock), encoding(d.encoding),
-              numerical_policy(d.numerical_policy), data_stride(preparedDataStride(d.encoding)),
-              interleaved_block_stride(preparedInterleavedBlockStride(d.encoding, d.is_asymmetric)), bytes_(bytes) {}
+              numerical_policy(d.numerical_policy), data_stride(preparedDataStride(d.encoding, d.source.codebook_id)),
+              interleaved_block_stride(preparedInterleavedBlockStride(d.encoding, d.is_asymmetric, d.source.codebook_id)), bytes_(bytes) {}
 
         /** @brief Check one column coordinate without clamping it into a valid lane.
          * @param column Physical column within one 64-column unit.

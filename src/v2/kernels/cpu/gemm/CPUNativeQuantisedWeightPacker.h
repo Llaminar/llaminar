@@ -778,9 +778,9 @@ namespace llaminar2::cpu::native_quantised
         out.encoding = preparedEncodingForSource(
             *fmt, use_rotated_path);
 
-        out.data_stride = preparedDataStride(out.encoding);
+        out.data_stride = preparedDataStride(out.encoding, out.codebook_id);
         out.interleaved_block_stride = preparedInterleavedBlockStride(
-            out.encoding, out.is_asymmetric);
+            out.encoding, out.is_asymmetric, out.codebook_id);
 
         // Temporary metadata is allocated only by layouts that still need a
         // distinct source-oriented pass.  Expanded-INT8 preparation writes

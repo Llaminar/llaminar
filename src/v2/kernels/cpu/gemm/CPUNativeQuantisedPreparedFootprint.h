@@ -97,15 +97,31 @@ namespace llaminar2::cpu::native_quantised
      * this geometry beside the encoding enum gives CPU execution and
      * heterogeneous tier conversion one authoritative layout definition.
      */
+    [[nodiscard]] constexpr std::uint32_t preparedCompactPayloadWords(
+        int codebook_id) noexcept
+    {
+        // The compact interleaved unit places one 32-bit word per payload
+        // byte-quad, 256 bytes apart (64 columns x 4 bytes). Only the words
+        // the decode actually reads are retained: three words cover the
+        // 9-12 byte payloads (Q3_K/IQ2_S/IQ2_XS/IQ3_XXS), two cover the
+        // 6-8 byte payloads (Q2_K/IQ2_XXS/IQ1_S/IQ1_M).
+        switch (codebook_id)
+        {
+        case 9: case 12: case 13: case 14: return 3;
+        default: return 2;
+        }
+    }
+
     [[nodiscard]] constexpr std::uint32_t preparedDataStride(
-        CPUNativeQuantisedEncoding encoding) noexcept
+        CPUNativeQuantisedEncoding encoding, int codebook_id = 0) noexcept
     {
         switch (encoding)
         {
         case CPUNativeQuantisedEncoding::NibbleLUT:
         case CPUNativeQuantisedEncoding::NibbleLUTSourceScale:
-        case CPUNativeQuantisedEncoding::CompactMultiScale:
             return 1024;
+        case CPUNativeQuantisedEncoding::CompactMultiScale:
+            return preparedCompactPayloadWords(codebook_id) * 256u;
         case CPUNativeQuantisedEncoding::ExpandedInt8:
         case CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale:
             return 2048;
@@ -122,9 +138,10 @@ namespace llaminar2::cpu::native_quantised
      */
     [[nodiscard]] constexpr std::uint32_t preparedInterleavedBlockStride(
         CPUNativeQuantisedEncoding encoding,
-        bool is_asymmetric) noexcept
+        bool is_asymmetric,
+        int codebook_id = 0) noexcept
     {
-        const std::uint32_t data_stride = preparedDataStride(encoding);
+        const std::uint32_t data_stride = preparedDataStride(encoding, codebook_id);
         if (data_stride == 0)
             return 0;
         if (encoding == CPUNativeQuantisedEncoding::NibbleLUTSourceScale)
@@ -133,10 +150,11 @@ namespace llaminar2::cpu::native_quantised
             return 2432;
         if (encoding == CPUNativeQuantisedEncoding::Q6KNativeDualScale)
             return 1792;
-        // A fixed padded native payload plus two scale vectors and one optional
-        // effective-minimum vector. Unused bytes are zero, not another ledger.
+        // The compact family reserves exactly the payload words each codebook
+        // decodes, plus two FP16 scale vectors and the effective-minimum
+        // vector. Unused bytes are zero, not another ledger.
         if (encoding == CPUNativeQuantisedEncoding::CompactMultiScale)
-            return 1536;
+            return data_stride + 512u;
         return data_stride + 256u + (is_asymmetric ? 128u : 0u);
     }
 

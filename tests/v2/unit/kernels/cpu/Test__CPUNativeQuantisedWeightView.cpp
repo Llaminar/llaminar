@@ -12,6 +12,7 @@
 #include "utils/NativeQuantisedPreparedByteFixture.h"
 
 #include <gtest/gtest.h>
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cstdint>
@@ -75,6 +76,43 @@ TEST(CPUNativeQuantisedWeightView, AllSourcesKeepTheirCanonicalRootAndMetadataCo
 }
 
 /** @test Raw source coefficients reproduce original half-factor arithmetic without new narrowing. */
+TEST(CPUNativeQuantisedWeightView, CompactStrideFollowsTheDecodedPayloadWords)
+{
+    // The compact family reserves exactly the payload words each codebook
+    // decodes (two 32-bit words for 6-8 byte payloads, three for 9-12 byte
+    // payloads) plus two FP16 scale vectors and the effective-minimum vector.
+    // Proving the exact per-codebook extents keeps packing, execution,
+    // tier-stream geometry and memory planning on one layout authority.
+    struct Expected { int codebook; std::uint32_t data; std::uint32_t unit; };
+    const Expected expected[] = {
+        {9, 768, 1280}, {10, 512, 1024}, {12, 768, 1280}, {13, 768, 1280},
+        {14, 768, 1280}, {15, 512, 1024}, {16, 512, 1024}, {17, 512, 1024},
+    };
+    for (const auto &e : expected)
+    {
+        SCOPED_TRACE(::testing::Message() << "codebook=" << e.codebook);
+        const auto *format = std::find_if(
+            native_quantised_formats::kAllSourceFormats.begin(),
+            native_quantised_formats::kAllSourceFormats.end(),
+            [&](const auto &entry) {
+                return entry.metadata->codebook_id == e.codebook;
+            });
+        ASSERT_NE(format, native_quantised_formats::kAllSourceFormats.end());
+        EXPECT_EQ(preparedDataStride(
+            CPUNativeQuantisedEncoding::CompactMultiScale, e.codebook), e.data);
+        EXPECT_EQ(preparedInterleavedBlockStride(
+            CPUNativeQuantisedEncoding::CompactMultiScale, format->metadata->is_asymmetric,
+            e.codebook), e.unit);
+        // A real packed unit must publish exactly the expected extents; the
+        // view constructor rejects any other stride as inconsistent geometry.
+        PreparedBytes fixture(*format->metadata, 64, 32);
+        const auto view = fixture.view();
+        EXPECT_EQ(view.data_stride, static_cast<int>(e.data));
+        EXPECT_EQ(view.interleaved_block_stride, e.unit);
+        EXPECT_EQ(view.bytes().size(), std::size_t(128 / 64) * 3 * e.unit);
+    }
+}
+
 TEST(CPUNativeQuantisedWeightView, OriginalSourceFactorsRetainEveryRoundingBoundary)
 {
     const std::array<const NativeQuantisedFormatInfo *, 4> sources{
