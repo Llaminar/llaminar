@@ -163,18 +163,27 @@ comparison produced these native event medians on the two RTX 3090s.
 
 | Routed Gate/Up and Down | Ideal L2 time | One DRAM stream | Staged | Resident |
 | --- | ---: | ---: | ---: | ---: |
-| Q4_K and Q5_1 | 7.85–7.98 µs | 21.17 µs | 85.01–87.56 µs | 70.26–72.18 µs |
-| Q4_K and Q8_0 | 8.28–8.41 µs | 22.33 µs | 84.98–87.71 µs | 69.03–71.23 µs |
-| Q5_K and Q8_0 | 8.63–8.76 µs | 23.25 µs | 89.04–89.06 µs | 73.00–73.04 µs |
+| Q4_K and Q5_1 | 7.85–7.98 µs | 21.17 µs | 87.37–87.42 µs | 70.88–70.90 µs |
+| Q4_K and Q8_0 | 8.28–8.41 µs | 22.33 µs | 85.02–85.10 µs | 67.82–68.16 µs |
+| Q5_K and Q8_0 | 8.63–8.76 µs | 23.25 µs | 86.18–86.19 µs | 69.64–69.66 µs |
 
 The positive-row prototype reduced 20 native nodes to one and matched the
 staged bytes in 18 states per layout and GPU, including all, partial and
 zero local routed selections. Gate/Up uses CTA-local partials and emits
-the Q8 operands for Down. The three timed entries each used 96 registers
-and zero local bytes per thread. The single-stream DRAM reference is
-29.3–32.3% of the resident time. The fixture omits the mixed graph's
-CPU dispatch and collective dependencies. The device-counted variant
-passed zero/full reset and output guard checks and took 78.36–83.66 µs.
+the Q8 operands for Down. All CTAs own an HC Up tile on a live row. The three
+timed entries each used 96 registers and zero local bytes per thread. The
+single-stream DRAM reference is 29.9–33.4% of the resident time. The fixture
+omits the mixed graph's CPU dispatch and collective dependencies. The
+device-counted variant passed zero/full reset and output guard checks and
+took 77.10–79.60 µs with the original formats.
+
+A pinned-bank diagnostic changed the physical Down decoder between packed
+Q5_1 and its lossless expanded representation. It compared the staged path
+and the original output bytes through 36 captured transitions across both
+cards and both launch contracts, including mixed physical formats in one
+row. The mixed-format positive-row timings were 70.74–72.86 µs in the
+resident program and 87.89–90.77 µs staged. The native counted graph
+contains a 1-CTA predicate and an IF body with the 164×256 cooperative grid.
 
 ### CUDA peer transfers at QFN decode sizes
 
