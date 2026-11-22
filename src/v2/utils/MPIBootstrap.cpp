@@ -748,9 +748,8 @@ namespace llaminar2
         // Linux hosts). A CLI override would disable that path and also defeat
         // an operator's inherited MCA setting. Preserve both sources of intent.
 
-        // Placement names are portable; remote ranks still observe their own
-        // allowed places and derive their numeric physical-worker budget.
-        // Name-only exports retain the selected value, including place syntax.
+        // Portable names only: remote ranks resolve their own worker geometry.
+        // This native launcher does not create a managed receipt or run its helper.
         for (const char *name : {"OMP_PLACES", "OMP_PROC_BIND"})
         {
             cmd.emplace_back("-x");
@@ -811,7 +810,6 @@ namespace llaminar2
                                     const CPUTopology &topology,
                                     MPIBootstrapArgumentPolicy arguments)
     {
-        // Configure OpenMP environment before exec (inherited by child processes)
         if (config.hostfile.empty())
             configureOpenMPEnvironment(topology, config);
         else

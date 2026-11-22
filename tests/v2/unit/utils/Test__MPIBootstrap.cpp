@@ -588,8 +588,9 @@ TEST(Test__MPIBootstrap, ObserverArgumentExtensionPreservesLegacyDefaultFilterin
     std::vector<char *> argv;
     for (auto &value : original) argv.push_back(value.data());
     const auto unchanged = MPIBootstrap::buildMPIRunCommand(static_cast<int>(argv.size()), argv.data(), {}, {});
-    EXPECT_EQ(unchanged, MPIBootstrap::buildMPIRunCommand(static_cast<int>(argv.size()), argv.data(), {}, {},
-        MPIBootstrapArgumentPolicy::FilterLaunchArguments));
+    const auto filtered = MPIBootstrap::buildMPIRunCommand(static_cast<int>(argv.size()), argv.data(), {}, {},
+        MPIBootstrapArgumentPolicy::FilterLaunchArguments);
+    EXPECT_EQ(unchanged, filtered);
     const auto binary = std::find(unchanged.begin(), unchanged.end(), "observer");
     ASSERT_NE(binary, unchanged.end());
     EXPECT_EQ((std::vector<std::string>(binary, unchanged.end())),
@@ -735,6 +736,39 @@ TEST(Test__MPIBootstrap, ExistingMPIKeepsExplicitRankConfigurationWithoutRelaunc
     EXPECT_EQ(config.mpi_procs, 4);
 }
 
+/** @test Old placement diagnostics cannot become native launch intent. */
+TEST(Test__MPIBootstrap, NativeBootstrapRejectsInheritedManagedPlacement)
+{
+    using namespace llaminar2;
+    OrchestrationConfig config;
+    config.mpi_no_bootstrap = true;
+    char binary[] = "llaminar2";
+    char *argv[] = {binary, nullptr};
+    {
+        ScopedLaunchEnvironment marker("LLAMINAR_MANAGED_PLACEMENT", nullptr);
+        ScopedLaunchEnvironment receipt("LLAMINAR_PLACEMENT_RECEIPT_V1", nullptr);
+        EXPECT_EQ(MPIBootstrapPhase{}.execute(config, 1, argv).action,
+                  BootstrapResult::Action::CONTINUE);
+    }
+
+    for (const auto &[marker_value, receipt_value] :
+         std::array<std::pair<const char *, const char *>, 4>{{
+             {"1", nullptr}, {nullptr, "stale"}, {"1", "stale"}, {"", ""}}})
+    {
+        ScopedLaunchEnvironment marker("LLAMINAR_MANAGED_PLACEMENT", marker_value);
+        ScopedLaunchEnvironment receipt("LLAMINAR_PLACEMENT_RECEIPT_V1", receipt_value);
+        try
+        {
+            (void)MPIBootstrapPhase{}.execute(config, 1, argv);
+            ADD_FAILURE() << "Native bootstrap admitted managed placement input";
+        }
+        catch (const std::runtime_error &error)
+        {
+            EXPECT_STREQ(error.what(), "Unexpected managed placement environment in native MPI bootstrap");
+        }
+    }
+}
+
 /** @test Invalid native place publications cannot reach exec or worker admission. */
 TEST(Test__MPIBootstrap, NativeCorePlaceReceiptRejectsMalformedAndIncompatiblePublication)
 {
@@ -857,6 +891,16 @@ TEST(Test__MPIBootstrap, PortableOpenMPPlacementPreservesRankLocalWorkerGeometry
             EXPECT_EQ(std::count(command.begin(), command.end(), name), 1);
         }
         EXPECT_FALSE(contains(command, "OMP_NUM_THREADS"));
+        const auto delimiter = std::find(command.begin(), command.end(), "--");
+        ASSERT_NE(delimiter, command.end());
+        EXPECT_EQ(std::count(command.begin(), command.end(), "--"), 1);
+        for (auto at = command.begin(); at != delimiter; ++at)
+        {
+            EXPECT_FALSE(at->starts_with("LLAMINAR_MANAGED_PLACEMENT"));
+            EXPECT_FALSE(at->starts_with("LLAMINAR_PLACEMENT_RECEIPT_V1"));
+        }
+        EXPECT_EQ((std::vector<std::string>(std::next(delimiter), command.end())),
+                  (std::vector<std::string>{"llaminar2", "serve"}));
         EXPECT_TRUE(launch.bind_to_socket);
         EXPECT_TRUE(launch.map_by_socket);
     }
@@ -1105,4 +1149,11 @@ TEST(Test__MPIBootstrap, ClusterWorkersOrderFastCoresFirst)
     EXPECT_EQ(llaminar2::MPIBootstrapPhase::capacityOrderedCpus({3, 2, 1, 0}, (root / "absent").string()),
               (std::vector<int>{0, 1, 2, 3}));
     fs::remove_all(root);
+}
+
+/** @test Native bootstrap preserves sparse kernel CPU lists. */
+TEST(Test__MPIBootstrap, NativeBootstrapParsesSparseCpuLists)
+{
+    EXPECT_EQ(llaminar2::MPIBootstrapPhase::parseCpuList("0,2-4,7"),
+              (std::vector<int>{0, 2, 3, 4, 7}));
 }

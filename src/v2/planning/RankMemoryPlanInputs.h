@@ -133,6 +133,10 @@ namespace llaminar2
         /** Explicit physical limits, shared with ExpertOverlay and runtime admission. */
         std::optional<std::size_t> max_gpu_memory_bytes;
         std::optional<std::size_t> max_cpu_memory_bytes;
+        /** @brief Exact rank-local serving pool demand when serving is selected
+         *  (the planner admits the ServingResponsePool owner line once per
+         *  rank); absent when not serving. */
+        std::optional<std::uint64_t> serving_pool_demand_bytes;
     };
 
     /**

@@ -385,6 +385,118 @@ TEST(Test__MemoryPlanner, DistributedTPDoesNotInventLocalCollective)
     }
 }
 
+
+
+/** @brief SERVING POOL admission: the designated config admits the
+ *  ServingResponsePool owner line EXACTLY once per rank (CPU device BOM and
+ *  GPU rank-local host BOM), and an absent demand adds no line. */
+TEST(Test__MemoryPlanner, ServingPoolDemandAdmitsHostOwnerLineExactlyOnce)
+{
+    const auto profile = createMoEOverlayProfile();
+    // CPU-only rank: the device BOM IS the rank-local host BOM.
+    {
+        auto config = overlayDeviceConfig(DeviceId::cpu());
+        config.serving_pool_demand_bytes = 2048;
+        const auto plan = MemoryPlanner::plan(profile, {config});
+        ASSERT_EQ(plan.devices.size(), 1u);
+        EXPECT_EQ(plan.devices[0].device(), DeviceId::cpu());
+        EXPECT_EQ(plan.devices[0].bom().bytes(PhysicalMemoryOwner::ServingResponsePool), 2048u);
+    }
+    // GPU rank with rank-local host memory: the host BOM receives the line once.
+    {
+        auto config = overlayDeviceConfig(DeviceId::cuda(0));
+        config.world_rank = 0;
+        config.associated_host_memory = PhysicalMemoryResource{
+            .world_rank = 0, .device = DeviceId::cpu(),
+            .total_bytes = 1ull << 40, .admission_available_bytes = 1ull << 40};
+        config.serving_pool_demand_bytes = 4096;
+        const auto plan = MemoryPlanner::plan(profile, {config});
+        // The admitted physical plan is the authority for the owner line.
+        const auto *host_bom = plan.physicalPlan().find({0, DeviceId::cpu()});
+        ASSERT_NE(host_bom, nullptr);
+        EXPECT_EQ(host_bom->bytes(PhysicalMemoryOwner::ServingResponsePool), 4096u);
+    }
+    // Absent demand => no serving line admitted.
+    {
+        auto config = overlayDeviceConfig(DeviceId::cpu());
+        const auto plan = MemoryPlanner::plan(profile, {config});
+        ASSERT_EQ(plan.devices.size(), 1u);
+        EXPECT_EQ(plan.devices[0].bom().bytes(PhysicalMemoryOwner::ServingResponsePool), 0u);
+    }
+}
+
+
+
+
+
+/** @brief SERVING POOL generality: CPU singleton + odd TP3 via the BUILDER
+ *  (join included) both admit the owner line exactly once. */
+
+
+/** @brief SERVING POOL mixed CPU-GPU composition: one admission across a
+ *  composed CPU + GPU plan (the demand carried by the designated config is
+ *  admitted exactly once on the host side). */
+TEST(Test__MemoryPlanner, ServingPoolDemandMixedCpuGpuComposition)
+{
+    const auto profile = createMoEOverlayProfile();
+    std::vector<DevicePlanConfig> configs;
+    auto cpu = overlayDeviceConfig(DeviceId::cpu());
+    cpu.world_rank = 0;
+    cpu.serving_pool_demand_bytes = 2048;
+    configs.push_back(cpu);
+    auto gpu = overlayDeviceConfig(DeviceId::cuda(0));
+    gpu.world_rank = 0;
+    gpu.associated_host_memory = PhysicalMemoryResource{
+        .world_rank = 0, .device = DeviceId::cpu(),
+        .total_bytes = 1ull << 40, .admission_available_bytes = 1ull << 40};
+    configs.push_back(gpu);
+    const auto plan = MemoryPlanner::plan(profile, configs);
+    std::size_t total = 0;
+    for (const auto &row : plan.devices)
+        if (row.device().is_cpu())
+            total += row.bom().bytes(PhysicalMemoryOwner::ServingResponsePool);
+    EXPECT_EQ(total, 2048u);
+}
+
+TEST(Test__MemoryPlanner, ServingPoolDemandSingletonOddComposition)
+{
+    const auto profile = createMoEOverlayProfile();
+    // CPU singleton (direct config: the CPU device BOM is the host BOM).
+    {
+        auto config = overlayDeviceConfig(DeviceId::cpu());
+        config.serving_pool_demand_bytes = 1024;
+        const auto plan = MemoryPlanner::plan(profile, {config});
+        ASSERT_EQ(plan.devices.size(), 1u);
+        EXPECT_EQ(plan.devices[0].bom().bytes(PhysicalMemoryOwner::ServingResponsePool), 1024u);
+    }
+    // Odd TP3 handled through the exact producer of the rank's real configs is
+    // covered by RankMemoryPlanInputs.ServingPoolDemandGpuJoinThroughPlanner;
+    // here the direct-planner TP3 with host metadata (the GPU host path) must
+    // admit the line exactly once.
+    {
+        std::vector<DevicePlanConfig> configs;
+        for (int i = 0; i < 3; ++i)
+        {
+            auto config = overlayDeviceConfig(DeviceId::cuda(i));
+            config.world_rank = 0;
+            config.shard_index = i;
+            config.total_shards = 3;
+            config.associated_host_memory = PhysicalMemoryResource{
+                .world_rank = 0, .device = DeviceId::cpu(),
+                .total_bytes = 1ull << 40, .admission_available_bytes = 1ull << 40};
+            if (i == 0)
+                config.serving_pool_demand_bytes = 4096;
+            configs.push_back(config);
+        }
+        const auto plan = MemoryPlanner::plan(profile, configs);
+        std::size_t total = 0;
+        for (const auto &row : plan.devices)
+            if (row.device().is_cpu())
+                total += row.bom().bytes(PhysicalMemoryOwner::ServingResponsePool);
+        EXPECT_EQ(total, 4096u);
+    }
+}
+
 /** A present-but-unresolved local collective is not the absent NodeTP case. */
 TEST(Test__MemoryPlanner, UnresolvedLocalCollectiveStillFailsAdmission)
 {

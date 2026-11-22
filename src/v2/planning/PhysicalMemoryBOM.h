@@ -73,6 +73,7 @@ namespace llaminar2
         NativeCPUCollectiveProcessPool, ///< Incremental first-domain MPI pool, retained through original MPI_Finalize.
         NativeAuxiliaryStream,    ///< Certified ordinary stream, retained by its exact native owner.
         NativeTransferEvent,     ///< Exact peer completion/timestamp event family, original physical lifetime.
+        ServingResponsePool,    ///< Accepted serving response leases + retained delivery staging (host).
         Count,                    ///< Sentinel; never a valid charge owner.
     };
 
@@ -148,6 +149,8 @@ namespace llaminar2
             return "native_cpu_collective_process_pool";
         case PhysicalMemoryOwner::NativeTransferEvent:
             return "native_transfer_event";
+        case PhysicalMemoryOwner::ServingResponsePool:
+            return "serving_response_pool";
         case PhysicalMemoryOwner::NativeAuxiliaryStream:
             return "native_auxiliary_stream";
         case PhysicalMemoryOwner::Count:

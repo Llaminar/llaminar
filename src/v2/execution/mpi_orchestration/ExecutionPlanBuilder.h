@@ -116,7 +116,7 @@ namespace llaminar2
         GlobalPPTopology buildGlobalPPTopology(
             const OrchestrationConfig &config,
             const ModelConfig &model_config,
-            const ClusterInventory &cluster_inventory);
+            const ClusterInventory &cluster_inventory) override;
 
         /**
          * @brief Select the canonical transport for exact orchestration endpoints.

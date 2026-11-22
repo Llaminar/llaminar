@@ -17,6 +17,7 @@
 #include "kernels/qwen4exp/PooledImmutableNativeKernels.h"
 #include "tensors/BlockStructures.h"
 #include <optional>
+#include "utils/HostPageSize.h"
 #include <span>
 #include <vector>
 #include "backends/BackendManager.h"
@@ -66,6 +67,17 @@ public:
 };
 /** @return Exact native IQ4_NL bytes; no floating-weight requantization.
  * @param rows Original source row count. @param columns Exact complete-block logical width. */
+/**
+ * @brief Page-relative source row count: the source spans three whole host
+ * page windows (two full plus one partial final window), so the MemoryMapped
+ * window seams and eviction pressure stay exercised on every supported page
+ * size. The historical literal 97 rows produced three windows only on
+ * 4 KiB hosts and collapsed to one window on 64 KiB hosts.
+ */
+inline std::size_t windowSpanningRows(std::size_t row_bytes,std::size_t page)
+{
+    return 2u*((page+row_bytes-1)/row_bytes)+1u;
+}
 inline std::vector<std::byte> iq4Source(std::size_t rows,int columns){
     require(columns>0&&columns%32==0,"IQ4_NL component width must contain complete original blocks");
     const auto n=product(rows,static_cast<std::size_t>(columns)/32);std::vector<IQ4_NLBlock> blocks(n);
@@ -92,8 +104,14 @@ void abandonOrdinaryAdmission(DeviceId device)
     std::vector<PhysicalMemoryPlan> cases;
     for(const auto mode:{ImmutableRowStorage::RAM,ImmutableRowStorage::MemoryMapped})
         for(int iteration=0;iteration<20;++iteration){
-            Source source(iq4Source(97,160),97,160,GGUFTensorType::IQ4_NL);
-            const auto policy=ImmutableRowTableStoragePolicy::forStorage(mode,4096,2);
+            const std::size_t source_rows=windowSpanningRows(90u,llaminar2::hostPageBytes());
+            Source source(iq4Source(source_rows,160),source_rows,160,GGUFTensorType::IQ4_NL);
+            const auto policy=ImmutableRowTableStoragePolicy::forStorage(mode,llaminar2::hostPageBytes(),2);
+            // Geometry guard: the source must span more MemoryMapped windows
+            // than the policy's two slots, or the seam/eviction coverage this
+            // lifecycle test exercises has silently vanished.
+            EXPECT_GT(source.descriptor().tensorBytes(),
+                2u*llaminar2::hostPageBytes());
             const auto layout=ImmutableLookupLayout::create(16,90);
             services.push_back(RetainedHostServiceFixture::original(RetainedHostServiceRole::ImmutableLookupIO,{0,device},services.size()));
             PhysicalMemoryPlanBuilder plan(services.back().bom(resource(DeviceId::cpu())));
@@ -112,8 +130,11 @@ void abandonOrdinaryAdmission(DeviceId device)
             for (const auto mode : {ImmutableRowStorage::RAM, ImmutableRowStorage::MemoryMapped})
                 for (int iteration = 0; iteration < 20; ++iteration)
                 {
-                    Source source(iq4Source(97, 160), 97, 160, GGUFTensorType::IQ4_NL);
-                    const auto policy = ImmutableRowTableStoragePolicy::forStorage(mode, 4096, 2);
+                    const std::size_t source_rows=windowSpanningRows(90u,llaminar2::hostPageBytes());
+                    Source source(iq4Source(source_rows, 160), source_rows, 160, GGUFTensorType::IQ4_NL);
+                    const auto policy = ImmutableRowTableStoragePolicy::forStorage(mode,llaminar2::hostPageBytes(),2);
+                    EXPECT_GT(source.descriptor().tensorBytes(),
+                        2u*llaminar2::hostPageBytes());
                     auto &io=services.at(ordinal++);
                     auto hostClaim =
                         memory->claimNewAllocation(DeviceId::cpu(), PhysicalMemoryOwner::ActivationArena, 64);
@@ -169,15 +190,17 @@ void abandonPooledPreparation(DeviceId device)
     const auto runCase=[&](std::uint32_t slots,bool admit,RetainedHostServiceInstance instance,bool declarationOnly){
             PhysicalMemoryPlan result;
             worker.submitAndWait([&]{
-                Source file(iq4Source(97,160),97,160,GGUFTensorType::IQ4_NL);
+                const std::size_t source_rows=windowSpanningRows(90u,llaminar2::hostPageBytes());
+                Source file(iq4Source(source_rows,160),source_rows,160,GGUFTensorType::IQ4_NL);
                 const auto source=file.descriptor();
+                EXPECT_GT(source.tensorBytes(),2u*llaminar2::hostPageBytes());
                 const PhysicalMemoryAllocatorIdentity gpuId{0,device},hostId{0,DeviceId::cpu()};
                 const std::array tiers{ImmutableRowStorage::VRAM,ImmutableRowStorage::RAM,ImmutableRowStorage::MemoryMapped};
                 const auto layout=ImmutableRowTableLayoutGeometry::checked(
                     ImmutableRowTableExtent::fromNative(source.format,source.rows,source.rowBytes()),
                     ImmutableRowTableTiers::of(tiers),ImmutableRowTableResidency::Adaptive,
                     {{{gpuId,ImmutableRowStorage::VRAM},0,slots,{}},{{hostId,ImmutableRowStorage::RAM},0,slots?2u:0u,{}}},
-                    {gpuId},{},{{hostId,ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::MemoryMapped,4096,2)}},
+                    {gpuId},{},{{hostId,ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::MemoryMapped,llaminar2::hostPageBytes(),2)}},
                     {},slots?std::optional(gpuId):std::nullopt,16);
                 const auto physical=PooledImmutablePhysicalOwnerGeometry::fromLayout(layout,std::array{gpuId},gpuId);
                 const auto policy=PooledImmutableCoordinatorGeometry::fromOwners(physical,{65536,1,2},64);

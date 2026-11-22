@@ -16,6 +16,7 @@
 #include "loaders/ImmutableLookupSetupObservation.h"
 #include "execution/local_execution/orchestrators/TPWorkerPool.h"
 #include "kernels/qwen4exp/PooledImmutableSourceOps.h"
+#include "utils/HostPageSize.h"
 #include <gtest/gtest.h>
 #include "../../../mocks/MockBackend.h"
 #include <chrono>
@@ -121,12 +122,25 @@ struct NativeFile {
         if(fd<0)throw std::runtime_error("Cannot create subordinate source fixture");
         path=name;source={.path=path,.tensor_name="fixture.ple",.file_offset=37,
             .rows=128,.row_elements=160,.format=GGUFTensorType::IQ4_NL};
+        // Preserve the original 4 KiB fixture exactly, while keeping the
+        // cross-window failure and final-row controls meaningful on larger pages.
+        source.rows=static_cast<std::uint64_t>(2*secondWindowRow());
         bytes.resize(source.file_offset+source.tensorBytes());
         for(std::size_t i=0;i<bytes.size();++i)bytes[i]=std::byte((i*13+i/31)%251);
         if(::write(fd,bytes.data(),bytes.size())!=static_cast<ssize_t>(bytes.size())) {
             ::close(fd);fd=-1;::unlink(path.c_str());
             throw std::runtime_error("Cannot write subordinate source fixture");
         }
+    }
+    /** @return A complete row in the second native window, retaining original row64 on 4 KiB hosts. */
+    std::int64_t secondWindowRow() const {
+        const auto bytesToBoundary=hostPageBytes()-source.file_offset;
+        return std::max<std::int64_t>(64,static_cast<std::int64_t>(
+            (bytesToBoundary+source.rowBytes()-1)/source.rowBytes()));
+    }
+    /** @return The row straddling the first page boundary after the nonzero source prefix. */
+    std::int64_t crossingRow() const {
+        return static_cast<std::int64_t>((hostPageBytes()-source.file_offset)/source.rowBytes());
     }
     /** @brief Remove only this authored source after all fixture owners have retired. */
     ~NativeFile(){if(fd>=0)::close(fd);::unlink(path.c_str());}
@@ -139,7 +153,7 @@ ImmutableRowTableLayoutGeometry layoutFor(const NativeFile &file,DeviceId gpu,st
         ImmutableRowTableExtent::fromNative(file.source.format,file.source.rows,file.source.rowBytes()),
         ImmutableRowTableTiers::of(tiers),ImmutableRowTableResidency::Adaptive,
         {{{hostId,ImmutableRowStorage::RAM},0,ramSlots,{}},{{requester,ImmutableRowStorage::VRAM},0,gpuSlots,{}}},
-        {requester},{},{{hostId,ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::MemoryMapped,4096,2)}},
+        {requester},{},{{hostId,ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::MemoryMapped,hostPageBytes(),2)}},
         {},gpuSlots?std::optional(requester):std::nullopt,8);
 }
 /** @brief Matching owner for this actual aligned CPU protocol allocation. */
@@ -245,7 +259,7 @@ TEST(ImmutableLookupSubordinate, DeclaredRequesterRemainsIndependentOfStorageCap
                     ImmutableRowTableExtent::fromNative(file.source.format,file.source.rows,file.source.rowBytes()),
                     ImmutableRowTableTiers::of(tiers),ImmutableRowTableResidency::Adaptive,
                     {{{hostId,ImmutableRowStorage::RAM},0,2,{}},{{storage,ImmutableRowStorage::VRAM},0,slots,{}}},
-                    std::move(consumers),{},{{hostId,ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::MemoryMapped,4096,2)}},
+                    std::move(consumers),{},{{hostId,ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::MemoryMapped,hostPageBytes(),2)}},
                     {},slots?std::optional(consumer):std::nullopt,8);
             };
             const auto original=layout({consumer});
@@ -317,7 +331,8 @@ TEST(ImmutableLookupSubordinate, PromotionDetachesBeforeAckAndRetainsOldPinnedBa
 /** @test Zero GPU/RAM capacities retain this explicit mode and exact live traffic, including empty batches and duplicates. */
 TEST(ImmutableLookupSubordinate, ZeroSlotsDuplicatesAndEmptyHaveExactLiveExtents){
     for(auto gpu:{DeviceId::cuda(0),DeviceId::rocm(0)})for(auto gpuSlots:{0u,2u}){
-        Lane lane(gpu,0,gpuSlots);const std::array<std::int64_t,4> ids{45,3,45,127};
+        Lane lane(gpu,0,gpuSlots);const auto crossing=lane.file.crossingRow();
+        const std::array<std::int64_t,4> ids{crossing,3,crossing,static_cast<std::int64_t>(lane.file.source.rows-1)};
         const std::array<Intent,4> intents{{{Operation::ReadAndInvalidate,101},{Operation::Read,0},{Operation::ReadAndInvalidate,101},{Operation::ReadAndInvalidate,103}}};
         lane.publish(1,1,ids,intents);ASSERT_EQ(lane.processor->poll(1),ImmutableLookupPoll::Completed);lane.expectRows(ids);
         EXPECT_EQ(lane.cache->stats().source_rows,3u);EXPECT_EQ(lane.cache->stats().duplicate_rows,1u);
@@ -348,7 +363,7 @@ TEST(ImmutableLookupSubordinate, InvalidFramesCannotMutatePayloadOrCpuResidency)
         case 4:ids[1]=3;intents={{{Operation::ReadAndInvalidate,9},{Operation::ReadAndInvalidate,10}}};break;
         case 5:intents={{{Operation::ReadAndInvalidate,9},{Operation::ReadAndInvalidate,9}}};break;
         case 6:ids[1]=-1;break;
-        case 7:ids[1]=128;break;
+        case 7:ids[1]=static_cast<std::int64_t>(lane.file.source.rows);break;
         default:break;
         }
         lane.publish(1,1,ids,intents);
@@ -554,7 +569,7 @@ struct ServiceLane {
                     ImmutableRowTableTiers::of(fullRAM?std::vector{ImmutableRowStorage::VRAM,ImmutableRowStorage::RAM}:
                         std::vector{ImmutableRowStorage::VRAM,ImmutableRowStorage::RAM,ImmutableRowStorage::MemoryMapped}),
                     ImmutableRowTableResidency::Adaptive,std::move(owners),consumers,{},
-                    {{hostId,ImmutableRowTableStoragePolicy::forStorage(fullRAM?ImmutableRowStorage::RAM:ImmutableRowStorage::MemoryMapped,4096,2)}},{},
+                    {{hostId,ImmutableRowTableStoragePolicy::forStorage(fullRAM?ImmutableRowStorage::RAM:ImmutableRowStorage::MemoryMapped,hostPageBytes(),2)}},{},
                     groupCount==2 && gpuSlots?std::optional(consumers.front()):std::nullopt,8,
                     groupCount==2?ImmutableRowTableAdaptiveGPUDomain::SharedCoordinator:ImmutableRowTableAdaptiveGPUDomain::ConsumerLocal);
             }();
@@ -826,7 +841,7 @@ TEST(ImmutableLookupSubordinate, WorkerFailedPartialPayloadRetainsOriginalIntent
         auto &view=lane.binding->deviceView();
         std::memset(view.base.nativeRows,0xa5,2*lane.layout.rowBytes());
         std::memset(view.acknowledgements,0xa5,2*sizeof(ImmutableRowInvalidationAcknowledgement));
-        const std::array<std::int64_t,2> ids{0,64};
+        const std::array<std::int64_t,2> ids{0,lane.file.secondWindowRow()};
         const std::array<Intent,2> intents{{{Operation::ReadAndInvalidate,0x100000001ULL},
                                           {Operation::ReadAndInvalidate,0xfedcba9876543210ULL}}};
         const auto ticket=lane.service->arm(2);

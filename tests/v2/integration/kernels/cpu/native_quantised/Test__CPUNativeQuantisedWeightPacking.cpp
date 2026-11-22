@@ -554,7 +554,21 @@ namespace llaminar2::cpu::native_quantised::test
         }
     }
 
-    TEST(CPUNativeQuantisedWeightPacking, FinalNUMAStorageCoversEveryCodebookAndArchive)
+    namespace {
+/** @return Whether @p node carries at least one CPU (memory-only nodes cannot host first-touch). */
+bool nodeHasCPUs(int node)
+{
+    if (numa_available() < 0)
+        return false;
+    bitmask *cpus = numa_bitmask_alloc(static_cast<unsigned int>(numa_num_possible_nodes()));
+    if (!cpus)
+        return false;
+    const bool has = numa_node_to_cpus(node, cpus) == 0 && numa_bitmask_weight(cpus) > 0;
+    numa_bitmask_free(cpus);
+    return has;
+}
+}
+TEST(CPUNativeQuantisedWeightPacking, FinalNUMAStorageCoversEveryCodebookAndArchive)
     {
         if (numa_available() < 0)
             GTEST_SKIP() << "NUMA page-query support is unavailable";
@@ -563,7 +577,7 @@ namespace llaminar2::cpu::native_quantised::test
         ASSERT_EQ(sched_getaffinity(0, sizeof(before), &before), 0);
         for (int node = 0; node <= numa_max_node(); ++node)
         {
-            if (!numa_bitmask_isbitset(numa_all_nodes_ptr, node))
+            if (!numa_bitmask_isbitset(numa_all_nodes_ptr, node) || !nodeHasCPUs(node))
                 continue;
             SCOPED_TRACE(node);
             const auto placement = CPUWeightStoragePlacement::onNode(node);
@@ -610,7 +624,7 @@ namespace llaminar2::cpu::native_quantised::test
         using Factory = llaminar2::test::TestTensorFactory;
         for (int node = 0; node <= numa_max_node(); ++node)
         {
-            if (!numa_bitmask_isbitset(numa_all_nodes_ptr, node))
+            if (!numa_bitmask_isbitset(numa_all_nodes_ptr, node) || !nodeHasCPUs(node))
                 continue;
             for (auto type : {TensorType::FP16, TensorType::BF16, TensorType::FP32})
             {
@@ -654,7 +668,16 @@ namespace llaminar2::cpu::native_quantised::test
         for (int worker = 0; worker < workers; ++worker)
         {
             threads.emplace_back([&, worker] {
-                const int node = worker % (numa_max_node() + 1);
+                static const std::vector<int> cpu_nodes = [] {
+                    std::vector<int> nodes;
+                    for (int candidate = 0; candidate <= numa_max_node(); ++candidate)
+                        if (numa_bitmask_isbitset(numa_all_nodes_ptr, candidate) && nodeHasCPUs(candidate))
+                            nodes.push_back(candidate);
+                    if (nodes.empty())
+                        nodes.push_back(0);
+                    return nodes;
+                }();
+                const int node = cpu_nodes[static_cast<std::size_t>(worker) % cpu_nodes.size()];
                 for (int iteration = 0; iteration < 16; ++iteration)
                 {
                     round.arrive_and_wait();

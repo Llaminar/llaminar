@@ -858,7 +858,24 @@ or join maintenance. `prefixStateProbe()` is a separate explicit diagnostic
 that may synchronize live caches; ordinary HTTP/SSE logging must never invoke
 it, even when the corresponding log level is enabled.
 
+Native MPI bootstrap preserves the original rank and worker placement admitted
+by `NativeCPUPlacement` and `MPINUMAMapping`. MPI's application delimiter keeps
+launcher options separate from the application argument list. The original-entry
+claim and programmatic bootstrap reject the presence of a legacy placement-helper
+marker or receipt before native placement or launch. Diagnostic helper execution
+is test-only and does not select a product placement policy.
+
 ## 6. Memory, coherence, and weights
+
+`NUMAAllocator` owns exact page ranges, revocation, residency certification and
+allocation rollback/publication. `firstTouchPopulateRange` is the single caller-thread
+placement transaction for both allocator-owned storage and external receive ranges.
+It prepares the complete possible-node mask and captures both thread settings
+before binding, then restores and independently reads back both settings before
+page certification. A rejected or contradictory restoration is fatal even when
+the other setting was restored. Revoking an owned range with `MADV_DONTNEED`
+is not reversible; external callers must promise a complete overwrite. A
+successful placement syscall alone never certifies physical residency.
 
 ### 6.1 Activation and workspace ownership
 

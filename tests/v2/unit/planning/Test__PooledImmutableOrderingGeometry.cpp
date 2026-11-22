@@ -6,6 +6,8 @@
  * The production geometry and PMA contribution bodies remain the sole arithmetic
  * authority; no catalog, worker, source key or allocation is manufactured.
  */
+#include <unistd.h>
+#include "utils/HostPageSize.h"
 #include "fixtures/loaders/AdaptiveImmutableLookupGeometryReplayAccess.h"
 #include "fixtures/backends/NativeOrderingEventGroupReplayAccess.h"
 #include <gtest/gtest.h>
@@ -26,7 +28,7 @@ auto geometry(std::span<const std::uint32_t> slots,const std::vector<Allocator>&
     const std::array tiers{ImmutableRowStorage::VRAM,ImmutableRowStorage::RAM,ImmutableRowStorage::MemoryMapped};
     const auto layout=ImmutableRowTableLayoutGeometry::checked(ImmutableRowTableExtent::fromNative(source.format,source.rows,source.rowBytes()),
         ImmutableRowTableTiers::of(tiers),ImmutableRowTableResidency::Adaptive,owners,{coordinator},{},
-        {{{0,DeviceId::cpu()},ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::MemoryMapped,4096,2)}},
+        {{{0,DeviceId::cpu()},ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::MemoryMapped,llaminar2::hostPageBytes(),2)}},
         {},positive?std::optional(coordinator):std::nullopt,16);
     AdaptiveVRAMRAMSSDRequest request;request.maximum_gpu_cache_rows=128;request.gpu_cache_physical_byte_limit=1u<<20;
     request.host.maximum_cache_rows=7;request.host.cache_physical_byte_limit=1u<<20;

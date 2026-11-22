@@ -196,6 +196,7 @@ namespace llaminar2
         /// Whether we're currently in the thinking phase
         bool inThinking() const { return phase_ == Phase::Reasoning; }
 
+
     private:
         /** @brief The same reasoning/answer lifecycle governs HTTP and SSE output. */
         enum class Phase

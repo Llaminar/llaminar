@@ -38,6 +38,8 @@
 #include <gtest/gtest.h>
 #include "fixtures/backends/NativeContextPreparationReplayAccess.h"
 #include "fixtures/backends/NativeOrderingEventGroupReplayAccess.h"
+#include "execution/config/ServingCapacity.h"
+#include "execution/config/ServingPoolMemoryDemand.h"
 #include "mocks/MockWorkerGPUContext.h"
 #include "backends/GPUDeviceProcessLifetime.h"
 #include <array>
@@ -100,6 +102,34 @@ namespace
         };
         std::vector<std::string> args{"llaminar2", "--define-domain", domain("head", reverse),
             "--define-domain", domain("tail", !reverse), "--pp-stage", "0=head:0-0", "--pp-stage", "1=tail:1-1"};
+        std::vector<char *> argv;
+        for (auto &arg : args) argv.push_back(arg.data());
+        auto config = OrchestrationConfigParser{}.parseArgs(argv.size(), argv.data());
+        config.model_path = source.path();
+        config.max_seq_len = 128;
+        config.moe_routed_prefill.overlay_segment_rows = 32;
+        config.moe_rebalance.mode = MoERebalanceRuntimeMode::Dynamic;
+        config.prefix_cache.enabled = true;
+        config.prefix_cache.storage_mode = PrefixCacheStorageMode::Tiered;
+        config.prefix_cache.ram_budget_bytes = 16ULL << 30;
+        config.prefix_cache.disk_budget_bytes = 32ULL << 30;
+        config.prefix_cache.disk_dir = "/metadata-only/shared-prefix";
+        return {OrchestrationStrategy::PipelineParallel, ExecutionRankMembership(inventory(width), {0}), std::move(config)};
+    }
+
+    /** @return Authored THREE-stage local topology (0-0, 1-1, 2-2) through the
+     *  public CLI grammar; needs a fixture model with >=3 main layers. */
+    AutomaticOrchestrationCandidate threeStageProposal(const PlanningModelSource &source, int width)
+    {
+        const auto domain = [width](std::string name, bool rocm) {
+            std::string members;
+            for (int ordinal = width - 1; ordinal >= 0; --ordinal)
+                members += (members.empty() ? "" : ",") + std::string(rocm ? "rocm:" : "cuda:") + std::to_string(ordinal);
+            return name + "=" + members + ";scope=rank_local;backend=" + (rocm ? "rccl" : "nccl") + ";owner=0";
+        };
+        std::vector<std::string> args{"llaminar2", "--define-domain", domain("head", false),
+            "--define-domain", domain("mid", false), "--define-domain", domain("tail", false),
+            "--pp-stage", "0=head:0-0", "--pp-stage", "1=mid:1-1", "--pp-stage", "2=tail:2-2"};
         std::vector<char *> argv;
         for (auto &arg : args) argv.push_back(arg.data());
         auto config = OrchestrationConfigParser{}.parseArgs(argv.size(), argv.data());
@@ -299,6 +329,64 @@ class MoEPipelineResidencySetup : public ::testing::TestWithParam<int> {};
 // Requires a compiled CUDA/ROCm backend family: its subject prices or
 // constructs GPU-native objects that do not exist in a CPU-only build.
 #if defined(HAVE_CUDA) || defined(HAVE_ROCM)
+
+
+/** @test Serving-pool contribution at the ADMIT level: the parent serving
+ *  stage charges the pool exactly ONCE (local multi-stage pipelines included);
+ *  non-serving pipelines charge nothing. */
+TEST(MoEPipelineMemoryAdmission, ServingPoolChargedOnceForParentStage)
+{
+    PlanningGGUFFixture file(true, true, PlanningGGUFFixture::sourceType(TensorType::FP32));
+    PlanningModelSource source(file.path());
+    const auto serving_expected = [](const OrchestrationConfig &cfg) {
+        return servingPoolMemoryDemand(
+            resolveInstalledServingCapacity(cfg.servingCapacityRequest()),
+            ServingPoolPerResponseBudget::defaultPolicy());
+    };
+    // SERVING 2-STAGE local pipeline: exactly one owner line, exact demand.
+    {
+        auto input = proposal(source, 2, false);
+        input.config.serve_mode = true;
+        const auto admitted = AdmittedOrchestrationCandidate::admit(input, source, policy());
+        std::size_t lines = 0; std::uint64_t total = 0;
+        for (const auto &bom : admitted.physicalAdmission().plan().resources())
+            if (const auto b = bom.bytes(PhysicalMemoryOwner::ServingResponsePool))
+            {
+                ++lines; total += b;
+            }
+        EXPECT_EQ(lines, 1u);
+        EXPECT_EQ(total, serving_expected(input.config));
+    }
+    // NON-SERVING control: zero pool charge.
+    {
+        auto input = proposal(source, 2, false);
+        input.config.serve_mode = false;
+        const auto admitted = AdmittedOrchestrationCandidate::admit(input, source, policy());
+        std::uint64_t total = 0;
+        for (const auto &bom : admitted.physicalAdmission().plan().resources())
+            total += bom.bytes(PhysicalMemoryOwner::ServingResponsePool);
+        EXPECT_EQ(total, 0u);
+    }
+    // THREE-STAGE local pipeline (fixture model with 4 main layers): still
+    // exactly ONE owner line (the vocabulary-head stage) — no per-stage repeats.
+    {
+        PlanningGGUFFixture wide(true, false, PlanningGGUFFixture::sourceType(TensorType::FP32),
+                                 PlanningGGUFFixture::Geometry::Directory, 4);
+        PlanningModelSource wide_source(wide.path());
+        auto input = threeStageProposal(wide_source, 2);
+        input.config.serve_mode = true;
+        const auto admitted = AdmittedOrchestrationCandidate::admit(input, wide_source, policy());
+        std::size_t lines = 0; std::uint64_t total = 0;
+        for (const auto &bom : admitted.physicalAdmission().plan().resources())
+            if (const auto b = bom.bytes(PhysicalMemoryOwner::ServingResponsePool))
+            {
+                ++lines; total += b;
+            }
+        EXPECT_EQ(lines, 1u);
+        EXPECT_GT(total, 0u);
+    }
+}
+
 /** @test Every source format and maintenance/MTP policy constructs exact stage owners. */
 TEST_P(MoEPipelineResidencySetup, AllFormatsModesAndBothVendorOrders)
 {

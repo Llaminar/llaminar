@@ -15,8 +15,11 @@ include_guard(GLOBAL)
 # @param git Executable selected by the caller's real Git discovery.
 # @param source Existing oneDNN checkout, which remains untouched on failure.
 # @param expected_origin Canonical upstream URL owned by dependency selection.
+# @details Pin the checkout's own Git directory, retaining native gitfile support
+# while forbidding discovery of an enclosing repository's unrelated origin.
 function(llaminar_require_onednn_origin git source expected_origin)
-    execute_process(COMMAND "${git}" -C "${source}" remote get-url origin
+    get_filename_component(source_git_dir "${source}/.git" ABSOLUTE)
+    execute_process(COMMAND "${git}" -C "${source}" "--git-dir=${source_git_dir}" remote get-url origin
         RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error
         OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_STRIP_TRAILING_WHITESPACE)
     if(NOT result STREQUAL "0")

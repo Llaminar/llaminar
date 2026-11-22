@@ -11,6 +11,7 @@
 #include "loaders/ImmutableRowTable.h"
 #include "memory/NUMAAllocator.h"
 #include <gtest/gtest.h>
+#include "utils/HostPageSize.h"
 #include <algorithm>
 #include <array>
 #include <climits>
@@ -56,7 +57,10 @@ public:
         int fd=::open(path.c_str(),O_RDONLY);if(fd<0)throw std::runtime_error("cannot inspect native source");
         void*view=::mmap(nullptr,Bytes,PROT_READ,MAP_SHARED,fd,0);::close(fd);
         if(view==MAP_FAILED)throw std::runtime_error("cannot map placement observation");
-        unsigned char resident=0;const auto status=::mincore(static_cast<char*>(view)+Bytes-4096,4096,&resident);
+        // mincore requires a page-aligned address and length: probe the last
+        // whole host page instead of assuming 4 KiB pages.
+        const auto page=llaminar2::hostPageBytes();
+        unsigned char resident=0;const auto status=::mincore(static_cast<char*>(view)+Bytes-page,page,&resident);
         ::munmap(view,Bytes);if(status)throw std::runtime_error("cannot query native source residency");
         return !(resident&1u);
     }
@@ -64,7 +68,7 @@ public:
 /** @brief Admit the exact same RAM owner that construction must materialize. */
 std::shared_ptr<PhysicalMemoryAuthority> authority(const ImmutableRowTableSource &source,DeviceId device)
 {
-    const auto policy = ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::RAM,4096,1);
+    const auto policy = ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::RAM,llaminar2::hostPageBytes(),1);
     PhysicalMemoryPlanBuilder plan;
     plan.add({.world_rank=0,.device=device,.total_bytes=1ull<<30,.admission_available_bytes=1ull<<30},
              PhysicalMemoryOwner::ImmutableTableStorage,ImmutableRowTable::physicalBytes(source,policy));
@@ -150,7 +154,7 @@ TEST(ImmutableRowTableNUMA, OwnedRAMIsCertifiedOrRejectedBeforeNativeRead)
     ASSERT_NE(control,MAP_FAILED);
     const bool capable=numa.prepareExternalReceiveRangeOnNode(control,4096,target);
     ::munmap(control,4096);
-    const auto policy = ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::RAM,4096,1);
+    const auto policy = ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::RAM,llaminar2::hostPageBytes(),1);
     if(!capable)
     {
         EXPECT_THROW(ImmutableRowTable(source,policy,device,memory,ImmutableRowTableHostPlacement::onNode(target)),std::runtime_error);
@@ -179,7 +183,7 @@ TEST(ImmutableRowTableNUMA, InvalidOwnedNodeRejectsBeforeReadingPayload)
 {
     SparseRows file;const auto source=file.source();const DeviceId device=DeviceId::cpu();
     auto memory=authority(source,device);
-    EXPECT_THROW(ImmutableRowTable(source,ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::RAM,4096,1),device,memory,ImmutableRowTableHostPlacement::onNode(INT_MAX)),std::runtime_error);
+    EXPECT_THROW(ImmutableRowTable(source,ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::RAM,llaminar2::hostPageBytes(),1),device,memory,ImmutableRowTableHostPlacement::onNode(INT_MAX)),std::runtime_error);
     EXPECT_TRUE(file.cold());
     EXPECT_EQ(memory->claimedBytes(device,PhysicalMemoryOwner::ImmutableTableStorage,
               PhysicalMemoryMaterializationKind::NewAllocation),0u);

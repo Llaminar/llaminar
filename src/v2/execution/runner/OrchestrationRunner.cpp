@@ -72,6 +72,8 @@
 #include "execution/moe/MoEOverlayCPUHostMaintenance.h"
 #include "execution/moe/ExpertHistogramServingRegime.h"
 #include "planning/ResolvedRankOrchestration.h"
+#include "execution/config/ServingCapacity.h"
+#include "execution/config/ServingPoolMemoryDemand.h"
 #include "execution/runner/PreparedWeightAuthorityIdentity.h"
 #include "IOrchestrationRunnerFactory.h"
 #include "ModelContextRetirement.h"
@@ -96,6 +98,7 @@
 #include "../mtp/MTPSpecTransactionDriver.h"
 #include "../mtp/MTPVerifierPolicy.h"
 #include "../mtp/MTPWeightManifest.h"
+#include "../global_pp/GlobalPPTopology.h"
 #include "../prefix_cache/PrefixCacheCoordinator.h"
 #include "../prefix_cache/PrefixCacheShutdown.h"
 #include "../local_execution/engine/PrefillBucketUtils.h"
@@ -2415,6 +2418,23 @@ namespace llaminar2
                 return false;
             }
 
+            // Step 5a: RESOLVE AND SEAL the request authority BEFORE BOM
+            // admission (the compute graph's vocabulary-head source at plan
+            // time), so the serving pool charge and the graph frontend consume
+            // ONE authority — never a pre-graph default.
+            if (!run_phase(
+                    "sealRequestAuthority",
+                    [&] {
+                        sealed_request_authority_rank_.emplace(
+                            resolveSealedRequestAuthority());
+                        mpi_coordinated_root_rank_ =
+                            *sealed_request_authority_rank_;
+                        return true;
+                    }))
+            {
+                return false;
+            }
+
             // Step 5: Validate the frozen memory plan.
             if (!run_phase(
                     "validateMemoryPlan",
@@ -2858,6 +2878,16 @@ namespace llaminar2
                 [&]
                 {
                     return initializeContinuationRequestGroup();
+                }))
+            return false;
+        if (!run_phase(
+                "sealRequestAuthority",
+                [&] {
+                    sealed_request_authority_rank_.emplace(
+                        resolveSealedRequestAuthority());
+                    mpi_coordinated_root_rank_ =
+                        *sealed_request_authority_rank_;
+                    return true;
                 }))
             return false;
         if (!run_phase(
@@ -17958,7 +17988,33 @@ namespace llaminar2
         requested_routed_weight_authority_identity_ = std::move(identity);
     }
 
-    bool OrchestrationRunner::buildExecutionPlan()
+    int OrchestrationRunner::resolveSealedRequestAuthority()
+{
+    if (requiresNamedDomainGlobalGraph(config_) && plan_builder_)
+    {
+        ModelConfig model;
+        model.n_layers = mainLayerCountExcludingMTP(
+            model_ctx_->concreteLoader(), model_ctx_->architecture(),
+            model_ctx_->totalBlockCount());
+        model.n_heads = model_ctx_->headCount();
+        model.n_kv_heads = model_ctx_->headCountKV();
+        model.hidden_size = model_ctx_->embeddingLength();
+        model.vocab_size = model_ctx_->vocabSize();
+        const auto topology = plan_builder_->buildGlobalPPTopology(
+            config_, model, cluster_inventory_);
+        const auto errors = topology.validate();
+        if (!errors.empty())
+            throw std::runtime_error(
+                "Invalid admitted named-domain topology: " + errors.front());
+        return requestAuthorityRank(topology);
+    }
+    const auto overlay_execution_plan = resolveOverlayExecutionPlanForRunner(
+        config_.moe_routed_expert_plan,
+        moe_expert_overlay_mpi_ctx_ ? moe_expert_overlay_mpi_ctx_ : mpi_ctx_);
+    return overlay_execution_plan ? overlay_execution_plan->continuation_root_rank : 0;
+}
+
+bool OrchestrationRunner::buildExecutionPlan()
     {
         if (plan_built_)
             return true;
@@ -22365,7 +22421,12 @@ namespace llaminar2
         }
     }
 
-    bool OrchestrationRunner::publishPhysicalMemoryAuthority()
+    std::shared_ptr<PhysicalMemoryAuthority> OrchestrationRunner::physicalMemoryAuthority() const
+{
+    return physical_memory_authority_;
+}
+
+bool OrchestrationRunner::publishPhysicalMemoryAuthority()
     {
         if (!model_ctx_ || !physical_memory_admission_)
         {
@@ -22611,6 +22672,13 @@ namespace llaminar2
             .captured_prefill_buckets = std::move(captured_prefill_buckets),
             .max_gpu_memory_bytes = config_.memoryLimitBytes(DeviceType::CUDA),
             .max_cpu_memory_bytes = config_.memoryLimitBytes(DeviceType::CPU),
+            // SERVING POOL CHARGE IS BOUND TO THE RESOLVED REQUEST AUTHORITY:
+            // only the authority rank constructs the HTTP serving executor
+            // (ServerMode is_authority); members run the worker loop, so only
+            // the authority's rank-local host BOM carries the owner line.
+            .serving_pool_demand_bytes = servingPoolDemandForRank(
+                config_.serve_mode, sealed_request_authority_rank_, plan_.rank,
+                config_.servingCapacityRequest()),
         });
 
         // CPU threads are not needed to observe GPUs. Only immutable role/BOM
@@ -23520,11 +23588,15 @@ namespace llaminar2
             runner_ = buildNamedDomainGlobalGraph(
                 config_, plan_, cluster_inventory_, *plan_builder_, model_ctx_, mpi_ctx_,
                 moe_pipeline_stage_bindings_);
-            // Resolve before readiness, while every rank still follows the
-            // common initialization schedule. The public frontend then runs
-            // on the same tail that owns logits, with no vocabulary transfer.
-            mpi_coordinated_root_rank_ = coordinatedRootRankForRunner(
-                config_.moe_routed_expert_plan, mpi_ctx_, runner_.get());
+            // The graph MUST agree with the sealed request authority (one
+            // ownership source; divergence is fatal). The public frontend then
+            // runs on the same tail that owns logits.
+            // UNCONDITIONAL authority requirement (shared guard): the graph MUST
+            // publish its request authority and it MUST equal the sealed one.
+            const auto graph_authority = runner_->requestAuthorityRank();
+            requireRequestAuthorityAgreement(sealed_request_authority_rank_,
+                                             graph_authority);
+            mpi_coordinated_root_rank_ = *graph_authority;
             return static_cast<bool>(runner_);
         }
 
@@ -26673,3 +26745,4 @@ namespace llaminar2
     }
 
 } // namespace llaminar2
+#include "execution/mpi_orchestration/IExecutionPlanBuilder.h"

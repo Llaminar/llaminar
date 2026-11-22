@@ -35,11 +35,15 @@
 #pragma once
 
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
 namespace llaminar2
 {
+    class SerializedInferenceExecutor; // device-free executor binding (friend below)
+    struct ServingCapacityTestIssuer;  // isolated device-free test authority (friend below)
+
     /** @brief Canonical preserved serving response pool (accepted including active and queued). */
     inline constexpr int kDefaultServingResponsePool = 32;
 
@@ -310,6 +314,31 @@ namespace llaminar2
         ResolvedServingCapacity &operator=(ResolvedServingCapacity &&) = delete;
 
     private:
+        /** @brief Checked private mint: SAME structural invariants as resolved
+         *         admission, computed in WIDENED 64-bit arithmetic (S+Q can never
+         *         overflow). Only the executor (device-free binding) and the
+         *         isolated device-free test issuer are friends; there is NO public
+         *         resolved-capacity mint. Production admission still uses
+         *         resolveServingCapacity (authenticated). */
+        static ResolvedServingCapacity fromComponentsChecked(int resident_slots,
+                                                             int response_leases,
+                                                             int queue_capacity)
+        {
+            if (resident_slots < 1)
+                throw std::invalid_argument("Resident slots must be at least 1");
+            if (queue_capacity < 0)
+                throw std::invalid_argument("Queue capacity must be nonnegative");
+            const std::int64_t minimum = static_cast<std::int64_t>(resident_slots) + queue_capacity;
+            if (static_cast<std::int64_t>(response_leases) < minimum)
+                throw std::invalid_argument(
+                    "Response leases must cover resident + queue (R >= S + Q)");
+            if (response_leases > kServingResponsePoolCeiling)
+                throw std::invalid_argument(
+                    "Response leases exceed the installed ceiling (1024)");
+            return ResolvedServingCapacity(resident_slots, response_leases, queue_capacity);
+        }
+        friend class SerializedInferenceExecutor;
+        friend struct ServingCapacityTestIssuer;
         /** @brief Only resolveServingCapacity may construct a resolved result. */
         constexpr explicit ResolvedServingCapacity(int resident_slots, int response_leases, int queue_capacity) noexcept
             : resident_slots_(resident_slots), response_leases_(response_leases), queue_capacity_(queue_capacity)
@@ -389,6 +418,36 @@ namespace llaminar2
      *         nonpositive pool.
      * @throws ServingCapacityUnqualified For valid intent outside the envelope.
      */
+/**
+     * @brief Typed control-plane headroom above the accepted response leases.
+     *
+     * The HTTP listener needs one worker per accepted response that may be
+     * mid-publication, plus bounded headroom so control-plane requests
+     * (discovery, passive /stats) are never starved by generation traffic.
+     * This is the single authority for the pool width; callers must not keep a
+     * second arithmetic rule (the former "capacity + 2" ad hoc expression).
+     */
+    inline constexpr int kDefaultServingHttpControlHeadroom = 2;
+
+    /**
+     * @brief HTTP serving pool width derived from the typed serving capacity.
+     *
+     * @param capacity Resolved serving capacity (R already envelope-checked).
+     * @param control_headroom Bounded control-plane headroom (default 2).
+     * @return R + control_headroom.
+     * @throws std::invalid_argument For a non-positive headroom.
+     */
+    [[nodiscard]] inline int servingHttpWorkerCount(
+        const ResolvedServingCapacity &capacity,
+        int control_headroom = kDefaultServingHttpControlHeadroom)
+    {
+        if (control_headroom <= 0)
+            throw std::invalid_argument("Serving HTTP control headroom must be positive");
+        if (control_headroom > std::numeric_limits<int>::max() - capacity.responseLeases())
+            throw std::overflow_error("Serving HTTP pool width overflows int");
+        return capacity.responseLeases() + control_headroom;
+    }
+
     inline ResolvedServingCapacity resolveInstalledServingCapacity(const ServingCapacityRequest &request)
     {
         return resolveServingCapacity(request, ServingCapacityQualificationOwner::installedEnvelope());

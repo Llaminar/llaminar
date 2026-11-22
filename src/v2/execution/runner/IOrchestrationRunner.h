@@ -634,6 +634,9 @@ namespace llaminar2
          *
          * @param request_batch Number of active logical requests.
          */
+        /** @brief Shared physical-memory authority (null when unbacked). */
+        virtual std::shared_ptr<PhysicalMemoryAuthority> physicalMemoryAuthority() const = 0;
+
         virtual GenerationBatchResult decodeStepBatch(int request_batch)
         {
             (void)request_batch;

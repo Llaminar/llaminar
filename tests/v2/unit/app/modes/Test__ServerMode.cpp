@@ -168,3 +168,4 @@ TEST(Test__ServerMode, OpenAIModelDiscoveryRoute_ReturnsLoadedModel)
         response->body,
         R"({"data":[{"created":0,"id":"Qwen3.5-122B-A10B-UD-Q8_K_XL","object":"model","owned_by":"llaminar"}],"object":"list"})");
 }
+

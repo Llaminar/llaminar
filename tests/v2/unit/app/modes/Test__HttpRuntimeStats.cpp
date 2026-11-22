@@ -358,7 +358,7 @@ TEST(Test__HttpRuntimeStats, ConcurrentReadersSeeWholePublications)
 TEST(Test__SerializedInferenceExecutor, BoundedAdmissionAndUnpublishedStreamRetirement)
 {
     EXPECT_THROW(SerializedInferenceExecutor(0), std::invalid_argument);
-    SerializedInferenceExecutor executor(2);
+    SerializedInferenceExecutor executor(2, 1);
     auto first = executor.tryReserve();
     auto second = executor.tryReserve();
     ASSERT_TRUE(first);
@@ -375,7 +375,7 @@ TEST(Test__SerializedInferenceExecutor, BoundedAdmissionAndUnpublishedStreamReti
 /** @brief Exceptions and subsequent jobs retain one stable worker and exactly one result. */
 TEST(Test__SerializedInferenceExecutor, StableWorkerSurvivesExceptionsAndRejectsReentry)
 {
-    SerializedInferenceExecutor executor(2);
+    SerializedInferenceExecutor executor(2, 1);
     const auto worker = executor.tryReserve()->run([] { return std::this_thread::get_id(); });
     EXPECT_NE(worker, std::this_thread::get_id());
     EXPECT_THROW(executor.tryReserve()->run([] { throw std::runtime_error("fixture"); }), std::runtime_error);
@@ -392,7 +392,7 @@ TEST(Test__SerializedInferenceExecutor, StableWorkerSurvivesExceptionsAndRejects
 /** @brief A held generation cannot retain the host snapshot mutex or admit concurrent work. */
 TEST(Test__SerializedInferenceExecutor, ActiveWorkDoesNotBlockSnapshotAndQueuedWork)
 {
-    SerializedInferenceExecutor executor(2);
+    SerializedInferenceExecutor executor(2, 1);
     std::promise<void> entered, release;
     const auto released = release.get_future().share();
     auto first = std::async(std::launch::async, [&] {

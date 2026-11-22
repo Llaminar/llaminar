@@ -29,6 +29,7 @@
 #include "app/modes/ServerRankMembership.h"
 #include "app/modes/ServerExecutionEvidence.h"
 #include "app/modes/ChatCompletionHandler.h"
+#include "app/modes/SSEPublishChannel.h"
 #include "app/modes/SerializedInferenceExecutor.h"
 #include "app/modes/HttpServiceThreadAffinity.h"
 #include "app/modes/HttpProcessStats.h"
@@ -567,24 +568,127 @@ namespace llaminar2
                          if (stream_observer) stream_observer(req, streamed_response_body);
 
                          // SSE streaming response
+                         // §10.1 INDEPENDENT WRITERS (v52, accepted channel):
+                         // run() is ONLY the producer (enqueue, no socket); the
+                         // httplib PROVIDER THREAD is the network writer (drains,
+                         // owns every sink.write). The WRITER LIFECYCLE is a
+                         // NONCOPYABLE owner/state allocated BEFORE the producer
+                         // launch (no unowned thread on any throw), close+join
+                         // exactly once, and the terminal verdict joins the
+                         // producer outcome with the transport outcome: an
+                         // exception mid-stream can never falsely Drain.
+                         auto retained_admission = admission;
+                         auto stream_request = std::move(*parsed_request);
+                         // QUEUED-PAYLOAD WINDOW QUOTA (PROVISIONAL POLICY):
+                         // max_entries = response-limit tokens x 2 (reasoning and
+                         // answer can both publish per token) + a provisional
+                         // framing-line allowance (role/finish/usage/DONE/tool-
+                         // flush). This is an honest provisional quota policy:
+                         // exact handler publication geometry is an OPEN
+                         // derivation — NOT certified. Bytes are UNBOUNDED here
+                         // (no guessed per-token byte constant; physical/admitted
+                         // byte authority (PMA-backed output window) is a
+                         // separate open admission piece, NOT claimed).
+                         auto channel = std::make_shared<SSEPublishChannel>(
+                             SSEPublishChannelBudget::forRequest(
+                                 stream_request.max_tokens));
+                         auto transport_open = std::make_shared<std::atomic<bool>>(true);
+                         auto writer_finished = std::make_shared<std::atomic<bool>>(false);
+                         auto writer_failed = std::make_shared<std::atomic<bool>>(false);
+                         auto producer_error = std::make_shared<std::exception_ptr>(nullptr);
+                         struct SSEWriterLifecycle
+                         {
+                             std::shared_ptr<SSEPublishChannel> channel;
+                             std::shared_ptr<std::atomic<bool>> retired;
+                             std::unique_ptr<std::thread> producer;
+                             SSEWriterLifecycle(std::shared_ptr<SSEPublishChannel> ch)
+                                 : channel(std::move(ch)),
+                                   retired(std::make_shared<std::atomic<bool>>(false)) {}
+                             ~SSEWriterLifecycle()
+                             {
+                                 if (!retired->exchange(true))
+                                 {
+                                     channel->close();
+                                     if (producer && producer->joinable())
+                                         producer->join();
+                                 }
+                             }
+                             SSEWriterLifecycle(const SSEWriterLifecycle &) = delete;
+                             SSEWriterLifecycle &operator=(const SSEWriterLifecycle &) = delete;
+                         };
+                         // OWNER/STATE FIRST (retired flag + channel ownership);
+                         // the thread is installed into it only afterwards, so a
+                         // failed launch never leaves an unowned joinable thread.
+                         auto lifecycle = std::make_shared<SSEWriterLifecycle>(channel);
+                         lifecycle->producer = std::make_unique<std::thread>(
+                             [&handler, producer_error, retained_admission, channel, transport_open,
+                              stream_request = std::move(stream_request), arrival] mutable {
+                                 try
+                                 {
+                                     retained_admission->run([&] {
+                                         auto enqueue = [channel, transport_open](const std::string &line) -> bool
+                                         {
+                                             if (!transport_open->load())
+                                                 return false;
+                                             return channel->push(line);
+                                         };
+                                         return handler.publishStreamingRequest(stream_request, enqueue, arrival);
+                                     });
+                                 }
+                                 catch (...)
+                                 {
+                                     *producer_error = std::current_exception();
+                                 }
+                                 channel->close();
+                             });
                          res.set_chunked_content_provider(
                              "text/event-stream",
-                             [&handler,
-                              admission = std::move(admission),
-                              request = std::move(*parsed_request),
-                              streamed_response_body, arrival](size_t /*offset*/, httplib::DataSink &sink) -> bool
+                             [channel, transport_open, writer_finished, writer_failed,
+                              streamed_response_body](size_t /*offset*/, httplib::DataSink &sink) -> bool
                              {
-                                 auto chunk_cb = [&sink, streamed_response_body](const std::string &sse_line) -> bool
+                                 for (;;)
                                  {
+                                     auto line = channel->popOrClosed();
+                                     if (!line)
+                                         break;
                                      if (streamed_response_body)
-                                         streamed_response_body->append(sse_line);
-                                     return sink.write(sse_line.c_str(), sse_line.size());
-                                 };
-
-                                 admission->run([&] { return handler.publishStreamingRequest(request, chunk_cb, arrival); });
-
+                                         streamed_response_body->append(*line);
+                                     if (!sink.write(line->c_str(), line->size()))
+                                     {
+                                         writer_failed->store(true);
+                                         transport_open->store(false);
+                                         channel->close();
+                                         return false;
+                                     }
+                                 }
                                  sink.done();
+                                 writer_finished->store(true);
                                  return true;
+                             },
+                             [retained_admission, lifecycle, transport_open,
+                              writer_finished, writer_failed, producer_error](bool native_success)
+                             {
+                                 if (!lifecycle->retired->exchange(true))
+                                 {
+                                     transport_open->store(false);
+                                     lifecycle->channel->close();
+                                     if (lifecycle->producer && lifecycle->producer->joinable())
+                                         lifecycle->producer->join();
+                                 }
+                                 // Join the PRODUCER outcome with the TRANSPORT
+                                 // outcome: an exception mid-stream (truncated or
+                                 // empty output with successful native framing)
+                                 // must never be reported as Drained. Fatal
+                                 // invalid-state/join semantics are NOT
+                                 // suppressed here (no try/catch around close or
+                                 // join); only the terminal verdict is computed
+                                 // without throwing.
+                                 const bool producer_ok =
+                                     (producer_error == nullptr || *producer_error == nullptr);
+                                 const bool writer_ok =
+                                     writer_finished->load() && !writer_failed->load();
+                                 retained_admission->publicationTerminal(
+                                     native_success && writer_ok && producer_ok);
                              });
                      }
                      else
@@ -592,7 +696,31 @@ namespace llaminar2
                          // Non-streaming response
                          auto response = admission->run([&] { return handler.handleRequest(*parsed_request, arrival); });
                          res.status = response.http_status;
-                         res.set_content(response.json_body, "application/json");
+                         // §10.1 TERMINAL OWNERSHIP (S2): the body is handed to the
+                         // transport as a ONE-SHOT provider, so the reservation is
+                         // RETAINED through write_response_core and the typed close runs
+                         // at the provider boundary only when the body write was
+                         // accepted. A rejected write leaves the reservation on the
+                         // honest abandoned path (destructor release) — never a
+                         // fabricated success close.
+                         const auto body = std::make_shared<std::string>(response.json_body);
+                         // The reservation is RETAINED through the transport write
+                         // (captured by the provider). NON-CHUNKED VERDICT: the close
+                         // runs inside the provider, gated on the accepted body write;
+                         // a rejected write leaves the honest abandoned path.
+                         res.set_content_provider(
+                             "application/json",
+                             [admission = std::move(admission), body](size_t, httplib::DataSink &sink) -> bool
+                             {
+                                 if (!sink.write(body->data(), body->size()))
+                                     return false;
+                                 sink.done();
+                                 admission->publicationInFlight();
+                                 admission->publicationDetached();
+                                 admission->publicationFinished();
+                                 return true;
+                             },
+                             [](bool) {});
                      }
                  });
     }
@@ -708,11 +836,12 @@ namespace llaminar2
         // exact and rejected when the installed envelope cannot serve it.
         std::size_t executor_capacity = SerializedInferenceExecutor::kDefaultCapacity;
         std::size_t executor_queue_capacity = SerializedInferenceExecutor::kDefaultQueueCapacity;
+        std::optional<ResolvedServingCapacity> resolved_capacity;
         try
         {
-            const auto resolved = resolveInstalledServingCapacity(config.servingCapacityRequest());
-            executor_capacity = static_cast<std::size_t>(resolved.responseLeases());
-            executor_queue_capacity = static_cast<std::size_t>(resolved.queueCapacity());
+            resolved_capacity.emplace(resolveInstalledServingCapacity(config.servingCapacityRequest()));
+            executor_capacity = static_cast<std::size_t>(resolved_capacity->responseLeases());
+            executor_queue_capacity = static_cast<std::size_t>(resolved_capacity->queueCapacity());
         }
         catch (const std::invalid_argument &error)
         {
@@ -721,7 +850,27 @@ namespace llaminar2
             runner->shutdown();
             return 1;
         }
-        SerializedInferenceExecutor inference_executor(executor_capacity, executor_queue_capacity);
+        // PMA-RESERVED SERVING POOL CAPACITY (REQUIRED): serving requires the
+        // runner's published physical-memory authority. A missing authority is a
+        // fatal startup diagnostic — production never runs an unbacked pool and
+        // never falls back. The executor additionally requires the admitted
+        // ServingResponsePool owner line (exact typed demand; addServingPoolDemand
+        // in the memory plan) and reserves the capacity there (typed-layout
+        // materialization belongs to the real serving-engine slice).
+        const auto serving_memory_authority = runner->physicalMemoryAuthority();
+        if (!serving_memory_authority)
+        {
+            LOG_ERROR("Server mode requires the runner's physical-memory authority; "
+                      "refusing to start with an unbacked serving pool.");
+            runner->shutdownMPIWorkers();
+            runner->shutdown();
+            flushPerfStatsFromEnv();
+            return 1;
+        }
+        SerializedInferenceExecutor inference_executor(
+            *resolved_capacity,
+            serving_memory_authority,
+            ServingPoolPerResponseBudget::defaultPolicy());
         httplib::Server svr;
         g_server_ptr = &svr;
         RequestLogState request_log_state;

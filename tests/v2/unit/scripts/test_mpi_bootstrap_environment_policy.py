@@ -32,6 +32,12 @@ class MPIBootstrapEnvironmentPolicy(unittest.TestCase):
         for name in ("src/v2/app/RuntimeInitPhase.cpp", "src/v2/utils/CPUFeatures.h",
                      "src/v2/utils/NativeCPUPlacement.cpp", "src/v2/utils/DebugEnv.h"):
             self.write(name, 'const char *legacy = std::getenv("LEGACY");\n')
+        # The OpenMP-free placement helper is a real bootstrap exception: its
+        # closed-key environment reads live outside DebugEnv because it cannot
+        # link the DebugEnv engine's closure. Mirror it in the synthetic repo
+        # so the guard's stale-exception validation matches the real tree.
+        self.write("src/v2/planning/PlacementHelper.cpp",
+                   'const char *helper_env = std::getenv("HELPERSIG");\n')
 
     def write(self, name, body):
         target = self.root / name

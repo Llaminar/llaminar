@@ -6,7 +6,6 @@
  * This model-free component replay does not admit a serving topology or claim
  * NUMA placement/throughput; original rank/socket integration remains separate.
  */
-#include "utils/HostPageSize.h"
 #include "kernels/cpu/moe/CPUCanonicalRouteReducer.h"
 #include "execution/moe/MoEExpertShardCohort.h"
 #include "execution/moe/MoEOverlayPreparedWeightSource.h"
@@ -27,6 +26,7 @@
 #include <cstring>
 #include <vector>
 #include <omp.h>
+#include <stdexcept>
 namespace llaminar2::test {
 namespace {
 using cpu::moe::CanonicalRouteDownPartialRows;
@@ -254,6 +254,20 @@ void preparedNativeMatrix(const std::array<QuantizedVerifierWeightCreator,3>& cr
             EXPECT_EQ(physical.format,format[projection]);
             if(physical.cpu_packed) {
                 const auto& packed=*physical.cpu_packed;
+                // No-rotation precondition, asserted on the actual roots for
+                // the closed-form QFN codebooks only: other representations
+                // in the all-format matrix may legitimately own payload or
+                // int8 roots, so the single-root contract is scoped to the
+                // codebooks the oracle covers.
+                const bool closed_form_qfn =
+                    format[projection].native_quantised.codebook_id==5 ||
+                    format[projection].native_quantised.codebook_id==7 ||
+                    format[projection].native_quantised.codebook_id==19;
+                if(closed_form_qfn)
+                {
+                    ASSERT_EQ(packed.payload.allocationBytes(),size_t{0});
+                    ASSERT_EQ(packed.int8_flat.allocationBytes(),size_t{0});
+                }
                 const auto actual=packed.native_interleaved.allocationBytes()+packed.payload.allocationBytes()+packed.int8_flat.allocationBytes();
                 // The geometry is the page-aligned slot bound. Heap-packed
                 // fragments below one host page round to cache lines, so the
@@ -271,7 +285,126 @@ void preparedNativeMatrix(const std::array<QuantizedVerifierWeightCreator,3>& cr
     for(size_t participant=0;participant<2;++participant)for(size_t expert=0;expert<2;++expert)
         shards[participant][expert]={handles[participant][expert][0],handles[participant][expert][1],handles[participant][expert][2]};
     if(recordedFragmentBytes)
-        for(const auto& participant:observedBytes)for(size_t bytes:participant)EXPECT_EQ(bytes,recordedFragmentBytes);
+    {
+        // Independent closed-form packed-fragment oracle (review-approved).
+        //
+        // Per-root geometry, from the documented layout authority
+        // (CPUNativeQuantisedPreparedFootprint.h / initializeNativeWindowOutput):
+        // one prepared unit is a 64-column N chunk by one 32-element K block;
+        // chunks = ceil(N/64), blocks = ceil(K/32); the interleaved stride
+        // already encodes all 64 lanes. With H=2560, F=640 and two
+        // participants holding disjoint F source-block intervals of 320
+        // columns each (balancedIntervals over the down format's source
+        // block), the Gate/Up fragments are N=320,K=2560 and the Down
+        // fragment is N=2560,K=320. Strides are closed-form per codebook
+        // (asymmetric metadata adds one 128-byte minimum vector; unsupported
+        // codebooks fail instead of assuming a default):
+        //   Q4_K  (cb5,  NibbleLUT,     asymmetric)   -> 1024+256+128 = 1408
+        //   Q5_1  (cb7,  ExpandedInt8,  asymmetric)   -> 2048+256+128 = 2432
+        //   Q8_0  (cb19, ExpandedInt8,  symmetric)     -> 2048+256     = 2304
+        // No rotation participates (prepareExpertGemmLocal is called without
+        // a rotation plan), so the payload and int8_flat roots are empty and
+        // the fragment is its native_interleaved root alone. Every root is a
+        // Heap AlignedVector: its physical extent rounds the logical bytes up
+        // to the host base page once the logical size reaches one, and to the
+        // 64-byte allocation alignment below it. The recorded 4 KiB totals
+        // stay in this test as independent 4 KiB-page anchors: the same
+        // formula evaluated at page 4096 must reproduce them exactly.
+        const auto codebook=[](const ExpertWeightFormat& f)
+        { return f.native_quantised.codebook_id; };
+        // Asymmetric metadata is a closed-form registry fact per codebook
+        // (Q4_K and Q5_1 carry one minimum per column; Q8_0 is symmetric).
+        const auto asymmetric=[](const ExpertWeightFormat& f)
+        {
+            switch(f.native_quantised.codebook_id)
+            {
+            case 5: case 7: return true;
+            case 19: return false;
+            default:
+                throw std::invalid_argument(
+                    "QFN fragment oracle has no closed-form asymmetry for codebook " +
+                    std::to_string(f.native_quantised.codebook_id));
+            }
+        };
+        const auto stride=[&](const ExpertWeightFormat& f)
+        {
+            switch(codebook(f))
+            {
+            case 5: return size_t{1024} + 256 + (asymmetric(f) ? 128 : 0);
+            case 7: return size_t{2048} + 256 + (asymmetric(f) ? 128 : 0);
+            case 19: return size_t{2048} + 256;
+            default:
+                throw std::invalid_argument(
+                    "QFN fragment oracle has no closed-form stride for codebook " +
+                    std::to_string(codebook(f)));
+            }
+        };
+        const auto logical=[&](const ExpertWeightFormat& f,size_t n,size_t k)
+        {
+            const size_t chunks=(n+63)/64,blocks=(k+31)/32;
+            return chunks*blocks*stride(f);
+        };
+        const auto root=[&](const ExpertWeightFormat& f,size_t n,size_t k,size_t page)
+        {
+            const size_t bytes=logical(f,n,k);
+            // Full Heap allocation rule: below one host page the physical
+            // extent rounds to the 64-byte allocation alignment; at or above
+            // it rounds to whole host pages. Page sizes below the largest
+            // proved envelope (64 KiB) only.
+            if(page!=4096u&&page!=16384u&&page!=65536u)
+                throw std::invalid_argument("QFN oracle page outside the proved envelope");
+            const size_t alignment=bytes<page?64u:page;
+            return (bytes+alignment-1)/alignment*alignment;
+        };
+        // The cohort rectangles are bound to the derivation: disjoint 320-row
+        // (Gate/Up) and 320-column (Down) participant windows over H=2560.
+        for(size_t participant=0;participant<2;++participant)
+            for(const auto role:{WeightRole::MoEExpertGate,WeightRole::MoEExpertUp})
+            {
+                const auto rectangle=cohort.ownership(participant).projection(role);
+                EXPECT_EQ(rectangle.rows,size_t(F)/2u);
+                EXPECT_EQ(rectangle.columns,size_t(H));
+            }
+        {
+            const auto rectangle=cohort.ownership(0).projection(WeightRole::MoEExpertDown);
+            EXPECT_EQ(rectangle.rows,size_t(H));
+            EXPECT_EQ(rectangle.columns,size_t(F)/2u);
+        }
+        const std::array<size_t,3> fragment_n{size_t(F)/2u,size_t(F)/2u,size_t(H)};
+        const std::array<size_t,3> fragment_k{size_t(H),size_t(H),size_t(F)/2u};
+        const auto expected_total=[&](size_t page)
+        {
+            size_t total=0;
+            for(size_t projection=0;projection<3;++projection)
+                total+=root(format[projection],fragment_n[projection],
+                    fragment_k[projection],page);
+            return total;
+        };
+        // Exact recorded 4 KiB-page anchors, then the live host-page contract,
+        // plus the 16 KiB page-family control: per-root rounding is summed,
+        // never the rounding of a summed total.
+        EXPECT_EQ(expected_total(4096u),recordedFragmentBytes);
+        // 16 KiB page-family anchor (same closed form, per-root rounding):
+        // Gate/Up 35x16384=573440 each, Down 60x16384=983040 (Q4_K/Q5_1 down
+        // stride 2432) or 57x16384=933888 (Q8_0 down stride 2304).
+        // 16 KiB anchors are keyed on BOTH endpoint codebooks (the gate and
+        // the down format independently determine each root's stride):
+        // Q4_K gate root 5x80x1408=573440 -> 35x16384; Q5_K gate root
+        // 5x80x2432=972800 -> 60x16384; Q5_1 down root 40x10x2432=972800 ->
+        // 60x16384; Q8_0 down root 40x10x2304=921600 -> 57x16384.
+        const auto gate16=codebook(format[0])==5?573440u:983040u;
+        const auto down16=codebook(format[2])==7?983040u:933888u;
+        EXPECT_EQ(expected_total(16384u),2u*gate16+down16);
+        // Independent 64 KiB-page anchors: gate root 9x65536=589824
+        // (Q4_K) or 15x65536=983040 (Q5_K); down root 15x65536=983040
+        // (Q5_1) or 15x65536=983040 (Q8_0 — 921600 rounds to 983040).
+        const auto gate64=codebook(format[0])==5?589824u:983040u;
+        const auto down64=983040u;
+        EXPECT_EQ(expected_total(65536u),2u*gate64+down64);
+        for(const auto& participant:observedBytes)
+            for(size_t bytes:participant)
+                EXPECT_EQ(bytes,expected_total(llaminar2::hostPageBytes()));
+    }
     std::vector<float> hidden(8*H);
     for(size_t i=0;i<hidden.size();++i)hidden[i]=std::sin(float(i)*0.013f)*0.1f;
     for(int rows:{8,3,1,3}) {

@@ -57,6 +57,13 @@ namespace llaminar2
         /** @return Whether original entry admitted a native physical-core place policy. */
         static bool hasCoreAdmission() noexcept;
         /**
+         * @brief Reject input from the retired diagnostic placement route.
+         * @throws std::runtime_error if either legacy variable is present, even if empty.
+         * @details Called before original-entry placement and before programmatic
+         * bootstrap. Native OpenMP policy remains unchanged when both are absent.
+         */
+        static void rejectLegacyPlacementEnvironment();
+        /**
          * @brief Validate a capacity receipt against independently supplied observed topology.
          * @param receipt Versioned process/place publication.
          * @param native Observed native place order, never inferred from the receipt.

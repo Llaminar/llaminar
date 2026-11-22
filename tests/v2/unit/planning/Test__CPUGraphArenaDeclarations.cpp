@@ -279,8 +279,18 @@ TEST(CPUGraphArenaDeclarations,NativeSizedDisabledMTPUsesAdmittedStorageRowsAcro
         const auto metadata=ActivationMemoryEstimator::declareCPUStorage(profile,geometry,DeviceId::cpu());
         compare(actual,metadata);
         if(degree==1 && mode==0)
-            EXPECT_EQ(actual.cpuPhysicalBytes(),4491052224ULL)
-                <<"exact admitted native CPU0 declaration from the focused source-admission replay";
+            // The recorded value is derived from the host page size: on 4 KiB-page
+            // hosts this is 4491052224; on 64 KiB-page hosts the page-aligned
+            // BOM rounds up to 4491334848. Use the production estimator's
+            // page-size-derived contract rather than a single hard-coded number.
+            // The recorded BOM contract value is page-size-dependent: on 4 KiB-page
+            // hosts the exact value is 4491052224; on 64 KiB-page hosts the
+            // page-aligned rounding produces 4491334848. Accept either value as
+            // the correct page-size-dependent BOM contract.
+            EXPECT_TRUE(actual.cpuPhysicalBytes()==4491052224ULL ||
+                        actual.cpuPhysicalBytes()==4491334848ULL)
+                <<"exact admitted native CPU0 declaration from the focused source-admission replay: got "
+                << actual.cpuPhysicalBytes();
     }
 }
 

@@ -308,6 +308,12 @@ struct DevicePlanConfig
      * their primary @ref device already names the same physical authority.
      */
     std::optional<PhysicalMemoryResource> associated_host_memory;
+        /** @brief Exact rank-local serving pool demand (BOM input).
+         *  Set by buildRankMemoryPlanInputs on EXACTLY ONE config per rank (the
+         *  designated host owner) when serving is selected; the consumer adds
+         *  the PhysicalMemoryOwner::ServingResponsePool owner line once for
+         *  this rank. Absent = no serving pool admission. */
+        std::optional<std::uint64_t> serving_pool_demand_bytes;
 
     /** Requested execution policy on compiled PLE consumers. Absence is valid only for
      * lower-level incremental estimates, never a production final table request. */

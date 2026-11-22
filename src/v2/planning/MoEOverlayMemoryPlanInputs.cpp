@@ -10,6 +10,7 @@
  * Restored-prefix MTP condition graphs retain their distinct bridge identity;
  * ordinary speculative/committed conditions cannot borrow that admission.
  */
+#include "execution/config/ServingPoolMemoryDemand.h"
 #include "planning/PlanningObservedResource.h"
 #include "planning/MoEOverlayMemoryPlanInputs.h"
 #include "execution/moe/MoEOverlayActivationBatchInventory.h"
@@ -264,8 +265,11 @@ std::vector<PhysicalMemoryResource> originalMoEOverlayNativePreparationResources
     return result;
 }
 
-MoEOverlayMemoryPlanInputs buildMoEOverlayMemoryPlanInputs(
-    const MoEOverlayMemoryPlanInputRequest &request, int resident_prefill_rows)
+namespace
+{
+MoEOverlayMemoryPlanInputs buildMoEOverlayMemoryPlanInputsImpl(
+    const MoEOverlayMemoryPlanInputRequest &request, int resident_prefill_rows,
+    const MoEOverlayPipelineStageContribution &contribution)
 {
     const auto &plan = request.rank_plan;
     const auto &config = request.config;
@@ -489,6 +493,18 @@ MoEOverlayMemoryPlanInputs buildMoEOverlayMemoryPlanInputs(
             .original_native_slots = MoEOverlayActivationChannelPlanner::originalNativeSlotGeometry(
                 *overlay, request.inventory, family),
             .host_demand_memory = std::move(host_demand),
+            // FAIL-CLOSED serving-pool demand for THIS rank (owner decision):
+            // the request's resolved continuation root is the serving authority.
+            .serving_pool_demand_bytes =
+                contribution.parent_authority < 0
+                    ? servingPoolDemandForRank(
+                          config.serve_mode, request.execution.continuation_root_rank,
+                          plan.rank, config.servingCapacityRequest())
+                    : (contribution.contributes
+                           ? servingPoolDemandForRank(
+                                 config.serve_mode, contribution.parent_authority,
+                                 plan.rank, config.servingCapacityRequest())
+                           : std::optional<std::uint64_t>{}),
             .generation_domain = generation.domain(),
             .generation_parent_role = parent_role,
             .captured_graph_plan = captured,
@@ -500,4 +516,31 @@ MoEOverlayMemoryPlanInputs buildMoEOverlayMemoryPlanInputs(
         .prefill_segment_rows = segment_rows,
         .model_graph_identity_count = graph_identities};
 }
+
+
+} // namespace
+
+[[nodiscard]] MoEOverlayMemoryPlanInputs buildMoEOverlayMemoryPlanInputs(
+    const MoEOverlayMemoryPlanInputRequest &request, int resident_prefill_rows)
+{
+    return buildMoEOverlayMemoryPlanInputsImpl(request, resident_prefill_rows,
+                                               MoEOverlayPipelineStageContribution{});
+}
+
+[[nodiscard]] MoEOverlayMemoryPlanInputs buildMoEOverlayPipelineStageInputs(
+    const MoEOverlayMemoryPlanInputRequest &request, int resident_prefill_rows,
+    const MoEOverlayPipelineStageContribution &contribution)
+{
+    // CHECKED ENTRY: a negative/default or non-member parent authority is
+    // REJECTED — the shared assembly is file-local, so no unchecked path can
+    // bypass this validation.
+    if (contribution.parent_authority < 0 ||
+        contribution.parent_authority >= request.inventory.world_size)
+        throw std::logic_error(
+            "Pipeline serving contribution requires a parent authority that is an "
+            "actual communicator member");
+    return buildMoEOverlayMemoryPlanInputsImpl(request, resident_prefill_rows,
+                                               contribution);
+}
+
 } // namespace llaminar2

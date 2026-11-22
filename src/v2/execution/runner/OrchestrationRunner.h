@@ -914,6 +914,8 @@ namespace llaminar2
          * @return True when the existing admission is consistently published.
          */
         bool publishPhysicalMemoryAuthority();
+        /** @brief Shared physical-memory authority (null when unbacked). */
+        std::shared_ptr<PhysicalMemoryAuthority> physicalMemoryAuthority() const override;
 
         /**
          * @brief Validate that the model fits in device memory
@@ -2352,6 +2354,16 @@ namespace llaminar2
          * during plan construction and never changes during inference.
          */
         int mpi_coordinated_root_rank_{0};
+        /** @brief SEALED request/serving authority resolved BEFORE BOM
+         *  admission (the same vocabulary-head source the compute graph uses),
+         *  so the serving pool charge, the coordinated root and the public
+         *  frontend consume ONE authority — never a pre-graph default. */
+        /** @brief SEALED request authority (engaged only after the
+         *  sealRequestAuthority phase; nullopt = NOT YET SEALED — never a
+         *  valid-looking default 0). */
+        std::optional<int> sealed_request_authority_rank_;
+        /** @brief Resolve/seal the request authority before BOM admission. */
+        int resolveSealedRequestAuthority();
         /** Sole typed authority for coordinated command admission. */
         MPIWorkerCommandLifecycle mpi_worker_command_lifecycle_{
             MPIWorkerCommandLifecycle::AcceptingCommands};

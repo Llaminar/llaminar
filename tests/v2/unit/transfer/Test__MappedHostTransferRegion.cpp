@@ -11,6 +11,7 @@
  */
 
 #include "backends/IBackend.h"
+#include "utils/HostPageSize.h"
 #include "execution/moe/MoEOverlaySparseCollective.h"
 #include "execution/moe/MoEOverlayGpuRemoteProjectionEndpoint.h"
 #include "execution/local_execution/graph/IGraphBuilder.h"
@@ -125,7 +126,7 @@ namespace
             void *allocation = nullptr;
             if (page_aligned_mapped_storage)
             {
-                const auto page = static_cast<size_t>(::sysconf(_SC_PAGESIZE));
+                const auto page = llaminar2::hostPageBytes();
                 if (!page || bytes % page != 0u)
                     throw std::invalid_argument("Fixture mapped storage requires whole pages");
                 allocation = std::aligned_alloc(page, bytes);
@@ -1295,7 +1296,12 @@ TEST_F(Test__MappedHostTransferRegion, ArenaFreshSlicesStayZeroAfterDirtyNeighbo
     {
         auto arena = engine_.createMappedHostArena(devices);
         std::vector<std::shared_ptr<MappedHostTransferRegion>> slices;
-        for (const size_t bytes : {size_t{17},size_t{8192},size_t{65},size_t{32768},size_t{513}})
+        // The final slice exceeds one whole host page, so the first backing
+        // region (one whole page on every supported host) cannot hold it and
+        // geometric growth is forced on every page size; smaller slices alone
+        // fit inside one 64 KiB page and would not exercise growth there.
+        const size_t page_straddling_bytes=2u*llaminar2::hostPageBytes()+1u;
+        for (const size_t bytes : {size_t{17},size_t{8192},size_t{65},size_t{32768},size_t{513},page_straddling_bytes})
         {
             auto fresh = arena->allocate(bytes,64);
             const auto* begin = static_cast<const std::byte*>(fresh->mutableHostData());
@@ -1382,7 +1388,7 @@ private:
 void Test__MappedHostTransferRegion::proveFreshTicketDoesNotRetouchPayload(DeviceId device)
 {
     auto* spy=device.is_cuda()?cuda_.get():rocm_.get();spy->page_aligned_mapped_storage=true;
-    const auto page=static_cast<size_t>(::sysconf(_SC_PAGESIZE));ASSERT_GT(page,0u);
+    const auto page=llaminar2::hostPageBytes();ASSERT_GT(page,0u);
     auto arena=engine_.createMappedHostArena(std::array{device});
     auto first=arena->allocate(8*page,1);auto second=arena->allocate(8*page,1);
     std::memset(first->mutableHostData(),0x4b,first->sizeBytes());
@@ -1395,10 +1401,43 @@ void Test__MappedHostTransferRegion::proveFreshTicketDoesNotRetouchPayload(Devic
     ASSERT_TRUE(spy->ownsPages(protectedBegin,protectedBytes));
     ReadOnlyFixturePages protection(protectedBegin,protectedBytes);
     MoEOverlayDispatchTicketStorage storage;
+    // The protected two-page interior must lie inside the ticket payload on
+    // every host page size, and the publication word allocated after the
+    // payload must stay outside it, so the row capacity is scaled from the
+    // host base page using this test's own typed plane arithmetic — per row
+    // two route planes of top_k x sizeof(float) and two hidden/return
+    // planes of d_model x sizeof(float), plus the 64-byte header the
+    // production header struct occupies — with no layout constant copied
+    // from production internals. Rows are then chosen so the payload end
+    // strictly passes four whole pages; the publication word allocated
+    // after the payload therefore lands beyond the protected window on
+    // every supported page size. The literal 64-row capacity only
+    // satisfied both on 4 KiB hosts.
+    const int top_k=2,d_model=64;
+    const std::size_t per_row_bytes=
+        2u*static_cast<std::size_t>(top_k)*sizeof(float)+
+        2u*static_cast<std::size_t>(d_model)*sizeof(float);
+    const std::size_t ticket_header_bytes=64u;
+    const std::size_t page_scaled_rows=
+        4u*page/per_row_bytes+1u;
     // The literal old second full memset faults on these already-zero interior
     // pages. Header and publication stores are outside the protected payload.
-    storage.bindFixedCapacity(2,64,2,64,device,9,arena);
-    ASSERT_EQ(static_cast<void*>(storage.ticket().header),expected);
+    storage.bindFixedCapacity(2,static_cast<int>(page_scaled_rows),top_k,d_model,device,9,arena);
+    // Diagnostic geometry assertions: if the production layout ever changes,
+    // these fail with the actual addresses instead of silently moving the
+    // mprotect scope and voiding the retouching proof.
+    const auto payload_begin=reinterpret_cast<std::uintptr_t>(storage.ticket().header);
+    const auto payload_end=payload_begin+storage.allocationBytes();
+    const auto protected_begin=reinterpret_cast<std::uintptr_t>(protectedBegin);
+    const auto protected_end=protected_begin+protectedBytes;
+    ASSERT_EQ(payload_begin,reinterpret_cast<std::uintptr_t>(expected));
+    ASSERT_GE(payload_end,protected_end);
+    ASSERT_GE(payload_begin, reinterpret_cast<std::uintptr_t>(anchor->mutableHostData()));
+    ASSERT_EQ(payload_begin%64u,0u);
+    const auto publication_begin=reinterpret_cast<std::uintptr_t>(storage.publicationTimelineAddress());
+    ASSERT_NE(publication_begin,0u);
+    ASSERT_GE(publication_begin,payload_end);
+    ASSERT_EQ(publication_begin%64u,0u);
     ASSERT_GT(storage.allocationBytes(),4*page);
     EXPECT_TRUE(storage.hasValidBoundIdentity());
     EXPECT_TRUE(std::all_of(protectedBegin,protectedBegin+protectedBytes,[](std::byte b){return b==std::byte{};}));

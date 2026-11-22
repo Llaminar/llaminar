@@ -2737,6 +2737,11 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
                 cfg.device.is_gpu()
                     ? cfg.weight_load_staging.device_bytes
                     : native_weight_source_staging_bytes);
+        // SERVING POOL: the CPU device BOM is the rank-local host BOM; admit the
+        // owner line exactly once (the designated config carries the demand).
+        if (cfg.device.is_cpu() && cfg.serving_pool_demand_bytes)
+            bom_builder.add(PhysicalMemoryOwner::ServingResponsePool,
+                            *cfg.serving_pool_demand_bytes);
         DeviceMemoryPlan dev_plan(
             bom_builder.build(), max_seq, activation_seq);
 
@@ -2767,7 +2772,8 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
              cfg.weight_load_staging.host_bytes != 0u || pipeline_host_bytes != 0u ||
              (native_table_bytes != 0u && !native_ngram_lookup) || immutable_lookup_host_bytes != 0u ||
              mixed_source_table || mixed_source_staging ||
-             (cfg.rank_ordered_resources && cfg.rank_ordered_resources->hostBytes())))
+             (cfg.rank_ordered_resources && cfg.rank_ordered_resources->hostBytes()) ||
+             cfg.serving_pool_demand_bytes.has_value()))
         {
             if (!cfg.associated_host_memory.has_value() ||
                 !cfg.associated_host_memory->valid() ||
@@ -2802,6 +2808,11 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
             host_builder.add(PhysicalMemoryOwner::ActivationTransportStaging, pipeline_host_bytes);
             if (cfg.rank_ordered_resources)
                 host_builder.add(PhysicalMemoryOwner::LocalCollective, cfg.rank_ordered_resources->hostBytes());
+            // SERVING POOL (exactly one config per rank carries the demand; the
+            // aggregated host BOM receives the owner line once).
+            if (cfg.serving_pool_demand_bytes)
+                host_builder.add(PhysicalMemoryOwner::ServingResponsePool,
+                                 *cfg.serving_pool_demand_bytes);
             appendPhysicalPlan(
                 result,
                 DeviceMemoryPlan(

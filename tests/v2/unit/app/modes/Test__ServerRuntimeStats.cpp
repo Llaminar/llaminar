@@ -283,7 +283,7 @@ protected:
     NiceMock<MockTokenizer> tokenizer;
     RequestRuntimeSummary summary;
     ChatCompletionHandler handler{runner, tokenizer, "fixture-model"};
-    SerializedInferenceExecutor executor{2};
+    SerializedInferenceExecutor executor{2, 1};
     httplib::Server server;
     std::thread listener;
     int port = 0;
@@ -410,4 +410,114 @@ TEST_F(Test__ServerRuntimeStats, ResetDuringPrefillStartsFreshEpoch)
 TEST_F(Test__ServerRuntimeStats, ResetDuringStreamingDecodeStartsFreshEpoch)
 {
     expectResetWhileActive(true);
+}
+
+
+/** @brief ACTUAL-BINDING transport verdict (CLIENT-SIDE BODY RECEIPT):
+ *  a fully read stream DRAINS; a mid-stream client stop is witnessed by a REAL
+ *  client-side nonempty-body receipt (first body bytes, possibly a partial role
+ *  chunk), the producer decode-gate ACK, a still-PENDING request and a
+ *  successful control-plane GET /stats while held, with an explicit failure
+ *  assert and complete-retirement counter rechecks. */
+TEST_F(Test__ServerRuntimeStats, TransportVerdictDistinguishesDrainedFromAbandoned)
+{
+    EXPECT_CALL(runner, requestRuntimeSummary()).Times(AnyNumber()).WillRepeatedly(Return(summary));
+    const std::string success_request = json{{"messages", {{{"role", "user"}, {"content", "hello"}}}},
+        {"stream", true}, {"max_tokens", 1}}.dump();
+    const std::string request = json{{"messages", {{{"role", "user"}, {"content", "hello"}}}},
+        {"stream", true}, {"max_tokens", 4}}.dump();
+
+    for (int rep = 0; rep < 2; ++rep)
+    {
+        // PER-REPETITION fresh witnesses (fresh per execution/invocation).
+        auto decode_calls = std::make_shared<std::atomic<int>>(0);
+        auto entered_gate = std::make_shared<std::atomic<bool>>(false);
+        std::promise<void> block_stream;
+        auto block_future = block_stream.get_future().share();
+        ON_CALL(runner, decodeStep()).WillByDefault(Invoke([block_future, decode_calls, entered_gate] {
+            const int call = ++*decode_calls;
+            if (call >= 3)
+            {
+                entered_gate->store(true); // ENTERED-GATE ACK, before the wait
+                block_future.wait();       // held until released after the stop
+            }
+            GenerationResult result;
+            result.tokens = {42};
+            return result;
+        }));
+
+        // SUCCESS CONTROL: fully read -> DRAINED (counter increments).
+        {
+            const auto full = client()->Post("/v1/chat/completions", success_request, "application/json");
+            ASSERT_TRUE(full);
+            EXPECT_EQ(full->status, 200);
+        }
+        ASSERT_TRUE(eventually([&] { return executor.drainedPublications() == rep + 1; }));
+
+        // FAILURE (dedicated client, separate thread) with a REAL CLIENT-SIDE
+        // BODY RECEIPT: Request::content_receiver + Client::send stream the
+        // response body to the client's receiver, so the FIRST nonempty body
+        // bytes arriving AT THE CLIENT are witnessed (possibly a partial role
+        // chunk — not a whole SSE frame, not a completed sink.write).
+        auto abandon = std::make_shared<httplib::Client>("127.0.0.1", port);
+        abandon->set_read_timeout(std::chrono::seconds(10));
+        // PREALLOCATE every stop/cleanup witness BEFORE the async launch: an
+        // allocation failure after launch would otherwise leave the future's
+        // join dependent on the read timeout with no cleanup owner.
+        auto client_payload = std::make_shared<std::atomic<bool>>(false);
+        auto stopped = std::make_shared<std::atomic<bool>>(false);
+        auto fail_future = std::async(std::launch::async, [&] {
+            httplib::Request req;
+            req.method = "POST";
+            req.path = "/v1/chat/completions";
+            req.body = request;
+            req.set_header("Content-Type", "application/json");
+            req.content_receiver = [client_payload](const char *, size_t len, uint64_t, uint64_t) {
+                if (len > 0)
+                    client_payload->store(true); // client-side nonempty receipt
+                return true;
+            };
+            return abandon->send(req);
+        });
+        {
+            // NESTED OWNER SCOPE (accepted shape): its destructor is the ONLY
+            // cleanup path — stop + release BEFORE the future get on every green
+            // repetition; no manual bypass.
+            struct CleanupGuard
+            {
+                std::shared_ptr<httplib::Client> client;
+                std::promise<void> &gate;
+                std::shared_ptr<std::atomic<bool>> stopped;
+                ~CleanupGuard()
+                {
+                    if (!stopped->exchange(true))
+                    {
+                        client->stop();
+                        gate.set_value();
+                    }
+                }
+            } cleanup{abandon, block_stream, stopped};
+            // Witness 1: the FIRST nonempty body bytes reached the CLIENT.
+            ASSERT_TRUE(eventually([&] { return client_payload->load(); }));
+            // Witness 2: the server is actually HELD at the gate (decode #3).
+            ASSERT_TRUE(eventually([&] { return entered_gate->load(); }));
+            // Witness 3: the request is STILL PENDING while held (it has not
+            // already failed/completed on its own).
+            EXPECT_EQ(fail_future.wait_for(std::chrono::seconds(0)), std::future_status::timeout);
+            // Witness 4: the control plane stays responsive while the stream is
+            // held (scoped control-plane observation).
+            const auto control = client()->Get("/stats");
+            ASSERT_TRUE(control);
+            EXPECT_EQ(control->status, 200);
+        } // scope exit: guard destructor stops the client and releases the gate
+        const auto failure_result = fail_future.get();
+        // Explicit failure assert: the stopped transport did NOT complete 200.
+        EXPECT_TRUE(failure_result == nullptr || failure_result->status != 200)
+            << "stopped client returned complete success";
+        // COMPLETE RETIREMENT FIRST, then the FINAL counter recheck.
+        ASSERT_TRUE(eventually([&] { return executor.snapshot().delivering == 0; }));
+        ASSERT_TRUE(eventually([&] { return executor.snapshot().admitted == 0; }));
+        EXPECT_EQ(executor.drainedPublications(), rep + 1); // ONLY the success controls drained
+        EXPECT_EQ(executor.snapshot().delivering, 0u);
+    }
 }

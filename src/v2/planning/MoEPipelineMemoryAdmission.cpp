@@ -80,6 +80,13 @@ namespace llaminar2
         const auto &profile = model.memoryProfile();
         auto parent = topology.rankPlan();
         const bool global = topology.globalPipeline().has_value();
+        // SINGLE PARENT REQUEST/POOL AUTHORITY before aggregate admission: the
+        // global pipeline's vocabulary-head owner (or the sole local-process
+        // rank). Every child's overlay inputs are gated on THIS authority so
+        // only the parent serving rank is charged — never every stage root.
+        const std::optional<int> serving_pool_authority =
+            global ? std::optional<int>{requestAuthorityRank(*topology.globalPipeline())}
+                   : std::optional<int>{parent.rank};
         if (topology.pipelineStages().empty() || (!global && topology.pipelineStages().size() < 2) ||
             topology.overlayExecution() || topology.config().moe_routed_expert_plan ||
             (!global && (!parent.usesLocalPP() || inventory.world_size != 1 || parent.rank != 0)) || inventory.world_size <= 0 ||
@@ -233,7 +240,7 @@ namespace llaminar2
                 const auto &child = stage.topology_;
                 const auto original_cpu=std::find_if(cpu_programs.begin(),cpu_programs.end(),
                     [&](const auto& program){return program.stageId()==child.stageId();});
-                auto input = buildMoEOverlayMemoryPlanInputs({
+                auto input = buildMoEOverlayPipelineStageInputs({
                     .model = profile, .rank_plan = stage.rank_plan_, .config = child.config(),
                     .inventory = inventory, .execution = child.overlayExecution(),
                     .capacity_policy = stage.storage_policy_, .retained_mtp = stage.rank_plan_.runtime.mtp,
@@ -244,7 +251,18 @@ namespace llaminar2
                     .weight_precision=WeightPrecision::NATIVE,
                     .native_source_placement=loader.nativeWeightSourcePlacement(),
                     .native_pipeline_maintenance_budget=native_maintenance_budget,
-                    .original_cpu_stage_program=original_cpu==cpu_programs.end()?nullptr:&*original_cpu}, rows);
+                    .original_cpu_stage_program=original_cpu==cpu_programs.end()?nullptr:&*original_cpu},
+                    rows,
+                    // MANDATORY contribution plan (typed pipeline entry): only
+                    // the parent serving STAGE (vocabulary-head stage on the
+                    // parent authority) contributes — every other stage is an
+                    // explicit no-contribution. No default-to-child-root path.
+                    MoEOverlayPipelineStageContribution{
+                        .parent_authority = *serving_pool_authority,
+                        .contributes = stage.rank_plan_.has_lm_head &&
+                                        (global ? stage.rank_plan_.rank ==
+                                                      *serving_pool_authority
+                                                : true)});
                 input.local_capacity.original_cpu_pipeline_programs=cpu_programs;
                 const auto rank = owner_topology.rankPlan().rank;
                 const auto *budget = planning_candidate ? &policy.candidate_rank_budgets.at(rank) : nullptr;

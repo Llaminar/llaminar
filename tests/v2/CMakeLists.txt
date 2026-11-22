@@ -17157,6 +17157,12 @@ add_v2_test(V2_Integration_MoEGlobalPipelineStageOwnership
         --gtest_filter=ResolvedRankOrchestration.MoEGlobalPipeline*
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;MPI;MoE;Pipeline;Ownership;Regression"
     MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_MoEOverlayServingPoolAdmissionContract
+    COMMAND $<TARGET_FILE:v2_test_execution_plan_builder>
+        --gtest_filter=AutomaticOrchestrationCandidates.OverlayServingPoolAdmitsOwnerLineForContinuation:AutomaticOrchestrationCandidates.ServingPoolOwnershipTypedDecision
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;Serving;ContinuousBatching;MoE;PMA;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 40
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
 
 # Stage-local TP is validated before native birth; no enclosing rank context
 # may be allocated merely to satisfy the model-geometry guard.
@@ -18370,12 +18376,51 @@ add_v2_test(V2_Unit_HttpRuntimeStats
     MPI_PROCS 1 NO_MODELS TIMEOUT 30)
 
 # Test: SerializedInferenceExecutor (typed serving admission R/Q at the response-lease boundary)
+add_executable(v2_test_sse_publish_channel unit/app/modes/Test__SSEPublishChannel.cpp)
+target_link_libraries(v2_test_sse_publish_channel llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_SSEPublishChannel
+    COMMAND $<TARGET_FILE:v2_test_sse_publish_channel>
+    LABELS "V2;Unit;HTTP;Serving;ContinuousBatching;Publication;Regression;DeviceFree"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 60)
+add_v2_test(V2_Integration_SSEPublishChannelRegressions
+    COMMAND $<TARGET_FILE:v2_test_sse_publish_channel>
+    LABELS "V2;Integration;ProductionTestPreflight;Serving;ContinuousBatching;Publication;Regression;DeviceFree"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 60)
 add_executable(v2_test_serialized_inference_executor unit/app/modes/Test__SerializedInferenceExecutor.cpp)
+target_include_directories(v2_test_serialized_inference_executor PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(v2_test_serialized_inference_executor llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_SerializedInferenceExecutor
     COMMAND $<TARGET_FILE:v2_test_serialized_inference_executor>
     LABELS "V2;Unit;HTTP;Serving;ContinuousBatching;Admission;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 60)
+
+# Test: ServingLifetimes (typed request/slot identity + response/execution/publication leases)
+add_executable(v2_test_serving_lifetimes unit/execution/config/Test__ServingLifetimes.cpp)
+target_link_libraries(v2_test_serving_lifetimes llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_ServingLifetimes
+    COMMAND $<TARGET_FILE:v2_test_serving_lifetimes>
+    LABELS "V2;Unit;Serving;ContinuousBatching;Lifetimes;Regression"
     MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+
+# Production preflight regressions for the serving admission/ownership defects
+# found in review (worker-owned completion, S-exemption transfer with displaced
+# recharging, Q-boundary refusal, throwing occupant; lease machines incl.
+# pre-execution cancellation and authenticated generation retirement). Both
+# suites are device-free host-threading tests, so the preflight host lane runs
+# the complete executables.
+add_v2_test(V2_Integration_ServingTransportVerdictRegressions
+    COMMAND $<TARGET_FILE:v2_test_server_mode>
+            --gtest_filter=Test__ServerRuntimeStats.TransportVerdictDistinguishesDrainedFromAbandoned
+    LABELS "V2;Integration;ProductionTestPreflight;Serving;ContinuousBatching;Publication;Regression;DeviceFree"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+add_v2_test(V2_Integration_ServingExecutorAdmissionRegressions
+    COMMAND $<TARGET_FILE:v2_test_serialized_inference_executor>
+    LABELS "V2;Integration;ProductionTestPreflight;Serving;ContinuousBatching;Admission;Threading;Regression;DeviceFree"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 60)
+add_v2_test(V2_Integration_ServingLeaseMachineRegressions
+    COMMAND $<TARGET_FILE:v2_test_serving_lifetimes>
+    LABELS "V2;Integration;ProductionTestPreflight;Serving;ContinuousBatching;Lifetimes;Regression;DeviceFree"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 60)
 add_v2_test(V2_Integration_HTTPRuntimeStatsHandlerLifecycle
     COMMAND $<TARGET_FILE:v2_test_chat_completion_handler>
         --gtest_filter=Test__ChatCompletionHandler.RuntimeStats*:Test__ChatCompletionHandler.RuntimeSummaryNeverProbesLiveInferenceState
@@ -26608,6 +26653,12 @@ add_v2_test(V2_Unit_GlobalPPTopology
     LABELS "V2;Unit;GlobalPP;Topology;RankPlan;PipelineParallel;TensorParallel"
     MPI_PROCS 1
 )
+add_v2_test(V2_Integration_ServingPoolAuthorityContract
+    COMMAND $<TARGET_FILE:v2_test_global_pp_topology>
+        --gtest_filter=*RequestAuthority*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;Serving;ContinuousBatching;PMA;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 40
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
 
 message(STATUS "V2 Tests: Added Global PP unit tests")
 
@@ -29816,6 +29867,7 @@ add_executable(v2_test_memory_planner
     unit/planning/Test__MoEPipelineFixedMemory.cpp)
 target_link_libraries(v2_test_memory_planner llaminar2_core GTest::gtest GTest::gtest_main)
 target_include_directories(v2_test_memory_planner PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../external/vendor)
+target_include_directories(v2_test_memory_planner PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 add_v2_test(V2_Integration_AutomaticPlanningRejectsUnrelatedNativeWorker
     COMMAND $<TARGET_FILE:v2_test_memory_planner>
         --gtest_filter=AutomaticOrchestrationPlanner.DefaultCalibrationRejectsExistingWorkerWithoutRetiringIt
@@ -29873,6 +29925,12 @@ add_v2_test(V2_Unit_MemoryPlanner
     MPI_PROCS 1
     NO_MODELS
 )
+add_v2_test(V2_Integration_ServingPoolDemandAdmissionContract
+    COMMAND $<TARGET_FILE:v2_test_memory_planner>
+        --gtest_filter=*ServingPoolDemand*:*OwnerFollowerServingBomJoin*:*ServingBomToReservationChain*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;Serving;ContinuousBatching;PMA;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 40
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
 add_v2_test(V2_Integration_NgramMandatoryBaseCapacity
     COMMAND $<TARGET_FILE:v2_test_memory_planner>
         --gtest_filter=OrchestrationCandidateNgramAdmission.MandatoryBaseCapacityRejectsBeforeOptionalTableSelection
@@ -44748,6 +44806,372 @@ if(HAVE_CUDA AND TARGET v2_integration_cuda_attention_padding_parity)
         list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDAAttentionPaddingInvocationContract)
     endif()
 endif()
+
+# ============================================================================
+# ============================================================================
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/PlacementHelperTests.cmake)
+# Preserved: bootstrap/MPI inventory + serving locality preflight (the restored
+# accepted Test__ClusterInventoryBootstrap fixture supports --placement-contract).
+add_v2_test(V2_Integration_ClusterPlacementAuthorityContract
+    COMMAND $<TARGET_FILE:v2_integration_cluster_inventory_bootstrap>
+        --placement-contract
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Placement;Bootstrap;MPI;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+
+
+
+# Preserved: first-touch contract filter (used by the preserved preflight registration below)
+set(NUMA_FIRST_TOUCH_CONTRACT_CASES
+    FirstTouchBoundary.PreconditionRejectsIncompleteOpsAndGeometry
+    FirstTouchBoundary.CaptureAffinityFailureLeavesThreadUnmutated
+    FirstTouchBoundary.CapturePolicyFailureLeavesThreadUnmutated
+    FirstTouchBoundary.NodeCpuResolutionFailureIsAttributed
+    FirstTouchBoundary.EmptyTargetCpuSetFailsWithoutMutation
+    FirstTouchBoundary.BindAffinityFailureRestoresStateAndPreservesErrno
+    FirstTouchBoundary.BindPolicyFailureRestoresBothPartsPreservesErrno
+    FirstTouchBoundary.FirstMutationExceptionWindowStillRestores
+    FirstTouchBoundary.UnwindOutOfTouchStillRestores
+    FirstTouchBoundary.RestorePolicyFailureIsFatal
+    FirstTouchBoundary.RestoreAffinityFailureIsFatal
+    FirstTouchBoundary.RestoreBothPartsFailureIsFatal
+    FirstTouchBoundary.UnwindOutOfTouchWithFailedRestoreIsFatal
+    FirstTouchBoundary.TraceFileFailedAcquisitionIsSafeAndVisible
+    FirstTouchBoundary.TraceFileRecordingFailureIsVisiblePreservesErrno
+    FirstTouchBoundary.TraceFileReadIsHardBounded
+    FirstTouchBoundary.TraceEvidenceValidatorRejectsTruncatedEvidenceContainingMarkers
+    FirstTouchBoundary.TraceEvidenceValidatorRejectsReadError
+    FirstTouchBoundary.TraceEvidenceValidatorRejectsReadErrorValueContainingMarkers
+    FirstTouchBoundary.TraceRecordingFailureProducesDistinctChildFailure
+    FirstTouchBoundary.MutationControlOmitBindFailsTheValidator
+    FirstTouchBoundary.SilentPolicyRestoreOmissionIsFatal
+    FirstTouchBoundary.SilentAffinityReplacementIsFatal
+    FirstTouchBoundary.SilentHighCpuLossIsFatal
+    FirstTouchBoundary.MutationControlTouchBeforeBindFailsTheValidator
+    FirstTouchBoundaryMasks.WordCountsCoverTheCompleteNodeSpace
+    FirstTouchBoundaryMasks.SetAndQueryNodeBitsAcrossAllWords
+    FirstTouchBoundaryMasks.OutOfBoundsIsRejectedWithoutMutation
+    FirstTouchBoundaryMasks.EqualityAndEmptinessCoverAllWords
+    FirstTouchBoundary.NativeMaxnodePreservesLastNodeAcrossWordBoundary
+    FirstTouchBoundary.EmptyPolicyRestoreUsesNullButReadbackUsesFullMask
+    FirstTouchBoundary.SilentPolicyModeChangeIsFatalWithMaskIntact
+    FirstTouchBoundary.SilentHighPolicyBitLossDuringUnwindIsFatal
+    FirstTouchBoundary.BindRejectionAndBothRestoreFailuresRetainEachOutcome
+    FirstTouchBoundary.RejectedRestoreIsFatalEvenWhenBothReadsMatch
+    FirstTouchBoundary.ThrowingRestoresAreFatalEvenWhenBothReadsMatch
+    FirstTouchBoundary.RejectedPolicyReadbackStillQueriesAffinityBeforeFatal
+    FirstTouchBoundary.ThrowingAffinityReadbackIsFatalDuringUnwind
+    FirstTouchBoundary.BothReadbackFailuresRetainedDuringUnwind
+)
+list(JOIN NUMA_FIRST_TOUCH_CONTRACT_CASES ":" NUMA_FIRST_TOUCH_CONTRACT_FILTER)
+
+add_executable(v2_test_placement_topology unit/planning/Test__PlacementTopology.cpp)
+target_link_libraries(v2_test_placement_topology llaminar2_core llaminar_placement_topology GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_PlacementTopology
+    COMMAND $<TARGET_FILE:v2_test_placement_topology>
+    LABELS "V2;Unit;DeviceFree;CPU;Planning;Placement;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+
+# PRESERVED REGISTRATIONS (rebase preservation: delivered branch content)
+# Restored from the accepted A-2 tree (b4e107ee) because the develop rebase
+# dropped these branch-only tests/sources; registrations replayed verbatim.
+# Duplicate target/test registrations already present in develop are ADOPTED
+# (dropped here) rather than duplicated — see the reconcile table.
+# ============================================================================
+
+add_v2_test(V2_Integration_PlacementReceiptCapacityOrderedCorePlaces
+    COMMAND $<TARGET_FILE:v2_test_placement_topology>
+        --gtest_filter=PlacementTopology.CapacityOrderedCorePlacesSortsFastestFirstNonIdentity:PlacementTopology.CapacityOrderedCorePlacesRejectsEmptyAndDuplicateAdmittedSets:PlacementTopology.ReceiptRoundtripThroughRealPath
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Placement;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+
+add_v2_test(V2_Integration_PlacementNativeWorkerContract
+    COMMAND $<TARGET_FILE:v2_integration_cpu_startup_affinity>
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Bootstrap;Placement;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+
+add_v2_test(V2_Integration_NUMABufferIteratorAllocationContract
+    COMMAND $<TARGET_FILE:v2_test_numa_allocator>
+            --gtest_filter=Test__NUMAAllocator.NUMABufferIterators
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;NUMA;Memory;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+
+add_v2_test(V2_Integration_NUMAObservedGeometryContracts
+    COMMAND $<TARGET_FILE:v2_test_numa_allocator>
+            --gtest_filter=Test__NUMAAllocator.PrepareExternalReceiveRangeUsesCertifiedFirstTouch:Test__NUMAAllocator.DedicatedMappingsSurviveAlternatingNodeChurn:Test__NUMAAllocator.HugePageAdvisedMappingsRetainExactFirstTouchNode
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;NUMA;Memory;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+
+add_executable(v2_test_numa_first_touch_boundary
+    unit/memory/Test__NUMAFirstTouchBoundary.cpp)
+
+target_link_libraries(v2_test_numa_first_touch_boundary
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+
+add_v2_test(V2_Unit_NUMAFirstTouchBoundary
+    COMMAND $<TARGET_FILE:v2_test_numa_first_touch_boundary>
+    LABELS "V2;Unit;Memory;NUMA;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+
+add_executable(v2_test_numa_first_touch_boundary_native
+    integration/memory/Test__NUMAFirstTouchBoundaryNative.cpp)
+
+target_link_libraries(v2_test_numa_first_touch_boundary_native
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+
+add_v2_test(V2_Integration_NUMAFirstTouchBoundaryFailureContracts
+    COMMAND $<TARGET_FILE:v2_test_numa_first_touch_boundary>
+            --gtest_filter=${NUMA_FIRST_TOUCH_CONTRACT_FILTER}
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;NUMA;Memory;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60)
+
+add_v2_test(V2_Integration_NUMAFirstTouchBoundaryQueryValidators
+    COMMAND $<TARGET_FILE:v2_test_numa_first_touch_boundary_native>
+            --gtest_filter=FirstTouchBoundaryNative.QueryValidatorRejectsPerPageErrors:FirstTouchBoundaryNative.QueryValidatorRejectsEmptyExtent:FirstTouchBoundaryNative.QueryValidatorRejectsMixedPlacement
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;NUMA;Memory;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+
+add_v2_test(V2_Integration_NUMAFirstTouchBoundaryNativeSingleNode
+    COMMAND $<TARGET_FILE:v2_test_numa_first_touch_boundary_native>
+            --gtest_filter=FirstTouchBoundaryNative.SingleNodeTransitionProof
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;NUMA;Memory;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60)
+
+add_v2_test(V2_Integration_NUMAFirstTouchRemoteRAMPlacement_MultiRAMNode
+    COMMAND $<TARGET_FILE:v2_test_numa_first_touch_boundary_native>
+            --gtest_filter=FirstTouchBoundaryNative.RemoteRAMPlacementMultiRAMNode
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;NUMA;Memory;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60)
+
+
+target_link_libraries(v2_test_placement_topology llaminar2_core llaminar_placement_topology GTest::gtest GTest::gtest_main)
+# A-2c + roadmap-3 substrate registrations (added on top of the A-3 v6 tree; the v6
+# preserved placement/first-touch registrations remain UNCHANGED)
+
+add_executable(v2_test_admission_gate unit/execution/serving/Test__AdmissionGate.cpp)
+target_link_libraries(v2_test_admission_gate llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_AdmissionGate
+    COMMAND $<TARGET_FILE:v2_test_admission_gate>
+    LABELS "V2;Unit;Serving;ContinuousBatching;Admission;Backpressure;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+
+add_executable(v2_test_shared_execution_proof unit/execution/serving/Test__SharedExecutionProof.cpp)
+target_link_libraries(v2_test_shared_execution_proof llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_SharedExecutionProof
+    COMMAND $<TARGET_FILE:v2_test_shared_execution_proof>
+    LABELS "V2;Unit;Serving;ContinuousBatching;SharedExecution;Acceptance;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+
+add_executable(v2_test_ragged_row_compaction unit/execution/serving/Test__RaggedRowCompaction.cpp)
+target_link_libraries(v2_test_ragged_row_compaction llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_RaggedRowCompaction
+    COMMAND $<TARGET_FILE:v2_test_ragged_row_compaction>
+    LABELS "V2;Unit;Serving;ContinuousBatching;Ragged;Compaction;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+
+add_executable(v2_test_physical_mode_classification unit/execution/serving/Test__PhysicalModeClassification.cpp)
+target_link_libraries(v2_test_physical_mode_classification llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_PhysicalModeClassification
+    COMMAND $<TARGET_FILE:v2_test_physical_mode_classification>
+    LABELS "V2;Unit;Serving;ContinuousBatching;Memory;Modes;FailClosed;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+
+add_executable(v2_test_path_evidence_counters unit/execution/serving/Test__PathEvidenceCounters.cpp)
+target_link_libraries(v2_test_path_evidence_counters llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_PathEvidenceCounters
+    COMMAND $<TARGET_FILE:v2_test_path_evidence_counters>
+    LABELS "V2;Unit;Serving;ContinuousBatching;Observability;PerfStats;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+
+add_executable(v2_test_output_grant_budget unit/execution/serving/Test__OutputGrantBudget.cpp)
+target_link_libraries(v2_test_output_grant_budget llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_OutputGrantBudget
+    COMMAND $<TARGET_FILE:v2_test_output_grant_budget>
+    LABELS "V2;Unit;Serving;ContinuousBatching;Budget;Output;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+
+add_executable(v2_test_stop_think_history unit/execution/serving/Test__StopThinkAndHistory.cpp)
+target_link_libraries(v2_test_stop_think_history llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_StopThinkHistory
+    COMMAND $<TARGET_FILE:v2_test_stop_think_history>
+    LABELS "V2;Unit;Serving;ContinuousBatching;StopThink;History;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+
+add_executable(v2_test_scheduling_policy unit/execution/serving/Test__SchedulingPolicy.cpp)
+target_link_libraries(v2_test_scheduling_policy llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_SchedulingPolicy
+    COMMAND $<TARGET_FILE:v2_test_scheduling_policy>
+    LABELS "V2;Unit;Serving;ContinuousBatching;Scheduling;AntiStarvation;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+
+add_executable(v2_test_multi_device_identity unit/execution/serving/Test__MultiDeviceIdentity.cpp)
+target_link_libraries(v2_test_multi_device_identity llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_MultiDeviceIdentity
+    COMMAND $<TARGET_FILE:v2_test_multi_device_identity>
+    LABELS "V2;Unit;Serving;ContinuousBatching;MultiDevice;Identity;Agreement;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+
+add_executable(v2_test_storage_io_coordinator unit/execution/serving/Test__StorageIOCoordinator.cpp)
+target_link_libraries(v2_test_storage_io_coordinator llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_StorageIOCoordinator
+    COMMAND $<TARGET_FILE:v2_test_storage_io_coordinator>
+    LABELS "V2;Unit;Serving;ContinuousBatching;Prefix;Storage;IO;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+
+add_executable(v2_test_terminal_arbitration unit/execution/serving/Test__TerminalArbitration.cpp)
+target_link_libraries(v2_test_terminal_arbitration llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_TerminalArbitration
+    COMMAND $<TARGET_FILE:v2_test_terminal_arbitration>
+    LABELS "V2;Unit;Serving;ContinuousBatching;Arbitration;ExactlyOnce;Lifecycle;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+
+add_executable(v2_test_prefill_decode_handoff unit/execution/serving/Test__PrefillDecodeHandoff.cpp)
+target_link_libraries(v2_test_prefill_decode_handoff llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_PrefillDecodeHandoff
+    COMMAND $<TARGET_FILE:v2_test_prefill_decode_handoff>
+    LABELS "V2;Unit;Serving;ContinuousBatching;Handoff;Prefill;Decode;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+
+add_executable(v2_test_window_grant unit/execution/serving/Test__WindowGrant.cpp)
+target_link_libraries(v2_test_window_grant llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_WindowGrant
+    COMMAND $<TARGET_FILE:v2_test_window_grant>
+    LABELS "V2;Unit;Serving;ContinuousBatching;Grants;Backpressure;Scheduling;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+
+add_executable(v2_test_mtp_row_policy unit/execution/serving/Test__MTPRowPolicy.cpp)
+target_link_libraries(v2_test_mtp_row_policy llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_MTPRowPolicy
+    COMMAND $<TARGET_FILE:v2_test_mtp_row_policy>
+    LABELS "V2;Unit;Serving;ContinuousBatching;MTP;Verifier;ExactlyOnce;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+
+add_executable(v2_test_serving_row_state unit/execution/serving/Test__ServingRowState.cpp)
+target_link_libraries(v2_test_serving_row_state llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_ServingRowState
+    COMMAND $<TARGET_FILE:v2_test_serving_row_state>
+    LABELS "V2;Unit;Serving;ContinuousBatching;Rows;Identity;Lifecycle;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+
+add_executable(v2_test_sampler_law unit/execution/serving/Test__SamplerLaw.cpp)
+target_link_libraries(v2_test_sampler_law llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_SamplerLaw
+    COMMAND $<TARGET_FILE:v2_test_sampler_law>
+    LABELS "V2;Unit;Serving;ContinuousBatching;Sampling;Laws;Memory;BOM;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+
+add_executable(v2_test_request_intrinsic_coordinates unit/execution/serving/Test__RequestIntrinsicCoordinates.cpp)
+target_link_libraries(v2_test_request_intrinsic_coordinates llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_RequestIntrinsicCoordinates
+    COMMAND $<TARGET_FILE:v2_test_request_intrinsic_coordinates>
+    LABELS "V2;Unit;Serving;ContinuousBatching;Sampling;RNG;Window;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+
+add_executable(v2_test_serving_capacity_intent unit/execution/config/Test__ServingCapacityIntent.cpp)
+target_link_libraries(v2_test_serving_capacity_intent llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_ServingCapacityIntent
+    COMMAND $<TARGET_FILE:v2_test_serving_capacity_intent>
+    LABELS "V2;Unit;Serving;ContinuousBatching;Config;Knobs;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+
+add_executable(v2_test_serving_http_pool_contract unit/execution/config/Test__ServingHttpPoolContract.cpp)
+target_link_libraries(v2_test_serving_http_pool_contract llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_ServingHttpPoolContract
+    COMMAND $<TARGET_FILE:v2_test_serving_http_pool_contract>
+    LABELS "V2;Unit;Serving;ContinuousBatching;HTTP;Pool;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+
+add_executable(v2_test_serving_publication_drain unit/app/modes/Test__ServingPublicationDrain.cpp)
+target_link_libraries(v2_test_serving_publication_drain llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_ServingPublicationDrain
+    COMMAND $<TARGET_FILE:v2_test_serving_publication_drain>
+    LABELS "V2;Unit;Serving;ContinuousBatching;Publication;Lifetimes;ExactlyOnce;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_ServingSamplerLawPolicies
+    COMMAND $<TARGET_FILE:v2_test_sampler_law>
+    LABELS "V2;Integration;ProductionTestPreflight;Serving;ContinuousBatching;Sampler;Laws;Memory;Regression;DeviceFree"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_ServingIntrinsicCoordinates
+    COMMAND $<TARGET_FILE:v2_test_request_intrinsic_coordinates>
+    LABELS "V2;Integration;ProductionTestPreflight;Serving;ContinuousBatching;RNG;Windows;Overflow;Regression;DeviceFree"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_ServingStopThinkPolicies
+    COMMAND $<TARGET_FILE:v2_test_stop_think_history>
+    LABELS "V2;Integration;ProductionTestPreflight;Serving;ContinuousBatching;StopThink;History;Regression;DeviceFree"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_ServingOutputBudgetPolicies
+    COMMAND $<TARGET_FILE:v2_test_output_grant_budget>
+    LABELS "V2;Integration;ProductionTestPreflight;Serving;ContinuousBatching;Budget;Windows;Regression;DeviceFree"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_PathEvidenceCounterPolicies
+    COMMAND $<TARGET_FILE:v2_test_path_evidence_counters>
+    LABELS "V2;Integration;ProductionTestPreflight;Serving;ContinuousBatching;Observability;Counters;Regression;DeviceFree"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_TerminalArbitrationPolicies
+    COMMAND $<TARGET_FILE:v2_test_terminal_arbitration>
+    LABELS "V2;Integration;ProductionTestPreflight;Serving;ContinuousBatching;Arbitration;Outcomes;Regression;DeviceFree"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+
+add_v2_test(V2_Integration_ServingPolicyContractRegressions
+    COMMAND $<TARGET_FILE:v2_test_window_grant>
+    LABELS "V2;Integration;ProductionTestPreflight;Serving;ContinuousBatching;Policy;Grants;Aging;Regression;DeviceFree"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_ServingRowPolicyRegressions
+    COMMAND $<TARGET_FILE:v2_test_serving_row_state>
+    LABELS "V2;Integration;ProductionTestPreflight;Serving;ContinuousBatching;Rows;Continuation;Regression;DeviceFree"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_ServingAdmissionPolicyRegressions
+    COMMAND $<TARGET_FILE:v2_test_admission_gate>
+    LABELS "V2;Integration;ProductionTestPreflight;Serving;ContinuousBatching;Admission;Backpressure;Regression;DeviceFree"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_RaggedCompactionPolicyRegressions
+    COMMAND $<TARGET_FILE:v2_test_ragged_row_compaction>
+    LABELS "V2;Integration;ProductionTestPreflight;Serving;ContinuousBatching;Ragged;Bijection;Regression;DeviceFree"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_MTPPolicyRegressions
+    COMMAND $<TARGET_FILE:v2_test_mtp_row_policy>
+    LABELS "V2;Integration;ProductionTestPreflight;Serving;ContinuousBatching;MTP;Verifier;ExactlyOnce;Regression;DeviceFree"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+
+add_v2_test(V2_Integration_ServingSemanticContractRegressions
+    COMMAND $<TARGET_FILE:v2_test_shared_execution_proof>
+    LABELS "V2;Integration;ProductionTestPreflight;Serving;ContinuousBatching;Semantic;Lifecycle;Grants;Restore;Regression;DeviceFree"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 60)
+
+add_v2_test(V2_Integration_ServingPublicationCompletionRegressions
+    COMMAND $<TARGET_FILE:v2_test_serving_publication_drain>
+    LABELS "V2;Integration;ProductionTestPreflight;Serving;ContinuousBatching;Publication;Lifetimes;Regression;DeviceFree"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+
+add_executable(v2_test_serving_pool_memory_demand unit/execution/config/Test__ServingPoolMemoryDemand.cpp)
+target_link_libraries(v2_test_serving_pool_memory_demand llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_ServingPoolMemoryDemand
+    COMMAND $<TARGET_FILE:v2_test_serving_pool_memory_demand>
+    LABELS "V2;Unit;Serving;ContinuousBatching;Memory;Planning;PMA;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_ServingPoolPMAChargeContract
+    COMMAND $<TARGET_FILE:v2_test_serving_pool_memory_demand>
+    LABELS "V2;Integration;ProductionTestPreflight;Serving;ContinuousBatching;Memory;Planning;PMA;Regression;DeviceFree"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+
+add_executable(v2_test_serving_pool_pma_reservation unit/app/modes/Test__ServingPoolPmaReservation.cpp)
+target_link_libraries(v2_test_serving_pool_pma_reservation llaminar2_core GTest::gtest GTest::gtest_main)
+target_include_directories(v2_test_serving_pool_pma_reservation PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+add_v2_test(V2_Unit_ServingPoolPmaReservation
+    COMMAND $<TARGET_FILE:v2_test_serving_pool_pma_reservation>
+    LABELS "V2;Unit;Serving;ContinuousBatching;Memory;Planning;PMA;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_ServingPoolPmaReservationContract
+    COMMAND $<TARGET_FILE:v2_test_serving_pool_pma_reservation>
+    LABELS "V2;Integration;ProductionTestPreflight;Serving;ContinuousBatching;Memory;Planning;PMA;Regression;DeviceFree"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
 
 # Report, never hide, every registration omitted (after all includes) because their compiled backend
 # family is absent from this build (for example a CPU-only build).

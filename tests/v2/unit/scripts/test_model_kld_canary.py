@@ -527,10 +527,25 @@ class ModelKLDPackagingTests(unittest.TestCase):
                 (root/'CMakeCache.txt').write_text(f'MPI_mpi_LIBRARY:FILEPATH={mpi_library}\n')
                 binary.write_bytes(b'placeholder native observer')
                 inventory=installed.inventory(root);self.assertIn(binary.name,inventory['files'])
-                receipt=root/'receipt.json';receipt.write_text(json.dumps(dict(
-                    schema=1,scope=installed.InstalledTestScope.PRODUCTION.value,inventory=inventory)))
+                # The modeled registration carries the ProductionTestPreflight
+                # label, so this fixture is a production-scope admission: the
+                # receipt must name exactly the scope its inventory was built
+                # for — the caller's typed scope, not a free-form default.
+                scope=installed.InstalledTestScope.PRODUCTION.value
+                receipt=root/'receipt.json';receipt.write_text(json.dumps(dict(schema=1,scope=scope,inventory=inventory)))
                 installed.validate(receipt,root)
                 binary.write_bytes(b'changed binary')
                 with self.assertRaises(ValueError):installed.validate(receipt,root)
+                # A receipt without any scope cannot admit any inventory.
+                scopeless=root/'scopeless-receipt.json'
+                scopeless.write_text(json.dumps(dict(schema=1,inventory=inventory)))
+                with self.assertRaises(ValueError):installed.validate(scopeless,root)
+                # A unit-scope receipt cannot certify this production-modeled
+                # tree: validate against the production scope rejects it, and
+                # the typed API rejects a bare string scope outright.
+                unit=root/'unit-receipt.json'
+                unit.write_text(json.dumps(dict(schema=1,scope=installed.InstalledTestScope.UNIT.value,inventory=inventory)))
+                with self.assertRaises(ValueError):installed.validate(unit,root)
+                with self.assertRaises(TypeError):installed.validate(receipt,root,'production')
 
 if __name__=='__main__':unittest.main()

@@ -211,6 +211,12 @@ namespace
         std::vector<std::string> validateConfig(const OrchestrationConfig &config,
             const ModelConfig &model, const ClusterInventory &cluster) override
         { return compiler_.validateConfig(config, model, cluster); }
+        /** @return Production topology (the mutation pipeline keeps this
+         *  interface complete); the authority-source method delegates to the
+         *  real compiler on the same inputs. */
+        GlobalPPTopology buildGlobalPPTopology(const OrchestrationConfig &config,
+            const ModelConfig &model, const ClusterInventory &cluster) override
+        { return compiler_.buildGlobalPPTopology(config, model, cluster); }
     private:
         ExecutionPlanBuilder compiler_;
         std::function<void(RankExecutionPlan &)> mutate_;
