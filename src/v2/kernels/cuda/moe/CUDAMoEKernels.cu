@@ -18985,11 +18985,50 @@ __global__ void softmax_topk_decode_descriptors_kernel(
     static_assert(moe_iq3_signs_are_canonical<llaminar2::iq3xxs_grid>());
 #endif
 
+    /** @brief Register schedule for the eight sign selectors of an IQ2 group. */
+    enum class NativeMoEIQ2SignSchedule : uint8_t
+    {
+        RegisterShifts,
+        IndependentProducts,
+    };
+
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ == 860
+    /**
+     * @brief Deposit eight source sign bits directly into the PRMT sign selectors.
+     * @param signs Original byte of IQ2 signs.
+     * @return Bit two of each nibble set from its corresponding source bit.
+     */
+    __host__ __device__ __forceinline__ constexpr uint32_t moe_iq2_independent_sign_selectors(uint32_t signs)
+    {
+        // Even and odd source positions issue independently. Carries between
+        // off-diagonal terms land outside the selected bit positions.
+        const uint32_t even = ((signs & 0x55u) * 0x104104u) & 0x04040404u;
+        const uint32_t odd = (((signs >> 1) & 0x55u) * 0x1041040u) & 0x40404040u;
+        return even | odd;
+    }
+
+    /** @brief Verify all original IQ2 sign bytes against the scalar selector layout. */
+    consteval bool moe_iq2_independent_sign_selectors_are_canonical()
+    {
+        for (uint32_t signs = 0; signs < 256; ++signs)
+        {
+            uint32_t expected = 0;
+            for (unsigned lane = 0; lane < 8; ++lane)
+                expected |= ((signs >> lane) & 1u) << (4 * lane + 2);
+            if (moe_iq2_independent_sign_selectors(signs) != expected)
+                return false;
+        }
+        return true;
+    }
+    static_assert(moe_iq2_independent_sign_selectors_are_canonical());
+#endif
+
     /**
      * @brief Form the eight packed signed-byte operands of an MoE K32 dot.
      * @tparam CodebookId Physical payload layout admitted for the route.
      * @tparam Order Dot schedule that owns this packet.
      * @tparam SharedIQ3 Read the canonical IQ3 table prepared by this Down CTA.
+     * @tparam SignSchedule IQ2's prepared-selector arithmetic schedule.
      * @param payload Address of one prepared packet. Q2_K and Q6_K packets
      *        and IQ2_XXS start on eight-byte boundaries. Q3_K, Q5_0 and
      *        IQ3_XXS start on four-byte boundaries.
@@ -18997,7 +19036,8 @@ __global__ void softmax_topk_decode_descriptors_kernel(
      * @param groups Decoded operands in the original DP4A order.
      * @param iq3_table Shared canonical IQ3 words when the CTA owns their copy.
      */
-    template <uint8_t CodebookId, NativeMoEDotOrder Order, bool SharedIQ3 = false>
+    template <uint8_t CodebookId, NativeMoEDotOrder Order, bool SharedIQ3 = false,
+              NativeMoEIQ2SignSchedule SignSchedule = NativeMoEIQ2SignSchedule::RegisterShifts>
     __device__ __forceinline__ void decode_moe_native_quantised_packet(
         const uint8_t *payload, int32_t (&groups)[8], const uint32_t *iq3_table = nullptr)
     {
@@ -19067,10 +19107,18 @@ __global__ void softmax_topk_decode_descriptors_kernel(
                     magnitudes = __ldg(moe_iq2_xxs_selectors.words + index);
 
                 const uint32_t signs = (packet.signs >> (8 * group)) & 0xffu;
-                const uint32_t halves = (signs | (signs << 12)) & 0x000f000fu;
-                const uint32_t pairs = (halves | (halves << 6)) & 0x03030303u;
-                const uint32_t lanes = (pairs | (pairs << 3)) & 0x11111111u;
-                const uint32_t selectors = magnitudes | (lanes << 2);
+                const uint32_t sign_selectors = [&] {
+                    if constexpr (SignSchedule == NativeMoEIQ2SignSchedule::IndependentProducts)
+                        return moe_iq2_independent_sign_selectors(signs);
+                    else
+                    {
+                        const uint32_t halves = (signs | (signs << 12)) & 0x000f000fu;
+                        const uint32_t pairs = (halves | (halves << 6)) & 0x03030303u;
+                        const uint32_t lanes = (pairs | (pairs << 3)) & 0x11111111u;
+                        return lanes << 2;
+                    }
+                }();
+                const uint32_t selectors = magnitudes | sign_selectors;
                 groups[2 * group] = static_cast<int32_t>(__byte_perm(kPositive, kNegative, selectors));
                 groups[2 * group + 1] = static_cast<int32_t>(__byte_perm(kPositive, kNegative, selectors >> 16));
             }
@@ -20553,6 +20601,7 @@ __global__ void softmax_topk_decode_descriptors_kernel(
      * @tparam PacketOrder Equivalent packed integer operand schedule, independent
      *         of the fixed FP32 split-K publication order below.
      * @tparam SplitIQ1SDot Use the measured independent integer chains for IQ1_S.
+     * @tparam SignSchedule The packed IQ2 sign arithmetic selected with the tile.
      * @param gate Original admitted Gate planes.
      * @param up Original admitted Up planes.
      * @param activations Aligned original Q8 activation row.
@@ -20566,7 +20615,8 @@ __global__ void softmax_topk_decode_descriptors_kernel(
      */
     template <uint8_t CodebookId, int Pitch, int Packets,
               NativeMoEDotOrder PacketOrder = NativeMoEDotOrder::PartitionPartial,
-              bool SplitIQ1SDot = false>
+              bool SplitIQ1SDot = false,
+              NativeMoEIQ2SignSchedule SignSchedule = NativeMoEIQ2SignSchedule::RegisterShifts>
     __device__ __forceinline__ void native_quantised_gate_up_fixed_partition(
         const DeviceNativeQuantisedMatrixDesc &gate, const DeviceNativeQuantisedMatrixDesc &up,
         const int8_t *activations, const float *activation_scales,
@@ -20599,7 +20649,7 @@ __global__ void softmax_topk_decode_descriptors_kernel(
             const auto contribution = [&](const DeviceNativeQuantisedMatrixDesc &desc) {
                 const uint8_t *payload = desc.payload + linear * payload_bytes;
                 int32_t weights[8];
-                decode_moe_native_quantised_packet<CodebookId, PacketOrder>(payload, weights);
+                decode_moe_native_quantised_packet<CodebookId, PacketOrder, false, SignSchedule>(payload, weights);
                 return moe_native_quantised_block_contribution_rn<CodebookId, PacketOrder, false, SplitIQ1SDot>(
                     codes, weights, payload, static_cast<const uint16_t *>(desc.scales),
                     static_cast<const uint16_t *>(desc.mins), static_cast<const uint32_t *>(desc.emins),
@@ -21098,7 +21148,9 @@ __global__ void softmax_topk_decode_descriptors_kernel(
         if constexpr (Pitch > 0)
         {
             constexpr bool split_iq1_s = ExactTile > 0 && CodebookId == native_formats::IQ1_S.codebook_id;
-            native_quantised_gate_up_fixed_partition<CodebookId, Pitch, Packets, PacketOrder, split_iq1_s>(
+            constexpr auto signs = ExactTile > 0 && CodebookId == native_formats::IQ2_XS.codebook_id
+                ? NativeMoEIQ2SignSchedule::IndependentProducts : NativeMoEIQ2SignSchedule::RegisterShifts;
+            native_quantised_gate_up_fixed_partition<CodebookId, Pitch, Packets, PacketOrder, split_iq1_s, signs>(
                 gate_desc, up_desc, slot_A, slot_scales, n, b_start, gate_partial, up_partial);
         }
         else
@@ -21109,6 +21161,23 @@ __global__ void softmax_topk_decode_descriptors_kernel(
         }
         gate_partials[partial_index] = gate_partial;
         up_partials[partial_index] = up_partial;
+    }
+
+    /**
+     * @brief Apply the canonical reciprocal to a widened positive half scale.
+     * @param scale Scale published by the bounded QFN SwiGLU conversion.
+     * @return The exact reciprocal word from the original Newton order.
+     * @pre Scale is a positive, finite binary16 value widened to binary32.
+     *      Its reciprocal and its widened representation are both normal in
+     *      binary32, including when the original half value is subnormal.
+     */
+    __device__ __forceinline__ float qfn_swiglu_scale_inverse(float scale)
+    {
+        const uint32_t bits = __float_as_uint(scale);
+        const float normalized = __uint_as_float(0x3f800000u | (bits & 0x007fffffu));
+        const float inverse = llaminar2::device_fp32_contract::reciprocalOneToTwo(normalized);
+        const uint32_t exponent_adjustment = 0x3f800000u - (bits & 0x7f800000u);
+        return __uint_as_float(__float_as_uint(inverse) + exponent_adjustment);
     }
 
     /**
@@ -21211,10 +21280,13 @@ __global__ void softmax_topk_decode_descriptors_kernel(
 
         if (active)
         {
+            int32_t code;
+            if constexpr (FixedColumns > 0)
+                code = quantizePreparedInverse(value, qfn_swiglu_scale_inverse(scale));
+            else
+                code = quantize(value, scale);
             swiglu_int8[static_cast<size_t>(grouped_slot) * static_cast<size_t>(N) + static_cast<size_t>(n)] =
-                static_cast<int8_t>(
-                    llaminar2::device_q8_activation_contract::quantize(
-                        value, scale));
+                static_cast<int8_t>(code);
         }
     }
 

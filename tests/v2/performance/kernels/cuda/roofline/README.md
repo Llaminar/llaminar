@@ -414,6 +414,15 @@ subnormal-scale, and saturated-scale packets. The IQ3_XXS stage went
 from 26.688 to 26.432 µs in the paired runs. The Release sweep measured
 26.432 µs on both cards, or 79.4–80.4% of the matched weight reference.
 
+The fixed-width publisher uses its positive binary16 scale range to
+apply the original Newton reciprocal with one FP32 exponent adjustment.
+Every positive finite half value matched the original reciprocal bits
+on both cards. The IQ2_XS tile also deposits the even and odd prepared
+sign bits independently, using 48 registers and zero shared or local
+bytes. Across six focused Release runs, Gate/Up took 27.712–27.904 µs
+for IQ2_XS and 26.304–26.368 µs for IQ3_XXS. IQ3_XXS reached 80.05–81.27%
+in those runs and 79.6–80.4% in the full-format sweep.
+
 Forcing the existing grouped INT8 tensor-core engine at four rows
 preserved serial output bytes on the six low-bit sources. The complete
 captured transaction, including routing and publication, ranged from
