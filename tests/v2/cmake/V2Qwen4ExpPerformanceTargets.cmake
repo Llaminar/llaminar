@@ -14,9 +14,12 @@ target_link_libraries(v2_perf_qwen_sparse_selection PRIVATE llaminar2_core GTest
 if(HAVE_CUDA)
     # Same-card hardware references have no model or runtime-core dependency.
     add_executable(v2_perf_cuda_decode_roofline EXCLUDE_FROM_ALL
-        "${_qfn_test_sources}/performance/kernels/cuda/roofline/CUDADecodeRoofline.cu")
+        "${_qfn_test_sources}/performance/kernels/cuda/roofline/CUDADecodeRoofline.cu"
+        "${_qfn_test_sources}/performance/kernels/cuda/roofline/CUDAHCFFNRooflineWork.cpp")
     set_target_properties(v2_perf_cuda_decode_roofline PROPERTIES
-        CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
+        CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+    target_include_directories(v2_perf_cuda_decode_roofline PRIVATE
+        "${_qfn_test_sources}" "${_qfn_test_sources}/../../src/v2")
     target_link_libraries(v2_perf_cuda_decode_roofline PRIVATE CUDA::cudart)
 
     # Same native-event fixture and original graph metadata; no profiler attachment.

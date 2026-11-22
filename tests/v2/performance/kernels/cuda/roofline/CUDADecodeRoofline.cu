@@ -1,6 +1,6 @@
 /**
  * @file CUDADecodeRoofline.cu
- * @brief Calibrate same-device read and integer compute rates for CUDA decode.
+ * @brief Calibrate same-device read and arithmetic issue rates for CUDA decode.
  *
  * The probe owns one stream and captures its timed launches before sampling.
  * Host verification observes every output lane outside the measured interval.
@@ -15,8 +15,15 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <string_view>
 #include <vector>
+
+namespace llaminar2::test
+{
+    /** @brief Emit the exact local HC/FFN work coordinates without opening a CUDA device. */
+    int cudaHCFFNRooflineWork(int argc, char** argv);
+}
 
 namespace
 {
@@ -43,8 +50,10 @@ namespace
     constexpr unsigned mmaChains = 8;
     constexpr unsigned issueIterations = 4097;
     constexpr unsigned issueChains = 8;
+    constexpr unsigned fmaIterations = 4096;
+    constexpr unsigned fmaChains = 8;
 
-    enum class Kernel { Read, Dp4a, BytePermute, Imma, Logic, MixedInteger };
+    enum class Kernel { Read, Dp4a, BytePermute, Imma, Logic, MixedInteger, Fma };
 
     /** @brief Generate distinct deterministic words for each input vector. */
     __host__ __device__ uint4 inputAt(unsigned index)
@@ -129,6 +138,36 @@ namespace
         for (unsigned chain = 0; chain < dotChains; ++chain)
             sum += accumulators[chain];
         output[thread] = sum;
+    }
+
+    /**
+     * @brief Measure independent scalar FP32 issue at the requested CTA geometry.
+     * @param output One checksum per lane encoded as its exact FP32 bits.
+     * @details Eight independent accumulators keep dependency latency out of
+     * the issue reference. Integer-valued operands keep every accumulator and
+     * the final checksum within the exact binary32 integer range.
+     */
+    __global__ void decodeFmaCeiling(uint32_t* output)
+    {
+        const unsigned thread = blockIdx.x * blockDim.x + threadIdx.x;
+        const float left = static_cast<float>(thread & 63u);
+        float accumulators[fmaChains]{};
+        #pragma unroll 1
+        for (unsigned iteration = 0; iteration < fmaIterations; ++iteration)
+        {
+            #pragma unroll
+            for (unsigned chain = 0; chain < fmaChains; ++chain)
+            {
+                const float right = static_cast<float>(chain + 1);
+                asm volatile("fma.rn.f32 %0, %1, %2, %0;"
+                    : "+f"(accumulators[chain]) : "f"(left), "f"(right));
+            }
+        }
+        float sum = 0.0f;
+        #pragma unroll
+        for (unsigned chain = 0; chain < fmaChains; ++chain)
+            sum += accumulators[chain];
+        output[thread] = __float_as_uint(sum);
     }
 
     /**
@@ -275,6 +314,8 @@ namespace
                     (kernel == Kernel::MixedInteger ? 4u : 1u);
             if (kernel == Kernel::Dp4a)
                 return uint64_t(blocks) * threadsPerBlock * dotIterations * dotChains;
+            if (kernel == Kernel::Fma)
+                return uint64_t(blocks) * threadsPerBlock * fmaIterations * fmaChains;
             if (kernel == Kernel::BytePermute)
                 return uint64_t(blocks) * threadsPerBlock * permuteIterations * permuteChains;
             if (kernel == Kernel::Imma)
@@ -311,6 +352,9 @@ namespace
         {
             if (probe.kernel == Kernel::Dp4a)
                 decodeDp4aCeiling<<<probe.blocks, threadsPerBlock, 0, stream>>>(
+                    reinterpret_cast<uint32_t*>(output));
+            else if (probe.kernel == Kernel::Fma)
+                decodeFmaCeiling<<<probe.blocks, threadsPerBlock, 0, stream>>>(
                     reinterpret_cast<uint32_t*>(output));
             else if (probe.kernel == Kernel::BytePermute)
                 decodeBytePermuteCeiling<<<probe.blocks, threadsPerBlock, 0, stream>>>(
@@ -365,6 +409,12 @@ namespace
                 {
                     constexpr unsigned sumOfCoefficients = dotChains * (dotChains + 1) / 2;
                     expected = (thread & 127U) * 4 * dotIterations * sumOfCoefficients;
+                }
+                else if (probe.kernel == Kernel::Fma)
+                {
+                    constexpr unsigned sumOfCoefficients = fmaChains * (fmaChains + 1) / 2;
+                    const float value = static_cast<float>((thread & 63u) * fmaIterations * sumOfCoefficients);
+                    expected = std::bit_cast<uint32_t>(value);
                 }
                 else if (probe.kernel == Kernel::Logic || probe.kernel == Kernel::MixedInteger)
                 {
@@ -431,10 +481,12 @@ namespace
 /** @brief Admit one explicit device and run exactly one reference regime. */
 int main(int argc, char** argv)
 {
+    if (argc >= 2 && std::string_view(argv[1]) == "hc-ffn-work")
+        return llaminar2::test::cudaHCFFNRooflineWork(argc, argv);
     int device = -1;
-    if (argc != 3)
+    if (argc != 3 && argc != 4)
     {
-        std::fprintf(stderr, "Usage: %s <cuda-device> <dram|l2|dp4a|prmt|imma|lop3|int-mix>\n", argv[0]);
+        std::fprintf(stderr, "Usage: %s <cuda-device> <dram|l2|dp4a|prmt|imma|lop3|int-mix|ffma> [blocks]\n", argv[0]);
         return EXIT_FAILURE;
     }
     const std::string_view ordinal(argv[1]);
@@ -442,7 +494,8 @@ int main(int argc, char** argv)
     const std::string_view mode(argv[2]);
     if (parsed.ec != std::errc{} || parsed.ptr != ordinal.data() + ordinal.size() ||
         device < 0 || (mode != "dram" && mode != "l2" && mode != "dp4a" &&
-                        mode != "prmt" && mode != "imma" && mode != "lop3" && mode != "int-mix"))
+                        mode != "prmt" && mode != "imma" && mode != "lop3" && mode != "int-mix" &&
+                        mode != "ffma"))
         return EXIT_FAILURE;
 
     CUDA_CHECK(cudaSetDevice(device));
@@ -456,13 +509,26 @@ int main(int argc, char** argv)
     const auto sms = static_cast<unsigned>(properties.multiProcessorCount);
     const auto kernel = mode == "dp4a" ? Kernel::Dp4a : mode == "prmt" ? Kernel::BytePermute :
         mode == "imma" ? Kernel::Imma : mode == "lop3" ? Kernel::Logic :
-        mode == "int-mix" ? Kernel::MixedInteger : Kernel::Read;
+        mode == "int-mix" ? Kernel::MixedInteger : mode == "ffma" ? Kernel::Fma : Kernel::Read;
     if (kernel == Kernel::Imma && properties.major < 8)
     {
         std::fprintf(stderr, "The dense INT8 m16n8k32 reference requires SM80 or newer\n");
         return EXIT_FAILURE;
     }
     Probe probe{.name = mode, .blocks = 4 * sms, .vectors = 0, .passes = 1, .kernel = kernel};
+    const bool explicitBlocks = argc == 4;
+    if (explicitBlocks)
+    {
+        const std::string_view argument(argv[3]);
+        const auto count = std::from_chars(argument.data(), argument.data() + argument.size(), probe.blocks);
+        if (count.ec != std::errc{} || count.ptr != argument.data() + argument.size() || !probe.blocks ||
+            probe.blocks > static_cast<unsigned>(properties.maxGridSize[0]) ||
+            probe.blocks > std::numeric_limits<unsigned>::max() / (4 * threadsPerBlock))
+        {
+            std::fprintf(stderr, "Invalid native CTA count\n");
+            return EXIT_FAILURE;
+        }
+    }
     if (kernel == Kernel::Read)
     {
         const size_t l2Bytes = properties.l2CacheSize;
@@ -474,8 +540,16 @@ int main(int argc, char** argv)
         if (mode == "l2")
         {
             // Four interleaved loads per thread still have to fit in half L2.
-            probe.blocks = std::min<size_t>(probe.blocks, targetBytes / bytesPerBlock);
-            probe.blocks = probe.blocks / sms * sms;
+            if (explicitBlocks && probe.blocks > targetBytes / bytesPerBlock)
+            {
+                std::fprintf(stderr, "Requested CTA count cannot address a complete stripe inside half L2\n");
+                return EXIT_FAILURE;
+            }
+            if (!explicitBlocks)
+            {
+                probe.blocks = std::min<size_t>(probe.blocks, targetBytes / bytesPerBlock);
+                probe.blocks = probe.blocks / sms * sms;
+            }
         }
         if (!probe.blocks)
         {

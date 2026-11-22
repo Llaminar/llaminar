@@ -54,6 +54,87 @@ collectives on its critical path.
 
 ## RTX 3090 reference measurements
 
+### Resident HC, router, and FFN
+
+The [MI50 calibration](../../../../../../docs/v2/projects/2026-11/QFN_MI50_EMPIRICAL_COMPUTE_MEMORY_REFERENCE.md)
+defines 15 original source tuples at M1, H2560, HC rank 320, routed/shared
+widths 256/256, 512 experts and ten selected routes. The CUDA probe reads that
+same source roster. It also emits the other QFN main-model and Q8_0 drafter
+tuples. Run the estimator with the prepared widths and the actual number of
+local routes for each participant. An incompatible original K block is
+reported without a score.
+
+The table uses 63 checksum-verified samples per cell, collected in three
+fresh processes with reversed device and probe order. Each process records
+the native PCI ID and launches one exact mode. CTA width is 256 threads.
+
+| PCI | CTAs | DRAM GB/s | L2 GB/s | DP4A Ginst/s | FP32 FMA Ginst/s | PRMT Ginst/s | Mixed INT Ginst/s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `0000:3f:00.0` | 82 | 886.17 | 2,304.44 | 8,223.34 | 8,788.15 | 8,016.80 | 12,548.03 |
+| `0000:42:00.0` | 82 | 886.17 | 2,348.79 | 8,344.65 | 8,919.42 | 8,138.17 | 12,726.28 |
+| `0000:3f:00.0` | 164 | 885.66 | 2,350.81 | 9,028.06 | 12,151.39 | 7,984.05 | 13,046.76 |
+| `0000:42:00.0` | 164 | 885.66 | 2,387.36 | 9,127.73 | 12,248.32 | 8,147.43 | 13,427.67 |
+
+Pass an explicit CTA count as the final hardware probe argument. For example,
+record 82- and 164-CTA captures on each card for `dram`, `l2`, `dp4a`, `ffma`,
+`prmt` and `int-mix`, then pass the receipts to the scorer.
+
+```sh
+"$PROBE" 0 ffma 82 > device0-82-ffma.csv
+"$PROBE" hc-ffn-work 2560 320 256 256 512 10 10 > family-work.csv
+"$PROBE" hc-ffn-work 2560 320 640 320 512 10 5 > overlay-work.csv
+python3 tests/v2/performance/kernels/cuda/roofline/score_hc_ffn.py \
+    family-work.csv "$CALIBRATIONS"/*.csv > family-reference.csv
+```
+
+The scorer takes the dominant read or useful arithmetic time for each ordered
+phase and adds the phases. HC Down and the paired HC Up count their Q8_0
+weights once. The paired Up counts both integer MACs. Routing counts the
+prepared FP16 weight and scalar FP32 MACs. The FFN counts both Gate/Up roles
+and one Down role for each live local route and the always-active shared
+expert. Integer MACs use four per DP4A. The named mixed and PRMT probes can
+explain instruction pressure once the exact reader instruction mix is known.
+
+The 15 common tuples span 7.97–10.75 µs for ideal L2 delivery on PCI3f at
+82 CTAs, and 20.73–27.96 µs for one DRAM stream of every compulsory weight
+request. At F640/S320, the Q4_K/Q5_1/Q8_0 model tuple's streaming reference
+is 13.76, 32.25, or 50.74 µs with 0, 5, or 10 local routed experts.
+The L2 estimate is an optimistic reference. The DRAM estimate assumes every
+compulsory weight request reaches DRAM once. These estimates exclude packet
+decode and correction, activation and output traffic, routing metadata,
+barriers, launch costs and the collective. Use graph event times for the
+complete transaction and capture contents for launch accounting. A lower
+bound or a ratio using requested bytes cannot establish physical bandwidth
+or end-to-end throughput.
+
+The staged CUDA comparator below used native graph events from the attention
+write through the local routed slots and weighted shared output. It ran the
+15 original source combinations at F256/S256 with ten local routes, using
+deterministic synthetic prepared planes. Each 21-node graph repeated two
+passes per card with reversed source order and 31 event samples per pass.
+Five independent initial states repeated byte-exactly. The explicit
+collective and the model loader were outside this diagnostic.
+
+| Family | Packed FFN bytes | 82-CTA DRAM reference, µs | Staged CUDA median range, µs |
+| --- | ---: | ---: | ---: |
+| G01 | 15,196,160 | 27.96 | 96.78–98.07 |
+| G02 | 12,165,120 | 24.54 | 91.94–93.27 |
+| G03 | 13,148,160 | 25.65 | 93.06–93.98 |
+| G04 | 12,165,120 | 24.54 | 96.72–97.64 |
+| G05 | 13,148,160 | 25.65 | 94.44–95.30 |
+| G06 | 12,165,120 | 24.54 | 93.20–94.17 |
+| G07 | 13,148,160 | 25.65 | 94.23–95.14 |
+| G08 | 8,785,920 | 20.73 | 105.20–106.42 |
+| G09 | 10,076,160 | 22.19 | 98.85–99.89 |
+| G10 | 10,117,120 | 22.23 | 95.49–96.50 |
+| G11 | 13,148,160 | 25.65 | 100.98–102.01 |
+| G12 | 10,731,520 | 22.93 | 101.86–102.94 |
+| G13 | 11,448,320 | 23.73 | 102.51–103.59 |
+| G14 | 13,496,320 | 26.05 | 107.11–108.20 |
+| G15 | 12,697,600 | 25.14 | 104.18–105.57 |
+
+### Independent projection and issue references
+
 Each entry is the median of 63 retained-launch samples from three fresh
 processes. The PCI endpoints are the two sm86 cards in the QFN CUDA/CPU
 qualification host.
