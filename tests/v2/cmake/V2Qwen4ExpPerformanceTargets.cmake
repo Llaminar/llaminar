@@ -11,6 +11,14 @@ add_executable(v2_perf_qwen_sparse_selection EXCLUDE_FROM_ALL
     "${_qfn_test_sources}/performance/kernels/cpu/attention/Perf__QwenSparseSelection.cpp")
 target_link_libraries(v2_perf_qwen_sparse_selection PRIVATE llaminar2_core GTest::gtest_main)
 
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND V2_CPU_TARGET_X86)
+    add_executable(v2_perf_qfn_cpu_decode_roofline EXCLUDE_FROM_ALL
+        "${_qfn_test_sources}/performance/kernels/cpu/roofline/QFNCPUDecodeRoofline.cpp")
+    set_target_properties(v2_perf_qfn_cpu_decode_roofline PROPERTIES
+        CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+    target_link_libraries(v2_perf_qfn_cpu_decode_roofline PRIVATE Threads::Threads)
+endif()
+
 if(HAVE_CUDA)
     # Same-card hardware references have no model or runtime-core dependency.
     add_executable(v2_perf_cuda_decode_roofline EXCLUDE_FROM_ALL

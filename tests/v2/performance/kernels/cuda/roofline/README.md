@@ -1,5 +1,8 @@
 # CUDA decode hardware references
 
+For concurrent host work in the hybrid QFN plan, use the paired
+[CPU NUMA and VNNI references](../../cpu/roofline/README.md).
+
 Build the explicit probe in a CUDA Release configuration. Run each mode on an
 idle card. The first record identifies the physical PCI device, ISA, SM count,
 and L2 size. Keep raw samples and the final checksum result. Repeat in fresh
