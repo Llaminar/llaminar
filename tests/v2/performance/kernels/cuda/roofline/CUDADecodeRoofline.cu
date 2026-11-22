@@ -10,6 +10,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <bit>
 #include <charconv>
 #include <cstdint>
 #include <cstdio>
@@ -36,10 +37,12 @@ namespace
     constexpr unsigned samples = 21;
     constexpr unsigned dotIterations = 4096;
     constexpr unsigned dotChains = 8;
+    constexpr unsigned permuteIterations = 4097;
+    constexpr unsigned permuteChains = 8;
     constexpr unsigned mmaIterations = 2048;
     constexpr unsigned mmaChains = 8;
 
-    enum class Kernel { Read, Dp4a, Imma };
+    enum class Kernel { Read, Dp4a, BytePermute, Imma };
 
     /** @brief Generate distinct deterministic words for each input vector. */
     __host__ __device__ uint4 inputAt(unsigned index)
@@ -127,6 +130,35 @@ namespace
     }
 
     /**
+     * @brief Drive independent PRMT chains with the byte selection used by packed IQ readers.
+     * @param output One checked modular checksum per launch thread.
+     * @details The selector rotates the four bytes right by one position.
+     * Distinct seeds exercise each byte and keep the independent chains live.
+     */
+    __global__ void decodeBytePermuteCeiling(uint32_t* output)
+    {
+        const unsigned thread = blockIdx.x * blockDim.x + threadIdx.x;
+        uint32_t words[permuteChains];
+        #pragma unroll
+        for (unsigned chain = 0; chain < permuteChains; ++chain)
+            words[chain] = inputAt(thread * permuteChains + chain).x;
+
+        #pragma unroll 1
+        for (unsigned iteration = 0; iteration < permuteIterations; ++iteration)
+        {
+            #pragma unroll
+            for (unsigned chain = 0; chain < permuteChains; ++chain)
+                asm volatile("prmt.b32 %0, %0, 0, 0x0321;" : "+r"(words[chain]));
+        }
+
+        uint32_t sum = 0;
+        #pragma unroll
+        for (unsigned chain = 0; chain < permuteChains; ++chain)
+            sum += words[chain];
+        output[thread] = sum;
+    }
+
+    /**
      * @brief Drive independent dense SM80+ INT8 tensor-core accumulator chains.
      * @param output Four S32 accumulator elements, summed across chains per lane.
      *
@@ -174,11 +206,13 @@ namespace
         unsigned passes;
         Kernel kernel;
 
-        /** @return Requested bytes, thread DP4A operations or warp IMMA operations per launch. */
+        /** @return Requested bytes, scalar-lane instruction count, or warp IMMA count per launch. */
         uint64_t count() const
         {
             if (kernel == Kernel::Dp4a)
                 return uint64_t(blocks) * threadsPerBlock * dotIterations * dotChains;
+            if (kernel == Kernel::BytePermute)
+                return uint64_t(blocks) * threadsPerBlock * permuteIterations * permuteChains;
             if (kernel == Kernel::Imma)
                 return uint64_t(blocks) * (threadsPerBlock / 32) * mmaIterations * mmaChains;
             return uint64_t(vectors) * passes * sizeof(uint4);
@@ -195,7 +229,8 @@ namespace
         const unsigned threads = probe.blocks * threadsPerBlock;
         uint4* input = nullptr;
         uint4* output = nullptr;
-        const auto outputBytes = threads * (probe.kernel == Kernel::Dp4a ? sizeof(uint32_t) : sizeof(uint4));
+        const bool scalarOutput = probe.kernel == Kernel::Dp4a || probe.kernel == Kernel::BytePermute;
+        const auto outputBytes = threads * (scalarOutput ? sizeof(uint32_t) : sizeof(uint4));
         CUDA_CHECK(cudaMalloc(&output, outputBytes));
         if (probe.kernel == Kernel::Read)
         {
@@ -212,6 +247,9 @@ namespace
         {
             if (probe.kernel == Kernel::Dp4a)
                 decodeDp4aCeiling<<<probe.blocks, threadsPerBlock, 0, stream>>>(
+                    reinterpret_cast<uint32_t*>(output));
+            else if (probe.kernel == Kernel::BytePermute)
+                decodeBytePermuteCeiling<<<probe.blocks, threadsPerBlock, 0, stream>>>(
                     reinterpret_cast<uint32_t*>(output));
             else if (probe.kernel == Kernel::Imma)
                 decodeImmaCeiling<<<probe.blocks, threadsPerBlock, 0, stream>>>(output);
@@ -244,7 +282,7 @@ namespace
         }
 
         bool valid = true;
-        if (probe.kernel == Kernel::Dp4a)
+        if (scalarOutput)
         {
             std::vector<uint32_t> actual(threads);
             CUDA_CHECK(cudaMemcpyAsync(actual.data(), output, outputBytes,
@@ -252,8 +290,18 @@ namespace
             CUDA_CHECK(cudaStreamSynchronize(stream));
             for (unsigned thread = 0; thread < threads; ++thread)
             {
-                constexpr unsigned sumOfCoefficients = dotChains * (dotChains + 1) / 2;
-                const uint32_t expected = (thread & 127U) * 4 * dotIterations * sumOfCoefficients;
+                uint32_t expected = 0;
+                if (probe.kernel == Kernel::Dp4a)
+                {
+                    constexpr unsigned sumOfCoefficients = dotChains * (dotChains + 1) / 2;
+                    expected = (thread & 127U) * 4 * dotIterations * sumOfCoefficients;
+                }
+                else
+                {
+                    constexpr int shift = 8 * (permuteIterations % 4);
+                    for (unsigned chain = 0; chain < permuteChains; ++chain)
+                        expected += std::rotr(inputAt(thread * permuteChains + chain).x, shift);
+                }
                 valid &= actual[thread] == expected;
             }
         }
@@ -300,14 +348,14 @@ int main(int argc, char** argv)
     int device = -1;
     if (argc != 3)
     {
-        std::fprintf(stderr, "Usage: %s <cuda-device> <dram|l2|dp4a|imma>\n", argv[0]);
+        std::fprintf(stderr, "Usage: %s <cuda-device> <dram|l2|dp4a|prmt|imma>\n", argv[0]);
         return EXIT_FAILURE;
     }
     const std::string_view ordinal(argv[1]);
     const auto parsed = std::from_chars(ordinal.data(), ordinal.data() + ordinal.size(), device);
     const std::string_view mode(argv[2]);
     if (parsed.ec != std::errc{} || parsed.ptr != ordinal.data() + ordinal.size() ||
-        device < 0 || (mode != "dram" && mode != "l2" && mode != "dp4a" && mode != "imma"))
+        device < 0 || (mode != "dram" && mode != "l2" && mode != "dp4a" && mode != "prmt" && mode != "imma"))
         return EXIT_FAILURE;
 
     CUDA_CHECK(cudaSetDevice(device));
@@ -319,7 +367,8 @@ int main(int argc, char** argv)
                 properties.major, properties.minor, properties.multiProcessorCount, properties.l2CacheSize);
 
     const auto sms = static_cast<unsigned>(properties.multiProcessorCount);
-    const auto kernel = mode == "dp4a" ? Kernel::Dp4a : mode == "imma" ? Kernel::Imma : Kernel::Read;
+    const auto kernel = mode == "dp4a" ? Kernel::Dp4a : mode == "prmt" ? Kernel::BytePermute :
+        mode == "imma" ? Kernel::Imma : Kernel::Read;
     if (kernel == Kernel::Imma && properties.major < 8)
     {
         std::fprintf(stderr, "The dense INT8 m16n8k32 reference requires SM80 or newer\n");

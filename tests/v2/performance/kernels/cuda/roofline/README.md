@@ -11,6 +11,7 @@ PROBE="$CMAKE_BUILD/tests/v2/v2_perf_cuda_decode_roofline"
 "$PROBE" 0 dram > dram.csv
 "$PROBE" 0 l2 > l2.csv
 "$PROBE" 0 dp4a > dp4a.csv
+"$PROBE" 0 prmt > prmt.csv
 "$PROBE" 0 imma > imma.csv
 ```
 
@@ -21,6 +22,9 @@ traverses a set that fits in half of L2. Both use the same coalesced 16-byte
 loads and checksum every output lane. The packed signed DP4A probe uses eight
 independent accumulator chains. Its work column counts DP4A instructions across
 all threads. Each instruction performs four integer multiply-accumulates.
+The byte-permutation probe issues eight independent PRMT chains and counts
+one instruction per active lane. Its host oracle checks the resulting byte
+rotations for every lane. This is an independent permutation-issue ceiling.
 The dense INT8 tensor-core probe counts warp-level `m16n8k32` operations, each
 consisting of 4,096 integer multiply-accumulates.
 
@@ -48,12 +52,12 @@ Each entry is the median of 63 retained-launch samples from three fresh
 processes. The PCI endpoints are the two sm86 cards in the QFN CUDA/CPU
 qualification host.
 
-| PCI endpoint | Streamed reads, GB/s | L2-resident reads, GB/s | DP4A, TOPS | INT8 tensor core, TOPS |
-| --- | ---: | ---: | ---: | ---: |
-| `0000:3f:00.0` | 879.53 | 2349.78 | 73.30 | 317.08 |
-| `0000:42:00.0` | 879.53 | 2378.91 | 73.35 | 319.36 |
+| PCI endpoint | Streamed reads, GB/s | L2-resident reads, GB/s | DP4A, TOPS | PRMT, trillion lane instructions/s | INT8 tensor core, TOPS |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `0000:3f:00.0` | 879.53 | 2349.78 | 73.30 | 8.03 | 317.08 |
+| `0000:42:00.0` | 879.53 | 2378.91 | 73.35 | 8.22 | 319.36 |
 
-Read rates count requested bytes. Integer rates count two operations per
+Read rates count requested bytes. Dot-product rates count two operations per
 multiply-accumulate. The driver logged a graphics-engine assertion during
 counter attachment on this host, so these references use quiet CUDA events.
 
