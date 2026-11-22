@@ -24590,6 +24590,20 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
                     {
                         ASSERT_FALSE(gate_reduce);
                         gate_reduce = KernelLaunch{node, params};
+                        constexpr unsigned packet_width = 32;
+                        EXPECT_EQ(params.blockDim.x, packet_width);
+                        EXPECT_EQ(params.gridDim.x, (intermediate + packet_width - 1) / packet_width);
+                        EXPECT_EQ(params.gridDim.y, static_cast<unsigned>(seq_len * top_k));
+                        EXPECT_EQ(params.gridDim.z, 1u);
+                        cudaFuncAttributes attributes{};
+                        ASSERT_EQ(cudaFuncGetAttributes(&attributes, params.func), cudaSuccess);
+                        EXPECT_EQ(attributes.localSizeBytes, 0u);
+                        if (!gate_weight_probe_path && !probe_path)
+                        {
+                            const bool fixed_qfn_publication = sm86 && qfn_width &&
+                                (expected_gate_tile == 64 || expected_gate_tile == 128);
+                            EXPECT_EQ(name.contains("ILi320EE"), fixed_qfn_publication);
+                        }
                     }
                     if (name.find("grouped_prefill_down_canonical_publish_k32_kernel") != std::string_view::npos)
                     {

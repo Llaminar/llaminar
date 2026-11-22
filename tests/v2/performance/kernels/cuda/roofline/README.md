@@ -378,6 +378,21 @@ zero shared, stack and local bytes. Their launch geometry allows 9 or
 16 CTAs per SM. The all-format replay verifies the captured tile and
 serial-row output bytes.
 
+At the same QFN geometry the SwiGLU publication uses a fixed 320-column
+pitch. Each submitted warp owns a complete K32 output group and folds
+the original 16 Gate and Up partitions in order. The captured kernel
+uses 40 registers, zero shared and local bytes, and no CTA barrier. In
+three paired runs per card, the IQ3_XXS stage dropped from 26.752 µs to
+26.560–26.624 µs. The full Release sweep measured 26.688 µs on both
+cards, or 79.4–79.6% of the matched weight reference. The 80% counts
+remain 15 of 21 for Gate/Up and seven of seven for Down.
+
+Forcing the existing grouped INT8 tensor-core engine at four rows
+preserved serial output bytes on the six low-bit sources. The complete
+captured transaction, including routing and publication, ranged from
+169.5 to 254.1 µs across both cards. The selected packed path took
+81.0–87.4 µs on the same sources and inputs.
+
 ### QFN-width IQ4 schedule
 
 The interleaved IQ4 reader also uses the fixed 320-column Gate/Up pitch

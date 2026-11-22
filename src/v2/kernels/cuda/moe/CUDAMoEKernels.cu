@@ -21106,7 +21106,11 @@ __global__ void softmax_topk_decode_descriptors_kernel(
      * FP32 gate/up scratch round trip.
      * The launch admits the fixed split-K arithmetic policy, so publication
      * can issue independent partial loads with the original ordered FP32 fold.
+     * @tparam FixedColumns Exact admitted QFN pitch, or zero for runtime geometry.
+     * @pre The QFN launch covers every column with complete warps and uses one
+     *      block for each submitted original route and K32 output group.
      */
+    template <int FixedColumns = 0>
     __global__ void grouped_native_quantised_gate_up_ordered_kpart_reduce_swiglu_kernel(
         const float *__restrict__ gate_partials,
         const float *__restrict__ up_partials,
@@ -21119,11 +21123,19 @@ __global__ void softmax_topk_decode_descriptors_kernel(
     {
         constexpr int kTileN = 32;
         constexpr int kPartitions = llaminar2::CUDAMoEBatchInvariantPolicy::gate_up_k_partitions;
+        if constexpr (FixedColumns > 0)
+        {
+            static_assert(FixedColumns == kQFNDecodeGateUpN && FixedColumns % kTileN == 0);
+            N = FixedColumns;
+        }
         const int lane = threadIdx.x;
         const int block_idx = blockIdx.x;
         const int local_route = blockIdx.y;
-        if (local_route >= tile_route_slots)
-            return;
+        if constexpr (FixedColumns == 0)
+        {
+            if (local_route >= tile_route_slots)
+                return;
+        }
 
         const int grouped_slot =
             original_to_grouped[original_slot_base + local_route];
@@ -21131,7 +21143,7 @@ __global__ void softmax_topk_decode_descriptors_kernel(
             return;
 
         const int n = block_idx * kTileN + lane;
-        const bool active = n < N;
+        const bool active = FixedColumns > 0 || n < N;
         const size_t route_base =
             static_cast<size_t>(local_route) *
             static_cast<size_t>(kPartitions) * static_cast<size_t>(N);
@@ -22859,7 +22871,7 @@ extern "C"
         case 4:
             queried = block_threads == 32 &&
                       query_grouped_prefill_kernel_resources(
-                          grouped_native_quantised_gate_up_ordered_kpart_reduce_swiglu_kernel,
+                          grouped_native_quantised_gate_up_ordered_kpart_reduce_swiglu_kernel<>,
                           block_threads,
                           &resources);
             break;
@@ -26813,11 +26825,17 @@ __attribute__((visibility("default"))) bool cudaMoE_softmax_topk_decode_selected
                     dim3 reduce_grid(
                         (intermediate + kReduceTileN - 1) / kReduceTileN,
                         tile_route_slots);
-                    grouped_native_quantised_gate_up_ordered_kpart_reduce_swiglu_kernel<<<
-                        reduce_grid, reduce_block, 0, cuda_stream>>>(
-                        d_gate_partials, d_up_partials, d_original_to_grouped,
-                        d_scratch_swiglu_int8, d_scratch_swiglu_scales,
-                        original_slot_base, tile_route_slots, intermediate);
+                    const auto publish = [&]<int FixedColumns>() {
+                        grouped_native_quantised_gate_up_ordered_kpart_reduce_swiglu_kernel<FixedColumns>
+                            <<<reduce_grid, reduce_block, 0, cuda_stream>>>(
+                                d_gate_partials, d_up_partials, d_original_to_grouped,
+                                d_scratch_swiglu_int8, d_scratch_swiglu_scales,
+                                original_slot_base, tile_route_slots, intermediate);
+                    };
+                    if (use_fixed_qfn)
+                        publish.template operator()<kQFNDecodeGateUpN>();
+                    else
+                        publish.template operator()<0>();
                     if (!finishGroupedPrefillLaunch(
                             "cudaMoE_grouped_gate_up_ordered_kpart_reduce_swiglu",
                             cuda_stream))
