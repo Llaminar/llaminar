@@ -494,18 +494,28 @@ the same executable. It also checks the split publication of independently
 recorded fragments that are eligible for child graph import.
 
 The real-weight probe kept the same 16-row capacity across these replays
-and timed 31 consecutive launches per publication. All live logits matched
-serial bytes and the poisoned inactive output bytes survived. The reference
-is 879.53 GB/s for the original 675,430,400-byte Q8_0 weight traversal.
+and timed 31 consecutive launches per publication. Both recordings use the
+same Release executable and original 675,430,400-byte Q8_0 weight. All live
+logits matched serial bytes and the poisoned inactive output bytes survived.
+The reference is 879.53 GB/s on each card.
 
 | Live rows | Original counted stage, µs | Arithmetic-only counted stage, µs | Streaming reference |
 | ---: | ---: | ---: | ---: |
-| 0 | 33.990–35.179 | 6.887–7.003 | |
-| 1 | 968.341–972.106 | 775.928–776.126 | 99.0% |
-| 5 | 1039.590–1041.240 | 787.192 | 97.6% |
-| 8 | 2015.975–2029.815 | 797.217–797.399 | 96.3% |
-| 16 | 3077.930–3092.925 | 822.041–822.999 | 93.3–93.4% |
+| 0 | 34.155–35.163 | 6.706–7.102 | |
+| 1 | 966.028–968.638 | 775.763–776.192 | 98.9–99.0% |
+| 5 | 1036.650–1044.480 | 787.456–787.852 | 97.5% |
+| 8 | 2021.890–2027.900 | 797.035–798.389 | 96.2–96.4% |
+| 16 | 3072.905–3090.595 | 819.712–824.270 | 93.2–93.7% |
 
 The compiled counted MMA kernel uses 52 registers, zero shared and local
 bytes, and no warp synchronization. The empty stage timing includes the
 activation producer and conditional control.
+
+On the matched 2×CUDA/2×CPU QFN Release workload at fixed draft depth seven,
+the fused-first comparison reached 44.552 tokens/s median decode versus
+43.547 for the immediately preceding implementation. Each arm measured three
+256-token requests after warmup. The six runs matched every generated token,
+57 verifier transactions, 456 verifier rows, and 399 drafts. The 2.3% delta
+describes this run order. The same Release build passed the mixed-tier movement
+regression with greedy and stochastic sampling and all 11 focused CUDA
+preflight tests.
