@@ -620,11 +620,16 @@ The compiled counted MMA kernel uses 52 registers, zero shared and local
 bytes, and no warp synchronization. The empty stage timing includes the
 activation producer and conditional control.
 
-On the matched 2×CUDA/2×CPU QFN Release workload at fixed draft depth seven,
-the fused-first comparison reached 44.552 tokens/s median decode versus
-43.547 for the immediately preceding implementation. Each arm measured three
-256-token requests after warmup. The six runs matched every generated token,
-57 verifier transactions, 456 verifier rows, and 399 drafts. The 2.3% delta
-describes this run order. The same Release build passed the mixed-tier movement
-regression with greedy and stochastic sampling and all 11 focused CUDA
+The matched 2×CUDA/2×CPU QFN Release workload used fixed draft depth seven.
+Each arm measured three 256-token requests after warmup. Both orders matched
+every generated token and the MTP work per request, including 57 verifier
+transactions, 456 verifier rows, and 399 drafts.
+
+| Run order | Previous verifier, median tokens/s | Fused verifier, median tokens/s | Gain |
+| --- | ---: | ---: | ---: |
+| Fused first | 43.547 | 44.552 | 2.31% |
+| Control first | 43.488 | 44.155 | 1.53% |
+
+The control-first Release build also passed the mixed-tier movement
+regression with greedy and stochastic sampling and all 14 focused CUDA
 preflight tests.
