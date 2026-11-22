@@ -133,6 +133,50 @@ collective and the model loader were outside this diagnostic.
 | G14 | 13,496,320 | 26.05 | 107.11–108.20 |
 | G15 | 12,697,600 | 25.14 | 104.18–105.57 |
 
+### CUDA peer transfers at QFN decode sizes
+
+The two QFN RTX 3090s report direct access in both directions over the
+PCIe PXB link. CUDA reports no native atomics across that link. The
+diagnostic therefore joins the original CUDA streams with native graph
+events. The NCCL controls use the same configured provider as the Release
+runtime. Each captured transaction times 32 successive operations on two
+already-prepared FP32 rows and checks the complete receiver publication
+after three input resets. The table spans both directions and two passes
+with reversed operation order, each with 43 samples per arm.
+
+| Payload per direction | Direct store | Peer DMA | Direct rooted publication | Root pulls peer | NCCL Reduce |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 10,240 B | 2.27 µs | 2.85–3.05 µs | 3.68 µs | 3.84 µs | 9.86–10.08 µs |
+| 102,400 B | 7.97–8.10 µs | 7.74–8.87 µs | 11.10–12.51 µs | 10.75 µs | 24.83–30.69 µs |
+| 409,600 B | 31.23–31.33 µs | 31.00–32.14 µs | 55.68–55.78 µs | 33.50–33.82 µs | 56.51–60.42 µs |
+
+The direct rooted publisher reads both original inputs and writes the sum
+from the source GPU into the receiver's local VRAM in one kernel. The
+root-pull variant reads the peer input from the receiving GPU and writes
+the sum locally. A separate push and receiver fold costs 10.94–11.62 µs
+at 10,240 B. The published and pulled sums use the original FP32 add order.
+The fixture starts with ready inputs. Production graphs must also preserve
+the input-producer events and ownership before reusing either participant's
+buffers. The table measures isolated transport and reduction, before any
+whole-model comparison.
+
+The 32-, 64-, 128- and 256-thread sweep exercised both PCI directions. The
+32-thread direct rooted publisher measured 3.62–3.65 µs at 10,240 B. At
+102,400 B the 256-thread root pull measured 10.75 µs in both directions.
+At 409,600 B all four root-pull widths measured 33.50–33.82 µs. Forcing
+`LL`, `LL128` or `Simple` gave no repeatable NCCL Reduce improvement at
+10,240 B or 102,400 B. The CUDA kernels use 14 registers for the direct
+store and 18 for the two-input add, with zero private bytes.
+
+```sh
+cmake --build "$CMAKE_BUILD" --parallel --target v2_perf_cuda_peer_decode_latency
+PEER="$CMAKE_BUILD/tests/v2/v2_perf_cuda_peer_decode_latency"
+"$PEER" 0 direct 10240 128
+"$PEER" 0 publish-root 10240 128
+"$PEER" 1 pull-root 102400 128
+"$PEER" 1 nccl-root 102400 128
+```
+
 ### Independent projection and issue references
 
 Each entry is the median of 63 retained-launch samples from three fresh

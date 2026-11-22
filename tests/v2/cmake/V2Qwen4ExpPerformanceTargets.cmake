@@ -22,6 +22,15 @@ if(HAVE_CUDA)
         "${_qfn_test_sources}" "${_qfn_test_sources}/../../src/v2")
     target_link_libraries(v2_perf_cuda_decode_roofline PRIVATE CUDA::cudart)
 
+    # Isolated from the runtime and RCCL symbols. Use the configured NCCL DSO and its own header.
+    add_executable(v2_perf_cuda_peer_decode_latency EXCLUDE_FROM_ALL
+        "${_qfn_test_sources}/performance/kernels/cuda/roofline/CUDAPeerDecodeLatency.cu")
+    set_target_properties(v2_perf_cuda_peer_decode_latency PROPERTIES
+        CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
+    target_compile_definitions(v2_perf_cuda_peer_decode_latency PRIVATE
+        "LLAMINAR_NCCL_ABI_HEADER=\"${_nccl_abi_header}\"")
+    target_link_libraries(v2_perf_cuda_peer_decode_latency PRIVATE CUDA::cudart "${NCCL_LIBRARY}")
+
     # Same native-event fixture and original graph metadata; no profiler attachment.
     add_executable(v2_perf_cuda_qwen_sparse_observations EXCLUDE_FROM_ALL
         "${_qfn_test_sources}/integration/kernels/cuda/Test__CUDAQwenSparseAttention.cpp")
