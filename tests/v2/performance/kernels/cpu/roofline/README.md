@@ -71,20 +71,22 @@ and Q5_K/Q8_0 for one. Accounting for each original routed expert's two
 Gate/Up matrices and one Down matrix gives 2,099,200, 2,048,000, and 2,867,200
 prepared weight bytes per live route, respectively. There is no shared-expert
 projection on this CPU endpoint. In one matched ordinary decode diagnostic,
-1,488 local calls processed 4–10 routes each. Their mean request was 16.59 MB
-of prepared weights. A single ideal DRAM pass on node 1 takes about 151 µs;
-the 80% target is about 189 µs for that workload. The useful VNNI phase times
-are smaller than the corresponding read times.
+1,488 local calls processed 4–10 routes each. Their mean prepared weight
+extent was 16.59 MB. The M1 Q4_K identity-nibble dot skips the 128-byte
+compensation plane in each of its Gate and Up N64/K32 units. The
+compulsory operand count is therefore 15.80 MB per call. A single ideal DRAM
+pass on node 1 takes about 144 µs and the 80% target is about 180 µs. The
+useful VNNI phase times are smaller than the corresponding read times.
 
-| CUDA parent | CPU expert execution, µs per call | Effective prepared-weight GB/s | Fraction of one-pass DRAM reference |
+| CUDA parent | CPU expert execution, µs per call | Compulsory operand GB/s | Fraction of one-pass DRAM reference |
 | --- | ---: | ---: | ---: |
-| Staged | 305.81 | 54.2 | 49.3% |
-| Resident with independent packet readiness | 317.55 | 52.2 | 47.5% |
+| Staged | 305.81 | 51.7 | 47.0% |
+| Resident with independent packet readiness | 317.55 | 49.8 | 45.2% |
 
 These CPU times include local expert execution and its team/activation work.
-The rates assume one requested read per prepared byte. Establish physical
-traffic and cache residency with separate counter measurements. The sampled
-decode window on this CPU rank spent 74.18% of user cycles at identified
+The rates assume one requested read per compulsory operand byte. Establish
+physical traffic and cache residency with separate counter measurements. The
+sampled decode window on this CPU rank spent 74.18% of user cycles at identified
 `libgomp` wait-loop addresses, 12.22% in the fused projection workshare body
 and 11.20% in the AVX-512 non-nibble GEMV entry. The most sampled instructions
 in those two projection symbols were AVX-512 arithmetic and weight operands.
