@@ -452,3 +452,7 @@ for the control and 44.89 for the fused prototype. Each arm ran three
 measured requests after warmup. All six requests produced the same 256
 tokens and the same 57 verifier transactions, 456 verifier rows, and
 399 drafts.
+
+The tuned-first comparison used the narrower Release specialization. Its
+median was 43.73 tokens/s, followed by 44.20 for the archived control.
+All six histories and MTP work counts match the prototype comparison.
