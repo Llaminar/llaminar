@@ -78,6 +78,27 @@ the native PCI ID and launches one exact mode. CTA width is 256 threads.
 | `0000:3f:00.0` | 164 | 885.66 | 2,350.81 | 9,028.06 | 12,151.39 | 7,984.05 | 13,046.76 |
 | `0000:42:00.0` | 164 | 885.66 | 2,387.36 | 9,127.73 | 12,248.32 | 8,147.43 | 13,427.67 |
 
+The same read and DP4A programs also measured smaller active CTA sets. In the
+F320 resident Gate/Up path, each live route contributes ten packet CTAs and
+the shared expert contributes ten more. Three fresh processes per width and
+card produced 63 checked samples per cell.
+
+| CTAs | DRAM GB/s, PCI 3f | DRAM GB/s, PCI 42 | DP4A Ginst/s, PCI 3f | DP4A Ginst/s, PCI 42 |
+| ---: | ---: | ---: | ---: | ---: |
+| 10 | 408.30 | 410.66 | 996.75 | 1,019.22 |
+| 20 | 725.86 | 729.66 | 1,993.49 | 2,024.28 |
+| 30 | 848.33 | 848.84 | 2,990.24 | 3,034.07 |
+| 40 | 877.65 | 877.84 | 3,986.98 | 4,045.43 |
+| 50 | 880.99 | 880.99 | 4,979.94 | 5,033.49 |
+| 60 | 884.29 | 884.47 | 5,975.93 | 6,021.68 |
+| 82 | 886.17 | 886.36 | 8,160.90 | 8,229.64 |
+| 164 | 885.66 | 885.66 | 8,956.59 | 9,028.06 |
+
+At four local routes, the 50-CTA streaming rate is within 0.7% of the full
+card. The 10- and 20-CTA rows quantify the much smaller bandwidth available
+to the fewest-route phases. Use these rates to distinguish active work
+geometry from selection, reduction and weight-reader costs.
+
 Pass an explicit CTA count as the final hardware probe argument. For example,
 record 82- and 164-CTA captures on each card for `dram`, `l2`, `dp4a`, `ffma`,
 `prmt` and `int-mix`, then pass the receipts to the scorer.
@@ -553,6 +574,16 @@ routed Gate and Up to separate CTAs increased retirement time by 0.51–1.02 µs
 across the six card/format cells. A 128-column routed Down tile improved one
 of the six cells by 1.02 µs and was flat in the other five. The original
 resident schedule retains one CTA per Gate/Up packet and 256-column Down tiles.
+
+The softmax tree trial retained the original stride-128 through stride-1
+ordering for the max and FP32 sum. One warp folds the original cross-warp
+partners from shared memory and completes the original lane tree with
+shuffle-down operations. Each reduction needs two CTA joins. All 18 seeded
+states per card and format matched through the original route and host
+packet publications. In the matched captures, the original ticket arrived
+0–2.05 µs sooner, mapped dispatch 0.51–2.05 µs sooner and kernel retirement
+1.02–2.05 µs sooner. The loaded Q4_K/Q5_1 root entry used 106 registers and
+22,148 shared bytes with zero stack and local bytes.
 
 ### Grouped Gate/Up packets and direct Down on SM86
 

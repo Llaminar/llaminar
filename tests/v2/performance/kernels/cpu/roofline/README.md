@@ -135,3 +135,22 @@ arm. Driver diagnostics were unchanged during the comparison.
 Median prefill rate improved by 0.30–1.94% across these cells. The revised
 compulsory footprint is 1,945,600 bytes per route for Q4_K/Q5_1 and
 Q4_K/Q8_0, and 2,764,800 for Q5_K/Q8_0.
+
+A separate 32-token service trace matched all 1,488 remote CPU calls by layer
+and live route count. Local expert execution fell from 305.81 to 294.15 µs
+per call, with a decrease across all 48 layers. The new kernel requests
+15.43 MB per measured call and delivers 52.44 GB/s of compulsory operands,
+47.7% of the 110 GB/s reference. In the same trace, the remote joint
+publication interval rose from 40.33 to 65.68 µs, while the GPU rank's
+rooted gather interval fell from 1.716 to 1.479 ms per token. These intervals
+include peer arrival and reflect a separate instrumented request cohort.
+
+The native rooted gather screen compared the actual MPI matched-envelope
+gather and native shared-memory gather with the same admitted NUMA record
+banks. At 2,561 floats per record and 4–10 live records per socket, MPI had
+the lower root median in both transport orders, with ready peers and with
+15 or 30 µs of root delay. In the ready-peer trials at four live routes,
+MPI took 11.60–14.14 µs and shared memory took 18.57–21.03 µs. At ten live
+routes the corresponding ranges were 24.94–29.54 and 41.18–46.69 µs. Both
+transports matched every output byte and live extent, including unequal and
+empty peers. The MPI path is the control for further overlap work.
