@@ -12164,10 +12164,10 @@ if(TARGET v2_integration_cuda_retained_hc_ffn)
             --gtest_filter=CUDARetainedHCFFN.RecordedFragmentRouting
         LABELS "V2;Integration;ProductionTestPreflight;CUDA;MoE;Hyperconnection;GraphCapture;Replay;ByteExact;Regression;HardwareOptional;LocalHostDevices;Devices1;NativeISA-sm_86"
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 120)
-    add_v2_test(V2_Integration_CUDA_RetainedHCFFNMappedDmaDispatchContract
+    add_v2_test(V2_Integration_CUDA_RetainedHCFFNMappedDmaDispatchReplay
         COMMAND $<TARGET_FILE:v2_integration_cuda_retained_hc_ffn>
-            --gtest_filter=CUDARetainedHCFFN.MappedDmaDispatchContract
-        LABELS "V2;Integration;ProductionTestPreflight;CUDA;MoE;Hyperconnection;GraphCapture;ByteExact;Contract;Regression;HardwareOptional;LocalHostDevices;Devices1;NativeISA-sm_86"
+            --gtest_filter=CUDARetainedHCFFN.RecordedMappedDmaDispatchPublications
+        LABELS "V2;Integration;ProductionTestPreflight;CUDA;MoE;Hyperconnection;GraphCapture;ByteExact;Replay;Regression;HardwareOptional;LocalHostDevices;Devices1;NativeISA-sm_86"
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 120)
     if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL 12.8)
         add_v2_test(V2_Integration_CUDA_GroupedLiveGridContract
@@ -39096,8 +39096,8 @@ endif()
 if(HAVE_CUDA AND TEST V2_Integration_CUDA_RetainedHCFFNFragmentRoutingReplay)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDA_RetainedHCFFNFragmentRoutingReplay)
 endif()
-if(HAVE_CUDA AND TEST V2_Integration_CUDA_RetainedHCFFNMappedDmaDispatchContract)
-    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDA_RetainedHCFFNMappedDmaDispatchContract)
+if(HAVE_CUDA AND TEST V2_Integration_CUDA_RetainedHCFFNMappedDmaDispatchReplay)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDA_RetainedHCFFNMappedDmaDispatchReplay)
 endif()
 if(HAVE_CUDA AND TEST V2_Integration_CUDA_GroupedLiveGridContract)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDA_GroupedLiveGridContract)

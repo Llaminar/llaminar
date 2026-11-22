@@ -74,6 +74,28 @@ namespace llaminar2
         void *signal,
         std::uint64_t value) noexcept;
 
+    /** @brief Single-dispatch ownership of an early resident route acquire. */
+    class CUDAResidentPacketAcquire final
+    {
+    public:
+        /** @brief Claim the readiness word once while recording the exact stream. */
+        std::uint64_t* claimSignal(void* stream) const;
+
+        CUDAResidentPacketAcquire(const CUDAResidentPacketAcquire&) = delete;
+        CUDAResidentPacketAcquire& operator=(const CUDAResidentPacketAcquire&) = delete;
+
+    private:
+        friend class CUDAEarlyPacketPublication;
+
+        /** @brief Bind the original producer's word to its first packet consumer. */
+        CUDAResidentPacketAcquire(cudaStream_t stream, std::uint64_t* signal) noexcept
+            : stream_(stream), signal_(signal) {}
+
+        cudaStream_t stream_; ///< Original same-device capture stream.
+        std::uint64_t* signal_; ///< Original arena word, reset by the single acquire owner.
+        mutable bool claimed_ = false; ///< Checked before this capture scope can publish its new frontier.
+    };
+
     /**
      * @brief Record explicit packet stages against a producer's early device publication.
      *
@@ -108,7 +130,21 @@ namespace llaminar2
          */
         bool recordConsumer(void* stream, const std::function<bool()>& record);
 
+        /**
+         * @brief Record a dispatch whose sole first lane can consume the word in its metadata warp.
+         * @param stream Exact original native capture stream.
+         * @param lane_count Number of prepared dispatch bindings that will record.
+         * @param record Original dispatch submission. A non-null acquire must be consumed once.
+         * @return True only when both the dispatch and arithmetic frontiers are joined.
+         */
+        bool recordDispatchConsumer(void* stream, std::size_t lane_count,
+            const std::function<bool(const CUDAResidentPacketAcquire*)>& record);
+
     private:
+        /** @brief Fork from the producer and assign exactly one owner to the readiness word. */
+        bool recordPacketConsumer(void* stream, bool inline_acquire,
+            const std::function<bool(const CUDAResidentPacketAcquire*)>& record);
+
         cudaGraph_t graph_ = nullptr;
         cudaStream_t stream_ = nullptr;
         unsigned long long capture_id_ = 0;

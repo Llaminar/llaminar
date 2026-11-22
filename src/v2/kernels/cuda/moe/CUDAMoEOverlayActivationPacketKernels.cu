@@ -20,6 +20,7 @@
 #include "../../common/MoEOverlayNativeInvocationDevice.inl"
 #include "../../common/MoEOverlayNodeLocalRouteExchangeDevice.inl"
 #include "backends/cuda/CUDAGraphCapture.h"
+#include "backends/cuda/MappedTransferServiceDevice.cuh"
 
 #include <algorithm>
 #include <cstddef>
@@ -103,10 +104,17 @@ namespace llaminar2::cuda_moe_packet
     {
     using namespace moe_activation_packet_device;
     constexpr unsigned kDispatchMetadataThreads = 32;
-    /** @brief Authenticate the original lane and publish its exact active payload predicate. */
+    /**
+     * @brief Authenticate the original lane and publish its exact active payload predicate.
+     * @tparam AcquireInMetadata This is the unique consumer of the resident route word.
+     * @param launch Original grant, placement and packet operands.
+     * @param handle Native condition for the exact live mapped row transfer.
+     * @param ready Original same-device word when this warp owns its acquire.
+     */
+    template<bool AcquireInMetadata>
     __global__ __launch_bounds__(32) void prepareResidentDmaMetadata(
         const __grid_constant__ MoEOverlayActivationDispatchPackLaunch launch,
-        cudaGraphConditionalHandle handle)
+        cudaGraphConditionalHandle handle, std::uint64_t* ready)
     {
         // Lane zero authenticates the acquired grant and placement. The warp
         // then compacts one original router slot per lane in canonical order.
@@ -114,7 +122,15 @@ namespace llaminar2::cuda_moe_packet
         const unsigned slot = threadIdx.x;
         DispatchMetadataPreparation preparation{};
         if (slot == 0)
+        {
             preparation = prepareDispatchMetadata(launch);
+            if constexpr (AcquireInMetadata)
+                consumeResidentPacketAcquire64(ready, 1u);
+        }
+        // Grant/placement validation needs no router output. Finish the one
+        // acquire before any lane reads the selected route and its weight.
+        if constexpr (AcquireInMetadata)
+            __syncwarp(warp);
         const auto placement_ptr = __shfl_sync(warp,
             reinterpret_cast<unsigned long long>(preparation.route_participants), 0);
         const auto* placement = reinterpret_cast<const int*>(placement_ptr);
@@ -189,16 +205,21 @@ namespace llaminar2::cuda_moe_packet
 
     /**
      * @brief Record one lane's metadata, live DMA, and ordered lease release.
+     * @tparam AcquireInMetadata Whether the metadata warp acquires the route once.
      * @param lane Original lane and TransferEngine-bound storage.
      * @param stream Exact captured stream with the early router dependency.
+     * @param ready Same-device release word when this warp owns the acquire.
      * @return Whether CUDA accepted the complete publication.
      */
-    bool recordResidentDispatchLane(const ResidentMappedDispatch& lane, cudaStream_t stream)
+    template<bool AcquireInMetadata = false>
+    bool recordResidentDispatchLane(const ResidentMappedDispatch& lane, cudaStream_t stream,
+        std::uint64_t* ready = nullptr)
     {
         const auto& launch = lane.launch;
         CUDAActiveCaptureConditional branch(stream, CUDAActiveCaptureConditionalKind::IfOnly);
         if (!branch.publishPredicate([&](cudaGraphConditionalHandle condition) {
-                prepareResidentDmaMetadata<<<1, kDispatchMetadataThreads, 0, stream>>>(launch.packet, condition);
+                prepareResidentDmaMetadata<AcquireInMetadata><<<1, kDispatchMetadataThreads, 0, stream>>>(
+                    launch.packet, condition, ready);
                 return launchAccepted();
             }) || !branch.beginBranches() ||
             !branch.appendMappedHostCopy(CUDAActiveCaptureConditionalBranch::IfNonZero, lane.copy) ||
@@ -221,25 +242,29 @@ namespace llaminar2::cuda_moe_packet
             cudaGetDevice(&current) != cudaSuccess || current != device_ordinal)
             return false;
 
-        cudaFuncAttributes attributes{};
-        if (cudaFuncGetAttributes(&attributes, prepareResidentDmaMetadata) != cudaSuccess)
-            return false;
-
         using Peer = ResidentDispatchPeerBudget;
         constexpr unsigned peer_registers = Peer::blocks_per_sm * Peer::block_threads * Peer::registers_per_thread;
-        const unsigned packet_registers = (unsigned(attributes.numRegs) + 7u) / 8u * 8u;
-        return attributes.maxThreadsPerBlock >= int(kDispatchMetadataThreads) &&
-            unsigned(hardware.registers_per_sm) >= peer_registers + kDispatchMetadataThreads * packet_registers &&
-            unsigned(hardware.maximum_threads_per_sm) >= Peer::blocks_per_sm * Peer::block_threads + kDispatchMetadataThreads &&
-            unsigned(hardware.maximum_blocks_per_sm) > Peer::blocks_per_sm &&
-            hardware.shared_memory_per_sm >= Peer::blocks_per_sm * Peer::shared_bytes + attributes.sharedSizeBytes;
+        const auto fits = [&](const auto kernel) {
+            cudaFuncAttributes attributes{};
+            if (cudaFuncGetAttributes(&attributes, kernel) != cudaSuccess)
+                return false;
+            const unsigned packet_registers = (unsigned(attributes.numRegs) + 7u) / 8u * 8u;
+            // The device graph conditional API owns a linked call frame.
+            // Register, thread and shared limits determine concurrent residency.
+            return attributes.maxThreadsPerBlock >= int(kDispatchMetadataThreads) &&
+                unsigned(hardware.registers_per_sm) >= peer_registers + kDispatchMetadataThreads * packet_registers &&
+                unsigned(hardware.maximum_threads_per_sm) >= Peer::blocks_per_sm * Peer::block_threads + kDispatchMetadataThreads &&
+                unsigned(hardware.maximum_blocks_per_sm) > Peer::blocks_per_sm &&
+                hardware.shared_memory_per_sm >= Peer::blocks_per_sm * Peer::shared_bytes + attributes.sharedSizeBytes;
+        };
+        return fits(prepareResidentDmaMetadata<false>) && fits(prepareResidentDmaMetadata<true>);
     }
 
     /** @copydoc recordResidentDispatchPackets */
     bool recordResidentDispatchPackets(std::span<const ResidentMappedDispatch> lanes,
-        int device_ordinal, void* stream)
+        int device_ordinal, void* stream, const CUDAResidentPacketAcquire* acquire)
     {
-        if (lanes.empty() || stream == cudaStreamLegacy || stream == cudaStreamPerThread ||
+        if (lanes.empty() || (acquire && lanes.size() != 1) || stream == cudaStreamLegacy || stream == cudaStreamPerThread ||
             !selectLaunchContext(device_ordinal, stream))
             return false;
         for (const auto& lane : lanes)
@@ -255,6 +280,8 @@ namespace llaminar2::cuda_moe_packet
         }
 
         const auto native = static_cast<cudaStream_t>(stream);
+        if (acquire)
+            return recordResidentDispatchLane<true>(lanes.front(), native, acquire->claimSignal(stream));
         if (lanes.size() == 1)
             return recordResidentDispatchLane(lanes.front(), native);
 

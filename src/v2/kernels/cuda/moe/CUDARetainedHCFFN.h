@@ -76,7 +76,8 @@ namespace llaminar2::cuda::moe
         float* shared_contribution; ///< Original participant-local shared output.
         RetainedM1RoutePublication route_publication;
         RetainedM1SharedPublication shared_publication;
-        std::uint64_t* early_packet_ready = nullptr; ///< Arena word released after the HC row and route packet are complete.
+        std::uint64_t* early_packet_ready = nullptr; ///< Readiness for the original mapped activation dispatch.
+        std::uint64_t* early_ticket_ready = nullptr; ///< Independent readiness for the original CPU dispatch ticket.
     };
 
     static_assert(std::is_trivially_copyable_v<RetainedM1HCFFN>);

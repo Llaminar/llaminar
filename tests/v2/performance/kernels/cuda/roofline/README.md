@@ -410,6 +410,22 @@ private bytes. The table spans all three source pairs and both RTX 3090s.
 | Routed Gate/Up | 8.19–10.24 |
 | Down and native retirement | 15.86–16.38 |
 
+The same 164-CTA hardware receipts give these streaming reference times for
+the diagnostic's F320/S320 geometry and four original local routes. The
+Gate/Up window begins after the router projection and includes route
+selection, descriptor publication, shared and routed arithmetic, and Q8
+publication. The Down window ends at native retirement.
+
+| Phase | One DRAM stream, µs | Observed window, µs | Reference / observed |
+| --- | ---: | ---: | ---: |
+| HC Down and Q8 publication | 3.93 | 8.19 | 48.0% |
+| HC Up and mixed read | 3.93 | 7.17 | 54.8% |
+| Router and input Q8 | 2.96 | 6.14 | 48.2% |
+| Q4_K routed Gate/Up | 6.59 | 27.65–28.67 | 23.0–23.8% |
+| Q5_K routed Gate/Up | 7.52 | 29.70–30.21 | 24.9–25.3% |
+| Q5_1 routed Down | 3.76 | 16.21–16.38 | 22.9–23.2% |
+| Q8_0 routed Down | 4.91 | 15.86–16.38 | 30.0–31.0% |
+
 In the next resident candidate the selector CTA publishes its completed
 descriptor plan directly to routed CTAs. Separate CTAs run shared Gate/Up.
 With that schedule, a matched math-only replay reduced retirement by
@@ -425,6 +441,48 @@ fragment uses 106 registers per thread and zero private bytes.
 Both RTX 3090s reproduced each of the 18 recorded-seed outputs per source
 pair. The six native tests include dirty route-ready words, alternating
 placement banks, and original packet lease acquisition by the CPU.
+
+The SM86 Q4_K / Q5_1 independent fragment uses `LDG.E.128` for packed loads,
+`IDP.4A.S8.S8` for signed dot products, and `FADD` for the ordered FP32 fold.
+The disassembly contains zero `LDL` or `STL` instructions. A fixed ten-packet
+shared Down reader with two integer accumulation chains preserved the
+recorded outputs and stayed within 1.03 µs of the existing math and packet
+medians on both cards. The Release candidate keeps the existing reader.
+
+The separate-shared-Down Release pairing used the original 2×CUDA/2×CPU
+F320/S320 plan and three measured 256-token requests per arm after warmup.
+All 12 requests in each mode agreed with the archived token stream and the
+fixed-depth verifier did the same work in both orders.
+
+| Arm order | Mode | Staged decode, tokens/s | Resident decode, tokens/s | Difference |
+| --- | --- | ---: | ---: | ---: |
+| Resident first | Ordinary | 29.315 | 29.228 | −0.30% |
+| Staged first | Ordinary | 29.425 | 29.240 | −0.63% |
+| Resident first | Fixed depth 7 | 41.346 | 41.100 | −0.60% |
+| Staged first | Fixed depth 7 | 43.530 | 43.561 | +0.07% |
+
+The single-lane CPU dispatch can authenticate the grant and its placement in
+the same metadata warp that acquires and resets the resident route word. The
+warp waits before reading the canonical indices and weights. This removes a
+native launch on the CPU packet side of the captured layer. Multiple mapped
+activation lanes share one acquire node before their batch. The original
+host dispatch ticket uses its own readiness word. Each transport can begin
+from the same router publication, and the parent joins both transports and
+the arithmetic before the original continuation boundary.
+
+An isolated capture with the same arithmetic and original registered DMA
+measured 62.46–63.49 µs to CPU packet completion with the fused acquire and
+73.71–74.21 µs with a separate acquire. Both cards reproduced all 18 seeded
+states for each of the three source pairs. These are layer-local event
+measurements with the original mapped publication.
+
+The real F320/S320 Release smoke captured 48 instances of the fused
+metadata warp on the root and 48 original ticket acquires on their
+separate branch. Both GPUs recorded 48 resident arithmetic kernels and
+the first 12 generated tokens matched the archive. The compiled math uses
+106 registers per thread, two resident CTAs per SM, and zero private bytes.
+The metadata warp uses 142 registers per thread. Its native conditional
+call retains the original 56-byte linked stack frame.
 
 ### Grouped Gate/Up packets and direct Down on SM86
 

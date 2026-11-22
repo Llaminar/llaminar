@@ -400,7 +400,7 @@
                 softmax_topk_decode_independent_body<ObserveCollectives,
                     llaminar2::RoutedExpertRowExecutionPolicy::IntermediateShardLocal, false, kRetainedQFNExpertCount>(
                     router.logits, runtime, router.route_indices, router.route_weights, router.experts, router.top_k,
-                    router.normalize, true, nullptr, {}, args.early_packet_ready);
+                    router.normalize, true, nullptr, {}, args.early_packet_ready, args.early_ticket_ready);
             else
                 softmax_topk_decode_runtime_body<ObserveCollectives, false, kRetainedQFNExpertCount>(router.logits, runtime,
                     nullptr, router.route_indices, router.route_weights, router.experts, router.top_k, router.normalize, true,
@@ -409,7 +409,10 @@
             if constexpr (!IndependentLocalShard)
             {
                 if (threadIdx.x == 0)
+                {
                     releaseRetainedQFNPacket(args.early_packet_ready);
+                    releaseRetainedQFNPacket(args.early_ticket_ready);
+                }
             }
             if (args.shared_publication == RetainedM1SharedPublication::GatedComplete)
             {

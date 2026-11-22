@@ -14832,6 +14832,7 @@ namespace
      * @param active_row_count_device Optional live count for this physical row.
      * @param publication Original arena outputs; unused in the control specialization.
      * @param early_packet_ready Optional same-device CPU packet edge for the fully active retained fragment.
+     * @param early_ticket_ready Optional independent CPU dispatch ticket edge from the same canonical routes.
  */
     template <bool UpdateRuntimeHistogram,
               llaminar2::RoutedExpertRowExecutionPolicy RowPolicy = llaminar2::RoutedExpertRowExecutionPolicy::ParticipantAssigned,
@@ -14847,7 +14848,8 @@ namespace
         bool write_legacy_outputs,
         const int32_t *__restrict__ active_row_count_device,
         llaminar2::MoEDecodeDescriptorPublication publication,
-        std::uint64_t* early_packet_ready = nullptr)
+        std::uint64_t* early_packet_ready = nullptr,
+        std::uint64_t* early_ticket_ready = nullptr)
     {
         __shared__ float values[ExpertCapacity];
         __shared__ float reductions[kThreads];
@@ -14922,7 +14924,7 @@ namespace
             if constexpr (ExpertCapacity == 512 &&
                 RowPolicy == llaminar2::RoutedExpertRowExecutionPolicy::IntermediateShardLocal)
             {
-                if (early_packet_ready)
+                if (early_packet_ready || early_ticket_ready)
                 {
                     runtime_require_decode_row_policy(runtime, RowPolicy);
                     const auto bank = runtime_require_decode_execution_bank(runtime);
@@ -14939,6 +14941,7 @@ namespace
                         legacy_weights[slot] = selected_weights[slot];
                     }
                     releaseRetainedQFNPacket(early_packet_ready);
+                    releaseRetainedQFNPacket(early_ticket_ready);
                 }
             }
         }
@@ -15016,7 +15019,7 @@ namespace
                     }
                 }
             }
-            if (write_legacy_outputs && !early_packet_ready)
+            if (write_legacy_outputs && !early_packet_ready && !early_ticket_ready)
             {
                 legacy_indices[slot] = static_cast<float>(expert_id);
                 legacy_weights[slot] = row_active ? weight : 0.0f;
@@ -28211,12 +28214,15 @@ namespace llaminar2::cuda::moe
             throw std::invalid_argument("Retained QFN HC/FFN entry cannot keep the measured CTA grid resident");
         if (router.local_policy == RoutedExpertRowExecutionPolicy::IntermediateShardLocal && blocks < 2u)
             throw std::invalid_argument("Retained QFN HC/FFN needs separate route and shared Gate/Up CTAs");
-        if (arguments.early_packet_ready)
+        if (arguments.early_packet_ready || arguments.early_ticket_ready)
         {
             if (hc.norm.extent.liveRows)
                 throw std::invalid_argument("CUDA retained QFN early CPU packet requires the original fully-active M1 invocation");
             int concurrent = 0;
-            if (blocks < 2u || reinterpret_cast<std::uintptr_t>(arguments.early_packet_ready) % alignof(std::uint64_t) ||
+            const auto packet_address = reinterpret_cast<std::uintptr_t>(arguments.early_packet_ready);
+            const auto ticket_address = reinterpret_cast<std::uintptr_t>(arguments.early_ticket_ready);
+            if (blocks < 2u || packet_address == ticket_address ||
+                (packet_address | ticket_address) % alignof(std::uint64_t) ||
                 cudaDeviceGetAttribute(&concurrent, cudaDevAttrConcurrentKernels, int(device.ordinal)) != cudaSuccess || !concurrent)
                 throw std::invalid_argument("Retained QFN HC/FFN cannot admit its independent packet lane");
             if (router.local_policy == RoutedExpertRowExecutionPolicy::IntermediateShardLocal)

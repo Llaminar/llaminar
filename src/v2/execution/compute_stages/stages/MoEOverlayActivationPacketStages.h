@@ -37,6 +37,7 @@
 namespace llaminar2
 {
     class CUDAEarlyPacketPublication;
+    class CUDAResidentPacketAcquire;
     class IBackend;
     class IMoEKernel;
     class TensorBase;
@@ -135,8 +136,13 @@ namespace llaminar2
         StageDumpInfo buildDumpInfoImpl() const override;
 
     private:
-        /** @brief Record the original packet against the currently selected native frontier. */
-        bool executePacket(IDeviceContext *ctx);
+        /**
+         * @brief Record the original packet against the selected native frontier.
+         * @param ctx Original participant execution context.
+         * @param acquire Optional capture-owned acquire consumed inside the sole CUDA metadata lane.
+         * @return Whether the full original dispatch was recorded.
+         */
+        bool executePacket(IDeviceContext *ctx, const CUDAResidentPacketAcquire* acquire = nullptr);
         /** @return Whether topology and shape are valid before device allocation. */
         bool hasStaticContract() const noexcept;
         /** @return Whether every captured device pointer is final. */
@@ -420,8 +426,13 @@ namespace llaminar2
         StageDumpInfo buildDumpInfoImpl() const override;
 
     private:
-        /** @brief Record the original packet batch against the currently selected native frontier. */
-        bool executePacket(IDeviceContext *ctx);
+        /**
+         * @brief Record the original packet batch against the selected native frontier.
+         * @param ctx Original participant execution context.
+         * @param acquire Optional capture-owned acquire when the original batch has one CUDA lane.
+         * @return Whether the full original dispatch batch was recorded.
+         */
+        bool executePacket(IDeviceContext *ctx, const CUDAResidentPacketAcquire* acquire = nullptr);
         /** @return Whether lane topology and source tensor geometry are valid. */
         bool hasStaticContract() const noexcept;
         /** @return Whether every persistent device address is capture-ready. */

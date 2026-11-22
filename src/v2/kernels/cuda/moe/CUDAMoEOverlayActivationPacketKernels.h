@@ -11,6 +11,11 @@
 
 #include <span>
 
+namespace llaminar2
+{
+    class CUDAResidentPacketAcquire;
+}
+
 namespace llaminar2::cuda_moe_packet
 {
     /** @brief Per-CTA resource envelope reserved by the co-resident QFN packet geometry on SM86. */
@@ -41,10 +46,11 @@ namespace llaminar2::cuda_moe_packet
      * @param lanes Prevalidated topology-ordered native packet bindings.
      * @param device_ordinal Exact CUDA device admitted for the program.
      * @param stream Original non-default stream recording the complete parent.
+     * @param acquire First single-lane consumer's optional capture-owned acquire.
      * @return Whether every lease is recorded and the current frontier joins them.
      */
     bool recordResidentDispatchPackets(std::span<const ResidentMappedDispatch> lanes,
-        int device_ordinal, void* stream);
+        int device_ordinal, void* stream, const CUDAResidentPacketAcquire* acquire = nullptr);
 
 }
 

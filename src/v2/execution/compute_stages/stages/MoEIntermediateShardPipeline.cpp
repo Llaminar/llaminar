@@ -1286,10 +1286,9 @@ void lowerCUDAMappedRetainedM1HCFFN(ComputeGraph& graph,const std::string& previ
                 export_.consumers.push_back(name);
         if(!export_.consumers.empty())exports.push_back(std::move(export_));
     }
-    std::shared_ptr<CUDAEarlyPacketPublication> packet;
+    CUDARetainedEarlyRouteReaders early_readers;
     if(!packet_nodes.empty())
     {
-        packet=std::make_shared<CUDAEarlyPacketPublication>();
         const auto& route=router->declaration();
         for(const auto& name:packet_nodes)
         {
@@ -1302,24 +1301,30 @@ void lowerCUDAMappedRetainedM1HCFFN(ComputeGraph& graph,const std::string& previ
                         !packet_nodes.contains(dependency);
                 }))
                 throw std::invalid_argument("CUDA retained QFN packet has a dependency outside its early router publication: " + name);
-            const auto bind=[&](auto& stage,const auto& declaration) {
+            // The host ticket and mapped activation lanes own distinct
+            // storage. Each can read the same canonical router publication
+            // independently. Their original graph cutpoint still joins both
+            // completions before the next consumer or replay can proceed.
+            const auto bind=[&](auto& stage,const auto& declaration, auto& publication) {
                 if(declaration.hidden!=mixed.tensor || declaration.routing_indices!=route.output_indices ||
                     declaration.routing_weights!=route.output_weights)
                     throw std::invalid_argument("CUDA retained QFN packet changed its early arena source: " + name);
-                stage.bindEarlyRoutePublication(packet,route.active_row_count_device);
+                if (!publication)
+                    publication=std::make_shared<CUDAEarlyPacketPublication>();
+                stage.bindEarlyRoutePublication(publication,route.active_row_count_device);
             };
             if(auto* dispatch=dynamic_cast<MoEOverlayActivationDispatchPackStage*>(reader.stage.get()))
-                bind(*dispatch,dispatch->getParams());
+                bind(*dispatch,dispatch->getParams(),early_readers.mapped_dispatch);
             else if(auto* batch=dynamic_cast<MoEOverlayActivationDispatchPackBatchStage*>(reader.stage.get()))
-                bind(*batch,batch->getParams());
+                bind(*batch,batch->getParams(),early_readers.mapped_dispatch);
             else if(auto* ticket=dynamic_cast<MoEOverlayTicketPublishStage*>(reader.stage.get()))
-                bind(*ticket,ticket->params());
+                bind(*ticket,ticket->params(),early_readers.cpu_ticket);
             else
                 throw std::invalid_argument("CUDA retained QFN has an unknown early packet stage: " + name);
         }
     }
     auto replacement=std::make_unique<CUDARetainedStage>(binding,router->declaration(),shared->declaration(),
-        std::move(prefix),std::move(packet),terminal);
+        std::move(prefix),std::move(early_readers),terminal);
     graph.replaceClosedLocalRegion(members,terminal,std::move(replacement),exports,
         LocalRegionCapturePolicy::HeterogeneousTicketLocal);
 #else

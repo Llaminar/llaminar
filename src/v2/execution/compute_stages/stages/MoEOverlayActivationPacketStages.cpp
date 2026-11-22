@@ -1087,7 +1087,8 @@ namespace llaminar2
     {
 #ifdef HAVE_CUDA
         if (early_route_publication_)
-            return early_route_publication_->recordConsumer(requireGPUStream(), [&] { return executePacket(ctx); });
+            return early_route_publication_->recordDispatchConsumer(requireGPUStream(), 1,
+                [&](const auto* acquire) { return executePacket(ctx, acquire); });
 #endif
         return executePacket(ctx);
     }
@@ -1105,7 +1106,9 @@ namespace llaminar2
     }
 #endif
 
-    bool MoEOverlayActivationDispatchPackStage::executePacket(IDeviceContext *ctx)
+    /** @copydoc MoEOverlayActivationDispatchPackStage::executePacket */
+    bool MoEOverlayActivationDispatchPackStage::executePacket(IDeviceContext *ctx,
+        [[maybe_unused]] const CUDAResidentPacketAcquire* acquire)
     {
         if (!validateExecutionContext(ctx, params_.device_id, name().c_str()) ||
             !hasFixedContract())
@@ -1194,7 +1197,8 @@ namespace llaminar2
                 if (!resident_dispatch_copy_)
                     throw std::logic_error("CUDA retained single-row dispatch lost its prepared mapped copy");
                 const cuda_moe_packet::ResidentMappedDispatch lane{packet, *resident_dispatch_copy_};
-                return cuda_moe_packet::recordResidentDispatchPackets(std::span(&lane, 1u), params_.device_id.ordinal, stream);
+                return cuda_moe_packet::recordResidentDispatchPackets(std::span(&lane, 1u),
+                    params_.device_id.ordinal, stream, acquire);
             }
 #endif
             return moe_kernel_->packSingleRowMoEOverlayActivationDispatch(packetLaunchContext(stream), packet);
@@ -2483,7 +2487,8 @@ namespace llaminar2
     {
 #ifdef HAVE_CUDA
         if (early_route_publication_)
-            return early_route_publication_->recordConsumer(requireGPUStream(), [&] { return executePacket(ctx); });
+            return early_route_publication_->recordDispatchConsumer(requireGPUStream(), resident_dispatch_.size(),
+                [&](const auto* acquire) { return executePacket(ctx, acquire); });
 #endif
         return executePacket(ctx);
     }
@@ -2502,8 +2507,9 @@ namespace llaminar2
     }
 #endif
 
+    /** @copydoc MoEOverlayActivationDispatchPackBatchStage::executePacket */
     bool MoEOverlayActivationDispatchPackBatchStage::executePacket(
-        IDeviceContext *ctx)
+        IDeviceContext *ctx, [[maybe_unused]] const CUDAResidentPacketAcquire* acquire)
     {
         if (!validateExecutionContext(ctx, params_.device_id, name().c_str()) ||
             !hasFixedContract())
@@ -2740,7 +2746,7 @@ namespace llaminar2
         if (early_route_publication_)
         {
             launched = cuda_moe_packet::recordResidentDispatchPackets(resident_dispatch_,
-                params_.device_id.ordinal, stream);
+                params_.device_id.ordinal, stream, acquire);
         }
         else
 #endif

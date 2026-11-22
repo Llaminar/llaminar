@@ -7,6 +7,13 @@
  * route slots and the shared FFN output for the existing ticket and TP graph.
  */
 
+/** @brief Independent readers of one original resident router publication. */
+struct CUDARetainedEarlyRouteReaders
+{
+    std::shared_ptr<CUDAEarlyPacketPublication> mapped_dispatch; ///< Original activation lanes and their ordering.
+    std::shared_ptr<CUDAEarlyPacketPublication> cpu_ticket; ///< Original host dispatch ticket's separate transport.
+};
+
 /** @brief Preparation and publication of one participant's complete local CUDA region. */
 class CUDARetainedStage final : public IComputeStage, public IWorkspaceConsumer
 {
@@ -17,14 +24,14 @@ public:
      * @param router Original router, authenticated by the route-slot builder.
      * @param shared Original prepared shared projections and Down publication.
      * @param prefix Original staged post-attention HC owner.
-     * @param packet Original explicit CPU packet stages' optional early native edge.
+     * @param early_readers Original explicit CPU packet and ticket readers, if present.
      * @param name Existing terminal of the local routed math.
      */
     CUDARetainedStage(std::shared_ptr<Binding> binding, const MoERoutingStage::Params& router,
         const SharedExpertFFNStage::Params& shared, std::shared_ptr<Qwen4ExpHCReadPhaseOwner> prefix,
-        std::shared_ptr<CUDAEarlyPacketPublication> packet, std::string name)
+        CUDARetainedEarlyRouteReaders early_readers, std::string name)
         : IComputeStage(binding->device()), binding_(std::move(binding)), router_(router), shared_(shared),
-          prefix_(std::move(prefix)), packet_(std::move(packet)), name_(std::move(name))
+          prefix_(std::move(prefix)), early_readers_(std::move(early_readers)), name_(std::move(name))
     {
         const auto& p = binding_->params;
         const auto& original = binding_->original;
@@ -116,8 +123,10 @@ public:
         auto requirements = prefix_->phaseWorkspaceRequirements();
         for (const auto& bank : banks())
             MoEWorkspaceBuffers::add(requirements, bank.name, bank.bytes);
-        if (packet_)
+        if (early_readers_.mapped_dispatch)
             MoEWorkspaceBuffers::add(requirements, packet_word_name, sizeof(std::uint64_t));
+        if (early_readers_.cpu_ticket)
+            MoEWorkspaceBuffers::add(requirements, ticket_word_name, sizeof(std::uint64_t));
         return requirements;
     }
 
@@ -188,14 +197,17 @@ public:
             .shared_contribution = static_cast<float*>(addresses[4]),
             .route_publication = cuda::moe::RetainedM1RoutePublication::Raw,
             .shared_publication = cuda::moe::RetainedM1SharedPublication::PartialBeforeCollective,
-            .early_packet_ready = earlyPacketWord(),
+            .early_packet_ready = readyWord(early_readers_.mapped_dispatch, packet_word_name),
+            .early_ticket_ready = readyWord(early_readers_.cpu_ticket, ticket_word_name),
         };
         auto program = cuda::moe::RetainedM1Program::prepare(device(), arguments, gate_, down_,
             output_demand_, router_.collect_device_runtime_histogram, workspace_->id());
         if (program.admission().resources().private_bytes)
             throw std::logic_error("CUDA retained QFN requires a spill-free resident entry");
-        if (packet_)
-            packet_->prepare(stream, arguments.early_packet_ready);
+        if (early_readers_.mapped_dispatch)
+            early_readers_.mapped_dispatch->prepare(stream, arguments.early_packet_ready);
+        if (early_readers_.cpu_ticket)
+            early_readers_.cpu_ticket->prepare(stream, arguments.early_ticket_ready);
         prepared_stream_ = stream;
         prepared_workspace_id_ = workspace_->id();
         prepared_banks_ = pointers;
@@ -203,6 +215,7 @@ public:
         prepared_runtime_ = runtime;
         prepared_shared_ = prepared_shared;
         prepared_packet_word_ = arguments.early_packet_ready;
+        prepared_ticket_word_ = arguments.early_ticket_ready;
         program_.emplace(std::move(program));
         setGPUStream(stream);
         const auto& native = program_->admission();
@@ -233,8 +246,10 @@ public:
             execution.requirePreparedOutput(output.tensor);
         for (const auto& output : outputs())
             execution.requirePreparedOutput(output.tensor);
-        if (packet_)
-            packet_->recordProducer(execution.nativeStream(), prepared_packet_word_);
+        if (early_readers_.mapped_dispatch)
+            early_readers_.mapped_dispatch->recordProducer(execution.nativeStream(), prepared_packet_word_);
+        if (early_readers_.cpu_ticket)
+            early_readers_.cpu_ticket->recordProducer(execution.nativeStream(), prepared_ticket_word_);
         program_->launch(execution.nativeStream(), prepared_workspace_id_);
         for (const auto& output : prefix_outputs_)
             execution.publish(output.tensor);
@@ -242,7 +257,8 @@ public:
             execution.publish(output.tensor);
         PerfStatsCollector::addCounter("moe_resident_ffn", "cuda_mapped_local_program_enqueued", 1.,
             "graph_capture", device().toString(), {{"layer", std::to_string(binding_->layer)},
-                {"early_cpu_packet", packet_ ? "1" : "0"}});
+                {"early_cpu_packet", prepared_packet_word_ ? "1" : "0"},
+                {"early_cpu_ticket", prepared_ticket_word_ ? "1" : "0"}});
         return true;
     }
 
@@ -265,7 +281,8 @@ public:
         mix(router_.norm_topk_prob); mix(router_.collect_device_runtime_histogram);
         mix(reinterpret_cast<std::uintptr_t>(router_.gate_weights));
         mix(reinterpret_cast<std::uintptr_t>(router_.absolute_position_ids_device));
-        mix(reinterpret_cast<std::uintptr_t>(packet_.get()));
+        mix(reinterpret_cast<std::uintptr_t>(early_readers_.mapped_dispatch.get()));
+        mix(reinterpret_cast<std::uintptr_t>(early_readers_.cpu_ticket.get()));
         mix(reinterpret_cast<std::uintptr_t>(shared_.prepared_store));
         mix(shared_.prepared_ref_gate->binding_id); mix(shared_.prepared_ref_up->binding_id);
         mix(shared_.prepared_ref_down->binding_id); mix(shared_.intermediate);
@@ -275,15 +292,21 @@ public:
 
 private:
     static constexpr const char* packet_word_name = "cuda_retained_qfn_cpu_packet_ready";
+    static constexpr const char* ticket_word_name = "cuda_retained_qfn_cpu_ticket_ready";
 
-    /** @return The named arena word only for a participant with original early packet readers. */
-    std::uint64_t* earlyPacketWord() const
+    /**
+     * @brief Borrow the named same-device word for an admitted original reader.
+     * @param reader Original capture recorder whose lifetime owns the word's acquire.
+     * @param name Role-specific arena allocation identity.
+     * @return Aligned arena word, or null when the original reader is absent.
+     */
+    std::uint64_t* readyWord(const std::shared_ptr<CUDAEarlyPacketPublication>& reader, const char* name) const
     {
-        if (!packet_)
+        if (!reader)
             return nullptr;
-        auto* word = static_cast<std::uint64_t*>(workspace_->getBuffer(packet_word_name));
-        if (!word || workspace_->getBufferSize(packet_word_name) < sizeof(*word))
-            throw std::logic_error("CUDA retained QFN has no admitted early packet signal word");
+        auto* word = static_cast<std::uint64_t*>(workspace_->getBuffer(name));
+        if (!word || workspace_->getBufferSize(name) < sizeof(*word))
+            throw std::logic_error(std::string("CUDA retained QFN has no admitted early signal word ") + name);
         return word;
     }
 
@@ -414,7 +437,8 @@ private:
         const auto same = [](const auto& a, const auto& b) { return std::memcmp(&a, &b, sizeof(a)) == 0; };
         if (!workspace_ || stream != prepared_stream_ || workspace_->id() != prepared_workspace_id_ ||
             tensorAddresses() != prepared_tensors_ || bankAddresses() != prepared_banks_ ||
-            earlyPacketWord() != prepared_packet_word_ ||
+            readyWord(early_readers_.mapped_dispatch, packet_word_name) != prepared_packet_word_ ||
+            readyWord(early_readers_.cpu_ticket, ticket_word_name) != prepared_ticket_word_ ||
             binding_->params.runtime->deviceLayerState(binding_->layer) != prepared_runtime_ ||
             !same(descriptor.gate, prepared_shared_.gate) || !same(descriptor.up, prepared_shared_.up) ||
             !same(descriptor.down, prepared_shared_.down))
@@ -426,7 +450,7 @@ private:
     const MoERoutingStage::Params router_;
     const SharedExpertFFNStage::Params shared_;
     const std::shared_ptr<Qwen4ExpHCReadPhaseOwner> prefix_;
-    const std::shared_ptr<CUDAEarlyPacketPublication> packet_;
+    const CUDARetainedEarlyRouteReaders early_readers_;
     const std::string name_;
     const FullNativeHCFFNOutputDemand output_demand_ = FullNativeHCFFNOutputDemand::all();
     std::vector<Qwen4ExpFloatBinding> prefix_inputs_, prefix_outputs_;
@@ -438,6 +462,7 @@ private:
     Addresses prepared_tensors_{};
     DeviceMoELayerRuntime* prepared_runtime_ = nullptr;
     std::uint64_t* prepared_packet_word_ = nullptr;
+    std::uint64_t* prepared_ticket_word_ = nullptr;
     DeviceMoEExpertDescriptor prepared_shared_{};
     std::uint64_t prepared_workspace_id_ = 0;
     void* prepared_stream_ = nullptr;
