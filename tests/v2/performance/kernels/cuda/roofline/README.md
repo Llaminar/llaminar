@@ -350,13 +350,17 @@ matched weight rate. Across both cards, the QFN Gate/Up cases sustain
 84.2–88.3% through publication. The QFN-width Q8_0 producer retains the
 general schedule after the comparison showed similar stage times.
 
-Across 31 samples per format and card, nine of 21 wide formats sustain
-at least 80% through publication on both cards. Q6_K drops from
-40.064–40.192 to 32.896 µs, and IQ2_XS from 27.264 to 22.848–22.912 µs.
-The low-bit IQ1, IQ2 and IQ3 formats range from 42.7% to 73.2% at the
-wide geometry. At the smaller geometry the full stage ranges from
-34.2% to 56.0%. These measurements retain the tested prepared formats
-and fully local route tape.
+Unrolling the packed wide packets and the fixed 16-part ordered publication
+brings 12 of 21 wide formats to at least 80% in both Gate/Up and Down on
+both cards. The 31-sample Gate/Up medians are 19.584 µs for Q2_K (86.3%),
+20.544 µs for Q3_K (81.3%), 25.408 µs for Q5_0 (81.1%) and
+30.912–30.976 µs for Q6_K (87.2–87.4%). IQ2_XS falls from the earlier
+27.264 µs control to 20.864 µs (74.5%). The low-bit IQ1, IQ2 and IQ3
+formats range from 49.8% to 77.4% at the wide geometry. The smaller
+geometry still falls short of 80%. These measurements retain the tested
+prepared formats and fully local route tape. The same Release build
+passes ten focused CUDA preflight tests and preserves generated tokens
+in the real 2×CUDA/2×CPU QFN movement regression.
 
 The mixed 2×CUDA/2×CPU QFN dynamic MTP benchmark produced identical
 256-token histories and per-iteration MTP work in both run orders. With the

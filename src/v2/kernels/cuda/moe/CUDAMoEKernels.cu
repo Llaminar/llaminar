@@ -20442,12 +20442,22 @@ __global__ void softmax_topk_decode_descriptors_kernel(
         int column, int first_packet, float &gate_sum, float &up_sum)
     {
         static_assert(Pitch % 4 == 0 && Packets > 0);
-        constexpr int payload_bytes = llaminar2::cuda_native_quantised::CodebookTraits<CodebookId>::payload_bytes;
+        using Traits = llaminar2::cuda_native_quantised::CodebookTraits<CodebookId>;
+        constexpr int payload_bytes = Traits::payload_bytes;
+        // Five independently decoded packets hide the latency of the packed
+        // readers on the measured verifier tile. Larger byte streams keep
+        // their shorter instruction body.
+        constexpr bool wide_packed_unroll = Pitch == 256 && Packets == 5 &&
+            (Traits::is_iq_grid || CodebookId == native_formats::Q2_K.codebook_id ||
+             CodebookId == native_formats::Q3_K.codebook_id || CodebookId == native_formats::Q5_0.codebook_id ||
+             CodebookId == native_formats::Q6_K.codebook_id);
+        constexpr int unroll = PacketOrder == NativeMoEDotOrder::PartitionPartial || wide_packed_unroll
+            ? Packets : 1;
         const auto *a = reinterpret_cast<const int4 *>(activations + first_packet * 32);
         const int start = first_packet * Pitch + column;
         gate_sum = 0.0f;
         up_sum = 0.0f;
-#pragma unroll (PacketOrder == NativeMoEDotOrder::PartitionPartial ? Packets : 1)
+#pragma unroll unroll
         for (int packet = 0; packet < Packets; ++packet)
         {
             const int linear = start + packet * Pitch;
@@ -20746,6 +20756,8 @@ __global__ void softmax_topk_decode_descriptors_kernel(
      * the same blockwise INT8 row layout for the down-projection kernel.  The
      * benefit is architectural: verifier graphs avoid a launch and a global
      * FP32 gate/up scratch round trip.
+     * The launch admits the fixed split-K arithmetic policy, so publication
+     * can issue independent partial loads with the original ordered FP32 fold.
      */
     __global__ void grouped_native_quantised_gate_up_ordered_kpart_reduce_swiglu_kernel(
         const float *__restrict__ gate_partials,
@@ -20755,10 +20767,10 @@ __global__ void softmax_topk_decode_descriptors_kernel(
         float *__restrict__ swiglu_scales,
         int original_slot_base,
         int tile_route_slots,
-        int N,
-        int k_partitions)
+        int N)
     {
         constexpr int kTileN = 32;
+        constexpr int kPartitions = llaminar2::CUDAMoEBatchInvariantPolicy::gate_up_k_partitions;
         const int lane = threadIdx.x;
         const int block_idx = blockIdx.x;
         const int local_route = blockIdx.y;
@@ -20774,13 +20786,14 @@ __global__ void softmax_topk_decode_descriptors_kernel(
         const bool active = n < N;
         const size_t route_base =
             static_cast<size_t>(local_route) *
-            static_cast<size_t>(k_partitions) * static_cast<size_t>(N);
+            static_cast<size_t>(kPartitions) * static_cast<size_t>(N);
 
         float gate_sum = 0.0f;
         float up_sum = 0.0f;
         if (active)
         {
-            for (int k_part = 0; k_part < k_partitions; ++k_part)
+#pragma unroll
+            for (int k_part = 0; k_part < kPartitions; ++k_part)
             {
                 const size_t idx =
                     route_base + static_cast<size_t>(k_part) * static_cast<size_t>(N) + static_cast<size_t>(n);
@@ -26219,11 +26232,8 @@ __attribute__((visibility("default"))) bool cudaMoE_softmax_topk_decode_selected
                                     constexpr bool prefer_unrolled =
                                         CodebookId == native_formats::Q4_0.codebook_id ||
                                         CodebookId == native_formats::Q4_K.codebook_id ||
-                                        CodebookId == native_formats::Q5_0.codebook_id ||
                                         CodebookId == native_formats::Q5_1.codebook_id ||
-                                        CodebookId == native_formats::Q5_K.codebook_id ||
-                                        CodebookId == native_formats::Q3_K.codebook_id ||
-                                        CodebookId == native_formats::IQ3_S.codebook_id;
+                                        CodebookId == native_formats::Q5_K.codebook_id;
                                     return issue.template operator()<256, 5, prefer_unrolled ? unrolled : packed>();
                                 }
                                 if constexpr (CodebookId == native_formats::Q4_K.codebook_id ||
@@ -26289,8 +26299,7 @@ __attribute__((visibility("default"))) bool cudaMoE_softmax_topk_decode_selected
                         reduce_grid, reduce_block, 0, cuda_stream>>>(
                         d_gate_partials, d_up_partials, d_original_to_grouped,
                         d_scratch_swiglu_int8, d_scratch_swiglu_scales,
-                        original_slot_base, tile_route_slots, intermediate,
-                        gateup_k_partitions);
+                        original_slot_base, tile_route_slots, intermediate);
                     if (!finishGroupedPrefillLaunch(
                             "cudaMoE_grouped_gate_up_ordered_kpart_reduce_swiglu",
                             cuda_stream))
