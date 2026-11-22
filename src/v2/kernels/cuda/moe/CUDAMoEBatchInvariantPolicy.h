@@ -74,9 +74,9 @@ namespace llaminar2
         /**
          * @brief Identify the packed codebooks measured with QFN's fixed K32 traversal.
          * @param codebook Physical NativeQuantised execution codebook.
-         * @return Whether the SM86 verifier has a measured fixed-pitch packed reader.
+         * @return Whether SM86 decode and verifier use the measured fixed-pitch packed reader.
          */
-        static constexpr bool qfnVerifierPackedGateUp(uint8_t codebook) noexcept
+        static constexpr bool qfnPackedGateUp(uint8_t codebook) noexcept
         {
             using namespace native_quantised_formats;
             return codebook == Q2_K.codebook_id || codebook == Q3_K.codebook_id ||

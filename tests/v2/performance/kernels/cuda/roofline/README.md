@@ -938,6 +938,34 @@ Gate/Up sources and five of seven Down sources reached 80% at width 320.
 At Down K=256, three of 21 reached 80%. The largest Gate/Up gaps at M=1
 were IQ1_M at 28.3%, IQ1_S at 29.4%, and IQ2_XXS at 32.3–32.5%.
 
+The SM86 packed-reader trial fixes five K32 packets per Gate/Up partition
+for ten original source families. The CTA resolves its actual expert and
+prepared planes before evaluating the partition. Gate and Up share the
+same loaded activation packet and retain independent ordered FP32 partials.
+The existing reducer publishes the original SwiGLU Q8 bytes.
+
+| Source | Paired Gate/Up stage change | Matched weight-read rate after the trial |
+| --- | ---: | ---: |
+| IQ1_M | 22.2–22.4% lower latency | 36.5% |
+| IQ1_S | 28.5–28.8% lower latency | 41.1–41.4% |
+| IQ2_XXS | 25.5% lower latency | 43.6% |
+| IQ2_S | 18.0–18.1% lower latency | 60.9% |
+| IQ2_XS | 16.4% lower latency | 62.2–62.4% |
+| IQ3_XXS | 16.3% lower latency | 76.6% |
+| IQ3_S | 6.6–6.8% lower latency | 78.4–78.5% |
+| Q2_K | 12.0–12.2% lower latency | 82.1% |
+| Q3_K | 5.1% lower latency | 78.8% |
+| Q6_K | 9.5–10.1% lower latency | 86.5% |
+
+Both cards reproduced the staged output across both paired orders. The
+new entries use 40–54 registers, no shared or local bytes, and an occupancy
+ceiling of 16 CTAs per SM for the 64-thread launch. SASS contains the expected
+signed DP4A instructions and zero local-memory load or store instructions.
+The final Release build has identical SASS instruction sequences for the
+original Q4_K, Q5_K, and Q8 Gate/Up readers.
+The [paired hybrid model comparison](../../cpu/roofline/README.md#ordered-avx-512-five-bit-pairs)
+verified every generated ID and MTP count for the available QFN weights.
+
 | QFN stage, ten live routes | Native stage, µs | Matched weight rate |
 | --- | ---: | ---: |
 | Main Q4_K Gate/Up | 17.344 | 84.1% |

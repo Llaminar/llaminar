@@ -679,7 +679,7 @@ namespace
             else if (device_ordinal >= 0 && seq_len == 4 && top_k == 10 &&
                      hidden_size == llaminar2::CUDAMoEBatchInvariantPolicy::qfn_gate_up_k &&
                      expert_width == llaminar2::CUDAMoEBatchInvariantPolicy::qfn_gate_up_n &&
-                     llaminar2::CUDAMoEBatchInvariantPolicy::qfnVerifierPackedGateUp(
+                     llaminar2::CUDAMoEBatchInvariantPolicy::qfnPackedGateUp(
                          static_cast<uint8_t>(gateup_codebook)) &&
                      gateup_codebook != llaminar2::native_quantised_formats::Q2_K.codebook_id &&
                      gateup_codebook != llaminar2::native_quantised_formats::Q6_K.codebook_id)

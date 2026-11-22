@@ -22640,7 +22640,8 @@ TEST_F(Test__CUDAMoEKernel, RuntimeGroupedDecodeSwiGLUPublicationReplay)
     const bool expect_fixed_reader = model_geometry && !geometry && hardware.major == 8 && hardware.minor == 6 &&
         (gate_codebook == native_formats::Q4_K.codebook_id ||
          gate_codebook == native_formats::Q5_K.codebook_id ||
-         gate_codebook == native_formats::Q8_0.codebook_id);
+         gate_codebook == native_formats::Q8_0.codebook_id ||
+         llaminar2::CUDAMoEBatchInvariantPolicy::qfnPackedGateUp(gate_codebook));
     for (auto node : nodes)
     {
         cudaGraphNodeType type{};
@@ -24456,7 +24457,7 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
         const auto gate_reader = gate_format->codebook_id;
         using llaminar2::CUDAMoEBatchInvariantPolicy;
         namespace native_formats = llaminar2::native_quantised_formats;
-        const bool packed_qfn_reader = CUDAMoEBatchInvariantPolicy::qfnVerifierPackedGateUp(gate_reader);
+        const bool packed_qfn_reader = CUDAMoEBatchInvariantPolicy::qfnPackedGateUp(gate_reader);
         const bool measured_qfn_gate_tile = sm86 && qfn_width && top_k == 10 && packed_qfn_reader &&
             gate_reader != native_formats::Q2_K.codebook_id && gate_reader != native_formats::Q6_K.codebook_id;
         const int expected_gate_tile = cuda_moe_config.cuda_moe_gateup_ordered_kpart_tile_n_override_active

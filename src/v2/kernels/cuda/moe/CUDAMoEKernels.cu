@@ -20779,6 +20779,12 @@ __global__ void softmax_topk_decode_descriptors_kernel(
         CodebookId == native_formats::Q5_K.codebook_id ||
         CodebookId == native_formats::Q8_0.codebook_id;
 
+    /** @brief Prepared layouts with a measured fixed-geometry reader for M=1. */
+    template <uint8_t CodebookId>
+    inline constexpr bool kQFNDecodeFixedGateUpCodebook =
+        kQFNDecodeGateUpCodebook<CodebookId> ||
+        llaminar2::CUDAMoEBatchInvariantPolicy::qfnPackedGateUp(CodebookId);
+
     /**
      * @brief Evaluate one fixed Gate/Up partition with shared activation registers.
      * @tparam CodebookId Physical decoder selected before recording the kernel.
@@ -20879,7 +20885,17 @@ __global__ void softmax_topk_decode_descriptors_kernel(
         const int n = blockIdx.x * kTileN + threadIdx.x;
         const int k_part = blockIdx.y;
         const int slot = blockIdx.z;
-        if (slot >= num_active || k_part >= k_partitions || n >= N)
+        constexpr bool PackedQFN = FixedQFN && !kQFNDecodeGateUpCodebook<CodebookId>;
+        if constexpr (PackedQFN)
+        {
+            // The measured packed entry submits only complete column and K
+            // tiles. Route and descriptor resolution precede the dot below.
+            static_assert(kQFNDecodeGateUpN % kTileN == 0);
+            N = kQFNDecodeGateUpN;
+            K = kQFNDecodeGateUpK;
+            k_partitions = llaminar2::CUDAMoEBatchInvariantPolicy::gate_up_k_partitions;
+        }
+        else if (slot >= num_active || k_part >= k_partitions || n >= N)
             return;
 
         // Linear index into the [num_active][k_partitions][N] partials buffer.
@@ -20920,11 +20936,24 @@ __global__ void softmax_topk_decode_descriptors_kernel(
         const DeviceNativeQuantisedMatrixDesc up_desc = up_descs[expert_id];
         if constexpr (FixedQFN)
         {
-            static_assert(kQFNDecodeGateUpCodebook<CodebookId>);
+            static_assert(kQFNDecodeFixedGateUpCodebook<CodebookId>);
+            using Traits = llaminar2::cuda_native_quantised::CodebookTraits<CodebookId>;
+            constexpr auto order = [] {
+                if constexpr (!PackedQFN)
+                    return NativeMoEDotOrder::PartitionPartial;
+                if constexpr (Traits::is_iq_grid)
+                    return NativeMoEDotOrder::VerifierWideGrid;
+                return NativeMoEDotOrder::VerifierK32;
+            }();
+            constexpr bool split_iq1_s = CodebookId == native_formats::IQ1_S.codebook_id;
+            constexpr auto signs = CodebookId == native_formats::IQ2_XS.codebook_id
+                ? NativeMoEIQ2SignSchedule::ClampedFunnelAndIndependentProducts
+                : NativeMoEIQ2SignSchedule::RegisterShifts;
             float gate = 0.0f;
             float up = 0.0f;
             if (native_quantised_pair_shape_ok<CodebookId>(gate_desc, up_desc, N, K))
-                native_quantised_gate_up_fixed_partition<CodebookId, kQFNDecodeGateUpN, kQFNDecodeGateUpPackets>(
+                native_quantised_gate_up_fixed_partition<CodebookId, kQFNDecodeGateUpN, kQFNDecodeGateUpPackets,
+                    order, split_iq1_s, signs>(
                     gate_desc, up_desc, A_int8, scales_A_blockwise, n, b_start, gate, up);
             gate_partials[partial_index] = gate;
             up_partials[partial_index] = up;
@@ -26408,7 +26437,7 @@ __attribute__((visibility("default"))) bool cudaMoE_softmax_topk_decode_selected
                         d_hidden_int8, d_hidden_scales, d_gate_desc_table, d_up_desc_table, d_expert_ids,
                         d_gate_partials, d_up_partials, num_active, N, K, num_experts, k_partitions);
             };
-            if constexpr (kQFNDecodeGateUpCodebook<CodebookId>)
+            if constexpr (kQFNDecodeFixedGateUpCodebook<CodebookId>)
             {
                 if (fixed_qfn)
                     return issue.template operator()<true>();
@@ -27158,7 +27187,7 @@ __attribute__((visibility("default"))) bool cudaMoE_softmax_topk_decode_selected
                                     original_slot_base, tile_route_slots, intermediate, d_model, num_experts,
                                     gateup_k_partitions);
                         };
-                        if constexpr (llaminar2::CUDAMoEBatchInvariantPolicy::qfnVerifierPackedGateUp(CodebookId))
+                        if constexpr (llaminar2::CUDAMoEBatchInvariantPolicy::qfnPackedGateUp(CodebookId))
                         {
                             if (use_fixed_qfn)
                             {
