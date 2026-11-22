@@ -5,9 +5,10 @@
  * The ordered pair additionally exercises independent low/high integer sums
  * with opposing signed extrema before the unchanged FP contribution/fold.
  * Canonical source factories and the public serial kernel own grouped-row
- * oracles. Actual identity-nibble M1 additionally uses an independent scalar
- * original biased-integer witness, since its public serial entry also changes. Identity-nibble inputs also authenticate unsigned decoded ranges and
- * the original stored compensation on AVX2 and AVX512. Native grouped execution
+ * oracles. Identity-nibble and expanded-five-bit M1 additionally use an
+ * independent scalar witness for the original biased integer dot. Prepared
+ * inputs authenticate unsigned decoded ranges and the original stored
+ * compensation on AVX2 and AVX512. Native grouped execution
  * borrows owned and workspace banks across
  * changing live rows, purposes and dirty-tail reuse. These are numerical and
  * lifecycle fixtures, not recorded model route replay or performance evidence.
@@ -142,8 +143,8 @@ TEST(CPUNativeQuantisedFusedCompletion, UnsignedCoefficientDomainContract)
 
 #if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
 /**
- * @brief Independent original biased-integer witness for one actual identity row.
- * @param packed Original Q4_1/Q4_K prepared bank, without modifying its layout.
+ * @brief Independent original biased-integer witness for one unsigned row.
+ * @param packed Original Q4_1/Q4_K or Q5_1/Q5_K prepared bank.
  * @param activation One original signed-Q8 row, including raw scale words.
  * @param output Destination for exactly packed.N columns.
  * @param workers Actual original invocation worker count owning serial K cuts.
@@ -153,7 +154,7 @@ TEST(CPUNativeQuantisedFusedCompletion, UnsignedCoefficientDomainContract)
  * FP contribution helpers and fixed partial reducer are shared with production;
  * this makes a changed public M1 kernel unable to certify its own integer dots.
  */
-void originalBiasedIdentityM1(
+void originalBiasedUnsignedM1(
     const cpu::native_quantised::CPUNativeQuantisedPackedWeights& packed,
     const Q8_1Block* activation,float* output,int workers)
 {
@@ -164,6 +165,8 @@ void originalBiasedIdentityM1(
     // production predicate may interpret this arithmetic-schedule field.
     const int tiles=nativeQuantisedUsesKPartitions(config.k_tiles)?config.k_tiles:1;
     const int blocks_per_tile=(packed.blocks_per_row+tiles-1)/tiles;
+    const bool expanded = packed.coefficientDomain() == CPUNativeQuantisedCoefficientDomain::UnsignedFiveBit;
+    const int groups = expanded ? 8 : 4;
     std::vector<float> partials(size_t(tiles)*64);
     for(int chunk=0;chunk<(packed.N+63)/64;++chunk) {
         for(int tile=0;tile<tiles;++tile) {
@@ -175,13 +178,17 @@ void originalBiasedIdentityM1(
                 alignas(64) int32_t dots[64];
                 for(int column=0;column<64;++column) {
                     int dot=0;
-                    for(int group=0;group<4;++group) {
+                    for(int group=0;group<groups;++group) {
                         const auto* bytes=reinterpret_cast<const uint8_t*>(
                             packed.interleavedB(chunk,kb,group,column/16));
                         for(int lane=0;lane<4;++lane) {
                             const uint8_t raw=bytes[(column%16)*4+lane];
-                            dot+=(int(input.qs[group*4+lane])+128)*(raw&15);
-                            dot+=(int(input.qs[group*4+16+lane])+128)*(raw>>4);
+                            if (expanded)
+                                dot+=(int(input.qs[group*4+lane])+128)*raw;
+                            else {
+                                dot+=(int(input.qs[group*4+lane])+128)*(raw&15);
+                                dot+=(int(input.qs[group*4+16+lane])+128)*(raw>>4);
+                            }
                         }
                     }
                     dots[column]=dot-128*int(packed.chunkComp(chunk,kb)[column]);
@@ -443,7 +450,8 @@ TEST(CPUNativeQuantisedFusedCompletion, UnsignedWeightDotAllFormatByteLifecycle)
                                                           extent * sizeof(float)), 0) << "Auto member=" << member;
                             }
 #if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
-                            if(source_identity_nibble && rows==1 && activeISALevel()>=ISALevel::AVX512)
+                            if ((source_identity_nibble || source_five_bit) && rows == 1 &&
+                                activeISALevel() >= ISALevel::AVX512)
                             {
                                 // Actual public decode and fused one-row members
                                 // must match the independent original integer
@@ -461,7 +469,7 @@ TEST(CPUNativeQuantisedFusedCompletion, UnsignedWeightDotAllFormatByteLifecycle)
                                         (scale_bits&0x7c00u)==0x7c00u && (scale_bits&0x03ffu)
                                             ? uint16_t(scale_bits^0x002au):uint16_t(scale_bits^0x8000u);
                                     std::vector<float> original(extent,guard),actual(extent,guard);
-                                    originalBiasedIdentityM1(packed,input.data(),original.data(),workers);
+                                    originalBiasedUnsignedM1(packed,input.data(),original.data(),workers);
                                     gemv_native_quantised_preq(packed,input.data(),actual.data(),serial_partials.span());
                                     EXPECT_EQ(std::memcmp(actual.data(),original.data(),extent*sizeof(float)),0)
                                         << "public M1 versus original biased integer witness";
@@ -474,7 +482,7 @@ TEST(CPUNativeQuantisedFusedCompletion, UnsignedWeightDotAllFormatByteLifecycle)
                                             descriptors[member].purpose=purpose;
                                         }
                                         const auto one=planNativeQuantisedFusedRows(descriptors,max_rows,workers,ISAPath::AUTO);
-                                        if(policy==CPUProjectionNumericalPolicy::GPUAlignedExpert) {
+                                        if (source_identity_nibble && policy == CPUProjectionNumericalPolicy::GPUAlignedExpert) {
                                             ASSERT_EQ(one.partial_route,NativeQuantisedFusedPartialRoute::OutputTileLocal);
                                             ASSERT_TRUE(nativeQuantisedUsesKPartitions(one.projections[0].k_tiles));
                                         }

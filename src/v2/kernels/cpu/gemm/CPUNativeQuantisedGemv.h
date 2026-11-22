@@ -37,9 +37,9 @@
  *   4 comp loads + 4 mullo + 4 sub (bias correction)
  *   4 scale loads + 4 mul + 4 fmadd (FP32 accumulation)
  *
- * Unsigned expanded five-bit and identity-nibble ordered pair dots retain
- * signed activations and exchange VNNI operand roles, eliminating only the
- * exact integer bias compensation; signed Q4_0/LUT coefficient paths do not change.
+ * Unsigned expanded five-bit and identity-nibble dots retain signed
+ * activations and exchange VNNI operand roles, eliminating the exact integer
+ * bias compensation for those prepared coefficient domains.
  * Fused prefix/LUT stack storage initializes only admitted live descriptors;
  * inactive fixed-capacity slots never enter searches or microkernel arguments.
  * Execution plans likewise default-construct only live projections in caller-owned
@@ -2758,6 +2758,68 @@ namespace llaminar2::cpu::native_quantised
     // =========================================================================
 
     /**
+     * @brief Apply one canonically prepared Q5_1/Q5_K AVX-512 output chunk.
+     * @tparam Policy Original matrix's FP32 contribution policy.
+     * @param packed Admitted expanded unsigned five-bit weights and plain FP16 coefficients.
+     * @param input Signed Q8 activation blocks in original K order.
+     * @param output Destination for the complete 64-column tile.
+     * @param chunk Physical output tile index.
+     * @param first First K block of the admitted partition.
+     * @param end Exclusive K-block end of the partition.
+     * @param accumulate Start from an existing destination instead of positive zero.
+     *
+     * As in the paired kernel, unsigned B and signed A give the original
+     * dot directly. Both that dot and the old biased dot plus compensation
+     * fit INT32. FP32 block contributions and increasing-K order stay exact.
+     */
+    template<CPUProjectionNumericalPolicy Policy>
+    inline void gemvUnsignedFiveBitAVX512Chunk(const CPUNativeQuantisedPackedWeights &packed,
+        const Q8_1Block *input, float *output, int chunk, int first, int end, bool accumulate)
+    {
+        __m512 fp[4];
+#pragma GCC unroll 4
+        for (int segment = 0; segment < 4; ++segment)
+            fp[segment] = accumulate ? _mm512_loadu_ps(output + segment * 16) : _mm512_setzero_ps();
+
+        for (int kb = first; kb < end; ++kb)
+        {
+            const Q8_1Block &activation = input[kb];
+            const uint8_t *payload = packed.interleavedB(chunk, kb, 0, 0);
+            __m512i dots[4]{};
+#pragma GCC unroll 8
+            for (int group = 0; group < 8; ++group)
+            {
+                int32_t activation_word;
+                std::memcpy(&activation_word, activation.qs + group * 4, sizeof(activation_word));
+                const __m512i a = _mm512_set1_epi32(activation_word);
+#pragma GCC unroll 4
+                for (int segment = 0; segment < 4; ++segment)
+                {
+                    const __m512i b = _mm512_load_si512(payload + group * 256 + segment * 64);
+                    dots[segment] = _mm512_dpbusd_epi32(dots[segment], b, a);
+                }
+            }
+
+            const float activation_scale = nativeQuantisedFP16ScaleToFP32(activation.d);
+            const uint16_t *scales = packed.chunkScales(chunk, kb);
+            const uint16_t *minima = packed.chunkMins(chunk, kb);
+#pragma GCC unroll 4
+            for (int segment = 0; segment < 4; ++segment)
+            {
+                const auto scale = packed.loadPlainFP16Scales512(scales + segment * 16);
+                const auto minimum = _mm512_cvtph_ps(_mm256_load_si256(
+                    reinterpret_cast<const __m256i *>(minima + segment * 16)));
+                fp[segment] = accumulateCorrectedSingleScaleBlockAVX512(
+                    fp[segment], dots[segment], scale, activation.sum_qs, minimum, activation_scale, Policy);
+            }
+        }
+
+#pragma GCC unroll 4
+        for (int segment = 0; segment < 4; ++segment)
+            _mm512_storeu_ps(output + segment * 16, fp[segment]);
+    }
+
+    /**
      * @brief Dispatch one non-nibble AVX-512 chunk by prepared encoding.
      *
      * Loads pre-decoded INT8 values directly from the interleaved buffer.
@@ -2790,6 +2852,14 @@ namespace llaminar2::cpu::native_quantised
         if (!packed.usesExpandedInt8())
             throw std::invalid_argument(
                 "AVX-512 non-nibble GEMV received an unsupported packed encoding");
+        if (packed.coefficientDomain() == CPUNativeQuantisedCoefficientDomain::UnsignedFiveBit)
+        {
+            if (packed.numerical_policy == CPUProjectionNumericalPolicy::GPUAlignedExpert)
+                return gemvUnsignedFiveBitAVX512Chunk<CPUProjectionNumericalPolicy::GPUAlignedExpert>(
+                    packed, A_q8, C, chunk, kb_start, kb_end, accumulate);
+            return gemvUnsignedFiveBitAVX512Chunk<CPUProjectionNumericalPolicy::BackendNative>(
+                packed, A_q8, C, chunk, kb_start, kb_end, accumulate);
+        }
 
         __m512 fp_acc0 = accumulate ? _mm512_loadu_ps(C) : _mm512_setzero_ps();
         __m512 fp_acc1 = accumulate ? _mm512_loadu_ps(C + 16) : _mm512_setzero_ps();

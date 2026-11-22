@@ -92,3 +92,32 @@ and 11.20% in the AVX-512 non-nibble GEMV entry. The most sampled instructions
 in those two projection symbols were AVX-512 arithmetic and weight operands.
 Attribute critical-path time with separate elapsed measurements of the CPU
 leaves and actual thread scaling alongside the CUDA dispatch timeline.
+
+## AVX-512 unsigned Q5 M1
+
+The Q5_1/Q5_K single-row path uses canonical unsigned prepared weights and the
+original signed Q8 activations as the VNNI operands. The dot skips activation
+rebiasing and the 128-byte compensation plane per N64/K32 unit. The kernel
+uses the original FP16 scale and minimum values, FP32 contribution policy
+and K reduction order. The linked Release code has 32 `vpdpbusd` instructions
+per K block in each bank path and no vector stack accesses. The existing
+AVX2 and AVX-512 unsigned-weight preflight cases passed, including the
+independent original biased-dot oracle for serial and fused one-row Q5.
+
+The Release comparison fixed the CUDA parent to its staged path and used
+the same 2×CUDA/2×CPU F320/S320 plan in both arms. Each cell used one warmup
+and three measured 256-token requests. Every generated history and all MTP
+work matched, including `[1197, 594, 132, 171, 1368]` draft steps, accepted
+tokens, rejected tokens, verifier runs and verifier tokens in each fixed-depth
+arm. Driver diagnostics were unchanged during the comparison.
+
+| Arm order | Cell | Original decode tokens/s | Unsigned Q5 decode tokens/s | Decode change | Combined prefill and decode latency change |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Candidate first | Ordinary | 29.600 | 29.829 | +0.77% | −0.81% |
+| Staged control first | Ordinary | 29.570 | 30.443 | +2.95% | −2.60% |
+| Candidate first | Fixed depth seven | 43.750 | 44.174 | +0.97% | −0.74% |
+| Staged control first | Fixed depth seven | 43.546 | 45.048 | +3.45% | −2.96% |
+
+Median prefill rate improved by 0.30–1.94% across these cells. The revised
+compulsory footprint is 1,945,600 bytes per route for Q4_K/Q5_1 and
+Q4_K/Q8_0, and 2,764,800 for Q5_K/Q8_0.
