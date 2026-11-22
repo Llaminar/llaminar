@@ -1185,12 +1185,19 @@ namespace llaminar2
             {
                 return false;
             }
-            return moe_kernel_->packSingleRowMoEOverlayActivationDispatch(
-                packetLaunchContext(stream),
-                MoEOverlayActivationSingleRowDispatchPackLaunch{
-                    .packet = launch,
-                    .publication = publication,
-                });
+            const MoEOverlayActivationSingleRowDispatchPackLaunch packet{
+                .packet = launch, .publication = publication,
+            };
+#ifdef HAVE_CUDA
+            if (early_route_publication_)
+            {
+                if (!resident_dispatch_copy_)
+                    throw std::logic_error("CUDA retained single-row dispatch lost its prepared mapped copy");
+                const cuda_moe_packet::ResidentMappedDispatch lane{packet, *resident_dispatch_copy_};
+                return cuda_moe_packet::recordResidentDispatchPackets(std::span(&lane, 1u), params_.device_id.ordinal, stream);
+            }
+#endif
+            return moe_kernel_->packSingleRowMoEOverlayActivationDispatch(packetLaunchContext(stream), packet);
         }
 
         if (!moe_kernel_->packMoEOverlayActivationDispatch(
@@ -1280,6 +1287,18 @@ namespace llaminar2
             return false;
         }
         setGPUStream(stream);
+#ifdef HAVE_CUDA
+        if (early_route_publication_ && !resident_dispatch_copy_)
+        {
+            const auto payload = params_.lane.dispatchPayload(params_.physical_rows);
+            if (!useSingleRowDirectPacket(payload) ||
+                !cuda_moe_packet::prepareResidentDispatchPacket(params_.device_id.ordinal))
+                throw std::logic_error("CUDA early route requires an admitted one-row mapped dispatch");
+            resident_dispatch_copy_ = TransferEngine::instance().prepareDeviceToMappedHostCopy(
+                *params_.hidden, *params_.lane.mapped_region, payload.hidden_payload_offset,
+                static_cast<std::size_t>(payload.packet.d_model) * sizeof(float), params_.device_id);
+        }
+#endif
         grant_initialization_joined_ =
             params_.stage_ordinal != 0u ||
             joinGrantInitialization(
@@ -2319,6 +2338,10 @@ namespace llaminar2
         }
         if (params_.transaction->usesAsynchronousLanes())
             return params_.transaction->persistentResourcesReady() && shared_row_groups_prepared_;
+#ifdef HAVE_CUDA
+        if (early_route_publication_)
+            return !resident_dispatch_.empty() && resident_dispatch_.size() == params_.transaction->lanes().size();
+#endif
         return
                params_.routing_indices->gpu_data_ptr() &&
                params_.routing_weights->gpu_data_ptr() &&
@@ -2361,6 +2384,13 @@ namespace llaminar2
             return false;
         }
         const auto &lanes = params_.transaction->lanes();
+#ifdef HAVE_CUDA
+        if (!resident_dispatch_.empty())
+            return resident_dispatch_.size() == lanes.size();
+        std::vector<cuda_moe_packet::ResidentMappedDispatch> mapped_dispatch;
+        if (early_route_publication_)
+            mapped_dispatch.reserve(lanes.size());
+#endif
         if (descriptor_storage_)
         {
             return descriptor_storage_->requireInput(stream) &&
@@ -2422,8 +2452,25 @@ namespace llaminar2
             };
             if (!launch.valid())
                 return false;
+#ifdef HAVE_CUDA
+            if (early_route_publication_)
+            {
+                auto copy = TransferEngine::instance().prepareDeviceToMappedHostCopy(
+                    *params_.hidden, *lane.mapped_region, payload.hidden_payload_offset,
+                    static_cast<std::size_t>(payload.packet.d_model) * sizeof(float), params_.device_id);
+                mapped_dispatch.push_back({launch, copy});
+                continue;
+            }
+#endif
             launches.push_back(launch);
         }
+#ifdef HAVE_CUDA
+        if (early_route_publication_)
+        {
+            resident_dispatch_ = std::move(mapped_dispatch);
+            return !resident_dispatch_.empty();
+        }
+#endif
         return uploadPersistentLaunchArray(
             launches,
             params_.device_id,
@@ -2667,7 +2714,11 @@ namespace llaminar2
             }
         }
 
+#ifdef HAVE_CUDA
+        if (!early_route_publication_ && !descriptor_storage_->requireInput(stream))
+#else
         if (!descriptor_storage_->requireInput(stream))
+#endif
         {
             LOG_ERROR("[MoEOverlayActivationDispatchPackBatchStage] Descriptor input join failed");
             return false;
@@ -2684,7 +2735,17 @@ namespace llaminar2
                 return false;
             }
         }
-        const auto launch =
+        bool launched = false;
+#ifdef HAVE_CUDA
+        if (early_route_publication_)
+        {
+            launched = cuda_moe_packet::recordResidentDispatchPackets(resident_dispatch_,
+                params_.device_id.ordinal, stream);
+        }
+        else
+#endif
+        {
+            const auto launch =
             MoEOverlayActivationSingleRowDispatchBatchLaunch{
                 .lanes = static_cast<const
                     MoEOverlayActivationSingleRowDispatchPackLaunch *>(
@@ -2692,9 +2753,8 @@ namespace llaminar2
                 .lane_count = static_cast<std::uint32_t>(
                     lanes.size()),
             };
-        const bool launched =
-            moe_kernel_->packSingleRowMoEOverlayActivationDispatchBatch(
-                packetLaunchContext(stream), launch);
+            launched = moe_kernel_->packSingleRowMoEOverlayActivationDispatchBatch(packetLaunchContext(stream), launch);
+        }
         if (launched)
         {
             PerfStatsCollector::addCounter(
@@ -2792,6 +2852,11 @@ namespace llaminar2
             return false;
         }
         setGPUStream(stream);
+#ifdef HAVE_CUDA
+        if (early_route_publication_ && (params_.transaction->usesAsynchronousLanes() ||
+            !cuda_moe_packet::prepareResidentDispatchPacket(params_.device_id.ordinal)))
+            throw std::logic_error("CUDA early route requires an admitted one-row mapped dispatch batch");
+#endif
         if(!params_.transaction->materializePersistentResources())return false;
         if (params_.transaction->usesAsynchronousLanes())
         {

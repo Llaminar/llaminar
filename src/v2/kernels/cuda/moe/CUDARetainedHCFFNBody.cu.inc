@@ -16,13 +16,6 @@
     constexpr int kRetainedRouteCounts = 2;
     static_assert(kMaxTopK <= 32, "A single original router warp compacts the QFN route slots");
 
-    /** @brief Release the original hidden and router bytes to the independent packet stage. */
-    __device__ __forceinline__ void releaseRetainedQFNPacket(std::uint64_t* signal)
-    {
-        if (signal)
-            cuda::atomic_ref<std::uint64_t, cuda::thread_scope_system>(*signal).store(1u, cuda::memory_order_release);
-    }
-
     /** @brief Select the active program and publish only the empty routing ledger on a zero row. */
     __global__ void retainedQFNM1Predicate(cudaGraphConditionalHandle condition, const int* live,
         llaminar2::cuda::moe::RetainedM1Router router)
@@ -365,20 +358,40 @@
                 args.hidden_scales + packet / 32, lane);
         grid.sync();
 
+        constexpr int output_packets = width / 32;
+        if constexpr (IndependentLocalShard)
+        {
+            // Shared Gate/Up depends on the Q8 row alone. Keep its complete
+            // packets on independent CTAs during route and descriptor setup.
+            if (blockIdx.x != 0)
+            {
+                for (unsigned packet = blockIdx.x - 1; packet < output_packets; packet += gridDim.x - 1)
+                {
+                    retainedGateUpPacket<SharedCodebook, width>(args.shared, packet,
+                        args.shared_workspace.down_codes, args.shared_workspace.down_scales,
+                        args.hidden_codes, args.hidden_scales, workspace.gate_up);
+                    __syncthreads();
+                }
+            }
+        }
+
         if (blockIdx.x == 0)
         {
             if constexpr (IndependentLocalShard)
                 softmax_topk_decode_independent_body<ObserveCollectives,
                     llaminar2::RoutedExpertRowExecutionPolicy::IntermediateShardLocal, false, kRetainedQFNExpertCount>(
                     router.logits, runtime, router.route_indices, router.route_weights, router.experts, router.top_k,
-                    router.normalize, true, nullptr, {});
+                    router.normalize, true, nullptr, {}, args.early_packet_ready);
             else
                 softmax_topk_decode_runtime_body<ObserveCollectives, false, kRetainedQFNExpertCount>(router.logits, runtime,
                     nullptr, router.route_indices, router.route_weights, router.experts, router.top_k, router.normalize, true,
                     router.local_policy, router.position, nullptr, 0, nullptr, nullptr, 0, {}, nullptr, nullptr, -1, 0, nullptr);
             __syncthreads();
-            if (threadIdx.x == 0)
-                releaseRetainedQFNPacket(args.early_packet_ready);
+            if constexpr (!IndependentLocalShard)
+            {
+                if (threadIdx.x == 0)
+                    releaseRetainedQFNPacket(args.early_packet_ready);
+            }
             if (args.shared_publication == RetainedM1SharedPublication::GatedComplete)
             {
                 const float factor = retainedSharedGateFactor(args.hc.mixed, args.shared_gate_input,
@@ -448,8 +461,6 @@
         grid.sync();
 
         const int local_count = args.route_order[0];
-        constexpr int output_packets = width / 32;
-        const unsigned routed_packets = local_count * output_packets;
         if constexpr (can_promote_gate)
         {
             const int canonical_count = args.route_order[1];
@@ -458,13 +469,17 @@
         }
         else
             retainedRoutedGateUpRange<GateCodebook, width>(args, 0, local_count, workspace.gate_up);
-        for (unsigned packet = (blockIdx.x + gridDim.x - routed_packets % gridDim.x) % gridDim.x;
-             packet < output_packets; packet += gridDim.x)
+        if constexpr (!IndependentLocalShard)
         {
-            retainedGateUpPacket<SharedCodebook, width>(args.shared, packet,
-                args.shared_workspace.down_codes, args.shared_workspace.down_scales,
-                args.hidden_codes, args.hidden_scales, workspace.gate_up);
-            __syncthreads();
+            const unsigned routed_packets = local_count * output_packets;
+            for (unsigned packet = (blockIdx.x + gridDim.x - routed_packets % gridDim.x) % gridDim.x;
+                 packet < output_packets; packet += gridDim.x)
+            {
+                retainedGateUpPacket<SharedCodebook, width>(args.shared, packet,
+                    args.shared_workspace.down_codes, args.shared_workspace.down_scales,
+                    args.hidden_codes, args.hidden_scales, workspace.gate_up);
+                __syncthreads();
+            }
         }
         grid.sync();
 

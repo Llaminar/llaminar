@@ -273,6 +273,106 @@ arithmetic across 18 input states for each format and card.
 | Q4_K / Q8_0 | 56.32 | 56.32 | 97.28–98.30 | 74.24–74.75 |
 | Q5_K / Q8_0 | 56.32 | 56.83–57.34 | 98.30 | 76.80–77.31 |
 
+Both Release run orders reproduced the same 256 tokens and per-iteration MTP
+work as the staged control. Ordinary decode medians were 29.26 → 29.02 and
+29.34 → 28.10 tok/s. Fixed-depth-seven medians were 43.13 → 43.00 and
+43.23 → 43.45 tok/s. The ordinary decode result keeps the candidate gated.
+
+### SM86 arithmetic and mapped packet residency
+
+The gfx906 reference starts independent shared Gate/Up work as soon as its Q8
+input is ready and resolves the physical route planes before the packed dot
+loop. The SM86 mapped fragment uses the same schedule boundary. A separate
+set of CTAs handles shared Gate/Up while the router CTA publishes the
+canonical indices and weights and binds the local routed descriptors.
+
+Disassembly of the SM86 Q4_K / Q5_1 fragment shows six `LDG.E.64` loads for
+the Gate/Up plane addresses before the packed K loop. The loop consumes the
+prepared Q8 input through two `LDG.E.128` loads per packet and uses
+`IDP.4A.S8.S8` for the two integer dots and their common activation sum.
+The corresponding gfx906 path uses `v_dot4_i32_i8`. The original ordered
+FP32 fold is preserved. All 24 SM86 fragment entries use 96 registers
+per thread, 22,080 shared bytes, and zero stack or local bytes.
+
+The first mapped dispatch experiment used 128 threads beside the SM86
+retained program. Two resident math CTAs consume 49,152 registers. The original
+single-lane and batch packet entries use 128 and 124 registers per thread
+respectively, which allocate 16,384 registers per 128-thread CTA after
+rounding. The combined geometry fits the measured 65,536-register SM86
+file and the shared-memory budget. Cold preparation verifies the compiled
+resources of each entry. The ordinary staged graph retains its 512-thread
+packet, which consumes the full register file on its SM.
+
+The captured transport probe uses the real GPU kernel, a mapped host lane,
+the original lease publication, and matched resident and staged F320/S320
+work. All 18 seeded states per arm produced identical contributions and
+packet bytes. Median ranges cover both RTX 3090s and the three source pairs.
+
+| Program | Mapped packet completion, µs | Local math retirement, µs |
+| --- | ---: | ---: |
+| Staged, 512-thread packet | 69.63–70.66 | 110.59–112.64 |
+| Resident, 512-thread packet | 86.02–88.06 | 77.82–79.87 |
+| Resident, 128-thread packet | 90.11–92.16 | 77.82–79.87 |
+
+The resource envelope alone left the CPU packet later than staged. The
+128-thread geometry also increased mapped completion time relative to the
+512-thread resident packet. This measurement scores the real mapped
+publication separately from the earlier on-device copy witness.
+
+The separate Release geometry receipt for the full 2×CUDA/2×CPU smoke
+contains 48 resident decoder layers per GPU and the corresponding 48
+128-thread packets on the continuation GPU. It reproduced the staged
+control's first 12 tokens. The six focused native contracts and replays
+passed on each CUDA card.
+
+Both paired full-model runs preserved all 256 tokens and every per-run
+MTP work count. Ordinary decode was 29.40 → 28.88 and 29.97 → 28.85 tok/s.
+Fixed depth seven was 43.53 → 43.84 and 44.49 → 43.46 tok/s. With an extra
+event at the packet acquire frontier,
+the resident graph made the route available in about 46 µs, versus 52 µs
+staged. CUDA node priority had no repeatable effect on mapped completion.
+The vectorized 128-thread packet matched the resident scalar 512-thread
+packet at about 87 µs, while staged mapped completion was about 74 µs in the
+same event-bracketed setup.
+
+### Captured conditional DMA for the CPU packet
+
+An isolated 10,240-byte copy-engine probe into the original mapped host
+row completed at 55.79–56.91 µs with the resident producer. Both RTX 3090s
+replayed native conditional copies across active and empty states with exact
+bytes and untouched destinations on empty rows.
+
+The complete packet probe uses the original route schema, pinned placement
+bank, mapped host row and system release. The device writes compacted routes
+in original router order. A conditional body owns only the live row's DMA.
+Each original lease is released when its metadata and optional copy retire.
+Across both cards and all three format pairs, 18 seeded full states per
+pair preserved every packet and contribution byte.
+
+| Program | Mapped packet completion, µs | Local math retirement, µs |
+| --- | ---: | ---: |
+| Staged 512-thread reference | 72.70–73.73 | 114.69–116.74 |
+| Resident scalar metadata and conditional DMA | 79.87–81.92 | 78.30–79.87 |
+| Resident warp metadata and conditional DMA | 72.70–73.73 | 76.80–79.87 |
+
+Each captured control has an event before dispatch to expose the packet
+frontier. The exact captured graph, topology residency and complete mixed
+Release case determine qualification.
+
+The integrated Release smoke preserved the first 12 original tokens on the
+2×CUDA/2×CPU plan. The native capture contains 48 resident arithmetic nodes
+on each CUDA device and 48 metadata and lease pairs on the continuation.
+The native preflight checks one and three independent lanes, exact packet
+order, empty destinations and CPU acquisition before graph retirement.
+
+An isolated Gate/Up experiment forms one exact signed sum per Q8 input
+packet during quantization. The representative Q4_K / Q5_1 entry uses
+280 packed-dot instructions in its static image versus 296 before the
+change. All 24 fragment entries retain 96 registers and zero private
+bytes. Across both cards and all three source pairs, retirement moved by
+0–1.03 µs. The native replays and all 18 full seeded states per pair and
+card retained exact bytes.
+
 ### Grouped Gate/Up packets and direct Down on SM86
 
 The grouped native program uses one 256-thread CTA per live 32-column

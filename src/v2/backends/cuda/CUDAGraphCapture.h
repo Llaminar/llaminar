@@ -33,6 +33,7 @@ namespace llaminar2
 {
     class CUDAGraphCapture;
     class NvidiaDeviceContext;
+    class DeviceToMappedHostCopy;
 
     /**
      * @brief Splice one mapped 64-bit wait into an active CUDA stream capture.
@@ -356,6 +357,15 @@ namespace llaminar2
             const cudaKernelNodeParams &params,
             const char *semantic_name,
             CUDACapturedKernelGrid grid);
+
+        /**
+         * @brief Append the exact live copy into a registered host packet.
+         * @param branch Device condition that owns the transfer's live extent.
+         * @param copy Original source and destination bound by TransferEngine.
+         * @return True when the native branch owns the copy completion.
+         */
+        bool appendMappedHostCopy(
+            CUDAActiveCaptureConditionalBranch branch, const DeviceToMappedHostCopy &copy);
 
         /**
          * @brief Seal non-empty branches and publish the conditional as the stream tail.

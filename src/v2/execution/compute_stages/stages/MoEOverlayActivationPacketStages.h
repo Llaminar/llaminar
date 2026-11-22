@@ -25,6 +25,10 @@
 #include "../../../execution/moe/MoEOverlayNodeLocalRankBatchTransport.h"
 #include "../../../memory/BufferId.h"
 
+#ifdef HAVE_CUDA
+#include "kernels/cuda/moe/CUDAMoEOverlayActivationPacketKernels.h"
+#endif
+
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -144,6 +148,7 @@ namespace llaminar2
         bool grant_initialization_joined_ = false;
 #ifdef HAVE_CUDA
         std::shared_ptr<CUDAEarlyPacketPublication> early_route_publication_;
+        std::optional<DeviceToMappedHostCopy> resident_dispatch_copy_; ///< Cold original row and mapped payload.
 #endif
     };
 
@@ -438,6 +443,7 @@ namespace llaminar2
         bool grant_initialization_joined_ = false;
 #ifdef HAVE_CUDA
         std::shared_ptr<CUDAEarlyPacketPublication> early_route_publication_;
+        std::vector<cuda_moe_packet::ResidentMappedDispatch> resident_dispatch_; ///< Cold original independent lanes.
 #endif
     };
 

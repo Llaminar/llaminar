@@ -7,6 +7,46 @@
 
 #include "execution/moe/MoEOverlayActivationPacketABI.h"
 #include "execution/moe/MoEOverlayNodeLocalRouteExchangeABI.h"
+#include "transfer/TransferEngine.h"
+
+#include <span>
+
+namespace llaminar2::cuda_moe_packet
+{
+    /** @brief Per-CTA resource envelope reserved by the co-resident QFN packet geometry on SM86. */
+    struct ResidentDispatchPeerBudget
+    {
+        static constexpr unsigned block_threads = 256;
+        static constexpr unsigned registers_per_thread = 96;
+        static constexpr unsigned shared_bytes = 22528;
+        static constexpr unsigned blocks_per_sm = 2;
+    };
+
+    /** @brief Original one-row packet with its registered, conditionally copied payload. */
+    struct ResidentMappedDispatch
+    {
+        MoEOverlayActivationSingleRowDispatchPackLaunch launch;
+        DeviceToMappedHostCopy copy;
+    };
+
+    /**
+     * @brief Certify the metadata warp's residency beside the original math grid.
+     * @param device_ordinal Exact prepared CUDA device.
+     * @return Whether its compiled resources fit beside two retained CTAs.
+     */
+    bool prepareResidentDispatchPacket(int device_ordinal);
+
+    /**
+     * @brief Record independent packet lanes on the current retained frontier.
+     * @param lanes Prevalidated topology-ordered native packet bindings.
+     * @param device_ordinal Exact CUDA device admitted for the program.
+     * @param stream Original non-default stream recording the complete parent.
+     * @return Whether every lease is recorded and the current frontier joins them.
+     */
+    bool recordResidentDispatchPackets(std::span<const ResidentMappedDispatch> lanes,
+        int device_ordinal, void* stream);
+
+}
 
 extern "C"
 {

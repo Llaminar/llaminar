@@ -51,6 +51,7 @@
 
 #include "CUDARetainedHCFFN.h"
 #include "CUDARetainedGroupedFFN.h"
+#include "CUDAMoEOverlayActivationPacketKernels.h"
 #include "CUDARetainedHCPrefix.cuh"
 #include "kernels/common/NativeCooperativeKernel.cuh"
 #include "kernels/cuda/gemm/CUDANativeQuantisedDecodeCommon.cuh"
@@ -14793,6 +14794,13 @@ namespace
             rebalance_command_buffer_count, active_row_count_device);
     }
 
+    /** @brief Release the original hidden and selected router bytes to the independent packet stage. */
+    __device__ __forceinline__ void releaseRetainedQFNPacket(std::uint64_t* signal)
+    {
+        if (signal)
+            cuda::atomic_ref<std::uint64_t, cuda::thread_scope_system>(*signal).store(1u, cuda::memory_order_release);
+    }
+
     /**
      * @brief Minimal decode router for independently published owner or fragment slots.
      *
@@ -14823,6 +14831,7 @@ namespace
      * @param write_legacy_outputs Whether complete selected outputs are required.
      * @param active_row_count_device Optional live count for this physical row.
      * @param publication Original arena outputs; unused in the control specialization.
+     * @param early_packet_ready Optional same-device CPU packet edge for the fully active retained fragment.
  */
     template <bool UpdateRuntimeHistogram,
               llaminar2::RoutedExpertRowExecutionPolicy RowPolicy = llaminar2::RoutedExpertRowExecutionPolicy::ParticipantAssigned,
@@ -14837,7 +14846,8 @@ namespace
         bool normalize_weights,
         bool write_legacy_outputs,
         const int32_t *__restrict__ active_row_count_device,
-        llaminar2::MoEDecodeDescriptorPublication publication)
+        llaminar2::MoEDecodeDescriptorPublication publication,
+        std::uint64_t* early_packet_ready = nullptr)
     {
         __shared__ float values[ExpertCapacity];
         __shared__ float reductions[kThreads];
@@ -14908,6 +14918,29 @@ namespace
             if (normalize_weights && topk_sum > 0.0f)
                 for (int slot = 0; slot < top_k; ++slot)
                     selected_weights[slot] = selected_weights[slot] / topk_sum;
+
+            if constexpr (ExpertCapacity == 512 &&
+                RowPolicy == llaminar2::RoutedExpertRowExecutionPolicy::IntermediateShardLocal)
+            {
+                if (early_packet_ready)
+                {
+                    runtime_require_decode_row_policy(runtime, RowPolicy);
+                    const auto bank = runtime_require_decode_execution_bank(runtime);
+                    if (!runtime_shape_ok(runtime, bank, num_experts, top_k) ||
+                        !runtime_route_assignment_ledger_ok(runtime, top_k))
+                        __trap();
+
+                    // The original CPU packet consults its own acquired target
+                    // map. The GPU fragment's private descriptor validation
+                    // can continue independently after these canonical bytes.
+                    for (int slot = 0; slot < top_k; ++slot)
+                    {
+                        legacy_indices[slot] = static_cast<float>(selected[slot]);
+                        legacy_weights[slot] = selected_weights[slot];
+                    }
+                    releaseRetainedQFNPacket(early_packet_ready);
+                }
+            }
         }
         // Only metadata publication is parallel: preserve the serial FP32
         // sum/division and make its exact bits visible to every selected lane.
@@ -14983,7 +15016,7 @@ namespace
                     }
                 }
             }
-            if (write_legacy_outputs)
+            if (write_legacy_outputs && !early_packet_ready)
             {
                 legacy_indices[slot] = static_cast<float>(expert_id);
                 legacy_weights[slot] = row_active ? weight : 0.0f;
@@ -28175,6 +28208,8 @@ namespace llaminar2::cuda::moe
             hidden / retained_hc_read_warp_channels);
         if (blocks > admitted.maximumGrid())
             throw std::invalid_argument("Retained QFN HC/FFN entry cannot keep the measured CTA grid resident");
+        if (router.local_policy == RoutedExpertRowExecutionPolicy::IntermediateShardLocal && blocks < 2u)
+            throw std::invalid_argument("Retained QFN HC/FFN needs separate route and shared Gate/Up CTAs");
         if (arguments.early_packet_ready)
         {
             if (hc.norm.extent.liveRows)
@@ -28183,6 +28218,14 @@ namespace llaminar2::cuda::moe
             if (blocks < 2u || reinterpret_cast<std::uintptr_t>(arguments.early_packet_ready) % alignof(std::uint64_t) ||
                 cudaDeviceGetAttribute(&concurrent, cudaDevAttrConcurrentKernels, int(device.ordinal)) != cudaSuccess || !concurrent)
                 throw std::invalid_argument("Retained QFN HC/FFN cannot admit its independent packet lane");
+            if (router.local_policy == RoutedExpertRowExecutionPolicy::IntermediateShardLocal)
+            {
+                using Peer = cuda_moe_packet::ResidentDispatchPeerBudget;
+                const auto& resources = admitted.resources();
+                if (admitted.threads() != Peer::block_threads || resources.registers_per_thread > Peer::registers_per_thread ||
+                    resources.static_shared_bytes > Peer::shared_bytes || resources.blocks_per_processor < Peer::blocks_per_sm)
+                    throw std::invalid_argument("Retained QFN HC/FFN exceeds its co-resident original dispatch packet budget");
+            }
             // Preserve room for a packet acquire CTA even when it runs before the
             // cooperative entry. The follower retains its full arithmetic grid.
             blocks = std::min(blocks, admitted.maximumGrid() - 1u);

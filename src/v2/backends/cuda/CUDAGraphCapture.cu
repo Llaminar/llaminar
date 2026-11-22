@@ -36,6 +36,7 @@
 #include "../NativeParallelGraphBranch.h"
 #include "../NativeGraphDependencyReduction.h"
 #include "../../utils/Logger.h"
+#include "transfer/TransferEngine.h"
 
 #include <cuda.h>
 #include <cuda/atomic>
@@ -966,6 +967,35 @@ namespace llaminar2
                 return fail("cudaGraphKernelNodeSetAttribute(cooperative conditional kernel)", result);
         }
         branch_tails_[index] = node;
+        ++branch_node_counts_[index];
+        return true;
+    }
+
+    /** @copydoc CUDAActiveCaptureConditional::appendMappedHostCopy */
+    bool CUDAActiveCaptureConditional::appendMappedHostCopy(
+        CUDAActiveCaptureConditionalBranch branch, const DeviceToMappedHostCopy &copy)
+    {
+        const auto index = branchIndex(branch);
+        if (state_ != State::BuildingBranches || index >= branch_graphs_.size() ||
+            !branch_graphs_[index] || branch != CUDAActiveCaptureConditionalBranch::IfNonZero)
+            return fail("CUDA mapped host copy requires an active positive conditional body");
+
+        int ordinal = -1;
+        // The active capture already authenticates its exact stream and parent.
+        // CUDA forbids stream-device queries during capture.
+        const auto device_status = cudaGetDevice(&ordinal);
+        if (device_status != cudaSuccess)
+            return fail("cudaGetDevice(active mapped host copy)", device_status);
+        if (copy.device() != DeviceId::cuda(ordinal))
+            return fail("CUDA mapped host copy belongs to a different device");
+
+        const auto dependency = branch_tails_[index];
+        auto& tail = branch_tails_[index];
+        const auto status = cudaGraphAddMemcpyNode1D(&tail, branch_graphs_[index],
+            dependency ? &dependency : nullptr, dependency ? 1u : 0u,
+            copy.destination(), copy.source(), copy.bytes(), cudaMemcpyDeviceToHost);
+        if (status != cudaSuccess)
+            return fail("cudaGraphAddMemcpyNode1D(active mapped host copy)", status);
         ++branch_node_counts_[index];
         return true;
     }

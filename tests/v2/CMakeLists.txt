@@ -12164,6 +12164,11 @@ if(TARGET v2_integration_cuda_retained_hc_ffn)
             --gtest_filter=CUDARetainedHCFFN.RecordedFragmentRouting
         LABELS "V2;Integration;ProductionTestPreflight;CUDA;MoE;Hyperconnection;GraphCapture;Replay;ByteExact;Regression;HardwareOptional;LocalHostDevices;Devices1;NativeISA-sm_86"
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 120)
+    add_v2_test(V2_Integration_CUDA_RetainedHCFFNMappedDmaDispatchContract
+        COMMAND $<TARGET_FILE:v2_integration_cuda_retained_hc_ffn>
+            --gtest_filter=CUDARetainedHCFFN.MappedDmaDispatchContract
+        LABELS "V2;Integration;ProductionTestPreflight;CUDA;MoE;Hyperconnection;GraphCapture;ByteExact;Contract;Regression;HardwareOptional;LocalHostDevices;Devices1;NativeISA-sm_86"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 120)
     if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL 12.8)
         add_v2_test(V2_Integration_CUDA_GroupedLiveGridContract
             COMMAND $<TARGET_FILE:v2_integration_cuda_retained_hc_ffn>

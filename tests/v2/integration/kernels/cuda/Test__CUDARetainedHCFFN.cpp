@@ -11,6 +11,7 @@
 #include "backends/cuda/CUDAGraphCapture.h"
 #include "backends/cuda/CUDAHardwareMetadata.h"
 #include "execution/moe/MoERuntimeTable.h"
+#include "kernels/cuda/moe/CUDAMoEOverlayActivationPacketKernels.h"
 #include "kernels/cuda/moe/CUDARetainedHCFFN.h"
 #include "kernels/cuda/moe/CUDARetainedGroupedFFN.h"
 #include "tensors/NativeQuantisedFormatInfo.h"
@@ -21,13 +22,17 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iterator>
 #include <memory>
 #include <stdexcept>
+#include <thread>
 #include <unistd.h>
 #include <vector>
 
@@ -256,6 +261,36 @@ void assertEarlyPacketDependencies(cudaGraph_t graph, const void* hidden, const 
 
 /** @brief Select the original invocation contract under test. */
 enum class RetainedReplayRole { Counted, ActiveEarlyPacket, ActiveShardEarlyPacket };
+
+/** @brief Separate mapped packet and timeline storage for each original target. */
+struct DispatchLane
+{
+    std::array<int, 1> rows{};
+    std::array<int, 2> offsets{};
+    std::array<int, top_k> expert_ids{}, original_slots{}, compact_slots{};
+    std::array<float, top_k> weights{};
+    std::array<float, hidden> payload{};
+    MoEOverlayActivationEpochControl epoch{};
+};
+
+/** @brief Own the independent mapped CPU packet lanes for the launch contract. */
+class MappedDispatchLanes
+{
+public:
+    MappedDispatchLanes(DeviceId owner, unsigned lanes)
+        : region(TransferEngine::instance().allocateMappedHostRegion(lanes * sizeof(DispatchLane), std::array{owner})),
+          host(static_cast<DispatchLane*>(region->mutableHostData())),
+          device(static_cast<DispatchLane*>(region->deviceAlias(owner)))
+    {
+        std::uninitialized_value_construct_n(host, lanes);
+    }
+    MappedDispatchLanes(const MappedDispatchLanes&) = delete;
+    MappedDispatchLanes& operator=(const MappedDispatchLanes&) = delete;
+
+    const std::shared_ptr<MappedHostTransferRegion> region;
+    DispatchLane* const host;
+    DispatchLane* const device;
+};
 
 /** @brief Decode the pointer-free original F640/F320 fragment record carried by the captured runtime. */
 DeviceMoEIntermediateShardBinding originalFragmentTrace()
@@ -545,6 +580,166 @@ TEST(CUDARetainedHCFFN, RecordedFragmentRouting)
     const auto blocks = std::min(2u * static_cast<unsigned>(device.sm_count), hidden / retained_hc_read_warp_channels);
     for (const auto& trace : traces)
         ASSERT_NO_THROW(replay(trace, ordinal, blocks, RetainedReplayRole::ActiveShardEarlyPacket));
+}
+
+/** @test Native mapped DMA copies live original packets and preserves the empty destinations and lease. */
+TEST(CUDARetainedHCFFN, MappedDmaDispatchContract)
+{
+    const int ordinal = selectVisibleSM86();
+    const auto device = DeviceId::cuda(ordinal);
+    const Stream stream;
+    const auto native = stream.value;
+    using namespace cuda_moe_packet;
+    constexpr unsigned lane_capacity = 3;
+    constexpr unsigned stage = 1;
+    auto& transfers = TransferEngine::instance();
+    MappedDispatchLanes lanes(device, lane_capacity), original(device, lane_capacity);
+    Array<MoEOverlayActivationDeviceEpochGrant> grant{lane_capacity}, original_grant{lane_capacity};
+    Array<MoEOverlayActivationSingleRowDispatchPackLaunch> original_batch{lane_capacity};
+    const auto input = transfers.allocateDeviceTransferBuffer(hidden * sizeof(float), device);
+    Array<float> ids{top_k}, weights{top_k};
+    Array<int> count_input{1}, row_count{1}, placement{experts};
+    Array<unsigned> epoch{1};
+    Array<DeviceMoEOverlayEpochTicket> ticket{1};
+    Array<DeviceMoEOverlayEpochStatus> status{1};
+    std::array<float, hidden> seeded_input{};
+    for (std::size_t i = 0; i < seeded_input.size(); ++i)
+        seeded_input[i] = signedValue(i, 112);
+    requireCUDA(cudaMemcpyAsync(input->mutableDeviceData(), seeded_input.data(), sizeof(seeded_input),
+        cudaMemcpyHostToDevice, native));
+    ids.set(native, [](auto i) { return static_cast<float>(i); });
+    weights.set(native, [](auto i) { return static_cast<float>(i + 1) / 64.f; });
+    epoch.set(native, [](auto) { return 2u; });
+    ticket.set(native, [](auto) { return DeviceMoEOverlayEpochTicket{.epoch = 2, .selector = 4}; });
+    status.set(native, [](auto) { return DeviceMoEOverlayEpochStatus{}; });
+    const MoEOverlayRoutePlacementBankDeviceView bank{placement.data(), epoch.data()};
+    const auto build = [&](MappedDispatchLanes& storage, auto& grants, unsigned lane) {
+        auto& device = storage.device[lane];
+        return MoEOverlayActivationSingleRowDispatchPackLaunch{
+            .packet = {.hidden_rows_fp32 = static_cast<const float*>(input->deviceData()), .route_expert_ids_fp32 = ids.data(),
+                .route_weights = weights.data(), .placement = {.banks = {bank, bank},
+                    .ticket = ticket.data(), .status = status.data(), .expert_count = experts},
+                .active_row_count_device = row_count.data(),
+                .packet = {device.rows.data(), device.offsets.data(), device.expert_ids.data(),
+                    device.weights.data(), device.original_slots.data(), device.compact_slots.data(),
+                    device.payload.data(), 1, top_k, hidden, top_k},
+                .control = &device.epoch, .grant = grants.data() + lane,
+                .target_participant_id = static_cast<int>(lane), .physical_rows = 1,
+                .stage_ordinal = stage, .model_layer_index = 1},
+            .publication = {&device.epoch.buffers[stage].dispatch_signal.value, 1},
+        };
+    };
+    const auto original_single = build(original, original_grant, 0);
+    original_batch.set(native, [&](auto lane) { return build(original, original_grant, lane); });
+    const MoEOverlayActivationSingleRowDispatchBatchLaunch original_many{original_batch.data(), lane_capacity};
+    std::vector<ResidentMappedDispatch> prepared;
+    for (unsigned lane = 0; lane < lane_capacity; ++lane)
+    {
+        prepared.push_back({build(lanes, grant, lane), transfers.prepareDeviceToMappedHostCopy(*input, *lanes.region,
+            lane * sizeof(DispatchLane) + offsetof(DispatchLane, payload), sizeof(seeded_input))});
+    }
+    ASSERT_TRUE(prepareResidentDispatchPacket(ordinal));
+
+    for (const unsigned lane_count : {1u, lane_capacity})
+    {
+        const auto publishCount = [&] {
+            requireCUDA(cudaMemcpyAsync(row_count.data(), count_input.data(), sizeof(int), cudaMemcpyDeviceToDevice, native));
+        };
+        CUDAGraphCapture candidate(native, ordinal), control(native, ordinal);
+        ASSERT_TRUE(candidate.beginCapture());
+        publishCount();
+        ASSERT_TRUE(recordResidentDispatchPackets(std::span(prepared).first(lane_count), ordinal, native));
+        ASSERT_TRUE(candidate.endCapture());
+        ASSERT_TRUE(candidate.instantiate());
+        std::vector<GPUGraphKernelNodeInfo> inventory;
+        std::string error;
+        ASSERT_TRUE(candidate.inspectKernelNodes(inventory, &error)) << error;
+        ASSERT_EQ(inventory.size(), 2u * lane_count);
+        EXPECT_EQ(std::count_if(inventory.begin(), inventory.end(), [](const auto& node) {
+            return node.grid_x == 1 && node.block_x == 32;
+        }), lane_count);
+        EXPECT_EQ(std::count_if(inventory.begin(), inventory.end(), [](const auto& node) {
+            return node.grid_x == 1 && node.block_x == 1;
+        }), lane_count);
+
+        const NativeGraphDump dump;
+        requireCUDA(cudaGraphDebugDotPrint(candidate.graph(), dump.path,
+            cudaGraphDebugDotFlagsKernelNodeParams | cudaGraphDebugDotFlagsMemcpyNodeParams));
+        std::ifstream dot(dump.path);
+        const std::string graph{std::istreambuf_iterator<char>{dot}, {}};
+        EXPECT_NE(graph.find("prepareResidentDmaMetadata"), std::string::npos);
+        EXPECT_NE(graph.find("publishResidentDmaPacket"), std::string::npos);
+
+        ASSERT_TRUE(control.beginCapture());
+        publishCount();
+        ASSERT_TRUE(lane_count == 1u ? cudaMoEOverlayActivationPackSingleRowDispatch(&original_single, ordinal, native)
+                               : cudaMoEOverlayActivationPackSingleRowDispatchBatch(&original_many, ordinal, native));
+        ASSERT_TRUE(control.endCapture());
+        ASSERT_TRUE(control.instantiate());
+
+        for (const unsigned round : {0u, 1u, 2u, 3u})
+        {
+            const bool active = round != 2u;
+            count_input.set(native, [=](auto) { return active ? 1 : 0; });
+            placement.set(native, [=](auto slot) { return int(slot % 2u == 0 ? round % lane_count : lane_count); });
+            const auto initial = [=](auto lane) {
+                return MoEOverlayActivationDeviceEpochGrant{
+                    .digest = {16 + lane, 32 + round}, .generation = 3 + round, .placement_epoch = 2,
+                    .stage_count = 2, .physical_rows = 1, .last_published_stage = 0,
+                    .endpoint = static_cast<unsigned>(MoEOverlayActivationEndpoint::Continuation),
+                    .state = static_cast<unsigned>(MoEOverlayActivationEndpointState::Active),
+                    .code = static_cast<unsigned>(MoEOverlayActivationStatusCode::Success),
+                    .graph_role = MoEOverlayInferenceGraphRole::MainDecode};
+            };
+            grant.set(native, initial);
+            original_grant.set(native, initial);
+            for (unsigned lane = 0; lane < lane_count; ++lane)
+            {
+                lanes.host[lane] = original.host[lane] = {};
+                lanes.host[lane].payload.fill(-1.f);
+                original.host[lane].payload.fill(-1.f);
+            }
+            ASSERT_TRUE(control.launch());
+            requireCUDA(cudaStreamSynchronize(native));
+            ASSERT_TRUE(candidate.launch());
+            for (unsigned lane = 0; lane < lane_count; ++lane)
+            {
+                auto& actual = lanes.host[lane];
+                const auto& expected = original.host[lane];
+                auto& publication = actual.epoch.buffers[stage];
+                // The original CPU endpoint acquires the lease before the
+                // graph as a whole retires. Observe that same publication edge.
+                std::atomic_ref<std::uint64_t> lease(publication.dispatch_signal.value);
+                const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+                std::uint64_t published = 0;
+                do
+                {
+                    published = lease.load(std::memory_order_acquire);
+                    if (published != 0)
+                        break;
+                    std::this_thread::yield();
+                }
+                while (std::chrono::steady_clock::now() < deadline);
+                EXPECT_EQ(published, 1u);
+                if (published != 1)
+                    break;
+                const auto& descriptor = publication.dispatch_descriptor;
+                const unsigned live_entries = active && round % lane_count == lane ? top_k / 2u : 0u;
+                EXPECT_EQ(descriptor.timeline, 1u);
+                EXPECT_EQ(descriptor.live_entries, live_entries);
+                EXPECT_EQ(descriptor.live_rows, live_entries != 0u);
+                EXPECT_EQ(descriptor.payload_bytes, moeOverlayDispatchPayloadBytes(descriptor.live_rows, live_entries, hidden));
+                EXPECT_EQ(actual.rows, expected.rows);
+                EXPECT_EQ(actual.offsets, expected.offsets);
+                EXPECT_EQ(actual.expert_ids, expected.expert_ids);
+                EXPECT_EQ(actual.original_slots, expected.original_slots);
+                EXPECT_EQ(actual.compact_slots, expected.compact_slots);
+                EXPECT_EQ(std::memcmp(actual.weights.data(), expected.weights.data(), sizeof(actual.weights)), 0);
+                EXPECT_EQ(std::memcmp(actual.payload.data(), expected.payload.data(), sizeof(actual.payload)), 0);
+            }
+            requireCUDA(cudaStreamSynchronize(native));
+        }
+    }
 }
 
 #if CUDART_VERSION >= 12080

@@ -51,6 +51,41 @@ namespace llaminar2
     class ImmutableNativeDeviceRegion;
     class ImmutableNativeDeviceRead;
 
+    /**
+     * @brief Stable storage binding for a device-to-mapped-host copy in a native graph.
+     *
+     * The enclosing graph retains the original owners and orders the producer,
+     * live-work condition, and completion. This value describes only the bytes
+     * in the positive branch and grants no authority to read them eagerly.
+     */
+    class DeviceToMappedHostCopy final
+    {
+    public:
+        /** @return Exact device owning the source and mapped registration. */
+        [[nodiscard]] DeviceId device() const noexcept { return device_; }
+        /** @return Original GPU address of the first transferred byte. */
+        [[nodiscard]] const void* source() const noexcept { return source_; }
+        /** @return Original pinned host address of the first transferred byte. */
+        [[nodiscard]] void* destination() const noexcept { return destination_; }
+        /** @return Exact device alias of the same registered destination. */
+        [[nodiscard]] const void* mappedAlias() const noexcept { return mapped_alias_; }
+        /** @return Exact positive copy size in the active branch. */
+        [[nodiscard]] std::size_t bytes() const noexcept { return bytes_; }
+
+    private:
+        friend class TransferEngine;
+        /** @brief Bind both views of the original mapped destination and the exact source extent. */
+        DeviceToMappedHostCopy(DeviceId device, const void* source, void* destination,
+            const void* mapped_alias, std::size_t bytes)
+            : device_(device), source_(source), destination_(destination), mapped_alias_(mapped_alias), bytes_(bytes) {}
+
+        DeviceId device_;
+        const void* source_;
+        void* destination_;
+        const void* mapped_alias_;
+        std::size_t bytes_;
+    };
+
     class CapturedTransferChannel;
     class CapturedTransferRankPlan;
     class CapturedTransferRankSession;
@@ -2267,6 +2302,33 @@ namespace llaminar2
             size_t bytes,
             DeviceId device,
             void *stream) const;
+
+        /**
+         * @brief Bind exact pre-existing source and mapped destination storage before capture.
+         * @param source Original graph tensor whose producer remains a graph dependency.
+         * @param region Original registered packet owner.
+         * @param destination_offset Offset of the payload within the registered owner.
+         * @param bytes Exact positive size of one admitted live copy.
+         * @param device GPU owning the original source and registration.
+         * @return Storage binding for the native graph copy node.
+         * @throws std::exception When ownership, registration, or the transfer extent is invalid.
+         */
+        [[nodiscard]] DeviceToMappedHostCopy prepareDeviceToMappedHostCopy(
+            ITensor& source, const MappedHostTransferRegion& region,
+            std::size_t destination_offset, std::size_t bytes, DeviceId device) const;
+
+        /**
+         * @brief Bind the same exact copy contract for pre-existing transport scratch.
+         * @param source Original device transfer storage and backend owner.
+         * @param region Original registered packet owner.
+         * @param destination_offset Offset of the payload within the registered owner.
+         * @param bytes Exact positive size of one admitted live copy.
+         * @return Storage binding for the native graph copy node.
+         * @throws std::exception When ownership, registration, or the transfer extent is invalid.
+         */
+        [[nodiscard]] DeviceToMappedHostCopy prepareDeviceToMappedHostCopy(
+            const DeviceTransferBuffer& source, const MappedHostTransferRegion& region,
+            std::size_t destination_offset, std::size_t bytes) const;
 
         /**
          * @brief Enqueue graph-private device scratch into mapped shared pages.
