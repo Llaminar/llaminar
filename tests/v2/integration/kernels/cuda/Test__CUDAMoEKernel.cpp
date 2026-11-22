@@ -24668,10 +24668,16 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
                         replay.data(), serial_values.data(), replay.size(), d_model);
                 }
             }
+            // An explicit diagnostic tile participates in both capture and
+            // PerfStats. Keep the generated-policy witness at its measured
+            // default when no diagnostic override was requested.
+            const int expected_gate_tile = cuda_moe_config.cuda_moe_gateup_ordered_kpart_tile_n_override_active
+                ? cuda_moe_config.cuda_moe_gateup_ordered_kpart_tile_n
+                : 128;
             expectPrefillSwiGLUPathRecord("fused", seq_len, top_k, num_experts, 0,
                                           "kpart_prefill",
                                           "ordered_kpart_prefill",
-                                          "row_ordered_kpart");
+                                          "row_ordered_kpart", -1, expected_gate_tile);
 
             const auto reuse_records =
                 llaminar2::PerfStatsCollector::snapshot(
