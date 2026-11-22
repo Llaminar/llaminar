@@ -210,6 +210,7 @@ namespace llaminar2::cuda::prefill_host
         case 0:
         case 4:
         case llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook:
+        case llaminar2::kNativeQuantisedMXFP4Codebook:
         case 5:
         case 6:
         case 7:
@@ -289,8 +290,7 @@ namespace llaminar2::cuda::prefill_host
         // IQ4_XS owns physical24 kernels and resources, but retains exactly
         // the source4 tile/staging/reduction schedule rather than losing its
         // admitted cells when the physical metadata identity changes.
-        const uint8_t policy_codebook = codebook == llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook
-            ? uint8_t{4} : codebook;
+        const uint8_t policy_codebook = llaminar2::nativeQuantisedPolicyCodebook(codebook);
         if (!llaminar2::cuda::generated::selectCUDADensePrefillOverlay(
                 policy_codebook, M, N, K, config))
         {
@@ -375,6 +375,7 @@ namespace llaminar2::cuda::prefill_host
             return 0;
         case 5:
         case 6:
+        case llaminar2::kNativeQuantisedMXFP4Codebook:
             return 1;
         case 7:
         case 8:

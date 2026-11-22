@@ -18,6 +18,7 @@
 #include "memory/CPUStorageRoot.h"
 #include "execution/moe/MoEExpertProjectionOwnership.h"
 #include "kernels/common/NativeEmbeddingLayout.h"
+#include "tensors/NativeQuantisedScalePlane.h"
 #include "loaders/PreparedWeightRepresentationContract.h"
 #include "utils/DebugEnv.h"
 #include "tensors/BlockStructures.h"
@@ -83,6 +84,7 @@ namespace llaminar2
             {"IQ3_S", sizeof(IQ3_SBlock), IQ3_SBlock::BLOCK_SIZE},
             {"IQ1_S", sizeof(IQ1_SBlock), IQ1_SBlock::BLOCK_SIZE},
             {"IQ1_M", sizeof(IQ1_MBlock), IQ1_MBlock::BLOCK_SIZE},
+            {"MXFP4", sizeof(MXFP4Block), MXFP4Block::BLOCK_SIZE},
         };
 
         const NativeBlockLayout *findNativeBlockLayout(const std::string &quant_type)
@@ -349,10 +351,10 @@ namespace llaminar2
         if (const auto *format =
                 native_quantised_formats::forQuantType(quant_type))
         {
-            const size_t metadata_bytes =
-                sizeof(uint16_t) +
-                (canonicalDeviceVnniFormat(*format).is_asymmetric ? sizeof(uint16_t) : 0) +
-                (format->has_emins ? sizeof(uint32_t) : 0);
+            const auto physical = canonicalDeviceVnniFormat(*format);
+            const auto planes = NativeQuantisedMetadataPlaneBytes::of(
+                1u, physical.codebook_id, physical.is_asymmetric, format->has_emins);
+            const size_t metadata_bytes = planes.scales + planes.secondary + planes.emins;
             return static_cast<float>(
                        static_cast<size_t>(format->payload_bytes) +
                        metadata_bytes) /

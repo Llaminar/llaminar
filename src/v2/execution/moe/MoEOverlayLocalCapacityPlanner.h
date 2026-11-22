@@ -15,6 +15,7 @@
  */
 
 #pragma once
+#include "backends/NativeGraphObjectGeometry.h"
 #include "planning/PlanningNativeContextEvidence.h"
 
 #include "MoEOverlayActivationBatchInventory.h"
@@ -120,6 +121,9 @@ namespace llaminar2
         /** Original selected-rank birth declarations; empty only without GPU evidence scope. */
         std::vector<PlanningNativeContextDeclaration> native_context_budgets;
         bool require_native_context_budgets=false;
+        /** Owner graph-adapter evidence, keyed by this input's rank, for admissions
+         * without declarations or a live source (recorded fixtures). */
+        NativeGraphObjectGeometry native_graph_objects;
 
         const ModelMemoryProfile *model_profile = nullptr;
         const RankExecutionPlan *rank_plan = nullptr;

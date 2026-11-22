@@ -20,3 +20,15 @@ if(TARGET v2_test_memory_planner)
         ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1" "LLAMINAR_SKIP_ROCM_STARTUP=1")
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_RecordedRemoteHostPlanningReplay)
 endif()
+
+# Remote table pricing uses the owner's published graph-adapter size, on the
+# planner and across the admission wire; missing evidence is fatal.
+if(TARGET v2_test_memory_planner)
+    add_v2_test(V2_Integration_TableGraphObjectOwnerEvidence
+        COMMAND $<TARGET_FILE:v2_test_memory_planner>
+            --gtest_filter=GPUCacheSourceVectorPlanner.RemoteTableGraphObjectsComeFromOwnerEvidence:GPUCacheSourceVectorPlanner.AdmissionWireCarriesOwnerGraphObjects
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;Qwen4Exp;Admission;Ownership;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1" "LLAMINAR_SKIP_ROCM_STARTUP=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_TableGraphObjectOwnerEvidence)
+endif()

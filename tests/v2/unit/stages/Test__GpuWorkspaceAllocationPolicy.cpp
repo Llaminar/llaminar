@@ -4370,6 +4370,86 @@ TEST(Test__GpuWorkspaceAllocationPolicy, CUDANativeQuantisedFusedVerifierRowsPin
            "parameter exists.";
 }
 
+/**
+ * @test ROCm device code never calls printf.
+ * @details A HIP device printf binds a hostcall buffer to every kernel that
+ * inlines it, even when the branch never runs, and such launches fail with
+ * hipErrorIllegalState on hosts without native PCIe atomics (gfx906 CI). Fatal
+ * device branches use __builtin_verbose_trap instead. Scans every __device__ and
+ * __global__ body in the ROCm kernel sources; host launch code may log.
+ */
+TEST(Test__GpuWorkspaceAllocationPolicy, ROCmDeviceCodeHasNoHostcallPrintf)
+{
+    const auto root = repoRoot() / "src/v2/kernels/rocm";
+    const std::regex function_head(R"((__device__|__global__)[^;{]*\{)");
+    const std::regex device_printf(R"((^|[^A-Za-z_])printf\s*\()");
+    std::size_t scanned = 0;
+    std::vector<std::string> offenders;
+    for (const auto &entry : std::filesystem::recursive_directory_iterator(root))
+    {
+        const auto name = entry.path().filename().string();
+        const bool device_source = name.ends_with(".hip") || name.ends_with(".hip.inc") ||
+            name.ends_with(".inc") || name.ends_with(".h");
+        if (!entry.is_regular_file() || !device_source)
+            continue;
+        const auto source = readFile(entry.path());
+        ++scanned;
+        for (auto head = std::sregex_iterator(source.begin(), source.end(), function_head);
+             head != std::sregex_iterator(); ++head)
+        {
+            std::size_t end = static_cast<std::size_t>(head->position() + head->length());
+            for (int depth = 1; depth > 0 && end < source.size(); ++end)
+                depth += source[end] == '{' ? 1 : source[end] == '}' ? -1 : 0;
+            const auto begin = static_cast<std::size_t>(head->position() + head->length());
+            const auto body = source.substr(begin, end - begin);
+            std::smatch found;
+            if (std::regex_search(body, found, device_printf))
+            {
+                const auto line = 1 + std::count(source.begin(),
+                    source.begin() + static_cast<std::ptrdiff_t>(begin + found.position()), '\n');
+                offenders.push_back(entry.path().lexically_relative(repoRoot()).string() + ":" +
+                    std::to_string(line));
+            }
+        }
+    }
+    EXPECT_GT(scanned, 100u);
+    EXPECT_TRUE(offenders.empty()) << "ROCm device printf (use __builtin_verbose_trap): "
+        << ::testing::PrintToString(offenders);
+}
+
+/**
+ * @test Both CUDA NativeQuantised trainers build MXFP4 weights deterministically.
+ * @details MXFP4 leads with an E8M0 exponent, so the generic half-scale
+ * builders cannot serve it; each trainer has a dedicated O(weight_bytes)
+ * builder with an admitted exponent and never falls back to the random
+ * quantizer in its format table.
+ */
+TEST(Test__GpuWorkspaceAllocationPolicy, CUDANativeQuantisedTrainersBuildDeterministicMXFP4Weights)
+{
+    struct Trainer { const char *path; const char *builder; const char *table_end; };
+    const std::array<Trainer, 2> trainers{{
+        {"tests/v2/performance/kernels/cuda/gemm/Perf__CUDABlockwiseTensorCoreGemmSweep.cpp",
+         "createFastSweepMXFP4Tensor", "const NativeQuantisedFormatInfo &requireNativeQuantisedInfo"},
+        {"tests/v2/performance/kernels/cuda/gemm/Perf__CUDANativeQuantisedDecodeTrainer.cpp",
+         "createTrainerMXFP4Tensor", "using Shape = native_quantised_dispatch::NativeQuantisedShapeSpec;"},
+    }};
+    for (const auto &trainer : trainers)
+    {
+        SCOPED_TRACE(trainer.path);
+        const auto source = readFile(repoRoot() / trainer.path);
+        const auto builder = sliceBetween(source,
+            std::string("std::unique_ptr<TensorBase> ") + trainer.builder + "(", "const std::vector<FormatSpec> kFormats");
+        EXPECT_NE(builder.find("dst[0] = 127;"), std::string::npos)
+            << "MXFP4 trainer weights must carry an admitted E8M0 exponent (127, scale 1.0).";
+        EXPECT_EQ(builder.find("TestTensorFactory"), std::string::npos);
+        const auto table = sliceBetween(source, "const std::vector<FormatSpec> kFormats", trainer.table_end);
+        EXPECT_NE(table.find(std::string("{ return ") + trainer.builder + "(n, k); }"), std::string::npos)
+            << "The MXFP4 entry must use the deterministic builder.";
+        EXPECT_EQ(table.find("TestTensorFactory::create"), std::string::npos)
+            << "Trainer format tables must not use random quantizers.";
+    }
+}
+
 TEST(Test__GpuWorkspaceAllocationPolicy, CUDANativeQuantisedDispatchSweepUsesFastDeterministicWeights)
 {
     const auto source =

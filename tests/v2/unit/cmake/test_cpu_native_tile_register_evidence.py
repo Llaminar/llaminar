@@ -40,7 +40,7 @@ CHECKER = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(CHECKER)
 
 # Tile::dispatch() programs per policy: (encoding, nibble map, with-minimum), written out independently.
-DISPATCHED = [(1, 0, 1), (1, 0, 0), (5, 0, 0), (2, 0, 0), (4, 2, 0), (0, 0, 0), (0, 2, 0), (0, 1, 1)]
+DISPATCHED = [(1, 0, 1), (1, 0, 0), (5, 0, 0), (2, 0, 0), (4, 2, 0), (0, 0, 0), (0, 2, 0), (0, 1, 1), (0, 3, 0)]
 NEON_KEYS = sorted((rows, 0, policy, encoding, nibble_map, minimum)
                    for rows in (1, 2, 3, 4) for policy in (0, 1) for encoding, nibble_map, minimum in DISPATCHED)
 NEON_INVENTORY = "1:ASIMD,2:ASIMD,3:ASIMD,4:ASIMD"
@@ -999,7 +999,7 @@ class InventoryTest(unittest.TestCase):
         for macho in (False, True):
             counts = audit_witness(macho=macho)
             self.assertEqual(sorted(tuple(map(int, CHECKER.program_key(n).split(":"))) for n in counts), NEON_KEYS)
-        self.assertEqual(len(NEON_KEYS), 64)
+        self.assertEqual(len(NEON_KEYS), 72)
 
     def test_missing_duplicate_empty_and_unexpected_programs(self) -> None:
         with self.assertRaisesRegex(ValueError, "missing"):
@@ -1084,7 +1084,7 @@ class PolicyTest(unittest.TestCase):
                 continue
             self.assertEqual(sorted(envelopes), ["NEON", "NEON_DOTPROD", "NEON_I8MM"])
             for mode, limits in envelopes.items():
-                self.assertEqual(len(limits), {"NEON": 48, "NEON_DOTPROD": 96, "NEON_I8MM": 144}[mode])
+                self.assertEqual(len(limits), {"NEON": 54, "NEON_DOTPROD": 108, "NEON_I8MM": 162}[mode])
                 self.assertTrue(all(not key.startswith("1:") and value >= 0 for key, value in limits.items()))
 
     def test_compiler_identity_is_derived_from_the_compiler(self) -> None:

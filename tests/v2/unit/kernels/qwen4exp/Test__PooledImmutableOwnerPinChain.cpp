@@ -14,6 +14,7 @@
 #include "execution/qwen4exp/PooledImmutableParticipantRetirementGraph.h"
 #include "execution/compute_stages/stages/qwen4exp/Qwen4ExpPLEBuilder.h"
 #include <typeinfo>
+#include "../../../utils/CompiledGPUBackends.h"
 namespace llaminar2::test {
 TEST(PooledImmutableOwnerPinChain, OriginalConcretePositiveAndC0ChainsPass){for(uint32_t capacity:{0u,3u}){OwnerChainCase c(capacity);
     EXPECT_NO_THROW(requirePooledPinOwnerCompletion(c.graph,c.returned,c.complete.last));const auto before=c.graph.getExecutionOrder().size();
@@ -826,7 +827,7 @@ namespace llaminar2::test {
 TEST(PooledImmutableOwnerPinChain, SoleLocalDirectedSourceKeepsOriginalPhasesAndModelJoins)
 {
     std::vector<PooledOriginalRecipe> recipes;
-    for(const auto type:{DeviceType::CUDA,DeviceType::ROCm})for(const auto slots:{0u,3u})
+    for(const auto type:compiledGPUTypes())for(const auto slots:{0u,3u})
         recipes.push_back({{slots},false,0,true,type,64});
     PooledImmutableOriginalPrograms programs(recipes);
     for(const auto& recipe:recipes){
@@ -894,7 +895,7 @@ namespace llaminar2::test
 /** @test Original pooled source/count declarations reject missing or substituted grouped prior authority. */
 TEST(PooledImmutableCurrentDemand, GroupedPrefixRejectsMissingPriorAndSubstitutedProjectionBeforeMutation){
     std::vector<PooledOriginalRecipe> recipes;
-    for(const auto type:{DeviceType::CUDA,DeviceType::ROCm})recipes.push_back({{3},false,0,true,type,64});
+    for(const auto type:compiledGPUTypes())recipes.push_back({{3},false,0,true,type,64});
     PooledImmutableOriginalPrograms programs(recipes);
     for(const auto& recipe:recipes){auto c=programs.make(recipe);const auto device=c.boundary->device();
         auto* live=static_cast<std::int32_t*>(c.queryLive->gpu_data_ptr());ASSERT_NE(live,nullptr);

@@ -10,6 +10,7 @@
 #include "kernels/common/DeviceNativeQuantisedContributionContract.h"
 #include "kernels/common/GPUQ8ResidualNative.h"
 #include "kernels/common/NativeQuantisedPackedBits.h"
+#include "kernels/common/NativeQuantisedScaleLoad.h"
 #include "tensors/NativeQuantisedIQ2SScale.h"
 #include "tensors/NativeQuantisedIQ3SScale.h"
 #include "tensors/NativeQuantisedIQ4XSScale.h"

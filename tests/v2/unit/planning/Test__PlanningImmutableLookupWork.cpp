@@ -169,7 +169,8 @@ TEST(PlanningImmutableLookupWork, EveryNativeFormatUsesOriginalRowWidth) {
         GGUFTensorType::Q8_0,GGUFTensorType::Q2_K,GGUFTensorType::Q3_K,GGUFTensorType::Q4_K,
         GGUFTensorType::Q5_K,GGUFTensorType::Q6_K,GGUFTensorType::Q8_K,GGUFTensorType::IQ1_S,
         GGUFTensorType::IQ1_M,GGUFTensorType::IQ2_XXS,GGUFTensorType::IQ2_XS,GGUFTensorType::IQ2_S,
-        GGUFTensorType::IQ3_XXS,GGUFTensorType::IQ3_S,GGUFTensorType::IQ4_NL,GGUFTensorType::IQ4_XS};
+        GGUFTensorType::IQ3_XXS,GGUFTensorType::IQ3_S,GGUFTensorType::IQ4_NL,GGUFTensorType::IQ4_XS,
+        GGUFTensorType::MXFP4};
     for(const auto format:formats) {
         SCOPED_TRACE(static_cast<int>(format));
         const ImmutableRowTableSource source{.rows=97,.row_elements=256,.format=format};

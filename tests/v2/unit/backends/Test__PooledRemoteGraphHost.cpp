@@ -20,6 +20,7 @@
 #include <gtest/gtest.h>
 #include <limits>
 #include "execution/local_execution/graph/ComputeGraph.h"
+#include "../../utils/CompiledGPUBackends.h"
 namespace llaminar2::test {
 namespace {
 using Access=PooledRemoteGraphHostReplayAccess;
@@ -103,7 +104,7 @@ struct Source {
         if(sourceSlots)plan.add(cpu,PhysicalMemoryOwner::NativeStorageGraphExecutable,
             RetainedParticipantGraphSourceSlots::physicalBytes(descriptor.geometry().participants));
         if (modelBudget) {
-            const auto model = RetainedParticipantGraphExecutable::generalBOM(cpu, gpu);
+            const auto model = RetainedParticipantGraphExecutable::generalBOM(cpu, gpu,NativeGraphObjectGeometry::localOwner({(gpu).world_rank,(gpu).device}));
             for (const auto& row : model.resources()) plan.add(row);
         }
         source->admitFinal(std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()));
@@ -124,7 +125,7 @@ struct Source {
             // The recorded resource has its original storage/context headroom
             // PLUS exactly one model's typed General BOM. The policy allowance
             // is unchanged; no empirical or anonymous capacity is introduced.
-            const auto model=RetainedParticipantGraphExecutable::generalBOM(observed[0],observed[1]);
+            const auto model=RetainedParticipantGraphExecutable::generalBOM(observed[0],observed[1],NativeGraphObjectGeometry::localOwner({(observed[1]).world_rank,(observed[1]).device}));
             for(const auto& row:model.resources())for(auto& resource:observed)if(resource.device==row.resource().device){
                 if(row.totalBytes()>std::numeric_limits<std::size_t>::max()-resourceBytes)
                     throw std::overflow_error("Recorded model fixture capacity overflows");
@@ -206,7 +207,7 @@ TEST(PooledRemoteGraphHost,MissingPlannedBytesAndCreatorPrefixKeepPreciseOrigina
     }()),::testing::ExitedWithCode(0),"");
 }
 TEST(PooledRemoteGraphHost,ExplicitRawDescriptorUsesSameSealWithoutInventedHostLimit){
-    GTEST_FLAG_SET(death_test_style,"threadsafe");for(const auto device:{DeviceId::cuda(0),DeviceId::rocm(0)})ASSERT_EXIT(([&]{
+    GTEST_FLAG_SET(death_test_style,"threadsafe");for(const auto device:compiledGPUDevices(0))ASSERT_EXIT(([&]{
         Source source(device,3,1,true);source.exact();auto owner=Access::raw(*source.original,source.descriptor);
         EXPECT_EQ(owner->hostQualification(),GraphHostQualification::UnqualifiedDiagnostic);source.record(*owner);
         EXPECT_TRUE(Access::submit(*owner,1));
@@ -282,11 +283,11 @@ namespace llaminar2::test {
 TEST(PooledRemoteGraphHost, StoragePurposeSurvivesFullyReservedModelAndFailedCreation)
 {
     GTEST_FLAG_SET(death_test_style, "threadsafe");
-    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)}) {
+    for (const auto device : compiledGPUDevices(0)) {
         ASSERT_EXIT(( [&] {
             Source source(device, 3, 2, false, 4096, 256u << 20, true);
             const auto model = RetainedParticipantGraphExecutable::generalBOM(
-                source.source->originalResource(DeviceId::cpu()), source.source->originalResource(device));
+                source.source->originalResource(DeviceId::cpu()), source.source->originalResource(device),NativeGraphObjectGeometry::localOwner({(source.source->originalResource(device)).world_rank,(source.source->originalResource(device)).device}));
             for(const auto& row:model.resources()){
                 EXPECT_EQ(row.resource().total_bytes, (256u << 20)+row.totalBytes());
                 EXPECT_EQ(row.resource().admission_available_bytes, row.resource().total_bytes);
@@ -598,8 +599,8 @@ struct NativeGeneralSource final {
         NativeContextPreparationReplayAccess::seed(device,[device](auto stack){return NativeContextPreparationReplayAccess::construct<Worker>(std::move(stack),device.ordinal);});
         constexpr std::size_t contextHeadroom=128u<<20;
         std::array observed{PhysicalMemoryResource{0,DeviceId::cpu(),contextHeadroom,contextHeadroom},PhysicalMemoryResource{0,device,contextHeadroom,contextHeadroom}};
-        const auto model=RetainedParticipantGraphExecutable::generalBOM(observed[0],observed[1]);
-        const auto storage=RetainedParticipantGraphExecutable::nativeStorageBOM(descriptor,observed[0],observed[1]);
+        const auto model=RetainedParticipantGraphExecutable::generalBOM(observed[0],observed[1],NativeGraphObjectGeometry::localOwner({(observed[1]).world_rank,(observed[1]).device}));
+        const auto storage=RetainedParticipantGraphExecutable::nativeStorageBOM(descriptor,observed[0],observed[1],NativeGraphObjectGeometry::localOwner({(observed[1]).world_rank,(observed[1]).device}));
         const auto holder=RetainedParticipantGraphSourceSlots::physicalBytes(descriptor.geometry().participants);
         for(const auto* bill:{&model,&storage})for(const auto& row:bill->resources())for(auto& resource:observed)if(resource.device==row.resource().device){
             if(row.totalBytes()>std::numeric_limits<std::size_t>::max()-resource.total_bytes)
@@ -607,8 +608,8 @@ struct NativeGeneralSource final {
             resource.total_bytes+=row.totalBytes();resource.admission_available_bytes+=row.totalBytes();}
         observed[0].total_bytes+=holder;observed[0].admission_available_bytes+=holder;
         source=NativeContextPreparationReplayAccess::source<Worker>(device,observed);original.emplace(source->acquire(device));memory=source->memory();source->freezeForPlanning();
-        const auto admittedModel=RetainedParticipantGraphExecutable::generalBOM(source->originalResource(DeviceId::cpu()),source->originalResource(device));
-        const auto admittedStorage=RetainedParticipantGraphExecutable::nativeStorageBOM(descriptor,source->originalResource(DeviceId::cpu()),source->originalResource(device));
+        const auto admittedModel=RetainedParticipantGraphExecutable::generalBOM(source->originalResource(DeviceId::cpu()),source->originalResource(device),NativeGraphObjectGeometry::localOwner({(source->originalResource(device)).world_rank,(source->originalResource(device)).device}));
+        const auto admittedStorage=RetainedParticipantGraphExecutable::nativeStorageBOM(descriptor,source->originalResource(DeviceId::cpu()),source->originalResource(device),NativeGraphObjectGeometry::localOwner({(source->originalResource(device)).world_rank,(source->originalResource(device)).device}));
         PhysicalMemoryPlanBuilder plan(source->mandatoryBOM());for(const auto& row:admittedModel.resources())plan.add(row);
         if(storageBudget)for(const auto& row:admittedStorage.resources())plan.add(row);
         plan.add(source->originalResource(DeviceId::cpu()),PhysicalMemoryOwner::NativeStorageGraphExecutable,holder);
@@ -626,7 +627,7 @@ struct NativeGeneralSource final {
 /** @test Native library graph storage reuses one original General slot without borrowing model purpose or flat scope. */
 TEST(PooledRemoteGraphHost, NativeGeneralSourceSlotsRetainPurposeAndOriginalIdentity){
     GTEST_FLAG_SET(death_test_style,"threadsafe");
-    for(const auto device:{DeviceId::cuda(0),DeviceId::rocm(0)})ASSERT_EXIT(([&]{
+    for(const auto device:compiledGPUDevices(0))ASSERT_EXIT(([&]{
         try{
             NativeGeneralSource source(device,true);
             const auto identity=static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(source.source.get()));
@@ -662,7 +663,7 @@ TEST(PooledRemoteGraphHost, NativeGeneralSourceSlotsRetainPurposeAndOriginalIden
 /** @test An admitted model General budget cannot authorize a native storage-only creator. */
 TEST(PooledRemoteGraphHost, NativeGeneralStorageCannotConsumeModelBudget){
     GTEST_FLAG_SET(death_test_style,"threadsafe");
-    for(const auto device:{DeviceId::cuda(0),DeviceId::rocm(0)})ASSERT_EXIT(([&]{
+    for(const auto device:compiledGPUDevices(0))ASSERT_EXIT(([&]{
         try{
             NativeGeneralSource source(device,false);
             const auto identity=static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(source.source.get()));
@@ -695,7 +696,7 @@ TEST(PooledRemoteGraphHost, SharedNativeChildKeepsExactOriginalOwnerUntilAllPare
             PhysicalMemoryPlanBuilder plan(source->mandatoryBOM());
             for(std::size_t i=0;i<devices.size();++i) {
                 const auto graph_bom=RetainedParticipantGraphExecutable::generalBOM(
-                    source->originalResource(DeviceId::cpu()),source->originalResource(devices[i]),i==0?4:1);
+                    source->originalResource(DeviceId::cpu()),source->originalResource(devices[i]),NativeGraphObjectGeometry::localOwner({(source->originalResource(devices[i])).world_rank,(source->originalResource(devices[i])).device}),i==0?4:1);
                 for(const auto& resource:graph_bom.resources())plan.add(resource);
             }
             source->admitFinal(std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()));

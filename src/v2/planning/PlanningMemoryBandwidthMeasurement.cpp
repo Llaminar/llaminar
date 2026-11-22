@@ -184,7 +184,8 @@ namespace llaminar2
         capture.finish();
         auto timing = PlanningExecutionMeasurement::recordGPU(work, worker, std::move(clock), std::move(graph));
         timing.prepare(memory);
-        require(GPUGraphMemoryContract::acceptsFamilyObservation(device, timing.residentMemoryBytes(), graph_bytes),
+        require(GPUGraphMemoryContract::acceptsFamilyObservation(device, GPUGraphMemoryGrowth{timing.residentMemoryBytes(),
+            GPUGraphMemoryContract::observationScope(memory->backing(device))}, graph_bytes),
             "native graph exceeded physical admission");
         return {request, timing.graphNodeCount(), timing.observe()};
     }

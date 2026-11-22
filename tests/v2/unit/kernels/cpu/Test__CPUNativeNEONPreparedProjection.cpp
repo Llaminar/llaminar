@@ -104,6 +104,12 @@ int sourceInteger(const CPUNativeQuantisedWeightView &packed, int column, int bl
         const int bit = (local % 16) * 4 + k % 4;
         return nibble + int((first >> bit) & 1) * 16 + int((second >> bit) & 1) * 32 - 32;
     }
+    // MXFP4 maps through its own E2M1 table, never IQ4_NL's grid.
+    if (packed.codebook_id == kNativeQuantisedMXFP4Codebook)
+    {
+        static constexpr int kE2M1Doubled[8] = {0, 1, 2, 3, 4, 6, 8, 12};
+        return (nibble & 8) ? -kE2M1Doubled[nibble & 7] : kE2M1Doubled[nibble & 7];
+    }
     return packed.codebook_id == 4 ? kvalues_iq4nl_i8[nibble]
         : packed.codebook_id == 0 ? nibble - 8 : nibble;
 }
@@ -168,11 +174,17 @@ float appendPreparedReference(const CPUNativeQuantisedWeightView &packed, const 
  * @param blocks Logical K block count spanning partition boundaries.
  */
 template <std::size_t Rows, typename Ops, ms::Reduction Tree>
-void verifyPrepared(const NativeQuantisedFormatInfo &source, int n, int blocks)
+void verifyPrepared(const NativeQuantisedFormatInfo &source, int n, int blocks, bool rotated = false)
 {
     SCOPED_TRACE(::testing::Message() << "codebook=" << int(source.codebook_id)
-        << " rows=" << Rows << " n=" << n << " blocks=" << blocks << " tree=" << int(Tree));
-    NativeQuantisedPreparedByteFixture fixture(source, n, blocks * 32);
+        << " rows=" << Rows << " n=" << n << " blocks=" << blocks << " tree=" << int(Tree)
+        << " rotated=" << rotated);
+    // Rotation publishes the symmetric ExpandedInt8 stream for any original
+    // source; the Q8_0 fixture owns that geometry, provenance stays original.
+    NativeQuantisedPreparedByteFixture fixture(rotated ? native_quantised_formats::Q8_0 : source, n, blocks * 32);
+    if (rotated)
+        fixture.descriptor.source = {
+            .codebook_id = source.codebook_id, .is_superblock = source.is_superblock, .present = true};
     if constexpr (Tree == ms::Reduction::Contiguous)
         fixture.descriptor.numerical_policy = CPUProjectionNumericalPolicy::BackendNative;
     fixture.seedPayloadAndMetadata();
@@ -837,6 +849,63 @@ TEST_F(CPUNativeNEONPreparedProjection, EveryHalfAndOpaqueWordHasExactBits)
                 std::bit_cast<std::uint32_t>(fp16_to_fp32(static_cast<std::uint16_t>(words[lane] ^ 0xa5b6u))));
         }
     }
+}
+
+/** @test Native MXFP4 BF16 power-of-two words widen exactly; FP16 interpretation is never used. */
+TEST_F(CPUNativeNEONPreparedProjection, EveryAdmittedPowerOfTwoBF16WordWidensExactly)
+{
+    using Ops = ms::NEONMultiScaleOps<ms::NEONByteDot::ASIMD>;
+    std::vector<std::uint16_t> words{0};
+    for (int e = 2; e <= 252; ++e)
+        words.push_back(mxfp4::powerOfTwoBF16Word(static_cast<std::uint8_t>(e)));
+    while (words.size() % 4 != 0) words.push_back(0);
+    for (std::size_t first = 0; first < words.size(); first += 4)
+    {
+        const auto widened = std::bit_cast<std::array<std::uint32_t, 4>>(Ops::bf16(words.data() + first));
+        for (int lane = 0; lane < 4; ++lane)
+        {
+            const auto word = words[first + lane];
+            std::uint8_t e = 0;
+            ASSERT_TRUE(mxfp4::e8m0FromPowerOfTwoBF16Word(word, e));
+            EXPECT_EQ(widened[lane], e == 0 ? 0u : mxfp4::normalScaleFP32Bits(e)) << "word=" << word;
+        }
+    }
+}
+
+/** @test Rotated MXFP4 (source 25, ExpandedInt8) dispatches the expanded FP16 program, not the BF16 nibble one. */
+TEST_F(CPUNativeNEONPreparedProjection, RotatedMXFP4ExecutesExpandedInt8WithFP16Scales)
+{
+    using Ops = ms::NEONMultiScaleOps<ms::NEONByteDot::ASIMD>;
+    for (const int n : {3, 65})
+        for (const int blocks : {1, 17})
+        {
+            verifyPrepared<1, Ops, ms::Reduction::Contiguous>(native_quantised_formats::MXFP4, n, blocks, true);
+            verifyPrepared<4, Ops, ms::Reduction::Contiguous>(native_quantised_formats::MXFP4, n, blocks, true);
+            verifyPrepared<2, Ops, ms::Reduction::OrderedPartitions>(native_quantised_formats::MXFP4, n, blocks, true);
+            verifyPrepared<3, Ops, ms::Reduction::OrderedPartitions>(native_quantised_formats::MXFP4, n, blocks, true);
+        }
+}
+
+/** @test Native MXFP4 and its rotated form keep distinct scale-word interpretations. */
+TEST_F(CPUNativeNEONPreparedProjection, MXFP4ScaleWordsFollowThePreparedIdentity)
+{
+    NativeQuantisedPreparedByteFixture native(native_quantised_formats::MXFP4, 65, 64);
+    ASSERT_EQ(native.descriptor.encoding, CPUNativeQuantisedEncoding::NibbleLUT);
+    EXPECT_EQ(native.view().scaleEncoding(), CPUNativeQuantisedScaleEncoding::PowerOfTwoBF16);
+    native.seedPayloadAndMetadata();
+    const auto view = native.view();
+    for (int column = 0; column < 65; ++column)
+        for (int block = 0; block < 2; ++block)
+        {
+            const auto word = view.chunkScales(column / 64, block)[column % 64];
+            std::uint8_t e = 0;
+            ASSERT_TRUE(mxfp4::e8m0FromPowerOfTwoBF16Word(word, e)) << "seeded an inadmissible word";
+            EXPECT_EQ(std::bit_cast<std::uint32_t>(view.blockScale(column / 64, block, column % 64)),
+                e == 0 ? 0u : mxfp4::normalScaleFP32Bits(e));
+        }
+    EXPECT_EQ(preparedScaleEncoding(kNativeQuantisedMXFP4Codebook, CPUNativeQuantisedEncoding::ExpandedInt8),
+        CPUNativeQuantisedScaleEncoding::FP16);
+    EXPECT_EQ(preparedScaleEncoding(4, CPUNativeQuantisedEncoding::NibbleLUT), CPUNativeQuantisedScaleEncoding::FP16);
 }
 
 /** @test Widening reductions retain every signed-byte extremum and exact quarter order. */

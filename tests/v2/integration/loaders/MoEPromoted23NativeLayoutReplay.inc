@@ -191,7 +191,8 @@ void run(NumericalProgram program=NumericalProgram::NativeLayout,std::span<const
                 const auto* native=gpuWeightSourceFormat(*binding.tensor);
                 const auto source_bytes=bounded?bounded->sourceBytes():binding.tensor->size_bytes();
                 if(native)plan.planWeight(binding.identity.canonical_name,binding.tensor->rows(),binding.tensor->cols(),
-                    native->payload_bytes,canonicalDeviceVnniFormat(*native).is_asymmetric,native->has_emins,source_bytes);
+                    native->payload_bytes,canonicalDeviceVnniFormat(*native).is_asymmetric,native->has_emins,
+                    nativeQuantisedScalePlaneWidth(canonicalDeviceVnniCodebookId(*native)),source_bytes);
                 else plan.planRawWeight(binding.identity.canonical_name,binding.tensor->rows(),binding.tensor->cols(),binding.tensor->size_bytes());
             }
             const auto gpu=std::find_if(resources.begin(),resources.end(),[&](const auto& r){return r.device==device;});

@@ -557,6 +557,8 @@ namespace
          { return test::TestTensorFactory::createIQ1_SRandom({rows, cols}); }},
         {"IQ1_M", 0.930f, [](size_t rows, size_t cols)
          { return test::TestTensorFactory::createIQ1_MRandom({rows, cols}); }},
+        {"MXFP4", 0.980f, [](size_t rows, size_t cols)
+         { return test::TestTensorFactory::createMXFP4Random({rows, cols}); }},
     };
 
     float vectorCosine(const std::vector<float> &actual, const std::vector<float> &expected)

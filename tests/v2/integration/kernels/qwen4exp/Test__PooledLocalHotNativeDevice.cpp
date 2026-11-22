@@ -50,7 +50,7 @@ namespace q=qwen4exp;namespace n=q::pooled_native;namespace p=n::p;namespace h=q
 /** @brief Actual supported loader format, never a separate backend inventory. */
 std::optional<GGUFTensorType> originalFormat(TensorType type)
 {
-    for(unsigned code=0;code<=unsigned(GGUFTensorType::BF16);++code)try {
+    for(unsigned code=0;code<=unsigned(GGUFTensorType::MXFP4);++code)try {
         if(ggufToTensorType(GGUFTensorType(code))==type)return GGUFTensorType(code);
     }catch(const std::invalid_argument&){}
     return std::nullopt;
@@ -176,7 +176,7 @@ void replayLocal(DeviceId device,std::uint32_t slots,bool wide,
         for(const auto& contribution:{cpu.bom(host),physical.cacheBOM(0,gpu),physical.mandatoryBOM(0,gpu),policy.policyBOM(gpu),policy.mandatoryBOM(gpu),
             q::PooledImmutableOwnerNativePlan::mandatoryBOM(physical,policy,0,gpu),q::PooledImmutableCoordinatorNativePlan::mandatoryBOM(physical,policy,gpu),
             q::PooledImmutableSourceGeometry::mandatoryBOM(physical,policy,c.file->descriptor(),gpu),local.mandatoryBOM(gpu,host),local.slotDependentBOM(gpu,host),io.bom(host),
-            RetainedParticipantGraphExecutable::generalBOM(host,gpu,5)})for(const auto& row:contribution.resources())bom.add(row);
+            RetainedParticipantGraphExecutable::generalBOM(host,gpu,NativeGraphObjectGeometry::localOwner({(gpu).world_rank,(gpu).device}),5)})for(const auto& row:contribution.resources())bom.add(row);
         bom.add(host,PhysicalMemoryOwner::ImmutableLookupStaging,q::ImmutableLookupService::hostBytes(channel));
         const auto activation=maximumOriginal*8+4+sampling_math::kDeviceGenerationControlCount*4+maximumOriginal*c.file->columns*4+
             (nextWindow?(2*(maximumOriginal/16+1)+4)*sizeof(std::int32_t):0);

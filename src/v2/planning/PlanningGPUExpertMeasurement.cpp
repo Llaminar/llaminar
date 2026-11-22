@@ -105,7 +105,8 @@ namespace llaminar2
                 if (format)
                     pool.planWeightForOwner(device.gpu_ordinal(), inputs[i]->tensor_name,
                         matrix.n, matrix.k, format->payload_bytes, canonicalDeviceVnniFormat(*format).is_asymmetric,
-                        format->has_emins, matrix.source_bytes, kWeightOwner);
+                        format->has_emins, nativeQuantisedScalePlaneWidth(canonicalDeviceVnniCodebookId(*format)),
+                        matrix.source_bytes, kWeightOwner);
                 else if (description.formats[i] == "F32" || description.formats[i] == "F16" ||
                          description.formats[i] == "BF16")
                     pool.planRawWeightForOwner(device.gpu_ordinal(), inputs[i]->tensor_name,
@@ -298,7 +299,7 @@ namespace llaminar2
         PlanningGPUExpertPhaseObservation measurePhase(DeviceId device, IWorkerGPUContext &worker,
             const PlanningExpertSampleDescription &description, ExpertHistogramSource phase,
             const MoEOverlayPreparedExpertPayload &payload, const std::shared_ptr<PhysicalMemoryAuthority> &memory,
-            const std::string &identity, size_t &pool_growth)
+            const std::string &identity, GPUGraphMemoryGrowth &pool_growth)
         {
             const auto phase_begin=std::chrono::steady_clock::now();
             const int rows = rowsFor(phase);
@@ -352,9 +353,8 @@ namespace llaminar2
             auto timing = PlanningExecutionMeasurement::recordGPU(work, worker, std::move(clock), std::move(graph));
             const auto measurement_begin=std::chrono::steady_clock::now();
             timing.prepare(memory);
-            if (timing.residentMemoryBytes() > std::numeric_limits<size_t>::max() - pool_growth)
-                throw std::overflow_error("GPU expert graph pool growth overflow");
-            pool_growth += timing.residentMemoryBytes();
+            pool_growth.add(timing.residentMemoryBytes(),
+                GPUGraphMemoryContract::observationScope(memory->backing(device)));
             auto observed = timing.observe();
             LOG_INFO("[PlanningExpertWall] device=" << device.toString() << " layer=" << description.layer << " rows=" << rows
                 << " phase=warmup_and_isolated_measure seconds="
@@ -767,7 +767,7 @@ namespace llaminar2
             << " formats=" << description.formats[0] << "/" << description.formats[1] << "/" << description.formats[2]
             << " phase=weight_pool_engine_prepare seconds="
             << std::chrono::duration<double>(std::chrono::steady_clock::now()-weight_begin).count());
-        size_t pool_growth = 0;
+        GPUGraphMemoryGrowth pool_growth;
         for (auto phase : kPhases) {
             const auto phase_begin=std::chrono::steady_clock::now();
             result.phases.push_back(measurePhase(device,worker,description,phase,payload,memory,identity,pool_growth));
@@ -779,7 +779,7 @@ namespace llaminar2
         }
         if (!GPUGraphMemoryContract::acceptsFamilyObservation(device, pool_growth, family_bytes))
             throw std::runtime_error("GPU expert sample native graph family exceeded certified physical admission: observed=" +
-                std::to_string(pool_growth) + " admitted=" + std::to_string(family_bytes));
+                std::to_string(pool_growth.bytes) + " admitted=" + std::to_string(family_bytes));
         LOG_INFO("[PlanningExpertWall] device=" << device.toString() << " layer=" << description.layer
             << " phase=sample_complete_before_weight_retirement seconds="
             << std::chrono::duration<double>(std::chrono::steady_clock::now()-weight_begin).count());

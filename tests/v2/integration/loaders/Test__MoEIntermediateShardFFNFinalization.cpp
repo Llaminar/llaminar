@@ -2183,7 +2183,8 @@ void proveOriginalFinalization(const std::vector<DeviceId> &devices, bool single
                     if (native)
                         primary_plan.planWeight(binding.identity.canonical_name, binding.tensor->rows(), binding.tensor->cols(),
                             native->payload_bytes, canonicalDeviceVnniFormat(*native).is_asymmetric,
-                            native->has_emins, source_bytes);
+                            native->has_emins, nativeQuantisedScalePlaneWidth(canonicalDeviceVnniCodebookId(*native)),
+                            source_bytes);
                     else
                     {
                         const auto type = binding.tensor->native_type();

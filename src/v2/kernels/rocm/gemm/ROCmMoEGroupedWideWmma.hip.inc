@@ -138,7 +138,7 @@ __global__ __launch_bounds__(TwoRoles ? 256 : 128) void wideProjection(MoEGroupe
                 if (owns_column)
                 {
                     load_payload<Traits::payload_bytes>(desc.payload + linear*Traits::payload_bytes,raw);
-                    scale = static_cast<const uint16_t *>(desc.scales)[linear];
+                    scale = ::llaminar2::native_quantised_scale::loadStagedPrimary<static_cast<uint8_t>(FMT)>(static_cast<const uint16_t *>(desc.scales), linear);
                     if constexpr (Traits::needs_aux_compute) aux = static_cast<const uint16_t *>(desc.mins)[linear];
                     if constexpr (Traits::is_dual_scale_asym) minima = static_cast<const uint32_t *>(desc.emins)[linear];
                 }
@@ -238,7 +238,7 @@ __global__ __launch_bounds__(TwoRoles ? 256 : 128) void wideProjection(MoEGroupe
                     if (n0+col < v.n)
                     {
                         load_payload<Traits::payload_bytes>(desc.payload + linear*Traits::payload_bytes,raw);
-                        scale = static_cast<const uint16_t *>(desc.scales)[linear];
+                        scale = ::llaminar2::native_quantised_scale::loadStagedPrimary<static_cast<uint8_t>(FMT)>(static_cast<const uint16_t *>(desc.scales), linear);
                         if constexpr (Traits::needs_aux_compute) aux = static_cast<const uint16_t *>(desc.mins)[linear];
                         if constexpr (Traits::is_dual_scale_asym) minima = static_cast<const uint32_t *>(desc.emins)[linear];
                     }

@@ -227,7 +227,7 @@ namespace llaminar2::test::native_quantised_transfer_parity_detail
                 .mins = static_cast<const uint16_t *>(descriptor.mins),
                 .emins = static_cast<const uint32_t *>(descriptor.emins),
                 .payload_bytes = blocks * layout.gpu_payload_bytes_per_block,
-                .scales_bytes = blocks * sizeof(uint16_t),
+                .scales_bytes = nativeQuantisedScalePlaneLiveBytes(layout.gpu_codebook_id, blocks),
                 .mins_bytes = layout.gpu_is_asymmetric ? blocks * sizeof(uint16_t) : 0u,
                 .emins_bytes = layout.gpu_has_emins ? blocks * sizeof(uint32_t) : 0u,
             };
@@ -261,6 +261,15 @@ namespace llaminar2::test::native_quantised_transfer_parity_detail
             if (stats.transfers_completed != 1u || stats.blocking_synchronizations != 0u ||
                 stats.inference_stream_waits != 0u)
                 throw std::runtime_error("Demotion proof violated its asynchronous transfer contract");
+        }
+        // Publish each arrival exactly as MoEOverlayParticipantMigration does:
+        // the transfer wrote an unsealed slot generation, and only an admitted
+        // publication may reach an engine. Architecture-native readers reject
+        // unsealed bytes, so skipping this would test an unpublished expert.
+        for (auto &projection : lease->projections)
+        {
+            if (projection.engine && projection.engine->exportCPUNativeQuantisedPackedWeights())
+                projection.engine->admitCPUNativeQuantisedPublication();
         }
         // Engine aliases retain the pool when this local shared owner leaves.
         return std::move(*lease);

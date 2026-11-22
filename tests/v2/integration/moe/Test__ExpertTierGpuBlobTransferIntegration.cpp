@@ -21,6 +21,7 @@
 #include "execution/moe/ExpertTierGpuBlobTransferLane.h"
 #include "execution/moe/MoEOverlayGpuRemoteProjectionEndpoint.h"
 #include "transfer/TransferEngine.h"
+#include "tensors/NativeQuantisedScalePlane.h"
 #include "kernels/cuda/gemm/CUDAFloatingPointGemmKernel.h"
 #include "kernels/cuda/gemm/CUDAQuantisedGemmKernel.h"
 #include "kernels/rocm/gemm/ROCmFloatingPointGemmKernel.h"
@@ -1418,6 +1419,166 @@ namespace llaminar2
         }
 
         /**
+         * @brief Admit native MXFP4 GPU roots at the real remote-projection endpoints.
+         *
+         * MXFP4 GPU roots carry one E8M0 byte per block. The source endpoint
+         * constructor and the destination manifest admission both authenticate
+         * the live descriptor against the manifest's plane extents; a root that
+         * declares a halfword primary plane must be rejected at both seams.
+         * @param device Exact single GPU owning both endpoint lanes.
+         * @param peer Same-backend identity of the remote endpoint (not allocated).
+         */
+        void admitMXFP4RemoteGpuEndpoints(DeviceId device, DeviceId peer)
+        {
+            IBackend *backend = getBackendFor(device);
+            ASSERT_NE(backend, nullptr);
+            const int ordinal = device.gpu_ordinal();
+            // Odd block count: the one-byte plane ends inside its last storage word.
+            constexpr int n = 131;
+            constexpr int k = 96;
+            constexpr std::size_t blocks = static_cast<std::size_t>(n) * (k / 32);
+            const std::size_t scale_storage_bytes =
+                nativeQuantisedScalePlaneStorageWords(kNativeQuantisedMXFP4Codebook, blocks) * sizeof(std::uint16_t);
+            auto *payload = static_cast<std::uint8_t *>(backend->allocate(blocks * 16, ordinal));
+            auto *scales = static_cast<std::uint16_t *>(backend->allocate(scale_storage_bytes, ordinal));
+            ASSERT_NE(payload, nullptr);
+            ASSERT_NE(scales, nullptr);
+            const GpuExpertPackedDescriptor descriptor{
+                .ptrs = {.d_vnni = payload, .d_scales = scales},
+                .n = n,
+                .k = k,
+                .blocks_per_row = static_cast<std::uint32_t>(k / 32),
+                .codebook_id = kNativeQuantisedMXFP4Codebook,
+                .payload_bytes_per_block = 16,
+                .is_asymmetric = false,
+                .has_emins = false,
+                .vnni_bytes = blocks * 16,
+                .scales_bytes = blocks,
+            };
+            auto halfword = descriptor;
+            halfword.scales_bytes = blocks * sizeof(std::uint16_t);
+            const NativeQuantisedSourceIdentity source_identity{
+                .codebook_id = kNativeQuantisedMXFP4Codebook,
+                .is_superblock = false,
+                .present = true,
+            };
+            const auto identity = [&](DeviceId source, DeviceId destination)
+            {
+                return MoEOverlayRemoteProjectionIdentity{
+                    .expected_epoch = 2000u,
+                    .candidate_epoch = 2001u,
+                    .execution_fingerprint = {.low = 0x6d786670u, .high = 0x34000000u},
+                    .migration_index = 3,
+                    .layer_idx = 2,
+                    .expert_id = 7,
+                    .projection = ExpertTierWeightProjection::Down,
+                    .source_participant = 0,
+                    .destination_participant = 1,
+                    .source_world_rank = 0,
+                    .destination_world_rank = 1,
+                    .source_device = source,
+                    .destination_device = destination,
+                };
+            };
+            const auto outgoing = makeMoEOverlayRemoteGpuProjectionManifest(
+                identity(device, peer), descriptor, source_identity, /*maximum_chunk_bytes=*/1024);
+            const auto incoming = makeMoEOverlayRemoteGpuProjectionManifest(
+                identity(peer, device), descriptor, source_identity, /*maximum_chunk_bytes=*/1024);
+            std::string error;
+            ASSERT_TRUE(outgoing.valid(&error)) << error;
+            ASSERT_TRUE(incoming.valid(&error)) << error;
+            EXPECT_EQ(outgoing.region_bytes,
+                      (std::array<std::uint64_t, 4>{blocks * 16, blocks, 0u, 0u}));
+
+            const auto make_lane = [&](const char *name)
+            {
+                return std::make_shared<MoEOverlayGpuRemoteProjectionLane>(
+                    MoEOverlayGpuRemoteProjectionLane::Config{
+                        .device = device,
+                        .staging = TransferEngine::instance()
+                                       .allocatePersistentTransferStagingSlices(
+                                           outgoing.maximum_chunk_bytes, 1u, device,
+                                           HostTransferAccess::CrossProcessReadable)
+                                       .front(),
+                        .execution = ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(
+                                         TransferEngine::instance(), 1u, device, name)
+                                         .front(),
+                        .progress = BackgroundTransferProgressBinding::nativeStream(),
+                        .lane_name = name,
+                        .perf_device = device.to_string(),
+                    });
+            };
+            auto source_lane = make_lane("mxfp4_remote_source_admission");
+            auto destination_lane = make_lane("mxfp4_remote_destination_admission");
+            ASSERT_TRUE(source_lane->materialize(&error)) << error;
+            ASSERT_TRUE(destination_lane->materialize(&error)) << error;
+
+            IWorkerGPUContext &context = GPUDeviceContextPool::instance().getContext(device);
+            void *producer_stream = context.getOrCreateAuxiliaryStream("mxfp4_remote_admission_producer");
+            ASSERT_NE(producer_stream, nullptr);
+            void *ready = backend->createEvent(ordinal);
+            ASSERT_NE(ready, nullptr);
+            ASSERT_TRUE(backend->recordEvent(ready, ordinal, producer_stream));
+
+            auto lifetime = std::make_shared<int>(1);
+            {
+                EXPECT_NO_THROW((void)MoEOverlayGpuRemoteProjectionSource(
+                    outgoing, source_lane, descriptor,
+                    ExpertTierSourceReadiness::producerEvent(ready), lifetime));
+                EXPECT_THROW((void)MoEOverlayGpuRemoteProjectionSource(
+                    outgoing, source_lane, halfword,
+                    ExpertTierSourceReadiness::producerEvent(ready), lifetime),
+                    std::invalid_argument);
+            }
+
+            const auto factory_for = [&](GpuExpertPackedDescriptor bound)
+            {
+                return [=](const MoEOverlayRemoteProjectionManifest &,
+                           MoEOverlayGpuRemoteProjectionDestinationBinding *binding,
+                           std::string *factory_error) -> bool
+                {
+                    std::shared_ptr<ITensorGemm> engine;
+#ifdef HAVE_CUDA
+                    if (device.is_cuda())
+                        engine = std::make_shared<cuda::CUDAQuantisedGemmKernel>(
+                            n, k, ordinal, bound.ptrs.d_vnni,
+                            static_cast<std::uint16_t *>(bound.ptrs.d_scales), nullptr, nullptr,
+                            bound.codebook_id, bound.blocks_per_row, lifetime, source_identity);
+#endif
+#ifdef HAVE_ROCM
+                    if (device.is_rocm())
+                        engine = std::make_shared<rocm::ROCmQuantisedGemmKernel>(
+                            n, k, ordinal, bound.ptrs.d_vnni, bound.ptrs.d_scales, nullptr, nullptr,
+                            bound.codebook_id, bound.blocks_per_row, lifetime, source_identity);
+#endif
+                    if (!binding || !engine)
+                    {
+                        if (factory_error)
+                            *factory_error = "MXFP4 admission fixture has no destination engine";
+                        return false;
+                    }
+                    *binding = {.descriptor = bound, .engine = std::move(engine)};
+                    return true;
+                };
+            };
+            {
+                MoEOverlayGpuRemoteProjectionDestination accepted(
+                    identity(peer, device), destination_lane, factory_for(descriptor), lifetime);
+                EXPECT_TRUE(accepted.beginManifest(incoming, &error)) << error;
+            }
+            {
+                MoEOverlayGpuRemoteProjectionDestination rejected(
+                    identity(peer, device), destination_lane, factory_for(halfword), lifetime);
+                EXPECT_FALSE(rejected.beginManifest(incoming, &error));
+                EXPECT_NE(error.find("descriptor differs"), std::string::npos) << error;
+            }
+
+            backend->destroyEvent(ready, ordinal);
+            backend->free(scales, ordinal);
+            backend->free(payload, ordinal);
+        }
+
+        /**
          * @brief Construct the real backend floating GEMM alias for a test slot.
          * @param device Exact CUDA or ROCm destination.
          * @param descriptor Complete raw floating weight view.
@@ -2014,5 +2175,28 @@ namespace llaminar2
                 << "PerfStats must prove every floating precision moved both ways";
 #endif
         }
+
+        TEST(ExpertTierGpuBlobTransferIntegration, CUDAAdmitsMXFP4RemoteGpuRootsWithOneBytePrimaryPlane)
+        {
+#if !defined(HAVE_CUDA)
+            GTEST_SKIP() << "CUDA is required";
+#else
+            if (!getBackendFor(DeviceId::cuda(0)))
+                GTEST_SKIP() << "No CUDA device is available";
+            admitMXFP4RemoteGpuEndpoints(DeviceId::cuda(0), DeviceId::cuda(1));
+#endif
+        }
+
+        TEST(ExpertTierGpuBlobTransferIntegration, ROCmAdmitsMXFP4RemoteGpuRootsWithOneBytePrimaryPlane)
+        {
+#if !defined(HAVE_ROCM)
+            GTEST_SKIP() << "ROCm is required";
+#else
+            if (!getBackendFor(DeviceId::rocm(0)))
+                GTEST_SKIP() << "No ROCm device is available";
+            admitMXFP4RemoteGpuEndpoints(DeviceId::rocm(0), DeviceId::rocm(1));
+#endif
+        }
+
     } // namespace
 } // namespace llaminar2

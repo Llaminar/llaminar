@@ -8,6 +8,7 @@
  * state, hardware discovery or performance ranking.
  */
 #pragma once
+#include "backends/NativeGraphObjectGeometry.h"
 #include "planning/PlanningNativeContextEvidence.h"
 #include "planning/AutomaticOrchestrationCandidates.h"
 #include "planning/PlanningHostServiceEvidence.h"
@@ -43,6 +44,10 @@ namespace llaminar2
         /** Original-rank keys; production startup requires complete selected GPU coverage. */
         PlanningNativeContextBudgets native_context_budgets;
         bool require_native_context_budgets=false;
+        /** Discovery-rank owner graph-adapter evidence for admissions without
+         * native declarations (recorded fixtures); production planning prices
+         * from native_context_budgets. */
+        NativeGraphObjectGeometry native_graph_objects;
 
         /** @return The production startup policy; no workload or memory estimate is invented. */
         static OrchestrationCandidateMemoryPolicy fromStartup();

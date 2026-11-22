@@ -46,7 +46,7 @@ TEST(ImmutableResidentLookup, ExactSourceInventoryAndIdentity)
 #define RESIDENT_FORMAT(F) formats.push_back(TensorType::F);
     QFN_LOOKUP_QUANT_FORMATS(RESIDENT_FORMAT)
 #undef RESIDENT_FORMAT
-    ASSERT_EQ(formats.size(),24u);
+    ASSERT_EQ(formats.size(),25u); // Includes MXFP4.
     for(const auto format:formats)
     {
         const auto table=fixture.table(format);

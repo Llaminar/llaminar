@@ -20,6 +20,7 @@
 
 #include "tensors/Tensors.h"
 #include "tensors/NativeQuantisedIQ4XSScale.h"
+#include "kernels/common/NativeQuantisedDescriptorValidation.h"
 #include "kernels/cpu/gemm/CPUNativeQuantisedWeightPacker.h"
 #include "../../utils/TestTensorFactory.h"
 
@@ -97,6 +98,8 @@ namespace
          [] { return TestTensorFactory::createQ8_1Random({2, 256}); }},
         {"Q8_K", 21, 32, false, true, false,
          [] { return TestTensorFactory::createQ8_KRandom({2, 256}); }},
+        {"MXFP4", kNativeQuantisedMXFP4Codebook, 16, false, false, false,
+         [] { return TestTensorFactory::createMXFP4Random({2, 256}); }},
     };
 }
 
@@ -251,7 +254,7 @@ TEST(Test__NativeQuantisedFormatInfo, CompactMultiScaleRetainsNativePayloadAndEv
 
 TEST(Test__NativeQuantisedFormatInfo, SourceIdentitiesAreExhaustiveUniqueAndCanonical)
 {
-    ASSERT_EQ(native_quantised_formats::kAllSourceFormats.size(), 21u);
+    ASSERT_EQ(native_quantised_formats::kAllSourceFormats.size(), 22u);
     ASSERT_EQ(native_quantised_formats::kAllSourceFormats.size(), kExpectations.size());
 
     for (size_t i = 0; i < native_quantised_formats::kAllSourceFormats.size(); ++i)
@@ -270,10 +273,13 @@ TEST(Test__NativeQuantisedFormatInfo, SourceIdentitiesAreExhaustiveUniqueAndCano
             entry.metadata)
             << entry.quant_type;
 
+        // Q8_1/Q8_K share the Q8_0 arithmetic policy; MXFP4 shares IQ4_NL's.
         const uint8_t expected_device_codebook =
             entry.metadata->codebook_id == 20 ||
                     entry.metadata->codebook_id == 21
                 ? static_cast<uint8_t>(19)
+            : entry.metadata->codebook_id == kNativeQuantisedMXFP4Codebook
+                ? static_cast<uint8_t>(4)
                 : entry.metadata->codebook_id;
         EXPECT_EQ(
             canonicalDeviceVnniCodebookId(entry.metadata->codebook_id),
@@ -340,7 +346,9 @@ TEST(Test__NativeQuantisedFormatInfo, PackedRegionSizingMatchesCanonicalMetadata
         EXPECT_EQ(
             regions.payload_bytes,
             blocks * static_cast<size_t>(expected.payload_bytes));
-        EXPECT_EQ(regions.scales_bytes, blocks * sizeof(uint16_t));
+        // Primary plane width follows the physical codebook (1 B for native MXFP4).
+        EXPECT_EQ(regions.scales_bytes,
+                  blocks * nativeQuantisedScalePlaneBytes(canonicalDeviceVnniCodebookId(*format)));
         EXPECT_EQ(
             regions.mins_bytes,
             (expected.is_asymmetric || expected.name == "IQ4_XS" || expected.name == "IQ3_S")
@@ -369,7 +377,8 @@ TEST(Test__NativeQuantisedFormatInfo, MigrationStableAndReusableFormatsCoverEver
                 ? source->payload_bytes
                 : (source->codebook_id == 0 ||
                            source->codebook_id == 4 ||
-                           source->codebook_id == 5
+                           source->codebook_id == 5 ||
+                           source->codebook_id == kNativeQuantisedMXFP4Codebook
                        ? 16
                        : 32);
         const uint8_t expected_migrated_codebook =
@@ -403,6 +412,32 @@ TEST(Test__NativeQuantisedFormatInfo, MigrationStableAndReusableFormatsCoverEver
         EXPECT_GE(
             allocation.payload_bytes_per_block,
             migrated.payload_bytes_per_block);
+    }
+}
+
+/**
+ * @test Every physical decoder a source format can reach is publishable.
+ *
+ * The descriptor validator keeps its own numeric inventory for device code.
+ * Each canonical and migration-stable physical codebook must be supported and
+ * must agree with the canonical secondary-plane presence; otherwise MoE
+ * publication silently rejects an otherwise implemented format.
+ */
+TEST(Test__NativeQuantisedFormatInfo, DescriptorValidationCoversEveryReachablePhysicalDecoder)
+{
+    for (const NativeQuantisedSourceFormat &entry : native_quantised_formats::kAllSourceFormats)
+    {
+        SCOPED_TRACE(entry.quant_type);
+        const auto canonical = canonicalDeviceVnniFormat(*entry.metadata);
+        const auto migrated = migrationStableDeviceVnniFormat(*entry.metadata);
+        for (const auto &[codebook, secondary] :
+             {std::pair{canonical.codebook_id, canonical.is_asymmetric},
+              std::pair{migrated.codebook_id, migrated.is_asymmetric}})
+        {
+            SCOPED_TRACE(static_cast<int>(codebook));
+            EXPECT_TRUE(NativeQuantisedDescriptorValidation::supported(codebook));
+            EXPECT_EQ(NativeQuantisedDescriptorValidation::secondary(codebook), secondary);
+        }
     }
 }
 

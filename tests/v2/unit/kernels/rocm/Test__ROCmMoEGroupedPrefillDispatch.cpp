@@ -1048,7 +1048,9 @@ TEST(Test__ROCmMoEGroupedPopulation, SharedVerifierSourceAndCapacityReplay)
                                         nativeQuantisedCodebookMaskBit(canonicalDeviceVnniCodebookId(up.metadata->codebook_id)),
                         .down_source = nativeQuantisedCodebookMaskBit(canonicalDeviceVnniCodebookId(down.metadata->codebook_id)),
                         .singleton_sources = {identity(gate), identity(up), identity(down)}};
-                    const bool same = gate.quant_type == up.quant_type && gate.quant_type == down.quant_type;
+                    // MXFP4 has no gfx1100 measurement, so it is never qualified.
+                    const bool same = gate.quant_type == up.quant_type && gate.quant_type == down.quant_type &&
+                                      gate.quant_type != "MXFP4";
                     const bool mixed = gate.quant_type == "IQ2_S" && up.quant_type == "IQ2_S" && down.quant_type == "IQ4_XS";
                     EXPECT_EQ(sharedVerifierWmmaQualified(key), (same && rows == 16) || (mixed && (rows == 9 || rows == 16)))
                         << gate.quant_type << '/' << up.quant_type << '/' << down.quant_type << " rows=" << rows;

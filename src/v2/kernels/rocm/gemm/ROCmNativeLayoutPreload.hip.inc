@@ -50,7 +50,8 @@ struct PhaseProjectionValidation {
         switch(descriptor.codebook_id)
         {
         NUMERIC_CASE(NATIVE_QUANTISED_Q4_0) NUMERIC_CASE(NATIVE_QUANTISED_IQ4_NL)
-        NUMERIC_CASE(NATIVE_QUANTISED_IQ4_XS_SOURCE) NUMERIC_CASE(NATIVE_QUANTISED_Q4_1)
+        NUMERIC_CASE(NATIVE_QUANTISED_IQ4_XS_SOURCE) NUMERIC_CASE(NATIVE_QUANTISED_MXFP4)
+        NUMERIC_CASE(NATIVE_QUANTISED_Q4_1)
         NUMERIC_CASE(NATIVE_QUANTISED_Q5_0) NUMERIC_CASE(NATIVE_QUANTISED_Q5_1)
         NUMERIC_CASE(NATIVE_QUANTISED_Q6_K) NUMERIC_CASE(NATIVE_QUANTISED_Q3_K) NUMERIC_CASE(NATIVE_QUANTISED_Q2_K)
         NUMERIC_CASE(NATIVE_QUANTISED_IQ3_S) NUMERIC_CASE(NATIVE_QUANTISED_IQ3_XXS)
@@ -200,7 +201,8 @@ __device__ __forceinline__ void preloadBlockPayload(BlockOperand<FMT>& operand,
  * @brief Load only this original format's required metadata into its existing operand.
  * @tparam FMT Original physical decoder; no scale conversion occurs.
  * @param operand Existing current-K operand, retaining its original payload bytes.
- * @param scales Original primary plane. @param mins Original optional secondary plane.
+ * @param scales Original primary plane, one element per block of its codebook's width.
+ * @param mins Original optional secondary plane.
  * @param emins Original optional extended-minimum plane. @param linear Original index.
  */
 template<NativeQuantisedFormat FMT,class Reader=NativeLayoutWeightReader>
@@ -208,7 +210,14 @@ __device__ __forceinline__ void preloadBlockMetadata(BlockOperand<FMT>& operand,
     const uint16_t* scales,const uint16_t* mins,const uint32_t* emins,size_t linear)
 {
     using Traits=NATIVE_QUANTISEDTraits<FMT>;
-    const uint32_t primary=Reader::template load<uint16_t>(scales+linear);
+    // Normalize to the staged primary word: a one-byte E8M0 plane is indexed
+    // by bytes and widened to its BF16 word, a halfword plane is loaded as is.
+    uint32_t primary;
+    if constexpr(::llaminar2::nativeQuantisedScalePlaneBytes(static_cast<uint8_t>(FMT))==1)
+        primary=::llaminar2::mxfp4::powerOfTwoBF16Word(
+            Reader::template load<uint8_t>(reinterpret_cast<const uint8_t*>(scales)+linear));
+    else
+        primary=Reader::template load<uint16_t>(scales+linear);
     uint32_t secondary=0;
     if constexpr(Traits::requires_secondary_metadata)secondary=Reader::template load<uint16_t>(mins+linear);
     operand.scale_pair=primary|(secondary<<16);

@@ -107,7 +107,7 @@ TEST(ROCmMoERouteOwnedGeometry, ParallelSourcePartitionContract)
             if (moeRouteOwnedGateUpLaunchCodebookMask(envelope.execution_codebook_mask) & bit(cb))
                 EXPECT_TRUE(moeRouteOwnedGateUpPartitionCodebook(cb));
     }
-    for (const auto cb : {1, 2, 3, 18, 20, 21, 22, 25, 31, 255})
+    for (const auto cb : {1, 2, 3, 18, 20, 21, 22, 26, 31, 255})
         EXPECT_FALSE(moeRouteOwnedGateUpPartitionCodebook(cb));
     std::array<std::uint8_t, 32> partitions{};
     EXPECT_EQ(moeRouteOwnedGateUpMaximumKPartitions(corrected, partitions, 2560), 0);
@@ -165,7 +165,7 @@ TEST(ROCmMoERouteOwnedGeometry, AllFormatSharedLayoutHasDisjointGridAndPartials)
             EXPECT_THROW((void)moeRouteOwnedGateUpK1SharedLayout(cb, P::FourWorkerPlanes, 0), std::invalid_argument);
             EXPECT_THROW((void)moeRouteOwnedGateUpK1SharedLayout(cb, static_cast<P>(255), 16), std::invalid_argument);
         }
-    EXPECT_EQ(seen.size(), 18u);
+    EXPECT_EQ(seen.size(), 19u);
     EXPECT_THROW((void)moeRouteOwnedGateUpK1SharedLayout(255, P::Serial), std::invalid_argument);
 }
 

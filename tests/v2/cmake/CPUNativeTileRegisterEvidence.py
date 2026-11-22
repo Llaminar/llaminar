@@ -155,7 +155,7 @@ PROGRAM = re.compile(r"27CPUNativeNEONProjectionTileILm(\d)EE3runINS1_11multi_sc
                      r"Li(\d)E")
 INVENTORY = re.compile(r"llaminar-native-neon-tile-probe:([A-Za-z0-9,:]*)")
 # (encoding, nibble map, with-minimum) dispatched per policy by Tile::dispatch().
-DISPATCH = ((1, 0, 1), (1, 0, 0), (5, 0, 0), (2, 0, 0), (4, 2, 0), (0, 0, 0), (0, 2, 0), (0, 1, 1))
+DISPATCH = ((1, 0, 1), (1, 0, 0), (5, 0, 0), (2, 0, 0), (4, 2, 0), (0, 0, 0), (0, 2, 0), (0, 1, 1), (0, 3, 0))
 DOTS = {"ASIMD": 0, "DotProd": 1, "I8MM": 2}
 # The one never-returning diagnostic a tile may call, and abort. Both must also be proven never to return.
 FATAL_DIAGNOSTIC = "_ZN9llaminar23cpu16native_quantised28CPUNativeQuantisedWeightView32rejectOutsideAdmittedPublicationEv"
@@ -188,7 +188,7 @@ ldr w,mem|ldr x,mem|ldrb w,mem|ldrh w,mem|ldrsh w,mem|ldrsw x,mem|ldur d,mem|ldu
 lsr x,x,imm|lsr x,x,x|madd x,x,x,x|mov d,v[]|mov v,v|mov v[],v[]|mov w,imm|mov w,w|mov x,imm|mov x,x|movi d,imm|movi v,imm
 movi v,imm,shift|movk x,imm,shift|mul w,w,w|mul x,x,x|mvni v,imm|mvni v,imm,shift|negs w,w|nop|orr v,imm|orr v,v,v|orr w,w,imm
 orr w,w,w|orr w,w,w,shift|orr x,x,imm|orr x,x,x,shift|ret|saddlp v,v|sbfiz x,x,imm,imm|scvtf s,w|scvtf v,v
-sdot v,v,v|sdot v,v,v[]|shl v,v,imm|smaddl x,w,w,x|smmla v,v,v|smull v,v,v|smull x,w,w|smull2 v,v,v|sshll v,v,imm|sshr v,v,imm
+sdot v,v,v|sdot v,v,v[]|shl v,v,imm|shll v,v,imm|smaddl x,w,w,x|smmla v,v,v|smull v,v,v|smull x,w,w|smull2 v,v,v|sshll v,v,imm|sshr v,v,imm
 st1 list,mem|st1 list,mem,imm|st1 list[],mem|stp d,d,mem|stp q,q,mem|stp w,w,mem|stp x,x,mem|str b,mem|str d,mem|str d,mem,imm|str q,mem,imm
 str h,mem|str q,mem|str s,mem|str w,mem|str x,mem|stur d,mem|stur q,mem|stur w,mem|stur x,mem|sub v,v,v|sub w,w,imm|sub w,w,w
 sub x,x,imm|sub x,x,imm,shift|sub x,x,x|subs w,w,imm|subs w,w,w|sxtw x,w|tbl v,list,v|tbnz w,imm,sym|tbnz x,imm,sym|tbz w,imm,sym

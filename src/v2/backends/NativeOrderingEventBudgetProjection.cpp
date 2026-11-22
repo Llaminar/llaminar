@@ -53,9 +53,10 @@ PhysicalMemoryPlan NativeOrderingEventBudgetProjection::bom(NativeOrderingEventP
     resources(host,gpu);const auto selected=bounds(program,gpu.device);if(!selected.hostBytes)throw std::logic_error("Installed ordering group lacks positive original host commitment");
     PhysicalMemoryPlanBuilder result;result.add(host,owner(program),selected.hostBytes);result.add(gpu,owner(program),selected.deviceBytes);return result.build();
 }
-PhysicalMemoryPlan NativeOrderingEventBudgetProjection::remoteHostBOM(const PooledRemoteGraphProgram& program,PhysicalMemoryResource host,PhysicalMemoryResource gpu)const{
+PhysicalMemoryPlan NativeOrderingEventBudgetProjection::remoteHostBOM(const PooledRemoteGraphProgram& program,PhysicalMemoryResource host,PhysicalMemoryResource gpu,
+    const NativeGraphObjectGeometry& graphObjects)const{
     resources(host,gpu);if(!state_)throw std::invalid_argument("Remote graph planning lost its sealed original source");
-    if(!state_->recorded)return RetainedParticipantGraphExecutable::hostBOM(program,host,gpu);
+    if(!state_->recorded)return RetainedParticipantGraphExecutable::hostBOM(program,host,gpu,graphObjects);
     for(const auto& row:state_->remote)if(row.device==gpu.device){
         if(!row.family.accepts(program.limits(),PooledRemoteGraphProgramClass::argumentLayout()))
             throw std::invalid_argument("Recorded remote graph planning program exceeds its distinct graph-family trace");

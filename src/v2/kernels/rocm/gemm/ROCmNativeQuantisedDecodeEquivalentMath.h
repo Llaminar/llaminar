@@ -27,6 +27,7 @@
 #include "tensors/NativeQuantisedIQ4XSScale.h"
 #include "tensors/NativeQuantisedIQ3SScale.h"
 #include "tensors/NativeQuantisedFormatInfo.h"
+#include "kernels/common/NativeQuantisedScaleLoad.h"
 
 #include <cstdint>
 
@@ -86,7 +87,8 @@ rocm_native_quantised_load_dual_weight_scales(uint16_t primary, uint16_t seconda
 /**
  * @brief Resolve original IQ3_S/IQ4_XS factors before the unchanged single-dot tree.
  * @tparam Codebook Physical decoder;11 stores d/raw nibble,24 stores d/raw encoded6.
- * @param primary Original half d for11/24, otherwise the unchanged half scale.
+ * @param primary Normalized staged primary word (loadStagedPrimary): original half
+ *        d for11/24, otherwise the half scale, or a native E8M0 power-of-two word.
  * @param secondary Raw nibble for11 or encoded coefficient for24, ignored for other formats.
  * @return Source d*(1+2*nibble) for11 or d*(encoded-32) for24; other scales widened.
  */
@@ -94,7 +96,11 @@ template <int Codebook>
 __device__ __forceinline__ float rocm_native_quantised_load_single_weight_scale(
     uint16_t primary, uint16_t secondary)
 {
-    const float base = __half2float(*reinterpret_cast<const __half *>(&primary));
+    float base;
+    if constexpr (::llaminar2::nativeQuantisedScalePlaneBytes(static_cast<uint8_t>(Codebook)) == 1)
+        base = ::llaminar2::native_quantised_scale::stagedNativeScale(primary);
+    else
+        base = __half2float(*reinterpret_cast<const __half *>(&primary));
     if constexpr (Codebook == 11)
         return llaminar2::device_fp32_contract::multiply(base,
             static_cast<float>(llaminar2::native_quantised_iq3s_scale::coefficient(secondary)));

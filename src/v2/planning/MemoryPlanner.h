@@ -16,6 +16,7 @@
 #include "collective/RankOrderedNativeResources.h"
 #include "planning/PlanningNativeContextEvidence.h"
 #include "loaders/NativeWeightLoadStaging.h"
+#include "backends/NativeGraphObjectGeometry.h"
 #include "backends/NativeOrderingEventBudgetProjection.h"
 #include "backends/CPUExecutionGeometry.h"
 #include "planning/MemoryPlan.h"
@@ -561,6 +562,12 @@ struct DevicePlanConfig
     CapturedServingGraphMemoryInventory captured_serving_graphs;
     /** Metadata-only original birth; never present alongside a live source. */
     std::optional<PlanningNativeContextDeclaration> planning_native_context_birth;
+    /**
+     * Owner-published graph-adapter sizes of the candidate's ranks, projected
+     * onto execution ranks. Prices GPUs that carry no birth declaration and
+     * no live source in this process; never derived from this binary.
+     */
+    NativeGraphObjectGeometry native_graph_objects;
 
     /**
      * Diagnostic checkpoint storage retained beside captured executables.

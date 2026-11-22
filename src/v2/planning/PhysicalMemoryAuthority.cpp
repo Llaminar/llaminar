@@ -2487,6 +2487,16 @@ namespace llaminar2
         return ledger_.admission();
     }
 
+    PhysicalMemoryBacking PhysicalMemoryAuthority::backing(DeviceId device) const
+    {
+        const auto *bom = admission()->plan().find(
+            PhysicalMemoryAllocatorIdentity{.world_rank = world_rank_, .device = device});
+        if (!bom)
+            throw std::out_of_range("Physical memory backing requested for an unadmitted device " +
+                                    device.toString());
+        return bom->resource().backing;
+    }
+
     bool PhysicalMemoryAuthority::contains(DeviceId device) const
     {
         if (!device.is_valid())

@@ -93,7 +93,7 @@ void OriginalSharedUnionSourceReplay::prepare(){
     bill.add(host,PhysicalMemoryOwner::ActivationTransportStaging,plan_.stagingBytesFor(rank,DeviceId::cpu())+
         TransferEngine::mappedHostRegionAllocationBytes(2*sizeof(MoEOverlayActivationDeviceEpochGrant)));
     const auto add=[&](const PhysicalMemoryPlan& value){for(const auto& line:value.resources())bill.add(line);};
-    add(RetainedParticipantGraphExecutable::generalBOM(host,original_->resource(devices_[0]),families_.size()));
+    add(RetainedParticipantGraphExecutable::generalBOM(host,original_->resource(devices_[0]),NativeGraphObjectGeometry::localOwner({(original_->resource(devices_[0])).world_rank,(original_->resource(devices_[0])).device}),families_.size()));
     add(MoEOverlayActivationBatchResources::sharedLaneStreamsBOM(channel,host,original_->resource(devices_[0])));
     for(std::size_t f=0;f<families_.size();++f)add(MoEOverlayActivationBatchResources::bom(channel,rows,0,host,original_->resource(devices_[0])));
     for(std::size_t p=1;p<devices_.size();++p)add(MoEOverlayActivationBatchResources::coldPublicationBOM(host,original_->resource(devices_[p])));

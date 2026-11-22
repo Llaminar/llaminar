@@ -43,6 +43,7 @@
 #include <array>
 #include <map>
 #include <set>
+#include "fixtures/backends/NativeGraphObjectGeometryRecordedAccess.h"
 
 namespace llaminar2::test
 {
@@ -116,7 +117,8 @@ namespace
 
     /** @return Explicit capture inventory small enough for fast metadata-only regression. */
     OrchestrationCandidateMemoryPolicy policy()
-    { return {.prefill_bucket_rows = {1, 8, 32}, .minimum_prefill_sequence_rows = 1, .maximum_cached_prefill_buckets = 16, .retained_host_services = planningHostServiceBudgets(1)}; }
+    { return {.prefill_bucket_rows = {1, 8, 32}, .minimum_prefill_sequence_rows = 1, .maximum_cached_prefill_buckets = 16, .retained_host_services = planningHostServiceBudgets(1),
+        .native_graph_objects = test::NativeGraphObjectGeometryRecordedAccess::uniform()}; }
 
     /** @return Every supported source codebook, excluding the runtime-only Q8_1 representation. */
     std::vector<TensorType> formats()
@@ -185,7 +187,7 @@ TEST_P(MoEPipelineMemoryAdmission, AllFormatsMTPModesAndBothVendorOrders)
     const int width = GetParam() / 2;
     // Q8_1 is a runtime-prepared format, not a supported GGUF source encoding.
     EXPECT_THROW(PlanningGGUFFixture::sourceType(TensorType::Q8_1), std::invalid_argument);
-    ASSERT_EQ(formats().size(), 23u);
+    ASSERT_EQ(formats().size(), 24u); // Includes MXFP4.
     for (const auto format : formats())
     {
         PlanningGGUFFixture file(true, true, PlanningGGUFFixture::sourceType(format));
@@ -1083,7 +1085,8 @@ MoEPipelineMemoryPolicy sourcePolicy(std::span<const DeviceId> devices,const Mod
     return {.prefill={.bucket_rows=rows,.minimum_sequence_rows=1,.maximum_cached_buckets=4},
         .gpu_weight_load={.policy=configuredGPUWeightLoadMemoryPolicy(),.maximum_source_bytes=maximumGGUFTensorPayloadBytes(loader.getModel())},
         .native_ordering_events=NativeOrderingEventGroupReplayAccess::projection(devices),
-        .retained_host_services=planningHostServiceProjection(),.native_context_preparation=std::move(source)};
+        .retained_host_services=planningHostServiceProjection(),.native_context_preparation=std::move(source),
+        .native_graph_objects=test::NativeGraphObjectGeometryRecordedAccess::uniform()};
 }
 /**
  * @brief Reuse all original source-admission contracts for the actual local stage GPU set.

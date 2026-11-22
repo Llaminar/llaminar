@@ -11,6 +11,7 @@
  * Worker entry holds a stable lane pointer while the owner grows its lane vector.
  */
 
+#include "tensors/MXFP4Format.h"
 #include "loaders/gpu_pipeline/DeviceLoadPipeline.h"
 #include "loaders/gpu_pipeline/WeightVRAMPool.h"
 #include "loaders/gpu_pipeline/PinnedRingBuffer.h"
@@ -628,6 +629,18 @@ namespace llaminar2
                                 std::memcpy(destination, job.host_raw_data, job.raw_bytes);
                                 result.payload = destination;
                             }
+                            if (result.error.empty() && job.format == RepackFormat::MXFP4)
+                            {
+                                // The repack kernel stores the native E8M0 byte. Validate every
+                                // nonzero block here, on the reader thread, so an exponent outside
+                                // [2, 252] fails the load instead of being decoded on device.
+                                // All-zero blocks (ggml writes e = 0) publish the zero marker.
+                                const auto *bytes = static_cast<const uint8_t *>(result.payload);
+                                const size_t rejected = mxfp4::firstInadmissibleNativeE8M0Block(bytes, job.raw_bytes);
+                                if (rejected + mxfp4::kSourceBlockBytes <= job.raw_bytes)
+                                    result.error = "MXFP4 block exponent " + std::to_string(bytes[rejected]) +
+                                                   " in '" + job.name + "' is outside the native E8M0 range [2, 252]";
+                            }
                         }
                         result.read_ms =
                             std::chrono::duration<double, std::milli>(
@@ -701,6 +714,8 @@ namespace llaminar2
                 return "IQ1_S";
             case RepackFormat::IQ1_M:
                 return "IQ1_M";
+            case RepackFormat::MXFP4:
+                return "MXFP4";
             case RepackFormat::RAW_FP:
                 return "RAW_FP";
             default:

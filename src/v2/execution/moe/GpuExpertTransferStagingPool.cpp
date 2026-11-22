@@ -1,3 +1,13 @@
+/**
+ * @file GpuExpertTransferStagingPool.cpp
+ * @brief Planning and ownership of the GPU scratch arena for rolling MoE expert transfers.
+ *
+ * Each transfer slot is planned through the load orchestrator with the same
+ * per-format geometry as an active expert slot, including the primary scale
+ * plane width (one byte per block for native MXFP4 E8M0, two otherwise), so a
+ * staged arrival has exactly the layout of the slot it is copied into. The
+ * arena is destination-device owned and reused across rebalance waves.
+ */
 #include "execution/moe/GpuExpertTransferStagingPool.h"
 
 #include "../../backends/IBackend.h"
@@ -100,6 +110,7 @@ namespace llaminar2
                     spec.payload_bytes_per_block,
                     spec.is_asymmetric,
                     spec.has_emins,
+                    spec.scale_plane,
                     /*raw_gguf_bytes=*/0);
             }
         }

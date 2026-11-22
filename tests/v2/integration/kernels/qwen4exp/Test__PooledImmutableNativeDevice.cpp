@@ -186,7 +186,7 @@ public:
         const auto sourceBytes=mode==RecordedTrace::SuccessfulSource?std::size_t{1024}*90:0;
         graphClass=mode==RecordedTrace::SuccessfulSource && maximum>512?GPUGraphExecutableClass::General:GPUGraphExecutableClass::BoundedFlatHelper;
         bom.add(gpu,PhysicalMemoryOwner::ActivationArena,inputBytes);bom.add(cpu,PhysicalMemoryOwner::ActivationArena,inputBytes);
-        const auto general=RetainedParticipantGraphExecutable::generalBOM(cpu,gpu,1);
+        const auto general=RetainedParticipantGraphExecutable::generalBOM(cpu,gpu,NativeGraphObjectGeometry::localOwner({(gpu).world_rank,(gpu).device}),1);
         for(const auto& row:general.resources())bom.add(row);
         for(const auto program:{q::PooledImmutableOwnerNativePlan::orderingProgram(physical,geometry,0),
                                 q::PooledImmutableCoordinatorNativePlan::orderingProgram(physical,geometry)})

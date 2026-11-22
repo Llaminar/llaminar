@@ -2049,8 +2049,26 @@ namespace
     /** @brief Keep every source format while bounding each registered setup transaction. */
     inline constexpr int kInstalledDensePrefillSourceGroups = 12;
 
+    /**
+     * @brief Installed-dispatch admission inventory: the trainer formats plus
+     * MXFP4, which has no tuning corpus of its own and executes IQ4_NL's
+     * installed policy through its own physical decoder (codebook 25).
+     */
+    static const std::vector<FormatSpec> &installedPrefillFormats()
+    {
+        static const std::vector<FormatSpec> formats = []
+        {
+            auto all = NATIVE_QUANTISED_FORMATS;
+            all.push_back({"MXFP4", [](size_t N, size_t K)
+                           { return TestTensorFactory::createMXFP4Random({N, K}); }});
+            return all;
+        }();
+        return formats;
+    }
+
     TEST_P(InstalledDensePrefillOverlayTest, AllSourceFormats)
     {
+        const auto &kInstalledFormats = installedPrefillFormats();
 #ifndef HAVE_ROCM
         GTEST_SKIP() << "HAVE_ROCM not defined";
 #else
@@ -2070,9 +2088,9 @@ namespace
         ASSERT_NE(selected, NATIVE_QUANTISED_VARIANTS.end());
         std::size_t cases = 0;
         for (std::size_t format_index = static_cast<std::size_t>(GetParam());
-             format_index < NATIVE_QUANTISED_FORMATS.size(); format_index += kInstalledDensePrefillSourceGroups)
+             format_index < kInstalledFormats.size(); format_index += kInstalledDensePrefillSourceGroups)
         {
-            const auto &format = NATIVE_QUANTISED_FORMATS[format_index];
+            const auto &format = kInstalledFormats[format_index];
             SCOPED_TRACE(format.name);
             for (const auto &[projection, row_buckets] : geometries)
             {
@@ -2096,16 +2114,22 @@ namespace
                     auto exact = selectDensePrefillExactConfig(codebook, m, n, k, family, &actual_hardware);
                     if (!exact && codebook == kNativeQuantisedIQ4XSSourceScaleCodebook)
                         exact = selectDensePrefillExactConfig(4, m, n, k, family);
-                    ASSERT_TRUE(exact);
+                    // MXFP4 has no tuning corpus, so no installed row: production
+                    // runs the complete generic dispatcher, verified below.
+                    const bool tuned = codebook != kNativeQuantisedMXFP4Codebook;
+                    ASSERT_EQ(exact.has_value(), tuned);
                     PreparedROCmSweepExecution execution(shape, m, weights.get(), {*selected}, 1,
                         SweepDispatch::InstalledProduction);
                     const auto result = execution.verifyCaptured(*selected);
-                    EXPECT_EQ(result.observed_producer, exact->producer);
-                    EXPECT_EQ(result.observed_n_tile, exact->n_tile);
-                    EXPECT_EQ(result.observed_m_tile, exact->m_tile);
-                    EXPECT_EQ(result.observed_min_blocks, exact->min_blocks);
-                    EXPECT_EQ(result.observed_unroll, exact->unroll);
-                    EXPECT_EQ(result.observed_full_tiles, exact->full_tiles);
+                    if (exact)
+                    {
+                        EXPECT_EQ(result.observed_producer, exact->producer);
+                        EXPECT_EQ(result.observed_n_tile, exact->n_tile);
+                        EXPECT_EQ(result.observed_m_tile, exact->m_tile);
+                        EXPECT_EQ(result.observed_min_blocks, exact->min_blocks);
+                        EXPECT_EQ(result.observed_unroll, exact->unroll);
+                        EXPECT_EQ(result.observed_full_tiles, exact->full_tiles);
+                    }
                     EXPECT_EQ(result.local_memory_bytes_per_thread, 0u);
                     EXPECT_GT(result.max_active_blocks_per_sm, 0);
                     ASSERT_EQ(result.byte_mismatches_vs_auto, 0u);
@@ -2188,7 +2212,7 @@ namespace
         EXPECT_EQ(native_wmma_cases, expected_native_wmma_cases);
         RecordProperty("unavailable_native_prepared_cases", unavailable_native_cases);
         const std::size_t source_count =
-            (NATIVE_QUANTISED_FORMATS.size() + kInstalledDensePrefillSourceGroups - 1u -
+            (kInstalledFormats.size() + kInstalledDensePrefillSourceGroups - 1u -
                 static_cast<std::size_t>(GetParam())) / kInstalledDensePrefillSourceGroups;
         EXPECT_EQ(cases, source_count * geometry_count);
 #endif

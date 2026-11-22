@@ -611,7 +611,7 @@ public:
             geometry.channel=local.channelLayout();
             bom.add(session_->resource(consumer),PhysicalMemoryOwner::ActivationArena,geometry.activation);
             for(const auto& root:geometry.declarations)bom.add(cpu,PhysicalMemoryOwner::ActivationArena,root.physicalBytes());
-            const auto graphBOM=RetainedParticipantGraphExecutable::generalBOM(cpu,session_->resource(consumer),geometry.graphCount);
+            const auto graphBOM=RetainedParticipantGraphExecutable::generalBOM(cpu,session_->resource(consumer),NativeGraphObjectGeometry::localOwner({(session_->resource(consumer)).world_rank,(session_->resource(consumer)).device}),geometry.graphCount);
             for(const auto& row:graphBOM.resources())bom.add(row);
             programs_.push_back({spec,std::move(geometry),session_,consumer,{},instance});
         }

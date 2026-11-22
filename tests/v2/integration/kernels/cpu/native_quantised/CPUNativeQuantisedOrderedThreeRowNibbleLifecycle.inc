@@ -71,10 +71,15 @@ TEST(CPUNativeQuantisedFusedCompletion, GPUAlignedOrderedThreeRowNibbleByteLifec
             const int stride = geometry.n + 7;
             const size_t extent = size_t(maximum_rows) * stride + 17;
             std::vector<Q8_1Block> input(size_t(maximum_rows) * packed.blocks_per_row);
-            for (int bank : {0, 1})
+            {
+                // A deferred workspace bank is unadmitted on every ISA.
+                OrderedThreeRowBankScope binding(packed, workspace.data());
+                EXPECT_THROW((void)packed.readView(), std::logic_error);
+            }
+            for (int bank : {0})
             {
                 SCOPED_TRACE(bank);
-                OrderedThreeRowBankScope binding(packed, bank ? workspace.data() : nullptr);
+                OrderedThreeRowBankScope binding(packed, nullptr);
                 for (int workers : {1, 4})
                 {
                     SCOPED_TRACE(workers);
@@ -394,8 +399,12 @@ TEST(CPUNativeQuantisedFusedCompletion, GPUAlignedPrefillOrderedThreeRowTileByte
         for(int workers:{1,4,7}) {
             FusedCompletionScope runtime(workers,std::nullopt);
             NativeQuantisedTestPartialStorage serial_partials(packed,1);
-            for(int bank:{0,1}) {
-                OrderedThreeRowBankScope binding(packed,bank?workspace.data():nullptr);
+            {
+                OrderedThreeRowBankScope binding(packed,workspace.data());
+                EXPECT_THROW((void)packed.readView(),std::logic_error);
+            }
+            for(int bank:{0}) {
+                OrderedThreeRowBankScope binding(packed,nullptr);
                 int turn=0;
                 // All formats get an explicit eligibility/no-write check. Only
                 // registry-admitted nibble preparations can enter the new body.

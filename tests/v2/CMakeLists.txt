@@ -295,8 +295,9 @@ function(add_v2_test TEST_NAME)
     cmake_parse_arguments(
         ARG                             # Prefix for parsed args
         "NO_MODELS;NO_MPI"              # Explicit model/process requirements
-        "MPI_PROCS;TIMEOUT;SKIP_REGULAR_EXPRESSION;GPU_DEVICES;CUDA_DEVICES;ROCM_DEVICES;REQUIRES_BACKEND" # One-value keywords
-        "COMMAND;LABELS;RESOURCE_LOCK;ENVIRONMENT;REQUIRED_FILES"  # Multi-value keywords
+        "MPI_PROCS;TIMEOUT;SKIP_REGULAR_EXPRESSION;GPU_DEVICES;CUDA_DEVICES;ROCM_DEVICES" # One-value keywords
+        # REQUIRES_BACKEND lists every required family; cross-vendor cases name both.
+        "COMMAND;LABELS;RESOURCE_LOCK;ENVIRONMENT;REQUIRED_FILES;REQUIRES_BACKEND"  # Multi-value keywords
         ${ARGN}                         # Arguments to parse
     )
     # Release aliases are admitted only through their explicitly selected
@@ -1061,6 +1062,27 @@ add_executable(v2_test_qwen4exp_metadata
     unit/loaders/Test__GGUFIntegerArrays.cpp
 )
 target_link_libraries(v2_test_qwen4exp_metadata PRIVATE llaminar2_core GTest::gtest_main)
+# OCP MXFP4 (GGUF type 39): exact decode, NativeQuantised packing and CPU projection.
+add_executable(v2_test_mxfp4_tensor unit/tensors/Test__MXFP4Tensor.cpp)
+target_link_libraries(v2_test_mxfp4_tensor PRIVATE llaminar2_core GTest::gtest_main)
+target_include_directories(v2_test_mxfp4_tensor PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+add_v2_test(V2_Unit_MXFP4Tensor
+    COMMAND $<TARGET_FILE:v2_test_mxfp4_tensor>
+    LABELS "V2;Unit;Tensors;MXFP4;CPU;Kernels"
+    MPI_PROCS 1
+    NO_MODELS
+    NO_MPI
+)
+# Exact MXFP4 preparation: inexact exponents rejected, ggml all-zero blocks
+# (e = 0 / e > 143) prepared with scale +0 through the production CPU packers.
+add_v2_test(V2_Integration_MXFP4ExactPreparation_CPU
+    COMMAND $<TARGET_FILE:v2_test_mxfp4_tensor>
+        --gtest_filter=MXFP4Tensor.NativeQuantisedPackingIsVerbatimAndRejectsInexactScales:MXFP4Tensor.GgmlAllZeroBlocksPrepareExactlyWithZeroScale:MXFP4CPUNativeQuantised.GgmlAllZeroBlocksMatchExactReference:MXFP4Format.NativeE8M0ScaleBitsAreExactNormalFP32:MXFP4Format.PowerOfTwoBF16WordIsExactAndValidated:MXFP4CPUScaleLoaders.*:MXFP4ScaleCarrier.*:MXFP4Tensor.NativeE8M0LayoutsCoverBoundariesAndRejectUnadmittedExponents:MXFP4ScalePlaneUpload.*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Tensors;MXFP4;Regression"
+    MPI_PROCS 1
+    NO_MODELS
+    NO_MPI
+)
 add_v2_test(V2_Unit_Qwen4ExpMetadata
     COMMAND $<TARGET_FILE:v2_test_qwen4exp_metadata>
     LABELS "V2;Unit;Models;Qwen4Exp;Loaders"
@@ -2141,6 +2163,16 @@ add_v2_routed_expert_policy_unit(
     V2_Unit_MoEOverlayDistributedResidencyProtocol
     unit/execution/moe/Test__MoEOverlayDistributedResidencyProtocol.cpp
 )
+# MXFP4 remote GPU blobs carry exactly one E8M0 byte per block.
+add_v2_test(V2_Integration_MXFP4RemoteGpuProjectionPlanes
+    COMMAND $<TARGET_FILE:v2_unit_moe_overlay_distributed_residency_protocol>
+        --gtest_filter=Test__MoEOverlayDistributedResidencyProtocol.RemoteGpuBlobManifestCarriesTheOneBytePrimaryPlaneOfMXFP4
+    LABELS "V2;Integration;CPU;DeviceFree;ExpertOverlay;Protocol;MXFP4;Regression;ProductionTestPreflight"
+    MPI_PROCS 1
+    NO_MODELS
+    TIMEOUT 30
+)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MXFP4RemoteGpuProjectionPlanes)
 add_v2_test(V2_Integration_MoEPipelineStageResidencyProposal
     COMMAND $<TARGET_FILE:v2_unit_moe_overlay_distributed_residency_protocol>
         --gtest_filter=Test__MoEOverlayDistributedResidencyProtocol.PipelineStageProposalRoundTripAuthenticatesOrigin
@@ -3278,6 +3310,18 @@ add_v2_test(V2_Unit_PackedWeightsSerialization
     LABELS "V2;Unit;Kernels;Serialization;PackedWeights;MoE"
     MPI_PROCS 1
 )
+# Native MXFP4 tier reference: exact byte plane <-> BF16 unit words, odd counts, malformed words.
+add_v2_test(V2_Integration_MXFP4TierReferenceRoundTrip
+    COMMAND $<TARGET_FILE:v2_test_expert_tier_weight_stream>
+        --gtest_filter=ExpertTierWeightStream.MXFP4NativeE8M0PlaneRoundTripsOddCountsAndRejectsMalformedWords:*EveryCpuPreparedEncoding*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MoE;MXFP4;Transfer;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60)
+# CPU packed-weight archive ABI 8: native MXFP4 unit scale words are BF16 powers of two.
+add_v2_test(V2_Integration_MXFP4PackedWeightsArchiveABI
+    COMMAND $<TARGET_FILE:v2_unit_packed_weights_serialization>
+        --gtest_filter=Test__PackedWeightsSerialization.MXFP4NativeUnitScaleWordsRoundTripAndRejectVersion7
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;MXFP4;Serialization;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 
 # Test: GPUPackedWeightsStubs - Phase 4 GPU packed weight stub IPackedWeights implementations
 # Tests: CUDA/ROCm construction, format, clone, convertTo, serialize, compatibility, empty data
@@ -7391,6 +7435,13 @@ if(HAVE_ROCM)
         COMMAND $<TARGET_FILE:v2_test_rocm_verifier_bundle_policy>
         LABELS "V2;Unit;DeviceFree;MTP;QKV;Regression;Replay"
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+    # Automatic verifier WMMA qualification excludes decoders unmeasured on gfx1100.
+    add_v2_test(V2_Integration_ROCmVerifierWmmaQualificationInventory
+        COMMAND $<TARGET_FILE:v2_test_rocm_verifier_bundle_policy>
+            --gtest_filter=ROCmVerifierBundlePolicy.WmmaQualificationExcludesUnmeasuredMXFP4
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;MTP;DeviceFree;Contract;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmVerifierWmmaQualificationInventory)
 endif()
 
 add_executable(v2_test_rocm_router_q8_policy
@@ -8417,6 +8468,26 @@ if(NOT V2_PERF_TESTS_ONLY)
     set_tests_properties(V2_Unit_CPUQuantizedGemmParity PROPERTIES
         PROCESSORS ${V2_CPU_GEMM_PARITY_MAX_THREADS})
 endif()
+
+# Test: MXFP4 OCP-spec reference oracle through the CPU NativeQuantised kernel
+add_executable(v2_test_mxfp4_native_quantised_oracle
+    unit/kernels/Test__MXFP4NativeQuantisedOracle.cpp)
+target_link_libraries(v2_test_mxfp4_native_quantised_oracle
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_MXFP4NativeQuantisedOracle
+    COMMAND $<TARGET_FILE:v2_test_mxfp4_native_quantised_oracle>
+    LABELS "V2;Unit;Kernels;GEMM;GEMV;MXFP4;Quantization;OCP;ByteExact;Regression"
+    MPI_PROCS 1
+)
+add_v2_test(V2_Integration_MXFP4NativeQuantisedOracle
+    COMMAND $<TARGET_FILE:v2_test_mxfp4_native_quantised_oracle>
+        --gtest_filter=MXFP4NativeQuantisedOracle.*
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeQuantised;MXFP4;OCP;ByteExact;Regression"
+    MPI_PROCS 1 NO_MODELS
+)
 
 # Test: AVX2 vs AVX512-VNNI parity (emulated dpbusd, chunk GEMV, full GEMV/GEMM)
 # x86 leaves only; ARM NativeQuantised programs have their own NEON byte gates.
@@ -19969,6 +20040,28 @@ add_v2_test(V2_Integration_CPUNativeQuantised_GEMV
     LABELS "V2;Integration;GEMM;GEMV;NativeQuantised;CPU;Q4_0;IQ4_NL;Decode"
     MPI_PROCS 1
 )
+# Every CPU NativeQuantised entry rejects unsealed or stale publications, on
+# each native runtime ISA of this build (NEON, AVX2, AVX512).
+set(V2_CPU_PUBLICATION_ADMISSION_ISAS ${V2_CPU_BASELINE_RUNTIME_ISA})
+if(LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
+    list(APPEND V2_CPU_PUBLICATION_ADMISSION_ISAS avx2 avx512)
+endif()
+list(REMOVE_DUPLICATES V2_CPU_PUBLICATION_ADMISSION_ISAS)
+foreach(V2_ADMISSION_ISA IN LISTS V2_CPU_PUBLICATION_ADMISSION_ISAS)
+    string(TOUPPER "${V2_ADMISSION_ISA}" V2_ADMISSION_ISA_LABEL)
+    string(REPLACE "-" "_" V2_ADMISSION_ISA_LABEL "${V2_ADMISSION_ISA_LABEL}")
+    add_v2_test(V2_Integration_CPU_NativeQuantisedPublicationAdmission_${V2_ADMISSION_ISA_LABEL}
+        COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_gemv>
+                --gtest_filter=CPUNativeQuantisedPublicationAdmission.*
+                --gtest_brief=1
+        LABELS "V2;Integration;CPU;NativeQuantised;MXFP4;Publication;${V2_ADMISSION_ISA_LABEL};ProductionTestPreflight;Regression"
+        MPI_PROCS 1
+        NO_MPI
+        NO_MODELS
+        ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_ADMISSION_ISA}")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+        V2_Integration_CPU_NativeQuantisedPublicationAdmission_${V2_ADMISSION_ISA_LABEL})
+endforeach()
 set(V2_CPU_MOVABLE_FLOATING_EXPERT_PREFLIGHT_TESTS)
 foreach(V2_FLOATING_EXPERT_ISA IN ITEMS scalar ${V2_CPU_BASELINE_RUNTIME_ISA})
     if(V2_FLOATING_EXPERT_ISA STREQUAL "scalar")
@@ -23949,6 +24042,15 @@ add_v2_test(V2_Integration_ROCmIQ2SFusedMoEOriginalEquation
         LABELS "V2;Integration;ROCm;MoE;Routing;Gather;Scatter;gfx906"
         MPI_PROCS 1
     )
+    # MXFP4: physical decoder 25 under the IQ4_NL (4) arithmetic policy.
+    # IQ4_NL shares MXFP4's arithmetic policy and the same runtime-table
+    # kernels; running it alongside separates format from path defects.
+    add_v2_test(V2_Integration_ROCm_MoEMXFP4GroupedDecodePolicy
+        COMMAND $<TARGET_FILE:v2_integration_rocm_moe_kernel>
+                --gtest_filter=Test__ROCmMoEKernel.GroupedExpertGateUpDecode_IQ4_NLMatchesSerialDecodeBytes:Test__ROCmMoEKernel.GroupedExpertGateUpDecode_MXFP4MatchesSerialDecodeBytes
+                --gtest_brief=1
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;MXFP4;DecodeEquivalent;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 60)
     add_v2_test(V2_Integration_ROCm_MoEColdGroupedVerifierPublisherReplay
         COMMAND $<TARGET_FILE:v2_integration_rocm_moe_kernel>
                 --gtest_filter=Test__ROCmMoEKernel.ColdGroupedVerifierPublisherCapturesWithoutComputeStream
@@ -24243,6 +24345,20 @@ if(HAVE_CUDA OR HAVE_ROCM)
             list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDANoPeerGPUExpertBlobTransfer)
         endif()
     endif()
+    # MXFP4 GPU roots with a one-byte primary plane pass both real remote
+    # projection endpoint admissions; a halfword-plane root is rejected.
+    foreach(_mxfp4_remote_backend CUDA ROCm)
+        if((_mxfp4_remote_backend STREQUAL "CUDA" AND HAVE_CUDA) OR (_mxfp4_remote_backend STREQUAL "ROCm" AND HAVE_ROCM))
+            add_v2_test(V2_Integration_MXFP4RemoteGpuEndpointAdmission_${_mxfp4_remote_backend}
+                COMMAND $<TARGET_FILE:v2_unit_gpu_expert_transfer>
+                    --gtest_filter=ExpertTierGpuBlobTransferIntegration.${_mxfp4_remote_backend}AdmitsMXFP4RemoteGpuRootsWithOneBytePrimaryPlane
+                LABELS "V2;Integration;ProductionTestPreflight;HardwareOptional;Devices1;${_mxfp4_remote_backend};MoE;ExpertOverlay;MXFP4;Regression"
+                MPI_PROCS 1 NO_MODELS TIMEOUT 60)
+            if(TEST V2_Integration_MXFP4RemoteGpuEndpointAdmission_${_mxfp4_remote_backend})
+                list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MXFP4RemoteGpuEndpointAdmission_${_mxfp4_remote_backend})
+            endif()
+        endif()
+    endforeach()
     add_v2_test(V2_Integration_MappedTransferProgressEpoch
         COMMAND $<TARGET_FILE:v2_unit_gpu_expert_transfer>
                 --gtest_filter=MappedTransferProgressEpochIntegration.*
@@ -27207,6 +27323,16 @@ if(HAVE_ROCM)
         LABELS "V2;Integration;ProductionTestPreflight;ROCm;GraphCapture;Prefill;Buckets;ByteExact;KVCache;Replay"
         MPI_PROCS 1 NO_MODELS TIMEOUT 60)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ExactPrefillMaterializerReplay_ROCm)
+    # Issue #30: the KV probe reset ran on the admission stream while the
+    # retained replay ran on the engine's prefill stream with no edge between
+    # them, so a replay could append past the capacity with the previous
+    # request's count. Repeat the reset/replay rounds to keep the edge proven.
+    add_v2_test(V2_Integration_PrefillRetainedRemainderResetOrdering_ROCm
+        COMMAND $<TARGET_FILE:v2_test_prefill_graph_cache_execution_rocm>
+                --gtest_filter=SharedBackendPolicy/RetainedPrefillBucketFamilyTest.ReplaysSmallRemainder/*
+                --gtest_repeat=10
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;GraphCapture;Prefill;KVCache;Lifecycle;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120)
     add_v2_test(V2_Integration_PrefillGraphCacheLongContextMTotality_ROCm
         COMMAND $<TARGET_FILE:v2_test_prefill_graph_cache_execution_rocm>
                 --gtest_filter=PrefillGraphCacheExecutionTest.LongContext256KPlusTailIsMTotal
@@ -27268,6 +27394,16 @@ if(HAVE_CUDA)
         LABELS "V2;Integration;ProductionTestPreflight;CUDA;GraphCapture;Prefill;Buckets;ByteExact;KVCache;Replay"
         MPI_PROCS 1 NO_MODELS TIMEOUT 60)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ExactPrefillMaterializerReplay_CUDA)
+    # Issue #30: the KV probe reset ran on the admission stream while the
+    # retained replay ran on the engine's prefill stream with no edge between
+    # them, so a replay could append past the capacity with the previous
+    # request's count. Repeat the reset/replay rounds to keep the edge proven.
+    add_v2_test(V2_Integration_PrefillRetainedRemainderResetOrdering_CUDA
+        COMMAND $<TARGET_FILE:v2_test_prefill_graph_cache_execution_cuda>
+                --gtest_filter=SharedBackendPolicy/RetainedPrefillBucketFamilyTest.ReplaysSmallRemainder/*
+                --gtest_repeat=10
+        LABELS "V2;Integration;ProductionTestPreflight;CUDA;GraphCapture;Prefill;KVCache;Lifecycle;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120)
     add_v2_test(V2_Integration_PrefillGraphCacheLongContextMTotality_CUDA
         COMMAND $<TARGET_FILE:v2_test_prefill_graph_cache_execution_cuda>
                 --gtest_filter=PrefillGraphCacheExecutionTest.LongContext256KPlusTailIsMTotal
@@ -27810,6 +27946,14 @@ if(HAVE_CUDA OR HAVE_ROCM)
                 LABELS "V2;Integration;ProductionTestPreflight;${_repetition_backend};Sampling;MTP;Penalty;GraphCapture;ByteExact;Replay;Regression"
                 MPI_PROCS 1 NO_MODELS TIMEOUT 120)
             list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_StochasticRawLogitPreservation_${_repetition_backend})
+            # A stale controller depth must publish the fatal outcome into the
+            # owned sample slots only, never a neighbouring request's slots.
+            add_v2_test(V2_Integration_InvalidVerifierDepthFatalOutcome_${_repetition_backend}
+                COMMAND $<TARGET_FILE:v2_integration_gpu_sampling_kernels>
+                    --gtest_filter=GPU/GPUSamplingTest.InvalidFusedVerifierDepthPublishesDeterministicFatalOutcome/${_repetition_backend}
+                LABELS "V2;Integration;ProductionTestPreflight;${_repetition_backend};Sampling;MTP;GenerationController;Contract;Regression"
+                MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+            list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_InvalidVerifierDepthFatalOutcome_${_repetition_backend})
             add_v2_test(V2_Integration_RepetitionPenalty_${_repetition_backend}
                 COMMAND $<TARGET_FILE:v2_integration_gpu_sampling_kernels>
                     --gtest_filter=*RepetitionPenalty*${_repetition_backend}:*MTPPenaltyLogitRowTransformIsSerialDecodeByteExactForAllDepths*${_repetition_backend}:*MTPBranchPenaltyProposalRowIsSerialDecodeByteExactForAllDepths*${_repetition_backend}:*OrdinaryDeviceGenerationSampling*${_repetition_backend}
@@ -29317,6 +29461,13 @@ add_v2_test(V2_Unit_CPUEmbeddingGroupedVerifier
     MPI_PROCS 1
 )
 # Original source values are independent of the optimized lookup implementation.
+# Arena-capacity outputs: native FP16/BF16 CPU lookups use the arena row pitch.
+add_v2_test(V2_Integration_EmbeddingArenaCapacityRowPitch_CPU
+    COMMAND $<TARGET_FILE:v2_test_cpu_embedding_grouped_verifier>
+        --gtest_filter=Test__CPUEmbeddingGroupedVerifier.ArenaCapacityOutputMatchesExactRowsForAllFormats
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Embedding;AllFormats;Regression"
+    MPI_PROCS 1 NO_MODELS
+)
 add_v2_test(V2_Integration_EmbeddingSourceRepresentation
     COMMAND $<TARGET_FILE:v2_test_cpu_embedding_grouped_verifier>
         --gtest_filter=Test__CPUEmbeddingGroupedVerifier.NativeLayoutRetainsEverySourceFormatAndRejectsInvalidGeometry
@@ -29497,6 +29648,14 @@ add_v2_test(V2_Integration_IntegratedGPUPoolObservationMerge
     COMMAND $<TARGET_FILE:v2_test_memory_planner>
         --gtest_filter=Test__MemoryPlanner.IntegratedGPULogicalLinesShareOnePoolObservation
     LABELS "V2;Integration;ProductionTestPreflight;Memory;PhysicalMemoryAuthority;DeviceFree;Regression"
+    MPI_PROCS 1 NO_MODELS)
+
+# Integrated GPUs observe system-wide graph growth, which neither certifies
+# nor refutes the committed family admission; device pools stay bounded.
+add_v2_test(V2_Integration_GraphFamilyObservationScope
+    COMMAND $<TARGET_FILE:v2_test_memory_planner>
+        --gtest_filter=Test__MemoryPlanner.CapturedGraphPoolGrowthIsCertifiedAgainstTheCompleteFamily
+    LABELS "V2;Integration;ProductionTestPreflight;Memory;PhysicalMemoryAuthority;GraphCapture;DeviceFree;Regression"
     MPI_PROCS 1 NO_MODELS)
 
 add_v2_test(V2_Integration_MoEProjectionTransportAccounting
@@ -30278,6 +30437,13 @@ add_v2_test(V2_Integration_GDNCompiledCaptureSupport
         --gtest_filter=GDNPrefillGraphCapture.DecodeAlwaysCapturableRegardlessOfState
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;GDN;GraphCapture;Regression"
     MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+# A GPU identity whose backend family is not compiled must never be advertised
+# as graph-capturable; both shared-expert routes check every backend family.
+add_v2_test(V2_Integration_SharedExpertUncompiledBackendCapture
+    COMMAND $<TARGET_FILE:v2_test_prefill_graph_capturability>
+        --gtest_filter=SharedExpertFFNPrefillGraphCapture.ForcedDecodeReplayCapturesAfterGroupedPrefillWarmup:SharedExpertFFNPrefillGraphCapture.GpuNormalDecodeUsesWorkspaceBackedGroupedTableRoute
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MoE;GraphCapture;Contract;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
 add_v2_test(V2_Unit_PrefillGraphCapturability
     COMMAND $<TARGET_FILE:v2_test_prefill_graph_capturability>
     LABELS "V2;Unit;MoE;GDN;Stages;GraphCapture"
@@ -30321,6 +30487,19 @@ add_v2_test(V2_Unit_GpuWorkspaceAllocationPolicy
     LABELS "V2;Unit;CUDA;ROCm;Stages;GraphCapture;Workspace"
     MPI_PROCS 1
 )
+# ROCm device code must not bind a hostcall buffer (device printf): such
+# launches fail on hosts without native PCIe atomics.
+add_v2_test(V2_Integration_ROCmDeviceCodeHasNoHostcallPrintf
+    COMMAND $<TARGET_FILE:v2_test_gpu_workspace_allocation_policy>
+        --gtest_filter=Test__GpuWorkspaceAllocationPolicy.ROCmDeviceCodeHasNoHostcallPrintf
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;ROCm;SourcePolicy;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60)
+# MXFP4 trainer weights stay deterministic and admitted (E8M0 exponent 127).
+add_v2_test(V2_Integration_CUDATrainerDeterministicMXFP4Weights
+    COMMAND $<TARGET_FILE:v2_test_gpu_workspace_allocation_policy>
+        --gtest_filter=Test__GpuWorkspaceAllocationPolicy.CUDANativeQuantisedDispatchSweepUsesFastDeterministicWeights:Test__GpuWorkspaceAllocationPolicy.CUDANativeQuantisedTrainersBuildDeterministicMXFP4Weights
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CUDA;MXFP4;NativeQuantised;Tooling;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 add_v2_test(V2_Integration_InitialMTPMaintenanceBoundary
     COMMAND $<TARGET_FILE:v2_test_gpu_workspace_allocation_policy>
         --gtest_filter=Test__GpuWorkspaceAllocationPolicy.FirstGroupedMTPBoundaryAlwaysSubmitsOwnMaintenance
@@ -30877,6 +31056,24 @@ add_v2_test(V2_Integration_DeviceLoadPipeline
     LABELS "V2;Integration;WeightLoading;GpuPipeline;CUDA;ROCm;HIP"
     MPI_PROCS 1
 )
+# MXFP4 through the production row-chunked GPU pipeline on each backend:
+# exact payload/scales, ggml zero blocks, and reader-thread inexact-scale failure.
+foreach(_mxfp4_backend CUDA ROCm)
+    if((_mxfp4_backend STREQUAL "CUDA" AND HAVE_CUDA) OR (_mxfp4_backend STREQUAL "ROCm" AND HAVE_ROCM))
+        add_v2_test(V2_Integration_MXFP4DeviceLoadPipeline_${_mxfp4_backend}
+            COMMAND $<TARGET_FILE:v2_integration_device_load_pipeline>
+                --gtest_filter=Test__DeviceLoadPipelineMXFP4.${_mxfp4_backend}RowChunkedSourceIsExactAndInexactScalesFail
+            LABELS "V2;Integration;ProductionTestPreflight;WeightLoading;GpuPipeline;${_mxfp4_backend};MXFP4;Regression"
+            MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+        # Selected source columns: nonzero first block, prefix and suffix
+        # selections write exactly their compact destination.
+        add_v2_test(V2_Integration_MXFP4SelectedColumnRepack_${_mxfp4_backend}
+            COMMAND $<TARGET_FILE:v2_integration_device_load_pipeline>
+                --gtest_filter=Test__DeviceLoadPipelineMXFP4.${_mxfp4_backend}SelectedSourceColumnsRepackExactly
+            LABELS "V2;Integration;ProductionTestPreflight;WeightLoading;GpuPipeline;${_mxfp4_backend};MXFP4;Regression"
+            MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+    endif()
+endforeach()
 
 # Backing-aware, exactly-once asynchronous mmap reclaim lifecycle. This is a
 # model-free integration invariant shared by CPU and accelerator model loading.
@@ -31423,7 +31620,6 @@ set(V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_MTPReplicatedSidecarKVPublicationLifecycle
     V2_Integration_MTPSidecarWorkspaceRows
     V2_Integration_AssignmentAwareFusedQKVTP2ThroughTP8
-    V2_Integration_DynamicConvergenceFiniteHorizonLifecycle
     V2_Integration_DynamicConvergenceProtectedTraffic
     V2_Integration_Qwen122DynamicWaveGeometry
     V2_Integration_DynamicMovementAxisGeometry
@@ -31441,6 +31637,12 @@ set(V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_MoEOverlayTicketRoutingWork
     V2_Integration_PrefixRestoreGDNMovementEpochContract
 )
+# The convergence lifecycle preflight member is bound to the 35B node
+# expert-overlay parity matrix; a CPU-only tree does not define that matrix.
+if(TARGET v2_integration_parity_qwen35moe_35b_node_expert_overlay_matrix)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+        V2_Integration_DynamicConvergenceFiniteHorizonLifecycle)
+endif()
 # Explicit inventory members registered earlier in this file; appended after the
 # list is (re)initialized above so they are not overwritten.
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
@@ -31925,6 +32127,16 @@ if(HAVE_ROCM AND TARGET v2_integration_rocm_vnni_repack_kernels)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmIQ4XSSourceTupleRepack)
 endif()
 
+# MXFP4 17-byte source blocks: exact FP16 scales, ggml zero blocks, offsets and replay.
+if(HAVE_ROCM AND TARGET v2_integration_rocm_vnni_repack_kernels)
+    add_v2_test(V2_Integration_ROCmMXFP4Repack
+        COMMAND $<TARGET_FILE:v2_integration_rocm_vnni_repack_kernels>
+            --gtest_filter=Test__VnniRepackKernels.MXFP4_ExactScalesCodesZeroBlocksOffsetsAndReplay
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;NativeQuantised;MXFP4;Repack;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmMXFP4Repack)
+endif()
+
 # Explicit focused inventory membership, in addition to registration labels.
 foreach(V2_IQ2S_PREFLIGHT_ISA IN LISTS V2_CPU_NATIVE_ISA_CELLS)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
@@ -31995,6 +32207,15 @@ add_v2_test(V2_Integration_CPUNativeQuantisedSlotReuseAdmission
     LABELS "V2;Integration;DeviceFree;CPU;NativeQuantised;Metadata;Lifecycle;Movement;Regression"
     TIMEOUT 60 NO_MODELS MPI_PROCS 1)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUNativeQuantisedSlotReuseAdmission)
+
+# Every physical decoder reachable from a source format, including MXFP4,
+# passes the shared descriptor validator used by MoE publication.
+add_v2_test(V2_Integration_NativeQuantisedDescriptorValidationInventory
+    COMMAND $<TARGET_FILE:v2_test_native_quantised_format_info>
+        --gtest_filter=Test__NativeQuantisedFormatInfo.DescriptorValidationCoversEveryReachablePhysicalDecoder
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;NativeQuantised;MXFP4;Metadata;Regression"
+    TIMEOUT 60 NO_MODELS MPI_PROCS 1)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NativeQuantisedDescriptorValidationInventory)
 
 # IQ4_XS source-tuple mapping, movement, serialization and arithmetic-generation fences.
 add_v2_test(V2_Integration_IQ4XSTupleFormatContract

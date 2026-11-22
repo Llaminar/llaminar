@@ -2879,10 +2879,11 @@ namespace
         ASSERT_TRUE(copyDeviceToHost(
             &diagnostic, d_diagnostic, sizeof(diagnostic), device_id_));
 
-        EXPECT_TRUE(std::all_of(
-            sampled_target_tokens.begin(),
-            sampled_target_tokens.end(),
-            [](int32_t token) { return token == -1; }));
+        // The kernel owns only the declared row_count + 1 sample slots: it
+        // publishes -1 there and must leave a neighbouring request's slots
+        // (still the host sentinel) untouched.
+        for (int row = 0; row < output_capacity; ++row)
+            EXPECT_EQ(sampled_target_tokens[row], row < sample_rows ? -1 : 0x13579BDF) << "sample slot " << row;
         EXPECT_TRUE(std::all_of(
             output_tokens.begin(),
             output_tokens.end(),

@@ -536,7 +536,7 @@ namespace
         const CPUMappedPublicationRoot gate_root(sizeof(std::uint64_t), DeviceId::cpu(), source_device);
         const auto capacity = tensor.rows() * tensor.columns() * sizeof(float);
         PhysicalMemoryPlanBuilder bom(RetainedParticipantGraphExecutable::generalBOM(
-            original->resource(DeviceId::cpu()), original->resource(source_device), 1));
+            original->resource(DeviceId::cpu()), original->resource(source_device),NativeGraphObjectGeometry::localOwner({(original->resource(source_device)).world_rank,(original->resource(source_device)).device}), 1));
         bom.add(original->resource(DeviceId::cpu()), PhysicalMemoryOwner::ExecutionWorkspace,
             2 * tensor.physicalBytes());
         bom.add(original->resource(source_device), PhysicalMemoryOwner::ExecutionWorkspace, capacity);

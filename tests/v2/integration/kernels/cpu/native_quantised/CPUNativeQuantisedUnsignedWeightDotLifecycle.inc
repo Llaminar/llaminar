@@ -8,7 +8,7 @@
  * oracles. Actual identity-nibble M1 additionally uses an independent scalar
  * original biased-integer witness, since its public serial entry also changes. Identity-nibble inputs also authenticate unsigned decoded ranges and
  * the original stored compensation on AVX2 and AVX512. Native grouped execution
- * borrows owned and workspace banks across
+ * borrows the sealed owned bank (a deferred workspace bank is rejected) across
  * changing live rows, purposes and dirty-tail reuse. These are numerical and
  * lifecycle fixtures, not recorded model route replay or performance evidence.
  */
@@ -313,17 +313,13 @@ TEST(CPUNativeQuantisedFusedCompletion, UnsignedWeightDotAllFormatByteLifecycle)
                 const size_t extent = size_t(max_rows) * stride + 17;
                 std::vector<Q8_1Block> input(size_t(max_rows) * packed.blocks_per_row);
                 std::array<std::vector<float>, 2> output, expected;
-#if defined(__aarch64__)
-                // ARM kernels borrow only the resident publication; a deferred
-                // workspace pointer carries no bounded lease and is rejected.
+                // Kernels borrow only the sealed resident publication; a deferred
+                // workspace pointer carries no bounded lease and is rejected on every ISA.
                 {
                     UnsignedDotBankScope binding(packed, workspace.data());
                     EXPECT_THROW((void)packed.readView(), std::logic_error);
                 }
                 constexpr int bank_count = 1;
-#else
-                constexpr int bank_count = 2;
-#endif
                 for (int bank = 0; bank < bank_count; ++bank)
                 {
                     SCOPED_TRACE(bank);
@@ -606,9 +602,14 @@ TEST(CPUNativeQuantisedFusedCompletion, OrderedNibbleSplitDotBoundaryLifecycle)
         const auto workspace = packed.native_interleaved;
         std::vector<Q8_1Block> input(size_t(max_rows) * packed.blocks_per_row);
         const size_t extent = size_t(max_rows) * stride + 17;
-        for (int bank = 0; bank < 2; ++bank)
         {
-            UnsignedDotBankScope binding(packed, bank ? workspace.data() : nullptr);
+            // A deferred workspace bank is unadmitted on every ISA.
+            UnsignedDotBankScope binding(packed, workspace.data());
+            EXPECT_THROW((void)packed.readView(), std::logic_error);
+        }
+        for (int bank = 0; bank < 1; ++bank)
+        {
+            UnsignedDotBankScope binding(packed, nullptr);
             for (int workers : {1, 3, 7})
             {
                 FusedCompletionScope runtime(workers, std::nullopt);
@@ -681,7 +682,7 @@ TEST(CPUNativeQuantisedFusedCompletion, OrderedNibbleSplitDotBoundaryLifecycle)
             }
         }
     }
-    EXPECT_EQ(nibble_sources, 5); // Original canonical Q4_0/Q4_1/Q4_K/IQ4_NL/IQ4_XS factories.
+    EXPECT_EQ(nibble_sources, 6); // Q4_0/Q4_1/Q4_K/IQ4_NL/IQ4_XS + MXFP4 (codebook 25, PR #38).
 }
 #endif // !defined(__aarch64__)
 

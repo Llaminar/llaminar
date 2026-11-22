@@ -15,6 +15,7 @@
  */
 #pragma once
 
+#include "backends/NativeGraphObjectGeometry.h"
 #include "planning/MoEOverlayMemoryPlanInputs.h"
 #include "planning/ResolvedRankOrchestration.h"
 
@@ -51,6 +52,8 @@ namespace llaminar2
         /** Original immutable birth declarations projected before stage quotas. */
         std::vector<PlanningNativeContextDeclaration> native_context_budgets;
         bool require_native_context_budgets=false;
+        /** Execution-rank owner graph-adapter evidence when declarations are absent. */
+        NativeGraphObjectGeometry native_graph_objects;
         /** @brief Per-search original source declarations only; never shares physical admission or quotas. */
         PlanningAdmissionPreparation *source_preparation=nullptr;
         /** @brief Compact-rank ordered budgets for source-free evaluation of the complete candidate. */

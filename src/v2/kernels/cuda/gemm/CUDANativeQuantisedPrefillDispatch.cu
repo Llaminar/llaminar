@@ -351,7 +351,7 @@ extern "C"
     {
         return cudaNativeQuantisedPrefill_getWorkspacePlanWithPolicy(
             codebook_id,
-            codebook_id == llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook ? uint8_t{4} : codebook_id,
+            llaminar2::nativeQuantisedPolicyCodebook(codebook_id),
             M,
             N,
             K,
@@ -410,7 +410,7 @@ extern "C"
                 for (const auto &entry :
                      llaminar2::cuda::generated::kCUDADensePrefillOverlayEntries)
                 {
-                    if (entry.codebook != (codebook_id == llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook ? uint8_t{4} : codebook_id) ||
+                    if (entry.codebook != llaminar2::nativeQuantisedPolicyCodebook(codebook_id) ||
                         entry.n != N || entry.k != K ||
                         entry.m <= 1 || entry.m > max_M)
                     {
@@ -467,7 +467,7 @@ extern "C"
     {
         return cudaNativeQuantisedPrefill_getWorkspaceEnvelopeWithPolicy(
             codebook_id,
-            codebook_id == llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook ? uint8_t{4} : codebook_id,
+            llaminar2::nativeQuantisedPolicyCodebook(codebook_id),
             max_M,
             N,
             K,
@@ -653,7 +653,7 @@ extern "C" bool cudaNativeQuantisedPrefill_fp32(
         d_C_existing,
         d_bias,
         codebook_id,
-        codebook_id == llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook ? uint8_t{4} : codebook_id,
+        llaminar2::nativeQuantisedPolicyCodebook(codebook_id),
         cuda_device_id,
         stream,
         prefill_ctx);

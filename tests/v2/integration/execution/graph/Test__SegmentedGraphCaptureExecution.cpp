@@ -60,6 +60,12 @@
 #include "execution/moe/MoEOverlayRetainedParentComposer.h"
 #include "execution/local_execution/device/DeviceContext.h"
 #include "backends/BackendManager.h"
+#if defined(HAVE_CUDA)
+#include "backends/cuda/CUDAHardwareMetadata.h"
+#endif
+#if defined(HAVE_ROCM)
+#include "backends/rocm/ROCmHardwareMetadata.h"
+#endif
 #include "backends/GPUGraphMemoryContract.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "backends/IBackend.h"
@@ -106,6 +112,27 @@ using namespace llaminar2::test;
 
 namespace
 {
+    /**
+     * @brief Classify a linked device's graph free-memory deltas.
+     * @param device Device whose worker has admitted hardware metadata.
+     * @return SystemWide for an integrated GPU, whose deltas are not
+     *         attributable to one graph; DevicePool otherwise.
+     */
+    GPUGraphMemoryObservationScope graphObservationScope(DeviceId device)
+    {
+        bool integrated = false;
+#if defined(HAVE_CUDA)
+        if (device.is_cuda())
+            integrated = cudaHardwareMetadata().at(device.ordinal).integrated;
+#endif
+#if defined(HAVE_ROCM)
+        if (device.is_rocm())
+            integrated = rocmHardwareMetadata().at(device.ordinal).integrated;
+#endif
+        return GPUGraphMemoryContract::observationScope(
+            integrated ? PhysicalMemoryBacking::RankHostPool : PhysicalMemoryBacking::Dedicated);
+    }
+
     /** @brief Enable and restore PerfStats for one integration certificate. */
     class ScopedPerfStats final
     {
@@ -2933,7 +2960,7 @@ TEST_F(CachedGraphReplayExecutionTest,
         std::vector<std::unique_ptr<DeviceGraphExecutor::GraphSegmentCache>>
             family;
         family.reserve(kFamilyOwners);
-        size_t family_growth = 0u;
+        GPUGraphMemoryGrowth family_growth;
         for (size_t owner = 0; owner < kFamilyOwners; ++owner)
         {
             SCOPED_TRACE(owner);
@@ -2946,22 +2973,24 @@ TEST_F(CachedGraphReplayExecutionTest,
             const auto &capture = cache->segments.front().capture;
             ASSERT_NE(capture, nullptr);
             ASSERT_EQ(capture->nodeCount(), kHelperNodes);
-            family_growth += capture->residentMemoryBytes();
+            family_growth.add(capture->residentMemoryBytes(), graphObservationScope(device_ctx_->deviceId()));
             family.push_back(std::move(cache));
 
         }
         // Admission owns the complete family before its first capture. Do not
         // compare a prefix's growth with only the slots populated so far: the
         // driver may grow storage that later admitted siblings will consume.
-        EXPECT_LE(family_growth, kFamilyOwners * bytes_per_owner);
+        EXPECT_TRUE(GPUGraphMemoryContract::acceptsFamilyObservation(
+            device_ctx_->deviceId(), family_growth, kFamilyOwners * bytes_per_owner))
+            << family_growth.bytes;
         RecordProperty(
             "helper_family_pool_growth_bytes_" + std::to_string(lifetime),
-            std::to_string(family_growth));
+            std::to_string(family_growth.bytes));
         std::cout << "[helper-family-certificate] device="
                   << device_ctx_->deviceId().toString()
                   << " lifetime=" << lifetime << " owners=" << family.size()
                   << " nodes_per_owner=" << kHelperNodes
-                  << " pool_growth_bytes=" << family_growth << '\n';
+                  << " pool_growth_bytes=" << family_growth.bytes << '\n';
         // Explicit test teardown fence: no executable may outlive its pending
         // launch. This is outside production inference and measured setup.
         for (const auto &cache : family)
@@ -3073,6 +3102,10 @@ TEST_F(CachedGraphReplayExecutionTest,
         segment_cache.segments.front().capture->nodeCount(),
         kCheckpointCount * 2u)
         << "Each checkpoint owns one producer kernel and one arena copy";
+    // An integrated GPU's delta is system-wide (any concurrent allocation
+    // lands in it), so only a device-pool observation is bounded here.
+    if (graphObservationScope(device_ctx_->deviceId()) ==
+        GPUGraphMemoryObservationScope::DevicePool)
     EXPECT_LE(
         segment_cache.segments.front().capture->residentMemoryBytes(),
         GPUGraphMemoryContract::reservationBytesPerExecutable(

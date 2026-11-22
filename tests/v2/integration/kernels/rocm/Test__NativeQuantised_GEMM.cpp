@@ -336,6 +336,8 @@ namespace
             weights = TestTensorFactory::createIQ1_SRandom({sz.first, sz.second});
         else if (p.format == "IQ1_M")
             weights = TestTensorFactory::createIQ1_MRandom({sz.first, sz.second});
+        else if (p.format == "MXFP4")
+            weights = TestTensorFactory::createMXFP4Random({sz.first, sz.second});
         else
             FAIL() << "Unknown format: " << p.format;
 
@@ -993,6 +995,15 @@ namespace
         {"IQ1_M_Stream_LM05B_M16", "IQ1_M", LM_N, 896, 16, "Streaming", 0.900f},
         {"IQ1_M_N128M16x3_FFNUp05_M16", "IQ1_M", 4864, 896, 16, "N128_M16_3wave", 0.900f},
         {"IQ1_M_N64M16x3_Attn05_M32", "IQ1_M", 896, 896, 32, "N64_M16_3wave", 0.900f},
+
+        // --- MXFP4 (IQ4_NL tiles and policy, doubled-E2M1 lookup) ---
+        {"MXFP4_Stream_LM05B_M1", "MXFP4", LM_N, 896, 1, "Streaming", 0.990f},
+        {"MXFP4_Stream_LM05B_M17", "MXFP4", LM_N, 896, 17, "Streaming", 0.990f},
+        {"MXFP4_N128M16x3_FFNUp05_M16", "MXFP4", 4864, 896, 16, "N128_M16_3wave", 0.990f},
+        {"MXFP4_N128M32x2_FFNUp3B_M64", "MXFP4", 11008, 2048, 64, "N128_M32_2wave", 0.990f},
+        {"MXFP4_N64M16x3_Attn05_M16", "MXFP4", 896, 896, 16, "N64_M16_3wave", 0.990f},
+        {"MXFP4_N64M32x2_Attn05_M128", "MXFP4", 896, 896, 128, "N64_M32_2wave", 0.990f},
+        {"MXFP4_N64M64x2_FFNDn7B_M256", "MXFP4", 3584, 18944, 256, "N64_M64_2wave", 0.990f},
     };
 
     INSTANTIATE_TEST_SUITE_P(

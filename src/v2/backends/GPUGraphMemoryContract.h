@@ -13,12 +13,51 @@
 #pragma once
 
 #include "DeviceId.h"
+#include "PhysicalMemoryBacking.h"
 
 #include <cstddef>
+#include <cstdint>
+#include <limits>
 #include <stdexcept>
 
 namespace llaminar2
 {
+    /**
+     * @brief What a setup-time free-memory delta around instantiation measures.
+     *
+     * On a discrete GPU the delta is this device's pool growth. On an
+     * integrated GPU (shared system memory, e.g. GB10) the device free-memory
+     * query is system-wide: any concurrent host or process allocation lands in
+     * the same delta, so it cannot be attributed to the graph. Callers derive
+     * the scope from the physical-memory authority's backing of the device.
+     */
+    enum class GPUGraphMemoryObservationScope : std::uint8_t
+    {
+        DevicePool,
+        SystemWide,
+    };
+
+    /** @brief Accumulated setup-only pool growth of one graph family, with its scope. */
+    struct GPUGraphMemoryGrowth
+    {
+        std::size_t bytes = 0;
+        GPUGraphMemoryObservationScope scope = GPUGraphMemoryObservationScope::DevicePool;
+
+        /**
+         * @brief Add one executable's observation; any system-wide member makes
+         *        the whole family system-wide.
+         * @throws std::overflow_error When the byte sum overflows.
+         */
+        void add(std::size_t observed, GPUGraphMemoryObservationScope observed_scope)
+        {
+            if (observed > std::numeric_limits<std::size_t>::max() - bytes)
+                throw std::overflow_error("Native graph family growth overflow");
+            bytes += observed;
+            if (observed_scope == GPUGraphMemoryObservationScope::SystemWide)
+                scope = observed_scope;
+        }
+    };
+
     /** @brief Certified physical shape, independent of a graph's semantic role. */
     enum class GPUGraphExecutableClass
     {
@@ -133,14 +172,34 @@ namespace llaminar2
          * A caller must not pass a single executable's slot reservation as
          * @p admitted_family_bytes. CUDA may charge a large shared-pool growth
          * event to the first executable and zero to several siblings.
+         *
+         * A system-wide observation (integrated GPU) is not evidence about the
+         * family: it neither certifies nor refutes the admission, which the
+         * physical-memory authority has already committed. Only device-pool
+         * observations are compared.
          */
+        /**
+         * @param backing The device's physical-memory authority backing.
+         * @return SystemWide when device memory is the rank's host pool
+         *         (integrated GPU), so free-memory deltas are not attributable.
+         */
+        [[nodiscard]] static constexpr GPUGraphMemoryObservationScope observationScope(
+            PhysicalMemoryBacking backing) noexcept
+        {
+            return backing == PhysicalMemoryBacking::RankHostPool
+                ? GPUGraphMemoryObservationScope::SystemWide
+                : GPUGraphMemoryObservationScope::DevicePool;
+        }
+
         [[nodiscard]] static bool acceptsFamilyObservation(
             DeviceId device,
-            std::size_t observed_pool_growth_bytes,
+            const GPUGraphMemoryGrowth &observed_pool_growth,
             std::size_t admitted_family_bytes)
         {
             (void)reservationBytesPerExecutable(device);
-            return observed_pool_growth_bytes <= admitted_family_bytes;
+            if (observed_pool_growth.scope == GPUGraphMemoryObservationScope::SystemWide)
+                return true;
+            return observed_pool_growth.bytes <= admitted_family_bytes;
         }
     };
 } // namespace llaminar2
