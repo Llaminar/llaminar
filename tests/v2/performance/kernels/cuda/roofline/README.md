@@ -196,6 +196,25 @@ Q5_1 use zero local bytes. Measurements use 31 samples per arm and card.
 The wide-format replay verifies both the captured reader selection and
 byte equality with serial decode.
 
+The fixed-pitch SM86 reader resolves the wide N and K before entering
+the packet traversal. IQ2 uses the canonical magnitude grid encoded
+as packed selectors and applies each packet's sign bits in registers.
+IQ2_S, IQ2_XS and IQ3_S reassemble their odd-width payloads from aligned
+32-bit words. The captured column pitch keeps those loads within each
+prepared weight plane.
+
+| M=4, N=2560, K=256 | Previous reader, µs | Fixed-pitch reader, µs |
+| --- | ---: | ---: |
+| IQ1_S | 10.752–10.816 | 10.496–10.560 |
+| IQ1_M | 12.160–12.224 | 11.712–11.776 |
+| IQ2_S | 11.904–11.968 | 10.624–10.688 |
+| IQ2_XS | 13.376–13.440 | 10.496–10.560 |
+| IQ2_XXS | 10.048 | 9.152 |
+| IQ3_S | 14.336–14.400 | 13.376–13.440 |
+
+IQ3_XXS varies by one 0.064 µs timing step at this width. All seven
+wide readers use 36–40 registers per thread and zero local bytes.
+
 ## Route-matched Down weight reference
 
 The verifier fixture can reuse the original capture arguments to measure a

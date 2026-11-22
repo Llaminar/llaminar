@@ -29,7 +29,8 @@
  * SM86 reuses the original activation packet across paired Gate/Up projections
  * and vector-loads each K32 Down activation for the measured codebooks.
  * Wide SM86 verifier tiles expand a compact IQ1 grid and use whole-word
- * index and sign loads for IQ3_XXS. IQ2_XXS uses one aligned payload load.
+ * index and sign loads for IQ3. Compact IQ2 selectors combine magnitudes
+ * and signs in registers. These launches resolve the physical pitch before K.
  * Serial Q5_1 resolves the measured ten-packet Down geometry before the dot.
  */
 
@@ -18778,6 +18779,10 @@ __global__ void softmax_topk_decode_descriptors_kernel(
         VerifierWideGrid,  ///< Identical verifier order with the wide IQ grid readers.
     };
 
+    constexpr int kWideVerifierDownN = 2560;
+    constexpr int kWideVerifierDownK = 256;
+    static_assert(kWideVerifierDownN % 4 == 0);
+
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ == 860
     /** @brief Read-only IQ1 grid with eight two-bit symbols stored per entry. */
     struct CompactMoEIQ1Grid
@@ -18825,6 +18830,98 @@ __global__ void softmax_topk_decode_descriptors_kernel(
     __device__ const CompactMoEIQ1Grid compact_moe_iq1_grid = make_compact_moe_iq1_grid();
 #endif
 
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ == 860
+    /** @brief Eight nibble selectors for positive IQ2 magnitudes in each grid entry. */
+    template <size_t Entries>
+    struct MoEIQ2SelectorGrid
+    {
+        uint32_t words[Entries];
+    };
+
+    /**
+     * @brief Check that the canonical IQ2 grid can use a three-byte magnitude table.
+     * @tparam Source Canonical unsigned-magnitude grid.
+     * @return Whether every source lane is one of the three supported magnitudes.
+     */
+    template <const auto &Source>
+    consteval bool moe_iq2_grid_uses_known_magnitudes()
+    {
+        for (const uint64_t word : Source)
+            for (unsigned lane = 0; lane < 8; ++lane)
+            {
+                const uint32_t magnitude = (word >> (8 * lane)) & 0xffu;
+                if (magnitude != 8 && magnitude != 25 && magnitude != 43)
+                    return false;
+            }
+        return true;
+    }
+
+    /**
+     * @brief Encode each canonical IQ2 entry as one packed byte-permutation selector.
+     * @tparam Source Canonical unsigned-magnitude grid.
+     * @return One four-bit selector per original signed-byte position.
+     */
+    template <const auto &Source>
+    consteval auto make_moe_iq2_selector_grid()
+    {
+        static_assert(moe_iq2_grid_uses_known_magnitudes<Source>());
+        constexpr size_t kEntries = sizeof(Source) / sizeof(Source[0]);
+        MoEIQ2SelectorGrid<kEntries> grid{};
+        for (size_t index = 0; index < kEntries; ++index)
+            for (unsigned lane = 0; lane < 8; ++lane)
+            {
+                const uint32_t magnitude = (Source[index] >> (8 * lane)) & 0xffu;
+                const uint32_t selector = magnitude == 8 ? 0u : (magnitude == 25 ? 1u : 2u);
+                grid.words[index] |= selector << (4 * lane);
+            }
+        return grid;
+    }
+
+    __device__ const auto moe_iq2_s_selectors = make_moe_iq2_selector_grid<llaminar2::iq2s_grid>();
+    __device__ const auto moe_iq2_xs_selectors = make_moe_iq2_selector_grid<llaminar2::iq2xs_grid>();
+    __device__ const auto moe_iq2_xxs_selectors = make_moe_iq2_selector_grid<llaminar2::iq2xxs_grid>();
+
+    /** @brief Aligned register image of the index and sign bytes of an odd-width packet. */
+    template <int IndexWords>
+    struct MoEOddGridPacket
+    {
+        static_assert(IndexWords == 1 || IndexWords == 2);
+        uint32_t indices[IndexWords];
+        uint32_t high_indices;
+        uint32_t signs;
+    };
+
+    /**
+     * @brief Gather one 9- or 13-byte IQ grid packet without byte loads.
+     * @tparam IndexWords One index word for IQ2 or two for IQ3.
+     * @param payload Original packet in its [K32][column] weight plane.
+     * @return Low index words, high index byte, and four sign bytes.
+     * @pre Aligned plane base and a captured column count divisible by four
+     *      keep all aligned word loads within the physical packet plane.
+     */
+    template <int IndexWords>
+    __device__ __forceinline__ MoEOddGridPacket<IndexWords> load_moe_odd_grid_packet(const uint8_t *payload)
+    {
+        const unsigned offset = reinterpret_cast<uintptr_t>(payload) & 3u;
+        const auto *words = reinterpret_cast<const uint32_t *>(payload - offset);
+        const unsigned shift = 8 * offset;
+        uint32_t head = words[0];
+        MoEOddGridPacket<IndexWords> packet{};
+#pragma unroll
+        for (int index = 0; index < IndexWords; ++index)
+        {
+            const uint32_t next = words[index + 1];
+            packet.indices[index] = __funnelshift_r(head, next, shift);
+            head = next;
+        }
+        const uint32_t last = words[IndexWords + 1];
+        const uint32_t high_and_signs = __funnelshift_r(head, last, shift);
+        packet.high_indices = high_and_signs & 0xffu;
+        packet.signs = (high_and_signs >> 8) | ((last >> shift) << 24);
+        return packet;
+    }
+#endif
+
     /**
      * @brief Form the eight packed signed-byte operands of an MoE K32 dot.
      * @tparam CodebookId Physical payload layout admitted for the route.
@@ -18869,6 +18966,63 @@ __global__ void softmax_topk_decode_descriptors_kernel(
                 const uint32_t ternary = __ldg(compact_moe_iq1_grid.words + index);
                 groups[group * 2] = expand(ternary);
                 groups[group * 2 + 1] = expand(ternary >> 8);
+            }
+        }
+        else if constexpr (Order == NativeMoEDotOrder::VerifierWideGrid && Traits::is_iq2_grid)
+        {
+            constexpr bool kLowOnly = CodebookId == native_formats::IQ2_XXS.codebook_id;
+            constexpr unsigned kHighBits = CodebookId == native_formats::IQ2_S.codebook_id ? 2u : 1u;
+            MoEOddGridPacket<1> packet{};
+            if constexpr (kLowOnly)
+            {
+                const uint2 words = *reinterpret_cast<const uint2 *>(payload);
+                packet.indices[0] = words.x;
+                packet.signs = words.y;
+            }
+            else
+                packet = load_moe_odd_grid_packet<1>(payload);
+
+            // Select +8,+25,+43 or -8,-25,-43 directly into each signed byte.
+            constexpr uint32_t kPositive = 0x002b1908u;
+            constexpr uint32_t kNegative = 0x00d5e7f8u;
+#pragma unroll
+            for (int group = 0; group < 4; ++group)
+            {
+                uint32_t index = (packet.indices[0] >> (8 * group)) & 0xffu;
+                if constexpr (!kLowOnly)
+                    index |= ((packet.high_indices >> (kHighBits * group)) & ((1u << kHighBits) - 1u)) << 8;
+
+                uint32_t magnitudes = 0;
+                if constexpr (CodebookId == native_formats::IQ2_S.codebook_id)
+                    magnitudes = __ldg(moe_iq2_s_selectors.words + index);
+                else if constexpr (CodebookId == native_formats::IQ2_XS.codebook_id)
+                    magnitudes = __ldg(moe_iq2_xs_selectors.words + index);
+                else
+                    magnitudes = __ldg(moe_iq2_xxs_selectors.words + index);
+
+                const uint32_t signs = (packet.signs >> (8 * group)) & 0xffu;
+                const uint32_t halves = (signs | (signs << 12)) & 0x000f000fu;
+                const uint32_t pairs = (halves | (halves << 6)) & 0x03030303u;
+                const uint32_t lanes = (pairs | (pairs << 3)) & 0x11111111u;
+                const uint32_t selectors = magnitudes | (lanes << 2);
+                groups[2 * group] = static_cast<int32_t>(__byte_perm(kPositive, kNegative, selectors));
+                groups[2 * group + 1] = static_cast<int32_t>(__byte_perm(kPositive, kNegative, selectors >> 16));
+            }
+        }
+        else if constexpr (Order == NativeMoEDotOrder::VerifierWideGrid &&
+                           CodebookId == native_formats::IQ3_S.codebook_id)
+        {
+            const auto packet = load_moe_odd_grid_packet<2>(payload);
+#pragma unroll
+            for (int group = 0; group < 8; ++group)
+            {
+                const uint32_t low = (packet.indices[group / 4] >> (8 * (group & 3))) & 0xffu;
+                const uint32_t high = (packet.high_indices >> group) & 1u;
+                const uint32_t grid = llaminar2::cuda_native_quantised::iq3_grid_lookup<CodebookId>(
+                    low | (high << 8));
+                groups[group] = static_cast<int32_t>(
+                    llaminar2::cuda_native_quantised::iq_apply_signs_4(
+                        grid, (packet.signs >> (4 * group)) & 0xfu));
             }
         }
         else if constexpr (Order == NativeMoEDotOrder::VerifierWideGrid &&
@@ -20856,6 +21010,11 @@ __global__ void softmax_topk_decode_descriptors_kernel(
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 860
         constexpr auto order = WideGrid
             ? NativeMoEDotOrder::VerifierWideGrid : NativeMoEDotOrder::VerifierK32;
+        if constexpr (WideGrid)
+        {
+            N = kWideVerifierDownN;
+            K = kWideVerifierDownK;
+        }
 #else
         constexpr auto order = NativeMoEDotOrder::VerifierK32;
 #endif
@@ -26139,7 +26298,7 @@ __attribute__((visibility("default"))) bool cudaMoE_softmax_topk_decode_selected
                 llaminar2::CUDAMoEBatchInvariantPolicy::directDownWarps(top_k);
             const int N = down_columns;
             const int K = intermediate;
-            const bool wide_grid_down = N == 2560 && K == 256;
+            const bool wide_grid_down = N == kWideVerifierDownN && K == kWideVerifierDownK;
             dim3 scatter_block(kScatterTileN);
             dim3 reduce_block(kReduceTileN);
             dim3 direct_block(kDirectWarpsPerBlock * 32);
@@ -26171,6 +26330,10 @@ __attribute__((visibility("default"))) bool cudaMoE_softmax_topk_decode_selected
                     };
                     if constexpr (CodebookId == native_formats::IQ1_S.codebook_id ||
                                   CodebookId == native_formats::IQ1_M.codebook_id ||
+                                  CodebookId == native_formats::IQ2_S.codebook_id ||
+                                  CodebookId == native_formats::IQ2_XS.codebook_id ||
+                                  CodebookId == native_formats::IQ2_XXS.codebook_id ||
+                                  CodebookId == native_formats::IQ3_S.codebook_id ||
                                   CodebookId == native_formats::IQ3_XXS.codebook_id)
                     {
                         if (wide_grid_down)

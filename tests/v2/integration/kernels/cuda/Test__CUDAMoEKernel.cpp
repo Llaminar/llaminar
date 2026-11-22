@@ -24278,6 +24278,8 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
                             const std::string_view source_format{format.label};
                             const bool wide_grid_reader = d_model == 2560 && intermediate == 256 &&
                                 (source_format == "IQ1_S" || source_format == "IQ1_M" ||
+                                 source_format == "IQ2_S" || source_format == "IQ2_XS" ||
+                                 source_format == "IQ2_XXS" || source_format == "IQ3_S" ||
                                  source_format == "IQ3_XXS");
                             // The CUDA C++ symbol encodes the captured WideGrid
                             // template argument. Timing mode also measures older
