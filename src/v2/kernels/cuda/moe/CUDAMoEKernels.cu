@@ -21669,6 +21669,99 @@ __global__ void softmax_topk_decode_descriptors_kernel(
                 desc, n, slot_A, slot_scales, N, K, b_start, b_end);
     }
 
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 860
+    /**
+     * @brief Read a complete SM86 Down tile with a fixed weight pitch.
+     *
+     * Each CTA addresses one route. Descriptor checks and shared activation or
+     * lookup preparation finish before the ordered K32 dot fold. A K32
+     * contribution enters the FP32 sum in the same order as serial decode.
+     *
+     * @tparam CodebookId Physical reader selected during capture.
+     * @tparam ReductionWidth Complete local K admitted by the launcher.
+     * @tparam TileColumns Exact output width of this CTA.
+     * @param desc Device-published descriptor for the selected expert.
+     * @param column Output column owned by the calling lane.
+     * @param codes Prepared SwiGLU activation row.
+     * @param scales Original FP32 SwiGLU K32 scales.
+     * @return The unweighted route contribution for this column.
+     * @pre The whole CTA calls with the same route and descriptor.
+     */
+    template <uint8_t CodebookId, int ReductionWidth, int TileColumns>
+    __device__ __forceinline__ float native_quantised_moe_fixed_down(
+        const DeviceNativeQuantisedMatrixDesc &desc, int column,
+        const int8_t *codes, const float *scales)
+    {
+        constexpr auto order = NativeMoEDotOrder::VerifierWideGrid;
+        static_assert(kWideVerifierDownN % TileColumns == 0);
+        float sum = 0.0f;
+        using Traits = llaminar2::cuda_native_quantised::CodebookTraits<CodebookId>;
+        if constexpr (Traits::is_iq4_lut)
+            sum = moe_iq4_interleaved_down<CodebookId, ReductionWidth>(desc, codes, scales, column);
+        else if constexpr (Traits::is_iq3_grid)
+        {
+            if (native_quantised_desc_shape_ok<CodebookId>(desc, kWideVerifierDownN, ReductionWidth))
+            {
+                constexpr bool source_s = CodebookId == native_formats::IQ3_S.codebook_id;
+                constexpr int entries = source_s ? 512 : 256;
+                constexpr int packets = ReductionWidth / 32;
+                __shared__ __align__(16) uint32_t table[entries];
+                const auto *original = source_s
+                    ? llaminar2::cuda_native_quantised::d_iq3s_grid
+                    : llaminar2::cuda_native_quantised::d_iq3xxs_grid;
+                // The fixed-width CTA owns one route and a complete tile.
+                // Its lanes load the table together before any K32 math.
+#pragma unroll
+                for (int i = threadIdx.x; i < entries; i += TileColumns)
+                    table[i] = __ldg(original + i);
+                __syncthreads();
+                sum = native_quantised_dot_admitted_range<CodebookId, order, packets, 1, true>(
+                    desc, column, codes, scales, kWideVerifierDownN, 0, packets, table);
+            }
+        }
+        else if constexpr (Traits::is_iq1_m)
+        {
+            if (native_quantised_desc_shape_ok<CodebookId>(desc, kWideVerifierDownN, ReductionWidth))
+            {
+                constexpr int packets = ReductionWidth / 32;
+                __shared__ MoEIQ1MPreparedCorrection corrections[packets];
+                if (threadIdx.x < packets * 2)
+                {
+                    constexpr int32_t ones = 0x01010101;
+                    const auto *words = reinterpret_cast<const int32_t *>(codes);
+                    const int first = threadIdx.x * 4;
+                    const int32_t sum0 = __dp4a(words[first + 1], ones, __dp4a(words[first], ones, 0));
+                    const int32_t sum1 = __dp4a(words[first + 3], ones, __dp4a(words[first + 2], ones, 0));
+                    const float group0 = __fmul_rn(0.125f, static_cast<float>(sum0));
+                    const float group1 = __fmul_rn(0.125f, static_cast<float>(sum1));
+                    auto &pair = corrections[threadIdx.x / 2].halves[threadIdx.x % 2];
+                    pair[0] = __fadd_rn(group0, group1);
+                    pair[1] = __fadd_rn(-group0, group1);
+                    pair[2] = __fadd_rn(group0, -group1);
+                    pair[3] = __fadd_rn(-group0, -group1);
+                }
+                // Stage each signed activation combination once. Explicit
+                // rounded adds preserve the canonical signed-zero cases.
+                __syncthreads();
+                sum = native_quantised_dot_admitted_range<CodebookId, order, packets, 2, false, true>(
+                    desc, column, codes, scales, kWideVerifierDownN, 0, packets, nullptr, corrections);
+            }
+        }
+        else if constexpr (CodebookId == native_formats::IQ1_S.codebook_id ||
+                           CodebookId == native_formats::IQ2_XXS.codebook_id)
+        {
+            constexpr int packets = ReductionWidth / 32;
+            if (native_quantised_desc_shape_ok<CodebookId>(desc, kWideVerifierDownN, ReductionWidth))
+                sum = native_quantised_dot_admitted_range<CodebookId, order, packets, 2>(
+                    desc, column, codes, scales, kWideVerifierDownN, 0, packets);
+        }
+        else
+            sum = native_quantised_dot_desc_range_dispatch<CodebookId, order>(
+                desc, column, codes, scales, kWideVerifierDownN, ReductionWidth, 0, ReductionWidth / 32);
+        return sum;
+    }
+#endif
+
     /**
      * @brief Publish a narrow Down row directly from its ordered K32 sums.
      *
@@ -21678,6 +21771,7 @@ __global__ void softmax_topk_decode_descriptors_kernel(
      * A slot owned by another tier still overwrites its public row with zero.
      *
      * @tparam CodebookId Physical reader family or an admitted mixed table.
+     * @tparam FixedShortPitch Use the admitted SM86 H=2560, K=256 rectangle.
      * @param activation_codes Retained canonical SwiGLU activation codes.
      * @param activation_scales Retained canonical K32 activation scales.
      * @param descriptors Already published expert descriptor directory.
@@ -21689,7 +21783,7 @@ __global__ void softmax_topk_decode_descriptors_kernel(
      * @param num_experts Admitted logical descriptor count.
      * @pre The launcher selects this body only for K / 32 <= ordered_k_partitions.
      */
-    template <uint8_t CodebookId>
+    template <uint8_t CodebookId, bool FixedShortPitch = false>
     __global__ void grouped_native_quantised_down_decode_publish_k32_kernel(
         const int8_t *__restrict__ activation_codes,
         const float *__restrict__ activation_scales,
@@ -21702,7 +21796,13 @@ __global__ void softmax_topk_decode_descriptors_kernel(
         constexpr int kTileN = 64;
         const int column = blockIdx.x * kTileN + threadIdx.x;
         const int route = blockIdx.y;
-        if (column >= N)
+        if constexpr (FixedShortPitch)
+        {
+            static_assert(kWideVerifierDownN % kTileN == 0);
+            N = kWideVerifierDownN;
+            K = kWideVerifierDownK;
+        }
+        else if (column >= N)
             return;
 
         const int expert = expert_ids[route];
@@ -21710,11 +21810,16 @@ __global__ void softmax_topk_decode_descriptors_kernel(
         float sum = 0.0f;
         if (expert >= 0 && expert < num_experts)
         {
-            sum = native_quantised_dot_desc_range_dispatch<CodebookId, NativeMoEDotOrder::DecodeK32>(
-                descriptors[expert], column,
-                activation_codes + static_cast<size_t>(route) * K,
-                activation_scales + static_cast<size_t>(route) * blocks,
-                N, K, 0, blocks);
+            const auto *codes = activation_codes + static_cast<size_t>(route) * K;
+            const auto *scales = activation_scales + static_cast<size_t>(route) * blocks;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 860
+            if constexpr (FixedShortPitch)
+                sum = native_quantised_moe_fixed_down<CodebookId, kWideVerifierDownK, kTileN>(
+                    descriptors[expert], column, codes, scales);
+            else
+#endif
+                sum = native_quantised_dot_desc_range_dispatch<CodebookId, NativeMoEDotOrder::DecodeK32>(
+                    descriptors[expert], column, codes, scales, N, K, 0, blocks);
         }
         routes[static_cast<size_t>(route) * N + column] =
             weights ? moe_weight_route_rn(weights[route], sum) : sum;
@@ -21879,6 +21984,7 @@ __global__ void softmax_topk_decode_descriptors_kernel(
      * @tparam CodebookId Physical reader chosen at admission or the mixed directory.
      * @tparam WideGrid Use the fixed-pitch reader for this captured node.
      * @tparam FixedReduction Logical K of that fixed-pitch reader.
+     * @tparam TileColumns Number of output columns owned by each complete CTA.
      * @param activation_codes Graph-owned SwiGLU codes in compact grouped order.
      * @param activation_scales Graph-owned K32 scales in the same order.
      * @param descriptors Original published Down descriptors.
@@ -21890,10 +21996,6 @@ __global__ void softmax_topk_decode_descriptors_kernel(
      * @param N Full output width.
      * @param K Narrow admitted reduction width, with one K32 block per partition.
      * @param num_experts Exact original descriptor count.
-     * @tparam CodebookId Physical decoder selected when recording the node.
-     * @tparam WideGrid Use the fixed wide Down geometry and packed readers.
-     * @tparam FixedReduction Reduction width selected with the wide reader.
-     * @tparam TileColumns Number of output columns owned by a complete CTA.
      */
     template <uint8_t CodebookId, bool WideGrid, int FixedReduction = kWideVerifierDownK,
               int TileColumns = kVerifierDownTileColumns>
@@ -21908,15 +22010,11 @@ __global__ void softmax_topk_decode_descriptors_kernel(
         int first_slot, int N, int K, int num_experts)
     {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 860
-        constexpr auto order = WideGrid
-            ? NativeMoEDotOrder::VerifierWideGrid : NativeMoEDotOrder::VerifierK32;
         if constexpr (WideGrid)
         {
             N = kWideVerifierDownN;
             K = FixedReduction;
         }
-#else
-        constexpr auto order = NativeMoEDotOrder::VerifierK32;
 #endif
         constexpr int kTileN = TileColumns;
         static_assert(kTileN == kVerifierDownTileColumns ||
@@ -21940,74 +22038,12 @@ __global__ void softmax_topk_decode_descriptors_kernel(
             const auto *codes = activation_codes + static_cast<size_t>(grouped_slot) * K;
             const auto *scales = activation_scales + static_cast<size_t>(grouped_slot) * blocks;
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 860
-            using Traits = llaminar2::cuda_native_quantised::CodebookTraits<CodebookId>;
-            if constexpr (WideGrid && Traits::is_iq4_lut)
-                sum = moe_iq4_interleaved_down<CodebookId, FixedReduction>(descriptors[expert], codes, scales, column);
-            else if constexpr (WideGrid && Traits::is_iq3_grid)
-            {
-                static_assert(kWideVerifierDownN % kTileN == 0);
-                const auto &desc = descriptors[expert];
-                if (native_quantised_desc_shape_ok<CodebookId>(desc, kWideVerifierDownN, kWideVerifierDownK))
-                {
-                    constexpr bool source_s = CodebookId == native_formats::IQ3_S.codebook_id;
-                    constexpr int entries = source_s ? 512 : 256;
-                    constexpr int packets = kWideVerifierDownK / 32;
-                    __shared__ __align__(16) uint32_t table[entries];
-                    const auto *original = source_s
-                        ? llaminar2::cuda_native_quantised::d_iq3s_grid
-                        : llaminar2::cuda_native_quantised::d_iq3xxs_grid;
-                    // The fixed-width CTA owns one route and a complete tile.
-                    // Its lanes load the table together before any K32 math.
-#pragma unroll
-                    for (int i = threadIdx.x; i < entries; i += kTileN)
-                        table[i] = __ldg(original + i);
-                    __syncthreads();
-                    sum = native_quantised_dot_admitted_range<CodebookId, order, packets, 1, true>(
-                        desc, column, codes, scales, kWideVerifierDownN, 0, packets, table);
-                }
-            }
-            else if constexpr (WideGrid && Traits::is_iq1_m)
-            {
-                static_assert(kWideVerifierDownN % kTileN == 0);
-                const auto &desc = descriptors[expert];
-                if (native_quantised_desc_shape_ok<CodebookId>(desc, kWideVerifierDownN, kWideVerifierDownK))
-                {
-                    constexpr int packets = kWideVerifierDownK / 32;
-                    __shared__ MoEIQ1MPreparedCorrection corrections[packets];
-                    if (threadIdx.x < packets * 2)
-                    {
-                        constexpr int32_t ones = 0x01010101;
-                        const auto *words = reinterpret_cast<const int32_t *>(codes);
-                        const int first = threadIdx.x * 4;
-                        const int32_t sum0 = __dp4a(words[first + 1], ones, __dp4a(words[first], ones, 0));
-                        const int32_t sum1 = __dp4a(words[first + 3], ones, __dp4a(words[first + 2], ones, 0));
-                        const float group0 = __fmul_rn(0.125f, static_cast<float>(sum0));
-                        const float group1 = __fmul_rn(0.125f, static_cast<float>(sum1));
-                        auto &pair = corrections[threadIdx.x / 2].halves[threadIdx.x % 2];
-                        pair[0] = __fadd_rn(group0, group1);
-                        pair[1] = __fadd_rn(-group0, group1);
-                        pair[2] = __fadd_rn(group0, -group1);
-                        pair[3] = __fadd_rn(-group0, -group1);
-                    }
-                    // Stage each signed activation combination once. Explicit
-                    // rounded adds preserve the canonical signed-zero cases.
-                    __syncthreads();
-                    sum = native_quantised_dot_admitted_range<CodebookId, order, packets, 2, false, true>(
-                        desc, column, codes, scales, kWideVerifierDownN, 0, packets, nullptr, corrections);
-                }
-            }
-            else if constexpr (WideGrid && (CodebookId == native_formats::IQ1_S.codebook_id ||
-                                            CodebookId == native_formats::IQ2_XXS.codebook_id))
-            {
-                constexpr int packets = kWideVerifierDownK / 32;
-                const auto &desc = descriptors[expert];
-                if (native_quantised_desc_shape_ok<CodebookId>(desc, kWideVerifierDownN, kWideVerifierDownK))
-                    sum = native_quantised_dot_admitted_range<CodebookId, order, packets, 2>(
-                        desc, column, codes, scales, kWideVerifierDownN, 0, packets);
-            }
+            if constexpr (WideGrid)
+                sum = native_quantised_moe_fixed_down<CodebookId, FixedReduction, kTileN>(
+                    descriptors[expert], column, codes, scales);
             else
 #endif
-                sum = native_quantised_dot_desc_range_dispatch<CodebookId, order>(
+                sum = native_quantised_dot_desc_range_dispatch<CodebookId, NativeMoEDotOrder::VerifierK32>(
                     descriptors[expert], column, codes, scales, N, K, 0, blocks);
         }
         route_rows[output] = grouped_weights
@@ -26660,23 +26696,30 @@ __attribute__((visibility("default"))) bool cudaMoE_softmax_topk_decode_selected
         dim3 block(kTileN);
 
         // Narrow routes keep the same ordered partition arithmetic in their output tile.
-#define LAUNCH_GROUPED_DOWN_KPART(CB)                                                       \
-    do {                                                                                    \
-        if (direct_route_publication)                                                       \
-        {                                                                                   \
-            grouped_native_quantised_down_decode_publish_k32_kernel<CB>                     \
-                <<<route_reduce_grid, block, 0, cuda_stream>>>(                             \
-                    d_swiglu_int8, d_swiglu_scales, d_desc_table, d_expert_ids, d_weights,  \
-                    d_canonical_route_contributions, N, K, num_experts);                    \
-        }                                                                                   \
-        else                                                                                \
-        {                                                                                   \
-            grouped_native_quantised_down_kpart_decode_route_kernel<CB>                     \
-                <<<scatter_grid, block, 0, cuda_stream>>>(                                  \
-                    d_swiglu_int8, d_swiglu_scales, d_desc_table, d_expert_ids,             \
-                    d_down_partials, num_active, N, K, num_experts, k_partitions);          \
-        }                                                                                   \
-    } while (0)
+        const bool fixed_short_pitch = direct_route_publication && N == kWideVerifierDownN &&
+            K == kWideVerifierDownK && is_sm86_cuda_device(device_idx);
+        const auto publish_down = [&]<uint8_t Codebook, bool FixedShortPitch>() {
+            grouped_native_quantised_down_decode_publish_k32_kernel<Codebook, FixedShortPitch>
+                <<<route_reduce_grid, block, 0, cuda_stream>>>(
+                    d_swiglu_int8, d_swiglu_scales, d_desc_table, d_expert_ids, d_weights,
+                    d_canonical_route_contributions, N, K, num_experts);
+        };
+        const auto launch_down = [&]<uint8_t Codebook>() {
+            if (direct_route_publication)
+            {
+                if constexpr (llaminar2::CUDAMoEBatchInvariantPolicy::qfnPackedShortDown(Codebook))
+                {
+                    if (fixed_short_pitch)
+                        return publish_down.template operator()<Codebook, true>();
+                }
+                return publish_down.template operator()<Codebook, false>();
+            }
+            grouped_native_quantised_down_kpart_decode_route_kernel<Codebook>
+                <<<scatter_grid, block, 0, cuda_stream>>>(
+                    d_swiglu_int8, d_swiglu_scales, d_desc_table, d_expert_ids,
+                    d_down_partials, num_active, N, K, num_experts, k_partitions);
+        };
+#define LAUNCH_GROUPED_DOWN_KPART(CB) launch_down.template operator()<CB>()
 
         switch (codebook_id)
         {

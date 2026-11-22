@@ -22642,6 +22642,8 @@ TEST_F(Test__CUDAMoEKernel, RuntimeGroupedDecodeSwiGLUPublicationReplay)
          gate_codebook == native_formats::Q5_K.codebook_id ||
          gate_codebook == native_formats::Q8_0.codebook_id ||
          llaminar2::CUDAMoEBatchInvariantPolicy::qfnPackedGateUp(gate_codebook));
+    const bool expect_fixed_down = model_geometry && geometry && hardware.major == 8 && hardware.minor == 6 &&
+        llaminar2::CUDAMoEBatchInvariantPolicy::qfnPackedShortDown(down_format->codebook_id);
     for (auto node : nodes)
     {
         cudaGraphNodeType type{};
@@ -22660,10 +22662,16 @@ TEST_F(Test__CUDAMoEKernel, RuntimeGroupedDecodeSwiGLUPublicationReplay)
         {
             ++direct_down_rows;
             down_sequence.push_back({node, params});
+            if (!m1_samples && !weight_reference)
+                EXPECT_EQ(name.contains("ELb1EEE"), expect_fixed_down);
             EXPECT_EQ(params.gridDim.x, static_cast<unsigned>((d_model + 63) / 64));
             EXPECT_EQ(params.gridDim.y, static_cast<unsigned>(top_k));
             EXPECT_EQ(params.gridDim.z, 1u);
             EXPECT_EQ(params.blockDim.x, 64u);
+            cudaFuncAttributes attributes{};
+            ASSERT_EQ(cudaFuncGetAttributes(&attributes, params.func), cudaSuccess);
+            if (expect_fixed_down)
+                EXPECT_EQ(attributes.localSizeBytes, 0u);
         }
         if (name.find("grouped_native_quantised_gate_up_kpart_decode_kernel") != std::string_view::npos)
         {

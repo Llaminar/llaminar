@@ -1486,3 +1486,57 @@ transactions, 456 verifier rows, and 399 drafts.
 The control-first Release build also passed the mixed-tier movement
 regression with greedy and stochastic sampling and all 14 focused CUDA
 preflight tests.
+
+## Fixed-pitch SM86 single-row Down
+
+For H=2560, K=256, the 64-column direct Down publisher reuses the verifier's
+fixed weight pitch and original ordered eight-packet fold. Each CTA resolves
+its live route and checks its descriptor before the arithmetic. IQ3 loads
+its canonical grid once per CTA. IQ1_M prepares the exact signed activation
+correction terms, and IQ4_NL prepares the interleaved Q8 operand before its
+output lanes start accumulating. The new single-row CTest cases check the
+captured reader, exact grid, resources and byte equality with a staged
+serial-row oracle.
+
+The compiled SM86 readers use 39–46 registers with no local-memory
+instructions. The existing fixed-pitch verifier Down entry points and
+the inspected original single-row formats retain identical SASS instruction
+sequences. Both cards passed 13 single-row captures and the wide and
+QFN-width grouped Down sweeps.
+
+Both RTX 3090s passed the native timing and oracle comparisons. The candidate
+reduced captured Down stage latency by 8–20% across the nine K=256 readers.
+The table reports the range of median capture times observed across cards and
+orders. The weight-only reference traverses the same requested physical
+planes for the same routes.
+
+| Down source | Original µs | Fixed pitch µs | Fraction of route-matched reference |
+| --- | ---: | ---: | ---: |
+| IQ1_M | 7.360 | 6.144 | 47–48% |
+| IQ1_S | 6.656 | 5.888–5.952 | 49% |
+| IQ2_XXS | 6.080 | 4.928 | 57–58% |
+| IQ2_S | 6.848 | 5.888 | 52% |
+| IQ2_XS | 6.848 | 6.016 | 51% |
+| IQ3_XXS | 5.824 | 4.672–4.736 | 65–66% |
+| IQ3_S | 6.784–6.816 | 5.696 | 60% |
+| IQ4_NL | 4.736 | 4.288–4.352 | 75–76% |
+| IQ4_XS | 5.376 | 4.800 | 72% |
+
+The 120 captured tile trials crossed 64, 128 and 256 columns in both orders
+on both cards. Moving to 128 columns gave up to 2% lower latency on a few
+sources and raised IQ3_XXS latency by 5.4%. The 256-column shape was slower
+across the nine K=256 sources. IQ4_NL at K=320 gained about 1% from the fixed
+pitch, so the measured specialization covers K=256.
+
+The available Release QFN weights use K=320 in the tested F320/S320 shard
+and exercise the existing Down reader. Both arm orders of the 2×CUDA/2×CPU
+comparison used three 256-token requests per mode after warmup. All prompt
+and generated IDs and every per-request MTP counter matched. The driver
+diagnostics were identical across each process.
+
+| Arm order | Mode | Previous decode tokens/s | New decode tokens/s | Combined prefill and decode latency change |
+| --- | --- | ---: | ---: | ---: |
+| New reader first | Ordinary | 30.258 | 30.404 | −0.40% |
+| New reader first | Fixed depth seven | 44.906 | 45.110 | −0.15% |
+| Control first | Ordinary | 29.716 | 29.777 | +0.04% |
+| Control first | Fixed depth seven | 43.846 | 43.889 | +0.04% |

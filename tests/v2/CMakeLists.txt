@@ -12249,6 +12249,20 @@ foreach(qfn_m1_packed_format IN ITEMS Q2_K Q3_K Q6_K IQ1_S IQ1_M IQ2_S IQ2_XS IQ
         list(APPEND V2_QFN_PACKED_M1_PREFLIGHT_TESTS ${qfn_m1_packed_test})
     endif()
 endforeach()
+foreach(qfn_m1_down_format IN ITEMS IQ1_S IQ1_M IQ2_S IQ2_XS IQ2_XXS IQ3_S IQ3_XXS IQ4_NL IQ4_XS)
+    set(qfn_m1_down_test V2_Integration_CUDA_MoEGroupedDecodePackedShortDown${qfn_m1_down_format}Replay)
+    add_v2_test(${qfn_m1_down_test}
+        COMMAND $<TARGET_FILE:v2_integration_cuda_moe_kernel>
+            --gtest_filter=Test__CUDAMoEKernel.RuntimeGroupedDecodeSwiGLUPublicationReplay
+        LABELS "V2;Integration;ProductionTestPreflight;CUDA;MoE;MTP;GraphCapture;Replay;ByteExact;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120
+        ENVIRONMENT "LLAMINAR_TEST_CUDA_MOE_M1_DOWN_FORMAT=${qfn_m1_down_format}"
+            "LLAMINAR_TEST_CUDA_MOE_M1_GEOMETRY=wide"
+            "LLAMINAR_TEST_CUDA_MOE_QFN_ROUTE_COUNT=10")
+    if(TEST ${qfn_m1_down_test})
+        list(APPEND V2_QFN_PACKED_M1_PREFLIGHT_TESTS ${qfn_m1_down_test})
+    endif()
+endforeach()
 add_v2_test(V2_Integration_CUDA_MoEVerifierK32PublicationReplay
     COMMAND $<TARGET_FILE:v2_integration_cuda_moe_kernel>
         --gtest_filter=Test__CUDAMoEKernel.RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRuntimeDecodeRows

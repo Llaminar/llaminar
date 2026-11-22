@@ -87,6 +87,21 @@ namespace llaminar2
         }
 
         /**
+         * @brief Identify the indexed readers measured for a short QFN Down shard.
+         * @param codebook Physical NativeQuantised execution codebook.
+         * @return Whether the codebook uses the packed H=2560, K=256 SM86 reader.
+         */
+        static constexpr bool qfnPackedShortDown(uint8_t codebook) noexcept
+        {
+            using namespace native_quantised_formats;
+            return codebook == IQ1_S.codebook_id || codebook == IQ1_M.codebook_id ||
+                   codebook == IQ2_S.codebook_id || codebook == IQ2_XS.codebook_id ||
+                   codebook == IQ2_XXS.codebook_id || codebook == IQ3_S.codebook_id ||
+                   codebook == IQ3_XXS.codebook_id || codebook == IQ4_NL.codebook_id ||
+                   codebook == kNativeQuantisedIQ4XSSourceScaleCodebook;
+        }
+
+        /**
          * @brief Select the mandatory grouped engine for a captured row bucket.
          * @param rows Positive grouped token-row count.
          * @return Ordered DP4A for verifier buckets, otherwise grouped IMMA.
