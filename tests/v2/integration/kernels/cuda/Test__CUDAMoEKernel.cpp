@@ -24702,6 +24702,13 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
                             const auto admitted_symbol = direct_activation ? "ELi64ELj10ELb1EEE" : "ELi64ELj0ELb1EEE";
                             EXPECT_EQ(name.contains(admitted_symbol), plan_validated)
                                 << gate_source << " captured the wrong descriptor-validation owner";
+                            const bool bounded_registers = plan_validated &&
+                                (gate_reader == native_formats::IQ1_M.codebook_id ||
+                                 gate_reader == native_formats::IQ1_S.codebook_id ||
+                                 gate_reader == native_formats::IQ2_S.codebook_id ||
+                                 gate_reader == native_formats::IQ2_XS.codebook_id);
+                            EXPECT_EQ(name.contains("scatter_kernel_bounded"), bounded_registers)
+                                << gate_source << " captured the wrong register schedule";
                         }
                     }
                     if (name.contains("grouped_native_quantised_gate_up_ordered_kpart_reduce_swiglu_kernel"))

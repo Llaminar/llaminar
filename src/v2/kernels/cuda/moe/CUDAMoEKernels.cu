@@ -21072,7 +21072,7 @@ __global__ void softmax_topk_decode_descriptors_kernel(
     template <uint8_t CodebookId, int Pitch = 0, int Packets = 0,
               NativeMoEDotOrder PacketOrder = NativeMoEDotOrder::PartitionPartial,
               int ExactTile = 0, unsigned RoutesPerToken = 0, bool PlanValidated = false>
-    __global__ void grouped_native_quantised_gate_up_ordered_kpart_scatter_kernel(
+    __device__ __forceinline__ void grouped_native_quantised_gate_up_ordered_kpart_scatter(
         const int8_t *__restrict__ A_int8,
         const float *__restrict__ scales_A_blockwise,
         llaminar2::MoEGroupedSourceRows source_rows,
@@ -21182,6 +21182,80 @@ __global__ void softmax_topk_decode_descriptors_kernel(
         gate_partials[partial_index] = gate_partial;
         up_partials[partial_index] = up_partial;
     }
+
+    /** @brief Codebooks measured with a 16-CTA budget and zero spills on SM86. */
+    template <uint8_t CodebookId>
+    inline constexpr bool kQFNBoundedGateRegisters =
+        CodebookId == native_formats::IQ1_S.codebook_id ||
+        CodebookId == native_formats::IQ1_M.codebook_id ||
+        CodebookId == native_formats::IQ2_S.codebook_id ||
+        CodebookId == native_formats::IQ2_XS.codebook_id;
+
+    /**
+     * @brief Launch the ordered scatter with the general register budget.
+     * @copydetails grouped_native_quantised_gate_up_ordered_kpart_scatter
+     */
+    template <uint8_t CodebookId, int Pitch = 0, int Packets = 0,
+              NativeMoEDotOrder PacketOrder = NativeMoEDotOrder::PartitionPartial,
+              int ExactTile = 0, unsigned RoutesPerToken = 0, bool PlanValidated = false>
+    __global__ void grouped_native_quantised_gate_up_ordered_kpart_scatter_kernel(
+        const int8_t *__restrict__ A_int8,
+        const float *__restrict__ scales_A_blockwise,
+        llaminar2::MoEGroupedSourceRows source_rows,
+        const DeviceNativeQuantisedMatrixDesc *__restrict__ gate_descs,
+        const DeviceNativeQuantisedMatrixDesc *__restrict__ up_descs,
+        const int *__restrict__ original_to_grouped,
+        const int *__restrict__ original_expert_ids,
+        float *__restrict__ gate_partials,
+        float *__restrict__ up_partials,
+        int original_slot_base,
+        int tile_route_slots,
+        int N,
+        int K,
+        int num_experts,
+        int k_partitions)
+    {
+        grouped_native_quantised_gate_up_ordered_kpart_scatter<
+            CodebookId, Pitch, Packets, PacketOrder, ExactTile, RoutesPerToken, PlanValidated>(
+            A_int8, scales_A_blockwise, source_rows, gate_descs, up_descs,
+            original_to_grouped, original_expert_ids, gate_partials, up_partials,
+            original_slot_base, tile_route_slots, N, K, num_experts, k_partitions);
+    }
+
+    /**
+     * @brief Bound registers only for measured, plan-validated QFN tiles.
+     * @pre Capture submits every original output column in 64-thread blocks.
+     *      The upstream producer selected a uniform measured physical codebook.
+     * @copydetails grouped_native_quantised_gate_up_ordered_kpart_scatter
+     */
+    template <uint8_t CodebookId, int Pitch, int Packets, NativeMoEDotOrder PacketOrder,
+              int ExactTile, unsigned RoutesPerToken, bool PlanValidated>
+    __global__ __launch_bounds__(64, 16)
+    void grouped_native_quantised_gate_up_ordered_kpart_scatter_kernel_bounded(
+        const int8_t *__restrict__ A_int8,
+        const float *__restrict__ scales_A_blockwise,
+        llaminar2::MoEGroupedSourceRows source_rows,
+        const DeviceNativeQuantisedMatrixDesc *__restrict__ gate_descs,
+        const DeviceNativeQuantisedMatrixDesc *__restrict__ up_descs,
+        const int *__restrict__ original_to_grouped,
+        const int *__restrict__ original_expert_ids,
+        float *__restrict__ gate_partials,
+        float *__restrict__ up_partials,
+        int original_slot_base,
+        int tile_route_slots,
+        int N,
+        int K,
+        int num_experts,
+        int k_partitions)
+    {
+        static_assert(ExactTile == 64 && PlanValidated && kQFNBoundedGateRegisters<CodebookId>);
+        grouped_native_quantised_gate_up_ordered_kpart_scatter<
+            CodebookId, Pitch, Packets, PacketOrder, ExactTile, RoutesPerToken, PlanValidated>(
+            A_int8, scales_A_blockwise, source_rows, gate_descs, up_descs,
+            original_to_grouped, original_expert_ids, gate_partials, up_partials,
+            original_slot_base, tile_route_slots, N, K, num_experts, k_partitions);
+    }
+
 
     /**
      * @brief Apply the canonical reciprocal to a widened positive half scale.
@@ -26863,9 +26937,15 @@ __attribute__((visibility("default"))) bool cudaMoE_softmax_topk_decode_selected
                         constexpr auto unrolled = NativeMoEDotOrder::PartitionPartial;
                         const auto issue = [&]<int Pitch, int Packets, NativeMoEDotOrder Order,
                                                int ExactTile = 0, unsigned RoutesPerToken = 0, bool PlanValidated = false>() {
-                            grouped_native_quantised_gate_up_ordered_kpart_scatter_kernel<
-                                CodebookId, Pitch, Packets, Order, ExactTile, RoutesPerToken, PlanValidated>
-                                <<<scatter_grid, block, 0, cuda_stream>>>(
+                            constexpr auto kernel = [] {
+                                if constexpr (PlanValidated && kQFNBoundedGateRegisters<CodebookId>)
+                                    return grouped_native_quantised_gate_up_ordered_kpart_scatter_kernel_bounded<
+                                        CodebookId, Pitch, Packets, Order, ExactTile, RoutesPerToken, PlanValidated>;
+                                else
+                                    return grouped_native_quantised_gate_up_ordered_kpart_scatter_kernel<
+                                        CodebookId, Pitch, Packets, Order, ExactTile, RoutesPerToken, PlanValidated>;
+                            }();
+                            kernel<<<scatter_grid, block, 0, cuda_stream>>>(
                                     gateup_input, gateup_scales, source_rows, d_gate_desc_table, d_up_desc_table,
                                     d_original_to_grouped, d_original_expert_ids, d_gate_partials, d_up_partials,
                                     original_slot_base, tile_route_slots, intermediate, d_model, num_experts,

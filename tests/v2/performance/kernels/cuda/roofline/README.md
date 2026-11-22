@@ -444,6 +444,22 @@ direction, including the plan checks.
 | IQ2_XXS | 22.080–22.208 | 72.9–73.7% |
 | IQ3_XXS | 26.240 | 80.2–81.0% |
 
+The four plan-validated IQ1_M, IQ1_S, IQ2_S, and IQ2_XS tiles use a
+compiler target of sixteen 64-thread CTAs per SM. They use 64 registers
+and zero shared, stack, or local bytes. The exact launch geometry and
+ordered partition arithmetic are the same in both timing arms.
+
+| Source | Release Gate/Up with publication, µs | Matched weight rate | Complete capture time reduction |
+| --- | ---: | ---: | ---: |
+| IQ1_M | 26.688–26.752 | 62.1–63.2% | 0.82–0.89% |
+| IQ1_S | 24.448–24.576 | 67.7–68.3% | 0.61% |
+| IQ2_S | 26.880–27.008 | 80.7–82.0% | 0.89–0.97% |
+| IQ2_XS | 27.072–27.200 | 79.7–80.9% | 0.15% |
+
+This sweep matched serial bytes for all 21 Gate/Up and seven K=320 Down
+formats on both RTX 3090s. Seventeen Gate/Up and all seven Down formats
+reached 80% of their matched reference on both cards.
+
 Forcing the existing grouped INT8 tensor-core engine at four rows
 preserved serial output bytes on the six low-bit sources. The complete
 captured transaction, including routing and publication, ranged from
