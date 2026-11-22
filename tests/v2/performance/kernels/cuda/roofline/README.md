@@ -500,6 +500,29 @@ three measured requests.
 
 The candidate remains opt-in pending a repeatable ordinary decode gain.
 
+A separate Release diagnostic matched 1,488 CPU layer observations by
+model layer and live-route count in each arm. Mean remote CPU dispatch wait
+dropped from 279.45 to 261.89 µs per layer. Local expert execution rose from
+305.81 to 317.55 µs, and joint publication rose from 40.33 to 46.85 µs.
+The root's concurrent ticket service averaged 30.24 and 30.27 ms per
+decode transaction. Both arms reproduced the first 32 archived tokens.
+
+A separate resident-first comparison sampled hardware counters on the
+original rank-one CPU workers for 2.8 seconds during ordinary decode. Both
+arms reproduced the full 256-token history. Staged and resident IPC were
+0.191 and 0.192. Cycles per reference cycle were 0.999 and 1.005, and LLC
+miss fractions were 95.03% and 95.12%. Each sample accumulated 78.50 CPU
+seconds across the rank's original 28 physical cores. The counter samples
+are separate from the Release timing comparison above.
+
+The isolated root ticket probe keeps the separate mapped dispatch and local
+arithmetic in the same graph. A 128-thread direct mapped store reduced root
+ticket completion from 56.32–57.34 to 55.26–55.30 µs while keeping mapped
+dispatch timing within 1.03 µs of the control. The second DMA variant took
+68.61–69.63 µs to complete the ticket. All variants reproduced every seeded
+packet and arithmetic output on both cards. The Release candidate retains
+the original ticket copy path.
+
 ### Grouped Gate/Up packets and direct Down on SM86
 
 The grouped native program uses one 256-thread CTA per live 32-column
