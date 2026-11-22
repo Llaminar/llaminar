@@ -97,6 +97,7 @@ namespace llaminar2
                     .total_memory = properties.totalGlobalMem,
                     .last_level_cache = static_cast<std::size_t>(std::max(properties.l2CacheSize, 0)),
                     .integrated = properties.integrated != 0,
+                    .can_launch_cooperative = properties.cooperativeLaunch != 0,
                 };
                 static_assert(sizeof(properties.uuid.bytes) == 16);
                 std::memcpy(hardware.uuid.data(), properties.uuid.bytes, hardware.uuid.size());

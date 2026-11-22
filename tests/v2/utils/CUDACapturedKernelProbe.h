@@ -17,6 +17,7 @@
 
 #include <cstdint>
 #include <fstream>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -90,6 +91,64 @@ namespace llaminar2::test
             GraphOwner(const GraphOwner &) = delete;
             GraphOwner &operator=(const GraphOwner &) = delete;
         };
+
+        /** Physical kernel identity borrowed from its retained production graph. */
+        struct KernelLaunch
+        {
+            cudaGraphNode_t source;
+            cudaKernelNodeParams params;
+        };
+
+        /** Time repeated ordered sequences on the same stream as the warmed fixture.
+         * @param launches Physical nodes in their original dependency order.
+         * @param stream Exact warmed fixture stream.
+         * @param config Positive warmup, sample and repetition counts.
+         * @return Per-sequence device-event time in microseconds for every sample.
+         */
+        inline std::vector<double> measureKernelSequence(std::span<KernelLaunch> launches,
+            cudaStream_t stream, const CUDACapturedKernelProbeConfig &config)
+        {
+            if (launches.empty() || !stream || config.warmup_runs <= 0 ||
+                config.sample_count <= 0 || config.operations_per_sample <= 0)
+                throw std::invalid_argument("CUDA kernel sequence needs retained launches and a positive sample policy");
+            GraphOwner isolated;
+            cudaGraphNode_t previous = nullptr;
+            for (int repeat = 0; repeat < config.operations_per_sample; ++repeat)
+            {
+                for (auto &launch : launches)
+                {
+                    cudaGraphNode_t current = nullptr;
+                    require(cudaGraphAddKernelNode(&current, isolated.graph, previous ? &previous : nullptr,
+                        previous ? 1 : 0, &launch.params), "retain exact sequence kernel launch");
+                    require(cudaGraphKernelNodeCopyAttributes(current, launch.source), "retain source kernel attributes");
+                    previous = current;
+                }
+            }
+            require(cudaGraphInstantiateWithFlags(&isolated.executable, isolated.graph, cudaGraphInstantiateFlagUseNodePriority),
+                    "instantiate isolated CUDA sequence");
+            for (int warmup = 0; warmup < config.warmup_runs; ++warmup)
+                require(cudaGraphLaunch(isolated.executable, stream), "warm isolated CUDA sequence");
+
+            std::vector<TimingEvent> starts(config.sample_count), stops(config.sample_count);
+            for (int sample = 0; sample < config.sample_count; ++sample)
+            {
+                require(cudaEventRecord(starts[sample].handle, stream), "start isolated CUDA sequence sample");
+                require(cudaGraphLaunch(isolated.executable, stream), "replay isolated CUDA sequence");
+                require(cudaEventRecord(stops[sample].handle, stream), "stop isolated CUDA sequence sample");
+            }
+            require(cudaEventSynchronize(stops.back().handle), "observe terminal isolated CUDA sequence event");
+
+            std::vector<double> samples;
+            samples.reserve(config.sample_count);
+            for (int sample = 0; sample < config.sample_count; ++sample)
+            {
+                float ms = 0;
+                require(cudaEventElapsedTime(&ms, starts[sample].handle, stops[sample].handle),
+                    "read isolated CUDA sequence sample");
+                samples.push_back(ms * 1000.0 / config.operations_per_sample);
+            }
+            return samples;
+        }
 
         /** Copy every compiled argument byte for complete capture identity.
          * @param params Parameters borrowed from the retained parent graph.
@@ -203,35 +262,8 @@ namespace llaminar2::test
             int occupancy = 0;
             require(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occupancy, params.func, threads, params.sharedMemBytes),
                     "inspect probe occupancy ceiling");
-            GraphOwner isolated;
-            cudaGraphNode_t previous = nullptr;
-            for (int repeat = 0; repeat < config.operations_per_sample; ++repeat)
-            {
-                cudaGraphNode_t current = nullptr;
-                require(cudaGraphAddKernelNode(&current, isolated.graph, previous ? &previous : nullptr,
-                    previous ? 1 : 0, &params), "retain isolated physical kernel");
-                require(cudaGraphKernelNodeCopyAttributes(current, entry.source), "retain exact probe node attributes");
-                previous = current;
-            }
-            require(cudaGraphInstantiateWithFlags(&isolated.executable, isolated.graph, cudaGraphInstantiateFlagUseNodePriority),
-                    "instantiate isolated probe");
-            for (int warmup = 0; warmup < config.warmup_runs; ++warmup)
-                require(cudaGraphLaunch(isolated.executable, stream), "warm isolated probe");
-            std::vector<TimingEvent> starts(config.sample_count), stops(config.sample_count);
-            for (int sample = 0; sample < config.sample_count; ++sample)
-            {
-                require(cudaEventRecord(starts[sample].handle, stream), "start isolated probe sample");
-                require(cudaGraphLaunch(isolated.executable, stream), "replay isolated probe sample");
-                require(cudaEventRecord(stops[sample].handle, stream), "stop isolated probe sample");
-            }
-            require(cudaEventSynchronize(stops.back().handle), "observe terminal isolated probe event");
-            std::vector<double> samples;
-            for (int sample = 0; sample < config.sample_count; ++sample)
-            {
-                float ms = 0;
-                require(cudaEventElapsedTime(&ms, starts[sample].handle, stops[sample].handle), "read isolated probe sample");
-                samples.push_back(ms * 1000.0 / config.operations_per_sample);
-            }
+            KernelLaunch launch{entry.source, params};
+            const auto samples = measureKernelSequence(std::span{&launch, 1u}, stream, config);
             records.push_back({{"diagnostic_only", true}, {"mode", "isolated_native_graph"},
                 {"operation", identity.operation}, {"format", identity.format}, {"tp_degree", identity.tp_degree},
                 {"m", identity.m}, {"n", identity.n}, {"k", identity.k}, {"kernel", name},

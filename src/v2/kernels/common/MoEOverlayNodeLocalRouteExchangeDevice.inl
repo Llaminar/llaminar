@@ -7,11 +7,14 @@
  * memory.  Payload work stays sparse: a producer writes only route slots whose
  * device-owned runtime assignment names it, and the root reads mapped memory
  * only for those same slots while retaining the exact original top-k fold.
+ * Raw continuation shards complete their participant sum before the router
+ * multiply, using the same arithmetic order as the CPU route return.
  */
 
 #pragma once
 
 #include "execution/moe/MoEOverlayNodeLocalRouteExchangeABI.h"
+#include "DeviceFP32NumericalContract.h"
 #include "MoEOverlayActivationPacketDevice.inl"
 
 #include <cstddef>
@@ -503,18 +506,23 @@ namespace llaminar2::moe_node_local_route_device
                 // The peer binding is in admitted participant order, excluding
                 // the root. Insert the root at its original rank coordinate.
                 bool added_root = false;
+                bool added_operand = false;
                 for (std::uint32_t index = 0u; index < launch.peer_count; ++index)
                 {
                     const auto &peer = launch.peers[index];
                     if (!added_root && launch.root_participant < peer.producer_participant)
                     {
-                        contribution = __fadd_rn(contribution, local);
+                        contribution = added_operand ? device_fp32_contract::add(contribution, local) : local;
                         added_root = true;
+                        added_operand = true;
                     }
-                    contribution = __fadd_rn(contribution, peer.route_payload[element]);
+                    const float partial = peer.route_payload[element];
+                    contribution = added_operand ? device_fp32_contract::add(contribution, partial) : partial;
+                    added_operand = true;
                 }
                 if (!added_root)
-                    contribution = __fadd_rn(contribution, local);
+                    contribution = device_fp32_contract::add(contribution, local);
+                contribution = device_fp32_contract::multiply(contribution, launch.cohort_route_weights[slot]);
             }
             else if (participant == launch.root_participant ||
                 (participant < 0 &&

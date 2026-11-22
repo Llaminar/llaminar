@@ -23,6 +23,7 @@
 #include "WorkspaceOverwriteContract.h"
 #include "DeviceRowRange.h"
 #include "MoEGroupingPackedDirectory.h"
+#include "MoEProjectionNumericalContract.h"
 
 #include <stdexcept>
 #include <cstdint>
@@ -158,6 +159,9 @@ namespace llaminar2
 
         /** @return The last successfully published static producer's origin. */
         [[nodiscard]] MoEPrefillRouteScope scope() const noexcept { return scope_; }
+
+        /** @return Capture-time identity revoked when any grouping replaces its bindings. */
+        [[nodiscard]] uint64_t generation() const noexcept { return generation_; }
 
         /** @brief Authenticate a consuming projection against its original grouping.
          * @param rows Actual physical projection rows, not the current live count.
@@ -316,16 +320,21 @@ namespace llaminar2
         /**
          * @brief Execute one original local F fragment and publish its full-H partial output.
          * @param model_columns Original unchanged hidden/output width H.
+         * @param weighting Whether the local fold or a mixed-tier cohort applies the router factor.
          * @return A distinct partial transaction; it cannot certify whole-expert measurements.
          * @note Runtime grouping must separately authenticate the original cohort and local F geometry.
          */
-        [[nodiscard]] static MoEPrefillProjectionExecution intermediateShard(int model_columns)
+        [[nodiscard]] static MoEPrefillProjectionExecution intermediateShard(int model_columns,
+            MoEExpertRouteWeighting weighting = MoEExpertRouteWeighting::LocalProjection)
         {
-            return {Phase::IntermediateShard, model_columns, 0, model_columns};
+            return {Phase::IntermediateShard, model_columns, 0, model_columns, weighting};
         }
 
         /** @return Whether the declared publication still requires its original cohort reduction. */
         [[nodiscard]] bool isIntermediateShard() const noexcept { return phase_ == Phase::IntermediateShard; }
+
+        /** @return Who owns the one weight multiply for these route rows. */
+        [[nodiscard]] MoEExpertRouteWeighting routeWeighting() const noexcept { return weighting_; }
 
         /**
          * @brief Stop after ordinary grouped SwiGLU publication.
@@ -470,9 +479,10 @@ namespace llaminar2
 
         /** @brief Reject invalid or overflowing ranges before capture begins. */
         MoEPrefillProjectionExecution(
-            Phase phase, int model_columns, int first_column, int column_count)
+            Phase phase, int model_columns, int first_column, int column_count,
+            MoEExpertRouteWeighting weighting = MoEExpertRouteWeighting::LocalProjection)
             : phase_(phase), model_columns_(model_columns),
-              first_column_(first_column), column_count_(column_count)
+              first_column_(first_column), column_count_(column_count), weighting_(weighting)
         {
             // A floating source need not have block-quantized geometry. Each
             // backend's quantized launch validates its own block alignment;
@@ -481,11 +491,15 @@ namespace llaminar2
                 first_column < 0 || first_column >= model_columns ||
                 column_count <= 0 || column_count > model_columns - first_column)
                 throw std::invalid_argument("grouped MoE projection requires a valid source column range");
+            if (weighting != MoEExpertRouteWeighting::LocalProjection &&
+                (weighting != MoEExpertRouteWeighting::CompletedCohort || phase != Phase::IntermediateShard))
+                throw std::invalid_argument("only an intermediate shard can defer the original router multiply");
         }
 
         Phase phase_;
         int model_columns_;
         int first_column_;
         int column_count_;
+        MoEExpertRouteWeighting weighting_;
     };
 } // namespace llaminar2

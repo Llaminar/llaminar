@@ -23,13 +23,17 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
 
 namespace llaminar2
 {
+    class CUDAGraphCapture;
     class NvidiaDeviceContext;
+    class DeviceToMappedHostCopy;
 
     /**
      * @brief Splice one mapped 64-bit wait into an active CUDA stream capture.
@@ -70,7 +74,146 @@ namespace llaminar2
         void *signal,
         std::uint64_t value) noexcept;
 
+    /** @brief Single-dispatch ownership of an early resident route acquire. */
+    class CUDAResidentPacketAcquire final
+    {
+    public:
+        /** @brief Claim the readiness word once while recording the exact stream. */
+        std::uint64_t* claimSignal(void* stream) const;
+
+        CUDAResidentPacketAcquire(const CUDAResidentPacketAcquire&) = delete;
+        CUDAResidentPacketAcquire& operator=(const CUDAResidentPacketAcquire&) = delete;
+
+    private:
+        friend class CUDAEarlyPacketPublication;
+
+        /** @brief Bind the original producer's word to its first packet consumer. */
+        CUDAResidentPacketAcquire(cudaStream_t stream, std::uint64_t* signal) noexcept
+            : stream_(stream), signal_(signal) {}
+
+        cudaStream_t stream_; ///< Original same-device capture stream.
+        std::uint64_t* signal_; ///< Original arena word, reset by the single acquire owner.
+        mutable bool claimed_ = false; ///< Checked before this capture scope can publish its new frontier.
+    };
+
+    /**
+     * @brief Record explicit packet stages against a producer's early device publication.
+     *
+     * The producer and its packet readers record into one native graph on the
+     * admitted stream. The producer release orders only the named early data;
+     * normal graph dependencies continue to own the producer's full retirement.
+     * This object holds capture metadata only. The original stage owns the
+     * device word and each original packet stage continues to own transport.
+     */
+    class CUDAEarlyPacketPublication final
+    {
+    public:
+        /**
+         * @brief Initialize the original arena word before the executable can record or replay.
+         * @param stream Exact original CUDA setup stream.
+         * @param signal Arena-owned word retained by the producer and consumed by the packet.
+         */
+        void prepare(void* stream, std::uint64_t* signal);
+
+        /**
+         * @brief Borrow the original producer frontier for a same-unit packet fork.
+         * @param stream Exact original native capture stream.
+         * @param signal Arena-owned signal released by the producer after the early data is complete.
+         */
+        void recordProducer(void* stream, std::uint64_t* signal);
+
+        /**
+         * @brief Record one original packet on the side of the producer and join both completions.
+         * @param stream Same active native capture and stream as the original producer.
+         * @param record Original packet stage submission. Every data input must be an early export.
+         * @return True only when the stage records and both frontiers are joined.
+         */
+        bool recordConsumer(void* stream, const std::function<bool()>& record);
+
+        /**
+         * @brief Record a dispatch whose sole first lane can consume the word in its metadata warp.
+         * @param stream Exact original native capture stream.
+         * @param lane_count Number of prepared dispatch bindings that will record.
+         * @param record Original dispatch submission. A non-null acquire must be consumed once.
+         * @return True only when both the dispatch and arithmetic frontiers are joined.
+         */
+        bool recordDispatchConsumer(void* stream, std::size_t lane_count,
+            const std::function<bool(const CUDAResidentPacketAcquire*)>& record);
+
+    private:
+        /** @brief Fork from the producer and assign exactly one owner to the readiness word. */
+        bool recordPacketConsumer(void* stream, bool inline_acquire,
+            const std::function<bool(const CUDAResidentPacketAcquire*)>& record);
+
+        cudaGraph_t graph_ = nullptr;
+        cudaStream_t stream_ = nullptr;
+        unsigned long long capture_id_ = 0;
+        std::uint64_t* signal_ = nullptr;
+        std::vector<cudaGraphNode_t> producer_frontier_;
+        std::vector<cudaGraphNode_t> packet_frontier_;
+    };
+
 #if CUDART_VERSION >= 12030
+    /**
+     * @brief Bind the recording thread to a fragment of its final native timeline.
+     *
+     * CUDA conditional handles cannot be cloned into a parent graph. Kernel
+     * launchers can add them to an ordered timeline only while the backend is
+     * recording directly into that timeline's native definition. This lexical
+     * scope authenticates the backend's existing ownership and exact stream.
+     */
+    class ScopedCUDAFinalTimelineRecording final
+    {
+    public:
+        /**
+         * @brief Open the recording-thread scope immediately after beginCapture().
+         * @param capture Active backend graph capture. An independent capture
+         *                cannot authorize an ordered-timeline conditional.
+         */
+        explicit ScopedCUDAFinalTimelineRecording(const IGPUGraphCapture &capture) noexcept;
+        /** @brief Restore the surrounding recording authority. */
+        ~ScopedCUDAFinalTimelineRecording();
+
+        ScopedCUDAFinalTimelineRecording(const ScopedCUDAFinalTimelineRecording &) = delete;
+        ScopedCUDAFinalTimelineRecording &operator=(const ScopedCUDAFinalTimelineRecording &) = delete;
+
+        /**
+         * @brief Check whether the exact CUDA stream records in the final definition.
+         * @param stream Native stream on which a conditional would be appended.
+         * @return True while the owner records an in-place timeline fragment on this stream.
+         */
+        [[nodiscard]] static bool admitsConditionalOn(cudaStream_t stream) noexcept;
+
+#if CUDART_VERSION >= 12080
+        /**
+         * @brief Bind device-updatable nodes to their final, uploadable definition.
+         * @param stream Exact in-place recording stream.
+         * @return The graph that will directly own the sole executable.
+         * @throws std::logic_error For a stream whose fragment would need cloning.
+         */
+        [[nodiscard]] static cudaGraph_t requireDeviceGridOn(cudaStream_t stream);
+#endif
+
+    private:
+        const CUDAGraphCapture *previous_; ///< Surrounding scope on the recording thread.
+    };
+
+#if CUDART_VERSION >= 12080
+    /**
+     * @brief Append arithmetic nodes whose exact live grids are set by their device plan.
+     * @param stream Exact non-default stream in the final in-place timeline.
+     * @param launches Ordered native arithmetic nodes with their immutable operands.
+     * @param publish Record the device plan using the ordered node handles. Before publishing
+     *                completion it must set each positive grid and disable each empty node.
+     * @throws std::exception If the original timeline, plan frontier or any native node is invalid.
+     * @details Nothing runs during capture. The original planner's native completion edge
+     *          gates the arithmetic, and the native executable uploads on its original stream.
+     */
+    void appendCUDADeviceSizedKernels(cudaStream_t stream,
+        std::span<const cudaKernelNodeParams> launches,
+        const std::function<bool(std::span<const cudaGraphDeviceNode_t>)>& publish);
+#endif
+
     /**
      * @brief Body identity for one native CUDA conditional transaction.
      *
@@ -98,6 +241,13 @@ namespace llaminar2
     {
         IfOnly, ///< One non-zero body; zero executes no child graph.
         IfElse, ///< Non-zero and zero each own a non-empty body.
+    };
+
+    /** @brief Native grid semantics for a node recorded inside a CUDA conditional body. */
+    enum class CUDACapturedKernelGrid : std::uint8_t
+    {
+        Ordinary,
+        Cooperative,
     };
 
     /**
@@ -229,6 +379,29 @@ namespace llaminar2
             CUDAActiveCaptureConditionalBranch branch,
             const cudaKernelNodeParams &params,
             const char *semantic_name);
+
+        /**
+         * @brief Append a kernel with its admitted native grid semantics.
+         * @param branch Device-condition branch receiving the kernel.
+         * @param params Complete immutable kernel launch parameters.
+         * @param semantic_name Stable producer role used in fatal diagnostics.
+         * @param grid Exact grid semantics of the loaded kernel.
+         * @return True when the complete native launch is bound to the branch.
+         */
+        bool appendKernel(
+            CUDAActiveCaptureConditionalBranch branch,
+            const cudaKernelNodeParams &params,
+            const char *semantic_name,
+            CUDACapturedKernelGrid grid);
+
+        /**
+         * @brief Append the exact live copy into a registered host packet.
+         * @param branch Device condition that owns the transfer's live extent.
+         * @param copy Original source and destination bound by TransferEngine.
+         * @return True when the native branch owns the copy completion.
+         */
+        bool appendMappedHostCopy(
+            CUDAActiveCaptureConditionalBranch branch, const DeviceToMappedHostCopy &copy);
 
         /**
          * @brief Seal non-empty branches and publish the conditional as the stream tail.
@@ -417,6 +590,8 @@ namespace llaminar2
         int deviceOrdinal() const noexcept { return device_ordinal_; }
 
     private:
+        friend class ScopedCUDAFinalTimelineRecording;
+
         /** @copydoc IGPUGraphCapture::appendActiveCaptureChild */
         [[nodiscard]] bool appendActiveCaptureChild(const IGPUGraphCapture &child) override;
 

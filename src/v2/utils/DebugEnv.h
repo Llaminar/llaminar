@@ -4562,4 +4562,16 @@ namespace llaminar2
         }();
         return selected.value_or(qualified_domain);
     }
+
+    /** @return Whether paired runs should select the experimental mapped CUDA M1 program. */
+    inline bool qfnCUDAMappedRetainedM1HCFFNCandidate()
+    {
+        static const bool enabled = [] {
+            const char *value = std::getenv("LLAMINAR_QFN_CUDA_MAPPED_RETAINED_M1_HC_FFN_CANDIDATE");
+            if (!value || std::strcmp(value, "0") == 0) return false;
+            if (std::strcmp(value, "1") == 0) return true;
+            throw std::invalid_argument("LLAMINAR_QFN_CUDA_MAPPED_RETAINED_M1_HC_FFN_CANDIDATE requires 0 or 1");
+        }();
+        return enabled;
+    }
 } // namespace llaminar2

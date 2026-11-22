@@ -18,6 +18,7 @@
  * schedule are unchanged; the coefficient is storage metadata, never a minimum.
  * Decode refreshes only its selected expert descriptors from the acquired
  * bank; prefill continues to publish the complete grouped descriptor plan.
+ * Native M1 gate reduction publishes SwiGLU codes directly to the Down launch.
  */
 
 #include "kernels/common/MoERuntimeDescriptorLaunch.h"
@@ -34,6 +35,7 @@
 #include "CUDAMoEOverlayEpochKernels.h"
 
 #include "../../../backends/BackendManager.h"
+#include "../../../backends/cuda/CUDAHardwareMetadata.h"
 #include "../gemm/CUDADeviceWorkspace.h"
 #include "../gemm/CUDAMoEGroupedPrefillKernels.h"
 #include "../gemm/CUDAMoEProductionPrefillPolicy.h"
@@ -60,6 +62,7 @@
 #include <numeric>
 #include <stdexcept>
 #include <unordered_map>
+#include <utility>
 
 extern "C" bool cudaNativeQuantisedInitIQGridTables_tuned();
 
@@ -334,21 +337,6 @@ namespace
             groupedDecodeTags(source, active_slots, d_model, intermediate, route));
     }
 
-    void recordFusedDecodeTimer(
-        const char *name,
-        int top_k,
-        int d_model,
-        int intermediate)
-    {
-        llaminar2::PerfStatsCollector::recordTimingNs(
-            "kernel_cuda", name, 1, {}, {},
-            {{"source", "fused_runtime"},
-             {"stage_type", "MOE_EXPERT_FFN"},
-             {"top_k", std::to_string(top_k)},
-             {"d_model", std::to_string(d_model)},
-             {"intermediate", std::to_string(intermediate)}});
-    }
-
     bool isAligned(const void *ptr, std::uintptr_t alignment)
     {
         return ptr && ((reinterpret_cast<std::uintptr_t>(ptr) & (alignment - 1)) == 0);
@@ -590,6 +578,8 @@ namespace
      * 128-thread candidate from the ordinary generic value 128. Any malformed
      * selected width remains invalid and causes the production caller to fail;
      * it is never replaced after selection.
+     * @param device_ordinal The admitted capture owner. Device-free queries
+     *        omit it and use the architecture-independent policy.
      */
     CUDAMoEProductionPrefillPolicy selectCUDAMoEProductionPrefillPolicy(
         llaminar2::MoEPrefillMeasuredOperation operation,
@@ -600,7 +590,8 @@ namespace
         int expert_width,
         int expert_count,
         int top_k,
-        bool use_gateup_kpart)
+        bool use_gateup_kpart,
+        int device_ordinal = -1)
     {
         if (gateup_codebook_mask == 0 || down_codebook_mask == 0 ||
             seq_len <= 0 || hidden_size <= 0 || expert_width <= 0 ||
@@ -684,6 +675,21 @@ namespace
             {
                 policy.gateup_tile_n = exact_tile_n;
                 policy.source = "exact_overlay";
+            }
+            else if (device_ordinal >= 0 && seq_len == 4 && top_k == 10 &&
+                     hidden_size == llaminar2::CUDAMoEBatchInvariantPolicy::qfn_gate_up_k &&
+                     expert_width == llaminar2::CUDAMoEBatchInvariantPolicy::qfn_gate_up_n &&
+                     llaminar2::CUDAMoEBatchInvariantPolicy::qfnVerifierPackedGateUp(
+                         static_cast<uint8_t>(gateup_codebook)) &&
+                     gateup_codebook != llaminar2::native_quantised_formats::Q2_K.codebook_id &&
+                     gateup_codebook != llaminar2::native_quantised_formats::Q6_K.codebook_id)
+            {
+                const auto &hardware = llaminar2::cudaHardwareMetadata().at(device_ordinal);
+                if (hardware.sm_major == 8 && hardware.sm_minor == 6)
+                {
+                    policy.gateup_tile_n = 64;
+                    policy.source = "sm86_qfn_verifier";
+                }
             }
         }
 
@@ -1691,7 +1697,8 @@ extern "C"
         llaminar2::DeviceMoEWeightFormat expected_format,
         int device_idx,
         void *stream,
-        llaminar2::DeviceMoEProjectionSet expected_projections);
+        llaminar2::DeviceMoEProjectionSet expected_projections,
+        llaminar2::CUDAMoERuntimeGateContract gate_contract);
 
     bool cudaMoE_regroup_prefill_routes_runtime_assignments(
         void *runtime,
@@ -1720,7 +1727,8 @@ extern "C"
         llaminar2::DeviceMoEWeightFormat expected_format,
         int device_idx,
         void *stream,
-        llaminar2::DeviceMoEProjectionSet expected_projections);
+        llaminar2::DeviceMoEProjectionSet expected_projections,
+        llaminar2::CUDAMoERuntimeGateContract gate_contract);
 
     bool cudaMoE_commit_grouped_verifier_histograms(
         void *runtime,
@@ -1840,7 +1848,8 @@ extern "C"
         uint8_t codebook_id,
         int k_partitions,
         int device_idx,
-        void *stream);
+        void *stream,
+        llaminar2::CUDAMoESwiGLUPublication swiglu = {});
 
     bool cudaMoE_grouped_gate_up_floating_decode_table(
         const float *d_hidden,
@@ -1895,7 +1904,8 @@ extern "C"
         uint8_t codebook_id,
         int k_partitions,
         int device_idx,
-        void *stream);
+        void *stream,
+        llaminar2::CUDAMoEDecodeDownInput input = llaminar2::CUDAMoEDecodeDownInput::FloatGateUp);
 
     bool cudaMoE_grouped_swiglu_down_floating_decode_table(
         const float *const *d_gate_ptrs,
@@ -1984,7 +1994,8 @@ extern "C"
             imma_gateup_schedule,
         int device_idx,
         void *stream,
-        const llaminar2::MoEPrefillProjectionExecution &execution);
+        const llaminar2::MoEPrefillProjectionExecution &execution,
+        llaminar2::CUDAMoERuntimeGateContract gate_contract = {});
 
 
     bool cudaMoE_reduce_canonical_route_contributions(
@@ -2604,6 +2615,7 @@ namespace llaminar2
             original_m1_hidden_q8_read_lifecycle_=OriginalM1HiddenQ8ReadLifecycle::Invalidated;
         original_m1_hidden_q8_read_.reset();
         grouped_prefill_grouping_.invalidate();
+        runtime_gate_plan_.reset();
         d_staging_indices_ = nullptr;
         d_staging_weights_ = nullptr;
         staging_capacity_ = 0;
@@ -3239,6 +3251,7 @@ namespace llaminar2
     void CUDAMoEKernel::resetDynamicState()
     {
         grouped_prefill_grouping_.invalidate();
+        runtime_gate_plan_.reset();
         /*
          * This hook is reached only on hard kernel-dynamic reset boundaries.
          * Replay-preserving request reset deliberately avoids
@@ -5595,7 +5608,6 @@ namespace llaminar2
                                            active_row_count_device);
         if (!route_ready)
             return false;
-
         if (write_legacy_outputs)
         {
             markDeviceWritten(output_indices, device, stream);
@@ -6891,6 +6903,7 @@ namespace llaminar2
                                                   int *d_grouped_token_indices, float *d_grouped_weights)
     {
         grouped_prefill_grouping_.invalidate();
+        runtime_gate_plan_.reset();
         const int total_slots = seq_len * top_k;
         void *stream = requireStream("CUDAMoEKernel::groupTokensByExpertDevice");
         // One graph node resets every publication, including padded/remote
@@ -6936,6 +6949,7 @@ namespace llaminar2
         bool retain_routes_for_deferred_commit)
     {
         grouped_prefill_grouping_.invalidate();
+        runtime_gate_plan_.reset();
         if (!runtime_layer || !routing_indices || !routing_weights)
         {
             LOG_ERROR("[CUDAMoEKernel::groupPrefillRoutes] null runtime or routing tensor");
@@ -7007,6 +7021,7 @@ namespace llaminar2
         bool retain_routes_for_deferred_commit)
     {
         grouped_prefill_grouping_.invalidate();
+        runtime_gate_plan_.reset();
         if (!runtime_layer ||
             current_tokens < 0 || max_tokens <= 0 ||
             current_tokens > max_tokens || num_experts <= 0 || top_k <= 0)
@@ -7034,6 +7049,22 @@ namespace llaminar2
             stream);
     }
 
+    CUDAMoERuntimeGateContract CUDAMoEKernel::runtimeGateContract(
+        const GroupedGateUpDescriptorTable &table, int rows, int capacity, int top_k) const
+    {
+        if (rows != CUDAMoEBatchInvariantPolicy::qfn_verifier_gate_plan_rows ||
+            capacity != rows || top_k != CUDAMoEBatchInvariantPolicy::qfn_verifier_routes_per_token ||
+            table.weight_format != DeviceMoEWeightFormat::NativeQuantised)
+            return {};
+        const auto contract = CUDAMoERuntimeGateContract::qfn(
+            table.intermediate, table.d_model, table.codebook_id);
+        if (!contract.enabled() || table.codebook_mask != (1u << contract.codebook()))
+            return {};
+        const auto &hardware = cudaHardwareMetadata().at(device_ordinal_);
+        return hardware.sm_major == 8 && hardware.sm_minor == 6
+                   ? contract : CUDAMoERuntimeGateContract{};
+    }
+
     bool CUDAMoEKernel::publishCompleteGroupedPrefillPlanFromRouter(
         DeviceMoELayerRuntime *runtime_layer,
         ITensor *routing_indices,
@@ -7049,6 +7080,7 @@ namespace llaminar2
         DeviceMoEProjectionSet expected_projections)
     {
         grouped_prefill_grouping_.invalidate();
+        runtime_gate_plan_.reset();
         if (!validMoEGroupedPlanDemand(demand) || !runtime_layer || !routing_indices || !routing_weights ||
             current_tokens < 0 || max_tokens <= 0 || current_tokens > max_tokens ||
             num_experts <= 0 || top_k <= 0 ||
@@ -7124,7 +7156,8 @@ namespace llaminar2
         const auto *device_weights =
             static_cast<const float *>(routing_weights->gpu_data_ptr());
         const int max_active_experts = std::min(max_slots, num_experts);
-        return device_indices && device_weights &&
+        const auto gate_contract = runtimeGateContract(gateup_table, current_tokens, max_tokens, top_k);
+        const bool submitted = device_indices && device_weights &&
                cudaMoE_group_prefill_routes_and_materialize_plan_runtime(
                    device_indices,
                    device_weights,
@@ -7143,7 +7176,12 @@ namespace llaminar2
                    static_cast<int>(demand),
                    gateup_table.weight_format,
                    device_ordinal_,
-                   stream, expected_projections);
+                   stream, expected_projections, gate_contract);
+        if (submitted && gate_contract.enabled())
+            runtime_gate_plan_ = RuntimeGatePlanPublication{
+                gate_contract, runtime_layer, runtime_gate_descs, runtime_up_descs,
+                d_group_original_to_grouped_, stream, grouped_prefill_grouping_.generation(), num_experts};
+        return submitted;
     }
 
     bool CUDAMoEKernel::publishCompleteGroupedPrefillPlanFromRuntimeAssignments(
@@ -7158,6 +7196,7 @@ namespace llaminar2
         DeviceMoEProjectionSet expected_projections)
     {
         grouped_prefill_grouping_.invalidate();
+        runtime_gate_plan_.reset();
         if (!validMoEGroupedPlanDemand(demand) || !runtime_layer ||
             current_tokens < 0 || max_tokens <= 0 || current_tokens > max_tokens ||
             num_experts <= 0 || top_k <= 0 ||
@@ -7223,7 +7262,8 @@ namespace llaminar2
             return false;
         }
 
-        return cudaMoE_regroup_prefill_routes_and_materialize_plan_runtime(
+        const auto gate_contract = runtimeGateContract(gateup_table, current_tokens, max_tokens, top_k);
+        const bool submitted = cudaMoE_regroup_prefill_routes_and_materialize_plan_runtime(
             static_cast<void *>(runtime_layer),
             d_group_original_to_grouped_,
             runtime_gate_descs,
@@ -7238,7 +7278,12 @@ namespace llaminar2
             static_cast<int>(demand),
             gateup_table.weight_format,
             device_ordinal_,
-            stream, expected_projections);
+            stream, expected_projections, gate_contract);
+        if (submitted && gate_contract.enabled())
+            runtime_gate_plan_ = RuntimeGatePlanPublication{
+                gate_contract, runtime_layer, runtime_gate_descs, runtime_up_descs,
+                d_group_original_to_grouped_, stream, grouped_prefill_grouping_.generation(), num_experts};
+        return submitted;
     }
 
     bool CUDAMoEKernel::commitGroupedVerifierHistograms(
@@ -9246,7 +9291,7 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
                 intermediate,
                 num_experts,
                 top_k,
-                use_gateup_kpart);
+                use_gateup_kpart, device_ordinal_);
         if (use_gateup_kpart &&
             !validCUDAMoEGateUpOrderedTileN(prefill_policy.gateup_tile_n))
         {
@@ -9542,6 +9587,8 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
               !canonical_route_contributions)))
             return false;
 
+        const uint64_t publication_generation = grouped_prefill_grouping_.generation();
+        const auto published_gate = std::exchange(runtime_gate_plan_, std::nullopt);
         grouped_prefill_grouping_.invalidate();
         if (!device_runtime_layer)
             return false;
@@ -9754,7 +9801,7 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
                 intermediate,
                 num_experts,
                 top_k,
-                use_gateup_kpart);
+                use_gateup_kpart, device_ordinal_);
         if (use_gateup_kpart &&
             !validCUDAMoEGateUpOrderedTileN(prefill_policy.gateup_tile_n))
         {
@@ -9917,6 +9964,24 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
          * inverse map and removes reconstruction work from every MoE layer.
          */
 
+        CUDAMoERuntimeGateContract gate_contract;
+        if (execution.executesGateUp() && published_gate)
+        {
+            const auto expected = runtimeGateContract(gateup_table, seq_len, seq_len, top_k);
+            if (published_gate->generation != publication_generation || !expected.enabled() ||
+                expected.codebook() != published_gate->contract.codebook() ||
+                published_gate->runtime != device_runtime_layer ||
+                published_gate->gate != runtime_gate_descs || published_gate->up != runtime_up_descs ||
+                published_gate->original_to_grouped != d_group_original_to_grouped_ ||
+                published_gate->stream != stream || published_gate->experts != num_experts)
+            {
+                LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillProjectionFromPublishedRuntimePlan] "
+                          "QFN Gate/Up validation belongs to a different runtime publication");
+                return false;
+            }
+            gate_contract = published_gate->contract;
+        }
+
         const bool ok = execution.overwriteOutputThenPublish(
             execution.executesDown() ? static_cast<float *>(publication_output->gpu_data_ptr()) : nullptr,
             execution.executesDown() ? publication_output->size_bytes() : 0u,
@@ -9981,7 +10046,7 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
                     prefill_policy.imma_down_columns,
                     prefill_policy.imma_gateup_schedule,
                     device_ordinal_,
-                    producer_stream, execution);
+                    producer_stream, execution, gate_contract);
             },
             [&](const EnqueuedWorkspaceRead<float> &read)
             {
@@ -11297,6 +11362,11 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
             }
         }
 
+        // Native decode binds only the Q8 planes; floating decode still
+        // publishes the original separate FP32 gate and up operands.
+        if (!floating)
+            return true;
+
         const int max_dim = std::max(d_model, intermediate);
         std::array<float *, kRuntimePointerArrayMaxTopK> gate_ptrs = {};
         std::array<float *, kRuntimePointerArrayMaxTopK> up_ptrs = {};
@@ -11504,7 +11574,7 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
         int d_model,
         int intermediate,
         MoEDecodeDescriptorSource descriptor_source,
-        ITensor *canonical_route_contributions)
+        ITensor *canonical_route_contributions, MoEExpertRouteWeighting weighting)
     {
         if (!validMoEDecodeDescriptorSource(descriptor_source)) return false;
 
@@ -11528,7 +11598,7 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
                 ? "runtime_intermediate_shard" : moEDecodeUsesRuntimeDescriptors(descriptor_source)
                 ? "runtime"
                 : "runtime_static_table",
-            canonical_route_contributions);
+            canonical_route_contributions, weighting);
     }
 
     bool CUDAMoEKernel::groupedExpertDecodeResolved(
@@ -11545,9 +11615,15 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
         MoEDecodeDescriptorSource descriptor_source,
         bool allow_router_q8_reuse,
         const char *counter_source,
-        ITensor *canonical_route_contributions)
+        ITensor *canonical_route_contributions, MoEExpertRouteWeighting weighting)
     {
         if (!validMoEDecodeDescriptorSource(descriptor_source)) return false;
+        const bool cohort_weights = weighting == MoEExpertRouteWeighting::CompletedCohort;
+        if (weighting != MoEExpertRouteWeighting::LocalProjection &&
+            (!cohort_weights || !canonical_route_contributions || output ||
+             descriptor_source != MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable))
+            return false;
+
 
         const bool use_runtime_descriptors = moEDecodeUsesRuntimeDescriptors(descriptor_source);
 
@@ -11669,12 +11745,13 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
                           "failed to bind graph-owned runtime descriptor slots");
                 return false;
             }
-            const bool materialized = cudaMoE_materialize_runtime_selected_decode_descriptors(
+            // Selected decode rewrites these same compact descriptor slots.
+            runtime_gate_plan_.reset();
+            if (!cudaMoE_materialize_runtime_selected_decode_descriptors(
                 runtime_layer, d_expert_ids, runtime_gate_descs, runtime_up_descs,
                 runtime_down_descs, gateup_table.num_experts, top_k,
                 gateup_table.weight_format, device_ordinal_, stream,
-                moEDecodeProjectionSet(descriptor_source));
-            if (!materialized)
+                moEDecodeProjectionSet(descriptor_source)))
             {
                 LOG_ERROR("[CUDAMoEKernel::groupedExpertDecodeFromRuntime] "
                           "failed to materialize compact runtime descriptor tables");
@@ -11710,7 +11787,7 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
                 return false;
             d_hidden = static_cast<const float *>(input->gpu_data_ptr());
         }
-        if (!d_hidden || !d_prefill_gate_ || !d_prefill_up_)
+        if (!d_hidden || (floating && (!d_prefill_gate_ || !d_prefill_up_)))
             return false;
 
         ITensor *publication_output = canonical_route_contributions
@@ -11735,31 +11812,34 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
             return false;
         }
 
-        const int max_dim = std::max(d_model, intermediate);
-        std::array<float *, kRuntimePointerArrayMaxTopK> gate_ptrs = {};
-        std::array<float *, kRuntimePointerArrayMaxTopK> up_ptrs = {};
-        std::array<const float *, kRuntimePointerArrayMaxTopK> const_gate_ptrs = {};
-        std::array<const float *, kRuntimePointerArrayMaxTopK> const_up_ptrs = {};
-        for (int slot = 0; slot < top_k; ++slot)
-        {
-            gate_ptrs[slot] = d_prefill_gate_ + static_cast<size_t>(slot) * max_dim;
-            up_ptrs[slot] = d_prefill_up_ + static_cast<size_t>(slot) * intermediate;
-            const_gate_ptrs[slot] = gate_ptrs[slot];
-            const_up_ptrs[slot] = up_ptrs[slot];
-        }
-
         float **d_gate_ptrs = nullptr;
         float **d_up_ptrs = nullptr;
-        if (!ensureRuntimeGateUpPointerArrays(gateup_table.workspace_slot, RuntimePointerArrayScope::RuntimeFused,
-                                              top_k, gate_ptrs, up_ptrs,
-                                              &d_gate_ptrs, &d_up_ptrs))
-            return false;
         const float **d_down_gate_ptrs = nullptr;
         const float **d_down_up_ptrs = nullptr;
-        if (!ensureRuntimeDownPointerArrays(down_table.workspace_slot, RuntimePointerArrayScope::RuntimeFused,
-                                            top_k, const_gate_ptrs, const_up_ptrs,
-                                            &d_down_gate_ptrs, &d_down_up_ptrs))
-            return false;
+        if (floating)
+        {
+            const int max_dim = std::max(d_model, intermediate);
+            std::array<float *, kRuntimePointerArrayMaxTopK> gate_ptrs = {};
+            std::array<float *, kRuntimePointerArrayMaxTopK> up_ptrs = {};
+            std::array<const float *, kRuntimePointerArrayMaxTopK> const_gate_ptrs = {};
+            std::array<const float *, kRuntimePointerArrayMaxTopK> const_up_ptrs = {};
+            for (int slot = 0; slot < top_k; ++slot)
+            {
+                gate_ptrs[slot] = d_prefill_gate_ + static_cast<size_t>(slot) * max_dim;
+                up_ptrs[slot] = d_prefill_up_ + static_cast<size_t>(slot) * intermediate;
+                const_gate_ptrs[slot] = gate_ptrs[slot];
+                const_up_ptrs[slot] = up_ptrs[slot];
+            }
+
+            if (!ensureRuntimeGateUpPointerArrays(gateup_table.workspace_slot, RuntimePointerArrayScope::RuntimeFused,
+                                                  top_k, gate_ptrs, up_ptrs,
+                                                  &d_gate_ptrs, &d_up_ptrs))
+                return false;
+            if (!ensureRuntimeDownPointerArrays(down_table.workspace_slot, RuntimePointerArrayScope::RuntimeFused,
+                                                top_k, const_gate_ptrs, const_up_ptrs,
+                                                &d_down_gate_ptrs, &d_down_up_ptrs))
+                return false;
+        }
 
         float *d_output = canonical_route_contributions
                               ? nullptr
@@ -11806,8 +11886,8 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
                   decode_gate_descs,
                   decode_up_descs,
                   d_expert_ids,
-                  d_gate_ptrs,
-                  d_up_ptrs,
+                  nullptr,
+                  nullptr,
                   d_decode_hidden_int8_,
                   d_decode_hidden_scales_,
                   reuse_router_q8_hidden,
@@ -11820,7 +11900,8 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
                   gateup_table.codebook_id,
                   gateup_k_partitions,
                   device_ordinal_,
-                  stream);
+                  stream,
+                  {d_decode_swiglu_int8_, d_decode_swiglu_scales_});
         if (!gateup_ok)
             return false;
 
@@ -11830,7 +11911,7 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
                   d_down_up_ptrs,
                   decode_floating_down_descs,
                   d_expert_ids,
-                  d_weights,
+                  cohort_weights ? nullptr : d_weights,
                   d_output,
                   d_canonical_route_contributions,
                   top_k,
@@ -11841,11 +11922,11 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
                   device_ordinal_,
                   stream)
             : cudaMoE_grouped_swiglu_down_native_quantised_decode_table_kpart(
-                  d_down_gate_ptrs,
-                  d_down_up_ptrs,
+                  nullptr,
+                  nullptr,
                   decode_down_descs,
                   d_expert_ids,
-                  d_weights,
+                  cohort_weights ? nullptr : d_weights,
                   d_decode_swiglu_int8_,
                   d_decode_swiglu_scales_,
                   d_grouped_down_partials_,
@@ -11858,7 +11939,8 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
                   down_table.codebook_id,
                   down_k_partitions,
                   device_ordinal_,
-                  stream);
+                  stream,
+                  CUDAMoEDecodeDownInput::PublishedSwiGLU);
         if (!down_ok)
             return false;
 
@@ -11873,13 +11955,10 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
             counter_source,
             top_k, d_model, intermediate,
             floating ? "floating_fixed_tree" : "fused_block_down");
-        if (!capture_active && !floating)
-        {
-            recordFusedDecodeTimer("cuda_moe_fused_decode_hidden_quantize", top_k, d_model, intermediate);
-            recordFusedDecodeTimer("cuda_moe_fused_decode_gateup_kpart", top_k, d_model, intermediate);
-            recordFusedDecodeTimer("cuda_moe_fused_decode_swiglu_quantize", top_k, d_model, intermediate);
-            recordFusedDecodeTimer("cuda_moe_fused_decode_down_warp_reduce", top_k, d_model, intermediate);
-        }
+        if (!floating)
+            recordGroupedDecodeCounter(
+                "cuda_moe_grouped_decode_swiglu_publication_calls",
+                counter_source, top_k, d_model, intermediate, "ordered_gate_reducer");
         return true;
     }
 

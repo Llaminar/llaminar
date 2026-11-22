@@ -24,6 +24,27 @@ namespace llaminar2
         return value;
     }
 
+    /**
+     * @brief Consume a same-device early packet release and reopen the arena word.
+     * @param signal Readiness word owned by one ordered resident producer and acquire.
+     * @param value Exact value published when the canonical route data is complete.
+     * @pre The parent graph joins the acquire and full producer retirement before reuse.
+     */
+    __device__ __forceinline__ void consumeResidentPacketAcquire64(std::uint64_t* signal, std::uint64_t value)
+    {
+        constexpr std::uint64_t deadline_nanoseconds = 30'000'000'000ULL;
+        const auto start = mappedTransferNanoseconds();
+        ::cuda::atomic_ref<std::uint64_t, ::cuda::thread_scope_system> word(*signal);
+        while (word.load(::cuda::memory_order_acquire) < value)
+        {
+            if (mappedTransferNanoseconds() - start >= deadline_nanoseconds)
+                __trap();
+            __nanosleep(128u);
+        }
+        if (word.exchange(0u, ::cuda::memory_order_acq_rel) != value)
+            __trap();
+    }
+
     /** System-visible lifecycle publication ordered in the captured branch. */
     static __global__ void mappedTransferWakeStateKernel(
         std::uint64_t *wake, MappedTransferWakeState value)

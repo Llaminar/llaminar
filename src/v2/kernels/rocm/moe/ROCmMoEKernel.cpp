@@ -9451,7 +9451,7 @@ namespace llaminar2
         int d_model,
         int intermediate,
         MoEDecodeDescriptorSource descriptor_source,
-        ITensor *canonical_route_contributions)
+        ITensor *canonical_route_contributions, MoEExpertRouteWeighting weighting)
     {
         if (!validMoEDecodeDescriptorSource(descriptor_source)) return false;
 
@@ -9475,7 +9475,7 @@ namespace llaminar2
                 ? "runtime_intermediate_shard" : moEDecodeUsesRuntimeDescriptors(descriptor_source)
                 ? "runtime_compact_table"
                 : "runtime_static_table",
-            canonical_route_contributions);
+            canonical_route_contributions, weighting);
     }
 
     bool ROCmMoEKernel::groupedExpertDecodeResolved(
@@ -9492,9 +9492,15 @@ namespace llaminar2
         MoEDecodeDescriptorSource descriptor_source,
         bool allow_router_q8_reuse,
         const char *counter_source,
-        ITensor *canonical_route_contributions)
+        ITensor *canonical_route_contributions, MoEExpertRouteWeighting weighting)
     {
         if (!validMoEDecodeDescriptorSource(descriptor_source)) return false;
+        const bool cohort_weights = weighting == MoEExpertRouteWeighting::CompletedCohort;
+        if (weighting != MoEExpertRouteWeighting::LocalProjection &&
+            (!cohort_weights || !canonical_route_contributions || output ||
+             descriptor_source != MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable))
+            return false;
+
 
         const bool use_runtime_descriptors = moEDecodeUsesRuntimeDescriptors(descriptor_source);
 
@@ -9828,7 +9834,7 @@ namespace llaminar2
                   d_down_up_ptrs,
                   decode_floating_down_descs,
                   d_expert_ids,
-                  d_weights,
+                  cohort_weights ? nullptr : d_weights,
                   d_output,
                   d_canonical_route_contributions,
                   top_k,
@@ -9843,7 +9849,7 @@ namespace llaminar2
                   d_down_up_ptrs,
                   decode_down_descs,
                   d_expert_ids,
-                  d_weights,
+                  cohort_weights ? nullptr : d_weights,
                   d_grouped_swiglu_int8_,
                   d_grouped_swiglu_scales_,
                   true,

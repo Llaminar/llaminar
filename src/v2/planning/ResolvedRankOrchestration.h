@@ -46,6 +46,16 @@ namespace llaminar2
         RoutedExpertComputePolicy requested_compute = RoutedExpertComputePolicy::TensorSharded);
 
     /**
+     * @brief Resolve the original intermediate partition once for planning and runtime.
+     * @param plan Original bound expert domains and their numerical execution policies.
+     * @param model Original routed Down source formats and widths.
+     * @return Native K32 cuts for an exactly aligned CPU/GPU cohort, or the existing
+     *         device-specific tiling policy for other admitted source geometries.
+     */
+    GPUExpertIntermediateTiling selectGPUExpertIntermediateTiling(
+        const MoERoutedExpertPlacementPlan& plan, const ModelMemoryProfile& model);
+
+    /**
      * @brief Immutable topology and BOM projection of one authored local PP stage.
      *
      * The parent remains the rank's execution plan. The child rank view supplies

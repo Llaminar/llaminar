@@ -26,9 +26,9 @@ bytes requested in a cache-resident loop can exceed physical memory throughput
 many times over. Record writes, cache hits, VALU issue and occupancy as
 additional evidence for a proposed bottleneck.
 
-The [ROCm probe instructions](../rocm/roofline/README.md) give the native
-measurement commands for MI50. Run the analyzer on one evidence document
-and retain the resource-level CSV.
+Use the [ROCm probes](../rocm/roofline/README.md) on MI50 and the
+[CUDA probes](../cuda/roofline/README.md) on NVIDIA devices. Run the analyzer
+on one evidence document and retain the resource-level CSV.
 
 ```sh
 python3 tests/v2/performance/kernels/qwen4exp/verifier_roofline.py \

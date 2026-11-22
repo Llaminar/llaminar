@@ -5032,8 +5032,9 @@ __device__ __forceinline__ void moeDownOriginalWeightedFoldTask(
                 expert_sum, partials[partial_index]);
         }
     }
-    route_output[output_index] = rocm_native_quantised_weight_route_rn(
-        route_weights[route], expert_sum);
+    // Raw fragment rows are weighted by their completed continuation cohort.
+    route_output[output_index] = route_weights
+        ? rocm_native_quantised_weight_route_rn(route_weights[route], expert_sum) : expert_sum;
 }
 
 template <bool RUNTIME_TABLE>
@@ -7877,7 +7878,8 @@ bool rocmMoE_grouped_swiglu_down_native_quantised_decode_table(
     if (!stream ||
         ((!d_gate_ptrs || !d_up_ptrs) && !swiglu_prequantized) ||
         !d_desc_table ||
-        !d_expert_ids || !d_weights || !d_swiglu_int8 || !d_swiglu_scales ||
+        !d_expert_ids || (!d_weights && (!canonical_publication || completion)) ||
+        !d_swiglu_int8 || !d_swiglu_scales ||
         (completion ? (!d_output || !canonical_publication) : (static_cast<bool>(d_output) == canonical_publication)) ||
         !d_ordered_down_partials ||
         num_active <= 0 || N <= 0 || K <= 0 || num_experts <= 0 ||

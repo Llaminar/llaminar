@@ -82,10 +82,22 @@ namespace llaminar2
         const std::string &terminal,std::unique_ptr<IComputeStage> replacement,
         std::span<const LocalRegionExport> exports)
     {
+        return replaceClosedLocalRegion(region,terminal,std::move(replacement),exports,
+            LocalRegionCapturePolicy::Unannotated);
+    }
+
+    ComputeGraph &ComputeGraph::replaceClosedLocalRegion(const std::vector<std::string> &region,
+        const std::string &terminal,std::unique_ptr<IComputeStage> replacement,
+        std::span<const LocalRegionExport> exports,LocalRegionCapturePolicy capture_policy)
+    {
         const auto require=[](bool condition,const char *message) {
             if(!condition)throw std::invalid_argument(message);
         };
         const std::unordered_set<std::string> members(region.begin(),region.end());
+        const bool ticket_local=capture_policy==LocalRegionCapturePolicy::HeterogeneousTicketLocal;
+        require(capture_policy==LocalRegionCapturePolicy::Unannotated ||
+            (ticket_local && requiresHeterogeneousTicketSegmentation(nativeCaptureEnvelope())),
+            "Ticket-local fusion requires an explicit heterogeneous ticket envelope");
         auto *sink=getNode(terminal);
         require(region.size()>1 && members.size()==region.size() && members.contains(terminal) &&
             sink && sink->stage && replacement && replacement->device()==sink->device &&
@@ -121,11 +133,18 @@ namespace llaminar2
         {
             const auto *node=getNode(name);
             require(node && node->stage && node->device==sink->device &&
-                node->stage->device()==node->device && !node->stage->isCollectiveStage(),
+                node->stage->device()==node->device && !node->stage->isCollectiveStage() &&
+                !node->stage->isManualGraphBoundary(),
                 "Local region fusion cannot absorb missing stages, foreign participants or collectives");
-            require(!node->completed && !node->weights_cohered && !node->is_final_output &&
-                !node->graph_capture_wave && !node->heterogeneous_ticket_unit_contract && name!=terminal_node_,
-                "Local region fusion cannot absorb live stages or sealed capture/output metadata");
+            const auto &wave=node->graph_capture_wave;
+            const auto &unit=node->heterogeneous_ticket_unit_contract;
+            const bool retained_cutpoint=ticket_local && node==sink && unit &&
+                unit->disposition==GraphHeterogeneousTicketUnitDisposition::BeforeManualBoundary;
+            if(node->completed || node->weights_cohered || node->is_final_output ||
+                (wave && (!ticket_local || wave->participation!=GraphCaptureWaveParticipation::Active ||
+                    !wave->passive_following_identities.empty())) ||
+                (unit && !retained_cutpoint) || name==terminal_node_)
+                throw std::invalid_argument("Local region fusion cannot absorb live or sealed capture node '"+name+"'");
         }
         std::unordered_map<std::string,std::unordered_set<std::string>> published;
         for(const auto &output:exports)
@@ -140,7 +159,7 @@ namespace llaminar2
                 require(!touched(name) && reader && reader->stage &&
                     reader->device==sink->device && reader->stage->device()==sink->device &&
                     !reader->completed && !reader->weights_cohered &&
-                    !reader->graph_capture_wave && !reader->heterogeneous_ticket_unit_contract &&
+                    (ticket_local || (!reader->graph_capture_wave && !reader->heterogeneous_ticket_unit_contract)) &&
                     readers.insert(name).second &&
                     std::find(reader->dependencies.begin(),reader->dependencies.end(),output.producer)!=reader->dependencies.end(),
                     "Local region fusion export requires an exact distinct outside reader on this participant");
@@ -218,10 +237,34 @@ namespace llaminar2
         for(std::size_t i=0;i<predecessors.size();++i)if(predecessors[i]==0)ready.push_back(i);
         for(std::size_t i=0;i<ready.size();++i)
             for(const auto consumer:consumers[ready[i]])if(--predecessors[consumer]==0)ready.push_back(consumer);
-        require(ready.size()==index.size(),"Local region fusion would create a cycle through an outside consumer");
+        if(ready.size()!=index.size())
+        {
+            // The original DAG was valid. A cycle in the contraction crosses
+            // a member output and returns through an outside dependency.
+            for(const auto &dependency:dependencies)
+            {
+                std::vector<std::string> frontier{dependency};
+                std::unordered_map<std::string,std::string> reader{{dependency,{}}};
+                for(std::size_t i=0;i<frontier.size();++i)
+                {
+                    const auto name=frontier[i];
+                    if(touched(name))
+                    {
+                        auto path=name;
+                        for(auto next=reader.at(name);!next.empty();next=reader.at(next))
+                            path+=" -> "+next;
+                        throw std::invalid_argument("Local region fusion at '"+terminal+"' closes a cycle through "+path);
+                    }
+                    for(const auto &ancestor:getNode(name)->dependencies)
+                        if(reader.emplace(ancestor,name).second)frontier.push_back(ancestor);
+                }
+            }
+            throw std::logic_error("Local region fusion topology has inconsistent cycle evidence");
+        }
         // Every potentially throwing validation/allocation is complete. The
         // sink keeps its identity and outside edges while removed stages retire.
         sink->stage=std::move(replacement);
+        if(ticket_local)sink->graph_capture_wave.reset();
         sink->dependencies.swap(dependencies);
         for(auto &[node,edges]:rewritten)node->dependencies.swap(edges);
         for(auto &node:nodes_)

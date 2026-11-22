@@ -25,6 +25,10 @@
 #include "../../../execution/moe/MoEOverlayNodeLocalRankBatchTransport.h"
 #include "../../../memory/BufferId.h"
 
+#ifdef HAVE_CUDA
+#include "kernels/cuda/moe/CUDAMoEOverlayActivationPacketKernels.h"
+#endif
+
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -32,6 +36,8 @@
 
 namespace llaminar2
 {
+    class CUDAEarlyPacketPublication;
+    class CUDAResidentPacketAcquire;
     class IBackend;
     class IMoEKernel;
     class TensorBase;
@@ -83,6 +89,11 @@ namespace llaminar2
         /** @return Immutable lane, layer, and graph-family capture identity. */
         [[nodiscard]] const Params &getParams() const noexcept { return params_; }
 
+#ifdef HAVE_CUDA
+        /** @brief Bind the original CUDA router export before native capture. */
+        void bindEarlyRoutePublication(std::shared_ptr<CUDAEarlyPacketPublication> publication, const int32_t* live_rows);
+#endif
+
         /** @return Immutable original-slot, lane, role and retained-row capture identity. */
         std::uint64_t graphCaptureVariantSignature() const override;
 
@@ -125,6 +136,13 @@ namespace llaminar2
         StageDumpInfo buildDumpInfoImpl() const override;
 
     private:
+        /**
+         * @brief Record the original packet against the selected native frontier.
+         * @param ctx Original participant execution context.
+         * @param acquire Optional capture-owned acquire consumed inside the sole CUDA metadata lane.
+         * @return Whether the full original dispatch was recorded.
+         */
+        bool executePacket(IDeviceContext *ctx, const CUDAResidentPacketAcquire* acquire = nullptr);
         /** @return Whether topology and shape are valid before device allocation. */
         bool hasStaticContract() const noexcept;
         /** @return Whether every captured device pointer is final. */
@@ -134,6 +152,10 @@ namespace llaminar2
         std::unique_ptr<IMoEKernel> moe_kernel_;
         /** Setup proof that the exact capture stream joined grant creation. */
         bool grant_initialization_joined_ = false;
+#ifdef HAVE_CUDA
+        std::shared_ptr<CUDAEarlyPacketPublication> early_route_publication_;
+        std::optional<DeviceToMappedHostCopy> resident_dispatch_copy_; ///< Cold original row and mapped payload.
+#endif
     };
 
     /**
@@ -357,6 +379,11 @@ namespace llaminar2
         /** @return Immutable topology and tensor bindings used by this batch. */
         [[nodiscard]] const Params &getParams() const noexcept { return params_; }
 
+#ifdef HAVE_CUDA
+        /** @brief Bind the original CUDA router export before native capture. */
+        void bindEarlyRoutePublication(std::shared_ptr<CUDAEarlyPacketPublication> publication, const int32_t* live_rows);
+#endif
+
         /** @return Immutable original-slot, lane, role and retained-row capture identity. */
         std::uint64_t graphCaptureVariantSignature() const override;
 
@@ -399,6 +426,13 @@ namespace llaminar2
         StageDumpInfo buildDumpInfoImpl() const override;
 
     private:
+        /**
+         * @brief Record the original packet batch against the selected native frontier.
+         * @param ctx Original participant execution context.
+         * @param acquire Optional capture-owned acquire when the original batch has one CUDA lane.
+         * @return Whether the full original dispatch batch was recorded.
+         */
+        bool executePacket(IDeviceContext *ctx, const CUDAResidentPacketAcquire* acquire = nullptr);
         /** @return Whether lane topology and source tensor geometry are valid. */
         bool hasStaticContract() const noexcept;
         /** @return Whether every persistent device address is capture-ready. */
@@ -418,6 +452,10 @@ namespace llaminar2
             descriptor_storage_;
         /** Setup proof covering every main or persistent lane stream. */
         bool grant_initialization_joined_ = false;
+#ifdef HAVE_CUDA
+        std::shared_ptr<CUDAEarlyPacketPublication> early_route_publication_;
+        std::vector<cuda_moe_packet::ResidentMappedDispatch> resident_dispatch_; ///< Cold original independent lanes.
+#endif
     };
 
     /**

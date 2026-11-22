@@ -12,15 +12,20 @@
  */
 
 #include "CUDAMoEOverlayActivationPacketKernels.h"
+#include "backends/cuda/CUDAHardwareMetadata.h"
 
 #include <cuda_runtime.h>
 
 #include "../../common/MoEOverlayActivationPacketDevice.inl"
 #include "../../common/MoEOverlayNativeInvocationDevice.inl"
 #include "../../common/MoEOverlayNodeLocalRouteExchangeDevice.inl"
+#include "backends/cuda/CUDAGraphCapture.h"
+#include "backends/cuda/MappedTransferServiceDevice.cuh"
 
 #include <algorithm>
 #include <cstddef>
+#include <stdexcept>
+#include <vector>
 
 namespace
 {
@@ -92,6 +97,233 @@ namespace
         return cudaGetLastError() == cudaSuccess;
     }
 } // namespace
+
+namespace llaminar2::cuda_moe_packet
+{
+    namespace
+    {
+    using namespace moe_activation_packet_device;
+    constexpr unsigned kDispatchMetadataThreads = 32;
+    /**
+     * @brief Authenticate the original lane and publish its exact active payload predicate.
+     * @tparam AcquireInMetadata This is the unique consumer of the resident route word.
+     * @param launch Original grant, placement and packet operands.
+     * @param handle Native condition for the exact live mapped row transfer.
+     * @param ready Original same-device word when this warp owns its acquire.
+     */
+    template<bool AcquireInMetadata>
+    __global__ __launch_bounds__(32) void prepareResidentDmaMetadata(
+        const __grid_constant__ MoEOverlayActivationDispatchPackLaunch launch,
+        cudaGraphConditionalHandle handle, std::uint64_t* ready)
+    {
+        // Lane zero authenticates the acquired grant and placement. The warp
+        // then compacts one original router slot per lane in canonical order.
+        constexpr unsigned warp = 0xffffffffu;
+        const unsigned slot = threadIdx.x;
+        DispatchMetadataPreparation preparation{};
+        if (slot == 0)
+        {
+            preparation = prepareDispatchMetadata(launch);
+            if constexpr (AcquireInMetadata)
+                consumeResidentPacketAcquire64(ready, 1u);
+        }
+        // Grant/placement validation needs no router output. Finish the one
+        // acquire before any lane reads the selected route and its weight.
+        if constexpr (AcquireInMetadata)
+            __syncwarp(warp);
+        const auto placement_ptr = __shfl_sync(warp,
+            reinterpret_cast<unsigned long long>(preparation.route_participants), 0);
+        const auto* placement = reinterpret_cast<const int*>(placement_ptr);
+        const auto rows = __shfl_sync(warp, preparation.active_rows, 0);
+        if (!placement)
+        {
+            if (slot == 0)
+                cudaGraphSetConditional(handle, 0);
+            return;
+        }
+
+        int expert = -1;
+        int participant = -1;
+        float weight = 0.f;
+        const bool real = rows == 1 && slot < static_cast<unsigned>(launch.packet.top_k);
+        const bool valid = !real || decodeDispatchRoute(launch, placement, slot, &expert, &weight, &participant);
+        if (__ballot_sync(warp, !valid))
+        {
+            if (slot == 0)
+            {
+                publishFailure(launch.control, launch.grant,
+                    MoEOverlayActivationEndpoint::Continuation, MoEOverlayActivationOperation::PublishDispatch,
+                    MoEOverlayActivationStatusCode::PayloadMismatch, launch.stage_ordinal, launch.model_layer_index, 0);
+                cudaGraphSetConditional(handle, 0);
+            }
+            return;
+        }
+
+        const bool selected = real && participant == launch.target_participant_id;
+        const auto mask = __ballot_sync(warp, selected);
+        const unsigned entries = __popc(mask);
+        if (entries > launch.packet.entry_capacity)
+        {
+            if (slot == 0)
+            {
+                publishFailure(launch.control, launch.grant,
+                    MoEOverlayActivationEndpoint::Continuation, MoEOverlayActivationOperation::PublishDispatch,
+                    MoEOverlayActivationStatusCode::PayloadMismatch, launch.stage_ordinal, launch.model_layer_index, 0);
+                cudaGraphSetConditional(handle, 0);
+            }
+            return;
+        }
+
+        if (selected)
+        {
+            const auto index = __popc(mask & ((1u << slot) - 1u));
+            launch.packet.expert_ids[index] = expert;
+            launch.packet.route_weights[index] = weight;
+            launch.packet.original_route_slots[index] = static_cast<int>(slot);
+            launch.packet.compact_route_slots[index] = static_cast<int>(index);
+        }
+        __syncwarp(warp);
+        if (slot == 0)
+        {
+            launch.packet.entry_offsets[0] = 0;
+            if (entries)
+            {
+                launch.packet.entry_offsets[1] = static_cast<int>(entries);
+                launch.packet.row_ids[0] = 0;
+            }
+            finishDispatchMetadata(launch, entries != 0, entries);
+            const auto& grant = *launch.grant;
+            cudaGraphSetConditional(handle, grant.code == raw(MoEOverlayActivationStatusCode::Success) && entries != 0);
+        }
+    }
+
+    /** @brief Publish the original lease once the validated exact transfer has retired. */
+    __global__ void publishResidentDmaPacket(MoEOverlayActivationTimelinePublishDeviceBinding publication)
+    {
+        storeSystemRelease64(publication);
+    }
+
+    /**
+     * @brief Record one lane's metadata, live DMA, and ordered lease release.
+     * @tparam AcquireInMetadata Whether the metadata warp acquires the route once.
+     * @param lane Original lane and TransferEngine-bound storage.
+     * @param stream Exact captured stream with the early router dependency.
+     * @param ready Same-device release word when this warp owns the acquire.
+     * @return Whether CUDA accepted the complete publication.
+     */
+    template<bool AcquireInMetadata = false>
+    bool recordResidentDispatchLane(const ResidentMappedDispatch& lane, cudaStream_t stream,
+        std::uint64_t* ready = nullptr)
+    {
+        const auto& launch = lane.launch;
+        CUDAActiveCaptureConditional branch(stream, CUDAActiveCaptureConditionalKind::IfOnly);
+        if (!branch.publishPredicate([&](cudaGraphConditionalHandle condition) {
+                prepareResidentDmaMetadata<AcquireInMetadata><<<1, kDispatchMetadataThreads, 0, stream>>>(
+                    launch.packet, condition, ready);
+                return launchAccepted();
+            }) || !branch.beginBranches() ||
+            !branch.appendMappedHostCopy(CUDAActiveCaptureConditionalBranch::IfNonZero, lane.copy) ||
+            !branch.commit())
+            throw std::runtime_error(branch.error());
+
+        // Empty packets still publish their authenticated timeline so the CPU
+        // endpoint can retire the lease without waiting for an absent copy.
+        publishResidentDmaPacket<<<1, 1, 0, stream>>>(launch.publication);
+        return launchAccepted();
+    }
+    } // namespace
+
+    /** @copydoc prepareResidentDispatchPacket */
+    bool prepareResidentDispatchPacket(int device_ordinal)
+    {
+        const auto& hardware = cudaHardwareMetadata().at(device_ordinal);
+        int current = -1;
+        if (hardware.sm_major != 8 || hardware.sm_minor != 6 ||
+            cudaGetDevice(&current) != cudaSuccess || current != device_ordinal)
+            return false;
+
+        using Peer = ResidentDispatchPeerBudget;
+        constexpr unsigned peer_registers = Peer::blocks_per_sm * Peer::block_threads * Peer::registers_per_thread;
+        const auto fits = [&](const auto kernel) {
+            cudaFuncAttributes attributes{};
+            if (cudaFuncGetAttributes(&attributes, kernel) != cudaSuccess)
+                return false;
+            const unsigned packet_registers = (unsigned(attributes.numRegs) + 7u) / 8u * 8u;
+            // The device graph conditional API owns a linked call frame.
+            // Register, thread and shared limits determine concurrent residency.
+            return attributes.maxThreadsPerBlock >= int(kDispatchMetadataThreads) &&
+                unsigned(hardware.registers_per_sm) >= peer_registers + kDispatchMetadataThreads * packet_registers &&
+                unsigned(hardware.maximum_threads_per_sm) >= Peer::blocks_per_sm * Peer::block_threads + kDispatchMetadataThreads &&
+                unsigned(hardware.maximum_blocks_per_sm) > Peer::blocks_per_sm &&
+                hardware.shared_memory_per_sm >= Peer::blocks_per_sm * Peer::shared_bytes + attributes.sharedSizeBytes;
+        };
+        return fits(prepareResidentDmaMetadata<false>) && fits(prepareResidentDmaMetadata<true>);
+    }
+
+    /** @copydoc recordResidentDispatchPackets */
+    bool recordResidentDispatchPackets(std::span<const ResidentMappedDispatch> lanes,
+        int device_ordinal, void* stream, const CUDAResidentPacketAcquire* acquire)
+    {
+        if (lanes.empty() || (acquire && lanes.size() != 1) || stream == cudaStreamLegacy || stream == cudaStreamPerThread ||
+            !selectLaunchContext(device_ordinal, stream))
+            return false;
+        for (const auto& lane : lanes)
+        {
+            const auto& launch = lane.launch;
+            if (!launch.valid() || launch.packet.packet.top_k > int(kDispatchMetadataThreads) ||
+                launch.packet.hidden_payload_layout != MoEOverlayActivationHiddenPayloadLayout::CompactRows ||
+                lane.copy.device() != DeviceId::cuda(device_ordinal) ||
+                lane.copy.source() != launch.packet.hidden_rows_fp32 ||
+                lane.copy.mappedAlias() != launch.packet.packet.hidden_rows_fp32 ||
+                lane.copy.bytes() != std::size_t(launch.packet.packet.d_model) * sizeof(float))
+                return false;
+        }
+
+        const auto native = static_cast<cudaStream_t>(stream);
+        if (acquire)
+            return recordResidentDispatchLane<true>(lanes.front(), native, acquire->claimSignal(stream));
+        if (lanes.size() == 1)
+            return recordResidentDispatchLane(lanes.front(), native);
+
+        // All admitted lanes borrow the same router frontier. Preserve each
+        // native edge and join their individual releases without serializing
+        // the independent host packets behind one another.
+        cudaStreamCaptureStatus state{};
+        unsigned long long capture_id = 0;
+        cudaGraph_t graph = nullptr;
+        const cudaGraphNode_t* incoming = nullptr;
+        const cudaGraphEdgeData* incoming_edges = nullptr;
+        std::size_t count = 0;
+        if (cudaStreamGetCaptureInfo(native, &state, &capture_id, &graph,
+                &incoming, &incoming_edges, &count) != cudaSuccess ||
+            state != cudaStreamCaptureStatusActive || !capture_id || !graph ||
+            count == 0 || !incoming || !incoming_edges)
+            return false;
+        std::vector<cudaGraphNode_t> fork(incoming, incoming + count);
+        const std::vector<cudaGraphEdgeData> edges(incoming_edges, incoming_edges + count);
+        std::vector<cudaGraphNode_t> completions;
+        completions.reserve(lanes.size());
+        for (const auto& lane : lanes)
+        {
+            if (cudaStreamUpdateCaptureDependencies(native, fork.data(), edges.data(), fork.size(),
+                    cudaStreamSetCaptureDependencies) != cudaSuccess ||
+                !recordResidentDispatchLane(lane, native))
+                return false;
+
+            cudaGraph_t current_graph = nullptr;
+            unsigned long long current_capture = 0;
+            const cudaGraphNode_t* tail = nullptr;
+            std::size_t tail_size = 0;
+            if (cudaStreamGetCaptureInfo(native, &state, &current_capture, &current_graph,
+                    &tail, nullptr, &tail_size) != cudaSuccess || state != cudaStreamCaptureStatusActive ||
+                current_capture != capture_id || current_graph != graph || tail_size != 1 || !tail)
+                return false;
+            completions.push_back(*tail);
+        }
+        return cudaStreamUpdateCaptureDependencies(native, completions.data(), nullptr, completions.size(),
+            cudaStreamSetCaptureDependencies) == cudaSuccess;
+    }
+}
 
 extern "C" bool cudaMoEOverlayActivationPackDispatch(
     const llaminar2::MoEOverlayActivationDispatchPackLaunch *launch,

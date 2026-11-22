@@ -22,9 +22,13 @@
 #include "execution/global_pp/GlobalPPRankPlanBuilder.h"
 #include "config/OrchestrationConfigParser.h"
 #include "config/OrchestrationStartupPolicy.h"
+#include "loaders/WeightIdentity.h"
+#include "tensors/BlockStructures.h"
+#include "tensors/NativeQuantisedFormatInfo.h"
 #include "utils/DebugEnv.h"
 #include <algorithm>
 #include <functional>
+#include <numeric>
 #include <stdexcept>
 #include <string_view>
 
@@ -74,6 +78,59 @@ namespace llaminar2
         };
         return std::all_of(domain->participants.begin(), domain->participants.end(), isMeasuredMI50)
             ? Policy::QFNMI50TP4 : Policy::Generic;
+    }
+
+    namespace
+    {
+        /**
+         * @brief Prove both tiers can use identical ordered Down partitions.
+         * @param plan Original mapped expert topology.
+         * @param model Original source information, including learned predictor tensors.
+         * @return True if each source Down splits evenly into the same complete
+         *         source and activation blocks on both cohorts.
+         */
+        bool hasIdenticalNativeMixedTierCuts(
+            const MoERoutedExpertPlacementPlan& plan, const ModelMemoryProfile& model)
+        {
+            if (!hasMappedGPUCPUIntermediateShardTopology(plan))
+                return false;
+            const auto findDomain = [&](const std::string& name) {
+                return std::find_if(plan.domains.begin(), plan.domains.end(),
+                    [&](const auto& domain) { return domain.name == name; });
+            };
+            const auto gpu = findDomain(plan.continuation_domain);
+            const auto cpu = findDomain(plan.routed_tiers.back().domain);
+            const auto degree = gpu->participants.size();
+            if (degree != cpu->participants.size())
+                return false;
+
+            bool foundDown = false;
+            for (const auto& tensor : model.tensors)
+            {
+                if (inferWeightRole(tensor.name) != WeightRole::MoEExpertDown)
+                    continue;
+                foundDown = true;
+                const auto* format = native_quantised_formats::forQuantType(tensor.quant_type);
+                if (!format)
+                    return false;
+                const auto sourceBlock = format->is_superblock ? Q4_KBlock::BLOCK_SIZE : Q4_0Block::BLOCK_SIZE;
+                const auto grain = static_cast<std::size_t>(std::lcm(sourceBlock, 32));
+                if (tensor.K == 0 || tensor.K % degree != 0 || (tensor.K / degree) % grain != 0)
+                    return false;
+            }
+            return foundDown;
+        }
+    }
+
+    GPUExpertIntermediateTiling selectGPUExpertIntermediateTiling(
+        const MoERoutedExpertPlacementPlan& plan, const ModelMemoryProfile& model)
+    {
+        // Equal source-aligned cuts preserve the original partial-sum tree when
+        // an expert moves between CPU and GPU. Coarse tiles would change that tree.
+        if (hasIdenticalNativeMixedTierCuts(plan, model))
+            return GPUExpertIntermediateTiling::BalancedNativeK32;
+        return qfnGPUExpertPreferredIntermediateGrain(plan.usesQFNMI50TP4() ? 32 : 128) == 32
+            ? GPUExpertIntermediateTiling::BalancedNativeK32 : GPUExpertIntermediateTiling::Coarse128;
     }
 
     namespace
@@ -134,9 +191,7 @@ namespace llaminar2
                     if (domain.name == bound->continuation_domain)
                         domain.routed_compute_policy = Compute::TensorSharded;
             }
-            const int preferred = qfnGPUExpertPreferredIntermediateGrain(bound->usesQFNMI50TP4() ? 32 : 128);
-            bound->gpu_expert_intermediate_tiling = preferred == 32 ? GPUExpertIntermediateTiling::BalancedNativeK32
-                                                                   : GPUExpertIntermediateTiling::Coarse128;
+            bound->gpu_expert_intermediate_tiling = selectGPUExpertIntermediateTiling(*bound, model);
             requireValid(installResolvedMoEExpertOverlayPlan(config, std::move(bound), origin),
                          "Cannot install hardware-resolved ExpertOverlay topology");
         }

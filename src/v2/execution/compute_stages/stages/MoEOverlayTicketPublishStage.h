@@ -23,6 +23,7 @@
 namespace llaminar2
 {
     class TensorBase;
+    class CUDAEarlyPacketPublication;
 
     /**
      * @brief Graph-capturable publisher for a fixed-capacity overlay ticket.
@@ -84,7 +85,14 @@ namespace llaminar2
 
         const Params &params() const noexcept { return params_; }
 
+#ifdef HAVE_CUDA
+        /** @brief Bind the original CUDA router export before native capture. */
+        void bindEarlyRoutePublication(std::shared_ptr<CUDAEarlyPacketPublication> publication, const int32_t* live_rows);
+#endif
+
     private:
+        /** @brief Record the original ticket against the currently selected native frontier. */
+        bool executePacket(IDeviceContext *ctx);
         /**
          * @brief Validate immutable geometry and pinned-ticket identity only.
          *
@@ -99,6 +107,9 @@ namespace llaminar2
         bool hasFixedTicketContract() const noexcept;
 
         Params params_;
+#ifdef HAVE_CUDA
+        std::shared_ptr<CUDAEarlyPacketPublication> early_route_publication_;
+#endif
     };
 
 } // namespace llaminar2

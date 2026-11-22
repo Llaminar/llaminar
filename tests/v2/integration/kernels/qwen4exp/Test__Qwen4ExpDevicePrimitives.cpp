@@ -66,6 +66,8 @@ using namespace llaminar2::qwen4exp;
 /** @brief Production native gate kernel used only as the serial-row diagnostic oracle. */
 extern "C" bool cudaGDN_gated_rmsnorm(const float *,const float *,const float *,float *,int,int,int,int,
     float,bool,GatedNormActivation,int,void *);
+/** @brief Frozen staged CUDA branch RMSNorm and optional K32 quantization. */
+extern "C" bool testOriginalCUDABranchNorm(BranchRMSNormSingleQ8Args, void*);
 #endif
 #ifdef HAVE_ROCM
 /** @brief Production native gate kernel used only as the serial-row diagnostic oracle. */
@@ -1072,6 +1074,121 @@ void proveLookup(DeviceId device,bool adaptive=false,LookupFrontierProof frontie
     session->retire();
     session->requireExactRetired();
 }
+#ifdef HAVE_CUDA
+/**
+ * @brief Record original CUDA branch outputs, then replay each saved input through production.
+ * @param worker The exact CUDA worker for both recordings and replay.
+ * @param backend The worker's resident CUDA backend.
+ * @param device The original assigned CUDA endpoint.
+ * @param hidden Per-branch channel count.
+ * @param rows Physical request geometry captured once.
+ * @param quantize Whether the original M1 K32 producer must run as one fused node.
+ */
+void cudaBranchNormReplay(IWorkerGPUContext& worker, IBackend* backend, DeviceId device,
+                          int hidden, int rows, bool quantize)
+{
+    constexpr std::size_t guard = 16;
+    const auto elements = std::size_t(rows) * 4 * hidden;
+    const auto count = elements + 2 * guard;
+    const float poison = std::bit_cast<float>(std::uint32_t{0x4b123456});
+    const std::vector<float> dirty(count, poison);
+    const auto gain = values(std::size_t(hidden) * 4, 19);
+    Storage storage{device, backend, ExplicitGPUStream(worker.defaultStream()).get(), {}, {}};
+    auto* input = storage.allocate<float>(elements);
+    const auto* gains = storage.input(gain);
+    auto* output = storage.input(dirty);
+    auto* live = rows > 1 ? storage.input(std::vector<int>{rows}) : nullptr;
+    auto* codes = quantize ? storage.allocate<std::int8_t>(elements) : nullptr;
+    auto* scales = quantize ? storage.allocate<float>(elements / 32) : nullptr;
+    const BranchRMSNormSingleQ8Args args{
+        {{rows, live}, hidden, 1e-6f, input, gains, output + guard}, codes, scales};
+
+    /** @brief Immutable inputs and independently recorded terminal bytes for one transaction. */
+    struct RecordedBranchNorm
+    {
+        int live;
+        std::vector<float> input;
+        std::vector<float> normalized;
+        std::vector<std::int8_t> codes;
+        std::vector<float> scales;
+    };
+    const std::array history{rows, 1, std::max(rows - 1, 1), 0, rows, 1};
+    std::vector<RecordedBranchNorm> tape;
+    for (std::size_t index = 0; index < history.size(); ++index)
+    {
+        RecordedBranchNorm entry{.live = live ? history[index] : rows,
+                                  .input = std::vector<float>(elements)};
+        for (std::size_t i = 0; i < elements; ++i)
+        {
+            const auto bits = static_cast<std::uint32_t>(i * 747796405u + index * 2891336453u);
+            const auto exponent = 119u + (bits >> 24) % 17u;
+            entry.input[i] = std::bit_cast<float>((bits & 0x807fffffu) | (exponent << 23));
+        }
+        if (index == 1 && hidden > 128)
+        {
+            // Multiple payloads exercise the original ordered addition operands.
+            entry.input[0] = std::bit_cast<float>(0x7fc01234u);
+            entry.input[128] = std::bit_cast<float>(0xffc05678u);
+        }
+        if (live)
+            storage.upload(live, std::vector<int>{entry.live});
+        storage.upload(input, entry.input);
+        storage.upload(output, dirty);
+        require(testOriginalCUDABranchNorm(args, storage.stream), "CUDA original norm recording failed");
+        entry.normalized = storage.download(output, count);
+        if (quantize)
+        {
+            entry.codes = storage.download(codes, elements);
+            entry.scales = storage.download(scales, elements / 32);
+        }
+        tape.push_back(std::move(entry));
+    }
+
+    auto kernel = createCUDAQwen4ExpKernels();
+    storage.graph = worker.createGraphCapture(storage.stream);
+    require(bool(storage.graph), "CUDA branch norm graph allocation failed");
+    ScopedBackendGraphCapture recording(worker, *storage.graph, "CUDA branch norm replay");
+    require(recording.begin(), "CUDA branch norm capture failed");
+    if (quantize)
+        kernel->branchRMSNormSingleQ8(args, storage.stream);
+    else
+        kernel->branchRMSNorm(args.norm, storage.stream);
+    recording.finish();
+    std::vector<GPUGraphKernelNodeInfo> nodes;
+    std::string detail;
+    require(storage.graph->inspectKernelNodes(nodes, &detail), detail.c_str());
+    ASSERT_EQ(storage.graph->nodeCount(), 1u);
+    ASSERT_EQ(nodes.size(), 1u);
+    EXPECT_EQ(nodes[0].grid_x, static_cast<unsigned>(rows) * 4);
+    EXPECT_EQ(nodes[0].block_x, 256u);
+    EXPECT_EQ(nodes[0].local_memory_bytes_per_thread, 0u);
+    require(storage.graph->instantiate(), "CUDA branch norm graph instantiate failed");
+
+    for (const auto& entry : tape)
+    {
+        if (live)
+            storage.upload(live, std::vector<int>{entry.live});
+        storage.upload(input, entry.input);
+        storage.upload(output, dirty);
+        if (quantize)
+        {
+            storage.upload(codes, std::vector<std::int8_t>(elements, -128));
+            storage.upload(scales, std::vector<float>(elements / 32, poison));
+        }
+        require(storage.graph->launch(), "CUDA branch norm replay failed");
+        const auto result = storage.download(output, count);
+        EXPECT_EQ(std::memcmp(result.data(), entry.normalized.data(), count * sizeof(float)), 0)
+            << "hidden=" << hidden << " rows=" << rows << " live=" << entry.live;
+        if (quantize)
+        {
+            EXPECT_EQ(storage.download(codes, elements), entry.codes);
+            const auto actual = storage.download(scales, elements / 32);
+            EXPECT_EQ(std::memcmp(actual.data(), entry.scales.data(), actual.size() * sizeof(float)), 0);
+        }
+    }
+}
+#endif
+
 #ifdef HAVE_ROCM
 /** @brief Explicit fixture-only execution demand; no production dispatch policy changes. */
 enum class BranchNormRun { Functional,Paired,ProfileOriginal,ProfileProduction };
@@ -1307,6 +1424,22 @@ void proveHistoricalBranchNorm(BranchNormRun run)
 TEST(Qwen4ExpDevicePrimitives, CUDA) { prove(DeviceId::cuda(0)); }
 /** @test Backend-neutral CUDA stages retain exact streams and immutable control subviews. */
 TEST(Qwen4ExpDevicePrimitives, CUDAStages) { proveStages(DeviceId::cuda(0)); }
+/** @test Frozen normalization and Q8 outputs replay through the production CUDA graph. */
+TEST(Qwen4ExpDevicePrimitives, CUDABranchNormReplay)
+{
+    const auto device = DeviceId::cuda(0);
+    auto* backend = getBackendFor(device);
+    if (!backend || backend->deviceCount() <= device.ordinal)
+        GTEST_SKIP() << "CUDA unavailable";
+    auto& worker = GPUDeviceContextPool::instance().getContext(device);
+    worker.submitAsync([&] {
+        for (int rows : {1, 4, 6, 16})
+            cudaBranchNormReplay(worker, backend, device, 2560, rows, false);
+        cudaBranchNormReplay(worker, backend, device, 257, 1, false);
+        for (int hidden : {32, 2560})
+            cudaBranchNormReplay(worker, backend, device, hidden, 1, true);
+    }).get();
+}
 /** @test Flash Next CUDA sigmoid GDN norm is captured and grouped-byte invariant. */
 TEST(Qwen4ExpDevicePrimitives, CUDASigmoidGDN) { proveSigmoidGDN(DeviceId::cuda(0)); }
 /** @test CUDA retained storage service gathers exact IQ4_NL rows in both explicit table modes. */

@@ -97,6 +97,7 @@ namespace llaminar2
                     reinterpret_cast<const char *>(prop.uuid.data()), 16});
                 dev.pci_bus_address = prop.pci_address;
                 dev.compute_capability = prop.sm_major * 10 + prop.sm_minor;
+                dev.native_isa = "sm_" + std::to_string(dev.compute_capability);
                 dev.compute_units = prop.sm_count;
                 dev.last_level_cache_bytes = prop.last_level_cache;
                 dev.total_memory_bytes = prop.total_memory;

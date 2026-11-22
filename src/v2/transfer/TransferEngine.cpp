@@ -2874,6 +2874,37 @@ namespace llaminar2
         return recordDeviceInputFork(DeviceTransferForkSources::single(*source), device, producer_stream, event);
     }
 
+    /** @copydoc TransferEngine::prepareDeviceToMappedHostCopy */
+    DeviceToMappedHostCopy TransferEngine::prepareDeviceToMappedHostCopy(
+        ITensor& source, const MappedHostTransferRegion& region,
+        std::size_t destination_offset, std::size_t bytes, DeviceId device) const
+    {
+        auto* owner = requireTransferStorageOwner(&source, "TransferEngine::prepareDeviceToMappedHostCopy");
+        std::lock_guard lock(owner->coherence_mutex_);
+        const auto* backend = resolveBackend(device);
+        if (!device.is_gpu() || !owner->gpu_data_ptr_ || owner->gpu_device_ != device ||
+            !region.isBound() || !backend || backend != region.backendFor(device))
+            throw std::invalid_argument("Captured mapped copy requires storage on the exact registered GPU");
+        if (bytes == 0 || bytes > source.size_bytes() || !region.contains(destination_offset, bytes))
+            throw std::out_of_range("Captured mapped copy exceeds the original source or destination storage");
+        return {device, owner->gpu_data_ptr_, region.mutableHostData(destination_offset),
+            region.deviceAlias(device, destination_offset), bytes};
+    }
+
+    /** @copydoc TransferEngine::prepareDeviceToMappedHostCopy */
+    DeviceToMappedHostCopy TransferEngine::prepareDeviceToMappedHostCopy(
+        const DeviceTransferBuffer& source, const MappedHostTransferRegion& region,
+        std::size_t destination_offset, std::size_t bytes) const
+    {
+        const auto device = source.device();
+        if (!source.isBound() || !region.isBound() || source.backend_ != region.backendFor(device))
+            throw std::invalid_argument("Captured mapped copy requires storage on the exact registered GPU");
+        if (bytes == 0 || !source.contains(0, bytes) || !region.contains(destination_offset, bytes))
+            throw std::out_of_range("Captured mapped copy exceeds the original source or destination storage");
+        return {device, source.deviceData(), region.mutableHostData(destination_offset),
+            region.deviceAlias(device, destination_offset), bytes};
+    }
+
     DeviceTransferInputFork TransferEngine::recordDeviceInputFork(
         const DeviceTransferForkSources &sources, DeviceId device, void *producer_stream, void *event) const
     {

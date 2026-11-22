@@ -28,6 +28,7 @@
 
 #include "backends/detail/GPUFlatGraphInspection.h"
 #include "CUDAGraphCapture.h"
+#include "MappedTransferServiceDevice.cuh"
 #include "NvidiaDeviceContext.h"
 #include "CUDADriverApi.h"
 #include "CUDABackend.h"
@@ -35,6 +36,7 @@
 #include "../NativeParallelGraphBranch.h"
 #include "../NativeGraphDependencyReduction.h"
 #include "../../utils/Logger.h"
+#include "transfer/TransferEngine.h"
 
 #include <cuda.h>
 #include <cuda/atomic>
@@ -63,6 +65,7 @@ namespace llaminar2
         int device_ordinal = -1;
         State state = State::Open;
         std::size_t fragment_count = 0u;
+        bool requires_device_node_upload = false;
 
         /** @brief Release the definition once the last owner/view is retired. */
         ~OrderedTimelineRecording()
@@ -153,6 +156,14 @@ namespace llaminar2
                 __nanosleep(128u);
         }
 
+        /** @brief Consume a same-device release and reopen the word for the next ordered resident row. */
+        __global__ void waitResidentPacketAcquire64(std::uint64_t* signal, std::uint64_t value)
+        {
+            consumeResidentPacketAcquire64(signal, value);
+        }
+
+        enum class NativeAcquire64 { MappedPeer, ResidentPacket };
+
         /**
          * @brief Append one single-warp system-acquire wait at an exact frontier.
          * @return CUDA validation or graph construction status.
@@ -166,7 +177,7 @@ namespace llaminar2
             const cudaGraphNode_t *dependencies,
             std::size_t dependency_count,
             void *signal,
-            std::uint64_t value) noexcept
+            std::uint64_t value, NativeAcquire64 kind = NativeAcquire64::MappedPeer) noexcept
         {
             if (!node || !graph || !signal || value == 0u ||
                 (dependency_count > 0u && !dependencies) ||
@@ -176,7 +187,9 @@ namespace llaminar2
             auto *signal_argument = static_cast<std::uint64_t *>(signal);
             void *arguments[] = {&signal_argument, &value};
             cudaKernelNodeParams params{};
-            params.func = reinterpret_cast<void *>(waitSystemAcquireValue64);
+            params.func = kind == NativeAcquire64::ResidentPacket
+                ? reinterpret_cast<void *>(waitResidentPacketAcquire64)
+                : reinterpret_cast<void *>(waitSystemAcquireValue64);
             params.gridDim = dim3(1u, 1u, 1u);
             params.blockDim = dim3(1u, 1u, 1u);
             params.kernelParams = arguments;
@@ -306,6 +319,159 @@ namespace llaminar2
         return true;
     }
 
+    namespace
+    {
+        /** @brief Original full-completion edges borrowed from one active native capture. */
+        struct EarlyPacketFrontier
+        {
+            cudaGraph_t graph = nullptr;
+            unsigned long long capture_id = 0;
+            std::span<const cudaGraphNode_t> nodes;
+        };
+
+        /** @brief Validate status, stream and default memory ordering before redirecting a frontier. */
+        EarlyPacketFrontier readEarlyPacketFrontier(cudaStream_t stream)
+        {
+            if (!stream || stream == cudaStreamLegacy || stream == cudaStreamPerThread)
+                throw std::invalid_argument("CUDA early packet requires its original explicit stream");
+            cudaStreamCaptureStatus status{};
+            EarlyPacketFrontier result;
+            const cudaGraphNode_t* nodes = nullptr;
+            const cudaGraphEdgeData* edges = nullptr;
+            std::size_t count = 0;
+            if (cudaStreamGetCaptureInfo(stream, &status, &result.capture_id, &result.graph,
+                    &nodes, &edges, &count) != cudaSuccess || status != cudaStreamCaptureStatusActive ||
+                !result.graph || !result.capture_id || (count && (!nodes || !edges)))
+                throw std::logic_error("CUDA early packet lost its active native capture frontier");
+            for (std::size_t i = 0; i < count; ++i)
+            {
+                const auto& edge = edges[i];
+                if (edge.type || edge.from_port || edge.to_port ||
+                    std::any_of(std::begin(edge.reserved), std::end(edge.reserved), [](auto value) { return value != 0; }))
+                    throw std::logic_error("CUDA early packet requires full-completion native dependency edges");
+            }
+            result.nodes = std::span(nodes, count);
+            return result;
+        }
+
+        /** @brief Redirect the exact stream's next recorded operations to a checked native frontier. */
+        void setEarlyPacketFrontier(cudaStream_t stream, std::span<cudaGraphNode_t> nodes, unsigned flags)
+        {
+            const auto status = cudaStreamUpdateCaptureDependencies(stream, nodes.data(), nullptr, nodes.size(), flags);
+            if (status != cudaSuccess)
+                throw std::runtime_error(std::string("CUDA early packet frontier update failed: ") + cudaGetErrorString(status));
+        }
+    }
+
+    /** @copydoc CUDAEarlyPacketPublication::prepare */
+    void CUDAEarlyPacketPublication::prepare(void* stream, std::uint64_t* signal)
+    {
+        const auto native = static_cast<cudaStream_t>(stream);
+        cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+        if (!native || native == cudaStreamLegacy || native == cudaStreamPerThread || !signal ||
+            reinterpret_cast<std::uintptr_t>(signal) % alignof(std::uint64_t) != 0u ||
+            cudaStreamIsCapturing(native, &capture) != cudaSuccess || capture != cudaStreamCaptureStatusNone)
+            throw std::logic_error("CUDA early packet requires cold preparation of its original aligned device signal");
+        const auto reset = cudaMemsetAsync(signal, 0, sizeof(*signal), native);
+        if (reset != cudaSuccess)
+            throw std::runtime_error(std::string("CUDA early packet initialization failed: ") + cudaGetErrorString(reset));
+        stream_ = native;
+        signal_ = signal;
+        graph_ = nullptr;
+        capture_id_ = 0;
+        producer_frontier_.clear();
+        packet_frontier_.clear();
+    }
+
+    /** @copydoc CUDAEarlyPacketPublication::recordProducer */
+    void CUDAEarlyPacketPublication::recordProducer(void* stream, std::uint64_t* signal)
+    {
+        const auto native = static_cast<cudaStream_t>(stream);
+        const auto fork = readEarlyPacketFrontier(native);
+        if (!signal_ || signal != signal_ || native != stream_ || (graph_ == fork.graph && capture_id_ == fork.capture_id))
+            throw std::logic_error("CUDA early packet lost its cold-prepared signal or has multiple original producers");
+        graph_ = fork.graph;
+        capture_id_ = fork.capture_id;
+        producer_frontier_.clear();
+        if (!fork.nodes.empty())
+            producer_frontier_.assign(fork.nodes.begin(), fork.nodes.end());
+        packet_frontier_.clear();
+    }
+
+    /** @copydoc CUDAResidentPacketAcquire::claimSignal */
+    std::uint64_t* CUDAResidentPacketAcquire::claimSignal(void* stream) const
+    {
+        if (stream != stream_ || claimed_)
+            throw std::logic_error("CUDA resident packet acquire requires exactly one owner on its original capture stream");
+        claimed_ = true;
+        return signal_;
+    }
+
+    /** @copydoc CUDAEarlyPacketPublication::recordConsumer */
+    bool CUDAEarlyPacketPublication::recordConsumer(void* stream, const std::function<bool()>& record)
+    {
+        if (!record)
+            throw std::invalid_argument("CUDA early packet requires its original consumer recorder");
+        return recordPacketConsumer(stream, false, [&](const auto*) { return record(); });
+    }
+
+    /** @copydoc CUDAEarlyPacketPublication::recordDispatchConsumer */
+    bool CUDAEarlyPacketPublication::recordDispatchConsumer(void* stream, std::size_t lane_count,
+        const std::function<bool(const CUDAResidentPacketAcquire*)>& record)
+    {
+        if (lane_count == 0)
+            throw std::invalid_argument("CUDA early packet dispatch requires a prepared lane");
+        return recordPacketConsumer(stream, lane_count == 1, record);
+    }
+
+    /** @copydoc CUDAEarlyPacketPublication::recordPacketConsumer */
+    bool CUDAEarlyPacketPublication::recordPacketConsumer(void* stream, bool inline_acquire,
+        const std::function<bool(const CUDAResidentPacketAcquire*)>& record)
+    {
+        const auto native = static_cast<cudaStream_t>(stream);
+        const auto primary = readEarlyPacketFrontier(native);
+        if (!record || native != stream_ || primary.graph != graph_ || primary.capture_id != capture_id_ ||
+            primary.nodes.empty() || !signal_)
+            throw std::logic_error("CUDA early packet consumer crossed its original producer's native capture unit");
+        std::vector<cudaGraphNode_t> join(primary.nodes.begin(), primary.nodes.end());
+        const bool first_consumer = packet_frontier_.empty();
+        const bool dispatch_acquires = first_consumer && inline_acquire;
+        if (first_consumer && !dispatch_acquires)
+        {
+            // Keep the exact producer dependency, but append the acquire after the
+            // arithmetic entry has been recorded. CUDA uses node insertion
+            // order as a scheduling hint within a native graph.
+            cudaGraphNode_t acquire = nullptr;
+            const auto added = addSystemWaitValue64Node(&acquire, graph_, producer_frontier_.data(),
+                producer_frontier_.size(), signal_, 1u, NativeAcquire64::ResidentPacket);
+            if (added != cudaSuccess || !acquire)
+                throw std::runtime_error(std::string("CUDA early packet acquire failed: ") + cudaGetErrorString(added));
+            packet_frontier_.assign(1u, acquire);
+        }
+        std::erase_if(join, [&](const auto node) {
+            return std::find(packet_frontier_.begin(), packet_frontier_.end(), node) != packet_frontier_.end();
+        });
+        if (join.empty())
+            throw std::logic_error("CUDA early packet consumer lost the independent producer completion");
+        // A single metadata warp may authenticate its packet before the
+        // router releases this row. Multiple lanes and other consumers
+        // share one acquire node before they can read the canonical routes.
+        auto& fork = dispatch_acquires ? producer_frontier_ : packet_frontier_;
+        setEarlyPacketFrontier(native, fork, cudaStreamSetCaptureDependencies);
+        const CUDAResidentPacketAcquire acquire(native, signal_);
+        if (!record(dispatch_acquires ? &acquire : nullptr))
+            return false;
+        if (dispatch_acquires && !acquire.claimed_)
+            throw std::logic_error("CUDA resident packet dispatch did not consume its readiness binding");
+        const auto packet = readEarlyPacketFrontier(native);
+        if (packet.graph != graph_ || packet.capture_id != capture_id_ || packet.nodes.empty() ||
+            std::equal(packet.nodes.begin(), packet.nodes.end(), fork.begin(), fork.end()))
+            throw std::logic_error("CUDA early packet consumer did not record a new native completion");
+        packet_frontier_.assign(packet.nodes.begin(), packet.nodes.end());
+        setEarlyPacketFrontier(native, join, cudaStreamAddCaptureDependencies);
+        return true;
+    }
+
     bool appendCUDAActiveCaptureTimelinePublish64(
         cudaStream_t stream,
         void *signal,
@@ -377,6 +543,123 @@ namespace llaminar2
     }
 
 #if CUDART_VERSION >= 12030
+    namespace
+    {
+        // The retained capture controller records synchronously on one worker.
+        // Keep this borrowed identity within its lexical recording scope.
+        thread_local const CUDAGraphCapture *final_timeline_capture = nullptr;
+    }
+
+    ScopedCUDAFinalTimelineRecording::ScopedCUDAFinalTimelineRecording(
+        const IGPUGraphCapture &capture) noexcept
+        : previous_(final_timeline_capture)
+    {
+        const auto *native = dynamic_cast<const CUDAGraphCapture *>(&capture);
+        final_timeline_capture =
+            native && native->native_capture_active_ &&
+                native->recording_role_ == CUDAGraphCapture::RecordingRole::Fragment &&
+                native->fragment_state_ == CUDAGraphCapture::FragmentState::Recording
+            ? native : nullptr;
+    }
+
+    ScopedCUDAFinalTimelineRecording::~ScopedCUDAFinalTimelineRecording()
+    {
+        final_timeline_capture = previous_;
+    }
+
+    bool ScopedCUDAFinalTimelineRecording::admitsConditionalOn(cudaStream_t stream) noexcept
+    {
+        return final_timeline_capture && final_timeline_capture->native_capture_active_ &&
+            final_timeline_capture->stream_ == stream;
+    }
+
+#if CUDART_VERSION >= 12080
+    /** @copydoc ScopedCUDAFinalTimelineRecording::requireDeviceGridOn */
+    cudaGraph_t ScopedCUDAFinalTimelineRecording::requireDeviceGridOn(cudaStream_t stream)
+    {
+        if (!stream || stream == cudaStreamLegacy || stream == cudaStreamPerThread ||
+            !admitsConditionalOn(stream) || !final_timeline_capture->timeline_recording_ ||
+            final_timeline_capture->timeline_recording_->state !=
+                CUDAGraphCapture::OrderedTimelineRecording::State::Recording)
+            throw std::logic_error("Device-sized CUDA work requires its exact final timeline recording");
+        auto& recording = *final_timeline_capture->timeline_recording_;
+        recording.requires_device_node_upload = true;
+        return recording.graph;
+    }
+
+    /** @copydoc appendCUDADeviceSizedKernels */
+    void appendCUDADeviceSizedKernels(cudaStream_t stream,
+        std::span<const cudaKernelNodeParams> launches,
+        const std::function<bool(std::span<const cudaGraphDeviceNode_t>)>& publish)
+    {
+        if (launches.empty() || !publish ||
+            std::any_of(launches.begin(), launches.end(), [](const auto& launch) { return !launch.func; }))
+            throw std::invalid_argument("Device-sized CUDA work requires ordered native arithmetic and a plan publisher");
+        const auto graph = ScopedCUDAFinalTimelineRecording::requireDeviceGridOn(stream);
+        const auto require = [](cudaError_t status, const char* operation) {
+            if (status != cudaSuccess)
+                throw std::runtime_error(std::string(operation) + ": " + cudaGetErrorString(status));
+        };
+        cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+        unsigned long long capture = 0;
+        cudaGraph_t observed = nullptr;
+        const cudaGraphNode_t* frontier = nullptr;
+        const cudaGraphEdgeData* edges = nullptr;
+        std::size_t count = 0;
+        require(cudaStreamGetCaptureInfo(stream, &status, &capture, &observed, &frontier, &edges, &count),
+            "read device-sized CUDA capture frontier");
+        if (status != cudaStreamCaptureStatusActive || observed != graph || (count && (!frontier || !edges)))
+            throw std::logic_error("Device-sized CUDA arithmetic lost its original native capture");
+        std::vector<cudaGraphNode_t> incoming;
+        if (count)
+            incoming.assign(frontier, frontier + count);
+        std::vector<cudaGraphNode_t> nodes;
+        std::vector<cudaGraphDeviceNode_t> handles;
+        nodes.reserve(launches.size());
+        handles.reserve(launches.size());
+        for (const auto& launch : launches)
+        {
+            cudaGraphNode_t node = nullptr;
+            require(cudaGraphAddKernelNode(&node, graph, nullptr, 0, &launch), "append device-sized CUDA arithmetic");
+            cudaKernelNodeAttrValue attribute{};
+            attribute.deviceUpdatableKernelNode.deviceUpdatable = 1;
+            require(cudaGraphKernelNodeSetAttribute(node, cudaKernelNodeAttributeDeviceUpdatableKernelNode, &attribute),
+                "mark device-sized CUDA arithmetic");
+            require(cudaGraphKernelNodeGetAttribute(node, cudaKernelNodeAttributeDeviceUpdatableKernelNode, &attribute),
+                "borrow device-sized CUDA arithmetic handle");
+            if (!attribute.deviceUpdatableKernelNode.devNode)
+                throw std::logic_error("CUDA device-sized arithmetic did not publish its device node handle");
+            nodes.push_back(node);
+            handles.push_back(attribute.deviceUpdatableKernelNode.devNode);
+        }
+
+        if (!publish(handles))
+            throw std::runtime_error("Device-sized CUDA plan publisher did not record successfully");
+        unsigned long long current_capture = 0;
+        require(cudaStreamGetCaptureInfo(stream, &status, &current_capture, &observed, &frontier, &edges, &count),
+            "read device-sized CUDA plan completion");
+        if (status != cudaStreamCaptureStatusActive || current_capture != capture || observed != graph ||
+            !count || !frontier || !edges || std::equal(incoming.begin(), incoming.end(), frontier, frontier + count))
+            throw std::logic_error("Device-sized CUDA plan publisher did not produce an original completion frontier");
+        // Full-memory ordering is required because the publisher authors the
+        // arithmetic grid as well as every packed descriptor and live count.
+        for (std::size_t i = 0; i < count; ++i)
+        {
+            const auto& edge = edges[i];
+            if (edge.from_port || edge.to_port || edge.type ||
+                std::any_of(std::begin(edge.reserved), std::end(edge.reserved), [](auto byte) { return byte != 0; }))
+                throw std::logic_error("Device-sized CUDA work requires the plan's full-completion edge");
+            require(cudaGraphAddDependencies(graph, frontier + i, nodes.data(), nullptr, 1),
+                "order device-sized CUDA arithmetic after plan");
+        }
+        for (std::size_t i = 1; i < nodes.size(); ++i)
+            require(cudaGraphAddDependencies(graph, &nodes[i - 1], &nodes[i], nullptr, 1),
+                "order device-sized CUDA arithmetic phases");
+        require(cudaStreamUpdateCaptureDependencies(stream, &nodes.back(), nullptr, 1, cudaStreamSetCaptureDependencies),
+            "publish device-sized CUDA completion frontier");
+    }
+#endif
+
     CUDAActiveCaptureConditional::CUDAActiveCaptureConditional(
         cudaStream_t stream,
         CUDAActiveCaptureConditionalKind kind)
@@ -658,6 +941,15 @@ namespace llaminar2
         const cudaKernelNodeParams &params,
         const char *semantic_name)
     {
+        return appendKernel(branch, params, semantic_name, CUDACapturedKernelGrid::Ordinary);
+    }
+
+    bool CUDAActiveCaptureConditional::appendKernel(
+        CUDAActiveCaptureConditionalBranch branch,
+        const cudaKernelNodeParams &params,
+        const char *semantic_name,
+        CUDACapturedKernelGrid grid)
+    {
         const std::size_t index = branchIndex(branch);
         if (state_ != State::BuildingBranches || index >= branch_graphs_.size() ||
             (branch == CUDAActiveCaptureConditionalBranch::ElseZero &&
@@ -665,6 +957,7 @@ namespace llaminar2
             return fail(
                 "CUDA active-capture conditional branch kernel was appended out of lifecycle order");
         if (!semantic_name || semantic_name[0] == '\0' || !branch_graphs_[index] ||
+            (grid != CUDACapturedKernelGrid::Ordinary && grid != CUDACapturedKernelGrid::Cooperative) ||
             !params.func || params.gridDim.x == 0 || params.gridDim.y == 0 ||
             params.gridDim.z == 0 || params.blockDim.x == 0 ||
             params.blockDim.y == 0 || params.blockDim.z == 0 ||
@@ -688,7 +981,44 @@ namespace llaminar2
                 std::string("cudaGraphAddKernelNode(active branch '") +
                 semantic_name + "'): " + cudaGetErrorString(status));
         }
+        if (grid == CUDACapturedKernelGrid::Cooperative)
+        {
+            cudaKernelNodeAttrValue attribute{};
+            attribute.cooperative = 1;
+            const auto result = cudaGraphKernelNodeSetAttribute(node, cudaKernelNodeAttributeCooperative, &attribute);
+            if (result != cudaSuccess)
+                return fail("cudaGraphKernelNodeSetAttribute(cooperative conditional kernel)", result);
+        }
         branch_tails_[index] = node;
+        ++branch_node_counts_[index];
+        return true;
+    }
+
+    /** @copydoc CUDAActiveCaptureConditional::appendMappedHostCopy */
+    bool CUDAActiveCaptureConditional::appendMappedHostCopy(
+        CUDAActiveCaptureConditionalBranch branch, const DeviceToMappedHostCopy &copy)
+    {
+        const auto index = branchIndex(branch);
+        if (state_ != State::BuildingBranches || index >= branch_graphs_.size() ||
+            !branch_graphs_[index] || branch != CUDAActiveCaptureConditionalBranch::IfNonZero)
+            return fail("CUDA mapped host copy requires an active positive conditional body");
+
+        int ordinal = -1;
+        // The active capture already authenticates its exact stream and parent.
+        // CUDA forbids stream-device queries during capture.
+        const auto device_status = cudaGetDevice(&ordinal);
+        if (device_status != cudaSuccess)
+            return fail("cudaGetDevice(active mapped host copy)", device_status);
+        if (copy.device() != DeviceId::cuda(ordinal))
+            return fail("CUDA mapped host copy belongs to a different device");
+
+        const auto dependency = branch_tails_[index];
+        auto& tail = branch_tails_[index];
+        const auto status = cudaGraphAddMemcpyNode1D(&tail, branch_graphs_[index],
+            dependency ? &dependency : nullptr, dependency ? 1u : 0u,
+            copy.destination(), copy.source(), copy.bytes(), cudaMemcpyDeviceToHost);
+        if (status != cudaSuccess)
+            return fail("cudaGraphAddMemcpyNode1D(active mapped host copy)", status);
         ++branch_node_counts_[index];
         return true;
     }
@@ -2312,6 +2642,18 @@ namespace llaminar2
                       << " detail='" << instantiate_log.data() << "'");
             exec_ = nullptr;
             return false;
+        }
+        if (timeline_recording_ && timeline_recording_->requires_device_node_upload)
+        {
+            err = cudaGraphUpload(exec_, stream_);
+            if (err != cudaSuccess)
+            {
+                LOG_ERROR("[CUDAGraphCapture] Cannot upload the device-updatable timeline: " << cudaGetErrorString(err));
+                if (cudaGraphExecDestroy(exec_) != cudaSuccess)
+                    std::terminate();
+                exec_ = nullptr;
+                return false;
+            }
         }
         std::size_t free_bytes_after = 0u;
         std::size_t total_bytes_after = 0u;

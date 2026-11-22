@@ -1530,7 +1530,9 @@ namespace llaminar2
          * sequence. When @p canonical_route_contributions is supplied, it is
          * the sole publication target; @p output belongs to the later
          * canonical reducer and may be absent. A declared dual-publication
-         * policy requires both destinations. The
+         * policy requires both destinations. When an intermediate-shard
+         * cohort owns the router multiply, each participant publishes raw
+         * expert rows and the cohort applies the original factors once. The
          * default returns false so existing backends keep the established
          * gate/up plus down path.
          */
@@ -1545,7 +1547,8 @@ namespace llaminar2
             int intermediate,
             MoEDecodeDescriptorSource descriptor_source =
                 MoEDecodeDescriptorSource::RuntimePlacementTable,
-            ITensor *canonical_route_contributions = nullptr)
+            ITensor *canonical_route_contributions = nullptr,
+            MoEExpertRouteWeighting weighting = MoEExpertRouteWeighting::LocalProjection)
         {
             (void)runtime_layer;
             (void)input;
@@ -1557,6 +1560,7 @@ namespace llaminar2
             (void)intermediate;
             (void)descriptor_source;
             (void)canonical_route_contributions;
+            (void)weighting;
             return false;
         }
 

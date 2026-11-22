@@ -670,7 +670,8 @@ namespace llaminar2
             int intermediate,
             MoEDecodeDescriptorSource descriptor_source =
                 MoEDecodeDescriptorSource::RuntimePlacementTable,
-            ITensor *canonical_route_contributions = nullptr) override;
+            ITensor *canonical_route_contributions = nullptr,
+            MoEExpertRouteWeighting weighting = MoEExpertRouteWeighting::LocalProjection) override;
 
         /**
          * @brief Execute fused workspace-native decode from device routing tensors.
@@ -1240,7 +1241,8 @@ namespace llaminar2
             MoEDecodeDescriptorSource descriptor_source,
             bool allow_router_q8_reuse,
             const char *counter_source,
-            ITensor *canonical_route_contributions);
+            ITensor *canonical_route_contributions,
+            MoEExpertRouteWeighting weighting = MoEExpertRouteWeighting::LocalProjection);
 
         static constexpr std::size_t kRuntimePointerArrayMaxTopK = 16;
         static constexpr std::size_t kRuntimePointerArrayTableSlots = 1024;

@@ -22238,12 +22238,11 @@ void rocm_grouped_floating_swiglu_down_decode_kernel(
         }
         if (threadIdx.x == 0)
         {
-            output_sum = rocm_native_quantised_accumulate_rn(
-                output_sum,
-                ready
-                    ? rocm_native_quantised_weight_route_rn(
-                          route_weights[route], sums[0])
-                    : 0.0f);
+            const float projected = ready ? sums[0] : 0.0f;
+            output_sum = route_weights
+                ? rocm_native_quantised_accumulate_rn(output_sum, ready
+                    ? rocm_native_quantised_weight_route_rn(route_weights[route], projected) : 0.0f)
+                : projected;
         }
         __syncthreads();
     }
@@ -22402,8 +22401,10 @@ void rocm_grouped_floating_down_prefill_kernel(
         }
         const float sum = warp::reduce(sums);
         if (lane == 0)
-            output_sum = rocm_native_quantised_accumulate_rn(output_sum,
-                rocm_native_quantised_weight_route_rn(grouped_weights[grouped_slot], sum));
+            output_sum = grouped_weights
+                ? rocm_native_quantised_accumulate_rn(output_sum,
+                    rocm_native_quantised_weight_route_rn(grouped_weights[grouped_slot], sum))
+                : sum;
     }
     if (lane == 0)
     {
@@ -23834,7 +23835,7 @@ __attribute__((visibility("default"))) bool rocmMoE_grouped_swiglu_down_floating
     void *stream)
 {
     if (!gate_rows || !up_rows || !down_descs || !expert_ids ||
-        !route_weights || (!output && !canonical_routes) ||
+        (!route_weights && (output || !canonical_routes)) || (!output && !canonical_routes) ||
         num_active <= 0 || d_model <= 0 || intermediate <= 0 ||
         num_experts <= 0 ||
         !llaminar2::deviceMoEWeightFormatIsFloating(format) || !stream)
@@ -23905,6 +23906,10 @@ __attribute__((visibility("default"))) bool rocmMoE_grouped_floating_prefill_pip
     void *stream,
     const llaminar2::MoEPrefillProjectionExecution &execution)
 {
+    const bool raw_cohort =
+        execution.routeWeighting() == llaminar2::MoEExpertRouteWeighting::CompletedCohort;
+    if (raw_cohort && (output || !canonical_routes))
+        return false;
     if ((execution.executesGateUp() && (!hidden || !gate_descs || !up_descs)) ||
         (execution.executesDown() && (!down_descs || !grouped_weights ||
             (!output && !canonical_routes))) ||
@@ -23968,7 +23973,7 @@ __attribute__((visibility("default"))) bool rocmMoE_grouped_floating_prefill_pip
         down_descs,
         original_to_grouped,
         original_expert_ids,
-        grouped_weights,
+        raw_cohort ? nullptr : grouped_weights,
         output,
         canonical_routes,
         seq_len,

@@ -9,11 +9,12 @@
 namespace
 {
 /**
- * @brief Select the best observed local MI50 TP2 pair across original owners.
+ * @brief Select the best observed rank-local TP2 pair for the requested backend.
  * @param inventory Immutable two-rank hardware/PCI and directed peer observations.
+ * @param backend Requested native CUDA backend or the qualified MI50 ROCm geometry.
  * @return Original owning rank and pair, preferring mutual P2P and nearest common switch.
  */
-std::optional<ObservedNativeReplayOwner> bestOriginalMI50Pair(const ClusterInventory& inventory)
+std::optional<ObservedNativeReplayOwner> bestOriginalMixedReplayPair(const ClusterInventory& inventory, DeviceType backend)
 {
     std::optional<ObservedNativeReplayOwner> selected;
     ObservedPeerGroupQuality best;
@@ -21,9 +22,11 @@ std::optional<ObservedNativeReplayOwner> bestOriginalMI50Pair(const ClusterInven
     {
         std::vector<DeviceId> eligible;
         for (const auto& gpu : rank.gpus)
-            if (gpu.type == DeviceType::ROCm && rankOwnsGPUDevice(rank, gpu) &&
-                std::string_view(gpu.native_isa).substr(0, gpu.native_isa.find(':')) == "gfx906")
-                eligible.push_back(DeviceId::rocm(gpu.local_device_id));
+            if (gpu.type == backend && rankOwnsGPUDevice(rank, gpu) &&
+                (backend == DeviceType::CUDA ||
+                 std::string_view(gpu.native_isa).substr(0, gpu.native_isa.find(':')) == "gfx906"))
+                eligible.push_back(backend == DeviceType::CUDA
+                    ? DeviceId::cuda(gpu.local_device_id) : DeviceId::rocm(gpu.local_device_id));
 
         if (eligible.size() < 2)
             continue;
@@ -41,7 +44,7 @@ std::optional<ObservedNativeReplayOwner> bestOriginalMI50Pair(const ClusterInven
 }
 
 /**
- * @brief Bind the canonical two-socket QFN source to the observed local MI50 pair.
+ * @brief Bind the canonical two-socket QFN source to the observed native GPU pair.
  * @param inventory Original MPI hardware inventory in world-rank order.
  * @param gpu_owner Original rank and ordered devices selected from that inventory.
  * @return Public paired-source configuration with both complete shard tiers.
@@ -54,15 +57,16 @@ OrchestrationConfig mixedTensorShardedFixed3Config(
     auto& gpu = placement->domains.front();
     auto& cpu = placement->domains.back();
     gpu.scope = ExecutionDomainScope::RANK_LOCAL;
-    gpu.backend = CollectiveBackendType::RCCL;
+    gpu.backend = gpu_owner.devices.front().is_cuda() ? CollectiveBackendType::NCCL : CollectiveBackendType::RCCL;
     gpu.owner_rank = gpu_owner.discovery_owner;
     gpu.world_ranks.clear();
     gpu.participants.clear();
     seed.topology.participants.clear();
     for (const auto device : gpu_owner.devices)
     {
-        const auto address = GlobalDeviceAddress::rocm(device.ordinal,
-            inventory.ranks.at(gpu.owner_rank).cpu.numa_node);
+        const int numa = inventory.ranks.at(gpu.owner_rank).cpu.numa_node;
+        const auto address = device.is_cuda() ? GlobalDeviceAddress::cuda(device.ordinal, numa)
+                                              : GlobalDeviceAddress::rocm(device.ordinal, numa);
         gpu.participants.push_back(address);
         seed.topology.participants.push_back({address, gpu.owner_rank});
     }
@@ -96,7 +100,7 @@ OrchestrationConfig mixedTensorShardedFixed3Config(
 /**
  * @brief Verify every current expert is resident in one complete cohort with its real two members.
  * @param snapshot Immutable original residency publication.
- * @param gpu_owner Original rank-local MI50 cohort selected from MPI discovery.
+ * @param gpu_owner Original rank-local GPU cohort selected from MPI discovery.
  */
 void expectCompleteMixedTensorShards(const MoEOverlayResidencySnapshot& snapshot,
     const ObservedNativeReplayOwner& gpu_owner)
@@ -144,7 +148,7 @@ void expectCompleteMixedTensorShards(const MoEOverlayResidencySnapshot& snapshot
 /**
  * @brief Exercise requests until the real maintenance owner accepts both directions, then prove post-swap replay.
  * @param runner Original coordinated inference root.
- * @param gpu_owner Original admitted rank-local MI50 cohort.
+ * @param gpu_owner Original admitted rank-local GPU cohort.
  */
 void proveMixedTensorShardedMovement(OrchestrationRunner& runner, const ObservedNativeReplayOwner& gpu_owner)
 {
@@ -160,6 +164,40 @@ void proveMixedTensorShardedMovement(OrchestrationRunner& runner, const Observed
     std::vector<int32_t> prompt(64);
     for (std::size_t i = 0; i < prompt.size(); ++i)
         prompt[i] = static_cast<int32_t>(100 + i);
+    // Use the production benchmark prompt that previously exposed the first
+    // resident-tier discrepancy. Authenticated tokenization stays with QFN.
+    const auto replay_prompt = runner.tokenizer()->encode(
+        resolveBenchmarkPrompt(OrchestrationConfig{}).text, false, false);
+    ASSERT_GT(replay_prompt.size(), 512u);
+    const SamplingParams greedy{.temperature = 0.0f, .top_k = 1, .top_p = 1.0f, .seed = 42u};
+    const auto active_policy = runner.mtpRequestPolicy();
+    ASSERT_TRUE(active_policy.enabled);
+    auto ordinary_policy = active_policy;
+    ordinary_policy.enabled = false;
+    constexpr int replay_tokens = 64;
+    std::vector<int32_t> before_movement;
+    const auto initial_pin = runner.withMoEOverlayInferencePlacementScope([&] {
+        runner.clearCache();
+        ASSERT_TRUE(runner.configureMTPRequestPolicy(ordinary_policy)) << runner.lastError();
+        const auto result = runner.generate(replay_prompt, replay_tokens, greedy);
+        ASSERT_TRUE(result.success()) << result.error;
+        ASSERT_EQ(result.tokenCount(), static_cast<std::size_t>(replay_tokens));
+        before_movement = result.tokens;
+        runner.clearCache();
+        ASSERT_TRUE(runner.configureMTPRequestPolicy(active_policy)) << runner.lastError();
+    });
+    ASSERT_EQ(initial_pin.placement_epoch, initial->epoch);
+    ASSERT_EQ(before_movement.size(), static_cast<std::size_t>(replay_tokens));
+    if (gpu_owner.devices.front().is_cuda())
+    {
+        const auto fused = PerfStatsCollector::snapshot({"kernel.cuda_moe_grouped_decode_swiglu_publication_calls"});
+        ASSERT_TRUE(std::any_of(fused.begin(), fused.end(), [](const auto &record) {
+            const auto source = record.tags.find("source");
+            return record.name == "cuda_moe_grouped_decode_swiglu_publication_calls" &&
+                   source != record.tags.end() && source->second == "runtime_intermediate_shard" &&
+                   record.count > 0;
+        })) << "CUDA ordinary decode must publish native SwiGLU from the ordered Gate/Up reducer";
+    }
     // Close real routed-demand windows without injecting a histogram or
     // commanding a swap. Vary the leading token between warm-up requests.
     for (int request = 0; request < 16; ++request)
@@ -227,14 +265,24 @@ void proveMixedTensorShardedMovement(OrchestrationRunner& runner, const Observed
                 EXPECT_EQ(result.tokens, expected);
         }
         ASSERT_NO_FATAL_FAILURE(expectQFNGroupedGreedyMatchesOrdinary(runner, prompt));
+        for (const auto& policy : {ordinary_policy, active_policy})
+        {
+            runner.clearCache();
+            ASSERT_TRUE(runner.configureMTPRequestPolicy(policy)) << runner.lastError();
+            const auto result = runner.generate(replay_prompt, replay_tokens, greedy);
+            ASSERT_TRUE(result.success()) << result.error;
+            EXPECT_EQ(result.tokens, before_movement) << "grouped MTP=" << policy.enabled;
+        }
     });
     EXPECT_GE(pinned.placement_epoch, published->epoch);
     EXPECT_GT(pinned.next_sequence_id, pinned.first_sequence_id);
 }
 }
 
-/** @test Real mixed-cohort Dynamic movement publishes and feeds a retained grouped verifier. */
-TEST(Qwen4ExpMixedTensorShardedTP2, DynamicResidencyPublishesCompleteCohortSwapBeforeGroupedReplay)
+namespace
+{
+/** @brief Compare generation across a published swap on the original native cohort. */
+void runMixedTensorShardedMovementReplay(DeviceType backend)
 {
     const auto mpi = MPIContextFactory::global();
     ASSERT_TRUE(mpi);
@@ -253,7 +301,7 @@ TEST(Qwen4ExpMixedTensorShardedTP2, DynamicResidencyPublishesCompleteCohortSwapB
         packages[rank] = socket->socket_id;
     }
     ASSERT_NE(packages.front(), packages.back());
-    const auto gpu_owner = bestOriginalMI50Pair(*inventory);
+    const auto gpu_owner = bestOriginalMixedReplayPair(*inventory, backend);
     ASSERT_TRUE(gpu_owner);
     const QFNDynamicReplayScratch scratch;
     ASSERT_FALSE(scratch.path().empty());
@@ -297,3 +345,20 @@ TEST(Qwen4ExpMixedTensorShardedTP2, DynamicResidencyPublishesCompleteCohortSwapB
     EXPECT_EQ(lifetime.retiredDeviceCount(),
         mpi->rank() == gpu_owner->discovery_owner ? gpu_owner->devices.size() : 0u);
 }
+} // namespace
+
+#ifdef HAVE_ROCM
+/** @test Real mixed-cohort movement preserves inference over original ROCm participants. */
+TEST(Qwen4ExpMixedTensorShardedTP2, DynamicResidencyPublishesCompleteCohortSwapBeforeGroupedReplay)
+{
+    runMixedTensorShardedMovementReplay(DeviceType::ROCm);
+}
+#endif
+
+#ifdef HAVE_CUDA
+/** @test Preserve ordinary and grouped QFN histories through a CUDA/CPU expert swap. */
+TEST(Qwen4ExpMixedTensorShardedTP2, CUDACPUCohortMovementPreservesGeneratedTokens)
+{
+    runMixedTensorShardedMovementReplay(DeviceType::CUDA);
+}
+#endif

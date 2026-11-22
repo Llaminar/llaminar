@@ -21,8 +21,8 @@
 #include "execution/moe/MoEOverlaySparseCollective.h"
 #include "execution/moe/MoEOverlayNodeLocalRouteExchange.h"
 #include "OriginalMappedComponentResources.h"
-#include "kernels/cuda/moe/CUDAMoEKernel.h"
-#include "kernels/rocm/moe/ROCmMoEKernel.h"
+#include "kernels/KernelFactory.h"
+#include "kernels/common/DeviceFP32NumericalContract.h"
 #include "transfer/TransferEngine.h"
 
 #include <algorithm>
@@ -80,11 +80,7 @@ namespace
     /** @return Production MoE kernel selected solely from endpoint device type. */
     std::unique_ptr<IMoEKernel> kernelFor(DeviceId device)
     {
-        if (device.is_cuda())
-            return std::make_unique<CUDAMoEKernel>(device.ordinal);
-        if (device.is_rocm())
-            return std::make_unique<ROCmMoEKernel>(device.ordinal);
-        return nullptr;
+        return llaminar::v2::kernels::KernelFactory::createMoEKernel(device);
     }
 
     /** @brief One raw allocation tracked with its exact backend owner. */
@@ -425,17 +421,7 @@ namespace
         ASSERT_TRUE(storage.hasValidBoundIdentity());
         metadata_arena->requireDeclarationConsumed();resources.requireDeclarationConsumed();
 
-        std::unique_ptr<IMoEKernel> kernel;
-        if (continuation_device.is_cuda())
-        {
-            kernel = std::make_unique<CUDAMoEKernel>(
-                continuation_device.ordinal);
-        }
-        else if (continuation_device.is_rocm())
-        {
-            kernel = std::make_unique<ROCmMoEKernel>(
-                continuation_device.ordinal);
-        }
+        auto kernel = kernelFor(continuation_device);
         ASSERT_NE(kernel, nullptr);
 
         MoEOverlayCanonicalRouteTicketConsumeLaunch ticket{
@@ -677,7 +663,7 @@ namespace
         const std::uint32_t invariant_epoch_begin = epochs - 2u;
 
         SparseRouteExchangeResources resources(original,
-            {OriginalMappedComponentProgram::Kind::Sparse,rows,d_model,epochs,replay_through_retained_graphs},root_device,producer_device);
+            {OriginalMappedComponentProgram::Kind::Sparse,rows,d_model,epochs,replay_through_retained_graphs,ownership},root_device,producer_device);
         ASSERT_NE(resources.root_backend, nullptr);
         ASSERT_NE(resources.producer_backend, nullptr);
         ASSERT_GT(resources.root_backend->deviceCount(), root_device.ordinal);
@@ -725,19 +711,26 @@ namespace
         std::vector<std::vector<float>> root_route_epochs(epochs);
         std::vector<std::vector<float>> producer_route_epochs(epochs);
         std::vector<std::vector<float>> expected_epochs(epochs);
+        std::vector<std::vector<float>> weight_epochs(joint ? epochs : 0);
+        bool distinguishes_weight_order = false;
         for (std::uint32_t epoch = 0u; epoch < epochs; ++epoch)
         {
             route_participant_epochs[epoch].resize(route_slots);
             root_route_epochs[epoch].resize(route_elements);
             producer_route_epochs[epoch].resize(route_elements);
             expected_epochs[epoch].assign(expected.size(), 0.0f);
+            if (joint)
+                weight_epochs[epoch].resize(route_slots);
             for (std::uint32_t slot = 0u; slot < route_slots; ++slot)
             {
                 const bool producer_owns = sparse_owner_stride == 0u
                     ? ((slot + epoch) % 3u) != 0u
                     : epoch != 0u && ((slot + epoch) % sparse_owner_stride) == 0u;
                 const auto route_epoch = std::min(epoch, invariant_epoch_begin);
-                const bool cohort_owns = epoch != 0u && ((slot + route_epoch) % 3u) != 0u;
+                const bool cohort_owns = epoch != 0u && ((slot + epoch) % 3u) != 0u;
+                const float weight = 0.3f + static_cast<float>((slot + route_epoch) % 4u) * 0.03125f;
+                if (joint)
+                    weight_epochs[epoch][slot] = weight;
                 route_participant_epochs[epoch][slot] =
                     joint ? (cohort_owns ? root_participant : -1)
                           : (producer_owns ? producer_participant : root_participant);
@@ -754,20 +747,36 @@ namespace
                             : route == 0u
                                   ? 1.0e20f
                                   : route == 2u ? -1.0e20f : 1.0f;
-                    root_route_epochs[epoch][route_index] = base;
-                    producer_route_epochs[epoch][route_index] =
-                        epoch < invariant_epoch_begin
-                            ? base + 32.0f
-                            : base;
-                    const float local = root_route_epochs[epoch][route_index];
-                    const float remote = producer_route_epochs[epoch][route_index];
-                    const float contribution = joint ? (cohort_owns ? (0.0f + local) + remote : local)
-                                                     : (producer_owns ? remote : local);
+                    float local = base;
+                    float remote = epoch < invariant_epoch_begin ? base + 32.0f : base;
+                    float contribution = producer_owns ? remote : local;
+                    if (joint)
+                    {
+                        // A placement change switches between two raw GPU fragments
+                        // and the completed CPU row already weighted in its return.
+                        // Cancellation makes multiplying each fragment observably wrong.
+                        if (route == 0u && column == 0u)
+                        {
+                            local = 100000000.0f;
+                            remote = -99999992.0f;
+                        }
+                        using namespace device_fp32_contract;
+                        contribution = multiply(add(local, remote), weight);
+                        if (cohort_owns)
+                            distinguishes_weight_order |=
+                                contribution != add(multiply(local, weight), multiply(remote, weight));
+                        else
+                            local = contribution;
+                    }
+                    root_route_epochs[epoch][route_index] = local;
+                    producer_route_epochs[epoch][route_index] = remote;
                     expected_epochs[epoch][
                         static_cast<std::size_t>(slot / top_k) * d_model + column] += contribution;
                 }
             }
         }
+        if (joint)
+            ASSERT_TRUE(distinguishes_weight_order);
         ASSERT_EQ(
             std::memcmp(
                 expected_epochs[invariant_epoch_begin].data(),
@@ -855,6 +864,8 @@ namespace
             root_device,
             root_peer_bindings.size() *
                 sizeof(MoENodeLocalRoutePeerDeviceBinding));
+        void *const weights_device = joint ? resources.allocate(
+            resources.root_backend, root_device, route_slots * sizeof(float)) : nullptr;
         resources.requireDeclarationConsumed();
         ASSERT_TRUE(std::all_of(
             resources.allocations.begin(), resources.allocations.end(),
@@ -928,6 +939,8 @@ namespace
             .top_k = top_k,
             .d_model = d_model,
             .ownership = ownership,
+            .cohort_route_weights = static_cast<const float *>(weights_device),
+            .cohort_route_capacity = joint ? route_slots : 0u,
         };
         const MoENodeLocalRoutePublishLaunch publish{
             .lane = resources.exchange->producerBinding(producer_device),
@@ -1008,6 +1021,12 @@ namespace
                 participant_bytes,
                 root_device.ordinal,
                 resources.root_stream));
+            if (joint)
+            {
+                ASSERT_TRUE(resources.root_backend->hostToDeviceOnStream(
+                    weights_device, weight_epochs[epoch].data(), route_slots * sizeof(float),
+                    root_device.ordinal, resources.root_stream));
+            }
             // Submit the waiter first to prove the root graph does not rely on
             // host ordering. Both endpoint streams then advance through their
             // monotonic SPSC epochs without an intervening host observation.
@@ -1408,7 +1427,7 @@ namespace
         originalRankLocalReplay(families,[&](const auto& devices) {
             std::vector<OriginalMappedComponentProgram> programs;
             for(const auto& profile:profiles)programs.push_back({OriginalMappedComponentProgram::Kind::Sparse,
-                profile.rows,profile.width,profile.epochs,profile.retained});
+                profile.rows,profile.width,profile.epochs,profile.retained,profile.ownership});
             OriginalMappedComponentSource original(devices,programs);
             for(const auto& profile:profiles)runSparseCanonicalRouteExchange(original,devices[0],devices[1],
                 profile.rows,profile.width,profile.epochs,profile.retained,profile.stride,profile.ownership);

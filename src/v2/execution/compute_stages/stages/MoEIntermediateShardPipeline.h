@@ -136,7 +136,7 @@ namespace llaminar2
         ComputeGraph &graph, MoEIntermediateShardPipelineParams params,
         const MoEOverlayParticipantLayerBank &source);
 
-    /** @brief Preweighted original route-slot partials for the tier-aware final reducer. */
+    /** @brief Raw original route-slot partials for the tier-aware reducer's single router multiply. */
     struct MoEIntermediateShardRouteSlots
     {
         std::string producer;
@@ -158,6 +158,21 @@ namespace llaminar2
     MoEIntermediateShardRouteSlots appendMoEIntermediateShardRouteSlots(
         ComputeGraph &graph, MoEIntermediateShardPipelineParams params,
         const MoEOverlayParticipantLayerBank &source);
+
+    /**
+     * @brief Keep independent shared FFN math after the CPU packet and inside its original producer unit.
+     * @param graph Participant-local graph with the original dispatch and ticket contract.
+     * @param shared Original shared FFN node.
+     * @param packet Original mapped CPU packet producer, present only on its owner.
+     * @param cutpoint Original end of the producer unit, present for an explicit CPU ticket.
+     * @throws std::invalid_argument For a foreign participant, stage, or capture boundary.
+     *
+     * The packet may start CPU service while the retained GPU producer still runs.
+     * A follower places its shared math in the matching unit without owning a packet.
+     * The following captured ingress and the existing collectives own their original dependencies.
+     */
+    void orderMappedDecodeSharedFFN(ComputeGraph &graph, const std::string &shared,
+        const std::optional<std::string> &packet, const std::optional<std::string> &cutpoint);
 
     /**
      * @brief Reuse the production compute/fold stages for one original cold prepared sample.
@@ -255,4 +270,11 @@ namespace llaminar2
      * @param previous_write_node Original attention write terminal.
      */
     void lowerRetainedM1HCFFNMainInference(ComputeGraph& graph,const std::string& previous_write_node);
+
+    /**
+     * @brief Close one mapped CUDA M1 region at its existing local route producer.
+     * @param graph Original composed participant graph with explicit ticket and collective nodes.
+     * @param previous_write_node Original attention residual write joined to the staged FFN read.
+     */
+    void lowerCUDAMappedRetainedM1HCFFN(ComputeGraph& graph,const std::string& previous_write_node);
 }

@@ -24,6 +24,7 @@
 
 #include "../../IMoEKernel.h"
 #include "../../../config/MoERouterArithmeticPolicy.h"
+#include "CUDAMoEBatchInvariantPolicy.h"
 #include "CUDARouterQ8Prefill.h"
 #include "../../common/DeviceResidentRouterGateCache.h"
 #include "../CUDAKernelBase.h"
@@ -35,6 +36,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <unordered_map>
 #include <vector>
 
@@ -805,7 +807,8 @@ namespace llaminar2
             int intermediate,
             MoEDecodeDescriptorSource descriptor_source =
                 MoEDecodeDescriptorSource::RuntimePlacementTable,
-            ITensor *canonical_route_contributions = nullptr) override;
+            ITensor *canonical_route_contributions = nullptr,
+            MoEExpertRouteWeighting weighting = MoEExpertRouteWeighting::LocalProjection) override;
 
         bool reduceCanonicalRouteContributions(
             ITensor *canonical_route_contributions,
@@ -1093,7 +1096,8 @@ namespace llaminar2
             MoEDecodeDescriptorSource descriptor_source,
             bool allow_router_q8_reuse,
             const char *counter_source,
-            ITensor *canonical_route_contributions);
+            ITensor *canonical_route_contributions,
+            MoEExpertRouteWeighting weighting = MoEExpertRouteWeighting::LocalProjection);
 
         static constexpr std::size_t kRuntimePointerArrayMaxTopK = 16;
         static constexpr std::size_t kRuntimePointerArrayTableSlots = 1024;
@@ -1455,6 +1459,30 @@ namespace llaminar2
             }
         };
 
+        /** @brief Capture-time identity of a runtime producer that validates the Gate/Up planes. */
+        struct RuntimeGatePlanPublication
+        {
+            CUDAMoERuntimeGateContract contract;
+            const DeviceMoELayerRuntime *runtime;
+            const DeviceNativeQuantisedMatrixDesc *gate;
+            const DeviceNativeQuantisedMatrixDesc *up;
+            const int *original_to_grouped;
+            void *stream;
+            uint64_t generation;
+            int experts;
+        };
+
+        /**
+         * @brief Select the measured exact validation program for a complete runtime plan.
+         * @param table Original capture-owned prepared Gate/Up descriptor declaration.
+         * @param rows Token rows submitted to this producer.
+         * @param capacity Original row capacity of the submitted grouping.
+         * @param top_k Original selected route count per row.
+         * @return Contract forwarded to the device grouping publisher.
+         */
+        [[nodiscard]] CUDAMoERuntimeGateContract runtimeGateContract(
+            const GroupedGateUpDescriptorTable &table, int rows, int capacity, int top_k) const;
+
         /**
          * @brief Publish or adopt one exact down-descriptor table.
          *
@@ -1527,6 +1555,8 @@ namespace llaminar2
         int group_active_expert_slots_ = 0;
         MoEPrefillGroupingProvenance grouped_prefill_grouping_;
             ///< Instance-owned static producer origin; no host copy of live route counts.
+        std::optional<RuntimeGatePlanPublication> runtime_gate_plan_;
+            ///< Immutable submission bindings. Device publication owns all live descriptor bytes.
         int group_slots_cap_ = 0;
         int group_experts_cap_ = 0;
         bool group_buffers_workspace_bound_ = false;

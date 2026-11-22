@@ -37,6 +37,7 @@ namespace llaminar2
         std::size_t shared_memory_per_block = 0, shared_memory_optin_per_block = 0;
         std::size_t shared_memory_per_sm = 0, total_memory = 0, last_level_cache = 0;
         bool integrated = false; ///< Driver fact: device memory is the host's physical memory (e.g. GB10).
+        bool can_launch_cooperative = false; ///< Native grid synchronization capability, observed at startup.
     };
 
     /** @brief Complete checked visibility with no fixed card-count ceiling or PCI-only alias. */

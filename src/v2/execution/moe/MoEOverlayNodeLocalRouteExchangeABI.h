@@ -243,6 +243,8 @@ namespace llaminar2
         std::uint32_t top_k = 0u;
         std::uint32_t d_model = 0u;
         MoENodeLocalRouteOwnership ownership = MoENodeLocalRouteOwnership::ExclusiveParticipant;
+        const float *cohort_route_weights = nullptr; ///< Exact original-slot router factors for raw shard rows.
+        std::uint32_t cohort_route_capacity = 0u; ///< Element extent of the router's published factor plane.
 
         /** @return Whether the root launch has a complete immutable geometry. */
         [[nodiscard]] LLAMINAR_MOE_NODE_LOCAL_ROUTE_HD constexpr bool
@@ -265,7 +267,10 @@ namespace llaminar2
             const std::uint64_t slots =
                 static_cast<std::uint64_t>(physical_rows) *
                 static_cast<std::uint64_t>(top_k);
+            const bool joint = ownership == MoENodeLocalRouteOwnership::ContinuationCohort;
             return slots <= static_cast<std::uint64_t>(UINT32_MAX) &&
+                   (joint ? cohort_route_weights && slots <= cohort_route_capacity
+                          : !cohort_route_weights && cohort_route_capacity == 0u) &&
                    domain_assignment.validFor(
                        static_cast<std::uint32_t>(slots));
         }

@@ -4,6 +4,9 @@
  */
 
 #include "MoEOverlayTicketPublishStage.h"
+#ifdef HAVE_CUDA
+#include "backends/cuda/CUDAGraphCapture.h"
+#endif
 
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/Logger.h"
@@ -72,6 +75,28 @@ namespace llaminar2
     }
 
     bool MoEOverlayTicketPublishStage::execute(IDeviceContext *ctx)
+    {
+#ifdef HAVE_CUDA
+        if (early_route_publication_)
+            return early_route_publication_->recordConsumer(requireGPUStream(), [&] { return executePacket(ctx); });
+#endif
+        return executePacket(ctx);
+    }
+
+#ifdef HAVE_CUDA
+    /** @copydoc MoEOverlayTicketPublishStage::bindEarlyRoutePublication */
+    void MoEOverlayTicketPublishStage::bindEarlyRoutePublication(
+        std::shared_ptr<CUDAEarlyPacketPublication> publication, const int32_t* live_rows)
+    {
+        if (!params_.device_id.is_cuda() || params_.bucket_rows != 1 || !publication || early_route_publication_ ||
+            (params_.active_row_count_device && params_.active_row_count_device != live_rows))
+            throw std::invalid_argument("Early route publication requires the original single-row CUDA ticket");
+        params_.active_row_count_device = live_rows;
+        early_route_publication_ = std::move(publication);
+    }
+#endif
+
+    bool MoEOverlayTicketPublishStage::executePacket(IDeviceContext *ctx)
     {
         if (!ctx || ctx->deviceId() != params_.device_id ||
             !params_.device_id.is_gpu())

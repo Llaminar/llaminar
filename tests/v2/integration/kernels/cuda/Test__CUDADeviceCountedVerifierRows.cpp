@@ -28,6 +28,7 @@
 #include "../../../utils/DeviceCountedFloatingRowsProof.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <memory>
@@ -305,6 +306,209 @@ TEST_P(CUDADeviceCountedVerifierRows, TensorCoreRetainsInactiveRowsAndPhysicalSc
 {
     const ScopedVerifierTensorCoreCandidate candidate;
     proveDeviceCountedRows(GetParam(), VerifierRowRoute::Raw);
+}
+
+/**
+ * @brief Replay recorded Q8 inputs through the normal mirrored vocabulary route.
+ *
+ * Fixed tiles and final-timeline fragments must preserve exact mirrored TP2
+ * serial arithmetic. Replay the original full, partial, empty, and resumed
+ * prefixes through the same executable while poisoning every output row.
+ */
+TEST(CUDAQFNVocabularyVerifier, OrderedSinglePartitionPublicationReplay)
+{
+    int devices = 0;
+    if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0)
+        GTEST_SKIP() << "No CUDA device available";
+    constexpr int N = 248320;
+    constexpr int K = 2560;
+    constexpr int M = 16;
+    const auto device = DeviceId::cuda(0);
+    cudaDeviceProp hardware{};
+    ASSERT_EQ(cudaGetDeviceProperties(&hardware, 0), cudaSuccess);
+    const bool sm86 = hardware.major == 8 && hardware.minor == 6;
+    ScopedGPUStream stream_owner(device);
+    auto stream = static_cast<cudaStream_t>(stream_owner.get());
+
+    // A repeating tape preserves both signs and distinct K32 scales without
+    // allocating an intermediate full-vocabulary FP32 weight tensor.
+    std::array<Q8_0Block, 257> tape{};
+    for (size_t i = 0; i < tape.size(); ++i)
+    {
+        tape[i].d = fp32_to_fp16(1.0f / static_cast<float>(128 + i % 31));
+        for (int k = 0; k < 32; ++k)
+            tape[i].qs[k] = static_cast<int8_t>(static_cast<int>((31 * i + 17 * k) % 255) - 127);
+    }
+    constexpr auto blocks = static_cast<size_t>(N) * K / Q8_0Block::BLOCK_SIZE;
+    AlignedVector<uint8_t> packed(blocks * sizeof(Q8_0Block));
+    auto *weights_data = reinterpret_cast<Q8_0Block *>(packed.data());
+    for (size_t offset = 0; offset < blocks; offset += tape.size())
+        std::copy_n(tape.data(), std::min(tape.size(), blocks - offset), weights_data + offset);
+    Q8_0Tensor weights({N, K}, std::move(packed));
+    auto prepared = makeGpuPreparedGemm(&weights, device, "test.cuda.qfn.vocabulary_q8");
+    auto *kernel = dynamic_cast<CUDAQuantisedGemmKernel *>(prepared.kernel);
+    ASSERT_NE(kernel, nullptr);
+    const auto policy = kernel->beginOutputPartitionEquivalenceScope(N, N / 2);
+    ASSERT_NE(policy, nullptr);
+    const auto requirements = kernel->getWorkspaceRequirements(M, N, K);
+    DeviceWorkspaceManager workspace(device, requirements.total_bytes_with_alignment());
+    ASSERT_TRUE(workspace.allocate(requirements));
+    kernel->setGPUStream(stream);
+    kernel->bindWorkspace(&workspace);
+    struct Binding
+    {
+        CUDAQuantisedGemmKernel &kernel;
+        ~Binding()
+        {
+            kernel.unbindWorkspace();
+            kernel.clearGPUStreamBinding();
+        }
+    } binding{*kernel};
+    ASSERT_TRUE(kernel->prepareFusedProjectionGraphCapture(1));
+
+    auto input = TestTensorFactory::createFP32Random({M, K}, -0.25f, 0.25f, 72043);
+    auto serial_input = TestTensorFactory::createFP32({1, K});
+    auto serial_output = TestTensorFactory::createFP32({1, N});
+    ASSERT_TRUE(input->ensureOnDevice(device, stream));
+    ASSERT_TRUE(serial_input->allocateOnDevice(device, stream));
+    ASSERT_TRUE(serial_output->allocateOnDevice(device, stream));
+    std::vector<float> expected(static_cast<size_t>(M) * N);
+    for (int row = 0; row < M; ++row)
+    {
+        ASSERT_EQ(cudaMemcpyAsync(serial_input->gpu_data_ptr(),
+            static_cast<const float *>(input->gpu_data_ptr()) + row * K,
+            K * sizeof(float), cudaMemcpyDeviceToDevice, stream), cudaSuccess);
+        TransferEngine::publishCurrentDeviceWrite(serial_input.get(), stream);
+        ASSERT_TRUE(kernel->multiply_tensor(serial_input.get(), serial_output.get(), 1, N, K));
+        ASSERT_EQ(cudaMemcpyAsync(expected.data() + static_cast<size_t>(row) * N,
+            serial_output->gpu_data_ptr(), N * sizeof(float), cudaMemcpyDeviceToHost, stream), cudaSuccess);
+    }
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+    ASSERT_TRUE(std::any_of(expected.begin(), expected.end(),
+        [](float value) { return std::isfinite(value) && value != 0.0f; }));
+    TransferEngine::requireDeviceInput(input.get(), device, stream);
+
+    auto count = TestTensorFactory::createINT32({1});
+    ASSERT_TRUE(count->allocateOnDevice(device, stream));
+    enum class RowRecording { Fixed, IndependentCount, TimelineCount };
+    for (const auto [rows, recording] : {
+            std::pair{5, RowRecording::Fixed}, std::pair{M, RowRecording::Fixed},
+            std::pair{M, RowRecording::IndependentCount}, std::pair{M, RowRecording::TimelineCount}})
+    {
+        SCOPED_TRACE(rows);
+        SCOPED_TRACE(static_cast<int>(recording));
+        const bool counted = recording != RowRecording::Fixed;
+        const bool timeline = recording == RowRecording::TimelineCount;
+        const bool conditional =
+#if CUDART_VERSION >= 12030
+            sm86 && timeline;
+#else
+            false;
+#endif
+        auto output = TestTensorFactory::createFP32({static_cast<size_t>(rows), N});
+        ASSERT_TRUE(output->allocateOnDevice(device, stream));
+        auto graph = GPUDeviceContextPool::instance().getNvidiaContext(0).createGraphCapture(stream);
+        ASSERT_NE(graph, nullptr);
+        auto fragment = timeline ? graph->createOrderedTimelineFragment() : nullptr;
+        ASSERT_EQ(fragment != nullptr, timeline);
+        auto &native_recording = fragment ? *fragment : *graph;
+        {
+            const auto row_range = counted
+                ? DeviceRowRange::deviceCounted(rows, static_cast<const int32_t *>(count->gpu_data_ptr()))
+                : DeviceRowRange::fullyActive(rows);
+            const auto arithmetic = kernel->beginVerifierDecodeEquivalentScope(row_range);
+            ScopedBackendGraphCapture capture(native_recording, "qfn_vocabulary_verifier");
+            ASSERT_TRUE(capture.begin());
+#if CUDART_VERSION >= 12030
+            const ScopedCUDAFinalTimelineRecording final_timeline_recording(native_recording);
+            EXPECT_EQ(ScopedCUDAFinalTimelineRecording::admitsConditionalOn(stream), timeline);
+            EXPECT_FALSE(ScopedCUDAFinalTimelineRecording::admitsConditionalOn(cudaStreamLegacy));
+#endif
+            const bool launched = kernel->multiply_fused_verifier_rows_decode_equivalent(
+                input.get(), {{kernel, output.get(), N, nullptr, "lm_head"}}, rows, K);
+            capture.finish();
+#if CUDART_VERSION >= 12030
+            EXPECT_FALSE(ScopedCUDAFinalTimelineRecording::admitsConditionalOn(stream));
+#endif
+            ASSERT_TRUE(launched);
+            if (timeline)
+            {
+                const std::array steps{GPUOrderedTimelineStep{
+                    .name = "qfn_vocabulary_verifier",
+                    .kind = GPUOrderedTimelineStepKind::CapturedFragment,
+                    .capture = fragment.get(),
+                }};
+                ASSERT_TRUE(graph->buildOrderedTimelineTransaction(steps));
+            }
+            ASSERT_TRUE(graph->instantiate());
+        }
+        if (sm86)
+        {
+            std::vector<GPUGraphKernelNodeInfo> nodes;
+            ASSERT_TRUE(native_recording.inspectKernelNodes(nodes));
+            const auto publication = std::find_if(nodes.begin(), nodes.end(), [](const auto &node) {
+                return node.name.find("nativeQuantisedGemvQ8TensorCorePublish") != std::string::npos;
+            });
+            const auto predicate = std::find_if(nodes.begin(), nodes.end(), [](const auto &node) {
+                return node.name.find("publishQFNVocabularyVerifierPredicate") != std::string::npos;
+            });
+            EXPECT_EQ(predicate != nodes.end(), conditional);
+            EXPECT_EQ(publication != nodes.end(), !counted);
+            EXPECT_EQ(std::any_of(nodes.begin(), nodes.end(), [](const auto &node) {
+                return node.name.find("nativeQuantisedGemv_reduce_small_m") != std::string::npos;
+            }), counted && !conditional);
+            if (!counted || conditional)
+            {
+                EXPECT_EQ(nodes.size(), 2u);
+                const auto projection = counted ? predicate : publication;
+                ASSERT_NE(projection, nodes.end());
+                EXPECT_EQ(projection->grid_x, counted ? 1u : N / 32u);
+                EXPECT_EQ(projection->grid_y, 1u);
+                EXPECT_EQ(projection->grid_z, 1u);
+                EXPECT_EQ(projection->block_x, counted ? 1u : 128u);
+                EXPECT_EQ(projection->static_shared_memory_bytes, 0u);
+                EXPECT_EQ(projection->local_memory_bytes_per_thread, 0u);
+            }
+#if CUDART_VERSION >= 12030
+            const auto *native = dynamic_cast<const CUDAGraphCapture *>(graph.get());
+            ASSERT_NE(native, nullptr);
+            size_t node_count = 0;
+            ASSERT_EQ(cudaGraphGetNodes(native->graph(), nullptr, &node_count), cudaSuccess);
+            std::vector<cudaGraphNode_t> native_nodes(node_count);
+            ASSERT_EQ(cudaGraphGetNodes(native->graph(), native_nodes.data(), &node_count), cudaSuccess);
+            int conditionals = 0;
+            for (auto node : native_nodes)
+            {
+                cudaGraphNodeType type{};
+                ASSERT_EQ(cudaGraphNodeGetType(node, &type), cudaSuccess);
+                conditionals += type == cudaGraphNodeTypeConditional;
+            }
+            EXPECT_EQ(conditionals, conditional ? 1 : 0);
+#endif
+        }
+        std::vector<float> actual(static_cast<size_t>(rows) * N);
+        const auto bytes = actual.size() * sizeof(float);
+        const std::vector<int32_t> publications = counted
+            ? std::vector<int32_t>{16, 8, 0, 1, 5, 16, 0, 8}
+            : std::vector<int32_t>{rows, rows};
+        for (int32_t active : publications)
+        {
+            SCOPED_TRACE(active);
+            if (counted)
+                ASSERT_EQ(cudaMemcpyAsync(count->gpu_data_ptr(), &active, sizeof(active),
+                    cudaMemcpyHostToDevice, stream), cudaSuccess);
+            ASSERT_EQ(cudaMemsetAsync(output->gpu_data_ptr(), 0xa5, bytes, stream), cudaSuccess);
+            ASSERT_TRUE(graph->launch());
+            ASSERT_EQ(cudaMemcpyAsync(actual.data(), output->gpu_data_ptr(), bytes,
+                cudaMemcpyDeviceToHost, stream), cudaSuccess);
+            ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+            const auto live_bytes = static_cast<size_t>(active) * N * sizeof(float);
+            EXPECT_EQ(std::memcmp(actual.data(), expected.data(), live_bytes), 0);
+            const auto *output_bytes = reinterpret_cast<const uint8_t *>(actual.data());
+            EXPECT_TRUE(std::all_of(output_bytes + live_bytes, output_bytes + bytes,
+                [](uint8_t value) { return value == 0xa5u; }));
+        }
+    }
 }
 
 TEST_P(CUDADeviceCountedVerifierRows, TensorProjectionInheritsDeviceRows)

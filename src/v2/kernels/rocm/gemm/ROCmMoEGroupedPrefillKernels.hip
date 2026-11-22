@@ -3120,7 +3120,8 @@ void moe_grouped_down_publish_canonical_routes_prefill_kernel(
                         total = rocm_native_quantised_accumulate_rn(total, partials[partition][output_lane]);
                     value = total;
                 }
-                route_output[output_index] = rocm_native_quantised_weight_route_rn(grouped_weights[grouped_slot], value);
+                route_output[output_index] = grouped_weights
+                    ? rocm_native_quantised_weight_route_rn(grouped_weights[grouped_slot], value) : value;
             }
             // Every slot iteration retires wave 0's bank reads before any other
             // wave can overwrite them for the next slot. Keep this second barrier
@@ -3164,8 +3165,8 @@ void moe_grouped_down_publish_canonical_routes_prefill_kernel(
             N,
             blocks_per_row,
             k_partition_policy);
-        route_output[output_index] = rocm_native_quantised_weight_route_rn(
-            grouped_weights[grouped_slot], expert_acc);
+        route_output[output_index] = grouped_weights
+            ? rocm_native_quantised_weight_route_rn(grouped_weights[grouped_slot], expert_acc) : expert_acc;
     }
 }
 
@@ -3201,15 +3202,14 @@ void moe_grouped_down_partials_canonical_publish_prefill_kernel(
             static_cast<size_t>(original_slot) *
                 static_cast<size_t>(d_model) +
             static_cast<size_t>(n);
-        route_output[output_index] =
-            grouped_slot < 0
-                ? 0.0f
-                : rocm_native_quantised_weight_route_rn(
-                      grouped_weights[grouped_slot],
-                      down_partials[
-                          static_cast<size_t>(grouped_slot) *
-                              static_cast<size_t>(d_model) +
-                          static_cast<size_t>(n)]);
+        if (grouped_slot < 0)
+        {
+            route_output[output_index] = 0.0f;
+            continue;
+        }
+        const float value = down_partials[static_cast<size_t>(grouped_slot) * d_model + n];
+        route_output[output_index] = grouped_weights
+            ? rocm_native_quantised_weight_route_rn(grouped_weights[grouped_slot], value) : value;
     }
 }
 
@@ -4306,6 +4306,11 @@ bool rocmMoE_grouped_prefill_pipeline(
     const int seq_len = total_slots / top_k;
     const bool canonical_publication =
         d_canonical_route_contributions != nullptr;
+    const bool raw_cohort =
+        execution.routeWeighting() == llaminar2::MoEExpertRouteWeighting::CompletedCohort;
+    if (raw_cohort && (!canonical_publication || d_output))
+        return false;
+    const float *const projection_weights = raw_cohort ? nullptr : d_group_weights;
     const auto measured_operation = execution.measuredOperation(
         canonical_publication ? llaminar2::MoEPrefillOutputLayout::OriginalRouteRows
                               : llaminar2::MoEPrefillOutputLayout::TokenRows,
@@ -4935,7 +4940,7 @@ bool rocmMoE_grouped_prefill_pipeline(
                         HIP_KERNEL_NAME(moe_grouped_down_publish_canonical_routes_prefill_kernel<FORMAT_TAG, WORKERS>), \
                         grid, dim3(CanonicalGeometry::threads), 0, hip_stream, \
                         d_scratch_swiglu_int8, d_scratch_swiglu_scales, down_descs, \
-                        d_original_to_grouped, d_original_expert_ids, d_group_weights, \
+                        d_original_to_grouped, d_original_expert_ids, projection_weights, \
                         d_canonical_route_contributions, total_slots, down_columns, \
                         intermediate, num_experts, down_k_partition_policy, admission); \
                 } while (0)
@@ -5203,7 +5208,7 @@ bool rocmMoE_grouped_prefill_pipeline(
                     publish_grid, dim3(publish_columns), 0, hip_stream,
                     d_scratch_gate,
                     d_original_to_grouped,
-                    d_group_weights,
+                    projection_weights,
                     d_canonical_route_contributions,
                     total_slots,
                     down_columns, admission);

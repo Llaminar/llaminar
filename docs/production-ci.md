@@ -1555,5 +1555,5 @@ certified ancestry/evidence commit on develop. The standalone driver's retained
 `--publish` capability is not the repository release procedure and is not
 authorized by an ordinary local qualification request.
 
-The source pre-commit hook remains Unit + ProductionTestPreflight only.
-Performance is never part of that model-free hook.
+The source pre-commit hook runs the complete Unit suite. The feature PR and
+release workflows run production preflight. See [the hook guide](../.githooks/README.md).
