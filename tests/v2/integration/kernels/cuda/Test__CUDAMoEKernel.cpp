@@ -24582,8 +24582,14 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
                                 gate_reader != native_formats::Q3_K.codebook_id &&
                                 gate_reader != native_formats::Q6_K.codebook_id &&
                                 gate_reader != native_formats::IQ3_S.codebook_id;
-                            EXPECT_EQ(name.contains("ELi64EEE"), exact_qfn_tile)
+                            const bool direct_activation = exact_qfn_tile && top_k == 10 &&
+                                (gate_reader == native_formats::IQ1_S.codebook_id ||
+                                 gate_reader == native_formats::IQ2_XXS.codebook_id);
+                            EXPECT_EQ(name.contains("ELi64ELj0EEE") || name.contains("ELi64ELj10EEE"),
+                                exact_qfn_tile)
                                 << gate_source << " captured the wrong QFN tile";
+                            EXPECT_EQ(name.contains("ELi64ELj10EEE"), direct_activation)
+                                << gate_source << " captured the wrong original-route address";
                         }
                     }
                     if (name.contains("grouped_native_quantised_gate_up_ordered_kpart_reduce_swiglu_kernel"))

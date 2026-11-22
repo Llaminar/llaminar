@@ -412,6 +412,17 @@ captured transaction, including routing and publication, ranged from
 169.5 to 254.1 µs across both cards. The selected packed path took
 81.0–87.4 µs on the same sources and inputs.
 
+At M=4 with ten routes per token, IQ1_S and IQ2_XXS address the original
+activation row directly from the route slot. The grouped producer
+validates the inverse map before the projection. The selected
+64-column tiles use 52 and 40 registers respectively and zero shared
+or local bytes.
+
+| Source | Paired control, µs | Release Gate/Up with publication, µs | Matched weight rate |
+| --- | ---: | ---: | ---: |
+| IQ1_S | 26.688–26.816 | 25.600–25.728 | 64.9–65.0% |
+| IQ2_XXS | 23.360–23.488 | 22.976–23.040 | 70.2–71.1% |
+
 ### QFN-width IQ4 schedule
 
 The interleaved IQ4 reader also uses the fixed 320-column Gate/Up pitch

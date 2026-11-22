@@ -32,6 +32,8 @@
  * per partition, with both weight streams sharing register-held activations.
  * Ordered verifier tiles also resolve their measured pitch and packed
  * operand readers before capture and retain the serial split-K rounding tree.
+ * The measured IQ1_S and IQ2_XXS tiles address the original activation
+ * row directly from the validated route slot.
  * Wide SM86 verifier tiles expand a compact IQ1 grid and use whole-word
  * index and sign loads for IQ3. Compact IQ2 selectors combine magnitudes
  * and signs in registers. These launches resolve the physical pitch before K.
@@ -20521,6 +20523,7 @@ __global__ void softmax_topk_decode_descriptors_kernel(
     constexpr int kQFNDecodeGateUpN = llaminar2::CUDAMoEBatchInvariantPolicy::qfn_gate_up_n;
     constexpr int kQFNDecodeGateUpK = llaminar2::CUDAMoEBatchInvariantPolicy::qfn_gate_up_k;
     constexpr int kQFNDecodeGateUpPackets = 5;
+    constexpr unsigned kQFNVerifierRoutesPerToken = 10;
     static_assert(kQFNDecodeGateUpK / 32 == kQFNDecodeGateUpPackets *
         llaminar2::CUDAMoEBatchInvariantPolicy::gate_up_k_partitions);
 
@@ -20991,12 +20994,16 @@ __global__ void softmax_topk_decode_descriptors_kernel(
      * @tparam Packets Fixed K32 partition length, or zero for runtime geometry.
      * @tparam PacketOrder Packed integer schedule for the fixed reader.
      * @tparam ExactTile Complete 64-column QFN tiles, or zero when bounds are dynamic.
+     * @tparam RoutesPerToken Positive when the producer publishes original route
+     *         IDs, or zero to resolve the source through the grouped map.
      * @pre For a complete tile the capture submits the exact column, route and
      *      K-partition extents. Every submitted partition contains five packets.
+     * @pre Direct addressing uses the runtime plan which publishes the original
+     *      slot as the inverse of each live grouped route.
      */
     template <uint8_t CodebookId, int Pitch = 0, int Packets = 0,
               NativeMoEDotOrder PacketOrder = NativeMoEDotOrder::PartitionPartial,
-              int ExactTile = 0>
+              int ExactTile = 0, unsigned RoutesPerToken = 0>
     __global__ void grouped_native_quantised_gate_up_ordered_kpart_scatter_kernel(
         const int8_t *__restrict__ A_int8,
         const float *__restrict__ scales_A_blockwise,
@@ -21066,7 +21073,15 @@ __global__ void softmax_topk_decode_descriptors_kernel(
             }
         }
 
-        const int source_row = source_rows.sourceRow(grouped_slot);
+        const int source_row = [&] {
+            if constexpr (RoutesPerToken > 0)
+            {
+                static_assert(ExactTile > 0);
+                return static_cast<int>(static_cast<unsigned>(original_slot) / RoutesPerToken);
+            }
+            else
+                return source_rows.sourceRow(grouped_slot);
+        }();
         const int8_t *slot_A = A_int8 + static_cast<size_t>(source_row) * K;
         const float *slot_scales =
             scales_A_blockwise + static_cast<size_t>(source_row) * blocks_per_row;
@@ -26721,9 +26736,11 @@ __attribute__((visibility("default"))) bool cudaMoE_softmax_topk_decode_selected
                         constexpr auto packed = Traits::is_iq_grid
                             ? NativeMoEDotOrder::VerifierWideGrid : NativeMoEDotOrder::VerifierK32;
                         constexpr auto unrolled = NativeMoEDotOrder::PartitionPartial;
-                        const auto issue = [&]<int Pitch, int Packets, NativeMoEDotOrder Order, int ExactTile = 0>() {
+                        const auto issue = [&]<int Pitch, int Packets, NativeMoEDotOrder Order,
+                                               int ExactTile = 0, unsigned RoutesPerToken = 0>() {
                             grouped_native_quantised_gate_up_ordered_kpart_scatter_kernel<
-                                CodebookId, Pitch, Packets, Order, ExactTile><<<scatter_grid, block, 0, cuda_stream>>>(
+                                CodebookId, Pitch, Packets, Order, ExactTile, RoutesPerToken>
+                                <<<scatter_grid, block, 0, cuda_stream>>>(
                                     gateup_input, gateup_scales, source_rows, d_gate_desc_table, d_up_desc_table,
                                     d_original_to_grouped, d_original_expert_ids, d_gate_partials, d_up_partials,
                                     original_slot_base, tile_route_slots, intermediate, d_model, num_experts,
@@ -26736,8 +26753,18 @@ __attribute__((visibility("default"))) bool cudaMoE_softmax_topk_decode_selected
                                 if constexpr (Traits::is_iq_grid && CodebookId != native_formats::IQ3_S.codebook_id)
                                 {
                                     if (kTileN == 64)
+                                    {
+                                        if constexpr (CodebookId == native_formats::IQ1_S.codebook_id ||
+                                                      CodebookId == native_formats::IQ2_XXS.codebook_id)
+                                        {
+                                            if (seq_len == 4 && static_cast<unsigned>(top_k) ==
+                                                kQFNVerifierRoutesPerToken && grouped_indices_are_route_slots)
+                                                return issue.template operator()<kQFNDecodeGateUpN,
+                                                    kQFNDecodeGateUpPackets, packed, 64, kQFNVerifierRoutesPerToken>();
+                                        }
                                         return issue.template operator()<
                                             kQFNDecodeGateUpN, kQFNDecodeGateUpPackets, packed, 64>();
+                                    }
                                 }
                                 return issue.template operator()<kQFNDecodeGateUpN, kQFNDecodeGateUpPackets, packed>();
                             }
