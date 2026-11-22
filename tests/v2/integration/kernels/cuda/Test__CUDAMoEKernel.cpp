@@ -24757,15 +24757,20 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
                                  source_format == "IQ2_XXS" || source_format == "IQ3_S" ||
                                  source_format == "IQ3_XXS" || (sm86 && iq4_format));
                             const bool qfn_iq4_reader = sm86 && qfn_width && iq4_format;
-                            EXPECT_EQ(name.contains("ELb1ELi256EEE"), wide_grid_reader)
+                            EXPECT_EQ(name.contains("ELb1ELi256ELi"), wide_grid_reader)
                                 << format.label << " captured the wrong wide Down reader";
-                            EXPECT_EQ(name.contains("ELb1ELi320EEE"), qfn_iq4_reader)
+                            EXPECT_EQ(name.contains("ELb1ELi320ELi"), qfn_iq4_reader)
                                 << format.label << " captured the wrong QFN Down reader";
                         }
-                        EXPECT_EQ(params.gridDim.x, static_cast<unsigned>((d_model + 63) / 64));
+                        const bool measured_wide_tile = sm86 && d_model == 2560 && intermediate == 256 &&
+                            seq_len == 4 && top_k == 8 &&
+                            (down_source_format == "IQ1_S" || down_source_format == "IQ2_S" ||
+                             down_source_format == "IQ2_XXS" || down_source_format == "IQ3_S");
+                        const unsigned down_tile = measured_wide_tile ? 256u : 64u;
+                        EXPECT_EQ(params.gridDim.x, (static_cast<unsigned>(d_model) + down_tile - 1) / down_tile);
                         EXPECT_EQ(params.gridDim.y, static_cast<unsigned>(seq_len * top_k));
                         EXPECT_EQ(params.gridDim.z, 1u);
-                        EXPECT_EQ(params.blockDim.x, 64u);
+                        EXPECT_EQ(params.blockDim.x, down_tile);
                         cudaFuncAttributes attributes{};
                         ASSERT_EQ(cudaFuncGetAttributes(&attributes, params.func), cudaSuccess);
                         EXPECT_EQ(attributes.localSizeBytes, 0u);

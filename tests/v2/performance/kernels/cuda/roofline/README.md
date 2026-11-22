@@ -631,6 +631,25 @@ and zero local bytes. In this sweep, 12 formats cleared 80% in both stages
 on both cards. The Release build also passed the 11 focused CUDA preflight
 tests and the mixed CUDA/CPU movement token regression.
 
+At M=4, top-K=8, N=2560 and K=256 on SM86, four Down formats use
+256-column CTAs. Each CTA publishes one complete route tile and retains
+the original K32 accumulation order. IQ3_S loads its 2 KiB table once
+per 256 columns. The other three tiles use zero shared bytes. All four
+use 36–40 registers with zero local memory. Both RTX 3090s passed the
+full 21-format serial-byte replay with a native grid of 10 × 32 × 1 for
+these tiles.
+
+| Source | Release Down, µs | Route-matched weight rate | Complete capture gain, µs |
+| --- | ---: | ---: | ---: |
+| IQ1_S | 9.664–9.728 | 46.7–47.0% | 0.324–0.448 |
+| IQ2_S | 10.240–10.304 | 50.6–50.9% | 0.320–0.576 |
+| IQ2_XXS | 8.384 | 51.9% | 0.128–0.448 |
+| IQ3_S | 10.048–10.112 | 64.6–65.0% | 0.064–0.192 |
+
+The complete capture differences use both paired run orders on both cards.
+Fourteen of 21 formats reached 80% on both cards in each of the wide Gate/Up
+and Down sweeps from this build.
+
 The mixed 2×CUDA/2×CPU QFN dynamic MTP benchmark produced identical
 256-token histories and per-iteration MTP work in both run orders. With the
 tuned verifier first, median decode was 47.29 tokens/s versus 47.54 for the

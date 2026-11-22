@@ -18811,6 +18811,7 @@ __global__ void softmax_topk_decode_descriptors_kernel(
     constexpr int kShortVerifierDownN = 512;
     constexpr int kShortVerifierDownK = 256;
     constexpr int kVerifierDownTileColumns = 64;
+    constexpr int kWideVerifierDownTileColumns = 256;
     static_assert(kWideVerifierGatePackets *
         llaminar2::CUDAMoEBatchInvariantPolicy::gate_up_k_partitions * 32 == kWideVerifierGateK);
     static_assert(kWideVerifierDownN % 4 == 0);
@@ -21706,8 +21707,13 @@ __global__ void softmax_topk_decode_descriptors_kernel(
      * @param N Full output width.
      * @param K Narrow admitted reduction width, with one K32 block per partition.
      * @param num_experts Exact original descriptor count.
+     * @tparam CodebookId Physical decoder selected when recording the node.
+     * @tparam WideGrid Use the fixed wide Down geometry and packed readers.
+     * @tparam FixedReduction Reduction width selected with the wide reader.
+     * @tparam TileColumns Number of output columns owned by a complete CTA.
      */
-    template <uint8_t CodebookId, bool WideGrid, int FixedReduction = kWideVerifierDownK>
+    template <uint8_t CodebookId, bool WideGrid, int FixedReduction = kWideVerifierDownK,
+              int TileColumns = kVerifierDownTileColumns>
     __global__ void grouped_prefill_down_canonical_publish_k32_kernel(
         const int8_t *__restrict__ activation_codes,
         const float *__restrict__ activation_scales,
@@ -21729,7 +21735,9 @@ __global__ void softmax_topk_decode_descriptors_kernel(
 #else
         constexpr auto order = NativeMoEDotOrder::VerifierK32;
 #endif
-        constexpr int kTileN = kVerifierDownTileColumns;
+        constexpr int kTileN = TileColumns;
+        static_assert(kTileN == kVerifierDownTileColumns ||
+                      (WideGrid && FixedReduction == kWideVerifierDownK && kWideVerifierDownN % kTileN == 0));
         const int column = blockIdx.x * kTileN + threadIdx.x;
         if (column >= N)
             return;
@@ -27325,9 +27333,13 @@ __attribute__((visibility("default"))) bool cudaMoE_softmax_topk_decode_selected
                             return;
                         }
                     }
-                    const auto launch = [&]<bool WideGrid, int FixedReduction = kWideVerifierDownK>() {
-                        grouped_prefill_down_canonical_publish_k32_kernel<CodebookId, WideGrid, FixedReduction>
-                            <<<route_reduce_grid, reduce_block, 0, cuda_stream>>>(
+                    const auto launch = [&]<bool WideGrid, int FixedReduction = kWideVerifierDownK,
+                                            int TileColumns = kReduceTileN>() {
+                        dim3 grid = route_reduce_grid;
+                        if constexpr (TileColumns != kReduceTileN)
+                            grid.x = static_cast<unsigned int>(kWideVerifierDownN / TileColumns);
+                        grouped_prefill_down_canonical_publish_k32_kernel<CodebookId, WideGrid, FixedReduction, TileColumns>
+                            <<<grid, TileColumns, 0, cuda_stream>>>(
                                 d_scratch_swiglu_int8, d_scratch_swiglu_scales,
                                 d_down_desc_table, d_original_to_grouped, d_original_expert_ids,
                                 projection_weights, d_canonical_route_contributions,
@@ -27343,6 +27355,17 @@ __attribute__((visibility("default"))) bool cudaMoE_softmax_topk_decode_selected
                     {
                         if (wide_grid_down)
                         {
+                            if constexpr (CodebookId == native_formats::IQ1_S.codebook_id ||
+                                          CodebookId == native_formats::IQ2_S.codebook_id ||
+                                          CodebookId == native_formats::IQ2_XXS.codebook_id ||
+                                          CodebookId == native_formats::IQ3_S.codebook_id)
+                            {
+                                // Complete 256-column tiles amortize route setup and, for IQ3_S,
+                                // the cooperative grid load at the measured four-row geometry.
+                                if (seq_len == 4 && tile_rows == seq_len && top_k == 8 && is_sm86_cuda_device(device_idx))
+                                    return launch.template operator()<true, kWideVerifierDownK,
+                                        kWideVerifierDownTileColumns>();
+                            }
                             launch.template operator()<true>();
                             return;
                         }
