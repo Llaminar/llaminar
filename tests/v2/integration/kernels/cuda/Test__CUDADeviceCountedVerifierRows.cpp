@@ -28,6 +28,7 @@
 #include "../../../utils/DeviceCountedFloatingRowsProof.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <memory>
@@ -305,6 +306,133 @@ TEST_P(CUDADeviceCountedVerifierRows, TensorCoreRetainsInactiveRowsAndPhysicalSc
 {
     const ScopedVerifierTensorCoreCandidate candidate;
     proveDeviceCountedRows(GetParam(), VerifierRowRoute::Raw);
+}
+
+/**
+ * @brief Replay recorded Q8 inputs through the normal mirrored vocabulary route.
+ *
+ * The fixed tile contains both a partial and a full set of MMA rows. Preserve
+ * the exact mirrored TP2 serial arithmetic and inspect the compiled publication
+ * node on SM86 after poisoning the retained output between launches.
+ */
+TEST(CUDAQFNVocabularyVerifier, OrderedSinglePartitionPublicationReplay)
+{
+    int devices = 0;
+    if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0)
+        GTEST_SKIP() << "No CUDA device available";
+    constexpr int N = 248320;
+    constexpr int K = 2560;
+    constexpr int M = 16;
+    const auto device = DeviceId::cuda(0);
+    cudaDeviceProp hardware{};
+    ASSERT_EQ(cudaGetDeviceProperties(&hardware, 0), cudaSuccess);
+    const bool sm86 = hardware.major == 8 && hardware.minor == 6;
+    ScopedGPUStream stream_owner(device);
+    auto stream = static_cast<cudaStream_t>(stream_owner.get());
+
+    // A repeating tape preserves both signs and distinct K32 scales without
+    // allocating an intermediate full-vocabulary FP32 weight tensor.
+    std::array<Q8_0Block, 257> tape{};
+    for (size_t i = 0; i < tape.size(); ++i)
+    {
+        tape[i].d = fp32_to_fp16(1.0f / static_cast<float>(128 + i % 31));
+        for (int k = 0; k < 32; ++k)
+            tape[i].qs[k] = static_cast<int8_t>(static_cast<int>((31 * i + 17 * k) % 255) - 127);
+    }
+    constexpr auto blocks = static_cast<size_t>(N) * K / Q8_0Block::BLOCK_SIZE;
+    AlignedVector<uint8_t> packed(blocks * sizeof(Q8_0Block));
+    auto *weights_data = reinterpret_cast<Q8_0Block *>(packed.data());
+    for (size_t offset = 0; offset < blocks; offset += tape.size())
+        std::copy_n(tape.data(), std::min(tape.size(), blocks - offset), weights_data + offset);
+    Q8_0Tensor weights({N, K}, std::move(packed));
+    auto prepared = makeGpuPreparedGemm(&weights, device, "test.cuda.qfn.vocabulary_q8");
+    auto *kernel = dynamic_cast<CUDAQuantisedGemmKernel *>(prepared.kernel);
+    ASSERT_NE(kernel, nullptr);
+    const auto policy = kernel->beginOutputPartitionEquivalenceScope(N, N / 2);
+    ASSERT_NE(policy, nullptr);
+    const auto requirements = kernel->getWorkspaceRequirements(M, N, K);
+    DeviceWorkspaceManager workspace(device, requirements.total_bytes_with_alignment());
+    ASSERT_TRUE(workspace.allocate(requirements));
+    kernel->setGPUStream(stream);
+    kernel->bindWorkspace(&workspace);
+    struct Binding
+    {
+        CUDAQuantisedGemmKernel &kernel;
+        ~Binding()
+        {
+            kernel.unbindWorkspace();
+            kernel.clearGPUStreamBinding();
+        }
+    } binding{*kernel};
+    ASSERT_TRUE(kernel->prepareFusedProjectionGraphCapture(1));
+
+    auto input = TestTensorFactory::createFP32Random({M, K}, -0.25f, 0.25f, 72043);
+    auto serial_input = TestTensorFactory::createFP32({1, K});
+    auto serial_output = TestTensorFactory::createFP32({1, N});
+    ASSERT_TRUE(input->ensureOnDevice(device, stream));
+    ASSERT_TRUE(serial_input->allocateOnDevice(device, stream));
+    ASSERT_TRUE(serial_output->allocateOnDevice(device, stream));
+    std::vector<float> expected(static_cast<size_t>(M) * N);
+    for (int row = 0; row < M; ++row)
+    {
+        ASSERT_EQ(cudaMemcpyAsync(serial_input->gpu_data_ptr(),
+            static_cast<const float *>(input->gpu_data_ptr()) + row * K,
+            K * sizeof(float), cudaMemcpyDeviceToDevice, stream), cudaSuccess);
+        TransferEngine::publishCurrentDeviceWrite(serial_input.get(), stream);
+        ASSERT_TRUE(kernel->multiply_tensor(serial_input.get(), serial_output.get(), 1, N, K));
+        ASSERT_EQ(cudaMemcpyAsync(expected.data() + static_cast<size_t>(row) * N,
+            serial_output->gpu_data_ptr(), N * sizeof(float), cudaMemcpyDeviceToHost, stream), cudaSuccess);
+    }
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+    ASSERT_TRUE(std::any_of(expected.begin(), expected.end(),
+        [](float value) { return std::isfinite(value) && value != 0.0f; }));
+    TransferEngine::requireDeviceInput(input.get(), device, stream);
+
+    for (const int rows : {5, M})
+    {
+        SCOPED_TRACE(rows);
+        auto output = TestTensorFactory::createFP32({static_cast<size_t>(rows), N});
+        ASSERT_TRUE(output->allocateOnDevice(device, stream));
+        auto graph = GPUDeviceContextPool::instance().getNvidiaContext(0).createGraphCapture(stream);
+        {
+            const auto arithmetic = kernel->beginVerifierDecodeEquivalentScope(DeviceRowRange::fullyActive(rows));
+            ScopedBackendGraphCapture capture(*graph, "qfn_vocabulary_verifier");
+            ASSERT_TRUE(capture.begin());
+            const bool launched = kernel->multiply_fused_verifier_rows_decode_equivalent(
+                input.get(), {{kernel, output.get(), N, nullptr, "lm_head"}}, rows, K);
+            capture.finish();
+            ASSERT_TRUE(launched);
+            ASSERT_TRUE(graph->instantiate());
+        }
+        if (sm86)
+        {
+            std::vector<GPUGraphKernelNodeInfo> nodes;
+            ASSERT_TRUE(graph->inspectKernelNodes(nodes));
+            EXPECT_EQ(nodes.size(), 2u);
+            const auto publication = std::find_if(nodes.begin(), nodes.end(), [](const auto &node) {
+                return node.name.find("nativeQuantisedGemvQ8TensorCorePublish") != std::string::npos;
+            });
+            ASSERT_NE(publication, nodes.end());
+            EXPECT_EQ(publication->grid_x, N / 32u);
+            EXPECT_EQ(publication->grid_y, 1u);
+            EXPECT_EQ(publication->grid_z, 1u);
+            EXPECT_EQ(publication->block_x, 128u);
+            EXPECT_EQ(publication->static_shared_memory_bytes, 0u);
+            EXPECT_EQ(publication->local_memory_bytes_per_thread, 0u);
+        }
+        std::vector<float> actual(static_cast<size_t>(rows) * N);
+        const auto bytes = actual.size() * sizeof(float);
+        for (int repeat : {0, 1})
+        {
+            SCOPED_TRACE(repeat);
+            ASSERT_EQ(cudaMemsetAsync(output->gpu_data_ptr(), 0xa5, bytes, stream), cudaSuccess);
+            ASSERT_TRUE(graph->launch());
+            ASSERT_EQ(cudaMemcpyAsync(actual.data(), output->gpu_data_ptr(), bytes,
+                cudaMemcpyDeviceToHost, stream), cudaSuccess);
+            ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+            EXPECT_EQ(std::memcmp(actual.data(), expected.data(), bytes), 0);
+        }
+    }
 }
 
 TEST_P(CUDADeviceCountedVerifierRows, TensorProjectionInheritsDeviceRows)

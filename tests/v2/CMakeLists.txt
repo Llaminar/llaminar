@@ -11882,6 +11882,12 @@ if(HAVE_CUDA)
         MPI_PROCS 1
         NO_MODELS
     )
+    add_v2_test(V2_Integration_CUDA_QFNVocabularyVerifierPublicationReplay
+        COMMAND $<TARGET_FILE:v2_integration_cuda_device_counted_verifier_rows>
+                --gtest_filter=CUDAQFNVocabularyVerifier.OrderedSinglePartitionPublicationReplay
+        LABELS "V2;Integration;ProductionTestPreflight;CUDA;GEMM;MTP;GraphCapture;Replay;ByteExact;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120
+    )
     # Release intentionally omits Integration targets. Share fixture source,
     # not an executable dependency on a target absent from the Perf build.
     add_executable(v2_perf_cuda_device_counted_verifier_rows

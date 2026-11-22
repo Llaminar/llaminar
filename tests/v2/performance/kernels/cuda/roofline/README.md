@@ -406,3 +406,49 @@ bytes. Its graph requests 675,430,400 packed weight bytes, which puts the
 measured rate within 0.3% of the independent 879.53 GB/s streaming reference.
 This comparison uses requested bytes. The production trace measures a
 larger captured fragment that also contains the routed fold and other work.
+
+## QFN grouped vocabulary verification
+
+The fixed-width grouped verifier uses the same original Q8_0 tensor and the
+same serial output-partition policy. Its SM86 single-partition specialization
+loads the prepared Q8 operands directly into MMA registers, applies the
+original K32 scales in ascending order, and folds the one ordered partition
+into the final logits store. It keeps one weight traversal for up to 16 live
+rows and omits the intermediate FP32 partial plane.
+
+The production-preflight replay covers five and sixteen live rows. It
+checks exact serial bytes after poisoning the retained output and inspects
+the original captured SM86 kernel, including its grid and compiler
+resources. The same fixture can be exercised with the Release target.
+
+```sh
+cmake --build "$CMAKE_BUILD" --parallel --target v2_perf_cuda_device_counted_verifier_rows
+CUDA_VISIBLE_DEVICES=0 "$CMAKE_BUILD/tests/v2/v2_perf_cuda_device_counted_verifier_rows" \
+  --gtest_filter=CUDAQFNVocabularyVerifier.OrderedSinglePartitionPublicationReplay
+```
+
+The realized Release path produced exact serial logits on both RTX 3090s.
+Each result is the median of 31 retained-graph samples with the real
+675,430,400-byte vocabulary weight. The efficiency column divides that
+unique weight size by captured stage time and then by 879.53 GB/s.
+The original schedule traverses the weights twice at 8 and 12 rows and
+three times at 16 rows.
+
+| Rows | Original stage, µs | Fused Release stage, µs | Streaming reference |
+| ---: | ---: | ---: | ---: |
+| 5 | 1015.808–1016.832 | 780.288 | 98.4% |
+| 6 | 1025.024–1030.144 | 782.336 | 98.2% |
+| 8 | 1991.680–1995.776 | 787.456 | 97.5% |
+| 12 | 2057.216–2064.384 | 801.792 | 95.8% |
+| 16 | 3061.760–3077.120 | 814.080 | 94.3% |
+
+The fused kernel records 7760 CTAs of 128 threads, 46 registers and room
+for ten CTAs per SM. The compiled body contains integer tensor-core
+instructions, zero shared and local bytes, and no warp synchronization.
+
+On the matched 2×CUDA/2×CPU QFN model at fixed draft depth seven, the
+control-first comparison measured median decode throughput of 44.42 tokens/s
+for the control and 44.89 for the fused prototype. Each arm ran three
+measured requests after warmup. All six requests produced the same 256
+tokens and the same 57 verifier transactions, 456 verifier rows, and
+399 drafts.
