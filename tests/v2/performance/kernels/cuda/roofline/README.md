@@ -476,3 +476,36 @@ tokens and the same 57 verifier transactions, 456 verifier rows, and
 The tuned-first comparison used the narrower Release specialization. Its
 median was 43.73 tokens/s, followed by 44.20 for the archived control.
 All six histories and MTP work counts match the prototype comparison.
+The real verifier captures in these runs borrow a device-owned row count.
+Their graph inventory shows the original split projection and reduction on
+both participants, so the fixed-row leaf measurements stand on their own.
+
+### Device-counted vocabulary projection
+
+The QFN main verifier records directly into the final retained timeline.
+Its device controller publishes the live row prefix. A native CUDA IF node
+submits one vocabulary tile per 32 columns for a positive count and skips
+the projection for an empty count. The projection resolves operands before
+the packet loop. Unused MMA lanes borrow a live activation row and the
+epilogue publishes only the live prefix.
+
+The vocabulary replay tests full, partial, empty, and resumed counts through
+the same executable. It also checks the split publication of independently
+recorded fragments that are eligible for child graph import.
+
+The real-weight probe kept the same 16-row capacity across these replays
+and timed 31 consecutive launches per publication. All live logits matched
+serial bytes and the poisoned inactive output bytes survived. The reference
+is 879.53 GB/s for the original 675,430,400-byte Q8_0 weight traversal.
+
+| Live rows | Original counted stage, µs | Arithmetic-only counted stage, µs | Streaming reference |
+| ---: | ---: | ---: | ---: |
+| 0 | 33.990–35.179 | 6.887–7.003 | |
+| 1 | 968.341–972.106 | 775.928–776.126 | 99.0% |
+| 5 | 1039.590–1041.240 | 787.192 | 97.6% |
+| 8 | 2015.975–2029.815 | 797.217–797.399 | 96.3% |
+| 16 | 3077.930–3092.925 | 822.041–822.999 | 93.3–93.4% |
+
+The compiled counted MMA kernel uses 52 registers, zero shared and local
+bytes, and no warp synchronization. The empty stage timing includes the
+activation producer and conditional control.

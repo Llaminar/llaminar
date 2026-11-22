@@ -377,6 +377,36 @@ namespace llaminar2
     }
 
 #if CUDART_VERSION >= 12030
+    namespace
+    {
+        // The retained capture controller records synchronously on one worker.
+        // Keep this borrowed identity within its lexical recording scope.
+        thread_local const CUDAGraphCapture *final_timeline_capture = nullptr;
+    }
+
+    ScopedCUDAFinalTimelineRecording::ScopedCUDAFinalTimelineRecording(
+        const IGPUGraphCapture &capture) noexcept
+        : previous_(final_timeline_capture)
+    {
+        const auto *native = dynamic_cast<const CUDAGraphCapture *>(&capture);
+        final_timeline_capture =
+            native && native->native_capture_active_ &&
+                native->recording_role_ == CUDAGraphCapture::RecordingRole::Fragment &&
+                native->fragment_state_ == CUDAGraphCapture::FragmentState::Recording
+            ? native : nullptr;
+    }
+
+    ScopedCUDAFinalTimelineRecording::~ScopedCUDAFinalTimelineRecording()
+    {
+        final_timeline_capture = previous_;
+    }
+
+    bool ScopedCUDAFinalTimelineRecording::admitsConditionalOn(cudaStream_t stream) noexcept
+    {
+        return final_timeline_capture && final_timeline_capture->native_capture_active_ &&
+            final_timeline_capture->stream_ == stream;
+    }
+
     CUDAActiveCaptureConditional::CUDAActiveCaptureConditional(
         cudaStream_t stream,
         CUDAActiveCaptureConditionalKind kind)

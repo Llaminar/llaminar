@@ -29,6 +29,7 @@
 
 namespace llaminar2
 {
+    class CUDAGraphCapture;
     class NvidiaDeviceContext;
 
     /**
@@ -71,6 +72,40 @@ namespace llaminar2
         std::uint64_t value) noexcept;
 
 #if CUDART_VERSION >= 12030
+    /**
+     * @brief Bind the recording thread to a fragment of its final native timeline.
+     *
+     * CUDA conditional handles cannot be cloned into a parent graph. Kernel
+     * launchers can add them to an ordered timeline only while the backend is
+     * recording directly into that timeline's native definition. This lexical
+     * scope authenticates the backend's existing ownership and exact stream.
+     */
+    class ScopedCUDAFinalTimelineRecording final
+    {
+    public:
+        /**
+         * @brief Open the recording-thread scope immediately after beginCapture().
+         * @param capture Active backend graph capture. An independent capture
+         *                cannot authorize an ordered-timeline conditional.
+         */
+        explicit ScopedCUDAFinalTimelineRecording(const IGPUGraphCapture &capture) noexcept;
+        /** @brief Restore the surrounding recording authority. */
+        ~ScopedCUDAFinalTimelineRecording();
+
+        ScopedCUDAFinalTimelineRecording(const ScopedCUDAFinalTimelineRecording &) = delete;
+        ScopedCUDAFinalTimelineRecording &operator=(const ScopedCUDAFinalTimelineRecording &) = delete;
+
+        /**
+         * @brief Check whether the exact CUDA stream records in the final definition.
+         * @param stream Native stream on which a conditional would be appended.
+         * @return True while the owner records an in-place timeline fragment on this stream.
+         */
+        [[nodiscard]] static bool admitsConditionalOn(cudaStream_t stream) noexcept;
+
+    private:
+        const CUDAGraphCapture *previous_; ///< Surrounding scope on the recording thread.
+    };
+
     /**
      * @brief Body identity for one native CUDA conditional transaction.
      *
@@ -417,6 +452,8 @@ namespace llaminar2
         int deviceOrdinal() const noexcept { return device_ordinal_; }
 
     private:
+        friend class ScopedCUDAFinalTimelineRecording;
+
         /** @copydoc IGPUGraphCapture::appendActiveCaptureChild */
         [[nodiscard]] bool appendActiveCaptureChild(const IGPUGraphCapture &child) override;
 

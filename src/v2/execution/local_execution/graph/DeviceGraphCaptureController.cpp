@@ -20,6 +20,10 @@
 #include "GraphCaptureStageActivity.h"
 #include "RetainedParentPerfEvidence.h"
 
+#ifdef HAVE_CUDA
+#include "../../../backends/cuda/CUDAGraphCapture.h"
+#endif
+
 #include "../coherence/CoherencePolicy.h"
 #include "../../../tensors/TensorClasses.h"
 #include "../../../utils/DebugEnv.h"
@@ -5268,6 +5272,9 @@ namespace llaminar2
                         result.reset_cache = true;
                         return result;
                     }
+#if defined(HAVE_CUDA) && CUDART_VERSION >= 12030
+                    const ScopedCUDAFinalTimelineRecording final_timeline_recording(*seg.capture);
+#endif
                     capture_begin_ns = static_cast<std::uint64_t>(
                         std::max<std::int64_t>(
                             0,

@@ -43,6 +43,7 @@
 #include "backends/BackendManager.h"
 #include "backends/cuda/CUDAHardwareMetadata.h"
 #include "CUDANativeQuantisedArchitecture.h"
+#include "backends/cuda/CUDAGraphCapture.h"
 #include "utils/DebugEnv.h"
 #include "utils/PerfStatsCollector.h"
 #include "utils/PrefillGraphBucketDefaults.h"
@@ -1036,8 +1037,9 @@ namespace
     /** @brief Publication schedule used by an admitted tensor-core verifier launch. */
     enum class TensorCoreVerifierPublication : uint8_t
     {
-        OrderedPartials,
-        OrderedSinglePartition,
+        OrderedPartials,               ///< Split scratch and independent ordered reduction.
+        OrderedSinglePartition,        ///< Direct publication for a fixed row tile.
+        OrderedCountedSinglePartition, ///< Live conditional tile with direct publication.
     };
 
     /** Record one byte-gated tensor-core verifier candidate invocation. */
@@ -1057,6 +1059,18 @@ namespace
         if (!llaminar2::PerfStatsCollector::isDomainEnabled("kernel"))
             return;
 
+        const char *publication_name = "ordered_partials";
+        switch (publication)
+        {
+            case TensorCoreVerifierPublication::OrderedPartials:
+                break;
+            case TensorCoreVerifierPublication::OrderedSinglePartition:
+                publication_name = "ordered_single_partition";
+                break;
+            case TensorCoreVerifierPublication::OrderedCountedSinglePartition:
+                publication_name = "ordered_counted_single_partition";
+                break;
+        }
         llaminar2::PerfStatsCollector::addCounter(
             "kernel",
             "cuda_native_quantised_gemv_dispatch",
@@ -1087,10 +1101,8 @@ namespace
                 {"max_kb", std::to_string(serial_tuning.max_kb)},
                 {"exact_kb", std::to_string(serial_tuning.exact_kb)},
                 {"force_two_phase",
-                 publication == TensorCoreVerifierPublication::OrderedSinglePartition ? "0" : "1"},
-                {"publication",
-                 publication == TensorCoreVerifierPublication::OrderedSinglePartition
-                     ? "ordered_single_partition" : "ordered_partials"},
+                 publication == TensorCoreVerifierPublication::OrderedPartials ? "1" : "0"},
+                {"publication", publication_name},
                 {"rowmajor_available", "false"}});
     }
 
@@ -2089,8 +2101,25 @@ namespace
     constexpr int kQFNVocabularyReduction = 2560;
     constexpr int kQFNVocabularyTileRows = 16;
 
+#if CUDART_VERSION >= 12030
     /**
-     * @brief Project and publish a fixed, full-range QFN vocabulary tile.
+     * @brief Select one fixed-width vocabulary tile from its device row owner.
+     * @tparam CB Physical normalized INT8 codebook in the owning CUDA shard.
+     * @param condition CUDA-owned predicate reset by the retained graph.
+     * @param rows Ordered live-prefix authority for this invocation.
+     */
+    template <uint8_t CB>
+    __global__ void publishQFNVocabularyVerifierPredicate(
+        cudaGraphConditionalHandle condition, llaminar2::DeviceRowRange rows)
+    {
+        static_assert(CB == 19);
+        if (rows.activeRows() > 0)
+            cudaGraphSetConditional(condition, 1u);
+    }
+#endif
+
+    /**
+     * @brief Project and publish one live QFN vocabulary tile.
      *
      * The prepared Q8 weight and activation planes already contain the four
      * signed bytes of each MMA operand register. Each lane loads the same
@@ -2098,23 +2127,25 @@ namespace
      * The original one-partition FP32 fold is performed before the final store.
      *
      * @tparam CB Physical normalized INT8 codebook in the owning CUDA shard.
+     * @tparam LiveRows Immutable row count or its ordered device range.
      * @param activations Aligned Q8 activation codes in original row order.
      * @param payload Aligned prepared weight packets in [K32][column] order.
      * @param weight_scales Original FP16 weight scale per packet.
      * @param activation_scales Original K32 activation scales.
      * @param output Final FP32 logits owned by this graph stage.
-     * @param rows Exact fixed live width of the captured projection.
+     * @param live_rows Exact active rows, resolved from the row owner before the dot loop.
      * @param alpha Original output multiplier.
      * @pre The SM86 capture admits the complete vocabulary rectangle, one
-     *      ordered K partition, zero beta, and no bias.
+     *      ordered K partition, zero beta, and no bias. A counted tile is
+     *      submitted by the parent only when its live prefix is nonempty.
      */
-    template <uint8_t CB>
+    template <uint8_t CB, class LiveRows>
     __global__ __launch_bounds__(128, 8) void nativeQuantisedGemvQ8TensorCorePublish(
         const int8_t *__restrict__ activations,
         const uint8_t *__restrict__ payload,
         const uint16_t *__restrict__ weight_scales,
         const float *__restrict__ activation_scales,
-        float *__restrict__ output, int rows, float alpha)
+        float *__restrict__ output, LiveRows live_rows, float alpha)
     {
         static_assert(CB == 19);
 #if __CUDA_ARCH__ >= 800
@@ -2122,15 +2153,22 @@ namespace
         constexpr int kReduction = kQFNVocabularyReduction;
         constexpr int kPackets = kReduction / BLOCK_K;
         constexpr int kWords = BLOCK_K / sizeof(uint32_t);
+        const int rows = [&]() {
+            if constexpr (std::is_same_v<LiveRows, int>)
+                return live_rows;
+            else
+                return live_rows.activeRows();
+        }();
         const int warp = threadIdx.x / 32;
         const int lane = threadIdx.x & 31;
         const int lane_row = lane >> 2;
         const int kword = lane & 3;
         const int column_base = blockIdx.x * 32 + warp * 8;
-        const int row0 = lane_row;
-        const int row1 = row0 + 8;
-        const bool live_row0 = row0 < rows;
-        const bool live_row1 = row1 < rows;
+        // Fill unused native MMA lanes from one valid operand row. Each
+        // live row retains its original source address and the epilogue
+        // publishes only the live prefix. The packet loop needs no row tests.
+        const int row0 = min(lane_row, rows - 1);
+        const int row1 = min(lane_row + 8, rows - 1);
         const int source_column = column_base + lane_row;
         const int output_column = column_base + kword * 2;
         const auto *activation_words = reinterpret_cast<const uint32_t *>(activations);
@@ -2145,17 +2183,12 @@ namespace
         {
             const int activation_offset = packet * kWords;
             const int weight_offset = packet * kColumns * kWords;
-            uint32_t a[4] = {};
-            if (live_row0)
-            {
-                a[0] = activation_words[activation_base0 + activation_offset];
-                a[2] = activation_words[activation_base0 + activation_offset + 4];
-            }
-            if (live_row1)
-            {
-                a[1] = activation_words[activation_base1 + activation_offset];
-                a[3] = activation_words[activation_base1 + activation_offset + 4];
-            }
+            const uint32_t a[] = {
+                activation_words[activation_base0 + activation_offset],
+                activation_words[activation_base1 + activation_offset],
+                activation_words[activation_base0 + activation_offset + 4],
+                activation_words[activation_base1 + activation_offset + 4],
+            };
             const uint32_t b[] = {
                 weight_words[weight_base + weight_offset],
                 weight_words[weight_base + weight_offset + 4],
@@ -2167,18 +2200,12 @@ namespace
             const float w0 = llaminar2::cuda_native_quantised::fp16_bits_to_float(weight_scales[scale_offset]);
             const float w1 = llaminar2::cuda_native_quantised::fp16_bits_to_float(weight_scales[scale_offset + 1]);
             using llaminar2::device_native_quantised_contract::singleScaleBlock;
-            if (live_row0)
-            {
-                const float scale = activation_scales[activation_scale_base0 + packet];
-                acc[0] = __fadd_rn(acc[0], singleScaleBlock(dot[0], w0, scale));
-                acc[1] = __fadd_rn(acc[1], singleScaleBlock(dot[1], w1, scale));
-            }
-            if (live_row1)
-            {
-                const float scale = activation_scales[activation_scale_base1 + packet];
-                acc[2] = __fadd_rn(acc[2], singleScaleBlock(dot[2], w0, scale));
-                acc[3] = __fadd_rn(acc[3], singleScaleBlock(dot[3], w1, scale));
-            }
+            const float scale0 = activation_scales[activation_scale_base0 + packet];
+            const float scale1 = activation_scales[activation_scale_base1 + packet];
+            acc[0] = __fadd_rn(acc[0], singleScaleBlock(dot[0], w0, scale0));
+            acc[1] = __fadd_rn(acc[1], singleScaleBlock(dot[1], w1, scale0));
+            acc[2] = __fadd_rn(acc[2], singleScaleBlock(dot[2], w0, scale1));
+            acc[3] = __fadd_rn(acc[3], singleScaleBlock(dot[3], w1, scale1));
         }
 
 #pragma unroll
@@ -2884,15 +2911,54 @@ namespace
             if (hardware.sm_major == 8 && hardware.sm_minor == 6 &&
                 N == kQFNVocabularyColumns && K == kQFNVocabularyReduction &&
                 M <= kQFNVocabularyTileRows && rows.physicalRows() == M &&
-                kb == 1 && beta == 0.0f && !d_bias && !rows.countOwner())
+                kb == 1 && beta == 0.0f && !d_bias)
             {
                 static_assert(kQFNVocabularyColumns % 32 == 0);
-                nativeQuantisedGemvQ8TensorCorePublish<CB><<<
-                    dim3(N / 32), 128, 0, stream>>>(
+                const dim3 grid(N / 32);
+                const dim3 block(128);
+                if (!rows.countOwner())
+                {
+                    nativeQuantisedGemvQ8TensorCorePublish<CB><<<grid, block, 0, stream>>>(
                         d_A_int8, d_payload, d_scales, d_scales_A, d_C, M, alpha);
-                if (cudaGetLastError() != cudaSuccess)
-                    return std::nullopt;
-                return TensorCoreVerifierPublication::OrderedSinglePartition;
+                    if (cudaGetLastError() != cudaSuccess)
+                        return std::nullopt;
+                    return TensorCoreVerifierPublication::OrderedSinglePartition;
+                }
+#if CUDART_VERSION >= 12030
+                if (llaminar2::ScopedCUDAFinalTimelineRecording::admitsConditionalOn(stream))
+                {
+                    // A nonempty prefix shares the same single MMA tile. Every
+                    // CTA then owns live columns. The zero prefix never enters
+                    // the arithmetic graph and leaves logits untouched.
+                    llaminar2::CUDAActiveCaptureConditional transaction(
+                        stream, llaminar2::CUDAActiveCaptureConditionalKind::IfOnly);
+                    void *arguments[] = {
+                        &d_A_int8, &d_payload, &d_scales, &d_scales_A, &d_C, &rows, &alpha,
+                    };
+                    const cudaKernelNodeParams node{
+                        .func = reinterpret_cast<void *>(nativeQuantisedGemvQ8TensorCorePublish<CB, Rows>),
+                        .gridDim = grid,
+                        .blockDim = block,
+                        .sharedMemBytes = 0,
+                        .kernelParams = arguments,
+                        .extra = nullptr,
+                    };
+                    if (!transaction.publishPredicate([&](cudaGraphConditionalHandle condition) {
+                            publishQFNVocabularyVerifierPredicate<CB><<<1, 1, 0, stream>>>(condition, rows);
+                            return cudaGetLastError() == cudaSuccess;
+                        }) ||
+                        !transaction.beginBranches() ||
+                        !transaction.appendKernel(
+                            llaminar2::CUDAActiveCaptureConditionalBranch::IfNonZero,
+                            node, "QFN counted vocabulary projection") ||
+                        !transaction.commit())
+                    {
+                        throw std::runtime_error("CUDA QFN vocabulary verifier failed to record its live-row conditional: " +
+                                                 transaction.error());
+                    }
+                    return TensorCoreVerifierPublication::OrderedCountedSinglePartition;
+                }
+#endif
             }
         }
 
