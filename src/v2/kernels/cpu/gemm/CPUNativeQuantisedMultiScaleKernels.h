@@ -51,7 +51,8 @@ namespace llaminar2::cpu::native_quantised::multi_scale
         return true;
     }
     static_assert(gridFitsSignedDot(iq2s_grid) && gridFitsSignedDot(iq2xs_grid) &&
-                  gridFitsSignedDot(iq1s_grid), "Native grids must exclude the non-negatable INT8 minimum");
+                  gridFitsSignedDot(iq1s_grid) && gridFitsSignedDot(iq3xxs_grid64),
+                  "Native grids must exclude the non-negatable INT8 minimum");
 
 #if defined(__GNUC__) && !defined(__clang__)
 #define LLAMINAR_MULTISCALE_EXACT __attribute__((optimize("fp-contract=off", "no-associative-math")))
@@ -396,7 +397,32 @@ namespace llaminar2::cpu::native_quantised::multi_scale
                 dots[Rows - 1] = Ops::dot(dots[Rows - 1], second, I{} + word1);
             }
         };
-        if constexpr (Codebook == 13 || Codebook == 14 || Codebook == 15 ||
+        if constexpr (Codebook == 12)
+        {
+            // IQ3_XXS: eight four-value grid entries per block.  Two adjacent
+            // groups share one sign byte (bits 0..3 even, 4..7 odd) and are
+            // decoded as one eight-value consume against the mirrored 64-bit
+            // table whose upper half is zero.
+            const auto quarter = [&]<int Q>() {
+                const auto word = [&](int offset) {
+                    return load<I>(unit + offset * 256 + column * 4);
+                };
+                const I index_even = (word((2 * Q) / 4) >> (8 * ((2 * Q) % 4))) & 255;
+                const I index_odd = (word((2 * Q + 1) / 4) >> (8 * ((2 * Q + 1) % 4))) & 255;
+                // signGrid tests one bit per value byte, so the shared sign
+                // byte must be replicated into every byte of each lane.
+                const I signs = Ops::template repeatByte<Q>(word(2));
+                I low, high, unused;
+                Ops::gridPair(iq3xxs_grid64, index_even, low, unused);
+                Ops::gridPair(iq3xxs_grid64, index_odd, high, unused);
+                low = Ops::template signGrid<0>(low, signs);
+                high = Ops::template signGrid<1>(high, signs);
+                consume(low, high, Q * 8);
+            };
+            quarter.template operator()<Half * 2>();
+            quarter.template operator()<Half * 2 + 1>();
+        }
+        else if constexpr (Codebook == 13 || Codebook == 14 || Codebook == 15 ||
                       Codebook == 16 || Codebook == 17)
         {
             const auto quarter = [&]<int Q>() {
@@ -471,6 +497,42 @@ namespace llaminar2::cpu::native_quantised::multi_scale
         using I = typename Ops::I;
         if constexpr (usesRowPairs<Ops> && Rows >= 2)
             return dotHalfRowPairs<Codebook, Half, Lanes, Rows, Ops>(unit, column, activation, kb, dots);
+        else if constexpr (Codebook == 12)
+        {
+            // IQ3_XXS: pair two adjacent four-value groups per consume; the
+            // per-half consume applies the matching sign half and the offset
+            // encoding owned by the arithmetic family.
+            const auto quarter = [&]<int Q>() {
+                const auto word = [&](int offset) {
+                    return load<I>(unit + offset * 256 + column * 4);
+                };
+                const I index_even = (word((2 * Q) / 4) >> (8 * ((2 * Q) % 4))) & 255;
+                const I index_odd = (word((2 * Q + 1) / 4) >> (8 * ((2 * Q + 1) % 4))) & 255;
+                // signGrid tests one bit per value byte, so the shared sign
+                // byte must be replicated into every byte of each lane.
+                const I signs = Ops::template repeatByte<Q>(word(2));
+                I low, high, unused;
+                Ops::gridPair(iq3xxs_grid64, index_even, low, unused);
+                Ops::gridPair(iq3xxs_grid64, index_odd, high, unused);
+                const auto consume = [&]<int H>(I weights) {
+                    weights = Ops::template signGrid<H>(weights, signs);
+                    if constexpr (Lanes == 16)
+                        weights ^= static_cast<int>(0x80808080u);
+#pragma GCC unroll 4
+                    for (size_t row = 0; row < Rows; ++row)
+                    {
+                        int activation_word = 0;
+                        std::memcpy(&activation_word,
+                            activation[row][kb].qs + Q * 8 + H * 4, 4);
+                        dots[row] = Ops::dot(dots[row], weights, I{} + activation_word);
+                    }
+                };
+                consume.template operator()<0>(low);
+                consume.template operator()<1>(high);
+            };
+            quarter.template operator()<Half * 2>();
+            quarter.template operator()<Half * 2 + 1>();
+        }
         else if constexpr (Codebook == 13 || Codebook == 14 || Codebook == 15 ||
                            Codebook == 16 || Codebook == 17)
         {
@@ -742,8 +804,11 @@ namespace llaminar2::cpu::native_quantised::multi_scale
 #define LLAMINAR_MULTISCALE_CASE(C) case C: return rows<C, Lanes, Rows, Reduction::Contiguous, Packed, Ops>(packed, activation, output, chunk, begin, end, accumulate, 1, 0, columns)
         LLAMINAR_MULTISCALE_CASE(9);
         LLAMINAR_MULTISCALE_CASE(10);
+        LLAMINAR_MULTISCALE_CASE(12);
         LLAMINAR_MULTISCALE_CASE(13);
         LLAMINAR_MULTISCALE_CASE(14);
+        LLAMINAR_MULTISCALE_CASE(15);
+        LLAMINAR_MULTISCALE_CASE(16);
         LLAMINAR_MULTISCALE_CASE(17);
 #undef LLAMINAR_MULTISCALE_CASE
         }
@@ -785,8 +850,11 @@ namespace llaminar2::cpu::native_quantised::multi_scale
 #define LLAMINAR_MULTISCALE_ORDERED_CASE(C) case C: return rows<C, Lanes, Rows, Reduction::OrderedPartitions, Packed, Ops>(packed, activation, output, chunk, 0, blocks, false, partitions, blocks_per_partition, columns)
         LLAMINAR_MULTISCALE_ORDERED_CASE(9);
         LLAMINAR_MULTISCALE_ORDERED_CASE(10);
+        LLAMINAR_MULTISCALE_ORDERED_CASE(12);
         LLAMINAR_MULTISCALE_ORDERED_CASE(13);
         LLAMINAR_MULTISCALE_ORDERED_CASE(14);
+        LLAMINAR_MULTISCALE_ORDERED_CASE(15);
+        LLAMINAR_MULTISCALE_ORDERED_CASE(16);
         LLAMINAR_MULTISCALE_ORDERED_CASE(17);
 #undef LLAMINAR_MULTISCALE_ORDERED_CASE
         }

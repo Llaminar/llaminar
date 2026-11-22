@@ -98,9 +98,9 @@ namespace llaminar2
     [[nodiscard]] inline constexpr bool hasCompactMultiScaleVnniPayload(
         uint8_t codebook) noexcept
     {
-        return codebook == 9 || codebook == 10 || codebook == 13 ||
-               codebook == 14 || codebook == 15 || codebook == 16 ||
-               codebook == 17;
+        return codebook == 9 || codebook == 10 || codebook == 12 ||
+               codebook == 13 || codebook == 14 || codebook == 15 ||
+               codebook == 16 || codebook == 17;
     }
 
     /**

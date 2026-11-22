@@ -134,7 +134,7 @@ namespace llaminar2::cpu::native_quantised
             case Encoding::CompactMultiScale:
                 switch (weights.codebook_id)
                 {
-                case 9: case 10: case 13: case 14: case 17: implemented = true; break;
+                case 9: case 10: case 12: case 13: case 14: case 15: case 16: case 17: implemented = true; break;
                 }
                 break;
             }
