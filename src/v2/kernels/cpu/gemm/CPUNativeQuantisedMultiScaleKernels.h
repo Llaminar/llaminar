@@ -93,7 +93,7 @@ namespace llaminar2::cpu::native_quantised::multi_scale
             return std::bit_cast<I>(_mm256_sub_epi8(std::bit_cast<__m256i>(a), std::bit_cast<__m256i>(b)));
         }
         /** @return Selected four-byte halves of immutable eight-byte grid entries. */
-        static I grid(const uint64_t *table, I index, int half)
+        static inline __attribute__((always_inline)) I grid(const uint64_t *table, I index, int half)
         {
             return std::bit_cast<I>(_mm256_i32gather_epi32(
                 reinterpret_cast<const int *>(table), std::bit_cast<__m256i>(index * 2 + half), 4));
@@ -118,7 +118,7 @@ namespace llaminar2::cpu::native_quantised::multi_scale
                 _mm256_xor_si256(std::bit_cast<__m256i>(values), negative), negative));
         }
         /** @brief Load both four-byte halves with the AVX2 gather geometry. */
-        static void gridPair(const uint64_t *table, I index, I &low, I &high)
+        static inline __attribute__((always_inline)) void gridPair(const uint64_t *table, I index, I &low, I &high)
         {
             low = grid(table, index, 0);
             high = grid(table, index, 1);
@@ -211,7 +211,7 @@ namespace llaminar2::cpu::native_quantised::multi_scale
          * rearrange integer bytes. No decoded-weight cache or wider prepared
          * representation is created.
          */
-        static void gridPair(const uint64_t *table, I index, I &low, I &high)
+        static inline __attribute__((always_inline)) void gridPair(const uint64_t *table, I index, I &low, I &high)
         {
             const __m512i indices = std::bit_cast<__m512i>(index);
             const __m512i first = _mm512_i32gather_epi64(

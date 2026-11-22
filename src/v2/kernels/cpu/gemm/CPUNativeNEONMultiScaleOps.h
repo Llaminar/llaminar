@@ -206,7 +206,7 @@ namespace llaminar2::cpu::native_quantised::multi_scale
          * @param low Receives the first four source bytes per column.
          * @param high Receives the last four source bytes per column.
          */
-        static void gridPair(const std::uint64_t *table, I index, I &low, I &high) noexcept
+        static inline __attribute__((always_inline)) void gridPair(const std::uint64_t *table, I index, I &low, I &high) noexcept
         {
             const auto indices = std::bit_cast<int32x4_t>(index);
             auto first = vdupq_n_u64(0);
