@@ -27139,7 +27139,7 @@ add_v2_test(V2_Integration_HeterogeneousTicketLifecycleEvidence
 )
 add_v2_test(V2_Integration_QFNMappedDecodeSharedFFNOrdering
     COMMAND $<TARGET_FILE:v2_test_forward_graph_types>
-        --gtest_filter=Test__GraphSegmentCache.HeterogeneousTicketMappedSharedFFNOrdering
+        --gtest_filter=Test__GraphSegmentCache.HeterogeneousTicketMapped*Contract:Test__GraphSegmentCache.HeterogeneousTicketMappedSharedFFNOrdering
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;GraphCapture;ExpertOverlay;Regression"
     MPI_PROCS 1
     NO_MPI NO_MODELS

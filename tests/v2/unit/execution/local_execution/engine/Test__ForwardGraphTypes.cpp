@@ -5493,6 +5493,86 @@ TEST(Test__GraphSegmentCache, HeterogeneousTicketMappedSharedFFNOrdering)
     }
 }
 
+/** @test Local program lowering preserves external ticket and collective ordering and capture cutpoints. */
+TEST(Test__GraphSegmentCache, HeterogeneousTicketMappedLocalProgramContract)
+{
+    const auto device = DeviceId::cuda(0);
+    const auto program = [&] { return std::make_unique<FakeSegmentStage>(device, true); };
+    ComputeGraph graph;
+    for (const char* name : {"hc", "router", "routed", "shared", "packet", "cutpoint", "ingress"})
+        graph.addNode(name, program(), device);
+    addFakeSegmentStage(graph, "cpu", false, true, ComputeStageType::COPY,
+        false, false, false, nullptr, DeviceId::cpu(), true);
+    graph.addDependency("router", "hc").addDependency("routed", "router")
+        .addDependency("shared", "hc").addDependency("packet", "router")
+        .addDependency("cutpoint", "routed").addDependency("cutpoint", "packet")
+        .addDependency("cpu", "cutpoint").addDependency("ingress", "cpu")
+        .addDependency("ingress", "shared");
+    graph.setGraphCaptureWaveContract("router", {.identity = "route"});
+    graph.setGraphCaptureWaveContract("routed", {.identity = "local"});
+    graph.setGraphCaptureWaveContract("packet", {.identity = "transport"});
+
+    const std::vector<std::string> members{"hc", "router", "routed", "shared"};
+    const std::array exports{LocalRegionExport{"router", {"packet"}}, LocalRegionExport{"shared", {"ingress"}}};
+    const auto policy = LocalRegionCapturePolicy::HeterogeneousTicketLocal;
+    EXPECT_THROW(graph.replaceClosedLocalRegion(members, "routed", program(), exports, policy), std::invalid_argument);
+
+    graph.setNativeCaptureEnvelope(GraphNativeCaptureEnvelope::HeterogeneousTicketAuthorityTransaction);
+    graph.setHeterogeneousTicketUnitContract("cutpoint", {.identity = "cpu_cutpoint"});
+    graph.setTerminalNode("ingress");
+    graph.setHeterogeneousTicketUnitContract("ingress", {.identity = "terminal",
+        .disposition = GraphHeterogeneousTicketUnitDisposition::TransactionTerminal});
+
+    EXPECT_THROW(graph.replaceClosedLocalRegion(members, "routed", program(), exports), std::invalid_argument);
+    EXPECT_THROW(graph.replaceClosedLocalRegion(
+        {"hc", "router", "routed", "shared", "packet", "cutpoint"}, "routed", program(), {}, policy),
+        std::invalid_argument);
+    ASSERT_NO_THROW(graph.replaceClosedLocalRegion(members, "routed", program(), exports, policy));
+    EXPECT_FALSE(graph.getNode("routed")->graph_capture_wave);
+    EXPECT_EQ(graph.getNode("router"), nullptr);
+    EXPECT_EQ(graph.getNode("packet")->graph_capture_wave->identity, "transport");
+    EXPECT_EQ(graph.getNode("packet")->dependencies, std::vector<std::string>{"routed"});
+    EXPECT_EQ(graph.getNode("cutpoint")->heterogeneous_ticket_unit_contract->identity, "cpu_cutpoint");
+    EXPECT_EQ(graph.getNode("ingress")->heterogeneous_ticket_unit_contract->identity, "terminal");
+
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    ASSERT_NO_THROW(DeviceGraphCaptureController::buildCapturePlan(graph, cache, nullptr, false, false,
+        DeviceGraphExecutor::GraphReplayPlanPolicy::AllowHeterogeneousBoundarySegmentation));
+    ASSERT_EQ(cache.segments.size(), 3u);
+    EXPECT_EQ(cache.segments[0].stage_names, (std::vector<std::string>{"routed", "packet", "cutpoint"}));
+    EXPECT_EQ(cache.segments[1].stage_names, std::vector<std::string>{"cpu"});
+    EXPECT_EQ(cache.segments[2].stage_names, std::vector<std::string>{"ingress"});
+}
+
+/** @test A follower retains a cutpoint on its existing fused local producer. */
+TEST(Test__GraphSegmentCache, HeterogeneousTicketMappedFollowerLocalProgramContract)
+{
+    const auto device = DeviceId::cuda(0);
+    const auto program = [&] { return std::make_unique<FakeSegmentStage>(device, true); };
+    ComputeGraph graph;
+    for (const char* name : {"router", "routed", "ingress"})
+        graph.addNode(name, program(), device);
+    graph.addDependency("routed", "router").addDependency("ingress", "routed");
+    graph.setNativeCaptureEnvelope(GraphNativeCaptureEnvelope::HeterogeneousTicketFollowerTransaction);
+    graph.setGraphCaptureWaveContract("routed", {.identity = "local"});
+    graph.setHeterogeneousTicketUnitContract("routed", {.identity = "cpu_cutpoint"});
+    graph.setTerminalNode("ingress");
+    graph.setHeterogeneousTicketUnitContract("ingress", {.identity = "terminal",
+        .disposition = GraphHeterogeneousTicketUnitDisposition::TransactionTerminal});
+
+    ASSERT_NO_THROW(graph.replaceClosedLocalRegion({"router", "routed"}, "routed", program(), {},
+        LocalRegionCapturePolicy::HeterogeneousTicketLocal));
+    ASSERT_TRUE(graph.getNode("routed")->heterogeneous_ticket_unit_contract);
+    EXPECT_EQ(graph.getNode("routed")->heterogeneous_ticket_unit_contract->identity, "cpu_cutpoint");
+    EXPECT_FALSE(graph.getNode("routed")->graph_capture_wave);
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    ASSERT_NO_THROW(DeviceGraphCaptureController::buildCapturePlan(graph, cache, nullptr, false, false,
+        DeviceGraphExecutor::GraphReplayPlanPolicy::AllowHeterogeneousBoundarySegmentation));
+    ASSERT_EQ(cache.segments.size(), 2u);
+    EXPECT_EQ(cache.segments[0].stage_names, std::vector<std::string>{"routed"});
+    EXPECT_EQ(cache.segments[1].stage_names, std::vector<std::string>{"ingress"});
+}
+
 /**
  * @brief Prove the typed ticket envelope admits only its exact segmented plan.
  *

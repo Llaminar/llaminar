@@ -46,6 +46,13 @@ namespace llaminar2
         std::vector<std::string> consumers; ///< Exact existing outside readers on this participant.
     };
 
+    /** @brief Capture lifecycle under which a cold local region may be contracted. */
+    enum class LocalRegionCapturePolicy : uint8_t
+    {
+        Unannotated, ///< Original region and exports own no capture metadata.
+        HeterogeneousTicketLocal, ///< Ticket units own segmentation; retire active wave labels and preserve a retained sink's cutpoint.
+    };
+
     /** @brief Select the complete DAG or only nodes executed by its main native units. */
     enum class GraphLeafScope : uint8_t
     {
@@ -468,6 +475,7 @@ namespace llaminar2
          * @param terminal Retained completion node for every output of the replacement.
          * @param replacement Complete local stage retaining the original public buffers and leases.
          * @param exports Exact original interior-producer/outside-consumer edges to redirect.
+         * @param capture_policy Original ownership of capture segmentation; ticket boundaries remain external.
          * @return This graph after one atomic topology mutation.
          * @throws std::invalid_argument Before mutation for incomplete exports, foreign readers,
          * disconnected work, forbidden metadata or any cycle introduced by region contraction.
@@ -476,6 +484,12 @@ namespace llaminar2
          * inventing an original dependency. The complete proposed DAG is validated before
          * mutation, so a path leaving and re-entering the region cannot deadlock capture.
          * Empty exports retain the strict single-output contract of the other overload.
+         */
+        ComputeGraph &replaceClosedLocalRegion(const std::vector<std::string> &region,
+            const std::string &terminal,std::unique_ptr<IComputeStage> replacement,
+            std::span<const LocalRegionExport> exports,LocalRegionCapturePolicy capture_policy);
+        /** @copydoc replaceClosedLocalRegion
+         * @details The original strict policy requires unannotated member and reader nodes.
          */
         ComputeGraph &replaceClosedLocalRegion(const std::vector<std::string> &region,
             const std::string &terminal,std::unique_ptr<IComputeStage> replacement,
