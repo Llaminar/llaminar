@@ -181,10 +181,18 @@ namespace llaminar2
                 throw std::invalid_argument(
                     "CPU expert slot projection byte capacity overflows size_t");
             }
-            const std::size_t destination_bytes =
-                static_cast<std::size_t>(unit_count) *
-                static_cast<std::size_t>(
-                    packed.interleaved_block_stride);
+            std::size_t destination_bytes;
+            if (packed.usesCompactMultiScale() &&
+                cpu::native_quantised::preparedCompactGroupScaleLayout(packed.codebook_id))
+                destination_bytes = cpu::native_quantised::preparedCompactResidentBytes(
+                    packed.codebook_id,
+                    static_cast<std::size_t>(packed.N_padded) / 64,
+                    static_cast<std::size_t>(packed.blocks_per_row));
+            else
+                destination_bytes =
+                    static_cast<std::size_t>(unit_count) *
+                    static_cast<std::size_t>(
+                        packed.interleaved_block_stride);
             if (requires_dedicated_mapping)
             {
                 packed.native_interleaved.replace(

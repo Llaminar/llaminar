@@ -60,12 +60,14 @@ inline void initializeNativeWindowOutput(const NativeQuantisedFormatInfo& format
     out.N=n;out.K=k;out.N_padded=(n+63)/64*64;out.blocks_per_row=(k+31)/32;
     out.payload_bytes=format.payload_bytes;out.codebook_id=format.codebook_id;
     out.is_asymmetric=format.is_asymmetric;out.is_superblock=format.is_superblock;
-    out.encoding=preparedEncodingForSource(format);out.data_stride=preparedDataStride(out.encoding);
-    out.interleaved_block_stride=preparedInterleavedBlockStride(out.encoding,out.is_asymmetric);
+    out.encoding=preparedEncodingForSource(format);out.data_stride=preparedDataStride(out.encoding,out.codebook_id);
+    out.interleaved_block_stride=preparedInterleavedBlockStride(out.encoding,out.is_asymmetric,out.codebook_id);
     const auto chunks=size_t(out.N_padded/64),blocks=size_t(out.blocks_per_row);
-    if(blocks && chunks>std::numeric_limits<size_t>::max()/blocks/out.interleaved_block_stride)
+    const bool group_layout=out.usesCompactMultiScale()&&preparedCompactGroupScaleLayout(out.codebook_id);
+    const auto slots=group_layout?size_t((blocks+7)/8)*preparedCompactGroupStride(out.codebook_id):blocks*out.interleaved_block_stride;
+    if(slots && chunks>std::numeric_limits<size_t>::max()/slots)
         throw std::overflow_error("Native weight final extent overflows");
-    out.native_interleaved.replace(placement.allocate<uint8_t>(chunks*blocks*out.interleaved_block_stride));
+    out.native_interleaved.replace(placement.allocate<uint8_t>(chunks*slots));
 }
 
 /**
@@ -100,8 +102,11 @@ inline void appendNativeWeightGroups(const IINT8Unpackable& source,const NativeQ
        out.encoding!=preparedEncodingForSource(format) || out.N<=0 || out.K<=0 ||
        out.N_padded!=int((size_t(out.N)+63)/64*64) ||
        out.blocks_per_row!=int((size_t(out.K)+31)/32) ||
-       out.interleaved_block_stride!=preparedInterleavedBlockStride(out.encoding,out.is_asymmetric) ||
-       out.native_interleaved.size()!=size_t(out.N_padded/64)*out.blocks_per_row*out.interleaved_block_stride ||
+       out.interleaved_block_stride!=preparedInterleavedBlockStride(out.encoding,out.is_asymmetric,out.codebook_id) ||
+       out.native_interleaved.size()!=size_t(out.N_padded/64)*
+           (preparedCompactGroupScaleLayout(out.codebook_id)
+               ? size_t((out.blocks_per_row+7)/8)*preparedCompactGroupStride(out.codebook_id)
+               : size_t(out.blocks_per_row)*out.interleaved_block_stride) ||
        source_k<=0 || source_k>std::numeric_limits<int>::max()-31)
         throw std::invalid_argument("Native append changed original codec or final owned geometry");
     const int group_blocks=format.is_superblock?8:1;
@@ -128,9 +133,18 @@ inline void appendNativeWeightGroups(const IINT8Unpackable& source,const NativeQ
         const int output_first=destination_kb+group*group_blocks;
         // A destination unit is first touched exactly when its original row0
         // arrives. Later partial windows preserve already-written sibling rows.
-        if(first==chunk*64)for(int b=0;b<count;++b)
-            std::memset(interleaved.data()+(size_t(chunk)*out.blocks_per_row+output_first+b)*out.interleaved_block_stride,
-                0,out.interleaved_block_stride);
+        // Group layouts zero the whole 256-value group once at its first block.
+        if(first==chunk*64)for(int b=0;b<count;++b) {
+            const int at=output_first+b;
+            if(preparedCompactGroupScaleLayout(out.codebook_id)) {
+                if(at%8==0)
+                    std::memset(interleaved.data()+
+                        (size_t(chunk)*(size_t((out.blocks_per_row+7)/8))+size_t(at/8))*preparedCompactGroupStride(out.codebook_id),
+                        0,preparedCompactGroupStride(out.codebook_id));
+            } else
+                std::memset(interleaved.data()+(size_t(chunk)*out.blocks_per_row+at)*out.interleaved_block_stride,
+                    0,out.interleaved_block_stride);
+        }
         for(int row=first;row<end;++row) {
             const int local_row=row-destination_row,column=row%64;
             auto* memory=reinterpret_cast<uint8_t*>(scratch.data())+(size_t(local_row)*groups+group)*layout.bytes;
@@ -164,15 +178,31 @@ inline void appendNativeWeightGroups(const IINT8Unpackable& source,const NativeQ
                 mins[b]=source.get_block_min(actual_row,input_first+b);
             }
             for(int b=0;b<count;++b) {
-                auto* target=interleaved.data()+(size_t(chunk)*out.blocks_per_row+output_first+b)*out.interleaved_block_stride;
+                const int at=output_first+b;
+                auto* target=preparedCompactGroupScaleLayout(out.codebook_id)
+                    ? interleaved.data()+(size_t(chunk)*(size_t((out.blocks_per_row+7)/8))+size_t(at/8))*preparedCompactGroupStride(out.codebook_id)
+                        +size_t(at%8)*out.data_stride
+                    : interleaved.data()+(size_t(chunk)*out.blocks_per_row+at)*out.interleaved_block_stride;
                 const auto* input=payload+size_t(b)*format.payload_bytes;
                 if(out.usesCompactMultiScale()) {
                     for(int byte=0;byte<format.payload_bytes;++byte)
                         target[(byte/4)*256+column*4+byte%4]=input[byte];
-                    std::memcpy(target+out.data_stride+column*2,primary+b,2);
-                    std::memcpy(target+out.data_stride+128+column*2,secondary+b,2);
-                    if (out.codebook_id == 10)
-                        std::memcpy(target+out.data_stride+256+column*4,emins+b,4);
+                    if(preparedCompactGroupScaleLayout(out.codebook_id)) {
+                        // One FP16 primary per 256-value group; the source
+                        // packer derives it from superblock constants alone,
+                        // so every sub-block must agree (fail closed), and no
+                        // secondary/effective-minimum is stored for this layout.
+                        auto* group_scale=target+(8-(output_first+b)%8)*out.data_stride+column*2;
+                        if((output_first+b)%8==0)
+                            std::memcpy(group_scale,primary+b,2);
+                        else if(std::memcmp(group_scale,primary+b,2))
+                            throw std::invalid_argument("Compact group scale disagrees across its 256-value block");
+                    } else {
+                        std::memcpy(target+out.data_stride+column*2,primary+b,2);
+                        std::memcpy(target+out.data_stride+128+column*2,secondary+b,2);
+                        if (out.codebook_id == 10)
+                            std::memcpy(target+out.data_stride+256+column*4,emins+b,4);
+                    }
                 } else if(out.usesQ6KNativeDualScale()) {
                     for(int g=0;g<4;++g)std::memcpy(target+g*256+column*4,input+g*4,4);
                     for(int g=0;g<8;++g) {

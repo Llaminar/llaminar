@@ -205,7 +205,14 @@ namespace llaminar2
             int kb) noexcept
         {
             // CPU units are ordered by 64-column chunk, then by K block.
+            // Group layouts place eight payload regions and one scale vector
+            // per 256-value source block (see preparedCompactGroupStride).
             const size_t chunk = static_cast<size_t>(n / 64);
+            if (cpu::native_quantised::preparedCompactGroupScaleLayout(cpu.codebook_id))
+                return (chunk * static_cast<size_t>((cpu.blocks_per_row + 7) / 8) +
+                        static_cast<size_t>(kb / 8)) *
+                           cpu::native_quantised::preparedCompactGroupStride(cpu.codebook_id) +
+                       static_cast<size_t>(kb % 8) * cpu.data_stride;
             return (chunk * static_cast<size_t>(cpu.blocks_per_row) +
                     static_cast<size_t>(kb)) *
                    static_cast<size_t>(cpu.interleaved_block_stride);
@@ -1509,9 +1516,12 @@ namespace llaminar2
             static_cast<size_t>(output.N_padded / 64) *
             static_cast<size_t>(output.blocks_per_row);
         // Value-initialization fixes padding and reserved metadata bytes at zero.
-        output.native_interleaved.resize(
-            unit_count * static_cast<size_t>(output.interleaved_block_stride),
-            0);
+        const size_t resident = cpu::native_quantised::preparedCompactGroupScaleLayout(output.codebook_id)
+            ? cpu::native_quantised::preparedCompactResidentBytes(output.codebook_id,
+                  static_cast<size_t>(output.N_padded / 64),
+                  static_cast<size_t>(output.blocks_per_row))
+            : unit_count * static_cast<size_t>(output.interleaved_block_stride);
+        output.native_interleaved.resize(resident, 0);
         const std::span<std::uint8_t> interleaved =
             output.native_interleaved.beginRewrite();
 
@@ -1534,11 +1544,27 @@ namespace llaminar2
                     for (int byte = 0; byte < output.payload_bytes; ++byte)
                         interleaved[
                             interleavedValueOffset(output, n, kb, byte)] = source[byte];
-                    uint8_t *const metadata = interleaved.data() + unit + output.data_stride;
-                    std::memcpy(metadata + local_column * 2, &gpu.scales[linear], 2);
-                    std::memcpy(metadata + 128 + local_column * 2, &gpu.mins[linear], 2);
-                    if (gpu.has_emins)
-                        std::memcpy(metadata + 256 + local_column * 4, &gpu.emins[linear], 4);
+                    if (cpu::native_quantised::preparedCompactGroupScaleLayout(output.codebook_id))
+                    {
+                        // One FP16 primary per 256-value group; the GPU-side
+                        // per-block scales must agree across the group.
+                        uint8_t *const group_scale = interleaved.data() +
+                            cpuUnitOffset(output, n, kb - kb % 8) +
+                            8u * output.data_stride + local_column * 2;
+                        if (kb % 8 == 0)
+                            std::memcpy(group_scale, &gpu.scales[linear], 2);
+                        else if (std::memcmp(group_scale, &gpu.scales[linear], 2))
+                            throw std::invalid_argument(
+                                "Tier-stream group scales disagree across their 256-value block");
+                    }
+                    else
+                    {
+                        uint8_t *const metadata = interleaved.data() + unit + output.data_stride;
+                        std::memcpy(metadata + local_column * 2, &gpu.scales[linear], 2);
+                        std::memcpy(metadata + 128 + local_column * 2, &gpu.mins[linear], 2);
+                        if (gpu.has_emins)
+                            std::memcpy(metadata + 256 + local_column * 4, &gpu.emins[linear], 4);
+                    }
                     continue;
                 }
 

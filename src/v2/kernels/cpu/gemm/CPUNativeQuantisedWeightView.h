@@ -239,6 +239,8 @@ namespace llaminar2::cpu::native_quantised
         const CPUProjectionNumericalPolicy numerical_policy; ///< Immutable arithmetic identity.
         const int data_stride; ///< Weight data bytes before inline metadata.
         const int interleaved_block_stride; ///< Total physical bytes per 64-column/K block.
+        const int groups_per_row; ///< Compact group-layout groups per row (else 0).
+        const int group_stride; ///< Real bytes per 64-column group (else 0).
 
         /// Every view is metadata-admitted: readers need no reserved-bit tests.
         static constexpr bool metadata_admitted = true;
@@ -310,6 +312,10 @@ namespace llaminar2::cpu::native_quantised
         /** @return Whether a compact multi-scale source payload is retained. */
         [[nodiscard]] bool usesCompactMultiScale() const noexcept
         { return encoding == CPUNativeQuantisedEncoding::CompactMultiScale; }
+
+        /** @return Whether this compact view stores one FP16 scale per 256-value group. */
+        [[nodiscard]] bool groupScaleLayout() const noexcept
+        { return usesCompactMultiScale() && preparedCompactGroupScaleLayout(codebook_id); }
         /** @return Whether inline signed weight-sum compensation precedes primary scales. */
         [[nodiscard]] bool usesInlineCompensation() const noexcept
         { return !usesQ6KNativeDualScale() && !usesCompactMultiScale(); }
@@ -324,7 +330,12 @@ namespace llaminar2::cpu::native_quantised
          * @return Sixty-four primary half words in original column order.
          */
         [[nodiscard]] const std::uint16_t *chunkScales(int chunk, int block) const
-        { return reinterpret_cast<const std::uint16_t *>(unit(chunk, block) + data_stride + (usesInlineCompensation() ? 128 : 0)); }
+        {
+            if (groupScaleLayout())
+                return reinterpret_cast<const std::uint16_t *>(
+                    unit(chunk, block - block % 8) + 8u * data_stride);
+            return reinterpret_cast<const std::uint16_t *>(unit(chunk, block) + data_stride + (usesInlineCompensation() ? 128 : 0));
+        }
 
         /** @brief Borrow the second source coefficient/scale/minimum vector.
          * @param chunk Physical 64-column chunk.
@@ -411,6 +422,8 @@ namespace llaminar2::cpu::native_quantised
         {
             validateColumn(column);
             (void)unit(chunk, block);
+            if (groupScaleLayout())
+                return 0.0f;
             if (usesNibbleLUTSourceScale() || usesIQ3SExpandedSourceScale() ||
                 (!is_asymmetric && !usesQ6KNativeDualScale() && !usesCompactMultiScale()))
                 return 0.0f;
@@ -454,9 +467,14 @@ namespace llaminar2::cpu::native_quantised
                 throw std::overflow_error("Native CPU padded output width exceeds its ABI");
             const std::size_t stride = preparedInterleavedBlockStride(descriptor.encoding, descriptor.is_asymmetric, descriptor.source.codebook_id);
             const std::size_t chunks = static_cast<std::size_t>(padded / 64);
-            if (chunks > std::numeric_limits<std::size_t>::max() / static_cast<std::size_t>(blocks) / stride)
+            const bool group_layout = descriptor.encoding == CPUNativeQuantisedEncoding::CompactMultiScale &&
+                preparedCompactGroupScaleLayout(descriptor.source.codebook_id);
+            const std::size_t groups = group_layout ? (static_cast<std::size_t>(blocks) + 7u) / 8u : static_cast<std::size_t>(blocks);
+            const std::size_t unit = group_layout
+                ? static_cast<std::size_t>(preparedCompactGroupStride(descriptor.source.codebook_id)) : stride;
+            if (chunks > std::numeric_limits<std::size_t>::max() / groups / unit)
                 throw std::overflow_error("Native CPU weight stream extent overflow");
-            const std::size_t extent = chunks * static_cast<std::size_t>(blocks) * stride;
+            const std::size_t extent = chunks * groups * unit;
             if (bytes.empty() || !bytes.data() || bytes.size() != extent ||
                 reinterpret_cast<std::uintptr_t>(bytes.data()) % alignof(std::uint32_t) != 0)
                 throw std::invalid_argument("Native CPU weight view requires the exact aligned resident byte extent");
@@ -480,7 +498,9 @@ namespace llaminar2::cpu::native_quantised
               source_payload_bytes(source.payload_bytes), codebook_id(source.codebook_id),
               is_asymmetric(d.is_asymmetric), is_superblock(source.is_superblock), encoding(d.encoding),
               numerical_policy(d.numerical_policy), data_stride(preparedDataStride(d.encoding, d.source.codebook_id)),
-              interleaved_block_stride(preparedInterleavedBlockStride(d.encoding, d.is_asymmetric, d.source.codebook_id)), bytes_(bytes) {}
+              interleaved_block_stride(preparedInterleavedBlockStride(d.encoding, d.is_asymmetric, d.source.codebook_id)),
+              groups_per_row(preparedCompactGroupScaleLayout(source.codebook_id) ? (blocks + 7) / 8 : 0),
+              group_stride(static_cast<int>(preparedCompactGroupStride(source.codebook_id))), bytes_(bytes) {}
 
         /** @brief Check one column coordinate without clamping it into a valid lane.
          * @param column Physical column within one 64-column unit.
@@ -502,6 +522,17 @@ namespace llaminar2::cpu::native_quantised
         {
             if (chunk < 0 || chunk >= N_padded / 64 || block < 0 || block >= blocks_per_row)
                 throw std::out_of_range("Native CPU weight unit is outside the admitted publication");
+            if (groupScaleLayout())
+            {
+                // Group layouts place the payloads of eight consecutive K
+                // blocks contiguously and the single FP16 scale vector of the
+                // 256-value source block at the group tail (see
+                // preparedCompactGroupStride).
+                const std::size_t group = static_cast<std::size_t>(block) / 8u;
+                const std::size_t sub = static_cast<std::size_t>(block) % 8u;
+                return bytes_.data() + (static_cast<std::size_t>(chunk) * groups_per_row + group) *
+                        group_stride + sub * data_stride;
+            }
             return bytes_.data() + (std::size_t(chunk) * blocks_per_row + block) * interleaved_block_stride;
         }
 

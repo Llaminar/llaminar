@@ -184,12 +184,20 @@ namespace llaminar2
             const std::size_t padded_n =
                 checkedAdd(static_cast<std::size_t>(N), 63u, "CPU padded N") &
                 ~std::size_t{63u};
-            const std::size_t units = checkedMultiply(
-                padded_n / 64u,
-                static_cast<std::size_t>(K / 32),
-                "CPU NativeQuantised units");
-            const std::size_t logical_bytes = checkedMultiply(
-                units, stride, "CPU NativeQuantised projection");
+            std::size_t logical_bytes;
+            if (encoding == cpu::native_quantised::CPUNativeQuantisedEncoding::CompactMultiScale)
+                logical_bytes = cpu::native_quantised::preparedCompactResidentBytes(
+                    source->codebook_id, padded_n / 64u,
+                    static_cast<std::size_t>(K / 32));
+            else
+            {
+                const std::size_t units = checkedMultiply(
+                    padded_n / 64u,
+                    static_cast<std::size_t>(K / 32),
+                    "CPU NativeQuantised units");
+                logical_bytes = checkedMultiply(
+                    units, stride, "CPU NativeQuantised projection");
+            }
             return AlignedVector<std::uint8_t>::requiredAllocationBytes(
                 logical_bytes, page_alignment);
         }
