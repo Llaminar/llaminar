@@ -12175,7 +12175,22 @@ add_v2_test(V2_Integration_CUDA_MoEDecodeQFNWidthPublicationReplay
         --gtest_filter=Test__CUDAMoEKernel.RuntimeGroupedDecodeSwiGLUPublicationReplay
     LABELS "V2;Integration;ProductionTestPreflight;CUDA;MoE;MTP;GraphCapture;Replay;ByteExact;Regression"
     MPI_PROCS 1 NO_MODELS TIMEOUT 120
-    ENVIRONMENT "LLAMINAR_TEST_CUDA_MOE_M1_SOURCE=main")
+    ENVIRONMENT "LLAMINAR_TEST_CUDA_MOE_M1_SOURCE=main"
+        "LLAMINAR_TEST_CUDA_MOE_QFN_ROUTE_COUNT=10")
+add_v2_test(V2_Integration_CUDA_MoEDecodeQFNQ5KWidthPublicationReplay
+    COMMAND $<TARGET_FILE:v2_integration_cuda_moe_kernel>
+        --gtest_filter=Test__CUDAMoEKernel.RuntimeGroupedDecodeSwiGLUPublicationReplay
+    LABELS "V2;Integration;ProductionTestPreflight;CUDA;MoE;MTP;GraphCapture;Replay;ByteExact;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 120
+    ENVIRONMENT "LLAMINAR_TEST_CUDA_MOE_M1_SOURCE=main_q5"
+        "LLAMINAR_TEST_CUDA_MOE_QFN_ROUTE_COUNT=10")
+add_v2_test(V2_Integration_CUDA_MoEDecodeQFNDrafterWidthPublicationReplay
+    COMMAND $<TARGET_FILE:v2_integration_cuda_moe_kernel>
+        --gtest_filter=Test__CUDAMoEKernel.RuntimeGroupedDecodeSwiGLUPublicationReplay
+    LABELS "V2;Integration;ProductionTestPreflight;CUDA;MoE;MTP;GraphCapture;Replay;ByteExact;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 120
+    ENVIRONMENT "LLAMINAR_TEST_CUDA_MOE_M1_SOURCE=drafter"
+        "LLAMINAR_TEST_CUDA_MOE_QFN_ROUTE_COUNT=10")
 add_v2_test(V2_Integration_CUDA_MoEVerifierK32PublicationReplay
     COMMAND $<TARGET_FILE:v2_integration_cuda_moe_kernel>
         --gtest_filter=Test__CUDAMoEKernel.RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRuntimeDecodeRows
@@ -12186,7 +12201,8 @@ add_v2_test(V2_Integration_CUDA_MoEVerifierQFNWidthPublicationReplay
         --gtest_filter=Test__CUDAMoEKernel.RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRuntimeDecodeRows
     LABELS "V2;Integration;ProductionTestPreflight;CUDA;MoE;MTP;GraphCapture;Replay;ByteExact;Regression"
     MPI_PROCS 1 NO_MODELS TIMEOUT 120
-    ENVIRONMENT "LLAMINAR_TEST_CUDA_MOE_M4_DOWN_GEOMETRY=qfn")
+    ENVIRONMENT "LLAMINAR_TEST_CUDA_MOE_M4_DOWN_GEOMETRY=qfn"
+        "LLAMINAR_TEST_CUDA_MOE_QFN_ROUTE_COUNT=10")
 add_v2_test(V2_Integration_CUDA_MoEVerifierWideNativeFormatsPublicationReplay
     COMMAND $<TARGET_FILE:v2_integration_cuda_moe_kernel>
         --gtest_filter=Test__CUDAMoEKernel.RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRuntimeDecodeRows

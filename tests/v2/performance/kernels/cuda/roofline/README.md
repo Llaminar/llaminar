@@ -254,6 +254,30 @@ and the aligned readers report zero local bytes. These rates use logical
 requested bytes from an isolated decode fixture. The full mixed-topology
 graph and physical memory-traffic rates need their own measurements.
 
+The SM86 capture can resolve the five K32 packets per ordered Gate/Up
+partition before recording the node. Unrolling the fixed pitch and sharing
+the two aligned activation loads gives 14.848 µs for Q4_K, 17.024 µs for
+Q5_K, and 21.312 µs for Q8_0 at the eight-route geometry. The selected
+production entries use 48–52 registers per thread and zero local bytes.
+In a matched QFN run on two CUDA devices and two CPU participants, the
+candidate moved dynamic MTP median decode from 47.87 to 47.96 tokens/s.
+All six 256-token histories and per-iteration MTP work records matched
+with expert movement disabled during timing.
+
+Set `LLAMINAR_TEST_CUDA_MOE_QFN_ROUTE_COUNT=10` for the QFN model's full
+selected-expert count. The width-specific production preflight replays use
+that setting. The reference fixture keeps every selected route local so it
+can compare a known work volume with the identical captured launch.
+
+| QFN stage, ten live routes | Native stage, µs | Matched weight rate |
+| --- | ---: | ---: |
+| Main Q4_K Gate/Up | 17.344 | 84.1% |
+| Main Q5_1 Down | 6.208 | 86.6% |
+| Main Q5_K Gate/Up | 19.904 | 85.9% |
+| Main Q8_0 Down | 12.224 | 96.9% |
+| Drafter Q8_0 Gate/Up | 25.408 | 89.4% |
+| Drafter Q8_0 Down | 12.608–12.672 | 96.5–97.0% |
+
 ## Route-matched verifier Down weight reference
 
 The verifier fixture can reuse the original capture arguments to measure a
@@ -314,6 +338,11 @@ the scatter and reports the original launch and compiler resources.
 | Q4_K | 23.936–24.000 | 29.056 | 82.4–82.6% |
 | Q5_K | 27.840–27.904 | 34.112–34.176 | 81.6% |
 | Q8_0 | 37.184–37.248 | 44.672–44.928 | 82.9–83.2% |
+
+With ten routes selected for each of four verifier rows, Q4_K and Q8_0
+Gate/Up reach 85.1–85.4% and 85.4–87.4% of the matched weight rate.
+Q5_K reaches 79.5–79.8%. The matching Q5_1 and Q8_0 Down replays sustain
+87.8–90.2% and 95.6–96.6% respectively on the same family of fixtures.
 
 Across 31 samples per format and card, six of 21 wide formats sustain
 at least 80% through publication on both cards. The low-bit IQ1, IQ2 and

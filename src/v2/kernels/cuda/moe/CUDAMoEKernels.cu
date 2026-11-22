@@ -28,12 +28,15 @@
  * Fused decode emits Q8 directly from the ordered gate/up partition reducer.
  * SM86 reuses the original activation packet across paired Gate/Up projections
  * and vector-loads each K32 Down activation for the measured codebooks.
+ * QFN decode specializes the paired Gate/Up schedule to five K32 packets
+ * per partition, with both weight streams sharing register-held activations.
  * Wide SM86 verifier tiles expand a compact IQ1 grid and use whole-word
  * index and sign loads for IQ3. Compact IQ2 selectors combine magnitudes
  * and signs in registers. These launches resolve the physical pitch before K.
  * Serial Q5_1 resolves the measured ten-packet Down geometry before the dot.
  */
 
+#include "backends/cuda/CUDAHardwareMetadata.h"
 #include "kernels/common/MoERuntimeDescriptorLaunch.h"
 #include "CUDARouterQ8Prefill.h"
 #include <cuda_runtime.h>
@@ -20387,6 +20390,66 @@ __global__ void softmax_topk_decode_descriptors_kernel(
             desc, n, A_int8, scales_A_blockwise, N, K, 0, K / 32);
     }
 
+    constexpr int kQFNDecodeGateUpN = 320;
+    constexpr int kQFNDecodeGateUpK = 2560;
+    constexpr int kQFNDecodeGateUpPackets = 5;
+    static_assert(kQFNDecodeGateUpK / 32 == kQFNDecodeGateUpPackets *
+        llaminar2::CUDAMoEBatchInvariantPolicy::gate_up_k_partitions);
+
+    /** @brief Identify the prepared layouts measured with the fixed QFN schedule. */
+    template <uint8_t CodebookId>
+    inline constexpr bool kQFNDecodeGateUpCodebook =
+        CodebookId == native_formats::Q4_K.codebook_id ||
+        CodebookId == native_formats::Q5_K.codebook_id ||
+        CodebookId == native_formats::Q8_0.codebook_id;
+
+    /**
+     * @brief Evaluate one fixed QFN Gate/Up partition with shared activation registers.
+     * @tparam CodebookId Physical decoder selected before recording the kernel.
+     * @param gate Original admitted Gate planes.
+     * @param up Original admitted Up planes.
+     * @param activations Aligned original Q8 activation row.
+     * @param activation_scales Original K32 activation scales.
+     * @param column Output column in both projections.
+     * @param first_packet First K32 packet of this ordered partition.
+     * @param gate_sum Receives the original ordered Gate partial.
+     * @param up_sum Receives the original ordered Up partial.
+     * @pre Both weight planes are validated at the QFN pitch and each
+     *      admitted partition contains exactly five complete packets.
+     */
+    template <uint8_t CodebookId>
+    __device__ __forceinline__ void qfn_decode_gate_up_fixed_partition(
+        const DeviceNativeQuantisedMatrixDesc &gate, const DeviceNativeQuantisedMatrixDesc &up,
+        const int8_t *activations, const float *activation_scales,
+        int column, int first_packet, float &gate_sum, float &up_sum)
+    {
+        constexpr int payload_bytes = llaminar2::cuda_native_quantised::CodebookTraits<CodebookId>::payload_bytes;
+        const auto *a = reinterpret_cast<const int4 *>(activations + first_packet * 32);
+        const int start = first_packet * kQFNDecodeGateUpN + column;
+        gate_sum = 0.0f;
+        up_sum = 0.0f;
+#pragma unroll
+        for (int packet = 0; packet < kQFNDecodeGateUpPackets; ++packet)
+        {
+            const int linear = start + packet * kQFNDecodeGateUpN;
+            const int4 low = a[2 * packet];
+            const int4 high = a[2 * packet + 1];
+            const int32_t codes[8] = {low.x, low.y, low.z, low.w, high.x, high.y, high.z, high.w};
+            const float scale_a = activation_scales[first_packet + packet];
+            const auto contribution = [&](const DeviceNativeQuantisedMatrixDesc &desc) {
+                const uint8_t *payload = desc.payload + linear * payload_bytes;
+                int32_t weights[8];
+                llaminar2::cuda_native_quantised::decode_groups_vec<CodebookId>(payload, weights);
+                return moe_native_quantised_block_contribution_rn<CodebookId>(
+                    codes, weights, payload, static_cast<const uint16_t *>(desc.scales),
+                    static_cast<const uint16_t *>(desc.mins), static_cast<const uint32_t *>(desc.emins),
+                    linear, scale_a);
+            };
+            gate_sum = __fadd_rn(gate_sum, contribution(gate));
+            up_sum = __fadd_rn(up_sum, contribution(up));
+        }
+    }
+
     /**
      * @brief Split-K scatter kernel for grouped gate/up decode projection.
      *
@@ -20398,8 +20461,10 @@ __global__ void softmax_topk_decode_descriptors_kernel(
      * hide global-memory latency on the weight payload loads.
      *
      * Grid:  ((N + 63)/64, k_partitions, num_active)   Block: (64)
+     * @tparam CodebookId Physical prepared decode layout.
+     * @tparam FixedQFN Use the admitted fixed-pitch and fixed-partition schedule.
      */
-    template <uint8_t CodebookId>
+    template <uint8_t CodebookId, bool FixedQFN = false>
     __global__ void grouped_native_quantised_gate_up_kpart_decode_kernel(
         const int8_t *__restrict__ A_int8,
         const float *__restrict__ scales_A_blockwise,
@@ -20457,12 +20522,22 @@ __global__ void softmax_topk_decode_descriptors_kernel(
 
         const DeviceNativeQuantisedMatrixDesc gate_desc = gate_descs[expert_id];
         const DeviceNativeQuantisedMatrixDesc up_desc = up_descs[expert_id];
+        if constexpr (FixedQFN)
+        {
+            static_assert(kQFNDecodeGateUpCodebook<CodebookId>);
+            float gate = 0.0f;
+            float up = 0.0f;
+            if (native_quantised_pair_shape_ok<CodebookId>(gate_desc, up_desc, N, K))
+                qfn_decode_gate_up_fixed_partition<CodebookId>(
+                    gate_desc, up_desc, A_int8, scales_A_blockwise, n, b_start, gate, up);
+            gate_partials[partial_index] = gate;
+            up_partials[partial_index] = up;
+            return;
+        }
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 860
         // Q4_K, Q5_K and Q8_0 share one activation traversal while retaining
         // each role's independent ordered FP32 accumulation.
-        if constexpr (CodebookId == native_formats::Q4_K.codebook_id ||
-                      CodebookId == native_formats::Q5_K.codebook_id ||
-                      CodebookId == native_formats::Q8_0.codebook_id)
+        if constexpr (!FixedQFN && kQFNDecodeGateUpCodebook<CodebookId>)
         {
             float gate = 0.0f;
             float up = 0.0f;
@@ -25358,10 +25433,28 @@ __attribute__((visibility("default"))) bool cudaMoE_softmax_topk_decode_selected
         dim3 partial_grid((N + kTileN - 1) / kTileN, k_partitions, num_active);
         dim3 block(kTileN);
 
-#define LAUNCH_GROUPED_GATE_UP_KPART(CB)                                                            \
-    grouped_native_quantised_gate_up_kpart_decode_kernel<CB><<<partial_grid, block, 0, cuda_stream>>>(   \
-        d_hidden_int8, d_hidden_scales, d_gate_desc_table, d_up_desc_table, d_expert_ids,           \
-        d_gate_partials, d_up_partials, num_active, N, K, num_experts, k_partitions)
+        const bool fixed_qfn = [&]() {
+            if (!publish_swiglu || N != kQFNDecodeGateUpN || K != kQFNDecodeGateUpK)
+                return false;
+            const auto &hardware = llaminar2::cudaHardwareMetadata().at(device_idx);
+            return hardware.sm_major == 8 && hardware.sm_minor == 6;
+        }();
+        const auto launch_gate = [&]<uint8_t CodebookId>() {
+            const auto issue = [&]<bool FixedQFN>() {
+                grouped_native_quantised_gate_up_kpart_decode_kernel<CodebookId, FixedQFN>
+                    <<<partial_grid, block, 0, cuda_stream>>>(
+                        d_hidden_int8, d_hidden_scales, d_gate_desc_table, d_up_desc_table, d_expert_ids,
+                        d_gate_partials, d_up_partials, num_active, N, K, num_experts, k_partitions);
+            };
+            if constexpr (kQFNDecodeGateUpCodebook<CodebookId>)
+            {
+                if (fixed_qfn)
+                    return issue.template operator()<true>();
+            }
+            issue.template operator()<false>();
+        };
+
+#define LAUNCH_GROUPED_GATE_UP_KPART(CB) launch_gate.template operator()<CB>()
 
         switch (codebook_id)
         {
