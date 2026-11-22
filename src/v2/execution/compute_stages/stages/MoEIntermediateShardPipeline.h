@@ -160,6 +160,21 @@ namespace llaminar2
         const MoEOverlayParticipantLayerBank &source);
 
     /**
+     * @brief Keep independent shared FFN math after the CPU packet and inside its original producer unit.
+     * @param graph Participant-local graph with the original dispatch and ticket contract.
+     * @param shared Original shared FFN node.
+     * @param packet Original mapped CPU packet producer, present only on its owner.
+     * @param cutpoint Original end of the producer unit, present for an explicit CPU ticket.
+     * @throws std::invalid_argument For a foreign participant, stage, or capture boundary.
+     *
+     * The packet may start CPU service while the retained GPU producer still runs.
+     * A follower places its shared math in the matching unit without owning a packet.
+     * The following captured ingress and the existing collectives own their original dependencies.
+     */
+    void orderMappedDecodeSharedFFN(ComputeGraph &graph, const std::string &shared,
+        const std::optional<std::string> &packet, const std::optional<std::string> &cutpoint);
+
+    /**
      * @brief Reuse the production compute/fold stages for one original cold prepared sample.
      * @param graph Private calibration graph; fixed route tensors are external inputs.
      * @param params Exact source2 family, phase, rows, arena and private runtime.

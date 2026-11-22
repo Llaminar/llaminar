@@ -27137,6 +27137,14 @@ add_v2_test(V2_Integration_HeterogeneousTicketLifecycleEvidence
     NO_MODELS
     ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1"
 )
+add_v2_test(V2_Integration_QFNMappedDecodeSharedFFNOrdering
+    COMMAND $<TARGET_FILE:v2_test_forward_graph_types>
+        --gtest_filter=Test__GraphSegmentCache.HeterogeneousTicketMappedSharedFFNOrdering
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;GraphCapture;ExpertOverlay;Regression"
+    MPI_PROCS 1
+    NO_MPI NO_MODELS
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1"
+)
 add_v2_test(V2_Integration_MTPConditionCommitGraphIdentity
     COMMAND $<TARGET_FILE:v2_test_forward_graph_types>
         --gtest_filter=Test__ForwardGraphSignature.SerialCommitOwnershipExcludesSpeculationAndPrefix:Test__ForwardGraphSignature.MTPConditionCommitPurposeIsCapturedIdentity
@@ -31466,6 +31474,7 @@ set(V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_MTPDisabledRetainedCapacityPrefillLifecycle
     V2_Integration_MTPCompactOutcomeSamplingTopology
     V2_Integration_HeterogeneousTicketLifecycleEvidence
+    V2_Integration_QFNMappedDecodeSharedFFNOrdering
     V2_Integration_MTPScalarCommitOwnership
     V2_Integration_MTPStochasticVerificationOwner
     V2_Integration_ParityMTPRoutingContributionBoundary

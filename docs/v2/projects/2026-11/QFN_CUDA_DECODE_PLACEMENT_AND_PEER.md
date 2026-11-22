@@ -53,6 +53,30 @@ increased by 686,387,200 bytes per GPU under the existing memory admission,
 with identical retained workspace bytes. The fusion control retains 112
 pending a repeatable gain.
 
+## Overlap between CPU dispatch and shared FFN
+
+On the mapped single-row SM86 path, the original activation packet is
+published before the independent shared expert FFN. The shared FFN stays in
+the existing captured producer unit. The follower keeps the corresponding
+pre-service cutpoint. The existing graph still owns CPU service, result
+ingress, and the ordered reduction.
+
+Both arms used the same Release binary and tensor-sharded 112-expert
+placement. Each arm ran three 256-token iterations after warmup. Ordinary
+decode and fixed-depth-seven MTP produced identical token IDs and MTP work in
+both run orders.
+
+| Run order | Ordinary control → overlap, tokens/s | Fixed-depth-seven control → overlap, tokens/s |
+| --- | ---: | ---: |
+| Overlap first | 28.89 → 29.69 (+2.76%) | 43.83 → 44.00 (+0.39%) |
+| Control first | 27.87 → 29.93 (+7.40%) | 43.99 → 44.24 (+0.56%) |
+
+A separate Release run using the production SM86 selector matched all 256
+tokens and the MTP work on all three iterations of each cell. The
+`V2_Integration_QFNMappedDecodeSharedFFNOrdering` regression checks the
+original producer, CPU boundary, and ingress for both backend graph types.
+The ROCm ordering is awaiting a native performance comparison.
+
 ## Inter-card decode payloads
 
 The native Release benchmark captures exact cross-device dependencies and

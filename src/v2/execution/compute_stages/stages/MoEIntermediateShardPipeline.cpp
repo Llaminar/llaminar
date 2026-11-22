@@ -10,6 +10,8 @@
  * Declaration identity precedes physical arena allocation. Launch preparation
  * seals the actual addresses; retained identity checks reject later rebinding
  * without changing the graph variant merely because initial storage appeared.
+ * Mixed decode can place independent shared work inside the existing CPU ticket
+ * producer segment, with all packet publication and ingress owned by the graph.
  */
 #include "kernels/common/NativeLayoutBarrierLayout.h"
 #include "MoEIntermediateShardPipeline.h"
@@ -59,6 +61,43 @@
 
 namespace llaminar2
 {
+    /** @copydoc orderMappedDecodeSharedFFN */
+    void orderMappedDecodeSharedFFN(ComputeGraph &graph, const std::string &shared,
+        const std::optional<std::string> &packet, const std::optional<std::string> &cutpoint)
+    {
+        const auto *shared_node = graph.getNode(shared);
+        if (!shared_node || !shared_node->stage || !shared_node->device.is_gpu() ||
+            shared_node->stage->type() != ComputeStageType::MOE_SHARED_EXPERT_FFN ||
+            (!packet && !cutpoint) ||
+            cutpoint.has_value() != requiresHeterogeneousTicketSegmentation(graph.nativeCaptureEnvelope()))
+            throw std::invalid_argument("Mapped decode overlap requires original shared math and its capture envelope");
+
+        if (packet)
+        {
+            const auto *node = graph.getNode(*packet);
+            if (!node || !node->stage || node->device != shared_node->device ||
+                node->stage->type() != ComputeStageType::MOE_OVERLAY_ACTIVATION_DISPATCH_PACK)
+                throw std::invalid_argument("Mapped decode overlap requires the original participant's CPU packet producer");
+        }
+        if (cutpoint)
+        {
+            const auto *node = graph.getNode(*cutpoint);
+            if (!node || node == shared_node || node->device != shared_node->device ||
+                !node->heterogeneous_ticket_unit_contract ||
+                node->heterogeneous_ticket_unit_contract->disposition !=
+                    GraphHeterogeneousTicketUnitDisposition::BeforeManualBoundary)
+                throw std::invalid_argument("Mapped decode overlap requires the original pre-CPU ticket cutpoint");
+        }
+
+        if (packet)
+            graph.addDependency(shared, *packet);
+        if (cutpoint)
+            graph.addDependency(*cutpoint, shared);
+        PerfStatsCollector::addCounter("forward_graph", "qfn_mapped_decode_shared_ffn_order",
+            1., "setup", shared_node->device.toString(),
+            {{"shared_node", shared}, {"packet_node", packet.value_or("")}, {"ticket_cutpoint", cutpoint.value_or("")}});
+    }
+
 namespace
 {
     /** @brief Two sequential local phases sharing the original router's kernel/workspace. */

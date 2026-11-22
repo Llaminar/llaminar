@@ -10,7 +10,8 @@
  * Native-capture ownership follows every declared service boundary: portable
  * inter-host MPI and colocated CPU work share the typed ticket lifecycle.
  * Ordinary-prefill CPU input publication precedes independent shared GPU FFN
- * work; result ingress still follows the final canonical-bank writer.
+ * work. Measured mapped decode also keeps shared FFN in the original packet's
+ * producer unit. Result ingress follows the final canonical-bank writer.
  * Independent rank-batch sends and colocated expert compute share a fork;
  * ordered return publication is the join, not a prerequisite for local compute.
  * CPU ExpertOverlay graphs adopt exact participant registry engines and shared
@@ -26,6 +27,9 @@
 #include "execution/moe/MoELocalTPMaintenanceDomain.h"
 #include "Qwen35MoEGraph.h"
 #include "models/qwen4exp/Qwen4ExpConfig.h"
+#ifdef HAVE_CUDA
+#include "backends/cuda/CUDAHardwareMetadata.h"
+#endif
 #include "execution/compute_stages/stages/MoEIntermediateShardPipeline.h"
 #include "execution/moe/MoEIntermediateShardDescriptorDeclaration.h"
 #include "execution/moe/MoEIntermediateShardRuntimeBinding.h"
@@ -5263,6 +5267,18 @@ namespace llaminar2
             ? MoEOverlayServicePhaseHint::Prefill : routed_service_phase;
         const bool mapped_shard_grouped = mapped_intermediate_shards &&
             (total_tokens != 1 || mapped_shard_phase != MoEOverlayServicePhaseHint::Decode);
+        const bool mapped_decode_shared_overlap = [&] {
+#ifdef HAVE_CUDA
+            // Keep startup and the economical release selection tied to the
+            // measured physical backend. The graph ordering itself is shared.
+            if (device.is_cuda() && config_.flash_next && mapped_intermediate_shards && !mapped_shard_grouped)
+            {
+                const auto &hardware = cudaHardwareMetadata().at(device.ordinal);
+                return hardware.sm_major == 8 && hardware.sm_minor == 6;
+            }
+#endif
+            return false;
+        }();
         if (intermediateShardArena() && !mapped_intermediate_shards)
         {
             if (!use_expert_overlay || batch_size != 1)
@@ -7868,6 +7884,8 @@ namespace llaminar2
             std::string routed_expert_node;
         };
         std::optional<SharedPrefillCPUInputFork> shared_prefill_cpu_input_fork;
+        std::optional<std::string> shared_decode_cpu_packet;
+        std::optional<std::string> shared_decode_ticket_cutpoint;
         /* Retain the root-only publisher identity so trace-only checkpoints can
          * localize the exact captured sibling immediately before it. */
         /*
@@ -12782,9 +12800,10 @@ namespace llaminar2
                         throw std::runtime_error(
                             "Qwen35 MoE mapped activation parent produced no dispatch stage");
                     }
-                    graph.addDependency(
-                        captured_local_expert_compute_node,
-                        mapped_activation_dispatch_nodes.back());
+                    const auto &cpu_packet = mapped_activation_dispatch_nodes.back();
+                    graph.addDependency(captured_local_expert_compute_node, cpu_packet);
+                    if (mapped_decode_shared_overlap && planned_shared_device == device)
+                        shared_decode_cpu_packet = cpu_packet;
 
                     if (use_lane_batch)
                     {
@@ -13455,6 +13474,8 @@ namespace llaminar2
                         std::move(ordered_reduce_capture_wave));
                     if (has_cpu_ticket_boundary)
                     {
+                        if (mapped_decode_shared_overlap && planned_shared_device == device)
+                            shared_decode_ticket_cutpoint = captured_continuation_terminal;
                         /*
                          * Close the captured producer immediately before the
                          * colocated CPU ticket transaction.  The following
@@ -14461,6 +14482,9 @@ namespace llaminar2
                           ComputeStageFactory::createSharedExpertFFN(shared_params),
                           shared_device);
             graph.addDependency(prefix + "shared_expert_ffn", prefix + "ffn_norm");
+            if (shared_decode_cpu_packet || shared_decode_ticket_cutpoint)
+                orderMappedDecodeSharedFFN(graph, prefix + "shared_expert_ffn",
+                    shared_decode_cpu_packet, shared_decode_ticket_cutpoint);
             if (shared_prefill_cpu_input_fork)
             {
                 // FIFO topological order otherwise makes this ffn_norm sibling
