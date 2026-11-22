@@ -180,7 +180,7 @@ namespace llaminar2
                 cpu::native_quantised::preparedEncodingForSource(*source);
             const std::size_t stride =
                 cpu::native_quantised::preparedInterleavedBlockStride(
-                    encoding, source->is_asymmetric);
+                    encoding, source->is_asymmetric, source->codebook_id);
             const std::size_t padded_n =
                 checkedAdd(static_cast<std::size_t>(N), 63u, "CPU padded N") &
                 ~std::size_t{63u};

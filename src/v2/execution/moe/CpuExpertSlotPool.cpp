@@ -144,11 +144,11 @@ namespace llaminar2
             packed.is_superblock = source->is_superblock;
             packed.encoding = cpu::native_quantised::preparedEncodingForSource(*source);
             packed.data_stride = static_cast<int>(
-                cpu::native_quantised::preparedDataStride(packed.encoding));
+                cpu::native_quantised::preparedDataStride(packed.encoding, packed.codebook_id));
             packed.interleaved_block_stride =
                 cpu::native_quantised::preparedInterleavedBlockStride(
                     packed.encoding,
-                    packed.is_asymmetric);
+                    packed.is_asymmetric, packed.codebook_id);
 
             switch (packed.encoding)
             {
