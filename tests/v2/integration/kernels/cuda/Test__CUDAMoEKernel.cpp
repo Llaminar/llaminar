@@ -24577,6 +24577,13 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
                                 "ELi" + std::to_string(d_model / (32 * partitions)) + "E";
                             EXPECT_EQ(name.contains(fixed_schedule), sm86 && fixed_source)
                                 << gate_source << " captured the wrong verifier Gate/Up schedule";
+                            const bool exact_qfn_tile = sm86 && qfn_width && params.blockDim.x == 64 &&
+                                packed_qfn_reader && gate_reader != native_formats::Q2_K.codebook_id &&
+                                gate_reader != native_formats::Q3_K.codebook_id &&
+                                gate_reader != native_formats::Q6_K.codebook_id &&
+                                gate_reader != native_formats::IQ3_S.codebook_id;
+                            EXPECT_EQ(name.contains("ELi64EEE"), exact_qfn_tile)
+                                << gate_source << " captured the wrong QFN tile";
                         }
                     }
                     if (name.contains("grouped_native_quantised_gate_up_ordered_kpart_reduce_swiglu_kernel"))

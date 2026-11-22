@@ -362,16 +362,20 @@ change, 14 of 21 QFN-width Gate/Up formats reached 80% on both cards.
 | Q3_K | 29.248–29.312 | 81.4–81.6% |
 | Q6_K | 45.952–46.016 | 83.7–83.8% |
 | IQ3_S | 33.984–34.048 | 85.3–85.5% |
-| IQ3_XXS | 27.200–27.264 | 77.2–77.4% |
-| IQ2_S | 30.208–30.464 | 72.5–72.9% |
-| IQ2_XS | 29.120–29.312 | 74.3–74.9% |
-| IQ2_XXS | 24.320–24.448 | 66.5–66.6% |
-| IQ1_S | 27.840–27.968 | 59.5% |
-| IQ1_M | 29.120–29.312 | 56.8–57.8% |
+| IQ3_XXS | 26.816–26.880 | 78.1–78.3% |
+| IQ2_S | 29.760–29.888 | 72.8–74.4% |
+| IQ2_XS | 28.544 | 75.3–76.5% |
+| IQ2_XXS | 23.488–23.552 | 68.5–68.7% |
+| IQ1_S | 26.816–26.880 | 61.2–62.1% |
+| IQ1_M | 28.480–28.608 | 58.2–58.6% |
 
-The compiled readers use 42–56 registers with zero shared, stack and
-local bytes. Their launch geometry permits 9 or 16 CTAs per SM. The
-captured all-format replay verifies the fixed reader, CTA width and
+The six sources below 80% use complete 64-column tiles. Capture fixes
+the grid and K-partition bounds, leaving each CTA to resolve its routed
+operands before the dot. IQ1_S also uses independent integer dot and
+activation-sum chains for each half, then applies the original FP32 scale
+and minimum correction. The compiled readers use 40–62 registers and
+zero shared, stack and local bytes. Their launch geometry allows 9 or
+16 CTAs per SM. The all-format replay verifies the captured tile and
 serial-row output bytes.
 
 ### QFN-width IQ4 schedule

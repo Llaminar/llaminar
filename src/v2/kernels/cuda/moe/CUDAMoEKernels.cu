@@ -19244,6 +19244,7 @@ __global__ void softmax_topk_decode_descriptors_kernel(
      * @param scale_a FP32 scale for the quantized activation block.
      * @param physical_codebook Actual operand identity within the IQ4 payload family.
      * @tparam SharedIQ1MCorrection Reuse the original signed Q8 delta terms prepared by the CTA.
+     * @tparam SplitIQ1SDot Accumulate the exact IQ1_S dot and activation sums in independent halves.
      * @param iq1m_correction Exact delta numerators for each sign pair in each half.
      * @return Canonically rounded contribution, not yet row-accumulated.
      * @pre The caller has admitted the descriptor and all of its required
@@ -19251,7 +19252,8 @@ __global__ void softmax_topk_decode_descriptors_kernel(
      */
     template <uint8_t CodebookId,
               NativeMoEDotOrder Order = NativeMoEDotOrder::PartitionPartial,
-              bool SharedIQ1MCorrection = false>
+              bool SharedIQ1MCorrection = false,
+              bool SplitIQ1SDot = false>
     __device__ __forceinline__ float moe_native_quantised_block_contribution_rn(
         const int32_t *__restrict__ a_vals,
         const int32_t *__restrict__ packed_groups,
@@ -19266,6 +19268,8 @@ __global__ void softmax_topk_decode_descriptors_kernel(
         using Traits = llaminar2::cuda_native_quantised::CodebookTraits<CodebookId>;
 
         static_assert(!SharedIQ1MCorrection || (Traits::is_iq1_m && Order == NativeMoEDotOrder::VerifierWideGrid));
+        static_assert(!SplitIQ1SDot || (CodebookId == native_formats::IQ1_S.codebook_id &&
+                                      Order == NativeMoEDotOrder::VerifierWideGrid));
         const auto sum_quantised_word = [](int32_t packed) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 860
             if constexpr ((Order == NativeMoEDotOrder::VerifierWideGrid && Traits::is_iq1_grid) ||
@@ -19282,7 +19286,31 @@ __global__ void softmax_topk_decode_descriptors_kernel(
         };
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 860
-        if constexpr (Order != NativeMoEDotOrder::PartitionPartial &&
+        if constexpr (SplitIQ1SDot)
+        {
+            constexpr int32_t ones = 0x01010101;
+            int dot_lo = 0;
+            int dot_hi = 0;
+            int sum_lo = 0;
+            int sum_hi = 0;
+#pragma unroll
+            for (int group = 0; group < 4; ++group)
+            {
+                const int32_t lo = a_vals[group];
+                const int32_t hi = a_vals[group + 4];
+                dot_lo = __dp4a(lo, packed_groups[group], dot_lo);
+                dot_hi = __dp4a(hi, packed_groups[group + 4], dot_hi);
+                sum_lo = __dp4a(lo, ones, sum_lo);
+                sum_hi = __dp4a(hi, ones, sum_hi);
+            }
+            // Both integer halves fit in INT32. The ordered FP32 scale and
+            // minimum correction still receive the original combined terms.
+            return llaminar2::cuda_native_quantised::
+                native_quantised_block_contribution_from_reduced_terms_rn<CodebookId>(
+                    dot_lo + dot_hi, 0, scale_a, scale_base[linear], min_base[linear],
+                    0u, sum_lo + sum_hi, sum_lo, sum_hi, 0u, 0, 0, 0, 0);
+        }
+        else if constexpr (Order != NativeMoEDotOrder::PartitionPartial &&
                       CodebookId == native_formats::Q5_1.codebook_id)
         {
             constexpr int32_t kSignedByteOnes = 0x01010101;
@@ -20521,6 +20549,7 @@ __global__ void softmax_topk_decode_descriptors_kernel(
      * @tparam Packets Ordered number of K32 packets per partition.
      * @tparam PacketOrder Equivalent packed integer operand schedule, independent
      *         of the fixed FP32 split-K publication order below.
+     * @tparam SplitIQ1SDot Use the measured independent integer chains for IQ1_S.
      * @param gate Original admitted Gate planes.
      * @param up Original admitted Up planes.
      * @param activations Aligned original Q8 activation row.
@@ -20533,7 +20562,8 @@ __global__ void softmax_topk_decode_descriptors_kernel(
      *      each admitted partition contains exactly Packets complete packets.
      */
     template <uint8_t CodebookId, int Pitch, int Packets,
-              NativeMoEDotOrder PacketOrder = NativeMoEDotOrder::PartitionPartial>
+              NativeMoEDotOrder PacketOrder = NativeMoEDotOrder::PartitionPartial,
+              bool SplitIQ1SDot = false>
     __device__ __forceinline__ void native_quantised_gate_up_fixed_partition(
         const DeviceNativeQuantisedMatrixDesc &gate, const DeviceNativeQuantisedMatrixDesc &up,
         const int8_t *activations, const float *activation_scales,
@@ -20567,7 +20597,7 @@ __global__ void softmax_topk_decode_descriptors_kernel(
                 const uint8_t *payload = desc.payload + linear * payload_bytes;
                 int32_t weights[8];
                 decode_moe_native_quantised_packet<CodebookId, PacketOrder>(payload, weights);
-                return moe_native_quantised_block_contribution_rn<CodebookId, PacketOrder>(
+                return moe_native_quantised_block_contribution_rn<CodebookId, PacketOrder, false, SplitIQ1SDot>(
                     codes, weights, payload, static_cast<const uint16_t *>(desc.scales),
                     static_cast<const uint16_t *>(desc.mins), static_cast<const uint32_t *>(desc.emins),
                     linear, scale_a);
@@ -20960,9 +20990,13 @@ __global__ void softmax_topk_decode_descriptors_kernel(
      * @tparam Pitch Fixed prepared column pitch, or zero for runtime geometry.
      * @tparam Packets Fixed K32 partition length, or zero for runtime geometry.
      * @tparam PacketOrder Packed integer schedule for the fixed reader.
+     * @tparam ExactTile Complete 64-column QFN tiles, or zero when bounds are dynamic.
+     * @pre For a complete tile the capture submits the exact column, route and
+     *      K-partition extents. Every submitted partition contains five packets.
      */
     template <uint8_t CodebookId, int Pitch = 0, int Packets = 0,
-              NativeMoEDotOrder PacketOrder = NativeMoEDotOrder::PartitionPartial>
+              NativeMoEDotOrder PacketOrder = NativeMoEDotOrder::PartitionPartial,
+              int ExactTile = 0>
     __global__ void grouped_native_quantised_gate_up_ordered_kpart_scatter_kernel(
         const int8_t *__restrict__ A_int8,
         const float *__restrict__ scales_A_blockwise,
@@ -20980,12 +21014,23 @@ __global__ void softmax_topk_decode_descriptors_kernel(
         int num_experts,
         int k_partitions)
     {
-        const int n = blockIdx.x * blockDim.x + threadIdx.x;
+        if constexpr (ExactTile > 0)
+        {
+            static_assert(ExactTile == 64 && Pitch == kQFNDecodeGateUpN && Pitch % ExactTile == 0 &&
+                          Packets == kQFNDecodeGateUpPackets);
+            k_partitions = llaminar2::CUDAMoEBatchInvariantPolicy::gate_up_k_partitions;
+            N = Pitch;
+            K = kQFNDecodeGateUpK;
+        }
+        const int tile_columns = ExactTile > 0 ? ExactTile : blockDim.x;
+        const int n = blockIdx.x * tile_columns + threadIdx.x;
         const int local_route = blockIdx.y;
         const int k_part = blockIdx.z;
-        if (n >= N || local_route >= tile_route_slots ||
-            k_part >= k_partitions)
-            return;
+        if constexpr (ExactTile == 0)
+        {
+            if (n >= N || local_route >= tile_route_slots || k_part >= k_partitions)
+                return;
+        }
 
         const int original_slot = original_slot_base + local_route;
         const int grouped_slot = original_to_grouped[original_slot];
@@ -20998,8 +21043,8 @@ __global__ void softmax_topk_decode_descriptors_kernel(
             (blocks_per_row + k_partitions - 1) / k_partitions;
         const int b_start = k_part * blocks_per_part;
         int b_end = b_start + blocks_per_part;
-        if (b_end > blocks_per_row)
-            b_end = blocks_per_row;
+        if constexpr (ExactTile == 0)
+            b_end = min(b_end, blocks_per_row);
 
         const DeviceNativeQuantisedMatrixDesc gate_desc = gate_descs[expert_id];
         const DeviceNativeQuantisedMatrixDesc up_desc = up_descs[expert_id];
@@ -21011,11 +21056,14 @@ __global__ void softmax_topk_decode_descriptors_kernel(
              static_cast<size_t>(k_part)) *
                 static_cast<size_t>(N) +
             static_cast<size_t>(n);
-        if (b_start >= b_end)
+        if constexpr (ExactTile == 0)
         {
-            gate_partials[partial_index] = 0.0f;
-            up_partials[partial_index] = 0.0f;
-            return;
+            if (b_start >= b_end)
+            {
+                gate_partials[partial_index] = 0.0f;
+                up_partials[partial_index] = 0.0f;
+                return;
+            }
         }
 
         const int source_row = source_rows.sourceRow(grouped_slot);
@@ -21034,7 +21082,8 @@ __global__ void softmax_topk_decode_descriptors_kernel(
 #endif
         if constexpr (Pitch > 0)
         {
-            native_quantised_gate_up_fixed_partition<CodebookId, Pitch, Packets, PacketOrder>(
+            constexpr bool split_iq1_s = ExactTile > 0 && CodebookId == native_formats::IQ1_S.codebook_id;
+            native_quantised_gate_up_fixed_partition<CodebookId, Pitch, Packets, PacketOrder, split_iq1_s>(
                 gate_desc, up_desc, slot_A, slot_scales, n, b_start, gate_partial, up_partial);
         }
         else
@@ -26660,9 +26709,9 @@ __attribute__((visibility("default"))) bool cudaMoE_softmax_topk_decode_selected
                         constexpr auto packed = Traits::is_iq_grid
                             ? NativeMoEDotOrder::VerifierWideGrid : NativeMoEDotOrder::VerifierK32;
                         constexpr auto unrolled = NativeMoEDotOrder::PartitionPartial;
-                        const auto issue = [&]<int Pitch, int Packets, NativeMoEDotOrder Order>() {
+                        const auto issue = [&]<int Pitch, int Packets, NativeMoEDotOrder Order, int ExactTile = 0>() {
                             grouped_native_quantised_gate_up_ordered_kpart_scatter_kernel<
-                                CodebookId, Pitch, Packets, Order><<<scatter_grid, block, 0, cuda_stream>>>(
+                                CodebookId, Pitch, Packets, Order, ExactTile><<<scatter_grid, block, 0, cuda_stream>>>(
                                     gateup_input, gateup_scales, source_rows, d_gate_desc_table, d_up_desc_table,
                                     d_original_to_grouped, d_original_expert_ids, d_gate_partials, d_up_partials,
                                     original_slot_base, tile_route_slots, intermediate, d_model, num_experts,
@@ -26671,7 +26720,15 @@ __attribute__((visibility("default"))) bool cudaMoE_softmax_topk_decode_selected
                         if constexpr (llaminar2::CUDAMoEBatchInvariantPolicy::qfnVerifierPackedGateUp(CodebookId))
                         {
                             if (use_fixed_qfn)
+                            {
+                                if constexpr (Traits::is_iq_grid && CodebookId != native_formats::IQ3_S.codebook_id)
+                                {
+                                    if (kTileN == 64)
+                                        return issue.template operator()<
+                                            kQFNDecodeGateUpN, kQFNDecodeGateUpPackets, packed, 64>();
+                                }
                                 return issue.template operator()<kQFNDecodeGateUpN, kQFNDecodeGateUpPackets, packed>();
+                            }
                         }
                         if constexpr (Traits::is_iq4_lut)
                         {
