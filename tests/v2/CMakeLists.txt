@@ -29927,7 +29927,7 @@ add_v2_test(V2_Unit_MemoryPlanner
 )
 add_v2_test(V2_Integration_ServingPoolDemandAdmissionContract
     COMMAND $<TARGET_FILE:v2_test_memory_planner>
-        --gtest_filter=*ServingPoolDemand*:*OwnerFollowerServingBomJoin*:*ServingBomToReservationChain*
+        --gtest_filter=*ServingPoolDemand*:*OwnerFollowerServingBomJoin*:*ServingBomToReservationChain*:MoEPipelineMemoryAdmission.ServingPoolChargedOnceForParentStage
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;Serving;ContinuousBatching;PMA;Regression"
     MPI_PROCS 1 NO_MODELS TIMEOUT 40
     ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")

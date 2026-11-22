@@ -370,8 +370,13 @@ TEST(MoEPipelineMemoryAdmission, ServingPoolChargedOnceForParentStage)
     // THREE-STAGE local pipeline (fixture model with 4 main layers): still
     // exactly ONE owner line (the vocabulary-head stage) — no per-stage repeats.
     {
+        // Correct ctor positions: (moe, mtp, expert_type, expert_width,
+        // gdn_projection, attention_heads, geometry, main_layers). 3 main
+        // layers are covered EXACTLY by stages 0-0/1-1/2-2 (no uncovered layer).
         PlanningGGUFFixture wide(true, false, PlanningGGUFFixture::sourceType(TensorType::FP32),
-                                 PlanningGGUFFixture::Geometry::Directory, 4);
+                                 /*expert_width*/ 256, /*gdn_projection*/ std::nullopt,
+                                 /*attention_heads*/ 8, PlanningGGUFFixture::Geometry::Directory,
+                                 /*main_layers*/ 3);
         PlanningModelSource wide_source(wide.path());
         auto input = threeStageProposal(wide_source, 2);
         input.config.serve_mode = true;
@@ -383,7 +388,12 @@ TEST(MoEPipelineMemoryAdmission, ServingPoolChargedOnceForParentStage)
                 ++lines; total += b;
             }
         EXPECT_EQ(lines, 1u);
-        EXPECT_GT(total, 0u);
+        // EXACT typed D (merged same-host contributions cannot hide a duplicate
+        // D+D charge — the total must equal the single parent-stage demand).
+        const auto wide_expected = servingPoolMemoryDemand(
+            resolveInstalledServingCapacity(input.config.servingCapacityRequest()),
+            ServingPoolPerResponseBudget::defaultPolicy());
+        EXPECT_EQ(total, wide_expected);
     }
 }
 

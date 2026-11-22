@@ -1197,6 +1197,7 @@ TEST(AutomaticOrchestrationCandidates, OverlayServingPoolAdmitsOwnerLineForConti
     config.automatic_planning.device_counts = {{DeviceType::CUDA, 2}};
     config.moe_rebalance.mode = MoERebalanceRuntimeMode::Off;
     config.ngram_table_policy.storage = ImmutableRowStoragePreference::RAM;
+    config.routed_expert_compute_policy = RoutedExpertComputePolicy::Apportioned;
     bool found = false;
     visitAutomaticOrchestrationCandidates(config, source.metadata(), inventory,
         [&](const auto &proposal)
@@ -1283,6 +1284,7 @@ TEST(AutomaticOrchestrationCandidates, ServingPoolOwnershipTypedDecision)
     config.automatic_planning.device_counts = {{DeviceType::CUDA, 2}};
     config.moe_rebalance.mode = MoERebalanceRuntimeMode::Off;
     config.ngram_table_policy.storage = ImmutableRowStoragePreference::RAM;
+    config.routed_expert_compute_policy = RoutedExpertComputePolicy::Apportioned;
     const auto proposals = candidates(config, inventory, true);
     ASSERT_FALSE(proposals.empty());
     bool entry_checked = false;
