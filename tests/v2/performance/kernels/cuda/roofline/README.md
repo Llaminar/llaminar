@@ -365,6 +365,19 @@ on each CUDA device and 48 metadata and lease pairs on the continuation.
 The native preflight checks one and three independent lanes, exact packet
 order, empty destinations and CPU acquisition before graph retirement.
 
+Both paired Release orders used three measured iterations with the same
+prompt, placement, and 256-token history. Every token and per-iteration MTP
+work count matched. Throughput was measured in tokens per second.
+
+| Run order | Mode | Staged decode | Resident decode | Decode change | Overall change |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Resident first | Ordinary | 29.340 | 29.967 | +2.14% | +3.70% |
+| Staged first | Ordinary | 29.489 | 29.113 | −1.27% | +0.16% |
+| Resident first | Fixed depth seven | 44.147 | 44.617 | +1.07% | +1.07% |
+| Staged first | Fixed depth seven | 43.487 | 43.864 | +0.87% | +3.02% |
+
+The resident path remains opt-in pending a repeatable ordinary decode win.
+
 An isolated Gate/Up experiment forms one exact signed sum per Q8 input
 packet during quantization. The representative Q4_K / Q5_1 entry uses
 280 packed-dot instructions in its static image versus 296 before the
@@ -372,6 +385,30 @@ change. All 24 fragment entries retain 96 registers and zero private
 bytes. Across both cards and all three source pairs, retirement moved by
 0–1.03 µs. The native replays and all 18 full seeded states per pair and
 card retained exact bytes.
+
+The fixed-geometry HC Up reader and vectorized shared Gate/Up fold also
+preserved all 18 seeded states per format and card, with 96 registers and
+zero private bytes. The vectorized product entry contained 16 `LDS.128`
+and two `STS.128` instructions and reduced static scalar shared loads
+from 241 to 177. Neither experiment produced a repeatable timing change
+beyond about 1 µs across formats.
+
+### Resident arithmetic phase timing
+
+A separate math-only SM86 capture samples the device clock at the original
+grid barriers. The instrumented fragment uses 110 registers and zero
+private bytes. The table spans all three source pairs and both RTX 3090s.
+
+| Phase | Median, µs |
+| --- | ---: |
+| Residual write and RMSNorm | 9.22 |
+| HC Down partials | 5.12 |
+| HC Down fold and Q8 publication | 3.07 |
+| HC Up and mixed read | 7.17 |
+| Router projection and input Q8 | 6.14 |
+| Route selection, descriptor publication and shared Gate/Up | 19.46–20.48 |
+| Routed Gate/Up | 8.19–10.24 |
+| Down and native retirement | 15.86–16.38 |
 
 ### Grouped Gate/Up packets and direct Down on SM86
 
