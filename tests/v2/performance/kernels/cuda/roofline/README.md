@@ -398,6 +398,25 @@ and its classification varies between runs. The wide all-format
 production replay checks the two IQ3 shared-memory sizes and exact output
 bytes across repeated launches.
 
+The IQ1_M Down tile prepares the four signed activation correction
+combinations for each of the two K16 halves before the K32 loop. The
+prepared values occupy 256 bytes of shared memory per CTA and retain the
+original rounded operations. The IQ3 hot loop uses a packed sign mask and
+carry-free byte addition. A compile-time check compares every original
+IQ3_S and IQ3_XXS grid entry under all 16 sign patterns with scalar bytes.
+
+| Source | Gate/Up with publication, µs | Matched rate | Down, µs | Matched rate |
+| --- | ---: | ---: | ---: | ---: |
+| IQ1_M | 20.416–20.480 | 50.0–50.2% | 10.368–10.496 | 44.5–45.1% |
+| IQ3_S | 24.512–24.576 | 82.6–82.8% | 11.200 | 60.6% |
+| IQ3_XXS | 19.648–20.224 | 73.7–75.6% | 8.832–9.024 | 60.9–61.0% |
+
+These are the Release medians of 31 samples on each card. Both cards passed
+the 21-format serial-byte replay. The three Down variants use 38–40 registers
+and zero local bytes. In this sweep, 12 formats cleared 80% in both stages
+on both cards. The Release build also passed the 11 focused CUDA preflight
+tests and the mixed CUDA/CPU movement token regression.
+
 The mixed 2×CUDA/2×CPU QFN dynamic MTP benchmark produced identical
 256-token histories and per-iteration MTP work in both run orders. With the
 tuned verifier first, median decode was 47.29 tokens/s versus 47.54 for the

@@ -18933,6 +18933,53 @@ __global__ void softmax_topk_decode_descriptors_kernel(
     }
 #endif
 
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ == 860
+    /**
+     * @brief Apply one IQ3 sign per byte using a packed mask and carry-free addition.
+     * @param grid Four nonzero positive int8 magnitudes from a canonical grid.
+     * @param nibble Four original sign bits.
+     * @return Four signed magnitudes in their original byte order.
+     */
+    __host__ __device__ __forceinline__ constexpr uint32_t moe_iq3_apply_signs(
+        uint32_t grid, uint32_t nibble)
+    {
+        const uint32_t low_bits = ((nibble & 0x0fu) * 0x00204081u) & 0x01010101u;
+        // Nonzero magnitudes ensure negating a selected byte cannot carry.
+        return (grid ^ (low_bits * 0xffu)) + low_bits;
+    }
+
+    /**
+     * @brief Compare the packed IQ3 program against every scalar byte and sign combination.
+     * @tparam Grid Original prepared codebook lookup values.
+     * @return True when every byte remains a valid signed operand with no cross-byte carry.
+     */
+    template <const auto &Grid>
+    consteval bool moe_iq3_signs_are_canonical()
+    {
+        for (const uint32_t word : Grid)
+            for (unsigned signs = 0; signs < 16; ++signs)
+            {
+                uint32_t expected = 0;
+                for (unsigned lane = 0; lane < 4; ++lane)
+                {
+                    const unsigned shift = lane * 8;
+                    const auto magnitude = static_cast<uint8_t>(word >> shift);
+                    if (magnitude == 0 || magnitude > 127)
+                        return false;
+                    const auto signed_byte = static_cast<uint8_t>(
+                        signs & (1u << lane) ? -static_cast<int>(magnitude) : magnitude);
+                    expected |= static_cast<uint32_t>(signed_byte) << shift;
+                }
+                if (moe_iq3_apply_signs(word, signs) != expected)
+                    return false;
+            }
+        return true;
+    }
+
+    static_assert(moe_iq3_signs_are_canonical<llaminar2::iq3s_grid>());
+    static_assert(moe_iq3_signs_are_canonical<llaminar2::iq3xxs_grid>());
+#endif
+
     /**
      * @brief Form the eight packed signed-byte operands of an MoE K32 dot.
      * @tparam CodebookId Physical payload layout admitted for the route.
@@ -19036,7 +19083,7 @@ __global__ void softmax_topk_decode_descriptors_kernel(
                 const uint32_t grid = SharedIQ3 ? iq3_table[index]
                     : llaminar2::cuda_native_quantised::iq3_grid_lookup<CodebookId>(index);
                 groups[group] = static_cast<int32_t>(
-                    llaminar2::cuda_native_quantised::iq_apply_signs_4(
+                    moe_iq3_apply_signs(
                         grid, (packet.signs >> (4 * group)) & 0xfu));
             }
         }
@@ -19057,7 +19104,7 @@ __global__ void softmax_topk_decode_descriptors_kernel(
                 const uint32_t grid = SharedIQ3 ? iq3_table[index]
                     : __ldg(llaminar2::cuda_native_quantised::d_iq3xxs_grid + index);
                 groups[group] = static_cast<int32_t>(
-                    llaminar2::cuda_native_quantised::iq_apply_signs_4(
+                    moe_iq3_apply_signs(
                         grid, (signs >> (4 * group)) & 0x0fu));
             }
         }
@@ -19163,6 +19210,12 @@ __global__ void softmax_topk_decode_descriptors_kernel(
         }
     }
 
+    /** @brief Canonical IQ1_M delta numerator for each half and sign pair. */
+    struct alignas(16) MoEIQ1MPreparedCorrection
+    {
+        float halves[2][4]; ///< The two weight-independent pairs of K8 delta terms.
+    };
+
     /**
      * @brief Compute one 32-wide native-quantised block with the serial GEMV FP32 order.
      *
@@ -19187,11 +19240,15 @@ __global__ void softmax_topk_decode_descriptors_kernel(
      * @param linear Block-major prepared-metadata index.
      * @param scale_a FP32 scale for the quantized activation block.
      * @param physical_codebook Actual operand identity within the IQ4 payload family.
+     * @tparam SharedIQ1MCorrection Reuse the original signed Q8 delta terms prepared by the CTA.
+     * @param iq1m_correction Exact delta numerators for each sign pair in each half.
      * @return Canonically rounded contribution, not yet row-accumulated.
      * @pre The caller has admitted the descriptor and all of its required
      *      coefficient planes before entering the K32 traversal.
      */
-    template <uint8_t CodebookId, NativeMoEDotOrder Order = NativeMoEDotOrder::PartitionPartial>
+    template <uint8_t CodebookId,
+              NativeMoEDotOrder Order = NativeMoEDotOrder::PartitionPartial,
+              bool SharedIQ1MCorrection = false>
     __device__ __forceinline__ float moe_native_quantised_block_contribution_rn(
         const int32_t *__restrict__ a_vals,
         const int32_t *__restrict__ packed_groups,
@@ -19201,10 +19258,11 @@ __global__ void softmax_topk_decode_descriptors_kernel(
         const uint32_t *__restrict__ emin_base,
         size_t linear,
         float scale_a,
-        uint8_t physical_codebook = CodebookId)
+        uint8_t physical_codebook = CodebookId, const MoEIQ1MPreparedCorrection *iq1m_correction = nullptr)
     {
         using Traits = llaminar2::cuda_native_quantised::CodebookTraits<CodebookId>;
 
+        static_assert(!SharedIQ1MCorrection || (Traits::is_iq1_m && Order == NativeMoEDotOrder::VerifierWideGrid));
         const auto sum_quantised_word = [](int32_t packed) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 860
             if constexpr ((Order == NativeMoEDotOrder::VerifierWideGrid && Traits::is_iq1_grid) ||
@@ -19275,6 +19333,22 @@ __global__ void softmax_topk_decode_descriptors_kernel(
                 dot_hi = __dp4a(a_vals[group + 4], packed_groups[group + 4], dot_hi);
                 sum_lo += sum_quantised_word(a_vals[group]);
                 sum_hi += sum_quantised_word(a_vals[group + 4]);
+            }
+
+            if constexpr (SharedIQ1MCorrection)
+            {
+                using namespace llaminar2::device_native_quantised_contract;
+                const auto scales = llaminar2::cuda_native_quantised::
+                    native_quantised_dual_scales_rn<CodebookId>(scale_base[linear], min_base[linear]);
+                const uint16_t signs = reinterpret_cast<const uint16_t *>(payload)[2];
+                const int low_pair = ((signs >> 3) & 1) | ((signs >> 6) & 2);
+                const int high_pair = ((signs >> 11) & 1) | ((signs >> 14) & 2);
+                const float low_delta = __fmul_rn(iq1m_correction->halves[0][low_pair], scales.low);
+                const float high_delta = __fmul_rn(iq1m_correction->halves[1][high_pair], scales.high);
+                const float correction = __fmul_rn(scale_a, __fadd_rn(low_delta, high_delta));
+                return accumulate(
+                    dualScaleBlock(dot_lo, dot_hi, scales.low, scales.high, scale_a),
+                    correction);
             }
 
             uint16_t iq1m_qh = 0u;
@@ -19983,6 +20057,7 @@ __global__ void softmax_topk_decode_descriptors_kernel(
      * @param b_start              First K-block (inclusive) this call reduces.
      * @param b_end                Last K-block (exclusive) this call reduces.
      * @param iq3_table            Canonical grid already copied into CTA shared memory.
+     * @param iq1m_correction      Original signed delta terms prepared from the K32 activation.
      * @return Partial accumulated dot product over the requested K-block range.
      * @tparam CodebookId Physical prepared weight format.
      * @tparam Order Direct Down folds each original rounded K32 partition.
@@ -19991,13 +20066,15 @@ __global__ void softmax_topk_decode_descriptors_kernel(
      *         admitted the fixed traversal. Zero uses the supplied interval.
      * @tparam Unroll Number of independent packets to issue per iteration.
      * @tparam SharedIQ3 Consume the CTA's prepared canonical table.
+     * @tparam SharedIQ1MCorrection Consume the CTA's exact IQ1_M activation delta terms.
      * @pre The caller has resolved the physical codebook, validated the
      *      descriptor and 16-byte-aligned activation row, and clipped the K32
      *      interval.
      */
     template <uint8_t CodebookId,
               NativeMoEDotOrder Order = NativeMoEDotOrder::PartitionPartial,
-              int FixedBlocks = 0, int Unroll = FixedBlocks, bool SharedIQ3 = false>
+              int FixedBlocks = 0, int Unroll = FixedBlocks, bool SharedIQ3 = false,
+              bool SharedIQ1MCorrection = false>
     __device__ __forceinline__ float native_quantised_dot_admitted_range(
         const DeviceNativeQuantisedMatrixDesc &desc,
         int n,
@@ -20006,7 +20083,8 @@ __global__ void softmax_topk_decode_descriptors_kernel(
         int N,
         int b_start,
         int b_end,
-        const uint32_t *iq3_table = nullptr)
+        const uint32_t *iq3_table = nullptr,
+        const MoEIQ1MPreparedCorrection *iq1m_correction = nullptr)
     {
         constexpr bool OrderedK32 = Order != NativeMoEDotOrder::PartitionPartial;
         const uint8_t *payload_base = desc.payload;
@@ -20059,7 +20137,7 @@ __global__ void softmax_topk_decode_descriptors_kernel(
 
             const float scale_a = scales_A_blockwise[block_idx];
             const float contribution =
-                moe_native_quantised_block_contribution_rn<CodebookId, Order>(
+                moe_native_quantised_block_contribution_rn<CodebookId, Order, SharedIQ1MCorrection>(
                     a4,
                     packed_groups,
                     payload,
@@ -20067,7 +20145,9 @@ __global__ void softmax_topk_decode_descriptors_kernel(
                     min_base,
                     emin_base,
                     linear,
-                    scale_a);
+                    scale_a,
+                    CodebookId,
+                    SharedIQ1MCorrection ? iq1m_correction + block_idx : nullptr);
             if constexpr (OrderedK32)
                 acc = moe_accumulate_rn(acc, __fadd_rn(0.0f, contribution));
             else
@@ -21361,6 +21441,36 @@ __global__ void softmax_topk_decode_descriptors_kernel(
                     __syncthreads();
                     sum = native_quantised_dot_admitted_range<CodebookId, order, packets, 1, true>(
                         desc, column, codes, scales, kWideVerifierDownN, 0, packets, table);
+                }
+            }
+            else if constexpr (WideGrid && Traits::is_iq1_m)
+            {
+                static_assert(kWideVerifierDownN % kTileN == 0);
+                const auto &desc = descriptors[expert];
+                if (native_quantised_desc_shape_ok<CodebookId>(desc, kWideVerifierDownN, kWideVerifierDownK))
+                {
+                    constexpr int packets = kWideVerifierDownK / 32;
+                    __shared__ MoEIQ1MPreparedCorrection corrections[packets];
+                    if (threadIdx.x < packets * 2)
+                    {
+                        constexpr int32_t ones = 0x01010101;
+                        const auto *words = reinterpret_cast<const int32_t *>(codes);
+                        const int first = threadIdx.x * 4;
+                        const int32_t sum0 = __dp4a(words[first + 1], ones, __dp4a(words[first], ones, 0));
+                        const int32_t sum1 = __dp4a(words[first + 3], ones, __dp4a(words[first + 2], ones, 0));
+                        const float group0 = __fmul_rn(0.125f, static_cast<float>(sum0));
+                        const float group1 = __fmul_rn(0.125f, static_cast<float>(sum1));
+                        auto &pair = corrections[threadIdx.x / 2].halves[threadIdx.x % 2];
+                        pair[0] = __fadd_rn(group0, group1);
+                        pair[1] = __fadd_rn(-group0, group1);
+                        pair[2] = __fadd_rn(group0, -group1);
+                        pair[3] = __fadd_rn(-group0, -group1);
+                    }
+                    // Stage each signed activation combination once. Explicit
+                    // rounded adds preserve the canonical signed-zero cases.
+                    __syncthreads();
+                    sum = native_quantised_dot_admitted_range<CodebookId, order, packets, 2, false, true>(
+                        desc, column, codes, scales, kWideVerifierDownN, 0, packets, nullptr, corrections);
                 }
             }
             else if constexpr (WideGrid && (CodebookId == native_formats::IQ1_S.codebook_id ||

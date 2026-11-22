@@ -24581,6 +24581,8 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
                         if (sm86 && d_model == 2560 && intermediate == 256 &&
                             !probe_path && !weight_probe_path && !gate_weight_probe_path)
                         {
+                            if (down_source_format == "IQ1_M")
+                                EXPECT_EQ(attributes.sharedSizeBytes, (256 / 32) * 2 * 4 * sizeof(float));
                             if (down_source_format == "IQ3_S")
                                 EXPECT_EQ(attributes.sharedSizeBytes, 512 * sizeof(uint32_t));
                             if (down_source_format == "IQ3_XXS")
