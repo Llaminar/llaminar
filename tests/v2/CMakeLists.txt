@@ -30487,6 +30487,13 @@ add_v2_test(V2_Unit_GpuWorkspaceAllocationPolicy
     LABELS "V2;Unit;CUDA;ROCm;Stages;GraphCapture;Workspace"
     MPI_PROCS 1
 )
+# ROCm device code must not bind a hostcall buffer (device printf): such
+# launches fail on hosts without native PCIe atomics.
+add_v2_test(V2_Integration_ROCmDeviceCodeHasNoHostcallPrintf
+    COMMAND $<TARGET_FILE:v2_test_gpu_workspace_allocation_policy>
+        --gtest_filter=Test__GpuWorkspaceAllocationPolicy.ROCmDeviceCodeHasNoHostcallPrintf
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;ROCm;SourcePolicy;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60)
 # MXFP4 trainer weights stay deterministic and admitted (E8M0 exponent 127).
 add_v2_test(V2_Integration_CUDATrainerDeterministicMXFP4Weights
     COMMAND $<TARGET_FILE:v2_test_gpu_workspace_allocation_policy>

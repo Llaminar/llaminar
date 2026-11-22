@@ -232,26 +232,10 @@ __device__ __forceinline__ uint32_t
         if (execution_bank <= 1u)
             return execution_bank;
 
-        const auto *const ticket = runtime
-                                       ? runtime->overlay_epoch_ticket
-                                       : nullptr;
-        const auto *const banks = ::llaminar2::rocm::router_native::runtime_durable_placement_banks(runtime);
-        printf("runtime_decode_invalid_overlay_ticket "
-               "participant=%u active_bank=%u active_epoch=%u "
-               "ticket_epoch=%llu ticket_selector=%llu "
-               "bank0_epoch=%u bank1_epoch=%u transient=%u\n",
-               runtime ? runtime->participant_id : 0u,
-               runtime ? runtime->active_bank : 0u,
-               runtime ? runtime->active_epoch : 0u,
-               static_cast<unsigned long long>(ticket ? ticket->epoch : 0u),
-               static_cast<unsigned long long>(ticket ? ticket->selector : 0u),
-               banks ? banks[0].epoch : 0u,
-               banks ? banks[1].epoch : 0u,
-               runtime
-                   ? runtime->current_batch_llep_transient_bank_active
-                   : 0u);
-        fail_fast_incomplete_llep_transfer();
-        return execution_bank;
+        // No device printf: it would bind a hostcall buffer to every router
+        // kernel and fail their launch on hosts without native PCIe atomics.
+        // The ticket and bank epochs stay readable in device memory.
+        __builtin_verbose_trap("Llaminar MoE", "decode runtime has no valid overlay execution bank");
     }
 /** @brief Shared original `runtime_route_assignment_ledger_ok` policy; arguments retain their source-owned meanings. */
 template<class RuntimeView>

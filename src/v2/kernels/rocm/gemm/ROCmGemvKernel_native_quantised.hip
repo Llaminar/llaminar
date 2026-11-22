@@ -2670,9 +2670,10 @@ __device__ __forceinline__ bool moe_runtime_native_descriptor_selected(
         if (selection.disposition != llaminar2::MoEIntermediateShardRowDisposition::Invalid)
             return selection.disposition == llaminar2::MoEIntermediateShardRowDisposition::Local;
     }
-    printf("native_quantised_runtime_fragment_invalid participant=%u expert=%d\n", runtime->participant_id, expert);
-    __builtin_trap();
-    return false;
+    // A device printf would bind a hostcall buffer to every kernel that
+    // inlines this check, and the launch fails outright on hosts without
+    // native PCIe atomics. The reason travels in the trap's debug record.
+    __builtin_verbose_trap("Llaminar MoE", "runtime descriptor names an invalid intermediate-shard fragment");
 }
 
 template <NativeQuantisedFormat FMT>
