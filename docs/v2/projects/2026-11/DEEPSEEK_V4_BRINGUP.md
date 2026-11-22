@@ -284,9 +284,12 @@ per-family byte ratios (CPU prepared vs file, real UD-IQ2_XXS inventory):
   words for 9-12 byte payloads, two for 6-8 byte payloads), plus fp16 scales and
   the effective-minimum vector. Units: 1280 B per 64-column/K-block for
   Q3_K/IQ2_S/IQ2_XS/IQ3_XXS (5 bits/value) and 1024 B for Q2_K/IQ2_XXS/IQ1_S/
-  IQ1_M (4 bits/value), down from one fixed 1536 B unit (6 bits/value). Measured
-  prepared/file ratios drop to: IQ3_XXS 1.63x (43.49 -> 24.2 GB), IQ2_XXS 1.94x,
-  IQ1_S 2.56x. The NEON tile-register witness required the grid gathers to be
+  IQ1_M (4 bits/value), down from one fixed 1536 B unit (6 bits/value). The
+  effective-minimum vector is reserved only for Q2_K (the sole consumer), which
+  shrinks the remaining units to 1024 B for Q3_K/IQ2_S/IQ2_XS/IQ3_XXS (4
+  bits/value) and 768 B for IQ2_XXS/IQ1_S/IQ1_M (3 bits/value). Measured
+  prepared/file ratios: IQ3_XXS 1.30x (43.49 -> 19.3 GB), IQ2_XXS 1.46x,
+  IQ1_S 1.92x. The NEON tile-register witness required the grid gathers to be
   always-inline (per-tile call overhead removed too).
 - Remaining (tracked, small): the effective-minimum vector is still reserved for
   every compact codebook though only IQ2_S consumes it (-0.5 to -1.0 bits/value
