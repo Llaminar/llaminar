@@ -30,6 +30,9 @@
 #ifdef HAVE_CUDA
 #include "backends/cuda/CUDAHardwareMetadata.h"
 #endif
+#ifdef HAVE_ROCM
+#include "backends/rocm/ROCmHardwareMetadata.h"
+#endif
 #include "execution/compute_stages/stages/MoEIntermediateShardPipeline.h"
 #include "execution/moe/MoEIntermediateShardDescriptorDeclaration.h"
 #include "execution/moe/MoEIntermediateShardRuntimeBinding.h"
@@ -5268,13 +5271,22 @@ namespace llaminar2
         const bool mapped_shard_grouped = mapped_intermediate_shards &&
             (total_tokens != 1 || mapped_shard_phase != MoEOverlayServicePhaseHint::Decode);
         const bool mapped_decode_shared_overlap = [&] {
+            if (!config_.flash_next || !mapped_intermediate_shards || mapped_shard_grouped)
+                return false;
+            // Both measured native backends use the same graph ordering at
+            // the existing heterogeneous ticket boundary.
 #ifdef HAVE_CUDA
-            // Keep startup and the economical release selection tied to the
-            // measured physical backend. The graph ordering itself is shared.
-            if (device.is_cuda() && config_.flash_next && mapped_intermediate_shards && !mapped_shard_grouped)
+            if (device.is_cuda())
             {
                 const auto &hardware = cudaHardwareMetadata().at(device.ordinal);
                 return hardware.sm_major == 8 && hardware.sm_minor == 6;
+            }
+#endif
+#ifdef HAVE_ROCM
+            if (device.is_rocm())
+            {
+                const auto &target = rocmHardwareMetadata().at(device.ordinal).isa_target;
+                return target == "gfx906" || target.starts_with("gfx906:");
             }
 #endif
             return false;

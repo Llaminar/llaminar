@@ -75,7 +75,21 @@ A separate Release run using the production SM86 selector matched all 256
 tokens and the MTP work on all three iterations of each cell. The
 `V2_Integration_QFNMappedDecodeSharedFFNOrdering` regression checks the
 original producer, CPU boundary, and ingress for both backend graph types.
-The ROCm ordering is awaiting a native performance comparison.
+
+The same ordering was measured on 2×ROCm/2×CPU using the two rank-local
+MI50s at `0000:91:00.0` and `0000:97:00.0` on NUMA node 1. Both orders used
+the same ROCm Release binary, the same prompt and placement budget, and the
+original mapped sparse transport. All three iterations in each cell matched
+the full 256-token history and the MTP work. Ordinary decode and fixed-depth
+MTP also produced the same history within each arm.
+
+| Run order | Ordinary control → overlap, tokens/s | Fixed-depth-seven control → overlap, tokens/s |
+| --- | ---: | ---: |
+| Overlap first | 13.75 → 14.30 (+4.02%) | 32.99 → 33.07 (+0.25%) |
+| Control first | 13.77 → 14.17 (+2.97%) | 32.26 → 32.90 (+1.99%) |
+
+The Release build using the default gfx906 selector also reproduced the
+256-token histories and MTP work across all three iterations of both cells.
 
 ## Inter-card decode payloads
 
