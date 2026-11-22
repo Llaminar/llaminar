@@ -21258,6 +21258,21 @@ __global__ void softmax_topk_decode_descriptors_kernel(
 
 
     /**
+     * @brief Evaluate the fixed QFN SiLU with one exponential and reciprocal chain.
+     * @param gate Ordered FP32 Gate value, including zero and exceptional values.
+     * @return The canonical rounded SiLU word before multiplication by Up.
+     */
+    __device__ __forceinline__ float qfn_shared_sigmoid_silu(float gate)
+    {
+        using namespace llaminar2::device_swiglu_contract;
+        const bool nonnegative = gate >= 0.0f;
+        const float exponential = expNonPositive(nonnegative ? -gate : gate);
+        const float inverse = reciprocalOneToTwo(add(1.0f, exponential));
+        const float sigmoid = nonnegative ? inverse : multiply(exponential, inverse);
+        return multiply(multiply(gate, sigmoid), 1.0f);
+    }
+
+    /**
      * @brief Apply the canonical reciprocal to a widened positive half scale.
      * @param scale Scale published by the bounded QFN SwiGLU conversion.
      * @return The exact reciprocal word from the original Newton order.
@@ -21287,10 +21302,11 @@ __global__ void softmax_topk_decode_descriptors_kernel(
      * The complete QFN warp uses an unsigned magnitude maximum and native
      * binary16 RNE over the canonical bounded scale range.
      * @tparam FixedColumns Exact admitted QFN pitch, or zero for runtime geometry.
+     * @tparam ShareSigmoid Use the common rounded exponential chain on measured tiles.
      * @pre The QFN launch covers every column with complete warps and uses one
      *      block for each submitted original route and K32 output group.
      */
-    template <int FixedColumns = 0>
+    template <int FixedColumns = 0, bool ShareSigmoid = false>
     __global__ void grouped_native_quantised_gate_up_ordered_kpart_reduce_swiglu_kernel(
         const float *__restrict__ gate_partials,
         const float *__restrict__ up_partials,
@@ -21301,6 +21317,7 @@ __global__ void softmax_topk_decode_descriptors_kernel(
         int tile_route_slots,
         int N)
     {
+        static_assert(!ShareSigmoid || FixedColumns > 0);
         constexpr int kTileN = 32;
         constexpr int kPartitions = llaminar2::CUDAMoEBatchInvariantPolicy::gate_up_k_partitions;
         if constexpr (FixedColumns > 0)
@@ -21342,7 +21359,11 @@ __global__ void softmax_topk_decode_descriptors_kernel(
             }
         }
 
-        const float value = active ? (silu(gate_sum) * up_sum) : 0.0f;
+        const float value = [&] {
+            if constexpr (ShareSigmoid)
+                return qfn_shared_sigmoid_silu(gate_sum) * up_sum;
+            return active ? silu(gate_sum) * up_sum : 0.0f;
+        }();
         using namespace llaminar2::device_q8_activation_contract;
         float scale;
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
@@ -27063,14 +27084,16 @@ __attribute__((visibility("default"))) bool cudaMoE_softmax_topk_decode_selected
                     dim3 reduce_grid(
                         (intermediate + kReduceTileN - 1) / kReduceTileN,
                         tile_route_slots);
-                    const auto publish = [&]<int FixedColumns>() {
-                        grouped_native_quantised_gate_up_ordered_kpart_reduce_swiglu_kernel<FixedColumns>
+                    const auto publish = [&]<int FixedColumns, bool ShareSigmoid = false>() {
+                        grouped_native_quantised_gate_up_ordered_kpart_reduce_swiglu_kernel<FixedColumns, ShareSigmoid>
                             <<<reduce_grid, reduce_block, 0, cuda_stream>>>(
                                 d_gate_partials, d_up_partials, d_original_to_grouped,
                                 d_scratch_swiglu_int8, d_scratch_swiglu_scales,
                                 original_slot_base, tile_route_slots, intermediate);
                     };
-                    if (use_fixed_qfn)
+                    if (use_fixed_qfn && kTileN == 64 && gate_contract.enabled())
+                        publish.template operator()<kQFNDecodeGateUpN, true>();
+                    else if (use_fixed_qfn)
                         publish.template operator()<kQFNDecodeGateUpN>();
                     else
                         publish.template operator()<0>();

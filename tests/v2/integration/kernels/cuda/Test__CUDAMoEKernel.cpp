@@ -22137,7 +22137,7 @@ namespace
     }
 
     /**
-     * @brief Check the captured QFN publisher at the binary16 scale boundaries.
+     * @brief Check captured QFN publication across signed gates and binary16 scale boundaries.
      * @param launch Production reducer and its borrowed captured arguments.
      * @param stream Owning test stream, ordered after the route-map producer.
      * @param routes Number of live routes in this fixture.
@@ -22145,7 +22145,7 @@ namespace
      * @pre The caller replays the whole graph after this check to restore
      *      the graph-owned partial and publication buffers.
      */
-    void verifyCapturedQFNSwiGLUScaleBoundaries(
+    void verifyCapturedQFNSwiGLUNumericalBoundaries(
         const llaminar2::test::cuda_kernel_probe_detail::KernelLaunch &launch,
         cudaStream_t stream, int routes, int columns)
     {
@@ -22190,22 +22190,31 @@ namespace
         std::vector<int8_t> expected_codes(elements), actual_codes(elements);
         std::vector<float> expected_scales(elements / packet_width), actual_scales(elements / packet_width);
         constexpr std::array exponents{-36, -26, -22, -14, -7, 0, 8, 24};
+        const std::array signed_gates{
+            std::nextafter(-87.0f, -88.0f), -87.0f, std::nextafter(-87.0f, -86.0f),
+            -4.0f, -1.0f, -0.0f, 0.0f, 1.0f, 4.0f, 87.0f};
         for (int route = 0; route < routes; ++route)
         {
             for (int packet = 0; packet < packets; ++packet)
             {
                 std::array<float, packet_width> values{};
                 float maximum = 0.0f;
-                const auto sample = static_cast<size_t>(route * packets + packet) % (exponents.size() + 1);
+                const auto sample_id = static_cast<size_t>(route * packets + packet);
+                const auto sample = sample_id % (exponents.size() + 1);
+                const bool mixed_signs = (sample_id / (exponents.size() + 1)) % 2 != 0;
                 for (int lane = 0; lane < packet_width; ++lane)
                 {
                     const float signed_lane = static_cast<float>(lane % 2 ? -lane - 1 : lane + 1);
-                    const float input = sample == 0 ? 0.0f : std::scalbn(signed_lane, exponents[sample - 1]);
+                    const float lane_gate = mixed_signs ? signed_gates[lane % signed_gates.size()] : 1.0f;
+                    // Make the smallest admitted sigmoid at -87 visible in the Q8 publication.
+                    const float input = sample == 0 ? 0.0f : std::scalbn(signed_lane,
+                        mixed_signs && sample == 1 && lane_gate < -86.0f ? 120 : exponents[sample - 1]);
                     const auto index = static_cast<size_t>(route) * partitions * columns +
                         packet * packet_width + lane;
-                    gate_input[index] = 1.0f;
+                    gate_input[index] = lane_gate;
                     up_input[index] = input;
-                    values[lane] = llaminar2::device_swiglu_contract::swigluValue(1.0f, input);
+                    // The first partition is folded from positive zero.
+                    values[lane] = llaminar2::device_swiglu_contract::swigluValue(0.0f + lane_gate, input);
                     maximum = maximumAbsoluteValue(maximum, values[lane]);
                 }
                 const float scale_value = scale(maximum);
@@ -24727,8 +24736,12 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
                         {
                             const bool fixed_qfn_publication = sm86 && qfn_width &&
                                 (expected_gate_tile == 64 || expected_gate_tile == 128);
-                            EXPECT_EQ(name.contains("ILi320EE"), fixed_qfn_publication);
+                            EXPECT_EQ(name.contains("ILi320E"), fixed_qfn_publication);
                         }
+                        const bool shared_sigmoid = sm86 && qfn_width && top_k == 10 && expected_gate_tile == 64 &&
+                            llaminar2::CUDAMoEBatchInvariantPolicy::qfnVerifierPlanValidatedGate(gate_format->codebook_id);
+                        EXPECT_EQ(name.contains("ILi320ELb1EE"), shared_sigmoid)
+                            << gate_source << " captured the wrong SwiGLU schedule";
                     }
                     if (name.find("grouped_prefill_down_canonical_publish_k32_kernel") != std::string_view::npos)
                     {
@@ -24779,10 +24792,10 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
                 ASSERT_EQ(direct_publications, 1);
                 ASSERT_TRUE(gate_scatter && gate_reduce)
                     << "the fixture must capture one ordered Gate/Up scatter and publication";
-                if (sm86 && qfn_all_gate && top_k == 10 && gate_source == "Q4_0" &&
+                if (sm86 && qfn_all_gate && top_k == 10 && (gate_source == "Q4_0" || gate_source == "IQ2_XS") &&
                     !probe_path && !weight_probe_path && !gate_weight_probe_path)
                 {
-                    ASSERT_NO_FATAL_FAILURE(verifyCapturedQFNSwiGLUScaleBoundaries(
+                    ASSERT_NO_FATAL_FAILURE(verifyCapturedQFNSwiGLUNumericalBoundaries(
                         *gate_reduce, stream_, seq_len * top_k, intermediate));
                 }
                 for (int repeat = 0; repeat < 3; ++repeat)

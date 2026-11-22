@@ -460,6 +460,18 @@ This sweep matched serial bytes for all 21 Gate/Up and seven K=320 Down
 formats on both RTX 3090s. Seventeen Gate/Up and all seven Down formats
 reached 80% of their matched reference on both cards.
 
+The six plan-validated low-bit tiles share the rounded exponential and
+reciprocal sequence for positive and negative gates. Independent device
+functions returned identical SiLU words for all 4,294,967,296 binary32
+input patterns on each RTX 3090. The captured reducer uses 216 compiled
+instructions, down from 264. The native replay checks mixed signs and the
+exp cutoff around −87 alongside the binary16 scale boundaries.
+
+Five of the six formats reduced complete capture time by 0.064–0.256 µs
+in the paired runs. IQ2_XS varied from a 0.064 µs gain to a 0.192 µs loss.
+The Release sweep measured IQ3_XXS at 26.112 µs on both cards and IQ2_S
+at 26.752–26.944 µs. Both cleared 80% of the matched reference on each card.
+
 Forcing the existing grouped INT8 tensor-core engine at four rows
 preserved serial output bytes on the six low-bit sources. The complete
 captured transaction, including routing and publication, ranged from
