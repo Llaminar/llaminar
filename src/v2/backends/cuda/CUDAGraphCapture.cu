@@ -155,7 +155,7 @@ namespace llaminar2
                 __nanosleep(128u);
         }
 
-        /** @brief Acquire a same-device resident release within the standard graph transport deadline. */
+        /** @brief Consume a same-device release and reopen the word for the next ordered resident row. */
         __global__ void waitResidentPacketAcquire64(std::uint64_t* signal, std::uint64_t value)
         {
             constexpr std::uint64_t deadline_nanoseconds = 30'000'000'000ULL;
@@ -167,6 +167,11 @@ namespace llaminar2
                     __trap();
                 __nanosleep(128u);
             }
+            // There is one acquire node per release. The graph joins this
+            // packet and resident retirement before the next row can publish.
+            // Returning the word here keeps reset out of every graph replay.
+            if (word.exchange(0u, cuda::memory_order_acq_rel) != value)
+                __trap();
         }
 
         enum class NativeAcquire64 { MappedPeer, ResidentPacket };
@@ -370,23 +375,38 @@ namespace llaminar2
         }
     }
 
+    /** @copydoc CUDAEarlyPacketPublication::prepare */
+    void CUDAEarlyPacketPublication::prepare(void* stream, std::uint64_t* signal)
+    {
+        const auto native = static_cast<cudaStream_t>(stream);
+        cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+        if (!native || native == cudaStreamLegacy || native == cudaStreamPerThread || !signal ||
+            reinterpret_cast<std::uintptr_t>(signal) % alignof(std::uint64_t) != 0u ||
+            cudaStreamIsCapturing(native, &capture) != cudaSuccess || capture != cudaStreamCaptureStatusNone)
+            throw std::logic_error("CUDA early packet requires cold preparation of its original aligned device signal");
+        const auto reset = cudaMemsetAsync(signal, 0, sizeof(*signal), native);
+        if (reset != cudaSuccess)
+            throw std::runtime_error(std::string("CUDA early packet initialization failed: ") + cudaGetErrorString(reset));
+        stream_ = native;
+        signal_ = signal;
+        graph_ = nullptr;
+        capture_id_ = 0;
+        producer_frontier_.clear();
+        packet_frontier_.clear();
+    }
+
     /** @copydoc CUDAEarlyPacketPublication::recordProducer */
     void CUDAEarlyPacketPublication::recordProducer(void* stream, std::uint64_t* signal)
     {
         const auto native = static_cast<cudaStream_t>(stream);
-        auto fork = readEarlyPacketFrontier(native);
-        if (!signal || reinterpret_cast<std::uintptr_t>(signal) % alignof(std::uint64_t) != 0u ||
-            (graph_ == fork.graph && capture_id_ == fork.capture_id))
-            throw std::logic_error("CUDA early packet requires one original producer and an aligned device signal");
-        const auto reset = cudaMemsetAsync(signal, 0, sizeof(*signal), native);
-        if (reset != cudaSuccess)
-            throw std::runtime_error(std::string("CUDA early packet reset failed: ") + cudaGetErrorString(reset));
-        fork = readEarlyPacketFrontier(native);
+        const auto fork = readEarlyPacketFrontier(native);
+        if (!signal_ || signal != signal_ || native != stream_ || (graph_ == fork.graph && capture_id_ == fork.capture_id))
+            throw std::logic_error("CUDA early packet lost its cold-prepared signal or has multiple original producers");
         graph_ = fork.graph;
-        stream_ = native;
         capture_id_ = fork.capture_id;
-        signal_ = signal;
-        reset_frontier_.assign(fork.nodes.begin(), fork.nodes.end());
+        producer_frontier_.clear();
+        if (!fork.nodes.empty())
+            producer_frontier_.assign(fork.nodes.begin(), fork.nodes.end());
         packet_frontier_.clear();
     }
 
@@ -396,17 +416,17 @@ namespace llaminar2
         const auto native = static_cast<cudaStream_t>(stream);
         const auto primary = readEarlyPacketFrontier(native);
         if (!record || native != stream_ || primary.graph != graph_ || primary.capture_id != capture_id_ ||
-            primary.nodes.empty() || reset_frontier_.empty())
+            primary.nodes.empty() || !signal_)
             throw std::logic_error("CUDA early packet consumer crossed its original producer's native capture unit");
         std::vector<cudaGraphNode_t> join(primary.nodes.begin(), primary.nodes.end());
         if (packet_frontier_.empty())
         {
-            // Keep the exact reset dependency, but append the acquire after the
+            // Keep the exact producer dependency, but append the acquire after the
             // arithmetic entry has been recorded. CUDA uses node insertion
             // order as a scheduling hint within a native graph.
             cudaGraphNode_t acquire = nullptr;
-            const auto added = addSystemWaitValue64Node(&acquire, graph_, reset_frontier_.data(),
-                reset_frontier_.size(), signal_, 1u, NativeAcquire64::ResidentPacket);
+            const auto added = addSystemWaitValue64Node(&acquire, graph_, producer_frontier_.data(),
+                producer_frontier_.size(), signal_, 1u, NativeAcquire64::ResidentPacket);
             if (added != cudaSuccess || !acquire)
                 throw std::runtime_error(std::string("CUDA early packet acquire failed: ") + cudaGetErrorString(added));
             packet_frontier_.assign(1u, acquire);

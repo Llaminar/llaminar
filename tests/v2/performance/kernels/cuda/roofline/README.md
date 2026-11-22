@@ -257,6 +257,22 @@ resident retirement by 10.2–35.8 µs in every measured frame. This fixture
 times the CUDA publication and packet witness on each device. Release
 qualification measures the original mixed CPU transport and model execution.
 
+The packet acquire now consumes and clears its arena word. Cold preparation
+initializes the word, and the graph joins both branches before the next layer
+can reuse it. All five native tests passed on both cards. In the real model
+capture, the root drops from 2,672 to 2,624 native nodes, and the follower
+retains 1,951. Both use one executable. A paired standalone F320/S320 capture
+with four local routes and the three production source pairs measured the
+following medians across both RTX 3090s. Its packet witness copies the original
+FP32 row and routing bytes on-device. Every paired output matched the staged
+arithmetic across 18 input states for each format and card.
+
+| Gate/Up and Down | Staged packet, µs | Resident packet, µs | Staged retirement, µs | Resident retirement, µs |
+| --- | ---: | ---: | ---: | ---: |
+| Q4_K / Q5_1 | 56.32 | 57.34 | 97.28 | 75.78–76.29 |
+| Q4_K / Q8_0 | 56.32 | 56.32 | 97.28–98.30 | 74.24–74.75 |
+| Q5_K / Q8_0 | 56.32 | 56.83–57.34 | 98.30 | 76.80–77.31 |
+
 ### Grouped Gate/Up packets and direct Down on SM86
 
 The grouped native program uses one 256-thread CTA per live 32-column

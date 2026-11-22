@@ -193,6 +193,8 @@ public:
             output_demand_, router_.collect_device_runtime_histogram, workspace_->id());
         if (program.admission().resources().private_bytes)
             throw std::logic_error("CUDA retained QFN requires a spill-free resident entry");
+        if (packet_)
+            packet_->prepare(stream, arguments.early_packet_ready);
         prepared_stream_ = stream;
         prepared_workspace_id_ = workspace_->id();
         prepared_banks_ = pointers;

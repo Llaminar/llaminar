@@ -86,7 +86,14 @@ namespace llaminar2
     {
     public:
         /**
-         * @brief Reset the original device word and fork its acquire from the exact reset edge.
+         * @brief Initialize the original arena word before the executable can record or replay.
+         * @param stream Exact original CUDA setup stream.
+         * @param signal Arena-owned word retained by the producer and consumed by the packet.
+         */
+        void prepare(void* stream, std::uint64_t* signal);
+
+        /**
+         * @brief Borrow the original producer frontier for a same-unit packet fork.
          * @param stream Exact original native capture stream.
          * @param signal Arena-owned signal released by the producer after the early data is complete.
          */
@@ -105,7 +112,7 @@ namespace llaminar2
         cudaStream_t stream_ = nullptr;
         unsigned long long capture_id_ = 0;
         std::uint64_t* signal_ = nullptr;
-        std::vector<cudaGraphNode_t> reset_frontier_;
+        std::vector<cudaGraphNode_t> producer_frontier_;
         std::vector<cudaGraphNode_t> packet_frontier_;
     };
 

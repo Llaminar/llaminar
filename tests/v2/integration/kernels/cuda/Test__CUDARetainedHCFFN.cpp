@@ -362,6 +362,8 @@ void replay(const TracePair& trace, int ordinal, unsigned resident_blocks, Retai
 
     llaminar2::CUDAGraphCapture capture(native, ordinal);
     CUDAEarlyPacketPublication packet;
+    if (early)
+        packet.prepare(native, signal.data());
     ASSERT_TRUE(capture.beginCapture());
     if (early)
         packet.recordProducer(native, signal.data());
@@ -476,6 +478,8 @@ void replay(const TracePair& trace, int ordinal, unsigned resident_blocks, Retai
         EXPECT_EQ(actual, frame.expected) << "seed=" << frame.seed << " epoch=" << epoch;
         if (early)
         {
+            constexpr std::uint64_t empty = 0;
+            EXPECT_EQ(signal.digest(native), fnv1a64(&empty, sizeof(empty)));
             EXPECT_EQ(packet_hidden.digest(native), mixed.digest(native));
             EXPECT_EQ(packet_route.digest(native), route_indices.digest(native));
             EXPECT_EQ(joined_routed.digest(native), routed.digest(native));
