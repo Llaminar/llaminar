@@ -526,6 +526,28 @@ dispatch timing within 1.03 µs of the control. The second DMA variant took
 packet and arithmetic output on both cards. The Release candidate retains
 the original ticket copy path.
 
+The split residual-normalization trial used four CTAs per branch to compute
+disjoint stripes. It retained the original 256-lane square-sum tree and Q8
+packet rounding. The original scratch bank held the lane partials before its
+Down producer acquired it. All 18 seeded native states for each of the three
+format pairs matched the original on both cards. Across 64 captured samples
+per cell, the trial brought the original ticket forward by 2.55–5.09 µs and the
+mapped dispatch by 2.04–4.10 µs. Fused arithmetic retirement fell by
+3.07–4.10 µs. The loaded Q4_K/Q5_1 root entry used 110 registers and 22,080
+shared bytes, with zero stack or local bytes and two resident blocks per SM.
+
+The matched 2×CUDA/2×CPU Release run used the original F320/S320 plan, one
+warmup and three measured 256-token requests per arm and cell. Token histories
+and per-iteration MTP work matched every staged control. The split remains a
+kernel experiment because both model comparisons lost throughput.
+
+| Arm order | Cell | Staged decode tokens/s | Split resident decode tokens/s | Change |
+| --- | --- | ---: | ---: | ---: |
+| Resident first | Ordinary | 29.783 | 29.367 | −1.40% |
+| Staged first | Ordinary | 29.550 | 29.305 | −0.83% |
+| Resident first | Fixed depth seven | 44.067 | 43.508 | −1.27% |
+| Staged first | Fixed depth seven | 43.693 | 43.399 | −0.67% |
+
 ### Grouped Gate/Up packets and direct Down on SM86
 
 The grouped native program uses one 256-thread CTA per live 32-column

@@ -83,9 +83,10 @@ are smaller than the corresponding read times.
 
 These CPU times include local expert execution and its team/activation work.
 The rates assume one requested read per prepared byte. Establish physical
-traffic and cache residency with separate counter measurements. The sampled decode
-window on this CPU rank spent 74.18% of user cycles at identified `libgomp`
-wait-loop addresses, 12.22% in the fused projection dispatcher and 11.20%
-in the AVX-512 non-nibble GEMV entry. Attribute critical-path time with separate
-elapsed measurements of the CPU leaves and actual thread scaling alongside the
-CUDA dispatch timeline.
+traffic and cache residency with separate counter measurements. The sampled
+decode window on this CPU rank spent 74.18% of user cycles at identified
+`libgomp` wait-loop addresses, 12.22% in the fused projection workshare body
+and 11.20% in the AVX-512 non-nibble GEMV entry. The most sampled instructions
+in those two projection symbols were AVX-512 arithmetic and weight operands.
+Attribute critical-path time with separate elapsed measurements of the CPU
+leaves and actual thread scaling alongside the CUDA dispatch timeline.
