@@ -8,6 +8,7 @@
  * and publication lifetime. It makes no allocation or capacity decision.
  */
 #pragma once
+#include "CPUProjectionOutputRows.h"
 #include "CPUNativeQuantisedPrefillSchedule.h"
 #include "tensors/BlockStructures.h"
 #include "utils/CPUFeatures.h"
@@ -415,7 +416,55 @@ namespace llaminar2::cpu::native_quantised
         /** Scheduling intent; changing it never changes the numerical K tree. */
         ProjectionRowsPurpose purpose = ProjectionRowsPurpose::Decode;
         int policy_n = 0; ///< Explicit authenticated leaf width; zero retains existing ambient policy.
+        CPUProjectionOutputRows output_rows; ///< Optional final publication coordinates in the destination bank.
+
+        /** @return Final output row address for a tile, with no validation in the arithmetic. */
+        [[nodiscard]] float *outputRow(std::size_t row) const noexcept
+        {
+            return output_rows.rowAddress(output, ldc, row);
+        }
+
+        /** @return Bounding byte range of the committed output rows, possibly including gaps. */
+        [[nodiscard]] storage_proof::Bytes outputEnvelope(int count) const noexcept
+        {
+            const float *first = outputRow(0);
+            return {first, (static_cast<std::size_t>(outputRow(count - 1) - first) + N) * sizeof(float)};
+        }
     };
+
+    /**
+     * @brief Keep two independent projections' live writes disjoint, including indexed banks.
+     * @param first First validated projection.
+     * @param first_rows Its exact live projection row count.
+     * @param second Second validated projection.
+     * @param second_rows Its exact live projection row count.
+     * @throws std::invalid_argument If the projections author overlapping values.
+     */
+    inline void requireDisjointFusedProjectionOutputs(const FusedVerifierRowsDesc &first, int first_rows,
+        const FusedVerifierRowsDesc &second, int second_rows)
+    {
+        const auto first_envelope = first.outputEnvelope(first_rows);
+        const auto second_envelope = second.outputEnvelope(second_rows);
+        if (!storage_proof::overlaps(first_envelope, second_envelope))
+            return;
+        if (!first.output_rows && !second.output_rows)
+        {
+            storage_proof::requireDisjoint(first_envelope, second_envelope);
+            return;
+        }
+        int a = 0, b = 0;
+        while (a < first_rows && b < second_rows)
+        {
+            const auto *left = first.outputRow(a);
+            const auto *right = second.outputRow(b);
+            storage_proof::requireDisjoint({left, static_cast<std::size_t>(first.N) * sizeof(float)},
+                {right, static_cast<std::size_t>(second.N) * sizeof(float)});
+            if (std::less<const float *>{}(left, right))
+                ++a;
+            else
+                ++b;
+        }
+    }
 
     /**
      * @brief Descriptor for one projection in a fused GEMV call.

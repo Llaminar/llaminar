@@ -13,6 +13,7 @@
  * Mixed-format transactions cycle the entire codebook registry through each
  * projection role: a GGUF file label must never imply uniform FFN weights.
  */
+#include "execution/moe/CanonicalMoERouteRecord.h"
 #include "kernels/cpu/gemm/CPUNativeQuantisedGemmKernel.h"
 #include "utils/NativeQuantisedTestPartialStorage.h"
 #include "utils/IQ2SFusedMoESourceWitness.h"
@@ -256,17 +257,21 @@ enum class ExpertFormatLayout
 /**
  * @brief Prove FFN/router bytes and audit warmed execution when diagnostics are off.
  * @param layout Select uniform or independent per-projection source formats.
+ * @param indexed_down Bind Down to its interleaved original packed route slots.
  */
-void proveExpertTransaction(ExpertFormatLayout layout = ExpertFormatLayout::Uniform)
+void proveExpertTransaction(ExpertFormatLayout layout = ExpertFormatLayout::Uniform, bool indexed_down = false)
 {
     VerifierWorkerScope restore;
     constexpr int width = 256, max_rows = 31;
     constexpr int blocks = width / Q8_1Block::BLOCK_SIZE;
+    constexpr int packed_stride = width + 1, bank_rows = max_rows * 2 + 1;
+    constexpr float untouched = -23456.0f;
     constexpr auto policy = CPUProjectionNumericalPolicy::GPUAlignedExpert;
     using Desc = CPUNativeQuantisedGemmKernel::BatchedPrequantizedProjectionDesc;
     auto input = TestTensorFactory::createFP32Random({max_rows, width}, -0.75f, 0.75f, 7103);
     std::vector<Q8_1Block> q8(max_rows * blocks), actual_q8(q8.size()), expected_q8(q8.size());
     std::vector<float> gate(max_rows * width), up(gate.size()), down(gate.size());
+    std::vector<float> route_bank(bank_rows * packed_stride, untouched);
     std::vector<float> expected_gate(gate.size()), expected_up(gate.size()), expected_down(gate.size());
     std::array<float, width> activated{};
 
@@ -325,6 +330,22 @@ void proveExpertTransaction(ExpertFormatLayout layout = ExpertFormatLayout::Unif
                 {.kernel=&down_kernel, .input_q8=actual_q8.data(), .output=down.data(), .rows=1, .n=width, .ldc=width},
                 {.kernel=&down_kernel, .input_q8=actual_q8.data()+blocks, .output=down.data()+width, .rows=rows-1, .n=width, .ldc=width},
             }};
+            std::array<int, max_rows> destination{};
+            if (indexed_down)
+            {
+                std::fill(route_bank.begin(), route_bank.end(), untouched);
+                destination[0] = rows;
+                for (int row = 1; row < rows; ++row)
+                    destination[row] = row * 2 + (rows % 2 == 0);
+                for (std::size_t member = 0; member < down_desc.size(); ++member)
+                {
+                    auto &desc = down_desc[member];
+                    desc.output = route_bank.data();
+                    desc.ldc = packed_stride;
+                    desc.output_rows = CPUProjectionOutputRows::indexed(route_bank, packed_stride, width,
+                        {destination.data() + member, static_cast<std::size_t>(desc.rows)});
+                }
+            }
             NativeQuantisedTestPartialStorage partials(std::max(
                 NativeQuantisedTestPartialStorage::bundleFloats(gate_up.data(), gate_up.size(), 1),
                 NativeQuantisedTestPartialStorage::bundleFloats(down_desc.data(), down_desc.size(), 1)));
@@ -336,7 +357,26 @@ void proveExpertTransaction(ExpertFormatLayout layout = ExpertFormatLayout::Unif
             const auto verify = [&] {
                 EXPECT_EQ(std::memcmp(gate.data(), expected_gate.data(), rows * width * sizeof(float)), 0);
                 EXPECT_EQ(std::memcmp(up.data(), expected_up.data(), rows * width * sizeof(float)), 0);
-                EXPECT_EQ(std::memcmp(down.data(), expected_down.data(), rows * width * sizeof(float)), 0);
+                if (indexed_down)
+                {
+                    std::array<bool, bank_rows> live{};
+                    for (int row = 0; row < rows; ++row)
+                    {
+                        const int slot = destination[row];
+                        live[slot] = true;
+                        EXPECT_EQ(std::memcmp(route_bank.data() + slot * packed_stride,
+                            expected_down.data() + row * width, width * sizeof(float)), 0);
+                    }
+                    for (int slot = 0; slot < bank_rows; ++slot)
+                    {
+                        const auto *record = route_bank.data() + slot * packed_stride;
+                        EXPECT_EQ(record[width], untouched);
+                        if (!live[slot])
+                            EXPECT_TRUE(std::all_of(record, record + width, [=](float v) { return v == untouched; }));
+                    }
+                }
+                else
+                    EXPECT_EQ(std::memcmp(down.data(), expected_down.data(), rows * width * sizeof(float)), 0);
                 EXPECT_EQ(std::memcmp(actual_q8.data(), expected_q8.data(), rows * blocks * sizeof(Q8_1Block)), 0);
             };
             std::fill(gate.begin(), gate.end(), -12345.0f);
@@ -344,7 +384,16 @@ void proveExpertTransaction(ExpertFormatLayout layout = ExpertFormatLayout::Unif
             down_desc.back().ldc = width - 1;
             EXPECT_FALSE(run());
             EXPECT_TRUE(std::all_of(gate.begin(), gate.end(), [](float x) { return x == -12345.0f; }));
-            down_desc.back().ldc = width;
+            down_desc.back().ldc = indexed_down ? packed_stride : width;
+            if (indexed_down)
+            {
+                const auto valid = down_desc.front().output_rows;
+                down_desc.front().output_rows = CPUProjectionOutputRows::indexed(route_bank, packed_stride,
+                    width, {destination.data() + 1, 1u});
+                EXPECT_THROW(run(), std::invalid_argument);
+                EXPECT_TRUE(std::all_of(gate.begin(), gate.end(), [](float x) { return x == -12345.0f; }));
+                down_desc.front().output_rows = valid;
+            }
             PerfStatsCollector::reset();
             ASSERT_TRUE(run());
             verify();
@@ -410,8 +459,9 @@ TEST(CPUNativeQuantisedVerifierWorkers, PreparedStandaloneSingleRowFFNContract)
     std::vector<float> bounded_inputs(capacity * hidden);
     std::vector<Q8_1Block> input_q8(capacity * input_blocks), expected_q8(capacity * middle_blocks);
     std::vector<Q8_1Block> actual_q8(expected_q8.size());
-    std::vector<float> gate(capacity * width), up(gate.size()), down(capacity * hidden);
-    std::vector<float> expected_gate(gate.size()), expected_up(up.size()), expected_down(down.size());
+    constexpr int packed_pitch = hidden + 1;
+    std::vector<float> gate(capacity * width), up(gate.size()), down(capacity * packed_pitch + 1);
+    std::vector<float> expected_gate(gate.size()), expected_up(up.size()), expected_down(capacity * hidden);
     std::array<float, width> activated{};
     const auto &formats = quantizedMoEVerifierFormats();
     std::vector<const QuantizedVerifierFormatCase *> down_formats;
@@ -459,7 +509,7 @@ TEST(CPUNativeQuantisedVerifierWorkers, PreparedStandaloneSingleRowFFNContract)
             gate_up[2 * row + 1] = {.kernel = &up_kernel, .input_q8 = activation,
                 .output = up.data() + row * width, .rows = 1, .n = width, .ldc = width};
             down_members[row] = {.kernel = &down_kernel, .input_q8 = actual_q8.data() + row * middle_blocks,
-                .output = down.data() + row * hidden, .rows = 1, .n = hidden, .ldc = hidden};
+                .output = down.data() + row * packed_pitch, .rows = 1, .n = hidden, .ldc = hidden};
         }
 
         for (int workers : {1, 3, 7})
@@ -474,6 +524,9 @@ TEST(CPUNativeQuantisedVerifierWorkers, PreparedStandaloneSingleRowFFNContract)
                 std::fill(gate.begin(), gate.end(), untouched);
                 std::fill(up.begin(), up.end(), untouched);
                 std::fill(down.begin(), down.end(), untouched);
+                for (int row = 0; row < routes; ++row)
+                    ASSERT_TRUE(canonical_moe_route_record::writeFlatRouteSlot(
+                        canonical_moe_route_record::record(down.data(), row, hidden), hidden, 2 * row));
                 std::memset(actual_q8.data(), 0xa5, actual_q8.size() * sizeof(Q8_1Block));
                 PerfStatsCollector::reset();
                 const auto prepared = Kernel::tryExecuteStandaloneMoEOneRow(
@@ -489,12 +542,18 @@ TEST(CPUNativeQuantisedVerifierWorkers, PreparedStandaloneSingleRowFFNContract)
                 }
                 EXPECT_EQ(std::memcmp(gate.data(), expected_gate.data(), routes * width * sizeof(float)), 0);
                 EXPECT_EQ(std::memcmp(up.data(), expected_up.data(), routes * width * sizeof(float)), 0);
-                EXPECT_EQ(std::memcmp(down.data(), expected_down.data(), routes * hidden * sizeof(float)), 0);
+                for (int row = 0; row < routes; ++row)
+                {
+                    EXPECT_EQ(std::memcmp(down.data() + row * packed_pitch,
+                        expected_down.data() + row * hidden, hidden * sizeof(float)), 0);
+                    EXPECT_EQ(canonical_moe_route_record::readFlatRouteSlot(
+                        canonical_moe_route_record::record(down.data(), row, hidden), hidden), 2u * row);
+                }
                 EXPECT_EQ(std::memcmp(actual_q8.data(), expected_q8.data(),
                     routes * middle_blocks * sizeof(Q8_1Block)), 0);
                 EXPECT_TRUE(std::all_of(gate.begin() + routes * width, gate.end(), [](float v) { return v == untouched; }));
                 EXPECT_TRUE(std::all_of(up.begin() + routes * width, up.end(), [](float v) { return v == untouched; }));
-                EXPECT_TRUE(std::all_of(down.begin() + routes * hidden, down.end(), [](float v) { return v == untouched; }));
+                EXPECT_TRUE(std::all_of(down.begin() + routes * packed_pitch, down.end(), [](float v) { return v == untouched; }));
                 const auto middle_tail = std::as_bytes(std::span(actual_q8).subspan(routes * middle_blocks));
                 EXPECT_TRUE(std::ranges::all_of(middle_tail, [](std::byte value) { return value == std::byte{0xa5}; }));
 #if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
@@ -524,6 +583,12 @@ TEST(CPUNativeQuantisedVerifierWorkers, MixedFormatExpertTransactionPreservesEve
 {
     ASSERT_FALSE(PerfStatsCollector::isDomainEnabled("kernel"));
     proveExpertTransaction(ExpertFormatLayout::Mixed);
+}
+
+/** @test Grouped Down writes every codebook directly to its final packed route coordinates. */
+TEST(CPUNativeQuantisedVerifierWorkers, IndexedGroupedDownPublishesOnlyItsFinalRouteRows)
+{
+    proveExpertTransaction(ExpertFormatLayout::Mixed, true);
 }
 
 /** @test Disabled collection must not allocate before the collector rejects a record. */

@@ -1357,6 +1357,7 @@ namespace llaminar2::cpu::native_quantised
             VerifierRowsPolicy verifier_schedule = VerifierRowsPolicy::Auto;
             /** Distinguish prompt work from equally large speculative batches. */
             ProjectionRowsPurpose purpose = ProjectionRowsPurpose::Decode;
+            CPUProjectionOutputRows output_rows; ///< Checked final row binding for indexed publication.
         };
 
         /** Maximum gate/up descriptors for routed experts plus one shared expert. */
@@ -1445,7 +1446,9 @@ namespace llaminar2::cpu::native_quantised
                 CPUNativeQuantisedGemmKernel *kernel = source.kernel;
                 if (!kernel || !kernel->valid_ || !source.input_q8 ||
                     !source.output || source.rows <= 0 || source.n <= 0 ||
-                    source.ldc < source.n || kernel->packed_.K != k ||
+                    source.ldc < source.n ||
+                    !source.output_rows.matches(source.output, source.ldc, source.n, source.rows) ||
+                    kernel->packed_.K != k ||
                     kernel->packed_.N != source.n ||
                     kernel->activation_rotation_ != nullptr)
                 {
@@ -1590,6 +1593,7 @@ namespace llaminar2::cpu::native_quantised
                     if (!kernel || !kernel->valid_ || !source.input_q8 ||
                         !source.output || source.rows <= 0 || source.n <= 0 ||
                         source.ldc < source.n ||
+                        !source.output_rows.matches(source.output, source.ldc, source.n, source.rows) ||
                         kernel->packed_.K != expected_k ||
                         kernel->packed_.N != source.n ||
                         kernel->activation_rotation_ != nullptr)
@@ -1598,6 +1602,20 @@ namespace llaminar2::cpu::native_quantised
                                   << phase << " descriptor " << projection
                                   << " violates the eager pre-quantized contract");
                         return false;
+                    }
+                }
+                for (int projection = 0; projection < count; ++projection)
+                {
+                    const auto &source = descriptors[projection];
+                    if (!source.output_rows)
+                        continue;
+                    const auto indexed = fusedPrequantizedDescriptor(source);
+                    for (int sibling = 0; sibling < count; ++sibling)
+                    {
+                        if (sibling == projection || (sibling < projection && descriptors[sibling].output_rows))
+                            continue;
+                        const auto other = fusedPrequantizedDescriptor(descriptors[sibling]);
+                        requireDisjointFusedProjectionOutputs(indexed, source.rows, other, other.rows);
                     }
                 }
                 return true;
@@ -1959,6 +1977,7 @@ namespace llaminar2::cpu::native_quantised
                     ? source.verifier_schedule
                     : VerifierRowsPolicy::Auto,
                 .purpose = source.purpose,
+                .output_rows = source.output_rows,
             };
         }
 

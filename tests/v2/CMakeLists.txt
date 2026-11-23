@@ -19994,7 +19994,7 @@ foreach(V2_VERIFIER_WORKER_ISA IN LISTS V2_CPU_NATIVE_ISA_CELLS)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPU_NativeQuantisedProjectionCapacity_${V2_VERIFIER_WORKER_ISA})
     add_v2_test(V2_Integration_CPU_NativeQuantisedVerifierWorkers_${V2_VERIFIER_WORKER_ISA}
         COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_verifier_workers> --gtest_brief=1
-            --gtest_filter=-CPUNativeQuantisedVerifierWorkers.DisabledDiagnosticsDoNotAllocate:CPUNativeQuantisedVerifierWorkers.MixedFormatExpertTransactionPreservesEveryProjection:CPUNativeQuantisedVerifierWorkers.PreparedStandaloneSingleRowFFNContract:AllFormats/CPUQueryRowWork.*:CPUQueryRowWorkRotation.*:CPUQueryRowWorkAdmission.*
+            --gtest_filter=-CPUNativeQuantisedVerifierWorkers.DisabledDiagnosticsDoNotAllocate:CPUNativeQuantisedVerifierWorkers.MixedFormatExpertTransactionPreservesEveryProjection:CPUNativeQuantisedVerifierWorkers.PreparedStandaloneSingleRowFFNContract:CPUNativeQuantisedVerifierWorkers.IndexedGroupedDownPublishesOnlyItsFinalRouteRows:AllFormats/CPUQueryRowWork.*:CPUQueryRowWorkRotation.*:CPUQueryRowWorkAdmission.*
         LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeQuantised;MTP;AllFormats;${V2_VERIFIER_WORKER_ISA};ByteExact;Regression"
         MPI_PROCS 1
         NO_MODELS
@@ -20026,6 +20026,12 @@ foreach(V2_VERIFIER_WORKER_ISA IN LISTS V2_CPU_NATIVE_ISA_CELLS)
         LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeQuantised;MTP;AllFormats;MixedFormats;${V2_VERIFIER_WORKER_ISA};ByteExact;NoAllocation;Regression"
         MPI_PROCS 1
         NO_MODELS
+        ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_VERIFIER_WORKER_RUNTIME_ISA};LLAMINAR_PERF_STATS_JSON=1;LLAMINAR_PERF_STATS_FILTER=moe")
+    add_v2_test(V2_Integration_CPU_NativeQuantisedIndexedGroupedDown_${V2_VERIFIER_WORKER_ISA}
+        COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_verifier_workers>
+            --gtest_filter=CPUNativeQuantisedVerifierWorkers.IndexedGroupedDownPublishesOnlyItsFinalRouteRows
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeQuantised;MoE;MTP;AllFormats;${V2_VERIFIER_WORKER_ISA};ByteExact;NoAllocation;Regression"
+        MPI_PROCS 1 NO_MODELS
         ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_VERIFIER_WORKER_RUNTIME_ISA};LLAMINAR_PERF_STATS_JSON=1;LLAMINAR_PERF_STATS_FILTER=moe")
 endforeach()
 
@@ -33799,6 +33805,13 @@ foreach(V2_EPOCH_PREFLIGHT_ISA IN LISTS V2_CPU_NATIVE_ISA_CELLS)
             list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${V2_EPOCH_PREFLIGHT_ALIAS})
         endif()
     endforeach()
+endforeach()
+
+foreach(V2_DIRECT_DOWN_ISA IN LISTS V2_CPU_NATIVE_ISA_CELLS)
+    set(V2_DIRECT_DOWN_TEST V2_Integration_CPU_NativeQuantisedIndexedGroupedDown_${V2_DIRECT_DOWN_ISA})
+    if(TEST ${V2_DIRECT_DOWN_TEST})
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${V2_DIRECT_DOWN_TEST})
+    endif()
 endforeach()
 
 

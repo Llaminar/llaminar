@@ -6732,7 +6732,7 @@ namespace llaminar2::cpu::native_quantised
      */
     inline CPUExecutionExactLayout cpuExecutionExactLayout(const FusedVerifierRowsDesc &descriptor) noexcept
     {
-        return descriptor.packed && descriptor.output && descriptor.N == descriptor.packed->N &&
+        return descriptor.packed && descriptor.output && !descriptor.output_rows && descriptor.N == descriptor.packed->N &&
                 descriptor.ldc == descriptor.N && descriptor.N > 0 && descriptor.N % 16 == 0 &&
                 reinterpret_cast<std::uintptr_t>(descriptor.output) % 64u == 0u
             ? CPUExecutionExactLayout::ContiguousFP32Aligned64 : CPUExecutionExactLayout::Other;
@@ -7424,6 +7424,7 @@ namespace llaminar2::cpu::native_quantised
             const int projection_rows = d.rows > 0 ? d.rows : M;
             if (!d.packed || !d.output || (!A_q8_all && !d.input) ||
                 d.N <= 0 || d.ldc < d.N ||
+                !d.output_rows.matches(d.output, d.ldc, d.N, projection_rows) ||
                 d.packed->blocks_per_row != K_blocks ||
                 projection_rows <= 0)
             {
@@ -7611,8 +7612,7 @@ namespace llaminar2::cpu::native_quantised
                     ? 0u
                     : output_row_ends[static_cast<size_t>(projection - 1)];
                 addNativeQuantisedBiasRow(
-                    descriptor.output + (row_index - prior_rows) *
-                        static_cast<size_t>(descriptor.ldc),
+                    descriptor.outputRow(row_index - prior_rows),
                     descriptor.bias, descriptor.N, use_avx512);
             }
         };
@@ -7757,9 +7757,7 @@ namespace llaminar2::cpu::native_quantised
                             row_input[row] = projection_input +
                                 static_cast<size_t>(first_row + row) *
                                     K_blocks;
-                            row_output[row] = descriptor.output +
-                                static_cast<size_t>(first_row + row) *
-                                    static_cast<size_t>(descriptor.ldc);
+                            row_output[row] = descriptor.outputRow(first_row + row);
                         }
 
                         for (int chunk_offset = 0;
@@ -8587,8 +8585,7 @@ namespace llaminar2::cpu::native_quantised
                                 const int columns = std::min(64, descriptor.N - n_start);
                                 alignas(64) float tails[3][64];
                                 const auto destination = [&](int row_offset) {
-                                    return columns == 64 ? descriptor.output +
-                                        static_cast<size_t>(first_row + row_offset) * descriptor.ldc + n_start
+                                    return columns == 64 ? descriptor.outputRow(first_row + row_offset) + n_start
                                         : tails[row_offset];
                                 };
                                 dispatch_3row_native_avx512_ordered_partitions(packed,
@@ -8600,8 +8597,7 @@ namespace llaminar2::cpu::native_quantised
                                     decode_luts_512[static_cast<size_t>(projection)].value);
                                 if (columns != 64)
                                     for (int row_offset = 0; row_offset < 3; ++row_offset)
-                                        std::memcpy(descriptor.output +
-                                            static_cast<size_t>(first_row + row_offset) * descriptor.ldc + n_start,
+                                        std::memcpy(descriptor.outputRow(first_row + row_offset) + n_start,
                                             tails[row_offset], static_cast<size_t>(columns) * sizeof(float));
                                 continue;
                             }
@@ -8621,9 +8617,7 @@ namespace llaminar2::cpu::native_quantised
                                 {
                                     const int row = first_row + row_offset;
                                     return n_columns == 64
-                                        ? descriptor.output +
-                                              static_cast<size_t>(row) *
-                                                  descriptor.ldc +
+                                        ? descriptor.outputRow(row) +
                                               n_start
                                         : tails[row_offset];
                                 };
@@ -8790,9 +8784,7 @@ namespace llaminar2::cpu::native_quantised
                                     {
                                         const int row = first_row + row_offset;
                                         std::memcpy(
-                                            descriptor.output +
-                                                static_cast<size_t>(row) *
-                                                descriptor.ldc +
+                                            descriptor.outputRow(row) +
                                                 n_start,
                                             tails[row_offset],
                                             static_cast<size_t>(n_columns) *
@@ -8826,9 +8818,7 @@ namespace llaminar2::cpu::native_quantised
                                 {
                                     const int row = first_row + row_offset;
                                     return n_columns == 64
-                                        ? descriptor.output +
-                                              static_cast<size_t>(row) *
-                                                  descriptor.ldc +
+                                        ? descriptor.outputRow(row) +
                                               n_start
                                         : tails[row_offset];
                                 };
@@ -8870,9 +8860,7 @@ namespace llaminar2::cpu::native_quantised
                                     {
                                         const int row = first_row + row_offset;
                                         std::memcpy(
-                                            descriptor.output +
-                                                static_cast<size_t>(row) *
-                                                    descriptor.ldc +
+                                            descriptor.outputRow(row) +
                                                 n_start,
                                             tails[row_offset],
                                             static_cast<size_t>(n_columns) *
@@ -8918,9 +8906,7 @@ namespace llaminar2::cpu::native_quantised
                                         plan.k_tiles * 64u;
                                 reduceNativeQuantisedKTilePartialsExact(
                                     base,
-                                    descriptor.output +
-                                        static_cast<size_t>(row) *
-                                            descriptor.ldc +
+                                    descriptor.outputRow(row) +
                                         n_start,
                                     n_columns,
                                     plan.k_tiles,
@@ -9042,8 +9028,7 @@ namespace llaminar2::cpu::native_quantised
                             plan.k_tiles * 64u;
                     reduceNativeQuantisedKTilePartialsExact(
                         base,
-                        descriptor.output +
-                            static_cast<size_t>(row) * descriptor.ldc +
+                        descriptor.outputRow(row) +
                             n_start,
                         n_columns,
                         plan.k_tiles,
@@ -9174,7 +9159,7 @@ namespace llaminar2::cpu::native_quantised
                             static_cast<size_t>(chunk) * k_tiles * 64;
                         reduceNativeQuantisedKTilePartialsExact(
                             base,
-                            d.output + n_start,
+                            d.outputRow(0) + n_start,
                             n_columns,
                             k_tiles,
                             use_avx512, packed.numerical_policy);
@@ -9184,7 +9169,7 @@ namespace llaminar2::cpu::native_quantised
                     {
 #pragma omp for schedule(static) nowait
                         for (int column = 0; column < d.N; ++column)
-                            d.output[column] += d.bias[column];
+                            d.outputRow(0)[column] += d.bias[column];
                     }
                     continue;
                 }
@@ -9356,7 +9341,7 @@ namespace llaminar2::cpu::native_quantised
                             (static_cast<size_t>(row) * N_chunks + chunk) *
                                 k_tiles * 64;
                         float *dst =
-                            d.output + static_cast<size_t>(row) * d.ldc + n_start;
+                            d.outputRow(row) + n_start;
                         reduceNativeQuantisedKTilePartialsExact(
                             base, dst, n_cols, k_tiles, use_avx512, packed.numerical_policy);
                     }
@@ -9367,7 +9352,7 @@ namespace llaminar2::cpu::native_quantised
                         for (int row = 0; row < projection_rows; ++row)
                         {
                             float *row_out =
-                                d.output + static_cast<size_t>(row) * d.ldc;
+                                d.outputRow(row);
                             addNativeQuantisedBiasRow(
                                 row_out, d.bias, d.N, use_avx512);
                         }
@@ -9461,7 +9446,7 @@ namespace llaminar2::cpu::native_quantised
                             projection_input +
                             static_cast<size_t>(row) * K_blocks;
                         float *compact =
-                            d.output + static_cast<size_t>(row) * d.ldc + n_start;
+                            d.outputRow(row) + n_start;
                         alignas(64) float tail[64];
                         float *destination = n_columns == 64 ? compact : tail;
                         compute_full_k_one_row(row_q8, destination, chunk);
@@ -9479,7 +9464,7 @@ namespace llaminar2::cpu::native_quantised
                         for (int row = 0; row < projection_rows; ++row)
                         {
                             addNativeQuantisedBiasRow(
-                                d.output + static_cast<size_t>(row) * d.ldc,
+                                d.outputRow(row),
                                 d.bias,
                                 d.N,
                                 use_avx512);
@@ -9521,11 +9506,10 @@ namespace llaminar2::cpu::native_quantised
                                 const int n_columns =
                                     std::min(64, N - n_start);
                                 float *compact0 =
-                                    d.output + static_cast<size_t>(row) * d.ldc +
+                                    d.outputRow(row) +
                                     n_start;
                                 float *compact1 =
-                                    d.output +
-                                    static_cast<size_t>(row + 1) * d.ldc +
+                                    d.outputRow(row + 1) +
                                     n_start;
                                 alignas(64) float tail0[64];
                                 alignas(64) float tail1[64];
@@ -9563,7 +9547,7 @@ namespace llaminar2::cpu::native_quantised
                                 const int n_columns =
                                     std::min(64, N - n_start);
                                 float *compact =
-                                    d.output + static_cast<size_t>(row) * d.ldc +
+                                    d.outputRow(row) +
                                     n_start;
                                 alignas(64) float tail[64];
                                 float *destination =
@@ -9587,7 +9571,7 @@ namespace llaminar2::cpu::native_quantised
                         for (int row = 0; row < projection_rows; ++row)
                         {
                             addNativeQuantisedBiasRow(
-                                d.output + static_cast<size_t>(row) * d.ldc,
+                                d.outputRow(row),
                                 d.bias,
                                 d.N,
                                 use_avx512);
@@ -9623,8 +9607,7 @@ namespace llaminar2::cpu::native_quantised
                         {
                             row_q8[row] = projection_input +
                                 static_cast<size_t>(first_row + row) * K_blocks;
-                            row_output[row] = d.output +
-                                static_cast<size_t>(first_row + row) * d.ldc;
+                            row_output[row] = d.outputRow(first_row + row);
                         }
                         for (int offset = 0;
                              offset < chunk_count;
@@ -9706,7 +9689,7 @@ namespace llaminar2::cpu::native_quantised
                         for (int row = 0; row < projection_rows; ++row)
                         {
                             addNativeQuantisedBiasRow(
-                                d.output + static_cast<size_t>(row) * d.ldc,
+                                d.outputRow(row),
                                 d.bias,
                                 d.N,
                                 use_avx512);
@@ -9742,8 +9725,8 @@ namespace llaminar2::cpu::native_quantised
                         const Q8_1Block *row1_q8 =
                             projection_input +
                             static_cast<size_t>(row1) * K_blocks;
-                        float *row0_out = d.output + static_cast<size_t>(row0) * d.ldc;
-                        float *row1_out = d.output + static_cast<size_t>(row1) * d.ldc;
+                        float *row0_out = d.outputRow(row0);
+                        float *row1_out = d.outputRow(row1);
 
                         for (int ci = 0; ci < chunk_count; ++ci)
                         {
@@ -9803,7 +9786,7 @@ namespace llaminar2::cpu::native_quantised
                     const Q8_1Block *row_q8 =
                         projection_input +
                         static_cast<size_t>(row0) * K_blocks;
-                    float *row_out = d.output + static_cast<size_t>(row0) * d.ldc;
+                    float *row_out = d.outputRow(row0);
                     if (use_avx512)
                     {
 #if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
@@ -9829,7 +9812,7 @@ namespace llaminar2::cpu::native_quantised
 #pragma omp for schedule(static) nowait
                     for (int row = 0; row < projection_rows; ++row)
                     {
-                        float *row_out = d.output + static_cast<size_t>(row) * d.ldc;
+                        float *row_out = d.outputRow(row);
                         addNativeQuantisedBiasRow(
                             row_out, d.bias, d.N, use_avx512);
                     }

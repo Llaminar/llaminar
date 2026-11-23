@@ -3246,6 +3246,7 @@ namespace llaminar2
          * into the final row below, so only that host-owned path needs an
          * explicit zero before projection work begins.
          */
+        float *cpu_packed_records = nullptr;
         if (!is_gpu)
         {
             TensorBase *const publication =
@@ -3285,6 +3286,7 @@ namespace llaminar2
                               << " required_records=" << top_k);
                     return false;
                 }
+                cpu_packed_records = records;
             }
             else if (!host_packet_dense_canonical)
             {
@@ -3798,6 +3800,22 @@ namespace llaminar2
             num_active++;
         }
 
+        // Bind the original slot metadata before any Down producer writes its
+        // disjoint record. The count remains zero until the CPU transaction retires.
+        if (cpu_packed_records)
+        {
+            for (int route = 0; route < num_active; ++route)
+            {
+                const auto &info = active_experts[route];
+                if (info.batch_idx != route || info.route_slot < 0 || info.route_slot >= top_k)
+                    throw std::logic_error("CPU decode lost its original packed route order");
+                float *const record = canonical_moe_route_record::record(cpu_packed_records, route, d_model);
+                if (!canonical_moe_route_record::writeFlatRouteSlot(record, d_model,
+                        static_cast<size_t>(info.route_slot)))
+                    throw std::logic_error("CPU decode lost its original packed route slot");
+            }
+        }
+
         // Single fused call: router-Q8 reuse on CPU NativeQuantised, then one
         // projection region for every active expert's gate/up pair.
         bool cpu_prepared_decode_completed = false;
@@ -3896,7 +3914,7 @@ namespace llaminar2
                                     cached_down_gemm_[active_experts[route].expert_id]);
                                 if (!down[route].kernel) return false;
                             }
-                            if (scratch_down_batch_.size() < routes)
+                            if (!cpu_packed_records && scratch_down_batch_.size() < routes)
                                 throw std::logic_error("CPU decode exceeds its declared route output capacity");
                             auto activation = CPUInvocationWorkspace::available<Q8_1Block>(bound_workspace_, kCPUProjectionQ8);
                             if (activation.size() < routes * blocks)
@@ -3904,8 +3922,11 @@ namespace llaminar2
                             std::array<Projection, 2 * capacity> gate_up;
                             for (size_t route = 0; route < routes; ++route)
                             {
+                                float *const destination = cpu_packed_records
+                                    ? canonical_moe_route_record::record(cpu_packed_records, route, d_model)
+                                    : scratch_down_batch_[route]->mutable_data();
                                 down[route] = {.kernel = down[route].kernel, .input_q8 = activation.data() + route * blocks,
-                                    .output = scratch_down_batch_[route]->mutable_data(), .rows = 1, .n = d_model, .ldc = d_model};
+                                    .output = destination, .rows = 1, .n = d_model, .ldc = d_model};
                             }
                             for (size_t index = 0; index < 2 * routes; ++index)
                             {
@@ -4103,56 +4124,6 @@ namespace llaminar2
                           << params_.layer_idx);
                 return false;
             }
-            const bool packed_canonical_records =
-                canonical_routes &&
-                params_.canonical_route_layout ==
-                    MoECanonicalRoutePublicationLayout::
-                        PackedIndexedRouteRows;
-
-            if (packed_canonical_records)
-            {
-                /*
-                 * Route identity is control metadata, not projection output.
-                 * Publish it once from the immutable active-route schedule before
-                 * copying any payload into the route slots. This keeps the payload loop branch
-                 * light and makes a malformed slot/index fail before partially
-                 * publishing a transaction.
-                 */
-                for (int active_index = 0; active_index < num_active; ++active_index)
-                {
-                    const auto &info = active_experts[active_index];
-                    if (info.batch_idx < 0 || info.batch_idx >= num_active ||
-                        info.route_slot < 0 || info.route_slot >= top_k)
-                    {
-                        LOG_ERROR("[MoEExpertComputeStage] CPU decode packed route "
-                                  "schedule contains an invalid record or route slot"
-                                  << " layer=" << params_.layer_idx
-                                  << " active_index=" << active_index
-                                  << " record=" << info.batch_idx
-                                  << " route_slot=" << info.route_slot
-                                  << " active_records=" << num_active
-                                  << " top_k=" << top_k);
-                        return false;
-                    }
-                    float *const route_record =
-                        canonical_moe_route_record::record(
-                            canonical_routes,
-                            static_cast<size_t>(info.batch_idx),
-                            d_model);
-                    if (!canonical_moe_route_record::writeFlatRouteSlot(
-                            route_record,
-                            d_model,
-                            static_cast<size_t>(info.route_slot)))
-                    {
-                        LOG_ERROR("[MoEExpertComputeStage] CPU decode route slot "
-                                  "cannot be represented by packed publication"
-                                  << " layer=" << params_.layer_idx
-                                  << " route_slot=" << info.route_slot);
-                        return false;
-                    }
-                }
-            }
-
             auto publish_route = [&](const ActiveExpert &info,
                                      const float *route_output)
             {
@@ -4165,7 +4136,7 @@ namespace llaminar2
                      * serial decode's FMA tree after ownership movement.
                      */
                     float *destination = nullptr;
-                    if (packed_canonical_records)
+                    if (cpu_packed_records)
                     {
                         destination = canonical_moe_route_record::record(
                             canonical_routes,
@@ -4193,12 +4164,13 @@ namespace llaminar2
 
             if (cpu_prepared_decode_completed)
             {
-                for (int i = 0; i < num_active; ++i)
-                    publish_route(active_experts[i], scratch_down_batch_[i]->data());
+                if (!cpu_packed_records)
+                    for (int i = 0; i < num_active; ++i)
+                        publish_route(active_experts[i], scratch_down_batch_[i]->data());
             }
             else
             {
-                if (static_cast<int>(scratch_down_batch_.size()) < num_active)
+                if (!cpu_packed_records && static_cast<int>(scratch_down_batch_.size()) < num_active)
                     throw std::logic_error("CPU MoE decode exceeds its declared route capacity");
 
                 // Validate down GEMM engines
@@ -4253,8 +4225,9 @@ namespace llaminar2
                             cached_down_gemm_[info.expert_id];
                         down_descs[i].input =
                             swiglu_scratch_batch_[i].data();
-                        down_descs[i].output =
-                            scratch_down_batch_[i]->mutable_data();
+                        down_descs[i].output = cpu_packed_records
+                            ? canonical_moe_route_record::record(cpu_packed_records, i, d_model)
+                            : scratch_down_batch_[i]->mutable_data();
                         down_descs[i].n = d_model;
                     }
                     fused_ok =
@@ -4267,7 +4240,7 @@ namespace llaminar2
                                 bound_workspace_);
                 }
 
-                if (fused_ok)
+                if (fused_ok && !cpu_packed_records)
                 {
                     // Phase 2c: Publish every completed route through the
                     // selected graph arithmetic contract.
@@ -4279,7 +4252,7 @@ namespace llaminar2
                             scratch_down_batch_[i]->data());
                     }
                 }
-                else
+                else if (!fused_ok)
                 {
                     // Standalone non-transaction CPU decode retains the exact
                     // per-expert SwiGLU/down implementation.
@@ -4311,9 +4284,9 @@ namespace llaminar2
                 }
             }
 
-            if (packed_canonical_records &&
+            if (cpu_packed_records &&
                 !canonical_moe_route_record::writeRecordCount(
-                    canonical_routes,
+                    cpu_packed_records,
                     params_.canonical_route_contributions->numel(),
                     static_cast<size_t>(num_active)))
             {
@@ -4442,6 +4415,8 @@ namespace llaminar2
 
         const size_t route_slot_capacity =
             static_cast<size_t>(seq_len) * static_cast<size_t>(top_k);
+        if (route_slot_capacity > static_cast<size_t>(std::numeric_limits<int>::max()))
+            throw std::logic_error("CPU grouped route schedule exceeds its signed row index representation");
         cpu_grouped_route_slots_.clear();
         cpu_grouped_route_slots_.reserve(route_slot_capacity);
         cpu_grouped_original_to_local_.assign(route_slot_capacity, -1);
@@ -4777,22 +4752,24 @@ namespace llaminar2
             params_.canonical_route_contributions
                 ? output_bytes * static_cast<size_t>(top_k)
                 : output_bytes;
+        float *const canonical_routes = params_.canonical_route_contributions
+            ? publication->mutable_data()
+            : nullptr;
+        if (params_.canonical_route_contributions && !canonical_routes)
+            return false;
         const auto publication_prepare_start =
             record_cpu_moe_phase_timings
                 ? PerfStatsCollector::Clock::now()
                 : PerfStatsCollector::Clock::time_point{};
         if (packed_canonical_records)
         {
-            float *const packed_records = publication->mutable_data();
             const size_t packed_capacity =
                 canonical_moe_route_record::recordCapacity(
                     publication->numel(),
                     d_model);
-            if (!packed_records || packed_capacity < route_slot_capacity ||
+            if (packed_capacity < route_slot_capacity ||
                 !canonical_moe_route_record::writeRecordCount(
-                    packed_records,
-                    publication->numel(),
-                    cpu_grouped_route_slots_.size()))
+                    canonical_routes, publication->numel(), 0))
             {
                 LOG_ERROR("[MoEExpertComputeStage] CPU grouped packed route "
                           "publication buffer is undersized"
@@ -4807,7 +4784,7 @@ namespace llaminar2
 
             /*
              * The route schedule is complete and immutable at this point. Encode
-             * every original slot before entering the OpenMP payload-copy loop so
+             * every original slot before entering the OpenMP projection so
              * worker threads cannot throw through an OpenMP region or expose a
              * half-described packed transaction.
              */
@@ -4835,7 +4812,7 @@ namespace llaminar2
                     static_cast<size_t>(slot.route);
                 float *const route_record =
                     canonical_moe_route_record::record(
-                        packed_records,
+                        canonical_routes,
                         local_slot,
                         d_model);
                 if (flat_slot >= route_slot_capacity ||
@@ -5131,14 +5108,8 @@ namespace llaminar2
                 const size_t required_router_q8_blocks =
                     static_cast<size_t>(local_route_rows) *
                     static_cast<size_t>(router_q8_blocks_per_row);
-                /*
-                 * Native descriptors consume expert offsets and the separate
-                 * local-to-expert map, never expert_local_slots_. Its last
-                 * native consumer was source-index materialization above.
-                 * The checked builder retires that permutation into unique
-                 * representatives using the original row/top-k route authority.
-                 * Floating bundles retain their permutation unchanged.
-                 */
+                // Source publication retires expert_local_slots_ into unique
+                // representatives. The inverse route map remains authoritative.
                 const auto publication_schedule =
                     CPUMoEKernel::RouterQ8ExpertMajorSchedule::fromOriginalRoutes(
                         {cpu_grouped_token_indices_.data(), static_cast<size_t>(local_route_rows)},
@@ -5256,9 +5227,30 @@ namespace llaminar2
             }();
             float *gate_rows = grouped_scratch_gate->mutable_data();
             float *up_rows = grouped_scratch_up->mutable_data();
-            float *down_rows = grouped_scratch_out->mutable_data();
+            float *down_rows = canonical_routes ? canonical_routes : grouped_scratch_out->mutable_data();
             if (!gate_rows || !up_rows || !down_rows)
                 return false;
+
+            const int down_stride = d_model + static_cast<int>(packed_canonical_records);
+            std::span<float> route_bank;
+            if (canonical_routes)
+            {
+                const size_t bank_elements = packed_canonical_records
+                    ? publication->numel() - canonical_moe_route_record::kTrailerElements
+                    : publication_bytes / sizeof(float);
+                if (bank_elements > publication->numel())
+                    throw std::logic_error("CPU grouped route destinations exceed their declared publication");
+                route_bank = {canonical_routes, bank_elements};
+                // The activation gather has completed. Reuse its index span
+                // to bind one final destination per expert-major Down row.
+                for (int local_slot = 0; local_slot < local_route_rows; ++local_slot)
+                {
+                    const auto &slot = cpu_grouped_route_slots_[local_slot];
+                    const int expert_position = cpu_grouped_local_to_expert_position_[local_slot];
+                    cpu_grouped_token_indices_[expert_position] =
+                        packed_canonical_records ? local_slot : slot.row * top_k + slot.route;
+                }
+            }
 
             const int swiglu_q8_blocks_per_row =
                 (intermediate + Q8_1Block::BLOCK_SIZE - 1) /
@@ -5330,14 +5322,20 @@ namespace llaminar2
                     .input_q8 = grouped_swiglu_q8.data() +
                         static_cast<size_t>(expert_begin) *
                             static_cast<size_t>(swiglu_q8_blocks_per_row),
-                    .output = down_rows +
-                        static_cast<size_t>(expert_begin) *
-                            static_cast<size_t>(d_model),
+                    .output = canonical_routes
+                        ? down_rows
+                        : down_rows + static_cast<size_t>(expert_begin) * d_model,
                     .bias = nullptr,
                     .rows = expert_rows,
                     .n = d_model,
-                    .ldc = d_model,
+                    .ldc = down_stride,
                     .purpose = projection_purpose,
+                    .output_rows = canonical_routes
+                        ? cpu::native_quantised::CPUProjectionOutputRows::indexed(
+                              route_bank, down_stride, d_model,
+                              {cpu_grouped_token_indices_.data() + expert_begin,
+                               static_cast<size_t>(expert_rows)})
+                        : cpu::native_quantised::CPUProjectionOutputRows{},
                 };
             }
 
@@ -5522,16 +5520,12 @@ namespace llaminar2
         }
 
         float *output = params_.output->mutable_data();
-        float *canonical_routes =
-            params_.canonical_route_contributions
-                ? params_.canonical_route_contributions->mutable_data()
-                : nullptr;
-        if (!output ||
-            (params_.canonical_route_contributions && !canonical_routes))
+        if (!output)
             return false;
+        const bool down_published_directly = all_native_bundles && canonical_routes;
         const float *native_down_rows =
-            all_native_bundles ? grouped_scratch_out->data() : nullptr;
-        if (all_native_bundles && !native_down_rows)
+            all_native_bundles && !down_published_directly ? grouped_scratch_out->data() : nullptr;
+        if (all_native_bundles && !down_published_directly && !native_down_rows)
             return false;
 
         /*
@@ -5608,7 +5602,17 @@ namespace llaminar2
                 }
             }
         };
-        OMP_WORKSHARE_REGION(accumulate_rows);
+        if (!down_published_directly)
+            OMP_WORKSHARE_REGION(accumulate_rows);
+        if (packed_canonical_records &&
+            !canonical_moe_route_record::writeRecordCount(
+                canonical_routes, publication->numel(), static_cast<size_t>(local_route_rows)))
+            throw std::logic_error("CPU grouped Down could not commit its admitted packed route count");
+        if (down_published_directly && PerfStatsCollector::isDomainEnabled("kernel"))
+            PerfStatsCollector::addCounter(
+                "kernel", "cpu_moe_grouped_down_direct_publication_rows",
+                static_cast<double>(local_route_rows), grouped_phase, "cpu",
+                {{"layout", packed_canonical_records ? "packed" : "dense"}});
         record_cpu_moe_phase(
             canonical_routes
                 ? "canonical_route_slot_publication"

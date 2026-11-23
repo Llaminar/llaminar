@@ -12,6 +12,7 @@
 #pragma once
 #include "CPUNativeNEONPreparedProjection.h"
 #include "CPUProjectionRowGrid.h"
+#include "CPUProjectionOutputRows.h"
 #include "CPUProjectionStorageProof.h"
 #include "utils/OpenMPUtils.h"
 #include <cstddef>
@@ -40,6 +41,7 @@ namespace llaminar2::cpu::native_quantised
          * @param work Optional original request publication, immutable during execution.
          * @param bias Empty or exactly N immutable FP32 bias values.
          * @param n_block_chunks Positive adjacent physical 64-column chunks per task.
+         * @param output_rows Optional validated original output coordinates.
          * @return Borrowed checked binding, with no buffer or live-word copies.
          * @throws std::invalid_argument For geometry, lifetime-envelope or alias conflicts.
          * @throws std::overflow_error For unrepresentable native span extents.
@@ -47,7 +49,8 @@ namespace llaminar2::cpu::native_quantised
         [[nodiscard]] static CPUNativeNEONProjectionBatch bind(CPUNativeQuantisedWeightView weights,
             std::span<const Q8_1Block> activation, std::span<float> output,
             int rows, int output_stride, NEONProjectionRowTile row_tile,
-            const ProjectionRowWork *work = nullptr, std::span<const float> bias = {}, int n_block_chunks = 1)
+            const ProjectionRowWork *work = nullptr, std::span<const float> bias = {}, int n_block_chunks = 1,
+            CPUProjectionOutputRows output_rows = {})
         {
             const CPUProjectionRowGrid grid(rows, work);
             const int width = [&] {
@@ -61,9 +64,14 @@ namespace llaminar2::cpu::native_quantised
             if (n_block_chunks <= 0 || output_stride < weights.N ||
                 !activation.data() || !output.data() ||
                 activation.size() != extent(rows, weights.blocks_per_row, 0) ||
-                output.size() != extent(rows - 1, output_stride, weights.N) ||
+                !output_rows.matches(output.data(), output_stride, weights.N, rows) ||
                 (!bias.empty() && (!bias.data() || bias.size() != std::size_t(weights.N))))
                 throw std::invalid_argument("Native NEON batch requires exact physical input/output and bias spans");
+            const auto output_extent = output_rows
+                ? static_cast<std::size_t>(output_rows.rowAddress(output.data(), output_stride, rows - 1) - output.data()) + weights.N
+                : extent(rows - 1, output_stride, weights.N);
+            if (output.size() != output_extent)
+                throw std::invalid_argument("Native NEON output span must end on its last live value");
             if (activation.size() > std::numeric_limits<std::size_t>::max() / sizeof(Q8_1Block) ||
                 output.size() > std::numeric_limits<std::size_t>::max() / sizeof(float))
                 throw std::overflow_error("Native NEON batch byte extent is unrepresentable");
@@ -79,7 +87,8 @@ namespace llaminar2::cpu::native_quantised
             // Everything a task could reject is decided here, before any team:
             // the seal admitted metadata, this admits policy/encoding/K tree.
             CPUNativeNEONProjectionTile<1>::requireExecutable(weights);
-            return CPUNativeNEONProjectionBatch(weights, activation, output, output_stride, width, grid, bias, n_block_chunks);
+            return CPUNativeNEONProjectionBatch(weights, activation, output, output_stride, width, grid, bias,
+                n_block_chunks, output_rows);
         }
 
         /**
@@ -171,12 +180,14 @@ namespace llaminar2::cpu::native_quantised
          * @param grid Existing original-coordinate row authority.
          * @param bias Empty or complete immutable bias row.
          * @param n_block_chunks Positive adjacent chunks owned by each task.
+         * @param output_rows Optional checked original output coordinates.
          */
         CPUNativeNEONProjectionBatch(CPUNativeQuantisedWeightView weights,
             std::span<const Q8_1Block> activation, std::span<float> output,
-            int stride, int width, CPUProjectionRowGrid grid, std::span<const float> bias, int n_block_chunks)
+            int stride, int width, CPUProjectionRowGrid grid, std::span<const float> bias, int n_block_chunks,
+            CPUProjectionOutputRows output_rows)
             : weights_(weights), activation_(activation), output_(output), stride_(stride),
-              width_(width), grid_(grid), bias_(bias), n_block_chunks_(n_block_chunks) {}
+              width_(width), grid_(grid), bias_(bias), n_block_chunks_(n_block_chunks), output_rows_(output_rows) {}
 
         /** @brief Form a checked element extent without overflowing signed geometry.
          * @param rows Nonnegative preceding row count.
@@ -224,7 +235,8 @@ namespace llaminar2::cpu::native_quantised
             for (std::size_t row = 0; row < Rows; ++row)
             {
                 input[row] = activation_.subspan((std::size_t(first) + row) * weights_.blocks_per_row, weights_.blocks_per_row);
-                output[row] = output_.subspan((std::size_t(first) + row) * stride_ + chunk * 64, columns);
+                output[row] = {output_rows_.rowAddress(output_.data(), stride_, std::size_t(first) + row) + chunk * 64,
+                    static_cast<std::size_t>(columns)};
             }
             // bind() proved every tile's spans, aliases and executability once.
             CPUNativeNEONProjectionTile<Rows>::admitted(weights_, input, output, chunk).template executeAdmitted<Instruction, Strips>();
@@ -248,5 +260,6 @@ namespace llaminar2::cpu::native_quantised
         CPUProjectionRowGrid grid_; ///< Borrowed original publications, not copied live values.
         std::span<const float> bias_; ///< Optional retained immutable epilogue input.
         int n_block_chunks_; ///< Explicit physical N ownership only; never a K arithmetic choice.
+        CPUProjectionOutputRows output_rows_; ///< Optional final publication coordinates.
     };
 } // namespace llaminar2::cpu::native_quantised

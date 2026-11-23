@@ -132,20 +132,25 @@ namespace llaminar2::cpu::native_quantised
          * @param chunks Positive adjacent column chunks per owner.
          * @param work Optional immutable original request publication.
          * @param bias Optional complete immutable bias row.
+         * @param output_rows Optional checked original output coordinates.
          * @return Allocation-free borrowed native binding.
          */
         inline CPUNativeNEONProjectionBatch bind(const CPUNativeQuantisedPackedWeights &packed,
             const Q8_1Block *input, float *output, int rows, int stride, NEONProjectionRowTile tile,
-            int chunks, const ProjectionRowWork *work = nullptr, const float *bias = nullptr)
+            int chunks, const ProjectionRowWork *work = nullptr, const float *bias = nullptr,
+            CPUProjectionOutputRows output_rows = {})
         {
             geometry(packed, rows, stride);
-            if (!input || !output) throw std::invalid_argument("Native ARM projection requires retained input/output storage");
-            storage_proof::requireDisjoint({output, (std::size_t(rows - 1) * stride + packed.N) * sizeof(float)},
+            if (!input || !output || !output_rows.matches(output, stride, packed.N, rows))
+                throw std::invalid_argument("Native ARM projection requires retained input/output storage");
+            const auto output_extent = static_cast<std::size_t>(
+                output_rows.rowAddress(output, stride, rows - 1) - output) + packed.N;
+            storage_proof::requireDisjoint({output, output_extent * sizeof(float)},
                 {&packed, sizeof(packed)});
             return CPUNativeNEONProjectionBatch::bind(packed.readView(),
                 {input, std::size_t(rows) * packed.blocks_per_row},
-                {output, std::size_t(rows - 1) * stride + packed.N}, rows, stride, tile, work,
-                bias ? std::span<const float>(bias, packed.N) : std::span<const float>{}, chunks);
+                {output, output_extent}, rows, stride, tile, work,
+                bias ? std::span<const float>(bias, packed.N) : std::span<const float>{}, chunks, output_rows);
         }
 
         /** @brief Execute a complete native binding after one ISA decision.
@@ -503,6 +508,8 @@ namespace llaminar2::cpu::native_quantised
                 throw std::invalid_argument("Native ARM fused descriptor has incomplete original geometry");
             plan.rows[p] = d.rows ? d.rows : rows;
             neon_execution::geometry(*d.packed, plan.rows[p], d.ldc);
+            if (!d.output_rows.matches(d.output, d.ldc, d.N, plan.rows[p]))
+                throw std::invalid_argument("Native ARM fused descriptors require exact indexed destinations");
             if (blocks && blocks != d.packed->blocks_per_row)
                 throw std::invalid_argument("Native ARM fused members require the same physical K width");
             blocks = d.packed->blocks_per_row;
@@ -565,25 +572,30 @@ namespace llaminar2::cpu::native_quantised
             if (d.packed->blocks_per_row != blocks)
                 throw std::invalid_argument("Native ARM fused K width disagrees with its Q8 input declaration");
             batches[p].emplace(neon_execution::bind(*d.packed, d.input ? d.input : input, d.output,
-                plan.rows[p], d.ldc, plan.tiles[p], plan.chunks[p], nullptr, d.bias));
+                plan.rows[p], d.ldc, plan.tiles[p], plan.chunks[p], nullptr, d.bias, d.output_rows));
+        }
+        for (int p = 0; p < count; ++p)
+        {
+            const auto &d = descriptors[p];
             // A bundle denotes independent projections. A member's destination
             // cannot mutate any sibling input, weight, bias or destination.
-            const auto output_bytes = (std::size_t(plan.rows[p] - 1) * d.ldc + d.N) * sizeof(float);
-            storage_proof::requireDisjoint({d.output, output_bytes}, {descriptors, std::size_t(count) * sizeof(FusedVerifierRowsDesc)});
+            const auto output = d.outputEnvelope(plan.rows[p]);
+            storage_proof::requireDisjoint(output, {descriptors, std::size_t(count) * sizeof(FusedVerifierRowsDesc)});
             for (int other = 0; other < count; ++other)
             {
                 if (other == p) continue;
                 const auto &s = descriptors[other];
                 const auto other_rows = plan.rows[other];
                 const auto view = s.packed->readView();
-                storage_proof::requireDisjoint({d.output, output_bytes}, {s.packed, sizeof(*s.packed)});
-                if (neon_execution::overlaps(d.output, output_bytes, s.input ? s.input : input,
-                        std::size_t(other_rows) * blocks * sizeof(Q8_1Block)) ||
-                    neon_execution::overlaps(d.output, output_bytes, view.bytes().data(), view.bytes().size()) ||
-                    neon_execution::overlaps(d.output, output_bytes, s.output,
-                        (std::size_t(other_rows - 1) * s.ldc + s.N) * sizeof(float)) ||
-                    (s.bias && neon_execution::overlaps(d.output, output_bytes, s.bias, std::size_t(s.N) * sizeof(float))))
+                storage_proof::requireDisjoint(output, {s.packed, sizeof(*s.packed)});
+                storage_proof::requireDisjoint(output, s.output_rows.indexBytes());
+                if (storage_proof::overlaps(output, {s.input ? s.input : input,
+                        std::size_t(other_rows) * blocks * sizeof(Q8_1Block)}) ||
+                    storage_proof::overlaps(output, {view.bytes().data(), view.bytes().size()}) ||
+                    (s.bias && storage_proof::overlaps(output, {s.bias, std::size_t(s.N) * sizeof(float)})))
                     throw std::invalid_argument("Native ARM fused destination aliases a sibling publication");
+                if (other > p)
+                    requireDisjointFusedProjectionOutputs(d, plan.rows[p], s, other_rows);
             }
         }
         /*
