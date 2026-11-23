@@ -46,6 +46,8 @@
 extern "C"
 {
     bool cudaNativeQuantisedInitIQGridTables_tuned();
+    void cudaNativeQuantisedGemvTuned_setDecodeEquivalentM1Config(int);
+    int cudaNativeQuantisedGemvTuned_getDecodeEquivalentM1Config();
     bool cudaNativeQuantisedGemvTuned_fp32_withPolicy(
         const int8_t *, const uint8_t *, ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes,
         float *, const float *, int, int, float, float, const float *, const float *, uint8_t, uint8_t, int, void *,
@@ -310,9 +312,18 @@ namespace llaminar2::test
                                                            out.as<float>(), sa.as<float>(), N, K, 1.0f, 0.0f, nullptr,
                                                            nullptr, codebook, policy, 0, stream_, gemv, nullptr);
                 else if (rows <= 8)
+                {
+                    // Production launches runtime-M decode only as the grouped
+                    // verifier, inside the decode-equivalent M1 dispatch scope
+                    // (ScopedNativeQuantisedDecodeEquivalentDispatch); outside
+                    // it no generated small-M policy exists.
+                    const int previous = cudaNativeQuantisedGemvTuned_getDecodeEquivalentM1Config();
+                    cudaNativeQuantisedGemvTuned_setDecodeEquivalentM1Config(1);
                     ok = cudaNativeQuantisedGemvTuned_small_m_fp32_withPolicy(
                         a.as<int8_t>(), weights, meta, out.as<float>(), sa.as<float>(), rows, N,
                         K, 1.0f, 0.0f, nullptr, nullptr, codebook, policy, 0, stream_, gemv, nullptr, nullptr);
+                    cudaNativeQuantisedGemvTuned_setDecodeEquivalentM1Config(previous);
+                }
                 else
                     ok = cudaNativeQuantisedPrefill_fp32_withPolicy(a.as<int8_t>(), weights, meta,
                                                          out.as<float>(), sa.as<float>(), sums.as<int32_t>(), rows,
