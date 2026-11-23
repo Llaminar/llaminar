@@ -457,7 +457,10 @@ namespace llaminar2::cpu::native_quantised
          * @param kb_start First logical K block.
          * @param kb_end One-past-last logical K block.
          * @param accumulate Load existing outputs before adding this K range.
+         * @tparam Bounded Bind the exact live destination width.
+         * @param columns Logical output columns in this tile.
          */
+        template<bool Bounded>
         LLAMINAR_Q6K_EXACT_FP
         inline void twoRowsTwoVectorsChunkAVX512(
             const CPUNativeQuantisedPackedWeights &packed,
@@ -468,7 +471,8 @@ namespace llaminar2::cpu::native_quantised
             int chunk,
             int kb_start,
             int kb_end,
-            bool accumulate)
+            bool accumulate,
+            int columns)
         {
 #if defined(__clang__)
 #pragma clang fp contract(off)
@@ -480,20 +484,16 @@ namespace llaminar2::cpu::native_quantised
                     "packed encoding");
 
             const __m512i nibble_mask = _mm512_set1_epi8(0x0F);
-            for (int z_base = 0; z_base < 4; z_base += 2)
+            for (int z_base = 0; z_base < (Bounded ? (columns + 15) / 16 : 4); z_base += 2)
             {
-                __m512 fp00 = accumulate
-                    ? _mm512_loadu_ps(output0 + z_base * 16)
-                    : _mm512_setzero_ps();
-                __m512 fp01 = accumulate
-                    ? _mm512_loadu_ps(output0 + (z_base + 1) * 16)
-                    : _mm512_setzero_ps();
-                __m512 fp10 = accumulate
-                    ? _mm512_loadu_ps(output1 + z_base * 16)
-                    : _mm512_setzero_ps();
-                __m512 fp11 = accumulate
-                    ? _mm512_loadu_ps(output1 + (z_base + 1) * 16)
-                    : _mm512_setzero_ps();
+                __m512 fp00 = readProjectionOutputVector<Bounded, 16, __m512>(
+                    output0, columns, z_base * 16, accumulate);
+                __m512 fp01 = readProjectionOutputVector<Bounded, 16, __m512>(
+                    output0, columns, (z_base + 1) * 16, accumulate);
+                __m512 fp10 = readProjectionOutputVector<Bounded, 16, __m512>(
+                    output1, columns, z_base * 16, accumulate);
+                __m512 fp11 = readProjectionOutputVector<Bounded, 16, __m512>(
+                    output1, columns, (z_base + 1) * 16, accumulate);
 
                 for (int kb = kb_start; kb < kb_end; ++kb)
                 {
@@ -630,10 +630,10 @@ namespace llaminar2::cpu::native_quantised
                         scale_low1, scale_high1);
                 }
 
-                _mm512_storeu_ps(output0 + z_base * 16, fp00);
-                _mm512_storeu_ps(output0 + (z_base + 1) * 16, fp01);
-                _mm512_storeu_ps(output1 + z_base * 16, fp10);
-                _mm512_storeu_ps(output1 + (z_base + 1) * 16, fp11);
+                publishProjectionOutputVector<Bounded, 16>(output0, columns, z_base * 16, fp00);
+                publishProjectionOutputVector<Bounded, 16>(output0, columns, (z_base + 1) * 16, fp01);
+                publishProjectionOutputVector<Bounded, 16>(output1, columns, z_base * 16, fp10);
+                publishProjectionOutputVector<Bounded, 16>(output1, columns, (z_base + 1) * 16, fp11);
             }
         }
 
@@ -1059,7 +1059,10 @@ namespace llaminar2::cpu::native_quantised
      * output accumulators while remaining within the AVX-512 register file.
      * This changes only column scheduling: each output lane still consumes K
      * blocks in the exact ascending order used by serial decode.
+     * @tparam Bounded Bind the exact live destination width.
+     * @param columns Logical output columns in this tile.
      */
+    template<bool Bounded = false>
     inline void gemmQ6KNativeTwoRowsAVX512Chunk(
         const CPUNativeQuantisedPackedWeights &packed,
         const Q8_1Block *activation0,
@@ -1069,9 +1072,10 @@ namespace llaminar2::cpu::native_quantised
         int chunk,
         int kb_start,
         int kb_end,
-        bool accumulate)
+        bool accumulate,
+        int columns = 64)
     {
-        q6k_detail::twoRowsTwoVectorsChunkAVX512(
+        q6k_detail::twoRowsTwoVectorsChunkAVX512<Bounded>(
             packed,
             activation0,
             activation1,
@@ -1080,7 +1084,7 @@ namespace llaminar2::cpu::native_quantised
             chunk,
             kb_start,
             kb_end,
-            accumulate);
+            accumulate, columns);
     }
 
     /** @brief Native Q6_K three-row AVX-512 verifier chunk. */
@@ -1176,7 +1180,12 @@ namespace llaminar2::cpu::native_quantised
             accumulate, columns);
     }
 
-    /** @brief Native Q6_K two-row AVX2 verifier chunk. */
+    /**
+     * @brief Native Q6_K two-row AVX2 verifier chunk.
+     * @tparam Bounded Bind the exact live destination width.
+     * @param columns Logical output columns in this tile.
+     */
+    template<bool Bounded = false>
     inline void gemmQ6KNativeTwoRowsAVX2Chunk(
         const CPUNativeQuantisedPackedWeights &packed,
         const Q8_1Block *activation0,
@@ -1186,11 +1195,12 @@ namespace llaminar2::cpu::native_quantised
         int chunk,
         int kb_start,
         int kb_end,
-        bool accumulate)
+        bool accumulate,
+        int columns = 64)
     {
-        q6k_detail::rowsChunkAVX2<2>(
+        q6k_detail::rowsChunkAVX2<2, Bounded>(
             packed, {activation0, activation1}, {output0, output1},
-            chunk, kb_start, kb_end, accumulate);
+            chunk, kb_start, kb_end, accumulate, columns);
     }
 
 #undef LLAMINAR_Q6K_EXACT_FP

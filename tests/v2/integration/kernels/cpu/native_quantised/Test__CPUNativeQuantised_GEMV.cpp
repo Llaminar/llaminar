@@ -1689,6 +1689,63 @@ namespace
         }
     }
 
+    /** @test Shared-weight x86 leaves resume and publish only their two live output prefixes. */
+    TEST_F(CPUNativeQuantisedGemvTest, PairedBoundedOutputAllFormats)
+    {
+        constexpr int width = 64, inner = 512, blocks = inner / Q8_1Block::BLOCK_SIZE;
+        constexpr float guard = -93.125f;
+        const auto input = TestTensorFactory::createFP32Random({2, inner}, -0.75f, 0.75f, 91791);
+        for (const auto policy : {CPUProjectionNumericalPolicy::BackendNative,
+                                  CPUProjectionNumericalPolicy::GPUAlignedExpert})
+        {
+            SCOPED_TRACE(static_cast<int>(policy));
+            std::array<Q8_1Block, 2 * blocks> activation{};
+            quantize_activations_to_q8_1(input->data(), activation.data(), 2, inner, blocks, policy);
+            for (const auto &format : quantizedMoEVerifierFormats())
+            {
+                SCOPED_TRACE(format.label);
+                auto weights = format.create({width, inner}, 91795);
+                CPUNativeQuantisedGemmKernel kernel(weights.get(), 0, -1, policy);
+                ASSERT_TRUE(kernel.isValid());
+                const auto &packed = kernel.packedWeights();
+                const auto lut256 = packed.usesNibbleLUT()
+                    ? build_decode_lut_avx2_for_codebook(packed.codebook_id) : _mm256_setzero_si256();
+#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
+                const bool use_avx512 = activeISALevel() >= ISALevel::AVX512;
+                const auto lut512 = use_avx512 && packed.usesNibbleLUT()
+                    ? build_decode_lut(packed.codebook_id) : _mm512_setzero_si512();
+#else
+                const bool use_avx512 = false;
+#endif
+                const auto run = [&](float *a, float *b, int first, int end, bool accumulate, int live) {
+                    publishNativeQuantisedTwoRows(packed, activation.data(), activation.data() + blocks,
+                        a, b, 0, first, end, accumulate, live, use_avx512,
+#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
+                        lut512,
+#endif
+                        lut256);
+                };
+                std::array<std::array<float, width>, 2> full{};
+                run(full[0].data(), full[1].data(), 0, blocks, false, width);
+                for (int live : {1, 7, 8, 9, 15, 16, 17, 31, 33, 63, 64})
+                {
+                    SCOPED_TRACE(live);
+                    std::array<std::array<float, width + 2>, 2> actual;
+                    for (auto &row : actual) row.fill(guard);
+                    run(actual[0].data() + 1, actual[1].data() + 1, 0, blocks / 2, false, live);
+                    run(actual[0].data() + 1, actual[1].data() + 1, blocks / 2, blocks, true, live);
+                    for (int row = 0; row < 2; ++row)
+                    {
+                        EXPECT_EQ(std::memcmp(actual[row].data() + 1, full[row].data(), live * sizeof(float)), 0);
+                        EXPECT_EQ(actual[row].front(), guard);
+                        for (int col = live + 1; col < static_cast<int>(actual[row].size()); ++col)
+                            EXPECT_EQ(actual[row][col], guard);
+                    }
+                }
+            }
+        }
+    }
+
     /** @test Every compact decoder publishes and resumes a partial vector in its own destination. */
     TEST_F(CPUNativeQuantisedGemvTest, CompactBoundedOutputRetainsOrderedArithmetic)
     {

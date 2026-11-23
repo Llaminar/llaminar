@@ -538,7 +538,10 @@ namespace llaminar2::cpu::native_quantised
      * weight vector is shared across both rows. Low and high nibbles are folded
      * into those row chains so the saturation-safe emulation fits the sixteen-
      * register AVX2 ABI without hot-loop spills.
+     * @tparam Bounded Bind the exact live destination width.
+     * @param columns Logical output columns in this tile.
      */
+    template<bool Bounded = false>
     inline void gemm_2row_native_chunk_avx2(
         const CPUNativeQuantisedPackedWeights &packed,
         const Q8_1Block *A_q8_row0,
@@ -549,16 +552,15 @@ namespace llaminar2::cpu::native_quantised
         int kb_start,
         int kb_end,
         const __m256i decode_lut,
-        bool accumulate)
+        bool accumulate,
+        int columns = 64)
     {
-        for (int segment = 0; segment < 8; ++segment)
+        for (int segment = 0; segment < (Bounded ? (columns + 7) / 8 : 8); ++segment)
         {
-            __m256 fp0 = accumulate
-                ? _mm256_loadu_ps(C_row0 + segment * 8)
-                : _mm256_setzero_ps();
-            __m256 fp1 = accumulate
-                ? _mm256_loadu_ps(C_row1 + segment * 8)
-                : _mm256_setzero_ps();
+            __m256 fp0 = readProjectionOutputVector<Bounded, 8, __m256>(
+                C_row0, columns, segment * 8, accumulate);
+            __m256 fp1 = readProjectionOutputVector<Bounded, 8, __m256>(
+                C_row1, columns, segment * 8, accumulate);
             accumulateTwoRowsNibbleSegmentAVX2(
                 packed,
                 A_q8_row0,
@@ -570,8 +572,8 @@ namespace llaminar2::cpu::native_quantised
                 segment,
                 fp0,
                 fp1);
-            _mm256_storeu_ps(C_row0 + segment * 8, fp0);
-            _mm256_storeu_ps(C_row1 + segment * 8, fp1);
+            publishProjectionOutputVector<Bounded, 8>(C_row0, columns, segment * 8, fp0);
+            publishProjectionOutputVector<Bounded, 8>(C_row1, columns, segment * 8, fp1);
         }
     }
 
@@ -595,8 +597,12 @@ namespace llaminar2::cpu::native_quantised
         }
     }
 
-    /** @brief Dispatch a two-row non-nibble AVX2 verifier chunk. */
-    template<bool SumPairs=false>
+    /**
+     * @brief Dispatch a two-row non-nibble AVX2 verifier chunk.
+     * @tparam Bounded Bind the exact live destination width.
+     * @param columns Logical output columns in this tile.
+     */
+    template<bool SumPairs = false, bool Bounded = false>
     inline void gemm_2row_non_nibble_chunk_avx2(
         const CPUNativeQuantisedPackedWeights &packed,
         const Q8_1Block *A_q8_row0,
@@ -606,17 +612,18 @@ namespace llaminar2::cpu::native_quantised
         int chunk,
         int kb_start,
         int kb_end,
-        bool accumulate)
+        bool accumulate,
+        int columns = 64)
     {
         if (packed.usesCompactMultiScale())
         {
             multi_scale::dispatch<8>(packed, std::array{A_q8_row0, A_q8_row1},
-                                     std::array{C_row0, C_row1}, chunk, kb_start, kb_end, accumulate);
+                                     std::array{C_row0, C_row1}, chunk, kb_start, kb_end, accumulate, Bounded ? columns : 64);
             return;
         }
         if (packed.usesQ6KNativeDualScale())
         {
-            gemmQ6KNativeTwoRowsAVX2Chunk(
+            gemmQ6KNativeTwoRowsAVX2Chunk<Bounded>(
                 packed,
                 A_q8_row0,
                 A_q8_row1,
@@ -625,7 +632,7 @@ namespace llaminar2::cpu::native_quantised
                 chunk,
                 kb_start,
                 kb_end,
-                accumulate);
+                accumulate, columns);
             return;
         }
         if (!packed.usesExpandedInt8())
@@ -633,16 +640,14 @@ namespace llaminar2::cpu::native_quantised
                 "AVX2 non-nibble two-row kernel received an unsupported packed encoding");
 
         const __m256i bias_128_i32 = _mm256_set1_epi32(128);
-        for (int segment = 0; segment < 8; ++segment)
+        for (int segment = 0; segment < (Bounded ? (columns + 7) / 8 : 8); ++segment)
         {
             const int z = segment / 2;
             const int byte_offset = (segment % 2) * 32;
-            __m256 fp0 = accumulate
-                ? _mm256_loadu_ps(C_row0 + segment * 8)
-                : _mm256_setzero_ps();
-            __m256 fp1 = accumulate
-                ? _mm256_loadu_ps(C_row1 + segment * 8)
-                : _mm256_setzero_ps();
+            __m256 fp0 = readProjectionOutputVector<Bounded, 8, __m256>(
+                C_row0, columns, segment * 8, accumulate);
+            __m256 fp1 = readProjectionOutputVector<Bounded, 8, __m256>(
+                C_row1, columns, segment * 8, accumulate);
             for (int kb = kb_start; kb < kb_end; ++kb)
             {
                 const Q8_1Block &a0 = A_q8_row0[kb];
@@ -724,8 +729,11 @@ namespace llaminar2::cpu::native_quantised
             }
             if constexpr (SumPairs)
                 storeNativeQuantisedLiveAVX2(C_row0, packed.N - chunk * 64, segment * 8, _mm256_add_ps(fp0, fp1));
-            else { _mm256_storeu_ps(C_row0 + segment * 8, fp0);
-            _mm256_storeu_ps(C_row1 + segment * 8, fp1); }
+            else
+            {
+                publishProjectionOutputVector<Bounded, 8>(C_row0, columns, segment * 8, fp0);
+                publishProjectionOutputVector<Bounded, 8>(C_row1, columns, segment * 8, fp1);
+            }
         }
     }
 
