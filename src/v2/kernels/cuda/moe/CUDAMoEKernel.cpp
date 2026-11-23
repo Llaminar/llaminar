@@ -42,6 +42,7 @@
 #include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../tensors/NativeQuantisedFormatInfo.h"
+#include "../../../tensors/NativeQuantisedScalePlane.h"
 #include "../../../tensors/TensorClasses.h"
 #include "../../../transfer/TransferEngine.h"
 #include "../../../utils/Logger.h"
@@ -1112,6 +1113,25 @@ namespace
         return true;
     }
 
+    /**
+     * @brief Whether a grouped descriptor carries every metadata plane its representation reads.
+     *
+     * A superblock-coded matrix keeps its superblock plane in `mins` and has no
+     * emins plane (Q2_K's effective minima are reconstructed from the code);
+     * per-block matrices need the codebook's secondary and emins planes. Same
+     * rule as the device-side grouped validators.
+     */
+    bool cudaGroupedDescMetadataPlanesPresent(const llaminar2::DeviceNativeQuantisedMatrixDesc &desc)
+    {
+        if (llaminar2::nativeQuantisedLayoutRepresentation(desc.metadata_layout) ==
+            llaminar2::NativeQuantisedMetadataRepresentation::SuperblockCoded)
+            return llaminar2::nativeQuantisedLayoutValid(desc.codebook_id, desc.metadata_layout) &&
+                   desc.mins != nullptr && desc.emins == nullptr;
+        return desc.metadata_layout == 0 &&
+               (!cudaGroupedPrefillRequiresMins(desc.codebook_id) || desc.mins != nullptr) &&
+               (!cudaGroupedPrefillRequiresEmins(desc.codebook_id) || desc.emins != nullptr);
+    }
+
     bool validateCudaGroupedDesc(
         const llaminar2::DeviceNativeQuantisedMatrixDesc &desc,
         int n,
@@ -1123,8 +1143,7 @@ namespace
                desc.k == k &&
                desc.blocks_per_row == static_cast<uint32_t>(k / 32) &&
                desc.codebook_id == codebook_id &&
-               (!cudaGroupedPrefillRequiresMins(codebook_id) || desc.mins != nullptr) &&
-               (!cudaGroupedPrefillRequiresEmins(codebook_id) || desc.emins != nullptr);
+               cudaGroupedDescMetadataPlanesPresent(desc);
     }
 
     bool validateCudaGroupedDescShape(
@@ -1138,8 +1157,7 @@ namespace
                desc.blocks_per_row == static_cast<uint32_t>(k / 32) &&
                validateCudaGroupedSourceIdentity(desc) &&
                cudaGroupedPrefillSupportsCodebook(desc.codebook_id) &&
-               (!cudaGroupedPrefillRequiresMins(desc.codebook_id) || desc.mins != nullptr) &&
-               (!cudaGroupedPrefillRequiresEmins(desc.codebook_id) || desc.emins != nullptr);
+               cudaGroupedDescMetadataPlanesPresent(desc);
     }
 
     bool isBlankGroupedDesc(const llaminar2::DeviceNativeQuantisedMatrixDesc &desc)

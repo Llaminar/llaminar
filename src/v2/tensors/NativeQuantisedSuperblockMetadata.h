@@ -586,6 +586,68 @@ namespace llaminar2::native_quantised_superblock
         return decodeSuperblockMetadata<Codebook>(loadCode<Codebook>(code_plane, address.linear, code_bit_shift),
                                                   loadSuperblock<Codebook>(superblock_plane, address.superblock));
     }
+
+    /**
+     * @brief Undo embedCodeInPayload(): restore a coded block's per-block payload bytes.
+     *
+     * Sign selectors regain their even-parity top bit and IQ2_XS's spare qh
+     * nibble is cleared, reproducing exactly what the per-block repack emits.
+     * IQ1_S and separate-plane formats are unchanged.
+     */
+    LLAMINAR_SUPERBLOCK_META_HD void restoreCodedPayload(std::uint8_t codebook, std::uint8_t *payload) noexcept
+    {
+        if (codebook != 12 && codebook != 14 && codebook != 15)
+            return;
+        const int signs = codebook == 12 ? 8 : codebook == 15 ? 4 : 5;
+        for (int i = 0; i < 4; ++i)
+            payload[signs + i] = restoreSignParity(payload[signs + i]);
+        if (codebook == 14)
+            payload[4] = static_cast<std::uint8_t>(payload[4] & 0x0Fu);
+    }
+
+    /**
+     * @brief Decode a whole block-major coded matrix into legacy per-block words.
+     *
+     * Host tooling for oracles, diagnostics and tests that inspect prepared
+     * bytes: reconstructs the exact staged primary/secondary/emin words every
+     * block's reader sees (block index blk * rows + row) and restores the
+     * per-block payload of code-in-payload formats in place.
+     * @param codebook Codable physical codebook.
+     * @param rows Matrix rows (block-major stride).
+     * @param blocks_per_row Prepared K blocks.
+     * @param phase Superblock phase of the first prepared block.
+     * @param bit_shift Code-plane bit offset of the first code.
+     * @param payload Payload bytes (payload_bytes per block), restored in place.
+     * @param code_plane Bit-packed code plane (ignored for code-in-payload formats).
+     * @param superblock_plane Superblock words (2 or 4 bytes each).
+     * @param primary,secondary,emin Outputs of rows * blocks_per_row words (may be null).
+     */
+    inline void decodeCodedMatrix(std::uint8_t codebook, std::size_t rows, std::uint32_t blocks_per_row,
+                                  std::uint32_t phase, std::uint32_t bit_shift, std::uint32_t payload_bytes,
+                                  std::uint8_t *payload, const std::uint8_t *code_plane,
+                                  const void *superblock_plane, std::uint16_t *primary, std::uint16_t *secondary,
+                                  std::uint32_t *emin) noexcept
+    {
+        const bool in_payload = superblockCodeInPayload(codebook);
+        const bool wide = superblockFieldBytes(codebook) == 4;
+        for (std::uint32_t blk = 0; blk < blocks_per_row; ++blk)
+            for (std::size_t row = 0; row < rows; ++row)
+            {
+                const auto address = blockMajorAddress(blk, static_cast<std::uint32_t>(row),
+                                                       static_cast<std::uint32_t>(rows), phase);
+                std::uint8_t *block = payload + address.linear * payload_bytes;
+                const std::uint32_t code = in_payload ? loadCode(codebook, block, 0)
+                                                      : loadCode(codebook, code_plane, address.linear, bit_shift);
+                const std::uint32_t word = wide ? static_cast<const std::uint32_t *>(superblock_plane)[address.superblock]
+                                                : static_cast<const std::uint16_t *>(superblock_plane)[address.superblock];
+                const auto words = decodeSuperblockMetadata(codebook, code, word);
+                if (primary) primary[address.linear] = words.primary;
+                if (secondary) secondary[address.linear] = words.secondary;
+                if (emin) emin[address.linear] = words.emin;
+                if (in_payload)
+                    restoreCodedPayload(codebook, block);
+            }
+    }
 } // namespace llaminar2::native_quantised_superblock
 
 #undef LLAMINAR_SUPERBLOCK_META_HD

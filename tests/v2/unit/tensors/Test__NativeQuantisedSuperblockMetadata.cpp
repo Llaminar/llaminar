@@ -426,4 +426,68 @@ namespace llaminar2::native_quantised_superblock::test
             }
         }
     }
+
+    /** decodeCodedMatrix reproduces per-block words and restores code-in-payload bytes for test oracles. */
+    TEST(NativeQuantisedSuperblockMetadata, HostMatrixDecodeMatchesPerBlockWordsAndRestoresPayload)
+    {
+        constexpr std::size_t rows = 5;
+        constexpr std::uint32_t blocks = 11, phase = 3, shift = 5;
+        for (const std::uint8_t cb : {5, 10, 12, 13, 14, 15, 16, 17})
+        {
+            SCOPED_TRACE(int(cb));
+            const std::uint32_t pb = superblockCodePayloadBytes(cb) ? superblockCodePayloadBytes(cb) : 16u;
+            const std::uint32_t bits = superblockCodeBits(cb);
+            const std::size_t count = rows * blocks;
+            const std::size_t superblocks = rows * superblocksPerRow(blocks, phase);
+            std::vector<std::uint8_t> legacy(count * pb), payload, plane((shift + count * bits + 7) / 8 + 4, 0);
+            for (std::size_t i = 0; i < legacy.size(); ++i)
+                legacy[i] = static_cast<std::uint8_t>((i * 131u + 7u) & 0xFFu);
+            // Legacy per-block payload: even-parity sign selectors, clear spare nibble.
+            for (std::size_t b = 0; b < count; ++b)
+                restoreCodedPayload(cb, legacy.data() + b * pb);
+            payload = legacy;
+            std::vector<std::uint32_t> codes(count);
+            std::vector<std::uint32_t> words(superblocks);
+            for (std::size_t i = 0; i < superblocks; ++i)
+                words[i] = static_cast<std::uint32_t>(0x3800u + (i * 37u) % 1024u) |
+                           (superblockFieldBytes(cb) == 4 ? (0x3400u + (i * 11u) % 512u) << 16 : 0u);
+            for (std::size_t i = 0; i < count; ++i)
+            {
+                codes[i] = static_cast<std::uint32_t>((i * 2654435761u) >> 9) & ((1u << bits) - 1u);
+                std::uint8_t *block = payload.data() + i * pb;
+                switch (cb)
+                {
+                case 12: embedCodeInPayload<12>(block, codes[i]); break;
+                case 14: embedCodeInPayload<14>(block, codes[i]); break;
+                case 15: embedCodeInPayload<15>(block, codes[i]); break;
+                case 16: codes[i] = codeFromPayload<16>(block); break;
+                default:
+                    for (std::uint32_t b = 0; b < bits; ++b)
+                    {
+                        const std::size_t bit = shift + i * bits + b;
+                        plane[bit / 8] = static_cast<std::uint8_t>(plane[bit / 8] | (((codes[i] >> b) & 1u) << (bit % 8)));
+                    }
+                }
+            }
+            std::vector<std::uint16_t> primary(count), secondary(count);
+            std::vector<std::uint32_t> emin(count);
+            std::vector<std::uint16_t> half_words(superblocks);
+            for (std::size_t i = 0; i < superblocks; ++i) half_words[i] = static_cast<std::uint16_t>(words[i]);
+            const void *sb_plane = superblockFieldBytes(cb) == 4 ? static_cast<const void *>(words.data())
+                                                                 : static_cast<const void *>(half_words.data());
+            decodeCodedMatrix(cb, rows, blocks, phase, shift, pb, payload.data(), plane.data(), sb_plane,
+                              primary.data(), secondary.data(), emin.data());
+            EXPECT_EQ(payload, legacy) << "per-block payload not restored";
+            for (std::uint32_t blk = 0; blk < blocks; ++blk)
+                for (std::size_t row = 0; row < rows; ++row)
+                {
+                    const auto a = blockMajorAddress(blk, static_cast<std::uint32_t>(row), rows, phase);
+                    const std::uint32_t w = superblockFieldBytes(cb) == 4 ? words[a.superblock] : half_words[a.superblock];
+                    const auto want = decodeSuperblockMetadata(cb, codes[a.linear], w);
+                    ASSERT_EQ(primary[a.linear], want.primary);
+                    ASSERT_EQ(secondary[a.linear], want.secondary);
+                    ASSERT_EQ(emin[a.linear], want.emin);
+                }
+        }
+    }
 } // namespace llaminar2::native_quantised_superblock::test

@@ -68,12 +68,16 @@ struct NativeQuantisedDescriptorValidation final {
     template<class Descriptor>
     LLAMINAR_DESCRIPTOR_HD static constexpr bool accepts(
         const Descriptor& d,unsigned n,unsigned k,unsigned decoder) noexcept {
+        // A superblock-coded matrix (layout bit 7) holds its code plane in
+        // `scales` (the payload for code-in-payload formats) and its
+        // superblock plane in `mins`; it never has an emins plane.
+        const bool coded = (d.metadata_layout & 0x80u) != 0;
         return d.payload && d.scales &&
             static_cast<unsigned>(d.n)==n && static_cast<unsigned>(d.k)==k &&
             d.blocks_per_row==k/32 &&
             (d.codebook_id==decoder || (decoder==24 && d.codebook_id==4)) &&
-            (!secondary(decoder) || d.codebook_id==4 || d.mins) &&
-            (decoder!=10 || d.emins);
+            (coded ? (d.mins && !d.emins)
+                   : ((!secondary(decoder) || d.codebook_id==4 || d.mins) && (decoder!=10 || d.emins)));
     }
     /**
      * @brief Strong ready-publication postcondition; never infers allocation capacity.
