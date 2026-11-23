@@ -306,19 +306,31 @@ one-token decode service enters `MoEExpertComputeStage::executeSingleToken`
 and consumes its own prepared Gate/Up and Down paths. The paired figures
 therefore measure the effect of the linked refactor on the complete model.
 
-A follow-up binds the existing SIMD tile entries on the actual one-token
-service path. A single team projects Gate/Up, publishes the GPU-aligned
-SwiGLU Q8 blocks and finishes Down into the original route rows. The
-32-token Release diagnostic matched the control and recorded 1,488 such
-transactions in its measured decode interval. The paired timing includes
-ordinary and fixed-depth-seven inference.
-
 | Arm order | Mode | Decode, control → candidate tok/s | Decode change | Complete throughput change |
 | --- | --- | ---: | ---: | ---: |
 | Candidate first | Ordinary | 29.412 → 29.618 | +0.70% | +0.52% |
 | Candidate first | Fixed depth seven | 43.409 → 43.673 | +0.61% | +0.43% |
 | Control first | Ordinary | 29.988 → 29.566 | −1.41% | −1.32% |
 | Control first | Fixed depth seven | 44.137 → 43.430 | −1.60% | −1.50% |
+
+A follow-up binds the existing SIMD tile entries on the actual one-token
+service path. A single team projects Gate/Up, publishes the GPU-aligned
+SwiGLU Q8 blocks and finishes Down into the original route rows. The
+32-token Release diagnostic matched the control and recorded 1,488 such
+transactions in its measured decode interval. The paired Release runs
+retained the original F320/S320 sharding and used three measured 256-token
+requests per mode after warmup. Prompts, generated tokens, MTP work and
+driver diagnostics matched in both orders. The expanded focused contract
+matched all 21 Gate/Up source formats and all seven source-legal K320 Down
+formats on AVX-512 and AVX2, including smaller live route prefixes in
+reused storage.
+
+| Arm order | Mode | Decode, control → candidate tok/s | Decode change | Complete throughput change |
+| --- | --- | ---: | ---: | ---: |
+| Candidate first | Ordinary | 29.716 → 31.267 | +5.22% | +3.82% |
+| Control first | Ordinary | 29.946 → 31.149 | +4.02% | +3.05% |
+| Candidate first | Fixed depth seven | 44.026 → 44.148 | +0.28% | +0.12% |
+| Control first | Fixed depth seven | 44.119 → 43.777 | −0.78% | −0.79% |
 
 The sealed IQ4 scale probe resolved the scale program at output-tile entry.
 The IQ4_XS packet loop consumed coefficients validated at weight publication.
