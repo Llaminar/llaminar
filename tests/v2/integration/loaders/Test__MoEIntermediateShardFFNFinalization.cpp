@@ -2184,7 +2184,9 @@ void proveOriginalFinalization(const std::vector<DeviceId> &devices, bool single
                         primary_plan.planWeight(binding.identity.canonical_name, binding.tensor->rows(), binding.tensor->cols(),
                             native->payload_bytes, canonicalDeviceVnniFormat(*native).is_asymmetric,
                             native->has_emins, nativeQuantisedScalePlaneWidth(canonicalDeviceVnniCodebookId(*native)),
-                            source_bytes);
+                            source_bytes, {0},
+                            gpuPreparedWeightCodedDeclaration(*binding.tensor, GPUPreparedWeightPoolLayout::SourceNative,
+                                                              device));
                     else
                     {
                         const auto type = binding.tensor->native_type();

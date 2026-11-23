@@ -16,6 +16,9 @@
 #include "tensors/TensorClasses.h"
 #include "tensors/TensorSlice.h"
 #include "loaders/gpu_pipeline/NativeQuantisedRepackColumns.h"
+#include "loaders/gpu_pipeline/WeightVRAMPool.h"
+#include "loaders/GPUPreparedWeightPoolLayout.h"
+#include <optional>
 #include <algorithm>
 #include <limits>
 #include <utility>
@@ -274,5 +277,24 @@ inline const NativeQuantisedFormatInfo *gpuWeightSourceFormat(const TensorBase &
     if (const auto *source = boundedGPUWeightSource(tensor)) return source->format();
     const auto *unpackable = dynamic_cast<const IINT8Unpackable *>(&tensor);
     return unpackable ? unpackable->vnniFormatInfo() : nullptr;
+}
+
+/**
+ * @brief The pool metadata declaration for one prepared GPU weight operand.
+ *
+ * The single producer-side decision shared by model loading and every test
+ * harness that plans a matrix: immutable source-native superblock weights on a
+ * codable device are superblock-coded (phase of the operand's first prepared
+ * K block); every other matrix keeps per-block planes. KernelFactory binding
+ * applies the same predicate and rejects a slot declared otherwise.
+ */
+inline std::optional<WeightVRAMPool::SuperblockCodedMetadata> gpuPreparedWeightCodedDeclaration(
+    const TensorBase &tensor, GPUPreparedWeightPoolLayout layout, DeviceId device)
+{
+    const auto *source = gpuWeightSourceFormat(tensor);
+    if (!source || !gpuPreparedSuperblockCoded(*source, layout, device))
+        return std::nullopt;
+    return WeightVRAMPool::SuperblockCodedMetadata{canonicalDeviceVnniCodebookId(*source),
+                                                   gpuWeightSourceSuperblockPhase(tensor)};
 }
 } // namespace llaminar2
