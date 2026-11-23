@@ -551,11 +551,7 @@ namespace llaminar2::primitives
 
         float inv = static_cast<float>(1.0 / sum);
 
-        // Pass 3: Normalize
-        const __m256 inv_ps = _mm256_set1_ps(inv);
-        const __m256 max_ps = _mm256_set1_ps(row_max);
-        const __m256 zero_ps = _mm256_setzero_ps();
-
+        // Publish each finished probability after loading the entire aliased input vector.
         c = 0;
         for (; c <= cols - 8; c += 8)
         {
@@ -565,20 +561,18 @@ namespace llaminar2::primitives
             alignas(32) float tmp[8];
             _mm256_store_ps(tmp, v);
 
-            float out[8];
             for (int lane = 0; lane < 8; ++lane)
             {
-                if (causal && c + lane > row_idx)
+                const int column = c + lane;
+                if (causal && column > row_idx)
                 {
-                    out[lane] = 0.0f;
+                    row[column] = 0.0f;
                 }
                 else
                 {
-                    out[lane] = std::exp(tmp[lane] - row_max) * inv;
+                    row[column] = std::exp(tmp[lane] - row_max) * inv;
                 }
             }
-
-            _mm256_storeu_ps(row + c, _mm256_loadu_ps(out));
         }
 
         // Tail
@@ -668,11 +662,7 @@ namespace llaminar2::primitives
 
         float inv = static_cast<float>(1.0 / sum);
 
-        // Pass 3: Normalize
-        const __m512 inv_ps = _mm512_set1_ps(inv);
-        const __m512 max_ps = _mm512_set1_ps(row_max);
-        const __m512 zero_ps = _mm512_setzero_ps();
-
+        // Publish each finished probability after loading the entire aliased input vector.
         c = 0;
         for (; c <= cols - 16; c += 16)
         {
@@ -682,20 +672,18 @@ namespace llaminar2::primitives
             alignas(64) float tmp[16];
             _mm512_store_ps(tmp, v);
 
-            float out[16];
             for (int lane = 0; lane < 16; ++lane)
             {
-                if (causal && c + lane > row_idx)
+                const int column = c + lane;
+                if (causal && column > row_idx)
                 {
-                    out[lane] = 0.0f;
+                    row[column] = 0.0f;
                 }
                 else
                 {
-                    out[lane] = std::exp(tmp[lane] - row_max) * inv;
+                    row[column] = std::exp(tmp[lane] - row_max) * inv;
                 }
             }
-
-            _mm512_storeu_ps(row + c, _mm512_loadu_ps(out));
         }
 
         // Tail
