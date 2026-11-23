@@ -556,4 +556,7 @@ tokens and per-iteration MTP work matched in both orders.
 The counter-enabled 32-token run observed 2,976 direct Down writes. Raw
 samples and the matched comparison are in
 `benchmark_results/qfn-cuda-2x2-95943372/cpu-direct-canonical-down/`.
+The same trace measured 249.48 µs of local execution per rank-one call.
+The unchanged 15.43 MB logical weight footprint gives a service proxy of
+61.83 GB/s, or 56.2% of that socket's concurrent 110 GB/s reference.
 These measurements cover the isolated standalone candidate.

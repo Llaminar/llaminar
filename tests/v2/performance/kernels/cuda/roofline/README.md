@@ -120,6 +120,14 @@ dimensions and rates. Each PCI device requires a checked DRAM, L2, DP4A, and
 FFMA calibration for its requested grids. A single common grid still models
 each resident launch.
 
+The CTA-width sweep measured 46 PCI, grid, and block-width combinations
+with 128, 256, and 512 threads. Across the two cards the highest DRAM
+rate was 886.47 GB/s at 120×256. The highest L2 rate was 2.627 TB/s at
+80×512. The highest DP4A and FP32 FMA rates were 9.449 and 12.549
+Tinst/s at 82×512. Each value comes from its own measured geometry.
+The raw calibrations and the 36-row F320/S320 mixed-grid score are in
+`benchmark_results/qfn-cuda-2x2-95943372/cuda-cta-width-roofline/`.
+
 The scorer takes the dominant read or useful arithmetic time for each ordered
 phase and adds the phases. HC Down and the paired HC Up count their Q8_0
 weights once. The paired Up counts both integer MACs. Routing counts the
@@ -1770,3 +1778,15 @@ graph took 90.11–91.14 µs. The staged graph took 93.70–94.21 µs. These
 captures measure one live replica row. The production predictor's counted
 row contract also permits empty replay, which requires device-sized launch
 admission.
+
+### In-place short-convolution publication
+
+An aliased scalar decode and an aliased verifier with a complete snapshot
+bank each captured one compute node. Both RTX 3090s and an MI50 reproduced
+the disjoint-buffer reference and its continuation state across repeated
+captures. An isolated SM86 profile with 4,096 channels and width four used
+16 blocks of 256 threads for scalar decode and seven-row verification. The
+kernels used 39 and 36 registers per thread, respectively, with zero spill
+bytes. The active SMs averaged 7.85 and 7.94 active warps. Native replay and
+Nsight receipts are in
+`benchmark_results/qfn-cuda-2x2-95943372/direct-publication-focused/`.
