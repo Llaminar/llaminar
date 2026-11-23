@@ -105,6 +105,8 @@ enum class RepackFormat : uint8_t {
 {
     switch (format)
     {
+    case RepackFormat::Q4_K: return 5;
+    case RepackFormat::Q5_K: return 7;
     case RepackFormat::Q6_K: return 8;
     case RepackFormat::Q3_K: return 9;
     case RepackFormat::Q2_K: return 10;

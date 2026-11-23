@@ -742,6 +742,50 @@ namespace
 
     // =====================================================================
     // Row-major weight layout for row-parallel GEMV
+    /**
+     * @brief Transpose a bit-packed code plane from block-major to row-major.
+     * @param src Block-major codes starting at bit @p src_shift.
+     * @param dst Row-major destination (4-byte aligned, starting at bit 0).
+     * @param bits Code width; each thread moves one code with disjoint-bit atomics.
+     */
+    __global__ void transpose_codes_kernel(
+        const uint8_t *__restrict__ src, uint8_t *__restrict__ dst,
+        int N, int K_blocks, uint32_t bits, uint32_t src_shift)
+    {
+        const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+        if (idx >= N * K_blocks)
+            return;
+        const int n = idx / K_blocks;
+        const int blk = idx % K_blocks;
+        namespace sb = ::llaminar2::native_quantised_superblock;
+        const uint32_t code = sb::loadPackedBits(
+            src, src_shift + (static_cast<size_t>(blk) * N + n) * bits, bits);
+        sb::storePackedBits(dst, (static_cast<size_t>(n) * K_blocks + blk) * bits, bits, code);
+    }
+
+    /** @brief Allocate and fill a row-major bit-packed code plane (padded like the source). */
+    static uint8_t *transposeCodes(const uint8_t *d_col, int N, int K_blocks, uint32_t bits, uint32_t shift,
+                                   int cuda_device_id, cudaStream_t stream)
+    {
+        auto *const backend = llaminar2::getCUDABackend();
+        if (!backend)
+            return nullptr;
+        const size_t bytes = (static_cast<size_t>(N) * K_blocks * bits + 7u) / 8u +
+                             ::llaminar2::native_quantised_superblock::kSuperblockCodePlanePadBytes;
+        auto *d_row = static_cast<uint8_t *>(backend->allocate(bytes, cuda_device_id));
+        if (!d_row)
+            return nullptr;
+        const int total = N * K_blocks, threads = 256;
+        transpose_codes_kernel<<<(total + threads - 1) / threads, threads, 0, stream>>>(
+            d_col, d_row, N, K_blocks, bits, shift);
+        if (cudaGetLastError() != cudaSuccess)
+        {
+            backend->free(d_row, cuda_device_id);
+            return nullptr;
+        }
+        return d_row;
+    }
+
     // col_major[blk * N + n] → row_major[n * K_blocks + blk]
     // Each thread transposes one (n, blk) block by copying PB bytes.
     template <int PB>
@@ -4548,10 +4592,8 @@ extern "C"
                 sb::superblocksPerRow(static_cast<uint32_t>(K_blocks), meta_col.superblock_phase));
             // Code-in-payload formats read their codes from the transposed payload.
             rm->d_primary = sb::superblockCodeInPayload(codebook_id) ? static_cast<void *>(rm->d_payload)
-                : sb::superblockCodeBytes(codebook_id) == 1
-                ? static_cast<void *>(transposeBuffer<uint8_t, 1>(
-                      reinterpret_cast<const uint8_t *>(meta_col.primary), N, K_blocks, device_id, s))
-                : static_cast<void *>(transposeBuffer<uint16_t, 2>(meta_col.primary, N, K_blocks, device_id, s));
+                : static_cast<void *>(transposeCodes(reinterpret_cast<const uint8_t *>(meta_col.primary), N,
+                      K_blocks, sb::superblockCodePlaneBits(codebook_id), meta_col.code_bit_shift, device_id, s));
             rm->d_secondary = sb::superblockFieldBytes(codebook_id) == 4
                 ? static_cast<void *>(transposeBuffer<uint32_t, 4>(
                       static_cast<const uint32_t *>(meta_col.secondary), N, superblocks, device_id, s))
@@ -4592,7 +4634,7 @@ extern "C"
             }
         }
         rm->meta = {static_cast<const uint16_t *>(rm->d_primary), rm->d_secondary, rm->d_emins,
-                    meta_col.superblock_phase, meta_col.representation};
+                    meta_col.superblock_phase, meta_col.representation, 0u};
 
         cudaStreamSynchronize(s);
         return rm;

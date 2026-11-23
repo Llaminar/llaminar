@@ -68,24 +68,26 @@ namespace llaminar2
         WeightVRAMPool iq2s;
         iq2s.planWeight("iq2s", 64, 512, 9, true, false, NativeQuantisedScalePlaneWidth::FP16Word, 0, {0},
                         coded(13, 0));
-        // 64 rows x 16 blocks: payload 9216, codes 1024, superblocks 64*2*2=256.
-        EXPECT_EQ(iq2s.totalPlannedBytes(), 9216u + 1024u + 256u);
+        // 64 rows x 16 blocks: payload 9216, 8-bit codes 1024 + 4 pad (region
+        // ends at 10244, next 256-aligned region at 10496), superblocks 64*2*2=256.
+        EXPECT_EQ(iq2s.totalPlannedBytes(), 10496u + 256u);
 
         // Q2_K (10): 2-byte codes, 4-byte d|dmin superblocks, never an emins region.
         WeightVRAMPool q2k;
         q2k.planWeight("q2k", 64, 512, 8, true, true, NativeQuantisedScalePlaneWidth::FP16Word, 0, {0},
                        coded(10, 0));
-        EXPECT_EQ(q2k.totalPlannedBytes(), 8192u + 2048u + 512u);
+        // 16-bit codes 2048 + 4 pad end at 10244; superblocks at 10496.
+        EXPECT_EQ(q2k.totalPlannedBytes(), 10496u + 512u);
 
         // Phase 5 over 16 blocks touches ceil((16+5)/8)=3 superblocks per row.
         WeightVRAMPool shifted;
         shifted.planWeight("shift", 64, 512, 9, true, false, NativeQuantisedScalePlaneWidth::FP16Word, 0, {0},
                            coded(13, 5));
-        EXPECT_EQ(shifted.totalPlannedBytes(), 9216u + 1024u + 64u * 3u * 2u);
+        EXPECT_EQ(shifted.totalPlannedBytes(), 10496u + 64u * 3u * 2u);
 
         // Non-codable codebooks and out-of-range phases are rejected.
         WeightVRAMPool invalid;
-        EXPECT_THROW(invalid.planWeight("q4", 64, 512, 16, false, false, NativeQuantisedScalePlaneWidth::FP16Word,
+        EXPECT_THROW(invalid.planWeight("q4_0", 64, 512, 16, false, false, NativeQuantisedScalePlaneWidth::FP16Word,
                                         0, {0}, coded(0, 0)),
                      std::invalid_argument);
         EXPECT_THROW(invalid.planWeight("phase", 64, 512, 9, true, false, NativeQuantisedScalePlaneWidth::FP16Word,
@@ -103,7 +105,7 @@ namespace llaminar2
         ASSERT_TRUE(slot);
         EXPECT_EQ(slot->metadata_layout,
                   nativeQuantisedMetadataLayout(NativeQuantisedMetadataRepresentation::SuperblockCoded, 3));
-        EXPECT_EQ(slot->scales_bytes, 1024u);
+        EXPECT_EQ(slot->scales_bytes, 1028u);
         EXPECT_EQ(slot->mins_bytes, 64u * 3u * 2u);
         EXPECT_EQ(slot->emins_bytes, 0u);
         const auto legacy = pool.getSlot("legacy");

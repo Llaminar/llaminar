@@ -306,11 +306,10 @@ namespace llaminar2::cuda::prefill
         constexpr bool IS_DUAL_SCALE_ASYM = Traits::is_dual_scale_asym;
         constexpr bool IS_IQ1_M = Traits::is_iq1_m;
         constexpr bool NEEDS_MINS = Traits::requires_secondary_metadata;
-        // Async metadata schedules copy per-block words verbatim; a coded plane
-        // holds codes and superblock words. Codable codebooks never qualify for
-        // async staging (16/20-byte payloads only), so the combination cannot exist.
-        static_assert(!::llaminar2::nativeQuantisedSuperblockCodable(CODEBOOK_ID) || ASYNC_RAW_MODE < 2,
-                      "superblock-codable codebooks cannot use async per-block metadata staging");
+        // Async metadata schedules copy per-block words verbatim; for a coded
+        // matrix (uniform per launch) load_B_metadata_tile instead reconstructs
+        // the identical words through the single typed loader.
+        [[maybe_unused]] const bool coded_metadata = meta_B.coded();
         [[maybe_unused]] const uint16_t *const scales_B = meta_B.primary;
         [[maybe_unused]] const uint16_t *const mins_B = static_cast<const uint16_t *>(meta_B.secondary);
 
@@ -536,6 +535,30 @@ namespace llaminar2::cuda::prefill
                 const size_t source_index = static_cast<size_t>(kb) * N + gcol;
                 const bool vector_valid = kb < num_q40_blocks && gcol + 8 <= N &&
                                           (source_index & 7) == 0;
+                if constexpr (::llaminar2::nativeQuantisedSuperblockCodable(CODEBOOK_ID) && !BYTE_STAGED_SCALES)
+                {
+                    if (coded_metadata)
+                    {
+                        // Same slots and zero-fill as the async copies below,
+                        // with words reconstructed from codes and superblocks.
+                        uint16_t *scale_slot = &smem_scales_B[stage][metadata_index(col, half)];
+                        [[maybe_unused]] uint16_t *min_slot = &smem_mins_B[stage][metadata_index(col, half)];
+#pragma unroll
+                        for (int i = 0; i < 8; ++i)
+                        {
+                            const bool live = kb < num_q40_blocks && gcol + i < N;
+                            const auto words = live
+                                ? ::llaminar2::native_quantised_scale::loadBlockMetadata<CODEBOOK_ID>(
+                                      meta_B, ::llaminar2::native_quantised_scale::blockMajorAddress(
+                                                  meta_B, kb, gcol + i, N))
+                                : ::llaminar2::native_quantised_scale::StagedBlockMetadata{};
+                            scale_slot[i] = words.primary;
+                            if constexpr (NEEDS_MINS)
+                                min_slot[i] = words.secondary;
+                        }
+                        return;
+                    }
+                }
                 auto stage_metadata = [&](const uint16_t *source, uint16_t *destination) {
                     if (vector_valid)
                         cp_async_cg_16_zfill_128(destination, source + source_index, 16);

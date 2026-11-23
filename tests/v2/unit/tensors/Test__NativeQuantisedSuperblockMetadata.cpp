@@ -19,6 +19,7 @@
 #include <bit>
 #include <cstdint>
 #include <set>
+#include <vector>
 
 namespace llaminar2::native_quantised_superblock::test
 {
@@ -70,16 +71,30 @@ namespace llaminar2::native_quantised_superblock::test
 
     TEST(NativeQuantisedSuperblockMetadata, CodeAndFieldWidthsCarryExactlyTheSourceBits)
     {
-        // Codebooks 5/7 are shared with Q4_1/Q5_1 and 4 is IQ4_NL: never coded.
-        for (const std::uint8_t cb : {0, 4, 5, 6, 7, 19, 20, 21, 23, 25})
+        // Codebook 4 is IQ4_NL (never superblock); 0/6/19.. have no source superblock codes.
+        for (const std::uint8_t cb : {0, 4, 6, 19, 20, 21, 23, 25})
             EXPECT_FALSE(isSuperblockCoded(cb)) << int(cb);
-        for (const std::uint8_t cb : {11, 12, 13, 14, 15, 16, 17, 24})
-            EXPECT_EQ(superblockCodeBytes(cb), 1u) << int(cb);
-        for (const std::uint8_t cb : {8, 9, 10})
-            EXPECT_EQ(superblockCodeBytes(cb), 2u) << int(cb);
-        EXPECT_EQ(superblockFieldBytes(10), 4u);
-        for (const std::uint8_t cb : {8, 9, 11, 12, 13, 14, 15, 16, 17, 24})
-            EXPECT_EQ(superblockFieldBytes(cb), 2u) << int(cb);
+        // Per 32 values: code bits + superblock bits / 8 + payload bits equal the GGUF bits.
+        struct Expect { std::uint8_t cb; std::uint32_t code_bits, field_bytes, payload_bytes, file_bits_per_256; };
+        const Expect table[] = {
+            {5, 12, 4, 16, 144 * 8},  {7, 12, 4, 20, 176 * 8},  {8, 16, 2, 24, 210 * 8},
+            {9, 12, 2, 12, 110 * 8},  {10, 16, 4, 8, 84 * 8},   {11, 4, 2, 13, 110 * 8},
+            {12, 4, 2, 12, 98 * 8},   {13, 8, 2, 9, 82 * 8},    {14, 8, 2, 9, 74 * 8},
+            {15, 4, 2, 8, 66 * 8},    {16, 4, 2, 6, 50 * 8},    {17, 6, 2, 6, 56 * 8},
+            {24, 6, 2, 16, 136 * 8},
+        };
+        for (const auto &e : table)
+        {
+            SCOPED_TRACE(int(e.cb));
+            EXPECT_EQ(superblockCodeBits(e.cb), e.code_bits);
+            EXPECT_EQ(superblockFieldBytes(e.cb), e.field_bytes);
+            // Code-in-payload formats spend no separate plane bits.
+            const std::uint32_t plane_bits = superblockCodePlaneBits(e.cb);
+            const std::uint32_t device_bits = 8u * (e.payload_bytes * 8u) + 8u * plane_bits + 8u * e.field_bytes;
+            const bool in_payload = superblockCodeInPayload(e.cb);
+            // In-payload codes reuse payload bits (sign parity / spare qh / existing qh bits).
+            EXPECT_EQ(device_bits, e.file_bits_per_256) << (in_payload ? "code in payload" : "separate plane");
+        }
     }
 
     /** IQ2_XXS (15): primary = half(d (0.5 + s) / 4); s = aux32_1 >> 28. */
@@ -288,7 +303,7 @@ namespace llaminar2::native_quantised_superblock::test
                     ASSERT_EQ(*bm.rbegin(), entries - 1);
                     ASSERT_EQ(*rm.rbegin(), entries - 1);
                     const auto planes = planeBytes(10, rows, kb, phase);
-                    EXPECT_EQ(planes.code, static_cast<std::size_t>(rows) * kb * 2u);
+                    EXPECT_EQ(planes.code, static_cast<std::size_t>(rows) * kb * 2u + kSuperblockCodePlanePadBytes);
                     EXPECT_EQ(planes.superblock, entries * 4u);
                 }
     }
@@ -328,9 +343,9 @@ namespace llaminar2::native_quantised_superblock::test
             EXPECT_EQ(restoreSignParity(mask), mask);
             EXPECT_EQ(restoreSignParity(static_cast<std::uint8_t>(mask ^ 0x80u)), mask);
         }
-        EXPECT_EQ(superblockCodePlaneBytes(12), 0u);
-        EXPECT_EQ(superblockCodePlaneBytes(13), 1u);
-        EXPECT_EQ(superblockCodePlaneBytes(10), 2u);
+        EXPECT_EQ(superblockCodePlaneBits(12), 0u);
+        EXPECT_EQ(superblockCodePlaneBits(13), 8u);
+        EXPECT_EQ(superblockCodePlaneBits(10), 16u);
         const auto check = [&]<std::uint8_t Codebook>(std::uint32_t codes) {
             constexpr std::uint32_t bytes = superblockCodePayloadBytes(Codebook);
             for (std::uint32_t seed = 0; seed < 64; ++seed)
@@ -366,5 +381,49 @@ namespace llaminar2::native_quantised_superblock::test
         check.template operator()<15>(16);
         check.template operator()<14>(256);
         check.template operator()<16>(16);
+    }
+
+    /** Q4_K/Q5_K (5/7): primary = half(d*sc), secondary = half(-dmin*m); code = sc | m << 6. */
+    TEST(NativeQuantisedSuperblockMetadata, Q4KQ5KReproduceScaleAndMinimum)
+    {
+        forEachHalf([](std::uint16_t h) {
+            const float v = refWiden(h);
+            for (std::uint32_t six = 0; six < 64; ++six)
+            {
+                const std::uint32_t other = (six * 37u + 11u) & 63u;
+                const auto q4 = decodeSuperblockMetadata<5>(six | (other << 6), packSuperblockWord(h, 0x3C00));
+                ASSERT_EQ(q4.primary, cph(v * static_cast<float>(six))) << h << ' ' << six;
+                const auto q5 = decodeSuperblockMetadata<7>(other | (six << 6), packSuperblockWord(0x3C00, h));
+                ASSERT_TRUE(sameHalf(q5.secondary, cph(-v * static_cast<float>(six)))) << h << ' ' << six;
+                ASSERT_EQ(q5.primary, cph(1.0f * static_cast<float>(other)));
+            }
+        });
+    }
+
+    /** Bit-packed code planes: every width, every bit shift, random codes round-trip exactly. */
+    TEST(NativeQuantisedSuperblockMetadata, BitPackedCodesRoundTripAtEveryShift)
+    {
+        for (const std::uint8_t cb : {5, 9, 10, 11, 13, 17, 24})
+        {
+            const std::uint32_t bits = superblockCodeBits(cb);
+            for (std::uint32_t shift = 0; shift < 8; ++shift)
+            {
+                constexpr std::size_t count = 97;
+                std::vector<std::uint8_t> plane((shift + count * bits + 7) / 8 + kSuperblockCodePlanePadBytes, 0xA5);
+                std::vector<std::uint32_t> codes(count);
+                for (std::size_t i = 0; i < count; ++i)
+                {
+                    codes[i] = static_cast<std::uint32_t>((i * 2654435761u) >> 7) & ((1u << bits) - 1u);
+                    for (std::uint32_t b = 0; b < bits; ++b)
+                    {
+                        const std::size_t bit = shift + i * bits + b;
+                        plane[bit / 8] = static_cast<std::uint8_t>((plane[bit / 8] & ~(1u << (bit % 8))) |
+                                                                   (((codes[i] >> b) & 1u) << (bit % 8)));
+                    }
+                }
+                for (std::size_t i = 0; i < count; ++i)
+                    ASSERT_EQ(loadCode(cb, plane.data(), i, shift), codes[i]) << int(cb) << ' ' << shift << ' ' << i;
+            }
+        }
     }
 } // namespace llaminar2::native_quantised_superblock::test

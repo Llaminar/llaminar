@@ -141,11 +141,20 @@ namespace llaminar::v2::kernels
             // The slot's producer chose the metadata layout; the operand's own
             // superblock phase must agree with it (one phase per packed run).
             const bool coded = gpuPreparedSuperblockCoded(*source, layout, device);
+            namespace sb = native_quantised_superblock;
+            // A bit-packed code plane binds at bit offset_blocks*bits; the
+            // byte part moves the pointer and the 0..7 remainder travels in
+            // the matrix's layout byte.
+            const size_t code_bits = coded ? sb::superblockCodePlaneBits(codebook) : 0u;
+            const size_t code_bit = product(offset_blocks, code_bits);
             const uint8_t metadata_layout = coded
                 ? nativeQuantisedMetadataLayout(NativeQuantisedMetadataRepresentation::SuperblockCoded,
-                                                gpuWeightSourceSuperblockPhase(tensor))
+                                                gpuWeightSourceSuperblockPhase(tensor),
+                                                static_cast<uint32_t>(code_bit & 7u))
                 : uint8_t{0};
-            if (slot->metadata_layout != metadata_layout)
+            // The slot records representation and phase; the code bit offset
+            // is per bound matrix.
+            if (slot->metadata_layout != (metadata_layout & ~uint8_t{0x38}))
                 throw std::invalid_argument("GPU weight-pool GEMM metadata layout disagrees with its slot: " + slot_name);
             uint16_t *scales = nullptr, *mins = nullptr;
             uint32_t *emins = nullptr;
@@ -153,17 +162,21 @@ namespace llaminar::v2::kernels
             {
                 // Code plane per block, superblock plane per (row, superblock);
                 // both follow the grouped row offset of the packed run.
-                namespace sb = native_quantised_superblock;
-                const size_t code_bytes = sb::superblockCodePlaneBytes(codebook);
                 const size_t field_bytes = sb::superblockFieldBytes(codebook);
                 const size_t superblocks = sb::superblocksPerRow(static_cast<uint32_t>(blocks_per_row),
                     nativeQuantisedLayoutPhase(metadata_layout));
                 // Code-in-payload formats bind the matrix's own payload as their code plane.
-                scales = sb::superblockCodeInPayload(codebook)
-                    ? reinterpret_cast<uint16_t *>(payload)
-                    : static_cast<uint16_t *>(region(slot->d_native_quantised_scales, slot->scales_bytes,
-                          product(offset_blocks, code_bytes), product(length_blocks, code_bytes), slot_name,
-                          "scale codes"));
+                if (sb::superblockCodeInPayload(codebook))
+                    scales = reinterpret_cast<uint16_t *>(payload);
+                else
+                {
+                    const size_t first_byte = code_bit / 8u;
+                    const size_t last_bit = code_bit + product(length_blocks, code_bits);
+                    // Readers may fetch up to the plane padding past the last code.
+                    scales = static_cast<uint16_t *>(region(slot->d_native_quantised_scales, slot->scales_bytes,
+                        first_byte, (last_bit + 7u) / 8u - first_byte + sb::kSuperblockCodePlanePadBytes,
+                        slot_name, "scale codes"));
+                }
                 mins = static_cast<uint16_t *>(region(slot->d_native_quantised_mins, slot->mins_bytes,
                     product(product(row_offset, superblocks), field_bytes),
                     product(product(static_cast<size_t>(n), superblocks), field_bytes), slot_name, "superblock scales"));
