@@ -138,14 +138,13 @@ public:
                     continue;
                 }
                 const auto primary = unit + layout.data_stride + (layout.usesInlineCompensation() ? 128 : 0) + local * 2;
-                // Native MXFP4 primary words are BF16 powers of two of an admitted
-                // E8M0 exponent, or zero; every other unit holds FP16. The seeded
-                // exponents span [2, 200] so whole-row sums stay finite; the
-                // remaining admitted words are covered by the loader tests.
-                writeWord(primary, layout.scaleEncoding() == cpu::native_quantised::CPUNativeQuantisedScaleEncoding::PowerOfTwoBF16
-                    ? (seed % 29u == 7u ? std::uint16_t{0}
-                        : mxfp4::powerOfTwoBF16Word(static_cast<std::uint8_t>(2u + (seed >> 8) % 199u)))
-                    : static_cast<std::uint16_t>(0x2401u + (seed & 0x1fffu)));
+                // Seed the admitted zero marker and finite native exponents.
+                if (layout.scaleEncoding() == cpu::native_quantised::CPUNativeQuantisedScaleEncoding::E8M0)
+                {
+                    bytes[unit + layout.data_stride + local] = seed % 29u == 7u ? 0u : 2u + (seed >> 8) % 199u;
+                    continue;
+                }
+                writeWord(primary, static_cast<std::uint16_t>(0x2401u + (seed & 0x1fffu)));
                 if (layout.is_asymmetric || layout.usesIQ3SExpandedSourceScale())
                     writeWord(primary + 128, layout.usesIQ3SExpandedSourceScale() ? static_cast<std::uint16_t>(seed & 15u)
                         : static_cast<std::uint16_t>(0xa301u + (seed & 0x0fffu)));

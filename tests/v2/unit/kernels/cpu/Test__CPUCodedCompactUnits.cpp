@@ -480,7 +480,7 @@ namespace llaminar2::test
                 {"Q4_K", 5, 20, [](auto s, auto r) { return Factory::createQ4_KRandom(s, r); }},
                 {"IQ4_NL", 4, 18, [](auto s, auto r) { return Factory::createIQ4_NLRandom(s, r); }},
                 {"IQ4_XS", 4, 0, [](auto s, auto r) { return Factory::createIQ4_XSRandom(s, r); }},
-                {"MXFP4", 25, 18, [](auto s, auto r) { return Factory::createMXFP4Random(s, r); }},
+                {"MXFP4", 25, 17, [](auto s, auto r) { return Factory::createMXFP4Random(s, r); }},
                 {"Q8_0", 19, 34, [](auto s, auto r) { return Factory::createQ8_0Random(s, r); }},
             };
         }

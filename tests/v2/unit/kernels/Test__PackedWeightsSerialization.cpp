@@ -614,28 +614,28 @@ TEST(Test__PackedWeightsSerialization, IQ4XSSourceTupleRoundTripsAndRejectsVersi
 }
 
 /**
- * @brief Native MXFP4 CPU units (BF16 power-of-two scale words) round-trip and
+ * @brief Native MXFP4 CPU units (E8M0 scale bytes) round-trip and
  * reject version-7 archives, whose identical codebook/encoding carried FP16 words.
  */
-TEST(Test__PackedWeightsSerialization, MXFP4NativeUnitScaleWordsRoundTripAndRejectVersion7)
+TEST(Test__PackedWeightsSerialization, MXFP4NativeUnitE8M0BytesRoundTripAndRejectVersion7)
 {
     auto packed = buildTestPacked(
         /*N=*/64, /*K=*/64, /*codebook_id=*/kNativeQuantisedMXFP4Codebook, /*blocks_per_row=*/2,
         /*payload_bytes=*/16, /*is_nibble_lut=*/true, /*is_asymmetric=*/false,
-        /*is_superblock=*/false, /*data_stride=*/1024, /*interleaved_block_stride=*/1280,
-        /*interleaved_sz=*/2 * 1280, /*payload_sz=*/0, /*int8_flat_sz=*/0);
-    ASSERT_EQ(packed.scaleEncoding(), CPUNativeQuantisedScaleEncoding::PowerOfTwoBF16);
+        /*is_superblock=*/false, /*data_stride=*/1024, /*interleaved_block_stride=*/1088,
+        /*interleaved_sz=*/2 * 1088, /*payload_sz=*/0, /*int8_flat_sz=*/0);
+    ASSERT_EQ(packed.scaleEncoding(), CPUNativeQuantisedScaleEncoding::E8M0);
     for (int kb = 0; kb < 2; ++kb)
         for (int n = 0; n < 64; ++n)
-            const_cast<uint16_t *>(packed.chunkScales(0, kb))[n] =
-                mxfp4::powerOfTwoBF16Word(static_cast<uint8_t>(n % 7 == 3 ? 0 : 2 + (kb * 64 + n) % 251));
+            packed.native_interleaved.beginRewrite()[packed.blockOffset(0, kb) + packed.data_stride + n] =
+                static_cast<uint8_t>(n % 7 == 3 ? 0 : 2 + (kb * 64 + n) % 251);
     CPUPackedWeights owner(std::move(packed));
     auto blob = serialize(owner);
     auto restored = deserialize(blob.data(), blob.size());
     ASSERT_NE(restored, nullptr);
     const auto *native = dynamic_cast<const CPUPackedWeights *>(restored.get());
     ASSERT_NE(native, nullptr);
-    EXPECT_EQ(native->packed().scaleEncoding(), CPUNativeQuantisedScaleEncoding::PowerOfTwoBF16);
+    EXPECT_EQ(native->packed().scaleEncoding(), CPUNativeQuantisedScaleEncoding::E8M0);
     EXPECT_EQ(std::memcmp(native->packed().native_interleaved.data(),
         owner.packed().native_interleaved.data(), owner.packed().native_interleaved.size()), 0);
     for (int n = 0; n < 64; ++n)
@@ -656,7 +656,7 @@ TEST(Test__PackedWeightsSerialization, MXFP4NativeUnitScaleWordsRoundTripAndReje
         }
         const auto *received = dynamic_cast<const CPUPackedWeights *>(target.weights.get());
         ASSERT_NE(received, nullptr);
-        EXPECT_EQ(received->packed().scaleEncoding(), CPUNativeQuantisedScaleEncoding::PowerOfTwoBF16);
+        EXPECT_EQ(received->packed().scaleEncoding(), CPUNativeQuantisedScaleEncoding::E8M0);
         EXPECT_EQ(std::memcmp(received->packed().native_interleaved.data(),
             owner.packed().native_interleaved.data(), owner.packed().native_interleaved.size()), 0);
         for (int kb = 0; kb < 2; ++kb)

@@ -245,6 +245,17 @@ namespace llaminar2::cpu::native_quantised::multi_scale
         static F bf16(const std::uint16_t *source) noexcept
         { return std::bit_cast<F>(vshll_n_u16(vld1_u16(source), 16)); }
 
+        /** @return Four E8M0 scales widened by exponent placement; byte 0 is the zero marker. */
+        static F e8m0(const std::uint8_t *source) noexcept
+        {
+            std::uint32_t four;
+            std::memcpy(&four, source, sizeof(four));
+            const auto bytes = vreinterpret_u8_u32(vdup_n_u32(four));
+            const auto exponent = vmovl_u16(vget_low_u16(vmovl_u8(bytes)));
+            const auto bits = vshlq_n_u32(vsubq_u32(exponent, vdupq_n_u32(1)), 23);
+            return std::bit_cast<F>(vbicq_u32(bits, vceqzq_u32(exponent)));
+        }
+
         /** @brief Widen opaque metadata without interpreting its half exponent.
          * @param source Four readable raw metadata words.
          * @return Four zero-extended INT32 metadata words.

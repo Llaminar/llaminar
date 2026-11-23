@@ -215,6 +215,12 @@ inline void appendNativeWeightGroups(const IINT8Unpackable& source,const NativeQ
                     if(nibble) {
                         for(int g=0;g<4;++g)std::memcpy(target+g*256+column*4,input+g*4,4);
                     } else for(int g=0;g<8;++g)std::memcpy(target+g*256+column*4,values+g*4,4);
+                    if(out.scaleEncoding()==CPUNativeQuantisedScaleEncoding::E8M0) {
+                        // The source packer already admitted the exponent and published
+                        // its exact byte, with zero as the all-zero block marker.
+                        target[out.data_stride+column]=reinterpret_cast<const uint8_t*>(primary)[b];
+                        continue;
+                    }
                     const int comp_bytes=out.usesInlineCompensation()?128:0;
                     if(comp_bytes) {
                         int32_t sum=0;for(int k=0;k<32;++k)sum+=values[k];
@@ -233,11 +239,6 @@ inline void appendNativeWeightGroups(const IINT8Unpackable& source,const NativeQ
                     uint16_t scale=0,minimum=0;
                     if(out.usesIQ3SExpandedSourceScale()) {
                         scale=primary[b];minimum=secondary[b];
-                    } else if(nibble && format.codebook_id==kNativeQuantisedMXFP4Codebook) {
-                        // packVnniBlock already validated the block and published the unit's
-                        // exact scale word (BF16 power of two, out.primaryScaleLayout(); 0 for
-                        // ggml all-zero blocks). Re-rounding the FP32 source scale would be lossy.
-                        scale=primary[b];
                     } else if(nibble) {
                         scale=fp32_to_fp16(source.get_block_scale(actual_row,input_first+b));
                         minimum=fp32_to_fp16(source.get_block_min(actual_row,input_first+b));

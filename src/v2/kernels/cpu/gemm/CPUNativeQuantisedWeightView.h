@@ -23,6 +23,7 @@
 #include "kernels/common/MoEProjectionNumericalContract.h"
 #include "tensors/BlockStructures.h"
 #include "tensors/FP16Utils.h"
+#include "tensors/MXFP4Format.h"
 #include "tensors/NativeQuantisedIQ2SScale.h"
 #include "tensors/NativeQuantisedIQ3SScale.h"
 #include "tensors/NativeQuantisedIQ4XSScale.h"
@@ -63,11 +64,7 @@ namespace llaminar2::cpu::native_quantised
     inline float nativeQuantisedPrimaryScale(CPUNativeQuantisedEncoding encoding,
         std::uint8_t codebook, std::uint16_t primary, std::uint16_t secondary)
     {
-        // Native MXFP4 units carry the exact BF16 word of their E8M0 power of
-        // two; it widens by placement alone (word << 16), never through FP16.
-        const float base = preparedScaleEncoding(codebook, encoding) == CPUNativeQuantisedScaleEncoding::PowerOfTwoBF16
-            ? std::bit_cast<float>(std::uint32_t{primary} << 16)
-            : fp16_to_fp32(primary);
+        const float base = fp16_to_fp32(primary);
         if (encoding == CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale)
         {
             if (!native_quantised_iq3s_scale::valid(secondary))
@@ -304,7 +301,7 @@ namespace llaminar2::cpu::native_quantised
         { return encoding == CPUNativeQuantisedEncoding::NibbleLUT || usesNibbleLUTSourceScale(); }
 
         /** @brief Interpretation of the primary scale words, derived from codebook and encoding.
-         * @return PowerOfTwoBF16 for native nibble MXFP4; FP16 otherwise (including rotated MXFP4).
+         * @return E8M0 for native nibble MXFP4; FP16 otherwise (including rotated MXFP4).
          */
         [[nodiscard]] CPUNativeQuantisedScaleEncoding scaleEncoding() const noexcept
         { return preparedScaleEncoding(codebook_id, encoding); }
@@ -350,8 +347,14 @@ namespace llaminar2::cpu::native_quantised
         [[nodiscard]] const std::uint16_t *chunkScales(int chunk, int block) const
         {
             requirePerBlockMetadata();
+            if (scaleEncoding() == CPUNativeQuantisedScaleEncoding::E8M0)
+                throw std::logic_error("Native MXFP4 weights have byte scales, not half words");
             return reinterpret_cast<const std::uint16_t *>(unit(chunk, block) + data_stride + (usesInlineCompensation() ? 128 : 0));
         }
+
+        /** @return One admitted 64-column MXFP4 exponent plane (E8M0 with a zero marker). */
+        [[nodiscard]] const std::uint8_t *admittedE8M0Scales(int chunk, int block) const noexcept
+        { return admittedUnit(chunk, block) + preparedDataStride(CPUNativeQuantisedEncoding::NibbleLUT, 25); }
 
         /** @brief First byte of one 64-column block (payload planes, then code planes). */
         [[nodiscard]] const std::uint8_t *blockUnit(int chunk, int block) const { return unit(chunk, block); }
@@ -483,6 +486,11 @@ namespace llaminar2::cpu::native_quantised
             {
                 const auto words = codedBlockMetadata(chunk, block, column);
                 return nativeQuantisedPrimaryScale(encoding, codebook_id, words.primary, words.secondary);
+            }
+            if (scaleEncoding() == CPUNativeQuantisedScaleEncoding::E8M0)
+            {
+                const std::uint8_t e = unit(chunk, block)[data_stride + column];
+                return std::bit_cast<float>(e ? mxfp4::normalScaleFP32Bits(e) : 0u);
             }
             const bool source_scale = usesNibbleLUTSourceScale() || usesIQ3SExpandedSourceScale() ||
                 usesQ6KNativeDualScale() || (usesCompactMultiScale() && codebook_id == 13);
@@ -646,6 +654,15 @@ namespace llaminar2::cpu::native_quantised
         const char *name = nullptr;
         if (view.usesIQ3SExpandedSourceScale())
         { rule = native_quantised_iq3s_scale::valid; name = "IQ3_S"; }
+        if (view.scaleEncoding() == CPUNativeQuantisedScaleEncoding::E8M0)
+            for (int chunk = 0; chunk < view.N_padded / 64; ++chunk)
+                for (int block = 0; block < view.blocks_per_row; ++block)
+                {
+                    const auto *exponents = view.admittedE8M0Scales(chunk, block);
+                    for (int column = 0; column < 64; ++column)
+                        if (exponents[column] && !mxfp4::exponentFitsNativeE8M0(exponents[column]))
+                            throw std::invalid_argument("Native MXFP4 prepared exponent is outside the admitted E8M0 range");
+                }
         if (rule)
         {
             // Every lane of every unit, padding columns included: native loads

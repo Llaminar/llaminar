@@ -1484,30 +1484,20 @@ namespace llaminar2::cpu::native_quantised
             return _mm512_shuffle_epi8(decode_lut, hi);
     }
 
-    /**
-     * @brief Load scales using the original nibble dispatcher's immutable decoder.
-     * @tparam DecodeKind Existing linear/identity/LUT decode semantics.
-     * @param packed Original admitted prepared operand; no layout is reinterpreted.
-     * @param chunk 64-column chunk index.
-     * @param block Logical K block.
-     * @param column First column of the 16-column strip.
-     * @return Identical effective FP32 scale values without unused source-factor work.
-     *
-     * Preparation maps codebooks0/5 to ordinary NibbleLUT and the dispatcher
-     * maps them to linear/identity. IQ4_XS factors require codebook4 and keep
-     * LUT; IQ3_S factors require ExpandedInt8 source-scale execution. Thus only
-     * linear kinds can statically widen plain halves. LUT retains the generic
-     * coded source factors, when present; no source scale is narrowed to half.
-     */
-    template <NibbleDecodeKind DecodeKind>
-    [[gnu::always_inline]] inline __m512 load_native_avx512_nibble_scales(
+    /** @return Sixteen SIMD factors of a packed nibble block, on its exact source layout. */
+    inline coded_metadata::Factors<__m512> loadNibbleFactors512(
         const CPUNativeQuantisedPackedWeights &packed, int chunk, int block, int column)
     {
-        if constexpr (DecodeKind == NibbleDecodeKind::Q4_0_LINEAR ||
-                      DecodeKind == NibbleDecodeKind::Q4_1_IDENTITY)
-            return CPUNativeQuantisedPackedWeights::loadPlainFP16Scales512(packed.chunkScales(chunk, block) + column);
-        else
-            return packed.loadScales512(chunk, block, column);
+        if (packed.scaleEncoding() == CPUNativeQuantisedScaleEncoding::E8M0)
+        {
+            const auto e = _mm_loadu_si128(reinterpret_cast<const __m128i *>(
+                packed.blockUnit(chunk, block) + packed.data_stride + column));
+            const auto biased = _mm_subs_epu8(e, _mm_set1_epi8(1));
+            return {.primary = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu8_epi32(biased), 23))};
+        }
+        return {.primary = packed.loadScales512(chunk, block, column),
+                .secondary = packed.is_asymmetric ? _mm512_cvtph_ps(_mm256_load_si256(
+                    reinterpret_cast<const __m256i *>(packed.chunkMins(chunk, block) + column))) : _mm512_setzero_ps()};
     }
 
     /**
@@ -1597,61 +1587,56 @@ namespace llaminar2::cpu::native_quantised
         int_acc1 = correctNibbleDot512(int_acc1, a_blk, weight_bias);
         int_acc2 = correctNibbleDot512(int_acc2, a_blk, weight_bias);
         int_acc3 = correctNibbleDot512(int_acc3, a_blk, weight_bias);
-        const __m512 scale0 = load_native_avx512_nibble_scales<DecodeKind>(packed, chunk, kb, 0);
-        const __m512 scale1 = load_native_avx512_nibble_scales<DecodeKind>(packed, chunk, kb, 16);
-        const __m512 scale2 = load_native_avx512_nibble_scales<DecodeKind>(packed, chunk, kb, 32);
-        const __m512 scale3 = load_native_avx512_nibble_scales<DecodeKind>(packed, chunk, kb, 48);
+        const auto factors0 = loadNibbleFactors512(packed, chunk, kb, 0);
+        const auto factors1 = loadNibbleFactors512(packed, chunk, kb, 16);
+        const auto factors2 = loadNibbleFactors512(packed, chunk, kb, 32);
+        const auto factors3 = loadNibbleFactors512(packed, chunk, kb, 48);
 
         if constexpr (IsAsymmetric)
         {
-            const uint16_t *b_mins = packed.chunkMins(chunk, kb);
             fp_acc0 = accumulateCorrectedSingleScaleBlockAVX512(
                 fp_acc0,
                 int_acc0,
-                scale0,
+                factors0.primary,
                 a_blk.sum_qs,
-                _mm512_cvtph_ps(_mm256_load_si256(
-                    reinterpret_cast<const __m256i *>(b_mins))),
+                factors0.secondary,
                 a_scale,
                 Policy);
             fp_acc1 = accumulateCorrectedSingleScaleBlockAVX512(
                 fp_acc1,
                 int_acc1,
-                scale1,
+                factors1.primary,
                 a_blk.sum_qs,
-                _mm512_cvtph_ps(_mm256_load_si256(
-                    reinterpret_cast<const __m256i *>(b_mins + 16))),
+                factors1.secondary,
                 a_scale,
                 Policy);
             fp_acc2 = accumulateCorrectedSingleScaleBlockAVX512(
                 fp_acc2,
                 int_acc2,
-                scale2,
+                factors2.primary,
                 a_blk.sum_qs,
-                _mm512_cvtph_ps(_mm256_load_si256(
-                    reinterpret_cast<const __m256i *>(b_mins + 32))),
+                factors2.secondary,
                 a_scale,
                 Policy);
             fp_acc3 = accumulateCorrectedSingleScaleBlockAVX512(
                 fp_acc3,
                 int_acc3,
-                scale3,
+                factors3.primary,
                 a_blk.sum_qs,
-                _mm512_cvtph_ps(_mm256_load_si256(
-                    reinterpret_cast<const __m256i *>(b_mins + 48))),
+                factors3.secondary,
                 a_scale,
                 Policy);
         }
         else
         {
             fp_acc0 = accumulateSingleScaleBlockAVX512(
-                fp_acc0, int_acc0, scale0, a_scale, Policy);
+                fp_acc0, int_acc0, factors0.primary, a_scale, Policy);
             fp_acc1 = accumulateSingleScaleBlockAVX512(
-                fp_acc1, int_acc1, scale1, a_scale, Policy);
+                fp_acc1, int_acc1, factors1.primary, a_scale, Policy);
             fp_acc2 = accumulateSingleScaleBlockAVX512(
-                fp_acc2, int_acc2, scale2, a_scale, Policy);
+                fp_acc2, int_acc2, factors2.primary, a_scale, Policy);
             fp_acc3 = accumulateSingleScaleBlockAVX512(
-                fp_acc3, int_acc3, scale3, a_scale, Policy);
+                fp_acc3, int_acc3, factors3.primary, a_scale, Policy);
         }
     }
 
@@ -1757,11 +1742,10 @@ namespace llaminar2::cpu::native_quantised
             int_acc2 = correctNibbleDot512(int_acc2, a_blk, weight_bias);
             int_acc3 = correctNibbleDot512(int_acc3, a_blk, weight_bias);
             // Convert exact integer dots through the selected publication tree.
-
-            const __m512 scale0 = load_native_avx512_nibble_scales<DecodeKind>(packed, chunk, kb, 0);
-            const __m512 scale1 = load_native_avx512_nibble_scales<DecodeKind>(packed, chunk, kb, 16);
-            const __m512 scale2 = load_native_avx512_nibble_scales<DecodeKind>(packed, chunk, kb, 32);
-            const __m512 scale3 = load_native_avx512_nibble_scales<DecodeKind>(packed, chunk, kb, 48);
+            const auto factors0 = loadNibbleFactors512(packed, chunk, kb, 0);
+            const auto factors1 = loadNibbleFactors512(packed, chunk, kb, 16);
+            const auto factors2 = loadNibbleFactors512(packed, chunk, kb, 32);
+            const auto factors3 = loadNibbleFactors512(packed, chunk, kb, 48);
 
             // Asymmetric correction: acc += a_scale * sum_qs * b_min[n]
             // Formula: weight = scale * int_val + min, so the offset term
@@ -1769,34 +1753,33 @@ namespace llaminar2::cpu::native_quantised
             // mins are FP16; load via F16C convert to FP32
             if constexpr (IsAsymmetric)
             {
-                const uint16_t *b_mins = packed.chunkMins(chunk, kb);
                 fp_acc0 = accumulateCorrectedSingleScaleBlockAVX512(
-                    fp_acc0, int_acc0, scale0, a_sum,
-                    _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_mins))),
+                    fp_acc0, int_acc0, factors0.primary, a_sum,
+                    factors0.secondary,
                     a_scale, Policy);
                 fp_acc1 = accumulateCorrectedSingleScaleBlockAVX512(
-                    fp_acc1, int_acc1, scale1, a_sum,
-                    _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_mins + 16))),
+                    fp_acc1, int_acc1, factors1.primary, a_sum,
+                    factors1.secondary,
                     a_scale, Policy);
                 fp_acc2 = accumulateCorrectedSingleScaleBlockAVX512(
-                    fp_acc2, int_acc2, scale2, a_sum,
-                    _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_mins + 32))),
+                    fp_acc2, int_acc2, factors2.primary, a_sum,
+                    factors2.secondary,
                     a_scale, Policy);
                 fp_acc3 = accumulateCorrectedSingleScaleBlockAVX512(
-                    fp_acc3, int_acc3, scale3, a_sum,
-                    _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_mins + 48))),
+                    fp_acc3, int_acc3, factors3.primary, a_sum,
+                    factors3.secondary,
                     a_scale, Policy);
             }
             else
             {
                 fp_acc0 = accumulateSingleScaleBlockAVX512(
-                    fp_acc0, int_acc0, scale0, a_scale, Policy);
+                    fp_acc0, int_acc0, factors0.primary, a_scale, Policy);
                 fp_acc1 = accumulateSingleScaleBlockAVX512(
-                    fp_acc1, int_acc1, scale1, a_scale, Policy);
+                    fp_acc1, int_acc1, factors1.primary, a_scale, Policy);
                 fp_acc2 = accumulateSingleScaleBlockAVX512(
-                    fp_acc2, int_acc2, scale2, a_scale, Policy);
+                    fp_acc2, int_acc2, factors2.primary, a_scale, Policy);
                 fp_acc3 = accumulateSingleScaleBlockAVX512(
-                    fp_acc3, int_acc3, scale3, a_scale, Policy);
+                    fp_acc3, int_acc3, factors3.primary, a_scale, Policy);
             }
         }
 
@@ -2065,8 +2048,8 @@ namespace llaminar2::cpu::native_quantised
                     // Reuse it here so impossible IQ3_S/IQ4_XS factor masks
                     // need not stay live across eight integer dot chains.
                     // LUT keeps the original source-factor loader/equation.
-                    const __m512 scale0 = load_native_avx512_nibble_scales<DecodeKind>(packed, chunk, kb, zbase * 16);
-                    const __m512 scale1 = load_native_avx512_nibble_scales<DecodeKind>(packed, chunk, kb, (zbase + 1) * 16);
+                    const auto factors0 = loadNibbleFactors512(packed, chunk, kb, (zbase + 0) * 16);
+                    const auto factors1 = loadNibbleFactors512(packed, chunk, kb, (zbase + 1) * 16);
                     const float a0_scale =
                         nativeQuantisedFP16ScaleToFP32(a0.d);
                     const float a1_scale =
@@ -2074,21 +2057,13 @@ namespace llaminar2::cpu::native_quantised
 
                     if constexpr (IsAsymmetric)
                     {
-                        const uint16_t *mins =
-                            packed.chunkMins(chunk, kb) + zbase * 16;
-                        const __m512 min0 = _mm512_cvtph_ps(
-                            _mm256_load_si256(
-                                reinterpret_cast<const __m256i *>(mins)));
-                        const __m512 min1 = _mm512_cvtph_ps(
-                            _mm256_load_si256(
-                                reinterpret_cast<const __m256i *>(mins + 16)));
                         partial0_0 =
                             accumulateCorrectedSingleScaleBlockAVX512(
                                 partial0_0,
                                 int0_0,
-                                scale0,
+                                factors0.primary,
                                 a0.sum_qs,
-                                min0,
+                                factors0.secondary,
                                 a0_scale,
                                 CPUProjectionNumericalPolicy::
                                     GPUAlignedExpert);
@@ -2096,9 +2071,9 @@ namespace llaminar2::cpu::native_quantised
                             accumulateCorrectedSingleScaleBlockAVX512(
                                 partial0_1,
                                 int0_1,
-                                scale1,
+                                factors1.primary,
                                 a0.sum_qs,
-                                min1,
+                                factors1.secondary,
                                 a0_scale,
                                 CPUProjectionNumericalPolicy::
                                     GPUAlignedExpert);
@@ -2106,9 +2081,9 @@ namespace llaminar2::cpu::native_quantised
                             accumulateCorrectedSingleScaleBlockAVX512(
                                 partial1_0,
                                 int1_0,
-                                scale0,
+                                factors0.primary,
                                 a1.sum_qs,
-                                min0,
+                                factors0.secondary,
                                 a1_scale,
                                 CPUProjectionNumericalPolicy::
                                     GPUAlignedExpert);
@@ -2116,9 +2091,9 @@ namespace llaminar2::cpu::native_quantised
                             accumulateCorrectedSingleScaleBlockAVX512(
                                 partial1_1,
                                 int1_1,
-                                scale1,
+                                factors1.primary,
                                 a1.sum_qs,
-                                min1,
+                                factors1.secondary,
                                 a1_scale,
                                 CPUProjectionNumericalPolicy::
                                     GPUAlignedExpert);
@@ -2128,25 +2103,25 @@ namespace llaminar2::cpu::native_quantised
                         partial0_0 = accumulateSingleScaleBlockAVX512(
                             partial0_0,
                             int0_0,
-                            scale0,
+                            factors0.primary,
                             a0_scale,
                             CPUProjectionNumericalPolicy::GPUAlignedExpert);
                         partial0_1 = accumulateSingleScaleBlockAVX512(
                             partial0_1,
                             int0_1,
-                            scale1,
+                            factors1.primary,
                             a0_scale,
                             CPUProjectionNumericalPolicy::GPUAlignedExpert);
                         partial1_0 = accumulateSingleScaleBlockAVX512(
                             partial1_0,
                             int1_0,
-                            scale0,
+                            factors0.primary,
                             a1_scale,
                             CPUProjectionNumericalPolicy::GPUAlignedExpert);
                         partial1_1 = accumulateSingleScaleBlockAVX512(
                             partial1_1,
                             int1_1,
-                            scale1,
+                            factors1.primary,
                             a1_scale,
                             CPUProjectionNumericalPolicy::GPUAlignedExpert);
                     }
@@ -2358,40 +2333,35 @@ namespace llaminar2::cpu::native_quantised
                         int0_##SEGMENT = correctNibbleDot512(int0_##SEGMENT, a0, weight_bias); \
                         int1_##SEGMENT = correctNibbleDot512(int1_##SEGMENT, a1, weight_bias); \
                         int2_##SEGMENT = correctNibbleDot512(int2_##SEGMENT, a2, weight_bias); \
-                        const __m512 scale = packed.loadScales512(           \
-                            chunk, kb, (zbase + SEGMENT) * 16);              \
+                        const auto factors = loadNibbleFactors512(packed, chunk, kb, (zbase + SEGMENT) * 16); \
                         const float a0_scale = nativeQuantisedFP16ScaleToFP32(a0.d); \
                         const float a1_scale = nativeQuantisedFP16ScaleToFP32(a1.d); \
                         const float a2_scale = nativeQuantisedFP16ScaleToFP32(a2.d); \
                         if constexpr (IsAsymmetric)                         \
                         {                                                    \
-                            const __m512 minimum = _mm512_cvtph_ps(         \
-                                _mm256_load_si256(reinterpret_cast<const __m256i *>( \
-                                    packed.chunkMins(chunk, kb) +            \
-                                        (zbase + SEGMENT) * 16)));           \
                             partial0_##SEGMENT = accumulateCorrectedSingleScaleBlockAVX512( \
-                                partial0_##SEGMENT, int0_##SEGMENT, scale,  \
-                                a0.sum_qs, minimum, a0_scale,                \
+                                partial0_##SEGMENT, int0_##SEGMENT, factors.primary,  \
+                                a0.sum_qs, factors.secondary, a0_scale,                \
                                 CPUProjectionNumericalPolicy::GPUAlignedExpert); \
                             partial1_##SEGMENT = accumulateCorrectedSingleScaleBlockAVX512( \
-                                partial1_##SEGMENT, int1_##SEGMENT, scale,  \
-                                a1.sum_qs, minimum, a1_scale,                \
+                                partial1_##SEGMENT, int1_##SEGMENT, factors.primary,  \
+                                a1.sum_qs, factors.secondary, a1_scale,                \
                                 CPUProjectionNumericalPolicy::GPUAlignedExpert); \
                             partial2_##SEGMENT = accumulateCorrectedSingleScaleBlockAVX512( \
-                                partial2_##SEGMENT, int2_##SEGMENT, scale,  \
-                                a2.sum_qs, minimum, a2_scale,                \
+                                partial2_##SEGMENT, int2_##SEGMENT, factors.primary,  \
+                                a2.sum_qs, factors.secondary, a2_scale,                \
                                 CPUProjectionNumericalPolicy::GPUAlignedExpert); \
                         }                                                    \
                         else                                                 \
                         {                                                    \
                             partial0_##SEGMENT = accumulateSingleScaleBlockAVX512( \
-                                partial0_##SEGMENT, int0_##SEGMENT, scale, a0_scale, \
+                                partial0_##SEGMENT, int0_##SEGMENT, factors.primary, a0_scale, \
                                 CPUProjectionNumericalPolicy::GPUAlignedExpert); \
                             partial1_##SEGMENT = accumulateSingleScaleBlockAVX512( \
-                                partial1_##SEGMENT, int1_##SEGMENT, scale, a1_scale, \
+                                partial1_##SEGMENT, int1_##SEGMENT, factors.primary, a1_scale, \
                                 CPUProjectionNumericalPolicy::GPUAlignedExpert); \
                             partial2_##SEGMENT = accumulateSingleScaleBlockAVX512( \
-                                partial2_##SEGMENT, int2_##SEGMENT, scale, a2_scale, \
+                                partial2_##SEGMENT, int2_##SEGMENT, factors.primary, a2_scale, \
                                 CPUProjectionNumericalPolicy::GPUAlignedExpert); \
                         }                                                    \
                     }
@@ -2804,9 +2774,8 @@ namespace llaminar2::cpu::native_quantised
             {
                 _mm_prefetch(reinterpret_cast<const char *>(packed.interleavedB(chunk + 1, 0, 0, 0)),
                              _MM_HINT_T1);
-                if (!packed.usesNibbleLUTSourceScale())
-                    _mm_prefetch(reinterpret_cast<const char *>(packed.chunkScales(chunk + 1, 0)),
-                                 _MM_HINT_T1);
+                _mm_prefetch(reinterpret_cast<const char *>(packed.blockUnit(chunk + 1, 0) + packed.data_stride),
+                             _MM_HINT_T1);
             }
 
             if (n_cols < 64)
@@ -3542,40 +3511,35 @@ namespace llaminar2::cpu::native_quantised
             ia1_1 = correctNibbleDot512(ia1_1, a1, weight_bias);
             ia1_2 = correctNibbleDot512(ia1_2, a1, weight_bias);
             ia1_3 = correctNibbleDot512(ia1_3, a1, weight_bias);
-            __m512 bs0 = packed.loadScales512(chunk, kb, 0);
-            __m512 bs1 = packed.loadScales512(chunk, kb, 16);
-            __m512 bs2 = packed.loadScales512(chunk, kb, 32);
-            __m512 bs3 = packed.loadScales512(chunk, kb, 48);
+            const auto factors0 = loadNibbleFactors512(packed, chunk, kb, 0);
+            const auto factors1 = loadNibbleFactors512(packed, chunk, kb, 16);
+            const auto factors2 = loadNibbleFactors512(packed, chunk, kb, 32);
+            const auto factors3 = loadNibbleFactors512(packed, chunk, kb, 48);
 
             const float a0_scale = nativeQuantisedFP16ScaleToFP32(a0.d);
             const float a1_scale = nativeQuantisedFP16ScaleToFP32(a1.d);
             if (packed.is_asymmetric)
             {
-                const uint16_t *b_mins = packed.chunkMins(chunk, kb);
-                __m512 bm0 = _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_mins)));
-                __m512 bm1 = _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_mins + 16)));
-                __m512 bm2 = _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_mins + 32)));
-                __m512 bm3 = _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_mins + 48)));
 
-                fp0_0 = accumulateCorrectedSingleScaleBlockAVX512(fp0_0, ia0_0, bs0, a0.sum_qs, bm0, a0_scale, packed.numerical_policy);
-                fp0_1 = accumulateCorrectedSingleScaleBlockAVX512(fp0_1, ia0_1, bs1, a0.sum_qs, bm1, a0_scale, packed.numerical_policy);
-                fp0_2 = accumulateCorrectedSingleScaleBlockAVX512(fp0_2, ia0_2, bs2, a0.sum_qs, bm2, a0_scale, packed.numerical_policy);
-                fp0_3 = accumulateCorrectedSingleScaleBlockAVX512(fp0_3, ia0_3, bs3, a0.sum_qs, bm3, a0_scale, packed.numerical_policy);
-                fp1_0 = accumulateCorrectedSingleScaleBlockAVX512(fp1_0, ia1_0, bs0, a1.sum_qs, bm0, a1_scale, packed.numerical_policy);
-                fp1_1 = accumulateCorrectedSingleScaleBlockAVX512(fp1_1, ia1_1, bs1, a1.sum_qs, bm1, a1_scale, packed.numerical_policy);
-                fp1_2 = accumulateCorrectedSingleScaleBlockAVX512(fp1_2, ia1_2, bs2, a1.sum_qs, bm2, a1_scale, packed.numerical_policy);
-                fp1_3 = accumulateCorrectedSingleScaleBlockAVX512(fp1_3, ia1_3, bs3, a1.sum_qs, bm3, a1_scale, packed.numerical_policy);
+                fp0_0 = accumulateCorrectedSingleScaleBlockAVX512(fp0_0, ia0_0, factors0.primary, a0.sum_qs, factors0.secondary, a0_scale, packed.numerical_policy);
+                fp0_1 = accumulateCorrectedSingleScaleBlockAVX512(fp0_1, ia0_1, factors1.primary, a0.sum_qs, factors1.secondary, a0_scale, packed.numerical_policy);
+                fp0_2 = accumulateCorrectedSingleScaleBlockAVX512(fp0_2, ia0_2, factors2.primary, a0.sum_qs, factors2.secondary, a0_scale, packed.numerical_policy);
+                fp0_3 = accumulateCorrectedSingleScaleBlockAVX512(fp0_3, ia0_3, factors3.primary, a0.sum_qs, factors3.secondary, a0_scale, packed.numerical_policy);
+                fp1_0 = accumulateCorrectedSingleScaleBlockAVX512(fp1_0, ia1_0, factors0.primary, a1.sum_qs, factors0.secondary, a1_scale, packed.numerical_policy);
+                fp1_1 = accumulateCorrectedSingleScaleBlockAVX512(fp1_1, ia1_1, factors1.primary, a1.sum_qs, factors1.secondary, a1_scale, packed.numerical_policy);
+                fp1_2 = accumulateCorrectedSingleScaleBlockAVX512(fp1_2, ia1_2, factors2.primary, a1.sum_qs, factors2.secondary, a1_scale, packed.numerical_policy);
+                fp1_3 = accumulateCorrectedSingleScaleBlockAVX512(fp1_3, ia1_3, factors3.primary, a1.sum_qs, factors3.secondary, a1_scale, packed.numerical_policy);
             }
             else
             {
-                fp0_0 = accumulateSingleScaleBlockAVX512(fp0_0, ia0_0, bs0, a0_scale, packed.numerical_policy);
-                fp0_1 = accumulateSingleScaleBlockAVX512(fp0_1, ia0_1, bs1, a0_scale, packed.numerical_policy);
-                fp0_2 = accumulateSingleScaleBlockAVX512(fp0_2, ia0_2, bs2, a0_scale, packed.numerical_policy);
-                fp0_3 = accumulateSingleScaleBlockAVX512(fp0_3, ia0_3, bs3, a0_scale, packed.numerical_policy);
-                fp1_0 = accumulateSingleScaleBlockAVX512(fp1_0, ia1_0, bs0, a1_scale, packed.numerical_policy);
-                fp1_1 = accumulateSingleScaleBlockAVX512(fp1_1, ia1_1, bs1, a1_scale, packed.numerical_policy);
-                fp1_2 = accumulateSingleScaleBlockAVX512(fp1_2, ia1_2, bs2, a1_scale, packed.numerical_policy);
-                fp1_3 = accumulateSingleScaleBlockAVX512(fp1_3, ia1_3, bs3, a1_scale, packed.numerical_policy);
+                fp0_0 = accumulateSingleScaleBlockAVX512(fp0_0, ia0_0, factors0.primary, a0_scale, packed.numerical_policy);
+                fp0_1 = accumulateSingleScaleBlockAVX512(fp0_1, ia0_1, factors1.primary, a0_scale, packed.numerical_policy);
+                fp0_2 = accumulateSingleScaleBlockAVX512(fp0_2, ia0_2, factors2.primary, a0_scale, packed.numerical_policy);
+                fp0_3 = accumulateSingleScaleBlockAVX512(fp0_3, ia0_3, factors3.primary, a0_scale, packed.numerical_policy);
+                fp1_0 = accumulateSingleScaleBlockAVX512(fp1_0, ia1_0, factors0.primary, a1_scale, packed.numerical_policy);
+                fp1_1 = accumulateSingleScaleBlockAVX512(fp1_1, ia1_1, factors1.primary, a1_scale, packed.numerical_policy);
+                fp1_2 = accumulateSingleScaleBlockAVX512(fp1_2, ia1_2, factors2.primary, a1_scale, packed.numerical_policy);
+                fp1_3 = accumulateSingleScaleBlockAVX512(fp1_3, ia1_3, factors3.primary, a1_scale, packed.numerical_policy);
             }
         }
 
@@ -4435,29 +4399,22 @@ namespace llaminar2::cpu::native_quantised
                 ia1_1 = correctNibbleDot512(ia1_1, a1, weight_bias);
                 ia2_0 = correctNibbleDot512(ia2_0, a2, weight_bias);
                 ia2_1 = correctNibbleDot512(ia2_1, a2, weight_bias);
-                const __m512 bscale0 =
-                    packed.loadScales512(chunk, kb, zbase * 16);
-                const __m512 bscale1 =
-                    packed.loadScales512(chunk, kb, (zbase + 1) * 16);
+                const auto factors0 = loadNibbleFactors512(packed, chunk, kb, (zbase + 0) * 16);
+                const auto factors1 = loadNibbleFactors512(packed, chunk, kb, (zbase + 1) * 16);
                 const float a0_scale = nativeQuantisedFP16ScaleToFP32(a0.d);
                 const float a1_scale = nativeQuantisedFP16ScaleToFP32(a1.d);
                 const float a2_scale = nativeQuantisedFP16ScaleToFP32(a2.d);
 
                 if (packed.is_asymmetric)
                 {
-                    const uint16_t *min_ptr = packed.chunkMins(chunk, kb) + zbase * 16;
-                    const __m512 bmin0 =
-                        _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(min_ptr)));
-                    const __m512 bmin1 =
-                        _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(min_ptr + 16)));
 
 #define CORRECTED_3ROW_NATIVE(ROW, ABLK, ASCALE)                               \
                     fp##ROW##_0 = accumulateCorrectedSingleScaleBlockAVX512(   \
-                        fp##ROW##_0, ia##ROW##_0, bscale0, ABLK.sum_qs,        \
-                        bmin0, ASCALE, packed.numerical_policy);                \
+                        fp##ROW##_0, ia##ROW##_0, factors0.primary, ABLK.sum_qs,        \
+                        factors0.secondary, ASCALE, packed.numerical_policy);                \
                     fp##ROW##_1 = accumulateCorrectedSingleScaleBlockAVX512(   \
-                        fp##ROW##_1, ia##ROW##_1, bscale1, ABLK.sum_qs,        \
-                        bmin1, ASCALE, packed.numerical_policy)
+                        fp##ROW##_1, ia##ROW##_1, factors1.primary, ABLK.sum_qs,        \
+                        factors1.secondary, ASCALE, packed.numerical_policy)
                     CORRECTED_3ROW_NATIVE(0, a0, a0_scale);
                     CORRECTED_3ROW_NATIVE(1, a1, a1_scale);
                     CORRECTED_3ROW_NATIVE(2, a2, a2_scale);
@@ -4467,10 +4424,10 @@ namespace llaminar2::cpu::native_quantised
                 {
 #define SYMMETRIC_3ROW_NATIVE(ROW, ASCALE)                                     \
                     fp##ROW##_0 = accumulateSingleScaleBlockAVX512(            \
-                        fp##ROW##_0, ia##ROW##_0, bscale0, ASCALE,              \
+                        fp##ROW##_0, ia##ROW##_0, factors0.primary, ASCALE,              \
                         packed.numerical_policy);                               \
                     fp##ROW##_1 = accumulateSingleScaleBlockAVX512(            \
-                        fp##ROW##_1, ia##ROW##_1, bscale1, ASCALE,              \
+                        fp##ROW##_1, ia##ROW##_1, factors1.primary, ASCALE,              \
                         packed.numerical_policy)
                     SYMMETRIC_3ROW_NATIVE(0, a0_scale);
                     SYMMETRIC_3ROW_NATIVE(1, a1_scale);
@@ -4729,8 +4686,7 @@ namespace llaminar2::cpu::native_quantised
                 ia1 = correctNibbleDot512(ia1, a1, weight_bias);
                 ia2 = correctNibbleDot512(ia2, a2, weight_bias);
                 ia3 = correctNibbleDot512(ia3, a3, weight_bias);
-                const __m512 bscale =
-                    packed.loadScales512(chunk, kb, z * 16);
+                const auto factors = loadNibbleFactors512(packed, chunk, kb, z * 16);
 
                 const float a0_scale = nativeQuantisedFP16ScaleToFP32(a0.d);
                 const float a1_scale = nativeQuantisedFP16ScaleToFP32(a1.d);
@@ -4738,13 +4694,10 @@ namespace llaminar2::cpu::native_quantised
                 const float a3_scale = nativeQuantisedFP16ScaleToFP32(a3.d);
                 if (packed.is_asymmetric)
                 {
-                    const uint16_t *min_ptr = packed.chunkMins(chunk, kb) + z * 16;
-                    const __m512 bmin =
-                        _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(min_ptr)));
 
 #define CORRECTED_4ROW_NATIVE(ROW, ABLK, ASCALE)                               \
                     fp##ROW = accumulateCorrectedSingleScaleBlockAVX512(       \
-                        fp##ROW, ia##ROW, bscale, ABLK.sum_qs, bmin, ASCALE,   \
+                        fp##ROW, ia##ROW, factors.primary, ABLK.sum_qs, factors.secondary, ASCALE,   \
                         packed.numerical_policy)
                     CORRECTED_4ROW_NATIVE(0, a0, a0_scale);
                     CORRECTED_4ROW_NATIVE(1, a1, a1_scale);
@@ -4756,7 +4709,7 @@ namespace llaminar2::cpu::native_quantised
                 {
 #define SYMMETRIC_4ROW_NATIVE(ROW, ASCALE)                                     \
                     fp##ROW = accumulateSingleScaleBlockAVX512(                \
-                        fp##ROW, ia##ROW, bscale, ASCALE,                       \
+                        fp##ROW, ia##ROW, factors.primary, ASCALE,                       \
                         packed.numerical_policy)
                     SYMMETRIC_4ROW_NATIVE(0, a0_scale);
                     SYMMETRIC_4ROW_NATIVE(1, a1_scale);

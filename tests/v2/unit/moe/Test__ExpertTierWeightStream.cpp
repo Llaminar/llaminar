@@ -523,7 +523,7 @@ namespace llaminar2
             ASSERT_TRUE(odd.valid(&error)) << error;
             cpu::native_quantised::CPUNativeQuantisedPackedWeights cpu;
             ASSERT_TRUE(gpuToCpuExpertPackedReference(odd, cpu, &error)) << error;
-            EXPECT_EQ(cpu.scaleEncoding(), cpu::native_quantised::CPUNativeQuantisedScaleEncoding::PowerOfTwoBF16);
+            EXPECT_EQ(cpu.scaleEncoding(), cpu::native_quantised::CPUNativeQuantisedScaleEncoding::E8M0);
             for (size_t block = 0; block < blocks; ++block)
             {
                 const int n = static_cast<int>(block % N), kb = static_cast<int>(block / N);

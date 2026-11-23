@@ -102,8 +102,8 @@ namespace llaminar2::cpu::native_quantised
         /// Pack-context layout that writes this unit's primary scale words.
         [[nodiscard]] VnniPrimaryScaleLayout primaryScaleLayout() const noexcept
         {
-            return scaleEncoding() == CPUNativeQuantisedScaleEncoding::PowerOfTwoBF16
-                       ? VnniPrimaryScaleLayout::PowerOfTwoBF16Words
+            return scaleEncoding() == CPUNativeQuantisedScaleEncoding::E8M0
+                       ? VnniPrimaryScaleLayout::NativeE8M0Bytes
                        : VnniPrimaryScaleLayout::FP16Words;
         }
 
@@ -451,10 +451,7 @@ namespace llaminar2::cpu::native_quantised
          */
         [[nodiscard]] inline __m512 loadScales512(const std::uint16_t *primary) const
         {
-            const __m256i words = _mm256_load_si256(reinterpret_cast<const __m256i *>(primary));
-            const __m512 base = scaleEncoding() == CPUNativeQuantisedScaleEncoding::PowerOfTwoBF16
-                ? _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(words), 16))
-                : _mm512_cvtph_ps(words);
+            const __m512 base = loadPlainFP16Scales512(primary);
             if (!usesIQ3SExpandedSourceScale()) return base;
             const __m512i raw = _mm512_cvtepu16_epi32(_mm256_load_si256(
                 reinterpret_cast<const __m256i *>(primary + 64)));
@@ -474,13 +471,9 @@ namespace llaminar2::cpu::native_quantised
         {
             if (usesNibbleLUTSourceScale())
                 return loadIQ4XSCodedScales<16>(chunk, block, column);
-            // Only nibble kernels call this overload. The ordinary nibble
-            // unit has no source coefficient; MXFP4 alone widens BF16.
-            const auto *primary = interleavedB(chunk, block, 0, 0) + data_stride + 128 + 2 * column;
+            const auto *primary = interleavedB(chunk, block, 0, 0) + data_stride + 2 * column;
             const __m256i words = _mm256_load_si256(reinterpret_cast<const __m256i *>(primary));
-            return scaleEncoding() == CPUNativeQuantisedScaleEncoding::PowerOfTwoBF16
-                ? _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(words), 16))
-                : _mm512_cvtph_ps(words);
+            return _mm512_cvtph_ps(words);
         }
 #endif
 #if defined(__AVX2__)
@@ -491,9 +484,7 @@ namespace llaminar2::cpu::native_quantised
         [[nodiscard]] inline __m256 loadScales256(const std::uint16_t *primary) const
         {
             const __m128i words = _mm_load_si128(reinterpret_cast<const __m128i *>(primary));
-            const __m256 base = scaleEncoding() == CPUNativeQuantisedScaleEncoding::PowerOfTwoBF16
-                ? _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(words), 16))
-                : _mm256_cvtph_ps(words);
+            const __m256 base = _mm256_cvtph_ps(words);
             if (!usesIQ3SExpandedSourceScale()) return base;
             const __m256i raw = _mm256_cvtepu16_epi32(_mm_load_si128(
                 reinterpret_cast<const __m128i *>(primary + 64)));
@@ -513,13 +504,9 @@ namespace llaminar2::cpu::native_quantised
         {
             if (usesNibbleLUTSourceScale())
                 return loadIQ4XSCodedScales<8>(chunk, block, column);
-            // Only nibble kernels call this overload. The ordinary nibble
-            // unit has no source coefficient; MXFP4 alone widens BF16.
-            const auto *primary = interleavedB(chunk, block, 0, 0) + data_stride + 128 + 2 * column;
+            const auto *primary = interleavedB(chunk, block, 0, 0) + data_stride + 2 * column;
             const __m128i words = _mm_load_si128(reinterpret_cast<const __m128i *>(primary));
-            return scaleEncoding() == CPUNativeQuantisedScaleEncoding::PowerOfTwoBF16
-                ? _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(words), 16))
-                : _mm256_cvtph_ps(words);
+            return _mm256_cvtph_ps(words);
         }
 #endif
 
@@ -536,6 +523,11 @@ namespace llaminar2::cpu::native_quantised
             {
                 const auto words = codedBlockMetadata(c, kb, n_local);
                 return nativeQuantisedPrimaryScale(encoding, codebook_id, words.primary, words.secondary);
+            }
+            if (scaleEncoding() == CPUNativeQuantisedScaleEncoding::E8M0)
+            {
+                const std::uint8_t e = blockUnit(c, kb)[data_stride + n_local];
+                return std::bit_cast<float>(e ? mxfp4::normalScaleFP32Bits(e) : 0u);
             }
             const bool source_scale = usesNibbleLUTSourceScale() || usesIQ3SExpandedSourceScale() ||
                 usesQ6KNativeDualScale() || (usesCompactMultiScale() && codebook_id == 13);
@@ -569,6 +561,8 @@ namespace llaminar2::cpu::native_quantised
         {
             if (superblockCoded())
                 throw std::logic_error("Superblock-coded CPU weights hold no per-block metadata words");
+            if (scaleEncoding() == CPUNativeQuantisedScaleEncoding::E8M0)
+                throw std::logic_error("Native MXFP4 weights have byte scales, not half words");
             size_t block_offset = blockOffset(c, kb);
             const size_t compensation_bytes = usesInlineCompensation() ? 128u : 0u;
             return reinterpret_cast<const uint16_t *>(

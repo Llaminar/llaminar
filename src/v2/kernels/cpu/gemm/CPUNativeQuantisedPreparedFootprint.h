@@ -31,7 +31,7 @@ namespace llaminar2::cpu::native_quantised
      * the bytes and decode work seen by the hot kernel.
      */
     /**
-     * @brief Interpretation of the 16-bit primary scale word in CPU units.
+     * @brief Interpretation of the primary scale field in CPU units.
      *
      * Chosen from the prepared physical representation, never from the source
      * codebook alone: rotated (expanded INT8) MXFP4 keeps source codebook 25 but
@@ -39,8 +39,8 @@ namespace llaminar2::cpu::native_quantised
      */
     enum class CPUNativeQuantisedScaleEncoding : std::uint8_t
     {
-        FP16 = 0,           ///< IEEE binary16 scale (every format today).
-        PowerOfTwoBF16 = 1, ///< Native MXFP4 E8M0 as mxfp4::powerOfTwoBF16Word.
+        FP16 = 0,          ///< IEEE binary16 scale.
+        E8M0 = 1,          ///< Native MXFP4 exponent byte; 0 is the prepared zero marker.
     };
 
     enum class CPUNativeQuantisedEncoding : std::uint8_t
@@ -57,7 +57,7 @@ namespace llaminar2::cpu::native_quantised
      * @brief Scale-word encoding of a prepared CPU unit, derived from its physical identity.
      * @param codebook_id Source codebook retained by the prepared matrix.
      * @param encoding Physical prepared encoding.
-     * @return PowerOfTwoBF16 only for MXFP4 in its native nibble encoding;
+     * @return E8M0 only for MXFP4 in its native nibble encoding;
      *         rotated (expanded INT8) MXFP4 and every other format carry FP16.
      *
      * Derived rather than stored, so no construction or import path can leave
@@ -67,7 +67,7 @@ namespace llaminar2::cpu::native_quantised
         std::uint8_t codebook_id, CPUNativeQuantisedEncoding encoding) noexcept
     {
         return codebook_id == 25 && encoding == CPUNativeQuantisedEncoding::NibbleLUT
-                   ? CPUNativeQuantisedScaleEncoding::PowerOfTwoBF16
+                   ? CPUNativeQuantisedScaleEncoding::E8M0
                    : CPUNativeQuantisedScaleEncoding::FP16;
     }
 
@@ -319,6 +319,8 @@ namespace llaminar2::cpu::native_quantised
             encoding == CPUNativeQuantisedEncoding::NibbleLUTSourceScale)
             return preparedCodedPlaneOffset(encoding, data_stride) +
                    8u * native_quantised_superblock::superblockCodePlaneBits(superblockMetadataCodebook(encoding, codebook_id));
+        if (preparedScaleEncoding(codebook_id, encoding) == CPUNativeQuantisedScaleEncoding::E8M0)
+            return data_stride + 64u;
         if (encoding == CPUNativeQuantisedEncoding::CompactMultiScale)
             return data_stride + 8u * preparedCompactCodeBits(codebook_id);
         return data_stride + (preparedUsesInlineCompensation(encoding, codebook_id) ? 128u : 0u) +

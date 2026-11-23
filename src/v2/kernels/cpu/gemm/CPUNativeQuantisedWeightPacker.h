@@ -226,7 +226,7 @@ namespace llaminar2::cpu::native_quantised
                         {
                             // Native nibble MXFP4 units always carry the exact BF16
                             // power-of-two word of their E8M0 scale.
-                            if (meta.scaleEncoding() != CPUNativeQuantisedScaleEncoding::PowerOfTwoBF16)
+                            if (meta.scaleEncoding() != CPUNativeQuantisedScaleEncoding::E8M0)
                                 throw std::logic_error("MXFP4 nibble units require the BF16 power-of-two scale encoding");
                             if (!mxfp4::blockFitsNativeE8M0(blk[0], blk + 1))
                                 throw std::invalid_argument(
