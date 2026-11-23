@@ -789,6 +789,61 @@ TEST(Test__WeightMemoryEstimator, SingleDevice_CUDAPackedBytesGTNative)
     EXPECT_GE(est.device_bytes, est.native_bytes);
 }
 
+/**
+ * @test CUDA never admits more bytes than the GGUF stores for any catalogued format.
+ *
+ * Immutable source-native matrices are admitted at exactly the file density:
+ * the only permitted excess is the pool's 256-byte region alignment (at most
+ * four regions: payload, code/scale plane, superblock/minimum plane, effective
+ * minima) plus the 4-byte read padding of a bit-packed code plane. Formats whose
+ * execution layout drops a redundant source field (Q8_1's sum, Q8_K's bsums)
+ * are admitted below the file. Every geometry is superblock aligned, so any
+ * per-block plane that were silently reintroduced would exceed the bound by
+ * megabytes and fail.
+ */
+TEST(Test__WeightMemoryEstimator, CUDANeverAdmitsMoreThanTheGGUFStoresForAnyFormat)
+{
+    struct Shape { size_t rows, k, instances; const char *name; };
+    const Shape shapes[] = {
+        {4096, 4096, 1, "blk.0.ffn_gate.weight"},
+        {1024, 4096, 1, "blk.0.attn_q_a.weight"},
+        {4096, 2048, 1, "blk.0.ffn_down.weight"},
+        {2048, 4096, 32, "blk.0.ffn_gate_exps.weight"},
+    };
+    for (const auto &format : nativeFormats())
+    {
+        if (format.quant_type == "F32" || format.quant_type == "F16" || format.quant_type == "BF16")
+            continue; // Floating weights are covered by the floating-format sweep.
+        const auto *native = native_quantised_formats::forQuantType(format.quant_type);
+        ASSERT_NE(native, nullptr) << format.quant_type;
+        for (const auto &shape : shapes)
+        {
+            SCOPED_TRACE(format.quant_type + " " + shape.name);
+            ModelMemoryProfile profile;
+            profile.architecture = "qwen35moe";
+            profile.n_layers = 1;
+            profile.d_model = 4096;
+            profile.expert_count = static_cast<int>(shape.instances);
+            const size_t elements = shape.rows * shape.k * shape.instances;
+            const size_t file_bytes = static_cast<size_t>(static_cast<double>(elements) * format.bytes_per_weight);
+            profile.tensors = {TensorSizeInfo{shape.name, file_bytes, format.quant_type, elements, shape.k, 0}};
+            profile.total_native_bytes = file_bytes;
+            const auto cuda = WeightMemoryEstimator::estimate(profile, DeviceId::cuda(0));
+            EXPECT_EQ(cuda.native_bytes, file_bytes);
+            EXPECT_LE(cuda.device_bytes, file_bytes + 4u * 256u)
+                << "CUDA prepared bytes exceed the GGUF bytes beyond region alignment";
+            const bool drops_redundant_field = format.quant_type == "Q8_1" || format.quant_type == "Q8_K";
+            if (!drops_redundant_field)
+                EXPECT_GE(cuda.device_bytes, file_bytes) << "prepared bytes below the file lose information";
+            // Superblock formats store no per-block FP16 planes on CUDA: the
+            // legacy representation would cost at least 2 bytes per block more.
+            if (native->is_superblock)
+                EXPECT_LT(cuda.device_bytes, file_bytes + elements / 32u)
+                    << "per-block metadata planes reappeared on CUDA";
+        }
+    }
+}
+
 TEST(Test__WeightMemoryEstimator, SingleDevice_Q4KUsesCompactGPUPacking)
 {
     ModelMemoryProfile profile;

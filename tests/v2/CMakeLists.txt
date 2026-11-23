@@ -9668,6 +9668,34 @@ add_v2_test(V2_Unit_DeepSeekV4ImagePreprocess
     LABELS "V2;Unit;DeepSeekV4;Vision;Multimodal"
     MPI_PROCS 1 NO_MODELS TIMEOUT 60)
 
+# Every Spark-fitting Unsloth UD variant (real tensor inventories) must be
+# admitted at GGUF file density on CUDA.
+set(DSV4_UD_INVENTORY_HEADER "${CMAKE_CURRENT_BINARY_DIR}/model-fixtures/DeepSeekV4UDInventory.generated.h")
+add_custom_command(OUTPUT "${DSV4_UD_INVENTORY_HEADER}"
+    COMMAND ${CMAKE_COMMAND}
+        -DJINJA_INPUT=${CMAKE_CURRENT_SOURCE_DIR}/unit/planning/fixtures/deepseek_v4_ud_inventory.json
+        -DHEADER_OUTPUT=${DSV4_UD_INVENTORY_HEADER}
+        -DNAMESPACE=llaminar2::test::dsv4
+        -DSYMBOL=kUDInventory
+        -DSOURCE_URL=huggingface.co/unsloth/DeepSeek-V4-Flash-Vision-Exp-GGUF
+        -DLICENSE=MIT
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/EmbedJinjaTemplate.cmake
+    DEPENDS unit/planning/fixtures/deepseek_v4_ud_inventory.json
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/EmbedJinjaTemplate.cmake
+    VERBATIM)
+add_executable(v2_test_deepseek4_ud_weight_density
+    unit/planning/Test__DeepSeekV4UDVariantWeightDensity.cpp "${DSV4_UD_INVENTORY_HEADER}")
+target_include_directories(v2_test_deepseek4_ud_weight_density PRIVATE
+    "${CMAKE_CURRENT_BINARY_DIR}/model-fixtures" ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../external/vendor)
+target_link_libraries(v2_test_deepseek4_ud_weight_density llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Integration_DeepSeekV4UDVariantWeightDensity
+    COMMAND $<TARGET_FILE:v2_test_deepseek4_ud_weight_density>
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;DeepSeekV4;Memory;Admission;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_DeepSeekV4UDVariantWeightDensity)
+
 set(DSV4_VISION_GOLDEN_HEADER "${CMAKE_CURRENT_BINARY_DIR}/model-fixtures/DeepSeekV4VisionEncoderGolden.generated.h")
 add_custom_command(OUTPUT "${DSV4_VISION_GOLDEN_HEADER}"
     COMMAND ${CMAKE_COMMAND}
