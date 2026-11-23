@@ -204,14 +204,17 @@ namespace llaminar2
             if constexpr (ToCpu)
             {
                 reinterpret_cast<uint16_t *>(cpu_destination + metadata)[column] = source.scales[linear];
-                reinterpret_cast<uint16_t *>(cpu_destination + metadata + 2*columns)[column] = source.mins[linear];
+                // Single-scale units (no GPU secondary plane) store a zero secondary.
+                reinterpret_cast<uint16_t *>(cpu_destination + metadata + 2*columns)[column] =
+                    layout.gpu_is_asymmetric ? source.mins[linear] : uint16_t{0};
                 if (layout.gpu_has_emins)
                     reinterpret_cast<uint32_t *>(cpu_destination + metadata + 4*columns)[column] = source.emins[linear];
             }
             else
             {
                 destination.scales[linear] = reinterpret_cast<const uint16_t *>(cpu_source + metadata)[column];
-                destination.mins[linear] = reinterpret_cast<const uint16_t *>(cpu_source + metadata + 2*columns)[column];
+                if (layout.gpu_is_asymmetric)
+                    destination.mins[linear] = reinterpret_cast<const uint16_t *>(cpu_source + metadata + 2*columns)[column];
                 if (layout.gpu_has_emins)
                     destination.emins[linear] = reinterpret_cast<const uint32_t *>(cpu_source + metadata + 4*columns)[column];
             }

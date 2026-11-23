@@ -28,6 +28,7 @@
 #include "../../../utils/CPUExecutionTestGeometry.h"
 #include "tensors/NativeQuantisedFormatInfo.h"
 #include "tensors/NativeQuantisedScalePlane.h"
+#include "utils/HostPageSize.h"
 
 #include <gtest/gtest.h>
 
@@ -103,7 +104,6 @@ namespace llaminar2
     namespace
     {
         constexpr std::size_t kGpuAlignment = 256;
-        constexpr std::size_t kCpuCacheLine = 64;
         constexpr std::size_t kCpuPage = 4096;
 
         /** @return `value` rounded to one power-of-two test alignment. */
@@ -217,10 +217,11 @@ namespace llaminar2
                 static_cast<std::size_t>(spec.N), 64);
             const std::size_t units =
                 (padded_n / 64) * static_cast<std::size_t>(spec.K / 32);
+            // CPU expert slots are host-page aligned at every size
+            // (NUMAAllocator::externalRangeAlignment), including projections
+            // smaller than one page.
             const std::size_t logical = units * expectedCpuStride(format);
-            return testAlignUp(
-                logical,
-                logical >= kCpuPage ? kCpuPage : kCpuCacheLine);
+            return testAlignUp(logical, hostPageBytes());
         }
 
         /**
@@ -297,9 +298,9 @@ namespace llaminar2
                     std::max(
                         format.payload_bytes,
                         expectedMigrationPayload(format)),
-                    // Compact multi-scale migration keeps a secondary plane.
-                    format.is_asymmetric || format.codebook_id == 11 || format.codebook_id == 12 ||
-                        format.codebook_id == 15 || (format.codebook_id == 4 && format.is_superblock),
+                    // Dual-scale/minimum sources, IQ3_S and IQ4_XS keep a secondary
+                    // plane; single-scale IQ3_XXS/IQ2_XXS migrations carry none.
+                    format.is_asymmetric || format.codebook_id == 11 || (format.codebook_id == 4 && format.is_superblock),
                     format.has_emins,
                     nativeQuantisedScalePlaneBytes(format.codebook_id));
                 expected.gpu_shadow_bytes += expectedGpuProjectionBytes(
@@ -662,7 +663,7 @@ namespace llaminar2
             const auto expected =
                 expectedFootprint(model_manifest.front(), *source.metadata);
 
-            if (source.quant_type == "IQ4_XS")
+            if (source.quant_type == "IQ4_XS" && hostPageBytes() == kCpuPage)
             {
                 // N/K are gate96x64, up80x96, down64x128. Independent64-row
                 // CPU padding/page rounding gives8192+12288+8192 bytes.

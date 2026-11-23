@@ -450,10 +450,13 @@ namespace llaminar2
         if (source.codebook_id == 8 ||
             hasCompactMultiScaleVnniPayload(source.codebook_id))
         {
+            // Dual-scale/minimum sources keep their secondary plane; the
+            // single-scale IQ3_XXS/IQ2_XXS units carry none, exactly as their
+            // canonical representation and descriptor validation require.
             return {
                 .codebook_id = source.codebook_id,
                 .payload_bytes_per_block = static_cast<uint8_t>(source.payload_bytes),
-                .is_asymmetric = true,
+                .is_asymmetric = source.is_asymmetric,
                 .has_emins = source.has_emins,
             };
         }
