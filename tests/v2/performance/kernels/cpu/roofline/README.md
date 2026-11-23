@@ -604,3 +604,14 @@ generated tokens by the sum of recorded prefill and decode times.
 These results establish byte parity and recovery from the original
 prefill loss. The timing changes depend on execution order. Raw receipts
 are in `benchmark_results/qfn-cuda-2x2-95943372/direct-publication-release/grouped-linear-isolation/quiet/`.
+
+An isolated grouped FFN comparison held the weight sources, route order and
+arithmetic constant while changing the Down destination. Both Xeon sockets
+replayed 32 experts with three or 21 rows per expert, hidden width 2560,
+intermediate width 320, Q4_K Gate/Up and Q5_1 or Q8_0 Down. All eight cells
+matched the staged output byte-for-byte and preserved the packed route trailer.
+Direct writes into the existing packed records reduced median FFN latency by
+5.16–16.86%. Aligned direct writes reduced latency a further 0.67–2.66% relative
+to the packed records. The aligned comparison used a synthetic destination layout.
+The raw receipts are in
+`benchmark_results/qfn-cuda-2x2-95943372/direct-publication-release/down-output-layout-attribution/`.
