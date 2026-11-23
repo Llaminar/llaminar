@@ -9,6 +9,7 @@
  * codec widths from physical expanded payloads without changing publications.
  */
 
+#include "../../utils/TestTensorFactory.h"
 #include "execution/moe/ExpertTierWeightStream.h"
 #include "execution/moe/ExpertTierGpuBlobTransferLane.h"
 #include "execution/moe/CpuExpertSlotPool.h"
@@ -132,15 +133,19 @@ namespace llaminar2
             for (const auto &source : native_quantised_formats::kAllSourceFormats)
             {
                 SCOPED_TRACE(source.quant_type);
+                // Native Q5_K/IQ3_S require coded migration slots; their
+                // rejection is covered by CodedQ5KIQ3SRejectLegacyMigration.
+                if (source.metadata->is_superblock &&
+                    (source.metadata->codebook_id == 7 || source.metadata->codebook_id == 11))
+                    continue;
                 const auto physical = migrationStableDeviceVnniFormat(*source.metadata);
                 auto gpu = makeProjection(physical.codebook_id, physical.payload_bytes_per_block,
                     physical.is_asymmetric, source.metadata->is_superblock);
                 gpu.source_codebook_id = source.metadata->codebook_id;
                 gpu.has_emins = physical.has_emins;
-                if (physical.codebook_id == 11 || physical.codebook_id == 13)
+                if (physical.codebook_id == 13)
                     for (std::size_t block = 0; block < gpu.mins.size(); ++block)
-                        gpu.mins[block] = static_cast<std::uint16_t>(
-                            block & (physical.codebook_id == 11 ? 15u : 255u));
+                        gpu.mins[block] = static_cast<std::uint16_t>(block & 255u);
                 if (physical.has_emins)
                     gpu.emins.assign(gpu.scales.size(), 0xac002c00u);
 
@@ -161,22 +166,18 @@ namespace llaminar2
 
         TEST(ExpertTierWeightStream, SingleScaleNativeGridsRoundTripWithoutRequantization)
         {
-            for (const uint8_t codebook : {11, 12, 15, 16})
+            for (const uint8_t codebook : {12, 15, 16})
             {
                 SCOPED_TRACE(static_cast<int>(codebook));
                 const auto *format = native_quantised_formats::forSourceIdentity(codebook, true);
                 ASSERT_NE(format, nullptr);
                 auto original = makeProjection(codebook, format->payload_bytes,
-                                               format->is_asymmetric || codebook == 11, true);
+                                               format->is_asymmetric, true);
                 // Metadata identity includes signed zero and tiny scales:
                 // no absmax threshold may silently zero out a native block.
                 const std::array<uint16_t, 6> scale_bits{0, 0x8000, 1, 0x03ff, 0x0400, 0x8400};
                 for (size_t index = 0; index < original.scales.size(); ++index)
-                {
-                    const size_t source_index=index%original.N+size_t(original.N)*((index/original.N)/8);
-                    original.scales[index] = scale_bits[(codebook == 11 ? source_index : index) % scale_bits.size()];
-                    if (codebook == 11) original.mins[index]=uint16_t((index*7+3)&15u);
-                }
+                    original.scales[index] = scale_bits[index % scale_bits.size()];
                 cpu::native_quantised::CPUNativeQuantisedPackedWeights cpu;
                 std::string error;
                 ASSERT_TRUE(gpuToCpuExpertPackedReference(original, cpu, &error)) << error;
@@ -185,24 +186,11 @@ namespace llaminar2
                 EXPECT_EQ(expanded.source_codebook_id, codebook);
                 EXPECT_EQ(expanded.scales, original.scales);
                 EXPECT_EQ(expanded.mins, original.mins);
-                if(codebook == 11)
-                {
-                    EXPECT_TRUE(cpu.usesIQ3SExpandedSourceScale());
-                    EXPECT_EQ(cpu.interleaved_block_stride,2432);
-                    EXPECT_EQ(expanded.codebook_id,11);
-                    ASSERT_EQ(expanded.payload_bytes_per_block,13);
-                    EXPECT_EQ(expanded.payload,original.payload);
-                }
-                else
-                {
-                    // IQ3_XXS/IQ2_XXS/IQ1_S keep their native grid in the CPU
-                    // CompactMultiScale tier, so promotion returns the original
-                    // compact payload rather than an expanded signed-INT8 one.
-                    EXPECT_TRUE(cpu.usesCompactMultiScale());
-                    EXPECT_EQ(expanded.codebook_id, codebook);
-                    ASSERT_EQ(expanded.payload_bytes_per_block, format->payload_bytes);
-                    EXPECT_EQ(expanded.payload, original.payload);
-                }
+                // Single-scale grids keep their payloads rather than normalizing to INT8.
+                EXPECT_TRUE(cpu.usesCompactMultiScale());
+                EXPECT_EQ(expanded.codebook_id, codebook);
+                ASSERT_EQ(expanded.payload_bytes_per_block, format->payload_bytes);
+                EXPECT_EQ(expanded.payload, original.payload);
                 for (size_t index = 0; index < original.scales.size(); ++index)
                 {
                     std::array<int8_t, 32> values{}, returned_values{};
@@ -217,6 +205,58 @@ namespace llaminar2
                 ASSERT_EQ(returned.native_interleaved.size(), cpu.native_interleaved.size());
                 EXPECT_EQ(std::memcmp(returned.native_interleaved.data(),
                     cpu.native_interleaved.data(), cpu.native_interleaved.size()), 0);
+            }
+        }
+
+        /** @test Coded Q5_K and IQ3_S cannot enter the legacy stream in either direction. */
+        TEST(ExpertTierWeightStream, CodedQ5KIQ3SRejectLegacyMigration)
+        {
+            using namespace cpu::native_quantised;
+            using Factory = test::TestTensorFactory;
+            constexpr auto diagnostic = "Superblock-coded Q5_K and IQ3_S CPU units require coded GPU migration slots";
+            for (const auto *format : {&native_quantised_formats::Q5_K, &native_quantised_formats::IQ3_S})
+            {
+                SCOPED_TRACE(format->codebook_id);
+                const bool iq = format->codebook_id == 11;
+                std::unique_ptr<TensorBase> source;
+                if (iq)
+                    source = Factory::createIQ3_SRandom({67, 288}, 37);
+                else
+                    source = Factory::createQ5_KRandom({67, 288}, 37);
+                CPUNativeQuantisedPackedWeights cpu, rejected;
+                ASSERT_TRUE(packWeightsCPUNativeQuantised(source.get(), cpu));
+                ASSERT_TRUE(cpu.usesCompactMultiScale());
+                HostGpuExpertPackedProjection destination;
+                std::string error;
+                EXPECT_FALSE(cpuToGpuExpertPackedReference(cpu, destination, &error));
+                EXPECT_EQ(error, diagnostic);
+                const auto expectManifestReject = [&](const auto &make) {
+                    try
+                    {
+                        (void)make();
+                        ADD_FAILURE() << "Legacy stream manifest admitted a coded CPU unit";
+                    }
+                    catch (const std::invalid_argument &ex)
+                    {
+                        EXPECT_STREQ(ex.what(), diagnostic);
+                    }
+                };
+                expectManifestReject([&] {
+                    return makeCpuToGpuExpertTierWeightStreamManifest(cpu, 1, 0, 0, ExpertTierWeightProjection::Gate, 1);
+                });
+                expectManifestReject([&] {
+                    return makeGpuToCpuExpertTierWeightStreamManifest(*format, cpu.N, cpu.K,
+                        1, 0, 0, ExpertTierWeightProjection::Gate, 1);
+                });
+                const auto physical = migrationStableDeviceVnniFormat(*format);
+                auto gpu = makeProjection(physical.codebook_id, physical.payload_bytes_per_block,
+                    physical.is_asymmetric, true);
+                gpu.source_codebook_id = format->codebook_id;
+                if (iq)
+                    std::fill(gpu.mins.begin(), gpu.mins.end(), 9u);
+                ASSERT_TRUE(gpu.valid(&error)) << error;
+                EXPECT_FALSE(gpuToCpuExpertPackedReference(gpu, rejected, &error));
+                EXPECT_EQ(error, diagnostic);
             }
         }
 
@@ -884,8 +924,8 @@ namespace llaminar2
         TEST(CpuExpertSlotPool, AcquisitionWithdrawsAdmissionUntilArrival)
         {
             const NativeQuantisedSourceIdentity identity{
-                .codebook_id = native_quantised_formats::IQ3_S.codebook_id,
-                .is_superblock = native_quantised_formats::IQ3_S.is_superblock,
+                .codebook_id = native_quantised_formats::IQ4_XS.codebook_id,
+                .is_superblock = native_quantised_formats::IQ4_XS.is_superblock,
                 .present = true,
             };
             auto pool = CpuExpertSlotPool::createForTest({
@@ -909,8 +949,8 @@ namespace llaminar2
                 EXPECT_EQ(projection.destination_bytes.data(), root);
                 EXPECT_FALSE(packed->publicationSealed());
                 EXPECT_DEATH((void)packed->readView(), "not admitted");
-                // Epoch-distinct payload with in-range IQ3_S coefficient words
-                // (<= 15) in every unit; only epoch 3 then corrupts one word.
+                // Epoch-distinct payload with in-range IQ4_XS coefficient words
+                // (<= 63) in every unit; only epoch 3 then corrupts one word.
                 std::fill(projection.destination_bytes.begin(), projection.destination_bytes.end(),
                     static_cast<std::uint8_t>(epoch));
                 const std::size_t units = std::size_t(packed->N_padded / 64) * std::size_t(packed->blocks_per_row);
@@ -926,7 +966,7 @@ namespace llaminar2
                     }
                 if (epoch == 3)
                 {
-                    const std::uint16_t reserved = 0x0010;
+                    const std::uint16_t reserved = 0x0040;
                     std::memcpy(secondary(units / 2) + 17 * 2, &reserved, sizeof(reserved));
                     EXPECT_THROW(projection.engine->admitCPUNativeQuantisedPublication(), std::invalid_argument);
                     EXPECT_FALSE(packed->publicationSealed());

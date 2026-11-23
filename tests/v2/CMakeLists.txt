@@ -32326,6 +32326,14 @@ add_v2_test(V2_Integration_CPUPreparedNativeReadPublication
     TIMEOUT 60 NO_MODELS MPI_PROCS 1)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUPreparedNativeReadPublication)
 
+# New coded Q5_K and IQ3_S units must not enter the legacy expert conversion.
+add_v2_test(V2_Integration_CPUCodedQ5KIQ3STierAdmission
+    COMMAND $<TARGET_FILE:v2_test_expert_tier_weight_stream>
+        --gtest_filter=ExpertTierWeightStream.CodedQ5KIQ3SRejectLegacyMigration
+    LABELS "V2;Integration;DeviceFree;CPU;NativeQuantised;Movement;Regression"
+    TIMEOUT 60 NO_MODELS MPI_PROCS 1)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUCodedQ5KIQ3STierAdmission)
+
 # Overlay slot reuse opens a new publication generation at the same address;
 # arrival admission is the only way the slot's engine becomes executable.
 add_v2_test(V2_Integration_CPUNativeQuantisedSlotReuseAdmission

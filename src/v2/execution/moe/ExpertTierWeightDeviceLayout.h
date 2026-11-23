@@ -134,6 +134,12 @@ namespace llaminar2
             size_t(count-regular)*(stride/64)*(rows%columns_per_unit);
     }
 
+    /** @return Whether the source's new coded unit is awaiting coded GPU migration slots. */
+    [[nodiscard]] constexpr bool requiresCodedQ5KIQ3SMigrationSlots(std::uint8_t codebook, bool superblock) noexcept
+    {
+        return superblock && (codebook == 7 || codebook == 11);
+    }
+
     /**
      * @brief Native CPU root and bounded encoded wire geometry, with no GPU metadata.
      *
@@ -161,6 +167,8 @@ namespace llaminar2
                !native_quantised_formats::forSourceIdentity(cpu_codebook_id,cpu_is_superblock!=0) ||
                !cpu::native_quantised::isKnownPreparedEncoding(cpu_encoding) ||
                codedSourceScaleStreamRejection(cpu_encoding) ||
+               (cpu_encoding == cpu::native_quantised::CPUNativeQuantisedEncoding::CompactMultiScale &&
+                requiresCodedQ5KIQ3SMigrationSlots(cpu_codebook_id, cpu_is_superblock != 0)) ||
                cpu_data_stride!=cpu::native_quantised::preparedDataStride(cpu_encoding,cpu_codebook_id) ||
                cpu_block_stride!=cpu::native_quantised::preparedInterleavedBlockStride(cpu_encoding,cpu_is_asymmetric!=0,cpu_codebook_id))return false;
             const uint64_t expected=((uint64_t(N)+wire_columns_per_unit-1)/wire_columns_per_unit)*blocks_per_row;
@@ -251,6 +259,8 @@ namespace llaminar2
                 direction == ExpertTierWeightConversionDirection::CpuToGpu;
             // CPU kernels consume whole 32-K blocks and 64-column N units.
             if ((!gpu_to_cpu && !cpu_to_gpu) ||
+                ((gpu_to_cpu || cpu_encoding == Encoding::CompactMultiScale) &&
+                 requiresCodedQ5KIQ3SMigrationSlots(cpu_codebook_id, cpu_is_superblock != 0)) ||
                 N <= 0 || N>std::numeric_limits<int32_t>::max()-63 ||
                 cpu_N>std::numeric_limits<int32_t>::max()-63 || K <= 0 || (K % 32) != 0 ||
                 blocks_per_row != K / 32 || N_padded < N ||

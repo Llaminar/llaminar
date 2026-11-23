@@ -86,6 +86,9 @@ namespace llaminar2
             return true;
         }
 
+        constexpr char kCodedQ5KIQ3SMigrationDiagnostic[] =
+            "Superblock-coded Q5_K and IQ3_S CPU units require coded GPU migration slots";
+
         /**
          * @brief Identify GPU formats retained as compact nibble CPU payloads.
          * @param codebook NativeQuantised execution codebook.
@@ -285,6 +288,9 @@ namespace llaminar2
                 return reject(error, "CPU packed encoding is unknown");
             if (const char *reason = codedSourceScaleStreamRejection(cpu.encoding))
                 return reject(error, reason);
+            if (cpu.usesCompactMultiScale() &&
+                requiresCodedQ5KIQ3SMigrationSlots(cpu.codebook_id, cpu.is_superblock))
+                return reject(error, kCodedQ5KIQ3SMigrationDiagnostic);
             // Source provenance must identify exactly one of the 21 cataloged
             // formats even when its final CPU bytes have been normalized.
             if (native_quantised_formats::forSourceIdentity(
@@ -597,6 +603,10 @@ namespace llaminar2
             return reject(error, "Tier stream CPU encoding is invalid");
         if (const char *reason = codedSourceScaleStreamRejection(cpu_encoding))
             return reject(error, reason);
+        if ((destination_packing == ExpertTierWeightPacking::CpuNativeQuantisedInterleaved ||
+             cpu_encoding == CPUEncoding::CompactMultiScale) &&
+            requiresCodedQ5KIQ3SMigrationSlots(cpu_codebook_id, cpu_is_superblock != 0))
+            return reject(error, kCodedQ5KIQ3SMigrationDiagnostic);
         // Re-derive strides rather than accepting redundant wire fields on trust.
         const uint32_t expected_data_stride =
             cpu::native_quantised::preparedDataStride(cpu_encoding, cpu_codebook_id);
@@ -1088,6 +1098,9 @@ namespace llaminar2
                 "Tier stream GPU source descriptor is not a canonical catalog format");
         }
 
+        if (requiresCodedQ5KIQ3SMigrationSlots(source_format.codebook_id, source_format.is_superblock))
+            throw std::invalid_argument(kCodedQ5KIQ3SMigrationDiagnostic);
+
         const CPUEncoding cpu_encoding =
             cpu::native_quantised::preparedEncodingForSource(source_format);
         ExpertTierWeightStreamManifest manifest;
@@ -1498,6 +1511,8 @@ namespace llaminar2
         // Region and codebook validation prevents out-of-bounds source reads.
         if (!gpu.valid(error))
             return false;
+        if (requiresCodedQ5KIQ3SMigrationSlots(gpu.source_codebook_id, gpu.is_superblock))
+            return reject(error, kCodedQ5KIQ3SMigrationDiagnostic);
         if (!cpu::native_quantised::is_payload_decodable(gpu.codebook_id) &&
             gpu.codebook_id != kNativeQuantisedIQ4XSSourceScaleCodebook &&
             !hasCompactMultiScaleVnniPayload(gpu.codebook_id) && gpu.codebook_id != 8 &&
