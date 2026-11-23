@@ -134,6 +134,46 @@ namespace llaminar2::deepseek4
             return m;
         }
 
+        /**
+         * @brief Take the fused [3D, D] attention projection and its bias.
+         *
+         * llama.cpp-converted projectors carry one fused attn_qkv; Unsloth's
+         * published deepseek4v mmproj carries separate attn_q/attn_k/attn_v
+         * (each [D, D] with a bias). The forward pass reads output columns
+         * [q | k | v], so stacking the separate matrices' rows in that order
+         * reproduces the fused matrix exactly: a lossless copy of the stored
+         * BF16/F16/F32 values with no arithmetic change.
+         */
+        std::pair<VisionMatrix, std::vector<float>> takeQKV(std::map<std::string, VisionHostTensor> &t,
+                                                             const std::string &pre, std::size_t D)
+        {
+            if (t.count(pre + "attn_qkv.weight"))
+            {
+                auto w = takeMatrix(t, pre + "attn_qkv.weight", {D, 3 * D}, 3 * D);
+                return {std::move(w), take(t, pre + "attn_qkv.bias", {3 * D})};
+            }
+            VisionMatrix fused;
+            std::vector<float> bias;
+            bias.reserve(3 * D);
+            for (const char *part : {"attn_q", "attn_k", "attn_v"})
+            {
+                auto w = takeMatrix(t, pre + part + ".weight", {D, D}, D);
+                if (fused.rows == 0)
+                {
+                    fused.cols = w.cols;
+                    fused.precision = w.precision;
+                }
+                else if (w.precision != fused.precision)
+                    throw std::invalid_argument("DeepSeek-V4 mmproj " + pre + "attn_q/k/v disagree on precision");
+                fused.rows += w.rows;
+                fused.f32.insert(fused.f32.end(), w.f32.begin(), w.f32.end());
+                fused.half_bits.insert(fused.half_bits.end(), w.half_bits.begin(), w.half_bits.end());
+                const auto b = take(t, pre + part + ".bias", {D});
+                bias.insert(bias.end(), b.begin(), b.end());
+            }
+            return {std::move(fused), std::move(bias)};
+        }
+
         /** @brief Row-major C[m, n] = alpha * op(A) . op(B); fatal on a oneDNN error. */
         void sgemm(char ta, char tb, int m, int n, int k, float alpha, const float *a, int lda, const float *b, int ldb,
                    float *c, int ldc)
@@ -237,8 +277,7 @@ namespace llaminar2::deepseek4
             const std::string pre = "v.blk." + std::to_string(i) + ".";
             Layer layer;
             layer.ln1 = take(t, pre + "ln1.weight", {D});
-            layer.qkv_w = takeMatrix(t, pre + "attn_qkv.weight", {D, 3 * D}, 3 * D);
-            layer.qkv_b = take(t, pre + "attn_qkv.bias", {3 * D});
+            std::tie(layer.qkv_w, layer.qkv_b) = takeQKV(t, pre, D);
             layer.out_w = takeMatrix(t, pre + "attn_out.weight", {D, D}, D);
             layer.out_b = take(t, pre + "attn_out.bias", {D});
             layer.ln2 = take(t, pre + "ln2.weight", {D});

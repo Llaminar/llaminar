@@ -115,6 +115,56 @@ TEST(DeepSeekV4VisionEncoder, MatchesReferenceOnSyntheticTower)
     EXPECT_THROW(encoder.sentinel(ImageSentinel::Image), std::invalid_argument);
 }
 
+/**
+ * @test Unsloth's published mmproj stores separate attn_q/attn_k/attn_v; the
+ * real file failed to load because only the fused attn_qkv was accepted. A
+ * split tower must encode bit-identically to the fused one.
+ */
+TEST(DeepSeekV4VisionEncoder, SplitQKVProjectorEncodesIdenticallyToFused)
+{
+    const auto golden = nlohmann::json::parse(test::dsv4::kVisionEncoderGolden);
+    const std::size_t D = golden["dim"].get<std::size_t>();
+    auto split = tensors(golden);
+    for (int layer = 0; layer < golden["layers"].get<int>(); ++layer)
+    {
+        const std::string pre = "v.blk." + std::to_string(layer) + ".";
+        const auto w = split.at(pre + "attn_qkv.weight");
+        const auto b = split.at(pre + "attn_qkv.bias");
+        split.erase(pre + "attn_qkv.weight");
+        split.erase(pre + "attn_qkv.bias");
+        const char *parts[] = {"attn_q", "attn_k", "attn_v"};
+        for (std::size_t part = 0; part < 3; ++part)
+        {
+            VisionHostTensor pw, pb;
+            pw.shape = {D, D};
+            pw.data.assign(w.data.begin() + part * D * D, w.data.begin() + (part + 1) * D * D);
+            pb.shape = {D};
+            pb.data.assign(b.data.begin() + part * D, b.data.begin() + (part + 1) * D);
+            split.emplace(pre + parts[part] + ".weight", std::move(pw));
+            split.emplace(pre + parts[part] + ".bias", std::move(pb));
+        }
+    }
+    DeepSeekV4VisionEncoder fused(tensors(golden), VisionPreprocessConfig{}, golden["layers"], golden["heads"]);
+    DeepSeekV4VisionEncoder separate(std::move(split), VisionPreprocessConfig{}, golden["layers"], golden["heads"]);
+    EXPECT_EQ(separate.weightBytes(), fused.weightBytes());
+    const auto &c = golden["cases"][0];
+    PreparedImage img;
+    img.vit_h = c["vit_h"];
+    img.vit_w = c["vit_w"];
+    img.llm_h = (img.vit_h + 2) / 3;
+    img.llm_w = (img.vit_w + 2) / 3;
+    img.patches = synth(1000 + img.vit_h * 10 + img.vit_w, static_cast<std::size_t>(img.vit_h) * img.vit_w * 588, 1.0f);
+    for (auto &v : img.patches) v = bf16(v);
+    buildImageBlock(img.llm_h, img.llm_w, img.block, img.perm);
+    EXPECT_EQ(separate.encode(img), fused.encode(img));
+
+    // A missing split part is still rejected.
+    auto missing = tensors(golden);
+    missing.erase("v.blk.0.attn_qkv.weight");
+    EXPECT_THROW(DeepSeekV4VisionEncoder(missing, VisionPreprocessConfig{}, golden["layers"], golden["heads"]),
+                 std::invalid_argument);
+}
+
 /** @test Missing or mis-shaped tensors are rejected at construction. */
 TEST(DeepSeekV4VisionEncoder, RejectsInconsistentProjector)
 {

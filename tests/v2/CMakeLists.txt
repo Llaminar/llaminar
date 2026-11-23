@@ -9709,6 +9709,13 @@ add_v2_test(V2_Integration_DeepSeekV4VisionTowerAdmission
 # A BF16 projector was widened to FP32 (2x its file) while admission priced the
 # file bytes, and the workspace counted floats as bytes for eight concurrent
 # images. Matrices now stay 16-bit and the counters match the loaded tower.
+# Unsloth's published mmproj stores separate attn_q/attn_k/attn_v; the real
+# file failed to load while only the fused attn_qkv was accepted.
+add_v2_test(V2_Integration_DeepSeekV4VisionSplitQKV
+    COMMAND $<TARGET_FILE:v2_test_deepseek4_vision_encoder>
+            --gtest_filter=DeepSeekV4VisionEncoder.SplitQKVProjectorEncodesIdenticallyToFused
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;DeepSeekV4;Vision;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 60)
 add_v2_test(V2_Integration_DeepSeekV4VisionBF16Residency
     COMMAND $<TARGET_FILE:v2_test_deepseek4_vision_encoder>
             --gtest_filter=DeepSeekV4VisionEncoder.BF16MmprojStaysHalfPrecisionAndEncodesExactly
