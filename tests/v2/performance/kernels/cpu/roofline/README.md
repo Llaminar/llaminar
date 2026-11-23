@@ -425,6 +425,16 @@ The ordinary probe's rank 1 local execution averaged 264.19 µs.
 Its 15.426 MB of compulsory operands per call gives 58.39 GB/s, or 53.1%
 of the 110 GB/s simultaneous socket reference.
 
+A separate phase trace timed the same 2,976 ordinary calls with counters
+inside the prepared CPU worker team. Gate/Up averaged 94.07 µs for 8.19 MB
+per call, reaching 87.02 GB/s or 79.1% of the socket reference. Down
+averaged 76.41 µs for 7.24 MB per call, reaching 94.74 GB/s or 86.1%. The
+two arithmetic phases together reached 82.3%. The complete prepared FFN,
+including plan construction, team entry, both completion edges, SwiGLU Q8,
+and retirement, averaged 184.88 µs and reached 83.43 GB/s or 75.8%. The
+outer service figure above is from the separate, minimally instrumented
+probe and includes the endpoint's other work.
+
 | Arm order | Mode | Decode, control → isolated tok/s | Decode change | Complete throughput change |
 | --- | --- | ---: | ---: | ---: |
 | Candidate first | Ordinary | 29.598 → 32.069 | +8.35% | +7.04% |
