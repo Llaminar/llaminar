@@ -637,6 +637,14 @@ The isolated replay supplies prepared operands. Production verifier and
 drafter qualification also requires the original runtime route publication,
 shared-gate and collective edges, and a paired complete transaction.
 
+A separate native capture used the original route map to partition live
+work into canonical and relocated decoder directories. Both RTX 3090s
+matched the recorded serial Q4_K/Q5_1 publication across partial and empty
+frames. The sparse frames required exact zeros for remote slots and preserved
+poisoned inactive slots. The device grid witness checked the live extent of
+both dependent arithmetic nodes. Qualification of the complete production
+verifier also measures the router, local projection, fold and collective.
+
 ### CUDA peer transfers at QFN decode sizes
 
 The two QFN RTX 3090s report direct access in both directions over the
@@ -1581,3 +1589,32 @@ indexed sources that benefit from packet ownership. Both geometries used
 zero local bytes. The wider block allocates more threads per CTA when the
 grid has only 40 output packets. At 100 packets its resource limit can
 force a second wave on the two RTX 3090s.
+
+### Indexed lookup preparation
+
+The ten-route screen compared read-only global lookup operands with
+CTA-local copies of the same original IQ tables. The 100 captures passed
+the staged byte oracle. The eight-warp program with the IQ2 table prepared
+before traversal took 9.152 µs for IQ2_XXS, 12.384–12.448 µs for IQ2_S and
+11.712 µs for IQ2_XS. The staged controls took 9.536, 13.440 and 13.376 µs.
+The original split-K IQ1_M and IQ1_S stages remain faster than their
+CTA-owned alternatives even with the full signed IQ1 table staged.
+
+### Replicated drafter
+
+Both native cards ran the same fully local router and expert transaction.
+One card used packet ownership and the other used the staged control.
+Reversing the card roles preserved exact route IDs, route weights, and
+final output bytes for all sources. The eight-route captures used H=2560
+and source-legal widths of 512 and 640.
+
+| Width | Original sources per card | Gate/Up latency reduction | Complete graph latency reduction |
+| --- | ---: | ---: | ---: |
+| 512 | 21 | 8.3–23.1% | 1.4–6.3% |
+| 640 | 7 | 8.6–14.4% | 1.9–5.0% |
+
+At width 640, Q8_0 Gate/Up took 35.2 µs and the complete routed-expert
+graph took 90.11–91.14 µs. The staged graph took 93.70–94.21 µs. These
+captures measure one live replica row. The production predictor's counted
+row contract also permits empty replay, which requires device-sized launch
+admission.

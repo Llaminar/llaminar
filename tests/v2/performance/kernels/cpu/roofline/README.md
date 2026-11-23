@@ -271,7 +271,43 @@ socket. Down used the same source at width 256 and Q8_0 at width 320.
 
 The width-320, one-row Q4_K Gate/Up and Q8_0 Down case improved 7.8–16.1%
 across sockets and arm orders. Other sources and work shapes gave mixed
-results. Production uses the original per-worker planner.
+results in that comparison.
+
+The follow-up alternated the complete original and prepared transactions
+inside the same process. Both arms reused the same prepared weights,
+activations, worker team and partial bank. All 48 runs checked the serial
+bytes before and after sampling. Across the three original QFN source pairs
+and four, six, eight and ten live experts on both sockets, all 24 cells
+improved in both orders. The median paired improvement was 8.35%, with
+order medians from 5.25% to 14.69%.
+
+At width 320 with Q8_0 Down, 20 of the 21 Gate/Up sources improved in
+each order on both sockets. Across all sources, one-row medians improved
+5.84–6.32%. The repeated orders added 0.79% and 0.93% to IQ1_M. The four-row
+medians changed by less than 0.6%. At width 256, one-row results varied by
+source and four-row results were essentially flat.
+
+The Release candidate for owner-side planning uses AVX-512 VNNI,
+H=2560, F=320, a standalone fixed worker team, and one live decode row per
+expert. The candidate's focused preflight case compares all 21 original Gate/Up
+sources and both Q5_1 and Q8_0 Down sources with the serial path. It checks
+Gate, Up, the SwiGLU Q8 publication, and Down, including untouched tails
+after the live expert count shrinks. It also verifies admission with
+1, 3, and 7 workers. IQ1_M retains the per-worker schedule based on the
+repeated-order measurements.
+
+The rerun used the staged CUDA graph, identical F320/S320 sharding, and
+three measured 256-token requests per mode and arm after warmup. Every
+prompt, token history, and per-request MTP work count matched. The complete
+column measures prefill and decode time together. The opposite arm orders
+gave opposite throughput changes, so owner-side planning remains experimental.
+
+| Arm order | Mode | Decode, control → candidate tok/s | Decode change | Complete throughput change |
+| --- | --- | ---: | ---: | ---: |
+| Candidate first | Ordinary | 29.412 → 29.618 | +0.70% | +0.52% |
+| Candidate first | Fixed depth seven | 43.409 → 43.673 | +0.61% | +0.43% |
+| Control first | Ordinary | 29.988 → 29.566 | −1.41% | −1.32% |
+| Control first | Fixed depth seven | 44.137 → 43.430 | −1.60% | −1.50% |
 
 The sealed IQ4 scale probe resolved the scale program at output-tile entry.
 The IQ4_XS packet loop consumed coefficients validated at weight publication.
