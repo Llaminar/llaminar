@@ -669,7 +669,7 @@ namespace llaminar2::cpu::native_quantised
                             if constexpr (multi_scale::usesRowPairs<Ops>)
                             {
                                 I unused[Rows]{};
-                                pairBlock<Ops, Encoding::Q4KSuperblockCoded, NibbleMap::Unsigned>(unit, column, block, dots, unused);
+                                pairBlock<Ops, Encoding::Q4KSuperblockCoded, NibbleMap::Unsigned, 0>(unit, column, block, dots, unused);
                             }
                             else if constexpr (Rows >= 3 && Ops::instruction == Dot::ASIMD)
                             {
