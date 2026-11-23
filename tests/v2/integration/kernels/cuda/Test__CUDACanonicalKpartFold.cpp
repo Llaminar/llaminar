@@ -13,6 +13,7 @@
  */
 #include "backends/cuda/CUDAHardwareMetadata.h"
 #include <gtest/gtest.h>
+#include "kernels/common/NativeQuantisedScaleLoad.h"
 #include <cuda_runtime.h>
 
 #include "backends/cuda/CUDAGraphCapture.h"
@@ -37,13 +38,13 @@ extern "C"
     void cudaNativeQuantisedGemvSweep_setGroupedRows(int);
     void cudaNativeQuantisedGemvTuned_setDecodeEquivalentM1Config(int);
     bool cudaNativeQuantisedGemvTuned_small_m_fp32(
-        const int8_t *, const uint8_t *, const uint16_t *, const uint16_t *,
-        const uint32_t *, float *, const float *, int, int, int, float, float,
+        const int8_t *, const uint8_t *, ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes,
+         float *, const float *, int, int, int, float, float,
         const float *, const float *, uint8_t, int, void *, CUDAGemvContext *,
         CUDARowMajorWeights **);
     bool cudaNativeQuantisedGemvTuned_fp32(
-        const int8_t *, const uint8_t *, const uint16_t *, const uint16_t *,
-        const uint32_t *, float *, const float *, int, int, float, float,
+        const int8_t *, const uint8_t *, ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes,
+         float *, const float *, int, int, float, float,
         const float *, const float *, uint8_t, int, void *, CUDAGemvContext *,
         CUDARowMajorWeights **);
 }
@@ -245,7 +246,7 @@ void verify(int codebook, int payload_bytes, int m, int n, int k,
             // One real grouped launch inherits the fused serial schedule; it
             // must not become a row-replay implementation under this policy.
             ASSERT_TRUE(cudaNativeQuantisedGemvTuned_small_m_fp32(
-                a.data, p.data, s.data, secondary_s.data, em.data, output.data,
+                a.data, p.data, ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes{s.data, secondary_s.data, em.data, 0}, output.data,
                 sa.data, m, n, k, alpha, beta,
                 affine ? (in_place ? output.data : old.data) : nullptr,
                 affine ? b.data : nullptr, codebook, 0, stream,
@@ -259,12 +260,12 @@ void verify(int codebook, int payload_bytes, int m, int n, int k,
             const auto *row_scales = sa.data + static_cast<size_t>(row) * (k / 32);
             if (path == 0 || path >= 3)
                 ASSERT_TRUE(cudaNativeQuantisedGemvTuned_fp32(
-                    activation, p.data, s.data, secondary_s.data, em.data, output.data + offset,
+                    activation, p.data, ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes{s.data, secondary_s.data, em.data, 0}, output.data + offset,
                     row_scales, n, k, alpha, beta, existing, affine ? b.data : nullptr,
                     codebook, 0, stream, execution.context.get(), nullptr));
             else
                 ASSERT_TRUE(cudaNativeQuantisedGemvTuned_fusedKpar_fp32(
-                    activation, p.data, s.data, secondary_s.data, em.data, output.data + offset,
+                    activation, p.data, ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes{s.data, secondary_s.data, em.data, 0}, output.data + offset,
                     row_scales, n, alpha, beta, existing, affine ? b.data : nullptr,
                     codebook, 0, stream, *plan));
         }
@@ -355,8 +356,7 @@ TEST(CUDACanonicalKpartFold, RejectsInvalidBindingsBeforeSubmission)
     const auto plan = *CUDACanonicalKpartFoldPlan::create(CUDACanonicalKpartColumns::Sixteen, 1, 32);
     const auto submit = [&](uint8_t cb, void *stream, int device, const int8_t *activation,
                             float beta, const uint16_t *primary) {
-        return cudaNativeQuantisedGemvTuned_fusedKpar_fp32(activation, p.data, primary, nullptr,
-            nullptr, out.data, scales.data, 1, 1.0f, beta, nullptr, nullptr, cb, device, stream, plan);
+        return cudaNativeQuantisedGemvTuned_fusedKpar_fp32(activation, p.data, ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes{primary, nullptr, nullptr, 0}, out.data, scales.data, 1, 1.0f, beta, nullptr, nullptr, cb, device, stream, plan);
     };
     // Admission failures must leave a live recording usable. In particular,
     // stream ownership queries may not invalidate capture as a side effect.

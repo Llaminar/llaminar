@@ -2430,7 +2430,7 @@ static_assert(offsetof(DeviceNativeQuantisedMatrixDesc,payload)==0 &&
     offsetof(DeviceNativeQuantisedMatrixDesc,source_codebook_id)==48 &&
     offsetof(DeviceNativeQuantisedMatrixDesc,source_is_superblock)==49 &&
     offsetof(DeviceNativeQuantisedMatrixDesc,source_identity_present)==50 &&
-    offsetof(DeviceNativeQuantisedMatrixDesc,reserved)==51 &&
+    offsetof(DeviceNativeQuantisedMatrixDesc,metadata_layout)==51 &&
     offsetof(DeviceNativeQuantisedMatrixDesc,reserved_tail)==52,
     "Canonical NativeQuantised descriptor must retain every original ROCm ABI field");
 
@@ -2685,6 +2685,9 @@ __device__ __forceinline__ bool native_quantised_desc_shape_ok(
     using Traits = NATIVE_QUANTISEDTraits<FMT>;
     return desc.payload &&
            desc.scales &&
+           // ROCm readers consume per-block planes only; a superblock-coded
+           // descriptor (CUDA-produced) must never reach them.
+           desc.metadata_layout == 0u &&
            desc.n == N &&
            desc.k == K &&
            desc.blocks_per_row == static_cast<uint32_t>(K / 32) &&

@@ -274,6 +274,18 @@ namespace llaminar2::cpu::native_quantised::multi_scale
     }
 
     /**
+     * @brief Whether a compact codebook carries one weight scale per 32-value block.
+     *
+     * IQ3_XXS (12), IQ2_XXS (15) and IQ1_S (16) share the compact payload
+     * family but publish the GPU's single-scale contribution: one scale for the
+     * whole block (IQ1_S adds its additive minimum), never two half scales.
+     */
+    constexpr bool isSingleScaleCompactCodebook(int codebook) noexcept
+    {
+        return codebook == 12 || codebook == 15 || codebook == 16;
+    }
+
+    /**
      * @brief Scalar diagnostic oracle for one multi-scale block, never a production dispatch.
      * @param packed Native immutable representation.
      * @param a Quantized activation block.
@@ -307,6 +319,16 @@ namespace llaminar2::cpu::native_quantised::multi_scale
         const float scale0 = packed.blockScale(chunk, kb, column);
         const float scale1 = packed.blockMin(chunk, kb, column);
         const float activation_scale = nativeQuantisedFP16ScaleToFP32(a.d);
+        if (isSingleScaleCompactCodebook(packed.codebook_id))
+        {
+            // GPU singleScaleBlock: (activation * weight scale) * dot, plus the
+            // IQ1_S additive minimum through singleScaleCorrection.
+            float contribution = (activation_scale * scale0) * static_cast<float>(dots[0] + dots[1]);
+            if (packed.codebook_id == 16)
+                contribution += (activation_scale * scale1) *
+                                static_cast<float>(sums[0] + sums[1] + sums[2] + sums[3]);
+            return contribution;
+        }
         float contribution = activation_scale * (scale0 * dots[0] + scale1 * dots[1]);
         if (packed.codebook_id == 10)
         {
@@ -725,9 +747,21 @@ namespace llaminar2::cpu::native_quantised::multi_scale
                             sum0 = activationHalfSum(a.qs);
                             sum1 = static_cast<int>(a.sum_qs) - sum0;
                         }
+                        const F activation_scale = F{} + nativeQuantisedFP16ScaleToFP32(a.d);
+                        if constexpr (isSingleScaleCompactCodebook(Codebook))
+                        {
+                            // GPU singleScaleBlock over the exact whole-block
+                            // integer dot; IQ1_S adds singleScaleCorrection.
+                            const int whole_sum = static_cast<int>(a.sum_qs);
+                            const F dot = __builtin_convertvector(low[row] + high[row] - center * whole_sum, F);
+                            F contribution = (activation_scale * scale0) * dot;
+                            if constexpr (Codebook == 16)
+                                contribution += (activation_scale * scale1) * static_cast<float>(whole_sum);
+                            acc[row] += contribution;
+                            continue;
+                        }
                         const F dot0 = __builtin_convertvector(low[row] - center * sum0, F);
                         const F dot1 = __builtin_convertvector(high[row] - center * sum1, F);
-                        const F activation_scale = F{} + nativeQuantisedFP16ScaleToFP32(a.d);
                         const F term0 = scale0 * dot0;
                         const F term1 = scale1 * dot1;
                         F contribution = activation_scale * (term0 + term1);

@@ -38,20 +38,29 @@ multimodal::ExpandedPrompt DeepSeekV4PromptImageEncoder::expand(
     encoded.reserve(images.size());
     for (std::size_t i = 0; i < images.size(); ++i)
     {
-        multimodal::RgbImage rgb;
-        try
         {
-            rgb = multimodal::decodeImage(images[i], kMaxDecodedPixels);
+            // The decoded RGB is the largest transient (up to the decode pixel
+            // bound); it dies before the encoder workspace exists.
+            multimodal::RgbImage rgb;
+            try
+            {
+                rgb = multimodal::decodeImage(images[i], kMaxDecodedPixels);
+            }
+            catch (const std::exception &error)
+            {
+                throw std::invalid_argument("image " + std::to_string(i) + " could not be decoded: " + error.what());
+            }
+            prepared.push_back(prepareImage(rgb, encoder_->preprocessConfig()));
+            LOG_DEBUG("[Vision] image " << i << " " << rgb.width << "x" << rgb.height << " -> ViT " << prepared.back().vit_h
+                      << "x" << prepared.back().vit_w << ", aligner " << prepared.back().llm_h << "x" << prepared.back().llm_w
+                      << ", block " << prepared.back().block.size() << " tokens");
         }
-        catch (const std::exception &error)
-        {
-            throw std::invalid_argument("image " + std::to_string(i) + " could not be decoded: " + error.what());
-        }
-        prepared.push_back(prepareImage(rgb, encoder_->preprocessConfig()));
-        LOG_DEBUG("[Vision] image " << i << " " << rgb.width << "x" << rgb.height << " -> ViT " << prepared.back().vit_h
-                  << "x" << prepared.back().vit_w << ", aligner " << prepared.back().llm_h << "x" << prepared.back().llm_w
-                  << ", block " << prepared.back().block.size() << " tokens");
+        // Prompt expansion needs only each image's geometry and block order:
+        // the resized pixels and, after encoding, the patches are released so
+        // a request retains one image's input at a time.
+        std::vector<std::uint8_t>().swap(prepared.back().pixels.rgb);
         encoded.push_back(encoder_->encode(prepared.back()));
+        std::vector<float>().swap(prepared.back().patches);
     }
     std::array<const std::vector<float> *, kImageSentinelCount> sentinels{};
     for (int t = 0; t < kImageSentinelCount; ++t)

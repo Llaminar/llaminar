@@ -316,10 +316,10 @@ namespace llaminar2::test
             packed.is_asymmetric = false;
             packed.is_superblock = false;
             packed.data_stride = static_cast<int>(
-                preparedDataStride(packed.encoding));
+                preparedDataStride(packed.encoding, packed.codebook_id));
             packed.interleaved_block_stride =
                 preparedInterleavedBlockStride(
-                    packed.encoding, packed.is_asymmetric);
+                    packed.encoding, packed.is_asymmetric, packed.codebook_id);
             const std::size_t bytes =
                 static_cast<std::size_t>(packed.N_padded / 64) *
                 static_cast<std::size_t>(packed.blocks_per_row) *
@@ -352,10 +352,10 @@ namespace llaminar2::test
             packed.is_asymmetric = true;
             packed.is_superblock = false;
             packed.data_stride = static_cast<int>(
-                preparedDataStride(packed.encoding));
+                preparedDataStride(packed.encoding, packed.codebook_id));
             packed.interleaved_block_stride =
                 preparedInterleavedBlockStride(
-                    packed.encoding, packed.is_asymmetric);
+                    packed.encoding, packed.is_asymmetric, packed.codebook_id);
             const std::size_t bytes =
                 static_cast<std::size_t>(packed.N_padded / 64) *
                 static_cast<std::size_t>(packed.blocks_per_row) *

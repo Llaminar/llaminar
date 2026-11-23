@@ -242,7 +242,7 @@ namespace
         uint8_t source_codebook_id;
         uint8_t source_is_superblock;
         uint8_t source_identity_present;
-        uint8_t reserved;
+        uint8_t metadata_layout;
         uint32_t reserved_tail;
     };
 
@@ -7904,12 +7904,17 @@ namespace
         dst.source_codebook_id = src.source_codebook_id;
         dst.source_is_superblock = src.source_is_superblock;
         dst.source_identity_present = src.source_identity_present;
+        dst.metadata_layout = src.metadata_layout;
     }
 
     __device__ __forceinline__ bool rebalance_matrix_copy_ready(
         const DeviceNativeQuantisedMatrixDescView &desc,
         const DeviceMoEExpertDirectoryEntryView &entry)
     {
+        // Movement copies per-block planes only; superblock-coded matrices are
+        // loader-owned and never enter a reusable slot (fail closed).
+        if (desc.metadata_layout != 0u)
+            return false;
         (void)entry;
         uint8_t payload_bytes = 0u;
         uint8_t is_asymmetric = 0u;

@@ -143,8 +143,8 @@ namespace llaminar2
                wire_columns_per_unit==0 || wire_columns_per_unit>64 || cpu_is_asymmetric>1 || cpu_is_superblock>1 ||
                !native_quantised_formats::forSourceIdentity(cpu_codebook_id,cpu_is_superblock!=0) ||
                !cpu::native_quantised::isKnownPreparedEncoding(cpu_encoding) ||
-               cpu_data_stride!=cpu::native_quantised::preparedDataStride(cpu_encoding) ||
-               cpu_block_stride!=cpu::native_quantised::preparedInterleavedBlockStride(cpu_encoding,cpu_is_asymmetric!=0))return false;
+               cpu_data_stride!=cpu::native_quantised::preparedDataStride(cpu_encoding,cpu_codebook_id) ||
+               cpu_block_stride!=cpu::native_quantised::preparedInterleavedBlockStride(cpu_encoding,cpu_is_asymmetric!=0,cpu_codebook_id))return false;
             const uint64_t expected=((uint64_t(N)+wire_columns_per_unit-1)/wire_columns_per_unit)*blocks_per_row;
             const uint64_t root_units=((uint64_t(cpu_N)+63)/64)*(cpu_K/32);
             return root_units<=std::numeric_limits<size_t>::max()/cpu_block_stride && expected<=std::numeric_limits<uint32_t>::max() && unit_count==expected &&
@@ -250,10 +250,10 @@ namespace llaminar2
             }
             // Redundant wire strides must agree with the canonical encoding.
             if (cpu_data_stride !=
-                    cpu::native_quantised::preparedDataStride(cpu_encoding) ||
+                    cpu::native_quantised::preparedDataStride(cpu_encoding, cpu_codebook_id) ||
                 cpu_block_stride !=
                     cpu::native_quantised::preparedInterleavedBlockStride(
-                        cpu_encoding, cpu_is_asymmetric != 0))
+                        cpu_encoding, cpu_is_asymmetric != 0, cpu_codebook_id))
             {
                 return false;
             }

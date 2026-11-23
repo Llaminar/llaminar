@@ -258,6 +258,16 @@ inline const BoundedGPUExpertSource *boundedGPUWeightSource(const TensorBase &te
     return bounded;
 }
 
+/**
+ * @brief Source-superblock phase of a GPU weight operand's first prepared K block.
+ * @return firstBlock() % 8 of a bounded column selection; zero for whole-K sources.
+ */
+inline std::uint32_t gpuWeightSourceSuperblockPhase(const TensorBase &tensor)
+{
+    const auto *bounded = boundedGPUWeightSource(tensor);
+    return bounded && bounded->columns() ? static_cast<std::uint32_t>(bounded->columns()->firstBlock() % 8) : 0u;
+}
+
 /** @return Canonical source format from either real raw storage or bounded metadata, without advertising unpacking. */
 inline const NativeQuantisedFormatInfo *gpuWeightSourceFormat(const TensorBase &tensor)
 {

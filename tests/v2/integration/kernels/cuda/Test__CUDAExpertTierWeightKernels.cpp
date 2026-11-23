@@ -50,6 +50,7 @@
 
 #include <cuda_runtime.h>
 #include <gtest/gtest.h>
+#include "kernels/common/NativeQuantisedScaleLoad.h"
 
 #include <algorithm>
 #include <array>
@@ -77,9 +78,7 @@ extern "C"
     bool cudaNativeQuantisedGemvTuned_fp32(
         const std::int8_t *d_A_int8,
         const std::uint8_t *d_payload,
-        const std::uint16_t *d_scales,
-        const std::uint16_t *d_mins,
-        const std::uint32_t *d_emins,
+        ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes d_meta,
         float *d_C_fp32,
         const float *d_scales_A_block,
         int N,
@@ -98,9 +97,7 @@ extern "C"
     bool cudaNativeQuantisedGemvTuned_fp32_withPolicy(
         const std::int8_t *d_A_int8,
         const std::uint8_t *d_payload,
-        const std::uint16_t *d_scales,
-        const std::uint16_t *d_mins,
-        const std::uint32_t *d_emins,
+        ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes d_meta,
         float *d_C_fp32,
         const float *d_scales_A_block,
         int N,
@@ -120,9 +117,7 @@ extern "C"
     bool cudaNativeQuantisedGemvTuned_small_m_fp32(
         const std::int8_t *d_A_int8,
         const std::uint8_t *d_payload,
-        const std::uint16_t *d_scales,
-        const std::uint16_t *d_mins,
-        const std::uint32_t *d_emins,
+        ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes d_meta,
         float *d_C_fp32,
         const float *d_scales_A_block,
         int M,
@@ -144,9 +139,7 @@ extern "C"
     bool cudaNativeQuantisedPrefill_fp32(
         const std::int8_t *d_A_int8,
         const std::uint8_t *d_payload,
-        const std::uint16_t *d_scales,
-        const std::uint16_t *d_mins,
-        const std::uint32_t *d_emins,
+        ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes d_meta,
         float *d_C_fp32,
         const float *d_scales_A_block,
         const std::int32_t *d_sums_A_block,
@@ -166,9 +159,7 @@ extern "C"
     bool cudaNativeQuantisedPrefill_fp32_withPolicy(
         const std::int8_t *d_A_int8,
         const std::uint8_t *d_payload,
-        const std::uint16_t *d_scales,
-        const std::uint16_t *d_mins,
-        const std::uint32_t *d_emins,
+        ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes d_meta,
         float *d_C_fp32,
         const float *d_scales_A_block,
         const std::int32_t *d_sums_A_block,
@@ -2353,7 +2344,7 @@ namespace llaminar2
                     if (rows == 1)
                     {
                         return cudaNativeQuantisedGemvTuned_fp32_withPolicy(
-                            activation.data(), payload, scales, mins, nullptr,
+                            activation.data(), payload, ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes{scales, mins, nullptr, 0},
                             output, activation_scales.data(), N, K,
                             1.0f, 0.0f, nullptr, nullptr, codebook,
                             arithmetic_policy_codebook, 0,
@@ -2362,14 +2353,14 @@ namespace llaminar2
                     if (rows == verifier_rows)
                     {
                         return cudaNativeQuantisedGemvTuned_small_m_fp32_withPolicy(
-                            activation.data(), payload, scales, mins, nullptr,
+                            activation.data(), payload, ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes{scales, mins, nullptr, 0},
                             output, activation_scales.data(), rows, N, K,
                             1.0f, 0.0f, nullptr, nullptr, codebook,
                             arithmetic_policy_codebook, 0,
                             stream.opaque(), gemv_context, nullptr);
                     }
                     return cudaNativeQuantisedPrefill_fp32_withPolicy(
-                        activation.data(), payload, scales, mins, nullptr,
+                        activation.data(), payload, ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes{scales, mins, nullptr, 0},
                         output, activation_scales.data(), activation_sums.data(),
                         rows, N, K, 1.0f, 0.0f, nullptr, nullptr, codebook,
                         arithmetic_policy_codebook, 0, stream.opaque(),

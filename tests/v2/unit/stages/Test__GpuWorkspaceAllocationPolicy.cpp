@@ -4350,8 +4350,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, CUDANativeQuantisedFusedVerifierRowsPin
         EXPECT_EQ(body.find("prepareRowMajorWeightsOutsideCapture("), std::string::npos);
     }
     EXPECT_NE(m1_compact.find("cudaNativeQuantisedGemvTuned_fp32_withPolicy("
-                              "d_A_int8,impl_->d_weights_native_quantised,impl_->d_weights_native_scales,"
-                              "impl_->d_weights_native_mins,impl_->d_weights_native_emins,d_C,"
+                              "d_A_int8,impl_->d_weights_native_quantised,impl_->nativeMetadataPlanes(),d_C,"
                               "d_scales_A_blockwise,n,k,alpha,beta,nullptr,d_bias,"
                               "impl_->native_codebook_id,arithmetic_policy_codebook_id,"
                               "cuda_device_id_,stream_handle,impl_->gemv_ctx,rowmajor_slot)"),

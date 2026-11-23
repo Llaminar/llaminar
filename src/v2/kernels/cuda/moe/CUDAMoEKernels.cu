@@ -67,6 +67,8 @@
 #include "execution/moe/DeviceMoEOverlayEpochABI.h"
 #include "execution/moe/DeviceMoERuntimeABI.h"
 #include "utils/DebugEnv.h"
+#include "kernels/common/DeviceNativeQuantisedMatrixDesc.h"
+#include "kernels/common/NativeQuantisedScaleLoad.h"
 
 #include <algorithm>
 #include <cassert>
@@ -252,29 +254,8 @@ namespace
                op == kDeviceMoERebalancePlanResidentExpertAssignment;
     }
 
-    struct DeviceNativeQuantisedMatrixDesc
-    {
-        const uint8_t *payload = nullptr;
-        const void *scales = nullptr;
-        const void *mins = nullptr;
-        const void *emins = nullptr;
-        int n = 0;
-        int k = 0;
-        uint32_t blocks_per_row = 0;
-        uint8_t codebook_id = 0;
-        uint8_t allocation_payload_bytes_per_block = 0;
-        uint8_t allocation_has_mins = 0;
-        uint8_t allocation_has_emins = 0;
-        uint8_t source_codebook_id = 0;
-        uint8_t source_is_superblock = 0;
-        uint8_t source_identity_present = 0;
-        uint8_t reserved = 0;
-        uint32_t reserved_tail = 0;
-    };
-
-    static_assert(
-        sizeof(DeviceNativeQuantisedMatrixDesc) == 56,
-        "CUDA MoE descriptor must match the shared device ABI");
+    // The single shared device ABI; never a hand-copied mirror that can drift.
+    using DeviceNativeQuantisedMatrixDesc = ::llaminar2::DeviceNativeQuantisedMatrixDesc;
 
     struct DeviceMoEExpertDescriptorView
     {
@@ -7572,12 +7553,17 @@ namespace
         dst.source_codebook_id = src.source_codebook_id;
         dst.source_is_superblock = src.source_is_superblock;
         dst.source_identity_present = src.source_identity_present;
+        dst.metadata_layout = src.metadata_layout;
     }
 
     __device__ __forceinline__ bool rebalance_matrix_copy_ready(
         const DeviceNativeQuantisedMatrixDesc &desc,
         const DeviceMoEExpertDirectoryEntryView &entry)
     {
+        // Movement copies per-block planes only; superblock-coded matrices are
+        // loader-owned and never enter a reusable slot (fail closed).
+        if (desc.metadata_layout != 0u)
+            return false;
         (void)entry;
         uint8_t payload_bytes = 0u;
         uint8_t is_asymmetric = 0u;
@@ -13202,8 +13188,11 @@ namespace
                desc.k == K &&
                desc.blocks_per_row == static_cast<uint32_t>(K / 32) &&
                grouped_desc_supports_codebook(desc.codebook_id) &&
-               (!grouped_desc_requires_mins(desc.codebook_id) || desc.mins) &&
-               (!grouped_desc_requires_emins(desc.codebook_id) || desc.emins);
+               ::llaminar2::nativeQuantisedLayoutValid(desc.codebook_id, desc.metadata_layout) &&
+               // A coded matrix keeps its superblock plane in `mins` and has no emins plane.
+               ((desc.metadata_layout & 0x80u) ? desc.mins != nullptr
+                : ((!grouped_desc_requires_mins(desc.codebook_id) || desc.mins) &&
+                   (!grouped_desc_requires_emins(desc.codebook_id) || desc.emins)));
     }
 
     template <uint8_t CodebookId>
@@ -13224,10 +13213,12 @@ namespace
                    desc.k == K &&
                    desc.blocks_per_row == static_cast<uint32_t>(K / 32) &&
                    llaminar2::cuda_native_quantised::native_quantised_descriptor_codebook_matches<CodebookId>(desc.codebook_id) &&
-                   (!(llaminar2::cuda_native_quantised::CodebookTraits<CodebookId>::requires_secondary_metadata) ||
-                    (CodebookId == llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook && desc.codebook_id == 4) || desc.mins) &&
-                   (!llaminar2::cuda_native_quantised::CodebookTraits<CodebookId>::is_dual_scale_asym ||
-                    desc.emins);
+                   ::llaminar2::nativeQuantisedLayoutValid(desc.codebook_id, desc.metadata_layout) &&
+                   ((desc.metadata_layout & 0x80u) ? desc.mins != nullptr
+                    : ((!(llaminar2::cuda_native_quantised::CodebookTraits<CodebookId>::requires_secondary_metadata) ||
+                        (CodebookId == llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook && desc.codebook_id == 4) || desc.mins) &&
+                       (!llaminar2::cuda_native_quantised::CodebookTraits<CodebookId>::is_dual_scale_asym ||
+                        desc.emins)));
         }
     }
 
@@ -18799,10 +18790,8 @@ __global__ void softmax_topk_decode_descriptors_kernel(
      * @param a_vals Eight packed activation groups for one 32-value K block.
      * @param packed_groups Eight decoded signed-weight groups.
      * @param payload Prepared codebook payload for IQ1_M sign extraction.
-     * @param scale_base Prepared primary binary16 scale plane.
-     * @param min_base Optional secondary scale or minimum plane.
-     * @param emin_base Optional Q2_K paired-minimum plane.
-     * @param linear Block-major prepared-metadata index.
+     * @param meta Typed metadata planes of the prepared matrix (either representation).
+     * @param address Block-major metadata address of this block.
      * @param scale_a FP32 scale for the quantized activation block.
      * @param physical_codebook Actual operand identity within the IQ4 payload family.
      * @return Canonically rounded contribution, not yet row-accumulated.
@@ -18812,13 +18801,14 @@ __global__ void softmax_topk_decode_descriptors_kernel(
         const int32_t *__restrict__ a_vals,
         const int32_t *__restrict__ packed_groups,
         const uint8_t *__restrict__ payload,
-        const uint16_t *__restrict__ scale_base,
-        const uint16_t *__restrict__ min_base,
-        const uint32_t *__restrict__ emin_base,
-        size_t linear,
+        ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes meta,
+        ::llaminar2::native_quantised_scale::BlockAddress address,
         float scale_a,
         uint8_t physical_codebook = CodebookId)
     {
+        // One authority reconstructs the per-block words for either metadata
+        // representation; every expression below consumes them unchanged.
+        const auto words = ::llaminar2::native_quantised_scale::loadBlockMetadata<CodebookId>(meta, address);
         // IQ4 pairs share exact LUT integers, but retain independent factors.
         if constexpr (llaminar2::cuda_native_quantised::CodebookTraits<CodebookId>::is_iq4_lut)
         {
@@ -18828,8 +18818,8 @@ __global__ void softmax_topk_decode_descriptors_kernel(
                 dot = __dp4a(a_vals[group], packed_groups[group], dot);
             const float scale = physical_codebook == llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook
                 ? llaminar2::cuda_native_quantised::native_quantised_single_scale_rn<llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook>(
-                      ::llaminar2::native_quantised_scale::loadStagedPrimary<CodebookId>(scale_base, linear), min_base[linear])
-                : llaminar2::cuda_native_quantised::fp16_bits_to_float(::llaminar2::native_quantised_scale::loadStagedPrimary<CodebookId>(scale_base, linear));
+                      words.primary, words.secondary)
+                : llaminar2::cuda_native_quantised::fp16_bits_to_float(words.primary);
             return llaminar2::device_native_quantised_contract::singleScaleBlock(dot, scale, scale_a);
         }
         if constexpr (llaminar2::cuda_native_quantised::CodebookTraits<CodebookId>::is_dual_scale)
@@ -18876,9 +18866,9 @@ __global__ void softmax_topk_decode_descriptors_kernel(
                     dot_lo,
                     dot_hi,
                     scale_a,
-                    ::llaminar2::native_quantised_scale::loadStagedPrimary<CodebookId>(scale_base, linear),
-                    min_base ? min_base[linear] : 0u,
-                    emin_base ? emin_base[linear] : 0u,
+                    words.primary,
+                    words.secondary,
+                    words.emin,
                     sum_lo + sum_hi,
                     sum_lo,
                     sum_hi,
@@ -18905,8 +18895,8 @@ __global__ void softmax_topk_decode_descriptors_kernel(
                     dot,
                     0,
                     scale_a,
-                    ::llaminar2::native_quantised_scale::loadStagedPrimary<CodebookId>(scale_base, linear),
-                    min_base ? min_base[linear] : 0u,
+                    words.primary,
+                    words.secondary,
                     0u,
                     sum_a,
                     0,
@@ -18922,11 +18912,9 @@ __global__ void softmax_topk_decode_descriptors_kernel(
     template <uint8_t CodebookId, int TileM>
     __device__ __forceinline__ void accumulate_prefill_dot_block(
         const int32_t (&packed_groups)[8],
-        const uint16_t *__restrict__ scale_base,
-        const uint16_t *__restrict__ min_base,
-        const uint32_t *__restrict__ emin_base,
+        ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes meta,
         const uint8_t *__restrict__ payload,
-        size_t linear,
+        ::llaminar2::native_quantised_scale::BlockAddress address,
         const int32_t *__restrict__ a4_base,
         int a4_stride_i32,
         const float *__restrict__ scale_a_base,
@@ -18956,10 +18944,8 @@ __global__ void softmax_topk_decode_descriptors_kernel(
                     a4,
                     packed_groups,
                     payload,
-                    scale_base,
-                    min_base,
-                    emin_base,
-                    linear,
+                    meta,
+                    address,
                     scale_a, physical_codebook);
             acc[m] = __fadd_rn(acc[m], contribution);
         }
@@ -19012,13 +18998,9 @@ __global__ void softmax_topk_decode_descriptors_kernel(
             return;
 
         const uint8_t *gate_payload_base = gate_desc.payload;
-        const uint16_t *gate_scale_base = static_cast<const uint16_t *>(gate_desc.scales);
-        const uint16_t *gate_min_base = static_cast<const uint16_t *>(gate_desc.mins);
-        const uint32_t *gate_emin_base = static_cast<const uint32_t *>(gate_desc.emins);
+        const auto gate_meta = ::llaminar2::native_quantised_scale::metadataPlanes(gate_desc);
         const uint8_t *up_payload_base = up_desc.payload;
-        const uint16_t *up_scale_base = static_cast<const uint16_t *>(up_desc.scales);
-        const uint16_t *up_min_base = static_cast<const uint16_t *>(up_desc.mins);
-        const uint32_t *up_emin_base = static_cast<const uint32_t *>(up_desc.emins);
+        const auto up_meta = ::llaminar2::native_quantised_scale::metadataPlanes(up_desc);
 
         // Staged activation tile for the current K-block: kTileM tokens × 32 int8 (= 8 int32)
         // plus one blockwise scale per token. Staging once per block (cooperatively) removes
@@ -19080,12 +19062,12 @@ __global__ void softmax_topk_decode_descriptors_kernel(
             if (active)
             {
                 accumulate_prefill_dot_block<CodebookId, kTileM>(
-                    gate_groups, gate_scale_base, gate_min_base, gate_emin_base, gate_payload,
-                    linear, s_a, /*a4_stride_i32=*/8, s_scale, /*scale_a_stride=*/1,
+                    gate_groups, gate_meta, gate_payload,
+                    ::llaminar2::native_quantised_scale::blockMajorAddress(gate_meta, block_idx, n, N), s_a, /*a4_stride_i32=*/8, s_scale, /*scale_a_stride=*/1,
                     tokens_in_group, gate_acc, gate_desc.codebook_id);
                 accumulate_prefill_dot_block<CodebookId, kTileM>(
-                    up_groups, up_scale_base, up_min_base, up_emin_base, up_payload,
-                    linear, s_a, /*a4_stride_i32=*/8, s_scale, /*scale_a_stride=*/1,
+                    up_groups, up_meta, up_payload,
+                    ::llaminar2::native_quantised_scale::blockMajorAddress(up_meta, block_idx, n, N), s_a, /*a4_stride_i32=*/8, s_scale, /*scale_a_stride=*/1,
                     tokens_in_group, up_acc, up_desc.codebook_id);
             }
 
@@ -19161,13 +19143,9 @@ __global__ void softmax_topk_decode_descriptors_kernel(
             return;
 
         const uint8_t *gate_payload_base = gate_desc.payload;
-        const uint16_t *gate_scale_base = static_cast<const uint16_t *>(gate_desc.scales);
-        const uint16_t *gate_min_base = static_cast<const uint16_t *>(gate_desc.mins);
-        const uint32_t *gate_emin_base = static_cast<const uint32_t *>(gate_desc.emins);
+        const auto gate_meta = ::llaminar2::native_quantised_scale::metadataPlanes(gate_desc);
         const uint8_t *up_payload_base = up_desc.payload;
-        const uint16_t *up_scale_base = static_cast<const uint16_t *>(up_desc.scales);
-        const uint16_t *up_min_base = static_cast<const uint16_t *>(up_desc.mins);
-        const uint32_t *up_emin_base = static_cast<const uint32_t *>(up_desc.emins);
+        const auto up_meta = ::llaminar2::native_quantised_scale::metadataPlanes(up_desc);
 
         __shared__ __align__(16) int32_t s_a[kTileM * 8];
         __shared__ float s_scale[kTileM];
@@ -19217,12 +19195,12 @@ __global__ void softmax_topk_decode_descriptors_kernel(
             if (active)
             {
                 accumulate_prefill_dot_block<CodebookId, kTileM>(
-                    gate_groups, gate_scale_base, gate_min_base, gate_emin_base, gate_payload,
-                    linear, s_a, /*a4_stride_i32=*/8, s_scale, /*scale_a_stride=*/1,
+                    gate_groups, gate_meta, gate_payload,
+                    ::llaminar2::native_quantised_scale::blockMajorAddress(gate_meta, block_idx, n, N), s_a, /*a4_stride_i32=*/8, s_scale, /*scale_a_stride=*/1,
                     tokens_in_group, gate_acc, gate_desc.codebook_id);
                 accumulate_prefill_dot_block<CodebookId, kTileM>(
-                    up_groups, up_scale_base, up_min_base, up_emin_base, up_payload,
-                    linear, s_a, /*a4_stride_i32=*/8, s_scale, /*scale_a_stride=*/1,
+                    up_groups, up_meta, up_payload,
+                    ::llaminar2::native_quantised_scale::blockMajorAddress(up_meta, block_idx, n, N), s_a, /*a4_stride_i32=*/8, s_scale, /*scale_a_stride=*/1,
                     tokens_in_group, up_acc, up_desc.codebook_id);
             }
 
@@ -19355,9 +19333,7 @@ __global__ void softmax_topk_decode_descriptors_kernel(
             return;
 
         const uint8_t *payload_base = desc.payload;
-        const uint16_t *scale_base = static_cast<const uint16_t *>(desc.scales);
-        const uint16_t *min_base = static_cast<const uint16_t *>(desc.mins);
-        const uint32_t *emin_base = static_cast<const uint32_t *>(desc.emins);
+        const auto desc_meta = ::llaminar2::native_quantised_scale::metadataPlanes(desc);
 
         // Staged activation tile (see gate_up kernel) to remove redundant L1 loads.
         // 16-byte aligned for vectorized 2× int4 (128-bit) per-token reads.
@@ -19394,8 +19370,8 @@ __global__ void softmax_topk_decode_descriptors_kernel(
                     linear * llaminar2::cuda_native_quantised::payload_bytes_for_codebook<CodebookId>();
                 llaminar2::cuda_native_quantised::decode_groups_vec<CodebookId>(payload, packed_groups);
                 accumulate_prefill_dot_block<CodebookId, kTileM>(
-                    packed_groups, scale_base, min_base, emin_base, payload,
-                    linear, s_a, /*a4_stride_i32=*/8, s_scale, /*scale_a_stride=*/1,
+                    packed_groups, desc_meta, payload,
+                    ::llaminar2::native_quantised_scale::blockMajorAddress(desc_meta, block_idx, n, N), s_a, /*a4_stride_i32=*/8, s_scale, /*scale_a_stride=*/1,
                     tokens_in_group, acc, desc.codebook_id);
             }
 
@@ -19592,9 +19568,7 @@ __global__ void softmax_topk_decode_descriptors_kernel(
             return 0.0f;
         }
         const uint8_t *payload_base = desc.payload;
-        const uint16_t *scale_base = static_cast<const uint16_t *>(desc.scales);
-        const uint16_t *min_base = static_cast<const uint16_t *>(desc.mins);
-        const uint32_t *emin_base = static_cast<const uint32_t *>(desc.emins);
+        const auto desc_meta = ::llaminar2::native_quantised_scale::metadataPlanes(desc);
         float acc = 0.0f;
 
         // Clamp the requested range to the valid K-block span.
@@ -19620,10 +19594,8 @@ __global__ void softmax_topk_decode_descriptors_kernel(
                     a4,
                     packed_groups,
                     payload,
-                    scale_base,
-                    min_base,
-                    emin_base,
-                    linear,
+                    desc_meta,
+                    ::llaminar2::native_quantised_scale::blockMajorAddress(desc_meta, block_idx, n, N),
                     scale_a, desc.codebook_id);
             acc = __fadd_rn(acc, contribution);
         }
@@ -19671,18 +19643,8 @@ __global__ void softmax_topk_decode_descriptors_kernel(
             return;
         }
 
-        const auto *gate_scales =
-            static_cast<const uint16_t *>(gate_desc.scales);
-        const auto *gate_mins =
-            static_cast<const uint16_t *>(gate_desc.mins);
-        const auto *gate_emins =
-            static_cast<const uint32_t *>(gate_desc.emins);
-        const auto *up_scales =
-            static_cast<const uint16_t *>(up_desc.scales);
-        const auto *up_mins =
-            static_cast<const uint16_t *>(up_desc.mins);
-        const auto *up_emins =
-            static_cast<const uint32_t *>(up_desc.emins);
+        const auto gate_meta = ::llaminar2::native_quantised_scale::metadataPlanes(gate_desc);
+        const auto up_meta = ::llaminar2::native_quantised_scale::metadataPlanes(up_desc);
 
         b_start = max(0, b_start);
         b_end = min(blocks_per_row, b_end);
@@ -19709,10 +19671,8 @@ __global__ void softmax_topk_decode_descriptors_kernel(
                     a4,
                     packed_groups,
                     gate_payload,
-                    gate_scales,
-                    gate_mins,
-                    gate_emins,
-                    linear,
+                    gate_meta,
+                    ::llaminar2::native_quantised_scale::blockMajorAddress(gate_meta, block_idx, n, N),
                     scale_a, gate_desc.codebook_id));
 
             const uint8_t *up_payload =
@@ -19725,10 +19685,8 @@ __global__ void softmax_topk_decode_descriptors_kernel(
                     a4,
                     packed_groups,
                     up_payload,
-                    up_scales,
-                    up_mins,
-                    up_emins,
-                    linear,
+                    up_meta,
+                    ::llaminar2::native_quantised_scale::blockMajorAddress(up_meta, block_idx, n, N),
                     scale_a, up_desc.codebook_id));
         }
     }

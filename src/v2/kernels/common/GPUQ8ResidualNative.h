@@ -9,6 +9,7 @@
  */
 #pragma once
 #include "kernels/common/NativeEmbeddingIQTables.h"
+#include "tensors/NativeQuantisedScalePlane.h"
 #include <limits>
 #include "kernels/common/Q8ResidualCorrection.h"
 namespace llaminar2
@@ -110,7 +111,8 @@ namespace llaminar2
                                      d.source_identity_present != 0},
             m, n, k);
         if (!d.valid() || d.n != n || d.k != k || d.blocks_per_row != static_cast<unsigned>(k / 32) ||
-            !deviceVnniExecutionCompatibleWithSource(source, d.codebook_id) || d.reserved ||
+            !deviceVnniExecutionCompatibleWithSource(source, d.codebook_id) ||
+            !nativeQuantisedLayoutValid(d.codebook_id, d.metadata_layout) ||
             d.reserved_tail || d.source_is_superblock > 1 || d.source_identity_present != 1 ||
             d.allocation_has_mins > 1 || d.allocation_has_emins > 1)
             throw std::invalid_argument("TwoTerm GPU prepared source/execution identity or shape mismatch");

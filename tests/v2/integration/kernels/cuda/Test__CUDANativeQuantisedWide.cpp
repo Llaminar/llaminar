@@ -18,6 +18,7 @@
  */
 #include "backends/cuda/CUDAHardwareMetadata.h"
 #include <gtest/gtest.h>
+#include "kernels/common/NativeQuantisedScaleLoad.h"
 #include <cuda_runtime.h>
 
 #include "backends/cuda/CUDAGraphCapture.h"
@@ -45,8 +46,8 @@ extern "C"
     void cudaNativeQuantisedGemvTuned_setDecodeEquivalentM1Config(int);
     int cudaNativeQuantisedGemvTuned_getDecodeEquivalentM1Config();
     bool cudaNativeQuantisedGemvTuned_fp32(
-        const int8_t *, const uint8_t *, const uint16_t *, const uint16_t *,
-        const uint32_t *, float *, const float *, int, int, float, float,
+        const int8_t *, const uint8_t *, ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes,
+         float *, const float *, int, int, float, float,
         const float *, const float *, uint8_t, int, void *, CUDAGemvContext *,
         CUDARowMajorWeights **);
 }
@@ -259,7 +260,7 @@ void verifyWide(int codebook, int payload_bytes, int tile, int cpt, int n, int k
         if (path == 1 && m > 1)
         {
             ASSERT_TRUE(cudaNativeQuantisedGemvTuned_small_m_fp32_withPolicy(
-                a.data, p.data, s.data, secondary_s.data, em.data, destination,
+                a.data, p.data, ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes{s.data, secondary_s.data, em.data, 0}, destination,
                 sa.data, m, n, k, 1.0f, 0.0f, nullptr, nullptr,
                 static_cast<uint8_t>(codebook),
                 // IQ4_XS-source and MXFP4 execute IQ4_NL's certified policy.
@@ -271,7 +272,7 @@ void verifyWide(int codebook, int payload_bytes, int tile, int cpt, int n, int k
         else
             for (int row = 0; row < m; ++row)
                 ASSERT_TRUE(cudaNativeQuantisedGemvTuned_fp32(
-                    a.data + row * k, p.data, s.data, secondary_s.data, em.data, destination + row * n,
+                    a.data + row * k, p.data, ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes{s.data, secondary_s.data, em.data, 0}, destination + row * n,
                     sa.data + row * (k / 32), n, k, 1.0f, 0.0f, nullptr, nullptr,
                     static_cast<uint8_t>(codebook), 0, stream,
                     execution.context.get(), nullptr));

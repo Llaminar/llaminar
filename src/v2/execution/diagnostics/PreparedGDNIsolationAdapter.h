@@ -37,7 +37,7 @@ inline bool staticGDNIsolationFormSupported(const GDNProjectionStage::Params &p)
 inline void validateGDNIsolationQ8Allocation(const DeviceNativeQuantisedMatrixDesc &n)
 {
     if(!n.valid() || n.codebook_id!=19 || n.source_identity_present!=1 ||
-        n.source_codebook_id!=19 || n.source_is_superblock || n.reserved || n.reserved_tail ||
+        n.source_codebook_id!=19 || n.source_is_superblock || n.metadata_layout || n.reserved_tail ||
         n.k%32 || n.blocks_per_row!=static_cast<std::uint32_t>(n.k/32) ||
         (n.allocation_payload_bytes_per_block!=0 && n.allocation_payload_bytes_per_block!=32) ||
         n.allocation_has_mins || n.allocation_has_emins || n.mins || n.emins)
@@ -282,9 +282,9 @@ private:
     static bool sameNative(const DeviceNativeQuantisedMatrixDesc &a,const DeviceNativeQuantisedMatrixDesc &b)
     {
         return std::tie(a.payload,a.scales,a.mins,a.emins,a.n,a.k,a.blocks_per_row,a.codebook_id,a.allocation_payload_bytes_per_block,
-            a.allocation_has_mins,a.allocation_has_emins,a.source_codebook_id,a.source_is_superblock,a.source_identity_present,a.reserved,a.reserved_tail)==
+            a.allocation_has_mins,a.allocation_has_emins,a.source_codebook_id,a.source_is_superblock,a.source_identity_present,a.metadata_layout,a.reserved_tail)==
             std::tie(b.payload,b.scales,b.mins,b.emins,b.n,b.k,b.blocks_per_row,b.codebook_id,b.allocation_payload_bytes_per_block,
-            b.allocation_has_mins,b.allocation_has_emins,b.source_codebook_id,b.source_is_superblock,b.source_identity_present,b.reserved,b.reserved_tail);
+            b.allocation_has_mins,b.allocation_has_emins,b.source_codebook_id,b.source_is_superblock,b.source_identity_present,b.metadata_layout,b.reserved_tail);
     }
     /** @brief Validate exact capture phase, source descriptors and retained storage before enqueue. */
     void ready(void *stream,bool recording) const

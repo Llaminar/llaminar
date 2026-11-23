@@ -280,7 +280,7 @@ void prove(const QuantizedVerifierFormatCase &format,QuantizedActivationOperandP
                         ASSERT_EQ(args.quantizer,Q8ResidualQuantizerPolicy::ROCmFiniteHalfNativeReciprocal);
                         ASSERT_EQ(args.input,input->gpu_data_ptr());ASSERT_EQ(args.output,outputs[path][0]->gpu_data_ptr());
                         const auto tuple=[](const DeviceNativeQuantisedMatrixDesc &d){return std::tie(d.payload,d.scales,d.mins,d.emins,d.n,d.k,d.blocks_per_row,d.codebook_id,
-                            d.allocation_payload_bytes_per_block,d.allocation_has_mins,d.allocation_has_emins,d.source_codebook_id,d.source_is_superblock,d.source_identity_present,d.reserved,d.reserved_tail);};
+                            d.allocation_payload_bytes_per_block,d.allocation_has_mins,d.allocation_has_emins,d.source_codebook_id,d.source_is_superblock,d.source_identity_present,d.metadata_layout,d.reserved_tail);};
                         ASSERT_EQ(tuple(args.weights),tuple(descriptors[path][0]));
                         const std::array<const void *,4> banks{args.primary,args.residual,args.primaryScales,args.residualScales};
                         const std::array<std::string,4> names{kGPUProjectionPrimaryQ8,kGPUProjectionResidualQ8,kGPUProjectionPrimaryQ8Scales,kGPUProjectionResidualQ8Scales};

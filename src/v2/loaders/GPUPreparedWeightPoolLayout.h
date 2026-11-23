@@ -8,7 +8,9 @@
  */
 #pragma once
 
+#include "backends/DeviceId.h"
 #include "tensors/NativeQuantisedFormatInfo.h"
+#include "tensors/NativeQuantisedScalePlane.h"
 #include <stdexcept>
 
 namespace llaminar2
@@ -41,5 +43,27 @@ namespace llaminar2
         default:
             throw std::invalid_argument("Unknown GPU prepared weight pool layout");
         }
+    }
+
+    /**
+     * @brief Whether one prepared GPU matrix stores superblock-coded metadata.
+     *
+     * Only immutable source-native matrices are coded: reusable migration slots
+     * hold the per-block union so CPU-tier arrivals and in-place movement keep
+     * their existing representation. CUDA is the first backend whose every
+     * NativeQuantised reader consumes coded metadata; ROCm producers keep
+     * per-block planes until its readers are converted
+     * (docs/v2/projects/2026-11/GPU_SUPERBLOCK_METADATA_PLAN.md), and its
+     * readers reject coded descriptors.
+     *
+     * @param source Original GGUF codebook metadata.
+     * @param layout Pool stride policy of the matrix.
+     * @param device Device owning the prepared matrix.
+     */
+    [[nodiscard]] inline bool gpuPreparedSuperblockCoded(const NativeQuantisedFormatInfo &source,
+        GPUPreparedWeightPoolLayout layout, DeviceId device)
+    {
+        return layout == GPUPreparedWeightPoolLayout::SourceNative && device.is_cuda() && source.is_superblock &&
+               nativeQuantisedSuperblockCodable(canonicalDeviceVnniCodebookId(source));
     }
 }

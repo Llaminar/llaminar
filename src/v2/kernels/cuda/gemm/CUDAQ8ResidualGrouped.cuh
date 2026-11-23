@@ -163,7 +163,7 @@ __global__ __launch_bounds__(256, 2) void projectNativeGrouped(GPUQ8ResidualCorr
                 const auto block = static_cast<std::uint64_t>(group) * a.weights.n + column;
                 const auto *payload = a.weights.payload + block * Traits::payload_bytes;
                 decoder.decode_groups<C>(payload, w);
-                meta = NativeBlock<C>(a.weights, block, payload);
+                meta = NativeBlock<C>(a.weights, group, column, payload);
             }
 #pragma unroll
             for (int word = 0; word < Words; ++word)

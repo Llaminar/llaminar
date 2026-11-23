@@ -262,18 +262,22 @@ namespace llaminar2::multimodal
             horiz = precompute(in.width, box[0], box[2], xsize);
         }
 
-        RgbImage cur = in;
+        // Each pass reads its predecessor directly; the source is never copied
+        // (a decoded photo can be 192 MiB at the admitted pixel bound).
+        RgbImage cur;
+        const RgbImage *src = &in;
         if (horizontal_first)
         {
-            if (need_horizontal) cur = horizontal(cur, xsize, ybox_last - ybox_first, ybox_first, horiz);
-            if (need_vertical) cur = vertical(cur, xsize, ysize, vert);
+            if (need_horizontal) { cur = horizontal(*src, xsize, ybox_last - ybox_first, ybox_first, horiz); src = &cur; }
+            if (need_vertical) { cur = vertical(*src, xsize, ysize, vert); src = &cur; }
         }
         else
         {
-            if (need_vertical) cur = vertical(cur, cur.width, ysize, vert);
-            if (need_horizontal) cur = horizontal(cur, xsize, ysize, 0, horiz);
+            if (need_vertical) { cur = vertical(*src, src->width, ysize, vert); src = &cur; }
+            if (need_horizontal) { cur = horizontal(*src, xsize, ysize, 0, horiz); src = &cur; }
         }
-        return cur;
+        // Unreachable when unchanged (early return above), kept total.
+        return src == &in ? in : cur;
     }
 
     RgbImage pad(const RgbImage &image, int width, int height, const std::uint8_t fill[3])

@@ -91,9 +91,9 @@ TEST(CPUNativeBlockDecode, AllSourceFormatsRetainTheirPreparedEncodingIdentity)
         const auto &format = *source.metadata;
         const auto encoding = preparedEncodingForSource(format);
         EXPECT_TRUE(isKnownPreparedEncoding(encoding));
-        EXPECT_GT(preparedDataStride(encoding), 0u);
-        EXPECT_GE(preparedInterleavedBlockStride(encoding, format.is_asymmetric),
-                  preparedDataStride(encoding) + 256u);
+        EXPECT_GT(preparedDataStride(encoding, format.codebook_id), 0u);
+        EXPECT_GE(preparedInterleavedBlockStride(encoding, format.is_asymmetric, format.codebook_id),
+                  preparedDataStride(encoding, format.codebook_id) + 256u);
         EXPECT_EQ(native_quantised_formats::forSourceIdentity(format.codebook_id, format.is_superblock),
                   source.metadata);
         EXPECT_EQ(preparedEncodingForSource(format, true), CPUNativeQuantisedEncoding::ExpandedInt8);

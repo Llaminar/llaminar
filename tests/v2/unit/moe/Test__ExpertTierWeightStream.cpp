@@ -621,8 +621,8 @@ namespace llaminar2
                     ExpertTierWeightProjection::Gate, 4).deviceLayout();
                 ASSERT_TRUE(layout.valid());
                 layout.cpu_encoding = cpu::native_quantised::CPUNativeQuantisedEncoding::ExpandedInt8;
-                layout.cpu_data_stride = cpu::native_quantised::preparedDataStride(layout.cpu_encoding);
-                layout.cpu_block_stride = cpu::native_quantised::preparedInterleavedBlockStride(layout.cpu_encoding, true);
+                layout.cpu_data_stride = cpu::native_quantised::preparedDataStride(layout.cpu_encoding, layout.cpu_codebook_id);
+                layout.cpu_block_stride = cpu::native_quantised::preparedInterleavedBlockStride(layout.cpu_encoding, true, layout.cpu_codebook_id);
                 layout.gpu_codebook_id = kNativeQuantisedExpandedInt8MinCodebook;
                 layout.gpu_payload_bytes_per_block = 32;
                 layout.gpu_has_emins = 0;

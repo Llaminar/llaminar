@@ -121,8 +121,8 @@ TEST(Test__MoEOverlayDistributedResidencyProtocol, NativeCpuRectanglesKeepStagin
         packed.codebook_id=format.metadata->codebook_id;packed.is_superblock=format.metadata->is_superblock;
         packed.is_asymmetric=format.metadata->is_asymmetric;
         packed.encoding=cpu::native_quantised::preparedEncodingForSource(*format.metadata);
-        packed.data_stride=cpu::native_quantised::preparedDataStride(packed.encoding);
-        packed.interleaved_block_stride=cpu::native_quantised::preparedInterleavedBlockStride(packed.encoding,packed.is_asymmetric);
+        packed.data_stride=cpu::native_quantised::preparedDataStride(packed.encoding,packed.codebook_id);
+        packed.interleaved_block_stride=cpu::native_quantised::preparedInterleavedBlockStride(packed.encoding,packed.is_asymmetric,packed.codebook_id);
         packed.native_interleaved.resize_uninitialized(size_t(6)*packed.interleaved_block_stride);
         {const auto written=packed.native_interleaved.beginRewrite();for(size_t i=0;i<written.size();++i)written[i]=uint8_t(i*37+11);}
         const auto manifest=makeMoEOverlayRemoteCpuProjectionManifest(identity,packed,73).forCPUIntersection(intersection);
@@ -204,8 +204,8 @@ TEST(Test__MoEOverlayDistributedResidencyProtocol, GpuArrivalAuthenticatesOrigin
         packed.is_superblock=format.metadata->is_superblock;
         packed.is_asymmetric=format.metadata->is_asymmetric;
         packed.encoding=cpu::native_quantised::preparedEncodingForSource(*format.metadata);
-        packed.data_stride=cpu::native_quantised::preparedDataStride(packed.encoding);
-        packed.interleaved_block_stride=cpu::native_quantised::preparedInterleavedBlockStride(packed.encoding,packed.is_asymmetric);
+        packed.data_stride=cpu::native_quantised::preparedDataStride(packed.encoding,packed.codebook_id);
+        packed.interleaved_block_stride=cpu::native_quantised::preparedInterleavedBlockStride(packed.encoding,packed.is_asymmetric,packed.codebook_id);
         packed.native_interleaved.resize_uninitialized(size_t(packed.N_padded/64)*packed.blocks_per_row*packed.interleaved_block_stride);
         const auto identity=remoteProjectionIdentity(fixture.transaction,DeviceId::cpu(),device);
         const auto intersection=ExpertTierWeightProjectionIntersection::between(source,destination);

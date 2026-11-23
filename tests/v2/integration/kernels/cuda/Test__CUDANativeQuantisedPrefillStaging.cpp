@@ -24,6 +24,7 @@
 #include "tensors/NativeQuantisedFormatInfo.h"
 #include <cuda_runtime.h>
 #include <gtest/gtest.h>
+#include "kernels/common/NativeQuantisedScaleLoad.h"
 #include <algorithm>
 #include <array>
 #include <barrier>
@@ -41,8 +42,8 @@
 extern "C" {
 /** @brief Production prefill bridge; the fixture never recompiles a device body. */
 bool cudaNativeQuantisedPrefill_fp32_withPolicy(
-    const int8_t*, const uint8_t*, const uint16_t*, const uint16_t*,
-    const uint32_t*, float*, const float*, const int32_t*, int, int, int,
+    const int8_t*, const uint8_t*, ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes,
+    float*, const float*, const int32_t*, int, int, int,
     float, float, const float*, const float*, uint8_t, uint8_t, int, void*,
     CUDAPrefillContext*);
 /** @brief Select the existing diagnostic BK256 candidate before workers start. */
@@ -140,7 +141,7 @@ void verifyBK256Context(int device, int rows)
     check(cudaStreamSynchronize(session.stream));
     check(cudaStreamBeginCapture(session.stream, cudaStreamCaptureModeThreadLocal));
     const bool launched = cudaNativeQuantisedPrefill_fp32_withPolicy(
-        activation.data, payload.data, scales.data, nullptr, nullptr, output.data,
+        activation.data, payload.data, ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes{scales.data, nullptr, nullptr, 0}, output.data,
         activation_scales.data, nullptr, rows, n, k, 1, 0, nullptr, nullptr,
         0, 0, device, session.stream, context.get());
     // End even an invalidated capture before unwinding its stream/buffers.

@@ -37,6 +37,7 @@
 #include "kernels/cuda/gemm/CUDANativeQuantisedArchitecture.h"
 #include "backends/GPUDeviceProcessLifetime.h"
 #include <gtest/gtest.h>
+#include "kernels/common/NativeQuantisedScaleLoad.h"
 #include "tensors/IQQuantTables.h"
 #include "transfer/TransferEngine.h"
 
@@ -178,9 +179,7 @@ extern "C"
     bool cudaNativeQuantisedGemvTuned_fp32(
         const int8_t *d_A_int8,
         const uint8_t *d_payload,
-        const uint16_t *d_scales,
-        const uint16_t *d_mins,
-        const uint32_t *d_emins,
+        ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes d_meta,
         float *d_C_fp32,
         const float *d_scales_A_block,
         int N, int K,
@@ -195,9 +194,7 @@ extern "C"
     bool cudaNativeQuantisedGemvTuned_small_m_fp32(
         const int8_t *d_A_int8,
         const uint8_t *d_payload,
-        const uint16_t *d_scales,
-        const uint16_t *d_mins,
-        const uint32_t *d_emins,
+        ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes d_meta,
         float *d_C_fp32,
         const float *d_scales_A_block,
         int M,
@@ -4470,9 +4467,7 @@ TEST_F(Test__CUDAGemmParity, Q6_K_SourceScaleMetadataAndCapturedArithmeticAreExa
                     byte >= 16 ? 0xaa : (b == 0 && byte == 0 ? 0x11 : 0));
         }
     rowmajor.reset(cudaRowMajorWeights_createForCodebook(
-        desc.payload, static_cast<const uint16_t *>(desc.scales),
-        static_cast<const uint16_t *>(desc.mins),
-        static_cast<const uint32_t *>(desc.emins), N, K, 8,
+        desc.payload, ::llaminar2::native_quantised_scale::metadataPlanes(desc), N, K, 8,
         gpu_device_.ordinal, stream));
     ASSERT_NE(rowmajor, nullptr);
     auto *quantized = static_cast<int8_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::QUANT_A));
@@ -4534,14 +4529,12 @@ TEST_F(Test__CUDAGemmParity, Q6_K_SourceScaleMetadataAndCapturedArithmeticAreExa
             auto *rowmajor_pointer = rowmajor.get();
             const bool launched = M == 1
                 ? cudaNativeQuantisedGemvTuned_fp32(
-                    quantized, desc.payload, static_cast<const uint16_t *>(desc.scales),
-                    static_cast<const uint16_t *>(desc.mins), static_cast<const uint32_t *>(desc.emins),
+                    quantized, desc.payload, ::llaminar2::native_quantised_scale::metadataPlanes(desc),
                     static_cast<float *>(output->gpu_data_ptr()), scales, N, K,
                     1.0f, 0.0f, nullptr, nullptr, 8, gpu_device_.ordinal, stream,
                     gemv.get(), &rowmajor_pointer)
                 : cudaNativeQuantisedGemvTuned_small_m_fp32(
-                    quantized, desc.payload, static_cast<const uint16_t *>(desc.scales),
-                    static_cast<const uint16_t *>(desc.mins), static_cast<const uint32_t *>(desc.emins),
+                    quantized, desc.payload, ::llaminar2::native_quantised_scale::metadataPlanes(desc),
                     static_cast<float *>(output->gpu_data_ptr()), scales, M, N, K,
                     1.0f, 0.0f, nullptr, nullptr, 8, gpu_device_.ordinal, stream,
                     gemv.get(), &rowmajor_pointer);
@@ -7943,9 +7936,7 @@ TEST_F(Test__CUDAGemmParity, MTP_Q40M1GEMVRepeatFromSameQuantizedActivationIsBit
             if (!cudaNativeQuantisedGemvTuned_fp32(
                     d_A_int8,
                     static_cast<const uint8_t *>(desc.payload),
-                    static_cast<const uint16_t *>(desc.scales),
-                    static_cast<const uint16_t *>(desc.mins),
-                    static_cast<const uint32_t *>(desc.emins),
+                    ::llaminar2::native_quantised_scale::metadataPlanes(desc),
                     d_first,
                     d_scales_A,
                     N,
@@ -7963,9 +7954,7 @@ TEST_F(Test__CUDAGemmParity, MTP_Q40M1GEMVRepeatFromSameQuantizedActivationIsBit
             if (!cudaNativeQuantisedGemvTuned_fp32(
                     d_A_int8,
                     static_cast<const uint8_t *>(desc.payload),
-                    static_cast<const uint16_t *>(desc.scales),
-                    static_cast<const uint16_t *>(desc.mins),
-                    static_cast<const uint32_t *>(desc.emins),
+                    ::llaminar2::native_quantised_scale::metadataPlanes(desc),
                     d_second,
                     d_scales_A,
                     N,
@@ -8080,9 +8069,7 @@ TEST_F(Test__CUDAGemmParity, MTP_Q40SmallMGEMVRepeatFromSameQuantizedActivationI
             if (!cudaNativeQuantisedGemvTuned_small_m_fp32(
                     d_A_int8,
                     static_cast<const uint8_t *>(desc.payload),
-                    static_cast<const uint16_t *>(desc.scales),
-                    static_cast<const uint16_t *>(desc.mins),
-                    static_cast<const uint32_t *>(desc.emins),
+                    ::llaminar2::native_quantised_scale::metadataPlanes(desc),
                     d_warmup,
                     d_scales_A,
                     M,
@@ -8101,9 +8088,7 @@ TEST_F(Test__CUDAGemmParity, MTP_Q40SmallMGEMVRepeatFromSameQuantizedActivationI
             if (!cudaNativeQuantisedGemvTuned_small_m_fp32(
                     d_A_int8,
                     static_cast<const uint8_t *>(desc.payload),
-                    static_cast<const uint16_t *>(desc.scales),
-                    static_cast<const uint16_t *>(desc.mins),
-                    static_cast<const uint32_t *>(desc.emins),
+                    ::llaminar2::native_quantised_scale::metadataPlanes(desc),
                     d_first,
                     d_scales_A,
                     M,
@@ -8122,9 +8107,7 @@ TEST_F(Test__CUDAGemmParity, MTP_Q40SmallMGEMVRepeatFromSameQuantizedActivationI
             if (!cudaNativeQuantisedGemvTuned_small_m_fp32(
                     d_A_int8,
                     static_cast<const uint8_t *>(desc.payload),
-                    static_cast<const uint16_t *>(desc.scales),
-                    static_cast<const uint16_t *>(desc.mins),
-                    static_cast<const uint32_t *>(desc.emins),
+                    ::llaminar2::native_quantised_scale::metadataPlanes(desc),
                     d_second,
                     d_scales_A,
                     M,
@@ -8340,9 +8323,7 @@ TEST_F(Test__CUDAGemmParity, NativeQuantisedSpecializedRuntimeM_AllNativeFormats
                     if (!cudaNativeQuantisedGemvTuned_small_m_fp32(
                             d_A_int8,
                             static_cast<const uint8_t *>(desc.payload),
-                            static_cast<const uint16_t *>(desc.scales),
-                            static_cast<const uint16_t *>(desc.mins),
-                            static_cast<const uint32_t *>(desc.emins),
+                            ::llaminar2::native_quantised_scale::metadataPlanes(desc),
                             d_C_specialized,
                             d_scales_A,
                             M,
@@ -8378,9 +8359,7 @@ TEST_F(Test__CUDAGemmParity, NativeQuantisedSpecializedRuntimeM_AllNativeFormats
                     const bool captured_launch = cudaNativeQuantisedGemvTuned_small_m_fp32(
                         d_A_int8,
                         static_cast<const uint8_t *>(desc.payload),
-                        static_cast<const uint16_t *>(desc.scales),
-                        static_cast<const uint16_t *>(desc.mins),
-                        static_cast<const uint32_t *>(desc.emins),
+                        ::llaminar2::native_quantised_scale::metadataPlanes(desc),
                         d_C_captured,
                         d_scales_A,
                         M,
@@ -8417,9 +8396,7 @@ TEST_F(Test__CUDAGemmParity, NativeQuantisedSpecializedRuntimeM_AllNativeFormats
                         captured_serial_launch = cudaNativeQuantisedGemvTuned_fp32(
                             row_A,
                             static_cast<const uint8_t *>(desc.payload),
-                            static_cast<const uint16_t *>(desc.scales),
-                            static_cast<const uint16_t *>(desc.mins),
-                            static_cast<const uint32_t *>(desc.emins),
+                            ::llaminar2::native_quantised_scale::metadataPlanes(desc),
                             row_C,
                             row_scales,
                             N,
@@ -8469,9 +8446,7 @@ TEST_F(Test__CUDAGemmParity, NativeQuantisedSpecializedRuntimeM_AllNativeFormats
                         if (!cudaNativeQuantisedGemvTuned_fp32(
                                 row_A,
                                 static_cast<const uint8_t *>(desc.payload),
-                                static_cast<const uint16_t *>(desc.scales),
-                                static_cast<const uint16_t *>(desc.mins),
-                                static_cast<const uint32_t *>(desc.emins),
+                                ::llaminar2::native_quantised_scale::metadataPlanes(desc),
                                 row_C,
                                 row_scales,
                                 N,
@@ -12093,9 +12068,7 @@ TEST_F(Test__CUDAGemmParity, IQ2_S_SourceScaleMetadataAndCapturedArithmeticAreEx
             ASSERT_EQ(payload[index * 9 + 4], source.qh[sub]);
         }
     rowmajor.reset(cudaRowMajorWeights_createForCodebook(
-        desc.payload, static_cast<const uint16_t *>(desc.scales),
-        static_cast<const uint16_t *>(desc.mins),
-        static_cast<const uint32_t *>(desc.emins), N, K, 13,
+        desc.payload, ::llaminar2::native_quantised_scale::metadataPlanes(desc), N, K, 13,
         gpu_device_.ordinal, stream));
     ASSERT_NE(rowmajor, nullptr);
     auto *quantized = static_cast<int8_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::QUANT_A));
@@ -12168,14 +12141,12 @@ TEST_F(Test__CUDAGemmParity, IQ2_S_SourceScaleMetadataAndCapturedArithmeticAreEx
             auto *rowmajor_pointer = rowmajor.get();
             const bool launched = M == 1
                 ? cudaNativeQuantisedGemvTuned_fp32(
-                    quantized, desc.payload, static_cast<const uint16_t *>(desc.scales),
-                    static_cast<const uint16_t *>(desc.mins), static_cast<const uint32_t *>(desc.emins),
+                    quantized, desc.payload, ::llaminar2::native_quantised_scale::metadataPlanes(desc),
                     static_cast<float *>(output->gpu_data_ptr()), scales, N, K,
                     1.0f, 0.0f, nullptr, nullptr, 13, gpu_device_.ordinal, stream,
                     gemv.get(), &rowmajor_pointer)
                 : cudaNativeQuantisedGemvTuned_small_m_fp32(
-                    quantized, desc.payload, static_cast<const uint16_t *>(desc.scales),
-                    static_cast<const uint16_t *>(desc.mins), static_cast<const uint32_t *>(desc.emins),
+                    quantized, desc.payload, ::llaminar2::native_quantised_scale::metadataPlanes(desc),
                     static_cast<float *>(output->gpu_data_ptr()), scales, M, N, K,
                     1.0f, 0.0f, nullptr, nullptr, 13, gpu_device_.ordinal, stream,
                     gemv.get(), &rowmajor_pointer);

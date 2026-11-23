@@ -1892,9 +1892,9 @@ namespace
         // Profiling must select the same physical representation as loading.
         // Otherwise a new encoding silently measures an obsolete kernel.
         packed.encoding = preparedEncodingForSource(*metadata);
-        packed.data_stride = preparedDataStride(packed.encoding);
+        packed.data_stride = preparedDataStride(packed.encoding, packed.codebook_id);
         packed.interleaved_block_stride = preparedInterleavedBlockStride(
-            packed.encoding, packed.is_asymmetric);
+            packed.encoding, packed.is_asymmetric, packed.codebook_id);
 
         const size_t n_chunks =
             static_cast<size_t>(packed.N_padded / 64);

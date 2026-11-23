@@ -61,6 +61,20 @@ namespace llaminar2
                  << system.total_bytes / (1024 * 1024) << " MB) to the single CPU package");
     }
 
+    void adoptIntegratedAcceleratorPoolCapacity(ComputeDevice &device)
+    {
+        if (device.memory_backing != PhysicalMemoryBacking::RankHostPool)
+            return;
+        const auto pool = observeIntegratedAcceleratorPool(device.numa_node);
+        const auto driver_free = device.free_memory_bytes;
+        device.free_memory_bytes =
+            integratedAcceleratorPoolAvailableBytes(pool, device.total_memory_bytes);
+        LOG_INFO("[HardwareInventory] Integrated accelerator " << device.name << " ordinal "
+                 << device.device_id << " admits its shared host pool: pool_available="
+                 << device.free_memory_bytes << " driver_free=" << driver_free
+                 << " reclaimable_file_cache=" << pool.inactive_file_bytes);
+    }
+
     // =========================================================================
     // CPU detection helpers
     // =========================================================================
@@ -332,7 +346,10 @@ namespace llaminar2
             // NUMA and P2P queries also enter the CUDA runtime, so they remain
             // inside the same authoritative discovery-policy branch.
             for (auto &dev : hw.cuda_devices)
+            {
                 dev.numa_node = cuda_enumeration::get_cuda_device_numa_node(dev.device_id);
+                adoptIntegratedAcceleratorPoolCapacity(dev);
+            }
             if (hw.cuda_devices.size() >= 2)
                 hw.cuda_p2p = cuda_enumeration::query_p2p_matrix(hw.cuda_devices);
         }
@@ -345,7 +362,10 @@ namespace llaminar2
             // NUMA and P2P queries can open KFD/runtime state and therefore
             // must never escape the ROCm discovery-policy branch.
             for (auto &dev : hw.rocm_devices)
+            {
                 dev.numa_node = rocm_enumeration::get_rocm_device_numa_node(dev.device_id);
+                adoptIntegratedAcceleratorPoolCapacity(dev);
+            }
             if (hw.rocm_devices.size() >= 2)
                 hw.rocm_p2p = rocm_enumeration::query_p2p_matrix(hw.rocm_devices);
         }

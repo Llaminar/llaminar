@@ -9,6 +9,8 @@
  */
 
 #include "HostMemoryCapacity.h"
+#include "utils/NUMATopology.h"
+#include <stdexcept>
 
 #include <algorithm>
 #include <cstdint>
@@ -172,5 +174,37 @@ namespace llaminar2
     HostMemoryCapacityObservation observeSystemMemoryCapacity()
     {
         return parseLinuxHostMemoryInfo(readTextFile("/proc/meminfo"));
+    }
+
+    std::size_t integratedAcceleratorPoolAvailableBytes(
+        const HostMemoryCapacityObservation &pool, std::size_t device_total_bytes)
+    {
+        if (!pool.valid() || device_total_bytes == 0)
+            throw std::runtime_error(
+                "Integrated accelerator capacity is unobservable: its host memory pool has no valid observation");
+        // The pool figure already caps itself at the pool total; the device
+        // total additionally bounds what this accelerator can address.
+        return std::min(pool.admission_available_bytes, device_total_bytes);
+    }
+
+    HostMemoryCapacityObservation observeIntegratedAcceleratorPool(int numa_node)
+    {
+        // Only the sysfs node view carries reclaimable-cache evidence; the
+        // libnuma path of observeNUMAMemoryCapacity reports raw MemFree, the
+        // very under-count this observation exists to remove.
+        if (numa_node >= 0)
+        {
+            auto node = parseLinuxHostMemoryInfo(readTextFile(
+                "/sys/devices/system/node/node" + std::to_string(numa_node) + "/meminfo"));
+            if (node.valid())
+                return node;
+        }
+        // A node-less accelerator is attributable to the machine-wide view
+        // only when the host is one memory domain.
+        if (NUMATopology::observedNodeCount() > 1)
+            throw std::runtime_error(
+                "Integrated accelerator on NUMA node " + std::to_string(numa_node) +
+                " has no node memory observation on a multi-node host");
+        return observeSystemMemoryCapacity();
     }
 } // namespace llaminar2

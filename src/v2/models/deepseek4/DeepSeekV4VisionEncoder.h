@@ -15,14 +15,22 @@
  *  - final RMSNorm;
  *  - aligner: zero-pad the grid to a multiple of ``merge``, 3x3 unfold
  *    (channel-major, ``F.unfold``), W2 . gelu_erf(W1 . u + b1) + b2.
- * Rows are returned in block (``perm``) order. Weights are FP32 host copies
- * of the GGUF tensors (BF16/F16 mmproj values widen exactly).
+ * Rows are returned in block (``perm``) order.
+ *
+ * Memory: projection matrices stay resident in their file precision (BF16/F16
+ * halves the FP32 footprint) and are widened exactly into a bounded scratch
+ * one output-row chunk at a time; vectors (norm gains, biases, sentinels) are
+ * widened once. Attention scores and the MLP are processed in row tiles, so
+ * the per-image workspace never materializes an N x N or N x I matrix. Every
+ * output row is computed by the same FP32 arithmetic on exactly widened
+ * weights; only the BLAS blocking of the tiles differs.
  */
 #pragma once
 
 #include "DeepSeekV4ImagePreprocess.h"
 
 #include <array>
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <string>
@@ -35,11 +43,41 @@ namespace llaminar2
 
 namespace llaminar2::deepseek4
 {
-    /** @brief One named FP32 host tensor in ggml dimension order (ne0 first). */
+    /** @brief Resident precision of a host vision tensor. */
+    enum class VisionHostPrecision : std::uint8_t
+    {
+        F32,  ///< `data` holds FP32 values.
+        BF16, ///< `half_bits` holds bfloat16 bit patterns (widen exactly).
+        F16,  ///< `half_bits` holds IEEE binary16 bit patterns (widen exactly).
+    };
+
+    /** @brief One named host tensor in ggml dimension order (ne0 first). */
     struct VisionHostTensor
     {
         std::vector<std::size_t> shape;
-        std::vector<float> data;
+        std::vector<float> data;               ///< FP32 storage (precision F32).
+        std::vector<std::uint16_t> half_bits;  ///< 16-bit storage (precision BF16/F16).
+        VisionHostPrecision precision = VisionHostPrecision::F32;
+    };
+
+    /**
+     * @brief Row-major [rows = out, cols = in] projection matrix in its resident precision.
+     *
+     * A 16-bit matrix is widened exactly (BF16/F16 -> FP32 is lossless) into
+     * caller scratch one row chunk at a time; it is never held as FP32.
+     */
+    struct VisionMatrix
+    {
+        int rows = 0, cols = 0;
+        VisionHostPrecision precision = VisionHostPrecision::F32;
+        std::vector<float> f32;
+        std::vector<std::uint16_t> half_bits;
+
+        /** @return Resident bytes. */
+        [[nodiscard]] std::size_t bytes() const noexcept
+        {
+            return f32.size() * sizeof(float) + half_bits.size() * sizeof(std::uint16_t);
+        }
     };
 
     /** @brief Host vision tower; immutable after construction, safe for concurrent encode(). */
@@ -80,35 +118,39 @@ namespace llaminar2::deepseek4
         /** @return Learned vector of a non-IMAGE sentinel role (START, PAD, NEWLINE, END). */
         const std::vector<float> &sentinel(ImageSentinel role) const;
 
-        /** @return FP32 bytes held by the tower's weights. */
+        /** @return Resident bytes held by the tower's weights. */
         std::size_t weightBytes() const noexcept { return weight_bytes_; }
 
         /**
-         * @brief Exact host FP32 weight bytes of a deepseek4v mmproj, metadata only.
+         * @brief Exact resident host weight bytes of a deepseek4v mmproj, metadata only.
          *
-         * Reads only the GGUF header/tensor directory (no payload), matching the
-         * FP32 host copies the tower keeps after @ref load. Used to admit the
-         * host tower into the physical-memory envelope before loading.
+         * Reads only the GGUF header/tensor directory (no payload) and applies
+         * the residency rule of @ref load: rank >= 2 BF16/F16 tensors keep 2
+         * bytes per value, every other tensor is widened to FP32, plus the
+         * synthetic IMAGE sentinel row.
          */
         static std::size_t mmprojHostWeightBytes(const std::string &path, const IMPIContext &mpi);
 
         /**
-         * @brief Worst-case host workspace of one request (encode + decode), bytes.
+         * @brief Worst-case host workspace of one request (decode + prepare + encode), bytes.
          *
-         * Closed form of @ref encode for the admitted request bound
-         * (kMaxImagesPerRequest images, official vision_max_n_token) plus the
-         * bounded decoded-RGB staging (kMaxDecodedPixels).
+         * Images are decoded, prepared and encoded one at a time, so the
+         * transient terms are one image's worth; the retained terms (each
+         * image's prepared geometry/pixels and encoded rows) scale with
+         * kMaxImagesPerRequest.
          */
         std::size_t encodeWorkspaceBytes() const noexcept;
 
     private:
         struct Layer
         {
-            std::vector<float> ln1, qkv_w, qkv_b, out_w, out_b, ln2, gate_w, up_w, down_w;
+            std::vector<float> ln1, qkv_b, out_b, ln2;
+            VisionMatrix qkv_w, out_w, gate_w, up_w, down_w;
         };
         VisionPreprocessConfig config_;
         int layers_ = 0, heads_ = 0, dim_ = 0, inter_ = 0, text_dim_ = 0;
-        std::vector<float> patch_w_, patch_b_, post_ln_, mm1_w_, mm1_b_, mm2_w_, mm2_b_;
+        std::vector<float> patch_b_, post_ln_, mm1_b_, mm2_b_;
+        VisionMatrix patch_w_, mm1_w_, mm2_w_;
         std::vector<Layer> blocks_;
         std::array<std::vector<float>, kImageSentinelCount> sentinels_;
         std::size_t weight_bytes_ = 0;

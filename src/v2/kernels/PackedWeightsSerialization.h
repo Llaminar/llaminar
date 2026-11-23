@@ -148,16 +148,16 @@ inline bool validNativeSourceScaleTupleHeader(const PackedWeightsHeader &header)
     if (header.prepared_encoding == static_cast<uint8_t>(Encoding::IQ3SExpandedSourceScale))
         return header.codebook_id == 11 && header.is_superblock == 1 &&
                header.is_asymmetric == 0 && header.payload_bytes == 13 &&
-               header.data_stride == static_cast<int32_t>(cpu::native_quantised::preparedDataStride(Encoding::IQ3SExpandedSourceScale)) &&
-               header.interleaved_block_stride == static_cast<int32_t>(cpu::native_quantised::preparedInterleavedBlockStride(Encoding::IQ3SExpandedSourceScale, false)) &&
+               header.data_stride == static_cast<int32_t>(cpu::native_quantised::preparedDataStride(Encoding::IQ3SExpandedSourceScale, header.codebook_id)) &&
+               header.interleaved_block_stride == static_cast<int32_t>(cpu::native_quantised::preparedInterleavedBlockStride(Encoding::IQ3SExpandedSourceScale, false, header.codebook_id)) &&
                header.has_native_blocks == 0;
     if (header.prepared_encoding == static_cast<uint8_t>(Encoding::NibbleLUTSourceScale))
         return header.codebook_id == 4 && header.is_superblock == 1 &&
                header.is_asymmetric == 0 && header.payload_bytes == 16 &&
                header.data_stride == static_cast<int32_t>(cpu::native_quantised::preparedDataStride(
-                   Encoding::NibbleLUTSourceScale)) &&
+                   Encoding::NibbleLUTSourceScale, header.codebook_id)) &&
                header.interleaved_block_stride == static_cast<int32_t>(
-                   cpu::native_quantised::preparedInterleavedBlockStride(Encoding::NibbleLUTSourceScale, false)) &&
+                   cpu::native_quantised::preparedInterleavedBlockStride(Encoding::NibbleLUTSourceScale, false, header.codebook_id)) &&
                header.has_native_blocks == 0;
     return !(header.codebook_id == 4 && header.is_superblock != 0 &&
              header.prepared_encoding == static_cast<uint8_t>(Encoding::NibbleLUT));

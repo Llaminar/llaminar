@@ -194,9 +194,9 @@ namespace
         packed.payload_bytes = encoding == CPUNativeQuantisedEncoding::NibbleLUT ? 16 : 32;
         packed.codebook_id = codebook;
         packed.encoding = encoding;
-        packed.data_stride = static_cast<int>(preparedDataStride(packed.encoding));
+        packed.data_stride = static_cast<int>(preparedDataStride(packed.encoding, packed.codebook_id));
         packed.interleaved_block_stride =
-            static_cast<int>(preparedInterleavedBlockStride(packed.encoding, false));
+            static_cast<int>(preparedInterleavedBlockStride(packed.encoding, false, packed.codebook_id));
         packed.native_interleaved.resize(static_cast<size_t>(packed.interleaved_block_stride), uint8_t{0});
         std::memcpy(const_cast<uint16_t *>(packed.chunkScales(0, 0)), words.data(), sizeof(words));
         return packed;

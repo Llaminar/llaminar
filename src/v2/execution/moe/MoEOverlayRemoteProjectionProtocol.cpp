@@ -202,11 +202,12 @@ namespace llaminar2
             manifest.cpu_encoding =
                 cpu::native_quantised::preparedEncodingForSource(*source);
             manifest.cpu_data_stride =
-                cpu::native_quantised::preparedDataStride(manifest.cpu_encoding);
+                cpu::native_quantised::preparedDataStride(manifest.cpu_encoding, manifest.cpu_codebook_id);
             manifest.cpu_block_stride = static_cast<std::uint32_t>(
                 cpu::native_quantised::preparedInterleavedBlockStride(
                     manifest.cpu_encoding,
-                    manifest.cpu_is_asymmetric != 0));
+                    manifest.cpu_is_asymmetric != 0,
+                    manifest.cpu_codebook_id));
             manifest.maximum_chunk_bytes = maximum_chunk_bytes;
             return manifest;
         }
@@ -512,10 +513,10 @@ namespace llaminar2
                 cpu_encoding !=
                     cpu::native_quantised::preparedEncodingForSource(*source) ||
                 cpu_data_stride !=
-                    cpu::native_quantised::preparedDataStride(cpu_encoding) ||
+                    cpu::native_quantised::preparedDataStride(cpu_encoding, cpu_codebook_id) ||
                 cpu_block_stride !=
                     cpu::native_quantised::preparedInterleavedBlockStride(
-                        cpu_encoding, cpu_is_asymmetric != 0))
+                        cpu_encoding, cpu_is_asymmetric != 0, cpu_codebook_id))
             {
                 return reject(
                     error,

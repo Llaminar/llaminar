@@ -1,12 +1,16 @@
 /**
  * @file DeepSeekV4VisionEncoder.cpp
- * @brief FP32 BLAS implementation of the official vision.py tower.
+ * @brief Memory-minimal FP32 BLAS implementation of the official vision.py tower.
  *
- * Matrices are row-major [out, in] (a GGUF tensor with ne = {in, out}).
- * Every projection is one oneDNN ``dnnl_sgemm`` (row-major) ``Y = X . W^T (+ b)``. Attention
- * materializes one head's [N, N] score matrix at a time (N <= the admitted
- * patch capacity), applies an exact max-subtracted softmax per row and
- * multiplies by V; heads are written to disjoint output columns.
+ * Matrices are row-major [out, in] (a GGUF tensor with ne = {in, out}) and stay
+ * resident in their file precision. Every projection is ``Y = X . W^T (+ b)``
+ * through oneDNN ``dnnl_sgemm`` (row-major); a 16-bit matrix is widened exactly
+ * into a bounded scratch one output-row chunk at a time, so FP32 copies of the
+ * weights never exist. Attention computes one head's scores for a tile of
+ * query rows at a time ([tile, N], never [N, N]), applies an exact
+ * max-subtracted softmax per row and multiplies by V; the MLP likewise runs
+ * one tile of rows through gate/up/down. Rows are independent in both, so
+ * tiling changes only BLAS blocking, not the arithmetic of a row.
  */
 #include "DeepSeekV4VisionEncoder.h"
 
@@ -19,6 +23,8 @@
 #include <oneapi/dnnl/dnnl.h>
 
 #include <algorithm>
+#include <cstdint>
+#include <cstring>
 #include <cmath>
 #include <stdexcept>
 #include "../../utils/OpenMPUtils.h"
@@ -29,6 +35,10 @@ namespace llaminar2::deepseek4
 constexpr std::uint64_t kHostDecodedPixelBound = std::uint64_t{64} << 20;
 constexpr int kVisionMaxTokens = 384;    ///< vision_max_n_token (official, fixed).
 constexpr int kVisionDefaultMerge = 3;   ///< Llama.cpp default scale_factor.
+/** @brief Query/MLP rows per tile: bounds the score tile to kVisionRowTile x N floats. */
+constexpr std::size_t kVisionRowTile = 256;
+/** @brief FP32 elements of the per-call weight-widening scratch (4 MiB). */
+constexpr std::size_t kVisionWeightScratchFloats = std::size_t{1} << 20;
 } // namespace llaminar2::deepseek4
 
 namespace llaminar2::deepseek4
@@ -38,17 +48,90 @@ namespace llaminar2::deepseek4
         constexpr float kNormEps = 1e-6f;
         constexpr double kRopeTheta = 10000.0;
 
+        /** @brief Exact BF16 -> FP32 widening. */
+        inline float widenBF16(std::uint16_t bits) noexcept
+        {
+            const std::uint32_t u = static_cast<std::uint32_t>(bits) << 16;
+            float f;
+            std::memcpy(&f, &u, sizeof(f));
+            return f;
+        }
+
+        /** @brief Exact IEEE binary16 -> FP32 widening (subnormals, inf and NaN included). */
+        inline float widenF16(std::uint16_t h) noexcept
+        {
+            const std::uint32_t sign = static_cast<std::uint32_t>(h & 0x8000u) << 16;
+            std::uint32_t exp = (h >> 10) & 0x1Fu, mant = h & 0x3FFu, u;
+            if (exp == 0x1Fu)
+                u = sign | 0x7F800000u | (mant << 13);
+            else if (exp != 0)
+                u = sign | ((exp + 112u) << 23) | (mant << 13);
+            else if (mant == 0)
+                u = sign;
+            else
+            {
+                // Subnormal half: normalize into an FP32 normal.
+                int e = -1;
+                do { ++e; mant <<= 1; } while ((mant & 0x400u) == 0);
+                u = sign | ((112u - static_cast<std::uint32_t>(e)) << 23) | ((mant & 0x3FFu) << 13);
+            }
+            float f;
+            std::memcpy(&f, &u, sizeof(f));
+            return f;
+        }
+
+        void requireShape(const VisionHostTensor &t, const std::string &name, std::initializer_list<std::size_t> shape)
+        {
+            if (!std::equal(shape.begin(), shape.end(), t.shape.begin(), t.shape.end()))
+                throw std::invalid_argument("DeepSeek-V4 mmproj tensor " + name + " has an unexpected shape");
+        }
+
+        /** @brief Consume a vector tensor, widened once to FP32 (vectors are tiny). */
         std::vector<float> take(std::map<std::string, VisionHostTensor> &t, const std::string &name,
                                 std::initializer_list<std::size_t> shape)
         {
             auto it = t.find(name);
             if (it == t.end())
                 throw std::invalid_argument("DeepSeek-V4 mmproj is missing " + name);
-            if (!std::equal(shape.begin(), shape.end(), it->second.shape.begin(), it->second.shape.end()))
-                throw std::invalid_argument("DeepSeek-V4 mmproj tensor " + name + " has an unexpected shape");
-            auto out = std::move(it->second.data);
+            requireShape(it->second, name, shape);
+            std::vector<float> out;
+            if (it->second.precision == VisionHostPrecision::F32)
+                out = std::move(it->second.data);
+            else
+            {
+                out.resize(it->second.half_bits.size());
+                const bool bf16 = it->second.precision == VisionHostPrecision::BF16;
+                for (std::size_t i = 0; i < out.size(); ++i)
+                    out[i] = bf16 ? widenBF16(it->second.half_bits[i]) : widenF16(it->second.half_bits[i]);
+            }
             t.erase(it);
             return out;
+        }
+
+        /** @brief Consume a projection as [rows = out, cols = in] in its resident precision. */
+        VisionMatrix takeMatrix(std::map<std::string, VisionHostTensor> &t, const std::string &name,
+                                std::initializer_list<std::size_t> shape, std::size_t rows)
+        {
+            auto it = t.find(name);
+            if (it == t.end())
+                throw std::invalid_argument("DeepSeek-V4 mmproj is missing " + name);
+            requireShape(it->second, name, shape);
+            std::size_t numel = 1;
+            for (const auto d : shape) numel *= d;
+            if (rows == 0 || numel % rows != 0)
+                throw std::invalid_argument("DeepSeek-V4 mmproj tensor " + name + " is not a row-major matrix");
+            VisionMatrix m;
+            m.rows = static_cast<int>(rows);
+            m.cols = static_cast<int>(numel / rows);
+            m.precision = it->second.precision;
+            if (m.precision == VisionHostPrecision::F32)
+                m.f32 = std::move(it->second.data);
+            else
+                m.half_bits = std::move(it->second.half_bits);
+            if ((m.f32.size() + m.half_bits.size()) != numel)
+                throw std::invalid_argument("DeepSeek-V4 mmproj tensor " + name + " storage disagrees with its shape");
+            t.erase(it);
+            return m;
         }
 
         /** @brief Row-major C[m, n] = alpha * op(A) . op(B); fatal on a oneDNN error. */
@@ -59,17 +142,53 @@ namespace llaminar2::deepseek4
                 throw std::runtime_error("DeepSeek-V4 vision tower: dnnl_sgemm failed");
         }
 
-        /** @brief Y[m, n] = X[m, k] . W[n, k]^T (+ bias[n]). */
-        void linear(const float *x, int m, int k, const std::vector<float> &w, const float *bias, int n, float *y)
+        /** @return Output rows of one widening chunk for a K-wide matrix. */
+        inline std::size_t widenChunkRows(std::size_t k) noexcept
         {
-            sgemm('N', 'T', m, n, k, 1.0f, x, k, w.data(), k, y, n);
+            return std::max<std::size_t>(1, kVisionWeightScratchFloats / std::max<std::size_t>(k, 1));
+        }
+
+        /**
+         * @brief Y[m, n] (row stride ldy) = X[m, k] . W[n, k]^T (+ bias[n]).
+         * @param scratch Widening scratch of at least widenChunkRows(k) * k floats
+         *        (unused for an FP32 matrix).
+         */
+        void linear(const float *x, int m, int k, const VisionMatrix &w, const float *bias, int n, float *y,
+                    std::vector<float> &scratch, int ldy = -1)
+        {
+            if (w.rows != n || w.cols != k)
+                throw std::invalid_argument("DeepSeek-V4 vision projection geometry mismatch");
+            if (ldy < 0) ldy = n;
+            if (w.precision == VisionHostPrecision::F32)
+                sgemm('N', 'T', m, n, k, 1.0f, x, k, w.f32.data(), k, y, ldy);
+            else
+            {
+                const std::size_t chunk = widenChunkRows(static_cast<std::size_t>(k));
+                if (scratch.size() < chunk * static_cast<std::size_t>(k))
+                    scratch.resize(chunk * static_cast<std::size_t>(k));
+                const bool bf16 = w.precision == VisionHostPrecision::BF16;
+                for (std::size_t r0 = 0; r0 < static_cast<std::size_t>(n); r0 += chunk)
+                {
+                    const std::size_t rows = std::min(chunk, static_cast<std::size_t>(n) - r0);
+                    const std::uint16_t *src = w.half_bits.data() + r0 * static_cast<std::size_t>(k);
+                    const std::size_t count = rows * static_cast<std::size_t>(k);
+                    auto do_widen = [&]()
+                    {
+#pragma omp for schedule(static)
+                        for (std::size_t i = 0; i < count; ++i)
+                            scratch[i] = bf16 ? widenBF16(src[i]) : widenF16(src[i]);
+                    };
+                    OMP_WORKSHARE_REGION(do_widen);
+                    sgemm('N', 'T', m, static_cast<int>(rows), k, 1.0f, x, k, scratch.data(), k, y + r0, ldy);
+                }
+            }
             if (bias)
             {
                 auto do_bias = [&]()
                 {
 #pragma omp for schedule(static)
                     for (int r = 0; r < m; ++r)
-                        for (int c = 0; c < n; ++c) y[static_cast<std::size_t>(r) * n + c] += bias[c];
+                        for (int c = 0; c < n; ++c) y[static_cast<std::size_t>(r) * ldy + c] += bias[c];
                 };
                 OMP_WORKSHARE_REGION(do_bias);
             }
@@ -106,7 +225,7 @@ namespace llaminar2::deepseek4
         const std::size_t D = static_cast<std::size_t>(dim_);
         if (layers_ <= 0 || heads_ <= 0 || dim_ % heads_ || (dim_ / heads_) % 4)
             throw std::invalid_argument("DeepSeek-V4 vision geometry requires head_dim divisible by 4");
-        patch_w_ = take(t, "v.patch_embd.weight", {p, p, 3, D});
+        patch_w_ = takeMatrix(t, "v.patch_embd.weight", {p, p, 3, D}, D);
         patch_b_ = take(t, "v.patch_embd.bias", {D});
         const auto gate_it = t.find("v.blk.0.ffn_gate.weight");
         if (gate_it == t.end() || gate_it->second.shape.size() != 2)
@@ -116,11 +235,17 @@ namespace llaminar2::deepseek4
         for (int i = 0; i < layers_; ++i)
         {
             const std::string pre = "v.blk." + std::to_string(i) + ".";
-            blocks_.push_back({take(t, pre + "ln1.weight", {D}), take(t, pre + "attn_qkv.weight", {D, 3 * D}),
-                               take(t, pre + "attn_qkv.bias", {3 * D}), take(t, pre + "attn_out.weight", {D, D}),
-                               take(t, pre + "attn_out.bias", {D}), take(t, pre + "ln2.weight", {D}),
-                               take(t, pre + "ffn_gate.weight", {D, I}), take(t, pre + "ffn_up.weight", {D, I}),
-                               take(t, pre + "ffn_down.weight", {I, D})});
+            Layer layer;
+            layer.ln1 = take(t, pre + "ln1.weight", {D});
+            layer.qkv_w = takeMatrix(t, pre + "attn_qkv.weight", {D, 3 * D}, 3 * D);
+            layer.qkv_b = take(t, pre + "attn_qkv.bias", {3 * D});
+            layer.out_w = takeMatrix(t, pre + "attn_out.weight", {D, D}, D);
+            layer.out_b = take(t, pre + "attn_out.bias", {D});
+            layer.ln2 = take(t, pre + "ln2.weight", {D});
+            layer.gate_w = takeMatrix(t, pre + "ffn_gate.weight", {D, I}, I);
+            layer.up_w = takeMatrix(t, pre + "ffn_up.weight", {D, I}, I);
+            layer.down_w = takeMatrix(t, pre + "ffn_down.weight", {I, D}, D);
+            blocks_.push_back(std::move(layer));
         }
         post_ln_ = take(t, "v.post_ln.weight", {D});
         const auto mm1 = t.find("mm.1.weight");
@@ -129,9 +254,9 @@ namespace llaminar2::deepseek4
             throw std::invalid_argument("DeepSeek-V4 mmproj aligner mm.1.weight does not match the ViT width");
         text_dim_ = static_cast<int>(mm1->second.shape[1]);
         const std::size_t T = static_cast<std::size_t>(text_dim_);
-        mm1_w_ = take(t, "mm.1.weight", {merged, T});
+        mm1_w_ = takeMatrix(t, "mm.1.weight", {merged, T}, T);
         mm1_b_ = take(t, "mm.1.bias", {T});
-        mm2_w_ = take(t, "mm.2.weight", {T, T});
+        mm2_w_ = takeMatrix(t, "mm.2.weight", {T, T}, T);
         mm2_b_ = take(t, "mm.2.bias", {T});
         sentinels_[static_cast<int>(ImageSentinel::Start)] = take(t, "v.token_embd.img_start", {T});
         sentinels_[static_cast<int>(ImageSentinel::Pad)] = take(t, "v.token_embd.img_pad", {T});
@@ -141,10 +266,17 @@ namespace llaminar2::deepseek4
         if (!t.empty())
             throw std::invalid_argument("DeepSeek-V4 mmproj has unconsumed tensor " + t.begin()->first);
 
+        // Resident bytes, by the same rule mmprojHostWeightBytes prices from
+        // the tensor directory: matrices in file precision, vectors in FP32.
         const auto add = [&](const std::vector<float> &v) { weight_bytes_ += v.size() * sizeof(float); };
-        for (const auto *v : {&patch_w_, &patch_b_, &post_ln_, &mm1_w_, &mm1_b_, &mm2_w_, &mm2_b_}) add(*v);
+        const auto addm = [&](const VisionMatrix &m) { weight_bytes_ += m.bytes(); };
+        for (const auto *v : {&patch_b_, &post_ln_, &mm1_b_, &mm2_b_}) add(*v);
+        for (const auto *m : {&patch_w_, &mm1_w_, &mm2_w_}) addm(*m);
         for (const auto &b : blocks_)
-            for (const auto *v : {&b.ln1, &b.qkv_w, &b.qkv_b, &b.out_w, &b.out_b, &b.ln2, &b.gate_w, &b.up_w, &b.down_w}) add(*v);
+        {
+            for (const auto *v : {&b.ln1, &b.qkv_b, &b.out_b, &b.ln2}) add(*v);
+            for (const auto *m : {&b.qkv_w, &b.out_w, &b.gate_w, &b.up_w, &b.down_w}) addm(*m);
+        }
         for (const auto &s : sentinels_) add(s);
     }
 
@@ -161,9 +293,12 @@ namespace llaminar2::deepseek4
         if (N <= 0 || img.patches.size() != static_cast<std::size_t>(N) * K)
             throw std::invalid_argument("DeepSeek-V4 vision input has inconsistent patch geometry");
         const std::size_t ND = static_cast<std::size_t>(N) * D;
-        std::vector<float> x(ND), a(ND), qkv(ND * 3), o(ND), mlp_g(static_cast<std::size_t>(N) * inter_),
-            mlp_u(mlp_g.size()), scores(static_cast<std::size_t>(N) * N);
-        linear(img.patches.data(), N, K, patch_w_, patch_b_.data(), D, x.data());
+        const std::size_t tile = std::min<std::size_t>(kVisionRowTile, static_cast<std::size_t>(N));
+        // Full-width activations (attention needs every K/V row); the score and
+        // MLP buffers cover one row tile only.
+        std::vector<float> x(ND), a(ND), qkv(ND * 3), o(ND), scores(tile * static_cast<std::size_t>(N)),
+            mlp_g(tile * static_cast<std::size_t>(inter_)), mlp_u(mlp_g.size()), widen;
+        linear(img.patches.data(), N, K, patch_w_, patch_b_.data(), D, x.data(), widen);
 
         // 2D rotary tables: pair j of the rotated half (hd/2 pairs, rotate-half).
         const int half = hd / 2, quarter = hd / 4;
@@ -183,7 +318,7 @@ namespace llaminar2::deepseek4
         for (const auto &blk : blocks_)
         {
             rmsNorm(x.data(), N, D, blk.ln1, a.data());
-            linear(a.data(), N, D, blk.qkv_w, blk.qkv_b.data(), 3 * D, qkv.data());
+            linear(a.data(), N, D, blk.qkv_w, blk.qkv_b.data(), 3 * D, qkv.data(), widen);
             // RoPE on q (columns [0, D)) and k ([D, 2D)).
             auto do_rope = [&]()
             {
@@ -206,45 +341,61 @@ namespace llaminar2::deepseek4
             OMP_WORKSHARE_REGION(do_rope);
             for (int h = 0; h < H; ++h)
             {
-                const float *q = &qkv[h * hd], *k = &qkv[D + h * hd], *v = &qkv[2 * D + h * hd];
-                sgemm('N', 'T', N, N, hd, scale, q, 3 * D, k, 3 * D, scores.data(), N);
-                auto do_softmax = [&]()
+                const float *k = &qkv[D + h * hd], *v = &qkv[2 * D + h * hd];
+                // Query rows are independent: score one tile of rows against
+                // every key, softmax each row exactly, then accumulate V.
+                for (int r0 = 0; r0 < N; r0 += static_cast<int>(tile))
                 {
-#pragma omp for schedule(static)
-                    for (int r = 0; r < N; ++r)
+                    const int rows = std::min(static_cast<int>(tile), N - r0);
+                    const float *q = &qkv[static_cast<std::size_t>(r0) * 3 * D + h * hd];
+                    sgemm('N', 'T', rows, N, hd, scale, q, 3 * D, k, 3 * D, scores.data(), N);
+                    auto do_softmax = [&]()
                     {
-                        float *row = &scores[static_cast<std::size_t>(r) * N];
-                        const float m = *std::max_element(row, row + N);
-                        double sum = 0.0;
-                        for (int c = 0; c < N; ++c)
+#pragma omp for schedule(static)
+                        for (int r = 0; r < rows; ++r)
                         {
-                            row[c] = std::exp(row[c] - m);
-                            sum += row[c];
+                            float *row = &scores[static_cast<std::size_t>(r) * N];
+                            const float m = *std::max_element(row, row + N);
+                            double sum = 0.0;
+                            for (int c = 0; c < N; ++c)
+                            {
+                                row[c] = std::exp(row[c] - m);
+                                sum += row[c];
+                            }
+                            const float inv = static_cast<float>(1.0 / sum);
+                            for (int c = 0; c < N; ++c) row[c] *= inv;
                         }
-                        const float inv = static_cast<float>(1.0 / sum);
-                        for (int c = 0; c < N; ++c) row[c] *= inv;
-                    }
-                };
-                OMP_WORKSHARE_REGION(do_softmax);
-                sgemm('N', 'N', N, hd, N, 1.0f, scores.data(), N, v, 3 * D, &o[h * hd], D);
+                    };
+                    OMP_WORKSHARE_REGION(do_softmax);
+                    sgemm('N', 'N', rows, hd, N, 1.0f, scores.data(), N, v, 3 * D,
+                          &o[static_cast<std::size_t>(r0) * D + h * hd], D);
+                }
             }
-            linear(o.data(), N, D, blk.out_w, blk.out_b.data(), D, a.data());
+            linear(o.data(), N, D, blk.out_w, blk.out_b.data(), D, a.data(), widen);
             for (std::size_t i = 0; i < ND; ++i) x[i] += a[i];
             rmsNorm(x.data(), N, D, blk.ln2, a.data());
-            linear(a.data(), N, D, blk.gate_w, nullptr, inter_, mlp_g.data());
-            linear(a.data(), N, D, blk.up_w, nullptr, inter_, mlp_u.data());
-            auto do_swiglu = [&]()
+            // MLP rows are independent: gate/up/SwiGLU/down one row tile at a
+            // time; o (free after the attention projection) receives down.
+            for (int r0 = 0; r0 < N; r0 += static_cast<int>(tile))
             {
-#pragma omp for schedule(static)
-                for (std::size_t i = 0; i < mlp_g.size(); ++i)
+                const int rows = std::min(static_cast<int>(tile), N - r0);
+                const float *ar = &a[static_cast<std::size_t>(r0) * D];
+                linear(ar, rows, D, blk.gate_w, nullptr, inter_, mlp_g.data(), widen);
+                linear(ar, rows, D, blk.up_w, nullptr, inter_, mlp_u.data(), widen);
+                const std::size_t count = static_cast<std::size_t>(rows) * inter_;
+                auto do_swiglu = [&]()
                 {
-                    const float g = mlp_g[i];
-                    mlp_g[i] = g / (1.0f + std::exp(-g)) * mlp_u[i];
-                }
-            };
-            OMP_WORKSHARE_REGION(do_swiglu);
-            linear(mlp_g.data(), N, inter_, blk.down_w, nullptr, D, a.data());
-            for (std::size_t i = 0; i < ND; ++i) x[i] += a[i];
+#pragma omp for schedule(static)
+                    for (std::size_t i = 0; i < count; ++i)
+                    {
+                        const float g = mlp_g[i];
+                        mlp_g[i] = g / (1.0f + std::exp(-g)) * mlp_u[i];
+                    }
+                };
+                OMP_WORKSHARE_REGION(do_swiglu);
+                linear(mlp_g.data(), rows, inter_, blk.down_w, nullptr, D, &o[static_cast<std::size_t>(r0) * D], widen);
+            }
+            for (std::size_t i = 0; i < ND; ++i) x[i] += o[i];
         }
         rmsNorm(x.data(), N, D, post_ln_, a.data());
 
@@ -252,6 +403,14 @@ namespace llaminar2::deepseek4
         const int r = config_.merge, LH = img.llm_h, LW = img.llm_w, U = D * r * r, L = LH * LW;
         if (LH != (img.vit_h + r - 1) / r || LW != (img.vit_w + r - 1) / r)
             throw std::invalid_argument("DeepSeek-V4 vision aligner grid disagrees with the patch grid");
+        // The ViT activations are dead once `a` holds the final norm; release
+        // them before the aligner buffers exist.
+        std::vector<float>().swap(x);
+        std::vector<float>().swap(qkv);
+        std::vector<float>().swap(o);
+        std::vector<float>().swap(scores);
+        std::vector<float>().swap(mlp_g);
+        std::vector<float>().swap(mlp_u);
         std::vector<float> unfolded(static_cast<std::size_t>(L) * U, 0.0f);
         auto do_unfold = [&]()
         {
@@ -271,10 +430,13 @@ namespace llaminar2::deepseek4
             }
         };
         OMP_WORKSHARE_REGION(do_unfold);
+        std::vector<float>().swap(a);
         std::vector<float> h1(static_cast<std::size_t>(L) * text_dim_), h2(h1.size());
-        linear(unfolded.data(), L, U, mm1_w_, mm1_b_.data(), text_dim_, h1.data());
+        linear(unfolded.data(), L, U, mm1_w_, mm1_b_.data(), text_dim_, h1.data(), widen);
+        std::vector<float>().swap(unfolded);
         for (auto &v : h1) v = 0.5f * v * (1.0f + std::erf(v * static_cast<float>(M_SQRT1_2)));
-        linear(h1.data(), L, text_dim_, mm2_w_, mm2_b_.data(), text_dim_, h2.data());
+        linear(h1.data(), L, text_dim_, mm2_w_, mm2_b_.data(), text_dim_, h2.data(), widen);
+        std::vector<float>().swap(h1);
 
         if (img.perm.size() != static_cast<std::size_t>(L))
             throw std::invalid_argument("DeepSeek-V4 vision block order does not cover the aligner grid");
@@ -316,8 +478,23 @@ namespace llaminar2::deepseek4
             const auto &shape = tensor->shape();
             if (shape.size() == 2) host.shape.assign(shape.rbegin(), shape.rend());
             else host.shape.assign(shape.begin(), shape.end());
-            host.data.resize(tensor->numel());
-            tensor->to_fp32(host.data.data());
+            // Residency rule (priced identically by mmprojHostWeightBytes):
+            // rank >= 2 BF16/F16 matrices keep their exact 16-bit values;
+            // every other tensor is widened to FP32 once.
+            const auto *bf16 = shape.size() >= 2 ? dynamic_cast<const BF16Tensor *>(tensor.get()) : nullptr;
+            const auto *f16 = shape.size() >= 2 ? dynamic_cast<const FP16Tensor *>(tensor.get()) : nullptr;
+            if (bf16 || f16)
+            {
+                const std::uint16_t *bits = bf16 ? bf16->typed_data() : f16->typed_data();
+                host.half_bits.assign(bits, bits + tensor->numel());
+                host.precision = bf16 ? VisionHostPrecision::BF16 : VisionHostPrecision::F16;
+            }
+            else
+            {
+                host.data.resize(tensor->numel());
+                tensor->to_fp32(host.data.data());
+            }
+            tensor.reset();
             tensors.emplace(name, std::move(host));
         }
         auto encoder = std::make_unique<DeepSeekV4VisionEncoder>(std::move(tensors), config, layers, heads);
@@ -335,14 +512,24 @@ namespace llaminar2::deepseek4
         if (!loader.loadModel(path))
             throw std::runtime_error("Cannot read DeepSeek-V4 mmproj metadata from " + path);
         loader.sealTensorSources();
-        // Exact directory data extents: the loader reads exactly `size_bytes`
-        // per tensor, and the tower keeps every tensor as an FP32 vector.
+        // Residency rule of load(): rank >= 2 BF16/F16 tensors stay 16-bit,
+        // every other tensor (vectors, F32 or quantized matrices) is FP32.
         std::size_t total = 0;
         for (const auto &info : loader.getModel().tensors)
         {
-            if (info.size_bytes > SIZE_MAX - total)
+            std::size_t numel = 1;
+            for (const auto d : info.dimensions)
+            {
+                if (d != 0 && numel > SIZE_MAX / d)
+                    throw std::overflow_error("DeepSeek-V4 mmproj tensor element count overflow");
+                numel *= static_cast<std::size_t>(d);
+            }
+            const bool half = info.dimensions.size() >= 2 &&
+                (info.type == GGUFTensorType::BF16 || info.type == GGUFTensorType::F16);
+            const std::size_t bytes = numel * (half ? sizeof(std::uint16_t) : sizeof(float));
+            if (bytes / (half ? sizeof(std::uint16_t) : sizeof(float)) != numel || bytes > SIZE_MAX - total)
                 throw std::overflow_error("DeepSeek-V4 mmproj host byte sum overflow");
-            total += info.size_bytes;
+            total += bytes;
         }
         // The tower also retains its synthetic IMAGE sentinel row (T floats),
         // which is not a file tensor (see the encoder constructor).
@@ -352,29 +539,56 @@ namespace llaminar2::deepseek4
         return total;
     }
 
-    /** @brief Shared worst-case host workspace formula (bytes); single authority. */
-    std::size_t visionTowerWorkspaceFor(std::size_t D, std::size_t I, std::size_t T,
-                                        std::size_t merge)
+    /**
+     * @brief Shared worst-case host request workspace (bytes); single authority.
+     *
+     * Mirrors the lifetimes of DeepSeekV4PromptImageEncoder::expand and encode():
+     * images are processed one at a time, so the transient term is the larger of
+     * one image's decode/prepare phase and its encode phase; only each image's
+     * encoded rows and block/perm vectors are retained across the request.
+     */
+    std::size_t visionTowerWorkspaceFor(std::size_t D, std::size_t I, std::size_t T, std::size_t merge,
+                                        std::size_t patch, std::size_t heads)
     {
-        const std::size_t max_tokens = static_cast<std::size_t>(kVisionMaxTokens);
-        // L = ceil(vit / merge) <= max_tokens, so the ViT grid is <= max_tokens * merge.
-        const std::size_t vit_cells = max_tokens * merge * merge;
-        const std::size_t per_image =
-            vit_cells * D * 6u +                       // x, a, qkv(3), o
-            2u * vit_cells * I +                       // mlp_g, mlp_u
-            vit_cells * vit_cells +                    // scores (N x N)
-            max_tokens * D * merge * merge +           // aligner unfolded (L * D * r^2)
-            3u * max_tokens * T;                       // h1, h2, rows
-        // Bounded decoded-RGB staging (3 bytes per pixel, 64 Mi-pixel cap).
-        const std::size_t decode = static_cast<std::size_t>(kHostDecodedPixelBound) * 3u;
-        return (per_image + decode) * static_cast<std::size_t>(kMaxImagesPerRequest);
+        if (!D || !I || !T || !merge || !patch || !heads || D % heads)
+            throw std::invalid_argument("DeepSeek-V4 vision workspace geometry is degenerate");
+        const std::size_t L = static_cast<std::size_t>(kVisionMaxTokens); // aligner rows
+        const std::size_t N = L * merge * merge;                           // ViT patch rows
+        const std::size_t K = 3u * patch * patch;                          // patch width
+        const std::size_t U = D * merge * merge;                           // unfolded width
+        const std::size_t hd = D / heads;
+        const std::size_t tile = std::min<std::size_t>(kVisionRowTile, N);
+        const std::size_t P = static_cast<std::size_t>(kHostDecodedPixelBound);
+        constexpr std::size_t f = sizeof(float);
+
+        // Widening scratch: the largest chunk any projection uses.
+        std::size_t widen = 0;
+        for (const std::size_t k : {K, D, I, U, T})
+            widen = std::max(widen, widenChunkRows(k) * k);
+
+        // Decode/prepare phase (bytes): stb's buffer and its RgbImage copy
+        // (2 x 3P); then the decoded image, one resize intermediate (<= 3P),
+        // the resized/padded pixels and the padded copy (each <= N*K bytes),
+        // and finally the FP32 patches beside the decoded image and pixels.
+        const std::size_t prepare = std::max({2u * 3u * P, 3u * P + 3u * P + 2u * N * K,
+                                              3u * P + N * K + f * N * K});
+        // Encode phase (bytes): patches, widening scratch, RoPE tables and the
+        // larger of the ViT working set and the aligner working set.
+        const std::size_t vit = 6u * N * D + tile * N + 2u * tile * I;
+        const std::size_t aligner = std::max(N * D + L * U, L * U + 2u * L * T);
+        const std::size_t encode = f * (N * K + widen + N * hd + std::max(vit, aligner));
+        // Retained per image: encoded rows plus block/perm order.
+        const std::size_t retained = f * L * T + sizeof(std::int32_t) *
+            (static_cast<std::size_t>(maxImageSlotsPerImage(kVisionMaxTokens)) + L);
+        return retained * static_cast<std::size_t>(kMaxImagesPerRequest) + std::max(prepare, encode);
     }
 
     std::size_t DeepSeekV4VisionEncoder::encodeWorkspaceBytes() const noexcept
     {
         return visionTowerWorkspaceFor(static_cast<std::size_t>(dim_),
             static_cast<std::size_t>(inter_), static_cast<std::size_t>(text_dim_),
-            static_cast<std::size_t>(config_.merge));
+            static_cast<std::size_t>(config_.merge), static_cast<std::size_t>(config_.patch),
+            static_cast<std::size_t>(heads_));
     }
 
     std::size_t visionTowerWorkspaceBytes(const std::string &path, const IMPIContext &mpi, int text_dim)
@@ -410,11 +624,13 @@ namespace llaminar2::deepseek4
         const std::int64_t merge_meta = loader.getInt("clip.vision.projector.scale_factor", kVisionDefaultMerge);
         const std::size_t merge = merge_meta > 0 ? static_cast<std::size_t>(merge_meta)
                                                  : static_cast<std::size_t>(kVisionDefaultMerge);
-        if (D == 0 || I == 0 || T == 0 || merge == 0)
+        const std::int64_t patch = loader.getInt("clip.vision.patch_size", 0);
+        const std::int64_t heads = loader.getInt("clip.vision.attention.head_count", 0);
+        if (D == 0 || I == 0 || T == 0 || merge == 0 || patch <= 0 || heads <= 0)
             throw std::invalid_argument("DeepSeek-V4 mmproj lacks the geometry for host workspace admission");
         if (text_dim > 0 && T != static_cast<std::size_t>(text_dim))
             throw std::invalid_argument("DeepSeek-V4 mmproj projects to width " + std::to_string(T) +
                                         " but the text model is " + std::to_string(text_dim));
-        return visionTowerWorkspaceFor(D, I, T, merge);
+        return visionTowerWorkspaceFor(D, I, T, merge, static_cast<std::size_t>(patch), static_cast<std::size_t>(heads));
     }
 } // namespace llaminar2::deepseek4

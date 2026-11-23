@@ -237,9 +237,12 @@ namespace
                desc.n == N && desc.k == K &&
                desc.blocks_per_row == static_cast<uint32_t>(K / kQuantBlock) &&
                llaminar2::cuda_native_quantised::native_quantised_descriptor_codebook_matches<CodebookId>(desc.codebook_id) &&
-               (!Traits::requires_secondary_metadata ||
-                (Traits::is_iq4_source_scale && desc.codebook_id == 4) || desc.mins) &&
-               (!Traits::is_dual_scale_asym || desc.emins);
+               ::llaminar2::nativeQuantisedLayoutValid(desc.codebook_id, desc.metadata_layout) &&
+               // A coded matrix keeps its superblock plane in `mins` and has no emins plane.
+               ((desc.metadata_layout & 0x80u) ? desc.mins != nullptr
+                : ((!Traits::requires_secondary_metadata ||
+                    (Traits::is_iq4_source_scale && desc.codebook_id == 4) || desc.mins) &&
+                   (!Traits::is_dual_scale_asym || desc.emins)));
     }
 
     /**
@@ -275,27 +278,25 @@ namespace
         int32_t dot_lo,
         int32_t dot_hi,
         const uint8_t *payload,
-        const uint16_t *scales,
-        const uint16_t *mins,
-        const uint32_t *emins,
-        size_t linear,
+        ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes meta,
+        ::llaminar2::native_quantised_scale::BlockAddress address,
         float activation_scale,
         uint8_t physical_codebook = CodebookId)
     {
         using Traits =
             llaminar2::cuda_native_quantised::CodebookTraits<CodebookId>;
+        // Per-block words for either metadata representation (one authority).
+        const auto words = ::llaminar2::native_quantised_scale::loadBlockMetadata<CodebookId>(meta, address);
         if constexpr (Traits::is_iq4_lut)
         {
             const float scale = physical_codebook == llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook
-                ? llaminar2::cuda_native_quantised::native_quantised_single_scale_rn<llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook>(::llaminar2::native_quantised_scale::loadStagedPrimary<CodebookId>(scales, linear), mins[linear])
-                : llaminar2::cuda_native_quantised::fp16_bits_to_float(::llaminar2::native_quantised_scale::loadStagedPrimary<CodebookId>(scales, linear));
+                ? llaminar2::cuda_native_quantised::native_quantised_single_scale_rn<llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook>(words.primary, words.secondary)
+                : llaminar2::cuda_native_quantised::fp16_bits_to_float(words.primary);
             return llaminar2::device_native_quantised_contract::singleScaleBlock(
                 dot_lo, scale, activation_scale);
         }
-        const uint16_t secondary_bits =
-            mins ? mins[linear] : uint16_t{0};
-        const uint32_t emin_bits =
-            emins ? emins[linear] : uint32_t{0};
+        const uint16_t secondary_bits = words.secondary;
+        const uint32_t emin_bits = words.emin;
         const uint16_t iq1m_qh = Traits::is_iq1_m
             ? static_cast<uint16_t>(payload[4]) |
                   (static_cast<uint16_t>(payload[5]) << 8)
@@ -322,7 +323,7 @@ namespace
                 dot_lo,
                 dot_hi,
                 activation_scale,
-                ::llaminar2::native_quantised_scale::loadStagedPrimary<CodebookId>(scales, linear),
+                words.primary,
                 secondary_bits,
                 emin_bits,
                 activation_sum_lo + activation_sum_hi,
@@ -832,12 +833,7 @@ namespace
         constexpr int kPayloadBytes =
             llaminar2::cuda_native_quantised::CodebookTraits<CodebookId>::
                 payload_bytes;
-        const uint16_t *weight_scales =
-            static_cast<const uint16_t *>(descriptor.scales);
-        const uint16_t *weight_mins =
-            static_cast<const uint16_t *>(descriptor.mins);
-        const uint32_t *weight_emins =
-            static_cast<const uint32_t *>(descriptor.emins);
+        const auto weight_meta = ::llaminar2::native_quantised_scale::metadataPlanes(descriptor);
         const int blocks_per_row = K / kQuantBlock;
         const int blocks_per_partition =
             (blocks_per_row + k_partitions - 1) / k_partitions;
@@ -894,11 +890,12 @@ namespace
                             const size_t linear =
                                 static_cast<size_t>(block) * N + column;
                             // The slot carries the normalized staged word (low 16 bits).
-                            scale_bits = ::llaminar2::native_quantised_scale::loadStagedPrimary<CodebookId>(
-                                weight_scales, linear);
+                            const auto words = ::llaminar2::native_quantised_scale::loadBlockMetadata<CodebookId>(
+                                weight_meta, ::llaminar2::native_quantised_scale::blockMajorAddress(weight_meta, block, column, N));
+                            scale_bits = words.primary;
                             if constexpr (llaminar2::cuda_native_quantised::CodebookTraits<CodebookId>::is_iq4_source_scale)
                                 if (descriptor.codebook_id == llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook)
-                                    scale_bits |= uint32_t{weight_mins[linear]} << 16;
+                                    scale_bits |= uint32_t{words.secondary} << 16;
                         }
                         shared_weight_scales[
                             warp * kColumnsPerWarp + lane] = scale_bits;
@@ -970,10 +967,8 @@ namespace
                                 dot_lo[element],
                                 dot_hi[element],
                                 payload,
-                                weight_scales,
-                                weight_mins,
-                                weight_emins,
-                                linear,
+                                weight_meta,
+                                ::llaminar2::native_quantised_scale::blockMajorAddress(weight_meta, block, column, N),
                                 activation_scale, descriptor.codebook_id));
                     }
                 }
@@ -1133,12 +1128,7 @@ namespace
         constexpr int kPayloadBytes =
             llaminar2::cuda_native_quantised::CodebookTraits<CodebookId>::
                 payload_bytes;
-        const uint16_t *weight_scales =
-            static_cast<const uint16_t *>(descriptor.scales);
-        const uint16_t *weight_mins =
-            static_cast<const uint16_t *>(descriptor.mins);
-        const uint32_t *weight_emins =
-            static_cast<const uint32_t *>(descriptor.emins);
+        const auto weight_meta = ::llaminar2::native_quantised_scale::metadataPlanes(descriptor);
         const int blocks_per_row = K / kQuantBlock;
         const int blocks_per_partition =
             (blocks_per_row + k_partitions - 1) / k_partitions;
@@ -1226,10 +1216,8 @@ namespace
                         dot_lo[element],
                         dot_hi[element],
                         payload,
-                        weight_scales,
-                        weight_mins,
-                        weight_emins,
-                        linear,
+                        weight_meta,
+                                ::llaminar2::native_quantised_scale::blockMajorAddress(weight_meta, block, column, N),
                         activation_scale, descriptor.codebook_id);
                     partial[element] = __fadd_rn(
                         partial[element],
@@ -1478,18 +1466,8 @@ namespace
                 payload_bytes;
         const uint8_t *gate_payload_base = gate_descriptor.payload;
         const uint8_t *up_payload_base = up_descriptor.payload;
-        const auto *gate_scales =
-            static_cast<const uint16_t *>(gate_descriptor.scales);
-        const auto *gate_mins =
-            static_cast<const uint16_t *>(gate_descriptor.mins);
-        const auto *gate_emins =
-            static_cast<const uint32_t *>(gate_descriptor.emins);
-        const auto *up_scales =
-            static_cast<const uint16_t *>(up_descriptor.scales);
-        const auto *up_mins =
-            static_cast<const uint16_t *>(up_descriptor.mins);
-        const auto *up_emins =
-            static_cast<const uint32_t *>(up_descriptor.emins);
+        const auto gate_meta = ::llaminar2::native_quantised_scale::metadataPlanes(gate_descriptor);
+        const auto up_meta = ::llaminar2::native_quantised_scale::metadataPlanes(up_descriptor);
         const int blocks_per_row = K / kQuantBlock;
         const int blocks_per_partition =
             (blocks_per_row + k_partitions - 1) / k_partitions;
@@ -1566,13 +1544,14 @@ namespace
                         {
                             const size_t linear =
                                 static_cast<size_t>(block) * N + column;
-                            gate_scale_pair =
-                                static_cast<uint32_t>(gate_scales[linear]) |
-                                (static_cast<uint32_t>(gate_mins[linear])
-                                 << 16);
-                            up_scale_pair =
-                                static_cast<uint32_t>(up_scales[linear]) |
-                                (static_cast<uint32_t>(up_mins[linear]) << 16);
+                            const auto gate_words = ::llaminar2::native_quantised_scale::loadBlockMetadata<CodebookId>(
+                                gate_meta, ::llaminar2::native_quantised_scale::blockMajorAddress(gate_meta, block, column, N));
+                            const auto up_words = ::llaminar2::native_quantised_scale::loadBlockMetadata<CodebookId>(
+                                up_meta, ::llaminar2::native_quantised_scale::blockMajorAddress(up_meta, block, column, N));
+                            gate_scale_pair = static_cast<uint32_t>(gate_words.primary) |
+                                              (static_cast<uint32_t>(gate_words.secondary) << 16);
+                            up_scale_pair = static_cast<uint32_t>(up_words.primary) |
+                                            (static_cast<uint32_t>(up_words.secondary) << 16);
                         }
                         const int scale_index =
                             warp * kColumnsPerWarp + lane;
@@ -1704,10 +1683,8 @@ namespace
                                 gate_dot_lo[element],
                                 gate_dot_hi[element],
                                 gate_payload_base + linear * kPayloadBytes,
-                                gate_scales,
-                                gate_mins,
-                                gate_emins,
-                                linear,
+                                gate_meta,
+                                ::llaminar2::native_quantised_scale::blockMajorAddress(gate_meta, block, column, N),
                                 activation_scale, gate_descriptor.codebook_id));
                     }
                     int32_t up_dot_lo[4] = {0, 0, 0, 0};
@@ -1746,10 +1723,8 @@ namespace
                                 up_dot_lo[element],
                                 up_dot_hi[element],
                                 up_payload_base + linear * kPayloadBytes,
-                                up_scales,
-                                up_mins,
-                                up_emins,
-                                linear,
+                                up_meta,
+                                ::llaminar2::native_quantised_scale::blockMajorAddress(up_meta, block, column, N),
                                 activation_scale, up_descriptor.codebook_id));
                     }
 #else
@@ -1807,10 +1782,8 @@ namespace
                                 gate_dot_lo[element],
                                 gate_dot_hi[element],
                                 gate_payload_base + linear * kPayloadBytes,
-                                gate_scales,
-                                gate_mins,
-                                gate_emins,
-                                linear,
+                                gate_meta,
+                                ::llaminar2::native_quantised_scale::blockMajorAddress(gate_meta, block, column, N),
                                 activation_scale, gate_descriptor.codebook_id));
                         up_partial[element] = __fadd_rn(
                             up_partial[element],
@@ -1819,10 +1792,8 @@ namespace
                                 up_dot_lo[element],
                                 up_dot_hi[element],
                                 up_payload_base + linear * kPayloadBytes,
-                                up_scales,
-                                up_mins,
-                                up_emins,
-                                linear,
+                                up_meta,
+                                ::llaminar2::native_quantised_scale::blockMajorAddress(up_meta, block, column, N),
                                 activation_scale, up_descriptor.codebook_id));
                     }
 #endif

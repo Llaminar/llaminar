@@ -39,18 +39,27 @@ namespace llaminar2::Q8R_NAMESPACE
         std::uint32_t emin;
         /** @brief Explicit inactive local tile metadata; no global source access. */
         __device__ NativeBlock() : scale(0), secondary(0), qh(0), emin(0) {}
-        /** @brief Load exact original scale/raw-factor planes and IQ1_M delta signs. */
-        __device__ NativeBlock(const DeviceNativeQuantisedMatrixDesc &w, std::uint64_t block,
+        /**
+         * @brief Load exact original metadata words and IQ1_M delta signs.
+         * @param w Prepared matrix descriptor (either metadata representation).
+         * @param group 32-value K block index.
+         * @param column Output column (descriptor row) index.
+         * @param payload This block's payload bytes.
+         */
+        __device__ NativeBlock(const DeviceNativeQuantisedMatrixDesc &w, std::uint32_t group, std::uint32_t column,
                                const std::uint8_t *payload)
-            // `scale` is the normalized staged word decoded by the shared contract.
-            : scale(::llaminar2::native_quantised_scale::loadStagedPrimary<C>(
-                  static_cast<const std::uint16_t *>(w.scales), static_cast<std::size_t>(block))),
-              secondary(0), qh(0), emin(0)
+            : scale(0), secondary(0), qh(0), emin(0)
         {
+            const auto planes = ::llaminar2::native_quantised_scale::metadataPlanes(w);
+            // `scale` is the normalized staged word decoded by the shared contract.
+            const auto words = ::llaminar2::native_quantised_scale::loadBlockMetadata<C>(
+                planes, ::llaminar2::native_quantised_scale::blockMajorAddress(
+                            planes, group, column, static_cast<std::uint32_t>(w.n)));
+            scale = words.primary;
             if constexpr (Traits::requires_secondary_metadata)
-                secondary = static_cast<const std::uint16_t *>(w.mins)[block];
+                secondary = words.secondary;
             if constexpr (Traits::is_dual_scale_asym)
-                emin = static_cast<const std::uint32_t *>(w.emins)[block];
+                emin = words.emin;
             if constexpr (Traits::is_iq1_m)
                 qh = static_cast<std::uint16_t>(payload[4]) | (static_cast<std::uint16_t>(payload[5]) << 8);
         }

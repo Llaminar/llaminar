@@ -60,8 +60,8 @@ inline void initializeNativeWindowOutput(const NativeQuantisedFormatInfo& format
     out.N=n;out.K=k;out.N_padded=(n+63)/64*64;out.blocks_per_row=(k+31)/32;
     out.payload_bytes=format.payload_bytes;out.codebook_id=format.codebook_id;
     out.is_asymmetric=format.is_asymmetric;out.is_superblock=format.is_superblock;
-    out.encoding=preparedEncodingForSource(format);out.data_stride=preparedDataStride(out.encoding);
-    out.interleaved_block_stride=preparedInterleavedBlockStride(out.encoding,out.is_asymmetric);
+    out.encoding=preparedEncodingForSource(format);out.data_stride=preparedDataStride(out.encoding,out.codebook_id);
+    out.interleaved_block_stride=preparedInterleavedBlockStride(out.encoding,out.is_asymmetric,out.codebook_id);
     const auto chunks=size_t(out.N_padded/64),blocks=size_t(out.blocks_per_row);
     if(blocks && chunks>std::numeric_limits<size_t>::max()/blocks/out.interleaved_block_stride)
         throw std::overflow_error("Native weight final extent overflows");
@@ -100,7 +100,7 @@ inline void appendNativeWeightGroups(const IINT8Unpackable& source,const NativeQ
        out.encoding!=preparedEncodingForSource(format) || out.N<=0 || out.K<=0 ||
        out.N_padded!=int((size_t(out.N)+63)/64*64) ||
        out.blocks_per_row!=int((size_t(out.K)+31)/32) ||
-       out.interleaved_block_stride!=preparedInterleavedBlockStride(out.encoding,out.is_asymmetric) ||
+       out.interleaved_block_stride!=preparedInterleavedBlockStride(out.encoding,out.is_asymmetric,out.codebook_id) ||
        out.native_interleaved.size()!=size_t(out.N_padded/64)*out.blocks_per_row*out.interleaved_block_stride ||
        source_k<=0 || source_k>std::numeric_limits<int>::max()-31)
         throw std::invalid_argument("Native append changed original codec or final owned geometry");

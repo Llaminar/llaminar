@@ -22765,7 +22765,19 @@ namespace llaminar2
             builder.add(*cpu, PhysicalMemoryOwner::VisionHostTower, demand);
             final_plan = builder.build();
             if (!final_plan.fits())
-                return setError("Memory plan validation failed — DeepSeek-V4 vision tower does not fit host memory");
+            {
+                // Name every exhausted member: on an integrated GPU the host
+                // tower shares one pool with the device weights.
+                std::string deficits;
+                for (const auto &bom : final_plan.resources())
+                    if (bom.deficitBytes() > 0)
+                        deficits += " " + bom.resource().id() + " deficit_bytes=" + std::to_string(bom.deficitBytes());
+                if (deficits.empty())
+                    deficits = " the rank's shared host pool (CPU + integrated accelerator) is exhausted";
+                return setError("Memory plan validation failed — DeepSeek-V4 vision tower (" + std::to_string(demand) +
+                                " bytes: weights " + std::to_string(weights) + ", workspace " + std::to_string(workspace) +
+                                ") exceeds the admitted physical memory:" + deficits);
+            }
         }
 
         if (imported_model_context_reuse_authority_)

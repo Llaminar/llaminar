@@ -183,13 +183,14 @@ namespace llaminar2
         [[nodiscard]] constexpr std::size_t expectedCpuStride(
             const NativeQuantisedFormatInfo &format)
         {
-            // Independently describe the compact multi-scale unit: 16 native
-            // payload bytes per column, two half scales and two half minima.
-            // The final minimum vector stays reserved/zero outside Q2_K.
+            // Independently describe the compact multi-scale unit: per column,
+            // the source payload rounded up to whole 32-bit words, two half
+            // scales, and the effective-minimum pair only for Q2_K, its sole
+            // consumer.
             if (format.codebook_id == 9 || format.codebook_id == 10 ||
-                format.codebook_id == 13 || format.codebook_id == 14 ||
-                format.codebook_id == 17)
-                return 64 * (16 + 2 * sizeof(uint16_t) + 2 * sizeof(uint16_t));
+                (format.codebook_id >= 12 && format.codebook_id <= 17))
+                return 64 * (static_cast<std::size_t>((format.payload_bytes + 3) / 4) * sizeof(uint32_t) +
+                             2 * sizeof(uint16_t) + (format.codebook_id == 10 ? 2 * sizeof(uint16_t) : 0));
             if (format.codebook_id == 8)
                 return 1792;
             if (format.codebook_id == 11)
@@ -260,8 +261,9 @@ namespace llaminar2
             // These sources never normalize to a single-scale INT8 GPU blob.
             // Migration preserves their native payload and all metadata planes.
             if (format.codebook_id == 9 || format.codebook_id == 10 ||
-                format.codebook_id == 13 || format.codebook_id == 14 ||
-                format.codebook_id == 17)
+                format.codebook_id == 12 || format.codebook_id == 13 ||
+                format.codebook_id == 14 || format.codebook_id == 15 ||
+                format.codebook_id == 16 || format.codebook_id == 17)
                 return format.payload_bytes;
             if (format.codebook_id == 8)
                 return 24;
@@ -295,7 +297,9 @@ namespace llaminar2
                     std::max(
                         format.payload_bytes,
                         expectedMigrationPayload(format)),
-                    format.is_asymmetric || format.codebook_id == 11 || (format.codebook_id == 4 && format.is_superblock),
+                    // Compact multi-scale migration keeps a secondary plane.
+                    format.is_asymmetric || format.codebook_id == 11 || format.codebook_id == 12 ||
+                        format.codebook_id == 15 || (format.codebook_id == 4 && format.is_superblock),
                     format.has_emins,
                     nativeQuantisedScalePlaneBytes(format.codebook_id));
                 expected.gpu_shadow_bytes += expectedGpuProjectionBytes(

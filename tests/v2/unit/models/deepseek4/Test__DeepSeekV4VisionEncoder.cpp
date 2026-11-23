@@ -130,8 +130,11 @@ TEST(DeepSeekV4VisionEncoder, RejectsInconsistentProjector)
 namespace
 {
 /** @brief Minimal GGUF v3 writer: string/u32 metadata and F32 tensors with ggml (ne0-first) dims. */
-void writeMmproj(const std::string &path, const std::map<std::string, VisionHostTensor> &tensors, int layers, int heads)
+void writeMmproj(const std::string &path, const std::map<std::string, VisionHostTensor> &tensors, int layers, int heads,
+                 bool bf16_matrices = false)
 {
+    // BF16 storage for rank >= 2 tensors: the production mmproj layout.
+    const auto asBF16 = [&](const VisionHostTensor &t) { return bf16_matrices && t.shape.size() >= 2; };
     std::ofstream out(path, std::ios::binary);
     const auto u32 = [&](std::uint32_t v) { out.write(reinterpret_cast<const char *>(&v), 4); };
     const auto u64 = [&](std::uint64_t v) { out.write(reinterpret_cast<const char *>(&v), 8); };
@@ -155,15 +158,24 @@ void writeMmproj(const std::string &path, const std::map<std::string, VisionHost
         str(name);
         u32(static_cast<std::uint32_t>(t.shape.size()));
         for (const auto d : t.shape) u64(d);
-        u32(0); // F32
+        u32(asBF16(t) ? 30u : 0u); // GGML_TYPE_BF16 / F32
         u64(offset);
-        offset = aligned(offset + t.data.size() * sizeof(float));
+        offset = aligned(offset + t.data.size() * (asBF16(t) ? 2u : 4u));
     }
     out.seekp(static_cast<std::streamoff>(aligned(static_cast<std::uint64_t>(out.tellp()))));
     const auto base = static_cast<std::uint64_t>(out.tellp());
     for (const auto &[name, t] : tensors)
     {
-        out.write(reinterpret_cast<const char *>(t.data.data()), static_cast<std::streamsize>(t.data.size() * 4));
+        if (asBF16(t))
+            for (const float v : t.data)
+            {
+                std::uint32_t b;
+                std::memcpy(&b, &v, 4);
+                const std::uint16_t h = static_cast<std::uint16_t>(b >> 16); // values are BF16-exact
+                out.write(reinterpret_cast<const char *>(&h), 2);
+            }
+        else
+            out.write(reinterpret_cast<const char *>(t.data.data()), static_cast<std::streamsize>(t.data.size() * 4));
         const auto end = static_cast<std::uint64_t>(out.tellp()) - base;
         const std::vector<char> pad(aligned(end) - end, 0);
         out.write(pad.data(), static_cast<std::streamsize>(pad.size()));
@@ -231,4 +243,61 @@ TEST(DeepSeekV4VisionEncoder, MmprojAdmissionBytesMatchLoadedTower)
     EXPECT_EQ(workspace, loaded->encodeWorkspaceBytes());
     EXPECT_GT(weights, 0u);
     EXPECT_GT(workspace, 0u);
+}
+
+/**
+ * @test A BF16 mmproj keeps its matrices 16-bit, prices them exactly, and
+ * encodes identically to the FP32 tower holding the same (BF16-exact) values.
+ * Regression: the tower widened every matrix to FP32 (2x the file) while
+ * admission priced the BF16 file bytes, under-admitting ~0.93 GB on the real
+ * projector; the workspace formula also counted floats as bytes.
+ */
+TEST(DeepSeekV4VisionEncoder, BF16MmprojStaysHalfPrecisionAndEncodesExactly)
+{
+    const auto golden = nlohmann::json::parse(test::dsv4::kVisionEncoderGolden);
+    auto t = tensors(golden);
+    for (auto &[name, tensor] : t)
+        if (tensor.shape.size() >= 2)
+            for (auto &v : tensor.data) v = bf16(v);
+    char pattern[] = "/tmp/dsv4-mmproj-bf16-XXXXXX";
+    const int fd = ::mkstemp(pattern);
+    ASSERT_GE(fd, 0);
+    ::close(fd);
+    const std::string path = pattern;
+    writeMmproj(path, t, golden["layers"], golden["heads"], /*bf16_matrices=*/true);
+    test::MockMPIContext mpi;
+    const std::size_t weights = DeepSeekV4VisionEncoder::mmprojHostWeightBytes(path, mpi);
+    const std::size_t workspace = visionTowerWorkspaceBytes(path, mpi, golden["text_dim"].get<int>());
+    std::unique_ptr<DeepSeekV4VisionEncoder> loaded;
+    ASSERT_NO_THROW(loaded = DeepSeekV4VisionEncoder::load(path, mpi, golden["text_dim"].get<int>()));
+    ::unlink(path.c_str());
+    ASSERT_TRUE(loaded);
+    EXPECT_EQ(weights, loaded->weightBytes());
+    EXPECT_EQ(workspace, loaded->encodeWorkspaceBytes());
+
+    // Exactly 2 bytes per matrix value and 4 per vector value (+ IMAGE row).
+    std::size_t matrix = 0, vector = 0;
+    for (const auto &[name, tensor] : t)
+        (tensor.shape.size() >= 2 ? matrix : vector) += tensor.data.size();
+    EXPECT_EQ(weights, 2u * matrix + 4u * vector + 4u * golden["text_dim"].get<std::size_t>());
+
+    DeepSeekV4VisionEncoder direct(t, VisionPreprocessConfig{}, golden["layers"], golden["heads"]);
+    EXPECT_LT(loaded->weightBytes(), direct.weightBytes());
+    PreparedImage img;
+    img.vit_h = 7;
+    img.vit_w = 5;
+    img.llm_h = 3;
+    img.llm_w = 2;
+    img.patches = synth(91, static_cast<std::size_t>(img.vit_h) * img.vit_w * 588, 1.0f);
+    buildImageBlock(img.llm_h, img.llm_w, img.block, img.perm);
+    const auto a = loaded->encode(img), b = direct.encode(img);
+    ASSERT_EQ(a.size(), b.size());
+    double err = 0.0, ref = 0.0;
+    for (std::size_t i = 0; i < a.size(); ++i)
+    {
+        err += (a[i] - b[i]) * static_cast<double>(a[i] - b[i]);
+        ref += b[i] * static_cast<double>(b[i]);
+    }
+    // Same widened values; only the BLAS chunk blocking may reassociate.
+    EXPECT_LT(std::sqrt(err / ref), 1e-6);
 }
