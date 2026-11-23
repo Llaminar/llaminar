@@ -750,9 +750,16 @@ namespace llaminar2
                 case Encoding::Q6KNativeDualScale:
                     return layout.gpu_codebook_id == 8;
                 case Encoding::CompactMultiScale:
-                    return layout.gpu_codebook_id == 9 || layout.gpu_codebook_id == 10 ||
-                        layout.gpu_codebook_id == 13 || layout.gpu_codebook_id == 14 ||
-                        layout.gpu_codebook_id == 17;
+                    // Every compact multi-scale codebook, including the
+                    // single-scale IQ3_XXS/IQ2_XXS/IQ1_S units, shares the
+                    // generic compact copy loop.
+                    switch (layout.gpu_codebook_id)
+                    {
+                    case 9: case 10: case 12: case 13: case 14: case 15: case 16: case 17:
+                        return true;
+                    default:
+                        return false;
+                    }
                 case Encoding::ExpandedInt8:
                     if (!to_cpu)
                         return layout.gpu_codebook_id == 19 ||

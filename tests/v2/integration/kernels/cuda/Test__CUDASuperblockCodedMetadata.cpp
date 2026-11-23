@@ -41,6 +41,7 @@
 #include <functional>
 #include <random>
 #include <stdexcept>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -300,6 +301,10 @@ namespace llaminar2::test
             DeviceBytes prefill_partials(prefill_bytes);
             cudaPrefillContext_bindWorkspace(prefill, prefill_partials.as<float>(), prefill_bytes);
 
+            // A forced staging/tile combination the dispatcher does not admit
+            // for this codebook (resource-excluded specialization) is skipped
+            // for both representations rather than failed.
+            bool require_admission = true, admitted = true;
             const auto run = [&](const NativeQuantisedMetadataPlanes &meta, int rows) {
                 const auto *weights = meta.coded() ? coded_payload.as<uint8_t>() : legacy_payload.as<uint8_t>();
                 DeviceBytes out(static_cast<std::size_t>(rows) * N * sizeof(float));
@@ -333,6 +338,9 @@ namespace llaminar2::test
                                                          N, K, 1.0f, 0.0f, nullptr, nullptr, codebook, policy, 0,
                                                          stream_, prefill);
                 recording.finish();
+                admitted = ok;
+                if (!ok && !require_admission)
+                    return std::vector<uint32_t>{};
                 EXPECT_TRUE(ok) << "rows " << rows;
                 EXPECT_TRUE(graph.instantiate());
                 // Retained replay: poison the output before each launch so a
@@ -369,6 +377,7 @@ namespace llaminar2::test
                 using llaminar2::cuda::prefill::PrefillStagingSchedule;
                 const auto previous_schedule = cudaNativeQuantisedPrefill_getStagingSchedule();
                 int previous_tile = -1;
+                std::set<int> admitted_schedules;
                 cudaNativeQuantisedPrefill_getForceTile(&previous_tile);
                 for (const int tile : {0, 2, 3, 4, 5})
                     for (const auto schedule : {PrefillStagingSchedule::RegisterDecode,
@@ -380,7 +389,12 @@ namespace llaminar2::test
                                                           << " staging=" << static_cast<int>(schedule));
                         cudaNativeQuantisedPrefill_setForceTile(tile);
                         ASSERT_TRUE(cudaNativeQuantisedPrefill_setStagingSchedule(schedule));
+                        require_admission = false;
                         const auto expected = run(legacy, max_rows);
+                        require_admission = true;
+                        if (!admitted)
+                            continue; // not an admitted specialization for this codebook
+                        admitted_schedules.insert(static_cast<int>(schedule));
                         const auto actual = run(coded, max_rows);
                         EXPECT_EQ(cudaNativeQuantisedPrefill_getLastLaunchStagingSchedule(), schedule)
                             << "forced staging schedule was not launched";
@@ -388,6 +402,8 @@ namespace llaminar2::test
                     }
                 cudaNativeQuantisedPrefill_setForceTile(previous_tile);
                 ASSERT_TRUE(cudaNativeQuantisedPrefill_setStagingSchedule(previous_schedule));
+                // Every staging schedule must have been exercised on some tile.
+                EXPECT_EQ(admitted_schedules.size(), 4u) << "a staging schedule was never admitted";
             }
             cudaPrefillContext_destroy(prefill);
             cudaGemvContext_destroy(gemv);

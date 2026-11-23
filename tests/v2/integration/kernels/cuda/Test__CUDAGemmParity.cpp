@@ -34,6 +34,7 @@
  * @date January 2026
  */
 
+#include "../../../utils/NativeQuantisedLegacyPlanes.h"
 #include "kernels/cuda/gemm/CUDANativeQuantisedArchitecture.h"
 #include "backends/GPUDeviceProcessLifetime.h"
 #include <gtest/gtest.h>
@@ -4444,13 +4445,25 @@ TEST_F(Test__CUDAGemmParity, Q6_K_SourceScaleMetadataAndCapturedArithmeticAreExa
         workspace_->getBufferSize(GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS));
     ASSERT_TRUE(input->ensureOnDevice(gpu_device_, stream));
     ASSERT_TRUE(output->allocateOnDevice(gpu_device_, stream));
-    ASSERT_EQ(cudaMemcpyAsync(primary.data(), desc.scales, primary.size() * 2,
-                              cudaMemcpyDeviceToHost, stream), cudaSuccess);
-    ASSERT_EQ(cudaMemcpyAsync(secondary.data(), desc.mins, secondary.size() * 2,
-                              cudaMemcpyDeviceToHost, stream), cudaSuccess);
-    ASSERT_EQ(cudaMemcpyAsync(payload.data(), desc.payload, payload.size(),
-                              cudaMemcpyDeviceToHost, stream), cudaSuccess);
-    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+    {
+        // Source-native CUDA superblock matrices are superblock-coded; read
+        // them back as the exact legacy per-block words the readers stage.
+        const auto planes = test::nativeQuantisedLegacyPlanes(
+            desc, static_cast<std::uint32_t>(payload.size() / primary.size()),
+            [&](void *dst, const void *src, std::size_t bytes) {
+                ASSERT_EQ(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToHost, stream), cudaSuccess);
+                ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+            },
+            [](const std::vector<uint8_t> &bytes, std::size_t count) {
+                std::vector<uint16_t> words(count);
+                std::memcpy(words.data(), bytes.data(), count * sizeof(uint16_t));
+                return words;
+            });
+        ASSERT_EQ(planes.coded, true) << "immutable source-native CUDA superblock weights are coded";
+        primary = planes.primary;
+        secondary = planes.secondary;
+        payload = planes.payload;
+    }
     for (int b = 0; b < K / 32; ++b)
         for (int n = 0; n < N; ++n)
         {
@@ -12043,13 +12056,25 @@ TEST_F(Test__CUDAGemmParity, IQ2_S_SourceScaleMetadataAndCapturedArithmeticAreEx
         workspace_->getBufferSize(GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS));
     ASSERT_TRUE(input->ensureOnDevice(gpu_device_, stream));
     ASSERT_TRUE(output->allocateOnDevice(gpu_device_, stream));
-    ASSERT_EQ(cudaMemcpyAsync(primary.data(), desc.scales, primary.size() * 2,
-                              cudaMemcpyDeviceToHost, stream), cudaSuccess);
-    ASSERT_EQ(cudaMemcpyAsync(secondary.data(), desc.mins, secondary.size() * 2,
-                              cudaMemcpyDeviceToHost, stream), cudaSuccess);
-    ASSERT_EQ(cudaMemcpyAsync(payload.data(), desc.payload, payload.size(),
-                              cudaMemcpyDeviceToHost, stream), cudaSuccess);
-    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+    {
+        // Source-native CUDA superblock matrices are superblock-coded; read
+        // them back as the exact legacy per-block words the readers stage.
+        const auto planes = test::nativeQuantisedLegacyPlanes(
+            desc, static_cast<std::uint32_t>(payload.size() / primary.size()),
+            [&](void *dst, const void *src, std::size_t bytes) {
+                ASSERT_EQ(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToHost, stream), cudaSuccess);
+                ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+            },
+            [](const std::vector<uint8_t> &bytes, std::size_t count) {
+                std::vector<uint16_t> words(count);
+                std::memcpy(words.data(), bytes.data(), count * sizeof(uint16_t));
+                return words;
+            });
+        ASSERT_EQ(planes.coded, true) << "immutable source-native CUDA superblock weights are coded";
+        primary = planes.primary;
+        secondary = planes.secondary;
+        payload = planes.payload;
+    }
     for (int b = 0; b < K / 32; ++b)
         for (int n = 0; n < N; ++n)
         {
