@@ -712,6 +712,19 @@ orders, six live rows with 40 local routes improved from 53.57–53.82 µs
 to 52.74–52.86 µs. One live row with seven local routes took 22.14–22.21 µs,
 up from 21.38–21.44 µs with the copying planner.
 
+The next planner uses warp ballots to produce stable slot prefixes.
+The native verifier family captured control blocks from 32 to 160 threads,
+in 32-thread increments. All five native tests passed on each GPU and
+the 32-token Release probe matched the staged control. The inspected
+direct planners have one compiled barrier site and zero local bytes.
+Their selected Q4_K Gate/Up and weighted Q5_1 Down instruction sequences
+match the borrowed-descriptor revision.
+
+On the same six-row-capacity event fixture, one live row with seven local
+routes improved from 22.21 to 21.44–21.50 µs. Six live rows with 40 local
+routes improved from 52.80–52.99 to 52.03–52.10 µs. All timed
+publications remained byte-exact on both RTX 3090s in both orders.
+
 The scalar drafter's original graph submission owns one live activation.
 On the mixed topology, the fused path selects the local F320 Q8 work from
 the ten original route slots and keeps weighting with the original cohort.
