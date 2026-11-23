@@ -504,7 +504,7 @@ namespace llaminar2::test
                 {"Q4_1", 5, 20, [](auto s, auto r) { return Factory::createQ4_1Random(s, r); }},
                 {"Q4_K", 5, 18, q4KSource},
                 {"IQ4_NL", 4, 18, [](auto s, auto r) { return Factory::createIQ4_NLRandom(s, r); }},
-                {"IQ4_XS", 4, 0, [](auto s, auto r) { return Factory::createIQ4_XSRandom(s, r); }},
+                {"IQ4_XS", 4, 17, [](auto s, auto r) { return Factory::createIQ4_XSRandom(s, r); }},
                 {"MXFP4", 25, 17, [](auto s, auto r) { return Factory::createMXFP4Random(s, r); }},
                 {"Q8_0", 19, 34, [](auto s, auto r) { return Factory::createQ8_0Random(s, r); }},
             };
@@ -563,8 +563,7 @@ namespace llaminar2::test
             CPUNativeQuantisedPackedWeights packed;
             ASSERT_TRUE(packWeightsCPUNativeQuantised(tensor.get(), packed));
             EXPECT_FALSE(packed.usesInlineCompensation());
-            if (source.file_bytes_per_32 != 0)
-                EXPECT_EQ(packed.native_interleaved.size(), source.file_bytes_per_32 * 128 * 16);
+            EXPECT_EQ(packed.native_interleaved.size(), source.prepared_bytes_per_32 * 128 * 16);
             if (source.name == "Q4_K")
                 EXPECT_TRUE(packed.superblockCoded());
             if (source.name == "Q4_1")

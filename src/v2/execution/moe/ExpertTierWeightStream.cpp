@@ -705,6 +705,8 @@ namespace llaminar2
     {
         if (const char *reason = codedSourceScaleStreamRejection(format.cpu_encoding))
             throw std::invalid_argument(reason);
+        if (requiresDensityAwareExpertTierSlots(format.cpu_encoding, format.cpu_codebook_id))
+            throw std::invalid_argument(kDensityAwareExpertTierSlotsRequired);
         if (intersection.empty() || (owned != intersection.source() && owned != intersection.destination()) ||
             intersection.columns() % 32 || intersection.firstColumn() % 32 ||
             intersection.firstColumn() < owned.first_column ||
