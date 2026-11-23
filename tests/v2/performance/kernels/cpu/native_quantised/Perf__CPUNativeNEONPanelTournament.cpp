@@ -185,6 +185,9 @@ Workload admit(const std::function<std::string(const char *, const char *)> &get
         if (preparedEncodingForSource(format(label)) == CPUNativeQuantisedEncoding::CompactMultiScale)
             throw std::invalid_argument("Compact multi-scale format " + label +
                 " keeps its own column walk; it has no panel candidate");
+    for (const auto &label : w.formats)
+        if (w.strips != 1 && preparedEncodingForSource(format(label)) == CPUNativeQuantisedEncoding::Q4KSuperblockCoded)
+            throw std::invalid_argument("Coded Q4_K keeps a superblock-hoisted strip walk; it has no wider panel candidate");
     // Numbers are canonical decimals, so the fields' textual uniqueness is
     // uniqueness of the parsed rows and N x K cells.
     for (const auto &text : fields(get("LLAMINAR_PANEL_SHAPES", "2048x4096,17408x5120,512x2048"), "LLAMINAR_PANEL_SHAPES"))

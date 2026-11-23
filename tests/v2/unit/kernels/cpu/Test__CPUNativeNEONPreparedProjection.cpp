@@ -421,7 +421,7 @@ template <typename Ops> void verifyAllPanelWidths()
 {
     for (const auto &source : native_quantised_formats::kAllSourceFormats)
     {
-        if (preparedEncodingForSource(*source.metadata) == CPUNativeQuantisedEncoding::CompactMultiScale)
+        if (preparedSuperblockCoded(preparedEncodingForSource(*source.metadata)))
             continue;
         for (const int n : {1, 5, 8, 12, 15, 16, 17, 20, 31, 33, 47, 63, 64, 65, 100})
             for (const int blocks : {1, 3, 17})
@@ -803,7 +803,8 @@ TEST_F(CPUNativeNEONPreparedProjection, RejectsIncompleteAliasedAndUnalignedExpe
  */
 TEST_F(CPUNativeNEONPreparedProjection, RejectsInvalidSourceMetadataBeforeAnyWrite)
 {
-    for (const auto *source : {&native_quantised_formats::IQ2_S, &native_quantised_formats::IQ3_S, &native_quantised_formats::IQ4_XS})
+    // IQ2_S now has an exact-width 8-bit plane, with no reserved storage bits.
+    for (const auto *source : {&native_quantised_formats::IQ3_S, &native_quantised_formats::IQ4_XS})
     {
         SCOPED_TRACE(int(source->codebook_id));
         NativeQuantisedPreparedByteFixture fixture(*source, 8, 32);

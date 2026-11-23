@@ -1488,6 +1488,14 @@ namespace llaminar2::cpu::native_quantised
     inline coded_metadata::Factors<__m512> loadNibbleFactors512(
         const CPUNativeQuantisedPackedWeights &packed, int chunk, int block, int column)
     {
+        if (packed.encoding == CPUNativeQuantisedEncoding::Q4KSuperblockCoded)
+        {
+            using Ops = multi_scale::SIMD<16>;
+            using L = coded_metadata::Lanes<Ops>;
+            return coded_metadata::reconstruct<5, Ops>(
+                L::code<5>(packed.blockUnit(chunk, block) + packed.data_stride, column),
+                L::superblockWords<5>(packed.superblockHeader(chunk, block), column));
+        }
         if (packed.scaleEncoding() == CPUNativeQuantisedScaleEncoding::E8M0)
         {
             const auto e = _mm_loadu_si128(reinterpret_cast<const __m128i *>(

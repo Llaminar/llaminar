@@ -193,6 +193,13 @@ inline void appendNativeWeightGroups(const IINT8Unpackable& source,const NativeQ
                     if(b==0)
                         coded_metadata::storeSuperblockWord(interleaved.data()+out.superblockHeaderOffset(chunk,output_first),
                             out.codebook_id,column,superblock[0]);
+                } else if(out.encoding==CPUNativeQuantisedEncoding::Q4KSuperblockCoded) {
+                    // Native nibble words, then the 12-bit code split into an 8-bit and a nibble plane.
+                    for(int g=0;g<4;++g)std::memcpy(target+g*256+column*4,input+g*4,4);
+                    coded_metadata::storeCode(target+out.data_stride,5,column,codes[b]);
+                    if(b==0)
+                        coded_metadata::storeSuperblockWord(interleaved.data()+out.superblockHeaderOffset(chunk,output_first),
+                            5,column,superblock[0]);
                 } else if(out.usesQ6KNativeDualScale()) {
                     for(int g=0;g<4;++g)std::memcpy(target+g*256+column*4,input+g*4,4);
                     for(int g=0;g<8;++g) {

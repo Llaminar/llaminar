@@ -51,6 +51,7 @@ namespace llaminar2::cpu::native_quantised
         CompactMultiScale = 3, ///< Native payload, two scales, optional two minima.
         NibbleLUTSourceScale = 4, ///< IQ4_XS nibble payload, original half base, raw coefficient.
         IQ3SExpandedSourceScale = 5, ///< Original IQ3_S signed grid, base and raw nibble.
+        Q4KSuperblockCoded = 6, ///< Unsigned nibble payload, 12-bit code and a superblock d/dmin word.
     };
 
     /**
@@ -83,6 +84,7 @@ namespace llaminar2::cpu::native_quantised
     {
         switch (encoding)
         {
+        case CPUNativeQuantisedEncoding::Q4KSuperblockCoded:
         case CPUNativeQuantisedEncoding::NibbleLUT:
         case CPUNativeQuantisedEncoding::NibbleLUTSourceScale:
         case CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale:
@@ -184,7 +186,8 @@ namespace llaminar2::cpu::native_quantised
     {
         return encoding == CPUNativeQuantisedEncoding::CompactMultiScale ||
                encoding == CPUNativeQuantisedEncoding::Q6KNativeDualScale ||
-               encoding == CPUNativeQuantisedEncoding::NibbleLUTSourceScale;
+               encoding == CPUNativeQuantisedEncoding::NibbleLUTSourceScale ||
+               encoding == CPUNativeQuantisedEncoding::Q4KSuperblockCoded;
     }
 
     /**
@@ -275,6 +278,7 @@ namespace llaminar2::cpu::native_quantised
     {
         switch (encoding)
         {
+        case CPUNativeQuantisedEncoding::Q4KSuperblockCoded:
         case CPUNativeQuantisedEncoding::NibbleLUT:
         case CPUNativeQuantisedEncoding::NibbleLUTSourceScale:
             return 1024;
@@ -321,6 +325,8 @@ namespace llaminar2::cpu::native_quantised
                    8u * native_quantised_superblock::superblockCodePlaneBits(superblockMetadataCodebook(encoding, codebook_id));
         if (preparedScaleEncoding(codebook_id, encoding) == CPUNativeQuantisedScaleEncoding::E8M0)
             return data_stride + 64u;
+        if (encoding == CPUNativeQuantisedEncoding::Q4KSuperblockCoded)
+            return data_stride + 8u * native_quantised_superblock::superblockCodePlaneBits(5);
         if (encoding == CPUNativeQuantisedEncoding::CompactMultiScale)
             return data_stride + 8u * preparedCompactCodeBits(codebook_id);
         return data_stride + (preparedUsesInlineCompensation(encoding, codebook_id) ? 128u : 0u) +

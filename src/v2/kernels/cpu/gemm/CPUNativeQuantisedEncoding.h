@@ -66,6 +66,8 @@ namespace llaminar2::cpu::native_quantised
     [[nodiscard]] inline CPUNativeQuantisedEncoding preparedEncodingForSource(
         const NativeQuantisedFormatInfo &source, bool rotation_enabled = false) noexcept
     {
+        if (!rotation_enabled && source.codebook_id == 5 && source.is_superblock)
+            return CPUNativeQuantisedEncoding::Q4KSuperblockCoded;
         if (!rotation_enabled && source.codebook_id == 4 && source.is_superblock)
             return CPUNativeQuantisedEncoding::NibbleLUTSourceScale;
         if (!rotation_enabled && source.codebook_id == 7 && source.is_superblock)
@@ -112,7 +114,8 @@ namespace llaminar2::cpu::native_quantised
         auto result = preparedFootprintForFormat(source.codebook_id, source.is_asymmetric, rotation_enabled);
         result.encoding = preparedEncodingForSource(source, rotation_enabled);
         result.weight_bytes_per_n_chunk_k_block = preparedInterleavedBlockStride(result.encoding, result.is_asymmetric, source.codebook_id);
-        if (result.encoding == CPUNativeQuantisedEncoding::Q6KNativeDualScale ||
+        if (result.encoding == CPUNativeQuantisedEncoding::Q4KSuperblockCoded ||
+            result.encoding == CPUNativeQuantisedEncoding::Q6KNativeDualScale ||
             result.encoding == CPUNativeQuantisedEncoding::NibbleLUTSourceScale ||
             (result.encoding == CPUNativeQuantisedEncoding::CompactMultiScale &&
              (source.codebook_id == 7 || source.codebook_id == 11)))

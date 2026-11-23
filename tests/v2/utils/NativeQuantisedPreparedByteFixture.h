@@ -138,8 +138,7 @@ public:
                     continue;
                 }
                 const auto primary = unit + layout.data_stride + (layout.usesInlineCompensation() ? 128 : 0) + local * 2;
-                // Seed the admitted zero marker and finite native exponents.
-                if (layout.scaleEncoding() == cpu::native_quantised::CPUNativeQuantisedScaleEncoding::E8M0)
+                if (layout.scaleEncoding() == CPUNativeQuantisedScaleEncoding::E8M0)
                 {
                     bytes[unit + layout.data_stride + local] = seed % 29u == 7u ? 0u : 2u + (seed >> 8) % 199u;
                     continue;

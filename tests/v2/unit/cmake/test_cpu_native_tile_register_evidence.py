@@ -40,7 +40,7 @@ CHECKER = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(CHECKER)
 
 # Tile::dispatch() programs per policy: (encoding, nibble map, with-minimum), written out independently.
-DISPATCHED = [(1, 0, 1), (1, 0, 0), (5, 0, 0), (2, 0, 0), (4, 2, 0), (0, 0, 0), (0, 2, 0), (0, 1, 1), (0, 3, 0)]
+DISPATCHED = [(1, 0, 1), (1, 0, 0), (5, 0, 0), (2, 0, 0), (4, 2, 0), (0, 0, 0), (0, 2, 0), (0, 1, 1), (0, 3, 0), (6, 1, 1)]
 NEON_KEYS = sorted((rows, 0, policy, encoding, nibble_map, minimum)
                    for rows in (1, 2, 3, 4) for policy in (0, 1) for encoding, nibble_map, minimum in DISPATCHED)
 NEON_INVENTORY = "1:ASIMD,2:ASIMD,3:ASIMD,4:ASIMD"
@@ -999,7 +999,7 @@ class InventoryTest(unittest.TestCase):
         for macho in (False, True):
             counts = audit_witness(macho=macho)
             self.assertEqual(sorted(tuple(map(int, CHECKER.program_key(n).split(":"))) for n in counts), NEON_KEYS)
-        self.assertEqual(len(NEON_KEYS), 72)
+        self.assertEqual(len(NEON_KEYS), 80)
 
     def test_missing_duplicate_empty_and_unexpected_programs(self) -> None:
         with self.assertRaisesRegex(ValueError, "missing"):
@@ -1062,6 +1062,12 @@ class PolicyTest(unittest.TestCase):
         CHECKER.require_registers(self.counts(4, 0), "GNU-14", "NEON", budget())
         with self.assertRaisesRegex(ValueError, "budget"):
             CHECKER.require_registers(self.counts(5, 0), "GNU-14", "NEON", budget())
+
+    def test_q4k_coded_program_cannot_exceed_the_previous_identity_nibble_ceiling(self) -> None:
+        counts = self.counts(0, 0)
+        counts[name(3, 0, 0, 6, 1, 1)] = 5
+        with self.assertRaisesRegex(ValueError, "3:0:0:6:1:1 spills 5 > budget 4"):
+            CHECKER.require_registers(counts, "GNU-14", "NEON", budget())
 
     def test_unknown_identity_envelope_missing_and_stale_budget_fail_closed(self) -> None:
         for identity, mode in (("GNU-15", "NEON"), ("GNU-14", "NEON_I8MM")):

@@ -238,13 +238,6 @@ namespace llaminar2::cpu::native_quantised::multi_scale
         static F half(const std::uint16_t *source) noexcept
         { return expandHalfBits(vld1_u16(source)); }
 
-        /** @brief Widen four BF16 words exactly by placement (word << 16).
-         * @param source Four readable BF16 words, e.g. native MXFP4 E8M0 powers of two.
-         * @return Four exact binary32 values; no rounding or FP16 interpretation.
-         */
-        static F bf16(const std::uint16_t *source) noexcept
-        { return std::bit_cast<F>(vshll_n_u16(vld1_u16(source), 16)); }
-
         /** @return Four E8M0 scales widened by exponent placement; byte 0 is the zero marker. */
         static F e8m0(const std::uint8_t *source) noexcept
         {
@@ -287,6 +280,24 @@ namespace llaminar2::cpu::native_quantised::multi_scale
          */
         static I halfBits(F value) noexcept
         { return std::bit_cast<I>(vmovl_u16(vreinterpret_u16_f16(vcvt_f16_f32(std::bit_cast<float32x4_t>(value))))); }
+
+        /** @return Widened half input for a product whose arithmetic already quiets NaNs. */
+        static F halfProductInput(I packed) noexcept requires (Dot == NEONByteDot::DotProd)
+        {
+            const auto half = vmovn_u32(std::bit_cast<uint32x4_t>(packed));
+            return std::bit_cast<F>(vcvt_f32_f16(vreinterpret_f16_u16(half)));
+        }
+
+        /** @return RNE half product widened immediately after canonicalizing negative zero.
+         * @details The input was a floating-point product, so any NaN is already
+         * quiet. A native widening preserves its staged quiet half payload.
+         */
+        static F stagedProduct(F value) noexcept
+        {
+            auto half = vreinterpret_u16_f16(vcvt_f16_f32(std::bit_cast<float32x4_t>(value)));
+            half = vbic_u16(half, vceq_u16(half, vdup_n_u16(0x8000)));
+            return std::bit_cast<F>(vcvt_f32_f16(vreinterpret_f16_u16(half)));
+        }
 
     private:
         /** @brief Preserve the portable half contract while using native finite conversion.

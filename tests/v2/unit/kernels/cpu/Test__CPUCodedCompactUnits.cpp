@@ -19,6 +19,8 @@
  * - a prepared matrix occupies exactly the GGUF bytes of its 64-padded columns;
  * - the production SIMD projection equals the scalar codec reference for
  *   1..4 rows, ragged N/K tails and both contiguous and ordered K reductions.
+ * - compensation-free nibble and Q8_0 layouts preserve the previous signed
+ *   integer dot and per-block output bytes, including coded Q4_K ragged K.
  */
 #include <gtest/gtest.h>
 
@@ -469,15 +471,38 @@ namespace llaminar2::test
                     run.template operator()<2>();
                     run.template operator()<3>();
                     run.template operator()<4>();
+                }
+            }
+        }
+    }
+
     namespace
     {
+        /** @brief Build source Q4_K with nonzero minima and all 12-bit scale/minimum fields varied. */
+        std::unique_ptr<TensorBase> q4KSource(const std::vector<std::size_t> &shape, std::uint32_t seed)
+        {
+            const auto superblocks = shape[0] * ((shape[1] + 255) / 256);
+            std::vector<std::uint8_t> bytes(superblocks * sizeof(Q4_KBlock));
+            std::mt19937 rng(seed);
+            for (std::size_t index = 0; index < superblocks; ++index)
+            {
+                Q4_KBlock block{};
+                block.d = static_cast<std::uint16_t>(0x1400 + rng() % 1024);
+                block.dmin = static_cast<std::uint16_t>(0x1000 + rng() % 1024);
+                for (auto &value : block.scales) value = static_cast<std::uint8_t>(rng());
+                for (auto &value : block.qs) value = static_cast<std::uint8_t>(rng());
+                std::memcpy(bytes.data() + index * sizeof(block), &block, sizeof(block));
+            }
+            return std::make_unique<Q4_KTensor>(shape, bytes);
+        }
+
         /** @return Test factories for every compensation-free source, including IQ4_XS's independent metadata. */
         std::vector<CompactSource> compensationFreeSources()
         {
             return {
                 {"Q4_0", 0, 18, [](auto s, auto r) { return Factory::createQ4_0Random(s, r); }},
                 {"Q4_1", 5, 20, [](auto s, auto r) { return Factory::createQ4_1Random(s, r); }},
-                {"Q4_K", 5, 20, [](auto s, auto r) { return Factory::createQ4_KRandom(s, r); }},
+                {"Q4_K", 5, 18, q4KSource},
                 {"IQ4_NL", 4, 18, [](auto s, auto r) { return Factory::createIQ4_NLRandom(s, r); }},
                 {"IQ4_XS", 4, 0, [](auto s, auto r) { return Factory::createIQ4_XSRandom(s, r); }},
                 {"MXFP4", 25, 17, [](auto s, auto r) { return Factory::createMXFP4Random(s, r); }},
@@ -540,9 +565,33 @@ namespace llaminar2::test
             EXPECT_FALSE(packed.usesInlineCompensation());
             if (source.file_bytes_per_32 != 0)
                 EXPECT_EQ(packed.native_interleaved.size(), source.file_bytes_per_32 * 128 * 16);
+            if (source.name == "Q4_K")
+                EXPECT_TRUE(packed.superblockCoded());
             if (source.name == "Q4_1")
                 EXPECT_FALSE(packed.superblockCoded());
         }
+    }
+
+    /** A ragged final K superblock keeps one header for only its live payload/code blocks. */
+    TEST(CPUCompensationFreeUnits, Q4KRaggedTailKeepsOneSourceHeader)
+    {
+        constexpr int N = 67, K = 288, Blocks = K / 32;
+        const auto tensor = q4KSource({N, K}, 9);
+        const auto *source = IINT8Unpackable::fromTensor(tensor.get());
+        ASSERT_NE(source, nullptr);
+        CPUNativeQuantisedPackedWeights packed;
+        ASSERT_TRUE(packWeightsCPUNativeQuantised(tensor.get(), packed));
+        const auto view = packed.readView();
+        EXPECT_EQ(view.geometry().rowBytes(), (16 * 64 + 96) * Blocks + 2 * 256);
+        EXPECT_EQ(view.bytes().size(), view.geometry().rowBytes() * 2);
+        for (int column = 0; column < N; ++column)
+            for (int block = 0; block < Blocks; ++block)
+            {
+                EXPECT_EQ(view.blockScale(column / 64, block, column % 64),
+                    fp16_to_fp32(fp32_to_fp16(source->get_block_scale(column, block))));
+                EXPECT_EQ(view.blockMin(column / 64, block, column % 64),
+                    fp16_to_fp32(fp32_to_fp16(source->get_block_min(column, block))));
+            }
     }
 
     /** The two unsigned dot programs reconstruct every signed product, including signed minima. */
@@ -595,6 +644,14 @@ namespace llaminar2::test
                     std::array<float, 4 * N> output{};
                     SCOPED_TRACE(source.name + " rows=" + std::to_string(rows) + " policy=" + std::to_string(int(policy)));
 #if defined(__aarch64__) && defined(__ARM_NEON)
+                    constexpr auto instruction =
+#if defined(__ARM_FEATURE_MATMUL_INT8)
+                        multi_scale::NEONByteDot::I8MM;
+#elif defined(__ARM_FEATURE_DOTPROD)
+                        multi_scale::NEONByteDot::DotProd;
+#else
+                        multi_scale::NEONByteDot::ASIMD;
+#endif
                     const auto run = [&]<std::size_t Rows>() {
                         const auto view = packed.readView();
                         std::array<std::span<const Q8_1Block>, Rows> inputs{};
@@ -605,7 +662,7 @@ namespace llaminar2::test
                             std::array<std::span<float>, Rows> outputs{};
                             for (std::size_t row = 0; row < Rows; ++row)
                                 outputs[row] = std::span(output).subspan(row * N + chunk * 64, std::min(64, N - chunk * 64));
-                            CPUNativeNEONProjectionTile<Rows>::bind(view, inputs, outputs, chunk).template execute<multi_scale::NEONByteDot::ASIMD>();
+                            CPUNativeNEONProjectionTile<Rows>::bind(view, inputs, outputs, chunk).template execute<instruction>();
                         }
                     };
                     switch (rows)

@@ -298,7 +298,8 @@ namespace llaminar2::cpu::native_quantised
 
         /** @return Whether a four-bit payload is retained in the stream. */
         [[nodiscard]] bool usesNibbleLUT() const noexcept
-        { return encoding == CPUNativeQuantisedEncoding::NibbleLUT || usesNibbleLUTSourceScale(); }
+        { return encoding == CPUNativeQuantisedEncoding::NibbleLUT || usesNibbleLUTSourceScale() ||
+            encoding == CPUNativeQuantisedEncoding::Q4KSuperblockCoded; }
 
         /** @brief Interpretation of the primary scale words, derived from codebook and encoding.
          * @return E8M0 for native nibble MXFP4; FP16 otherwise (including rotated MXFP4).

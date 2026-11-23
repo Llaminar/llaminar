@@ -127,7 +127,8 @@ namespace llaminar2::cpu::native_quantised
         /** @brief Return whether this matrix uses native four-bit interleaving. */
         [[nodiscard]] bool usesNibbleLUT() const noexcept
         {
-            return encoding == CPUNativeQuantisedEncoding::NibbleLUT || usesNibbleLUTSourceScale();
+            return encoding == CPUNativeQuantisedEncoding::NibbleLUT || usesNibbleLUTSourceScale() ||
+                encoding == CPUNativeQuantisedEncoding::Q4KSuperblockCoded;
         }
 
         /** @brief Whether raw IQ4_XS source factors accompany the nibble payload. */

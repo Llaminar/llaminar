@@ -312,6 +312,39 @@ namespace llaminar2::cpu::native_quantised::coded_metadata
         F emin_high{}; ///< Q2_K effective minimum of the high half.
     };
 
+    /** @brief Widened Q4_K source header reused by every block of one superblock. */
+    template <typename F> struct Q4KBaseFactors
+    {
+        F d;
+        F dmin;
+    };
+
+    /** @return Q4_K's original d and dmin, widened exactly for one lane vector. */
+    template <typename Ops>
+    inline Q4KBaseFactors<typename Ops::F> q4KBase(typename Ops::I word)
+    {
+        using L = Lanes<Ops>;
+        if constexpr (requires { Ops::halfProductInput(word); })
+            return {Ops::halfProductInput(word), Ops::halfProductInput(word >> 16)};
+        else
+            return {L::half(word), L::half(word >> 16)};
+    }
+
+    /** @return The staged Q4_K scale and minimum from one code and its reusable source factors. */
+    template <std::uint8_t Codebook, typename Ops> requires (Codebook == 5)
+    inline Factors<typename Ops::F> reconstruct(typename Ops::I code, const Q4KBaseFactors<typename Ops::F> &base)
+    {
+        using L = Lanes<Ops>;
+        // Code = 6-bit scale | 6-bit min << 6. Keep both old binary16
+        // rounding points and signed-zero normalization of the source codec.
+        const auto primary = base.d * L::toFloat(code & 63);
+        const auto minimum = -base.dmin * L::toFloat((code >> 6) & 63);
+        if constexpr (requires { Ops::stagedProduct(primary); })
+            return {.primary = Ops::stagedProduct(primary), .secondary = Ops::stagedProduct(minimum)};
+        else
+            return {.primary = L::staged(primary), .secondary = L::staged(minimum)};
+    }
+
     /**
      * @brief Multiply the original base by the signed source coefficients without half rounding.
      * @tparam Codebook Physical source-scale codebook: Q6_K or IQ4_XS.
@@ -384,9 +417,11 @@ namespace llaminar2::cpu::native_quantised::coded_metadata
             out.emin_low = L::staged(-dmin * L::toFloat((code >> 4) & 15));
             out.emin_high = L::staged(-dmin * L::toFloat((code >> 12) & 15));
         }
-        else if constexpr (Codebook == 5 || Codebook == 7)
+        else if constexpr (Codebook == 5)
+            return reconstruct<5, Ops>(code, q4KBase<Ops>(word));
+        else if constexpr (Codebook == 7)
         {
-            // Q4_K/Q5_K: one 6-bit scale and one 6-bit additive minimum per block.
+            // Q5_K: one 6-bit scale and one 6-bit additive minimum per block.
             const F dmin = L::half(word >> 16);
             out.primary = L::staged(d * L::toFloat(code & 63));
             out.secondary = L::staged(-dmin * L::toFloat((code >> 6) & 63));

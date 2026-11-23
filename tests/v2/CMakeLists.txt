@@ -3336,7 +3336,7 @@ add_v2_test(V2_Integration_MXFP4TierReferenceRoundTrip
         --gtest_filter=ExpertTierWeightStream.MXFP4NativeE8M0PlaneRoundTripsOddCountsAndRejectsMalformedWords:*EveryCpuPreparedEncoding*
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MoE;MXFP4;Transfer;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60)
-# CPU packed-weight archive ABI 8: native MXFP4 unit scale words are BF16 powers of two.
+# Native MXFP4 archive payload retains the original E8M0 scale bytes.
 add_v2_test(V2_Integration_MXFP4PackedWeightsArchiveABI
     COMMAND $<TARGET_FILE:v2_unit_packed_weights_serialization>
         --gtest_filter=Test__PackedWeightsSerialization.MXFP4NativeUnitE8M0BytesRoundTripAndRejectVersion7
@@ -10639,7 +10639,7 @@ add_v2_test(V2_Integration_CPUCodedFileDensityQ6IQ4
 add_v2_test(V2_Integration_CPUCompensationFreeUnits
     COMMAND $<TARGET_FILE:v2_unit_cpu_coded_compact_units>
         --gtest_filter=CPUCompensationFreeUnits.*:CPUCodedCompactUnits.SimdReconstructionEqualsCodecWordsExhaustively
-    LABELS "V2;Integration;CPU;DeviceFree;NativeQuantised;Memory;ByteExact;Regression"
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;NativeQuantised;Memory;ByteExact;Regression"
     MPI_PROCS 1 NO_MODELS)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUCompensationFreeUnits)
 
@@ -28468,7 +28468,7 @@ add_v2_test(V2_Unit_ExpertTierWeightStream
 add_v2_test(V2_Integration_ExpertTierWeightDensityAdmission
     COMMAND $<TARGET_FILE:v2_test_expert_tier_weight_stream>
         --gtest_filter=ExpertTierWeightStream.DensityLayoutsRequireCompatibleMigrationSlots
-    LABELS "V2;Integration;DeviceFree;MoE;WeightLifecycle;ExpertOverlay;Streaming"
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MoE;WeightLifecycle;ExpertOverlay;Streaming"
     NO_MODELS)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ExpertTierWeightDensityAdmission)
 
