@@ -22,7 +22,7 @@ if ! git config --global --get-all safe.directory | grep -Fxq "$WORKSPACE_DIR"; 
 fi
 
 bash "$WORKSPACE_DIR/.devcontainer/setup-ccache.sh"
-bash "$WORKSPACE_DIR/.devcontainer/setup-codex-cli.sh"
+bash "$WORKSPACE_DIR/.devcontainer/setup-codex-state.sh"
 bash "$WORKSPACE_DIR/.devcontainer/setup-python-env.sh"
 bash "$WORKSPACE_DIR/.devcontainer/setup-github-cli.sh" --if-authenticated
 

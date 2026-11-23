@@ -49,8 +49,9 @@ persistent authority for authentication, configuration, plugins, memories,
 and session history. Container deletion and rebuilds do not delete this named
 volume. Do not remove it with `docker volume rm` or a volume-pruning command.
 
-The standalone Codex CLI is installed during the devcontainer's post-create
-phase, after the persistent volume is mounted. If authentication expires, run
+The image build installs `codex`, `claude`, and `agy` on the `vscode` user's
+`PATH`. The Codex executable lives outside the mounted state directory.
+If Codex authentication expires, run
 `llaminar shell`, then `codex login --device-auth`; follow the displayed device
 sign-in flow from the client device. Never copy `auth.json` into the repository
 or commit it.

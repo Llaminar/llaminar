@@ -142,6 +142,19 @@ RUN git clone https://github.com/Microsoft/vcpkg.git ~/vcpkg && \
     echo 'export PATH="$HOME/vcpkg:$PATH"' >> ~/.bashrc
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 
+# Keep Codex's executable outside the state volume mounted at ~/.codex.
+# CODEX_HOME applies only to the installer, so sessions use the mounted state.
+RUN <<'INSTALL'
+#!/bin/bash
+set -euo pipefail
+curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_HOME="$HOME/.local/share/codex-cli" CODEX_NON_INTERACTIVE=1 sh
+curl -fsSL https://claude.ai/install.sh | bash
+curl -fsSL https://antigravity.google/cli/install.sh | bash
+codex --version
+claude --version
+agy --version
+INSTALL
+
 RUN echo 'alias ll="ls -la"' >> ~/.bashrc && \
     echo 'alias la="ls -la"' >> ~/.bashrc && \
     echo 'alias uvx="uv run --with"' >> ~/.bashrc
