@@ -113,6 +113,13 @@ python3 tests/v2/performance/kernels/cuda/roofline/score_hc_ffn.py \
     family-work.csv "$CALIBRATIONS"/*.csv > family-reference.csv
 ```
 
+For a staged capture, pass the recorded grid for each phase with
+`--phase-grid PHASE=BLOCKSxTHREADS`. The phase names are `hc_down`, `hc_up`,
+`router`, `gate_up`, and `down`. The output records each phase's launch
+dimensions and rates. Each PCI device requires a checked DRAM, L2, DP4A, and
+FFMA calibration for its requested grids. A single common grid still models
+each resident launch.
+
 The scorer takes the dominant read or useful arithmetic time for each ordered
 phase and adds the phases. HC Down and the paired HC Up count their Q8_0
 weights once. The paired Up counts both integer MACs. Routing counts the
