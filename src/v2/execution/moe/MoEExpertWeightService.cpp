@@ -545,7 +545,10 @@ namespace llaminar2
                     slot.d_native_quantised_emins,
                     codebook_id, blocks_per_row,
                     lifetime_owner,
-                    source_identity);
+                    source_identity,
+                    NativeQuantisedReusableDeviceAllocationFormat{},
+                    // The pool slot's producer chose its metadata representation.
+                    slot.metadata_layout);
             }
 #endif
             return nullptr;
@@ -2159,7 +2162,10 @@ namespace llaminar2
                         slot->d_native_quantised_emins,
                         canonicalDeviceVnniCodebookId(format), blocks_per_row,
                         orchestrator,
-                        sourceIdentityFor(format));
+                        sourceIdentityFor(format),
+                        NativeQuantisedReusableDeviceAllocationFormat{},
+                        // The pool slot's producer chose its metadata representation.
+                        slot->metadata_layout);
                 }
 #endif
 
@@ -2522,7 +2528,10 @@ namespace llaminar2
                         slot->d_native_quantised_emins,
                         canonicalDeviceVnniCodebookId(*vnni), blocks_per_row,
                         orchestrator,
-                        sourceIdentityFor(*vnni)); // lifetime: keeps VRAM pool alive
+                        sourceIdentityFor(*vnni), // lifetime: keeps VRAM pool alive
+                        NativeQuantisedReusableDeviceAllocationFormat{},
+                        // The pool slot's producer chose its metadata representation.
+                        slot->metadata_layout);
                 }
 #endif
 
@@ -4535,7 +4544,10 @@ namespace llaminar2
                     slot.d_native_quantised_emins,
                     canonicalDeviceVnniCodebookId(vnni), blocks_per_row,
                     lifetime_owner,
-                    sourceIdentityFor(vnni));
+                    sourceIdentityFor(vnni),
+                    NativeQuantisedReusableDeviceAllocationFormat{},
+                    // The pool slot's producer chose its metadata representation.
+                    slot.metadata_layout);
             }
 #endif
             return nullptr;

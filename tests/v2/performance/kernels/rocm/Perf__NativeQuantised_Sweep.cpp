@@ -59,6 +59,7 @@
 #include <tuple>
 #include <vector>
 
+#include "kernels/rocm/gemm/ROCmNativeQuantisedBlockMetadata.h"
 #include "kernels/rocm/gemm/ROCmQuantisedGemmKernel.h"
 #include "kernels/rocm/gemm/ROCmWeightPacker.h"
 #include "kernels/rocm/gemm/ROCmDensePrefillPreparedWeightFamily.h"
@@ -744,7 +745,8 @@ namespace
 
     /** @brief Production dispatcher with independent physical and source-math identities. */
     extern "C" bool rocmGemm_native_quantised_fp32_with_policy(
-        const int8_t *, const uint8_t *, const void *, const void *, const void *,
+        const int8_t *, const uint8_t *,
+    const ::llaminar2::rocm_native_metadata::MetadataPlanes d_meta,
         float *, const float *, const float *, int, int, int, uint8_t, uint8_t,
         int, void *);
 
@@ -1342,7 +1344,7 @@ namespace
                 workspace_->getBuffer(GemmWorkspaceBuffers::SCALES_A_BLOCKWISE));
             if (!activations || !row_scales || !block_scales ||
                 !rocmGemm_native_quantised_fp32_with_policy(
-                    activations, weights.payload, weights.scales, weights.mins, weights.emins,
+                    activations, weights.payload, ::llaminar2::native_quantised_scale::metadataPlanes(weights),
                     static_cast<float *>(output_->gpu_data_ptr()), row_scales, block_scales,
                     m_, shape_.N, shape_.K, weights.codebook_id,
                     canonicalDeviceVnniCodebookId(weights.source_codebook_id), device_ordinal_, stream_))
@@ -1743,8 +1745,7 @@ namespace
             const auto launch = [&](FP32Tensor *destination) {
                 return rocmGemm_native_quantised_fp32_with_policy(
                     static_cast<const int8_t *>(a->gpu_data_ptr()),
-                    static_cast<const uint8_t *>(payload->gpu_data_ptr()), scales->gpu_data_ptr(),
-                    codebook == kNativeQuantisedExpandedInt8MinCodebook ? minima->gpu_data_ptr() : nullptr, nullptr,
+                    static_cast<const uint8_t *>(payload->gpu_data_ptr()), ::llaminar2::rocm_native_metadata::perBlockMetadataPlanes(scales->gpu_data_ptr(), codebook == kNativeQuantisedExpandedInt8MinCodebook ? minima->gpu_data_ptr() : nullptr, nullptr),
                     static_cast<float *>(destination->gpu_data_ptr()),
                     static_cast<const float *>(rows->gpu_data_ptr()), nullptr, m, n, k,
                     codebook, codebook == kNativeQuantisedExpandedInt8MinCodebook ? 5 : 0, device_ordinal, stream);

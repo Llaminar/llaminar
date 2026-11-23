@@ -30,6 +30,7 @@ class CurrentDownFields {
     unsigned columns_;
     const uint8_t* payload_;
     const unsigned short *scales_, *mins_;
+    uint8_t layout_ = 0; ///< Packed metadata layout (per-block or superblock-coded).
 public:
     /**
      * @brief Borrow the original descriptor without changing its representation.
@@ -40,6 +41,7 @@ public:
     __device__ __forceinline__ explicit CurrentDownFields(const Descriptor& descriptor)
     {
         native_descriptor_fields<NeedMins>(descriptor, columns_, payload_, scales_, mins_);
+        layout_ = native_descriptor_layout(descriptor);
     }
 
     /**
@@ -66,6 +68,7 @@ public:
             payload_=reinterpret_cast<const uint8_t*>(uint64_t(bits[0])|(uint64_t(bits[1])<<32));
             scales_=reinterpret_cast<const unsigned short*>(uint64_t(bits[2])|(uint64_t(bits[3])<<32));
             mins_=reinterpret_cast<const unsigned short*>(uint64_t(bits[4])|(uint64_t(bits[5])<<32));
+            layout_=native_descriptor_layout(descriptor);
         } else {
             NativeScalarWords4 bits;
             asm volatile("s_load_dwordx4 %0, %1, 0\n\t"
@@ -85,7 +88,8 @@ public:
     __device__ __forceinline__ explicit CurrentDownFields(const NativeMatrix& descriptor,
         std::integral_constant<unsigned,Columns>) :
         columns_(Columns), payload_(static_cast<const uint8_t*>(descriptor.payload)),
-        scales_(static_cast<const unsigned short*>(descriptor.scales)), mins_(nullptr)
+        scales_(static_cast<const unsigned short*>(descriptor.scales)), mins_(nullptr),
+        layout_(native_descriptor_layout(descriptor))
     {
         static_assert(!NeedMins && Columns>0);
     }
@@ -98,6 +102,9 @@ public:
      * @param scales Original globally resident scale plane.
      * @param mins Original secondary plane, or null when it is not consumed.
      */
+    /** @return The borrowed matrix's packed metadata layout. */
+    __device__ __forceinline__ uint8_t layout() const { return layout_; }
+
     template<bool ReadMins>
     __device__ __forceinline__ void borrow(unsigned& columns, const uint8_t*& payload,
         const unsigned short*& scales, const unsigned short*& mins) const
@@ -124,6 +131,13 @@ __device__ __forceinline__ void native_descriptor_fields(const CurrentDownFields
     const unsigned short*& mins)
 {
     fields.template borrow<ReadMins>(columns, payload, scales, mins);
+}
+
+/** @brief Metadata layout already borrowed by task-local down fields. */
+template<bool NeedMins>
+__device__ __forceinline__ uint8_t native_descriptor_layout(const CurrentDownFields<NeedMins>& fields)
+{
+    return fields.layout();
 }
 
 /**
@@ -202,7 +216,7 @@ __device__ __forceinline__ float currentDownQ8Block(
  * @param activation Canonical Q8 block, including its original code sum.
  * @return Independently rounded block value before its ordered accumulation.
  */
-template<unsigned Codebook, class Fields>
+template<unsigned Codebook, int CodedRepresentation, class Fields>
 __device__ __forceinline__ float currentDownBlock(
     const Fields& fields, unsigned column, unsigned block,
     const CanonicalFFNQ8Block& activation)
@@ -211,7 +225,7 @@ __device__ __forceinline__ float currentDownBlock(
         "Matched diagnostic requires its original native Q5_1/Q8_0 sources");
     if constexpr (Codebook == 7) {
         int words[6];
-        native_q51_block(fields, int(column), int(block), words);
+        native_q51_block<true, CodedRepresentation>(fields, int(column), int(block), words);
         return currentDownQ51Block(words, activation);
     } else {
         return currentDownQ8Block(fields, column, block, activation);
@@ -232,18 +246,13 @@ __device__ __forceinline__ float currentDownBlock(
  * partition bookkeeping. For longer widths only one partition accumulator is
  * live; no capacity-sized array or cross-lane reduction is necessary.
  */
-template<unsigned Codebook, unsigned FixedColumns=0, class Descriptor>
-__device__ __forceinline__ float currentDownRow(
-    const Descriptor& matrix, unsigned column, unsigned width,
+template<unsigned Codebook, int CodedRepresentation, class Fields>
+__device__ __forceinline__ float currentDownRowBlocks(
+    const Fields& fields, unsigned column, unsigned width,
     const CanonicalFFNQ8Block* activation)
 {
     namespace numeric = ::llaminar2::device_native_quantised_contract;
     namespace fp = ::llaminar2::device_fp32_contract;
-    const auto fields=[&] {
-        if constexpr(FixedColumns)
-            return CurrentDownFields<Codebook==7>(matrix,std::integral_constant<unsigned,FixedColumns>{});
-        else return CurrentDownFields<Codebook==7>(matrix);
-    }();
     const unsigned blocks = width / 32;
     const unsigned parts = blocks < unsigned(::llaminar2::MoEProjectionNumericalContract::ordered_k_partitions)
         ? blocks : unsigned(::llaminar2::MoEProjectionNumericalContract::ordered_k_partitions);
@@ -252,7 +261,7 @@ __device__ __forceinline__ float currentDownRow(
 #pragma unroll 1
         for (unsigned block = 0; block < blocks; ++block) {
             const float partial = fp::multiply(numeric::accumulate(0.0f,
-                currentDownBlock<Codebook>(fields, column, block, activation[block])), 1.0f);
+                currentDownBlock<Codebook, CodedRepresentation>(fields, column, block, activation[block])), 1.0f);
             result = parts == 1 ? partial : numeric::accumulate(result, partial);
         }
         return result;
@@ -266,11 +275,33 @@ __device__ __forceinline__ float currentDownRow(
 #pragma unroll 1
         for (unsigned block = first; block < last; ++block)
             partial = numeric::accumulate(partial,
-                currentDownBlock<Codebook>(fields, column, block, activation[block]));
+                currentDownBlock<Codebook, CodedRepresentation>(fields, column, block, activation[block]));
         partial = fp::multiply(partial, 1.0f);
         result = numeric::accumulate(result, partial);
     }
     return result;
+}
+
+/**
+ * @brief Complete one row after selecting the matrix's metadata representation once.
+ * @details The representation is uniform for the whole expert matrix; the
+ * per-block loop keeps the original coefficient reads, the superblock-coded
+ * loop reconstructs identical words (Q5_K). Arithmetic and order are shared.
+ */
+template<unsigned Codebook, unsigned FixedColumns=0, class Descriptor>
+__device__ __forceinline__ float currentDownRow(
+    const Descriptor& matrix, unsigned column, unsigned width,
+    const CanonicalFFNQ8Block* activation)
+{
+    const auto fields=[&] {
+        if constexpr(FixedColumns)
+            return CurrentDownFields<Codebook==7>(matrix,std::integral_constant<unsigned,FixedColumns>{});
+        else return CurrentDownFields<Codebook==7>(matrix);
+    }();
+    if constexpr(Codebook == 7)
+        if(native_descriptor_layout(fields)!=0)
+            return currentDownRowBlocks<Codebook,1>(fields,column,width,activation);
+    return currentDownRowBlocks<Codebook,0>(fields,column,width,activation);
 }
 
 /**

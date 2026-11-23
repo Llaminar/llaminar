@@ -12,6 +12,7 @@
 
 #include "kernels/common/DeviceRowRange.h"
 #include "kernels/common/HCDownOutputPublicationArgs.h"
+#include "kernels/rocm/gemm/ROCmNativeQuantisedBlockMetadata.h"
 #include <cstdint>
 
 extern "C"
@@ -20,9 +21,9 @@ extern "C"
      * @brief Execute grouped verifier rows using serial-M1 ordered arithmetic.
      * @param d_A_int8 Quantized row-major activations [M,K].
      * @param d_payload Prepared native-format device weight bytes.
-     * @param d_block_scales Prepared per-block primary scale metadata.
-     * @param d_block_mins Optional format-owned secondary scale/minimum metadata.
-     * @param d_block_emins Optional format-owned extended minimum metadata.
+     * @param d_meta Block metadata planes and representation: per-block primary,
+     *        optional secondary/emin planes, or superblock-coded codes plus
+     *        per-superblock d/dmin words (rocm_native_metadata::MetadataPlanes).
      * @param d_C_fp32 Persistent row-major output [M,N].
      * @param d_scale_A_blockwise Activation scale per row and K block.
      * @param d_sum_A_blockwise Activation sum per block, where required.
@@ -40,8 +41,7 @@ extern "C"
      */
     bool rocmGemv_native_quantised_small_m_fp32_with_sums_policy(
         const int8_t *d_A_int8, const uint8_t *d_payload,
-        const void *d_block_scales, const void *d_block_mins,
-        const void *d_block_emins, float *d_C_fp32,
+        const ::llaminar2::rocm_native_metadata::MetadataPlanes d_meta, float *d_C_fp32,
         const float *d_scale_A_blockwise, const int32_t *d_sum_A_blockwise,
         float *d_partial_fp32, int M, int N, int K,
         uint8_t codebook_id, uint8_t arithmetic_policy_codebook_id,
@@ -51,8 +51,8 @@ extern "C"
     /**
      * @brief Fused same-format projections sharing quantization and row admission.
      *
-     * Operand planes follow the single-projection contract above. Pointer/N
-     * arrays contain num_projections entries and are copied into kernel args;
+     * Operand planes follow the single-projection contract above. Pointer,
+     * metadata-plane and N arrays contain num_projections entries and are copied into kernel args;
      * every output/partial owns a distinct slice. policy_kb and
      * policy_target_waves must reproduce the generated serial-M1 schedule.
      * row_range is shared by the entire bundle, never read on the host.
@@ -63,9 +63,7 @@ extern "C"
     bool rocmGemv_native_quantised_small_m_batched_fp32_with_sums_policy(
         const int8_t *d_A_int8,
         const uint8_t *const *d_payloads,
-        const uint16_t *const *d_block_scales,
-        const uint16_t *const *d_block_mins,
-        const uint32_t *const *d_block_emins,
+        const ::llaminar2::rocm_native_metadata::MetadataPlanes *d_metas, // per-projection metadata planes
         const float *const *d_biases,
         float *const *d_outputs,
         const float *d_scale_A_blockwise, // [M × blocks_per_row]
@@ -91,9 +89,7 @@ extern "C"
     bool rocmGemv_native_quantised_small_m_batched_mixed_fp32_with_sums_policy(
         const int8_t *d_A_int8,
         const uint8_t *const *d_payloads,
-        const uint16_t *const *d_block_scales,
-        const uint16_t *const *d_block_mins,
-        const uint32_t *const *d_block_emins,
+        const ::llaminar2::rocm_native_metadata::MetadataPlanes *d_metas, // per-projection metadata planes
         const float *const *d_biases,
         float *const *d_outputs,
         const float *d_scale_A_blockwise, // [M × blocks_per_row]

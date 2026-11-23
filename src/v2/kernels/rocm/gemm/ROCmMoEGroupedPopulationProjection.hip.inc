@@ -152,10 +152,9 @@ __device__ __forceinline__ void populationProjectionBody(const MoEGroupedWmmaArg
     int source = desc.source_identity_present ? desc.source_codebook_id : desc.codebook_id;
     if (source == 20 || source == 21) source = 19;
     if (source != Source) __builtin_trap();
-    if (!desc.payload || !desc.scales || desc.n != N || desc.k != K ||
+    if (!desc.payload || desc.n != N || desc.k != K ||
         desc.blocks_per_row != static_cast<uint32_t>(K / 32) ||
-        (Traits::needs_aux_compute && !desc.mins) ||
-        (Traits::is_dual_scale_asym && !desc.emins)) __builtin_trap();
+        !::llaminar2::rocm_native_metadata::descriptorMetadataComplete(desc, Traits::needs_aux_compute, Traits::is_dual_scale_asym)) __builtin_trap();
     const auto producer = populationProjectionProducer(family,count);
     if (producer == MoEGroupedDotProducer::Invalid) __builtin_trap();
     if constexpr (Arithmetic == PopulationArithmetic::Ordered)
@@ -207,8 +206,12 @@ __device__ __forceinline__ void populationProjectionBody(const MoEGroupedWmmaArg
                     const size_t linear = static_cast<size_t>(kb)*N + col;
                     uint32_t raw[Traits::payload_dwords];
                     load_payload<Traits::payload_bytes>(desc.payload + linear*Traits::payload_bytes,raw);
-                    const uint16_t scale = ::llaminar2::native_quantised_scale::loadStagedPrimary<static_cast<uint8_t>(FMT)>(static_cast<const uint16_t *>(desc.scales), linear);
-                    const uint16_t aux = static_cast<const uint16_t *>(desc.mins)[linear];
+                    // One metadata authority for per-block and superblock-coded descriptors.
+                    const auto block_meta = ::llaminar2::rocm_native_metadata::blockMetadata<static_cast<uint8_t>(FMT)>(
+                        ::llaminar2::native_quantised_scale::metadataPlanes(desc), static_cast<uint32_t>(kb),
+                        static_cast<uint32_t>(col), static_cast<uint32_t>(N));
+                    const uint16_t scale = block_meta.primary;
+                    const uint16_t aux = block_meta.secondary;
                     int decoded[8]; decode_block<FMT>(raw,decoded);
                     const auto weight = rocm_native_quantised_load_dual_weight_scales<FMT>(scale,aux);
                     const auto input = v.activations + static_cast<size_t>(row)*K + kb*32;
@@ -280,9 +283,13 @@ __device__ __forceinline__ void populationProjectionBody(const MoEGroupedWmmaArg
                 if (owns_column)
                 {
                     load_payload<Traits::payload_bytes>(desc.payload + linear*Traits::payload_bytes,raw);
-                    scale = ::llaminar2::native_quantised_scale::loadStagedPrimary<static_cast<uint8_t>(FMT)>(static_cast<const uint16_t *>(desc.scales), linear);
-                    if constexpr (Traits::needs_aux_compute) aux = static_cast<const uint16_t *>(desc.mins)[linear];
-                    if constexpr (Traits::is_dual_scale_asym) minima = static_cast<const uint32_t *>(desc.emins)[linear];
+                    // One metadata authority for per-block and superblock-coded descriptors.
+                    const auto block_meta = ::llaminar2::rocm_native_metadata::blockMetadata<static_cast<uint8_t>(FMT)>(
+                        ::llaminar2::native_quantised_scale::metadataPlanes(desc), static_cast<uint32_t>(kb),
+                        static_cast<uint32_t>(col), static_cast<uint32_t>(N));
+                    scale = block_meta.primary;
+                    if constexpr (Traits::needs_aux_compute) aux = block_meta.secondary;
+                    if constexpr (Traits::is_dual_scale_asym) minima = block_meta.emin;
                 }
                 int decoded[8]; decode_block<FMT>(raw,decoded);
                 // Complete packed-word decoding before activation publication.
@@ -395,9 +402,13 @@ __device__ __forceinline__ void populationProjectionBody(const MoEGroupedWmmaArg
                     if (n0+col < N)
                     {
                         load_payload<Traits::payload_bytes>(desc.payload + linear*Traits::payload_bytes,raw);
-                        scale = ::llaminar2::native_quantised_scale::loadStagedPrimary<static_cast<uint8_t>(FMT)>(static_cast<const uint16_t *>(desc.scales), linear);
-                        if constexpr (Traits::needs_aux_compute) aux = static_cast<const uint16_t *>(desc.mins)[linear];
-                        if constexpr (Traits::is_dual_scale_asym) minima = static_cast<const uint32_t *>(desc.emins)[linear];
+                        // One metadata authority for per-block and superblock-coded descriptors.
+                        const auto block_meta = ::llaminar2::rocm_native_metadata::blockMetadata<static_cast<uint8_t>(FMT)>(
+                            ::llaminar2::native_quantised_scale::metadataPlanes(desc), static_cast<uint32_t>(kb),
+                            static_cast<uint32_t>(n0+col), static_cast<uint32_t>(N));
+                        scale = block_meta.primary;
+                        if constexpr (Traits::needs_aux_compute) aux = block_meta.secondary;
+                        if constexpr (Traits::is_dual_scale_asym) minima = block_meta.emin;
                     }
                     int decoded[8]; decode_block<FMT>(raw,decoded);
                     I32x4 lo, hi;

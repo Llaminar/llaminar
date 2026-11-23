@@ -208,8 +208,8 @@ namespace
     /**
      * @brief Expected pool bytes of one immutable source-native GPU matrix.
      *
-     * CUDA stores superblock sources with superblock-coded metadata (bit-packed
-     * per-block codes plus per-superblock d/dmin); ROCm and non-superblock
+     * CUDA and ROCm store superblock sources with superblock-coded metadata
+     * (bit-packed per-block codes plus per-superblock d/dmin); non-superblock
      * sources keep per-block planes. Each region starts on a 256-byte boundary.
      */
     size_t expectedGpuPackedBytes(size_t rows, size_t k, const NativeQuantisedFormatInfo &native, DeviceId device,
@@ -218,7 +218,8 @@ namespace
         const auto align = [](size_t bytes) { return (bytes + 255u) & ~size_t(255u); };
         auto packed = nativeQuantisedPackedRegionSizes(rows, k, native);
         const uint8_t codebook = canonicalDeviceVnniCodebookId(native);
-        if (device.is_cuda() && native.is_superblock && nativeQuantisedSuperblockCodable(codebook))
+        if ((device.is_cuda() || device.is_rocm()) && native.is_superblock &&
+            nativeQuantisedSuperblockCodable(codebook))
         {
             const auto planes = native_quantised_superblock::planeBytes(codebook, rows,
                                                                         static_cast<uint32_t>(k / 32), superblock_phase);
@@ -764,14 +765,12 @@ TEST(Test__WeightMemoryEstimator, SingleDevice_IQProfileUsesCompactGPUPacking)
     EXPECT_EQ(estimate.native_bytes, profile.total_native_bytes);
     EXPECT_EQ(estimate.device_bytes, profile.total_native_bytes + 2u * 256u);
 
-    // ROCm keeps per-block FP16 planes.
+    // ROCm stores the identical superblock-coded representation.
     const auto rocm = WeightMemoryEstimator::estimate(profile, DeviceId::rocm(0));
-    const size_t expected_rocm_bytes =
-        static_cast<size_t>(static_cast<float>(elements) * (17.0f / 32.0f)) +
-        static_cast<size_t>(static_cast<float>(elements) * (14.0f / 32.0f)) +
-        static_cast<size_t>(static_cast<float>(elements) * (16.0f / 32.0f)) +
-        static_cast<size_t>(static_cast<float>(elements) * (10.0f / 32.0f));
-    EXPECT_EQ(rocm.device_bytes, expected_rocm_bytes);
+    EXPECT_EQ(rocm.native_bytes, profile.total_native_bytes);
+    EXPECT_EQ(rocm.device_bytes, estimate.device_bytes);
+    EXPECT_EQ(rocm.device_bytes, profile.total_native_bytes + 2u * 256u);
+    (void)elements;
 }
 
 TEST(Test__WeightMemoryEstimator, SingleDevice_NativeBytes)
@@ -902,9 +901,9 @@ TEST(Test__WeightMemoryEstimator, SingleDevice_Q4KUsesCompactGPUPacking)
     EXPECT_EQ(estimate.native_bytes, q4k_tensor.native_bytes);
     EXPECT_EQ(estimate.device_bytes, file_bytes + 256u);
 
-    // ROCm: per-block FP16 scale and minimum planes.
+    // ROCm: the same file-density coded representation.
     auto rocm = WeightMemoryEstimator::estimate(profile, DeviceId::rocm(0));
-    EXPECT_EQ(rocm.device_bytes, static_cast<size_t>(static_cast<float>(q4k_tensor.elements) * (20.0f / 32.0f)));
+    EXPECT_EQ(rocm.device_bytes, file_bytes + 256u);
 }
 
 TEST(Test__WeightMemoryEstimator, QuantizedEmbeddingUsesOriginalNativeBytes)

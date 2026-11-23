@@ -10,6 +10,7 @@
 #pragma once
 #include "ROCmNativeQuantisedWmmaPolicy.h"
 #include "ROCmVNNIPrefillLaunch.h"
+#include "kernels/rocm/gemm/ROCmNativeQuantisedBlockMetadata.h"
 #include <cstdint>
 
 namespace llaminar2::rocm
@@ -19,9 +20,9 @@ struct NativeQuantisedWmmaArguments
 {
     const int8_t *activations;       ///< Row-major signed bytes [M,K].
     const uint8_t *payload;          ///< Block-major compact source payload.
-    const uint16_t *scales;          ///< Primary scale words [K/32,N].
-    const uint16_t *auxiliary;       ///< Optional secondary scale/correction words.
-    const uint32_t *minima_pairs;    ///< Optional Q2_K half-block minima pairs.
+    /// Block metadata: per-block primary/secondary/Q2_K minima planes [K/32,N],
+    /// or superblock-coded codes plus per-superblock d/dmin words.
+    rocm_native_metadata::MetadataPlanes metadata;
     float *output;                   ///< Unique-writer result [M,N].
     const float *row_scales;         ///< Whole-row scales when block_scales is null.
     const float *block_scales;       ///< Optional activation scales [M,K/32].

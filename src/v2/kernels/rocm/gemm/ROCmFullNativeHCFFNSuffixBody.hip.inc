@@ -341,7 +341,7 @@ __device__ __forceinline__ void writeProjection(PhaseProjection& destination,con
     destination.mins=source.mins;destination.emins=source.emins;
     destination.parts=source.parts;destination.partition_blocks=source.partition_blocks;
     destination.codebook=source.codebook;destination.ready=source.ready;
-    destination.numeric_validity=source.numeric_validity;
+    destination.numeric_validity=source.numeric_validity;destination.metadata_layout=source.metadata_layout;
 }
 /**
  * @brief Publish independent gate/up records from the same acquired selected route.
@@ -419,6 +419,17 @@ template<class Binding>
 __device__ __forceinline__ void publishPanel(const Binding& record,unsigned columns,
     unsigned first,unsigned count,unsigned first_block,unsigned blocks,unsigned capacity,unsigned* panel) {
     if(!record.ready||record.numeric_validity!=PhaseProjectionValidation::State::Valid)return;
+    if(record.metadata_layout!=0) {
+        // Superblock-coded Q4_K role: reconstruct the identical scale/min words
+        // per real (block,row) element; the per-block path below is unchanged.
+        const auto meta=::llaminar2::rocm_native_metadata::planesFromLayout(record.scales,record.mins,nullptr,record.metadata_layout);
+        for(unsigned item=threadIdx.x;item<blocks*count;item+=1024) {
+            const unsigned block=item/count,row=item%count;
+            const auto words=::llaminar2::rocm_native_metadata::blockMetadata<5>(meta,first_block+block,first+row,columns);
+            panel[panelIndex(row,block,capacity)]=unsigned(words.primary)|(unsigned(words.secondary)<<16);
+        }
+        return;
+    }
     const unsigned packets=(count+7u)/8u;
     for(unsigned item=threadIdx.x;item<blocks*packets;item+=1024) {
         const unsigned block=item/packets,row=(item%packets)*8;
@@ -633,8 +644,8 @@ __device__ __forceinline__ void routedGateUp(const NativeLayoutRouterFFNArgs& ar
                         gate,up,n,codes,scales,sums,F,H,part,g,u);
 #endif
                 if(!shared_activation) {
-                    g=phasePartial<Mask,ActivationIssue::GateUpBlockPreload,GlobalWeightReader>(gate,n,codes,scales,sums,F,H,part,lookup);
-                    u=phasePartial<Mask,ActivationIssue::GateUpBlockPreload,GlobalWeightReader>(up,n,codes,scales,sums,F,H,part,lookup);
+                    g=phasePartial<Mask,ActivationIssue::GateUpBlockPreload,GlobalWeightReader,true>(gate,n,codes,scales,sums,F,H,part,lookup);
+                    u=phasePartial<Mask,ActivationIssue::GateUpBlockPreload,GlobalWeightReader,true>(up,n,codes,scales,sums,F,H,part,lookup);
                 }
             }
             const NativeLayoutDownWaveGeometry geometry{16,4};
@@ -687,8 +698,10 @@ __device__ __forceinline__ float selectedQ8Partial(const SelectedQ8Fields& field
     float result=0.f;
 #pragma unroll 1
     for(unsigned block=first;block<last;++block) {
-        const auto operand=preloadBlock<NATIVE_QUANTISED_Q8_0,GlobalWeightReader>(fields.payload,fields.scales,nullptr,nullptr,
-            std::size_t(block)*N+n);
+        // Native Q8 has no superblock-coded representation: layout-zero planes.
+        const auto meta=::llaminar2::rocm_native_metadata::perBlockMetadataPlanes(fields.scales,nullptr,nullptr);
+        const auto operand=preloadBlock<NATIVE_QUANTISED_Q8_0,GlobalWeightReader>(fields.payload,meta,
+            ::llaminar2::rocm_native_metadata::blockAddress(meta,block,n,N));
         consumePackedBlock<NATIVE_QUANTISED_Q8_0,ActivationIssue::GateUpBlockPreload>(operand,
             codes+std::size_t(block)*32,scales,sums,block,result);
     }
@@ -749,8 +762,8 @@ __device__ __forceinline__ void sharedItem(const NativeLayoutRouterFFNArgs& args
     } else {
         const unsigned column=lane&3u,part=lane>>2,n=first+column;
         if(column<rows) {
-            g=phasePartial<Mask,ActivationIssue::GateUpBlockPreload,GlobalWeightReader>(gate,n,codes,scales,sums,S,H,part);
-            u=phasePartial<Mask,ActivationIssue::GateUpBlockPreload,GlobalWeightReader>(up,n,codes,scales,sums,S,H,part);
+            g=phasePartial<Mask,ActivationIssue::GateUpBlockPreload,GlobalWeightReader,true>(gate,n,codes,scales,sums,S,H,part);
+            u=phasePartial<Mask,ActivationIssue::GateUpBlockPreload,GlobalWeightReader,true>(up,n,codes,scales,sums,S,H,part);
         }
         const NativeLayoutDownWaveGeometry geometry{16,4};
         g=orderedWorkerZeroFold(g,waveMetadataValue(gate.parts),geometry,column,lane);
@@ -855,20 +868,22 @@ __device__ __forceinline__ float completeRow(const Binding& role,unsigned n,unsi
     if(waveMetadataValue(role.numeric_validity)!=PhaseProjectionValidation::State::Valid)
         return completeZeroRow(parts);
     using Traits=NATIVE_QUANTISEDTraits<FMT>;
+    const auto role_meta=phaseRoleMetadata<FMT>(role);
     const PhaseProjection acquired{
         .payload=waveMetadataValue(role.payload),
-        .scales=waveMetadataValue(role.scales),
-        .mins=Traits::requires_secondary_metadata?waveMetadataValue(role.mins):nullptr,
-        .emins=Traits::needs_emin_array?waveMetadataValue(role.emins):nullptr,
+        .scales=role_meta.primary,
+        .mins=static_cast<const uint16_t*>(role_meta.secondary),
+        .emins=role_meta.emins,
         .parts=parts,
         .partition_blocks=waveMetadataValue(role.partition_blocks),
         .codebook=static_cast<uint8_t>(FMT),
         .ready=true,
-        .numeric_validity=PhaseProjectionValidation::State::Valid};
+        .numeric_validity=PhaseProjectionValidation::State::Valid,
+        .metadata_layout=::llaminar2::rocm_native_metadata::packedLayout(role_meta)};
     float result=0.f;
 #pragma unroll 1
     for(unsigned part=0;part<parts;++part) {
-        float value=phaseRolePartial<FMT,ActivationIssue::DownWordsPreload,GlobalWeightReader>(
+        float value=phaseRolePartial<FMT,ActivationIssue::DownWordsPreload,GlobalWeightReader,true>(
             acquired,n,codes,scales,sums,N,K,part);
         value=device_fp32_contract::multiply(value,1.f);
         result=parts==1?value:rocm_native_quantised_accumulate_rn(result,value);

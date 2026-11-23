@@ -1,6 +1,6 @@
 # GPU superblock-coded NativeQuantised metadata
 
-Status: CUDA implemented (2026-11-23); ROCm (josh) and CPU tier + migration in progress on the same PR.
+Status: CUDA and ROCm implemented (2026-11-23); CPU tier and migration in progress on the same PR.
 
 ## Problem
 
@@ -150,8 +150,19 @@ expert slot geometry, PMA BOM.
 - CUDA: all thirteen formats coded at file density (readers, repack, async
   prefill staging, row-major diagnostic copies); migration slots, expert
   transfer and rebalance reject coded descriptors.
-- ROCm: readers and repack reject coded layouts, so ROCm keeps per-block
-  planes. Conversion needs a HIP compile host.
+- ROCm: all thirteen formats coded at file density. The repack writes
+  codes and superblock words (`VnniRepackKernels.hip`); every reader reads block
+  metadata through `ROCmNativeQuantisedBlockMetadata.h` (shared
+  `loadBlockMetadata`): serial/IQ-LDS GEMV, small-M/batched/mixed verifier,
+  dp4a prefill shards, WMMA and verifier WMMA (gfx1100), grouped MoE
+  prefill/WMMA/wide WMMA/population projection, grouped FFN frontier and
+  generic programs, native-layout router/HC FFN, persistent MoE FFN and the
+  retained HC FFN. IQ3_XXS/IQ2_XS/IQ2_XXS decoders recompute sign parity.
+  Tuned dp4a prefill and the retained HC down rows select a per-block or
+  coded instantiation once per matrix, so per-block kernels keep their
+  original code and register budget. Movement and transfer slots reject
+  coded descriptors, as on CUDA. Gate: `V2_Integration_ROCmSuperblockCodedMetadata`
+  (repack/codec plus captured GEMV, small-M and prefill byte parity).
 - CPU compact tier: still per-block FP16 words (see below). The
   NEON/AVX2/AVX-512 loaders need the codec before coded CPU-to-GPU promotion
   can exist.

@@ -91,10 +91,14 @@ __device__ __forceinline__ ProjectionResult<MaxUsers> orderedProjectionFormat(
             const int end=fixedGate?begin+gateBlocks/gateParts:OneBlockPerPartition?begin+1:min(begin+stride,blocks);
 #pragma unroll 1
             for(int b=begin;b<end;++b) {
-                const size_t index=size_t(b)*(fixedGate?FixedGatePitch:desc.n)+column;
+                const int pitch=fixedGate?FixedGatePitch:desc.n;
+                const size_t index=size_t(b)*pitch+column;
                 const auto* payload=desc.payload+index*Traits::payload_bytes;
                 int32_t decoded[8];
                 moe_prefill_decode_groups<Format,false,BatchIQ3XXS>(payload,decoded);
+                // One metadata fetch per weight block, shared by every user row.
+                const auto block_words=::llaminar2::rocm_native_metadata::blockMetadata<static_cast<uint8_t>(Format)>(
+                    ::llaminar2::native_quantised_scale::metadataPlanes(desc),uint32_t(b),uint32_t(column),uint32_t(pitch));
 #pragma unroll
                 for(int user=0;user<MaxUsers;++user) {
                     if(user>=users.live)continue;
@@ -104,12 +108,12 @@ __device__ __forceinline__ ProjectionResult<MaxUsers> orderedProjectionFormat(
                     if constexpr(Traits::is_asymmetric && !Traits::is_dual_scale) {
                         if(row.sum32) {
                             partial.value[user]=moe_prefill_accumulate_decoded_block<Format,true>(
-                                desc,index,payload,decoded,codes,scale,partial.value[user],row.sum32[b]);
+                                desc,block_words,payload,decoded,codes,scale,partial.value[user],row.sum32[b]);
                             continue;
                         }
                     }
                     partial.value[user]=moe_prefill_accumulate_decoded_block<Format>(
-                        desc,index,payload,decoded,codes,scale,partial.value[user]);
+                        desc,block_words,payload,decoded,codes,scale,partial.value[user]);
                 }
             }
         }

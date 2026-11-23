@@ -30,6 +30,7 @@
 #include "kernels/rocm/gemm/ROCmGroupedFFNFrontier.h"
 #include "kernels/rocm/gemm/ROCmNativeQuantisedArchitecture.h"
 #include "kernels/rocm/gemm/ROCmGroupedFFNFormatSelection.h"
+#include "kernels/rocm/gemm/ROCmNativeQuantisedBlockMetadata.h"
 #include "kernels/common/NativeQuantisedDescriptorValidation.h"
 #include "../gemm/ROCmResidentMoEFFN.h"
 #include "../gemm/ROCmNativeLayoutRouterFFN.h"
@@ -165,6 +166,9 @@ namespace
             static_cast<std::uint64_t>(descriptor.source_codebook_id) |
             (static_cast<std::uint64_t>(descriptor.source_is_superblock) << 8U) |
             (static_cast<std::uint64_t>(descriptor.source_identity_present) << 16U));
+        // Metadata representation, phase and code bit shift are part of the
+        // captured descriptor identity (per-block vs superblock-coded readers).
+        words.push_back(static_cast<std::uint64_t>(descriptor.metadata_layout));
     }
 
     /**
@@ -450,8 +454,9 @@ namespace
                desc.blocks_per_row == static_cast<uint32_t>(intermediate / 32) &&
                validateGroupedSourceIdentity(desc) &&
                groupedDecodeSupportsCodebook(desc.codebook_id) &&
-               (!groupedDecodeRequiresMins(desc.codebook_id) || desc.mins) &&
-               (!groupedDecodeRequiresEmins(desc.codebook_id) || desc.emins);
+               // Per-block planes or a superblock-coded code + superblock plane.
+               ::llaminar2::rocm_native_metadata::descriptorMetadataComplete(desc, groupedDecodeRequiresMins(desc.codebook_id),
+                                              groupedDecodeRequiresEmins(desc.codebook_id));
     }
 
     bool validateGroupedGateUpDesc(
@@ -463,8 +468,9 @@ namespace
                desc.blocks_per_row == static_cast<uint32_t>(d_model / 32) &&
                validateGroupedSourceIdentity(desc) &&
                groupedDecodeSupportsCodebook(desc.codebook_id) &&
-               (!groupedDecodeRequiresMins(desc.codebook_id) || desc.mins) &&
-               (!groupedDecodeRequiresEmins(desc.codebook_id) || desc.emins);
+               // Per-block planes or a superblock-coded code + superblock plane.
+               ::llaminar2::rocm_native_metadata::descriptorMetadataComplete(desc, groupedDecodeRequiresMins(desc.codebook_id),
+                                              groupedDecodeRequiresEmins(desc.codebook_id));
     }
 
     bool isBlankGroupedDesc(const llaminar2::DeviceNativeQuantisedMatrixDesc &desc)
@@ -10318,8 +10324,9 @@ namespace llaminar2
                 down_descs[i].blocks_per_row != static_cast<uint32_t>(intermediate / 32) ||
                 !areNativeQuantisedGateUpCodebooksCompatible(
                     down_descs[i].codebook_id, codebook_id) ||
-                (groupedDecodeRequiresMins(down_descs[i].codebook_id) && !down_descs[i].mins) ||
-                (groupedDecodeRequiresEmins(down_descs[i].codebook_id) && !down_descs[i].emins))
+                !::llaminar2::rocm_native_metadata::descriptorMetadataComplete(down_descs[i],
+                    groupedDecodeRequiresMins(down_descs[i].codebook_id),
+                    groupedDecodeRequiresEmins(down_descs[i].codebook_id)))
             {
                 return false;
             }

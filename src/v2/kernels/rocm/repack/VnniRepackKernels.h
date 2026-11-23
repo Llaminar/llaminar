@@ -87,11 +87,12 @@ bool launchVnniRepack(
     void* stream);
 
 /**
- * @brief Repack with an explicit packed metadata layout.
- * @param metadata_layout Must be zero: ROCm readers consume only per-block
- *        planes until they are converted to superblock-coded metadata
- *        (docs/v2/projects/2026-11/GPU_SUPERBLOCK_METADATA_PLAN.md). A coded
- *        layout is rejected rather than silently written as per-block planes.
+ * @brief Repack with an explicit packed metadata layout (nativeQuantisedMetadataLayout).
+ * @param metadata_layout Zero writes per-block planes; a superblock-coded
+ *        layout writes per-block codes into @p d_scales and per-superblock
+ *        d/dmin words into @p d_mins (no emins). Its phase must equal
+ *        columns.firstBlock() % 8 and the format must be codable
+ *        (docs/v2/projects/2026-11/GPU_SUPERBLOCK_METADATA_PLAN.md).
  */
 bool launchVnniRepack(
     RepackFormat format,

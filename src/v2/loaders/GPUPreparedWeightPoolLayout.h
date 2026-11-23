@@ -50,11 +50,11 @@ namespace llaminar2
      *
      * Only immutable source-native matrices are coded: reusable migration slots
      * hold the per-block union so CPU-tier arrivals and in-place movement keep
-     * their existing representation. CUDA is the first backend whose every
-     * NativeQuantised reader consumes coded metadata; ROCm producers keep
-     * per-block planes until its readers are converted
-     * (docs/v2/projects/2026-11/GPU_SUPERBLOCK_METADATA_PLAN.md), and its
-     * readers reject coded descriptors.
+     * their existing representation. Every CUDA and ROCm NativeQuantised reader
+     * consumes coded metadata through the shared loader
+     * (native_quantised_scale::loadBlockMetadata), so both GPU backends store
+     * immutable superblock weights at GGUF file density
+     * (docs/v2/projects/2026-11/GPU_SUPERBLOCK_METADATA_PLAN.md).
      *
      * @param source Original GGUF codebook metadata.
      * @param layout Pool stride policy of the matrix.
@@ -63,7 +63,8 @@ namespace llaminar2
     [[nodiscard]] inline bool gpuPreparedSuperblockCoded(const NativeQuantisedFormatInfo &source,
         GPUPreparedWeightPoolLayout layout, DeviceId device)
     {
-        return layout == GPUPreparedWeightPoolLayout::SourceNative && device.is_cuda() && source.is_superblock &&
+        return layout == GPUPreparedWeightPoolLayout::SourceNative && (device.is_cuda() || device.is_rocm()) &&
+               source.is_superblock &&
                nativeQuantisedSuperblockCodable(canonicalDeviceVnniCodebookId(source));
     }
 }

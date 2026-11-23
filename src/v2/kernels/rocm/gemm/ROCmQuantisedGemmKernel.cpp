@@ -342,9 +342,7 @@ namespace llaminar2
             bool rocmGemm_native_quantised_fp32(
                 const int8_t *d_A_int8,
                 const uint8_t *d_payload,
-                const void *d_block_scales, // __half* (FP16 d)
-                const void *d_block_mins,   // __half* (FP16 m, nullable)
-                const void *d_block_emins,  // uint32_t* (packed FP16 emins, Q2_K only, else NULL)
+                const ::llaminar2::rocm_native_metadata::MetadataPlanes d_meta, // per-block or superblock-coded block metadata
                 float *d_output,
                 const float *d_scales_A,
                 const float *d_scales_A_blockwise, // [M × blocks_per_row] per-block scales (nullptr = row-wise)
@@ -356,9 +354,7 @@ namespace llaminar2
             bool rocmGemm_native_quantised_fp32_with_policy(
                 const int8_t *d_A_int8,
                 const uint8_t *d_payload,
-                const void *d_block_scales,
-                const void *d_block_mins,
-                const void *d_block_emins,
+                const ::llaminar2::rocm_native_metadata::MetadataPlanes d_meta, // per-block or superblock-coded block metadata
                 float *d_output,
                 const float *d_scales_A,
                 const float *d_scales_A_blockwise,
@@ -379,9 +375,7 @@ namespace llaminar2
             bool rocmGemv_native_quantised_fp32(
                 const int8_t *d_A_int8,
                 const uint8_t *d_payload,
-                const void *d_block_scales, // __half* (FP16 d)
-                const void *d_block_mins,   // __half* (FP16 m), NULL for symmetric formats
-                const void *d_block_emins,  // uint32_t* (packed FP16 emins, Q2_K only, else NULL)
+                const ::llaminar2::rocm_native_metadata::MetadataPlanes d_meta, // per-block or superblock-coded block metadata
                 float *d_C_fp32,
                 const float *d_scale_A,
                 float *d_partial_fp32, // [KB_MAX × N] partial buffer (nullable when KB=1)
@@ -394,9 +388,7 @@ namespace llaminar2
             bool rocmGemv_native_quantised_fp32_with_policy(
                 const int8_t *d_A_int8,
                 const uint8_t *d_payload,
-                const void *d_block_scales,
-                const void *d_block_mins,
-                const void *d_block_emins,
+                const ::llaminar2::rocm_native_metadata::MetadataPlanes d_meta, // per-block or superblock-coded block metadata
                 float *d_C_fp32,
                 const float *d_scale_A,
                 float *d_partial_fp32,
@@ -409,9 +401,7 @@ namespace llaminar2
             bool rocmGemv_native_quantised_small_m_fp32(
                 const int8_t *d_A_int8,
                 const uint8_t *d_payload,
-                const void *d_block_scales, // __half* (FP16 d)
-                const void *d_block_mins,   // __half* auxiliary mins/scales, nullable for symmetric formats
-                const void *d_block_emins,  // uint32_t* packed emins, Q2_K only
+                const ::llaminar2::rocm_native_metadata::MetadataPlanes d_meta, // per-block or superblock-coded block metadata
                 float *d_C_fp32,
                 const float *d_scale_A_blockwise, // [M × blocks_per_row]
                 float *d_partial_fp32,            // [KB_MAX × M × N]
@@ -422,9 +412,7 @@ namespace llaminar2
             bool rocmGemv_native_quantised_small_m_fp32_with_sums(
                 const int8_t *d_A_int8,
                 const uint8_t *d_payload,
-                const void *d_block_scales, // __half* (FP16 d)
-                const void *d_block_mins,   // __half* auxiliary mins/scales, nullable for symmetric formats
-                const void *d_block_emins,  // uint32_t* packed emins, Q2_K only
+                const ::llaminar2::rocm_native_metadata::MetadataPlanes d_meta, // per-block or superblock-coded block metadata
                 float *d_C_fp32,
                 const float *d_scale_A_blockwise, // [M × blocks_per_row]
                 const int32_t *d_sum_A_blockwise, // [M × blocks_per_row], nullable
@@ -437,9 +425,7 @@ namespace llaminar2
             bool rocmGemv_native_quantised_small_m_batched_fp32_with_sums(
                 const int8_t *d_A_int8,
                 const uint8_t *const *d_payloads,
-                const uint16_t *const *d_block_scales,
-                const uint16_t *const *d_block_mins,
-                const uint32_t *const *d_block_emins,
+                const ::llaminar2::rocm_native_metadata::MetadataPlanes *d_metas, // per-projection block metadata
                 const float *const *d_biases,
                 float *const *d_outputs,
                 const float *d_scale_A_blockwise, // [M × blocks_per_row]
@@ -456,9 +442,7 @@ namespace llaminar2
             bool rocmGemv_native_quantised_small_m_batched_mixed_fp32_with_sums(
                 const int8_t *d_A_int8,
                 const uint8_t *const *d_payloads,
-                const uint16_t *const *d_block_scales,
-                const uint16_t *const *d_block_mins,
-                const uint32_t *const *d_block_emins,
+                const ::llaminar2::rocm_native_metadata::MetadataPlanes *d_metas, // per-projection block metadata
                 const float *const *d_biases,
                 float *const *d_outputs,
                 const float *d_scale_A_blockwise, // [M × blocks_per_row]
@@ -753,6 +737,23 @@ namespace llaminar2
             void *d_weights_native_emins = nullptr;   // [blocks_per_row × N] uint32_t* (Q2_K only, packed {lo,hi} FP16 emins)
             uint8_t native_quantised_codebook_id = 0;
             uint32_t native_quantised_blocks_per_row = 0;
+            /**
+             * Packed metadata layout (representation, superblock phase, code
+             * bit shift) recorded by the weights' producer; zero is the
+             * per-block-plane layout.
+             */
+            uint8_t native_metadata_layout = 0;
+
+            /** @return The typed metadata planes of the prepared native matrix. */
+            [[nodiscard]] ::llaminar2::rocm_native_metadata::MetadataPlanes nativeMetadataPlanes() const
+            {
+                const auto planes = ::llaminar2::rocm_native_metadata::planesFromLayout(
+                    d_weights_native_scales, d_weights_native_mins, d_weights_native_emins, native_metadata_layout);
+                if (!::llaminar2::rocm_native_metadata::metadataPlanesAdmitted(native_quantised_codebook_id, planes))
+                    throw std::logic_error(
+                        "[ROCmQuantisedGemmKernel] prepared weights carry an invalid metadata layout");
+                return planes;
+            }
             NativeQuantisedSourceIdentity native_source_identity;
             // Borrowed immutable IQ view is bound cold once and never replaced.
             // A backend reset invalidates it together with the prepared weights.
@@ -1194,7 +1195,8 @@ namespace llaminar2
             uint8_t codebook_id, uint32_t blocks_per_row,
             std::shared_ptr<void> lifetime_owner,
             NativeQuantisedSourceIdentity source_identity,
-            NativeQuantisedReusableDeviceAllocationFormat allocation_format)
+            NativeQuantisedReusableDeviceAllocationFormat allocation_format,
+            uint8_t metadata_layout)
             : weights_(nullptr),
               packed_(nullptr),
               lifetime_owner_(std::move(lifetime_owner)),
@@ -1212,6 +1214,17 @@ namespace llaminar2
             impl_->d_weights_native_emins = d_native_emins;
             impl_->native_quantised_codebook_id = codebook_id;
             impl_->native_quantised_blocks_per_row = blocks_per_row;
+            // Coded metadata is immutable source storage: never a reusable slot
+            // whose later arrivals carry per-block planes. Its superblock plane
+            // occupies the secondary slot.
+            if (!nativeQuantisedLayoutValid(codebook_id, metadata_layout) ||
+                (metadata_layout != 0 && allocation_format.payload_bytes_per_block != 0) ||
+                (nativeQuantisedLayoutRepresentation(metadata_layout) ==
+                     NativeQuantisedMetadataRepresentation::SuperblockCoded &&
+                 !d_native_mins))
+                throw std::invalid_argument(
+                    "[ROCmQuantisedGemmKernel] invalid metadata layout for prepared weights");
+            impl_->native_metadata_layout = metadata_layout;
             const NativeQuantisedFormatInfo *source_format =
                 source_identity.present
                     ? native_quantised_formats::forSourceIdentity(
@@ -1413,7 +1426,8 @@ namespace llaminar2
                 .allocation_has_emins = static_cast<std::uint8_t>(impl_->native_allocation_format.has_emins),
                 .source_codebook_id = source.codebook_id,
                 .source_is_superblock = static_cast<std::uint8_t>(source.is_superblock),
-                .source_identity_present = static_cast<std::uint8_t>(source.present)};
+                .source_identity_present = static_cast<std::uint8_t>(source.present),
+                .metadata_layout = impl_->native_metadata_layout};
             (void)requireQ8ResidualNativeMatrix(descriptor, m, n, k);
             if (q8ResidualNeedsIQTables(descriptor.codebook_id))
             {
@@ -1581,7 +1595,7 @@ namespace llaminar2
                     static_cast<float*>(output->gpu_data_ptr()),rowscale,partials,n,k,weights.codebook_id,policy,
                     rocm_device_id_,gpu_stream_,blockscales,*publication,output_publication->preparedProducer())
                 :rocmGemv_native_quantised_fp32_with_policy(d_A_int8,weights.payload,
-                    weights.scales,weights.mins,weights.emins,static_cast<float*>(output->gpu_data_ptr()),
+                    native_quantised_scale::metadataPlanes(weights),static_cast<float*>(output->gpu_data_ptr()),
                     rowscale,partials,n,k,weights.codebook_id,policy,rocm_device_id_,gpu_stream_,blockscales);
             if(!success)return false;
             if(output_publication)output_publication->recordPublished();
@@ -1722,6 +1736,19 @@ namespace llaminar2
             auto* row_scales=static_cast<float*>(requireBank(GemmWorkspaceBuffers::SCALES_A,sizeof(float)));
             (void)requireBank(GemmWorkspaceBuffers::SUMS_A_BLOCKWISE,static_cast<size_t>(k/32)*sizeof(std::int32_t));
             const auto blocks=static_cast<size_t>(n)*weights.blocks_per_row;
+            // A superblock-coded matrix reads a bit-packed code plane (plus read
+            // padding) and one d/dmin word per row and superblock, never the
+            // per-block planes; describe exactly the bytes its reader can touch.
+            const auto weight_meta=native_quantised_scale::metadataPlanes(weights);
+            const auto coded_planes=weight_meta.coded()
+                ? native_quantised_superblock::planeBytes(weights.codebook_id,static_cast<size_t>(n),
+                      weights.blocks_per_row,weight_meta.superblock_phase)
+                : native_quantised_superblock::PlaneBytes{};
+            const size_t primary_bytes=weight_meta.coded()
+                ? coded_planes.code+((weight_meta.code_bit_shift+7u)/8u)
+                : blocks*sizeof(std::uint16_t);
+            const size_t secondary_bytes=weight_meta.coded()?coded_planes.superblock:
+                (weights.mins?blocks*sizeof(std::uint16_t):0);
             // Protect complete original capacities, including unused immutable
             // allocation planes and the scalar consumer's untouched sums bank.
             const std::array writes{
@@ -1735,8 +1762,8 @@ namespace llaminar2
                 Q8ResidualStorageSpan{input.gamma.gpu_data_ptr(),std::max(input.gamma.size_bytes(),size_t{128}*sizeof(float)),alignof(float)},
                 Q8ResidualStorageSpan{weights.payload,blocks*(weights.allocation_payload_bytes_per_block?
                     weights.allocation_payload_bytes_per_block:physical.payload_bytes_per_block),16},
-                Q8ResidualStorageSpan{weights.scales,blocks*sizeof(std::uint16_t),alignof(std::uint16_t)},
-                Q8ResidualStorageSpan{weights.mins,weights.mins?blocks*sizeof(std::uint16_t):0,alignof(std::uint16_t)},
+                Q8ResidualStorageSpan{weights.scales,primary_bytes,weight_meta.coded()?1u:alignof(std::uint16_t)},
+                Q8ResidualStorageSpan{weights.mins,secondary_bytes,alignof(std::uint16_t)},
                 Q8ResidualStorageSpan{weights.emins,weights.emins?blocks*sizeof(std::uint32_t):0,alignof(std::uint32_t)},
                 Q8ResidualStorageSpan{workspace->getBuffer(GemmWorkspaceBuffers::SUMS_A_BLOCKWISE),
                     workspace->getBufferSize(GemmWorkspaceBuffers::SUMS_A_BLOCKWISE),alignof(std::int32_t)},
@@ -1770,8 +1797,8 @@ namespace llaminar2
             TransferEngine::requireDeviceOutput(output,target,gpu_stream_);
             if(!rocm::launchGatedNormSingleQ8(native.input,rocm_device_id_,gpu_stream_))return false;
             const auto& weights=native.weights;
-            if(!rocmGemv_native_quantised_fp32_with_policy(native.input.quant,weights.payload,weights.scales,weights.mins,
-                weights.emins,static_cast<float*>(output->gpu_data_ptr()),native.row_scales,native.partials,n,k,
+            if(!rocmGemv_native_quantised_fp32_with_policy(native.input.quant,weights.payload,
+                native_quantised_scale::metadataPlanes(weights),static_cast<float*>(output->gpu_data_ptr()),native.row_scales,native.partials,n,k,
                 weights.codebook_id,requireNativeQuantisedArithmeticPolicyCodebook(
                     impl_->native_quantised_codebook_id,impl_->native_source_identity),
                 rocm_device_id_,gpu_stream_,native.input.scales))return false;
@@ -1810,6 +1837,7 @@ namespace llaminar2
             out.scales = impl_->d_weights_native_scales;
             out.mins = impl_->d_weights_native_mins;
             out.emins = impl_->d_weights_native_emins;
+            out.metadata_layout = impl_->native_metadata_layout;
             out.n = static_cast<int>(N_);
             out.k = static_cast<int>(K_);
             out.blocks_per_row = impl_->native_quantised_blocks_per_row;
@@ -2060,9 +2088,7 @@ namespace llaminar2
                 native_ok = rocmGemm_native_quantised_fp32_with_policy(
                     d_A_int8,
                     impl_->d_weights_native_quantised,
-                    impl_->d_weights_native_scales,
-                    impl_->d_weights_native_mins,
-                    impl_->d_weights_native_emins,
+                    impl_->nativeMetadataPlanes(),
                     d_native_output,
                     d_scales_A,
                     d_scales_A_blockwise,
@@ -3037,9 +3063,7 @@ namespace llaminar2
                     if (!rocmGemv_native_quantised_small_m_fp32_with_sums_policy(
                             impl_->d_A_int8,
                             impl_->d_weights_native_quantised,
-                            impl_->d_weights_native_scales,
-                            impl_->d_weights_native_mins,
-                            impl_->d_weights_native_emins,
+                            impl_->nativeMetadataPlanes(),
                             grouped_output,
                             impl_->d_scales_A_blockwise,
                             impl_->d_sums_A_blockwise,
@@ -3228,9 +3252,7 @@ namespace llaminar2
                         if (!rocmGemv_native_quantised_fp32_with_policy(
                                 impl_->d_A_int8,
                                 impl_->d_weights_native_quantised,
-                                impl_->d_weights_native_scales,
-                                impl_->d_weights_native_mins,
-                                impl_->d_weights_native_emins,
+                                impl_->nativeMetadataPlanes(),
                                 d_gemv_output,
                                 impl_->d_scales_A,
                                 impl_->d_scatter_partial,
@@ -3511,9 +3533,7 @@ namespace llaminar2
                         if (rocmGemm_native_quantised_fp32_with_policy(
                                 d_A_int8,
                                 impl_->d_weights_native_quantised,
-                                impl_->d_weights_native_scales,
-                                impl_->d_weights_native_mins,
-                                impl_->d_weights_native_emins,
+                                impl_->nativeMetadataPlanes(),
                                 d_prefill_output,
                                 d_scales_A,
                                 impl_->d_scales_A_blockwise,
@@ -4376,9 +4396,7 @@ namespace llaminar2
                             proj_ok = rocmGemv_native_quantised_fp32_with_policy(
                                 impl_->d_A_int8,
                                 rocm_kernel->impl_->d_weights_native_quantised,
-                                rocm_kernel->impl_->d_weights_native_scales,
-                                rocm_kernel->impl_->d_weights_native_mins,
-                                rocm_kernel->impl_->d_weights_native_emins,
+                                rocm_kernel->impl_->nativeMetadataPlanes(),
                                 d_output,
                                 impl_->d_scales_A,
                                 stream_partial,
@@ -4476,9 +4494,7 @@ namespace llaminar2
                 projections.size() <= 8)
             {
                 std::array<const uint8_t *, 8> payloads{};
-                std::array<const uint16_t *, 8> scales{};
-                std::array<const uint16_t *, 8> mins{};
-                std::array<const uint32_t *, 8> emins{};
+                std::array<rocm_native_metadata::MetadataPlanes, 8> metas{};
                 std::array<float *, 8> outputs{};
                 std::array<float *, 8> partials{};
                 std::array<const float *, 8> biases{};
@@ -4600,9 +4616,7 @@ namespace llaminar2
                     }
 
                     payloads[i] = rocm_kernel->impl_->d_weights_native_quantised;
-                    scales[i] = static_cast<const uint16_t *>(rocm_kernel->impl_->d_weights_native_scales);
-                    mins[i] = static_cast<const uint16_t *>(rocm_kernel->impl_->d_weights_native_mins);
-                    emins[i] = static_cast<const uint32_t *>(rocm_kernel->impl_->d_weights_native_emins);
+                    metas[i] = rocm_kernel->impl_->nativeMetadataPlanes();
                     outputs[i] = d_output;
                     partials[i] = nullptr;
                     biases[i] = d_bias;
@@ -4705,9 +4719,7 @@ namespace llaminar2
                                             int policy_target_waves = -1) -> bool
                     {
                         std::array<const uint8_t *, 8> group_payloads{};
-                        std::array<const uint16_t *, 8> group_scales{};
-                        std::array<const uint16_t *, 8> group_mins{};
-                        std::array<const uint32_t *, 8> group_emins{};
+                        std::array<rocm_native_metadata::MetadataPlanes, 8> group_metas{};
                         std::array<const float *, 8> group_biases{};
                         std::array<float *, 8> group_outputs{};
                         std::array<float *, 8> group_partials{};
@@ -4720,9 +4732,7 @@ namespace llaminar2
                         {
                             const int projection_index = indices[group_slot];
                             group_payloads[group_slot] = payloads[projection_index];
-                            group_scales[group_slot] = scales[projection_index];
-                            group_mins[group_slot] = mins[projection_index];
-                            group_emins[group_slot] = emins[projection_index];
+                            group_metas[group_slot] = metas[projection_index];
                             group_biases[group_slot] = biases[projection_index];
                             group_outputs[group_slot] = outputs[projection_index];
                             group_partials[group_slot] = partials[projection_index];
@@ -4736,9 +4746,7 @@ namespace llaminar2
                             ? rocmGemv_native_quantised_small_m_batched_mixed_fp32_with_sums_policy(
                                   impl_->d_A_int8,
                                   group_payloads.data(),
-                                  group_scales.data(),
-                                  group_mins.data(),
-                                  group_emins.data(),
+                                  group_metas.data(),
                                   group_biases.data(),
                                   group_outputs.data(),
                                   impl_->d_scales_A_blockwise,
@@ -4756,9 +4764,7 @@ namespace llaminar2
                             : rocmGemv_native_quantised_small_m_batched_fp32_with_sums_policy(
                                   impl_->d_A_int8,
                                   group_payloads.data(),
-                                  group_scales.data(),
-                                  group_mins.data(),
-                                  group_emins.data(),
+                                  group_metas.data(),
                                   group_biases.data(),
                                   group_outputs.data(),
                                   impl_->d_scales_A_blockwise,
@@ -5057,8 +5063,7 @@ namespace llaminar2
                         auto *kernel=static_cast<ROCmQuantisedGemmKernel *>(p.kernel);
                         auto *partial=reinterpret_cast<float *>(reinterpret_cast<unsigned char *>(impl_->d_scatter_partial_batched)+offsets[local]);
                         if(!enqueueNativeM1Producer(tickets[local],impl_->d_A_int8,
-                            kernel->impl_->d_weights_native_quantised,kernel->impl_->d_weights_native_scales,
-                            kernel->impl_->d_weights_native_mins,kernel->impl_->d_weights_native_emins,
+                            kernel->impl_->d_weights_native_quantised,kernel->impl_->nativeMetadataPlanes(),
                             static_cast<float *>(p.output->gpu_data_ptr()),impl_->d_scales_A,partial,p.n,k,
                             kernel->impl_->native_quantised_codebook_id,
                             requireNativeQuantisedArithmeticPolicyCodebook(kernel->impl_->native_quantised_codebook_id,kernel->impl_->native_source_identity),
@@ -5250,9 +5255,7 @@ namespace llaminar2
                         if (!rocmGemv_native_quantised_fp32_with_policy(
                                 impl_->d_A_int8,
                                 rocm_kernel->impl_->d_weights_native_quantised,
-                                rocm_kernel->impl_->d_weights_native_scales,
-                                rocm_kernel->impl_->d_weights_native_mins,
-                                rocm_kernel->impl_->d_weights_native_emins,
+                                rocm_kernel->impl_->nativeMetadataPlanes(),
                                 d_native_output,
                                 impl_->d_scales_A,
                                 impl_->d_scatter_partial,
@@ -5401,9 +5404,7 @@ namespace llaminar2
                     if (!rocmGemv_native_quantised_small_m_fp32_with_sums_policy(
                             impl_->d_A_int8,
                             rocm_kernel->impl_->d_weights_native_quantised,
-                            rocm_kernel->impl_->d_weights_native_scales,
-                            rocm_kernel->impl_->d_weights_native_mins,
-                            rocm_kernel->impl_->d_weights_native_emins,
+                            rocm_kernel->impl_->nativeMetadataPlanes(),
                             d_prefill_output,
                             impl_->d_scales_A_blockwise,
                             impl_->d_sums_A_blockwise,
@@ -6834,9 +6835,7 @@ namespace llaminar2
                     if (!rocmGemv_native_quantised_small_m_fp32_with_sums_policy(
                             impl_->d_A_int8,
                             impl_->d_weights_native_quantised,
-                            impl_->d_weights_native_scales,
-                            impl_->d_weights_native_mins,
-                            impl_->d_weights_native_emins,
+                            impl_->nativeMetadataPlanes(),
                             d_C,
                             impl_->d_scales_A_blockwise,
                             impl_->d_sums_A_blockwise,
@@ -6894,9 +6893,7 @@ namespace llaminar2
                     if (rocmGemm_native_quantised_fp32_with_policy(
                             impl_->d_A_int8,
                             impl_->d_weights_native_quantised,
-                            impl_->d_weights_native_scales,
-                            impl_->d_weights_native_mins,
-                            impl_->d_weights_native_emins,
+                            impl_->nativeMetadataPlanes(),
                             d_C,
                             impl_->d_scales_A,
                             impl_->d_scales_A_blockwise,
@@ -7058,9 +7055,7 @@ namespace llaminar2
                         if (!rocmGemv_native_quantised_fp32_with_policy(
                                 impl_->d_A_int8,
                                 impl_->d_weights_native_quantised,
-                                impl_->d_weights_native_scales,
-                                impl_->d_weights_native_mins,
-                                impl_->d_weights_native_emins,
+                                impl_->nativeMetadataPlanes(),
                                 d_native_output,
                                 impl_->d_scales_A,
                                 impl_->d_scatter_partial,
@@ -7223,9 +7218,7 @@ namespace llaminar2
                 if (rocmGemm_native_quantised_fp32_with_policy(
                         impl_->d_A_int8,
                         impl_->d_weights_native_quantised,
-                        impl_->d_weights_native_scales,
-                        impl_->d_weights_native_mins,
-                        impl_->d_weights_native_emins,
+                        impl_->nativeMetadataPlanes(),
                         d_C,
                         impl_->d_scales_A,
                         impl_->d_scales_A_blockwise,

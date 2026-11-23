@@ -103,6 +103,7 @@ __device__ __forceinline__ PhaseProjection phaseProjection(const DeviceNativeQua
         result.payload=descriptor->payload;result.scales=static_cast<const uint16_t*>(descriptor->scales);
         result.mins=static_cast<const uint16_t*>(descriptor->mins);result.emins=static_cast<const uint32_t*>(descriptor->emins);
         result.codebook=descriptor->codebook_id;
+        result.metadata_layout=descriptor->metadata_layout;
         // Keep policy failure fatal before this independent numeric-zero decision.
         result.numeric_validity=PhaseProjectionValidation::classify(*descriptor,columns,reduction);
     }
@@ -130,6 +131,7 @@ __device__ __forceinline__ PhaseProjection phaseProjection(
     result.payload=descriptor.payload;result.scales=static_cast<const uint16_t*>(descriptor.scales);
     result.mins=static_cast<const uint16_t*>(descriptor.mins);result.emins=static_cast<const uint32_t*>(descriptor.emins);
     result.codebook=descriptor.codebook_id;result.ready=true;
+    result.metadata_layout=descriptor.metadata_layout;
     result.numeric_validity=PhaseProjectionValidation::State::Valid;
     return result;
 }
@@ -137,11 +139,13 @@ __device__ __forceinline__ PhaseProjection phaseProjection(
  * @tparam Issue Internal activation issue contract, defaulting to down words-only preload.
  * @tparam Mask Admitted immutable physical decoder envelope.
  * @tparam Reader Default original generic loads or an explicitly proven weight-only reader.
+ * @tparam SplitRepresentation Select the role metadata representation once per
+ *         partition (two loops) instead of a uniform per-block branch.
  * @tparam Binding Existing native LDS or generic metadata reference; never copied.
  * @tparam Grid Original device table or exact published lookup view.
  * @param grid Immutable lookup bytes retained for the original role consumer. */
 template<uint32_t Mask,ActivationIssue Issue=ActivationIssue::DownWordsPreload,
-    class Reader=NativeLayoutWeightReader,class Binding,class Grid=NativeQuantisedGridLookup>
+    class Reader=NativeLayoutWeightReader,bool SplitRepresentation=false,class Binding,class Grid=NativeQuantisedGridLookup>
 __device__ __forceinline__ float phasePartial(const Binding& p,unsigned n,const int8_t* code,const float* scale,
     const int32_t* sums,unsigned N,unsigned K,unsigned part,Grid grid={})
 {
@@ -149,7 +153,7 @@ __device__ __forceinline__ float phasePartial(const Binding& p,unsigned n,const 
     // physical wave. Preserve that authority at the dispatcher as well as
     // within each decoder; column and partition eligibility remain lane-local.
     if(!waveMetadataValue(p.ready)||n>=N||part>=waveMetadataValue(p.parts))return 0.f;
-#define LAYOUT_CASE(F) case F:if constexpr(Mask&(1u<<unsigned(F)))return phaseRolePartial<F,Issue,Reader>(p,n,code,scale,sums,N,K,part,grid);else break;
+#define LAYOUT_CASE(F) case F:if constexpr(Mask&(1u<<unsigned(F)))return phaseRolePartial<F,Issue,Reader,SplitRepresentation>(p,n,code,scale,sums,N,K,part,grid);else break;
     switch(waveMetadataValue(p.codebook))
     {
     LAYOUT_CASE(NATIVE_QUANTISED_Q4_0) LAYOUT_CASE(NATIVE_QUANTISED_IQ4_NL)
@@ -453,7 +457,7 @@ __device__ __forceinline__ void gateUpWavePhase(unsigned width,unsigned hidden,u
             value.mins=record.mins;value.emins=record.emins;
             value.parts=record.parts;value.partition_blocks=record.partition_blocks;
             value.codebook=record.codebook;value.ready=record.ready;
-            value.numeric_validity=record.numeric_validity;
+            value.numeric_validity=record.numeric_validity;value.metadata_layout=record.metadata_layout;
         }
     }
     workgroupJoin<WorkgroupJoinMemory::LDSOnly>();
@@ -560,7 +564,7 @@ __device__ __forceinline__ void publishDownPhase(unsigned hidden,unsigned routed
             value.payload=record.payload;value.scales=record.scales;value.mins=record.mins;value.emins=record.emins;
             value.parts=record.parts;value.partition_blocks=record.partition_blocks;
             value.codebook=record.codebook;value.ready=record.ready;
-            value.numeric_validity=record.numeric_validity;
+            value.numeric_validity=record.numeric_validity;value.metadata_layout=record.metadata_layout;
             if(!is_shared)
             {
                 auto* publication_weights=currentFormatAddress((CurrentFormatLDSValue<float>*)route_weights);

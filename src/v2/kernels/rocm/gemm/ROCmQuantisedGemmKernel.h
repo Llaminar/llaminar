@@ -388,6 +388,12 @@ namespace llaminar2
              * @param source_identity Exact GGUF arithmetic provenance
              * @param allocation_format Optional reusable-slot capacity; zero
              *        payload identifies an ordinary immutable allocation
+             * @param metadata_layout Packed metadata layout written by the
+             *        producer (nativeQuantisedMetadataLayout); zero is the
+             *        per-block-plane representation. A superblock-coded layout
+             *        stores codes in @p d_native_scales and per-superblock d/dmin
+             *        words in @p d_native_mins; it is immutable source storage and
+             *        cannot be a reusable slot.
              */
             ROCmQuantisedGemmKernel(
                 int N, int K, int rocm_device_id,
@@ -396,7 +402,8 @@ namespace llaminar2
                 uint8_t codebook_id, uint32_t blocks_per_row,
                 std::shared_ptr<void> lifetime_owner,
                 NativeQuantisedSourceIdentity source_identity,
-                NativeQuantisedReusableDeviceAllocationFormat allocation_format = {});
+                NativeQuantisedReusableDeviceAllocationFormat allocation_format = {},
+                uint8_t metadata_layout = 0);
 
             ~ROCmQuantisedGemmKernel() override;
 

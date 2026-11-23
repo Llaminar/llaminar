@@ -18,6 +18,7 @@
 #include "backends/rocm/ROCmHardwareMetadata.h"
 #include "backends/GPUDeviceProcessLifetime.h"
 #include "utils/MPISessionOwner.h"
+#include "kernels/rocm/gemm/ROCmNativeQuantisedBlockMetadata.h"
 #include "kernels/rocm/gemm/ROCmNativeQuantisedGemmShard.h"
 #include "tensors/IQQuantTables.h"
 #include "tensors/NativeQuantisedFormatInfo.h"
@@ -35,11 +36,11 @@ bool rocmInitIQGridTables(int, const void*, const void*, const void*,
                          const void*, const void*, const void*);
 bool rocmInitIQGridTables_gemm(int, const void*, const void*, const void*,
                               const void*, const void*, const void*);
-bool rocmGemm_native_quantised_fp32(const int8_t*, const uint8_t*, const void*,
-    const void*, const void*, float*, const float*, const float*,
+bool rocmGemm_native_quantised_fp32(const int8_t*, const uint8_t*,
+    const ::llaminar2::rocm_native_metadata::MetadataPlanes d_meta, float*, const float*, const float*,
     int, int, int, uint8_t, int, void*);
-bool rocmGemv_native_quantised_fp32(const int8_t*, const uint8_t*, const void*,
-    const void*, const void*, float*, const float*, float*, int, int,
+bool rocmGemv_native_quantised_fp32(const int8_t*, const uint8_t*,
+    const ::llaminar2::rocm_native_metadata::MetadataPlanes d_meta, float*, const float*, float*, int, int,
     uint8_t, int, void*, const float*);
 bool rocmGemv_native_quantised_query_serial_m1_config_with_policy(
     uint8_t, int, int, int*, int*);
@@ -221,14 +222,14 @@ void verify(int codebook, int payload_bytes, int m, int n, int k,
         if (path == 0)
             for (int row = 0; row < m; ++row)
                 launched &= rocmGemv_native_quantised_fp32(
-                    a.data + row * k, p.data, s.data, secondary_s.data, em.data,
+                    a.data + row * k, p.data, ::llaminar2::rocm_native_metadata::perBlockMetadataPlanes(s.data, secondary_s.data, em.data),
                     destination + row * n, sr.data + row, partials.data,
                     n, k, static_cast<uint8_t>(codebook), 0, stream,
                     scale_mode == ActivationScaleMode::Blockwise
                         ? sa.data + row * blocks : nullptr);
         else
             launched = rocmGemm_native_quantised_fp32(
-                a.data, p.data, s.data, secondary_s.data, em.data, destination,
+                a.data, p.data, ::llaminar2::rocm_native_metadata::perBlockMetadataPlanes(s.data, secondary_s.data, em.data), destination,
                 sr.data,
                 scale_mode == ActivationScaleMode::Blockwise ? sa.data : nullptr,
                 m, n, k, static_cast<uint8_t>(codebook), 0, stream);

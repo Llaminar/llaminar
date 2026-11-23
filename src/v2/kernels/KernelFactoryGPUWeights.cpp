@@ -204,7 +204,7 @@ namespace llaminar::v2::kernels
             if (device.is_rocm())
                 return std::make_unique<rocm::ROCmQuantisedGemmKernel>(n, k, device.ordinal,
                     payload, scales, mins, emins, codebook, static_cast<uint32_t>(blocks_per_row),
-                    std::move(owner), identity, reusable);
+                    std::move(owner), identity, reusable, metadata_layout);
 #endif
         }
         throw std::invalid_argument("GPU weight-pool GEMM backend was not built");
