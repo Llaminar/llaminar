@@ -445,8 +445,14 @@ A separate route-local publication experiment lets Down start after its
 own route's SwiGLU Q8 packets are complete. It matched all 216 cells and
 improved 201, with a median 5.0% lower complete FFN latency. Individual
 cells ranged from a 30.9% decrease to a 19.0% increase. Q4_K Gate/Up improved
-in every measured cell with either Q5_1 or Q8_0 Down. The prepared CPU
-schedule uses the team completion edges while model timing is pending.
+in every measured cell with either Q5_1 or Q8_0 Down.
+
+The paired Release model passed exact 256-token history and MTP work checks
+in both orders. Ordinary decode changed from 31.998 to 31.741 tok/s with the
+candidate first and from 31.771 to 31.479 tok/s with the control first.
+Fixed-depth-seven decode measured 45.075 → 44.190 and 44.683 → 43.579 tok/s
+with the same staged MTP schedule in both arms. The prepared CPU production
+schedule uses the team completion edges.
 
 The sealed IQ4 scale probe resolved the scale program at output-tile entry.
 The IQ4_XS packet loop consumed coefficients validated at weight publication.
