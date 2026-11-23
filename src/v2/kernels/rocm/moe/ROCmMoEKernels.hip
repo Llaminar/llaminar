@@ -13506,7 +13506,11 @@ namespace
     using llaminar2::rocm::moe_wave_contract::rocm_moe_wave_reduce_sum_f32;
     using llaminar2::rocm::moe_wave_contract::rocm_moe_wave_reduce_max_f32;
 
-    __device__ void moe_select_topk_probabilities_block(
+    // Force inlining: as an out-of-line callee (three router call sites) the
+    // gfx1100 function-call ABI saves two registers to scratch, which the spill
+    // guard rejects. Inlined into each router kernel it is spill-free on every
+    // shipping target; the comparison order and results are unchanged.
+    __device__ __forceinline__ void moe_select_topk_probabilities_block(
         float *__restrict__ expert_probs,
         int num_experts,
         int top_k,
