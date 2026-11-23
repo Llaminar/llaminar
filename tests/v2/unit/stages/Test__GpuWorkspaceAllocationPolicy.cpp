@@ -925,7 +925,7 @@ TEST(
 /**
  * @test Only an FP32-gate router owns the CUDA Q8 gate cache.
  *
- * BF16/FP16 gates (DeepSeek-V4) never bind it, yet it was reserved for every
+ * BF16/FP16 gates never bind it, yet it was reserved for every
  * MoE graph: 128 slots x 256 experts x 4096 = 144 MiB of dead device memory.
  * Expert stages never own it either.
  */

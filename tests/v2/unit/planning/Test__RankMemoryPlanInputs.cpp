@@ -369,8 +369,9 @@ TEST(RankMemoryPlanInputs, ExplicitMemoryLimitsReachEveryCPUAndGPUOwner)
 /**
  * @test Only the rank's runtime admission prices GPU workspace with the exact
  * kernel contract. A missing declaration fell back to the device-free legacy
- * envelope and under-admitted DeepSeek-V4 UD-IQ3_XXS split-K partials, failing
- * the serial workspace family at load; candidate planning keeps the bound.
+ * envelope and under-admitted large-K/N NativeQuantised split-K partials,
+ * failing the serial workspace family at load; candidate planning keeps the
+ * bound.
  */
 TEST(RankMemoryPlanInputs, RuntimeAdmissionDeclaresExactLocalGPUWorkspacePolicy)
 {

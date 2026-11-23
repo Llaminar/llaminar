@@ -9689,8 +9689,8 @@ target_include_directories(v2_test_deepseek4_ud_weight_density PRIVATE
     "${CMAKE_CURRENT_BINARY_DIR}/model-fixtures" ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/../../external/vendor)
 target_link_libraries(v2_test_deepseek4_ud_weight_density llaminar2_core GTest::gtest GTest::gtest_main)
-# A BF16/FP16 router gate never binds the CUDA Q8 gate cache (144 MiB for
-# DeepSeek-V4); only FP32-gate routers may declare it.
+# A BF16/FP16 router gate never binds the CUDA Q8 gate cache (144 MiB for 256
+# experts at d_model 4096); only FP32-gate routers may declare it.
 add_v2_test(V2_Integration_RouterQ8GateCacheOnlyForFP32Gates
     COMMAND $<TARGET_FILE:v2_test_gpu_workspace_allocation_policy>
         --gtest_filter=Test__GpuWorkspaceAllocationPolicy.RouterQ8GateCacheIsDeclaredOnlyForFP32Gates

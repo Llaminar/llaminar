@@ -53,8 +53,8 @@ namespace llaminar2
     /**
      * @brief Superblock-coded metadata is priced at file density and published to the slot.
      *
-     * Regression for the DeepSeek-V4 GB10 fit: per-block FP16 planes made IQ2_S
-     * experts 1.27x and IQ2_XS 1.41x their GGUF bytes. A coded matrix keeps
+     * Per-block FP16 planes made IQ2_S matrices 1.27x and IQ2_XS 1.41x their
+     * GGUF bytes. A coded matrix keeps
      * one code per block in `scales` and one d (d|dmin for Q2_K) per source
      * superblock in `mins`, with no emins region; a phase-shifted column slice
      * spans one extra superblock per row. Invalid declarations fail closed.

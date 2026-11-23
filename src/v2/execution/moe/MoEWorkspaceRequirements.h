@@ -208,7 +208,7 @@ namespace llaminar2
          * (CUDAMoEKernel::getOrCreateQ8RouterGateCache). BF16/FP16 gates are
          * consumed natively and never bind the cache, so declaring it for them
          * reserved kRouterGateCacheSlots x experts x d_model bytes of dead
-         * device memory (144 MiB for DeepSeek-V4).
+         * device memory (144 MiB for 256 experts at d_model 4096).
          */
         enum class CUDARouterGateCache : bool
         {
