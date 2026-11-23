@@ -353,6 +353,28 @@ Rank 1 observed 182 prepared calls alongside 182 one-row drafter calls and
 1,248 eight-row verifier calls across warmup and measurement. This identifies
 the drafter as the fixed-depth workload that exercised the specialization.
 
+The next candidate binds the prepared schedule only during ordinary decode.
+The 32-token service probe observed 2,976 prepared ordinary calls on rank 1
+and the original schedule on all one-row drafter and eight-row verifier
+calls. The complete 256-token comparisons preserved every generated token
+and the per-request MTP counts.
+
+| Arm order | Mode | Decode, control → candidate tok/s | Decode change | Complete throughput change |
+| --- | --- | ---: | ---: | ---: |
+| Candidate first | Ordinary | 30.916 → 31.213 | +0.96% | +0.80% |
+| Control first | Ordinary | 29.580 → 31.166 | +5.37% | +4.25% |
+| Candidate first | Fixed depth seven | 45.981 → 43.875 | −4.58% | −3.36% |
+| Control first | Fixed depth seven | 43.759 → 43.378 | −0.87% | −0.65% |
+
+The unchanged fixed-depth control varied by 5.08% between arm orders.
+Five of 36 matched grouped CPU symbols changed size in the ordinary-only
+candidate. The revision that compiles the standalone implementation
+separately restores the linked sizes of all 36 grouped symbols. The
+instruction comparison found differences in the diagnostic sections of two
+symbols, including the compiled source path. The isolated revision passes
+the AVX-512 and AVX2 all-format contract. The existing production schedule
+remains active during model qualification.
+
 The sealed IQ4 scale probe resolved the scale program at output-tile entry.
 The IQ4_XS packet loop consumed coefficients validated at weight publication.
 Both sockets, one and two rows per expert, eight and 64 experts, and both
