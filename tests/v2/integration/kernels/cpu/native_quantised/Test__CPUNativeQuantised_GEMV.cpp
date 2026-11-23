@@ -1519,6 +1519,38 @@ namespace
         }
     }
 
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
+    /** @test Live tail stores preserve the ordered fold and every adjacent destination byte. */
+    TEST_F(CPUNativeQuantisedGemvTest, OrderedKTilePublicationWritesOnlyLiveColumns)
+    {
+        constexpr int width = 64;
+        constexpr float guard = -991.25f;
+        std::array<float, 3 * width> partials{};
+        for (int column = 0; column < width; ++column)
+        {
+            partials[column] = 16777216.0f;
+            partials[width + column] = -16777216.0f;
+            partials[2 * width + column] = static_cast<float>(column - 18) * 0.125f;
+        }
+        const bool use_avx512 = activeISALevel() >= ISALevel::AVX512;
+        for (const auto policy : {CPUProjectionNumericalPolicy::BackendNative,
+                 CPUProjectionNumericalPolicy::GPUAlignedExpert})
+            for (int live = 1; live <= width; ++live)
+            {
+                SCOPED_TRACE(live);
+                std::array<float, width + 2> destination;
+                destination.fill(guard);
+                reduceNativeQuantisedKTilePartialsExact(partials.data(), destination.data() + 1,
+                    live, 3, use_avx512, policy);
+                EXPECT_EQ(destination.front(), guard);
+                for (int column = 0; column < live; ++column)
+                    EXPECT_EQ(destination[column + 1], partials[2 * width + column]);
+                for (int index = live + 1; index < static_cast<int>(destination.size()); ++index)
+                    EXPECT_EQ(destination[index], guard);
+            }
+    }
+#endif
+
     /** Prompt scheduling retains every format's serial arithmetic for odd worker/M tails. */
     TEST_F(CPUNativeQuantisedGemvTest, ExpertPrefillSchedulingAllFormatsMatchesSerialDecode)
     {

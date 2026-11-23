@@ -3021,6 +3021,24 @@ namespace llaminar2::cpu::native_quantised
 
 #endif // __AVX512F__ && __AVX512VNNI__ && __AVX512BW__
 
+#if defined(__AVX512F__)
+    /**
+     * @brief Store a terminal sixteen-column FP32 vector within the caller's row.
+     * @param destination Final row for this 64-column chunk.
+     * @param columns Live width of the chunk.
+     * @param offset Column offset of the vector within the chunk.
+     * @param value Sixteen terminal values in increasing column order.
+     */
+    inline void storeNativeQuantisedLiveAVX512(float *destination, int columns, int offset, __m512 value)
+    {
+        const int live = columns - offset;
+        if (live >= 16)
+            _mm512_storeu_ps(destination + offset, value);
+        else if (live > 0)
+            _mm512_mask_storeu_ps(destination + offset, static_cast<__mmask16>((1u << live) - 1u), value);
+    }
+#endif
+
     /**
      * @brief Reduce one 64-column K-tile partial stream in decode order.
      *
@@ -3036,6 +3054,8 @@ namespace llaminar2::cpu::native_quantised
      * same way. Batch invariance therefore depends on adding tile 0, tile 1,
      * and so on in exactly this order for every FP32 lane. Keeping the reduction
      * here gives all callers one implementation of that contract.
+     * A partial N chunk publishes only its live columns directly from vector
+     * accumulators, using the same reduction as a complete chunk.
      *
      * The runtime ISA branch is intentional. An AVX512 build can be launched
      * with AVX2 runtime dispatch for training or deployment, and that regime
@@ -3076,15 +3096,10 @@ namespace llaminar2::cpu::native_quantised
 
             if (valid_columns < 64)
             {
-                alignas(64) float temporary[64];
-                _mm512_store_ps(temporary, sum0);
-                _mm512_store_ps(temporary + 16, sum1);
-                _mm512_store_ps(temporary + 32, sum2);
-                _mm512_store_ps(temporary + 48, sum3);
-                std::memcpy(
-                    destination,
-                    temporary,
-                    static_cast<size_t>(valid_columns) * sizeof(float));
+                storeNativeQuantisedLiveAVX512(destination, valid_columns, 0, sum0);
+                storeNativeQuantisedLiveAVX512(destination, valid_columns, 16, sum1);
+                storeNativeQuantisedLiveAVX512(destination, valid_columns, 32, sum2);
+                storeNativeQuantisedLiveAVX512(destination, valid_columns, 48, sum3);
             }
             else
             {
@@ -3138,19 +3153,14 @@ namespace llaminar2::cpu::native_quantised
 
         if (valid_columns < 64)
         {
-            alignas(64) float temporary[64];
-            _mm256_store_ps(temporary, sum0);
-            _mm256_store_ps(temporary + 8, sum1);
-            _mm256_store_ps(temporary + 16, sum2);
-            _mm256_store_ps(temporary + 24, sum3);
-            _mm256_store_ps(temporary + 32, sum4);
-            _mm256_store_ps(temporary + 40, sum5);
-            _mm256_store_ps(temporary + 48, sum6);
-            _mm256_store_ps(temporary + 56, sum7);
-            std::memcpy(
-                destination,
-                temporary,
-                static_cast<size_t>(valid_columns) * sizeof(float));
+            storeNativeQuantisedLiveAVX2(destination, valid_columns, 0, sum0);
+            storeNativeQuantisedLiveAVX2(destination, valid_columns, 8, sum1);
+            storeNativeQuantisedLiveAVX2(destination, valid_columns, 16, sum2);
+            storeNativeQuantisedLiveAVX2(destination, valid_columns, 24, sum3);
+            storeNativeQuantisedLiveAVX2(destination, valid_columns, 32, sum4);
+            storeNativeQuantisedLiveAVX2(destination, valid_columns, 40, sum5);
+            storeNativeQuantisedLiveAVX2(destination, valid_columns, 48, sum6);
+            storeNativeQuantisedLiveAVX2(destination, valid_columns, 56, sum7);
         }
         else
         {
@@ -3820,22 +3830,6 @@ namespace llaminar2::cpu::native_quantised
                 accumulate);
         }
         throw std::logic_error("Unknown NativeQuantised nibble decode kind");
-    }
-
-    /**
-     * @brief Store a terminal sixteen-column FP32 vector within the caller's row.
-     * @param destination Final row for this 64-column chunk.
-     * @param columns Live width of the chunk.
-     * @param offset Column offset of the vector within the chunk.
-     * @param value Sixteen terminal values in increasing column order.
-     */
-    inline void storeNativeQuantisedLiveAVX512(float *destination, int columns, int offset, __m512 value)
-    {
-        const int live = columns - offset;
-        if (live >= 16)
-            _mm512_storeu_ps(destination + offset, value);
-        else if (live > 0)
-            _mm512_mask_storeu_ps(destination + offset, static_cast<__mmask16>((1u << live) - 1u), value);
     }
 
     /**
