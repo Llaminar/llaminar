@@ -1610,6 +1610,92 @@ namespace
         }
     }
 
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
+    /** @test Every compact decoder publishes and resumes a partial vector in its own destination. */
+    TEST_F(CPUNativeQuantisedGemvTest, CompactBoundedOutputRetainsOrderedArithmetic)
+    {
+        constexpr int width = 64, inner = 512, blocks = inner / Q8_1Block::BLOCK_SIZE;
+        constexpr float guard = -113.25f;
+        const auto input = TestTensorFactory::createFP32Random({inner}, -0.5f, 0.5f, 91707);
+        std::array<Q8_1Block, blocks> quantized{};
+        quantize_activations_to_q8_1(input->data(), quantized.data(), 1, inner, blocks,
+            CPUProjectionNumericalPolicy::GPUAlignedExpert);
+        const std::array<const Q8_1Block *, 1> activation{quantized.data()};
+
+        for (const auto &format : quantizedMoEVerifierFormats())
+        {
+            if (format.source_codebook_id != 9 && format.source_codebook_id != 10 &&
+                format.source_codebook_id != 13 && format.source_codebook_id != 14 &&
+                format.source_codebook_id != 17)
+                continue;
+            SCOPED_TRACE(format.label);
+            auto weights = format.create({width, inner}, 91721);
+            CPUNativeQuantisedGemmKernel kernel(weights.get(), 0, -1,
+                CPUProjectionNumericalPolicy::GPUAlignedExpert);
+            ASSERT_TRUE(kernel.isValid());
+            const auto &packed = kernel.packedWeights();
+            ASSERT_TRUE(packed.usesCompactMultiScale());
+
+            const auto exercise = [&]<int Lanes>() {
+                std::array<float, width> reference{}, ordered_reference{};
+                multi_scale::dispatch<Lanes>(packed, activation, std::array{reference.data()}, 0, 0, blocks, false);
+                multi_scale::dispatchOrdered<Lanes>(packed, activation, std::array{ordered_reference.data()},
+                    0, blocks, 8, blocks / 8);
+                for (int columns : {1, 7, 8, 9, 15, 16, 17, 31, 33, 63, 64})
+                {
+                    SCOPED_TRACE(columns);
+                    std::array<float, width + 2> continued, ordered;
+                    continued.fill(guard);
+                    ordered.fill(guard);
+                    const std::array destination{continued.data() + 1};
+                    multi_scale::dispatch<Lanes>(packed, activation, destination, 0, 0, blocks / 2, false, columns);
+                    multi_scale::dispatch<Lanes>(packed, activation, destination, 0, blocks / 2, blocks, true, columns);
+                    multi_scale::dispatchOrdered<Lanes>(packed, activation, std::array{ordered.data() + 1},
+                        0, blocks, 8, blocks / 8, columns);
+                    EXPECT_EQ(std::memcmp(continued.data() + 1, reference.data(), columns * sizeof(float)), 0);
+                    EXPECT_EQ(std::memcmp(ordered.data() + 1, ordered_reference.data(), columns * sizeof(float)), 0);
+                    EXPECT_EQ(continued.front(), guard);
+                    EXPECT_EQ(ordered.front(), guard);
+                    for (int column = columns + 1; column < static_cast<int>(continued.size()); ++column)
+                    {
+                        EXPECT_EQ(continued[column], guard);
+                        EXPECT_EQ(ordered[column], guard);
+                    }
+                }
+                constexpr int ragged = width + 3;
+                auto ragged_weights = format.create({ragged, inner}, 91739);
+                CPUNativeQuantisedGemmKernel ragged_kernel(ragged_weights.get(), 0, -1,
+                    CPUProjectionNumericalPolicy::GPUAlignedExpert);
+                ASSERT_TRUE(ragged_kernel.isValid());
+                const auto &ragged_packed = ragged_kernel.packedWeights();
+                std::array<float, 2 * width> padded_reference{};
+                for (int chunk = 0; chunk < 2; ++chunk)
+                    multi_scale::dispatch<Lanes>(ragged_packed, activation, std::array{padded_reference.data() + chunk * width},
+                        chunk, 0, blocks, false);
+                std::array<float, ragged + 2> actual;
+                actual.fill(guard);
+#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
+                if constexpr (Lanes == 16)
+                    gemv_native_quantised_avx512_block(ragged_packed, activation[0], actual.data() + 1,
+                        0, 2, blocks, ragged, _mm512_setzero_si512());
+                else
+#endif
+                    gemv_avx2_block(ragged_packed, activation[0], actual.data() + 1,
+                        0, 2, blocks, ragged, _mm256_setzero_si256());
+                EXPECT_EQ(std::memcmp(actual.data() + 1, padded_reference.data(), ragged * sizeof(float)), 0);
+                EXPECT_EQ(actual.front(), guard);
+                EXPECT_EQ(actual.back(), guard);
+            };
+#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
+            if (activeISALevel() >= ISALevel::AVX512)
+                exercise.template operator()<16>();
+            else
+#endif
+                exercise.template operator()<8>();
+        }
+    }
+#endif
+
     /** Independent scalar decoder proves the fused tree, not just two shared SIMD paths. */
     TEST_F(CPUNativeQuantisedGemvTest, CompactOrderedPartitionsMatchIndependentScalarDecoder)
     {

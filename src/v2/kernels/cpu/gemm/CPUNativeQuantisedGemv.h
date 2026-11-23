@@ -3000,6 +3000,12 @@ namespace llaminar2::cpu::native_quantised
 
             if (n_cols < 64)
             {
+                if (packed.usesCompactMultiScale())
+                {
+                    multi_scale::dispatch<16>(packed, std::array{A_q8}, std::array{C + n_start},
+                        chunk, 0, K_blocks, false, n_cols);
+                    continue;
+                }
                 // Tail chunk: kernel writes 64 floats, but only n_cols are valid.
                 // Use a temp buffer to avoid overflowing the caller's C buffer.
                 alignas(64) float tmp[64];

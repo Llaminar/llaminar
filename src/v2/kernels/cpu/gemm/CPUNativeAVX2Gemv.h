@@ -384,6 +384,12 @@ namespace llaminar2::cpu::native_quantised
 
             if (n_cols < 64)
             {
+                if (packed.usesCompactMultiScale())
+                {
+                    multi_scale::dispatch<8>(packed, std::array{A_q8}, std::array{C + n_start},
+                        chunk, 0, K_blocks, false, n_cols);
+                    continue;
+                }
                 alignas(64) float tmp[64];
                 if (use_nibble_lut)
                     gemv_avx2_chunk_native(packed, A_q8, tmp, chunk, 0, K_blocks, decode_lut);

@@ -533,6 +533,61 @@ namespace llaminar2::cpu::native_quantised::multi_scale
     }
 
     /**
+     * @brief Load a partial terminal vector without reading an adjacent row.
+     * @tparam Lanes Native width of one FP32 output vector.
+     * @tparam F Prepared backend vector type.
+     * @param source First live value owned by the output tile.
+     * @param live Number of valid values, less than the vector width.
+     * @return Live values followed by positive zero in inactive SIMD lanes.
+     */
+    template<int Lanes, class F>
+    inline F loadPartialOutput(const float *source, int live) noexcept
+    {
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
+        if constexpr (Lanes == 8)
+        {
+            const auto mask = _mm256_cmpgt_epi32(_mm256_set1_epi32(live),
+                _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7));
+            return std::bit_cast<F>(_mm256_maskload_ps(source, mask));
+        }
+#if defined(__AVX512F__)
+        if constexpr (Lanes == 16)
+            return std::bit_cast<F>(_mm512_maskz_loadu_ps(static_cast<__mmask16>((1u << live) - 1u), source));
+#endif
+#endif
+        F value{};
+        std::memcpy(&value, source, static_cast<size_t>(live) * sizeof(float));
+        return value;
+    }
+
+    /**
+     * @brief Publish a partial terminal vector directly into its live row.
+     * @tparam Lanes Native width of one FP32 output vector.
+     * @tparam F Prepared backend vector type.
+     * @param destination First exclusively owned live value.
+     * @param value SIMD accumulator in original column order.
+     * @param live Number of valid values, less than the vector width.
+     */
+    template<int Lanes, class F>
+    inline void storePartialOutput(float *destination, F value, int live) noexcept
+    {
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
+        if constexpr (Lanes == 8)
+        {
+            const auto mask = _mm256_cmpgt_epi32(_mm256_set1_epi32(live),
+                _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7));
+            return _mm256_maskstore_ps(destination, mask, std::bit_cast<__m256>(value));
+        }
+#if defined(__AVX512F__)
+        if constexpr (Lanes == 16)
+            return _mm512_mask_storeu_ps(destination, static_cast<__mmask16>((1u << live) - 1u),
+                std::bit_cast<__m512>(value));
+#endif
+#endif
+        std::memcpy(destination, &value, static_cast<size_t>(live) * sizeof(float));
+    }
+
+    /**
      * @brief Execute a shared-weight tile with the GPU's exact multi-scale expression.
      * @tparam Codebook Native source execution codebook.
      * @tparam Lanes Physical SIMD column width.
@@ -595,7 +650,7 @@ namespace llaminar2::cpu::native_quantised::multi_scale
                             if (column + Lanes <= columns)
                                 acc[row] = load<F>(output[row] + column);
                             else
-                                std::memcpy(&acc[row], output[row] + column, (columns - column) * sizeof(float));
+                                acc[row] = loadPartialOutput<Lanes, F>(output[row] + column, columns - column);
                         }
                 }
                 const int first =
@@ -705,7 +760,7 @@ namespace llaminar2::cpu::native_quantised::multi_scale
                 if (column + Lanes <= columns)
                     std::memcpy(output[row] + column, &reduced[row], sizeof(F));
                 else
-                    std::memcpy(output[row] + column, &reduced[row], (columns - column) * sizeof(float));
+                    storePartialOutput<Lanes>(output[row] + column, reduced[row], columns - column);
             }
         }
     }
