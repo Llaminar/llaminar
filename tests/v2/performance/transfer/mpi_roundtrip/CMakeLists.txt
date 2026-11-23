@@ -1,0 +1,107 @@
+# Opt-in core-free transport experiment: native dependencies, never a serving backend.
+# Host contracts can run without CUDA/MPI; GPU work requires an explicit native build.
+cmake_minimum_required(VERSION 3.24)
+project(llaminar_mpi_roundtrip LANGUAGES CXX)
+include(CTest)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+find_program(CCACHE_PROGRAM ccache)
+if(CCACHE_PROGRAM)
+    set(CMAKE_CXX_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+endif()
+add_executable(roundtrip_contracts Test__RoundTripContracts.cpp)
+add_test(NAME MPITransportExperiment_Contracts COMMAND roundtrip_contracts)
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+add_test(NAME MPITransportExperiment_Evidence
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test_campaign.py")
+add_test(NAME MPITransportExperiment_DmaBufEvidence
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test_dmabuf_probe.py")
+option(ROUNDTRIP_GPU "Build the explicit CUDA/OpenMPI experiment" OFF)
+option(ROUNDTRIP_DMABUF "Build CUDA13 allocation-specific DMA-BUF export/NIC-import probe" OFF)
+if(ROUNDTRIP_DMABUF AND NOT ROUNDTRIP_GPU)
+    message(FATAL_ERROR "DMA-BUF probe requires the explicit native GPU build")
+endif()
+if(ROUNDTRIP_GPU)
+    if(NOT CMAKE_BUILD_TYPE STREQUAL "Release")
+        message(FATAL_ERROR "GPU timings require Release")
+    endif()
+    if(NOT CMAKE_CUDA_ARCHITECTURES)
+        message(FATAL_ERROR "Supply the actual CUDA architecture explicitly")
+    endif()
+    enable_language(CUDA)
+    set(CMAKE_CUDA_STANDARD 20)
+    set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+    if(CCACHE_PROGRAM)
+        set(CMAKE_CUDA_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+    endif()
+    find_package(MPI REQUIRED COMPONENTS CXX)
+    find_package(CUDAToolkit REQUIRED)
+    # Build the actual core-free process owner against this selected MPI closure.
+    # These are original production sources, not a second cleanup implementation.
+    enable_language(C)
+    find_package(Threads REQUIRED)
+    find_package(OpenMP REQUIRED COMPONENTS CXX)
+    get_filename_component(DEFAULT_ROOT "${CMAKE_CURRENT_LIST_DIR}/../../../../.." ABSOLUTE)
+    set(LLAMINAR_SOURCE_ROOT "${DEFAULT_ROOT}" CACHE PATH "Exact repository source for MPI session ownership")
+    set(OWNER_ROOT "${LLAMINAR_SOURCE_ROOT}/src/v2")
+    set(MPI_LIBRARY_DIRS "")
+    foreach(LIB IN LISTS MPI_CXX_LIBRARIES)
+        get_filename_component(LIB_DIR "${LIB}" DIRECTORY)
+        list(APPEND MPI_LIBRARY_DIRS "${LIB_DIR}")
+    endforeach()
+    find_library(NATIVE_ORTE NAMES open-rte PATHS ${MPI_LIBRARY_DIRS} NO_DEFAULT_PATH REQUIRED)
+    find_library(NATIVE_OPAL NAMES open-pal PATHS ${MPI_LIBRARY_DIRS} NO_DEFAULT_PATH REQUIRED)
+    add_library(roundtrip_session_owner STATIC
+        "${OWNER_ROOT}/utils/MPISessionOwner.cpp" "${OWNER_ROOT}/utils/NativeCPUPlacement.cpp")
+    target_include_directories(roundtrip_session_owner PUBLIC "${OWNER_ROOT}")
+    target_link_libraries(roundtrip_session_owner PUBLIC Threads::Threads OpenMP::OpenMP_CXX ${CMAKE_DL_LIBS})
+    add_library(roundtrip_mpi_schizo MODULE
+        "${OWNER_ROOT}/utils/NativeMPISessionSchizo.cpp" "${OWNER_ROOT}/utils/NativeMPISessionSchizoAdapter.c")
+    target_include_directories(roundtrip_mpi_schizo PRIVATE "${OWNER_ROOT}" ${MPI_CXX_INCLUDE_DIRS})
+    target_link_libraries(roundtrip_mpi_schizo PRIVATE "${NATIVE_ORTE}" "${NATIVE_OPAL}")
+    set_target_properties(roundtrip_mpi_schizo PROPERTIES PREFIX "" OUTPUT_NAME mca_schizo_llaminar
+        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/llaminar_mpi_components")
+    add_executable(llaminar_mpi_session "${OWNER_ROOT}/tools/MPISessionLauncher.cpp")
+    target_link_libraries(llaminar_mpi_session PRIVATE roundtrip_session_owner)
+    add_dependencies(llaminar_mpi_session roundtrip_mpi_schizo)
+    add_executable(mpi_gpu_roundtrip Perf__MPIGPURoundTrip.cu)
+    target_link_libraries(mpi_gpu_roundtrip PRIVATE MPI::MPI_CXX CUDA::cudart roundtrip_session_owner)
+    add_dependencies(mpi_gpu_roundtrip llaminar_mpi_session)
+    set_target_properties(mpi_gpu_roundtrip PROPERTIES BUILD_RPATH "$<TARGET_FILE_DIR:CUDA::cudart>")
+    target_compile_definitions(mpi_gpu_roundtrip PRIVATE OMPI_SKIP_MPICXX=1)
+    target_compile_options(mpi_gpu_roundtrip PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--ptxas-options=-v,--warn-on-spills,--warning-as-error>)
+    if(ROUNDTRIP_DMABUF)
+        if(CUDAToolkit_VERSION VERSION_LESS 13.0)
+            message(FATAL_ERROR "Host DMA-BUF capability probing requires CUDA13 headers")
+        endif()
+        find_path(VERBS_INCLUDE_DIR infiniband/verbs.h REQUIRED)
+        find_library(VERBS_LIBRARY ibverbs REQUIRED)
+        target_compile_definitions(mpi_gpu_roundtrip PRIVATE ROUNDTRIP_VERBS=1)
+        target_include_directories(mpi_gpu_roundtrip PRIVATE "${VERBS_INCLUDE_DIR}")
+        target_link_libraries(mpi_gpu_roundtrip PRIVATE "${VERBS_LIBRARY}")
+        add_executable(cuda_dmabuf_probe Probe__CUDADmaBuf.cpp)
+        target_include_directories(cuda_dmabuf_probe PRIVATE "${VERBS_INCLUDE_DIR}")
+        target_link_libraries(cuda_dmabuf_probe PRIVATE CUDA::cudart "${VERBS_LIBRARY}" roundtrip_session_owner)
+        add_dependencies(cuda_dmabuf_probe llaminar_mpi_session)
+        set_target_properties(cuda_dmabuf_probe PROPERTIES BUILD_RPATH "$<TARGET_FILE_DIR:CUDA::cudart>")
+        file(SHA256 "${CMAKE_CURRENT_SOURCE_DIR}/Probe__CUDADmaBuf.cpp" DMABUF_SOURCE_SHA)
+        file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/dmabuf-build-identity.json"
+            "{\"source_sha256\":\"${DMABUF_SOURCE_SHA}\",\"cuda_toolkit\":\"${CUDAToolkit_VERSION}\",\"verbs_library\":\"${VERBS_LIBRARY}\"}\n")
+    endif()
+    # Identity receipts must refresh when a compiled source/header changes, not
+    # only when a caller happens to rerun configuration manually.
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/Perf__MPIGPURoundTrip.cu"
+        "${CMAKE_CURRENT_SOURCE_DIR}/RoundTripContract.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/VerbsRoundTrip.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/Probe__CUDADmaBuf.cpp")
+    file(SHA256 "${CMAKE_CURRENT_SOURCE_DIR}/VerbsRoundTrip.h" VERBS_SOURCE_SHA)
+    # The cooperative kernel owns its complete program in one translation unit.
+    # No split-compile, profiler perturbation, fast-math or hidden device libraries.
+    set_target_properties(mpi_gpu_roundtrip PROPERTIES CUDA_RUNTIME_LIBRARY Shared)
+    file(SHA256 "${CMAKE_CURRENT_SOURCE_DIR}/Perf__MPIGPURoundTrip.cu" SOURCE_SHA)
+    file(SHA256 "${CMAKE_CURRENT_SOURCE_DIR}/RoundTripContract.h" CONTRACT_SHA)
+    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/build-identity.json"
+        "{\"source_sha256\":\"${SOURCE_SHA}\",\"contract_sha256\":\"${CONTRACT_SHA}\",\"verbs_header_sha256\":\"${VERBS_SOURCE_SHA}\",\"verbs_enabled\":\"${ROUNDTRIP_DMABUF}\",\"cuda_compiler\":\"${CMAKE_CUDA_COMPILER_VERSION}\",\"architectures\":\"${CMAKE_CUDA_ARCHITECTURES}\",\"mpi_compiler\":\"${MPI_CXX_COMPILER}\",\"build_type\":\"${CMAKE_BUILD_TYPE}\"}\n")
+endif()

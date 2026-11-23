@@ -1,0 +1,14 @@
+--- a/test/apps/test_cuda_hook.c
++++ b/test/apps/test_cuda_hook.c
+@@ -55,7 +55,11 @@ static void alloc_driver_api()
+         return;
+     }
+ 
++#if CUDA_VERSION >= 13000
++    res = cuCtxCreate(&context, NULL, 0, device);
++#else
+     res = cuCtxCreate(&context, 0, device);
++#endif
+     if (res != CUDA_SUCCESS) {
+         printf("cuCtxCreate() failed: %d\n", res);
+         return;
