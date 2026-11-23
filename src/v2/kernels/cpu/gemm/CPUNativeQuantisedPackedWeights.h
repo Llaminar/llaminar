@@ -23,6 +23,7 @@
 #include <stdexcept>
 #if defined(__AVX2__) || defined(__AVX512F__)
 #include <immintrin.h>
+#include "CPUNativeQuantisedMultiScaleKernels.h"
 #endif
 
 namespace llaminar2::cpu::native_quantised
@@ -367,12 +368,14 @@ namespace llaminar2::cpu::native_quantised
         [[nodiscard]] native_quantised_superblock::StagedBlockMetadata codedBlockMetadata(int c, int kb, int column) const
         {
             const uint8_t *base = blockUnit(c, kb);
-            uint8_t source_payload[16]{};
-            compactColumnPayload(base, codebook_id, column, source_payload);
-            const auto code = coded_metadata::columnCode(base, static_cast<std::uint32_t>(data_stride), codebook_id,
-                                                         column, source_payload);
-            const auto word = coded_metadata::loadSuperblockWord(superblockHeader(c, kb), codebook_id, column);
-            return native_quantised_superblock::decodeSuperblockMetadata(codebook_id, code, word);
+            const auto sb_codebook = superblockMetadataCodebook(encoding, codebook_id);
+            uint8_t payload[16]{};
+            if (native_quantised_superblock::superblockCodeInPayload(sb_codebook))
+                compactColumnPayload(base, codebook_id, column, payload);
+            const auto code = coded_metadata::columnCode(base, preparedCodedPlaneOffset(encoding, data_stride),
+                                                         sb_codebook, column, payload);
+            const auto word = coded_metadata::loadSuperblockWord(superblockHeader(c, kb), sb_codebook, column);
+            return native_quantised_superblock::decodeSuperblockMetadata(sb_codebook, code, word);
         }
 
         // -------------------------------------------------------------------
@@ -399,58 +402,83 @@ namespace llaminar2::cpu::native_quantised
                 reinterpret_cast<const __m256i *>(primary)));
         }
 
-        /** @brief Load sixteen effective scales without rounding source products to half.
-         * @param primary Aligned inline primary words, within one64-column unit.
-         * @return Widened ordinary scale or exact IQ4_XS base times signed coefficient.
+        /** @brief Load 16 effective scales from an inline per-block plane.
+         * @param primary Aligned primary words of a per-block encoding.
+         * @return Widened scale or exact IQ3_S base times signed source factor.
          */
-        [[nodiscard]] inline __m512 loadScales512(const uint16_t *primary) const
+        [[nodiscard]] inline __m512 loadScales512(const std::uint16_t *primary) const
         {
-            // BF16 power-of-two words widen by placement alone (word << 16); never F16C.
+            const __m256i words = _mm256_load_si256(reinterpret_cast<const __m256i *>(primary));
             const __m512 base = scaleEncoding() == CPUNativeQuantisedScaleEncoding::PowerOfTwoBF16
-                ? _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(
-                      _mm256_load_si256(reinterpret_cast<const __m256i *>(primary))), 16))
-                : loadPlainFP16Scales512(primary);
-            if (!usesNibbleLUTSourceScale() && !usesIQ3SExpandedSourceScale()) return base;
+                ? _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(words), 16))
+                : _mm512_cvtph_ps(words);
+            if (!usesIQ3SExpandedSourceScale()) return base;
             const __m512i raw = _mm512_cvtepu16_epi32(_mm256_load_si256(
                 reinterpret_cast<const __m256i *>(primary + 64)));
-            if (usesIQ3SExpandedSourceScale())
+            if (_mm512_test_epi32_mask(raw, _mm512_set1_epi32(~15)) != 0)
+                throw std::invalid_argument("IQ3_S coefficient contains reserved bits");
+            return _mm512_mul_ps(base, _mm512_cvtepi32_ps(_mm512_add_epi32(
+                _mm512_slli_epi32(raw, 1), _mm512_set1_epi32(1))));
+        }
+
+        /** @brief Load 16 effective scales from the admitted block and column strip.
+         * @param chunk 64-column chunk index.
+         * @param block Logical 32-value K block.
+         * @param column First column of the strip, a multiple of 16.
+         * @return Exact FP32 source factors or widened ordinary scale words.
+         */
+        [[nodiscard]] inline __m512 loadScales512(int chunk, int block, int column) const
+        {
+            if (usesNibbleLUTSourceScale())
             {
-                if (_mm512_test_epi32_mask(raw, _mm512_set1_epi32(~15)) != 0)
-                    throw std::invalid_argument("IQ3_S coefficient contains reserved bits");
-                return _mm512_mul_ps(base, _mm512_cvtepi32_ps(_mm512_add_epi32(
-                    _mm512_slli_epi32(raw, 1), _mm512_set1_epi32(1))));
+                constexpr auto codebook = kNativeQuantisedIQ4XSSourceScaleCodebook;
+                using Ops = multi_scale::SIMD<16>;
+                using L = coded_metadata::Lanes<Ops>;
+                const auto *planes = admittedBlockUnit(chunk, block) + preparedCodedPlaneOffset(encoding, data_stride);
+                return coded_metadata::sourceScaleFactors<codebook, Ops>(L::template code<codebook>(planes, column),
+                    L::half(L::template superblockWords<codebook>(admittedSuperblockHeader(chunk, block), column))).primary;
             }
-            if (_mm512_test_epi32_mask(raw, _mm512_set1_epi32(~63)) != 0)
-                throw std::invalid_argument("IQ4_XS coefficient contains reserved bits");
-            return _mm512_mul_ps(base, _mm512_cvtepi32_ps(
-                _mm512_sub_epi32(_mm512_and_si512(raw, _mm512_set1_epi32(63)), _mm512_set1_epi32(32))));
+            return loadScales512(chunkScales(chunk, block) + column);
         }
 #endif
 #if defined(__AVX2__)
-        /** @brief Load eight effective scales using the same original source equation.
-         * @param primary Aligned inline primary words, within one64-column unit.
-         * @return Separately rounded FP32 scale vector, shared across grouped rows.
+        /** @brief Load 8 effective scales from an inline per-block plane.
+         * @param primary Aligned primary words of a per-block encoding.
+         * @return Widened scale or exact IQ3_S base times signed source factor.
          */
-        [[nodiscard]] inline __m256 loadScales256(const uint16_t *primary) const
+        [[nodiscard]] inline __m256 loadScales256(const std::uint16_t *primary) const
         {
             const __m128i words = _mm_load_si128(reinterpret_cast<const __m128i *>(primary));
             const __m256 base = scaleEncoding() == CPUNativeQuantisedScaleEncoding::PowerOfTwoBF16
                 ? _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(words), 16))
                 : _mm256_cvtph_ps(words);
-            if (!usesNibbleLUTSourceScale() && !usesIQ3SExpandedSourceScale()) return base;
+            if (!usesIQ3SExpandedSourceScale()) return base;
             const __m256i raw = _mm256_cvtepu16_epi32(_mm_load_si128(
                 reinterpret_cast<const __m128i *>(primary + 64)));
-            if (usesIQ3SExpandedSourceScale())
+            if (!_mm256_testz_si256(raw, _mm256_set1_epi32(~15)))
+                throw std::invalid_argument("IQ3_S coefficient contains reserved bits");
+            return _mm256_mul_ps(base, _mm256_cvtepi32_ps(_mm256_add_epi32(
+                _mm256_slli_epi32(raw, 1), _mm256_set1_epi32(1))));
+        }
+
+        /** @brief Load 8 effective scales from the admitted block and column strip.
+         * @param chunk 64-column chunk index.
+         * @param block Logical 32-value K block.
+         * @param column First column of the strip, a multiple of 8.
+         * @return Exact FP32 source factors or widened ordinary scale words.
+         */
+        [[nodiscard]] inline __m256 loadScales256(int chunk, int block, int column) const
+        {
+            if (usesNibbleLUTSourceScale())
             {
-                if (!_mm256_testz_si256(raw, _mm256_set1_epi32(~15)))
-                    throw std::invalid_argument("IQ3_S coefficient contains reserved bits");
-                return _mm256_mul_ps(base, _mm256_cvtepi32_ps(_mm256_add_epi32(
-                    _mm256_slli_epi32(raw, 1), _mm256_set1_epi32(1))));
+                constexpr auto codebook = kNativeQuantisedIQ4XSSourceScaleCodebook;
+                using Ops = multi_scale::SIMD<8>;
+                using L = coded_metadata::Lanes<Ops>;
+                const auto *planes = admittedBlockUnit(chunk, block) + preparedCodedPlaneOffset(encoding, data_stride);
+                return coded_metadata::sourceScaleFactors<codebook, Ops>(L::template code<codebook>(planes, column),
+                    L::half(L::template superblockWords<codebook>(admittedSuperblockHeader(chunk, block), column))).primary;
             }
-            if (!_mm256_testz_si256(raw, _mm256_set1_epi32(~63)))
-                throw std::invalid_argument("IQ4_XS coefficient contains reserved bits");
-            return _mm256_mul_ps(base, _mm256_cvtepi32_ps(
-                _mm256_sub_epi32(_mm256_and_si256(raw, _mm256_set1_epi32(63)), _mm256_set1_epi32(32))));
+            return loadScales256(chunkScales(chunk, block) + column);
         }
 #endif
 

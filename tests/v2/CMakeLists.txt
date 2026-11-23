@@ -10621,6 +10621,21 @@ add_v2_test(V2_Unit_CPUCodedCompactUnits
     LABELS "V2;Unit;CPU;DeviceFree;NativeQuantised;Memory;ByteExact;Regression"
     MPI_PROCS 1 NO_MODELS)
 
+# Q6_K and IQ4_XS coded CPU units: exact file-density bytes and the coded code
+# plane plus superblock header reproduce the per-block source factors exactly.
+add_executable(v2_unit_cpu_coded_file_density_q6iq4 unit/kernels/cpu/Test__CPUCodedFileDensityQ6IQ4.cpp)
+target_link_libraries(v2_unit_cpu_coded_file_density_q6iq4
+    llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_CPUCodedFileDensityQ6IQ4
+    COMMAND $<TARGET_FILE:v2_unit_cpu_coded_file_density_q6iq4>
+    LABELS "V2;Unit;CPU;DeviceFree;NativeQuantised;Memory;ByteExact;Regression"
+    MPI_PROCS 1 NO_MODELS)
+
+add_v2_test(V2_Integration_CPUCodedFileDensityQ6IQ4
+    COMMAND $<TARGET_FILE:v2_unit_cpu_coded_file_density_q6iq4>
+    LABELS "V2;Integration;CPU;DeviceFree;NativeQuantised;Memory;ByteExact;Regression;ProductionTestPreflight"
+    MPI_PROCS 1 NO_MODELS)
+
 # Original Q6 source factors remain exact without changing Q8 GEMM inputs.
 add_executable(v2_test_q6_source_scale unit/kernels/Test__Q6SourceScale.cpp)
 target_link_libraries(v2_test_q6_source_scale

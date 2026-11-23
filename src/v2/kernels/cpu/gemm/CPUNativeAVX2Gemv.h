@@ -158,7 +158,7 @@ namespace llaminar2::cpu::native_quantised
             {
                 const uint8_t *base =
                     packed.interleavedB(chunk, kb, group, z) + byte_offset;
-                const __m256i raw = _mm256_load_si256(
+                const __m256i raw = _mm256_loadu_si256(
                     reinterpret_cast<const __m256i *>(base));
                 const __m256i low = _mm256_shuffle_epi8(
                     decode_lut, _mm256_and_si256(raw, mask_0F));
@@ -179,18 +179,18 @@ namespace llaminar2::cpu::native_quantised
             }
 
             const __m256i compensation = _mm256_cvtepi16_epi32(
-                _mm_load_si128(reinterpret_cast<const __m128i *>(
+                _mm_loadu_si128(reinterpret_cast<const __m128i *>(
                     packed.chunkComp(chunk, kb) + segment * 8)));
             const __m256i corrected = _mm256_sub_epi32(
                 _mm256_add_epi32(dot_low, dot_high),
                 _mm256_mullo_epi32(bias_128_i32, compensation));
-            const __m256 weight_scale = packed.loadScales256(packed.chunkScales(chunk, kb) + segment * 8);
+            const __m256 weight_scale = packed.loadScales256(chunk, kb, segment * 8);
             const float activation_scale =
                 nativeQuantisedFP16ScaleToFP32(activation.d);
             if (packed.is_asymmetric)
             {
                 const __m256 weight_min = _mm256_cvtph_ps(
-                    _mm_load_si128(reinterpret_cast<const __m128i *>(
+                    _mm_loadu_si128(reinterpret_cast<const __m128i *>(
                         packed.chunkMins(chunk, kb) + segment * 8)));
                 accumulator = accumulateCorrectedSingleScaleBlockAVX2(
                     accumulator,
@@ -467,7 +467,7 @@ namespace llaminar2::cpu::native_quantised
                 {
                     const uint8_t *base =
                         packed.interleavedB(chunk, kb, group, z) + byte_offset;
-                    const __m256i raw = _mm256_load_si256(
+                    const __m256i raw = _mm256_loadu_si256(
                         reinterpret_cast<const __m256i *>(base));
                     const __m256i low = _mm256_shuffle_epi8(
                         decode_lut, _mm256_and_si256(raw, mask_0F));
@@ -498,7 +498,7 @@ namespace llaminar2::cpu::native_quantised
                 }
 
                 const __m256i compensation = _mm256_cvtepi16_epi32(
-                    _mm_load_si128(reinterpret_cast<const __m128i *>(
+                    _mm_loadu_si128(reinterpret_cast<const __m128i *>(
                         packed.chunkComp(chunk, kb) + segment * 8)));
                 const __m256i bias =
                     _mm256_mullo_epi32(bias_128_i32, compensation);
@@ -506,13 +506,13 @@ namespace llaminar2::cpu::native_quantised
                     _mm256_add_epi32(dot0_low, dot0_high), bias);
                 const __m256i corrected1 = _mm256_sub_epi32(
                     _mm256_add_epi32(dot1_low, dot1_high), bias);
-                const __m256 weight_scale = packed.loadScales256(packed.chunkScales(chunk, kb) + segment * 8);
+                const __m256 weight_scale = packed.loadScales256(chunk, kb, segment * 8);
                 const float a0_scale = nativeQuantisedFP16ScaleToFP32(a0.d);
                 const float a1_scale = nativeQuantisedFP16ScaleToFP32(a1.d);
                 if (packed.is_asymmetric)
                 {
                     const __m256 weight_min = _mm256_cvtph_ps(
-                        _mm_load_si128(reinterpret_cast<const __m128i *>(
+                        _mm_loadu_si128(reinterpret_cast<const __m128i *>(
                             packed.chunkMins(chunk, kb) + segment * 8)));
                     fp0 = accumulateCorrectedSingleScaleBlockAVX2(
                         fp0, corrected0, weight_scale, a0.sum_qs,

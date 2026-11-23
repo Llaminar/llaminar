@@ -44,11 +44,16 @@ public:
     {
         if (n <= 0 || k <= 0)
             throw std::invalid_argument("Native CPU byte fixture requires positive geometry");
-        const std::uint64_t units = ((std::uint64_t(n) + 63) / 64) * ((std::uint64_t(k) + 31) / 32);
+        const std::uint64_t chunks = (std::uint64_t(n) + 63) / 64;
+        const std::uint64_t blocks_per_row = (std::uint64_t(k) + 31) / 32;
         const auto stride = cpu::native_quantised::preparedInterleavedBlockStride(descriptor.encoding, descriptor.is_asymmetric, descriptor.source.codebook_id);
-        if (units > max_bytes / stride)
+        const auto header = cpu::native_quantised::preparedSuperblockHeaderBytes(descriptor.encoding, descriptor.source.codebook_id);
+        const cpu::native_quantised::CPUNativeQuantisedBlockGeometry geometry{
+            .block_stride = stride, .header_bytes = header,
+            .blocks_per_row = static_cast<std::size_t>(blocks_per_row), .phase = 0};
+        if (stride == 0 || chunks > max_bytes / geometry.rowBytes())
             throw std::overflow_error("Native CPU byte fixture exceeds its declared byte bound");
-        const auto extent = static_cast<std::size_t>(units) * stride;
+        const auto extent = geometry.matrixBytes(chunks);
         storage_.resize(extent + 127);
         const auto offset = (64 - reinterpret_cast<std::uintptr_t>(storage_.data()) % 64) % 64;
         bytes = std::span(storage_).subspan(offset, extent);
@@ -78,12 +83,16 @@ public:
             for (int block = 0; block < layout.blocks_per_row; ++block)
             {
                 const int local = column % 64;
-                const auto unit = (std::size_t(column / 64) * layout.blocks_per_row + block) *
-                    layout.interleaved_block_stride;
+                const int chunk = column / 64;
+                using namespace cpu::native_quantised;
+                const auto unit = layout.geometry().blockOffset(chunk, block);
                 const std::uint32_t seed = 0x9e3779b9u * (column + 1u) ^ 0x85ebca6bu * (block + 3u);
+                const int words = layout.usesCompactMultiScale() ? preparedCompactPayloadWords(layout.codebook_id) : layout.payload_bytes / 4;
+                const int tail = layout.usesCompactMultiScale() ? preparedCompactPayloadTailBytes(layout.codebook_id) : 0;
                 for (int byte = 0; byte < layout.payload_bytes; ++byte)
                 {
-                    const auto offset = unit + (byte / 4) * 256 + local * 4 + byte % 4;
+                    const auto offset = unit + (byte < 4 * words ? (byte / 4) * 256 + local * 4 + byte % 4
+                        : words * 256 + local * tail + byte - 4 * words);
                     bytes[offset] = static_cast<std::uint8_t>((seed >> ((byte % 4) * 8)) + byte * 29u);
                 }
                 if (layout.usesInlineCompensation())
@@ -105,6 +114,21 @@ public:
                     std::memcpy(bytes.data() + unit + layout.data_stride + local * 2,
                         &compensation, sizeof(compensation));
                 }
+                if (layout.superblockCoded())
+                {
+                    const auto codebook = superblockMetadataCodebook(layout.encoding, layout.codebook_id);
+                    if (native_quantised_superblock::superblockCodePlaneBits(codebook))
+                        coded_metadata::storeCode(bytes.data() + unit + preparedCodedPlaneOffset(layout.encoding, layout.data_stride),
+                            codebook, local, seed);
+                    if (block % 8 == 0)
+                    {
+                        const std::uint32_t d = 0x2401u + (seed & 0x1fffu);
+                        const std::uint32_t word = d | (native_quantised_superblock::superblockHasDmin(codebook) ? d << 16 : 0u);
+                        coded_metadata::storeSuperblockWord(bytes.data() + layout.geometry().headerOffset(chunk, block),
+                            codebook, local, word);
+                    }
+                    continue;
+                }
                 const auto primary = unit + layout.data_stride + (layout.usesInlineCompensation() ? 128 : 0) + local * 2;
                 // Native MXFP4 primary words are BF16 powers of two of an admitted
                 // E8M0 exponent, or zero; every other unit holds FP16. The seeded
@@ -114,23 +138,9 @@ public:
                     ? (seed % 29u == 7u ? std::uint16_t{0}
                         : mxfp4::powerOfTwoBF16Word(static_cast<std::uint8_t>(2u + (seed >> 8) % 199u)))
                     : static_cast<std::uint16_t>(0x2401u + (seed & 0x1fffu)));
-                if (layout.is_asymmetric || layout.usesNibbleLUTSourceScale() || layout.usesIQ3SExpandedSourceScale() ||
-                    layout.usesQ6KNativeDualScale() || layout.usesCompactMultiScale())
-                {
-                    const std::uint16_t secondary = layout.usesQ6KNativeDualScale() ? static_cast<std::uint16_t>(seed)
-                        : layout.usesIQ3SExpandedSourceScale() ? static_cast<std::uint16_t>(seed & 15u)
-                        : layout.usesNibbleLUTSourceScale() ? static_cast<std::uint16_t>(seed & 63u)
-                        : layout.usesCompactMultiScale() && layout.codebook_id == 13 ? static_cast<std::uint16_t>(seed & 255u)
-                        : static_cast<std::uint16_t>(0xa301u + (seed & 0x0fffu));
-                    writeWord(primary + 128, secondary);
-                }
-                // Only Q2_K's compact unit reserves the effective-minimum vector.
-                if (layout.usesCompactMultiScale() && layout.codebook_id == 10)
-                {
-                    const std::uint32_t minima = 0x94019c03u + (seed & 0x003f003fu);
-                    std::memcpy(bytes.data() + unit + layout.data_stride + 256 + local * 4,
-                        &minima, sizeof(minima));
-                }
+                if (layout.is_asymmetric || layout.usesIQ3SExpandedSourceScale())
+                    writeWord(primary + 128, layout.usesIQ3SExpandedSourceScale() ? static_cast<std::uint16_t>(seed & 15u)
+                        : static_cast<std::uint16_t>(0xa301u + (seed & 0x0fffu)));
             }
     }
 

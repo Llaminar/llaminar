@@ -1473,24 +1473,26 @@ namespace llaminar2::cpu::native_quantised
      * @brief Load scales using the original nibble dispatcher's immutable decoder.
      * @tparam DecodeKind Existing linear/identity/LUT decode semantics.
      * @param packed Original admitted prepared operand; no layout is reinterpreted.
-     * @param primary Original aligned inline scale words.
+     * @param chunk 64-column chunk index.
+     * @param block Logical K block.
+     * @param column First column of the 16-column strip.
      * @return Identical effective FP32 scale values without unused source-factor work.
      *
      * Preparation maps codebooks0/5 to ordinary NibbleLUT and the dispatcher
      * maps them to linear/identity. IQ4_XS factors require codebook4 and keep
      * LUT; IQ3_S factors require ExpandedInt8 source-scale execution. Thus only
      * linear kinds can statically widen plain halves. LUT retains the generic
-     * source-factor equation and validation; no source scale is rounded/repacked.
+     * coded source factors, when present; no source scale is narrowed to half.
      */
     template <NibbleDecodeKind DecodeKind>
     inline __m512 load_native_avx512_nibble_scales(
-        const CPUNativeQuantisedPackedWeights &packed,const uint16_t *primary)
+        const CPUNativeQuantisedPackedWeights &packed, int chunk, int block, int column)
     {
         if constexpr (DecodeKind == NibbleDecodeKind::Q4_0_LINEAR ||
                       DecodeKind == NibbleDecodeKind::Q4_1_IDENTITY)
-            return CPUNativeQuantisedPackedWeights::loadPlainFP16Scales512(primary);
+            return CPUNativeQuantisedPackedWeights::loadPlainFP16Scales512(packed.chunkScales(chunk, block) + column);
         else
-            return packed.loadScales512(primary);
+            return packed.loadScales512(chunk, block, column);
     }
 
     /**
@@ -1564,7 +1566,7 @@ namespace llaminar2::cpu::native_quantised
              */
 #define NIBBLE_BLOCK_SUBCHUNK(Z, ACC)                                          \
             {                                                                  \
-                const __m512i raw = _mm512_load_si512(                         \
+                const __m512i raw = _mm512_loadu_si512(                         \
                     packed.interleavedB(chunk, kb, group, Z));                 \
                 const __m512i low =                                            \
                     decode_low_nibbles_avx512_static<DecodeKind>(              \
@@ -1600,33 +1602,32 @@ namespace llaminar2::cpu::native_quantised
                 int_acc0,
                 _mm512_mullo_epi32(
                     bias_128_i32,
-                    _mm512_cvtepi16_epi32(_mm256_load_si256(
+                    _mm512_cvtepi16_epi32(_mm256_loadu_si256(
                         reinterpret_cast<const __m256i *>(comp_ptr)))));
             int_acc1 = _mm512_sub_epi32(
                 int_acc1,
                 _mm512_mullo_epi32(
                     bias_128_i32,
-                    _mm512_cvtepi16_epi32(_mm256_load_si256(
+                    _mm512_cvtepi16_epi32(_mm256_loadu_si256(
                         reinterpret_cast<const __m256i *>(comp_ptr + 16)))));
             int_acc2 = _mm512_sub_epi32(
                 int_acc2,
                 _mm512_mullo_epi32(
                     bias_128_i32,
-                    _mm512_cvtepi16_epi32(_mm256_load_si256(
+                    _mm512_cvtepi16_epi32(_mm256_loadu_si256(
                         reinterpret_cast<const __m256i *>(comp_ptr + 32)))));
             int_acc3 = _mm512_sub_epi32(
                 int_acc3,
                 _mm512_mullo_epi32(
                     bias_128_i32,
-                    _mm512_cvtepi16_epi32(_mm256_load_si256(
+                    _mm512_cvtepi16_epi32(_mm256_loadu_si256(
                         reinterpret_cast<const __m256i *>(comp_ptr + 48)))));
         }
 
-        const uint16_t *b_scales = packed.chunkScales(chunk, kb);
-        const __m512 scale0 = load_native_avx512_nibble_scales<DecodeKind>(packed, b_scales);
-        const __m512 scale1 = load_native_avx512_nibble_scales<DecodeKind>(packed, b_scales + 16);
-        const __m512 scale2 = load_native_avx512_nibble_scales<DecodeKind>(packed, b_scales + 32);
-        const __m512 scale3 = load_native_avx512_nibble_scales<DecodeKind>(packed, b_scales + 48);
+        const __m512 scale0 = load_native_avx512_nibble_scales<DecodeKind>(packed, chunk, kb, 0);
+        const __m512 scale1 = load_native_avx512_nibble_scales<DecodeKind>(packed, chunk, kb, 16);
+        const __m512 scale2 = load_native_avx512_nibble_scales<DecodeKind>(packed, chunk, kb, 32);
+        const __m512 scale3 = load_native_avx512_nibble_scales<DecodeKind>(packed, chunk, kb, 48);
 
         if constexpr (IsAsymmetric)
         {
@@ -1765,7 +1766,7 @@ namespace llaminar2::cpu::native_quantised
                  */
 #define NIBBLE_1ROW_SUBCHUNK(Z, ACC)                                           \
                 {                                                              \
-                    const __m512i raw = _mm512_load_si512(                     \
+                    const __m512i raw = _mm512_loadu_si512(                     \
                         packed.interleavedB(chunk, kb, group, Z));             \
                     const __m512i a_low = _mm512_set1_epi32(                   \
                         activation_word(a_blk, group * 4));                    \
@@ -1799,10 +1800,10 @@ namespace llaminar2::cpu::native_quantised
                 // Bias correction: corrected = int_acc - 128 * comp
                 // comp is INT16 (halved metadata); load via sign-extend to INT32
                 const int16_t *comp_ptr = packed.chunkComp(chunk, kb);
-                __m512i comp0 = _mm512_cvtepi16_epi32(_mm256_load_si256(reinterpret_cast<const __m256i *>(comp_ptr)));
-                __m512i comp1 = _mm512_cvtepi16_epi32(_mm256_load_si256(reinterpret_cast<const __m256i *>(comp_ptr + 16)));
-                __m512i comp2 = _mm512_cvtepi16_epi32(_mm256_load_si256(reinterpret_cast<const __m256i *>(comp_ptr + 32)));
-                __m512i comp3 = _mm512_cvtepi16_epi32(_mm256_load_si256(reinterpret_cast<const __m256i *>(comp_ptr + 48)));
+                __m512i comp0 = _mm512_cvtepi16_epi32(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(comp_ptr)));
+                __m512i comp1 = _mm512_cvtepi16_epi32(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(comp_ptr + 16)));
+                __m512i comp2 = _mm512_cvtepi16_epi32(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(comp_ptr + 32)));
+                __m512i comp3 = _mm512_cvtepi16_epi32(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(comp_ptr + 48)));
 
                 int_acc0 = _mm512_sub_epi32(int_acc0, _mm512_mullo_epi32(bias_128_i32, comp0));
                 int_acc1 = _mm512_sub_epi32(int_acc1, _mm512_mullo_epi32(bias_128_i32, comp1));
@@ -1811,11 +1812,11 @@ namespace llaminar2::cpu::native_quantised
             }
 
             // Convert exact integer dots through the selected publication tree.
-            const uint16_t *b_scales = packed.chunkScales(chunk, kb);
-            const __m512 scale0 = load_native_avx512_nibble_scales<DecodeKind>(packed, b_scales);
-            const __m512 scale1 = load_native_avx512_nibble_scales<DecodeKind>(packed, b_scales + 16);
-            const __m512 scale2 = load_native_avx512_nibble_scales<DecodeKind>(packed, b_scales + 32);
-            const __m512 scale3 = load_native_avx512_nibble_scales<DecodeKind>(packed, b_scales + 48);
+
+            const __m512 scale0 = load_native_avx512_nibble_scales<DecodeKind>(packed, chunk, kb, 0);
+            const __m512 scale1 = load_native_avx512_nibble_scales<DecodeKind>(packed, chunk, kb, 16);
+            const __m512 scale2 = load_native_avx512_nibble_scales<DecodeKind>(packed, chunk, kb, 32);
+            const __m512 scale3 = load_native_avx512_nibble_scales<DecodeKind>(packed, chunk, kb, 48);
 
             // Asymmetric correction: acc += a_scale * sum_qs * b_min[n]
             // Formula: weight = scale * int_val + min, so the offset term
@@ -2083,10 +2084,10 @@ namespace llaminar2::cpu::native_quantised
                     // BEFORE original compensation, FP conversion or scaling.
                     for (int group = 0; group < 4; ++group)
                     {
-                        const __m512i raw0 = _mm512_load_si512(
+                        const __m512i raw0 = _mm512_loadu_si512(
                             packed.interleavedB(
                                 chunk, kb, group, zbase));
-                        const __m512i raw1 = _mm512_load_si512(
+                        const __m512i raw1 = _mm512_loadu_si512(
                             packed.interleavedB(
                                 chunk, kb, group, zbase + 1));
                         const __m512i low0 =
@@ -2152,11 +2153,11 @@ namespace llaminar2::cpu::native_quantised
                             packed.chunkComp(chunk, kb) + zbase * 16;
                         const __m512i bias0 = _mm512_mullo_epi32(
                             bias_128_i32,
-                            _mm512_cvtepi16_epi32(_mm256_load_si256(
+                            _mm512_cvtepi16_epi32(_mm256_loadu_si256(
                                 reinterpret_cast<const __m256i *>(comp))));
                         const __m512i bias1 = _mm512_mullo_epi32(
                             bias_128_i32,
-                            _mm512_cvtepi16_epi32(_mm256_load_si256(
+                            _mm512_cvtepi16_epi32(_mm256_loadu_si256(
                                 reinterpret_cast<const __m256i *>(comp + 16))));
                         int0_0 = _mm512_sub_epi32(int0_0, bias0);
                         int0_1 = _mm512_sub_epi32(int0_1, bias1);
@@ -2164,15 +2165,13 @@ namespace llaminar2::cpu::native_quantised
                         int1_1 = _mm512_sub_epi32(int1_1, bias1);
                     }
 
-                    const uint16_t *scales =
-                        packed.chunkScales(chunk, kb) + zbase * 16;
                     // The original decoder-specialized M1 helper already
                     // proves ordinary halves for linear/identity metadata.
                     // Reuse it here so impossible IQ3_S/IQ4_XS factor masks
                     // need not stay live across eight integer dot chains.
                     // LUT keeps the original source-factor loader/equation.
-                    const __m512 scale0 = load_native_avx512_nibble_scales<DecodeKind>(packed, scales);
-                    const __m512 scale1 = load_native_avx512_nibble_scales<DecodeKind>(packed, scales + 16);
+                    const __m512 scale0 = load_native_avx512_nibble_scales<DecodeKind>(packed, chunk, kb, zbase * 16);
+                    const __m512 scale1 = load_native_avx512_nibble_scales<DecodeKind>(packed, chunk, kb, (zbase + 1) * 16);
                     const float a0_scale =
                         nativeQuantisedFP16ScaleToFP32(a0.d);
                     const float a1_scale =
@@ -2402,10 +2401,10 @@ namespace llaminar2::cpu::native_quantised
 
                     for (int group = 0; group < 4; ++group)
                     {
-                        const __m512i raw0 = _mm512_load_si512(
+                        const __m512i raw0 = _mm512_loadu_si512(
                             packed.interleavedB(
                                 chunk, kb, group, zbase));
-                        const __m512i raw1 = _mm512_load_si512(
+                        const __m512i raw1 = _mm512_loadu_si512(
                             packed.interleavedB(
                                 chunk, kb, group, zbase + 1));
                         const __m512i low0 =
@@ -2465,14 +2464,13 @@ namespace llaminar2::cpu::native_quantised
                             (zbase + SEGMENT) * 16;                          \
                         const __m512i bias = _mm512_mullo_epi32(             \
                             bias_128_i32, _mm512_cvtepi16_epi32(             \
-                                _mm256_load_si256(                          \
+                                _mm256_loadu_si256(                         \
                                     reinterpret_cast<const __m256i *>(comp)))); \
                         int0_##SEGMENT = _mm512_sub_epi32(int0_##SEGMENT, bias); \
                         int1_##SEGMENT = _mm512_sub_epi32(int1_##SEGMENT, bias); \
                         int2_##SEGMENT = _mm512_sub_epi32(int2_##SEGMENT, bias); \
                         const __m512 scale = packed.loadScales512(           \
-                            packed.chunkScales(chunk, kb) +                 \
-                                (zbase + SEGMENT) * 16);                     \
+                            chunk, kb, (zbase + SEGMENT) * 16);              \
                         const float a0_scale = nativeQuantisedFP16ScaleToFP32(a0.d); \
                         const float a1_scale = nativeQuantisedFP16ScaleToFP32(a1.d); \
                         const float a2_scale = nativeQuantisedFP16ScaleToFP32(a2.d); \
@@ -2933,8 +2931,9 @@ namespace llaminar2::cpu::native_quantised
             {
                 _mm_prefetch(reinterpret_cast<const char *>(packed.interleavedB(chunk + 1, 0, 0, 0)),
                              _MM_HINT_T1);
-                _mm_prefetch(reinterpret_cast<const char *>(packed.chunkScales(chunk + 1, 0)),
-                             _MM_HINT_T1);
+                if (!packed.usesNibbleLUTSourceScale())
+                    _mm_prefetch(reinterpret_cast<const char *>(packed.chunkScales(chunk + 1, 0)),
+                                 _MM_HINT_T1);
             }
 
             if (n_cols < 64)
@@ -3602,7 +3601,7 @@ namespace llaminar2::cpu::native_quantised
                 // and high-nibble second, exactly matching serial GEMV.
 #define NIBBLE_2ROW_SUBCHUNK(Z, IA0, IA1)                                        \
                 {                                                                \
-                    const __m512i raw = _mm512_load_si512(                       \
+                    const __m512i raw = _mm512_loadu_si512(                       \
                         packed.interleavedB(chunk, kb, group, Z));               \
                     {                                                            \
                         const __m512i decoded = [&]()                            \
@@ -3660,10 +3659,10 @@ namespace llaminar2::cpu::native_quantised
 
             // Bias correction + scale (shared comp/scales loads, per-row a_scale)
             const int16_t *comp_ptr = packed.chunkComp(chunk, kb);
-            __m512i c0 = _mm512_cvtepi16_epi32(_mm256_load_si256(reinterpret_cast<const __m256i *>(comp_ptr)));
-            __m512i c1 = _mm512_cvtepi16_epi32(_mm256_load_si256(reinterpret_cast<const __m256i *>(comp_ptr + 16)));
-            __m512i c2 = _mm512_cvtepi16_epi32(_mm256_load_si256(reinterpret_cast<const __m256i *>(comp_ptr + 32)));
-            __m512i c3 = _mm512_cvtepi16_epi32(_mm256_load_si256(reinterpret_cast<const __m256i *>(comp_ptr + 48)));
+            __m512i c0 = _mm512_cvtepi16_epi32(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(comp_ptr)));
+            __m512i c1 = _mm512_cvtepi16_epi32(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(comp_ptr + 16)));
+            __m512i c2 = _mm512_cvtepi16_epi32(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(comp_ptr + 32)));
+            __m512i c3 = _mm512_cvtepi16_epi32(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(comp_ptr + 48)));
 
             __m512i bias_c0 = _mm512_mullo_epi32(bias_128_i32, c0);
             __m512i bias_c1 = _mm512_mullo_epi32(bias_128_i32, c1);
@@ -3679,11 +3678,10 @@ namespace llaminar2::cpu::native_quantised
             ia1_2 = _mm512_sub_epi32(ia1_2, bias_c2);
             ia1_3 = _mm512_sub_epi32(ia1_3, bias_c3);
 
-            const uint16_t *b_scales = packed.chunkScales(chunk, kb);
-            __m512 bs0 = packed.loadScales512(b_scales);
-            __m512 bs1 = packed.loadScales512(b_scales + 16);
-            __m512 bs2 = packed.loadScales512(b_scales + 32);
-            __m512 bs3 = packed.loadScales512(b_scales + 48);
+            __m512 bs0 = packed.loadScales512(chunk, kb, 0);
+            __m512 bs1 = packed.loadScales512(chunk, kb, 16);
+            __m512 bs2 = packed.loadScales512(chunk, kb, 32);
+            __m512 bs3 = packed.loadScales512(chunk, kb, 48);
 
             const float a0_scale = nativeQuantisedFP16ScaleToFP32(a0.d);
             const float a1_scale = nativeQuantisedFP16ScaleToFP32(a1.d);
@@ -4568,9 +4566,9 @@ namespace llaminar2::cpu::native_quantised
                 for (int group = 0; group < 4; ++group)
                 {
                     const __m512i raw0 =
-                        _mm512_load_si512(packed.interleavedB(chunk, kb, group, zbase));
+                        _mm512_loadu_si512(packed.interleavedB(chunk, kb, group, zbase));
                     const __m512i raw1 =
-                        _mm512_load_si512(packed.interleavedB(chunk, kb, group, zbase + 1));
+                        _mm512_loadu_si512(packed.interleavedB(chunk, kb, group, zbase + 1));
                     const __m512i lo0 = decode_low_nibbles_avx512(
                         raw0, decode_lut, decode_kind, mask_0F, q4_zero_offset);
                     const __m512i lo1 = decode_low_nibbles_avx512(
@@ -4599,9 +4597,9 @@ namespace llaminar2::cpu::native_quantised
 
                 const int16_t *comp_ptr = packed.chunkComp(chunk, kb) + zbase * 16;
                 const __m512i comp0 =
-                    _mm512_cvtepi16_epi32(_mm256_load_si256(reinterpret_cast<const __m256i *>(comp_ptr)));
+                    _mm512_cvtepi16_epi32(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(comp_ptr)));
                 const __m512i comp1 =
-                    _mm512_cvtepi16_epi32(_mm256_load_si256(reinterpret_cast<const __m256i *>(comp_ptr + 16)));
+                    _mm512_cvtepi16_epi32(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(comp_ptr + 16)));
                 const __m512i bias0 = _mm512_mullo_epi32(bias_128_i32, comp0);
                 const __m512i bias1 = _mm512_mullo_epi32(bias_128_i32, comp1);
 
@@ -4612,11 +4610,10 @@ namespace llaminar2::cpu::native_quantised
                 ia1_1 = _mm512_sub_epi32(ia1_1, bias1);
                 ia2_1 = _mm512_sub_epi32(ia2_1, bias1);
 
-                const uint16_t *scale_ptr = packed.chunkScales(chunk, kb) + zbase * 16;
                 const __m512 bscale0 =
-                    packed.loadScales512(scale_ptr);
+                    packed.loadScales512(chunk, kb, zbase * 16);
                 const __m512 bscale1 =
-                    packed.loadScales512(scale_ptr + 16);
+                    packed.loadScales512(chunk, kb, (zbase + 1) * 16);
                 const float a0_scale = nativeQuantisedFP16ScaleToFP32(a0.d);
                 const float a1_scale = nativeQuantisedFP16ScaleToFP32(a1.d);
                 const float a2_scale = nativeQuantisedFP16ScaleToFP32(a2.d);
@@ -4883,7 +4880,7 @@ namespace llaminar2::cpu::native_quantised
                 for (int group = 0; group < 4; ++group)
                 {
                     const __m512i raw =
-                        _mm512_load_si512(packed.interleavedB(chunk, kb, group, z));
+                        _mm512_loadu_si512(packed.interleavedB(chunk, kb, group, z));
                     const __m512i lo = decode_low_nibbles_avx512(
                         raw, decode_lut, decode_kind, mask_0F, q4_zero_offset);
                     const __m512i hi = decode_high_nibbles_avx512(
@@ -4907,7 +4904,7 @@ namespace llaminar2::cpu::native_quantised
 
                 const int16_t *comp_ptr = packed.chunkComp(chunk, kb) + z * 16;
                 const __m512i comp =
-                    _mm512_cvtepi16_epi32(_mm256_load_si256(reinterpret_cast<const __m256i *>(comp_ptr)));
+                    _mm512_cvtepi16_epi32(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(comp_ptr)));
                 const __m512i bias = _mm512_mullo_epi32(bias_128_i32, comp);
 
                 ia0 = _mm512_sub_epi32(ia0, bias);
@@ -4915,9 +4912,9 @@ namespace llaminar2::cpu::native_quantised
                 ia2 = _mm512_sub_epi32(ia2, bias);
                 ia3 = _mm512_sub_epi32(ia3, bias);
 
-                const uint16_t *scale_ptr = packed.chunkScales(chunk, kb) + z * 16;
+
                 const __m512 bscale =
-                    packed.loadScales512(scale_ptr);
+                    packed.loadScales512(chunk, kb, z * 16);
 
                 const float a0_scale = nativeQuantisedFP16ScaleToFP32(a0.d);
                 const float a1_scale = nativeQuantisedFP16ScaleToFP32(a1.d);

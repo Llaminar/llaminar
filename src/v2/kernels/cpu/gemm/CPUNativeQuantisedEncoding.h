@@ -93,7 +93,9 @@ namespace llaminar2::cpu::native_quantised
             .is_asymmetric = prepared_is_asymmetric,
             .weight_bytes_per_n_chunk_k_block =
                 static_cast<std::uint64_t>(preparedInterleavedBlockStride(
-                    encoding, prepared_is_asymmetric, codebook_id)),
+                    encoding, prepared_is_asymmetric, codebook_id)) +
+                (encoding == CPUNativeQuantisedEncoding::Q6KNativeDualScale
+                    ? preparedSuperblockHeaderBytes(encoding, codebook_id) / 8u : 0u),
             .activation_bytes_per_row_k_block = sizeof(Q8_1Block),
             .output_bytes_per_row_n_chunk = 64u * sizeof(float),
         };
@@ -110,6 +112,9 @@ namespace llaminar2::cpu::native_quantised
         auto result = preparedFootprintForFormat(source.codebook_id, source.is_asymmetric, rotation_enabled);
         result.encoding = preparedEncodingForSource(source, rotation_enabled);
         result.weight_bytes_per_n_chunk_k_block = preparedInterleavedBlockStride(result.encoding, result.is_asymmetric, source.codebook_id);
+        if (result.encoding == CPUNativeQuantisedEncoding::Q6KNativeDualScale ||
+            result.encoding == CPUNativeQuantisedEncoding::NibbleLUTSourceScale)
+            result.weight_bytes_per_n_chunk_k_block += preparedSuperblockHeaderBytes(result.encoding, source.codebook_id) / 8u;
         return result;
     }
 

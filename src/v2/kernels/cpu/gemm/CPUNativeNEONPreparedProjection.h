@@ -534,6 +534,48 @@ namespace llaminar2::cpu::native_quantised
         }
 
         /**
+         * @brief Decode four IQ4_XS coefficients from their packed nibble and crumb planes.
+         * @param planes First byte of the block's six-bit code plane.
+         * @param column First column of the four-column strip.
+         * @return Six-bit coefficients as four zero-extended lanes.
+         */
+        template <typename Ops>
+        static typename Ops::I iq4xsCodes(const std::uint8_t *planes, int column) noexcept
+        {
+            std::uint16_t nibbles;
+            std::memcpy(&nibbles, planes + column / 2, sizeof(nibbles));
+            const std::uint32_t crumbs = planes[32 + column / 4];
+            const std::uint32_t bytes = (nibbles & 0x000fu) | ((nibbles & 0x00f0u) << 4) |
+                ((nibbles & 0x0f00u) << 8) | ((nibbles & 0xf000u) << 12) |
+                ((crumbs & 0x03u) << 4) | ((crumbs & 0x0cu) << 10) |
+                ((crumbs & 0x30u) << 16) | ((crumbs & 0xc0u) << 22);
+            return std::bit_cast<typename Ops::I>(vmovl_u16(vget_low_u16(vmovl_u8(vcreate_u8(bytes)))));
+        }
+
+        /**
+         * @brief Read original source-scale factors for one four-column strip.
+         * @tparam Ops Admitted integer instruction implementation.
+         * @tparam Physical Q6_K or IQ4_XS encoding.
+         * @param unit Admitted block address of the current K block.
+         * @param column First of four output columns.
+         * @param block Logical K block owning the code plane.
+         * @return Exact FP32 factors for the two Q6_K halves or the whole IQ4_XS block.
+         */
+        template <typename Ops, Encoding Physical>
+        [[gnu::always_inline]] auto codedScales(const std::uint8_t *unit, int column, int block) const noexcept
+        {
+            constexpr auto codebook = superblockMetadataCodebook(Physical, 8);
+            const auto *plane = unit + preparedCodedPlaneOffset(Physical, weights_.data_stride);
+            const auto *bases = reinterpret_cast<const std::uint16_t *>(weights_.admittedSuperblockHeader(chunk_, block));
+            typename Ops::I code;
+            if constexpr (Physical == Encoding::Q6KNativeDualScale)
+                code = Ops::words(reinterpret_cast<const std::uint16_t *>(plane) + column);
+            else
+                code = iq4xsCodes<Ops>(plane, column);
+            return coded_metadata::sourceScaleFactors<codebook, Ops>(code, Ops::half(bases + column));
+        }
+
+        /**
          * @brief Execute the source's exact block program with a fixed serial/grouped K tree.
          * @tparam Ops Admitted integer instruction implementation.
          * @tparam Policy Backend-native FMA or separately rounded expert program.
@@ -574,8 +616,10 @@ namespace llaminar2::cpu::native_quantised
                         const int last = std::min(first + blocks_per_partition_, weights_.blocks_per_row);
                         for (int block = first; block < last; ++block)
                         {
-                            const auto *unit = weights_.interleavedBase() +
-                                (std::size_t(chunk_) * weights_.blocks_per_row + block) * weights_.interleaved_block_stride;
+                            const auto *unit = preparedSuperblockCoded(Physical)
+                                ? weights_.admittedBlockUnit(chunk_, block)
+                                : weights_.interleavedBase() +
+                                    (std::size_t(chunk_) * weights_.blocks_per_row + block) * weights_.interleaved_block_stride;
                             I low[Rows]{}, high[Rows]{};
                             if constexpr (multi_scale::usesRowPairs<Ops>)
                                 pairBlock<Ops, Physical, Map>(unit, column, block, low, high);
@@ -620,6 +664,16 @@ namespace llaminar2::cpu::native_quantised
                                     }
                                 });
                             }
+                            else if constexpr (Physical == Encoding::NibbleLUTSourceScale && Rows > 1)
+                            {
+#pragma GCC unroll 1
+                                for (int group = 0; group < 4; ++group)
+                                {
+                                    const auto raw = vld1q_u8(unit + group * 256 + column * 4);
+                                    consume<Ops>(nibbles<Map>(vandq_u8(raw, vdupq_n_u8(15))), block, group, low);
+                                    consume<Ops>(nibbles<Map>(vshrq_n_u8(raw, 4)), block, group + 4, low);
+                                }
+                            }
                             else if constexpr (nibble)
                             {
 #pragma GCC unroll 4
@@ -639,27 +693,26 @@ namespace llaminar2::cpu::native_quantised
                             }
                             // BF16 power-of-two words widen by placement alone (exact),
                             // matching the x86 loaders and the scalar view.
-                            F scale0 = kPowerOfTwoBF16Scales<Map>
-                                ? Ops::bf16(weights_.admittedScales(chunk_, block) + column)
-                                : Ops::half(weights_.admittedScales(chunk_, block) + column);
-                            F scale1{};
-                            if constexpr (Physical == Encoding::Q6KNativeDualScale)
+                            F scale0, scale1{};
+                            if constexpr (preparedSuperblockCoded(Physical))
                             {
-                                const I metadata = Ops::words(weights_.admittedMins(chunk_, block) + column);
-                                const I low_coefficient = (metadata & 127) - (metadata & 128);
-                                const I high_coefficient = ((metadata >> 8) & 127) - ((metadata >> 8) & 128);
-                                scale1 = scale0 * __builtin_convertvector(high_coefficient, F);
-                                scale0 = scale0 * __builtin_convertvector(low_coefficient, F);
+                                const auto factors = codedScales<Ops, Physical>(unit, column, block);
+                                scale0 = factors.primary;
+                                scale1 = factors.secondary;
                             }
-                            else if constexpr (Physical == Encoding::IQ3SExpandedSourceScale || Physical == Encoding::NibbleLUTSourceScale)
+                            else
                             {
-                                // The publication seal admitted every coefficient word.
-                                const I metadata = Ops::words(weights_.admittedMins(chunk_, block) + column);
-                                const I coefficient = Physical == Encoding::IQ3SExpandedSourceScale ? metadata * 2 + 1 : metadata - 32;
-                                scale0 = scale0 * __builtin_convertvector(coefficient, F);
+                                scale0 = kPowerOfTwoBF16Scales<Map>
+                                    ? Ops::bf16(weights_.admittedScales(chunk_, block) + column)
+                                    : Ops::half(weights_.admittedScales(chunk_, block) + column);
+                                if constexpr (Physical == Encoding::IQ3SExpandedSourceScale)
+                                {
+                                    const I metadata = Ops::words(weights_.admittedMins(chunk_, block) + column);
+                                    scale0 = scale0 * __builtin_convertvector(metadata * 2 + 1, F);
+                                }
+                                else if constexpr (WithMinimum)
+                                    scale1 = Ops::half(weights_.admittedMins(chunk_, block) + column);
                             }
-                            else if constexpr (WithMinimum)
-                                scale1 = Ops::half(weights_.admittedMins(chunk_, block) + column);
 #pragma GCC unroll 4
                             for (std::size_t row = 0; row < Rows; ++row)
                             {
@@ -770,8 +823,10 @@ namespace llaminar2::cpu::native_quantised
                 const int last = std::min(first + blocks_per_partition_, weights_.blocks_per_row);
                 for (int block = first; block < last; ++block)
                 {
-                    const auto *unit = weights_.interleavedBase() +
-                        (std::size_t(chunk_) * weights_.blocks_per_row + block) * weights_.interleaved_block_stride;
+                    const auto *unit = preparedSuperblockCoded(Physical)
+                        ? weights_.admittedBlockUnit(chunk_, block)
+                        : weights_.interleavedBase() +
+                            (std::size_t(chunk_) * weights_.blocks_per_row + block) * weights_.interleaved_block_stride;
                     I low[Rows][S]{}, high[Rows][S]{};
                     if constexpr (Physical == Encoding::Q6KNativeDualScale)
                     {
@@ -839,26 +894,26 @@ namespace llaminar2::cpu::native_quantised
                     for (int strip = 0; strip < S; ++strip)
                     {
                         const int column = column0 + 4 * strip;
-                        F scale0 = kPowerOfTwoBF16Scales<Map>
-                            ? Ops::bf16(weights_.admittedScales(chunk_, block) + column)
-                            : Ops::half(weights_.admittedScales(chunk_, block) + column);
-                        F scale1{};
-                        if constexpr (Physical == Encoding::Q6KNativeDualScale)
+                        F scale0, scale1{};
+                        if constexpr (preparedSuperblockCoded(Physical))
                         {
-                            const I metadata = Ops::words(weights_.admittedMins(chunk_, block) + column);
-                            const I low_coefficient = (metadata & 127) - (metadata & 128);
-                            const I high_coefficient = ((metadata >> 8) & 127) - ((metadata >> 8) & 128);
-                            scale1 = scale0 * __builtin_convertvector(high_coefficient, F);
-                            scale0 = scale0 * __builtin_convertvector(low_coefficient, F);
+                            const auto factors = codedScales<Ops, Physical>(unit, column, block);
+                            scale0 = factors.primary;
+                            scale1 = factors.secondary;
                         }
-                        else if constexpr (Physical == Encoding::IQ3SExpandedSourceScale || Physical == Encoding::NibbleLUTSourceScale)
+                        else
                         {
-                            const I metadata = Ops::words(weights_.admittedMins(chunk_, block) + column);
-                            const I coefficient = Physical == Encoding::IQ3SExpandedSourceScale ? metadata * 2 + 1 : metadata - 32;
-                            scale0 = scale0 * __builtin_convertvector(coefficient, F);
+                            scale0 = kPowerOfTwoBF16Scales<Map>
+                                ? Ops::bf16(weights_.admittedScales(chunk_, block) + column)
+                                : Ops::half(weights_.admittedScales(chunk_, block) + column);
+                            if constexpr (Physical == Encoding::IQ3SExpandedSourceScale)
+                            {
+                                const I metadata = Ops::words(weights_.admittedMins(chunk_, block) + column);
+                                scale0 = scale0 * __builtin_convertvector(metadata * 2 + 1, F);
+                            }
+                            else if constexpr (WithMinimum)
+                                scale1 = Ops::half(weights_.admittedMins(chunk_, block) + column);
                         }
-                        else if constexpr (WithMinimum)
-                            scale1 = Ops::half(weights_.admittedMins(chunk_, block) + column);
 #pragma GCC unroll 4
                         for (std::size_t row = 0; row < Rows; ++row)
                         {

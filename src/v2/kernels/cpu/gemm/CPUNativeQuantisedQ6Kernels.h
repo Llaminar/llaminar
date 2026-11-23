@@ -23,8 +23,8 @@
  * The VNNI operands are intentionally reversed from the older expanded-INT8
  * kernel.  Unsigned raw Q6 values multiply signed Q8_1 activations, followed
  * by a common `32 * activation_half_sum` centering correction.  This removes
- * all per-column compensation bytes and keeps the prepared block at 1792
- * bytes per 64 columns instead of 2304 bytes.
+ * all per-column compensation bytes. Each block holds 1536 payload bytes
+ * and 128 coefficient bytes; 128 base bytes serve the entire superblock.
  */
 
 #pragma once
@@ -62,23 +62,22 @@ namespace llaminar2::cpu::native_quantised
         };
 
         /**
-         * @brief Widen sixteen original bases and signed coefficient pairs.
-         * @param bases Aligned source FP16 bases, one per output column.
-         * @param coefficients Aligned opaque signed coefficient pairs.
-         * @return Exact FP32 products; finite half times int8 fits FP32 exactly.
+         * @brief Read 16 Q6_K source-scale pairs from the coded planes.
+         * @param packed Admitted Q6_K prepared weights.
+         * @param chunk 64-column chunk index.
+         * @param block Logical 32-value K block.
+         * @param column First column of the strip, a multiple of 16.
+         * @return Exact FP32 factors for the low and high 16-weight dots.
          */
         LLAMINAR_Q6K_EXACT_FP inline SourceScalesAVX512 sourceScalesAVX512(
-            const uint16_t *bases, const uint16_t *coefficients) noexcept
+            const CPUNativeQuantisedPackedWeights &packed, int chunk, int block, int column) noexcept
         {
-            const __m512 base = _mm512_cvtph_ps(_mm256_load_si256(
-                reinterpret_cast<const __m256i *>(bases)));
-            const __m512i words = _mm512_cvtepu16_epi32(_mm256_load_si256(
-                reinterpret_cast<const __m256i *>(coefficients)));
-            const __m512 low = _mm512_cvtepi32_ps(_mm512_srai_epi32(
-                _mm512_slli_epi32(words, 24), 24));
-            const __m512 high = _mm512_cvtepi32_ps(_mm512_srai_epi32(
-                _mm512_slli_epi32(words, 16), 24));
-            return {_mm512_mul_ps(base, low), _mm512_mul_ps(base, high)};
+            using Ops = multi_scale::SIMD<16>;
+            using L = coded_metadata::Lanes<Ops>;
+            const auto factors = coded_metadata::sourceScaleFactors<8, Ops>(
+                L::template code<8>(packed.admittedBlockUnit(chunk, block) + packed.data_stride, column),
+                L::half(L::template superblockWords<8>(packed.admittedSuperblockHeader(chunk, block), column)));
+            return {factors.primary, factors.secondary};
         }
 #endif
 #if defined(__AVX2__)
@@ -90,23 +89,22 @@ namespace llaminar2::cpu::native_quantised
         };
 
         /**
-         * @brief Widen eight original bases and signed coefficient pairs.
-         * @param bases Aligned source FP16 bases, one per output column.
-         * @param coefficients Aligned opaque signed coefficient pairs.
-         * @return Exact FP32 products; finite half times int8 fits FP32 exactly.
+         * @brief Read 8 Q6_K source-scale pairs from the coded planes.
+         * @param packed Admitted Q6_K prepared weights.
+         * @param chunk 64-column chunk index.
+         * @param block Logical 32-value K block.
+         * @param column First column of the strip, a multiple of 8.
+         * @return Exact FP32 factors for the low and high 16-weight dots.
          */
         LLAMINAR_Q6K_EXACT_FP inline SourceScalesAVX256 sourceScalesAVX256(
-            const uint16_t *bases, const uint16_t *coefficients) noexcept
+            const CPUNativeQuantisedPackedWeights &packed, int chunk, int block, int column) noexcept
         {
-            const __m256 base = _mm256_cvtph_ps(_mm_load_si128(
-                reinterpret_cast<const __m128i *>(bases)));
-            const __m256i words = _mm256_cvtepu16_epi32(_mm_load_si128(
-                reinterpret_cast<const __m128i *>(coefficients)));
-            const __m256 low = _mm256_cvtepi32_ps(_mm256_srai_epi32(
-                _mm256_slli_epi32(words, 24), 24));
-            const __m256 high = _mm256_cvtepi32_ps(_mm256_srai_epi32(
-                _mm256_slli_epi32(words, 16), 24));
-            return {_mm256_mul_ps(base, low), _mm256_mul_ps(base, high)};
+            using Ops = multi_scale::SIMD<8>;
+            using L = coded_metadata::Lanes<Ops>;
+            const auto factors = coded_metadata::sourceScaleFactors<8, Ops>(
+                L::template code<8>(packed.admittedBlockUnit(chunk, block) + packed.data_stride, column),
+                L::half(L::template superblockWords<8>(packed.admittedSuperblockHeader(chunk, block), column)));
+            return {factors.primary, factors.secondary};
         }
 #endif
 
@@ -396,8 +394,7 @@ namespace llaminar2::cpu::native_quantised
                                 _mm512_sub_epi32(
                                     dot_high[row][zi], high_center));
                             const auto source_scales = sourceScalesAVX512(
-                                packed.chunkScales(chunk, kb) + z * 16,
-                                packed.chunkMins(chunk, kb) + z * 16);
+                                packed, chunk, kb, z * 16);
                             const __m512 scale_low = source_scales.low;
                             const __m512 scale_high = source_scales.high;
 
@@ -605,13 +602,11 @@ namespace llaminar2::cpu::native_quantised
                     }
 
                     const auto source_scales0 = sourceScalesAVX512(
-                        packed.chunkScales(chunk, kb) + z_base * 16,
-                        packed.chunkMins(chunk, kb) + z_base * 16);
+                        packed, chunk, kb, z_base * 16);
                     const __m512 scale_low0 = source_scales0.low;
                     const __m512 scale_high0 = source_scales0.high;
                     const auto source_scales1 = sourceScalesAVX512(
-                        packed.chunkScales(chunk, kb) + (z_base + 1) * 16,
-                        packed.chunkMins(chunk, kb) + (z_base + 1) * 16);
+                        packed, chunk, kb, (z_base + 1) * 16);
                     const __m512 scale_low1 = source_scales1.low;
                     const __m512 scale_high1 = source_scales1.high;
 
@@ -796,8 +791,7 @@ namespace llaminar2::cpu::native_quantised
                     }
 
                     const auto source_scales = sourceScalesAVX512(
-                        packed.chunkScales(chunk, kb) + z * 16,
-                        packed.chunkMins(chunk, kb) + z * 16);
+                        packed, chunk, kb, z * 16);
                     const __m512 scale_low = source_scales.low;
                     const __m512 scale_high = source_scales.high;
                     fp0 = addScaledDotsAVX512(
@@ -987,8 +981,7 @@ namespace llaminar2::cpu::native_quantised
                                 _mm256_mullo_epi32(
                                     center, _mm256_set1_epi32(high_sum))));
                         const auto source_scales = sourceScalesAVX256(
-                            packed.chunkScales(chunk, kb) + segment * 8,
-                            packed.chunkMins(chunk, kb) + segment * 8);
+                            packed, chunk, kb, segment * 8);
                         const __m256 scale_low = source_scales.low;
                         const __m256 scale_high = source_scales.high;
                         const __m256 low_term =

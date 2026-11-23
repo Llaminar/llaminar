@@ -286,6 +286,28 @@ namespace llaminar2::cpu::native_quantised::coded_metadata
     };
 
     /**
+     * @brief Multiply the original base by the signed source coefficients without half rounding.
+     * @tparam Codebook Physical source-scale codebook: Q6_K or IQ4_XS.
+     * @tparam Ops SIMD lane and half-conversion implementation.
+     * @param code Packed signed-byte pairs (Q6_K) or six-bit ls (IQ4_XS).
+     * @param d Original FP16 bases widened to FP32.
+     * @return Effective FP32 factors for the two Q6_K halves or the entire IQ4_XS block.
+     */
+    template <std::uint8_t Codebook, typename Ops>
+    inline Factors<typename Ops::F> sourceScaleFactors(typename Ops::I code, typename Ops::F d)
+    {
+        using L = Lanes<Ops>;
+        if constexpr (Codebook == 8)
+            return {.primary = d * L::toFloat((code & 127) - (code & 128)),
+                    .secondary = d * L::toFloat(((code >> 8) & 127) - ((code >> 8) & 128))};
+        else
+        {
+            static_assert(Codebook == kNativeQuantisedIQ4XSSourceScaleCodebook);
+            return {.primary = d * L::toFloat(code - 32)};
+        }
+    }
+
+    /**
      * @brief Reconstruct one block's factors for kLanes columns.
      * @tparam Codebook Compact codable codebook other than the source-scale IQ2_S.
      * @param code Codes of the columns.

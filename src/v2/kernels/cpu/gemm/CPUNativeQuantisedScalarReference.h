@@ -11,6 +11,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 
@@ -32,8 +33,9 @@ namespace llaminar2::cpu::native_quantised
      *
      * For nibble-LUT formats (Q4_0, IQ4_NL, Q4_1, IQ4_XS): decodes from payload.
      * For INT8 pre-decoded formats: reads from int8_flat buffer.
-     * Q6 uses the original base/coefficient metadata with separate FP32 edges.
-     * @param packed Prepared source payload and per-block metadata.
+     * Q6_K and IQ4_XS reconstruct the original half base and coefficients
+     * before applying their respective FP32 contribution programs.
+     * @param packed Prepared source payload and metadata.
      * @param A_q8 Unchanged Q8 activation blocks for one row.
      * @param C Destination for N output values.
      * @param N Live output columns, excluding padded allocation capacity.
@@ -215,6 +217,15 @@ namespace llaminar2::cpu::native_quantised
                     }
 
                     int32_t corrected = dot - 128 * b_comp;
+                    if (packed.usesNibbleLUTSourceScale())
+                    {
+                        const float combined = device_fp32_contract::multiply(a_scale, b_scale);
+                        const float dot_fp32 = static_cast<float>(corrected);
+                        acc = packed.numerical_policy == CPUProjectionNumericalPolicy::GPUAlignedExpert
+                            ? device_fp32_contract::add(acc, device_fp32_contract::multiply(combined, dot_fp32))
+                            : std::fma(combined, dot_fp32, acc);
+                        continue;
+                    }
                     acc += static_cast<float>(corrected) * a_scale * b_scale;
 
                     if (packed.is_asymmetric && b_min != 0.0f)

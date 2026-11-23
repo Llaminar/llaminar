@@ -138,7 +138,7 @@ namespace llaminar2::cpu::native_quantised
      * |---|---|
      * | ExpandedInt8 (symmetric or asymmetric) | none; the asymmetric word is an FP16 minimum |
      * | NibbleLUT (any admitted codebook) | none; an FP16 minimum where asymmetric |
-     * | NibbleLUTSourceScale (IQ4_XS) | native_quantised_iq4xs_scale::valid, i.e. <= 63 |
+     * | NibbleLUTSourceScale (IQ4_XS) | none; coded coefficients are six bits |
      * | IQ3SExpandedSourceScale (IQ3_S) | native_quantised_iq3s_scale::valid, i.e. <= 15 |
      * | Q6KNativeDualScale | none; both bytes are signed coefficients |
      * | CompactMultiScale codebook 13 (IQ2_S) | native_quantised_iq2s_scale::valid, i.e. <= 255 |
@@ -278,10 +278,8 @@ namespace llaminar2::cpu::native_quantised
             const CPUNativeQuantisedWeightDescriptor &descriptor, std::span<const std::uint8_t> bytes)
         {
             const auto view = admitStructure(descriptor, bytes);
-            // Coded compact units hold codes and superblock words, every value
-            // of which is in-domain; they have no secondary words to normalize.
-            const bool secondary = view.is_asymmetric || view.usesNibbleLUTSourceScale() ||
-                view.usesIQ3SExpandedSourceScale() || view.usesQ6KNativeDualScale();
+            const bool secondary = !view.superblockCoded() &&
+                (view.is_asymmetric || view.usesIQ3SExpandedSourceScale());
             return {
                 .columns = view.N, .padded_columns = view.N_padded, .blocks_per_row = view.blocks_per_row,
                 .data_stride = view.data_stride, .interleaved_block_stride = view.interleaved_block_stride,
@@ -384,11 +382,14 @@ namespace llaminar2::cpu::native_quantised
         {
             validateColumn(column);
             const std::uint8_t *base = unit(chunk, block);
-            std::uint8_t payload[16]{};
-            compactColumnPayload(base, codebook_id, column, payload);
-            const auto code = coded_metadata::columnCode(base, data_stride, codebook_id, column, payload);
-            const auto word = coded_metadata::loadSuperblockWord(superblockHeader(chunk, block), codebook_id, column);
-            return native_quantised_superblock::decodeSuperblockMetadata(codebook_id, code, word);
+            const auto sb_codebook = superblockMetadataCodebook(encoding, codebook_id);
+            uint8_t payload[16]{};
+            if (native_quantised_superblock::superblockCodeInPayload(sb_codebook))
+                compactColumnPayload(base, codebook_id, column, payload);
+            const auto code = coded_metadata::columnCode(base, preparedCodedPlaneOffset(encoding, data_stride),
+                                                         sb_codebook, column, payload);
+            const auto word = coded_metadata::loadSuperblockWord(superblockHeader(chunk, block), sb_codebook, column);
+            return native_quantised_superblock::decodeSuperblockMetadata(sb_codebook, code, word);
         }
 
         /** @brief Borrow the second source coefficient/scale/minimum vector.
@@ -520,8 +521,6 @@ namespace llaminar2::cpu::native_quantised
             const std::size_t stride = preparedInterleavedBlockStride(descriptor.encoding, descriptor.is_asymmetric, descriptor.source.codebook_id);
             const std::size_t header = preparedSuperblockHeaderBytes(descriptor.encoding, descriptor.source.codebook_id);
             const std::size_t chunks = static_cast<std::size_t>(padded / 64);
-            if (header && blocks % native_quantised_superblock::kBlocksPerSuperblock != 0)
-                throw std::invalid_argument("Superblock-coded CPU weights require whole source superblocks per row");
             if (chunks > std::numeric_limits<std::size_t>::max() / static_cast<std::size_t>(blocks) / (stride + header))
                 throw std::overflow_error("Native CPU weight stream extent overflow");
             const std::size_t extent = CPUNativeQuantisedBlockGeometry{
@@ -619,8 +618,6 @@ namespace llaminar2::cpu::native_quantised
         const char *name = nullptr;
         if (view.usesIQ3SExpandedSourceScale())
         { rule = native_quantised_iq3s_scale::valid; name = "IQ3_S"; }
-        else if (view.usesNibbleLUTSourceScale())
-        { rule = native_quantised_iq4xs_scale::valid; name = "IQ4_XS"; }
         if (rule)
         {
             // Every lane of every unit, padding columns included: native loads

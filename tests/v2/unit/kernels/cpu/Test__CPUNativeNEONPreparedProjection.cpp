@@ -86,8 +86,7 @@ std::vector<Q8_1Block> activationRows(int blocks, int rows)
 int sourceInteger(const CPUNativeQuantisedWeightView &packed, int column, int block, int k)
 {
     const int local = column % 64;
-    const auto *unit = packed.interleavedBase() +
-        (std::size_t(column / 64) * packed.blocks_per_row + block) * packed.interleaved_block_stride;
+    const auto *unit = packed.blockUnit(column / 64, block);
     if (packed.usesExpandedInt8())
     {
         const int raw = unit[(k / 4) * 256 + local * 4 + k % 4];
@@ -294,9 +293,13 @@ template <typename Ops> void verifyTailPadding(const NativeQuantisedFormatInfo &
         NativeQuantisedPreparedByteFixture fixture(source, n, blocks * 32);
         fixture.seedPayloadAndMetadata();
         const auto view = fixture.view();
-        const bool rules = view.usesIQ3SExpandedSourceScale() || view.usesNibbleLUTSourceScale() ||
-            (view.usesCompactMultiScale() && view.codebook_id == 13);
-        if (rules)
+        if (view.superblockCoded())
+        {
+            // Every bit pattern fits the coded planes, but no header bytes may be missing.
+            EXPECT_THROW((void)CPUNativeQuantisedMetadataSeal::validate(fixture.descriptor,
+                fixture.bytes.first(fixture.bytes.size() - 1)), std::invalid_argument);
+        }
+        else if (view.usesIQ3SExpandedSourceScale())
         {
             const int last = view.N_padded / 64 - 1, live = n % 64 == 0 ? 64 : n % 64;
             const std::size_t secondary = std::size_t(view.data_stride) + (view.usesInlineCompensation() ? 256 : 128);
@@ -304,7 +307,7 @@ template <typename Ops> void verifyTailPadding(const NativeQuantisedFormatInfo &
             for (int column = live; column < std::min(64, (live + 3) / 4 * 4 + 4); ++column)
                 for (int block : {0, blocks - 1})
                 {
-                    auto *word = fixture.bytes.data() + (std::size_t(last) * blocks + block) * view.interleaved_block_stride +
+                    auto *word = fixture.bytes.data() + view.geometry().blockOffset(last, block) +
                         secondary + std::size_t(column) * 2;
                     std::uint16_t original = 0;
                     std::memcpy(&original, word, sizeof(original));
@@ -779,11 +782,10 @@ TEST_F(CPUNativeNEONPreparedProjection, RejectsIncompleteAliasedAndUnalignedExpe
 }
 
 /**
- * @test Opaque source words cannot hide reserved bits by masking them into a
- * usable coefficient. Publication admission rejects them before any tile or
- * worker team exists, so no output is ever authored.
+ * @test Publication rejects reserved bits in inline coefficients or a truncated
+ * coded header before a tile can write output.
  */
-TEST_F(CPUNativeNEONPreparedProjection, RejectsReservedSourceCoefficientBitsBeforeAnyWrite)
+TEST_F(CPUNativeNEONPreparedProjection, RejectsInvalidSourceMetadataBeforeAnyWrite)
 {
     for (const auto *source : {&native_quantised_formats::IQ2_S, &native_quantised_formats::IQ3_S, &native_quantised_formats::IQ4_XS})
     {
@@ -791,26 +793,36 @@ TEST_F(CPUNativeNEONPreparedProjection, RejectsReservedSourceCoefficientBitsBefo
         NativeQuantisedPreparedByteFixture fixture(*source, 8, 32);
         fixture.seedPayloadAndMetadata();
         const auto weights = fixture.view();
-        const auto secondary = weights.data_stride + (weights.usesInlineCompensation() ? 256 : 128);
         const auto activation = activationRows(1, 1);
         const std::array<std::span<const Q8_1Block>, 1> input{std::span(activation)};
         std::array<float, 8> result;
         const std::array<std::span<float>, 1> output{std::span(result)};
         CPUNativeNEONProjectionTile<1>::bind(weights, input, output, 0).execute();
         const auto reference = result;
-        // Every lane of the unit, including the 56 padding columns past N=8.
-        for (int bad_column = 0; bad_column < 64; ++bad_column)
+        if (weights.superblockCoded())
         {
-            SCOPED_TRACE(bad_column);
-            std::uint16_t original = 0;
-            auto *word = fixture.bytes.data() + secondary + bad_column * 2;
-            std::memcpy(&original, word, sizeof(original));
-            const std::uint16_t invalid = 0xffff;
-            std::memcpy(word, &invalid, sizeof(invalid));
             result.fill(123.0f);
-            EXPECT_THROW((void)fixture.view(), std::invalid_argument);
+            EXPECT_THROW((void)CPUNativeQuantisedMetadataSeal::validate(fixture.descriptor,
+                fixture.bytes.first(fixture.bytes.size() - 1)), std::invalid_argument);
             for (const float value : result) EXPECT_EQ(value, 123.0f);
-            std::memcpy(word, &original, sizeof(original));
+        }
+        else
+        {
+            const auto secondary = weights.data_stride + (weights.usesInlineCompensation() ? 256 : 128);
+            // Every lane of the unit, including the 56 padding columns past N=8.
+            for (int bad_column = 0; bad_column < 64; ++bad_column)
+            {
+                SCOPED_TRACE(bad_column);
+                std::uint16_t original = 0;
+                auto *word = fixture.bytes.data() + secondary + bad_column * 2;
+                std::memcpy(&original, word, sizeof(original));
+                const std::uint16_t invalid = 0xffff;
+                std::memcpy(word, &invalid, sizeof(invalid));
+                result.fill(123.0f);
+                EXPECT_THROW((void)fixture.view(), std::invalid_argument);
+                for (const float value : result) EXPECT_EQ(value, 123.0f);
+                std::memcpy(word, &original, sizeof(original));
+            }
         }
         result.fill(123.0f);
         CPUNativeNEONProjectionTile<1>::bind(fixture.view(), input, output, 0).execute();

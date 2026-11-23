@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "tensors/NativeQuantisedFormatInfo.h"
 #include "tensors/NativeQuantisedSuperblockMetadata.h"
 
 namespace llaminar2::cpu::native_quantised
@@ -137,6 +138,37 @@ namespace llaminar2::cpu::native_quantised
     }
 
     /**
+     * @brief Physical superblock-coded metadata codebook of a prepared encoding.
+     *
+     * Most encodings use their source codebook directly as the codec's physical
+     * codebook (code plane width and `d`/`dmin` field bytes). IQ4_XS source-scale
+     * units are the exception: the source codebook is 4 (IQ4_NL payload), but the
+     * superblock codec's six-bit `ls` and single `d` fields use the IQ4_XS
+     * source-scale physical codebook 24 (kNativeQuantisedIQ4XSSourceScaleCodebook).
+     * @param encoding Physical prepared encoding.
+     * @param codebook_id Source codebook retained by the prepared matrix.
+     * @return Codebook passed to NativeQuantisedSuperblockMetadata for this unit.
+     */
+    [[nodiscard]] constexpr std::uint8_t superblockMetadataCodebook(
+        CPUNativeQuantisedEncoding encoding, int codebook_id) noexcept
+    {
+        return encoding == CPUNativeQuantisedEncoding::NibbleLUTSourceScale
+                   ? kNativeQuantisedIQ4XSSourceScaleCodebook
+                   : static_cast<std::uint8_t>(codebook_id);
+    }
+
+    /** @brief Offset of the code plane, after payload and any retained IQ4_XS compensation.
+     * @param encoding Physical coded CPU encoding.
+     * @param data_stride Bytes of payload per 64-column unit.
+     * @return Byte offset relative to the admitted block.
+     */
+    [[nodiscard]] constexpr std::uint32_t preparedCodedPlaneOffset(
+        CPUNativeQuantisedEncoding encoding, std::uint32_t data_stride) noexcept
+    {
+        return data_stride + (encoding == CPUNativeQuantisedEncoding::NibbleLUTSourceScale ? 128u : 0u);
+    }
+
+    /**
      * @brief Whether an encoding stores superblock-coded metadata.
      *
      * Coded units carry per-block codes and one superblock word per
@@ -146,7 +178,9 @@ namespace llaminar2::cpu::native_quantised
      */
     [[nodiscard]] constexpr bool preparedSuperblockCoded(CPUNativeQuantisedEncoding encoding) noexcept
     {
-        return encoding == CPUNativeQuantisedEncoding::CompactMultiScale;
+        return encoding == CPUNativeQuantisedEncoding::CompactMultiScale ||
+               encoding == CPUNativeQuantisedEncoding::Q6KNativeDualScale ||
+               encoding == CPUNativeQuantisedEncoding::NibbleLUTSourceScale;
     }
 
     /**
@@ -157,7 +191,8 @@ namespace llaminar2::cpu::native_quantised
         CPUNativeQuantisedEncoding encoding, int codebook_id) noexcept
     {
         return preparedSuperblockCoded(encoding)
-            ? 64u * native_quantised_superblock::superblockFieldBytes(static_cast<std::uint8_t>(codebook_id))
+            ? 64u * native_quantised_superblock::superblockFieldBytes(
+                       superblockMetadataCodebook(encoding, codebook_id))
             : 0u;
     }
 
@@ -257,15 +292,15 @@ namespace llaminar2::cpu::native_quantised
         const std::uint32_t data_stride = preparedDataStride(encoding, codebook_id);
         if (data_stride == 0)
             return 0;
-        if (encoding == CPUNativeQuantisedEncoding::NibbleLUTSourceScale)
-            return 1408;
         if (encoding == CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale)
             return 2432;
-        if (encoding == CPUNativeQuantisedEncoding::Q6KNativeDualScale)
-            return 1792;
-        // Coded compact blocks hold the exact payload and the exact-width code
-        // (64 columns x code bits); the superblock words follow each
-        // eight-block unit (preparedSuperblockHeaderBytes).
+        // Coded blocks hold the exact payload and the exact-width code plane
+        // (64 columns x code bits) inside the unit; the superblock words follow
+        // each eight-block unit (preparedSuperblockHeaderBytes).
+        if (encoding == CPUNativeQuantisedEncoding::Q6KNativeDualScale ||
+            encoding == CPUNativeQuantisedEncoding::NibbleLUTSourceScale)
+            return preparedCodedPlaneOffset(encoding, data_stride) +
+                   8u * native_quantised_superblock::superblockCodePlaneBits(superblockMetadataCodebook(encoding, codebook_id));
         if (encoding == CPUNativeQuantisedEncoding::CompactMultiScale)
             return data_stride + 8u * preparedCompactCodeBits(codebook_id);
         return data_stride + 256u + (is_asymmetric ? 128u : 0u);
