@@ -129,11 +129,12 @@ namespace llaminar2
                 const auto *format = native_quantised_formats::forSourceIdentity(
                     cpu.codebook_id, cpu.is_superblock);
                 if (!format || !hasCompactMultiScaleVnniPayload(cpu.codebook_id) ||
-                    cpu.payload_bytes != format->payload_bytes || !cpu.is_asymmetric)
+                    cpu.payload_bytes != format->payload_bytes || cpu.is_asymmetric != format->is_asymmetric)
                     return reject(error, "Compact multi-scale CPU stream metadata is invalid");
                 codebook = cpu.codebook_id;
                 payload_bytes = static_cast<uint8_t>(format->payload_bytes);
-                is_asymmetric = true;
+                // Single-scale compact units (IQ3_XXS/IQ2_XXS) have no secondary plane.
+                is_asymmetric = format->is_asymmetric;
                 has_emins = format->has_emins;
                 return true;
             }

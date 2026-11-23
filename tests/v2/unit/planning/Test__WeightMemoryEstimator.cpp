@@ -10,6 +10,8 @@
 #include "backends/DeviceId.h"
 #include "kernels/common/NativeEmbeddingLayout.h"
 #include "tensors/NativeQuantisedFormatInfo.h"
+#include "tensors/NativeQuantisedScalePlane.h"
+#include "tensors/NativeQuantisedSuperblockMetadata.h"
 #include "loaders/PreparedWeightRepresentationContract.h"
 #include "execution/moe/MoEExpertProjectionOwnership.h"
 #include "../../utils/EmbeddingVerifierFormats.h"
@@ -203,6 +205,30 @@ namespace
         return formats;
     }
 
+    /**
+     * @brief Expected pool bytes of one immutable source-native GPU matrix.
+     *
+     * CUDA stores superblock sources with superblock-coded metadata (bit-packed
+     * per-block codes plus per-superblock d/dmin); ROCm and non-superblock
+     * sources keep per-block planes. Each region starts on a 256-byte boundary.
+     */
+    size_t expectedGpuPackedBytes(size_t rows, size_t k, const NativeQuantisedFormatInfo &native, DeviceId device)
+    {
+        const auto align = [](size_t bytes) { return (bytes + 255u) & ~size_t(255u); };
+        auto packed = nativeQuantisedPackedRegionSizes(rows, k, native);
+        const uint8_t codebook = canonicalDeviceVnniCodebookId(native);
+        if (device.is_cuda() && native.is_superblock && nativeQuantisedSuperblockCodable(codebook))
+        {
+            const auto planes = native_quantised_superblock::planeBytes(codebook, rows,
+                                                                        static_cast<uint32_t>(k / 32), 0);
+            packed.scales_bytes = planes.code;
+            packed.mins_bytes = planes.superblock;
+            packed.emins_bytes = 0;
+        }
+        return align(packed.payload_bytes) + align(packed.scales_bytes) + align(packed.mins_bytes) +
+               align(packed.emins_bytes);
+    }
+
     const std::vector<ExpectedBytesPerWeight> &gpuFormats()
     {
         static const std::vector<ExpectedBytesPerWeight> formats = {
@@ -290,9 +316,7 @@ TEST(Test__WeightMemoryEstimator, ExactInputAndOutputAxesAllFormatsTP1Through8)
                     {
                         if (const auto *native = native_quantised_formats::forQuantType(format.quant_type))
                         {
-                            const auto pool = nativeQuantisedPackedRegionSizes(65, local_k, *native);
-                            const size_t expected = align(pool.payload_bytes) + align(pool.scales_bytes) +
-                                align(pool.mins_bytes) + align(pool.emins_bytes);
+                            const size_t expected = expectedGpuPackedBytes(65, local_k, *native, device);
                             EXPECT_EQ(bytes.device_bytes, expected) << device.to_string();
                             if (degree == 2)
                             {
@@ -486,7 +510,6 @@ TEST(MoEExpertProjectionOwnership, AllFormatsRetainExactIndependentProjectionGeo
     profile.expert_feed_forward_length = 512;
     profile.expert_count = 24;
     const Ownership::Geometry source{profile.expert_count, profile.d_model, profile.expert_feed_forward_length};
-    const auto align = [](size_t bytes) { return (bytes + 255u) & ~size_t(255u); };
     for (const auto &format : nativeFormats())
     {
         SCOPED_TRACE(format.quant_type);
@@ -525,9 +548,7 @@ TEST(MoEExpertProjectionOwnership, AllFormatsRetainExactIndependentProjectionGeo
                         {
                             if (const auto *native = native_quantised_formats::forQuantType(format.quant_type))
                             {
-                                const auto packed = nativeQuantisedPackedRegionSizes(rows * instances, k, *native);
-                                expected_bytes = align(packed.payload_bytes) + align(packed.scales_bytes) +
-                                    align(packed.mins_bytes) + align(packed.emins_bytes);
+                                expected_bytes = expectedGpuPackedBytes(rows * instances, k, *native, device);
                             }
                             else
                                 expected_bytes = static_cast<size_t>(rows * k * instances * format.bytes_per_weight);
@@ -732,15 +753,21 @@ TEST(Test__WeightMemoryEstimator, SingleDevice_IQProfileUsesCompactGPUPacking)
 
     const auto estimate = WeightMemoryEstimator::estimate(profile, DeviceId::cuda(0));
     const size_t elements = 4096ULL * 4096ULL;
-    const size_t expected_gpu_bytes =
+    // CUDA stores superblock-coded metadata at exactly the GGUF density. IQ3_S
+    // and Q2_K carry a separate bit-packed code plane whose 4 read-padding
+    // bytes cost one more 256-byte region unit each; IQ3_XXS and IQ1_S keep
+    // their code inside the payload and match the file to the byte.
+    EXPECT_EQ(estimate.native_bytes, profile.total_native_bytes);
+    EXPECT_EQ(estimate.device_bytes, profile.total_native_bytes + 2u * 256u);
+
+    // ROCm keeps per-block FP16 planes.
+    const auto rocm = WeightMemoryEstimator::estimate(profile, DeviceId::rocm(0));
+    const size_t expected_rocm_bytes =
         static_cast<size_t>(static_cast<float>(elements) * (17.0f / 32.0f)) +
         static_cast<size_t>(static_cast<float>(elements) * (14.0f / 32.0f)) +
         static_cast<size_t>(static_cast<float>(elements) * (16.0f / 32.0f)) +
         static_cast<size_t>(static_cast<float>(elements) * (10.0f / 32.0f));
-
-    EXPECT_EQ(estimate.native_bytes, profile.total_native_bytes);
-    EXPECT_EQ(estimate.device_bytes, expected_gpu_bytes);
-    EXPECT_LT(estimate.device_bytes, static_cast<size_t>(static_cast<float>(elements * 4) * 1.0f));
+    EXPECT_EQ(rocm.device_bytes, expected_rocm_bytes);
 }
 
 TEST(Test__WeightMemoryEstimator, SingleDevice_NativeBytes)
@@ -778,12 +805,17 @@ TEST(Test__WeightMemoryEstimator, SingleDevice_Q4KUsesCompactGPUPacking)
     profile.total_native_bytes = q4k_tensor.native_bytes;
     profile.tensors.push_back(q4k_tensor);
 
+    // CUDA: 16-byte payload, 12-bit codes and one d|dmin word per superblock
+    // equal Q4_K's 144 bytes per 256 values; the code plane's read padding
+    // costs one extra 256-byte region unit.
     auto estimate = WeightMemoryEstimator::estimate(profile, DeviceId::cuda(0));
-    auto expected_gpu_bytes = static_cast<size_t>(static_cast<float>(q4k_tensor.elements) * (20.0f / 32.0f));
-
+    const size_t file_bytes = q4k_tensor.elements / 256u * 144u;
     EXPECT_EQ(estimate.native_bytes, q4k_tensor.native_bytes);
-    EXPECT_EQ(estimate.device_bytes, expected_gpu_bytes);
-    EXPECT_LT(estimate.device_bytes, static_cast<size_t>(static_cast<float>(q4k_tensor.elements) * 1.0f));
+    EXPECT_EQ(estimate.device_bytes, file_bytes + 256u);
+
+    // ROCm: per-block FP16 scale and minimum planes.
+    auto rocm = WeightMemoryEstimator::estimate(profile, DeviceId::rocm(0));
+    EXPECT_EQ(rocm.device_bytes, static_cast<size_t>(static_cast<float>(q4k_tensor.elements) * (20.0f / 32.0f)));
 }
 
 TEST(Test__WeightMemoryEstimator, QuantizedEmbeddingUsesOriginalNativeBytes)
@@ -808,8 +840,11 @@ TEST(Test__WeightMemoryEstimator, QuantizedEmbeddingUsesOriginalNativeBytes)
             DeviceId::cuda(0));
     const size_t expected_embedding_bytes =
         1000ULL * sizeof(Q4_KBlock);
+    // Tied CUDA head (1000 rows, 2 blocks): payload 32000; 2000 bit-packed
+    // 12-bit codes (3000 B + 4 padding -> 3072); one d|dmin word per row
+    // (4000 -> 4096).
     const size_t expected_tied_lm_head_bytes =
-        32000ULL + 4096ULL + 4096ULL;
+        32000ULL + 3072ULL + 4096ULL;
 
     EXPECT_EQ(
         estimate.prepared_embedding_bytes,
