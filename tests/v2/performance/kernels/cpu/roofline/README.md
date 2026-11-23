@@ -473,6 +473,26 @@ Fixed-depth-seven decode measured 45.075 → 44.190 and 44.683 → 43.579 tok/s
 with the same staged MTP schedule in both arms. The prepared CPU production
 schedule uses the team completion edges.
 
+A separate CPU trial bound only live fragment triplets from the original
+packet's acquired bank and skipped building the GPU routing mask on the CPU.
+It retained the existing bank release edge and CPU arithmetic. The matched
+32-token traces authenticated all 2,976 candidate bindings on rank 1. Mean
+stage setup fell from 23.50 to 9.11 µs and packet service fell from 286.93 to
+251.21 µs. On rank 0, setup fell from 21.21 to 8.73 µs and packet service
+fell from 250.68 to 246.84 µs over 1,488 observed packets.
+
+The same-library Release comparison used one warmup and three measured
+256-token runs in each mode. Both orders matched every generated token and
+MTP count. The experiment remains gated while the fixed-depth result is
+investigated.
+
+| Order | Mode | Decode, original → live binding tok/s | Decode change | Complete throughput change |
+| --- | --- | ---: | ---: | ---: |
+| Candidate first | Ordinary | 32.309 → 32.871 | +1.74% | +1.19% |
+| Control first | Ordinary | 31.270 → 32.269 | +3.19% | +2.33% |
+| Candidate first | Fixed depth seven | 45.492 → 44.672 | −1.80% | −1.36% |
+| Control first | Fixed depth seven | 43.884 → 43.926 | +0.09% | −0.06% |
+
 The sealed IQ4 scale probe resolved the scale program at output-tile entry.
 The IQ4_XS packet loop consumed coefficients validated at weight publication.
 Both sockets, one and two rows per expert, eight and 64 experts, and both
