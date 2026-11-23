@@ -25,6 +25,7 @@
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "kernels/common/NativeQuantisedScaleLoad.h"
 #include "kernels/cuda/gemm/CUDADeviceWorkspace.h"
+#include "kernels/cuda/gemm/CUDANativeQuantisedPrefillDiagnostics.h"
 #include "kernels/common/DeviceRowRange.h"
 #include "kernels/cuda/repack/CUDAVnniRepackKernels.h"
 #include "loaders/gpu_pipeline/RepackFormat.h"
@@ -46,6 +47,8 @@
 extern "C"
 {
     bool cudaNativeQuantisedInitIQGridTables_tuned();
+    void cudaNativeQuantisedPrefill_setForceTile(int);
+    void cudaNativeQuantisedPrefill_getForceTile(int *);
     void cudaNativeQuantisedGemvTuned_setDecodeEquivalentM1Config(int);
     int cudaNativeQuantisedGemvTuned_getDecodeEquivalentM1Config();
     bool cudaNativeQuantisedGemvTuned_fp32_withPolicy(
@@ -332,9 +335,22 @@ namespace llaminar2::test
                 recording.finish();
                 EXPECT_TRUE(ok) << "rows " << rows;
                 EXPECT_TRUE(graph.instantiate());
-                EXPECT_TRUE(graph.launch());
-                checked(cudaStreamSynchronize(stream_));
-                return out.download<uint32_t>();
+                // Retained replay: poison the output before each launch so a
+                // replay that skips publication cannot pass on stale bytes,
+                // and require every replay to produce identical bits.
+                std::vector<uint32_t> first;
+                for (int replay = 0; replay < 3; ++replay)
+                {
+                    checked(cudaMemsetAsync(out.data, 0x5a, out.size, stream_));
+                    EXPECT_TRUE(graph.launch());
+                    checked(cudaStreamSynchronize(stream_));
+                    auto bits = out.download<uint32_t>();
+                    if (replay == 0)
+                        first = std::move(bits);
+                    else
+                        EXPECT_EQ(bits, first) << "replay " << replay << " differs";
+                }
+                return first;
             };
             for (const int rows : {1, 4, max_rows})
             {
@@ -343,6 +359,35 @@ namespace llaminar2::test
                 const auto actual = run(coded, rows);
                 ASSERT_EQ(expected.size(), actual.size());
                 EXPECT_EQ(expected, actual) << "FP32 output bits differ between representations";
+            }
+            // Formats eligible for asynchronous operand staging (16/20-byte
+            // payloads) must match under every forced schedule and output
+            // tile: the coded branch reconstructs words into the same shared
+            // slots the cp.async metadata copies fill.
+            if (payload_bytes == 16 || payload_bytes == 20)
+            {
+                using llaminar2::cuda::prefill::PrefillStagingSchedule;
+                const auto previous_schedule = cudaNativeQuantisedPrefill_getStagingSchedule();
+                int previous_tile = -1;
+                cudaNativeQuantisedPrefill_getForceTile(&previous_tile);
+                for (const int tile : {0, 2, 3, 4, 5})
+                    for (const auto schedule : {PrefillStagingSchedule::RegisterDecode,
+                                                PrefillStagingSchedule::AsyncPayload,
+                                                PrefillStagingSchedule::AsyncWeightOperands,
+                                                PrefillStagingSchedule::AsyncAllOperands})
+                    {
+                        SCOPED_TRACE(::testing::Message() << "tile=" << tile
+                                                          << " staging=" << static_cast<int>(schedule));
+                        cudaNativeQuantisedPrefill_setForceTile(tile);
+                        ASSERT_TRUE(cudaNativeQuantisedPrefill_setStagingSchedule(schedule));
+                        const auto expected = run(legacy, max_rows);
+                        const auto actual = run(coded, max_rows);
+                        EXPECT_EQ(cudaNativeQuantisedPrefill_getLastLaunchStagingSchedule(), schedule)
+                            << "forced staging schedule was not launched";
+                        EXPECT_EQ(expected, actual) << "FP32 output bits differ under forced staging";
+                    }
+                cudaNativeQuantisedPrefill_setForceTile(previous_tile);
+                ASSERT_TRUE(cudaNativeQuantisedPrefill_setStagingSchedule(previous_schedule));
             }
             cudaPrefillContext_destroy(prefill);
             cudaGemvContext_destroy(gemv);

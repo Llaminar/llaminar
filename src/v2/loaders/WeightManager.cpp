@@ -6870,10 +6870,8 @@ namespace llaminar2
             const size_t raw_bytes = bounded ? bounded->sourceBytes() : tensor->size_bytes();
 
             // Dense weights are immutable source-native matrices.
-            std::optional<WeightVRAMPool::SuperblockCodedMetadata> coded;
-            if (gpuPreparedSuperblockCoded(*vnni, GPUPreparedWeightPoolLayout::SourceNative, target_device))
-                coded = WeightVRAMPool::SuperblockCodedMetadata{canonicalDeviceVnniCodebookId(*vnni),
-                                                                gpuWeightSourceSuperblockPhase(*tensor)};
+            const auto coded = gpuPreparedWeightCodedDeclaration(
+                *tensor, GPUPreparedWeightPoolLayout::SourceNative, target_device);
             orchestrator->planWeight(target_device.ordinal, name, N, K,
                                      vnni->payload_bytes, canonicalDeviceVnniFormat(*vnni).is_asymmetric,
                                      vnni->has_emins,
@@ -7056,11 +7054,8 @@ namespace llaminar2
                     }
                     // Every member of a coalesced run shares K, column selection
                     // and therefore one superblock phase.
-                    std::optional<WeightVRAMPool::SuperblockCodedMetadata> coded;
-                    if (gpuPreparedSuperblockCoded(*vnni, layout, target_device))
-                        coded = WeightVRAMPool::SuperblockCodedMetadata{
-                            canonicalDeviceVnniCodebookId(*vnni),
-                            gpuWeightSourceSuperblockPhase(*moe_jobs[first_semantic_index].view)};
+                    const auto coded = gpuPreparedWeightCodedDeclaration(
+                        *moe_jobs[first_semantic_index].view, layout, target_device);
                     orchestrator->planWeight(
                         target_device.ordinal,
                         run.job.name,
