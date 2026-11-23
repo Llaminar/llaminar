@@ -260,11 +260,19 @@ void applyDeepSeekV4BufferLayout(GraphSchema &schema)
     };
     for (auto &spec : schema.model_buffers) widen(spec);
     for (auto &spec : schema.layer_buffers) widen(spec);
-    // DeepSeek-V4 has no Gated DeltaNet layers: drop the inherited GDN scratch
-    // roles, whose geometry formulas resolve to zero for this architecture.
-    const auto gdn = [](const BufferSpec &spec) { return spec.name.rfind("gdn_", 0) == 0; };
-    schema.layer_buffers.erase(std::remove_if(schema.layer_buffers.begin(), schema.layer_buffers.end(), gdn),
-                               schema.layer_buffers.end());
+    // Drop inherited Qwen roots the DeepSeek-V4 graph never binds, so the
+    // device arena (and its admission) holds only live storage:
+    // - gdn_*: no Gated DeltaNet layers;
+    // - fa_q_raw / fa_gate / Q / attn_output: Qwen gated full attention; the
+    //   DeepSeek-V4 attention owns dsv4_q / dsv4_attn instead;
+    // - mtp_*: the MTP sidecar, which DeepSeek-V4 rejects at admission.
+    // At 512 resident rows these were ~620 MiB of never-touched device memory.
+    const auto unused = [](const BufferSpec &spec) {
+        return spec.name.rfind("gdn_", 0) == 0 || spec.name.rfind("mtp_", 0) == 0 || spec.name == "fa_q_raw" ||
+               spec.name == "fa_gate" || spec.name == "Q" || spec.name == "attn_output";
+    };
+    for (auto *buffers : {&schema.layer_buffers, &schema.model_buffers})
+        buffers->erase(std::remove_if(buffers->begin(), buffers->end(), unused), buffers->end());
     for (const auto &entry : declarations)
     {
         const auto duplicate = [&entry](const BufferSpec &spec) { return spec.name == entry.spec.name; };

@@ -131,6 +131,35 @@ TEST(DeepSeekV4Admission, GPUArenaPricesEveryRegisteredRootOnce)
     EXPECT_EQ(deepSeekV4PersistentPoolBytes(releaseGeometry(), 32768), 115154944ull);
 }
 
+/**
+ * @test The device arena holds only roots the DeepSeek-V4 graph binds.
+ *
+ * The inherited Qwen gated-attention (Q, attn_output, fa_q_raw, fa_gate), MTP
+ * sidecar (mtp_*) and GDN (gdn_*) roles were registered and admitted at full
+ * resident-row size although DeepSeek-V4 never touches them: ~620 MiB of the
+ * GB10's shared pool at 512 rows that could otherwise hold KV cache.
+ */
+TEST(DeepSeekV4Admission, ArenaRegistersNoInheritedRootsTheGraphNeverBinds)
+{
+    const auto profile = deepSeekV4Profile();
+    const auto layout = ActivationMemoryEstimator::declareSchemaStorage(profile, graphGeometry(512, 32768),
+                                                                       DeviceId::cuda(0));
+    for (const auto &entry : layout.entries())
+    {
+        const auto &name = entry.descriptor.name;
+        SCOPED_TRACE(name);
+        EXPECT_NE(name.rfind("mtp_", 0), 0u);
+        EXPECT_NE(name.rfind("gdn_", 0), 0u);
+        EXPECT_NE(name, "fa_q_raw");
+        EXPECT_NE(name, "fa_gate");
+        EXPECT_NE(name, "Q");
+        EXPECT_NE(name, "attn_output");
+    }
+    // Release geometry at 512 rows: the whole arena stays below 600 MiB
+    // (it was 1.18 GiB with the inherited roots).
+    EXPECT_LT(linearRootBytes(layout, false), 600ull << 20);
+}
+
 TEST(DeepSeekV4Admission, CanonicalCacheChargesNoKVPayload)
 {
     const auto profile = deepSeekV4Profile();
