@@ -109,6 +109,12 @@ int sourceInteger(const CPUNativeQuantisedWeightView &packed, int column, int bl
         const auto qh = unit[1024 + 32 * (k / 4) + local / 2];
         return nibble + 16 * ((qh >> (4 * (local % 2) + k % 4)) & 1);
     }
+    if (packed.encoding == CPUNativeQuantisedEncoding::Q5NativeSingleScale)
+    {
+        const auto fifth = unit[1024 + local * 4 + (k % 16) / 4];
+        const int bit = k % 4 + (k < 16 ? 0 : 4);
+        return nibble + 16 * ((fifth >> bit) & 1) - (packed.is_asymmetric ? 0 : 16);
+    }
     if (packed.usesQ6KNativeDualScale())
     {
         const auto *planes = unit + 1024 + (k / 4) * 64 + (local / 16) * 16;
@@ -277,7 +283,7 @@ template <typename Ops> void verifyAllCompact()
             }
     }
 }
-/** @brief Cover all registered sources and all six physical encodings on both arithmetic policies. */
+/** @brief Cover all registered sources and physical encodings on both arithmetic policies. */
 template <typename Ops> void verifyAllPrepared()
 {
     for (const auto &source : native_quantised_formats::kAllSourceFormats)

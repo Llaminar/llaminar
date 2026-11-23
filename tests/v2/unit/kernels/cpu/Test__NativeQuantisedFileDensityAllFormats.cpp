@@ -59,16 +59,16 @@ namespace
     };
 
     constexpr PendingDensity pending_density[] = {
-        {&IQ4_XS, 176, 160, "pending lanes g1/mig"},
-        {&Q6_K, 224, 224, "pending lanes g1/mig"},
+        {&IQ4_XS, 152, 160, "pending lanes g2/mig"},
+        {&Q6_K, 0, 224, "pending lane mig"},
         {&Q4_0, 160, 0, "pending lane g2"},
         {&Q4_1, 176, 0, "pending lane g2"},
         {&IQ4_NL, 160, 0, "pending lane g2"},
         {&Q4_K, 176, 160, "pending lanes g2/mig"},
         {&Q8_0, 288, 0, "pending lane g2"},
         {&MXFP4, 160, 0, "pending lane g2"},
-        {&Q5_K, 304, 288, "pending lanes g3/mig"},
-        {&IQ3_S, 304, 136, "pending lanes g3/mig"},
+        {&Q5_K, 0, 288, "pending lane mig"},
+        {&IQ3_S, 0, 136, "pending lane mig"},
         {&Q5_0, 0, 272, "pending lane mig"},
         {&Q5_1, 0, 288, "pending lane mig"},
         {&Q2_K, 0, 128, "pending lane mig"},
