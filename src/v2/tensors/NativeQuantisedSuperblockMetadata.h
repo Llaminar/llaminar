@@ -33,8 +33,10 @@
 
 #if defined(__HIPCC__)
 #include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
 #elif defined(__CUDACC__)
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 #endif
 
 #include "kernels/common/DeviceHalfMetadataContract.h"
@@ -134,6 +136,11 @@ namespace llaminar2::native_quantised_superblock
      */
     LLAMINAR_SUPERBLOCK_META_HD float halfBitsToFloat(std::uint16_t h) noexcept
     {
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
+        // Hardware widening is exact for every binary16 pattern and keeps
+        // decode register pressure at the legacy kernels' level.
+        return __half2float(__ushort_as_half(h));
+#endif
         const std::uint32_t sign = static_cast<std::uint32_t>(h & 0x8000u) << 16;
         std::uint32_t exponent = (h >> 10) & 0x1Fu;
         std::uint32_t mantissa = h & 0x3FFu;
@@ -161,6 +168,25 @@ namespace llaminar2::native_quantised_superblock
         float out;
         std::memcpy(&out, &bits, sizeof(out));
         return out;
+#endif
+    }
+
+    /**
+     * @brief canonicalPreparedHalfBits() with the hardware conversion on device.
+     *
+     * `__float2half_rn` is IEEE round-to-nearest-even like the software
+     * contract; the contract's signed-zero canonicalization is applied here,
+     * and NaN keeps the contract's exact payload rule (cold path only).
+     */
+    LLAMINAR_SUPERBLOCK_META_HD std::uint16_t preparedHalfBits(float value) noexcept
+    {
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
+        if (value != value)
+            return canonicalPreparedHalfBits(value);
+        const std::uint16_t bits = __half_as_ushort(__float2half_rn(value));
+        return bits == 0x8000u ? std::uint16_t{0} : bits;
+#else
+        return canonicalPreparedHalfBits(value);
 #endif
     }
 
@@ -193,47 +219,47 @@ namespace llaminar2::native_quantised_superblock
             const float d = halfBitsToFloat(d_bits);
             if constexpr (Codebook == 15)
             {
-                out.primary = canonicalPreparedHalfBits(d * (0.5f + static_cast<float>(code & 15u)) * 0.25f);
+                out.primary = preparedHalfBits(d * (0.5f + static_cast<float>(code & 15u)) * 0.25f);
             }
             else if constexpr (Codebook == 14)
             {
-                out.primary = canonicalPreparedHalfBits(d * (0.5f + static_cast<float>(code & 15u)) * 0.25f);
-                out.secondary = canonicalPreparedHalfBits(d * (0.5f + static_cast<float>((code >> 4) & 15u)) * 0.25f);
+                out.primary = preparedHalfBits(d * (0.5f + static_cast<float>(code & 15u)) * 0.25f);
+                out.secondary = preparedHalfBits(d * (0.5f + static_cast<float>((code >> 4) & 15u)) * 0.25f);
             }
             else if constexpr (Codebook == 12)
             {
-                out.primary = canonicalPreparedHalfBits(d * (0.5f + static_cast<float>(code & 15u)) * 0.5f);
+                out.primary = preparedHalfBits(d * (0.5f + static_cast<float>(code & 15u)) * 0.5f);
             }
             else if constexpr (Codebook == 16)
             {
                 // code bits 0..2: scale selector; bit 3: delta sign (qh bit 15).
                 const float dl = d * (2.0f * static_cast<float>(code & 7u) + 1.0f);
                 const float delta = (code & 8u) ? -0.125f : 0.125f;
-                out.primary = canonicalPreparedHalfBits(dl);
-                out.secondary = canonicalPreparedHalfBits(dl * delta);
+                out.primary = preparedHalfBits(dl);
+                out.secondary = preparedHalfBits(dl * delta);
             }
             else if constexpr (Codebook == 17)
             {
                 // code bits 0..2: low 3-bit scale; bits 3..5: high 3-bit scale.
-                out.primary = canonicalPreparedHalfBits(d * (2.0f * static_cast<float>(code & 7u) + 1.0f));
-                out.secondary = canonicalPreparedHalfBits(d * (2.0f * static_cast<float>((code >> 3) & 7u) + 1.0f));
+                out.primary = preparedHalfBits(d * (2.0f * static_cast<float>(code & 7u) + 1.0f));
+                out.secondary = preparedHalfBits(d * (2.0f * static_cast<float>((code >> 3) & 7u) + 1.0f));
             }
             else if constexpr (Codebook == 9)
             {
                 // code: two unpacked 6-bit scales (low, high); stored biased by 32.
-                out.primary = canonicalPreparedHalfBits(d * static_cast<float>(static_cast<int>(code & 63u) - 32));
+                out.primary = preparedHalfBits(d * static_cast<float>(static_cast<int>(code & 63u) - 32));
                 out.secondary =
-                    canonicalPreparedHalfBits(d * static_cast<float>(static_cast<int>((code >> 6) & 63u) - 32));
+                    preparedHalfBits(d * static_cast<float>(static_cast<int>((code >> 6) & 63u) - 32));
             }
             else if constexpr (Codebook == 10)
             {
                 // code: original scale bytes of the two 16-value halves (low, high).
                 const float dmin = halfBitsToFloat(static_cast<std::uint16_t>(superblock >> 16));
                 const std::uint32_t lo = code & 0xFFu, hi = (code >> 8) & 0xFFu;
-                out.primary = canonicalPreparedHalfBits(d * static_cast<float>(lo & 0xFu));
-                out.secondary = canonicalPreparedHalfBits(d * static_cast<float>(hi & 0xFu));
-                const std::uint16_t emin_lo = canonicalPreparedHalfBits(-dmin * static_cast<float>(lo >> 4));
-                const std::uint16_t emin_hi = canonicalPreparedHalfBits(-dmin * static_cast<float>(hi >> 4));
+                out.primary = preparedHalfBits(d * static_cast<float>(lo & 0xFu));
+                out.secondary = preparedHalfBits(d * static_cast<float>(hi & 0xFu));
+                const std::uint16_t emin_lo = preparedHalfBits(-dmin * static_cast<float>(lo >> 4));
+                const std::uint16_t emin_hi = preparedHalfBits(-dmin * static_cast<float>(hi >> 4));
                 out.emin = static_cast<std::uint32_t>(emin_lo) | (static_cast<std::uint32_t>(emin_hi) << 16);
             }
         }
