@@ -49,36 +49,30 @@ namespace
         return 0;
     }
 
-    /** @brief Temporary per-plane upper bounds in bytes per 256 values; zero means no exception. */
+    /** @brief Temporary CUDA migration upper bounds in bytes per 256 values. */
     struct PendingDensity
     {
         const NativeQuantisedFormatInfo *format;
-        std::size_t cpu;
         std::size_t cuda_migration;
         std::string_view lane;
     };
 
     constexpr PendingDensity pending_density[] = {
-        {&IQ4_XS, 152, 160, "pending lanes g2/mig"},
-        {&Q6_K, 0, 224, "pending lane mig"},
-        {&Q4_0, 160, 0, "pending lane g2"},
-        {&Q4_1, 176, 0, "pending lane g2"},
-        {&IQ4_NL, 160, 0, "pending lane g2"},
-        {&Q4_K, 176, 160, "pending lanes g2/mig"},
-        {&Q8_0, 288, 0, "pending lane g2"},
-        {&MXFP4, 160, 0, "pending lane g2"},
-        {&Q5_K, 0, 288, "pending lane mig"},
-        {&IQ3_S, 0, 136, "pending lane mig"},
-        {&Q5_0, 0, 272, "pending lane mig"},
-        {&Q5_1, 0, 288, "pending lane mig"},
-        {&Q2_K, 0, 128, "pending lane mig"},
-        {&Q3_K, 0, 128, "pending lane mig"},
-        {&IQ2_XXS, 0, 80, "pending lane mig"},
-        {&IQ2_XS, 0, 104, "pending lane mig"},
-        {&IQ2_S, 0, 104, "pending lane mig"},
-        {&IQ3_XXS, 0, 112, "pending lane mig"},
-        {&IQ1_S, 0, 80, "pending lane mig"},
-        {&IQ1_M, 0, 80, "pending lane mig"},
+        {&IQ4_XS, 160, "pending lane mig"},
+        {&Q6_K, 224, "pending lane mig"},
+        {&Q4_K, 160, "pending lane mig"},
+        {&Q5_K, 288, "pending lane mig"},
+        {&IQ3_S, 136, "pending lane mig"},
+        {&Q5_0, 272, "pending lane mig"},
+        {&Q5_1, 288, "pending lane mig"},
+        {&Q2_K, 128, "pending lane mig"},
+        {&Q3_K, 128, "pending lane mig"},
+        {&IQ2_XXS, 80, "pending lane mig"},
+        {&IQ2_XS, 104, "pending lane mig"},
+        {&IQ2_S, 104, "pending lane mig"},
+        {&IQ3_XXS, 112, "pending lane mig"},
+        {&IQ1_S, 80, "pending lane mig"},
+        {&IQ1_M, 80, "pending lane mig"},
     };
 
     TEST(NativeQuantisedFileDensityAllFormats, LogicalPreparedPlanesDoNotExceedGGUFUnlessExplicitlyPending)
@@ -97,7 +91,7 @@ namespace
             const auto geometry = cpu_nq::preparedBlockGeometry(
                 footprint.encoding, footprint.is_asymmetric, format->codebook_id, blocks);
 
-            PendingDensity pending{nullptr, 0, 0, "no pending lane"};
+            PendingDensity pending{nullptr, 0, "no pending lane"};
             for (const auto &entry : pending_density)
                 if (format == entry.format)
                     pending = entry;
@@ -109,7 +103,7 @@ namespace
                 const std::size_t chunks = (n + 63) / 64;
                 const std::size_t padded_n = chunks * 64;
                 const auto cpu = geometry.matrixBytes(chunks);
-                EXPECT_LE(cpu, padded_n * std::max(gguf, pending.cpu));
+                EXPECT_LE(cpu, padded_n * gguf);
 
                 auto source = nativeQuantisedPackedRegionSizes(n, k, *format);
                 std::size_t code_pad = 0;
