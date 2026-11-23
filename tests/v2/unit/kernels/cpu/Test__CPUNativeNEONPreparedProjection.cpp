@@ -87,13 +87,18 @@ int sourceInteger(const CPUNativeQuantisedWeightView &packed, int column, int bl
 {
     const int local = column % 64;
     const auto *unit = packed.blockUnit(column / 64, block);
-    if (packed.usesExpandedInt8())
+    if (packed.usesExpandedInt8() || (packed.usesCompactMultiScale() && packed.codebook_id == 11))
     {
         const int raw = unit[(k / 4) * 256 + local * 4 + k % 4];
         return raw < 128 ? raw : raw - 256;
     }
     const int raw = unit[((k % 16) / 4) * 256 + local * 4 + k % 4];
     const int nibble = k < 16 ? raw & 15 : raw >> 4;
+    if (packed.usesCompactMultiScale() && packed.codebook_id == 7)
+    {
+        const auto qh = unit[1024 + 32 * (k / 4) + local / 2];
+        return nibble + 16 * ((qh >> (4 * (local % 2) + k % 4)) & 1);
+    }
     if (packed.usesQ6KNativeDualScale())
     {
         const auto *planes = unit + 1024 + (k / 4) * 64 + (local / 16) * 16;
@@ -125,7 +130,7 @@ int sourceInteger(const CPUNativeQuantisedWeightView &packed, int column, int bl
 float appendPreparedReference(const CPUNativeQuantisedWeightView &packed, const Q8_1Block &activation,
     int column, int block, float accumulator)
 {
-    if (packed.usesCompactMultiScale())
+    if (packed.usesCompactMultiScale() && packed.codebook_id != 7 && packed.codebook_id != 11)
         return memoryRoundedAdd(accumulator, ms::scalarReferenceBlock(
             packed, activation, column / 64, block, column % 64));
     int low = 0, high = 0;

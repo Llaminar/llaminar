@@ -89,11 +89,19 @@ public:
                 const std::uint32_t seed = 0x9e3779b9u * (column + 1u) ^ 0x85ebca6bu * (block + 3u);
                 const int words = layout.usesCompactMultiScale() ? preparedCompactPayloadWords(layout.codebook_id) : layout.payload_bytes / 4;
                 const int tail = layout.usesCompactMultiScale() ? preparedCompactPayloadTailBytes(layout.codebook_id) : 0;
-                for (int byte = 0; byte < layout.payload_bytes; ++byte)
+                const bool q5k = layout.usesCompactMultiScale() && layout.codebook_id == 7;
+                const int payload_bytes = layout.usesCompactMultiScale() ? preparedCompactPayloadBytes(layout.codebook_id) : layout.payload_bytes;
+                for (int byte = 0; byte < (q5k ? 16 : payload_bytes); ++byte)
                 {
                     const auto offset = unit + (byte < 4 * words ? (byte / 4) * 256 + local * 4 + byte % 4
                         : words * 256 + local * tail + byte - 4 * words);
                     bytes[offset] = static_cast<std::uint8_t>((seed >> ((byte % 4) * 8)) + byte * 29u);
+                }
+                if (q5k)
+                {
+                    const std::uint8_t qh[]{static_cast<std::uint8_t>(seed), static_cast<std::uint8_t>(seed >> 8),
+                        static_cast<std::uint8_t>(seed >> 16), static_cast<std::uint8_t>(seed >> 24)};
+                    coded_metadata::storeQ5HighBits(bytes.data() + unit + 1024, local, qh);
                 }
                 if (layout.usesInlineCompensation())
                 {
