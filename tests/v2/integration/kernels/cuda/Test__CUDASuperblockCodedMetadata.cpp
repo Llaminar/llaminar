@@ -7,7 +7,10 @@
  * once into the superblock-coded planes (per-block codes plus per-superblock
  * d/dmin). The test proves, for every codable source format and for a column
  * slice whose first block sits mid-superblock (nonzero phase):
- *  - both repacks emit identical payload bytes;
+ *  - both repacks emit identical payload bytes, except the parity bits of
+ *    IQ3_XXS/IQ2_XXS/IQ2_XS sign masks (and IQ2_XS's spare qh nibble), which
+ *    the coded payload uses for its scale code; restoring parity recovers the
+ *    per-block payload exactly;
  *  - the host codec reconstructs every legacy per-block word from the coded
  *    planes at the production addresses (block-major, grouped by phase);
  *  - production GEMV (M=1), grouped small-M GEMV and dense prefill produce
@@ -173,7 +176,10 @@ namespace llaminar2::test
                                              legacy_scales.as<uint16_t>(), legacy_mins.as<uint16_t>(),
                                              legacy_emins.as<uint32_t>(), N, K, N, 0, 0, payload_bytes, selection,
                                              std::uint8_t{0}, stream_));
-            ASSERT_TRUE(launchVnniRepackCUDA(*format, raw.data, coded_payload.as<uint8_t>(), codes.as<uint16_t>(),
+            const bool in_payload = sb::superblockCodeInPayload(codebook);
+            ASSERT_EQ(planes.code, in_payload ? 0u : block_count * sb::superblockCodeBytes(codebook));
+            ASSERT_TRUE(launchVnniRepackCUDA(*format, raw.data, coded_payload.as<uint8_t>(),
+                                             in_payload ? nullptr : codes.as<uint16_t>(),
                                              superblocks.as<uint16_t>(), nullptr, N, K, N, 0, 0, payload_bytes,
                                              selection, layout, stream_));
             // A coded layout with the wrong phase is rejected, never written.
@@ -184,7 +190,26 @@ namespace llaminar2::test
                 stream_));
             checked(cudaStreamSynchronize(stream_));
 
-            ASSERT_EQ(legacy_payload.download<uint8_t>(), coded_payload.download<uint8_t>());
+            const auto legacy_bytes = legacy_payload.download<uint8_t>();
+            const auto coded_bytes = coded_payload.download<uint8_t>();
+            if (!in_payload)
+                ASSERT_EQ(legacy_bytes, coded_bytes);
+            else
+            {
+                // Restoring sign parity (and clearing IQ2_XS's spare qh nibble)
+                // recovers every per-block payload byte.
+                const int signs = codebook == 12 ? 8 : codebook == 15 ? 4 : codebook == 14 ? 5 : -1;
+                for (std::size_t i = 0; i < coded_bytes.size(); ++i)
+                {
+                    const int byte = static_cast<int>(i % payload_bytes);
+                    std::uint8_t value = coded_bytes[i];
+                    if (signs >= 0 && byte >= signs && byte < signs + 4)
+                        value = sb::restoreSignParity(value);
+                    if (codebook == 14 && byte == 4)
+                        value &= 0x0Fu;
+                    ASSERT_EQ(value, legacy_bytes[i]) << "payload byte " << i;
+                }
+            }
 
             // Host codec at the production block-major addresses equals every legacy word.
             const auto scales = legacy_scales.download<uint16_t>();
@@ -199,8 +224,17 @@ namespace llaminar2::test
                 {
                     const auto address = sb::blockMajorAddress(block, row, N, phase);
                     std::uint32_t code = 0, word = 0;
-                    std::memcpy(&code, code_bytes.data() + address.linear * sb::superblockCodeBytes(codebook),
-                                sb::superblockCodeBytes(codebook));
+                    if (in_payload)
+                    {
+                        const auto *block_payload = coded_bytes.data() + address.linear * payload_bytes;
+                        code = codebook == 12   ? sb::codeFromPayload<12>(block_payload)
+                               : codebook == 14 ? sb::codeFromPayload<14>(block_payload)
+                               : codebook == 15 ? sb::codeFromPayload<15>(block_payload)
+                                                : sb::codeFromPayload<16>(block_payload);
+                    }
+                    else
+                        std::memcpy(&code, code_bytes.data() + address.linear * sb::superblockCodeBytes(codebook),
+                                    sb::superblockCodeBytes(codebook));
                     std::memcpy(&word, sb_bytes.data() + address.superblock * sb::superblockFieldBytes(codebook),
                                 sb::superblockFieldBytes(codebook));
                     const auto words = sb::decodeSuperblockMetadata(codebook, code, word);
@@ -216,7 +250,8 @@ namespace llaminar2::test
                 legacy_scales.as<uint16_t>(), consumes_secondary ? legacy_mins.data : nullptr,
                 codebook == 10 ? legacy_emins.as<uint32_t>() : nullptr, 0,
                 NativeQuantisedMetadataRepresentation::PerBlockPlanes};
-            const NativeQuantisedMetadataPlanes coded{codes.as<uint16_t>(), superblocks.data, nullptr, phase,
+            const NativeQuantisedMetadataPlanes coded{in_payload ? coded_payload.as<uint16_t>() : codes.as<uint16_t>(),
+                                                      superblocks.data, nullptr, phase,
                                                       NativeQuantisedMetadataRepresentation::SuperblockCoded};
             constexpr int max_rows = 33;
             std::mt19937 rng(1234u + GetParam());
@@ -249,18 +284,19 @@ namespace llaminar2::test
             cudaPrefillContext_bindWorkspace(prefill, prefill_partials.as<float>(), prefill_bytes);
 
             const auto run = [&](const NativeQuantisedMetadataPlanes &meta, int rows) {
+                const auto *weights = meta.coded() ? coded_payload.as<uint8_t>() : legacy_payload.as<uint8_t>();
                 DeviceBytes out(static_cast<std::size_t>(rows) * N * sizeof(float));
                 bool ok = false;
                 if (rows == 1)
-                    ok = cudaNativeQuantisedGemvTuned_fp32(a.as<int8_t>(), coded_payload.as<uint8_t>(), meta,
+                    ok = cudaNativeQuantisedGemvTuned_fp32(a.as<int8_t>(), weights, meta,
                                                            out.as<float>(), sa.as<float>(), N, K, 1.0f, 0.0f, nullptr,
                                                            nullptr, codebook, 0, stream_, gemv, nullptr);
                 else if (rows <= 8)
                     ok = cudaNativeQuantisedGemvTuned_small_m_fp32(
-                        a.as<int8_t>(), coded_payload.as<uint8_t>(), meta, out.as<float>(), sa.as<float>(), rows, N,
+                        a.as<int8_t>(), weights, meta, out.as<float>(), sa.as<float>(), rows, N,
                         K, 1.0f, 0.0f, nullptr, nullptr, codebook, 0, stream_, gemv, nullptr);
                 else
-                    ok = cudaNativeQuantisedPrefill_fp32(a.as<int8_t>(), coded_payload.as<uint8_t>(), meta,
+                    ok = cudaNativeQuantisedPrefill_fp32(a.as<int8_t>(), weights, meta,
                                                          out.as<float>(), sa.as<float>(), sums.as<int32_t>(), rows,
                                                          N, K, 1.0f, 0.0f, nullptr, nullptr, codebook, 0, stream_,
                                                          prefill);

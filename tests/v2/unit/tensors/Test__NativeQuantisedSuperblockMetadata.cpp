@@ -302,8 +302,8 @@ namespace llaminar2::native_quantised_superblock::test
         const std::uint32_t d32[1] = {0x40003800u};
         for (std::size_t i = 0; i < 4; ++i)
         {
-            const auto got = loadBlockMetadata<14>(codes8, d16, BlockAddress{i, i / 2});
-            const auto want = decodeSuperblockMetadata<14>(codes8[i], d16[i / 2]);
+            const auto got = loadBlockMetadata<13>(codes8, d16, BlockAddress{i, i / 2});
+            const auto want = decodeSuperblockMetadata<13>(codes8[i], d16[i / 2]);
             EXPECT_EQ(got.primary, want.primary);
             EXPECT_EQ(got.secondary, want.secondary);
         }
@@ -311,5 +311,60 @@ namespace llaminar2::native_quantised_superblock::test
         const auto q2_want = decodeSuperblockMetadata<10>(0xABCD, 0x40003800u);
         EXPECT_EQ(q2.primary, q2_want.primary);
         EXPECT_EQ(q2.emin, q2_want.emin);
+    }
+
+    /**
+     * Code-in-payload formats: parity restoration is ksigns_iq2xs for every
+     * seven-bit selector and idempotent on per-block masks; embedding then
+     * extracting returns every code while restoring parity (and IQ2_XS's spare
+     * qh nibble) recovers the original payload byte for byte.
+     */
+    TEST(NativeQuantisedSuperblockMetadata, CodeInPayloadRoundTripsAndRestoresSigns)
+    {
+        for (std::uint32_t index = 0; index < 128; ++index)
+        {
+            const std::uint32_t parity = static_cast<std::uint32_t>(std::popcount(index)) & 1u;
+            const auto mask = static_cast<std::uint8_t>(index | (parity << 7));
+            EXPECT_EQ(restoreSignParity(mask), mask);
+            EXPECT_EQ(restoreSignParity(static_cast<std::uint8_t>(mask ^ 0x80u)), mask);
+        }
+        EXPECT_EQ(superblockCodePlaneBytes(12), 0u);
+        EXPECT_EQ(superblockCodePlaneBytes(13), 1u);
+        EXPECT_EQ(superblockCodePlaneBytes(10), 2u);
+        const auto check = [&]<std::uint8_t Codebook>(std::uint32_t codes) {
+            constexpr std::uint32_t bytes = superblockCodePayloadBytes(Codebook);
+            for (std::uint32_t seed = 0; seed < 64; ++seed)
+                for (std::uint32_t code = 0; code < codes; ++code)
+                {
+                    std::uint8_t legacy[bytes];
+                    for (std::uint32_t i = 0; i < bytes; ++i)
+                        legacy[i] = static_cast<std::uint8_t>(seed * 131u + i * 29u + 7u);
+                    // Legacy invariants: parity-correct sign masks, IQ2_XS qh upper nibble zero,
+                    // IQ1_S qh bits 12..15 hold the code.
+                    const int signs = Codebook == 12 ? 8 : Codebook == 15 ? 4 : Codebook == 14 ? 5 : -1;
+                    if (signs >= 0)
+                        for (int i = 0; i < 4; ++i) legacy[signs + i] = restoreSignParity(legacy[signs + i]);
+                    if constexpr (Codebook == 14) legacy[4] &= 0x0Fu;
+                    if constexpr (Codebook == 16)
+                        legacy[5] = static_cast<std::uint8_t>((legacy[5] & 0x0Fu) | (code << 4));
+                    std::uint8_t coded[bytes];
+                    std::memcpy(coded, legacy, bytes);
+                    embedCodeInPayload<Codebook>(coded, code);
+                    ASSERT_EQ(codeFromPayload<Codebook>(coded), code);
+                    ASSERT_EQ(loadCode<Codebook>(coded, 0), code);
+                    for (std::uint32_t i = 0; i < bytes; ++i)
+                    {
+                        std::uint8_t value = coded[i];
+                        if (signs >= 0 && static_cast<int>(i) >= signs && static_cast<int>(i) < signs + 4)
+                            value = restoreSignParity(value);
+                        if (Codebook == 14 && i == 4) value &= 0x0Fu;
+                        ASSERT_EQ(value, legacy[i]) << int(Codebook) << " byte " << i;
+                    }
+                }
+        };
+        check.template operator()<12>(16);
+        check.template operator()<15>(16);
+        check.template operator()<14>(256);
+        check.template operator()<16>(16);
     }
 } // namespace llaminar2::native_quantised_superblock::test

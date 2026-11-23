@@ -103,6 +103,86 @@ namespace llaminar2::native_quantised_superblock
         }
     }
 
+    /**
+     * @brief Whether a coded matrix keeps its per-block code inside the payload.
+     *
+     * IQ3_XXS (12), IQ2_XXS (15) and IQ2_XS (14) store each sign selector as an
+     * 8-bit mask whose top bit is the even-parity of its seven sign bits, so
+     * the four parity bits of a block are recomputable and carry the 4-bit
+     * scale code instead (IQ2_XS also uses the unused high nibble of its qh
+     * byte for the rest of its 8-bit code). IQ1_S (16) already stores its
+     * scale selector and delta sign in qh bits 12..15. These matrices have no
+     * code plane; the decoder restores sign parity (idempotent for per-block
+     * payloads, whose parity bits are already correct).
+     */
+    LLAMINAR_SUPERBLOCK_META_HD constexpr bool superblockCodeInPayload(std::uint8_t codebook) noexcept
+    {
+        return codebook == 12 || codebook == 14 || codebook == 15 || codebook == 16;
+    }
+
+    /** @return Payload bytes per block of a code-in-payload codebook (0 otherwise). */
+    LLAMINAR_SUPERBLOCK_META_HD constexpr std::uint32_t superblockCodePayloadBytes(std::uint8_t codebook) noexcept
+    {
+        return codebook == 12 ? 12u : codebook == 14 ? 9u : codebook == 15 ? 8u : codebook == 16 ? 6u : 0u;
+    }
+
+    /** @return Bytes per block of the separate code plane (0 when the code lives in the payload). */
+    LLAMINAR_SUPERBLOCK_META_HD constexpr std::uint32_t superblockCodePlaneBytes(std::uint8_t codebook) noexcept
+    {
+        return superblockCodeInPayload(codebook) ? 0u : superblockCodeBytes(codebook);
+    }
+
+    /** @brief Restore the even-parity top bit of a seven-bit IQ sign selector (ksigns_iq2xs). */
+    LLAMINAR_SUPERBLOCK_META_HD constexpr std::uint8_t restoreSignParity(std::uint8_t mask) noexcept
+    {
+        std::uint32_t parity = mask & 0x7Fu;
+        parity ^= parity >> 4;
+        parity ^= parity >> 2;
+        parity ^= parity >> 1;
+        return static_cast<std::uint8_t>((mask & 0x7Fu) | ((parity & 1u) << 7));
+    }
+
+    /**
+     * @brief Read the code of a code-in-payload block.
+     * @param payload The block's payload bytes (coded layout).
+     */
+    template <std::uint8_t Codebook>
+    LLAMINAR_SUPERBLOCK_META_HD std::uint32_t codeFromPayload(const std::uint8_t *payload) noexcept
+    {
+        static_assert(superblockCodeInPayload(Codebook));
+        if constexpr (Codebook == 16)
+            return static_cast<std::uint32_t>(payload[5] >> 4);
+        else
+        {
+            constexpr int signs = Codebook == 12 ? 8 : Codebook == 15 ? 4 : 5;
+            std::uint32_t code = 0;
+            for (int i = 0; i < 4; ++i)
+                code |= static_cast<std::uint32_t>(payload[signs + i] >> 7) << i;
+            if constexpr (Codebook == 14)
+                code |= static_cast<std::uint32_t>(payload[4] >> 4) << 4;
+            return code;
+        }
+    }
+
+    /**
+     * @brief Embed a block code into its (per-block-layout) payload bytes in place.
+     * @param payload Payload exactly as the per-block repack emits it.
+     * @param code Source code (nibble for 12/15, byte for 14; ignored for 16).
+     */
+    template <std::uint8_t Codebook>
+    LLAMINAR_SUPERBLOCK_META_HD void embedCodeInPayload(std::uint8_t *payload, std::uint32_t code) noexcept
+    {
+        static_assert(superblockCodeInPayload(Codebook));
+        if constexpr (Codebook != 16)
+        {
+            constexpr int signs = Codebook == 12 ? 8 : Codebook == 15 ? 4 : 5;
+            for (int i = 0; i < 4; ++i)
+                payload[signs + i] = static_cast<std::uint8_t>((payload[signs + i] & 0x7Fu) | (((code >> i) & 1u) << 7));
+            if constexpr (Codebook == 14)
+                payload[4] = static_cast<std::uint8_t>((payload[4] & 0x0Fu) | ((code >> 4) << 4));
+        }
+    }
+
     /** @return Whether @p codebook uses the superblock-coded representation. */
     LLAMINAR_SUPERBLOCK_META_HD constexpr bool isSuperblockCoded(std::uint8_t codebook) noexcept
     {
@@ -356,7 +436,7 @@ namespace llaminar2::native_quantised_superblock
     LLAMINAR_SUPERBLOCK_META_HD constexpr PlaneBytes planeBytes(std::uint8_t codebook, std::size_t rows,
                                                              std::uint32_t blocks_per_row, std::uint32_t phase) noexcept
     {
-        return {rows * blocks_per_row * superblockCodeBytes(codebook),
+        return {rows * blocks_per_row * superblockCodePlaneBytes(codebook),
                 rows * superblocksPerRow(blocks_per_row, phase) * superblockFieldBytes(codebook)};
     }
 
@@ -367,7 +447,11 @@ namespace llaminar2::native_quantised_superblock
     template <std::uint8_t Codebook>
     LLAMINAR_SUPERBLOCK_META_HD std::uint32_t loadCode(const void *code_plane, std::size_t linear) noexcept
     {
-        if constexpr (superblockCodeBytes(Codebook) == 1)
+        // Code-in-payload matrices bind the payload base as their code plane.
+        if constexpr (superblockCodeInPayload(Codebook))
+            return codeFromPayload<Codebook>(static_cast<const std::uint8_t *>(code_plane) +
+                                             linear * superblockCodePayloadBytes(Codebook));
+        else if constexpr (superblockCodeBytes(Codebook) == 1)
             return static_cast<const std::uint8_t *>(code_plane)[linear];
         else
             return static_cast<const std::uint16_t *>(code_plane)[linear];

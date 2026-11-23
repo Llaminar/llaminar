@@ -154,12 +154,16 @@ namespace llaminar::v2::kernels
                 // Code plane per block, superblock plane per (row, superblock);
                 // both follow the grouped row offset of the packed run.
                 namespace sb = native_quantised_superblock;
-                const size_t code_bytes = sb::superblockCodeBytes(codebook);
+                const size_t code_bytes = sb::superblockCodePlaneBytes(codebook);
                 const size_t field_bytes = sb::superblockFieldBytes(codebook);
                 const size_t superblocks = sb::superblocksPerRow(static_cast<uint32_t>(blocks_per_row),
                     nativeQuantisedLayoutPhase(metadata_layout));
-                scales = static_cast<uint16_t *>(region(slot->d_native_quantised_scales, slot->scales_bytes,
-                    product(offset_blocks, code_bytes), product(length_blocks, code_bytes), slot_name, "scale codes"));
+                // Code-in-payload formats bind the matrix's own payload as their code plane.
+                scales = sb::superblockCodeInPayload(codebook)
+                    ? reinterpret_cast<uint16_t *>(payload)
+                    : static_cast<uint16_t *>(region(slot->d_native_quantised_scales, slot->scales_bytes,
+                          product(offset_blocks, code_bytes), product(length_blocks, code_bytes), slot_name,
+                          "scale codes"));
                 mins = static_cast<uint16_t *>(region(slot->d_native_quantised_mins, slot->mins_bytes,
                     product(product(row_offset, superblocks), field_bytes),
                     product(product(static_cast<size_t>(n), superblocks), field_bytes), slot_name, "superblock scales"));

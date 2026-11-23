@@ -4528,7 +4528,7 @@ extern "C"
         auto *const backend = llaminar2::getCUDABackend();
         const auto release = [&]() {
             backend->free(rm->d_payload, device_id);
-            if (rm->d_primary) backend->free(rm->d_primary, device_id);
+            if (rm->d_primary && rm->d_primary != rm->d_payload) backend->free(rm->d_primary, device_id);
             if (rm->d_secondary) backend->free(rm->d_secondary, device_id);
             if (rm->d_emins) backend->free(rm->d_emins, device_id);
             delete rm;
@@ -4546,7 +4546,9 @@ extern "C"
             // plane transposes to [N, S], exactly rowMajorAddress()'s order.
             const int superblocks = static_cast<int>(
                 sb::superblocksPerRow(static_cast<uint32_t>(K_blocks), meta_col.superblock_phase));
-            rm->d_primary = sb::superblockCodeBytes(codebook_id) == 1
+            // Code-in-payload formats read their codes from the transposed payload.
+            rm->d_primary = sb::superblockCodeInPayload(codebook_id) ? static_cast<void *>(rm->d_payload)
+                : sb::superblockCodeBytes(codebook_id) == 1
                 ? static_cast<void *>(transposeBuffer<uint8_t, 1>(
                       reinterpret_cast<const uint8_t *>(meta_col.primary), N, K_blocks, device_id, s))
                 : static_cast<void *>(transposeBuffer<uint16_t, 2>(meta_col.primary, N, K_blocks, device_id, s));
@@ -4663,10 +4665,11 @@ extern "C"
              */
             std::terminate();
         }
+        // A code-in-payload view aliases its primary plane to the payload.
+        if (rm->d_primary && rm->d_primary != rm->d_payload)
+            backend->free(rm->d_primary, rm->device_id);
         if (rm->d_payload)
             backend->free(rm->d_payload, rm->device_id);
-        if (rm->d_primary)
-            backend->free(rm->d_primary, rm->device_id);
         if (rm->d_secondary)
             backend->free(rm->d_secondary, rm->device_id);
         if (rm->d_emins)
