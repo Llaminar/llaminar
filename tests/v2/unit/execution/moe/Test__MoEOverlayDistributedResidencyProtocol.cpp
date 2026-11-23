@@ -301,7 +301,7 @@ namespace llaminar2::test
             };
         }
 
-        /** @brief Materialize deterministic bytes in a currently admitted Q8_K resident layout. */
+        /** @brief Materialize deterministic bytes in a density-exact Q8_K direct CPU wire layout. */
         cpu::native_quantised::CPUNativeQuantisedPackedWeights cpuProjectionBytes()
         {
             using namespace cpu::native_quantised;
@@ -630,45 +630,26 @@ namespace llaminar2::test
 
     TEST(
         Test__MoEOverlayDistributedResidencyProtocol,
-        CpuGpuManifestUsesWholeRepackUnitsAndRejectsPartialWireCapacity)
+        CpuManifestAdmitsWholeColumnsAndRejectsInconsistentWireCapacity)
     {
         auto fixture = makeTransaction();
         const auto cpu_bytes = cpuProjectionBytes();
         const auto identity = remoteProjectionIdentity(
-            fixture.transaction, DeviceId::cpu(), DeviceId::cuda(0));
-        const auto stream = makeCpuToGpuExpertTierWeightStreamManifest(
-            cpu_bytes,
-            identity.candidate_epoch,
-            identity.layer_idx,
-            identity.expert_id,
-            identity.projection,
-            /*maximum_units_per_chunk=*/1);
-        const auto manifest = makeMoEOverlayRemoteCpuProjectionManifest(
-            identity,
-            stream,
-            /*maximum_chunk_bytes=*/4096);
-
+            fixture.transaction, DeviceId::cpu(), DeviceId(DeviceType::CPU, 1));
+        const auto manifest = makeMoEOverlayRemoteCpuProjectionManifest(identity, cpu_bytes, 73);
         ASSERT_TRUE(manifest.valid());
-        EXPECT_EQ(manifest.maximum_chunk_bytes, manifest.cpu_block_stride);
-        const auto layout = remoteCpuProjectionDeviceLayout(manifest);
-        EXPECT_EQ(
-            layout.direction,
-            ExpertTierWeightConversionDirection::CpuToGpu);
-        EXPECT_EQ(layout.maximum_units_per_chunk, 1u);
-        EXPECT_EQ(layout.unit_count, stream.unit_count);
-        EXPECT_EQ(layout.gpu_codebook_id, stream.gpu_codebook_id);
+        const auto layout = remoteCpuProjectionStorageLayout(manifest, MoEOverlayRemoteCPUStorageEndpoint::Source);
+        EXPECT_EQ(layout.wire_columns_per_unit, 2u);
+        EXPECT_EQ(layout.chunkBytes(1, 0), 68u);
+        EXPECT_EQ(layout.cpuStorageBytes(), cpu_bytes.preparedBytes());
 
         auto partial = manifest;
-        ++partial.maximum_chunk_bytes;
+        partial.maximum_chunk_bytes = 67;
         partial.manifest_hash = partial.computedHash();
         std::string error;
         EXPECT_FALSE(partial.valid(&error));
-        EXPECT_NE(error.find("complete NativeQuantised units"), std::string::npos);
-        EXPECT_THROW(
-            {
-                [[maybe_unused]] const auto rejected =
-                    remoteCpuProjectionDeviceLayout(partial);
-            },
+        EXPECT_NE(error.find("bounded column groups"), std::string::npos);
+        EXPECT_THROW((void)remoteCpuProjectionStorageLayout(partial, MoEOverlayRemoteCPUStorageEndpoint::Source),
             std::invalid_argument);
     }
 
@@ -737,28 +718,13 @@ namespace llaminar2::test
 
     TEST(
         Test__MoEOverlayDistributedResidencyProtocol,
-        CpuDestinationAcceptsOnlyEquivalentAuthenticatedLiveGpuFormat)
+        CpuDestinationAcceptsOnlyExactAuthenticatedManifest)
     {
         auto fixture = makeTransaction();
         const auto cpu_bytes = cpuProjectionBytes();
         const auto identity = remoteProjectionIdentity(
-            fixture.transaction, DeviceId::cuda(0), DeviceId::cpu());
-        const NativeQuantisedFormatInfo *source_format =
-            native_quantised_formats::forSourceIdentity(
-                cpu_bytes.codebook_id, cpu_bytes.is_superblock);
-        ASSERT_NE(source_format, nullptr);
-        const auto canonical_stream =
-            makeGpuToCpuExpertTierWeightStreamManifest(
-                *source_format,
-                cpu_bytes.N,
-                cpu_bytes.K,
-                identity.expected_epoch,
-                identity.layer_idx,
-                identity.expert_id,
-                identity.projection,
-                /*maximum_units_per_chunk=*/1);
-        const auto expected = makeMoEOverlayRemoteCpuProjectionManifest(
-            identity, canonical_stream, /*maximum_chunk_bytes=*/4096);
+            fixture.transaction, DeviceId(DeviceType::CPU, 1), DeviceId::cpu());
+        const auto expected = makeMoEOverlayRemoteCpuProjectionManifest(identity, cpu_bytes, 73);
         const auto live = expected;
 
         std::vector<std::uint8_t> destination_bytes(
@@ -773,9 +739,7 @@ namespace llaminar2::test
             identity,
             regions,
             std::make_shared<int>(2),
-            expected,
-            MoEOverlayRemoteProjectionManifestMatchPolicy::
-                EquivalentGpuSourceForFinalCpuStorage);
+            expected);
         std::string error;
         EXPECT_TRUE(destination.beginManifest(live, &error)) << error;
 
@@ -787,9 +751,7 @@ namespace llaminar2::test
             identity,
             regions,
             std::make_shared<int>(3),
-            expected,
-            MoEOverlayRemoteProjectionManifestMatchPolicy::
-                EquivalentGpuSourceForFinalCpuStorage);
+            expected);
         EXPECT_FALSE(rejecting_destination.beginManifest(
             altered_geometry, &error));
         EXPECT_NE(error.find("physical format"), std::string::npos);

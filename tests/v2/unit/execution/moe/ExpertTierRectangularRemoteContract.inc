@@ -7,23 +7,21 @@
  * does not claim executable prepared-engine/source admission.
  */
 namespace llaminar2::test {
-TEST(Test__MoEOverlayDistributedResidencyProtocol, RectangularCpuGpuSourcesUseOriginalRootAndExistingSendStaging)
+TEST(Test__MoEOverlayDistributedResidencyProtocol, RectangularCpuSourcesUseOriginalRootAndExistingSendStaging)
 {
     using P=MoEExpertProjectionOwnership::Projection;using R=MoEProjectionResidence;
     auto fixture=makeTransaction();const auto cpu=cpuProjectionBytes();
     const P originalCPU{R::ParticipantOutputSlice,128,128,5,32,32,64};
-    const P originalGPU{R::ParticipantInputSlice,128,128,17,50,64,64};
-    const auto upIdentity=remoteProjectionIdentity(fixture.transaction,DeviceId::cpu(),DeviceId::cuda(0));
-    const auto up=makeCpuToGpuExpertTierWeightStreamManifest(cpu,upIdentity.candidate_epoch,
-        upIdentity.layer_idx,upIdentity.expert_id,upIdentity.projection,1)
-        .forIntersection(ExpertTierWeightProjectionIntersection::between(originalCPU,originalGPU));
-    const auto outgoing=makeMoEOverlayRemoteCpuProjectionManifest(upIdentity,up,4096);
+    const P peerCPU{R::ParticipantInputSlice,128,128,17,50,64,64};
+    const auto upIdentity=remoteProjectionIdentity(fixture.transaction,DeviceId::cpu(),DeviceId(DeviceType::CPU,1));
+    const auto outgoing=makeMoEOverlayRemoteCpuProjectionManifest(upIdentity,cpu,4096)
+        .forCPUIntersection(ExpertTierWeightProjectionIntersection::between(originalCPU,peerCPU));
     ASSERT_TRUE(outgoing.valid());
     std::array<uint8_t,MoEOverlayRemoteProjectionManifest::kWireBytes> packet{};
     ASSERT_TRUE(encodeMoEOverlayRemoteProjectionManifest(outgoing,packet));
     MoEOverlayRemoteProjectionManifest decoded;
     ASSERT_TRUE(decodeMoEOverlayRemoteProjectionManifest(packet,&decoded));
-    EXPECT_EQ(decoded,outgoing);EXPECT_EQ(decoded.source_projection,originalCPU);EXPECT_EQ(decoded.destination_projection,originalGPU);
+    EXPECT_EQ(decoded,outgoing);EXPECT_EQ(decoded.source_projection,originalCPU);EXPECT_EQ(decoded.destination_projection,peerCPU);
     const std::array<std::span<const uint8_t>,4> sourceRegions{
         std::span<const uint8_t>(cpu.native_interleaved.data(),cpu.native_interleaved.size()),{},{},{}};
     MoEOverlayHostRemoteProjectionSource sender(outgoing,sourceRegions,std::make_shared<int>(1));
@@ -32,7 +30,7 @@ TEST(Test__MoEOverlayDistributedResidencyProtocol, RectangularCpuGpuSourcesUseOr
     EXPECT_EQ(sender.pollNextChunk(&chunk,&error),MoEOverlayResidencyWaveProgress::Failed);
     EXPECT_EQ(staging,untouchedStaging);
     ASSERT_EQ(sender.pollNextChunk(&chunk,&error,staging),MoEOverlayResidencyWaveProgress::Ready) << error;
-    EXPECT_EQ(chunk.payload.size(),size_t(20)*(up.cpu_block_stride/64));
+    EXPECT_EQ(chunk.payload.size(),size_t(20)*(outgoing.cpu_block_stride/64));
     EXPECT_EQ(outgoing.total_bytes,chunk.payload.size());EXPECT_TRUE(chunk.header.final_chunk);
     EXPECT_EQ(chunk.payload.data(),staging.data());
     const std::vector<uint8_t> transmitted(chunk.payload.begin(),chunk.payload.end()),heldStage=staging;
@@ -41,11 +39,9 @@ TEST(Test__MoEOverlayDistributedResidencyProtocol, RectangularCpuGpuSourcesUseOr
     EXPECT_EQ(staging,heldStage);
     ASSERT_TRUE(sender.acknowledgeChunkSent(chunk.header,&error));
 
-    const auto downIdentity=remoteProjectionIdentity(fixture.transaction,DeviceId::cuda(0),DeviceId::cpu());
-    const auto down=makeGpuToCpuExpertTierWeightStreamManifest(native_quantised_formats::Q8_K,50,64,
-        downIdentity.expected_epoch,downIdentity.layer_idx,downIdentity.expert_id,downIdentity.projection,1)
-        .forIntersection(ExpertTierWeightProjectionIntersection::between(originalGPU,originalCPU));
-    const auto incoming=makeMoEOverlayRemoteCpuProjectionManifest(downIdentity,down,4096);
+    const auto downIdentity=remoteProjectionIdentity(fixture.transaction,DeviceId(DeviceType::CPU,1),DeviceId::cpu());
+    const auto incoming=makeMoEOverlayRemoteCpuDestinationProjectionManifest(downIdentity,cpu,
+        ExpertTierWeightProjectionIntersection::between(peerCPU,originalCPU),4096);
     std::vector<uint8_t> destination(cpu.native_interleaved.size(),0xa5);
     const std::array<std::span<uint8_t>,4> destinationRegions{std::span<uint8_t>(destination),{},{},{}};
     MoEOverlayHostRemoteProjectionDestination receiver(downIdentity,destinationRegions,std::make_shared<int>(2),incoming);
@@ -57,7 +53,7 @@ TEST(Test__MoEOverlayDistributedResidencyProtocol, RectangularCpuGpuSourcesUseOr
     EXPECT_EQ(destination,before);
     ASSERT_EQ(receiver.beginChunk(header,transmitted,&error),MoEOverlayResidencyWaveProgress::Ready) << error;
     std::vector<uint8_t> observed(transmitted.size());
-    ASSERT_TRUE(gatherExpertTierCPUWeightChunk(down.deviceLayout(),destination,0,1,observed));
+    ASSERT_TRUE(gatherExpertTierCPUWeightChunk(remoteCpuProjectionStorageLayout(incoming,MoEOverlayRemoteCPUStorageEndpoint::Destination),destination,0,1,observed));
     EXPECT_EQ(observed,transmitted);
     EXPECT_EQ(std::memcmp(destination.data(),before.data(),cpu.interleaved_block_stride),0)
         << "the nonintersecting original K block must remain untouched";
