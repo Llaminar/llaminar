@@ -535,7 +535,7 @@ namespace llaminar2::native_quantised_superblock
         }
     }
 
-#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
+#if defined(__CUDACC__) || defined(__HIPCC__)
     /**
      * @brief Store @p bits of @p value at bit @p bit of a 4-byte-aligned plane.
      *
