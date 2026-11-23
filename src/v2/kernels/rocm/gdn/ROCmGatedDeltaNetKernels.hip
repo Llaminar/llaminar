@@ -1931,10 +1931,10 @@ void rocm_gdn_scalar_prepared_qk_conv_kernel(
 }
 
 __global__ void rocm_short_conv1d_decode_kernel(
-    const float *__restrict__ input,
+    const float *input,
     const float *__restrict__ weight,
     const float *__restrict__ bias,
-    float *__restrict__ output,
+    float *output,
     const float *initial_conv_state,
     float *updated_conv_state,
     int channels, int kernel_size,
@@ -1950,7 +1950,9 @@ __global__ void rocm_short_conv1d_decode_kernel(
     float sum = 0.0f;
     for (int k = 0; k < ks_minus1; k++)
         sum += initial_conv_state[ch * ks_minus1 + k] * weight[ch * kernel_size + k];
-    sum += input[ch] * weight[ch * kernel_size + ks_minus1];
+    // Preserve the raw projection before publishing a possibly aliased output.
+    const float raw_input = input[ch];
+    sum += raw_input * weight[ch * kernel_size + ks_minus1];
 
     if (bias) sum += bias[ch];
     if (apply_silu)
@@ -1961,7 +1963,7 @@ __global__ void rocm_short_conv1d_decode_kernel(
     for (int k = 0; k < ks_minus1 - 1; k++)
         updated_conv_state[ch * ks_minus1 + k] =
             initial_conv_state[ch * ks_minus1 + k + 1];
-    updated_conv_state[ch * ks_minus1 + ks_minus1 - 1] = input[ch];
+    updated_conv_state[ch * ks_minus1 + ks_minus1 - 1] = raw_input;
 }
 
 __global__ void rocm_short_conv1d_prefill_kernel(
@@ -2034,6 +2036,7 @@ __global__ void rocm_short_conv1d_prefill_kernel(
  * commits speculative state once all reads from the old channel history finish.
  * There is one launch for the complete matrix and no row replay.
  */
+template<bool AliasedSnapshot = false>
 __global__ void rocm_short_conv1d_small_m_kernel(
     const float *__restrict__ input,
     const float *__restrict__ weight,
@@ -2070,8 +2073,13 @@ __global__ void rocm_short_conv1d_small_m_kernel(
             ? initial_conv_state + static_cast<size_t>(ch) * ks_minus1
             : nullptr;
 
-    for (int t = 0; t < seq_len; ++t)
+    // With a complete snapshot matrix, each earlier raw row stays live
+    // until its last consumer. Visit aliases back to front and author
+    // the immutable raw snapshot before overwriting the current row.
+    const float *const original = AliasedSnapshot ? output : input;
+    for (int row = 0; row < seq_len; ++row)
     {
+        const int t = AliasedSnapshot ? seq_len - 1 - row : row;
         float sum = 0.0f;
         if (t < effective_seq_len)
         {
@@ -2080,7 +2088,7 @@ __global__ void rocm_short_conv1d_small_m_kernel(
                 const int src_t = t - ks_minus1 + k;
                 const float val =
                     (src_t >= 0)
-                        ? input[static_cast<size_t>(src_t) * channels + ch]
+                        ? original[static_cast<size_t>(src_t) * channels + ch]
                         : (channel_initial_state
                                ? channel_initial_state[ks_minus1 + src_t]
                                : 0.0f);
@@ -2092,7 +2100,6 @@ __global__ void rocm_short_conv1d_small_m_kernel(
             if (apply_silu)
                 sum = sum / (1.0f + expf(-sum));
         }
-        output[static_cast<size_t>(t) * channels + ch] = sum;
 
         if (state_snapshots && t < effective_seq_len && t < max_snapshot_rows)
         {
@@ -2105,13 +2112,17 @@ __global__ void rocm_short_conv1d_small_m_kernel(
                 const int src_t = t - ks_minus1 + 1 + state_idx;
                 snapshot[state_idx] =
                     (src_t >= 0)
-                        ? input[static_cast<size_t>(src_t) * channels + ch]
+                        ? original[static_cast<size_t>(src_t) * channels + ch]
                         : (channel_initial_state
                                ? channel_initial_state[ks_minus1 + src_t]
                                : 0.0f);
             }
         }
+        output[static_cast<size_t>(t) * channels + ch] = sum;
     }
+
+    if constexpr (AliasedSnapshot)
+        return; // The complete snapshot owns terminal state publication.
 
     const bool terminal_state_is_snapshotted =
         state_snapshots != nullptr && max_snapshot_rows >= seq_len;
@@ -2124,7 +2135,7 @@ __global__ void rocm_short_conv1d_small_m_kernel(
             const int src_t = effective_seq_len - ks_minus1 + state_idx;
             state[state_idx] =
                 (src_t >= 0 && src_t < effective_seq_len)
-                    ? input[static_cast<size_t>(src_t) * channels + ch]
+                    ? original[static_cast<size_t>(src_t) * channels + ch]
                     : channel_initial_state[ks_minus1 + src_t];
         }
     }
@@ -3829,15 +3840,21 @@ bool rocmGDN_short_conv1d(
     if (complete_verifier_capture) {
         int threads = 256;
         int blocks = (channels + threads - 1) / threads;
-        hipLaunchKernelGGL(rocm_short_conv1d_small_m_kernel,
-            dim3(blocks), dim3(threads), 0, (hipStream_t)stream,
-            input, weight, bias, output,
-            initial_conv_state, updated_conv_state,
-            nullptr,
-            state_snapshots,
-            snapshot_stride_floats,
-            max_snapshot_rows,
-            seq_len, channels, kernel_size, apply_silu);
+        const auto submit = [&]<bool Aliased>() {
+            hipLaunchKernelGGL((rocm_short_conv1d_small_m_kernel<Aliased>),
+                dim3(blocks), dim3(threads), 0, (hipStream_t)stream,
+                input, weight, bias, output,
+                initial_conv_state, updated_conv_state,
+                nullptr,
+                state_snapshots,
+                snapshot_stride_floats,
+                max_snapshot_rows,
+                seq_len, channels, kernel_size, apply_silu);
+        };
+        if (input == output)
+            submit.template operator()<true>();
+        else
+            submit.template operator()<false>();
     } else if (seq_len == 1) {
         int threads = 256;
         int blocks = (channels + threads - 1) / threads;
@@ -3849,7 +3866,7 @@ bool rocmGDN_short_conv1d(
     } else if (seq_len <= 4) {
         int threads = 256;
         int blocks = (channels + threads - 1) / threads;
-        hipLaunchKernelGGL(rocm_short_conv1d_small_m_kernel,
+        hipLaunchKernelGGL((rocm_short_conv1d_small_m_kernel<false>),
             dim3(blocks), dim3(threads), 0, (hipStream_t)stream,
             input, weight, bias, output,
             initial_conv_state, updated_conv_state,
@@ -3932,15 +3949,21 @@ bool rocmGDN_short_conv1d_effective_with_policy(
     if (complete_verifier_capture) {
         int threads = 256;
         int blocks = (channels + threads - 1) / threads;
-        hipLaunchKernelGGL(rocm_short_conv1d_small_m_kernel,
-            dim3(blocks), dim3(threads), 0, (hipStream_t)stream,
-            input, weight, bias, output,
-            initial_conv_state, updated_conv_state,
-            device_effective_seq_len,
-            state_snapshots,
-            snapshot_stride_floats,
-            max_snapshot_rows,
-            seq_len, channels, kernel_size, apply_silu);
+        const auto submit = [&]<bool Aliased>() {
+            hipLaunchKernelGGL((rocm_short_conv1d_small_m_kernel<Aliased>),
+                dim3(blocks), dim3(threads), 0, (hipStream_t)stream,
+                input, weight, bias, output,
+                initial_conv_state, updated_conv_state,
+                device_effective_seq_len,
+                state_snapshots,
+                snapshot_stride_floats,
+                max_snapshot_rows,
+                seq_len, channels, kernel_size, apply_silu);
+        };
+        if (input == output)
+            submit.template operator()<true>();
+        else
+            submit.template operator()<false>();
     } else if (seq_len == 1) {
         int threads = 256;
         int blocks = (channels + threads - 1) / threads;
@@ -3952,7 +3975,7 @@ bool rocmGDN_short_conv1d_effective_with_policy(
     } else if (seq_len <= 4) {
         int threads = 256;
         int blocks = (channels + threads - 1) / threads;
-        hipLaunchKernelGGL(rocm_short_conv1d_small_m_kernel,
+        hipLaunchKernelGGL((rocm_short_conv1d_small_m_kernel<false>),
             dim3(blocks), dim3(threads), 0, (hipStream_t)stream,
             input, weight, bias, output,
             initial_conv_state, updated_conv_state,

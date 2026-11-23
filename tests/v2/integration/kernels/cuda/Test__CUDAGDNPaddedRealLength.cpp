@@ -4870,9 +4870,8 @@ TEST_F(Test__CUDAGDNPaddedRealLength, CapturedVerifierAndDecodeRecurrencePublica
 /**
  * @brief Prove captured in-place short-conv decode survives accepted-row publication.
  *
- * Qwen3.6 feeds its 10,240-wide merged QKV projection through short-conv in
- * place.  The captured graph therefore includes both the convolution kernel
- * and its scratch-to-output copy. This sweep publishes every possible row for
+ * The captured scalar continuation owns its aliased output and raw history
+ * in one native kernel. This sweep publishes every possible verifier row for
  * M=2..16 and M=31 through a device scalar, compares every grouped output row
  * with scalar decode, then requires the original executable and resulting live
  * history bytes to match serial M=1 continuation exactly.
@@ -4902,6 +4901,7 @@ TEST_F(Test__CUDAGDNPaddedRealLength, CapturedVerifierAndDecodeShortConvPublicat
     CudaFloatBuffer d_oracle_verifier(verifier_input);
     CudaFloatBuffer d_replay_continuation(continuation_input);
     CudaFloatBuffer d_oracle_continuation(continuation_input);
+    CudaFloatBuffer d_oracle_continuation_output(channels, -77.0f);
     CudaFloatBuffer d_weight(weight);
     CudaFloatBuffer d_bias(bias);
     CudaFloatBuffer d_snapshots(
@@ -4911,8 +4911,6 @@ TEST_F(Test__CUDAGDNPaddedRealLength, CapturedVerifierAndDecodeShortConvPublicat
 
     CUDAShortConvolution live_kernel(cuda_ordinal_);
     CudaGDNStateOwner live_kernel_state_owner(live_kernel, state_floats);
-    live_kernel_state_owner.bindScratch(
-        live_kernel, max_verifier_rows * channels);
     live_kernel.setGPUStream(stream.stream);
     live_kernel.bindVerifierStateCaptureWorkspace(nullptr, 0, state_floats);
     live_kernel.bindSpeculativeStateWorkspace(nullptr, state_floats);
@@ -4932,6 +4930,18 @@ TEST_F(Test__CUDAGDNPaddedRealLength, CapturedVerifierAndDecodeShortConvPublicat
                 kernel_size,
                 /*apply_silu=*/true);
         });
+
+    const auto expectOneKernel = [](const CudaCapturedGraph &captured) {
+        std::size_t count = 0;
+        checkCuda(cudaGraphGetNodes(captured.graph, nullptr, &count), "inspect direct convolution");
+        ASSERT_EQ(count, 1u);
+        cudaGraphNode_t node{};
+        checkCuda(cudaGraphGetNodes(captured.graph, &node, &count), "inspect convolution entry");
+        cudaGraphNodeType kind{};
+        checkCuda(cudaGraphNodeGetType(node, &kind), "inspect convolution node kind");
+        ASSERT_EQ(kind, cudaGraphNodeTypeKernel);
+    };
+    ASSERT_NO_FATAL_FAILURE(expectOneKernel(captured_decode));
 
     CUDAShortConvolution oracle_kernel(cuda_ordinal_);
     CudaGDNStateOwner oracle_kernel_state_owner(oracle_kernel, state_floats);
@@ -4960,6 +4970,8 @@ TEST_F(Test__CUDAGDNPaddedRealLength, CapturedVerifierAndDecodeShortConvPublicat
                     kernel_size,
                     /*apply_silu=*/true);
             });
+
+        ASSERT_NO_FATAL_FAILURE(expectOneKernel(captured_verifier));
 
         for (int accepted_row = 0; accepted_row < verifier_rows; ++accepted_row)
         {
@@ -5024,7 +5036,7 @@ TEST_F(Test__CUDAGDNPaddedRealLength, CapturedVerifierAndDecodeShortConvPublicat
                 d_oracle_continuation.ptr,
                 d_weight.ptr,
                 d_bias.ptr,
-                d_oracle_continuation.ptr,
+                d_oracle_continuation_output.ptr,
                 nullptr,
                 1,
                 channels,
@@ -5055,7 +5067,7 @@ TEST_F(Test__CUDAGDNPaddedRealLength, CapturedVerifierAndDecodeShortConvPublicat
                 grouped_row.size());
 
             const auto replay_output = d_replay_continuation.toHost();
-            const auto oracle_output = d_oracle_continuation.toHost();
+            const auto oracle_output = d_oracle_continuation_output.toHost();
             expectByteExactEquivalent(
                 "CUDA captured short-conv continuation output",
                 replay_output,

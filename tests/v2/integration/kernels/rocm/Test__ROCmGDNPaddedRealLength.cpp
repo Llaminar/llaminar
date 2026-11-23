@@ -4133,6 +4133,7 @@ TEST(Test__ROCmGDNPaddedRealLength, CapturedVerifierAndDecodeShortConvPublicatio
     HipFloatBuffer d_oracle_verifier(verifier_input);
     HipFloatBuffer d_replay_continuation(continuation_input);
     HipFloatBuffer d_oracle_continuation(continuation_input);
+    HipFloatBuffer d_oracle_continuation_output(channels, -77.0f);
     HipFloatBuffer d_weight(weight);
     HipFloatBuffer d_bias(bias);
     HipFloatBuffer d_snapshots(
@@ -4142,8 +4143,6 @@ TEST(Test__ROCmGDNPaddedRealLength, CapturedVerifierAndDecodeShortConvPublicatio
 
     ROCmShortConvolution live_kernel(0);
     HipGDNStateOwner live_kernel_state_owner(live_kernel, state_floats);
-    live_kernel_state_owner.bindScratch(
-        live_kernel, max_verifier_rows * channels);
     live_kernel.setGPUStream(stream.stream);
     live_kernel.bindVerifierStateCaptureWorkspace(nullptr, 0, state_floats);
     live_kernel.bindSpeculativeStateWorkspace(nullptr, state_floats);
@@ -4163,6 +4162,18 @@ TEST(Test__ROCmGDNPaddedRealLength, CapturedVerifierAndDecodeShortConvPublicatio
                 kernel_size,
                 /*apply_silu=*/true);
         });
+
+    const auto expectOneKernel = [](const HipCapturedGraph &captured) {
+        std::size_t count = 0;
+        checkHip(hipGraphGetNodes(captured.graph, nullptr, &count), "inspect direct convolution");
+        ASSERT_EQ(count, 1u);
+        hipGraphNode_t node{};
+        checkHip(hipGraphGetNodes(captured.graph, &node, &count), "inspect convolution entry");
+        hipGraphNodeType kind{};
+        checkHip(hipGraphNodeGetType(node, &kind), "inspect convolution node kind");
+        ASSERT_EQ(kind, hipGraphNodeTypeKernel);
+    };
+    ASSERT_NO_FATAL_FAILURE(expectOneKernel(captured_decode));
 
     ROCmShortConvolution oracle_kernel(0);
     HipGDNStateOwner oracle_kernel_state_owner(oracle_kernel, state_floats);
@@ -4191,6 +4202,8 @@ TEST(Test__ROCmGDNPaddedRealLength, CapturedVerifierAndDecodeShortConvPublicatio
                     kernel_size,
                     /*apply_silu=*/true);
             });
+
+        ASSERT_NO_FATAL_FAILURE(expectOneKernel(captured_verifier));
 
         for (int accepted_row = 0; accepted_row < verifier_rows; ++accepted_row)
         {
@@ -4255,7 +4268,7 @@ TEST(Test__ROCmGDNPaddedRealLength, CapturedVerifierAndDecodeShortConvPublicatio
                 d_oracle_continuation.ptr,
                 d_weight.ptr,
                 d_bias.ptr,
-                d_oracle_continuation.ptr,
+                d_oracle_continuation_output.ptr,
                 nullptr,
                 1,
                 channels,
@@ -4286,7 +4299,7 @@ TEST(Test__ROCmGDNPaddedRealLength, CapturedVerifierAndDecodeShortConvPublicatio
                 grouped_row.size());
 
             const auto replay_output = d_replay_continuation.toHost();
-            const auto oracle_output = d_oracle_continuation.toHost();
+            const auto oracle_output = d_oracle_continuation_output.toHost();
             expectByteExactEquivalent(
                 "ROCm captured short-conv continuation output",
                 replay_output,

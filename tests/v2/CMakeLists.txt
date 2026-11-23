@@ -12946,8 +12946,8 @@ add_v2_test(V2_Integration_GroupedVerifierRows_CUDA_ShortConv
     COMMAND $<TARGET_FILE:v2_integration_cuda_gdn_padded_real_length>
             --gtest_filter=Test__CUDAGDNPaddedRealLength.ShortConvQwen36M2InPlaceStateMatchesStepwiseReplay:Test__CUDAGDNPaddedRealLength.ShortConvQwen36M3InPlaceStateMatchesStepwiseReplay:Test__CUDAGDNPaddedRealLength.ShortConvQwen36M4InPlaceStateMatchesStepwiseReplay:Test__CUDAGDNPaddedRealLength.CapturedVerifierAndDecodeShortConvPublicationRuntimeM
             --gtest_brief=1
-    LABELS "V2;Integration;CUDA;MTP;GroupedVerifierRows;DecodeEquivalent;ShortConv;StatePublication;FP32;Regression"
-    MPI_PROCS 1
+    LABELS "V2;Integration;ProductionTestPreflight;CUDA;MTP;GroupedVerifierRows;DecodeEquivalent;ShortConv;StatePublication;FP32;Replay;Regression"
+    MPI_PROCS 1 NO_MODELS
 )
 add_v2_test(V2_Integration_GroupedVerifierRows_CUDA_GDNRequestBatch
     COMMAND $<TARGET_FILE:v2_integration_cuda_gdn_padded_real_length>
@@ -23256,8 +23256,8 @@ if(HAVE_ROCM)
         COMMAND $<TARGET_FILE:v2_integration_rocm_gdn_padded_real_length>
                 --gtest_filter=Test__ROCmGDNPaddedRealLength.ShortConvQwen36M2InPlaceStateMatchesStepwiseReplay:Test__ROCmGDNPaddedRealLength.ShortConvQwen36M3InPlaceStateMatchesStepwiseReplay:Test__ROCmGDNPaddedRealLength.ShortConvQwen36M4InPlaceStateMatchesStepwiseReplay:Test__ROCmGDNPaddedRealLength.CapturedVerifierAndDecodeShortConvPublicationRuntimeM
                 --gtest_brief=1
-        LABELS "V2;Integration;ROCm;MTP;GroupedVerifierRows;DecodeEquivalent;ShortConv;StatePublication;FP32;Regression;gfx906"
-        MPI_PROCS 1
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;MTP;GroupedVerifierRows;DecodeEquivalent;ShortConv;StatePublication;FP32;Replay;Regression;gfx906"
+        MPI_PROCS 1 NO_MODELS
     )
     message(STATUS "V2 Tests: Added ROCm padded GDN real-length integration tests")
 
@@ -31655,7 +31655,9 @@ add_v2_test(V2_Integration_CUDA_GDNTensorCaptureOwnership REQUIRES_BACKEND CUDA
         --gtest_brief=1
     LABELS "V2;Integration;ProductionTestPreflight;CUDA;GEMM;GDN;GraphCapture;TransferEngine;Regression"
     MPI_PROCS 1 NO_MODELS TIMEOUT 120)
-list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDA_GDNTensorCaptureOwnership)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+    V2_Integration_CUDA_GDNTensorCaptureOwnership
+    V2_Integration_GroupedVerifierRows_CUDA_ShortConv)
 if(TEST V2_Integration_ROCmNativeQuantisedTrainerOpenMPRuntimeBinding)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
         V2_Integration_ROCmNativeQuantisedTrainerOpenMPRuntimeBinding)
@@ -31822,6 +31824,7 @@ if(HAVE_ROCM)
     V2_Integration_ROCm_NativeQuantised_PrefillBucketMInvariantAllFormats
     V2_Integration_ROCm_TPCanonicalRankOrderGraphCapture
     V2_Integration_GroupedVerifierRows_ROCm_Qwen35GDNOutputProjection
+    V2_Integration_GroupedVerifierRows_ROCm_ShortConv
     V2_Integration_ROCm_TPCapturedEpochTransactionGraphCapture
     V2_Integration_ROCm_MappedLinearMemcpyParentGraphCapture
     V2_Integration_ROCmFlashAttentionContextParallelByteExact

@@ -392,11 +392,12 @@ namespace llaminar2
                 return false;
             float *effective_output = output;
 
-            // GDN QKV short-conv is commonly in-place. Prefill needs scratch
-            // so one timestep cannot clobber another; decode also needs it so
-            // the history update stores the raw projection, not the convolved
-            // output row.
-            const bool needs_scratch = (input == output);
+            // One scalar owner keeps the raw sample through its history update.
+            // A complete snapshot producer keeps its original neighborhoods alive.
+            const bool snapshot_producer = verifier_state_capture_ &&
+                verifier_state_capture_size_ >= required_state_size &&
+                verifier_state_capture_rows_ >= seq_len;
+            const bool needs_scratch = input == output && seq_len != 1 && !snapshot_producer;
             if (needs_scratch)
             {
                 const int required_scratch_size = seq_len * channels;
@@ -464,7 +465,10 @@ namespace llaminar2
             if (!updated_state)
                 return false;
             float *effective_output = output;
-            const bool needs_scratch = (input == output);
+            const bool snapshot_producer = verifier_state_capture_ &&
+                verifier_state_capture_size_ >= required_state_size &&
+                verifier_state_capture_rows_ >= seq_len;
+            const bool needs_scratch = input == output && seq_len != 1 && !snapshot_producer;
             if (needs_scratch)
             {
                 const int required_scratch_size = seq_len * channels;
