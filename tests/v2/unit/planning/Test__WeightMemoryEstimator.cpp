@@ -212,7 +212,8 @@ namespace
      * per-block codes plus per-superblock d/dmin); ROCm and non-superblock
      * sources keep per-block planes. Each region starts on a 256-byte boundary.
      */
-    size_t expectedGpuPackedBytes(size_t rows, size_t k, const NativeQuantisedFormatInfo &native, DeviceId device)
+    size_t expectedGpuPackedBytes(size_t rows, size_t k, const NativeQuantisedFormatInfo &native, DeviceId device,
+                                  uint32_t superblock_phase = 0)
     {
         const auto align = [](size_t bytes) { return (bytes + 255u) & ~size_t(255u); };
         auto packed = nativeQuantisedPackedRegionSizes(rows, k, native);
@@ -220,7 +221,7 @@ namespace
         if (device.is_cuda() && native.is_superblock && nativeQuantisedSuperblockCodable(codebook))
         {
             const auto planes = native_quantised_superblock::planeBytes(codebook, rows,
-                                                                        static_cast<uint32_t>(k / 32), 0);
+                                                                        static_cast<uint32_t>(k / 32), superblock_phase);
             packed.scales_bytes = planes.code;
             packed.mins_bytes = planes.superblock;
             packed.emins_bytes = 0;
@@ -315,7 +316,10 @@ TEST(Test__WeightMemoryEstimator, ExactInputAndOutputAxesAllFormatsTP1Through8)
                     {
                         if (const auto *native = native_quantised_formats::forQuantType(format.quant_type))
                         {
-                            const size_t expected = expectedGpuPackedBytes(65, local_k, *native, device);
+                            // Input slices carry no source column origin, so they
+                            // are priced at the worst superblock phase.
+                            const size_t expected = expectedGpuPackedBytes(65, local_k, *native, device,
+                                                                           degree == 1 ? 0u : 7u);
                             EXPECT_EQ(bytes.device_bytes, expected) << device.to_string();
                             if (degree == 2)
                             {
@@ -842,6 +846,36 @@ TEST(Test__WeightMemoryEstimator, CUDANeverAdmitsMoreThanTheGGUFStoresForAnyForm
                     << "per-block metadata planes reappeared on CUDA";
         }
     }
+}
+
+/**
+ * @test An input-axis slice never under-admits its superblock plane.
+ *
+ * Unequal TP assignments are only 32-aligned: with source K = 1024 and FFN
+ * widths 32/256/736, the 256-wide middle shard starts at column 32 (phase 1)
+ * and spans two source superblocks per row. Width alone cannot prove a
+ * superblock-aligned origin, so every slice is priced at the worst phase.
+ */
+TEST(Test__WeightMemoryEstimator, CodedInputSliceCoversAShiftedSuperblockOrigin)
+{
+    const auto *q4k = native_quantised_formats::forQuantType("Q4_K");
+    ASSERT_NE(q4k, nullptr);
+    const size_t rows = 4096, k = 256;
+    const auto shifted = expectedGpuPackedBytes(rows, k, *q4k, DeviceId::cuda(0), 1u);
+    const auto aligned = expectedGpuPackedBytes(rows, k, *q4k, DeviceId::cuda(0), 0u);
+    ASSERT_GT(shifted, aligned) << "a phase-1 slice spans one more superblock per row";
+
+    ModelMemoryProfile profile;
+    profile.architecture = "qwen35";
+    profile.n_layers = 1;
+    profile.d_model = 4096;
+    profile.d_ff = 1024;
+    const TensorSizeInfo down{"blk.0.ffn_down.weight", rows * 1024u / 256u * 144u, "Q4_K", rows * 1024u, 1024u, 0};
+    profile.tensors = {down};
+    // Four equal 256-wide shards: the estimator cannot tell this apart from
+    // an unequal 32/256/736 split, so it must cover the shifted origin.
+    const auto estimate = WeightMemoryEstimator::estimate(profile, DeviceId::cuda(0), 1, 4);
+    EXPECT_GE(estimate.device_bytes, shifted);
 }
 
 TEST(Test__WeightMemoryEstimator, SingleDevice_Q4KUsesCompactGPUPacking)
