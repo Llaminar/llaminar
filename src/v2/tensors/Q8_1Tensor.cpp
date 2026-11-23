@@ -943,6 +943,49 @@ namespace llaminar2
         return copyFrom_fp32_rows(src_data, shape_[0]);
     }
 
+    namespace
+    {
+        /**
+         * @brief Write each original FP32 row into its complete native Q8_1 blocks.
+         * @param input Contiguous logical source rows without quantized padding.
+         * @param output Final row-major Q8_1 allocation including terminal blocks.
+         * @param rows Number of source rows owned by this publication.
+         * @param columns Number of logical FP32 columns in each source row.
+         */
+        void publishQ8_1Rows(const float *input, Q8_1Block *output, size_t rows, size_t columns)
+        {
+            constexpr size_t block_width = Q8_1Block::BLOCK_SIZE;
+            const size_t blocks_per_row = (columns + block_width - 1) / block_width;
+            const size_t blocks = rows * blocks_per_row;
+
+            if (columns % block_width == 0)
+            {
+                // Aligned rows already form one contiguous independent block stream.
+                ::llaminar::v2::noteOpenMPTeamFork();
+#pragma omp parallel for schedule(static) if (blocks >= 128)
+                for (size_t block = 0; block < blocks; ++block)
+                    simd::quantize_single_block(input + block * block_width, output[block], block_width);
+                return;
+            }
+
+            // Keep the terminal block inside its own row. A flat element stream
+            // consumes the beginning of the next row as padding for this one.
+            ::llaminar::v2::noteOpenMPTeamFork();
+#pragma omp parallel for schedule(static) if (blocks >= 128)
+            for (size_t row = 0; row < rows; ++row)
+            {
+                const float *source = input + row * columns;
+                Q8_1Block *destination = output + row * blocks_per_row;
+                for (size_t block = 0; block < blocks_per_row; ++block)
+                {
+                    const size_t first = block * block_width;
+                    const auto count = static_cast<int>(std::min(block_width, columns - first));
+                    simd::quantize_single_block(source + first, destination[block], count);
+                }
+            }
+        }
+    }
+
     bool Q8_1Tensor::copyFrom_fp32_rows(const float *src_data, size_t num_rows)
     {
         if (!src_data)
@@ -965,9 +1008,6 @@ namespace llaminar2
         }
 
         const size_t cols = shape_[1];
-        const size_t total_elements = num_rows * cols;
-        const size_t n_blocks = (total_elements + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
-
         Q8_1Block *blocks = mutable_typed_data();
         if (!blocks)
         {
@@ -975,17 +1015,7 @@ namespace llaminar2
             return false;
         }
 
-::llaminar::v2::noteOpenMPTeamFork();
-#pragma omp parallel for schedule(static) if (n_blocks >= 128)
-        for (size_t block_idx = 0; block_idx < n_blocks; ++block_idx)
-        {
-            const size_t offset = block_idx * Q8_1Block::BLOCK_SIZE;
-            const size_t count = std::min(Q8_1Block::BLOCK_SIZE, total_elements - offset);
-
-            Q8_1Block &block = blocks[block_idx];
-            simd::quantize_single_block(src_data + offset, block, static_cast<int>(count));
-        }
-
+        publishQ8_1Rows(src_data, blocks, num_rows, cols);
         return true;
     }
 
@@ -995,40 +1025,15 @@ namespace llaminar2
         const float *src,
         const std::vector<size_t> &shape)
     {
-        if (shape.empty())
-        {
-            throw std::invalid_argument("Q8_1Tensor::quantize_from_fp32: shape cannot be empty");
-        }
+        if (shape.size() != 2)
+            throw std::invalid_argument("Q8_1Tensor::quantize_from_fp32 requires a 2D source");
 
-        // Calculate total elements
-        size_t total_elements = 1;
-        for (auto dim : shape)
-        {
-            total_elements *= dim;
-        }
-
-        // Calculate number of blocks
-        const size_t n_blocks = (total_elements + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
-        const size_t total_bytes = n_blocks * sizeof(Q8_1Block);
-
-        // Allocate raw data buffer
-        std::vector<uint8_t> raw_data(total_bytes);
-        Q8_1Block *blocks = reinterpret_cast<Q8_1Block *>(raw_data.data());
-
-        // Quantize each block
-::llaminar::v2::noteOpenMPTeamFork();
-#pragma omp parallel for if (n_blocks >= 128)
-        for (size_t block_idx = 0; block_idx < n_blocks; ++block_idx)
-        {
-            const size_t offset = block_idx * Q8_1Block::BLOCK_SIZE;
-            const size_t count = std::min(Q8_1Block::BLOCK_SIZE, total_elements - offset);
-
-            Q8_1Block &block = blocks[block_idx];
-            simd::quantize_single_block(src + offset, block, static_cast<int>(count));
-        }
-
-        // Create and return Q8_1Tensor
-        return std::make_shared<Q8_1Tensor>(shape, raw_data);
+        const size_t bytes = nativeMatrixExtent<Q8_1Block>(shape[0], shape[1]);
+        if (bytes != 0 && !src)
+            throw std::invalid_argument("Q8_1Tensor::quantize_from_fp32 requires its original FP32 rows");
+        AlignedVector<uint8_t> storage(bytes);
+        publishQ8_1Rows(src, reinterpret_cast<Q8_1Block *>(storage.data()), shape[0], shape[1]);
+        return adoptImmutableCPUStorage(shape, std::move(storage), DeviceId::cpu());
     }
 
     bool Q8_1Tensor::applyRMSNorm(

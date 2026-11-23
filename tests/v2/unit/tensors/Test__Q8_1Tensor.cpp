@@ -5,6 +5,7 @@
  */
 
 #include <gtest/gtest.h>
+#include <array>
 #include "tensors/Tensors.h"
 #include "tensors/FP16Utils.h"
 #include "tensors/SIMDHelpers.h"
@@ -273,4 +274,44 @@ TEST(Test__Q8_1Tensor, NativeQ8_1Addition)
     // Max error should be < 0.1 for values in [-2, 2] range
     EXPECT_LT(max_abs_error, 0.15f)
         << "Q8_1 native addition max error exceeds 0.15 threshold";
+}
+
+/** @test FP32 producers publish all padded native blocks of each independent source row. */
+TEST(Q8_1RowPublication, OddWidthWritesPerRowBlocks)
+{
+    using namespace llaminar2;
+    constexpr size_t rows = 3, columns = 33;
+    constexpr size_t blocks_per_row = 2;
+    std::array<float, rows * columns> source{};
+    for (size_t row = 0; row < rows; ++row)
+        for (size_t column = 0; column < columns; ++column)
+            source[row * columns + column] = static_cast<float>(3 + 19 * row) * (column < 20 ? 0.25f : -0.5f);
+
+    std::array<Q8_1Block, rows * blocks_per_row> expected{};
+    for (size_t row = 0; row < rows; ++row)
+    {
+        simd::quantize_single_block(source.data() + row * columns, expected[row * blocks_per_row], 32);
+        simd::quantize_single_block(source.data() + row * columns + 32, expected[row * blocks_per_row + 1], 1);
+    }
+    Q8_1Tensor mutable_tensor({rows, columns}, DeviceId::cpu());
+    ASSERT_TRUE(mutable_tensor.copyFrom_fp32_rows(source.data(), rows));
+    ASSERT_EQ(mutable_tensor.size_bytes(), sizeof(expected));
+    EXPECT_EQ(std::memcmp(mutable_tensor.raw_data(), expected.data(), sizeof(expected)), 0);
+
+    Q8_1Tensor retained({rows + 1, columns}, DeviceId::cpu());
+    auto *retained_bytes = static_cast<uint8_t *>(retained.raw_mutable_data());
+    ASSERT_NE(retained_bytes, nullptr);
+    std::array<uint8_t, blocks_per_row * sizeof(Q8_1Block)> guard;
+    guard.fill(0x6b);
+    std::memcpy(retained_bytes + sizeof(expected), guard.data(), guard.size());
+    ASSERT_TRUE(retained.copyFrom_fp32_rows(source.data(), rows));
+    const auto *published = static_cast<const uint8_t *>(retained.raw_data());
+    EXPECT_EQ(std::memcmp(published, expected.data(), sizeof(expected)), 0);
+    EXPECT_EQ(std::memcmp(published + sizeof(expected), guard.data(), guard.size()), 0);
+
+    std::shared_ptr<Q8_1Tensor> immutable;
+    ASSERT_NO_THROW(immutable = Q8_1Tensor::quantize_from_fp32(source.data(), {rows, columns}));
+    ASSERT_TRUE(immutable);
+    ASSERT_EQ(immutable->size_bytes(), sizeof(expected));
+    EXPECT_EQ(std::memcmp(immutable->raw_data(), expected.data(), sizeof(expected)), 0);
 }

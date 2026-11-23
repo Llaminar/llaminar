@@ -3983,6 +3983,13 @@ add_v2_test(V2_Unit_Q8_1Tensor
     MPI_PROCS 1  # Quantized activation tests are CPU-only
 )
 
+add_v2_test(V2_Integration_CPUQ8RowPaddedPublication
+    COMMAND $<TARGET_FILE:v2_test_q8_1_tensor>
+            --gtest_filter=Q8_1RowPublication.OddWidthWritesPerRowBlocks
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;Q8_1;ByteExact;Regression"
+    MPI_PROCS 1 NO_MODELS)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUQ8RowPaddedPublication)
+
 # Test: Q16_1Tensor class (high-precision quantized activations)
 add_executable(v2_test_q16_1_tensor unit/tensors/Test__Q16_1Tensor.cpp)
 target_link_libraries(v2_test_q16_1_tensor 
