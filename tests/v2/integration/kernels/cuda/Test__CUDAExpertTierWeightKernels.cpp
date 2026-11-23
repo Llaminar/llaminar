@@ -2734,9 +2734,7 @@ namespace llaminar2
             ASSERT_TRUE(cudaNativeQuantisedGemvTuned_fp32(
                 activation.data(),
                 payload.data(),
-                scales.data(),
-                nullptr,
-                nullptr,
+                ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes{scales.data(), nullptr, nullptr, 0},
                 baseline_output.data(),
                 activation_scales.data(),
                 source.N,
@@ -2791,9 +2789,7 @@ namespace llaminar2
             ASSERT_TRUE(cudaNativeQuantisedGemvTuned_fp32(
                 activation.data(),
                 payload.data(),
-                scales.data(),
-                nullptr,
-                nullptr,
+                ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes{scales.data(), nullptr, nullptr, 0},
                 concurrent_output.data(),
                 activation_scales.data(),
                 source.N,
