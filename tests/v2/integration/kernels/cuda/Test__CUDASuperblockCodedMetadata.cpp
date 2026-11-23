@@ -15,8 +15,8 @@
  *    planes at the production addresses (block-major, grouped by phase);
  *  - production GEMV (M=1), grouped small-M GEMV and dense prefill produce
  *    byte-identical FP32 outputs from the two representations.
- * Together these establish the representation-change contract behind the
- * DeepSeek-V4 GB10 storage economy: smaller metadata, unchanged arithmetic.
+ * Together these establish the representation-change contract: file-density
+ * metadata with unchanged arithmetic.
  */
 #include <gtest/gtest.h>
 
