@@ -301,6 +301,17 @@ three measured 256-token requests per mode and arm after warmup. Every
 prompt, token history, and per-request MTP work count matched. The complete
 column measures prefill and decode time together. The opposite arm orders
 gave opposite throughput changes, so owner-side planning remains experimental.
+The rank-by-rank dispatch trace counted grouped prefill transactions. The
+one-token decode service enters `MoEExpertComputeStage::executeSingleToken`
+and consumes its own prepared Gate/Up and Down paths. The paired figures
+therefore measure the effect of the linked refactor on the complete model.
+
+A follow-up binds the existing SIMD tile entries on the actual one-token
+service path. A single team projects Gate/Up, publishes the GPU-aligned
+SwiGLU Q8 blocks and finishes Down into the original route rows. The
+32-token Release diagnostic matched the control and recorded 1,488 such
+transactions in its measured decode interval. The paired timing includes
+ordinary and fixed-depth-seven inference.
 
 | Arm order | Mode | Decode, control → candidate tok/s | Decode change | Complete throughput change |
 | --- | --- | ---: | ---: | ---: |

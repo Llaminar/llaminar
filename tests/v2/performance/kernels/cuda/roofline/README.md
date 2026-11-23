@@ -645,6 +645,20 @@ poisoned inactive slots. The device grid witness checked the live extent of
 both dependent arithmetic nodes. Qualification of the complete production
 verifier also measures the router, local projection, fold and collective.
 
+The ten-route replay resolves the original grouped route factor before
+arithmetic and checks the local multiply against the recorded unweighted
+bytes. Both cards passed repeated full, partial and empty captures. The six
+weighted Down entries use 47–63 registers, zero stack and zero local memory.
+Gate/Up uses 64–72 registers and 4,096 shared bytes with zero local memory.
+
+The Release model probe captured the new route planner and both arithmetic
+phases on both RTX 3090s in `main_verifier`. The native inventory reports
+three resident Gate/Up blocks per SM and eight or nine Down blocks per SM.
+The fixed-depth-seven probe matched all 32 control tokens. The model's
+`mtp_decode_sidecar` capture uses intermediate shards with ten routes and
+local width 320 on this topology. The separate fully replicated drafter
+fixture measures a different placement and width.
+
 ### CUDA peer transfers at QFN decode sizes
 
 The two QFN RTX 3090s report direct access in both directions over the
