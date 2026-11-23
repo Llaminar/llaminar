@@ -289,6 +289,16 @@ inline const NativeQuantisedFormatInfo *gpuWeightSourceFormat(const TensorBase &
  * applies the same predicate and rejects a slot declared otherwise.
  */
 inline std::optional<WeightVRAMPool::SuperblockCodedMetadata> gpuPreparedWeightCodedDeclaration(
+    const NativeQuantisedFormatInfo &source, GPUPreparedWeightPoolLayout layout, DeviceId device,
+    std::uint32_t superblock_phase = 0)
+{
+    if (!gpuPreparedSuperblockCoded(source, layout, device))
+        return std::nullopt;
+    return WeightVRAMPool::SuperblockCodedMetadata{canonicalDeviceVnniCodebookId(source), superblock_phase};
+}
+
+/** @brief Tensor form: source format and superblock phase come from the operand itself. */
+inline std::optional<WeightVRAMPool::SuperblockCodedMetadata> gpuPreparedWeightCodedDeclaration(
     const TensorBase &tensor, GPUPreparedWeightPoolLayout layout, DeviceId device)
 {
     const auto *source = gpuWeightSourceFormat(tensor);
