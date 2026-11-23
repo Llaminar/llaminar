@@ -922,6 +922,30 @@ TEST(
         << "Mixed-stride LocalTP geometry must not overlap a scalar owner with the packed bank";
 }
 
+/**
+ * @test Only an FP32-gate router owns the CUDA Q8 gate cache.
+ *
+ * BF16/FP16 gates (DeepSeek-V4) never bind it, yet it was reserved for every
+ * MoE graph: 128 slots x 256 experts x 4096 = 144 MiB of dead device memory.
+ * Expert stages never own it either.
+ */
+TEST(Test__GpuWorkspaceAllocationPolicy, RouterQ8GateCacheIsDeclaredOnlyForFP32Gates)
+{
+    using llaminar2::MoEWorkspaceBuffers::CUDARouterGateCache;
+    namespace moe = llaminar2::MoEWorkspaceBuffers;
+    const auto q8 = moe::cudaRouting(512, 4096, 256, CUDARouterGateCache::Q8);
+    const auto none = moe::cudaRouting(512, 4096, 256, CUDARouterGateCache::None);
+    ASSERT_NE(q8.find(moe::CUDA_ROUTER_Q8_GATE_WEIGHTS), nullptr);
+    ASSERT_NE(q8.find(moe::CUDA_ROUTER_Q8_GATE_SCALES), nullptr);
+    EXPECT_EQ(none.find(moe::CUDA_ROUTER_Q8_GATE_WEIGHTS), nullptr);
+    EXPECT_EQ(none.find(moe::CUDA_ROUTER_Q8_GATE_SCALES), nullptr);
+    EXPECT_GE(q8.total_bytes_with_alignment() - none.total_bytes_with_alignment(), 144ull << 20);
+    // The hidden-row Q8 scratch still exists for both: grouped decode uses it.
+    EXPECT_NE(none.find(moe::DECODE_HIDDEN_INT8), nullptr);
+    const auto expert = moe::cudaMoE(512, 4096, 2048, 256, 6, CUDARouterGateCache::None);
+    EXPECT_EQ(expert.find(moe::CUDA_ROUTER_Q8_GATE_WEIGHTS), nullptr);
+}
+
 TEST(Test__GpuWorkspaceAllocationPolicy, MoEWorkspaceActiveExpertIdsCoversAllExperts)
 {
     const int max_seq_len = 9;

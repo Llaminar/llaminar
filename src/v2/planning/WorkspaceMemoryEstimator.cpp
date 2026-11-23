@@ -185,6 +185,37 @@ std::pair<int, int> compactRoutedExpertWorkspaceRows(
     const ModelMemoryProfile& profile, const WorkspaceMemoryGeometry& geometry);
 
 /**
+ * @brief Whether this participant's router owns the CUDA Q8 gate cache.
+ *
+ * Mirrors MoERoutingStage: only an FP32 prepared router gate (resolved by the
+ * same representation contract the loader applies) binds the cache, and only
+ * while the Q8 router is enabled. A profile without router tensors keeps the
+ * conservative declaration.
+ */
+MoEWorkspaceBuffers::CUDARouterGateCache plannedCUDARouterGateCache(
+    const ModelMemoryProfile& profile, const WorkspaceMemoryGeometry& geometry)
+{
+    using Cache = MoEWorkspaceBuffers::CUDARouterGateCache;
+    if (!debugEnv().gemm.cuda_moe_router_q8)
+        return Cache::None;
+    bool any_router = false;
+    for (const auto& tensor : profile.tensors)
+    {
+        if (!tensor.name.ends_with(".ffn_gate_inp.weight"))
+            continue;
+        any_router = true;
+        const auto representation = PreparedWeightRepresentationContract::resolve(
+            WeightRole::MoERouter, tensor.quant_type, tensor.name, profile.architecture,
+            geometry.planning_policy.gdn_projection_arithmetic, geometry.planning_policy.moe_router_arithmetic);
+        const bool fp32_source = tensor.quant_type == "F32" || tensor.quant_type == "FP32";
+        if (representation == ModelPreparedWeightRepresentation::FP32 ||
+            (representation == ModelPreparedWeightRepresentation::SourceNative && fp32_source))
+            return Cache::Q8;
+    }
+    return any_router ? Cache::None : Cache::Q8;
+}
+
+/**
  * @brief Compute the exact MoE requirement contribution for one GPU participant.
  *
  * MoE scratch names coexist with the dense GEMM and recurrent names already
@@ -230,7 +261,8 @@ size_t exactMoEWorkspaceBytes(
             profile.d_model,
             profile.expert_feed_forward_length,
             profile.expert_count,
-            profile.expert_used_count);
+            profile.expert_used_count,
+            plannedCUDARouterGateCache(profile, geometry));
     }
     else if (device.is_rocm())
     {
@@ -255,7 +287,8 @@ size_t exactMoEWorkspaceBytes(
         const auto compact_rows = compactRoutedExpertWorkspaceRows(profile, geometry).second;
         requirements.merge(device.is_cuda()
             ? MoEWorkspaceBuffers::cudaMoE(compact_rows, profile.d_model,
-                profile.expert_feed_forward_length, profile.expert_count, 1)
+                profile.expert_feed_forward_length, profile.expert_count, 1,
+                plannedCUDARouterGateCache(profile, geometry))
             : MoEWorkspaceBuffers::rocmMoE(compact_rows, profile.d_model,
                 profile.expert_feed_forward_length, profile.expert_count, 1, geometry.gate_up_publication, geometry.down_publication));
     }
