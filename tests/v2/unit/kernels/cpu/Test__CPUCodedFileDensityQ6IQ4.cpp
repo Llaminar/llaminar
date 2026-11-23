@@ -7,6 +7,7 @@
 #include <gtest/gtest.h>
 
 #include "../../../utils/TestTensorFactory.h"
+#include "execution/moe/ExpertTierWeightStream.h"
 #include "kernels/cpu/gemm/CPUNativeQuantisedMultiScaleKernels.h"
 #include "kernels/cpu/gemm/CPUNativeQuantisedWeightPacker.h"
 #if defined(__aarch64__) && defined(__ARM_NEON)
@@ -253,4 +254,35 @@ TEST(CPUCodedFileDensityQ6IQ4, NEONProjectionEqualsPerBlockSourceOracle)
     verifyProjectionPolicies<kIQ4XS>();
 }
 #endif
+/** @test Reject old per-block wire layouts before either direction can reach a converter. */
+TEST(CPUCodedFileDensityQ6IQ4, CodedSourceScalesRejectUncodedTierStreams)
+{
+    const auto verify = []<std::uint8_t Codebook>(const char *message) {
+        auto tensor = source<Codebook>(256);
+        CPUNativeQuantisedPackedWeights packed;
+        ASSERT_TRUE(packWeightsCPUNativeQuantised(tensor.get(), packed));
+        SCOPED_TRACE(message);
+        const auto expectRejection = [message](auto make_manifest) {
+            try
+            {
+                (void)make_manifest();
+                ADD_FAILURE() << "Uncoded tier stream was admitted";
+            }
+            catch (const std::invalid_argument &error)
+            {
+                EXPECT_STREQ(error.what(), message);
+            }
+        };
+        expectRejection([&] {
+            return makeCpuToGpuExpertTierWeightStreamManifest(packed, 1, 0, 0,
+                ExpertTierWeightProjection::Down, 1);
+        });
+        expectRejection([&] {
+            return makeGpuToCpuExpertTierWeightStreamManifest(*tensor->vnniFormatInfo(), packed.N, packed.K,
+                1, 0, 0, ExpertTierWeightProjection::Down, 1);
+        });
+    };
+    verify.template operator()<8>("Superblock-coded Q6_K CPU encoding requires coded GPU migration slots");
+    verify.template operator()<kIQ4XS>("Superblock-coded IQ4_XS CPU encoding requires coded GPU migration slots");
+}
 } // namespace llaminar2::test

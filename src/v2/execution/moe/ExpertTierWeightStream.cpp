@@ -283,6 +283,8 @@ namespace llaminar2
             }
             if (!cpu::native_quantised::isKnownPreparedEncoding(cpu.encoding))
                 return reject(error, "CPU packed encoding is unknown");
+            if (const char *reason = codedSourceScaleStreamRejection(cpu.encoding))
+                return reject(error, reason);
             // Source provenance must identify exactly one of the 21 cataloged
             // formats even when its final CPU bytes have been normalized.
             if (native_quantised_formats::forSourceIdentity(
@@ -593,6 +595,8 @@ namespace llaminar2
         }
         if (!cpu::native_quantised::isKnownPreparedEncoding(cpu_encoding))
             return reject(error, "Tier stream CPU encoding is invalid");
+        if (const char *reason = codedSourceScaleStreamRejection(cpu_encoding))
+            return reject(error, reason);
         // Re-derive strides rather than accepting redundant wire fields on trust.
         const uint32_t expected_data_stride =
             cpu::native_quantised::preparedDataStride(cpu_encoding, cpu_codebook_id);
@@ -678,6 +682,8 @@ namespace llaminar2
         ExpertTierWeightCPUStorageLayout format, MoEExpertProjectionOwnership::Projection owned,
         const ExpertTierWeightProjectionIntersection &intersection, std::uint32_t capacity)
     {
+        if (const char *reason = codedSourceScaleStreamRejection(format.cpu_encoding))
+            throw std::invalid_argument(reason);
         if (intersection.empty() || (owned != intersection.source() && owned != intersection.destination()) ||
             intersection.columns() % 32 || intersection.firstColumn() % 32 ||
             intersection.firstColumn() < owned.first_column ||
@@ -1505,6 +1511,8 @@ namespace llaminar2
 
         CPUWeights output;
         configureCpuFromGpu(gpu, output);
+        if (const char *reason = codedSourceScaleStreamRejection(output.encoding))
+            return reject(error, reason);
         const size_t unit_count =
             static_cast<size_t>(output.N_padded / 64) *
             static_cast<size_t>(output.blocks_per_row);

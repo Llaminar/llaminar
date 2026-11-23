@@ -25,6 +25,23 @@
 
 namespace llaminar2
 {
+    /** @brief Diagnose source-scale CPU units not supported by the per-block stream.
+     * @param encoding Physical CPU prepared encoding.
+     * @return Static diagnostic, or nullptr when this restriction does not apply.
+     */
+    [[nodiscard]] constexpr const char *codedSourceScaleStreamRejection(
+        cpu::native_quantised::CPUNativeQuantisedEncoding encoding) noexcept
+    {
+        using Encoding = cpu::native_quantised::CPUNativeQuantisedEncoding;
+        if (!cpu::native_quantised::preparedSuperblockCoded(encoding))
+            return nullptr;
+        if (encoding == Encoding::Q6KNativeDualScale)
+            return "Superblock-coded Q6_K CPU encoding requires coded GPU migration slots";
+        if (encoding == Encoding::NibbleLUTSourceScale)
+            return "Superblock-coded IQ4_XS CPU encoding requires coded GPU migration slots";
+        return nullptr;
+    }
+
     /**
      * @brief Checked overlap of two admitted projections in original GEMM coordinates.
      *
@@ -143,6 +160,7 @@ namespace llaminar2
                wire_columns_per_unit==0 || wire_columns_per_unit>64 || cpu_is_asymmetric>1 || cpu_is_superblock>1 ||
                !native_quantised_formats::forSourceIdentity(cpu_codebook_id,cpu_is_superblock!=0) ||
                !cpu::native_quantised::isKnownPreparedEncoding(cpu_encoding) ||
+               codedSourceScaleStreamRejection(cpu_encoding) ||
                cpu_data_stride!=cpu::native_quantised::preparedDataStride(cpu_encoding,cpu_codebook_id) ||
                cpu_block_stride!=cpu::native_quantised::preparedInterleavedBlockStride(cpu_encoding,cpu_is_asymmetric!=0,cpu_codebook_id))return false;
             const uint64_t expected=((uint64_t(N)+wire_columns_per_unit-1)/wire_columns_per_unit)*blocks_per_row;
@@ -238,6 +256,7 @@ namespace llaminar2
                 blocks_per_row != K / 32 || N_padded < N ||
                 (N_padded % 64) != 0 || N_padded != ((N + 63) / 64) * 64 ||
                 !cpu::native_quantised::isKnownPreparedEncoding(cpu_encoding) ||
+                codedSourceScaleStreamRejection(cpu_encoding) ||
                 cpu_is_asymmetric>1 || cpu_is_superblock>1 || gpu_source_is_superblock>1 ||
                 gpu_is_asymmetric>1 || gpu_has_emins>1 ||
                 cpu_N<=0 || cpu_K<=0 || gpu_N<=0 || gpu_K<=0 || cpu_K%32 || gpu_K%32 ||
