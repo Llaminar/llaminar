@@ -670,8 +670,11 @@ endif()
                 with self.subTest(performance_only=performance_only, cuda=cuda, rocm=rocm):
                     expected = ["v2_perf_immutable_host_lookup", "v2_perf_qwen_sparse_selection",
                                 "v2_perf_q8_residual_prepared_projection"]
+                    if sys.platform.startswith("linux"):
+                        expected.append("v2_perf_qfn_cpu_decode_roofline")
                     if cuda:
                         expected += ["v2_perf_cuda_decode_roofline",
+                                     "v2_perf_cuda_peer_decode_latency",
                                      "v2_perf_cuda_qwen_sparse_selection",
                                      "v2_perf_cuda_qwen_sparse_observations"]
                     if rocm:
@@ -707,12 +710,16 @@ set(HAVE_ROCM {"ON" if rocm else "OFF"})
 set(CMAKE_BUILD_TYPE {"Release" if performance_only else "Integration"})
 set(V2_TEST_SOCKETS 1)
 set(V2_TEST_CORES_PER_SOCKET 1)
+set(V2_CPU_TARGET_X86 ON)
 {registration}
 add_library(llaminar2_core INTERFACE)
+add_library(Threads::Threads INTERFACE IMPORTED)
 add_library(GTest::gtest INTERFACE IMPORTED)
 add_library(GTest::gtest_main INTERFACE IMPORTED)
 add_library(hip::host INTERFACE IMPORTED)
 add_library(CUDA::cudart INTERFACE IMPORTED)
+add_library(qfn_configured_nccl INTERFACE)
+set(NCCL_LIBRARY qfn_configured_nccl)
 # Actual pooled declarations attach include requirements and registrations to
 # these pre-existing functional owners; only their bodies are fixture doubles.
 add_executable(v2_test_memory_planner main.cpp)
@@ -744,16 +751,36 @@ endif()
 if(TARGET v2_perf_immutable_adaptive_lookup)
     message(FATAL_ERROR "Retired combined adaptive lookup performance entrypoint remains")
 endif()
+if(TARGET v2_perf_qfn_cpu_decode_roofline)
+    get_target_property(cpu_probe_source v2_perf_qfn_cpu_decode_roofline SOURCES)
+    get_target_property(cpu_probe_standard v2_perf_qfn_cpu_decode_roofline CXX_STANDARD)
+    get_target_property(cpu_probe_excluded v2_perf_qfn_cpu_decode_roofline EXCLUDE_FROM_ALL)
+    if(NOT cpu_probe_source MATCHES "/QFNCPUDecodeRoofline[.]cpp$" OR
+       NOT cpu_probe_standard EQUAL 20 OR NOT cpu_probe_excluded)
+        message(FATAL_ERROR "Lost explicit-build CPU decode roofline policy")
+    endif()
+endif()
 if(HAVE_CUDA)
     get_target_property(cuda_probe_source v2_perf_cuda_decode_roofline SOURCES)
     get_target_property(cuda_probe_standard v2_perf_cuda_decode_roofline CUDA_STANDARD)
     get_target_property(cuda_probe_excluded v2_perf_cuda_decode_roofline EXCLUDE_FROM_ALL)
-    if(NOT cuda_probe_source MATCHES "/CUDADecodeRoofline[.]cu$" OR
+    if(NOT cuda_probe_source MATCHES "/CUDADecodeRoofline[.]cu(;|$)" OR
+       NOT cuda_probe_source MATCHES "/CUDAHCFFNRooflineWork[.]cpp(;|$)" OR
        NOT cuda_probe_standard EQUAL 20 OR NOT cuda_probe_excluded)
         message(FATAL_ERROR "Lost native or explicit-build CUDA decode roofline policy")
     endif()
     # The device-free fixture checks the declaration without a CUDA compiler.
     set_property(TARGET v2_perf_cuda_decode_roofline PROPERTY SOURCES "${{CMAKE_CURRENT_SOURCE_DIR}}/main.cpp")
+    get_target_property(peer_source v2_perf_cuda_peer_decode_latency SOURCES)
+    get_target_property(peer_standard v2_perf_cuda_peer_decode_latency CUDA_STANDARD)
+    get_target_property(peer_excluded v2_perf_cuda_peer_decode_latency EXCLUDE_FROM_ALL)
+    get_target_property(peer_libraries v2_perf_cuda_peer_decode_latency LINK_LIBRARIES)
+    if(NOT peer_source MATCHES "/CUDAPeerDecodeLatency[.]cu$" OR
+       NOT peer_standard EQUAL 20 OR NOT peer_excluded OR
+       NOT "qfn_configured_nccl" IN_LIST peer_libraries)
+        message(FATAL_ERROR "Lost native CUDA peer decode policy or configured NCCL provider")
+    endif()
+    set_property(TARGET v2_perf_cuda_peer_decode_latency PROPERTY SOURCES "${{CMAKE_CURRENT_SOURCE_DIR}}/main.cpp")
     get_target_property(hc103_sources v2_perf_q8_residual_prepared_projection SOURCES)
     get_target_property(hc103_standard v2_perf_q8_residual_prepared_projection CUDA_STANDARD)
     if(NOT hc103_standard EQUAL 20)

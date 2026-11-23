@@ -119,6 +119,7 @@ endif()
                                     "Fixed5", "Fixed6")
                     tp4_prefix = "V2_Integration_Qwen4ExpFullROCmTP4MTPAdmission_"
                     bridge = "V2_Integration_Qwen4ExpTensorShardedRestoredPrefixMTP"
+                    cuda_movement = "V2_Integration_QFNCUDATP2CPUTP2MovementPreservesGeneratedTokens"
                     active_shards = {
                         "V2_Integration_QFNTP4DynamicTensorShardedStationaryReplay": (
                             "Qwen4ExpTensorShardedROCmTP4.DynamicResidencyOneCohortRetainsEpochAcrossGroupedReplay",
@@ -131,6 +132,8 @@ endif()
                         names.update(tp4_prefix + policy for policy in tp4_policies)
                         names.add(bridge)
                         names.update(active_shards)
+                    if cuda:
+                        names.add(cuda_movement)
                     self.assertEqual({test["name"] for test in tests}, names)
                     self.assertEqual(len(tests), len(names))
                     for test in tests:
@@ -145,6 +148,16 @@ endif()
                         self.assertEqual("CUDA" in props["LABELS"], "CUDA" in test["name"])
                         self.assertEqual("ROCm" in props["LABELS"], "ROCm" in test["name"]
                                          or test["name"] == bridge or test["name"] in active_shards)
+                        if test["name"] == cuda_movement:
+                            self.assertTrue({"HardwareOptional", "Devices2", "DistinctNUMARanks",
+                                             "ByteExact", "Replay", "Regression"} <= set(props["LABELS"]))
+                            self.assertEqual(set(props["RESOURCE_LOCK"]), {
+                                "Integration_Serial", "cuda_gpu_0", "cuda_gpu_1"})
+                            command = test["command"]
+                            self.assertEqual(command[command.index("-np") + 1], "2")
+                            self.assertIn(
+                                "--gtest_filter=Qwen4ExpMixedTensorShardedTP2."
+                                "CUDACPUCohortMovementPreservesGeneratedTokens", command)
                         if test["name"] in active_shards:
                             case, devices, ranks = active_shards[test["name"]]
                             self.assertTrue({"HardwareOptional", "NativeISA-gfx906", f"Devices{devices}"}
