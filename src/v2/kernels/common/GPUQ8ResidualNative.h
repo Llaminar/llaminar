@@ -123,7 +123,16 @@ namespace llaminar2
         // real capacity/plane flags remain authoritative; source geometry only
         // proves that the current live decoder fits, never invents a slot size.
         const bool allocated = d.allocation_payload_bytes_per_block != 0;
-        if ((physical.is_asymmetric && !d.mins) || (physical.has_emins && !d.emins) ||
+        // A superblock-coded immutable matrix holds a code plane in `scales`
+        // and its superblock plane in `mins`; it has no emins and no slot.
+        if (nativeQuantisedLayoutRepresentation(d.metadata_layout) ==
+            NativeQuantisedMetadataRepresentation::SuperblockCoded)
+        {
+            if (!d.mins || d.emins || allocated || d.allocation_has_mins || d.allocation_has_emins)
+                throw std::invalid_argument("TwoTerm GPU superblock-coded source has malformed metadata planes");
+            physical.has_emins = false;
+        }
+        else if ((physical.is_asymmetric && !d.mins) || (physical.has_emins && !d.emins) ||
             (!allocated && (bool(d.mins) != physical.is_asymmetric || bool(d.emins) != physical.has_emins ||
                             d.allocation_has_mins || d.allocation_has_emins)) ||
             (allocated && (d.allocation_payload_bytes_per_block < physical.payload_bytes_per_block ||

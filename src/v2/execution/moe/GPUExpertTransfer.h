@@ -41,6 +41,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 #include <vector>
 
 namespace llaminar2 {
@@ -143,6 +144,10 @@ inline GpuExpertPackedDescriptor makeGpuExpertPackedDescriptor(
     bool is_asymmetric,
     bool has_emins)
 {
+    // Expert transfer copies per-block planes; coded metadata is immutable
+    // loader storage and has no transfer representation.
+    if (desc.metadata_layout != 0u)
+        throw std::invalid_argument("Superblock-coded expert weights cannot enter GPU expert transfer");
     const size_t block_count =
         static_cast<size_t>(desc.blocks_per_row) * static_cast<size_t>(desc.n);
 

@@ -1638,6 +1638,10 @@ namespace llaminar2
         const DeviceNativeQuantisedMatrixDesc &src,
         const DeviceNativeQuantisedMatrixDesc &dst) noexcept
     {
+        // Transfer slots carry per-block planes only; a superblock-coded
+        // (loader-resident) matrix never enters movement.
+        if (src.metadata_layout != 0u || dst.metadata_layout != 0u)
+            return false;
         if (src.n != dst.n ||
             src.k != dst.k ||
             src.blocks_per_row != dst.blocks_per_row)
@@ -1684,6 +1688,7 @@ namespace llaminar2
         dst.source_codebook_id = src.source_codebook_id;
         dst.source_is_superblock = src.source_is_superblock;
         dst.source_identity_present = src.source_identity_present;
+        dst.metadata_layout = src.metadata_layout;
     }
 
     inline uint64_t deviceMoEMatrixBlockCount(const DeviceNativeQuantisedMatrixDesc &desc) noexcept

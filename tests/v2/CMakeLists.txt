@@ -12086,6 +12086,21 @@ if(HAVE_CUDA)
         NO_MODELS
         TIMEOUT 60
     )
+    # Superblock-coded metadata: per-block codes plus per-superblock d/dmin must
+    # reproduce every legacy word and byte-identical GEMV/small-M/prefill outputs.
+    add_executable(v2_integration_cuda_superblock_coded_metadata
+        integration/kernels/cuda/Test__CUDASuperblockCodedMetadata.cpp)
+    target_include_directories(v2_integration_cuda_superblock_coded_metadata PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(v2_integration_cuda_superblock_coded_metadata PRIVATE
+        llaminar2_core GTest::gtest GTest::gtest_main CUDA::cudart)
+    add_v2_test(V2_Integration_CUDASuperblockCodedMetadata
+        COMMAND $<TARGET_FILE:v2_integration_cuda_superblock_coded_metadata>
+        LABELS "V2;Integration;ProductionTestPreflight;CUDA;GEMM;ByteExact;AllFormats;NativeQuantised;Memory;Regression"
+        MPI_PROCS 1
+        NO_MODELS
+        TIMEOUT 120
+    )
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDASuperblockCodedMetadata)
     add_executable(v2_integration_cuda_native_quantised_wide
         integration/kernels/cuda/Test__CUDANativeQuantisedWide.cpp)
     target_link_libraries(v2_integration_cuda_native_quantised_wide PRIVATE
