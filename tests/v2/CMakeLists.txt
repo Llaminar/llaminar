@@ -28906,6 +28906,12 @@ add_v2_test(V2_Integration_CPUSharedGDNSnapshotLifecycle
     LABELS "V2;Integration;ProductionTestPreflight;ARM;CPU;DeviceFree;GDN;ByteExact;Lifecycle;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
     ENVIRONMENT "OMP_NUM_THREADS=1")
+add_v2_test(V2_Integration_CPUSharedGDNPreparedHeadContract
+    COMMAND $<TARGET_FILE:v2_test_cpu_fixed_epoch_gdn>
+        --gtest_filter=CPUGDNRepeatedHeadPreprocessing.MappedHeadsMatchExpandedInputsAndContinuation
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;GDN;ByteExact;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "OMP_NUM_THREADS=1")
 # Short-conv prefill windows wider than the SIMD register program reject before writing.
 add_v2_test(V2_Integration_CPUShortConvPrefillWindowBound
     COMMAND $<TARGET_FILE:v2_test_gdn_kernels>
@@ -33777,6 +33783,7 @@ list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_CPUSharedGDNAlignedLogicalCapacity
     V2_Integration_CPUSharedGDNSnapshotLifecycle
     V2_Integration_CPUSharedGDNStagePublication
+    V2_Integration_CPUSharedGDNPreparedHeadContract
     V2_Integration_CPUFixedEpochCounterBatching
     V2_Integration_CPUFixedEpochGDNZeroLayerAccounting
     V2_Integration_CPUSharedGDNWorkspaceAdmission

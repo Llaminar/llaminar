@@ -275,13 +275,13 @@ namespace llaminar2
         /**
          * @brief Admit persistent query/key and scalar-gate tables before execution.
          * @param seq_len Admitted row capacity for the upcoming grouped call.
-         * @param n_heads Local value-head count.
+         * @param qk_heads Number of independent prepared Q/K heads per token.
+         * @param value_heads Local value-head count and scalar-gate stride.
          * @param d_k Key width of each normalized/adjusted query.
-         * @param d_v Value width, unused by query/gate storage admission.
          * Existing capacities are reused; prepared queries, keys and gates share
          * token/head ownership and are published before epoch contraction.
          */
-        void ensureScratch(int seq_len, int n_heads, int d_k, int d_v);
+        void ensureScratch(int seq_len, int qk_heads, int value_heads, int d_k);
 
         /**
          * @brief Canonical CPU recurrence over an explicit Q/K/V source view.

@@ -426,10 +426,10 @@ namespace llaminar2
     // Scratch buffer management (grow-only, eliminates per-call allocations)
     // =========================================================================
 
-    void CPUGatedDeltaNet::ensureScratch(int seq_len, int n_heads, int d_k, int /*d_v*/)
+    void CPUGatedDeltaNet::ensureScratch(int seq_len, int qk_heads, int value_heads, int d_k)
     {
-        const size_t qk_total = static_cast<size_t>(seq_len) * n_heads * d_k;
-        const size_t gate_total = static_cast<size_t>(seq_len) * n_heads;
+        const size_t qk_total = static_cast<size_t>(seq_len) * qk_heads * d_k;
+        const size_t gate_total = static_cast<size_t>(seq_len) * value_heads;
 
         if (q_scratch_.size() < qk_total)
             q_scratch_.resize(qk_total);
@@ -1105,7 +1105,7 @@ namespace llaminar2
         if (capture && (verifier_state_capture_rows_ < seq_len || verifier_state_capture_size_ < layout.floats())) return false;
         const bool shared_capture=capture && shared_slots_;
         if (shared_capture && !prepareShared(request_count,request_seq_len,n_heads,d_k,d_v)) return false;
-        ensureScratch(seq_len, n_heads, d_k, d_v);
+        ensureScratch(seq_len, n_heads, n_heads, d_k);
         const int qk_stride = n_heads*d_k, output_stride = n_heads*d_v;
         const float scale = 1.0f/std::sqrt(static_cast<float>(d_k));
         std::atomic<bool> failed{false};
@@ -1352,7 +1352,8 @@ namespace llaminar2
         }
 
         if (shared_capture && !prepareShared(1,seq_len,n_heads,d_k,d_v)) return false;
-        ensureScratch(seq_len, n_heads, d_k, d_v);
+        const int prepared_qk_heads = std::min(input.n_k_heads, n_heads);
+        ensureScratch(seq_len, prepared_qk_heads, n_heads, d_k);
 
         PerfStatsCollector::addCounter("kernel", "cpu_gdn_epoch_readout_rows",
             static_cast<double>(seq_len * n_heads), "recurrence", "cpu");
@@ -1360,8 +1361,9 @@ namespace llaminar2
         const float scale_val = 1.0f / std::sqrt(static_cast<float>(d_k));
         constexpr float l2_eps = 1e-6f;
 
-        // Stride between consecutive timesteps in [seq_len, n_heads * dim] layout
-        const int qk_stride = n_heads * d_k;
+        // One producer publishes each distinct normalized Q/K pair. All value
+        // heads with that source read the same immutable pair after the team join.
+        const int qk_stride = prepared_qk_heads * d_k;
         const int v_stride = n_heads * d_v;
 
         const int active_or_requested_workers = omp_in_parallel() ? omp_get_num_threads() : omp_get_max_threads();
@@ -1415,13 +1417,16 @@ namespace llaminar2
         const auto advance_head = [&](int head) -> CPUFixedEpochObservations
         {
                 const size_t offset = static_cast<size_t>(head) * layout.headFloats();
+                const int prepared_offset = (head % prepared_qk_heads) * d_k;
+                const float *prepared_q = q_scratch_.data() + prepared_offset;
+                const float *prepared_k = k_scratch_.data() + prepared_offset;
                 float *initial = state + offset;
                 float *snapshots = capture_state_snapshots && !shared_capture ? state_snapshots + offset : nullptr;
                 if (shared_capture)
                 {
                     CPUSharedGDNSnapshots shared(layout,shared_slots_+static_cast<size_t>(head)*CPUSharedGDNSnapshots::headFloats(layout,shared_width_),shared_width_);
                     const auto observed = cpu_gdn_epoch::runShared(layout,initial,
-                        q_scratch_.data()+head*d_k,k_scratch_.data()+head*d_k,input.v+head*d_v,
+                        prepared_q,prepared_k,input.v+head*d_v,
                         gate_scratch_.data()+head,beta_sig_scratch_.data()+head,
                         seq_len,qk_stride,input.v_row_stride,n_heads,output+head*d_v,v_stride,shared);
                     if (input_state_disposition==InputStateDisposition::PublishTerminalState)
@@ -1433,7 +1438,7 @@ namespace llaminar2
                     float *working=capture_state_snapshots
                         ? snapshots+static_cast<size_t>(seq_len-1)*snapshot_stride_floats : initial;
                     const auto observed = cpu_gdn_epoch::run(layout,initial,working,
-                        q_scratch_.data()+head*d_k,k_scratch_.data()+head*d_k,input.v+head*d_v,
+                        prepared_q,prepared_k,input.v+head*d_v,
                         gate_scratch_.data()+head,beta_sig_scratch_.data()+head,
                         seq_len,qk_stride,input.v_row_stride,n_heads,output+head*d_v,v_stride,
                         snapshots,snapshot_stride_floats);
@@ -1448,46 +1453,27 @@ namespace llaminar2
 #pragma omp for schedule(static)
             for (int t = 0; t < seq_len; ++t)
             {
-                for (int h = 0; h < n_heads; ++h)
+                for (int head = 0; head < prepared_qk_heads; ++head)
                 {
-                    const int qk_off = t * qk_stride + h * d_k;
+                    const size_t qk_off = static_cast<size_t>(t) * qk_stride + head * d_k;
                     float *q_dst = q_scratch_.data() + qk_off;
                     float *k_dst = k_scratch_.data() + qk_off;
-                    if (h >= input.n_k_heads)
-                    {
-                        // Modular source-head mapping repeats after n_k_heads,
-                        // including nonzero/negative offsets. The same token's
-                        // earlier head owns the already rounded normalization;
-                        // copying it avoids repeating reductions and square roots.
-                        // This whole token belongs to one worker, so no event or
-                        // additional worksharing barrier is required here.
-                        const int prepared_off = t * qk_stride + (h % input.n_k_heads) * d_k;
-                        std::memcpy(q_dst, q_scratch_.data() + prepared_off, d_k * sizeof(float));
-                        std::memcpy(k_dst, k_scratch_.data() + prepared_off, d_k * sizeof(float));
-                    }
+                    int source_head = static_cast<int>(
+                        (static_cast<int64_t>(head) + input.global_v_head_offset) % input.n_k_heads);
+                    if (source_head < 0)
+                        source_head += input.n_k_heads;
+                    const float *q_src = input.q + static_cast<size_t>(t) * input.q_row_stride +
+                        static_cast<size_t>(source_head) * d_k;
+                    const float *k_src = input.k + static_cast<size_t>(t) * input.k_row_stride +
+                        static_cast<size_t>(source_head) * d_k;
+                    if (use_qk_l2norm)
+                        gdn_preprocess_qk_l2norm(q_src, k_src, q_dst, k_dst, d_k, scale_val, l2_eps);
                     else
-                    {
-                        int source_head =
-                            (h + input.global_v_head_offset) % input.n_k_heads;
-                        if (source_head < 0)
-                            source_head += input.n_k_heads;
-                        const float *q_src =
-                            input.q + static_cast<size_t>(t) * input.q_row_stride +
-                            static_cast<size_t>(source_head) * d_k;
-                        const float *k_src =
-                            input.k + static_cast<size_t>(t) * input.k_row_stride +
-                            static_cast<size_t>(source_head) * d_k;
+                        gdn_preprocess_qk_scale(q_src, k_src, q_dst, k_dst, d_k, scale_val);
+                }
 
-                        if (use_qk_l2norm)
-                        {
-                            gdn_preprocess_qk_l2norm(q_src, k_src, q_dst, k_dst, d_k, scale_val, l2_eps);
-                        }
-                        else
-                        {
-                            gdn_preprocess_qk_scale(q_src, k_src, q_dst, k_dst, d_k, scale_val);
-                        }
-                    }
-
+                for (int h = 0; h < n_heads; ++h)
+                {
                     // Compute the exact decode gate expressions while tokens
                     // are already distributed across the OpenMP team. The old
                     // AVX fast-exp batch changed arithmetic between prefill and
