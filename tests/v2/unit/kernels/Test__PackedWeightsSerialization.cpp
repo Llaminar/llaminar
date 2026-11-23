@@ -446,7 +446,7 @@ TEST(Test__PackedWeightsSerialization, SerializeDeserialize_WithInt8Flat)
 {
     // Test with all three data sections populated.
     auto packed = buildTestPacked(
-        64, 128, /*codebook_id=*/19, /*blocks_per_row=*/4,
+        64, 128, /*codebook_id=*/0, /*blocks_per_row=*/4,
         /*payload_bytes=*/34, /*is_nibble_lut=*/false, /*is_asymmetric=*/false,
         /*is_superblock=*/false, /*data_stride=*/2048, /*interleaved_block_stride=*/2304,
         /*interleaved_sz=*/1 * 4 * 2304, /*payload_sz=*/1 * 4 * 64 * 34,
@@ -464,7 +464,7 @@ TEST(Test__PackedWeightsSerialization, SerializeDeserialize_WithInt8Flat)
     ASSERT_NE(cpu_result, nullptr);
 
     const auto& p = cpu_result->packed();
-    EXPECT_EQ(p.codebook_id, 19);
+    EXPECT_EQ(p.codebook_id, 0);
     EXPECT_EQ(p.data_stride, 2048);
     EXPECT_EQ(p.interleaved_block_stride, 2304);
     EXPECT_TRUE(p.usesExpandedInt8());
@@ -701,6 +701,43 @@ TEST(Test__PackedWeightsSerialization, MXFP4NativeUnitE8M0BytesRoundTripAndRejec
     std::memcpy(&descriptor.header, blob.data(), sizeof(descriptor.header));
     std::memcpy(&descriptor.sections, blob.data() + sizeof(descriptor.header), sizeof(descriptor.sections));
     EXPECT_THROW((void)allocateTransferTarget(descriptor), std::invalid_argument);
+}
+
+/** @brief Exact Q8 archives round-trip and reject the old per-block weight-sum plane, even with a current header version. */
+TEST(Test__PackedWeightsSerialization, Q8ExpandedDensityRejectsLegacyCompensationPlane)
+{
+    using llaminar2::test::TestTensorFactory;
+    for (bool superblock : {false, true})
+    {
+        SCOPED_TRACE(superblock);
+        std::unique_ptr<TensorBase> source;
+        if (superblock)
+            source = TestTensorFactory::createQ8_KRandom({67, 256});
+        else
+            source = TestTensorFactory::createQ8_1Random({67, 256});
+        CPUNativeQuantisedPackedWeights packed;
+        ASSERT_TRUE(packWeightsCPUNativeQuantised(source.get(), packed));
+        CPUPackedWeights owner(std::move(packed));
+        auto blob = serialize(owner);
+        auto restored = deserialize(blob.data(), blob.size());
+        const auto *native = dynamic_cast<const CPUPackedWeights *>(restored.get());
+        ASSERT_NE(native, nullptr);
+        const auto &bytes = native->packed().native_interleaved;
+        ASSERT_EQ(bytes.size(), 128u * 8u * 34u);
+        EXPECT_EQ(std::memcmp(bytes.data(), owner.packed().native_interleaved.data(), bytes.size()), 0);
+
+        PackedWeightsTransferDescriptor direct{};
+        PackedWeightsConstSectionViews views{};
+        ASSERT_TRUE(describeTransfer(owner, direct, views));
+        EXPECT_NO_THROW((void)allocateTransferTarget(direct));
+        direct.header.interleaved_block_stride += 128;
+        direct.sections.interleaved_size += 2u * 8u * 128u;
+        EXPECT_THROW((void)allocateTransferTarget(direct), std::invalid_argument);
+        blob.resize(sizeof(PackedWeightsHeader) + sizeof(PackedWeightsSectionTable) + direct.sections.interleaved_size);
+        std::memcpy(blob.data(), &direct.header, sizeof(direct.header));
+        std::memcpy(blob.data() + sizeof(direct.header), &direct.sections, sizeof(direct.sections));
+        EXPECT_EQ(deserialize(blob.data(), blob.size()), nullptr);
+    }
 }
 
 /** @brief GPU tuple wire has20 bytes/block, authentic source4 and a distinct physical ID. */

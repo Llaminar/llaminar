@@ -199,13 +199,9 @@ void verifyPrepared(const NativeQuantisedFormatInfo &source, int n, int blocks, 
     SCOPED_TRACE(::testing::Message() << "codebook=" << int(source.codebook_id)
         << " rows=" << Rows << " n=" << n << " blocks=" << blocks << " tree=" << int(Tree)
         << " rotated=" << rotated);
-    // Rotation publishes the symmetric ExpandedInt8 stream for any original
-    // source; the Q8_0 fixture owns that geometry, provenance stays original.
-    NativeQuantisedPreparedByteFixture fixture(rotated && source.codebook_id != 19 ? native_quantised_formats::Q8_1 :
-        rotated ? native_quantised_formats::Q8_0 : source, n, blocks * 32);
-    if (rotated)
-        fixture.descriptor.source = {
-            .codebook_id = source.codebook_id, .is_superblock = source.is_superblock, .present = true};
+    // Use the original source's rotated footprint: non-Q8 rotation still
+    // retains its compensation plane, while signed-Q8 shares the dense unit.
+    NativeQuantisedPreparedByteFixture fixture(source, n, blocks * 32, 4u * 1024u * 1024u, rotated);
     if constexpr (Tree == ms::Reduction::Contiguous)
         fixture.descriptor.numerical_policy = CPUProjectionNumericalPolicy::BackendNative;
     fixture.seedPayloadAndMetadata();

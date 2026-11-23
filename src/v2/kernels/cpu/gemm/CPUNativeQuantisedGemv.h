@@ -37,7 +37,7 @@
  *   4 comp loads + 4 mullo + 4 sub (bias correction)
  *   4 scale loads + 4 mul + 4 fmadd (FP32 accumulation)
  *
- * Nibble and Q8_0 VNNI dots consume unchanged signed activations and unsigned
+ * Nibble and compensation-free signed-Q8 VNNI dots consume unchanged signed activations and unsigned
  * weights. The weight zero point is removed from the completed integer dot
  * via the activation sum, without changing the FP contribution or partition tree.
  * Unsigned expanded five-bit ordered pairs keep their existing zero point of zero.
@@ -1370,7 +1370,7 @@ namespace llaminar2::cpu::native_quantised
         return _mm512_sub_epi32(dot, _mm512_set1_epi32(bias * activation.sum_qs));
     }
 
-    /** @brief Dot with legacy unsigned activation or the Q8_0 unsigned-weight operand. */
+    /** @brief Dot with legacy unsigned activation or the compensation-free unsigned-weight operand. */
     inline __m512i dotExpandedWeights512(__m512i dot, __m512i activation, __m512i weight, bool compensated) noexcept
     {
         const auto sign_bit = _mm512_set1_epi8(-128);
@@ -1379,7 +1379,7 @@ namespace llaminar2::cpu::native_quantised
         return _mm512_dpbusd_epi32(dot, _mm512_xor_si512(weight, sign_bit), activation);
     }
 
-    /** @return The legacy per-column correction, or Q8_0's per-row correction. */
+    /** @return The legacy per-column correction, or the compensation-free per-row correction. */
     inline __m512i expandedBias512(const CPUNativeQuantisedPackedWeights &packed, const Q8_1Block &activation,
                                 int chunk, int block, int column)
     {

@@ -511,6 +511,8 @@ namespace llaminar2::test
                 {"IQ4_XS", 4, 17, [](auto s, auto r) { return Factory::createIQ4_XSRandom(s, r); }},
                 {"MXFP4", 25, 17, [](auto s, auto r) { return Factory::createMXFP4Random(s, r); }},
                 {"Q8_0", 19, 34, [](auto s, auto r) { return Factory::createQ8_0Random(s, r); }},
+                {"Q8_1", 20, 34, [](auto s, auto r) { return Factory::createQ8_1Random(s, -1.0f, 1.0f, r); }},
+                {"Q8_K", 21, 34, [](auto s, auto r) { return Factory::createQ8_KRandom(s, r); }},
             };
         }
 
@@ -527,7 +529,7 @@ namespace llaminar2::test
                 .primary_layout=packed.codebook_id == 25 ? VnniPrimaryScaleLayout::PowerOfTwoBF16Words
                                                         : VnniPrimaryScaleLayout::FP16Words}, column, 0, block);
             std::int8_t weight[32];
-            if (packed.codebook_id == 19)
+            if (packed.usesExpandedInt8())
                 std::memcpy(weight, payload, sizeof(weight));
             else
                 decode_native_block(packed.codebook_id, payload, weight);

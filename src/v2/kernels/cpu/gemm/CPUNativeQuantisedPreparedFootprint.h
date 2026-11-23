@@ -314,12 +314,28 @@ namespace llaminar2::cpu::native_quantised
         return 0;
     }
 
+    /**
+     * @brief Identify the expanded signed-Q8 units that need only payload and FP16 scale.
+     * @param encoding Physical CPU execution encoding.
+     * @param codebook_id Original source codebook for prepared CPU bytes.
+     * @return Whether the expanded unit omits its signed weight-sum plane.
+     * @details Rotation preserves the source identity and already uses the same
+     *          signed-byte payload and scale layout as ordinary Q8 preparation.
+     */
+    [[nodiscard]] constexpr bool preparedExpandedInt8OmitsCompensation(
+        CPUNativeQuantisedEncoding encoding, int codebook_id) noexcept
+    {
+        using namespace native_quantised_formats;
+        return encoding == CPUNativeQuantisedEncoding::ExpandedInt8 &&
+            (codebook_id == Q8_0.codebook_id || codebook_id == Q8_1.codebook_id || codebook_id == Q8_K.codebook_id);
+    }
+
     /** @return Whether a block stores the legacy signed weight-sum plane. */
     [[nodiscard]] constexpr bool preparedUsesInlineCompensation(
         CPUNativeQuantisedEncoding encoding, int codebook_id) noexcept
     {
         return encoding == CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale ||
-            (encoding == CPUNativeQuantisedEncoding::ExpandedInt8 && codebook_id != 19);
+            (encoding == CPUNativeQuantisedEncoding::ExpandedInt8 && !preparedExpandedInt8OmitsCompensation(encoding, codebook_id));
     }
 
     /**

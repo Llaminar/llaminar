@@ -3338,6 +3338,13 @@ add_v2_test(V2_Integration_CPUCodedCompactPackedWeightsArchiveABI
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;NativeQuantised;Serialization;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUCodedCompactPackedWeightsArchiveABI)
+# Q8 archives reject the retired expanded compensation plane before allocation.
+add_v2_test(V2_Integration_CPUQ8ExpandedArchiveABI
+    COMMAND $<TARGET_FILE:v2_unit_packed_weights_serialization>
+        --gtest_filter=Test__PackedWeightsSerialization.Q8ExpandedDensityRejectsLegacyCompensationPlane
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;NativeQuantised;Serialization;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUQ8ExpandedArchiveABI)
 # Native MXFP4 wire keeps the exact exponent-byte plane; GPU migration is not admitted.
 add_v2_test(V2_Integration_MXFP4CpuWireByteScale
     COMMAND $<TARGET_FILE:v2_test_expert_tier_weight_stream>

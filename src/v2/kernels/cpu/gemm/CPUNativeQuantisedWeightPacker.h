@@ -141,7 +141,7 @@ namespace llaminar2::cpu::native_quantised
     // For nibble-LUT formats (Q4_0, IQ4_NL, Q4_1): extracts payload nibbles + scales,
     // interleaves into 4-group VNNI layout with inline comp/scales.
     //
-    // For INT8 pre-decoded formats (Q8_0, Q5_0, etc.): extracts INT8 values + scales,
+    // For legacy compensated expanded Q5: extracts INT8 values + scales,
     // interleaves into 8-group VNNI layout with inline comp/scales.
     //
     // Superblock formats (Q6_K, Q3_K, Q2_K) are NOT supported for deferred repacking
@@ -309,7 +309,7 @@ namespace llaminar2::cpu::native_quantised
         else
         {
             // ---------------------------------------------------------------
-            // INT8 PRE-DECODED PATH (Q8_0, Q5_0, Q5_1)
+            // LEGACY COMPENSATED INT8 PATH (Q5_0, Q5_1)
             // 8 groups, 32 INT8 values per block
             // ---------------------------------------------------------------
 
@@ -344,12 +344,7 @@ namespace llaminar2::cpu::native_quantised
                         const int row = chunk * 64 + col;
                         const uint8_t *blk = native_blocks + row * native_row_stride + kb * block_size;
 
-                        if (codebook_id == 19) // Q8_0: scale(2) + qs(32) = 34 bytes
-                        {
-                            std::memcpy(&scales_buf[col], blk, 2);
-                            std::memcpy(int8_buf[col], blk + 2, 32);
-                        }
-                        else if (codebook_id == 6) // Q5_0
+                        if (codebook_id == 6) // Q5_0
                         {
                             std::memcpy(&scales_buf[col], blk, 2);
                             Q5_0Block block;

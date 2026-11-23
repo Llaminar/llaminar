@@ -166,15 +166,19 @@ inline bool validNativeSourceScaleTupleHeader(const PackedWeightsHeader &header)
              header.prepared_encoding == static_cast<uint8_t>(Encoding::NibbleLUT));
 }
 
-/** @brief Validate the exact resident section of a coded CPU archive before allocating or borrowing it. */
-inline bool validCodedCPUSection(const PackedWeightsHeader &header, const PackedWeightsSectionTable &sections) noexcept
+/** @brief Validate the exact resident section of a density-exact CPU archive before allocating or borrowing it.
+ * @param header Serialized source, encoding and geometry.
+ * @param sections Serialized resident and optional source section extents.
+ * @return Whether density-sensitive units agree with their canonical layout.
+ */
+inline bool validDensityCPUSection(const PackedWeightsHeader &header, const PackedWeightsSectionTable &sections) noexcept
 {
     using namespace cpu::native_quantised;
     const auto encoding = static_cast<CPUNativeQuantisedEncoding>(header.prepared_encoding);
-    if (!preparedSuperblockCoded(encoding))
+    if (!preparedSuperblockCoded(encoding) && !preparedExpandedInt8OmitsCompensation(encoding, header.codebook_id))
         return true;
-    const auto *source = native_quantised_formats::forSourceIdentity(header.codebook_id, true);
-    if (!source || header.is_superblock != 1 || header.is_asymmetric != uint8_t(source->is_asymmetric) ||
+    const auto *source = native_quantised_formats::forSourceIdentity(header.codebook_id, header.is_superblock == 1);
+    if (!source || header.is_superblock != uint8_t(source->is_superblock) || header.is_asymmetric != uint8_t(source->is_asymmetric) ||
         header.payload_bytes != source->payload_bytes || preparedEncodingForSource(*source) != encoding ||
         header.N <= 0 || header.K <= 0 || header.has_native_blocks ||
         sections.native_blocks_size || sections.payload_size || sections.int8_flat_size)
@@ -299,7 +303,7 @@ inline bool describeTransfer(
     sections.payload_size = packed.payload.size();
     sections.int8_flat_size = packed.int8_flat.size();
     sections.native_blocks_size = native_blocks.size();
-    if (!validCodedCPUSection(header, sections))
+    if (!validDensityCPUSection(header, sections))
         return false;
 
     views.data = {
@@ -355,7 +359,7 @@ inline PackedWeightsReceiveTarget allocateTransferTarget(
     const auto &sections = descriptor.sections;
     if (header.magic != PACKED_WEIGHTS_MAGIC ||
         header.version != PACKED_WEIGHTS_VERSION ||
-        !validNativeSourceScaleTupleHeader(header) || !validCodedCPUSection(header, sections) ||
+        !validNativeSourceScaleTupleHeader(header) || !validDensityCPUSection(header, sections) ||
         header.format !=
             static_cast<uint32_t>(PackedWeightsFormat::CPU_NATIVE_QUANTISED))
     {
@@ -587,7 +591,7 @@ inline std::unique_ptr<IPackedWeights> deserialize(
     // Read section table.
     PackedWeightsSectionTable sections;
     std::memcpy(&sections, data + sizeof(header), sizeof(sections));
-    if (!validCodedCPUSection(header, sections))
+    if (!validDensityCPUSection(header, sections))
         return nullptr;
 
     // Validate total size.

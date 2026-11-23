@@ -121,7 +121,7 @@ namespace llaminar2::cpu::native_quantised
         int data_stride = 1024;
 
         /// Total bytes per K-block including inline metadata.
-        /// = data_stride + 128 (comp) + 128 (scales) [+ 128 (mins) if asymmetric]
+        /// ExpandedInt8: payload + optional compensation + primary and optional minimum scales.
         int interleaved_block_stride = 1280;
 
         /** @brief Return whether this matrix uses native four-bit interleaving. */
@@ -183,7 +183,7 @@ namespace llaminar2::cpu::native_quantised
         /**
          * @brief Return whether each prepared block carries weight compensation.
          *
-         * Only legacy expanded INT8 sources (excluding Q8_0) store a column sum.
+         * Expanded signed-Q8 units omit the column sum; legacy expanded units retain it.
          * On x86 the compensation-free kernels consume signed activation bytes
          * and correct any unsigned weight bias with the activation sum instead.
          */

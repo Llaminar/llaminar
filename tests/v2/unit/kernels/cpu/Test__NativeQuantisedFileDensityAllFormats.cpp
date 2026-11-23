@@ -49,6 +49,16 @@ namespace
         return 0;
     }
 
+    /** @return CPU byte limit for 256 values, excluding unused source fields. */
+    std::size_t cpuBytesPer256Limit(const NativeQuantisedFormatInfo *format, std::size_t gguf)
+    {
+        // Q8_1's source sum s is derived from the payload and unused for weights.
+        if (format == &Q8_1) return 8 * (2 + 32);
+        // Q8_K's bsums are unused; projection already stages d as FP16 per 32 signed bytes.
+        if (format == &Q8_K) return 8 * (2 + 32);
+        return gguf;
+    }
+
     /** @brief Temporary CUDA migration upper bounds in bytes per 256 values. */
     struct PendingDensity
     {
@@ -103,7 +113,7 @@ namespace
                 const std::size_t chunks = (n + 63) / 64;
                 const std::size_t padded_n = chunks * 64;
                 const auto cpu = geometry.matrixBytes(chunks);
-                EXPECT_LE(cpu, padded_n * gguf);
+                EXPECT_LE(cpu, padded_n * cpuBytesPer256Limit(format, gguf));
 
                 auto source = nativeQuantisedPackedRegionSizes(n, k, *format);
                 std::size_t code_pad = 0;

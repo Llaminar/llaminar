@@ -1546,7 +1546,7 @@ namespace llaminar2
         if (!cpu::native_quantised::is_payload_decodable(gpu.codebook_id) &&
             gpu.codebook_id != kNativeQuantisedIQ4XSSourceScaleCodebook &&
             !hasCompactMultiScaleVnniPayload(gpu.codebook_id) && gpu.codebook_id != 8 &&
-            gpu.codebook_id != 19 &&
+            !cpu::native_quantised::preparedExpandedInt8OmitsCompensation(CPUEncoding::ExpandedInt8, gpu.codebook_id) &&
             gpu.codebook_id != kNativeQuantisedExpandedInt8MinCodebook)
         {
             return reject(

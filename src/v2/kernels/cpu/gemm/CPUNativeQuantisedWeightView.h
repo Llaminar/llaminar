@@ -443,7 +443,7 @@ namespace llaminar2::cpu::native_quantised
         template <CPUNativeQuantisedEncoding Physical, bool WithMinimum>
         [[nodiscard]] const std::uint16_t *admittedPerBlockPrimary(int chunk, int block) const noexcept
         {
-            // Only symmetric expanded units can be Q8_0. Derive their
+            // Only symmetric expanded units can omit compensation. Derive their
             // primary offset from the sealed stride; the asymmetric expanded
             // unit always retains the legacy compensation plane.
             const int offset = Physical == CPUNativeQuantisedEncoding::ExpandedInt8 && !WithMinimum

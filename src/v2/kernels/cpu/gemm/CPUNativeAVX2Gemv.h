@@ -103,7 +103,7 @@ namespace llaminar2::cpu::native_quantised
         return dotUnsignedWeightsAVX2(dot, _mm256_xor_si256(weights, _mm256_set1_epi8(-128)), _mm256_set1_epi32(a));
     }
 
-    /** @return The legacy per-column correction, or the activation-side correction for Q8_0. */
+    /** @return The legacy per-column correction, or the compensation-free activation-side correction. */
     inline __m256i expandedBiasAVX2(const CPUNativeQuantisedPackedWeights &packed, const Q8_1Block &activation,
                                   int chunk, int block, int column)
     {

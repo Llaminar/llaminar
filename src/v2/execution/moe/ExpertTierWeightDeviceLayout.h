@@ -123,7 +123,7 @@ namespace llaminar2
         using Encoding = cpu::native_quantised::CPUNativeQuantisedEncoding;
         return encoding == Encoding::NibbleLUT ||
             encoding == Encoding::Q4KSuperblockCoded ||
-            (encoding == Encoding::ExpandedInt8 && codebook == 19);
+            cpu::native_quantised::preparedExpandedInt8OmitsCompensation(encoding, codebook);
     }
 
     /**
