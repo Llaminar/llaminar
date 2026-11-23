@@ -30333,6 +30333,11 @@ add_v2_test(V2_Integration_GroupedVerifierRows_CPU_MoEExpertPaths
     LABELS "V2;Integration;CPU;MoE;MTP;GroupedVerifierRows;DecodeEquivalent;AllFormats;NativeQuantised;Regression"
     MPI_PROCS 1
 )
+add_v2_test(V2_Integration_CPU_GroupedFloatingDownSparsePublication
+    COMMAND $<TARGET_FILE:v2_test_moe_expert_compute_stage>
+            --gtest_filter=MoEExpertComputeStageTest.GroupedFloatingDownPublishesSparseCanonicalRows
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;MoE;FP32;CanonicalRoutes;Regression"
+    MPI_PROCS 1 NO_MODELS NO_MPI TIMEOUT 30)
 
 # This reuses the actual all-format stage replay; transported rows additionally
 # prove the native slot permutation can be retired/rebuilt between invocations.
@@ -33827,6 +33832,7 @@ foreach(V2_DIRECT_DOWN_ISA IN LISTS V2_CPU_NATIVE_ISA_CELLS)
         list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${V2_DIRECT_DOWN_TEST})
     endif()
 endforeach()
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPU_GroupedFloatingDownSparsePublication)
 
 
 # Focused native snapshot and stage-local MoE admission regressions.

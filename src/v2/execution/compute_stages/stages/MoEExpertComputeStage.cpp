@@ -4757,6 +4757,9 @@ namespace llaminar2
             : nullptr;
         if (params_.canonical_route_contributions && !canonical_routes)
             return false;
+        if (canonical_routes && !packed_canonical_records &&
+            publication_bytes / sizeof(float) > publication->numel())
+            throw std::logic_error("CPU grouped route destinations exceed their declared publication");
         const auto publication_prepare_start =
             record_cpu_moe_phase_timings
                 ? PerfStatsCollector::Clock::now()
@@ -5009,7 +5012,7 @@ namespace llaminar2
                                                  : PerfStatsCollector::Clock::time_point{};
         const int scratch_rows =
             all_native_bundles ? local_route_rows : max_batch;
-        if (!all_native_bundles)
+        if (!all_native_bundles && !canonical_routes)
         {
             const size_t required_route_output_elements =
                 static_cast<size_t>(local_route_rows) *
@@ -5233,13 +5236,12 @@ namespace llaminar2
 
             const int down_stride = d_model + static_cast<int>(packed_canonical_records);
             std::span<float> route_bank;
+            std::optional<CPUNativeQuantisedGemmKernel::GroupedDownRouteOrder> down_route_order;
             if (canonical_routes)
             {
                 const size_t bank_elements = packed_canonical_records
                     ? publication->numel() - canonical_moe_route_record::kTrailerElements
                     : publication_bytes / sizeof(float);
-                if (bank_elements > publication->numel())
-                    throw std::logic_error("CPU grouped route destinations exceed their declared publication");
                 route_bank = {canonical_routes, bank_elements};
                 // The activation gather has completed. Reuse its index span
                 // to bind one final destination per expert-major Down row.
@@ -5250,6 +5252,13 @@ namespace llaminar2
                     cpu_grouped_token_indices_[expert_position] =
                         packed_canonical_records ? local_slot : slot.row * top_k + slot.route;
                 }
+                const auto live_routes = static_cast<size_t>(local_route_rows);
+                down_route_order = CPUNativeQuantisedGemmKernel::GroupedDownRouteOrder{
+                    .expert_major_destinations = {cpu_grouped_token_indices_.data(), live_routes},
+                    .local_to_expert = {cpu_grouped_local_to_expert_position_.data(), live_routes},
+                    .destination_to_local = packed_canonical_records ? std::span<const int>{}
+                        : std::span<const int>{cpu_grouped_original_to_local_.data(), route_slot_capacity},
+                };
             }
 
             const int swiglu_q8_blocks_per_row =
@@ -5355,7 +5364,10 @@ namespace llaminar2
                         swiglu_q8_blocks_per_row,
                         down_projection_descriptors.data(),
                         down_projection_count, CPUInvocationWorkspace::available<float>(
-                            bound_workspace_, kCPUProjectionPartials)))
+                            bound_workspace_, kCPUProjectionPartials),
+                        cpu::native_quantised::FusedOutputJobOwnership::Auto,
+                        cpu::native_quantised::FusedOutputJobOwnership::Auto,
+                        down_route_order))
             {
                 LOG_ERROR("[MoEExpertComputeStage] CPU NativeQuantised layer-batched "
                           "grouped FFN transaction failed in layer "
@@ -5507,14 +5519,29 @@ namespace llaminar2
                     const int local_slot =
                         cpu_grouped_expert_local_slots_[
                             static_cast<size_t>(expert_begin + expert_row)];
+                    float *destination = nullptr;
+                    if (packed_canonical_records)
+                    {
+                        destination = canonical_moe_route_record::record(
+                            canonical_routes, static_cast<size_t>(local_slot), d_model);
+                    }
+                    else if (canonical_routes)
+                    {
+                        const auto &slot = cpu_grouped_route_slots_[local_slot];
+                        const auto flat_slot = static_cast<size_t>(slot.row) * top_k + slot.route;
+                        destination = canonical_routes + flat_slot * d_model;
+                    }
+                    else
+                    {
+                        destination = grouped_route_outputs.data() + static_cast<size_t>(local_slot) * d_model;
+                    }
+                    // The floating projection owns an expert-major matrix.
+                    // Transfer each finished row straight to its consumer.
                     std::copy_n(
                         expert_down_rows +
                             static_cast<size_t>(expert_row) *
                                 static_cast<size_t>(d_model),
-                        d_model,
-                        grouped_route_outputs.data() +
-                            static_cast<size_t>(local_slot) *
-                                static_cast<size_t>(d_model));
+                        d_model, destination);
                 }
             }
         }
@@ -5570,39 +5597,11 @@ namespace llaminar2
                         : grouped_route_outputs.data() +
                               static_cast<size_t>(output_position) *
                                   static_cast<size_t>(d_model);
-                    if (canonical_routes)
-                    {
-                        float *destination = nullptr;
-                        if (packed_canonical_records)
-                        {
-                            destination = canonical_moe_route_record::record(
-                                canonical_routes,
-                                static_cast<size_t>(local_slot),
-                                d_model);
-                        }
-                        else
-                        {
-                            destination =
-                                canonical_routes +
-                                flat_slot * static_cast<size_t>(d_model);
-                        }
-                        std::copy_n(
-                            route_output,
-                            d_model,
-                            destination);
-                    }
-                    else
-                    {
-                        primitives::vec_axpy(
-                            row_output,
-                            route_output,
-                            slot.weight,
-                            d_model);
-                    }
+                    primitives::vec_axpy(row_output, route_output, slot.weight, d_model);
                 }
             }
         };
-        if (!down_published_directly)
+        if (!canonical_routes)
             OMP_WORKSHARE_REGION(accumulate_rows);
         if (packed_canonical_records &&
             !canonical_moe_route_record::writeRecordCount(

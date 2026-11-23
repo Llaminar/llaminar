@@ -331,12 +331,16 @@ void proveExpertTransaction(ExpertFormatLayout layout = ExpertFormatLayout::Unif
                 {.kernel=&down_kernel, .input_q8=actual_q8.data()+blocks, .output=down.data()+width, .rows=rows-1, .n=width, .ldc=width},
             }};
             std::array<int, max_rows> destination{};
+            std::array<int, max_rows> local_to_expert{};
+            std::array<int, bank_rows> destination_to_local{};
+            std::optional<CPUNativeQuantisedGemmKernel::GroupedDownRouteOrder> route_order;
+            const bool packed_indices = rows % 2 == 0;
             if (indexed_down)
             {
                 std::fill(route_bank.begin(), route_bank.end(), untouched);
-                destination[0] = rows;
+                destination[0] = packed_indices ? rows - 1 : rows;
                 for (int row = 1; row < rows; ++row)
-                    destination[row] = row * 2 + (rows % 2 == 0);
+                    destination[row] = packed_indices ? row - 1 : row * 2;
                 for (std::size_t member = 0; member < down_desc.size(); ++member)
                 {
                     auto &desc = down_desc[member];
@@ -352,7 +356,8 @@ void proveExpertTransaction(ExpertFormatLayout layout = ExpertFormatLayout::Unif
             const auto run = [&] {
                 return CPUNativeQuantisedGemmKernel::execute_moe_grouped_ffn_transaction_preq_decode_equivalent(
                     gate_up.data(), gate_up.size(), width, gate.data(), up.data(), actual_q8.data(),
-                    rows, width, blocks, down_desc.data(), down_desc.size(), partials.span());
+                    rows, width, blocks, down_desc.data(), down_desc.size(), partials.span(),
+                    FusedOutputJobOwnership::Auto, FusedOutputJobOwnership::Auto, route_order);
             };
             const auto verify = [&] {
                 EXPECT_EQ(std::memcmp(gate.data(), expected_gate.data(), rows * width * sizeof(float)), 0);
@@ -387,12 +392,37 @@ void proveExpertTransaction(ExpertFormatLayout layout = ExpertFormatLayout::Unif
             down_desc.back().ldc = indexed_down ? packed_stride : width;
             if (indexed_down)
             {
-                const auto valid = down_desc.front().output_rows;
+                const auto valid = down_desc.front();
                 down_desc.front().output_rows = CPUProjectionOutputRows::indexed(route_bank, packed_stride,
                     width, {destination.data() + 1, 1u});
                 EXPECT_THROW(run(), std::invalid_argument);
                 EXPECT_TRUE(std::all_of(gate.begin(), gate.end(), [](float x) { return x == -12345.0f; }));
-                down_desc.front().output_rows = valid;
+
+                // The first column of an affine row still conflicts with the
+                // last live column of the other projection's indexed row.
+                down_desc.front().output_rows = {};
+                down_desc.front().output = route_bank.data() + destination[1] * packed_stride + width - 1;
+                EXPECT_THROW(run(), std::invalid_argument);
+                EXPECT_TRUE(std::all_of(gate.begin(), gate.end(), [](float x) { return x == -12345.0f; }));
+                down_desc.front() = valid;
+
+                destination_to_local.fill(-1);
+                for (int row = 0; row < rows; ++row)
+                {
+                    const int local_slot = packed_indices ? destination[row] : rows - 1 - row;
+                    destination_to_local[destination[row]] = local_slot;
+                    local_to_expert[local_slot] = row;
+                }
+                route_order = CPUNativeQuantisedGemmKernel::GroupedDownRouteOrder{
+                    .expert_major_destinations = std::span(destination).first(rows),
+                    .local_to_expert = std::span(local_to_expert).first(rows),
+                    .destination_to_local = packed_indices ? std::span<const int>{}
+                        : std::span<const int>{destination_to_local},
+                };
+                std::swap(local_to_expert[0], local_to_expert[1]);
+                EXPECT_THROW(run(), std::invalid_argument);
+                EXPECT_TRUE(std::all_of(gate.begin(), gate.end(), [](float x) { return x == -12345.0f; }));
+                std::swap(local_to_expert[0], local_to_expert[1]);
             }
             PerfStatsCollector::reset();
             ASSERT_TRUE(run());

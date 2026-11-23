@@ -41,6 +41,7 @@
 #include "utils/PerfStatsCollector.h"
 #include "kernels/cpu/CPUInvocationWorkspace.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <optional>
@@ -1364,6 +1365,14 @@ namespace llaminar2::cpu::native_quantised
         static constexpr int kMaxBatchedPrequantizedProjections =
             NativeQuantisedFusedRowsPlan::capacity;
 
+        /** @brief Original route ownership for one indexed Down publication bank. */
+        struct GroupedDownRouteOrder
+        {
+            std::span<const int> expert_major_destinations; ///< Final destination row for each expert-major row.
+            std::span<const int> local_to_expert; ///< Inverse of the transport's compact local route ordering.
+            std::span<const int> destination_to_local; ///< Original slot-to-local map, empty for compact packed records.
+        };
+
         /**
          * @brief Resolve the measured standalone schedule before binding phase operands.
          * @param hidden Original hidden width.
@@ -1549,6 +1558,7 @@ namespace llaminar2::cpu::native_quantised
          * @param partial_storage Admitted bank reused only after each phase's readers retire.
          * @param gate_up_ownership Independent requested gate/up ownership; defaults to typed Auto.
          * @param down_ownership Independent requested down ownership; defaults to typed Auto.
+         * @param down_route_order Optional original routing order for a complete shared Down bank.
          * @return `true` only when every team participant completes every phase.
          * @throws std::invalid_argument Before any phase writes for unsupported explicit ownership.
          */
@@ -1566,7 +1576,8 @@ namespace llaminar2::cpu::native_quantised
             int down_count,
             std::span<float> partial_storage,
             FusedOutputJobOwnership gate_up_ownership = FusedOutputJobOwnership::Auto,
-            FusedOutputJobOwnership down_ownership = FusedOutputJobOwnership::Auto)
+            FusedOutputJobOwnership down_ownership = FusedOutputJobOwnership::Auto,
+            std::optional<GroupedDownRouteOrder> down_route_order = std::nullopt)
         {
             if (!gate_up_descriptors || gate_up_count <= 0 ||
                 !down_descriptors || down_count <= 0 ||
@@ -1604,20 +1615,6 @@ namespace llaminar2::cpu::native_quantised
                         return false;
                     }
                 }
-                for (int projection = 0; projection < count; ++projection)
-                {
-                    const auto &source = descriptors[projection];
-                    if (!source.output_rows)
-                        continue;
-                    const auto indexed = fusedPrequantizedDescriptor(source);
-                    for (int sibling = 0; sibling < count; ++sibling)
-                    {
-                        if (sibling == projection || (sibling < projection && descriptors[sibling].output_rows))
-                            continue;
-                        const auto other = fusedPrequantizedDescriptor(descriptors[sibling]);
-                        requireDisjointFusedProjectionOutputs(indexed, source.rows, other, other.rows);
-                    }
-                }
                 return true;
             };
             if (!validate_bundle(
@@ -1633,6 +1630,13 @@ namespace llaminar2::cpu::native_quantised
             {
                 return false;
             }
+
+            requireDisjointIndexedBatchedOutputs({gate_up_descriptors, static_cast<size_t>(gate_up_count)});
+            const std::span down_bundle{down_descriptors, static_cast<size_t>(down_count)};
+            if (down_route_order)
+                requireGroupedDownRoutePartition(down_bundle, route_rows, *down_route_order);
+            else
+                requireDisjointIndexedBatchedOutputs(down_bundle);
 
             // Both explicit phases must be legal before gate/up can mutate any
             // payload. The same original planner is used again under the actual
@@ -1957,6 +1961,106 @@ namespace llaminar2::cpu::native_quantised
         }
 
     private:
+        /**
+         * @brief Prove shared-bank Down ownership using the router's existing inverse.
+         * @param projections Validated Down descriptors in expert-bucket order.
+         * @param route_rows Exact number of live local routes in the FFN.
+         * @param order Original forward and inverse route maps, immutable through the workshare.
+         * @throws std::invalid_argument When descriptors or route maps disagree.
+         *
+         * The descriptors must partition the same expert-major index span and
+         * share a physical bank and pitch. An exact inverse proves that no two
+         * rows can name the same slot, even when expert buckets interleave.
+         */
+        static void requireGroupedDownRoutePartition(
+            std::span<const BatchedPrequantizedProjectionDesc> projections,
+            int route_rows, const GroupedDownRouteOrder &order)
+        {
+            const auto destinations = order.expert_major_destinations;
+            if (destinations.size() != static_cast<size_t>(route_rows) ||
+                order.local_to_expert.size() != destinations.size())
+                throw std::invalid_argument("Grouped Down requires a complete live route order");
+
+            const auto &first = projections.front();
+            size_t offset = 0;
+            for (const auto &projection : projections)
+            {
+                const auto indices = projection.output_rows.indexBytes();
+                const auto rows = static_cast<size_t>(projection.rows);
+                if (projection.output != first.output || projection.ldc != first.ldc ||
+                    rows > destinations.size() - offset || indices.data != destinations.data() + offset ||
+                    indices.size != rows * sizeof(int))
+                    throw std::invalid_argument("Grouped Down descriptors do not partition one output bank");
+                offset += rows;
+            }
+            if (offset != destinations.size())
+                throw std::invalid_argument("Grouped Down descriptors do not cover the live route order");
+
+            const auto destination_to_local = order.destination_to_local;
+            for (size_t expert_row = 0; expert_row < destinations.size(); ++expert_row)
+            {
+                int local_slot = destinations[expert_row];
+                if (!destination_to_local.empty())
+                {
+                    if (static_cast<size_t>(local_slot) >= destination_to_local.size())
+                        throw std::invalid_argument("Grouped Down names a destination outside the original route order");
+                    local_slot = destination_to_local[local_slot];
+                }
+                if (static_cast<size_t>(local_slot) >= order.local_to_expert.size() ||
+                    order.local_to_expert[local_slot] != static_cast<int>(expert_row))
+                    throw std::invalid_argument("Grouped Down destinations do not have unique original owners");
+            }
+        }
+
+        /**
+         * @brief Prove a complete indexed bundle's output rows are exclusive before worksharing.
+         * @param projections Validated descriptors whose row addresses increase within each member.
+         * @throws std::invalid_argument If any two live writes overlap.
+         *
+         * Merge the original member schedules with one cursor per live expert.
+         * Visiting only neighboring intervals avoids comparing every pair of
+         * expert row lists in large prefill bundles with overlapping envelopes.
+         */
+        static void requireDisjointIndexedBatchedOutputs(
+            std::span<const BatchedPrequantizedProjectionDesc> projections)
+        {
+            if (std::none_of(projections.begin(), projections.end(),
+                    [](const auto &projection) { return static_cast<bool>(projection.output_rows); }))
+                return;
+
+            struct Cursor
+            {
+                const BatchedPrequantizedProjectionDesc *projection;
+                float *address;
+                int row;
+            };
+            std::array<Cursor, kMaxBatchedPrequantizedProjections> cursors;
+            auto end = cursors.begin();
+            for (const auto &projection : projections)
+                *end++ = {&projection, projection.output_rows.rowAddress(
+                    projection.output, projection.ldc, 0), 0};
+            const auto later = [](const Cursor &left, const Cursor &right) {
+                return reinterpret_cast<std::uintptr_t>(left.address) >
+                    reinterpret_cast<std::uintptr_t>(right.address);
+            };
+            std::make_heap(cursors.begin(), end, later);
+            storage_proof::Bytes previous;
+            while (end != cursors.begin())
+            {
+                std::pop_heap(cursors.begin(), end, later);
+                auto &cursor = *--end;
+                const auto &projection = *cursor.projection;
+                const storage_proof::Bytes current{cursor.address, static_cast<size_t>(projection.n) * sizeof(float)};
+                storage_proof::requireDisjoint(previous, current);
+                previous = current;
+                if (++cursor.row != projection.rows)
+                {
+                    cursor.address = projection.output_rows.rowAddress(projection.output, projection.ldc, cursor.row);
+                    std::push_heap(cursors.begin(), ++end, later);
+                }
+            }
+        }
+
         /**
          * @brief Preserve the original prepared descriptor projection in one authority.
          * @param source Already validated original batched member.

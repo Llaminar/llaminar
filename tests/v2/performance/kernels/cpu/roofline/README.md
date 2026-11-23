@@ -560,3 +560,33 @@ The same trace measured 249.48 µs of local execution per rank-one call.
 The unchanged 15.43 MB logical weight footprint gives a service proxy of
 61.83 GB/s, or 56.2% of that socket's concurrent 110 GB/s reference.
 These measurements cover the isolated standalone candidate.
+
+Grouped NativeQuantised Down binds the original route destinations before
+the expert-major workshare and commits the packed count after all live
+writes. The mixed-format regression covered all 21 source formats on
+AVX2 and AVX-512, including overlapping-destination rejection, inactive
+rows, record padding, and execution inside an existing team. The combined
+CUDA+CPU Release smoke matched the archived 32-token prefix in ordinary
+and fixed-depth-seven modes. Its counters recorded 576 packed prefill and
+1,872 packed verifier publications across the two CPU ranks.
+
+A matched instrumented Release comparison measured 284.06 and 284.65
+prefill tokens/s with staged Down for ordinary and fixed-depth-seven
+generation. The initial indexed publication measured 260.09 and 259.36
+tokens/s. On CPU rank one its pairwise overlap proof used 1,438.09 ms
+across the campaign, compared with 274.12 ms for the former prefill copy.
+Merging the sorted write intervals reduced the proof to 121.88 ms and
+recovered prefill to 283.58 and 282.88 tokens/s. All 32-token histories and
+MTP work matched across the three arms. The instrumented phase totals are
+in `benchmark_results/qfn-cuda-2x2-95943372/direct-publication-release/grouped-isolation/profile/`.
+
+The grouped MoE stage supplies the original router's inverse map. The
+projection transaction checks that its descriptors partition the exact
+index span and verifies each destination's original owner before either
+projection writes. Independent bundles use the sorted-interval proof.
+The inverse-map run spent 3.54 ms in rank one's validation across the
+same 2,544 Down invocations. Its rank-one prefill FFN and publication total
+fell from 4,563.60 to 4,447.72 ms. Instrumented full-prefill rates were
+286.46 and 285.56 tokens/s against matched controls of 288.06 and 287.66,
+with exact 32-token histories and MTP work. See
+`benchmark_results/qfn-cuda-2x2-95943372/direct-publication-release/grouped-linear-isolation/profile/`.

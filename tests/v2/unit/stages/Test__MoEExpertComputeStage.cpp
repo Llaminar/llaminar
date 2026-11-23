@@ -1668,6 +1668,105 @@ TEST_F(MoEExpertComputeStageTest, SharedExpert_RuntimeMVerifierAllNativeFormatsM
     PerfStatsCollector::reset();
 }
 
+/** @test Floating Down scatters live expert rows into the original dense or packed slots. */
+TEST_F(MoEExpertComputeStageTest, GroupedFloatingDownPublishesSparseCanonicalRows)
+{
+    ScopedOpenMPThreadCount omp_threads(/*threads=*/1);
+    constexpr int rows = 3, width = 32, experts = 3, top_k = 2;
+    constexpr int slots = rows * top_k;
+    constexpr float guard = -313.0f;
+    constexpr std::array<int, slots> routing{2, 0, 1, 2, 0, -1};
+    constexpr std::array<float, slots> weights{0.5f, 0.25f, 0.5f, 0.5f, 0.25f, 0.0f};
+    const std::vector<bool> owned{true, false, true};
+    FP32Tensor input({rows, width}), indices({rows, top_k}), route_weights({rows, top_k});
+    FP32Tensor output({rows, width});
+    std::transform(routing.begin(), routing.end(), indices.mutable_data(),
+        [](int expert) { return static_cast<float>(expert); });
+    std::copy(weights.begin(), weights.end(), route_weights.mutable_data());
+    for (int row = 0; row < rows; ++row)
+        for (int column = 0; column < width; ++column)
+            input.mutable_data()[row * width + column] = (row + 1) * (column - 17) / 64.0f;
+
+    const auto diagonal = [](float value) {
+        auto matrix = TestTensorFactory::createFP32({width, width});
+        std::fill_n(matrix->mutable_data(), width * width, 0.0f);
+        for (int column = 0; column < width; ++column)
+            matrix->mutable_data()[column * width + column] = value;
+        return matrix;
+    };
+    MoEExpertComputeStage::Params common;
+    common.device_id = DeviceId::cpu();
+    common.input = &input;
+    common.routing_indices = &indices;
+    common.routing_weights = &route_weights;
+    common.output = &output;
+    common.seq_len = rows;
+    common.d_model = width;
+    common.num_experts = experts;
+    common.top_k = top_k;
+    common.expert_intermediate = width;
+    common.expert_mask = owned;
+    common.canonical_route_arithmetic = MoECanonicalRouteArithmeticPolicy::UnweightedExpertRowThenOrderedFMA;
+    for (int expert = 0; expert < experts; ++expert)
+    {
+        common.expert_gate_views.push_back(diagonal(static_cast<float>(expert + 1)));
+        common.expert_up_views.push_back(diagonal(1.0f));
+        common.expert_down_views.push_back(diagonal(0.5f * (expert + 1)));
+    }
+
+    for (const auto layout : {MoECanonicalRoutePublicationLayout::DenseOriginalRouteSlots,
+             MoECanonicalRoutePublicationLayout::PackedIndexedRouteRows})
+    {
+        const bool packed = layout == MoECanonicalRoutePublicationLayout::PackedIndexedRouteRows;
+        const size_t elements = packed ? slots * canonical_moe_route_record::recordWidth(width) +
+            canonical_moe_route_record::kTrailerElements : slots * width;
+        FP32Tensor publication({elements});
+        std::fill_n(publication.mutable_data(), elements, guard);
+        auto params = common;
+        params.canonical_route_layout = layout;
+        params.canonical_route_contributions = &publication;
+        const auto admission = test::admitCPUExpertStageForTest(params, PhysicalMemoryOwner::PrimaryModelWeights);
+        ASSERT_TRUE(MoEExpertComputeStage::prepareExpertGemmEngines(params));
+        ExpertGemmRegistry registry;
+        publishCPUExpertStageRegistryForTest(params, registry);
+        MoEExpertComputeStage stage(params);
+        auto workspace = bindExpertWorkspace(stage, params);
+        ASSERT_TRUE(stage.execute(cpu_ctx_.get()));
+
+        size_t live = 0;
+        for (int slot = 0; slot < slots; ++slot)
+        {
+            const int expert = routing[slot];
+            if (expert < 0 || !owned[expert])
+            {
+                if (!packed)
+                    EXPECT_TRUE(std::all_of(publication.data() + slot * width,
+                        publication.data() + (slot + 1) * width, [](float value) { return value == 0.0f; }));
+                continue;
+            }
+            const float *result = packed ? canonical_moe_route_record::record(publication.data(), live, width)
+                : publication.data() + slot * width;
+            if (packed)
+                EXPECT_EQ(canonical_moe_route_record::readFlatRouteSlot(result, width), static_cast<uint32_t>(slot));
+            const float factor = static_cast<float>(expert + 1);
+            for (int column = 0; column < width; ++column)
+            {
+                const float value = input.data()[(slot / top_k) * width + column];
+                const float gate = value * factor;
+                EXPECT_NEAR(result[column], (gate / (1.0f + std::exp(-gate))) * value * (0.5f * factor), 1e-6f);
+            }
+            ++live;
+        }
+        if (packed)
+        {
+            EXPECT_EQ(canonical_moe_route_record::readRecordCount(publication.data(), elements), live);
+            EXPECT_TRUE(std::all_of(canonical_moe_route_record::record(publication.data(), live, width),
+                publication.data() + elements - canonical_moe_route_record::kTrailerElements,
+                [](float value) { return value == guard; }));
+        }
+    }
+}
+
 TEST_F(MoEExpertComputeStageTest, MoEFFN_RuntimeMVerifierMatchesSerialDecode_AllNativeFormatsRouterQ8Reuse)
 {
     ScopedEnv perf_env("LLAMINAR_PERF_STATS_SUMMARY", "1");
