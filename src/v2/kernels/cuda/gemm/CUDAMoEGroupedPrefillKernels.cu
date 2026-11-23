@@ -887,8 +887,6 @@ namespace
                         uint32_t scale_bits = 0;
                         if (column < N)
                         {
-                            const size_t linear =
-                                static_cast<size_t>(block) * N + column;
                             // The slot carries the normalized staged word (low 16 bits).
                             const auto words = ::llaminar2::native_quantised_scale::loadBlockMetadata<CodebookId>(
                                 weight_meta, ::llaminar2::native_quantised_scale::blockMajorAddress(weight_meta, block, column, N));
@@ -1522,8 +1520,6 @@ namespace
                         uint32_t up_scale_pair = 0;
                         if (column < N)
                         {
-                            const size_t linear =
-                                static_cast<size_t>(block) * N + column;
                             const auto gate_words = ::llaminar2::native_quantised_scale::loadBlockMetadata<CodebookId>(
                                 gate_meta, ::llaminar2::native_quantised_scale::blockMajorAddress(gate_meta, block, column, N));
                             const auto up_words = ::llaminar2::native_quantised_scale::loadBlockMetadata<CodebookId>(
