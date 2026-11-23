@@ -163,10 +163,9 @@ namespace llaminar2::cpu::native_quantised
                    : static_cast<std::uint8_t>(codebook_id);
     }
 
-    /** @brief Offset of the code plane, after payload and any retained IQ4_XS compensation.
-     * @param encoding Physical coded CPU encoding.
+    /** @brief Offset of the first code plane in a superblock-coded CPU unit.
      * @param data_stride Bytes of payload per 64-column unit.
-     * @return Byte offset relative to the admitted block.
+     * @return Byte offset relative to the admitted block; no column sums precede it.
      */
     [[nodiscard]] constexpr std::uint32_t preparedCodedPlaneOffset(
         CPUNativeQuantisedEncoding, std::uint32_t data_stride) noexcept
