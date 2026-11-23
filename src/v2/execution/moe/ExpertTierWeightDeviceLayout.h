@@ -375,7 +375,10 @@ namespace llaminar2
                 return hasCompactMultiScaleVnniPayload(cpu_codebook_id) &&
                        gpu_codebook_id == cpu_codebook_id &&
                        gpu_payload_bytes_per_block == source_format->payload_bytes &&
-                       cpu_is_asymmetric != 0 && gpu_is_asymmetric != 0 &&
+                       // Secondary-plane presence follows the source: single-scale
+                       // IQ3_XXS/IQ2_XXS units carry none on either side.
+                       cpu_is_asymmetric == static_cast<uint8_t>(source_format->is_asymmetric) &&
+                       gpu_is_asymmetric == cpu_is_asymmetric &&
                        gpu_has_emins == static_cast<uint8_t>(source_format->has_emins);
             }
             return false;
