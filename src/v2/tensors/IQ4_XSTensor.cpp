@@ -499,7 +499,7 @@ namespace llaminar2
 
     void IQ4_XSTensor::packVnniBlock(const VnniPackContext &ctx, int source_n, int destination_n, int b) const
     {
-        if (!ctx.mins_array)
+        if (!ctx.mins_array && !vnniCoded(ctx))
             throw std::invalid_argument("IQ4_XS preparation requires original coefficient storage");
         const size_t linear = vnniLinearIdx(ctx, destination_n, b);
         const int sb_per_row = vnniSuperBlocksPerRow(ctx.K);
@@ -511,6 +511,11 @@ namespace llaminar2
 
         const int ls = ((blk->scales_l[sub_idx / 2] >> (4 * (sub_idx % 2))) & 0xf) |
                        (((blk->scales_h >> (2 * sub_idx)) & 3) << 4);
+        if (vnniCoded(ctx))
+        {
+            vnniStoreCoded(ctx, linear, destination_n, b, static_cast<uint32_t>(ls), blk->d);
+            return;
+        }
         ctx.scales_array[linear] = blk->d;
         ctx.mins_array[linear] = native_quantised_iq4xs_scale::encodeSourceCoefficient(
             static_cast<uint8_t>(ls));

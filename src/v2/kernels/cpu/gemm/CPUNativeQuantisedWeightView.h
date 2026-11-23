@@ -17,6 +17,7 @@
  */
 #pragma once
 
+#include "CPUNativeQuantisedCodedMetadata.h"
 #include "CPUNativeQuantisedEncoding.h"
 #include "kernels/common/DeviceFP32NumericalContract.h"
 #include "kernels/common/MoEProjectionNumericalContract.h"
@@ -239,6 +240,7 @@ namespace llaminar2::cpu::native_quantised
         const CPUProjectionNumericalPolicy numerical_policy; ///< Immutable arithmetic identity.
         const int data_stride; ///< Weight data bytes before inline metadata.
         const int interleaved_block_stride; ///< Total physical bytes per 64-column/K block.
+        const int superblock_header_bytes; ///< Bytes after each eight-block coded unit (0 for per-block encodings).
 
         /// Every view is metadata-admitted: readers need no reserved-bit tests.
         static constexpr bool metadata_admitted = true;
@@ -276,8 +278,10 @@ namespace llaminar2::cpu::native_quantised
             const CPUNativeQuantisedWeightDescriptor &descriptor, std::span<const std::uint8_t> bytes)
         {
             const auto view = admitStructure(descriptor, bytes);
+            // Coded compact units hold codes and superblock words, every value
+            // of which is in-domain; they have no secondary words to normalize.
             const bool secondary = view.is_asymmetric || view.usesNibbleLUTSourceScale() ||
-                view.usesIQ3SExpandedSourceScale() || view.usesQ6KNativeDualScale() || view.usesCompactMultiScale();
+                view.usesIQ3SExpandedSourceScale() || view.usesQ6KNativeDualScale();
             return {
                 .columns = view.N, .padded_columns = view.N_padded, .blocks_per_row = view.blocks_per_row,
                 .data_stride = view.data_stride, .interleaved_block_stride = view.interleaved_block_stride,
@@ -318,13 +322,74 @@ namespace llaminar2::cpu::native_quantised
         /** @return Exact borrowed publication extent. */
         [[nodiscard]] std::span<const std::uint8_t> bytes() const noexcept { return bytes_; }
 
+        /** @return Whether metadata is superblock-coded (codes + per-superblock words). */
+        [[nodiscard]] bool superblockCoded() const noexcept { return preparedSuperblockCoded(encoding); }
+        /** @return Block/header addressing of this publication (superblock-aligned). */
+        [[nodiscard]] CPUNativeQuantisedBlockGeometry geometry() const noexcept
+        {
+            return {.block_stride = std::size_t(interleaved_block_stride),
+                    .header_bytes = std::size_t(superblock_header_bytes),
+                    .blocks_per_row = std::size_t(blocks_per_row)};
+        }
+
         /** @brief Borrow one complete primary metadata vector.
          * @param chunk Physical 64-column chunk.
          * @param block Logical 32-value K block.
          * @return Sixty-four primary half words in original column order.
+         * @throws std::logic_error For superblock-coded units (no per-block words exist).
          */
         [[nodiscard]] const std::uint16_t *chunkScales(int chunk, int block) const
-        { return reinterpret_cast<const std::uint16_t *>(unit(chunk, block) + data_stride + (usesInlineCompensation() ? 128 : 0)); }
+        {
+            requirePerBlockMetadata();
+            return reinterpret_cast<const std::uint16_t *>(unit(chunk, block) + data_stride + (usesInlineCompensation() ? 128 : 0));
+        }
+
+        /** @brief First byte of one 64-column block (payload planes, then code planes). */
+        [[nodiscard]] const std::uint8_t *blockUnit(int chunk, int block) const { return unit(chunk, block); }
+        /** @brief blockUnit() for coordinates an admitted binding proved in range. */
+        [[nodiscard]] const std::uint8_t *admittedBlockUnit(int chunk, int block) const noexcept
+        {
+            if (chunk < 0 || chunk >= N_padded / 64 || block < 0 || block >= blocks_per_row) [[unlikely]]
+                rejectOutsideAdmittedPublication();
+            return bytes_.data() + geometry().blockOffset(std::size_t(chunk), std::size_t(block));
+        }
+
+        /**
+         * @brief The 64 superblock words serving one coded block.
+         * @param chunk Physical 64-column chunk.
+         * @param block Logical K block (any block of the source superblock).
+         * @return Header of the block's eight-block unit.
+         * @throws std::logic_error For per-block encodings.
+         */
+        [[nodiscard]] const std::uint8_t *superblockHeader(int chunk, int block) const
+        {
+            if (!superblockCoded())
+                throw std::logic_error("Native CPU weight encoding has no superblock words");
+            (void)unit(chunk, block);
+            return bytes_.data() + geometry().headerOffset(std::size_t(chunk), std::size_t(block));
+        }
+        /** @brief superblockHeader() for coordinates an admitted binding proved in range. */
+        [[nodiscard]] const std::uint8_t *admittedSuperblockHeader(int chunk, int block) const noexcept
+        {
+            if (chunk < 0 || chunk >= N_padded / 64 || block < 0 || block >= blocks_per_row) [[unlikely]]
+                rejectOutsideAdmittedPublication();
+            return bytes_.data() + geometry().headerOffset(std::size_t(chunk), std::size_t(block));
+        }
+
+        /**
+         * @brief Reconstruct a coded column's per-block staged words through the codec.
+         * @return Exactly the words a per-block unit would have held (GPU contract).
+         */
+        [[nodiscard]] native_quantised_superblock::StagedBlockMetadata codedBlockMetadata(int chunk, int block, int column) const
+        {
+            validateColumn(column);
+            const std::uint8_t *base = unit(chunk, block);
+            std::uint8_t payload[16]{};
+            compactColumnPayload(base, codebook_id, column, payload);
+            const auto code = coded_metadata::columnCode(base, data_stride, codebook_id, column, payload);
+            const auto word = coded_metadata::loadSuperblockWord(superblockHeader(chunk, block), codebook_id, column);
+            return native_quantised_superblock::decodeSuperblockMetadata(codebook_id, code, word);
+        }
 
         /** @brief Borrow the second source coefficient/scale/minimum vector.
          * @param chunk Physical 64-column chunk.
@@ -334,8 +399,9 @@ namespace llaminar2::cpu::native_quantised
          */
         [[nodiscard]] const std::uint16_t *chunkMins(int chunk, int block) const
         {
+            requirePerBlockMetadata();
             if (!is_asymmetric && !usesNibbleLUTSourceScale() && !usesIQ3SExpandedSourceScale() &&
-                !usesQ6KNativeDualScale() && !usesCompactMultiScale())
+                !usesQ6KNativeDualScale())
                 throw std::logic_error("Native CPU weight encoding has no secondary metadata");
             return reinterpret_cast<const std::uint16_t *>(unit(chunk, block) + data_stride + (usesInlineCompensation() ? 256 : 128));
         }
@@ -358,19 +424,6 @@ namespace llaminar2::cpu::native_quantised
         [[nodiscard]] const std::uint16_t *admittedMins(int chunk, int block) const noexcept
         { return reinterpret_cast<const std::uint16_t *>(admittedUnit(chunk, block) + data_stride + (usesInlineCompensation() ? 256 : 128)); }
 
-        /** @brief Borrow Q2_K's packed pair of effective minima.
-         * @param chunk Physical output chunk.
-         * @param block Logical K block.
-         * @return Sixty-four raw low/high half-word pairs.
-         * @throws std::logic_error If the encoding is not compact multi-scale.
-         */
-        [[nodiscard]] const std::uint32_t *chunkEffectiveMins(int chunk, int block) const
-        {
-            if (!usesCompactMultiScale() || codebook_id != 10)
-                throw std::logic_error("Effective minima exist only in compact Q2_K weights");
-            return reinterpret_cast<const std::uint32_t *>(unit(chunk, block) + data_stride + 256);
-        }
-
         /** @brief Borrow one 16-column/four-byte interleaving group.
          * @param chunk Physical output chunk.
          * @param block Logical K block.
@@ -381,7 +434,9 @@ namespace llaminar2::cpu::native_quantised
          */
         [[nodiscard]] const std::uint8_t *interleavedB(int chunk, int block, int group, int vector) const
         {
-            if (group < 0 || group >= data_stride / 256 || vector < 0 || vector >= 4)
+            if (group < 0 || group >= (usesCompactMultiScale() ? int(preparedCompactPayloadWords(codebook_id))
+                                                                  : data_stride / 256) ||
+                vector < 0 || vector >= 4)
                 throw std::out_of_range("Native CPU interleaved payload group is outside its unit");
             return unit(chunk, block) + group * 256 + vector * 64;
         }
@@ -395,6 +450,11 @@ namespace llaminar2::cpu::native_quantised
         [[nodiscard]] float blockScale(int chunk, int block, int column) const
         {
             validateColumn(column);
+            if (superblockCoded())
+            {
+                const auto words = codedBlockMetadata(chunk, block, column);
+                return nativeQuantisedPrimaryScale(encoding, codebook_id, words.primary, words.secondary);
+            }
             const bool source_scale = usesNibbleLUTSourceScale() || usesIQ3SExpandedSourceScale() ||
                 usesQ6KNativeDualScale() || (usesCompactMultiScale() && codebook_id == 13);
             const auto secondary = source_scale ? chunkMins(chunk, block)[column] : 0;
@@ -411,6 +471,11 @@ namespace llaminar2::cpu::native_quantised
         {
             validateColumn(column);
             (void)unit(chunk, block);
+            if (superblockCoded())
+            {
+                const auto words = codedBlockMetadata(chunk, block, column);
+                return nativeQuantisedSecondaryScale(encoding, codebook_id, words.primary, words.secondary);
+            }
             if (usesNibbleLUTSourceScale() || usesIQ3SExpandedSourceScale() ||
                 (!is_asymmetric && !usesQ6KNativeDualScale() && !usesCompactMultiScale()))
                 return 0.0f;
@@ -453,10 +518,15 @@ namespace llaminar2::cpu::native_quantised
             if (padded > std::numeric_limits<int>::max())
                 throw std::overflow_error("Native CPU padded output width exceeds its ABI");
             const std::size_t stride = preparedInterleavedBlockStride(descriptor.encoding, descriptor.is_asymmetric, descriptor.source.codebook_id);
+            const std::size_t header = preparedSuperblockHeaderBytes(descriptor.encoding, descriptor.source.codebook_id);
             const std::size_t chunks = static_cast<std::size_t>(padded / 64);
-            if (chunks > std::numeric_limits<std::size_t>::max() / static_cast<std::size_t>(blocks) / stride)
+            if (header && blocks % native_quantised_superblock::kBlocksPerSuperblock != 0)
+                throw std::invalid_argument("Superblock-coded CPU weights require whole source superblocks per row");
+            if (chunks > std::numeric_limits<std::size_t>::max() / static_cast<std::size_t>(blocks) / (stride + header))
                 throw std::overflow_error("Native CPU weight stream extent overflow");
-            const std::size_t extent = chunks * static_cast<std::size_t>(blocks) * stride;
+            const std::size_t extent = CPUNativeQuantisedBlockGeometry{
+                .block_stride = stride, .header_bytes = header, .blocks_per_row = static_cast<std::size_t>(blocks)}
+                                           .matrixBytes(chunks);
             if (bytes.empty() || !bytes.data() || bytes.size() != extent ||
                 reinterpret_cast<std::uintptr_t>(bytes.data()) % alignof(std::uint32_t) != 0)
                 throw std::invalid_argument("Native CPU weight view requires the exact aligned resident byte extent");
@@ -480,7 +550,16 @@ namespace llaminar2::cpu::native_quantised
               source_payload_bytes(source.payload_bytes), codebook_id(source.codebook_id),
               is_asymmetric(d.is_asymmetric), is_superblock(source.is_superblock), encoding(d.encoding),
               numerical_policy(d.numerical_policy), data_stride(preparedDataStride(d.encoding, d.source.codebook_id)),
-              interleaved_block_stride(preparedInterleavedBlockStride(d.encoding, d.is_asymmetric, d.source.codebook_id)), bytes_(bytes) {}
+              interleaved_block_stride(preparedInterleavedBlockStride(d.encoding, d.is_asymmetric, d.source.codebook_id)),
+              superblock_header_bytes(static_cast<int>(preparedSuperblockHeaderBytes(d.encoding, d.source.codebook_id))),
+              bytes_(bytes) {}
+
+        /** @throws std::logic_error For superblock-coded units, which hold no per-block words. */
+        void requirePerBlockMetadata() const
+        {
+            if (superblockCoded())
+                throw std::logic_error("Superblock-coded CPU weights hold no per-block metadata words");
+        }
 
         /** @brief Check one column coordinate without clamping it into a valid lane.
          * @param column Physical column within one 64-column unit.
@@ -502,7 +581,7 @@ namespace llaminar2::cpu::native_quantised
         {
             if (chunk < 0 || chunk >= N_padded / 64 || block < 0 || block >= blocks_per_row)
                 throw std::out_of_range("Native CPU weight unit is outside the admitted publication");
-            return bytes_.data() + (std::size_t(chunk) * blocks_per_row + block) * interleaved_block_stride;
+            return bytes_.data() + geometry().blockOffset(std::size_t(chunk), std::size_t(block));
         }
 
         /**
@@ -516,6 +595,9 @@ namespace llaminar2::cpu::native_quantised
         {
             if (chunk < 0 || chunk >= N_padded / 64 || block < 0 || block >= blocks_per_row) [[unlikely]]
                 rejectOutsideAdmittedPublication();
+            // Per-block encodings only (their admitted metadata readers): the
+            // original expression, with no superblock-header arithmetic in the
+            // hot path. Coded readers use admittedBlockUnit().
             return bytes_.data() + (std::size_t(chunk) * blocks_per_row + block) * interleaved_block_stride;
         }
 
@@ -539,8 +621,6 @@ namespace llaminar2::cpu::native_quantised
         { rule = native_quantised_iq3s_scale::valid; name = "IQ3_S"; }
         else if (view.usesNibbleLUTSourceScale())
         { rule = native_quantised_iq4xs_scale::valid; name = "IQ4_XS"; }
-        else if (view.usesCompactMultiScale() && view.codebook_id == 13)
-        { rule = native_quantised_iq2s_scale::valid; name = "IQ2_S"; }
         if (rule)
         {
             // Every lane of every unit, padding columns included: native loads

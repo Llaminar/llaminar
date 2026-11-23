@@ -523,6 +523,12 @@ namespace llaminar2
         payload_buf[5] = qh[1];
 
         std::memcpy(vnniPayloadDst(ctx, linear), payload_buf, 6);
+        if (vnniCoded(ctx))
+        {
+            // Code: both 3-bit scales; the reconstructed half d per superblock.
+            vnniStoreCoded(ctx, linear, destination_n, b, static_cast<uint32_t>(sc3_lo | (sc3_hi << 3)), scale_u16);
+            return;
+        }
         ctx.scales_array[linear] = fp32_to_fp16(dl1);
         ctx.mins_array[linear] = fp32_to_fp16(dl2);
     }

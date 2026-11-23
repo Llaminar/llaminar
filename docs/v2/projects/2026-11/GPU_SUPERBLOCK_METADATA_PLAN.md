@@ -1,6 +1,6 @@
 # GPU superblock-coded NativeQuantised metadata
 
-Status: CUDA implemented (2026-11-23); ROCm and CPU tier pending.
+Status: CUDA implemented (2026-11-23); ROCm (josh) and CPU tier + migration in progress on the same PR.
 
 ## Problem
 
@@ -184,12 +184,71 @@ products instead of codes + superblock d; payloads padded to whole 32-bit
 words per column (IQ2_XS/IQ2_S 9 -> 12 bytes); expanded signed-INT8 for
 IQ3_S/Q5_K/Q5_0/Q5_1; per-block planes in reusable GPU slots.
 
-Target: CPU units carry the source payload bytes (byte-interleaved) and the
-same codes + superblock words as CUDA; NEON/AVX2/AVX-512 loaders reconstruct
-the identical FP16 words with the shared codec; GPU migration slots become
-coded; streams copy codes and superblock words in both directions. Gates:
-byte-identical CPU outputs per ISA, captured CPU<->GPU round trips, wire
-extents equal the file bytes.
+### CPU coded units (design)
+
+Every superblock-codable source format without activation rotation is
+prepared as a coded CPU unit; rotation requantizes to FP32-derived scales and
+keeps its per-block expanded-INT8 unit. The representation is a property of
+the prepared matrix (descriptor, read view, metadata seal, archive and wire
+manifest), never a runtime choice.
+
+- **Codes and words come from the host packer.** `VnniPackContext` gains
+  `codes_array`/`superblocks_array`; each codable host `packVnniBlock` writes
+  the same code and `d`/`dmin` word as the CUDA/HIP repack (and embeds the
+  code in the payload for IQ3_XXS/IQ2_XS/IQ2_XXS). `V2_Unit_VnniCodedPacking`
+  proves, for every format and for windows that start inside a superblock,
+  that the restored payload equals the per-block payload and that
+  `decodeSuperblockMetadata(code, word)` equals the per-block staged words.
+  The host per-block converter keeps a computed `-0`; the coded path follows
+  the GPU publication contract (`+0`), which is also what the GPU computes.
+- **Unit (64 columns x one K block).** Payload is stored column-interleaved
+  at its exact width: whole 32-bit words where the payload has them, then one
+  narrower plane (16-bit for IQ1_S/IQ1_M qh, 8-bit for the ninth IQ2_XS/IQ2_S
+  byte, the thirteenth IQ3_S byte). A narrower plane loads zero-extended into
+  the same 32-bit lane the decoder reads today, so decoder bodies stay
+  unchanged apart from sign-parity restoration for code-in-payload formats.
+  The code follows at exact width, split into lane-friendly planes (16 =
+  halfword, 12 = byte + nibble, 8 = byte, 6 = nibble + 2-bit, 4 = nibble).
+- **Superblock words** live after all units in `[chunk][superblock][column]`
+  order; packing windows are superblock-aligned on the CPU, so the phase is 0.
+- **Readers.** One SIMD reconstruction per codebook (AVX2, AVX-512 and NEON
+  share it through the existing vector types) computes the codec's float
+  expression in the same order, rounds through the hardware half conversion
+  and adds `+0.0f` (the contract's signed-zero canonicalization), producing
+  the same FP32 scale the per-block word widened to. Scalar accessors use the
+  codec directly.
+- **Per-matrix extent** = file bytes per (column, block) x 64-padded columns,
+  plus the superblock plane: the 64-column padding is the only overhead.
+- **Compensation.** Nibble and expanded-INT8 units store a per-block weight
+  sum (2 B/column) for the unsigned-activation dot. Coded nibble units
+  (Q4_K, IQ4_XS) compute it in the dot instead (sign-moved activation, as the
+  compact family already does) so they also reach the file density.
+- **Native payloads.** IQ3_S and Q5_K leave expanded INT8 for their native
+  payload (IQ3_S grid lookup as IQ3_XXS does; Q5_K nibble + high-bit plane),
+  measured against the expanded form before the old path is retired.
+
+### Migration
+
+GPU migration slots and the CPU<->GPU expert stream switch to coded units in
+the same change as the CPU unit of each format: promotion and demotion copy
+codes, payload bytes and superblock words, never derived products, so both
+directions are exact. Slot capacity, manifests (layout field and version) and
+transfer extents equal the coded unit bytes.
+
+### Order
+
+1. Host coded packing + proof (done in this PR).
+2. Compact family (IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, Q2_K,
+   Q3_K): unit, packer, view/seal, scalar and SIMD readers, footprint and
+   admission, archive, migration.
+3. Q6_K, IQ4_XS, Q4_K (source-scale and nibble families).
+4. IQ3_S and Q5_K native payloads.
+5. ROCm migration kernels with the ROCm reader port.
+
+Gates per step: device-free coded == per-block byte-exact outputs on every
+ISA (AVX2, AVX-512, NEON) and thread count; CPU<->GPU round trips with wire
+extents equal to the unit bytes; admission at file density; performance
+measured against the per-block unit on each ISA.
 
 ## Sequencing
 

@@ -480,6 +480,11 @@ namespace llaminar2
         const uint8_t sc = blk->scales[sub_idx];
 
         std::memcpy(vnniPayloadDst(ctx, linear), payload_buf, 9);
+        if (vnniCoded(ctx))
+        {
+            vnniStoreCoded(ctx, linear, destination_n, b, sc, blk->d);
+            return;
+        }
         ctx.scales_array[linear] = blk->d;
         ctx.mins_array[linear] = native_quantised_iq2s_scale::pack(sc);
     }
