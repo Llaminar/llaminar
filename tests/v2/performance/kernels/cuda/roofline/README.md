@@ -684,7 +684,9 @@ of retained Gate/Up and Down nodes matched the preceding fused candidate.
 The same-library Release comparison selects the direct planner for the
 candidate verifier and stages the control verifier. Both orders preserved all
 256 generated tokens and the per-request MTP work in ordinary decode and at
-fixed depth seven. The staged verifier remains the production default.
+fixed depth seven. The ordinary decode arms use the same staged execution
+policy and show run-to-run timing variation. The staged verifier remains the
+production default.
 
 | Arm order | Mode | Decode, staged → candidate tok/s | Decode change | Complete throughput change |
 | --- | --- | ---: | ---: | ---: |
@@ -702,6 +704,19 @@ Q8 and Down replay across partial, empty-local, and repeated route frames.
 Both retained `mtp_decode_sidecar` and `mtp_decode_chained` graphs captured
 the planner and the two fused arithmetic phases on each GPU. The Release
 probe matched all 32 tokens and per-request MTP work with the staged control.
+
+The full Release comparison selected the fused scalar drafter in the
+candidate process and staged the drafter in the control process using the
+same library. Every 256-token history and per-request MTP count matched in
+both orders. Ordinary decode used the same staged execution policy in both
+arms. The staged drafter remains the production default.
+
+| Arm order | Mode | Decode, staged → candidate tok/s | Decode change | Complete throughput change |
+| --- | --- | ---: | ---: | ---: |
+| Candidate first | Ordinary | 29.814 → 29.249 | −1.90% | −1.61% |
+| Candidate first | Fixed depth seven | 43.947 → 44.213 | +0.61% | +0.31% |
+| Staged first | Ordinary | 30.276 → 29.480 | −2.63% | −2.01% |
+| Staged first | Fixed depth seven | 44.665 → 44.509 | −0.35% | −0.18% |
 
 ### CUDA peer transfers at QFN decode sizes
 
