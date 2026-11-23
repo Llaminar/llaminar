@@ -659,6 +659,19 @@ The fixed-depth-seven probe matched all 32 control tokens. The model's
 local width 320 on this topology. The separate fully replicated drafter
 fixture measures a different placement and width.
 
+The paired Release comparison kept the original F320/S320 sharding and
+used one warmup and three measured 256-token requests per mode and arm.
+Both orders matched every generated token and the per-request MTP work.
+Driver diagnostics were unchanged. Complete throughput includes prefill
+and decode. The staged verifier remains the default.
+
+| Arm order | Mode | Decode, staged → candidate tok/s | Decode change | Complete throughput change |
+| --- | --- | ---: | ---: | ---: |
+| Candidate first | Ordinary | 29.509 → 28.776 | −2.48% | −1.66% |
+| Candidate first | Fixed depth seven | 43.464 → 42.947 | −1.19% | −0.90% |
+| Staged first | Ordinary | 30.621 → 29.594 | −3.35% | −2.87% |
+| Staged first | Fixed depth seven | 45.487 → 44.113 | −3.02% | −2.48% |
+
 ### CUDA peer transfers at QFN decode sizes
 
 The two QFN RTX 3090s report direct access in both directions over the
