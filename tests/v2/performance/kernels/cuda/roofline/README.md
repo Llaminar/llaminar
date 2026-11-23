@@ -705,6 +705,13 @@ including acquired-bank, partial, empty, and repeated work. The real
 32-token Release probe matched the staged control and captured the
 intended planner and both arithmetic phases on both GPUs.
 
+The separate event comparison timed the acquired-bank planner and both
+arithmetic phases with the same six-row retained capacity. All timed
+publications matched the recorded bytes. On both cards and in both arm
+orders, six live rows with 40 local routes improved from 53.57–53.82 µs
+to 52.74–52.86 µs. One live row with seven local routes took 22.14–22.21 µs,
+up from 21.38–21.44 µs with the copying planner.
+
 The scalar drafter's original graph submission owns one live activation.
 On the mixed topology, the fused path selects the local F320 Q8 work from
 the ten original route slots and keeps weighting with the original cohort.
