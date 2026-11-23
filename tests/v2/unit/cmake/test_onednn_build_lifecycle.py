@@ -113,7 +113,9 @@ llaminar_require_onednn_origin("${GIT_PROGRAM}" "${PROBE_SOURCE}" "${EXPECTED_OR
         return subprocess.run([
             CMAKE, f"-DPHASE_MODULE={MODULE}", f"-DGIT_PROGRAM={GIT}",
             f"-DPROBE_SOURCE={self.source}", f"-DEXPECTED_ORIGIN={expected}",
-            "-P", str(probe)], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            "-P", str(probe)], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            # CTest may place this fixture inside a checkout's build directory.
+            env=dict(os.environ, GIT_CEILING_DIRECTORIES=str(self.root.resolve())))
 
     def initialize_origin(self) -> str:
         """Create a genuine local Git fixture without network or global configuration."""
