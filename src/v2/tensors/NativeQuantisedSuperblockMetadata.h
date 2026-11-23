@@ -155,6 +155,24 @@ namespace llaminar2::native_quantised_superblock
      */
     inline constexpr std::uint32_t kSuperblockCodePlanePadBytes = 4;
 
+    /**
+     * @brief Largest code plane (in bits, including the bit shift) a device reader addresses.
+     *
+     * Device loaders compute code bit offsets in 32 bits to keep decode
+     * register pressure at the per-block layout's level; binding and planning
+     * reject any coded matrix whose plane would exceed this bound.
+     */
+    inline constexpr std::uint64_t kSuperblockMaxCodePlaneBits = 0xFFFFFFFFull - 7u;
+
+    /** @return Whether a coded matrix of @p rows x @p blocks_per_row blocks is addressable by device readers. */
+    LLAMINAR_SUPERBLOCK_META_HD constexpr bool superblockCodePlaneAddressable(std::uint8_t codebook, std::uint64_t rows,
+                                                                              std::uint64_t blocks_per_row) noexcept
+    {
+        const std::uint64_t bits = superblockCodePlaneBits(codebook);
+        return bits == 0 || (blocks_per_row == 0 || rows <= kSuperblockMaxCodePlaneBits / blocks_per_row / bits);
+    }
+
+
     /** @brief Restore the even-parity top bit of a seven-bit IQ sign selector (ksigns_iq2xs). */
     LLAMINAR_SUPERBLOCK_META_HD constexpr std::uint8_t restoreSignParity(std::uint8_t mask) noexcept
     {
@@ -285,7 +303,14 @@ namespace llaminar2::native_quantised_superblock
     {
 #if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
         if (value != value)
-            return canonicalPreparedHalfBits(value);
+        {
+            // The contract's NaN branch, inlined bit-exactly: keep sign and the
+            // high payload, force a quiet nonzero payload. Calling the full
+            // software converter here would inline its finite paths into every
+            // decoding kernel for a value that is never finite.
+            const std::uint32_t f = __float_as_uint(value);
+            return static_cast<std::uint16_t>(((f >> 16) & 0x8000u) | 0x7c00u | ((f & 0x007fffffu) >> 13) | 0x0200u);
+        }
         const std::uint16_t bits = __half_as_ushort(__float2half_rn(value));
         return bits == 0x8000u ? std::uint16_t{0} : bits;
 #else
@@ -510,9 +535,19 @@ namespace llaminar2::native_quantised_superblock
         }
         else
         {
+            // Bit offsets fit 32 bits: binding rejects any matrix whose code
+            // plane exceeds kSuperblockMaxCodePlaneBits, so the address math
+            // stays in one register on the decode hot path.
             constexpr std::uint32_t bits = superblockCodeBits(Codebook);
-            return loadPackedBits(static_cast<const std::uint8_t *>(code_plane),
-                                  bit_shift + linear * bits, bits);
+            const std::uint32_t bit = bit_shift + static_cast<std::uint32_t>(linear) * bits;
+            const std::uint8_t *p = static_cast<const std::uint8_t *>(code_plane) + (bit >> 3);
+            const std::uint32_t shift = bit & 7u;
+            std::uint32_t word = p[0];
+            if constexpr (bits > 1u)
+                if (shift + bits > 8u) word |= static_cast<std::uint32_t>(p[1]) << 8;
+            if constexpr (bits > 9u)
+                if (shift + bits > 16u) word |= static_cast<std::uint32_t>(p[2]) << 16;
+            return (word >> shift) & ((1u << bits) - 1u);
         }
     }
 
