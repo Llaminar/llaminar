@@ -29784,6 +29784,14 @@ target_include_directories(v2_test_memory_planner PRIVATE ${CMAKE_CURRENT_SOURCE
 # contract; the device-free envelope under-admitted large split-K partials.
 # Input-axis slices carry no source column origin; unequal 32-aligned TP can
 # shift a superblock-wide slice, so coded planes are priced at the worst phase.
+# Shared ready-publication validation must reject a coded layout byte on a
+# non-codable codebook, reserved bits, and phase/shift on per-block matrices.
+add_v2_test(V2_Integration_DescriptorMetadataLayoutValidation
+    COMMAND $<TARGET_FILE:v2_test_native_quantised_format_info>
+        --gtest_filter=Test__NativeQuantisedFormatInfo.DescriptorValidationAuthenticatesMetadataLayout
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;NativeQuantised;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_DescriptorMetadataLayoutValidation)
 add_v2_test(V2_Integration_CodedInputSliceWorstPhaseAdmission
     COMMAND $<TARGET_FILE:v2_test_weight_memory_estimator>
         --gtest_filter=Test__WeightMemoryEstimator.CodedInputSliceCoversAShiftedSuperblockOrigin:Test__WeightMemoryEstimator.ExactInputAndOutputAxesAllFormatsTP1Through8:Test__WeightMemoryEstimator.CUDANeverAdmitsMoreThanTheGGUFStoresForAnyFormat
