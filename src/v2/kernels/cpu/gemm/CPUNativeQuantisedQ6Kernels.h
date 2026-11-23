@@ -38,6 +38,7 @@
 #include <immintrin.h>
 
 #include "CPUNativeQuantisedFP16.h"
+#include "CPUNativeQuantisedOutputVector.h"
 #include "CPUNativeQuantisedWeightPacker.h"
 #include "VNNIEmulation.h"
 
@@ -251,8 +252,10 @@ namespace llaminar2::cpu::native_quantised
          * @param kb_start First logical K block.
          * @param kb_end One-past-last logical K block.
          * @param accumulate Load existing outputs before adding this K range.
+         * @tparam Bounded Bind output accesses to a live terminal width.
+         * @param columns Logical column count in that tile.
          */
-        template <int Rows, int ZSpan>
+        template <int Rows, int ZSpan, bool Bounded = false>
         LLAMINAR_Q6K_EXACT_FP
         inline void rowsChunkAVX512(
             const CPUNativeQuantisedPackedWeights &packed,
@@ -261,7 +264,8 @@ namespace llaminar2::cpu::native_quantised
             int chunk,
             int kb_start,
             int kb_end,
-            bool accumulate)
+            bool accumulate,
+            int columns = 64)
         {
 #if defined(__clang__)
 #pragma clang fp contract(off)
@@ -284,10 +288,8 @@ namespace llaminar2::cpu::native_quantised
                 {
                     for (int zi = 0; zi < ZSpan; ++zi)
                     {
-                        fp_accumulators[row][zi] = accumulate
-                            ? _mm512_loadu_ps(
-                                  outputs[row] + (z_base + zi) * 16)
-                            : _mm512_setzero_ps();
+                        fp_accumulators[row][zi] = readProjectionOutputVector<Bounded, 16, __m512>(
+                            outputs[row], columns, (z_base + zi) * 16, accumulate);
                     }
                 }
 
@@ -422,9 +424,8 @@ namespace llaminar2::cpu::native_quantised
                 {
                     for (int zi = 0; zi < ZSpan; ++zi)
                     {
-                        _mm512_storeu_ps(
-                            outputs[row] + (z_base + zi) * 16,
-                            fp_accumulators[row][zi]);
+                        publishProjectionOutputVector<Bounded, 16>(
+                            outputs[row], columns, (z_base + zi) * 16, fp_accumulators[row][zi]);
                     }
                 }
             }
@@ -883,8 +884,10 @@ namespace llaminar2::cpu::native_quantised
          * AVX2 exposes sixteen architectural YMM registers, so retaining the
          * whole 64-column/two-row tile would force stack spills.  Weight bytes
          * remain sequential and each loaded vector is reused across all rows.
+         * @tparam Bounded Bind output accesses to a live terminal width.
+         * @param columns Logical column count in that tile.
          */
-        template <int Rows>
+        template <int Rows, bool Bounded = false>
         LLAMINAR_Q6K_EXACT_FP
         inline void rowsChunkAVX2(
             const CPUNativeQuantisedPackedWeights &packed,
@@ -893,7 +896,8 @@ namespace llaminar2::cpu::native_quantised
             int chunk,
             int kb_start,
             int kb_end,
-            bool accumulate)
+            bool accumulate,
+            int columns = 64)
         {
 #if defined(__clang__)
 #pragma clang fp contract(off)
@@ -907,16 +911,15 @@ namespace llaminar2::cpu::native_quantised
             const __m256i nibble_mask = _mm256_set1_epi8(0x0F);
             const __m256i center = _mm256_set1_epi32(32);
 
-            for (int segment = 0; segment < 8; ++segment)
+            for (int segment = 0; segment < (Bounded ? (columns + 7) / 8 : 8); ++segment)
             {
                 const int z = segment / 2;
                 const int z_half = segment % 2;
                 __m256 fp_accumulators[Rows];
                 for (int row = 0; row < Rows; ++row)
                 {
-                    fp_accumulators[row] = accumulate
-                        ? _mm256_loadu_ps(outputs[row] + segment * 8)
-                        : _mm256_setzero_ps();
+                    fp_accumulators[row] = readProjectionOutputVector<Bounded, 8, __m256>(
+                        outputs[row], columns, segment * 8, accumulate);
                 }
 
                 for (int kb = kb_start; kb < kb_end; ++kb)
@@ -1008,9 +1011,8 @@ namespace llaminar2::cpu::native_quantised
 
                 for (int row = 0; row < Rows; ++row)
                 {
-                    _mm256_storeu_ps(
-                        outputs[row] + segment * 8,
-                        fp_accumulators[row]);
+                    publishProjectionOutputVector<Bounded, 8>(
+                        outputs[row], columns, segment * 8, fp_accumulators[row]);
                 }
             }
         }
@@ -1023,7 +1025,10 @@ namespace llaminar2::cpu::native_quantised
      * @param accumulate Load the existing output before consuming this K
      *        range. This preserves the serial per-K-block arithmetic when an
      *        ordinary prefill tile boundary materializes the accumulator.
+     * @tparam Bounded Bind output accesses to a live terminal width.
+     * @param columns Logical column count in that tile.
      */
+    template<bool Bounded = false>
     inline void gemvQ6KNativeAVX512Chunk(
         const CPUNativeQuantisedPackedWeights &packed,
         const Q8_1Block *activation,
@@ -1031,16 +1036,17 @@ namespace llaminar2::cpu::native_quantised
         int chunk,
         int kb_start,
         int kb_end,
-        bool accumulate = false)
+        bool accumulate = false,
+        int columns = 64)
     {
-        q6k_detail::rowsChunkAVX512<1, 4>(
+        q6k_detail::rowsChunkAVX512<1, 4, Bounded>(
             packed,
             {activation},
             {output},
             chunk,
             kb_start,
             kb_end,
-            accumulate);
+            accumulate, columns);
     }
 
     /**
@@ -1146,7 +1152,10 @@ namespace llaminar2::cpu::native_quantised
      * @param accumulate Load the existing output before consuming this K
      *        range. This preserves the serial per-K-block arithmetic when an
      *        ordinary prefill tile boundary materializes the accumulator.
+     * @tparam Bounded Bind output accesses to a live terminal width.
+     * @param columns Logical column count in that tile.
      */
+    template<bool Bounded = false>
     inline void gemvQ6KNativeAVX2Chunk(
         const CPUNativeQuantisedPackedWeights &packed,
         const Q8_1Block *activation,
@@ -1154,16 +1163,17 @@ namespace llaminar2::cpu::native_quantised
         int chunk,
         int kb_start,
         int kb_end,
-        bool accumulate = false)
+        bool accumulate = false,
+        int columns = 64)
     {
-        q6k_detail::rowsChunkAVX2<1>(
+        q6k_detail::rowsChunkAVX2<1, Bounded>(
             packed,
             {activation},
             {output},
             chunk,
             kb_start,
             kb_end,
-            accumulate);
+            accumulate, columns);
     }
 
     /** @brief Native Q6_K two-row AVX2 verifier chunk. */

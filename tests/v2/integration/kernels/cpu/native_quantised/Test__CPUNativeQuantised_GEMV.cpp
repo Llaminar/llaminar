@@ -1611,6 +1611,84 @@ namespace
     }
 
 #if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
+    /** @test Every prepared x86 decoder owns only its live serial tail across K continuations. */
+    TEST_F(CPUNativeQuantisedGemvTest, SerialBoundedOutputAllFormats)
+    {
+        constexpr int width = 64, columns = width + 3;
+        constexpr int inner = 512, blocks = inner / Q8_1Block::BLOCK_SIZE;
+        constexpr float guard = -113.25f;
+        const auto input = TestTensorFactory::createFP32Random({inner}, -0.5f, 0.5f, 91743);
+        for (const auto policy : {CPUProjectionNumericalPolicy::BackendNative,
+                                  CPUProjectionNumericalPolicy::GPUAlignedExpert})
+        {
+            SCOPED_TRACE(static_cast<int>(policy));
+            std::array<Q8_1Block, blocks> activation{};
+            quantize_activations_to_q8_1(input->data(), activation.data(), 1, inner, blocks, policy);
+            for (const auto &format : quantizedMoEVerifierFormats())
+            {
+                SCOPED_TRACE(format.label);
+                auto weights = format.create({columns, inner}, 91751);
+                CPUNativeQuantisedGemmKernel kernel(weights.get(), 0, -1, policy);
+                ASSERT_TRUE(kernel.isValid());
+                const auto &packed = kernel.packedWeights();
+                const auto lut256 = packed.usesNibbleLUT()
+                    ? build_decode_lut_avx2_for_codebook(packed.codebook_id) : _mm256_setzero_si256();
+#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
+                const bool use_avx512 = activeISALevel() >= ISALevel::AVX512;
+                const auto lut512 = use_avx512 && packed.usesNibbleLUT()
+                    ? build_decode_lut(packed.codebook_id) : _mm512_setzero_si512();
+#endif
+                const auto leaf = [&]<bool Bounded>(float *out, int chunk, int first,
+                    int end, bool accumulate, int live) {
+#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
+                    if (use_avx512)
+                    {
+                        if (packed.usesNibbleLUT())
+                            return gemv_native_quantised_avx512_chunk_native<Bounded>(
+                                packed, activation.data(), out, chunk, first, end, lut512, accumulate, live);
+                        return gemv_native_quantised_avx512_chunk_non_nibble<Bounded>(
+                            packed, activation.data(), out, chunk, first, end, accumulate, live);
+                    }
+#endif
+                    if (packed.usesNibbleLUT())
+                        return gemv_avx2_chunk_native<Bounded>(
+                            packed, activation.data(), out, chunk, first, end, lut256, accumulate, live);
+                    return gemv_avx2_chunk_non_nibble<Bounded>(
+                        packed, activation.data(), out, chunk, first, end, accumulate, live);
+                };
+                std::array<float, 2 * width> full{};
+                for (int chunk = 0; chunk < 2; ++chunk)
+                    leaf.template operator()<false>(full.data() + chunk * width, chunk, 0, blocks, false, width);
+                std::array<float, columns + 2> row;
+                row.fill(guard);
+#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
+                if (use_avx512)
+                    gemv_native_quantised_avx512_block(packed, activation.data(), row.data() + 1,
+                        0, 2, blocks, columns, lut512);
+                else
+#endif
+                    gemv_avx2_block(packed, activation.data(), row.data() + 1,
+                        0, 2, blocks, columns, lut256);
+                EXPECT_EQ(std::memcmp(row.data() + 1, full.data(), columns * sizeof(float)), 0);
+                EXPECT_EQ(row.front(), guard);
+                EXPECT_EQ(row.back(), guard);
+
+                for (int live : {1, 7, 8, 9, 15, 16, 17, 31, 33, 63, 64})
+                {
+                    SCOPED_TRACE(live);
+                    std::array<float, width + 2> continued;
+                    continued.fill(guard);
+                    leaf.template operator()<true>(continued.data() + 1, 0, 0, blocks / 2, false, live);
+                    leaf.template operator()<true>(continued.data() + 1, 0, blocks / 2, blocks, true, live);
+                    EXPECT_EQ(std::memcmp(continued.data() + 1, full.data(), live * sizeof(float)), 0);
+                    EXPECT_EQ(continued.front(), guard);
+                    for (int col = live + 1; col < static_cast<int>(continued.size()); ++col)
+                        EXPECT_EQ(continued[col], guard);
+                }
+            }
+        }
+    }
+
     /** @test Every compact decoder publishes and resumes a partial vector in its own destination. */
     TEST_F(CPUNativeQuantisedGemvTest, CompactBoundedOutputRetainsOrderedArithmetic)
     {

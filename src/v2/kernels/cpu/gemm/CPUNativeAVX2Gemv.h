@@ -27,6 +27,7 @@
 #include "CPUNativeQuantisedWeightPacker.h"
 #include "CPUNativeQuantisedContributionContract.h"
 #include "CPUNativeQuantisedFP16.h"
+#include "CPUNativeQuantisedOutputVector.h"
 #include "CPUNativeQuantisedQ6Kernels.h"
 #include "CPUNativeQuantisedMultiScaleKernels.h"
 #include "VNNIEmulation.h"
@@ -212,7 +213,10 @@ namespace llaminar2::cpu::native_quantised
      * @param accumulate Load `C` as the initial FP32 accumulator. Tile callers
      *        use this mode to materialize cache boundaries without changing
      *        the serial per-K-block reduction tree.
+     * @tparam Bounded Bind output accesses to a live terminal width.
+     * @param columns Logical column count in that tile.
      */
+    template<bool Bounded = false>
     inline void gemv_avx2_chunk_native(
         const CPUNativeQuantisedPackedWeights &packed,
         const Q8_1Block *A_q8,
@@ -221,15 +225,13 @@ namespace llaminar2::cpu::native_quantised
         int kb_start,
         int kb_end,
         const __m256i decode_lut,
-        bool accumulate = false)
+        bool accumulate = false,
+        int columns = 64)
     {
-        for (int segment = 0; segment < 8; ++segment)
+        for (int segment = 0; segment < (Bounded ? (columns + 7) / 8 : 8); ++segment)
         {
-            const __m256 initial = accumulate
-                ? _mm256_loadu_ps(C + segment * 8)
-                : _mm256_setzero_ps();
-            _mm256_storeu_ps(
-                C + segment * 8,
+            const auto initial = readProjectionOutputVector<Bounded, 8, __m256>(C, columns, segment * 8, accumulate);
+            publishProjectionOutputVector<Bounded, 8>(C, columns, segment * 8,
                 accumulateNibbleSegmentAVX2(
                     packed,
                     A_q8,
@@ -256,7 +258,10 @@ namespace llaminar2::cpu::native_quantised
      * @param accumulate Load `C` as the initial FP32 accumulator. The flag is
      *        forwarded to native Q6 as well as the expanded-INT8 path so every
      *        prepared encoding has identical tile-boundary semantics.
+     * @tparam Bounded Bind output accesses to a live terminal width.
+     * @param columns Logical column count in that tile.
      */
+    template<bool Bounded = false>
     inline void gemv_avx2_chunk_non_nibble(
         const CPUNativeQuantisedPackedWeights &packed,
         const Q8_1Block *A_q8,
@@ -264,18 +269,19 @@ namespace llaminar2::cpu::native_quantised
         int chunk,
         int kb_start,
         int kb_end,
-        bool accumulate = false)
+        bool accumulate = false,
+        int columns = 64)
     {
         if (packed.usesCompactMultiScale())
         {
             multi_scale::dispatch<8>(packed, std::array{A_q8}, std::array{C},
-                                     chunk, kb_start, kb_end, accumulate);
+                                     chunk, kb_start, kb_end, accumulate, Bounded ? columns : 64);
             return;
         }
         if (packed.usesQ6KNativeDualScale())
         {
-            gemvQ6KNativeAVX2Chunk(
-                packed, A_q8, C, chunk, kb_start, kb_end, accumulate);
+            gemvQ6KNativeAVX2Chunk<Bounded>(
+                packed, A_q8, C, chunk, kb_start, kb_end, accumulate, columns);
             return;
         }
         if (!packed.usesExpandedInt8())
@@ -283,13 +289,12 @@ namespace llaminar2::cpu::native_quantised
                 "AVX2 non-nibble GEMV received an unsupported packed encoding");
 
         const __m256i bias_128_i32 = _mm256_set1_epi32(128);
-        for (int segment = 0; segment < 8; ++segment)
+        for (int segment = 0; segment < (Bounded ? (columns + 7) / 8 : 8); ++segment)
         {
             const int z = segment / 2;
             const int byte_offset = (segment % 2) * 32;
-            __m256 fp_accumulator = accumulate
-                ? _mm256_loadu_ps(C + segment * 8)
-                : _mm256_setzero_ps();
+            __m256 fp_accumulator = readProjectionOutputVector<Bounded, 8, __m256>(
+                C, columns, segment * 8, accumulate);
             for (int kb = kb_start; kb < kb_end; ++kb)
             {
                 const Q8_1Block &activation = A_q8[kb];
@@ -356,7 +361,7 @@ namespace llaminar2::cpu::native_quantised
                         packed.numerical_policy);
                 }
             }
-            _mm256_storeu_ps(C + segment * 8, fp_accumulator);
+            publishProjectionOutputVector<Bounded, 8>(C, columns, segment * 8, fp_accumulator);
         }
     }
 
@@ -384,18 +389,12 @@ namespace llaminar2::cpu::native_quantised
 
             if (n_cols < 64)
             {
-                if (packed.usesCompactMultiScale())
-                {
-                    multi_scale::dispatch<8>(packed, std::array{A_q8}, std::array{C + n_start},
-                        chunk, 0, K_blocks, false, n_cols);
-                    continue;
-                }
-                alignas(64) float tmp[64];
                 if (use_nibble_lut)
-                    gemv_avx2_chunk_native(packed, A_q8, tmp, chunk, 0, K_blocks, decode_lut);
+                    gemv_avx2_chunk_native<true>(
+                        packed, A_q8, C + n_start, chunk, 0, K_blocks, decode_lut, false, n_cols);
                 else
-                    gemv_avx2_chunk_non_nibble(packed, A_q8, tmp, chunk, 0, K_blocks);
-                std::memcpy(C + n_start, tmp, n_cols * sizeof(float));
+                    gemv_avx2_chunk_non_nibble<true>(
+                        packed, A_q8, C + n_start, chunk, 0, K_blocks, false, n_cols);
             }
             else
             {

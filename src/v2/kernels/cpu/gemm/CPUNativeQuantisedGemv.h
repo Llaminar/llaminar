@@ -97,6 +97,7 @@
 #include "CPUProjectionQ8Publication.h"
 #include "CPUNativeQuantisedExecutionContract.h"
 #include "CPUNativeQuantisedContributionContract.h"
+#include "CPUNativeQuantisedOutputVector.h"
 #include "CPUNativeQuantisedFP16.h"
 #include "CPUNativeQuantisedWeightPacker.h"
 #include "CPUNativeQuantisedScalarReference.h"
@@ -1688,11 +1689,14 @@ namespace llaminar2::cpu::native_quantised
      * @tparam DecodeKind Immutable nibble decoder of the prepared tensor.
      * @tparam Policy Immutable FP publication policy of the prepared tensor.
      * @tparam IsAsymmetric Whether scale-and-min correction is present.
+     * @tparam Bounded Bind output accesses to a live terminal width.
+     * @param columns Logical column count in that tile.
      */
     template <
         NibbleDecodeKind DecodeKind,
         CPUProjectionNumericalPolicy Policy,
-        bool IsAsymmetric>
+        bool IsAsymmetric,
+        bool Bounded = false>
     inline void gemv_native_quantised_avx512_chunk_native(
         const CPUNativeQuantisedPackedWeights &packed,
         const Q8_1Block *A_q8,
@@ -1701,12 +1705,13 @@ namespace llaminar2::cpu::native_quantised
         int kb_start,
         int kb_end,
         const __m512i decode_lut,
-        bool accumulate = false)
+        bool accumulate = false,
+        int columns = 64)
     {
-        __m512 fp_acc0 = accumulate ? _mm512_loadu_ps(C) : _mm512_setzero_ps();
-        __m512 fp_acc1 = accumulate ? _mm512_loadu_ps(C + 16) : _mm512_setzero_ps();
-        __m512 fp_acc2 = accumulate ? _mm512_loadu_ps(C + 32) : _mm512_setzero_ps();
-        __m512 fp_acc3 = accumulate ? _mm512_loadu_ps(C + 48) : _mm512_setzero_ps();
+        __m512 fp_acc0 = readProjectionOutputVector<Bounded, 16, __m512>(C, columns, 0, accumulate);
+        __m512 fp_acc1 = readProjectionOutputVector<Bounded, 16, __m512>(C, columns, 16, accumulate);
+        __m512 fp_acc2 = readProjectionOutputVector<Bounded, 16, __m512>(C, columns, 32, accumulate);
+        __m512 fp_acc3 = readProjectionOutputVector<Bounded, 16, __m512>(C, columns, 48, accumulate);
 
         // Only the canonical identity decoder proves unsigned B in [0,15].
         // Swap VNNI roles to consume unchanged signed Q8 bytes directly; the
@@ -1845,10 +1850,10 @@ namespace llaminar2::cpu::native_quantised
             }
         }
 
-        _mm512_storeu_ps(C, fp_acc0);
-        _mm512_storeu_ps(C + 16, fp_acc1);
-        _mm512_storeu_ps(C + 32, fp_acc2);
-        _mm512_storeu_ps(C + 48, fp_acc3);
+        publishProjectionOutputVector<Bounded, 16>(C, columns, 0, fp_acc0);
+        publishProjectionOutputVector<Bounded, 16>(C, columns, 16, fp_acc1);
+        publishProjectionOutputVector<Bounded, 16>(C, columns, 32, fp_acc2);
+        publishProjectionOutputVector<Bounded, 16>(C, columns, 48, fp_acc3);
     }
 
     /**
@@ -2601,10 +2606,13 @@ namespace llaminar2::cpu::native_quantised
      * @brief Dispatch one immutable policy/decode pair by tensor layout.
      * @tparam DecodeKind Compile-time nibble decoder.
      * @tparam Policy Compile-time FP publication policy.
+     * @tparam Bounded Bind output accesses to a live terminal width.
+     * @param columns Logical column count in that tile.
      */
     template <
         NibbleDecodeKind DecodeKind,
-        CPUProjectionNumericalPolicy Policy>
+        CPUProjectionNumericalPolicy Policy,
+        bool Bounded>
     inline void dispatch_native_avx512_chunk_layout(
         const CPUNativeQuantisedPackedWeights &packed,
         const Q8_1Block *A_q8,
@@ -2613,12 +2621,13 @@ namespace llaminar2::cpu::native_quantised
         int kb_start,
         int kb_end,
         const __m512i decode_lut,
-        bool accumulate)
+        bool accumulate,
+        int columns)
     {
         if (packed.is_asymmetric)
         {
             return gemv_native_quantised_avx512_chunk_native<
-                DecodeKind, Policy, true>(
+                DecodeKind, Policy, true, Bounded>(
                 packed,
                 A_q8,
                 C,
@@ -2626,10 +2635,10 @@ namespace llaminar2::cpu::native_quantised
                 kb_start,
                 kb_end,
                 decode_lut,
-                accumulate);
+                accumulate, columns);
         }
         return gemv_native_quantised_avx512_chunk_native<
-            DecodeKind, Policy, false>(
+            DecodeKind, Policy, false, Bounded>(
             packed,
             A_q8,
             C,
@@ -2637,14 +2646,16 @@ namespace llaminar2::cpu::native_quantised
             kb_start,
             kb_end,
             decode_lut,
-            accumulate);
+            accumulate, columns);
     }
 
     /**
      * @brief Dispatch one compile-time decoder by immutable FP policy.
      * @tparam DecodeKind Compile-time nibble decoder.
+     * @tparam Bounded Bind output accesses to a live terminal width.
+     * @param columns Logical column count in that tile.
      */
-    template <NibbleDecodeKind DecodeKind>
+    template <NibbleDecodeKind DecodeKind, bool Bounded>
     inline void dispatch_native_avx512_chunk_policy(
         const CPUNativeQuantisedPackedWeights &packed,
         const Q8_1Block *A_q8,
@@ -2653,13 +2664,14 @@ namespace llaminar2::cpu::native_quantised
         int kb_start,
         int kb_end,
         const __m512i decode_lut,
-        bool accumulate)
+        bool accumulate,
+        int columns)
     {
         switch (packed.numerical_policy)
         {
         case CPUProjectionNumericalPolicy::BackendNative:
             return dispatch_native_avx512_chunk_layout<
-                DecodeKind, CPUProjectionNumericalPolicy::BackendNative>(
+                DecodeKind, CPUProjectionNumericalPolicy::BackendNative, Bounded>(
                 packed,
                 A_q8,
                 C,
@@ -2667,10 +2679,10 @@ namespace llaminar2::cpu::native_quantised
                 kb_start,
                 kb_end,
                 decode_lut,
-                accumulate);
+                accumulate, columns);
         case CPUProjectionNumericalPolicy::GPUAlignedExpert:
             return dispatch_native_avx512_chunk_layout<
-                DecodeKind, CPUProjectionNumericalPolicy::GPUAlignedExpert>(
+                DecodeKind, CPUProjectionNumericalPolicy::GPUAlignedExpert, Bounded>(
                 packed,
                 A_q8,
                 C,
@@ -2678,7 +2690,7 @@ namespace llaminar2::cpu::native_quantised
                 kb_start,
                 kb_end,
                 decode_lut,
-                accumulate);
+                accumulate, columns);
         }
         throw std::logic_error("Unknown CPU projection numerical policy");
     }
@@ -2691,7 +2703,10 @@ namespace llaminar2::cpu::native_quantised
      * mutually exclusive decode and scale/min programs from adding branches or
      * competing for vector registers in every block of the regular and
      * ExpertOverlay kernels.
+     * @tparam Bounded Bind output accesses to a live terminal width.
+     * @param columns Logical column count in that tile.
      */
+    template<bool Bounded = false>
     inline void gemv_native_quantised_avx512_chunk_native(
         const CPUNativeQuantisedPackedWeights &packed,
         const Q8_1Block *A_q8,
@@ -2700,13 +2715,14 @@ namespace llaminar2::cpu::native_quantised
         int kb_start,
         int kb_end,
         const __m512i decode_lut,
-        bool accumulate = false)
+        bool accumulate = false,
+        int columns = 64)
     {
         switch (nibbleDecodeKind(packed.codebook_id))
         {
         case NibbleDecodeKind::LUT:
             return dispatch_native_avx512_chunk_policy<
-                NibbleDecodeKind::LUT>(
+                NibbleDecodeKind::LUT, Bounded>(
                 packed,
                 A_q8,
                 C,
@@ -2714,10 +2730,10 @@ namespace llaminar2::cpu::native_quantised
                 kb_start,
                 kb_end,
                 decode_lut,
-                accumulate);
+                accumulate, columns);
         case NibbleDecodeKind::Q4_0_LINEAR:
             return dispatch_native_avx512_chunk_policy<
-                NibbleDecodeKind::Q4_0_LINEAR>(
+                NibbleDecodeKind::Q4_0_LINEAR, Bounded>(
                 packed,
                 A_q8,
                 C,
@@ -2725,10 +2741,10 @@ namespace llaminar2::cpu::native_quantised
                 kb_start,
                 kb_end,
                 decode_lut,
-                accumulate);
+                accumulate, columns);
         case NibbleDecodeKind::Q4_1_IDENTITY:
             return dispatch_native_avx512_chunk_policy<
-                NibbleDecodeKind::Q4_1_IDENTITY>(
+                NibbleDecodeKind::Q4_1_IDENTITY, Bounded>(
                 packed,
                 A_q8,
                 C,
@@ -2736,7 +2752,7 @@ namespace llaminar2::cpu::native_quantised
                 kb_start,
                 kb_end,
                 decode_lut,
-                accumulate);
+                accumulate, columns);
         }
         throw std::logic_error("Unknown NativeQuantised nibble decode kind");
     }
@@ -2771,15 +2787,18 @@ namespace llaminar2::cpu::native_quantised
      * As in the paired kernel, unsigned B and signed A give the original
      * dot directly. Both that dot and the old biased dot plus compensation
      * fit INT32. FP32 block contributions and increasing-K order stay exact.
+     * @tparam Bounded Bind output accesses to a live terminal width.
+     * @param columns Logical column count in that tile.
      */
-    template<CPUProjectionNumericalPolicy Policy>
+    template<CPUProjectionNumericalPolicy Policy, bool Bounded>
     inline void gemvUnsignedFiveBitAVX512Chunk(const CPUNativeQuantisedPackedWeights &packed,
-        const Q8_1Block *input, float *output, int chunk, int first, int end, bool accumulate)
+        const Q8_1Block *input, float *output, int chunk, int first, int end, bool accumulate, int columns)
     {
         __m512 fp[4];
 #pragma GCC unroll 4
         for (int segment = 0; segment < 4; ++segment)
-            fp[segment] = accumulate ? _mm512_loadu_ps(output + segment * 16) : _mm512_setzero_ps();
+            fp[segment] = readProjectionOutputVector<Bounded, 16, __m512>(
+                output, columns, segment * 16, accumulate);
 
         for (int kb = first; kb < end; ++kb)
         {
@@ -2816,7 +2835,7 @@ namespace llaminar2::cpu::native_quantised
 
 #pragma GCC unroll 4
         for (int segment = 0; segment < 4; ++segment)
-            _mm512_storeu_ps(output + segment * 16, fp[segment]);
+            publishProjectionOutputVector<Bounded, 16>(output, columns, segment * 16, fp[segment]);
     }
 
     /**
@@ -2827,7 +2846,10 @@ namespace llaminar2::cpu::native_quantised
      *
      * @param accumulate Load `C` as the initial FP32 accumulator. This contract
      *        is shared by expanded INT8 and native Q6 prepared encodings.
+     * @tparam Bounded Bind output accesses to a live terminal width.
+     * @param columns Logical column count in that tile.
      */
+    template<bool Bounded = false>
     inline void gemv_native_quantised_avx512_chunk_non_nibble(
         const CPUNativeQuantisedPackedWeights &packed,
         const Q8_1Block *A_q8,
@@ -2835,18 +2857,19 @@ namespace llaminar2::cpu::native_quantised
         int chunk,
         int kb_start,
         int kb_end,
-        bool accumulate = false)
+        bool accumulate = false,
+        int columns = 64)
     {
         if (packed.usesCompactMultiScale())
         {
             multi_scale::dispatch<16>(packed, std::array{A_q8}, std::array{C},
-                                      chunk, kb_start, kb_end, accumulate);
+                                      chunk, kb_start, kb_end, accumulate, Bounded ? columns : 64);
             return;
         }
         if (packed.usesQ6KNativeDualScale())
         {
-            gemvQ6KNativeAVX512Chunk(
-                packed, A_q8, C, chunk, kb_start, kb_end, accumulate);
+            gemvQ6KNativeAVX512Chunk<Bounded>(
+                packed, A_q8, C, chunk, kb_start, kb_end, accumulate, columns);
             return;
         }
         if (!packed.usesExpandedInt8())
@@ -2855,16 +2878,16 @@ namespace llaminar2::cpu::native_quantised
         if (packed.coefficientDomain() == CPUNativeQuantisedCoefficientDomain::UnsignedFiveBit)
         {
             if (packed.numerical_policy == CPUProjectionNumericalPolicy::GPUAlignedExpert)
-                return gemvUnsignedFiveBitAVX512Chunk<CPUProjectionNumericalPolicy::GPUAlignedExpert>(
-                    packed, A_q8, C, chunk, kb_start, kb_end, accumulate);
-            return gemvUnsignedFiveBitAVX512Chunk<CPUProjectionNumericalPolicy::BackendNative>(
-                packed, A_q8, C, chunk, kb_start, kb_end, accumulate);
+                return gemvUnsignedFiveBitAVX512Chunk<CPUProjectionNumericalPolicy::GPUAlignedExpert, Bounded>(
+                    packed, A_q8, C, chunk, kb_start, kb_end, accumulate, columns);
+            return gemvUnsignedFiveBitAVX512Chunk<CPUProjectionNumericalPolicy::BackendNative, Bounded>(
+                packed, A_q8, C, chunk, kb_start, kb_end, accumulate, columns);
         }
 
-        __m512 fp_acc0 = accumulate ? _mm512_loadu_ps(C) : _mm512_setzero_ps();
-        __m512 fp_acc1 = accumulate ? _mm512_loadu_ps(C + 16) : _mm512_setzero_ps();
-        __m512 fp_acc2 = accumulate ? _mm512_loadu_ps(C + 32) : _mm512_setzero_ps();
-        __m512 fp_acc3 = accumulate ? _mm512_loadu_ps(C + 48) : _mm512_setzero_ps();
+        __m512 fp_acc0 = readProjectionOutputVector<Bounded, 16, __m512>(C, columns, 0, accumulate);
+        __m512 fp_acc1 = readProjectionOutputVector<Bounded, 16, __m512>(C, columns, 16, accumulate);
+        __m512 fp_acc2 = readProjectionOutputVector<Bounded, 16, __m512>(C, columns, 32, accumulate);
+        __m512 fp_acc3 = readProjectionOutputVector<Bounded, 16, __m512>(C, columns, 48, accumulate);
 
         const __m512i bias_128_i32 = _mm512_set1_epi32(128);
 
@@ -2960,10 +2983,10 @@ namespace llaminar2::cpu::native_quantised
             }
         }
 
-        _mm512_storeu_ps(C, fp_acc0);
-        _mm512_storeu_ps(C + 16, fp_acc1);
-        _mm512_storeu_ps(C + 32, fp_acc2);
-        _mm512_storeu_ps(C + 48, fp_acc3);
+        publishProjectionOutputVector<Bounded, 16>(C, columns, 0, fp_acc0);
+        publishProjectionOutputVector<Bounded, 16>(C, columns, 16, fp_acc1);
+        publishProjectionOutputVector<Bounded, 16>(C, columns, 32, fp_acc2);
+        publishProjectionOutputVector<Bounded, 16>(C, columns, 48, fp_acc3);
     }
 
     /**
@@ -3000,20 +3023,12 @@ namespace llaminar2::cpu::native_quantised
 
             if (n_cols < 64)
             {
-                if (packed.usesCompactMultiScale())
-                {
-                    multi_scale::dispatch<16>(packed, std::array{A_q8}, std::array{C + n_start},
-                        chunk, 0, K_blocks, false, n_cols);
-                    continue;
-                }
-                // Tail chunk: kernel writes 64 floats, but only n_cols are valid.
-                // Use a temp buffer to avoid overflowing the caller's C buffer.
-                alignas(64) float tmp[64];
                 if (use_nibble_lut)
-                    gemv_native_quantised_avx512_chunk_native(packed, A_q8, tmp, chunk, 0, K_blocks, decode_lut);
+                    gemv_native_quantised_avx512_chunk_native<true>(
+                        packed, A_q8, C + n_start, chunk, 0, K_blocks, decode_lut, false, n_cols);
                 else
-                    gemv_native_quantised_avx512_chunk_non_nibble(packed, A_q8, tmp, chunk, 0, K_blocks);
-                std::memcpy(C + n_start, tmp, n_cols * sizeof(float));
+                    gemv_native_quantised_avx512_chunk_non_nibble<true>(
+                        packed, A_q8, C + n_start, chunk, 0, K_blocks, false, n_cols);
             }
             else
             {
@@ -5586,48 +5601,17 @@ namespace llaminar2::cpu::native_quantised
                     int m = task % M;
                     if(!row_grid.active(m))continue;
                     const Q8_1Block *aq = A_q8_all + static_cast<size_t>(m) * K_blocks;
-                    float *c_out = C + m * ldc + chunk * 64;
-
-                    int n_cols_actual = std::min(64, N - chunk * 64);
-                    if (n_cols_actual < 64)
+                    float *output_row = C + m * ldc;
+                    if (use_avx512)
                     {
-                        alignas(64) float tmp[64];
-                        if (use_avx512)
-                        {
 #if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
-                            if (packed.usesNibbleLUT())
-                                gemv_native_quantised_avx512_chunk_native(packed, aq, tmp, chunk, 0, K_blocks, decode_lut_512);
-                            else
-                                gemv_native_quantised_avx512_chunk_non_nibble(packed, aq, tmp, chunk, 0, K_blocks);
+                        gemv_native_quantised_avx512_block(
+                            packed, aq, output_row, chunk, 1, K_blocks, N, decode_lut_512);
 #endif
-                        }
-                        else
-                        {
-                            if (packed.usesNibbleLUT())
-                                gemv_avx2_chunk_native(packed, aq, tmp, chunk, 0, K_blocks, decode_lut_256);
-                            else
-                                gemv_avx2_chunk_non_nibble(packed, aq, tmp, chunk, 0, K_blocks);
-                        }
-                        std::memcpy(c_out, tmp, n_cols_actual * sizeof(float));
                     }
                     else
                     {
-                        if (use_avx512)
-                        {
-#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
-                            if (packed.usesNibbleLUT())
-                                gemv_native_quantised_avx512_chunk_native(packed, aq, c_out, chunk, 0, K_blocks, decode_lut_512);
-                            else
-                                gemv_native_quantised_avx512_chunk_non_nibble(packed, aq, c_out, chunk, 0, K_blocks);
-#endif
-                        }
-                        else
-                        {
-                            if (packed.usesNibbleLUT())
-                                gemv_avx2_chunk_native(packed, aq, c_out, chunk, 0, K_blocks, decode_lut_256);
-                            else
-                                gemv_avx2_chunk_non_nibble(packed, aq, c_out, chunk, 0, K_blocks);
-                        }
+                        gemv_avx2_block(packed, aq, output_row, chunk, 1, K_blocks, N, decode_lut_256);
                     }
                 }
             };
@@ -5751,56 +5735,37 @@ namespace llaminar2::cpu::native_quantised
                                 int n_start = chunk * 64;
                                 float *c_row = C + m * ldc + n_start;
 
-                                /*
-                                 * An odd final M row uses the serial-shaped chunk
-                                 * kernel, which also writes 64 columns. Give a
-                                 * partial N tail the same bounded publication
-                                 * contract as the paired-row path above.
-                                 */
-                                const int n_cols_actual =
-                                    std::min(64, N - n_start);
-                                const auto compute_one_row = [&](float *output)
-                                {
+                                // The odd final M row continues directly in its live output.
+                                const int columns = std::min(64, N - n_start);
+                                const auto compute_one_row = [&]<bool Bounded>() {
                                     if (use_avx512)
                                     {
-    #if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
+#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
                                         if (packed.usesNibbleLUT())
-                                            gemv_native_quantised_avx512_chunk_native(
-                                                packed, aq, output, chunk,
-                                                kb_start, kb_end, decode_lut_512,
-                                                accum);
+                                            gemv_native_quantised_avx512_chunk_native<Bounded>(
+                                                packed, aq, c_row, chunk, kb_start, kb_end,
+                                                decode_lut_512, accum, columns);
                                         else
-                                            gemv_native_quantised_avx512_chunk_non_nibble(
-                                                packed, aq, output, chunk,
-                                                kb_start, kb_end, accum);
-    #endif
+                                            gemv_native_quantised_avx512_chunk_non_nibble<Bounded>(
+                                                packed, aq, c_row, chunk, kb_start, kb_end, accum, columns);
+#endif
+                                    }
+                                    else if (packed.usesNibbleLUT())
+                                    {
+                                        gemv_avx2_chunk_native<Bounded>(
+                                            packed, aq, c_row, chunk, kb_start, kb_end,
+                                            decode_lut_256, accum, columns);
                                     }
                                     else
                                     {
-                                        if (packed.usesNibbleLUT())
-                                            gemv_avx2_chunk_native(
-                                                packed, aq, output, chunk,
-                                                kb_start, kb_end, decode_lut_256,
-                                                accum);
-                                        else
-                                            gemv_avx2_chunk_non_nibble(
-                                                packed, aq, output, chunk,
-                                                kb_start, kb_end, accum);
+                                        gemv_avx2_chunk_non_nibble<Bounded>(
+                                            packed, aq, c_row, chunk, kb_start, kb_end, accum, columns);
                                     }
                                 };
-
-                                if (n_cols_actual == 64)
-                                {
-                                    compute_one_row(c_row);
-                                }
+                                if (columns == 64)
+                                    compute_one_row.template operator()<false>();
                                 else
-                                {
-                                    alignas(64) float tail[64] = {};
-                                    if (accum)
-                                        std::copy_n(c_row, n_cols_actual, tail);
-                                    compute_one_row(tail);
-                                    std::copy_n(tail, n_cols_actual, c_row);
-                                }
+                                    compute_one_row.template operator()<true>();
                             }
 
                         }
