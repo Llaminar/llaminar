@@ -681,6 +681,18 @@ matched all control tokens. Its native verifier inventory removed 2,880
 original grouping nodes per GPU across the retained graph family. The counts
 of retained Gate/Up and Down nodes matched the preceding fused candidate.
 
+The same-library Release comparison selects the direct planner for the
+candidate verifier and stages the control verifier. Both orders preserved all
+256 generated tokens and the per-request MTP work in ordinary decode and at
+fixed depth seven. The staged verifier remains the production default.
+
+| Arm order | Mode | Decode, staged → candidate tok/s | Decode change | Complete throughput change |
+| --- | --- | ---: | ---: | ---: |
+| Candidate first | Ordinary | 29.552 → 29.070 | −1.63% | −1.26% |
+| Candidate first | Fixed depth seven | 43.487 → 43.278 | −0.48% | −0.29% |
+| Staged first | Ordinary | 29.884 → 29.145 | −2.48% | −1.97% |
+| Staged first | Fixed depth seven | 44.095 → 43.432 | −1.51% | −1.05% |
+
 The scalar drafter's original graph submission owns one live activation.
 On the mixed topology, the fused path selects the local F320 Q8 work from
 the ten original route slots and keeps weighting with the original cohort.
