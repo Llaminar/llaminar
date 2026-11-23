@@ -1119,6 +1119,8 @@ namespace llaminar2
                     job.packed_group_rows,
                     static_cast<int>(allocated_payload_bytes_per_block),
                     job.columns.value_or(NativeQuantisedRepackColumns::whole(job.K)),
+                    // The slot's planned layout decides coded vs per-block metadata.
+                    slot->metadata_layout,
                     repack_stream_);
 
                 if (!repack_ok)

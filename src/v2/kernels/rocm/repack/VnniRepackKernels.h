@@ -86,6 +86,29 @@ bool launchVnniRepack(
     NativeQuantisedRepackColumns columns,
     void* stream);
 
+/**
+ * @brief Repack with an explicit packed metadata layout.
+ * @param metadata_layout Must be zero: ROCm readers consume only per-block
+ *        planes until they are converted to superblock-coded metadata
+ *        (docs/v2/projects/2026-11/GPU_SUPERBLOCK_METADATA_PLAN.md). A coded
+ *        layout is rejected rather than silently written as per-block planes.
+ */
+bool launchVnniRepack(
+    RepackFormat format,
+    const void* d_raw_blocks,
+    uint8_t* d_payload,
+    uint16_t* d_scales,
+    uint16_t* d_mins,
+    uint32_t* d_emins,
+    int N, int K,
+    int output_N,
+    int output_row_offset,
+    int packed_group_rows,
+    int allocation_payload_bytes_per_block,
+    NativeQuantisedRepackColumns columns,
+    uint8_t metadata_layout,
+    void* stream);
+
 bool launchVnniRepack(
     RepackFormat format,
     const void* d_raw_blocks,

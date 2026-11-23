@@ -1542,6 +1542,31 @@ bool launchVnniRepack(
     return true;
 }
 
+/** @brief Layout-aware entry: ROCm emits per-block planes only (layout zero). */
+bool launchVnniRepack(
+    RepackFormat format,
+    const void* d_raw_blocks,
+    uint8_t* d_payload,
+    uint16_t* d_scales,
+    uint16_t* d_mins,
+    uint32_t* d_emins,
+    int N, int K,
+    int output_N,
+    int output_row_offset,
+    int packed_group_rows,
+    int allocation_payload_bytes_per_block,
+    NativeQuantisedRepackColumns columns,
+    uint8_t metadata_layout,
+    void* stream)
+{
+    if (metadata_layout != 0)
+        return false;
+    return launchVnniRepack(format, d_raw_blocks, d_payload, d_scales, d_mins, d_emins, N, K, output_N,
+                            output_row_offset, packed_group_rows, allocation_payload_bytes_per_block, columns,
+                            stream);
+}
+
+
 // ============================================================================
 // Host dispatch compatibility wrappers
 // ============================================================================

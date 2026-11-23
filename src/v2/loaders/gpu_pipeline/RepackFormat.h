@@ -96,6 +96,30 @@ enum class RepackFormat : uint8_t {
     return 0;
 }
 
+/**
+ * @brief Physical execution codebook produced by a superblock repack format.
+ * @return The codebook whose superblock-coded metadata the repack can emit,
+ *         or 0 for formats that never carry coded metadata.
+ */
+[[nodiscard]] inline constexpr uint8_t repackSuperblockCodebook(RepackFormat format) noexcept
+{
+    switch (format)
+    {
+    case RepackFormat::Q6_K: return 8;
+    case RepackFormat::Q3_K: return 9;
+    case RepackFormat::Q2_K: return 10;
+    case RepackFormat::IQ4_XS: return 24;
+    case RepackFormat::IQ3_S: return 11;
+    case RepackFormat::IQ3_XXS: return 12;
+    case RepackFormat::IQ2_S: return 13;
+    case RepackFormat::IQ2_XS: return 14;
+    case RepackFormat::IQ2_XXS: return 15;
+    case RepackFormat::IQ1_S: return 16;
+    case RepackFormat::IQ1_M: return 17;
+    default: return 0;
+    }
+}
+
 /// Function pointer types for backend-agnostic repack kernel dispatch.
 /// DeviceLoadPipeline stores these and calls through them without knowing
 /// whether the underlying implementation is CUDA or ROCm.
@@ -113,6 +137,7 @@ struct RepackKernels {
                                   int packed_group_rows,
                                   int allocation_payload_bytes_per_block,
                                   NativeQuantisedRepackColumns columns,
+                                  uint8_t metadata_layout,
                                   void* stream);
 
     VnniRepackFn vnniRepack = nullptr;

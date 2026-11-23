@@ -18,6 +18,7 @@
 #include "../../tensors/ITensor.h"
 #include "../../transfer/TransferEngine.h"
 #include "../../tensors/NativeQuantisedFormatInfo.h"
+#include "../../tensors/NativeQuantisedScalePlane.h"
 #include <tuple>
 #include <map>
 
@@ -122,7 +123,14 @@ public:
                             .is_superblock=false,.has_emins=format.has_emins,
                             .max_abs_factor=source.metadata->max_abs_factor};
         if(!physical) throw std::invalid_argument("Initial isolation adapter cannot authenticate prepared format regions");
-        const auto sizes=nativeQuantisedPackedRegionSizes(std::size_t(p.n),std::size_t(p.k),*physical);
+        auto sizes=nativeQuantisedPackedRegionSizes(std::size_t(p.n),std::size_t(p.k),*physical);
+        // Superblock-coded weights: code plane in `scales`, superblock plane in `mins`.
+        if(nativeQuantisedLayoutRepresentation(weight_.metadata_layout)==NativeQuantisedMetadataRepresentation::SuperblockCoded)
+        {
+            const auto coded=NativeQuantisedMetadataPlaneBytes::coded(weight_.codebook_id,std::size_t(p.n),
+                weight_.blocks_per_row,nativeQuantisedLayoutPhase(weight_.metadata_layout));
+            sizes.scales_bytes=coded.scales;sizes.mins_bytes=coded.secondary;sizes.emins_bytes=0;
+        }
         weights_={{{reinterpret_cast<std::uintptr_t>(weight_.payload),sizes.payload_bytes},
                   {reinterpret_cast<std::uintptr_t>(weight_.scales),sizes.scales_bytes},
                   {reinterpret_cast<std::uintptr_t>(weight_.mins),sizes.mins_bytes},

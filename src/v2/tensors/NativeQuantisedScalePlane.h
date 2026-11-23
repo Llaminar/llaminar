@@ -115,8 +115,10 @@ namespace llaminar2
     LLAMINAR_NATIVE_QUANTISED_PLANE_HD constexpr bool nativeQuantisedSuperblockCodable(
         std::uint8_t physical_codebook) noexcept
     {
-        (void)physical_codebook;
-        return false;
+        // Q6_K, Q3_K, Q2_K and the IQ superblock formats. IQ4_XS's source-scale
+        // codebook (24) waits until the prefill async metadata schedules,
+        // which it qualifies for, read coded planes.
+        return physical_codebook >= 8 && physical_codebook <= 17;
     }
 
     LLAMINAR_NATIVE_QUANTISED_PLANE_HD constexpr bool nativeQuantisedLayoutValid(

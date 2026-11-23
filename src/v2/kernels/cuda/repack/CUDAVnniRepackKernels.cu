@@ -84,7 +84,65 @@ struct PackedVnniDestination
     int blocks_per_row;
     int allocation_payload_bytes_per_block;
     int first_source_block; ///< First selected32-value source subgroup, before destination compaction.
+    /**
+     * Superblock-coded metadata destination (NativeQuantisedSuperblockMetadata.h).
+     * When non-null, per-block source scale codes go to `codes` (same linear
+     * index as the payload) and per-superblock d/dmin words to `superblocks`;
+     * the legacy per-block scale/minimum planes are not written.
+     */
+    void *codes;
+    void *superblocks;
 };
+
+/** @return Whether this destination stores superblock-coded metadata. */
+__device__ __forceinline__ bool packedVnniCoded(PackedVnniDestination destination)
+{
+    return destination.codes != nullptr;
+}
+
+/**
+ * @brief Superblock-plane index of (local_row, block) and whether this block publishes it.
+ *
+ * Local superblock = source superblock minus the first selected source
+ * superblock, which equals (local block + phase) / 8 used by the readers.
+ * Grouped (coalesced expert) destinations keep `[group][superblock][row]`,
+ * mirroring the `[group][block][row]` payload/code layout.
+ */
+__device__ __forceinline__ size_t packedVnniSuperblockIndex(
+    int local_row,
+    int block,
+    PackedVnniDestination destination,
+    bool &publishes)
+{
+    const int first = destination.first_source_block;
+    publishes = (block % 8) == 0 || block == first;
+    const int local_sb = block / 8 - first / 8;
+    const int superblocks = (destination.blocks_per_row + first % 8 + 7) / 8;
+    const int absolute_row = destination.row_offset + local_row;
+    if (destination.group_rows <= 0)
+        return static_cast<size_t>(local_sb) * destination.matrix_rows + static_cast<size_t>(absolute_row);
+    const int group = absolute_row / destination.group_rows;
+    const int row_in_group = absolute_row % destination.group_rows;
+    return (static_cast<size_t>(group) * superblocks + static_cast<size_t>(local_sb)) *
+               static_cast<size_t>(destination.group_rows) +
+           static_cast<size_t>(row_in_group);
+}
+
+/**
+ * @brief Publish one block's coded metadata: its code and, once per superblock, d/dmin.
+ * @tparam CodeT uint8_t or uint16_t (superblockCodeBytes of the codebook).
+ * @tparam WordT uint16_t (d) or uint32_t (d | dmin << 16).
+ */
+template <typename CodeT, typename WordT>
+__device__ __forceinline__ void storePackedVnniCoded(
+    PackedVnniDestination destination, size_t linear, int local_row, int block, CodeT code, WordT superblock)
+{
+    static_cast<CodeT *>(destination.codes)[linear] = code;
+    bool publishes = false;
+    const size_t index = packedVnniSuperblockIndex(local_row, block, destination, publishes);
+    if (publishes)
+        static_cast<WordT *>(destination.superblocks)[index] = superblock;
+}
 
 /**
  * @brief Map one source row/block to its stable persistent packed location.
@@ -618,10 +676,16 @@ __global__ void cuda_repack_q6k_to_vnni(
     const int8_t* signed_scales = reinterpret_cast<const int8_t*>(blk.scales);
     const int sc_lo_idx = half * 8 + sub_in_half * 2;
     const int sc_hi_idx = sc_lo_idx + 1;
-    d_scales[linear] = blk.d;
-    d_mins[linear] = native_quantised_q6_scale::pack(
+    const uint16_t coefficients = native_quantised_q6_scale::pack(
         signed_scales[sc_lo_idx],
         signed_scales[sc_hi_idx]);
+    if (packedVnniCoded(destination))
+    {
+        storePackedVnniCoded<uint16_t, uint16_t>(destination, linear, n, b, coefficients, blk.d);
+        return;
+    }
+    d_scales[linear] = blk.d;
+    d_mins[linear] = coefficients;
 }
 
 // ============================================================================
@@ -701,6 +765,15 @@ __global__ void cuda_repack_q3k_to_vnni(
 
     const int sc_lo_idx = sub_idx * 2;
     const int sc_hi_idx = sub_idx * 2 + 1;
+    if (packedVnniCoded(destination))
+    {
+        // Code: the two unpacked 6-bit scales (low, high); d per superblock.
+        const uint16_t code = static_cast<uint16_t>(
+            (static_cast<uint32_t>(unpacked_scales[sc_lo_idx]) & 63u) |
+            ((static_cast<uint32_t>(unpacked_scales[sc_hi_idx]) & 63u) << 6));
+        storePackedVnniCoded<uint16_t, uint16_t>(destination, linear, n, b, code, blk.d);
+        return;
+    }
     float d_f = __half2float(*reinterpret_cast<const __half*>(&blk.d));
     d_scales[linear] = canonicalPreparedHalfBits(
         d_f * static_cast<float>(unpacked_scales[sc_lo_idx] - 32));
@@ -761,6 +834,15 @@ __global__ void cuda_repack_q2k_to_vnni(
 
     const int sc_lo_idx = sub_idx * 2;
     const int sc_hi_idx = sub_idx * 2 + 1;
+    if (packedVnniCoded(destination))
+    {
+        // Code: the two original scale/min bytes; d | dmin << 16 per superblock.
+        const uint16_t code = static_cast<uint16_t>(
+            static_cast<uint32_t>(blk.scales[sc_lo_idx]) | (static_cast<uint32_t>(blk.scales[sc_hi_idx]) << 8));
+        const uint32_t superblock = static_cast<uint32_t>(blk.d) | (static_cast<uint32_t>(blk.dmin) << 16);
+        storePackedVnniCoded<uint16_t, uint32_t>(destination, linear, n, b, code, superblock);
+        return;
+    }
     float d_val  = __half2float(*reinterpret_cast<const __half*>(&blk.d));
     float dmin_f = __half2float(*reinterpret_cast<const __half*>(&blk.dmin));
     d_scales[linear] = canonicalPreparedHalfBits(
@@ -806,6 +888,11 @@ __global__ void cuda_repack_iq4xs_to_vnni(
     const int ls = ((blk.scales_l[sub_idx / 2] >> (4 * (sub_idx % 2))) & 0xf)
                  | (((blk.scales_h >> (2 * sub_idx)) & 3) << 4);
     // Preserve both original source factors; the consumer multiplies in FP32.
+    if (packedVnniCoded(destination))
+    {
+        storePackedVnniCoded<uint8_t, uint16_t>(destination, linear, n, b, static_cast<uint8_t>(ls), blk.d);
+        return;
+    }
     d_scales[linear] = blk.d;
     d_mins[linear] = llaminar2::native_quantised_iq4xs_scale::encodeSourceCoefficient(
         static_cast<uint8_t>(ls));
@@ -842,6 +929,11 @@ __global__ void cuda_repack_iq3s_to_vnni(
 
     uint8_t sc_byte = blk.scales[sub_idx / 2];
     int nibble = (sub_idx & 1) ? (sc_byte >> 4) : (sc_byte & 0xF);
+    if (packedVnniCoded(destination))
+    {
+        storePackedVnniCoded<uint8_t, uint16_t>(destination, linear, n, b, static_cast<uint8_t>(nibble), blk.d);
+        return;
+    }
     d_scales[linear] = blk.d;
     d_coefficients[linear] = llaminar2::native_quantised_iq3s_scale::encodeSourceCoefficient(
         static_cast<uint8_t>(nibble));
@@ -887,6 +979,11 @@ __global__ void cuda_repack_iq3xxs_to_vnni(
     dst32[2] = *reinterpret_cast<uint32_t*>(payload_buf + 8);
 
     int nibble = static_cast<int>(aux32 >> 28);
+    if (packedVnniCoded(destination))
+    {
+        storePackedVnniCoded<uint8_t, uint16_t>(destination, linear, n, b, static_cast<uint8_t>(nibble), blk.d);
+        return;
+    }
     float d_f = __half2float(*reinterpret_cast<const __half*>(&blk.d));
     d_scales[linear] = canonicalPreparedHalfBits(
         d_f * (0.5f + static_cast<float>(nibble)) * 0.5f);
@@ -937,6 +1034,11 @@ __global__ void cuda_repack_iq2s_to_vnni(
     dst[4] = blk.qh[sub_idx];
     memcpy(dst + 5, blk.qs + 32 + sub_idx * 4, 4);
 
+    if (packedVnniCoded(destination))
+    {
+        storePackedVnniCoded<uint8_t, uint16_t>(destination, linear, n, b, blk.scales[sub_idx], blk.d);
+        return;
+    }
     d_scales[linear] = blk.d;
     d_mins[linear] = native_quantised_iq2s_scale::pack(blk.scales[sub_idx]);
 }
@@ -978,8 +1080,13 @@ __global__ void cuda_repack_iq2xs_to_vnni(
     uint8_t* dst = d_payload + packedVnniPayloadOffset(linear, 9, destination);
     memcpy(dst, payload_buf, 9);
 
-    float d_f = __half2float(*reinterpret_cast<const __half*>(&blk.d));
     uint8_t sc = blk.scales[sub_idx];
+    if (packedVnniCoded(destination))
+    {
+        storePackedVnniCoded<uint8_t, uint16_t>(destination, linear, n, b, sc, blk.d);
+        return;
+    }
+    float d_f = __half2float(*reinterpret_cast<const __half*>(&blk.d));
     d_scales[linear] = canonicalPreparedHalfBits(
         d_f * (0.5f + static_cast<float>(sc & 0xF)) * 0.25f);
     d_mins[linear] = canonicalPreparedHalfBits(
@@ -1029,6 +1136,11 @@ __global__ void cuda_repack_iq2xxs_to_vnni(
     dst32[1] = *reinterpret_cast<uint32_t*>(payload_buf + 4);
 
     int nibble = static_cast<int>(aux32_1 >> 28);
+    if (packedVnniCoded(destination))
+    {
+        storePackedVnniCoded<uint8_t, uint16_t>(destination, linear, n, b, static_cast<uint8_t>(nibble), blk.d);
+        return;
+    }
     float d_f = __half2float(*reinterpret_cast<const __half*>(&blk.d));
     d_scales[linear] = canonicalPreparedHalfBits(
         d_f * (0.5f + static_cast<float>(nibble)) * 0.25f);
@@ -1074,6 +1186,13 @@ __global__ void cuda_repack_iq1s_to_vnni(
         payload_buf,
         6);
 
+    if (packedVnniCoded(destination))
+    {
+        // Code: the scale selector (bits 0..2) and delta sign (bit 3) of qh.
+        storePackedVnniCoded<uint8_t, uint16_t>(destination, linear, n, b,
+                                                static_cast<uint8_t>(qh_word >> 12), blk.d);
+        return;
+    }
     float d_f = __half2float(*reinterpret_cast<const __half*>(&blk.d));
     int scale_sel = (qh_word >> 12) & 7;
     float dl = d_f * (2.0f * static_cast<float>(scale_sel) + 1.0f);
@@ -1139,6 +1258,13 @@ __global__ void cuda_repack_iq1m_to_vnni(
         payload_buf,
         6);
 
+    if (packedVnniCoded(destination))
+    {
+        // Code: both 3-bit scales; the reconstructed half d per superblock.
+        storePackedVnniCoded<uint8_t, uint16_t>(destination, linear, n, b,
+                                                static_cast<uint8_t>(sc3_lo | (sc3_hi << 3)), scale_u16);
+        return;
+    }
     d_scales[linear] = canonicalPreparedHalfBits(dl1);
     d_mins[linear] = canonicalPreparedHalfBits(dl2);
 }
@@ -1160,9 +1286,22 @@ bool launchVnniRepackCUDA(
     int packed_group_rows,
     int allocation_payload_bytes_per_block,
     NativeQuantisedRepackColumns columns,
+    uint8_t metadata_layout,
     void* stream)
 {
     cudaStream_t cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    // A coded layout writes per-block codes into the `scales` region and
+    // per-superblock d/dmin words into the `mins` region (no emins); its
+    // phase must be the selected columns' own superblock phase.
+    const bool coded =
+        llaminar2::nativeQuantisedLayoutRepresentation(metadata_layout) ==
+        llaminar2::NativeQuantisedMetadataRepresentation::SuperblockCoded;
+    if (!llaminar2::nativeQuantisedLayoutValid(repackSuperblockCodebook(format), metadata_layout) ||
+        (metadata_layout != 0 && (!coded ||
+            llaminar2::nativeQuantisedLayoutPhase(metadata_layout) !=
+                static_cast<uint32_t>(columns.firstBlock() % 8) ||
+            !d_scales || !d_mins)))
+        return false;
     const int source_K = columns.sourceColumns();
     const int blocks_per_row = source_K / 32;
     if (!stream || N <= 0 || K <= 0 || K % 32 != 0 || columns.columns() != K || output_N <= 0 ||
@@ -1184,6 +1323,8 @@ bool launchVnniRepackCUDA(
         .allocation_payload_bytes_per_block =
             allocation_payload_bytes_per_block,
         .first_source_block = columns.firstBlock(),
+        .codes = coded ? static_cast<void *>(d_scales) : nullptr,
+        .superblocks = coded ? static_cast<void *>(d_mins) : nullptr,
     };
 
     /*
@@ -1419,6 +1560,18 @@ bool launchVnniRepackCUDA(
     return launchVnniRepackCUDA(format,d_raw_blocks,d_payload,d_scales,d_mins,d_emins,N,K,
         output_N,output_row_offset,packed_group_rows,allocation_payload_bytes_per_block,
         NativeQuantisedRepackColumns::whole(K),stream);
+}
+
+/** @brief Per-block-plane repack of an explicit column selection (metadata layout zero). */
+bool launchVnniRepackCUDA(
+    RepackFormat format,const void* d_raw_blocks,uint8_t* d_payload,uint16_t* d_scales,
+    uint16_t* d_mins,uint32_t* d_emins,int N,int K,int output_N,int output_row_offset,
+    int packed_group_rows,int allocation_payload_bytes_per_block,NativeQuantisedRepackColumns columns,
+    void* stream)
+{
+    return launchVnniRepackCUDA(format,d_raw_blocks,d_payload,d_scales,d_mins,d_emins,N,K,
+        output_N,output_row_offset,packed_group_rows,allocation_payload_bytes_per_block,columns,
+        uint8_t{0},stream);
 }
 
 bool launchVnniRepackCUDA(
