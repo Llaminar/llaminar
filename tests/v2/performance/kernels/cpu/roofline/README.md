@@ -493,6 +493,15 @@ investigated.
 | Candidate first | Fixed depth seven | 45.492 → 44.672 | −1.80% | −1.36% |
 | Control first | Fixed depth seven | 43.884 → 43.926 | +0.09% | −0.06% |
 
+A separate 32-token fixed-depth-seven trace matched the saved prompt, token
+sequence, and MTP work. Both arms recorded zero live bindings and zero
+ordinary prepared FFN plans. On rank 1, the mean endpoint time for 182
+capacity-one packets was 419.92 → 400.65 µs and the mean for 1,248
+capacity-eight packets was 1,115.84 → 1,081.18 µs. Rank 0 changed
+420.33 → 417.55 µs and 1,111.78 → 1,114.81 µs across the same capacities.
+These instrumented endpoint timings leave the quiet end-to-end difference
+unexplained. The live-binding experiment remains gated.
+
 The sealed IQ4 scale probe resolved the scale program at output-tile entry.
 The IQ4_XS packet loop consumed coefficients validated at weight publication.
 Both sockets, one and two rows per expert, eight and 64 experts, and both
