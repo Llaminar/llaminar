@@ -672,6 +672,25 @@ and decode. The staged verifier remains the default.
 | Staged first | Ordinary | 30.621 → 29.594 | −3.35% | −2.87% |
 | Staged first | Fixed depth seven | 45.487 → 44.113 | −3.02% | −2.48% |
 
+The direct planner reads the original static router outputs and the acquired
+placement bank. Both RTX 3090s passed the recorded acquired-epoch replay,
+including partial and empty work, original weights and Q8 publication, and
+inactive output guards. The four SM86 planner entries used 144–152 registers,
+32 shared bytes, and zero stack or local bytes. A 32-token Release probe
+matched all control tokens. Its native verifier inventory removed 2,880
+original grouping nodes per GPU across the retained graph family. The counts
+of retained Gate/Up and Down nodes matched the preceding fused candidate.
+
+The scalar drafter's original graph submission owns one live activation.
+On the mixed topology, the fused path selects the local F320 Q8 work from
+the ten original route slots and keeps weighting with the original cohort.
+The FP16 router declares its
+existing original-input Q8 publication before capture. Both GPUs passed the
+Q8 and Down replay across partial, empty-local, and repeated route frames.
+Both retained `mtp_decode_sidecar` and `mtp_decode_chained` graphs captured
+the planner and the two fused arithmetic phases on each GPU. The Release
+probe matched all 32 tokens and per-request MTP work with the staged control.
+
 ### CUDA peer transfers at QFN decode sizes
 
 The two QFN RTX 3090s report direct access in both directions over the
