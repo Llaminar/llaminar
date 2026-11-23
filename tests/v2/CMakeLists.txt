@@ -9749,7 +9749,7 @@ add_v2_test(V2_Integration_DeepSeekV4VisionTowerAdmission
 # file failed to load while only the fused attn_qkv was accepted.
 add_v2_test(V2_Integration_DeepSeekV4VisionSplitQKV
     COMMAND $<TARGET_FILE:v2_test_deepseek4_vision_encoder>
-            --gtest_filter=DeepSeekV4VisionEncoder.SplitQKVProjectorEncodesIdenticallyToFused
+            --gtest_filter=DeepSeekV4VisionEncoder.SplitQKVProjectorEncodesIdenticallyToFused:DeepSeekV4VisionEncoder.BF16SplitQKVProjectorHoldsExactlyTheAdmittedBytes
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;DeepSeekV4;Vision;Regression"
     MPI_PROCS 1 NO_MODELS TIMEOUT 60)
 add_v2_test(V2_Integration_DeepSeekV4VisionBF16Residency

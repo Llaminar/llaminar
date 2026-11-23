@@ -147,6 +147,9 @@ TEST(DeepSeekV4VisionEncoder, SplitQKVProjectorEncodesIdenticallyToFused)
     DeepSeekV4VisionEncoder fused(tensors(golden), VisionPreprocessConfig{}, golden["layers"], golden["heads"]);
     DeepSeekV4VisionEncoder separate(std::move(split), VisionPreprocessConfig{}, golden["layers"], golden["heads"]);
     EXPECT_EQ(separate.weightBytes(), fused.weightBytes());
+    // Admission prices sizes; the split assembly must not leave growth slack.
+    EXPECT_EQ(separate.physicalWeightBytes(), separate.weightBytes());
+    EXPECT_EQ(fused.physicalWeightBytes(), fused.weightBytes());
     const auto &c = golden["cases"][0];
     PreparedImage img;
     img.vit_h = c["vit_h"];
@@ -350,4 +353,53 @@ TEST(DeepSeekV4VisionEncoder, BF16MmprojStaysHalfPrecisionAndEncodesExactly)
     }
     // Same widened values; only the BLAS chunk blocking may reassociate.
     EXPECT_LT(std::sqrt(err / ref), 1e-6);
+}
+
+/**
+ * @test A BF16 projector with separate attn_q/attn_k/attn_v (the published
+ * layout) holds exactly the admitted bytes: assembling the fused matrix must
+ * reserve its final extent instead of leaving geometric-growth slack that
+ * admission (priced by size from the file directory) never sees.
+ */
+TEST(DeepSeekV4VisionEncoder, BF16SplitQKVProjectorHoldsExactlyTheAdmittedBytes)
+{
+    const auto golden = nlohmann::json::parse(test::dsv4::kVisionEncoderGolden);
+    const std::size_t D = golden["dim"].get<std::size_t>();
+    auto t = tensors(golden);
+    for (auto &[name, tensor] : t)
+        if (tensor.shape.size() >= 2)
+            for (auto &v : tensor.data) v = bf16(v);
+    for (int layer = 0; layer < golden["layers"].get<int>(); ++layer)
+    {
+        const std::string pre = "v.blk." + std::to_string(layer) + ".";
+        const auto w = t.at(pre + "attn_qkv.weight");
+        const auto b = t.at(pre + "attn_qkv.bias");
+        t.erase(pre + "attn_qkv.weight");
+        t.erase(pre + "attn_qkv.bias");
+        const char *parts[] = {"attn_q", "attn_k", "attn_v"};
+        for (std::size_t part = 0; part < 3; ++part)
+        {
+            VisionHostTensor pw, pb;
+            pw.shape = {D, D};
+            pw.data.assign(w.data.begin() + part * D * D, w.data.begin() + (part + 1) * D * D);
+            pb.shape = {D};
+            pb.data.assign(b.data.begin() + part * D, b.data.begin() + (part + 1) * D);
+            t.emplace(pre + parts[part] + ".weight", std::move(pw));
+            t.emplace(pre + parts[part] + ".bias", std::move(pb));
+        }
+    }
+    char pattern[] = "/tmp/dsv4-mmproj-split-XXXXXX";
+    const int fd = ::mkstemp(pattern);
+    ASSERT_GE(fd, 0);
+    ::close(fd);
+    const std::string path = pattern;
+    writeMmproj(path, t, golden["layers"], golden["heads"], /*bf16_matrices=*/true);
+    test::MockMPIContext mpi;
+    const std::size_t admitted = DeepSeekV4VisionEncoder::mmprojHostWeightBytes(path, mpi);
+    std::unique_ptr<DeepSeekV4VisionEncoder> loaded;
+    ASSERT_NO_THROW(loaded = DeepSeekV4VisionEncoder::load(path, mpi, golden["text_dim"].get<int>()));
+    ::unlink(path.c_str());
+    ASSERT_TRUE(loaded);
+    EXPECT_EQ(loaded->weightBytes(), admitted);
+    EXPECT_EQ(loaded->physicalWeightBytes(), admitted) << "fused QKV assembly left vector capacity slack";
 }

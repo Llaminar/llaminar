@@ -451,3 +451,24 @@ greedy, prompt `[image] Describe the picture.`, thinking high):
 
 Not yet: GPU vision tower, multi-rank image requests, prefix caching of image
 prompts (prefix cache is rejected for DSV4), image-content-aware prefix keys.
+
+## Single-GB10 storage (file-density weights, PR #73)
+
+Measured with `--dry-run --device cuda:0 -c 32768` on one GB10, real Unsloth
+DeepSeek-V4-Flash-Vision UD shard headers. Before file-density metadata,
+UD-IQ3_XXS needed 115.3 GiB of weights from a 103.0 GB file (IQ2_S experts
++15.5 GB, IQ3_XXS +4.8 GB) and missed the 117.3 GiB pool by 0.56 GiB.
+
+With CUDA superblock-coded metadata every Spark-fitting UD variant is
+admitted at its GGUF bytes plus code-plane alignment (~11 KB per variant):
+UD-IQ1_S 82.4, UD-IQ1_M 86.9, UD-IQ2_XXS 90.7, UD-Q2_K_XL 96.8, UD-IQ3_XXS
+103.0 and UD-IQ3_S 114.4 GB (`V2_Integration_DeepSeekV4UDVariantWeightDensity`
+replays their real tensor inventories). UD-IQ3_XXS and UD-IQ1_M load and
+generate on one GB10; UD-IQ3_XXS with the BF16 mmproj describes images.
+
+Non-KV GPU memory at 512 resident rows (UD-IQ3_XXS, 32K): the arena is
+700 MiB after dropping never-bound Qwen fa_q_raw/fa_gate/mtp_*/gdn_* roots
+(was 1.18 GiB), and the serial workspace family is 1.27 GB after declaring
+the 144 MiB CUDA Q8 router gate cache only for FP32 gates (was 1.43 GB). The
+KV/state pools are 110 MiB at 32K and 3.4 GiB at 1M.
+

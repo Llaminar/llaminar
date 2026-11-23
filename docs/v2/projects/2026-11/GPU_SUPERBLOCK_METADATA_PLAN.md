@@ -1,6 +1,6 @@
 # GPU superblock-coded NativeQuantised metadata
 
-Status: plan and design (2026-11-23). Owner: DeepSeek-V4 bring-up (PR #71).
+Status: CUDA implemented (2026-11-23); ROCm and CPU tier pending.
 
 ## Problem
 
@@ -28,11 +28,9 @@ the file:
 | Q5_K (7) | 22.00 | 24 | 1.09 | half(d*sc) | half(-dmin*m) |
 | Q6_K (8) | 26.25 | 28 | 1.07 | d | two int8 coefficients |
 
-Measured on the real Unsloth DeepSeek-V4-Flash-Vision UD-IQ3_XXS directory
-(`--dry-run`, single GB10, 32K): weights 115.3 GiB from a 103.0 GB file
-(IQ2_S experts alone +15.5 GB, IQ3_XXS +4.8 GB). With the integrated-GPU
-capacity fix the pool admits 117.3 GiB, so the model misses by 0.56 GiB and
-has no KV headroom. llama.cpp uploads GGUF blocks verbatim (1.00x).
+For a ~100 GB low-bit MoE GGUF this costs well over 10 GB on the GPU, enough
+to stop a model that fits a 128 GB integrated-GPU host from loading.
+llama.cpp uploads GGUF blocks verbatim (1.00x).
 
 ## Design: superblock-coded planes (Tier 1)
 
@@ -78,7 +76,7 @@ Payload + code + superblock bits per 256 values equal the GGUF bits for all
 thirteen codable formats (Q4_K, Q5_K, Q6_K, Q3_K, Q2_K, IQ4_XS, IQ3_S,
 IQ3_XXS, IQ2_S, IQ2_XS, IQ2_XXS, IQ1_S, IQ1_M); the codec unit test asserts
 this table. The only remaining excess is 256-byte region alignment and the
-four padding bytes per code plane (about 0.5 MB for a DSV4 UD model).
+four padding bytes per code plane (well under 1 MB for a ~100 GB model).
 
 Producers write codes with disjoint-bit `atomicAnd`/`atomicOr`, so concurrent
 blocks need no zeroing and no ordering. A matrix bound at a sub-byte offset of
@@ -86,9 +84,6 @@ a coalesced run carries the bit shift in metadata-layout bits 3-5 (bit 7
 coded, bits 0-2 superblock phase). Q4_K/Q5_K share physical codebooks 5/7 with
 Q4_1/Q5_1 without conflict: the representation is per matrix and only
 superblock sources are ever coded.
-
-Predicted CUDA weight bytes equal the file: UD-IQ1_S 82.5 GB, UD-IQ1_M
-86.9 GB, UD-IQ2_XXS 90.7 GB, UD-IQ3_XXS 103.0 GB.
 
 ### Tier 2 (payload redundancy)
 
@@ -147,8 +142,8 @@ expert slot geometry, PMA BOM.
 3. Spill guard on every shipping architecture; ncu/rocprof of each changed
    kernel family (loader adds a few ALU ops per block; no throughput loss
    accepted without evidence).
-4. Real DSV4 UD-IQ3_XXS/IQ1_M/IQ2_XXS dry-run BOMs on GB10, then load and
-   generate.
+4. Real low-bit MoE GGUFs: dry-run admission at file density on an
+   integrated GPU, then load and generate.
 
 ## Status
 
@@ -157,9 +152,9 @@ expert slot geometry, PMA BOM.
   transfer and rebalance reject coded descriptors.
 - ROCm: readers and repack reject coded layouts, so ROCm keeps per-block
   planes. Conversion needs a HIP compile host.
-- CPU compact tier: still per-block FP16 words (1.33-1.66x of file). The
+- CPU compact tier: still per-block FP16 words (see below). The
   NEON/AVX2/AVX-512 loaders need the codec before coded CPU-to-GPU promotion
-  can exist; x86 verification needs an x86 host.
+  can exist.
 
 ## CPU tier and expert movement (next phase)
 
@@ -202,7 +197,7 @@ extents equal the file bytes.
 2. Address type + helpers; descriptor phase field.
 3. Q4_K/Q5_K/IQ4_XS after the IQ formats (done: the per-matrix
    representation lets them share codebooks 5/7 with Q4_1/Q5_1).
-4. Format by format in descending DSV4 waste order: IQ2_S, IQ3_XXS, IQ2_XS,
+4. Format by format in descending waste order: IQ2_S, IQ3_XXS, IQ2_XS,
    IQ1_S/IQ1_M, IQ3_S, Q6_K, IQ2_XXS, then K-quants and IQ4_XS. Each format
    switches every producer and consumer on both backends at once; the legacy
    planes for that format are retired in the same change.

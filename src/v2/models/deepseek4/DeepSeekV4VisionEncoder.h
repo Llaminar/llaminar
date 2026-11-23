@@ -78,6 +78,12 @@ namespace llaminar2::deepseek4
         {
             return f32.size() * sizeof(float) + half_bits.size() * sizeof(std::uint16_t);
         }
+
+        /** @return Physically reserved bytes (vector capacity), never below bytes(). */
+        [[nodiscard]] std::size_t capacityBytes() const noexcept
+        {
+            return f32.capacity() * sizeof(float) + half_bits.capacity() * sizeof(std::uint16_t);
+        }
     };
 
     /** @brief Host vision tower; immutable after construction, safe for concurrent encode(). */
@@ -120,6 +126,8 @@ namespace llaminar2::deepseek4
 
         /** @return Resident bytes held by the tower's weights. */
         std::size_t weightBytes() const noexcept { return weight_bytes_; }
+        /** @return Physically reserved tower bytes (vector capacities); equals weightBytes() when no slack exists. */
+        std::size_t physicalWeightBytes() const noexcept { return physical_weight_bytes_; }
 
         /**
          * @brief Exact resident host weight bytes of a deepseek4v mmproj, metadata only.
@@ -154,6 +162,7 @@ namespace llaminar2::deepseek4
         std::vector<Layer> blocks_;
         std::array<std::vector<float>, kImageSentinelCount> sentinels_;
         std::size_t weight_bytes_ = 0;
+        std::size_t physical_weight_bytes_ = 0;
     };
 
     /**

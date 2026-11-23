@@ -160,8 +160,15 @@ namespace llaminar2::deepseek4
                 auto w = takeMatrix(t, pre + part + ".weight", {D, D}, D);
                 if (fused.rows == 0)
                 {
+                    // Reserve the exact final extent: geometric growth would
+                    // leave 4D^2 capacity behind 3D^2 values that admission
+                    // (VisionMatrix::bytes, by size) never sees.
                     fused.cols = w.cols;
                     fused.precision = w.precision;
+                    if (w.precision == VisionHostPrecision::F32)
+                        fused.f32.reserve(3 * D * D);
+                    else
+                        fused.half_bits.reserve(3 * D * D);
                 }
                 else if (w.precision != fused.precision)
                     throw std::invalid_argument("DeepSeek-V4 mmproj " + pre + "attn_q/k/v disagree on precision");
@@ -307,8 +314,14 @@ namespace llaminar2::deepseek4
 
         // Resident bytes, by the same rule mmprojHostWeightBytes prices from
         // the tensor directory: matrices in file precision, vectors in FP32.
-        const auto add = [&](const std::vector<float> &v) { weight_bytes_ += v.size() * sizeof(float); };
-        const auto addm = [&](const VisionMatrix &m) { weight_bytes_ += m.bytes(); };
+        const auto add = [&](const std::vector<float> &v) {
+            weight_bytes_ += v.size() * sizeof(float);
+            physical_weight_bytes_ += v.capacity() * sizeof(float);
+        };
+        const auto addm = [&](const VisionMatrix &m) {
+            weight_bytes_ += m.bytes();
+            physical_weight_bytes_ += m.capacityBytes();
+        };
         for (const auto *v : {&patch_b_, &post_ln_, &mm1_b_, &mm2_b_}) add(*v);
         for (const auto *m : {&patch_w_, &mm1_w_, &mm2_w_}) addm(*m);
         for (const auto &b : blocks_)
