@@ -28,6 +28,7 @@
 #include "CPUNativeQuantisedContributionContract.h"
 #include "CPUNativeQuantisedFP16.h"
 #include "CPUNativeQuantisedQ6Kernels.h"
+#include "CPUNativeQuantisedQ5X86Kernels.h"
 #include "CPUNativeQuantisedMultiScaleKernels.h"
 #include "VNNIEmulation.h"
 #include "tensors/BlockStructures.h"
@@ -338,6 +339,9 @@ namespace llaminar2::cpu::native_quantised
         int kb_end,
         bool accumulate = false)
     {
+        if (packed.encoding == CPUNativeQuantisedEncoding::Q5NativeSingleScale)
+            return q5::dispatch<8>(packed, std::array{A_q8}, std::array{C},
+                chunk, kb_start, kb_end, accumulate);
         if (packed.usesCompactMultiScale())
         {
             multi_scale::dispatch<8>(packed, std::array{A_q8}, std::array{C},
@@ -624,6 +628,9 @@ namespace llaminar2::cpu::native_quantised
         int kb_end,
         bool accumulate)
     {
+        if (packed.encoding == CPUNativeQuantisedEncoding::Q5NativeSingleScale)
+            return q5::dispatch<8, SumPairs>(packed, std::array{A_q8_row0, A_q8_row1}, std::array{C_row0, C_row1},
+                chunk, kb_start, kb_end, accumulate);
         if (packed.usesCompactMultiScale())
         {
             multi_scale::dispatch<8>(packed, std::array{A_q8_row0, A_q8_row1},

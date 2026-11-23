@@ -68,6 +68,8 @@ namespace llaminar2::cpu::native_quantised
     {
         if (!rotation_enabled && source.codebook_id == 5 && source.is_superblock)
             return CPUNativeQuantisedEncoding::Q4KSuperblockCoded;
+        if (!rotation_enabled && isQ5NativeSingleScaleSource(source.codebook_id, source.is_superblock))
+            return CPUNativeQuantisedEncoding::Q5NativeSingleScale;
         if (!rotation_enabled && source.codebook_id == 4 && source.is_superblock)
             return CPUNativeQuantisedEncoding::NibbleLUTSourceScale;
         if (!rotation_enabled && source.codebook_id == 7 && source.is_superblock)

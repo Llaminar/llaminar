@@ -162,6 +162,8 @@ namespace llaminar2::cpu::native_quantised
         const CPUNativeQuantisedPackedWeights &meta,
         uint8_t *workspace)
     {
+        if (meta.encoding == CPUNativeQuantisedEncoding::Q5NativeSingleScale)
+            throw std::invalid_argument("Deferred raw-block repacking cannot publish native Q5 CPU units; use the native window producer");
         if (!meta.usesInlineCompensation())
             throw std::invalid_argument("Legacy deferred CPU repack requires per-block weight-sum compensation metadata");
         if (meta.usesQ6KNativeDualScale() || meta.usesCompactMultiScale() ||

@@ -52,6 +52,25 @@ namespace llaminar2::cpu::native_quantised
         NibbleLUTSourceScale = 4, ///< IQ4_XS nibble payload, original half base, raw coefficient.
         IQ3SExpandedSourceScale = 5, ///< Original IQ3_S signed grid, base and raw nibble.
         Q4KSuperblockCoded = 6, ///< Unsigned nibble payload, 12-bit code and a superblock d/dmin word.
+        Q5NativeSingleScale = 7, ///< Q5_0/Q5_1 low nibbles and fifth bits, with FP16 d and optional m.
+    };
+
+    /** @return Whether the original source uses the ordinary Q5 block, not Q5_K. */
+    [[nodiscard]] constexpr bool isQ5NativeSingleScaleSource(std::uint8_t codebook, bool superblock) noexcept
+    {
+        return !superblock && (codebook == 6 || codebook == 7);
+    }
+
+    /** @brief Q5's 16 nibble bytes plus four paired fifth-bit bytes per padded column. */
+    struct Q5NativePayload
+    {
+        static constexpr int groups = 4;
+        static constexpr int bytes = 64 * 20;
+
+        /** @return Offset of four original nibble bytes for one column and K group. */
+        static constexpr int nibbleOffset(int group, int column) noexcept { return group * 256 + column * 4; }
+        /** @return Offset of the fifth bits of groups @p group and @p group + 4 in one byte. */
+        static constexpr int fifthOffset(int group, int column) noexcept { return 1024 + column * 4 + group; }
     };
 
     /**
@@ -91,6 +110,7 @@ namespace llaminar2::cpu::native_quantised
         case CPUNativeQuantisedEncoding::ExpandedInt8:
         case CPUNativeQuantisedEncoding::Q6KNativeDualScale:
         case CPUNativeQuantisedEncoding::CompactMultiScale:
+        case CPUNativeQuantisedEncoding::Q5NativeSingleScale:
             return true;
         }
         return false;
@@ -288,6 +308,8 @@ namespace llaminar2::cpu::native_quantised
             return 2048;
         case CPUNativeQuantisedEncoding::Q6KNativeDualScale:
             return 1536;
+        case CPUNativeQuantisedEncoding::Q5NativeSingleScale:
+            return Q5NativePayload::bytes;
         }
         return 0;
     }

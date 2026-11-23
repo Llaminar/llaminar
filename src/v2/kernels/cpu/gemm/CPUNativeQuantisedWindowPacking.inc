@@ -200,6 +200,21 @@ inline void appendNativeWeightGroups(const IINT8Unpackable& source,const NativeQ
                     if(b==0)
                         coded_metadata::storeSuperblockWord(interleaved.data()+out.superblockHeaderOffset(chunk,output_first),
                             5,column,superblock[0]);
+                } else if(out.encoding==CPUNativeQuantisedEncoding::Q5NativeSingleScale) {
+                    // Four nibble groups and one group of four paired fifth-bit bytes.
+                    // Keeping every group four bytes wide per column lets the CPU
+                    // rectangle stream use its unchanged native plane copier.
+                    for(int g=0;g<Q5NativePayload::groups;++g) {
+                        std::memcpy(target+Q5NativePayload::nibbleOffset(g,column),input+g*4,4);
+                        target[Q5NativePayload::fifthOffset(g,column)]=uint8_t(((input[16+g/2]>>(4*(g%2)))&15) |
+                            (((input[18+g/2]>>(4*(g%2)))&15)<<4));
+                    }
+                    const uint16_t scale=fp32_to_fp16(fp16_to_fp32(primary[b]));
+                    std::memcpy(target+out.data_stride+column*2,&scale,2);
+                    if(out.is_asymmetric) {
+                        const uint16_t minimum=fp32_to_fp16(fp16_to_fp32(secondary[b]));
+                        std::memcpy(target+out.data_stride+128+column*2,&minimum,2);
+                    }
                 } else if(out.usesQ6KNativeDualScale()) {
                     for(int g=0;g<4;++g)std::memcpy(target+g*256+column*4,input+g*4,4);
                     for(int g=0;g<8;++g) {

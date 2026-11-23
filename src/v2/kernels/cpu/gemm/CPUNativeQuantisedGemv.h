@@ -2656,6 +2656,9 @@ namespace llaminar2::cpu::native_quantised
                                       chunk, kb_start, kb_end, accumulate);
             return;
         }
+        if (packed.encoding == CPUNativeQuantisedEncoding::Q5NativeSingleScale)
+            return q5::dispatch<16>(packed, std::array{A_q8},
+                std::array{C}, chunk, kb_start, kb_end, accumulate);
         if (packed.usesQ6KNativeDualScale())
         {
             gemvQ6KNativeAVX512Chunk(
@@ -3654,6 +3657,9 @@ namespace llaminar2::cpu::native_quantised
                                       std::array{C_row0, C_row1}, chunk, kb_start, kb_end, accumulate);
             return;
         }
+        if (packed.encoding == CPUNativeQuantisedEncoding::Q5NativeSingleScale)
+            return q5::dispatch<16, SumPairs>(packed, std::array{A_q8_row0, A_q8_row1},
+                std::array{C_row0, C_row1}, chunk, kb_start, kb_end, accumulate);
         if (packed.usesQ6KNativeDualScale())
         {
             gemmQ6KNativeTwoRowsAVX512Chunk(
@@ -4480,6 +4486,9 @@ namespace llaminar2::cpu::native_quantised
                                       std::array{C_row0, C_row1, C_row2}, chunk, kb_start, kb_end, accumulate);
             return;
         }
+        if (packed.encoding == CPUNativeQuantisedEncoding::Q5NativeSingleScale)
+            return q5::dispatch<16>(packed, std::array{A_q8_row0, A_q8_row1, A_q8_row2},
+                std::array{C_row0, C_row1, C_row2}, chunk, kb_start, kb_end, accumulate);
         if (packed.usesQ6KNativeDualScale())
         {
             gemmQ6KNativeThreeRowsAVX512Chunk(
@@ -4770,6 +4779,9 @@ namespace llaminar2::cpu::native_quantised
                                       std::array{C_row0, C_row1, C_row2, C_row3}, chunk, kb_start, kb_end, accumulate);
             return;
         }
+        if (packed.encoding == CPUNativeQuantisedEncoding::Q5NativeSingleScale)
+            return q5::dispatch<16, SumPairs>(packed, std::array{A_q8_row0, A_q8_row1, A_q8_row2, A_q8_row3},
+                std::array{C_row0, C_row1, C_row2, C_row3}, chunk, kb_start, kb_end, accumulate);
         if (packed.usesQ6KNativeDualScale())
         {
             gemmQ6KNativeFourRowsAVX512Chunk(

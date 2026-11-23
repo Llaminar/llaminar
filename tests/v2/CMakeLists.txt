@@ -10654,6 +10654,14 @@ add_v2_test(V2_Unit_NativeQuantisedFileDensityAllFormats
     LABELS "V2;Unit;CPU;DeviceFree;NativeQuantised;Memory;Regression;ProductionTestPreflight"
     MPI_PROCS 1 NO_MODELS NO_MPI)
 
+# Native Q5 ordinary blocks retain file density and their original arithmetic.
+add_executable(v2_unit_cpu_q5_native_single_scale unit/kernels/cpu/Test__CPUQ5NativeSingleScale.cpp)
+target_link_libraries(v2_unit_cpu_q5_native_single_scale llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_CPUQ5NativeSingleScale
+    COMMAND $<TARGET_FILE:v2_unit_cpu_q5_native_single_scale>
+    LABELS "V2;Unit;CPU;DeviceFree;NativeQuantised;ByteExact;Regression;ProductionTestPreflight"
+    MPI_PROCS 1 NO_MODELS NO_MPI)
+
 # Original Q6 source factors remain exact without changing Q8 GEMM inputs.
 add_executable(v2_test_q6_source_scale unit/kernels/Test__Q6SourceScale.cpp)
 target_link_libraries(v2_test_q6_source_scale

@@ -155,7 +155,7 @@ PROGRAM = re.compile(r"27CPUNativeNEONProjectionTileILm(\d)EE3runINS1_11multi_sc
                      r"Li(\d)E")
 INVENTORY = re.compile(r"llaminar-native-neon-tile-probe:([A-Za-z0-9,:]*)")
 # (encoding, nibble map, with-minimum) dispatched per policy by Tile::dispatch().
-DISPATCH = ((1, 0, 1), (1, 0, 0), (5, 0, 0), (2, 0, 0), (4, 2, 0), (0, 0, 0), (0, 2, 0), (0, 1, 1), (0, 3, 0), (6, 1, 1))
+DISPATCH = ((1, 0, 1), (1, 0, 0), (5, 0, 0), (2, 0, 0), (4, 2, 0), (0, 0, 0), (0, 2, 0), (0, 1, 1), (0, 3, 0), (6, 1, 1), (7, 0, 0), (7, 1, 1))
 DOTS = {"ASIMD": 0, "DotProd": 1, "I8MM": 2}
 # The one never-returning diagnostic a tile may call, and abort. Both must also be proven never to return.
 FATAL_DIAGNOSTIC = "_ZN9llaminar23cpu16native_quantised28CPUNativeQuantisedWeightView32rejectOutsideAdmittedPublicationEv"
@@ -177,7 +177,7 @@ FORMS = frozenset(line.strip() for line in """
 add v,v,v|add w,w,imm|add w,w,w|add x,x,imm|add x,x,imm,shift|add x,x,reloc|add x,x,w,shift|add x,x,x|add x,x,x,shift
 addp v,v,v|adds x,x,imm|adrp x,reloc|adrp x,sym|and v,v,v|and w,w,imm|and x,x,imm|asr w,w,imm|b sym|b.cond sym|bic v,imm|bic v,imm,shift
 bic v,v,v|bic w,w,w,shift|bics w,w,w|bif v,v,v|bit v,v,v|bfi w,w,imm,imm|bfi x,x,imm,imm|bfxil x,x,imm,imm|bl sym|bsl v,v,v
-cbnz w,sym|cbnz x,sym|cbz w,sym|cbz x,sym|ccmp w,w,imm,cond|cmeq v,v,imm|cmeq v,v,v|cmhi v,v,v|cmn w,imm
+cbnz w,sym|cbnz x,sym|cbz w,sym|cbz x,sym|ccmp w,w,imm,cond|cmeq v,v,imm|cmeq v,v,v|cmhi v,v,v|cmn w,imm|cmtst v,v,v
 cmp w,imm|cmp w,w|cmp w,w,shift|cmp x,imm|cmp x,w,shift|cmp x,x|csel w,w,w,cond|csel x,x,x,cond|csneg w,w,w,cond|cset x,cond|dup d,v[]
 dup v,v[]|dup v,w|dup v,x|eor x,x,x|ext v,v,v,imm|fadd v,v,v|fcsel s,s,s,cond|fcvtl v,v|fcvtn v,v|fmla v,v,v|fmov d,d|fmov d,x|fmov s,s
 fmov s,w|fmov w,s|fmov x,d|fmul s,s,s|fmul v,v,v|fmul v,v,v[]|fneg v,v|ins v[],v[]|ins v[],x|ld1 list,mem
@@ -1573,6 +1573,13 @@ def require_registers(counts: dict[str, int], identity: str, mode: str, budget: 
         if key.startswith("1:"):
             if count:
                 failures.append(f"{key} spills {count} (single-row programs must not spill)")
+        elif key.split(":")[3] == "7":
+            # Native Q5 replaces the corresponding expanded program. It can
+            # never require more stack traffic than that existing grouped bound.
+            rows, family, policy, _, _, minimum = key.split(":")
+            replaced = f"{rows}:{family}:{policy}:1:0:{minimum}"
+            if replaced not in limits or count > limits[replaced]:
+                failures.append(f"{key} spills {count} > replaced expanded budget {limits.get(replaced)}")
         elif key not in limits:
             failures.append(f"{key} has no budget")
         elif count > limits[key]:

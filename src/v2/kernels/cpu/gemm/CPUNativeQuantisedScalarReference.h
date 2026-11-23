@@ -156,7 +156,22 @@ namespace llaminar2::cpu::native_quantised
                     }
 
                     int8_t b_vals[32];
-                    if (packed.usesNibbleLUT())
+                    if (packed.encoding == CPUNativeQuantisedEncoding::Q5NativeSingleScale)
+                    {
+                        const auto *unit = packed.interleavedBase() + packed.blockOffset(chunk, kb);
+                        for (int group = 0; group < 4; ++group)
+                        {
+                            const auto *low = unit + Q5NativePayload::nibbleOffset(group, n_local);
+                            const unsigned fifth = unit[Q5NativePayload::fifthOffset(group, n_local)];
+                            const int bias = packed.is_asymmetric ? 0 : 16;
+                            for (int i = 0; i < 4; ++i)
+                            {
+                                b_vals[group * 4 + i] = (low[i] & 15) + 16 * ((fifth >> i) & 1) - bias;
+                                b_vals[group * 4 + 16 + i] = (low[i] >> 4) + 16 * ((fifth >> (i + 4)) & 1) - bias;
+                            }
+                        }
+                    }
+                    else if (packed.usesNibbleLUT())
                     {
                         // Four groups contain the original sixteen native
                         // bytes for this column. Reconstruct only this bounded

@@ -1,6 +1,6 @@
 /**
  * @file CPUNativeNEONPreparedProjection.h
- * @brief Native AArch64 prepared quantized projection tiles over all six encodings.
+ * @brief Native AArch64 prepared quantized projection tiles over all admitted encodings.
  *
  * A checked synchronous tile borrows canonical resident weights, persistent Q8
  * activations and exclusive output spans. Physical rows share integer payload
@@ -119,6 +119,7 @@ namespace llaminar2::cpu::native_quantised
             bool implemented = false;
             switch (weights.encoding)
             {
+            case Encoding::Q5NativeSingleScale:
             case Encoding::ExpandedInt8:
             case Encoding::IQ3SExpandedSourceScale:
             case Encoding::Q6KNativeDualScale:
@@ -324,6 +325,10 @@ namespace llaminar2::cpu::native_quantised
                 if (weights_.is_asymmetric)
                     return run<Ops, Policy, Encoding::ExpandedInt8, NibbleMap::Centered, true, Strips>();
                 return run<Ops, Policy, Encoding::ExpandedInt8, NibbleMap::Centered, false, Strips>();
+            case Encoding::Q5NativeSingleScale:
+                if (weights_.is_asymmetric)
+                    return run<Ops, Policy, Encoding::Q5NativeSingleScale, NibbleMap::Unsigned, true, Strips>();
+                return run<Ops, Policy, Encoding::Q5NativeSingleScale, NibbleMap::Centered, false, Strips>();
             case Encoding::IQ3SExpandedSourceScale:
                 return run<Ops, Policy, Encoding::IQ3SExpandedSourceScale, NibbleMap::Centered, false, Strips>();
             case Encoding::Q6KNativeDualScale:
@@ -479,7 +484,7 @@ namespace llaminar2::cpu::native_quantised
         }
 
         /** @brief Decode one Q5_K group using a 16-bit high-plane slice for four columns. */
-        [[gnu::always_inline]] static int8x16_t q5Group(const std::uint8_t *unit, int column, int group) noexcept
+        [[gnu::always_inline]] static int8x16_t q5KGroup(const std::uint8_t *unit, int column, int group) noexcept
         {
             const auto raw = vld1q_u8(unit + (group % 4) * 256 + column * 4);
             const auto low = group < 4 ? vandq_u8(raw, vdupq_n_u8(15)) : vshrq_n_u8(raw, 4);
@@ -558,6 +563,33 @@ namespace llaminar2::cpu::native_quantised
             }
         }
 
+        /** @brief Decode both K halves of four columns from one pair of Q5 bitplanes.
+         * @tparam Centered Subtract sixteen for Q5_0; Q5_1 uses unsigned source values.
+         * @param unit Prepared 64-column unit.
+         * @param column First of four output columns.
+         * @param group Nibble group in [0,3] covering K groups @p group and @p group + 4.
+         * @return The two signed-byte vectors consumed by the exact integer dot.
+         */
+        template <bool Centered> [[gnu::always_inline]] static inline std::array<int8x16_t, 2>
+        ordinaryQ5Groups(const std::uint8_t *unit, int column, int group) noexcept
+        {
+            const auto raw = vld1q_u8(unit + Q5NativePayload::nibbleOffset(group, column));
+            const auto fifth = vld1q_u8(unit + Q5NativePayload::fifthOffset(0, column));
+            const uint8x16_t lane{0, 0, 0, 0, 4, 4, 4, 4, 8, 8, 8, 8, 12, 12, 12, 12};
+            const uint8x16_t positions{1, 2, 4, 8, 1, 2, 4, 8, 1, 2, 4, 8, 1, 2, 4, 8};
+            const auto bits = vqtbl1q_u8(fifth, vaddq_u8(lane, vdupq_n_u8(static_cast<std::uint8_t>(group))));
+            const auto low_set = vtstq_u8(bits, positions);
+            const auto high_set = vtstq_u8(bits, vshlq_n_u8(positions, 4));
+            const auto low = vandq_u8(raw, vdupq_n_u8(15));
+            const auto high = vshrq_n_u8(raw, 4);
+            if constexpr (Centered)
+                return {vreinterpretq_s8_u8(vsubq_u8(low, vbicq_u8(vdupq_n_u8(16), low_set))),
+                        vreinterpretq_s8_u8(vsubq_u8(high, vbicq_u8(vdupq_n_u8(16), high_set)))};
+            else
+                return {vreinterpretq_s8_u8(vbslq_u8(vdupq_n_u8(16), low_set, low)),
+                        vreinterpretq_s8_u8(vbslq_u8(vdupq_n_u8(16), high_set, high))};
+        }
+
         /**
          * @brief Compute one block's exact INT32 dots for every row with row-pair SMMLA.
          * @tparam Ops Admitted I8MM operation set.
@@ -599,6 +631,17 @@ namespace llaminar2::cpu::native_quantised
                 for (int group = 0; group < 8; group += 2)
                     consumePair<Ops>(iq3sGroup<Ops>(unit, column, group), iq3sGroup<Ops>(unit, column, group + 1),
                         block, group, low01, low23, low);
+            }
+            else if constexpr (Physical == Encoding::Q5NativeSingleScale)
+            {
+#pragma GCC unroll 1
+                for (int group = 0; group < 4; group += 2)
+                {
+                    const auto first = ordinaryQ5Groups<Map == NibbleMap::Centered>(unit, column, group);
+                    const auto second = ordinaryQ5Groups<Map == NibbleMap::Centered>(unit, column, group + 1);
+                    consumePair<Ops>(first[0], second[0], block, group, low01, low23, low);
+                    consumePair<Ops>(first[1], second[1], block, group + 4, low01, low23, low);
+                }
             }
             else if constexpr (Physical == Encoding::NibbleLUT || Physical == Encoding::NibbleLUTSourceScale ||
                                Physical == Encoding::Q4KSuperblockCoded)
@@ -843,7 +886,7 @@ namespace llaminar2::cpu::native_quantised
                                 // SDOT chain bounds liveness while preserving grouped reuse.
 #pragma GCC unroll 1
                                 for (int group = 0; group < 8; ++group)
-                                    consume<Ops>(q5Group(unit, column, group), block, group, low);
+                                    consume<Ops>(q5KGroup(unit, column, group), block, group, low);
                             }
                             else if constexpr (multi_scale::usesRowPairs<Ops>)
                                 pairBlock<Ops, Physical, Map, Coded>(unit, column, block, low, high);
@@ -884,6 +927,19 @@ namespace llaminar2::cpu::native_quantised
 #pragma GCC unroll 1
                                 for (int group = 0; group < 8; ++group)
                                     consume<Ops>(iq3sGroup<Ops>(unit, column, group), block, group, low);
+                            }
+                            else if constexpr (Physical == Encoding::Q5NativeSingleScale)
+                            {
+                                // Bound the live decode and activation vectors independently of Rows.
+                                // SDOT decode panels use lane dots; this strip shares each decoded pair
+                                // across rows before advancing to the next four-byte group.
+#pragma GCC unroll 1
+                                for (int group = 0; group < Q5NativePayload::groups; ++group)
+                                {
+                                    const auto weights = ordinaryQ5Groups<Map == NibbleMap::Centered>(unit, column, group);
+                                    consume<Ops>(weights[0], block, group, low);
+                                    consume<Ops>(weights[1], block, group + 4, low);
+                                }
                             }
 #if defined(__clang__)
                             else if constexpr (Rows >= 3 && Ops::instruction == Dot::ASIMD)
@@ -971,6 +1027,13 @@ namespace llaminar2::cpu::native_quantised
                                 const auto factors = codedScales<Ops, Physical>(unit, column, block);
                                 scale0 = factors.primary;
                                 scale1 = factors.secondary;
+                            }
+                            else if constexpr (Physical == Encoding::Q5NativeSingleScale)
+                            {
+                                const auto *scales = reinterpret_cast<const std::uint16_t *>(unit + Q5NativePayload::bytes);
+                                scale0 = Ops::half(scales + column);
+                                if constexpr (WithMinimum)
+                                    scale1 = Ops::half(scales + 64 + column);
                             }
                             else
                             {
@@ -1119,6 +1182,23 @@ namespace llaminar2::cpu::native_quantised
                             }
                         }
                     }
+                    else if constexpr (Physical == Encoding::Q5NativeSingleScale)
+                    {
+                        const auto blocks = activationBlocks<Ops>(block);
+                        forEachGroup<4>([&]<int Group>() __attribute__((always_inline)) {
+#pragma GCC unroll 4
+                            for (int strip = 0; strip < S; ++strip)
+                            {
+                                const auto weights = ordinaryQ5Groups<Map == NibbleMap::Centered>(unit, column0 + 4 * strip, Group);
+#pragma GCC unroll 4
+                                for (std::size_t row = 0; row < Rows; ++row)
+                                {
+                                    low[row][strip] = Ops::template dotLane<Group>(low[row][strip], std::bit_cast<I>(weights[0]), blocks[row]);
+                                    low[row][strip] = Ops::template dotLane<Group + 4>(low[row][strip], std::bit_cast<I>(weights[1]), blocks[row]);
+                                }
+                            }
+                        });
+                    }
                     else if constexpr (nibble)
                     {
                         // Each row's block is loaded once; every strip reads its groups by lane.
@@ -1174,6 +1254,13 @@ namespace llaminar2::cpu::native_quantised
                             const auto factors = codedScales<Ops, Physical>(unit, column, block);
                             scale0 = factors.primary;
                             scale1 = factors.secondary;
+                        }
+                        else if constexpr (Physical == Encoding::Q5NativeSingleScale)
+                        {
+                            const auto *scales = reinterpret_cast<const std::uint16_t *>(unit + Q5NativePayload::bytes);
+                            scale0 = Ops::half(scales + column);
+                            if constexpr (WithMinimum)
+                                scale1 = Ops::half(scales + 64 + column);
                         }
                         else
                         {
