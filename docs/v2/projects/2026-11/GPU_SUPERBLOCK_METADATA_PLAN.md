@@ -39,8 +39,10 @@ has no KV headroom. llama.cpp uploads GGUF blocks verbatim (1.00x).
 A superblock physical encoding replaces the per-32 FP16 planes with:
 
 - **Code plane** (the existing `scales` pointer slot): per 32-value block,
-  `W` bytes holding exactly the source's per-block scale code bits
-  (W = 1 for IQ*, 2 for Q2_K/Q3_K/Q4_K/Q5_K/Q6_K).
+  exactly the source's scale-code bits, bit-packed (12 for Q3_K/Q4_K/Q5_K,
+  16 for Q6_K/Q2_K, 8 for IQ2_S, 6 for IQ1_M/IQ4_XS, 4 for IQ3_S), plus four
+  bytes of read padding. IQ3_XXS/IQ2_XS/IQ2_XXS/IQ1_S keep their code inside
+  the payload (Tier 2) and have no code plane.
 - **Superblock plane** (the existing `mins` pointer slot): per source
   superblock, FP16 `d` (and `dmin` for formats with minima).
 - No emins plane.
@@ -70,22 +72,23 @@ A typed `NativeQuantisedBlockAddress {linear, superblock}` built by one helper
 per layout replaces every raw `linear`; the phase travels with the matrix
 (descriptor field for grouped kernels, launch argument for dense kernels).
 
-### Tier 1 result (payload unchanged)
+### Density
 
-| Format | Tier 1 B/32 | File B/32 | Ratio |
-|---|---|---|---|
-| IQ2_S, Q2_K, Q6_K | = file | | 1.000 |
-| IQ3_S | 14.25 | 13.75 | 1.036 |
-| IQ4_XS | 17.25 | 17.00 | 1.015 |
-| Q4_K / Q5_K (later, need own codebooks) | 18.5 / 22.5 | 18 / 22 | 1.028 / 1.023 |
-| Q3_K | 14.25 | 13.75 | 1.036 |
-| IQ3_XXS | 13.25 | 12.25 | 1.082 |
-| IQ2_XS | 10.25 | 9.25 | 1.108 |
-| IQ2_XXS | 9.25 | 8.25 | 1.121 |
-| IQ1_S / IQ1_M | 7.25 | 6.25 / 7.00 | 1.160 / 1.036 |
+Payload + code + superblock bits per 256 values equal the GGUF bits for all
+thirteen codable formats (Q4_K, Q5_K, Q6_K, Q3_K, Q2_K, IQ4_XS, IQ3_S,
+IQ3_XXS, IQ2_S, IQ2_XS, IQ2_XXS, IQ1_S, IQ1_M); the codec unit test asserts
+this table. The only remaining excess is 256-byte region alignment and the
+four padding bytes per code plane (about 0.5 MB for a DSV4 UD model).
 
-UD-IQ3_XXS: ~105.9 GB weights (98.6 GiB) vs 123.8 GB today, leaving ~17 GiB
-for KV/state after workspace (DSV4 needs 3,514 B/token: ~5M tokens).
+Producers write codes with disjoint-bit `atomicAnd`/`atomicOr`, so concurrent
+blocks need no zeroing and no ordering. A matrix bound at a sub-byte offset of
+a coalesced run carries the bit shift in metadata-layout bits 3-5 (bit 7
+coded, bits 0-2 superblock phase). Q4_K/Q5_K share physical codebooks 5/7 with
+Q4_1/Q5_1 without conflict: the representation is per matrix and only
+superblock sources are ever coded.
+
+Predicted CUDA weight bytes equal the file: UD-IQ1_S 82.5 GB, UD-IQ1_M
+86.9 GB, UD-IQ2_XXS 90.7 GB, UD-IQ3_XXS 103.0 GB.
 
 ### Tier 2 (payload redundancy)
 
@@ -94,7 +97,7 @@ in the payload `qh`) and the parity bit of each expanded sign mask
 (IQ2_XXS/IQ2_XS/IQ3_XXS store 8-bit masks for 7-bit sign indices). Tier 2
 reads IQ1 codes from the payload and stores the scale nibble in the freed
 parity bits, reaching 1.000 for every format. It changes decoder bodies and is
-sequenced after Tier 1 is certified.
+landed for CUDA together with Tier 1.
 
 ### CPU tier and migration
 
@@ -147,13 +150,23 @@ expert slot geometry, PMA BOM.
 4. Real DSV4 UD-IQ3_XXS/IQ1_M/IQ2_XXS dry-run BOMs on GB10, then load and
    generate.
 
+## Status
+
+- CUDA: all thirteen formats coded at file density (readers, repack, async
+  prefill staging, row-major diagnostic copies); migration slots, expert
+  transfer and rebalance reject coded descriptors.
+- ROCm: readers and repack reject coded layouts, so ROCm keeps per-block
+  planes. Conversion needs a HIP compile host.
+- CPU compact tier: still per-block FP16 words (1.33-1.66x of file). The
+  NEON/AVX2/AVX-512 loaders need the codec before coded CPU-to-GPU promotion
+  can exist; x86 verification needs an x86 host.
+
 ## Sequencing
 
 1. Codec header + exhaustive device-free proofs (all formats).
 2. Address type + helpers; descriptor phase field.
-3. Q4_K/Q5_K share physical codebooks 5/7 with Q4_1/Q5_1 (identical legacy
-   planes); they need distinct physical codebooks before adopting the
-   superblock representation and follow the IQ formats.
+3. Q4_K/Q5_K/IQ4_XS after the IQ formats (done: the per-matrix
+   representation lets them share codebooks 5/7 with Q4_1/Q5_1).
 4. Format by format in descending DSV4 waste order: IQ2_S, IQ3_XXS, IQ2_XS,
    IQ1_S/IQ1_M, IQ3_S, Q6_K, IQ2_XXS, then K-quants and IQ4_XS. Each format
    switches every producer and consumer on both backends at once; the legacy
