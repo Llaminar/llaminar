@@ -22,6 +22,7 @@
 
 #include "kernels/common/NativeQuantisedScaleLoad.h"
 #include "kernels/cuda/gemm/CUDADeviceWorkspace.h"
+#include "kernels/common/DeviceRowRange.h"
 #include "kernels/cuda/repack/CUDAVnniRepackKernels.h"
 #include "loaders/gpu_pipeline/RepackFormat.h"
 #include "tensors/NativeQuantisedFormatInfo.h"
@@ -42,18 +43,18 @@
 extern "C"
 {
     bool cudaNativeQuantisedInitIQGridTables_tuned();
-    bool cudaNativeQuantisedGemvTuned_fp32(
+    bool cudaNativeQuantisedGemvTuned_fp32_withPolicy(
         const int8_t *, const uint8_t *, ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes,
-        float *, const float *, int, int, float, float, const float *, const float *, uint8_t, int, void *,
+        float *, const float *, int, int, float, float, const float *, const float *, uint8_t, uint8_t, int, void *,
         CUDAGemvContext *, CUDARowMajorWeights **);
-    bool cudaNativeQuantisedGemvTuned_small_m_fp32(
+    bool cudaNativeQuantisedGemvTuned_small_m_fp32_withPolicy(
         const int8_t *, const uint8_t *, ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes,
-        float *, const float *, int, int, int, float, float, const float *, const float *, uint8_t, int, void *,
-        CUDAGemvContext *, CUDARowMajorWeights **);
-    bool cudaNativeQuantisedPrefill_fp32(
+        float *, const float *, int, int, int, float, float, const float *, const float *, uint8_t, uint8_t, int,
+        void *, CUDAGemvContext *, CUDARowMajorWeights **, const llaminar2::DeviceRowRange *);
+    bool cudaNativeQuantisedPrefill_fp32_withPolicy(
         const std::int8_t *, const std::uint8_t *, ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes,
         float *, const float *, const std::int32_t *, int, int, int, float, float, const float *, const float *,
-        std::uint8_t, int, void *, CUDAPrefillContext *);
+        std::uint8_t, std::uint8_t, int, void *, CUDAPrefillContext *);
 }
 
 namespace llaminar2::test
@@ -100,6 +101,9 @@ namespace llaminar2::test
         const std::vector<Case> &cases()
         {
             static const std::vector<Case> all{
+                {"Q4_K", [](const std::vector<size_t> &s) { return TestTensorFactory::createQ4_KRandom(s); }},
+                {"Q5_K", [](const std::vector<size_t> &s) { return TestTensorFactory::createQ5_KRandom(s); }},
+                {"IQ4_XS", [](const std::vector<size_t> &s) { return TestTensorFactory::createIQ4_XSRandom(s); }},
                 {"Q6_K", [](const std::vector<size_t> &s) { return TestTensorFactory::createQ6_KRandom(s); }},
                 {"Q3_K", [](const std::vector<size_t> &s) { return TestTensorFactory::createQ3_KRandom(s); }},
                 {"Q2_K", [](const std::vector<size_t> &s) { return TestTensorFactory::createQ2_KRandom(s); }},
@@ -177,7 +181,9 @@ namespace llaminar2::test
                                              legacy_emins.as<uint32_t>(), N, K, N, 0, 0, payload_bytes, selection,
                                              std::uint8_t{0}, stream_));
             const bool in_payload = sb::superblockCodeInPayload(codebook);
-            ASSERT_EQ(planes.code, in_payload ? 0u : block_count * sb::superblockCodeBytes(codebook));
+            ASSERT_EQ(planes.code, in_payload ? 0u
+                                              : (block_count * sb::superblockCodeBits(codebook) + 7u) / 8u +
+                                                    sb::kSuperblockCodePlanePadBytes);
             ASSERT_TRUE(launchVnniRepackCUDA(*format, raw.data, coded_payload.as<uint8_t>(),
                                              in_payload ? nullptr : codes.as<uint16_t>(),
                                              superblocks.as<uint16_t>(), nullptr, N, K, N, 0, 0, payload_bytes,
@@ -217,7 +223,7 @@ namespace llaminar2::test
             const auto emins = legacy_emins.download<uint32_t>();
             const auto code_bytes = codes.download<uint8_t>();
             const auto sb_bytes = superblocks.download<uint8_t>();
-            const bool consumes_secondary = source->is_asymmetric || codebook == 8 || codebook == 9 ||
+            const bool consumes_secondary = source->is_asymmetric || codebook == 8 || codebook == 9 || codebook == 24 ||
                                             codebook == 11 || codebook == 13 || codebook == 14 || codebook == 17;
             for (int block = 0; block < blocks; ++block)
                 for (int row = 0; row < N; ++row)
@@ -233,8 +239,7 @@ namespace llaminar2::test
                                                 : sb::codeFromPayload<16>(block_payload);
                     }
                     else
-                        std::memcpy(&code, code_bytes.data() + address.linear * sb::superblockCodeBytes(codebook),
-                                    sb::superblockCodeBytes(codebook));
+                        code = sb::loadCode(codebook, code_bytes.data(), address.linear);
                     std::memcpy(&word, sb_bytes.data() + address.superblock * sb::superblockFieldBytes(codebook),
                                 sb::superblockFieldBytes(codebook));
                     const auto words = sb::decodeSuperblockMetadata(codebook, code, word);
@@ -278,8 +283,10 @@ namespace llaminar2::test
             ASSERT_NE(prefill, nullptr);
             std::size_t prefill_bytes = 0;
             int prefill_partitions = 1;
-            ASSERT_TRUE(cudaNativeQuantisedPrefill_getWorkspacePlan(codebook, max_rows, N, K, 0, &prefill_bytes,
-                                                                    &prefill_partitions));
+            // IQ4_XS's physical 24 executes IQ4_NL's certified arithmetic policy.
+            const std::uint8_t policy = codebook == 24 ? std::uint8_t{4} : codebook;
+            ASSERT_TRUE(cudaNativeQuantisedPrefill_getWorkspacePlanWithPolicy(codebook, policy, max_rows, N, K, 0,
+                                                                              &prefill_bytes, &prefill_partitions));
             DeviceBytes prefill_partials(prefill_bytes);
             cudaPrefillContext_bindWorkspace(prefill, prefill_partials.as<float>(), prefill_bytes);
 
@@ -288,18 +295,18 @@ namespace llaminar2::test
                 DeviceBytes out(static_cast<std::size_t>(rows) * N * sizeof(float));
                 bool ok = false;
                 if (rows == 1)
-                    ok = cudaNativeQuantisedGemvTuned_fp32(a.as<int8_t>(), weights, meta,
+                    ok = cudaNativeQuantisedGemvTuned_fp32_withPolicy(a.as<int8_t>(), weights, meta,
                                                            out.as<float>(), sa.as<float>(), N, K, 1.0f, 0.0f, nullptr,
-                                                           nullptr, codebook, 0, stream_, gemv, nullptr);
+                                                           nullptr, codebook, policy, 0, stream_, gemv, nullptr);
                 else if (rows <= 8)
-                    ok = cudaNativeQuantisedGemvTuned_small_m_fp32(
+                    ok = cudaNativeQuantisedGemvTuned_small_m_fp32_withPolicy(
                         a.as<int8_t>(), weights, meta, out.as<float>(), sa.as<float>(), rows, N,
-                        K, 1.0f, 0.0f, nullptr, nullptr, codebook, 0, stream_, gemv, nullptr);
+                        K, 1.0f, 0.0f, nullptr, nullptr, codebook, policy, 0, stream_, gemv, nullptr, nullptr);
                 else
-                    ok = cudaNativeQuantisedPrefill_fp32(a.as<int8_t>(), weights, meta,
+                    ok = cudaNativeQuantisedPrefill_fp32_withPolicy(a.as<int8_t>(), weights, meta,
                                                          out.as<float>(), sa.as<float>(), sums.as<int32_t>(), rows,
-                                                         N, K, 1.0f, 0.0f, nullptr, nullptr, codebook, 0, stream_,
-                                                         prefill);
+                                                         N, K, 1.0f, 0.0f, nullptr, nullptr, codebook, policy, 0,
+                                                         stream_, prefill);
                 EXPECT_TRUE(ok) << "rows " << rows;
                 checked(cudaStreamSynchronize(stream_));
                 return out.download<uint32_t>();
@@ -318,7 +325,7 @@ namespace llaminar2::test
     }
 
     INSTANTIATE_TEST_SUITE_P(CodableFormats, CUDASuperblockCodedMetadata,
-                             ::testing::Range(0, 10),
+                             ::testing::Range(0, 13),
                              [](const ::testing::TestParamInfo<int> &info) {
                                  return std::string(cases().at(static_cast<std::size_t>(info.param)).name);
                              });

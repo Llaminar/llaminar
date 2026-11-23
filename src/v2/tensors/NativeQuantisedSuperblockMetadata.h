@@ -10,7 +10,7 @@
  *
  * The superblock-coded representation stores instead:
  *  - a code plane: per 32-value block, exactly the source scale-code bits
- *    (superblockCodeBytes() bytes);
+ *    (superblockCodeBits() bits, bit-packed);
  *  - a superblock plane: per source superblock, the FP16 `d` and, where the
  *    format has minima, the FP16 `dmin` (superblockFieldBytes() bytes).
  *
@@ -77,30 +77,45 @@ namespace llaminar2::native_quantised_superblock
     };
 
     /**
-     * @brief Per-32 code-plane width of a superblock-coded execution codebook.
-     * @param codebook Physical execution codebook.
-     * @return 1 or 2 bytes for superblock-coded codebooks, 0 otherwise.
+     * @brief Exact source scale-code bits per 32-value block of a codebook.
+     *
+     * These are the GGUF superblock's per-block code bits; the code plane
+     * stores them bit-packed, so coded metadata matches the file density:
+     * Q4_K/Q5_K/Q3_K 12 (two 6-bit fields), Q6_K/Q2_K 16 (two bytes),
+     * IQ2_S/IQ2_XS 8, IQ4_XS/IQ1_M 6, IQ3_S/IQ3_XXS/IQ2_XXS/IQ1_S 4.
+     * @return 0 for codebooks that are not superblock-coded.
      */
-    LLAMINAR_SUPERBLOCK_META_HD constexpr std::uint32_t superblockCodeBytes(std::uint8_t codebook) noexcept
+    LLAMINAR_SUPERBLOCK_META_HD constexpr std::uint32_t superblockCodeBits(std::uint8_t codebook) noexcept
     {
         switch (codebook)
         {
-        case 24: // IQ4_XS source-scale physical codebook (6-bit ls)
-        case 11: // IQ3_S (4-bit nibble)
-        case 12: // IQ3_XXS (4-bit nibble)
-        case 13: // IQ2_S (two 4-bit nibbles)
-        case 14: // IQ2_XS (two 4-bit nibbles)
-        case 15: // IQ2_XXS (4-bit nibble)
-        case 16: // IQ1_S (3-bit scale + delta sign)
-        case 17: // IQ1_M (two 3-bit scales)
-            return 1;
-        case 8:  // Q6_K (two int8 coefficients)
-        case 9:  // Q3_K (two 6-bit scales)
-        case 10: // Q2_K (two scale/min bytes)
-            return 2;
+        case 5:  // Q4_K: 6-bit scale, 6-bit min
+        case 7:  // Q5_K: 6-bit scale, 6-bit min
+        case 9:  // Q3_K: two 6-bit scales
+            return 12;
+        case 8:  // Q6_K: two int8 coefficients
+        case 10: // Q2_K: two scale/min bytes
+            return 16;
+        case 13: // IQ2_S: two 4-bit nibbles
+        case 14: // IQ2_XS: two 4-bit nibbles
+            return 8;
+        case 17: // IQ1_M: two 3-bit scales
+        case 24: // IQ4_XS source-scale physical codebook: 6-bit ls
+            return 6;
+        case 11: // IQ3_S
+        case 12: // IQ3_XXS
+        case 15: // IQ2_XXS
+        case 16: // IQ1_S: 3-bit selector + delta sign
+            return 4;
         default:
             return 0;
         }
+    }
+
+    /** @brief Whole-byte code width, used only where codes are addressed bytewise (tests). */
+    LLAMINAR_SUPERBLOCK_META_HD constexpr std::uint32_t superblockCodeBytes(std::uint8_t codebook) noexcept
+    {
+        return (superblockCodeBits(codebook) + 7u) / 8u;
     }
 
     /**
@@ -126,11 +141,19 @@ namespace llaminar2::native_quantised_superblock
         return codebook == 12 ? 12u : codebook == 14 ? 9u : codebook == 15 ? 8u : codebook == 16 ? 6u : 0u;
     }
 
-    /** @return Bytes per block of the separate code plane (0 when the code lives in the payload). */
-    LLAMINAR_SUPERBLOCK_META_HD constexpr std::uint32_t superblockCodePlaneBytes(std::uint8_t codebook) noexcept
+    /** @return Bits per block of the separate code plane (0 when the code lives in the payload). */
+    LLAMINAR_SUPERBLOCK_META_HD constexpr std::uint32_t superblockCodePlaneBits(std::uint8_t codebook) noexcept
     {
-        return superblockCodeInPayload(codebook) ? 0u : superblockCodeBytes(codebook);
+        return superblockCodeInPayload(codebook) ? 0u : superblockCodeBits(codebook);
     }
+
+    /**
+     * @brief Padding after a bit-packed code plane.
+     *
+     * Readers fetch the up-to-three bytes covering a code (bit offset < 8 plus
+     * at most 16 code bits); padding keeps the last code's fetch in bounds.
+     */
+    inline constexpr std::uint32_t kSuperblockCodePlanePadBytes = 4;
 
     /** @brief Restore the even-parity top bit of a seven-bit IQ sign selector (ksigns_iq2xs). */
     LLAMINAR_SUPERBLOCK_META_HD constexpr std::uint8_t restoreSignParity(std::uint8_t mask) noexcept
@@ -192,7 +215,7 @@ namespace llaminar2::native_quantised_superblock
     /** @return Whether the format stores `dmin` beside `d` in its superblock word. */
     LLAMINAR_SUPERBLOCK_META_HD constexpr bool superblockHasDmin(std::uint8_t codebook) noexcept
     {
-        return codebook == 10;
+        return codebook == 5 || codebook == 7 || codebook == 10;
     }
 
     /** @return Superblock-plane bytes per source superblock (0 when not coded). */
@@ -331,6 +354,13 @@ namespace llaminar2::native_quantised_superblock
                 out.secondary =
                     preparedHalfBits(d * static_cast<float>(static_cast<int>((code >> 6) & 63u) - 32));
             }
+            else if constexpr (Codebook == 5 || Codebook == 7)
+            {
+                // Q4_K/Q5_K: code = 6-bit scale (low) | 6-bit min << 6.
+                const float dmin = halfBitsToFloat(static_cast<std::uint16_t>(superblock >> 16));
+                out.primary = preparedHalfBits(d * static_cast<float>(code & 63u));
+                out.secondary = preparedHalfBits(-dmin * static_cast<float>((code >> 6) & 63u));
+            }
             else if constexpr (Codebook == 10)
             {
                 // code: original scale bytes of the two 16-value halves (low, high).
@@ -352,6 +382,8 @@ namespace llaminar2::native_quantised_superblock
     {
         switch (codebook)
         {
+        case 5: return decodeSuperblockMetadata<5>(code, superblock);
+        case 7: return decodeSuperblockMetadata<7>(code, superblock);
         case 8: return decodeSuperblockMetadata<8>(code, superblock);
         case 9: return decodeSuperblockMetadata<9>(code, superblock);
         case 10: return decodeSuperblockMetadata<10>(code, superblock);
@@ -436,26 +468,99 @@ namespace llaminar2::native_quantised_superblock
     LLAMINAR_SUPERBLOCK_META_HD constexpr PlaneBytes planeBytes(std::uint8_t codebook, std::size_t rows,
                                                              std::uint32_t blocks_per_row, std::uint32_t phase) noexcept
     {
-        return {rows * blocks_per_row * superblockCodePlaneBytes(codebook),
+        const std::size_t code_bits = rows * blocks_per_row * superblockCodePlaneBits(codebook);
+        return {code_bits ? (code_bits + 7u) / 8u + kSuperblockCodePlanePadBytes : 0u,
                 rows * superblocksPerRow(blocks_per_row, phase) * superblockFieldBytes(codebook)};
     }
 
     /**
-     * @brief Load one block's code from the code plane.
+     * @brief Read @p bits (<= 16) starting at bit @p bit of a byte plane.
+     *
+     * Fetches only the bytes that hold the field (at most three), so the
+     * plane needs kSuperblockCodePlanePadBytes of padding and no alignment.
+     */
+    LLAMINAR_SUPERBLOCK_META_HD std::uint32_t loadPackedBits(const std::uint8_t *plane, std::size_t bit,
+                                                             std::uint32_t bits) noexcept
+    {
+        const std::uint8_t *p = plane + (bit >> 3);
+        const std::uint32_t shift = static_cast<std::uint32_t>(bit & 7u);
+        std::uint32_t word = p[0];
+        if (shift + bits > 8u) word |= static_cast<std::uint32_t>(p[1]) << 8;
+        if (shift + bits > 16u) word |= static_cast<std::uint32_t>(p[2]) << 16;
+        return (word >> shift) & ((1u << bits) - 1u);
+    }
+
+    /**
+     * @brief Load one block's code.
      * @tparam Codebook Physical execution codebook.
+     * @param code_plane Bit-packed code plane (or the payload for code-in-payload formats).
+     * @param linear Block index in the matrix (payload index).
+     * @param bit_shift Bit offset of the matrix's first code inside @p code_plane (0..7).
      */
     template <std::uint8_t Codebook>
-    LLAMINAR_SUPERBLOCK_META_HD std::uint32_t loadCode(const void *code_plane, std::size_t linear) noexcept
+    LLAMINAR_SUPERBLOCK_META_HD std::uint32_t loadCode(const void *code_plane, std::size_t linear,
+                                                       std::uint32_t bit_shift = 0) noexcept
     {
         // Code-in-payload matrices bind the payload base as their code plane.
         if constexpr (superblockCodeInPayload(Codebook))
+        {
+            (void)bit_shift;
             return codeFromPayload<Codebook>(static_cast<const std::uint8_t *>(code_plane) +
                                              linear * superblockCodePayloadBytes(Codebook));
-        else if constexpr (superblockCodeBytes(Codebook) == 1)
-            return static_cast<const std::uint8_t *>(code_plane)[linear];
+        }
         else
-            return static_cast<const std::uint16_t *>(code_plane)[linear];
+        {
+            constexpr std::uint32_t bits = superblockCodeBits(Codebook);
+            return loadPackedBits(static_cast<const std::uint8_t *>(code_plane),
+                                  bit_shift + linear * bits, bits);
+        }
     }
+
+    /** @brief Runtime-codebook form of loadCode() (host tooling, tests). */
+    LLAMINAR_SUPERBLOCK_META_HD std::uint32_t loadCode(std::uint8_t codebook, const void *code_plane,
+                                                       std::size_t linear, std::uint32_t bit_shift = 0) noexcept
+    {
+        switch (codebook)
+        {
+        case 12: return loadCode<12>(code_plane, linear);
+        case 14: return loadCode<14>(code_plane, linear);
+        case 15: return loadCode<15>(code_plane, linear);
+        case 16: return loadCode<16>(code_plane, linear);
+        default:
+        {
+            const std::uint32_t bits = superblockCodeBits(codebook);
+            return bits ? loadPackedBits(static_cast<const std::uint8_t *>(code_plane), bit_shift + linear * bits, bits)
+                        : 0u;
+        }
+        }
+    }
+
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
+    /**
+     * @brief Store @p bits of @p value at bit @p bit of a 4-byte-aligned plane.
+     *
+     * Concurrent producers own disjoint bit ranges: each clears and sets only
+     * its own bits with atomicAnd/atomicOr on the (at most two) covering words,
+     * so any interleaving publishes every field exactly and no prior zeroing is
+     * required.
+     */
+    __device__ __forceinline__ void storePackedBits(void *plane, std::size_t bit, std::uint32_t bits,
+                                                    std::uint32_t value)
+    {
+        auto *words = static_cast<unsigned int *>(plane);
+        const std::size_t word = bit >> 5;
+        const std::uint32_t shift = static_cast<std::uint32_t>(bit & 31u);
+        const std::uint64_t mask = ((std::uint64_t{1} << bits) - 1u) << shift;
+        const std::uint64_t field = (static_cast<std::uint64_t>(value) << shift) & mask;
+        atomicAnd(&words[word], ~static_cast<unsigned int>(mask));
+        atomicOr(&words[word], static_cast<unsigned int>(field));
+        if (mask >> 32)
+        {
+            atomicAnd(&words[word + 1], ~static_cast<unsigned int>(mask >> 32));
+            atomicOr(&words[word + 1], static_cast<unsigned int>(field >> 32));
+        }
+    }
+#endif
 
     /** @brief Load one superblock word (d, or d|dmin<<16). */
     template <std::uint8_t Codebook>
@@ -475,9 +580,10 @@ namespace llaminar2::native_quantised_superblock
     template <std::uint8_t Codebook>
     LLAMINAR_SUPERBLOCK_META_HD StagedBlockMetadata loadBlockMetadata(const void *code_plane,
                                                                        const void *superblock_plane,
-                                                                       BlockAddress address) noexcept
+                                                                       BlockAddress address,
+                                                                       std::uint32_t code_bit_shift = 0) noexcept
     {
-        return decodeSuperblockMetadata<Codebook>(loadCode<Codebook>(code_plane, address.linear),
+        return decodeSuperblockMetadata<Codebook>(loadCode<Codebook>(code_plane, address.linear, code_bit_shift),
                                                   loadSuperblock<Codebook>(superblock_plane, address.superblock));
     }
 } // namespace llaminar2::native_quantised_superblock
