@@ -530,3 +530,30 @@ source, and socket cells remained byte-exact. IQ1_M improved in several
 grouped cells and added 4.0–5.8% to the eight-expert M=1 Gate/Up latency.
 The 64-expert M=1 Gate/Up cells also slowed for IQ2_S and IQ2_XS. The
 production grid arithmetic stays with the original tables.
+
+### Direct packed Down publication
+
+The standalone CPU Down candidate wrote each prepared native result into the
+existing packed route record. Only the payload destination changed. The route
+identity occupied the same trailer word, and the consumer kept the original
+top-k fold. Both AVX2 and AVX-512 passed the native publication contract. All
+216 matched format, socket, route-count, and order cells were byte-identical.
+Their complete isolated transaction latency fell 5.3–25.5%, with a median
+reduction of 17.6%.
+
+The Release A/B used the local QFN UD-Q4_K_XL model with the Q8 sidecar,
+2×RTX 3090 and 2×Xeon 6238R, and the existing F320/S320 placement. Each arm
+ran one warmup and three measured 256-token requests in each mode. The generated
+tokens and per-iteration MTP work matched in both orders.
+
+| Order | Mode | Control → direct decode, tok/s | Decode | Complete |
+| --- | --- | ---: | ---: | ---: |
+| Candidate first | Ordinary | 31.036 → 32.806 | +5.70% | +4.76% |
+| Control first | Ordinary | 31.094 → 32.526 | +4.61% | +3.78% |
+| Candidate first | Fixed depth seven | 43.507 → 44.831 | +3.04% | +2.40% |
+| Control first | Fixed depth seven | 43.476 → 44.442 | +2.22% | +1.75% |
+
+The counter-enabled 32-token run observed 2,976 direct Down writes. Raw
+samples and the matched comparison are in
+`benchmark_results/qfn-cuda-2x2-95943372/cpu-direct-canonical-down/`.
+These measurements cover the isolated standalone candidate.
