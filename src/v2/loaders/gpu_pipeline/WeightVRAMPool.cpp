@@ -151,12 +151,8 @@ namespace llaminar2
         // Region extents come from the single metadata-plane authority with
         // the caller's explicit primary-plane capacity.
         const size_t blocks = static_cast<size_t>(N) * static_cast<size_t>(K / 32);
-        // A coalesced run is one slot: its whole code plane must stay within
-        // the device readers' 32-bit bit addressing.
         if (coded && (!nativeQuantisedSuperblockCodable(coded->physical_codebook) || coded->superblock_phase >= 8 ||
-                      N <= 0 || K <= 0 || K % 32 != 0 ||
-                      !native_quantised_superblock::superblockCodePlaneAddressable(
-                          coded->physical_codebook, static_cast<std::uint64_t>(N), static_cast<std::uint64_t>(K / 32))))
+                      N <= 0 || K <= 0 || K % 32 != 0))
             throw std::invalid_argument("WeightVRAMPool: invalid superblock-coded metadata declaration for '" +
                                         name + "'");
         // Superblock-coded matrices store codes and superblock words; every

@@ -4589,11 +4589,11 @@ extern "C"
             // Codes transpose like per-block words; the [S, N] superblock
             // plane transposes to [N, S], exactly rowMajorAddress()'s order.
             const int superblocks = static_cast<int>(
-                sb::superblocksPerRow(static_cast<uint32_t>(K_blocks), meta_col.superblockPhase()));
+                sb::superblocksPerRow(static_cast<uint32_t>(K_blocks), meta_col.superblock_phase));
             // Code-in-payload formats read their codes from the transposed payload.
             rm->d_primary = sb::superblockCodeInPayload(codebook_id) ? static_cast<void *>(rm->d_payload)
                 : static_cast<void *>(transposeCodes(reinterpret_cast<const uint8_t *>(meta_col.primary), N,
-                      K_blocks, sb::superblockCodePlaneBits(codebook_id), meta_col.codeBitShift(), device_id, s));
+                      K_blocks, sb::superblockCodePlaneBits(codebook_id), meta_col.code_bit_shift, device_id, s));
             rm->d_secondary = sb::superblockFieldBytes(codebook_id) == 4
                 ? static_cast<void *>(transposeBuffer<uint32_t, 4>(
                       static_cast<const uint32_t *>(meta_col.secondary), N, superblocks, device_id, s))
@@ -4634,7 +4634,7 @@ extern "C"
             }
         }
         rm->meta = {static_cast<const uint16_t *>(rm->d_primary), rm->d_secondary, rm->d_emins,
-                    static_cast<std::uint8_t>(meta_col.layout & ~std::uint8_t{0x38})};
+                    meta_col.superblock_phase, meta_col.representation, 0u};
 
         cudaStreamSynchronize(s);
         return rm;

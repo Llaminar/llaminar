@@ -188,28 +188,14 @@ namespace llaminar2::native_quantised_scale
         const std::uint16_t *primary = nullptr;
         const void *secondary = nullptr;
         const std::uint32_t *emins = nullptr;
-        /**
-         * Packed metadata layout byte (nativeQuantisedMetadataLayout): the
-         * representation, superblock phase and code bit shift share one value
-         * so a kernel holding several matrices' planes keeps one register per
-         * matrix for them, as it did for the per-block layout alone.
-         */
-        std::uint8_t layout = 0;
+        std::uint32_t superblock_phase = 0;
+        NativeQuantisedMetadataRepresentation representation = NativeQuantisedMetadataRepresentation::PerBlockPlanes;
+        std::uint32_t code_bit_shift = 0; ///< First code's bit offset inside `primary` (coded only).
 
         /** @return Whether the planes hold superblock-coded metadata. */
         LLAMINAR_NATIVE_QUANTISED_SCALE_HD bool coded() const
         {
-            return nativeQuantisedLayoutRepresentation(layout) == NativeQuantisedMetadataRepresentation::SuperblockCoded;
-        }
-        /** @return Superblock phase of the first prepared K block (0 for per-block planes). */
-        LLAMINAR_NATIVE_QUANTISED_SCALE_HD std::uint32_t superblockPhase() const
-        {
-            return nativeQuantisedLayoutPhase(layout);
-        }
-        /** @return Bit offset of the first code inside `primary` (coded only). */
-        LLAMINAR_NATIVE_QUANTISED_SCALE_HD std::uint32_t codeBitShift() const
-        {
-            return nativeQuantisedLayoutCodeBitShift(layout);
+            return representation == NativeQuantisedMetadataRepresentation::SuperblockCoded;
         }
     };
 
@@ -218,14 +204,16 @@ namespace llaminar2::native_quantised_scale
         const DeviceNativeQuantisedMatrixDesc &desc)
     {
         return {static_cast<const std::uint16_t *>(desc.scales), desc.mins,
-                static_cast<const std::uint32_t *>(desc.emins), desc.metadata_layout};
+                static_cast<const std::uint32_t *>(desc.emins), nativeQuantisedLayoutPhase(desc.metadata_layout),
+                nativeQuantisedLayoutRepresentation(desc.metadata_layout),
+                nativeQuantisedLayoutCodeBitShift(desc.metadata_layout)};
     }
 
     /** @return Address of block-major block (@p block, @p column) in an @p n-column matrix. */
     LLAMINAR_NATIVE_QUANTISED_SCALE_HD BlockAddress blockMajorAddress(
         const NativeQuantisedMetadataPlanes &planes, std::uint32_t block, std::uint32_t column, std::uint32_t n)
     {
-        return native_quantised_superblock::blockMajorAddress(block, column, n, planes.superblockPhase());
+        return native_quantised_superblock::blockMajorAddress(block, column, n, planes.superblock_phase);
     }
 
     /** @return Address of row-major block (@p block, @p column) with @p blocks_per_row blocks per row. */
@@ -233,7 +221,7 @@ namespace llaminar2::native_quantised_scale
         const NativeQuantisedMetadataPlanes &planes, std::uint32_t block, std::uint32_t column,
         std::uint32_t blocks_per_row)
     {
-        return native_quantised_superblock::rowMajorAddress(block, column, blocks_per_row, planes.superblockPhase());
+        return native_quantised_superblock::rowMajorAddress(block, column, blocks_per_row, planes.superblock_phase);
     }
 
     /**
@@ -256,7 +244,7 @@ namespace llaminar2::native_quantised_scale
         {
             if (planes.coded())
                 return native_quantised_superblock::loadBlockMetadata<Codebook>(planes.primary, planes.secondary,
-                                                                                address, planes.codeBitShift());
+                                                                                address, planes.code_bit_shift);
         }
         StagedBlockMetadata out;
         out.primary = loadStagedPrimary<Codebook>(planes.primary, address.linear);

@@ -529,7 +529,9 @@ namespace llaminar2
                     throw std::logic_error(
                         "[CUDAQuantisedGemmKernel] prepared weights carry an invalid metadata layout");
                 return {d_weights_native_scales, d_weights_native_mins, d_weights_native_emins,
-                        native_metadata_layout};
+                        nativeQuantisedLayoutPhase(native_metadata_layout),
+                        nativeQuantisedLayoutRepresentation(native_metadata_layout),
+                        nativeQuantisedLayoutCodeBitShift(native_metadata_layout)};
             }
             NativeQuantisedSourceIdentity native_source_identity;
             // Borrowed immutable IQ view is bound cold once and never replaced.
