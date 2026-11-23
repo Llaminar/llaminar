@@ -10643,6 +10643,17 @@ add_v2_test(V2_Integration_CPUCompensationFreeUnits
     MPI_PROCS 1 NO_MODELS)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUCompensationFreeUnits)
 
+# Exhaustive file-density accounting; all CUDA plane calculations are device-free.
+add_executable(v2_unit_native_quantised_file_density_all_formats
+    unit/kernels/cpu/Test__NativeQuantisedFileDensityAllFormats.cpp)
+target_include_directories(v2_unit_native_quantised_file_density_all_formats PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(v2_unit_native_quantised_file_density_all_formats GTest::gtest GTest::gtest_main)
+target_compile_features(v2_unit_native_quantised_file_density_all_formats PRIVATE cxx_std_20)
+add_v2_test(V2_Unit_NativeQuantisedFileDensityAllFormats
+    COMMAND $<TARGET_FILE:v2_unit_native_quantised_file_density_all_formats>
+    LABELS "V2;Unit;CPU;DeviceFree;NativeQuantised;Memory;Regression;ProductionTestPreflight"
+    MPI_PROCS 1 NO_MODELS NO_MPI)
+
 # Original Q6 source factors remain exact without changing Q8 GEMM inputs.
 add_executable(v2_test_q6_source_scale unit/kernels/Test__Q6SourceScale.cpp)
 target_link_libraries(v2_test_q6_source_scale
