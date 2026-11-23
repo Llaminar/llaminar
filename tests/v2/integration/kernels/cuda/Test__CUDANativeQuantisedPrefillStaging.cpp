@@ -368,7 +368,9 @@ void run(int m,int n,int k,int kb,Epilogue epilogue,int tile_id=CB==7?2:5) {
         llaminar2::cuda::prefill::CanonicalM1PartitionGeometry partitions{
             kb, (k / 32 + kb - 1) / kb};
         int ordered = 1;
-        void *arguments[]{&a.data, &p.data, &s.data, &b.data, &emins,
+        // The kernel takes one typed metadata-plane argument (per-block planes here).
+        ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes meta{s.data, b.data, emins, 0};
+        void *arguments[]{&a.data, &p.data, &meta,
             &out.data, &sa.data, &asum.data, &prior_data, &bias_data,
             &m, &n, &k, &alpha, &beta, &partitions, &ordered};
         check(cudaStreamBeginCapture(session.stream,cudaStreamCaptureModeThreadLocal));
@@ -497,8 +499,10 @@ TEST(CUDANativeQuantisedPrefillStaging, SharedActivationCorrectionsMatchExactRow
                     // CUDA copies these immutable dimensions at capture; it never
                     // retains a pointer to the host's scalar argument array.
                     int rows = m, columns = n, reduction = k;
-                    void *arguments[]{&activation.data, &payload.data, &scales.data,
-                        &minima.data, &emins, &output.data, &activation_scales.data,
+                    ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes meta{
+                        scales.data, minima.data, emins, 0};
+                    void *arguments[]{&activation.data, &payload.data, &meta,
+                        &output.data, &activation_scales.data,
                         &activation_sums, &prior, &bias, &rows, &columns, &reduction,
                         &alpha, &beta, &partitions, &ordered};
                     check(cudaStreamBeginCapture(session.stream, cudaStreamCaptureModeThreadLocal));

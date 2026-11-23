@@ -334,11 +334,16 @@ namespace llaminar2::test
                 seed);
             TensorBase *weight_ptr = weight.get();
             weights.push_back(std::move(weight));
+            // These matrices are moved between experts and tiers, so they use
+            // the migration-reusable layout (per-block planes) that production
+            // gives every movable routed expert; immutable source-native
+            // superblock matrices are coded and fail closed on movement.
             prepared.push_back(makeGpuPreparedGemm(
                 weight_ptr,
                 device,
                 name,
-                model_id));
+                model_id,
+                GPUPreparedWeightPoolLayout::MigrationReusable));
 
             ITensorGemm *gemm = prepared.back().kernel;
             if (!gemm)

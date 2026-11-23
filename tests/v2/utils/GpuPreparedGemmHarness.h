@@ -425,7 +425,8 @@ namespace llaminar2::test
         TensorBase *weights,
         DeviceId device,
         const std::string &canonical_name = "test.gpu_prepared_gemm.weight",
-        ModelContextId model_id = ModelContextId{9900})
+        ModelContextId model_id = ModelContextId{9900},
+        GPUPreparedWeightPoolLayout layout = GPUPreparedWeightPoolLayout::SourceNative)
     {
         namespace kf = llaminar::v2::kernels;
 
@@ -468,11 +469,16 @@ namespace llaminar2::test
         out.orchestrator = std::make_shared<LoadOrchestrator>(
             backend, kTestOnlyUnadmittedGPUAllocation);
         out.orchestrator->addDevice(device.ordinal);
+        // The pool layout decides both the allocation (a migration-reusable
+        // slot holds the union of source and migrated planes) and the
+        // metadata representation (only immutable source-native matrices
+        // are superblock-coded), exactly as model loading does.
+        const auto allocation = gpuPreparedWeightPoolAllocation(*vnni, layout);
         out.orchestrator->planWeight(
             device.ordinal, canonical_name, N, K,
-            vnni->payload_bytes, canonicalDeviceVnniFormat(*vnni).is_asymmetric, vnni->has_emins,
+            allocation.payload_bytes_per_block, allocation.has_mins, allocation.has_emins,
             nativeQuantisedScalePlaneWidth(canonicalDeviceVnniCodebookId(*vnni)), raw_bytes, {0},
-            gpuPreparedWeightCodedDeclaration(*weights, GPUPreparedWeightPoolLayout::SourceNative, device));
+            gpuPreparedWeightCodedDeclaration(*weights, layout, device));
 
         // Allocate pool + staging. Pinned slot size must cover the largest raw weight.
         constexpr int kNumStreams = 3;
@@ -487,12 +493,13 @@ namespace llaminar2::test
         job.N = N;
         job.K = K;
         job.is_asymmetric = canonicalDeviceVnniFormat(*vnni).is_asymmetric;
+        job.packed_payload_capacity_bytes_per_block = allocation.payload_bytes_per_block;
         out.orchestrator->addWeightJob(device.ordinal, job);
         out.orchestrator->load();
 
         // Step 4: Bind through exactly the same factory used by model loading.
         auto kernel = kf::KernelFactory::createGemmFromGPUWeightPool(
-            *weights, device, out.orchestrator, canonical_name);
+            *weights, device, out.orchestrator, canonical_name, 0, layout);
         const auto prep_kind = device.is_cuda()
             ? kf::KernelFactory::GemmPreparationKind::CUDA_INT8_PACKED
             : kf::KernelFactory::GemmPreparationKind::ROCM_INT8_PACKED;

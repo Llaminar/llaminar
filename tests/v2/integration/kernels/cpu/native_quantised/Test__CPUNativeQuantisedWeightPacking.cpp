@@ -531,8 +531,10 @@ namespace llaminar2::cpu::native_quantised::test
         // This count
         // makes a future encoding-policy change update the independent oracle
         // deliberately rather than silently shrinking its coverage.
-        EXPECT_EQ(expanded_formats, 10u);
-        EXPECT_EQ(compact_formats, 5u);
+        // CompactMultiScale covers Q3_K, Q2_K, IQ3_XXS, IQ2_S, IQ2_XS,
+        // IQ2_XXS, IQ1_S and IQ1_M; IQ3_XXS/IQ2_XXS/IQ1_S left ExpandedInt8.
+        EXPECT_EQ(expanded_formats, 7u);
+        EXPECT_EQ(compact_formats, 8u);
     }
     namespace
     {
