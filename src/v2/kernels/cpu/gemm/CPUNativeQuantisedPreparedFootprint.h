@@ -113,7 +113,7 @@ namespace llaminar2::cpu::native_quantised
     }
 
     [[nodiscard]] constexpr std::uint32_t preparedDataStride(
-        CPUNativeQuantisedEncoding encoding, int codebook_id = 0) noexcept
+        CPUNativeQuantisedEncoding encoding, int codebook_id) noexcept
     {
         switch (encoding)
         {
@@ -139,7 +139,7 @@ namespace llaminar2::cpu::native_quantised
     [[nodiscard]] constexpr std::uint32_t preparedInterleavedBlockStride(
         CPUNativeQuantisedEncoding encoding,
         bool is_asymmetric,
-        int codebook_id = 0) noexcept
+        int codebook_id) noexcept
     {
         const std::uint32_t data_stride = preparedDataStride(encoding, codebook_id);
         if (data_stride == 0)

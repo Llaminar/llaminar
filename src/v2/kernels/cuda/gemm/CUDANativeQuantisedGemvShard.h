@@ -16,6 +16,7 @@
 #include "CUDACanonicalKpartFold.h"
 #include "kernels/common/DeviceRowRange.h"
 #include "kernels/common/NativeQuantisedArchitecture.h"
+#include "kernels/common/NativeQuantisedScaleLoad.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -28,8 +29,8 @@
 #define LLAMINAR_DECLARE_CUDA_NATIVE_QUANTISED_GEMV_SHARD(INDEX)                   \
     extern "C" bool LLAMINAR_CUDA_NATIVE_QUANTISED_SHARD_SYMBOL(                  \
         cudaNativeQuantisedGemvTuned_fusedKpar_fp32, INDEX)(                 \
-        const int8_t *, const uint8_t *, const uint16_t *,              \
-        const uint16_t *, const uint32_t *, float *, const float *,     \
+        const int8_t *, const uint8_t *, ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes,              \
+         float *, const float *,     \
         int, float, float, const float *, const float *, uint8_t,       \
         int, void *, const llaminar2::CUDACanonicalKpartFoldPlan &);    \
     extern "C" bool LLAMINAR_CUDA_NATIVE_QUANTISED_SHARD_SYMBOL(                  \
@@ -58,28 +59,28 @@
         uint64_t *);                                                    \
     extern "C" bool LLAMINAR_CUDA_NATIVE_QUANTISED_SHARD_SYMBOL(                  \
         cudaNativeQuantisedGemvTuned_fp32, INDEX)(                           \
-        const int8_t *, const uint8_t *, const uint16_t *,              \
-        const uint16_t *, const uint32_t *, float *, const float *,     \
+        const int8_t *, const uint8_t *, ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes,              \
+         float *, const float *,     \
         int, int, float, float, const float *, const float *, uint8_t,  \
         int, void *, CUDAGemvContext *, CUDARowMajorWeights **);        \
     extern "C" bool LLAMINAR_CUDA_NATIVE_QUANTISED_SHARD_SYMBOL(                  \
         cudaNativeQuantisedGemvTuned_fp32_withPolicy, INDEX)(                \
-        const int8_t *, const uint8_t *, const uint16_t *,              \
-        const uint16_t *, const uint32_t *, float *, const float *,     \
+        const int8_t *, const uint8_t *, ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes,              \
+         float *, const float *,     \
         int, int, float, float, const float *, const float *, uint8_t,  \
         uint8_t, int, void *, CUDAGemvContext *,                        \
         CUDARowMajorWeights **);                                        \
     extern "C" bool LLAMINAR_CUDA_NATIVE_QUANTISED_SHARD_SYMBOL(                  \
         cudaNativeQuantisedGemvTuned_small_m_fp32, INDEX)(                   \
-        const int8_t *, const uint8_t *, const uint16_t *,              \
-        const uint16_t *, const uint32_t *, float *, const float *,     \
+        const int8_t *, const uint8_t *, ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes,              \
+         float *, const float *,     \
         int, int, int, float, float, const float *, const float *,      \
         uint8_t, int, void *, CUDAGemvContext *,                        \
         CUDARowMajorWeights **);                                        \
     extern "C" bool LLAMINAR_CUDA_NATIVE_QUANTISED_SHARD_SYMBOL(                  \
         cudaNativeQuantisedGemvTuned_small_m_fp32_withPolicy, INDEX)(        \
-        const int8_t *, const uint8_t *, const uint16_t *,              \
-        const uint16_t *, const uint32_t *, float *, const float *,     \
+        const int8_t *, const uint8_t *, ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes,              \
+         float *, const float *,     \
         int, int, int, float, float, const float *, const float *,      \
         uint8_t, uint8_t, int, void *, CUDAGemvContext *,               \
         CUDARowMajorWeights **, const llaminar2::DeviceRowRange *);    \
@@ -108,14 +109,8 @@
         CUDAGemvContext *, float *, size_t);                            \
     extern "C" CUDARowMajorWeights *                                  \
         LLAMINAR_CUDA_NATIVE_QUANTISED_SHARD_SYMBOL(                               \
-            cudaRowMajorWeights_create, INDEX)(                         \
-            const uint8_t *, const uint16_t *, const uint16_t *,        \
-            const uint32_t *, int, int, int, int, void *);              \
-    extern "C" CUDARowMajorWeights *                                  \
-        LLAMINAR_CUDA_NATIVE_QUANTISED_SHARD_SYMBOL(                               \
             cudaRowMajorWeights_createForCodebook, INDEX)(              \
-            const uint8_t *, const uint16_t *, const uint16_t *,        \
-            const uint32_t *, int, int, uint8_t, int, void *);          \
+            const uint8_t *, ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes,  int, int, uint8_t, int, void *);          \
     extern "C" bool LLAMINAR_CUDA_NATIVE_QUANTISED_SHARD_SYMBOL(                  \
         cudaNativeQuantisedGemvTuned_policyRequiresRowMajor, INDEX)(         \
         uint8_t, int, int);                                             \

@@ -15,8 +15,8 @@ ExpertTierWeightCPUStorageLayout directCPUFormat(const NativeQuantisedFormatInfo
     return {.cpu_codebook_id = format.codebook_id,
         .cpu_is_asymmetric = uint8_t(format.is_asymmetric),
         .cpu_is_superblock = uint8_t(format.is_superblock), .cpu_encoding = encoding,
-        .cpu_data_stride = uint32_t(cpu::native_quantised::preparedDataStride(encoding)),
-        .cpu_block_stride = uint32_t(cpu::native_quantised::preparedInterleavedBlockStride(encoding, format.is_asymmetric)),
+        .cpu_data_stride = uint32_t(cpu::native_quantised::preparedDataStride(encoding, format.codebook_id)),
+        .cpu_block_stride = uint32_t(cpu::native_quantised::preparedInterleavedBlockStride(encoding, format.is_asymmetric, format.codebook_id)),
         .wire_columns_per_unit = quantum};
 }
 

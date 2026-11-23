@@ -361,8 +361,8 @@ private:
     /** @brief Compare named immutable descriptor fields; C++ padding is never identity. */
     static bool sameDescriptor(const DeviceNativeQuantisedMatrixDesc &a,const DeviceNativeQuantisedMatrixDesc &b) noexcept
     {
-        return std::tie(a.payload, a.scales, a.mins, a.emins, a.n, a.k, a.blocks_per_row, a.codebook_id, a.allocation_payload_bytes_per_block, a.allocation_has_mins, a.allocation_has_emins, a.source_codebook_id, a.source_is_superblock, a.source_identity_present, a.reserved, a.reserved_tail) ==
-               std::tie(b.payload, b.scales, b.mins, b.emins, b.n, b.k, b.blocks_per_row, b.codebook_id, b.allocation_payload_bytes_per_block, b.allocation_has_mins, b.allocation_has_emins, b.source_codebook_id, b.source_is_superblock, b.source_identity_present, b.reserved, b.reserved_tail);
+        return std::tie(a.payload, a.scales, a.mins, a.emins, a.n, a.k, a.blocks_per_row, a.codebook_id, a.allocation_payload_bytes_per_block, a.allocation_has_mins, a.allocation_has_emins, a.source_codebook_id, a.source_is_superblock, a.source_identity_present, a.metadata_layout, a.reserved_tail) ==
+               std::tie(b.payload, b.scales, b.mins, b.emins, b.n, b.k, b.blocks_per_row, b.codebook_id, b.allocation_payload_bytes_per_block, b.allocation_has_mins, b.allocation_has_emins, b.source_codebook_id, b.source_is_superblock, b.source_identity_present, b.metadata_layout, b.reserved_tail);
     }
     /** @brief Reject stale actual bindings and phase/stream errors before native enqueue. */
     void requireReady(void *stream,bool recording) const

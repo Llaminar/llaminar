@@ -34,6 +34,7 @@
 
 #include "WeightManager.h"
 #include "loaders/BoundedGPUExpertSource.h"
+#include "loaders/GPUPreparedWeightPoolLayout.h"
 #include <map>
 #include <tuple>
 #include "utils/ScopedOpenMPPartitionAffinity.h"
@@ -6868,11 +6869,16 @@ namespace llaminar2
             const int K = static_cast<int>(tensor->cols());
             const size_t raw_bytes = bounded ? bounded->sourceBytes() : tensor->size_bytes();
 
+            // Dense weights are immutable source-native matrices.
+            std::optional<WeightVRAMPool::SuperblockCodedMetadata> coded;
+            if (gpuPreparedSuperblockCoded(*vnni, GPUPreparedWeightPoolLayout::SourceNative, target_device))
+                coded = WeightVRAMPool::SuperblockCodedMetadata{canonicalDeviceVnniCodebookId(*vnni),
+                                                                gpuWeightSourceSuperblockPhase(*tensor)};
             orchestrator->planWeight(target_device.ordinal, name, N, K,
                                      vnni->payload_bytes, canonicalDeviceVnniFormat(*vnni).is_asymmetric,
                                      vnni->has_emins,
                                      nativeQuantisedScalePlaneWidth(canonicalDeviceVnniCodebookId(*vnni)),
-                                     raw_bytes);
+                                     raw_bytes, {0}, coded);
             max_raw_bytes = std::max(max_raw_bytes, raw_bytes);
             ++planned_storage_count;
             weight_formats.emplace_back(name, vnni);
@@ -7048,6 +7054,13 @@ namespace llaminar2
                         throw std::logic_error(
                             "[WeightManager] Coalesced MoE run lost its payload-allocation contract");
                     }
+                    // Every member of a coalesced run shares K, column selection
+                    // and therefore one superblock phase.
+                    std::optional<WeightVRAMPool::SuperblockCodedMetadata> coded;
+                    if (gpuPreparedSuperblockCoded(*vnni, layout, target_device))
+                        coded = WeightVRAMPool::SuperblockCodedMetadata{
+                            canonicalDeviceVnniCodebookId(*vnni),
+                            gpuWeightSourceSuperblockPhase(*moe_jobs[first_semantic_index].view)};
                     orchestrator->planWeight(
                         target_device.ordinal,
                         run.job.name,
@@ -7057,7 +7070,7 @@ namespace llaminar2
                         allocation.has_mins,
                         allocation.has_emins,
                         nativeQuantisedScalePlaneWidth(canonicalDeviceVnniCodebookId(*vnni)),
-                        run.job.raw_bytes);
+                        run.job.raw_bytes, {0}, coded);
                 }
                 else
                 {

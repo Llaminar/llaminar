@@ -96,8 +96,8 @@ TEST(ExpertTierWeightStream, NativeCpuRectanglesUseOnlyLivePlanesAndIndependentR
             .cpu_is_asymmetric=uint8_t(format.metadata->is_asymmetric),
             .cpu_is_superblock=uint8_t(format.metadata->is_superblock),
             .cpu_encoding=encoding,
-            .cpu_data_stride=uint32_t(cpu::native_quantised::preparedDataStride(encoding)),
-            .cpu_block_stride=uint32_t(cpu::native_quantised::preparedInterleavedBlockStride(encoding,format.metadata->is_asymmetric))};
+            .cpu_data_stride=uint32_t(cpu::native_quantised::preparedDataStride(encoding,format.metadata->codebook_id)),
+            .cpu_block_stride=uint32_t(cpu::native_quantised::preparedInterleavedBlockStride(encoding,format.metadata->is_asymmetric,format.metadata->codebook_id))};
         source.cpu_N=128;source.cpu_K=96;source.cpu_first_row=59;source.cpu_first_column=32;
         source.wire_columns_per_unit=quantum;source.unit_count=((69+quantum-1)/quantum)*2;
         source.maximum_units_per_chunk=std::min(2u,source.unit_count);

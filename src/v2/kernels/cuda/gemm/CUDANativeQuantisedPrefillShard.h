@@ -18,6 +18,7 @@
 
 #include <cuda_runtime.h>
 #include <cstdint>
+#include "kernels/common/NativeQuantisedScaleLoad.h"
 
 #define LLAMINAR_CUDA_NATIVE_QUANTISED_PREFILL_SHARD_SYMBOL_IMPL(NAME, INDEX) \
     NAME##_prefill_shard_##INDEX
@@ -28,8 +29,9 @@
 #define LLAMINAR_DECLARE_CUDA_NATIVE_QUANTISED_PREFILL_SHARD(INDEX)                    \
     extern "C" bool LLAMINAR_CUDA_NATIVE_QUANTISED_PREFILL_SHARD_INDEXED_SYMBOL(       \
         cudaNativeQuantisedPrefill_launch, INDEX)(                                     \
-        const int8_t *, const uint8_t *, const uint16_t *, const uint16_t *,          \
-        const uint32_t *, float *, const float *, const int32_t *, int, int, int,     \
+        const int8_t *, const uint8_t *,                                              \
+        ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes,            \
+        float *, const float *, const int32_t *, int, int, int,                       \
         float, float, const float *, const float *, uint8_t, int, int,                \
         cudaStream_t, CUDAPrefillContext *);                                          \
     extern "C" bool LLAMINAR_CUDA_NATIVE_QUANTISED_PREFILL_SHARD_INDEXED_SYMBOL(       \

@@ -75,7 +75,7 @@ TEST(Q8ResidualAllFormats, NativeDescriptorRejectsForeignAndMalformedPlanes) {
         bad.k = 288;
         break;
       case 8:
-        bad.reserved = 1;
+        bad.metadata_layout = 0x40; // reserved layout bit
         break;
       case 9:
         bad.reserved_tail = 1;

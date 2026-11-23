@@ -405,7 +405,7 @@ __global__ __launch_bounds__(128, 2) void projectNative(GPUQ8ResidualCorrectionA
         const auto *payload = a.weights.payload + block * Traits::payload_bytes;
         int weights[8];
         decoder.decode_groups<C>(payload, weights);
-        const NativeBlock<C> meta(a.weights, block, payload);
+        const NativeBlock<C> meta(a.weights, group, column, payload);
 #pragma unroll
         for (int r = 0; r < Rows; ++r)
         {
@@ -553,7 +553,7 @@ __global__ __launch_bounds__(512,1) void projectHCRead(GPUHCResidualReadProjecti
                 const auto block=static_cast<std::uint64_t>(group)*a.weights.n+branch*hidden+column;
                 const auto* payload=a.weights.payload+block*Traits::payload_bytes;
                 int weights[8];decoder.decode_groups<C>(payload,weights);
-                const NativeBlock<C> meta(a.weights,block,payload);
+                const NativeBlock<C> meta(a.weights,group,branch*hidden+column,payload);
                 const auto activation=static_cast<std::uint64_t>(row)*a.weights.blocks_per_row+group;
                 const auto* p0=reinterpret_cast<const int*>(a.primary+activation*32);
                 const auto* p1=reinterpret_cast<const int*>(a.residual+activation*32);

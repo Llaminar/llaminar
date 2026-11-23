@@ -1033,6 +1033,19 @@ target_include_directories(v2_test_utils PUBLIC
     ${V2_SOURCE_DIR}             # For src/v2/ includes
 )
 
+# Test: superblock-coded GPU metadata codec (header-only, core-free). The
+# exhaustive proof that reconstructed staged words equal the legacy repack
+# planes for every code and every binary16 d/dmin.
+add_executable(v2_unit_native_quantised_superblock_metadata
+    unit/tensors/Test__NativeQuantisedSuperblockMetadata.cpp)
+target_include_directories(v2_unit_native_quantised_superblock_metadata PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(v2_unit_native_quantised_superblock_metadata GTest::gtest GTest::gtest_main)
+target_compile_features(v2_unit_native_quantised_superblock_metadata PRIVATE cxx_std_20)
+add_v2_test(V2_Unit_NativeQuantisedSuperblockMetadata
+    COMMAND $<TARGET_FILE:v2_unit_native_quantised_superblock_metadata>
+    LABELS "V2;Unit;Tensors;NativeQuantised;Memory;DeviceFree"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60)
+
 # Test: FP32Tensor class
 add_executable(v2_test_tensor_basics
     unit/tensors/Test__FP32Tensor.cpp
@@ -3174,6 +3187,13 @@ add_v2_test(V2_Integration_NonNUMAHostMemoryAttribution
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Memory;Capacity;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NonNUMAHostMemoryAttribution)
+# An integrated GPU (GB10) must admit its shared pool's reclaimable page cache.
+add_v2_test(V2_Integration_IntegratedAcceleratorPoolCapacity
+    COMMAND $<TARGET_FILE:v2_unit_host_memory_capacity>
+        --gtest_filter=HostMemoryCapacity.IntegratedAcceleratorAdmitsItsReclaimableHostPool:HostMemoryCapacity.OnlyRankHostPoolDevicesAdoptThePoolObservation
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Memory;Capacity;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_IntegratedAcceleratorPoolCapacity)
 
 # Test: DeviceWorkspaceManager - Per-device GPU workspace buffer management
 add_executable(v2_unit_device_workspace_manager unit/execution/local_execution/device/Test__DeviceWorkspaceManager.cpp)

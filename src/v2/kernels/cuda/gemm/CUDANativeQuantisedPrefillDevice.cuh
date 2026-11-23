@@ -203,9 +203,7 @@ namespace llaminar2::cuda::prefill
      * @tparam STAGING Compile-time operand publication policy; never arithmetic.
      * @param A Persistent quantized activations, row-major [M,K].
      * @param payload Native packed weights, block-major [K/32,N,payload_bytes].
-     * @param scales_B Native per-block weight scales.
-     * @param mins_B Per-block offset or second scale when required by the format.
-     * @param emins_B Packed subgroup offsets for dual-scale asymmetric formats.
+     * @param meta_B Typed metadata planes (per-block words or superblock-coded) and phase.
      * @param C Disjoint output or persistent canonical-partition workspace.
      * @param scales_A Row-major activation scales [M,K/32].
      * @param sums_A Optional block-major activation sums [K/32,M].
@@ -230,9 +228,7 @@ namespace llaminar2::cuda::prefill
     __global__ __launch_bounds__(BLOCK_SIZE_, MIN_BLOCKS_HINT) void nativeQuantisedTC_BK64(
         const int8_t *__restrict__ A,
         const uint8_t *__restrict__ payload,
-        const uint16_t *__restrict__ scales_B,
-        const uint16_t *__restrict__ mins_B,
-        const uint32_t *__restrict__ emins_B,
+        ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes meta_B,
         float *__restrict__ C,
         const float *__restrict__ scales_A,
         const int32_t *__restrict__ sums_A,
@@ -310,6 +306,13 @@ namespace llaminar2::cuda::prefill
         constexpr bool IS_DUAL_SCALE_ASYM = Traits::is_dual_scale_asym;
         constexpr bool IS_IQ1_M = Traits::is_iq1_m;
         constexpr bool NEEDS_MINS = Traits::requires_secondary_metadata;
+        // Async metadata schedules copy per-block words verbatim; a coded plane
+        // holds codes and superblock words. Codable codebooks never qualify for
+        // async staging (16/20-byte payloads only), so the combination cannot exist.
+        static_assert(!::llaminar2::nativeQuantisedSuperblockCodable(CODEBOOK_ID) || ASYNC_RAW_MODE < 2,
+                      "superblock-codable codebooks cannot use async per-block metadata staging");
+        [[maybe_unused]] const uint16_t *const scales_B = meta_B.primary;
+        [[maybe_unused]] const uint16_t *const mins_B = static_cast<const uint16_t *>(meta_B.secondary);
 
         // Shared memory: no smem_B_raw staging buffer needed.
         // STAGES_=1 (single-buffered) halves smem → potential 3 blocks/SM.
@@ -601,19 +604,23 @@ namespace llaminar2::cuda::prefill
                 {
                     constexpr int PAYLOAD_BYTES = Traits::payload_bytes;
                     const size_t base = (static_cast<size_t>(kb) * N + gcol) * PAYLOAD_BYTES;
-                    const uint16_t s = ASYNC_RAW_MODE >= 2 ? uint16_t{0}
-                        : ::llaminar2::native_quantised_scale::loadStagedPrimary<CODEBOOK_ID>(
-                              scales_B, static_cast<size_t>(kb) * N + gcol);
+                    // Per-block words, or words reconstructed from codes; async
+                    // metadata schedules publish their words in load_B_metadata_tile.
+                    const auto block_meta = ASYNC_RAW_MODE >= 2
+                        ? ::llaminar2::native_quantised_scale::StagedBlockMetadata{}
+                        : ::llaminar2::native_quantised_scale::loadBlockMetadata<CODEBOOK_ID>(
+                              meta_B, ::llaminar2::native_quantised_scale::blockMajorAddress(meta_B, kb, gcol, N));
+                    const uint16_t s = block_meta.primary;
                     const uint8_t *raw_source = ASYNC_RAW_MODE == 0 ? payload + base
                         : reinterpret_cast<const uint8_t *>(&dst_words[word_offset]);
 
                     [[maybe_unused]] uint16_t m = 0;
                     if constexpr (NEEDS_MINS && ASYNC_RAW_MODE < 2)
-                        m = mins_B[static_cast<size_t>(kb) * N + gcol];
+                        m = block_meta.secondary;
 
                     [[maybe_unused]] uint32_t em = 0;
                     if constexpr (IS_DUAL_SCALE_ASYM)
-                        em = emins_B[static_cast<size_t>(kb) * N + gcol];
+                        em = block_meta.emin;
 
                     [[maybe_unused]] uint16_t qh_packed = 0;
                     if constexpr (IS_IQ1_M)
@@ -727,27 +734,27 @@ namespace llaminar2::cuda::prefill
                                                  : size_t{0};
 
                         // Staged words; store_staged_scale keeps raw bytes only under BYTE_STAGED_SCALES.
-                        const uint16_t s0 = ::llaminar2::native_quantised_scale::loadStagedPrimary<CODEBOOK_ID>(
-                            scales_B, static_cast<size_t>(kb0) * N + gcol);
-                        const uint16_t s1 = has_block1
-                                                ? ::llaminar2::native_quantised_scale::loadStagedPrimary<CODEBOOK_ID>(
-                                                      scales_B, static_cast<size_t>(kb0 + 1) * N + gcol)
-                                                : uint16_t{0};
+                        const auto meta0 = ::llaminar2::native_quantised_scale::loadBlockMetadata<CODEBOOK_ID>(
+                            meta_B, ::llaminar2::native_quantised_scale::blockMajorAddress(meta_B, kb0, gcol, N));
+                        const auto meta1 = has_block1
+                            ? ::llaminar2::native_quantised_scale::loadBlockMetadata<CODEBOOK_ID>(
+                                  meta_B, ::llaminar2::native_quantised_scale::blockMajorAddress(meta_B, kb0 + 1, gcol, N))
+                            : ::llaminar2::native_quantised_scale::StagedBlockMetadata{};
+                        const uint16_t s0 = meta0.primary;
+                        const uint16_t s1 = meta1.primary;
 
                         [[maybe_unused]] uint16_t m0 = 0, m1 = 0;
                         if constexpr (NEEDS_MINS)
                         {
-                            m0 = mins_B[static_cast<size_t>(kb0) * N + gcol];
-                            if (has_block1)
-                                m1 = mins_B[static_cast<size_t>(kb0 + 1) * N + gcol];
+                            m0 = meta0.secondary;
+                            m1 = meta1.secondary;
                         }
 
                         [[maybe_unused]] uint32_t em0 = 0, em1 = 0;
                         if constexpr (IS_DUAL_SCALE_ASYM)
                         {
-                            em0 = emins_B[static_cast<size_t>(kb0) * N + gcol];
-                            if (has_block1)
-                                em1 = emins_B[static_cast<size_t>(kb0 + 1) * N + gcol];
+                            em0 = meta0.emin;
+                            em1 = meta1.emin;
                         }
 
                         [[maybe_unused]] uint16_t qh_packed0 = 0, qh_packed1 = 0;
@@ -1342,7 +1349,7 @@ namespace llaminar2::cuda::prefill
 #else
         (void)A;
         (void)payload;
-        (void)scales_B;
+        (void)meta_B;
         (void)C;
         (void)scales_A;
         (void)C_existing;

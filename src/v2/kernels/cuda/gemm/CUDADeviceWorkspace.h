@@ -14,6 +14,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include "kernels/common/NativeQuantisedScaleLoad.h"
 
 #ifdef __cplusplus
 extern "C"
@@ -48,20 +49,9 @@ extern "C"
     // -----------------------------------------------------------------
     // Row-major weight transpose lifetime (per quantized GEMM kernel weight)
     // -----------------------------------------------------------------
-    CUDARowMajorWeights *cudaRowMajorWeights_create(
-        const uint8_t *d_payload_col,
-        const uint16_t *d_scales_col,
-        const uint16_t *d_mins_col,
-        const uint32_t *d_emins_col,
-        int N, int K,
-        int payload_bytes,
-        int cuda_device_id,
-        void *stream);
     CUDARowMajorWeights *cudaRowMajorWeights_createForCodebook(
         const uint8_t *d_payload_col,
-        const uint16_t *d_scales_col,
-        const uint16_t *d_mins_col,
-        const uint32_t *d_emins_col,
+        ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes meta_col,
         int N,
         int K,
         uint8_t codebook_id,

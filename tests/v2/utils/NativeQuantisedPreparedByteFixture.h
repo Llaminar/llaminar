@@ -45,7 +45,7 @@ public:
         if (n <= 0 || k <= 0)
             throw std::invalid_argument("Native CPU byte fixture requires positive geometry");
         const std::uint64_t units = ((std::uint64_t(n) + 63) / 64) * ((std::uint64_t(k) + 31) / 32);
-        const auto stride = cpu::native_quantised::preparedInterleavedBlockStride(descriptor.encoding, descriptor.is_asymmetric);
+        const auto stride = cpu::native_quantised::preparedInterleavedBlockStride(descriptor.encoding, descriptor.is_asymmetric, descriptor.source.codebook_id);
         if (units > max_bytes / stride)
             throw std::overflow_error("Native CPU byte fixture exceeds its declared byte bound");
         const auto extent = static_cast<std::size_t>(units) * stride;

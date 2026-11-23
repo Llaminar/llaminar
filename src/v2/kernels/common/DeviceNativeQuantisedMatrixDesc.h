@@ -42,7 +42,13 @@ namespace llaminar2
         uint8_t source_codebook_id = 0; ///< Original GGUF arithmetic-policy codebook.
         uint8_t source_is_superblock = 0; ///< Original source block-family discriminator.
         uint8_t source_identity_present = 0; ///< Whether the two source fields are authoritative.
-        uint8_t reserved = 0;             ///< Reserved ABI byte; producers write zero.
+        /**
+         * Packed metadata layout (nativeQuantisedMetadataLayout()): bit 7 is the
+         * NativeQuantisedMetadataRepresentation (set = superblock-coded), bits 0-2
+         * the source-superblock phase of the first prepared K block. Zero is the
+         * per-block-plane layout every legacy producer writes.
+         */
+        uint8_t metadata_layout = 0;
         uint32_t reserved_tail = 0;       ///< Explicit tail padding for byte-stable publication.
 
         /** @return Whether the descriptor names a minimally valid matrix. */

@@ -13703,7 +13703,7 @@ public:
                 a.allocation_payload_bytes_per_block==b.allocation_payload_bytes_per_block &&
                 a.allocation_has_mins==b.allocation_has_mins && a.allocation_has_emins==b.allocation_has_emins &&
                 a.source_codebook_id==b.source_codebook_id && a.source_is_superblock==b.source_is_superblock &&
-                a.source_identity_present==b.source_identity_present && a.reserved==b.reserved && a.reserved_tail==b.reserved_tail;
+                a.source_identity_present==b.source_identity_present && a.metadata_layout==b.metadata_layout && a.reserved_tail==b.reserved_tail;
         };
         if(!shared_gate.valid||!shared_down.valid||shared_gate.num_experts!=1||shared_down.num_experts!=1||
             shared_gate.weight_format!=DeviceMoEWeightFormat::NativeQuantised||shared_down.weight_format!=DeviceMoEWeightFormat::NativeQuantised||

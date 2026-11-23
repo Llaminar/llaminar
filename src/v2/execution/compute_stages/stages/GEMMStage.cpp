@@ -480,7 +480,7 @@ namespace llaminar2
         result.weight_geometry={static_cast<uint64_t>(weights.n),static_cast<uint64_t>(weights.k),
             weights.blocks_per_row,weights.codebook_id,weights.allocation_payload_bytes_per_block,
             weights.allocation_has_mins,weights.allocation_has_emins,weights.source_codebook_id,
-            weights.source_is_superblock,weights.source_identity_present,weights.reserved,weights.reserved_tail};
+            weights.source_is_superblock,weights.source_identity_present,weights.metadata_layout,weights.reserved_tail};
         const std::array<const TensorBase*,5> tensors{dynamic_cast<const TensorBase*>(params_.A),
             hcActivatedOutput(),dynamic_cast<const TensorBase*>(params_.C),
             params_.hc_short_k_read?params_.hc_short_k_read->normalized:nullptr,
@@ -558,7 +558,7 @@ namespace llaminar2
         result.weight_geometry={static_cast<uint64_t>(weights.n),static_cast<uint64_t>(weights.k),
             weights.blocks_per_row,weights.codebook_id,weights.allocation_payload_bytes_per_block,
             weights.allocation_has_mins,weights.allocation_has_emins,weights.source_codebook_id,
-            weights.source_is_superblock,weights.source_identity_present,weights.reserved,weights.reserved_tail};
+            weights.source_is_superblock,weights.source_identity_present,weights.metadata_layout,weights.reserved_tail};
         const std::array<const TensorBase*,4> tensors{dynamic_cast<const TensorBase*>(params_.A),
             dynamic_cast<const TensorBase*>(params_.gated_norm->gate),
             dynamic_cast<const TensorBase*>(params_.gated_norm->gamma),dynamic_cast<const TensorBase*>(params_.C)};

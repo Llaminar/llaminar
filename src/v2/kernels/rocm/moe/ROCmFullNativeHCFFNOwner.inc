@@ -29,7 +29,7 @@ void mixFullNativeHCFFNPrefix(const rocm::FullNativeHCFFNPrefixArgs& prefix,cons
         mix(value.n);mix(value.k);mix(value.blocks_per_row);mix(value.codebook_id);
         mix(value.allocation_payload_bytes_per_block);mix(value.allocation_has_mins);mix(value.allocation_has_emins);
         mix(value.source_codebook_id);mix(value.source_is_superblock);mix(value.source_identity_present);
-        mix(value.reserved);mix(value.reserved_tail);
+        mix(value.metadata_layout);mix(value.reserved_tail);
     };
     const auto& hc=prefix.hc;
     mix(prefix.output_demand.bits());

@@ -349,6 +349,9 @@ __device__ __forceinline__ bool prefill_native_quantised_desc_shape_ok(
     using Traits = PrefillNATIVE_QUANTISEDTraits<FMT>;
     return desc.payload &&
            desc.scales &&
+           // ROCm readers consume per-block planes only; a superblock-coded
+           // descriptor (CUDA-produced) must never reach them.
+           desc.metadata_layout == 0u &&
            desc.n == N &&
            desc.k == K &&
            desc.blocks_per_row == static_cast<uint32_t>(K / 32) &&

@@ -129,7 +129,8 @@ namespace llaminar2
                                     int payload_bytes_per_block, bool is_asymmetric,
                                     bool has_emins, NativeQuantisedScalePlaneWidth scale_plane,
                                     size_t raw_gguf_bytes,
-                                    ContiguousAlias alias)
+                                    ContiguousAlias alias,
+                                    std::optional<SuperblockCodedMetadata> coded)
     {
         if (allocated_)
         {
@@ -150,7 +151,20 @@ namespace llaminar2
         // Region extents come from the single metadata-plane authority with
         // the caller's explicit primary-plane capacity.
         const size_t blocks = static_cast<size_t>(N) * static_cast<size_t>(K / 32);
-        const auto planes = NativeQuantisedMetadataPlaneBytes::of(blocks, scale_plane, is_asymmetric, has_emins);
+        if (coded && (!nativeQuantisedSuperblockCodable(coded->physical_codebook) || coded->superblock_phase >= 8 ||
+                      N <= 0 || K <= 0 || K % 32 != 0))
+            throw std::invalid_argument("WeightVRAMPool: invalid superblock-coded metadata declaration for '" +
+                                        name + "'");
+        // Superblock-coded matrices store codes and superblock words; every
+        // other matrix keeps the per-block planes of the metadata authority.
+        const auto planes = coded
+            ? NativeQuantisedMetadataPlaneBytes::coded(coded->physical_codebook, static_cast<size_t>(N),
+                                                       static_cast<uint32_t>(K / 32), coded->superblock_phase)
+            : NativeQuantisedMetadataPlaneBytes::of(blocks, scale_plane, is_asymmetric, has_emins);
+        plan.metadata_layout = coded
+            ? nativeQuantisedMetadataLayout(NativeQuantisedMetadataRepresentation::SuperblockCoded,
+                                            coded->superblock_phase)
+            : uint8_t{0};
         const NativeQuantisedPackedRegionSizes regions{
             .payload_bytes = blocks * static_cast<size_t>(payload_bytes_per_block),
             .scales_bytes = planes.scales,
@@ -421,6 +435,7 @@ namespace llaminar2
         slot.mins_bytes = plan.mins_bytes;
         slot.emins_bytes = plan.emins_bytes;
         slot.staging_bytes = plan.staging_bytes;
+        slot.metadata_layout = plan.metadata_layout;
 
         if (base)
         {

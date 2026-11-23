@@ -131,4 +131,59 @@ namespace llaminar2::test
         std::vector<CPUSocketInfo> unobservable(1);
         EXPECT_THROW(assignNonNUMAHostMemory(unobservable, HostMemoryCapacityObservation{}), std::runtime_error);
     }
+    /**
+     * Regression (DGX Spark/GB10): an integrated GPU's driver free figure
+     * tracks MemFree and omitted 39 GiB of reclaimable page cache, so a model
+     * that fit the shared pool was rejected ("only 78.1 GB available") until
+     * the cache was dropped by hand. The accelerator member of a shared pool
+     * must admit the same canonical host observation as the CPU member,
+     * bounded by its own addressable total, and must never invent capacity
+     * for an unobservable pool.
+     */
+    TEST(HostMemoryCapacity, IntegratedAcceleratorAdmitsItsReclaimableHostPool)
+    {
+        // The Spark observation: 121 GiB total, 78 GiB MemFree, 39 GiB cold cache.
+        const auto pool = parseLinuxHostMemoryInfo(
+            "MemTotal:       127535104 kB\n"
+            "MemFree:         81788928 kB\n"
+            "MemAvailable:   121905332 kB\n"
+            "Inactive(file):  38797312 kB\n"
+            "Shmem:              80324 kB\n");
+        ASSERT_TRUE(pool.valid());
+        const std::size_t driver_total = 125000000000ull;
+        const auto available = integratedAcceleratorPoolAvailableBytes(pool, driver_total);
+        EXPECT_EQ(available, (81788928ull + 38797312ull) * kKiB);
+        EXPECT_GT(available, pool.free_bytes) << "reclaimable cache must be admitted";
+
+        // The accelerator can never address more than its own total.
+        EXPECT_EQ(integratedAcceleratorPoolAvailableBytes(pool, 64ull << 30), 64ull << 30);
+
+        EXPECT_THROW((void)integratedAcceleratorPoolAvailableBytes(HostMemoryCapacityObservation{}, driver_total),
+                     std::runtime_error);
+        EXPECT_THROW((void)integratedAcceleratorPoolAvailableBytes(pool, 0u), std::runtime_error);
+    }
+
+    /** Dedicated devices keep their driver figure; pooled ones adopt the pool. */
+    TEST(HostMemoryCapacity, OnlyRankHostPoolDevicesAdoptThePoolObservation)
+    {
+        ComputeDevice dedicated{};
+        dedicated.total_memory_bytes = 24ull << 30;
+        dedicated.free_memory_bytes = 3ull << 30;
+        dedicated.numa_node = -1;
+        dedicated.memory_backing = PhysicalMemoryBacking::Dedicated;
+        adoptIntegratedAcceleratorPoolCapacity(dedicated);
+        EXPECT_EQ(dedicated.free_memory_bytes, 3ull << 30);
+
+        ComputeDevice pooled = dedicated;
+        pooled.memory_backing = PhysicalMemoryBacking::RankHostPool;
+        pooled.total_memory_bytes = std::size_t{1} << 50; // bound by the live pool, not the device
+        pooled.free_memory_bytes = 1u;
+        adoptIntegratedAcceleratorPoolCapacity(pooled);
+        const auto live = observeIntegratedAcceleratorPool(-1);
+        ASSERT_TRUE(live.valid());
+        // A live observation moves between samples; it must be the pool's
+        // order of magnitude, never the 1-byte driver figure.
+        EXPECT_GT(pooled.free_memory_bytes, 1u);
+        EXPECT_LE(pooled.free_memory_bytes, live.total_bytes);
+    }
 } // namespace llaminar2::test

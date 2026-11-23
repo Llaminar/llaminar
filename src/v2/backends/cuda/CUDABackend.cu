@@ -33,6 +33,8 @@
 #include "../../kernels/common/SamplingMath.h"
 #include "../../kernels/cuda/ops/CUDARowSelectKernels.h"
 #include "../../kernels/cuda/ops/CUDAVectorAddKernels.h"
+#include "../HostMemoryCapacity.h"
+#include "../GPUEnumeration.h"
 #include <cuda/atomic>
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -1412,6 +1414,15 @@ namespace llaminar2
             .world_rank = memory->worldRank(), .device = DeviceId::cuda(device_id)});
         if (!physical || before_total > physical->resource().total_bytes)
             throw std::runtime_error("CUDA context footprint exceeds its authenticated physical resource");
+        // The probe delta is a driver measurement, but an integrated device's
+        // admission headroom is its shared host pool: the driver free figure
+        // omits reclaimable page cache (including the model file just read).
+        const bool pooled = physical->resource().sharesRankHostPool();
+        const std::size_t available_bytes = pooled
+            ? integratedAcceleratorPoolAvailableBytes(
+                  observeIntegratedAcceleratorPool(cuda_enumeration::get_cuda_device_numa_node(device_id)),
+                  before_total)
+            : before_free;
         std::optional<PhysicalMemoryAllocationLease> lease;
         if (measured_bytes)
             lease.emplace(memory->claimMeasuredRuntimeContextStorage({
@@ -1420,10 +1431,9 @@ namespace llaminar2
                 // backing. Preserve the canonical physical-total identity and
                 // use only the actually observed free bytes for admission.
                 .total_bytes = physical->resource().total_bytes,
-                .admission_available_bytes = before_free,
-                // An integrated device's fresh free figure is the shared host pool.
+                .admission_available_bytes = available_bytes,
                 .backing = physical->resource().backing,
-                .pool_available_bytes = physical->resource().sharesRankHostPool() ? before_free : 0u}, measured_bytes));
+                .pool_available_bytes = pooled ? available_bytes : 0u}, measured_bytes));
         // Allocate host bookkeeping before changing persistent native storage:
         // successful growth must not become unowned on a vector allocation failure.
         auto &retained = nativeContextStorageLeases()[device_id];

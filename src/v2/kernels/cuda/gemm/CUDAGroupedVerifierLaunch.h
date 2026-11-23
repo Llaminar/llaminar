@@ -11,6 +11,7 @@
 #include "CUDADeviceWorkspace.h"
 #include "kernels/common/DeviceRowRange.h"
 #include <cstdint>
+#include "kernels/common/NativeQuantisedScaleLoad.h"
 
 extern "C"
 {
@@ -42,8 +43,7 @@ extern "C"
      */
     bool cudaNativeQuantisedGemvTuned_small_m_fp32_withPolicy(
         const int8_t *d_A_int8, const uint8_t *d_payload,
-        const uint16_t *d_scales, const uint16_t *d_mins,
-        const uint32_t *d_emins, float *d_C_fp32,
+        ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes d_meta, float *d_C_fp32,
         const float *d_scales_A_block, int M, int N, int K,
         float alpha, float beta, const float *d_C_existing,
         const float *d_bias, uint8_t codebook_id,
