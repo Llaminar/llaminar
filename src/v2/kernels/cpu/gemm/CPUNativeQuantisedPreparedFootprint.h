@@ -167,9 +167,9 @@ namespace llaminar2::cpu::native_quantised
      * @return Byte offset relative to the admitted block.
      */
     [[nodiscard]] constexpr std::uint32_t preparedCodedPlaneOffset(
-        CPUNativeQuantisedEncoding encoding, std::uint32_t data_stride) noexcept
+        CPUNativeQuantisedEncoding, std::uint32_t data_stride) noexcept
     {
-        return data_stride + (encoding == CPUNativeQuantisedEncoding::NibbleLUTSourceScale ? 128u : 0u);
+        return data_stride;
     }
 
     /**
@@ -289,6 +289,14 @@ namespace llaminar2::cpu::native_quantised
         return 0;
     }
 
+    /** @return Whether a block stores the legacy signed weight-sum plane. */
+    [[nodiscard]] constexpr bool preparedUsesInlineCompensation(
+        CPUNativeQuantisedEncoding encoding, int codebook_id) noexcept
+    {
+        return encoding == CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale ||
+            (encoding == CPUNativeQuantisedEncoding::ExpandedInt8 && codebook_id != 19);
+    }
+
     /**
      * @brief Return all bytes in one prepared CPU unit, including metadata.
      * @param encoding Physical execution encoding.
@@ -313,7 +321,8 @@ namespace llaminar2::cpu::native_quantised
                    8u * native_quantised_superblock::superblockCodePlaneBits(superblockMetadataCodebook(encoding, codebook_id));
         if (encoding == CPUNativeQuantisedEncoding::CompactMultiScale)
             return data_stride + 8u * preparedCompactCodeBits(codebook_id);
-        return data_stride + 256u + (is_asymmetric ? 128u : 0u);
+        return data_stride + (preparedUsesInlineCompensation(encoding, codebook_id) ? 128u : 0u) +
+            128u + (is_asymmetric ? 128u : 0u);
     }
 
     /**

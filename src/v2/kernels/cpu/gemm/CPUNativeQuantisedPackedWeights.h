@@ -182,15 +182,13 @@ namespace llaminar2::cpu::native_quantised
         /**
          * @brief Return whether each prepared block carries weight compensation.
          *
-         * Nibble and expanded-INT8 kernels bias signed weights by shifting the
-         * activation to unsigned bytes, and therefore need one per-column
-         * weight sum. Q6_K reverses the VNNI operands: unsigned six-bit weights
-         * multiply signed activations, so its centering correction depends only
-         * on the activation half sums and no weight compensation is stored.
+         * Only legacy expanded INT8 sources (excluding Q8_0) store a column sum.
+         * On x86 the compensation-free kernels consume signed activation bytes
+         * and correct any unsigned weight bias with the activation sum instead.
          */
         [[nodiscard]] bool usesInlineCompensation() const noexcept
         {
-            return !usesQ6KNativeDualScale() && !usesCompactMultiScale();
+            return preparedUsesInlineCompensation(encoding, codebook_id);
         }
 
         /**
@@ -604,7 +602,7 @@ namespace llaminar2::cpu::native_quantised
         {
             if (!usesInlineCompensation())
                 throw std::logic_error(
-                    "Q6_K native dual-scale weights do not carry compensation metadata");
+                    "Prepared CPU encoding does not carry weight-sum compensation");
             size_t block_offset = blockOffset(c, kb);
             return reinterpret_cast<const int16_t *>(
                 interleavedBase() + block_offset + data_stride);

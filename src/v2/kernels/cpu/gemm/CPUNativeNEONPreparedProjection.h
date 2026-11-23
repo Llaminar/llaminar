@@ -751,21 +751,11 @@ namespace llaminar2::cpu::native_quantised
                                 // hoist a complete four-row activation panel into
                                 // registers and spill it inside the K traversal.
 #pragma GCC unroll 1
-                                for (int group = 0; group < 8; ++group)
-                                {
-                                    const auto raw = vld1q_u8(unit + (group % 4) * 256 + column * 4);
-                                    auto values = group < 4 ? vandq_u8(raw, vdupq_n_u8(15)) : vshrq_n_u8(raw, 4);
-                                    const auto *planes = unit + 1024 + group * 64 + (column / 16) * 16;
-                                    std::uint64_t bits0 = 0, bits1 = 0;
-                                    std::memcpy(&bits0, planes, sizeof(bits0));
-                                    std::memcpy(&bits1, planes + 8, sizeof(bits1));
-                                    const int shift = (column % 16) * 4;
-                                    values = vorrq_u8(values, q6Plane(static_cast<std::uint16_t>(bits0 >> shift), 16));
-                                    values = vorrq_u8(values, q6Plane(static_cast<std::uint16_t>(bits1 >> shift), 32));
-                                    const auto centered = vsubq_s8(vreinterpretq_s8_u8(values), vdupq_n_s8(32));
-                                    if (group < 4) consume<Ops>(centered, block, group, low);
-                                    else consume<Ops>(centered, block, group, high);
-                                }
+                                for (int group = 0; group < 4; ++group)
+                                    consume<Ops>(q6Group(unit, column, group), block, group, low);
+#pragma GCC unroll 1
+                                for (int group = 4; group < 8; ++group)
+                                    consume<Ops>(q6Group(unit, column, group), block, group, high);
                             }
                             else if constexpr (Coded == 11)
                             {
@@ -811,6 +801,15 @@ namespace llaminar2::cpu::native_quantised
                                     consume<Ops>(nibbles<Map>(vshrq_n_u8(raw, 4)), block, group + 4, low);
                                 }
                             }
+                            else if constexpr (Physical == Encoding::IQ3SExpandedSourceScale &&
+                                Rows == 4 && Ops::instruction == multi_scale::NEONByteDot::ASIMD)
+                            {
+                                // Bound baseline ASIMD register pressure across eight expanded groups.
+#pragma GCC unroll 1
+                                for (int group = 0; group < 8; ++group)
+                                    consume<Ops>(vld1q_s8(reinterpret_cast<const std::int8_t *>(unit + group * 256 + column * 4)),
+                                        block, group, low);
+                            }
                             else
                             {
 #pragma GCC unroll 8
@@ -836,15 +835,15 @@ namespace llaminar2::cpu::native_quantised
                             else
                             {
                                 scale0 = kPowerOfTwoBF16Scales<Map>
-                                    ? Ops::bf16(weights_.admittedScales(chunk_, block) + column)
-                                    : Ops::half(weights_.admittedScales(chunk_, block) + column);
+                                    ? Ops::bf16(weights_.admittedPerBlockPrimary<Physical, WithMinimum>(chunk_, block) + column)
+                                    : Ops::half(weights_.admittedPerBlockPrimary<Physical, WithMinimum>(chunk_, block) + column);
                                 if constexpr (Physical == Encoding::IQ3SExpandedSourceScale)
                                 {
-                                    const I metadata = Ops::words(weights_.admittedMins(chunk_, block) + column);
+                                    const I metadata = Ops::words(weights_.admittedPerBlockSecondary<Physical>(chunk_, block) + column);
                                     scale0 = scale0 * __builtin_convertvector(metadata * 2 + 1, F);
                                 }
                                 else if constexpr (WithMinimum)
-                                    scale1 = Ops::half(weights_.admittedMins(chunk_, block) + column);
+                                    scale1 = Ops::half(weights_.admittedPerBlockSecondary<Physical>(chunk_, block) + column);
                             }
 #pragma GCC unroll 4
                             for (std::size_t row = 0; row < Rows; ++row)
@@ -1039,15 +1038,15 @@ namespace llaminar2::cpu::native_quantised
                         else
                         {
                             scale0 = kPowerOfTwoBF16Scales<Map>
-                                ? Ops::bf16(weights_.admittedScales(chunk_, block) + column)
-                                : Ops::half(weights_.admittedScales(chunk_, block) + column);
+                                ? Ops::bf16(weights_.admittedPerBlockPrimary<Physical, WithMinimum>(chunk_, block) + column)
+                                : Ops::half(weights_.admittedPerBlockPrimary<Physical, WithMinimum>(chunk_, block) + column);
                             if constexpr (Physical == Encoding::IQ3SExpandedSourceScale)
                             {
-                                const I metadata = Ops::words(weights_.admittedMins(chunk_, block) + column);
+                                const I metadata = Ops::words(weights_.admittedPerBlockSecondary<Physical>(chunk_, block) + column);
                                 scale0 = scale0 * __builtin_convertvector(metadata * 2 + 1, F);
                             }
                             else if constexpr (WithMinimum)
-                                scale1 = Ops::half(weights_.admittedMins(chunk_, block) + column);
+                                scale1 = Ops::half(weights_.admittedPerBlockSecondary<Physical>(chunk_, block) + column);
                         }
 #pragma GCC unroll 4
                         for (std::size_t row = 0; row < Rows; ++row)

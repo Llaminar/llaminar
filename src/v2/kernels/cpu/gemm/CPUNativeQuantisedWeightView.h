@@ -325,7 +325,7 @@ namespace llaminar2::cpu::native_quantised
         { return encoding == CPUNativeQuantisedEncoding::CompactMultiScale; }
         /** @return Whether inline signed weight-sum compensation precedes primary scales. */
         [[nodiscard]] bool usesInlineCompensation() const noexcept
-        { return !usesQ6KNativeDualScale() && !usesCompactMultiScale(); }
+        { return preparedUsesInlineCompensation(encoding, codebook_id); }
         /** @return Borrowed canonical byte root; no source-order mirror exists. */
         [[nodiscard]] const std::uint8_t *interleavedBase() const noexcept { return bytes_.data(); }
         /** @return Exact borrowed publication extent. */
@@ -435,6 +435,23 @@ namespace llaminar2::cpu::native_quantised
          */
         [[nodiscard]] const std::uint16_t *admittedMins(int chunk, int block) const noexcept
         { return reinterpret_cast<const std::uint16_t *>(admittedUnit(chunk, block) + data_stride + (usesInlineCompensation() ? 256 : 128)); }
+
+        /** @return Primary words under an admitted compile-time per-block encoding. */
+        template <CPUNativeQuantisedEncoding Physical, bool WithMinimum>
+        [[nodiscard]] const std::uint16_t *admittedPerBlockPrimary(int chunk, int block) const noexcept
+        {
+            // The expanded scale plane is always last (symmetric) or just
+            // before the minimum. Thus Q8_0 needs no hot-loop format test.
+            const int offset = Physical == CPUNativeQuantisedEncoding::ExpandedInt8
+                ? interleaved_block_stride - (WithMinimum ? 256 : 128)
+                : preparedDataStride(Physical, 0) + (preparedUsesInlineCompensation(Physical, 0) ? 128 : 0);
+            return reinterpret_cast<const std::uint16_t *>(admittedUnit(chunk, block) + offset);
+        }
+
+        /** @return Secondary words under an admitted compile-time per-block encoding. */
+        template <CPUNativeQuantisedEncoding Physical>
+        [[nodiscard]] const std::uint16_t *admittedPerBlockSecondary(int chunk, int block) const noexcept
+        { return admittedPerBlockPrimary<Physical, true>(chunk, block) + 64; }
 
         /** @brief Borrow one 16-column/four-byte interleaving group.
          * @param chunk Physical output chunk.

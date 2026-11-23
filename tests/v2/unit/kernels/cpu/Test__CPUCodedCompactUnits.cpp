@@ -26,6 +26,7 @@
 #include "kernels/common/MoEProjectionNumericalContract.h"
 #include "kernels/cpu/gemm/CPUNativeQuantisedCodedMetadata.h"
 #include "kernels/cpu/gemm/CPUNativeQuantisedMultiScaleKernels.h"
+#include "kernels/cpu/gemm/CPUNativeQuantisedGemv.h"
 #include "kernels/cpu/gemm/CPUNativeQuantisedWeightPacker.h"
 #if defined(__aarch64__)
 #include "kernels/cpu/gemm/CPUNativeNEONPreparedProjection.h"
@@ -214,7 +215,7 @@ namespace llaminar2::test
     TEST(CPUCodedCompactUnits, SimdCodeReadersEqualScalarPlaneReaders)
     {
         std::mt19937 rng(5);
-        for (std::uint8_t codebook : {7, 9, 10, 11, 13, 17})
+        for (std::uint8_t codebook : {5, 7, 9, 10, 11, 13, 17})
         {
             std::vector<std::uint8_t> planes(coded_metadata::codeBlockBytes(codebook) + 16, 0);
             std::vector<std::uint32_t> expected(64);
@@ -231,6 +232,7 @@ namespace llaminar2::test
                 switch (codebook)
                 {
                 case 7: code = L::code<7>(planes.data(), column); break;
+                case 5: code = L::code<5>(planes.data(), column); break;
                 case 9: code = L::code<9>(planes.data(), column); break;
                 case 10: code = L::code<10>(planes.data(), column); break;
                 case 11: code = L::code<11>(planes.data(), column); break;
@@ -467,6 +469,170 @@ namespace llaminar2::test
                     run.template operator()<2>();
                     run.template operator()<3>();
                     run.template operator()<4>();
+    namespace
+    {
+        /** @return Test factories for every compensation-free source, including IQ4_XS's independent metadata. */
+        std::vector<CompactSource> compensationFreeSources()
+        {
+            return {
+                {"Q4_0", 0, 18, [](auto s, auto r) { return Factory::createQ4_0Random(s, r); }},
+                {"Q4_1", 5, 20, [](auto s, auto r) { return Factory::createQ4_1Random(s, r); }},
+                {"Q4_K", 5, 20, [](auto s, auto r) { return Factory::createQ4_KRandom(s, r); }},
+                {"IQ4_NL", 4, 18, [](auto s, auto r) { return Factory::createIQ4_NLRandom(s, r); }},
+                {"IQ4_XS", 4, 0, [](auto s, auto r) { return Factory::createIQ4_XSRandom(s, r); }},
+                {"MXFP4", 25, 18, [](auto s, auto r) { return Factory::createMXFP4Random(s, r); }},
+                {"Q8_0", 19, 34, [](auto s, auto r) { return Factory::createQ8_0Random(s, r); }},
+            };
+        }
+
+        /** @brief Replay the previous per-block source factors and signed-dot program, independent of resident bytes. */
+        float previousBlock(const IINT8Unpackable &source, const CPUNativeQuantisedPackedWeights &packed,
+            const Q8_1Block &a, int column, int block, float acc)
+        {
+            std::uint8_t payload[32]{};
+            std::uint16_t primary{}, secondary{};
+            source.packVnniBlock(VnniPackContext{.N=1, .K=packed.K,
+                .blocks_per_row=packed.blocks_per_row, .payload_bytes=packed.payload_bytes,
+                .payload_array=payload, .scales_array=&primary, .mins_array=&secondary,
+                .destination_block_origin=block, .destination_block_count=1,
+                .primary_layout=packed.codebook_id == 25 ? VnniPrimaryScaleLayout::PowerOfTwoBF16Words
+                                                        : VnniPrimaryScaleLayout::FP16Words}, column, 0, block);
+            std::int8_t weight[32];
+            if (packed.codebook_id == 19)
+                std::memcpy(weight, payload, sizeof(weight));
+            else
+                decode_native_block(packed.codebook_id, payload, weight);
+            // Old x86 formula, even for formats whose optimized leaf already used unsigned B.
+            int biased_dot = 0, sum_weights = 0;
+            for (int k = 0; k < 32; ++k)
+            {
+                biased_dot += (128 + int(a.qs[k])) * weight[k];
+                sum_weights += weight[k];
+            }
+            const float dot = float(biased_dot - 128 * sum_weights);
+            const float as = nativeQuantisedFP16ScaleToFP32(a.d);
+            const float ws = packed.codebook_id == 25 ? std::bit_cast<float>(std::uint32_t{primary} << 16)
+                : packed.usesNibbleLUTSourceScale() ? device_fp32_contract::multiply(fp16_to_fp32(primary), float(int(secondary) - 32))
+                : fp16_to_fp32(primary);
+            using device_fp32_contract::multiply;
+            using device_fp32_contract::add;
+            const float scaled = multiply(as, ws);
+            const float minimum = fp16_to_fp32(secondary);
+            if (packed.numerical_policy == CPUProjectionNumericalPolicy::BackendNative)
+            {
+                const float result = std::fma(scaled, dot, acc);
+                return packed.is_asymmetric ? std::fma(multiply(as, float(a.sum_qs)), minimum, result) : result;
+            }
+            const float main = multiply(scaled, dot);
+            return add(acc, packed.is_asymmetric ? add(main, multiply(multiply(as, minimum), float(a.sum_qs))) : main);
+        }
+    } // namespace
+
+    /** The resident layout pays only for payload, source/staged factors and live superblock headers. */
+    TEST(CPUCompensationFreeUnits, PreparedBytesMatchCompensationFreeLayout)
+    {
+        for (const auto &source : compensationFreeSources())
+        {
+            const auto tensor = source.make({67, 512}, 9);
+            SCOPED_TRACE(source.name);
+            CPUNativeQuantisedPackedWeights packed;
+            ASSERT_TRUE(packWeightsCPUNativeQuantised(tensor.get(), packed));
+            EXPECT_FALSE(packed.usesInlineCompensation());
+            if (source.file_bytes_per_32 != 0)
+                EXPECT_EQ(packed.native_interleaved.size(), source.file_bytes_per_32 * 128 * 16);
+            if (source.name == "Q4_1")
+                EXPECT_FALSE(packed.superblockCoded());
+        }
+    }
+
+    /** The two unsigned dot programs reconstruct every signed product, including signed minima. */
+    TEST(CPUCompensationFreeUnits, WeightBiasAndActivationBiasProduceIdenticalIntegerDots)
+    {
+        for (int a = -128; a <= 127; ++a)
+            for (int w = -128; w <= 127; ++w)
+            {
+                const int previous = (a + 128) * w - 128 * w;
+                const int next = a * (w + 128) - 128 * a;
+                ASSERT_EQ(previous, next);
+#if defined(__AVX2__)
+                const auto dot = dotUnsignedWeightsAVX2(_mm256_setzero_si256(), _mm256_set1_epi8(static_cast<char>(w + 128)),
+                    _mm256_set1_epi8(static_cast<char>(a)));
+                ASSERT_EQ(_mm256_extract_epi32(dot, 0) - 4 * 128 * a, 4 * previous);
+#endif
+            }
+    }
+
+    /** Real SIMD leaves preserve old projection bytes at M=1..4, including a partial N tile and ordered K folds. */
+    TEST(CPUCompensationFreeUnits, SimdProjectionMatchesPreviousPerBlockProgram)
+    {
+        constexpr int N = 67, K = 512, Blocks = K / 32;
+        std::array<Q8_1Block, 4 * Blocks> activation{};
+        std::mt19937 rng(352);
+        for (auto &a : activation)
+        {
+            a.d = 0x2800 + (rng() % 1024);
+            for (auto &v : a.qs)
+            {
+                v = static_cast<std::int8_t>(int(rng() % 256) - 128);
+                a.sum_qs += v;
+            }
+        }
+        for (const auto &source : compensationFreeSources())
+        {
+            const auto tensor = source.make({N, K}, 23 + source.codebook);
+            const auto *unpackable = IINT8Unpackable::fromTensor(tensor.get());
+            ASSERT_NE(unpackable, nullptr);
+            CPUNativeQuantisedPackedWeights packed;
+            ASSERT_TRUE(packWeightsCPUNativeQuantised(tensor.get(), packed));
+            for (const auto policy : {CPUProjectionNumericalPolicy::BackendNative, CPUProjectionNumericalPolicy::GPUAlignedExpert})
+            {
+                packed.numerical_policy = policy;
+                const int partitions = policy == CPUProjectionNumericalPolicy::GPUAlignedExpert
+                    ? MoEProjectionNumericalContract::orderedKPartitionsForWidth(K) : 1;
+                const int span = (Blocks + partitions - 1) / partitions;
+                for (int rows = 1; rows <= 4; ++rows)
+                {
+                    std::array<float, 4 * N> output{};
+                    SCOPED_TRACE(source.name + " rows=" + std::to_string(rows) + " policy=" + std::to_string(int(policy)));
+#if defined(__aarch64__) && defined(__ARM_NEON)
+                    const auto run = [&]<std::size_t Rows>() {
+                        const auto view = packed.readView();
+                        std::array<std::span<const Q8_1Block>, Rows> inputs{};
+                        for (std::size_t row = 0; row < Rows; ++row)
+                            inputs[row] = std::span(activation).subspan(row * Blocks, Blocks);
+                        for (int chunk = 0; chunk < 2; ++chunk)
+                        {
+                            std::array<std::span<float>, Rows> outputs{};
+                            for (std::size_t row = 0; row < Rows; ++row)
+                                outputs[row] = std::span(output).subspan(row * N + chunk * 64, std::min(64, N - chunk * 64));
+                            CPUNativeNEONProjectionTile<Rows>::bind(view, inputs, outputs, chunk).template execute<multi_scale::NEONByteDot::ASIMD>();
+                        }
+                    };
+                    switch (rows)
+                    {
+                    case 1: run.template operator()<1>(); break;
+                    case 2: run.template operator()<2>(); break;
+                    case 3: run.template operator()<3>(); break;
+                    case 4: run.template operator()<4>(); break;
+                    }
+#else
+                    std::array<float, 4 * Blocks * 128> scratch{};
+                    gemm_native_quantised_preq(packed, activation.data(), output.data(), scratch, rows, N);
+#endif
+                    for (int row = 0; row < rows; ++row)
+                        for (int column = 0; column < N; ++column)
+                        {
+                            float expected = 0.0f;
+                            for (int part = 0; part < partitions; ++part)
+                            {
+                                float partial = 0.0f;
+                                for (int block = part * span; block < std::min((part + 1) * span, Blocks); ++block)
+                                    partial = previousBlock(*unpackable, packed, activation[row * Blocks + block], column, block, partial);
+                                expected = part == 0 ? partial : device_fp32_contract::add(expected, partial);
+                            }
+                            EXPECT_EQ(std::bit_cast<std::uint32_t>(output[row * N + column]), std::bit_cast<std::uint32_t>(expected))
+                                << "row=" << row << " column=" << column;
+                        }
                 }
             }
         }

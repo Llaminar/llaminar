@@ -162,6 +162,8 @@ namespace llaminar2::cpu::native_quantised
         const CPUNativeQuantisedPackedWeights &meta,
         uint8_t *workspace)
     {
+        if (!meta.usesInlineCompensation())
+            throw std::invalid_argument("Legacy deferred CPU repack requires per-block weight-sum compensation metadata");
         if (meta.usesQ6KNativeDualScale() || meta.usesCompactMultiScale() ||
             meta.usesNibbleLUTSourceScale() || meta.usesIQ3SExpandedSourceScale())
         {
@@ -637,9 +639,10 @@ namespace llaminar2::cpu::native_quantised
                         auto *const compensation =
                             reinterpret_cast<int16_t *>(
                                 destination + out.data_stride);
+                        const int comp_bytes = out.usesInlineCompensation() ? 128 : 0;
                         auto *const inline_scales =
                             reinterpret_cast<uint16_t *>(
-                                destination + out.data_stride + 128);
+                                destination + out.data_stride + comp_bytes);
                         if (source_column_valid)
                         {
                             int32_t sum = 0;
@@ -651,14 +654,14 @@ namespace llaminar2::cpu::native_quantised
                             {
                                 sum += values[value];
                             }
-                            compensation[column] =
-                                static_cast<int16_t>(sum);
+                            if (comp_bytes)
+                                compensation[column] = static_cast<int16_t>(sum);
                             inline_scales[column] = out.usesIQ3SExpandedSourceScale()
                                 ? source_bases[local_kb] : fp32_to_fp16(scales[local_kb]);
                         }
                         else
                         {
-                            compensation[column] = 0;
+                            if (comp_bytes) compensation[column] = 0;
                             inline_scales[column] = 0;
                         }
 
@@ -666,7 +669,7 @@ namespace llaminar2::cpu::native_quantised
                         {
                             auto *const inline_mins =
                                 reinterpret_cast<uint16_t *>(
-                                    destination + out.data_stride + 256);
+                                    destination + out.data_stride + comp_bytes + 128);
                             inline_mins[column] = source_column_valid
                                 ? (out.usesIQ3SExpandedSourceScale()
                                     ? source_coefficients[local_kb] : fp32_to_fp16(mins[local_kb])) : 0;
@@ -1024,7 +1027,8 @@ namespace llaminar2::cpu::native_quantised
                     // Write comp inline after group data
                     size_t meta_idx = (size_t)chunk * blocks_per_row * 64 + (size_t)kb * 64;
                     int16_t *inline_comp = reinterpret_cast<int16_t *>(interleaved_dst + 2048);
-                    for (int col = 0; col < 64; ++col)
+                    const int comp_bytes = out.usesInlineCompensation() ? 128 : 0;
+                    if (comp_bytes) for (int col = 0; col < 64; ++col)
                     {
                         if (col < n_cols)
                         {
@@ -1043,13 +1047,13 @@ namespace llaminar2::cpu::native_quantised
                     }
 
                     // Write scales inline after comp
-                    uint16_t *inline_scales = reinterpret_cast<uint16_t *>(interleaved_dst + 2048 + 128);
+                    uint16_t *inline_scales = reinterpret_cast<uint16_t *>(interleaved_dst + 2048 + comp_bytes);
                     std::memcpy(inline_scales, &temp_scales[meta_idx], 64 * sizeof(uint16_t));
 
                     // Write mins inline after scales (if asymmetric)
                     if (out.is_asymmetric || out.usesNibbleLUTSourceScale())
                     {
-                        uint16_t *inline_mins = reinterpret_cast<uint16_t *>(interleaved_dst + 2048 + 256);
+                        uint16_t *inline_mins = reinterpret_cast<uint16_t *>(interleaved_dst + 2048 + comp_bytes + 128);
                         std::memcpy(inline_mins, &temp_mins[meta_idx], 64 * sizeof(uint16_t));
                     }
                 }

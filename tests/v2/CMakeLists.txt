@@ -10636,6 +10636,13 @@ add_v2_test(V2_Integration_CPUCodedFileDensityQ6IQ4
     LABELS "V2;Integration;CPU;DeviceFree;NativeQuantised;Memory;ByteExact;Regression;ProductionTestPreflight"
     MPI_PROCS 1 NO_MODELS)
 
+add_v2_test(V2_Integration_CPUCompensationFreeUnits
+    COMMAND $<TARGET_FILE:v2_unit_cpu_coded_compact_units>
+        --gtest_filter=CPUCompensationFreeUnits.*:CPUCodedCompactUnits.SimdReconstructionEqualsCodecWordsExhaustively
+    LABELS "V2;Integration;CPU;DeviceFree;NativeQuantised;Memory;ByteExact;Regression"
+    MPI_PROCS 1 NO_MODELS)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUCompensationFreeUnits)
+
 # Original Q6 source factors remain exact without changing Q8 GEMM inputs.
 add_executable(v2_test_q6_source_scale unit/kernels/Test__Q6SourceScale.cpp)
 target_link_libraries(v2_test_q6_source_scale
