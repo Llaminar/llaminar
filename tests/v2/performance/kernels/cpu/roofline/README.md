@@ -155,6 +155,36 @@ routes the corresponding ranges were 24.94–29.54 and 41.18–46.69 µs. Both
 transports matched every output byte and live extent, including unequal and
 empty peers. The MPI path is the control for further overlap work.
 
+### Compact five-bit CPU operands
+
+The experimental AVX-512 reader stores the four-bit payload and a separate
+plane containing the high bits. It reads 1,536 bytes per N64/K32 tile,
+including the original scales and minima. The expanded unsigned reader
+requests 2,304 bytes for the same arithmetic. Both paths preserve the
+ordered K partitions and produce identical FP32 bytes.
+
+The fixture alternated both readers over 48 distinct weight frames of
+eight routes, using 28 pinned physical workers per socket. The compact
+weight set totals 236 MB in each geometry. The measured interval includes
+the workshare completion edge between frames. A single-frame comparison
+with cache reuse took 29–39% longer with the initial compact reader.
+
+The register-only revision retains all 32 `vpdpbusd` instructions per
+K32 iteration and removes vector stack accesses. It passed the exact
+comparison on both sockets in both orders. The reference fraction uses
+one read of the compact operands and the independently measured NUMA
+DRAM bandwidth for that socket.
+
+| Source and projection | NUMA node | Compact latency, µs | Latency reduction | Requested-byte reference fraction |
+| --- | ---: | ---: | ---: | ---: |
+| Q5_1 Down N2560/K320 | 0 | 50.28–51.49 | 35.1–37.3% | 91.8–94.0% |
+| Q5_1 Down N2560/K320 | 1 | 52.33–53.76 | 36.6–39.1% | 82.6–84.9% |
+| Q5_K Gate/Up N320/K2560 | 0 | 54.88–55.77 | 31.4–33.1% | 84.7–86.1% |
+| Q5_K Gate/Up N320/K2560 | 1 | 57.99–58.99 | 31.8–33.7% | 75.3–76.6% |
+
+The measurements cover the original five-bit projection arithmetic with
+experimental packing. The complete hybrid model uses the expanded format.
+
 ## NativeQuantised source matrix
 
 Use the Release `v2_perf_cpu_moe_expert_verifier_rows` fixture pinned to
