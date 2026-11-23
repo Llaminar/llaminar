@@ -247,6 +247,7 @@ namespace llaminar2::test
     /** SIMD reconstruction equals widening the codec's staged words for every derived-scale compact format. */
     TEST(CPUCodedCompactUnits, SimdReconstructionEqualsCodecWordsExhaustively)
     {
+        expectReconstructionMatchesCodec<5>();
         expectReconstructionMatchesCodec<7>();
         expectReconstructionMatchesCodec<9>();
         expectReconstructionMatchesCodec<10>();

@@ -384,9 +384,9 @@ namespace llaminar2::cpu::native_quantised::coded_metadata
             out.emin_low = L::staged(-dmin * L::toFloat((code >> 4) & 15));
             out.emin_high = L::staged(-dmin * L::toFloat((code >> 12) & 15));
         }
-        else if constexpr (Codebook == 7)
+        else if constexpr (Codebook == 5 || Codebook == 7)
         {
-            // Q5_K: one 6-bit scale and one 6-bit additive minimum per block.
+            // Q4_K/Q5_K: one 6-bit scale and one 6-bit additive minimum per block.
             const F dmin = L::half(word >> 16);
             out.primary = L::staged(d * L::toFloat(code & 63));
             out.secondary = L::staged(-dmin * L::toFloat((code >> 6) & 63));
