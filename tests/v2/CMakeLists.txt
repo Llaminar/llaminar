@@ -28491,6 +28491,13 @@ add_v2_test(V2_Integration_ExpertTierWeightDensityAdmission
     NO_MODELS)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ExpertTierWeightDensityAdmission)
 
+# Ordinary Q5 has no file-density GPU migration converter yet.
+add_v2_test(V2_Unit_NativeQ5GPUStreamAdmission
+    COMMAND $<TARGET_FILE:v2_test_expert_tier_weight_stream>
+        --gtest_filter=ExpertTierWeightStream.NativeQ5RejectsBothGPUStreamDirections
+    LABELS "V2;Unit;CPU;DeviceFree;NativeQuantised;Movement;Regression;ProductionTestPreflight"
+    MPI_PROCS 1 NO_MODELS NO_MPI)
+
 # Test: device-free arbitrary-tier composite wave protocol
 add_executable(v2_test_moe_overlay_tier_migration_transport
     unit/moe/Test__MoEOverlayTierMigrationTransport.cpp

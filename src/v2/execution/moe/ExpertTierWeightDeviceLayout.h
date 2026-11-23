@@ -179,7 +179,7 @@ namespace llaminar2
                codedSourceScaleStreamRejection(cpu_encoding) ||
                (cpu_encoding == cpu::native_quantised::CPUNativeQuantisedEncoding::CompactMultiScale &&
                 requiresCodedQ5KIQ3SMigrationSlots(cpu_codebook_id, cpu_is_superblock != 0)) ||
-               requiresDensityAwareExpertTierSlots(cpu_encoding, cpu_codebook_id) ||
+                requiresDensityAwareExpertTierSlots(cpu_encoding, cpu_codebook_id) ||
                cpu_data_stride!=cpu::native_quantised::preparedDataStride(cpu_encoding,cpu_codebook_id) ||
                cpu_block_stride!=cpu::native_quantised::preparedInterleavedBlockStride(cpu_encoding,cpu_is_asymmetric!=0,cpu_codebook_id))return false;
             const uint64_t expected=((uint64_t(N)+wire_columns_per_unit-1)/wire_columns_per_unit)*blocks_per_row;
@@ -278,7 +278,8 @@ namespace llaminar2
                 (N_padded % 64) != 0 || N_padded != ((N + 63) / 64) * 64 ||
                 !cpu::native_quantised::isKnownPreparedEncoding(cpu_encoding) ||
                 codedSourceScaleStreamRejection(cpu_encoding) ||
-               requiresDensityAwareExpertTierSlots(cpu_encoding, cpu_codebook_id) ||
+                requiresDensityAwareExpertTierSlots(cpu_encoding, cpu_codebook_id) ||
+                cpu::native_quantised::isQ5NativeSingleScaleSource(gpu_source_codebook_id, gpu_source_is_superblock != 0) ||
                 cpu_is_asymmetric>1 || cpu_is_superblock>1 || gpu_source_is_superblock>1 ||
                 gpu_is_asymmetric>1 || gpu_has_emins>1 ||
                 cpu_N<=0 || cpu_K<=0 || gpu_N<=0 || gpu_K<=0 || cpu_K%32 || gpu_K%32 ||
@@ -383,6 +384,8 @@ namespace llaminar2
                 return false;
             switch (cpu_encoding)
             {
+            case Encoding::Q5NativeSingleScale:
+                return false; // Native Q5 requires file-density GPU slots and an explicit converter.
             case Encoding::IQ3SExpandedSourceScale:
                 return cpu_codebook_id == 11 && cpu_is_superblock == 1 &&
                        gpu_codebook_id == 11 && gpu_payload_bytes_per_block == 13 &&

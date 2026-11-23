@@ -75,7 +75,7 @@ namespace llaminar2
             projection.N = 70;
             projection.K = 96;
             projection.blocks_per_row = 3;
-            // Codebook 23 is a normalized destination for a Q5_1-derived
+            // Codebook 23 is a normalized destination for a Q5_K-derived
             // asymmetric expanded CPU representation, not a GGUF source id.
             projection.source_codebook_id =
                 codebook == kNativeQuantisedExpandedInt8MinCodebook
@@ -187,6 +187,61 @@ namespace llaminar2
             }
         }
 
+        /** @test Ordinary Q5 weights must not enter the expanded GPU migration ABI in either direction. */
+        TEST(ExpertTierWeightStream, NativeQ5RejectsBothGPUStreamDirections)
+        {
+            using namespace cpu::native_quantised;
+            const std::string reason = "require file-density GPU migration slots and a native Q5 converter";
+            for (const auto *format : {&native_quantised_formats::Q5_0, &native_quantised_formats::Q5_1})
+            {
+                SCOPED_TRACE(format->codebook_id);
+                auto gpu = makeProjection(format->codebook_id, format->payload_bytes, format->is_asymmetric, false);
+                ASSERT_TRUE(gpu.valid());
+                CPUNativeQuantisedPackedWeights cpu;
+                std::string error;
+                EXPECT_FALSE(gpuToCpuExpertPackedReference(gpu, cpu, &error));
+                EXPECT_NE(error.find(reason), std::string::npos) << error;
+                EXPECT_TRUE(cpu.native_interleaved.empty());
+                try
+                {
+                    (void)makeGpuToCpuExpertTierWeightStreamManifest(*format, gpu.N, gpu.K, 101, 0, 7,
+                        ExpertTierWeightProjection::Gate, 1);
+                    ADD_FAILURE() << "Native Q5 demotion published a manifest";
+                }
+                catch (const std::invalid_argument &failure)
+                {
+                    EXPECT_NE(std::string(failure.what()).find(reason), std::string::npos) << failure.what();
+                }
+
+                cpu.N = gpu.N;
+                cpu.K = gpu.K;
+                cpu.N_padded = 128;
+                cpu.blocks_per_row = gpu.blocks_per_row;
+                cpu.codebook_id = format->codebook_id;
+                cpu.payload_bytes = format->payload_bytes;
+                cpu.is_asymmetric = format->is_asymmetric;
+                cpu.encoding = preparedEncodingForSource(*format);
+                cpu.data_stride = preparedDataStride(cpu.encoding, cpu.codebook_id);
+                cpu.interleaved_block_stride = preparedInterleavedBlockStride(cpu.encoding, cpu.is_asymmetric, cpu.codebook_id);
+                cpu.native_interleaved.resize(cpu.preparedBytes(), 0);
+                cpu.sealPublication();
+                HostGpuExpertPackedProjection returned;
+                error.clear();
+                EXPECT_FALSE(cpuToGpuExpertPackedReference(cpu, returned, &error));
+                EXPECT_NE(error.find(reason), std::string::npos) << error;
+                EXPECT_TRUE(returned.payload.empty());
+                try
+                {
+                    (void)makeCpuToGpuExpertTierWeightStreamManifest(cpu, 101, 0, 7, ExpertTierWeightProjection::Gate, 1);
+                    ADD_FAILURE() << "Native Q5 promotion published a manifest";
+                }
+                catch (const std::invalid_argument &failure)
+                {
+                    EXPECT_NE(std::string(failure.what()).find(reason), std::string::npos) << failure.what();
+                }
+            }
+        }
+
         /** @test Real demotion publications retain native view geometry for every source. */
         TEST(ExpertTierWeightStream, PreparedReadViewAcceptsAllMigratedSourceFormats)
         {
@@ -198,6 +253,8 @@ namespace llaminar2
                 if (source.metadata->is_superblock &&
                     (source.metadata->codebook_id == 7 || source.metadata->codebook_id == 11))
                     continue;
+                if (cpu::native_quantised::isQ5NativeSingleScaleSource(source.metadata->codebook_id, source.metadata->is_superblock))
+                    continue; // NativeQ5RejectsBothGPUStreamDirections owns these unadmitted edges.
                 const auto physical = migrationStableDeviceVnniFormat(*source.metadata);
                 auto gpu = makeProjection(physical.codebook_id, physical.payload_bytes_per_block,
                     physical.is_asymmetric, source.metadata->is_superblock);
@@ -500,7 +557,7 @@ namespace llaminar2
                     kNativeQuantisedExpandedInt8MinCodebook,
                     32,
                     true,
-                    false)));
+                    true)));
 
         /**
          * @test Native MXFP4 GPU<->CPU reference round trip with an odd block count,
@@ -682,6 +739,8 @@ namespace llaminar2
                  native_quantised_formats::kAllSourceFormats)
             {
                 ASSERT_NE(entry.metadata, nullptr) << entry.quant_type;
+                if (cpu::native_quantised::isQ5NativeSingleScaleSource(entry.metadata->codebook_id, entry.metadata->is_superblock))
+                    continue; // NativeQ5RejectsBothGPUStreamDirections owns these unadmitted edges.
                 const auto manifest =
                     makeGpuToCpuExpertTierWeightStreamManifest(
                         *entry.metadata,

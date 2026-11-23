@@ -107,6 +107,9 @@ namespace llaminar2
                    codebook == kNativeQuantisedMXFP4Codebook;
         }
 
+        constexpr auto kNativeQ5GpuStreamUnsupported =
+            "Native Q5_0/Q5_1 CPU units require file-density GPU migration slots and a native Q5 converter";
+
         /**
          * @brief Derive the only lossless GPU execution representation for a
          * prepared CPU projection.
@@ -132,8 +135,12 @@ namespace llaminar2
         {
             // None of the currently normalized stream formats uses Q2_K emins.
             has_emins = false;
+            if (cpu::native_quantised::isQ5NativeSingleScaleSource(cpu.codebook_id, cpu.is_superblock))
+                return reject(error, kNativeQ5GpuStreamUnsupported);
             switch (cpu.encoding)
             {
+            case CPUEncoding::Q5NativeSingleScale:
+                return reject(error, kNativeQ5GpuStreamUnsupported);
             case CPUEncoding::CompactMultiScale:
             {
                 const auto *format = native_quantised_formats::forSourceIdentity(
@@ -1118,6 +1125,8 @@ namespace llaminar2
             cpu::native_quantised::preparedEncodingForSource(source_format);
         if (requiresDensityAwareExpertTierSlots(cpu_encoding, source_format.codebook_id))
             throw std::invalid_argument(kDensityAwareExpertTierSlotsRequired);
+        if (cpu_encoding == CPUEncoding::Q5NativeSingleScale)
+            throw std::invalid_argument(kNativeQ5GpuStreamUnsupported);
         ExpertTierWeightStreamManifest manifest;
         manifest.source_packing =
             ExpertTierWeightPacking::GpuSeparatedNativeQuantised;
@@ -1528,6 +1537,8 @@ namespace llaminar2
             return false;
         if (requiresCodedQ5KIQ3SMigrationSlots(gpu.source_codebook_id, gpu.is_superblock))
             return reject(error, kCodedQ5KIQ3SMigrationDiagnostic);
+        if (cpu::native_quantised::isQ5NativeSingleScaleSource(gpu.source_codebook_id, gpu.is_superblock))
+            return reject(error, kNativeQ5GpuStreamUnsupported);
         if (!cpu::native_quantised::is_payload_decodable(gpu.codebook_id) &&
             gpu.codebook_id != kNativeQuantisedIQ4XSSourceScaleCodebook &&
             !hasCompactMultiScaleVnniPayload(gpu.codebook_id) && gpu.codebook_id != 8 &&
