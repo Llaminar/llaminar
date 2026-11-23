@@ -3823,6 +3823,22 @@ namespace llaminar2::cpu::native_quantised
     }
 
     /**
+     * @brief Store a terminal sixteen-column FP32 vector within the caller's row.
+     * @param destination Final row for this 64-column chunk.
+     * @param columns Live width of the chunk.
+     * @param offset Column offset of the vector within the chunk.
+     * @param value Sixteen terminal values in increasing column order.
+     */
+    inline void storeNativeQuantisedLiveAVX512(float *destination, int columns, int offset, __m512 value)
+    {
+        const int live = columns - offset;
+        if (live >= 16)
+            _mm512_storeu_ps(destination + offset, value);
+        else if (live > 0)
+            _mm512_mask_storeu_ps(destination + offset, static_cast<__mmask16>((1u << live) - 1u), value);
+    }
+
+    /**
      * @brief Execute the existing two-row tile with a fixed integer operand domain.
      * @tparam SumPairs Preserve the existing optional terminal row-pair addition.
      * @tparam Domain Canonical signed or nonnegative five-bit coefficients.
@@ -4043,14 +4059,25 @@ namespace llaminar2::cpu::native_quantised
             }
         }
 
-        if constexpr(SumPairs) _mm512_storeu_ps(C_row0,_mm512_add_ps(fp0_0,fp1_0)); else _mm512_storeu_ps(C_row0,fp0_0);
-        if constexpr(SumPairs) _mm512_storeu_ps(C_row0 + 16,_mm512_add_ps(fp0_1,fp1_1)); else _mm512_storeu_ps(C_row0 + 16,fp0_1);
-        if constexpr(SumPairs) _mm512_storeu_ps(C_row0 + 32,_mm512_add_ps(fp0_2,fp1_2)); else _mm512_storeu_ps(C_row0 + 32,fp0_2);
-        if constexpr(SumPairs) _mm512_storeu_ps(C_row0 + 48,_mm512_add_ps(fp0_3,fp1_3)); else _mm512_storeu_ps(C_row0 + 48,fp0_3);
-        if constexpr(!SumPairs) _mm512_storeu_ps(C_row1,fp1_0);
-        if constexpr(!SumPairs) _mm512_storeu_ps(C_row1 + 16,fp1_1);
-        if constexpr(!SumPairs) _mm512_storeu_ps(C_row1 + 32,fp1_2);
-        if constexpr(!SumPairs) _mm512_storeu_ps(C_row1 + 48,fp1_3);
+        if constexpr (SumPairs)
+        {
+            const int columns = packed.N - chunk * 64;
+            storeNativeQuantisedLiveAVX512(C_row0, columns, 0, _mm512_add_ps(fp0_0, fp1_0));
+            storeNativeQuantisedLiveAVX512(C_row0, columns, 16, _mm512_add_ps(fp0_1, fp1_1));
+            storeNativeQuantisedLiveAVX512(C_row0, columns, 32, _mm512_add_ps(fp0_2, fp1_2));
+            storeNativeQuantisedLiveAVX512(C_row0, columns, 48, _mm512_add_ps(fp0_3, fp1_3));
+        }
+        else
+        {
+            _mm512_storeu_ps(C_row0, fp0_0);
+            _mm512_storeu_ps(C_row0 + 16, fp0_1);
+            _mm512_storeu_ps(C_row0 + 32, fp0_2);
+            _mm512_storeu_ps(C_row0 + 48, fp0_3);
+            _mm512_storeu_ps(C_row1, fp1_0);
+            _mm512_storeu_ps(C_row1 + 16, fp1_1);
+            _mm512_storeu_ps(C_row1 + 32, fp1_2);
+            _mm512_storeu_ps(C_row1 + 48, fp1_3);
+        }
     }
 
     /**
@@ -5208,14 +5235,25 @@ namespace llaminar2::cpu::native_quantised
                 }
             }
 
-            if constexpr(SumPairs) _mm512_storeu_ps(C_row0 + zbase * 16,_mm512_add_ps(fp0_0,fp1_0)); else _mm512_storeu_ps(C_row0 + zbase * 16,fp0_0);
-            if constexpr(SumPairs) _mm512_storeu_ps(C_row0 + (zbase + 1) * 16,_mm512_add_ps(fp0_1,fp1_1)); else _mm512_storeu_ps(C_row0 + (zbase + 1) * 16,fp0_1);
-            if constexpr(!SumPairs) _mm512_storeu_ps(C_row1 + zbase * 16,fp1_0);
-            if constexpr(!SumPairs) _mm512_storeu_ps(C_row1 + (zbase + 1) * 16,fp1_1);
-            if constexpr(SumPairs) _mm512_storeu_ps(C_row2 + zbase * 16,_mm512_add_ps(fp2_0,fp3_0)); else _mm512_storeu_ps(C_row2 + zbase * 16,fp2_0);
-            if constexpr(SumPairs) _mm512_storeu_ps(C_row2 + (zbase + 1) * 16,_mm512_add_ps(fp2_1,fp3_1)); else _mm512_storeu_ps(C_row2 + (zbase + 1) * 16,fp2_1);
-            if constexpr(!SumPairs) _mm512_storeu_ps(C_row3 + zbase * 16,fp3_0);
-            if constexpr(!SumPairs) _mm512_storeu_ps(C_row3 + (zbase + 1) * 16,fp3_1);
+            if constexpr (SumPairs)
+            {
+                const int columns = packed.N - chunk * 64;
+                storeNativeQuantisedLiveAVX512(C_row0, columns, zbase * 16, _mm512_add_ps(fp0_0, fp1_0));
+                storeNativeQuantisedLiveAVX512(C_row0, columns, (zbase + 1) * 16, _mm512_add_ps(fp0_1, fp1_1));
+                storeNativeQuantisedLiveAVX512(C_row2, columns, zbase * 16, _mm512_add_ps(fp2_0, fp3_0));
+                storeNativeQuantisedLiveAVX512(C_row2, columns, (zbase + 1) * 16, _mm512_add_ps(fp2_1, fp3_1));
+            }
+            else
+            {
+                _mm512_storeu_ps(C_row0 + zbase * 16, fp0_0);
+                _mm512_storeu_ps(C_row0 + (zbase + 1) * 16, fp0_1);
+                _mm512_storeu_ps(C_row1 + zbase * 16, fp1_0);
+                _mm512_storeu_ps(C_row1 + (zbase + 1) * 16, fp1_1);
+                _mm512_storeu_ps(C_row2 + zbase * 16, fp2_0);
+                _mm512_storeu_ps(C_row2 + (zbase + 1) * 16, fp2_1);
+                _mm512_storeu_ps(C_row3 + zbase * 16, fp3_0);
+                _mm512_storeu_ps(C_row3 + (zbase + 1) * 16, fp3_1);
+            }
         }
     }
 

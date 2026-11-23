@@ -571,8 +571,25 @@ namespace llaminar2::cpu::native_quantised
     }
 
     /**
-     * @brief AVX2 2-row INT8 pre-decoded GEMM microkernel for one 64-col chunk.
+     * @brief Store a terminal FP32 vector into its live output columns.
+     * @param destination Final row for the current 64-column chunk.
+     * @param columns Live columns in the chunk.
+     * @param offset Column offset of the vector within the chunk.
+     * @param value Eight terminal values in increasing column order.
      */
+    inline void storeNativeQuantisedLiveAVX2(float *destination, int columns, int offset, __m256 value)
+    {
+        const int live = columns - offset;
+        if (live >= 8)
+            _mm256_storeu_ps(destination + offset, value);
+        else if (live > 0)
+        {
+            const auto mask = _mm256_cmpgt_epi32(_mm256_set1_epi32(live),
+                _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7));
+            _mm256_maskstore_ps(destination + offset, mask, value);
+        }
+    }
+
     /** @brief Dispatch a two-row non-nibble AVX2 verifier chunk. */
     template<bool SumPairs=false>
     inline void gemm_2row_non_nibble_chunk_avx2(
@@ -700,7 +717,8 @@ namespace llaminar2::cpu::native_quantised
                         packed.numerical_policy);
                 }
             }
-            if constexpr(SumPairs) _mm256_storeu_ps(C_row0 + segment * 8,_mm256_add_ps(fp0,fp1));
+            if constexpr (SumPairs)
+                storeNativeQuantisedLiveAVX2(C_row0, packed.N - chunk * 64, segment * 8, _mm256_add_ps(fp0, fp1));
             else { _mm256_storeu_ps(C_row0 + segment * 8, fp0);
             _mm256_storeu_ps(C_row1 + segment * 8, fp1); }
         }

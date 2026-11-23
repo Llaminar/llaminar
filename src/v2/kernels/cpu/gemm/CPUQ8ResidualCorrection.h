@@ -149,13 +149,15 @@ inline void cpuNativeResidualChunk(const CPUNativeQuantisedPackedWeights &packed
    else gemm_2row_non_nibble_chunk_avx2(packed,primary1,residual1,term2,term3,chunk,0,blocks,false);
   }
  }
- for(int column=0;column<64;column+=8)
- {
-  _mm256_store_ps(term0+column,_mm256_add_ps(_mm256_load_ps(term0+column),_mm256_load_ps(term1+column)));
-  if(primary1)_mm256_store_ps(term2+column,_mm256_add_ps(_mm256_load_ps(term2+column),_mm256_load_ps(term3+column)));
- }
- std::copy_n(term0,valid,destination0);
- if(primary1)std::copy_n(term2,valid,destination1);
+ // The final sum owns the caller's row. Mask the last store so a short
+ // output never writes into the following row or the caller's guard bytes.
+ const auto publish = [valid](const float *primary, const float *residual, float *destination) {
+  for (int column = 0; column < valid; column += 8)
+   storeNativeQuantisedLiveAVX2(destination, valid, column,
+    _mm256_add_ps(_mm256_load_ps(primary + column), _mm256_load_ps(residual + column)));
+ };
+ publish(term0, term1, destination0);
+ if (primary1) publish(term2, term3, destination1);
 #endif
 }
 /**
@@ -169,7 +171,7 @@ inline void cpuNativeResidualChunk(const CPUNativeQuantisedPackedWeights &packed
  * @pre Every member of the existing team calls after the same finite-publication
  * check and the publication workshare's implicit barrier. This helper creates
  * no team, allocates no storage and retains the original static workshare.
- * @details Keep dispatch and task-local tail storage outside the publication
+ * @details Keep dispatch and bounded output stores outside the publication
  * template so HC and already-activated inputs execute the same compiled loop.
  * GCC noipa also prevents cloning/constant-propagation variants; other supported
  * compilers retain an explicit noinline boundary whose actual callee identity
@@ -205,20 +207,17 @@ inline void cpuQ8ResidualProjectionWorkshare(const CPUNativeQuantisedPackedWeigh
       output+row*n+chunk*64,second?output+(row+1)*n+chunk*64:nullptr,chunk,valid,avx512);
     continue;
    }
-   alignas(64) float tail0[64],tail1[64];
-   float *destination0=valid==64?output+row*n+chunk*64:tail0;
-   float *destination1=row+1<live?(valid==64?output+(row+1)*n+chunk*64:tail1):nullptr;
+   float *destination0=output+row*n+chunk*64;
 #if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
    if(avx512&&row+1<live) {
     gemm_4row_non_nibble_2z_chunk<true>(packed,primary.data()+row*bpr,residual.data()+row*bpr,
       primary.data()+(row+1)*bpr,residual.data()+(row+1)*bpr,
-      destination0,nullptr,destination1,nullptr,chunk,0,bpr,false);
-    if(valid<64){std::copy_n(tail0,valid,output+row*n+chunk*64);std::copy_n(tail1,valid,output+(row+1)*n+chunk*64);}
+      destination0,nullptr,destination0+n,nullptr,chunk,0,bpr,false);
     continue;
    }
 #endif
    for(auto current=row;current<std::min<std::int64_t>(row+2,live);++current) {
-    float*destination=current==row?destination0:destination1;
+    float*destination=destination0+(current-row)*n;
 #if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
     if(avx512)gemm_2row_non_nibble_chunk<true>(packed,primary.data()+current*bpr,residual.data()+current*bpr,
       destination,nullptr,chunk,0,bpr,false);
@@ -226,7 +225,6 @@ inline void cpuQ8ResidualProjectionWorkshare(const CPUNativeQuantisedPackedWeigh
 #endif
       gemm_2row_non_nibble_chunk_avx2<true>(packed,primary.data()+current*bpr,residual.data()+current*bpr,
         destination,nullptr,chunk,0,bpr,false);
-    if(valid<64)std::copy_n(destination,valid,output+current*n+chunk*64);
    }
 #endif
   }
