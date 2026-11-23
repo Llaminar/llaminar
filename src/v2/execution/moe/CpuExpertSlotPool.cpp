@@ -165,6 +165,7 @@ namespace llaminar2
             case CpuEncoding::Q6KNativeDualScale:
                 packed.payload_bytes = 24;
                 break;
+            case CpuEncoding::Q5NativeSingleScale:
             case CpuEncoding::CompactMultiScale:
                 packed.payload_bytes = source->payload_bytes;
                 break;

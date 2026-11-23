@@ -11,6 +11,7 @@
 
 #include "../../utils/TestTensorFactory.h"
 #include "execution/moe/ExpertTierWeightStream.h"
+#include "../../utils/ExpertTierEncodedColumnOracle.h"
 #include "execution/moe/ExpertTierGpuBlobTransferLane.h"
 #include "execution/moe/CpuExpertSlotPool.h"
 #include "execution/moe/ExpertPreparedMemoryGeometry.h"
@@ -1032,6 +1033,62 @@ namespace llaminar2
                 }
                 lease.reset();
                 EXPECT_EQ(pool->usedSlots(), 0u);
+            }
+        }
+
+        /** @test CPU-only Q5 slots seal the full native tuple after a rectangular copy. */
+        TEST(CpuExpertSlotPool, NativeQ5SlotSealsExactPayloadAndRectangle)
+        {
+            using namespace cpu::native_quantised;
+            for (const auto *format : {&native_quantised_formats::Q5_0, &native_quantised_formats::Q5_1})
+            {
+                SCOPED_TRACE(format->codebook_id);
+                auto pool = CpuExpertSlotPool::createForTest({
+                    .participant_id = 0,
+                    .layer_idx = 0,
+                    .capacity = 1,
+                    .projections = cpuSlotProjectionSpecs({format->codebook_id, false, true}),
+                    .memory_placement = CpuExpertSlotPool::MemoryPlacement::aggregateDomain(),
+                    .perf_device = "cpu-native-q5-slot-test",
+                });
+                auto lease = pool->acquire(3, 9);
+                ASSERT_TRUE(lease.has_value());
+                const auto &gate = lease->projections[0];
+                const auto *packed = gate.engine->exportCPUNativeQuantisedPackedWeights();
+                ASSERT_NE(packed, nullptr);
+                EXPECT_EQ(packed->payload_bytes, 20);
+                ASSERT_EQ(packed->encoding, CPUNativeQuantisedEncoding::Q5NativeSingleScale);
+                EXPECT_FALSE(packed->publicationSealed());
+                const ExpertTierWeightCPUStorageLayout from{
+                    .N = 13, .K = 32, .blocks_per_row = 1,
+                    .cpu_N = 64, .cpu_K = 64, .cpu_first_row = 7, .cpu_first_column = 32,
+                    .cpu_codebook_id = packed->codebook_id, .cpu_is_asymmetric = uint8_t(packed->is_asymmetric),
+                    .cpu_encoding = packed->encoding,
+                    .cpu_data_stride = static_cast<uint32_t>(packed->data_stride),
+                    .cpu_block_stride = static_cast<uint32_t>(packed->interleaved_block_stride),
+                    .unit_count = 1, .maximum_units_per_chunk = 1};
+                auto to = from;
+                to.cpu_first_row = 19;
+                to.cpu_first_column = 0;
+                std::vector<uint8_t> source(from.cpuStorageBytes());
+                for (size_t i = 0; i < source.size(); ++i)
+                    source[i] = static_cast<uint8_t>((i ^ (i >> 8)) * 53 + 7);
+                std::fill(gate.destination_bytes.begin(), gate.destination_bytes.end(), uint8_t{0});
+                const std::vector<uint8_t> untouched(to.cpuStorageBytes());
+                ASSERT_TRUE(copyExpertTierCPUWeightChunk(from, source, to, gate.destination_bytes, 0, 1));
+                gate.engine->admitCPUNativeQuantisedPublication();
+                const auto view = packed->readView();
+                EXPECT_EQ(view.payload_bytes, 20);
+                EXPECT_EQ(view.bytes().size(), to.cpuStorageBytes());
+                EXPECT_EQ(to.chunkBytes(1), 13u * (format->is_asymmetric ? 24u : 22u));
+                for (size_t column = 0; column < 64; ++column)
+                    for (size_t block = 0; block < 2; ++block)
+                    {
+                        const auto expected = column >= 19 && column < 32 && block == 0
+                            ? test::encodedTierColumn(source, from, column - 19 + 7, 1)
+                            : test::encodedTierColumn(untouched, to, column, block);
+                        EXPECT_EQ(test::encodedTierColumn(view.bytes(), to, column, block), expected);
+                    }
             }
         }
 

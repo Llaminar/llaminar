@@ -32374,6 +32374,13 @@ add_v2_test(V2_Integration_CPUCodedQ5KIQ3STierAdmission
     TIMEOUT 60 NO_MODELS MPI_PROCS 1)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUCodedQ5KIQ3STierAdmission)
 
+# Native Q5 CPU-only slots must seal the exact rectangle-installed payload.
+add_v2_test(V2_Unit_CPUExpertNativeQ5SlotPublication
+    COMMAND $<TARGET_FILE:v2_test_expert_tier_weight_stream>
+        --gtest_filter=CpuExpertSlotPool.NativeQ5SlotSealsExactPayloadAndRectangle
+    LABELS "V2;Unit;CPU;DeviceFree;NativeQuantised;Movement;Regression;ProductionTestPreflight"
+    MPI_PROCS 1 NO_MODELS NO_MPI)
+
 # Overlay slot reuse opens a new publication generation at the same address;
 # arrival admission is the only way the slot's engine becomes executable.
 add_v2_test(V2_Integration_CPUNativeQuantisedSlotReuseAdmission
