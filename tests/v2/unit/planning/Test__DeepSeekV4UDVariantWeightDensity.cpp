@@ -74,7 +74,8 @@ TEST(DeepSeekV4UDVariantWeightDensity, EverySparkFittingVariantIsAdmittedAtFileD
     for (const auto &[variant, families] : inventory.items())
     {
         SCOPED_TRACE(variant);
-        std::size_t file_total = 0, device_total = 0, coded_planes = 0, host_tables = 0;
+        std::size_t file_total = 0, coded_planes = 0;
+        std::vector<TensorSizeInfo> model;
         for (const auto &family : families)
         {
             const std::string name = family[0], type = family[1], layer_list = family[3];
@@ -98,25 +99,39 @@ TEST(DeepSeekV4UDVariantWeightDensity, EverySparkFittingVariantIsAdmittedAtFileD
                 SCOPED_TRACE(tensor_name + " " + type);
                 const std::size_t file = ggufBytes(type, elements);
                 const TensorSizeInfo tensor{tensor_name, file, type, elements, dims.at(0), std::max(0, layer)};
-                const auto estimate = WeightMemoryEstimator::estimate(profileOf(tensor), DeviceId::cuda(0));
+                model.push_back(tensor);
                 file_total += file;
-                device_total += estimate.device_bytes;
+                const std::size_t allowance = hasSeparateCodePlane(type) ? 256u : 0u;
+                coded_planes += allowance ? 1u : 0u;
+                // A lone embedding would also price a synthetic tied LM head;
+                // the variant ships its own output.weight, so the embedding
+                // is checked through the whole-model total below.
+                if (tensor_name == "token_embd.weight")
+                    continue;
+                const auto estimate = WeightMemoryEstimator::estimate(profileOf(tensor), DeviceId::cuda(0));
                 if (type == "I32")
                 {
                     // Integer routing tables are host-resident lookups.
                     EXPECT_LE(estimate.device_bytes, file);
-                    host_tables += file - estimate.device_bytes;
                     continue;
                 }
-                const std::size_t allowance = hasSeparateCodePlane(type) ? 256u : 0u;
-                coded_planes += allowance ? 1u : 0u;
                 EXPECT_GE(estimate.device_bytes, file) << "prepared bytes below the file lose information";
                 EXPECT_LE(estimate.device_bytes, file + allowance)
                     << "CUDA admits more than the GGUF stores beyond code-plane alignment";
             }
         }
-        EXPECT_LE(device_total, file_total + 256u * coded_planes);
-        EXPECT_GE(device_total + host_tables, file_total);
+        // The whole model in one estimate: the explicit output.weight
+        // suppresses the tied head, so the embedding is its file bytes.
+        auto profile = profileOf(model.front());
+        profile.tensors = model;
+        profile.total_native_bytes = file_total;
+        const auto whole = WeightMemoryEstimator::estimate(profile, DeviceId::cuda(0));
+        const std::size_t device_total = whole.device_bytes;
+        EXPECT_EQ(whole.tied_lm_head_bytes, 0u);
+        EXPECT_LE(device_total, file_total + 256u * coded_planes)
+            << "CUDA admits more than the GGUF stores for the whole variant";
+        // Only host-resident integer routing tables may be admitted below the file.
+        EXPECT_GE(device_total + (16ull << 20), file_total);
         RecordProperty(variant + "_file_bytes", std::to_string(file_total));
         RecordProperty(variant + "_cuda_bytes", std::to_string(device_total));
     }

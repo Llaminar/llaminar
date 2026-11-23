@@ -134,10 +134,11 @@ TEST(DeepSeekV4Admission, GPUArenaPricesEveryRegisteredRootOnce)
 /**
  * @test The device arena holds only roots the DeepSeek-V4 graph binds.
  *
- * The inherited Qwen gated-attention (Q, attn_output, fa_q_raw, fa_gate), MTP
- * sidecar (mtp_*) and GDN (gdn_*) roles were registered and admitted at full
- * resident-row size although DeepSeek-V4 never touches them: ~620 MiB of the
- * GB10's shared pool at 512 rows that could otherwise hold KV cache.
+ * The inherited Qwen gated-attention (fa_q_raw, fa_gate), MTP sidecar (mtp_*)
+ * and GDN (gdn_*) roles were registered and admitted at full resident-row size
+ * although DeepSeek-V4 never touches them: ~490 MiB of the GB10's shared pool
+ * at 512 rows that could otherwise hold KV cache. Q and attn_output remain as
+ * orchestrator core state.
  */
 TEST(DeepSeekV4Admission, ArenaRegistersNoInheritedRootsTheGraphNeverBinds)
 {
@@ -152,12 +153,10 @@ TEST(DeepSeekV4Admission, ArenaRegistersNoInheritedRootsTheGraphNeverBinds)
         EXPECT_NE(name.rfind("gdn_", 0), 0u);
         EXPECT_NE(name, "fa_q_raw");
         EXPECT_NE(name, "fa_gate");
-        EXPECT_NE(name, "Q");
-        EXPECT_NE(name, "attn_output");
     }
-    // Release geometry at 512 rows: the whole arena stays below 600 MiB
+    // Release geometry at 512 rows: the whole arena stays below 720 MiB
     // (it was 1.18 GiB with the inherited roots).
-    EXPECT_LT(linearRootBytes(layout, false), 600ull << 20);
+    EXPECT_LT(linearRootBytes(layout, false), 720ull << 20);
 }
 
 TEST(DeepSeekV4Admission, CanonicalCacheChargesNoKVPayload)

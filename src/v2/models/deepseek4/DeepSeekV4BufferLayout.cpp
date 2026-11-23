@@ -263,13 +263,16 @@ void applyDeepSeekV4BufferLayout(GraphSchema &schema)
     // Drop inherited Qwen roots the DeepSeek-V4 graph never binds, so the
     // device arena (and its admission) holds only live storage:
     // - gdn_*: no Gated DeltaNet layers;
-    // - fa_q_raw / fa_gate / Q / attn_output: Qwen gated full attention; the
-    //   DeepSeek-V4 attention owns dsv4_q / dsv4_attn instead;
+    // - fa_q_raw / fa_gate: Qwen gated full attention; the DeepSeek-V4
+    //   attention owns dsv4_q / dsv4_attn instead;
     // - mtp_*: the MTP sidecar, which DeepSeek-V4 rejects at admission.
-    // At 512 resident rows these were ~620 MiB of never-touched device memory.
+    // Q and attn_output stay: DeviceGraphOrchestrator binds them as core
+    // state for every architecture.
+    // At 512 resident rows the dropped roots were ~490 MiB of never-touched
+    // device memory.
     const auto unused = [](const BufferSpec &spec) {
         return spec.name.rfind("gdn_", 0) == 0 || spec.name.rfind("mtp_", 0) == 0 || spec.name == "fa_q_raw" ||
-               spec.name == "fa_gate" || spec.name == "Q" || spec.name == "attn_output";
+               spec.name == "fa_gate";
     };
     for (auto *buffers : {&schema.layer_buffers, &schema.model_buffers})
         buffers->erase(std::remove_if(buffers->begin(), buffers->end(), unused), buffers->end());
