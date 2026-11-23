@@ -695,6 +695,16 @@ production default.
 | Staged first | Ordinary | 29.884 → 29.145 | −2.48% | −1.97% |
 | Staged first | Fixed depth seven | 44.095 → 43.432 | −1.51% | −1.05% |
 
+A further revision borrows the original matrix descriptors through the
+acquired bank. The four direct planner entries use 42–58 registers,
+compared with 144–152 for the copying planner, and retain 32 shared bytes
+and zero local bytes. Gate/Up uses 72–80 registers, up from 64–72. Down
+uses 48–63 registers, compared with 46–63. Both arithmetic phases retain
+zero local bytes. All five native contracts passed on each RTX 3090,
+including acquired-bank, partial, empty, and repeated work. The real
+32-token Release probe matched the staged control and captured the
+intended planner and both arithmetic phases on both GPUs.
+
 The scalar drafter's original graph submission owns one live activation.
 On the mixed topology, the fused path selects the local F320 Q8 work from
 the ten original route slots and keeps weighting with the original cohort.

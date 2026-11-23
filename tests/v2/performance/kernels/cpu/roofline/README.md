@@ -182,6 +182,17 @@ DRAM bandwidth for that socket.
 | Q5_K Gate/Up N320/K2560 | 0 | 54.88–55.77 | 31.4–33.1% | 84.7–86.1% |
 | Q5_K Gate/Up N320/K2560 | 1 | 57.99–58.99 | 31.8–33.7% | 75.3–76.6% |
 
+The two-row program reuses each reconstructed weight vector for both
+original activation rows. Its ordered products and outputs matched the
+expanded row pair on both sockets. Across the eight 48-frame cells the
+compact pair reduced latency by 32.9–39.5%. Seven of the eight single-frame
+cells were slower. The inspected AVX-512 entries have no vector stack
+accesses.
+
+A single-row revision folds the original K partitions in registers.
+It improved single-frame compact Q5_K by 6.1–8.1% and changed the
+48-frame medians by less than 0.5% in either direction.
+
 The measurements cover the original five-bit projection arithmetic with
 experimental packing. The complete hybrid model uses the expanded format.
 
@@ -410,6 +421,10 @@ and the 1,248 eight-row verifier calls used their original schedules. Both
 full comparisons matched the staged control's 256 generated tokens and
 per-iteration MTP work. Driver diagnostics were unchanged.
 
+The ordinary probe's rank 1 local execution averaged 264.19 µs.
+Its 15.426 MB of compulsory operands per call gives 58.39 GB/s, or 53.1%
+of the 110 GB/s simultaneous socket reference.
+
 | Arm order | Mode | Decode, control → isolated tok/s | Decode change | Complete throughput change |
 | --- | --- | ---: | ---: | ---: |
 | Candidate first | Ordinary | 29.598 → 32.069 | +8.35% | +7.04% |
@@ -425,6 +440,13 @@ legal K320 Down source with Q4_K Gate/Up. Complete FFN latency fell by
 4.3–39.1% across the cells. Q4_K Gate/Up with Q8_0 Down improved by
 26.4–36.2%. Runtime selection uses the original shape, worker, numerical
 and execution-phase contracts for the prepared schedule.
+
+A separate route-local publication experiment lets Down start after its
+own route's SwiGLU Q8 packets are complete. It matched all 216 cells and
+improved 201, with a median 5.0% lower complete FFN latency. Individual
+cells ranged from a 30.9% decrease to a 19.0% increase. Q4_K Gate/Up improved
+in every measured cell with either Q5_1 or Q8_0 Down. The prepared CPU
+schedule uses the team completion edges while model timing is pending.
 
 The sealed IQ4 scale probe resolved the scale program at output-tile entry.
 The IQ4_XS packet loop consumed coefficients validated at weight publication.
