@@ -131,6 +131,40 @@ TEST_F(DeepSeekV4CUDAKernels, QATPostOperationsAreByteExact)
     }
 }
 
+/**
+ * @test q_a_norm normalizes q_lora_rank (1024 in DeepSeek-V4-Flash) channels,
+ * wider than the RoPE/QAT staging buffer; the real checkpoint failed graph
+ * materialization because the GPU rejected it. A plain norm runs in place.
+ */
+TEST_F(DeepSeekV4CUDAKernels, PlainNormWiderThanTheStagingBufferMatchesCPU)
+{
+    const int rows = 7;
+    RopePolicy no_rope;
+    no_rope.ropeDim = 0;
+    for (const int dim : {kMaxHeadDim + 32, 1024, 1536})
+    {
+        auto data = randomVector(static_cast<std::size_t>(rows) * dim, 23, 3.0f);
+        auto gain = randomVector(static_cast<std::size_t>(dim), 29, 1.0f);
+        auto cpu = data;
+        HeadNormRopeArgs a{{rows, nullptr}, 1, dim, true, 1e-6f, gain.data(), no_rope, false, ActivationQuant::None,
+                           nullptr, cpu.data()};
+        cpu_->headNormRope(a, nullptr);
+        DeviceBuffer<float> dData(data.size()), dGain(gain.size());
+        a.gain = upload(dGain, gain);
+        a.data = upload(dData, data);
+        gpu_->headNormRope(a, stream_);
+        const auto gpu = download(dData);
+        for (std::size_t i = 0; i < gpu.size(); ++i)
+            ASSERT_NEAR(gpu[i], cpu[i], 2e-5f * std::max(1.0f, std::fabs(cpu[i]))) << dim << " at " << i;
+    }
+    // RoPE or QAT on a head wider than the staging buffer stays rejected.
+    std::vector<float> wide(1024, 1.0f);
+    DeviceBuffer<float> dWide(wide.size());
+    HeadNormRopeArgs rejected{{1, nullptr}, 1, 1024, true, 1e-6f, nullptr, no_rope, false,
+                              ActivationQuant::HadamardFP4, nullptr, upload(dWide, wide)};
+    EXPECT_THROW(gpu_->headNormRope(rejected, stream_), std::invalid_argument);
+}
+
 TEST_F(DeepSeekV4CUDAKernels, RawStorePacksByteExactAndKeepsTheLastWindow)
 {
     const int rows = 9, window = 4;

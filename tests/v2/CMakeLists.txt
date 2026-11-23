@@ -1111,6 +1111,14 @@ if(HAVE_CUDA)
         LABELS "V2;Integration;ProductionTestPreflight;CUDA;DeepSeekV4;KVCache;ByteExact;Regression"
         ENVIRONMENT "LLAMINAR_SKIP_CUDA_STARTUP=0;LLAMINAR_SKIP_ROCM_STARTUP=1"
         MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+    # The real checkpoint's q_a_norm (q_lora_rank 1024) exceeded the GPU
+    # head-staging buffer and failed graph materialization.
+    add_v2_test(V2_Integration_CUDA_DeepSeekV4WidePlainNorm
+        COMMAND $<TARGET_FILE:v2_test_deepseek4_cuda_kernels>
+            --gtest_filter=DeepSeekV4CUDAKernels.PlainNormWiderThanTheStagingBufferMatchesCPU
+        LABELS "V2;Integration;ProductionTestPreflight;CUDA;DeepSeekV4;Regression"
+        ENVIRONMENT "LLAMINAR_SKIP_CUDA_STARTUP=0;LLAMINAR_SKIP_ROCM_STARTUP=1"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 60)
 endif()
 
 add_executable(v2_test_mxfp4_tensor unit/tensors/Test__MXFP4Tensor.cpp)

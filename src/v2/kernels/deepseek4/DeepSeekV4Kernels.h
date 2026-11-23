@@ -143,7 +143,7 @@ struct HeadNormRopeArgs
 {
     RowExtent extent;                      ///< Live token rows.
     int heads = 1;                         ///< Heads per row.
-    int headDim = 0;                       ///< Channels per head (>= ropeDim, <= kMaxHeadDim).
+    int headDim = 0;                       ///< Channels per head (>= ropeDim; <= kMaxHeadDim unless a plain norm).
     bool normalize = true;                 ///< Apply RMS normalization before rotation.
     float eps = 1e-6f;                     ///< RMS epsilon.
     const float *gain = nullptr;           ///< Optional [headDim] gain shared by all heads.

@@ -286,11 +286,20 @@ __global__ __launch_bounds__(kThreads) void headNormRopeKernel(HeadNormRopeArgs 
     const int r = task / a.heads;
     if (r >= liveRows(a.extent)) return;
     __shared__ float scratch[kThreads];
-    __shared__ float vec[kMaxHeadDim];
+    __shared__ float vec_storage[kMaxHeadDim];
     __shared__ int exponents[kMaxHeadDim / kFP4BlockSize];
     float *v = a.data + static_cast<std::size_t>(task) * a.headDim;
-    for (int d = threadIdx.x; d < a.headDim; d += kThreads) vec[d] = v[d];
-    __syncthreads();
+    // RoPE and QAT need the whole head staged. A plain RMS norm wider than
+    // the staging buffer (q_a_norm over q_lora_rank) normalizes in place:
+    // each thread reads and writes only its own strided channels and the
+    // block reduction is unchanged, so the arithmetic is identical.
+    const bool in_place = a.headDim > kMaxHeadDim;
+    float *vec = in_place ? v : vec_storage;
+    if (!in_place)
+    {
+        for (int d = threadIdx.x; d < a.headDim; d += kThreads) vec[d] = v[d];
+        __syncthreads();
+    }
     if (a.normalize)
     {
         float partial = 0.0f;
@@ -315,6 +324,7 @@ __global__ __launch_bounds__(kThreads) void headNormRopeKernel(HeadNormRopeArgs 
         }
         __syncthreads();
     }
+    if (in_place) return;
     quantizeShared(a.quant, vec, a.headDim, a.rope.ropeDim, exponents);
     for (int d = threadIdx.x; d < a.headDim; d += kThreads) v[d] = vec[d];
 }
@@ -807,8 +817,11 @@ public:
     }
     void headNormRope(const HeadNormRopeArgs &a, void *stream) const override
     {
-        require(a.data && (a.positions || a.rope.ropeDim == 0) && a.headDim >= a.rope.ropeDim &&
-                    a.headDim <= kMaxHeadDim, "headNormRope operands");
+        // Heads wider than the staging buffer are admitted only as a plain
+        // RMS norm (no RoPE, no QAT), which the kernel applies in place.
+        require(a.data && (a.positions || a.rope.ropeDim == 0) && a.headDim >= a.rope.ropeDim && a.headDim > 0 &&
+                    (a.headDim <= kMaxHeadDim || (a.rope.ropeDim == 0 && a.quant == ActivationQuant::None)),
+                "headNormRope operands");
         require(a.quant == ActivationQuant::None ||
                     (a.quant == ActivationQuant::FP8NopeBF16Rope ? PackedKVEntryFormat{a.headDim, a.rope.ropeDim}.valid()
                                                                  : PackedIndexerKeyFormat{a.headDim}.valid()),
