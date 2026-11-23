@@ -43,7 +43,6 @@ template <std::uint8_t Codebook> void verifyExtent()
 {
     constexpr std::size_t padded_columns = 128;
     constexpr std::size_t payload_and_codes = Codebook == 8 ? 26 * 64 : 16 * 64 + 48;
-    constexpr std::size_t compensation = Codebook == 8 ? 0 : 2 * 64;
     constexpr std::size_t header = 2 * 64;
     for (int k : {32, 256, 288, 544, 1024})
     {
@@ -53,16 +52,16 @@ template <std::uint8_t Codebook> void verifyExtent()
         ASSERT_TRUE(packWeightsCPUNativeQuantised(tensor.get(), packed));
         const std::size_t blocks = k / 32;
         const std::size_t superblocks = (k + 255) / 256;
-        const std::size_t row_bytes = (payload_and_codes + compensation) * blocks + header * superblocks;
-        EXPECT_EQ(packed.interleaved_block_stride, payload_and_codes + compensation);
+        const std::size_t row_bytes = payload_and_codes * blocks + header * superblocks;
+        EXPECT_EQ(packed.interleaved_block_stride, payload_and_codes);
         EXPECT_EQ(packed.native_interleaved.size(), padded_columns / 64 * row_bytes);
-        EXPECT_EQ(packed.usesInlineCompensation(), compensation != 0);
+        EXPECT_FALSE(packed.usesInlineCompensation());
         const auto view = packed.readView();
         EXPECT_EQ(view.superblockHeader(1, blocks - 1) - view.bytes().data(), 2 * row_bytes - header);
         if (k % 256 == 0)
         {
             constexpr auto file_superblock = Codebook == 8 ? 210u : 136u;
-            EXPECT_EQ(view.bytes().size() - padded_columns / 64 * blocks * compensation,
+            EXPECT_EQ(view.bytes().size(),
                 padded_columns * superblocks * file_superblock);
         }
     }

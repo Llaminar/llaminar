@@ -33,6 +33,13 @@ namespace llaminar2
 {
     namespace
     {
+        /** @brief Admission diagnostic shared by both directions and the host reference. */
+        constexpr char kDensityAwareExpertTierSlotsRequired[] =
+            "CPU prepared weight layout requires coded/compensation-free GPU migration slots";
+    }
+
+    namespace
+    {
         using CPUEncoding = cpu::native_quantised::CPUNativeQuantisedEncoding;
         using CPUWeights = cpu::native_quantised::CPUNativeQuantisedPackedWeights;
 
@@ -291,6 +298,8 @@ namespace llaminar2
             if (cpu.usesCompactMultiScale() &&
                 requiresCodedQ5KIQ3SMigrationSlots(cpu.codebook_id, cpu.is_superblock))
                 return reject(error, kCodedQ5KIQ3SMigrationDiagnostic);
+            if (requiresDensityAwareExpertTierSlots(cpu.encoding, cpu.codebook_id))
+                return reject(error, kDensityAwareExpertTierSlotsRequired);
             // Source provenance must identify exactly one of the 21 cataloged
             // formats even when its final CPU bytes have been normalized.
             if (native_quantised_formats::forSourceIdentity(
@@ -607,6 +616,8 @@ namespace llaminar2
              cpu_encoding == CPUEncoding::CompactMultiScale) &&
             requiresCodedQ5KIQ3SMigrationSlots(cpu_codebook_id, cpu_is_superblock != 0))
             return reject(error, kCodedQ5KIQ3SMigrationDiagnostic);
+        if (requiresDensityAwareExpertTierSlots(cpu_encoding, cpu_codebook_id))
+            return reject(error, kDensityAwareExpertTierSlotsRequired);
         // Re-derive strides rather than accepting redundant wire fields on trust.
         const uint32_t expected_data_stride =
             cpu::native_quantised::preparedDataStride(cpu_encoding, cpu_codebook_id);
@@ -1103,6 +1114,8 @@ namespace llaminar2
 
         const CPUEncoding cpu_encoding =
             cpu::native_quantised::preparedEncodingForSource(source_format);
+        if (requiresDensityAwareExpertTierSlots(cpu_encoding, source_format.codebook_id))
+            throw std::invalid_argument(kDensityAwareExpertTierSlotsRequired);
         ExpertTierWeightStreamManifest manifest;
         manifest.source_packing =
             ExpertTierWeightPacking::GpuSeparatedNativeQuantised;
@@ -1528,6 +1541,8 @@ namespace llaminar2
         configureCpuFromGpu(gpu, output);
         if (const char *reason = codedSourceScaleStreamRejection(output.encoding))
             return reject(error, reason);
+        if (requiresDensityAwareExpertTierSlots(output.encoding, output.codebook_id))
+            return reject(error, kDensityAwareExpertTierSlotsRequired);
         const size_t unit_count =
             static_cast<size_t>(output.N_padded / 64) *
             static_cast<size_t>(output.blocks_per_row);

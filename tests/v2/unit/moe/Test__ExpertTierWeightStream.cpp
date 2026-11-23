@@ -27,6 +27,8 @@
 #include <limits>
 #include <span>
 #include <string>
+#include <string_view>
+
 #include <tuple>
 #include <vector>
 
@@ -125,6 +127,64 @@ namespace llaminar2
                 }
             }
             return projection;
+        }
+
+        /** @test Both conversion directions reject density layouts before touching payload or reserving a lane. */
+        TEST(ExpertTierWeightStream, DensityLayoutsRequireCompatibleMigrationSlots)
+        {
+            using namespace cpu::native_quantised;
+            constexpr std::string_view diagnostic = "requires coded/compensation-free GPU migration slots";
+            for (const auto *source : {&native_quantised_formats::Q4_0, &native_quantised_formats::Q4_1,
+                    &native_quantised_formats::Q4_K, &native_quantised_formats::IQ4_NL,
+                    &native_quantised_formats::MXFP4, &native_quantised_formats::Q8_0})
+            {
+                SCOPED_TRACE(int(source->codebook_id));
+                const auto expectRejected = [&](auto build) {
+                    try
+                    {
+                        (void)build();
+                        ADD_FAILURE() << "Unsupported CPU slot was admitted";
+                    }
+                    catch (const std::invalid_argument &error)
+                    { EXPECT_NE(std::string_view(error.what()).find(diagnostic), std::string_view::npos); }
+                };
+                CPUNativeQuantisedPackedWeights cpu;
+                cpu.N = cpu.N_padded = 64;
+                cpu.K = 256;
+                cpu.blocks_per_row = 8;
+                cpu.codebook_id = source->codebook_id;
+                cpu.payload_bytes = source->payload_bytes;
+                cpu.is_superblock = source->is_superblock;
+                cpu.is_asymmetric = source->is_asymmetric;
+                cpu.encoding = preparedEncodingForSource(*source);
+                cpu.data_stride = preparedDataStride(cpu.encoding, cpu.codebook_id);
+                cpu.interleaved_block_stride = preparedInterleavedBlockStride(cpu.encoding, cpu.is_asymmetric, cpu.codebook_id);
+                expectRejected([&] { return makeCpuToGpuExpertTierWeightStreamManifest(cpu, 101, 2, 7,
+                    ExpertTierWeightProjection::Down, 1); });
+                expectRejected([&] { return makeGpuToCpuExpertTierWeightStreamManifest(*source, cpu.N, cpu.K, 101, 2, 7,
+                    ExpertTierWeightProjection::Down, 1); });
+                // Even a self-consistent new resident stride cannot authorize
+                // the old converter's hardcoded metadata addresses.
+                for (const auto direction : {ExpertTierWeightConversionDirection::GpuToCpu,
+                        ExpertTierWeightConversionDirection::CpuToGpu})
+                {
+                    const auto gpu = canonicalDeviceVnniFormat(*source);
+                    const ExpertTierWeightDeviceLayout layout{
+                        .direction = direction, .N = 64, .K = 256, .N_padded = 64, .blocks_per_row = 8,
+                        .cpu_N = 64, .cpu_K = 256, .gpu_N = 64, .gpu_K = 256,
+                        .cpu_codebook_id = source->codebook_id, .gpu_source_codebook_id = source->codebook_id,
+                        .gpu_source_is_superblock = static_cast<std::uint8_t>(source->is_superblock),
+                        .gpu_codebook_id = canonicalDeviceVnniCodebookId(*source),
+                        .gpu_payload_bytes_per_block = static_cast<std::uint8_t>(source->payload_bytes),
+                        .cpu_is_asymmetric = static_cast<std::uint8_t>(source->is_asymmetric),
+                        .cpu_is_superblock = static_cast<std::uint8_t>(source->is_superblock),
+                        .gpu_is_asymmetric = static_cast<std::uint8_t>(gpu.is_asymmetric),
+                        .cpu_encoding = cpu.encoding, .cpu_data_stride = static_cast<std::uint32_t>(cpu.data_stride),
+                        .cpu_block_stride = static_cast<std::uint32_t>(cpu.interleaved_block_stride),
+                        .unit_count = 8, .maximum_units_per_chunk = 1};
+                    EXPECT_FALSE(layout.valid());
+                }
+            }
         }
 
         /** @test Real demotion publications retain native view geometry for every source. */

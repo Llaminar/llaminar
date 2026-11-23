@@ -28465,6 +28465,13 @@ add_v2_test(V2_Unit_ExpertTierWeightStream
     NO_MODELS
 )
 
+add_v2_test(V2_Integration_ExpertTierWeightDensityAdmission
+    COMMAND $<TARGET_FILE:v2_test_expert_tier_weight_stream>
+        --gtest_filter=ExpertTierWeightStream.DensityLayoutsRequireCompatibleMigrationSlots
+    LABELS "V2;Integration;DeviceFree;MoE;WeightLifecycle;ExpertOverlay;Streaming"
+    NO_MODELS)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ExpertTierWeightDensityAdmission)
+
 # Test: device-free arbitrary-tier composite wave protocol
 add_executable(v2_test_moe_overlay_tier_migration_transport
     unit/moe/Test__MoEOverlayTierMigrationTransport.cpp
