@@ -590,3 +590,17 @@ fell from 4,563.60 to 4,447.72 ms. Instrumented full-prefill rates were
 286.46 and 285.56 tokens/s against matched controls of 288.06 and 287.66,
 with exact 32-token histories and MTP work. See
 `benchmark_results/qfn-cuda-2x2-95943372/direct-publication-release/grouped-linear-isolation/profile/`.
+
+The unprofiled crossover used one warmup and three measured 256-token
+requests per arm, execution order, and inference mode. Both arms returned
+the same tokens and MTP work in every request. End-to-end rate divides
+generated tokens by the sum of recorded prefill and decode times.
+
+| Execution order | Ordinary prefill | Ordinary end-to-end | Fixed-depth-seven prefill | Fixed-depth-seven end-to-end |
+| --- | ---: | ---: | ---: | ---: |
+| Direct first | −0.31% | −1.69% | −0.73% | −1.27% |
+| Staged first | +1.05% | +0.40% | +1.31% | +1.29% |
+
+These results establish byte parity and recovery from the original
+prefill loss. The timing changes depend on execution order. Raw receipts
+are in `benchmark_results/qfn-cuda-2x2-95943372/direct-publication-release/grouped-linear-isolation/quiet/`.

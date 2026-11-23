@@ -3246,6 +3246,7 @@ namespace llaminar2
          * into the final row below, so only that host-owned path needs an
          * explicit zero before projection work begins.
          */
+        float *cpu_canonical_rows = nullptr;
         float *cpu_packed_records = nullptr;
         if (!is_gpu)
         {
@@ -3253,6 +3254,12 @@ namespace llaminar2
                 params_.canonical_route_contributions
                     ? params_.canonical_route_contributions
                     : params_.output;
+            if (params_.canonical_route_contributions)
+            {
+                cpu_canonical_rows = publication->mutable_data();
+                if (!cpu_canonical_rows)
+                    throw std::logic_error("CPU decode lacks its canonical route publication");
+            }
             const bool packed_canonical_records =
                 params_.canonical_route_contributions &&
                 params_.canonical_route_layout ==
@@ -3267,12 +3274,12 @@ namespace llaminar2
                     SparseOverlayBindingKind::HostPacketPublication;
             if (packed_canonical_records)
             {
-                float *const records = publication->mutable_data();
+                float *const records = cpu_canonical_rows;
                 const size_t capacity =
                     canonical_moe_route_record::recordCapacity(
                         publication->numel(),
                         d_model);
-                if (!records || capacity < static_cast<size_t>(top_k) ||
+                if (capacity < static_cast<size_t>(top_k) ||
                     !canonical_moe_route_record::writeRecordCount(
                         records,
                         publication->numel(),
@@ -3288,16 +3295,14 @@ namespace llaminar2
                 }
                 cpu_packed_records = records;
             }
-            else if (!host_packet_dense_canonical)
+            else
             {
-                const size_t publication_rows =
-                    params_.canonical_route_contributions
-                        ? static_cast<size_t>(top_k)
-                        : size_t{1};
-                kernel->zeroBuffer(
-                    publication,
-                    publication_rows * static_cast<size_t>(d_model) *
-                        sizeof(float));
+                const size_t publication_rows = cpu_canonical_rows ? static_cast<size_t>(top_k) : 1u;
+                const size_t publication_elements = publication_rows * static_cast<size_t>(d_model);
+                if (cpu_canonical_rows && publication->numel() < publication_elements)
+                    throw std::logic_error("CPU decode dense canonical publication is undersized");
+                if (!host_packet_dense_canonical)
+                    kernel->zeroBuffer(publication, publication_elements * sizeof(float));
             }
         }
 
@@ -3816,6 +3821,17 @@ namespace llaminar2
             }
         }
 
+        // The final canonical row is bound before the Down workshare. A
+        // complete local owner instead retains an unweighted row for its
+        // separately ordered top-k accumulation.
+        const auto canonical_destination = [&](const ActiveExpert &route) -> float * {
+            if (cpu_packed_records)
+                return canonical_moe_route_record::record(cpu_packed_records, route.batch_idx, d_model);
+            return cpu_canonical_rows
+                ? cpu_canonical_rows + static_cast<size_t>(route.route_slot) * d_model
+                : nullptr;
+        };
+
         // Single fused call: router-Q8 reuse on CPU NativeQuantised, then one
         // projection region for every active expert's gate/up pair.
         bool cpu_prepared_decode_completed = false;
@@ -3914,7 +3930,7 @@ namespace llaminar2
                                     cached_down_gemm_[active_experts[route].expert_id]);
                                 if (!down[route].kernel) return false;
                             }
-                            if (!cpu_packed_records && scratch_down_batch_.size() < routes)
+                            if (!cpu_canonical_rows && scratch_down_batch_.size() < routes)
                                 throw std::logic_error("CPU decode exceeds its declared route output capacity");
                             auto activation = CPUInvocationWorkspace::available<Q8_1Block>(bound_workspace_, kCPUProjectionQ8);
                             if (activation.size() < routes * blocks)
@@ -3922,8 +3938,8 @@ namespace llaminar2
                             std::array<Projection, 2 * capacity> gate_up;
                             for (size_t route = 0; route < routes; ++route)
                             {
-                                float *const destination = cpu_packed_records
-                                    ? canonical_moe_route_record::record(cpu_packed_records, route, d_model)
+                                float *const destination = cpu_canonical_rows
+                                    ? canonical_destination(active_experts[route])
                                     : scratch_down_batch_[route]->mutable_data();
                                 down[route] = {.kernel = down[route].kernel, .input_q8 = activation.data() + route * blocks,
                                     .output = destination, .rows = 1, .n = d_model, .ldc = d_model};
@@ -4112,46 +4128,16 @@ namespace llaminar2
             // either the serial ordered fold or raw canonical-slot publication.
 
             float *output = params_.output->mutable_data();
-            float *canonical_routes =
-                params_.canonical_route_contributions
-                    ? params_.canonical_route_contributions->mutable_data()
-                    : nullptr;
-            if (!output ||
-                (params_.canonical_route_contributions && !canonical_routes))
+            if (!output)
             {
-                LOG_ERROR("[MoEExpertComputeStage] CPU decode could not access "
-                          "its publication tensor for layer "
-                          << params_.layer_idx);
+                LOG_ERROR("[MoEExpertComputeStage] CPU decode could not access its local output");
                 return false;
             }
             auto publish_route = [&](const ActiveExpert &info,
                                      const float *route_output)
             {
-                if (canonical_routes)
-                {
-                    /*
-                     * Keep the expert row unweighted. The post-collective CPU
-                     * reducer applies this route's original weight with
-                     * vec_axpy in increasing slot order, exactly reproducing
-                     * serial decode's FMA tree after ownership movement.
-                     */
-                    float *destination = nullptr;
-                    if (cpu_packed_records)
-                    {
-                        destination = canonical_moe_route_record::record(
-                            canonical_routes,
-                            static_cast<size_t>(info.batch_idx),
-                            d_model);
-                    }
-                    else
-                    {
-                        destination =
-                            canonical_routes +
-                            static_cast<size_t>(info.route_slot) *
-                                static_cast<size_t>(d_model);
-                    }
+                if (float *destination = canonical_destination(info))
                     std::copy_n(route_output, d_model, destination);
-                }
                 else
                 {
                     primitives::vec_axpy(
@@ -4162,15 +4148,16 @@ namespace llaminar2
                 }
             };
 
+            bool down_published_directly = cpu_prepared_decode_completed && cpu_canonical_rows;
             if (cpu_prepared_decode_completed)
             {
-                if (!cpu_packed_records)
+                if (!cpu_canonical_rows)
                     for (int i = 0; i < num_active; ++i)
                         publish_route(active_experts[i], scratch_down_batch_[i]->data());
             }
             else
             {
-                if (!cpu_packed_records && static_cast<int>(scratch_down_batch_.size()) < num_active)
+                if (!cpu_canonical_rows && static_cast<int>(scratch_down_batch_.size()) < num_active)
                     throw std::logic_error("CPU MoE decode exceeds its declared route capacity");
 
                 // Validate down GEMM engines
@@ -4225,8 +4212,8 @@ namespace llaminar2
                             cached_down_gemm_[info.expert_id];
                         down_descs[i].input =
                             swiglu_scratch_batch_[i].data();
-                        down_descs[i].output = cpu_packed_records
-                            ? canonical_moe_route_record::record(cpu_packed_records, i, d_model)
+                        down_descs[i].output = cpu_canonical_rows
+                            ? canonical_destination(info)
                             : scratch_down_batch_[i]->mutable_data();
                         down_descs[i].n = d_model;
                     }
@@ -4240,19 +4227,14 @@ namespace llaminar2
                                 bound_workspace_);
                 }
 
-                if (fused_ok && !cpu_packed_records)
+                if (fused_ok)
                 {
-                    // Phase 2c: Publish every completed route through the
-                    // selected graph arithmetic contract.
-                    for (int i = 0; i < num_active; ++i)
-                    {
-                        const auto &info = active_experts[i];
-                        publish_route(
-                            info,
-                            scratch_down_batch_[i]->data());
-                    }
+                    down_published_directly = cpu_canonical_rows != nullptr;
+                    if (!down_published_directly)
+                        for (int i = 0; i < num_active; ++i)
+                            publish_route(active_experts[i], scratch_down_batch_[i]->data());
                 }
-                else if (!fused_ok)
+                else
                 {
                     // Standalone non-transaction CPU decode retains the exact
                     // per-expert SwiGLU/down implementation.
@@ -4284,6 +4266,13 @@ namespace llaminar2
                 }
             }
 
+            if (down_published_directly &&
+                PerfStatsCollector::isRecordFamilyEnabled("kernel", "cpu_moe_single_row_down_direct_publication"))
+            {
+                PerfStatsCollector::addCounter("kernel", "cpu_moe_single_row_down_direct_publication",
+                    static_cast<double>(num_active), "gemm", "cpu",
+                    {{"layout", cpu_packed_records ? "packed" : "dense"}});
+            }
             if (cpu_packed_records &&
                 !canonical_moe_route_record::writeRecordCount(
                     cpu_packed_records,

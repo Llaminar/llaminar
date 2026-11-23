@@ -1818,7 +1818,9 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_RuntimeMVerifierMatchesSerialDecode_All
                            TensorBase *run_canonical_routes = nullptr,
                            CPURouterQ8InputPublicationPolicy input_policy =
                                CPURouterQ8InputPublicationPolicy::RequireRouterStage,
-                           int replays = 1)
+                           int replays = 1,
+                           MoECanonicalRoutePublicationLayout canonical_layout =
+                               MoECanonicalRoutePublicationLayout::PackedIndexedRouteRows)
         {
             MoEExpertComputeStage::Params params;
             params.device_id = DeviceId::cpu();
@@ -1838,9 +1840,7 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_RuntimeMVerifierMatchesSerialDecode_All
                 ? MoECanonicalRouteArithmeticPolicy::
                       UnweightedExpertRowThenOrderedFMA
                 : MoECanonicalRouteArithmeticPolicy::Unspecified;
-            params.canonical_route_layout = run_canonical_routes
-                ? MoECanonicalRoutePublicationLayout::
-                      PackedIndexedRouteRows
+            params.canonical_route_layout = run_canonical_routes ? canonical_layout
                 : MoECanonicalRoutePublicationLayout::Unspecified;
             params.seq_len = run_seq;
             params.d_model = d;
@@ -1972,6 +1972,40 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_RuntimeMVerifierMatchesSerialDecode_All
                              [static_cast<size_t>(participant)],
                         participant_routes[static_cast<size_t>(participant)]
                             .get()));
+
+                    if (run_seq == 1 && !verifier_rows)
+                    {
+                        // The packed path names the original slots independently
+                        // of the dense producer's physical destination pitch.
+                        auto dense = TestTensorFactory::createFP32({route_slot_count * d});
+                        const auto published_dense_rows = [] {
+                            double rows = 0;
+                            for (const auto &record : PerfStatsCollector::snapshot({"kernel.cpu_moe_single_row_down_direct_publication"}))
+                                if (record.tags.contains("layout") && record.tags.at("layout") == "dense")
+                                    rows += record.value;
+                            return rows;
+                        };
+                        const auto before = published_dense_rows();
+                        ASSERT_TRUE(run_moe(run_input, run_indices, run_weights, kernel_owner,
+                            unused_compact_output.get(), run_seq, verifier_rows,
+                            &ownership_maps[ownership_index][static_cast<size_t>(participant)], dense.get(),
+                            CPURouterQ8InputPublicationPolicy::RequireRouterStage, 1,
+                            MoECanonicalRoutePublicationLayout::DenseOriginalRouteSlots));
+                        const auto &packed = *participant_routes[static_cast<size_t>(participant)];
+                        const auto count = canonical_moe_route_record::readRecordCount(packed.data(), packed.numel());
+                        ASSERT_LE(count, route_slot_count);
+                        EXPECT_EQ(published_dense_rows() - before, static_cast<double>(count));
+                        auto expected_dense = TestTensorFactory::createFP32({route_slot_count * d});
+                        std::fill_n(expected_dense->mutable_data(), expected_dense->numel(), 0.0f);
+                        for (size_t record = 0; record < count; ++record)
+                        {
+                            const auto *values = canonical_moe_route_record::record(packed.data(), record, d);
+                            const auto slot = canonical_moe_route_record::readFlatRouteSlot(values, d);
+                            ASSERT_LT(slot, route_slot_count);
+                            std::copy_n(values, d, expected_dense->mutable_data() + static_cast<size_t>(slot) * d);
+                        }
+                        EXPECT_EQ(std::memcmp(dense->data(), expected_dense->data(), dense->numel() * sizeof(float)), 0);
+                    }
                 }
 
                 /*
