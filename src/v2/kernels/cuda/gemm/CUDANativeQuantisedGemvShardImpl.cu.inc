@@ -1502,9 +1502,9 @@ namespace
     {
         using Traits = llaminar2::cuda_native_quantised::CodebookTraits<CB>;
         if constexpr (Traits::requires_secondary_metadata)
-            if (!secondary) return false;
+            if (!metadata.secondary) return false;
         if constexpr (Traits::is_dual_scale_asym)
-            if (!extended_minima) return false;
+            if (!metadata.coded() && !metadata.emins) return false;
         const auto launch = [&]<int Columns>() {
             // Division without n+Columns-1 avoids overflow near the ABI limit.
             llaminar2::dispatchProjectionRows(1,nullptr,[&](auto work) {
@@ -3827,14 +3827,14 @@ static double measureCachedGeneratedDispatchNs(
 extern "C"
 {
     bool cudaNativeQuantisedGemvTuned_fp32_withPolicy(
-        const int8_t *, const uint8_t *, const uint16_t *,
-        const uint16_t *, const uint32_t *, float *, const float *,
+        const int8_t *, const uint8_t *, ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes,
+        float *, const float *,
         int, int, float, float, const float *, const float *, uint8_t,
         uint8_t, int, void *, CUDAGemvContext *, CUDARowMajorWeights **);
 
     bool cudaNativeQuantisedGemvTuned_small_m_fp32_withPolicy(
-        const int8_t *, const uint8_t *, const uint16_t *,
-        const uint16_t *, const uint32_t *, float *, const float *,
+        const int8_t *, const uint8_t *, ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes,
+        float *, const float *,
         int, int, int, float, float, const float *, const float *, uint8_t,
         uint8_t, int, void *, CUDAGemvContext *, CUDARowMajorWeights **,
         const llaminar2::DeviceRowRange *row_range = nullptr);

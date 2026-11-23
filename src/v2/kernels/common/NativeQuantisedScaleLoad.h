@@ -248,7 +248,9 @@ namespace llaminar2::native_quantised_scale
         out.primary = loadStagedPrimary<Codebook>(planes.primary, address.linear);
         out.secondary = planes.secondary ? static_cast<const std::uint16_t *>(planes.secondary)[address.linear]
                                          : std::uint16_t{0};
-        out.emin = planes.emins ? planes.emins[address.linear] : std::uint32_t{0};
+        // Only Q2_K owns an effective-minimum plane; never keep the pointer live otherwise.
+        if constexpr (Codebook == 10)
+            out.emin = planes.emins ? planes.emins[address.linear] : std::uint32_t{0};
         return out;
     }
 

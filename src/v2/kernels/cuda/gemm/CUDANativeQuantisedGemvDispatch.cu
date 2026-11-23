@@ -127,7 +127,7 @@ bool cudaNativeQuantisedGemvTuned_fusedKpar_fp32(
 {
     const auto stream = static_cast<cudaStream_t>(raw_stream);
     if (!stream || stream == cudaStreamLegacy || stream == cudaStreamPerThread ||
-        !activations || !payload || !scales || !output || !activation_scales ||
+        !activations || !payload || !metadata.primary || !output || !activation_scales ||
         n <= 0 || device < 0 || (beta != 0.0f && !existing) ||
         reinterpret_cast<uintptr_t>(activations) % alignof(int4) != 0)
         return false;
