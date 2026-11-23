@@ -1540,3 +1540,44 @@ diagnostics were identical across each process.
 | New reader first | Fixed depth seven | 44.906 | 45.110 | −0.15% |
 | Control first | Ordinary | 29.716 | 29.777 | +0.04% |
 | Control first | Fixed depth seven | 43.846 | 43.889 | +0.04% |
+
+## Packet-owned Gate/Up and SwiGLU experiments
+
+One CTA can own a complete 32-column SwiGLU packet. Eight warps write
+the original 16 Gate and Up partials to two CTA-local planes. Warp zero
+folds them in their original FP32 order and publishes the canonical Q8
+packet. This removes the global partial planes and the separate reducer.
+The two-card screen used H=2560, F=320 and byte-checked the captured
+projection against independent staged decode in every arm.
+
+The eight-warp specialization uses 63–115 registers, 4–6.5 KiB of shared
+storage and zero local bytes across the ten formats screened. The loaded
+compiler resources allow two to four such CTAs per SM. IQ1_M, IQ1_S and
+IQ2_XXS slowed at ten live routes. IQ3_S was essentially flat. The table
+shows the reduction in median stage latency across both cards for the
+six remaining sources.
+
+| Source | Four routes | Six routes | Eight routes | Ten routes | Fraction of matched weight reference at ten routes |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| IQ2_S | 15.4–15.7% | 17.0% | 24.0% | 4.8–5.2% | 64.0–64.1% |
+| IQ2_XS | 11.9–12.2% | 13.9–14.2% | 24.6% | 8.9–9.1% | 68.4–68.6% |
+| IQ3_XXS | 2.6–3.5% | 6.5% | 20.9–21.2% | 6.1% | 81.3% |
+| Q4_K | 1.0–1.9% | 3.8% | 14.4% | 10.3% | 93.8% |
+| Q5_K | −13.2 to −12.7% | 11.2% | 10.7–11.1% | 10.3% | 95.4% |
+| Q8_0 | 13.1% | 9.3% | 9.2–9.5% | 7.7–7.9% | 96.9–97.0% |
+
+All 120 ten-route comparisons and 144 comparisons at smaller route counts
+passed byte checks. These isolated captures use fully local route sets.
+A hybrid launch needs the device's live route directory before selecting
+the arithmetic geometry.
+
+The 16-warp comparison passed 180 captured observations at four and ten
+routes in crossed order. At four routes, it was faster for all six tested
+sources than both the two-node control and the eight-warp program. Median
+latency fell 20.9% for IQ2_S, 14.8–15.6% for IQ2_XS, 4.4% for IQ3_XXS,
+9.7% for Q4_K, 3.6% for Q5_K and 16.1–16.4% for Q8_0 against the two-node
+control. At ten routes the eight-warp program remained faster for the
+indexed sources that benefit from packet ownership. Both geometries used
+zero local bytes. The wider block allocates more threads per CTA when the
+grid has only 40 output packets. At 100 packets its resource limit can
+force a second wave on the two RTX 3090s.

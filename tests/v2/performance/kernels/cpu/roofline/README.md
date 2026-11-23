@@ -254,9 +254,32 @@ planner inside the retained team added a publication barrier and took
 starting the team and adding the measured pre-admitted worker entry cost
 reduced the estimated planning phase by 17.2–39.0% across the 40 cells.
 The native plan checks cover the actual worker count, prepared codebook,
-K partitioning and output ownership. Complete transaction measurements
-must include both plans, each team completion edge and the shared SwiGLU
-publication.
+K partitioning and output ownership.
+
+The complete-transaction probe includes both plans, each team completion
+edge and the shared SwiGLU publication. It passed the serial-byte oracle
+before and after timing in all 672 observations. Each width and row count
+used eight experts, 21 original Gate/Up sources, and both arm orders per
+socket. Down used the same source at width 256 and Q8_0 at width 320.
+
+| Expert width | Rows per expert | Median latency change, socket 0 | Median latency change, socket 1 |
+| --- | ---: | ---: | ---: |
+| 256 | 1 | −5.24% | +1.81% |
+| 256 | 4 | +0.18% | +0.09% |
+| 320 | 1 | −1.45% | −5.30% |
+| 320 | 4 | −0.30% | −1.09% |
+
+The width-320, one-row Q4_K Gate/Up and Q8_0 Down case improved 7.8–16.1%
+across sockets and arm orders. Other sources and work shapes gave mixed
+results. Production uses the original per-worker planner.
+
+The sealed IQ4 scale probe resolved the scale program at output-tile entry.
+The IQ4_XS packet loop consumed coefficients validated at weight publication.
+Both sockets, one and two rows per expert, eight and 64 experts, and both
+orders produced 96 byte-exact observations with Q4_K as the timing control.
+IQ4_XS Gate/Up improved 2.7–21.4% at eight experts and gave mixed results
+at 64 experts. The Q4_K control varied by up to 14.0% in the small workloads,
+so these clocks did not qualify a production dispatch change.
 Both arms used the staged CUDA graph and identical F320/S320 sharding.
 Every arm used one warmup and three measured 256-token requests per mode.
 All generated IDs, prompts, and per-iteration MTP counts matched.
