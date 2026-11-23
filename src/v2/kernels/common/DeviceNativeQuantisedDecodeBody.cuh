@@ -681,7 +681,12 @@
                 if constexpr (CODEBOOK_ID == 11)
                     idx |= static_cast<int>((qh_byte >> g) & 1u) << 8;
                 const uint32_t grid4 = iq3_grid_lookup<CODEBOOK_ID>(idx);
-                const uint8_t signs = payload[sign_base + g / 2];
+                uint8_t signs = payload[sign_base + g / 2];
+                // IQ3_XXS sign masks carry even parity in bit 7; a superblock-coded
+                // payload stores its scale code there, so recompute it (idempotent
+                // for per-block payloads). IQ3_S signs are explicit.
+                if constexpr (CODEBOOK_ID == 12)
+                    signs = static_cast<uint8_t>((signs & 0x7Fu) | ((__popc(signs & 0x7Fu) & 1u) << 7));
                 const uint8_t nibble = (g & 1) ? static_cast<uint8_t>(signs >> 4) : static_cast<uint8_t>(signs & 0x0F);
                 packed_groups[g] = static_cast<int32_t>(iq_apply_signs_4(grid4, nibble));
             }
@@ -700,7 +705,11 @@
                 const uint64_t grid8 = iq2_grid_lookup<CODEBOOK_ID>(idx);
                 const uint32_t lo = static_cast<uint32_t>(grid8);
                 const uint32_t hi = static_cast<uint32_t>(grid8 >> 32);
-                const uint8_t signs = payload[sign_base + l];
+                uint8_t signs = payload[sign_base + l];
+                // IQ2_XS/IQ2_XXS parity-coded sign masks (see the IQ3_XXS case);
+                // IQ2_S signs are explicit eight-bit masks.
+                if constexpr (CODEBOOK_ID == 14 || CODEBOOK_ID == 15)
+                    signs = static_cast<uint8_t>((signs & 0x7Fu) | ((__popc(signs & 0x7Fu) & 1u) << 7));
                 packed_groups[l * 2] = static_cast<int32_t>(iq_apply_signs_4(lo, signs & 0x0F));
                 packed_groups[l * 2 + 1] = static_cast<int32_t>(iq_apply_signs_4(hi, signs >> 4));
             }
