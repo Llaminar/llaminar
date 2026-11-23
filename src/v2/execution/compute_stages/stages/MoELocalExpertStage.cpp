@@ -4824,7 +4824,9 @@ namespace llaminar2
                 params_.d_model,
                 params_.expert_intermediate,
                 params_.num_experts,
-                /*top_k=*/1));
+                /*top_k=*/1,
+                // The routing stage alone owns the router gate cache.
+                MoEWorkspaceBuffers::CUDARouterGateCache::None));
         }
         else if (params_.device_id.is_rocm())
         {

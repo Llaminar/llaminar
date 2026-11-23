@@ -9551,6 +9551,14 @@ add_v2_test(V2_Integration_QwenNativeToolCallProtocol
     NO_MODELS
 )
 
+# A BF16/FP16 router gate never binds the CUDA Q8 gate cache (144 MiB for 256
+# experts at d_model 4096); only FP32-gate routers may declare it.
+add_v2_test(V2_Integration_RouterQ8GateCacheOnlyForFP32Gates
+    COMMAND $<TARGET_FILE:v2_test_gpu_workspace_allocation_policy>
+        --gtest_filter=Test__GpuWorkspaceAllocationPolicy.RouterQ8GateCacheIsDeclaredOnlyForFP32Gates
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MoE;Workspace;Memory;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_RouterQ8GateCacheOnlyForFP32Gates)
 # Note: ArgParser tests removed - replaced by OrchestrationConfigParser tests
 
 # Test: NodeTopology (NUMA/socket topology detection for CPU tensor parallelism)
