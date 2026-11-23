@@ -22482,6 +22482,8 @@ namespace llaminar2
             .captured_prefill_buckets = std::move(captured_prefill_buckets),
             .max_gpu_memory_bytes = config_.memoryLimitBytes(DeviceType::CUDA),
             .max_cpu_memory_bytes = config_.memoryLimitBytes(DeviceType::CPU),
+            // Runtime admission: local backend contexts and hardware metadata exist.
+            .local_runtime_device_policy = true,
         });
 
         // CPU threads are not needed to observe GPUs. Only immutable role/BOM

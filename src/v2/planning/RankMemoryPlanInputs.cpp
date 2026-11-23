@@ -459,6 +459,7 @@ namespace llaminar2
                 device.is_cpu() ? request.max_cpu_memory_bytes : request.max_gpu_memory_bytes);
             cfg.device_compute_units = device.is_cpu()
                 ? request.inventory.cpuWorkerThreads() : inventory.compute_units;
+            cfg.runtime_device_policy_available = request.local_runtime_device_policy && device.is_gpu();
             if (device.is_cpu()) cfg.cpu_execution = request.inventory.cpu_execution;
             if (device.is_gpu() && request.snapshot_capacity.has_value())
             {
