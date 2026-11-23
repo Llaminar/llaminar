@@ -366,6 +366,28 @@ TEST(RankMemoryPlanInputs, ExplicitMemoryLimitsReachEveryCPUAndGPUOwner)
     }
 }
 
+/**
+ * @test Only the rank's runtime admission prices GPU workspace with the exact
+ * kernel contract. A missing declaration fell back to the device-free legacy
+ * envelope and under-admitted DeepSeek-V4 UD-IQ3_XXS split-K partials, failing
+ * the serial workspace family at load; candidate planning keeps the bound.
+ */
+TEST(RankMemoryPlanInputs, RuntimeAdmissionDeclaresExactLocalGPUWorkspacePolicy)
+{
+    for (const auto backend : {DeviceType::CPU, DeviceType::CUDA, DeviceType::ROCm})
+    for (const bool runtime : {false, true})
+    {
+        SCOPED_TRACE(::testing::Message() << static_cast<int>(backend) << ' ' << runtime);
+        Fixture fixture(backend, 2);
+        auto request = fixture.request();
+        request.local_runtime_device_policy = runtime;
+        const auto configs = buildRankMemoryPlanInputs(request);
+        ASSERT_FALSE(configs.empty());
+        for (const auto &cfg : configs)
+            EXPECT_EQ(cfg.runtime_device_policy_available, runtime && cfg.device.is_gpu());
+    }
+}
+
 TEST(RankMemoryPlanInputs, MemoryIntentConversionIsCheckedAndVendorSymmetric)
 {
     OrchestrationConfig config;

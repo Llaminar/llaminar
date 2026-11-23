@@ -29772,6 +29772,15 @@ add_executable(v2_test_memory_planner
     unit/planning/Test__MoEPipelineFixedMemory.cpp)
 target_link_libraries(v2_test_memory_planner llaminar2_core GTest::gtest GTest::gtest_main)
 target_include_directories(v2_test_memory_planner PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../external/vendor)
+# Runtime rank admission must price GPU workspace with the exact kernel
+# contract; the device-free envelope under-admitted large split-K partials.
+add_v2_test(V2_Integration_RuntimeAdmissionExactGPUWorkspacePolicy
+    COMMAND $<TARGET_FILE:v2_test_memory_planner>
+        --gtest_filter=RankMemoryPlanInputs.RuntimeAdmissionDeclaresExactLocalGPUWorkspacePolicy
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;Workspace;Memory;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_RuntimeAdmissionExactGPUWorkspacePolicy)
 add_v2_test(V2_Integration_AutomaticPlanningRejectsUnrelatedNativeWorker
     COMMAND $<TARGET_FILE:v2_test_memory_planner>
         --gtest_filter=AutomaticOrchestrationPlanner.DefaultCalibrationRejectsExistingWorkerWithoutRetiringIt
