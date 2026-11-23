@@ -758,7 +758,9 @@ namespace llaminar2
             for (size_t plane = 0; plane < (compact ? 2 : planes); ++plane)
                 copy(source_base + payload_per_column * source_columns + plane * source_columns * 2 + source_column * 2,
                      destination_base + payload_per_column * destination_columns + plane * destination_columns * 2 + destination_column * 2, 2);
-            if (compact)
+            // Only Q2_K's compact unit reserves the effective-minimum vector;
+            // every other compact unit ends after its two scale planes.
+            if (compact && layout.cpu_block_stride > layout.cpu_data_stride + 256)
                 copy(source_base + payload_per_column * source_columns + 4 * source_columns + source_column * 4,
                      destination_base + payload_per_column * destination_columns + 4 * destination_columns + destination_column * 4, 4);
         }

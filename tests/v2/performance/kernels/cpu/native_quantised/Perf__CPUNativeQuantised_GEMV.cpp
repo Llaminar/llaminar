@@ -1973,10 +1973,9 @@ namespace
                     scales[column] = one_fp16;
                     if (minima)
                         minima[column] = secondary_word;
-                    if (packed.usesCompactMultiScale())
+                    if (packed.usesCompactMultiScale() && metadata->has_emins)
                     {
-                        // Both Q2_K minima are finite; all other compact
-                        // codebooks reserve these words as deterministic zero.
+                        // Only Q2_K's compact unit reserves the effective-minimum vector.
                         reinterpret_cast<uint32_t *>(block + packed.data_stride + 256)[column] =
                             metadata->has_emins
                                 ? static_cast<uint32_t>(min_fp16) | (static_cast<uint32_t>(min_fp16) << 16)

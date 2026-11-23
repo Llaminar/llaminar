@@ -40,7 +40,9 @@ std::vector<uint8_t> encodedTierColumn(std::span<const uint8_t> root,
     const bool compact=layout.cpu_encoding==cpu::native_quantised::CPUNativeQuantisedEncoding::CompactMultiScale;
     for(size_t plane=0;plane<(compact?2:(layout.cpu_block_stride-layout.cpu_data_stride)/128);++plane)
         for(size_t byte=0;byte<2;++byte)result.push_back(root[unit+layout.cpu_data_stride+plane*128+column*2+byte]);
-    if(compact)for(size_t byte=0;byte<4;++byte)result.push_back(root[unit+layout.cpu_data_stride+256+column*4+byte]);
+    // Only Q2_K's compact unit reserves the effective-minimum vector after its scales.
+    const bool effective_minima=compact && layout.cpu_block_stride>layout.cpu_data_stride+256;
+    if(effective_minima)for(size_t byte=0;byte<4;++byte)result.push_back(root[unit+layout.cpu_data_stride+256+column*4+byte]);
     return result;
 }
 } // namespace llaminar2::test

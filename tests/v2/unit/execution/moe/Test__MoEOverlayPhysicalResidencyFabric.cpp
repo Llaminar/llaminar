@@ -2022,7 +2022,8 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric, LiveNativeOracleDistinguishesDirty
         const bool compact=packed->encoding==cpu::native_quantised::CPUNativeQuantisedEncoding::CompactMultiScale;
         for(size_t plane=0;plane<(compact?2:(size_t(packed->interleaved_block_stride)-packed->data_stride)/128);++plane)
             for(size_t byte=0;byte<2;++byte)fields.push_back(packed->data_stride+plane*128+byte);
-        if(compact)for(size_t byte=0;byte<4;++byte)fields.push_back(packed->data_stride+256+byte);
+        // Only Q2_K's compact unit reserves the effective-minimum vector.
+        if(compact && packed->codebook_id==10)for(size_t byte=0;byte<4;++byte)fields.push_back(packed->data_stride+256+byte);
         for(const size_t byte:fields) {
             SCOPED_TRACE(byte);const auto saved=bytes[byte];bytes[byte]^=1;
             EXPECT_NE(livePreparedBytes(changed),expected); // All data/comp/scale/min/grid classes must contribute.

@@ -29,6 +29,20 @@ namespace llaminar2::native_quantised_superblock::test
 
         std::uint16_t cph(float v) { return canonicalPreparedHalfBits(v); }
 
+        /**
+         * @brief Equality of half words where a NaN's sign is unspecified.
+         *
+         * `-dmin * 0` with an infinite `dmin` is a NaN whose sign depends on
+         * whether the compiler negates the operand or the product (both legal);
+         * the repack kernels have the same freedom. Every non-NaN word,
+         * including signed zeros and infinities, must match exactly.
+         */
+        bool sameHalf(std::uint16_t a, std::uint16_t b)
+        {
+            const auto nan = [](std::uint16_t h) { return (h & 0x7C00u) == 0x7C00u && (h & 0x03FFu) != 0; };
+            return nan(a) && nan(b) ? (a & 0x7FFFu) == (b & 0x7FFFu) : a == b;
+        }
+
         /** @brief Every binary16 bit pattern. */
         template <class F>
         void forEachHalf(F &&f)
@@ -178,7 +192,9 @@ namespace llaminar2::native_quantised_superblock::test
                 const auto m = decodeSuperblockMetadata<10>(lo | (hi << 8), packSuperblockWord(0x3C00, dmin));
                 const std::uint32_t expected = static_cast<std::uint32_t>(cph(-mf * static_cast<float>(lo >> 4))) |
                                                (static_cast<std::uint32_t>(cph(-mf * static_cast<float>(hi >> 4))) << 16);
-                ASSERT_EQ(m.emin, expected) << dmin << ' ' << nibbles;
+                ASSERT_TRUE(sameHalf(static_cast<std::uint16_t>(m.emin), static_cast<std::uint16_t>(expected)) &&
+                            sameHalf(static_cast<std::uint16_t>(m.emin >> 16), static_cast<std::uint16_t>(expected >> 16)))
+                    << dmin << ' ' << nibbles << ' ' << m.emin << ' ' << expected;
             }
         });
     }

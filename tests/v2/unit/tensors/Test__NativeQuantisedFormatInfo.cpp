@@ -214,10 +214,15 @@ TEST(Test__NativeQuantisedFormatInfo, CompactMultiScaleRetainsNativePayloadAndEv
         ASSERT_TRUE(packWeightsCPUNativeQuantised(tensor.get(), packed, 1, 2));
         ASSERT_TRUE(packed.usesCompactMultiScale());
         EXPECT_FALSE(packed.usesInlineCompensation());
-        EXPECT_EQ(packed.data_stride, 1024);
-        EXPECT_EQ(packed.interleaved_block_stride, 1536);
-        EXPECT_EQ(packed.native_interleaved.size(), 8u * 1536u);
-        EXPECT_EQ(packed.preparedFootprint().weight_bytes_per_n_chunk_k_block, 1536u);
+        // Independent unit geometry: the payload rounded up to whole 32-bit
+        // words per column, two half-scale vectors, and the effective-minimum
+        // vector only for Q2_K, its sole consumer.
+        const int words = (format.payload_bytes + 3) / 4;
+        const int unit_bytes = words * 256 + 256 + (format.codebook_id == 10 ? 256 : 0);
+        EXPECT_EQ(packed.data_stride, words * 256);
+        EXPECT_EQ(packed.interleaved_block_stride, unit_bytes);
+        EXPECT_EQ(packed.native_interleaved.size(), 8u * static_cast<size_t>(unit_bytes));
+        EXPECT_EQ(packed.preparedFootprint().weight_bytes_per_n_chunk_k_block, static_cast<uint64_t>(unit_bytes));
         EXPECT_TRUE(packed.int8_flat.empty());
         std::array<uint8_t, 8 * 16> payload{};
         std::array<uint16_t, 8> scales{}, secondary{};
@@ -234,10 +239,13 @@ TEST(Test__NativeQuantisedFormatInfo, CompactMultiScaleRetainsNativePayloadAndEv
         {
             EXPECT_EQ(packed.chunkScales(0, block)[0], scales[block]);
             EXPECT_EQ(packed.chunkMins(0, block)[0], secondary[block]);
-            EXPECT_EQ(packed.chunkEffectiveMins(0, block)[0], emins[block]);
-            const uint8_t *unit = packed.interleavedBase() + block * 1536;
+            if (format.codebook_id == 10)
+                EXPECT_EQ(packed.chunkEffectiveMins(0, block)[0], emins[block]);
+            else
+                EXPECT_THROW((void)packed.chunkEffectiveMins(0, block), std::logic_error);
+            const uint8_t *unit = packed.interleavedBase() + block * static_cast<size_t>(unit_bytes);
             for (int column = 0; column < 64; ++column)
-                for (int byte = 0; byte < 16; ++byte)
+                for (int byte = 0; byte < words * 4; ++byte)
                     EXPECT_EQ(unit[(byte / 4) * 256 + column * 4 + byte % 4],
                         column == 0 && byte < format.payload_bytes
                             ? payload[block * format.payload_bytes + byte] : 0);
@@ -245,11 +253,12 @@ TEST(Test__NativeQuantisedFormatInfo, CompactMultiScaleRetainsNativePayloadAndEv
             {
                 EXPECT_EQ(packed.chunkScales(0, block)[column], 0);
                 EXPECT_EQ(packed.chunkMins(0, block)[column], 0);
-                EXPECT_EQ(packed.chunkEffectiveMins(0, block)[column], 0u);
+                if (format.codebook_id == 10)
+                    EXPECT_EQ(packed.chunkEffectiveMins(0, block)[column], 0u);
             }
         }
     }
-    EXPECT_EQ(covered, 5u);
+    EXPECT_EQ(covered, 8u); // Q3_K, Q2_K, IQ3_XXS, IQ2_S, IQ2_XS, IQ2_XXS, IQ1_S, IQ1_M
 }
 
 TEST(Test__NativeQuantisedFormatInfo, SourceIdentitiesAreExhaustiveUniqueAndCanonical)

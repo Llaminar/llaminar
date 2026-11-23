@@ -460,8 +460,10 @@ namespace llaminar2::cpu::native_quantised
          */
         inline const uint32_t *chunkEffectiveMins(int c, int kb) const
         {
-            if (!usesCompactMultiScale())
-                throw std::logic_error("Effective minima require compact multi-scale weights");
+            // Only Q2_K reserves the effective-minimum vector; any other
+            // compact unit ends after its two scale vectors.
+            if (!usesCompactMultiScale() || codebook_id != 10)
+                throw std::logic_error("Effective minima exist only in compact Q2_K weights");
             const size_t offset = ((size_t)c * blocks_per_row + kb) * interleaved_block_stride;
             return reinterpret_cast<const uint32_t *>(interleavedBase() + offset + data_stride + 256);
         }

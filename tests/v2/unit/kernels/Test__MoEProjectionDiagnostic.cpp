@@ -288,7 +288,8 @@ TEST(MoEProjectionDiagnostic, Promoted23SourcesUseCanonicalMigrationContract)
         }
         else EXPECT_THROW((void)parseMoEProjectionDiagnostic(authored, Json::object()), std::invalid_argument);
     }
-    EXPECT_EQ(accepted, (std::set<std::string>{"Q5_1", "Q5_K", "IQ1_S"}));
+    // IQ1_S now migrates in its compact payload, so only Q5_1/Q5_K promote.
+    EXPECT_EQ(accepted, (std::set<std::string>{"Q5_1", "Q5_K"}));
     EXPECT_FALSE(moeProjectionSupportsPromoted23("23"));
     EXPECT_FALSE(moeProjectionSupportsPromoted23("Q4_K"));
 }
@@ -318,7 +319,7 @@ TEST(MoEProjectionDiagnostic, Promoted23RejectsUnknownAndMixedPreparationAuthori
 /** Promotion does not widen the original M1/topK oracle or add authored staging/environment controls. */
 TEST(MoEProjectionDiagnostic, Promoted23KeepsBoundedSyntheticOperation)
 {
-    auto authored = syntheticRequest("IQ1_S"); authored["prepared_representation"] = "cpu-prepared-promoted23";
+    auto authored = syntheticRequest("Q5_K"); authored["prepared_representation"] = "cpu-prepared-promoted23";
     for (const auto &[field, invalid] : std::vector<std::pair<std::string, Json>>{{"m", 2}, {"top_k", 17},
              {"promotion_chunk_units", 64}, {"promotion_epoch", 2}})
     {

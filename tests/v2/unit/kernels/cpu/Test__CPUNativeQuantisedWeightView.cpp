@@ -111,7 +111,7 @@ TEST(CPUNativeQuantisedWeightView, CompactStrideFollowsTheDecodedPayloadWords)
         const auto view = fixture.view();
         EXPECT_EQ(view.data_stride, static_cast<int>(e.data));
         EXPECT_EQ(view.interleaved_block_stride, e.unit);
-        EXPECT_EQ(view.bytes().size(), std::size_t(128 / 64) * 3 * e.unit);
+        EXPECT_EQ(view.bytes().size(), std::size_t{e.unit}); // one 64x32 unit
     }
 }
 

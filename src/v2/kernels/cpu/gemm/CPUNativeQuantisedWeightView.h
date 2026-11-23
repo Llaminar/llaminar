@@ -366,8 +366,8 @@ namespace llaminar2::cpu::native_quantised
          */
         [[nodiscard]] const std::uint32_t *chunkEffectiveMins(int chunk, int block) const
         {
-            if (!usesCompactMultiScale())
-                throw std::logic_error("Effective minima require compact CPU weights");
+            if (!usesCompactMultiScale() || codebook_id != 10)
+                throw std::logic_error("Effective minima exist only in compact Q2_K weights");
             return reinterpret_cast<const std::uint32_t *>(unit(chunk, block) + data_stride + 256);
         }
 

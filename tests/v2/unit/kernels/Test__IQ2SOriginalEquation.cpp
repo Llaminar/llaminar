@@ -282,8 +282,9 @@ TEST_F(IQ2SOriginalEquation, ScalarAndAllSIMDRowsUseOriginalFactors)
     ASSERT_TRUE(packWeightsCPUNativeQuantised(&tensor, packed, kStart, kStart + kN));
     ASSERT_TRUE(packed.usesCompactMultiScale());
     ASSERT_EQ(packed.codebook_id, 13);
-    EXPECT_EQ(packed.interleaved_block_stride, 1536);
-    EXPECT_EQ(packed.native_interleaved.size(), size_t(2 * kBlocks * 1536));
+    // Three payload words (9 bytes) plus two half-scale vectors; no minima.
+    EXPECT_EQ(packed.interleaved_block_stride, 1024);
+    EXPECT_EQ(packed.native_interleaved.size(), size_t(2 * kBlocks * 1024));
     std::array<std::array<Q8_1Block, kBlocks>, 4> activations{};
     for (int row = 0; row < 4; ++row)
     for (int kb = 0; kb < kBlocks; ++kb)
