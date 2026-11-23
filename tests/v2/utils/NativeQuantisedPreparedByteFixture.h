@@ -124,7 +124,8 @@ public:
                         : static_cast<std::uint16_t>(0xa301u + (seed & 0x0fffu));
                     writeWord(primary + 128, secondary);
                 }
-                if (layout.usesCompactMultiScale())
+                // Only Q2_K's compact unit reserves the effective-minimum vector.
+                if (layout.usesCompactMultiScale() && layout.codebook_id == 10)
                 {
                     const std::uint32_t minima = 0x94019c03u + (seed & 0x003f003fu);
                     std::memcpy(bytes.data() + unit + layout.data_stride + 256 + local * 4,
