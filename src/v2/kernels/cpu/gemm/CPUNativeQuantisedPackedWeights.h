@@ -382,6 +382,51 @@ namespace llaminar2::cpu::native_quantised
         // Accessors for the kernel inner loop
         // -------------------------------------------------------------------
 
+#if defined(__AVX2__) || defined(__AVX512F__)
+        /**
+         * @brief Reconstruct an IQ4_XS source scale strip in registers.
+         * @tparam Columns Eight or sixteen output columns per SIMD strip.
+         * @param chunk 64-column chunk index.
+         * @param block Logical 32-value K block.
+         * @param column First column, aligned to the strip width.
+         * @return Original widened d multiplied by the signed six-bit factor.
+         * @details The caller has proved the physical encoding. Fixed strides
+         * avoid re-dispatching the format in every iteration of the K loop.
+         */
+        template <int Columns>
+        [[nodiscard, gnu::always_inline]] inline auto loadIQ4XSCodedScales(int chunk, int block, int column) const
+        {
+            constexpr auto codebook = kNativeQuantisedIQ4XSSourceScaleCodebook;
+            constexpr auto physical = CPUNativeQuantisedEncoding::NibbleLUTSourceScale;
+            constexpr auto source = native_quantised_formats::IQ4_XS.codebook_id;
+            using Ops = multi_scale::SIMD<Columns>;
+            using L = coded_metadata::Lanes<Ops>;
+            const CPUNativeQuantisedBlockGeometry geometry{preparedInterleavedBlockStride(physical, false, source),
+                preparedSuperblockHeaderBytes(physical, source), static_cast<std::size_t>(blocks_per_row)};
+            const auto *base = interleavedBase() + geometry.blockOffset(chunk, 0);
+            const auto *planes = base + geometry.blockOffset(0, block) +
+                preparedCodedPlaneOffset(physical, preparedDataStride(physical, source));
+            const auto *bases = base + geometry.headerOffset(0, block) + 2 * column;
+            if constexpr (Columns == 16)
+                return coded_metadata::sourceScaleFactors<codebook, Ops>(L::template code<codebook>(planes, column),
+                    _mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(bases)))).primary;
+            else
+            {
+                // BMI2 deposits the two narrow planes into byte slots before
+                // a single widening load; no shuffle masks occupy YMMs.
+                std::uint32_t low;
+                std::uint16_t high;
+                std::memcpy(&low, planes + column / 2, sizeof(low));
+                std::memcpy(&high, planes + 32 + column / 4, sizeof(high));
+                const auto bytes = _pdep_u64(low, 0x0f0f0f0f0f0f0f0full) |
+                    _pdep_u64(high, 0x3030303030303030ull);
+                const auto code = std::bit_cast<typename Ops::I>(_mm256_cvtepu8_epi32(_mm_cvtsi64_si128(bytes)));
+                return coded_metadata::sourceScaleFactors<codebook, Ops>(code,
+                    _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i *>(bases)))).primary;
+            }
+        }
+#endif
+
 #if defined(__AVX512F__)
         /**
          * @brief Widen sixteen ordinary inline FP16 scale words, without factors.
@@ -421,24 +466,23 @@ namespace llaminar2::cpu::native_quantised
                 _mm512_slli_epi32(raw, 1), _mm512_set1_epi32(1))));
         }
 
-        /** @brief Load 16 effective scales from the admitted block and column strip.
+        /** @brief Load 16 effective scales from an admitted nibble block.
          * @param chunk 64-column chunk index.
          * @param block Logical 32-value K block.
          * @param column First column of the strip, a multiple of 16.
          * @return Exact FP32 source factors or widened ordinary scale words.
          */
-        [[nodiscard]] inline __m512 loadScales512(int chunk, int block, int column) const
+        [[nodiscard, gnu::always_inline]] inline __m512 loadScales512(int chunk, int block, int column) const
         {
             if (usesNibbleLUTSourceScale())
-            {
-                constexpr auto codebook = kNativeQuantisedIQ4XSSourceScaleCodebook;
-                using Ops = multi_scale::SIMD<16>;
-                using L = coded_metadata::Lanes<Ops>;
-                const auto *planes = admittedBlockUnit(chunk, block) + preparedCodedPlaneOffset(encoding, data_stride);
-                return coded_metadata::sourceScaleFactors<codebook, Ops>(L::template code<codebook>(planes, column),
-                    L::half(L::template superblockWords<codebook>(admittedSuperblockHeader(chunk, block), column))).primary;
-            }
-            return loadScales512(chunkScales(chunk, block) + column);
+                return loadIQ4XSCodedScales<16>(chunk, block, column);
+            // Only nibble kernels call this overload. The ordinary nibble
+            // unit has no source coefficient; MXFP4 alone widens BF16.
+            const auto *primary = interleavedB(chunk, block, 0, 0) + data_stride + 128 + 2 * column;
+            const __m256i words = _mm256_load_si256(reinterpret_cast<const __m256i *>(primary));
+            return scaleEncoding() == CPUNativeQuantisedScaleEncoding::PowerOfTwoBF16
+                ? _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(words), 16))
+                : _mm512_cvtph_ps(words);
         }
 #endif
 #if defined(__AVX2__)
@@ -461,24 +505,23 @@ namespace llaminar2::cpu::native_quantised
                 _mm256_slli_epi32(raw, 1), _mm256_set1_epi32(1))));
         }
 
-        /** @brief Load 8 effective scales from the admitted block and column strip.
+        /** @brief Load 8 effective scales from an admitted nibble block.
          * @param chunk 64-column chunk index.
          * @param block Logical 32-value K block.
          * @param column First column of the strip, a multiple of 8.
          * @return Exact FP32 source factors or widened ordinary scale words.
          */
-        [[nodiscard]] inline __m256 loadScales256(int chunk, int block, int column) const
+        [[nodiscard, gnu::always_inline]] inline __m256 loadScales256(int chunk, int block, int column) const
         {
             if (usesNibbleLUTSourceScale())
-            {
-                constexpr auto codebook = kNativeQuantisedIQ4XSSourceScaleCodebook;
-                using Ops = multi_scale::SIMD<8>;
-                using L = coded_metadata::Lanes<Ops>;
-                const auto *planes = admittedBlockUnit(chunk, block) + preparedCodedPlaneOffset(encoding, data_stride);
-                return coded_metadata::sourceScaleFactors<codebook, Ops>(L::template code<codebook>(planes, column),
-                    L::half(L::template superblockWords<codebook>(admittedSuperblockHeader(chunk, block), column))).primary;
-            }
-            return loadScales256(chunkScales(chunk, block) + column);
+                return loadIQ4XSCodedScales<8>(chunk, block, column);
+            // Only nibble kernels call this overload. The ordinary nibble
+            // unit has no source coefficient; MXFP4 alone widens BF16.
+            const auto *primary = interleavedB(chunk, block, 0, 0) + data_stride + 128 + 2 * column;
+            const __m128i words = _mm_load_si128(reinterpret_cast<const __m128i *>(primary));
+            return scaleEncoding() == CPUNativeQuantisedScaleEncoding::PowerOfTwoBF16
+                ? _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(words), 16))
+                : _mm256_cvtph_ps(words);
         }
 #endif
 

@@ -146,6 +146,7 @@ namespace llaminar2::cpu::native_quantised
 
         for (int kb = kb_start; kb < kb_end; ++kb)
         {
+            const auto *unit = packed.admittedBlockUnit(chunk, kb);
             const Q8_1Block &activation = A_q8[kb];
             __m256i dot_low = _mm256_setzero_si256();
             __m256i dot_high = _mm256_setzero_si256();
@@ -157,7 +158,7 @@ namespace llaminar2::cpu::native_quantised
             for (int group = 0; group < 4; ++group)
             {
                 const uint8_t *base =
-                    packed.interleavedB(chunk, kb, group, z) + byte_offset;
+                    unit + group * 256 + z * 64 + byte_offset;
                 const __m256i raw = _mm256_loadu_si256(
                     reinterpret_cast<const __m256i *>(base));
                 const __m256i low = _mm256_shuffle_epi8(
@@ -180,7 +181,7 @@ namespace llaminar2::cpu::native_quantised
 
             const __m256i compensation = _mm256_cvtepi16_epi32(
                 _mm_loadu_si128(reinterpret_cast<const __m128i *>(
-                    packed.chunkComp(chunk, kb) + segment * 8)));
+                    reinterpret_cast<const std::int16_t *>(unit + packed.data_stride) + segment * 8)));
             const __m256i corrected = _mm256_sub_epi32(
                 _mm256_add_epi32(dot_low, dot_high),
                 _mm256_mullo_epi32(bias_128_i32, compensation));
@@ -451,6 +452,7 @@ namespace llaminar2::cpu::native_quantised
 
         for (int kb = kb_start; kb < kb_end; ++kb)
         {
+                const auto *unit = packed.admittedBlockUnit(chunk, kb);
                 const Q8_1Block &a0 = A_q8_row0[kb];
                 const Q8_1Block &a1 = A_q8_row1[kb];
                 __m256i dot0_low = _mm256_setzero_si256();
@@ -466,7 +468,7 @@ namespace llaminar2::cpu::native_quantised
                 for (int group = 0; group < 4; ++group)
                 {
                     const uint8_t *base =
-                        packed.interleavedB(chunk, kb, group, z) + byte_offset;
+                        unit + group * 256 + z * 64 + byte_offset;
                     const __m256i raw = _mm256_loadu_si256(
                         reinterpret_cast<const __m256i *>(base));
                     const __m256i low = _mm256_shuffle_epi8(
@@ -499,7 +501,7 @@ namespace llaminar2::cpu::native_quantised
 
                 const __m256i compensation = _mm256_cvtepi16_epi32(
                     _mm_loadu_si128(reinterpret_cast<const __m128i *>(
-                        packed.chunkComp(chunk, kb) + segment * 8)));
+                        reinterpret_cast<const std::int16_t *>(unit + packed.data_stride) + segment * 8)));
                 const __m256i bias =
                     _mm256_mullo_epi32(bias_128_i32, compensation);
                 const __m256i corrected0 = _mm256_sub_epi32(

@@ -1485,7 +1485,7 @@ namespace llaminar2::cpu::native_quantised
      * coded source factors, when present; no source scale is narrowed to half.
      */
     template <NibbleDecodeKind DecodeKind>
-    inline __m512 load_native_avx512_nibble_scales(
+    [[gnu::always_inline]] inline __m512 load_native_avx512_nibble_scales(
         const CPUNativeQuantisedPackedWeights &packed, int chunk, int block, int column)
     {
         if constexpr (DecodeKind == NibbleDecodeKind::Q4_0_LINEAR ||
@@ -1536,6 +1536,7 @@ namespace llaminar2::cpu::native_quantised
         // Swap VNNI roles to consume unchanged signed Q8 bytes directly; the
         // exact32-value integer dot is in [-61440,60960]. No FP term or tree
         // changes. Signed Q4_0/nonlinear LUT retain their original compensation.
+        const auto *unit = packed.admittedBlockUnit(chunk, kb);
         constexpr bool unsigned_identity = DecodeKind == NibbleDecodeKind::Q4_1_IDENTITY;
         const auto activation_word = [](const Q8_1Block &activation, int first)
         {
@@ -1558,6 +1559,11 @@ namespace llaminar2::cpu::native_quantised
         __m512i int_acc2 = _mm512_setzero_si512();
         __m512i int_acc3 = _mm512_setzero_si512();
 
+#if defined(__clang__)
+#pragma clang loop unroll(disable)
+#elif defined(__GNUC__)
+#pragma GCC unroll 1
+#endif
         for (int group = 0; group < 4; ++group)
         {
             /*
@@ -1567,7 +1573,7 @@ namespace llaminar2::cpu::native_quantised
 #define NIBBLE_BLOCK_SUBCHUNK(Z, ACC)                                          \
             {                                                                  \
                 const __m512i raw = _mm512_loadu_si512(                         \
-                    packed.interleavedB(chunk, kb, group, Z));                 \
+                    unit + group * 256 + (Z) * 64);                            \
                 const __m512i low =                                            \
                     decode_low_nibbles_avx512_static<DecodeKind>(              \
                         raw, decode_lut, mask_0F, q4_zero_offset);              \
@@ -1597,7 +1603,7 @@ namespace llaminar2::cpu::native_quantised
         if constexpr (!unsigned_identity)
         {
             const __m512i bias_128_i32 = _mm512_set1_epi32(128);
-            const int16_t *comp_ptr = packed.chunkComp(chunk, kb);
+            const int16_t *comp_ptr = reinterpret_cast<const std::int16_t *>(unit + packed.data_stride);
             int_acc0 = _mm512_sub_epi32(
                 int_acc0,
                 _mm512_mullo_epi32(
@@ -1740,6 +1746,7 @@ namespace llaminar2::cpu::native_quantised
 
         for (int kb = kb_start; kb < kb_end; ++kb)
         {
+            const auto *unit = packed.admittedBlockUnit(chunk, kb);
             const Q8_1Block &a_blk = A_q8[kb];
             float a_scale = nativeQuantisedFP16ScaleToFP32(a_blk.d);
             int16_t a_sum = a_blk.sum_qs;
@@ -1753,6 +1760,11 @@ namespace llaminar2::cpu::native_quantised
             // Group g covers native bytes [g*4..g*4+3]:
             //   low  nibbles → K-elements [g*4 .. g*4+3]     (1st sub)
             //   high nibbles → K-elements [g*4+16 .. g*4+19]  (2nd sub)
+#if defined(__clang__)
+#pragma clang loop unroll(disable)
+#elif defined(__GNUC__)
+#pragma GCC unroll 1
+#endif
             for (int group = 0; group < 4; ++group)
             {
                 /*
@@ -1767,7 +1779,7 @@ namespace llaminar2::cpu::native_quantised
 #define NIBBLE_1ROW_SUBCHUNK(Z, ACC)                                           \
                 {                                                              \
                     const __m512i raw = _mm512_loadu_si512(                     \
-                        packed.interleavedB(chunk, kb, group, Z));             \
+                        unit + group * 256 + (Z) * 64);                        \
                     const __m512i a_low = _mm512_set1_epi32(                   \
                         activation_word(a_blk, group * 4));                    \
                     const __m512i low =                                        \
@@ -1799,7 +1811,7 @@ namespace llaminar2::cpu::native_quantised
             {
                 // Bias correction: corrected = int_acc - 128 * comp
                 // comp is INT16 (halved metadata); load via sign-extend to INT32
-                const int16_t *comp_ptr = packed.chunkComp(chunk, kb);
+                const int16_t *comp_ptr = reinterpret_cast<const std::int16_t *>(unit + packed.data_stride);
                 __m512i comp0 = _mm512_cvtepi16_epi32(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(comp_ptr)));
                 __m512i comp1 = _mm512_cvtepi16_epi32(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(comp_ptr + 16)));
                 __m512i comp2 = _mm512_cvtepi16_epi32(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(comp_ptr + 32)));
@@ -2067,29 +2079,28 @@ namespace llaminar2::cpu::native_quantised
 
                 for (int kb = kb_start; kb < kb_end; ++kb)
                 {
+                    const auto *unit = packed.admittedBlockUnit(chunk, kb);
                     const Q8_1Block &a0 = A_q8_row0[kb];
                     const Q8_1Block &a1 = A_q8_row1[kb];
                     __m512i int0_0 = _mm512_setzero_si512();
                     __m512i int0_1 = _mm512_setzero_si512();
                     __m512i int1_0 = _mm512_setzero_si512();
                     __m512i int1_1 = _mm512_setzero_si512();
-                    __m512i high0_0 = _mm512_setzero_si512();
-                    __m512i high0_1 = _mm512_setzero_si512();
-                    __m512i high1_0 = _mm512_setzero_si512();
-                    __m512i high1_1 = _mm512_setzero_si512();
 
-                    // Low/high16 integer sums are independent dependency chains.
-                    // Even the signed-byte decoder bound is only16*255*128
-                    // per half, well within INT32. Merge the exact integers
-                    // BEFORE original compensation, FP conversion or scaling.
+                    // Consume both halves in the same integer chain to keep
+                    // the live dot bank small. The 32*255*128 bound fits INT32;
+                    // compensation and FP32 accumulation remain block-ordered.
+#if defined(__clang__)
+#pragma clang loop unroll(disable)
+#elif defined(__GNUC__)
+#pragma GCC unroll 1
+#endif
                     for (int group = 0; group < 4; ++group)
                     {
                         const __m512i raw0 = _mm512_loadu_si512(
-                            packed.interleavedB(
-                                chunk, kb, group, zbase));
+                            unit + group * 256 + zbase * 64);
                         const __m512i raw1 = _mm512_loadu_si512(
-                            packed.interleavedB(
-                                chunk, kb, group, zbase + 1));
+                            unit + group * 256 + (zbase + 1) * 64);
                         const __m512i low0 =
                             decode_low_nibbles_avx512_static<DecodeKind>(
                                 raw0,
@@ -2134,7 +2145,7 @@ namespace llaminar2::cpu::native_quantised
                                 a_low, low0, low1)                             \
                             const __m512i a_high = _mm512_set1_epi32(          \
                                 activation_word(BLOCK, group * 4 + 16));       \
-                            ORDERED_2ROW_DOT_HALF(high##ROW##_0, high##ROW##_1,\
+                            ORDERED_2ROW_DOT_HALF(int##ROW##_0, int##ROW##_1,  \
                                 a_high, high0, high1)                          \
                         }
                         ORDERED_2ROW_DOT(0, a0)
@@ -2142,15 +2153,11 @@ namespace llaminar2::cpu::native_quantised
 #undef ORDERED_2ROW_DOT
 #undef ORDERED_2ROW_DOT_HALF
                     }
-                    int0_0 = _mm512_add_epi32(int0_0, high0_0);
-                    int0_1 = _mm512_add_epi32(int0_1, high0_1);
-                    int1_0 = _mm512_add_epi32(int1_0, high1_0);
-                    int1_1 = _mm512_add_epi32(int1_1, high1_1);
 
                     if constexpr (!unsigned_identity)
                     {
                         const int16_t *comp =
-                            packed.chunkComp(chunk, kb) + zbase * 16;
+                            reinterpret_cast<const std::int16_t *>(unit + packed.data_stride) + zbase * 16;
                         const __m512i bias0 = _mm512_mullo_epi32(
                             bias_128_i32,
                             _mm512_cvtepi16_epi32(_mm256_loadu_si256(
@@ -2389,6 +2396,7 @@ namespace llaminar2::cpu::native_quantised
 
                 for (int kb = kb_start; kb < kb_end; ++kb)
                 {
+                    const auto *unit = packed.admittedBlockUnit(chunk, kb);
                     const Q8_1Block &a0 = A_q8_row0[kb];
                     const Q8_1Block &a1 = A_q8_row1[kb];
                     const Q8_1Block &a2 = A_q8_row2[kb];
@@ -2399,14 +2407,17 @@ namespace llaminar2::cpu::native_quantised
                     __m512i int2_0 = _mm512_setzero_si512();
                     __m512i int2_1 = _mm512_setzero_si512();
 
+#if defined(__clang__)
+#pragma clang loop unroll(disable)
+#elif defined(__GNUC__)
+#pragma GCC unroll 1
+#endif
                     for (int group = 0; group < 4; ++group)
                     {
                         const __m512i raw0 = _mm512_loadu_si512(
-                            packed.interleavedB(
-                                chunk, kb, group, zbase));
+                            unit + group * 256 + zbase * 64);
                         const __m512i raw1 = _mm512_loadu_si512(
-                            packed.interleavedB(
-                                chunk, kb, group, zbase + 1));
+                            unit + group * 256 + (zbase + 1) * 64);
                         const __m512i low0 =
                             decode_low_nibbles_avx512_static<DecodeKind>(
                                 raw0,
@@ -2460,7 +2471,7 @@ namespace llaminar2::cpu::native_quantised
                     // arithmetic authority; no combined scale/min expression.
 #define ORDERED_3ROW_FOLD_SEGMENT(SEGMENT)                                    \
                     {                                                        \
-                        const int16_t *comp = packed.chunkComp(chunk, kb) +  \
+                        const int16_t *comp = reinterpret_cast<const std::int16_t *>(unit + packed.data_stride) +  \
                             (zbase + SEGMENT) * 16;                          \
                         const __m512i bias = _mm512_mullo_epi32(             \
                             bias_128_i32, _mm512_cvtepi16_epi32(             \
@@ -3584,6 +3595,7 @@ namespace llaminar2::cpu::native_quantised
 
         for (int kb = kb_start; kb < kb_end; ++kb)
         {
+            const auto *unit = packed.admittedBlockUnit(chunk, kb);
             const Q8_1Block &a0 = A_q8_row0[kb];
             const Q8_1Block &a1 = A_q8_row1[kb];
             __m512i ia0_0 = _mm512_setzero_si512(), ia0_1 = _mm512_setzero_si512();
@@ -3591,6 +3603,11 @@ namespace llaminar2::cpu::native_quantised
             __m512i ia1_0 = _mm512_setzero_si512(), ia1_1 = _mm512_setzero_si512();
             __m512i ia1_2 = _mm512_setzero_si512(), ia1_3 = _mm512_setzero_si512();
 
+#if defined(__clang__)
+#pragma clang loop unroll(disable)
+#elif defined(__GNUC__)
+#pragma GCC unroll 1
+#endif
             for (int group = 0; group < 4; ++group)
             {
                 // A full four-subchunk decode keeps eight decoded vectors alive
@@ -3602,7 +3619,7 @@ namespace llaminar2::cpu::native_quantised
 #define NIBBLE_2ROW_SUBCHUNK(Z, IA0, IA1)                                        \
                 {                                                                \
                     const __m512i raw = _mm512_loadu_si512(                       \
-                        packed.interleavedB(chunk, kb, group, Z));               \
+                        unit + group * 256 + (Z) * 64);                        \
                     {                                                            \
                         const __m512i decoded = [&]()                            \
                         {                                                        \
@@ -3658,7 +3675,7 @@ namespace llaminar2::cpu::native_quantised
             }
 
             // Bias correction + scale (shared comp/scales loads, per-row a_scale)
-            const int16_t *comp_ptr = packed.chunkComp(chunk, kb);
+            const int16_t *comp_ptr = reinterpret_cast<const std::int16_t *>(unit + packed.data_stride);
             __m512i c0 = _mm512_cvtepi16_epi32(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(comp_ptr)));
             __m512i c1 = _mm512_cvtepi16_epi32(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(comp_ptr + 16)));
             __m512i c2 = _mm512_cvtepi16_epi32(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(comp_ptr + 32)));
@@ -4555,6 +4572,7 @@ namespace llaminar2::cpu::native_quantised
 
             for (int kb = kb_start; kb < kb_end; ++kb)
             {
+                const auto *unit = packed.admittedBlockUnit(chunk, kb);
                 const Q8_1Block &a0 = A_q8_row0[kb];
                 const Q8_1Block &a1 = A_q8_row1[kb];
                 const Q8_1Block &a2 = A_q8_row2[kb];
@@ -4563,12 +4581,17 @@ namespace llaminar2::cpu::native_quantised
                 __m512i ia1_0 = _mm512_setzero_si512(), ia1_1 = _mm512_setzero_si512();
                 __m512i ia2_0 = _mm512_setzero_si512(), ia2_1 = _mm512_setzero_si512();
 
+#if defined(__clang__)
+#pragma clang loop unroll(disable)
+#elif defined(__GNUC__)
+#pragma GCC unroll 1
+#endif
                 for (int group = 0; group < 4; ++group)
                 {
                     const __m512i raw0 =
-                        _mm512_loadu_si512(packed.interleavedB(chunk, kb, group, zbase));
+                        _mm512_loadu_si512(unit + group * 256 + zbase * 64);
                     const __m512i raw1 =
-                        _mm512_loadu_si512(packed.interleavedB(chunk, kb, group, zbase + 1));
+                        _mm512_loadu_si512(unit + group * 256 + (zbase + 1) * 64);
                     const __m512i lo0 = decode_low_nibbles_avx512(
                         raw0, decode_lut, decode_kind, mask_0F, q4_zero_offset);
                     const __m512i lo1 = decode_low_nibbles_avx512(
@@ -4595,7 +4618,7 @@ namespace llaminar2::cpu::native_quantised
 #undef NIBBLE_3ROW_ACCUM
                 }
 
-                const int16_t *comp_ptr = packed.chunkComp(chunk, kb) + zbase * 16;
+                const int16_t *comp_ptr = reinterpret_cast<const std::int16_t *>(unit + packed.data_stride) + zbase * 16;
                 const __m512i comp0 =
                     _mm512_cvtepi16_epi32(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(comp_ptr)));
                 const __m512i comp1 =
@@ -4867,6 +4890,7 @@ namespace llaminar2::cpu::native_quantised
 
             for (int kb = kb_start; kb < kb_end; ++kb)
             {
+                const auto *unit = packed.admittedBlockUnit(chunk, kb);
                 const Q8_1Block &a0 = A_q8_row0[kb];
                 const Q8_1Block &a1 = A_q8_row1[kb];
                 const Q8_1Block &a2 = A_q8_row2[kb];
@@ -4877,10 +4901,15 @@ namespace llaminar2::cpu::native_quantised
                 __m512i ia2 = _mm512_setzero_si512();
                 __m512i ia3 = _mm512_setzero_si512();
 
+#if defined(__clang__)
+#pragma clang loop unroll(disable)
+#elif defined(__GNUC__)
+#pragma GCC unroll 1
+#endif
                 for (int group = 0; group < 4; ++group)
                 {
                     const __m512i raw =
-                        _mm512_loadu_si512(packed.interleavedB(chunk, kb, group, z));
+                        _mm512_loadu_si512(unit + group * 256 + z * 64);
                     const __m512i lo = decode_low_nibbles_avx512(
                         raw, decode_lut, decode_kind, mask_0F, q4_zero_offset);
                     const __m512i hi = decode_high_nibbles_avx512(
@@ -4902,7 +4931,7 @@ namespace llaminar2::cpu::native_quantised
 #undef NIBBLE_4ROW_ACCUM
                 }
 
-                const int16_t *comp_ptr = packed.chunkComp(chunk, kb) + z * 16;
+                const int16_t *comp_ptr = reinterpret_cast<const std::int16_t *>(unit + packed.data_stride) + z * 16;
                 const __m512i comp =
                     _mm512_cvtepi16_epi32(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(comp_ptr)));
                 const __m512i bias = _mm512_mullo_epi32(bias_128_i32, comp);
