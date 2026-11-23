@@ -3479,11 +3479,16 @@ namespace llaminar
                         const auto *original = dynamic_cast<rocm::ROCmQuantisedGemmKernel *>(source.get());
                         if (!original || original->rocm_device_id() != device.gpu_ordinal())
                             throw std::invalid_argument("Expert service view ROCm owner mismatch");
+                        // The view borrows the original planes, so it must also
+                        // borrow their metadata representation (per-block or coded).
+                        DeviceNativeQuantisedMatrixDesc original_desc{};
+                        if (!original->inspectPreparedNativeQuantisedMatrixDesc(original_desc))
+                            throw std::invalid_argument("Expert service view ROCm owner has no prepared native matrix");
                         return std::make_shared<rocm::ROCmQuantisedGemmKernel>(
                             d.n, d.k, device.gpu_ordinal(), d.ptrs.d_vnni,
                             d.ptrs.d_scales, d.ptrs.d_mins, d.ptrs.d_emins,
                             d.codebook_id, d.blocks_per_row, source,
-                            prepared.format.native_quantised, allocation);
+                            prepared.format.native_quantised, allocation, original_desc.metadata_layout);
                     }
 #endif
                 }

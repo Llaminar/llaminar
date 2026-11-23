@@ -36,18 +36,16 @@ __device__ __forceinline__ float persistentMoEFFNPartial(const DeviceNativeQuant
     const int blocks=K/32,width=(blocks+partitions-1)/partitions;
     const int first=part*width,last=min(blocks,first+width);
     const auto* payload=descriptor->payload;
-    const auto* weight_scales=static_cast<const uint16_t*>(descriptor->scales);
-    const auto* mins=static_cast<const uint16_t*>(descriptor->mins);
-    const auto* emins=static_cast<const uint32_t*>(descriptor->emins);
+    // Per-block or superblock-coded metadata of this immutable expert matrix.
+    const auto meta=::llaminar2::native_quantised_scale::metadataPlanes(*descriptor);
     float accumulator=0.f;
     #pragma unroll 1
     for(int block=first;block<last;++block)
     {
         const auto* activation=reinterpret_cast<const int32_t*>(codes+size_t(block)*32);
-        const size_t linear=size_t(block)*N+n;
         // This is the same source decoder and complete rounded-block commit
         // used by the original producer. Integer summation has no overflow.
-        moePairedK32CommitPlanes<FMT>(payload,weight_scales,mins,emins,linear,
+        moePairedK32CommitPlanes<FMT>(payload,meta,::llaminar2::rocm_native_metadata::blockAddress(meta,uint32_t(block),uint32_t(n),uint32_t(N)),
             activation,scales[block],sums[block],accumulator);
     }
     return accumulator;

@@ -17,6 +17,7 @@
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "execution/local_execution/graph/DeviceGraphExecutor.h"
 #include "execution/local_execution/device/DeviceContext.h"
+#include "kernels/rocm/gemm/ROCmNativeQuantisedBlockMetadata.h"
 #include "kernels/rocm/gemm/ROCmGroupedVerifierLaunch.h"
 #include "kernels/rocm/gemm/ROCmNativeQuantisedVerifierLaunch.h"
 #include "kernels/rocm/gemm/ROCmNativeQuantisedArchitecture.h"
@@ -373,7 +374,7 @@ static void proveDeviceCountedRows(
             else if (bundle == VerifierProjectionBundle::Single)
             {
                 launched = rocmGemv_native_quantised_small_m_fp32_with_sums_policy(
-                    quant, matrix.payload, matrix.scales, matrix.mins, matrix.emins,
+                    quant, matrix.payload, ::llaminar2::native_quantised_scale::metadataPlanes(matrix),
                     static_cast<float *>(output->gpu_data_ptr()), scales, sums, partials,
                     M, N, K, matrix.codebook_id,
                     canonicalDeviceVnniCodebookId(matrix.arithmeticPolicyCodebookId()),
@@ -384,8 +385,7 @@ static void proveDeviceCountedRows(
                 // Launch descriptors are copied during capture, while every
                 // mutable payload and count remains device-owned.
                 std::array<const uint8_t *, 3> payloads{};
-                std::array<const uint16_t *, 3> weight_scales{}, mins{};
-                std::array<const uint32_t *, 3> emins{};
+                std::array<::llaminar2::rocm_native_metadata::MetadataPlanes, 3> metas{};
                 std::array<float *, 3> outputs{}, scratch{};
                 std::array<const float *, 3> biases{};
                 std::array<int, 3> columns{N, N, N};
@@ -393,9 +393,8 @@ static void proveDeviceCountedRows(
                 for (int p = 0; p < projection_count; ++p)
                 {
                     payloads[p] = matrix.payload;
-                    weight_scales[p] = static_cast<const uint16_t *>(matrix.scales);
-                    mins[p] = static_cast<const uint16_t *>(matrix.mins);
-                    emins[p] = static_cast<const uint32_t *>(matrix.emins);
+                    // The prepared descriptor's own representation (per-block or coded).
+                    metas[p] = ::llaminar2::native_quantised_scale::metadataPlanes(matrix);
                     outputs[p] = static_cast<float *>(output->gpu_data_ptr()) + p * M * N;
                     scratch[p] = partials + p * partial_slice;
                     codebooks[p] = matrix.codebook_id;
@@ -406,11 +405,11 @@ static void proveDeviceCountedRows(
                 {
                     if (bundle == VerifierProjectionBundle::Homogeneous)
                         return rocmGemv_native_quantised_small_m_batched_fp32_with_sums_policy(
-                            quant, payloads.data(), weight_scales.data(), mins.data(), emins.data(),
+                            quant, payloads.data(), metas.data(),
                             biases.data(), outputs.data(), scales, activation_sums, scratch.data(), columns.data(),
                             projection_count, M, K, matrix.codebook_id, 0, stream, -1, -1, &rows);
                     return rocmGemv_native_quantised_small_m_batched_mixed_fp32_with_sums_policy(
-                            quant, payloads.data(), weight_scales.data(), mins.data(), emins.data(),
+                            quant, payloads.data(), metas.data(),
                             biases.data(), outputs.data(), scales, activation_sums, scratch.data(), columns.data(),
                             codebooks.data(), projection_count, M, K, 0, stream, -1, -1, &rows);
                 };

@@ -135,10 +135,9 @@ __global__ __launch_bounds__(BN * 4) void projection(MoEGroupedWmmaArguments v)
     // Each physical-format launch has exactly its own descriptor writers.
     // In particular, an IQ4_NL descriptor never borrows IQ4_XS auxiliary data.
     if (desc.codebook_id != FMT) return;
-    if (!desc.payload || !desc.scales || desc.n != v.n || desc.k != v.k ||
+    if (!desc.payload || desc.n != v.n || desc.k != v.k ||
         desc.blocks_per_row != static_cast<uint32_t>(v.k / 32) ||
-        (Traits::needs_aux_compute && !desc.mins) ||
-        (Traits::is_dual_scale_asym && !desc.emins)) __builtin_trap();
+        !::llaminar2::rocm_native_metadata::descriptorMetadataComplete(desc, Traits::needs_aux_compute, Traits::is_dual_scale_asym)) __builtin_trap();
     const auto producer = v.dot_admission.select(desc,count);
     if (producer == MoEGroupedDotProducer::Invalid) __builtin_trap();
     if constexpr (!Adaptive)
@@ -207,9 +206,13 @@ __global__ __launch_bounds__(BN * 4) void projection(MoEGroupedWmmaArguments v)
                 if (kb < end && n0 + col < v.n)
                 {
                     load_payload<Traits::payload_bytes>(desc.payload + linear * Traits::payload_bytes, raw);
-                    scale = ::llaminar2::native_quantised_scale::loadStagedPrimary<static_cast<uint8_t>(FMT)>(static_cast<const uint16_t *>(desc.scales), linear);
-                    if constexpr (Traits::needs_aux_compute) aux = static_cast<const uint16_t *>(desc.mins)[linear];
-                    if constexpr (Traits::is_dual_scale_asym) emin = static_cast<const uint32_t *>(desc.emins)[linear];
+                    // One metadata authority for per-block and superblock-coded descriptors.
+                    const auto block_meta = ::llaminar2::rocm_native_metadata::blockMetadata<static_cast<uint8_t>(FMT)>(
+                        ::llaminar2::native_quantised_scale::metadataPlanes(desc), static_cast<uint32_t>(kb),
+                        static_cast<uint32_t>(n0 + col), static_cast<uint32_t>(v.n));
+                    scale = block_meta.primary;
+                    if constexpr (Traits::needs_aux_compute) aux = block_meta.secondary;
+                    if constexpr (Traits::is_dual_scale_asym) emin = block_meta.emin;
                 }
                 int decoded[8]; decode_block<FMT>(raw, decoded);
                 I32x4 lo, hi;

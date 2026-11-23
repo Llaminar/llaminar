@@ -40,6 +40,10 @@ struct NativeQuantisedSmallMBatchedArgs
     float* output[NATIVE_QUANTISED_SMALL_M_MAX_BATCH] = {};
     float* partial[NATIVE_QUANTISED_SMALL_M_MAX_BATCH] = {};
     uint8_t codebook[NATIVE_QUANTISED_SMALL_M_MAX_BATCH] = {};
+    /// Packed metadata layout per projection (nativeQuantisedMetadataLayout): zero
+    /// for per-block planes; a superblock-coded matrix carries its codes in
+    /// `scales` and its per-superblock d/dmin words in `mins` (no emins).
+    uint8_t metadata_layout[NATIVE_QUANTISED_SMALL_M_MAX_BATCH] = {};
     // Preserve the aligned projection planes at the front of the launch ABI.
     // Row admission dies before decoder dispatch, unlike those live operands.
     llaminar2::DeviceRowRange rows; ///< Original prefix/grid geometry.
@@ -115,6 +119,9 @@ struct NativeQuantisedVerifierBundleMember {
     const uint8_t *weights = nullptr;
     const uint16_t *scales = nullptr, *mins = nullptr;
     const uint32_t *emins = nullptr;
+    /// Packed metadata layout of these planes (nativeQuantisedMetadataLayout);
+    /// zero is the per-block representation.
+    uint8_t metadata_layout = 0;
     float *output = nullptr;
     int n = 0;
     NativeQuantisedSourceIdentity source{};

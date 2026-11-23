@@ -30,6 +30,7 @@
 #include "backends/IBackend.h"
 #include "execution/moe/ExpertTierWeightStream.h"
 #include "kernels/KernelFactory.h"
+#include "kernels/rocm/gemm/ROCmNativeQuantisedBlockMetadata.h"
 #include "kernels/rocm/gemm/ROCmFloatingPointGemmKernel.h"
 #include "execution/moe/ExpertTierWeightTransferLane.h"
 #include "execution/moe/MoEOverlayGpuRemoteProjectionEndpoint.h"
@@ -86,9 +87,7 @@ extern "C"
     bool rocmGemv_native_quantised_fp32(
         const std::int8_t *d_A_int8,
         const std::uint8_t *d_payload,
-        const void *d_block_scales,
-        const void *d_block_mins,
-        const void *d_block_emins,
+    const ::llaminar2::rocm_native_metadata::MetadataPlanes d_meta,
         float *d_C_fp32,
         const float *d_scale_A,
         float *d_partial_fp32,
@@ -103,9 +102,7 @@ extern "C"
     bool rocmGemv_native_quantised_fp32_with_policy(
         const std::int8_t *d_A_int8,
         const std::uint8_t *d_payload,
-        const void *d_block_scales,
-        const void *d_block_mins,
-        const void *d_block_emins,
+    const ::llaminar2::rocm_native_metadata::MetadataPlanes d_meta,
         float *d_C_fp32,
         const float *d_scale_A,
         float *d_partial_fp32,
@@ -121,9 +118,7 @@ extern "C"
     bool rocmGemv_native_quantised_small_m_fp32(
         const std::int8_t *d_A_int8,
         const std::uint8_t *d_payload,
-        const void *d_block_scales,
-        const void *d_block_mins,
-        const void *d_block_emins,
+    const ::llaminar2::rocm_native_metadata::MetadataPlanes d_meta,
         float *d_C_fp32,
         const float *d_scale_A_blockwise,
         float *d_partial_fp32,
@@ -138,9 +133,7 @@ extern "C"
     bool rocmGemv_native_quantised_small_m_fp32_with_policy(
         const std::int8_t *d_A_int8,
         const std::uint8_t *d_payload,
-        const void *d_block_scales,
-        const void *d_block_mins,
-        const void *d_block_emins,
+    const ::llaminar2::rocm_native_metadata::MetadataPlanes d_meta,
         float *d_C_fp32,
         const float *d_scale_A_blockwise,
         float *d_partial_fp32,
@@ -156,9 +149,7 @@ extern "C"
     bool rocmGemm_native_quantised_fp32(
         const std::int8_t *d_A_int8,
         const std::uint8_t *d_payload,
-        const void *d_block_scales,
-        const void *d_block_mins,
-        const void *d_block_emins,
+    const ::llaminar2::rocm_native_metadata::MetadataPlanes d_meta,
         float *d_output,
         const float *d_scales_A,
         const float *d_scales_A_blockwise,
@@ -173,9 +164,7 @@ extern "C"
     bool rocmGemm_native_quantised_fp32_with_policy(
         const std::int8_t *d_A_int8,
         const std::uint8_t *d_payload,
-        const void *d_block_scales,
-        const void *d_block_mins,
-        const void *d_block_emins,
+    const ::llaminar2::rocm_native_metadata::MetadataPlanes d_meta,
         float *d_output,
         const float *d_scales_A,
         const float *d_scales_A_blockwise,
@@ -683,11 +672,9 @@ namespace llaminar2
                             throw std::runtime_error("Deferred M1 fixture dirty history failed");
                         std::optional<ProjectionRowWorkScope> work_scope;
                         if(mixed_work && p==0)work_scope.emplace(inactive_work);
-                        const bool ok=grouped?enqueueNativeM1Producer(tickets[p],activation.data(),w.payload.data(),
-                            w.scales.data(),w.mins.data(),w.emins.data(),w.output.data(),nullptr,w.partials.data(),
+                        const bool ok=grouped?enqueueNativeM1Producer(tickets[p],activation.data(),w.payload.data(), ::llaminar2::rocm_native_metadata::perBlockMetadataPlanes(w.scales.data(), w.mins.data(), w.emins.data()),w.output.data(),nullptr,w.partials.data(),
                             widths[p],K,w.packed.codebook_id,canonicalDeviceVnniCodebookId(w.packed.source_codebook_id),0,stream.opaque(),activation_scales.data()):
-                            rocmGemv_native_quantised_fp32_with_policy(activation.data(),w.payload.data(),w.scales.data(),
-                            w.mins.data(),w.emins.data(),w.output.data(),nullptr,w.partials.data(),widths[p],K,
+                            rocmGemv_native_quantised_fp32_with_policy(activation.data(),w.payload.data(), ::llaminar2::rocm_native_metadata::perBlockMetadataPlanes(w.scales.data(), w.mins.data(), w.emins.data()),w.output.data(),nullptr,w.partials.data(),widths[p],K,
                             w.packed.codebook_id,canonicalDeviceVnniCodebookId(w.packed.source_codebook_id),0,stream.opaque(),activation_scales.data());
                         if(!ok)throw std::runtime_error("Deferred M1 fixture original producer failed");
                         // The ticket, not this retired TLS scope, owns reduction
@@ -1700,10 +1687,7 @@ namespace llaminar2
                 TestHIPStream stream;
                 ASSERT_TRUE(rocmGemv_native_quantised_fp32_with_policy(
                     device_activation.data(),
-                    payload.data(),
-                    scales.data(),
-                    nullptr,
-                    nullptr,
+                    payload.data(), ::llaminar2::rocm_native_metadata::perBlockMetadataPlanes(scales.data(), nullptr, nullptr),
                     device_output.data(),
                     nullptr,
                     partials.data(),
@@ -2690,7 +2674,7 @@ namespace llaminar2
                         // Include migration-only physical23 with its original source
                         // policy in the deferred ordinary publication coverage.
                         rocm::NativeM1ReductionTicket ticket;
-                        if(!rocm::enqueueNativeM1Producer(ticket,activation.data(),payload,scales,mins,nullptr,
+                        if(!rocm::enqueueNativeM1Producer(ticket,activation.data(),payload, ::llaminar2::rocm_native_metadata::perBlockMetadataPlanes(scales, mins, nullptr),
                             output,nullptr,partials.data(),N,K,codebook,arithmetic_policy_codebook,0,
                             stream.opaque(),activation_scales.data()))return false;
                         return rocm::submitNativeM1Reductions(std::span(&ticket,1),0,stream.opaque());
@@ -2698,13 +2682,13 @@ namespace llaminar2
                     if (rows == verifier_rows)
                     {
                         return rocmGemv_native_quantised_small_m_fp32_with_policy(
-                            activation.data(), payload, scales, mins, nullptr,
+                            activation.data(), payload, ::llaminar2::rocm_native_metadata::perBlockMetadataPlanes(scales, mins, nullptr),
                             output, activation_scales.data(), partials.data(),
                             rows, N, K, codebook,
                             arithmetic_policy_codebook, 0, stream.opaque());
                     }
                     return rocmGemm_native_quantised_fp32_with_policy(
-                        activation.data(), payload, scales, mins, nullptr,
+                        activation.data(), payload, ::llaminar2::rocm_native_metadata::perBlockMetadataPlanes(scales, mins, nullptr),
                         output, nullptr, activation_scales.data(), rows, N, K,
                         codebook, arithmetic_policy_codebook, 0,
                         stream.opaque());
@@ -2885,10 +2869,7 @@ namespace llaminar2
             ScopedROCmDecodeEquivalentM1 decode_equivalent_scope;
             ASSERT_TRUE(rocmGemv_native_quantised_fp32(
                 activation.data(),
-                payload.data(),
-                scales.data(),
-                nullptr,
-                nullptr,
+                payload.data(), ::llaminar2::rocm_native_metadata::perBlockMetadataPlanes(scales.data(), nullptr, nullptr),
                 baseline_output.data(),
                 nullptr,
                 partials.data(),
@@ -2938,10 +2919,7 @@ namespace llaminar2
 
             ASSERT_TRUE(rocmGemv_native_quantised_fp32(
                 activation.data(),
-                payload.data(),
-                scales.data(),
-                nullptr,
-                nullptr,
+                payload.data(), ::llaminar2::rocm_native_metadata::perBlockMetadataPlanes(scales.data(), nullptr, nullptr),
                 concurrent_output.data(),
                 nullptr,
                 partials.data(),

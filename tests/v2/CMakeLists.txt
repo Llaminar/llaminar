@@ -6144,6 +6144,29 @@ if(HAVE_ROCM AND (NOT V2_PERF_TESTS_ONLY OR V2_ROCM_REGISTER_LIFETIME_OWNER_SELE
         LABELS "V2;Integration;ProductionTestPreflight;ROCm;GEMM;AllFormats;Regression"
         MPI_PROCS 1 NO_MODELS TIMEOUT 120
     )
+    # Superblock-coded metadata on ROCm: the production repack writes per-block
+    # codes plus per-superblock d/dmin at file density, and the shared codec
+    # reconstructs every per-block word, for all codable formats and a
+    # mid-superblock column slice.
+    add_executable(v2_integration_rocm_superblock_coded_metadata
+        integration/kernels/rocm/Test__ROCmSuperblockCodedMetadata.cpp)
+    target_include_directories(v2_integration_rocm_superblock_coded_metadata
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR} ${ROCM_PATH}/include)
+    if(LLAMINAR_SHARED_CORE)
+        target_link_libraries(v2_integration_rocm_superblock_coded_metadata
+            PRIVATE llaminar2_core hip::host GTest::gtest)
+    else()
+        target_link_libraries_with_groups(v2_integration_rocm_superblock_coded_metadata
+            llaminar2_core -Wl,--whole-archive rocm_backend -Wl,--no-whole-archive
+            hip::host GTest::gtest)
+    endif()
+    target_compile_features(v2_integration_rocm_superblock_coded_metadata PRIVATE cxx_std_23)
+    add_v2_test(V2_Integration_ROCmSuperblockCodedMetadata
+        COMMAND $<TARGET_FILE:v2_integration_rocm_superblock_coded_metadata>
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;GEMM;ByteExact;AllFormats;NativeQuantised;Memory;GraphCapture;Replay;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 300
+    )
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmSuperblockCodedMetadata)
 endif()
 
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/V2ROCmLTOArtifactTests.cmake)

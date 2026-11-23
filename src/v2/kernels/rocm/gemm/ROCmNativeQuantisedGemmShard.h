@@ -19,13 +19,12 @@
 #include <cstddef>
 #include <cstdint>
 #include "ROCmVNNIPrefillLaunch.h"
+#include "kernels/rocm/gemm/ROCmNativeQuantisedBlockMetadata.h"
 
 using ROCmNativeQuantisedGemmShardFn = bool (*)(
     const int8_t *d_A_int8,
     const uint8_t *d_payload,
-    const void *d_block_scales,
-    const void *d_block_mins,
-    const void *d_block_emins,
+    const ::llaminar2::rocm_native_metadata::MetadataPlanes d_meta,
     float *d_output,
     const float *d_scales_A,
     const float *d_scales_A_blockwise,
@@ -48,8 +47,9 @@ using ROCmNativeQuantisedGridInitShardFn = bool (*)(
 
 #define LLAMINAR_DECLARE_ROCM_NATIVE_QUANTISED_GEMM_SHARD(INDEX)                   \
     extern "C" bool rocmGemm_native_quantised_fp32_shard_##INDEX(           \
-        const int8_t *, const uint8_t *, const void *, const void *,    \
-        const void *, float *, const float *, const float *, int, int,  \
+        const int8_t *, const uint8_t *,                                \
+        ::llaminar2::rocm_native_metadata::MetadataPlanes,              \
+        float *, const float *, const float *, int, int,                \
         int, uint8_t, uint8_t, int, void *);                            \
     extern "C" bool rocmInitIQGridTables_gemm_shard_##INDEX(            \
         int, const void *, const void *, const void *, const void *,     \

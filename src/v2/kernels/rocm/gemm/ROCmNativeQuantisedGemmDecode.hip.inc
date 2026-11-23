@@ -14,6 +14,7 @@
 #include "../../../tensors/NativeQuantisedFormatInfo.h"
 #include "../../../backends/rocm/HipDeviceGuard.h"
 #include "ROCmNativeQuantisedNibbleLUT.h"
+#include "kernels/rocm/gemm/ROCmNativeQuantisedBlockMetadata.h"
 
 // ============================================================================
 // Format tags — full set matching ROCmGemvKernel_native_quantised.hip
@@ -458,8 +459,10 @@ __device__ __forceinline__ void decode_block(
         // IQ3_S (13B) / IQ3_XXS (12B): grid lookup + sign application
         if constexpr (!Traits::has_qh)
         {
-            // IQ3_XXS: 3 dwords [qs0-7][signs0-3]
-            const uint32_t w0 = raw[0], w1 = raw[1], w2 = raw[2];
+            // IQ3_XXS: 3 dwords [qs0-7][signs0-3]; coded payloads keep their
+            // scale code in the sign parity bits, restored here (idempotent).
+            const uint32_t w0 = raw[0], w1 = raw[1];
+            const uint32_t w2 = ::llaminar2::rocm_native_metadata::restoreSignParityWord<static_cast<uint8_t>(FMT)>(raw[2]);
             #pragma unroll
             for (int g = 0; g < 8; ++g)
             {
@@ -495,8 +498,9 @@ __device__ __forceinline__ void decode_block(
     {
         if constexpr (!Traits::has_qh)
         {
-            // IQ2_XXS (8B): 2 dwords [qs0-3][signs0-3]
-            const uint32_t w_qs = raw[0], w_signs = raw[1];
+            // IQ2_XXS (8B): 2 dwords [qs0-3][signs0-3]; sign parity restored (coded payloads).
+            const uint32_t w_qs = raw[0];
+            const uint32_t w_signs = ::llaminar2::rocm_native_metadata::restoreSignParityWord<static_cast<uint8_t>(FMT)>(raw[1]);
             #pragma unroll
             for (int l = 0; l < 4; ++l)
             {
@@ -512,8 +516,10 @@ __device__ __forceinline__ void decode_block(
         else
         {
             // IQ2_S (9B) / IQ2_XS (9B): [qs0-3][qh+signs0-2] + signs3
-            const uint32_t w_qs = raw[0], w_qh_signs = raw[1];
-            const uint8_t signs3 = reinterpret_cast<const uint8_t*>(raw)[8];
+            // IQ2_XS sign parity restored (coded payloads); qh lane and IQ2_S untouched.
+            const uint32_t w_qs = raw[0];
+            const uint32_t w_qh_signs = ::llaminar2::rocm_native_metadata::restoreSignParityWord<static_cast<uint8_t>(FMT), 0xFFFFFF00u>(raw[1]);
+            const uint8_t signs3 = ::llaminar2::rocm_native_metadata::restoreSignParity<static_cast<uint8_t>(FMT)>(reinterpret_cast<const uint8_t*>(raw)[8]);
             #pragma unroll
             for (int l = 0; l < 4; ++l)
             {

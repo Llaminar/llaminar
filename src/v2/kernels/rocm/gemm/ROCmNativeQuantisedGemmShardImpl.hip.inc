@@ -580,9 +580,8 @@ __device__ __forceinline__ void load_serial_m1_partition_sum(
  * @tparam FULL_TILES Admission proved every M/N/K tile fully live.
  * @param d_A_int8 Row-major prepared INT8 activations.
  * @param d_payload Compact weight blocks in K-block/column order.
- * @param d_block_scales Primary FP16 weight scale per block/column.
- * @param d_block_mins Optional auxiliary weight scale or minimum plane.
- * @param d_block_emins Optional packed FP16 minimum pairs for Q2_K.
+ * @param d_meta Block metadata: per-block primary/auxiliary/Q2_K minimum planes,
+ *        or superblock-coded codes plus per-superblock d/dmin words.
  * @param d_output Live row-major FP32 output extent.
  * @param d_scales_A Whole-row activation scales when the block plane is absent.
  * @param M Live activation rows; inactive tails never read row scales.
@@ -597,14 +596,13 @@ template <int N_TILE,
           NativeQuantisedGemmFormat FMT,
           int MIN_BLOCKS = 2,
           int UNROLL_G = 4,
-          bool FULL_TILES = false>
+          bool FULL_TILES = false,
+          bool CODED = false>
 __global__ __launch_bounds__(256, MIN_BLOCKS)
 void native_quantised_gemm_kernel(
     const int8_t*    __restrict__ d_A_int8,       // [M × K] INT8 activations, row-major
     const uint8_t*   __restrict__ d_payload,      // [blocks_per_row × N × PB] native-quantised payload
-    const uint16_t*  __restrict__ d_block_scales, // [blocks_per_row × N] FP16 per-block scales
-    const uint16_t*  __restrict__ d_block_mins,   // [blocks_per_row × N] FP16 per-block min/aux
-    const uint32_t*  __restrict__ d_block_emins,  // [blocks_per_row × N] packed FP16 emin pair (Q2_K only, else NULL)
+    const ::llaminar2::rocm_native_metadata::MetadataPlanes d_meta, // per-block planes or superblock-coded metadata
     float*           __restrict__ d_output,       // [M × N] FP32 output, row-major
     const float*     __restrict__ d_scales_A,     // [M] per-row activation scales
     int M, int N, int K,
@@ -804,12 +802,15 @@ void native_quantised_gemm_kernel(
             {
                 const size_t linear = static_cast<size_t>(block_global) * N + b_load_n_global;
                 load_payload<PB>(d_payload + linear * PB, b_payload_dw);
-                b_scale_staging = ::llaminar2::native_quantised_scale::loadStagedPrimary<static_cast<uint8_t>(FMT)>(d_block_scales, linear);
+                // One metadata authority for per-block and superblock-coded matrices.
+                const auto block_meta = ::llaminar2::rocm_native_metadata::blockMetadataAs<static_cast<uint8_t>(FMT), CODED>(
+                    d_meta, linear, static_cast<uint32_t>(block_global), static_cast<uint32_t>(b_load_n_global), static_cast<uint32_t>(N), b_payload_dw);
+                b_scale_staging = block_meta.primary;
                 if constexpr (Traits::needs_aux_compute)
-                    b_aux_staging = d_block_mins[linear];
+                    b_aux_staging = block_meta.secondary;
                 if constexpr (Traits::is_dual_scale_asym) {
                     if constexpr (Traits::needs_emin_array) {
-                        const uint32_t emin_packed = d_block_emins[linear];
+                        const uint32_t emin_packed = block_meta.emin;
                         b_emin_lo_staging = static_cast<uint16_t>(emin_packed);
                         b_emin_hi_staging = static_cast<uint16_t>(emin_packed >> 16);
                     } else {
@@ -907,12 +908,15 @@ void native_quantised_gemm_kernel(
             const int block_global = tile_block_base + b_load_block;
             const size_t linear = static_cast<size_t>(block_global) * N + b_load_n_global;
             load_payload<PB>(d_payload + linear * PB, b_payload_dw);
-            b_scale_staging = ::llaminar2::native_quantised_scale::loadStagedPrimary<static_cast<uint8_t>(FMT)>(d_block_scales, linear);
+            // One metadata authority for per-block and superblock-coded matrices.
+            const auto block_meta = ::llaminar2::rocm_native_metadata::blockMetadataAs<static_cast<uint8_t>(FMT), CODED>(
+                d_meta, linear, static_cast<uint32_t>(block_global), static_cast<uint32_t>(b_load_n_global), static_cast<uint32_t>(N), b_payload_dw);
+            b_scale_staging = block_meta.primary;
             if constexpr (Traits::needs_aux_compute)
-                b_aux_staging = d_block_mins[linear];
+                b_aux_staging = block_meta.secondary;
             if constexpr (Traits::is_dual_scale_asym) {
                 if constexpr (Traits::needs_emin_array) {
-                    const uint32_t emin_packed = d_block_emins[linear];
+                    const uint32_t emin_packed = block_meta.emin;
                     b_emin_lo_staging = static_cast<uint16_t>(emin_packed);
                     b_emin_hi_staging = static_cast<uint16_t>(emin_packed >> 16);
                 } else {
@@ -1128,12 +1132,15 @@ void native_quantised_gemm_kernel(
             {
                 const size_t linear = static_cast<size_t>(block_global) * N + b_load_n_global;
                 load_payload<PB>(d_payload + linear * PB, b_payload_dw);
-                b_scale_staging = ::llaminar2::native_quantised_scale::loadStagedPrimary<static_cast<uint8_t>(FMT)>(d_block_scales, linear);
+                // One metadata authority for per-block and superblock-coded matrices.
+                const auto block_meta = ::llaminar2::rocm_native_metadata::blockMetadataAs<static_cast<uint8_t>(FMT), CODED>(
+                    d_meta, linear, static_cast<uint32_t>(block_global), static_cast<uint32_t>(b_load_n_global), static_cast<uint32_t>(N), b_payload_dw);
+                b_scale_staging = block_meta.primary;
                 if constexpr (Traits::needs_aux_compute)
-                    b_aux_staging = d_block_mins[linear];
+                    b_aux_staging = block_meta.secondary;
                 if constexpr (Traits::is_dual_scale_asym) {
                     if constexpr (Traits::needs_emin_array) {
-                        const uint32_t emin_packed = d_block_emins[linear];
+                        const uint32_t emin_packed = block_meta.emin;
                         b_emin_lo_staging = static_cast<uint16_t>(emin_packed);
                         b_emin_hi_staging = static_cast<uint16_t>(emin_packed >> 16);
                     } else {
@@ -1486,9 +1493,8 @@ void native_quantised_gemm_kernel(
  * @tparam MIN_BLOCKS Minimum resident waves per SIMD used for register admission.
  * @param d_A_int8 Packed row-major activation bytes.
  * @param d_payload Compact block-major weight payload.
- * @param d_block_scales First weight scale for each block and output column.
- * @param d_block_mins Auxiliary weight scale/correction when the codebook needs it.
- * @param d_block_emins Packed asymmetric half-block corrections when required.
+ * @param d_meta Block metadata: per-block primary/auxiliary/Q2_K minimum planes,
+ *        or superblock-coded codes plus per-superblock d/dmin words.
  * @param d_output Unique row-major FP32 destination for every output owner.
  * @param d_scales_A Whole-row activation scales used by the final publication.
  * @param d_scales_A_blockwise Optional per-block activation scale table.
@@ -1497,14 +1503,12 @@ void native_quantised_gemm_kernel(
  * @param K Logical activation/weight width, divisible by the block width.
  * @param serial_m1_kblocks Canonical serial decode partition count.
  */
-template <int M_TILE, NativeQuantisedGemmFormat FMT, int MIN_BLOCKS = 3>
+template <int M_TILE, NativeQuantisedGemmFormat FMT, int MIN_BLOCKS = 3, bool CODED = false>
 __global__ __launch_bounds__(256, MIN_BLOCKS)
 void streaming_lm_head_kernel(
     const int8_t*    __restrict__ d_A_int8,       // [M × K] INT8 activations
     const uint8_t*   __restrict__ d_payload,      // [blocks_per_row × N × PB] payload
-    const uint16_t*  __restrict__ d_block_scales, // [blocks_per_row × N] FP16 scales
-    const uint16_t*  __restrict__ d_block_mins,   // [blocks_per_row × N] FP16 min/aux
-    const uint32_t*  __restrict__ d_block_emins,  // [blocks_per_row × N] packed {lo,hi} emins (Q2_K only, else nullptr)
+    const ::llaminar2::rocm_native_metadata::MetadataPlanes d_meta, // per-block planes or superblock-coded metadata
     float*           __restrict__ d_output,       // [M × N] FP32 output
     const float*     __restrict__ d_scales_A,     // [M] per-row activation scales
     const float*     __restrict__ d_scales_A_blockwise, // [M × blocks_per_row] per-block activation scales
@@ -1657,17 +1661,20 @@ void streaming_lm_head_kernel(
         const size_t linear = static_cast<size_t>(block) * N + n_col;
         uint32_t b_payload_dw[Traits::payload_dwords];
         load_payload<PB>(d_payload + linear * PB, b_payload_dw);
+        // One metadata authority for per-block and superblock-coded matrices.
+        const auto block_meta = ::llaminar2::rocm_native_metadata::blockMetadataAs<static_cast<uint8_t>(FMT), CODED>(
+            d_meta, linear, static_cast<uint32_t>(block), static_cast<uint32_t>(n_col), static_cast<uint32_t>(N), b_payload_dw);
 
-        uint16_t scale_bits = ::llaminar2::native_quantised_scale::loadStagedPrimary<static_cast<uint8_t>(FMT)>(d_block_scales, linear);
+        uint16_t scale_bits = block_meta.primary;
 
         uint16_t aux_bits = 0;
         if constexpr (Traits::needs_aux_compute)
-            aux_bits = d_block_mins[linear];
+            aux_bits = block_meta.secondary;
 
         uint16_t emin_lo_bits = 0, emin_hi_bits = 0;
         if constexpr (Traits::is_dual_scale_asym) {
             if constexpr (Traits::needs_emin_array) {
-                const uint32_t emin_packed = d_block_emins[linear];
+                const uint32_t emin_packed = block_meta.emin;
                 emin_lo_bits = static_cast<uint16_t>(emin_packed);
                 emin_hi_bits = static_cast<uint16_t>(emin_packed >> 16);
             }
@@ -2109,13 +2116,11 @@ void streaming_lm_head_kernel(
 // that minimizes padding waste for the given M value.
 // ============================================================================
 
-template <NativeQuantisedGemmFormat FMT>
+template <NativeQuantisedGemmFormat FMT, bool CODED>
 static bool launch_native_quantised_gemm(
     const int8_t* d_A_int8,
     const uint8_t* d_payload,
-    const uint16_t* d_block_scales,
-    const uint16_t* d_block_mins,
-    const uint32_t* d_block_emins,
+    const ::llaminar2::rocm_native_metadata::MetadataPlanes d_meta,
     float* d_output,
     const float* d_scales_A,
     const float* d_scales_A_blockwise,
@@ -2124,7 +2129,7 @@ static bool launch_native_quantised_gemm(
     uint8_t arithmetic_policy_codebook_id)
 {
     if constexpr (FMT == NATIVE_QUANTISED_GEMM_IQ3_S || FMT == NATIVE_QUANTISED_GEMM_IQ4_XS_SOURCE)
-        if (!d_block_mins) return false;
+        if (!d_meta.secondary) return false;
     constexpr int BPT = 2;
     constexpr int BLOCK_SIZE = 256;
 
@@ -2251,8 +2256,7 @@ static bool launch_native_quantised_gemm(
         clear_launch_error();
         const auto submission = llaminar2::rocm::submitNativeQuantisedWmma(tile, {
             .activations = d_A_int8, .payload = d_payload,
-            .scales = d_block_scales, .auxiliary = d_block_mins,
-            .minima_pairs = d_block_emins, .output = d_output,
+            .metadata = d_meta, .output = d_output,
             .row_scales = d_scales_A, .block_scales = d_scales_A_blockwise,
             .m = M, .n = N, .k = K, .serial_partitions = serial_m1_kblocks,
             .codebook = static_cast<uint8_t>(FMT)}, hip_stream);
@@ -2275,12 +2279,12 @@ static bool launch_native_quantised_gemm(
         dim3 grid((N + NT - 1) / NT, (M + MT - 1) / MT, 1);
         dim3 block(BLOCK_SIZE, 1, 1);
         const void* function = reinterpret_cast<const void*>(HIP_KERNEL_NAME(
-            native_quantised_gemm_kernel<NT, BPT, MT, FMT, MB, 4, false>));
+            native_quantised_gemm_kernel<NT, BPT, MT, FMT, MB, 4, false, CODED>));
 
         clear_launch_error();
-        native_quantised_gemm_kernel<NT, BPT, MT, FMT, MB, 4, false>
+        native_quantised_gemm_kernel<NT, BPT, MT, FMT, MB, 4, false, CODED>
             <<<grid, block, 0, hip_stream>>>(
-                d_A_int8, d_payload, d_block_scales, d_block_mins, d_block_emins,
+                d_A_int8, d_payload, d_meta,
                 d_output, d_scales_A, M, N, K, d_scales_A_blockwise,
                 serial_m1_kblocks);
 
@@ -2301,12 +2305,12 @@ static bool launch_native_quantised_gemm(
         dim3 grid((N + NT - 1) / NT, (M + MT - 1) / MT, 1);
         dim3 block(BLOCK_SIZE, 1, 1);
         const void* function = reinterpret_cast<const void*>(HIP_KERNEL_NAME(
-            native_quantised_gemm_kernel<NT, BPT, MT, FMT, kMinimumWaves>));
+            native_quantised_gemm_kernel<NT, BPT, MT, FMT, kMinimumWaves, 4, false, CODED>));
 
         clear_launch_error();
-        native_quantised_gemm_kernel<NT, BPT, MT, FMT, kMinimumWaves>
+        native_quantised_gemm_kernel<NT, BPT, MT, FMT, kMinimumWaves, 4, false, CODED>
             <<<grid, block, 0, hip_stream>>>(
-                d_A_int8, d_payload, d_block_scales, d_block_mins, d_block_emins,
+                d_A_int8, d_payload, d_meta,
                 d_output, d_scales_A, M, N, K, d_scales_A_blockwise,
                 serial_m1_kblocks);
 
@@ -2341,12 +2345,12 @@ static bool launch_native_quantised_gemm(
                 : 0;
         const size_t shared_bytes = sum_a_bytes;
         const void* function = reinterpret_cast<const void*>(HIP_KERNEL_NAME(
-            streaming_lm_head_kernel<MT, FMT, kMinimumWaves>));
+            streaming_lm_head_kernel<MT, FMT, kMinimumWaves, CODED>));
 
         clear_launch_error();
-        streaming_lm_head_kernel<MT, FMT, kMinimumWaves>
+        streaming_lm_head_kernel<MT, FMT, kMinimumWaves, CODED>
             <<<grid, block, shared_bytes, hip_stream>>>(
-                d_A_int8, d_payload, d_block_scales, d_block_mins, d_block_emins,
+                d_A_int8, d_payload, d_meta,
                 d_output, d_scales_A, d_scales_A_blockwise, M, N, K,
                 serial_m1_kblocks);
 
@@ -2392,15 +2396,13 @@ static bool launch_native_quantised_gemm(
             const dim3 block(BLOCK_SIZE, 1, 1);
             const void* function = reinterpret_cast<const void*>(HIP_KERNEL_NAME(
                 native_quantised_gemm_kernel<
-                    NT, BPT, MT, FMT, MB, UG, FULL_TILES>));
+                    NT, BPT, MT, FMT, MB, UG, FULL_TILES, CODED>));
             clear_launch_error();
-            native_quantised_gemm_kernel<NT, BPT, MT, FMT, MB, UG, FULL_TILES>
+            native_quantised_gemm_kernel<NT, BPT, MT, FMT, MB, UG, FULL_TILES, CODED>
                 <<<grid, block, 0, hip_stream>>>(
                     d_A_int8,
                     d_payload,
-                    d_block_scales,
-                    d_block_mins,
-                    d_block_emins,
+                    d_meta,
                     d_output,
                     d_scales_A,
                     M,
@@ -2651,12 +2653,12 @@ static bool launch_native_quantised_gemm(
             dim3 grid((N + NT - 1) / NT, (M + MT - 1) / MT, 1);
             dim3 block(BLOCK_SIZE, 1, 1);
             const void* function = reinterpret_cast<const void*>(HIP_KERNEL_NAME(
-                native_quantised_gemm_kernel<NT, BPT, MT, FMT, 1, 2>));
+                native_quantised_gemm_kernel<NT, BPT, MT, FMT, 1, 2, false, CODED>));
 
             clear_launch_error();
-            native_quantised_gemm_kernel<NT, BPT, MT, FMT, 1, 2>
+            native_quantised_gemm_kernel<NT, BPT, MT, FMT, 1, 2, false, CODED>
                 <<<grid, block, 0, hip_stream>>>(
-                    d_A_int8, d_payload, d_block_scales, d_block_mins, d_block_emins,
+                    d_A_int8, d_payload, d_meta,
                     d_output, d_scales_A, M, N, K, d_scales_A_blockwise,
                     serial_m1_kblocks);
 
@@ -2913,14 +2915,36 @@ static bool launch_native_quantised_gemm(
 // Output is FP32 with scale_A applied inline — no separate epilogue.
 // ============================================================================
 
+/**
+ * @brief Select the per-block or superblock-coded kernel instantiation once on the host.
+ * @tparam FMT Physical decoder. Only codable decoders have a coded instantiation.
+ * @details The representation is uniform for the whole matrix, so the choice
+ * is a host-side launch selection, never a per-block device branch: per-block
+ * kernels keep their original code and register budget.
+ */
+template <NativeQuantisedGemmFormat FMT>
+static bool dispatch_native_quantised_gemm_representation(
+    const int8_t* d_A_int8, const uint8_t* d_payload,
+    const ::llaminar2::rocm_native_metadata::MetadataPlanes d_meta, float* d_output,
+    const float* d_scales_A, const float* d_scales_A_blockwise, int M, int N, int K,
+    int device_id, void* stream, uint8_t arithmetic_policy_codebook_id)
+{
+    if constexpr (::llaminar2::nativeQuantisedSuperblockCodable(static_cast<uint8_t>(FMT)))
+        if (d_meta.coded())
+            return launch_native_quantised_gemm<FMT, true>(d_A_int8, d_payload, d_meta, d_output, d_scales_A,
+                d_scales_A_blockwise, M, N, K, device_id, stream, arithmetic_policy_codebook_id);
+    if (d_meta.coded())
+        return false; // A coded layout on a non-codable decoder is never admitted.
+    return launch_native_quantised_gemm<FMT, false>(d_A_int8, d_payload, d_meta, d_output, d_scales_A,
+        d_scales_A_blockwise, M, N, K, device_id, stream, arithmetic_policy_codebook_id);
+}
+
 extern "C"
 bool LLAMINAR_ROCM_NATIVE_QUANTISED_SHARD_SYMBOL(
     rocmGemm_native_quantised_fp32_shard_)(
     const int8_t*  d_A_int8,       // [M × K] INT8 activations
     const uint8_t* d_payload,      // [blocks_per_row × N × PB] native-quantised payload
-    const void*    d_block_scales, // [blocks_per_row × N] __half per-block scales
-    const void*    d_block_mins,   // [blocks_per_row × N] __half per-block mins/aux (nullable)
-    const void*    d_block_emins,  // [blocks_per_row × N] packed {lo,hi} emins (Q2_K only, nullable)
+    const ::llaminar2::rocm_native_metadata::MetadataPlanes d_meta, // per-block planes or superblock-coded metadata
     float*         d_output,       // [M × N] FP32 output
     const float*   d_scales_A,     // [M] per-row activation scales
     const float*   d_scales_A_blockwise, // [M × blocks_per_row] per-block activation scales
@@ -2934,13 +2958,12 @@ bool LLAMINAR_ROCM_NATIVE_QUANTISED_SHARD_SYMBOL(
 
     llaminar2::HipDeviceGuard::setDevice(device_id);
 
-    const auto* scales = reinterpret_cast<const uint16_t*>(d_block_scales);
-    const auto* mins   = reinterpret_cast<const uint16_t*>(d_block_mins);
-    const auto* emins  = reinterpret_cast<const uint32_t*>(d_block_emins);
+    if (!::llaminar2::rocm_native_metadata::metadataPlanesAdmitted(codebook_id, d_meta))
+        return false;
 
     #define LAUNCH_GEMM(FMT) \
-        return launch_native_quantised_gemm<FMT>( \
-            d_A_int8, d_payload, scales, mins, emins, d_output, d_scales_A, \
+        return dispatch_native_quantised_gemm_representation<FMT>( \
+            d_A_int8, d_payload, d_meta, d_output, d_scales_A, \
             d_scales_A_blockwise, M, N, K, device_id, stream, \
             arithmetic_policy_codebook_id)
 

@@ -12,6 +12,7 @@
 #include "../../../utils/ROCmQFNReplayDevice.h"
 #include "kernels/common/NativeQuantisedGroupedDecodePolicy.h"
 #include "kernels/common/ProjectionRowWork.h"
+#include "kernels/rocm/gemm/ROCmNativeQuantisedBlockMetadata.h"
 #include "kernels/rocm/gemm/ROCmGroupedVerifierLaunch.h"
 
 #include <algorithm>
@@ -27,7 +28,8 @@
 
 extern "C" void rocmGemv_native_quantised_set_decode_equivalent_m1_config(int);
 extern "C" bool rocmGemv_native_quantised_fp32_with_policy(
-    const int8_t *, const uint8_t *, const void *, const void *, const void *, float *,
+    const int8_t *, const uint8_t *,
+    const ::llaminar2::rocm_native_metadata::MetadataPlanes d_meta, float *,
     const float *, float *, int, int, uint8_t, uint8_t, int, void *, const float *);
 
 namespace {
@@ -250,7 +252,7 @@ TEST(ROCmGroupedHCDownLongK, DecoderPartialsAndFinalMatchSerialWithDirtyCapacity
             const auto rows = DeviceRowRange::deviceCounted(m + origin, count.data).slice(origin, m);
             const auto enqueue = [&] {
                 return rocmGemv_native_quantised_small_m_fp32_with_sums_policy(
-                    input.data, packed.data, weightScales.data, nullptr, nullptr,
+                    input.data, packed.data, ::llaminar2::rocm_native_metadata::perBlockMetadataPlanes(weightScales.data, nullptr, nullptr),
                     result.data, activationScales.data, nullptr, partials.data,
                     m, n, k, q8, q8, ordinal, stream, &rows);
             };
@@ -282,7 +284,7 @@ TEST(ROCmGroupedHCDownLongK, DecoderPartialsAndFinalMatchSerialWithDirtyCapacity
                 referencePartials.input(partialPoison, stream);
                 for (int row = 0; row < m; ++row)
                     ASSERT_TRUE(rocmGemv_native_quantised_fp32_with_policy(
-                        input.data + row * k, packed.data, weightScales.data, nullptr, nullptr,
+                        input.data + row * k, packed.data, ::llaminar2::rocm_native_metadata::perBlockMetadataPlanes(weightScales.data, nullptr, nullptr),
                         reference.data + row * n, nullptr, referencePartials.data + row * scratchPartitions * n,
                         n, k, q8, q8, ordinal, stream, activationScales.data + row * groups));
                 const auto serialResults = reference.output(stream);
