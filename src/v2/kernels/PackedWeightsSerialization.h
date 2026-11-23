@@ -53,10 +53,8 @@ static constexpr uint32_t PACKED_WEIGHTS_MAGIC = 0x5457504C; // "LPWT" in little
 /// Version6 preserves IQ4_XS original half bases and encoded signed coefficients.
 /// Version5 and earlier archives are rejected before any section is adopted.
 /// Version7 retains IQ3_S original half bases and raw nibbles in CPU encoding5.
-/// Version8 stores native MXFP4 (codebook 25, NibbleLUT) unit scales as BF16
-/// power-of-two words instead of FP16; the codebook/encoding fields are
-/// unchanged, so a version-7 MXFP4 archive would otherwise be misread.
-/// Version 9 replaces compact per-block metadata with source codes and superblock words.
+/// Version 9 uses exact-density CPU units, including native MXFP4 exponent
+/// bytes and coded source metadata instead of expanded per-block words.
 /// Earlier archives are rejected before any payload is adopted.
 static constexpr uint32_t PACKED_WEIGHTS_VERSION = 9;
 
@@ -132,6 +130,10 @@ inline cpu::native_quantised::CPUNativeQuantisedEncoding decodePreparedEncoding(
         return Encoding::Q6KNativeDualScale;
     case static_cast<uint8_t>(Encoding::CompactMultiScale):
         return Encoding::CompactMultiScale;
+    case static_cast<uint8_t>(Encoding::Q4KSuperblockCoded):
+        return Encoding::Q4KSuperblockCoded;
+    case static_cast<uint8_t>(Encoding::Q5NativeSingleScale):
+        return Encoding::Q5NativeSingleScale;
     default:
         throw std::invalid_argument(
             "Packed-weight transfer received an unknown prepared encoding");

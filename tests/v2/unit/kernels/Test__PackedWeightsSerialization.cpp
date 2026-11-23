@@ -869,16 +869,23 @@ TEST(Test__PackedWeightsSerialization, CPUPreparedBankAllocationAndArchiveReplay
             EXPECT_EQ(std::memcmp(reference.data(), scalar.data(), sizeof(reference)), 0);
             CPUPackedWeights legacy_owner(std::move(legacy));
             const auto legacy_blob = serialize(legacy_owner);
-            ASSERT_GT(legacy_blob.size(), canonical_blob.size());
-            EXPECT_EQ(KernelFactory::createExpertGemmFromTransferBlob(
-                legacy_blob.data(), legacy_blob.size() - 1), nullptr);
-            legacy_imported = KernelFactory::createExpertGemmFromTransferBlob(
-                legacy_blob.data(), legacy_blob.size());
-            ASSERT_TRUE(legacy_imported);
-            expectCanonicalCPUProjectionAllocation(*legacy_imported, *format);
-            // Attachment is a distinct publication boundary from construction.
-            ASSERT_TRUE(imported->attachWeights(deserialize(legacy_blob.data(), legacy_blob.size())));
-            expectCanonicalCPUProjectionAllocation(*imported, *format);
+            if (preparedSuperblockCoded(packed->encoding))
+            {
+                EXPECT_TRUE(legacy_blob.empty()) << "Coded archive must reject a redundant source shadow";
+            }
+            else
+            {
+                ASSERT_GT(legacy_blob.size(), canonical_blob.size());
+                EXPECT_EQ(KernelFactory::createExpertGemmFromTransferBlob(
+                    legacy_blob.data(), legacy_blob.size() - 1), nullptr);
+                legacy_imported = KernelFactory::createExpertGemmFromTransferBlob(
+                    legacy_blob.data(), legacy_blob.size());
+                ASSERT_TRUE(legacy_imported);
+                expectCanonicalCPUProjectionAllocation(*legacy_imported, *format);
+                // Attachment is a distinct publication boundary from construction.
+                ASSERT_TRUE(imported->attachWeights(deserialize(legacy_blob.data(), legacy_blob.size())));
+                expectCanonicalCPUProjectionAllocation(*imported, *format);
+            }
         }
         for (auto replay : {imported, legacy_imported})
         {

@@ -73,7 +73,13 @@ TEST(CPUNativeQuantisedWeightView, AllSourcesKeepTheirCanonicalRootAndMetadataCo
         {
             const std::size_t metadata = view.usesInlineCompensation() ? 128 : 0;
             EXPECT_EQ(unit, fixture.bytes.data() + 5 * view.interleaved_block_stride);
-            EXPECT_EQ(reinterpret_cast<const std::uint8_t *>(view.chunkScales(1, 2)), unit + view.data_stride + metadata);
+            if (view.scaleEncoding() == CPUNativeQuantisedScaleEncoding::E8M0)
+            {
+                EXPECT_EQ(view.admittedE8M0Scales(1, 2), unit + view.data_stride);
+                EXPECT_THROW((void)view.chunkScales(1, 2), std::logic_error);
+            }
+            else
+                EXPECT_EQ(reinterpret_cast<const std::uint8_t *>(view.chunkScales(1, 2)), unit + view.data_stride + metadata);
             if (view.is_asymmetric || view.usesNibbleLUTSourceScale() || view.usesIQ3SExpandedSourceScale() ||
                 view.usesQ6KNativeDualScale())
                 EXPECT_EQ(reinterpret_cast<const std::uint8_t *>(view.chunkMins(1, 2)), unit + view.data_stride + metadata + 128);

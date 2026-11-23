@@ -157,9 +157,10 @@ TEST(Test__NativeQuantisedFormatInfo, ExpandedSingleScaleGridsRetainNativeScaleA
     using namespace cpu::native_quantised;
     for (const auto &format : kExpectations)
     {
+        const auto *identity = native_quantised_formats::forSourceIdentity(format.codebook_id, format.is_superblock);
+        ASSERT_NE(identity, nullptr);
         if (!is_payload_decodable(format.codebook_id) ||
-            (preparedEncodingForCodebook(format.codebook_id) != CPUNativeQuantisedEncoding::ExpandedInt8 &&
-             preparedEncodingForCodebook(format.codebook_id) != CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale))
+            preparedEncodingForSource(*identity) != CPUNativeQuantisedEncoding::ExpandedInt8)
             continue;
         SCOPED_TRACE(format.name);
         auto tensor = format.create();
@@ -635,8 +636,11 @@ TEST(Test__NativeQuantisedFormatInfo, IQ4XSSourceTupleMappingAndCapacityAreExact
     EXPECT_FALSE(areNativeQuantisedGateUpCodebooksCompatible(24, 5));
     EXPECT_EQ(preparedEncodingForSource(xs), CPUNativeQuantisedEncoding::NibbleLUTSourceScale);
     EXPECT_EQ(preparedEncodingForSource(nl), CPUNativeQuantisedEncoding::NibbleLUT);
-    EXPECT_EQ(preparedFootprintForFormat(xs).weight_bytes_per_n_chunk_k_block, 1408);
-    EXPECT_EQ(preparedFootprintForFormat(nl).weight_bytes_per_n_chunk_k_block, 1280);
+    const auto xs_geometry = preparedBlockGeometry(preparedEncodingForSource(xs), xs.is_asymmetric, xs.codebook_id, 8);
+    EXPECT_EQ(xs_geometry.block_stride, 64 * 16 + 48); // Nibble payload and six-bit codes.
+    EXPECT_EQ(xs_geometry.header_bytes, 64 * 2);
+    EXPECT_EQ(preparedFootprintForFormat(xs).weight_bytes_per_n_chunk_k_block, xs_geometry.rowBytes() / 8);
+    EXPECT_EQ(preparedFootprintForFormat(nl).weight_bytes_per_n_chunk_k_block, 1152);
     EXPECT_EQ(nativeQuantisedPackedRegionSizes(17, 288, xs).logicalBytes(), 17u * 9u * 20u);
     EXPECT_EQ(nativeQuantisedPackedRegionSizes(17, 288, nl).logicalBytes(), 17u * 9u * 18u);
     for (unsigned value = 0; value < 64; ++value)
