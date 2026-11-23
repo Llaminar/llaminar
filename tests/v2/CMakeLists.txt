@@ -22151,6 +22151,12 @@ if(HAVE_ROCM)
         MPI_PROCS 1
         NO_MODELS
     )
+    add_v2_test(V2_Integration_ROCm_ScalarGEMVBetaPublicationReplay
+        COMMAND $<TARGET_FILE:v2_integration_rocm_verifier_epilogue_replay>
+                --gtest_filter=ROCmScalarGEMVEpilogueReplay.DeviceDestinationOwnsBetaPublication
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;GEMV;GraphCapture;ByteExact;AllCodebooks;Replay;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60
+    )
     add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_WmmaEpilogueReplay
         COMMAND $<TARGET_FILE:v2_integration_rocm_verifier_epilogue_replay>
                 --gtest_filter=ROCmVerifierWmmaEpilogueReplay.*
@@ -31820,6 +31826,7 @@ if(HAVE_ROCM)
     V2_Integration_ROCmEmbeddingNativeSourcePreservation
     V2_Integration_ROCm_DeviceCountedVerifierRows
     V2_Integration_GroupedVerifierRows_ROCm_EpilogueReplay
+    V2_Integration_ROCm_ScalarGEMVBetaPublicationReplay
     V2_Integration_GroupedVerifierRows_ROCm_WmmaReplay
     V2_Integration_GroupedVerifierRows_ROCm_WmmaEpilogueReplay
     V2_Integration_GroupedVerifierRows_ROCm_AllFormats

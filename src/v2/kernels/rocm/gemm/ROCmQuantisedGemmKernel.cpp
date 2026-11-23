@@ -3246,9 +3246,12 @@ namespace llaminar2
 
                         if (beta != 0.0f)
                         {
+                            // Each epilogue lane reads its own previous C value before
+                            // publishing the result. Device-local C is the final destination.
+                            float *const epilogue_output = gemv_output_is_mapped ? d_gemv_output : d_output;
                             if (!rocmQuantGemm_applyFp32CombineEpilogue(
                                     d_gemv_output,
-                                    d_gemv_output,
+                                    epilogue_output,
                                     d_output,
                                     d_bias,
                                     m,
@@ -3277,13 +3280,13 @@ namespace llaminar2
                                 return false;
                             }
                         }
-                        // Bulk DMA from HBM workspace to output
-                        if (gemv_output_needs_copyout)
+                        // Bulk DMA is reserved for the mapped host destination.
+                        if (gemv_output_is_mapped && hipMemcpyAsync(
+                                d_output, d_gemv_output, static_cast<size_t>(n) * sizeof(float),
+                                hipMemcpyDeviceToDevice, static_cast<hipStream_t>(gpu_stream_)) != hipSuccess)
                         {
-                            (void)hipMemcpyAsync(d_output, impl_->d_C_fp32,
-                                           static_cast<size_t>(n) * sizeof(float),
-                                           hipMemcpyDeviceToDevice,
-                                           static_cast<hipStream_t>(gpu_stream_));
+                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] NativeQuantised mapped-output publication failed");
+                            return false;
                         }
                         publishROCmTensorWrite(*C, rocm_device_id_, gpu_stream_);
                         return true;

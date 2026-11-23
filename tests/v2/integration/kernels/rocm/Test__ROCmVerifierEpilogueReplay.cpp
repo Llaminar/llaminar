@@ -32,6 +32,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 using namespace llaminar2;
@@ -378,4 +379,98 @@ TEST(ROCmVerifierWmmaEpilogueReplay, NativeRequestIntervalInterleaving)
     for (auto placement : {OutputPlacement::Device, OutputPlacement::Mapped})
         ASSERT_NO_FATAL_FAILURE((proveVerifierEpilogue<14,8,1>(placement,
             RowAdmission::Requests, -0.25f, rocm::NativeQuantisedVerifierCandidate::WmmaM16N64)));
+}
+
+/** @brief Replay scalar beta publication into retained device C for every source. */
+TEST(ROCmScalarGEMVEpilogueReplay, DeviceDestinationOwnsBetaPublication)
+{
+    int devices = 0;
+    if (hipGetDeviceCount(&devices) != hipSuccess || devices == 0)
+        GTEST_SKIP() << "No ROCm device available";
+    constexpr int N = 17, K = 256;
+    constexpr float beta = 0.25f;
+    const auto device = DeviceId::rocm(0);
+    ScopedGPUStream owner(device);
+    const auto stream = static_cast<hipStream_t>(owner.get());
+    for (const auto &format : quantizedVerifierFormats())
+    {
+        SCOPED_TRACE(format.label);
+        auto weights = format.create({N, K}, 73201);
+        auto prepared = makeGpuPreparedGemm(weights.get(), device,
+            "test.scalar.gemv.beta", ModelContextId{73202});
+        auto *kernel = dynamic_cast<rocm::ROCmQuantisedGemmKernel *>(prepared.kernel);
+        ASSERT_NE(kernel, nullptr);
+        kernel->setGPUStream(stream);
+        auto requirements = kernel->getWorkspaceRequirements(1, N, K);
+        DeviceWorkspaceManager workspace(device, requirements.total_bytes_with_alignment());
+        ASSERT_TRUE(workspace.allocate(requirements));
+        kernel->bindWorkspace(&workspace);
+        const auto release_binding = [](rocm::ROCmQuantisedGemmKernel *bound) { bound->unbindWorkspace(); };
+        const std::unique_ptr<rocm::ROCmQuantisedGemmKernel, decltype(release_binding)> binding(kernel, release_binding);
+        ASSERT_TRUE(kernel->prepareFusedProjectionGraphCapture(1));
+
+        auto input = TestTensorFactory::createFP32Random({1, K}, -0.75f, 0.75f, 73203);
+        auto output = TestTensorFactory::createFP32({1, N});
+        std::array<float, N> projection{}, initial{}, actual{};
+        HIPGraphCapture graph(stream, 0);
+        const FixtureStreamDrain drain{stream};
+        ASSERT_TRUE(input->ensureOnDevice(device, stream));
+        ASSERT_TRUE(output->allocateOnDevice(device, stream));
+        ASSERT_FALSE(output->isMapped());
+        ASSERT_TRUE(kernel->multiply_tensor(input.get(), output.get(), 1, N, K));
+        ASSERT_EQ(hipMemcpyAsync(projection.data(), output->gpu_data_ptr(), sizeof(projection),
+            hipMemcpyDeviceToHost, stream), hipSuccess);
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+        // The oracle's publication and the input upload both precede the
+        // captured consumer. Join their retained events on its exact stream.
+        TransferEngine::requireDeviceInput(input.get(), device, stream);
+        TransferEngine::requireDeviceInput(output.get(), device, stream);
+        {
+            ScopedBackendGraphCapture capture(graph, "scalar_gemv_beta_destination");
+            ASSERT_TRUE(capture.begin());
+            ASSERT_TRUE(kernel->multiply_tensor(input.get(), output.get(), 1, N, K, true, 1.0f, beta));
+            capture.finish();
+        }
+
+        std::size_t count = 0;
+        ASSERT_EQ(hipGraphGetNodes(graph.graph(), nullptr, &count), hipSuccess);
+        std::vector<hipGraphNode_t> nodes(count);
+        ASSERT_EQ(hipGraphGetNodes(graph.graph(), nodes.data(), &count), hipSuccess);
+        int combinations = 0;
+        for (auto node : nodes)
+        {
+            hipGraphNodeType type{};
+            ASSERT_EQ(hipGraphNodeGetType(node, &type), hipSuccess);
+            EXPECT_NE(type, hipGraphNodeTypeMemcpy);
+            if (type != hipGraphNodeTypeKernel)
+                continue;
+            hipKernelNodeParams parameters{};
+            ASSERT_EQ(hipGraphKernelNodeGetParams(node, &parameters), hipSuccess);
+            const char *name = hipKernelNameRefByPtr(parameters.func, stream);
+            ASSERT_NE(name, nullptr);
+            if (std::string_view(name).find("applyFp32CombineEpilogue_kernel") == std::string_view::npos)
+                continue;
+            ++combinations;
+            ASSERT_NE(parameters.kernelParams, nullptr);
+            void *destination = nullptr;
+            std::memcpy(&destination, parameters.kernelParams[1], sizeof(destination));
+            EXPECT_EQ(destination, output->gpu_data_ptr());
+        }
+        EXPECT_EQ(combinations, 1);
+        ASSERT_TRUE(graph.instantiate());
+        for (const float sign : {1.0f, -1.0f, 1.0f})
+        {
+            for (int column = 0; column < N; ++column)
+                initial[column] = sign * static_cast<float>(column - N / 2) / 32.0f;
+            ASSERT_EQ(hipMemcpyAsync(output->gpu_data_ptr(), initial.data(), sizeof(initial),
+                hipMemcpyHostToDevice, stream), hipSuccess);
+            ASSERT_TRUE(graph.launch());
+            ASSERT_EQ(hipMemcpyAsync(actual.data(), output->gpu_data_ptr(), sizeof(actual),
+                hipMemcpyDeviceToHost, stream), hipSuccess);
+            ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+            for (int column = 0; column < N; ++column)
+                EXPECT_EQ(std::bit_cast<std::uint32_t>(actual[column]),
+                    std::bit_cast<std::uint32_t>(projection[column] + beta * initial[column]));
+        }
+    }
 }
