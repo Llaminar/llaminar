@@ -3011,7 +3011,7 @@ namespace llaminar2
         if (params_.seq_len == 1 &&
             !params_.force_grouped_verifier_prefill_for_decode)
         {
-            return executeSingleToken(ctx);
+            return executeSingleToken(ctx, serviceTelemetryPhaseHint());
         }
 
         if (!params_.routing_indices || !params_.routing_weights)
@@ -3215,7 +3215,7 @@ namespace llaminar2
         gpuExecution().publish(publicationTarget());
     }
 
-    bool MoEExpertComputeStage::executeSingleToken(IDeviceContext *ctx)
+    bool MoEExpertComputeStage::executeSingleToken(IDeviceContext *ctx, MoEOverlayServicePhaseHint phase)
     {
         const int d_model = params_.d_model;
         const int num_experts = params_.num_experts;
@@ -3800,6 +3800,7 @@ namespace llaminar2
 
         // Single fused call: router-Q8 reuse on CPU NativeQuantised, then one
         // projection region for every active expert's gate/up pair.
+        bool cpu_prepared_decode_completed = false;
         if (num_active > 0)
         {
             bool projected = false;
@@ -3878,13 +3879,54 @@ namespace llaminar2
                                   << params_.layer_idx);
                         return false;
                     }
-                    projected = native_gate->
-                        multiply_fused_router_q8_hidden_grouped_decode_equivalent(
-                            published_router_q8,
-                            batch_projections_,
-                            /*m=*/1,
-                            d_model, CPUInvocationWorkspace::available<float>(
-                                bound_workspace_, kCPUProjectionPartials));
+                    const size_t routes = static_cast<size_t>(num_active);
+                    if (phase == MoEOverlayServicePhaseHint::Decode &&
+                        CPUNativeQuantisedGemmKernel::standaloneMoEOneRowWorkers(d_model, intermediate, routes))
+                    {
+                        // Keep the prepared schedule's operand staging and
+                        // stack frame independent of the existing grouped code.
+                        const auto complete_prepared = [&]() __attribute__((noinline)) {
+                            using Projection = CPUNativeQuantisedGemmKernel::BatchedPrequantizedProjectionDesc;
+                            constexpr size_t capacity = std::extent_v<decltype(active_experts)>;
+                            constexpr size_t blocks = 320 / Q8_1Block::BLOCK_SIZE;
+                            std::array<Projection, capacity> down;
+                            for (size_t route = 0; route < routes; ++route)
+                            {
+                                down[route].kernel = dynamic_cast<CPUNativeQuantisedGemmKernel *>(
+                                    cached_down_gemm_[active_experts[route].expert_id]);
+                                if (!down[route].kernel) return false;
+                            }
+                            if (scratch_down_batch_.size() < routes)
+                                throw std::logic_error("CPU decode exceeds its declared route output capacity");
+                            auto activation = CPUInvocationWorkspace::available<Q8_1Block>(bound_workspace_, kCPUProjectionQ8);
+                            if (activation.size() < routes * blocks)
+                                throw std::logic_error("CPU one-row decode lacks its admitted Down activation workspace");
+                            std::array<Projection, 2 * capacity> gate_up;
+                            for (size_t route = 0; route < routes; ++route)
+                            {
+                                down[route] = {.kernel = down[route].kernel, .input_q8 = activation.data() + route * blocks,
+                                    .output = scratch_down_batch_[route]->mutable_data(), .rows = 1, .n = d_model, .ldc = d_model};
+                            }
+                            for (size_t index = 0; index < 2 * routes; ++index)
+                            {
+                                const auto &source = batch_projections_[index];
+                                gate_up[index] = {.kernel = static_cast<CPUNativeQuantisedGemmKernel *>(source.kernel),
+                                    .input_q8 = published_router_q8, .output = source.output->mutable_data(),
+                                    .rows = 1, .n = intermediate, .ldc = intermediate};
+                            }
+                            const auto candidate = CPUNativeQuantisedGemmKernel::tryExecuteStandaloneMoEOneRow(
+                                std::span(gate_up).first(2 * routes), std::span(down).first(routes), activation,
+                                d_model, intermediate);
+                            if (candidate.has_value() && !*candidate)
+                                throw std::runtime_error("Prepared standalone CPU MoE did not complete its fixed worker team");
+                            return candidate.value_or(false);
+                        };
+                        cpu_prepared_decode_completed = complete_prepared();
+                    }
+                    projected = cpu_prepared_decode_completed || native_gate->
+                        multiply_fused_router_q8_hidden_grouped_decode_equivalent(published_router_q8,
+                            batch_projections_, /*m=*/1, d_model,
+                            CPUInvocationWorkspace::available<float>(bound_workspace_, kCPUProjectionPartials));
                     if (projected)
                     {
                         PerfStatsCollector::addCounter(
@@ -4072,7 +4114,7 @@ namespace llaminar2
                 /*
                  * Route identity is control metadata, not projection output.
                  * Publish it once from the immutable active-route schedule before
-                 * any row arithmetic begins. This keeps the payload loop branch
+                 * copying any payload into the route slots. This keeps the payload loop branch
                  * light and makes a malformed slot/index fail before partially
                  * publishing a transaction.
                  */
@@ -4149,8 +4191,12 @@ namespace llaminar2
                 }
             };
 
-            // Ensure per-expert output buffers for the standalone CPU decode
-            // implementation.
+            if (cpu_prepared_decode_completed)
+            {
+                for (int i = 0; i < num_active; ++i)
+                    publish_route(active_experts[i], scratch_down_batch_[i]->data());
+            }
+            else
             {
                 if (static_cast<int>(scratch_down_batch_.size()) < num_active)
                     throw std::logic_error("CPU MoE decode exceeds its declared route capacity");
@@ -5706,7 +5752,7 @@ namespace llaminar2
             params_.force_grouped_verifier_prefill_for_decode = false;
             params_.require_device_routing_tensor_decode = is_gpu;
 
-            return executeSingleToken(ctx);
+            return executeSingleToken(ctx, MoEOverlayServicePhaseHint::GroupedVerifier);
         }
 
         if (!is_gpu)

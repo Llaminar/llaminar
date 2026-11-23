@@ -19994,11 +19994,21 @@ foreach(V2_VERIFIER_WORKER_ISA IN LISTS V2_CPU_NATIVE_ISA_CELLS)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPU_NativeQuantisedProjectionCapacity_${V2_VERIFIER_WORKER_ISA})
     add_v2_test(V2_Integration_CPU_NativeQuantisedVerifierWorkers_${V2_VERIFIER_WORKER_ISA}
         COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_verifier_workers> --gtest_brief=1
-            --gtest_filter=-CPUNativeQuantisedVerifierWorkers.DisabledDiagnosticsDoNotAllocate:CPUNativeQuantisedVerifierWorkers.MixedFormatExpertTransactionPreservesEveryProjection:AllFormats/CPUQueryRowWork.*:CPUQueryRowWorkRotation.*:CPUQueryRowWorkAdmission.*
+            --gtest_filter=-CPUNativeQuantisedVerifierWorkers.DisabledDiagnosticsDoNotAllocate:CPUNativeQuantisedVerifierWorkers.MixedFormatExpertTransactionPreservesEveryProjection:CPUNativeQuantisedVerifierWorkers.PreparedStandaloneSingleRowFFNContract:AllFormats/CPUQueryRowWork.*:CPUQueryRowWorkRotation.*:CPUQueryRowWorkAdmission.*
         LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeQuantised;MTP;AllFormats;${V2_VERIFIER_WORKER_ISA};ByteExact;Regression"
         MPI_PROCS 1
         NO_MODELS
         ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_VERIFIER_WORKER_RUNTIME_ISA};LLAMINAR_PERF_STATS_JSON=1;LLAMINAR_PERF_STATS_FILTER=kernel.cpu_native_quantised_verifier_worker_tasks")
+    add_v2_test(V2_Integration_CPU_NativeQuantisedPreparedSingleRowFFN_${V2_VERIFIER_WORKER_ISA}
+        COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_verifier_workers>
+            --gtest_filter=CPUNativeQuantisedVerifierWorkers.PreparedStandaloneSingleRowFFNContract
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeQuantised;MoE;QwenFlashNext;AllFormats;${V2_VERIFIER_WORKER_ISA};ByteExact;Regression"
+        MPI_PROCS 1 NO_MODELS
+        ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_VERIFIER_WORKER_RUNTIME_ISA};LLAMINAR_PERF_STATS_JSON=1;LLAMINAR_PERF_STATS_FILTER=kernel.cpu_native_quantised_moe_prepared_phase_plans")
+    if(TEST V2_Integration_CPU_NativeQuantisedPreparedSingleRowFFN_${V2_VERIFIER_WORKER_ISA})
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+            V2_Integration_CPU_NativeQuantisedPreparedSingleRowFFN_${V2_VERIFIER_WORKER_ISA})
+    endif()
     # The same all-format FFN proof runs without kernel collection. This catches
     # dormant diagnostic strings/maps allocating before the collector's guard.
     add_v2_test(V2_Integration_CPU_NativeQuantisedDisabledDiagnostics_${V2_VERIFIER_WORKER_ISA}

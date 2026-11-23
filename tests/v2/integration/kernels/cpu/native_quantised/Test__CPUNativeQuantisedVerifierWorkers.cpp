@@ -31,6 +31,7 @@
 #include <new>
 #include <set>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace
@@ -389,6 +390,123 @@ void proveExpertTransaction(ExpertFormatLayout layout = ExpertFormatLayout::Unif
                 }
                 EXPECT_EQ(std::memcmp(router_output.data(), expected_gate.data(),
                     router_rows * width * sizeof(float)), 0);
+            }
+        }
+    }
+}
+
+/** @test Standalone preparation preserves every original QFN source and exact output boundaries. */
+TEST(CPUNativeQuantisedVerifierWorkers, PreparedStandaloneSingleRowFFNContract)
+{
+    VerifierWorkerScope restore;
+    constexpr auto policy = CPUProjectionNumericalPolicy::GPUAlignedExpert;
+    using Kernel = CPUNativeQuantisedGemmKernel;
+    using Desc = Kernel::BatchedPrequantizedProjectionDesc;
+    constexpr int hidden = 2560, width = 320, capacity = 7;
+    constexpr int input_blocks = hidden / Q8_1Block::BLOCK_SIZE;
+    constexpr int middle_blocks = width / Q8_1Block::BLOCK_SIZE;
+    constexpr float untouched = -12345.f;
+    const auto inputs = TestTensorFactory::createFP32Random({capacity, hidden}, -0.75f, 0.75f, 8409);
+    std::vector<float> bounded_inputs(capacity * hidden);
+    std::vector<Q8_1Block> input_q8(capacity * input_blocks), expected_q8(capacity * middle_blocks);
+    std::vector<Q8_1Block> actual_q8(expected_q8.size());
+    std::vector<float> gate(capacity * width), up(gate.size()), down(capacity * hidden);
+    std::vector<float> expected_gate(gate.size()), expected_up(up.size()), expected_down(down.size());
+    std::array<float, width> activated{};
+    const auto &formats = quantizedMoEVerifierFormats();
+    std::vector<const QuantizedVerifierFormatCase *> down_formats;
+    for (const auto &format : formats)
+        if (!format.source_is_superblock)
+            down_formats.push_back(&format);
+    ASSERT_FALSE(down_formats.empty());
+
+    for (size_t index = 0; index < formats.size(); ++index)
+    {
+        const auto &format = formats[index];
+        const auto &down_format = *down_formats[index % down_formats.size()];
+        requireQuantizedVerifierSourceShape(down_format, hidden, width);
+        SCOPED_TRACE(std::string(format.label) + '/' + down_format.label);
+        omp_set_num_threads(1);
+        auto wg = format.create({width, hidden}, 8411);
+        auto wu = format.create({width, hidden}, 8419);
+        auto wd = down_format.create({hidden, width}, 8423);
+        const float multiplier = composedMoEVerifierInputMultiplier(*wg, *wu, 0.75f);
+        std::transform(inputs->data(), inputs->data() + bounded_inputs.size(), bounded_inputs.begin(),
+            [multiplier](float value) { return value * multiplier; });
+        Kernel gate_kernel(wg.get(), 0, -1, policy), up_kernel(wu.get(), 0, -1, policy),
+            down_kernel(wd.get(), 0, -1, policy);
+        ASSERT_TRUE(gate_kernel.isValid() && up_kernel.isValid() && down_kernel.isValid());
+        quantize_activations_to_q8_1(bounded_inputs.data(), input_q8.data(), capacity, hidden, input_blocks, policy);
+        NativeQuantisedTestPartialStorage gate_partials(gate_kernel.packedWeights(), 1);
+        NativeQuantisedTestPartialStorage up_partials(up_kernel.packedWeights(), 1);
+        NativeQuantisedTestPartialStorage down_partials(down_kernel.packedWeights(), 1);
+        std::array<Desc, 2 * capacity> gate_up{};
+        std::array<Desc, capacity> down_members{};
+        for (int row = 0; row < capacity; ++row)
+        {
+            const auto *activation = input_q8.data() + row * input_blocks;
+            auto *serial_gate = expected_gate.data() + row * width;
+            auto *serial_up = expected_up.data() + row * width;
+            auto *serial_q8 = expected_q8.data() + row * middle_blocks;
+            gemv_native_quantised_preq(gate_kernel.packedWeights(), activation, serial_gate, gate_partials.span());
+            gemv_native_quantised_preq(up_kernel.packedWeights(), activation, serial_up, up_partials.span());
+            primitives::compute_swiglu_gpu_aligned_expert_serial(serial_gate, serial_up, activated.data(), width);
+            quantize_activations_to_q8_1(activated.data(), serial_q8, 1, width, middle_blocks, policy);
+            gemv_native_quantised_preq(down_kernel.packedWeights(), serial_q8,
+                expected_down.data() + row * hidden, down_partials.span());
+            gate_up[2 * row] = {.kernel = &gate_kernel, .input_q8 = activation,
+                .output = gate.data() + row * width, .rows = 1, .n = width, .ldc = width};
+            gate_up[2 * row + 1] = {.kernel = &up_kernel, .input_q8 = activation,
+                .output = up.data() + row * width, .rows = 1, .n = width, .ldc = width};
+            down_members[row] = {.kernel = &down_kernel, .input_q8 = actual_q8.data() + row * middle_blocks,
+                .output = down.data() + row * hidden, .rows = 1, .n = hidden, .ldc = hidden};
+        }
+
+        for (int workers : {1, 3, 7})
+        {
+            omp_set_num_threads(workers);
+            NativeQuantisedTestPartialStorage partials(std::max(
+                NativeQuantisedTestPartialStorage::bundleFloats(gate_up.data(), gate_up.size(), 1),
+                NativeQuantisedTestPartialStorage::bundleFloats(down_members.data(), down_members.size(), 1)));
+            for (int routes : {capacity, 1, 3, capacity})
+            {
+                SCOPED_TRACE("workers=" + std::to_string(workers) + " routes=" + std::to_string(routes));
+                std::fill(gate.begin(), gate.end(), untouched);
+                std::fill(up.begin(), up.end(), untouched);
+                std::fill(down.begin(), down.end(), untouched);
+                std::memset(actual_q8.data(), 0xa5, actual_q8.size() * sizeof(Q8_1Block));
+                PerfStatsCollector::reset();
+                const auto prepared = Kernel::tryExecuteStandaloneMoEOneRow(
+                    std::span(gate_up).first(2 * routes), std::span(down_members).first(routes),
+                    std::span(actual_q8).first(routes * middle_blocks), hidden, width);
+                if (prepared.has_value())
+                    ASSERT_TRUE(*prepared);
+                else
+                {
+                    ASSERT_TRUE(Kernel::execute_moe_grouped_ffn_transaction_preq_decode_equivalent(
+                        gate_up.data(), 2 * routes, hidden, gate.data(), up.data(), actual_q8.data(),
+                        routes, width, middle_blocks, down_members.data(), routes, partials.span()));
+                }
+                EXPECT_EQ(std::memcmp(gate.data(), expected_gate.data(), routes * width * sizeof(float)), 0);
+                EXPECT_EQ(std::memcmp(up.data(), expected_up.data(), routes * width * sizeof(float)), 0);
+                EXPECT_EQ(std::memcmp(down.data(), expected_down.data(), routes * hidden * sizeof(float)), 0);
+                EXPECT_EQ(std::memcmp(actual_q8.data(), expected_q8.data(),
+                    routes * middle_blocks * sizeof(Q8_1Block)), 0);
+                EXPECT_TRUE(std::all_of(gate.begin() + routes * width, gate.end(), [](float v) { return v == untouched; }));
+                EXPECT_TRUE(std::all_of(up.begin() + routes * width, up.end(), [](float v) { return v == untouched; }));
+                EXPECT_TRUE(std::all_of(down.begin() + routes * hidden, down.end(), [](float v) { return v == untouched; }));
+                const auto middle_tail = std::as_bytes(std::span(actual_q8).subspan(routes * middle_blocks));
+                EXPECT_TRUE(std::ranges::all_of(middle_tail, [](std::byte value) { return value == std::byte{0xa5}; }));
+#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
+                if (activeISALevel() >= ISALevel::AVX512 && PerfStatsCollector::isRecordFamilyEnabled(
+                        "kernel", "cpu_native_quantised_moe_prepared_phase_plans"))
+                {
+                    ASSERT_TRUE(prepared.has_value());
+                    const auto records = PerfStatsCollector::snapshot({"kernel.cpu_native_quantised_moe_prepared_phase_plans"});
+                    ASSERT_EQ(records.size(), 1u);
+                    EXPECT_EQ(records.front().value, 2.0);
+                }
+#endif
             }
         }
     }

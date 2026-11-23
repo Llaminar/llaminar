@@ -43,6 +43,7 @@
 
 #include <atomic>
 #include <cstddef>
+#include <optional>
 #include <new>
 #include <type_traits>
 
@@ -1363,6 +1364,28 @@ namespace llaminar2::cpu::native_quantised
             NativeQuantisedFusedRowsPlan::capacity;
 
         /**
+         * @brief Resolve the measured standalone schedule before binding phase operands.
+         * @param hidden Original hidden width.
+         * @param intermediate Original expert width.
+         * @param routes Number of originally admitted live local routes.
+         * @return Fixed worker count on the supported physical schedule, or zero for another schedule.
+         */
+        static int standaloneMoEOneRowWorkers(int hidden, int intermediate, size_t routes) noexcept;
+
+        /**
+         * @brief Execute the prepared one-token native expert phases on their original fixed OpenMP team.
+         * @param gate Gate and Up sources and destinations, adjacent in original local route order.
+         * @param down Original Down sources, their activation Q8 rows and their route destinations.
+         * @param activation Exact admitted middle Q8 workspace, with one row per live route.
+         * @param hidden Original hidden width.
+         * @param intermediate Original expert width.
+         * @return Empty for other supported schedules, or whether the native team completed its publication.
+         */
+        static std::optional<bool> tryExecuteStandaloneMoEOneRow(std::span<const BatchedPrequantizedProjectionDesc> gate,
+            std::span<const BatchedPrequantizedProjectionDesc> down, std::span<Q8_1Block> activation,
+            int hidden, int intermediate);
+
+        /**
          * @brief Execute unequal-M pre-quantized projections in one CPU team.
          *
          * Every descriptor independently resolves its typed scheduling purpose:
@@ -1938,6 +1961,19 @@ namespace llaminar2::cpu::native_quantised
                 .purpose = source.purpose,
             };
         }
+
+#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
+        struct PreparedMoERow; ///< Immutable admitted operands in one invocation-owned tile plan.
+        template<int Blocks, bool Nibble>
+        static void preparedMoERowTile(const PreparedMoERow &row, int chunk);
+        template<int Width, int Blocks>
+        static bool prepareMoERows(std::span<const BatchedPrequantizedProjectionDesc> original,
+            std::span<PreparedMoERow> prepared, int workers);
+        template<int Width, bool Join>
+        static void executeMoERows(std::span<const PreparedMoERow> rows);
+        static std::optional<bool> runPreparedFixedMoETiles(std::span<const BatchedPrequantizedProjectionDesc> gate,
+            std::span<const BatchedPrequantizedProjectionDesc> down, std::span<Q8_1Block> activation, int workers);
+#endif
 
         /**
          * @brief Reject an unsupported explicit phase before any FFN payload write.

@@ -402,8 +402,29 @@ candidate. The revision that compiles the standalone implementation
 separately restores the linked sizes of all 36 grouped symbols. The
 instruction comparison found differences in the diagnostic sections of two
 symbols, including the compiled source path. The isolated revision passes
-the AVX-512 and AVX2 all-format contract. The existing production schedule
-remains active during model qualification.
+the AVX-512 and AVX2 all-format contract.
+
+The isolated revision's Release probe selected the prepared schedule on
+all 2,976 ordinary calls observed on rank 1. The 182 one-row drafter calls
+and the 1,248 eight-row verifier calls used their original schedules. Both
+full comparisons matched the staged control's 256 generated tokens and
+per-iteration MTP work. Driver diagnostics were unchanged.
+
+| Arm order | Mode | Decode, control → isolated tok/s | Decode change | Complete throughput change |
+| --- | --- | ---: | ---: | ---: |
+| Candidate first | Ordinary | 29.598 → 32.069 | +8.35% | +7.04% |
+| Control first | Ordinary | 29.421 → 32.040 | +8.90% | +7.31% |
+| Candidate first | Fixed depth seven | 43.714 → 44.998 | +2.94% | +2.63% |
+| Control first | Fixed depth seven | 43.476 → 45.044 | +3.61% | +3.05% |
+
+The isolated Release fixture compared the complete FFN with four and ten
+live routes, 28 workers on each socket, and both arm orders. It checked the
+Gate/Up, SwiGLU Q8 and Down bytes before and after timing. All 216 cells
+improved, covering every Gate/Up source with Q8_0 Down and every other
+legal K320 Down source with Q4_K Gate/Up. Complete FFN latency fell by
+4.3–39.1% across the cells. Q4_K Gate/Up with Q8_0 Down improved by
+26.4–36.2%. Runtime selection uses the original shape, worker, numerical
+and execution-phase contracts for the prepared schedule.
 
 The sealed IQ4 scale probe resolved the scale program at output-tile entry.
 The IQ4_XS packet loop consumed coefficients validated at weight publication.

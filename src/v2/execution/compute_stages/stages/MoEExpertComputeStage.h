@@ -1752,9 +1752,13 @@ namespace llaminar2
          */
         void publishPublicationTarget() const;
 
-        /// Fast path for decode (seq_len=1): avoids token grouping, gather/scatter,
-        /// and per-expert heap allocations. Uses routing results directly.
-        bool executeSingleToken(IDeviceContext *ctx);
+        /**
+         * @brief Execute one row with the exact original router publication and ordered local result.
+         * @param ctx Original participant context.
+         * @param phase Original semantic graph phase, including degenerate verifier rows.
+         * @return Whether all routed projections and their original output publication completed.
+         */
+        bool executeSingleToken(IDeviceContext *ctx, MoEOverlayServicePhaseHint phase);
 
         /**
          * @brief Execute verifier-sized batches with grouped serial-row math.
