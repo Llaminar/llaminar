@@ -76,11 +76,11 @@ namespace llaminar2
             projection.N = 70;
             projection.K = 96;
             projection.blocks_per_row = 3;
-            // Codebook 23 is a normalized destination for a Q5_K-derived
-            // asymmetric expanded CPU representation, not a GGUF source id.
+            // Codebook 23 is a normalized asymmetric representation, not a
+            // source ID. Use Q4_1 provenance; both Q5_1 and Q5_K reject legacy migration.
             projection.source_codebook_id =
                 codebook == kNativeQuantisedExpandedInt8MinCodebook
-                    ? static_cast<uint8_t>(7)
+                    ? native_quantised_formats::Q4_1.codebook_id
                     : codebook == kNativeQuantisedIQ4XSSourceScaleCodebook ? uint8_t{4} : codebook;
             projection.codebook_id = codebook;
             projection.payload_bytes_per_block = payload_bytes;
@@ -558,7 +558,7 @@ namespace llaminar2
                     kNativeQuantisedExpandedInt8MinCodebook,
                     32,
                     true,
-                    true)));
+                    false)));
 
         /**
          * @test Native MXFP4 GPU<->CPU reference round trip with an odd block count,

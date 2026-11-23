@@ -289,7 +289,8 @@ namespace llaminar2::test
                 EXPECT_EQ(preparedFootprintForFormat(*native_quantised_formats::forSourceIdentity(source.codebook, true))
                               .weight_bytes_per_n_chunk_k_block, source.prepared_bytes_per_32 * 64.0);
         }
-        EXPECT_EQ(preparedEncodingForSource(native_quantised_formats::Q5_1), CPUNativeQuantisedEncoding::ExpandedInt8);
+        EXPECT_EQ(preparedEncodingForSource(native_quantised_formats::Q5_1), CPUNativeQuantisedEncoding::Q5NativeSingleScale);
+        EXPECT_EQ(preparedEncodingForSource(native_quantised_formats::Q5_1, true), CPUNativeQuantisedEncoding::ExpandedInt8);
         EXPECT_EQ(preparedEncodingForSource(native_quantised_formats::Q5_K, true), CPUNativeQuantisedEncoding::ExpandedInt8);
         EXPECT_EQ(preparedEncodingForSource(native_quantised_formats::IQ3_S, true), CPUNativeQuantisedEncoding::ExpandedInt8);
     }
