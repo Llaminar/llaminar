@@ -43,6 +43,7 @@
 #include <stdexcept>
 #include "../../../utils/DebugEnv.h"
 #include "kernels/gdn/GDNDeinterleaveRows.h"
+#include "kernels/gdn/GDNInPlaceShortConv.h"
 #include "kernels/gdn/GDNMergedRecurrence.h"
 #include "kernels/gdn/GDNDenseCompactSnapshots.h"
 #include "kernels/gdn/GDNPreparedQK.h"
@@ -2036,7 +2037,7 @@ __global__ void rocm_short_conv1d_prefill_kernel(
  * commits speculative state once all reads from the old channel history finish.
  * There is one launch for the complete matrix and no row replay.
  */
-template<bool AliasedSnapshot = false>
+template<bool AliasedSnapshot = false, bool AliasedK4 = false>
 __global__ void rocm_short_conv1d_small_m_kernel(
     const float *__restrict__ input,
     const float *__restrict__ weight,
@@ -2065,6 +2066,15 @@ __global__ void rocm_short_conv1d_small_m_kernel(
         const int raw_effective = *effective_seq_len_ptr;
         effective_seq_len =
             raw_effective < 1 ? 1 : (raw_effective > seq_len ? seq_len : raw_effective);
+    }
+
+    if constexpr (AliasedK4)
+    {
+        llaminar2::gdn::publishInPlaceShortConvChannel(output, weight, bias,
+            initial_conv_state, updated_conv_state, state_snapshots,
+            snapshot_stride_floats, max_snapshot_rows, seq_len, effective_seq_len,
+            channels, ch, apply_silu);
+        return;
     }
 
     const float *channel_weight = weight + static_cast<size_t>(ch) * kernel_size;
@@ -3866,15 +3876,21 @@ bool rocmGDN_short_conv1d(
     } else if (seq_len <= 4) {
         int threads = 256;
         int blocks = (channels + threads - 1) / threads;
-        hipLaunchKernelGGL((rocm_short_conv1d_small_m_kernel<false>),
-            dim3(blocks), dim3(threads), 0, (hipStream_t)stream,
-            input, weight, bias, output,
-            initial_conv_state, updated_conv_state,
-            nullptr,
-            state_snapshots,
-            snapshot_stride_floats,
-            max_snapshot_rows,
-            seq_len, channels, kernel_size, apply_silu);
+        const auto submit = [&]<bool Aliased>() {
+            hipLaunchKernelGGL((rocm_short_conv1d_small_m_kernel<false, Aliased>),
+                dim3(blocks), dim3(threads), 0, (hipStream_t)stream,
+                input, weight, bias, output,
+                initial_conv_state, updated_conv_state,
+                nullptr,
+                state_snapshots,
+                snapshot_stride_floats,
+                max_snapshot_rows,
+                seq_len, channels, kernel_size, apply_silu);
+        };
+        if (input == output && llaminar2::gdn::usesInPlaceShortConvHistory(seq_len, kernel_size))
+            submit.template operator()<true>();
+        else
+            submit.template operator()<false>();
     } else {
         int total = seq_len * channels;
         int threads = 256;
@@ -3975,15 +3991,21 @@ bool rocmGDN_short_conv1d_effective_with_policy(
     } else if (seq_len <= 4) {
         int threads = 256;
         int blocks = (channels + threads - 1) / threads;
-        hipLaunchKernelGGL((rocm_short_conv1d_small_m_kernel<false>),
-            dim3(blocks), dim3(threads), 0, (hipStream_t)stream,
-            input, weight, bias, output,
-            initial_conv_state, updated_conv_state,
-            device_effective_seq_len,
-            state_snapshots,
-            snapshot_stride_floats,
-            max_snapshot_rows,
-            seq_len, channels, kernel_size, apply_silu);
+        const auto submit = [&]<bool Aliased>() {
+            hipLaunchKernelGGL((rocm_short_conv1d_small_m_kernel<false, Aliased>),
+                dim3(blocks), dim3(threads), 0, (hipStream_t)stream,
+                input, weight, bias, output,
+                initial_conv_state, updated_conv_state,
+                device_effective_seq_len,
+                state_snapshots,
+                snapshot_stride_floats,
+                max_snapshot_rows,
+                seq_len, channels, kernel_size, apply_silu);
+        };
+        if (input == output && llaminar2::gdn::usesInPlaceShortConvHistory(seq_len, kernel_size))
+            submit.template operator()<true>();
+        else
+            submit.template operator()<false>();
     } else {
         int total = seq_len * channels;
         int threads = 256;

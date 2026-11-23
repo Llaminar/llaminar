@@ -4208,8 +4208,6 @@ TEST_F(Test__CUDAGDNPaddedRealLength, ShortConvQwen36M2InPlaceStateMatchesStepwi
 
     CUDAShortConvolution m2_kernel(cuda_ordinal_);
     CudaGDNStateOwner m2_kernel_state_owner(m2_kernel, state_floats);
-    m2_kernel_state_owner.bindScratch(
-        m2_kernel, static_cast<int>(output_elems));
     m2_kernel.setGPUStream(stream.stream);
     ASSERT_TRUE(m2_kernel.importState(initial_state.data(), nullptr, stream.stream));
     ASSERT_TRUE(m2_kernel.forward(
@@ -4294,8 +4292,6 @@ TEST_F(Test__CUDAGDNPaddedRealLength, ShortConvQwen36M3InPlaceStateMatchesStepwi
 
     CUDAShortConvolution m3_kernel(cuda_ordinal_);
     CudaGDNStateOwner m3_kernel_state_owner(m3_kernel, state_floats);
-    m3_kernel_state_owner.bindScratch(
-        m3_kernel, static_cast<int>(output_elems));
     m3_kernel.setGPUStream(stream.stream);
     ASSERT_TRUE(m3_kernel.importState(initial_state.data(), nullptr, stream.stream));
     ASSERT_TRUE(m3_kernel.forward(
@@ -4354,8 +4350,8 @@ TEST_F(Test__CUDAGDNPaddedRealLength, ShortConvQwen36M4InPlaceStateMatchesStepwi
     /*
      * Qwen3.6 dense uses a fused QKV short-conv width of 10240.  The MTP
      * verifier runs up to four compact rows, and the graph uses the QKV buffer
-     * in-place, so the kernel must use scratch for the convolved output while
-     * preserving raw projection rows in its live history state.
+     * in-place. The kernel must preserve the raw history while publishing
+     * the final values into that same buffer.
      */
     constexpr int channels = 10240;
     constexpr int kernel_size = 4;
@@ -4380,18 +4376,23 @@ TEST_F(Test__CUDAGDNPaddedRealLength, ShortConvQwen36M4InPlaceStateMatchesStepwi
 
     CUDAShortConvolution m4_kernel(cuda_ordinal_);
     CudaGDNStateOwner m4_kernel_state_owner(m4_kernel, state_floats);
-    m4_kernel_state_owner.bindScratch(
-        m4_kernel, static_cast<int>(output_elems));
     m4_kernel.setGPUStream(stream.stream);
     ASSERT_TRUE(m4_kernel.importState(initial_state.data(), nullptr, stream.stream));
-    ASSERT_TRUE(m4_kernel.forward(
-        d_m4_inout.ptr,
-        d_weight.ptr,
-        d_bias.ptr,
-        d_m4_inout.ptr,
-        nullptr,
-        verifier_len, channels, kernel_size,
-        /*apply_silu=*/true));
+    CudaIntBuffer d_live(verifier_len);
+    CudaCapturedGraph captured(stream.stream, [&] {
+        return m4_kernel.forwardWithEffectiveSeqLen(
+            d_m4_inout.ptr, d_weight.ptr, d_bias.ptr, d_m4_inout.ptr, nullptr,
+            verifier_len, channels, kernel_size, d_live.ptr, /*apply_silu=*/true);
+    });
+    std::size_t nodes = 0u;
+    checkCuda(cudaGraphGetNodes(captured.graph, nullptr, &nodes), "inspect short convolution capture");
+    ASSERT_EQ(nodes, 1u);
+    cudaGraphNode_t node{};
+    checkCuda(cudaGraphGetNodes(captured.graph, &node, &nodes), "inspect short convolution node");
+    cudaGraphNodeType kind{};
+    checkCuda(cudaGraphNodeGetType(node, &kind), "inspect short convolution node type");
+    EXPECT_EQ(kind, cudaGraphNodeTypeKernel);
+    captured.launch(stream.stream);
     checkCuda(cudaStreamSynchronize(stream.stream), "cudaStreamSynchronize(Qwen36 M4 in-place short-conv)");
     std::vector<float> m4_state(static_cast<size_t>(state_floats));
     ASSERT_TRUE(m4_kernel.exportState(m4_state.data(), nullptr, stream.stream));
@@ -4430,6 +4431,34 @@ TEST_F(Test__CUDAGDNPaddedRealLength, ShortConvQwen36M4InPlaceStateMatchesStepwi
         step_state,
         0,
         m4_state.size());
+
+    for (const int live : {2, 1, verifier_len})
+    {
+        SCOPED_TRACE(live);
+        d_m4_inout.copyFrom(input);
+        ASSERT_TRUE(m4_kernel.importState(initial_state.data(), nullptr, stream.stream));
+        checkCuda(cudaMemcpyAsync(d_live.ptr, &live, sizeof(live),
+            cudaMemcpyHostToDevice, stream.stream), "publish short convolution live rows");
+        captured.launch(stream.stream);
+        checkCuda(cudaStreamSynchronize(stream.stream), "retire short convolution replay");
+        const auto output = d_m4_inout.toHost();
+        auto expected = step_out;
+        std::fill(expected.begin() + static_cast<std::size_t>(live) * channels, expected.end(), 0.0f);
+        expectByteExactEquivalent("counted in-place short convolution", output, expected, 0, output_elems);
+
+        ASSERT_TRUE(m4_kernel.exportState(m4_state.data(), nullptr, stream.stream));
+        for (int channel = 0; channel < channels; ++channel)
+            for (int offset = 0; offset < kernel_size - 1; ++offset)
+            {
+                const int source_row = live - (kernel_size - 1) + offset;
+                const auto index = static_cast<std::size_t>(channel) * (kernel_size - 1) + offset;
+                const float original = source_row >= 0
+                    ? input[static_cast<std::size_t>(source_row) * channels + channel]
+                    : initial_state[static_cast<std::size_t>(channel) * (kernel_size - 1) +
+                                    static_cast<std::size_t>(source_row + kernel_size - 1)];
+                EXPECT_EQ(std::bit_cast<std::uint32_t>(m4_state[index]), std::bit_cast<std::uint32_t>(original));
+            }
+    }
 }
 
 TEST_F(Test__CUDAGDNPaddedRealLength, ShortConvTwoRowVerifierRowZeroRestoreMatchesOneRowReplay)

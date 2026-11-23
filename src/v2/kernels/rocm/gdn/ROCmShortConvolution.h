@@ -17,6 +17,7 @@
 #include "../../../tensors/TensorKernels.h"
 #include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../utils/Logger.h"
+#include "kernels/gdn/GDNInPlaceShortConv.h"
 
 #include <algorithm>
 
@@ -397,7 +398,8 @@ namespace llaminar2
             const bool snapshot_producer = verifier_state_capture_ &&
                 verifier_state_capture_size_ >= required_state_size &&
                 verifier_state_capture_rows_ >= seq_len;
-            const bool needs_scratch = input == output && seq_len != 1 && !snapshot_producer;
+            const bool needs_scratch = input == output && seq_len != 1 && !snapshot_producer &&
+                !gdn::usesInPlaceShortConvHistory(seq_len, kernel_size);
             if (needs_scratch)
             {
                 const int required_scratch_size = seq_len * channels;
@@ -468,7 +470,8 @@ namespace llaminar2
             const bool snapshot_producer = verifier_state_capture_ &&
                 verifier_state_capture_size_ >= required_state_size &&
                 verifier_state_capture_rows_ >= seq_len;
-            const bool needs_scratch = input == output && seq_len != 1 && !snapshot_producer;
+            const bool needs_scratch = input == output && seq_len != 1 && !snapshot_producer &&
+                !gdn::usesInPlaceShortConvHistory(seq_len, kernel_size);
             if (needs_scratch)
             {
                 const int required_scratch_size = seq_len * channels;

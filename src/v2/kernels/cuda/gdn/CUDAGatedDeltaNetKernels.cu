@@ -30,6 +30,7 @@
 #include "../ops/CUDAHelpers.cuh"
 #include "../../../utils/DebugEnv.h"
 #include "kernels/gdn/GDNDeinterleaveRows.h"
+#include "kernels/gdn/GDNInPlaceShortConv.h"
 #include "kernels/gdn/GDNMergedRecurrence.h"
 #include "kernels/gdn/GDNDenseCompactSnapshots.h"
 #include "kernels/gdn/GDNPlanarRecurrence.h"
@@ -1708,7 +1709,7 @@ namespace
      * final speculative state. There is one launch for the complete matrix and
      * no host or launch-level row replay.
      */
-    template<bool AliasedSnapshot = false>
+    template<bool AliasedSnapshot = false, bool AliasedK4 = false>
     __global__ void cuda_short_conv1d_small_m_kernel(
         const float *__restrict__ input,
         const float *__restrict__ weight,
@@ -1737,6 +1738,15 @@ namespace
             const int raw_effective = *effective_seq_len_ptr;
             effective_seq_len =
                 raw_effective < 1 ? 1 : (raw_effective > seq_len ? seq_len : raw_effective);
+        }
+
+        if constexpr (AliasedK4)
+        {
+            llaminar2::gdn::publishInPlaceShortConvChannel(output, weight, bias,
+                initial_conv_state, updated_conv_state, state_snapshots,
+                snapshot_stride_floats, max_snapshot_rows, seq_len, effective_seq_len,
+                channels, ch, apply_silu);
+            return;
         }
 
         const float *channel_weight =
@@ -3200,14 +3210,20 @@ extern "C"
         {
             int threads = 256;
             int blocks = (channels + threads - 1) / threads;
-            cuda_short_conv1d_small_m_kernel<false><<<blocks, threads, 0, (cudaStream_t)stream>>>(
-                input, weight, bias, output,
-                initial_conv_state, updated_conv_state,
-                nullptr,
-                state_snapshots,
-                snapshot_stride_floats,
-                max_snapshot_rows,
-                seq_len, channels, kernel_size, apply_silu);
+            const auto submit = [&]<bool Aliased>() {
+                cuda_short_conv1d_small_m_kernel<false, Aliased><<<blocks, threads, 0, (cudaStream_t)stream>>>(
+                    input, weight, bias, output,
+                    initial_conv_state, updated_conv_state,
+                    nullptr,
+                    state_snapshots,
+                    snapshot_stride_floats,
+                    max_snapshot_rows,
+                    seq_len, channels, kernel_size, apply_silu);
+            };
+            if (input == output && llaminar2::gdn::usesInPlaceShortConvHistory(seq_len, kernel_size))
+                submit.template operator()<true>();
+            else
+                submit.template operator()<false>();
         }
         else
         {
@@ -3289,14 +3305,20 @@ extern "C"
         {
             int threads = 256;
             int blocks = (channels + threads - 1) / threads;
-            cuda_short_conv1d_small_m_kernel<false><<<blocks, threads, 0, (cudaStream_t)stream>>>(
-                input, weight, bias, output,
-                initial_conv_state, updated_conv_state,
-                device_effective_seq_len,
-                state_snapshots,
-                snapshot_stride_floats,
-                max_snapshot_rows,
-                seq_len, channels, kernel_size, apply_silu);
+            const auto submit = [&]<bool Aliased>() {
+                cuda_short_conv1d_small_m_kernel<false, Aliased><<<blocks, threads, 0, (cudaStream_t)stream>>>(
+                    input, weight, bias, output,
+                    initial_conv_state, updated_conv_state,
+                    device_effective_seq_len,
+                    state_snapshots,
+                    snapshot_stride_floats,
+                    max_snapshot_rows,
+                    seq_len, channels, kernel_size, apply_silu);
+            };
+            if (input == output && llaminar2::gdn::usesInPlaceShortConvHistory(seq_len, kernel_size))
+                submit.template operator()<true>();
+            else
+                submit.template operator()<false>();
         }
         else
         {
