@@ -44,14 +44,13 @@ public:
     {
         if (n <= 0 || k <= 0)
             throw std::invalid_argument("Native CPU byte fixture requires positive geometry");
-        const std::uint64_t chunks = (std::uint64_t(n) + 63) / 64;
-        const std::uint64_t blocks_per_row = (std::uint64_t(k) + 31) / 32;
-        const auto stride = cpu::native_quantised::preparedInterleavedBlockStride(descriptor.encoding, descriptor.is_asymmetric, descriptor.source.codebook_id);
-        const auto header = cpu::native_quantised::preparedSuperblockHeaderBytes(descriptor.encoding, descriptor.source.codebook_id);
-        const cpu::native_quantised::CPUNativeQuantisedBlockGeometry geometry{
-            .block_stride = stride, .header_bytes = header,
-            .blocks_per_row = static_cast<std::size_t>(blocks_per_row), .phase = 0};
-        if (stride == 0 || chunks > max_bytes / geometry.rowBytes())
+        const std::size_t chunks = (std::size_t(n) + 63) / 64;
+        const std::size_t blocks = (std::size_t(k) + 31) / 32;
+        const auto geometry = cpu::native_quantised::preparedBlockGeometry(
+            descriptor.encoding, descriptor.is_asymmetric, descriptor.source.codebook_id, blocks);
+        const auto row_bytes = geometry.rowBytes();
+        if (row_bytes == 0 || chunks > max_bytes / row_bytes ||
+            chunks > (storage_.max_size() - 127) / row_bytes)
             throw std::overflow_error("Native CPU byte fixture exceeds its declared byte bound");
         const auto extent = geometry.matrixBytes(chunks);
         storage_.resize(extent + 127);

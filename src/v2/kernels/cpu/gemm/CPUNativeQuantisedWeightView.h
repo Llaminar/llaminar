@@ -149,8 +149,7 @@ namespace llaminar2::cpu::native_quantised
      * | NibbleLUTSourceScale (IQ4_XS) | none; coded coefficients are six bits |
      * | IQ3SExpandedSourceScale (IQ3_S) | native_quantised_iq3s_scale::valid, i.e. <= 15 |
      * | Q6KNativeDualScale | none; both bytes are signed coefficients |
-     * | CompactMultiScale codebook 13 (IQ2_S) | native_quantised_iq2s_scale::valid, i.e. <= 255 |
-     * | CompactMultiScale other codebooks | none; FP16 scales and minima |
+     * | CompactMultiScale | no per-block secondary word; every code and superblock word is in-domain |
      *
      * This is exactly the set of reserved-bit checks that execution performed
      * per K block. The seal binds the byte root, extent and every descriptor

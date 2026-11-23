@@ -33,6 +33,7 @@
 #if defined(__aarch64__)
 #include "kernels/cpu/gemm/CPUNativeNEONPreparedProjection.h"
 #endif
+#include "kernels/cpu/gemm/CPUWeightPreparationMemory.h"
 #include "tensors/NativeQuantisedSuperblockMetadata.h"
 
 #include <array>
@@ -283,6 +284,8 @@ namespace llaminar2::test
             const double bytes = source.prepared_bytes_per_32 * 128.0 * (1024 / 32);
             EXPECT_EQ(static_cast<double>(packed.native_interleaved.size()), bytes);
             EXPECT_EQ(packed.preparedBytes(), packed.native_interleaved.size());
+            EXPECT_EQ(CPUWeightPreparationMemory::sourceNative(source.name, 128, 1024).persistent_payload_bytes,
+                packed.native_interleaved.size());
             EXPECT_EQ(static_cast<double>(packed.preparedFootprint().weight_bytes_per_n_chunk_k_block),
                       source.prepared_bytes_per_32 * 64.0);
             if (source.codebook == 7 || source.codebook == 11)

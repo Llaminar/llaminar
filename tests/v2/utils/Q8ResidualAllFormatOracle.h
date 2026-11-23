@@ -12,6 +12,8 @@
 #include "QuantizedVerifierFormats.h"
 #include "kernels/common/DeviceNativeQuantisedMatrixDesc.h"
 #include "kernels/cpu/gemm/CPUNativeQuantisedDecode.h"
+#include "kernels/cpu/gemm/CPUNativeQuantisedCodedMetadata.h"
+#include "tensors/NativeQuantisedSuperblockMetadata.h"
 #include "tensors/MXFP4Format.h"
 #include "tensors/NativeQuantisedScalePlane.h"
 #include "kernels/cpu/gemm/CPUNativeQuantisedGemmKernel.h"
@@ -211,14 +213,19 @@ cpuWeights(const cpu::native_quantised::CPUNativeQuantisedPackedWeights &p) {
       const int chunk = n / 64, col = n % 64, z = col / 16, lane = col % 16;
       std::array<double, 32> decoded{};
       if (p.usesCompactMultiScale()) {
+        // Coded compact units carry the source payload at its exact width;
+        // the per-block staged words are reconstructed through the codec
+        // (codedBlockMetadata) and code-in-payload codebooks restore the
+        // sign-parity bits before the integer decoder runs.
         std::array<uint8_t, 32> payload{};
-        for (int j = 0; j < p.payload_bytes; ++j)
-          payload[j] = p.interleavedB(chunk, b, j / 4, z)[lane * 4 + j % 4];
+        cpu::native_quantised::compactColumnPayload(p.blockUnit(chunk, b), p.codebook_id, col, payload.data());
+        ::llaminar2::native_quantised_superblock::restoreCodedPayload(p.codebook_id, payload.data());
+        const auto meta = p.codedBlockMetadata(chunk, b, col);
         decoded = coefficients(
             p.codebook_id,
             std::span<const uint8_t>(payload.data(), p.payload_bytes),
-            p.chunkScales(chunk, b)[col], p.chunkMins(chunk, b)[col],
-            p.codebook_id == 10 ? p.chunkEffectiveMins(chunk, b)[col] : 0);
+            meta.primary, meta.secondary,
+            p.codebook_id == 10 ? meta.emin : 0);
       } else
         for (int i = 0; i < 32; ++i) {
           int value;

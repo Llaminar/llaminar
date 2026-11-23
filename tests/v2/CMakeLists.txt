@@ -2624,6 +2624,7 @@ add_v2_test(V2_Unit_NativeQuantisedDispatchCache
 # Prefill task ownership is a pure geometry policy, independent of ISA or devices.
 add_executable(v2_test_native_quantised_prefill_schedule
     unit/kernels/Test__NativeQuantisedPrefillSchedule.cpp)
+target_compile_features(v2_test_native_quantised_prefill_schedule PRIVATE cxx_std_20)
 target_include_directories(v2_test_native_quantised_prefill_schedule PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/../../src/v2")
 target_link_libraries(v2_test_native_quantised_prefill_schedule PRIVATE
@@ -3330,6 +3331,13 @@ add_v2_test(V2_Unit_PackedWeightsSerialization
     LABELS "V2;Unit;Kernels;Serialization;PackedWeights;MoE"
     MPI_PROCS 1
 )
+# Coded compact roots retain source bits in both archive and direct transfer.
+add_v2_test(V2_Integration_CPUCodedCompactPackedWeightsArchiveABI
+    COMMAND $<TARGET_FILE:v2_unit_packed_weights_serialization>
+        --gtest_filter=Test__PackedWeightsSerialization.CompactMultiScalePreservesEveryNativeMetadataBit
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;NativeQuantised;Serialization;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUCodedCompactPackedWeightsArchiveABI)
 # Native MXFP4 tier reference: exact byte plane <-> BF16 unit words, odd counts, malformed words.
 add_v2_test(V2_Integration_MXFP4TierReferenceRoundTrip
     COMMAND $<TARGET_FILE:v2_test_expert_tier_weight_stream>
@@ -7426,6 +7434,7 @@ add_executable(v2_test_native_quantised_trainer_evidence
     unit/utils/Test__NativeQuantisedTrainerEvidence.cpp
     unit/utils/Test__BenchmarkGeometrySelection.cpp
 )
+target_compile_features(v2_test_native_quantised_trainer_evidence PRIVATE cxx_std_20)
 target_include_directories(v2_test_native_quantised_trainer_evidence PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_SOURCE_DIR}
@@ -10635,6 +10644,12 @@ add_v2_test(V2_Integration_CPUCodedFileDensityQ6IQ4
     COMMAND $<TARGET_FILE:v2_unit_cpu_coded_file_density_q6iq4>
     LABELS "V2;Integration;CPU;DeviceFree;NativeQuantised;Memory;ByteExact;Regression;ProductionTestPreflight"
     MPI_PROCS 1 NO_MODELS)
+add_v2_test(V2_Integration_CPUCodedCompactPreparedAdmissionGeometry
+    COMMAND $<TARGET_FILE:v2_unit_cpu_coded_compact_units>
+        --gtest_filter=CPUCodedCompactUnits.PreparedBytesEqualFileDensity
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;NativeQuantised;Memory;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUCodedCompactPreparedAdmissionGeometry)
 
 add_v2_test(V2_Integration_CPUCompensationFreeUnits
     COMMAND $<TARGET_FILE:v2_unit_cpu_coded_compact_units>

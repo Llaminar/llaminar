@@ -56,8 +56,9 @@ static constexpr uint32_t PACKED_WEIGHTS_MAGIC = 0x5457504C; // "LPWT" in little
 /// Version8 stores native MXFP4 (codebook 25, NibbleLUT) unit scales as BF16
 /// power-of-two words instead of FP16; the codebook/encoding fields are
 /// unchanged, so a version-7 MXFP4 archive would otherwise be misread.
+/// Version 9 replaces compact per-block metadata with source codes and superblock words.
 /// Earlier archives are rejected before any payload is adopted.
-static constexpr uint32_t PACKED_WEIGHTS_VERSION = 8;
+static constexpr uint32_t PACKED_WEIGHTS_VERSION = 9;
 
 #pragma pack(push, 1)
 
@@ -161,6 +162,29 @@ inline bool validNativeSourceScaleTupleHeader(const PackedWeightsHeader &header)
                header.has_native_blocks == 0;
     return !(header.codebook_id == 4 && header.is_superblock != 0 &&
              header.prepared_encoding == static_cast<uint8_t>(Encoding::NibbleLUT));
+}
+
+/** @brief Validate the exact resident section of a coded CPU archive before allocating or borrowing it. */
+inline bool validCodedCPUSection(const PackedWeightsHeader &header, const PackedWeightsSectionTable &sections) noexcept
+{
+    using namespace cpu::native_quantised;
+    const auto encoding = static_cast<CPUNativeQuantisedEncoding>(header.prepared_encoding);
+    if (!preparedSuperblockCoded(encoding))
+        return true;
+    const auto *source = native_quantised_formats::forSourceIdentity(header.codebook_id, true);
+    if (!source || header.is_superblock != 1 || header.is_asymmetric != uint8_t(source->is_asymmetric) ||
+        header.payload_bytes != source->payload_bytes || preparedEncodingForSource(*source) != encoding ||
+        header.N <= 0 || header.K <= 0 || header.has_native_blocks ||
+        sections.native_blocks_size || sections.payload_size || sections.int8_flat_size)
+        return false;
+    const auto chunks = (uint64_t(header.N) + 63) / 64;
+    const auto blocks = (uint64_t(header.K) + 31) / 32;
+    const auto geometry = preparedBlockGeometry(encoding, source->is_asymmetric, source->codebook_id, blocks);
+    return uint64_t(header.N_padded) == chunks * 64 && uint64_t(header.blocks_per_row) == blocks &&
+        uint64_t(header.data_stride) == preparedDataStride(encoding, source->codebook_id) &&
+        uint64_t(header.interleaved_block_stride) == geometry.block_stride &&
+        chunks <= std::numeric_limits<size_t>::max() / geometry.rowBytes() &&
+        sections.interleaved_size == geometry.matrixBytes(chunks);
 }
 
 /**
@@ -273,6 +297,8 @@ inline bool describeTransfer(
     sections.payload_size = packed.payload.size();
     sections.int8_flat_size = packed.int8_flat.size();
     sections.native_blocks_size = native_blocks.size();
+    if (!validCodedCPUSection(header, sections))
+        return false;
 
     views.data = {
         packed.native_interleaved.data(),
@@ -327,7 +353,7 @@ inline PackedWeightsReceiveTarget allocateTransferTarget(
     const auto &sections = descriptor.sections;
     if (header.magic != PACKED_WEIGHTS_MAGIC ||
         header.version != PACKED_WEIGHTS_VERSION ||
-        !validNativeSourceScaleTupleHeader(header) ||
+        !validNativeSourceScaleTupleHeader(header) || !validCodedCPUSection(header, sections) ||
         header.format !=
             static_cast<uint32_t>(PackedWeightsFormat::CPU_NATIVE_QUANTISED))
     {
@@ -559,6 +585,8 @@ inline std::unique_ptr<IPackedWeights> deserialize(
     // Read section table.
     PackedWeightsSectionTable sections;
     std::memcpy(&sections, data + sizeof(header), sizeof(sections));
+    if (!validCodedCPUSection(header, sections))
+        return nullptr;
 
     // Validate total size.
     const size_t expected_size = MIN_SIZE
