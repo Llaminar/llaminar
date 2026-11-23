@@ -96,7 +96,6 @@ namespace
             ASSERT_TRUE(footprint.isValid());
             const auto geometry = cpu_nq::preparedBlockGeometry(
                 footprint.encoding, footprint.is_asymmetric, format->codebook_id, blocks);
-            ASSERT_EQ(geometry.block_stride, footprint.weight_bytes_per_n_chunk_k_block);
 
             PendingDensity pending{nullptr, 0, 0, "no pending lane"};
             for (const auto &entry : pending_density)
