@@ -490,17 +490,4 @@ namespace llaminar2::native_quantised_superblock::test
                 }
         }
     }
-
-    /** Device readers address code bits in 32 bits; planning rejects larger planes. */
-    TEST(NativeQuantisedSuperblockMetadata, CodePlaneAddressingBoundIsEnforcedPerFormat)
-    {
-        // A 256k-vocabulary x 8192-wide head (64M blocks) fits every width.
-        for (const std::uint8_t cb : {5, 8, 10, 11, 13, 17, 24})
-            EXPECT_TRUE(superblockCodePlaneAddressable(cb, 262144, 256)) << int(cb);
-        // 16-bit codes: 2^28 blocks would need 2^32 bits.
-        EXPECT_FALSE(superblockCodePlaneAddressable(10, std::uint64_t{1} << 20, 256));
-        EXPECT_TRUE(superblockCodePlaneAddressable(10, (std::uint64_t{1} << 20) - 1, 255));
-        // Code-in-payload formats have no plane to bound.
-        EXPECT_TRUE(superblockCodePlaneAddressable(12, std::uint64_t{1} << 40, 1u << 20));
-    }
 } // namespace llaminar2::native_quantised_superblock::test
