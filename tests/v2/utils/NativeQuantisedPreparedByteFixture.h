@@ -31,16 +31,17 @@ public:
      * @param n Logical output columns.
      * @param k Logical reduction elements.
      * @param max_bytes Allocation bound; the default is the Unit budget.
+     * @param rotation_enabled Select explicit symmetric rotated storage before allocating bytes.
      * @throws std::invalid_argument For nonpositive geometry.
      * @throws std::overflow_error If the requested fixture exceeds @p max_bytes.
      */
     explicit NativeQuantisedPreparedByteFixture(const NativeQuantisedFormatInfo &source, int n = 65, int k = 65,
-        std::size_t max_bytes = 4u * 1024u * 1024u)
+        std::size_t max_bytes = 4u * 1024u * 1024u, bool rotation_enabled = false)
         : descriptor{.columns = n, .reduction_width = k,
             .source = {.codebook_id = source.codebook_id, .is_superblock = source.is_superblock, .present = true},
-            .encoding = cpu::native_quantised::preparedEncodingForSource(source),
+            .encoding = cpu::native_quantised::preparedEncodingForSource(source, rotation_enabled),
             .numerical_policy = CPUProjectionNumericalPolicy::GPUAlignedExpert,
-            .is_asymmetric = source.is_asymmetric}
+            .is_asymmetric = !rotation_enabled && source.is_asymmetric}
     {
         if (n <= 0 || k <= 0)
             throw std::invalid_argument("Native CPU byte fixture requires positive geometry");

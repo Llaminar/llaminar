@@ -150,6 +150,14 @@ namespace llaminar2
         return superblock && (codebook == 7 || codebook == 11);
     }
 
+    /** @return Why a per-block CPU wire cannot carry a coded resident root; null for per-block roots. */
+    [[nodiscard]] constexpr const char *codedCpuWireRejection(
+        cpu::native_quantised::CPUNativeQuantisedEncoding encoding) noexcept
+    {
+        return cpu::native_quantised::preparedSuperblockCoded(encoding)
+            ? "Superblock-coded CPU roots require coded expert weight streams" : nullptr;
+    }
+
     /**
      * @brief Native CPU root and bounded encoded wire geometry, with no GPU metadata.
      *
@@ -176,10 +184,7 @@ namespace llaminar2
                wire_columns_per_unit==0 || wire_columns_per_unit>64 || cpu_is_asymmetric>1 || cpu_is_superblock>1 ||
                !native_quantised_formats::forSourceIdentity(cpu_codebook_id,cpu_is_superblock!=0) ||
                !cpu::native_quantised::isKnownPreparedEncoding(cpu_encoding) ||
-               codedSourceScaleStreamRejection(cpu_encoding) ||
-               (cpu_encoding == cpu::native_quantised::CPUNativeQuantisedEncoding::CompactMultiScale &&
-                requiresCodedQ5KIQ3SMigrationSlots(cpu_codebook_id, cpu_is_superblock != 0)) ||
-                requiresDensityAwareExpertTierSlots(cpu_encoding, cpu_codebook_id) ||
+               codedCpuWireRejection(cpu_encoding) ||
                cpu_data_stride!=cpu::native_quantised::preparedDataStride(cpu_encoding,cpu_codebook_id) ||
                cpu_block_stride!=cpu::native_quantised::preparedInterleavedBlockStride(cpu_encoding,cpu_is_asymmetric!=0,cpu_codebook_id))return false;
             const uint64_t expected=((uint64_t(N)+wire_columns_per_unit-1)/wire_columns_per_unit)*blocks_per_row;
@@ -277,7 +282,7 @@ namespace llaminar2
                 blocks_per_row != K / 32 || N_padded < N ||
                 (N_padded % 64) != 0 || N_padded != ((N + 63) / 64) * 64 ||
                 !cpu::native_quantised::isKnownPreparedEncoding(cpu_encoding) ||
-                codedSourceScaleStreamRejection(cpu_encoding) ||
+                codedCpuWireRejection(cpu_encoding) ||
                 requiresDensityAwareExpertTierSlots(cpu_encoding, cpu_codebook_id) ||
                 cpu::native_quantised::isQ5NativeSingleScaleSource(gpu_source_codebook_id, gpu_source_is_superblock != 0) ||
                 cpu_is_asymmetric>1 || cpu_is_superblock>1 || gpu_source_is_superblock>1 ||

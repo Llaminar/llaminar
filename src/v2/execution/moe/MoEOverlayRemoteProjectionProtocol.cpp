@@ -525,6 +525,8 @@ namespace llaminar2
 
             if (carriesCpuBytes())
             {
+            if (const char *reason = codedCpuWireRejection(cpu_encoding))
+                return reject(error, reason);
             if (!identity.source_device.is_cpu() &&
                 !identity.destination_device.is_cpu())
             {
@@ -550,6 +552,9 @@ namespace llaminar2
             if (identity.source_device.is_gpu() ||
                 identity.destination_device.is_gpu())
             {
+                if (requiresDensityAwareExpertTierSlots(cpu_encoding, cpu_codebook_id) ||
+                    cpu::native_quantised::isQ5NativeSingleScaleSource(cpu_codebook_id, cpu_is_superblock != 0))
+                    return reject(error, "Remote CPU/GPU projection requires a file-density migration converter");
                 if (!validGpuExecutionFormat(*this, *source))
                 {
                     return reject(
@@ -637,10 +642,12 @@ namespace llaminar2
         void requireCanonicalCpuRoot(const cpu::native_quantised::CPUNativeQuantisedPackedWeights &root,
             const MoEOverlayRemoteProjectionManifest &format)
         {
+            if (const char *reason = codedCpuWireRejection(root.encoding))
+                throw std::invalid_argument(reason);
             if (root.N_padded != format.N_padded || root.blocks_per_row != format.blocks_per_row ||
                 root.encoding != format.cpu_encoding || root.data_stride != static_cast<int>(format.cpu_data_stride) ||
                 root.interleaved_block_stride != format.cpu_block_stride || root.native_interleaved.size() !=
-                    uint64_t(format.N_padded / 64) * format.blocks_per_row * format.cpu_block_stride)
+                    root.preparedBytes())
                 throw std::invalid_argument("Remote CPU root does not match its genuine canonical final storage");
         }
         /** @brief Seal CPU-only wire geometry without claiming any source payload owner. */

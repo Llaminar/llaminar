@@ -38,6 +38,12 @@ std::vector<uint8_t> encodedTierColumn(std::span<const uint8_t> root,
         result.push_back(static_cast<uint8_t>(((low>>bit)&15)|(((high>>bit)&15)<<4)));
     }
     const bool compact=layout.cpu_encoding==cpu::native_quantised::CPUNativeQuantisedEncoding::CompactMultiScale;
+    if (cpu::native_quantised::preparedScaleEncoding(layout.cpu_codebook_id, layout.cpu_encoding) ==
+        cpu::native_quantised::CPUNativeQuantisedScaleEncoding::E8M0)
+    {
+        result.push_back(root[unit + layout.cpu_data_stride + column]);
+        return result;
+    }
     for(size_t plane=0;plane<(compact?2:(layout.cpu_block_stride-layout.cpu_data_stride)/128);++plane)
         for(size_t byte=0;byte<2;++byte)result.push_back(root[unit+layout.cpu_data_stride+plane*128+column*2+byte]);
     // Only Q2_K's compact unit reserves the effective-minimum vector after its scales.

@@ -209,10 +209,7 @@ TEST(CPUNativeQuantisedWeightView, EverySingleFactorAndRotatedSourceHasBoundedZe
 
         // Rotation's canonical symmetric ExpandedInt8 stream has the same
         // physical span for every original source; provenance stays original.
-        PreparedBytes rotated(native_quantised_formats::Q8_0, 64, 32);
-        rotated.descriptor.source = {
-            .codebook_id = source.metadata->codebook_id,
-            .is_superblock = source.metadata->is_superblock, .present = true};
+        PreparedBytes rotated(*source.metadata, 64, 32, 4u * 1024u * 1024u, true);
         const auto rotated_view = rotated.view();
         EXPECT_EQ(rotated_view.payload_bytes, 32);
         EXPECT_EQ(rotated_view.source_payload_bytes, source.metadata->payload_bytes);

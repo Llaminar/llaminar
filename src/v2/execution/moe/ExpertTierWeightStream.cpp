@@ -307,6 +307,8 @@ namespace llaminar2
                 return reject(error, kCodedQ5KIQ3SMigrationDiagnostic);
             if (requiresDensityAwareExpertTierSlots(cpu.encoding, cpu.codebook_id))
                 return reject(error, kDensityAwareExpertTierSlotsRequired);
+            if (const char *reason = codedCpuWireRejection(cpu.encoding))
+                return reject(error, reason);
             // Source provenance must identify exactly one of the 21 cataloged
             // formats even when its final CPU bytes have been normalized.
             if (native_quantised_formats::forSourceIdentity(
@@ -625,6 +627,8 @@ namespace llaminar2
             return reject(error, kCodedQ5KIQ3SMigrationDiagnostic);
         if (requiresDensityAwareExpertTierSlots(cpu_encoding, cpu_codebook_id))
             return reject(error, kDensityAwareExpertTierSlotsRequired);
+        if (const char *reason = codedCpuWireRejection(cpu_encoding))
+            return reject(error, reason);
         // Re-derive strides rather than accepting redundant wire fields on trust.
         const uint32_t expected_data_stride =
             cpu::native_quantised::preparedDataStride(cpu_encoding, cpu_codebook_id);
@@ -710,10 +714,8 @@ namespace llaminar2
         ExpertTierWeightCPUStorageLayout format, MoEExpertProjectionOwnership::Projection owned,
         const ExpertTierWeightProjectionIntersection &intersection, std::uint32_t capacity)
     {
-        if (const char *reason = codedSourceScaleStreamRejection(format.cpu_encoding))
+        if (const char *reason = codedCpuWireRejection(format.cpu_encoding))
             throw std::invalid_argument(reason);
-        if (requiresDensityAwareExpertTierSlots(format.cpu_encoding, format.cpu_codebook_id))
-            throw std::invalid_argument(kDensityAwareExpertTierSlotsRequired);
         if (intersection.empty() || (owned != intersection.source() && owned != intersection.destination()) ||
             intersection.columns() % 32 || intersection.firstColumn() % 32 ||
             intersection.firstColumn() < owned.first_column ||
@@ -790,16 +792,14 @@ namespace llaminar2
                     }
                     else destination[destination_base + 16 * destination_columns + group * destination_columns + destination_column] = value;
                 }
-            const bool compact = layout.cpu_encoding == cpu::native_quantised::CPUNativeQuantisedEncoding::CompactMultiScale;
-            const size_t planes = (layout.cpu_block_stride - layout.cpu_data_stride) / 128;
-            for (size_t plane = 0; plane < (compact ? 2 : planes); ++plane)
-                copy(source_base + payload_per_column * source_columns + plane * source_columns * 2 + source_column * 2,
-                     destination_base + payload_per_column * destination_columns + plane * destination_columns * 2 + destination_column * 2, 2);
-            // Only Q2_K's compact unit reserves the effective-minimum vector;
-            // every other compact unit ends after its two scale planes.
-            if (compact && layout.cpu_block_stride > layout.cpu_data_stride + 256)
-                copy(source_base + payload_per_column * source_columns + 4 * source_columns + source_column * 4,
-                     destination_base + payload_per_column * destination_columns + 4 * destination_columns + destination_column * 4, 4);
+            using namespace cpu::native_quantised;
+            const size_t field_bytes = preparedScaleEncoding(layout.cpu_codebook_id, layout.cpu_encoding) ==
+                CPUNativeQuantisedScaleEncoding::E8M0 ? 1 : 2;
+            const size_t planes = (layout.cpu_block_stride - layout.cpu_data_stride) / (64 * field_bytes);
+            for (size_t plane = 0; plane < planes; ++plane)
+                copy(source_base + (payload_per_column + plane * field_bytes) * source_columns + source_column * field_bytes,
+                     destination_base + (payload_per_column + plane * field_bytes) * destination_columns + destination_column * field_bytes,
+                     field_bytes);
         }
         /** @brief Shared encoded plane copier; full and partial units use the same original coordinates. */
         template<bool Gather>
@@ -1125,6 +1125,10 @@ namespace llaminar2
             cpu::native_quantised::preparedEncodingForSource(source_format);
         if (requiresDensityAwareExpertTierSlots(cpu_encoding, source_format.codebook_id))
             throw std::invalid_argument(kDensityAwareExpertTierSlotsRequired);
+        if (const char *reason = codedSourceScaleStreamRejection(cpu_encoding))
+            throw std::invalid_argument(reason);
+        if (const char *reason = codedCpuWireRejection(cpu_encoding))
+            throw std::invalid_argument(reason);
         if (cpu_encoding == CPUEncoding::Q5NativeSingleScale)
             throw std::invalid_argument(kNativeQ5GpuStreamUnsupported);
         ExpertTierWeightStreamManifest manifest;
@@ -1556,6 +1560,8 @@ namespace llaminar2
             return reject(error, reason);
         if (requiresDensityAwareExpertTierSlots(output.encoding, output.codebook_id))
             return reject(error, kDensityAwareExpertTierSlotsRequired);
+        if (const char *reason = codedCpuWireRejection(output.encoding))
+            return reject(error, reason);
         const size_t unit_count =
             static_cast<size_t>(output.N_padded / 64) *
             static_cast<size_t>(output.blocks_per_row);

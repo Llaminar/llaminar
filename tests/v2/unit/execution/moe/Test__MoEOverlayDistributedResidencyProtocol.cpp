@@ -301,72 +301,27 @@ namespace llaminar2::test
             };
         }
 
-        /** @brief Materialize deterministic final Q4_0 CPU execution bytes. */
+        /** @brief Materialize deterministic bytes in a currently admitted Q8_K resident layout. */
         cpu::native_quantised::CPUNativeQuantisedPackedWeights cpuProjectionBytes()
         {
             using namespace cpu::native_quantised;
+            const auto &source = native_quantised_formats::Q8_K;
             CPUNativeQuantisedPackedWeights packed;
             packed.N = 32;
             packed.K = 64;
             packed.N_padded = 64;
-            packed.blocks_per_row = 2;
-            packed.codebook_id = native_quantised_formats::Q4_0.codebook_id;
-            packed.payload_bytes = 16;
-            packed.encoding = CPUNativeQuantisedEncoding::NibbleLUT;
-            packed.is_asymmetric = false;
-            packed.is_superblock = false;
-            packed.data_stride = static_cast<int>(
-                preparedDataStride(packed.encoding, packed.codebook_id));
-            packed.interleaved_block_stride =
-                preparedInterleavedBlockStride(
-                    packed.encoding, packed.is_asymmetric, packed.codebook_id);
-            const std::size_t bytes =
-                static_cast<std::size_t>(packed.N_padded / 64) *
-                static_cast<std::size_t>(packed.blocks_per_row) *
-                static_cast<std::size_t>(
-                    packed.interleaved_block_stride);
-            packed.native_interleaved.resize_uninitialized(bytes);
+            packed.blocks_per_row = packed.K / 32;
+            packed.codebook_id = source.codebook_id;
+            packed.payload_bytes = source.payload_bytes;
+            packed.is_superblock = source.is_superblock;
+            packed.is_asymmetric = source.is_asymmetric;
+            packed.encoding = preparedEncodingForSource(source);
+            packed.data_stride = preparedDataStride(packed.encoding, packed.codebook_id);
+            packed.interleaved_block_stride = preparedInterleavedBlockStride(packed.encoding, packed.is_asymmetric, packed.codebook_id);
+            packed.native_interleaved.resize_uninitialized(packed.preparedBytes());
             const auto written = packed.native_interleaved.beginRewrite();
-            for (std::size_t index = 0; index < bytes; ++index)
-            {
-                written[index] =
-                    static_cast<std::uint8_t>((index * 37u + 11u) & 0xffu);
-            }
-            return packed;
-        }
-
-        /** @brief Materialize deterministic expanded asymmetric Q5_1 bytes. */
-        cpu::native_quantised::CPUNativeQuantisedPackedWeights
-        cpuAsymmetricProjectionBytes()
-        {
-            using namespace cpu::native_quantised;
-            CPUNativeQuantisedPackedWeights packed;
-            packed.N = 32;
-            packed.K = 64;
-            packed.N_padded = 64;
-            packed.blocks_per_row = 2;
-            packed.codebook_id = native_quantised_formats::Q5_1.codebook_id;
-            packed.payload_bytes = 32;
-            packed.encoding = preparedEncodingForCodebook(
-                packed.codebook_id);
-            packed.is_asymmetric = true;
-            packed.is_superblock = false;
-            packed.data_stride = static_cast<int>(
-                preparedDataStride(packed.encoding, packed.codebook_id));
-            packed.interleaved_block_stride =
-                preparedInterleavedBlockStride(
-                    packed.encoding, packed.is_asymmetric, packed.codebook_id);
-            const std::size_t bytes =
-                static_cast<std::size_t>(packed.N_padded / 64) *
-                static_cast<std::size_t>(packed.blocks_per_row) *
-                packed.interleaved_block_stride;
-            packed.native_interleaved.resize_uninitialized(bytes);
-            const auto written = packed.native_interleaved.beginRewrite();
-            for (std::size_t index = 0; index < bytes; ++index)
-            {
-                written[index] =
-                    static_cast<std::uint8_t>((index * 53u + 17u) & 0xffu);
-            }
+            for (std::size_t index = 0; index < written.size(); ++index)
+                written[index] = static_cast<std::uint8_t>((index * 37u + 11u) & 0xffu);
             return packed;
         }
     } // namespace
@@ -400,7 +355,7 @@ namespace llaminar2::test
         const auto manifest = makeMoEOverlayRemoteCpuProjectionManifest(
             identity, cpu_bytes, /*maximum_chunk_bytes=*/73);
         ASSERT_TRUE(manifest.valid());
-        EXPECT_EQ(manifest.region_bytes[0],1280u); // N32/K64 live columns, not2560-byte resident storage.
+        EXPECT_EQ(manifest.region_bytes[0], cpu_bytes.preparedBytes() / 2); // 32 of 64 resident columns.
         EXPECT_EQ(manifest.region_bytes[1], 0u);
 
         std::array<
@@ -678,7 +633,7 @@ namespace llaminar2::test
         CpuGpuManifestUsesWholeRepackUnitsAndRejectsPartialWireCapacity)
     {
         auto fixture = makeTransaction();
-        const auto cpu_bytes = cpuAsymmetricProjectionBytes();
+        const auto cpu_bytes = cpuProjectionBytes();
         const auto identity = remoteProjectionIdentity(
             fixture.transaction, DeviceId::cpu(), DeviceId::cuda(0));
         const auto stream = makeCpuToGpuExpertTierWeightStreamManifest(
@@ -738,9 +693,9 @@ namespace llaminar2::test
         MoEOverlayHostRemoteProjectionSource source(
             manifest, regions, std::make_shared<int>(1));
 
-        EXPECT_EQ(cpu_bytes.native_interleaved.size(),2560u);
-        EXPECT_EQ(manifest.total_bytes,1280u);
-        EXPECT_EQ(manifest.cpu_wire_columns_per_unit,3u);
+        EXPECT_EQ(cpu_bytes.native_interleaved.size(), cpu_bytes.preparedBytes());
+        EXPECT_EQ(manifest.total_bytes, cpu_bytes.preparedBytes() / 2);
+        EXPECT_EQ(manifest.cpu_wire_columns_per_unit, 73u / (cpu_bytes.interleaved_block_stride / 64u));
         std::vector<uint8_t> staging(manifest.maximum_chunk_bytes,0xa5);
         MoEOverlayRemoteProjectionChunkView first;
         std::string error;
@@ -777,7 +732,7 @@ namespace llaminar2::test
             ++acknowledged_chunks;
         }
         EXPECT_GT(acknowledged_chunks, 1u);
-        EXPECT_EQ(acknowledged_bytes,1280u);
+        EXPECT_EQ(acknowledged_bytes, cpu_bytes.preparedBytes() / 2);
     }
 
     TEST(
@@ -785,7 +740,7 @@ namespace llaminar2::test
         CpuDestinationAcceptsOnlyEquivalentAuthenticatedLiveGpuFormat)
     {
         auto fixture = makeTransaction();
-        const auto cpu_bytes = cpuAsymmetricProjectionBytes();
+        const auto cpu_bytes = cpuProjectionBytes();
         const auto identity = remoteProjectionIdentity(
             fixture.transaction, DeviceId::cuda(0), DeviceId::cpu());
         const NativeQuantisedFormatInfo *source_format =
@@ -804,14 +759,7 @@ namespace llaminar2::test
                 /*maximum_units_per_chunk=*/1);
         const auto expected = makeMoEOverlayRemoteCpuProjectionManifest(
             identity, canonical_stream, /*maximum_chunk_bytes=*/4096);
-        auto live = expected;
-        /* Q5_1 demoted through CPU promotes as normalized INT8+minimum. */
-        live.gpu_codebook_id = kNativeQuantisedExpandedInt8MinCodebook;
-        live.gpu_payload_bytes_per_block = 32;
-        live.gpu_is_asymmetric = 1;
-        live.gpu_has_emins = 0;
-        live.manifest_hash = live.computedHash();
-        ASSERT_TRUE(live.valid());
+        const auto live = expected;
 
         std::vector<std::uint8_t> destination_bytes(
             cpu_bytes.native_interleaved.size(), 0u);

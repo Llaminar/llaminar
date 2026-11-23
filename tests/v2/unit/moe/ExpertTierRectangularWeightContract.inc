@@ -44,8 +44,12 @@ TEST(ExpertTierWeightStream, RectangularEncodedColumnsAllFormatsPreserveNeighbou
         P{R::ParticipantInputSlice,256,256,72,160,64,128});
     for(const auto& format:native_quantised_formats::kAllSourceFormats) {
         SCOPED_TRACE(format.quant_type);
-        if (cpu::native_quantised::isQ5NativeSingleScaleSource(format.metadata->codebook_id, format.metadata->is_superblock))
-            continue; // CPU-only movement below still covers these native units.
+        if (!legacyGpuStreamRejection(*format.metadata).empty())
+        {
+            EXPECT_THROW((void)makeGpuToCpuExpertTierWeightStreamManifest(*format.metadata, 128, 96, 17, 0, 9,
+                ExpertTierWeightProjection::Down, 2), std::invalid_argument);
+            continue;
+        }
         const auto full=makeGpuToCpuExpertTierWeightStreamManifest(*format.metadata,128,96,17,0,9,ExpertTierWeightProjection::Down,2);
         const auto manifest=full.forIntersection(intersection);
         const auto source_layout=manifest.deviceLayout();ASSERT_TRUE(source_layout.valid());
@@ -104,6 +108,12 @@ TEST(ExpertTierWeightStream, NativeCpuRectanglesUseOnlyLivePlanesAndIndependentR
         source.wire_columns_per_unit=quantum;source.unit_count=((69+quantum-1)/quantum)*2;
         source.maximum_units_per_chunk=std::min(2u,source.unit_count);
         auto target=source;target.cpu_N=160;target.cpu_K=128;target.cpu_first_row=7;target.cpu_first_column=64;
+        if (cpu::native_quantised::preparedSuperblockCoded(encoding))
+        {
+            EXPECT_FALSE(source.valid());
+            EXPECT_FALSE(target.valid());
+            continue;
+        }
         ASSERT_TRUE(source.valid());ASSERT_TRUE(target.valid());
         std::vector<uint8_t> original(source.cpuStorageBytes()),destination(target.cpuStorageBytes(),0xa5);
         for(size_t byte=0;byte<original.size();++byte)original[byte]=uint8_t(byte*37+11);

@@ -42,7 +42,7 @@ TEST(Test__MoEOverlayDistributedResidencyProtocol, RectangularCpuGpuSourcesUseOr
     ASSERT_TRUE(sender.acknowledgeChunkSent(chunk.header,&error));
 
     const auto downIdentity=remoteProjectionIdentity(fixture.transaction,DeviceId::cuda(0),DeviceId::cpu());
-    const auto down=makeGpuToCpuExpertTierWeightStreamManifest(native_quantised_formats::Q4_0,50,64,
+    const auto down=makeGpuToCpuExpertTierWeightStreamManifest(native_quantised_formats::Q8_K,50,64,
         downIdentity.expected_epoch,downIdentity.layer_idx,downIdentity.expert_id,downIdentity.projection,1)
         .forIntersection(ExpertTierWeightProjectionIntersection::between(originalGPU,originalCPU));
     const auto incoming=makeMoEOverlayRemoteCpuProjectionManifest(downIdentity,down,4096);
@@ -123,8 +123,13 @@ TEST(Test__MoEOverlayDistributedResidencyProtocol, NativeCpuRectanglesKeepStagin
         packed.encoding=cpu::native_quantised::preparedEncodingForSource(*format.metadata);
         packed.data_stride=cpu::native_quantised::preparedDataStride(packed.encoding,packed.codebook_id);
         packed.interleaved_block_stride=cpu::native_quantised::preparedInterleavedBlockStride(packed.encoding,packed.is_asymmetric,packed.codebook_id);
-        packed.native_interleaved.resize_uninitialized(size_t(6)*packed.interleaved_block_stride);
+        packed.native_interleaved.resize_uninitialized(packed.preparedBytes());
         {const auto written=packed.native_interleaved.beginRewrite();for(size_t i=0;i<written.size();++i)written[i]=uint8_t(i*37+11);}
+        if (cpu::native_quantised::preparedSuperblockCoded(packed.encoding))
+        {
+            EXPECT_THROW((void)makeMoEOverlayRemoteCpuProjectionManifest(identity, packed, 73), std::invalid_argument);
+            continue;
+        }
         const auto manifest=makeMoEOverlayRemoteCpuProjectionManifest(identity,packed,73).forCPUIntersection(intersection);
         ASSERT_TRUE(manifest.valid());EXPECT_EQ(manifest.total_bytes,size_t(69*2)*(packed.interleaved_block_stride/64));
         EXPECT_LT(manifest.total_bytes,packed.native_interleaved.size());
@@ -206,11 +211,21 @@ TEST(Test__MoEOverlayDistributedResidencyProtocol, GpuArrivalAuthenticatesOrigin
         packed.encoding=cpu::native_quantised::preparedEncodingForSource(*format.metadata);
         packed.data_stride=cpu::native_quantised::preparedDataStride(packed.encoding,packed.codebook_id);
         packed.interleaved_block_stride=cpu::native_quantised::preparedInterleavedBlockStride(packed.encoding,packed.is_asymmetric,packed.codebook_id);
-        packed.native_interleaved.resize_uninitialized(size_t(packed.N_padded/64)*packed.blocks_per_row*packed.interleaved_block_stride);
+        packed.native_interleaved.resize(packed.preparedBytes(), 0);
         const auto identity=remoteProjectionIdentity(fixture.transaction,DeviceId::cpu(),device);
         const auto intersection=ExpertTierWeightProjectionIntersection::between(source,destination);
-        const auto stream=makeCpuToGpuExpertTierWeightStreamManifest(packed,identity.candidate_epoch,
-            identity.layer_idx,identity.expert_id,identity.projection,1).forIntersection(intersection);
+        const auto makeStream = [&] {
+            return makeCpuToGpuExpertTierWeightStreamManifest(packed, identity.candidate_epoch,
+                identity.layer_idx, identity.expert_id, identity.projection, 1).forIntersection(intersection);
+        };
+        if (cpu::native_quantised::preparedSuperblockCoded(packed.encoding) ||
+            requiresDensityAwareExpertTierSlots(packed.encoding, packed.codebook_id) ||
+            cpu::native_quantised::isQ5NativeSingleScaleSource(packed.codebook_id, packed.is_superblock))
+        {
+            EXPECT_THROW((void)makeStream(), std::invalid_argument);
+            continue;
+        }
+        const auto stream = makeStream();
         const auto manifest=makeMoEOverlayRemoteCpuProjectionManifest(identity,stream,4096);
         ASSERT_TRUE(manifest.valid());
         const auto model_format=ExpertWeightFormat::nativeQuantised({.codebook_id=format.metadata->codebook_id,

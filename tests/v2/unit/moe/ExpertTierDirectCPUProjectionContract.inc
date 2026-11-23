@@ -33,6 +33,11 @@ TEST(ExpertTierWeightStream, DirectCPUOriginalRootsAllFormatsPreserveIndependent
             SCOPED_TRACE(format.quant_type);
             SCOPED_TRACE(quantum);
             const auto traits = directCPUFormat(*format.metadata, quantum);
+            if (cpu::native_quantised::preparedSuperblockCoded(traits.cpu_encoding))
+            {
+                EXPECT_THROW((void)cpuExpertTierStorageLayoutForIntersection(traits, from, overlap, 65536), std::invalid_argument);
+                continue;
+            }
             const auto source = cpuExpertTierStorageLayoutForIntersection(traits, from, overlap, 65536);
             const auto destination = cpuExpertTierStorageLayoutForIntersection(traits, to, overlap, 65536);
             std::vector<uint8_t> bytes(source.cpuStorageBytes());
@@ -67,7 +72,7 @@ TEST(ExpertTierWeightStream, DirectCPUOriginalRootsAllFormatsPreserveIndependent
         }
 }
 
-TEST(ExpertTierWeightStream, DirectCPUParallelPiecesPreserveSharedQ6WordsAcrossReset)
+TEST(ExpertTierWeightStream, DirectCPUParallelPiecesPreserveDirtyNeighborsAcrossReset)
 {
     using P = MoEExpertProjectionOwnership::Projection;
     using R = MoEProjectionResidence;
@@ -80,6 +85,11 @@ TEST(ExpertTierWeightStream, DirectCPUParallelPiecesPreserveSharedQ6WordsAcrossR
     {
         SCOPED_TRACE(format.quant_type);
         const auto traits = directCPUFormat(*format.metadata, 1);
+        if (cpu::native_quantised::preparedSuperblockCoded(traits.cpu_encoding))
+        {
+            EXPECT_THROW((void)cpuExpertTierStorageLayoutForIntersection(traits, a, first, 65536), std::invalid_argument);
+            continue;
+        }
         const auto source_a = cpuExpertTierStorageLayoutForIntersection(traits, a, first, 65536);
         const auto source_b = cpuExpertTierStorageLayoutForIntersection(traits, b, second, 65536);
         const auto target_a = cpuExpertTierStorageLayoutForIntersection(traits, target, first, 65536);

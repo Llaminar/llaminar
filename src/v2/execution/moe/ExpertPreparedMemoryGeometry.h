@@ -178,18 +178,10 @@ namespace llaminar2
             }
             const auto encoding =
                 cpu::native_quantised::preparedEncodingForSource(*source);
-            const std::size_t stride =
-                cpu::native_quantised::preparedInterleavedBlockStride(
-                    encoding, source->is_asymmetric, source->codebook_id);
-            const std::size_t padded_n =
-                checkedAdd(static_cast<std::size_t>(N), 63u, "CPU padded N") &
-                ~std::size_t{63u};
-            const std::size_t units = checkedMultiply(
-                padded_n / 64u,
-                static_cast<std::size_t>(K / 32),
-                "CPU NativeQuantised units");
-            const std::size_t logical_bytes = checkedMultiply(
-                units, stride, "CPU NativeQuantised projection");
+            const auto geometry = cpu::native_quantised::preparedBlockGeometry(
+                encoding, source->is_asymmetric, source->codebook_id, K / 32);
+            const auto chunks = checkedAdd(static_cast<std::size_t>(N), 63u, "CPU padded N") / 64u;
+            const auto logical_bytes = checkedMultiply(chunks, geometry.rowBytes(), "CPU NativeQuantised projection");
             return AlignedVector<std::uint8_t>::requiredAllocationBytes(
                 logical_bytes, page_alignment);
         }

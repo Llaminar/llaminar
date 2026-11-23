@@ -130,6 +130,31 @@ namespace llaminar2
             return projection;
         }
 
+        /** @return The required legacy GPU stream rejection for a source whose converter has not been ported. */
+        std::string_view legacyGpuStreamRejection(const NativeQuantisedFormatInfo &source)
+        {
+            using namespace native_quantised_formats;
+            if (&source == &Q5_0 || &source == &Q5_1)
+                return "require file-density GPU migration slots";
+            if (&source == &Q5_K || &source == &IQ3_S)
+                return "Superblock-coded Q5_K and IQ3_S";
+            if (&source == &IQ4_XS || &source == &Q6_K)
+                return "requires coded GPU migration slots";
+            if (&source == &Q4_0 || &source == &Q4_1 || &source == &Q4_K || &source == &IQ4_NL || &source == &MXFP4 || &source == &Q8_0)
+                return "requires coded/compensation-free GPU migration slots";
+            if (cpu::native_quantised::preparedSuperblockCoded(cpu::native_quantised::preparedEncodingForSource(source)))
+                return "require coded expert weight streams";
+            return {};
+        }
+
+        /** @return An admitted symmetric expanded projection with unambiguous Q8_K provenance. */
+        HostGpuExpertPackedProjection makeQ8KProjection()
+        {
+            auto gpu = makeProjection(19, 32, false, true);
+            gpu.source_codebook_id = native_quantised_formats::Q8_K.codebook_id;
+            return gpu;
+        }
+
         /** @test Both conversion directions reject density layouts before touching payload or reserving a lane. */
         TEST(ExpertTierWeightStream, DensityLayoutsRequireCompatibleMigrationSlots)
         {
@@ -249,13 +274,8 @@ namespace llaminar2
             for (const auto &source : native_quantised_formats::kAllSourceFormats)
             {
                 SCOPED_TRACE(source.quant_type);
-                // Native Q5_K/IQ3_S require coded migration slots; their
-                // rejection is covered by CodedQ5KIQ3SRejectLegacyMigration.
-                if (source.metadata->is_superblock &&
-                    (source.metadata->codebook_id == 7 || source.metadata->codebook_id == 11))
-                    continue;
-                if (cpu::native_quantised::isQ5NativeSingleScaleSource(source.metadata->codebook_id, source.metadata->is_superblock))
-                    continue; // NativeQ5RejectsBothGPUStreamDirections owns these unadmitted edges.
+                if (!legacyGpuStreamRejection(*source.metadata).empty())
+                    continue; // The catalog-wide admission test asserts the exact rejection.
                 const auto physical = migrationStableDeviceVnniFormat(*source.metadata);
                 auto gpu = makeProjection(physical.codebook_id, physical.payload_bytes_per_block,
                     physical.is_asymmetric, source.metadata->is_superblock);
@@ -282,47 +302,21 @@ namespace llaminar2
             }
         }
 
-        TEST(ExpertTierWeightStream, SingleScaleNativeGridsRoundTripWithoutRequantization)
+        /** @test The legacy staged grids cannot reconstruct the coded resident source bits. */
+        TEST(ExpertTierWeightStream, SingleScaleNativeGridsRejectStagedMetadata)
         {
             for (const uint8_t codebook : {12, 15, 16})
             {
-                SCOPED_TRACE(static_cast<int>(codebook));
+                SCOPED_TRACE(codebook);
                 const auto *format = native_quantised_formats::forSourceIdentity(codebook, true);
                 ASSERT_NE(format, nullptr);
-                auto original = makeProjection(codebook, format->payload_bytes,
-                                               format->is_asymmetric, true);
-                // Metadata identity includes signed zero and tiny scales:
-                // no absmax threshold may silently zero out a native block.
-                const std::array<uint16_t, 6> scale_bits{0, 0x8000, 1, 0x03ff, 0x0400, 0x8400};
-                for (size_t index = 0; index < original.scales.size(); ++index)
-                    original.scales[index] = scale_bits[index % scale_bits.size()];
-                cpu::native_quantised::CPUNativeQuantisedPackedWeights cpu;
+                const auto staged = makeProjection(codebook, format->payload_bytes, format->is_asymmetric, true);
+                ASSERT_TRUE(staged.valid());
+                cpu::native_quantised::CPUNativeQuantisedPackedWeights destination;
                 std::string error;
-                ASSERT_TRUE(gpuToCpuExpertPackedReference(original, cpu, &error)) << error;
-                HostGpuExpertPackedProjection expanded;
-                ASSERT_TRUE(cpuToGpuExpertPackedReference(cpu, expanded, &error)) << error;
-                EXPECT_EQ(expanded.source_codebook_id, codebook);
-                EXPECT_EQ(expanded.scales, original.scales);
-                EXPECT_EQ(expanded.mins, original.mins);
-                // Single-scale grids keep their payloads rather than normalizing to INT8.
-                EXPECT_TRUE(cpu.usesCompactMultiScale());
-                EXPECT_EQ(expanded.codebook_id, codebook);
-                ASSERT_EQ(expanded.payload_bytes_per_block, format->payload_bytes);
-                EXPECT_EQ(expanded.payload, original.payload);
-                for (size_t index = 0; index < original.scales.size(); ++index)
-                {
-                    std::array<int8_t, 32> values{}, returned_values{};
-                    cpu::native_quantised::decode_native_block(codebook,
-                        original.payload.data() + index * format->payload_bytes, values.data());
-                    cpu::native_quantised::decode_native_block(codebook,
-                        expanded.payload.data() + index * expanded.payload_bytes_per_block, returned_values.data());
-                    EXPECT_EQ(values, returned_values);
-                }
-                cpu::native_quantised::CPUNativeQuantisedPackedWeights returned;
-                ASSERT_TRUE(gpuToCpuExpertPackedReference(expanded, returned, &error)) << error;
-                ASSERT_EQ(returned.native_interleaved.size(), cpu.native_interleaved.size());
-                EXPECT_EQ(std::memcmp(returned.native_interleaved.data(),
-                    cpu.native_interleaved.data(), cpu.native_interleaved.size()), 0);
+                EXPECT_FALSE(gpuToCpuExpertPackedReference(staged, destination, &error));
+                EXPECT_NE(error.find("require coded expert weight streams"), std::string::npos) << error;
+                EXPECT_TRUE(destination.native_interleaved.empty());
             }
         }
 
@@ -452,49 +446,18 @@ namespace llaminar2
             EXPECT_EQ(actual.emins, expected.emins);
         }
 
-        /** @brief Source tuples survive reversible movement without scale narrowing. */
-        TEST(ExpertTierWeightStream, IQ4XSTupleRoundTripAndPhysicalLayoutAreExact)
+        /** @test A valid staged IQ4_XS projection cannot publish a coded CPU root. */
+        TEST(ExpertTierWeightStream, IQ4XSStagedTupleCannotPublishCodedRoot)
         {
-            using namespace cpu::native_quantised;
-            auto source = makeProjection(kNativeQuantisedIQ4XSSourceScaleCodebook, 16, true, true);
-            const std::array<uint16_t, 8> bases{0, 0x8000, 1, 0x8001, 0x03ff, 0x0400, 0x3c01, 0x7bff};
-            for (size_t i = 0; i < source.scales.size(); ++i)
-            {
-                source.scales[i] = bases[i % bases.size()];
-                source.mins[i] = static_cast<uint16_t>(i % 64);
-            }
-            ASSERT_TRUE(source.valid());
-            CPUNativeQuantisedPackedWeights cpu;
+            auto staged = makeProjection(kNativeQuantisedIQ4XSSourceScaleCodebook, 16, true, true);
+            ASSERT_TRUE(staged.valid());
+            cpu::native_quantised::CPUNativeQuantisedPackedWeights destination;
             std::string error;
-            ASSERT_TRUE(gpuToCpuExpertPackedReference(source, cpu, &error)) << error;
-            EXPECT_EQ(cpu.encoding, CPUNativeQuantisedEncoding::NibbleLUTSourceScale);
-            EXPECT_EQ(cpu.codebook_id, 4); EXPECT_TRUE(cpu.is_superblock);
-            EXPECT_FALSE(cpu.is_asymmetric); EXPECT_EQ(cpu.interleaved_block_stride, 1408);
-            for (int n = 0; n < cpu.N; ++n) for (int kb = 0; kb < cpu.blocks_per_row; ++kb)
-            {
-                const size_t index = size_t(kb) * cpu.N + n;
-                EXPECT_EQ(cpu.chunkScales(n / 64, kb)[n % 64], source.scales[index]);
-                EXPECT_EQ(cpu.chunkMins(n / 64, kb)[n % 64], source.mins[index]);
-                EXPECT_EQ(cpu.blockMin(n / 64, kb, n % 64), 0.0f);
-            }
-            const auto demote = makeGpuToCpuExpertTierWeightStreamManifest(
-                native_quantised_formats::IQ4_XS, source.N, source.K, 101, 2, 7,
-                ExpertTierWeightProjection::Down, 2);
-            const auto promote = makeCpuToGpuExpertTierWeightStreamManifest(
-                cpu, 101, 2, 7, ExpertTierWeightProjection::Down, 2);
-            ASSERT_TRUE(demote.valid(&error)) << error;
-            ASSERT_TRUE(promote.valid(&error)) << error;
-            EXPECT_TRUE(demote.deviceLayout().valid()); EXPECT_TRUE(promote.deviceLayout().valid());
-            EXPECT_EQ(demote.gpu_codebook_id, 24); EXPECT_EQ(demote.gpu_source_codebook_id, 4);
-            EXPECT_EQ(demote.cpu_block_stride, 1408);
-            auto malformed = demote.deviceLayout(); malformed.gpu_is_asymmetric = 0;
-            EXPECT_FALSE(malformed.valid());
-            malformed = demote.deviceLayout(); malformed.gpu_source_is_superblock = 0;
-            EXPECT_FALSE(malformed.valid());
-            HostGpuExpertPackedProjection returned;
-            ASSERT_TRUE(cpuToGpuExpertPackedReference(cpu, returned, &error)) << error;
-            expectGpuEqual(source, returned);
-            source.codebook_id = 4; EXPECT_FALSE(source.valid());
+            EXPECT_FALSE(gpuToCpuExpertPackedReference(staged, destination, &error));
+            EXPECT_EQ(error, "Superblock-coded IQ4_XS CPU encoding requires coded GPU migration slots");
+            EXPECT_TRUE(destination.native_interleaved.empty());
+            staged.codebook_id = 4;
+            EXPECT_FALSE(staged.valid());
         }
 
         /** @brief Preserve the existing explicit normalized metadata boundary only.
@@ -503,7 +466,7 @@ namespace llaminar2
          */
         TEST(ExpertTierWeightStream, IQ4XSExplicitExpandedMetadataRemainsAccepted)
         {
-            auto plain = makeProjection(19, 32, false, false);
+            const auto plain = makeQ8KProjection();
             cpu::native_quantised::CPUNativeQuantisedPackedWeights expanded;
             std::string error;
             ASSERT_TRUE(gpuToCpuExpertPackedReference(plain, expanded, &error)) << error;
@@ -522,15 +485,24 @@ namespace llaminar2
         {
         };
 
-        TEST_P(ExpertTierWeightEncodingTest, CpuWireRoundTripIsByteExact)
+        TEST_P(ExpertTierWeightEncodingTest, LegacyGpuRoundTripIsByteExactOrRejectsUnportedLayout)
         {
             const auto source = GetParam();
             ASSERT_TRUE(source.valid());
 
             cpu::native_quantised::CPUNativeQuantisedPackedWeights cpu;
             std::string error;
-            ASSERT_TRUE(gpuToCpuExpertPackedReference(source, cpu, &error))
-                << error;
+            const auto *format = native_quantised_formats::forSourceIdentity(source.source_codebook_id, source.is_superblock);
+            ASSERT_NE(format, nullptr);
+            const auto rejection = legacyGpuStreamRejection(*format);
+            if (!rejection.empty())
+            {
+                EXPECT_FALSE(gpuToCpuExpertPackedReference(source, cpu, &error));
+                EXPECT_NE(error.find(rejection), std::string::npos) << error;
+                EXPECT_TRUE(cpu.native_interleaved.empty());
+                return;
+            }
+            ASSERT_TRUE(gpuToCpuExpertPackedReference(source, cpu, &error)) << error;
             EXPECT_EQ(cpu.N, source.N);
             EXPECT_EQ(cpu.K, source.K);
             EXPECT_EQ(cpu.N_padded, 128);
@@ -554,55 +526,40 @@ namespace llaminar2
                 makeProjection(5, 16, true, true),
                 makeProjection(8, 24, true, true),
                 makeProjection(19, 32, false, false),
-                makeProjection(
-                    kNativeQuantisedExpandedInt8MinCodebook,
-                    32,
-                    true,
-                    false)));
+                makeQ8KProjection()));
 
-        /**
-         * @test Native MXFP4 GPU<->CPU reference round trip with an odd block count,
-         * and fail-fast rejection of a CPU unit word that is no admitted power of two.
-         */
-        TEST(ExpertTierWeightStream, MXFP4NativeE8M0PlaneRoundTripsOddCountsAndRejectsMalformedWords)
+        /** @test A ragged MXFP4 CPU wire carries exactly one exponent byte per live column. */
+        TEST(ExpertTierWeightStream, MXFP4CpuWireKeepsOddLiveExponentBytes)
         {
-            auto source = makeProjection(kNativeQuantisedMXFP4Codebook, 16, false, false);
-            // Shrink to an odd block count (N = 69 rows, 207 blocks).
-            const int N = 69;
-            HostGpuExpertPackedProjection odd = source;
-            odd.N = N;
-            const size_t blocks = static_cast<size_t>(N) * odd.blocks_per_row;
-            odd.payload.resize(blocks * 16);
-            odd.scales.assign(nativeQuantisedScalePlaneStorageWords(kNativeQuantisedMXFP4Codebook, blocks), 0);
-            for (size_t block = 0; block < blocks; ++block)
-                reinterpret_cast<uint8_t *>(odd.scales.data())[block] =
-                    block % 11 == 3 ? uint8_t{0} : static_cast<uint8_t>(2 + (block * 7) % 251);
-            std::string error;
-            ASSERT_TRUE(odd.valid(&error)) << error;
-            cpu::native_quantised::CPUNativeQuantisedPackedWeights cpu;
-            ASSERT_TRUE(gpuToCpuExpertPackedReference(odd, cpu, &error)) << error;
-            EXPECT_EQ(cpu.scaleEncoding(), cpu::native_quantised::CPUNativeQuantisedScaleEncoding::E8M0);
-            for (size_t block = 0; block < blocks; ++block)
+            using namespace cpu::native_quantised;
+            const auto tensor = test::TestTensorFactory::createMXFP4Random({69, 96}, 23);
+            CPUNativeQuantisedPackedWeights cpu;
+            ASSERT_TRUE(packWeightsCPUNativeQuantised(tensor.get(), cpu));
+            using Residence = MoEProjectionResidence;
+            const MoEExpertProjectionOwnership::Projection root{Residence::ExpertOwner, cpu.N, cpu.K, 0, cpu.N, 0, cpu.K};
+            ExpertTierWeightCPUStorageLayout traits{
+                .cpu_codebook_id = cpu.codebook_id, .cpu_encoding = cpu.encoding,
+                .cpu_data_stride = static_cast<uint32_t>(cpu.data_stride),
+                .cpu_block_stride = static_cast<uint32_t>(cpu.interleaved_block_stride), .wire_columns_per_unit = 64};
+            const auto layout = cpuExpertTierStorageLayoutForIntersection(traits, root,
+                ExpertTierWeightProjectionIntersection::between(root, root), cpu.interleaved_block_stride);
+            std::vector<uint8_t> restored(cpu.preparedBytes(), 0);
+            for (uint32_t first = 0; first < layout.unit_count; ++first)
             {
-                const int n = static_cast<int>(block % N), kb = static_cast<int>(block / N);
-                EXPECT_EQ(cpu.chunkScales(n / 64, kb)[n % 64],
-                          mxfp4::powerOfTwoBF16Word(reinterpret_cast<const uint8_t *>(odd.scales.data())[block]))
-                    << block;
+                const size_t columns = first < 3 ? 64 : 5;
+                std::vector<uint8_t> wire(layout.chunkBytes(1, first));
+                ASSERT_EQ(wire.size(), columns * 17);
+                ASSERT_TRUE(gatherExpertTierCPUWeightChunk(layout, cpu.readView().bytes(), first, 1, wire));
+                const auto *exponents = cpu.readView().admittedE8M0Scales(first / 3, first % 3);
+                EXPECT_EQ(std::memcmp(wire.data() + columns * 16, exponents, columns), 0);
+                ASSERT_TRUE(scatterExpertTierCPUWeightChunk(layout, wire, first, 1, restored));
             }
-            HostGpuExpertPackedProjection back;
-            ASSERT_TRUE(cpuToGpuExpertPackedReference(cpu, back, &error)) << error;
-            ASSERT_EQ(back.scales.size(), odd.scales.size());
-            EXPECT_EQ(std::memcmp(back.scales.data(), odd.scales.data(), blocks), 0);
-            EXPECT_EQ(back.payload, odd.payload);
-            // A malformed unit word (mantissa bits set) is rejected, not truncated.
-            const_cast<uint16_t *>(cpu.chunkScales(0, 1))[7] = 0x3f81u;
-            HostGpuExpertPackedProjection rejected;
-            EXPECT_FALSE(cpuToGpuExpertPackedReference(cpu, rejected, &error));
+            EXPECT_EQ(std::memcmp(restored.data(), cpu.native_interleaved.data(), restored.size()), 0);
         }
 
         TEST(ExpertTierWeightStream, OrderedChunksWriteDirectlyToFinalBytes)
         {
-            const auto source = makeProjection(5, 16, true, true);
+            const auto source = makeQ8KProjection();
             cpu::native_quantised::CPUNativeQuantisedPackedWeights cpu;
             std::string error;
             ASSERT_TRUE(gpuToCpuExpertPackedReference(source, cpu, &error))
@@ -660,7 +617,7 @@ namespace llaminar2
 
         TEST(ExpertTierWeightStream, RejectsCorruptionAndOrderingWithoutMutation)
         {
-            const auto source = makeProjection(19, 32, false, false);
+            const auto source = makeQ8KProjection();
             cpu::native_quantised::CPUNativeQuantisedPackedWeights cpu;
             ASSERT_TRUE(gpuToCpuExpertPackedReference(source, cpu));
             const auto manifest = makeCpuToGpuExpertTierWeightStreamManifest(
@@ -706,7 +663,7 @@ namespace llaminar2
 
         TEST(ExpertTierWeightStream, ManifestHashCoversEveryLayoutField)
         {
-            const auto source = makeProjection(8, 24, true, true);
+            const auto source = makeQ8KProjection();
             cpu::native_quantised::CPUNativeQuantisedPackedWeights cpu;
             ASSERT_TRUE(gpuToCpuExpertPackedReference(source, cpu));
             const NativeQuantisedFormatInfo *source_format =
@@ -740,18 +697,20 @@ namespace llaminar2
                  native_quantised_formats::kAllSourceFormats)
             {
                 ASSERT_NE(entry.metadata, nullptr) << entry.quant_type;
-                if (cpu::native_quantised::isQ5NativeSingleScaleSource(entry.metadata->codebook_id, entry.metadata->is_superblock))
-                    continue; // NativeQ5RejectsBothGPUStreamDirections owns these unadmitted edges.
-                const auto manifest =
-                    makeGpuToCpuExpertTierWeightStreamManifest(
-                        *entry.metadata,
-                        70,
-                        256,
-                        101,
-                        3,
-                        7,
-                        ExpertTierWeightProjection::Gate,
-                        4);
+                SCOPED_TRACE(entry.quant_type);
+                const auto makeManifest = [&] {
+                    return makeGpuToCpuExpertTierWeightStreamManifest(*entry.metadata, 70, 256,
+                        101, 3, 7, ExpertTierWeightProjection::Gate, 4);
+                };
+                const auto rejection = legacyGpuStreamRejection(*entry.metadata);
+                if (!rejection.empty())
+                {
+                    try { (void)makeManifest(); ADD_FAILURE() << "Legacy stream admitted an unported layout"; }
+                    catch (const std::invalid_argument &failure)
+                    { EXPECT_NE(std::string_view(failure.what()).find(rejection), std::string_view::npos); }
+                    continue;
+                }
+                const auto manifest = makeManifest();
                 std::string error;
                 ASSERT_TRUE(manifest.valid(&error))
                     << entry.quant_type << ": " << error;
@@ -781,9 +740,12 @@ namespace llaminar2
                     continue;
                 SCOPED_TRACE(std::string(entry.quant_type));
                 auto layout = makeGpuToCpuExpertTierWeightStreamManifest(
-                    *entry.metadata, 70, 256, 101, 3, 7,
+                    native_quantised_formats::Q8_K, 70, 256, 101, 3, 7,
                     ExpertTierWeightProjection::Gate, 4).deviceLayout();
                 ASSERT_TRUE(layout.valid());
+                layout.cpu_codebook_id = layout.gpu_source_codebook_id = id;
+                layout.cpu_is_superblock = layout.gpu_source_is_superblock = 1;
+                layout.cpu_is_asymmetric = layout.gpu_is_asymmetric = 1;
                 layout.cpu_encoding = cpu::native_quantised::CPUNativeQuantisedEncoding::ExpandedInt8;
                 layout.cpu_data_stride = cpu::native_quantised::preparedDataStride(layout.cpu_encoding, layout.cpu_codebook_id);
                 layout.cpu_block_stride = cpu::native_quantised::preparedInterleavedBlockStride(layout.cpu_encoding, true, layout.cpu_codebook_id);
@@ -1100,8 +1062,8 @@ namespace llaminar2
         TEST(CpuExpertSlotPool, AcquisitionWithdrawsAdmissionUntilArrival)
         {
             const NativeQuantisedSourceIdentity identity{
-                .codebook_id = native_quantised_formats::IQ4_XS.codebook_id,
-                .is_superblock = native_quantised_formats::IQ4_XS.is_superblock,
+                .codebook_id = native_quantised_formats::MXFP4.codebook_id,
+                .is_superblock = native_quantised_formats::MXFP4.is_superblock,
                 .present = true,
             };
             auto pool = CpuExpertSlotPool::createForTest({
@@ -1125,25 +1087,14 @@ namespace llaminar2
                 EXPECT_EQ(projection.destination_bytes.data(), root);
                 EXPECT_FALSE(packed->publicationSealed());
                 EXPECT_DEATH((void)packed->readView(), "not admitted");
-                // Epoch-distinct payload with in-range IQ4_XS coefficient words
-                // (<= 63) in every unit; only epoch 3 then corrupts one word.
+                // All raw exponent bytes set to 2 or 3 are valid; poison one only on the final acquisition.
                 std::fill(projection.destination_bytes.begin(), projection.destination_bytes.end(),
-                    static_cast<std::uint8_t>(epoch));
-                const std::size_t units = std::size_t(packed->N_padded / 64) * std::size_t(packed->blocks_per_row);
-                const auto secondary = [&](std::size_t unit) {
-                    return projection.destination_bytes.data() + unit * std::size_t(packed->interleaved_block_stride) +
-                        std::size_t(packed->data_stride) + 256;
-                };
-                for (std::size_t unit = 0; unit < units; ++unit)
-                    for (int column = 0; column < 64; ++column)
-                    {
-                        const std::uint16_t coefficient = static_cast<std::uint16_t>(epoch + column % 3);
-                        std::memcpy(secondary(unit) + column * 2, &coefficient, sizeof(coefficient));
-                    }
+                    static_cast<std::uint8_t>(epoch + 1));
                 if (epoch == 3)
                 {
-                    const std::uint16_t reserved = 0x0040;
-                    std::memcpy(secondary(units / 2) + 17 * 2, &reserved, sizeof(reserved));
+                    const auto exponent = packed->geometry().blockOffset(0, 0) + packed->data_stride + 17;
+                    ASSERT_LT(exponent, projection.destination_bytes.size());
+                    projection.destination_bytes[exponent] = 0xff;
                     EXPECT_THROW(projection.engine->admitCPUNativeQuantisedPublication(), std::invalid_argument);
                     EXPECT_FALSE(packed->publicationSealed());
                     continue;
@@ -1162,15 +1113,8 @@ namespace llaminar2
         TEST(CpuExpertSlotPool, PublicationCopyInheritsOnlyACurrentSeal)
         {
             cpu::native_quantised::CPUNativeQuantisedPackedWeights cpu;
-            const auto physical = migrationStableDeviceVnniFormat(native_quantised_formats::Q4_K);
-            auto gpu = makeProjection(physical.codebook_id, physical.payload_bytes_per_block,
-                physical.is_asymmetric, native_quantised_formats::Q4_K.is_superblock);
-            gpu.source_codebook_id = native_quantised_formats::Q4_K.codebook_id;
-            gpu.has_emins = physical.has_emins;
-            if (physical.has_emins)
-                gpu.emins.assign(gpu.scales.size(), 0xac002c00u);
-            std::string error;
-            ASSERT_TRUE(gpuToCpuExpertPackedReference(gpu, cpu, &error)) << error;
+            const auto source = test::TestTensorFactory::createQ4_KRandom({70, 96}, 17);
+            ASSERT_TRUE(cpu::native_quantised::packWeightsCPUNativeQuantised(source.get(), cpu));
             ASSERT_TRUE(cpu.publicationSealed());
             const auto copy = cpu;
             EXPECT_NE(copy.native_interleaved.data(), cpu.native_interleaved.data());
