@@ -450,6 +450,55 @@ TEST(Test__NativeQuantisedFormatInfo, DescriptorValidationCoversEveryReachablePh
     }
 }
 
+/**
+ * @test Shared publication validation authenticates the metadata layout byte.
+ *
+ * A descriptor claiming superblock-coded metadata is publishable only for a
+ * codable physical codebook and a layout byte with no reserved bits; a
+ * per-block descriptor must carry no phase or code bit shift. Coded matrices
+ * need their superblock plane and never an emins plane.
+ */
+TEST(Test__NativeQuantisedFormatInfo, DescriptorValidationAuthenticatesMetadataLayout)
+{
+    static std::uint8_t payload[4], scales[4], mins[4], emins[4];
+    const auto descriptor = [&](std::uint8_t codebook, std::uint8_t layout, bool with_mins, bool with_emins) {
+        DeviceNativeQuantisedMatrixDesc d{};
+        d.payload = payload;
+        d.scales = scales;
+        d.mins = with_mins ? mins : nullptr;
+        d.emins = with_emins ? emins : nullptr;
+        d.n = 64;
+        d.k = 256;
+        d.blocks_per_row = 8;
+        d.codebook_id = codebook;
+        d.metadata_layout = layout;
+        return d;
+    };
+    const auto coded = nativeQuantisedMetadataLayout(NativeQuantisedMetadataRepresentation::SuperblockCoded, 3, 5);
+    // Codable formats: coded with a superblock plane and no emins.
+    for (const std::uint8_t cb : {5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 24})
+    {
+        SCOPED_TRACE(int(cb));
+        EXPECT_TRUE(NativeQuantisedDescriptorValidation::publishable(descriptor(cb, coded, true, false)));
+        EXPECT_FALSE(NativeQuantisedDescriptorValidation::publishable(descriptor(cb, coded, false, false)));
+        EXPECT_FALSE(NativeQuantisedDescriptorValidation::publishable(descriptor(cb, coded, true, true)));
+        // Reserved bit 6 is never valid.
+        EXPECT_FALSE(NativeQuantisedDescriptorValidation::publishable(
+            descriptor(cb, static_cast<std::uint8_t>(coded | 0x40u), true, false)));
+    }
+    // Non-codable physical codebooks reject a coded layout even with complete planes.
+    for (const std::uint8_t cb : {0, 4, 6, 19, 23, 25})
+    {
+        SCOPED_TRACE(int(cb));
+        EXPECT_FALSE(NativeQuantisedDescriptorValidation::publishable(descriptor(cb, 0x80u, true, false)));
+        EXPECT_FALSE(NativeQuantisedDescriptorValidation::publishable(descriptor(cb, coded, true, true)));
+    }
+    // A per-block descriptor must not carry a phase or bit shift.
+    EXPECT_TRUE(NativeQuantisedDescriptorValidation::publishable(descriptor(10, 0u, true, true)));
+    EXPECT_FALSE(NativeQuantisedDescriptorValidation::publishable(descriptor(10, 0x03u, true, true)));
+    EXPECT_FALSE(NativeQuantisedDescriptorValidation::publishable(descriptor(10, 0x08u, true, true)));
+}
+
 TEST(Test__NativeQuantisedFormatInfo, RuntimeCaptureEnvelopeCoversEveryTierRepresentation)
 {
     for (const NativeQuantisedSourceFormat &entry :
