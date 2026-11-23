@@ -219,6 +219,18 @@ namespace llaminar2::cpu::native_quantised::multi_scale
             high = std::bit_cast<I>(vuzp2q_u32(vreinterpretq_u32_u64(first), vreinterpretq_u32_u64(second)));
         }
 
+        /** @brief Gather one four-value grid entry per column without a stack staging buffer. */
+        static inline __attribute__((always_inline)) I grid4(const std::uint32_t *table, I index) noexcept
+        {
+            const auto indices = std::bit_cast<uint32x4_t>(index);
+            auto result = vdupq_n_u32(0);
+            result = vld1q_lane_u32(table + vgetq_lane_u32(indices, 0), result, 0);
+            result = vld1q_lane_u32(table + vgetq_lane_u32(indices, 1), result, 1);
+            result = vld1q_lane_u32(table + vgetq_lane_u32(indices, 2), result, 2);
+            result = vld1q_lane_u32(table + vgetq_lane_u32(indices, 3), result, 3);
+            return std::bit_cast<I>(result);
+        }
+
         /** @brief Widen four persisted halves without changing nonfinite payload bits.
          * @param source Four readable canonical half words.
          * @return Four exact binary32 conversions.

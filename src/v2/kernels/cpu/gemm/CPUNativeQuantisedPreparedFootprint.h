@@ -112,7 +112,7 @@ namespace llaminar2::cpu::native_quantised
         case 13: case 14: return 9;  // IQ2_S, IQ2_XS
         case 10: case 15: return 8;  // Q2_K, IQ2_XXS
         case 16: case 17: return 6;  // IQ1_S, IQ1_M
-        case 11: return 32;  // IQ3_S signed grid retained for the fast dot; only metadata is coded.
+        case 11: return 13;  // IQ3_S: eight indices, one high-bit byte and four sign bytes.
         default: return 0;
         }
     }

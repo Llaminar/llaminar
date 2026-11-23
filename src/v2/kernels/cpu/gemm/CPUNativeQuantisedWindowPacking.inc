@@ -186,12 +186,6 @@ inline void appendNativeWeightGroups(const IINT8Unpackable& source,const NativeQ
                     if(out.codebook_id==7) {
                         for(int word=0;word<4;++word)std::memcpy(target+word*256+column*4,input+word*4,4);
                         coded_metadata::storeQ5HighBits(target+1024,column,input+16);
-                    } else if(out.codebook_id==11) {
-                        // Decode directly into the final signed-grid interleave; keep the
-                        // scale nibble and superblock d independently in their source widths.
-                        int8_t values[32];
-                        decode_native_block(11,input,values);
-                        for(int group=0;group<8;++group)std::memcpy(target+group*256+column*4,values+group*4,4);
                     } else for(int byte=0;byte<format.payload_bytes;++byte)
                         if(byte<4*words)target[(byte/4)*256+column*4+byte%4]=input[byte];
                         else target[words*256+column*tail+(byte-4*words)]=input[byte];

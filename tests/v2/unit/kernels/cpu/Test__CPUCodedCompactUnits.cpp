@@ -3,8 +3,7 @@
  * @brief Superblock-coded compact CPU units: exact size, exact metadata, exact outputs.
  *
  * Compact multi-scale CPU units (Q5_K, Q3_K, Q2_K, IQ3_S, IQ3_XXS, IQ2_S, IQ2_XS, IQ2_XXS,
- * IQ1_S, IQ1_M) store the exact source codes and payload (IQ3_S keeps expanded
- * signed grid bytes) and one `d`/`dmin` word per (column, source
+ * IQ1_S, IQ1_M) store the exact source codes and payload and one `d`/`dmin` word per (column, source
  * superblock). This suite proves, device-free and on the build's native ISA
  * (NEON, AVX2 or AVX-512):
  *
@@ -17,8 +16,7 @@
  *   754 leaves the sign and payload of an arithmetic NaN unspecified, and
  *   compilers may fold `-dmin * c` into `dmin * -c`, so a NaN result only
  *   has to be a NaN; every other result is compared bit for bit);
- * - a prepared matrix occupies exactly the GGUF bytes of its 64-padded
- *   columns, plus the explicit signed grid expansion for IQ3_S;
+ * - a prepared matrix occupies exactly the GGUF bytes of its 64-padded columns;
  * - the production SIMD projection equals the scalar codec reference for
  *   1..4 rows, ragged N/K tails and both contiguous and ordered K reductions.
  */
@@ -115,7 +113,7 @@ namespace llaminar2::test
                 }},
                 {"Q3_K", 9, 13.75, [](auto s, auto r) { return Factory::createQ3_KRandom(s, r); }},
                 {"Q2_K", 10, 10.5, [](auto s, auto r) { return Factory::createQ2_KRandom(s, r); }},
-                {"IQ3_S", 11, 32.75, [](auto s, auto r) { return Factory::createIQ3_SRandom(s, r); }},
+                {"IQ3_S", 11, 13.75, [](auto s, auto r) { return Factory::createIQ3_SRandom(s, r); }},
                 {"IQ3_XXS", 12, 12.25, [](auto s, auto r) { return Factory::createIQ3_XXSRandom(s, r); }},
                 {"IQ2_S", 13, 10.25, [](auto s, auto r) { return Factory::createIQ2_SRandom(s, r); }},
                 {"IQ2_XS", 14, 9.25, [](auto s, auto r) { return Factory::createIQ2_XSRandom(s, r); }},
@@ -267,8 +265,8 @@ namespace llaminar2::test
             }
     }
 
-    /** Compact matrices retain file density except IQ3_S's explicitly expanded signed grid. */
-    TEST(CPUCodedCompactUnits, PreparedBytesEqualFileDensityWithIQ3SSignedGrid)
+    /** Compact matrices retain the exact file density of each original format. */
+    TEST(CPUCodedCompactUnits, PreparedBytesEqualFileDensity)
     {
         for (const auto &source : compactSources())
         {

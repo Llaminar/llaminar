@@ -4,8 +4,8 @@
  *
  * Prepared blocks carry exact source codes and use one base/minimum word per
  * column and source superblock. Q5_K retains both its five-bit unsigned values
- * and additive minimum. IQ3_S retains expanded signed grid bytes for the fast
- * dot, but derives its coefficient from the source nibble and header d. SIMD
+ * and additive minimum. IQ3_S decodes its signed grid in registers and
+ * derives its coefficient from the source nibble and header d. SIMD
  * lanes represent output columns, with decoded integer values shared by rows.
  * Q5_K and IQ3_S use the same FP32 contribution policy as their former
  * expanded units; other compact codebooks keep the CUDA/HIP-ordered program.
@@ -91,6 +91,40 @@ namespace llaminar2::cpu::native_quantised::multi_scale
                 std::bit_cast<__m256i>(acc),
                 _mm256_madd_epi16(pairs, _mm256_set1_epi16(1))));
         }
+        /** @brief Spread eight columns' packed Q5_K high bits directly into the dot byte lanes. */
+        template <bool ScalarSpread> static I q5High(const std::uint8_t *source)
+        {
+            std::uint32_t packed;
+            std::memcpy(&packed, source, sizeof(packed));
+            if constexpr (ScalarSpread)
+            {
+                const auto spread = [](std::uint64_t bits) {
+                    bits = (bits | (bits << 28)) & 0x0000000f0000000full;
+                    bits = (bits | (bits << 14)) & 0x0003000300030003ull;
+                    bits = (bits | (bits << 7)) & 0x0101010101010101ull;
+                    return static_cast<long long>(bits << 4);
+                };
+                return std::bit_cast<I>(_mm256_setr_epi64x(spread(packed & 255), spread((packed >> 8) & 255),
+                    spread((packed >> 16) & 255), spread(packed >> 24)));
+            }
+            else
+            {
+                const auto qh = _mm256_set1_epi32(static_cast<int>(packed));
+                const auto shuffle = _mm256_setr_epi32(0, 0, 0x01010101, 0x01010101,
+                    0x02020202, 0x02020202, 0x03030303, 0x03030303);
+                const auto masks = _mm256_setr_epi32(0x08040201, 0x80402010, 0x08040201, 0x80402010,
+                    0x08040201, 0x80402010, 0x08040201, 0x80402010);
+                const auto set = _mm256_cmpeq_epi8(_mm256_and_si256(_mm256_shuffle_epi8(qh, shuffle), masks), masks);
+                return std::bit_cast<I>(_mm256_and_si256(set, _mm256_set1_epi8(16)));
+            }
+        }
+        /** @brief Dot unsigned five-bit weights against signed Q8 without saturation. */
+        static I dotUnsignedQ5(I acc, I weights, I activation)
+        {
+            const auto pairs = _mm256_maddubs_epi16(std::bit_cast<__m256i>(weights), std::bit_cast<__m256i>(activation));
+            return std::bit_cast<I>(_mm256_add_epi32(std::bit_cast<__m256i>(acc),
+                _mm256_madd_epi16(pairs, _mm256_set1_epi16(1))));
+        }
         /** @return Bytewise difference without cross-byte borrow. */
         static I subtractBytes(I a, I b)
         {
@@ -126,6 +160,12 @@ namespace llaminar2::cpu::native_quantised::multi_scale
         {
             low = grid(table, index, 0);
             high = grid(table, index, 1);
+        }
+        /** @brief Gather four source grid values for each output column. */
+        static I grid4(const std::uint32_t *table, I index)
+        {
+            return std::bit_cast<I>(_mm256_i32gather_epi32(
+                reinterpret_cast<const int *>(table), std::bit_cast<__m256i>(index), 4));
         }
         /** @return Eight exact FP16-to-FP32 conversions. */
         static F half(const uint16_t *source)
@@ -233,6 +273,12 @@ namespace llaminar2::cpu::native_quantised::multi_scale
                 1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31);
             low = std::bit_cast<I>(_mm512_permutex2var_epi32(first, even, second));
             high = std::bit_cast<I>(_mm512_permutex2var_epi32(first, odd, second));
+        }
+        /** @brief Gather four source grid values for each output column. */
+        static I grid4(const std::uint32_t *table, I index)
+        {
+            return std::bit_cast<I>(_mm512_i32gather_epi32(
+                std::bit_cast<__m512i>(index), table, 4));
         }
         /** @return Sixteen exact FP16-to-FP32 conversions. */
         static F half(const uint16_t *source)
@@ -393,22 +439,13 @@ namespace llaminar2::cpu::native_quantised::multi_scale
 #pragma clang fp contract(off)
 #pragma clang fp reassociate(off)
 #endif
-        if (!packed.usesCompactMultiScale() || packed.payload_bytes <= 0 || packed.payload_bytes > 32)
+        if (!packed.usesCompactMultiScale() || packed.payload_bytes <= 0 || packed.payload_bytes > 20)
             throw std::invalid_argument("Multi-scale diagnostic requires its bounded compact source payload");
-        const auto *unit = packed.blockUnit(chunk, kb);
         uint8_t payload[20]{};
         int8_t values[32];
-        if (packed.codebook_id == 11)
-        {
-            for (int group = 0; group < 8; ++group)
-                std::memcpy(values + group * 4, unit + group * 256 + column * 4, 4);
-        }
-        else
-        {
-            compactColumnPayload(unit, packed.codebook_id, column, payload);
-            native_quantised_superblock::restoreCodedPayload(packed.codebook_id, payload);
-            decode_native_block(packed.codebook_id, payload, values);
-        }
+        compactColumnPayload(packed.blockUnit(chunk, kb), packed.codebook_id, column, payload);
+        native_quantised_superblock::restoreCodedPayload(packed.codebook_id, payload);
+        decode_native_block(packed.codebook_id, payload, values);
         int dots[2]{}, sums[4]{};
         for (int k = 0; k < 32; ++k)
         {
@@ -447,6 +484,27 @@ namespace llaminar2::cpu::native_quantised::multi_scale
                 (delta2 * sums[2] + delta3 * sums[3]) * scale1);
         }
         return contribution;
+    }
+
+    /** @brief Decode one IQ3_S four-value group per SIMD column from the source grid and sign bits.
+     * @param unit Resident block's three word planes followed by one byte-tail plane.
+     * @param column First SIMD column in the 64-column block.
+     * @param group Original four-value group in [0,7].
+     * @return Signed dot operands, biased for unsigned AVX-512 VNNI.
+     */
+    template <int Lanes, typename Ops>
+    [[gnu::always_inline]] inline typename Ops::I decodeIQ3SGroup(const std::uint8_t *unit, int column, int group)
+    {
+        const auto metadata = payloadWord<11, Ops>(unit, 2, column);
+        const auto qs = payloadWord<11, Ops>(unit, group / 4, column);
+        const auto index = ((qs >> (8 * (group % 4))) & 255) | (((metadata >> group) & 1) << 8);
+        const auto signs = group >= 6 ? payloadWord<11, Ops>(unit, 3, column)
+                                      : metadata >> (8 * (1 + group / 2));
+        const auto masks = Ops::template repeatByte<0>(signs >> (4 * (group % 2)));
+        auto weights = Ops::template signGrid<0>(Ops::grid4(iq3s_grid, index), masks);
+        if constexpr (Lanes == 16)
+            weights ^= static_cast<int>(0x80808080u);
+        return weights;
     }
 
     /**
@@ -598,6 +656,50 @@ namespace llaminar2::cpu::native_quantised::multi_scale
         }
     }
 
+    /** @brief Accumulate whole-block Q5_K/IQ3_S products while keeping only one decoded group live. */
+    template <int Codebook, int Lanes, size_t Rows, Reduction Tree, typename Ops>
+    [[gnu::always_inline]] inline void dotSingleScale(const uint8_t *unit, int column,
+        const std::array<const Q8_1Block *, Rows> &activation, int kb, typename Ops::I (&dots)[Rows])
+    {
+        using I = typename Ops::I;
+#pragma GCC unroll 1
+        for (int group = 0; group < 8; ++group)
+        {
+            I weights;
+            if constexpr (Codebook == 7)
+            {
+                const I raw = payloadWord<Codebook, Ops>(unit, group % 4, column);
+                const I low = (group < 4 ? raw : raw >> 4) & 0x0F0F0F0F;
+                if constexpr (Lanes == 8)
+                    // Ordered partials keep an additional output vector per row
+                    // live. Move the bit spread to integer registers for the
+                    // widest tiles so the dot and FP32 state stay in registers.
+                    weights = low | Ops::template q5High<Rows == 4 || (Rows == 3 && Tree == Reduction::OrderedPartitions)>(
+                        unit + 1024 + 32 * group + column / 2);
+                else
+                {
+                    const I high = coded_metadata::Lanes<Ops>::nibbles(unit + 1024 + 32 * group, column);
+                    weights = low | ((high * 0x02040810) & 0x10101010);
+                }
+            }
+            else
+            {
+                static_assert(Codebook == 11);
+                weights = decodeIQ3SGroup<Lanes, Ops>(unit, column, group);
+            }
+#pragma GCC unroll 4
+            for (size_t row = 0; row < Rows; ++row)
+            {
+                int activation_word;
+                std::memcpy(&activation_word, activation[row][kb].qs + group * 4, 4);
+                if constexpr (Codebook == 7 && Lanes == 8)
+                    dots[row] = Ops::dotUnsignedQ5(dots[row], weights, I{} + activation_word);
+                else
+                    dots[row] = Ops::dot(dots[row], weights, I{} + activation_word);
+            }
+        }
+    }
+
     /**
      * @brief Apply all four groups of a half to every independently accumulated row.
      * @tparam Half Zero for K0..15 or one for K16..31.
@@ -616,52 +718,8 @@ namespace llaminar2::cpu::native_quantised::multi_scale
                         int kb, typename Ops::I (&dots)[Rows])
     {
         using I = typename Ops::I;
-        // Q5_K and IQ3_S have an explicit NEON prepared tile; this common
-        // path provides the x86 decode and the scalar-reference test seam.
-        if constexpr (usesRowPairs<Ops> && Rows >= 2 && Codebook != 7 && Codebook != 11)
+        if constexpr (usesRowPairs<Ops> && Rows >= 2)
             return dotHalfRowPairs<Codebook, Half, Lanes, Rows, Ops>(unit, column, activation, kb, dots);
-        else if constexpr (Codebook == 11)
-        {
-            const auto group = [&]<int G>() {
-                I weights = payloadWord<Codebook, Ops>(unit, Half * 4 + G, column);
-                if constexpr (Lanes == 16)
-                    weights ^= static_cast<int>(0x80808080u);
-#pragma GCC unroll 4
-                for (size_t row = 0; row < Rows; ++row)
-                {
-                    int activation_word = 0;
-                    std::memcpy(&activation_word, activation[row][kb].qs + Half * 16 + G * 4, 4);
-                    dots[row] = Ops::dot(dots[row], weights, I{} + activation_word);
-                }
-            };
-            group.template operator()<0>();
-            group.template operator()<1>();
-            group.template operator()<2>();
-            group.template operator()<3>();
-        }
-        else if constexpr (Codebook == 7)
-        {
-            // Each Q5_K source group owns one nibble of the high-bit plane
-            // per column. The four low-nibble words serve both K halves.
-            const auto group = [&]<int G>() {
-                const I raw = payloadWord<Codebook, Ops>(unit, G, column);
-                I weights = Half == 0 ? (raw & 0x0F0F0F0F) : ((raw >> 4) & 0x0F0F0F0F);
-                const I high = coded_metadata::Lanes<Ops>::nibbles(unit + 1024 + 32 * (Half * 4 + G), column);
-                weights |= (high * 0x02040810) & 0x10101010;
-                // Q5_K values are unsigned 0..31: no AVX-512 0x80 bias is applied.
-#pragma GCC unroll 4
-                for (size_t row = 0; row < Rows; ++row)
-                {
-                    int activation_word = 0;
-                    std::memcpy(&activation_word, activation[row][kb].qs + Half * 16 + G * 4, 4);
-                    dots[row] = Ops::dot(dots[row], weights, I{} + activation_word);
-                }
-            };
-            group.template operator()<0>();
-            group.template operator()<1>();
-            group.template operator()<2>();
-            group.template operator()<3>();
-        }
         else if constexpr (Codebook == 12)
         {
             // IQ3_XXS: pair two adjacent four-value groups per consume; the
@@ -845,8 +903,13 @@ namespace llaminar2::cpu::native_quantised::multi_scale
                 {
                     const uint8_t *const unit = packed.admittedBlockUnit(chunk, kb);
                     I low[Rows]{}, high[Rows]{};
-                    dotHalf<Codebook, 0, Lanes, Rows, Ops>(unit, column, activation, kb, low);
-                    dotHalf<Codebook, 1, Lanes, Rows, Ops>(unit, column, activation, kb, high);
+                    if constexpr (Codebook == 7 || Codebook == 11)
+                        dotSingleScale<Codebook, Lanes, Rows, Tree, Ops>(unit, column, activation, kb, low);
+                    else
+                    {
+                        dotHalf<Codebook, 0, Lanes, Rows, Ops>(unit, column, activation, kb, low);
+                        dotHalf<Codebook, 1, Lanes, Rows, Ops>(unit, column, activation, kb, high);
+                    }
                     // Coded metadata: the block's code and its superblock word
                     // reconstruct exactly the factors the per-block words held.
                     using L = coded_metadata::Lanes<Ops>;
@@ -907,7 +970,7 @@ namespace llaminar2::cpu::native_quantised::multi_scale
                         const F activation_scale = F{} + nativeQuantisedFP16ScaleToFP32(a.d);
                         if constexpr (Codebook == 7 || Codebook == 11)
                         {
-                            const auto dot = low[row] + high[row] - center * static_cast<int>(a.sum_qs);
+                            const auto dot = low[row] - center * static_cast<int>(a.sum_qs);
                             const auto scale_a = nativeQuantisedFP16ScaleToFP32(a.d);
 #if defined(__aarch64__) && defined(__ARM_NEON)
                             if constexpr (Codebook == 7)

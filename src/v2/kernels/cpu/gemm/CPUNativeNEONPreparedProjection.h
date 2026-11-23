@@ -476,23 +476,21 @@ namespace llaminar2::cpu::native_quantised
             return vsubq_s8(vreinterpretq_s8_u8(values), vdupq_n_s8(32));
         }
 
-        /** @brief Decode four columns of a native coded group for SDOT or the SMMLA pair walk. */
-        template <int Codebook, int Group, typename Ops>
-        [[gnu::always_inline]] static int8x16_t codedGroup(const std::uint8_t *unit, int column) noexcept
+        /** @brief Decode one Q5_K group using a 16-bit high-plane slice for four columns. */
+        [[gnu::always_inline]] static int8x16_t q5Group(const std::uint8_t *unit, int column, int group) noexcept
         {
-            if constexpr (Codebook == 7)
-            {
-                const auto raw = vld1q_u8(unit + (Group % 4) * 256 + column * 4);
-                const auto low = Group < 4 ? vandq_u8(raw, vdupq_n_u8(15)) : vshrq_n_u8(raw, 4);
-                std::uint16_t high;
-                std::memcpy(&high, unit + 1024 + Group * 32 + column / 2, sizeof(high));
-                return vreinterpretq_s8_u8(vorrq_u8(low, q6Plane(high, 16)));
-            }
-            else
-            {
-                static_assert(Codebook == 11);
-                return vld1q_s8(reinterpret_cast<const std::int8_t *>(unit + Group * 256 + column * 4));
-            }
+            const auto raw = vld1q_u8(unit + (group % 4) * 256 + column * 4);
+            const auto low = group < 4 ? vandq_u8(raw, vdupq_n_u8(15)) : vshrq_n_u8(raw, 4);
+            std::uint16_t high;
+            std::memcpy(&high, unit + 1024 + group * 32 + column / 2, sizeof(high));
+            return vreinterpretq_s8_u8(vorrq_u8(low, q6Plane(high, 16)));
+        }
+
+        /** @brief Decode four IQ3_S columns from their native indices and signs, entirely in registers. */
+        template <typename Ops>
+        [[gnu::always_inline]] static int8x16_t iq3sGroup(const std::uint8_t *unit, int column, int group) noexcept
+        {
+            return std::bit_cast<int8x16_t>(multi_scale::decodeIQ3SGroup<4, Ops>(unit, column, group));
         }
 
         /** @brief Load exact coded scale/minimum factors from this block and its source superblock. */
@@ -593,13 +591,12 @@ namespace llaminar2::cpu::native_quantised
                 }
                 publishPairs<Ops>(high01, high23, high);
             }
-            else if constexpr (Coded != 0)
+            else if constexpr (Coded == 11)
             {
-                forEachGroup<4>([&]<int Pair>() __attribute__((always_inline)) {
-                    constexpr int Group = 2 * Pair;
-                    consumePair<Ops>(codedGroup<Coded, Group, Ops>(unit, column),
-                        codedGroup<Coded, Group + 1, Ops>(unit, column), block, Group, low01, low23, low);
-                });
+#pragma GCC unroll 1
+                for (int group = 0; group < 8; group += 2)
+                    consumePair<Ops>(iq3sGroup<Ops>(unit, column, group), iq3sGroup<Ops>(unit, column, group + 1),
+                        block, group, low01, low23, low);
             }
             else if constexpr (Physical == Encoding::NibbleLUT || Physical == Encoding::NibbleLUTSourceScale)
             {
@@ -706,8 +703,8 @@ namespace llaminar2::cpu::native_quantised
                   NibbleMap Map, bool WithMinimum, int Strips, int Coded>
         [[gnu::always_inline]] LLAMINAR_NEON_PROJECTION_EXACT inline void executeBlockProgram() const noexcept
         {
-            constexpr auto PanelShape = Coded == 11 ? Encoding::IQ3SExpandedSourceScale : Physical;
-            constexpr int S = Strips > 0 ? Strips : panelStrips<Ops, PanelShape, WithMinimum>();
+            // Native coded groups use the strip walk to bound register liveness.
+            constexpr int S = Coded != 0 ? 1 : Strips > 0 ? Strips : panelStrips<Ops, Physical, WithMinimum>();
             // A panel never crosses its 64-column chunk: S strips must tile the chunk's 16.
             static_assert(S == 1 || S == 2 || S == 4);
             if constexpr (S > 1 && !multi_scale::usesRowPairs<Ops>)
@@ -737,7 +734,15 @@ namespace llaminar2::cpu::native_quantised
                         forPartitionBlocks<Physical, Coded>(first, last, [&](int block, const std::uint8_t *unit,
                             [[maybe_unused]] const std::uint8_t *header) __attribute__((always_inline)) {
                             I low[Rows]{}, high[Rows]{};
-                            if constexpr (multi_scale::usesRowPairs<Ops>)
+                            if constexpr (Coded == 7)
+                            {
+                                // Decode each group once for all rows. The strip's
+                                // SDOT chain bounds liveness while preserving grouped reuse.
+#pragma GCC unroll 1
+                                for (int group = 0; group < 8; ++group)
+                                    consume<Ops>(q5Group(unit, column, group), block, group, low);
+                            }
+                            else if constexpr (multi_scale::usesRowPairs<Ops>)
                                 pairBlock<Ops, Physical, Map, Coded>(unit, column, block, low, high);
                             else if constexpr (Physical == Encoding::Q6KNativeDualScale)
                             {
@@ -762,15 +767,11 @@ namespace llaminar2::cpu::native_quantised
                                     else consume<Ops>(centered, block, group, high);
                                 }
                             }
-                            else if constexpr (Coded != 0)
+                            else if constexpr (Coded == 11)
                             {
-                                const auto blocks = activationBlocks<Ops>(block);
-                                forEachGroup<8>([&]<int Group>() __attribute__((always_inline)) {
-                                    const auto values = std::bit_cast<I>(codedGroup<Coded, Group, Ops>(unit, column));
-#pragma GCC unroll 4
-                                    for (std::size_t row = 0; row < Rows; ++row)
-                                        low[row] = Ops::template dotLane<Group>(low[row], values, blocks[row]);
-                                });
+#pragma GCC unroll 1
+                                for (int group = 0; group < 8; ++group)
+                                    consume<Ops>(iq3sGroup<Ops>(unit, column, group), block, group, low);
                             }
                             else if constexpr (nibble && kPowerOfTwoBF16Scales<Map>)
                             {
@@ -978,20 +979,6 @@ namespace llaminar2::cpu::native_quantised
                                 }
                             }
                         }
-                    }
-                    else if constexpr (Coded != 0)
-                    {
-                        const auto blocks = activationBlocks<Ops>(block);
-                        forEachGroup<8>([&]<int Group>() __attribute__((always_inline)) {
-#pragma GCC unroll 4
-                            for (int strip = 0; strip < S; ++strip)
-                            {
-                                const auto values = std::bit_cast<I>(codedGroup<Coded, Group, Ops>(unit, column0 + 4 * strip));
-#pragma GCC unroll 4
-                                for (std::size_t row = 0; row < Rows; ++row)
-                                    low[row][strip] = Ops::template dotLane<Group>(low[row][strip], values, blocks[row]);
-                            }
-                        });
                     }
                     else if constexpr (nibble)
                     {

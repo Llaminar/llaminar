@@ -87,10 +87,20 @@ int sourceInteger(const CPUNativeQuantisedWeightView &packed, int column, int bl
 {
     const int local = column % 64;
     const auto *unit = packed.blockUnit(column / 64, block);
-    if (packed.usesExpandedInt8() || (packed.usesCompactMultiScale() && packed.codebook_id == 11))
+    if (packed.usesExpandedInt8())
     {
         const int raw = unit[(k / 4) * 256 + local * 4 + k % 4];
         return raw < 128 ? raw : raw - 256;
+    }
+    if (packed.usesCompactMultiScale() && packed.codebook_id == 11)
+    {
+        const int group = k / 4;
+        const auto qh = unit[512 + local * 4];
+        const auto qs = unit[(group / 4) * 256 + local * 4 + group % 4];
+        const auto signs = group < 6 ? unit[512 + local * 4 + 1 + group / 2] : unit[768 + local];
+        const auto grid = iq3s_grid[qs | (((qh >> group) & 1) << 8)];
+        const int value = (grid >> (8 * (k % 4))) & 255;
+        return signs & (1 << (k % 8)) ? -value : value;
     }
     const int raw = unit[((k % 16) / 4) * 256 + local * 4 + k % 4];
     const int nibble = k < 16 ? raw & 15 : raw >> 4;
