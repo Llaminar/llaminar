@@ -725,6 +725,25 @@ routes improved from 22.21 to 21.44–21.50 µs. Six live rows with 40 local
 routes improved from 52.80–52.99 to 52.03–52.10 µs. All timed
 publications remained byte-exact on both RTX 3090s in both orders.
 
+The paired Release model also exercised the warp planner with the installed
+CPU single-row FFN in both arms. Both cards captured the acquired-bank
+planner and its two math phases. The comparison used the original F320/S320
+plan, one warmup and three measured 256-token runs per arm and mode. Every
+generated ID and per-request MTP count matched. The driver log matched
+before and after each arm.
+
+| Arm order | Mode | Decode, staged → candidate tok/s | Decode change | Complete throughput change |
+| --- | --- | ---: | ---: | ---: |
+| Candidate first | Ordinary | 31.397 → 30.169 | −3.91% | −3.34% |
+| Control first | Ordinary | 31.437 → 30.551 | −2.82% | −2.26% |
+| Candidate first | Fixed depth seven | 44.061 → 42.966 | −2.48% | −1.95% |
+| Control first | Fixed depth seven | 43.920 → 43.519 | −0.91% | −0.47% |
+
+Both ordinary arms used the same staged projection and reported matching
+non-verifier graph materialization counts. The candidate process measured
+lower ordinary throughput in both orders. This comparison leaves the staged
+verifier as the production default.
+
 The scalar drafter's original graph submission owns one live activation.
 On the mixed topology, the fused path selects the local F320 Q8 work from
 the ten original route slots and keeps weighting with the original cohort.
