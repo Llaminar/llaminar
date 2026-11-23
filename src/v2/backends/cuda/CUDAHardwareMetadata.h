@@ -38,6 +38,8 @@ namespace llaminar2
         std::size_t shared_memory_per_sm = 0, total_memory = 0, last_level_cache = 0;
         bool integrated = false; ///< Driver fact: device memory is the host's physical memory (e.g. GB10).
         bool can_launch_cooperative = false; ///< Native grid synchronization capability, observed at startup.
+        int maximum_grid_y = 0; ///< Native grid row limit for prepared grouped launches.
+        bool concurrent_kernels = false; ///< Native overlap capability for independently ordered kernel lanes.
     };
 
     /** @brief Complete checked visibility with no fixed card-count ceiling or PCI-only alias. */
@@ -66,7 +68,8 @@ namespace llaminar2
                     device.maximum_blocks_per_sm <= 0 || device.registers_per_block <= 0 ||
                     device.registers_per_sm <= 0 || device.shared_memory_per_block == 0 ||
                     device.shared_memory_optin_per_block < device.shared_memory_per_block ||
-                    device.shared_memory_per_sm < device.shared_memory_per_block || device.total_memory == 0)
+                    device.shared_memory_per_sm < device.shared_memory_per_block || device.total_memory == 0 ||
+                    device.maximum_grid_y <= 0)
                     throw std::invalid_argument("Incomplete CUDA physical metadata at ordinal " + std::to_string(index));
                 const auto pci = DevicePCIAddress::parse(device.pci_address).toString();
                 const auto colon = pci.find(':');

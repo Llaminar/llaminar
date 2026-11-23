@@ -174,6 +174,8 @@ namespace llaminar2::test
             EXPECT_EQ(hardware.shared_memory_per_sm, properties.sharedMemPerMultiprocessor);
             EXPECT_EQ(hardware.total_memory, properties.totalGlobalMem);
             EXPECT_EQ(hardware.last_level_cache, static_cast<std::size_t>(std::max(properties.l2CacheSize, 0)));
+            EXPECT_EQ(hardware.maximum_grid_y, properties.maxGridSize[1]);
+            EXPECT_EQ(hardware.concurrent_kernels, properties.concurrentKernels != 0);
             std::array<char, 33> uuid{};
             for (std::size_t byte = 0; byte < hardware.uuid.size(); ++byte)
                 std::snprintf(uuid.data() + byte * 2, 3, "%02x", static_cast<unsigned>(hardware.uuid[byte]));

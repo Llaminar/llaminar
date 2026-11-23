@@ -1789,13 +1789,14 @@ namespace llaminar2::test
         EXPECT_NE(runtime.find("participantMaskCount(resident_mask) > 1u"), std::string::npos)
             << "Host-published placement banks must mark whether hot-cache stats can ever be useful.";
 
-        auto expectStaticFastSkip = [](const std::string &source, const char *label)
+        auto expectStaticFastSkip = [](const std::string &source,
+                                       const char *load_marker, const char *label)
         {
             const size_t helper_pos =
                 source.find("runtime_resolve_decode_dispatch");
             ASSERT_NE(helper_pos, std::string::npos) << label;
             const size_t helper_end =
-                source.find("int default_load[kDeviceMoEMaxParticipants]", helper_pos);
+                source.find(load_marker, helper_pos);
             ASSERT_NE(helper_end, std::string::npos) << label;
             const std::string prefix = source.substr(helper_pos, helper_end - helper_pos);
             EXPECT_NE(
@@ -1814,8 +1815,8 @@ namespace llaminar2::test
                 << label << " must maintain the gate after device-side rebalance applies.";
         };
 
-        expectStaticFastSkip(cuda, "CUDA");
-        expectStaticFastSkip(rocm, "ROCm");
+        expectStaticFastSkip(cuda, "auto &default_load = scratch.default_load", "CUDA");
+        expectStaticFastSkip(rocm, "int default_load[kDeviceMoEMaxParticipants]", "ROCm");
     }
 
     /**
@@ -1906,7 +1907,9 @@ namespace llaminar2::test
             if (std::string_view(backend) == "CUDA")
             {
                 expect_requirement_before_shape(
-                    "softmax_topk_decode_runtime_kernel(");
+                    "softmax_topk_decode_runtime_body(");
+                expect_requirement_before_shape(
+                    "softmax_topk_decode_independent_body(");
                 expect_requirement_before_shape(
                     "decode_route_select_runtime_kernel(");
             }
@@ -6933,8 +6936,8 @@ namespace llaminar2::test
         };
 
         require_fused_publication(cuda_contents,
+                                  "void softmax_topk_decode_runtime_body(",
                                   "__global__ void softmax_topk_decode_runtime_kernel(",
-                                  "__global__ void decode_route_select_runtime_kernel(",
                                   "CUDA softmax-topk");
         require_fused_publication(cuda_contents,
                                   "__global__ void decode_route_select_runtime_kernel(",

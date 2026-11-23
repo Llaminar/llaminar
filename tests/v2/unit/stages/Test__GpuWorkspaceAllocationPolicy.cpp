@@ -12649,7 +12649,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MoEVerifierRoutingTensorDecodeDoesNotRe
     const auto verifier_replay_body = sliceBetween(
         stage_source,
         "struct ScopedSingleVerifierRow",
-        "return executeSingleToken(ctx);");
+        "return executeSingleToken(ctx, MoEOverlayServicePhaseHint::GroupedVerifier);");
     const auto routing_tensor_predicate = sliceBetween(
         stage_source,
         "const bool require_device_routing_tensor_decode =",
@@ -14932,7 +14932,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
 
     const auto single_token = sliceBetween(
         source,
-        "bool MoEExpertComputeStage::executeSingleToken(IDeviceContext *ctx)",
+        "bool MoEExpertComputeStage::executeSingleToken(",
         "bool MoEExpertComputeStage::executeCPUGroupedDecodeEquivalentRows(");
     const auto runtime_route = sliceBetween(
         single_token,
@@ -14968,7 +14968,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MoERuntimeDecodeUsesFusedWorkspaceBefor
         readFile(repoRoot() / "src/v2/execution/compute_stages/stages/MoEExpertComputeStage.cpp");
     const auto single_token = sliceBetween(
         source,
-        "bool MoEExpertComputeStage::executeSingleToken(IDeviceContext *ctx)",
+        "bool MoEExpertComputeStage::executeSingleToken(",
         "bool MoEExpertComputeStage::executeCPUGroupedDecodeEquivalentRows(");
 
     expectNeedleBefore(
@@ -15220,11 +15220,12 @@ TEST(Test__GpuWorkspaceAllocationPolicy, Qwen35MoEMultiRowVerifierKeepsStrictPub
            "branch-local storage and must remain parallel with routed expert "
            "execution until their explicit publication join.";
     EXPECT_NE(compact_shared_dependency.find(
-                  "if(main_verifier_rows&&!shared_verifier_owns_branch_local_math&&"
+                  "if(main_verifier_rows&&!mapped_cuda_retained_m1&&"
+                  "!shared_verifier_owns_branch_local_math&&"
                   "!ffn_terminal.empty())"),
               std::string::npos)
-        << "Do not restore a blanket routed->shared verifier dependency. Only "
-           "routes without branch-local shared verifier ownership should serialize.";
+        << "The retained CUDA program already owns its shared-math edge. Other "
+           "routes should serialize only when they lack branch-local ownership.";
 
     const auto canonical_rank_bank_section = sliceBetween(
         graph_source,

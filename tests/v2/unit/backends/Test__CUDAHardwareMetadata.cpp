@@ -52,7 +52,9 @@ namespace llaminar2::test
                     .registers_per_sm = 65536, .shared_memory_per_block = 49152,
                     .shared_memory_optin_per_block = 65536 + index * 256u,
                     .shared_memory_per_sm = 262144, .total_memory = 1ull << 30,
-                    .last_level_cache = 1u << 20};
+                    .last_level_cache = 1u << 20,
+                    .maximum_grid_y = 65535 - static_cast<int>(index),
+                    .concurrent_kernels = index % 2 != 0};
                 for (unsigned byte = 0; byte < 4; ++byte)
                     record.uuid[byte] = static_cast<std::uint8_t>((index + 1) >> (8 * byte));
                 result.push_back(std::move(record));
@@ -121,6 +123,8 @@ namespace llaminar2::test
                 const auto &record = inventory.at(ordinal);
                 const auto bound = policy::bindCUDAFA2Hardware(record);
                 EXPECT_EQ(record.ordinal, ordinal);
+                EXPECT_EQ(record.maximum_grid_y, 65535 - ordinal);
+                EXPECT_EQ(record.concurrent_kernels, ordinal % 2 != 0);
                 EXPECT_EQ(bound.sm_major, 8);
                 EXPECT_EQ(bound.sm_minor, ordinal % 3);
                 EXPECT_EQ(bound.sm_count, 20 + ordinal);
@@ -293,6 +297,8 @@ namespace llaminar2::test
         EXPECT_THROW(CUDAHardwareInventory(std::move(gap)), std::invalid_argument);
         auto missing_architecture = cudaRecords(1); missing_architecture[0].sm_major = 0;
         EXPECT_THROW(CUDAHardwareInventory(std::move(missing_architecture)), std::invalid_argument);
+        auto missing_grid_limit = cudaRecords(1); missing_grid_limit[0].maximum_grid_y = 0;
+        EXPECT_THROW(CUDAHardwareInventory(std::move(missing_grid_limit)), std::invalid_argument);
     }
 
     /** @test Concurrent failing callers all receive the original failure without partial publication. */

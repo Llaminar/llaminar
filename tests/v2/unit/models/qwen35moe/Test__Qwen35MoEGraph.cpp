@@ -6218,7 +6218,7 @@ TEST(Test__Qwen35MoEGraph,
         transport_selection);
     ASSERT_NE(authority_binding, std::string::npos);
     const size_t follower_branch = source.find(
-        "else if (mapped_activation_topology &&",
+        "else if (!mapped_cuda_retained_m1 && mapped_activation_topology &&",
         authority_binding);
     ASSERT_NE(follower_branch, std::string::npos);
     const std::string authority_body = source.substr(

@@ -28099,10 +28099,10 @@ namespace llaminar2::cuda::moe
             (range.role != RetainedGroupedFFNRole::Routed && range.role != RetainedGroupedFFNRole::Shared))
             throw std::invalid_argument("Retained grouped QFN requires its original CUDA geometry and workspace");
         const auto& hardware = cudaHardwareMetadata().at(device.ordinal);
-        int current = -1, max_rows = 0;
+        int current = -1;
         if (hardware.sm_major != 8 || hardware.sm_minor != 6 || cudaGetDevice(&current) != cudaSuccess ||
             current != static_cast<int>(device.ordinal) ||
-            cudaDeviceGetAttribute(&max_rows, cudaDevAttrMaxGridDimY, current) != cudaSuccess || range.capacity > max_rows)
+            range.capacity > hardware.maximum_grid_y)
             throw std::invalid_argument("Retained grouped QFN exceeds its admitted SM86 launch capacity");
         cudaStreamCaptureStatus capture{};
         if (cudaStreamIsCapturing(native, &capture) != cudaSuccess || capture != cudaStreamCaptureStatusNone)
@@ -28290,12 +28290,11 @@ namespace llaminar2::cuda::moe
         {
             if (hc.norm.extent.liveRows)
                 throw std::invalid_argument("CUDA retained QFN early CPU packet requires the original fully-active M1 invocation");
-            int concurrent = 0;
             const auto packet_address = reinterpret_cast<std::uintptr_t>(arguments.early_packet_ready);
             const auto ticket_address = reinterpret_cast<std::uintptr_t>(arguments.early_ticket_ready);
             if (blocks < 2u || packet_address == ticket_address ||
                 (packet_address | ticket_address) % alignof(std::uint64_t) ||
-                cudaDeviceGetAttribute(&concurrent, cudaDevAttrConcurrentKernels, int(device.ordinal)) != cudaSuccess || !concurrent)
+                !hardware.concurrent_kernels)
                 throw std::invalid_argument("Retained QFN HC/FFN cannot admit its independent packet lane");
             if (router.local_policy == RoutedExpertRowExecutionPolicy::IntermediateShardLocal)
             {
