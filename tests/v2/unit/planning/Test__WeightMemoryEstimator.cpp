@@ -283,7 +283,6 @@ TEST(Test__WeightMemoryEstimator, ExactInputAndOutputAxesAllFormatsTP1Through8)
     profile.d_model = 65;
     // Every TP degree up to eight has native-superblock-aligned K.
     profile.d_ff = 256 * 840;
-    const auto align = [](size_t bytes) { return (bytes + 255u) & ~size_t(255u); };
     for (const auto &format : nativeFormats())
     {
         SCOPED_TRACE(format.quant_type);
@@ -320,10 +319,11 @@ TEST(Test__WeightMemoryEstimator, ExactInputAndOutputAxesAllFormatsTP1Through8)
                             EXPECT_EQ(bytes.device_bytes, expected) << device.to_string();
                             if (degree == 2)
                             {
-                                const auto truncated = nativeQuantisedPackedRegionSizes(
-                                    d.elements() / down.K, down.K, *native);
-                                EXPECT_GT(expected, align(truncated.payload_bytes) + align(truncated.scales_bytes) +
-                                    align(truncated.mins_bytes) + align(truncated.emins_bytes));
+                                // Reinterpreting the shard as fewer full-K rows must
+                                // price less than the exact geometry, in the same
+                                // representation the device actually stores.
+                                EXPECT_GT(expected,
+                                    expectedGpuPackedBytes(d.elements() / down.K, down.K, *native, device));
                             }
                         }
                         else
