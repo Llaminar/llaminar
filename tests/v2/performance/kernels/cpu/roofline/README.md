@@ -615,3 +615,19 @@ Direct writes into the existing packed records reduced median FFN latency by
 to the packed records. The aligned comparison used a synthetic destination layout.
 The raw receipts are in
 `benchmark_results/qfn-cuda-2x2-95943372/direct-publication-release/down-output-layout-attribution/`.
+
+The full Release build of `451e0b13` ran the same crossover against the
+archived standalone direct-Down control. All 24 measured requests matched
+every token and MTP work counter. Each arm used the original F320/S320
+placement on two RTX 3090s and both Xeon sockets.
+
+| Execution order | Mode | Prefill | Decode | End-to-end |
+| --- | --- | ---: | ---: | ---: |
+| Branch first | Ordinary | −0.65% | −2.47% | −2.03% |
+| Branch first | Fixed depth seven | −0.75% | −1.54% | −1.34% |
+| Control first | Ordinary | +0.81% | +0.34% | +0.42% |
+| Control first | Fixed depth seven | +0.70% | +0.83% | +0.76% |
+
+The timing direction changed with run order. The raw comparison and binary
+hashes are in
+`benchmark_results/qfn-cuda-2x2-95943372/direct-publication-release/final-source/model-comparison/`.
