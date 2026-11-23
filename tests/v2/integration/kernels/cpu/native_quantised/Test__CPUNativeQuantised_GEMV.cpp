@@ -1746,6 +1746,66 @@ namespace
         }
     }
 
+#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
+    /** @test The three- and four-row weight-sharing leaves publish only live AVX512 columns. */
+    TEST_F(CPUNativeQuantisedGemvTest, WideBoundedOutputAllFormats)
+    {
+        ASSERT_GE(activeISALevel(), ISALevel::AVX512);
+        constexpr int width = 64, inner = 512, blocks = inner / Q8_1Block::BLOCK_SIZE;
+        constexpr float guard = -79.625f;
+        const auto input = TestTensorFactory::createFP32Random({4, inner}, -0.875f, 0.875f, 91801);
+        for (const auto policy : {CPUProjectionNumericalPolicy::BackendNative,
+                                  CPUProjectionNumericalPolicy::GPUAlignedExpert})
+        {
+            SCOPED_TRACE(static_cast<int>(policy));
+            std::array<Q8_1Block, 4 * blocks> activation{};
+            quantize_activations_to_q8_1(input->data(), activation.data(), 4, inner, blocks, policy);
+            const std::array<const Q8_1Block *, 4> inputs{
+                activation.data(), activation.data() + blocks, activation.data() + 2 * blocks,
+                activation.data() + 3 * blocks};
+            for (const auto &format : quantizedMoEVerifierFormats())
+            {
+                SCOPED_TRACE(format.label);
+                auto weights = format.create({width, inner}, 91803);
+                CPUNativeQuantisedGemmKernel kernel(weights.get(), 0, -1, policy);
+                ASSERT_TRUE(kernel.isValid());
+                const auto &packed = kernel.packedWeights();
+                const auto lut = packed.usesNibbleLUT() ? build_decode_lut(packed.codebook_id) : _mm512_setzero_si512();
+                for (int rows : {3, 4})
+                {
+                    SCOPED_TRACE(rows);
+                    std::array<std::array<float, width>, 4> reference{};
+                    const std::array outputs{reference[0].data(), reference[1].data(), reference[2].data(), reference[3].data()};
+                    publishNativeQuantisedAVX512WideRows(packed, inputs.data(), outputs.data(),
+                        rows, 0, 0, blocks, false, width, lut);
+                    for (int live : {1, 15, 16, 17, 31, 32, 33, 47, 48, 49, 63, 64})
+                    {
+                        SCOPED_TRACE(live);
+                        std::array<std::array<float, width + 2>, 4> result;
+                        for (auto &row : result) row.fill(guard);
+                        const std::array destination{result[0].data() + 1, result[1].data() + 1,
+                            result[2].data() + 1, result[3].data() + 1};
+                        publishNativeQuantisedAVX512WideRows(packed, inputs.data(), destination.data(),
+                            rows, 0, 0, blocks / 2, false, live, lut);
+                        publishNativeQuantisedAVX512WideRows(packed, inputs.data(), destination.data(),
+                            rows, 0, blocks / 2, blocks, true, live, lut);
+                        for (int row = 0; row < rows; ++row)
+                        {
+                            EXPECT_EQ(std::memcmp(destination[row], outputs[row], live * sizeof(float)), 0);
+                            EXPECT_EQ(result[row].front(), guard);
+                            for (int col = live + 1; col < static_cast<int>(result[row].size()); ++col)
+                                EXPECT_EQ(result[row][col], guard);
+                        }
+                        if (rows == 3)
+                            EXPECT_TRUE(std::all_of(result[3].begin(), result[3].end(),
+                                [](float x) { return x == guard; }));
+                    }
+                }
+            }
+        }
+    }
+#endif
+
     /** @test Every compact decoder publishes and resumes a partial vector in its own destination. */
     TEST_F(CPUNativeQuantisedGemvTest, CompactBoundedOutputRetainsOrderedArithmetic)
     {
