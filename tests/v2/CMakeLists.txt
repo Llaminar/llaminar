@@ -2629,6 +2629,9 @@ target_include_directories(v2_test_native_quantised_prefill_schedule PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/../../src/v2")
 target_link_libraries(v2_test_native_quantised_prefill_schedule PRIVATE
     GTest::gtest GTest::gtest_main)
+# The schedule includes the prepared-footprint header, whose format catalog
+# uses C++20 defaulted comparisons; this target does not inherit core's standard.
+target_compile_features(v2_test_native_quantised_prefill_schedule PRIVATE cxx_std_23)
 add_v2_test(V2_Unit_NativeQuantisedPrefillSchedule
     COMMAND $<TARGET_FILE:v2_test_native_quantised_prefill_schedule>
     LABELS "V2;Unit;CPU;NativeQuantised;Prefill;Scheduling;Regression"
@@ -7451,6 +7454,9 @@ target_link_libraries(v2_test_native_quantised_trainer_evidence
     GTest::gtest
     GTest::gtest_main
 )
+# The probe plan reaches the prepared-footprint header (C++20 format catalog);
+# this core-free target needs the project standard explicitly.
+target_compile_features(v2_test_native_quantised_trainer_evidence PRIVATE cxx_std_23)
 add_v2_test(V2_Unit_NativeQuantisedTrainerEvidence
     COMMAND $<TARGET_FILE:v2_test_native_quantised_trainer_evidence>
     LABELS "V2;Unit;NativeQuantised;CPU;CUDA;ROCm;MTP;Trainer;Evidence;Regression"
