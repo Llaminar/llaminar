@@ -1877,8 +1877,10 @@ namespace llaminar2::cpu::native_quantised
      * @param k_tiles Fixed ordered partition count.
      * @param k_blocks_per_tile Consecutive blocks assigned to one partition.
      * @param decode_lut Broadcast decoder table for non-linear codebooks.
+     * @tparam Bounded Limit destination access to the live columns of the final panel.
+     * @param columns Live destination width when the panel is bounded.
      */
-    template <NibbleDecodeKind DecodeKind, bool IsAsymmetric>
+    template <NibbleDecodeKind DecodeKind, bool IsAsymmetric, bool Bounded>
     inline void gemv_native_avx512_ordered_partitions(
         const CPUNativeQuantisedPackedWeights &packed,
         const Q8_1Block *A_q8,
@@ -1887,7 +1889,8 @@ namespace llaminar2::cpu::native_quantised
         int K_blocks,
         int k_tiles,
         int k_blocks_per_tile,
-        const __m512i decode_lut)
+        const __m512i decode_lut,
+        int columns = 64)
     {
         __m512 reduced0 = _mm512_setzero_ps();
         __m512 reduced1 = _mm512_setzero_ps();
@@ -1936,15 +1939,16 @@ namespace llaminar2::cpu::native_quantised
             }
         }
 
-        _mm512_storeu_ps(C, reduced0);
-        _mm512_storeu_ps(C + 16, reduced1);
-        _mm512_storeu_ps(C + 32, reduced2);
-        _mm512_storeu_ps(C + 48, reduced3);
+        publishProjectionOutputVector<Bounded, 16>(C, columns, 0, reduced0);
+        publishProjectionOutputVector<Bounded, 16>(C, columns, 16, reduced1);
+        publishProjectionOutputVector<Bounded, 16>(C, columns, 32, reduced2);
+        publishProjectionOutputVector<Bounded, 16>(C, columns, 48, reduced3);
     }
 
     /**
      * @brief Dispatch the register-only ordered nibble tree once per chunk.
      */
+    template<bool Bounded = false>
     inline void dispatch_native_avx512_ordered_partitions(
         const CPUNativeQuantisedPackedWeights &packed,
         const Q8_1Block *A_q8,
@@ -1953,18 +1957,19 @@ namespace llaminar2::cpu::native_quantised
         int K_blocks,
         int k_tiles,
         int k_blocks_per_tile,
-        const __m512i decode_lut)
+        const __m512i decode_lut,
+        int columns = 64)
     {
 #define DISPATCH_ORDERED_NIBBLE(DECODE_KIND)                                   \
         if (packed.is_asymmetric)                                              \
             return gemv_native_avx512_ordered_partitions<                      \
-                DECODE_KIND, true>(                                            \
-                packed, A_q8, C, chunk, K_blocks, k_tiles,                    \
-                k_blocks_per_tile, decode_lut);                                \
+                DECODE_KIND, true, Bounded>(                                   \
+                packed, A_q8, C, chunk, K_blocks, k_tiles,                     \
+                k_blocks_per_tile, decode_lut, columns);                       \
         return gemv_native_avx512_ordered_partitions<                          \
-            DECODE_KIND, false>(                                               \
-            packed, A_q8, C, chunk, K_blocks, k_tiles,                        \
-            k_blocks_per_tile, decode_lut)
+            DECODE_KIND, false, Bounded>(                                      \
+            packed, A_q8, C, chunk, K_blocks, k_tiles,                         \
+            k_blocks_per_tile, decode_lut, columns)
 
         switch (nibbleDecodeKind(packed.codebook_id))
         {
@@ -2001,8 +2006,10 @@ namespace llaminar2::cpu::native_quantised
      * @param k_tiles Original fixed partition count, including empty partitions.
      * @param k_blocks_per_tile Original consecutive blocks in each partition.
      * @param decode_lut Original nonlinear decoder; identity does not consume it.
+     * @tparam Bounded Limit destination access to the live columns of the final panel.
+     * @param columns Live destination width when the panel is bounded.
      */
-    template <NibbleDecodeKind DecodeKind, bool IsAsymmetric>
+    template <NibbleDecodeKind DecodeKind, bool IsAsymmetric, bool Bounded>
     inline void gemm_2row_native_avx512_ordered_partitions(
         const CPUNativeQuantisedPackedWeights &packed,
         const Q8_1Block *A_q8_row0,
@@ -2013,7 +2020,8 @@ namespace llaminar2::cpu::native_quantised
         int K_blocks,
         int k_tiles,
         int k_blocks_per_tile,
-        const __m512i decode_lut)
+        const __m512i decode_lut,
+        int columns = 64)
     {
         // The identity decoder emits the literal nibble in [0,15]. VNNI may
         // therefore consume B as unsigned and the unchanged Q8 bytes as signed.
@@ -2038,7 +2046,7 @@ namespace llaminar2::cpu::native_quantised
         const __m512i q4_zero_offset = _mm512_set1_epi8(8);
         const __m512i bias_128_i32 = _mm512_set1_epi32(128);
 
-        for (int zbase = 0; zbase < 4; zbase += 2)
+        for (int zbase = 0; zbase < (Bounded ? (columns + 15) / 16 : 4); zbase += 2)
         {
             __m512 reduced0_0 = _mm512_setzero_ps();
             __m512 reduced0_1 = _mm512_setzero_ps();
@@ -2270,14 +2278,15 @@ namespace llaminar2::cpu::native_quantised
                 }
             }
 
-            _mm512_storeu_ps(C_row0 + zbase * 16, reduced0_0);
-            _mm512_storeu_ps(C_row0 + (zbase + 1) * 16, reduced0_1);
-            _mm512_storeu_ps(C_row1 + zbase * 16, reduced1_0);
-            _mm512_storeu_ps(C_row1 + (zbase + 1) * 16, reduced1_1);
+            publishProjectionOutputVector<Bounded, 16>(C_row0, columns, zbase * 16, reduced0_0);
+            publishProjectionOutputVector<Bounded, 16>(C_row0, columns, (zbase + 1) * 16, reduced0_1);
+            publishProjectionOutputVector<Bounded, 16>(C_row1, columns, zbase * 16, reduced1_0);
+            publishProjectionOutputVector<Bounded, 16>(C_row1, columns, (zbase + 1) * 16, reduced1_1);
         }
     }
 
     /** @brief Dispatch the two-row ordered nibble tree once per chunk. */
+    template<bool Bounded = false>
     inline void dispatch_2row_native_avx512_ordered_partitions(
         const CPUNativeQuantisedPackedWeights &packed,
         const Q8_1Block *A_q8_row0,
@@ -2288,18 +2297,19 @@ namespace llaminar2::cpu::native_quantised
         int K_blocks,
         int k_tiles,
         int k_blocks_per_tile,
-        const __m512i decode_lut)
+        const __m512i decode_lut,
+        int columns = 64)
     {
 #define DISPATCH_ORDERED_2ROW(DECODE_KIND)                                     \
         if (packed.is_asymmetric)                                              \
             return gemm_2row_native_avx512_ordered_partitions<                 \
-                DECODE_KIND, true>(                                            \
-                packed, A_q8_row0, A_q8_row1, C_row0, C_row1, chunk,          \
-                K_blocks, k_tiles, k_blocks_per_tile, decode_lut);             \
+                DECODE_KIND, true, Bounded>(                                   \
+                packed, A_q8_row0, A_q8_row1, C_row0, C_row1, chunk,           \
+                K_blocks, k_tiles, k_blocks_per_tile, decode_lut, columns);    \
         return gemm_2row_native_avx512_ordered_partitions<                     \
-            DECODE_KIND, false>(                                               \
-            packed, A_q8_row0, A_q8_row1, C_row0, C_row1, chunk,              \
-            K_blocks, k_tiles, k_blocks_per_tile, decode_lut)
+            DECODE_KIND, false, Bounded>(                                      \
+            packed, A_q8_row0, A_q8_row1, C_row0, C_row1, chunk,               \
+            K_blocks, k_tiles, k_blocks_per_tile, decode_lut, columns)
 
         switch (nibbleDecodeKind(packed.codebook_id))
         {
@@ -2337,8 +2347,10 @@ namespace llaminar2::cpu::native_quantised
      * generalized or rewritten. Keep this per-decoder/asymmetry specialization
      * as a normal optimization unit rather than forcing all variants into one
      * giant dispatcher. Zero hot spills remains a compiled qualification gate.
+     * @tparam Bounded Limit destination access to the live columns of the final panel.
+     * @param columns Live destination width when the panel is bounded.
      */
-    template <NibbleDecodeKind DecodeKind, bool IsAsymmetric>
+    template <NibbleDecodeKind DecodeKind, bool IsAsymmetric, bool Bounded>
     inline void gemm_3row_native_avx512_ordered_partitions(
         const CPUNativeQuantisedPackedWeights &packed,
         const Q8_1Block *A_q8_row0,
@@ -2351,13 +2363,14 @@ namespace llaminar2::cpu::native_quantised
         int K_blocks,
         int k_tiles,
         int k_blocks_per_tile,
-        const __m512i decode_lut)
+        const __m512i decode_lut,
+        int columns = 64)
     {
         const __m512i mask_0F = _mm512_set1_epi8(0x0F);
         const __m512i q4_zero_offset = _mm512_set1_epi8(8);
         const __m512i bias_128_i32 = _mm512_set1_epi32(128);
 
-        for (int zbase = 0; zbase < 4; zbase += 2)
+        for (int zbase = 0; zbase < (Bounded ? (columns + 15) / 16 : 4); zbase += 2)
         {
             __m512 reduced0_0 = _mm512_setzero_ps();
             __m512 reduced0_1 = _mm512_setzero_ps();
@@ -2529,12 +2542,12 @@ namespace llaminar2::cpu::native_quantised
                 }
             }
 
-            _mm512_storeu_ps(C_row0 + zbase * 16, reduced0_0);
-            _mm512_storeu_ps(C_row0 + (zbase + 1) * 16, reduced0_1);
-            _mm512_storeu_ps(C_row1 + zbase * 16, reduced1_0);
-            _mm512_storeu_ps(C_row1 + (zbase + 1) * 16, reduced1_1);
-            _mm512_storeu_ps(C_row2 + zbase * 16, reduced2_0);
-            _mm512_storeu_ps(C_row2 + (zbase + 1) * 16, reduced2_1);
+            publishProjectionOutputVector<Bounded, 16>(C_row0, columns, zbase * 16, reduced0_0);
+            publishProjectionOutputVector<Bounded, 16>(C_row0, columns, (zbase + 1) * 16, reduced0_1);
+            publishProjectionOutputVector<Bounded, 16>(C_row1, columns, zbase * 16, reduced1_0);
+            publishProjectionOutputVector<Bounded, 16>(C_row1, columns, (zbase + 1) * 16, reduced1_1);
+            publishProjectionOutputVector<Bounded, 16>(C_row2, columns, zbase * 16, reduced2_0);
+            publishProjectionOutputVector<Bounded, 16>(C_row2, columns, (zbase + 1) * 16, reduced2_1);
         }
     }
 
@@ -2544,16 +2557,19 @@ namespace llaminar2::cpu::native_quantised
      * @param A_q8_row0 First Q8 row in the tile.
      * @param A_q8_row1 Second Q8 row in the tile.
      * @param A_q8_row2 Third Q8 row in the tile.
-     * @param C_row0 First complete N64 destination or caller-owned tail scratch.
-     * @param C_row1 Second complete N64 destination or caller-owned tail scratch.
-     * @param C_row2 Third complete N64 destination or caller-owned tail scratch.
+     * @param C_row0 First live destination row.
+     * @param C_row1 Second live destination row.
+     * @param C_row2 Third live destination row.
      * @param chunk Original N64 panel index.
      * @param K_blocks Original live activation block count.
      * @param k_tiles Fixed ordered partition count from the admitted plan.
      * @param k_blocks_per_tile Original consecutive blocks per partition.
      * @param decode_lut Original prepared codebook decode table.
      * @throws std::logic_error For conflicting source/encoding/asymmetry metadata.
+     * @tparam Bounded Limit destination access to the live columns of the final panel.
+     * @param columns Live destination width when the panel is bounded.
      */
+    template<bool Bounded = false>
     inline void dispatch_3row_native_avx512_ordered_partitions(
         const CPUNativeQuantisedPackedWeights &packed,
         const Q8_1Block *A_q8_row0,
@@ -2566,7 +2582,8 @@ namespace llaminar2::cpu::native_quantised
         int K_blocks,
         int k_tiles,
         int k_blocks_per_tile,
-        const __m512i decode_lut)
+        const __m512i decode_lut,
+        int columns = 64)
     {
         // These are prepared-format consistency checks, not a numerical
         // alternative. The existing source/codebook authority admits exactly
@@ -2579,15 +2596,15 @@ namespace llaminar2::cpu::native_quantised
                       native_quantised_formats::IQ4_NL.is_asymmetric);
         static_assert(native_quantised_formats::Q4_K.is_asymmetric ==
                       native_quantised_formats::Q4_1.is_asymmetric);
-#define DISPATCH_ORDERED_3ROW(DECODE_KIND, FORMAT)                              \
-        if (packed.is_asymmetric != native_quantised_formats::FORMAT.is_asymmetric) \
-            throw std::logic_error(                                           \
-                "CPU ordered three-row nibble decoder/asymmetry metadata mismatch: " #FORMAT); \
-        return gemm_3row_native_avx512_ordered_partitions<                      \
-            DECODE_KIND, native_quantised_formats::FORMAT.is_asymmetric>(      \
-            packed, A_q8_row0, A_q8_row1, A_q8_row2,                            \
+#define DISPATCH_ORDERED_3ROW(DECODE_KIND, FORMAT)                             \
+        if (packed.is_asymmetric != native_quantised_formats::FORMAT.is_asymmetric)\
+            throw std::logic_error(                                            \
+                "CPU ordered three-row nibble decoder/asymmetry metadata mismatch: " #FORMAT);\
+        return gemm_3row_native_avx512_ordered_partitions<                     \
+            DECODE_KIND, native_quantised_formats::FORMAT.is_asymmetric, Bounded>(\
+            packed, A_q8_row0, A_q8_row1, A_q8_row2,                           \
             C_row0, C_row1, C_row2, chunk,                                     \
-            K_blocks, k_tiles, k_blocks_per_tile, decode_lut)
+            K_blocks, k_tiles, k_blocks_per_tile, decode_lut, columns)
 
         switch (nibbleDecodeKind(packed.codebook_id))
         {
@@ -4184,9 +4201,11 @@ namespace llaminar2::cpu::native_quantised
      * @param K_blocks Number of source Q8_1 blocks.
      * @param k_tiles Ordered K-partition count.
      * @param k_blocks_per_tile Consecutive blocks in one partition.
+     * @tparam Bounded Limit destination access to the live columns of the final panel.
+     * @param columns Live destination width when the panel is bounded.
      */
     template <bool IsAsymmetric,
-              CPUNativeQuantisedCoefficientDomain Domain = CPUNativeQuantisedCoefficientDomain::SignedInt8>
+              CPUNativeQuantisedCoefficientDomain Domain = CPUNativeQuantisedCoefficientDomain::SignedInt8, bool Bounded = false>
     inline void gemmTwoRowsExpandedAVX512OrderedPartitionsImpl(
         const CPUNativeQuantisedPackedWeights &packed,
         const Q8_1Block *row0,
@@ -4196,7 +4215,8 @@ namespace llaminar2::cpu::native_quantised
         int chunk,
         int K_blocks,
         int k_tiles,
-        int k_blocks_per_tile)
+        int k_blocks_per_tile,
+        int columns = 64)
     {
         constexpr bool unsigned_weights = Domain == CPUNativeQuantisedCoefficientDomain::UnsignedFiveBit;
         static_assert(!unsigned_weights || IsAsymmetric);
@@ -4213,7 +4233,7 @@ namespace llaminar2::cpu::native_quantised
             else
                 return pack_q8_1_unsigned_word(row, group * 4);
         };
-        for (int zbase = 0; zbase < 4; zbase += 2)
+        for (int zbase = 0; zbase < (Bounded ? (columns + 15) / 16 : 4); zbase += 2)
         {
             __m512 reduced0_0 = _mm512_setzero_ps();
             __m512 reduced0_1 = _mm512_setzero_ps();
@@ -4391,10 +4411,10 @@ namespace llaminar2::cpu::native_quantised
                 }
             }
 
-            _mm512_storeu_ps(output0 + zbase * 16, reduced0_0);
-            _mm512_storeu_ps(output0 + (zbase + 1) * 16, reduced0_1);
-            _mm512_storeu_ps(output1 + zbase * 16, reduced1_0);
-            _mm512_storeu_ps(output1 + (zbase + 1) * 16, reduced1_1);
+            publishProjectionOutputVector<Bounded, 16>(output0, columns, zbase * 16, reduced0_0);
+            publishProjectionOutputVector<Bounded, 16>(output0, columns, (zbase + 1) * 16, reduced0_1);
+            publishProjectionOutputVector<Bounded, 16>(output1, columns, zbase * 16, reduced1_0);
+            publishProjectionOutputVector<Bounded, 16>(output1, columns, (zbase + 1) * 16, reduced1_1);
         }
     }
 
@@ -4403,7 +4423,10 @@ namespace llaminar2::cpu::native_quantised
      *
      * @throws std::invalid_argument when the matrix does not own the expanded
      *         physical encoding.
+     * @tparam Bounded Limit destination access to the live columns of the final panel.
+     * @param columns Live destination width when the panel is bounded.
      */
+    template<bool Bounded = false>
     inline void gemmTwoRowsExpandedAVX512OrderedPartitions(
         const CPUNativeQuantisedPackedWeights &packed,
         const Q8_1Block *row0,
@@ -4413,7 +4436,8 @@ namespace llaminar2::cpu::native_quantised
         int chunk,
         int K_blocks,
         int k_tiles,
-        int k_blocks_per_tile)
+        int k_blocks_per_tile,
+        int columns = 64)
     {
         if (!packed.usesExpandedInt8())
         {
@@ -4423,13 +4447,13 @@ namespace llaminar2::cpu::native_quantised
         if (packed.coefficientDomain() == CPUNativeQuantisedCoefficientDomain::UnsignedFiveBit)
         {
             return gemmTwoRowsExpandedAVX512OrderedPartitionsImpl<
-                true, CPUNativeQuantisedCoefficientDomain::UnsignedFiveBit>(
+                true, CPUNativeQuantisedCoefficientDomain::UnsignedFiveBit, Bounded>(
                 packed, row0, row1, output0, output1, chunk,
-                K_blocks, k_tiles, k_blocks_per_tile);
+                K_blocks, k_tiles, k_blocks_per_tile, columns);
         }
         if (packed.is_asymmetric)
         {
-            return gemmTwoRowsExpandedAVX512OrderedPartitionsImpl<true>(
+            return gemmTwoRowsExpandedAVX512OrderedPartitionsImpl<true, CPUNativeQuantisedCoefficientDomain::SignedInt8, Bounded>(
                 packed,
                 row0,
                 row1,
@@ -4438,9 +4462,9 @@ namespace llaminar2::cpu::native_quantised
                 chunk,
                 K_blocks,
                 k_tiles,
-                k_blocks_per_tile);
+                k_blocks_per_tile, columns);
         }
-        return gemmTwoRowsExpandedAVX512OrderedPartitionsImpl<false>(
+        return gemmTwoRowsExpandedAVX512OrderedPartitionsImpl<false, CPUNativeQuantisedCoefficientDomain::SignedInt8, Bounded>(
             packed,
             row0,
             row1,
@@ -4449,7 +4473,7 @@ namespace llaminar2::cpu::native_quantised
             chunk,
             K_blocks,
             k_tiles,
-            k_blocks_per_tile);
+            k_blocks_per_tile, columns);
     }
 
     /**
@@ -4462,22 +4486,23 @@ namespace llaminar2::cpu::native_quantised
      * @param destination Running 64-column reduction.
      * @param partial Newly completed 64-column K-partition.
      * @param first_partition Whether @p partial initializes the reduction.
+     * @tparam Bounded Limit destination access to the live columns of the final panel.
+     * @param columns Live destination width when the panel is bounded.
      */
+    template<bool Bounded = false>
     inline void foldOrderedAVX512Partition(
         float *destination,
         const float *partial,
-        bool first_partition)
+        bool first_partition,
+        int columns = 64)
     {
-        for (int segment = 0; segment < 4; ++segment)
+        for (int segment = 0; segment < (Bounded ? (columns + 15) / 16 : 4); ++segment)
         {
             const __m512 value = _mm512_load_ps(partial + segment * 16);
-            _mm512_storeu_ps(
-                destination + segment * 16,
-                first_partition
-                    ? value
-                    : addOrderedAVX512(
-                          _mm512_loadu_ps(destination + segment * 16),
-                          value));
+            const int offset = segment * 16;
+            const auto sum = first_partition ? value : addOrderedAVX512(
+                readProjectionOutputVector<Bounded, 16, __m512>(destination, columns, offset, true), value);
+            publishProjectionOutputVector<Bounded, 16>(destination, columns, offset, sum);
         }
     }
 
@@ -4502,7 +4527,10 @@ namespace llaminar2::cpu::native_quantised
      * @param k_tiles Ordered K-partition count.
      * @param k_blocks_per_tile Consecutive blocks in one partition.
      * @param decode_lut Broadcast nibble decoder for nibble encodings.
+     * @tparam Bounded Limit destination access to the live columns of the final panel.
+     * @param columns Live destination width when the panel is bounded.
      */
+    template<bool Bounded = false>
     inline void gemmTwoRowsAVX512OrderedPartitions(
         const CPUNativeQuantisedPackedWeights &packed,
         const Q8_1Block *row0,
@@ -4513,7 +4541,8 @@ namespace llaminar2::cpu::native_quantised
         int K_blocks,
         int k_tiles,
         int k_blocks_per_tile,
-        const __m512i decode_lut)
+        const __m512i decode_lut,
+        int columns = 64)
     {
         if (packed.usesCompactMultiScale())
         {
@@ -4521,7 +4550,7 @@ namespace llaminar2::cpu::native_quantised
             // not repeated sixteen times through a temporary partial buffer.
             return multi_scale::dispatchOrdered<16, 2>(
                 packed, {row0, row1}, {output0, output1}, chunk,
-                K_blocks, k_tiles, k_blocks_per_tile);
+                K_blocks, k_tiles, k_blocks_per_tile, Bounded ? columns : 64);
         }
         if (MoEProjectionNumericalContract::
                 oneNativeQuantisedBlockPerOrderedPartition(
@@ -4531,7 +4560,7 @@ namespace llaminar2::cpu::native_quantised
         {
             if (packed.usesNibbleLUT())
             {
-                gemm_2row_native_chunk(
+                gemm_2row_native_chunk<Bounded>(
                     packed,
                     row0,
                     row1,
@@ -4541,11 +4570,11 @@ namespace llaminar2::cpu::native_quantised
                     0,
                     K_blocks,
                     decode_lut,
-                    /*accumulate=*/false);
+                    /*accumulate=*/false, columns);
             }
             else
             {
-                gemm_2row_non_nibble_chunk(
+                gemm_2row_non_nibble_chunk<false, Bounded>(
                     packed,
                     row0,
                     row1,
@@ -4554,7 +4583,7 @@ namespace llaminar2::cpu::native_quantised
                     chunk,
                     0,
                     K_blocks,
-                    /*accumulate=*/false);
+                    /*accumulate=*/false, columns);
             }
             return;
         }
@@ -4593,10 +4622,10 @@ namespace llaminar2::cpu::native_quantised
                     kb_end,
                     /*accumulate=*/false);
             }
-            foldOrderedAVX512Partition(
-                output0, partial0, k_tile == 0);
-            foldOrderedAVX512Partition(
-                output1, partial1, k_tile == 0);
+            foldOrderedAVX512Partition<Bounded>(
+                output0, partial0, k_tile == 0, columns);
+            foldOrderedAVX512Partition<Bounded>(
+                output1, partial1, k_tile == 0, columns);
         }
     }
 
@@ -4615,7 +4644,10 @@ namespace llaminar2::cpu::native_quantised
      * @param K_blocks Number of source Q8_1 blocks.
      * @param k_tiles Ordered K-partition count.
      * @param k_blocks_per_tile Consecutive blocks in one partition.
+     * @tparam Bounded Limit destination access to the live columns of the final panel.
+     * @param columns Live destination width when the panel is bounded.
      */
+    template<bool Bounded = false>
     inline void gemvNonNibbleAVX512OrderedPartitions(
         const CPUNativeQuantisedPackedWeights &packed,
         const Q8_1Block *row,
@@ -4623,12 +4655,13 @@ namespace llaminar2::cpu::native_quantised
         int chunk,
         int K_blocks,
         int k_tiles,
-        int k_blocks_per_tile)
+        int k_blocks_per_tile,
+        int columns = 64)
     {
         if (packed.usesCompactMultiScale())
             return multi_scale::dispatchOrdered<16, 1>(
                 packed, {row}, {output}, chunk,
-                K_blocks, k_tiles, k_blocks_per_tile);
+                K_blocks, k_tiles, k_blocks_per_tile, Bounded ? columns : 64);
         alignas(64) float partial[64];
         for (int k_tile = 0; k_tile < k_tiles; ++k_tile)
         {
@@ -4643,8 +4676,8 @@ namespace llaminar2::cpu::native_quantised
                 kb_start,
                 kb_end,
                 /*accumulate=*/false);
-            foldOrderedAVX512Partition(
-                output, partial, k_tile == 0);
+            foldOrderedAVX512Partition<Bounded>(
+                output, partial, k_tile == 0, columns);
         }
     }
 
@@ -8447,214 +8480,79 @@ namespace llaminar2::cpu::native_quantised
                                 const Q8_1Block *input = descriptor.input ? descriptor.input : A_q8_all;
                                 const int n_start = chunk * 64;
                                 const int columns = std::min(64, descriptor.N - n_start);
-                                alignas(64) float tails[3][64];
-                                const auto destination = [&](int row_offset) {
-                                    return columns == 64 ? descriptor.outputRow(first_row + row_offset) + n_start
-                                        : tails[row_offset];
+                                const auto execute = [&]<bool Bounded>() {
+                                    dispatch_3row_native_avx512_ordered_partitions<Bounded>(packed,
+                                        input + static_cast<size_t>(first_row) * K_blocks,
+                                        input + static_cast<size_t>(first_row + 1) * K_blocks,
+                                        input + static_cast<size_t>(first_row + 2) * K_blocks,
+                                        descriptor.outputRow(first_row) + n_start,
+                                        descriptor.outputRow(first_row + 1) + n_start,
+                                        descriptor.outputRow(first_row + 2) + n_start,
+                                        chunk, K_blocks, plan.k_tiles, plan.k_blocks_per_tile,
+                                        decode_luts_512[static_cast<size_t>(projection)].value, columns);
                                 };
-                                dispatch_3row_native_avx512_ordered_partitions(packed,
-                                    input + static_cast<size_t>(first_row) * K_blocks,
-                                    input + static_cast<size_t>(first_row + 1) * K_blocks,
-                                    input + static_cast<size_t>(first_row + 2) * K_blocks,
-                                    destination(0), destination(1), destination(2), chunk,
-                                    K_blocks, plan.k_tiles, plan.k_blocks_per_tile,
-                                    decode_luts_512[static_cast<size_t>(projection)].value);
-                                if (columns != 64)
-                                    for (int row_offset = 0; row_offset < 3; ++row_offset)
-                                        std::memcpy(descriptor.outputRow(first_row + row_offset) + n_start,
-                                            tails[row_offset], static_cast<size_t>(columns) * sizeof(float));
+                                if (columns == 64)
+                                    execute.template operator()<false>();
+                                else
+                                    execute.template operator()<true>();
                                 continue;
                             }
                             if (tile_rows <= 2 && use_avx512 &&
                                 packed.numerical_policy ==
                                     CPUProjectionNumericalPolicy::GPUAlignedExpert)
                             {
-                                const Q8_1Block *projection_input =
-                                    descriptor.input
-                                        ? descriptor.input
-                                        : A_q8_all;
+                                const Q8_1Block *input = descriptor.input ? descriptor.input : A_q8_all;
+                                const Q8_1Block *row0 = input + static_cast<size_t>(first_row) * K_blocks;
                                 const int n_start = chunk * 64;
-                                const int n_columns = std::min(
-                                    64, descriptor.N - n_start);
-                                alignas(64) float tails[2][64];
-                                const auto destination_for = [&](int row_offset)
-                                {
-                                    const int row = first_row + row_offset;
-                                    return n_columns == 64
-                                        ? descriptor.outputRow(row) +
-                                              n_start
-                                        : tails[row_offset];
-                                };
-                                if (tile_rows == 2)
-                                {
-                                    const Q8_1Block *row0 = projection_input +
-                                        static_cast<size_t>(first_row) * K_blocks;
-                                    const Q8_1Block *row1 = projection_input +
-                                        static_cast<size_t>(first_row + 1) *
-                                            K_blocks;
-                                    const bool one_block_partitions =
-                                        MoEProjectionNumericalContract::
-                                            oneNativeQuantisedBlockPerOrderedPartition(
-                                                K_blocks *
-                                                MoEProjectionNumericalContract::
-                                                    native_quantised_values_per_block);
-                                    if (one_block_partitions)
+                                const int columns = std::min(64, descriptor.N - n_start);
+                                float *output0 = descriptor.outputRow(first_row) + n_start;
+                                const bool one_block_partitions =
+                                    MoEProjectionNumericalContract::oneNativeQuantisedBlockPerOrderedPartition(
+                                        K_blocks * MoEProjectionNumericalContract::native_quantised_values_per_block);
+                                const auto lut = decode_luts_512[static_cast<size_t>(projection)].value;
+                                const auto execute = [&]<bool Bounded>() {
+                                    if (tile_rows == 2)
                                     {
-                                        gemmTwoRowsAVX512OrderedPartitions(
-                                            packed,
-                                            row0,
-                                            row1,
-                                            destination_for(0),
-                                            destination_for(1),
-                                            chunk,
-                                            K_blocks,
-                                            plan.k_tiles,
-                                            plan.k_blocks_per_tile,
-                                            decode_luts_512[
-                                                static_cast<size_t>(projection)]
-                                                    .value);
+                                        const Q8_1Block *row1 = row0 + K_blocks;
+                                        float *output1 = descriptor.outputRow(first_row + 1) + n_start;
+                                        if (!one_block_partitions && packed.usesNibbleLUT())
+                                        {
+                                            // Two vector segments preserve the original ordered tree
+                                            // without keeping all 64 columns live in registers.
+                                            return dispatch_2row_native_avx512_ordered_partitions<Bounded>(
+                                                packed, row0, row1, output0, output1, chunk,
+                                                K_blocks, plan.k_tiles, plan.k_blocks_per_tile, lut, columns);
+                                        }
+                                        if (!one_block_partitions && packed.usesExpandedInt8())
+                                            return gemmTwoRowsExpandedAVX512OrderedPartitions<Bounded>(
+                                                packed, row0, row1, output0, output1, chunk,
+                                                K_blocks, plan.k_tiles, plan.k_blocks_per_tile, columns);
+                                        return gemmTwoRowsAVX512OrderedPartitions<Bounded>(
+                                            packed, row0, row1, output0, output1, chunk,
+                                            K_blocks, plan.k_tiles, plan.k_blocks_per_tile, lut, columns);
                                     }
-                                    else if (packed.usesNibbleLUT())
-                                    {
-                                        // Decoder and asymmetry are immutable prepared
-                                        // policy. The existing bounded two-row kernel
-                                        // owns their exact per-block publication and
-                                        // ordered K fold for every nibble encoding,
-                                        // including Q4_K/Q4_1 and non-linear IQ4.
-                                        // The generic 64-column kernel keeps enough
-                                        // simultaneous FP/INT vectors to spill live
-                                        // accumulators in optimized builds. The
-                                        // existing two-segment tile bounds that live
-                                        // state without changing any arithmetic.
-                                        dispatch_2row_native_avx512_ordered_partitions(
-                                            packed,
-                                            row0,
-                                            row1,
-                                            destination_for(0),
-                                            destination_for(1),
-                                            chunk,
-                                            K_blocks,
-                                            plan.k_tiles,
-                                            plan.k_blocks_per_tile,
-                                            decode_luts_512[
-                                                static_cast<size_t>(projection)]
-                                                    .value);
-                                    }
-                                    else if (packed.usesExpandedInt8())
-                                    {
-                                        gemmTwoRowsExpandedAVX512OrderedPartitions(
-                                            packed,
-                                            row0,
-                                            row1,
-                                            destination_for(0),
-                                            destination_for(1),
-                                            chunk,
-                                            K_blocks,
-                                            plan.k_tiles,
-                                            plan.k_blocks_per_tile);
-                                    }
-                                    else
-                                    {
-                                        gemmTwoRowsAVX512OrderedPartitions(
-                                            packed,
-                                            row0,
-                                            row1,
-                                            destination_for(0),
-                                            destination_for(1),
-                                            chunk,
-                                            K_blocks,
-                                            plan.k_tiles,
-                                            plan.k_blocks_per_tile,
-                                            decode_luts_512[
-                                                static_cast<size_t>(projection)]
-                                                    .value);
-                                    }
-                                }
-                                else
-                                {
-                                    const bool one_block_partitions =
-                                        MoEProjectionNumericalContract::
-                                            oneNativeQuantisedBlockPerOrderedPartition(
-                                                K_blocks *
-                                                MoEProjectionNumericalContract::
-                                                    native_quantised_values_per_block);
                                     if (one_block_partitions)
                                     {
                                         if (packed.usesNibbleLUT())
-                                        {
-                                            gemv_native_quantised_avx512_chunk_native(
-                                                packed,
-                                                projection_input +
-                                                    static_cast<size_t>(first_row) *
-                                                        K_blocks,
-                                                destination_for(0),
-                                                chunk,
-                                                0,
-                                                K_blocks,
-                                                decode_luts_512[
-                                                    static_cast<size_t>(projection)]
-                                                        .value,
-                                                /*accumulate=*/false);
-                                        }
-                                        else
-                                        {
-                                            gemv_native_quantised_avx512_chunk_non_nibble(
-                                                packed,
-                                                projection_input +
-                                                    static_cast<size_t>(first_row) *
-                                                        K_blocks,
-                                                destination_for(0),
-                                                chunk,
-                                                0,
-                                                K_blocks,
-                                                /*accumulate=*/false);
-                                        }
+                                            return gemv_native_quantised_avx512_chunk_native<Bounded>(
+                                                packed, row0, output0, chunk, 0, K_blocks, lut,
+                                                /*accumulate=*/false, columns);
+                                        return gemv_native_quantised_avx512_chunk_non_nibble<Bounded>(
+                                            packed, row0, output0, chunk, 0, K_blocks,
+                                            /*accumulate=*/false, columns);
                                     }
-                                    else if (packed.usesNibbleLUT())
-                                    {
-                                        dispatch_native_avx512_ordered_partitions(
-                                            packed,
-                                            projection_input +
-                                                static_cast<size_t>(first_row) *
-                                                    K_blocks,
-                                            destination_for(0),
-                                            chunk,
-                                            K_blocks,
-                                            plan.k_tiles,
-                                            plan.k_blocks_per_tile,
-                                            decode_luts_512[
-                                                static_cast<size_t>(projection)]
-                                                    .value);
-                                    }
-                                    else
-                                    {
-                                        gemvNonNibbleAVX512OrderedPartitions(
-                                            packed,
-                                            projection_input +
-                                                static_cast<size_t>(first_row) *
-                                                    K_blocks,
-                                            destination_for(0),
-                                            chunk,
-                                            K_blocks,
-                                            plan.k_tiles,
-                                            plan.k_blocks_per_tile);
-                                    }
-                                }
-                                if (n_columns != 64)
-                                {
-                                    for (int row_offset = 0;
-                                         row_offset < tile_rows;
-                                         ++row_offset)
-                                    {
-                                        const int row = first_row + row_offset;
-                                        std::memcpy(
-                                            descriptor.outputRow(row) +
-                                                n_start,
-                                            tails[row_offset],
-                                            static_cast<size_t>(n_columns) *
-                                                sizeof(float));
-                                    }
-                                }
+                                    if (packed.usesNibbleLUT())
+                                        return dispatch_native_avx512_ordered_partitions<Bounded>(
+                                            packed, row0, output0, chunk, K_blocks, plan.k_tiles,
+                                            plan.k_blocks_per_tile, lut, columns);
+                                    return gemvNonNibbleAVX512OrderedPartitions<Bounded>(
+                                        packed, row0, output0, chunk, K_blocks, plan.k_tiles,
+                                        plan.k_blocks_per_tile, columns);
+                                };
+                                if (columns == 64)
+                                    execute.template operator()<false>();
+                                else
+                                    execute.template operator()<true>();
                                 continue;
                             }
 #endif
@@ -8670,67 +8568,26 @@ namespace llaminar2::cpu::native_quantised
                                 packed_avx2.numerical_policy ==
                                     CPUProjectionNumericalPolicy::GPUAlignedExpert)
                             {
-                                const Q8_1Block *projection_input =
-                                    descriptor.input
-                                        ? descriptor.input
-                                        : A_q8_all;
+                                const Q8_1Block *input = descriptor.input ? descriptor.input : A_q8_all;
+                                const Q8_1Block *row0 = input + static_cast<size_t>(first_row) * K_blocks;
                                 const int n_start = chunk * 64;
-                                const int n_columns = std::min(
-                                    64, descriptor.N - n_start);
-                                alignas(32) float tails[2][64];
-                                const auto destination_for = [&](int row_offset)
-                                {
-                                    const int row = first_row + row_offset;
-                                    return n_columns == 64
-                                        ? descriptor.outputRow(row) +
-                                              n_start
-                                        : tails[row_offset];
+                                const int columns = std::min(64, descriptor.N - n_start);
+                                float *output0 = descriptor.outputRow(first_row) + n_start;
+                                const auto lut = decode_luts_256[static_cast<size_t>(projection)].value;
+                                const auto execute = [&]<bool Bounded>() {
+                                    if (tile_rows == 2)
+                                        return gemmTwoRowsAVX2OrderedPartitions<Bounded>(
+                                            packed_avx2, row0, row0 + K_blocks,
+                                            output0, descriptor.outputRow(first_row + 1) + n_start,
+                                            chunk, K_blocks, plan.k_tiles, plan.k_blocks_per_tile, lut, columns);
+                                    return gemvAVX2OrderedPartitions<Bounded>(packed_avx2,
+                                        row0, output0, chunk, K_blocks, plan.k_tiles,
+                                        plan.k_blocks_per_tile, lut, columns);
                                 };
-                                const Q8_1Block *row0 = projection_input +
-                                    static_cast<size_t>(first_row) * K_blocks;
-                                if (tile_rows == 2)
-                                {
-                                    gemmTwoRowsAVX2OrderedPartitions(
-                                        packed_avx2,
-                                        row0,
-                                        row0 + K_blocks,
-                                        destination_for(0),
-                                        destination_for(1),
-                                        chunk,
-                                        K_blocks,
-                                        plan.k_tiles,
-                                        plan.k_blocks_per_tile,
-                                        decode_luts_256[
-                                            static_cast<size_t>(projection)].value);
-                                }
+                                if (columns == 64)
+                                    execute.template operator()<false>();
                                 else
-                                {
-                                    gemvAVX2OrderedPartitions(
-                                        packed_avx2,
-                                        row0,
-                                        destination_for(0),
-                                        chunk,
-                                        K_blocks,
-                                        plan.k_tiles,
-                                        plan.k_blocks_per_tile,
-                                        decode_luts_256[
-                                            static_cast<size_t>(projection)].value);
-                                }
-                                if (n_columns != 64)
-                                {
-                                    for (int row_offset = 0;
-                                         row_offset < tile_rows;
-                                         ++row_offset)
-                                    {
-                                        const int row = first_row + row_offset;
-                                        std::memcpy(
-                                            descriptor.outputRow(row) +
-                                                n_start,
-                                            tails[row_offset],
-                                            static_cast<size_t>(n_columns) *
-                                                sizeof(float));
-                                    }
-                                }
+                                    execute.template operator()<true>();
                                 continue;
                             }
 

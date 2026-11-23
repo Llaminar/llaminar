@@ -1520,6 +1520,66 @@ namespace
     }
 
 #if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
+    /** @test The ordered grouped producer publishes bitwise serial values into strided live rows. */
+    TEST_F(CPUNativeQuantisedGemvTest, OrderedGroupedTailPublishesOnlyLiveColumnsAllFormats)
+    {
+        constexpr auto policy = CPUProjectionNumericalPolicy::GPUAlignedExpert;
+        constexpr float guard = -991.25f;
+        // AVX-512 WideRows owns one four-row tile followed by a three-row tile.
+        // Pairwise owns three pairs followed by one serial lane.
+        constexpr int rows = 7;
+        const bool use_avx512 = activeISALevel() >= ISALevel::AVX512;
+        const ScopedOMPThreadCount workers(1);
+        for (int inner : {512, 768, 2048})
+        {
+            const int blocks = inner / Q8_1Block::BLOCK_SIZE;
+            const auto input = TestTensorFactory::createFP32Random({rows, static_cast<size_t>(inner)},
+                -0.875f, 0.875f, 91811);
+            std::vector<Q8_1Block> activation(static_cast<size_t>(rows) * blocks);
+            quantize_activations_to_q8_1(input->data(), activation.data(), rows, inner, blocks, policy);
+            for (const auto &format : quantizedMoEVerifierFormats())
+            for (int columns : {1, 9, 17, 63, 65, 81, 127})
+            {
+                SCOPED_TRACE(format.label);
+                SCOPED_TRACE(inner);
+                SCOPED_TRACE(columns);
+                auto weights = format.create({static_cast<size_t>(columns), static_cast<size_t>(inner)}, 91813);
+                CPUNativeQuantisedGemmKernel kernel(weights.get(), 0, -1, policy);
+                ASSERT_TRUE(kernel.isValid());
+                const auto &packed = kernel.packedWeights();
+                std::vector<float> reference(static_cast<size_t>(rows) * columns);
+                llaminar2::test::NativeQuantisedTestPartialStorage serial_workspace(packed, 1);
+                for (int row = 0; row < rows; ++row)
+                    gemv_native_quantised_preq(packed, activation.data() + static_cast<size_t>(row) * blocks,
+                        reference.data() + static_cast<size_t>(row) * columns, serial_workspace.span(), ISAPath::AUTO);
+                const int stride = columns + 9;
+                std::vector<float> output(static_cast<size_t>(rows) * stride + 1, guard);
+                for (auto schedule : {VerifierRowsPolicy::Pairwise, VerifierRowsPolicy::WideRows})
+                {
+                    if (schedule == VerifierRowsPolicy::WideRows && !use_avx512)
+                        continue;
+                    SCOPED_TRACE(verifierRowsPolicyName(schedule));
+                    std::fill(output.begin(), output.end(), guard);
+                    const CPUNativeQuantisedGemmKernel::BatchedPrequantizedProjectionDesc descriptor{
+                        .kernel = &kernel, .input_q8 = activation.data(), .output = output.data() + 1,
+                        .rows = rows, .n = columns, .ldc = stride, .verifier_schedule = schedule};
+                    ASSERT_TRUE(CPUNativeQuantisedGemmKernel::multiply_batched_preq_decode_equivalent(
+                        &descriptor, 1, inner,
+                        llaminar2::test::NativeQuantisedTestPartialStorage(&descriptor, 1, rows).span()));
+                    EXPECT_EQ(output.front(), guard);
+                    for (int row = 0; row < rows; ++row)
+                    {
+                        const auto offset = 1 + static_cast<size_t>(row) * stride;
+                        EXPECT_EQ(std::memcmp(output.data() + offset,
+                            reference.data() + static_cast<size_t>(row) * columns, columns * sizeof(float)), 0);
+                        EXPECT_TRUE(std::all_of(output.begin() + offset + columns,
+                            output.begin() + offset + stride, [](float value) { return value == guard; }));
+                    }
+                }
+            }
+        }
+    }
+
     /** @test Live tail stores preserve the ordered fold and every adjacent destination byte. */
     TEST_F(CPUNativeQuantisedGemvTest, OrderedKTilePublicationWritesOnlyLiveColumns)
     {

@@ -748,22 +748,23 @@ namespace llaminar2::cpu::native_quantised
      * @param destination Running 64-column reduction.
      * @param partial Newly completed 64-column partition.
      * @param first_partition Whether @p partial initializes the reduction.
+     * @tparam Bounded Limit destination access to the live columns of the final panel.
+     * @param columns Live destination width when the panel is bounded.
      */
+    template<bool Bounded = false>
     inline void foldOrderedAVX2Partition(
         float *destination,
         const float *partial,
-        bool first_partition)
+        bool first_partition,
+        int columns = 64)
     {
-        for (int segment = 0; segment < 8; ++segment)
+        for (int segment = 0; segment < (Bounded ? (columns + 7) / 8 : 8); ++segment)
         {
             const __m256 value = _mm256_load_ps(partial + segment * 8);
-            _mm256_storeu_ps(
-                destination + segment * 8,
-                first_partition
-                    ? value
-                    : addOrderedAVX2(
-                          _mm256_loadu_ps(destination + segment * 8),
-                          value));
+            const int offset = segment * 8;
+            const auto sum = first_partition ? value : addOrderedAVX2(
+                readProjectionOutputVector<Bounded, 8, __m256>(destination, columns, offset, true), value);
+            publishProjectionOutputVector<Bounded, 8>(destination, columns, offset, sum);
         }
     }
 
@@ -782,7 +783,10 @@ namespace llaminar2::cpu::native_quantised
      * @param k_tiles Ordered K-partition count.
      * @param k_blocks_per_tile Consecutive blocks in one partition.
      * @param decode_lut Broadcast decoder for nibble formats.
+     * @tparam Bounded Limit destination access to the live columns of the final panel.
+     * @param columns Live destination width when the panel is bounded.
      */
+    template<bool Bounded = false>
     inline void gemvAVX2OrderedPartitions(
         const CPUNativeQuantisedPackedWeights &packed,
         const Q8_1Block *row,
@@ -791,7 +795,8 @@ namespace llaminar2::cpu::native_quantised
         int K_blocks,
         int k_tiles,
         int k_blocks_per_tile,
-        const __m256i decode_lut)
+        const __m256i decode_lut,
+        int columns = 64)
     {
         if (MoEProjectionNumericalContract::
                 oneNativeQuantisedBlockPerOrderedPartition(
@@ -801,7 +806,7 @@ namespace llaminar2::cpu::native_quantised
         {
             if (packed.usesNibbleLUT())
             {
-                gemv_avx2_chunk_native(
+                gemv_avx2_chunk_native<Bounded>(
                     packed,
                     row,
                     output,
@@ -809,25 +814,25 @@ namespace llaminar2::cpu::native_quantised
                     0,
                     K_blocks,
                     decode_lut,
-                    /*accumulate=*/false);
+                    /*accumulate=*/false, columns);
             }
             else
             {
-                gemv_avx2_chunk_non_nibble(
+                gemv_avx2_chunk_non_nibble<Bounded>(
                     packed,
                     row,
                     output,
                     chunk,
                     0,
                     K_blocks,
-                    /*accumulate=*/false);
+                    /*accumulate=*/false, columns);
             }
             return;
         }
 
         if (packed.usesNibbleLUT())
         {
-            for (int segment = 0; segment < 8; ++segment)
+            for (int segment = 0; segment < (Bounded ? (columns + 7) / 8 : 8); ++segment)
             {
                 __m256 reduced = _mm256_setzero_ps();
                 for (int k_tile = 0; k_tile < k_tiles; ++k_tile)
@@ -848,7 +853,7 @@ namespace llaminar2::cpu::native_quantised
                         ? partial
                         : addOrderedAVX2(reduced, partial);
                 }
-                _mm256_storeu_ps(output + segment * 8, reduced);
+                publishProjectionOutputVector<Bounded, 8>(output, columns, segment * 8, reduced);
             }
             return;
         }
@@ -867,8 +872,8 @@ namespace llaminar2::cpu::native_quantised
                 kb_start,
                 kb_end,
                 /*accumulate=*/false);
-            foldOrderedAVX2Partition(
-                output, partial, k_tile == 0);
+            foldOrderedAVX2Partition<Bounded>(
+                output, partial, k_tile == 0, columns);
         }
     }
 
@@ -889,7 +894,10 @@ namespace llaminar2::cpu::native_quantised
      * @param k_tiles Ordered K-partition count.
      * @param k_blocks_per_tile Consecutive blocks in one partition.
      * @param decode_lut Broadcast decoder for nibble formats.
+     * @tparam Bounded Limit destination access to the live columns of the final panel.
+     * @param columns Live destination width when the panel is bounded.
      */
+    template<bool Bounded = false>
     inline void gemmTwoRowsAVX2OrderedPartitions(
         const CPUNativeQuantisedPackedWeights &packed,
         const Q8_1Block *row0,
@@ -900,7 +908,8 @@ namespace llaminar2::cpu::native_quantised
         int K_blocks,
         int k_tiles,
         int k_blocks_per_tile,
-        const __m256i decode_lut)
+        const __m256i decode_lut,
+        int columns = 64)
     {
         if (MoEProjectionNumericalContract::
                 oneNativeQuantisedBlockPerOrderedPartition(
@@ -910,7 +919,7 @@ namespace llaminar2::cpu::native_quantised
         {
             if (packed.usesNibbleLUT())
             {
-                gemm_2row_native_chunk_avx2(
+                gemm_2row_native_chunk_avx2<Bounded>(
                     packed,
                     row0,
                     row1,
@@ -920,11 +929,11 @@ namespace llaminar2::cpu::native_quantised
                     0,
                     K_blocks,
                     decode_lut,
-                    /*accumulate=*/false);
+                    /*accumulate=*/false, columns);
             }
             else
             {
-                gemm_2row_non_nibble_chunk_avx2(
+                gemm_2row_non_nibble_chunk_avx2<false, Bounded>(
                     packed,
                     row0,
                     row1,
@@ -933,14 +942,14 @@ namespace llaminar2::cpu::native_quantised
                     chunk,
                     0,
                     K_blocks,
-                    /*accumulate=*/false);
+                    /*accumulate=*/false, columns);
             }
             return;
         }
 
         if (packed.usesNibbleLUT())
         {
-            for (int segment = 0; segment < 8; ++segment)
+            for (int segment = 0; segment < (Bounded ? (columns + 7) / 8 : 8); ++segment)
             {
                 __m256 reduced0 = _mm256_setzero_ps();
                 __m256 reduced1 = _mm256_setzero_ps();
@@ -973,8 +982,8 @@ namespace llaminar2::cpu::native_quantised
                         reduced1 = addOrderedAVX2(reduced1, partial1);
                     }
                 }
-                _mm256_storeu_ps(output0 + segment * 8, reduced0);
-                _mm256_storeu_ps(output1 + segment * 8, reduced1);
+                publishProjectionOutputVector<Bounded, 8>(output0, columns, segment * 8, reduced0);
+                publishProjectionOutputVector<Bounded, 8>(output1, columns, segment * 8, reduced1);
             }
             return;
         }
@@ -996,10 +1005,10 @@ namespace llaminar2::cpu::native_quantised
                 kb_start,
                 kb_end,
                 /*accumulate=*/false);
-            foldOrderedAVX2Partition(
-                output0, partial0, k_tile == 0);
-            foldOrderedAVX2Partition(
-                output1, partial1, k_tile == 0);
+            foldOrderedAVX2Partition<Bounded>(
+                output0, partial0, k_tile == 0, columns);
+            foldOrderedAVX2Partition<Bounded>(
+                output1, partial1, k_tile == 0, columns);
         }
     }
 
