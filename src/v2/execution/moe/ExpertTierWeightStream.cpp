@@ -1329,7 +1329,9 @@ namespace llaminar2
                         destination[byte] = cpu.native_interleaved[
                             interleavedValueOffset(cpu, n, kb, byte)];
                     output.scales[linear] = cpu.chunkScales(n / 64, kb)[n % 64];
-                    output.mins[linear] = cpu.chunkMins(n / 64, kb)[n % 64];
+                    // Single-scale units (IQ3_XXS/IQ2_XXS) own no secondary plane.
+                    if (!output.mins.empty())
+                        output.mins[linear] = cpu.chunkMins(n / 64, kb)[n % 64];
                     if (gpu_emins)
                         output.emins[linear] = cpu.chunkEffectiveMins(n / 64, kb)[n % 64];
                     continue;
@@ -1539,7 +1541,10 @@ namespace llaminar2
                             interleavedValueOffset(output, n, kb, byte)] = source[byte];
                     uint8_t *const metadata = interleaved.data() + unit + output.data_stride;
                     std::memcpy(metadata + local_column * 2, &gpu.scales[linear], 2);
-                    std::memcpy(metadata + 128 + local_column * 2, &gpu.mins[linear], 2);
+                    // Single-scale units keep the reserved secondary vector zero,
+                    // matching the CUDA/ROCm demotion kernels.
+                    if (gpu.is_asymmetric)
+                        std::memcpy(metadata + 128 + local_column * 2, &gpu.mins[linear], 2);
                     if (gpu.has_emins)
                         std::memcpy(metadata + 256 + local_column * 4, &gpu.emins[linear], 4);
                     continue;

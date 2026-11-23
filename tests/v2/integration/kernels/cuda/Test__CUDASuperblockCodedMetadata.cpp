@@ -20,6 +20,7 @@
  */
 #include <gtest/gtest.h>
 
+#include "backends/cuda/CUDAHardwareMetadata.h"
 #include "kernels/common/NativeQuantisedScaleLoad.h"
 #include "kernels/cuda/gemm/CUDADeviceWorkspace.h"
 #include "kernels/common/DeviceRowRange.h"
@@ -128,6 +129,8 @@ namespace llaminar2::test
             if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0)
                 GTEST_SKIP() << "No CUDA device: unqualified";
             checked(cudaSetDevice(0));
+            // Dispatch reads admitted physical facts (SM count, limits).
+            llaminar2::initializeCUDAHardwareMetadata();
             ASSERT_TRUE(cudaNativeQuantisedInitIQGridTables_tuned());
             checked(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
         }
