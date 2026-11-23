@@ -675,16 +675,13 @@ namespace llaminar2
                         // store superblock-coded metadata (same predicate as the pool).
                         const bool coded = gpuPreparedSuperblockCoded(
                             *format, GPUPreparedWeightPoolLayout::SourceNative, device);
-                        // An equal contiguous input-axis split whose width is a
-                        // whole number of 256-value superblocks starts every
-                        // shard on a superblock boundary (phase 0); any other
-                        // column subset is priced at the worst phase.
-                        const size_t source_k = static_cast<size_t>(t.K);
-                        const bool superblock_aligned_split =
-                            columns == source_k ||
-                            (columns % 256u == 0 && source_k % columns == 0);
+                        // The shard geometry carries no source column origin:
+                        // unequal TP assignments are only 32-aligned, so a
+                        // superblock-wide slice may still start mid-superblock.
+                        // Any column subset is therefore priced at the worst
+                        // superblock phase (at most one extra word per row).
                         device_size = exactGpuPackedMatrixBytes(rows, columns, *format, coded,
-                                                                superblock_aligned_split);
+                                                                columns == static_cast<size_t>(t.K));
                     }
                     else
                     {
