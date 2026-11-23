@@ -107,10 +107,12 @@ namespace llaminar2::cpu::native_quantised
     {
         switch (codebook_id)
         {
+        case 7: return 20;   // Q5_K: 16 low-nibble bytes + 4 B/column in group-major bitplanes.
         case 9: case 12: return 12;  // Q3_K, IQ3_XXS
         case 13: case 14: return 9;  // IQ2_S, IQ2_XS
         case 10: case 15: return 8;  // Q2_K, IQ2_XXS
         case 16: case 17: return 6;  // IQ1_S, IQ1_M
+        case 11: return 32;  // IQ3_S signed grid retained for the fast dot; only metadata is coded.
         default: return 0;
         }
     }
@@ -121,10 +123,12 @@ namespace llaminar2::cpu::native_quantised
      * Whole 32-bit payload words are stored as `[word][64 columns]` (256 bytes
      * per word, as before); the remaining 1 or 2 bytes form one narrower
      * plane `[64 columns][tail]` that loads zero-extended into the same lane.
+     * Q5_K has four whole low-nibble words; its remaining 256 bytes are eight
+     * 32-byte high-bit planes, not a fifth word or a column-tail plane.
      */
     [[nodiscard]] constexpr std::uint32_t preparedCompactPayloadWords(int codebook_id) noexcept
     {
-        return preparedCompactPayloadBytes(codebook_id) / 4u;
+        return codebook_id == 7 ? 4u : preparedCompactPayloadBytes(codebook_id) / 4u;
     }
     /** @return Bytes per column of the narrower payload tail plane (0, 1 or 2). */
     [[nodiscard]] constexpr std::uint32_t preparedCompactPayloadTailBytes(int codebook_id) noexcept
@@ -185,7 +189,7 @@ namespace llaminar2::cpu::native_quantised
 
     /**
      * @brief Header bytes after each 64-column superblock unit (0 for per-block encodings).
-     * @return 64 columns x the superblock word (`d`, or `d | dmin << 16` for Q2_K).
+     * @return 64 columns x the superblock word (`d`, or `d | dmin << 16` for Q2_K and Q5_K).
      */
     [[nodiscard]] constexpr std::uint32_t preparedSuperblockHeaderBytes(
         CPUNativeQuantisedEncoding encoding, int codebook_id) noexcept
@@ -238,6 +242,12 @@ namespace llaminar2::cpu::native_quantised
         {
             return header_bytes && (block + 1 == blocks_per_row || (block + phase) % 8 == 7);
         }
+        /** @return Exclusive logical end of the source superblock serving @p block, including a ragged tail. */
+        [[nodiscard]] constexpr std::size_t superblockEnd(std::size_t block) const noexcept
+        {
+            const std::size_t end = ((block + phase) / 8 + 1) * 8 - phase;
+            return end < blocks_per_row ? end : blocks_per_row;
+        }
         /** @return Offset of the header serving block @p block of chunk row @p chunk. */
         [[nodiscard]] constexpr std::size_t headerOffset(std::size_t chunk, std::size_t block) const noexcept
         {
@@ -269,7 +279,7 @@ namespace llaminar2::cpu::native_quantised
         case CPUNativeQuantisedEncoding::NibbleLUTSourceScale:
             return 1024;
         case CPUNativeQuantisedEncoding::CompactMultiScale:
-            return preparedCompactPayloadWords(codebook_id) * 256u + preparedCompactPayloadTailBytes(codebook_id) * 64u;
+            return preparedCompactPayloadBytes(codebook_id) * 64u;
         case CPUNativeQuantisedEncoding::ExpandedInt8:
         case CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale:
             return 2048;

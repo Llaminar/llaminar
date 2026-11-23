@@ -89,6 +89,14 @@ namespace llaminar2::cpu::native_quantised
             return device_fp32_contract::multiply(device_fp32_contract::multiply(base,
                 0.5f + static_cast<float>(native_quantised_iq2s_scale::low(secondary))), 0.25f);
         }
+        if (encoding == CPUNativeQuantisedEncoding::CompactMultiScale && codebook == 11)
+        {
+            if (!native_quantised_iq3s_scale::valid(secondary))
+                throw std::invalid_argument("IQ3_S coefficient contains reserved bits");
+            // Exactly the IQ3SExpandedSourceScale source-tuple factor: d * (2*nibble+1).
+            return device_fp32_contract::multiply(base,
+                static_cast<float>(native_quantised_iq3s_scale::coefficient(secondary)));
+        }
         return base;
     }
 
@@ -117,6 +125,9 @@ namespace llaminar2::cpu::native_quantised
             return device_fp32_contract::multiply(device_fp32_contract::multiply(fp16_to_fp32(primary),
                 0.5f + static_cast<float>(native_quantised_iq2s_scale::high(secondary))), 0.25f);
         }
+        // IQ3_S is single-source-scale: it carries no additive minimum plane.
+        if (encoding == CPUNativeQuantisedEncoding::CompactMultiScale && codebook == 11)
+            return 0.0f;
         return fp16_to_fp32(secondary);
     }
 

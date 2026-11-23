@@ -49,13 +49,11 @@ namespace llaminar2::cpu::native_quantised
     {
         if (rotation_enabled)
             return CPUNativeQuantisedEncoding::ExpandedInt8;
-        if (codebook_id == 11)
-            return CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale;
         if (is_nibble_lut_format(codebook_id))
             return CPUNativeQuantisedEncoding::NibbleLUT;
         if (codebook_id == 8)
             return CPUNativeQuantisedEncoding::Q6KNativeDualScale;
-        if (hasCompactMultiScaleVnniPayload(codebook_id))
+        if (codebook_id == 11 || hasCompactMultiScaleVnniPayload(codebook_id))
             return CPUNativeQuantisedEncoding::CompactMultiScale;
         return CPUNativeQuantisedEncoding::ExpandedInt8;
     }
@@ -70,6 +68,8 @@ namespace llaminar2::cpu::native_quantised
     {
         if (!rotation_enabled && source.codebook_id == 4 && source.is_superblock)
             return CPUNativeQuantisedEncoding::NibbleLUTSourceScale;
+        if (!rotation_enabled && source.codebook_id == 7 && source.is_superblock)
+            return CPUNativeQuantisedEncoding::CompactMultiScale;
         return preparedEncodingForCodebook(source.codebook_id, rotation_enabled);
     }
 
@@ -113,7 +113,9 @@ namespace llaminar2::cpu::native_quantised
         result.encoding = preparedEncodingForSource(source, rotation_enabled);
         result.weight_bytes_per_n_chunk_k_block = preparedInterleavedBlockStride(result.encoding, result.is_asymmetric, source.codebook_id);
         if (result.encoding == CPUNativeQuantisedEncoding::Q6KNativeDualScale ||
-            result.encoding == CPUNativeQuantisedEncoding::NibbleLUTSourceScale)
+            result.encoding == CPUNativeQuantisedEncoding::NibbleLUTSourceScale ||
+            (result.encoding == CPUNativeQuantisedEncoding::CompactMultiScale &&
+             (source.codebook_id == 7 || source.codebook_id == 11)))
             result.weight_bytes_per_n_chunk_k_block += preparedSuperblockHeaderBytes(result.encoding, source.codebook_id) / 8u;
         return result;
     }

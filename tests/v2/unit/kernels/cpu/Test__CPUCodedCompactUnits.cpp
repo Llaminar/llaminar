@@ -2,9 +2,9 @@
  * @file Test__CPUCodedCompactUnits.cpp
  * @brief Superblock-coded compact CPU units: exact size, exact metadata, exact outputs.
  *
- * Compact multi-scale CPU units (Q3_K, Q2_K, IQ3_XXS, IQ2_S, IQ2_XS, IQ2_XXS,
- * IQ1_S, IQ1_M) store the source payload at its exact width, the source
- * scale code at its exact width and one `d`/`dmin` word per (column, source
+ * Compact multi-scale CPU units (Q5_K, Q3_K, Q2_K, IQ3_S, IQ3_XXS, IQ2_S, IQ2_XS, IQ2_XXS,
+ * IQ1_S, IQ1_M) store the exact source codes and payload (IQ3_S keeps expanded
+ * signed grid bytes) and one `d`/`dmin` word per (column, source
  * superblock). This suite proves, device-free and on the build's native ISA
  * (NEON, AVX2 or AVX-512):
  *
@@ -18,21 +18,26 @@
  *   compilers may fold `-dmin * c` into `dmin * -c`, so a NaN result only
  *   has to be a NaN; every other result is compared bit for bit);
  * - a prepared matrix occupies exactly the GGUF bytes of its 64-padded
- *   columns, nothing else;
+ *   columns, plus the explicit signed grid expansion for IQ3_S;
  * - the production SIMD projection equals the scalar codec reference for
- *   1..4 rows, a ragged final column chunk and every compact format.
+ *   1..4 rows, ragged N/K tails and both contiguous and ordered K reductions.
  */
 #include <gtest/gtest.h>
 
 #include "../../../utils/TestTensorFactory.h"
+#include "kernels/common/MoEProjectionNumericalContract.h"
 #include "kernels/cpu/gemm/CPUNativeQuantisedCodedMetadata.h"
 #include "kernels/cpu/gemm/CPUNativeQuantisedMultiScaleKernels.h"
 #include "kernels/cpu/gemm/CPUNativeQuantisedWeightPacker.h"
+#if defined(__aarch64__)
+#include "kernels/cpu/gemm/CPUNativeNEONPreparedProjection.h"
+#endif
 #include "tensors/NativeQuantisedSuperblockMetadata.h"
 
 #include <array>
 #include <bit>
 #include <cstdint>
+#include <cmath>
 #include <cstring>
 #include <functional>
 #include <memory>
@@ -89,15 +94,28 @@ namespace llaminar2::test
         {
             std::string name;
             std::uint8_t codebook = 0;
-            double file_bytes_per_32 = 0;
+            double prepared_bytes_per_32 = 0;
             std::function<std::unique_ptr<TensorBase>(const std::vector<size_t> &, uint32_t)> make;
         };
 
         std::vector<CompactSource> compactSources()
         {
             return {
+                {"Q5_K", 7, 22.0, [](auto s, auto r) {
+                    const auto tensor = Factory::createQ5_KRandom(s, r);
+                    const size_t blocks = s[0] * ((s[1] + 255) / 256);
+                    std::vector<uint8_t> bytes(blocks * sizeof(Q5_KBlock));
+                    for (size_t i = 0; i < blocks; ++i)
+                    {
+                        auto block = tensor->typed_data()[i];
+                        block.dmin = static_cast<uint16_t>(0x1800 + i % 0x1300);
+                        std::memcpy(bytes.data() + i * sizeof(block), &block, sizeof(block));
+                    }
+                    return std::make_unique<Q5_KTensor>(s, bytes);
+                }},
                 {"Q3_K", 9, 13.75, [](auto s, auto r) { return Factory::createQ3_KRandom(s, r); }},
                 {"Q2_K", 10, 10.5, [](auto s, auto r) { return Factory::createQ2_KRandom(s, r); }},
+                {"IQ3_S", 11, 32.75, [](auto s, auto r) { return Factory::createIQ3_SRandom(s, r); }},
                 {"IQ3_XXS", 12, 12.25, [](auto s, auto r) { return Factory::createIQ3_XXSRandom(s, r); }},
                 {"IQ2_S", 13, 10.25, [](auto s, auto r) { return Factory::createIQ2_SRandom(s, r); }},
                 {"IQ2_XS", 14, 9.25, [](auto s, auto r) { return Factory::createIQ2_XSRandom(s, r); }},
@@ -105,6 +123,38 @@ namespace llaminar2::test
                 {"IQ1_S", 16, 6.25, [](auto s, auto r) { return Factory::createIQ1_SRandom(s, r); }},
                 {"IQ1_M", 17, 7.0, [](auto s, auto r) { return Factory::createIQ1_MRandom(s, r); }},
             };
+        }
+
+        /** @brief One block's original per-block publication and explicit FP32 accumulation. */
+        float expandedReferenceBlock(const IINT8Unpackable &source,
+            const Q8_1Block &activation, int k, int column, int kb,
+            CPUProjectionNumericalPolicy policy, float acc)
+        {
+            const auto &format = *source.vnniFormatInfo();
+            uint8_t payload[20];
+            uint16_t scale = 0, minimum = 0;
+            source.packVnniBlock({.N = 1, .K = k, .blocks_per_row = (k + 31) / 32,
+                .payload_bytes = format.payload_bytes, .payload_array = payload,
+                .scales_array = &scale, .mins_array = &minimum,
+                .destination_block_origin = kb, .destination_block_count = 1}, column, 0, kb);
+            int8_t values[32];
+            decode_native_block(format.codebook_id, payload, values);
+            int dot = 0;
+            for (int i = 0; i < 32; ++i)
+                dot += int(values[i]) * activation.qs[i];
+            using device_fp32_contract::multiply;
+            using device_fp32_contract::add;
+            const bool iq = format.codebook_id == 11;
+            const float weight = iq ? multiply(fp16_to_fp32(scale), float(2 * minimum + 1)) : fp16_to_fp32(scale);
+            const float a = nativeQuantisedFP16ScaleToFP32(activation.d);
+            const float combined = multiply(a, weight);
+            if (policy == CPUProjectionNumericalPolicy::BackendNative)
+            {
+                const float value = std::fma(float(dot), combined, acc);
+                return iq ? value : std::fma(multiply(a, float(activation.sum_qs)), fp16_to_fp32(minimum), value);
+            }
+            const float value = multiply(combined, float(dot));
+            return add(acc, iq ? value : add(value, multiply(multiply(a, fp16_to_fp32(minimum)), float(activation.sum_qs))));
         }
 
         /** @return Interesting binary16 words: zeros, subnormals, normals of both signs, extremes, inf, NaN. */
@@ -166,7 +216,7 @@ namespace llaminar2::test
     TEST(CPUCodedCompactUnits, SimdCodeReadersEqualScalarPlaneReaders)
     {
         std::mt19937 rng(5);
-        for (std::uint8_t codebook : {9, 10, 11, 13, 17})
+        for (std::uint8_t codebook : {7, 9, 10, 11, 13, 17})
         {
             std::vector<std::uint8_t> planes(coded_metadata::codeBlockBytes(codebook) + 16, 0);
             std::vector<std::uint32_t> expected(64);
@@ -182,6 +232,7 @@ namespace llaminar2::test
                 I code{};
                 switch (codebook)
                 {
+                case 7: code = L::code<7>(planes.data(), column); break;
                 case 9: code = L::code<9>(planes.data(), column); break;
                 case 10: code = L::code<10>(planes.data(), column); break;
                 case 11: code = L::code<11>(planes.data(), column); break;
@@ -198,6 +249,7 @@ namespace llaminar2::test
     /** SIMD reconstruction equals widening the codec's staged words for every derived-scale compact format. */
     TEST(CPUCodedCompactUnits, SimdReconstructionEqualsCodecWordsExhaustively)
     {
+        expectReconstructionMatchesCodec<7>();
         expectReconstructionMatchesCodec<9>();
         expectReconstructionMatchesCodec<10>();
         expectReconstructionMatchesCodec<12>();
@@ -205,10 +257,18 @@ namespace llaminar2::test
         expectReconstructionMatchesCodec<15>();
         expectReconstructionMatchesCodec<16>();
         expectReconstructionMatchesCodec<17>();
+        for (const auto d : halfSweep())
+            for (unsigned code = 0; code < 16; ++code)
+            {
+                const auto input = sb::decodeSuperblockMetadata<11>(code, d);
+                const auto factor = multi_scale::iq3sSourceScale<Ops>(I{} + int(code), I{} + int(d));
+                const auto expected = device_fp32_contract::multiply(fp16_to_fp32(input.primary), float(2 * input.secondary + 1));
+                ASSERT_PRED2(sameFactor, laneBits(factor, 0), std::bit_cast<uint32_t>(expected));
+            }
     }
 
-    /** A prepared compact matrix holds exactly the file bytes of its 64-padded columns. */
-    TEST(CPUCodedCompactUnits, PreparedBytesEqualFileDensity)
+    /** Compact matrices retain file density except IQ3_S's explicitly expanded signed grid. */
+    TEST(CPUCodedCompactUnits, PreparedBytesEqualFileDensityWithIQ3SSignedGrid)
     {
         for (const auto &source : compactSources())
         {
@@ -217,18 +277,28 @@ namespace llaminar2::test
             CPUNativeQuantisedPackedWeights packed;
             ASSERT_TRUE(packWeightsCPUNativeQuantised(tensor.get(), packed));
             ASSERT_TRUE(packed.usesCompactMultiScale());
-            const double file = source.file_bytes_per_32 * 128.0 * (1024 / 32);
-            EXPECT_EQ(static_cast<double>(packed.native_interleaved.size()), file);
+            const double bytes = source.prepared_bytes_per_32 * 128.0 * (1024 / 32);
+            EXPECT_EQ(static_cast<double>(packed.native_interleaved.size()), bytes);
             EXPECT_EQ(packed.preparedBytes(), packed.native_interleaved.size());
             EXPECT_EQ(static_cast<double>(packed.preparedFootprint().weight_bytes_per_n_chunk_k_block),
-                      source.file_bytes_per_32 * 64.0);
+                      source.prepared_bytes_per_32 * 64.0);
+            if (source.codebook == 7 || source.codebook == 11)
+                EXPECT_EQ(preparedFootprintForFormat(*native_quantised_formats::forSourceIdentity(source.codebook, true))
+                              .weight_bytes_per_n_chunk_k_block, source.prepared_bytes_per_32 * 64.0);
         }
+        EXPECT_EQ(preparedEncodingForSource(native_quantised_formats::Q5_1), CPUNativeQuantisedEncoding::ExpandedInt8);
+        EXPECT_EQ(preparedEncodingForSource(native_quantised_formats::Q5_K, true), CPUNativeQuantisedEncoding::ExpandedInt8);
+        EXPECT_EQ(preparedEncodingForSource(native_quantised_formats::IQ3_S, true), CPUNativeQuantisedEncoding::ExpandedInt8);
     }
 
     /** The production SIMD projection equals the scalar codec reference for every compact format. */
     TEST(CPUCodedCompactUnits, SimdProjectionEqualsScalarCodecReference)
     {
-        constexpr int kN = 67, kK = 512, kBlocks = kK / 32;
+        constexpr int kN = 67, kK = 544, kBlocks = kK / 32;
+        constexpr int kPartitions = MoEProjectionNumericalContract::orderedKPartitionsForWidth(kK);
+        constexpr int kBlocksPerPartition = (kBlocks + kPartitions - 1) / kPartitions;
+        static_assert(kBlocks % sb::kBlocksPerSuperblock != 0);
+        static_assert(kBlocksPerPartition > 1 && kBlocks % kBlocksPerPartition != 0);
         std::mt19937 rng(11);
         std::array<std::vector<Q8_1Block>, 4> activation;
         for (auto &row : activation)
@@ -252,18 +322,31 @@ namespace llaminar2::test
             const auto tensor = source.make({static_cast<size_t>(kN), static_cast<size_t>(kK)}, 23u + source.codebook);
             CPUNativeQuantisedPackedWeights packed;
             ASSERT_TRUE(packWeightsCPUNativeQuantised(tensor.get(), packed));
+            packed.numerical_policy = CPUProjectionNumericalPolicy::GPUAlignedExpert;
             const auto view = packed.readView();
             for (int chunk = 0; chunk < packed.N_padded / 64; ++chunk)
             {
                 const int columns = std::min(64, kN - chunk * 64);
-                std::array<std::array<float, 64>, 4> actual{}, expected{};
+                std::array<std::array<float, 64>, 4> actual{}, expected{}, expected_ordered{};
                 for (int row = 0; row < 4; ++row)
                     for (int column = 0; column < columns; ++column)
                     {
-                        float acc = 0.0f;
-                        for (int kb = 0; kb < kBlocks; ++kb)
-                            acc += multi_scale::scalarReferenceBlock(view, activation[row][kb], chunk, kb, column);
+                        float acc = 0.0f, reduced = 0.0f;
+                        for (int partition = 0; partition < kPartitions; ++partition)
+                        {
+                            float partial = 0.0f;
+                            for (int kb = partition * kBlocksPerPartition;
+                                 kb < std::min(kBlocks, (partition + 1) * kBlocksPerPartition); ++kb)
+                            {
+                                const float contribution = multi_scale::scalarReferenceBlock(
+                                    view, activation[row][kb], chunk, kb, column);
+                                acc += contribution;
+                                partial += contribution;
+                            }
+                            reduced = partition == 0 ? partial : reduced + partial;
+                        }
                         expected[row][column] = acc;
+                        expected_ordered[row][column] = reduced;
                     }
                 const auto run = [&]<std::size_t Rows>() {
                     std::array<const Q8_1Block *, Rows> input;
@@ -274,18 +357,118 @@ namespace llaminar2::test
                         output[row] = actual[row].data();
                         actual[row].fill(-1.0f);
                     }
-                    multi_scale::dispatch<kLanes, Rows, Ops>(view, input, output, chunk, 0, kBlocks, false,
-                                                             kLanes == 4 ? columns : 64);
-                    for (std::size_t row = 0; row < Rows; ++row)
-                        for (int column = 0; column < columns; ++column)
-                            ASSERT_EQ(std::bit_cast<std::uint32_t>(actual[row][column]),
-                                      std::bit_cast<std::uint32_t>(expected[row][column]))
-                                << "rows=" << Rows << " row=" << row << " column=" << chunk * 64 + column;
+                    const auto compare = [&](const auto &reference) {
+                        for (std::size_t row = 0; row < Rows; ++row)
+                            for (int column = 0; column < columns; ++column)
+                                ASSERT_EQ(std::bit_cast<std::uint32_t>(actual[row][column]),
+                                          std::bit_cast<std::uint32_t>(reference[row][column]))
+                                    << "rows=" << Rows << " row=" << row << " column=" << chunk * 64 + column;
+                    };
+                    const int live = kLanes == 4 ? columns : 64;
+                    multi_scale::dispatch<kLanes, Rows, Ops>(view, input, output, chunk, 0, kBlocks, false, live);
+                    compare(expected);
+                    multi_scale::dispatchOrdered<kLanes, Rows, Ops>(view, input, output, chunk, kBlocks,
+                                                                   kPartitions, kBlocksPerPartition, live);
+                    compare(expected_ordered);
                 };
                 run.template operator()<1>();
                 run.template operator()<2>();
                 run.template operator()<3>();
                 run.template operator()<4>();
+            }
+        }
+    }
+
+    /** Both CPU arithmetic contracts stay byte-identical to the prior expanded CPU publication. */
+    TEST(CPUCodedCompactUnits, Q5KIQ3SPreserveExpandedOutputs)
+    {
+        constexpr int n = 67, k = 544, blocks = k / 32;
+        constexpr int partitions = MoEProjectionNumericalContract::orderedKPartitionsForWidth(k);
+        std::mt19937 rng(1493);
+        std::array<std::array<Q8_1Block, blocks>, 4> activation{};
+        for (auto &row : activation)
+            for (auto &a : row)
+            {
+                a.d = static_cast<uint16_t>(0x2000 + rng() % 0x1800);
+                for (auto &q : a.qs)
+                {
+                    q = static_cast<int8_t>(int(rng() % 255) - 127);
+                    a.sum_qs += q;
+                }
+            }
+        for (const auto &format : compactSources())
+        {
+            if (format.codebook != 7 && format.codebook != 11)
+                continue;
+            SCOPED_TRACE(format.name);
+            const auto source = format.make({n, k}, 37);
+            const auto &unpackable = dynamic_cast<const IINT8Unpackable &>(*source);
+            for (const auto policy : {CPUProjectionNumericalPolicy::BackendNative, CPUProjectionNumericalPolicy::GPUAlignedExpert})
+            {
+                SCOPED_TRACE(static_cast<int>(policy));
+                CPUNativeQuantisedPackedWeights packed;
+                packed.numerical_policy = policy;
+                ASSERT_TRUE(packWeightsCPUNativeQuantised(source.get(), packed));
+                const auto view = packed.readView();
+                const bool ordered = policy == CPUProjectionNumericalPolicy::GPUAlignedExpert;
+                const int parts = ordered ? partitions : 1;
+                const int blocks_per_part = (blocks + parts - 1) / parts;
+                for (int chunk = 0; chunk < 2; ++chunk)
+                {
+                    const int columns = std::min(64, n - chunk * 64);
+                    const auto run = [&]<size_t Rows>() {
+                        std::array<std::array<float, 64>, Rows> actual{};
+#if defined(__aarch64__)
+                        std::array<std::span<const Q8_1Block>, Rows> input;
+                        std::array<std::span<float>, Rows> output;
+                        for (size_t r = 0; r < Rows; ++r)
+                        {
+                            input[r] = activation[r];
+                            output[r] = std::span(actual[r]).first(columns);
+                        }
+                        const auto tile = CPUNativeNEONProjectionTile<Rows>::bind(view, input, output, chunk);
+#if defined(__ARM_FEATURE_MATMUL_INT8)
+                        tile.template execute<multi_scale::NEONByteDot::I8MM>();
+#elif defined(__ARM_FEATURE_DOTPROD)
+                        tile.template execute<multi_scale::NEONByteDot::DotProd>();
+#else
+                        tile.template execute<>();
+#endif
+#else
+                        std::array<const Q8_1Block *, Rows> input;
+                        std::array<float *, Rows> output;
+                        for (size_t r = 0; r < Rows; ++r)
+                        {
+                            input[r] = activation[r].data();
+                            output[r] = actual[r].data();
+                        }
+                        if (ordered)
+                            multi_scale::dispatchOrdered<kLanes, Rows, Ops>(view, input, output, chunk,
+                                blocks, parts, blocks_per_part);
+                        else
+                            multi_scale::dispatch<kLanes, Rows, Ops>(view, input, output, chunk, 0, blocks, false);
+#endif
+                        for (size_t row = 0; row < Rows; ++row)
+                            for (int column = 0; column < columns; ++column)
+                            {
+                                float expected = 0.0f;
+                                for (int p = 0; p < parts; ++p)
+                                {
+                                    float partial = 0.0f;
+                                    for (int kb = p * blocks_per_part; kb < std::min(blocks, (p + 1) * blocks_per_part); ++kb)
+                                        partial = expandedReferenceBlock(unpackable, activation[row][kb], k, chunk * 64 + column,
+                                            kb, policy, partial);
+                                    expected = p == 0 ? partial : expected + partial;
+                                }
+                                ASSERT_EQ(std::bit_cast<uint32_t>(actual[row][column]), std::bit_cast<uint32_t>(expected))
+                                    << "rows=" << Rows << " row=" << row << " column=" << chunk * 64 + column;
+                            }
+                    };
+                    run.template operator()<1>();
+                    run.template operator()<2>();
+                    run.template operator()<3>();
+                    run.template operator()<4>();
+                }
             }
         }
     }

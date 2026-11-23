@@ -134,7 +134,7 @@ namespace llaminar2::cpu::native_quantised
             case Encoding::CompactMultiScale:
                 switch (weights.codebook_id)
                 {
-                case 9: case 10: case 12: case 13: case 14: case 15: case 16: case 17: implemented = true; break;
+                case 7: case 9: case 10: case 11: case 12: case 13: case 14: case 15: case 16: case 17: implemented = true; break;
                 }
                 break;
             }
@@ -259,7 +259,7 @@ namespace llaminar2::cpu::native_quantised
         /** @brief Run one admitted tile with an explicit operation set; cannot fail. */
         template <typename Ops, int Strips = 0> void executeWithAdmitted() const noexcept
         {
-            if (weights_.usesCompactMultiScale())
+            if (weights_.usesCompactMultiScale() && weights_.codebook_id != 7 && weights_.codebook_id != 11)
             {
                 std::array<const Q8_1Block *, Rows> input;
                 std::array<float *, Rows> output;
@@ -346,6 +346,10 @@ namespace llaminar2::cpu::native_quantised
                 }
                 break;
             case Encoding::CompactMultiScale:
+                if (weights_.codebook_id == 7)
+                    return runCoded<Ops, Policy, 7, Strips>();
+                if (weights_.codebook_id == 11)
+                    return runCoded<Ops, Policy, 11, Strips>();
                 break; // The shared compact implementation was selected before this switch.
             }
             // requireExecutable() rejected every other tuple before the team.
@@ -472,6 +476,88 @@ namespace llaminar2::cpu::native_quantised
             return vsubq_s8(vreinterpretq_s8_u8(values), vdupq_n_s8(32));
         }
 
+        /** @brief Decode four columns of a native coded group for SDOT or the SMMLA pair walk. */
+        template <int Codebook, int Group, typename Ops>
+        [[gnu::always_inline]] static int8x16_t codedGroup(const std::uint8_t *unit, int column) noexcept
+        {
+            if constexpr (Codebook == 7)
+            {
+                const auto raw = vld1q_u8(unit + (Group % 4) * 256 + column * 4);
+                const auto low = Group < 4 ? vandq_u8(raw, vdupq_n_u8(15)) : vshrq_n_u8(raw, 4);
+                std::uint16_t high;
+                std::memcpy(&high, unit + 1024 + Group * 32 + column / 2, sizeof(high));
+                return vreinterpretq_s8_u8(vorrq_u8(low, q6Plane(high, 16)));
+            }
+            else
+            {
+                static_assert(Codebook == 11);
+                return vld1q_s8(reinterpret_cast<const std::int8_t *>(unit + Group * 256 + column * 4));
+            }
+        }
+
+        /** @brief Load exact coded scale/minimum factors from this block and its source superblock. */
+        template <int Codebook, typename Ops>
+        [[gnu::always_inline]] coded_metadata::Factors<typename Ops::F> codedFactors(
+            const std::uint8_t *unit, const std::uint8_t *header, int column) const noexcept
+        {
+            constexpr auto data_stride = preparedDataStride(Encoding::CompactMultiScale, Codebook);
+            if constexpr (Codebook == 7)
+            {
+                using L = coded_metadata::Lanes<Ops>;
+                const auto code = L::template code<7>(unit + data_stride, column);
+                const auto word = L::template superblockWords<7>(header, column);
+                return coded_metadata::reconstruct<7, Ops>(code, word);
+            }
+            else
+            {
+                static_assert(Codebook == 11);
+                // Four consecutive nibbles fit a single halfword load. A
+                // register shift/extract builds the four original odd factors.
+                std::uint16_t packed;
+                std::memcpy(&packed, unit + data_stride + column / 2, sizeof(packed));
+                const auto spread = vshlq_u32(vdupq_n_u32(packed), int32x4_t{0, -4, -8, -12});
+                const auto nibble = vandq_u32(spread, vdupq_n_u32(15));
+                const auto coefficient = vorrq_u32(vshlq_n_u32(nibble, 1), vdupq_n_u32(1));
+                const auto base = Ops::half(reinterpret_cast<const uint16_t *>(header) + column);
+                return {.primary = base * std::bit_cast<typename Ops::F>(vcvtq_f32_u32(coefficient))};
+            }
+        }
+
+        /** @brief Visit increasing-K blocks without redoing coded header/address arithmetic inside a source superblock.
+         * @tparam Coded Codebook of a coded source, or zero for per-block tiles.
+         * @param first First block of the current ordered partition.
+         * @param last Exclusive end of the current ordered partition.
+         * @param visit Always-inlined consumer of (block, unit, superblock header).
+         */
+        template <Encoding Physical, int Coded, typename Visit>
+        [[gnu::always_inline]] void forPartitionBlocks(int first, int last, Visit &&visit) const noexcept
+        {
+            if constexpr (Coded == 0)
+            {
+                for (int block = first; block < last; ++block)
+                {
+                    const auto *unit = preparedSuperblockCoded(Physical)
+                        ? weights_.admittedBlockUnit(chunk_, block)
+                        : weights_.interleavedBase() +
+                            (std::size_t(chunk_) * weights_.blocks_per_row + block) * weights_.interleaved_block_stride;
+                    visit(block, unit, nullptr);
+                }
+            }
+            else
+            {
+                constexpr auto stride = preparedInterleavedBlockStride(Encoding::CompactMultiScale, Coded == 7, Coded);
+                const auto geometry = weights_.geometry();
+                for (int block = first; block < last; )
+                {
+                    const int end = std::min(last, static_cast<int>(geometry.superblockEnd(block)));
+                    const auto *unit = weights_.admittedBlockUnit(chunk_, block);
+                    const auto *header = weights_.admittedSuperblockHeader(chunk_, block);
+                    for (; block < end; ++block, unit += stride)
+                        visit(block, unit, header);
+                }
+            }
+        }
+
         /**
          * @brief Compute one block's exact INT32 dots for every row with row-pair SMMLA.
          * @tparam Ops Admitted I8MM operation set.
@@ -486,7 +572,7 @@ namespace llaminar2::cpu::native_quantised
          * walk and consumed as adjacent pairs that never straddle a scale half.
          * The FP32 block program that follows is shared and unchanged.
          */
-        template <typename Ops, Encoding Physical, NibbleMap Map>
+        template <typename Ops, Encoding Physical, NibbleMap Map, int Coded>
         void pairBlock(const std::uint8_t *unit, int column, int block,
             typename Ops::I (&low)[Rows], typename Ops::I (&high)[Rows]) const noexcept
         {
@@ -506,6 +592,14 @@ namespace llaminar2::cpu::native_quantised
                     else consumePair<Ops>(first, second, block, group, high01, high23, high);
                 }
                 publishPairs<Ops>(high01, high23, high);
+            }
+            else if constexpr (Coded != 0)
+            {
+                forEachGroup<4>([&]<int Pair>() __attribute__((always_inline)) {
+                    constexpr int Group = 2 * Pair;
+                    consumePair<Ops>(codedGroup<Coded, Group, Ops>(unit, column),
+                        codedGroup<Coded, Group + 1, Ops>(unit, column), block, Group, low01, low23, low);
+                });
             }
             else if constexpr (Physical == Encoding::NibbleLUT || Physical == Encoding::NibbleLUTSourceScale)
             {
@@ -587,7 +681,33 @@ namespace llaminar2::cpu::native_quantised
                   NibbleMap Map = NibbleMap::Centered, bool WithMinimum = false, int Strips = 0>
         LLAMINAR_NEON_PROJECTION_EXACT void run() const noexcept
         {
-            constexpr int S = Strips > 0 ? Strips : panelStrips<Ops, Physical, WithMinimum>();
+            executeBlockProgram<Ops, Policy, Physical, Map, WithMinimum, Strips, 0>();
+        }
+
+        /** @brief Execute a coded tile with the same FP32 tree and a source-specific decoder. */
+        template <typename Ops, CPUProjectionNumericalPolicy Policy, int Codebook, int Strips>
+        LLAMINAR_NEON_PROJECTION_EXACT void runCoded() const noexcept
+        {
+            constexpr bool minimum = Codebook == 7;
+            executeBlockProgram<Ops, Policy, Encoding::CompactMultiScale, NibbleMap::Centered, minimum, Strips, Codebook>();
+        }
+
+        /**
+         * @brief Execute the source's exact block program with a fixed serial/grouped K tree.
+         * @tparam Ops Admitted integer instruction implementation.
+         * @tparam Policy Backend-native FMA or separately rounded expert program.
+         * @tparam Physical Prepared encoding.
+         * @tparam Map Nibble decoder, used only by nibble encodings.
+         * @tparam WithMinimum Whether the source owns an additive minimum vector.
+         * @tparam Strips Override for a measured panel width, or zero for the installed width.
+         * @tparam Coded Coded source codebook, or zero for the legacy per-block program.
+         */
+        template <typename Ops, CPUProjectionNumericalPolicy Policy, Encoding Physical,
+                  NibbleMap Map, bool WithMinimum, int Strips, int Coded>
+        [[gnu::always_inline]] LLAMINAR_NEON_PROJECTION_EXACT inline void executeBlockProgram() const noexcept
+        {
+            constexpr auto PanelShape = Coded == 11 ? Encoding::IQ3SExpandedSourceScale : Physical;
+            constexpr int S = Strips > 0 ? Strips : panelStrips<Ops, PanelShape, WithMinimum>();
             // A panel never crosses its 64-column chunk: S strips must tile the chunk's 16.
             static_assert(S == 1 || S == 2 || S == 4);
             if constexpr (S > 1 && !multi_scale::usesRowPairs<Ops>)
@@ -595,7 +715,7 @@ namespace llaminar2::cpu::native_quantised
                 // Panels cover the whole chunk: a final panel may extend into the
                 // chunk's sealed padding columns, which it computes but never stores.
                 for (int column = 0; column < columns_; column += 4 * S)
-                    panel<Ops, Policy, Physical, Map, WithMinimum, S>(column);
+                    panel<Ops, Policy, Physical, Map, WithMinimum, S, Coded>(column);
             }
             else
             {
@@ -614,15 +734,11 @@ namespace llaminar2::cpu::native_quantised
                         float32x4_t accumulator[Rows]{};
                         const int first = partition * blocks_per_partition_;
                         const int last = std::min(first + blocks_per_partition_, weights_.blocks_per_row);
-                        for (int block = first; block < last; ++block)
-                        {
-                            const auto *unit = preparedSuperblockCoded(Physical)
-                                ? weights_.admittedBlockUnit(chunk_, block)
-                                : weights_.interleavedBase() +
-                                    (std::size_t(chunk_) * weights_.blocks_per_row + block) * weights_.interleaved_block_stride;
+                        forPartitionBlocks<Physical, Coded>(first, last, [&](int block, const std::uint8_t *unit,
+                            [[maybe_unused]] const std::uint8_t *header) __attribute__((always_inline)) {
                             I low[Rows]{}, high[Rows]{};
                             if constexpr (multi_scale::usesRowPairs<Ops>)
-                                pairBlock<Ops, Physical, Map>(unit, column, block, low, high);
+                                pairBlock<Ops, Physical, Map, Coded>(unit, column, block, low, high);
                             else if constexpr (Physical == Encoding::Q6KNativeDualScale)
                             {
                                 // Keep one decoded group live at a time. Fully
@@ -645,6 +761,16 @@ namespace llaminar2::cpu::native_quantised
                                     if (group < 4) consume<Ops>(centered, block, group, low);
                                     else consume<Ops>(centered, block, group, high);
                                 }
+                            }
+                            else if constexpr (Coded != 0)
+                            {
+                                const auto blocks = activationBlocks<Ops>(block);
+                                forEachGroup<8>([&]<int Group>() __attribute__((always_inline)) {
+                                    const auto values = std::bit_cast<I>(codedGroup<Coded, Group, Ops>(unit, column));
+#pragma GCC unroll 4
+                                    for (std::size_t row = 0; row < Rows; ++row)
+                                        low[row] = Ops::template dotLane<Group>(low[row], values, blocks[row]);
+                                });
                             }
                             else if constexpr (nibble && kPowerOfTwoBF16Scales<Map>)
                             {
@@ -694,7 +820,13 @@ namespace llaminar2::cpu::native_quantised
                             // BF16 power-of-two words widen by placement alone (exact),
                             // matching the x86 loaders and the scalar view.
                             F scale0, scale1{};
-                            if constexpr (preparedSuperblockCoded(Physical))
+                            if constexpr (Coded != 0)
+                            {
+                                const auto factors = codedFactors<Coded, Ops>(unit, header, column);
+                                scale0 = factors.primary;
+                                scale1 = factors.secondary;
+                            }
+                            else if constexpr (preparedSuperblockCoded(Physical))
                             {
                                 const auto factors = codedScales<Ops, Physical>(unit, column, block);
                                 scale0 = factors.primary;
@@ -733,7 +865,7 @@ namespace llaminar2::cpu::native_quantised
                                     accumulator[row] = accumulateSingleScaleBlockNEON(accumulator[row],
                                         std::bit_cast<int32x4_t>(low[row]), std::bit_cast<float32x4_t>(scale0), activation_scale, Policy);
                             }
-                        }
+                        });
 #pragma GCC unroll 4
                         for (std::size_t row = 0; row < Rows; ++row)
                             reduced[row] = partition == 0 ? accumulator[row] : vaddq_f32(reduced[row], accumulator[row]);
@@ -805,7 +937,7 @@ namespace llaminar2::cpu::native_quantised
          * chains are interleaved and each activation group/scale is read once.
          */
         template <typename Ops, CPUProjectionNumericalPolicy Policy, Encoding Physical,
-                  NibbleMap Map, bool WithMinimum, int S>
+                  NibbleMap Map, bool WithMinimum, int S, int Coded>
         [[gnu::always_inline]] LLAMINAR_NEON_PROJECTION_EXACT inline void panel(int column0) const noexcept
         {
 #if defined(__clang__)
@@ -821,12 +953,8 @@ namespace llaminar2::cpu::native_quantised
                 float32x4_t accumulator[Rows][S]{};
                 const int first = partition * blocks_per_partition_;
                 const int last = std::min(first + blocks_per_partition_, weights_.blocks_per_row);
-                for (int block = first; block < last; ++block)
-                {
-                    const auto *unit = preparedSuperblockCoded(Physical)
-                        ? weights_.admittedBlockUnit(chunk_, block)
-                        : weights_.interleavedBase() +
-                            (std::size_t(chunk_) * weights_.blocks_per_row + block) * weights_.interleaved_block_stride;
+                forPartitionBlocks<Physical, Coded>(first, last, [&](int block, const std::uint8_t *unit,
+                    [[maybe_unused]] const std::uint8_t *header) __attribute__((always_inline)) {
                     I low[Rows][S]{}, high[Rows][S]{};
                     if constexpr (Physical == Encoding::Q6KNativeDualScale)
                     {
@@ -850,6 +978,20 @@ namespace llaminar2::cpu::native_quantised
                                 }
                             }
                         }
+                    }
+                    else if constexpr (Coded != 0)
+                    {
+                        const auto blocks = activationBlocks<Ops>(block);
+                        forEachGroup<8>([&]<int Group>() __attribute__((always_inline)) {
+#pragma GCC unroll 4
+                            for (int strip = 0; strip < S; ++strip)
+                            {
+                                const auto values = std::bit_cast<I>(codedGroup<Coded, Group, Ops>(unit, column0 + 4 * strip));
+#pragma GCC unroll 4
+                                for (std::size_t row = 0; row < Rows; ++row)
+                                    low[row][strip] = Ops::template dotLane<Group>(low[row][strip], values, blocks[row]);
+                            }
+                        });
                     }
                     else if constexpr (nibble)
                     {
@@ -895,7 +1037,13 @@ namespace llaminar2::cpu::native_quantised
                     {
                         const int column = column0 + 4 * strip;
                         F scale0, scale1{};
-                        if constexpr (preparedSuperblockCoded(Physical))
+                        if constexpr (Coded != 0)
+                        {
+                            const auto factors = codedFactors<Coded, Ops>(unit, header, column);
+                            scale0 = factors.primary;
+                            scale1 = factors.secondary;
+                        }
+                        else if constexpr (preparedSuperblockCoded(Physical))
                         {
                             const auto factors = codedScales<Ops, Physical>(unit, column, block);
                             scale0 = factors.primary;
@@ -936,7 +1084,7 @@ namespace llaminar2::cpu::native_quantised
                                     activation_scale[row], Policy);
                         }
                     }
-                }
+                });
 #pragma GCC unroll 4
                 for (std::size_t row = 0; row < Rows; ++row)
 #pragma GCC unroll 4

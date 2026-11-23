@@ -128,6 +128,33 @@ namespace llaminar2::cpu::native_quantised::coded_metadata
         return word;
     }
 
+    /** @brief Write Q5_K high bits as eight 32-byte planes, one nibble per column in each group.
+     * @param planes Zero-initialized high-bit region after the four low-nibble words.
+     * @param column Physical output column in [0,63].
+     * @param qh Four source high-bit bytes in increasing K order.
+     */
+    inline void storeQ5HighBits(std::uint8_t *planes, int column, const std::uint8_t *qh)
+    {
+        for (int group = 0; group < 8; ++group)
+        {
+            const auto bits = (qh[group / 2] >> (4 * (group % 2))) & 15;
+            planes[32 * group + column / 2] |= static_cast<std::uint8_t>(bits << (4 * (column % 2)));
+        }
+    }
+
+    /** @brief Reconstruct the four original Q5_K high-bit bytes for one column. */
+    inline void loadQ5HighBits(const std::uint8_t *planes, int column, std::uint8_t *qh)
+    {
+        for (int byte = 0; byte < 4; ++byte)
+        {
+            const int shift = 4 * (column % 2);
+            const auto *even = planes + 64 * byte + column / 2;
+            const int low = (*even >> shift) & 15;
+            const int high = (even[32] >> shift) & 15;
+            qh[byte] = static_cast<std::uint8_t>(low | (high << 4));
+        }
+    }
+
     /**
      * @brief Code of one column of a block, including code-in-payload formats.
      * @param block First byte of the 64-column block (payload planes first).
@@ -357,6 +384,13 @@ namespace llaminar2::cpu::native_quantised::coded_metadata
             out.emin_low = L::staged(-dmin * L::toFloat((code >> 4) & 15));
             out.emin_high = L::staged(-dmin * L::toFloat((code >> 12) & 15));
         }
+        else if constexpr (Codebook == 7)
+        {
+            // Q5_K: one 6-bit scale and one 6-bit additive minimum per block.
+            const F dmin = L::half(word >> 16);
+            out.primary = L::staged(d * L::toFloat(code & 63));
+            out.secondary = L::staged(-dmin * L::toFloat((code >> 6) & 63));
+        }
         else
             static_assert(Codebook == 15 && Codebook != 15, "reconstruct() covers the derived-scale compact codebooks");
         return out;
@@ -374,6 +408,13 @@ namespace llaminar2::cpu::native_quantised
      */
     inline void compactColumnPayload(const std::uint8_t *block, std::uint8_t codebook, int column, std::uint8_t *payload)
     {
+        if (codebook == 7)
+        {
+            for (int word = 0; word < 4; ++word)
+                std::memcpy(payload + 4 * word, block + 256 * word + 4 * column, 4);
+            coded_metadata::loadQ5HighBits(block + 1024, column, payload + 16);
+            return;
+        }
         const int words = int(preparedCompactPayloadWords(codebook));
         const int tail = int(preparedCompactPayloadTailBytes(codebook));
         for (int byte = 0; byte < 4 * words; ++byte)

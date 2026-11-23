@@ -2,12 +2,13 @@
  * @file CPUNativeQuantisedMultiScaleKernels.h
  * @brief Lossless compact multi-scale CPU projections with shared serial/grouped arithmetic.
  *
- * Prepared blocks retain the GPU-native payload, two scale metadata words and optional
- * Q2_K minima. IQ2_S retains its original half base plus raw coefficient byte,
- * reconstructing both factors in SIMD without scalar staging. SIMD lanes represent output columns, so each activation word is
- * broadcast once and reused across columns and verifier rows. Integer lookup
- * and dot work never changes source quantization. Each row visits increasing
- * K blocks and publishes the same separately rounded contribution as CUDA/HIP.
+ * Prepared blocks carry exact source codes and use one base/minimum word per
+ * column and source superblock. Q5_K retains both its five-bit unsigned values
+ * and additive minimum. IQ3_S retains expanded signed grid bytes for the fast
+ * dot, but derives its coefficient from the source nibble and header d. SIMD
+ * lanes represent output columns, with decoded integer values shared by rows.
+ * Q5_K and IQ3_S use the same FP32 contribution policy as their former
+ * expanded units; other compact codebooks keep the CUDA/HIP-ordered program.
  * The same primitive serves serial decode and grouped verification; no row
  * replay, temporary decoded matrix or inference-time allocation is used.
  * AArch64's four-column native operations use the same decoder and rounded
@@ -25,6 +26,7 @@
 #include "CPUNativeQuantisedDecode.h"
 #include "CPUNativeQuantisedFP16.h"
 #include "CPUNativeQuantisedActivationSums.h"
+#include "CPUNativeQuantisedContributionContract.h"
 #include "CPUNativeQuantisedCodedMetadata.h"
 #include "CPUNativeQuantisedPreparedFootprint.h"
 #if defined(__aarch64__) && defined(__ARM_NEON)
@@ -354,16 +356,23 @@ namespace llaminar2::cpu::native_quantised::multi_scale
             return L::template code<static_cast<std::uint8_t>(Codebook)>(unit + data_stride, column);
     }
 
+    /** @brief Reconstruct IQ3_S's FP32 factor without a half round trip. */
+    template <typename Ops>
+    [[gnu::always_inline]] inline typename Ops::F iq3sSourceScale(typename Ops::I code, typename Ops::I word)
+    {
+        using L = coded_metadata::Lanes<Ops>;
+        return L::half(word) * L::toFloat(2 * (code & 15) + 1);
+    }
+
     /**
      * @brief Whether a compact codebook carries one weight scale per 32-value block.
      *
-     * IQ3_XXS (12), IQ2_XXS (15) and IQ1_S (16) share the compact payload
-     * family but publish the GPU's single-scale contribution: one scale for the
-     * whole block (IQ1_S adds its additive minimum), never two half scales.
+     * Q5_K, IQ3_S, IQ3_XXS, IQ2_XXS and IQ1_S apply one scale to the whole
+     * 32-value dot. Q5_K and IQ1_S also apply a whole-block minimum.
      */
     constexpr bool isSingleScaleCompactCodebook(int codebook) noexcept
     {
-        return codebook == 12 || codebook == 15 || codebook == 16;
+        return codebook == 7 || codebook == 11 || codebook == 12 || codebook == 15 || codebook == 16;
     }
 
     /**
@@ -384,13 +393,22 @@ namespace llaminar2::cpu::native_quantised::multi_scale
 #pragma clang fp contract(off)
 #pragma clang fp reassociate(off)
 #endif
-        if (!packed.usesCompactMultiScale() || packed.payload_bytes <= 0 || packed.payload_bytes > 16)
+        if (!packed.usesCompactMultiScale() || packed.payload_bytes <= 0 || packed.payload_bytes > 32)
             throw std::invalid_argument("Multi-scale diagnostic requires its bounded compact source payload");
-        uint8_t payload[16]{};
+        const auto *unit = packed.blockUnit(chunk, kb);
+        uint8_t payload[20]{};
         int8_t values[32];
-        compactColumnPayload(packed.blockUnit(chunk, kb), packed.codebook_id, column, payload);
-        native_quantised_superblock::restoreCodedPayload(packed.codebook_id, payload);
-        decode_native_block(packed.codebook_id, payload, values);
+        if (packed.codebook_id == 11)
+        {
+            for (int group = 0; group < 8; ++group)
+                std::memcpy(values + group * 4, unit + group * 256 + column * 4, 4);
+        }
+        else
+        {
+            compactColumnPayload(unit, packed.codebook_id, column, payload);
+            native_quantised_superblock::restoreCodedPayload(packed.codebook_id, payload);
+            decode_native_block(packed.codebook_id, payload, values);
+        }
         int dots[2]{}, sums[4]{};
         for (int k = 0; k < 32; ++k)
         {
@@ -403,9 +421,9 @@ namespace llaminar2::cpu::native_quantised::multi_scale
         if (isSingleScaleCompactCodebook(packed.codebook_id))
         {
             // GPU singleScaleBlock: (activation * weight scale) * dot, plus the
-            // IQ1_S additive minimum through singleScaleCorrection.
+            // IQ1_S/Q5_K additive minimum through singleScaleCorrection.
             float contribution = (activation_scale * scale0) * static_cast<float>(dots[0] + dots[1]);
-            if (packed.codebook_id == 16)
+            if (packed.codebook_id == 16 || packed.codebook_id == 7)
                 contribution += (activation_scale * scale1) *
                                 static_cast<float>(sums[0] + sums[1] + sums[2] + sums[3]);
             return contribution;
@@ -598,8 +616,52 @@ namespace llaminar2::cpu::native_quantised::multi_scale
                         int kb, typename Ops::I (&dots)[Rows])
     {
         using I = typename Ops::I;
-        if constexpr (usesRowPairs<Ops> && Rows >= 2)
+        // Q5_K and IQ3_S have an explicit NEON prepared tile; this common
+        // path provides the x86 decode and the scalar-reference test seam.
+        if constexpr (usesRowPairs<Ops> && Rows >= 2 && Codebook != 7 && Codebook != 11)
             return dotHalfRowPairs<Codebook, Half, Lanes, Rows, Ops>(unit, column, activation, kb, dots);
+        else if constexpr (Codebook == 11)
+        {
+            const auto group = [&]<int G>() {
+                I weights = payloadWord<Codebook, Ops>(unit, Half * 4 + G, column);
+                if constexpr (Lanes == 16)
+                    weights ^= static_cast<int>(0x80808080u);
+#pragma GCC unroll 4
+                for (size_t row = 0; row < Rows; ++row)
+                {
+                    int activation_word = 0;
+                    std::memcpy(&activation_word, activation[row][kb].qs + Half * 16 + G * 4, 4);
+                    dots[row] = Ops::dot(dots[row], weights, I{} + activation_word);
+                }
+            };
+            group.template operator()<0>();
+            group.template operator()<1>();
+            group.template operator()<2>();
+            group.template operator()<3>();
+        }
+        else if constexpr (Codebook == 7)
+        {
+            // Each Q5_K source group owns one nibble of the high-bit plane
+            // per column. The four low-nibble words serve both K halves.
+            const auto group = [&]<int G>() {
+                const I raw = payloadWord<Codebook, Ops>(unit, G, column);
+                I weights = Half == 0 ? (raw & 0x0F0F0F0F) : ((raw >> 4) & 0x0F0F0F0F);
+                const I high = coded_metadata::Lanes<Ops>::nibbles(unit + 1024 + 32 * (Half * 4 + G), column);
+                weights |= (high * 0x02040810) & 0x10101010;
+                // Q5_K values are unsigned 0..31: no AVX-512 0x80 bias is applied.
+#pragma GCC unroll 4
+                for (size_t row = 0; row < Rows; ++row)
+                {
+                    int activation_word = 0;
+                    std::memcpy(&activation_word, activation[row][kb].qs + Half * 16 + G * 4, 4);
+                    dots[row] = Ops::dot(dots[row], weights, I{} + activation_word);
+                }
+            };
+            group.template operator()<0>();
+            group.template operator()<1>();
+            group.template operator()<2>();
+            group.template operator()<3>();
+        }
         else if constexpr (Codebook == 12)
         {
             // IQ3_XXS: pair two adjacent four-value groups per consume; the
@@ -750,7 +812,11 @@ namespace llaminar2::cpu::native_quantised::multi_scale
                 static_cast<int64_t>(partitions) * blocks_per_partition < end - begin ||
                 static_cast<int64_t>(begin) + static_cast<int64_t>(partitions) * blocks_per_partition > INT32_MAX)
                 throw std::invalid_argument("Multi-scale CPU tile requires an exact bounded ordered K tree");
-        constexpr int center = Lanes != 16 || Codebook == 10 ? 0 : Codebook == 9 ? 4 : 128;
+        // Q5_K (7) decodes to unsigned five-bit values (0..31), so its AVX-512
+        // bytes need no signed->unsigned bias and the recovered dot needs no
+        // center correction.
+        constexpr int center = Lanes != 16 || Codebook == 10 || Codebook == 7
+            ? 0 : Codebook == 9 ? 4 : 128;
         for (int column = 0; column < columns; column += Lanes)
         {
             F reduced[Rows]{};
@@ -800,6 +866,14 @@ namespace llaminar2::cpu::native_quantised::multi_scale
                         scale0 = (base * (low_coefficient + 0.5f)) * 0.25f;
                         scale1 = (base * (high_coefficient + 0.5f)) * 0.25f;
                     }
+                    else if constexpr (Codebook == 11)
+                    {
+                        // IQ3_S keeps its source factors: base d and the scale nibble,
+                        // factor = d * (2*nibble+1) in FP32 with no half re-rounding,
+                        // exactly nativeQuantisedPrimaryScale's IQ3_S expression.
+                        scale0 = iq3sSourceScale<Ops>(code, superblock_word);
+                        scale1 = F{};  // single-source-scale, no additive minimum.
+                    }
                     else
                     {
                         factors = coded_metadata::reconstruct<static_cast<std::uint8_t>(Codebook), Ops>(code, superblock_word);
@@ -831,10 +905,55 @@ namespace llaminar2::cpu::native_quantised::multi_scale
                             sum1 = static_cast<int>(a.sum_qs) - sum0;
                         }
                         const F activation_scale = F{} + nativeQuantisedFP16ScaleToFP32(a.d);
+                        if constexpr (Codebook == 7 || Codebook == 11)
+                        {
+                            const auto dot = low[row] + high[row] - center * static_cast<int>(a.sum_qs);
+                            const auto scale_a = nativeQuantisedFP16ScaleToFP32(a.d);
+#if defined(__aarch64__) && defined(__ARM_NEON)
+                            if constexpr (Codebook == 7)
+                                acc[row] = std::bit_cast<F>(accumulateCorrectedSingleScaleBlockNEON(
+                                    std::bit_cast<float32x4_t>(acc[row]), std::bit_cast<int32x4_t>(dot),
+                                    std::bit_cast<float32x4_t>(scale0), a.sum_qs,
+                                    std::bit_cast<float32x4_t>(scale1), scale_a, packed.numerical_policy));
+                            else
+                                acc[row] = std::bit_cast<F>(accumulateSingleScaleBlockNEON(
+                                    std::bit_cast<float32x4_t>(acc[row]), std::bit_cast<int32x4_t>(dot),
+                                    std::bit_cast<float32x4_t>(scale0), scale_a, packed.numerical_policy));
+#else
+                            if constexpr (Lanes == 8)
+                            {
+                                if constexpr (Codebook == 7)
+                                    acc[row] = std::bit_cast<F>(accumulateCorrectedSingleScaleBlockAVX2(
+                                        std::bit_cast<__m256>(acc[row]), std::bit_cast<__m256i>(dot),
+                                        std::bit_cast<__m256>(scale0), a.sum_qs,
+                                        std::bit_cast<__m256>(scale1), scale_a, packed.numerical_policy));
+                                else
+                                    acc[row] = std::bit_cast<F>(accumulateSingleScaleBlockAVX2(
+                                        std::bit_cast<__m256>(acc[row]), std::bit_cast<__m256i>(dot),
+                                        std::bit_cast<__m256>(scale0), scale_a, packed.numerical_policy));
+                            }
+#if defined(__AVX512F__)
+                            else
+                            {
+                                if constexpr (Codebook == 7)
+                                    acc[row] = std::bit_cast<F>(accumulateCorrectedSingleScaleBlockAVX512(
+                                        std::bit_cast<__m512>(acc[row]), std::bit_cast<__m512i>(dot),
+                                        std::bit_cast<__m512>(scale0), a.sum_qs,
+                                        std::bit_cast<__m512>(scale1), scale_a, packed.numerical_policy));
+                                else
+                                    acc[row] = std::bit_cast<F>(accumulateSingleScaleBlockAVX512(
+                                        std::bit_cast<__m512>(acc[row]), std::bit_cast<__m512i>(dot),
+                                        std::bit_cast<__m512>(scale0), scale_a, packed.numerical_policy));
+                            }
+#endif
+#endif
+                            continue;
+                        }
                         if constexpr (isSingleScaleCompactCodebook(Codebook))
                         {
                             // GPU singleScaleBlock over the exact whole-block
-                            // integer dot; IQ1_S adds singleScaleCorrection.
+                            // integer dot; IQ1_S adds its scaled additive
+                            // minimum over the whole block sum.
                             const int whole_sum = static_cast<int>(a.sum_qs);
                             const F dot = __builtin_convertvector(low[row] + high[row] - center * whole_sum, F);
                             F contribution = (activation_scale * scale0) * dot;
@@ -918,8 +1037,10 @@ namespace llaminar2::cpu::native_quantised::multi_scale
         switch (packed.codebook_id)
         {
 #define LLAMINAR_MULTISCALE_CASE(C) case C: return rows<C, Lanes, Rows, Reduction::Contiguous, Packed, Ops>(packed, activation, output, chunk, begin, end, accumulate, 1, 0, columns)
+        LLAMINAR_MULTISCALE_CASE(7);
         LLAMINAR_MULTISCALE_CASE(9);
         LLAMINAR_MULTISCALE_CASE(10);
+        LLAMINAR_MULTISCALE_CASE(11);
         LLAMINAR_MULTISCALE_CASE(12);
         LLAMINAR_MULTISCALE_CASE(13);
         LLAMINAR_MULTISCALE_CASE(14);
@@ -964,8 +1085,10 @@ namespace llaminar2::cpu::native_quantised::multi_scale
         switch (packed.codebook_id)
         {
 #define LLAMINAR_MULTISCALE_ORDERED_CASE(C) case C: return rows<C, Lanes, Rows, Reduction::OrderedPartitions, Packed, Ops>(packed, activation, output, chunk, 0, blocks, false, partitions, blocks_per_partition, columns)
+        LLAMINAR_MULTISCALE_ORDERED_CASE(7);
         LLAMINAR_MULTISCALE_ORDERED_CASE(9);
         LLAMINAR_MULTISCALE_ORDERED_CASE(10);
+        LLAMINAR_MULTISCALE_ORDERED_CASE(11);
         LLAMINAR_MULTISCALE_ORDERED_CASE(12);
         LLAMINAR_MULTISCALE_ORDERED_CASE(13);
         LLAMINAR_MULTISCALE_ORDERED_CASE(14);
