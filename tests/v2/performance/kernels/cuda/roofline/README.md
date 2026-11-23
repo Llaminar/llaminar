@@ -744,6 +744,27 @@ non-verifier graph materialization counts. The candidate process measured
 lower ordinary throughput in both orders. This comparison leaves the staged
 verifier as the production default.
 
+A separate Gate/Up trial gives each of the 16 fixed K partitions its own
+warp. Both schedules fold partitions in the same order and publish the same
+Q8 and Down bytes. Both cards passed the five native contracts in both arm
+orders, including the captured 512-thread launch geometry. The eight wide
+Gate/Up entries use 64–72 registers per thread, 4 KiB of shared memory, and
+zero stack or local bytes. On the inspected F320 Q4_K entry, the static
+packed-dot instruction count per thread decreased from 48 to 24 as threads
+increased from 256 to 512. Both entries have one barrier.
+
+| Captured fixture | Live work | Latency change across both cards and orders |
+| --- | --- | ---: |
+| F320, seven physical source pairs | One packet row | −13.2% to −2.5% |
+| F320, seven physical source pairs | Six packet rows | −3.7% to −0.2% |
+| F640, seven physical source pairs | One packet row | −10.9% to −2.1% |
+| F640, seven physical source pairs | Six packet rows | −1.7% to +3.4% |
+| Acquired-bank F320 | One live row, seven local routes | −5.0% to −0.6% |
+| Acquired-bank F320 | Six live rows, 40 local routes | +0.7% to +3.0% |
+
+This trial measures captured packet and route work. The high-route results
+favor the 256-thread shape, while sparse work favors the wider block.
+
 The scalar drafter's original graph submission owns one live activation.
 On the mixed topology, the fused path selects the local F320 Q8 work from
 the ten original route slots and keeps weighting with the original cohort.

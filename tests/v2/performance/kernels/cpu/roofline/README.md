@@ -435,6 +435,15 @@ and retirement, averaged 184.88 µs and reached 83.43 GB/s or 75.8%. The
 outer service figure above is from the separate, minimally instrumented
 probe and includes the endpoint's other work.
 
+A distinct endpoint trace kept the same Release arithmetic and matched the
+32-token control. Rank 1 recorded 2,976 packets with mean 4.11 µs for route
+validation and compaction, 23.50 µs for stage setup, and 257.91 µs inside the
+compute stage. Output materialization and return validation took 0.70 and
+0.71 µs. The endpoint averaged 286.93 µs with detail collection enabled. Rank
+0 recorded 1,488 measured packets with 21.21 µs for stage setup and 225.46 µs
+inside the compute stage. These endpoint timings include instrumentation and
+serve to localize the work around the prepared FFN.
+
 | Arm order | Mode | Decode, control → isolated tok/s | Decode change | Complete throughput change |
 | --- | --- | ---: | ---: | ---: |
 | Candidate first | Ordinary | 29.598 → 32.069 | +8.35% | +7.04% |
