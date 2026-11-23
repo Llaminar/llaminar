@@ -161,6 +161,41 @@ expert slot geometry, PMA BOM.
   NEON/AVX2/AVX-512 loaders need the codec before coded CPU-to-GPU promotion
   can exist; x86 verification needs an x86 host.
 
+## CPU tier and expert movement (next phase)
+
+Measured per 32 values (bytes), from the production stride/allocation helpers:
+
+| Format | GGUF | CPU unit | x | GPU migration slot | x |
+|---|---|---|---|---|---|
+| IQ1_S | 6.25 | 12 | 1.92 | 10 | 1.60 |
+| IQ1_M | 7.00 | 12 | 1.71 | 10 | 1.43 |
+| IQ2_XXS | 8.25 | 12 | 1.45 | 10 | 1.21 |
+| IQ2_XS | 9.25 | 16 | 1.73 | 13 | 1.41 |
+| IQ2_S | 10.25 | 16 | 1.56 | 13 | 1.27 |
+| IQ3_XXS | 12.25 | 16 | 1.31 | 14 | 1.14 |
+| IQ3_S | 13.75 | 38 | 2.76 | 17 | 1.24 |
+| Q2_K | 10.50 | 16 | 1.52 | 16 | 1.52 |
+| Q3_K | 13.75 | 16 | 1.16 | 16 | 1.16 |
+| Q4_K | 18.00 | 22 | 1.22 | 20 | 1.11 |
+| Q5_K | 22.00 | 38 | 1.73 | 36 | 1.64 |
+| Q6_K | 26.25 | 28 | 1.07 | 28 | 1.07 |
+| IQ4_XS | 17.00 | 22 | 1.29 | 20 | 1.18 |
+| MXFP4 | 17.00 | 20 | 1.18 | 17 | 1.00 |
+| Q8_0 | 34.00 | 36 | 1.06 | 34 | 1.00 |
+
+CPU-to-GPU and GPU-to-CPU expert streams carry CPU units, so transfer
+volume has the CPU overhead too. Sources of the excess: per-block FP16 scale
+products instead of codes + superblock d; payloads padded to whole 32-bit
+words per column (IQ2_XS/IQ2_S 9 -> 12 bytes); expanded signed-INT8 for
+IQ3_S/Q5_K/Q5_0/Q5_1; per-block planes in reusable GPU slots.
+
+Target: CPU units carry the source payload bytes (byte-interleaved) and the
+same codes + superblock words as CUDA; NEON/AVX2/AVX-512 loaders reconstruct
+the identical FP16 words with the shared codec; GPU migration slots become
+coded; streams copy codes and superblock words in both directions. Gates:
+byte-identical CPU outputs per ISA, captured CPU<->GPU round trips, wire
+extents equal the file bytes.
+
 ## Sequencing
 
 1. Codec header + exhaustive device-free proofs (all formats).
