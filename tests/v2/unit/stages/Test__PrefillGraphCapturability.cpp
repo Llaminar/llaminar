@@ -411,7 +411,8 @@ namespace
             int,
             MoEDecodeDescriptorSource descriptor_source =
                 MoEDecodeDescriptorSource::RuntimePlacementTable,
-            ITensor * = nullptr) override
+            ITensor * = nullptr,
+            MoEExpertRouteWeighting = MoEExpertRouteWeighting::LocalProjection) override
         {
             ++fused_runtime_decode_calls;
             last_fused_descriptor_source = descriptor_source;
