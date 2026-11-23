@@ -354,10 +354,24 @@ __device__ __forceinline__ int gemv_find_batch_for_block(
     return batch;
 }
 
+/**
+ * @brief Initialize each column's beta and bias before its split-K producers run.
+ * @tparam TILE_N Columns owned by the CTA.
+ * @tparam CPT Adjacent columns owned by each lane.
+ * @param d_C_fp32 Final column bank, which may also supply the old values.
+ * @param d_C_existing Original beta operand.
+ * @param d_bias Optional bias.
+ * @param N Number of live columns.
+ * @param beta Original multiplier of C.
+ *
+ * The single-CTA and wide terminal leaves likewise admit the same C pointer
+ * for input and output. Each owner reads its old column before its first
+ * write. Split initialization completes before any arithmetic CTA consumes C.
+ */
 template <int TILE_N, int CPT>
 __global__ void gemv_init_output_kernel_t(
-    float* __restrict__ d_C_fp32,
-    const float* __restrict__ d_C_existing,
+    float* d_C_fp32,
+    const float* d_C_existing,
     const float* __restrict__ d_bias,
     int N,
     float beta)
@@ -1263,14 +1277,14 @@ __global__ void gemv_int8_int8_square_vnni_kernel(
 __global__ void gemv_int8_int8_vnni_blockwise_scaled_kernel(
     const int8_t* __restrict__ d_A_int8,
     const int8_t* __restrict__ d_B_int8_vnni,
-    float* __restrict__ d_C_fp32,
+    float* d_C_fp32,
     const float* __restrict__ d_scales_A_blockwise,
     const float* __restrict__ d_scale_B,
     int N,
     int K,
     float alpha,
     float beta,
-    const float* __restrict__ d_C_existing,
+    const float* d_C_existing,
     const float* __restrict__ d_bias)
 {
     const int n = blockIdx.x * GEMV_TILE_N + threadIdx.x;
@@ -1314,14 +1328,14 @@ template <int TILE_N, int CPT, bool VEC_PACKED_LOAD>
 __global__ void gemv_int8_int8_wide_vnni_blockwise_scaled_kernel_t(
     const int8_t* __restrict__ d_A_int8,
     const int8_t* __restrict__ d_B_int8_vnni,
-    float* __restrict__ d_C_fp32,
+    float* d_C_fp32,
     const float* __restrict__ d_scales_A_blockwise,
     const float* __restrict__ d_scale_B,
     int N,
     int K,
     float alpha,
     float beta,
-    const float* __restrict__ d_C_existing,
+    const float* d_C_existing,
     const float* __restrict__ d_bias)
 {
     const int n_base = blockIdx.x * TILE_N + threadIdx.x * CPT;
@@ -1441,18 +1455,18 @@ __global__ void gemv_int8_int8_wide_vnni_blockwise_scaled_kernel_t(
 __global__ void gemv_int8_int8_square_vnni_blockwise_scaled_kernel(
     const int8_t* __restrict__ d_A_int8,
     const int8_t* __restrict__ d_B_int8_vnni,
-    float* __restrict__ d_C_fp32,
+    float* d_C_fp32,
     const float* __restrict__ d_scales_A_blockwise,
     const float* __restrict__ d_scale_B,
     int N,
     int K,
     float alpha,
     float beta,
-    const float* __restrict__ d_C_existing,
+    const float* d_C_existing,
     const float* __restrict__ d_bias)
 {
     const int n = blockIdx.x * GEMV_INT8_VNNI_SQUARE_TILE_N + threadIdx.x;
-    if (n >= N) return;
+    const bool owns_column = n < N;
 
     float fp_acc = 0.0f;
     __shared__ int8_t sA[GEMV_INT8_VNNI_KPAR_TILE_K];
@@ -1470,31 +1484,35 @@ __global__ void gemv_int8_int8_square_vnni_blockwise_scaled_kernel(
         const int act_block_base = k_tile_base / GEMV_INT8_VNNI_ACT_BLOCK_K;
         const int tile_k_group_base = k_tile_base / 4;
 
-        #pragma unroll
-        for (int tile_block = 0; tile_block < GEMV_INT8_VNNI_KPAR_TILE_K / GEMV_INT8_VNNI_ACT_BLOCK_K; ++tile_block)
+        // A partial N tile still needs every lane to load A and reach both
+        // barriers. Only live column owners read weights or accumulate.
+        if (owns_column)
         {
-            if (tile_block >= tile_act_blocks)
-            {
-                break;
-            }
-
-            int32_t block_acc = 0;
-            const int local_k_byte = tile_block * GEMV_INT8_VNNI_ACT_BLOCK_K;
-            const int k_group_base = tile_k_group_base + tile_block * GEMV_INT8_VNNI_KGROUPS_PER_ACT_BLOCK;
             #pragma unroll
-            for (int kgi = 0; kgi < GEMV_INT8_VNNI_KGROUPS_PER_ACT_BLOCK; ++kgi)
+            for (int tile_block = 0; tile_block < GEMV_INT8_VNNI_KPAR_TILE_K / GEMV_INT8_VNNI_ACT_BLOCK_K; ++tile_block)
             {
-                const int32_t a_packed = *reinterpret_cast<const int32_t*>(sA + local_k_byte + kgi * 4);
-                const int32_t b_packed = *reinterpret_cast<const int32_t*>(
-                    d_B_int8_vnni + (static_cast<size_t>(k_group_base + kgi) * N + n) * 4);
-                block_acc = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_packed, block_acc);
-            }
+                if (tile_block >= tile_act_blocks)
+                    break;
 
-            fp_acc += static_cast<float>(block_acc) * d_scales_A_blockwise[act_block_base + tile_block];
+                int32_t block_acc = 0;
+                const int local_k_byte = tile_block * GEMV_INT8_VNNI_ACT_BLOCK_K;
+                const int k_group_base = tile_k_group_base + tile_block * GEMV_INT8_VNNI_KGROUPS_PER_ACT_BLOCK;
+                #pragma unroll
+                for (int kgi = 0; kgi < GEMV_INT8_VNNI_KGROUPS_PER_ACT_BLOCK; ++kgi)
+                {
+                    const int32_t a_packed = *reinterpret_cast<const int32_t*>(sA + local_k_byte + kgi * 4);
+                    const int32_t b_packed = *reinterpret_cast<const int32_t*>(
+                        d_B_int8_vnni + (static_cast<size_t>(k_group_base + kgi) * N + n) * 4);
+                    block_acc = ::llaminar2::rocm_integer_contract::signedDot4(a_packed, b_packed, block_acc);
+                }
+
+                fp_acc += static_cast<float>(block_acc) * d_scales_A_blockwise[act_block_base + tile_block];
+            }
         }
         __syncthreads();
     }
 
+    if (!owns_column) return;
     float result = fp_acc * d_scale_B[n];
     result *= alpha;
     if (beta != 0.0f)

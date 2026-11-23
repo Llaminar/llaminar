@@ -31,12 +31,18 @@
 #include <exception>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 using namespace llaminar2;
 using namespace llaminar2::test;
+
+extern "C" bool rocmGemv_int8_int8_fp32_vnni_blockwise_scaled(
+    const int8_t *, const int8_t *, float *, const float *, const float *,
+    int, int, float, float, const float *, const float *, int, void *);
 
 namespace
 {
@@ -471,6 +477,110 @@ TEST(ROCmScalarGEMVEpilogueReplay, DeviceDestinationOwnsBetaPublication)
             for (int column = 0; column < N; ++column)
                 EXPECT_EQ(std::bit_cast<std::uint32_t>(actual[column]),
                     std::bit_cast<std::uint32_t>(projection[column] + beta * initial[column]));
+        }
+    }
+}
+
+/** @test Execute captured INT8 beta publication against the same disjoint original state. */
+TEST(ROCmScalarVNNIBetaPublicationReplay, ExistingValuesAndFinalDeviceRowCanAlias)
+{
+    int devices = 0;
+    if (hipGetDeviceCount(&devices) != hipSuccess || devices == 0)
+        GTEST_SKIP() << "No ROCm device available";
+    const auto device = DeviceId::rocm(0);
+    ScopedGPUStream owner(device);
+    const auto stream = static_cast<hipStream_t>(owner.get());
+    const auto free_device = [](void *pointer) { (void)hipFree(pointer); };
+    const auto upload = [&]<typename T>(const std::vector<T> &values) {
+        T *pointer = nullptr;
+        const auto bytes = values.size() * sizeof(T);
+        if (hipMalloc(reinterpret_cast<void **>(&pointer), bytes) != hipSuccess)
+            throw std::runtime_error("INT8 GEMV replay could not allocate its fixture buffer");
+        std::unique_ptr<T, decltype(free_device)> buffer(pointer, free_device);
+        if (hipMemcpyAsync(pointer, values.data(), bytes, hipMemcpyHostToDevice, stream) != hipSuccess)
+            throw std::runtime_error("INT8 GEMV replay could not load its recorded fixture");
+        return buffer;
+    };
+    // Odd N, square, LDS split-K, and wide dispatches. Exact binary
+    // coefficients make the old split contribution and its beta seed exact.
+    const std::array geometries{std::pair{17, 256}, std::pair{257, 256},
+        std::pair{269, 768}, std::pair{384, 512}, std::pair{512, 32}};
+    for (const auto &[n, k] : geometries)
+    {
+        SCOPED_TRACE("N=" + std::to_string(n) + " K=" + std::to_string(k));
+        std::vector<std::int8_t> activation(k), weights(static_cast<std::size_t>(n) * k);
+        std::vector<float> scales_a(k / 32, 0.25f), scales_b(n, 0.125f), bias(n);
+        std::vector<float> old(n + 8, -782.0f), control(old.size()), actual(old.size());
+        for (int j = 0; j < k; ++j)
+            activation[j] = static_cast<std::int8_t>((j * 5 + 1) % 11 - 5);
+        for (std::size_t j = 0; j < weights.size(); ++j)
+            weights[j] = static_cast<std::int8_t>(static_cast<int>((j * 3 + 7) % 13) - 6);
+        for (int j = 0; j < n; ++j)
+            bias[j] = static_cast<float>(j % 7 - 3) * 0.0625f;
+
+        const auto d_a = upload(activation);
+        const auto d_b = upload(weights);
+        const auto d_a_scale = upload(scales_a);
+        const auto d_b_scale = upload(scales_b);
+        const auto d_bias = upload(bias);
+        const auto d_existing = upload(old);
+        const auto d_control = upload(old);
+        const auto d_alias = upload(old);
+
+        HIPGraphCapture graph(stream, 0);
+        const FixtureStreamDrain drain{stream};
+        const auto launch = [&](float *destination, const float *existing) {
+            return rocmGemv_int8_int8_fp32_vnni_blockwise_scaled(
+                d_a.get(), d_b.get(), destination, d_a_scale.get(), d_b_scale.get(),
+                n, k, 0.5f, 0.25f, existing, d_bias.get(), 0, stream);
+        };
+        {
+            ScopedBackendGraphCapture capture(graph, "int8_scalar_beta_on_final_device_row");
+            ASSERT_TRUE(capture.begin());
+            ASSERT_TRUE(launch(d_alias.get(), d_alias.get()));
+            capture.finish();
+        }
+        std::size_t count = 0;
+        ASSERT_EQ(hipGraphGetNodes(graph.graph(), nullptr, &count), hipSuccess);
+        ASSERT_GT(count, 0u);
+        std::vector<hipGraphNode_t> nodes(count);
+        ASSERT_EQ(hipGraphGetNodes(graph.graph(), nodes.data(), &count), hipSuccess);
+        for (auto node : nodes)
+        {
+            hipGraphNodeType type{};
+            ASSERT_EQ(hipGraphNodeGetType(node, &type), hipSuccess);
+            EXPECT_NE(type, hipGraphNodeTypeMemcpy);
+        }
+        ASSERT_TRUE(graph.instantiate());
+        const auto bytes = old.size() * sizeof(float);
+        for (const float sign : {1.0f, -1.0f, 1.0f})
+        {
+            for (int column = 0; column < n; ++column)
+                old[column] = sign * static_cast<float>(column % 23 - 11) * 0.0625f;
+            ASSERT_EQ(hipMemcpyAsync(d_existing.get(), old.data(), bytes, hipMemcpyHostToDevice, stream), hipSuccess);
+            ASSERT_EQ(hipMemcpyAsync(d_alias.get(), old.data(), bytes, hipMemcpyHostToDevice, stream), hipSuccess);
+            ASSERT_TRUE(launch(d_control.get(), d_existing.get()));
+            ASSERT_TRUE(graph.launch());
+            ASSERT_EQ(hipMemcpyAsync(control.data(), d_control.get(), bytes, hipMemcpyDeviceToHost, stream), hipSuccess);
+            ASSERT_EQ(hipMemcpyAsync(actual.data(), d_alias.get(), bytes, hipMemcpyDeviceToHost, stream), hipSuccess);
+            ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+            EXPECT_EQ(std::memcmp(actual.data(), control.data(), bytes), 0);
+            // Two device executions could both miss columns in a partial N
+            // tile. Also check every live column against the recorded weights.
+            for (int column = 0; column < n; ++column)
+            {
+                int dot = 0;
+                for (int inner = 0; inner < k; ++inner)
+                {
+                    const auto packed = (static_cast<std::size_t>(inner / 4) * n + column) * 4 + inner % 4;
+                    dot += activation[inner] * weights[packed];
+                }
+                const float expected = static_cast<float>(dot) * (0.25f * 0.125f * 0.5f)
+                    + 0.25f * old[column] + bias[column];
+                EXPECT_EQ(actual[column], expected) << "column " << column;
+            }
+            for (std::size_t column = n; column < old.size(); ++column)
+                EXPECT_EQ(actual[column], old[column]);
         }
     }
 }

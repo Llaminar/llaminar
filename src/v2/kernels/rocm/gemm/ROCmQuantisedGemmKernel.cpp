@@ -3175,8 +3175,9 @@ namespace llaminar2
                     // Fix: redirect kernel output to HBM workspace, then bulk DMA.
                     // =================================================================
                     const bool gemv_output_is_mapped = C_fp32->isMapped();
-                    const bool gemv_output_needs_copyout = gemv_output_is_mapped || beta != 0.0f;
-                    float *d_gemv_output = gemv_output_needs_copyout ? impl_->d_C_fp32 : d_output;
+                    // A native beta GEMV keeps its raw product until the terminal fold.
+                    float *const d_gemv_output = (gemv_output_is_mapped || beta != 0.0f)
+                        ? impl_->d_C_fp32 : d_output;
                     if (gemv_output_is_mapped)
                     {
                         static std::once_flag gemv_mapped_once;
@@ -3292,7 +3293,7 @@ namespace llaminar2
                         return true;
                     }
 
-                    // Use INT8 scatter+reduce GEMV when VNNI weights are available.
+                    // The admitted VNNI program owns final device columns including beta.
                     if (d_weights_vnni)
                     {
                         if (!rocmQuantGemm_quantizeActivationsBlockwiseScoped(
@@ -3302,9 +3303,10 @@ namespace llaminar2
                             return false;
                         }
 
+                        float *const int8_output = gemv_output_is_mapped ? impl_->d_C_fp32 : d_output;
                         const float *d_existing = (beta != 0.0f) ? d_output : nullptr;
-                        bool int8_decode_ok = rocmGemv_int8_int8_fp32_vnni_blockwise_scaled(
-                            impl_->d_A_int8, d_weights_vnni, d_gemv_output,
+                        const bool int8_decode_ok = rocmGemv_int8_int8_fp32_vnni_blockwise_scaled(
+                            impl_->d_A_int8, d_weights_vnni, int8_output,
                             impl_->d_scales_A_blockwise, d_scales_B,
                             n, k,
                             alpha, beta,
@@ -3313,26 +3315,16 @@ namespace llaminar2
 
                         if (!int8_decode_ok)
                         {
-                            int8_decode_ok = rocmGemv_int8_scatter_vnni_blockwise(
-                                impl_->d_A_int8, d_weights_vnni, d_gemv_output, impl_->d_scales_A_blockwise, d_scales_B, d_bias,
-                                impl_->d_scatter_partial, impl_->d_selfreduce_counters,
-                                n, k, alpha, beta, d_existing,
-                                rocm_device_id_, gpu_stream_);
-                        }
-
-                        if (!int8_decode_ok)
-                        {
-                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] INT8 scatter GEMV failed");
+                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] INT8 blockwise GEMV failed");
                             return false;
                         }
 
-                        // Bulk DMA from HBM workspace to output
-                        if (gemv_output_needs_copyout)
+                        if (gemv_output_is_mapped && hipMemcpyAsync(d_output, int8_output,
+                                static_cast<size_t>(n) * sizeof(float), hipMemcpyDeviceToDevice,
+                                static_cast<hipStream_t>(gpu_stream_)) != hipSuccess)
                         {
-                            (void)hipMemcpyAsync(d_output, impl_->d_C_fp32,
-                                           static_cast<size_t>(n) * sizeof(float),
-                                           hipMemcpyDeviceToDevice,
-                                           static_cast<hipStream_t>(gpu_stream_));
+                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] INT8 mapped-output publication failed");
+                            return false;
                         }
                         publishROCmTensorWrite(*C, rocm_device_id_, gpu_stream_);
                         return true;
