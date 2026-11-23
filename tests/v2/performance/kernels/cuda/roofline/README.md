@@ -99,12 +99,14 @@ card. The 10- and 20-CTA rows quantify the much smaller bandwidth available
 to the fewest-route phases. Use these rates to distinguish active work
 geometry from selection, reduction and weight-reader costs.
 
-Pass an explicit CTA count as the final hardware probe argument. For example,
-record 82- and 164-CTA captures on each card for `dram`, `l2`, `dp4a`, `ffma`,
-`prmt` and `int-mix`, then pass the receipts to the scorer.
+Pass an explicit CTA count after the mode and optionally specify threads per
+CTA. The default is 256. The cooperative grid probes use their compiled
+256-thread width. Keep the CTA count and width with each measurement so the
+scorer can distinguish the hardware references for different launch shapes.
 
 ```sh
 "$PROBE" 0 ffma 82 > device0-82-ffma.csv
+"$PROBE" 0 dp4a 40 512 > device0-40x512-dp4a.csv
 "$PROBE" hc-ffn-work 2560 320 256 256 512 10 10 > family-work.csv
 "$PROBE" hc-ffn-work 2560 320 320 320 512 10 4 > overlay-work.csv
 python3 tests/v2/performance/kernels/cuda/roofline/score_hc_ffn.py \

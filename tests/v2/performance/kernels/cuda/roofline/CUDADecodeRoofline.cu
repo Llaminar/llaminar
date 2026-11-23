@@ -40,7 +40,7 @@ namespace
 
     #define CUDA_CHECK(operation) check((operation), #operation)
 
-    constexpr unsigned threadsPerBlock = 256;
+    constexpr unsigned defaultThreadsPerBlock = 256;
     constexpr unsigned launchesPerGraph = 16;
     constexpr unsigned samples = 21;
     constexpr unsigned dotIterations = 4096;
@@ -62,7 +62,7 @@ namespace
      * @param output One checksum per participating CTA.
      */
     template<unsigned Joins>
-    __global__ __launch_bounds__(threadsPerBlock, 2) void decodeCooperativeCeiling(uint32_t* output)
+    __global__ __launch_bounds__(defaultThreadsPerBlock, 2) void decodeCooperativeCeiling(uint32_t* output)
     {
         if constexpr (Joins > 0)
         {
@@ -338,6 +338,7 @@ namespace
     {
         std::string_view name;
         unsigned blocks;
+        unsigned threads = defaultThreadsPerBlock;
         unsigned vectors;
         unsigned passes;
         Kernel kernel;
@@ -349,16 +350,16 @@ namespace
             if (kernel == Kernel::Cooperative)
                 return joins;
             if (kernel == Kernel::Logic || kernel == Kernel::MixedInteger)
-                return uint64_t(blocks) * threadsPerBlock * issueIterations * issueChains *
+                return uint64_t(blocks) * threads * issueIterations * issueChains *
                     (kernel == Kernel::MixedInteger ? 4u : 1u);
             if (kernel == Kernel::Dp4a)
-                return uint64_t(blocks) * threadsPerBlock * dotIterations * dotChains;
+                return uint64_t(blocks) * threads * dotIterations * dotChains;
             if (kernel == Kernel::Fma)
-                return uint64_t(blocks) * threadsPerBlock * fmaIterations * fmaChains;
+                return uint64_t(blocks) * threads * fmaIterations * fmaChains;
             if (kernel == Kernel::BytePermute)
-                return uint64_t(blocks) * threadsPerBlock * permuteIterations * permuteChains;
+                return uint64_t(blocks) * threads * permuteIterations * permuteChains;
             if (kernel == Kernel::Imma)
-                return uint64_t(blocks) * (threadsPerBlock / 32) * mmaIterations * mmaChains;
+                return uint64_t(blocks) * (threads / 32) * mmaIterations * mmaChains;
             return uint64_t(vectors) * passes * sizeof(uint4);
         }
     };
@@ -370,7 +371,7 @@ namespace
      */
     bool measure(const Probe& probe, cudaStream_t stream)
     {
-        const unsigned threads = probe.blocks * threadsPerBlock;
+        const unsigned threads = probe.blocks * probe.threads;
         const bool cooperative = probe.kernel == Kernel::Cooperative;
         const unsigned results = cooperative ? probe.blocks : threads;
         const auto* entry = cooperative ? cooperativeEntry(probe.joins) : nullptr;
@@ -382,7 +383,7 @@ namespace
         if (probe.kernel == Kernel::Read)
         {
             CUDA_CHECK(cudaMalloc(&input, size_t(probe.vectors) * sizeof(uint4)));
-            prepareReadInput<<<probe.blocks, threadsPerBlock, 0, stream>>>(input, probe.vectors);
+            prepareReadInput<<<probe.blocks, probe.threads, 0, stream>>>(input, probe.vectors);
             CUDA_CHECK(cudaGetLastError());
             CUDA_CHECK(cudaStreamSynchronize(stream));
         }
@@ -393,31 +394,31 @@ namespace
         for (unsigned launch = 0; launch < launchesPerGraph; ++launch)
         {
             if (probe.kernel == Kernel::Dp4a)
-                decodeDp4aCeiling<<<probe.blocks, threadsPerBlock, 0, stream>>>(
+                decodeDp4aCeiling<<<probe.blocks, probe.threads, 0, stream>>>(
                     reinterpret_cast<uint32_t*>(output));
             else if (probe.kernel == Kernel::Fma)
-                decodeFmaCeiling<<<probe.blocks, threadsPerBlock, 0, stream>>>(
+                decodeFmaCeiling<<<probe.blocks, probe.threads, 0, stream>>>(
                     reinterpret_cast<uint32_t*>(output));
             else if (probe.kernel == Kernel::BytePermute)
-                decodeBytePermuteCeiling<<<probe.blocks, threadsPerBlock, 0, stream>>>(
+                decodeBytePermuteCeiling<<<probe.blocks, probe.threads, 0, stream>>>(
                     reinterpret_cast<uint32_t*>(output));
             else if (probe.kernel == Kernel::Logic)
-                decodeIntegerIssueCeiling<false><<<probe.blocks, threadsPerBlock, 0, stream>>>(
+                decodeIntegerIssueCeiling<false><<<probe.blocks, probe.threads, 0, stream>>>(
                     reinterpret_cast<uint32_t*>(output));
             else if (probe.kernel == Kernel::MixedInteger)
-                decodeIntegerIssueCeiling<true><<<probe.blocks, threadsPerBlock, 0, stream>>>(
+                decodeIntegerIssueCeiling<true><<<probe.blocks, probe.threads, 0, stream>>>(
                     reinterpret_cast<uint32_t*>(output));
             else if (probe.kernel == Kernel::Imma)
-                decodeImmaCeiling<<<probe.blocks, threadsPerBlock, 0, stream>>>(output);
+                decodeImmaCeiling<<<probe.blocks, probe.threads, 0, stream>>>(output);
             else if (cooperative)
             {
                 auto* checksums = reinterpret_cast<uint32_t*>(output);
                 void* parameters[]{&checksums};
                 CUDA_CHECK(cudaLaunchCooperativeKernel(entry,
-                    probe.blocks, threadsPerBlock, parameters, 0, stream));
+                    probe.blocks, probe.threads, parameters, 0, stream));
             }
             else
-                decodeReadCeiling<<<probe.blocks, threadsPerBlock, 0, stream>>>(
+                decodeReadCeiling<<<probe.blocks, probe.threads, 0, stream>>>(
                     input, output, probe.vectors, probe.passes);
             CUDA_CHECK(cudaGetLastError());
         }
@@ -439,7 +440,7 @@ namespace
             float milliseconds = 0.0f;
             CUDA_CHECK(cudaEventElapsedTime(&milliseconds, start, end));
             std::printf("%.*s,%u,%u,%u,%u,%u,%llu,%.6f\n",
-                        int(probe.name.size()), probe.name.data(), sample, probe.blocks, threadsPerBlock,
+                        int(probe.name.size()), probe.name.data(), sample, probe.blocks, probe.threads,
                         probe.vectors, probe.passes, static_cast<unsigned long long>(probe.count()),
                         double(milliseconds) * 1000 / launchesPerGraph);
         }
@@ -535,9 +536,9 @@ int main(int argc, char** argv)
     if (argc >= 2 && std::string_view(argv[1]) == "hc-ffn-work")
         return llaminar2::test::cudaHCFFNRooflineWork(argc, argv);
     int device = -1;
-    if (argc != 3 && argc != 4)
+    if (argc < 3 || argc > 5)
     {
-        std::fprintf(stderr, "Usage: %s <cuda-device> <dram|l2|dp4a|prmt|imma|lop3|int-mix|ffma|grid-0|grid-1|grid-6> [blocks]\n", argv[0]);
+        std::fprintf(stderr, "Usage: %s <cuda-device> <dram|l2|dp4a|prmt|imma|lop3|int-mix|ffma|grid-0|grid-1|grid-6> [blocks [threads]]\n", argv[0]);
         return EXIT_FAILURE;
     }
     const std::string_view ordinal(argv[1]);
@@ -570,14 +571,31 @@ int main(int argc, char** argv)
     }
     Probe probe{.name = mode, .blocks = (cooperative ? 2 : 4) * sms,
         .vectors = 0, .passes = 1, .kernel = kernel};
-    const bool explicitBlocks = argc == 4;
+    if (argc == 5)
+    {
+        const std::string_view argument(argv[4]);
+        const auto width = std::from_chars(argument.data(), argument.data() + argument.size(), probe.threads);
+        if (width.ec != std::errc{} || width.ptr != argument.data() + argument.size() || !probe.threads ||
+            probe.threads > static_cast<unsigned>(properties.maxThreadsPerBlock) ||
+            properties.warpSize <= 0 || probe.threads % static_cast<unsigned>(properties.warpSize) != 0)
+        {
+            std::fprintf(stderr, "Requested CTA width must contain complete native warps and fit the device limit\n");
+            return EXIT_FAILURE;
+        }
+        if (cooperative && probe.threads != defaultThreadsPerBlock)
+        {
+            std::fprintf(stderr, "The cooperative reference admits only its compiled %u-thread width\n", defaultThreadsPerBlock);
+            return EXIT_FAILURE;
+        }
+    }
+    const bool explicitBlocks = argc >= 4;
     if (explicitBlocks)
     {
         const std::string_view argument(argv[3]);
         const auto count = std::from_chars(argument.data(), argument.data() + argument.size(), probe.blocks);
         if (count.ec != std::errc{} || count.ptr != argument.data() + argument.size() || !probe.blocks ||
             probe.blocks > static_cast<unsigned>(properties.maxGridSize[0]) ||
-            probe.blocks > std::numeric_limits<unsigned>::max() / (4 * threadsPerBlock))
+            probe.blocks > std::numeric_limits<unsigned>::max() / (4 * probe.threads))
         {
             std::fprintf(stderr, "Invalid native CTA count\n");
             return EXIT_FAILURE;
@@ -593,7 +611,7 @@ int main(int argc, char** argv)
         }
         int blocksPerSM = 0;
         CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &blocksPerSM, cooperativeEntry(probe.joins), threadsPerBlock, 0));
+            &blocksPerSM, cooperativeEntry(probe.joins), probe.threads, 0));
         if (probe.blocks > static_cast<unsigned>(blocksPerSM) * sms)
         {
             std::fprintf(stderr, "Requested CTA count exceeds the cooperative residency limit\n");
@@ -603,8 +621,8 @@ int main(int argc, char** argv)
     if (kernel == Kernel::Read)
     {
         const size_t l2Bytes = properties.l2CacheSize;
-        const unsigned bytesPerBlock = 4 * threadsPerBlock * sizeof(uint4);
-        const size_t minimumDramBytes = 8 * l2Bytes + probe.blocks * bytesPerBlock;
+        const size_t bytesPerBlock = 4 * probe.threads * sizeof(uint4);
+        const size_t minimumDramBytes = 8 * l2Bytes + size_t(probe.blocks) * bytesPerBlock;
         const size_t targetBytes = mode == "dram"
             ? std::max(size_t{256} << 20, minimumDramBytes)
             : l2Bytes / 2;
@@ -627,8 +645,14 @@ int main(int argc, char** argv)
             std::fprintf(stderr, "Device L2 cannot fit a complete launch wave\n");
             return EXIT_FAILURE;
         }
-        const unsigned stripe = 4 * threadsPerBlock * probe.blocks;
-        probe.vectors = targetBytes / sizeof(uint4) / stripe * stripe;
+        const unsigned stripe = 4 * probe.threads * probe.blocks;
+        const size_t vectors = targetBytes / sizeof(uint4) / stripe * stripe;
+        if (vectors == 0 || vectors > std::numeric_limits<unsigned>::max())
+        {
+            std::fprintf(stderr, "Read reference cannot represent the requested complete stripe geometry\n");
+            return EXIT_FAILURE;
+        }
+        probe.vectors = static_cast<unsigned>(vectors);
         probe.passes = mode == "dram" ? 1 : 128;
     }
     std::puts("probe,sample,blocks,threads,vectors,passes,count,us_per_launch");
