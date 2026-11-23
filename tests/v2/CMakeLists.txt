@@ -9810,6 +9810,15 @@ add_v2_test(V2_Unit_CPURingKVCache
     MPI_PROCS 1
 )
 
+add_v2_test(V2_Integration_CPUFP16CacheDirectPublication
+    COMMAND $<TARGET_FILE:v2_test_cpu_ring_kv_cache>
+            --gtest_filter=Test__CPURingKVCache.FP16ConversionPublishesOwnedRows
+    LABELS "V2;Integration;ProductionTestPreflight;KVCache;Ring;CPU;FP16;ByteExact;Regression"
+    MPI_PROCS 1
+    NO_MODELS
+)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUFP16CacheDirectPublication)
+
 # Test: IKVCache logical block IO for prefix cache restore/rollback
 add_executable(v2_test_ikv_cache_logical_block_io unit/kernels/Test__IKVCacheLogicalBlockIO.cpp)
 target_link_libraries(v2_test_ikv_cache_logical_block_io

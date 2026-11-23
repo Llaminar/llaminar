@@ -597,6 +597,21 @@ namespace llaminar2
          */
         bool append_kv_impl(int layer, int seq_idx, const KTensorT *new_k, const VTensorT *new_v, int num_tokens);
 
+        /** @brief Select the existing ordinary or serial-equivalent ring advance contract. */
+        enum class ConvertedAppendGeometry { Ordinary, Verifier };
+
+        /**
+         * @brief Convert two host-owned producers directly into their FP16 ring slots.
+         * @param layer Original cache layer. @param seq_idx Owning cache sequence.
+         * @param keys Producer key tensor. @param values Producer value tensor.
+         * @param rows Number of producer rows to append.
+         * @param geometry Physical source and ring advance contract selected by the original entry.
+         * @return True after both destinations and their shared cursor are published.
+         */
+        bool appendConvertedFP16(int layer, int seq_idx, const TensorBase &keys, const TensorBase &values,
+            int rows, ConvertedAppendGeometry geometry)
+            requires (KPrecision == ActivationPrecision::FP16 && VPrecision == ActivationPrecision::FP16);
+
         /**
          * @brief Encode FP32 projections directly into native anchored K/V slots.
          * @param layer Local attention layer owning the cache entry.

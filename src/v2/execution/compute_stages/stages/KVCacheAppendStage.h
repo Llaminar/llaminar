@@ -362,8 +362,6 @@ namespace llaminar2
         bool shouldUseDecodeEquivalentVerifierAppend(int request_rows) const;
 
         Params params_;
-        std::unique_ptr<FP16Tensor> fp16_k_scratch_;
-        std::unique_ptr<FP16Tensor> fp16_v_scratch_;
         std::unique_ptr<Q8_1Tensor> q8_k_scratch_;
         std::unique_ptr<Q8_1Tensor> q8_v_scratch_;
         std::shared_ptr<TQ4Tensor> tq4_k_scratch_;

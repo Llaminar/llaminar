@@ -4,6 +4,7 @@
  */
 
 #include <gtest/gtest.h>
+#include <cstring>
 
 #include "kernels/cpu/CPURingKVCache.h"
 #include "tensors/Tensors.h"
@@ -19,6 +20,64 @@ static MPIContext getTestMPIContext()
 class Test__CPURingKVCache : public ::testing::Test
 {
 };
+
+/** @test Host FP16 conversion publishes exact bytes and the original cursor after wrap. */
+TEST_F(Test__CPURingKVCache, FP16ConversionPublishesOwnedRows)
+{
+    constexpr int capacity = 5, heads = 3, head_dim = 11, width = heads * head_dim;
+    for (auto layout : {KVCacheLayoutMode::POSITION_MAJOR, KVCacheLayoutMode::HEAD_MAJOR})
+    for (bool verifier : {false, true})
+    {
+        SCOPED_TRACE(static_cast<int>(layout));
+        SCOPED_TRACE(verifier);
+        auto context = getTestMPIContext();
+        CPURingKVCacheFP16 reference(context, 1, 1, capacity, heads, head_dim, DeviceId::cpu(), layout);
+        CPURingKVCacheFP16 direct(context, 1, 1, capacity, heads, head_dim, DeviceId::cpu(), layout);
+
+        for (int rows : {3, 2, 9, 6})
+        {
+            const std::vector<std::size_t> shape{static_cast<std::size_t>(rows), width};
+            FP32Tensor key(shape), value(shape);
+            FP16Tensor staged_key(shape), staged_value(shape);
+            for (int i = 0; i < rows * width; ++i)
+            {
+                const auto perturb = static_cast<float>((i * 23 + rows) % 115 - 53);
+                key.mutable_data()[i] = perturb * 0.003165f;
+                value.mutable_data()[i] = (i % 5 == 0) ? -0.0f : (perturb + 0.75f) * -0.012311f;
+            }
+            staged_key.from_fp32(key.data(), rows * width);
+            staged_value.from_fp32(value.data(), rows * width);
+            SCOPED_TRACE(rows);
+            if (verifier)
+            {
+                ASSERT_TRUE(reference.appendVerifierRowsDecodeEquivalent(0, 0, &staged_key, &staged_value, rows, nullptr));
+                ASSERT_TRUE(direct.appendVerifierRowsDecodeEquivalent(0, 0, &key, &value, rows, nullptr));
+            }
+            else
+            {
+                ASSERT_TRUE(reference.append(0, 0, &staged_key, &staged_value, rows));
+                ASSERT_TRUE(direct.append(0, 0, &key, &value, rows));
+            }
+            EXPECT_EQ(reference.ring_head(0, 0), direct.ring_head(0, 0));
+            EXPECT_EQ(reference.ring_size(0, 0), direct.ring_size(0, 0));
+            if (direct.ring_size(0, 0) == capacity)
+            {
+                constexpr size_t bytes = capacity * width * sizeof(uint16_t);
+                ASSERT_NE(direct.get_k(0, 0), nullptr);
+                ASSERT_NE(direct.get_v(0, 0), nullptr);
+                EXPECT_EQ(std::memcmp(reference.get_k(0, 0)->raw_data(), direct.get_k(0, 0)->raw_data(), bytes), 0);
+                EXPECT_EQ(std::memcmp(reference.get_v(0, 0)->raw_data(), direct.get_v(0, 0)->raw_data(), bytes), 0);
+            }
+        }
+
+        FP32Tensor key({2, width}), bad_value({2, width - 1});
+        EXPECT_FALSE(direct.append(0, 0, &key, &bad_value, 2));
+        EXPECT_EQ(reference.ring_head(0, 0), direct.ring_head(0, 0));
+        EXPECT_EQ(reference.ring_size(0, 0), direct.ring_size(0, 0));
+        EXPECT_EQ(std::memcmp(reference.get_k(0, 0)->raw_data(), direct.get_k(0, 0)->raw_data(),
+            capacity * width * sizeof(uint16_t)), 0);
+    }
+}
 
 TEST_F(Test__CPURingKVCache, Construction_InitialState)
 {

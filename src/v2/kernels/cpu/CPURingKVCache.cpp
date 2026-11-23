@@ -33,12 +33,14 @@
 #include "turboquant/TurboQuantQuantizeTQ4.h"
 #include "turboquant/TurboQuantQuantizeTQ8.h"
 #include "../../tensors/SIMDHelpers.h"
+#include "../../utils/KVCacheProfiler.h"
 #include "../../utils/OpenMPUtils.h"
 #include "../../utils/PerfStatsCollector.h"
 
 #include <algorithm>
 #include <cstring>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 
 namespace llaminar2
@@ -574,10 +576,102 @@ namespace llaminar2
         const VTensorT *typed_v = dynamic_cast<const VTensorT *>(new_v);
         if (!typed_k || !typed_v)
         {
+            if constexpr (KPrecision == ActivationPrecision::FP16 && VPrecision == ActivationPrecision::FP16)
+                return appendConvertedFP16(layer, seq_idx, *new_k, *new_v, num_tokens,
+                    ConvertedAppendGeometry::Ordinary);
             return false;
         }
 
         return append_kv_impl(layer, seq_idx, typed_k, typed_v, num_tokens);
+    }
+
+    /** @copydoc CPURingKVCache::appendConvertedFP16 */
+    template <ActivationPrecision KPrecision, ActivationPrecision VPrecision>
+    bool CPURingKVCache<KPrecision, VPrecision>::appendConvertedFP16(
+        int layer, int seq_idx, const TensorBase &keys, const TensorBase &values,
+        int rows, ConvertedAppendGeometry geometry)
+        requires (KPrecision == ActivationPrecision::FP16 && VPrecision == ActivationPrecision::FP16)
+    {
+        auto &entry = entries_[layer][seq_idx];
+        if (!entry.K || !entry.V || &keys == entry.K.get() || &keys == entry.V.get() ||
+            &values == entry.K.get() || &values == entry.V.get())
+            return false;
+
+        /** @brief Borrowed FP32 producer rows prepared before touching the ring. */
+        struct Source
+        {
+            const float *data;
+            bool head_major;
+        };
+
+        // Authenticate both sources before taking mutable destination storage.
+        const auto prepare = [&](const TensorBase &tensor) -> Source {
+            if (tensor.shape().size() != 2)
+                return {};
+            if (tensor.cols() == static_cast<size_t>(kv_dim_) && tensor.rows() >= static_cast<size_t>(rows))
+                return {tensor.fp32_data(), false};
+            if (geometry == ConvertedAppendGeometry::Verifier &&
+                tensor.cols() == static_cast<size_t>(head_dim_) &&
+                tensor.rows() == static_cast<size_t>(local_n_kv_heads_) * rows)
+                return {tensor.fp32_data(), true};
+            return {};
+        };
+        const Source k = prepare(keys);
+        const Source v = prepare(values);
+        if (!k.data || !v.data)
+            return false;
+
+        auto *out_k = static_cast<uint16_t *>(entry.K->raw_mutable_data());
+        auto *out_v = static_cast<uint16_t *>(entry.V->raw_mutable_data());
+        if (!out_k || !out_v)
+            return false;
+
+        // Ordinary append historically drops excess source rows before
+        // advancing the physical cursor. Verifier append advances as if every
+        // serial row were appended, including any overwritten within this call.
+        const int skipped = geometry == ConvertedAppendGeometry::Ordinary
+            ? std::max(0, rows - max_seq_len_) : 0;
+        const KVRingAppendPlan plan(max_seq_len_, entry.head, entry.size, rows - skipped);
+        if (plan.overwrittenRows() > 0 && !wrap_warned_)
+        {
+            LOG_WARN("Context window full (" << max_seq_len_
+                                             << " tokens). Sliding window is now overwriting oldest tokens. "
+                                             << "Use -c <size> to increase context length.");
+            wrap_warned_ = true;
+        }
+
+        const auto start = std::chrono::steady_clock::now();
+        const auto convert = [&](const Source &source, uint16_t *out, int row, int dest) {
+            if (layout_mode_ == KVCacheLayoutMode::POSITION_MAJOR && !source.head_major)
+            {
+                simd::convert_fp32_to_fp16(source.data + static_cast<size_t>(row) * kv_dim_,
+                    out + static_cast<size_t>(dest) * kv_dim_, kv_dim_);
+                return;
+            }
+            for (int head = 0; head < local_n_kv_heads_; ++head)
+            {
+                const auto src = source.head_major ? static_cast<size_t>(head) * rows + row
+                                                     : static_cast<size_t>(row) * local_n_kv_heads_ + head;
+                const auto dst = layout_mode_ == KVCacheLayoutMode::HEAD_MAJOR
+                    ? static_cast<size_t>(head) * max_seq_len_ + dest
+                    : static_cast<size_t>(dest) * local_n_kv_heads_ + head;
+                simd::convert_fp32_to_fp16(source.data + src * head_dim_, out + dst * head_dim_, head_dim_);
+            }
+        };
+        const int first = plan.firstRetainedSourceRow();
+        for (int i = 0; i < plan.retainedRows(); ++i)
+        {
+            const int row = first + i;
+            const int dest = plan.destination(row);
+            convert(k, out_k, row + skipped, dest);
+            convert(v, out_v, row + skipped, dest);
+        }
+        entry.head = plan.headAfter();
+        entry.size = plan.sizeAfter();
+        KVCacheProfiler::record(KVCacheOpType::CONVERT_TO_FP16,
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count(),
+            plan.retainedRows(), static_cast<std::uint64_t>(plan.retainedRows()) * kv_dim_ * 2u * sizeof(uint16_t));
+        return true;
     }
 
     /**
@@ -783,6 +877,14 @@ namespace llaminar2
         const auto *new_v = dynamic_cast<const VTensorT *>(V);
         if (!new_k || !new_v)
         {
+            if constexpr (KPrecision == ActivationPrecision::FP16 && VPrecision == ActivationPrecision::FP16)
+            {
+                const auto *keys = dynamic_cast<const TensorBase *>(K);
+                const auto *values = dynamic_cast<const TensorBase *>(V);
+                if (keys && values)
+                    return appendConvertedFP16(layer, seq_idx, *keys, *values, verifier_rows,
+                        ConvertedAppendGeometry::Verifier);
+            }
             LOG_ERROR("[CPURingKVCache] Grouped verifier append type mismatch: K="
                       << K->dtype_name() << " V=" << V->dtype_name());
             return false;

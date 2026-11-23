@@ -601,31 +601,8 @@ namespace llaminar2
                                                             << params_.layer_idx << " seq_idx=" << seq_idx);
 
                 bool success = false;
-                if (cache_k_precision == ActivationPrecision::FP16 &&
-                    cache_v_precision == ActivationPrecision::FP16)
-                {
-                    const auto conv_start = std::chrono::high_resolution_clock::now();
-
-                    auto k_fp16 = std::make_unique<FP16Tensor>(
-                        std::vector<size_t>{static_cast<size_t>(seq_len), kv_dim});
-                    auto v_fp16 = std::make_unique<FP16Tensor>(
-                        std::vector<size_t>{static_cast<size_t>(seq_len), kv_dim});
-
-                    k_fp16->from_fp32(k_slice->data(), static_cast<size_t>(seq_len) * kv_dim);
-                    v_fp16->from_fp32(v_slice->data(), static_cast<size_t>(seq_len) * kv_dim);
-
-                    const auto conv_end = std::chrono::high_resolution_clock::now();
-                    const uint64_t conv_ns = static_cast<uint64_t>(
-                        std::chrono::duration_cast<std::chrono::nanoseconds>(conv_end - conv_start).count());
-                    const uint64_t conv_bytes = static_cast<uint64_t>(
-                        estimateTensorAppendBytes(k_fp16.get(), seq_len) +
-                        estimateTensorAppendBytes(v_fp16.get(), seq_len));
-                    KVCacheProfiler::record(KVCacheOpType::CONVERT_TO_FP16, conv_ns, static_cast<uint64_t>(seq_len), conv_bytes);
-
-                    success = append_to_cache(seq_idx, k_fp16.get(), v_fp16.get(), seq_len);
-                }
-                else if (cache_k_precision == ActivationPrecision::Q8_1 &&
-                         cache_v_precision == ActivationPrecision::Q8_1)
+                if (cache_k_precision == ActivationPrecision::Q8_1 &&
+                    cache_v_precision == ActivationPrecision::Q8_1)
                 {
                     const auto conv_start = std::chrono::high_resolution_clock::now();
 
@@ -730,9 +707,6 @@ namespace llaminar2
         const bool cache_is_fp32 =
             cache_k_precision == ActivationPrecision::FP32 &&
             cache_v_precision == ActivationPrecision::FP32;
-        const bool cache_is_fp16 =
-            cache_k_precision == ActivationPrecision::FP16 &&
-            cache_v_precision == ActivationPrecision::FP16;
         const bool cache_is_q8_1 =
             cache_k_precision == ActivationPrecision::Q8_1 &&
             cache_v_precision == ActivationPrecision::Q8_1;
@@ -933,52 +907,6 @@ namespace llaminar2
             if (!success)
             {
                 LOG_ERROR("[KVCacheAppendStage] append failed (after conversion)");
-                return false;
-            }
-
-            return true;
-        }
-
-        // If cache is FP16 but inputs are not, convert K/V to FP16 for cache append
-        if (!has_gpu_inputs && cache_is_fp16 && (params_.K->native_type() != TensorType::FP16 || params_.V->native_type() != TensorType::FP16))
-        {
-            const auto conv_start = std::chrono::high_resolution_clock::now();
-
-            const size_t kv_dim = params_.K->shape().size() > 1 ? params_.K->shape()[1] : 0;
-
-            const std::vector<size_t> fp16_shape{static_cast<size_t>(total_tokens), kv_dim};
-            if (!fp16_k_scratch_ || fp16_k_scratch_->shape() != fp16_shape)
-            {
-                fp16_k_scratch_ = std::make_unique<FP16Tensor>(fp16_shape);
-            }
-            if (!fp16_v_scratch_ || fp16_v_scratch_->shape() != fp16_shape)
-            {
-                fp16_v_scratch_ = std::make_unique<FP16Tensor>(fp16_shape);
-            }
-
-            const float *k_fp32 = params_.K->fp32_data();
-            const float *v_fp32 = params_.V->fp32_data();
-            if (!k_fp32 || !v_fp32)
-            {
-                LOG_ERROR("[KVCacheAppendStage] Cannot get FP32 data for FP16 cache conversion");
-                return false;
-            }
-
-            fp16_k_scratch_->from_fp32(k_fp32, static_cast<size_t>(total_tokens) * kv_dim);
-            fp16_v_scratch_->from_fp32(v_fp32, static_cast<size_t>(total_tokens) * kv_dim);
-
-            const auto conv_end = std::chrono::high_resolution_clock::now();
-            const uint64_t conv_ns = static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(conv_end - conv_start).count());
-            const uint64_t conv_bytes = static_cast<uint64_t>(
-                estimateTensorAppendBytes(fp16_k_scratch_.get(), total_tokens) +
-                estimateTensorAppendBytes(fp16_v_scratch_.get(), total_tokens));
-            KVCacheProfiler::record(KVCacheOpType::CONVERT_TO_FP16, conv_ns, static_cast<uint64_t>(total_tokens), conv_bytes);
-
-            bool success = append_to_cache(params_.seq_idx, fp16_k_scratch_.get(), fp16_v_scratch_.get(), total_tokens);
-            if (!success)
-            {
-                LOG_ERROR("[KVCacheAppendStage] append failed (FP16 cache conversion path)");
                 return false;
             }
 
