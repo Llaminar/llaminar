@@ -258,6 +258,13 @@ namespace llaminar2::cpu::native_quantised::multi_scale
         static F halfWords(I packed) noexcept
         { return expandHalfBits(vmovn_u32(std::bit_cast<uint32x4_t>(packed))); }
 
+        /** @brief Round four FP32 lanes to binary16 (round-to-nearest-even, FPCR default).
+         * @param value Four computed metadata products.
+         * @return Four zero-extended binary16 words; NaN is quieted with its high payload.
+         */
+        static I halfBits(F value) noexcept
+        { return std::bit_cast<I>(vmovl_u16(vreinterpret_u16_f16(vcvt_f16_f32(std::bit_cast<float32x4_t>(value))))); }
+
     private:
         /** @brief Preserve the portable half contract while using native finite conversion.
          * @param half Four raw binary16 words.

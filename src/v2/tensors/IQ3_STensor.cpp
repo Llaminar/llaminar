@@ -497,6 +497,11 @@ namespace llaminar2
         const int nibble = (sub_idx & 1) ? (sc_byte >> 4) : (sc_byte & 0xF);
 
         std::memcpy(vnniPayloadDst(ctx, linear), payload_buf, 13);
+        if (vnniCoded(ctx))
+        {
+            vnniStoreCoded(ctx, linear, destination_n, b, static_cast<uint32_t>(nibble), blk->d);
+            return;
+        }
         if (!ctx.mins_array)
             throw std::invalid_argument("IQ3_S source preparation requires raw coefficient storage");
         ctx.scales_array[linear] = blk->d;

@@ -25,6 +25,8 @@
 #include "CPUNativeQuantisedDecode.h"
 #include "CPUNativeQuantisedFP16.h"
 #include "CPUNativeQuantisedActivationSums.h"
+#include "CPUNativeQuantisedCodedMetadata.h"
+#include "CPUNativeQuantisedPreparedFootprint.h"
 #if defined(__aarch64__) && defined(__ARM_NEON)
 #include "CPUNativeNEONMultiScaleOps.h"
 #else
@@ -152,6 +154,11 @@ namespace llaminar2::cpu::native_quantised::multi_scale
             const __m256i bits = std::bit_cast<__m256i>(words & 65535);
             return std::bit_cast<F>(_mm256_cvtph_ps(_mm_packus_epi32(
                 _mm256_castsi256_si128(bits), _mm256_extracti128_si256(bits, 1))));
+        }        /** @return Round-to-nearest-even binary16 bits of each lane, zero-extended (F16C). */
+        static I halfBits(F value)
+        {
+            return std::bit_cast<I>(_mm256_cvtepu16_epi32(_mm256_cvtps_ph(
+                std::bit_cast<__m256>(value), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC)));
         }
     };
 
@@ -253,6 +260,11 @@ namespace llaminar2::cpu::native_quantised::multi_scale
         {
             return std::bit_cast<F>(_mm512_cvtph_ps(
                 _mm512_cvtepi32_epi16(std::bit_cast<__m512i>(words))));
+        }        /** @return Round-to-nearest-even binary16 bits of each lane, zero-extended. */
+        static I halfBits(F value)
+        {
+            return std::bit_cast<I>(_mm512_cvtepu16_epi32(_mm512_cvtps_ph(
+                std::bit_cast<__m512>(value), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC)));
         }
     };
 #endif
@@ -271,6 +283,75 @@ namespace llaminar2::cpu::native_quantised::multi_scale
         V value;
         std::memcpy(&value, source, sizeof(value));
         return value;
+    }
+
+    /**
+     * @brief Load payload word @p offset of a coded compact block for SIMD columns.
+     * @tparam Raw True to return the stored bytes; false restores the sign-selector
+     *         parity bits that code-in-payload formats repurpose for their code.
+     * @param unit First byte of the 64-column block.
+     * @param offset Payload word index (bytes 4*offset .. 4*offset+3).
+     * @param column First SIMD column.
+     *
+     * Whole words live at `offset * 256 + column * 4`; the 1-2 byte tail of
+     * IQ2_S/IQ2_XS/IQ1_S/IQ1_M is a `[column][tail]` plane loaded
+     * zero-extended, which is exactly the word the per-block layout held.
+     */
+    template <int Codebook, typename Ops, bool Raw = false>
+    [[gnu::always_inline]] inline typename Ops::I payloadWord(const uint8_t *unit, int offset, int column)
+    {
+        using I = typename Ops::I;
+        using L = coded_metadata::Lanes<Ops>;
+        constexpr int words = static_cast<int>(preparedCompactPayloadWords(Codebook));
+        constexpr int tail = static_cast<int>(preparedCompactPayloadTailBytes(Codebook));
+        I word{};
+        if (offset < words)
+            word = load<I>(unit + offset * 256 + column * 4);
+        else if constexpr (tail == 1)
+            word = L::bytes(unit + words * 256 + column);
+        else if constexpr (tail == 2)
+            word = L::halfwords(unit + words * 256 + column * 2);
+        if constexpr (!Raw)
+        {
+            // Sign selectors carry the code in their parity bits (IQ3_XXS word
+            // 2, IQ2_XXS word 1, IQ2_XS words 1 and 2). Restoring parity on the
+            // IQ2_XS qh byte only sets its unused bit 7.
+            const bool signs = (Codebook == 12 && offset == 2) || (Codebook == 15 && offset == 1) ||
+                               (Codebook == 14 && offset >= 1);
+            if (signs)
+                word = L::restoreSignParity(word);
+        }
+        return word;
+    }
+
+    /**
+     * @brief Codes of SIMD columns of one coded compact block.
+     * @param unit First byte of the 64-column block.
+     * @param data_stride Payload bytes of the block (code planes follow).
+     * @param column First SIMD column.
+     */
+    template <int Codebook, typename Ops>
+    [[gnu::always_inline]] inline typename Ops::I compactCode(const uint8_t *unit, int data_stride, int column)
+    {
+        using I = typename Ops::I;
+        using L = coded_metadata::Lanes<Ops>;
+        if constexpr (Codebook == 16)
+            return (payloadWord<Codebook, Ops, true>(unit, 1, column) >> 12) & 15;
+        else if constexpr (Codebook == 12 || Codebook == 15)
+        {
+            const I word = payloadWord<Codebook, Ops, true>(unit, Codebook == 12 ? 2 : 1, column);
+            return ((word >> 7) & 1) | ((word >> 14) & 2) | ((word >> 21) & 4) | ((word >> 28) & 8);
+        }
+        else if constexpr (Codebook == 14)
+        {
+            // Sign bytes 5..8: word 1 bytes 1..3 and the tail byte; qh (word 1 byte 0) high nibble.
+            const I word = payloadWord<Codebook, Ops, true>(unit, 1, column);
+            const I tail = payloadWord<Codebook, Ops, true>(unit, 2, column);
+            return ((word >> 15) & 1) | ((word >> 22) & 2) | ((word >> 29) & 4) | ((tail >> 4) & 8) |
+                   (word & 0xF0);
+        }
+        else
+            return L::template code<static_cast<std::uint8_t>(Codebook)>(unit + data_stride, column);
     }
 
     /**
@@ -307,8 +388,8 @@ namespace llaminar2::cpu::native_quantised::multi_scale
             throw std::invalid_argument("Multi-scale diagnostic requires its bounded compact source payload");
         uint8_t payload[16]{};
         int8_t values[32];
-        for (int byte = 0; byte < packed.payload_bytes; ++byte)
-            payload[byte] = packed.interleavedB(chunk, kb, byte / 4, column / 16)[(column % 16) * 4 + byte % 4];
+        compactColumnPayload(packed.blockUnit(chunk, kb), packed.codebook_id, column, payload);
+        native_quantised_superblock::restoreCodedPayload(packed.codebook_id, payload);
         decode_native_block(packed.codebook_id, payload, values);
         int dots[2]{}, sums[4]{};
         for (int k = 0; k < 32; ++k)
@@ -332,7 +413,7 @@ namespace llaminar2::cpu::native_quantised::multi_scale
         float contribution = activation_scale * (scale0 * dots[0] + scale1 * dots[1]);
         if (packed.codebook_id == 10)
         {
-            const uint32_t bits = packed.chunkEffectiveMins(chunk, kb)[column];
+            const uint32_t bits = packed.codedBlockMetadata(chunk, kb, column).emin;
             const float min0 = fp16_to_fp32(static_cast<uint16_t>(bits));
             const float min1 = fp16_to_fp32(static_cast<uint16_t>(bits >> 16));
             contribution += activation_scale * (min0 * (sums[0] + sums[1]) + min1 * (sums[2] + sums[3]));
@@ -364,7 +445,7 @@ namespace llaminar2::cpu::native_quantised::multi_scale
     {
         static_assert(Codebook == 9 || Codebook == 10);
         using I = typename Ops::I;
-        const auto word = [&](int index) { return load<I>(unit + index * 256 + column * 4); };
+        const auto word = [&](int index) { return payloadWord<Codebook, Ops>(unit, index, column); };
         I values = (word(Group / 4) >> ((Group % 4) * 2)) & 0x03030303;
         if constexpr (Codebook == 9)
         {
@@ -427,7 +508,7 @@ namespace llaminar2::cpu::native_quantised::multi_scale
             // table whose upper half is zero.
             const auto quarter = [&]<int Q>() {
                 const auto word = [&](int offset) {
-                    return load<I>(unit + offset * 256 + column * 4);
+                    return payloadWord<Codebook, Ops>(unit, offset, column);
                 };
                 const I index_even = (word((2 * Q) / 4) >> (8 * ((2 * Q) % 4))) & 255;
                 const I index_odd = (word((2 * Q + 1) / 4) >> (8 * ((2 * Q + 1) % 4))) & 255;
@@ -449,7 +530,7 @@ namespace llaminar2::cpu::native_quantised::multi_scale
         {
             const auto quarter = [&]<int Q>() {
                 const auto word = [&](int offset) {
-                    return load<I>(unit + offset * 256 + column * 4);
+                    return payloadWord<Codebook, Ops>(unit, offset, column);
                 };
                 I index = (word(0) >> (Q * 8)) & 255;
                 if constexpr (Codebook == 16)
@@ -526,7 +607,7 @@ namespace llaminar2::cpu::native_quantised::multi_scale
             // encoding owned by the arithmetic family.
             const auto quarter = [&]<int Q>() {
                 const auto word = [&](int offset) {
-                    return load<I>(unit + offset * 256 + column * 4);
+                    return payloadWord<Codebook, Ops>(unit, offset, column);
                 };
                 const I index_even = (word((2 * Q) / 4) >> (8 * ((2 * Q) % 4))) & 255;
                 const I index_odd = (word((2 * Q + 1) / 4) >> (8 * ((2 * Q + 1) % 4))) & 255;
@@ -560,7 +641,7 @@ namespace llaminar2::cpu::native_quantised::multi_scale
         {
             const auto quarter = [&]<int Q>() {
                 const auto word = [&](int offset) {
-                    return load<I>(unit + offset * 256 + column * 4);
+                    return payloadWord<Codebook, Ops>(unit, offset, column);
                 };
                 I index = (word(0) >> (Q * 8)) & 255;
                 if constexpr (Codebook == 16)
@@ -696,33 +777,35 @@ namespace llaminar2::cpu::native_quantised::multi_scale
                     Tree == Reduction::OrderedPartitions ? std::min(first + blocks_per_partition, end) : end;
                 for (int kb = first; kb < last; ++kb)
                 {
-                    const uint8_t *const unit =
-                        packed.interleavedBase() + (static_cast<size_t>(chunk) * packed.blocks_per_row + kb) *
-                                                       packed.interleaved_block_stride;
+                    const uint8_t *const unit = packed.admittedBlockUnit(chunk, kb);
                     I low[Rows]{}, high[Rows]{};
                     dotHalf<Codebook, 0, Lanes, Rows, Ops>(unit, column, activation, kb, low);
                     dotHalf<Codebook, 1, Lanes, Rows, Ops>(unit, column, activation, kb, high);
-                    F scale0 = Ops::half(packed.chunkScales(chunk, kb) + column);
-                    F scale1;
+                    // Coded metadata: the block's code and its superblock word
+                    // reconstruct exactly the factors the per-block words held.
+                    using L = coded_metadata::Lanes<Ops>;
+                    const I superblock_word = L::template superblockWords<static_cast<std::uint8_t>(Codebook)>(
+                        packed.admittedSuperblockHeader(chunk, kb), column);
+                    const I code = compactCode<Codebook, Ops>(unit, packed.data_stride, column);
+                    F scale0, scale1;
+                    [[maybe_unused]] coded_metadata::Factors<F> factors;
                     if constexpr (Codebook == 13)
                     {
-                        // The secondary is a source byte, not a second half.
+                        // IQ2_S keeps its source factors: base d and the coefficient byte.
                         // Function contraction/reassociation is disabled above;
                         // each source multiply remains a separate FP32 edge.
-                        const I metadata = Ops::words(packed.chunkMins(chunk, kb) + column);
-                        // A sealed view's coefficients were admitted at publication;
-                        // owners without a seal keep the per-block check.
-                        if constexpr (!requires { Packed::metadata_admitted; })
-                            if (!Ops::metadataFits(metadata, 255u))
-                                throw std::invalid_argument("IQ2_S coefficient contains reserved bits");
-                        const F low_coefficient = __builtin_convertvector(metadata & 15, F);
-                        const F high_coefficient = __builtin_convertvector((metadata >> 4) & 15, F);
-                        const F base = scale0;
+                        const F low_coefficient = __builtin_convertvector(code & 15, F);
+                        const F high_coefficient = __builtin_convertvector((code >> 4) & 15, F);
+                        const F base = L::half(superblock_word);
                         scale0 = (base * (low_coefficient + 0.5f)) * 0.25f;
                         scale1 = (base * (high_coefficient + 0.5f)) * 0.25f;
                     }
                     else
-                        scale1 = Ops::half(packed.chunkMins(chunk, kb) + column);
+                    {
+                        factors = coded_metadata::reconstruct<static_cast<std::uint8_t>(Codebook), Ops>(code, superblock_word);
+                        scale0 = factors.primary;
+                        scale1 = factors.secondary;
+                    }
                     // Rows is at most four. Expanding this tiny loop keeps every
                     // accumulator/dot in a distinct register: a runtime-indexed
                     // array otherwise spills the entire tile on every K block.
@@ -769,14 +852,13 @@ namespace llaminar2::cpu::native_quantised::multi_scale
                         {
                             // Minima retain their original half bits and the GPU
                             // rounds this correction independently of the dot term.
-                            const I bits = load<I>(packed.chunkEffectiveMins(chunk, kb) + column);
-                            const F correction0 = Ops::halfWords(bits) * static_cast<float>(sum0);
-                            const F correction1 = Ops::halfWords(bits >> 16) * static_cast<float>(sum1);
+                            const F correction0 = factors.emin_low * static_cast<float>(sum0);
+                            const F correction1 = factors.emin_high * static_cast<float>(sum1);
                             contribution += activation_scale * (correction0 + correction1);
                         }
                         if constexpr (Codebook == 17)
                         {
-                            const I signs = load<I>(unit + 256 + column * 4);
+                            const I signs = payloadWord<Codebook, Ops>(unit, 1, column);
                             const auto delta = [&](int bit, int sum) {
                                 // Materialize the sign on the FP32 delta itself so
                                 // zero sums preserve exactly the GPU's signed zero.

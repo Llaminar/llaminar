@@ -78,7 +78,26 @@ namespace llaminar2
         int destination_block_count = 0;
         /// Encoding of scales_array; the destination owner selects it.
         VnniPrimaryScaleLayout primary_layout = VnniPrimaryScaleLayout::FP16Words;
+
+        /**
+         * Superblock-coded destination (NativeQuantisedSuperblockMetadata.h).
+         * When non-null, a superblock-codable format writes each block's
+         * zero-extended source scale code here (same linear index as the
+         * payload) and, once per (row, source superblock), the superblock word
+         * (`d`, or `d | dmin << 16`) to `superblocks_array`; code-in-payload
+         * formats also embed the code in the written payload. The per-block
+         * scale/minimum/effective-minimum arrays are then not written. These
+         * are the same codes and words the CUDA/HIP repack kernels publish.
+         */
+        uint32_t *codes_array = nullptr;       ///< [window blocks x N]
+        uint32_t *superblocks_array = nullptr; ///< [window superblocks x N], window superblock = b/8 - origin/8
     };
+
+    /** @return Whether @p ctx requests superblock-coded metadata. */
+    [[nodiscard]] inline bool vnniCoded(const VnniPackContext &ctx) noexcept
+    {
+        return ctx.codes_array != nullptr;
+    }
 
     // =================================================================
     // Inline helpers for VNNI interleaved layout
@@ -103,6 +122,31 @@ namespace llaminar2
             throw std::out_of_range("NativeQuantised packing coordinates outside destination window");
         return static_cast<size_t>(b - ctx.destination_block_origin) * ctx.N +
                static_cast<size_t>(n);
+    }
+
+    /**
+     * @brief Publish one block's coded metadata: its code and, once per superblock, its word.
+     * @param ctx Coded destination (vnniCoded()).
+     * @param linear Window-local block index from vnniLinearIdx().
+     * @param n Destination row.
+     * @param b Absolute source K-block index.
+     * @param code Zero-extended source scale code of the block.
+     * @param superblock Superblock word of the block's source superblock.
+     *
+     * Every block of one source superblock carries the same word; the first
+     * block of the superblock (or of the window) publishes it.
+     */
+    inline void vnniStoreCoded(const VnniPackContext &ctx, size_t linear, int n, int b, uint32_t code,
+                               uint32_t superblock)
+    {
+        if (!ctx.codes_array || !ctx.superblocks_array)
+            throw std::invalid_argument("Superblock-coded packing requires code and superblock planes");
+        ctx.codes_array[linear] = code;
+        if (b % 8 == 0 || b == ctx.destination_block_origin)
+        {
+            const int local_superblock = b / 8 - ctx.destination_block_origin / 8;
+            ctx.superblocks_array[static_cast<size_t>(local_superblock) * ctx.N + static_cast<size_t>(n)] = superblock;
+        }
     }
 
     /** @brief Address a validated window-local block in the payload array. */

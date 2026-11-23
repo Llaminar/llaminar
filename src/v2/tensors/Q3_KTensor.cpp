@@ -895,6 +895,15 @@ namespace llaminar2
             std::memcpy(unpacked_scales, aux, 16);
         }
 
+        if (vnniCoded(ctx))
+        {
+            // Code: the two unpacked 6-bit scales (low, high); d per superblock.
+            vnniStoreCoded(ctx, linear, destination_n, b,
+                           (static_cast<uint32_t>(unpacked_scales[sub_idx * 2]) & 63u) |
+                               ((static_cast<uint32_t>(unpacked_scales[sub_idx * 2 + 1]) & 63u) << 6),
+                           blk->d);
+            return;
+        }
         const float d = fp16_to_fp32(blk->d);
         const int sc_lo_idx = sub_idx * 2;
         const int sc_hi_idx = sub_idx * 2 + 1;

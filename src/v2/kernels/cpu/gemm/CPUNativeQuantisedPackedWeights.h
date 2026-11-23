@@ -207,8 +207,9 @@ namespace llaminar2::cpu::native_quantised
             return NativeQuantisedPreparedFootprint{
                 .encoding = encoding,
                 .is_asymmetric = is_asymmetric,
+                // A coded block also owns 1/8 of its superblock header (8 words of 64).
                 .weight_bytes_per_n_chunk_k_block =
-                    static_cast<std::uint64_t>(interleaved_block_stride),
+                    static_cast<std::uint64_t>(interleaved_block_stride) + superblockHeaderBytes() / 8u,
                 .activation_bytes_per_row_k_block = sizeof(Q8_1Block),
                 .output_bytes_per_row_n_chunk = 64u * sizeof(float),
             };
@@ -324,6 +325,57 @@ namespace llaminar2::cpu::native_quantised
         }
 
         // -------------------------------------------------------------------
+        // Superblock-coded geometry (CPUNativeQuantisedPreparedFootprint.h)
+        // -------------------------------------------------------------------
+
+        /** @return Whether metadata is superblock-coded (codes + per-superblock words). */
+        [[nodiscard]] bool superblockCoded() const noexcept { return preparedSuperblockCoded(encoding); }
+        /** @return Bytes after each eight-block coded unit (0 for per-block encodings). */
+        [[nodiscard]] std::size_t superblockHeaderBytes() const noexcept
+        { return preparedSuperblockHeaderBytes(encoding, codebook_id); }
+        /** @return Block/header addressing of this matrix (superblock-aligned). */
+        [[nodiscard]] CPUNativeQuantisedBlockGeometry geometry() const noexcept
+        {
+            return {.block_stride = std::size_t(interleaved_block_stride), .header_bytes = superblockHeaderBytes(),
+                    .blocks_per_row = std::size_t(blocks_per_row)};
+        }
+        /** @return Byte offset of block (c, kb). */
+        [[nodiscard]] std::size_t blockOffset(int c, int kb) const noexcept
+        { return geometry().blockOffset(std::size_t(c), std::size_t(kb)); }
+        /** @return Byte offset of the superblock header serving block (c, kb). */
+        [[nodiscard]] std::size_t superblockHeaderOffset(int c, int kb) const noexcept
+        { return geometry().headerOffset(std::size_t(c), std::size_t(kb)); }
+        /** @return Exact bytes of the complete prepared matrix. */
+        [[nodiscard]] std::size_t preparedBytes() const noexcept
+        { return geometry().matrixBytes(std::size_t(N_padded / 64)); }
+        /** @return First byte of block (c, kb): payload planes, then code planes. */
+        [[nodiscard]] const uint8_t *blockUnit(int c, int kb) const { return interleavedBase() + blockOffset(c, kb); }
+        /** @return blockUnit() under an admitted binding (same address). */
+        [[nodiscard]] const uint8_t *admittedBlockUnit(int c, int kb) const noexcept
+        { return interleavedBase() + blockOffset(c, kb); }
+        /** @return The 64 superblock words serving block (c, kb). */
+        [[nodiscard]] const uint8_t *superblockHeader(int c, int kb) const
+        {
+            if (!superblockCoded())
+                throw std::logic_error("Native CPU weight encoding has no superblock words");
+            return interleavedBase() + superblockHeaderOffset(c, kb);
+        }
+        /** @return superblockHeader() under an admitted binding (same address). */
+        [[nodiscard]] const uint8_t *admittedSuperblockHeader(int c, int kb) const noexcept
+        { return interleavedBase() + superblockHeaderOffset(c, kb); }
+        /** @return A coded column's per-block staged words reconstructed through the codec. */
+        [[nodiscard]] native_quantised_superblock::StagedBlockMetadata codedBlockMetadata(int c, int kb, int column) const
+        {
+            const uint8_t *base = blockUnit(c, kb);
+            uint8_t source_payload[16]{};
+            compactColumnPayload(base, codebook_id, column, source_payload);
+            const auto code = coded_metadata::columnCode(base, static_cast<std::uint32_t>(data_stride), codebook_id,
+                                                         column, source_payload);
+            const auto word = coded_metadata::loadSuperblockWord(superblockHeader(c, kb), codebook_id, column);
+            return native_quantised_superblock::decodeSuperblockMetadata(codebook_id, code, word);
+        }
+
+        // -------------------------------------------------------------------
         // Accessors for the kernel inner loop
         // -------------------------------------------------------------------
 
@@ -411,6 +463,11 @@ namespace llaminar2::cpu::native_quantised
          */
         inline float blockScale(int c, int kb, int n_local) const
         {
+            if (superblockCoded())
+            {
+                const auto words = codedBlockMetadata(c, kb, n_local);
+                return nativeQuantisedPrimaryScale(encoding, codebook_id, words.primary, words.secondary);
+            }
             const bool source_scale = usesNibbleLUTSourceScale() || usesIQ3SExpandedSourceScale() ||
                 usesQ6KNativeDualScale() || (usesCompactMultiScale() && codebook_id == 13);
             const auto secondary = source_scale ? chunkMins(c, kb)[n_local] : 0;
@@ -426,6 +483,11 @@ namespace llaminar2::cpu::native_quantised
          */
         inline float blockMin(int c, int kb, int n_local) const
         {
+            if (superblockCoded())
+            {
+                const auto words = codedBlockMetadata(c, kb, n_local);
+                return nativeQuantisedSecondaryScale(encoding, codebook_id, words.primary, words.secondary);
+            }
             if (usesNibbleLUTSourceScale() || usesIQ3SExpandedSourceScale() ||
                 (!is_asymmetric && !usesQ6KNativeDualScale() && !usesCompactMultiScale()))
                 return 0.0f;
@@ -436,7 +498,9 @@ namespace llaminar2::cpu::native_quantised
         /// Scales pointer for N-chunk c, K-block kb (contiguous 64 FP16 values, inline in native_interleaved)
         inline const uint16_t *chunkScales(int c, int kb) const
         {
-            size_t block_offset = ((size_t)c * blocks_per_row + kb) * interleaved_block_stride;
+            if (superblockCoded())
+                throw std::logic_error("Superblock-coded CPU weights hold no per-block metadata words");
+            size_t block_offset = blockOffset(c, kb);
             const size_t compensation_bytes = usesInlineCompensation() ? 128u : 0u;
             return reinterpret_cast<const uint16_t *>(
                 interleavedBase() + block_offset + data_stride + compensation_bytes);
@@ -445,27 +509,13 @@ namespace llaminar2::cpu::native_quantised
         /// Secondary words for one chunk: FP16 minimum/scale, or Q6_K/IQ2_S/IQ3_S/IQ4_XS raw coefficients.
         inline const uint16_t *chunkMins(int c, int kb) const
         {
-            size_t block_offset = ((size_t)c * blocks_per_row + kb) * interleaved_block_stride;
+            if (superblockCoded())
+                throw std::logic_error("Superblock-coded CPU weights hold no per-block metadata words");
+            size_t block_offset = blockOffset(c, kb);
             const size_t metadata_offset =
                 usesInlineCompensation() ? 256u : 128u;
             return reinterpret_cast<const uint16_t *>(
                 interleavedBase() + block_offset + data_stride + metadata_offset);
-        }
-
-        /**
-         * @brief Access the packed pair of Q2_K effective minima per output column.
-         * @param c Output chunk of 64 columns.
-         * @param kb Logical K block.
-         * @return Sixty-four packed FP16 pairs; zero for other compact formats.
-         */
-        inline const uint32_t *chunkEffectiveMins(int c, int kb) const
-        {
-            // Only Q2_K reserves the effective-minimum vector; any other
-            // compact unit ends after its two scale vectors.
-            if (!usesCompactMultiScale() || codebook_id != 10)
-                throw std::logic_error("Effective minima exist only in compact Q2_K weights");
-            const size_t offset = ((size_t)c * blocks_per_row + kb) * interleaved_block_stride;
-            return reinterpret_cast<const uint32_t *>(interleavedBase() + offset + data_stride + 256);
         }
 
         /// Native-interleaved B data for N-chunk c, K-block kb, group g, ZMM z (0..3)
@@ -474,7 +524,7 @@ namespace llaminar2::cpu::native_quantised
         /// For INT8 pre-decoded: group ∈ [0,7], each holds 4 INT8 values.
         inline const uint8_t *interleavedB(int c, int kb, int group, int z) const
         {
-            size_t block_offset = ((size_t)c * blocks_per_row + kb) * interleaved_block_stride;
+            size_t block_offset = blockOffset(c, kb);
             return interleavedBase() + block_offset + group * 256 + z * 64;
         }
 
@@ -484,7 +534,7 @@ namespace llaminar2::cpu::native_quantised
             if (!usesInlineCompensation())
                 throw std::logic_error(
                     "Q6_K native dual-scale weights do not carry compensation metadata");
-            size_t block_offset = ((size_t)c * blocks_per_row + kb) * interleaved_block_stride;
+            size_t block_offset = blockOffset(c, kb);
             return reinterpret_cast<const int16_t *>(
                 interleavedBase() + block_offset + data_stride);
         }
@@ -515,8 +565,7 @@ namespace llaminar2::cpu::native_quantised
                 throw std::logic_error(
                     "q6KHighBitplanes requires native Q6_K encoding and valid group/ZMM indices");
             }
-            const size_t block_offset =
-                ((size_t)c * blocks_per_row + kb) * interleaved_block_stride;
+            const size_t block_offset = blockOffset(c, kb);
             return interleavedBase() + block_offset + 1024u +
                    static_cast<size_t>(group) * 64u +
                    static_cast<size_t>(z) * 16u;
@@ -574,8 +623,7 @@ namespace llaminar2::cpu::native_quantised
     /// Compute the workspace buffer size needed for repackNativeBlocksToInterleaved().
     inline size_t interleavedWorkspaceSize(const CPUNativeQuantisedPackedWeights &meta)
     {
-        int N_chunks = meta.N_padded / 64;
-        return (size_t)N_chunks * meta.blocks_per_row * meta.interleaved_block_stride;
+        return meta.preparedBytes();
     }
 
 } // namespace llaminar2::cpu::native_quantised

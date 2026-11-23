@@ -812,6 +812,13 @@ namespace llaminar2
 
         uint8_t sc, m_val;
         simd::get_scale_min_k4(sub_idx, blk->scales, &sc, &m_val);
+        if (vnniCoded(ctx))
+        {
+            // Code: 6-bit scale | 6-bit min << 6; d | dmin << 16 per superblock.
+            vnniStoreCoded(ctx, linear, destination_n, b, uint32_t{sc} | (uint32_t{m_val} << 6),
+                           uint32_t{blk->d} | (uint32_t{blk->dmin} << 16));
+            return;
+        }
         const float d = fp16_to_fp32(blk->d);
         const float dmin = fp16_to_fp32(blk->dmin);
         ctx.scales_array[linear] = fp32_to_fp16(d * static_cast<float>(sc));

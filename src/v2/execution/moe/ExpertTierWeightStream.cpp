@@ -1328,13 +1328,8 @@ namespace llaminar2
                     for (int byte = 0; byte < payload_bytes; ++byte)
                         destination[byte] = cpu.native_interleaved[
                             interleavedValueOffset(cpu, n, kb, byte)];
-                    output.scales[linear] = cpu.chunkScales(n / 64, kb)[n % 64];
-                    // Single-scale units (IQ3_XXS/IQ2_XXS) own no secondary plane.
-                    if (!output.mins.empty())
-                        output.mins[linear] = cpu.chunkMins(n / 64, kb)[n % 64];
-                    if (gpu_emins)
-                        output.emins[linear] = cpu.chunkEffectiveMins(n / 64, kb)[n % 64];
-                    continue;
+                    // WIP(coded-migration): coded compact units move as codes.
+                    return reject(error, "Superblock-coded compact CPU units require coded GPU migration slots");
                 }
 
                 if (cpu.usesNibbleLUT())

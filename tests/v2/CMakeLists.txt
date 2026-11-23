@@ -10578,6 +10578,26 @@ add_v2_test(V2_Unit_Q5_1_SIMD_Unpack
     MPI_PROCS 1
 )
 
+# Host superblock-coded packing equals the per-block packer through the codec
+# for every codable source format, including windows inside a superblock.
+add_executable(v2_unit_vnni_coded_packing unit/tensors/Test__VnniCodedPacking.cpp)
+target_link_libraries(v2_unit_vnni_coded_packing
+    llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_VnniCodedPacking
+    COMMAND $<TARGET_FILE:v2_unit_vnni_coded_packing>
+    LABELS "V2;Unit;CPU;DeviceFree;NativeQuantised;Memory;Regression"
+    MPI_PROCS 1 NO_MODELS)
+
+# Superblock-coded compact CPU units: exact size, exact SIMD metadata
+# reconstruction and exact SIMD outputs on the build's native ISA.
+add_executable(v2_unit_cpu_coded_compact_units unit/kernels/cpu/Test__CPUCodedCompactUnits.cpp)
+target_link_libraries(v2_unit_cpu_coded_compact_units
+    llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_CPUCodedCompactUnits
+    COMMAND $<TARGET_FILE:v2_unit_cpu_coded_compact_units>
+    LABELS "V2;Unit;CPU;DeviceFree;NativeQuantised;Memory;ByteExact;Regression"
+    MPI_PROCS 1 NO_MODELS)
+
 # Original Q6 source factors remain exact without changing Q8 GEMM inputs.
 add_executable(v2_test_q6_source_scale unit/kernels/Test__Q6SourceScale.cpp)
 target_link_libraries(v2_test_q6_source_scale
