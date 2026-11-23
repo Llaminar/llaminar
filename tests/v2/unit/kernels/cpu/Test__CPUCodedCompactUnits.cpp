@@ -386,14 +386,20 @@ namespace llaminar2::test
         }
     }
 
-    /** Both CPU arithmetic contracts stay byte-identical to the prior expanded CPU publication. */
-    TEST(CPUCodedCompactUnits, Q5KIQ3SPreserveExpandedOutputs)
+    /** @brief Check both CPU policies against independent expanded weights across source and K-tree boundaries.
+     * @param k Logical K, with a ragged final source superblock.
+     */
+    static void verifyQ5KIQ3SExpandedOutputs(int k)
     {
-        constexpr int n = 67, k = 544, blocks = k / 32;
-        constexpr int partitions = MoEProjectionNumericalContract::orderedKPartitionsForWidth(k);
+        constexpr int n = 67;
+        const int blocks = k / 32;
+        const int partitions = MoEProjectionNumericalContract::orderedKPartitionsForWidth(k);
+        SCOPED_TRACE(k);
         std::mt19937 rng(1493);
-        std::array<std::array<Q8_1Block, blocks>, 4> activation{};
+        std::array<std::vector<Q8_1Block>, 4> activation;
         for (auto &row : activation)
+        {
+            row.resize(blocks);
             for (auto &a : row)
             {
                 a.d = static_cast<uint16_t>(0x2000 + rng() % 0x1800);
@@ -403,12 +409,13 @@ namespace llaminar2::test
                     a.sum_qs += q;
                 }
             }
+        }
         for (const auto &format : compactSources())
         {
             if (format.codebook != 7 && format.codebook != 11)
                 continue;
             SCOPED_TRACE(format.name);
-            const auto source = format.make({n, k}, 37);
+            const auto source = format.make({n, static_cast<std::size_t>(k)}, 37);
             const auto &unpackable = dynamic_cast<const IINT8Unpackable &>(*source);
             for (const auto policy : {CPUProjectionNumericalPolicy::BackendNative, CPUProjectionNumericalPolicy::GPUAlignedExpert})
             {
@@ -478,6 +485,15 @@ namespace llaminar2::test
                 }
             }
         }
+    }
+
+    /** @test Hoisted header factors survive a new K partition inside a superblock and a new superblock inside a partition. */
+    TEST(CPUCodedCompactUnits, Q5KIQ3SPreserveExpandedOutputs)
+    {
+        verifyQ5KIQ3SExpandedOutputs(544);
+        // 98 blocks gives a seven-block partition and a two-block final
+        // superblock. This exercises both kinds of interior boundary.
+        verifyQ5KIQ3SExpandedOutputs(3136);
     }
 
     namespace

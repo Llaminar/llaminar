@@ -10638,6 +10638,15 @@ add_v2_test(V2_Unit_CPUCodedCompactUnits
     LABELS "V2;Unit;CPU;DeviceFree;NativeQuantised;Memory;ByteExact;Regression"
     MPI_PROCS 1 NO_MODELS)
 
+# Q5_K and IQ3_S keep the expanded program's bytes across misaligned K-tree
+# boundaries, including grouped reuse and ragged superblock headers.
+add_v2_test(V2_Integration_CPUCodedQ5KIQ3SProjection
+    COMMAND $<TARGET_FILE:v2_unit_cpu_coded_compact_units>
+        --gtest_filter=CPUCodedCompactUnits.Q5KIQ3SPreserveExpandedOutputs
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;NativeQuantised;ByteExact;Regression"
+    MPI_PROCS 1 NO_MODELS)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUCodedQ5KIQ3SProjection)
+
 # Q6_K and IQ4_XS coded CPU units: exact file-density bytes and the coded code
 # plane plus superblock header reproduce the per-block source factors exactly.
 add_executable(v2_unit_cpu_coded_file_density_q6iq4 unit/kernels/cpu/Test__CPUCodedFileDensityQ6IQ4.cpp)

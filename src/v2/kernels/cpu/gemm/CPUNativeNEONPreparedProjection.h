@@ -483,35 +483,236 @@ namespace llaminar2::cpu::native_quantised
             return vsubq_s8(vreinterpretq_s8_u8(values), vdupq_n_s8(32));
         }
 
-        /** @brief Decode one Q5_K group using a 16-bit high-plane slice for four columns. */
-        [[gnu::always_inline]] static int8x16_t q5KGroup(const std::uint8_t *unit, int column, int group) noexcept
+        /** @brief Merge four columns' contiguous Q5_K high-plane slice into the dot bytes.
+         * @param low Sixteen unpacked low nibbles in dot-lane order.
+         * @param plane Two readable bytes, holding four high bits per column.
+         * @return Sixteen complete unsigned five-bit source values.
+         */
+        [[gnu::always_inline]] static uint8x16_t q5KMerge(uint8x16_t low, const std::uint8_t *plane) noexcept
         {
-            const auto raw = vld1q_u8(unit + (group % 4) * 256 + column * 4);
-            const auto low = group < 4 ? vandq_u8(raw, vdupq_n_u8(15)) : vshrq_n_u8(raw, 4);
-            std::uint16_t high;
-            std::memcpy(&high, unit + 1024 + group * 32 + column / 2, sizeof(high));
-            return vreinterpretq_s8_u8(vorrq_u8(low, q6Plane(high, 16)));
+            std::uint16_t packed;
+            std::memcpy(&packed, plane, sizeof(packed));
+            const uint8x16_t select{0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1};
+            const auto bits = vqtbl1q_u8(vreinterpretq_u8_u16(vdupq_n_u16(packed)), select);
+            const auto mask = vreinterpretq_u8_u64(vdupq_n_u64(0x8040201008040201ull));
+            return vbslq_u8(vdupq_n_u8(16), vtstq_u8(bits, mask), low);
         }
 
-        /** @brief Decode four IQ3_S columns from their native indices and signs, entirely in registers. */
+        /** @brief Decode one Q5_K strip's K block once, sharing each vector across all activation rows.
+         * @param unit Current borrowed prepared unit.
+         * @param column First of four output columns.
+         * @param block Logical K block.
+         * @param dots Receives the whole-block integer dot for each row.
+         */
         template <typename Ops>
-        [[gnu::always_inline]] static int8x16_t iq3sGroup(const std::uint8_t *unit, int column, int group) noexcept
+        [[gnu::always_inline]] void q5KBlock(const std::uint8_t *unit, int column, int block,
+            typename Ops::I (&dots)[Rows]) const noexcept
         {
-            return std::bit_cast<int8x16_t>(multi_scale::decodeIQ3SGroup<4, Ops>(unit, column, group));
+            using I = typename Ops::I;
+            const auto *nibbles = unit + column * 4;
+            const auto *planes = unit + 1024 + column / 2;
+            // The three-row tile uses one shared SDOT group rather than keeping
+            // row-pair and odd-row accumulators live through both group decodes.
+            if constexpr (multi_scale::usesRowPairs<Ops> && Rows != 3)
+            {
+                I columns01[Pairs]{}, columns23[Pairs]{};
+                // Visit one eight-K pair at a time. A uniform slice avoids
+                // duplicating the row-pair state for the low and high K halves.
+#pragma GCC unroll 1
+                for (int group = 0; group < 8; group += 2)
+                {
+                    const auto sh = vdupq_n_s8(static_cast<std::int8_t>(-(group & 4)));
+                    const auto a = vshlq_u8(vld1q_u8(nibbles + (group & 2) * 256), sh);
+                    const auto b = vshlq_u8(vld1q_u8(nibbles + ((group & 2) + 1) * 256), sh);
+                    consumePair<Ops>(vreinterpretq_s8_u8(q5KMerge(vandq_u8(a, vdupq_n_u8(15)), planes + group * 32)),
+                        vreinterpretq_s8_u8(q5KMerge(vandq_u8(b, vdupq_n_u8(15)), planes + (group + 1) * 32)),
+                        block, group, columns01, columns23, dots);
+                }
+                publishPairs<Ops>(columns01, columns23, dots);
+            }
+            else if constexpr (Ops::instruction == Dot::DotProd && Rows == 1)
+            {
+                // Read the activation once and keep the two independent dot
+                // chains until the exact integer sum is consumed by FP32.
+                const auto a = Ops::activationBlock(activation_[0][block].qs);
+                I lo{}, hi{};
+                forEachGroup<4>([&]<int Group>() __attribute__((always_inline)) {
+                    const auto raw = vld1q_u8(nibbles + Group * 256);
+                    const auto low = q5KMerge(vandq_u8(raw, vdupq_n_u8(15)), planes + Group * 32);
+                    const auto high = q5KMerge(vshrq_n_u8(raw, 4), planes + (Group + 4) * 32);
+                    lo = Ops::template dotLane<Group>(lo, std::bit_cast<I>(low), a);
+                    hi = Ops::template dotLane<Group + 4>(hi, std::bit_cast<I>(high), a);
+                });
+                dots[0] = lo + hi;
+            }
+            else if constexpr (Rows >= 3)
+            {
+                // The wider non-paired tiles retire one decoded group before
+                // the next load; the two-half walk spills an accumulator.
+#pragma GCC unroll 1
+                for (int group = 0; group < 8; ++group)
+                {
+                    const auto raw = vld1q_u8(nibbles + (group & 3) * 256);
+                    const auto low = group < 4 ? vandq_u8(raw, vdupq_n_u8(15)) : vshrq_n_u8(raw, 4);
+                    consume<Ops>(vreinterpretq_s8_u8(q5KMerge(low, planes + group * 32)), block, group, dots);
+                }
+            }
+            else
+            {
+#pragma GCC unroll 1
+                for (int group = 0; group < 4; ++group)
+                {
+                    const auto raw = vld1q_u8(nibbles + group * 256);
+                    consume<Ops>(vreinterpretq_s8_u8(q5KMerge(vandq_u8(raw, vdupq_n_u8(15)), planes + group * 32)),
+                        block, group, dots);
+                    consume<Ops>(vreinterpretq_s8_u8(q5KMerge(vshrq_n_u8(raw, 4), planes + (group + 4) * 32)),
+                        block, group + 4, dots);
+                }
+            }
         }
 
-        /** @brief Load exact coded scale/minimum factors from this block and its source superblock. */
+        /** @brief Load four immutable IQ3_S codebook entries from independent table addresses.
+         * @param indices One native nine-bit grid index per output column.
+         * @return Four packed original magnitude bytes per output column.
+         */
+        [[gnu::always_inline]] static uint32x4_t iq3Grid(uint32x4_t indices) noexcept
+        {
+            return uint32x4_t{iq3s_grid[vgetq_lane_u32(indices, 0)], iq3s_grid[vgetq_lane_u32(indices, 1)],
+                iq3s_grid[vgetq_lane_u32(indices, 2)], iq3s_grid[vgetq_lane_u32(indices, 3)]};
+        }
+
+        /** @brief Decode one exact IQ3_S four-value group from preloaded column words.
+         * @tparam Group Four-value group in [0,7].
+         * @param qs Index words for the current half; one word per output column.
+         * @param metadata Packed ninth index bits and first three sign bytes per column.
+         * @param signs Already repeated sign byte, shared with the adjacent group.
+         * @return Signed source bytes in production dot-lane order.
+         */
+        template <int Group, typename Ops>
+        [[gnu::always_inline]] static int8x16_t iq3sGroup(typename Ops::I qs, typename Ops::I metadata,
+            typename Ops::I signs) noexcept
+        {
+            const auto index = ((qs >> (8 * (Group % 4))) & 255) | (((metadata >> Group) & 1) << 8);
+            const auto mag = std::bit_cast<typename Ops::I>(iq3Grid(std::bit_cast<uint32x4_t>(index)));
+            return std::bit_cast<int8x16_t>(Ops::template signGrid<Group % 2>(mag, signs));
+        }
+
+        /** @brief Decode one IQ3_S K block, sharing each decoded vector across all live rows.
+         * @param unit Current native payload.
+         * @param column First of four output columns.
+         * @param block Logical K block.
+         * @param dots Receives each row's whole-block exact integer dot.
+         */
+        template <typename Ops>
+        [[gnu::always_inline]] void iq3sBlock(const std::uint8_t *unit, int column, int block,
+            typename Ops::I (&dots)[Rows]) const noexcept
+        {
+            using I = typename Ops::I;
+            const auto metadata = multi_scale::payloadWord<11, Ops>(unit, 2, column);
+            const auto signsFor = [&]<int Pair>() __attribute__((always_inline)) {
+                if constexpr (Pair == 3)
+                    return Ops::template repeatByte<0>(multi_scale::payloadWord<11, Ops>(unit, 3, column));
+                else
+                    return Ops::template repeatByte<1 + Pair>(metadata);
+            };
+            if constexpr (multi_scale::usesRowPairs<Ops>)
+            {
+                I columns01[Pairs]{}, columns23[Pairs]{};
+                if constexpr (Rows == 3)
+                {
+                    // The odd row needs its own SDOT chain; retire each
+                    // pair before loading the next pair's grid indices.
+#pragma GCC unroll 1
+                    for (int group = 0; group < 8; group += 2)
+                        consumePair<Ops>(std::bit_cast<int8x16_t>(multi_scale::decodeIQ3SGroup<4, Ops>(unit, column, group)),
+                            std::bit_cast<int8x16_t>(multi_scale::decodeIQ3SGroup<4, Ops>(unit, column, group + 1)),
+                            block, group, columns01, columns23, dots);
+                }
+                else
+                {
+                    forEachGroup<4>([&]<int Pair>() __attribute__((always_inline)) {
+                        constexpr int group = Pair * 2;
+                        const auto qs = multi_scale::payloadWord<11, Ops>(unit, Pair / 2, column);
+                        const auto signs = signsFor.template operator()<Pair>();
+                        consumePair<Ops>(iq3sGroup<group, Ops>(qs, metadata, signs),
+                            iq3sGroup<group + 1, Ops>(qs, metadata, signs), block, group, columns01, columns23, dots);
+                    });
+                }
+                publishPairs<Ops>(columns01, columns23, dots);
+            }
+            else if constexpr (Ops::instruction == Dot::DotProd && Rows == 1)
+            {
+                const auto a = Ops::activationBlock(activation_[0][block].qs);
+                I even{}, odd{};
+                forEachGroup<4>([&]<int Pair>() __attribute__((always_inline)) {
+                    constexpr int group = Pair * 2;
+                    const auto qs = multi_scale::payloadWord<11, Ops>(unit, Pair / 2, column);
+                    const auto signs = signsFor.template operator()<Pair>();
+                    even = Ops::template dotLane<group>(even,
+                        std::bit_cast<I>(iq3sGroup<group, Ops>(qs, metadata, signs)), a);
+                    odd = Ops::template dotLane<group + 1>(odd,
+                        std::bit_cast<I>(iq3sGroup<group + 1, Ops>(qs, metadata, signs)), a);
+                });
+                dots[0] = even + odd;
+            }
+            else
+            {
+                // Baseline ASIMD widens each group. Retire it immediately
+                // before moving to the next to bound live product vectors.
+#pragma GCC unroll 1
+                for (int group = 0; group < 8; ++group)
+                    consume<Ops>(std::bit_cast<int8x16_t>(multi_scale::decodeIQ3SGroup<4, Ops>(unit, column, group)),
+                        block, group, dots);
+            }
+        }
+
+        /** @brief Widen a strip's original source factors once per partition/superblock intersection.
+         * @tparam Codebook Q5_K (7) or IQ3_S (11).
+         * @tparam Ops Admitted native lane operations.
+         * @param header Sealed source superblock header owning the current K block.
+         * @param column First of four consecutive column headers.
+         * @return Widened d/dmin for Q5_K, or source d for IQ3_S.
+         */
         template <int Codebook, typename Ops>
-        [[gnu::always_inline]] coded_metadata::Factors<typename Ops::F> codedFactors(
-            const std::uint8_t *unit, const std::uint8_t *header, int column) const noexcept
+        [[gnu::always_inline]] static auto codedBase(const std::uint8_t *header, int column) noexcept
+        {
+            if constexpr (Codebook == 7)
+            {
+                using F = typename Ops::F;
+                // The header is d | dmin per column. Split it at the load,
+                // preserving the original binary16 payloads in both vectors.
+                const auto sources = vld2_u16(reinterpret_cast<const std::uint16_t *>(header) + column * 2);
+                return coded_metadata::Q4KBaseFactors<F>{std::bit_cast<F>(neon_fp16::widen(sources.val[0])),
+                    std::bit_cast<F>(neon_fp16::widen(sources.val[1]))};
+            }
+            else
+            {
+                static_assert(Codebook == 11);
+                return Ops::half(reinterpret_cast<const std::uint16_t *>(header) + column);
+            }
+        }
+
+        /** @brief Apply the block's coded factors to its already widened source superblock header.
+         * @tparam Codebook Q5_K (7) or IQ3_S (11).
+         * @tparam Ops Admitted native lane operations.
+         * @tparam Base Widened source factor type returned by codedBase().
+         * @param unit Current prepared unit including its block code plane.
+         * @param base Source factors shared by this strip's current K interval.
+         * @param column First of four consecutive coded columns.
+         * @return Exact previous FP32 factors: staged scale/minimum for Q5_K,
+         *         or source d times the odd IQ3_S coefficient without staging.
+         */
+        template <int Codebook, typename Ops, typename Base>
+        [[gnu::always_inline]] static coded_metadata::Factors<typename Ops::F> codedFactors(
+            const std::uint8_t *unit, const Base &base, int column) noexcept
         {
             constexpr auto data_stride = preparedDataStride(Encoding::CompactMultiScale, Codebook);
             if constexpr (Codebook == 7)
             {
                 using L = coded_metadata::Lanes<Ops>;
-                const auto code = L::template code<7>(unit + data_stride, column);
-                const auto word = L::template superblockWords<7>(header, column);
-                return coded_metadata::reconstruct<7, Ops>(code, word);
+                // Q4_K and Q5_K use the same 6+6 code, signed minimum and
+                // FP16 staging. Their separate payload decoders do not affect it.
+                return coded_metadata::reconstruct<5, Ops>(L::template code<7>(unit + data_stride, column), base);
             }
             else
             {
@@ -523,19 +724,21 @@ namespace llaminar2::cpu::native_quantised
                 const auto spread = vshlq_u32(vdupq_n_u32(packed), int32x4_t{0, -4, -8, -12});
                 const auto nibble = vandq_u32(spread, vdupq_n_u32(15));
                 const auto coefficient = vorrq_u32(vshlq_n_u32(nibble, 1), vdupq_n_u32(1));
-                const auto base = Ops::half(reinterpret_cast<const uint16_t *>(header) + column);
                 return {.primary = base * std::bit_cast<typename Ops::F>(vcvtq_f32_u32(coefficient))};
             }
         }
 
-        /** @brief Visit increasing-K blocks without redoing coded header/address arithmetic inside a source superblock.
-         * @tparam Coded Codebook of a coded source, or zero for per-block tiles.
+        /** @brief Visit increasing-K blocks without recomputing addresses or header factors in the K loop.
+         * @tparam Physical Prepared encoding.
+         * @tparam Coded Codebook of a coded source, or zero for the generic per-block tile.
+         * @tparam Ops Admitted SIMD family.
          * @param first First block of the current ordered partition.
          * @param last Exclusive end of the current ordered partition.
-         * @param visit Always-inlined consumer of (block, unit, superblock header).
+         * @param column First lane of the four-column strip.
+         * @param visit Always-inlined consumer of (block, unit, widened header factors).
          */
-        template <Encoding Physical, int Coded, typename Visit>
-        [[gnu::always_inline]] void forPartitionBlocks(int first, int last, Visit &&visit) const noexcept
+        template <Encoding Physical, int Coded, typename Ops, typename Visit>
+        [[gnu::always_inline]] void forPartitionBlocks(int first, int last, [[maybe_unused]] int column, Visit &&visit) const noexcept
         {
             if constexpr (Coded == 0)
             {
@@ -551,14 +754,20 @@ namespace llaminar2::cpu::native_quantised
             else
             {
                 constexpr auto stride = preparedInterleavedBlockStride(Encoding::CompactMultiScale, Coded == 7, Coded);
-                const auto geometry = weights_.geometry();
+                const CPUNativeQuantisedBlockGeometry geometry{
+                    .block_stride = stride,
+                    .header_bytes = preparedSuperblockHeaderBytes(Encoding::CompactMultiScale, Coded),
+                    .blocks_per_row = std::size_t(weights_.blocks_per_row)};
+                // Tile binding already admitted the resident geometry. A wire
+                // intersection is never passed directly to this execution ABI.
+                const auto *root = weights_.interleavedBase() + std::size_t(chunk_) * geometry.rowBytes();
                 for (int block = first; block < last; )
                 {
                     const int end = std::min(last, static_cast<int>(geometry.superblockEnd(block)));
-                    const auto *unit = weights_.admittedBlockUnit(chunk_, block);
-                    const auto *header = weights_.admittedSuperblockHeader(chunk_, block);
+                    const auto *unit = root + geometry.blockOffset(0, block);
+                    const auto base = codedBase<Coded, Ops>(root + geometry.headerOffset(0, block), column);
                     for (; block < end; ++block, unit += stride)
-                        visit(block, unit, header);
+                        visit(block, unit, base);
                 }
             }
         }
@@ -604,7 +813,7 @@ namespace llaminar2::cpu::native_quantised
          * walk and consumed as adjacent pairs that never straddle a scale half.
          * The FP32 block program that follows is shared and unchanged.
          */
-        template <typename Ops, Encoding Physical, NibbleMap Map, int Coded>
+        template <typename Ops, Encoding Physical, NibbleMap Map>
         void pairBlock(const std::uint8_t *unit, int column, int block,
             typename Ops::I (&low)[Rows], typename Ops::I (&high)[Rows]) const noexcept
         {
@@ -624,13 +833,6 @@ namespace llaminar2::cpu::native_quantised
                     else consumePair<Ops>(first, second, block, group, high01, high23, high);
                 }
                 publishPairs<Ops>(high01, high23, high);
-            }
-            else if constexpr (Coded == 11)
-            {
-#pragma GCC unroll 1
-                for (int group = 0; group < 8; group += 2)
-                    consumePair<Ops>(iq3sGroup<Ops>(unit, column, group), iq3sGroup<Ops>(unit, column, group + 1),
-                        block, group, low01, low23, low);
             }
             else if constexpr (Physical == Encoding::Q5NativeSingleScale)
             {
@@ -712,7 +914,7 @@ namespace llaminar2::cpu::native_quantised
                             if constexpr (multi_scale::usesRowPairs<Ops>)
                             {
                                 I unused[Rows]{};
-                                pairBlock<Ops, Encoding::Q4KSuperblockCoded, NibbleMap::Unsigned, 0>(unit, column, block, dots, unused);
+                                pairBlock<Ops, Encoding::Q4KSuperblockCoded, NibbleMap::Unsigned>(unit, column, block, dots, unused);
                             }
                             else if constexpr (Rows >= 3 && Ops::instruction == Dot::ASIMD)
                             {
@@ -858,7 +1060,7 @@ namespace llaminar2::cpu::native_quantised
                 // Panels cover the whole chunk: a final panel may extend into the
                 // chunk's sealed padding columns, which it computes but never stores.
                 for (int column = 0; column < columns_; column += 4 * S)
-                    panel<Ops, Policy, Physical, Map, WithMinimum, S, Coded>(column);
+                    panel<Ops, Policy, Physical, Map, WithMinimum, S>(column);
             }
             else
             {
@@ -868,28 +1070,30 @@ namespace llaminar2::cpu::native_quantised
 #endif
                 using I = typename Ops::I;
                 using F = typename Ops::F;
+                constexpr bool ordered = Policy == CPUProjectionNumericalPolicy::GPUAlignedExpert;
+                constexpr bool widen_activation_rows =
+                    Coded != 0 && Rows == 4 && ordered && Ops::instruction != Dot::ASIMD;
                 constexpr bool nibble = Physical == Encoding::NibbleLUT || Physical == Encoding::NibbleLUTSourceScale;
                 for (int column = 0; column < columns_; column += 4)
                 {
                     float32x4_t reduced[Rows]{};
-                    for (int partition = 0; partition < partitions_; ++partition)
+                    for (int partition = 0; partition < (ordered || Coded == 0 ? partitions_ : 1); ++partition)
                     {
                         float32x4_t accumulator[Rows]{};
-                        const int first = partition * blocks_per_partition_;
-                        const int last = std::min(first + blocks_per_partition_, weights_.blocks_per_row);
-                        forPartitionBlocks<Physical, Coded>(first, last, [&](int block, const std::uint8_t *unit,
-                            [[maybe_unused]] const std::uint8_t *header) __attribute__((always_inline)) {
+                        const int first = ordered || Coded == 0 ? partition * blocks_per_partition_ : 0;
+                        const int last = ordered || Coded == 0 ? std::min(first + blocks_per_partition_, weights_.blocks_per_row)
+                            : weights_.blocks_per_row;
+                        forPartitionBlocks<Physical, Coded, Ops>(first, last, column, [&](int block, const std::uint8_t *unit,
+                            [[maybe_unused]] const auto &base) __attribute__((always_inline)) {
                             I low[Rows]{}, high[Rows]{};
                             if constexpr (Coded == 7)
                             {
-                                // Decode each group once for all rows. The strip's
-                                // SDOT chain bounds liveness while preserving grouped reuse.
-#pragma GCC unroll 1
-                                for (int group = 0; group < 8; ++group)
-                                    consume<Ops>(q5KGroup(unit, column, group), block, group, low);
+                                q5KBlock<Ops>(unit, column, block, low);
                             }
+                            else if constexpr (Coded == 11)
+                                iq3sBlock<Ops>(unit, column, block, low);
                             else if constexpr (multi_scale::usesRowPairs<Ops>)
-                                pairBlock<Ops, Physical, Map, Coded>(unit, column, block, low, high);
+                                pairBlock<Ops, Physical, Map>(unit, column, block, low, high);
                             else if constexpr (Physical == Encoding::Q6KNativeDualScale)
                             {
                                 // Keep one decoded group live at a time. Fully
@@ -921,12 +1125,6 @@ namespace llaminar2::cpu::native_quantised
                                 for (int group = 4; group < 8; ++group)
                                     consume<Ops>(q6Group(unit, column, group), block, group, high);
 #endif
-                            }
-                            else if constexpr (Coded == 11)
-                            {
-#pragma GCC unroll 1
-                                for (int group = 0; group < 8; ++group)
-                                    consume<Ops>(iq3sGroup<Ops>(unit, column, group), block, group, low);
                             }
                             else if constexpr (Physical == Encoding::Q5NativeSingleScale)
                             {
@@ -1018,7 +1216,7 @@ namespace llaminar2::cpu::native_quantised
                             F scale0, scale1{};
                             if constexpr (Coded != 0)
                             {
-                                const auto factors = codedFactors<Coded, Ops>(unit, header, column);
+                                const auto factors = codedFactors<Coded, Ops>(unit, base, column);
                                 scale0 = factors.primary;
                                 scale1 = factors.secondary;
                             }
@@ -1048,11 +1246,27 @@ namespace llaminar2::cpu::native_quantised
                                 else if constexpr (WithMinimum)
                                     scale1 = Ops::half(weights_.admittedPerBlockSecondary<Physical>(chunk_, block) + column);
                             }
+                            [[maybe_unused]] float32x4_t activation_scales;
+                            if constexpr (widen_activation_rows)
+                            {
+                                // Widen the row scales as one vector with the same half-word
+                                // payload bits, rather than branching after each row's dot.
+                                uint16x4_t halves{};
+                                forEachGroup<Rows>([&]<int Row>() __attribute__((always_inline)) {
+                                    halves = vset_lane_u16(activation_[Row][block].d, halves, Row);
+                                });
+                                activation_scales = neon_fp16::widen(halves);
+                            }
 #pragma GCC unroll 4
                             for (std::size_t row = 0; row < Rows; ++row)
                             {
                                 const auto &a = activation_[row][block];
-                                const float activation_scale = nativeQuantisedFP16ScaleToFP32(a.d);
+                                const float activation_scale = [&]() __attribute__((always_inline)) {
+                                    if constexpr (widen_activation_rows)
+                                        return activation_scales[row];
+                                    else
+                                        return nativeQuantisedFP16ScaleToFP32(a.d);
+                                }();
                                 if constexpr (Physical == Encoding::Q6KNativeDualScale)
                                 {
                                     const F term0 = scale0 * __builtin_convertvector(low[row], F);
@@ -1071,7 +1285,8 @@ namespace llaminar2::cpu::native_quantised
                         });
 #pragma GCC unroll 4
                         for (std::size_t row = 0; row < Rows; ++row)
-                            reduced[row] = partition == 0 ? accumulator[row] : vaddq_f32(reduced[row], accumulator[row]);
+                            reduced[row] = (!ordered && Coded != 0) || partition == 0
+                                ? accumulator[row] : vaddq_f32(reduced[row], accumulator[row]);
                     }
 #pragma GCC unroll 4
                     for (std::size_t row = 0; row < Rows; ++row)
@@ -1140,7 +1355,7 @@ namespace llaminar2::cpu::native_quantised
          * chains are interleaved and each activation group/scale is read once.
          */
         template <typename Ops, CPUProjectionNumericalPolicy Policy, Encoding Physical,
-                  NibbleMap Map, bool WithMinimum, int S, int Coded>
+                  NibbleMap Map, bool WithMinimum, int S>
         [[gnu::always_inline]] LLAMINAR_NEON_PROJECTION_EXACT inline void panel(int column0) const noexcept
         {
 #if defined(__clang__)
@@ -1156,8 +1371,8 @@ namespace llaminar2::cpu::native_quantised
                 float32x4_t accumulator[Rows][S]{};
                 const int first = partition * blocks_per_partition_;
                 const int last = std::min(first + blocks_per_partition_, weights_.blocks_per_row);
-                forPartitionBlocks<Physical, Coded>(first, last, [&](int block, const std::uint8_t *unit,
-                    [[maybe_unused]] const std::uint8_t *header) __attribute__((always_inline)) {
+                forPartitionBlocks<Physical, 0, Ops>(first, last, column0, [&](int block, const std::uint8_t *unit,
+                    std::nullptr_t) __attribute__((always_inline)) {
                     I low[Rows][S]{}, high[Rows][S]{};
                     if constexpr (Physical == Encoding::Q6KNativeDualScale)
                     {
@@ -1243,13 +1458,7 @@ namespace llaminar2::cpu::native_quantised
                     {
                         const int column = column0 + 4 * strip;
                         F scale0, scale1{};
-                        if constexpr (Coded != 0)
-                        {
-                            const auto factors = codedFactors<Coded, Ops>(unit, header, column);
-                            scale0 = factors.primary;
-                            scale1 = factors.secondary;
-                        }
-                        else if constexpr (preparedSuperblockCoded(Physical))
+                        if constexpr (preparedSuperblockCoded(Physical))
                         {
                             const auto factors = codedScales<Ops, Physical>(unit, column, block);
                             scale0 = factors.primary;

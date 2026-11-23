@@ -691,8 +691,13 @@ template <std::size_t Rows> void verifyI8MMGrouping(const NativeQuantisedFormatI
             return Tile::template panelStrips<SDOTOps, CPUNativeQuantisedEncoding::NibbleLUTSourceScale>();
         case CPUNativeQuantisedEncoding::NibbleLUT:
             return Tile::template panelStrips<SDOTOps, CPUNativeQuantisedEncoding::NibbleLUT>();
+        case CPUNativeQuantisedEncoding::Q5NativeSingleScale:
+            return packed.is_asymmetric
+                ? Tile::template panelStrips<SDOTOps, CPUNativeQuantisedEncoding::Q5NativeSingleScale, true>()
+                : Tile::template panelStrips<SDOTOps, CPUNativeQuantisedEncoding::Q5NativeSingleScale, false>();
+        case CPUNativeQuantisedEncoding::Q4KSuperblockCoded:
         case CPUNativeQuantisedEncoding::CompactMultiScale:
-            return 1; // Own column walk; no panels.
+            return 1; // Own four-column strip walks; no panels.
         }
         return 0;
     }();
