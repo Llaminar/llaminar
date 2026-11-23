@@ -444,10 +444,11 @@ namespace llaminar2::cpu::native_quantised
         template <CPUNativeQuantisedEncoding Physical, bool WithMinimum>
         [[nodiscard]] const std::uint16_t *admittedPerBlockPrimary(int chunk, int block) const noexcept
         {
-            // The expanded scale plane is always last (symmetric) or just
-            // before the minimum. Thus Q8_0 needs no hot-loop format test.
-            const int offset = Physical == CPUNativeQuantisedEncoding::ExpandedInt8
-                ? interleaved_block_stride - (WithMinimum ? 256 : 128)
+            // Only symmetric expanded units can be Q8_0. Derive their
+            // primary offset from the sealed stride; the asymmetric expanded
+            // unit always retains the legacy compensation plane.
+            const int offset = Physical == CPUNativeQuantisedEncoding::ExpandedInt8 && !WithMinimum
+                ? interleaved_block_stride - 128
                 : preparedDataStride(Physical, 0) + (preparedUsesInlineCompensation(Physical, 0) ? 128 : 0);
             return reinterpret_cast<const std::uint16_t *>(admittedUnit(chunk, block) + offset);
         }
