@@ -21,6 +21,8 @@
 #include <gtest/gtest.h>
 
 #include "backends/cuda/CUDAHardwareMetadata.h"
+#include "backends/cuda/CUDAGraphCapture.h"
+#include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "kernels/common/NativeQuantisedScaleLoad.h"
 #include "kernels/cuda/gemm/CUDADeviceWorkspace.h"
 #include "kernels/common/DeviceRowRange.h"
@@ -297,6 +299,12 @@ namespace llaminar2::test
                 const auto *weights = meta.coded() ? coded_payload.as<uint8_t>() : legacy_payload.as<uint8_t>();
                 DeviceBytes out(static_cast<std::size_t>(rows) * N * sizeof(float));
                 bool ok = false;
+                // Production executes every NativeQuantised projection inside a
+                // captured graph, whose dispatch policy differs from eager
+                // launches; record and replay exactly that path.
+                llaminar2::CUDAGraphCapture graph(stream_, 0);
+                llaminar2::ScopedBackendGraphCapture recording(graph, "superblock coded metadata parity");
+                EXPECT_TRUE(recording.begin());
                 if (rows == 1)
                     ok = cudaNativeQuantisedGemvTuned_fp32_withPolicy(a.as<int8_t>(), weights, meta,
                                                            out.as<float>(), sa.as<float>(), N, K, 1.0f, 0.0f, nullptr,
@@ -310,7 +318,10 @@ namespace llaminar2::test
                                                          out.as<float>(), sa.as<float>(), sums.as<int32_t>(), rows,
                                                          N, K, 1.0f, 0.0f, nullptr, nullptr, codebook, policy, 0,
                                                          stream_, prefill);
+                recording.finish();
                 EXPECT_TRUE(ok) << "rows " << rows;
+                EXPECT_TRUE(graph.instantiate());
+                EXPECT_TRUE(graph.launch());
                 checked(cudaStreamSynchronize(stream_));
                 return out.download<uint32_t>();
             };

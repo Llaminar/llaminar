@@ -159,7 +159,7 @@ namespace llaminar2
             }
         }
 
-        TEST(ExpertTierWeightStream, SingleScaleNativeGridsExpandWithoutRequantization)
+        TEST(ExpertTierWeightStream, SingleScaleNativeGridsRoundTripWithoutRequantization)
         {
             for (const uint8_t codebook : {11, 12, 15, 16})
             {
@@ -193,20 +193,24 @@ namespace llaminar2
                     ASSERT_EQ(expanded.payload_bytes_per_block,13);
                     EXPECT_EQ(expanded.payload,original.payload);
                 }
-                else ASSERT_EQ(expanded.payload_bytes_per_block,32);
+                else
+                {
+                    // IQ3_XXS/IQ2_XXS/IQ1_S keep their native grid in the CPU
+                    // CompactMultiScale tier, so promotion returns the original
+                    // compact payload rather than an expanded signed-INT8 one.
+                    EXPECT_TRUE(cpu.usesCompactMultiScale());
+                    EXPECT_EQ(expanded.codebook_id, codebook);
+                    ASSERT_EQ(expanded.payload_bytes_per_block, format->payload_bytes);
+                    EXPECT_EQ(expanded.payload, original.payload);
+                }
                 for (size_t index = 0; index < original.scales.size(); ++index)
                 {
-                    std::array<int8_t, 32> values{};
+                    std::array<int8_t, 32> values{}, returned_values{};
                     cpu::native_quantised::decode_native_block(codebook,
                         original.payload.data() + index * format->payload_bytes, values.data());
-                    if(codebook == 11)
-                    {
-                        std::array<int8_t,32> returned_values{};
-                        cpu::native_quantised::decode_native_block(11,expanded.payload.data()+index*13,returned_values.data());
-                        EXPECT_EQ(values,returned_values);
-                    }
-                    else EXPECT_EQ(std::memcmp(values.data(), expanded.payload.data() + index * 32,
-                                          values.size()), 0);
+                    cpu::native_quantised::decode_native_block(codebook,
+                        expanded.payload.data() + index * expanded.payload_bytes_per_block, returned_values.data());
+                    EXPECT_EQ(values, returned_values);
                 }
                 cpu::native_quantised::CPUNativeQuantisedPackedWeights returned;
                 ASSERT_TRUE(gpuToCpuExpertPackedReference(expanded, returned, &error)) << error;
