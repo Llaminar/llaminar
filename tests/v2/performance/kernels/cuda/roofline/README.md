@@ -1790,3 +1790,46 @@ kernels used 39 and 36 registers per thread, respectively, with zero spill
 bytes. The active SMs averaged 7.85 and 7.94 active warps. Native replay and
 Nsight receipts are in
 `benchmark_results/qfn-cuda-2x2-95943372/direct-publication-focused/`.
+
+### Early route publication through native graph completion
+
+The SM86 hybrid candidate records the HC and router as one resident prefix.
+The mapped CPU dispatch, CPU ticket, and local FFN suffix depend on its native
+completion. The FFN and packet completions rejoin before dependent graph work.
+Both RTX 3090s passed the retained replay suite and twelve additional runs
+of the single- and dual-reader regressions. Each recorded frame ran 384
+captured replays and checked the original bytes and graph dependencies.
+
+The prefix uses 164 CTAs and the suffix uses 160, both with 256 threads per
+CTA. The suffix grid gives every CTA 16 shared Down columns, including when
+the participant has no routed experts. At 160 CTAs, the measured DRAM roof
+was 886.09 GB/s on each card. The measured DP4A roof was 8.74 and 8.88
+trillion instructions per second at the two PCI devices.
+
+| Node | Physical DRAM bandwidth | Registers per thread | Achieved occupancy | Local spill requests |
+| --- | ---: | ---: | ---: | ---: |
+| Q4_K / Q5_1 HC and route | 252.2–252.8 GB/s | 96 | 33.1% | 0 |
+| Q4_K / Q5_1 FFN | 477.3–485.3 GB/s | 80 | 23.8% | 0 |
+
+Each Nsight invocation measured one native graph node on one adapter.
+The suffix measured 54–55% of its launch-matched DRAM roof. The per-node
+profiles, SASS, and calibrated probe samples are under
+`benchmark_results/qfn-cuda-2x2-95943372/branch-qualification/cuda-native-packet-frontier/`.
+
+The same Release binary served both arms of the 2×RTX 3090 + 2×CPU QFN
+comparison with the admitted F320/S320 placement. Each arm warmed once and
+then generated 256 tokens in each of three measured runs for ordinary decode
+and MTP fixed depth 7. All 24 measured token histories and corresponding MTP
+work counts agreed. The fused decode capture recorded seven fewer compute
+stages per layer on each GPU. The table shows changes in median throughput.
+
+| Run order | Serving lane | Prefill | Decode | Prefill and decode |
+| --- | --- | ---: | ---: | ---: |
+| Fused first | Ordinary | +0.38% | +0.64% | +0.59% |
+| Fused first | MTP fixed 7 | +0.25% | +1.28% | +1.11% |
+| Control first | Ordinary | +2.61% | +2.80% | +2.70% |
+| Control first | MTP fixed 7 | +2.07% | +3.85% | +3.42% |
+
+The Release comparison used the explicit CUDA candidate selector. Its
+configuration hashes, reports, and paired comparison are in
+`release/model-crossover/` under the same evidence directory.
