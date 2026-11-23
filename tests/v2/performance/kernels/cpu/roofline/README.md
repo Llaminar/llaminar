@@ -332,6 +332,27 @@ reused storage.
 | Candidate first | Fixed depth seven | 44.026 → 44.148 | +0.28% | +0.12% |
 | Control first | Fixed depth seven | 44.119 → 43.777 | −0.78% | −0.79% |
 
+The revision that checks ISA, worker-team eligibility and native Down
+ownership before binding scratch passed the same focused format checks.
+One additional matched Release pair measured 30.001 → 31.255 tok/s for
+ordinary decode and 44.152 → 43.926 tok/s at fixed depth seven. Complete
+throughput changed by +3.05% and −0.74%, respectively. All generated
+tokens and MTP work matched.
+
+The corresponding CPU service trace includes one warmup and one measured
+32-token request on each arm. Rank 1 reported 2,976 local calls in each
+arm with the same layer and live route counts. The candidate authenticated
+two prepared phase plans for each call. Local execution decreased from
+331.95 to 277.73 µs per call. Counting 15.426 MB of compulsory operands
+per call gives 46.47 → 55.54 GB/s, or 42.2% → 50.5% of the measured
+110 GB/s simultaneous socket reference. The dispatch wait was practically
+flat, and joint publication decreased from 57.40 to 51.51 µs per call.
+
+A separate fixed-depth-seven trace matched the first 32 staged tokens.
+Rank 1 observed 182 prepared calls alongside 182 one-row drafter calls and
+1,248 eight-row verifier calls across warmup and measurement. This identifies
+the drafter as the fixed-depth workload that exercised the specialization.
+
 The sealed IQ4 scale probe resolved the scale program at output-tile entry.
 The IQ4_XS packet loop consumed coefficients validated at weight publication.
 Both sockets, one and two rows per expert, eight and 64 experts, and both
