@@ -12,6 +12,7 @@
 #include "utils/NativeQuantisedPreparedByteFixture.h"
 #include "utils/CPUExplicitRoundingOracle.h"
 #include <gtest/gtest.h>
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstring>
@@ -197,6 +198,29 @@ TEST_F(CPUNativeNEONExecution, AllOwnersSerialGroupedAndPrefillRetainBytes)
                         ISAPath::AUTO, VerifierRowsPolicy::Auto, true, 0, &work);
                 }
                 bytes(actual, expected);
+                if (nativeQuantisedProjectionPartialFloats(packed, rows) != 0)
+                {
+                    // The panel route must borrow distinct slots even inside a
+                    // retained team, without touching never-admitted rows.
+                    AlignedVector<float> scratch;
+                    scratch.resize_uninitialized(nativeQuantisedProjectionPartialFloats(packed, rows));
+                    std::fill(actual.begin(), actual.end(), 123456.0f);
+#pragma omp parallel
+                    {
+                        gemm_native_quantised_preq(packed, input.data(), actual.data(),
+                            {scratch.data(), scratch.size()}, rows, stride,
+                            ISAPath::AUTO, VerifierRowsPolicy::Auto, PrefillSchedulePolicy::Auto, 0, &work);
+                    }
+                    bytes(actual, expected);
+                    live = 0;
+                    std::fill(actual.begin(), actual.end(), 123456.0f);
+#pragma omp parallel
+                    {
+                        gemm_native_quantised_preq(packed, input.data(), actual.data(), {}, rows, stride,
+                            ISAPath::AUTO, VerifierRowsPolicy::Auto, PrefillSchedulePolicy::Auto, 0, &work);
+                    }
+                    EXPECT_TRUE(std::all_of(actual.begin(), actual.end(), [](float x) { return x == 123456.0f; }));
+                }
             }
         }
 }

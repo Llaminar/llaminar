@@ -166,24 +166,30 @@ namespace llaminar2::cpu::native_quantised
             batch.execute<multi_scale::NEONByteDot::ASIMD>();
         }
 
-        /** @return Whether this exact source and active prefill ISA use transient packed panels. */
-        inline bool usesPackedPrefill(const CPUNativeQuantisedPackedWeights &w, int rows,
-            multi_scale::NEONByteDot dot) noexcept
+        /** @return Whether this source and row extent use transient packed panels. */
+        inline bool usesPackedPrefill(const CPUNativeQuantisedPackedWeights &w, int rows) noexcept
         {
-            return dot != multi_scale::NEONByteDot::ASIMD && rows >= neon_panel::min_rows &&
+            return rows >= neon_panel::min_rows &&
                 neon_panel::supports(w.preparedFootprint().encoding, w.codebook_id, w.is_asymmetric);
         }
 
-#if defined(__ARM_FEATURE_DOTPROD)
+        /** @return Existing team width, including a serialized team, or the new team's budget. */
+        inline int packedPrefillWorkers() noexcept
+        { return llaminar::v2::inLexicalWorkshare() ? omp_get_num_threads() : omp_get_max_threads(); }
+
         /** @brief Launch an admitted panel binding with the invocation's native dot family. */
         inline void executePacked(const CPUNativeNEONPackedPrefill &binding, multi_scale::NEONByteDot dot)
         {
 #if LLAMINAR_COMPILED_WITH_NEON_I8MM
             if (dot == multi_scale::NEONByteDot::I8MM) return binding.execute<multi_scale::NEONByteDot::I8MM>();
 #endif
-            binding.execute<multi_scale::NEONByteDot::DotProd>();
-        }
+#if defined(__ARM_FEATURE_DOTPROD)
+            if (dot == multi_scale::NEONByteDot::DotProd) return binding.execute<multi_scale::NEONByteDot::DotProd>();
 #endif
+            if (dot != multi_scale::NEONByteDot::ASIMD)
+                throw std::invalid_argument("Native ARM packed prefill requires its admitted dot family");
+            binding.execute<multi_scale::NEONByteDot::ASIMD>();
+        }
 
         /** @brief Publish original FP32 rows and project them within one retained/new team.
          * @param packed Retained canonical prepared owner.
@@ -197,7 +203,7 @@ namespace llaminar2::cpu::native_quantised
          */
         inline void full(const CPUNativeQuantisedPackedWeights &packed, const float *input, float *output,
             int rows, int stride, std::span<Q8_1Block> activation, const ProjectionRowWork *work = nullptr,
-            [[maybe_unused]] std::span<float> partial = {})
+            std::span<float> partial = {})
         {
             geometry(packed, rows, stride);
             const CPUProjectionRowGrid grid(rows, work);
@@ -215,21 +221,17 @@ namespace llaminar2::cpu::native_quantised
             const auto schedule = automatic(packed, rows);
             const auto batch = bind(packed, activation.data(), output, rows, stride,
                 schedule.tile, schedule.n_block_chunks, work);
-#if defined(__ARM_FEATURE_DOTPROD)
             std::optional<CPUNativeNEONPackedPrefill> panel;
-            if (usesPackedPrefill(packed, rows, dot))
+            if (usesPackedPrefill(packed, rows))
             {
                 storage_proof::requireDisjoint({partial.data(), partial.size_bytes()},
                     {input, std::size_t(rows) * packed.K * sizeof(float)});
-                panel.emplace(CPUNativeNEONPackedPrefill::bind(batch, partial, nativeQuantisedInvocationWorkerCount()));
+                panel.emplace(CPUNativeNEONPackedPrefill::bind(batch, partial, packedPrefillWorkers()));
             }
-#endif
             auto run = [&] {
                 quantize_activations_to_q8_1(input, activation.data(), rows, packed.K, packed.blocks_per_row,
                     packed.numerical_policy, work);
-#if defined(__ARM_FEATURE_DOTPROD)
                 if (panel) return executePacked(*panel, dot);
-#endif
                 execute(batch, dot);
             };
             OMP_WORKSHARE_REGION(run);
@@ -258,9 +260,8 @@ namespace llaminar2::cpu::native_quantised
     inline std::size_t nativeQuantisedProjectionPartialFloats(const CPUNativeQuantisedPackedWeights &packed, int rows)
     {
         neon_execution::geometry(packed, rows, packed.N);
-        if (activeISALevel() != ISALevel::NEONDotProd) return 0;
         return neon_panel::workspaceFloats(packed.preparedFootprint().encoding, packed.codebook_id, packed.is_asymmetric,
-            rows, packed.K, nativeQuantisedInvocationWorkerCount(), packed.numerical_policy);
+            rows, packed.K, neon_execution::packedPrefillWorkers(), packed.numerical_policy);
     }
 
     /** @copydoc nativeQuantisedProjectionPartialFloats */
@@ -360,16 +361,16 @@ namespace llaminar2::cpu::native_quantised
         }
         else if (schedule != PrefillSchedulePolicy::Auto)
             throw std::invalid_argument("ARM prefill requires native shared-row grid ownership");
-#if defined(__ARM_FEATURE_DOTPROD)
-        const auto dot = neon_execution::instruction(isa_path);
         if (schedule == PrefillSchedulePolicy::Auto && policy == VerifierRowsPolicy::Auto && chunks == 0 &&
-            neon_execution::usesPackedPrefill(packed, rows, dot))
+            neon_execution::usesPackedPrefill(packed, rows))
         {
+            neon_execution::geometry(packed, rows, stride);
+            if (!CPUProjectionRowGrid(rows, work).beginWorkshare()) return;
+            const auto dot = neon_execution::instruction(isa_path);
             const auto batch = neon_execution::bind(packed, input, output, rows, stride, NEONProjectionRowTile::Pair, 1, work);
-            const auto panel = CPUNativeNEONPackedPrefill::bind(batch, partial_storage, nativeQuantisedInvocationWorkerCount());
+            const auto panel = CPUNativeNEONPackedPrefill::bind(batch, partial_storage, neon_execution::packedPrefillWorkers());
             return neon_execution::executePacked(panel, dot);
         }
-#endif
         gemm_native_quantised_preq_decode_equivalent_rows(packed, input, output, partial_storage,
             rows, stride, isa_path, policy, false, chunks, work);
     }
@@ -463,7 +464,7 @@ namespace llaminar2::cpu::native_quantised
                 throw std::invalid_argument("Native ARM beta epilogue requires distinct admitted retained banks");
         }
         float *destination = beta == 0.0f ? output : product.data();
-        if (beta != 0.0f)
+        if (beta != 0.0f && neon_execution::usesPackedPrefill(packed, rows))
             storage_proof::requireDisjoint({partial.data(), partial.size_bytes()}, {output, elements * sizeof(float)});
         neon_execution::full(packed, input, destination, rows, columns, activation, work, partial);
         if (beta == 0.0f && alpha == 1.0f) return;

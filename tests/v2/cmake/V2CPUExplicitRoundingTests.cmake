@@ -120,20 +120,18 @@ if(LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
         COMMAND $<TARGET_FILE:v2_test_cpu_native_neon_prepared_projection>
             --gtest_filter=*PanelWidthsMatchTheStripProgram:CPUNativeNEONMultiScaleOps.*
         LABELS V2 Integration ProductionTestPreflight CPU NEON NativeQuantised ByteExact AllFormats Regression)
-    if(LLAMINAR_CPU_ISA_UPPER STREQUAL "NEON_DOTPROD" OR LLAMINAR_CPU_ISA_UPPER STREQUAL "NEON_I8MM")
-        add_executable(v2_test_cpu_native_neon_packed_prefill
-            "${V2_NUMERIC_ROOT}/tests/v2/unit/kernels/cpu/Test__CPUNativeNEONPackedPrefill.cpp")
-        target_include_directories(v2_test_cpu_native_neon_packed_prefill PRIVATE
-            "${V2_NUMERIC_ROOT}/src/v2" "${V2_NUMERIC_ROOT}/tests/v2")
-        target_compile_features(v2_test_cpu_native_neon_packed_prefill PRIVATE cxx_std_20)
-        target_link_libraries(v2_test_cpu_native_neon_packed_prefill PRIVATE GTest::gtest_main OpenMP::OpenMP_CXX)
-        v2_add_core_free_test(V2_Unit_CPUNativeNEONPackedPrefill
-            COMMAND $<TARGET_FILE:v2_test_cpu_native_neon_packed_prefill>
-            LABELS V2 Unit CPU NEON NativeQuantised ByteExact)
-        v2_add_core_free_test(V2_Integration_CPUNativeNEONPackedPrefill
-            COMMAND $<TARGET_FILE:v2_test_cpu_native_neon_packed_prefill>
-            LABELS V2 Integration ProductionTestPreflight CPU NEON NativeQuantised ByteExact Regression)
-    endif()
+    add_executable(v2_test_cpu_native_neon_packed_prefill
+        "${V2_NUMERIC_ROOT}/tests/v2/unit/kernels/cpu/Test__CPUNativeNEONPackedPrefill.cpp")
+    target_include_directories(v2_test_cpu_native_neon_packed_prefill PRIVATE
+        "${V2_NUMERIC_ROOT}/src/v2" "${V2_NUMERIC_ROOT}/tests/v2")
+    target_compile_features(v2_test_cpu_native_neon_packed_prefill PRIVATE cxx_std_20)
+    target_link_libraries(v2_test_cpu_native_neon_packed_prefill PRIVATE GTest::gtest_main OpenMP::OpenMP_CXX)
+    v2_add_core_free_test(V2_Unit_CPUNativeNEONPackedPrefill
+        COMMAND $<TARGET_FILE:v2_test_cpu_native_neon_packed_prefill>
+        LABELS V2 Unit CPU NEON NativeQuantised ByteExact)
+    v2_add_core_free_test(V2_Integration_CPUNativeNEONPackedPrefill
+        COMMAND $<TARGET_FILE:v2_test_cpu_native_neon_packed_prefill>
+        LABELS V2 Integration ProductionTestPreflight CPU NEON NativeQuantised ByteExact Regression)
     # Row-pair SMMLA exists only in the I8MM envelope. These focused gates
     # prove its operands are the serial SDOT walk's product terms and that its
     # N-tail/odd-row bytes, including canaries past N, equal SDOT's.

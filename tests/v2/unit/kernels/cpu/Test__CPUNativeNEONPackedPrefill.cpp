@@ -55,7 +55,7 @@ std::vector<Q8_1Block> activationRows(int blocks, int rows)
  */
 TEST(CPUNativeNEONPackedPrefill, MatchesSerialAcrossPanelsAndTails)
 {
-    constexpr auto serial = ms::NEONByteDot::DotProd;
+    constexpr auto serial = ms::NEONByteDot::ASIMD;
     constexpr std::uint32_t dirty_bits = 0x7fc12345u;
     constexpr float dirty = std::bit_cast<float>(dirty_bits);
     struct Case { int rows, n, blocks; };
@@ -104,6 +104,9 @@ TEST(CPUNativeNEONPackedPrefill, MatchesSerialAcrossPanelsAndTails)
                     EXPECT_EQ(std::bit_cast<std::uint32_t>(scratch.data()[demand]), dirty_bits);
                 };
                 compare.template operator()<serial>();
+#if defined(__ARM_FEATURE_DOTPROD)
+                compare.template operator()<ms::NEONByteDot::DotProd>();
+#endif
 #if defined(__ARM_FEATURE_MATMUL_INT8)
                 compare.template operator()<ms::NEONByteDot::I8MM>();
 #endif

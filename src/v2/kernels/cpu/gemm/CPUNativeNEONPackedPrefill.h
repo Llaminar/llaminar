@@ -16,7 +16,6 @@
 
 namespace llaminar2::cpu::native_quantised
 {
-#if defined(__ARM_FEATURE_DOTPROD)
 #if defined(__GNUC__) && !defined(__clang__)
 #define LLAMINAR_NEON_PREFILL_EXACT __attribute__((optimize("fp-contract=off", "no-associative-math")))
 #else
@@ -63,12 +62,12 @@ namespace llaminar2::cpu::native_quantised
         /** @brief Execute the checked packed panel binding with its admitted native dot family. */
         template<Dot Instruction> void execute() const
         {
-            static_assert(Instruction != Dot::ASIMD);
             if (!batch_.grid_.beginWorkshare()) return;
-            const int team = omp_in_parallel() ? omp_get_num_threads() : omp_get_max_threads();
+            const int team = llaminar::v2::inLexicalWorkshare() ? omp_get_num_threads() : omp_get_max_threads();
             if (team > workers_)
                 throw std::invalid_argument("Native NEON prefill team exceeds its admitted projection slab");
-            ARMCPUCapabilities::native().require(ARMCPUFeature::DotProd);
+            if constexpr (Instruction != Dot::ASIMD)
+                ARMCPUCapabilities::native().require(ARMCPUFeature::DotProd);
             if constexpr (Instruction == Dot::I8MM)
                 ARMCPUCapabilities::native().require(ARMCPUFeature::IntegerMatMul);
             const auto &w = batch_.weights_;
@@ -387,5 +386,4 @@ namespace llaminar2::cpu::native_quantised
         int workers_; ///< Admitted slots, indexed by active-team worker id.
     };
 #undef LLAMINAR_NEON_PREFILL_EXACT
-#endif
 }

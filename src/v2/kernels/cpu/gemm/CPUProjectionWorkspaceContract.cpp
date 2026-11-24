@@ -58,13 +58,10 @@ namespace llaminar2
             auto requirements = cpuProjectionQ8WorkspaceRequirements(geometry.rows, geometry.k);
             // Decode retains its register-only contract. The prefill panel is
             // a worker-indexed borrow of the existing named projection slab.
-            if (geometry.execution.active_isa == ISALevel::NEONDotProd)
-            {
-                const auto panel = cpuProjectionPartialWorkspaceRequirements(cpu::native_quantised::neon_panel::workspaceFloats(
-                    footprint.encoding, codebook, footprint.is_asymmetric, geometry.rows, geometry.k, geometry.workers,
-                    geometry.numerical_policy));
-                requirements.buffers.insert(requirements.buffers.end(), panel.buffers.begin(), panel.buffers.end());
-            }
+            const auto panel = cpuProjectionPartialWorkspaceRequirements(cpu::native_quantised::neon_panel::workspaceFloats(
+                footprint.encoding, codebook, footprint.is_asymmetric, geometry.rows, geometry.k, geometry.workers,
+                geometry.numerical_policy));
+            requirements.buffers.insert(requirements.buffers.end(), panel.buffers.begin(), panel.buffers.end());
             return requirements;
         }
         const auto config = cpu::native_quantised::serialTileConfigForPreparedProjection(footprint,

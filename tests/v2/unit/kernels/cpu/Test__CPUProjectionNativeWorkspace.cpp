@@ -33,7 +33,7 @@ TEST(CPUProjectionNativeWorkspace, CompilerRuntimePairsAreArchitectureExact)
         }
 }
 
-/** @test Every source uses the same actual native Q8-only workspace authority. */
+/** @test Short row tiles use the native Q8-only workspace authority for every source. */
 TEST(CPUProjectionNativeWorkspace, NativeRegisterTreesNeverReserveX86SharedPartials)
 {
     constexpr CPUExecutionGeometry native{.maximum_native_row_tile = 4,
@@ -44,13 +44,13 @@ TEST(CPUProjectionNativeWorkspace, NativeRegisterTreesNeverReserveX86SharedParti
     for (const auto &source : native_quantised_formats::kAllSourceFormats)
         for (const auto policy : {CPUProjectionNumericalPolicy::BackendNative, CPUProjectionNumericalPolicy::GPUAlignedExpert})
         {
-            CPUProjectionWorkspaceGeometry geometry{.rows = 31, .n = 65, .k = 1056, .workers = 10,
+            CPUProjectionWorkspaceGeometry geometry{.rows = 15, .n = 65, .k = 1056, .workers = 10,
                 .execution = native, .numerical_policy = policy};
             const auto footprint = cpu::native_quantised::preparedFootprintForFormat(*source.metadata);
             const auto requirements = CPUProjectionWorkspaceContract::prepared(footprint, source.metadata->codebook_id, geometry);
             ASSERT_EQ(requirements.buffers.size(), 1u);
             EXPECT_EQ(requirements.buffers[0].name, kCPUProjectionQ8);
-            EXPECT_EQ(requirements.buffers[0].size_bytes, 31u * 33 * sizeof(Q8_1Block));
+            EXPECT_EQ(requirements.buffers[0].size_bytes, 15u * 33 * sizeof(Q8_1Block));
             auto unrelated = geometry;
             unrelated.execution.cache = kSyntheticCPUExecutionGeometry.cache;
             const auto same = CPUProjectionWorkspaceContract::prepared(footprint, source.metadata->codebook_id, unrelated);
@@ -73,6 +73,17 @@ TEST(CPUProjectionNativeWorkspace, PrefillWorkerPanelsAreChargedToTheNamedSlab)
                     constexpr int workers = 7;
                     const auto requirements = CPUProjectionWorkspaceContract::sourceNative(format,
                         {.rows = rows, .n = 67, .k = k, .workers = workers, .execution = native, .numerical_policy = policy});
+                    auto baseline = native;
+                    baseline.compiled_isa = ISALevel::NEON;
+                    baseline.active_isa = ISALevel::NEON;
+                    const auto asimd = CPUProjectionWorkspaceContract::sourceNative(format,
+                        {.rows = rows, .n = 67, .k = k, .workers = workers, .execution = baseline, .numerical_policy = policy});
+                    ASSERT_EQ(asimd.buffers.size(), requirements.buffers.size());
+                    for (std::size_t i = 0; i < requirements.buffers.size(); ++i)
+                    {
+                        EXPECT_EQ(asimd.buffers[i].name, requirements.buffers[i].name);
+                        EXPECT_EQ(asimd.buffers[i].size_bytes, requirements.buffers[i].size_bytes);
+                    }
                     const std::string_view type = format;
                     const bool packed = rows >= 16 && (type == "IQ3_S" || type == "Q5_K" || type == "Q5_0");
                     ASSERT_EQ(requirements.buffers.size(), packed ? 2u : 1u);
