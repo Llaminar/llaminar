@@ -804,11 +804,22 @@ namespace llaminar2::test
             {
                 const int previous = (a + 128) * w - 128 * w;
                 const int next = a * (w + 128) - 128 * a;
-                ASSERT_EQ(previous, next);
+                const auto product = std::int64_t(a) * w;
+                ASSERT_EQ(previous, product) << "a=" << a << " w=" << w;
+                ASSERT_EQ(next, product) << "a=" << a << " w=" << w;
 #if defined(__AVX2__)
                 const auto dot = dotUnsignedWeightsAVX2(_mm256_setzero_si256(), _mm256_set1_epi8(static_cast<char>(w + 128)),
                     _mm256_set1_epi8(static_cast<char>(a)));
-                ASSERT_EQ(_mm256_extract_epi32(dot, 0) - 4 * 128 * a, 4 * previous);
+                ASSERT_EQ(_mm256_extract_epi32(dot, 0) - 4 * 128 * a, 4 * product) << "a=" << a << " w=" << w;
+#endif
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
+                for (const bool compensated : {false, true})
+                {
+                    const auto dot512 = dotExpandedWeights512(_mm512_setzero_si512(),
+                        _mm512_set1_epi8(static_cast<char>(a)), _mm512_set1_epi8(static_cast<char>(w)), compensated);
+                    ASSERT_EQ(_mm_cvtsi128_si32(_mm512_castsi512_si128(dot512)) - 4 * 128 * (compensated ? w : a), 4 * product)
+                        << "a=" << a << " w=" << w << " compensated=" << compensated;
+                }
 #endif
             }
     }

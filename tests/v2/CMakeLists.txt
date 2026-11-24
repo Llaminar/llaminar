@@ -10688,6 +10688,19 @@ add_v2_test(V2_Integration_CPUCompensationFreeUnits
     MPI_PROCS 1 NO_MODELS)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUCompensationFreeUnits)
 
+# Signed-byte endpoints through the production leaves for every GGUF source format.
+add_executable(v2_unit_cpu_native_extreme_byte_projection unit/kernels/cpu/Test__CPUNativeExtremeByteProjection.cpp)
+target_link_libraries(v2_unit_cpu_native_extreme_byte_projection llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_CPUNativeExtremeByteProjection
+    COMMAND $<TARGET_FILE:v2_unit_cpu_native_extreme_byte_projection>
+    LABELS "V2;Unit;CPU;DeviceFree;NativeQuantised;ByteExact;Regression"
+    MPI_PROCS 1 NO_MODELS NO_MPI)
+add_v2_test(V2_Integration_CPUNativeExtremeByteProjection
+    COMMAND $<TARGET_FILE:v2_unit_cpu_native_extreme_byte_projection>
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;NativeQuantised;ByteExact;Regression"
+    MPI_PROCS 1 NO_MODELS NO_MPI ENVIRONMENT "OMP_NUM_THREADS=4")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUNativeExtremeByteProjection)
+
 # Exhaustive file-density accounting; all CUDA plane calculations are device-free.
 add_executable(v2_unit_native_quantised_file_density_all_formats
     unit/kernels/cpu/Test__NativeQuantisedFileDensityAllFormats.cpp)
