@@ -98,6 +98,8 @@ namespace llaminar2::cpu::native_quantised
             const int selectedEnd=std::min(end,authored.end);
             return {std::min(selectedEnd,std::max(first,authored.first)),selectedEnd};
         }
+        /** @return Original publication whose bytes must remain disjoint from any writable workspace. */
+        [[nodiscard]] const ProjectionRowWork *publication() const noexcept { return work_; }
     private:
         int physical_; ///< Original tensor/partial capacity; never useful row count.
         const ProjectionRowWork *work_; ///< Invocation-owned immutable metadata, live through the workshare.

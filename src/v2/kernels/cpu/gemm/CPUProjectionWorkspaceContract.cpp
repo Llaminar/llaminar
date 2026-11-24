@@ -10,6 +10,7 @@
 #include "CPUProjectionWorkspaceContract.h"
 #include "CPUNativeQuantisedTileConfig.h"
 #include "CPUNativeQuantisedEncoding.h"
+#include "CPUNativeNEONPanelWorkspace.h"
 #include "kernels/cpu/CPUInvocationWorkspace.h"
 #include <climits>
 #include <stdexcept>
@@ -54,10 +55,17 @@ namespace llaminar2
             if (!MoEProjectionNumericalContract::ownsOrderedKPartitionTree(codebook) ||
                 (geometry.numerical_policy == CPUProjectionNumericalPolicy::GPUAlignedExpert && geometry.k % 32 != 0))
                 throw std::invalid_argument("Native ARM projection workspace requires a supported source and complete expert K blocks");
-            // The same registered implementation owns both ordinary full-K and
-            // canonical expert trees in registers. No x86 shared-K slab or
-            // anonymous capacity reserve is charged to the native participant.
-            return cpuProjectionQ8WorkspaceRequirements(geometry.rows, geometry.k);
+            auto requirements = cpuProjectionQ8WorkspaceRequirements(geometry.rows, geometry.k);
+            // Decode retains its register-only contract. The prefill panel is
+            // a worker-indexed borrow of the existing named projection slab.
+            if (geometry.execution.active_isa == ISALevel::NEONDotProd)
+            {
+                const auto panel = cpuProjectionPartialWorkspaceRequirements(cpu::native_quantised::neon_panel::workspaceFloats(
+                    footprint.encoding, codebook, footprint.is_asymmetric, geometry.rows, geometry.k, geometry.workers,
+                    geometry.numerical_policy));
+                requirements.buffers.insert(requirements.buffers.end(), panel.buffers.begin(), panel.buffers.end());
+            }
+            return requirements;
         }
         const auto config = cpu::native_quantised::serialTileConfigForPreparedProjection(footprint,
             codebook, geometry.numerical_policy, geometry.serial_n > 0 ? geometry.serial_n : geometry.n,

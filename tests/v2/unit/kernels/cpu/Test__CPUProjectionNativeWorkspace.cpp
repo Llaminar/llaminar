@@ -3,8 +3,8 @@
  * @brief Device-free native CPU execution identity and canonical workspace BOM.
  *
  * Synthetic remote records are explicit typed observations, not borrowed local
- * CPU capabilities. ARM's register-resident K ABI contributes only its named
- * Q8 bank; x86 retains its real cache-derived shared-partial program. Unknown
+ * CPU capabilities. ARM contributes its named Q8 bank and, for qualifying
+ * prefill, a bounded worker slab; x86 retains its cache-derived partial program. Unknown
  * or cross-architecture identities cannot borrow another implementation's BOM.
  */
 #include "backends/CPUExecutionGeometry.h"
@@ -57,6 +57,32 @@ TEST(CPUProjectionNativeWorkspace, NativeRegisterTreesNeverReserveX86SharedParti
             ASSERT_EQ(same.buffers.size(), 1u);
             EXPECT_EQ(same.buffers[0].size_bytes, requirements.buffers[0].size_bytes);
         }
+}
+
+/** @test A remote ARM executor gets a panel per worker only in the supported prefill domain. */
+TEST(CPUProjectionNativeWorkspace, PrefillWorkerPanelsAreChargedToTheNamedSlab)
+{
+    constexpr CPUExecutionGeometry native{.maximum_native_row_tile = 4,
+        .projection_abi = CPUProjectionScheduleABI::ARMRegisterK,
+        .compiled_isa = ISALevel::NEONDotProd, .active_isa = ISALevel::NEONDotProd};
+    for (const auto format : {"IQ3_S", "Q5_K", "Q5_0", "Q5_1", "Q8_0"})
+        for (int rows : {15, 16, 19})
+            for (int k : {512, 8224})
+                for (auto policy : {CPUProjectionNumericalPolicy::BackendNative, CPUProjectionNumericalPolicy::GPUAlignedExpert})
+                {
+                    constexpr int workers = 7;
+                    const auto requirements = CPUProjectionWorkspaceContract::sourceNative(format,
+                        {.rows = rows, .n = 67, .k = k, .workers = workers, .execution = native, .numerical_policy = policy});
+                    const std::string_view type = format;
+                    const bool packed = rows >= 16 && (type == "IQ3_S" || type == "Q5_K" || type == "Q5_0");
+                    ASSERT_EQ(requirements.buffers.size(), packed ? 2u : 1u);
+                    EXPECT_EQ(requirements.buffers[0].size_bytes, std::size_t(rows * (k / 32)) * sizeof(Q8_1Block));
+                    if (!packed) continue;
+                    const std::size_t carry = k > 8192 && policy == CPUProjectionNumericalPolicy::GPUAlignedExpert
+                        ? (std::size_t(rows) * 16 + 63) / 64 * 64 : 0;
+                    EXPECT_EQ(requirements.buffers[1].name, kCPUProjectionPartials);
+                    EXPECT_EQ(requirements.buffers[1].size_bytes, workers * (2560 + carry));
+                }
 }
 
 /** @test Unknown/foreign/native-width metadata is rejected before memory admission. */

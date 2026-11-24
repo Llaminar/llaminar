@@ -159,6 +159,10 @@ namespace llaminar2::cpu::native_quantised
         }
 
     private:
+        // Packed prefill retains the same checked input/output spans and
+        // original row authorization; it supplies its own column workshare.
+        friend class CPUNativeNEONPackedPrefill;
+
         /** @return Ceil(physical 64-column chunks / chunks per task). */
         [[nodiscard]] std::int64_t chunkGroups() const noexcept
         {

@@ -1,0 +1,391 @@
+/**
+ * @file CPUNativeNEONPackedPrefill.h
+ * @brief Panel-major ARM prefill over the canonical file-density publication.
+ *
+ * Each column strip has one worker owner. The worker decodes one increasing-K
+ * panel into its private invocation slab and consumes it across every active
+ * row tile before reusing that slot. We never publish an expanded weight bank.
+ * Native FP32 state rolls directly through the destination between panels;
+ * an ordered partition spanning panels keeps its unfinished sum separate from
+ * the already folded destination. No output tile is staged and then copied.
+ */
+#pragma once
+
+#include "CPUNativeNEONPanelWorkspace.h"
+#include "CPUNativeNEONProjectionBatch.h"
+
+namespace llaminar2::cpu::native_quantised
+{
+#if defined(__ARM_FEATURE_DOTPROD)
+#if defined(__GNUC__) && !defined(__clang__)
+#define LLAMINAR_NEON_PREFILL_EXACT __attribute__((optimize("fp-contract=off", "no-associative-math")))
+#else
+#define LLAMINAR_NEON_PREFILL_EXACT
+#endif
+
+    /** @brief Synchronous borrowed prefill program; the batch and slab outlive execute(). */
+    class CPUNativeNEONPackedPrefill final
+    {
+        using Tile = CPUNativeNEONProjectionTile<1>;
+        using Dot = multi_scale::NEONByteDot;
+        using Policy = CPUProjectionNumericalPolicy;
+        static constexpr int dot_floats = 128 / sizeof(float);
+        static constexpr int block_floats = neon_panel::block_bytes / sizeof(float);
+
+    public:
+        /**
+         * @brief Check the stage-owned worker bank before any quantizer or dot writes.
+         * @param batch Admitted original-coordinate projection with no attached bias.
+         * @param scratch Persistent slab, disjoint from all invocation inputs and outputs.
+         * @param workers Budget for the active or prospective OpenMP team.
+         * @return Binding that uses only the admitted slab prefix.
+         */
+        static CPUNativeNEONPackedPrefill bind(const CPUNativeNEONProjectionBatch &batch,
+            std::span<float> scratch, int workers)
+        {
+            const auto &w = batch.weights_;
+            const int rows = static_cast<int>(batch.activation_.size() / w.blocks_per_row);
+            if (workers <= 0 || !batch.bias_.empty() || !neon_panel::supports(w.encoding, w.codebook_id, w.is_asymmetric) ||
+                rows < neon_panel::min_rows)
+                throw std::invalid_argument("Native NEON prefill requires eligible retained panel geometry");
+            const auto used = neon_panel::workspaceFloats(w.encoding, w.codebook_id, w.is_asymmetric,
+                rows, w.K, workers, w.numerical_policy);
+            if (scratch.size() < used || reinterpret_cast<std::uintptr_t>(scratch.data()) % 64)
+                throw std::invalid_argument("Native NEON prefill requires its aligned per-worker projection slab");
+            const storage_proof::Bytes writes{scratch.data(), used * sizeof(float)};
+            storage_proof::requireDisjoint(writes, {batch.activation_.data(), batch.activation_.size_bytes()});
+            storage_proof::requireDisjoint(writes, {batch.output_.data(), batch.output_.size_bytes()});
+            storage_proof::requireDisjoint(writes, {w.bytes().data(), w.bytes().size()});
+            storage_proof::requireOriginalWorkReadOnly(writes, batch.grid_.publication());
+            return {batch, scratch.data(), neon_panel::workerFloats(rows, w.K, w.numerical_policy), workers};
+        }
+
+        /** @brief Execute the checked packed panel binding with its admitted native dot family. */
+        template<Dot Instruction> void execute() const
+        {
+            static_assert(Instruction != Dot::ASIMD);
+            if (!batch_.grid_.beginWorkshare()) return;
+            const int team = omp_in_parallel() ? omp_get_num_threads() : omp_get_max_threads();
+            if (team > workers_)
+                throw std::invalid_argument("Native NEON prefill team exceeds its admitted projection slab");
+            ARMCPUCapabilities::native().require(ARMCPUFeature::DotProd);
+            if constexpr (Instruction == Dot::I8MM)
+                ARMCPUCapabilities::native().require(ARMCPUFeature::IntegerMatMul);
+            const auto &w = batch_.weights_;
+            if (w.usesCompactMultiScale())
+            {
+                if (w.codebook_id == 11) return dispatch<Instruction, 11>();
+                return dispatch<Instruction, 7>();
+            }
+            dispatch<Instruction, 0>();
+        }
+
+    private:
+        /** @brief Retain the original spans and the size of each worker-exclusive slot. */
+        CPUNativeNEONPackedPrefill(const CPUNativeNEONProjectionBatch &batch, float *scratch,
+            std::size_t worker_floats, int workers) noexcept
+            : batch_(batch), scratch_(scratch), worker_floats_(worker_floats), workers_(workers) {}
+
+        /**
+         * @brief Decode one 32-value K block for four columns directly into its slab slot.
+         * @tparam C IQ3_S (11), Q5_K (7), or Q5_0 (0).
+         * @tparam Ops Native consumer's lane layout; SMMLA operands are zipped once here.
+         * @param unit First byte of the file-density block.
+         * @param c First column inside the prepared chunk.
+         * @param x Existing worker slab; weight bytes use byte-wise access and the scale planes are FP32.
+         */
+        template<int C, typename Ops> [[gnu::always_inline]] static void packBytes(
+            const std::uint8_t *unit, int c, float *x) noexcept
+        {
+            auto *bytes = reinterpret_cast<std::int8_t *>(x);
+            const auto put = [&]<int G>(int8x16_t a, int8x16_t b) __attribute__((always_inline)) {
+                if constexpr (multi_scale::usesRowPairs<Ops>)
+                {
+                    const auto l = vreinterpretq_s32_s8(a), r = vreinterpretq_s32_s8(b);
+                    a = vreinterpretq_s8_s32(vzip1q_s32(l, r));
+                    b = vreinterpretq_s8_s32(vzip2q_s32(l, r));
+                }
+                std::memcpy(bytes + 16 * G, &a, sizeof(a));
+                std::memcpy(bytes + 16 * (G + 1), &b, sizeof(b));
+            };
+            if constexpr (C == 11)
+            {
+                using I = typename Ops::I;
+                const auto meta = multi_scale::payloadWord<11, Ops>(unit, 2, c);
+                const uint8x16_t gather{255, 0, 255, 4, 255, 8, 255, 12, 255, 0, 255, 4, 255, 8, 255, 12};
+                const int16x8_t align{0, 0, 0, 0, -1, -1, -1, -1};
+                const auto high = vshlq_u16(vreinterpretq_u16_u8(vqtbl1q_u8(std::bit_cast<uint8x16_t>(meta), gather)), align);
+                Tile::forEachGroup<4>([&]<int Pair>() __attribute__((always_inline)) {
+                    const auto qs = multi_scale::payloadWord<11, Ops>(unit, Pair / 2, c);
+                    const auto indices = Tile::iq3PairIndices<Pair, Ops>(qs, high);
+                    const auto signs = [&]() __attribute__((always_inline)) {
+                        if constexpr (Pair < 3) return Ops::template repeatByte<1 + Pair>(meta);
+                        else
+                        {
+                            const auto tail = vreinterpretq_u8_u32(vld1q_dup_u32(reinterpret_cast<const std::uint32_t *>(
+                                unit + preparedCompactPayloadWords(11) * 256 + c)));
+                            return std::bit_cast<I>(vqtbl1q_u8(tail,
+                                uint8x16_t{0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3}));
+                        }
+                    }();
+                    put.template operator()<2 * Pair>(Tile::iq3PairGroup<0, Ops>(indices, signs),
+                        Tile::iq3PairGroup<1, Ops>(indices, signs));
+                });
+            }
+            else if constexpr (C == 7)
+            {
+                Tile::forEachGroup<2>([&]<int Pair>() __attribute__((always_inline)) {
+                    constexpr int g = 2 * Pair;
+                    const auto a = vld1q_u8(unit + g * 256 + c * 4);
+                    const auto b = vld1q_u8(unit + (g + 1) * 256 + c * 4);
+                    const auto *plane = unit + 1024 + c / 2 + 32 * g;
+                    put.template operator()<g>(
+                        vreinterpretq_s8_u8(Tile::q5KMerge(vandq_u8(a, vdupq_n_u8(15)), plane)),
+                        vreinterpretq_s8_u8(Tile::q5KMerge(vandq_u8(b, vdupq_n_u8(15)), plane + 32)));
+                    put.template operator()<g + 4>(
+                        vreinterpretq_s8_u8(Tile::q5KMerge(vshrq_n_u8(a, 4), plane + 128)),
+                        vreinterpretq_s8_u8(Tile::q5KMerge(vshrq_n_u8(b, 4), plane + 160)));
+                });
+            }
+            else
+            {
+                Tile::forEachGroup<2>([&]<int Pair>() __attribute__((always_inline)) {
+                    constexpr int g = 2 * Pair;
+                    const auto a = Tile::ordinaryQ5Groups<true>(unit, c, g);
+                    const auto b = Tile::ordinaryQ5Groups<true>(unit, c, g + 1);
+                    put.template operator()<g>(a[0], b[0]);
+                    put.template operator()<g + 4>(a[1], b[1]);
+                });
+            }
+        }
+
+        /** @brief Stream one physical K panel; widen each original superblock header once. */
+        template<int C, typename Ops> [[gnu::noinline]] static void pack(const CPUNativeQuantisedWeightView &w,
+            int chunk, int c, int first, int end, float *buffer) noexcept
+        {
+            const auto geometry = w.geometry();
+            const auto *root = w.interleavedBase() + std::size_t(chunk) * geometry.rowBytes();
+            if constexpr (C != 0)
+            {
+                for (int block = first; block < end; )
+                {
+                    const int last = std::min(end, static_cast<int>(geometry.superblockEnd(block)));
+                    const auto *unit = root + geometry.blockOffset(0, block);
+                    const auto base = Tile::codedBase<C, Ops>(root + geometry.headerOffset(0, block), c);
+                    constexpr auto stride = preparedInterleavedBlockStride(CPUNativeQuantisedEncoding::CompactMultiScale, C == 7, C);
+                    for (; block < last; ++block, unit += stride, buffer += block_floats)
+                    {
+                        packBytes<C, Ops>(unit, c, buffer);
+                        const auto factors = Tile::codedFactors<C, Ops>(unit, base, c);
+                        vst1q_f32(buffer + dot_floats, std::bit_cast<float32x4_t>(factors.primary));
+                        if constexpr (C == 7)
+                            vst1q_f32(buffer + dot_floats + 4, std::bit_cast<float32x4_t>(factors.secondary));
+                    }
+                }
+            }
+            else
+            {
+                constexpr auto stride = preparedInterleavedBlockStride(CPUNativeQuantisedEncoding::Q5NativeSingleScale,
+                    false, native_quantised_formats::Q5_0.codebook_id);
+                const auto *unit = root + std::size_t(first) * stride;
+                for (int block = first; block < end; ++block, unit += stride, buffer += block_floats)
+                {
+                    packBytes<C, Ops>(unit, c, buffer);
+                    vst1q_f32(buffer + dot_floats, std::bit_cast<float32x4_t>(Ops::half(
+                        reinterpret_cast<const std::uint16_t *>(unit + Q5NativePayload::bytes) + c)));
+                }
+            }
+        }
+
+        /** @brief Read only live N lanes of the prior running result; padding stays untouched. */
+        static float32x4_t loadOutput(const float *p, int n) noexcept
+        {
+            if (n == 4) return vld1q_f32(p);
+            auto value = vld1q_lane_f32(p, vdupq_n_f32(0), 0);
+            if (n > 1) value = vld1q_lane_f32(p + 1, value, 1);
+            if (n > 2) value = vld1q_lane_f32(p + 2, value, 2);
+            return value;
+        }
+
+        /** @brief Publish the running result straight to its original N coordinates. */
+        static void storeOutput(float *p, float32x4_t value, int n) noexcept
+        {
+            if (n == 4) { vst1q_f32(p, value); return; }
+            vst1q_lane_f32(p, value, 0);
+            if (n > 1) vst1q_lane_f32(p + 1, value, 1);
+            if (n > 2) vst1q_lane_f32(p + 2, value, 2);
+        }
+
+        /** @brief Take one packed native dot operand without treating its INT8 bytes as floats. */
+        [[gnu::always_inline]] static int8x16_t dotOperand(const float *block, int group) noexcept
+        {
+            int8x16_t result;
+            std::memcpy(&result, block + 4 * group, sizeof(result));
+            return result;
+        }
+
+        /** @brief Apply the original single-block FP32 contribution to one output row. */
+        template<Policy P, bool Minimum>
+        [[gnu::always_inline]] static float32x4_t update(float32x4_t sum, int32x4_t dot, const float *block,
+            const Q8_1Block &activation) noexcept
+        {
+            const float scale = nativeQuantisedFP16ScaleToFP32(activation.d);
+            const auto w = vld1q_f32(block + dot_floats);
+            if constexpr (Minimum)
+                return accumulateCorrectedSingleScaleBlockNEON(sum, dot, w, activation.sum_qs,
+                    vld1q_f32(block + dot_floats + 4), scale, P);
+            else
+                return accumulateSingleScaleBlockNEON(sum, dot, w, scale, P);
+        }
+
+        /**
+         * @brief Consume one reusable panel for a row or pair, preserving its canonical K tree.
+         * @param packed Packed INT8 groups and widened FP32 factors, in ascending logical K order.
+         * @param count Blocks in the current panel (zero for a canonical empty partition).
+         * @param a,a1 First block of each live activation row for the current panel.
+         * @param out,out1 Destination strips in original row order; only nc lanes are writable.
+         * @param nc Actual live N lanes in [1,4].
+         * @param carry Worker-private unfinished ordered partition, present only when split.
+         * @param start,finish Whether the current panel starts/ends its canonical arithmetic interval.
+         * @param fold Whether an ordered preceding partition is already resident in the destination.
+         */
+        template<int Rows, typename Ops, Policy P, bool Minimum>
+        [[gnu::noinline]] LLAMINAR_NEON_PREFILL_EXACT static void compute(const float *packed, int count,
+            const Q8_1Block *a, const Q8_1Block *a1, float *out, float *out1, int nc, float *carry,
+            bool start, bool finish, bool fold) noexcept
+        {
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#pragma clang fp reassociate(off)
+#endif
+            using I = typename Ops::I;
+            constexpr bool ordered = P == Policy::GPUAlignedExpert;
+            auto v = start ? vdupq_n_f32(0) : loadOutput(ordered ? carry : out, ordered ? 4 : nc);
+            auto w = vdupq_n_f32(0);
+            if constexpr (Rows == 2)
+                if (!start) w = loadOutput(ordered ? carry + 4 : out1, ordered ? 4 : nc);
+            for (int b = 0; b < count; ++b, packed += block_floats)
+            {
+                auto x = vdupq_n_s32(0), y = vdupq_n_s32(0);
+#if defined(__ARM_FEATURE_MATMUL_INT8)
+                if constexpr (multi_scale::usesRowPairs<Ops>)
+                {
+                    auto lo = vdupq_n_s32(0), hi = vdupq_n_s32(0);
+                    Tile::forEachGroup<4>([&]<int G>() __attribute__((always_inline)) {
+                        const auto q = [&]() __attribute__((always_inline)) {
+                            if constexpr (Rows == 2)
+                                return std::bit_cast<int8x16_t>(Ops::activationPair(a[b].qs + 8 * G, a1[b].qs + 8 * G));
+                            else
+                                return vcombine_s8(vld1_s8(a[b].qs + 8 * G), vdup_n_s8(0));
+                        }();
+                        lo = vmmlaq_s32(lo, q, dotOperand(packed, 2 * G));
+                        hi = vmmlaq_s32(hi, q, dotOperand(packed, 2 * G + 1));
+                    });
+                    splitRowPairI8MM(lo, hi, x, y);
+                }
+                else
+#endif
+                {
+                    const auto a0 = Ops::activationBlock(a[b].qs);
+                    typename Ops::ActivationBlock second{};
+                    if constexpr (Rows == 2) second = Ops::activationBlock(a1[b].qs);
+                    I d0{}, d1{};
+                    Tile::forEachGroup<8>([&]<int G>() __attribute__((always_inline)) {
+                        const auto weight = std::bit_cast<I>(dotOperand(packed, G));
+                        d0 = Ops::template dotLane<G>(d0, weight, a0);
+                        if constexpr (Rows == 2) d1 = Ops::template dotLane<G>(d1, weight, second);
+                    });
+                    x = std::bit_cast<int32x4_t>(d0);
+                    y = std::bit_cast<int32x4_t>(d1);
+                }
+                v = update<P, Minimum>(v, x, packed, a[b]);
+                if constexpr (Rows == 2) w = update<P, Minimum>(w, y, packed, a1[b]);
+            }
+            if constexpr (ordered)
+            {
+                if (!finish)
+                {
+                    vst1q_f32(carry, v);
+                    if constexpr (Rows == 2) vst1q_f32(carry + 4, w);
+                    return;
+                }
+                if (fold)
+                {
+                    v = vaddq_f32(loadOutput(out, nc), v);
+                    if constexpr (Rows == 2) w = vaddq_f32(loadOutput(out1, nc), w);
+                }
+            }
+            storeOutput(out, v, nc);
+            if constexpr (Rows == 2) storeOutput(out1, w, nc);
+        }
+
+        /** @brief Stream private K panels across all useful row pairs owned by a column strip. */
+        template<Dot Instruction, int C, Policy P> void run() const
+        {
+            using Ops = multi_scale::NEONMultiScaleOps<Instruction>;
+            const auto &w = batch_.weights_;
+            const auto *a = batch_.activation_.data();
+            auto *out = batch_.output_.data();
+            const int stride = batch_.stride_;
+            const int pairs = batch_.grid_.tiles(2);
+            const int partitions = Tile::partitionsFor(w);
+            const int per_partition = (w.blocks_per_row + partitions - 1) / partitions;
+            auto work = [&] {
+                ARMFloatingPointProfile::require("Native NEON packed prefill");
+                auto *panel = scratch_ + std::size_t(omp_get_thread_num()) * worker_floats_;
+                auto *carry = neon_panel::needsCarry(w.K, P) ? panel + neon_panel::panel_floats : nullptr;
+#pragma omp for schedule(dynamic, 1)
+                for (int chunk = 0; chunk < w.N_padded / 64; ++chunk)
+                    for (int c = 0; c < std::min(64, w.N - 64 * chunk); c += 4)
+                    {
+                        const int n = 64 * chunk + c, nc = std::min(4, w.N - n);
+                        for (int p = 0; p < partitions; ++p)
+                        {
+                            // The legacy fold includes empty trailing partitions. They
+                            // contribute +0 (including FP sign/payload behavior).
+                            const int first = std::min(p * per_partition, w.blocks_per_row);
+                            const int end = std::min(first + per_partition, w.blocks_per_row);
+                            for (int b = first;;)
+                            {
+                                const int last = b + std::min(neon_panel::depth, end - b);
+                                if (last > b) pack<C, Ops>(w, chunk, c, b, last, panel);
+                                for (int pair = 0; pair < pairs; ++pair)
+                                {
+                                    const auto rows = batch_.grid_.tileSpan(pair, 2);
+                                    if (!rows.size()) continue;
+                                    const auto r = std::size_t(rows.first);
+                                    const auto *q = a + r * w.blocks_per_row + b;
+                                    auto *o = out + r * stride + n;
+                                    auto *s = carry ? carry + r * 4 : nullptr;
+                                    if (rows.size() == 2)
+                                        compute<2, Ops, P, C == 7>(panel, last - b, q, q + w.blocks_per_row, o, o + stride, nc,
+                                            s, b == first, last == end, p != 0);
+                                    else
+                                        compute<1, Ops, P, C == 7>(panel, last - b, q, nullptr, o, nullptr, nc,
+                                            s, b == first, last == end, p != 0);
+                                }
+                                if (last == end) break;
+                                b = last;
+                            }
+                        }
+                    }
+            };
+            OMP_WORKSHARE_REGION(work);
+        }
+
+        /** @brief Resolve the two different arithmetic programs once before worksharing. */
+        template<Dot Instruction, int C> void dispatch() const
+        {
+            if (batch_.weights_.numerical_policy == Policy::GPUAlignedExpert)
+                return run<Instruction, C, Policy::GPUAlignedExpert>();
+            run<Instruction, C, Policy::BackendNative>();
+        }
+
+        const CPUNativeNEONProjectionBatch &batch_; ///< Synchronous original-coordinate binding.
+        float *scratch_; ///< Stage-owned slab; disjoint per-worker slots.
+        std::size_t worker_floats_; ///< 64-byte-aligned size of each slot.
+        int workers_; ///< Admitted slots, indexed by active-team worker id.
+    };
+#undef LLAMINAR_NEON_PREFILL_EXACT
+#endif
+}

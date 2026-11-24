@@ -179,7 +179,10 @@ TEST_F(CPUNativeNEONExecution, AllOwnersSerialGroupedAndPrefillRetainBytes)
                     gemm_native_quantised_preq_decode_equivalent_rows(packed, input.data(), actual.data(), {}, rows, stride);
                     bytes(actual, expected);
                     std::fill(actual.begin(), actual.end(), 123456.0f);
-                    gemm_native_quantised_preq(packed, input.data(), actual.data(), {}, rows, stride);
+                    AlignedVector<float> partials;
+                    partials.resize_uninitialized(nativeQuantisedProjectionPartialFloats(packed, rows));
+                    gemm_native_quantised_preq(packed, input.data(), actual.data(),
+                        {partials.data(), partials.size()}, rows, stride);
                     bytes(actual, expected);
                 }
                 std::int32_t live = rows / 2;

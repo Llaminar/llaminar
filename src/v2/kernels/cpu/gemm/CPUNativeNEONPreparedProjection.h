@@ -228,6 +228,7 @@ namespace llaminar2::cpu::native_quantised
         // policy, K tree and every task's spans before forming a team, may build
         // and run tiles without per-task checks.
         friend class CPUNativeNEONProjectionBatch;
+        friend class CPUNativeNEONPackedPrefill;
 
         /**
          * @brief Execute an admitted family inside a worker team.
