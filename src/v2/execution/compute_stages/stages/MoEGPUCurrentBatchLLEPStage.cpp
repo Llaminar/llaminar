@@ -557,8 +557,12 @@ namespace llaminar2
             bound_workspace_->getBuffer(workspaceBufferName(
                 MoEDeviceRebalanceStage::WS_GATHERED_TRANSFER_PAYLOAD,
                 params_.workspace_name)));
+        auto *claim_index = static_cast<DeviceMoETransferSlotClaimIndex *>(
+            bound_workspace_->getBuffer(workspaceBufferName(
+                MoEDeviceRebalanceStage::WS_TRANSFER_SLOT_CLAIM_INDEX,
+                params_.workspace_name)));
         if (!plan_entries || !plan_count || !command_header || !status ||
-            !apply_status || !gathered_payload)
+            !apply_status || !gathered_payload || !claim_index)
         {
             LOG_ERROR("[MoEGPUCurrentBatchLLEPStage] Unpack/apply workspace is incomplete");
             return false;
@@ -580,7 +584,7 @@ namespace llaminar2
                 params_.local_transfer_slot_count,
                 config,
                 apply_status,
-                nullptr,
+                borrowDeviceMoEArrivalScratch(claim_index),
                 /*command_buffer_count=*/1) ||
             !kernel->applyDeviceRebalanceArrivals(
                 launch,

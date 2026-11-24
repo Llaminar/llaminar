@@ -17,6 +17,19 @@
 
 namespace llaminar2
 {
+    /**
+     * @brief Header of participant-local live arrival scratch, followed by two slot-count arrays.
+     *
+     * The first array arbitrates duplicate commands by physical slot. The second
+     * contains one plan index per distinct live arrival, independent of slot ID.
+     * A completed command projection may lend its retired claim-index storage;
+     * the wave stream orders this exclusive borrow until unpack completes.
+     */
+    struct DeviceMoERebalanceArrivalScratch
+    {
+        uint32_t live_count;
+    };
+
     /** @brief Immutable physical address range and durable occupancy limit for a layer's family. */
     struct DeviceMoETransferSlotRange
     {

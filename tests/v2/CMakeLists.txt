@@ -27225,7 +27225,8 @@ endif()
 # Test: CUDA Graph Capture - NVIDIA graph capture/replay infrastructure
 # Tests IGPUGraphCapture interface via CUDAGraphCapture: lifecycle, error paths, ownership
 if(HAVE_CUDA)
-    add_executable(v2_integration_cuda_graph_capture integration/backends/Test__CUDAGraphCapture.cpp)
+    add_executable(v2_integration_cuda_graph_capture integration/backends/Test__CUDAGraphCapture.cpp
+        integration/backends/CUDALiveLaunchProof.cu)
     if(LLAMINAR_SHARED_CORE)
         target_link_libraries(v2_integration_cuda_graph_capture PRIVATE
             llaminar2_core
@@ -27250,7 +27251,7 @@ if(HAVE_CUDA)
     )
     add_v2_test(V2_Integration_CUDA_PipelineFollowerMoECadence
         COMMAND $<TARGET_FILE:v2_integration_cuda_graph_capture>
-            --gtest_filter=Test__CUDAGraphCapture.FollowerCadenceUsesOriginalSourcesInNativeWhile
+            --gtest_filter=Test__CUDAGraphCapture.FollowerCadenceUsesOriginalSourcesInNativeWhile:Test__CUDAGraphCapture.FinalImportsDoNotAliasLiveLaunchBindings
         LABELS "V2;Integration;ProductionTestPreflight;CUDA;MoE;Pipeline;GraphCapture;Regression"
         MPI_PROCS 1 NO_MODELS TIMEOUT 30)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDA_PipelineFollowerMoECadence)

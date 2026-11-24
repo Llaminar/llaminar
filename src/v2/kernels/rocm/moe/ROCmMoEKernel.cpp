@@ -6577,9 +6577,10 @@ namespace llaminar2
         uint32_t local_transfer_slot_count,
         const DeviceMoERebalanceConfig &config,
         DeviceMoERebalanceApplyStatus *status,
-        DeviceMoERebalanceGraphControllerState *controller_state,
+        DeviceMoERebalanceArrivalScratch *arrival_scratch,
         uint32_t command_buffer_count)
     {
+        (void)arrival_scratch;
         if (!validateDeviceMoERebalanceConfig(config))
         {
             LOG_ERROR("[ROCmMoEKernel::unpackDeviceRebalanceCollectivePayloads] invalid device rebalance config");
@@ -6614,7 +6615,7 @@ namespace llaminar2
             local_transfer_slot_count,
             &config,
             status,
-            controller_state,
+            nullptr,
             command_buffer_count,
             device_ordinal_,
             stream);

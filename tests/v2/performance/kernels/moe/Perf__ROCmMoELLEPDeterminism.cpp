@@ -2141,7 +2141,8 @@ TEST(Perf__MoELLEPDeterminism, ROCm_PayloadMovementAndApplyDeterministic)
                 d_transfer_slots,
                 transfer_slot_count,
                 destination_config,
-                d_unpack_status));
+                d_unpack_status,
+            borrowDeviceMoEArrivalScratch(d_transfer_slot_claim_index)));
         };
         auto apply_arrivals = [&]()
         {
@@ -2207,7 +2208,8 @@ TEST(Perf__MoELLEPDeterminism, ROCm_PayloadMovementAndApplyDeterministic)
             d_transfer_slots,
             transfer_slot_count,
             destination_config,
-            d_unpack_status));
+            d_unpack_status,
+            borrowDeviceMoEArrivalScratch(d_transfer_slot_claim_index)));
     };
     auto apply_arrivals_once = [&]()
     {

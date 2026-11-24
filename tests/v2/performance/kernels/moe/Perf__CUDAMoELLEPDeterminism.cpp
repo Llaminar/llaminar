@@ -11,6 +11,7 @@
 #include <gtest/gtest.h>
 #include "../../../utils/DeviceEpochArenaTestMemory.h"
 
+#include "backends/cuda/CUDAGraphCapture.h"
 #include "Perf__MoELLEPDeterminismCommon.h"
 
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
@@ -2071,6 +2072,29 @@ TEST(Perf__MoELLEPDeterminism, CUDA_PayloadMovementAndApplyDeterministic)
     }
     ASSERT_EQ(leased_destination_slots, destination_one_arrivals);
 
+    DeviceMoERebalanceConfig unpack_config = rebalanceConfig(shape);
+    unpack_config.num_layers = projection_runtime_layers;
+    unpack_config.participant_id = 1u;
+    CUDAGraphCapture unpack(harness.stream_, 0);
+    ASSERT_TRUE(unpack.beginCapture());
+    const bool unpack_recorded = harness.kernel_->unpackDeviceRebalanceCollectivePayloads(
+        harness.launchContext(),
+        d_destination_plan,
+        d_destination_plan_count,
+        plan_capacity,
+        d_destination_header,
+        d_gathered_payload,
+        payload_slot_count,
+        payload_slot_bytes,
+        d_transfer_slots,
+        transfer_slot_count,
+        unpack_config,
+        d_unpack_status,
+        borrowDeviceMoEArrivalScratch(d_transfer_slot_claim_index));
+    ASSERT_TRUE(unpack.endCapture());
+    ASSERT_TRUE(unpack_recorded);
+    ASSERT_TRUE(unpack.instantiate());
+
     auto run_payload_wave = [&]()
     {
         const DeviceMoERebalanceConfig source_config = rebalanceConfig(shape);
@@ -2102,22 +2126,6 @@ TEST(Perf__MoELLEPDeterminism, CUDA_PayloadMovementAndApplyDeterministic)
                                       harness.stream_),
                       cudaSuccess);
         };
-        auto unpack_payloads = [&]()
-        {
-            ASSERT_TRUE(harness.kernel_->unpackDeviceRebalanceCollectivePayloads(
-                harness.launchContext(),
-                d_destination_plan,
-                d_destination_plan_count,
-                plan_capacity,
-                d_destination_header,
-                d_gathered_payload,
-                payload_slot_count,
-                payload_slot_bytes,
-                d_transfer_slots,
-                transfer_slot_count,
-                destination_config,
-                d_unpack_status));
-        };
         auto apply_arrivals = [&]()
         {
             ASSERT_TRUE(harness.kernel_->applyDeviceRebalanceArrivals(
@@ -2137,7 +2145,7 @@ TEST(Perf__MoELLEPDeterminism, CUDA_PayloadMovementAndApplyDeterministic)
         project_destination_once();
         pack_payloads();
         copy_payload_bucket();
-        unpack_payloads();
+        ASSERT_TRUE(unpack.launch());
         apply_arrivals();
     };
     auto pack_payloads_once = [&]()
@@ -2166,23 +2174,8 @@ TEST(Perf__MoELLEPDeterminism, CUDA_PayloadMovementAndApplyDeterministic)
     };
     auto unpack_payloads_once = [&]()
     {
-        DeviceMoERebalanceConfig destination_config = rebalanceConfig(shape);
-        destination_config.num_layers = projection_runtime_layers;
-        destination_config.participant_id = 1u;
         project_destination_once();
-        ASSERT_TRUE(harness.kernel_->unpackDeviceRebalanceCollectivePayloads(
-            harness.launchContext(),
-            d_destination_plan,
-            d_destination_plan_count,
-            plan_capacity,
-            d_destination_header,
-            d_gathered_payload,
-            payload_slot_count,
-            payload_slot_bytes,
-            d_transfer_slots,
-            transfer_slot_count,
-            destination_config,
-            d_unpack_status));
+        ASSERT_TRUE(unpack.launch());
     };
     auto apply_arrivals_once = [&]()
     {

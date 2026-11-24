@@ -195,6 +195,7 @@ namespace llaminar2::test
             DeviceAllocation destination_header(backend, device.ordinal, sizeof(DeviceMoERebalanceCommandBufferHeader));
             DeviceAllocation payload(backend, device.ordinal, 2u * payload_bytes);
             DeviceAllocation status(backend, device.ordinal, sizeof(DeviceMoERebalanceApplyStatus));
+            DeviceAllocation arrival_scratch(backend, device.ordinal, deviceMoETransferSlotClaimIndexBytes(directory->slotCount()));
             auto upload = [&](void *dst, const void *src, size_t bytes)
             {
                 ASSERT_TRUE(backend->hostToDeviceOnStream(dst, src, bytes, device.ordinal, stream));
@@ -242,7 +243,8 @@ namespace llaminar2::test
                 launch, plans.as<DeviceMoERebalancePlanEntry>(), nullptr, 1u,
                 destination_header.as<DeviceMoERebalanceCommandBufferHeader>(),
                 payload.as<uint8_t>(), 2u, payload_bytes, directory->deviceEntries(),
-                directory->slotCount(), destination_config, status.as<DeviceMoERebalanceApplyStatus>(), nullptr, 1u);
+                directory->slotCount(), destination_config, status.as<DeviceMoERebalanceApplyStatus>(),
+                arrival_scratch.as<DeviceMoERebalanceArrivalScratch>(), 1u);
             capture.finish();
             ASSERT_TRUE(described);
             ASSERT_TRUE(packed);

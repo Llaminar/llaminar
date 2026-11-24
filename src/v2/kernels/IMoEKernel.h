@@ -2732,8 +2732,9 @@ namespace llaminar2
          * ticket. Source-side pack errors and destination-side unpack errors
          * are published as one transfer-wave status so the graph controller can
          * fail the wave before apply observes incomplete payloads. Sampling
-         * `controller_state->active_wave` here is forbidden because planning may
-         * already have advanced that cursor for the next overlapped transaction.
+         * the live controller cursor here is forbidden because planning may
+         * already have advanced it for the next overlapped transaction.
+         * @param arrival_scratch Participant-local retired claim scratch, exclusive through unpack completion.
          */
         virtual bool unpackDeviceRebalanceCollectivePayloads(
             const MoEKernelLaunchContext &launch,
@@ -2748,7 +2749,7 @@ namespace llaminar2
             uint32_t local_transfer_slot_count,
             const DeviceMoERebalanceConfig &config,
             DeviceMoERebalanceApplyStatus *status,
-            DeviceMoERebalanceGraphControllerState *controller_state = nullptr,
+            DeviceMoERebalanceArrivalScratch *arrival_scratch,
             uint32_t command_buffer_count = 1)
         {
             (void)launch;
@@ -2763,7 +2764,7 @@ namespace llaminar2
             (void)local_transfer_slot_count;
             (void)config;
             (void)status;
-            (void)controller_state;
+            (void)arrival_scratch;
             (void)command_buffer_count;
             return false;
         }

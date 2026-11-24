@@ -77,13 +77,16 @@ TEST_F(Test__CUDAGraphCapture, StreamMembershipCycleRetiresAcyclicCapture)
     ctx().submitAndWait([&]{test::proveNativeCaptureStreamReentry(ctx(),*backend,DeviceId::cuda(0));});
 }
 
+/** @brief Record the native test kernels compiled with the pinned CUDA toolchain. */
+cudaError_t recordCUDALiveLaunchProof(cudaStream_t, const unsigned *, unsigned *, unsigned *);
+
 /** @test The original cadence sources compose directly inside the follower WHILE, not as a nested conditional child. */
 TEST_F(Test__CUDAGraphCapture, FollowerCadenceUsesOriginalSourcesInNativeWhile)
 {
     ctx().submitAndWait([&] {
         auto stream = static_cast<cudaStream_t>(ctx().defaultStream());
         uint32_t *words = nullptr;
-        ASSERT_EQ(cudaMalloc(&words, 6u * sizeof(uint32_t)), cudaSuccess);
+        ASSERT_EQ(cudaMalloc(&words, 9u * sizeof(uint32_t)), cudaSuccess);
         std::unique_ptr<uint32_t, decltype(&cudaFree)> storage(words, cudaFree);
         auto publish = ctx().createGraphCapture(stream);
         auto maintenance = ctx().createGraphCapture(stream);
@@ -99,6 +102,7 @@ TEST_F(Test__CUDAGraphCapture, FollowerCadenceUsesOriginalSourcesInNativeWhile)
         }));
         ASSERT_NO_FATAL_FAILURE(record(*maintenance, [&] {
             ASSERT_EQ(cudaMemcpyAsync(words + 4, words + 3, sizeof(uint32_t), cudaMemcpyDeviceToDevice, stream), cudaSuccess);
+            ASSERT_EQ(recordCUDALiveLaunchProof(stream, words + 6, words + 7, words + 8), cudaSuccess);
         }));
         ASSERT_NO_FATAL_FAILURE(record(*ack, [&] {
             ASSERT_EQ(cudaMemcpyAsync(words + 5, words + 4, sizeof(uint32_t), cudaMemcpyDeviceToDevice, stream), cudaSuccess);
@@ -119,9 +123,11 @@ TEST_F(Test__CUDAGraphCapture, FollowerCadenceUsesOriginalSourcesInNativeWhile)
         body.push_back({.name = "terminal pipeline command", .capture = complete.get()});
         ASSERT_TRUE(follower->buildDeviceControlledWhileLoop({.iteration = body}, predicate));
         ASSERT_TRUE(follower->instantiate());
-        for (uint32_t due : {1u, 0u, 1u, 0u})
+        EXPECT_EQ(dynamic_cast<CUDAGraphCapture &>(*follower).graph(), nullptr)
+            << "A lowered native conditional owner does not export a cloneable definition";
+        for (const auto [due, live] : {std::pair{1u, 7u}, {1u, 0u}, {1u, 3u}, {0u, 7u}, {1u, 7u}, {1u, 0u}})
         {
-            std::array<uint32_t, 6> observed{1u, 0u, due, 0u, 0u, 0u};
+            std::array<uint32_t, 9> observed{1u, 0u, due, 0u, 0u, 0u, live, 0u, 99u};
             ASSERT_EQ(cudaMemcpyAsync(words, observed.data(), sizeof(observed), cudaMemcpyHostToDevice, stream), cudaSuccess);
             ASSERT_TRUE(follower->launch());
             ASSERT_EQ(cudaMemcpyAsync(observed.data(), words, sizeof(observed), cudaMemcpyDeviceToHost, stream), cudaSuccess);
@@ -130,6 +136,45 @@ TEST_F(Test__CUDAGraphCapture, FollowerCadenceUsesOriginalSourcesInNativeWhile)
             EXPECT_EQ(observed[3], 0x12121212u);
             EXPECT_EQ(observed[4], due ? 0x12121212u : 0u);
             EXPECT_EQ(observed[5], observed[4]);
+            EXPECT_EQ(observed[7], due ? live : 0u);
+            EXPECT_EQ(observed[8], due ? 0u : 99u);
+        }
+    });
+}
+
+/** @test Each final import of a reusable source receives an independent grid update handle. */
+TEST_F(Test__CUDAGraphCapture, FinalImportsDoNotAliasLiveLaunchBindings)
+{
+    ctx().submitAndWait([&] {
+        auto stream = static_cast<cudaStream_t>(ctx().defaultStream());
+        uint32_t *words = nullptr;
+        ASSERT_EQ(cudaMalloc(&words, 3u * sizeof(uint32_t)), cudaSuccess);
+        std::unique_ptr<uint32_t, decltype(&cudaFree)> storage(words, cudaFree);
+        auto source = ctx().createGraphCapture(stream);
+        ASSERT_TRUE(source->beginCapture());
+        ASSERT_EQ(recordCUDALiveLaunchProof(stream, words, words + 1, words + 2), cudaSuccess);
+        ASSERT_TRUE(source->endCapture());
+        ASSERT_TRUE(source->instantiate());
+        auto nested = ctx().createGraphCapture(stream);
+        const std::array steps{GPUOrderedTimelineStep{.name = "import nested live launch", .capture = source.get()}};
+        ASSERT_TRUE(nested->buildOrderedTimelineTransaction(steps));
+        auto parent = ctx().createGraphCapture(stream);
+        const std::array body{
+            DeviceControlledLoopFragment{.name = "first import", .capture = nested.get()},
+            DeviceControlledLoopFragment{.name = "second import", .capture = nested.get()},
+        };
+        ASSERT_TRUE(parent->buildDeviceControlledTransaction(body));
+        ASSERT_TRUE(parent->instantiate());
+        EXPECT_FALSE(parent->supportsExecutableUpdate());
+        for (auto live : {7u, 0u, 3u, 7u, 0u, 3u})
+        {
+            std::array<uint32_t, 3> actual{live, 0u, 99u};
+            ASSERT_EQ(cudaMemcpyAsync(words, actual.data(), sizeof(actual), cudaMemcpyHostToDevice, stream), cudaSuccess);
+            ASSERT_TRUE(parent->launch());
+            ASSERT_EQ(cudaMemcpyAsync(actual.data(), words, sizeof(actual), cudaMemcpyDeviceToHost, stream), cudaSuccess);
+            ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+            EXPECT_EQ(actual[1], 2u * live);
+            EXPECT_EQ(actual[2], 0u);
         }
     });
 }

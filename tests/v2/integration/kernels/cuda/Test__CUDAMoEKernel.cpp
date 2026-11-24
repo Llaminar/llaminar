@@ -12,6 +12,7 @@
  * Disabled paired events and event-free profile modes isolate one real bridge.
  */
 #include "../../../utils/IQ2SFusedMoEGpuSourceWitness.h"
+#include "../../../utils/CUDAMoEArrivalCapture.h"
 #include <gtest/gtest.h>
 
 #ifdef HAVE_CUDA
@@ -12895,21 +12896,26 @@ TEST_F(Test__CUDAMoEKernel,
                               cudaMemcpyHostToDevice,
                               stream_),
               cudaSuccess);
-    ASSERT_TRUE(cuda_kernel_->unpackDeviceRebalanceCollectivePayloads(
-        launchContext(),
-        d_plan,
-        nullptr,
-        plan_capacity,
-        d_command_header,
-        d_gathered_payload,
-        local_payload_slot_count,
-        payload_slot_bytes,
-        d_transfer_slots,
-        1,
-        config,
-        d_copy_status,
-        d_controller_state,
-        command_buffer_count));
+    llaminar2::DeviceMoERebalanceArrivalScratch *arrival_scratch_0_storage = nullptr;
+    ASSERT_EQ(cudaMalloc(&arrival_scratch_0_storage, llaminar2::deviceMoETransferSlotClaimIndexBytes(1)), cudaSuccess);
+    std::unique_ptr<llaminar2::DeviceMoERebalanceArrivalScratch, decltype(&cudaFree)> arrival_scratch_0(arrival_scratch_0_storage, cudaFree);
+    ASSERT_TRUE(llaminar2::test::recordNativeMoEArrival(llaminar2::DeviceId::cuda(0), stream_, [&] {
+        return cuda_kernel_->unpackDeviceRebalanceCollectivePayloads(
+            launchContext(),
+            d_plan,
+            nullptr,
+            plan_capacity,
+            d_command_header,
+            d_gathered_payload,
+            local_payload_slot_count,
+            payload_slot_bytes,
+            d_transfer_slots,
+            1,
+            config,
+            d_copy_status,
+            arrival_scratch_0.get(),
+            command_buffer_count);
+    }));
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
 
     llaminar2::DeviceMoERebalanceApplyStatus copy_status{};
@@ -13058,21 +13064,26 @@ TEST_F(Test__CUDAMoEKernel,
                               stream_),
               cudaSuccess);
 
-    ASSERT_TRUE(cuda_kernel_->unpackDeviceRebalanceCollectivePayloads(
-        launchContext(),
-        d_plans,
-        nullptr,
-        plan_capacity,
-        d_command_headers,
-        d_gathered_payload,
-        local_payload_slot_count,
-        payload_slot_bytes,
-        d_transfer_slots,
-        local_transfer_slot_count,
-        config,
-        d_copy_status,
-        d_controller_state,
-        command_buffer_count));
+    llaminar2::DeviceMoERebalanceArrivalScratch *arrival_scratch_1_storage = nullptr;
+    ASSERT_EQ(cudaMalloc(&arrival_scratch_1_storage, llaminar2::deviceMoETransferSlotClaimIndexBytes(local_transfer_slot_count)), cudaSuccess);
+    std::unique_ptr<llaminar2::DeviceMoERebalanceArrivalScratch, decltype(&cudaFree)> arrival_scratch_1(arrival_scratch_1_storage, cudaFree);
+    ASSERT_TRUE(llaminar2::test::recordNativeMoEArrival(llaminar2::DeviceId::cuda(0), stream_, [&] {
+        return cuda_kernel_->unpackDeviceRebalanceCollectivePayloads(
+            launchContext(),
+            d_plans,
+            nullptr,
+            plan_capacity,
+            d_command_headers,
+            d_gathered_payload,
+            local_payload_slot_count,
+            payload_slot_bytes,
+            d_transfer_slots,
+            local_transfer_slot_count,
+            config,
+            d_copy_status,
+            arrival_scratch_1.get(),
+            command_buffer_count);
+    }));
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
 
     ASSERT_EQ(cudaMemcpy(&copy_status,
@@ -13536,19 +13547,25 @@ TEST_F(Test__CUDAMoEKernel, DeviceRebalanceCopyAndApplyArrivalUsesTransferSlot)
                               cudaMemcpyHostToDevice,
                               stream_),
               cudaSuccess);
-    ASSERT_TRUE(cuda_kernel_->unpackDeviceRebalanceCollectivePayloads(
-        launchContext(),
-        d_plan,
-        d_plan_count,
-        plan_capacity,
-        d_command_header,
-        d_gathered_payload,
-        static_cast<uint32_t>(local_payload_slot_count),
-        payload_slot_bytes,
-        d_transfer_slots,
-        static_cast<uint32_t>(transfer_slots.size()),
-        config,
-        d_copy_status));
+    llaminar2::DeviceMoERebalanceArrivalScratch *arrival_scratch_2_storage = nullptr;
+    ASSERT_EQ(cudaMalloc(&arrival_scratch_2_storage, llaminar2::deviceMoETransferSlotClaimIndexBytes(static_cast<uint32_t>(transfer_slots.size()))), cudaSuccess);
+    std::unique_ptr<llaminar2::DeviceMoERebalanceArrivalScratch, decltype(&cudaFree)> arrival_scratch_2(arrival_scratch_2_storage, cudaFree);
+    ASSERT_TRUE(llaminar2::test::recordNativeMoEArrival(llaminar2::DeviceId::cuda(0), stream_, [&] {
+        return cuda_kernel_->unpackDeviceRebalanceCollectivePayloads(
+            launchContext(),
+            d_plan,
+            d_plan_count,
+            plan_capacity,
+            d_command_header,
+            d_gathered_payload,
+            static_cast<uint32_t>(local_payload_slot_count),
+            payload_slot_bytes,
+            d_transfer_slots,
+            static_cast<uint32_t>(transfer_slots.size()),
+            config,
+            d_copy_status,
+            arrival_scratch_2.get());
+    }));
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
 
     llaminar2::DeviceMoERebalanceApplyStatus copy_status;
@@ -13813,19 +13830,25 @@ TEST_F(Test__CUDAMoEKernel, DeviceRebalanceCopyAndApplyArrivalUsesTransferSlot)
                               cudaMemcpyHostToDevice,
                               stream_),
               cudaSuccess);
-    ASSERT_TRUE(cuda_kernel_->unpackDeviceRebalanceCollectivePayloads(
-        launchContext(),
-        d_plan,
-        d_plan_count,
-        plan_capacity,
-        d_command_header,
-        d_gathered_payload,
-        static_cast<uint32_t>(local_payload_slot_count),
-        payload_slot_bytes,
-        d_transfer_slots,
-        static_cast<uint32_t>(transfer_slots.size()),
-        config,
-        d_copy_status));
+    llaminar2::DeviceMoERebalanceArrivalScratch *arrival_scratch_3_storage = nullptr;
+    ASSERT_EQ(cudaMalloc(&arrival_scratch_3_storage, llaminar2::deviceMoETransferSlotClaimIndexBytes(static_cast<uint32_t>(transfer_slots.size()))), cudaSuccess);
+    std::unique_ptr<llaminar2::DeviceMoERebalanceArrivalScratch, decltype(&cudaFree)> arrival_scratch_3(arrival_scratch_3_storage, cudaFree);
+    ASSERT_TRUE(llaminar2::test::recordNativeMoEArrival(llaminar2::DeviceId::cuda(0), stream_, [&] {
+        return cuda_kernel_->unpackDeviceRebalanceCollectivePayloads(
+            launchContext(),
+            d_plan,
+            d_plan_count,
+            plan_capacity,
+            d_command_header,
+            d_gathered_payload,
+            static_cast<uint32_t>(local_payload_slot_count),
+            payload_slot_bytes,
+            d_transfer_slots,
+            static_cast<uint32_t>(transfer_slots.size()),
+            config,
+            d_copy_status,
+            arrival_scratch_3.get());
+    }));
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
     ASSERT_EQ(cudaMemcpy(&copy_status, d_copy_status, sizeof(copy_status), cudaMemcpyDeviceToHost), cudaSuccess);
     ASSERT_EQ(cudaMemcpy(transfer_slots.data(), d_transfer_slots,
@@ -13989,19 +14012,25 @@ TEST_F(Test__CUDAMoEKernel, DeviceRebalanceCopyAndApplyArrivalUsesTransferSlot)
                               cudaMemcpyHostToDevice,
                               stream_),
               cudaSuccess);
-    ASSERT_TRUE(cuda_kernel_->unpackDeviceRebalanceCollectivePayloads(
-        launchContext(),
-        d_plan,
-        d_plan_count,
-        plan_capacity,
-        d_command_header,
-        d_gathered_payload,
-        static_cast<uint32_t>(local_payload_slot_count),
-        payload_slot_bytes,
-        d_transfer_slots,
-        static_cast<uint32_t>(transfer_slots.size()),
-        config,
-        d_copy_status));
+    llaminar2::DeviceMoERebalanceArrivalScratch *arrival_scratch_4_storage = nullptr;
+    ASSERT_EQ(cudaMalloc(&arrival_scratch_4_storage, llaminar2::deviceMoETransferSlotClaimIndexBytes(static_cast<uint32_t>(transfer_slots.size()))), cudaSuccess);
+    std::unique_ptr<llaminar2::DeviceMoERebalanceArrivalScratch, decltype(&cudaFree)> arrival_scratch_4(arrival_scratch_4_storage, cudaFree);
+    ASSERT_TRUE(llaminar2::test::recordNativeMoEArrival(llaminar2::DeviceId::cuda(0), stream_, [&] {
+        return cuda_kernel_->unpackDeviceRebalanceCollectivePayloads(
+            launchContext(),
+            d_plan,
+            d_plan_count,
+            plan_capacity,
+            d_command_header,
+            d_gathered_payload,
+            static_cast<uint32_t>(local_payload_slot_count),
+            payload_slot_bytes,
+            d_transfer_slots,
+            static_cast<uint32_t>(transfer_slots.size()),
+            config,
+            d_copy_status,
+            arrival_scratch_4.get());
+    }));
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
     ASSERT_EQ(cudaMemcpy(
                   &copy_status,
@@ -14172,20 +14201,26 @@ TEST_F(Test__CUDAMoEKernel,
                   d_status.get(), &status, sizeof(status), cudaMemcpyHostToDevice, stream_),
               cudaSuccess);
 
-    ASSERT_TRUE(cuda_kernel_->unpackDeviceRebalanceCollectivePayloads(
-        launchContext(),
-        static_cast<llaminar2::DeviceMoERebalancePlanEntry *>(d_plan.get()),
-        nullptr,
-        /*plan_capacity=*/1,
-        static_cast<llaminar2::DeviceMoERebalanceCommandBufferHeader *>(
-            d_header.get()),
-        static_cast<const uint8_t *>(d_gathered_payload.get()),
-        /*local_payload_slot_count=*/1,
-        payload_slot_bytes,
-        static_cast<llaminar2::DeviceMoEExpertDirectoryEntry *>(d_slot.get()),
-        /*local_transfer_slot_count=*/1,
-        config,
-        static_cast<llaminar2::DeviceMoERebalanceApplyStatus *>(d_status.get())));
+    llaminar2::DeviceMoERebalanceArrivalScratch *arrival_scratch_5_storage = nullptr;
+    ASSERT_EQ(cudaMalloc(&arrival_scratch_5_storage, llaminar2::deviceMoETransferSlotClaimIndexBytes(/*local_transfer_slot_count=*/1)), cudaSuccess);
+    std::unique_ptr<llaminar2::DeviceMoERebalanceArrivalScratch, decltype(&cudaFree)> arrival_scratch_5(arrival_scratch_5_storage, cudaFree);
+    ASSERT_TRUE(llaminar2::test::recordNativeMoEArrival(llaminar2::DeviceId::cuda(0), stream_, [&] {
+        return cuda_kernel_->unpackDeviceRebalanceCollectivePayloads(
+            launchContext(),
+            static_cast<llaminar2::DeviceMoERebalancePlanEntry *>(d_plan.get()),
+            nullptr,
+            /*plan_capacity=*/1,
+            static_cast<llaminar2::DeviceMoERebalanceCommandBufferHeader *>(
+                d_header.get()),
+            static_cast<const uint8_t *>(d_gathered_payload.get()),
+            /*local_payload_slot_count=*/1,
+            payload_slot_bytes,
+            static_cast<llaminar2::DeviceMoEExpertDirectoryEntry *>(d_slot.get()),
+            /*local_transfer_slot_count=*/1,
+            config,
+            static_cast<llaminar2::DeviceMoERebalanceApplyStatus *>(d_status.get()),
+            arrival_scratch_5.get());
+    }));
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
     ASSERT_EQ(cudaMemcpy(
                   &status, d_status.get(), sizeof(status), cudaMemcpyDeviceToHost),

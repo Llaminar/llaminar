@@ -26,6 +26,7 @@
 
 #include "kernels/common/MoERuntimeDescriptorLaunch.h"
 #include "CUDARouterQ8Prefill.h"
+#include "backends/cuda/CUDADeferredKernelLaunch.h"
 #include "tensors/NativeQuantisedScalePlane.h"
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
@@ -10958,9 +10959,40 @@ namespace
         (void)rebalance_pack_expert_to_payload(src, payload_data);
     }
 
-    __global__ void unpack_rebalance_collective_payloads_kernel(
+#include "kernels/common/DeviceMoERebalanceArrivalIndices.inl"
+
+#if CUDART_VERSION >= 13000
+    /** @brief Preserve copy diagnostics and enable the work node for exactly the live arrival grid. */
+    __global__ void plan_rebalance_collective_payload_unpack_kernel(
+        cudaGraphDeviceNode_t handle,
         const DeviceMoERebalancePlanEntryView *plan_entries,
         const uint32_t *plan_count,
+        uint32_t plan_capacity,
+        const DeviceMoERebalanceCommandBufferHeaderView *command_header,
+        uint32_t local_payload_slot_count,
+        uint32_t local_transfer_slot_count,
+        DeviceMoERebalanceConfigView config,
+        DeviceMoERebalanceApplyStatusView *status,
+        llaminar2::DeviceMoERebalanceArrivalScratch *scratch,
+        uint32_t command_buffer_count)
+    {
+        rebalance_collect_local_arrival_indices(plan_entries, plan_count, plan_capacity, command_header,
+            local_payload_slot_count, local_transfer_slot_count, config, status, scratch, command_buffer_count);
+        __syncthreads();
+        if (threadIdx.x == 0)
+        {
+            const auto live = scratch->live_count;
+            const auto err = cudaGraphKernelNodeSetEnabled(handle, live != 0u);
+            if (err != cudaSuccess)
+                __assert_fail("rebalance arrival work node rejected device enablement", __FILE__, __LINE__, __func__);
+            if (live != 0u && cudaGraphKernelNodeSetGridDim(handle, dim3(live)) != cudaSuccess)
+                __assert_fail("rebalance arrival work node rejected its live grid", __FILE__, __LINE__, __func__);
+        }
+    }
+
+    /** @brief Install one distinct device-selected arrival per actually submitted block. */
+    __global__ void unpack_rebalance_collective_payloads_kernel(
+        const DeviceMoERebalancePlanEntryView *plan_entries,
         uint32_t plan_capacity,
         const DeviceMoERebalanceCommandBufferHeaderView *command_header,
         const uint8_t *gathered_payload,
@@ -10970,134 +11002,14 @@ namespace
         uint32_t local_transfer_slot_count,
         DeviceMoERebalanceConfigView config,
         DeviceMoERebalanceApplyStatusView *status,
-        DeviceMoERebalanceGraphControllerStateView *controller_state,
-        uint32_t command_buffer_count)
+        const llaminar2::DeviceMoERebalanceArrivalScratch *scratch)
     {
-        const uint32_t command_wave_index =
-            status->transaction_wave_index;
-        if (command_wave_index >=
-            rebalance_command_buffer_count(command_buffer_count))
-        {
-            return;
-        }
-        if (plan_entries)
-            plan_entries += static_cast<unsigned long long>(command_wave_index) * plan_capacity;
-        if (plan_count)
-            plan_count += command_wave_index;
-        if (command_header)
-            command_header += command_wave_index;
-
-        if (!status || !plan_entries || (!plan_count && !command_header) ||
-            !gathered_payload || !local_transfer_slots ||
-            plan_capacity == 0u ||
-            payload_slot_bytes <= sizeof(DeviceMoEExpertDirectoryEntryView))
-            return;
-
-        const uint32_t count = rebalance_command_count(plan_count, plan_capacity, command_header);
-
-        if (blockIdx.x == 0)
-        {
-            if (threadIdx.x == 0)
-            {
-                atomicAdd(&status->plan_entries_seen, count);
-                status->local_transfer_slot_count =
-                    local_transfer_slot_count;
-            }
-            for (uint32_t plan_index = threadIdx.x;
-                 plan_index < count;
-                 plan_index += blockDim.x)
-            {
-                const auto &plan = plan_entries[plan_index];
-                if (plan.op == 0u)
-                    continue;
-                if (!rebalance_plan_applies_runtime(plan.op) ||
-                    plan.layer >= config.num_layers ||
-                    plan.expert >= config.num_experts ||
-                    plan.source_participant >= config.participant_count ||
-                    plan.destination_participant >= config.participant_count)
-                {
-                    atomicAdd(&status->invalid_plan_entries, 1u);
-                    continue;
-                }
-
-                /*
-                 * ResidentExpertAssignment is already fully represented by
-                 * command metadata. It must reach the apply kernel, but this
-                 * byte-unpack phase has no payload work to validate or copy.
-                 */
-                if (!rebalance_plan_requires_payload(plan.op))
-                    continue;
-
-                if ((plan.source_resident_mask &
-                     runtime_participant_bit(static_cast<int>(plan.source_participant))) == 0u)
-                {
-                    atomicAdd(&status->invalid_plan_entries, 1u);
-                    continue;
-                }
-                if (plan.destination_participant != config.participant_id)
-                {
-                    atomicAdd(&status->skipped_wrong_destination, 1u);
-                    continue;
-                }
-                if (plan.destination_slot >= local_transfer_slot_count)
-                {
-                    atomicAdd(&status->missing_destination_slots, 1u);
-                    if (atomicCAS(
-                            &status->first_missing_destination_layer,
-                            kDeviceMoEInvalidSlot,
-                            plan.layer) == kDeviceMoEInvalidSlot)
-                    {
-                        status->first_missing_destination_slot =
-                            plan.destination_slot;
-                        status->first_missing_destination_expert =
-                            plan.expert;
-                        status->first_missing_destination_source =
-                            plan.source_participant;
-                    }
-                    continue;
-                }
-                if (plan.payload_slot >= local_payload_slot_count)
-                {
-                    atomicAdd(&status->invalid_plan_entries, 1u);
-                    continue;
-                }
-            }
-            return;
-        }
-
-        const uint32_t destination_slot = blockIdx.x - 1u;
-        if (destination_slot >= local_transfer_slot_count)
-            return;
-
-        __shared__ uint32_t shared_plan_index;
-        if (threadIdx.x == 0)
-            shared_plan_index = kDeviceMoEInvalidSlot;
-        __syncthreads();
-
-        for (uint32_t plan_index = threadIdx.x;
-             plan_index < count;
-             plan_index += blockDim.x)
-        {
-            const auto &plan = plan_entries[plan_index];
-            if (plan.op != 0u &&
-                rebalance_plan_requires_payload(plan.op) &&
-                plan.layer < config.num_layers &&
-                plan.expert < config.num_experts &&
-                plan.source_participant < config.participant_count &&
-                (plan.source_resident_mask &
-                 runtime_participant_bit(static_cast<int>(plan.source_participant))) != 0u &&
-                plan.destination_participant == config.participant_id &&
-                plan.destination_slot == destination_slot &&
-                plan.payload_slot < local_payload_slot_count)
-            {
-                atomicMin(&shared_plan_index, plan_index);
-            }
-        }
-        __syncthreads();
-        if (shared_plan_index == kDeviceMoEInvalidSlot)
-            return;
-
-        const auto &plan = plan_entries[shared_plan_index];
+        const auto wave = status->transaction_wave_index;
+        plan_entries += static_cast<uint64_t>(wave) * plan_capacity;
+        if (command_header) command_header += wave;
+        const auto *arrival_indices = reinterpret_cast<const uint32_t *>(scratch + 1) + local_transfer_slot_count;
+        const auto &plan = plan_entries[arrival_indices[blockIdx.x]];
+        const uint32_t destination_slot = plan.destination_slot;
 
         const unsigned long long gathered_slot =
             (static_cast<unsigned long long>(plan.source_participant) *
@@ -11215,6 +11127,8 @@ namespace
             atomicAdd(reinterpret_cast<unsigned long long *>(&status->copied_payload_bytes), offset);
         }
     }
+
+#endif
 
     /**
      * @brief Report whether a ready local arrival replaces an expert's slot.
@@ -23040,44 +22954,45 @@ __attribute__((visibility("default"))) bool cudaMoE_softmax_topk_decode_selected
         uint32_t local_transfer_slot_count,
         const void *config,
         void *status,
-        void *controller_state,
+        void *arrival_scratch,
         uint32_t command_buffer_count,
         int device_idx,
         void *stream)
     {
-        if (!plan_entries || (!plan_count && !command_header) ||
-            !gathered_payload || !local_transfer_slots || !config || !status ||
-            !stream || plan_capacity == 0u || local_payload_slot_count == 0u ||
-            payload_slot_bytes <= sizeof(DeviceMoEExpertDirectoryEntryView))
+#if CUDART_VERSION < 13000
+        fprintf(stderr, "CUDA rebalance payload unpack requires CUDA 13.0 device-updatable graphs\n");
+        return false;
+#else
+        if (!plan_entries || (!plan_count && !command_header) || !gathered_payload || !local_transfer_slots ||
+            !config || !status || !arrival_scratch || !stream || plan_capacity == 0u ||
+            local_payload_slot_count == 0u || local_transfer_slot_count == 0u ||
+            payload_slot_bytes <= sizeof(DeviceMoEExpertDirectoryEntryView) || cudaSetDevice(device_idx) != cudaSuccess)
             return false;
-        cudaSetDevice(device_idx);
-        const auto cfg = *static_cast<const DeviceMoERebalanceConfigView *>(config);
-        if (local_transfer_slot_count == 0xffffffffu)
+        auto cfg = *static_cast<const DeviceMoERebalanceConfigView *>(config);
+        cudaGraphDeviceNode_t unbound{};
+        void *control_args[]{&unbound, &plan_entries, &plan_count, &plan_capacity, &command_header,
+            &local_payload_slot_count, &local_transfer_slot_count, &cfg, &status, &arrival_scratch, &command_buffer_count};
+        cudaKernelNodeParams control{};
+        control.func = reinterpret_cast<void *>(plan_rebalance_collective_payload_unpack_kernel);
+        control.gridDim = dim3(1);
+        control.blockDim = dim3(kThreads);
+        control.kernelParams = control_args;
+        void *work_args[]{&plan_entries, &plan_capacity, &command_header, &gathered_payload, &local_payload_slot_count,
+            &payload_slot_bytes, &local_transfer_slots, &local_transfer_slot_count, &cfg, &status, &arrival_scratch};
+        cudaKernelNodeParams work{};
+        work.func = reinterpret_cast<void *>(unpack_rebalance_collective_payloads_kernel);
+        work.gridDim = dim3(1);
+        work.blockDim = dim3(kThreads);
+        work.kernelParams = work_args;
+        const auto err = llaminar2::appendCUDADeferredKernelLaunch(static_cast<cudaStream_t>(stream), control,
+            sizeof(control_args) / sizeof(control_args[0]), work);
+        if (err != cudaSuccess)
+        {
+            fprintf(stderr, "CUDA rebalance payload unpack requires an owned CUDA 13.0 graph capture: %s\n", cudaGetErrorString(err));
             return false;
-        const uint32_t unpack_block_count = local_transfer_slot_count + 1u;
-        // Deliberately preserve the status initialized by the matching pack
-        // call.  Pack and unpack are two halves of one transfer wave and both
-        // must contribute counters to the same status record.
-        unpack_rebalance_collective_payloads_kernel<<<
-            static_cast<int>(unpack_block_count),
-            kThreads,
-            0,
-            static_cast<cudaStream_t>(stream)>>>(
-            static_cast<const DeviceMoERebalancePlanEntryView *>(plan_entries),
-            plan_count,
-            plan_capacity,
-            const_cast<DeviceMoERebalanceCommandBufferHeaderView *>(
-                static_cast<const DeviceMoERebalanceCommandBufferHeaderView *>(command_header)),
-            static_cast<const uint8_t *>(gathered_payload),
-            local_payload_slot_count,
-            payload_slot_bytes,
-            static_cast<DeviceMoEExpertDirectoryEntryView *>(local_transfer_slots),
-            local_transfer_slot_count,
-            cfg,
-            static_cast<DeviceMoERebalanceApplyStatusView *>(status),
-            static_cast<DeviceMoERebalanceGraphControllerStateView *>(controller_state),
-            command_buffer_count);
-        return finishLaunch("cudaMoE_unpack_rebalance_collective_payloads");
+        }
+        return true;
+#endif
     }
 
     bool cudaMoE_apply_rebalance_arrivals(

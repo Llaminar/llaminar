@@ -6398,7 +6398,7 @@ namespace llaminar2
         uint32_t local_transfer_slot_count,
         const DeviceMoERebalanceConfig &config,
         DeviceMoERebalanceApplyStatus *status,
-        DeviceMoERebalanceGraphControllerState *controller_state,
+        DeviceMoERebalanceArrivalScratch *arrival_scratch,
         uint32_t command_buffer_count)
     {
         if (!validateDeviceMoERebalanceConfig(config))
@@ -6407,7 +6407,7 @@ namespace llaminar2
             return false;
         }
         if (!plan_entries || (!plan_count && !command_header) ||
-            !gathered_payload || !local_transfer_slots || !status ||
+            !gathered_payload || !local_transfer_slots || !status || !arrival_scratch ||
             plan_capacity == 0 || local_payload_slot_count == 0 ||
             payload_slot_bytes <= sizeof(DeviceMoEExpertDirectoryEntry))
         {
@@ -6432,7 +6432,7 @@ namespace llaminar2
             local_transfer_slot_count,
             &config,
             status,
-            controller_state,
+            arrival_scratch,
             command_buffer_count,
             device_ordinal_,
             stream);

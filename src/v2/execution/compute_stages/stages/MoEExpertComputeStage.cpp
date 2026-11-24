@@ -7483,7 +7483,7 @@ namespace llaminar2
                 params_.prefill_llep_transfer_slot_count,
                 config,
                 apply_status,
-                nullptr,
+                borrowDeviceMoEArrivalScratch(transfer_slot_claim_index),
                 1))
         {
             LOG_ERROR("[MoEExpertComputeStage] Transfer-backed LLEP prefill payload unpack failed");

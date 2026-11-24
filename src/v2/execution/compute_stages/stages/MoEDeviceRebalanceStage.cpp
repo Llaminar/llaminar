@@ -1549,7 +1549,7 @@ namespace llaminar2
                     params_.local_transfer_slot_count,
                     params_.config,
                     copy_status,
-                    controller_state,
+                    borrowDeviceMoEArrivalScratch(transfer_slot_claim_index),
                     static_cast<uint32_t>(commandBufferCount())))
             {
                 LOG_ERROR("[MoEDeviceRebalanceStage] Collective rebalance payload unpack failed");
@@ -1648,7 +1648,7 @@ namespace llaminar2
                     params_.local_transfer_slot_count,
                     params_.config,
                     copy_status,
-                    controller_state,
+                    borrowDeviceMoEArrivalScratch(transfer_slot_claim_index),
                     static_cast<uint32_t>(commandBufferCount())))
             {
                 LOG_ERROR("[MoEDeviceRebalanceStage] Sideband collective rebalance payload unpack failed");

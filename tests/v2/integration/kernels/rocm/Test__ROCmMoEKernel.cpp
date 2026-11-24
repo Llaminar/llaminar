@@ -11137,7 +11137,7 @@ TEST(Test__ROCmMoEKernel,
         1,
         config,
         d_copy_status,
-        d_controller_state,
+        nullptr,
         command_buffer_count));
     ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 
@@ -11300,7 +11300,7 @@ TEST(Test__ROCmMoEKernel,
         local_transfer_slot_count,
         config,
         d_copy_status,
-        d_controller_state,
+        nullptr,
         command_buffer_count));
     ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 
@@ -13349,7 +13349,8 @@ static void proveDeviceRebalanceCopyAndApplyArrival(bool coded)
         d_transfer_slots,
         static_cast<uint32_t>(transfer_slots.size()),
         config,
-        d_copy_status));
+        d_copy_status,
+        nullptr));
     ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 
     DeviceMoERebalanceApplyStatus copy_status;
@@ -13667,7 +13668,8 @@ static void proveDeviceRebalanceCopyAndApplyArrival(bool coded)
         d_transfer_slots,
         static_cast<uint32_t>(transfer_slots.size()),
         config,
-        d_copy_status));
+        d_copy_status,
+        nullptr));
     ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
     ASSERT_EQ(hipMemcpy(&copy_status, d_copy_status, sizeof(copy_status), hipMemcpyDeviceToHost), hipSuccess);
     ASSERT_EQ(hipMemcpy(transfer_slots.data(), d_transfer_slots,
@@ -13850,7 +13852,8 @@ static void proveDeviceRebalanceCopyAndApplyArrival(bool coded)
         d_transfer_slots,
         static_cast<uint32_t>(transfer_slots.size()),
         config,
-        d_copy_status));
+        d_copy_status,
+        nullptr));
     ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
     ASSERT_EQ(hipMemcpy(
                   &copy_status,
@@ -15350,7 +15353,8 @@ TEST(Test__ROCmMoEKernel,
         static_cast<DeviceMoEExpertDirectoryEntry *>(d_slot.get()),
         /*local_transfer_slot_count=*/1,
         config,
-        static_cast<DeviceMoERebalanceApplyStatus *>(d_status.get())));
+        static_cast<DeviceMoERebalanceApplyStatus *>(d_status.get()),
+        nullptr));
     ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
     ASSERT_EQ(hipMemcpy(
                   &status, d_status.get(), sizeof(status), hipMemcpyDeviceToHost),
