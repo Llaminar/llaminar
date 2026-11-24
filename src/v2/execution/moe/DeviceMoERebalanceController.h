@@ -566,9 +566,12 @@ namespace llaminar2
         uint32_t initial_maintenance_period_tokens = 1;
         /** Recurring serial-visible decode period after the first boundary. */
         uint32_t maintenance_period_tokens = 1;
-        /// Immutable layer-indexed transfer family ranges; null for resident-only or raw kernel fixtures.
+        /// Collective stride and metadata tail shared with the workspace contract.
+        moe_rebalance_abi::HistogramLayout histogram_layout = moe_rebalance_abi::HistogramLayout::ResidentOnly;
+        /// Immutable layer-indexed transfer family ranges; required for the transfer family layout.
         const DeviceMoETransferSlotRange *transfer_slot_layer_ranges = nullptr;
     };
+    static_assert(offsetof(DeviceMoERebalanceConfig, histogram_layout) == moe_rebalance_abi::kConfigHistogramLayoutOffset);
 
     /**
      * @brief Identify the evidence lifecycle of a prefill payload transfer.
@@ -1160,6 +1163,15 @@ namespace llaminar2
                deviceMoERebalanceModeMovesFixedPayloadCapacity(mode);
     }
 
+    /** @return Exact histogram wire layout for the admitted transport, without needing device addresses. */
+    inline moe_rebalance_abi::HistogramLayout deviceMoERebalanceHistogramLayout(
+        DeviceMoERebalanceTransferMode mode) noexcept
+    {
+        return deviceMoERebalanceModeUsesTransferSlots(mode)
+            ? moe_rebalance_abi::HistogramLayout::TransferFamilyOccupancy
+            : moe_rebalance_abi::HistogramLayout::ResidentOnly;
+    }
+
     inline bool deviceMoERebalanceModePlansMissingArrivals(
         DeviceMoERebalanceTransferMode mode) noexcept
     {
@@ -1408,6 +1420,7 @@ namespace llaminar2
     {
         return config.magic == kDeviceMoERebalanceMagic &&
                config.version == kDeviceMoERebalanceVersion &&
+               moe_rebalance_abi::histogramLayoutMatchesRanges(config.histogram_layout, config.transfer_slot_layer_ranges) &&
                config.num_layers > 0 &&
                config.num_experts > 0 &&
                config.num_experts <= kDeviceMoEMaxExperts &&

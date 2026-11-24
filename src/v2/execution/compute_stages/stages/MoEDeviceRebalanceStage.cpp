@@ -724,6 +724,11 @@ namespace llaminar2
                           << params_.device_id.to_string());
             return false;
         }
+        if (!workspaceCapacity().matchesHistogramConfig(params_.config))
+        {
+            LOG_ERROR("[" << label << "] Histogram layout and immutable transfer family ranges must match the admitted transport");
+            return false;
+        }
         if (!validateDeviceMoERebalanceConfig(params_.config))
         {
             LOG_ERROR("[" << label << "] Invalid device rebalance config"

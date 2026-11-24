@@ -12473,9 +12473,15 @@ add_v2_test(V2_Integration_CUDA_MoECompactTransferAllFormats
     NO_MODELS
     TIMEOUT 120
 )
+add_v2_test(V2_Integration_CUDA_MoERebalanceFamilyHistogramPlanning
+    COMMAND $<TARGET_FILE:v2_integration_cuda_moe_kernel>
+        --gtest_filter=Test__CUDAMoEKernel.DeviceRebalanceDeferredPlannerHonorsOddFamilyStrideAndSaturation
+    LABELS "V2;Integration;ProductionTestPreflight;CUDA;MoE;Histogram;Transfer;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDA_MoERebalanceFamilyHistogramPlanning)
 add_v2_test(V2_Integration_CUDA_MoEMovementEvidenceLifecycle
     COMMAND $<TARGET_FILE:v2_integration_cuda_moe_kernel>
-            --gtest_filter=Test__CUDAMoEKernel.ApplyReadyDeviceRebalanceWaveClearsAppliedCommandHeader:Test__CUDAMoEKernel.DeviceRebalanceTransferStateMachineFullCapacityStress:Test__CUDAMoEKernel.DeviceRebalanceCopyAndApplyArrivalUsesTransferSlot:Test__CUDAMoEKernel.DeviceRebalanceDeferredPlannerUsesScratchAndPlansCapacityReleasingOwnershipTransfers
+            --gtest_filter=Test__CUDAMoEKernel.ApplyReadyDeviceRebalanceWaveClearsAppliedCommandHeader:Test__CUDAMoEKernel.DeviceRebalanceTransferStateMachineFullCapacityStress:Test__CUDAMoEKernel.DeviceRebalanceCopyAndApplyArrivalUsesTransferSlot
             --gtest_brief=1
     LABELS "V2;Integration;CUDA;MoE;Dynamic;Transfer;Publication;Regression"
     MPI_PROCS 1
@@ -18782,7 +18788,7 @@ add_v2_test(V2_Unit_ComputeStages
 
 add_v2_test(V2_Integration_DeviceMoERebalanceCodedSlotAdmission
     COMMAND $<TARGET_FILE:v2_test_compute_stages>
-        --gtest_filter=ComputeStagesTest.MoEDeviceRebalanceExactSlotFamilies
+        --gtest_filter=ComputeStagesTest.MoEDeviceRebalanceExactSlotFamilies:ComputeStagesTest.MoEDeviceRebalanceHistogramLayoutMatchesTransferAdmission
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MoE;PhysicalMemory;Admission;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_DeviceMoERebalanceCodedSlotAdmission)
@@ -24291,9 +24297,15 @@ add_v2_test(V2_Integration_ROCmIQ2SFusedMoEOriginalEquation
         NO_MODELS
         TIMEOUT 120
     )
+    add_v2_test(V2_Integration_ROCm_MoERebalanceFamilyHistogramPlanning
+        COMMAND $<TARGET_FILE:v2_integration_rocm_moe_kernel>
+            --gtest_filter=Test__ROCmMoEKernel.DeviceRebalanceDeferredPlannerHonorsOddFamilyStrideAndSaturation
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;Histogram;Transfer;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCm_MoERebalanceFamilyHistogramPlanning)
     add_v2_test(V2_Integration_ROCm_MoEMovementEvidenceLifecycle
         COMMAND $<TARGET_FILE:v2_integration_rocm_moe_kernel>
-                --gtest_filter=Test__ROCmMoEKernel.ApplyReadyDeviceRebalanceWaveClearsAppliedCommandHeader:Test__ROCmMoEKernel.DeviceRebalanceTransferStateMachineFullCapacityStress:Test__ROCmMoEKernel.DeviceRebalanceCopyAndApplyArrivalUsesTransferSlot:Test__ROCmMoEKernel.DeviceRebalanceDeferredPlannerUsesScratchAndPlansCapacityReleasingOwnershipTransfers
+                --gtest_filter=Test__ROCmMoEKernel.ApplyReadyDeviceRebalanceWaveClearsAppliedCommandHeader:Test__ROCmMoEKernel.DeviceRebalanceTransferStateMachineFullCapacityStress:Test__ROCmMoEKernel.DeviceRebalanceCopyAndApplyArrivalUsesTransferSlot
                 --gtest_brief=1
         LABELS "V2;Integration;ROCm;MoE;Dynamic;Transfer;Publication;Regression"
         MPI_PROCS 1

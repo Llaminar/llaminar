@@ -873,6 +873,47 @@ TEST_F(ComputeStagesTest, MoEDeviceRebalanceExactSlotFamilies)
     EXPECT_THROW(Directory::profileForLayerFormats({iq3, floating}), std::invalid_argument);
 }
 
+/** @brief Admit a range-bound planner only when its collective wire layout agrees. */
+TEST_F(ComputeStagesTest, MoEDeviceRebalanceHistogramLayoutMatchesTransferAdmission)
+{
+    namespace abi = moe_rebalance_abi;
+    using Mode = DeviceMoERebalanceTransferMode;
+    DeviceMoERebalanceConfig config;
+    config.num_layers = 3u;
+    config.num_experts = 4u;
+    config.participant_count = 3u;
+    config.layer_wave_count = 1u;
+    const auto capacity = [&](Mode mode)
+    {
+        return DeviceMoERebalanceWorkspaceCapacity::fromRuntime(
+            config, mode == Mode::ResidentOnly ? 0u : 4u, 1u,
+            DeviceMoERebalanceStagePhase::PlanCopyApply, mode);
+    };
+    const auto resident = capacity(Mode::ResidentOnly);
+    const auto transfer = capacity(Mode::CompactTransferSlots);
+    ASSERT_TRUE(resident.matchesHistogramConfig(config));
+    EXPECT_FALSE(transfer.matchesHistogramConfig(config));
+    EXPECT_EQ(resident.localHistogramWords(), 8u);
+    EXPECT_EQ(transfer.localHistogramWords(), 9u);
+
+    config.histogram_layout = abi::HistogramLayout::TransferFamilyOccupancy;
+    EXPECT_FALSE(transfer.matchesHistogramConfig(config));
+    const std::array ranges{DeviceMoETransferSlotRange{0u, 2u, 1u},
+                            DeviceMoETransferSlotRange{2u, 4u, 1u},
+                            DeviceMoETransferSlotRange{0u, 2u, 1u}};
+    config.transfer_slot_layer_ranges = ranges.data();
+    ASSERT_TRUE(transfer.matchesHistogramConfig(config));
+    EXPECT_FALSE(resident.matchesHistogramConfig(config));
+    const auto requirements = DeviceMoERebalanceWorkspaceContract::requirements({
+        .capacity = transfer, .collective_payload_slot_bytes = 256u, .workspace_suffix = "range_bound"});
+    const auto *local = requirements.find("moe_rebalance_local_histogram_range_bound");
+    const auto *gathered = requirements.find("moe_rebalance_gathered_histogram_range_bound");
+    ASSERT_NE(local, nullptr);
+    ASSERT_NE(gathered, nullptr);
+    EXPECT_EQ(local->size_bytes, 9u * sizeof(uint32_t));
+    EXPECT_EQ(gathered->size_bytes, 27u * sizeof(uint32_t));
+}
+
 /** @brief Scheduling windows must not change the runtime-domain allocation. */
 TEST_F(ComputeStagesTest, MoEDeviceRebalancePersistentSlotsCoverRuntimeDomain)
 {

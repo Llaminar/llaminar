@@ -435,6 +435,7 @@ namespace llaminar2::test
             auto destination_config = base_config;
             destination_config.participant_id = kDestinationParticipant;
             destination_config.transfer_slot_layer_ranges = transfer_directory->deviceLayerRanges();
+            destination_config.histogram_layout = moe_rebalance_abi::HistogramLayout::TransferFamilyOccupancy;
             const auto apply_config = prefillLLEPTransferConfig(
                 destination_config,
                 PrefillLLEPTransferPurpose::CurrentBatchMovement);
