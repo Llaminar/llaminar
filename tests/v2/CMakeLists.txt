@@ -2178,7 +2178,7 @@ add_v2_routed_expert_policy_unit(
 )
 add_v2_test(V2_Integration_CodedGpuExpertRelayWire
     COMMAND $<TARGET_FILE:v2_unit_moe_overlay_distributed_residency_protocol>
-        --gtest_filter=Test__MoEOverlayDistributedResidencyProtocol.CodedGpuRelayAuthenticatesExactPhasedWire:Test__MoEOverlayDistributedResidencyProtocol.CodedCrossBackendRelayUsesTheSameWireForAllFormats
+        --gtest_filter=Test__MoEOverlayDistributedResidencyProtocol.CodedGpuRelayAuthenticatesExactPhasedWire:Test__MoEOverlayDistributedResidencyProtocol.CodedCrossBackendRelayUsesTheSameWireForAllFormats:Test__MoEOverlayDistributedResidencyProtocol.RemoteProjectionManifestRejectsRetiredEncodingFive
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MoE;Transfer;ByteExact;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CodedGpuExpertRelayWire)
@@ -28736,7 +28736,7 @@ list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ExpertTierCodedSou
 
 add_v2_test(V2_Integration_ExpertTierWeightDensityAdmission
     COMMAND $<TARGET_FILE:v2_test_expert_tier_weight_stream>
-        --gtest_filter=ExpertTierWeightStream.NativeQ5FileDensityRoundTrip:ExpertTierWeightStream.EveryCatalogedSourceFormatHasGpuToCpuContract:ExpertTierWeightStream.CodedDemotionRejectsLegacyPlanesBeforeAllocating:MoEOverlayPreparedWeightSource.AcceptsOnlyCanonicalGpuRepresentations
+        --gtest_filter=ExpertTierWeightStream.NativeQ5FileDensityRoundTrip:ExpertTierWeightStream.EveryCatalogedSourceFormatHasGpuToCpuContract:ExpertTierWeightStream.CodedDemotionRejectsLegacyPlanesBeforeAllocating:MoEOverlayPreparedWeightSource.AcceptsOnlyCanonicalGpuRepresentations:ExpertTierWeightStream.RetiredEncodingFiveHasTypedRejection
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MoE;WeightLifecycle;ExpertOverlay;Streaming"
     NO_MODELS)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ExpertTierWeightDensityAdmission)

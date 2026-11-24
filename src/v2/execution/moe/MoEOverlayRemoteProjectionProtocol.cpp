@@ -555,6 +555,8 @@ namespace llaminar2
                     error,
                     "Remote ExpertOverlay NativeQuantised projection geometry or format kind is invalid");
             }
+            if (cpu::native_quantised::isRetiredCPUPreparedEncoding(cpu_encoding))
+                return reject(error, cpu::native_quantised::kRetiredIQ3SExpandedSourceScaleDiagnostic);
             const auto *source = native_quantised_formats::forSourceIdentity(
                 source_codebook_id, source_is_superblock != 0);
             if (!source || cpu_codebook_id != source_codebook_id ||

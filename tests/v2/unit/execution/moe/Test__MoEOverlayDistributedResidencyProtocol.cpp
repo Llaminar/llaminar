@@ -345,6 +345,23 @@ namespace llaminar2::test
         EXPECT_FALSE(overflowing.projectionOperationCount().has_value());
     }
 
+    /** @test Reserved encoding 5 in a remote projection manifest gets the typed rejection of packed v9. */
+    TEST(Test__MoEOverlayDistributedResidencyProtocol, RemoteProjectionManifestRejectsRetiredEncodingFive)
+    {
+        using namespace cpu::native_quantised;
+        auto fixture = makeTransaction();
+        const auto identity = remoteProjectionIdentity(fixture.transaction, DeviceId::cpu(), DeviceId::cpu());
+        auto manifest = makeMoEOverlayRemoteCpuProjectionManifest(identity, cpuProjectionBytes(), 73);
+        std::string error;
+        ASSERT_TRUE(manifest.valid(&error)) << error;
+        manifest.cpu_encoding = static_cast<CPUNativeQuantisedEncoding>(kRetiredIQ3SExpandedSourceScaleEncoding);
+        EXPECT_FALSE(manifest.valid(&error));
+        EXPECT_EQ(error, kRetiredIQ3SExpandedSourceScaleDiagnostic);
+        std::array<std::uint8_t, MoEOverlayRemoteProjectionManifest::kWireBytes> packet{};
+        EXPECT_FALSE(encodeMoEOverlayRemoteProjectionManifest(manifest, packet, &error));
+        EXPECT_EQ(error, kRetiredIQ3SExpandedSourceScaleDiagnostic);
+    }
+
     TEST(
         Test__MoEOverlayDistributedResidencyProtocol,
         RemoteCpuProjectionManifestAndChunksAreExactAndAuthenticated)

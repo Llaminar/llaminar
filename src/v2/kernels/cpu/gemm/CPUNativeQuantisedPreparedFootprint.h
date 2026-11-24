@@ -53,6 +53,15 @@ namespace llaminar2::cpu::native_quantised
 
     /// Reserved packed-weight ID; never a valid prepared CPU encoding.
     inline constexpr std::uint8_t kRetiredIQ3SExpandedSourceScaleEncoding = 5;
+    /// The one rejection message for that ID at every receive and publication boundary.
+    inline constexpr const char *kRetiredIQ3SExpandedSourceScaleDiagnostic =
+        "CPU prepared encoding 5 (IQ3SExpandedSourceScale) is retired; IQ3_S requires CompactMultiScale";
+
+    /** @return Whether a sender- or owner-supplied prepared encoding names the retired ID 5. */
+    [[nodiscard]] constexpr bool isRetiredCPUPreparedEncoding(CPUNativeQuantisedEncoding encoding) noexcept
+    {
+        return static_cast<std::uint8_t>(encoding) == kRetiredIQ3SExpandedSourceScaleEncoding;
+    }
 
     /** @return Whether the original source uses the ordinary Q5 block, not Q5_K. */
     [[nodiscard]] constexpr bool isQ5NativeSingleScaleSource(std::uint8_t codebook, bool superblock) noexcept

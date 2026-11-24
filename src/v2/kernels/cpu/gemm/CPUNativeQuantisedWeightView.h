@@ -60,8 +60,8 @@ namespace llaminar2::cpu::native_quantised
      */
     inline void requireAdmittedCPUPreparedEncoding(CPUNativeQuantisedEncoding encoding, std::uint8_t codebook)
     {
-        if (static_cast<std::uint8_t>(encoding) == kRetiredIQ3SExpandedSourceScaleEncoding)
-            throw std::invalid_argument("CPU prepared encoding 5 (IQ3SExpandedSourceScale) is retired; IQ3_S requires CompactMultiScale");
+        if (isRetiredCPUPreparedEncoding(encoding))
+            throw std::invalid_argument(kRetiredIQ3SExpandedSourceScaleDiagnostic);
         if (encoding == CPUNativeQuantisedEncoding::SignedInt8SingleScale &&
             !isSignedInt8SingleScaleSource(codebook))
             throw std::invalid_argument("CPU prepared encoding 1 (SignedInt8SingleScale) requires a Q8_0, Q8_1, or Q8_K source; received codebook " +

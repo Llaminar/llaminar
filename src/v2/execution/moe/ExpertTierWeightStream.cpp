@@ -273,6 +273,8 @@ namespace llaminar2
             {
                 return reject(error, "CPU packed geometry is invalid for tier streaming");
             }
+            if (cpu::native_quantised::isRetiredCPUPreparedEncoding(cpu.encoding))
+                return reject(error, cpu::native_quantised::kRetiredIQ3SExpandedSourceScaleDiagnostic);
             if (!cpu::native_quantised::isKnownPreparedEncoding(cpu.encoding))
                 return reject(error, "CPU packed encoding is unknown");
             // Never trust serialized stride fields independently of encoding.
@@ -522,6 +524,8 @@ namespace llaminar2
         {
             return reject(error, "Tier stream geometry is invalid");
         }
+        if (cpu::native_quantised::isRetiredCPUPreparedEncoding(cpu_encoding))
+            return reject(error, cpu::native_quantised::kRetiredIQ3SExpandedSourceScaleDiagnostic);
         if (!cpu::native_quantised::isKnownPreparedEncoding(cpu_encoding))
             return reject(error, "Tier stream CPU encoding is invalid");
         // Re-derive strides rather than accepting redundant wire fields on trust.

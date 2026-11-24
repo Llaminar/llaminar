@@ -1003,6 +1003,36 @@ namespace llaminar2
             }
         }
 
+        /** @test Reserved encoding 5 gets the same typed rejection on the tier stream as on packed v9. */
+        TEST(ExpertTierWeightStream, RetiredEncodingFiveHasTypedRejection)
+        {
+            using namespace cpu::native_quantised;
+            const auto retired = static_cast<CPUNativeQuantisedEncoding>(kRetiredIQ3SExpandedSourceScaleEncoding);
+            // Sender-supplied manifest field.
+            auto manifest = makeGpuToCpuExpertTierWeightStreamManifest(native_quantised_formats::IQ3_S, 70, 256,
+                101, 3, 7, ExpertTierWeightProjection::Gate, 4);
+            std::string error;
+            ASSERT_TRUE(manifest.valid(&error)) << error;
+            manifest.cpu_encoding = retired;
+            EXPECT_FALSE(manifest.valid(&error));
+            EXPECT_EQ(error, kRetiredIQ3SExpandedSourceScaleDiagnostic);
+            EXPECT_FALSE(manifest.deviceLayout().valid());
+            // Locally materialized CPU weights entering the stream.
+            const auto tensor = test::TestTensorFactory::createIQ3_SRandom({70, 256}, 17);
+            CPUNativeQuantisedPackedWeights cpu;
+            ASSERT_TRUE(packWeightsCPUNativeQuantised(tensor.get(), cpu));
+            cpu.encoding = retired;
+            try
+            {
+                (void)makeCpuToGpuExpertTierWeightStreamManifest(cpu, 101, 3, 7, ExpertTierWeightProjection::Gate, 4);
+                ADD_FAILURE() << "retired CPU encoding entered the tier stream";
+            }
+            catch (const std::invalid_argument &failure)
+            {
+                EXPECT_STREQ(failure.what(), kRetiredIQ3SExpandedSourceScaleDiagnostic);
+            }
+        }
+
         std::vector<CpuExpertSlotPool::ProjectionSpec>
         cpuSlotProjectionSpecs(NativeQuantisedSourceIdentity source_identity)
         {
