@@ -47,6 +47,7 @@
 #endif
 #include "kernels/cpu/gemm/CPUWeightPreparationMemory.h"
 #include "tensors/NativeQuantisedSuperblockMetadata.h"
+#include "utils/DebugEnv.h"
 #include "utils/PerfStatsCollector.h"
 
 #include <omp.h>
@@ -944,7 +945,24 @@ namespace llaminar2::test
             const int lanes = activeISALevel() >= ISALevel::AVX512 ? 16 : 8;
             const auto config = serialTileConfigForPackedMatrix(packed, n, k, workers);
             if (require_k_partitions)
-                ASSERT_GT(config.k_tiles, 1) << "the replay must fold several serial K partitions";
+            {
+                // Restate the serial M=1 split (CPUNativeQuantisedTileConfig.h)
+                // for this cell instead of trusting the host's cache regime:
+                // one N task, fewer than the team; at least 256 blocks and 16M
+                // FLOPs admit the split in both regimes. A memory-bound host
+                // targets one partition per worker and a compute-bound host
+                // eight, both far below blocks/4, so both fold several.
+                const auto &tile = debugEnv().cpu_vnni;
+                ASSERT_TRUE(tile.k_tiles <= 0 && tile.min_bpr_k_parallel <= 0 && tile.n_block_chunks <= 0)
+                    << "LLAMINAR_CPU_VNNI_* overrides replace the serial K tree under test";
+                ASSERT_GE(workers, 2);
+                ASSERT_LE(n, 64);
+                ASSERT_GE(blocks, 256);
+                ASSERT_GE(2LL * n * k, 16'000'000LL);
+                ASSERT_GE(blocks / 4, 8 * workers);
+                ASSERT_TRUE(config.k_tiles == workers || config.k_tiles == 8 * workers)
+                    << "k_tiles=" << config.k_tiles << " workers=" << workers;
+            }
             const int partitions = std::max(1, config.k_tiles);
 
             // Independent slot geometry: up to eight K blocks of eight dot-group
@@ -1118,9 +1136,10 @@ namespace llaminar2::test
                     replayPackedPrefill(*source, policy, workers, narrower, false, 4);
         }
         // The backend-native tree splits K only for at least 16M FLOPs with fewer
-        // N tasks than workers. One 64-column chunk with 4104 K blocks gives 2..32
-        // partitions at every width >= 2 (cache-regime dependent), each longer
-        // than one panel, so partials fold and carry across panels.
+        // N tasks than workers. One 64-column chunk with 4104 K blocks gives
+        // exactly one or eight partitions per worker at every width >= 2 (memory-
+        // or compute-bound host), each longer than one panel, so partials fold
+        // and carry across panels in either cache regime.
         const PanelReplay partitioned{.n = 61, .k = 4104 * 32, .requests = 1, .rows_per_request = 17,
             .live = {{17}, {3}}};
         for (const auto &[name, source] : panelSources(partitioned.n, partitioned.k))
