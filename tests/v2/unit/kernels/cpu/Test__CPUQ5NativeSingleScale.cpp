@@ -188,6 +188,25 @@ namespace
         }
     }
 
+#if defined(__AVX2__)
+    /** @test The Q5_0 center correction sums every signed activation byte, including -128. */
+    TEST(CPUQ5NativeSingleScale, X86ActivationSumCoversEveryByteAtEveryPosition)
+    {
+        std::array<std::int8_t, 32> bytes;
+        for (const int background : {-128, 0, 127})
+            for (std::size_t lane = 0; lane < bytes.size(); ++lane)
+            {
+                bytes.fill(static_cast<std::int8_t>(background));
+                for (int value = -128; value <= 127; ++value)
+                {
+                    bytes[lane] = static_cast<std::int8_t>(value);
+                    ASSERT_EQ(q5::sumQ8(bytes.data()), 31 * background + value)
+                        << "lane=" << lane << " value=" << value;
+                }
+            }
+    }
+#endif
+
 #if defined(__aarch64__) && defined(__ARM_NEON)
     TEST(CPUQ5NativeSingleScale, WidenedScaleMatchesEveryStagedHalfWord)
     {

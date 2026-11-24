@@ -9,7 +9,6 @@
  */
 #pragma once
 
-#include "CPUNativeQuantisedActivationSums.h"
 #include "CPUNativeQuantisedContributionContract.h"
 #include "CPUNativeQuantisedMultiScaleKernels.h"
 #include "CPUNativeQuantisedPackedWeights.h"
@@ -25,14 +24,16 @@ namespace llaminar2::cpu::native_quantised::q5
         const auto fifth = _mm256_srl_epi32(
             multi_scale::load<__m256i>(unit + Q5NativePayload::fifthOffset(0, column)), _mm_cvtsi32_si128(group * 8));
         const auto bits = std::bit_cast<__m256i>(Ops::repeatByte<0>(std::bit_cast<I>(fifth)));
-        const auto unpack = [&]<int Shift>(__m256i raw) {
-            const auto mask = _mm256_set1_epi32(static_cast<int>(0x08040201u << Shift));
-            const auto missing = _mm256_cmpeq_epi8(_mm256_and_si256(bits, mask), _mm256_setzero_si256());
+        const auto unpack = [](__m256i raw, __m256i fifth_bits) {
+            const auto mask = _mm256_set1_epi32(0x08040201);
+            const auto missing = _mm256_cmpeq_epi8(_mm256_and_si256(fifth_bits, mask), _mm256_setzero_si256());
             return _mm256_or_si256(_mm256_and_si256(raw, _mm256_set1_epi8(15)),
                                    _mm256_andnot_si256(missing, _mm256_set1_epi8(16)));
         };
-        return std::pair{std::bit_cast<I>(unpack.template operator()<0>(nibbles)),
-                         std::bit_cast<I>(unpack.template operator()<4>(_mm256_srli_epi16(nibbles, 4)))};
+        // Shift the second set of fifth bits into the same mask positions,
+        // reducing the constants competing with the live row accumulators.
+        return std::pair{std::bit_cast<I>(unpack(nibbles, bits)),
+                         std::bit_cast<I>(unpack(_mm256_srli_epi16(nibbles, 4), _mm256_srli_epi16(bits, 4)))};
     }
 
 #if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
@@ -47,8 +48,8 @@ namespace llaminar2::cpu::native_quantised::q5
         const auto bits = std::bit_cast<__m512i>(Ops::repeatByte<0>(std::bit_cast<I>(fifth)));
         const auto unpack = [&]<int Shift>(__m512i raw) {
             const auto mask = _mm512_set1_epi32(static_cast<int>(0x08040201u << Shift));
-            const auto high = _mm512_maskz_set1_epi8(_mm512_test_epi8_mask(bits, mask), 16);
-            return _mm512_or_si512(_mm512_and_si512(raw, _mm512_set1_epi8(15)), high);
+            const auto low = _mm512_and_si512(raw, _mm512_set1_epi8(15));
+            return _mm512_mask_add_epi8(low, _mm512_test_epi8_mask(bits, mask), low, _mm512_set1_epi8(16));
         };
         return std::pair{std::bit_cast<I>(unpack.template operator()<0>(nibbles)),
                          std::bit_cast<I>(unpack.template operator()<4>(_mm512_srli_epi16(nibbles, 4)))};
@@ -75,6 +76,19 @@ namespace llaminar2::cpu::native_quantised::q5
 #endif
     }
 
+    /** @brief Sum all original Q8 bytes for the Q5_0 zero-point correction.
+     * @param qs Full 32-byte signed activation payload (including -128).
+     * @return The exact signed sum, independently of any staged FP32 metadata.
+     */
+    [[nodiscard]] inline int sumQ8(const std::int8_t *qs) noexcept
+    {
+        const auto input = multi_scale::load<__m256i>(qs);
+        const auto biased = _mm256_xor_si256(input, _mm256_set1_epi8(-128));
+        const auto sums = _mm256_sad_epu8(biased, _mm256_setzero_si256());
+        const auto pairs = _mm_add_epi64(_mm256_castsi256_si128(sums), _mm256_extracti128_si256(sums, 1));
+        return _mm_cvtsi128_si32(_mm_add_epi64(pairs, _mm_srli_si128(pairs, 8))) - 32 * 128;
+    }
+
     /** @brief Apply the unchanged FP32 contribution program on either x86 width. */
     template <int Lanes, bool Asymmetric>
     [[nodiscard]] inline typename multi_scale::SIMD<Lanes>::F contribute(
@@ -85,7 +99,7 @@ namespace llaminar2::cpu::native_quantised::q5
         using F = typename multi_scale::SIMD<Lanes>::F;
         const float a_scale = nativeQuantisedFP16ScaleToFP32(a.d);
         if constexpr (!Asymmetric)
-            dot -= 16 * (activationHalfSum(a.qs) + activationHalfSum(a.qs + 16));
+            dot -= 16 * sumQ8(a.qs);
         if constexpr (Lanes == 8)
         {
             const auto scale = _mm256_cvtph_ps(multi_scale::load<__m128i>(d));
@@ -140,8 +154,13 @@ namespace llaminar2::cpu::native_quantised::q5
                     partial[row] = multi_scale::load<F>(output[row] + column);
             for (int kb = first; kb < last; ++kb)
             {
-                const auto *unit = packed.interleavedBase() + packed.blockOffset(chunk, kb);
+                const auto *unit = packed.admittedBlockUnit(chunk, kb);
                 I dots[Rows]{};
+#if defined(__clang__)
+#pragma clang loop unroll(disable)
+#else
+#pragma GCC unroll 1
+#endif
                 for (int group = 0; group < 4; ++group)
                 {
                     const auto [low, high] = [&] {
@@ -156,8 +175,11 @@ namespace llaminar2::cpu::native_quantised::q5
                         dots[row] = dot<Lanes>(dots[row], high, input[row][kb], group + 4);
                     }
                 }
-                const auto *d = packed.chunkScales(chunk, kb) + column;
-                const auto *m = Asymmetric ? packed.chunkMins(chunk, kb) + column : nullptr;
+                // This leaf is bound to Q5NativeSingleScale. Its inline half
+                // planes immediately follow the payload; reuse the hot unit
+                // pointer for both rather than resolving the layout again.
+                const auto *d = reinterpret_cast<const std::uint16_t *>(unit + Q5NativePayload::bytes) + column;
+                const auto *m = Asymmetric ? d + 64 : nullptr;
                 for (std::size_t row = 0; row < Rows; ++row)
                     partial[row] = contribute<Lanes, Asymmetric>(partial[row], dots[row], d, m,
                         input[row][kb], packed.numerical_policy);

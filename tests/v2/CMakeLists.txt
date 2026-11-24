@@ -10733,6 +10733,14 @@ add_v2_test(V2_Unit_CPUQ5NativeSingleScale
     COMMAND $<TARGET_FILE:v2_unit_cpu_q5_native_single_scale>
     LABELS "V2;Unit;CPU;DeviceFree;NativeQuantised;ByteExact;Regression;ProductionTestPreflight"
     MPI_PROCS 1 NO_MODELS NO_MPI)
+if(LLAMINAR_CPU_ISA_UPPER MATCHES "^AVX(2|512)$")
+    add_v2_test(V2_Integration_CPUQ5NativeSignedActivationSum
+        COMMAND $<TARGET_FILE:v2_unit_cpu_q5_native_single_scale>
+            --gtest_filter=CPUQ5NativeSingleScale.X86ActivationSumCoversEveryByteAtEveryPosition
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;NativeQuantised;ByteExact;Regression"
+        MPI_PROCS 1 NO_MODELS NO_MPI)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUQ5NativeSignedActivationSum)
+endif()
 
 # Original Q6 source factors remain exact without changing Q8 GEMM inputs.
 add_executable(v2_test_q6_source_scale unit/kernels/Test__Q6SourceScale.cpp)
