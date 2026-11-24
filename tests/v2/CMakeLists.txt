@@ -24439,13 +24439,13 @@ add_v2_test(V2_Integration_ROCmIQ2SFusedMoEOriginalEquation
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmGroupedWmmaN64Replay)
     add_v2_test(V2_Integration_ROCmGroupedWmmaBoundaryReplay
         COMMAND $<TARGET_FILE:v2_integration_rocm_moe_kernel>
-            --gtest_filter=Test__ROCmMoEKernel.NativeWmmaMixedIQ4CapturedReplay:Test__ROCmMoEKernel.NativeWmmaTailPartitionsCapturedReplay:ROCmMoEGroupedWmmaPromotion.CapturedExpandedReplay
+            --gtest_filter=Test__ROCmMoEKernel.NativeWmmaMixedIQ4CapturedReplay:Test__ROCmMoEKernel.NativeWmmaTailPartitionsCapturedReplay:ROCmMoEGroupedWmmaPromotion.CapturedCodedQ5KReplay
         LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;Prefill;AllCodebooks;LocalTP;GraphCapture;ByteExact;Regression;HardwareOptional;Devices1;NativeISA-gfx1100"
         MPI_PROCS 1 NO_MODELS TIMEOUT 120 RESOURCE_LOCK rocm_gpu_0)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmGroupedWmmaBoundaryReplay)
     add_v2_test(V2_Integration_ROCmGroupedWmmaMacroReplay
         COMMAND $<TARGET_FILE:v2_integration_rocm_moe_kernel>
-            --gtest_filter=NativeGfx1100/ROCmMoEGroupedWideWmma.CapturedAllCodebookReplay/*:Test__ROCmMoEKernel.WideWmmaMixedIQ4CapturedReplay:Test__ROCmMoEKernel.WideWmmaTailPartitionsCapturedReplay:ROCmMoEGroupedWmmaPromotion.CapturedWideExpandedReplay
+            --gtest_filter=NativeGfx1100/ROCmMoEGroupedWideWmma.CapturedAllCodebookReplay/*:Test__ROCmMoEKernel.WideWmmaMixedIQ4CapturedReplay:Test__ROCmMoEKernel.WideWmmaTailPartitionsCapturedReplay:ROCmMoEGroupedWmmaPromotion.CapturedWideCodedQ5KReplay
         LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;Prefill;AllCodebooks;LocalTP;GraphCapture;ByteExact;Regression;HardwareOptional;Devices1;NativeISA-gfx1100"
         MPI_PROCS 1 NO_MODELS TIMEOUT 120 RESOURCE_LOCK rocm_gpu_0)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmGroupedWmmaMacroReplay)
