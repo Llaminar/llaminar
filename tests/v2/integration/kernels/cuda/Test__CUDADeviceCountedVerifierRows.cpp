@@ -199,9 +199,7 @@ static void proveDeviceCountedRows(
                     input.get(), input.get(), output.get(), M, N, K);
             else
                 launched = cudaNativeQuantisedGemvTuned_small_m_fp32_withPolicy(
-                quant, matrix.payload, static_cast<const uint16_t *>(matrix.scales),
-                static_cast<const uint16_t *>(matrix.mins),
-                static_cast<const uint32_t *>(matrix.emins),
+                quant, matrix.payload, ::llaminar2::native_quantised_scale::metadataPlanes(matrix),
                 static_cast<float *>(output->gpu_data_ptr()), scales,
                 M, N, K, 1.0f, 0.0f, nullptr, nullptr, matrix.codebook_id,
                 canonicalDeviceVnniCodebookId(matrix.arithmeticPolicyCodebookId()),

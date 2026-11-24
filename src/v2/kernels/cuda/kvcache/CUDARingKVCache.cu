@@ -3645,6 +3645,11 @@ namespace llaminar2
          */
         (void)k;
 
+        // A cache without attention layers (model-owned attention state or a
+        // recurrent-only slice) owns no K/V rows to convert: no scratch exists.
+        if (n_layers_ == 0)
+            return {};
+
         const auto geometry = kv_cache_workspace::ConversionGeometry{
             .configured_batch_size = batch_size_,
             .configured_context_rows = max_seq_len_,
@@ -3703,7 +3708,7 @@ namespace llaminar2
         void *new_scratch_k = nullptr;
         void *new_scratch_v = nullptr;
         size_t new_scratch_capacity = 0;
-        if (workspace)
+        if (workspace && n_layers_ > 0)
         {
             new_scratch_k =
                 workspace->getBuffer(KVCacheWorkspaceBuffers::CONV_SCRATCH_K);

@@ -212,7 +212,7 @@ std::vector<float> preparedRouteRows(const Engines& engines,int intermediate,
 /** @brief Exercise complete native sources without inventing CPU device ordinal1. */
 void preparedNativeMatrix(const std::array<QuantizedVerifierWeightCreator,3>& create,
     const std::array<ExpertWeightFormat,3>& format,int hidden_columns=H,int intermediate=F,
-    size_t recordedFragmentBytes=0,bool packedCollectiveReplay=false) {
+    bool requireFileDensity=false,bool packedCollectiveReplay=false) {
     const int H=hidden_columns,F=intermediate;
     MoEOverlayLayerWeightManifest manifest{3,{{{ExpertTierWeightProjection::Gate,F,H,format[0]},
         {ExpertTierWeightProjection::Up,F,H,format[1]},{ExpertTierWeightProjection::Down,H,F,format[2]}}}};
@@ -229,7 +229,6 @@ void preparedNativeMatrix(const std::array<QuantizedVerifierWeightCreator,3>& cr
     ASSERT_EQ(cohort.participants()[0].address.numa_node,0);ASSERT_EQ(cohort.participants()[1].address.numa_node,1);
     ASSERT_EQ(cohort.participants()[0].address.device_ordinal,0);ASSERT_EQ(cohort.participants()[1].address.device_ordinal,0);
     std::array<Engines,2> shards;
-    std::array<std::array<size_t,2>,2> observedBytes{};
     std::array<std::array<std::array<std::shared_ptr<ITensorGemm>,3>,2>,2> handles;
     for(size_t expert=0;expert<2;++expert)for(size_t projection=0;projection<3;++projection) {
         auto source=create[projection](projection==2?std::vector<size_t>{H,F}:std::vector<size_t>{F,H},uint32_t(71+expert*11+projection));
@@ -261,7 +260,17 @@ void preparedNativeMatrix(const std::array<QuantizedVerifierWeightCreator,3>& cr
                 const auto expected=resolveExpertPreparedProjectionMemoryGeometry(rectangle.rows,rectangle.columns,format[projection]).cpu_bytes;
                 EXPECT_LE(actual,expected);
                 EXPECT_LT(expected-actual,hostPageBytes());
-                observedBytes[participant][expert]+=actual;
+                if (requireFileDensity)
+                {
+                    // The recording owns the original N/K cut, not a fixed
+                    // prepared allocation size. Price the actual GGUF rows
+                    // using the canonical local allocator and SIMD N padding.
+                    const auto paddedRows = (compact->rows() + 63u) / 64u * 64u;
+                    ASSERT_EQ(compact->size_bytes() % compact->rows(), 0u);
+                    const auto sourcePayloadBytes = paddedRows * (compact->size_bytes() / compact->rows());
+                    EXPECT_EQ(packed.preparedBytes(), sourcePayloadBytes);
+                    EXPECT_EQ(actual, CPUStoragePlacement::local().physicalBytes<uint8_t>(sourcePayloadBytes));
+                }
             }
             EXPECT_EQ(std::memcmp(source->raw_data(),original.data(),original.size()),0);
         }
@@ -270,8 +279,6 @@ void preparedNativeMatrix(const std::array<QuantizedVerifierWeightCreator,3>& cr
     }
     for(size_t participant=0;participant<2;++participant)for(size_t expert=0;expert<2;++expert)
         shards[participant][expert]={handles[participant][expert][0],handles[participant][expert][1],handles[participant][expert][2]};
-    if(recordedFragmentBytes)
-        for(const auto& participant:observedBytes)for(size_t bytes:participant)EXPECT_EQ(bytes,recordedFragmentBytes);
     std::vector<float> hidden(8*H);
     for(size_t i=0;i<hidden.size();++i)hidden[i]=std::sin(float(i)*0.013f)*0.1f;
     for(int rows:{8,3,1,3}) {
@@ -355,8 +362,8 @@ TEST(CPUExpertShardExecution, PreparedNativeSourceAllFormatsAndSerialRows) {
 
 namespace llaminar2::test {
 namespace {
-/** @brief Execute one observed original source class, keeping its own exact allocation expectation. */
-void qfnOriginalClass(TensorType gateType,TensorType downType,size_t fragmentBytes,bool packed=false) {
+/** @brief Execute an observed QFN source class with density-exact native fragments. */
+void qfnOriginalClass(TensorType gateType,TensorType downType,bool packed=false) {
     if(!hasCPUBackend())initCPUBackend(-1);
     TeamScope team(1);
     const auto& formats=quantizedMoEVerifierFormats();
@@ -368,20 +375,20 @@ void qfnOriginalClass(TensorType gateType,TensorType downType,size_t fragmentByt
     const auto& gate=find(gateType);const auto& down=find(downType);
     const auto gateFormat=ExpertWeightFormat::nativeQuantised({gate.source_codebook_id,gate.source_is_superblock,true});
     const auto downFormat=ExpertWeightFormat::nativeQuantised({down.source_codebook_id,down.source_is_superblock,true});
-    preparedNativeMatrix({gate.create,gate.create,down.create},{gateFormat,gateFormat,downFormat},2560,640,fragmentBytes,packed);
+    preparedNativeMatrix({gate.create,gate.create,down.create},{gateFormat,gateFormat,downFormat},2560,640,true,packed);
 }
 }
 /** @test The43-layer original Q4_K/Q5_1 class executes native320+320 fragments. */
 TEST(CPUExpertShardExecution, QFNOriginalMixedFormatsAndNative320Cuts) {
-    recordReplayScope();qfnOriginalClass(TensorType::Q4_K,TensorType::Q5_1,2105344);
+    recordReplayScope();qfnOriginalClass(TensorType::Q4_K,TensorType::Q5_1);
 }
 /** @test The4-layer original Q4_K/Q8_0 class retains its distinct physical representation. */
 TEST(CPUExpertShardExecution, QFNOriginalQ4KQ8_0Native320Cuts) {
-    recordReplayScope();qfnOriginalClass(TensorType::Q4_K,TensorType::Q8_0,2052096);
+    recordReplayScope();qfnOriginalClass(TensorType::Q4_K,TensorType::Q8_0);
 }
-/** @test The1-layer original Q5_K/Q8_0 class cannot borrow the common class byte quote. */
+/** @test The1-layer original Q5_K/Q8_0 class prices its own source cuts. */
 TEST(CPUExpertShardExecution, QFNOriginalQ5KQ8_0Native320Cuts) {
-    recordReplayScope();qfnOriginalClass(TensorType::Q5_K,TensorType::Q8_0,2871296);
+    recordReplayScope();qfnOriginalClass(TensorType::Q5_K,TensorType::Q8_0);
 }
 } // namespace llaminar2::test
 
@@ -394,7 +401,7 @@ TEST(CPUExpertShardExecution, PreparedPackedSourceRecordsAllFormatsAndPhases) {
     for(const auto& format:quantizedMoEVerifierFormats()) {
         SCOPED_TRACE(format.label);
         const auto identity=ExpertWeightFormat::nativeQuantised({format.source_codebook_id,format.source_is_superblock,true});
-        preparedNativeMatrix({format.create,format.create,format.create},{identity,identity,identity},H,F,0,true);
+        preparedNativeMatrix({format.create,format.create,format.create},{identity,identity,identity},H,F,false,true);
     }
     for(const auto type:{TensorType::FP32,TensorType::FP16,TensorType::BF16}) {
         const QuantizedVerifierWeightCreator create=[type](const auto& shape,uint32_t seed)->std::unique_ptr<TensorBase> {
@@ -403,14 +410,14 @@ TEST(CPUExpertShardExecution, PreparedPackedSourceRecordsAllFormatsAndPhases) {
             return TestTensorFactory::createBF16Random(shape,-0.02f,0.02f,seed);
         };
         const auto identity=ExpertWeightFormat::floating(type);
-        preparedNativeMatrix({create,create,create},{identity,identity,identity},H,F,0,true);
+        preparedNativeMatrix({create,create,create},{identity,identity,identity},H,F,false,true);
     }
 }
 TEST(CPUExpertShardExecution, PreparedPackedQFNMixedClasses) {
     recordReplayScope();
-    qfnOriginalClass(TensorType::Q4_K,TensorType::Q5_1,2105344,true);
-    qfnOriginalClass(TensorType::Q4_K,TensorType::Q8_0,2052096,true);
-    qfnOriginalClass(TensorType::Q5_K,TensorType::Q8_0,2871296,true);
+    qfnOriginalClass(TensorType::Q4_K,TensorType::Q5_1,true);
+    qfnOriginalClass(TensorType::Q4_K,TensorType::Q8_0,true);
+    qfnOriginalClass(TensorType::Q5_K,TensorType::Q8_0,true);
 }
 } // namespace llaminar2::test
 

@@ -487,16 +487,25 @@ namespace llaminar2::cpu::native_quantised::test
                 {
                     for (int kb = 0; kb < blocks; ++kb)
                         unpackable->packVnniBlock(context, column + kRowStart, 0, kb);
+                    // Independent unit geometry: whole 32-bit payload words
+                    // per column (256 bytes per word for 64 columns), then
+                    // the primary and secondary FP16 vectors and, for Q2_K
+                    // only, the effective-minimum vector.
+                    const int words = (bytes + 3) / 4;
+                    const int data_stride = words * 256;
+                    const int unit_stride = data_stride + 256 + (format.metadata->has_emins ? 256 : 0);
+                    ASSERT_EQ(serial.data_stride, data_stride);
+                    ASSERT_EQ(serial.interleaved_block_stride, unit_stride);
                     for (int kb = 0; kb < blocks; ++kb)
                     {
-                        auto *unit = oracle.data() + ((column / 64) * blocks + kb) * 1536;
+                        auto *unit = oracle.data() + ((column / 64) * blocks + kb) * unit_stride;
                         const int local = column % 64;
                         for (int byte = 0; byte < bytes; ++byte)
                             unit[(byte / 4) * 256 + local * 4 + byte % 4] = payload[kb * bytes + byte];
-                        std::memcpy(unit + 1024 + local * 2, &scales[kb], 2);
-                        std::memcpy(unit + 1152 + local * 2, &secondary[kb], 2);
+                        std::memcpy(unit + data_stride + local * 2, &scales[kb], 2);
+                        std::memcpy(unit + data_stride + 128 + local * 2, &secondary[kb], 2);
                         if (format.metadata->has_emins)
-                            std::memcpy(unit + 1280 + local * 4, &minima[kb], 4);
+                            std::memcpy(unit + data_stride + 256 + local * 4, &minima[kb], 4);
                     }
                 }
                 EXPECT_EQ(std::memcmp(serial.native_interleaved.data(), oracle.data(), oracle.size()), 0)
@@ -522,8 +531,10 @@ namespace llaminar2::cpu::native_quantised::test
         // This count
         // makes a future encoding-policy change update the independent oracle
         // deliberately rather than silently shrinking its coverage.
-        EXPECT_EQ(expanded_formats, 10u);
-        EXPECT_EQ(compact_formats, 5u);
+        // CompactMultiScale covers Q3_K, Q2_K, IQ3_XXS, IQ2_S, IQ2_XS,
+        // IQ2_XXS, IQ1_S and IQ1_M; IQ3_XXS/IQ2_XXS/IQ1_S left ExpandedInt8.
+        EXPECT_EQ(expanded_formats, 7u);
+        EXPECT_EQ(compact_formats, 8u);
     }
     namespace
     {

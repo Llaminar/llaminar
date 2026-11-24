@@ -81,7 +81,7 @@ TEST(CPUNativeBlockDecode, FiveBitExhaustiveBytesMatchIndependentIntegerOracle)
         }
 }
 
-/** @test The canonical registry remains total over six physical encodings and source tuples. */
+/** @test The canonical registry remains total over live physical encodings and source tuples. */
 TEST(CPUNativeBlockDecode, AllSourceFormatsRetainTheirPreparedEncodingIdentity)
 {
     std::set<CPUNativeQuantisedEncoding> encodings;
@@ -91,17 +91,36 @@ TEST(CPUNativeBlockDecode, AllSourceFormatsRetainTheirPreparedEncodingIdentity)
         const auto &format = *source.metadata;
         const auto encoding = preparedEncodingForSource(format);
         EXPECT_TRUE(isKnownPreparedEncoding(encoding));
-        EXPECT_GT(preparedDataStride(encoding), 0u);
-        EXPECT_GE(preparedInterleavedBlockStride(encoding, format.is_asymmetric),
-                  preparedDataStride(encoding) + 256u);
+        const auto data = preparedDataStride(encoding, format.codebook_id);
+        ASSERT_GT(data, 0u);
+        const auto geometry = preparedBlockGeometry(encoding, format.is_asymmetric, format.codebook_id, 8);
+        if (preparedSuperblockCoded(encoding))
+        {
+            const auto book = superblockMetadataCodebook(encoding, format.codebook_id);
+            EXPECT_EQ(geometry.block_stride - data, 8u * native_quantised_superblock::superblockCodePlaneBits(book));
+            EXPECT_EQ(geometry.header_bytes, 64u * native_quantised_superblock::superblockFieldBytes(book));
+            EXPECT_GT(geometry.header_bytes, 0u);
+        }
+        else
+        {
+            const unsigned scale = preparedScaleEncoding(format.codebook_id, encoding) ==
+                CPUNativeQuantisedScaleEncoding::E8M0 ? 1u : 2u;
+            const unsigned comp = preparedUsesInlineCompensation(encoding, format.codebook_id) ? 2u : 0u;
+            EXPECT_EQ(geometry.block_stride - data, 64u * (scale + comp + (format.is_asymmetric ? 2u : 0u)));
+            EXPECT_EQ(geometry.header_bytes, 0u);
+        }
         EXPECT_EQ(native_quantised_formats::forSourceIdentity(format.codebook_id, format.is_superblock),
                   source.metadata);
         EXPECT_EQ(preparedEncodingForSource(format, true), CPUNativeQuantisedEncoding::ExpandedInt8);
         encodings.insert(encoding);
     }
-    EXPECT_EQ(encodings.size(), 6u);
-    EXPECT_EQ(preparedEncodingForSource(native_quantised_formats::IQ4_NL), CPUNativeQuantisedEncoding::NibbleLUT);
-    EXPECT_EQ(preparedEncodingForSource(native_quantised_formats::IQ4_XS), CPUNativeQuantisedEncoding::NibbleLUTSourceScale);
-    EXPECT_EQ(preparedEncodingForSource(native_quantised_formats::IQ3_S), CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale);
+    using Encoding = CPUNativeQuantisedEncoding;
+    const std::set expected{Encoding::NibbleLUT, Encoding::ExpandedInt8, Encoding::Q6KNativeDualScale,
+        Encoding::CompactMultiScale, Encoding::NibbleLUTSourceScale, Encoding::Q4KSuperblockCoded,
+        Encoding::Q5NativeSingleScale};
+    EXPECT_EQ(encodings, expected);
+    EXPECT_EQ(preparedEncodingForSource(native_quantised_formats::IQ4_NL), Encoding::NibbleLUT);
+    EXPECT_EQ(preparedEncodingForSource(native_quantised_formats::IQ4_XS), Encoding::NibbleLUTSourceScale);
+    EXPECT_EQ(preparedEncodingForSource(native_quantised_formats::IQ3_S), Encoding::CompactMultiScale);
 }
 } // namespace llaminar2::test

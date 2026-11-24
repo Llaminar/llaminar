@@ -494,6 +494,12 @@ namespace llaminar2
         const float delta = (qh_word & 0x8000) ? -IQ1S_DELTA : IQ1S_DELTA;
 
         std::memcpy(vnniPayloadDst(ctx, linear), payload_buf, 6);
+        if (vnniCoded(ctx))
+        {
+            // The code (scale selector + delta sign) is already qh bits 12..15.
+            vnniStoreCoded(ctx, linear, destination_n, b, static_cast<uint32_t>(qh_word >> 12) & 15u, blk->d);
+            return;
+        }
         ctx.scales_array[linear] = fp32_to_fp16(dl);
         ctx.mins_array[linear] = fp32_to_fp16(dl * delta);
     }

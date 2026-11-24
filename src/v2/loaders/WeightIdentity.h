@@ -77,7 +77,23 @@ namespace llaminar2
         PerLayerEmbeddingConvolution,
         /** Predictor embedding/hidden mixing projection. */
         PredictorProjection,
+        /** DeepSeek-V4 immutable FP32 operator tensors (compressor APE, sinks, HC base/scale, routing bias). */
+        DeepSeekV4Operator,
+        /** DeepSeek-V4 INT32 token-id -> expert hash-routing table; never a GEMM weight. */
+        DeepSeekV4HashTable,
+        /** DeepSeek-V4 grouped output LoRA (attn_output_a) read in native block format by its own kernel. */
+        DeepSeekV4NativeProjection,
     };
+
+    /**
+     * @brief DeepSeek-V4 operands that DeepSeek-V4 kernels read in their native GGUF
+     *        layout (exact integer tables, grouped projections). They are uploaded
+     *        unchanged and never enter prepared-GEMM packing.
+     */
+    inline bool isDeepSeekV4NativeOperandRole(WeightRole role) noexcept
+    {
+        return role == WeightRole::DeepSeekV4HashTable || role == WeightRole::DeepSeekV4NativeProjection;
+    }
 
     /**
      * @brief Identify the original HC-up source roles shared by planning and observation.
@@ -97,6 +113,7 @@ namespace llaminar2
     inline constexpr bool isImmutableFP32WeightRole(WeightRole role) noexcept
     {
         return role == WeightRole::HyperConnectionNorm ||
+               role == WeightRole::DeepSeekV4Operator ||
                role == WeightRole::SparseIndexerNorm ||
                role == WeightRole::PerLayerEmbeddingNorm ||
                role == WeightRole::PerLayerEmbeddingConvolution;

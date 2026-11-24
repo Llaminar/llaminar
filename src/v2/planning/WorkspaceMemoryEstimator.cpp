@@ -19,6 +19,7 @@
 #include "planning/PlanningModelMetadata.h"
 #include "planning/WeightShardGeometry.h"
 #include "execution/moe/MoEExpertProjectionOwnership.h"
+#include "planning/PersistentStateMemoryEstimator.h"
 #include "models/qwen4exp/Qwen4ExpPredictorProjectionGeometry.h"
 #include "models/qwen4exp/Qwen4ExpProjectionWorkspace.h"
 #include "models/qwen/LayerGraphIdentity.h"
@@ -184,6 +185,37 @@ std::pair<int, int> compactRoutedExpertWorkspaceRows(
     const ModelMemoryProfile& profile, const WorkspaceMemoryGeometry& geometry);
 
 /**
+ * @brief Whether this participant's router owns the CUDA Q8 gate cache.
+ *
+ * Mirrors MoERoutingStage: only an FP32 prepared router gate (resolved by the
+ * same representation contract the loader applies) binds the cache, and only
+ * while the Q8 router is enabled. A profile without router tensors keeps the
+ * conservative declaration.
+ */
+MoEWorkspaceBuffers::CUDARouterGateCache plannedCUDARouterGateCache(
+    const ModelMemoryProfile& profile, const WorkspaceMemoryGeometry& geometry)
+{
+    using Cache = MoEWorkspaceBuffers::CUDARouterGateCache;
+    if (!debugEnv().gemm.cuda_moe_router_q8)
+        return Cache::None;
+    bool any_router = false;
+    for (const auto& tensor : profile.tensors)
+    {
+        if (!tensor.name.ends_with(".ffn_gate_inp.weight"))
+            continue;
+        any_router = true;
+        const auto representation = PreparedWeightRepresentationContract::resolve(
+            WeightRole::MoERouter, tensor.quant_type, tensor.name, profile.architecture,
+            geometry.planning_policy.gdn_projection_arithmetic, geometry.planning_policy.moe_router_arithmetic);
+        const bool fp32_source = tensor.quant_type == "F32" || tensor.quant_type == "FP32";
+        if (representation == ModelPreparedWeightRepresentation::FP32 ||
+            (representation == ModelPreparedWeightRepresentation::SourceNative && fp32_source))
+            return Cache::Q8;
+    }
+    return any_router ? Cache::None : Cache::Q8;
+}
+
+/**
  * @brief Compute the exact MoE requirement contribution for one GPU participant.
  *
  * MoE scratch names coexist with the dense GEMM and recurrent names already
@@ -229,7 +261,8 @@ size_t exactMoEWorkspaceBytes(
             profile.d_model,
             profile.expert_feed_forward_length,
             profile.expert_count,
-            profile.expert_used_count);
+            profile.expert_used_count,
+            plannedCUDARouterGateCache(profile, geometry));
     }
     else if (device.is_rocm())
     {
@@ -254,7 +287,8 @@ size_t exactMoEWorkspaceBytes(
         const auto compact_rows = compactRoutedExpertWorkspaceRows(profile, geometry).second;
         requirements.merge(device.is_cuda()
             ? MoEWorkspaceBuffers::cudaMoE(compact_rows, profile.d_model,
-                profile.expert_feed_forward_length, profile.expert_count, 1)
+                profile.expert_feed_forward_length, profile.expert_count, 1,
+                plannedCUDARouterGateCache(profile, geometry))
             : MoEWorkspaceBuffers::rocmMoE(compact_rows, profile.d_model,
                 profile.expert_feed_forward_length, profile.expert_count, 1, geometry.gate_up_publication, geometry.down_publication));
     }
@@ -432,9 +466,11 @@ bool isRoutedExpertWeight(std::string_view name)
 /** @brief Whether a tensor is prepared through the quantized NativeQuantised GEMM. */
 bool isQuantizedMatrixWeight(const TensorSizeInfo& tensor)
 {
+    // Integer tables (e.g. DeepSeek-V4 INT32 hash routing) are lookups, not projections.
     return tensor.K > 0u && tensor.elements >= tensor.K &&
            tensor.elements % tensor.K == 0u &&
-           !tensor.quant_type.empty() && !isFloatingWeight(tensor);
+           !tensor.quant_type.empty() && !isFloatingWeight(tensor) &&
+           tensor.quant_type != "I32" && tensor.quant_type != "INT32";
 }
 
 /** @brief Whether a matrix supplies the terminal vocabulary projection. */
@@ -641,7 +677,8 @@ bool workspaceOwnsTensorImpl(
     const WorkspaceMemoryGeometry& geometry)
 {
     const auto role = workspaceSourceRole(tensor,profile,geometry);
-    if (role == WeightRole::ImmutableRowTable || isImmutableFP32WeightRole(role)) return false;
+    if (role == WeightRole::ImmutableRowTable || isImmutableFP32WeightRole(role) ||
+        isDeepSeekV4NativeOperandRole(role)) return false;
     if (tensor.layer_index < 0)
     {
         if ((workspaceSourceRole(tensor,profile,geometry)==WeightRole::Embedding))
@@ -1726,6 +1763,14 @@ bool hasFullAttentionLayer(
     int first_layer,
     int last_layer)
 {
+    // Model-owned attention state (DeepSeek-V4) has no full-attention cache
+    // layer: no RoPE ABI, attention member or KV conversion consumer exists.
+    if (profile.totalLayerCount() > 0 &&
+        PersistentStateMemoryEstimator::layerStateKind(
+            profile, std::clamp(first_layer, 0, profile.totalLayerCount() - 1)) ==
+            LayerStateKind::ModelOwned)
+        return false;
+
     const bool explicit_full_attention = std::any_of(
         profile.tensors.begin(),
         profile.tensors.end(),
@@ -1814,6 +1859,11 @@ WorkspaceRequirements exactAttentionMemberRequirements(
     const ModelMemoryProfile& profile,
     const WorkspaceMemoryGeometry& geometry)
 {
+    // DeepSeek-V4 builds no AttentionComputeStage: its sparse MQA kernel owns
+    // arena-declared scratch (DeepSeekV4BufferLayout), so no FA2/split-decode
+    // workspace exists to admit.
+    if (profile.deepseek_v4)
+        return {};
     const bool has_exact_local_query_heads =
         geometry.local_query_heads > 0;
     if (geometry.device_compute_units <= 0 || geometry.batch_size <= 0 ||
@@ -2024,6 +2074,10 @@ size_t exactKVConversionWorkspaceBytes(
         throw std::runtime_error(
             "KV workspace planning requires positive batch, context, head, and TP geometry");
     }
+    // DeepSeek-V4's model-owned attention banks publish no KV precision-
+    // conversion scratch; every other model keeps the canonical pair, even
+    // when its full-attention evidence is carried by a single layer marker.
+    const bool main_converts = !profile.deepseek_v4;
 
     const int local_kv_heads =
         geometry.local_kv_heads > 0
@@ -2036,8 +2090,9 @@ size_t exactKVConversionWorkspaceBytes(
         static_cast<size_t>(local_kv_heads),
         static_cast<size_t>(profile.head_dim),
         "KV conversion local width");
-    WorkspaceRequirements requirements =
-        kv_cache_workspace::conversionRequirements({
+    WorkspaceRequirements requirements;
+    if (main_converts)
+        requirements = kv_cache_workspace::conversionRequirements({
             .configured_batch_size = geometry.batch_size,
             .configured_context_rows = geometry.max_context_rows,
             .requested_graph_rows = geometry.resident_graph_rows,

@@ -8,6 +8,8 @@
  * Its original runtime bank remains the sole live source/placement authority.
  */
 #pragma once
+
+#include "kernels/common/ExpertSwiGLUActivationPolicy.h"
 #include "kernels/common/DeviceRowRange.h"
 #include "ResidentMoEFFNProgramEvidence.h"
 #include "execution/moe/MoEIntermediateShardDescriptorDeclaration.h"
@@ -49,6 +51,7 @@ struct ResidentMoEFFNRequest
     ITensor* shared_gate_scratch=nullptr;
     ITensor* shared_up_scratch=nullptr;
     std::optional<ResidentMoEFFNModelCoordinates> model_main_inference;
+    ExpertSwiGLUActivationPolicy routed_activation, shared_activation;
 };
 
 /** @brief Backend-owned sealed local transaction; no public private-buffer accessor. */

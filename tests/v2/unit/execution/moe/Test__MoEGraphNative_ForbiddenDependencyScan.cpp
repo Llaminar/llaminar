@@ -3250,7 +3250,7 @@ namespace llaminar2::test
             << "Histogram sidebands and the legacy payload path use gathers, not activation allreduces.";
         EXPECT_NE(ffn_body.find("moe_rebalance_histogram_sideband"),
                   std::string::npos);
-        EXPECT_NE(ffn_body.find("std::max<uint32_t>(1u, wave_count)"),
+        EXPECT_NE(ffn_body.find("std::max(1u, wave_count), binding.config.num_experts)"),
                   std::string::npos)
             << "Even diagnostic histogram sidebands must be sized by the rolling wave, not the full model.";
         EXPECT_EQ(ffn_body.find("moe_rebalance_directory_sideband"),
@@ -7310,11 +7310,11 @@ namespace llaminar2::test
             << "Format admission must cover the complete stage runtime interval, including terminal MTP layers";
         EXPECT_NE(graph.find("DeviceMoETransferSlotDirectory::profileForLayerFormats"),
                   std::string::npos)
-            << "Qwen MoE graph construction must merge exact layer formats into one explicit profile";
+            << "Qwen MoE graph construction must group exact layer formats into one explicit family profile";
         EXPECT_NE(graph.find("collectGraphRebalanceTransferProfile"),
                   std::string::npos)
             << "Prefill LLEP and decode maintenance must share the same stage-scoped format admission";
-        EXPECT_NE(graph.find("graphRebalanceTransferDirectoryKey"),
+        EXPECT_NE(graph.find("existing->second->requireCaptureIdentity("),
                   std::string::npos)
             << "Prefill and maintenance must derive persistent transfer storage "
                "identity through one device-domain key builder";
@@ -8733,19 +8733,11 @@ namespace llaminar2::test
                 graph,
                 "rebalance_config.transfer_slot_directory_capacity ="),
             2u);
-        EXPECT_EQ(
-            countOccurrences(graph, "transfer_capacity.active_slots;"),
-            2u);
-        EXPECT_EQ(
-            countOccurrences(graph, "transfer_capacity.total_slots;"),
-            3u)
-            << "Both configs use total addressability and the directory boundary derives its slot count from the typed capacity";
-        EXPECT_EQ(
-            countOccurrences(
-                graph,
-                "transfer_capacity,\n"),
-            4u)
-            << "The typed capacity must cross the helper, production create, prefill, and decode boundaries intact";
+        EXPECT_EQ(countOccurrences(graph, "rebalance_config.transfer_slot_layer_ranges ="), 2u);
+        EXPECT_EQ(countOccurrences(graph, "= graphTransferDirectoryCapacity(rebalance_config);"), 2u)
+            << "Prefill and decode must derive capacity through the same resolver";
+        EXPECT_NE(graph.find("const std::string transfer_key = graphRebalanceDomainKey();"), std::string::npos)
+            << "A different layout must not open a second cache entry for the same domain";
 
         EXPECT_GE(moe_rebalance_abi::kVersion, 16u)
             << "Projection-aware descriptors require the revised host/device ABI";
@@ -8755,7 +8747,7 @@ namespace llaminar2::test
             << "The ABI must retain sealed demand with the cross-domain route identity.";
         EXPECT_NE(abi.find("kCommandHeaderBytes = 128u"), std::string::npos);
         EXPECT_NE(
-            abi.find("kConfigBytes = 140u"),
+            abi.find("kConfigBytes = 152u"),
             std::string::npos);
 
         for (const auto &[backend, source] :

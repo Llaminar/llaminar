@@ -236,6 +236,22 @@ namespace llaminar2
              * assemble its complete probability checkpoint without duplication. */
             std::optional<DeviceRowPartition> probability_snapshot_partition;
 
+            /**
+             * @brief Router scoring function (DeepSeek-V4 uses SqrtSoftplus).
+             * @details Model tensors below are frozen weights resolved to the
+             * routing device at execution; @c scoring_token_ids is a stable
+             * execution-device token row for hash-routed layers.
+             */
+            MoERouterScoringPolicy::Function scoring_function = MoERouterScoringPolicy::Function::Softmax;
+            const TensorBase *scoring_selection_bias = nullptr; ///< FP32 [num_experts] (score routing).
+            const TensorBase *scoring_hash_table = nullptr;     ///< INT32 [vocab, top_k] (hash routing).
+            const int32_t *scoring_token_ids = nullptr;         ///< [seq_len] token ids (hash routing, vision).
+            float scoring_route_scale = 1.0f;                   ///< Post-normalization weight scale.
+            /// Vision: FP32 [num_experts] exp_probs_b_vl for image-sentinel rows (every layer), or null.
+            const TensorBase *scoring_image_bias = nullptr;
+            int32_t scoring_image_sentinel_base = 0;  ///< First image-sentinel token id.
+            int32_t scoring_image_sentinel_count = 0; ///< Image-sentinel id count.
+
             // Outputs (written by this stage)
             TensorBase *output_indices = nullptr; ///< FP32 [seq_len * top_k] expert IDs as float
             TensorBase *output_weights = nullptr; ///< FP32 [seq_len * top_k] normalized weights

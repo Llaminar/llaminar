@@ -808,6 +808,14 @@ namespace llaminar2
 
         const int sc_lo_idx = sub_idx * 2;
         const int sc_hi_idx = sub_idx * 2 + 1;
+        if (vnniCoded(ctx))
+        {
+            // Code: the two original scale/min bytes; d | dmin << 16 per superblock.
+            vnniStoreCoded(ctx, linear, destination_n, b,
+                           uint32_t{blk->scales[sc_lo_idx]} | (uint32_t{blk->scales[sc_hi_idx]} << 8),
+                           uint32_t{blk->d} | (uint32_t{blk->dmin} << 16));
+            return;
+        }
         const float d_val = fp16_to_fp32(blk->d);
         const float dmin = fp16_to_fp32(blk->dmin);
         ctx.scales_array[linear] = fp32_to_fp16(d_val * static_cast<float>(blk->scales[sc_lo_idx] & 0xF));

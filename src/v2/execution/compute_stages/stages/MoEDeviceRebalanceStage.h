@@ -345,6 +345,8 @@ namespace llaminar2
         std::string applyStatusBufferName() const;
         size_t localHistogramEntries() const;
         size_t gatheredHistogramEntries() const;
+        /** @return Live wire extent in INT32 elements, including transfer occupancy metadata. */
+        size_t localHistogramWords() const;
         size_t histogramLayerCount() const;
         size_t llepPlannerScratchCount() const;
         size_t localDirectoryEntries() const;

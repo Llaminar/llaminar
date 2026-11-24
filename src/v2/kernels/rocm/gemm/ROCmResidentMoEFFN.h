@@ -293,6 +293,7 @@ struct ResidentMoEFFNArgs
     float *route_contributions=nullptr,*routed_output=nullptr,*shared_output=nullptr,*combined_output=nullptr;
     float *shared_gate_output=nullptr,*shared_up_output=nullptr;
     ResidentMoEPartitionPolicy routed_gate_policy,routed_down_policy,shared_gate_policy,shared_down_policy;
+    float routed_swiglu_limit=0.0f, shared_swiglu_limit=0.0f;
 };
 /** @brief Original immutable source masks required to resolve all reachable descriptor policies. */
 struct ResidentMoEFFNPolicyMasks

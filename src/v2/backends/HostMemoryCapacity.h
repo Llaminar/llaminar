@@ -76,4 +76,35 @@ namespace llaminar2
      * @return System observation, or an invalid zero observation.
      */
     [[nodiscard]] HostMemoryCapacityObservation observeSystemMemoryCapacity();
+
+    /**
+     * @brief Allocatable bytes of an integrated accelerator's shared host pool.
+     *
+     * An integrated GPU (DGX Spark/GB10, APUs) allocates from host DRAM. Its
+     * driver free figure (`cudaMemGetInfo`/`hipMemGetInfo`) tracks `MemFree`
+     * and excludes reclaimable page cache, which on a host that just read a
+     * model file is routinely tens of GiB (NVIDIA DGX Spark porting guide,
+     * "Memory reporting on UMA systems"). The pool's CPU member is already
+     * admitted from the canonical host observation, so the accelerator member
+     * must read that same observation: both describe one physical pool and
+     * must never disagree about its free bytes.
+     *
+     * @param pool Canonical host observation of the accelerator's memory node
+     *        (its NUMA node, or the system view when the node is unknown).
+     * @param device_total_bytes Driver-reported accelerator total; an
+     *        accelerator can never allocate beyond its own addressable total.
+     * @return `min(pool.admission_available_bytes, device_total_bytes)`.
+     * @throws std::runtime_error When the pool observation is invalid: an
+     *         unobservable pool cannot be replaced by an invented figure.
+     */
+    [[nodiscard]] std::size_t integratedAcceleratorPoolAvailableBytes(
+        const HostMemoryCapacityObservation &pool, std::size_t device_total_bytes);
+
+    /**
+     * @brief Observe the host pool that backs an integrated accelerator.
+     * @param numa_node Accelerator memory node, or a negative value when unknown.
+     * @return The node observation when the node is known and observable,
+     *         otherwise the machine-wide `/proc/meminfo` observation.
+     */
+    [[nodiscard]] HostMemoryCapacityObservation observeIntegratedAcceleratorPool(int numa_node);
 } // namespace llaminar2

@@ -196,6 +196,8 @@ namespace llaminar2
     {
         if(name=="F32")return TensorType::FP32;
         if(name=="F16")return TensorType::FP16;
+        // GGUF spelling of integer tables (DeepSeek-V4 token-id hash routing).
+        if(name=="I32")return TensorType::INT32;
         for(int value=0;value<=static_cast<int>(TensorType::MXFP4);++value)
             if(name==tensorTypeName(static_cast<TensorType>(value)))return static_cast<TensorType>(value);
         return std::nullopt;

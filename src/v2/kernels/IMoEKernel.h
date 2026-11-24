@@ -21,6 +21,8 @@
 
 #pragma once
 
+#include "kernels/common/ExpertSwiGLUActivationPolicy.h"
+
 #include "../execution/config/RoutedExpertPolicy.h"
 #include "../execution/moe/MoEOverlayActivationPacketABI.h"
 #include "../execution/moe/MoEOverlayNodeLocalRouteExchangeABI.h"
@@ -40,6 +42,7 @@
 #include <cstdint>
 #include <stdexcept>
 #include <memory>
+#include <stdexcept>
 #include <vector>
 
 namespace llaminar2
@@ -311,6 +314,48 @@ namespace llaminar2
     };
 
     /**
+     * @brief Router scoring function and expert-selection policy.
+     *
+     * Softmax is the ordinary Qwen router (softmax probabilities, top-k by
+     * logit, optional renormalization). SqrtSoftplus is DeepSeek-V4: scores
+     * s = sqrt(softplus(logit)); experts are selected by the top-k of
+     * s + selection_bias (ascending expert id on ties), or by hash_table[token]
+     * for hash-routed layers; weights are the unbiased s of the selected
+     * experts, normalized to sum 1 and multiplied by route_scale.
+     *
+     * Pointers are stable graph-construction addresses in the routing
+     * device's address space (host for CPU, device for GPU); the policy is
+     * fixed for the lifetime of the routed pipeline kernel that stores it.
+     */
+    struct MoERouterScoringPolicy
+    {
+        enum class Function : uint8_t { Softmax, SqrtSoftplus };
+        Function function = Function::Softmax;
+        const float *selection_bias = nullptr;   ///< [num_experts] FP32 (SqrtSoftplus score routing).
+        float route_scale = 1.0f;                ///< Multiplier after normalization.
+        const int32_t *hash_table = nullptr;     ///< [vocab, top_k] INT32 (hash routing) or null.
+        int hash_vocab = 0;                      ///< Rows of @c hash_table.
+        const int32_t *token_ids = nullptr;      ///< [rows] routed token ids (hash routing, image sentinels).
+        /**
+         * DeepSeek-V4 vision: rows whose token is one of the @c image_sentinel_count
+         * ids starting at @c image_sentinel_base select by s + @c image_bias on every
+         * layer (hash layers included); weights stay the unbiased s. Null disables.
+         */
+        const float *image_bias = nullptr;       ///< [num_experts] exp_probs_b_vl.
+        int32_t image_sentinel_base = 0;
+        int32_t image_sentinel_count = 0;
+
+        /** @return Whether @p token routes with the image bias. */
+        [[nodiscard]] bool isImageToken(int32_t token) const noexcept
+        {
+            return image_bias && token >= image_sentinel_base && token < image_sentinel_base + image_sentinel_count;
+        }
+
+        /** @return Whether this is the ordinary softmax router. */
+        [[nodiscard]] bool isSoftmax() const noexcept { return function == Function::Softmax; }
+    };
+
+    /**
      * @brief Device-agnostic MoE kernel interface
      *
      * Encapsulates all non-GEMM MoE operations. GEMM (gate/up/down projections)
@@ -325,6 +370,45 @@ namespace llaminar2
     class IMoEKernel : public ITensorKernel
     {
     public:
+        /**
+         * @brief Install this routed pipeline's router scoring policy before any launch.
+         * @throws std::invalid_argument when the backend does not implement @p policy.
+         */
+        virtual void setRouterScoringPolicy(const MoERouterScoringPolicy &policy)
+        {
+            if (!policy.isSoftmax())
+                throw std::invalid_argument("MoE router scoring policy is not implemented by this backend");
+        }
+        /** @brief Routed-expert and shared-expert SwiGLU clamp (0 = unclamped). */
+        virtual void setExpertSwiGLUActivationPolicy(ExpertSwiGLUActivationPolicy policy)
+        {
+            if (policy.clampsOperands())
+                throw std::invalid_argument("MoE SwiGLU clamp is not implemented by this backend");
+        }
+
+        /**
+         * @brief Clamp materialized FP32 gate/up projections in place (DeepSeek-V4).
+         *
+         * Used where a backend-independent fused SwiGLU/down GEMM consumes
+         * already materialized gate/up rows: clamping the operands first
+         * (`gate = min(gate, limit)`, `up = clamp(up, -limit, limit)`) yields
+         * exactly the clamped SwiGLU without changing the GEMM's arithmetic.
+         * The launch is ordered on this kernel's bound stream.
+         *
+         * @param gate Contiguous FP32 gate rows on this kernel's device.
+         * @param up Contiguous FP32 up rows on this kernel's device.
+         * @param count Elements to clamp from the start of both tensors.
+         * @param limit Positive clamp; <= 0 is a no-op that launches nothing.
+         * @return false on invalid bindings or launch failure.
+         */
+        virtual bool clampSwiGLUOperands(ITensor *gate, ITensor *up, int count, float limit)
+        {
+            (void)gate; (void)up; (void)count;
+            if (limit > 0.0f)
+                throw std::invalid_argument("MoE SwiGLU operand clamp is not implemented by this backend");
+            return true;
+        }
+
         ~IMoEKernel() override = default;
 
         // =================================================================

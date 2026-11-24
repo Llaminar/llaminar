@@ -20,6 +20,8 @@
 
 #pragma once
 
+#include "../models/AttentionStateOwner.h"
+
 #include "OrchestrationConfig.h"
 #include "TensorParallelConfig.h"
 #include "planning/TensorParallelSourceDeclaration.h"
@@ -150,6 +152,7 @@ namespace llaminar2
             // =====================================================================
 
             validateCPULayers(config, model, result);
+            validateDeepSeekV4Capabilities(config, model, result);
 
             // Overlay normalization retires simple selectors after installing
             // its named domain. A scalar selector therefore does not mean the
@@ -208,6 +211,35 @@ namespace llaminar2
         }
 
     private:
+        /**
+         * @brief Reject runtime features the DeepSeek-V4 graph does not implement yet.
+         *
+         * Model-owned attention banks (AttentionStateOwner::ModelBanks: the
+         * DeepSeek-V4 raw window, compressor state and compressed/indexer
+         * pools) are neither archived nor restored by the prefix cache, so a
+         * prefix hit would resume over another request's state. MTP/DSpark
+         * and dense TP/PP have no DeepSeek-V4 graph either. Multi-device
+         * placement uses ExpertOverlay (`--expert-tier`), which is supported.
+         */
+        static void validateDeepSeekV4Capabilities(
+            const OrchestrationConfig &config,
+            const IModelContext &model,
+            TPPPValidationResult &result)
+        {
+            if (attentionStateOwnerOf(model.architecture()) == AttentionStateOwner::ModelBanks &&
+                config.prefix_cache.enabled &&
+                config.prefix_cache.storage_mode != PrefixCacheStorageMode::Disabled)
+                result.addError("DeepSeek V4: prefix cache unimplemented (model-owned attention banks are "
+                                "not archived); pass --no-prefix-cache");
+            if (model.architecture() != "deepseek4")
+                return;
+            if (config.mtp.enabled)
+                result.addError("DeepSeek V4: MTP/DSpark speculative decoding unimplemented; omit --mtp");
+            if (config.tp_degree > 1 || config.pp_degree > 1)
+                result.addError("DeepSeek V4: dense tensor/pipeline parallelism unimplemented; "
+                                "place experts across devices with --expert-tier");
+        }
+
         /**
          * @brief Validate the exact assignment production LocalTP will consume.
          *

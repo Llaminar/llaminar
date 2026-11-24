@@ -322,14 +322,14 @@ bool PipelineDeviceGeneration::prepareSpeculativeParticipants(int depth,
             fragments.push_back({"pipeline grouped verifier", forward->capture});
             fragments.push_back({"pipeline accepted-state publication", publication->capture});
         }
-        if (const auto *maintenance = nativeStageMaintenance(index))
-            fragments.push_back({"original follower cadence and maintenance", maintenance});
+        if (const auto cadence = nativeStageMaintenance(index))
+            fragments.insert(fragments.end(), cadence->fragments().begin(), cadence->fragments().end());
         const auto generation = stage.workspaceGeneration(stage.state_.device_id);
         if (loop.valid && loop.workspace_generation == generation &&
             loop.pipeline_verifier_identity == program_signature &&
             std::equal(loop.source_fragments.begin(), loop.source_fragments.end(),
                 fragments.begin(), fragments.end(),
-                [](const auto &left, const auto &right) { return left.capture == right.capture; }))
+                [](const auto &left, const auto &right) { return left.hasSameExecutionIdentity(right); }))
         {
             PerfStatsCollector::addCounter("generation", "pipeline_mtp_follower_graph_reuses", 1.0,
                 "graph_setup", stage.state_.device_id.toString());

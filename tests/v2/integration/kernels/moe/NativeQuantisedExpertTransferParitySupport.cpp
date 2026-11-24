@@ -51,7 +51,7 @@ namespace llaminar2::test::native_quantised_transfer_parity_detail
     void expectCPUExpertPacketParity(
         const std::array<ITensorGemm *, 3> &engines,
         const float *hidden, const float *expected,
-        int rows, int d_model, int intermediate)
+        int rows, int d_model, int intermediate, ExpertSwiGLUActivationPolicy activation)
     {
         constexpr int routes = 8;
         const auto count = static_cast<size_t>(rows);
@@ -106,6 +106,7 @@ namespace llaminar2::test::native_quantised_transfer_parity_detail
         params.top_k = routes;
         params.d_model = d_model;
         params.expert_intermediate = intermediate;
+        params.swiglu_activation = activation;
         params.layer_idx = 0;
         params.expert_mask.assign(routes, true);
         params.prepared_gate_gemm.assign(routes, engines[0]);
@@ -216,20 +217,23 @@ namespace llaminar2::test::native_quantised_transfer_parity_detail
         for (size_t i = 0; i < roles.size(); ++i)
         {
             const auto &descriptor = descriptors[i];
+            const auto physical = canonicalDeviceVnniFormat(*source_format);
+            const auto packed = makeGpuExpertPackedDescriptor(descriptor,
+                physical.payload_bytes_per_block, physical.is_asymmetric, physical.has_emins);
             const auto layout = makeGpuToCpuExpertTierWeightStreamManifest(
-                *source_format, descriptor.n, descriptor.k,
+                *source_format, packed,
                 /*residency_epoch=*/1, /*layer_idx=*/0, /*expert_id=*/0,
                 roles[i], /*maximum_units_per_chunk=*/16).deviceLayout();
-            const size_t blocks = static_cast<size_t>(layout.N) * layout.blocks_per_row;
             const ExpertTierGpuConstProjectionView source{
                 .payload = descriptor.payload,
                 .scales = static_cast<const uint16_t *>(descriptor.scales),
                 .mins = static_cast<const uint16_t *>(descriptor.mins),
                 .emins = static_cast<const uint32_t *>(descriptor.emins),
-                .payload_bytes = blocks * layout.gpu_payload_bytes_per_block,
-                .scales_bytes = nativeQuantisedScalePlaneLiveBytes(layout.gpu_codebook_id, blocks),
-                .mins_bytes = layout.gpu_is_asymmetric ? blocks * sizeof(uint16_t) : 0u,
-                .emins_bytes = layout.gpu_has_emins ? blocks * sizeof(uint32_t) : 0u,
+                .payload_bytes = packed.vnni_bytes,
+                .scales_bytes = packed.scales_bytes,
+                .mins_bytes = packed.mins_bytes,
+                .emins_bytes = packed.emins_bytes,
+                .metadata_layout = packed.metadata_layout,
             };
             auto &transfer = TransferEngine::instance();
             ExpertTierWeightTransferLane lane({

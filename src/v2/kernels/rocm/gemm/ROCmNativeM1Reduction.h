@@ -23,6 +23,7 @@
 #include <cstdio>
 #include "kernels/common/NativeQuantisedGroupedDecodePolicy.h"
 #include "kernels/common/HCDownOutputPublicationArgs.h"
+#include "kernels/rocm/gemm/ROCmNativeQuantisedBlockMetadata.h"
 
 namespace llaminar2::rocm
 {
@@ -120,9 +121,8 @@ private:
  * @param ticket Unissued ticket receiving only successful native producer publication.
  * @param A Existing original quantized activation.
  * @param payload Existing native prepared payload.
- * @param scales Existing native primary scales.
- * @param mins Existing optional source-owned secondary metadata.
- * @param emins Existing optional source-owned extended metadata.
+ * @param meta Block metadata planes and layout (per-block planes or
+ *        superblock-coded codes plus superblock words).
  * @param output Original output owner; KB1 publishes directly.
  * @param scale_a Original optional per-row scale.
  * @param partials Distinct admitted persistent partial slot, never shared by pending producers.
@@ -136,7 +136,7 @@ private:
  * @return Whether original submission succeeded; failure never retries another route.
  */
 bool enqueueNativeM1Producer(NativeM1ReductionTicket &ticket,const std::int8_t *A,
-    const std::uint8_t *payload,const void *scales,const void *mins,const void *emins,
+    const std::uint8_t *payload,const rocm_native_metadata::MetadataPlanes meta,
     float *output,const float *scale_a,float *partials,int n,int k,
     std::uint8_t execution,std::uint8_t policy,int device,void *stream,const float *block_scales);
 /**

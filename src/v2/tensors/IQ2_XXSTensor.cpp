@@ -517,6 +517,13 @@ namespace llaminar2
         const int nibble = static_cast<int>(aux32[1] >> 28);
 
         std::memcpy(vnniPayloadDst(ctx, linear), payload_buf, 8);
+        if (vnniCoded(ctx))
+        {
+            native_quantised_superblock::embedCodeInPayload<15>(vnniPayloadDst(ctx, linear),
+                                                                 static_cast<uint32_t>(nibble));
+            vnniStoreCoded(ctx, linear, destination_n, b, static_cast<uint32_t>(nibble), blk->d);
+            return;
+        }
         ctx.scales_array[linear] = fp32_to_fp16(d_val * (0.5f + static_cast<float>(nibble)) * 0.25f);
     }
 

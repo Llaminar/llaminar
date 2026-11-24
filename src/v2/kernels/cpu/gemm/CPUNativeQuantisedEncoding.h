@@ -43,19 +43,17 @@ namespace llaminar2::cpu::native_quantised
      *        rotated values are requantized to the expanded INT8 encoding.
      * @return Physical encoding consumed by CPU GEMV/GEMM kernels.
      */
-    [[nodiscard]] inline CPUNativeQuantisedEncoding preparedEncodingForCodebook(
+    [[nodiscard]] inline constexpr CPUNativeQuantisedEncoding preparedEncodingForCodebook(
         uint8_t codebook_id,
         bool rotation_enabled = false) noexcept
     {
         if (rotation_enabled)
             return CPUNativeQuantisedEncoding::ExpandedInt8;
-        if (codebook_id == 11)
-            return CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale;
         if (is_nibble_lut_format(codebook_id))
             return CPUNativeQuantisedEncoding::NibbleLUT;
         if (codebook_id == 8)
             return CPUNativeQuantisedEncoding::Q6KNativeDualScale;
-        if (hasCompactMultiScaleVnniPayload(codebook_id))
+        if (codebook_id == 11 || hasCompactMultiScaleVnniPayload(codebook_id))
             return CPUNativeQuantisedEncoding::CompactMultiScale;
         return CPUNativeQuantisedEncoding::ExpandedInt8;
     }
@@ -65,12 +63,24 @@ namespace llaminar2::cpu::native_quantised
      * @param rotation_enabled Explicit separately selected rotated INT8 policy.
      * @return Lossless ordinary encoding or the unchanged explicit rotation encoding.
      */
-    [[nodiscard]] inline CPUNativeQuantisedEncoding preparedEncodingForSource(
+    [[nodiscard]] inline constexpr CPUNativeQuantisedEncoding preparedEncodingForSource(
         const NativeQuantisedFormatInfo &source, bool rotation_enabled = false) noexcept
     {
+        if (!rotation_enabled && source.codebook_id == 5 && source.is_superblock)
+            return CPUNativeQuantisedEncoding::Q4KSuperblockCoded;
+        if (!rotation_enabled && isQ5NativeSingleScaleSource(source.codebook_id, source.is_superblock))
+            return CPUNativeQuantisedEncoding::Q5NativeSingleScale;
         if (!rotation_enabled && source.codebook_id == 4 && source.is_superblock)
             return CPUNativeQuantisedEncoding::NibbleLUTSourceScale;
+        if (!rotation_enabled && source.codebook_id == 7 && source.is_superblock)
+            return CPUNativeQuantisedEncoding::CompactMultiScale;
         return preparedEncodingForCodebook(source.codebook_id, rotation_enabled);
+    }
+
+    /** @return Whether migration must preserve this source's codes and superblock words, not staged products. */
+    [[nodiscard]] inline constexpr bool migrationUsesSuperblockCodes(const NativeQuantisedFormatInfo &source) noexcept
+    {
+        return preparedSuperblockCoded(preparedEncodingForSource(source));
     }
 
     /**
@@ -93,7 +103,9 @@ namespace llaminar2::cpu::native_quantised
             .is_asymmetric = prepared_is_asymmetric,
             .weight_bytes_per_n_chunk_k_block =
                 static_cast<std::uint64_t>(preparedInterleavedBlockStride(
-                    encoding, prepared_is_asymmetric)),
+                    encoding, prepared_is_asymmetric, codebook_id)) +
+                (encoding == CPUNativeQuantisedEncoding::Q6KNativeDualScale
+                    ? preparedSuperblockHeaderBytes(encoding, codebook_id) / 8u : 0u),
             .activation_bytes_per_row_k_block = sizeof(Q8_1Block),
             .output_bytes_per_row_n_chunk = 64u * sizeof(float),
         };
@@ -109,7 +121,13 @@ namespace llaminar2::cpu::native_quantised
     {
         auto result = preparedFootprintForFormat(source.codebook_id, source.is_asymmetric, rotation_enabled);
         result.encoding = preparedEncodingForSource(source, rotation_enabled);
-        result.weight_bytes_per_n_chunk_k_block = preparedInterleavedBlockStride(result.encoding, result.is_asymmetric);
+        result.weight_bytes_per_n_chunk_k_block = preparedInterleavedBlockStride(result.encoding, result.is_asymmetric, source.codebook_id);
+        if (result.encoding == CPUNativeQuantisedEncoding::Q4KSuperblockCoded ||
+            result.encoding == CPUNativeQuantisedEncoding::Q6KNativeDualScale ||
+            result.encoding == CPUNativeQuantisedEncoding::NibbleLUTSourceScale ||
+            (result.encoding == CPUNativeQuantisedEncoding::CompactMultiScale &&
+             (source.codebook_id == 7 || source.codebook_id == 11)))
+            result.weight_bytes_per_n_chunk_k_block += preparedSuperblockHeaderBytes(result.encoding, source.codebook_id) / 8u;
         return result;
     }
 

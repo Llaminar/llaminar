@@ -98,8 +98,9 @@ namespace llaminar2
     [[nodiscard]] inline constexpr bool hasCompactMultiScaleVnniPayload(
         uint8_t codebook) noexcept
     {
-        return codebook == 9 || codebook == 10 || codebook == 13 ||
-               codebook == 14 || codebook == 17;
+        return codebook == 9 || codebook == 10 || codebook == 12 ||
+               codebook == 13 || codebook == 14 || codebook == 15 ||
+               codebook == 16 || codebook == 17;
     }
 
     /**
@@ -440,19 +441,23 @@ namespace llaminar2
     {
         if (source.codebook_id == 0 || source.codebook_id == 4 ||
             source.codebook_id == 5 || source.codebook_id == 11 ||
-            source.codebook_id == kNativeQuantisedMXFP4Codebook)
+            source.codebook_id == kNativeQuantisedMXFP4Codebook ||
+            (!source.is_superblock && (source.codebook_id == 6 || source.codebook_id == 7)))
         {
-            // Nibble payloads, including MXFP4 codes with their exact FP16
-            // scale, survive a CPU-tier round trip unchanged.
+            // Nibbles and native Q5 retain their original payload and scale,
+            // including MXFP4 exponent bytes.
             return canonicalDeviceVnniFormat(source);
         }
         if (source.codebook_id == 8 ||
             hasCompactMultiScaleVnniPayload(source.codebook_id))
         {
+            // Dual-scale/minimum sources keep their secondary plane; the
+            // single-scale IQ3_XXS/IQ2_XXS units carry none, exactly as their
+            // canonical representation and descriptor validation require.
             return {
                 .codebook_id = source.codebook_id,
                 .payload_bytes_per_block = static_cast<uint8_t>(source.payload_bytes),
-                .is_asymmetric = true,
+                .is_asymmetric = source.is_asymmetric,
                 .has_emins = source.has_emins,
             };
         }

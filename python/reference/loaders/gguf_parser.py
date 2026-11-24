@@ -68,8 +68,14 @@ class GGUFTensorType(IntEnum):
     IQ3_S = 21
     IQ2_S = 22
     IQ4_XS = 23
+    I8 = 24
+    I16 = 25
+    I32 = 26
+    I64 = 27
+    F64 = 28
     IQ1_M = 29
     BF16 = 30
+    MXFP4 = 39
 
 
 class GGUFTensorInfo:
@@ -512,8 +518,15 @@ class GGUFParser:
             return n_elements * 4
         elif tensor_type in (GGUFTensorType.F16, GGUFTensorType.BF16):
             return n_elements * 2
+        elif tensor_type in (GGUFTensorType.I32,):
+            return n_elements * 4
+        elif tensor_type == GGUFTensorType.MXFP4:
+            # MXFP4: 32 elements per block, 17 bytes (1 E8M0 scale + 16 nibble bytes)
+            block_size = 32
+            n_blocks = (n_elements + block_size - 1) // block_size
+            return n_blocks * 17
         elif tensor_type in (GGUFTensorType.Q4_0, GGUFTensorType.IQ4_NL):
-            # Both native formats store32 elements in18 bytes; arithmetic differs.
+            # Both native formats store 32 elements in 18 bytes; arithmetic differs.
             block_size = 32
             n_blocks = (n_elements + block_size - 1) // block_size
             return n_blocks * 18

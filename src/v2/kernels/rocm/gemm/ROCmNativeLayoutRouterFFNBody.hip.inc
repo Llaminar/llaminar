@@ -103,6 +103,7 @@ __device__ __forceinline__ PhaseProjection phaseProjection(const DeviceNativeQua
         result.payload=descriptor->payload;result.scales=static_cast<const uint16_t*>(descriptor->scales);
         result.mins=static_cast<const uint16_t*>(descriptor->mins);result.emins=static_cast<const uint32_t*>(descriptor->emins);
         result.codebook=descriptor->codebook_id;
+        result.metadata_layout=descriptor->metadata_layout;
         // Keep policy failure fatal before this independent numeric-zero decision.
         result.numeric_validity=PhaseProjectionValidation::classify(*descriptor,columns,reduction);
     }
@@ -130,6 +131,7 @@ __device__ __forceinline__ PhaseProjection phaseProjection(
     result.payload=descriptor.payload;result.scales=static_cast<const uint16_t*>(descriptor.scales);
     result.mins=static_cast<const uint16_t*>(descriptor.mins);result.emins=static_cast<const uint32_t*>(descriptor.emins);
     result.codebook=descriptor.codebook_id;result.ready=true;
+    result.metadata_layout=descriptor.metadata_layout;
     result.numeric_validity=PhaseProjectionValidation::State::Valid;
     return result;
 }
@@ -137,11 +139,13 @@ __device__ __forceinline__ PhaseProjection phaseProjection(
  * @tparam Issue Internal activation issue contract, defaulting to down words-only preload.
  * @tparam Mask Admitted immutable physical decoder envelope.
  * @tparam Reader Default original generic loads or an explicitly proven weight-only reader.
+ * @tparam SplitRepresentation Select the role metadata representation once per
+ *         partition (two loops) instead of a uniform per-block branch.
  * @tparam Binding Existing native LDS or generic metadata reference; never copied.
  * @tparam Grid Original device table or exact published lookup view.
  * @param grid Immutable lookup bytes retained for the original role consumer. */
 template<uint32_t Mask,ActivationIssue Issue=ActivationIssue::DownWordsPreload,
-    class Reader=NativeLayoutWeightReader,class Binding,class Grid=NativeQuantisedGridLookup>
+    class Reader=NativeLayoutWeightReader,bool SplitRepresentation=false,class Binding,class Grid=NativeQuantisedGridLookup>
 __device__ __forceinline__ float phasePartial(const Binding& p,unsigned n,const int8_t* code,const float* scale,
     const int32_t* sums,unsigned N,unsigned K,unsigned part,Grid grid={})
 {
@@ -149,7 +153,7 @@ __device__ __forceinline__ float phasePartial(const Binding& p,unsigned n,const 
     // physical wave. Preserve that authority at the dispatcher as well as
     // within each decoder; column and partition eligibility remain lane-local.
     if(!waveMetadataValue(p.ready)||n>=N||part>=waveMetadataValue(p.parts))return 0.f;
-#define LAYOUT_CASE(F) case F:if constexpr(Mask&(1u<<unsigned(F)))return phaseRolePartial<F,Issue,Reader>(p,n,code,scale,sums,N,K,part,grid);else break;
+#define LAYOUT_CASE(F) case F:if constexpr(Mask&(1u<<unsigned(F)))return phaseRolePartial<F,Issue,Reader,SplitRepresentation>(p,n,code,scale,sums,N,K,part,grid);else break;
     switch(waveMetadataValue(p.codebook))
     {
     LAYOUT_CASE(NATIVE_QUANTISED_Q4_0) LAYOUT_CASE(NATIVE_QUANTISED_IQ4_NL)
@@ -392,7 +396,7 @@ __device__ __forceinline__ void gateUpWavePhase(unsigned width,unsigned hidden,u
     const DeviceNativeQuantisedMatrixDesc* gates,const DeviceNativeQuantisedMatrixDesc* ups,const int* route_ids,
     const router_native::RuntimeDecodeExecutionBankStorage<DeviceMoELayerRuntimeView>* bank_storage,
     const int8_t* codes,const float* scales,const int32_t* sums,float* activated,size_t output_base,
-    float* gate_output,float* up_output,PhaseProjection* bindings)
+    float* gate_output,float* up_output,PhaseProjection* bindings,float swiglu_limit)
 {
     using Tasks=NativeLayoutGateUpGeometry;
     const auto resolved=NativeLayoutDownWaveGeometry::resolve(maximum);
@@ -453,7 +457,7 @@ __device__ __forceinline__ void gateUpWavePhase(unsigned width,unsigned hidden,u
             value.mins=record.mins;value.emins=record.emins;
             value.parts=record.parts;value.partition_blocks=record.partition_blocks;
             value.codebook=record.codebook;value.ready=record.ready;
-            value.numeric_validity=record.numeric_validity;
+            value.numeric_validity=record.numeric_validity;value.metadata_layout=record.metadata_layout;
         }
     }
     workgroupJoin<WorkgroupJoinMemory::LDSOnly>();
@@ -483,7 +487,7 @@ __device__ __forceinline__ void gateUpWavePhase(unsigned width,unsigned hidden,u
         {
             if constexpr(Shared){gate_output[n]=g;up_output[n]=u;}
             activated[output_base+(Shared?0:size_t(item.route)*width)+n]=
-                waveMetadataValue(gate.ready)&&waveMetadataValue(up.ready)?decode_equivalent::swigluValue(g,u):0.f;
+                waveMetadataValue(gate.ready)&&waveMetadataValue(up.ready)?decode_equivalent::swigluValue(g,u,swiglu_limit):0.f;
         }
     }
 }
@@ -560,7 +564,7 @@ __device__ __forceinline__ void publishDownPhase(unsigned hidden,unsigned routed
             value.payload=record.payload;value.scales=record.scales;value.mins=record.mins;value.emins=record.emins;
             value.parts=record.parts;value.partition_blocks=record.partition_blocks;
             value.codebook=record.codebook;value.ready=record.ready;
-            value.numeric_validity=record.numeric_validity;
+            value.numeric_validity=record.numeric_validity;value.metadata_layout=record.metadata_layout;
             if(!is_shared)
             {
                 auto* publication_weights=currentFormatAddress((CurrentFormatLDSValue<float>*)route_weights);
@@ -906,7 +910,7 @@ __device__ __forceinline__ void nativeLayoutRouterFFNPhase(const NativeLayoutRou
     // only this role's scalar/pointer values; no enclosing args record escapes.
     gateUpWavePhase<true,Mask>(S,H,T,a.experts,live,max_parts,
         LLAMINAR_PHASE_FFN_FIELD(shared_gate),LLAMINAR_PHASE_FFN_FIELD(shared_up),nullptr,nullptr,code,scale,sum,LLAMINAR_PHASE_FFN_FIELD(gate_partials),size_t(T)*F,
-        LLAMINAR_PHASE_FFN_FIELD(shared_gate_output),LLAMINAR_PHASE_FFN_FIELD(shared_up_output),gate_binding);
+        LLAMINAR_PHASE_FFN_FIELD(shared_gate_output),LLAMINAR_PHASE_FFN_FIELD(shared_up_output),gate_binding,a.shared_swiglu_limit);
     grid.sync();
     // Only one global scalar load per CTA; the canonical selector's first
     // existing CTA barrier publishes this LDS value to every eventual consumer.
@@ -921,7 +925,7 @@ __device__ __forceinline__ void nativeLayoutRouterFFNPhase(const NativeLayoutRou
             a.rows.countOwner(),args.router_publication);
     gateUpWavePhase<false,Mask>(F,H,T,a.experts,live,max_parts,
         a.gates,a.ups,selection.selected_ids,&gate_state.bank,code,scale,sum,
-        LLAMINAR_PHASE_FFN_FIELD(gate_partials),0,nullptr,nullptr,gate_binding);
+        LLAMINAR_PHASE_FFN_FIELD(gate_partials),0,nullptr,nullptr,gate_binding,a.routed_swiglu_limit);
     grid.sync();
     // Every CTA has finished reading raw logits. Only now may the original
     // public probability array be overwritten; down never consumes it.

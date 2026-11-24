@@ -22,6 +22,8 @@
  */
 
 #pragma once
+
+#include "kernels/common/ExpertSwiGLUActivationPolicy.h"
 #include "../../../loaders/ExpertGemmRegistry.h"
 
 #include "../IComputeStage.h"
@@ -605,6 +607,8 @@ namespace llaminar2
             int top_k = 0;
             int d_model = 0;
             int expert_intermediate = 0;
+            /// DeepSeek-V4 routed SwiGLU operand clamp forwarded to the compute stage; 0 = none.
+            ExpertSwiGLUActivationPolicy swiglu_activation;
             int layer_idx = -1;
             std::vector<bool> expert_mask;
 

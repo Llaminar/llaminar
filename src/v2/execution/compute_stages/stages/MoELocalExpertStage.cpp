@@ -1394,6 +1394,7 @@ namespace llaminar2
         compute_params.up_exps = registry_only ? nullptr : params_.up_exps;
         compute_params.down_exps = registry_only ? nullptr : params_.down_exps;
         compute_params.expert_intermediate = params_.expert_intermediate;
+        compute_params.swiglu_activation = params_.swiglu_activation;
         compute_params.layer_idx = params_.layer_idx;
         compute_params.cpu_joint_layer=params_.cpu_joint_layer;
         compute_params.expert_mask = invocation_expert_mask_;
@@ -1580,6 +1581,7 @@ namespace llaminar2
             compute_params.up_exps = params_.up_exps;
             compute_params.down_exps = params_.down_exps;
             compute_params.expert_intermediate = params_.expert_intermediate;
+        compute_params.swiglu_activation = params_.swiglu_activation;
             compute_params.layer_idx = params_.layer_idx;
             compute_params.expert_mask = invocation_expert_mask_;
             compute_params.routing_indices =
@@ -3596,6 +3598,7 @@ namespace llaminar2
             compute_params.up_exps = params_.up_exps;
             compute_params.down_exps = params_.down_exps;
             compute_params.expert_intermediate = params_.expert_intermediate;
+        compute_params.swiglu_activation = params_.swiglu_activation;
             compute_params.layer_idx = params_.layer_idx;
             compute_params.expert_mask = invocation_expert_mask_;
             compute_params.routing_indices = compact_routing_indices_.get();
@@ -4824,7 +4827,9 @@ namespace llaminar2
                 params_.d_model,
                 params_.expert_intermediate,
                 params_.num_experts,
-                /*top_k=*/1));
+                /*top_k=*/1,
+                // The routing stage alone owns the router gate cache.
+                MoEWorkspaceBuffers::CUDARouterGateCache::None));
         }
         else if (params_.device_id.is_rocm())
         {

@@ -71,6 +71,12 @@ namespace llaminar2
     class ROCmMoEKernel : public IMoEKernel, public ROCmKernelBase, public IResidentMoEFFNPreparation
     {
     public:
+        void setExpertSwiGLUActivationPolicy(ExpertSwiGLUActivationPolicy policy) override
+        {
+            swiglu_limit_ = policy.operandLimit();
+        }
+        bool clampSwiGLUOperands(ITensor *gate, ITensor *up, int count, float limit) override;
+
         /** @copydoc IResidentMoEFFNPreparation::prepareResidentMoEFFN */
         std::unique_ptr<PreparedResidentMoEFFN> prepareResidentMoEFFN(
             const ResidentMoEFFNRequest& request,void* stream) override;
@@ -1213,6 +1219,7 @@ namespace llaminar2
         void clearGPUStreamBinding() override;
 
     private:
+        float swiglu_limit_ = 0.0f;
         /**
          * @brief Shared fused decode implementation after route metadata is resolved.
          *

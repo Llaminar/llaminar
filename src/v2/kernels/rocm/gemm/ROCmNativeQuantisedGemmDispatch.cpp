@@ -172,9 +172,7 @@ bool llaminar2::rocm::inspectVNNIPrefillLaunch(
 extern "C" bool rocmGemm_native_quantised_fp32_with_policy(
     const int8_t *d_A_int8,
     const uint8_t *d_payload,
-    const void *d_block_scales,
-    const void *d_block_mins,
-    const void *d_block_emins,
+    const ::llaminar2::rocm_native_metadata::MetadataPlanes d_meta,
     float *d_output,
     const float *d_scales_A,
     const float *d_scales_A_blockwise,
@@ -202,9 +200,7 @@ extern "C" bool rocmGemm_native_quantised_fp32_with_policy(
     const bool launched = shard(
         d_A_int8,
         d_payload,
-        d_block_scales,
-        d_block_mins,
-        d_block_emins,
+        d_meta,
         d_output,
         d_scales_A,
         d_scales_A_blockwise,
@@ -252,9 +248,7 @@ extern "C" bool rocmGemm_native_quantised_fp32_with_policy(
 extern "C" bool rocmGemm_native_quantised_fp32(
     const int8_t *d_A_int8,
     const uint8_t *d_payload,
-    const void *d_block_scales,
-    const void *d_block_mins,
-    const void *d_block_emins,
+    const ::llaminar2::rocm_native_metadata::MetadataPlanes d_meta,
     float *d_output,
     const float *d_scales_A,
     const float *d_scales_A_blockwise,
@@ -268,9 +262,7 @@ extern "C" bool rocmGemm_native_quantised_fp32(
     return rocmGemm_native_quantised_fp32_with_policy(
         d_A_int8,
         d_payload,
-        d_block_scales,
-        d_block_mins,
-        d_block_emins,
+        d_meta,
         d_output,
         d_scales_A,
         d_scales_A_blockwise,
@@ -405,6 +397,7 @@ bool matchesVerifierMembers(std::span<const NativeQuantisedVerifierBundleMember>
             if (packet.output[projection] == original.output && packet.payload[projection] == original.weights &&
                 packet.N[projection] == original.n && packet.scales[projection] == original.scales &&
                 packet.mins[projection] == original.mins && packet.emins[projection] == original.emins &&
+                packet.metadata_layout[projection] == original.metadata_layout &&
                 packet.codebook[projection] == canonicalDeviceVnniCodebookId(original.source))
                 match = member;
         }

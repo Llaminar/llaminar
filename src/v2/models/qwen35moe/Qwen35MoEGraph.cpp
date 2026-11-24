@@ -31,6 +31,8 @@
 #include "execution/moe/MoEIntermediateShardRuntimeBinding.h"
 #include "execution/moe/MoEIntermediateShardStaticGraphAdmission.h"
 #include "execution/moe/MoEOverlayActivationBatchInventory.h"
+#include "../deepseek4/DeepSeekV4Config.h"
+#include "../deepseek4/DeepSeekV4ImagePreprocess.h"
 #include "execution/moe/MoEOverlayPreparedGraphBank.h"
 #include "execution/moe/MoEGraphOwnerProjection.h"
 #include "execution/moe/MoECPUExpertWorkspaceSource.h"
@@ -2089,8 +2091,10 @@ namespace llaminar2
                 spec.is_asymmetric = has_mins != 0;
                 spec.has_emins = has_emins != 0;
                 spec.codebook_id = descriptor.codebook_id;
+                spec.scale_plane = nativeQuantisedScalePlaneWidth(descriptor.codebook_id);
                 spec.format =
                     ExpertWeightFormat::nativeQuantised(source_identity);
+                spec.gpu_superblock_phase = nativeQuantisedLayoutPhase(descriptor.metadata_layout);
                 return spec;
             };
 
@@ -4930,7 +4934,7 @@ namespace llaminar2
         publishInitialMoEIntermediateShardRuntimeLayer(*runtime, owners, source, layer_idx, stream);
 
         ComputeGraph graph;
-        std::optional<Qwen4ExpHyperconnectionBuilder::BlockRead> residual_read;
+        std::optional<ResidualBlockRead> residual_read;
         std::string norm;
         if (config_.flash_next)
         {
@@ -4989,6 +4993,8 @@ namespace llaminar2
         graph.addNode(router, ComputeStageFactory::createMoERouting(route), device);
         graph.addDependency(router, norm);
         MoEIntermediateShardPipelineParams local;
+        if (config_.deepseek_v4)
+            local.swiglu_activation = config_.deepseek_v4->layer(layer_idx).routedSwiGLU;
         local.family = declaration->family(); local.runtime = runtime; local.kernel_owner = owner;
         local.rows = rows; local.top_k = config_.moe.top_k; local.phase = phase;
         local.row_mode = grouped ? MoEIntermediateShardRowMode::Grouped : MoEIntermediateShardRowMode::Decode;
@@ -5028,6 +5034,8 @@ namespace llaminar2
         const auto *shared_up = original_shared.optionalLayerForDevice(layer_idx, "ffn_up_shexp.weight", device);
         const auto *shared_down = original_shared.optionalLayerForDevice(layer_idx, "ffn_down_shexp.weight", device);
         SharedExpertFFNStage::Params shared;
+        if (config_.deepseek_v4)
+            shared.swiglu_activation = config_.deepseek_v4->layer(layer_idx).sharedSwiGLU;
         shared.device_id = device; shared.input = buffers.normalized;
         shared.gate_w = legacyTensor(shared_gate);
         shared.up_w = legacyTensor(shared_up);
@@ -5983,15 +5991,7 @@ namespace llaminar2
                         bound_runtime_table_layers, config_.moe.num_experts,
                         bound_runtime_first_layer), DeviceMoEProjectionSet::GateUp);
             }
-            /*
-             * One transfer directory is shared by the complete device-local MoE
-             * domain. Its slots retain arrivals from different layers, so sizing
-             * it from the current layer would either reject a later, wider
-             * codebook or force one full directory allocation per layer. Scan
-             * every compute-ready registry descriptor before any directory is
-             * created and merge those formats into one immutable capacity
-             * profile.
-             */
+            // Every owned runtime layer has exactly one authenticated tuple.
             std::vector<std::vector<DeviceMoETransferSlotDirectory::ProjectionSpec>>
                 layer_formats;
             layer_formats.reserve(
@@ -6059,7 +6059,10 @@ namespace llaminar2
                                 registry_scope + " on " +
                                 device.to_string());
                         }
-                        layer_formats.push_back(std::move(*exact_specs));
+                        if (layer_formats.size() == static_cast<size_t>(scan_layer - bound_runtime_first_layer))
+                            layer_formats.push_back(std::move(*exact_specs));
+                        else if (layer_formats.back() != *exact_specs)
+                            throw std::invalid_argument("Device rebalance requires one movable projection layout per layer");
                         found_complete_expert = true;
                     }
                     return found_complete_expert;
@@ -6628,42 +6631,16 @@ namespace llaminar2
                 return false;
             return graphRebalanceUsesTransferSlots();
         };
-        auto graphRebalanceTransferDirectoryKey =
-            [&](uint32_t transfer_slot_count) -> std::string
+        const auto graphTransferDirectoryCapacity = [&](const DeviceMoERebalanceConfig &rebalance_config)
         {
-            if (!graph_rebalance_transfer_profile.has_value())
-            {
-                throw std::logic_error(
-                    "Qwen35 MoE cannot identify a transfer directory without "
-                    "an expert weight format profile");
-            }
-
-            /*
-             * This key identifies physical storage, not only a logical TP
-             * domain. graphRebalanceDomainKey() already includes the exact
-             * DeviceId and participant. Keeping all remaining allocation
-             * discriminators in this one builder prevents prefill and decode
-             * maintenance from silently inventing different cache identities.
-             */
-            std::ostringstream key;
-            key << graphRebalanceDomainKey()
-                << ":slots=" << transfer_slot_count;
-            for (const auto &spec :
-                 graph_rebalance_transfer_profile->allocation_specs)
-            {
-                key << ':' << spec.label
-                    << '=' << spec.N << 'x' << spec.K
-                    << ":cb" << static_cast<int>(spec.codebook_id)
-                    << ":pb" << spec.payload_bytes_per_block
-                    << ":asym" << (spec.is_asymmetric ? 1 : 0)
-                    << ":emins" << (spec.has_emins ? 1 : 0)
-                    << ":format" << static_cast<int>(spec.format.kind);
-            }
-            key << ":floating_capacity=" << static_cast<int>(
-                graph_rebalance_transfer_profile->floating_allocation_format);
-            key << ":wire="
-                << graph_rebalance_transfer_profile->max_wire_payload_bytes;
-            return key.str();
+            const auto compact_slots = static_cast<uint32_t>(std::max(1,
+                env.moe_rebalance.device_rebalance_compact_payload_slots));
+            const auto minimum = DeviceMoETransferSlotDirectory::runtimeMinimumActiveSlots(
+                local_tp_ctx && isHomogeneousGpuLocalTPRebalanceDomain(*local_tp_ctx, device, config_.tp_device_idx),
+                config_.moe.routed_prefill_assignment_policy, config_.prefix_cache, compact_slots);
+            return DeviceMoETransferSlotDirectory::planRuntimeCapacity(rebalance_config, minimum,
+                static_cast<uint32_t>(std::max(1, env.moe_rebalance.gpu_direct_transfer_wave_experts)),
+                static_cast<uint32_t>(std::max(1, env.moe_rebalance.gpu_direct_transfer_buffers)));
         };
         auto getOrCreateGraphRebalanceTransferDirectory =
             [&](const DeviceMoERebalanceConfig &rebalance_config,
@@ -6681,9 +6658,6 @@ namespace llaminar2
                     "weight format profile");
             }
 
-            const uint32_t transfer_slot_count =
-                transfer_capacity.total_slots;
-
             IBackend *backend = getBackendFor(device);
             const int gpu_ordinal = gpuOrdinalForGraphDevice(device);
             if (!backend || gpu_ordinal < 0)
@@ -6696,8 +6670,7 @@ namespace llaminar2
                              : std::string{}));
             }
 
-            const std::string transfer_key =
-                graphRebalanceTransferDirectoryKey(transfer_slot_count);
+            const std::string transfer_key = graphRebalanceDomainKey();
             auto existing =
                 moe_transfer_slot_directories_.find(transfer_key);
             if (existing == moe_transfer_slot_directories_.end())
@@ -6745,6 +6718,7 @@ namespace llaminar2
                 device,
                 gpu_ordinal,
                 rebalance_config.participant_id);
+            existing->second->requireCaptureIdentity(*graph_rebalance_transfer_profile, transfer_capacity);
             return {transfer_key, existing->second};
         };
         auto ensureGraphRebalanceTransferBindingOnly =
@@ -6810,28 +6784,14 @@ namespace llaminar2
                     (context ? std::string(" (") + context + ")" : std::string{}));
             }
 
-            const uint64_t prefill_llep_slots =
-                prefill_llep_transfer_candidate
-                    ? static_cast<uint64_t>(
-                          std::max(1, env.moe_rebalance.device_rebalance_compact_payload_slots))
-                    : 1ULL;
-            const auto transfer_capacity =
-                DeviceMoETransferSlotDirectory::planRuntimeCapacity(
-                    rebalance_config,
-                    prefill_llep_slots,
-                    static_cast<uint32_t>(
-                        std::max(1, env.moe_rebalance.gpu_direct_transfer_wave_experts)),
-                    static_cast<uint32_t>(
-                        std::max(1, env.moe_rebalance.gpu_direct_transfer_buffers)));
-            rebalance_config.active_transfer_slot_capacity =
-                transfer_capacity.active_slots;
-            rebalance_config.transfer_slot_directory_capacity =
-                transfer_capacity.total_slots;
+            const auto transfer_capacity = graphTransferDirectoryCapacity(rebalance_config);
             auto [transfer_key, transfer_directory] =
-                getOrCreateGraphRebalanceTransferDirectory(
-                    rebalance_config,
-                    transfer_capacity,
-                    context);
+                getOrCreateGraphRebalanceTransferDirectory(rebalance_config, transfer_capacity, context);
+            rebalance_config.active_transfer_slot_capacity = transfer_directory->activeSlotCount();
+            rebalance_config.transfer_slot_directory_capacity = transfer_directory->slotCount();
+            rebalance_config.transfer_slot_layer_ranges = transfer_directory->deviceLayerRanges();
+            rebalance_config.histogram_layout =
+                deviceMoERebalanceHistogramLayout(graph_rebalance_transfer_mode.value());
 
             const std::string rebalance_workspace = graphRebalanceWorkspaceName();
             /*
@@ -6934,6 +6894,8 @@ namespace llaminar2
                 binding->config.active_transfer_slot_capacity;
             invocation_config.transfer_slot_directory_capacity =
                 binding->config.transfer_slot_directory_capacity;
+            invocation_config.transfer_slot_layer_ranges = binding->config.transfer_slot_layer_ranges;
+            invocation_config.histogram_layout = binding->config.histogram_layout;
             if (deviceMoERebalanceModePlansMissingArrivals(
                     binding->transfer_mode))
             {
@@ -7033,19 +6995,13 @@ namespace llaminar2
                 return sidebands;
             }
 
-            const uint32_t window_count =
-                binding.config.layer_window_count == 0u
-                    ? binding.config.num_layers
-                    : std::min(binding.config.layer_window_count,
-                               binding.config.num_layers);
-            const uint32_t wave_count =
-                binding.config.layer_wave_count == 0u
-                    ? window_count
-                    : std::min(binding.config.layer_wave_count, window_count);
-            const size_t local_histogram_entries =
-                static_cast<size_t>(std::max<uint32_t>(1u, wave_count)) *
-                static_cast<size_t>(binding.config.num_experts);
-            if (local_histogram_entries == 0)
+            const auto capacity = DeviceMoERebalanceWorkspaceCapacity::fromRuntime(binding.config,
+                binding.local_transfer_slot_count, binding.collective_payload_slot_capacity,
+                DeviceMoERebalanceStagePhase::CollectState, binding.transfer_mode);
+            if (!capacity.matchesHistogramConfig(binding.config))
+                throw std::logic_error("Qwen35 MoE histogram sideband layout does not match the admitted transport");
+            const size_t local_histogram_words = capacity.localHistogramWords();
+            if (local_histogram_words == 0u)
                 return sidebands;
 
             TPAllreduceSidebandWorkspaceBinding histogram_sideband;
@@ -7058,8 +7014,7 @@ namespace llaminar2
                 MoEDeviceRebalanceStage::workspaceBufferName(
                     MoEDeviceRebalanceStage::WS_GATHERED_HISTOGRAM,
                     binding.workspace_name);
-            static_assert(sizeof(uint64_t) == 2 * sizeof(int32_t));
-            histogram_sideband.element_count = local_histogram_entries * 2u;
+            histogram_sideband.element_count = local_histogram_words;
             histogram_sideband.dtype = CollectiveDataType::INT32;
             histogram_sideband.root_device_index =
                 static_cast<int>(binding.config.root_participant);
@@ -7379,22 +7334,7 @@ namespace llaminar2
                             (context ? std::string(" (") + context + ")" : std::string{}));
                     }
 
-                    const auto transfer_capacity =
-                        DeviceMoETransferSlotDirectory::planRuntimeCapacity(
-                            rebalance_config,
-                            /*minimum_active_slots=*/0u,
-                            static_cast<uint32_t>(
-                                std::max(
-                                    1,
-                                    env.moe_rebalance.gpu_direct_transfer_wave_experts)),
-                            static_cast<uint32_t>(
-                                std::max(
-                                    1,
-                                    env.moe_rebalance.gpu_direct_transfer_buffers)));
-                    rebalance_config.active_transfer_slot_capacity =
-                        transfer_capacity.active_slots;
-                    rebalance_config.transfer_slot_directory_capacity =
-                        transfer_capacity.total_slots;
+                    const auto transfer_capacity = graphTransferDirectoryCapacity(rebalance_config);
                     auto directory_result =
                         getOrCreateGraphRebalanceTransferDirectory(
                             rebalance_config,
@@ -7404,6 +7344,11 @@ namespace llaminar2
                     auto transfer_directory =
                         std::move(directory_result.second);
 
+                    rebalance_config.active_transfer_slot_capacity = transfer_directory->activeSlotCount();
+                    rebalance_config.transfer_slot_directory_capacity = transfer_directory->slotCount();
+                    rebalance_config.transfer_slot_layer_ranges = transfer_directory->deviceLayerRanges();
+                    rebalance_config.histogram_layout =
+                        deviceMoERebalanceHistogramLayout(graph_rebalance_transfer_mode.value());
                     local_transfer_slots = transfer_directory->deviceEntries();
                     local_transfer_slot_count = transfer_directory->slotCount();
                     collective_payload_slot_capacity =
@@ -7616,7 +7561,7 @@ namespace llaminar2
             apply_params.tp_ctx = local_tp_ctx;
             apply_params.moe_runtime_table = moe_runtime_table;
             apply_params.tp_device_idx = config_.tp_device_idx;
-            apply_params.config = rebalance_config;
+            apply_params.config = binding_it->second.config;
             apply_params.local_transfer_slots = apply_transfer_slots;
             apply_params.local_transfer_slot_count = apply_transfer_slot_count;
             apply_params.collective_payload_slot_bytes =
@@ -7650,8 +7595,8 @@ namespace llaminar2
         // =====================================================================
         // Stage 1: Pre-FFN RMSNorm (fused with attention residual add)
         // =====================================================================
-        std::optional<Qwen4ExpHyperconnectionBuilder::BlockRead> residual_read;
-        if (config_.flash_next)
+        std::optional<ResidualBlockRead> residual_read;
+        if (config_.usesResidualTrunk())
         {
             residual_read.emplace(addBranchBlockRead(graph, prefix, buffers,
                 layer_idx, total_tokens, device, ResidualBlock::FeedForward, predictor));
@@ -7771,6 +7716,44 @@ namespace llaminar2
                 device.is_gpu() && batch_size == 1
                     ? routed_live_rows
                     : nullptr;
+            if (config_.deepseek_v4)
+            {
+                // DeepSeek-V4 sqrt(softplus) routing: bias-shifted top-k on
+                // score layers, token-id hash rows on the first hash layers.
+                const auto &dsv4 = *config_.deepseek_v4;
+                route_params.scoring_function = MoERouterScoringPolicy::Function::SqrtSoftplus;
+                route_params.scoring_route_scale = dsv4.routeScale();
+                const auto execution_token_ids = [&] {
+                    const auto &input = modelForwardInput();
+                    return device.is_gpu() ? static_cast<const int32_t *>(input.token_ids_device)
+                                           : reinterpret_cast<const int32_t *>(input.token_ids);
+                };
+                if (dsv4.visionCapable())
+                {
+                    // Image sentinels select with exp_probs_b_vl on every
+                    // layer (hash layers included); the sentinel ids are
+                    // inside the chunk's ordinary token row.
+                    route_params.scoring_image_bias = layer.deepseek_v4.router_bias_vl;
+                    route_params.scoring_image_sentinel_base = deepseek4::kImageSentinelBase;
+                    route_params.scoring_image_sentinel_count = deepseek4::kImageSentinelCount;
+                    route_params.scoring_token_ids = execution_token_ids();
+                    if (!route_params.scoring_image_bias || !route_params.scoring_token_ids)
+                        throw std::invalid_argument("DeepSeek-V4 vision routing requires exp_probs_b_vl and token ids");
+                }
+                if (dsv4.layer(layer_idx).hashRouted)
+                {
+                    route_params.scoring_hash_table = layer.deepseek_v4.hash_table;
+                    route_params.scoring_token_ids = execution_token_ids();
+                    if (!route_params.scoring_hash_table || !route_params.scoring_token_ids)
+                        throw std::invalid_argument("DeepSeek-V4 hash routing requires its table and execution-device token ids");
+                }
+                else
+                {
+                    route_params.scoring_selection_bias = layer.deepseek_v4.router_bias;
+                    if (!route_params.scoring_selection_bias)
+                        throw std::invalid_argument("DeepSeek-V4 score routing requires exp_probs_b.bias");
+                }
+            }
             route_params.output_indices = routing_indices;
             route_params.output_weights = routing_weights;
             route_params.input_buffer_id = buffers.idFor(BufferId::NORMALIZED);
@@ -8095,6 +8078,11 @@ namespace llaminar2
                 expert_params.down_exps = layer.moe_down_exps;
                 expert_params.expert_intermediate = expert_intermediate;
                 expert_params.layer_idx = layer_idx;
+                // DeepSeek-V4 clamps routed-expert SwiGLU operands per layer.
+                expert_params.swiglu_activation = config_.deepseek_v4
+                    ? config_.deepseek_v4->layer(layer_idx).routedSwiGLU : ExpertSwiGLUActivationPolicy{};
+                expert_params.shared_swiglu_activation = config_.deepseek_v4
+                    ? config_.deepseek_v4->layer(layer_idx).sharedSwiGLU : ExpertSwiGLUActivationPolicy{};
                 expert_params.routing_indices = routing_indices;
                 expert_params.routing_weights = routing_weights;
                 expert_params.routing_indices_buffer_id = buffers.idFor(BufferId::MOE_EXPERT_INDICES);
@@ -9870,6 +9858,8 @@ namespace llaminar2
                         publishInitialMoEIntermediateShardRuntimeLayer(*runtime, *owner_map_lifetime,
                             source, layer_idx, device_state_publication_stream);
                         MoEIntermediateShardPipelineParams local;
+                        if (config_.deepseek_v4)
+                            local.swiglu_activation = config_.deepseek_v4->layer(layer_idx).routedSwiGLU;
                         local.family = declaration->family();
                         local.runtime = runtime;
                         local.kernel_owner = routed_pipeline_kernel_owner;
@@ -10787,6 +10777,8 @@ namespace llaminar2
                     local_params.d_model = config_.d_model;
                     local_params.expert_intermediate = expert_intermediate;
                     local_params.layer_idx = layer_idx;
+                    local_params.swiglu_activation = config_.deepseek_v4
+                        ? config_.deepseek_v4->layer(layer_idx).routedSwiGLU : ExpertSwiGLUActivationPolicy{};
                     local_params.expert_mask = std::move(participant_mask);
                     local_params.prepared_store = prepared_weight_store_;
                     local_params.physical_memory_authority = prepared_weight_store_
@@ -11851,6 +11843,8 @@ namespace llaminar2
                             local_params.d_model = config_.d_model;
                             local_params.expert_intermediate = expert_intermediate;
                             local_params.layer_idx = layer_idx;
+                            local_params.swiglu_activation = config_.deepseek_v4
+                                ? config_.deepseek_v4->layer(layer_idx).routedSwiGLU : ExpertSwiGLUActivationPolicy{};
                             local_params.expert_mask = std::move(participant_mask);
                             local_params.prepared_store = prepared_weight_store_;
                             local_params.physical_memory_authority = prepared_weight_store_
@@ -14344,6 +14338,8 @@ namespace llaminar2
 
             SharedExpertFFNStage::Params shared_params;
             shared_params.device_id = shared_device;
+            shared_params.swiglu_activation = config_.deepseek_v4
+                ? config_.deepseek_v4->layer(layer_idx).sharedSwiGLU : ExpertSwiGLUActivationPolicy{};
             shared_params.input = buffers.normalized;
             shared_params.gate_w = layer.shared_expert_gate;
             shared_params.up_w = layer.shared_expert_up;

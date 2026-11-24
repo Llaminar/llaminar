@@ -23,6 +23,13 @@ std::optional<NativeWeightLoadStagingRequest> quoteCPUWeightPreparation(
       default:throw std::invalid_argument("CPU weight quote has invalid resolved precision");
     }
     if(!n || !k)throw std::invalid_argument("CPU weight quote requires positive matrix geometry");
+    // Integer tables (DeepSeek-V4 token-id hash routing) are copied verbatim
+    // into their resident root: no staging unit, no conversion, never a GEMM.
+    if(type==TensorType::INT32) {
+        if(consumer!=CPUWeightConsumer::ResidentTensor || precision!=WeightPrecision::NATIVE)
+            throw std::invalid_argument("CPU INT32 tables are native resident tensors only");
+        return std::nullopt;
+    }
     const bool floating=type==TensorType::FP32 || type==TensorType::FP16 || type==TensorType::BF16;
     if(floating) {
         const auto source_bytes=type==TensorType::FP32?size_t(4):size_t(2);

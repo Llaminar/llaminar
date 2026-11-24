@@ -36,8 +36,7 @@ struct Storage {
 struct Projection {
     int n, column; ///< Physical width and CTA column origin.
     const uint8_t *payload; ///< Compact source blocks.
-    const uint16_t *scales, *aux; ///< Original scale and correction planes.
-    const uint32_t *minima; ///< Optional dual-half minima.
+    ::llaminar2::rocm_native_metadata::MetadataPlanes meta; ///< Per-block planes or superblock-coded metadata.
     const float *bias; ///< Only direct fused publication uses this pointer.
     float *destination; ///< Exact physical partition/output plane selected before decode.
 };
@@ -85,9 +84,11 @@ __device__ __forceinline__ void tile(const int8_t *a, const float *activation_sc
         if (n<p.n && kb<end_block) {
             const size_t index=static_cast<size_t>(kb)*p.n+n;
             load_payload<Traits::payload_bytes>(p.payload+index*Traits::payload_bytes,raw);
-            primary=::llaminar2::native_quantised_scale::loadStagedPrimary<static_cast<uint8_t>(FMT)>(p.scales,index);
-            if constexpr(Traits::needs_aux_compute) secondary=p.aux[index];
-            if constexpr(Traits::is_dual_scale_asym) minima=p.minima[index];
+            // One metadata authority for per-block and superblock-coded matrices.
+            const auto words=::llaminar2::rocm_native_metadata::blockMetadata<static_cast<uint8_t>(FMT)>(p.meta,uint32_t(kb),uint32_t(n),uint32_t(p.n));
+            primary=words.primary;
+            if constexpr(Traits::needs_aux_compute) secondary=words.secondary;
+            if constexpr(Traits::is_dual_scale_asym) minima=words.emin;
         }
         int decoded[8]; decode_block<FMT>(raw,decoded);
         I32x4 low,high;
@@ -226,7 +227,8 @@ __device__ __forceinline__ void produce(
         if constexpr(Publication==VerifierWmmaPublication::Batched)bias=args.bias[proj];
     }
     Projection p{n,static_cast<int>(blockIdx.x-args.grid_offsets[proj])*64,
-        args.payload[proj],args.scales[proj],args.mins[proj],args.emins[proj],bias,dest};
+        args.payload[proj],::llaminar2::rocm_native_metadata::planesFromLayout(args.scales[proj],args.mins[proj],args.emins[proj],
+            args.metadata_layout[proj]),bias,dest};
     const auto codebook=static_cast<NativeQuantisedGemmFormat>(args.codebook[proj]);
     auto cursor=projectionCursorFor<HasWork>(args.work,args.rows,blockIdx.z,gridDim.z,16);
     const int begin=blockIdx.y*span,end_block=min(k/32,begin+span);
@@ -304,8 +306,9 @@ void submitNativeQuantisedVerifierWmma(const NativeQuantisedVerifierWmmaArgument
         tiles+=1+(bundle.N[p]-1)/64;
         auto validate=[&]<NativeQuantisedGemmFormat FMT>() {
             using T=NATIVE_QUANTISEDGemmTraits<FMT>;
-            if((T::needs_aux_compute && !bundle.mins[p]) || (T::is_dual_scale_asym && !bundle.emins[p]))
-                throw std::invalid_argument("Native verifier WMMA source metadata is incomplete");
+            if(!::llaminar2::rocm_native_metadata::metadataPlanesComplete(bundle.codebook[p],::llaminar2::rocm_native_metadata::planesFromLayout(bundle.scales[p],
+                    bundle.mins[p],bundle.emins[p],bundle.metadata_layout[p]),T::needs_aux_compute,T::is_dual_scale_asym))
+                throw std::invalid_argument("Native verifier WMMA source metadata is incomplete or not admitted");
         };
         switch(bundle.codebook[p]) {
 #define LLAMINAR_VALIDATE_VERIFIER(F) case F: validate.template operator()<F>();break

@@ -16,12 +16,12 @@ bool sameMatrix(const Matrix& a,const Matrix& b) noexcept {
  a.blocks_per_row==b.blocks_per_row&&a.codebook_id==b.codebook_id&&a.source_codebook_id==b.source_codebook_id&&
  a.source_is_superblock==b.source_is_superblock&&a.source_identity_present==b.source_identity_present&&
  a.allocation_payload_bytes_per_block==b.allocation_payload_bytes_per_block&&a.allocation_has_mins==b.allocation_has_mins&&
- a.allocation_has_emins==b.allocation_has_emins&&a.reserved==b.reserved&&a.reserved_tail==b.reserved_tail;
+ a.allocation_has_emins==b.allocation_has_emins&&a.metadata_layout==b.metadata_layout&&a.reserved_tail==b.reserved_tail;
 }
 bool validMatrix(const Matrix& d,int n,int k,unsigned physical,unsigned source,bool superblock) noexcept {
  return d.valid()&&d.n==n&&d.k==k&&d.blocks_per_row==unsigned(k/32)&&d.codebook_id==physical&&
  d.source_identity_present==1&&d.source_codebook_id==source&&bool(d.source_is_superblock)==superblock&&
- !d.reserved&&!d.reserved_tail&&
+ !d.metadata_layout&&!d.reserved_tail&&
  (!d.allocation_payload_bytes_per_block||d.allocation_payload_bytes_per_block==(physical==19?32:physical==7?20:16))&&
  d.allocation_has_mins==(d.allocation_payload_bytes_per_block&&physical!=19)&&!d.allocation_has_emins&&
  d.payload&&d.scales&&!d.emins&&

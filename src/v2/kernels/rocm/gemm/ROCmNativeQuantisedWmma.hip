@@ -23,7 +23,7 @@ VNNIPrefillLaunch submitNativeQuantisedWmma(
 {
     const auto hip_stream = static_cast<hipStream_t>(stream);
     if (!hip_stream || hip_stream == hipStreamLegacy || hip_stream == hipStreamPerThread ||
-        !args.activations || !args.payload || !args.scales || !args.output ||
+        !args.activations || !args.payload || !args.metadata.primary || !args.output ||
         (!args.row_scales && !args.block_scales) || args.m <= 0 || args.n <= 0 ||
         args.k <= 0 || args.k % 32 || args.serial_partitions <= 0 ||
         args.serial_partitions > args.k / 32)
@@ -31,17 +31,17 @@ VNNIPrefillLaunch submitNativeQuantisedWmma(
 #if !defined(__HIP_DEVICE_COMPILE__) || defined(__gfx1100__)
     auto format = [&]<NativeQuantisedGemmFormat FMT>() {
         using Traits = NATIVE_QUANTISEDGemmTraits<FMT>;
-        if ((Traits::needs_aux_compute && !args.auxiliary) ||
-            (Traits::is_dual_scale_asym && !args.minima_pairs))
-            throw std::invalid_argument("native WMMA source correction metadata is missing");
+        if (!rocm_native_metadata::metadataPlanesComplete(args.codebook, args.metadata,
+                Traits::needs_aux_compute, Traits::is_dual_scale_asym))
+            throw std::invalid_argument("native WMMA source correction metadata is missing or not admitted");
         auto scale_mode = [&]<NativeWmmaActivationScale ScaleMode>() {
             auto submit = [&]<int MT, int NT>() {
                 const void *function = reinterpret_cast<const void *>(
                     HIP_KERNEL_NAME(native_quantised_wmma_gemm<FMT, MT, NT, ScaleMode>));
                 native_quantised_wmma_gemm<FMT, MT, NT, ScaleMode><<<
                     dim3((args.n + NT - 1) / NT, (args.m + MT - 1) / MT), 256, 0, hip_stream>>>(
-                    args.activations, args.payload, args.scales, args.auxiliary,
-                    args.minima_pairs, args.output, args.row_scales, args.block_scales,
+                    args.activations, args.payload, args.metadata, args.output,
+                    args.row_scales, args.block_scales,
                     args.m, args.n, args.k, args.serial_partitions);
                 return VNNIPrefillLaunch{.producer = VNNIPrefillProducer::NativeWmma,
                     .execution_codebook = args.codebook, .n_tile = NT, .m_tile = MT,

@@ -1,19 +1,103 @@
 /**
  * @file MixedFormatExpertTransferPublication.cpp
- * @brief Captured CUDA/ROCm transfer-slot reuse across every expert format.
+ * @brief Captured CUDA/ROCm movement across exact expert slot families.
  *
  * The production pack/unpack kernels run in one retained graph. Only setup
- * inputs change between replays; a destination slot keeps its physical address
- * and immutable capacity while its occupant changes. Stale lease replays must
+ * inputs change between replays; each family keeps its own physical address
+ * and immutable layout while its occupants change. Stale lease replays must
  * leave the previous publication untouched. Arithmetic parity is certified by
  * the separate grouped-expert sweeps; this test isolates the transfer contract.
  * Original IQ3_S/IQ4_XS coefficient planes have independently fixed byte
  * extents so a production metadata omission cannot also shrink the oracle.
  */
 #include "NativeQuantisedExpertTransferParityTest.h"
+#include "execution/config/RuntimeConfig.h"
 
 namespace llaminar2::test
 {
+    namespace
+    {
+        /** @brief Replay one live layer whose family has durable claims outside the wave. */
+        void testTransferFamilyOccupancy(DeviceId device, void *stream, IBackend *backend, IMoEKernel &kernel)
+        {
+            using native_quantised_transfer_parity_detail::DeviceAllocation;
+            namespace abi = moe_rebalance_abi;
+            constexpr uint32_t layers = 3u, experts = 300u, live_layers = 1u;
+            constexpr size_t words = abi::histogramWords(abi::HistogramLayout::TransferFamilyOccupancy, live_layers, experts);
+            constexpr std::array ranges{
+                DeviceMoETransferSlotRange{0u, 601u, 600u},
+                DeviceMoETransferSlotRange{601u, 903u, 300u},
+                DeviceMoETransferSlotRange{0u, 601u, 600u}};
+            DeviceAllocation device_ranges(backend, device.ordinal, sizeof(ranges));
+            DeviceAllocation device_runtime(backend, device.ordinal, layers * sizeof(DeviceMoELayerRuntime));
+            DeviceAllocation device_words(backend, device.ordinal, (words + 1u) * sizeof(uint32_t));
+            const auto upload = [&](void *dst, const void *src, size_t bytes) {
+                ASSERT_TRUE(backend->hostToDeviceOnStream(dst, src, bytes, device.ordinal, stream));
+            };
+            ASSERT_NO_FATAL_FAILURE(upload(device_ranges.get(), ranges.data(), sizeof(ranges)));
+            std::vector<DeviceMoELayerRuntime> runtime(layers);
+            for (uint32_t layer = 0; layer < layers; ++layer)
+            {
+                auto &local = runtime[layer];
+                local.active_epoch = 1u;
+                local.expert_count = experts;
+                local.top_k = 1u;
+                local.participant_count = 2u;
+                if (layer == 1u)
+                    continue; // An empty layer in the other family still emits exactly one metadata word when scheduled.
+                for (uint32_t expert = 0u; expert < experts; ++expert)
+                {
+                    auto &desc = local.banks[0].experts[expert];
+                    desc.flags = toMoEExpertFlags(DeviceMoEExpertFlags::Valid | DeviceMoEExpertFlags::Resident |
+                        DeviceMoEExpertFlags::TransferSlot);
+                    desc.owner_participant = 0;
+                    desc.local_slot = static_cast<int32_t>((layer == 0 ? 0u : experts) + expert);
+                    local.banks[0].resident_participant_mask[expert] = 1u;
+                }
+            }
+            std::array<uint32_t, words + 1u> evidence{};
+            evidence.back() = 0x1a2b3c4du;
+            ASSERT_NO_FATAL_FAILURE(upload(device_words.get(), evidence.data(), sizeof(evidence)));
+            DeviceMoERebalanceConfig config;
+            config.num_layers = layers;
+            config.num_experts = experts;
+            config.top_k = 1u;
+            config.participant_count = 2u;
+            config.window_size_tokens = 1u;
+            config.layer_wave_count = live_layers;
+            config.active_transfer_slot_capacity = 900u;
+            config.transfer_slot_directory_capacity = 903u;
+            config.transfer_slot_layer_ranges = device_ranges.as<DeviceMoETransferSlotRange>();
+            config.histogram_layout = moe_rebalance_abi::HistogramLayout::TransferFamilyOccupancy;
+            auto &context = GPUDeviceContextPool::instance().getContext(device);
+            auto graph = context.createGraphCapture(stream);
+            ASSERT_NE(graph, nullptr);
+            ScopedBackendGraphCapture capture(context, *graph, "partial-wave exact family occupancy");
+            ASSERT_TRUE(capture.begin());
+            const bool packed = kernel.packDeviceRebalanceHistograms({.stream = stream},
+                device_runtime.as<DeviceMoELayerRuntime>(), device_words.as<uint64_t>(), config);
+            capture.finish();
+            ASSERT_TRUE(packed);
+            ASSERT_TRUE(graph->instantiate());
+            for (const uint32_t expected : {600u, 0u})
+            {
+                if (expected == 0u)
+                    for (auto &layer : runtime)
+                        for (uint32_t expert = 0; expert < experts; ++expert)
+                        {
+                            layer.banks[0].resident_participant_mask[expert] = 0u;
+                            layer.banks[0].experts[expert].flags = 0u;
+                        }
+                ASSERT_NO_FATAL_FAILURE(upload(device_runtime.get(), runtime.data(), runtime.size() * sizeof(runtime[0])));
+                ASSERT_TRUE(graph->launch());
+                ASSERT_TRUE(backend->deviceToHostOnStream(evidence.data(), device_words.get(), sizeof(evidence), device.ordinal, stream));
+                ASSERT_TRUE(backend->synchronizeStream(stream, device.ordinal));
+                EXPECT_EQ(evidence[2u * experts], expected);
+                EXPECT_EQ(evidence.back(), 0x1a2b3c4du) << "Partial wave must not emit occupancy for unscheduled layers";
+            }
+        }
+    }
+
     void runMixedFormatExpertTransferPublication(DeviceId device, void *stream,
         DeviceMoEProjectionSet projections)
     {
@@ -33,8 +117,7 @@ namespace llaminar2::test
             std::vector<Specs> formats;
             for (const auto &format : quantizedMoEVerifierFormats())
                 formats.push_back(projectionSpecsForFormat(format, k, n));
-            // Interleave the widest raw representation with narrower ones, and
-            // return to quantized storage afterwards. Capacity cannot follow dtype.
+            // Include distinct floating precisions and reuse one coded/quantized family.
             for (const auto type : {TensorType::FP32, TensorType::FP16, TensorType::BF16,
                                     TensorType::FP32})
             {
@@ -50,29 +133,63 @@ namespace llaminar2::test
             // declining to transmit an allocated whole-expert buffer.
             if (projections == DeviceMoEProjectionSet::GateUp)
                 for (auto &specs : formats) specs.pop_back();
-            auto directory = DeviceMoETransferSlotDirectory::createForTest(
-                backend, device, device.ordinal, 1u, 1u,
-                DeviceMoETransferSlotDirectory::profileForLayerFormats(formats, projections));
+            const auto profile = DeviceMoETransferSlotDirectory::profileForLayerFormats(formats, projections);
+            DeviceMoERebalanceConfig capacity_policy;
+            capacity_policy.num_layers = static_cast<uint32_t>(formats.size());
+            const PrefixCacheRuntimeConfig prefix_cache;
+            const auto minimum = DeviceMoETransferSlotDirectory::runtimeMinimumActiveSlots(true,
+                RoutedExpertAssignmentPolicy::StaticOwner, prefix_cache, 3u);
+            ASSERT_EQ(minimum, 3u);
+            const auto capacities = DeviceMoETransferSlotDirectory::planRuntimeCapacity(capacity_policy, minimum, 1u, 1u);
+            const auto quote = DeviceMoETransferSlotDirectory::allocationBOM(capacities, profile);
+            const PhysicalMemoryResource resource{0, device, quote.total_bytes, quote.total_bytes};
+            PhysicalMemoryPlanBuilder admitted;
+            size_t family_bytes = 0u;
+            for (const auto &family : quote.families)
+            {
+                admitted.add(resource, PhysicalMemoryOwner::ExpertMigrationStaging, family.totalBytes());
+                family_bytes += family.totalBytes();
+            }
+            admitted.add(resource, PhysicalMemoryOwner::ExpertMigrationStaging, quote.layer_range_bytes);
+            const auto authority = std::make_shared<PhysicalMemoryAuthority>(
+                std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(admitted.build()), 0);
+            auto directory = DeviceMoETransferSlotDirectory::create(
+                backend, device, device.ordinal, 1u, capacities, profile, authority);
             ASSERT_NE(directory, nullptr);
+            EXPECT_EQ(quote.total_bytes, family_bytes + quote.layer_range_bytes);
+            EXPECT_EQ(directory->materializedBOM().total_bytes, quote.total_bytes);
+            EXPECT_EQ(authority->claimedBytes(device, PhysicalMemoryOwner::ExpertMigrationStaging,
+                PhysicalMemoryMaterializationKind::NewAllocation), quote.total_bytes);
+            const auto prefill_capacity = DeviceMoETransferSlotDirectory::planRuntimeCapacity(capacity_policy,
+                DeviceMoETransferSlotDirectory::runtimeMinimumActiveSlots(true,
+                    RoutedExpertAssignmentPolicy::LeastLoadedResident, prefix_cache, 3u), 1u, 1u);
+            EXPECT_NO_THROW(directory->requireCaptureIdentity(profile, prefill_capacity));
+            EXPECT_THROW(directory->requireCaptureIdentity(profile,
+                DeviceMoETransferSlotDirectory::planRuntimeCapacity(capacity_policy, minimum + 1u, 1u, 1u)),
+                std::logic_error);
             auto kernel = llaminar::v2::kernels::KernelFactory::createMoEKernel(device);
             ASSERT_NE(kernel, nullptr);
             kernel->setGPUStream(stream);
+            if (packing == Packing::Compact && projections == DeviceMoEProjectionSet::CompleteExpert)
+                ASSERT_NO_FATAL_FAILURE(testTransferFamilyOccupancy(device, stream, backend, *kernel));
             const MoEKernelLaunchContext launch{.stream = stream};
             DeviceMoERebalanceConfig source_config;
-            source_config.num_layers = 1u;
+            source_config.num_layers = static_cast<uint32_t>(formats.size());
             source_config.num_experts = 1u;
             source_config.top_k = 1u;
             source_config.participant_count = 2u;
             source_config.participant_id = 0u;
             source_config.window_size_tokens = 1u;
-            source_config.active_transfer_slot_capacity = 1u;
-            source_config.transfer_slot_directory_capacity = 1u;
+            source_config.active_transfer_slot_capacity = directory->activeSlotCount();
+            source_config.transfer_slot_directory_capacity = directory->slotCount();
             auto destination_config = source_config;
             destination_config.participant_id = 1u;
+            destination_config.transfer_slot_layer_ranges = directory->deviceLayerRanges();
+            destination_config.histogram_layout = moe_rebalance_abi::HistogramLayout::TransferFamilyOccupancy;
             const size_t payload_bytes = sizeof(DeviceMoEExpertDirectoryEntry) + directory->wirePayloadBytes();
             DeviceAllocation source_weights(backend, device.ordinal, source_bytes);
-            DeviceAllocation source_runtime(backend, device.ordinal, sizeof(DeviceMoELayerRuntime));
-            DeviceAllocation source_directory(backend, device.ordinal, 2u * sizeof(DeviceMoEExpertDirectoryEntry));
+            DeviceAllocation source_runtime(backend, device.ordinal, formats.size() * sizeof(DeviceMoELayerRuntime));
+            DeviceAllocation source_directory(backend, device.ordinal, 2u * formats.size() * sizeof(DeviceMoEExpertDirectoryEntry));
             DeviceAllocation plans(backend, device.ordinal, 2u * sizeof(DeviceMoERebalancePlanEntry));
             DeviceAllocation header(backend, device.ordinal, 2u * sizeof(DeviceMoERebalanceCommandBufferHeader));
             DeviceAllocation destination_header(backend, device.ordinal, sizeof(DeviceMoERebalanceCommandBufferHeader));
@@ -87,13 +204,13 @@ namespace llaminar2::test
                 ASSERT_TRUE(backend->deviceToHostOnStream(dst, src, bytes, device.ordinal, stream));
                 ASSERT_TRUE(backend->synchronizeStream(stream, device.ordinal));
             };
+            const std::vector<uint8_t> empty_runtime(formats.size() * sizeof(DeviceMoELayerRuntime));
+            ASSERT_NO_FATAL_FAILURE(upload(source_runtime.get(), empty_runtime.data(), empty_runtime.size()));
             std::vector<uint8_t> pattern(source_bytes);
             for (size_t i = 0; i < pattern.size(); ++i)
                 pattern[i] = static_cast<uint8_t>((i * 53u + i / 257u) & 255u);
             ASSERT_NO_FATAL_FAILURE(upload(source_weights.get(), pattern.data(), pattern.size()));
             DeviceMoEExpertDirectoryEntry observed;
-            ASSERT_NO_FATAL_FAILURE(download(&observed, directory->deviceEntries(), sizeof(observed)));
-            const auto *immutable_raw_pointer = observed.descriptor.floating_gate.data;
             auto &context = GPUDeviceContextPool::instance().getContext(device);
             auto graph = context.createGraphCapture(stream);
             ASSERT_NE(graph, nullptr);
@@ -125,7 +242,7 @@ namespace llaminar2::test
                 launch, plans.as<DeviceMoERebalancePlanEntry>(), nullptr, 1u,
                 destination_header.as<DeviceMoERebalanceCommandBufferHeader>(),
                 payload.as<uint8_t>(), 2u, payload_bytes, directory->deviceEntries(),
-                1u, destination_config, status.as<DeviceMoERebalanceApplyStatus>(), nullptr, 1u);
+                directory->slotCount(), destination_config, status.as<DeviceMoERebalanceApplyStatus>(), nullptr, 1u);
             capture.finish();
             ASSERT_TRUE(described);
             ASSERT_TRUE(packed);
@@ -135,9 +252,15 @@ namespace llaminar2::test
             uint32_t epoch = 0;
             for (const auto &specs : formats)
             {
-                SCOPED_TRACE(device.to_string() + " transfer epoch=" + std::to_string(++epoch));
+                const uint32_t layer = epoch++;
+                SCOPED_TRACE(device.to_string() + " transfer epoch=" + std::to_string(epoch));
+                const auto slot = directory->materializedBOM().families[profile.layer_families[layer]].range.first;
+                const auto *destination_entry = directory->deviceEntries() + slot;
+                ASSERT_NO_FATAL_FAILURE(download(&observed, destination_entry, sizeof(observed)));
+                const auto original = observed.descriptor;
                 DeviceMoEExpertDirectoryEntry source;
                 source.participant = 0u;
+                source.layer = layer;
                 source.resident_mask = 1u;
                 source.slot_index = 0u;
                 source.flags = static_cast<uint32_t>(DeviceMoERebalanceDirectoryFlags::Valid) |
@@ -168,7 +291,7 @@ namespace llaminar2::test
                     // Source tuples own two distinct words per block even though
                     // neither format performs an additive minimum correction.
                     // Fix these extents independently of the production metadata.
-                    if (spec.codebook_id == 11u || spec.codebook_id == kNativeQuantisedIQ4XSSourceScaleCodebook)
+                    if (!spec.codedDeclaration() && (spec.codebook_id == 11u || spec.codebook_id == kNativeQuantisedIQ4XSSourceScaleCodebook))
                     {
                         EXPECT_EQ(spec.payload_bytes_per_block, spec.codebook_id == 11u ? 13u : 16u);
                         ASSERT_TRUE(spec.is_asymmetric) << "Original source coefficient plane is mandatory";
@@ -189,6 +312,15 @@ namespace llaminar2::test
                     matrix.allocation_payload_bytes_per_block = spec.payload_bytes_per_block;
                     matrix.allocation_has_mins = spec.is_asymmetric;
                     matrix.allocation_has_emins = spec.has_emins;
+                    if (const auto coded = spec.codedDeclaration())
+                    {
+                        matrix.metadata_layout = nativeQuantisedMetadataLayout(
+                            NativeQuantisedMetadataRepresentation::SuperblockCoded, coded->superblock_phase);
+                        if (native_quantised_superblock::superblockCodeInPayload(spec.codebook_id))
+                            matrix.scales = matrix.payload;
+                        matrix.mins = base + 2u * plane_bytes;
+                        matrix.emins = nullptr;
+                    }
                 }
                 ASSERT_TRUE(deviceMoEDirectoryCopyReady(source));
                 auto runtime = std::make_unique<DeviceMoELayerRuntime>();
@@ -206,7 +338,8 @@ namespace llaminar2::test
                 plan.source_participant = 0u;
                 plan.destination_participant = 1u;
                 plan.source_resident_mask = 1u;
-                plan.destination_slot = 0u;
+                plan.layer = layer;
+                plan.destination_slot = slot;
                 // Collective packing partitions wire slots by destination. Compact
                 // packing must address the same nonzero slot without interpreting
                 // it as a directory index.
@@ -222,7 +355,7 @@ namespace llaminar2::test
                 destination_command.participant_id = 1u;
                 const std::array plan_records{plan, plan};
                 const std::array command_records{command, destination_command};
-                ASSERT_NO_FATAL_FAILURE(upload(source_runtime.get(), runtime.get(), sizeof(*runtime)));
+                ASSERT_NO_FATAL_FAILURE(upload(source_runtime.as<DeviceMoELayerRuntime>() + layer, runtime.get(), sizeof(*runtime)));
                 ASSERT_NO_FATAL_FAILURE(upload(plans.get(), plan_records.data(), sizeof(plan_records)));
                 ASSERT_NO_FATAL_FAILURE(upload(header.get(), command_records.data(), sizeof(command_records)));
                 ASSERT_NO_FATAL_FAILURE(upload(destination_header.get(), &destination_command, sizeof(destination_command)));
@@ -236,8 +369,8 @@ namespace llaminar2::test
                     {specs}, projections).max_wire_payload_bytes;
                 EXPECT_EQ(result.copied_payload_bytes, exact_wire)
                     << "Movement evidence must count only the projections actually transmitted";
-                ASSERT_NO_FATAL_FAILURE(download(&observed, directory->deviceEntries(), sizeof(observed)));
-                EXPECT_TRUE(deviceMoETransferSlotCopyComplete(observed, 1u, 0u, 0u));
+                ASSERT_NO_FATAL_FAILURE(download(&observed, destination_entry, sizeof(observed)));
+                EXPECT_TRUE(deviceMoETransferSlotCopyComplete(observed, 1u, layer, 0u));
                 EXPECT_EQ(observed.generation, plan.destination_generation + 1u);
                 EXPECT_EQ(observed.descriptor.weight_format, source.descriptor.weight_format);
                 EXPECT_EQ(observed.descriptor.projection_set, projections);
@@ -249,8 +382,8 @@ namespace llaminar2::test
                     EXPECT_EQ(observed.descriptor.down.scales, nullptr);
                     EXPECT_EQ(observed.descriptor.floating_down.data, nullptr);
                 }
-                EXPECT_EQ(observed.descriptor.floating_allocation_format, DeviceMoEWeightFormat::FP32);
-                EXPECT_EQ(observed.descriptor.floating_gate.data, immutable_raw_pointer);
+                EXPECT_EQ(observed.descriptor.floating_allocation_format, original.floating_allocation_format);
+                EXPECT_EQ(observed.descriptor.floating_gate.data, original.floating_gate.data);
                 const std::array<DeviceNativeQuantisedMatrixDesc, 3> native_dst{
                     observed.descriptor.gate, observed.descriptor.up, observed.descriptor.down};
                 const std::array<DeviceMoEFloatingMatrixDesc, 3> raw_dst{
@@ -275,7 +408,18 @@ namespace llaminar2::test
                     {
                         const auto &src = *matrices[projection];
                         const auto &dst = native_dst[projection];
-                        if (src.codebook_id == 11u || src.codebook_id == kNativeQuantisedIQ4XSSourceScaleCodebook)
+                        if (src.metadata_layout)
+                        {
+                            namespace sb = native_quantised_superblock;
+                            const auto cb = src.codebook_id;
+                            const auto blocks = size_t(n) * size_t(k / 32);
+                            const auto phase = nativeQuantisedLayoutPhase(src.metadata_layout);
+                            const auto code = sb::superblockCodePlaneBits(cb) * blocks;
+                            ASSERT_NO_FATAL_FAILURE(verify(dst.payload, blocks * specs[projection].payload_bytes_per_block, 0));
+                            ASSERT_NO_FATAL_FAILURE(verify(dst.scales, (code + 7u) / 8u, 1));
+                            ASSERT_NO_FATAL_FAILURE(verify(dst.mins, sb::planeBytes(cb, n, k / 32, phase).superblock, 2));
+                        }
+                        else if (!src.metadata_layout && (src.codebook_id == 11u || src.codebook_id == kNativeQuantisedIQ4XSSourceScaleCodebook))
                         {
                             const size_t blocks = size_t(n) * size_t(k / 32);
                             const size_t payload = blocks * (src.codebook_id == 11u ? 13u : 16u);
@@ -292,11 +436,24 @@ namespace llaminar2::test
                         else
                         {
                             ASSERT_NO_FATAL_FAILURE(verify(dst.payload, deviceMoEMatrixPayloadBytes(src, source), 0));
-                            ASSERT_NO_FATAL_FAILURE(verify(dst.scales, deviceMoEMatrixScalesBytes(src), 1));
+                            ASSERT_NO_FATAL_FAILURE(verify(dst.scales, deviceMoEMatrixBlockCount(src) * nativeQuantisedScalePlaneBytes(src.codebook_id), 1));
                             ASSERT_NO_FATAL_FAILURE(verify(dst.mins, deviceMoEMatrixMinsBytes(src, source), 2));
                             ASSERT_NO_FATAL_FAILURE(verify(dst.emins, deviceMoEMatrixEminsBytes(src, source), 3));
                         }
                     }
+                }
+                // A current-generation lease for another family must still fail before mutation.
+                if (layer == 0u)
+                {
+                    auto wrong = plan;
+                    wrong.destination_slot = directory->materializedBOM().families[1].range.first;
+                    const std::array wrong_plans{wrong, wrong};
+                    ASSERT_NO_FATAL_FAILURE(upload(plans.get(), wrong_plans.data(), sizeof(wrong_plans)));
+                    ASSERT_TRUE(graph->launch());
+                    ASSERT_NO_FATAL_FAILURE(download(&result, status.get(), sizeof(result)));
+                    EXPECT_EQ(result.copied_arrivals, 0u);
+                    EXPECT_EQ(result.descriptor_mismatches, 1u);
+                    ASSERT_NO_FATAL_FAILURE(upload(plans.get(), plan_records.data(), sizeof(plan_records)));
                 }
                 // Same captured graph and stale lease: reject without changing the
                 // installed identity, pointers, dtype, generation or capacity.
@@ -305,7 +462,7 @@ namespace llaminar2::test
                 EXPECT_EQ(result.copied_arrivals, 0u);
                 EXPECT_EQ(result.descriptor_mismatches, 1u);
                 DeviceMoEExpertDirectoryEntry after_stale;
-                ASSERT_NO_FATAL_FAILURE(download(&after_stale, directory->deviceEntries(), sizeof(after_stale)));
+                ASSERT_NO_FATAL_FAILURE(download(&after_stale, destination_entry, sizeof(after_stale)));
                 EXPECT_EQ(std::memcmp(&after_stale, &observed, sizeof(observed)), 0);
             }
         }

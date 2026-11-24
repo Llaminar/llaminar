@@ -237,9 +237,12 @@ namespace
                desc.n == N && desc.k == K &&
                desc.blocks_per_row == static_cast<uint32_t>(K / kQuantBlock) &&
                llaminar2::cuda_native_quantised::native_quantised_descriptor_codebook_matches<CodebookId>(desc.codebook_id) &&
-               (!Traits::requires_secondary_metadata ||
-                (Traits::is_iq4_source_scale && desc.codebook_id == 4) || desc.mins) &&
-               (!Traits::is_dual_scale_asym || desc.emins);
+               ::llaminar2::nativeQuantisedLayoutValid(desc.codebook_id, desc.metadata_layout) &&
+               // A coded matrix keeps its superblock plane in `mins` and has no emins plane.
+               ((desc.metadata_layout & 0x80u) ? desc.mins != nullptr
+                : ((!Traits::requires_secondary_metadata ||
+                    (Traits::is_iq4_source_scale && desc.codebook_id == 4) || desc.mins) &&
+                   (!Traits::is_dual_scale_asym || desc.emins)));
     }
 
     /**
@@ -275,27 +278,25 @@ namespace
         int32_t dot_lo,
         int32_t dot_hi,
         const uint8_t *payload,
-        const uint16_t *scales,
-        const uint16_t *mins,
-        const uint32_t *emins,
-        size_t linear,
+        ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes meta,
+        ::llaminar2::native_quantised_scale::BlockAddress address,
         float activation_scale,
         uint8_t physical_codebook = CodebookId)
     {
         using Traits =
             llaminar2::cuda_native_quantised::CodebookTraits<CodebookId>;
+        // Per-block words for either metadata representation (one authority).
+        const auto words = ::llaminar2::native_quantised_scale::loadBlockMetadata<CodebookId>(meta, address);
         if constexpr (Traits::is_iq4_lut)
         {
             const float scale = physical_codebook == llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook
-                ? llaminar2::cuda_native_quantised::native_quantised_single_scale_rn<llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook>(::llaminar2::native_quantised_scale::loadStagedPrimary<CodebookId>(scales, linear), mins[linear])
-                : llaminar2::cuda_native_quantised::fp16_bits_to_float(::llaminar2::native_quantised_scale::loadStagedPrimary<CodebookId>(scales, linear));
+                ? llaminar2::cuda_native_quantised::native_quantised_single_scale_rn<llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook>(words.primary, words.secondary)
+                : llaminar2::cuda_native_quantised::fp16_bits_to_float(words.primary);
             return llaminar2::device_native_quantised_contract::singleScaleBlock(
                 dot_lo, scale, activation_scale);
         }
-        const uint16_t secondary_bits =
-            mins ? mins[linear] : uint16_t{0};
-        const uint32_t emin_bits =
-            emins ? emins[linear] : uint32_t{0};
+        const uint16_t secondary_bits = words.secondary;
+        const uint32_t emin_bits = words.emin;
         const uint16_t iq1m_qh = Traits::is_iq1_m
             ? static_cast<uint16_t>(payload[4]) |
                   (static_cast<uint16_t>(payload[5]) << 8)
@@ -322,7 +323,7 @@ namespace
                 dot_lo,
                 dot_hi,
                 activation_scale,
-                ::llaminar2::native_quantised_scale::loadStagedPrimary<CodebookId>(scales, linear),
+                words.primary,
                 secondary_bits,
                 emin_bits,
                 activation_sum_lo + activation_sum_hi,
@@ -832,12 +833,7 @@ namespace
         constexpr int kPayloadBytes =
             llaminar2::cuda_native_quantised::CodebookTraits<CodebookId>::
                 payload_bytes;
-        const uint16_t *weight_scales =
-            static_cast<const uint16_t *>(descriptor.scales);
-        const uint16_t *weight_mins =
-            static_cast<const uint16_t *>(descriptor.mins);
-        const uint32_t *weight_emins =
-            static_cast<const uint32_t *>(descriptor.emins);
+        const auto weight_meta = ::llaminar2::native_quantised_scale::metadataPlanes(descriptor);
         const int blocks_per_row = K / kQuantBlock;
         const int blocks_per_partition =
             (blocks_per_row + k_partitions - 1) / k_partitions;
@@ -891,14 +887,13 @@ namespace
                         uint32_t scale_bits = 0;
                         if (column < N)
                         {
-                            const size_t linear =
-                                static_cast<size_t>(block) * N + column;
                             // The slot carries the normalized staged word (low 16 bits).
-                            scale_bits = ::llaminar2::native_quantised_scale::loadStagedPrimary<CodebookId>(
-                                weight_scales, linear);
+                            const auto words = ::llaminar2::native_quantised_scale::loadBlockMetadata<CodebookId>(
+                                weight_meta, ::llaminar2::native_quantised_scale::blockMajorAddress(weight_meta, block, column, N));
+                            scale_bits = words.primary;
                             if constexpr (llaminar2::cuda_native_quantised::CodebookTraits<CodebookId>::is_iq4_source_scale)
                                 if (descriptor.codebook_id == llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook)
-                                    scale_bits |= uint32_t{weight_mins[linear]} << 16;
+                                    scale_bits |= uint32_t{words.secondary} << 16;
                         }
                         shared_weight_scales[
                             warp * kColumnsPerWarp + lane] = scale_bits;
@@ -970,10 +965,8 @@ namespace
                                 dot_lo[element],
                                 dot_hi[element],
                                 payload,
-                                weight_scales,
-                                weight_mins,
-                                weight_emins,
-                                linear,
+                                weight_meta,
+                                ::llaminar2::native_quantised_scale::blockMajorAddress(weight_meta, block, column, N),
                                 activation_scale, descriptor.codebook_id));
                     }
                 }
@@ -1048,7 +1041,8 @@ namespace
         int total_slots,
         int N,
         int K,
-        int k_partitions)
+        int k_partitions,
+        float swiglu_limit)
     {
         using Geometry = ParallelGateUpGeometry<ColumnsPerBlock>;
         const int directory_index = directoryIndexFromGrid();
@@ -1132,12 +1126,7 @@ namespace
         constexpr int kPayloadBytes =
             llaminar2::cuda_native_quantised::CodebookTraits<CodebookId>::
                 payload_bytes;
-        const uint16_t *weight_scales =
-            static_cast<const uint16_t *>(descriptor.scales);
-        const uint16_t *weight_mins =
-            static_cast<const uint16_t *>(descriptor.mins);
-        const uint32_t *weight_emins =
-            static_cast<const uint32_t *>(descriptor.emins);
+        const auto weight_meta = ::llaminar2::native_quantised_scale::metadataPlanes(descriptor);
         const int blocks_per_row = K / kQuantBlock;
         const int blocks_per_partition =
             (blocks_per_row + k_partitions - 1) / k_partitions;
@@ -1225,10 +1214,8 @@ namespace
                         dot_lo[element],
                         dot_hi[element],
                         payload,
-                        weight_scales,
-                        weight_mins,
-                        weight_emins,
-                        linear,
+                        weight_meta,
+                                ::llaminar2::native_quantised_scale::blockMajorAddress(weight_meta, block, column, N),
                         activation_scale, descriptor.codebook_id);
                     partial[element] = __fadd_rn(
                         partial[element],
@@ -1300,7 +1287,7 @@ namespace
             // supported weight format publishes the same SwiGLU FP32 word.
             const float value = quant_column_active
                                     ? llaminar2::device_swiglu_contract::
-                                          swigluValue(gate, up)
+                                          swigluValue(gate, up, swiglu_limit)
                                     : 0.0f;
 
             float abs_value =
@@ -1345,10 +1332,10 @@ namespace
      * A warp owns eight output columns for both projections. It decodes the two
      * B fragments into disjoint shared ranges, loads the common A fragment once,
      * and evaluates the fixed partition tree without an intervening
-     * publication. Only the exact SwiGLU value enters shared memory for the
-     * unchanged 32-column blockwise quantizer.
+     * publication. The clamped epilogue stages both projections in shared memory
+     * so its activation work does not extend the MMA register lifetimes.
      */
-    template <uint8_t CodebookId, int ColumnsPerBlock>
+    template <uint8_t CodebookId, int ColumnsPerBlock, bool Clamp>
     __global__ __launch_bounds__(
         PairedGateUpGeometry<ColumnsPerBlock>::gate_up_threads,
         PairedGateUpGeometry<ColumnsPerBlock>::
@@ -1369,7 +1356,8 @@ namespace
         int total_slots,
         int N,
         int K,
-        int k_partitions)
+        int k_partitions,
+        float swiglu_limit)
     {
         using Geometry = PairedGateUpGeometry<ColumnsPerBlock>;
         const int directory_index = directoryIndexFromGrid();
@@ -1432,9 +1420,11 @@ namespace
             CodebookId == 13 && ColumnsPerBlock == 32;
         constexpr int kStagedMetadataWords =
             kStageIQ2SMetadata ? 2 * kScaleColumns + kRows : 0;
-        __shared__ __align__(16) uint32_t shared_storage[
-            Geometry::gate_up_shared_bytes / sizeof(uint32_t) +
-            kStagedMetadataWords];
+        constexpr int kProjectionWords = kRows * ColumnsPerBlock;
+        constexpr int kSharedWords = Clamp ? 2 * kProjectionWords
+                                           : Geometry::gate_up_shared_bytes / sizeof(uint32_t);
+        static_assert(kSharedWords * sizeof(uint32_t) >= Geometry::gate_up_operand_bytes);
+        __shared__ __align__(16) uint32_t shared_storage[kSharedWords + kStagedMetadataWords];
         auto *shared_bytes = reinterpret_cast<int8_t *>(shared_storage);
         int8_t *shared_a = shared_bytes;
         constexpr int kWarpWeightBytes = kColumnsPerWarp * kQuantBlock;
@@ -1447,7 +1437,7 @@ namespace
 
         uint32_t *shared_gate_scale_pairs =
             shared_storage +
-            Geometry::gate_up_shared_bytes / sizeof(uint32_t);
+            kSharedWords;
         uint32_t *shared_up_scale_pairs =
             shared_gate_scale_pairs + kScaleColumns;
         float *shared_activation_scales = reinterpret_cast<float *>(
@@ -1458,18 +1448,8 @@ namespace
                 payload_bytes;
         const uint8_t *gate_payload_base = gate_descriptor.payload;
         const uint8_t *up_payload_base = up_descriptor.payload;
-        const auto *gate_scales =
-            static_cast<const uint16_t *>(gate_descriptor.scales);
-        const auto *gate_mins =
-            static_cast<const uint16_t *>(gate_descriptor.mins);
-        const auto *gate_emins =
-            static_cast<const uint32_t *>(gate_descriptor.emins);
-        const auto *up_scales =
-            static_cast<const uint16_t *>(up_descriptor.scales);
-        const auto *up_mins =
-            static_cast<const uint16_t *>(up_descriptor.mins);
-        const auto *up_emins =
-            static_cast<const uint32_t *>(up_descriptor.emins);
+        const auto gate_meta = ::llaminar2::native_quantised_scale::metadataPlanes(gate_descriptor);
+        const auto up_meta = ::llaminar2::native_quantised_scale::metadataPlanes(up_descriptor);
         const int blocks_per_row = K / kQuantBlock;
         const int blocks_per_partition =
             (blocks_per_row + k_partitions - 1) / k_partitions;
@@ -1544,15 +1524,14 @@ namespace
                         uint32_t up_scale_pair = 0;
                         if (column < N)
                         {
-                            const size_t linear =
-                                static_cast<size_t>(block) * N + column;
-                            gate_scale_pair =
-                                static_cast<uint32_t>(gate_scales[linear]) |
-                                (static_cast<uint32_t>(gate_mins[linear])
-                                 << 16);
-                            up_scale_pair =
-                                static_cast<uint32_t>(up_scales[linear]) |
-                                (static_cast<uint32_t>(up_mins[linear]) << 16);
+                            const auto gate_words = ::llaminar2::native_quantised_scale::loadBlockMetadata<CodebookId>(
+                                gate_meta, ::llaminar2::native_quantised_scale::blockMajorAddress(gate_meta, block, column, N));
+                            const auto up_words = ::llaminar2::native_quantised_scale::loadBlockMetadata<CodebookId>(
+                                up_meta, ::llaminar2::native_quantised_scale::blockMajorAddress(up_meta, block, column, N));
+                            gate_scale_pair = static_cast<uint32_t>(gate_words.primary) |
+                                              (static_cast<uint32_t>(gate_words.secondary) << 16);
+                            up_scale_pair = static_cast<uint32_t>(up_words.primary) |
+                                            (static_cast<uint32_t>(up_words.secondary) << 16);
                         }
                         const int scale_index =
                             warp * kColumnsPerWarp + lane;
@@ -1684,10 +1663,8 @@ namespace
                                 gate_dot_lo[element],
                                 gate_dot_hi[element],
                                 gate_payload_base + linear * kPayloadBytes,
-                                gate_scales,
-                                gate_mins,
-                                gate_emins,
-                                linear,
+                                gate_meta,
+                                ::llaminar2::native_quantised_scale::blockMajorAddress(gate_meta, block, column, N),
                                 activation_scale, gate_descriptor.codebook_id));
                     }
                     int32_t up_dot_lo[4] = {0, 0, 0, 0};
@@ -1726,10 +1703,8 @@ namespace
                                 up_dot_lo[element],
                                 up_dot_hi[element],
                                 up_payload_base + linear * kPayloadBytes,
-                                up_scales,
-                                up_mins,
-                                up_emins,
-                                linear,
+                                up_meta,
+                                ::llaminar2::native_quantised_scale::blockMajorAddress(up_meta, block, column, N),
                                 activation_scale, up_descriptor.codebook_id));
                     }
 #else
@@ -1787,10 +1762,8 @@ namespace
                                 gate_dot_lo[element],
                                 gate_dot_hi[element],
                                 gate_payload_base + linear * kPayloadBytes,
-                                gate_scales,
-                                gate_mins,
-                                gate_emins,
-                                linear,
+                                gate_meta,
+                                ::llaminar2::native_quantised_scale::blockMajorAddress(gate_meta, block, column, N),
                                 activation_scale, gate_descriptor.codebook_id));
                         up_partial[element] = __fadd_rn(
                             up_partial[element],
@@ -1799,10 +1772,8 @@ namespace
                                 up_dot_lo[element],
                                 up_dot_hi[element],
                                 up_payload_base + linear * kPayloadBytes,
-                                up_scales,
-                                up_mins,
-                                up_emins,
-                                linear,
+                                up_meta,
+                                ::llaminar2::native_quantised_scale::blockMajorAddress(up_meta, block, column, N),
                                 activation_scale, up_descriptor.codebook_id));
                     }
 #endif
@@ -1834,12 +1805,17 @@ namespace
                 static_cast<int>(blockIdx.x) * ColumnsPerBlock + local_column;
             if (local_row < active_rows && column < N)
             {
-                // Keep the paired schedule byte-identical to serial decode and
-                // to the parallel gate/up schedule for every weight codebook.
-                shared_values[local_row * ColumnsPerBlock + local_column] =
-                    llaminar2::device_swiglu_contract::swigluValue(
-                        gate_total[element],
-                        up_total[element]);
+                const int index = local_row * ColumnsPerBlock + local_column;
+                if constexpr (Clamp)
+                {
+                    shared_values[index] = gate_total[element];
+                    shared_values[kProjectionWords + index] = up_total[element];
+                }
+                else
+                {
+                    shared_values[index] = llaminar2::device_swiglu_contract::swigluValue(
+                        gate_total[element], up_total[element]);
+                }
             }
         }
         __syncthreads();
@@ -1860,9 +1836,16 @@ namespace
             const int fragment_index =
                 local_row * ColumnsPerBlock +
                 local_quant_block * kQuantBlock + lane;
-            const float value = quant_column_active
-                                    ? shared_values[fragment_index]
-                                    : 0.0f;
+            float value = 0.0f;
+            if (quant_column_active)
+            {
+                if constexpr (Clamp)
+                    value = llaminar2::device_swiglu_contract::swigluValue(
+                        shared_values[fragment_index],
+                        shared_values[kProjectionWords + fragment_index], swiglu_limit);
+                else
+                    value = shared_values[fragment_index];
+            }
             float abs_value =
                 llaminar2::device_q8_activation_contract::maximumAbsoluteValue(
                     value, 0.0f);
@@ -1990,6 +1973,7 @@ namespace
         int N,
         int K,
         int k_partitions,
+        float swiglu_limit,
         bool &launched)
     {
         if ((codebook_mask & (uint32_t{1} << CodebookId)) == 0)
@@ -2014,12 +1998,15 @@ namespace
             total_slots,
             N,
             K,
-            k_partitions);
+            k_partitions,
+            swiglu_limit);
         launched = true;
         return cudaGetLastError() == cudaSuccess;
     }
 
-    /** Launch one paired gate/up specialization when its mask bit exists. */
+    /** Launch one paired gate/up specialization when its mask bit exists.
+     * @tparam Clamp Whether this codebook can carry DeepSeek-V4's operand clamp;
+     *        non-clamped instantiation keeps the original register budget. */
     template <uint8_t CodebookId, int ColumnsPerBlock>
     bool launchCodebookPairedGateUpSwiGlu(
         uint32_t codebook_mask,
@@ -2041,13 +2028,39 @@ namespace
         int N,
         int K,
         int k_partitions,
+        float swiglu_limit,
         bool &launched)
     {
         if ((codebook_mask & (uint32_t{1} << CodebookId)) == 0)
             return true;
-        groupedImmaPairedGateUpSwiGluKernel<
-            CodebookId,
-            ColumnsPerBlock><<<
+        if (swiglu_limit > 0.0f)
+        {
+            groupedImmaPairedGateUpSwiGluKernel<CodebookId, ColumnsPerBlock, true><<<
+                grid,
+                PairedGateUpGeometry<ColumnsPerBlock>::gate_up_threads,
+                0,
+                stream>>>(
+                A_int8,
+                scales_A,
+                source_rows,
+                gate_descriptors,
+                up_descriptors,
+                group_counts,
+                group_offsets,
+                directory,
+                swiglu_int8,
+                swiglu_scales,
+                directory_entries,
+                num_experts,
+                total_slots,
+                N,
+                K,
+                k_partitions,
+                swiglu_limit);
+            launched = true;
+            return cudaGetLastError() == cudaSuccess;
+        }
+        groupedImmaPairedGateUpSwiGluKernel<CodebookId, ColumnsPerBlock, false><<<
             grid,
             PairedGateUpGeometry<ColumnsPerBlock>::gate_up_threads,
             0,
@@ -2067,7 +2080,8 @@ namespace
             total_slots,
             N,
             K,
-            k_partitions);
+            k_partitions,
+            swiglu_limit);
         launched = true;
         return cudaGetLastError() == cudaSuccess;
     }
@@ -2154,7 +2168,8 @@ namespace
         int total_slots,
         int N,
         int K,
-        int k_partitions)
+        int k_partitions,
+        float swiglu_limit)
     {
         dim3 grid;
         if (!makeProjectionGrid(N, directory_entries, ColumnsPerBlock, grid))
@@ -2168,7 +2183,7 @@ namespace
                 codebook_mask, grid, stream, A_int8, scales_A, source_rows,     \
                 gate_descriptors, up_descriptors, group_counts, group_offsets,  \
                 directory, swiglu_int8, swiglu_scales, directory_entries,       \
-                num_experts, total_slots, N, K, k_partitions, launched))         \
+                num_experts, total_slots, N, K, k_partitions, swiglu_limit, launched))         \
         {                                                                        \
             return false;                                                        \
         }                                                                        \
@@ -2219,7 +2234,8 @@ namespace
         int total_slots,
         int N,
         int K,
-        int k_partitions)
+        int k_partitions,
+        float swiglu_limit)
     {
         dim3 grid;
         if (!makeProjectionGrid(N, directory_entries, ColumnsPerBlock, grid))
@@ -2229,11 +2245,11 @@ namespace
 #define LAUNCH_PAIRED_GATE_UP_CODEBOOK(CB)                                      \
     do                                                                           \
     {                                                                            \
-        if (!launchCodebookPairedGateUpSwiGlu<CB, ColumnsPerBlock>(              \
+        if (!launchCodebookPairedGateUpSwiGlu<CB, ColumnsPerBlock>(               \
                 codebook_mask, grid, stream, A_int8, scales_A, source_rows,     \
                 gate_descriptors, up_descriptors, group_counts, group_offsets,  \
                 directory, swiglu_int8, swiglu_scales, directory_entries,       \
-                num_experts, total_slots, N, K, k_partitions, launched))         \
+                num_experts, total_slots, N, K, k_partitions, swiglu_limit, launched))         \
         {                                                                        \
             return false;                                                        \
         }                                                                        \
@@ -2391,7 +2407,8 @@ extern "C" bool cudaMoEGroupedImma_projectGateUpSwiGlu(
     llaminar2::cuda::moe::GroupedImmaColumns columns,
     llaminar2::cuda::moe::GroupedImmaGateUpSchedule schedule,
     int device_idx,
-    void *stream)
+    void *stream,
+    float swiglu_limit)
 {
     codebook_mask = llaminar2::cuda_native_quantised::native_quantised_iq4_launch_mask(codebook_mask);
     if (!d_A_int8 || !d_scales_A || !d_gate_desc_table ||
@@ -2426,13 +2443,13 @@ extern "C" bool cudaMoEGroupedImma_projectGateUpSwiGlu(
                          d_gate_desc_table, d_up_desc_table, d_group_counts,
                          d_group_offsets, d_directory, d_swiglu_int8,
                          d_swiglu_scales, directory_entries, num_experts,
-                         total_slots, N, K, k_partitions)
+                         total_slots, N, K, k_partitions, swiglu_limit)
                    : launchGroupedImmaGateUpTable<32>(
                          codebook_mask, cuda_stream, d_A_int8, d_scales_A, source_rows,
                          d_gate_desc_table, d_up_desc_table, d_group_counts,
                          d_group_offsets, d_directory, d_swiglu_int8,
                          d_swiglu_scales, directory_entries, num_experts,
-                         total_slots, N, K, k_partitions);
+                         total_slots, N, K, k_partitions, swiglu_limit);
     case GroupedImmaColumns::Columns64:
         return paired
                    ? launchGroupedImmaPairedGateUpTable<64>(
@@ -2440,13 +2457,13 @@ extern "C" bool cudaMoEGroupedImma_projectGateUpSwiGlu(
                          d_gate_desc_table, d_up_desc_table, d_group_counts,
                          d_group_offsets, d_directory, d_swiglu_int8,
                          d_swiglu_scales, directory_entries, num_experts,
-                         total_slots, N, K, k_partitions)
+                         total_slots, N, K, k_partitions, swiglu_limit)
                    : launchGroupedImmaGateUpTable<64>(
                          codebook_mask, cuda_stream, d_A_int8, d_scales_A, source_rows,
                          d_gate_desc_table, d_up_desc_table, d_group_counts,
                          d_group_offsets, d_directory, d_swiglu_int8,
                          d_swiglu_scales, directory_entries, num_experts,
-                         total_slots, N, K, k_partitions);
+                         total_slots, N, K, k_partitions, swiglu_limit);
     case GroupedImmaColumns::Columns128:
         return paired
                    ? launchGroupedImmaPairedGateUpTable<128>(
@@ -2454,13 +2471,13 @@ extern "C" bool cudaMoEGroupedImma_projectGateUpSwiGlu(
                          d_gate_desc_table, d_up_desc_table, d_group_counts,
                          d_group_offsets, d_directory, d_swiglu_int8,
                          d_swiglu_scales, directory_entries, num_experts,
-                         total_slots, N, K, k_partitions)
+                         total_slots, N, K, k_partitions, swiglu_limit)
                    : launchGroupedImmaGateUpTable<128>(
                          codebook_mask, cuda_stream, d_A_int8, d_scales_A, source_rows,
                          d_gate_desc_table, d_up_desc_table, d_group_counts,
                          d_group_offsets, d_directory, d_swiglu_int8,
                          d_swiglu_scales, directory_entries, num_experts,
-                         total_slots, N, K, k_partitions);
+                         total_slots, N, K, k_partitions, swiglu_limit);
     case GroupedImmaColumns::Columns256:
         return false;
     }
@@ -2559,7 +2576,8 @@ namespace
                 &attributes,
                 groupedImmaPairedGateUpSwiGluKernel<
                     CodebookId,
-                    ColumnsPerBlock>) != cudaSuccess)
+                    ColumnsPerBlock,
+                    false>) != cudaSuccess)
         {
             (void)cudaGetLastError();
             return false;
@@ -2570,7 +2588,8 @@ namespace
                 &active_blocks,
                 groupedImmaPairedGateUpSwiGluKernel<
                     CodebookId,
-                    ColumnsPerBlock>,
+                    ColumnsPerBlock,
+                    false>,
                 PairedGateUpGeometry<ColumnsPerBlock>::gate_up_threads,
                 0) != cudaSuccess)
         {

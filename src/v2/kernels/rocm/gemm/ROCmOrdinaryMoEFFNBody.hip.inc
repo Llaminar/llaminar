@@ -170,7 +170,7 @@ __global__ __launch_bounds__(256,1) void rocmOrdinaryMoEFFNGateUpKernel(const ll
         const float g=persistentMoEFFNFold(partials.gate,column,columns,binding.gate_parts);
         const float u=persistentMoEFFNFold(partials.up,column,columns,binding.up_parts);
         if(is_shared){a.shared_gate_output[n]=g;a.shared_up_output[n]=u;}
-        a.gate_partials[offset+n]=llaminar2::rocm::decode_equivalent::swigluValue(g,u);
+        a.gate_partials[offset+n]=llaminar2::rocm::decode_equivalent::swigluValue(g,u,is_shared?a.shared_swiglu_limit:a.routed_swiglu_limit);
     }
 }
 

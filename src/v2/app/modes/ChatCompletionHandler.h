@@ -18,6 +18,7 @@
 
 #pragma once
 
+#include "multimodal/PromptImageEncoder.h"
 #include "app/modes/HttpRuntimeStats.h"
 #include "utils/Sampler.h"
 #include "utils/ChatTemplate.h"
@@ -127,6 +128,9 @@ namespace llaminar2
         CompletionRuntimeOutput runtime_output{CompletionRuntimeOutput::Omit};
                                    ///< Optional immutable outcome, independent of logging/PerfStats.
         std::optional<bool> enable_thinking; ///< Omission selects the loaded model's reasoning default.
+        /// Validated OpenAI reasoning_effort ("none", "minimal", "low", "medium",
+        /// "high", "xhigh", "max"); "none" disables thinking. Absent: model default.
+        std::optional<std::string> reasoning_effort;
         std::string model;          ///< Model identifier from request (optional)
 
         /// Thinking budget: maximum tokens to spend in thinking mode.
@@ -142,11 +146,25 @@ namespace llaminar2
         /// JSON array of {type: "function", function: {name, description, parameters}}.
         nlohmann::json tools;
 
+        /// The same tools array with the client's key order, for prompt
+        /// rendering: templates serialize schemas, and key order is visible text.
+        nlohmann::ordered_json tools_ordered;
+
         /// Validated tool choice control; raw request JSON is not retained.
         ToolChoicePolicy tool_choice;
 
         /// Allow model to call multiple tools in a single response.
         bool parallel_tool_calls{false};
+
+        /// One image_url content part: its message/part slot and data: URL.
+        struct ImagePart
+        {
+            std::size_t message = 0; ///< Index into @c messages.
+            std::size_t part = 0;    ///< Index into that message's content_parts.
+            std::string url;         ///< data: URL (validated scheme).
+        };
+        /// Image parts in prompt order; their content_parts slots are empty until setup.
+        std::vector<ImagePart> image_parts;
     };
 
     /**
@@ -174,8 +192,16 @@ namespace llaminar2
     class StreamingThinkSplitter
     {
     public:
-        /** @brief Start the reasoning phase with the model's exact closing marker. */
-        explicit StreamingThinkSplitter(const std::string &end_tag);
+        /**
+         * @brief Start the reasoning phase with the model's exact closing marker.
+         * @param end_tag Closing marker; empty disables reasoning framing.
+         * @param reasoning_exits Model-native markers that also end reasoning and
+         *        begin answer text verbatim (DeepSeek-V4 may open a DSML tool
+         *        section before "</think>"). The marker is not consumed: it is
+         *        the first byte of content so the tool parser sees it.
+         */
+        explicit StreamingThinkSplitter(const std::string &end_tag,
+                                        std::vector<std::string> reasoning_exits = {});
 
         /// Construct a no-op splitter (no thinking support)
         StreamingThinkSplitter();
@@ -213,6 +239,7 @@ namespace llaminar2
         SplitResult drainContent(bool terminal);
 
         std::string end_tag_;
+        std::vector<std::string> reasoning_exits_; ///< Content-opening markers accepted while reasoning.
         Phase phase_{Phase::Reasoning}; ///< Single authority for output transitions.
         std::string buffer_;     ///< Buffer for partial end-tag matches
     };
@@ -237,7 +264,8 @@ namespace llaminar2
         static constexpr int kStreamingPublicationWindowTokens = 16;
 
         ChatCompletionHandler(IOrchestrationRunner &runner, ITokenizer &tokenizer,
-                              const std::string &model_name = "");
+                              const std::string &model_name = "",
+                              std::shared_ptr<const multimodal::IPromptImageEncoder> image_encoder = nullptr);
 
         /**
          * @brief Read completed lifetime counters without touching inference state.
@@ -250,6 +278,13 @@ namespace llaminar2
 
         /** @brief Observe an actual completed HTTP response independently of inference state. */
         void recordHttpResponse(int status) { runtime_stats_.recordHttpResponse(status); }
+
+        /**
+         * @brief Render every image part of @p request as @p placeholder text.
+         * @return A copy whose image content parts hold the placeholder.
+         */
+        static ChatCompletionRequest withImagePlaceholders(const ChatCompletionRequest &request,
+                                                           const std::string &placeholder);
 
         /// Parse a JSON string into a validated ChatCompletionRequest.
         /// On failure, returns an error ChatCompletionResponse.
@@ -314,6 +349,8 @@ namespace llaminar2
         IOrchestrationRunner &runner_;
         ITokenizer &tokenizer_;
         std::string model_name_;
+        /// Request image pipeline (--mmproj); null rejects image parts with 400.
+        std::shared_ptr<const multimodal::IPromptImageEncoder> image_encoder_;
     };
 
 } // namespace llaminar2

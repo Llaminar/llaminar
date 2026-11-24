@@ -30,6 +30,7 @@
 #include "kernels/rocm/gemm/ROCmGroupedFFNFrontier.h"
 #include "kernels/rocm/gemm/ROCmNativeQuantisedArchitecture.h"
 #include "kernels/rocm/gemm/ROCmGroupedFFNFormatSelection.h"
+#include "kernels/rocm/gemm/ROCmNativeQuantisedBlockMetadata.h"
 #include "kernels/common/NativeQuantisedDescriptorValidation.h"
 #include "../gemm/ROCmResidentMoEFFN.h"
 #include "../gemm/ROCmNativeLayoutRouterFFN.h"
@@ -165,6 +166,9 @@ namespace
             static_cast<std::uint64_t>(descriptor.source_codebook_id) |
             (static_cast<std::uint64_t>(descriptor.source_is_superblock) << 8U) |
             (static_cast<std::uint64_t>(descriptor.source_identity_present) << 16U));
+        // Metadata representation, phase and code bit shift are part of the
+        // captured descriptor identity (per-block vs superblock-coded readers).
+        words.push_back(static_cast<std::uint64_t>(descriptor.metadata_layout));
     }
 
     /**
@@ -450,8 +454,9 @@ namespace
                desc.blocks_per_row == static_cast<uint32_t>(intermediate / 32) &&
                validateGroupedSourceIdentity(desc) &&
                groupedDecodeSupportsCodebook(desc.codebook_id) &&
-               (!groupedDecodeRequiresMins(desc.codebook_id) || desc.mins) &&
-               (!groupedDecodeRequiresEmins(desc.codebook_id) || desc.emins);
+               // Per-block planes or a superblock-coded code + superblock plane.
+               ::llaminar2::rocm_native_metadata::descriptorMetadataComplete(desc, groupedDecodeRequiresMins(desc.codebook_id),
+                                              groupedDecodeRequiresEmins(desc.codebook_id));
     }
 
     bool validateGroupedGateUpDesc(
@@ -463,8 +468,9 @@ namespace
                desc.blocks_per_row == static_cast<uint32_t>(d_model / 32) &&
                validateGroupedSourceIdentity(desc) &&
                groupedDecodeSupportsCodebook(desc.codebook_id) &&
-               (!groupedDecodeRequiresMins(desc.codebook_id) || desc.mins) &&
-               (!groupedDecodeRequiresEmins(desc.codebook_id) || desc.emins);
+               // Per-block planes or a superblock-coded code + superblock plane.
+               ::llaminar2::rocm_native_metadata::descriptorMetadataComplete(desc, groupedDecodeRequiresMins(desc.codebook_id),
+                                              groupedDecodeRequiresEmins(desc.codebook_id));
     }
 
     bool isBlankGroupedDesc(const llaminar2::DeviceNativeQuantisedMatrixDesc &desc)
@@ -1090,10 +1096,13 @@ extern "C"
         const int *device_effective_seq_len,
         int device_idx, void *stream);
 
+    bool hipMoE_clamp_swiglu_operands(float *gate, float *up, int count,
+                                    int device_idx, void *stream, float limit);
+
     bool hipMoE_swiglu(
         float *gate, const float *up,
         int count,
-        int device_idx, void *stream);
+        int device_idx, void *stream, float swiglu_limit);
 
     bool hipMoE_weighted_add(
         float *output, const float *input,
@@ -1314,7 +1323,7 @@ extern "C"
         int K,
         uint8_t codebook_id,
         int device_idx,
-        void *stream);
+        void *stream, float swiglu_limit);
 
     bool rocmMoE_grouped_swiglu_down_native_quantised_decode_table(
         const float *const *d_gate_ptrs,
@@ -1336,7 +1345,7 @@ extern "C"
         uint32_t policy_codebook_mask,
         int device_idx,
         void *stream,
-        const llaminar2::NativeDownCompletionView* completion=nullptr);
+        const llaminar2::NativeDownCompletionView* completion, float swiglu_limit);
 
     bool rocmMoE_grouped_swiglu_down_floating_decode_table(
         const float *const *d_gate_ptrs,
@@ -1352,7 +1361,7 @@ extern "C"
         int num_experts,
         llaminar2::DeviceMoEWeightFormat format,
         int device_idx,
-        void *stream);
+        void *stream, float swiglu_limit);
 
     bool rocmMoE_grouped_gate_up_native_quantised_decode_table(
         const float *d_hidden,
@@ -1376,7 +1385,7 @@ extern "C"
         uint32_t policy_codebook_mask,
         int device_idx,
         void *stream,
-        const llaminar2::NativeTileCompletionView* completion=nullptr);
+        const llaminar2::NativeTileCompletionView* completion, float swiglu_limit);
 
     bool rocmMoE_grouped_gate_up_floating_decode_table(
         const float *d_hidden,
@@ -1430,7 +1439,7 @@ extern "C"
         uint8_t codebook_id,
         uint32_t policy_codebook_mask,
         int device_idx,
-        void *stream);
+        void *stream, float swiglu_limit);
 
 
 
@@ -4075,7 +4084,7 @@ namespace llaminar2
         if (!setMoEDevice(device_ordinal_, "swiGLU"))
             return;
 
-        if (!hipMoE_swiglu(gate, up, count, device_ordinal_, getStream()))
+        if (!hipMoE_swiglu(gate, up, count, device_ordinal_, getStream(), swiglu_limit_))
         {
             LOG_ERROR("[ROCmMoEKernel::swiGLU] kernel launch failed");
         }
@@ -7202,6 +7211,27 @@ namespace llaminar2
         return true;
     }
 
+    bool ROCmMoEKernel::clampSwiGLUOperands(ITensor *gate, ITensor *up, int count, float limit)
+    {
+        if (limit <= 0.0f)
+            return true;
+        if (!gate || !up || count <= 0 || gate->numel() < static_cast<size_t>(count) ||
+            up->numel() < static_cast<size_t>(count))
+            return false;
+        void *stream = getStream();
+        const DeviceId device = DeviceId::rocm(device_ordinal_);
+        if (!stream || !requireTensorOnDevice(gate, device, stream, "gate", "SwiGLU operand clamp") ||
+            !requireTensorOnDevice(up, device, stream, "up", "SwiGLU operand clamp"))
+            return false;
+        if (!hipMoE_clamp_swiglu_operands(static_cast<float *>(gate->gpu_data_ptr()),
+                                        static_cast<float *>(up->gpu_data_ptr()),
+                                        count, device_ordinal_, stream, limit))
+            return false;
+        markDeviceWritten(gate, device, stream);
+        markDeviceWritten(up, device, stream);
+        return true;
+    }
+
     void ROCmMoEKernel::swiGLUFromTensors(ITensor *gate, ITensor *up, int count)
     {
         if (!setMoEDevice(device_ordinal_, "swiGLUFromTensors"))
@@ -8577,7 +8607,7 @@ namespace llaminar2
                   table.codebook_id,
                   table.policy_codebook_mask,
                   device_ordinal_,
-                  getStream());
+                  getStream(), nullptr, swiglu_limit_);
 
         if (ok)
         {
@@ -8760,7 +8790,7 @@ namespace llaminar2
             table.codebook_id,
             table.policy_codebook_mask,
             device_ordinal_,
-            getStream());
+            getStream(), nullptr, swiglu_limit_);
 
         if (ok)
         {
@@ -9803,7 +9833,7 @@ namespace llaminar2
                   gateup_table.codebook_id,
                   gateup_table.policy_codebook_mask,
                   device_ordinal_,
-                  stream,gateUpCompletionForCall(gateup_descriptor_table_id,top_k));
+                  stream,gateUpCompletionForCall(gateup_descriptor_table_id,top_k), swiglu_limit_);
         if (!gateup_ok)
             return false;
 
@@ -9838,7 +9868,7 @@ namespace llaminar2
                   down_table.num_experts,
                   down_table.weight_format,
                   device_ordinal_,
-                  stream)
+                  stream, swiglu_limit_)
             : rocmMoE_grouped_swiglu_down_native_quantised_decode_table(
                   d_down_gate_ptrs,
                   d_down_up_ptrs,
@@ -9858,7 +9888,7 @@ namespace llaminar2
                   down_table.codebook_id,
                   down_table.policy_codebook_mask,
                   device_ordinal_,
-                  stream,down_completion);
+                  stream, down_completion, swiglu_limit_);
         if (!down_ok)
             return false;
 
@@ -10004,7 +10034,7 @@ namespace llaminar2
                   table.num_experts,
                   table.weight_format,
                   device_ordinal_,
-                  getStream())
+                  getStream(), swiglu_limit_)
             : rocmMoE_grouped_swiglu_down_native_quantised_decode_table(
                   d_gate_ptrs,
                   d_up_ptrs,
@@ -10024,7 +10054,7 @@ namespace llaminar2
                   table.codebook_id,
                   table.policy_codebook_mask,
                   device_ordinal_,
-                  getStream());
+                  getStream(), nullptr, swiglu_limit_);
 
         if (ok)
         {
@@ -10183,7 +10213,7 @@ namespace llaminar2
             table.codebook_id,
             table.policy_codebook_mask,
             device_ordinal_,
-            getStream());
+            getStream(), nullptr, swiglu_limit_);
 
         if (ok)
             markDeviceWritten(output, device, getStream());
@@ -10275,7 +10305,7 @@ namespace llaminar2
             table.codebook_id,
             table.policy_codebook_mask,
             device_ordinal_,
-            getStream());
+            getStream(), swiglu_limit_);
 
         if (ok)
         {
@@ -10318,8 +10348,9 @@ namespace llaminar2
                 down_descs[i].blocks_per_row != static_cast<uint32_t>(intermediate / 32) ||
                 !areNativeQuantisedGateUpCodebooksCompatible(
                     down_descs[i].codebook_id, codebook_id) ||
-                (groupedDecodeRequiresMins(down_descs[i].codebook_id) && !down_descs[i].mins) ||
-                (groupedDecodeRequiresEmins(down_descs[i].codebook_id) && !down_descs[i].emins))
+                !::llaminar2::rocm_native_metadata::descriptorMetadataComplete(down_descs[i],
+                    groupedDecodeRequiresMins(down_descs[i].codebook_id),
+                    groupedDecodeRequiresEmins(down_descs[i].codebook_id)))
             {
                 return false;
             }
@@ -10399,7 +10430,7 @@ namespace llaminar2
             intermediate,
             codebook_id,
             device_ordinal_,
-            getStream());
+            getStream(), swiglu_limit_);
 
         if (ok)
         {
@@ -12258,7 +12289,7 @@ namespace llaminar2
                         gateup_table.weight_format,
                         device_ordinal_,
                         producer_stream,
-                        execution);
+                        execution, swiglu_limit_);
                 },
                 [&](const EnqueuedWorkspaceRead<float> &read)
                 {
@@ -12385,7 +12416,7 @@ namespace llaminar2
                     execution,
                     grouped_prefill_grouping_.scopeForProjection(seq_len, top_k), owner_admission,
                     owner_admission ? &owner_completed : nullptr, d_grouped_population_selection_, &grouped_submitted,
-                    singleton_sources, grouping_offset_slots ? &grouping_directory : nullptr, original_routed_key.routed_sources);
+                    singleton_sources, grouping_offset_slots ? &grouping_directory : nullptr, original_routed_key.routed_sources, swiglu_limit_);
             },
             [&](const EnqueuedWorkspaceRead<float> &read)
             {
@@ -12740,7 +12771,7 @@ namespace llaminar2
                         gateup_table.weight_format,
                         device_ordinal_,
                         producer_stream,
-                        execution);
+                        execution, swiglu_limit_);
                 },
                 [&](const EnqueuedWorkspaceRead<float> &read)
                 {
@@ -12814,7 +12845,8 @@ namespace llaminar2
                 static_cast<float*>(workspace_->getBuffer(MoEWorkspaceBuffers::ROCM_SHARED_GATE)),
                 address(frontier->sharedInputGate),
                 address(frontier->sharedGateScratch),address(frontier->sharedUpScratch),address(frontier->routedOutput),
-                address(frontier->sharedOutput),address(frontier->combined),d_canonical_route_contributions};
+                address(frontier->sharedOutput),address(frontier->combined),d_canonical_route_contributions,
+                frontier->routedActivation.operandLimit(),frontier->sharedActivation.operandLimit()};
             program::DirectBankInput direct;
             if(frontier->directRouter.indices) {
                 const auto& router=frontier->directRouter;
@@ -12904,7 +12936,7 @@ namespace llaminar2
                     producer_stream,
                     execution,
                     MoEPrefillRouteScope::SelectedRoutes, owner_admission,
-                    owner_admission ? &owner_completed : nullptr, d_grouped_population_selection_, &grouped_submitted);
+                    owner_admission ? &owner_completed : nullptr, d_grouped_population_selection_, &grouped_submitted, {}, nullptr, {}, swiglu_limit_);
             },
             [&](const EnqueuedWorkspaceRead<float> &read)
             {
@@ -13559,11 +13591,14 @@ public:
             mix(matrix.n);mix(matrix.k);mix(matrix.blocks_per_row);mix(matrix.codebook_id);
             mix(matrix.source_identity_present);mix(matrix.source_codebook_id);mix(matrix.source_is_superblock);
             mix(matrix.allocation_payload_bytes_per_block);mix(matrix.allocation_has_mins);mix(matrix.allocation_has_emins);
+            mix(matrix.metadata_layout);mix(matrix.reserved_tail);
         }
         const auto rows=args_.rows.captureIdentity();
         mix(reinterpret_cast<std::uintptr_t>(rows.count));mix(rows.count_capacity);mix(rows.first_physical_row);
         mix(rows.physical_rows);mix(rows.repeats_per_row);mix(rows.schema_version);
         mix(args_.hidden_columns);mix(args_.routed_columns);mix(args_.shared_columns);mix(args_.experts);mix(args_.top_k);mix(args_.resident_grid);
+        mix(std::bit_cast<std::uint32_t>(args_.routed_swiglu_limit));
+        mix(std::bit_cast<std::uint32_t>(args_.shared_swiglu_limit));
         mix(args_.execution.routed_gate);mix(args_.execution.routed_down);
         mix(args_.execution.shared_gate);mix(args_.execution.shared_down);
         mix(args_.original.firstIntermediateColumn());mix(args_.original.intermediateColumns());
@@ -13703,7 +13738,7 @@ public:
                 a.allocation_payload_bytes_per_block==b.allocation_payload_bytes_per_block &&
                 a.allocation_has_mins==b.allocation_has_mins && a.allocation_has_emins==b.allocation_has_emins &&
                 a.source_codebook_id==b.source_codebook_id && a.source_is_superblock==b.source_is_superblock &&
-                a.source_identity_present==b.source_identity_present && a.reserved==b.reserved && a.reserved_tail==b.reserved_tail;
+                a.source_identity_present==b.source_identity_present && a.metadata_layout==b.metadata_layout && a.reserved_tail==b.reserved_tail;
         };
         if(!shared_gate.valid||!shared_down.valid||shared_gate.num_experts!=1||shared_down.num_experts!=1||
             shared_gate.weight_format!=DeviceMoEWeightFormat::NativeQuantised||shared_down.weight_format!=DeviceMoEWeightFormat::NativeQuantised||
@@ -14002,6 +14037,8 @@ std::unique_ptr<PreparedResidentMoEFFN> ROCmMoEKernel::prepareResidentMoEFFNImpl
         intermediate_values*NativeQuantisedGroupedDecodePolicy::maximum_k_partitions*sizeof(float)));
     args.down_partials=static_cast<float*>(bind(MoEWorkspaceBuffers::DOWN_PARTIALS,
         size_t(request.top_k)*H*NativeQuantisedGroupedDecodePolicy::maximum_k_partitions*sizeof(float)));
+    args.routed_swiglu_limit=request.routed_activation.operandLimit();
+    args.shared_swiglu_limit=request.shared_activation.operandLimit();
     args.swiglu_q8=static_cast<int8_t*>(bind(MoEWorkspaceBuffers::DECODE_SWIGLU_INT8,intermediate_values));
     args.swiglu_scales=static_cast<float*>(bind(MoEWorkspaceBuffers::DECODE_SWIGLU_SCALES,intermediate_values/32*sizeof(float)));
     const rocm::ResidentMoEFFNPolicyMasks masks{

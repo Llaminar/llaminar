@@ -156,6 +156,7 @@
 #include "../../backends/ComputeBackend.h"
 #include "../../planning/ClusterInventoryGatherer.h"
 #include "../../planning/ModelMemoryProfile.h"
+#include "../../models/deepseek4/DeepSeekV4VisionEncoder.h"
 #include "../../config/OrchestrationStartupPolicy.h"
 #include "../../planning/ActivationBufferSizing.h"
 #include "../../planning/RankMemoryPlanInputs.h"
@@ -3485,10 +3486,12 @@ namespace llaminar2
             // nonterminal remainder must use its smaller existing graph too.
             // For example, 448 live rows under a 384-row cap require 384+64,
             // not 384+384. This changes neither row authority nor KV extent.
-            const auto policy = PrefillChunkSchedulerPolicy::forRetainedBucketFamily(
+            auto policy = PrefillChunkSchedulerPolicy::forRetainedBucketFamily(
                 buckets, runner_->get_position(), token_count,
                 plan_.runtime.ngram_table_placement && plan_.runtime.ngram_table_placement->fixedHeadPipeline()
                     ? PrefillChunkWidthPolicy::ExactRetained : PrefillChunkWidthPolicy::RetainedPadding);
+            // Model-declared atomic spans (image blocks) of this request.
+            policy.atomic_spans = prompt_atomic_spans_;
 
             PrefillChunkSchedule chunk_schedule = planPrefillChunkSchedule(policy);
             if (!chunk_schedule)
@@ -3498,6 +3501,13 @@ namespace llaminar2
                 return setError(failure_message + " (chunk planning failed: " +
                                 chunk_schedule.error + ")");
             }
+            LOG_DEBUG("[OrchestrationRunner] Prefill chunk schedule: " << [&] {
+                std::string text;
+                for (const auto &chunk : chunk_schedule.chunks)
+                    text += "[" + std::to_string(chunk.token_offset) + "+" + std::to_string(chunk.real_count) + "/" +
+                            std::to_string(chunk.bucket_seq_len) + "] ";
+                return text + "atomic_spans=" + std::to_string(policy.atomic_spans.size());
+            }());
 
             uint64_t local_padding_rows = 0;
             for (const auto &chunk : chunk_schedule.chunks)
@@ -3711,8 +3721,19 @@ namespace llaminar2
         }
     }
 
+    bool OrchestrationRunner::setNextPromptEmbeddingRows(std::shared_ptr<const PromptEmbeddingRows> rows)
+    {
+        if (rows && !rows->valid())
+            return setError("Prompt-embedding rows are malformed");
+        next_prompt_embedding_rows_ = std::move(rows);
+        return true;
+    }
+
     bool OrchestrationRunner::prefill(const std::vector<int32_t> &prompt_tokens)
     {
+        // Multimodal rows belong to exactly this request, even when it fails.
+        auto prompt_rows = std::move(next_prompt_embedding_rows_);
+        next_prompt_embedding_rows_.reset();
         if (!initialization_lifecycle_.readyForInference())
         {
             setError("Runner not initialized");
@@ -3776,6 +3797,20 @@ namespace llaminar2
             return setError(
                 "Inference runner rejected request penalty policy at "
                 "request admission");
+        }
+        {
+            // A text request stages null, clearing the previous request's rows.
+            if (prompt_rows && prompt_rows->position_rows.size() > prompt_tokens.size())
+                return setError("Prompt-embedding rows name positions beyond the prompt");
+            // The bank map is indexed by absolute position: multimodal rows
+            // require a fresh sequence (no restored prefix or prior turn).
+            if (prompt_rows && runner_->get_position() != 0)
+                return setError("Multimodal prompt rows require a prefill from position 0");
+            prompt_atomic_spans_ = prompt_rows ? prompt_rows->atomic_spans : std::vector<std::pair<int, int>>{};
+            if (prompt_rows && mpi_coordinated_world)
+                return setError("Multimodal prompt rows are not implemented for multi-rank placements");
+            if (!runner_->stagePromptEmbeddingRows(std::move(prompt_rows)))
+                return setError("Inference runner rejected the request's prompt-embedding rows");
         }
 
         mtp_bypassed_ = false;
@@ -22482,6 +22517,8 @@ namespace llaminar2
             .captured_prefill_buckets = std::move(captured_prefill_buckets),
             .max_gpu_memory_bytes = config_.memoryLimitBytes(DeviceType::CUDA),
             .max_cpu_memory_bytes = config_.memoryLimitBytes(DeviceType::CPU),
+            // Runtime admission: local backend contexts and hardware metadata exist.
+            .local_runtime_device_policy = true,
         });
 
         // CPU threads are not needed to observe GPUs. Only immutable role/BOM
@@ -22704,6 +22741,44 @@ namespace llaminar2
                 auto selected=ImmutableRowTablePlacementPlanner::select(*request,final_plan);
                 plan_.runtime.ngram_table_placement=std::move(selected.placement);
                 final_plan=std::move(selected.physical_plan);
+            }
+        }
+
+        // DeepSeek-V4 vision tower: the exact host FP32 weights and the
+        // worst-case per-request encode workspace are this rank's host RAM.
+        // Admit the metadata-derived bytes into the CPU allocator envelope
+        // before the tower is loaded, so the fit check and the admission
+        // certificate cover the complete host load peak.
+        if (profile.deepseek_v4 && !config_.mmproj_path.empty())
+        {
+            const auto weights = deepseek4::DeepSeekV4VisionEncoder::mmprojHostWeightBytes(
+                config_.mmproj_path, *mpi_ctx_);
+            const auto workspace = deepseek4::visionTowerWorkspaceBytes(
+                config_.mmproj_path, *mpi_ctx_, profile.d_model);
+            const std::size_t demand = weights + workspace;
+            if (demand < weights)
+                return setError("DeepSeek-V4 vision tower host demand overflows");
+            const PhysicalMemoryResource *cpu = nullptr;
+            for (const auto &bom : final_plan.resources())
+                if (bom.resource().device.is_cpu()) { cpu = &bom.resource(); break; }
+            if (!cpu)
+                return setError("DeepSeek-V4 vision tower has no admitted CPU allocator");
+            PhysicalMemoryPlanBuilder builder(final_plan);
+            builder.add(*cpu, PhysicalMemoryOwner::VisionHostTower, demand);
+            final_plan = builder.build();
+            if (!final_plan.fits())
+            {
+                // Name every exhausted member: on an integrated GPU the host
+                // tower shares one pool with the device weights.
+                std::string deficits;
+                for (const auto &bom : final_plan.resources())
+                    if (bom.deficitBytes() > 0)
+                        deficits += " " + bom.resource().id() + " deficit_bytes=" + std::to_string(bom.deficitBytes());
+                if (deficits.empty())
+                    deficits = " the rank's shared host pool (CPU + integrated accelerator) is exhausted";
+                return setError("Memory plan validation failed — DeepSeek-V4 vision tower (" + std::to_string(demand) +
+                                " bytes: weights " + std::to_string(weights) + ", workspace " + std::to_string(workspace) +
+                                ") exceeds the admitted physical memory:" + deficits);
             }
         }
 

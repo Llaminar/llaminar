@@ -157,9 +157,10 @@ TEST(Test__NativeQuantisedFormatInfo, ExpandedSingleScaleGridsRetainNativeScaleA
     using namespace cpu::native_quantised;
     for (const auto &format : kExpectations)
     {
+        const auto *identity = native_quantised_formats::forSourceIdentity(format.codebook_id, format.is_superblock);
+        ASSERT_NE(identity, nullptr);
         if (!is_payload_decodable(format.codebook_id) ||
-            (preparedEncodingForCodebook(format.codebook_id) != CPUNativeQuantisedEncoding::ExpandedInt8 &&
-             preparedEncodingForCodebook(format.codebook_id) != CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale))
+            preparedEncodingForSource(*identity) != CPUNativeQuantisedEncoding::ExpandedInt8)
             continue;
         SCOPED_TRACE(format.name);
         auto tensor = format.create();
@@ -199,6 +200,8 @@ TEST(Test__NativeQuantisedFormatInfo, ExpandedSingleScaleGridsRetainNativeScaleA
 TEST(Test__NativeQuantisedFormatInfo, CompactMultiScaleRetainsNativePayloadAndEveryMetadataBit)
 {
     using namespace cpu::native_quantised;
+    namespace sb = ::llaminar2::native_quantised_superblock;
+    const auto canonicalZero = [](std::uint16_t word) { return word == 0x8000u ? std::uint16_t{0} : word; };
     size_t covered = 0;
     for (const auto &format : kExpectations)
     {
@@ -214,10 +217,24 @@ TEST(Test__NativeQuantisedFormatInfo, CompactMultiScaleRetainsNativePayloadAndEv
         ASSERT_TRUE(packWeightsCPUNativeQuantised(tensor.get(), packed, 1, 2));
         ASSERT_TRUE(packed.usesCompactMultiScale());
         EXPECT_FALSE(packed.usesInlineCompensation());
-        EXPECT_EQ(packed.data_stride, 1024);
-        EXPECT_EQ(packed.interleaved_block_stride, 1536);
-        EXPECT_EQ(packed.native_interleaved.size(), 8u * 1536u);
-        EXPECT_EQ(packed.preparedFootprint().weight_bytes_per_n_chunk_k_block, 1536u);
+        // Coded compact units carry the source payload at its exact width, the
+        // exact-width code planes, and one d/dmin word per (column, source
+        // superblock) behind each eight-block unit (CPUNativeQuantisedBlockGeometry).
+        const auto geometry = packed.geometry();
+        EXPECT_EQ(packed.data_stride, format.payload_bytes * 64);
+        EXPECT_EQ(packed.N_padded, 64);
+        EXPECT_EQ(geometry.matrixBytes(1), geometry.rowBytes());
+        EXPECT_EQ(packed.native_interleaved.size(), geometry.rowBytes());
+        EXPECT_EQ(packed.preparedBytes(), packed.native_interleaved.size());
+        // The block stride is the exact payload plus the exact-width code plane;
+        // the superblock bytes follow each eight-block unit, never per block.
+        EXPECT_EQ(geometry.block_stride,
+                  packed.data_stride +
+                      8u * sb::superblockCodePlaneBits(static_cast<std::uint8_t>(format.codebook_id)));
+        EXPECT_EQ(geometry.header_bytes,
+                  64u * sb::superblockFieldBytes(static_cast<std::uint8_t>(format.codebook_id)));
+        EXPECT_EQ(packed.preparedFootprint().weight_bytes_per_n_chunk_k_block,
+                  geometry.block_stride + geometry.header_bytes / 8u);
         EXPECT_TRUE(packed.int8_flat.empty());
         std::array<uint8_t, 8 * 16> payload{};
         std::array<uint16_t, 8> scales{}, secondary{};
@@ -232,24 +249,39 @@ TEST(Test__NativeQuantisedFormatInfo, CompactMultiScaleRetainsNativePayloadAndEv
             source->packVnniBlock(native, 1, 0, block);
         for (int block = 0; block < 8; ++block)
         {
-            EXPECT_EQ(packed.chunkScales(0, block)[0], scales[block]);
-            EXPECT_EQ(packed.chunkMins(0, block)[0], secondary[block]);
-            EXPECT_EQ(packed.chunkEffectiveMins(0, block)[0], emins[block]);
-            const uint8_t *unit = packed.interleavedBase() + block * 1536;
-            for (int column = 0; column < 64; ++column)
-                for (int byte = 0; byte < 16; ++byte)
-                    EXPECT_EQ(unit[(byte / 4) * 256 + column * 4 + byte % 4],
-                        column == 0 && byte < format.payload_bytes
-                            ? payload[block * format.payload_bytes + byte] : 0);
+            // Live column zero holds the exact source payload at its exact width.
+            std::array<std::uint8_t, 16> coded_payload{};
+            compactColumnPayload(packed.blockUnit(0, block), packed.codebook_id, 0, coded_payload.data());
+            sb::restoreCodedPayload(packed.codebook_id, coded_payload.data());
+            for (int byte = 0; byte < format.payload_bytes; ++byte)
+                EXPECT_EQ(coded_payload[byte], payload[block * format.payload_bytes + byte]);
+            // The codec reconstructs the exact legacy per-block staged words.
+            const auto meta = packed.codedBlockMetadata(0, block, 0);
+            EXPECT_EQ(canonicalZero(meta.primary), canonicalZero(scales[block]));
+            EXPECT_EQ(canonicalZero(meta.secondary), canonicalZero(secondary[block]));
+            if (format.codebook_id == 10)
+            {
+                const std::uint32_t expect_emin =
+                    static_cast<std::uint32_t>(canonicalZero(static_cast<std::uint16_t>(emins[block]))) |
+                    (static_cast<std::uint32_t>(canonicalZero(static_cast<std::uint16_t>(emins[block] >> 16))) << 16);
+                EXPECT_EQ(meta.emin, expect_emin);
+            }
+            else
+                EXPECT_EQ(meta.emin, 0u);
+            // Padded columns (single live column) are benign zero words.
             for (int column = 1; column < 64; ++column)
             {
-                EXPECT_EQ(packed.chunkScales(0, block)[column], 0);
-                EXPECT_EQ(packed.chunkMins(0, block)[column], 0);
-                EXPECT_EQ(packed.chunkEffectiveMins(0, block)[column], 0u);
+                std::array<std::uint8_t, 16> padded_payload{};
+                compactColumnPayload(packed.blockUnit(0, block), packed.codebook_id, column, padded_payload.data());
+                EXPECT_EQ(padded_payload, (std::array<std::uint8_t, 16>{}));
+                const auto pad = packed.codedBlockMetadata(0, block, column);
+                EXPECT_EQ(pad.primary, 0u);
+                EXPECT_EQ(pad.secondary, 0u);
+                EXPECT_EQ(pad.emin, 0u);
             }
         }
     }
-    EXPECT_EQ(covered, 5u);
+    EXPECT_EQ(covered, 8u); // Q3_K, Q2_K, IQ3_XXS, IQ2_S, IQ2_XS, IQ2_XXS, IQ1_S, IQ1_M
 }
 
 TEST(Test__NativeQuantisedFormatInfo, SourceIdentitiesAreExhaustiveUniqueAndCanonical)
@@ -373,7 +405,8 @@ TEST(Test__NativeQuantisedFormatInfo, MigrationStableAndReusableFormatsCoverEver
 
         const auto migrated = migrationStableDeviceVnniFormat(*source);
         const int expected_migrated_payload =
-            source->codebook_id == 8 || source->codebook_id == 11 || hasCompactMultiScaleVnniPayload(source->codebook_id)
+            source->codebook_id == 8 || source->codebook_id == 11 || hasCompactMultiScaleVnniPayload(source->codebook_id) ||
+                (!source->is_superblock && (source->codebook_id == 6 || source->codebook_id == 7))
                 ? source->payload_bytes
                 : (source->codebook_id == 0 ||
                            source->codebook_id == 4 ||
@@ -439,6 +472,55 @@ TEST(Test__NativeQuantisedFormatInfo, DescriptorValidationCoversEveryReachablePh
             EXPECT_EQ(NativeQuantisedDescriptorValidation::secondary(codebook), secondary);
         }
     }
+}
+
+/**
+ * @test Shared publication validation authenticates the metadata layout byte.
+ *
+ * A descriptor claiming superblock-coded metadata is publishable only for a
+ * codable physical codebook and a layout byte with no reserved bits; a
+ * per-block descriptor must carry no phase or code bit shift. Coded matrices
+ * need their superblock plane and never an emins plane.
+ */
+TEST(Test__NativeQuantisedFormatInfo, DescriptorValidationAuthenticatesMetadataLayout)
+{
+    static std::uint8_t payload[4], scales[4], mins[4], emins[4];
+    const auto descriptor = [&](std::uint8_t codebook, std::uint8_t layout, bool with_mins, bool with_emins) {
+        DeviceNativeQuantisedMatrixDesc d{};
+        d.payload = payload;
+        d.scales = scales;
+        d.mins = with_mins ? mins : nullptr;
+        d.emins = with_emins ? emins : nullptr;
+        d.n = 64;
+        d.k = 256;
+        d.blocks_per_row = 8;
+        d.codebook_id = codebook;
+        d.metadata_layout = layout;
+        return d;
+    };
+    const auto coded = nativeQuantisedMetadataLayout(NativeQuantisedMetadataRepresentation::SuperblockCoded, 3, 5);
+    // Codable formats: coded with a superblock plane and no emins.
+    for (const std::uint8_t cb : {5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 24})
+    {
+        SCOPED_TRACE(int(cb));
+        EXPECT_TRUE(NativeQuantisedDescriptorValidation::publishable(descriptor(cb, coded, true, false)));
+        EXPECT_FALSE(NativeQuantisedDescriptorValidation::publishable(descriptor(cb, coded, false, false)));
+        EXPECT_FALSE(NativeQuantisedDescriptorValidation::publishable(descriptor(cb, coded, true, true)));
+        // Reserved bit 6 is never valid.
+        EXPECT_FALSE(NativeQuantisedDescriptorValidation::publishable(
+            descriptor(cb, static_cast<std::uint8_t>(coded | 0x40u), true, false)));
+    }
+    // Non-codable physical codebooks reject a coded layout even with complete planes.
+    for (const std::uint8_t cb : {0, 4, 6, 19, 23, 25})
+    {
+        SCOPED_TRACE(int(cb));
+        EXPECT_FALSE(NativeQuantisedDescriptorValidation::publishable(descriptor(cb, 0x80u, true, false)));
+        EXPECT_FALSE(NativeQuantisedDescriptorValidation::publishable(descriptor(cb, coded, true, true)));
+    }
+    // A per-block descriptor must not carry a phase or bit shift.
+    EXPECT_TRUE(NativeQuantisedDescriptorValidation::publishable(descriptor(10, 0u, true, true)));
+    EXPECT_FALSE(NativeQuantisedDescriptorValidation::publishable(descriptor(10, 0x03u, true, true)));
+    EXPECT_FALSE(NativeQuantisedDescriptorValidation::publishable(descriptor(10, 0x08u, true, true)));
 }
 
 TEST(Test__NativeQuantisedFormatInfo, RuntimeCaptureEnvelopeCoversEveryTierRepresentation)
@@ -555,8 +637,11 @@ TEST(Test__NativeQuantisedFormatInfo, IQ4XSSourceTupleMappingAndCapacityAreExact
     EXPECT_FALSE(areNativeQuantisedGateUpCodebooksCompatible(24, 5));
     EXPECT_EQ(preparedEncodingForSource(xs), CPUNativeQuantisedEncoding::NibbleLUTSourceScale);
     EXPECT_EQ(preparedEncodingForSource(nl), CPUNativeQuantisedEncoding::NibbleLUT);
-    EXPECT_EQ(preparedFootprintForFormat(xs).weight_bytes_per_n_chunk_k_block, 1408);
-    EXPECT_EQ(preparedFootprintForFormat(nl).weight_bytes_per_n_chunk_k_block, 1280);
+    const auto xs_geometry = preparedBlockGeometry(preparedEncodingForSource(xs), xs.is_asymmetric, xs.codebook_id, 8);
+    EXPECT_EQ(xs_geometry.block_stride, 64 * 16 + 48); // Nibble payload and six-bit codes.
+    EXPECT_EQ(xs_geometry.header_bytes, 64 * 2);
+    EXPECT_EQ(preparedFootprintForFormat(xs).weight_bytes_per_n_chunk_k_block, xs_geometry.rowBytes() / 8);
+    EXPECT_EQ(preparedFootprintForFormat(nl).weight_bytes_per_n_chunk_k_block, 1152);
     EXPECT_EQ(nativeQuantisedPackedRegionSizes(17, 288, xs).logicalBytes(), 17u * 9u * 20u);
     EXPECT_EQ(nativeQuantisedPackedRegionSizes(17, 288, nl).logicalBytes(), 17u * 9u * 18u);
     for (unsigned value = 0; value < 64; ++value)

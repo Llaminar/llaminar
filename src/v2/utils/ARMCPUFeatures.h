@@ -7,12 +7,20 @@
  * CPU, and cannot substitute for these observations. The mandatory ASIMD ABI
  * is checked separately from DotProd, full FP16 arithmetic, BF16 and I8MM.
  * This device-free CPU authority owns no accelerator or mutable model state.
+ *
+ * It also owns the per-thread floating-point profile admission
+ * (ARMFloatingPointProfile): native kernels whose bytes depend on FPCR
+ * rounding, flush or half-format controls admit the executing thread's FPCR
+ * against the one profile their contract is defined under and fail fatally
+ * otherwise. Nothing here ever writes FPCR.
  */
 #pragma once
 
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <initializer_list>
 #include <string>
 #include <stdexcept>
@@ -250,5 +258,69 @@ namespace llaminar2::cpu
         }
 
         std::uint32_t features_ = 0; ///< Native observation bits, immutable after construction.
+    };
+
+    /**
+     * @brief The per-thread FPCR profile every native numerical contract is defined under.
+     *
+     * Round-to-nearest-even (FPCR.RMode = 0), no binary32 or binary16 flush to
+     * zero (FZ = 0, FZ16 = 0), the IEEE binary16 format (AHP = 0) and NaN
+     * propagation (DN = 0). This is the process default; no Llaminar code or
+     * bundled library sets any of these bits. Binary32 products and sums,
+     * FCVT/FCVTN conversions and binary16 arithmetic all round, flush or
+     * replace NaNs under these controls, so a kernel that uses them produces
+     * its contract bytes only under this profile. DN = 1 would replace every
+     * NaN result (including a widening of a NaN half) by the positive default
+     * NaN, losing the sign and payload the software codecs preserve. The admission is per thread because FPCR is per thread; it never
+     * changes FPCR (silently overwriting a caller's mode is forbidden).
+     */
+    struct ARMFloatingPointProfile
+    {
+        static constexpr std::uint64_t kRModeMask = 0x3ull << 22; ///< FPCR.RMode.
+        static constexpr std::uint64_t kFZ = 0x1ull << 24;        ///< Binary32/64 flush to zero.
+        static constexpr std::uint64_t kFZ16 = 0x1ull << 19;      ///< Binary16 flush to zero.
+        static constexpr std::uint64_t kAHP = 0x1ull << 26;       ///< Alternative half-precision format.
+        static constexpr std::uint64_t kDN = 0x1ull << 25;        ///< Default-NaN mode.
+
+        /** @return Whether @p fpcr carries the admitted rounding, flush, NaN and half-format controls. */
+        [[nodiscard]] static constexpr bool admitted(std::uint64_t fpcr) noexcept
+        { return (fpcr & (kRModeMask | kFZ | kFZ16 | kAHP | kDN)) == 0; }
+
+        /**
+         * @return The calling thread's FPCR.
+         * @details A compiler builtin rather than inline assembly: headers in
+         * the native tile closure carry no inline assembly (the tile register
+         * witness proves the assembled programs, not asm templates).
+         */
+        [[nodiscard]] static std::uint64_t current() noexcept
+        {
+#if defined(__clang__)
+            return __builtin_arm_rsr64("fpcr");
+#else
+            return __builtin_aarch64_get_fpcr64();
+#endif
+        }
+
+        /**
+         * @brief Fail fatally unless the calling thread runs the admitted profile.
+         * @param consumer Stable name of the kernel entry, part of the diagnostic.
+         * @details Cheap (one system-register read); call it once per worker
+         * task at every native entry whose bytes depend on the profile.
+         */
+        static void require(const char *consumer) noexcept
+        {
+            const auto fpcr = current();
+            if (!admitted(fpcr)) [[unlikely]]
+                reject(consumer, fpcr);
+        }
+
+    private:
+        /** @brief Fatal diagnostic naming the entry and the observed FPCR. */
+        [[noreturn, gnu::cold, gnu::noinline]] static void reject(const char *consumer, std::uint64_t fpcr) noexcept
+        {
+            std::fprintf(stderr, "ERROR: %s requires the process FP profile FPCR.RMode=RNE, FZ=0, FZ16=0, AHP=0, DN=0; "
+                                 "observed FPCR=0x%llx\n", consumer, static_cast<unsigned long long>(fpcr));
+            std::abort();
+        }
     };
 } // namespace llaminar2::cpu

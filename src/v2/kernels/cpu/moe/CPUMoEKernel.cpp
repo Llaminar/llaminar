@@ -24,6 +24,7 @@
 #include "../../cpu/primitives/SoftmaxPrimitives_New.h"
 #include "../../cpu/primitives/GPUAlignedExpertQ8Primitives.h"
 #include "../../cpu/primitives/SwiGLUPrimitives.h"
+#include "../../common/DeviceSwiGLUNumericalContract.h"
 #include "../../cpu/primitives/VectorPrimitives.h"
 #include "../gemm/CPUNativeQuantisedGemv.h"
 #include "../gemm/FloatingPointGemmKernel.h"
@@ -1178,6 +1179,51 @@ namespace llaminar2
                 float *probabilities =
                     result.router_logits.data() +
                     static_cast<size_t>(row) * num_experts;
+                if (!router_scoring_.isSoftmax())
+                {
+                    // DeepSeek-V4: s = sqrt(softplus(logit)); select by s + bias
+                    // (or the token's hash row); weights are the unbiased s,
+                    // normalized and scaled. Ties break to the lower expert id.
+                    for (int e = 0; e < num_experts; ++e)
+                    {
+                        const float x = probabilities[e];
+                        probabilities[e] = std::sqrt(x > 20.0f ? x : std::log1p(std::exp(x)));
+                    }
+                    thread_local std::vector<int> chosen;
+                    chosen.resize(static_cast<size_t>(top_k));
+                    const bool image_row = router_scoring_.image_bias && router_scoring_.token_ids &&
+                        router_scoring_.isImageToken(router_scoring_.token_ids[row]);
+                    if (router_scoring_.hash_table && !image_row)
+                    {
+                        const int token = router_scoring_.token_ids[row];
+                        for (int k = 0; k < top_k; ++k)
+                            chosen[k] = router_scoring_.hash_table[static_cast<size_t>(token) * top_k + k];
+                    }
+                    else
+                    {
+                        thread_local std::vector<int> order;
+                        order.resize(static_cast<size_t>(num_experts));
+                        std::iota(order.begin(), order.end(), 0);
+                        const float *bias = image_row ? router_scoring_.image_bias : router_scoring_.selection_bias;
+                        std::partial_sort(order.begin(), order.begin() + top_k, order.end(),
+                            [probabilities, bias](int left, int right) {
+                                const float l = probabilities[left] + bias[left];
+                                const float r = probabilities[right] + bias[right];
+                                return l > r || (l == r && left < right);
+                            });
+                        std::copy(order.begin(), order.begin() + top_k, chosen.begin());
+                    }
+                    float sum = 0.0f;
+                    for (int k = 0; k < top_k; ++k) sum += probabilities[chosen[k]];
+                    for (int k = 0; k < top_k; ++k)
+                    {
+                        const size_t route_index = static_cast<size_t>(row) * top_k + k;
+                        result.expert_indices[route_index] = chosen[k];
+                        result.expert_weights[route_index] =
+                            probabilities[chosen[k]] / sum * router_scoring_.route_scale;
+                    }
+                    continue;
+                }
                 primitives::softmax_row_fp32(probabilities, num_experts);
 
                 /*
@@ -1378,7 +1424,37 @@ namespace llaminar2
 
     void CPUMoEKernel::swiGLU(float *gate, const float *up, int count)
     {
+        if (swiglu_limit_ > 0.0f)
+        {
+            // `up` is read-only here; clamp both operands through the shared
+            // contract while producing the activation in place of `gate`.
+            for (int i = 0; i < count; ++i)
+                gate[i] = device_swiglu_contract::swigluValue(gate[i], up[i], swiglu_limit_);
+            return;
+        }
         primitives::compute_swiglu_gpu_aligned_expert(gate, up, gate, count);
+    }
+
+    bool CPUMoEKernel::clampSwiGLUOperands(ITensor *gate, ITensor *up, int count, float limit)
+    {
+        if (limit <= 0.0f)
+            return true;
+        auto *gate_tensor = dynamic_cast<FP32Tensor *>(gate);
+        auto *up_tensor = dynamic_cast<FP32Tensor *>(up);
+        if (!gate_tensor || !up_tensor || count < 0 ||
+            gate_tensor->numel() < static_cast<size_t>(count) || up_tensor->numel() < static_cast<size_t>(count))
+            return false;
+        float *g = gate_tensor->mutable_data();
+        float *u = up_tensor->mutable_data();
+        // Element-wise and order-free: exact min/max, so any partition is byte-identical.
+        auto clamp = [&]()
+        {
+#pragma omp for schedule(static)
+            for (int i = 0; i < count; ++i)
+                device_swiglu_contract::clampOperands(g[i], u[i], limit);
+        };
+        OMP_WORKSHARE_REGION(clamp);
+        return true;
     }
 
 } // namespace llaminar2

@@ -292,9 +292,11 @@ static int workspaceBoundedKparTileRows(
 struct CUDARowMajorWeights_
 {
     uint8_t *d_payload = nullptr;
-    uint16_t *d_scales = nullptr;
-    uint16_t *d_mins = nullptr;
+    void *d_primary = nullptr;   ///< Transposed primary words or block codes.
+    void *d_secondary = nullptr; ///< Transposed secondary words or [N, S] superblock words.
     uint32_t *d_emins = nullptr;
+    /** Row-major view of the planes above; the phase is the source matrix's. */
+    ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes meta{};
     int N = 0;
     int K_blocks = 0;
     int device_id = -1;
@@ -629,10 +631,8 @@ namespace
         int dot_lo,
         int dot_hi,
         const uint8_t *__restrict__ payload,
-        const uint16_t *__restrict__ d_scales,
-        const uint16_t *__restrict__ d_mins,
-        const uint32_t *__restrict__ d_emins,
-        size_t linear,
+        ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes d_meta,
+        ::llaminar2::native_quantised_scale::BlockAddress address,
         float scale_a)
     {
         using Traits =
@@ -657,10 +657,10 @@ namespace
             subgroup_sums[group / 2] += group_sum;
         }
 
-        const uint16_t secondary_bits =
-            d_mins ? d_mins[linear] : uint16_t{0};
-        const uint32_t emin_bits =
-            d_emins ? d_emins[linear] : uint32_t{0};
+        // One authority reconstructs the staged words for either metadata
+        // representation; the contribution arithmetic below is unchanged.
+        const auto metadata =
+            ::llaminar2::native_quantised_scale::loadBlockMetadata<CB>(d_meta, address);
         const uint16_t iq1m_qh =
             Traits::is_iq1_m
                 ? static_cast<uint16_t>(payload[4]) |
@@ -672,9 +672,9 @@ namespace
                 dot_lo,
                 dot_hi,
                 scale_a,
-                ::llaminar2::native_quantised_scale::loadStagedPrimary<CB>(d_scales, linear),
-                secondary_bits,
-                emin_bits,
+                metadata.primary,
+                metadata.secondary,
+                metadata.emin,
                 sum_a,
                 sum_lo,
                 sum_hi,
@@ -699,10 +699,8 @@ namespace
         const int32_t *__restrict__ a_vals,
         const int32_t *__restrict__ packed_groups,
         const uint8_t *__restrict__ payload,
-        const uint16_t *__restrict__ d_scales,
-        const uint16_t *__restrict__ d_mins,
-        const uint32_t *__restrict__ d_emins,
-        size_t linear,
+        ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes d_meta,
+        ::llaminar2::native_quantised_scale::BlockAddress address,
         float scale_a)
     {
         int dot_lo = 0;
@@ -728,10 +726,8 @@ namespace
             dot_lo,
             dot_hi,
             payload,
-            d_scales,
-            d_mins,
-            d_emins,
-            linear,
+            d_meta,
+            address,
             scale_a);
     }
 
@@ -746,6 +742,50 @@ namespace
 
     // =====================================================================
     // Row-major weight layout for row-parallel GEMV
+    /**
+     * @brief Transpose a bit-packed code plane from block-major to row-major.
+     * @param src Block-major codes starting at bit @p src_shift.
+     * @param dst Row-major destination (4-byte aligned, starting at bit 0).
+     * @param bits Code width; each thread moves one code with disjoint-bit atomics.
+     */
+    __global__ void transpose_codes_kernel(
+        const uint8_t *__restrict__ src, uint8_t *__restrict__ dst,
+        int N, int K_blocks, uint32_t bits, uint32_t src_shift)
+    {
+        const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+        if (idx >= N * K_blocks)
+            return;
+        const int n = idx / K_blocks;
+        const int blk = idx % K_blocks;
+        namespace sb = ::llaminar2::native_quantised_superblock;
+        const uint32_t code = sb::loadPackedBits(
+            src, src_shift + (static_cast<size_t>(blk) * N + n) * bits, bits);
+        sb::storePackedBits(dst, (static_cast<size_t>(n) * K_blocks + blk) * bits, bits, code);
+    }
+
+    /** @brief Allocate and fill a row-major bit-packed code plane (padded like the source). */
+    static uint8_t *transposeCodes(const uint8_t *d_col, int N, int K_blocks, uint32_t bits, uint32_t shift,
+                                   int cuda_device_id, cudaStream_t stream)
+    {
+        auto *const backend = llaminar2::getCUDABackend();
+        if (!backend)
+            return nullptr;
+        const size_t bytes = (static_cast<size_t>(N) * K_blocks * bits + 7u) / 8u +
+                             ::llaminar2::native_quantised_superblock::kSuperblockCodePlanePadBytes;
+        auto *d_row = static_cast<uint8_t *>(backend->allocate(bytes, cuda_device_id));
+        if (!d_row)
+            return nullptr;
+        const int total = N * K_blocks, threads = 256;
+        transpose_codes_kernel<<<(total + threads - 1) / threads, threads, 0, stream>>>(
+            d_col, d_row, N, K_blocks, bits, shift);
+        if (cudaGetLastError() != cudaSuccess)
+        {
+            backend->free(d_row, cuda_device_id);
+            return nullptr;
+        }
+        return d_row;
+    }
+
     // col_major[blk * N + n] → row_major[n * K_blocks + blk]
     // Each thread transposes one (n, blk) block by copying PB bytes.
     template <int PB>
@@ -1204,9 +1244,7 @@ namespace
     __global__ void nativeQuantisedGemv_wide(
         const int8_t *__restrict__ d_A_int8,
         const uint8_t *__restrict__ d_payload,
-        const uint16_t *__restrict__ d_scales,
-        const uint16_t *__restrict__ d_mins,
-        const uint32_t *__restrict__ d_emins,
+        ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes d_meta,
         float *__restrict__ d_C,
         const float *__restrict__ d_scales_A,
         int N, int K,
@@ -1260,10 +1298,8 @@ namespace
                     a_vals,
                     packed_groups,
                     payload,
-                    d_scales,
-                    d_mins,
-                    d_emins,
-                    linear,
+                    d_meta,
+                    ::llaminar2::native_quantised_scale::blockMajorAddress(d_meta, blk, n, N),
                     scale_a);
                 acc[c] = __fadd_rn(acc[c], contribution);
             }
@@ -1301,9 +1337,7 @@ namespace
     __global__ void nativeQuantisedGemv_kpar(
         const int8_t *__restrict__ d_A_int8,
         const uint8_t *__restrict__ d_payload,
-        const uint16_t *__restrict__ d_scales,
-        const uint16_t *__restrict__ d_mins,
-        const uint32_t *__restrict__ d_emins,
+        ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes d_meta,
         float *__restrict__ d_C,
         const float *__restrict__ d_scales_A,
         int N, int K, int kb,
@@ -1386,10 +1420,8 @@ namespace
                     a_vals,
                     packed_groups,
                     payload,
-                    d_scales,
-                    d_mins,
-                    d_emins,
-                    linear,
+                    d_meta,
+                    ::llaminar2::native_quantised_scale::blockMajorAddress(d_meta, blk, n, N),
                     scale_a);
                 acc[c] = __fadd_rn(acc[c], contribution);
             }
@@ -1435,8 +1467,7 @@ namespace
      */
     template <uint8_t CB, int Columns, class Rows = llaminar2::DeviceRowRange>
     __global__ void nativeQuantisedGemv_fusedKpar(
-        const int8_t *activations, const uint8_t *payload, const uint16_t *scales,
-        const uint16_t *secondary, const uint32_t *extended_minima, float *output,
+        const int8_t *activations, const uint8_t *payload, ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes metadata, float *output,
         const float *activation_scales, int n, int k, int kb, float alpha,
         float beta, const float *existing, const float *bias, Rows work)
     {
@@ -1466,8 +1497,8 @@ namespace
                 int32_t groups[8];
                 llaminar2::cuda_native_quantised::decode_groups_vec<CB>(packed, groups);
                 accumulator = __fadd_rn(accumulator, native_quantised_block_contribution_rn<CB>(
-                    values, groups, packed, scales, secondary, extended_minima,
-                    linear, activation_scales[block]));
+                    values, groups, packed, metadata,
+                    ::llaminar2::native_quantised_scale::blockMajorAddress(metadata, block, column, n), activation_scales[block]));
             }
         partials[partition * Columns + lane] = alpha * accumulator;
         __syncthreads();
@@ -1508,24 +1539,23 @@ namespace
     /** @brief Submit one admitted candidate; never alter its arithmetic partition tree. */
     template <uint8_t CB>
     bool launchFusedKpar(
-        const int8_t *activations, const uint8_t *payload, const uint16_t *scales,
-        const uint16_t *secondary, const uint32_t *extended_minima, float *output,
+        const int8_t *activations, const uint8_t *payload, ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes metadata, float *output,
         const float *activation_scales, int n, float alpha, float beta,
         const float *existing, const float *bias, cudaStream_t stream,
         const llaminar2::CUDACanonicalKpartFoldPlan &plan)
     {
         using Traits = llaminar2::cuda_native_quantised::CodebookTraits<CB>;
         if constexpr (Traits::requires_secondary_metadata)
-            if (!secondary) return false;
+            if (!metadata.secondary) return false;
         if constexpr (Traits::is_dual_scale_asym)
-            if (!extended_minima) return false;
+            if (!metadata.coded() && !metadata.emins) return false;
         const auto launch = [&]<int Columns>() {
             // Division without n+Columns-1 avoids overflow near the ABI limit.
             llaminar2::dispatchProjectionRows(1,nullptr,[&](auto work) {
             nativeQuantisedGemv_fusedKpar<CB, Columns><<<
                 1 + (n - 1) / Columns, dim3(Columns, plan.partitions()),
                 plan.sharedBytes(), stream>>>(
-                activations, payload, scales, secondary, extended_minima, output,
+                activations, payload, metadata, output,
                 activation_scales, n, plan.reductionElements(), plan.partitions(),
                 alpha, beta, existing, bias, work);
             });
@@ -1580,9 +1610,7 @@ namespace
     __global__ void nativeQuantisedGemv_rowpar(
         const int8_t *__restrict__ d_A_int8,
         const uint8_t *__restrict__ d_payload_rm,
-        const uint16_t *__restrict__ d_scales_rm,
-        const uint16_t *__restrict__ d_mins_rm,
-        const uint32_t *__restrict__ d_emins_rm,
+        ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes d_meta_rm,
         float *__restrict__ d_C,
         const float *__restrict__ d_scales_A,
         int N, int K,
@@ -1629,6 +1657,8 @@ namespace
 
             // Row-major indexing: [n, blk]
             const size_t linear = static_cast<size_t>(n) * k_blocks + blk;
+            const auto rm_meta = ::llaminar2::native_quantised_scale::loadBlockMetadata<CB>(
+                d_meta_rm, ::llaminar2::native_quantised_scale::rowMajorAddress(d_meta_rm, blk, n, k_blocks));
             const uint8_t *payload = d_payload_rm + linear * PB;
 
             int32_t packed_groups[8];
@@ -1648,14 +1678,14 @@ namespace
                 }
 
                 const auto scales = llaminar2::cuda_native_quantised::native_quantised_dual_scales_rn<CB>(
-                    ::llaminar2::native_quantised_scale::loadStagedPrimary<CB>(d_scales_rm, linear), d_mins_rm ? d_mins_rm[linear] : uint16_t{0});
+                    rm_meta.primary, rm_meta.secondary);
                 const float scale_lo = scales.low;
                 const float scale_hi = scales.high;
                 acc += scale_a * (scale_lo * static_cast<float>(dot_lo) + scale_hi * static_cast<float>(dot_hi));
 
                 if constexpr (llaminar2::cuda_native_quantised::CodebookTraits<CB>::is_dual_scale_asym)
                 {
-                    const uint32_t emin = d_emins_rm ? d_emins_rm[linear] : 0u;
+                    const uint32_t emin = rm_meta.emin;
                     const float min_lo = llaminar2::cuda_native_quantised::fp16_bits_to_float(static_cast<uint16_t>(emin));
                     const float min_hi = llaminar2::cuda_native_quantised::fp16_bits_to_float(static_cast<uint16_t>(emin >> 16));
                     acc += scale_a * (min_lo * static_cast<float>(sum_lo) + min_hi * static_cast<float>(sum_hi));
@@ -1690,12 +1720,12 @@ namespace
                 }
 
                 const float scale_b = llaminar2::cuda_native_quantised::native_quantised_single_scale_rn<CB>(
-                    ::llaminar2::native_quantised_scale::loadStagedPrimary<CB>(d_scales_rm, linear), d_mins_rm ? d_mins_rm[linear] : uint16_t{0});
+                    rm_meta.primary, rm_meta.secondary);
                 acc += scale_a * scale_b * static_cast<float>(dot);
 
                 if constexpr (llaminar2::cuda_native_quantised::CodebookTraits<CB>::is_asymmetric)
                 {
-                    const float min_b = d_mins_rm ? llaminar2::cuda_native_quantised::fp16_bits_to_float(d_mins_rm[linear]) : 0.0f;
+                    const float min_b = d_meta_rm.secondary ? llaminar2::cuda_native_quantised::fp16_bits_to_float(rm_meta.secondary) : 0.0f;
                     acc += scale_a * min_b * static_cast<float>(sum_a);
                 }
             }
@@ -1758,9 +1788,7 @@ namespace
     __global__ void nativeQuantisedGemv_rowpar_small_m(
         const int8_t *__restrict__ d_A_int8,
         const uint8_t *__restrict__ d_payload_rm,
-        const uint16_t *__restrict__ d_scales_rm,
-        const uint16_t *__restrict__ d_mins_rm,
-        const uint32_t *__restrict__ d_emins_rm,
+        ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes d_meta_rm,
         float *__restrict__ d_C,
         const float *__restrict__ d_scales_A,
         int M, int N, int K,
@@ -1814,6 +1842,8 @@ namespace
             }
 
             const size_t linear = static_cast<size_t>(n) * k_blocks + blk;
+            const auto rm_meta = ::llaminar2::native_quantised_scale::loadBlockMetadata<CB>(
+                d_meta_rm, ::llaminar2::native_quantised_scale::rowMajorAddress(d_meta_rm, blk, n, k_blocks));
             const uint8_t *payload = d_payload_rm + linear * PB;
 
             int32_t packed_groups[8];
@@ -1822,10 +1852,10 @@ namespace
             if constexpr (llaminar2::cuda_native_quantised::CodebookTraits<CB>::is_dual_scale)
             {
                 const auto scales = llaminar2::cuda_native_quantised::native_quantised_dual_scales_rn<CB>(
-                    ::llaminar2::native_quantised_scale::loadStagedPrimary<CB>(d_scales_rm, linear), d_mins_rm ? d_mins_rm[linear] : uint16_t{0});
+                    rm_meta.primary, rm_meta.secondary);
                 const float scale_lo = scales.low;
                 const float scale_hi = scales.high;
-                const uint32_t emin = d_emins_rm ? d_emins_rm[linear] : 0u;
+                const uint32_t emin = rm_meta.emin;
                 const float min_lo = llaminar2::cuda_native_quantised::fp16_bits_to_float(static_cast<uint16_t>(emin));
                 const float min_hi = llaminar2::cuda_native_quantised::fp16_bits_to_float(static_cast<uint16_t>(emin >> 16));
 
@@ -1883,8 +1913,8 @@ namespace
             else
             {
                 const float scale_b = llaminar2::cuda_native_quantised::native_quantised_single_scale_rn<CB>(
-                    ::llaminar2::native_quantised_scale::loadStagedPrimary<CB>(d_scales_rm, linear), d_mins_rm ? d_mins_rm[linear] : uint16_t{0});
-                const float min_b = d_mins_rm ? llaminar2::cuda_native_quantised::fp16_bits_to_float(d_mins_rm[linear]) : 0.0f;
+                    rm_meta.primary, rm_meta.secondary);
+                const float min_b = d_meta_rm.secondary ? llaminar2::cuda_native_quantised::fp16_bits_to_float(rm_meta.secondary) : 0.0f;
 
 #pragma unroll
                 for (int tile_row = 0; tile_row < ROWS_PER_TILE; ++tile_row)
@@ -2090,9 +2120,7 @@ namespace
     __global__ __launch_bounds__(128, 8) void nativeQuantisedGemvTensorCoreSmallM(
         const int8_t *__restrict__ d_A_int8,
         const uint8_t *__restrict__ d_payload,
-        const uint16_t *__restrict__ d_scales,
-        const uint16_t *__restrict__ d_mins,
-        const uint32_t *__restrict__ d_emins,
+        ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes d_meta,
         float *__restrict__ d_partials,
         const float *__restrict__ d_scales_A,
         int M,
@@ -2243,10 +2271,8 @@ namespace
                         dot_lo[element],
                         dot_hi[element],
                         payload,
-                        d_scales,
-                        d_mins,
-                        d_emins,
-                        linear,
+                        d_meta,
+                        ::llaminar2::native_quantised_scale::blockMajorAddress(d_meta, block, column, N),
                         scale_a);
                 accumulator[element] = __fadd_rn(
                     accumulator[element],
@@ -2273,9 +2299,7 @@ namespace
 #else
         (void)d_A_int8;
         (void)d_payload;
-        (void)d_scales;
-        (void)d_mins;
-        (void)d_emins;
+        (void)d_meta;
         (void)d_partials;
         (void)d_scales_A;
         (void)M;
@@ -2311,9 +2335,7 @@ namespace
     __global__ void nativeQuantisedGemv_kpar_small_m(
         const int8_t *__restrict__ d_A_int8,
         const uint8_t *__restrict__ d_payload,
-        const uint16_t *__restrict__ d_scales,
-        const uint16_t *__restrict__ d_mins,
-        const uint32_t *__restrict__ d_emins,
+        ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes d_meta,
         float *__restrict__ d_C,
         const float *__restrict__ d_scales_A,
         int M, int N, int K, int kb,
@@ -2378,7 +2400,6 @@ namespace
              */
             int32_t packed_groups[CPT][8];
             const uint8_t *payloads[CPT];
-            size_t linears[CPT];
 #pragma unroll
             for (int c = 0; c < CPT; ++c)
             {
@@ -2390,7 +2411,6 @@ namespace
                     d_payload + linear *
                                     llaminar2::cuda_native_quantised::
                                         payload_bytes_for_codebook<CB>();
-                linears[c] = linear;
                 payloads[c] = payload;
                 llaminar2::cuda_native_quantised::decode_groups_vec<CB>(
                     payload,
@@ -2433,10 +2453,8 @@ namespace
                         a_vals,
                         packed_groups[c],
                         payloads[c],
-                        d_scales,
-                        d_mins,
-                        d_emins,
-                        linears[c],
+                        d_meta,
+                        ::llaminar2::native_quantised_scale::blockMajorAddress(d_meta, blk, n, N),
                         scale_a);
                     acc[tile_row][c] = __fadd_rn(acc[tile_row][c], contribution);
                 }
@@ -2535,8 +2553,7 @@ namespace
     template <int TILE_N, int CPT, uint8_t CB>
     bool sweepLaunchKpar(
         const int8_t *d_A_int8, const uint8_t *d_payload,
-        const uint16_t *d_scales, const uint16_t *d_mins,
-        const uint32_t *d_emins, float *d_C,
+        ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes d_meta, float *d_C,
         const float *d_scales_A, int N, int K,
         float alpha, float beta,
         const float *d_C_existing, const float *d_bias,
@@ -2554,8 +2571,7 @@ namespace
         bool MATCH_WIDE_SERIAL = false, class Rows = llaminar2::DeviceRowRange>
     bool launchKparSmallMImpl(
         const int8_t *d_A_int8, const uint8_t *d_payload,
-        const uint16_t *d_scales, const uint16_t *d_mins,
-        const uint32_t *d_emins, float *d_C,
+        ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes d_meta, float *d_C,
         const float *d_scales_A, int M, int N, int K,
         float alpha, float beta,
         const float *d_C_existing, const float *d_bias,
@@ -2681,7 +2697,7 @@ namespace
                 CB,
                 MATCH_WIDE_SERIAL>
                 <<<grid, THREADS, 0, stream>>>(
-                    tile_a, d_payload, d_scales, d_mins, d_emins,
+                    tile_a, d_payload, d_meta,
                     producer_output, tile_scales, tile_m, N, K, kb_capped,
                     alpha, beta, tile_existing, d_bias, tile_rows);
             const cudaError_t launch_error = cudaGetLastError();
@@ -2715,9 +2731,7 @@ namespace
         const GeneratedDispatchTuning &serial_tuning,
         const int8_t *d_A_int8,
         const uint8_t *d_payload,
-        const uint16_t *d_scales,
-        const uint16_t *d_mins,
-        const uint32_t *d_emins,
+        ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes d_meta,
         float *d_C,
         const float *d_scales_A,
         int M,
@@ -2789,9 +2803,7 @@ namespace
                 stream>>>(
                 tile_a,
                 d_payload,
-                d_scales,
-                d_mins,
-                d_emins,
+                d_meta,
                 partials,
                 tile_scales,
                 tile_m,
@@ -2829,9 +2841,7 @@ namespace
     bool launchRowPar(
         const int8_t *d_A_int8,
         const uint8_t *d_payload_rm,
-        const uint16_t *d_scales_rm,
-        const uint16_t *d_mins_rm,
-        const uint32_t *d_emins_rm,
+        ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes d_meta_rm,
         float *d_C,
         const float *d_scales_A, int N, int K,
         float alpha, float beta,
@@ -2844,28 +2854,28 @@ namespace
         case 2:
             llaminar2::dispatchProjectionRows(1,nullptr,[&](auto work) {
             nativeQuantisedGemv_rowpar<2, CB><<<N, 64, 0, stream>>>(
-                d_A_int8, d_payload_rm, d_scales_rm, d_mins_rm, d_emins_rm, d_C,
+                d_A_int8, d_payload_rm, d_meta_rm, d_C,
                 d_scales_A, N, K, alpha, beta, d_C_existing, d_bias, work);
             });
             break;
         case 4:
             llaminar2::dispatchProjectionRows(1,nullptr,[&](auto work) {
             nativeQuantisedGemv_rowpar<4, CB><<<N, 128, 0, stream>>>(
-                d_A_int8, d_payload_rm, d_scales_rm, d_mins_rm, d_emins_rm, d_C,
+                d_A_int8, d_payload_rm, d_meta_rm, d_C,
                 d_scales_A, N, K, alpha, beta, d_C_existing, d_bias, work);
             });
             break;
         case 8:
             llaminar2::dispatchProjectionRows(1,nullptr,[&](auto work) {
             nativeQuantisedGemv_rowpar<8, CB><<<N, 256, 0, stream>>>(
-                d_A_int8, d_payload_rm, d_scales_rm, d_mins_rm, d_emins_rm, d_C,
+                d_A_int8, d_payload_rm, d_meta_rm, d_C,
                 d_scales_A, N, K, alpha, beta, d_C_existing, d_bias, work);
             });
             break;
         default:
             llaminar2::dispatchProjectionRows(1,nullptr,[&](auto work) {
             nativeQuantisedGemv_rowpar<4, CB><<<N, 128, 0, stream>>>(
-                d_A_int8, d_payload_rm, d_scales_rm, d_mins_rm, d_emins_rm, d_C,
+                d_A_int8, d_payload_rm, d_meta_rm, d_C,
                 d_scales_A, N, K, alpha, beta, d_C_existing, d_bias, work);
             });
             break;
@@ -2878,9 +2888,7 @@ namespace
     bool launchRowParSmallM(
         const int8_t *d_A_int8,
         const uint8_t *d_payload_rm,
-        const uint16_t *d_scales_rm,
-        const uint16_t *d_mins_rm,
-        const uint32_t *d_emins_rm,
+        ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes d_meta_rm,
         float *d_C,
         const float *d_scales_A, int M, int N, int K,
         float alpha, float beta,
@@ -2894,22 +2902,22 @@ namespace
         {
         case 2:
             nativeQuantisedGemv_rowpar_small_m<ROWS_PER_TILE, 2, CB><<<grid, 64, 0, stream>>>(
-                d_A_int8, d_payload_rm, d_scales_rm, d_mins_rm, d_emins_rm, d_C,
+                d_A_int8, d_payload_rm, d_meta_rm, d_C,
                 d_scales_A, M, N, K, alpha, beta, d_C_existing, d_bias, rows);
             break;
         case 4:
             nativeQuantisedGemv_rowpar_small_m<ROWS_PER_TILE, 4, CB><<<grid, 128, 0, stream>>>(
-                d_A_int8, d_payload_rm, d_scales_rm, d_mins_rm, d_emins_rm, d_C,
+                d_A_int8, d_payload_rm, d_meta_rm, d_C,
                 d_scales_A, M, N, K, alpha, beta, d_C_existing, d_bias, rows);
             break;
         case 8:
             nativeQuantisedGemv_rowpar_small_m<ROWS_PER_TILE, 8, CB><<<grid, 256, 0, stream>>>(
-                d_A_int8, d_payload_rm, d_scales_rm, d_mins_rm, d_emins_rm, d_C,
+                d_A_int8, d_payload_rm, d_meta_rm, d_C,
                 d_scales_A, M, N, K, alpha, beta, d_C_existing, d_bias, rows);
             break;
         default:
             nativeQuantisedGemv_rowpar_small_m<ROWS_PER_TILE, 4, CB><<<grid, 128, 0, stream>>>(
-                d_A_int8, d_payload_rm, d_scales_rm, d_mins_rm, d_emins_rm, d_C,
+                d_A_int8, d_payload_rm, d_meta_rm, d_C,
                 d_scales_A, M, N, K, alpha, beta, d_C_existing, d_bias, rows);
             break;
         }
@@ -2923,8 +2931,7 @@ namespace
         NativeGemvShape shape,
         const GeneratedDispatchTuning &tuning,
         const int8_t *d_A_int8, const uint8_t *d_payload,
-        const uint16_t *d_scales, const uint16_t *d_mins,
-        const uint32_t *d_emins, float *d_C,
+        ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes d_meta, float *d_C,
         const float *d_scales_A, int N, int K,
         float alpha, float beta,
         const float *d_C_existing, const float *d_bias,
@@ -2949,7 +2956,7 @@ namespace
             if (!plan) return false;
             g_last_effective_kb = plan->partitions();
             return launchFusedKpar<CB>(
-                d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
+                d_A_int8, d_payload, d_meta, d_C,
                 d_scales_A, N, alpha, beta, d_C_existing, d_bias, stream, *plan);
         }
 
@@ -2962,7 +2969,7 @@ namespace
                 const int grid_n = (N + 32 - 1) / 32;
                 llaminar2::dispatchProjectionRows(1,nullptr,[&](auto work) {
                 nativeQuantisedGemv_wide<32, 1, CB><<<grid_n, 32, 0, stream>>>(
-                    d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
+                    d_A_int8, d_payload, d_meta, d_C,
                     d_scales_A, N, K, alpha, beta, d_C_existing, d_bias, work);
                 });
                 return cudaGetLastError() == cudaSuccess;
@@ -2972,7 +2979,7 @@ namespace
                 const int grid_n = (N + 64 - 1) / 64;
                 llaminar2::dispatchProjectionRows(1,nullptr,[&](auto work) {
                 nativeQuantisedGemv_wide<64, 1, CB><<<grid_n, 64, 0, stream>>>(
-                    d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
+                    d_A_int8, d_payload, d_meta, d_C,
                     d_scales_A, N, K, alpha, beta, d_C_existing, d_bias, work);
                 });
                 return cudaGetLastError() == cudaSuccess;
@@ -2982,7 +2989,7 @@ namespace
                 const int grid_n = (N + 64 - 1) / 64;
                 llaminar2::dispatchProjectionRows(1,nullptr,[&](auto work) {
                 nativeQuantisedGemv_wide<64, 2, CB><<<grid_n, 32, 0, stream>>>(
-                    d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
+                    d_A_int8, d_payload, d_meta, d_C,
                     d_scales_A, N, K, alpha, beta, d_C_existing, d_bias, work);
                 });
                 return cudaGetLastError() == cudaSuccess;
@@ -2992,7 +2999,7 @@ namespace
                 const int grid_n = (N + 128 - 1) / 128;
                 llaminar2::dispatchProjectionRows(1,nullptr,[&](auto work) {
                 nativeQuantisedGemv_wide<128, 1, CB><<<grid_n, 128, 0, stream>>>(
-                    d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
+                    d_A_int8, d_payload, d_meta, d_C,
                     d_scales_A, N, K, alpha, beta, d_C_existing, d_bias, work);
                 });
                 return cudaGetLastError() == cudaSuccess;
@@ -3002,7 +3009,7 @@ namespace
                 const int grid_n = (N + 128 - 1) / 128;
                 llaminar2::dispatchProjectionRows(1,nullptr,[&](auto work) {
                 nativeQuantisedGemv_wide<128, 2, CB><<<grid_n, 64, 0, stream>>>(
-                    d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
+                    d_A_int8, d_payload, d_meta, d_C,
                     d_scales_A, N, K, alpha, beta, d_C_existing, d_bias, work);
                 });
                 return cudaGetLastError() == cudaSuccess;
@@ -3012,7 +3019,7 @@ namespace
                 const int grid_n = (N + 256 - 1) / 256;
                 llaminar2::dispatchProjectionRows(1,nullptr,[&](auto work) {
                 nativeQuantisedGemv_wide<256, 2, CB><<<grid_n, 128, 0, stream>>>(
-                    d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
+                    d_A_int8, d_payload, d_meta, d_C,
                     d_scales_A, N, K, alpha, beta, d_C_existing, d_bias, work);
                 });
                 return cudaGetLastError() == cudaSuccess;
@@ -3022,7 +3029,7 @@ namespace
                 const int grid_n = (N + 256 - 1) / 256;
                 llaminar2::dispatchProjectionRows(1,nullptr,[&](auto work) {
                 nativeQuantisedGemv_wide<256, 4, CB><<<grid_n, 64, 0, stream>>>(
-                    d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
+                    d_A_int8, d_payload, d_meta, d_C,
                     d_scales_A, N, K, alpha, beta, d_C_existing, d_bias, work);
                 });
                 return cudaGetLastError() == cudaSuccess;
@@ -3032,7 +3039,7 @@ namespace
                 const int grid_n = (N + 512 - 1) / 512;
                 llaminar2::dispatchProjectionRows(1,nullptr,[&](auto work) {
                 nativeQuantisedGemv_wide<512, 4, CB><<<grid_n, 128, 0, stream>>>(
-                    d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
+                    d_A_int8, d_payload, d_meta, d_C,
                     d_scales_A, N, K, alpha, beta, d_C_existing, d_bias, work);
                 });
                 return cudaGetLastError() == cudaSuccess;
@@ -3048,49 +3055,49 @@ namespace
             {
             case 32 * 100 + 1:
                 return sweepLaunchKpar<32, 1, CB>(
-                    d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
+                    d_A_int8, d_payload, d_meta, d_C,
                     d_scales_A, N, K, alpha, beta, d_C_existing, d_bias,
                     tuning.target_waves, tuning.mkg, tuning.max_kb,
                     tuning.exact_kb,
                     tuning.force_two_phase, gemv_ctx, cuda_device_id, stream);
             case 64 * 100 + 1:
                 return sweepLaunchKpar<64, 1, CB>(
-                    d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
+                    d_A_int8, d_payload, d_meta, d_C,
                     d_scales_A, N, K, alpha, beta, d_C_existing, d_bias,
                     tuning.target_waves, tuning.mkg, tuning.max_kb,
                     tuning.exact_kb,
                     tuning.force_two_phase, gemv_ctx, cuda_device_id, stream);
             case 64 * 100 + 2:
                 return sweepLaunchKpar<64, 2, CB>(
-                    d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
+                    d_A_int8, d_payload, d_meta, d_C,
                     d_scales_A, N, K, alpha, beta, d_C_existing, d_bias,
                     tuning.target_waves, tuning.mkg, tuning.max_kb,
                     tuning.exact_kb,
                     tuning.force_two_phase, gemv_ctx, cuda_device_id, stream);
             case 128 * 100 + 1:
                 return sweepLaunchKpar<128, 1, CB>(
-                    d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
+                    d_A_int8, d_payload, d_meta, d_C,
                     d_scales_A, N, K, alpha, beta, d_C_existing, d_bias,
                     tuning.target_waves, tuning.mkg, tuning.max_kb,
                     tuning.exact_kb,
                     tuning.force_two_phase, gemv_ctx, cuda_device_id, stream);
             case 128 * 100 + 2:
                 return sweepLaunchKpar<128, 2, CB>(
-                    d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
+                    d_A_int8, d_payload, d_meta, d_C,
                     d_scales_A, N, K, alpha, beta, d_C_existing, d_bias,
                     tuning.target_waves, tuning.mkg, tuning.max_kb,
                     tuning.exact_kb,
                     tuning.force_two_phase, gemv_ctx, cuda_device_id, stream);
             case 256 * 100 + 2:
                 return sweepLaunchKpar<256, 2, CB>(
-                    d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
+                    d_A_int8, d_payload, d_meta, d_C,
                     d_scales_A, N, K, alpha, beta, d_C_existing, d_bias,
                     tuning.target_waves, tuning.mkg, tuning.max_kb,
                     tuning.exact_kb,
                     tuning.force_two_phase, gemv_ctx, cuda_device_id, stream);
             case 256 * 100 + 4:
                 return sweepLaunchKpar<256, 4, CB>(
-                    d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
+                    d_A_int8, d_payload, d_meta, d_C,
                     d_scales_A, N, K, alpha, beta, d_C_existing, d_bias,
                     tuning.target_waves, tuning.mkg, tuning.max_kb,
                     tuning.exact_kb,
@@ -3102,13 +3109,12 @@ namespace
 
         if (shape == NativeGemvShape::ROWPAR)
         {
-            if (!rowmajor || !rowmajor->d_payload || !rowmajor->d_scales)
+            if (!rowmajor || !rowmajor->d_payload || !rowmajor->d_primary)
                 return false;
 
             // tile_n encodes NWARPS for ROWPAR (2, 4, 8)
             return launchRowPar<CB>(
-                d_A_int8, rowmajor->d_payload, rowmajor->d_scales,
-                rowmajor->d_mins, rowmajor->d_emins, d_C,
+                d_A_int8, rowmajor->d_payload, rowmajor->meta, d_C,
                 d_scales_A, N, K, alpha, beta, d_C_existing, d_bias,
                 tuning.tile_n, stream);
         }
@@ -3119,8 +3125,7 @@ namespace
     template <int TILE_N, int CPT, uint8_t CB>
     bool sweepLaunchKpar(
         const int8_t *d_A_int8, const uint8_t *d_payload,
-        const uint16_t *d_scales, const uint16_t *d_mins,
-        const uint32_t *d_emins, float *d_C,
+        ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes d_meta, float *d_C,
         const float *d_scales_A, int N, int K,
         float alpha, float beta,
         const float *d_C_existing, const float *d_bias,
@@ -3134,8 +3139,7 @@ namespace
     bool dispatchKparSmallMGeneratedRows(
         const GeneratedDispatchTuning &tuning,
         const int8_t *d_A_int8, const uint8_t *d_payload,
-        const uint16_t *d_scales, const uint16_t *d_mins,
-        const uint32_t *d_emins, float *d_C,
+        ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes d_meta, float *d_C,
         const float *d_scales_A, int M, int N, int K,
         float alpha, float beta,
         const float *d_C_existing, const float *d_bias,
@@ -3146,42 +3150,42 @@ namespace
         {
         case 32 * 100 + 1:
             return launchKparSmallMImpl<32, 1, CB, ROWS_PER_TILE, MATCH_WIDE_SERIAL>(
-                d_A_int8, d_payload, d_scales, d_mins, d_emins,
+                d_A_int8, d_payload, d_meta,
                 d_C, d_scales_A, M, N, K, alpha, beta, d_C_existing, d_bias,
                 tuning.target_waves, tuning.mkg, tuning.max_kb,
                 tuning.exact_kb,
                 tuning.force_two_phase, cuda_device_id, stream, gemv_ctx, rows);
         case 64 * 100 + 1:
             return launchKparSmallMImpl<64, 1, CB, ROWS_PER_TILE, MATCH_WIDE_SERIAL>(
-                d_A_int8, d_payload, d_scales, d_mins, d_emins,
+                d_A_int8, d_payload, d_meta,
                 d_C, d_scales_A, M, N, K, alpha, beta, d_C_existing, d_bias,
                 tuning.target_waves, tuning.mkg, tuning.max_kb,
                 tuning.exact_kb,
                 tuning.force_two_phase, cuda_device_id, stream, gemv_ctx, rows);
         case 64 * 100 + 2:
             return launchKparSmallMImpl<64, 2, CB, ROWS_PER_TILE, MATCH_WIDE_SERIAL>(
-                d_A_int8, d_payload, d_scales, d_mins, d_emins,
+                d_A_int8, d_payload, d_meta,
                 d_C, d_scales_A, M, N, K, alpha, beta, d_C_existing, d_bias,
                 tuning.target_waves, tuning.mkg, tuning.max_kb,
                 tuning.exact_kb,
                 tuning.force_two_phase, cuda_device_id, stream, gemv_ctx, rows);
         case 128 * 100 + 1:
             return launchKparSmallMImpl<128, 1, CB, ROWS_PER_TILE, MATCH_WIDE_SERIAL>(
-                d_A_int8, d_payload, d_scales, d_mins, d_emins,
+                d_A_int8, d_payload, d_meta,
                 d_C, d_scales_A, M, N, K, alpha, beta, d_C_existing, d_bias,
                 tuning.target_waves, tuning.mkg, tuning.max_kb,
                 tuning.exact_kb,
                 tuning.force_two_phase, cuda_device_id, stream, gemv_ctx, rows);
         case 128 * 100 + 2:
             return launchKparSmallMImpl<128, 2, CB, ROWS_PER_TILE, MATCH_WIDE_SERIAL>(
-                d_A_int8, d_payload, d_scales, d_mins, d_emins,
+                d_A_int8, d_payload, d_meta,
                 d_C, d_scales_A, M, N, K, alpha, beta, d_C_existing, d_bias,
                 tuning.target_waves, tuning.mkg, tuning.max_kb,
                 tuning.exact_kb,
                 tuning.force_two_phase, cuda_device_id, stream, gemv_ctx, rows);
         case 256 * 100 + 2:
             return launchKparSmallMImpl<256, 2, CB, ROWS_PER_TILE, MATCH_WIDE_SERIAL>(
-                d_A_int8, d_payload, d_scales, d_mins, d_emins,
+                d_A_int8, d_payload, d_meta,
                 d_C, d_scales_A, M, N, K, alpha, beta, d_C_existing, d_bias,
                 tuning.target_waves, tuning.mkg, tuning.max_kb,
                 tuning.exact_kb,
@@ -3195,14 +3199,14 @@ namespace
              * otherwise valid decode-equivalent projection to fail.
              */
             return launchKparSmallMImpl<256, 4, CB, ROWS_PER_TILE, MATCH_WIDE_SERIAL>(
-                d_A_int8, d_payload, d_scales, d_mins, d_emins,
+                d_A_int8, d_payload, d_meta,
                 d_C, d_scales_A, M, N, K, alpha, beta, d_C_existing, d_bias,
                 tuning.target_waves, tuning.mkg, tuning.max_kb,
                 tuning.exact_kb,
                 tuning.force_two_phase, cuda_device_id, stream, gemv_ctx, rows);
         case 512 * 100 + 4:
             return launchKparSmallMImpl<512, 4, CB, ROWS_PER_TILE, MATCH_WIDE_SERIAL>(
-                d_A_int8, d_payload, d_scales, d_mins, d_emins,
+                d_A_int8, d_payload, d_meta,
                 d_C, d_scales_A, M, N, K, alpha, beta, d_C_existing, d_bias,
                 tuning.target_waves, tuning.mkg, tuning.max_kb,
                 tuning.exact_kb,
@@ -3225,8 +3229,7 @@ namespace
         const GeneratedDispatchTuning &tuning,
         int grouped_rows,
         const int8_t *d_A_int8, const uint8_t *d_payload,
-        const uint16_t *d_scales, const uint16_t *d_mins,
-        const uint32_t *d_emins, float *d_C,
+        ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes d_meta, float *d_C,
         const float *d_scales_A, int M, int N, int K,
         float alpha, float beta,
         const float *d_C_existing, const float *d_bias,
@@ -3237,32 +3240,32 @@ namespace
         {
         case 4:
             return dispatchKparSmallMGeneratedRows<4, CB, MATCH_WIDE_SERIAL>(
-                tuning, d_A_int8, d_payload, d_scales, d_mins, d_emins,
+                tuning, d_A_int8, d_payload, d_meta,
                 d_C, d_scales_A, M, N, K, alpha, beta,
                 d_C_existing, d_bias, gemv_ctx, cuda_device_id, stream, rows);
         case 8:
             return dispatchKparSmallMGeneratedRows<8, CB, MATCH_WIDE_SERIAL>(
-                tuning, d_A_int8, d_payload, d_scales, d_mins, d_emins,
+                tuning, d_A_int8, d_payload, d_meta,
                 d_C, d_scales_A, M, N, K, alpha, beta,
                 d_C_existing, d_bias, gemv_ctx, cuda_device_id, stream, rows);
         case 16:
             return dispatchKparSmallMGeneratedRows<16, CB, MATCH_WIDE_SERIAL>(
-                tuning, d_A_int8, d_payload, d_scales, d_mins, d_emins,
+                tuning, d_A_int8, d_payload, d_meta,
                 d_C, d_scales_A, M, N, K, alpha, beta,
                 d_C_existing, d_bias, gemv_ctx, cuda_device_id, stream, rows);
         case 32:
             return dispatchKparSmallMGeneratedRows<32, CB, MATCH_WIDE_SERIAL>(
-                tuning, d_A_int8, d_payload, d_scales, d_mins, d_emins,
+                tuning, d_A_int8, d_payload, d_meta,
                 d_C, d_scales_A, M, N, K, alpha, beta,
                 d_C_existing, d_bias, gemv_ctx, cuda_device_id, stream, rows);
         case 64:
             return dispatchKparSmallMGeneratedRows<64, CB, MATCH_WIDE_SERIAL>(
-                tuning, d_A_int8, d_payload, d_scales, d_mins, d_emins,
+                tuning, d_A_int8, d_payload, d_meta,
                 d_C, d_scales_A, M, N, K, alpha, beta,
                 d_C_existing, d_bias, gemv_ctx, cuda_device_id, stream, rows);
         case 2:
             return dispatchKparSmallMGeneratedRows<2, CB, MATCH_WIDE_SERIAL>(
-                tuning, d_A_int8, d_payload, d_scales, d_mins, d_emins,
+                tuning, d_A_int8, d_payload, d_meta,
                 d_C, d_scales_A, M, N, K, alpha, beta,
                 d_C_existing, d_bias, gemv_ctx, cuda_device_id, stream, rows);
         default:
@@ -3277,8 +3280,7 @@ namespace
     template <uint8_t CB>
     bool dispatchCodebook(
         const int8_t *d_A_int8, const uint8_t *d_payload,
-        const uint16_t *d_scales, const uint16_t *d_mins,
-        const uint32_t *d_emins, float *d_C,
+        ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes d_meta, float *d_C,
         const float *d_scales_A, int N, int K,
         float alpha, float beta,
         const float *d_C_existing, const float *d_bias,
@@ -3350,7 +3352,7 @@ namespace
 
             return dispatchGeneratedTuning<CB>(
                 shape, tuning,
-                d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
+                d_A_int8, d_payload, d_meta, d_C,
                 d_scales_A, N, K, alpha, beta, d_C_existing, d_bias,
                 gemv_ctx, rm_slot ? *rm_slot : nullptr,
                 cuda_device_id, stream);
@@ -3390,7 +3392,7 @@ namespace
 
         return dispatchGeneratedTuning<CB>(
             shape, tuning,
-            d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
+            d_A_int8, d_payload, d_meta, d_C,
             d_scales_A, N, K, alpha, beta, d_C_existing, d_bias,
             gemv_ctx, rm_slot ? *rm_slot : nullptr,
             cuda_device_id, stream);
@@ -3399,8 +3401,7 @@ namespace
     template <uint8_t CB, class Rows = llaminar2::DeviceRowRange>
     bool dispatchCodebookSmallMRowPar(
         const int8_t *d_A_int8, const uint8_t *d_payload,
-        const uint16_t *d_scales, const uint16_t *d_mins,
-        const uint32_t *d_emins, float *d_C,
+        ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes d_meta, float *d_C,
         const float *d_scales_A, int M, int N, int K,
         float alpha, float beta,
         const float *d_C_existing, const float *d_bias,
@@ -3573,9 +3574,7 @@ namespace
                 tuning,
                 d_A_int8,
                 d_payload,
-                d_scales,
-                d_mins,
-                d_emins,
+                d_meta,
                 d_C,
                 d_scales_A,
                 M,
@@ -3624,7 +3623,7 @@ namespace
                 return false;
             return dispatchKparSmallMGenerated<CB, true>(
                 tuning, grouped_rows,
-                d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
+                d_A_int8, d_payload, d_meta, d_C,
                 d_scales_A, M, N, K, alpha, beta, d_C_existing, d_bias,
                 gemv_ctx, cuda_device_id, stream, rows);
         }
@@ -3634,11 +3633,10 @@ namespace
             /* Explicit diagnostic ROWPAR candidates require setup preparation. */
             if (shape == NativeGemvShape::ROWPAR && rm_slot)
             {
-                if (*rm_slot && (*rm_slot)->d_payload && (*rm_slot)->d_scales)
+                if (*rm_slot && (*rm_slot)->d_payload && (*rm_slot)->d_primary)
                 {
                     return launchRowParSmallM<CB>(
-                        d_A_int8, (*rm_slot)->d_payload, (*rm_slot)->d_scales,
-                        (*rm_slot)->d_mins, (*rm_slot)->d_emins, d_C,
+                        d_A_int8, (*rm_slot)->d_payload, (*rm_slot)->meta, d_C,
                         d_scales_A, M, N, K, alpha, beta, d_C_existing, d_bias,
                         tuning.tile_n, stream, rows);
                 }
@@ -3663,7 +3661,7 @@ namespace
             grouped_tuning.tile_n = 32;
             return dispatchKparSmallMGenerated<CB>(
                 grouped_tuning, grouped_rows,
-                d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
+                d_A_int8, d_payload, d_meta, d_C,
                 d_scales_A, M, N, K, alpha, beta, d_C_existing, d_bias,
                 gemv_ctx, cuda_device_id, stream, rows);
         }
@@ -3672,7 +3670,7 @@ namespace
         {
             return dispatchKparSmallMGenerated<CB>(
                 tuning, grouped_rows,
-                d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
+                d_A_int8, d_payload, d_meta, d_C,
                 d_scales_A, M, N, K, alpha, beta, d_C_existing, d_bias,
                 gemv_ctx, cuda_device_id, stream, rows);
         }
@@ -3680,33 +3678,36 @@ namespace
         return false;
     }
 
-    /** Return the secondary-scale/minimum plane only for formats that own it. */
+    /**
+     * @brief Retain only the metadata planes a codebook's representation owns.
+     *
+     * Per-block codebooks keep the secondary plane only when they consume it and
+     * the Q2_K effective-minimum plane only for dual-scale asymmetric decode.
+     * Superblock-coded codebooks always own both their code and superblock
+     * planes and never an effective-minimum plane.
+     */
     template <uint8_t CB>
-    const uint16_t *secondaryPlaneForCodebook(const uint16_t *d_mins)
+    ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes metadataPlanesForCodebook(
+        ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes planes)
     {
         using Traits = llaminar2::cuda_native_quantised::CodebookTraits<CB>;
-        if constexpr (Traits::requires_secondary_metadata)
-            return d_mins;
-        return nullptr;
-    }
-
-    /** Return the packed asymmetric-minimum plane only for Q2_K. */
-    template <uint8_t CB>
-    const uint32_t *extendedMinimumPlaneForCodebook(const uint32_t *d_emins)
-    {
-        using Traits = llaminar2::cuda_native_quantised::CodebookTraits<CB>;
-        if constexpr (Traits::is_dual_scale_asym)
-            return d_emins;
-        return nullptr;
+        if (planes.coded())
+        {
+            planes.emins = nullptr;
+            return planes;
+        }
+        if constexpr (!Traits::requires_secondary_metadata)
+            planes.secondary = nullptr;
+        if constexpr (!Traits::is_dual_scale_asym)
+            planes.emins = nullptr;
+        return planes;
     }
 
     template<class Rows = llaminar2::DeviceRowRange>
     bool dispatchSmallMByCodebook(
         const int8_t *d_A_int8,
         const uint8_t *d_payload,
-        const uint16_t *d_scales,
-        const uint16_t *d_mins,
-        const uint32_t *d_emins,
+        ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes d_meta,
         float *d_C_fp32,
         const float *d_scales_A_block,
         int M, int N, int K,
@@ -3725,9 +3726,7 @@ namespace
 #define LLAMINAR_DISPATCH_CUDA_NATIVE_QUANTISED_SMALL_M(CODEBOOK)                  \
         case CODEBOOK:                                                  \
             return dispatchCodebookSmallMRowPar<CODEBOOK>(              \
-                d_A_int8, d_payload, d_scales,                           \
-                secondaryPlaneForCodebook<CODEBOOK>(d_mins),            \
-                extendedMinimumPlaneForCodebook<CODEBOOK>(d_emins),     \
+                d_A_int8, d_payload, metadataPlanesForCodebook<CODEBOOK>(d_meta),     \
                 d_C_fp32, d_scales_A_block, M, N, K, alpha, beta,       \
                 d_C_existing, d_bias, gemv_ctx, rm_slot,                \
                 arithmetic_policy_codebook_id,                         \
@@ -3746,8 +3745,7 @@ namespace
     template <int TILE_N, int CPT, uint8_t CB>
     bool sweepLaunchKpar(
         const int8_t *d_A_int8, const uint8_t *d_payload,
-        const uint16_t *d_scales, const uint16_t *d_mins,
-        const uint32_t *d_emins, float *d_C,
+        ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes d_meta, float *d_C,
         const float *d_scales_A, int N, int K,
         float alpha, float beta,
         const float *d_C_existing, const float *d_bias,
@@ -3781,7 +3779,7 @@ namespace
 
         llaminar2::dispatchProjectionRows(1,nullptr,[&](auto work) {
         nativeQuantisedGemv_kpar<TILE_N, CPT, CB><<<grid, THREADS, 0, stream>>>(
-            d_A_int8, d_payload, d_scales, d_mins, d_emins,
+            d_A_int8, d_payload, d_meta,
             d_partials, d_scales_A, N, K, kb_capped, alpha, work);
         });
         {
@@ -3873,14 +3871,14 @@ static double measureCachedGeneratedDispatchNs(
 extern "C"
 {
     bool cudaNativeQuantisedGemvTuned_fp32_withPolicy(
-        const int8_t *, const uint8_t *, const uint16_t *,
-        const uint16_t *, const uint32_t *, float *, const float *,
+        const int8_t *, const uint8_t *, ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes,
+        float *, const float *,
         int, int, float, float, const float *, const float *, uint8_t,
         uint8_t, int, void *, CUDAGemvContext *, CUDARowMajorWeights **);
 
     bool cudaNativeQuantisedGemvTuned_small_m_fp32_withPolicy(
-        const int8_t *, const uint8_t *, const uint16_t *,
-        const uint16_t *, const uint32_t *, float *, const float *,
+        const int8_t *, const uint8_t *, ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes,
+        float *, const float *,
         int, int, int, float, float, const float *, const float *, uint8_t,
         uint8_t, int, void *, CUDAGemvContext *, CUDARowMajorWeights **,
         const llaminar2::DeviceRowRange *row_range = nullptr);
@@ -4150,8 +4148,7 @@ extern "C"
 
     /** @brief Submit the header-declared fold after public stream/buffer validation. */
     bool cudaNativeQuantisedGemvTuned_fusedKpar_fp32(
-        const int8_t *activations, const uint8_t *payload, const uint16_t *scales,
-        const uint16_t *secondary, const uint32_t *extended_minima, float *output,
+        const int8_t *activations, const uint8_t *payload, ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes metadata, float *output,
         const float *activation_scales, int n, float alpha, float beta,
         const float *existing, const float *bias, uint8_t codebook_id, int device,
         void *raw_stream, const llaminar2::CUDACanonicalKpartFoldPlan &plan)
@@ -4161,8 +4158,7 @@ extern "C"
         const auto stream = static_cast<cudaStream_t>(raw_stream);
         (void)device;
 #define LLAMINAR_LAUNCH_FUSED_KPAR(CB) \
-        case CB: return launchFusedKpar<CB>(activations, payload, scales, secondary, \
-            extended_minima, output, activation_scales, n, alpha, beta, existing, bias, stream, plan)
+        case CB: return launchFusedKpar<CB>(activations, payload, metadata, output, activation_scales, n, alpha, beta, existing, bias, stream, plan)
         switch (codebook_id)
         {
             LLAMINAR_CUDA_NATIVE_QUANTISED_GEMV_FOR_EACH_CODEBOOK(LLAMINAR_LAUNCH_FUSED_KPAR);
@@ -4190,9 +4186,7 @@ extern "C"
     bool cudaNativeQuantisedGemvTuned_fp32(
         const int8_t *d_A_int8,
         const uint8_t *d_payload,
-        const uint16_t *d_scales,
-        const uint16_t *d_mins,
-        const uint32_t *d_emins,
+        ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes d_meta,
         float *d_C_fp32,
         const float *d_scales_A_block,
         int N, int K,
@@ -4208,9 +4202,7 @@ extern "C"
         return cudaNativeQuantisedGemvTuned_fp32_withPolicy(
             d_A_int8,
             d_payload,
-            d_scales,
-            d_mins,
-            d_emins,
+            d_meta,
             d_C_fp32,
             d_scales_A_block,
             N,
@@ -4237,9 +4229,7 @@ extern "C"
     bool cudaNativeQuantisedGemvTuned_fp32_withPolicy(
         const int8_t *d_A_int8,
         const uint8_t *d_payload,
-        const uint16_t *d_scales,
-        const uint16_t *d_mins,
-        const uint32_t *d_emins,
+        ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes d_meta,
         float *d_C_fp32,
         const float *d_scales_A_block,
         int N, int K,
@@ -4253,11 +4243,15 @@ extern "C"
         CUDAGemvContext *gemv_ctx,
         CUDARowMajorWeights **rm_slot)
     {
-        if (!d_A_int8 || !d_payload || !d_scales || !d_C_fp32 || !d_scales_A_block)
+        if (!d_A_int8 || !d_payload || !d_meta.primary || !d_C_fp32 || !d_scales_A_block)
             return false;
         if (N <= 0 || K <= 0 || (K % BLOCK_K) != 0)
             return false;
-        if ((codebook_id == 11 || codebook_id == llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook) && !d_mins)
+        if (d_meta.coded() && !::llaminar2::nativeQuantisedSuperblockCodable(codebook_id))
+            return false;
+        if ((codebook_id == 11 || codebook_id == llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook ||
+             d_meta.coded()) &&
+            !d_meta.secondary)
             return false;
         if (!cudaNativeQuantisedGemvTuned_supportsCodebook(codebook_id))
             return false;
@@ -4275,9 +4269,7 @@ extern "C"
 #define LLAMINAR_DISPATCH_CUDA_NATIVE_QUANTISED_M1(CODEBOOK)                       \
         case CODEBOOK:                                                  \
             return dispatchCodebook<CODEBOOK>(                           \
-                d_A_int8, d_payload, d_scales,                           \
-                secondaryPlaneForCodebook<CODEBOOK>(d_mins),            \
-                extendedMinimumPlaneForCodebook<CODEBOOK>(d_emins),     \
+                d_A_int8, d_payload, metadataPlanesForCodebook<CODEBOOK>(d_meta),     \
                 d_C_fp32, d_scales_A_block, N, K, alpha, beta,          \
                 d_C_existing, d_bias, gemv_ctx, rm_slot,                \
                 arithmetic_policy_codebook_id,                         \
@@ -4293,9 +4285,7 @@ extern "C"
     bool cudaNativeQuantisedGemvTuned_small_m_fp32(
         const int8_t *d_A_int8,
         const uint8_t *d_payload,
-        const uint16_t *d_scales,
-        const uint16_t *d_mins,
-        const uint32_t *d_emins,
+        ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes d_meta,
         float *d_C_fp32,
         const float *d_scales_A_block,
         int M,
@@ -4312,9 +4302,7 @@ extern "C"
         return cudaNativeQuantisedGemvTuned_small_m_fp32_withPolicy(
             d_A_int8,
             d_payload,
-            d_scales,
-            d_mins,
-            d_emins,
+            d_meta,
             d_C_fp32,
             d_scales_A_block,
             M,
@@ -4336,9 +4324,7 @@ extern "C"
     bool cudaNativeQuantisedGemvTuned_small_m_fp32_withPolicy(
         const int8_t *d_A_int8,
         const uint8_t *d_payload,
-        const uint16_t *d_scales,
-        const uint16_t *d_mins,
-        const uint32_t *d_emins,
+        ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes d_meta,
         float *d_C_fp32,
         const float *d_scales_A_block,
         int M,
@@ -4354,12 +4340,16 @@ extern "C"
         CUDARowMajorWeights **rm_slot,
         const llaminar2::DeviceRowRange *row_range)
     {
-        if (!d_A_int8 || !d_payload || !d_scales || !d_C_fp32 || !d_scales_A_block)
+        if (!d_A_int8 || !d_payload || !d_meta.primary || !d_C_fp32 || !d_scales_A_block)
             return false;
         if (M <= 0 || (M == 1 && (!row_range || !row_range->countOwner())) ||
             N <= 0 || K <= 0 || (K % BLOCK_K) != 0)
             return false;
-        if ((codebook_id == 11 || codebook_id == llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook) && !d_mins)
+        if (d_meta.coded() && !::llaminar2::nativeQuantisedSuperblockCodable(codebook_id))
+            return false;
+        if ((codebook_id == 11 || codebook_id == llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook ||
+             d_meta.coded()) &&
+            !d_meta.secondary)
             return false;
         if (!cudaNativeQuantisedGemvTuned_supportsCodebook(codebook_id))
             return false;
@@ -4375,7 +4365,7 @@ extern "C"
 
         return llaminar2::dispatchProjectionRows(M,row_range,[&](auto rows) {
         return dispatchSmallMByCodebook(
-            d_A_int8, d_payload, d_scales, d_mins, d_emins,
+            d_A_int8, d_payload, d_meta,
             d_C_fp32, d_scales_A_block, M, N, K, alpha, beta,
             d_C_existing, d_bias, codebook_id,
             arithmetic_policy_codebook_id, cuda_device_id,
@@ -4503,11 +4493,10 @@ extern "C"
 
     CUDARowMajorWeights *cudaRowMajorWeights_create(
         const uint8_t *d_payload_col,
-        const uint16_t *d_scales_col,
-        const uint16_t *d_mins_col,
-        const uint32_t *d_emins_col,
+        ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes meta_col,
         int N, int K,
         int payload_bytes,
+        uint8_t codebook_id,
         int device_id,
         void *stream)
     {
@@ -4579,47 +4568,73 @@ extern "C"
             return nullptr;
         }
 
-        // Transpose scales (2 bytes each)
-        rm->d_scales = transposeBuffer<uint16_t, 2>(
-            d_scales_col, N, K_blocks, device_id, s);
-        if (!rm->d_scales)
+        namespace sb = ::llaminar2::native_quantised_superblock;
+        auto *const backend = llaminar2::getCUDABackend();
+        const auto release = [&]() {
+            backend->free(rm->d_payload, device_id);
+            if (rm->d_primary && rm->d_primary != rm->d_payload) backend->free(rm->d_primary, device_id);
+            if (rm->d_secondary) backend->free(rm->d_secondary, device_id);
+            if (rm->d_emins) backend->free(rm->d_emins, device_id);
+            delete rm;
+        };
+        if (meta_col.coded() && !::llaminar2::nativeQuantisedSuperblockCodable(codebook_id))
         {
             llaminar2::getCUDABackend()->free(rm->d_payload, device_id);
             delete rm;
             return nullptr;
         }
-
-        // Transpose mins if present
-        if (d_mins_col)
+        const bool coded = meta_col.coded();
+        if (coded)
         {
-            rm->d_mins = transposeBuffer<uint16_t, 2>(
-                d_mins_col, N, K_blocks, device_id, s);
-            if (!rm->d_mins)
+            // Codes transpose like per-block words; the [S, N] superblock
+            // plane transposes to [N, S], exactly rowMajorAddress()'s order.
+            const int superblocks = static_cast<int>(
+                sb::superblocksPerRow(static_cast<uint32_t>(K_blocks), meta_col.superblock_phase));
+            // Code-in-payload formats read their codes from the transposed payload.
+            rm->d_primary = sb::superblockCodeInPayload(codebook_id) ? static_cast<void *>(rm->d_payload)
+                : static_cast<void *>(transposeCodes(reinterpret_cast<const uint8_t *>(meta_col.primary), N,
+                      K_blocks, sb::superblockCodePlaneBits(codebook_id), meta_col.code_bit_shift, device_id, s));
+            rm->d_secondary = sb::superblockFieldBytes(codebook_id) == 4
+                ? static_cast<void *>(transposeBuffer<uint32_t, 4>(
+                      static_cast<const uint32_t *>(meta_col.secondary), N, superblocks, device_id, s))
+                : static_cast<void *>(transposeBuffer<uint16_t, 2>(
+                      static_cast<const uint16_t *>(meta_col.secondary), N, superblocks, device_id, s));
+            if (!rm->d_primary || !rm->d_secondary)
             {
-                auto *const backend = llaminar2::getCUDABackend();
-                backend->free(rm->d_payload, device_id);
-                backend->free(rm->d_scales, device_id);
-                delete rm;
+                release();
                 return nullptr;
             }
         }
-
-        // Transpose emins if present
-        if (d_emins_col)
+        else
         {
-            rm->d_emins = transposeBuffer<uint32_t, 4>(
-                d_emins_col, N, K_blocks, device_id, s);
-            if (!rm->d_emins)
+            rm->d_primary = transposeBuffer<uint16_t, 2>(meta_col.primary, N, K_blocks, device_id, s);
+            if (!rm->d_primary)
             {
-                auto *const backend = llaminar2::getCUDABackend();
-                backend->free(rm->d_payload, device_id);
-                backend->free(rm->d_scales, device_id);
-                if (rm->d_mins)
-                    backend->free(rm->d_mins, device_id);
-                delete rm;
+                release();
                 return nullptr;
             }
+            if (meta_col.secondary)
+            {
+                rm->d_secondary = transposeBuffer<uint16_t, 2>(
+                    static_cast<const uint16_t *>(meta_col.secondary), N, K_blocks, device_id, s);
+                if (!rm->d_secondary)
+                {
+                    release();
+                    return nullptr;
+                }
+            }
+            if (meta_col.emins)
+            {
+                rm->d_emins = transposeBuffer<uint32_t, 4>(meta_col.emins, N, K_blocks, device_id, s);
+                if (!rm->d_emins)
+                {
+                    release();
+                    return nullptr;
+                }
+            }
         }
+        rm->meta = {static_cast<const uint16_t *>(rm->d_primary), rm->d_secondary, rm->d_emins,
+                    meta_col.superblock_phase, meta_col.representation, 0u};
 
         cudaStreamSynchronize(s);
         return rm;
@@ -4627,9 +4642,7 @@ extern "C"
 
     CUDARowMajorWeights *cudaRowMajorWeights_createForCodebook(
         const uint8_t *d_payload_col,
-        const uint16_t *d_scales_col,
-        const uint16_t *d_mins_col,
-        const uint32_t *d_emins_col,
+        ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes meta_col,
         int N,
         int K,
         uint8_t codebook_id,
@@ -4639,11 +4652,10 @@ extern "C"
 #define LLAMINAR_CREATE_CUDA_ROW_MAJOR(CODEBOOK)                         \
         case CODEBOOK:                                                   \
             return cudaRowMajorWeights_create(                           \
-                d_payload_col, d_scales_col, d_mins_col, d_emins_col,    \
-                N, K,                                                    \
-                llaminar2::cuda_native_quantised::                            \
+                d_payload_col, meta_col, N, K,                          \
+                llaminar2::cuda_native_quantised::                       \
                     CodebookTraits<CODEBOOK>::payload_bytes,              \
-                device_id, stream)
+                CODEBOOK, device_id, stream)
         switch (codebook_id)
         {
             LLAMINAR_CUDA_NATIVE_QUANTISED_GEMV_FOR_EACH_CODEBOOK(
@@ -4695,12 +4707,13 @@ extern "C"
              */
             std::terminate();
         }
+        // A code-in-payload view aliases its primary plane to the payload.
+        if (rm->d_primary && rm->d_primary != rm->d_payload)
+            backend->free(rm->d_primary, rm->device_id);
         if (rm->d_payload)
             backend->free(rm->d_payload, rm->device_id);
-        if (rm->d_scales)
-            backend->free(rm->d_scales, rm->device_id);
-        if (rm->d_mins)
-            backend->free(rm->d_mins, rm->device_id);
+        if (rm->d_secondary)
+            backend->free(rm->d_secondary, rm->device_id);
         if (rm->d_emins)
             backend->free(rm->d_emins, rm->device_id);
         delete rm;

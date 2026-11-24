@@ -60,6 +60,7 @@
 #include "kernels/IMoEKernel.h"
 #include "kernels/KernelFactory.h"
 #include "kernels/common/DeviceFP32NumericalContract.h"
+#include "kernels/common/DeviceSwiGLUNumericalContract.h"
 #include "kernels/cpu/gemm/CPUNativeQuantisedGemmKernel.h"
 #ifdef HAVE_CUDA
 #include "kernels/cuda/gemm/CUDAQuantisedGemmKernel.h"
@@ -334,11 +335,16 @@ namespace llaminar2::test
                 seed);
             TensorBase *weight_ptr = weight.get();
             weights.push_back(std::move(weight));
+            // These matrices are moved between experts and tiers, so they use
+            // the migration-reusable layout (per-block planes) that production
+            // gives every movable routed expert; immutable source-native
+            // superblock matrices are coded and fail closed on movement.
             prepared.push_back(makeGpuPreparedGemm(
                 weight_ptr,
                 device,
                 name,
-                model_id));
+                model_id,
+                GPUPreparedWeightPoolLayout::MigrationReusable));
 
             ITensorGemm *gemm = prepared.back().kernel;
             if (!gemm)
@@ -665,7 +671,8 @@ namespace llaminar2::test
         void expectCPUExpertPacketParity(
             const std::array<ITensorGemm *, 3> &engines,
             const float *hidden, const float *expected,
-            int rows, int d_model, int intermediate);
+            int rows, int d_model, int intermediate,
+            ExpertSwiGLUActivationPolicy activation = {});
 
         /**
          * @brief Extend the complete format inventory with numerical boundary operands.
@@ -716,7 +723,8 @@ namespace llaminar2::test
         const std::vector<QuantizedVerifierFormatCase> &formats =
             native_quantised_transfer_parity_detail::crossTierArithmeticFormats(),
         float input_scale = 1.0f,
-        std::optional<CrossTierArithmeticFormatRange> selected_formats = std::nullopt)
+        std::optional<CrossTierArithmeticFormatRange> selected_formats = std::nullopt,
+        ExpertSwiGLUActivationPolicy activation = {})
     {
         using namespace native_quantised_transfer_parity_detail;
         using CpuKernel =
@@ -778,6 +786,7 @@ namespace llaminar2::test
             llaminar::v2::kernels::KernelFactory::createMoEKernel(device);
         ASSERT_NE(gpu_kernel, nullptr);
         gpu_kernel->setGPUStream(stream);
+        gpu_kernel->setExpertSwiGLUActivationPolicy(activation);
         auto requirements = device.is_cuda()
                                 ? MoEWorkspaceBuffers::cudaMoE(
                                       kMaximumRows,
@@ -974,6 +983,9 @@ namespace llaminar2::test
             for (const auto &input : kInputs)
             {
                 const int rows = input.rows;
+                if (activation.clampsOperands() &&
+                    ((rows != 1 && rows != 3 && rows != 65) || input.amplitude != 1.0f))
+                    continue;
                 SCOPED_TRACE("rows=" + std::to_string(rows) +
                              " amplitude=" + std::to_string(input.amplitude) +
                              " pattern=" + std::to_string(static_cast<int>(input.pattern)));
@@ -1005,13 +1017,6 @@ namespace llaminar2::test
                     cpu_activation_q8.size());
                 std::vector<float> cpu_serial_output(cpu_output.size());
 
-                cpu::native_quantised::quantize_activations_to_q8_1(
-                    hidden->data(),
-                    hidden_q8.data(),
-                    rows,
-                    kDModel,
-                    hidden_blocks_per_row,
-                    CPUProjectionNumericalPolicy::GPUAlignedExpert);
                 const std::array<CpuDescriptor, 2> gate_up{{
                     {
                         .kernel = cpu_kernels[0].get(),
@@ -1042,20 +1047,52 @@ namespace llaminar2::test
                 PartialStorage grouped_partials(std::max(
                     PartialStorage::bundleFloats(gate_up.data(), gate_up.size(), rows),
                     PartialStorage::bundleFloats(down.data(), down.size(), rows)));
-                ASSERT_TRUE(
-                    CpuKernel::
-                        execute_moe_grouped_ffn_transaction_preq_decode_equivalent(
-                            gate_up.data(),
-                            static_cast<int>(gate_up.size()),
-                            kDModel,
-                            cpu_gate.data(),
-                            cpu_up.data(),
-                            cpu_activation_q8.data(),
-                            rows,
-                            kIntermediate,
-                            activation_blocks_per_row,
-                            down.data(),
-                            static_cast<int>(down.size()), grouped_partials.span()));
+                // Small-scale formats may require amplifying the authored hidden rows.
+                // Bound the search and require a clamp-sensitive activation in each cell.
+                bool clamped_value_exercised = false;
+                for (int attempt = 0; attempt != 17; ++attempt)
+                {
+                    cpu::native_quantised::quantize_activations_to_q8_1(
+                        hidden->data(),
+                        hidden_q8.data(),
+                        rows,
+                        kDModel,
+                        hidden_blocks_per_row,
+                        CPUProjectionNumericalPolicy::GPUAlignedExpert);
+                    ASSERT_TRUE(
+                        CpuKernel::
+                            execute_moe_grouped_ffn_transaction_preq_decode_equivalent(
+                                gate_up.data(),
+                                static_cast<int>(gate_up.size()),
+                                kDModel,
+                                cpu_gate.data(),
+                                cpu_up.data(),
+                                cpu_activation_q8.data(),
+                                rows,
+                                kIntermediate,
+                                activation_blocks_per_row,
+                                down.data(),
+                                static_cast<int>(down.size()), grouped_partials.span(),
+                                cpu::native_quantised::FusedOutputJobOwnership::Auto,
+                                cpu::native_quantised::FusedOutputJobOwnership::Auto,
+                                activation.operandLimit()));
+                    if (!activation.clampsOperands())
+                        break;
+                    for (size_t i = 0; i < cpu_gate.size(); ++i)
+                    {
+                        const float clamped = device_swiglu_contract::swigluValue(
+                            cpu_gate[i], cpu_up[i], activation.operandLimit());
+                        const float plain = device_swiglu_contract::swigluValue(cpu_gate[i], cpu_up[i]);
+                        ASSERT_TRUE(std::isfinite(clamped));
+                        clamped_value_exercised |= clamped != plain;
+                    }
+                    if (clamped_value_exercised)
+                        break;
+                    for (size_t i = 0; i < hidden->numel(); ++i)
+                        hidden->mutable_data()[i] *= 2.0f;
+                }
+                if (activation.clampsOperands())
+                    ASSERT_TRUE(clamped_value_exercised) << "fixture never exceeded the clamp";
 
                 /*
                  * Keep an independent M=1 oracle beside the layer-global CPU
@@ -1083,11 +1120,20 @@ namespace llaminar2::test
                         cpu_kernels[1]->packedWeights(),
                         hidden_q8.data() + hidden_offset,
                         cpu_serial_up.data() + intermediate_offset, llaminar2::test::NativeQuantisedTestPartialStorage(cpu_kernels[1]->packedWeights(), 1).span());
-                    primitives::compute_swiglu_gpu_aligned_expert_serial(
-                        cpu_serial_gate.data() + intermediate_offset,
-                        cpu_serial_up.data() + intermediate_offset,
-                        cpu_serial_activation.data() + intermediate_offset,
-                        kIntermediate);
+                    if (activation.clampsOperands())
+                    {
+                        for (int col = 0; col < kIntermediate; ++col)
+                            cpu_serial_activation[intermediate_offset + col] =
+                                device_swiglu_contract::swigluValue(
+                                    cpu_serial_gate[intermediate_offset + col],
+                                    cpu_serial_up[intermediate_offset + col], activation.operandLimit());
+                    }
+                    else
+                        primitives::compute_swiglu_gpu_aligned_expert_serial(
+                            cpu_serial_gate.data() + intermediate_offset,
+                            cpu_serial_up.data() + intermediate_offset,
+                            cpu_serial_activation.data() + intermediate_offset,
+                            kIntermediate);
                     cpu::native_quantised::quantize_activations_to_q8_1(
                         cpu_serial_activation.data() + intermediate_offset,
                         cpu_serial_activation_q8.data() + activation_offset,
@@ -1134,7 +1180,9 @@ namespace llaminar2::test
                     demoted_gate_up.data(), static_cast<int>(demoted_gate_up.size()),
                     kDModel, cpu_gate.data(), cpu_up.data(), cpu_activation_q8.data(),
                     rows, kIntermediate, activation_blocks_per_row,
-                    demoted_down.data(), static_cast<int>(demoted_down.size()), grouped_partials.span()));
+                    demoted_down.data(), static_cast<int>(demoted_down.size()), grouped_partials.span(),
+                    cpu::native_quantised::FusedOutputJobOwnership::Auto,
+                    cpu::native_quantised::FusedOutputJobOwnership::Auto, activation.operandLimit()));
                 expectByteEqual(
                     std::string(backend_label) + " " + format.label +
                         " GPU-demoted CPU gate vs initial CPU M=" + std::to_string(rows),
@@ -1156,7 +1204,7 @@ namespace llaminar2::test
                      demoted.projections[1].engine.get(),
                      demoted.projections[2].engine.get()},
                     hidden->data(), cpu_serial_output.data(),
-                    rows, kDModel, kIntermediate);
+                    rows, kDModel, kIntermediate, activation);
 
                 if (rows == 1)
                 {
@@ -1282,6 +1330,33 @@ namespace llaminar2::test
                     gpu_output,
                     cpu_preweighted_output,
                     kDModel);
+
+                if (activation.clampsOperands())
+                {
+                    // The homogeneous CUDA graph uses static descriptors and direct token output.
+                    auto static_output = TestTensorFactory::createFP32(
+                        {static_cast<size_t>(rows), kDModel});
+                    ASSERT_TRUE(static_output->ensureOnDevice(device, stream));
+                    auto &context = GPUDeviceContextPool::instance().getContext(device);
+                    auto graph = context.createGraphCapture(stream);
+                    ASSERT_NE(graph, nullptr);
+                    ScopedBackendGraphCapture capture(context, *graph, "static clamped expert");
+                    ASSERT_TRUE(capture.begin());
+                    const bool submitted = gpu_kernel->executeStaticRoutedPrefillTransaction(
+                        {stream, &workspace}, routing_indices.get(), routing_weights.get(),
+                        hidden.get(), static_output.get(), original_gate_up_table, original_down_table,
+                        rows, kDModel, kIntermediate, kNumExperts, kTopK);
+                    capture.finish();
+                    ASSERT_TRUE(submitted);
+                    ASSERT_TRUE(graph->instantiate());
+                    ASSERT_TRUE(graph->launch());
+                    TransferEngine::publishDeviceWrite(static_output.get(), device, stream);
+                    ASSERT_TRUE(static_output->ensureOnHost(stream));
+                    ASSERT_TRUE(backend->synchronizeStream(stream, device.ordinal));
+                    expectByteEqual("static clamped GPU vs CPU", std::vector<float>(
+                        static_output->data(), static_output->data() + static_output->numel()),
+                        cpu_preweighted_output, kDModel);
+                }
 
                 if (rows == 1)
                 {
@@ -1488,53 +1563,45 @@ namespace llaminar2::test
                     "CPU promotion did not produce a valid device layout");
             }
 
-            const size_t blocks =
-                static_cast<size_t>(layout.N) *
-                static_cast<size_t>(layout.blocks_per_row);
+            const auto blocks = static_cast<size_t>(layout.gpu_N) * (layout.gpu_K / 32);
+            const bool coded = layout.cpuStorage().coded();
+            const auto planes = coded
+                ? NativeQuantisedMetadataPlaneBytes::coded(layout.gpu_codebook_id,
+                    layout.gpu_N, layout.gpu_K / 32, layout.gpu_superblock_phase)
+                : NativeQuantisedMetadataPlaneBytes::of(blocks,
+                    layout.gpu_codebook_id, layout.gpu_is_asymmetric, layout.gpu_has_emins);
+            const auto allocate = [&](size_t bytes) -> std::unique_ptr<DeviceAllocation> {
+                return bytes ? std::make_unique<DeviceAllocation>(backend, device.ordinal, bytes) : nullptr;
+            };
             PromotedCPUProjection result;
             result.manifest = manifest;
-            result.payload = std::make_unique<DeviceAllocation>(
-                backend,
-                device.ordinal,
-                blocks * layout.gpu_payload_bytes_per_block);
-            // Exact live primary plane (one byte per block for native MXFP4).
-            result.scales = std::make_unique<DeviceAllocation>(
-                backend,
-                device.ordinal,
-                nativeQuantisedScalePlaneLiveBytes(layout.gpu_codebook_id, blocks));
-            if (layout.gpu_is_asymmetric != 0u)
-            {
-                result.mins = std::make_unique<DeviceAllocation>(
-                    backend,
-                    device.ordinal,
-                    blocks * sizeof(uint16_t));
-            }
-            if (layout.gpu_has_emins != 0u)
-            {
-                result.emins = std::make_unique<DeviceAllocation>(
-                    backend,
-                    device.ordinal,
-                    blocks * sizeof(uint32_t));
-            }
+            result.payload = allocate(blocks * layout.gpu_payload_bytes_per_block);
+            result.scales = allocate(planes.scales);
+            result.mins = allocate(planes.secondary);
+            result.emins = allocate(planes.emins);
 
             ExpertTierGpuMutableProjectionView destination{
                 .payload = result.payload->as<uint8_t>(),
-                .scales = result.scales->as<uint16_t>(),
-                .mins = result.mins
-                            ? result.mins->as<uint16_t>()
-                            : nullptr,
-                .emins = result.emins
-                             ? result.emins->as<uint32_t>()
-                             : nullptr,
+                .scales = result.scales ? result.scales->as<uint16_t>() : result.payload->as<uint16_t>(),
+                .mins = result.mins ? result.mins->as<uint16_t>() : nullptr,
+                .emins = result.emins ? result.emins->as<uint32_t>() : nullptr,
                 .payload_bytes = result.payload->bytes(),
-                .scales_bytes = result.scales->bytes(),
-                .mins_bytes = result.mins ? result.mins->bytes() : 0u,
-                .emins_bytes = result.emins ? result.emins->bytes() : 0u,
+                .scales_bytes = coded && planes.scales
+                    ? planes.scales - native_quantised_superblock::kSuperblockCodePlanePadBytes
+                    : planes.scales,
+                .mins_bytes = planes.secondary,
+                .emins_bytes = planes.emins,
+                .metadata_layout = coded ? nativeQuantisedMetadataLayout(
+                    NativeQuantisedMetadataRepresentation::SuperblockCoded,
+                    layout.gpu_superblock_phase) : uint8_t{0},
             };
             if (!destination.validFor(layout))
             {
                 throw std::runtime_error(
-                    "CPU promotion allocation does not satisfy its layout");
+                    "CPU promotion allocation does not satisfy its layout: codebook=" +
+                    std::to_string(layout.gpu_codebook_id) + " phase=" +
+                    std::to_string(layout.gpu_superblock_phase) + " shape=" +
+                    std::to_string(layout.gpu_N) + "x" + std::to_string(layout.gpu_K));
             }
 
             std::string error;
@@ -1542,7 +1609,8 @@ namespace llaminar2::test
                 .device = device,
                 .staging = TransferEngine::instance()
                                .allocatePersistentTransferStagingSlices(
-                                   layout.chunkBytes(layout.maximum_units_per_chunk),
+                                   layout.cpuStorage().maximumWireUnitBytes() *
+                                       layout.maximum_units_per_chunk,
                                    1u,
                                    device)
                                .front(),
@@ -1596,10 +1664,10 @@ namespace llaminar2::test
             }
 
             result.descriptor = DeviceNativeQuantisedMatrixDesc{
-                .payload = result.payload->as<uint8_t>(),
-                .scales = result.scales->get(),
-                .mins = result.mins ? result.mins->get() : nullptr,
-                .emins = result.emins ? result.emins->get() : nullptr,
+                .payload = destination.payload,
+                .scales = destination.scales,
+                .mins = destination.mins,
+                .emins = destination.emins,
                 .n = layout.N,
                 .k = layout.K,
                 .blocks_per_row =
@@ -1608,12 +1676,13 @@ namespace llaminar2::test
                 .allocation_payload_bytes_per_block =
                     layout.gpu_payload_bytes_per_block,
                 .allocation_has_mins =
-                    static_cast<uint8_t>(layout.gpu_is_asymmetric),
+                    static_cast<uint8_t>(planes.secondary != 0),
                 .allocation_has_emins =
-                    static_cast<uint8_t>(layout.gpu_has_emins),
+                    static_cast<uint8_t>(planes.emins != 0),
                 .source_codebook_id = layout.gpu_source_codebook_id,
                 .source_is_superblock = layout.gpu_source_is_superblock,
                 .source_identity_present = 1u,
+                .metadata_layout = destination.metadata_layout,
             };
             return result;
         }

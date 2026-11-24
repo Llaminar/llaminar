@@ -7,6 +7,7 @@
  * not a second live allocation ledger. Tied lookup and LM-head representations
  * remain distinct physical consumers of one logical source tensor.
  */
+#include "loaders/GPUPreparedWeightPoolLayout.h"
 #include "planning/WeightMemoryEstimator.h"
 #include "planning/PreparedWeightPhysicalUses.h"
 #include "planning/ModelMemoryProfile.h"
@@ -21,11 +22,14 @@
 #include "tensors/NativeQuantisedScalePlane.h"
 #include "loaders/PreparedWeightRepresentationContract.h"
 #include "utils/DebugEnv.h"
+#include "utils/Logger.h"
 #include "tensors/BlockStructures.h"
 #include "tensors/NativeQuantisedFormatInfo.h"
 
 #include <algorithm>
 #include <limits>
+#include <map>
+#include <memory>
 #include <stdexcept>
 #include <string_view>
 #include <utility>
@@ -158,13 +162,31 @@ namespace llaminar2
                        : bytes;
         }
 
+        /**
+         * @param coded Whether the prepared matrix stores superblock-coded
+         *        metadata (gpuPreparedSuperblockCoded for its device/layout).
+         * @param complete_columns Whether the matrix spans the source's full K;
+         *        a column shard's superblock phase is unknown here, so its
+         *        superblock plane is priced at the worst phase (conservative).
+         */
         size_t exactGpuPackedMatrixBytes(
             size_t rows,
             size_t columns,
-            const NativeQuantisedFormatInfo &format)
+            const NativeQuantisedFormatInfo &format,
+            bool coded = false,
+            bool complete_columns = true)
         {
-            const NativeQuantisedPackedRegionSizes regions =
+            NativeQuantisedPackedRegionSizes regions =
                 nativeQuantisedPackedRegionSizes(rows, columns, format);
+            if (coded)
+            {
+                const auto planes = NativeQuantisedMetadataPlaneBytes::coded(
+                    canonicalDeviceVnniCodebookId(format), rows, static_cast<uint32_t>(columns / 32),
+                    complete_columns ? 0u : 7u);
+                regions.scales_bytes = planes.scales;
+                regions.mins_bytes = planes.secondary;
+                regions.emins_bytes = 0;
+            }
 
             /*
              * WeightVRAMPool starts every independently-addressable region at
@@ -465,6 +487,10 @@ namespace llaminar2
         const bool owns_terminal = weightScopeOwnsTerminal(components);
 
         WeightEstimate est;
+        // DEBUG-only per-family (native, device) byte breakdown of this estimate.
+        std::unique_ptr<std::map<std::string, std::pair<size_t, size_t>>> debug_families;
+        if (Logger::getInstance().shouldLog(LogLevel::VERBOSITY_DEBUG))
+            debug_families = std::make_unique<std::map<std::string, std::pair<size_t, size_t>>>();
         const WeightShardGeometryResolver geometry_resolver(
             profile, device, shard_index, total_shards, tensor_parallel_assignment);
         // A sealed canonical head proves presence without rescanning the source.
@@ -645,7 +671,17 @@ namespace llaminar2
                         const size_t rows = matrix
                             ? matrix->rows * matrix->instances : selected_elements / t.K;
                         const size_t columns = matrix ? matrix->columns : t.K;
-                        device_size = exactGpuPackedMatrixBytes(rows, columns, *format);
+                        // Immutable source-native weights on a codable device
+                        // store superblock-coded metadata (same predicate as the pool).
+                        const bool coded = gpuPreparedSuperblockCoded(
+                            *format, GPUPreparedWeightPoolLayout::SourceNative, device);
+                        // The shard geometry carries no source column origin:
+                        // unequal TP assignments are only 32-aligned, so a
+                        // superblock-wide slice may still start mid-superblock.
+                        // Any column subset is therefore priced at the worst
+                        // superblock phase (at most one extra word per row).
+                        device_size = exactGpuPackedMatrixBytes(rows, columns, *format, coded,
+                                                                columns == static_cast<size_t>(t.K));
                     }
                     else
                     {
@@ -681,6 +717,17 @@ namespace llaminar2
             if (isLMHeadTensor(t.name))
                 est.lm_head_bytes += device_size;
             est.device_bytes += device_size;
+            if (debug_families)
+            {
+                // Collapse "blk.N." so one row summarizes a tensor family per format.
+                std::string family = t.name;
+                if (family.rfind("blk.", 0) == 0)
+                    if (const auto dot = family.find('.', 4); dot != std::string::npos)
+                        family = "blk.N" + family.substr(dot);
+                auto &row = (*debug_families)[family + " " + t.quant_type];
+                row.first += native;
+                row.second += device_size;
+            }
         };
 
         const auto addTensor=[&](const TensorSizeInfo &t) {
@@ -721,6 +768,10 @@ namespace llaminar2
                 [&](size_t index){addTensor(profile.tensors[index]);});
         } else for(const auto &tensor:profile.tensors)addTensor(tensor);
 
+        if (debug_families)
+            for (const auto &[family, bytes] : *debug_families)
+                LOG_DEBUG("[WeightMemoryEstimator] device=" << device.to_string() << " family=" << family
+                          << " native_bytes=" << bytes.first << " device_bytes=" << bytes.second);
         return est;
     }
 

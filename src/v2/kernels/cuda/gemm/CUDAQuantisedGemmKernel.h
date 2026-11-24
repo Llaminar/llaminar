@@ -170,6 +170,10 @@ namespace llaminar2
              * @param source_identity Exact GGUF arithmetic provenance
              * @param allocation_format Optional reusable-slot capacity; zero
              *        payload identifies an ordinary immutable allocation
+             * @param metadata_layout Packed metadata layout written by the
+             *        producer (nativeQuantisedMetadataLayout); zero is the
+             *        per-block-plane representation. Reusable coded slots
+             *        admit only arrivals with the same native representation.
              */
             CUDAQuantisedGemmKernel(
                 int N, int K, int cuda_device_id,
@@ -177,7 +181,8 @@ namespace llaminar2
                 uint8_t codebook_id, uint32_t blocks_per_row,
                 std::shared_ptr<void> lifetime_owner,
                 NativeQuantisedSourceIdentity source_identity,
-                NativeQuantisedReusableDeviceAllocationFormat allocation_format = {});
+                NativeQuantisedReusableDeviceAllocationFormat allocation_format = {},
+                uint8_t metadata_layout = 0);
 
             ~CUDAQuantisedGemmKernel() override;
 

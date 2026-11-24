@@ -85,7 +85,8 @@ namespace llaminar2
                                       bool is_asymmetric, bool has_emins,
                                       NativeQuantisedScalePlaneWidth scale_plane,
                                       size_t raw_gguf_bytes,
-                                      WeightVRAMPool::ContiguousAlias alias)
+                                      WeightVRAMPool::ContiguousAlias alias,
+                                      std::optional<WeightVRAMPool::SuperblockCodedMetadata> coded)
     {
         planWeightForOwner(
             device_id,
@@ -97,7 +98,7 @@ namespace llaminar2
             has_emins,
             scale_plane,
             raw_gguf_bytes,
-            persistent_owner_, alias);
+            persistent_owner_, alias, coded);
     }
 
     void LoadOrchestrator::planWeightForOwner(
@@ -111,7 +112,8 @@ namespace llaminar2
         NativeQuantisedScalePlaneWidth scale_plane,
         size_t raw_gguf_bytes,
         PhysicalMemoryOwner owner,
-        WeightVRAMPool::ContiguousAlias alias)
+        WeightVRAMPool::ContiguousAlias alias,
+        std::optional<WeightVRAMPool::SuperblockCodedMetadata> coded)
     {
         auto *ctx = findDevice(device_id);
         if (!ctx)
@@ -123,7 +125,7 @@ namespace llaminar2
 
         const size_t bytes_before = ctx->pool->totalPlannedBytes();
         ctx->pool->planWeight(name, N, K, payload_bytes_per_block, is_asymmetric,
-                              has_emins, scale_plane, raw_gguf_bytes, alias);
+                              has_emins, scale_plane, raw_gguf_bytes, alias, coded);
         recordPersistentOwnerGrowth(
             *ctx,
             owner,

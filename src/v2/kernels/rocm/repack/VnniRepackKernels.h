@@ -86,6 +86,30 @@ bool launchVnniRepack(
     NativeQuantisedRepackColumns columns,
     void* stream);
 
+/**
+ * @brief Repack with an explicit packed metadata layout (nativeQuantisedMetadataLayout).
+ * @param metadata_layout Zero writes per-block planes; a superblock-coded
+ *        layout writes per-block codes into @p d_scales and per-superblock
+ *        d/dmin words into @p d_mins (no emins). Its phase must equal
+ *        columns.firstBlock() % 8 and the format must be codable
+ *        (docs/v2/projects/2026-11/GPU_SUPERBLOCK_METADATA_PLAN.md).
+ */
+bool launchVnniRepack(
+    RepackFormat format,
+    const void* d_raw_blocks,
+    uint8_t* d_payload,
+    uint16_t* d_scales,
+    uint16_t* d_mins,
+    uint32_t* d_emins,
+    int N, int K,
+    int output_N,
+    int output_row_offset,
+    int packed_group_rows,
+    int allocation_payload_bytes_per_block,
+    NativeQuantisedRepackColumns columns,
+    uint8_t metadata_layout,
+    void* stream);
+
 bool launchVnniRepack(
     RepackFormat format,
     const void* d_raw_blocks,

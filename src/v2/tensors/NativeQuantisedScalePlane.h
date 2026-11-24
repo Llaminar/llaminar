@@ -25,6 +25,8 @@
 #include <cuda_runtime.h>
 #endif
 
+#include "tensors/NativeQuantisedSuperblockMetadata.h"
+
 #include <cstddef>
 #include <cstdint>
 
@@ -51,6 +53,99 @@ namespace llaminar2
         std::uint8_t physical_codebook) noexcept
     {
         return physical_codebook == 25 ? 1 : 2;
+    }
+
+    /**
+     * @brief Physical representation of one prepared matrix's block metadata.
+     *
+     * `PerBlockPlanes`: primary/secondary/emin words per 32-value block.
+     * `SuperblockCoded`: per-block source scale codes plus per-superblock
+     * `d`/`dmin` (NativeQuantisedSuperblockMetadata.h); loaders reconstruct the
+     * identical per-block words. The representation is a property of each
+     * prepared matrix, chosen by its producer: loader-resident weights use the
+     * coded form, while reusable migration slots keep per-block planes.
+     * docs/v2/projects/2026-11/GPU_SUPERBLOCK_METADATA_PLAN.md.
+     */
+    enum class NativeQuantisedMetadataRepresentation : std::uint8_t
+    {
+        PerBlockPlanes = 0,
+        SuperblockCoded = 1,
+    };
+
+    /**
+     * @brief Packed one-byte metadata layout.
+     *
+     * Bit 7: representation (set = superblock-coded). Bits 0-2: superblock
+     * phase of the first prepared K block. Bits 3-5: bit offset (0..7) of the
+     * matrix's first code inside its bit-packed code plane, which is nonzero
+     * only for a matrix bound at a sub-byte offset of a coalesced run. Bit 6
+     * is reserved.
+     */
+    LLAMINAR_NATIVE_QUANTISED_PLANE_HD constexpr std::uint8_t nativeQuantisedMetadataLayout(
+        NativeQuantisedMetadataRepresentation representation, std::uint32_t superblock_phase,
+        std::uint32_t code_bit_shift = 0) noexcept
+    {
+        return static_cast<std::uint8_t>(
+            (representation == NativeQuantisedMetadataRepresentation::SuperblockCoded ? 0x80u : 0u) |
+            ((code_bit_shift & 7u) << 3) | (superblock_phase & 7u));
+    }
+
+    /** @return Code-plane bit offset encoded in a packed metadata layout byte. */
+    LLAMINAR_NATIVE_QUANTISED_PLANE_HD constexpr std::uint32_t nativeQuantisedLayoutCodeBitShift(
+        std::uint8_t layout) noexcept
+    {
+        return (layout >> 3) & 7u;
+    }
+
+    /** @return Representation encoded in a packed metadata layout byte. */
+    LLAMINAR_NATIVE_QUANTISED_PLANE_HD constexpr NativeQuantisedMetadataRepresentation
+    nativeQuantisedLayoutRepresentation(std::uint8_t layout) noexcept
+    {
+        return (layout & 0x80u) ? NativeQuantisedMetadataRepresentation::SuperblockCoded
+                                : NativeQuantisedMetadataRepresentation::PerBlockPlanes;
+    }
+
+    /** @return Superblock phase encoded in a packed metadata layout byte. */
+    LLAMINAR_NATIVE_QUANTISED_PLANE_HD constexpr std::uint32_t nativeQuantisedLayoutPhase(std::uint8_t layout) noexcept
+    {
+        return layout & 7u;
+    }
+
+    /**
+     * @brief Whether a packed layout is well formed for @p physical_codebook.
+     *
+     * Reserved bits are zero; a coded layout requires a codable codebook; a
+     * per-block layout carries no phase (its addressing never uses one).
+     */
+    LLAMINAR_NATIVE_QUANTISED_PLANE_HD constexpr bool nativeQuantisedLayoutValid(
+        std::uint8_t physical_codebook, std::uint8_t layout) noexcept;
+
+    /**
+     * @brief Whether kernels for physical codebook @p physical_codebook compile the coded path.
+     *
+     * A codebook gains this capability only once every consumer of that
+     * codebook reads metadata through native_quantised_scale::loadBlockMetadata
+     * and every producer can emit it. A coded matrix of an incapable codebook
+     * is rejected by its producer and validators.
+     */
+    LLAMINAR_NATIVE_QUANTISED_PLANE_HD constexpr bool nativeQuantisedSuperblockCodable(
+        std::uint8_t physical_codebook) noexcept
+    {
+        // Q4_K/Q5_K (physical 5/7, shared with Q4_1/Q5_1 whose producers never
+        // code them), Q6_K, Q3_K, Q2_K, the IQ superblock formats and IQ4_XS's
+        // source-scale codebook 24.
+        return physical_codebook == 5 || physical_codebook == 7 ||
+               (physical_codebook >= 8 && physical_codebook <= 17) || physical_codebook == 24;
+    }
+
+    LLAMINAR_NATIVE_QUANTISED_PLANE_HD constexpr bool nativeQuantisedLayoutValid(
+        std::uint8_t physical_codebook, std::uint8_t layout) noexcept
+    {
+        if (layout & 0x40u)
+            return false;
+        if (nativeQuantisedLayoutRepresentation(layout) == NativeQuantisedMetadataRepresentation::SuperblockCoded)
+            return nativeQuantisedSuperblockCodable(physical_codebook);
+        return (layout & 0x3Fu) == 0;
     }
 
     /**
@@ -181,6 +276,22 @@ namespace llaminar2
             bool has_secondary, bool has_emins) noexcept
         {
             return of(block_count, nativeQuantisedScalePlaneWidth(physical_codebook), has_secondary, has_emins);
+        }
+
+        /**
+         * @brief Plane extents of a superblock-coded matrix.
+         * @param physical_codebook Codable execution codebook.
+         * @param rows Matrix rows (all grouped matrices of a packed run).
+         * @param blocks_per_row Prepared 32-value blocks per row.
+         * @param superblock_phase Source-superblock phase of the first prepared block.
+         * @return Code plane in `scales`, superblock plane in `secondary`, no emins.
+         */
+        static NativeQuantisedMetadataPlaneBytes coded(std::uint8_t physical_codebook, std::size_t rows,
+                                                       std::uint32_t blocks_per_row, std::uint32_t superblock_phase)
+        {
+            const auto planes = native_quantised_superblock::planeBytes(physical_codebook, rows, blocks_per_row,
+                                                                        superblock_phase);
+            return {planes.code, planes.superblock, 0u};
         }
 
         /** @brief Plane extents for an explicit primary capacity (slots shared by formats). */

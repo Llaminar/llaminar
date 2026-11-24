@@ -189,6 +189,8 @@ public:
         request.runtime=p.runtime->deviceLayerState(binding_->layer);
         request.hidden=dynamic_cast<TensorBase *>(p.hidden.tensor);
         request.rows=p.live_rows.value_or(DeviceRowRange::fullyActive(1));
+        request.routed_activation=p.swiglu_activation;
+        request.shared_activation=shared_.swiglu_activation;
         request.gate_up_table=binding_->prepared->gate;request.down_table=binding_->prepared->down;
         request.top_k=p.top_k;request.shared=descriptor_;request.shared_input_gate=input_gate_;
         request.route_contributions=p.route_partials.tensor;request.routed_output=p.output.tensor;
@@ -302,6 +304,7 @@ public:
         if(native_router_){mix(reinterpret_cast<std::uintptr_t>(native_router_->gate_weights));mix(native_router_->norm_topk_prob);}
         for(const auto &output:outputs()){mix(reinterpret_cast<std::uintptr_t>(output.tensor));mix(static_cast<unsigned>(output.id));}
         for(const auto *weight:{input_gate_,shared_.gate_w,shared_.up_w,shared_.down_w})mix(reinterpret_cast<std::uintptr_t>(weight));
+        mix(shared_.swiglu_activation.captureWord());
         mix(shared_.intermediate);mix(reinterpret_cast<std::uintptr_t>(shared_.prepared_store));
         // The declarative signature must not change merely because the arena
         // became physical. Native preparation separately seals its complete

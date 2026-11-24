@@ -30,6 +30,8 @@
 namespace llaminar2
 {
     class IBackend;
+    struct GpuExpertPackedDescriptor;
+    struct ContiguousFloatingPointWeightDescriptor;
     class LoadOrchestrator;
     class PhysicalMemoryAuthority;
     enum class PhysicalMemoryOwner : std::uint8_t;
@@ -61,6 +63,13 @@ namespace llaminar2
             /// above, so the initializer sees it); unions max-merge explicitly.
             NativeQuantisedScalePlaneWidth scale_plane = nativeQuantisedScalePlaneWidth(codebook_id);
             ExpertWeightFormat format; ///< Original arithmetic identity.
+            std::uint8_t gpu_superblock_phase = 0; ///< Immutable phase shared by every expert in this projection shard.
+
+            /** @return Whether all immutable layout traits match. */
+            bool operator==(const ProjectionSpec &) const = default;
+
+            /** @return Coded allocation identity, or no coded storage for a per-block format. */
+            [[nodiscard]] std::optional<WeightVRAMPool::SuperblockCodedMetadata> codedDeclaration() const;
         };
 
         /** @brief One projection's persistent allocation and exact geometry. */
@@ -70,6 +79,31 @@ namespace llaminar2
             WeightVRAMPool::WeightSlot slot;
             uint32_t blocks_per_row = 0;
         };
+
+        /** @brief Declare a family from original source identity and the source K phase.
+         * @param label Projection role; @param n Output rows; @param k Input columns.
+         * @param format Source format; @param phase Coded K-root phase (zero for per-block/floating).
+         * @return The same reusable projection specification for allocation and initial adoption.
+         */
+        [[nodiscard]] static ProjectionSpec migrationProjectionSpec(
+            std::string label, int n, int k, ExpertWeightFormat format, uint8_t phase);
+
+        /** @brief Adopt an already materialized quantized resident without allocating or copying.
+         * @param family Original reusable projection specification.
+         * @param resident Validated engine descriptor including actual allocation traits.
+         * @return Recyclable slot over the resident's original planes.
+         * @throws std::invalid_argument If representation, phase or capacity differs.
+         */
+        [[nodiscard]] static ProjectionSlot adoptResidentProjection(
+            ProjectionSpec family, const GpuExpertPackedDescriptor &resident);
+
+        /** @brief Adopt an already materialized floating resident in its original format.
+         * @param family Original floating projection specification.
+         * @param resident Contiguous engine-owned weight matrix.
+         * @return Recyclable slot with the original payload only.
+         */
+        [[nodiscard]] static ProjectionSlot adoptResidentProjection(
+            ProjectionSpec family, const ContiguousFloatingPointWeightDescriptor &resident);
 
         /** @brief Compute-facing slot retained by an expert/epoch lease. */
         struct AcquiredSlot

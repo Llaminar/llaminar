@@ -6,11 +6,14 @@
  * including the shared compact program, not row replay. Four-column ASIMD and
  * explicitly targeted DotProd implementations
  * share payload decode across up to four rows; the I8MM family consumes those
- * rows in SMMLA pairs and must reproduce the SDOT bytes and operand grouping. Logical N tails must neither
+ * rows in SMMLA pairs and must reproduce the SDOT bytes and operand grouping. Every entry
+ * admits the calling thread's FPCR profile and fails fatally under any other one. Logical N tails must neither
  * load nor publish outside the supplied output extent. Full factory/model and
  * worker-scaling certification remains a separate production integration gate.
  */
 #include "kernels/cpu/gemm/CPUNativeNEONPreparedProjection.h"
+#include "kernels/cpu/gemm/CPUNativeNEONProjectionBatch.h"
+#include "tensors/NativeQuantisedSuperblockMetadata.h"
 #include "utils/ARMCPUFeatures.h"
 #include "utils/CPUExplicitRoundingOracle.h"
 #include "utils/NativeQuantisedPreparedByteFixture.h"
@@ -21,6 +24,7 @@
 #include <bit>
 #include <cstdint>
 #include <cmath>
+#include <initializer_list>
 #include <cstring>
 #include <span>
 #include <vector>
@@ -86,15 +90,35 @@ std::vector<Q8_1Block> activationRows(int blocks, int rows)
 int sourceInteger(const CPUNativeQuantisedWeightView &packed, int column, int block, int k)
 {
     const int local = column % 64;
-    const auto *unit = packed.interleavedBase() +
-        (std::size_t(column / 64) * packed.blocks_per_row + block) * packed.interleaved_block_stride;
+    const auto *unit = packed.blockUnit(column / 64, block);
     if (packed.usesExpandedInt8())
     {
         const int raw = unit[(k / 4) * 256 + local * 4 + k % 4];
         return raw < 128 ? raw : raw - 256;
     }
+    if (packed.usesCompactMultiScale() && packed.codebook_id == 11)
+    {
+        const int group = k / 4;
+        const auto qh = unit[512 + local * 4];
+        const auto qs = unit[(group / 4) * 256 + local * 4 + group % 4];
+        const auto signs = group < 6 ? unit[512 + local * 4 + 1 + group / 2] : unit[768 + local];
+        const auto grid = iq3s_grid[qs | (((qh >> group) & 1) << 8)];
+        const int value = (grid >> (8 * (k % 4))) & 255;
+        return signs & (1 << (k % 8)) ? -value : value;
+    }
     const int raw = unit[((k % 16) / 4) * 256 + local * 4 + k % 4];
     const int nibble = k < 16 ? raw & 15 : raw >> 4;
+    if (packed.usesCompactMultiScale() && packed.codebook_id == 7)
+    {
+        const auto qh = unit[1024 + 32 * (k / 4) + local / 2];
+        return nibble + 16 * ((qh >> (4 * (local % 2) + k % 4)) & 1);
+    }
+    if (packed.encoding == CPUNativeQuantisedEncoding::Q5NativeSingleScale)
+    {
+        const auto fifth = unit[1024 + local * 4 + (k % 16) / 4];
+        const int bit = k % 4 + (k < 16 ? 0 : 4);
+        return nibble + 16 * ((fifth >> bit) & 1) - (packed.is_asymmetric ? 0 : 16);
+    }
     if (packed.usesQ6KNativeDualScale())
     {
         const auto *planes = unit + 1024 + (k / 4) * 64 + (local / 16) * 16;
@@ -126,7 +150,7 @@ int sourceInteger(const CPUNativeQuantisedWeightView &packed, int column, int bl
 float appendPreparedReference(const CPUNativeQuantisedWeightView &packed, const Q8_1Block &activation,
     int column, int block, float accumulator)
 {
-    if (packed.usesCompactMultiScale())
+    if (packed.usesCompactMultiScale() && packed.codebook_id != 7 && packed.codebook_id != 11)
         return memoryRoundedAdd(accumulator, ms::scalarReferenceBlock(
             packed, activation, column / 64, block, column % 64));
     int low = 0, high = 0;
@@ -179,12 +203,9 @@ void verifyPrepared(const NativeQuantisedFormatInfo &source, int n, int blocks, 
     SCOPED_TRACE(::testing::Message() << "codebook=" << int(source.codebook_id)
         << " rows=" << Rows << " n=" << n << " blocks=" << blocks << " tree=" << int(Tree)
         << " rotated=" << rotated);
-    // Rotation publishes the symmetric ExpandedInt8 stream for any original
-    // source; the Q8_0 fixture owns that geometry, provenance stays original.
-    NativeQuantisedPreparedByteFixture fixture(rotated ? native_quantised_formats::Q8_0 : source, n, blocks * 32);
-    if (rotated)
-        fixture.descriptor.source = {
-            .codebook_id = source.codebook_id, .is_superblock = source.is_superblock, .present = true};
+    // Use the original source's rotated footprint: non-Q8 rotation still
+    // retains its compensation plane, while signed-Q8 shares the dense unit.
+    NativeQuantisedPreparedByteFixture fixture(source, n, blocks * 32, 4u * 1024u * 1024u, rotated);
     if constexpr (Tree == ms::Reduction::Contiguous)
         fixture.descriptor.numerical_policy = CPUProjectionNumericalPolicy::BackendNative;
     fixture.seedPayloadAndMetadata();
@@ -262,7 +283,7 @@ template <typename Ops> void verifyAllCompact()
             }
     }
 }
-/** @brief Cover all registered sources and all six physical encodings on both arithmetic policies. */
+/** @brief Cover all registered sources and physical encodings on both arithmetic policies. */
 template <typename Ops> void verifyAllPrepared()
 {
     for (const auto &source : native_quantised_formats::kAllSourceFormats)
@@ -294,9 +315,13 @@ template <typename Ops> void verifyTailPadding(const NativeQuantisedFormatInfo &
         NativeQuantisedPreparedByteFixture fixture(source, n, blocks * 32);
         fixture.seedPayloadAndMetadata();
         const auto view = fixture.view();
-        const bool rules = view.usesIQ3SExpandedSourceScale() || view.usesNibbleLUTSourceScale() ||
-            (view.usesCompactMultiScale() && view.codebook_id == 13);
-        if (rules)
+        if (view.superblockCoded())
+        {
+            // Every bit pattern fits the coded planes, but no header bytes may be missing.
+            EXPECT_THROW((void)CPUNativeQuantisedMetadataSeal::validate(fixture.descriptor,
+                fixture.bytes.first(fixture.bytes.size() - 1)), std::invalid_argument);
+        }
+        else if (view.usesIQ3SExpandedSourceScale())
         {
             const int last = view.N_padded / 64 - 1, live = n % 64 == 0 ? 64 : n % 64;
             const std::size_t secondary = std::size_t(view.data_stride) + (view.usesInlineCompensation() ? 256 : 128);
@@ -304,7 +329,7 @@ template <typename Ops> void verifyTailPadding(const NativeQuantisedFormatInfo &
             for (int column = live; column < std::min(64, (live + 3) / 4 * 4 + 4); ++column)
                 for (int block : {0, blocks - 1})
                 {
-                    auto *word = fixture.bytes.data() + (std::size_t(last) * blocks + block) * view.interleaved_block_stride +
+                    auto *word = fixture.bytes.data() + view.geometry().blockOffset(last, block) +
                         secondary + std::size_t(column) * 2;
                     std::uint16_t original = 0;
                     std::memcpy(&original, word, sizeof(original));
@@ -402,6 +427,7 @@ template <typename Ops> void verifyAllPanelWidths()
 {
     for (const auto &source : native_quantised_formats::kAllSourceFormats)
     {
+        // Compact multi-scale tiles keep their own column walk (no panel width).
         if (preparedEncodingForSource(*source.metadata) == CPUNativeQuantisedEncoding::CompactMultiScale)
             continue;
         for (const int n : {1, 5, 8, 12, 15, 16, 17, 20, 31, 33, 47, 63, 64, 65, 100})
@@ -670,8 +696,14 @@ template <std::size_t Rows> void verifyI8MMGrouping(const NativeQuantisedFormatI
             return Tile::template panelStrips<SDOTOps, CPUNativeQuantisedEncoding::NibbleLUTSourceScale>();
         case CPUNativeQuantisedEncoding::NibbleLUT:
             return Tile::template panelStrips<SDOTOps, CPUNativeQuantisedEncoding::NibbleLUT>();
+        case CPUNativeQuantisedEncoding::Q5NativeSingleScale:
+            return packed.is_asymmetric
+                ? Tile::template panelStrips<SDOTOps, CPUNativeQuantisedEncoding::Q5NativeSingleScale, true>()
+                : Tile::template panelStrips<SDOTOps, CPUNativeQuantisedEncoding::Q5NativeSingleScale, false>();
+        case CPUNativeQuantisedEncoding::Q4KSuperblockCoded:
+            return Tile::template panelStrips<SDOTOps, CPUNativeQuantisedEncoding::Q4KSuperblockCoded, true>();
         case CPUNativeQuantisedEncoding::CompactMultiScale:
-            return 1; // Own column walk; no panels.
+            return 1; // Own four-column strip walks; no panels.
         }
         return 0;
     }();
@@ -779,38 +811,48 @@ TEST_F(CPUNativeNEONPreparedProjection, RejectsIncompleteAliasedAndUnalignedExpe
 }
 
 /**
- * @test Opaque source words cannot hide reserved bits by masking them into a
- * usable coefficient. Publication admission rejects them before any tile or
- * worker team exists, so no output is ever authored.
+ * @test Publication rejects reserved bits in inline coefficients or a truncated
+ * coded header before a tile can write output.
  */
-TEST_F(CPUNativeNEONPreparedProjection, RejectsReservedSourceCoefficientBitsBeforeAnyWrite)
+TEST_F(CPUNativeNEONPreparedProjection, RejectsInvalidSourceMetadataBeforeAnyWrite)
 {
-    for (const auto *source : {&native_quantised_formats::IQ2_S, &native_quantised_formats::IQ3_S, &native_quantised_formats::IQ4_XS})
+    // IQ2_S now has an exact-width 8-bit plane, with no reserved storage bits.
+    for (const auto *source : {&native_quantised_formats::IQ3_S, &native_quantised_formats::IQ4_XS})
     {
         SCOPED_TRACE(int(source->codebook_id));
         NativeQuantisedPreparedByteFixture fixture(*source, 8, 32);
         fixture.seedPayloadAndMetadata();
         const auto weights = fixture.view();
-        const auto secondary = weights.data_stride + (weights.usesInlineCompensation() ? 256 : 128);
         const auto activation = activationRows(1, 1);
         const std::array<std::span<const Q8_1Block>, 1> input{std::span(activation)};
         std::array<float, 8> result;
         const std::array<std::span<float>, 1> output{std::span(result)};
         CPUNativeNEONProjectionTile<1>::bind(weights, input, output, 0).execute();
         const auto reference = result;
-        // Every lane of the unit, including the 56 padding columns past N=8.
-        for (int bad_column = 0; bad_column < 64; ++bad_column)
+        if (weights.superblockCoded())
         {
-            SCOPED_TRACE(bad_column);
-            std::uint16_t original = 0;
-            auto *word = fixture.bytes.data() + secondary + bad_column * 2;
-            std::memcpy(&original, word, sizeof(original));
-            const std::uint16_t invalid = 0xffff;
-            std::memcpy(word, &invalid, sizeof(invalid));
             result.fill(123.0f);
-            EXPECT_THROW((void)fixture.view(), std::invalid_argument);
+            EXPECT_THROW((void)CPUNativeQuantisedMetadataSeal::validate(fixture.descriptor,
+                fixture.bytes.first(fixture.bytes.size() - 1)), std::invalid_argument);
             for (const float value : result) EXPECT_EQ(value, 123.0f);
-            std::memcpy(word, &original, sizeof(original));
+        }
+        else
+        {
+            const auto secondary = weights.data_stride + (weights.usesInlineCompensation() ? 256 : 128);
+            // Every lane of the unit, including the 56 padding columns past N=8.
+            for (int bad_column = 0; bad_column < 64; ++bad_column)
+            {
+                SCOPED_TRACE(bad_column);
+                std::uint16_t original = 0;
+                auto *word = fixture.bytes.data() + secondary + bad_column * 2;
+                std::memcpy(&original, word, sizeof(original));
+                const std::uint16_t invalid = 0xffff;
+                std::memcpy(word, &invalid, sizeof(invalid));
+                result.fill(123.0f);
+                EXPECT_THROW((void)fixture.view(), std::invalid_argument);
+                for (const float value : result) EXPECT_EQ(value, 123.0f);
+                std::memcpy(word, &original, sizeof(original));
+            }
         }
         result.fill(123.0f);
         CPUNativeNEONProjectionTile<1>::bind(fixture.view(), input, output, 0).execute();
@@ -851,28 +893,26 @@ TEST_F(CPUNativeNEONPreparedProjection, EveryHalfAndOpaqueWordHasExactBits)
     }
 }
 
-/** @test Native MXFP4 BF16 power-of-two words widen exactly; FP16 interpretation is never used. */
-TEST_F(CPUNativeNEONPreparedProjection, EveryAdmittedPowerOfTwoBF16WordWidensExactly)
+/** @test Native MXFP4 E8M0 bytes widen exactly; FP16 interpretation is never used. */
+TEST_F(CPUNativeNEONPreparedProjection, EveryAdmittedE8M0ByteWidensExactly)
 {
     using Ops = ms::NEONMultiScaleOps<ms::NEONByteDot::ASIMD>;
-    std::vector<std::uint16_t> words{0};
+    std::vector<std::uint8_t> words{0};
     for (int e = 2; e <= 252; ++e)
-        words.push_back(mxfp4::powerOfTwoBF16Word(static_cast<std::uint8_t>(e)));
+        words.push_back(static_cast<std::uint8_t>(e));
     while (words.size() % 4 != 0) words.push_back(0);
     for (std::size_t first = 0; first < words.size(); first += 4)
     {
-        const auto widened = std::bit_cast<std::array<std::uint32_t, 4>>(Ops::bf16(words.data() + first));
+        const auto widened = std::bit_cast<std::array<std::uint32_t, 4>>(Ops::e8m0(words.data() + first));
         for (int lane = 0; lane < 4; ++lane)
         {
-            const auto word = words[first + lane];
-            std::uint8_t e = 0;
-            ASSERT_TRUE(mxfp4::e8m0FromPowerOfTwoBF16Word(word, e));
-            EXPECT_EQ(widened[lane], e == 0 ? 0u : mxfp4::normalScaleFP32Bits(e)) << "word=" << word;
+            const auto e = words[first + lane];
+            EXPECT_EQ(widened[lane], std::uint32_t{mxfp4::powerOfTwoBF16Word(e)} << 16) << "exponent=" << int(e);
         }
     }
 }
 
-/** @test Rotated MXFP4 (source 25, ExpandedInt8) dispatches the expanded FP16 program, not the BF16 nibble one. */
+/** @test Rotated MXFP4 (source 25, ExpandedInt8) dispatches the expanded FP16 program, not the E8M0 nibble one. */
 TEST_F(CPUNativeNEONPreparedProjection, RotatedMXFP4ExecutesExpandedInt8WithFP16Scales)
 {
     using Ops = ms::NEONMultiScaleOps<ms::NEONByteDot::ASIMD>;
@@ -887,22 +927,27 @@ TEST_F(CPUNativeNEONPreparedProjection, RotatedMXFP4ExecutesExpandedInt8WithFP16
 }
 
 /** @test Native MXFP4 and its rotated form keep distinct scale-word interpretations. */
-TEST_F(CPUNativeNEONPreparedProjection, MXFP4ScaleWordsFollowThePreparedIdentity)
+TEST_F(CPUNativeNEONPreparedProjection, MXFP4ScaleFieldsFollowThePreparedIdentity)
 {
     NativeQuantisedPreparedByteFixture native(native_quantised_formats::MXFP4, 65, 64);
     ASSERT_EQ(native.descriptor.encoding, CPUNativeQuantisedEncoding::NibbleLUT);
-    EXPECT_EQ(native.view().scaleEncoding(), CPUNativeQuantisedScaleEncoding::PowerOfTwoBF16);
+    EXPECT_EQ(native.view().scaleEncoding(), CPUNativeQuantisedScaleEncoding::E8M0);
     native.seedPayloadAndMetadata();
     const auto view = native.view();
     for (int column = 0; column < 65; ++column)
         for (int block = 0; block < 2; ++block)
         {
-            const auto word = view.chunkScales(column / 64, block)[column % 64];
-            std::uint8_t e = 0;
-            ASSERT_TRUE(mxfp4::e8m0FromPowerOfTwoBF16Word(word, e)) << "seeded an inadmissible word";
+            const auto e = view.admittedE8M0Scales(column / 64, block)[column % 64];
+            ASSERT_TRUE(e == 0 || mxfp4::exponentFitsNativeE8M0(e)) << "seeded an inadmissible exponent";
             EXPECT_EQ(std::bit_cast<std::uint32_t>(view.blockScale(column / 64, block, column % 64)),
                 e == 0 ? 0u : mxfp4::normalScaleFP32Bits(e));
         }
+    EXPECT_THROW((void)view.chunkScales(0, 0), std::logic_error);
+    for (const auto invalid : {1, 253, 254, 255})
+    {
+        native.bytes[view.data_stride] = static_cast<std::uint8_t>(invalid);
+        EXPECT_THROW((void)native.view(), std::invalid_argument);
+    }
     EXPECT_EQ(preparedScaleEncoding(kNativeQuantisedMXFP4Codebook, CPUNativeQuantisedEncoding::ExpandedInt8),
         CPUNativeQuantisedScaleEncoding::FP16);
     EXPECT_EQ(preparedScaleEncoding(4, CPUNativeQuantisedEncoding::NibbleLUT), CPUNativeQuantisedScaleEncoding::FP16);
@@ -972,6 +1017,160 @@ TEST(CPUNativeNEONMultiScaleOps, DotProdDotLaneEqualsBroadcastDot)
     verifyDotLanes<ms::NEONMultiScaleOps<ms::NEONByteDot::DotProd>>();
 }
 #endif
+
+namespace
+{
+/** @brief Test-only FPCR access; production code never writes FPCR. */
+std::uint64_t readFpcr() { return cpu::ARMFloatingPointProfile::current(); }
+void writeFpcr(std::uint64_t value) { asm volatile("msr fpcr, %0" :: "r"(value) : "memory"); }
+
+/** @brief Run @p body with only the rounding/flush/half-format FPCR controls replaced, then restore. */
+template <typename Body> void underFpcrProfile(std::uint64_t profile, Body &&body)
+{
+    using P = cpu::ARMFloatingPointProfile;
+    const auto saved = readFpcr();
+    writeFpcr((saved & ~(P::kRModeMask | P::kFZ | P::kFZ16 | P::kAHP | P::kDN)) | profile);
+    body();
+    writeFpcr(saved);
+}
+
+constexpr std::uint64_t kRModeMinusInfinity = 2ull << 22;
+
+/** @brief One coded Q4_K publication and an M = 2 workload bound to the tile and batch entries. */
+struct Q4KEntryWorkload
+{
+    NativeQuantisedPreparedByteFixture fixture{native_quantised_formats::Q4_K, 67, 288};
+    std::vector<Q8_1Block> activation = activationRows(9, 2);
+    std::vector<float> output = std::vector<float>(2 * 67);
+
+    Q4KEntryWorkload() { fixture.seedPayloadAndMetadata(); }
+
+    /** @brief Execute through the public tile entry (both rows of chunk 0). */
+    void tile()
+    {
+        const auto view = fixture.view();
+        std::array<std::span<const Q8_1Block>, 2> input{std::span<const Q8_1Block>(activation).first(9),
+                                                        std::span<const Q8_1Block>(activation).subspan(9, 9)};
+        std::array<std::span<float>, 2> out{std::span<float>(output).first(64), std::span<float>(output).subspan(67, 64)};
+        CPUNativeNEONProjectionTile<2>::bind(view, input, out, 0).execute();
+    }
+
+    /**
+     * @brief Execute every task of the batch entry on this thread.
+     * @details runTask() is the unit each worker of execute()'s workshare
+     * runs, and it admits that worker's FPCR. Driving it directly keeps this
+     * core-free test independent of an OpenMP runtime.
+     */
+    void batch()
+    {
+        const auto view = fixture.view();
+        const auto bound = CPUNativeNEONProjectionBatch::bind(view, activation, output, 2, 67, NEONProjectionRowTile::Pair);
+        for (std::int64_t task = 0; task < bound.taskCount(); ++task)
+            bound.runTask(task);
+    }
+};
+} // namespace
+
+/** @test The shared profile predicate admits exactly RNE with FZ, FZ16, AHP and DN clear. */
+TEST(CPUNativeNEONFloatingPointProfile, AdmitsOnlyTheContractProfile)
+{
+    using P = cpu::ARMFloatingPointProfile;
+    EXPECT_TRUE(P::admitted(0));
+    EXPECT_TRUE(P::admitted(1ull << 21)); // FPCR.IDE, an exception-trap enable outside the numeric controls.
+    for (const std::uint64_t foreign :
+         std::initializer_list<std::uint64_t>{1ull << 22, 2ull << 22, 3ull << 22, P::kFZ, P::kFZ16, P::kAHP, P::kDN})
+        EXPECT_FALSE(P::admitted(foreign)) << std::hex << foreign;
+    EXPECT_TRUE(P::admitted(readFpcr())) << "the test process must start in the contract profile";
+}
+
+/**
+ * @test The ambient-FPCR hazard the admission guards against is real on this
+ * machine: binary16 products flush a live subnormal scale under FZ16, and the
+ * hardware narrowing rounds toward the FPCR mode, and default-NaN mode
+ * replaces the sign and payload of a widened NaN half (the reader's -0
+ * canonicalization alone could not fix any of these). Under DN the coded Q4_K
+ * reader itself loses the codec's negative NaN minimum of `-(inf * 0)`.
+ */
+TEST(CPUNativeNEONFloatingPointProfile, ForeignProfilesChangeNativeArithmetic)
+{
+    volatile float third = -1.0f / 3.0f; // 0xB555 to nearest, 0xB556 toward -inf.
+    volatile std::uint16_t narrowed_nearest = 0, narrowed_down = 0;
+    underFpcrProfile(0, [&] { narrowed_nearest = vget_lane_u16(vreinterpret_u16_f16(vcvt_f16_f32(vdupq_n_f32(third))), 0); });
+    underFpcrProfile(kRModeMinusInfinity,
+        [&] { narrowed_down = vget_lane_u16(vreinterpret_u16_f16(vcvt_f16_f32(vdupq_n_f32(third))), 0); });
+    EXPECT_EQ(narrowed_nearest, 0xB555);
+    EXPECT_EQ(narrowed_down, 0xB556);
+    // FCVT half -> single of a negative NaN with payload: propagated, or the default NaN.
+    volatile std::uint16_t nan_half = 0xFE01;
+    volatile std::uint32_t widened_propagated = 0, widened_default = 0;
+    const auto widen = [&] {
+        return vgetq_lane_u32(vreinterpretq_u32_f32(vcvt_f32_f16(vreinterpret_f16_u16(vdup_n_u16(nan_half)))), 0);
+    };
+    underFpcrProfile(0, [&] { widened_propagated = widen(); });
+    underFpcrProfile(cpu::ARMFloatingPointProfile::kDN, [&] { widened_default = widen(); });
+    EXPECT_EQ(widened_propagated, 0xFFC02000u);
+    EXPECT_EQ(widened_default, 0x7FC00000u);
+#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+    {
+        // The fused Q4_K reader on d = 1.0, dmin = +inf, code 0: the codec's
+        // minimum is the negated product -(inf * 0) = 0xFFC00000.
+        alignas(16) std::array<std::uint8_t, 256> header{};
+        alignas(16) std::array<std::uint8_t, 96> codes{};
+        for (int column = 0; column < 64; ++column)
+            coded_metadata::storeSuperblockWord(header.data(), 5, column,
+                native_quantised_superblock::packSuperblockWord(0x3C00, 0x7C00));
+        const auto reader_minimum = [&] {
+            float32x4_t scale, minimum;
+            coded_metadata::neon_half::q4KFactors(codes.data(), 0,
+                coded_metadata::neon_half::q4KHalfBase(header.data(), 0), scale, minimum);
+            return vgetq_lane_u32(vreinterpretq_u32_f32(minimum), 0);
+        };
+        volatile std::uint32_t minimum_contract = 0, minimum_default_nan = 0;
+        underFpcrProfile(0, [&] { minimum_contract = reader_minimum(); });
+        underFpcrProfile(cpu::ARMFloatingPointProfile::kDN, [&] { minimum_default_nan = reader_minimum(); });
+        const auto staged = native_quantised_superblock::decodeSuperblockMetadata<5>(0,
+            native_quantised_superblock::packSuperblockWord(0x3C00, 0x7C00));
+        EXPECT_EQ(staged.secondary, 0xFE00);
+        EXPECT_EQ(minimum_contract, 0xFFC00000u);
+        EXPECT_EQ(minimum_default_nan, 0x7FC00000u);
+    }
+    volatile std::uint16_t tiny = 0x0001, two = 0x4000, product_default = 0, product_flushed = 0;
+    const auto multiply = [&] {
+        return vget_lane_u16(vreinterpret_u16_f16(vmul_f16(vreinterpret_f16_u16(vdup_n_u16(tiny)),
+                                                           vreinterpret_f16_u16(vdup_n_u16(two)))), 0);
+    };
+    underFpcrProfile(0, [&] { product_default = multiply(); });
+    underFpcrProfile(cpu::ARMFloatingPointProfile::kFZ16, [&] { product_flushed = multiply(); });
+    EXPECT_EQ(product_default, 0x0002);
+    EXPECT_EQ(product_flushed, 0x0000);
+#endif
+}
+
+/**
+ * @test The coded Q4_K projection runs only under the contract profile: its
+ * tile and batch entries fail fatally, with the profile diagnostic, under
+ * FPCR.RMode = toward -inf, FPCR.FZ16 = 1 and FPCR.DN = 1, and execute normally (and
+ * byte-identically) after the caller's profile is restored.
+ */
+TEST(CPUNativeNEONFloatingPointProfile, Q4KEntriesRejectForeignFpcrProfiles)
+{
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    Q4KEntryWorkload workload;
+    workload.batch();
+    const auto reference = workload.output;
+    for (const std::uint64_t foreign : std::initializer_list<std::uint64_t>{
+             kRModeMinusInfinity, cpu::ARMFloatingPointProfile::kFZ16, cpu::ARMFloatingPointProfile::kDN})
+    {
+        SCOPED_TRACE(::testing::Message() << "FPCR controls 0x" << std::hex << foreign);
+        EXPECT_DEATH(underFpcrProfile(foreign, [&] { workload.tile(); }),
+            "Native NEON quantized projection requires the process FP profile");
+        EXPECT_DEATH(underFpcrProfile(foreign, [&] { workload.batch(); }),
+            "Native NEON quantized projection batch requires the process FP profile");
+    }
+    std::fill(workload.output.begin(), workload.output.end(), -1.0f);
+    workload.batch();
+    EXPECT_EQ(std::memcmp(workload.output.data(), reference.data(), reference.size() * sizeof(float)), 0);
+}
 
 #if defined(__ARM_FEATURE_MATMUL_INT8)
 /** @test The I8MM family's single-row lane leaf equals its broadcast SDOT leaf. */

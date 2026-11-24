@@ -35,6 +35,8 @@
 #endif
 
 #include "tensors/MXFP4Format.h"
+#include "tensors/NativeQuantisedSuperblockMetadata.h"
+#include "kernels/common/DeviceNativeQuantisedMatrixDesc.h"
 #include "tensors/NativeQuantisedScalePlane.h"
 
 #include <cstddef>
@@ -165,6 +167,93 @@ namespace llaminar2::native_quantised_scale
         }
         plane[linear] = cpu_word;
         return true;
+    }
+
+    using native_quantised_superblock::BlockAddress;
+    using native_quantised_superblock::StagedBlockMetadata;
+
+    /**
+     * @brief Device metadata planes of one prepared matrix, with their addressing phase.
+     *
+     * `primary` is the primary word plane (per-block representation) or the
+     * per-block code plane (superblock-coded). `secondary` is the secondary
+     * word plane or the per-superblock d/dmin plane. `emins` is the Q2_K
+     * effective-minimum plane of the per-block representation. The phase is
+     * native_quantised_superblock::superblockPhase() of the matrix's first
+     * prepared K block; it is zero for the per-block representation and for
+     * every matrix that starts on a source superblock boundary.
+     */
+    struct NativeQuantisedMetadataPlanes
+    {
+        const std::uint16_t *primary = nullptr;
+        const void *secondary = nullptr;
+        const std::uint32_t *emins = nullptr;
+        std::uint32_t superblock_phase = 0;
+        NativeQuantisedMetadataRepresentation representation = NativeQuantisedMetadataRepresentation::PerBlockPlanes;
+        std::uint32_t code_bit_shift = 0; ///< First code's bit offset inside `primary` (coded only).
+
+        /** @return Whether the planes hold superblock-coded metadata. */
+        LLAMINAR_NATIVE_QUANTISED_SCALE_HD bool coded() const
+        {
+            return representation == NativeQuantisedMetadataRepresentation::SuperblockCoded;
+        }
+    };
+
+    /** @return The typed metadata planes and phase named by a matrix descriptor. */
+    LLAMINAR_NATIVE_QUANTISED_SCALE_HD NativeQuantisedMetadataPlanes metadataPlanes(
+        const DeviceNativeQuantisedMatrixDesc &desc)
+    {
+        return {static_cast<const std::uint16_t *>(desc.scales), desc.mins,
+                static_cast<const std::uint32_t *>(desc.emins), nativeQuantisedLayoutPhase(desc.metadata_layout),
+                nativeQuantisedLayoutRepresentation(desc.metadata_layout),
+                nativeQuantisedLayoutCodeBitShift(desc.metadata_layout)};
+    }
+
+    /** @return Address of block-major block (@p block, @p column) in an @p n-column matrix. */
+    LLAMINAR_NATIVE_QUANTISED_SCALE_HD BlockAddress blockMajorAddress(
+        const NativeQuantisedMetadataPlanes &planes, std::uint32_t block, std::uint32_t column, std::uint32_t n)
+    {
+        return native_quantised_superblock::blockMajorAddress(block, column, n, planes.superblock_phase);
+    }
+
+    /** @return Address of row-major block (@p block, @p column) with @p blocks_per_row blocks per row. */
+    LLAMINAR_NATIVE_QUANTISED_SCALE_HD BlockAddress rowMajorAddress(
+        const NativeQuantisedMetadataPlanes &planes, std::uint32_t block, std::uint32_t column,
+        std::uint32_t blocks_per_row)
+    {
+        return native_quantised_superblock::rowMajorAddress(block, column, blocks_per_row, planes.superblock_phase);
+    }
+
+    /**
+     * @brief Load one block's staged metadata words through the representation authority.
+     * @tparam Codebook Physical execution codebook.
+     * @param planes Matrix planes, phase and representation.
+     * @param address Block address (linear plus superblock index).
+     * @return The staged primary word (loadStagedPrimary semantics), the raw
+     *         secondary word and the emin word, bit-identical across representations.
+     *
+     * The representation branch is uniform for a whole matrix, so it never
+     * diverges within a warp/wavefront; incapable codebooks compile only the
+     * per-block path.
+     */
+    template <std::uint8_t Codebook>
+    LLAMINAR_NATIVE_QUANTISED_SCALE_HD StagedBlockMetadata loadBlockMetadata(
+        const NativeQuantisedMetadataPlanes &planes, BlockAddress address)
+    {
+        if constexpr (nativeQuantisedSuperblockCodable(Codebook))
+        {
+            if (planes.coded())
+                return native_quantised_superblock::loadBlockMetadata<Codebook>(planes.primary, planes.secondary,
+                                                                                address, planes.code_bit_shift);
+        }
+        StagedBlockMetadata out;
+        out.primary = loadStagedPrimary<Codebook>(planes.primary, address.linear);
+        out.secondary = planes.secondary ? static_cast<const std::uint16_t *>(planes.secondary)[address.linear]
+                                         : std::uint16_t{0};
+        // Only Q2_K owns an effective-minimum plane; never keep the pointer live otherwise.
+        if constexpr (Codebook == 10)
+            out.emin = planes.emins ? planes.emins[address.linear] : std::uint32_t{0};
+        return out;
     }
 
     /** @brief Load and decode block @p linear directly from the global plane. */

@@ -566,7 +566,12 @@ namespace llaminar2
         uint32_t initial_maintenance_period_tokens = 1;
         /** Recurring serial-visible decode period after the first boundary. */
         uint32_t maintenance_period_tokens = 1;
+        /// Collective stride and metadata tail shared with the workspace contract.
+        moe_rebalance_abi::HistogramLayout histogram_layout = moe_rebalance_abi::HistogramLayout::ResidentOnly;
+        /// Immutable layer-indexed transfer family ranges; required for the transfer family layout.
+        const DeviceMoETransferSlotRange *transfer_slot_layer_ranges = nullptr;
     };
+    static_assert(offsetof(DeviceMoERebalanceConfig, histogram_layout) == moe_rebalance_abi::kConfigHistogramLayoutOffset);
 
     /**
      * @brief Identify the evidence lifecycle of a prefill payload transfer.
@@ -1158,6 +1163,15 @@ namespace llaminar2
                deviceMoERebalanceModeMovesFixedPayloadCapacity(mode);
     }
 
+    /** @return Exact histogram wire layout for the admitted transport, without needing device addresses. */
+    inline moe_rebalance_abi::HistogramLayout deviceMoERebalanceHistogramLayout(
+        DeviceMoERebalanceTransferMode mode) noexcept
+    {
+        return deviceMoERebalanceModeUsesTransferSlots(mode)
+            ? moe_rebalance_abi::HistogramLayout::TransferFamilyOccupancy
+            : moe_rebalance_abi::HistogramLayout::ResidentOnly;
+    }
+
     inline bool deviceMoERebalanceModePlansMissingArrivals(
         DeviceMoERebalanceTransferMode mode) noexcept
     {
@@ -1406,6 +1420,7 @@ namespace llaminar2
     {
         return config.magic == kDeviceMoERebalanceMagic &&
                config.version == kDeviceMoERebalanceVersion &&
+               moe_rebalance_abi::histogramLayoutMatchesRanges(config.histogram_layout, config.transfer_slot_layer_ranges) &&
                config.num_layers > 0 &&
                config.num_experts > 0 &&
                config.num_experts <= kDeviceMoEMaxExperts &&
@@ -1638,12 +1653,14 @@ namespace llaminar2
         const DeviceNativeQuantisedMatrixDesc &src,
         const DeviceNativeQuantisedMatrixDesc &dst) noexcept
     {
-        if (src.n != dst.n ||
-            src.k != dst.k ||
-            src.blocks_per_row != dst.blocks_per_row)
-        {
+        if (src.n != dst.n || src.k != dst.k || src.blocks_per_row != dst.blocks_per_row)
             return false;
-        }
+        if (src.metadata_layout || dst.metadata_layout)
+            return src.metadata_layout && dst.metadata_layout && src.codebook_id == dst.codebook_id &&
+                nativeQuantisedLayoutValid(src.codebook_id, src.metadata_layout) &&
+                nativeQuantisedLayoutValid(dst.codebook_id, dst.metadata_layout) &&
+                nativeQuantisedLayoutPhase(src.metadata_layout) == nativeQuantisedLayoutPhase(dst.metadata_layout) &&
+                src.valid() && dst.valid() && src.mins && dst.mins && !src.emins && !dst.emins;
 
         uint8_t src_payload_bytes = 0;
         uint8_t src_is_asymmetric = 0;
@@ -1684,6 +1701,7 @@ namespace llaminar2
         dst.source_codebook_id = src.source_codebook_id;
         dst.source_is_superblock = src.source_is_superblock;
         dst.source_identity_present = src.source_identity_present;
+        // Representation and phase already agree; the destination owns its code bit offset.
     }
 
     inline uint64_t deviceMoEMatrixBlockCount(const DeviceNativeQuantisedMatrixDesc &desc) noexcept
@@ -1759,6 +1777,12 @@ namespace llaminar2
         const DeviceNativeQuantisedMatrixDesc &desc,
         const DeviceMoEExpertDirectoryEntry &entry) noexcept
     {
+        if (desc.metadata_layout)
+        {
+            // Coded Q2_K owns original superblock headers, not per-block emins.
+            return desc.valid() && nativeQuantisedLayoutValid(desc.codebook_id, desc.metadata_layout) &&
+                desc.mins && !desc.emins;
+        }
         (void)entry;
         uint8_t payload_bytes_per_block = 0;
         uint8_t is_asymmetric = 0;

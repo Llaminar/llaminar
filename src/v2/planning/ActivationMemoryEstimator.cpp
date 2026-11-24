@@ -192,10 +192,18 @@ bool hasHybridRecurrentLayer(
 GraphArenaStorageLayout ActivationMemoryEstimator::declareCPUStorage(
     const ModelMemoryProfile &profile, const ActivationGraphMemoryGeometry &geometry, DeviceId device)
 {
-    if (!device.is_valid() || !device.is_cpu() || geometry.batch_size <= 0 ||
+    if (!device.is_valid() || !device.is_cpu())
+        throw std::invalid_argument("CPU graph storage requires exact allocator and positive admitted geometry");
+    return declareSchemaStorage(profile, geometry, device);
+}
+
+GraphArenaStorageLayout ActivationMemoryEstimator::declareSchemaStorage(
+    const ModelMemoryProfile &profile, const ActivationGraphMemoryGeometry &geometry, DeviceId device)
+{
+    if (!device.is_valid() || geometry.batch_size <= 0 ||
         geometry.resident_graph_rows <= 0 || geometry.total_shards <= 0 ||
         geometry.mtp_target_query_rows <= 0)
-        throw std::invalid_argument("CPU graph storage requires exact allocator and positive admitted geometry");
+        throw std::invalid_argument("Graph storage requires an exact allocator and positive admitted geometry");
     const size_t rows = checkedMultiply(static_cast<size_t>(geometry.batch_size),
         static_cast<size_t>(geometry.resident_graph_rows), "CPU flattened graph rows");
     if (rows > static_cast<size_t>(std::numeric_limits<int>::max()))
@@ -245,12 +253,23 @@ GraphArenaStorageLayout ActivationMemoryEstimator::declareCPUStorage(
     formulas["mtp_gather_rows"] = gather.rows();
     formulas["mtp_gather_vocab"] = gather.columns();
 
-    const bool hybrid = profile.flash_next || hasHybridRecurrentLayer(profile, 0, std::max(0, profile.n_layers - 1));
+    const bool hybrid = profile.flash_next || profile.deepseek_v4 ||
+        hasHybridRecurrentLayer(profile, 0, std::max(0, profile.n_layers - 1));
     GraphSchema schema = hybrid ? (profile.expert_count > 0
         ? Qwen35MoESchemaFactory{}.createSchema() : Qwen35SchemaFactory{}.createSchema())
         : Qwen2SchemaFactory{}.createSchema();
     if (hybrid)
     {
+        if (profile.deepseek_v4)
+        {
+            // Attention-only hybrid schema: GDN roles are removed by the DeepSeek-V4 layout.
+            formulas["fa_q_full_dim"] = checkedMultiply(2, query_columns, "CPU FA query/gate");
+            formulas["mtp_fa_q_full_dim"] = checkedMultiply(2, formulas.at("mtp_q_dim"), "CPU predictor query/gate");
+            formulas["attn_output_dim"] = query_columns;
+            formulas["mtp_attn_output_dim"] = std::max(formulas.at("mtp_q_dim"), query_columns);
+        }
+        else
+        {
         if (profile.gdn_state_size <= 0 || profile.gdn_group_count <= 0 ||
             profile.gdn_time_step_rank <= 0 || profile.gdn_inner_size <= 0)
             throw std::invalid_argument("CPU hybrid arena requires complete source GDN metadata");
@@ -268,13 +287,17 @@ GraphArenaStorageLayout ActivationMemoryEstimator::declareCPUStorage(
         formulas["mtp_fa_q_full_dim"] = checkedMultiply(2, formulas.at("mtp_q_dim"), "CPU predictor query/gate");
         formulas["attn_output_dim"] = std::max(query_columns, inner);
         formulas["mtp_attn_output_dim"] = std::max(formulas.at("mtp_q_dim"), formulas.at("attn_output_dim"));
+        }
     }
     if (hybrid && profile.expert_count > 0)
     {
-        if (geometry.routed_compute_policy == RoutedExpertComputePolicy::GateUpOwnedDownColumns)
+        const bool projection = geometry.routed_compute_policy == RoutedExpertComputePolicy::GateUpOwnedDownColumns;
+        if (projection && !device.is_gpu())
             throw std::invalid_argument("MoE projection arena requires a native GPU domain");
         formulas["moe_top_k"] = static_cast<size_t>(profile.expert_used_count);
-        formulas["moe_canonical_publication_slots"] = checkedAdd(
+        // The projection transaction arena replaces the canonical publication
+        // slots and is priced by MoEProjectionArenaGeometry (GPU only).
+        formulas["moe_canonical_publication_slots"] = projection ? 0 : checkedAdd(
             static_cast<size_t>(profile.expert_used_count), static_cast<size_t>(geometry.total_shards),
             "CPU MoE publication slots");
         formulas["moe_expert_intermediate"] = static_cast<size_t>(profile.expert_feed_forward_length);
@@ -289,12 +312,21 @@ GraphArenaStorageLayout ActivationMemoryEstimator::declareCPUStorage(
         applyQwen4ExpBufferLayout(schema, *profile.flash_next, dimensions);
         applyQwen4ExpBufferGeometry(resolver, *profile.flash_next, dimensions);
     }
+    if (profile.deepseek_v4)
+    {
+        if (geometry.context_tokens <= 0)
+            throw std::invalid_argument("DeepSeek-V4 activation admission requires explicit runtime context capacity");
+        applyDeepSeekV4BufferLayout(schema);
+        applyDeepSeekV4BufferGeometry(resolver, *profile.deepseek_v4, resolver.seq_len, geometry.context_tokens);
+    }
     const bool retained_mtp = geometry.retained_mtp_candidate_rows > 0;
     auto layout = GraphArenaStorageLayout::resolve(schema, resolver, {
         .full_prefill_kv_handoff = geometry.replicated_dense_decode,
         .terminal_hidden_rows = retained_mtp ? std::max(static_cast<size_t>(geometry.batch_size), target_rows) : 0,
         .terminal_hidden_columns = retained_mtp ? (profile.flash_next
-            ? static_cast<size_t>(profile.flash_next->residual_width) : static_cast<size_t>(profile.d_model)) : 0});
+            ? static_cast<size_t>(profile.flash_next->residual_width)
+            : profile.deepseek_v4 ? static_cast<size_t>(profile.deepseek_v4->hc) * profile.d_model
+            : static_cast<size_t>(profile.d_model)) : 0});
     // Diagnostic mirror of DeviceGraphOrchestrator's arena registration log:
     // admission and allocation must name one identical root inventory.
     for (const auto &entry : layout.entries())
@@ -389,6 +421,8 @@ size_t ActivationMemoryEstimator::estimate(
 
     if (device.is_cpu())
         return declareCPUStorage(profile, geometry, device).cpuPhysicalBytes();
+    if (profile.deepseek_v4)
+        return deepSeekV4DeviceArenaBytes(profile, geometry, device);
 
     size_t bytes = estimate(
         geometry.batch_size,
@@ -646,6 +680,60 @@ size_t ActivationMemoryEstimator::estimate(
         bytes = checkedAdd(bytes, qwen4ExpArenaExtensionBytes(common_factory.createSchema(), resolver,
             *profile.flash_next, dimensions), "Flash Next declared arena/state extensions");
     }
+    return bytes;
+}
+
+std::size_t ActivationMemoryEstimator::deepSeekV4DeviceArenaBytes(const ModelMemoryProfile &profile,
+    const ActivationGraphMemoryGeometry &geometry, DeviceId device)
+{
+    if (!profile.deepseek_v4 || !device.is_gpu() || geometry.context_tokens <= 0)
+        throw std::invalid_argument("DeepSeek-V4 device arena admission requires its GPU participant and context");
+    // Exactly the roots DeviceGraphOrchestrator registers: the production
+    // schema (shared MoE roots without GDN, widened trunk, every DeepSeek-V4
+    // declaration) resolved through the same formulas. No KV slab exists;
+    // the window ring, compressor state and packed pools are these roots.
+    const auto layout = declareSchemaStorage(profile, geometry, device);
+    std::size_t bytes = 0, dsv4 = 0;
+    for (const auto &entry : layout.entries())
+    {
+        std::size_t element = 0;
+        switch (entry.descriptor.tensor_type)
+        {
+        case BufferTensorType::FP32:
+        case BufferTensorType::INT32: element = 4; break;
+        case BufferTensorType::BF16:
+        case BufferTensorType::FP16: element = 2; break;
+        default:
+            throw std::invalid_argument("DeepSeek-V4 device arena root has a non-linear dtype: " + entry.descriptor.name);
+        }
+        std::size_t elements = 1;
+        for (const auto dimension : entry.descriptor.shape)
+            elements = checkedMultiply(elements, dimension, "DeepSeek-V4 arena root extent");
+        const std::size_t root = checkedMultiply(elements, element, "DeepSeek-V4 arena root bytes");
+        bytes = checkedAdd(bytes, root, "DeepSeek-V4 arena roots");
+        for (const auto &declaration : deepSeekV4BufferDeclarations())
+            if (declaration.id == entry.id) dsv4 = checkedAdd(dsv4, root, "DeepSeek-V4 declared roots");
+    }
+    const int rows = static_cast<int>(checkedMultiply(static_cast<size_t>(geometry.batch_size),
+        static_cast<size_t>(geometry.resident_graph_rows), "DeepSeek-V4 flattened graph rows"));
+    // The declared roots must be exactly the inventory admission prices
+    // elsewhere (deepSeekV4ArenaExtensionBytes minus the widened trunk).
+    const std::size_t trunk = checkedMultiply(2u * static_cast<size_t>(rows),
+        checkedMultiply(profile.deepseek_v4->hc - 1u, profile.deepseek_v4->hidden, "trunk"), "trunk") * sizeof(float);
+    if (dsv4 + trunk != deepSeekV4ArenaExtensionBytes(*profile.deepseek_v4, rows, geometry.context_tokens))
+        throw std::logic_error("DeepSeek-V4 schema roots disagree with the declared extension inventory");
+    if (geometry.routed_compute_policy == RoutedExpertComputePolicy::GateUpOwnedDownColumns)
+        bytes = checkedAdd(bytes, MoEProjectionArenaGeometry::resolve(profile, geometry.total_shards).bytes(
+            std::max(static_cast<size_t>(rows), static_cast<size_t>(geometry.mtp_target_query_rows))),
+            "MoE projection transaction arena");
+    bytes = checkedAdd(bytes, GenerationRequestSeedGeometry(
+        geometry.batch_size, geometry.generation_request_capacity).bytes(), "resident generation request seeds");
+    LOG_DEBUG("[ActivationMemoryEstimator] DeepSeek-V4 device arena: total=" << bytes << " B, declared DeepSeek-V4 roots="
+              << dsv4 << " B (context pools=" << deepSeekV4PersistentPoolBytes(*profile.deepseek_v4, geometry.context_tokens)
+              << " B, indexer score scratch="
+              << static_cast<std::size_t>(deepSeekV4IndexerScoreRows(rows, geometry.context_tokens)) *
+                     ((static_cast<std::size_t>(geometry.context_tokens) + 3) / 4) * sizeof(float)
+              << " B), rows=" << rows << " context=" << geometry.context_tokens);
     return bytes;
 }
 

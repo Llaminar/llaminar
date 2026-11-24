@@ -3,6 +3,8 @@
  * @brief Device-bound publication and launch policy for a counted ROCm verifier FFN.
  */
 #pragma once
+
+#include "kernels/common/ExpertSwiGLUActivationPolicy.h"
 #include "utils/DebugEnv.h"
 #include "kernels/common/DeviceNativeQuantisedMatrixDesc.h"
 #include "kernels/common/DeviceRowRange.h"
@@ -363,6 +365,7 @@ struct LocalPublication {
     DirectBankRouter directRouter{};
     Program program;
     std::optional<BoundSourceFormatProgram> boundSourceProgram;
+    ExpertSwiGLUActivationPolicy routedActivation, sharedActivation;
 };
 
 /** @brief Canonical original mutable plan views from the complete grouped-plan owner. */
@@ -403,6 +406,7 @@ struct Output {
     float* sharedOutput;
     float* combined;
     float* routeContributions;
+    float routedSwiGLULimit=0.0f, sharedSwiGLULimit=0.0f;
 };
 
 /**

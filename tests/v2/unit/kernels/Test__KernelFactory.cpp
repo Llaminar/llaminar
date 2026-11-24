@@ -26,6 +26,7 @@
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/compute_stages/stages/MoEExpertComputeStage.h"
 #include "loaders/gpu_pipeline/LoadOrchestrator.h"
+#include "loaders/GPUPreparedWeightPoolLayout.h"
 #include "kernels/cpu/moe/CPUMoEKernel.h"
 #include "../../utils/CPURouterKernelTestAdmission.h"
 #include <array>
@@ -141,6 +142,27 @@ TEST(GPUPreparedWeightBinding, RejectsMissingSourceCoefficientPlane)
                 ASSERT_EQ(slot->scales_bytes, blocks * sizeof(uint16_t));
                 ASSERT_EQ(slot->d_native_quantised_mins, nullptr);
                 ASSERT_EQ(slot->mins_bytes, 0u);
+                // Immutable CUDA source-native weights bind superblock-coded
+                // metadata, which has no per-block secondary plane: a slot
+                // planned with per-block planes must be rejected as a layout
+                // mismatch before any plane is read.
+                const auto *format = native_quantised_formats::forQuantType(label);
+                ASSERT_NE(format, nullptr);
+                if (gpuPreparedSuperblockCoded(*format, layout, device))
+                {
+                    try
+                    {
+                        auto kernel = KernelFactory::createGemmFromGPUWeightPool(
+                            *tensor, device, owner, "missing.coefficients", 0, layout);
+                        FAIL() << "Per-block slot was bound as superblock-coded metadata";
+                    }
+                    catch (const std::invalid_argument &error)
+                    {
+                        EXPECT_NE(std::string(error.what()).find("metadata layout"), std::string::npos)
+                            << error.what();
+                    }
+                    continue;
+                }
                 try
                 {
                     auto kernel = KernelFactory::createGemmFromGPUWeightPool(

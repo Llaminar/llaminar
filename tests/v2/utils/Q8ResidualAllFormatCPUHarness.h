@@ -15,7 +15,9 @@
 #include "execution/compute_stages/stages/GEMMStage.h"
 #include "execution/local_execution/device/DeviceContext.h"
 #include <gtest/gtest.h>
+#include <bit>
 #include <iostream>
+#include <type_traits>
 #include <omp.h>
 namespace llaminar2::test::q8_all_formats {
 /** @brief Restore the invoking test's exact OpenMP policy even after assertion
@@ -110,6 +112,46 @@ struct CPUOracle {
   std::vector<Q8_1Block> primary, residual;
   int rows = 0;
 };
+/** @brief Replay the pre-density Q5 program from original GGUF blocks.
+ * @tparam Block Original symmetric Q5_0 or asymmetric Q5_1 type.
+ * @param f Retained original bytes and projection geometry.
+ * @param expected Published activation banks and serial native output bytes.
+ * @details Reconstruct the old expanded signed/nonnegative coefficient, apply
+ * the integer dot and original per-block FP32 FMA order, then fold once. No
+ * prepared address, packed decoder or projection helper is consulted.
+ */
+template <class Block>
+inline void checkExpandedQ5ByteParity(const CPUFixture &f, const CPUOracle &expected) {
+  constexpr bool asymmetric = std::is_same_v<Block, Q5_1Block>;
+  const int blocks = f.k / 32;
+  for (int row = 0; row < expected.rows; ++row)
+    for (int col = 0; col < f.n; ++col) {
+      float terms[2]{};
+      for (int block = 0; block < blocks; ++block) {
+        Block source;
+        std::memcpy(&source, f.raw.data() + (col * blocks + block) * sizeof(Block),
+                    sizeof(Block));
+        const auto offset = row * blocks + block;
+        const Q8_1Block *banks[]{&expected.primary[offset], &expected.residual[offset]};
+        for (int term = 0; term < 2; ++term) {
+          const auto &a = *banks[term];
+          int dot = 0;
+          for (int i = 0; i < 32; ++i) {
+            const int q = ((source.qs[i % 16] >> (i < 16 ? 0 : 4)) & 15) +
+                          16 * ((source.qh[i / 8] >> (i % 8)) & 1);
+            dot += (q - (asymmetric ? 0 : 16)) * int(a.qs[i]);
+          }
+          const auto scale = fp16_to_fp32(a.d);
+          terms[term] = std::fma(float(dot), scale * fp16_to_fp32(source.d), terms[term]);
+          if constexpr (asymmetric)
+            terms[term] = std::fma(scale * float(a.sum_qs), fp16_to_fp32(source.m), terms[term]);
+        }
+      }
+      const float sum = terms[0] + terms[1];
+      EXPECT_EQ(std::bit_cast<std::uint32_t>(expected.output[row * f.n + col]),
+                std::bit_cast<std::uint32_t>(sum)) << "row=" << row << " column=" << col;
+    }
+}
 /**
  * @brief Check every unique native M1 contribution against independent FP64
  * math.
@@ -118,6 +160,10 @@ struct CPUOracle {
  * implementation.
  */
 inline void checkCPUOracle(const CPUFixture &f, const CPUOracle &expected) {
+  if (f.weight->native_type() == TensorType::Q5_0)
+    checkExpandedQ5ByteParity<Q5_0Block>(f, expected);
+  if (f.weight->native_type() == TensorType::Q5_1)
+    checkExpandedQ5ByteParity<Q5_1Block>(f, expected);
   const auto banks = cpuBanks(expected.primary.data(), expected.residual.data(),
                               expected.rows, f.k);
   const auto contribution =

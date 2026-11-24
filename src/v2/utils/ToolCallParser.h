@@ -13,6 +13,8 @@
  *     (Hermes 2/3 and compatible community models)
  *   - QWEN_3_XML: <tool_call><function=name><parameter=key>value</parameter>
  *     </function></tool_call> (Qwen 3.5/3.8 hybrid families)
+ *   - DEEPSEEK_V4_DSML: <｜DSML｜tool_calls><｜DSML｜invoke name="f"><｜DSML｜parameter
+ *     name="k" string="true|false">v</｜DSML｜parameter>... (DeepSeek-V4)
  *   - GENERIC: Fallback that looks for JSON objects with "name" and "arguments"
  */
 
@@ -122,13 +124,31 @@ namespace llaminar2
         /** @brief Drain all currently decidable bytes from @ref buffer_. */
         std::vector<Event> drain(bool terminal);
 
+        /** @brief DeepSeek-V4 DSML state machine (multiple openers, per-invoke emission). */
+        std::vector<Event> drainDeepSeekV4(bool terminal);
+
         ToolCallFormat format_{ToolCallFormat::NONE};
         nlohmann::json tools_; ///< Request-owned schemas outlive every buffered parameter.
         std::string open_marker_;
         std::string close_marker_;
         Phase phase_{Phase::Content};
         std::string buffer_;
+        size_t dsml_scan_ = 0;      ///< DSML: first unscanned byte of the buffered tool section.
+        bool dsml_emitted_ = false; ///< DSML: whether this section already produced a call.
+        std::string dsml_rejected_; ///< DSML: literal text of non-executable invokes, published at flush.
     };
+
+    /**
+     * @brief Markers that open a tool section even while the model is still reasoning.
+     *
+     * DeepSeek-V4 may begin a DSML tool section before closing "</think>";
+     * vLLM's parser ends reasoning there (REASONING + TOOL_START). Formats
+     * whose calls only follow the reasoning close return an empty list.
+     *
+     * @param format Format selected by the admitted model schema.
+     * @return Exact opener spellings, empty when reasoning never yields to tools.
+     */
+    std::vector<std::string> toolSectionReasoningExits(ToolCallFormat format);
 
     /**
      * @brief Generate a unique tool call ID (e.g., "call_abc123def456")

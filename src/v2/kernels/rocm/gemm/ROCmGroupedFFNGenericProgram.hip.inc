@@ -134,7 +134,8 @@ void groupedFFNFormatProgramGate(const int32_t* liveOwner,const int8_t* hiddenCo
                         output.sharedGateScratch[row*span+column]=values.gate;
                         output.sharedUpScratch[row*span+column]=values.up;
                     }
-                    published[owner][column%32]=decode_equivalent::swigluValue(values.gate,values.up);
+                    published[owner][column%32]=decode_equivalent::swigluValue(values.gate,values.up,
+                        routed?output.routedSwiGLULimit:output.sharedSwiGLULimit);
                 }
             } else {
                 float gateValue=0.0f;
@@ -172,7 +173,8 @@ void groupedFFNFormatProgramGate(const int32_t* liveOwner,const int8_t* hiddenCo
                             output.sharedGateScratch[row*span+column]=gateValue;
                             output.sharedUpScratch[row*span+column]=values.value[0];
                         }
-                        published[owner][column%32]=decode_equivalent::swigluValue(gateValue,values.value[0]);
+                        published[owner][column%32]=decode_equivalent::swigluValue(gateValue,values.value[0],
+                            routed?output.routedSwiGLULimit:output.sharedSwiGLULimit);
                     }
                 }
             }
@@ -224,11 +226,12 @@ __device__ __forceinline__ float orderedQ51DownPackets(const DeviceNativeQuantis
     using Payload=std::array<std::uint32_t,Traits::payload_bytes/sizeof(std::uint32_t)>;
     static_assert(sizeof(Payload)==Traits::payload_bytes);
     const auto partial=[&](const Payload& raw,int block,std::size_t index) {
+        (void)index; // The payload was loaded by the caller; metadata addresses by block/column.
         const auto* bytes=reinterpret_cast<const std::uint8_t*>(raw.data());
         int32_t decoded[8];
         moe_prefill_decode_groups<NATIVE_QUANTISED_PF_Q5_1,false>(bytes,decoded,nullptr);
-        return moe_prefill_accumulate_decoded_block<NATIVE_QUANTISED_PF_Q5_1>(
-            role,index,bytes,decoded,reinterpret_cast<const int32_t*>(codes+block*32),scales[block],0.0f);
+        return moe_prefill_accumulate_decoded_block_at<NATIVE_QUANTISED_PF_Q5_1>(
+            role,block,column,hidden,bytes,decoded,reinterpret_cast<const int32_t*>(codes+block*32),scales[block],0.0f);
     };
     float total=0.0f;
 #pragma unroll 1

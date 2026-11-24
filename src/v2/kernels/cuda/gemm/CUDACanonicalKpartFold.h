@@ -12,6 +12,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include "kernels/common/NativeQuantisedScaleLoad.h"
 #include <optional>
 
 namespace llaminar2
@@ -126,8 +127,7 @@ extern "C" bool cudaNativeQuantisedGemvTuned_fusedKpar_resources(
  * @return Whether the exact launch was admitted and submitted successfully.
  */
 extern "C" bool cudaNativeQuantisedGemvTuned_fusedKpar_fp32(
-    const int8_t *activations, const uint8_t *payload, const uint16_t *scales,
-    const uint16_t *secondary, const uint32_t *extended_minima, float *output,
+    const int8_t *activations, const uint8_t *payload, ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes metadata, float *output,
     const float *activation_scales, int n, float alpha, float beta,
     const float *existing, const float *bias, uint8_t codebook, int device,
     void *stream, const llaminar2::CUDACanonicalKpartFoldPlan &plan);

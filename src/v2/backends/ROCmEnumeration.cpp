@@ -18,6 +18,7 @@
 #include <hip/hip_runtime_api.h> // For hipDevicePrimaryCtxRelease, hipDevicePrimaryCtxGetState
 #include <vector>
 #include <string>
+#include "../utils/NUMATopology.h"
 #include <cstring>
 #include <cstdio>
 #include <exception>
@@ -272,6 +273,9 @@ namespace llaminar2
             FILE *f = fopen(path, "r");
             if (!f)
             {
+                // Integrated GPUs (e.g. APUs) have no PCIe NUMA node; on a
+                // single-NUMA host the only possible locality is node 0.
+                if (NUMATopology::observedNodeCount() == 1) return 0;
                 return -1;
             }
 
@@ -282,6 +286,8 @@ namespace llaminar2
             }
             fclose(f);
 
+            if (numa_node < 0 && NUMATopology::observedNodeCount() == 1)
+                return 0;
             return numa_node;
         }
 

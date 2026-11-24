@@ -8,6 +8,7 @@
  * has no global kernel registry, model runner, routing policy or inference state.
  */
 #include "PlanningProjectionMeasurement.h"
+#include "loaders/BoundedGPUExpertSource.h"
 #include "backends/BackendManager.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "backends/GPUGraphMemoryContract.h"
@@ -147,7 +148,8 @@ namespace llaminar2
             if (const auto *format = native_quantised_formats::forQuantType(plan.format))
                 pool.planWeightForOwner(device.gpu_ordinal(), plan.name, plan.n, plan.k,
                     format->payload_bytes, canonicalDeviceVnniFormat(*format).is_asymmetric, format->has_emins,
-                    nativeQuantisedScalePlaneWidth(canonicalDeviceVnniCodebookId(*format)), plan.payload_bytes, kWeightOwner);
+                    nativeQuantisedScalePlaneWidth(canonicalDeviceVnniCodebookId(*format)), plan.payload_bytes, kWeightOwner,
+                    {0}, gpuPreparedWeightCodedDeclaration(*format, GPUPreparedWeightPoolLayout::SourceNative, device));
             else if (floating(plan))
                 pool.planRawWeightForOwner(device.gpu_ordinal(), plan.name,
                     plan.n, plan.k, plan.payload_bytes, kWeightOwner);

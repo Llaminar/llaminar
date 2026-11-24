@@ -10,6 +10,7 @@
  * retain exact live output, activation-byte, scale and sums extents across
  * full/partial/empty replay; empty work cannot write native partial scratch.
  */
+#include "../../utils/NativeQuantisedLegacyPlanes.h"
 #include "utils/GpuPreparedGemmHarness.h"
 #include "utils/PerfStatsCollector.h"
 #include "moe/NativeQuantisedExpertTransferParityTest.h"
@@ -169,34 +170,36 @@ struct Planes {
   std::vector<uint32_t> emins;
   bool operator==(const Planes &) const = default;
 };
-/** @brief Download exactly the live primary plane (one E8M0 byte per block for
- * native MXFP4) and return one staged word per block. */
-std::vector<uint16_t> stagedPrimaryWords(Storage &s, const DeviceNativeQuantisedMatrixDesc &d,
-                                         std::size_t blocks) {
-  const auto bytes = s.download(static_cast<const uint8_t *>(d.scales),
-                                nativeQuantisedScalePlaneLiveBytes(d.codebook_id, blocks));
-  // Re-home the bytes in word storage so loadStagedPrimary reads the same plane layout.
-  std::vector<uint16_t> plane((bytes.size() + 1) / 2, 0);
-  std::memcpy(plane.data(), bytes.data(), bytes.size());
-  std::vector<uint16_t> words(blocks);
-  for (std::size_t i = 0; i < blocks; ++i)
-    words[i] = native_quantised_scale::loadStagedPrimary(d.codebook_id, plane.data(), i);
-  return words;
-}
 /** @brief Terminal snapshot of actual source allocations, never a hot-path
- * source mirror. */
+ * source mirror. A superblock-coded matrix is read as the identical legacy
+ * per-block words (and restored per-block payload) through the production
+ * codec, so the scalar oracle below is representation independent. */
 Planes readPlanes(Storage &s, const DeviceNativeQuantisedMatrixDesc &d) {
   const auto physical = requireQ8ResidualNativeMatrix(d, 1, d.n, d.k);
   const auto blocks = std::size_t(d.n) * d.blocks_per_row;
-  return {
-      s.download(d.payload, blocks * (d.allocation_payload_bytes_per_block
-                                          ? d.allocation_payload_bytes_per_block
-                                          : physical.payload_bytes_per_block)),
-      stagedPrimaryWords(s, d, blocks),
-      d.mins ? s.download(static_cast<const uint16_t *>(d.mins), blocks)
-             : std::vector<uint16_t>{},
-      d.emins ? s.download(static_cast<const uint32_t *>(d.emins), blocks)
-              : std::vector<uint32_t>{}};
+  const auto payload_bytes = d.allocation_payload_bytes_per_block
+                                 ? d.allocation_payload_bytes_per_block
+                                 : physical.payload_bytes_per_block;
+  auto legacy = test::nativeQuantisedLegacyPlanes(
+      d, payload_bytes,
+      [&](void *dst, const void *src, std::size_t bytes) {
+        const auto host = s.download(static_cast<const uint8_t *>(src), bytes);
+        std::memcpy(dst, host.data(), bytes);
+      },
+      [&](const std::vector<uint8_t> &bytes, std::size_t count) {
+        std::vector<uint16_t> plane((bytes.size() + 1) / 2, 0);
+        std::memcpy(plane.data(), bytes.data(), bytes.size());
+        std::vector<uint16_t> words(count);
+        for (std::size_t i = 0; i < count; ++i)
+          words[i] = native_quantised_scale::loadStagedPrimary(d.codebook_id, plane.data(), i);
+        return words;
+      });
+  // Per-block oracle semantics: a secondary/emin word exists only where the
+  // physical decoder reads one.
+  if (legacy.coded && !physical.is_asymmetric)
+    legacy.secondary.clear();
+  return {std::move(legacy.payload), std::move(legacy.primary), std::move(legacy.secondary),
+          std::move(legacy.emins)};
 }
 /** @brief Scalar coefficient interpretation independent of GPU integer dots and
  * FP32 contribution/reduction helpers. */

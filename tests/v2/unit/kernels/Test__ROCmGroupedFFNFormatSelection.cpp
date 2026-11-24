@@ -77,10 +77,15 @@ TEST(ROCmGroupedFFNFormatSelection, AllSourceAndMigrationFormatsRetainIndependen
 /** @test An indexed gate schedule depends on its gate/up readers, including every encoding reachable by movement. */
 TEST(ROCmGroupedFFNFormatSelection, IndexedGateReadersAreIndependentOfDownAndRejectMixedEncodings)
 {
-    const auto& gate=formats::IQ3_XXS;
     const auto& sharedGate=formats::IQ2_S;
+    // IQ3_XXS movement keeps its compact multi-scale encoding (codebook 12), so
+    // the original readers survive every move; Q5_K movement expands to
+    // codebook 23, so a movable Q5_K gate cannot keep the original readers.
+    struct Gate {const NativeQuantisedFormatInfo* format; bool movable_keeps_readers;};
+    for(const Gate g:{Gate{&formats::IQ3_XXS,true},Gate{&formats::Q5_K,false}})
     for(const auto* down:{&formats::Q5_1,&formats::Q6_K}) {
-        SCOPED_TRACE(down->codebook_id);
+        const auto& gate=*g.format;
+        SCOPED_TRACE(::testing::Message()<<int(gate.codebook_id)<<' '<<int(down->codebook_id));
         const std::array weights{matrix(sharedGate,sharedGate.codebook_id,false),
             matrix(sharedGate,sharedGate.codebook_id,false),matrix(*down,down->codebook_id,true)};
         const auto declare=[&](bool movable) {
@@ -89,7 +94,7 @@ TEST(ROCmGroupedFFNFormatSelection, IndexedGateReadersAreIndependentOfDownAndRej
         };
         const auto compact=declare(false);
         EXPECT_TRUE(compact.hasOriginalGateReaders(gate,sharedGate,weights));
-        EXPECT_FALSE(declare(true).hasOriginalGateReaders(gate,sharedGate,weights));
+        EXPECT_EQ(declare(true).hasOriginalGateReaders(gate,sharedGate,weights),g.movable_keeps_readers);
         EXPECT_FALSE(compact.hasOriginalGateReaders(formats::IQ3_S,sharedGate,weights));
         for(unsigned role=0;role<2;++role) {
             auto changed=weights;

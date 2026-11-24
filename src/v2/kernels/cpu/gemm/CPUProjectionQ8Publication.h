@@ -12,6 +12,7 @@
 #include "CPUProjectionRowGrid.h"
 #include "CPUProjectionStorageProof.h"
 #include "kernels/common/MoEProjectionNumericalContract.h"
+#include "kernels/common/DeviceSwiGLUNumericalContract.h"
 #include "kernels/cpu/primitives/GPUAlignedExpertQ8Primitives.h"
 #include "tensors/SIMDHelpers.h"
 #include "utils/OpenMPUtils.h"
@@ -174,6 +175,9 @@ namespace llaminar2::cpu::native_quantised
      * @param K Logical FP32 elements in each row; must be divisible by 32.
      * @param K_blocks Number of Q8_1 blocks per row; must equal `K / 32`.
      * @param policy Complete ordinary or heterogeneous-expert numerical program.
+     * @param swiglu_limit Positive DeepSeek-V4 SwiGLU operand clamp, or 0 for plain SwiGLU.
+     *        Clamped operands are staged in task-local copies, so the caller's
+     *        gate/up rows are never modified.
      * @throws std::invalid_argument Before mutation on invalid geometry/policy or output/source overlap.
      */
     inline void swiglu_quantize_activations_to_q8_1(
@@ -184,7 +188,8 @@ namespace llaminar2::cpu::native_quantised
         int K,
         int K_blocks,
         CPUProjectionNumericalPolicy policy =
-            CPUProjectionNumericalPolicy::BackendNative)
+            CPUProjectionNumericalPolicy::BackendNative,
+        float swiglu_limit = 0.0f)
     {
         constexpr int kQ8BlockSize =
             static_cast<int>(Q8_1Block::BLOCK_SIZE);
@@ -240,19 +245,36 @@ namespace llaminar2::cpu::native_quantised
                  * compiler from forwarding wider intermediate precision.
                  */
                 alignas(64) float activated[kElementsPerTask] = {};
+                const float *task_gate = gate + fp32_offset;
+                const float *task_up = up + fp32_offset;
+                alignas(64) float clamped_gate[kElementsPerTask];
+                alignas(64) float clamped_up[kElementsPerTask];
+                if (swiglu_limit > 0.0f)
+                {
+                    // Exact min/max on copies; the SwiGLU program below is unchanged.
+                    for (int i = 0; i < element_count; ++i)
+                    {
+                        clamped_gate[i] = task_gate[i];
+                        clamped_up[i] = task_up[i];
+                        device_swiglu_contract::clampOperands(
+                            clamped_gate[i], clamped_up[i], swiglu_limit);
+                    }
+                    task_gate = clamped_gate;
+                    task_up = clamped_up;
+                }
                 if (policy == CPUProjectionNumericalPolicy::GPUAlignedExpert)
                 {
                     primitives::compute_swiglu_gpu_aligned_expert_serial(
-                        gate + fp32_offset,
-                        up + fp32_offset,
+                        task_gate,
+                        task_up,
                         activated,
                         element_count);
                 }
                 else
                 {
                     primitives::compute_swiglu_serial(
-                        gate + fp32_offset,
-                        up + fp32_offset,
+                        task_gate,
+                        task_up,
                         activated,
                         element_count);
                 }

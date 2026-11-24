@@ -13,6 +13,7 @@
 #include "kernels/cpu/CPUInvocationWorkspace.h"
 #include <climits>
 #include <stdexcept>
+#include <string>
 
 namespace llaminar2
 {
@@ -33,7 +34,7 @@ namespace llaminar2
         requireGeometry(geometry);
         if (format == "F32" || format == "F16" || format == "BF16") return {};
         const auto *native = native_quantised_formats::forQuantType(format);
-        if (!native) throw std::invalid_argument("CPU projection workspace has an unsupported source format");
+        if (!native) throw std::invalid_argument("CPU projection workspace has an unsupported source format: " + std::string(format));
         return prepared(cpu::native_quantised::preparedFootprintForFormat(*native), native->codebook_id, geometry);
     }
 

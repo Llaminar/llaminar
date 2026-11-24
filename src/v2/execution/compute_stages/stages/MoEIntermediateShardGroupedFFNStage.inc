@@ -161,7 +161,8 @@ public:
         : IComputeStage(binding->device()),binding_(std::move(binding)),shared_(shared),
         publication_{*binding_->params.live_rows,{descriptor.gate,descriptor.up,descriptor.down},gate,
             shared.gate_scratch,shared.up_scratch,dynamic_cast<TensorBase*>(binding_->params.output.tensor),
-            shared.output,dynamic_cast<TensorBase*>(combined.tensor),{},std::move(selection.program)},
+            shared.output,dynamic_cast<TensorBase*>(combined.tensor),{},std::move(selection.program),{},
+            binding_->params.swiglu_activation,shared.swiglu_activation},
             direct_bank_(selection.direct_bank),combined_id_(combined.id),name_(std::move(name))
     {
         for(auto* tensor:extraOperands())
@@ -241,6 +242,7 @@ public:
         validateSeal();
         auto value=binding_->signature^0x46464e47524f5550ULL;
         const auto mix=[&](std::uint64_t part){value=(value^part)*kFNV1a64Prime;};
+        mix(publication_.sharedActivation.captureWord());
         mix(direct_bank_);
         mix(frontier::usesExactK32Sums(publication_.program));
         mix(publication_.program.index());

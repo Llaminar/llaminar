@@ -141,7 +141,7 @@ namespace llaminar2::cpu::native_quantised
     // For nibble-LUT formats (Q4_0, IQ4_NL, Q4_1): extracts payload nibbles + scales,
     // interleaves into 4-group VNNI layout with inline comp/scales.
     //
-    // For INT8 pre-decoded formats (Q8_0, Q5_0, etc.): extracts INT8 values + scales,
+    // For legacy compensated expanded Q5: extracts INT8 values + scales,
     // interleaves into 8-group VNNI layout with inline comp/scales.
     //
     // Superblock formats (Q6_K, Q3_K, Q2_K) are NOT supported for deferred repacking
@@ -162,6 +162,10 @@ namespace llaminar2::cpu::native_quantised
         const CPUNativeQuantisedPackedWeights &meta,
         uint8_t *workspace)
     {
+        if (meta.encoding == CPUNativeQuantisedEncoding::Q5NativeSingleScale)
+            throw std::invalid_argument("Deferred raw-block repacking cannot publish native Q5 CPU units; use the native window producer");
+        if (!meta.usesInlineCompensation())
+            throw std::invalid_argument("Legacy deferred CPU repack requires per-block weight-sum compensation metadata");
         if (meta.usesQ6KNativeDualScale() || meta.usesCompactMultiScale() ||
             meta.usesNibbleLUTSourceScale() || meta.usesIQ3SExpandedSourceScale())
         {
@@ -224,7 +228,7 @@ namespace llaminar2::cpu::native_quantised
                         {
                             // Native nibble MXFP4 units always carry the exact BF16
                             // power-of-two word of their E8M0 scale.
-                            if (meta.scaleEncoding() != CPUNativeQuantisedScaleEncoding::PowerOfTwoBF16)
+                            if (meta.scaleEncoding() != CPUNativeQuantisedScaleEncoding::E8M0)
                                 throw std::logic_error("MXFP4 nibble units require the BF16 power-of-two scale encoding");
                             if (!mxfp4::blockFitsNativeE8M0(blk[0], blk + 1))
                                 throw std::invalid_argument(
@@ -305,7 +309,7 @@ namespace llaminar2::cpu::native_quantised
         else
         {
             // ---------------------------------------------------------------
-            // INT8 PRE-DECODED PATH (Q8_0, Q5_0, Q5_1)
+            // LEGACY COMPENSATED INT8 PATH (Q5_0, Q5_1)
             // 8 groups, 32 INT8 values per block
             // ---------------------------------------------------------------
 
@@ -340,12 +344,7 @@ namespace llaminar2::cpu::native_quantised
                         const int row = chunk * 64 + col;
                         const uint8_t *blk = native_blocks + row * native_row_stride + kb * block_size;
 
-                        if (codebook_id == 19) // Q8_0: scale(2) + qs(32) = 34 bytes
-                        {
-                            std::memcpy(&scales_buf[col], blk, 2);
-                            std::memcpy(int8_buf[col], blk + 2, 32);
-                        }
-                        else if (codebook_id == 6) // Q5_0
+                        if (codebook_id == 6) // Q5_0
                         {
                             std::memcpy(&scales_buf[col], blk, 2);
                             Q5_0Block block;
@@ -637,9 +636,10 @@ namespace llaminar2::cpu::native_quantised
                         auto *const compensation =
                             reinterpret_cast<int16_t *>(
                                 destination + out.data_stride);
+                        const int comp_bytes = out.usesInlineCompensation() ? 128 : 0;
                         auto *const inline_scales =
                             reinterpret_cast<uint16_t *>(
-                                destination + out.data_stride + 128);
+                                destination + out.data_stride + comp_bytes);
                         if (source_column_valid)
                         {
                             int32_t sum = 0;
@@ -651,14 +651,14 @@ namespace llaminar2::cpu::native_quantised
                             {
                                 sum += values[value];
                             }
-                            compensation[column] =
-                                static_cast<int16_t>(sum);
+                            if (comp_bytes)
+                                compensation[column] = static_cast<int16_t>(sum);
                             inline_scales[column] = out.usesIQ3SExpandedSourceScale()
                                 ? source_bases[local_kb] : fp32_to_fp16(scales[local_kb]);
                         }
                         else
                         {
-                            compensation[column] = 0;
+                            if (comp_bytes) compensation[column] = 0;
                             inline_scales[column] = 0;
                         }
 
@@ -666,7 +666,7 @@ namespace llaminar2::cpu::native_quantised
                         {
                             auto *const inline_mins =
                                 reinterpret_cast<uint16_t *>(
-                                    destination + out.data_stride + 256);
+                                    destination + out.data_stride + comp_bytes + 128);
                             inline_mins[column] = source_column_valid
                                 ? (out.usesIQ3SExpandedSourceScale()
                                     ? source_coefficients[local_kb] : fp32_to_fp16(mins[local_kb])) : 0;
@@ -778,9 +778,9 @@ namespace llaminar2::cpu::native_quantised
         out.encoding = preparedEncodingForSource(
             *fmt, use_rotated_path);
 
-        out.data_stride = preparedDataStride(out.encoding);
+        out.data_stride = preparedDataStride(out.encoding, out.codebook_id);
         out.interleaved_block_stride = preparedInterleavedBlockStride(
-            out.encoding, out.is_asymmetric);
+            out.encoding, out.is_asymmetric, out.codebook_id);
 
         // Temporary metadata is allocated only by layouts that still need a
         // distinct source-oriented pass.  Expanded-INT8 preparation writes
@@ -1024,7 +1024,8 @@ namespace llaminar2::cpu::native_quantised
                     // Write comp inline after group data
                     size_t meta_idx = (size_t)chunk * blocks_per_row * 64 + (size_t)kb * 64;
                     int16_t *inline_comp = reinterpret_cast<int16_t *>(interleaved_dst + 2048);
-                    for (int col = 0; col < 64; ++col)
+                    const int comp_bytes = out.usesInlineCompensation() ? 128 : 0;
+                    if (comp_bytes) for (int col = 0; col < 64; ++col)
                     {
                         if (col < n_cols)
                         {
@@ -1043,13 +1044,13 @@ namespace llaminar2::cpu::native_quantised
                     }
 
                     // Write scales inline after comp
-                    uint16_t *inline_scales = reinterpret_cast<uint16_t *>(interleaved_dst + 2048 + 128);
+                    uint16_t *inline_scales = reinterpret_cast<uint16_t *>(interleaved_dst + 2048 + comp_bytes);
                     std::memcpy(inline_scales, &temp_scales[meta_idx], 64 * sizeof(uint16_t));
 
                     // Write mins inline after scales (if asymmetric)
                     if (out.is_asymmetric || out.usesNibbleLUTSourceScale())
                     {
-                        uint16_t *inline_mins = reinterpret_cast<uint16_t *>(interleaved_dst + 2048 + 256);
+                        uint16_t *inline_mins = reinterpret_cast<uint16_t *>(interleaved_dst + 2048 + comp_bytes + 128);
                         std::memcpy(inline_mins, &temp_mins[meta_idx], 64 * sizeof(uint16_t));
                     }
                 }

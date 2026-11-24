@@ -44,6 +44,7 @@
 #include "../../../backends/GPUDeviceContextPool.h"
 #include "IInferenceRunner.h"
 #include "execution/moe/NativeMoEMovementArchive.h"
+#include "execution/moe/DeviceMoERebalanceCadenceRecipe.h"
 #include "../graph/DeviceGraphExecutor.h"
 #include "../device/DeviceContext.h"
 #include "../device/WorkspaceAllocator.h"
@@ -2428,6 +2429,13 @@ namespace llaminar2
          */
         bool initializePromptRepetitionHistory(
             std::span<const int32_t> unique_tokens, int request_index = 0) override;
+
+        /**
+         * @brief Stage the next request's prompt-embedding rows (multimodal), or clear them.
+         * @details CPU writes the host bank now; GPU uploads at the next prefill
+         * request-input admission on its admission stream.
+         */
+        bool stagePromptEmbeddingRows(std::shared_ptr<const PromptEmbeddingRows> rows) override;
 
         bool configureMTPRequestPenaltyPolicy(
             const MTPRequestPenaltyPolicy &policy) override;
@@ -6077,6 +6085,9 @@ namespace llaminar2
         bool composeDeviceMoERebalanceCadenceTransaction(
             std::string *error = nullptr);
 
+        /** @return The current native cadence's ordinary sources and device predicate, or a diagnostic. */
+        std::optional<DeviceMoERebalanceCadenceRecipe> nativeMoERebalanceCadenceRecipe(std::string *error = nullptr);
+
         /**
          * @brief Initialize the persistent MoE ticket on a request-reset stream.
          *
@@ -6765,6 +6776,13 @@ namespace llaminar2
 
         /// Graph builder (declarative layer)
         std::shared_ptr<IGraphBuilder> graph_builder_;
+        /// Next request's prompt-embedding rows; retained as the H2D source until replaced.
+        std::shared_ptr<const PromptEmbeddingRows> staged_prompt_embeddings_;
+        std::vector<std::int32_t> prompt_embedding_map_host_; ///< H2D source of the map prefix.
+        std::size_t prompt_embedding_map_extent_ = 0;         ///< Positions the last admitted map named.
+        bool prompt_embeddings_pending_ = false;              ///< GPU upload owed at the next prefill admission.
+        /** @brief Upload staged prompt-embedding rows and map on the request-admission stream. */
+        bool admitPromptEmbeddingRowsOnDevice(IBackend &backend, void *stream);
 
         /// Graph executor
         DeviceGraphExecutor executor_;
@@ -8532,7 +8550,9 @@ namespace llaminar2
             std::optional<ForwardGraphSignature> pipeline_verifier_identity;
             /** Exact ordinary ownership/lifecycle topology embedded in this parent. */
             std::optional<OrdinaryGenerationComposition> ordinary_composition;
-            /** Exact maintenance executable borrowed by an ordinary parent, if any. */
+            /** Exact native cadence sources and device predicate borrowed by an ordinary parent. */
+            std::optional<DeviceMoERebalanceCadenceRecipe> ordinary_native_cadence;
+            /** Exact hosted maintenance executable, if any. */
             const IGPUGraphCapture *ordinary_maintenance_capture = nullptr;
             /** Exact resident condition word embedded beside that executable. */
             const uint32_t *ordinary_maintenance_due = nullptr;
@@ -8618,6 +8638,7 @@ namespace llaminar2
                 pipeline_verifier_branches.clear();
                 pipeline_verifier_identity.reset();
                 ordinary_composition.reset();
+                ordinary_native_cadence.reset();
                 ordinary_maintenance_capture = nullptr;
                 ordinary_maintenance_due = nullptr;
                 workspace_generation = 0;

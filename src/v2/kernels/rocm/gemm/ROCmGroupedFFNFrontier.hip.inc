@@ -131,6 +131,10 @@ struct RoutedQ4Planes {
     const uint8_t* payload{};
     const void* scales{};
     const void* mins{};
+    uint8_t layout{}; ///< Packed metadata layout; nonzero only for superblock-coded Q4_K.
+    /** @return The role's typed metadata planes. */
+    __device__ __forceinline__ ::llaminar2::rocm_native_metadata::MetadataPlanes meta() const
+    { return ::llaminar2::rocm_native_metadata::planesFromLayout(scales,mins,nullptr,layout); }
 };
 
 #if defined(__gfx906__)
@@ -159,9 +163,11 @@ __device__ __forceinline__ RoutedQ4Planes borrowRoutedQ4Planes(
                  "s_load_dwordx2 %1, %2, 0x10 glc\n\t"
                  "s_waitcnt lgkmcnt(0)"
                  : "=&s"(primary), "=&s"(minimum) : "s"(uniform) : "memory");
+    // The metadata layout byte is uniform for the borrowed role as well.
     return {reinterpret_cast<const uint8_t*>(composeWaveAddress(primary[0],primary[1])),
             reinterpret_cast<const void*>(composeWaveAddress(primary[2],primary[3])),
-            reinterpret_cast<const void*>(minimum)};
+            reinterpret_cast<const void*>(minimum),
+            static_cast<uint8_t>(__builtin_amdgcn_readfirstlane(role.metadata_layout))};
 }
 #endif
 
@@ -177,21 +183,39 @@ __device__ __forceinline__ T readPackedGlobal(const void* pointer)
 }
 
 /** @brief Append one affine K32 pair with the retained M1 integer and FP32 operations. */
+/**
+ * @brief Scale and minimum words of one routed Q4 role block.
+ * @param planes Borrowed role planes. @param index Block-major payload index.
+ * @param block K32 block. @param column Output column. @param width Block-major pitch.
+ * @return {scale, minimum} FP16 words, identical for both representations.
+ *
+ * Per-block roles keep the original global-address loads; a superblock-coded
+ * Q4_K role reconstructs the identical words (uniform branch per role).
+ */
+__device__ __forceinline__ uint2 routedQ4ScaleWords(const RoutedQ4Planes& planes,size_t index,
+    int block,int column,int width)
+{
+    if(planes.layout==0)
+        return {readPackedGlobal<uint16_t>(static_cast<const uint16_t*>(planes.scales)+index),
+                readPackedGlobal<uint16_t>(static_cast<const uint16_t*>(planes.mins)+index)};
+    const auto words=::llaminar2::rocm_native_metadata::blockMetadata<5>(planes.meta(),uint32_t(block),uint32_t(column),uint32_t(width));
+    return {words.primary,words.secondary};
+}
+
 template<bool ReuseSum>
 __device__ __forceinline__ void accumulateRoutedQ4Pair(RoutedQ4Planes gate,RoutedQ4Planes up,
-    size_t index,const int* activation,float scale,int sum,float& g,float& u)
+    size_t index,int block,int column,int width,const int* activation,float scale,int sum,float& g,float& u)
 {
     const auto gateWords=readPackedGlobal<int4>(gate.payload+index*16);
     const auto upWords=readPackedGlobal<int4>(up.payload+index*16);
     const auto dots=q4PairedDots<!ReuseSum>(gateWords,upWords,activation,sum);
-    const auto coefficient=[&](const void* plane) {
-        return __half2float(__ushort_as_half(readPackedGlobal<uint16_t>(
-            static_cast<const uint16_t*>(plane)+index)));
-    };
+    const auto gateScale=routedQ4ScaleWords(gate,index,block,column,width);
+    const auto upScale=routedQ4ScaleWords(up,index,block,column,width);
+    const auto coefficient=[](uint32_t word) { return __half2float(__ushort_as_half(uint16_t(word))); };
     g=rocm_native_quantised_commit_corrected_single_scale_block(
-        g,dots.gate,coefficient(gate.scales),dots.sum,coefficient(gate.mins),scale);
+        g,dots.gate,coefficient(gateScale.x),dots.sum,coefficient(gateScale.y),scale);
     u=rocm_native_quantised_commit_corrected_single_scale_block(
-        u,dots.up,coefficient(up.scales),dots.sum,coefficient(up.mins),scale);
+        u,dots.up,coefficient(upScale.x),dots.sum,coefficient(upScale.y),scale);
 }
 
 /** @brief Original packed operands for one routed K32 block. */
@@ -202,14 +226,13 @@ struct RoutedQ4Block {
 
 /** @brief Load one original K32 block of each ready role. */
 __device__ __forceinline__ RoutedQ4Block loadRoutedQ4Block(
-    RoutedQ4Planes gate,RoutedQ4Planes up,size_t index)
+    RoutedQ4Planes gate,RoutedQ4Planes up,size_t index,int block,int column,int width)
 {
+    const auto gateScale=routedQ4ScaleWords(gate,index,block,column,width);
+    const auto upScale=routedQ4ScaleWords(up,index,block,column,width);
     return {readPackedGlobal<int4>(gate.payload+index*16),
             readPackedGlobal<int4>(up.payload+index*16),
-            readPackedGlobal<uint16_t>(static_cast<const uint16_t*>(gate.scales)+index),
-            readPackedGlobal<uint16_t>(static_cast<const uint16_t*>(gate.mins)+index),
-            readPackedGlobal<uint16_t>(static_cast<const uint16_t*>(up.scales)+index),
-            readPackedGlobal<uint16_t>(static_cast<const uint16_t*>(up.mins)+index)};
+            uint16_t(gateScale.x),uint16_t(gateScale.y),uint16_t(upScale.x),uint16_t(upScale.y)};
 }
 
 /** @brief Append one affine K32 pair with the retained M1 integer and FP32 operations. */
@@ -266,14 +289,14 @@ __device__ __forceinline__ Projections pairedProjections(const DeviceNativeQuant
 #pragma unroll 1
                 for(;block+1<end;block+=2) {
                     const auto index=static_cast<size_t>(block)*width+column;
-                    const auto first=loadRoutedQ4Block(gatePlanes,upPlanes,index);
-                    const auto second=loadRoutedQ4Block(gatePlanes,upPlanes,index+width);
+                    const auto first=loadRoutedQ4Block(gatePlanes,upPlanes,index,block,column,width);
+                    const auto second=loadRoutedQ4Block(gatePlanes,upPlanes,index+width,block+1,column,width);
                     commitRoutedQ4Block<ReuseSum>(first,block,codes,scales,sums,g,u);
                     commitRoutedQ4Block<ReuseSum>(second,block+1,codes,scales,sums,g,u);
                 }
                 if(block<end) {
                     const auto index=static_cast<size_t>(block)*width+column;
-                    const auto tail=loadRoutedQ4Block(gatePlanes,upPlanes,index);
+                    const auto tail=loadRoutedQ4Block(gatePlanes,upPlanes,index,block,column,width);
                     commitRoutedQ4Block<ReuseSum>(tail,block,codes,scales,sums,g,u);
                 }
             }
@@ -286,7 +309,7 @@ __device__ __forceinline__ Projections pairedProjections(const DeviceNativeQuant
                 const auto scale=scales[block];
 #if defined(__gfx906__)
                 if constexpr(scalarQ4) {
-                    accumulateRoutedQ4Pair<ReuseSum>(gatePlanes,upPlanes,index,a4,scale,
+                    accumulateRoutedQ4Pair<ReuseSum>(gatePlanes,upPlanes,index,block,column,width,a4,scale,
                         ReuseSum?sums[block]:0,g,u);
                 } else
 #endif
@@ -297,9 +320,9 @@ __device__ __forceinline__ Projections pairedProjections(const DeviceNativeQuant
                     if constexpr(ReuseSum)sum=sums[block];
                     int32_t decoded[8];
                     moe_prefill_decode_groups<Format,false>(gatePayload,decoded,nullptr);
-                    g=moe_prefill_accumulate_decoded_block<Format,ReuseSum>(gate,index,gatePayload,decoded,a4,scale,g,sum);
+                    g=moe_prefill_accumulate_decoded_block_at<Format,ReuseSum>(gate,block,column,width,gatePayload,decoded,a4,scale,g,sum);
                     moe_prefill_decode_groups<Format,false>(upPayload,decoded,nullptr);
-                    u=moe_prefill_accumulate_decoded_block<Format,ReuseSum>(up,index,upPayload,decoded,a4,scale,u,sum);
+                    u=moe_prefill_accumulate_decoded_block_at<Format,ReuseSum>(up,block,column,width,upPayload,decoded,a4,scale,u,sum);
                 }
             }
         if(parts==1)return {g,u};
@@ -415,7 +438,8 @@ void groupedFFNPairedGatePublish(Args p)
                     p.output.sharedGateScratch[row*sharedWidth+column]=value.gate;
                     p.output.sharedUpScratch[row*sharedWidth+column]=value.up;
                 }
-                publication[owner][column%32]=decode_equivalent::swigluValue(value.gate,value.up);
+                publication[owner][column%32]=decode_equivalent::swigluValue(value.gate,value.up,
+                    routed?p.output.routedSwiGLULimit:p.output.sharedSwiGLULimit);
             }
         }
         __syncthreads();
@@ -465,8 +489,8 @@ __device__ __forceinline__ float fixedPublishedDown(const DeviceNativeQuantisedM
         const auto* activation=reinterpret_cast<const int32_t*>(codes+block*32);
         int sum=0;
         if constexpr(ReuseSum)sum=sums[block];
-        const float partial=moe_prefill_accumulate_decoded_block<Format,ReuseSum>(
-            down,index,data,decoded,activation,scales[block],0.0f,sum);
+        const float partial=moe_prefill_accumulate_decoded_block_at<Format,ReuseSum>(
+            down,block,column,hidden,data,decoded,activation,scales[block],0.0f,sum);
         total=rocm_native_quantised_accumulate_rn(total,partial);
     }
     return total;

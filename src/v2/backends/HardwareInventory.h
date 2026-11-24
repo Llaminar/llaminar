@@ -54,6 +54,19 @@ namespace llaminar2
                                  const HostMemoryCapacityObservation &system);
 
     /**
+     * @brief Replace an integrated accelerator's driver free figure with its pool capacity.
+     *
+     * A `RankHostPool` device allocates from host DRAM, and its driver free
+     * figure omits reclaimable page cache. Its admission capacity is the same
+     * canonical host observation that admits the pool's CPU member, bounded by
+     * the device's addressable total. Dedicated devices are unchanged.
+     *
+     * @param device Enumerated accelerator with its NUMA node already assigned.
+     * @throws std::runtime_error When the backing pool cannot be observed.
+     */
+    void adoptIntegratedAcceleratorPoolCapacity(ComputeDevice &device);
+
+    /**
      * @brief Policy-scoped hardware inventory for one process on one machine
      *
      * This struct is the single source of truth for hardware detected under

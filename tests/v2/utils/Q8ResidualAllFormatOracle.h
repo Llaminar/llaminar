@@ -12,6 +12,8 @@
 #include "QuantizedVerifierFormats.h"
 #include "kernels/common/DeviceNativeQuantisedMatrixDesc.h"
 #include "kernels/cpu/gemm/CPUNativeQuantisedDecode.h"
+#include "kernels/cpu/gemm/CPUNativeQuantisedCodedMetadata.h"
+#include "tensors/NativeQuantisedSuperblockMetadata.h"
 #include "tensors/MXFP4Format.h"
 #include "tensors/NativeQuantisedScalePlane.h"
 #include "kernels/cpu/gemm/CPUNativeQuantisedGemmKernel.h"
@@ -211,14 +213,19 @@ cpuWeights(const cpu::native_quantised::CPUNativeQuantisedPackedWeights &p) {
       const int chunk = n / 64, col = n % 64, z = col / 16, lane = col % 16;
       std::array<double, 32> decoded{};
       if (p.usesCompactMultiScale()) {
+        // Coded compact units carry the source payload at its exact width;
+        // the per-block staged words are reconstructed through the codec
+        // (codedBlockMetadata) and code-in-payload codebooks restore the
+        // sign-parity bits before the integer decoder runs.
         std::array<uint8_t, 32> payload{};
-        for (int j = 0; j < p.payload_bytes; ++j)
-          payload[j] = p.interleavedB(chunk, b, j / 4, z)[lane * 4 + j % 4];
+        cpu::native_quantised::compactColumnPayload(p.blockUnit(chunk, b), p.codebook_id, col, payload.data());
+        ::llaminar2::native_quantised_superblock::restoreCodedPayload(p.codebook_id, payload.data());
+        const auto meta = p.codedBlockMetadata(chunk, b, col);
         decoded = coefficients(
             p.codebook_id,
             std::span<const uint8_t>(payload.data(), p.payload_bytes),
-            p.chunkScales(chunk, b)[col], p.chunkMins(chunk, b)[col],
-            p.codebook_id == 10 ? p.chunkEffectiveMins(chunk, b)[col] : 0);
+            meta.primary, meta.secondary,
+            p.codebook_id == 10 ? meta.emin : 0);
       } else
         for (int i = 0; i < 32; ++i) {
           int value;
@@ -233,6 +240,19 @@ cpuWeights(const cpu::native_quantised::CPUNativeQuantisedPackedWeights &p) {
             const int bit = lane * 4 + i % 4;
             value =
                 (low | (((a >> bit) & 1) << 4) | (((c >> bit) & 1) << 5)) - 32;
+          } else if (p.encoding == cpu::native_quantised::CPUNativeQuantisedEncoding::Q5NativeSingleScale) {
+            // Four nibble groups share one fifth-bit byte per group and column.
+            // Treating groups 4-7 as expanded INT8 reads fifth bits, scales,
+            // and neighboring K blocks as though they were weight coefficients.
+            using Layout = cpu::native_quantised::Q5NativePayload;
+            const auto *unit = p.blockUnit(chunk, b);
+            const int group = (i % 16) / 4, element = i % 4, half = i / 16;
+            const auto nibble = unit[Layout::nibbleOffset(group, col) + element];
+            const auto fifth = unit[Layout::fifthOffset(group, col)];
+            value = ((nibble >> (4 * half)) & 15) |
+                    (((fifth >> (4 * half + element)) & 1) << 4);
+            if (!p.is_asymmetric)
+              value -= 16;
           } else if (p.usesNibbleLUT()) {
             const auto byte =
                 p.interleavedB(chunk, b, (i % 16) / 4, z)[lane * 4 + i % 4];

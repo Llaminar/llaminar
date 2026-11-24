@@ -647,6 +647,194 @@ TEST_F(Test__ChatCompletionHandler, HandleRequest_SetsSamplingParams_BeforePrefi
     EXPECT_LT(sp_pos, prefill_pos) << "setSamplingParams must be called before prefill";
 }
 
+/** @brief Fake model image pipeline: placeholder token 99 expands to three IMAGE rows. */
+class FakePromptImageEncoder final : public multimodal::IPromptImageEncoder
+{
+public:
+    const std::string &placeholderText() const noexcept override { return text_; }
+    std::int32_t placeholderToken() const noexcept override { return 99; }
+    int maxImagesPerRequest() const noexcept override { return 2; }
+    multimodal::ExpandedPrompt expand(const std::vector<std::int32_t> &tokens,
+                                      const std::vector<std::vector<std::uint8_t>> &images) const override
+    {
+        multimodal::ExpandedPrompt out;
+        auto rows = std::make_shared<PromptEmbeddingRows>();
+        rows->width = 1;
+        std::size_t image = 0;
+        for (const auto t : tokens)
+        {
+            if (t != 99) { out.tokens.push_back(t); rows->position_rows.push_back(0); continue; }
+            if (image >= images.size()) throw std::invalid_argument("more placeholders than images");
+            for (int i = 0; i < 3; ++i)
+            {
+                out.tokens.push_back(7);
+                rows->rows.push_back(static_cast<float>(images[image].size()));
+                rows->position_rows.push_back(static_cast<std::int32_t>(rows->rows.size()));
+            }
+            ++image;
+        }
+        if (image != images.size()) throw std::invalid_argument("fewer placeholders than images");
+        out.rows = rows;
+        return out;
+    }
+
+private:
+    std::string text_ = "<IMG>";
+};
+
+/** @test Image parts need a vision projector; without one the request is a 400 before any inference. */
+TEST_F(Test__ChatCompletionHandler, ImagePartsWithoutProjectorAre400)
+{
+    auto handler = makeHandler();
+    EXPECT_CALL(*runner_, prefill(_)).Times(0);
+    EXPECT_CALL(*runner_, setNextPromptEmbeddingRows(_)).Times(0);
+    ON_CALL(*tokenizer_, encodeChat(_, _, _)).WillByDefault(Return(std::vector<int>{1, 2}));
+    ChatCompletionResponse error;
+    const auto request = ChatCompletionHandler::parseRequest(
+        R"({"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]}], "max_tokens": 2})",
+        error);
+    ASSERT_TRUE(request) << error.json_body;
+    const auto response = handler->handleRequest(*request);
+    EXPECT_FALSE(response.ok);
+    EXPECT_EQ(response.http_status, 400);
+    EXPECT_NE(response.json_body.find("--mmproj"), std::string::npos) << response.json_body;
+}
+
+/** @test Images render as placeholders, expand after encoding and reach the runner with their rows before prefill. */
+TEST_F(Test__ChatCompletionHandler, ImagePartsExpandAndStageRowsBeforePrefill)
+{
+    auto handler = std::make_unique<ChatCompletionHandler>(*runner_, *tokenizer_, "", std::make_shared<FakePromptImageEncoder>());
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
+        .WillByDefault(Invoke([](const std::vector<ChatMessage> &messages, bool, const std::string &) {
+            // The placeholder text sits in the image's content part.
+            EXPECT_EQ(messages.at(0).content_parts.at(1), "<IMG>");
+            return std::vector<int>{1, 99, 2};
+        }));
+    ON_CALL(*tokenizer_, is_stop_token(_)).WillByDefault(Return(false));
+    std::vector<std::string> order;
+    std::shared_ptr<const PromptEmbeddingRows> staged;
+    EXPECT_CALL(*runner_, setNextPromptEmbeddingRows(_))
+        .WillOnce(Invoke([&](std::shared_ptr<const PromptEmbeddingRows> rows) {
+            order.push_back("rows");
+            staged = std::move(rows);
+            return true;
+        }));
+    EXPECT_CALL(*runner_, prefill(_))
+        .WillOnce(Invoke([&](const std::vector<int32_t> &tokens) {
+            order.push_back("prefill");
+            EXPECT_EQ(tokens, (std::vector<int32_t>{1, 7, 7, 7, 2}));
+            return true;
+        }));
+    EXPECT_CALL(*runner_, decodeStep()).WillOnce(Return(makeToken(42, /*is_complete=*/true)));
+    ChatCompletionResponse error;
+    // "AAAA" decodes to three bytes.
+    const auto request = ChatCompletionHandler::parseRequest(
+        R"({"messages": [{"role": "user", "content": [{"type": "text", "text": "Look:"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]}], "max_tokens": 2})",
+        error);
+    ASSERT_TRUE(request) << error.json_body;
+    const auto response = handler->handleRequest(*request);
+    EXPECT_TRUE(response.ok) << response.json_body;
+    EXPECT_EQ(order, (std::vector<std::string>{"rows", "prefill"}));
+    ASSERT_TRUE(staged);
+    EXPECT_EQ(staged->rows, (std::vector<float>{3, 3, 3}));
+    EXPECT_EQ(staged->position_rows, (std::vector<std::int32_t>{0, 1, 2, 3, 0}));
+
+    // Undecodable data and too many images are client errors.
+    for (const char *body : {
+             R"({"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,@@@"}}]}]})",
+             R"({"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:,a"}},
+                 {"type": "image_url", "image_url": {"url": "data:,a"}}, {"type": "image_url", "image_url": {"url": "data:,a"}}]}]})"})
+    {
+        const auto bad = ChatCompletionHandler::parseRequest(body, error);
+        ASSERT_TRUE(bad) << error.json_body;
+        const auto rejected = handler->handleRequest(*bad);
+        EXPECT_EQ(rejected.http_status, 400) << body << " -> " << rejected.json_body;
+    }
+}
+
+/** @test An image request that grows past the context window is rejected at its
+ * expanded length before any prompt-embedding rows are staged, so the next
+ * (text) request never observes a stale image row map.
+ * Regression: rows were staged before the context check, and a 400 left
+ * next_prompt_embedding_rows_ populated, so the following text request failed
+ * at the runner with a 500. */
+TEST_F(Test__ChatCompletionHandler, OversizedImageExpansionIs400AndNeverStagesRows)
+{
+    OrchestrationConfig config;
+    config.max_seq_len = 4; // expanded {1,7,7,7,2} is 5 tokens
+    runner_->setConfig(config);
+
+    auto handler = std::make_unique<ChatCompletionHandler>(*runner_, *tokenizer_, "", std::make_shared<FakePromptImageEncoder>());
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
+        .WillByDefault(Return(std::vector<int>{1, 99, 2}));
+    EXPECT_CALL(*runner_, setNextPromptEmbeddingRows(_)).Times(0);
+    EXPECT_CALL(*runner_, prefill(_)).Times(0);
+
+    ChatCompletionResponse error;
+    const auto request = ChatCompletionHandler::parseRequest(
+        R"({"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]}], "max_tokens": 2})",
+        error);
+    ASSERT_TRUE(request) << error.json_body;
+    const auto rejected = handler->handleRequest(*request);
+    EXPECT_FALSE(rejected.ok);
+    EXPECT_EQ(rejected.http_status, 400);
+    EXPECT_NE(rejected.json_body.find("Prompt (5 tokens) exceeds context window (4 tokens)"),
+              std::string::npos) << rejected.json_body;
+
+    // The very next text request must behave like a fresh request: no image
+    // rows are staged and prefill sees only the text tokens.
+    ON_CALL(*tokenizer_, encodeChat(_, _, _)).WillByDefault(Return(std::vector<int>{1, 2}));
+    EXPECT_CALL(*runner_, prefill(_))
+        .WillOnce(Invoke([](const std::vector<int32_t> &tokens) {
+            EXPECT_EQ(tokens, (std::vector<int32_t>{1, 2}));
+            return true;
+        }));
+    ON_CALL(*tokenizer_, is_stop_token(_)).WillByDefault(Return(false));
+    EXPECT_CALL(*runner_, decodeStep()).WillOnce(Return(makeToken(42, /*is_complete=*/true)));
+    const auto text = ChatCompletionHandler::parseRequest(
+        R"({"messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}], "max_tokens": 2})", error);
+    ASSERT_TRUE(text) << error.json_body;
+    const auto response = handler->handleRequest(*text);
+    EXPECT_TRUE(response.ok) << response.json_body;
+}
+
+/** @test A failing image admission (prefill 500) must not make the next request
+ * stage image rows again; admission retirement belongs to the runner, and the
+ * handler stages rows for exactly one request. */
+TEST_F(Test__ChatCompletionHandler, FailedImageAdmissionDoesNotStageRowsForNextRequest)
+{
+    OrchestrationConfig config;
+    config.max_seq_len = 512;
+    runner_->setConfig(config);
+
+    auto handler = std::make_unique<ChatCompletionHandler>(*runner_, *tokenizer_, "", std::make_shared<FakePromptImageEncoder>());
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
+        .WillByDefault(Return(std::vector<int>{1, 99, 2}));
+    EXPECT_CALL(*runner_, setNextPromptEmbeddingRows(_))
+        .WillOnce(Return(true));
+    EXPECT_CALL(*runner_, prefill(_)).WillOnce(Return(false));
+
+    ChatCompletionResponse error;
+    const auto request = ChatCompletionHandler::parseRequest(
+        R"({"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]}], "max_tokens": 2})",
+        error);
+    ASSERT_TRUE(request) << error.json_body;
+    const auto failed = handler->handleRequest(*request);
+    EXPECT_FALSE(failed.ok);
+    EXPECT_EQ(failed.http_status, 500);
+
+    // Next text request: no further staging (Times(1) total) and prefill runs.
+    EXPECT_CALL(*runner_, prefill(_)).WillOnce(Return(true));
+    ON_CALL(*tokenizer_, is_stop_token(_)).WillByDefault(Return(false));
+    EXPECT_CALL(*runner_, decodeStep()).WillOnce(Return(makeToken(42, /*is_complete=*/true)));
+    const auto text = ChatCompletionHandler::parseRequest(
+        R"({"messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}], "max_tokens": 2})", error);
+    ASSERT_TRUE(text) << error.json_body;
+    const auto response = handler->handleRequest(*text);
+    EXPECT_TRUE(response.ok) << response.json_body;
+}
+
 TEST_F(Test__ChatCompletionHandler, HandleRequest_PassesSamplingParams_ToRunner)
 {
     auto handler = makeHandler();
@@ -3096,8 +3284,11 @@ TEST_F(Test__ChatCompletionHandler, StreamingUsagePublishesExactCountsAfterTermi
                 {
                     EXPECT_TRUE(chunks.back()["choices"].empty());
                     EXPECT_EQ(chunks.back()["id"], chunks[0]["id"]);
+                    // prompt_tokens_details mirrors vLLM --enable-prompt-tokens-details;
+                    // this mock runner reports no prefix-cache hit.
                     EXPECT_EQ(chunks.back()["usage"], (json{{"prompt_tokens", 5},
-                        {"completion_tokens", length ? 2 : 3}, {"total_tokens", length ? 7 : 8}}));
+                        {"completion_tokens", length ? 2 : 3}, {"total_tokens", length ? 7 : 8},
+                        {"prompt_tokens_details", {{"cached_tokens", 0}}}}));
                 }
             }
 }
@@ -5383,4 +5574,88 @@ TEST_F(Test__ChatCompletionHandler, RuntimeStatsFreshnessIncludesCleanupRetireme
     EXPECT_EQ(complete["last_request"]["completion_tokens"], usage["completion_tokens"]);
     EXPECT_EQ(complete["tokens"]["completion"], 1);
     EXPECT_EQ(complete["timings"]["latency"]["samples"], 1);
+}
+
+/**
+ * @test DeepSeek-V4 may open a DSML tool section before closing "</think>".
+ * vLLM ends reasoning at the tool opener (REASONING + TOOL_START); the handler
+ * must do the same so the call is executable on both HTTP and SSE, while text
+ * before the opener stays reasoning. Regression: the generic think splitter
+ * kept the whole tool block in reasoning_content and returned no tool_calls.
+ */
+TEST_F(Test__ChatCompletionHandler, DeepSeekV4ToolSectionInsideReasoningIsExecutable)
+{
+    const auto tmpl = ChatTemplate::create(ChatTemplateType::DEEPSEEK_V4);
+    ASSERT_TRUE(tmpl->isThinkingModel());
+    const std::string dsml = "｜DSML｜";
+    const std::string text = "I should look it up.\n\n<" + dsml + "tool_calls>\n<" + dsml +
+        "invoke name=\"get_weather\">\n<" + dsml + "parameter name=\"city\" string=\"true\">Paris</" + dsml +
+        "parameter>\n</" + dsml + "invoke>\n</" + dsml + "tool_calls>";
+    for (const bool stream : {false, true})
+    {
+        SCOPED_TRACE(stream ? "SSE" : "HTTP");
+        auto handler = makeHandler();
+        ON_CALL(*tokenizer_, hasChatTemplate()).WillByDefault(Return(true));
+        ON_CALL(*tokenizer_, getChatTemplate()).WillByDefault(::testing::ReturnRef(*tmpl));
+        ON_CALL(*tokenizer_, encodeChat(_, _, _, _)).WillByDefault(Return(std::vector<int>{1, 2, 3}));
+        ON_CALL(*runner_, prefill(_)).WillByDefault(Return(true));
+        ON_CALL(*tokenizer_, is_stop_token(_)).WillByDefault(Return(false));
+        ON_CALL(*runner_, getToolCallFormat()).WillByDefault(Return(ToolCallFormat::DEEPSEEK_V4_DSML));
+        // One byte per token: every marker straddles tokenizer pieces.
+        {
+            auto sequence = testing::InSequence{};
+            for (size_t i = 0; i < text.size(); ++i)
+            {
+                ON_CALL(*tokenizer_, decode_token(int(1000 + i))).WillByDefault(Return(text.substr(i, 1)));
+                EXPECT_CALL(*runner_, decodeStep()).WillOnce(Return(makeToken(int(1000 + i)))).RetiresOnSaturation();
+            }
+            EXPECT_CALL(*runner_, decodeStep()).WillOnce(Return(makeToken(0, true))).RetiresOnSaturation();
+        }
+        ChatCompletionRequest request;
+        request.messages = {ChatMessage("user", "Weather in Paris?")};
+        request.max_tokens = int(text.size()) + 8;
+        request.stream = stream;
+        request.tools = json::array({json{{"type", "function"}, {"function", {{"name", "get_weather"},
+            {"parameters", {{"type", "object"}, {"properties", {{"city", {{"type", "string"}}}}}}}}}}});
+
+        std::string reasoning, content, name, arguments, finish;
+        if (!stream)
+        {
+            const auto response = handler->handleRequest(request);
+            ASSERT_TRUE(response.ok) << response.json_body;
+            const auto choice = json::parse(response.json_body)["choices"][0];
+            reasoning = choice["message"].value("reasoning_content", "");
+            content = choice["message"]["content"].is_string() ? choice["message"]["content"].get<std::string>() : "";
+            ASSERT_EQ(choice["message"]["tool_calls"].size(), 1u);
+            name = choice["message"]["tool_calls"][0]["function"]["name"];
+            arguments = choice["message"]["tool_calls"][0]["function"]["arguments"];
+            finish = choice["finish_reason"];
+        }
+        else
+        {
+            const auto response = handler->handleStreamingRequest(request, [&](const std::string &line) {
+                if (line.rfind("data: {", 0) != 0) return true;
+                const auto chunk = json::parse(line.substr(6));
+                if (chunk["choices"].empty()) return true;
+                const auto &choice = chunk["choices"][0];
+                const auto &delta = choice["delta"];
+                if (delta.contains("reasoning_content")) reasoning += delta["reasoning_content"].get<std::string>();
+                if (delta.contains("content") && delta["content"].is_string()) content += delta["content"].get<std::string>();
+                if (delta.contains("tool_calls"))
+                    for (const auto &call : delta["tool_calls"])
+                    {
+                        if (call["function"].contains("name")) name += call["function"]["name"].get<std::string>();
+                        if (call["function"].contains("arguments")) arguments += call["function"]["arguments"].get<std::string>();
+                    }
+                if (choice.contains("finish_reason") && choice["finish_reason"].is_string()) finish = choice["finish_reason"];
+                return true;
+            });
+            ASSERT_TRUE(response.ok);
+        }
+        EXPECT_EQ(reasoning, "I should look it up.\n\n");
+        EXPECT_EQ(content, "");
+        EXPECT_EQ(name, "get_weather");
+        EXPECT_EQ(arguments, "{\"city\": \"Paris\"}");
+        EXPECT_EQ(finish, "tool_calls");
+    }
 }

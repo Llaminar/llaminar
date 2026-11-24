@@ -8,7 +8,7 @@
  * never become a weight-equivalence or communication extent.
  */
 #pragma once
-#include "kernels/cpu/gemm/CPUNativeQuantisedPreparedFootprint.h"
+#include "kernels/cpu/gemm/CPUNativeQuantisedCodedMetadata.h"
 #include <cstdint>
 #include <cstring>
 #include <span>
@@ -26,6 +26,47 @@ template<class Layout>
 std::vector<uint8_t> encodedTierColumn(std::span<const uint8_t> root,
     const Layout& layout,size_t n,size_t kb)
 {
+    using namespace cpu::native_quantised;
+    const auto geometry = preparedBlockGeometry(layout.cpu_encoding, layout.cpu_is_asymmetric,
+        layout.cpu_codebook_id, layout.cpu_K / 32);
+    if (preparedSuperblockCoded(layout.cpu_encoding))
+    {
+        namespace sb = native_quantised_superblock;
+        const auto book = superblockMetadataCodebook(layout.cpu_encoding, layout.cpu_codebook_id);
+        const auto *block = root.data() + geometry.blockOffset(n / 64, kb);
+        const auto column = n % 64;
+        std::vector<uint8_t> result(layout.cpu_data_stride / 64);
+        if (layout.cpu_encoding == CPUNativeQuantisedEncoding::CompactMultiScale)
+            compactColumnPayload(block, layout.cpu_codebook_id, column, result.data());
+        else
+        {
+            for (size_t byte = 0; byte < 16; ++byte)
+                result[byte] = block[(byte / 4) * 256 + column * 4 + byte % 4];
+            if (book == 8)
+                for (size_t group = 0; group < 8; ++group)
+                {
+                    uint64_t low, high;
+                    const auto *plane = block + 1024 + group * 64 + (column / 16) * 16;
+                    std::memcpy(&low, plane, 8);
+                    std::memcpy(&high, plane + 8, 8);
+                    for (unsigned lane = 0; lane < 4; ++lane)
+                    {
+                        const auto bit = (column % 16) * 4 + lane;
+                        result[16 + group] |= (((low >> bit) & 1u) | (((high >> bit) & 1u) << 1)) << (lane * 2);
+                    }
+                }
+        }
+        if (sb::superblockCodePlaneBits(book))
+        {
+            const auto code = coded_metadata::loadCode(block + preparedCodedPlaneOffset(layout.cpu_encoding, layout.cpu_data_stride), book, column);
+            result.push_back(uint8_t(code));
+            if (sb::superblockCodePlaneBits(book) > 8) result.push_back(uint8_t(code >> 8));
+        }
+        const auto field = sb::superblockFieldBytes(book);
+        const auto *header = root.data() + geometry.headerOffset(n / 64, kb) + column * field;
+        result.insert(result.end(), header, header + field);
+        return result;
+    }
     const size_t unit=((n/64)*(layout.cpu_K/32)+kb)*layout.cpu_block_stride,column=n%64;
     const bool q6=layout.cpu_encoding==cpu::native_quantised::CPUNativeQuantisedEncoding::Q6KNativeDualScale;
     std::vector<uint8_t> result;
@@ -37,10 +78,13 @@ std::vector<uint8_t> encodedTierColumn(std::span<const uint8_t> root,
         const auto bit=(column%16)*4;
         result.push_back(static_cast<uint8_t>(((low>>bit)&15)|(((high>>bit)&15)<<4)));
     }
-    const bool compact=layout.cpu_encoding==cpu::native_quantised::CPUNativeQuantisedEncoding::CompactMultiScale;
-    for(size_t plane=0;plane<(compact?2:(layout.cpu_block_stride-layout.cpu_data_stride)/128);++plane)
-        for(size_t byte=0;byte<2;++byte)result.push_back(root[unit+layout.cpu_data_stride+plane*128+column*2+byte]);
-    if(compact)for(size_t byte=0;byte<4;++byte)result.push_back(root[unit+layout.cpu_data_stride+256+column*4+byte]);
+    if (cpu::native_quantised::preparedScaleEncoding(layout.cpu_codebook_id, layout.cpu_encoding) ==
+        cpu::native_quantised::CPUNativeQuantisedScaleEncoding::E8M0)
+        result.push_back(root[unit + layout.cpu_data_stride + column]);
+    else
+        for (size_t plane = 0; plane < (layout.cpu_block_stride - layout.cpu_data_stride) / 128; ++plane)
+            for (size_t byte = 0; byte < 2; ++byte)
+                result.push_back(root[unit + layout.cpu_data_stride + plane * 128 + column * 2 + byte]);
     return result;
 }
 } // namespace llaminar2::test

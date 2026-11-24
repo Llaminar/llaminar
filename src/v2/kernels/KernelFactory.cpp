@@ -17,6 +17,7 @@
 
 #include "KernelFactory.h"
 #include "qwen4exp/Qwen4ExpKernels.h"
+#include "deepseek4/DeepSeekV4Kernels.h"
 #include "qwen4exp/QwenSparseAttention.h"
 #include "../transfer/TransferEngine.h"
 #include <cstring>
@@ -1848,6 +1849,22 @@ namespace llaminar
                 throw std::invalid_argument("Qwen4Exp kernels are not compiled for " + device.toString());
             }
 
+            std::unique_ptr<llaminar2::deepseek4::IDeepSeekV4Kernels>
+            KernelFactory::createDeepSeekV4(::llaminar2::DeviceId device)
+            {
+                if (!device.is_valid())
+                    throw std::invalid_argument("DeepSeek V4 kernels require a valid participant device");
+                if (device.is_cpu())
+                    return ::llaminar2::deepseek4::createCPUDeepSeekV4Kernels();
+#ifdef HAVE_CUDA
+                if (device.is_cuda())
+                    return ::llaminar2::deepseek4::createCUDADeepSeekV4Kernels();
+#endif
+                if (device.is_rocm())
+                    throw std::invalid_argument(::llaminar2::deepseek4::kROCmUnimplemented);
+                throw std::invalid_argument("DeepSeek V4 kernels are not compiled for " + device.toString());
+            }
+
             std::unique_ptr<llaminar2::qwen4exp::IQwenSparseAttentionKernels>
             KernelFactory::createQwenSparseAttention(::llaminar2::DeviceId device)
             {
@@ -3453,7 +3470,7 @@ namespace llaminar
                             static_cast<uint16_t *>(d.ptrs.d_mins),
                             static_cast<uint32_t *>(d.ptrs.d_emins),
                             d.codebook_id, d.blocks_per_row, source,
-                            prepared.format.native_quantised, allocation);
+                            prepared.format.native_quantised, allocation, d.metadata_layout);
                     }
 #endif
 #ifdef HAVE_ROCM
@@ -3462,11 +3479,16 @@ namespace llaminar
                         const auto *original = dynamic_cast<rocm::ROCmQuantisedGemmKernel *>(source.get());
                         if (!original || original->rocm_device_id() != device.gpu_ordinal())
                             throw std::invalid_argument("Expert service view ROCm owner mismatch");
+                        // The view borrows the original planes, so it must also
+                        // borrow their metadata representation (per-block or coded).
+                        DeviceNativeQuantisedMatrixDesc original_desc{};
+                        if (!original->inspectPreparedNativeQuantisedMatrixDesc(original_desc))
+                            throw std::invalid_argument("Expert service view ROCm owner has no prepared native matrix");
                         return std::make_shared<rocm::ROCmQuantisedGemmKernel>(
                             d.n, d.k, device.gpu_ordinal(), d.ptrs.d_vnni,
                             d.ptrs.d_scales, d.ptrs.d_mins, d.ptrs.d_emins,
                             d.codebook_id, d.blocks_per_row, source,
-                            prepared.format.native_quantised, allocation);
+                            prepared.format.native_quantised, allocation, original_desc.metadata_layout);
                     }
 #endif
                 }

@@ -24,6 +24,7 @@
 #include "tensors/NativeQuantisedFormatInfo.h"
 #include <cuda_runtime.h>
 #include <gtest/gtest.h>
+#include "kernels/common/NativeQuantisedScaleLoad.h"
 #include <algorithm>
 #include <array>
 #include <barrier>
@@ -41,8 +42,8 @@
 extern "C" {
 /** @brief Production prefill bridge; the fixture never recompiles a device body. */
 bool cudaNativeQuantisedPrefill_fp32_withPolicy(
-    const int8_t*, const uint8_t*, const uint16_t*, const uint16_t*,
-    const uint32_t*, float*, const float*, const int32_t*, int, int, int,
+    const int8_t*, const uint8_t*, ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes,
+    float*, const float*, const int32_t*, int, int, int,
     float, float, const float*, const float*, uint8_t, uint8_t, int, void*,
     CUDAPrefillContext*);
 /** @brief Select the existing diagnostic BK256 candidate before workers start. */
@@ -140,7 +141,7 @@ void verifyBK256Context(int device, int rows)
     check(cudaStreamSynchronize(session.stream));
     check(cudaStreamBeginCapture(session.stream, cudaStreamCaptureModeThreadLocal));
     const bool launched = cudaNativeQuantisedPrefill_fp32_withPolicy(
-        activation.data, payload.data, scales.data, nullptr, nullptr, output.data,
+        activation.data, payload.data, ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes{scales.data, nullptr, nullptr, 0}, output.data,
         activation_scales.data, nullptr, rows, n, k, 1, 0, nullptr, nullptr,
         0, 0, device, session.stream, context.get());
     // End even an invalidated capture before unwinding its stream/buffers.
@@ -367,7 +368,9 @@ void run(int m,int n,int k,int kb,Epilogue epilogue,int tile_id=CB==7?2:5) {
         llaminar2::cuda::prefill::CanonicalM1PartitionGeometry partitions{
             kb, (k / 32 + kb - 1) / kb};
         int ordered = 1;
-        void *arguments[]{&a.data, &p.data, &s.data, &b.data, &emins,
+        // The kernel takes one typed metadata-plane argument (per-block planes here).
+        ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes meta{s.data, b.data, emins, 0};
+        void *arguments[]{&a.data, &p.data, &meta,
             &out.data, &sa.data, &asum.data, &prior_data, &bias_data,
             &m, &n, &k, &alpha, &beta, &partitions, &ordered};
         check(cudaStreamBeginCapture(session.stream,cudaStreamCaptureModeThreadLocal));
@@ -496,8 +499,10 @@ TEST(CUDANativeQuantisedPrefillStaging, SharedActivationCorrectionsMatchExactRow
                     // CUDA copies these immutable dimensions at capture; it never
                     // retains a pointer to the host's scalar argument array.
                     int rows = m, columns = n, reduction = k;
-                    void *arguments[]{&activation.data, &payload.data, &scales.data,
-                        &minima.data, &emins, &output.data, &activation_scales.data,
+                    ::llaminar2::native_quantised_scale::NativeQuantisedMetadataPlanes meta{
+                        scales.data, minima.data, emins, 0};
+                    void *arguments[]{&activation.data, &payload.data, &meta,
+                        &output.data, &activation_scales.data,
                         &activation_sums, &prior, &bias, &rows, &columns, &reduction,
                         &alpha, &beta, &partitions, &ordered};
                     check(cudaStreamBeginCapture(session.stream, cudaStreamCaptureModeThreadLocal));

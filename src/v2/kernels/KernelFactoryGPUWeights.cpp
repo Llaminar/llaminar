@@ -11,6 +11,7 @@
 #include "KernelFactory.h"
 #include "loaders/gpu_pipeline/LoadOrchestrator.h"
 #include "loaders/BoundedGPUExpertSource.h"
+#include "loaders/GPUPreparedWeightPoolLayout.h"
 #include "tensors/TensorClasses.h"
 #ifdef HAVE_CUDA
 #include "cuda/gemm/CUDAFloatingPointGemmKernel.h"
@@ -136,28 +137,74 @@ namespace llaminar::v2::kernels
             // The primary plane width follows the physical decoder (1 byte for
             // MXFP4's native E8M0 plane); canonical and migration-stable
             // decoders share it for every format.
-            const size_t scale_plane_bytes = nativeQuantisedScalePlaneBytes(canonicalDeviceVnniCodebookId(*source));
-            auto *scales = static_cast<uint16_t *>(region(slot->d_native_quantised_scales, slot->scales_bytes,
-                product(offset_blocks, scale_plane_bytes), product(length_blocks, scale_plane_bytes), slot_name, "scales"));
-            auto *mins = static_cast<uint16_t *>(region(slot->d_native_quantised_mins, slot->mins_bytes,
-                allocation.has_mins ? product(offset_blocks, sizeof(uint16_t)) : 0,
-                allocation.has_mins ? product(length_blocks, sizeof(uint16_t)) : 0, slot_name, "minima"));
-            auto *emins = static_cast<uint32_t *>(region(slot->d_native_quantised_emins, slot->emins_bytes,
-                allocation.has_emins ? product(offset_blocks, sizeof(uint32_t)) : 0,
-                allocation.has_emins ? product(length_blocks, sizeof(uint32_t)) : 0, slot_name, "embedded minima"));
-            const NativeQuantisedSourceIdentity identity{source->codebook_id, source->is_superblock, true};
             const auto codebook = canonicalDeviceVnniCodebookId(*source);
+            // The slot's producer chose the metadata layout; the operand's own
+            // superblock phase must agree with it (one phase per packed run).
+            const bool coded = gpuPreparedSuperblockCoded(*source, layout, device);
+            namespace sb = native_quantised_superblock;
+            // A bit-packed code plane binds at bit offset_blocks*bits; the
+            // byte part moves the pointer and the 0..7 remainder travels in
+            // the matrix's layout byte.
+            const size_t code_bits = coded ? sb::superblockCodePlaneBits(codebook) : 0u;
+            const size_t code_bit = product(offset_blocks, code_bits);
+            const uint8_t metadata_layout = coded
+                ? nativeQuantisedMetadataLayout(NativeQuantisedMetadataRepresentation::SuperblockCoded,
+                                                gpuWeightSourceSuperblockPhase(tensor),
+                                                static_cast<uint32_t>(code_bit & 7u))
+                : uint8_t{0};
+            // The slot records representation and phase; the code bit offset
+            // is per bound matrix.
+            if (slot->metadata_layout != (metadata_layout & ~uint8_t{0x38}))
+                throw std::invalid_argument("GPU weight-pool GEMM metadata layout disagrees with its slot: " + slot_name);
+            uint16_t *scales = nullptr, *mins = nullptr;
+            uint32_t *emins = nullptr;
+            if (coded)
+            {
+                // Code plane per block, superblock plane per (row, superblock);
+                // both follow the grouped row offset of the packed run.
+                const size_t field_bytes = sb::superblockFieldBytes(codebook);
+                const size_t superblocks = sb::superblocksPerRow(static_cast<uint32_t>(blocks_per_row),
+                    nativeQuantisedLayoutPhase(metadata_layout));
+                // Code-in-payload formats bind the matrix's own payload as their code plane.
+                if (sb::superblockCodeInPayload(codebook))
+                    scales = reinterpret_cast<uint16_t *>(payload);
+                else
+                {
+                    const size_t first_byte = code_bit / 8u;
+                    const size_t last_bit = code_bit + product(length_blocks, code_bits);
+                    // Readers may fetch up to the plane padding past the last code.
+                    scales = static_cast<uint16_t *>(region(slot->d_native_quantised_scales, slot->scales_bytes,
+                        first_byte, (last_bit + 7u) / 8u - first_byte + sb::kSuperblockCodePlanePadBytes,
+                        slot_name, "scale codes"));
+                }
+                mins = static_cast<uint16_t *>(region(slot->d_native_quantised_mins, slot->mins_bytes,
+                    product(product(row_offset, superblocks), field_bytes),
+                    product(product(static_cast<size_t>(n), superblocks), field_bytes), slot_name, "superblock scales"));
+            }
+            else
+            {
+                const size_t scale_plane_bytes = nativeQuantisedScalePlaneBytes(codebook);
+                scales = static_cast<uint16_t *>(region(slot->d_native_quantised_scales, slot->scales_bytes,
+                    product(offset_blocks, scale_plane_bytes), product(length_blocks, scale_plane_bytes), slot_name, "scales"));
+                mins = static_cast<uint16_t *>(region(slot->d_native_quantised_mins, slot->mins_bytes,
+                    allocation.has_mins ? product(offset_blocks, sizeof(uint16_t)) : 0,
+                    allocation.has_mins ? product(length_blocks, sizeof(uint16_t)) : 0, slot_name, "minima"));
+                emins = static_cast<uint32_t *>(region(slot->d_native_quantised_emins, slot->emins_bytes,
+                    allocation.has_emins ? product(offset_blocks, sizeof(uint32_t)) : 0,
+                    allocation.has_emins ? product(length_blocks, sizeof(uint32_t)) : 0, slot_name, "embedded minima"));
+            }
+            const NativeQuantisedSourceIdentity identity{source->codebook_id, source->is_superblock, true};
 #ifdef HAVE_CUDA
             if (device.is_cuda())
                 return std::make_unique<cuda::CUDAQuantisedGemmKernel>(n, k, device.ordinal,
                     payload, scales, mins, emins, codebook, static_cast<uint32_t>(blocks_per_row),
-                    std::move(owner), identity, reusable);
+                    std::move(owner), identity, reusable, metadata_layout);
 #endif
 #ifdef HAVE_ROCM
             if (device.is_rocm())
                 return std::make_unique<rocm::ROCmQuantisedGemmKernel>(n, k, device.ordinal,
                     payload, scales, mins, emins, codebook, static_cast<uint32_t>(blocks_per_row),
-                    std::move(owner), identity, reusable);
+                    std::move(owner), identity, reusable, metadata_layout);
 #endif
         }
         throw std::invalid_argument("GPU weight-pool GEMM backend was not built");

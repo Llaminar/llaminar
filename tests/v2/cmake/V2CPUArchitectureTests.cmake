@@ -1267,7 +1267,7 @@ if(LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
     target_compile_features(v2_unit_neon_typed_tensor_ops PRIVATE cxx_std_20)
     target_include_directories(v2_unit_neon_typed_tensor_ops PRIVATE
         "${V2_CPU_ARCHITECTURE_ROOT}/src/v2" "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2")
-    target_link_libraries(v2_unit_neon_typed_tensor_ops PRIVATE GTest::gtest_main)
+    target_link_libraries(v2_unit_neon_typed_tensor_ops PRIVATE GTest::gtest_main OpenMP::OpenMP_CXX)
     v2_add_core_free_test(V2_Unit_NEONTypedTensorOps
         COMMAND $<TARGET_FILE:v2_unit_neon_typed_tensor_ops>
         LABELS V2 Unit CPU NEON DeviceFree Quantization Numerics ByteExact)
@@ -1309,7 +1309,7 @@ add_executable(v2_test_cpu_typed_tensor_arithmetic
 target_compile_features(v2_test_cpu_typed_tensor_arithmetic PRIVATE cxx_std_20)
 target_include_directories(v2_test_cpu_typed_tensor_arithmetic PRIVATE
     "${V2_CPU_ARCHITECTURE_ROOT}/src/v2" "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2")
-target_link_libraries(v2_test_cpu_typed_tensor_arithmetic PRIVATE GTest::gtest_main)
+target_link_libraries(v2_test_cpu_typed_tensor_arithmetic PRIVATE GTest::gtest_main OpenMP::OpenMP_CXX)
 v2_add_core_free_test(V2_Unit_CPUTypedTensorArithmetic
     COMMAND $<TARGET_FILE:v2_test_cpu_typed_tensor_arithmetic>
     LABELS V2 Unit CPU DeviceFree Quantization Numerics ByteExact)
@@ -1325,7 +1325,7 @@ add_executable(v2_unit_typed_tensor_block_geometry
     "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/cpu/Test__TypedTensorBlockGeometry.cpp")
 target_compile_features(v2_unit_typed_tensor_block_geometry PRIVATE cxx_std_20)
 target_include_directories(v2_unit_typed_tensor_block_geometry PRIVATE "${V2_CPU_ARCHITECTURE_ROOT}/src/v2")
-target_link_libraries(v2_unit_typed_tensor_block_geometry PRIVATE GTest::gtest_main)
+target_link_libraries(v2_unit_typed_tensor_block_geometry PRIVATE GTest::gtest_main OpenMP::OpenMP_CXX)
 v2_add_core_free_test(V2_Unit_TypedTensorBlockGeometry
     COMMAND $<TARGET_FILE:v2_unit_typed_tensor_block_geometry>
     LABELS V2 Unit CPU DeviceFree Quantization)

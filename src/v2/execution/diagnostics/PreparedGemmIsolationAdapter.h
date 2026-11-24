@@ -18,6 +18,7 @@
 #include "../../tensors/ITensor.h"
 #include "../../transfer/TransferEngine.h"
 #include "../../tensors/NativeQuantisedFormatInfo.h"
+#include "../../tensors/NativeQuantisedScalePlane.h"
 #include <tuple>
 #include <map>
 
@@ -122,7 +123,14 @@ public:
                             .is_superblock=false,.has_emins=format.has_emins,
                             .max_abs_factor=source.metadata->max_abs_factor};
         if(!physical) throw std::invalid_argument("Initial isolation adapter cannot authenticate prepared format regions");
-        const auto sizes=nativeQuantisedPackedRegionSizes(std::size_t(p.n),std::size_t(p.k),*physical);
+        auto sizes=nativeQuantisedPackedRegionSizes(std::size_t(p.n),std::size_t(p.k),*physical);
+        // Superblock-coded weights: code plane in `scales`, superblock plane in `mins`.
+        if(nativeQuantisedLayoutRepresentation(weight_.metadata_layout)==NativeQuantisedMetadataRepresentation::SuperblockCoded)
+        {
+            const auto coded=NativeQuantisedMetadataPlaneBytes::coded(weight_.codebook_id,std::size_t(p.n),
+                weight_.blocks_per_row,nativeQuantisedLayoutPhase(weight_.metadata_layout));
+            sizes.scales_bytes=coded.scales;sizes.mins_bytes=coded.secondary;sizes.emins_bytes=0;
+        }
         weights_={{{reinterpret_cast<std::uintptr_t>(weight_.payload),sizes.payload_bytes},
                   {reinterpret_cast<std::uintptr_t>(weight_.scales),sizes.scales_bytes},
                   {reinterpret_cast<std::uintptr_t>(weight_.mins),sizes.mins_bytes},
@@ -361,8 +369,8 @@ private:
     /** @brief Compare named immutable descriptor fields; C++ padding is never identity. */
     static bool sameDescriptor(const DeviceNativeQuantisedMatrixDesc &a,const DeviceNativeQuantisedMatrixDesc &b) noexcept
     {
-        return std::tie(a.payload, a.scales, a.mins, a.emins, a.n, a.k, a.blocks_per_row, a.codebook_id, a.allocation_payload_bytes_per_block, a.allocation_has_mins, a.allocation_has_emins, a.source_codebook_id, a.source_is_superblock, a.source_identity_present, a.reserved, a.reserved_tail) ==
-               std::tie(b.payload, b.scales, b.mins, b.emins, b.n, b.k, b.blocks_per_row, b.codebook_id, b.allocation_payload_bytes_per_block, b.allocation_has_mins, b.allocation_has_emins, b.source_codebook_id, b.source_is_superblock, b.source_identity_present, b.reserved, b.reserved_tail);
+        return std::tie(a.payload, a.scales, a.mins, a.emins, a.n, a.k, a.blocks_per_row, a.codebook_id, a.allocation_payload_bytes_per_block, a.allocation_has_mins, a.allocation_has_emins, a.source_codebook_id, a.source_is_superblock, a.source_identity_present, a.metadata_layout, a.reserved_tail) ==
+               std::tie(b.payload, b.scales, b.mins, b.emins, b.n, b.k, b.blocks_per_row, b.codebook_id, b.allocation_payload_bytes_per_block, b.allocation_has_mins, b.allocation_has_emins, b.source_codebook_id, b.source_is_superblock, b.source_identity_present, b.metadata_layout, b.reserved_tail);
     }
     /** @brief Reject stale actual bindings and phase/stream errors before native enqueue. */
     void requireReady(void *stream,bool recording) const
