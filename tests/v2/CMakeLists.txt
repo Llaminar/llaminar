@@ -38232,10 +38232,10 @@ if(NOT V2_PERF_TESTS_ONLY AND TARGET v2_test_qwen4exp_device_primitives)
             else()
                 set(V2_TT_PROMOTED_ENV "LLAMINAR_FORCE_CPU_ONLY_STARTUP=0;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=0")
             endif()
-            set(V2_TT_PROMOTED_ALIAS V2_Integration_${V2_TT_PROMOTED_BACKEND}_TwoTermPromotedAsymmetric)
+            set(V2_TT_PROMOTED_ALIAS V2_Integration_${V2_TT_PROMOTED_BACKEND}_TwoTermCpuMigratedQ5)
             add_v2_test(${V2_TT_PROMOTED_ALIAS}
                 COMMAND $<TARGET_FILE:v2_test_qwen4exp_device_primitives>
-                    --gtest_filter=Q8ResidualAllFormatsDevice.${V2_TT_PROMOTED_BACKEND}ExpandedMinimumPromotion
+                    --gtest_filter=Q8ResidualAllFormatsDevice.${V2_TT_PROMOTED_BACKEND}CpuMigratedQ5
                 LABELS "V2;Integration;ProductionTestPreflight;${V2_TT_PROMOTED_BACKEND};NativeQuantised;Migration;TwoTermQ8;Capture;ByteExact;Regression"
                 MPI_PROCS 1 NO_MODELS TIMEOUT 120
                 ENVIRONMENT ${V2_TT_PROMOTED_ENV})
