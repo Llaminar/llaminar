@@ -8,7 +8,9 @@
  * FP16 derives half-RNE weights from those same original decoded values; its
  * prepared engine uses half-RNE activations and FP32 accumulation. Serial
  * decode and verifier rows share a fixed reduction tree; ordinary GPU prefill
- * uses the admitted half operand bank and the backend's floating GEMM.
+ * of every explicit mode (FP32, FP16, selective alpha/beta) uses the fixed-K
+ * partition contract (kernels/common/FixedKProjectionContract.h), so prompt
+ * rows do not depend on prefill chunking or bucket size.
  * FP16AlphaBeta applies that half arithmetic only to original floating alpha
  * and beta weights; all wide GDN projections retain their native codebooks.
  * FP16MoEAlphaBeta selects original floating alpha/beta for qwen35moe and

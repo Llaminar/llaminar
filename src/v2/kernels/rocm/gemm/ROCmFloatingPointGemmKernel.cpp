@@ -13,6 +13,9 @@
  * 3. Handles tensor type introspection in multiply_tensor()
  * Custom FP32/native16 consumers embed exact immutable addresses directly in
  * captured arguments; real BLAS/physical-half table consumers retain arena tables.
+ * Explicit-operand (FP16RNE, strict FP32) ordinary multi-row prefill never uses
+ * hipBLAS: it evaluates the fixed-K contract (ROCmFixedKProjectionLaunch.h) so
+ * prompt rows are independent of prefill chunking and bucket size (#74).
  *
  * @author David Sanftenberg
  * @date January 2026
@@ -823,7 +826,7 @@ namespace llaminar2
                     input->numel() < static_cast<size_t>(m) * static_cast<size_t>(k))
                     throw std::invalid_argument("Half-operand GDN group requires complete FP32 source rows");
                 // Validate every consumer before submitting the shared producer.
-                // The one stream orders all GemmEx reads before the next cast
+                // The one stream orders all fixed-K reads before the next cast
                 // reuses this stage-owned half-A publication.
                 for (const auto &projection : projections)
                 {

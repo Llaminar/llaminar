@@ -61,57 +61,70 @@ __device__ __forceinline__ int projectionOf(const Group &g, int compact, int &lo
  * @tparam Aligned K % 4 == 0 and every partition boundary (multiples of K/8) ends a staged
  *         tile, so 16-byte copies are aligned and the fold runs once per tile; otherwise
  *         elements are gathered and the fold is checked per element.
+ * @tparam SPLIT Raster tiles are (BM*SPLIT) x BN; this CTA computes row slice
+ *         blockIdx.x % SPLIT of raster tile tile_first + blockIdx.x / SPLIT. The
+ *         host launches full waves with SPLIT=1 and the final partial wave with
+ *         thinner slices so its work spreads over every SM. Per-output arithmetic
+ *         never depends on the tiling.
  * @param g Borrowed group. @param m Physical rows. @param k Reduction width.
+ * @param tile_first First raster tile of this launch.
  */
-template<int BM, int BN, int TM, int TN, int BK, int STAGES, bool Aligned>
+template<int BM, int BN, int TM, int TN, int BK, int STAGES, bool Aligned, int SPLIT = 1>
 __global__ __launch_bounds__((BM / TM) * (BN / TN), 1) void sgemmProjectionKernel(
-    const __grid_constant__ Group g, int m, int k)
+    const __grid_constant__ Group g, int m, int k, int tile_first)
 {
     constexpr int TY = BM / TM, TX = BN / TN, THREADS = TY * TX;
     constexpr int PITCH = BK + 4;                         // floats; +4 rotates 16-byte bank groups
     constexpr int CHUNKS = BK / 4;
-    static_assert(BK % 4 == 0 && (BM * CHUNKS) % THREADS == 0 && (BN * CHUNKS) % THREADS == 0);
-    constexpr int A_SLOTS = BM * CHUNKS / THREADS, B_SLOTS = BN * CHUNKS / THREADS;
+    static_assert(BK % 4 == 0 && BM % TM == 0 && BN % TN == 0);
+    // Copy slots per thread; a final partial round leaves some threads idle so
+    // column tiles need not be powers of two (wave-fitting widths).
+    constexpr int A_SLOTS = (BM * CHUNKS + THREADS - 1) / THREADS, B_SLOTS = (BN * CHUNKS + THREADS - 1) / THREADS;
     constexpr unsigned A_STAGE = BM * PITCH * 4, B_STAGE = BN * PITCH * 4;
     extern __shared__ __align__(16) float staged[];
 
     const int total = g.totalColumns();
     const int tid = static_cast<int>(threadIdx.x), tx = tid % TX, ty = tid / TX;
     // Banded raster: up to 16 row tiles walk every column tile while their rows stay in L2.
-    const int row_tiles = (m + BM - 1) / BM, col_tiles = (total + BN - 1) / BN;
-    const int linear = static_cast<int>(blockIdx.x);
+    constexpr int RBM = BM * SPLIT;
+    const int row_tiles = (m + RBM - 1) / RBM, col_tiles = (total + BN - 1) / BN;
+    const int linear = tile_first + static_cast<int>(blockIdx.x) / SPLIT;
     const int band = linear / (16 * col_tiles), band_rows = min(row_tiles - band * 16, 16);
     const int within = linear - band * 16 * col_tiles;
-    const int m0 = (band * 16 + within % band_rows) * BM, c0 = (within / band_rows) * BN;
+    const int m0 = (band * 16 + within % band_rows) * RBM + (static_cast<int>(blockIdx.x) % SPLIT) * BM;
+    const int c0 = (within / band_rows) * BN;
 
     const unsigned sa = static_cast<unsigned>(__cvta_generic_to_shared(staged));
     const unsigned sb = sa + STAGES * A_STAGE;
-    const float *a_src[A_SLOTS]; unsigned a_dst[A_SLOTS]; int a_k[A_SLOTS]; bool a_ok[A_SLOTS];
-    const float *b_src[B_SLOTS]; unsigned b_dst[B_SLOTS]; int b_k[B_SLOTS]; bool b_ok[B_SLOTS];
+    const float *a_src[A_SLOTS]; unsigned a_dst[A_SLOTS]; int a_k[A_SLOTS]; bool a_ok[A_SLOTS], a_slot[A_SLOTS];
+    const float *b_src[B_SLOTS]; unsigned b_dst[B_SLOTS]; int b_k[B_SLOTS]; bool b_ok[B_SLOTS], b_slot[B_SLOTS];
 #pragma unroll
     for (int i = 0; i < A_SLOTS; ++i)
     {
         const int c = tid + i * THREADS, row = c / CHUNKS, chunk = c % CHUNKS;
-        a_ok[i] = m0 + row < m;
+        a_slot[i] = c < BM * CHUNKS;
+        a_ok[i] = a_slot[i] && m0 + row < m;
         a_k[i] = chunk * 4;
         a_src[i] = g.input() + static_cast<size_t>(a_ok[i] ? m0 + row : 0) * k + chunk * 4;
-        a_dst[i] = sa + static_cast<unsigned>((row * PITCH + chunk * 4) * 4);
+        a_dst[i] = sa + static_cast<unsigned>(((a_slot[i] ? row : 0) * PITCH + chunk * 4) * 4);
     }
 #pragma unroll
     for (int i = 0; i < B_SLOTS; ++i)
     {
         const int c = tid + i * THREADS, row = c / CHUNKS, chunk = c % CHUNKS;
-        b_ok[i] = c0 + row < total;
+        b_slot[i] = c < BN * CHUNKS;
+        b_ok[i] = b_slot[i] && c0 + row < total;
         int local = 0;
         const int p = b_ok[i] ? projectionOf(g, c0 + row, local) : 0;
         b_k[i] = chunk * 4;
         b_src[i] = g.weight(p) + static_cast<size_t>(local) * k + chunk * 4;
-        b_dst[i] = sb + static_cast<unsigned>((row * PITCH + chunk * 4) * 4);
+        b_dst[i] = sb + static_cast<unsigned>(((b_slot[i] ? row : 0) * PITCH + chunk * 4) * 4);
     }
     auto stage = [&](int slot, int k0) {
 #pragma unroll
         for (int i = 0; i < A_SLOTS; ++i)
         {
+            if (!a_slot[i]) continue;
             const unsigned dst = a_dst[i] + slot * A_STAGE;
             if constexpr (Aligned)
             {
@@ -131,6 +144,7 @@ __global__ __launch_bounds__((BM / TM) * (BN / TN), 1) void sgemmProjectionKerne
 #pragma unroll
         for (int i = 0; i < B_SLOTS; ++i)
         {
+            if (!b_slot[i]) continue;
             const unsigned dst = b_dst[i] + slot * B_STAGE;
             if constexpr (Aligned)
             {
@@ -238,6 +252,22 @@ template<int BK>
 inline constexpr bool sgemmAligned(int k) noexcept
 {
     return k % 4 == 0 && k % contract::kPartitions == 0 && (k / contract::kPartitions) % BK == 0;
+}
+
+/**
+ * @brief Slice factor for the final partial wave, in raster-tile time units.
+ * @param remainder Raster tiles left after the full waves. @param slots Resident CTAs per wave.
+ * @return 4 or 2 when every slice of the tail still runs in one round on its own
+ *         SM (thinner slices are less efficient, so fuller tails stay whole), else 1.
+ * @details Measured on GB10: splitting a tail that needs a second round of
+ * slices is slower than one round of whole tiles.
+ */
+inline int tailSplit(int remainder, int slots) noexcept
+{
+    if (remainder <= 0) return 1;
+    if (remainder * 4 <= slots) return 4;
+    if (remainder * 2 <= slots) return 2;
+    return 1;
 }
 
 /** @brief Dynamic shared bytes of one instantiation. */

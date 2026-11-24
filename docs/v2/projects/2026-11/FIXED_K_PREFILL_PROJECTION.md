@@ -1,7 +1,9 @@
 # Fixed-K Explicit-Operand Prefill Projections (issue #74)
 
-Status: in progress (draft PR). CUDA half-RNE path complete and verified on
-GB10; strict-FP32 mode and ROCm (gfx906 scalar, gfx1100 WMMA) in progress.
+Status: in progress (draft PR #75). CUDA half-RNE and strict-FP32 paths
+complete and verified on GB10. ROCm (gfx906 scalar, gfx1100 WMMA) implemented;
+native compile/qualification pending on the ROCm host (gfx1100 has no
+hardware and is reported runtime-unqualified).
 
 ## Problem
 
@@ -58,6 +60,62 @@ Known cells above parity (deterministic arithmetic retained, documented):
 memory-bound M=16 for 5120+3072 K=2560 (+2%), 4096-only M=448 (+3-4%),
 1536/3072-column groups at M=384 (up to +6%; not production groups).
 
+## Strict FP32 (explicit `fp32` GDN mode)
+
+Scalar contract: eight partitions of K elements, one IEEE FMA chain each,
+left fold; bit-identical to a host `std::fma` evaluation (checked in the
+preflight regression). Narrow groups use the shared CUDA/HIP partitioned body
+(`kernels/common/FixedKScalarProjectionBody.cuh`); wide groups use the
+SGEMM-class kernel (`kernels/cuda/gemm/CUDAFixedKScalarProjection.cuh`):
+128x128 tiles, 8x8 outputs per thread, three cp.async stages, register
+partition flush, plus a wave-balanced tail (the final partial wave is cut into
+2 or 4 row slices when every slice fits one round). cuBLAS pedantic
+`GemmEx`/`GemmBatchedEx` explicit-operand paths are retired; serial
+explicit-FP32 decode now uses the verifier's fixed tree like half.
+
+GB10 (.79), cold weights, µs, policy vs pedantic cuBLAS:
+
+| group (K=2048) | M=256 | 384 | 448 | 512 | 1024 |
+|---|---|---|---|---|---|
+| TP2 4096+2048+16+16, cuBLAS | 590.0 | 919.4 | 1070.1 | 937.8 | 1884.9 |
+| fixed-K | 510.2 | 724.6 | 932.2 | 946.2 | 1823.5 |
+| full 8192+4096+32+32, cuBLAS | 1255.9 | 1750.8 | 2095.6 | 2019.1 | 4030.0 |
+| fixed-K | 1004.6 | 1472.1 | 1934.2 | 1945.3 | 3803.9 |
+
+QFN TP2 5120+3072+24+24 (K=2560) is 0.76-0.85x throughout; small M (16-128)
+0.65-0.97x. Above parity: TP2 M=512 +1% (noise level) and the Z-only 4096
+group at M=512 (+9%, not a production group: Z always runs fused with QKV).
+
+## Kernel resource evidence (ncu, GB10, base clocks, one kernel per launch)
+
+No local-memory loads or stores in any kernel (`local_ld`/`local_st` = 0);
+ptxas reports zero spills for every instantiation.
+
+| kernel (case) | grid x block | regs | smem | occ theo/ach % | SM % | mem % |
+|---|---|---|---|---|---|---|
+| half partitioned 64x64 (32+32, M=512) | 8,1,8 x 128 | 123 | 49 KB | 16.7/11.2 | 6.3 | 13.3 |
+| half fold (32+32, M=512) | 128 x 256 | 22 | 0 | 100/32.2 | 1.8 | 4.5 |
+| half partitioned 64x64 (48+48, M=512) | 8,2,8 x 128 | 123 | 49 KB | 16.7/15.8 | 12.7 | 21.8 |
+| half tiled 64x32 w4 (48+48, M=1024) | 48 x 128 | 111 | 49 KB | 16.7/8.3 | 11.4 | 29.1 |
+| half tiled 32x64 w4 (12352 cols, M=32) | 193 x 128 | 118 | 49 KB | 16.7/16.6 | 6.1 | 15.5 |
+| half tiled 64x32 w4 (12352 cols, M=128) | 772 x 128 | 111 | 49 KB | 16.7/16.4 | 18.6 | 47.5 |
+| half tiled 64x64 (12352 cols, M=256) | 772 x 128 | 153 | 49 KB | 16.7/16.5 | 32.0 | 54.6 |
+| half tiled 128x64 w8 (3072 cols, M=384) | 144 x 256 | 147 | 74 KB | 16.7/16.7 | 29.9 | 38.5 |
+| half tiled 128x64 (12352 cols, M=512) | 772 x 128 | 233 | 49 KB | 16.7/16.4 | 40.8 | 52.5 |
+| half tiled 64x128 w8 (12352 cols, M=512) | 776 x 256 | 147 | 74 KB | 16.7/16.6 | 35.8 | 46.1 |
+| half tiled 128x128 w8 (12352 cols, M=512) | 388 x 256 | 217 | 66 KB | 16.7/16.7 | 44.9 | 39.2 |
+| FP32 partitioned 64x32 (32+32, M=128) | 2,2,8 x 256 | 64 | 0 | 66.7/16.7 | 11.3 | 16.8 |
+| FP32 partitioned 64x64 (32+32, M=512) | 8,1,8 x 256 | 62 | 0 | 66.7/22.3 | 18.1 | 26.5 |
+| FP32 sgemm 64x64 (12352 cols, M=64) | 193 x 256 | 122 | 41 KB | 33.3/32.6 | 22.2 | 28.1 |
+| FP32 sgemm 128x128 (6176 cols, M=512) | 192 x 256 | 254 | 61 KB | 16.7/16.7 | 54.4 | 37.7 |
+| FP32 sgemm 32x128 tail slice (6176 cols, M=512) | 16 x 256 | 124 | 38 KB | 33.3/16.7 | 7.5 | 12.8 |
+
+Low theoretical occupancy is deliberate: multi-stage shared pipelines and
+large register tiles hide latency per warp, and the measured end-to-end kernel
+times above are at or below the vendor BLAS they replace. Narrow partitioned
+launches are latency bound by construction (few output tiles); their SM/memory
+utilization is low but their wall time is 0.2-0.9x of cuBLAS.
+
 ## End-to-end (GB10, Qwen3.6-35B-A3B UD-IQ3_S, 778-token prompt, 160 greedy tokens)
 
 develop + local admission cherry-picks (037ccc892, 9349a8210; not part of the PR):
@@ -77,10 +135,16 @@ the same archive misses precisely (hit=false, 0 matched tokens, no warnings),
 its second request hits, and a v19 restart restores from disk. All v19
 completions (cold, RAM, disk) equal prefix-off; v18 differs at index 7.
 
+## ROCm
+
+`kernels/rocm/gemm/ROCmFixedKProjection.hip`: gfx1100 half uses
+`v_wmma_f32_16x16x16_f16` (wave64) over 64-element blocks, four units in
+natural K order; other targets (gfx906) and strict FP32 use the shared scalar
+body. Bytes differ between architectures (different hardware arithmetic) but
+each is chunk-, bucket- and offset-invariant. hipBLAS half `GemmEx` is
+retired; strict FP32 wide groups no longer use hipBLAS.
+
 ## Remaining
 
-- strict-FP32 mode: SGEMM-class scalar kernel at least as economical as
-  pedantic cuBLAS for wide QKV/Z at M >= 256 (ncu evidence).
-- ROCm: gfx906 scalar half/FP32 (shared body), gfx1100 WMMA half
-  (runtime-unqualified; spill-guard compiled), hipBLAS route retired.
-- ncu evidence for every new kernel; ROCm qualification on josh.
+- ROCm native compile, spill guard (gfx906, gfx1100) and preflight on the
+  ROCm host; gfx906 schedule economy versus the retired hipBLAS paths.
