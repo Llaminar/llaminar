@@ -197,6 +197,46 @@ namespace llaminar2
             }
         }
 
+        /** @test Native Q5 GPU round trips preserve the GGUF bytes and the original CPU units. */
+        TEST(ExpertTierWeightStream, NativeQ5FileDensityRoundTrip)
+        {
+            using namespace cpu::native_quantised;
+            constexpr int n = 70, k = 288, blocks = n * (k / 32);
+            for (const auto label : {"Q5_0", "Q5_1"})
+            {
+                SCOPED_TRACE(label);
+                const auto tensor = test::quantizedVerifierFormat(label).create({n, k}, 90197u);
+                const auto *source = dynamic_cast<const IINT8Unpackable *>(tensor.get());
+                ASSERT_NE(source, nullptr);
+                const auto &format = *source->vnniFormatInfo();
+                CPUNativeQuantisedPackedWeights cpu, restored;
+                ASSERT_TRUE(packWeightsCPUNativeQuantised(tensor.get(), cpu));
+                HostGpuExpertPackedProjection gpu;
+                std::string error;
+                ASSERT_TRUE(cpuToGpuExpertPackedReference(cpu, gpu, &error)) << error;
+                ASSERT_TRUE(gpu.valid(&error)) << error;
+                EXPECT_EQ(gpu.codebook_id, format.codebook_id);
+                EXPECT_EQ(gpu.payload_bytes_per_block, 20);
+                EXPECT_EQ(gpu.metadata_layout, 0u);
+                EXPECT_EQ(gpu.payload.size() + sizeof(uint16_t) * (gpu.scales.size() + gpu.mins.size()),
+                    tensor->size_bytes());
+                std::vector<uint8_t> payload(blocks * 20u);
+                std::vector<uint16_t> scales(blocks), mins(format.is_asymmetric ? blocks : 0u);
+                const VnniPackContext context{.N = n, .K = k, .blocks_per_row = k / 32,
+                    .payload_bytes = 20, .payload_array = payload.data(), .scales_array = scales.data(),
+                    .mins_array = mins.data()};
+                for (int row = 0; row < n; ++row)
+                    for (int block = 0; block < k / 32; ++block)
+                        source->packVnniBlock(context, row, row, block);
+                EXPECT_EQ(gpu.payload, payload);
+                EXPECT_EQ(gpu.scales, scales);
+                EXPECT_EQ(gpu.mins, mins);
+                ASSERT_TRUE(gpuToCpuExpertPackedReference(gpu, restored, &error)) << error;
+                ASSERT_EQ(restored.preparedBytes(), cpu.preparedBytes());
+                EXPECT_EQ(std::memcmp(restored.native_interleaved.data(), cpu.native_interleaved.data(), cpu.preparedBytes()), 0);
+            }
+        }
+
         /** @return An ordinary source tensor with a ragged final output-column chunk. */
         std::unique_ptr<TensorBase> makeCodedSource(uint8_t codebook, int columns = 512)
         {

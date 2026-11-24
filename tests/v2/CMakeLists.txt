@@ -28626,7 +28626,7 @@ list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ExpertTierCodedSou
 
 add_v2_test(V2_Integration_ExpertTierWeightDensityAdmission
     COMMAND $<TARGET_FILE:v2_test_expert_tier_weight_stream>
-        --gtest_filter=ExpertTierWeightStream.EveryCatalogedSourceFormatHasGpuToCpuContract:ExpertTierWeightStream.CodedDemotionRejectsLegacyPlanesBeforeAllocating:MoEOverlayPreparedWeightSource.AcceptsCanonicalAndCpuNormalizedGpuRepresentationsOnly
+        --gtest_filter=ExpertTierWeightStream.NativeQ5FileDensityRoundTrip:ExpertTierWeightStream.EveryCatalogedSourceFormatHasGpuToCpuContract:ExpertTierWeightStream.CodedDemotionRejectsLegacyPlanesBeforeAllocating:MoEOverlayPreparedWeightSource.AcceptsCanonicalAndCpuNormalizedGpuRepresentationsOnly
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MoE;WeightLifecycle;ExpertOverlay;Streaming"
     NO_MODELS)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ExpertTierWeightDensityAdmission)
@@ -28634,7 +28634,7 @@ list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ExpertTierWeightDe
 # Native Q5 slots reject retired expanded GPU descriptors.
 add_v2_test(V2_Unit_NativeQ5GPUStreamAdmission
     COMMAND $<TARGET_FILE:v2_test_expert_tier_weight_stream>
-        --gtest_filter=ExpertTierWeightStream.NativeQ5RejectsExpandedGpuDescriptor
+        --gtest_filter=ExpertTierWeightStream.NativeQ5RejectsExpandedGpuDescriptor:ExpertTierWeightStream.NativeQ5FileDensityRoundTrip
     LABELS "V2;Unit;CPU;DeviceFree;NativeQuantised;Movement;Regression;ProductionTestPreflight"
     MPI_PROCS 1 NO_MODELS NO_MPI)
 
@@ -38773,12 +38773,12 @@ add_v2_test(V2_Integration_MoEProjectionAutomaticContest
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEProjectionAutomaticContest)
 
 # Genuine CPU promotion retains original source authority through descriptor publication.
-add_v2_test(V2_Integration_MoEProjectionPromoted23Fixture
+add_v2_test(V2_Integration_MoEProjectionCpuMigrationFixture
     COMMAND $<TARGET_FILE:v2_unit_moe_projection_diagnostic>
-        --gtest_filter=MoEProjectionDiagnostic.Promoted23RepresentationPreservesDefaultAndOriginalSource:MoEProjectionDiagnostic.Promoted23SourcesUseCanonicalMigrationContract:MoEProjectionDiagnostic.Promoted23RejectsUnknownAndMixedPreparationAuthority:MoEProjectionDiagnostic.Promoted23KeepsBoundedSyntheticOperation
+        --gtest_filter=MoEProjectionDiagnostic.CpuMigrationRepresentationPreservesDefaultAndOriginalSource:MoEProjectionDiagnostic.CpuMigrationSourcesUseCanonicalMigrationContract:MoEProjectionDiagnostic.CpuMigrationRejectsUnknownAndMixedPreparationAuthority:MoEProjectionDiagnostic.CpuMigrationKeepsBoundedSyntheticOperation
     LABELS "V2;Integration;ProductionTestPreflight;MoE;NativeQuantised;Trainer;DeviceFree;Regression"
     NO_MPI NO_MODELS MPI_PROCS 1 TIMEOUT 30)
-list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEProjectionPromoted23Fixture)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEProjectionCpuMigrationFixture)
 
 
 # Both the native trainer and its device-free parser bind the same catalogs.
@@ -39028,7 +39028,7 @@ list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
 if(HAVE_ROCM AND NOT V2_PERF_TESTS_ONLY)
     add_v2_test(V2_Integration_ROCmMoERouteOwnedAllFormatPartitions
         COMMAND $<TARGET_FILE:v2_integration_moe_live_rows>
-            --gtest_filter=ROCmMoERouteOwnedGeometryNative.CapturedParallelSourcePartitionsMatchSerialBytes:ROCmMoERouteOwnedGeometryNative.CapturedParallelSourcePartitionsPromotedQ5KMatchSerialBytes
+            --gtest_filter=ROCmMoERouteOwnedGeometryNative.CapturedParallelSourcePartitionsMatchSerialBytes:ROCmMoERouteOwnedGeometryNative.CapturedParallelSourcePartitionsCpuMigratedQ5MatchSerialBytes
         LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;NativeQuantised;GraphCapture;Regression"
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 120)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS

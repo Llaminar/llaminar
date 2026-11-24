@@ -581,8 +581,8 @@ struct PublishedFFNEpoch final {
     std::shared_ptr<DeviceMoERuntimeTable> runtime;
     std::shared_ptr<DeviceMoEOverlayEpochArena> arena;
     MoEOverlayParticipantBankLease bank;
-    std::vector<int> promoted_experts; ///< Actual CPU-arrival IDs whose down descriptors are physical23.
-    std::vector<int> canonical_experts; ///< Retained original GPU residents required in the same observed EB4 packet.
+    std::vector<int> promoted_experts; ///< Actual expert IDs that arrived from another original GPU source.
+    std::vector<int> canonical_experts; ///< Unchanged original GPU residents retained beside the arrived experts.
     /** @return Exact completed source epoch, or zero for an empty borrow. */
     uint64_t epoch() const noexcept { return bank ? bank->epoch : 0; }
 };
@@ -1984,8 +1984,8 @@ void replayParticipant(DeviceId device, int member, ILocalTPContext &tp, std::ba
 #if defined(HAVE_ROCM)
 #include "FullNativeHCFFNReplay.inc"
 #include "FullNativeHCFFNEpochReplay.inc"
+#include "MoERetainedGpuEpochReplay.inc"
 #endif
-#include "MoEPromoted23NativeLayoutReplay.inc"
 #if defined(LLAMINAR_CASTAGNA_KERNEL_AB)
 #include "CastagnaFullRegionABReplay.inc"
 #endif
@@ -2386,7 +2386,7 @@ void proveOriginalFinalization(const std::vector<DeviceId> &devices, bool single
                             shared[member],*manager.tensorParallelConfig(),*store,
                             qualification==OriginalSourceQualification::NativeLayoutRouterFFNEconomy?ResidentFFNObservation::PairedEvents:
                             qualification==OriginalSourceQualification::NativeLayoutRouterFFNParentReplay?ResidentFFNObservation::RepeatedParent:ResidentFFNObservation::Replay,
-                            format.name,LocalFFNReplayCandidate::Resident,LocalFFNProgram::Original,shape,true,nullptr,
+                            format.name,LocalFFNReplayCandidate::Resident,LocalFFNProgram::Original,shape,true,
                             format.expected_native_layout_groups);
                     else if(qualification==OriginalSourceQualification::ResidentFFN || qualification==OriginalSourceQualification::ResidentFFNEconomy ||
                        qualification==OriginalSourceQualification::GateUpLastProducer || qualification==OriginalSourceQualification::GateUpPairedK32 ||
@@ -2769,8 +2769,8 @@ TEST(FullNativeHCFFN, DISABLED_ROCmRetainedProductionWindowEpoch)
             require(!owners[index].empty(),"real window movement PCI is nonempty");
             if(separator!=std::string_view::npos)list.remove_prefix(separator+1);
         }
-        promoted23_replay::run(promoted23_replay::NumericalProgram::FullHCFFNEpoch,owners,
-            promoted23_replay::EpochSource::GPUNative5_7,&window);
+        retained_gpu_epoch_replay::run(owners,
+            retained_gpu_epoch_replay::EpochSource::GPUNative5_7,&window);
         if(::testing::Test::HasFailure())MPI_Abort(MPI_COMM_WORLD,2);
     } catch(const std::exception& error){ADD_FAILURE()<<error.what();MPI_Abort(MPI_COMM_WORLD,2);throw;}
 }
@@ -2787,8 +2787,8 @@ TEST(FullNativeHCFFN, DISABLED_ROCmRetainedProductionTP4Epoch)
         const auto inventory=mpi->clusterInventory();
         require(inventory!=nullptr,"real TP4 movement uses actual MPI rank inventory");
         const auto pci=originalRetainedClosedMovementPCIs(scope,*inventory);
-        promoted23_replay::run(promoted23_replay::NumericalProgram::FullHCFFNEpoch,pci.views(),
-            promoted23_replay::EpochSource::GPUNativeRealTP4,&source);
+        retained_gpu_epoch_replay::run(pci.views(),
+            retained_gpu_epoch_replay::EpochSource::GPUNativeRealTP4,&source);
         if(::testing::Test::HasFailure())MPI_Abort(MPI_COMM_WORLD,2);
     } catch(const std::exception& error){ADD_FAILURE()<<error.what();MPI_Abort(MPI_COMM_WORLD,2);throw;}
 }

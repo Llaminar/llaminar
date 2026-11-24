@@ -8,7 +8,7 @@
  * are observed in a real native capture and must leave zero nodes of any kind.
  * Admission/empty-capture cases guard scope and exact resource ownership.
  * The captured cases compare real production leaf transactions against an
- * independent serial-M1 byte oracle, including one real CPU-prepared promotion.
+ * independent serial-M1 byte oracle, including native Q5 CPU-prepared promotions.
  * They do not certify QFN owner/compact geometry or
  * economy. Those larger operation/timing proofs belong to the canonical trainer.
  */
@@ -329,7 +329,7 @@ std::vector<PerfStatRecord> ownerSubmissionRecords()
  * @param requested_execution Original serial policy or paired serial/four-plane TN64 execution.
  * @param H Actual reduction width; source-superblock cases require a 256-value multiple.
  * @param F Actual expert width, preserving a partial TN64 output tile when not divisible by64.
- * @param promote_asymmetric Exercise actual codebook23 values through original CPU preparation and promotion.
+ * @param cpu_migrated Exercise genuine native Q5 arrivals through original CPU preparation and migration.
  * @param rows Actual token rows; two with topK9 exercises ordinary IQ2_S capacity18 without widening M1 scope.
  * @param top_k Actual routes per row, bounded by the original serial oracle.
  * @param iq2_only Restrict the capacity-boundary witness to the actual IQ2_S source.
@@ -340,7 +340,7 @@ std::vector<PerfStatRecord> ownerSubmissionRecords()
  * oracle and every partition/FP32 expression remain the original public path.
  */
 void verifyCapturedPublicM1Sources(MoERouteOwnedGateUpPartitionExecution requested_execution, int H, int F,
-    bool promote_asymmetric = false, int rows = 1, int top_k = 1, bool iq2_only = false, bool model_binding = false)
+    bool cpu_migrated = false, int rows = 1, int top_k = 1, bool iq2_only = false, bool model_binding = false)
 {
     using namespace llaminar2::test;
     constexpr int Guard = 16, Replays = 20;
@@ -372,10 +372,14 @@ void verifyCapturedPublicM1Sources(MoERouteOwnedGateUpPartitionExecution request
             cases.emplace_back(quantizedMoEVerifierFormat("Q4_K"), true, runtime_mutable, false);
             cases.emplace_back(quantizedMoEVerifierFormat("IQ4_XS"), false, runtime_mutable, true);
         }
+        std::set<std::string_view> migrated_sources;
         for (const auto &[format, q5_down, runtime_mutable, iq4_mixed] : cases)
         {
             if (model_binding && !runtime_mutable) continue;
-            if (promote_asymmetric && std::string_view(format.label) != "Q5_K") continue;
+            if (cpu_migrated && (!cpu::native_quantised::isQ5NativeSingleScaleSource(
+                    format.source_codebook_id, format.source_is_superblock) &&
+                !(format.source_codebook_id == native_quantised_formats::Q5_K.codebook_id && format.source_is_superblock)))
+                continue;
             if (iq2_only && std::string_view(format.label) != "IQ2_S") continue;
             if (format.source_is_superblock && H % 256 != 0) continue;
             SCOPED_TRACE(std::string(format.label) + (q5_down ? "/Q5_1" : "/Q8_0") +
@@ -411,23 +415,30 @@ void verifyCapturedPublicM1Sources(MoERouteOwnedGateUpPartitionExecution request
             using namespace native_quantised_transfer_parity_detail;
             std::array<cpu::native_quantised::CPUNativeQuantisedPackedWeights, 2> cpu_weights;
             std::optional<PromotedCPUProjection> promoted_gate, promoted_up;
-            if (promote_asymmetric)
+            if (cpu_migrated)
             {
                 for (std::size_t index = 0; index < cpu_weights.size(); ++index)
                 {
                     ASSERT_TRUE(cpu::native_quantised::packWeightsCPUNativeQuantised(sources[index].get(), cpu_weights[index]));
-                    ASSERT_TRUE(cpu_weights[index].usesExpandedInt8());
-                    ASSERT_TRUE(cpu_weights[index].is_asymmetric);
+                    ASSERT_EQ(cpu_weights[index].encoding, cpu::native_quantised::preparedEncodingForSource(
+                        *native_quantised_formats::forQuantType(format.label)));
+                    ASSERT_EQ(cpu_weights[index].payload_bytes, 20);
                 }
                 promoted_gate = promoteCPUProjection(backend, device, cpu_weights[0], ExpertTierWeightProjection::Gate, 88801);
                 promoted_up = promoteCPUProjection(backend, device, cpu_weights[1], ExpertTierWeightProjection::Up, 88802);
                 gate = promoted_gate->descriptor;
                 up = promoted_up->descriptor;
-                ASSERT_EQ(gate.codebook_id, kNativeQuantisedExpandedInt8MinCodebook);
-                ASSERT_EQ(up.codebook_id, kNativeQuantisedExpandedInt8MinCodebook);
+                ASSERT_EQ(gate.codebook_id, original_gate.codebook_id);
+                ASSERT_EQ(up.codebook_id, original_up.codebook_id);
+                ASSERT_EQ(gate.metadata_layout, original_gate.metadata_layout);
+                ASSERT_EQ(up.metadata_layout, original_up.metadata_layout);
+                ASSERT_EQ(gate.allocation_payload_bytes_per_block, 20);
+                ASSERT_EQ(up.allocation_payload_bytes_per_block, 20);
                 ASSERT_EQ(gate.source_codebook_id, original_gate.source_codebook_id);
                 ASSERT_EQ(gate.source_is_superblock, original_gate.source_is_superblock);
                 ASSERT_NE(gate.source_identity_present, 0u);
+                ASSERT_NE(up.source_identity_present, 0u);
+                migrated_sources.emplace(format.label);
             }
             // Distinct route slots may borrow identical retained expert weights.
             // Host descriptor vectors outlive the metadata-upload retirement join.
@@ -456,7 +467,7 @@ void verifyCapturedPublicM1Sources(MoERouteOwnedGateUpPartitionExecution request
             ASSERT_GE(down_table, 0);
             // Only the independent public serial oracle uses immutable tables.
             // The actual capture below retains its genuine runtime envelope.
-            const int oracle_gate_table = (runtime_mutable || promote_asymmetric)
+            const int oracle_gate_table = (runtime_mutable || cpu_migrated)
                 ? kernel->uploadGroupedExpertGateUpDescriptorTables(original_gates.data(), original_ups.data(), E, H, F,
                     MoEDecodeDescriptorSource::StaticDescriptorTable) : gate_table;
             const int oracle_down_table = runtime_mutable
@@ -869,6 +880,8 @@ void verifyCapturedPublicM1Sources(MoERouteOwnedGateUpPartitionExecution request
             }
             consumer->unbindWorkspace();
         }
+        if (cpu_migrated)
+            EXPECT_EQ(migrated_sources, (std::set<std::string_view>{"Q5_0", "Q5_1", "Q5_K"}));
     });
 }
 
@@ -906,8 +919,8 @@ TEST(ROCmMoERouteOwnedGeometryNative, CapturedIQ2AutomaticCapacityBranchesMatchP
     verifyCapturedPublicM1Sources(MoERouteOwnedGateUpPartitionExecution::FourWorkerPlanes, 256, 96, false, 2, 9, true);
 }
 
-/** @brief Real CPU-prepared codebook23 values match original compact serial bytes under both captured execution modes. */
-TEST(ROCmMoERouteOwnedGeometryNative, CapturedParallelSourcePartitionsPromotedQ5KMatchSerialBytes)
+/** @brief Real CPU-prepared Q5_0, Q5_1 and Q5_K values match original compact serial bytes under both captured execution modes. */
+TEST(ROCmMoERouteOwnedGeometryNative, CapturedParallelSourcePartitionsCpuMigratedQ5MatchSerialBytes)
 {
     verifyCapturedPublicM1Sources(MoERouteOwnedGateUpPartitionExecution::FourWorkerPlanes, 2560, 96, true);
 }
@@ -918,8 +931,8 @@ TEST(ROCmMoERouteOwnedGeometryNative, CapturedModelOwnerBindingMatchesSerialByte
     verifyCapturedPublicM1Sources(MoERouteOwnedGateUpPartitionExecution::FourWorkerPlanes, 256, 96,
         false, 1, 1, false, true);
 }
-/** @brief Real promoted23 payloads retain exact source-policy identity in table-owned model lowering. */
-TEST(ROCmMoERouteOwnedGeometryNative, CapturedModelOwnerBindingPromotedQ5KMatchesSerialBytes)
+/** @brief Real migrated Q5 payloads retain exact source-policy identity in table-owned model lowering. */
+TEST(ROCmMoERouteOwnedGeometryNative, CapturedModelOwnerBindingCpuMigratedQ5MatchesSerialBytes)
 {
     verifyCapturedPublicM1Sources(MoERouteOwnedGateUpPartitionExecution::FourWorkerPlanes, 256, 96,
         true, 1, 1, false, true);

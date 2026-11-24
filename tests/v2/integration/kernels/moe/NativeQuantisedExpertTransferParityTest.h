@@ -1502,39 +1502,36 @@ namespace llaminar2::test
                 backend,
                 device.ordinal,
                 blocks * layout.gpu_payload_bytes_per_block);
-            // Exact live primary plane (one byte per block for native MXFP4).
-            result.scales = std::make_unique<DeviceAllocation>(
-                backend,
-                device.ordinal,
-                nativeQuantisedScalePlaneLiveBytes(layout.gpu_codebook_id, blocks));
-            if (layout.gpu_is_asymmetric != 0u)
-            {
-                result.mins = std::make_unique<DeviceAllocation>(
-                    backend,
-                    device.ordinal,
-                    blocks * sizeof(uint16_t));
-            }
-            if (layout.gpu_has_emins != 0u)
-            {
-                result.emins = std::make_unique<DeviceAllocation>(
-                    backend,
-                    device.ordinal,
-                    blocks * sizeof(uint32_t));
-            }
-
+            namespace sb = native_quantised_superblock;
+            const bool coded = layout.cpuStorage().coded();
+            const auto planes = coded
+                ? NativeQuantisedMetadataPlaneBytes::coded(layout.gpu_codebook_id, layout.N,
+                    layout.blocks_per_row, layout.gpu_superblock_phase)
+                : NativeQuantisedMetadataPlaneBytes::of(blocks, nativeQuantisedScalePlaneWidth(layout.gpu_codebook_id),
+                    layout.gpu_is_asymmetric, layout.gpu_has_emins);
+            const auto metadata_layout = coded
+                ? nativeQuantisedMetadataLayout(NativeQuantisedMetadataRepresentation::SuperblockCoded,
+                    layout.gpu_superblock_phase)
+                : uint8_t{0};
+            if (planes.scales)
+                result.scales = std::make_unique<DeviceAllocation>(backend, device.ordinal, planes.scales);
+            if (planes.secondary)
+                result.mins = std::make_unique<DeviceAllocation>(backend, device.ordinal, planes.secondary);
+            if (planes.emins)
+                result.emins = std::make_unique<DeviceAllocation>(backend, device.ordinal, planes.emins);
+            // Align the bound plane like the loader; TransferEngine sends
+            // only the logical code bytes, not its readable tail padding.
+            const auto live_scale_bytes = (coded && planes.scales) ? planes.scales - sb::kSuperblockCodePlanePadBytes : planes.scales;
             ExpertTierGpuMutableProjectionView destination{
                 .payload = result.payload->as<uint8_t>(),
-                .scales = result.scales->as<uint16_t>(),
-                .mins = result.mins
-                            ? result.mins->as<uint16_t>()
-                            : nullptr,
-                .emins = result.emins
-                             ? result.emins->as<uint32_t>()
-                             : nullptr,
+                .scales = result.scales ? result.scales->as<uint16_t>() : result.payload->as<uint16_t>(),
+                .mins = result.mins ? result.mins->as<uint16_t>() : nullptr,
+                .emins = result.emins ? result.emins->as<uint32_t>() : nullptr,
                 .payload_bytes = result.payload->bytes(),
-                .scales_bytes = result.scales->bytes(),
-                .mins_bytes = result.mins ? result.mins->bytes() : 0u,
-                .emins_bytes = result.emins ? result.emins->bytes() : 0u,
+                .scales_bytes = live_scale_bytes,
+                .mins_bytes = planes.secondary,
+                .emins_bytes = planes.emins,
+                .metadata_layout = metadata_layout,
             };
             if (!destination.validFor(layout))
             {
@@ -1602,7 +1599,7 @@ namespace llaminar2::test
 
             result.descriptor = DeviceNativeQuantisedMatrixDesc{
                 .payload = result.payload->as<uint8_t>(),
-                .scales = result.scales->get(),
+                .scales = destination.scales,
                 .mins = result.mins ? result.mins->get() : nullptr,
                 .emins = result.emins ? result.emins->get() : nullptr,
                 .n = layout.N,
@@ -1613,12 +1610,13 @@ namespace llaminar2::test
                 .allocation_payload_bytes_per_block =
                     layout.gpu_payload_bytes_per_block,
                 .allocation_has_mins =
-                    static_cast<uint8_t>(layout.gpu_is_asymmetric),
+                    static_cast<uint8_t>(planes.secondary != 0u),
                 .allocation_has_emins =
                     static_cast<uint8_t>(layout.gpu_has_emins),
                 .source_codebook_id = layout.gpu_source_codebook_id,
                 .source_is_superblock = layout.gpu_source_is_superblock,
                 .source_identity_present = 1u,
+                .metadata_layout = metadata_layout,
             };
             return result;
         }
@@ -1802,7 +1800,8 @@ namespace llaminar2::test
                     descriptor.blocks_per_row,
                     lifetime,
                     source_identity,
-                    allocation);
+                    allocation,
+                    descriptor.metadata_layout);
             }
 #endif
 #ifdef HAVE_ROCM
@@ -1820,7 +1819,8 @@ namespace llaminar2::test
                     descriptor.blocks_per_row,
                     lifetime,
                     source_identity,
-                    allocation);
+                    allocation,
+                    descriptor.metadata_layout);
             }
 #endif
             throw std::runtime_error(

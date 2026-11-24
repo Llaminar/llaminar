@@ -10,7 +10,7 @@
  * source fixtures use the canonical source registry and normal preparation;
  * they carry no fictitious GGUF descriptor, layer, file or model identity.
  * An explicitly tagged promoted fixture retains that original source identity
- * while requiring genuine expanded asymmetric CPU preparation and transfer.
+ * while requiring canonical CPU preparation and transfer.
  */
 #pragma once
 
@@ -18,6 +18,7 @@
 #include "NativeQuantisedMoERoutingProfiles.h"
 #include "execution/moe/MoEExpertProjectionOwnership.h"
 
+#include "kernels/cpu/gemm/CPUNativeQuantisedEncoding.h"
 #include "tensors/NativeQuantisedFormatInfo.h"
 
 #include <cstdint>
@@ -62,7 +63,7 @@ enum class MoEProjectionSourceKind : std::uint8_t
 enum class MoEProjectionPreparedRepresentation : std::uint8_t
 {
     OriginalGpu, ///< Existing source-native GPU preparation and independent oracle.
-    CpuPreparedPromoted23 ///< Genuine expanded asymmetric CPU preparation followed by ordinary transfer-lane promotion.
+    CpuPreparedMigrated ///< Original CPU preparation followed by ordinary transfer-lane promotion.
 };
 
 /**
@@ -75,22 +76,16 @@ enum class MoEProjectionPreparedRepresentation : std::uint8_t
     switch (representation)
     {
     case MoEProjectionPreparedRepresentation::OriginalGpu: return "original-gpu-prepared";
-    case MoEProjectionPreparedRepresentation::CpuPreparedPromoted23: return "cpu-prepared-promoted23";
+    case MoEProjectionPreparedRepresentation::CpuPreparedMigrated: return "cpu-prepared-migrated";
     }
     throw std::invalid_argument("unknown MoE diagnostic prepared representation");
 }
 
-/**
- * @param original_format Canonical original source alias, never an authored physical23 label.
- * @return Whether canonical CPU promotion yields actual expanded asymmetric23 for this original source.
- */
-[[nodiscard]] inline bool moeProjectionSupportsPromoted23(std::string_view original_format) noexcept
+/** @return Execution codebook of an ordinary arrival from the original CPU source. */
+[[nodiscard]] inline constexpr std::uint8_t moeProjectionMigrationCodebook(const NativeQuantisedFormatInfo &source) noexcept
 {
-    for (const auto &source : native_quantised_formats::kAllSourceFormats)
-        if (source.quant_type == original_format)
-            return source.metadata->is_asymmetric &&
-                migrationStableDeviceVnniFormat(*source.metadata).codebook_id == kNativeQuantisedExpandedInt8MinCodebook;
-    return false;
+    return cpu::native_quantised::migrationUsesSuperblockCodes(source)
+        ? canonicalDeviceVnniCodebookId(source) : migrationStableDeviceVnniFormat(source).codebook_id;
 }
 
 /** @brief One M1 owner gate/up contest and separately named fixed-down control. */
@@ -218,13 +213,13 @@ inline MoEProjectionDiagnostic parseMoEProjectionDiagnostic(
             throw std::invalid_argument("MoE prepared representation must be an explicit string");
         const auto &name = request.at("prepared_representation").get_ref<const std::string &>();
         if (name == "original-gpu-prepared") result.prepared_representation = MoEProjectionPreparedRepresentation::OriginalGpu;
-        else if (name == "cpu-prepared-promoted23") result.prepared_representation = MoEProjectionPreparedRepresentation::CpuPreparedPromoted23;
+        else if (name == "cpu-prepared-migrated") result.prepared_representation = MoEProjectionPreparedRepresentation::CpuPreparedMigrated;
         else throw std::invalid_argument("unknown MoE prepared representation: " + name);
     }
-    if (result.prepared_representation == MoEProjectionPreparedRepresentation::CpuPreparedPromoted23 &&
+    if (result.prepared_representation == MoEProjectionPreparedRepresentation::CpuPreparedMigrated &&
         (result.source_kind != MoEProjectionSourceKind::SyntheticSourceFixture ||
          result.contest != MoEProjectionContest::AutomaticVsParallelPartitions64))
-        throw std::invalid_argument("promoted23 is an explicit synthetic automatic-versus-worker fixture only");
+        throw std::invalid_argument("CPU migration is an explicit synthetic automatic-versus-worker fixture only");
     const auto degree = result.device_ordinals.size();
     if ((result.source_kind == MoEProjectionSourceKind::RetainedDescriptors &&
             (result.layer < 0 || result.descriptor_document.empty())) || degree < 2 || degree > 8 || result.participant < 0 ||
@@ -258,9 +253,9 @@ inline MoEProjectionDiagnostic parseMoEProjectionDiagnostic(
             h % degree || e < result.top_k || e > 1024 || e < static_cast<int>(degree) ||
             triple.gate != triple.up || !detail::isNativeQuantisedTriple(triple))
             throw std::invalid_argument("invalid synthetic MoE source geometry or native format triple");
-        if (result.prepared_representation == MoEProjectionPreparedRepresentation::CpuPreparedPromoted23 &&
-            (!moeProjectionSupportsPromoted23(triple.gate) || f % 64))
-            throw std::invalid_argument("promoted23 requires a canonical asymmetric source and complete live64-column CPU stream units");
+        if (result.prepared_representation == MoEProjectionPreparedRepresentation::CpuPreparedMigrated &&
+            f % 64)
+            throw std::invalid_argument("CPU migration diagnostic requires complete live64-column CPU stream units");
         nlohmann::json identities = nlohmann::json::object();
         for (const std::string role : {"gate", "up", "down"})
         {
@@ -274,14 +269,15 @@ inline MoEProjectionDiagnostic parseMoEProjectionDiagnostic(
                 {"source_is_superblock", metadata->is_superblock},
                 {"canonical_native_payload_bytes_per_k32", metadata->payload_bytes},
                 {"canonical_execution_codebook", canonicalDeviceVnniFormat(*metadata).codebook_id},
-                {"migration_execution_codebook", migrationStableDeviceVnniFormat(*metadata).codebook_id},
+                {"migration_execution_codebook", moeProjectionMigrationCodebook(*metadata)},
+                {"migration_superblock_coded", cpu::native_quantised::migrationUsesSuperblockCodes(*metadata)},
                 {"original_n", role == "down" ? h : f}, {"original_k", role == "down" ? f : h}};
         }
         result.source = {h, f, e, result.top_k, triple, {}};
         result.descriptor_evidence = {{"authority", "canonical-native-quantised-source-fixture"},
             {"model_identity", nullptr}, {"original_source_roles", identities},
             {"expert_count", e}, {"normal_preparation", true}};
-        if (result.prepared_representation == MoEProjectionPreparedRepresentation::CpuPreparedPromoted23)
+        if (result.prepared_representation == MoEProjectionPreparedRepresentation::CpuPreparedMigrated)
             result.descriptor_evidence["prepared_representation"] = moeProjectionPreparedRepresentationName(result.prepared_representation);
         (void)result.ownership();
         return result;

@@ -7,7 +7,7 @@
  * family, prepared shared matrices and canonical collective implementation.
  * Twenty dirty/full/empty/reset histories compare all six original public
  * planes. The actual native function must match the immutable source envelope
- * (including promotions), not only a symbol prefix or current residency.
+ * rather than only a symbol prefix or current residency.
  * The final lifetime adversary releases names on the SAME workspace
  * manager while captured handles and retained leases remain alive; signature
  * validation must reject before another native submission can occur.
@@ -47,7 +47,6 @@ enum class LocalFFNReplayCandidate {Resident,GateUpLastProducer,GateUpPairedK32,
  * @param observation Replay gate or explicit separately selected Performance observation.
  * @param source_name Original fixture source label, never inferred from a kernel symbol.
  * @param native_layout_router Select the original-layout router/local-FFN closure through its actual graph lowerer.
- * @param published Optional genuine promoted fragment bank/runtime, retained through all native replay.
  * @param expected_native_layout_groups Optional original-source compiled-family assertion, never a dispatch override.
  */
 void replayResidentParticipant(DeviceId device,int member,ILocalTPContext &tp,std::barrier<> &rendezvous,
@@ -56,7 +55,7 @@ void replayResidentParticipant(DeviceId device,int member,ILocalTPContext &tp,st
     ResidentFFNObservation observation=ResidentFFNObservation::Replay,std::string_view source_name={},
     LocalFFNReplayCandidate replay_candidate=LocalFFNReplayCandidate::Resident,LocalFFNProgram local_program=LocalFFNProgram::Original,
     OriginalFFNFixtureGeometry shape={},bool native_layout_router=false,
-    const PublishedFFNEpoch* published=nullptr,std::uint8_t expected_native_layout_groups=0)
+    std::uint8_t expected_native_layout_groups=0)
 {
 #ifdef HAVE_ROCM
     require(device.is_rocm(),"resident FFN replay requires its implemented ROCm participant");
@@ -70,8 +69,6 @@ void replayResidentParticipant(DeviceId device,int member,ILocalTPContext &tp,st
             ?rocm::ResidentMoEFFNProgram::PartitionLocal:rocm::ResidentMoEFFNProgram::Original);
         require(!(partition_local||ordinary_phases)||replay_candidate==LocalFFNReplayCandidate::Resident,
             "partition-local program only applies to the complete resident candidate");
-        if(published)require(native_layout_router&&observation==ResidentFFNObservation::Replay,
-            "promoted epoch qualification retains the complete NativeLayout byte replay");
         // The actual worker, not its submitting test thread, owns cold launch policy.
         const rocm::ScopedGateUpProducerLoads producer_loads(replay_candidate==LocalFFNReplayCandidate::GateUpPairedK32
             ?rocm::GateUpProducerLoads::PairedK32:rocm::GateUpProducerLoads::Original);
@@ -123,53 +120,11 @@ void replayResidentParticipant(DeviceId device,int member,ILocalTPContext &tp,st
             MoEGateUpPublicationPolicy publication=MoEGateUpPublicationPolicy::Staged,
             MoEDownPublicationPolicy down_publication=MoEDownPublicationPolicy::Staged,
             NativeRouterAliasProbe alias_probe=NativeRouterAliasProbe::None) {
-            auto frame=published?banks.jointLayer(original_member,0,published->epoch()):banks.initialJointLayer(original_member,0);
+            auto frame=banks.initialJointLayer(original_member,0);
             require(frame!=nullptr,"resident original joint layer");
-            auto setup=published?frame->bankLease():frame->acquireInitialConstruction();
+            auto setup=frame->acquireInitialConstruction();
             require(bool(setup),"resident setup-only original source reader");
             const auto& source=setup->layerForModelLayer(0);
-            if(published) {
-                require(published->runtime && published->arena && setup->epoch==published->epoch() &&
-                    !published->promoted_experts.empty(),"promoted replay retains exact completed epoch and actual CPU-arrival IDs");
-                int original_parts=0;
-                int original_n=0,original_k=0;
-                require(!published->canonical_experts.empty(),"mixed physical packet retains an original GPU resident");
-                for(const int expert:published->canonical_experts) {
-                    require(expert>=0&&expert<int(source.fragments.size())&&source.resident_mask.at(expert),
-                        "canonical packet expert belongs to the actual published bank");
-                    const auto& payload=source.fragments.at(expert);
-                    DeviceNativeQuantisedMatrixDesc descriptor;
-                    require(payload.down()&&payload.down()->exportNativeQuantisedMatrixDesc(descriptor)&&
-                        descriptor.codebook_id==7&&descriptor.source_identity_present&&descriptor.source_codebook_id==7&&
-                        !descriptor.source_is_superblock&&descriptor.mins&&!descriptor.emins,
-                        "retained original GPU Q5_1 keeps physical7 and source7");
-                    int parts=0;
-                    require(rocmGemv_native_quantised_query_serial_m1_config_with_policy(descriptor.source_codebook_id,
-                        descriptor.n,descriptor.k,&parts,nullptr)&&parts>0,
-                        "canonical GPU resident resolves original source7 partitions");
-                    if(original_parts)require(parts==original_parts&&descriptor.n==original_n&&descriptor.k==original_k,
-                        "retained canonical packet experts have the same original geometry and partitions");
-                    original_parts=parts;original_n=descriptor.n;original_k=descriptor.k;
-                }
-                for(const int expert:published->promoted_experts) {
-                    require(expert>=0 && expert<int(source.fragments.size()) && source.resident_mask.at(expert),
-                        "promoted expert belongs to this actual destination bank");
-                    const auto& payload=source.fragments.at(expert);
-                    DeviceNativeQuantisedMatrixDesc descriptor;
-                    require(payload.arrivalEpoch()==published->epoch() && payload.down() &&
-                        payload.down()->exportNativeQuantisedMatrixDesc(descriptor) &&
-                        descriptor.codebook_id==kNativeQuantisedExpandedInt8MinCodebook &&
-                        descriptor.source_identity_present && descriptor.source_codebook_id==7 &&
-                        !descriptor.source_is_superblock && descriptor.mins && !descriptor.emins,
-                        "actual Q5_1 CPU arrival retains physical23 and original source7 policy");
-                    int parts=0;
-                    require(rocmGemv_native_quantised_query_serial_m1_config_with_policy(descriptor.source_codebook_id,
-                        descriptor.n,descriptor.k,&parts,nullptr)&&parts==original_parts&&
-                        descriptor.n==original_n&&descriptor.k==original_k,
-                        "physical23 arrival preserves the exact original physical7 source-policy partitions and K intervals");
-                }
-            }
-
             const auto geometry=DeviceMoEIntermediateShardBinding::fromOriginalFamily(*source.fragment_family);
             require(geometry.modelColumns()==kH,"native-event fixture original H authority");
             if(routed_columns)require(routed_columns==int(geometry.localIntermediateColumns()),"timed lanes retain original local F");
@@ -215,10 +170,6 @@ void replayResidentParticipant(DeviceId device,int member,ILocalTPContext &tp,st
             const auto required=declaration.nativeGateUpEnvelope().execution_codebook_mask|
                 declaration.nativeDownEnvelope().execution_codebook_mask|shared_gate_envelope.execution_codebook_mask|
                 shared_down_envelope.execution_codebook_mask;
-            if(published) require((declaration.nativeDownEnvelope().execution_codebook_mask&(uint32_t(1)<<23)) &&
-                (declaration.nativeDownEnvelope().policy_codebook_mask&(uint32_t(1)<<7)) &&
-                !(declaration.nativeDownEnvelope().policy_codebook_mask&(uint32_t(1)<<23)),
-                "promoted descriptor retains original source7 partition policy and independently admits physical23");
             const auto program=rocm::ResidentMoEFFNDecoderProgram::fromExecutionMask(required);
             if(expected_native_layout_groups) {
                 require(native_layout_router&&program.groups()==expected_native_layout_groups,
@@ -272,7 +223,7 @@ void replayResidentParticipant(DeviceId device,int member,ILocalTPContext &tp,st
                 tile_completion&&observation==ResidentFFNObservation::Replay&&
                     (publication==MoEGateUpPublicationPolicy::LastProducer||down_publication==MoEDownPublicationPolicy::LastProducerRouteFold)
                     ?CompletionSerialFamilyReplay::PrefillScratchBeforeDecode:CompletionSerialFamilyReplay::Disabled,shape,
-                native_layout_router&&execution==MoEIntermediateShardFFNExecution::ResidentCandidate,alias_probe,published,
+                native_layout_router&&execution==MoEIntermediateShardFFNExecution::ResidentCandidate,alias_probe,nullptr,
                 observation==ResidentFFNObservation::PairedEvents
                     ?OriginalFFNCollectiveWitness::ProductionPayloadOnly:OriginalFFNCollectiveWitness::DiagnosticSideband);
             setup={}; // Initial source reader never survives into recording.
@@ -317,7 +268,7 @@ void replayResidentParticipant(DeviceId device,int member,ILocalTPContext &tp,st
             return result;
         };
         const auto original_signature=signatures(*original),candidate_signature=signatures(*candidate);
-        if(native_layout_router)require(candidate->graph.getNode("router")==nullptr&&candidate->graph.size()==(published?4u:2u),
+        if(native_layout_router)require(candidate->graph.getNode("router")==nullptr&&candidate->graph.size()==2u,
             "native-layout router FFN contains actual router once and preserves final collective");
         auto *original_native=dynamic_cast<HIPGraphCapture *>(original->capture.get());
         auto *candidate_native=dynamic_cast<HIPGraphCapture *>(candidate->capture.get());
@@ -494,48 +445,6 @@ void replayResidentParticipant(DeviceId device,int member,ILocalTPContext &tp,st
         };
         if(ordinary_phases)require_ordinary_graph(candidate_graph);
         if(native_layout_router)require_direct_graph(candidate_graph);
-        const auto require_epoch_edges=[&](HIPGraphCapture& capture) {
-            if(!published)return;
-            const auto graph=capture.graph();
-            size_t count=0;
-            require(hipGraphGetNodes(graph,nullptr,&count)==hipSuccess,"enumerate actual epoch-bound graph");
-            std::vector<hipGraphNode_t> nodes(count);
-            require(hipGraphGetNodes(graph,nodes.data(),&count)==hipSuccess,"read actual epoch-bound graph");
-            hipGraphNode_t acquire=nullptr,release=nullptr,body=nullptr;
-            for(const auto node:nodes) {
-                hipGraphNodeType type;
-                require(hipGraphNodeGetType(node,&type)==hipSuccess,"inspect actual epoch node type");
-                if(type!=hipGraphNodeTypeKernel)continue;
-                hipKernelNodeParams parameters{};
-                require(hipGraphKernelNodeGetParams(node,&parameters)==hipSuccess,"inspect epoch kernel parameters");
-                // The existing inventory owns exact kernel names; find the
-                // matching native identity without guessing mangled symbols.
-                const auto info=std::find_if(candidate_nodes.begin(),candidate_nodes.end(),[&](const auto& n){
-                    return n.function_identity==reinterpret_cast<std::uintptr_t>(parameters.func);});
-                if(info==candidate_nodes.end())continue;
-                if(info->name.find("acquireEpochKernel")!=std::string::npos)acquire=node;
-                if(info->name.find("releaseEpochKernel")!=std::string::npos)release=node;
-                if(parameters.func==expected_function)body=node;
-            }
-            require(acquire&&release&&body,"actual captured epoch acquire/body/release kernels");
-            size_t edges=0;
-            require(hipGraphGetEdges(graph,nullptr,nullptr,&edges)==hipSuccess,"count actual epoch graph edges");
-            std::vector<hipGraphNode_t> from(edges),to(edges);
-            require(hipGraphGetEdges(graph,from.data(),to.data(),&edges)==hipSuccess,"read actual epoch graph edges");
-            const auto reaches=[&](hipGraphNode_t first,hipGraphNode_t last) {
-                std::vector<hipGraphNode_t> work{first},seen;
-                for(size_t index=0;index<work.size();++index) {
-                    const auto current=work[index];
-                    if(current==last)return true;
-                    if(std::find(seen.begin(),seen.end(),current)!=seen.end())continue;
-                    seen.push_back(current);
-                    for(size_t edge=0;edge<edges;++edge)if(from[edge]==current)work.push_back(to[edge]);
-                }
-                return false;
-            };
-            require(reaches(acquire,body)&&reaches(body,release),"native dependency path retains exact epoch around complete FFN");
-        };
-        require_epoch_edges(*candidate_native);
         const auto original_node_count=original->capture->nodeCount(),candidate_node_count=candidate->capture->nodeCount();
         /** @brief Retire imported work on its actual scheduler stream before the cloned graph retires. */
         struct ImportedReplay final
@@ -566,11 +475,6 @@ void replayResidentParticipant(DeviceId device,int member,ILocalTPContext &tp,st
             std::vector<GPUGraphKernelNodeInfo> imported_nodes;
             require(imported->capture->inspectKernelNodes(imported_nodes,&error)&&imported_nodes.size()==candidate_nodes.size(),
                 "native import preserves every original candidate kernel exactly once");
-            if(published) {
-                auto* native_import=dynamic_cast<HIPGraphCapture*>(imported->capture.get());
-                require(native_import!=nullptr,"promoted imported parent has native HIP ownership");
-                require_epoch_edges(*native_import);
-            }
             if(ordinary_phases) {
                 auto* native_import=dynamic_cast<HIPGraphCapture*>(imported->capture.get());
                 require(native_import!=nullptr,"ordinary imported parent has native HIP ownership");
@@ -614,7 +518,6 @@ void replayResidentParticipant(DeviceId device,int member,ILocalTPContext &tp,st
                 scratch_guards[bank].resize(candidate->workspace->getBufferSize(scratch_names[bank]));
                 require(structural_live_bytes[bank]<=scratch_guards[bank].size(),"structural scratch exact live prefix fits its original named bank");
             }
-        bool executed_promoted=false,nonzero_promoted=false,mixed_packet_executed=false;
         for(int replay=0;replay<20;++replay)
         {
             const int live=live_history[replay%live_history.size()];
@@ -710,31 +613,6 @@ void replayResidentParticipant(DeviceId device,int member,ILocalTPContext &tp,st
                 rendezvous.arrive_and_wait();
             };
             run(*original,expected);run(*candidate,actual);
-            if(published && live) {
-                for(size_t slot=0;slot<native_indices[1].size();++slot)
-                    if(std::find(published->promoted_experts.begin(),published->promoted_experts.end(),int(native_indices[1][slot]))!=published->promoted_experts.end()) {
-                        executed_promoted=true;
-                        for(int column=0;column<kH;++column)
-                            nonzero_promoted=nonzero_promoted||actual[0][slot*size_t(kH)+column]!=0.f;
-                    }
-            }
-            if(published&&live) {
-                // EB4 processes consecutive router slots. Require both actual
-                // physical representations in one observed packet, with nonzero
-                // public contributions, rather than inferring use from residency.
-                for(size_t first=0;first<native_indices[1].size();first+=4) {
-                    bool canonical=false,promoted=false;
-                    for(size_t slot=first;slot<std::min(first+4,native_indices[1].size());++slot) {
-                        const int expert=int(native_indices[1][slot]);
-                        bool nonzero=false;
-                        for(int column=0;column<kH;++column)
-                            nonzero=nonzero||actual[0][slot*size_t(kH)+column]!=0.f;
-                        canonical=canonical||(nonzero&&std::find(published->canonical_experts.begin(),published->canonical_experts.end(),expert)!=published->canonical_experts.end());
-                        promoted=promoted||(nonzero&&std::find(published->promoted_experts.begin(),published->promoted_experts.end(),expert)!=published->promoted_experts.end());
-                    }
-                    mixed_packet_executed=mixed_packet_executed||(canonical&&promoted);
-                }
-            }
             if(native_layout_router) {
                 require(std::memcmp(native_indices[0].data(),native_indices[1].data(),kTopK*sizeof(float))==0,"native-layout original router ID bytes");
                 require(std::memcmp(native_probabilities[0].data(),native_probabilities[1].data(),kTopK*sizeof(float))==0,"native-layout original router weight bytes");
@@ -758,8 +636,6 @@ void replayResidentParticipant(DeviceId device,int member,ILocalTPContext &tp,st
 #include "MoEPartitionLocalFFNTiming.inc"
         }
         rendezvous.arrive_and_wait();
-        require(!published||(executed_promoted&&nonzero_promoted),"retained NativeLayout actually executed a nonzero promoted physical23 route");
-        require(!published||mixed_packet_executed,"retained NativeLayout executed nonzero physical7 and23 routes in the same original EB4 packet");
         if(tile_completion||ordinary_phases||native_layout_router)
         {
             // A native executable borrows immutable backend identity. Changing
@@ -835,7 +711,7 @@ void replayResidentParticipant(DeviceId device,int member,ILocalTPContext &tp,st
     });
 #else
     (void)device;(void)member;(void)tp;(void)rendezvous;(void)banks;(void)original_member;
-    (void)shared;(void)shared_partition;(void)store;(void)observation;(void)source_name;(void)replay_candidate;(void)local_program;(void)shape;(void)native_layout_router;(void)published;
+    (void)shared;(void)shared_partition;(void)store;(void)observation;(void)source_name;(void)replay_candidate;(void)local_program;(void)shape;(void)native_layout_router;(void)expected_native_layout_groups;
     throw std::invalid_argument("Resident FFN replay requires compiled ROCm production kernels");
 #endif
 }

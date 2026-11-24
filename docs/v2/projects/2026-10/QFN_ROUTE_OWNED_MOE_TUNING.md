@@ -468,7 +468,12 @@ native-node checks. The original failed build remains recorded. The same-source
 Serial/Four A/B/B/A comparison below supplies the separate model throughput
 evidence. These focused checks do not refresh complete production preflight.
 
-### Active CPU-promoted decoder23
+### Historical CPU-promoted decoder23 (retired)
+
+These measurements used the former expanded preparation. The current
+`prepared_representation: cpu-prepared-migrated` diagnostic instead measures
+the canonical CPU-to-GPU arrival for the authored source (including native
+Q5_0/Q5_1 and coded Q5_K). Decoder23 results do not qualify that replacement.
 
 The [promoted-source comparison](../../../../parity-results/qwen-flash-next/moe-promoted23-component-disposition/report.json)
 passes the Q5_K one-route smoke and all three eligible original source formats:
