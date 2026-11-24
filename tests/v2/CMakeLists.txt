@@ -28824,6 +28824,16 @@ if(HAVE_ROCM)
         NO_MODELS
         TIMEOUT 300
     )
+    # Native gfx1100 qualification of the WMMA schedules (the generic entry
+    # selects them automatically on gfx1100; this one binds the ISA explicitly).
+    add_v2_test(V2_Integration_ROCmFixedKPrefillProjectionWmma
+        COMMAND $<TARGET_FILE:v2_integration_rocm_fixed_k_prefill_projection>
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;GDN;GEMM;WMMA;PrefixCache;GraphCapture;Replay;ByteExact;Regression;NativeISA-gfx1100;HardwareOptional;Devices1"
+        MPI_PROCS 1
+        NO_MODELS
+        TIMEOUT 300
+        RESOURCE_LOCK rocm_gpu_0
+    )
 endif()
 if(HAVE_ROCM)
     add_executable(v2_integration_rocm_gdn_projection_capture

@@ -71,6 +71,46 @@ namespace llaminar2::fixed_k_projection
     }
 
     /**
+     * @brief Whether a group is narrow enough to need K partitions spread over CTAs.
+     * @param m Physical rows. @param columns Total group columns.
+     * @return True for at most 128 columns and at most sixteen 64x64 output
+     *         tiles; such groups cannot occupy a GPU by walking K per tile.
+     * @details Shared by every backend so the partition-chain bank is one
+     * device-free admission quantity (see partialBound()).
+     */
+    LLAMINAR_FIXED_K_HD constexpr bool usesPartitionedSchedule(int m, int columns) noexcept
+    {
+        return columns <= 128 && ((m + 63) / 64) * ((columns + 63) / 64) <= 16;
+    }
+
+    /**
+     * @brief Exact partial-chain bytes of a partitioned launch.
+     * @param m Physical rows. @param columns Total group columns.
+     * @return kPartitions * m * columns FP32 values.
+     */
+    LLAMINAR_FIXED_K_HD constexpr unsigned long long partialBytes(int m, int columns) noexcept
+    {
+        return static_cast<unsigned long long>(kPartitions) * static_cast<unsigned long long>(m) *
+               static_cast<unsigned long long>(columns) * 4ull;
+    }
+
+    /**
+     * @brief Upper bound of partialBytes() over every partitioned group at @p m rows.
+     * @param m Physical rows of the retained launch envelope.
+     * @return Bytes covering any group the schedules partition at m rows.
+     *
+     * usesPartitionedSchedule() implies m * columns <= min(128 m, 65536), so one
+     * named bank of this size serves every group of a stage without summing
+     * member widths; launches still check their exact extent.
+     */
+    LLAMINAR_FIXED_K_HD constexpr unsigned long long partialBound(int m) noexcept
+    {
+        const unsigned long long rows = static_cast<unsigned long long>(m > 0 ? m : 0);
+        const unsigned long long outputs = rows * 128ull < 65536ull ? rows * 128ull : 65536ull;
+        return static_cast<unsigned long long>(kPartitions) * outputs * 4ull;
+    }
+
+    /**
      * @brief Number of half tensor-core reduction blocks for width @p k.
      * @param k Positive reduction width; the final block zero-fills its tail.
      * @return Ceil(k / 64).

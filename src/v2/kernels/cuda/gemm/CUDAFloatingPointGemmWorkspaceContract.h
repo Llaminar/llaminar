@@ -16,7 +16,7 @@
 #include "kernels/FloatingActivationOperandPrecision.h"
 #include "execution/local_execution/device/WorkspaceDescriptor.h"
 #include "kernels/common/FloatingPointGemmWorkspaceABI.h"
-#include "kernels/cuda/gemm/CUDAFixedKProjectionLaunch.h"
+#include "kernels/common/FixedKProjectionContract.h"
 #include <limits>
 #include <cstdint>
 #include <stdexcept>
@@ -62,13 +62,14 @@ namespace llaminar2::cuda::floating_gemm_workspace
     }
 
     /**
-     * @brief Add one physical half-A bank for explicit ordinary half operands.
+     * @brief Add explicit-operand scratch: the fixed-K chain bank and, for half, the half-A bank.
      * @param rows Complete retained row envelope, not the allocation capacity.
      * @param columns Output width used by the existing redirect declaration.
      * @param k Prepared activation reduction width.
-     * @param operand Immutable arithmetic; only FP16RNE needs a half bank.
-     * @return Existing requirements plus exact rows*k*sizeof(uint16_t) and the
-     *         bounded fixed-K partial bank when FP16RNE is requested.
+     * @param operand Immutable arithmetic; Native adds nothing, FP32 the chain bank,
+     *        FP16RNE the chain bank and the half-A bank.
+     * @return Existing requirements plus the bounded chain bank and, for half,
+     *         exactly rows*k*sizeof(uint16_t).
      * @throws std::invalid_argument Half operand geometry is not positive.
      * @throws std::overflow_error Named half bank bytes cannot be represented.
      */
@@ -76,18 +77,24 @@ namespace llaminar2::cuda::floating_gemm_workspace
         size_t k, FloatingActivationOperandPrecision operand)
     {
         auto result = projectionRequirements(rows, columns);
+        if (operand == FloatingActivationOperandPrecision::Native)
+            return result;
+        if (operand == FloatingActivationOperandPrecision::FP16RNE && (!rows || !k))
+            throw std::invalid_argument("CUDA FP16 operand workspace requires rows and k");
+        if (!rows)
+            return result;  // a rowless strict-FP32 envelope launches nothing
+        if (rows > static_cast<size_t>(std::numeric_limits<int>::max()))
+            throw std::overflow_error("CUDA fixed-K partial row envelope overflow");
+        // Ordinary explicit-operand prefill may partition narrow groups; one
+        // bounded chain bank covers every group at this row envelope.
+        result.buffers.push_back({GemmWorkspaceBuffers::FIXED_K_PARTIALS,
+            static_cast<size_t>(fixed_k_projection::partialBound(static_cast<int>(rows))), 256, true});
         if (operand == FloatingActivationOperandPrecision::FP16RNE)
         {
-            if (!rows || !k)
-                throw std::invalid_argument("CUDA FP16 operand workspace requires rows and k");
             if (rows > std::numeric_limits<size_t>::max() / sizeof(std::uint16_t) / k)
                 throw std::overflow_error("CUDA FP16 activation operand extent overflow");
             result.buffers.push_back({GemmWorkspaceBuffers::FULL_A_FP16,
                 rows * k * sizeof(std::uint16_t), 256, true});
-            if (rows > static_cast<size_t>(std::numeric_limits<int>::max()))
-                throw std::overflow_error("CUDA fixed-K partial row envelope overflow");
-            result.buffers.push_back({GemmWorkspaceBuffers::FIXED_K_PARTIALS,
-                fixedKHalfPartialBound(static_cast<int>(rows)), 256, true});
         }
         return result;
     }

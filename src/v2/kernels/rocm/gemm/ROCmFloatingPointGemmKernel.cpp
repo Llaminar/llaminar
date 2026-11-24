@@ -24,6 +24,7 @@
 
 #include "kernels/common/ProjectionWorkLaunch.h"
 #include "ROCmFloatingPointGemmKernel.h"
+#include "kernels/rocm/gemm/ROCmFixedKProjectionLaunch.h"
 #include "kernels/common/FloatingPointVerifierLaunch.h"
 #include "kernels/common/FloatingPointGemmWorkspaceABI.h"
 #include "HipBLASGemmKernel.h"
@@ -41,6 +42,7 @@
 #include <mutex>
 #include <algorithm>
 #include <atomic>
+#include <type_traits>
 #include <hip/hip_runtime.h>
 
 
@@ -402,8 +404,27 @@ namespace llaminar2
                         throw std::invalid_argument("Fixed half projections require the declared unit epilogue");
                     return runFixedHalfProjection(source, d_C, m, n, k, bank);
                 }
-                const auto *half_input = prepareFP16Operand(source, m, k, bank);
-                return runFP16OperandProjection(half_input, d_C, m, n, k, alpha, beta, bank);
+                if (alpha != 1.0f || beta != 0.0f)
+                    throw std::invalid_argument("Fixed-K half projections require the declared unit epilogue");
+                const auto *half_input = static_cast<const std::uint16_t *>(prepareFP16Operand(source, m, k, bank));
+                return runFixedKGroup(FixedHalfProjectionGroup::single(half_input,
+                    static_cast<const std::uint16_t *>(d_weights_), d_C, n), m, k, bank);
+            }
+
+            // Strict FP32 operands: ordinary multi-row prefill uses the fixed-K
+            // contract; serial, verifier and fixed-column rows keep their trees.
+            if (operand_precision_ == FloatingActivationOperandPrecision::FP32 && m > 1 &&
+                !VerifierKernelModeScope::active() && !currentProjectionRowWork(m) && !fixed_columns &&
+                !VerifierKernelModeScope::rowsFor(m))
+            {
+                if (!transpose_B || bias || C->isMapped() || alpha != 1.0f || beta != 0.0f ||
+                    n != static_cast<int>(N_) || k != static_cast<int>(K_) || activation_row_offset < 0 ||
+                    A->numel() < (static_cast<size_t>(activation_row_offset) + static_cast<size_t>(m)) * static_cast<size_t>(k) ||
+                    C->numel() < static_cast<size_t>(m) * static_cast<size_t>(n))
+                    throw std::invalid_argument("Strict FP32 operands require declared GDN projection geometry");
+                return runFixedKGroup(FixedStrictFP32ProjectionGroup::single(
+                    d_A + static_cast<size_t>(activation_row_offset) * k, static_cast<const float *>(d_weights_), d_C, n),
+                    m, k, workspace ? workspace : workspace_);
             }
 
             // =================================================================
@@ -819,19 +840,75 @@ namespace llaminar2
                         FloatingOutputPartitionScope::requiresFixedColumns(*engine, projection.n))
                         throw std::invalid_argument("Half-operand GDN subgroup has incompatible policy, output or stream");
                 }
-                const auto *half_input = prepareFP16Operand(
-                    static_cast<const float *>(input->gpu_data_ptr()), m, k,
-                    workspace ? workspace : workspace_);
-                for (const auto &projection : projections)
+                auto *bank = workspace ? workspace : workspace_;
+                if (!bank || !bank->hasBuffer(GemmWorkspaceBuffers::FULL_A_FP16))
+                    throw std::invalid_argument("Half-operand GDN group has no admitted half bank");
+                const auto *half_bank = static_cast<const std::uint16_t *>(bank->getBuffer(GemmWorkspaceBuffers::FULL_A_FP16));
+                // Bind every owner before the one shared producer; each group of
+                // at most eight projections is one fixed-K launch on this stream.
+                std::vector<FixedHalfProjectionGroup> groups;
+                for (size_t first = 0; first < projections.size(); first += floating_gemm_abi::kMaxBatchedProjections)
                 {
-                    auto *engine = static_cast<ROCmFloatingPointGemmKernel *>(projection.kernel);
-                    // Each view retains its own persistent library workspace
-                    // binding; all views borrow the same context-owned handle.
-                    if (!engine->runFP16OperandProjection(half_input,
-                        static_cast<float *>(projection.output->gpu_data_ptr()),
-                        m, projection.n, k, 1.0f, 0.0f, workspace ? workspace : workspace_))
-                        return false;
+                    const size_t end = std::min(projections.size(), first + floating_gemm_abi::kMaxBatchedProjections);
+                    const auto bind = [&](size_t index) {
+                        const auto &p = projections[index];
+                        const auto *engine = static_cast<const ROCmFloatingPointGemmKernel *>(p.kernel);
+                        return FixedHalfProjectionGroup::single(half_bank,
+                            static_cast<const std::uint16_t *>(engine->d_weights_),
+                            static_cast<float *>(p.output->gpu_data_ptr()), p.n);
+                    };
+                    auto group = bind(first);
+                    for (size_t index = first + 1; index < end; ++index)
+                    {
+                        const auto next = bind(index);
+                        group.append(next.weight(0), next.output(0), next.columns(0));
+                    }
+                    groups.push_back(group);
                 }
+                (void)prepareFP16Operand(static_cast<const float *>(input->gpu_data_ptr()), m, k, bank);
+                for (const auto &group : groups)
+                    if (!runFixedKGroup(group, m, k, bank))
+                        return false;
+                return true;
+            }
+            if (operand_precision_ == FloatingActivationOperandPrecision::FP32 && m > 1 &&
+                !VerifierKernelModeScope::active() && !currentProjectionRowWork(m) && !VerifierKernelModeScope::rowsFor(m) &&
+                std::none_of(projections.begin(), projections.end(), [](const auto &p) {
+                    return p.kernel && FloatingOutputPartitionScope::requiresFixedColumns(*p.kernel, p.n); }))
+            {
+                // Strict FP32 ordinary prefill: validate every consumer, then one
+                // fixed-K launch per group of at most eight projections.
+                if (input->native_type() != TensorType::FP32 || k != static_cast<int>(K_) ||
+                    input->numel() < static_cast<size_t>(m) * static_cast<size_t>(k))
+                    throw std::invalid_argument("Strict FP32 GDN group requires complete FP32 source rows");
+                const auto *source = static_cast<const float *>(input->gpu_data_ptr());
+                std::vector<FixedStrictFP32ProjectionGroup> groups;
+                for (size_t first = 0; first < projections.size(); first += floating_gemm_abi::kMaxBatchedProjections)
+                {
+                    const size_t end = std::min(projections.size(), first + floating_gemm_abi::kMaxBatchedProjections);
+                    const auto bind = [&](size_t index) {
+                        const auto &p = projections[index];
+                        const auto *engine = dynamic_cast<const ROCmFloatingPointGemmKernel *>(p.kernel);
+                        if (!engine || engine->operand_precision_ != operand_precision_ || engine->precision_ != Precision::FP32 ||
+                            engine->gpu_stream_ != gpu_stream_ || engine->rocm_device_id_ != rocm_device_id_ ||
+                            static_cast<int>(engine->K_) != k || p.n != static_cast<int>(engine->N_) || p.bias ||
+                            !p.output || p.output->native_type() != TensorType::FP32 || p.output->isMapped() ||
+                            !p.output->gpu_data_ptr() || p.output->numel() < static_cast<size_t>(m) * p.n)
+                            throw std::invalid_argument("Strict FP32 GDN subgroup has incompatible policy, output or stream");
+                        return FixedStrictFP32ProjectionGroup::single(source,
+                            static_cast<const float *>(engine->d_weights_), static_cast<float *>(p.output->gpu_data_ptr()), p.n);
+                    };
+                    auto group = bind(first);
+                    for (size_t index = first + 1; index < end; ++index)
+                    {
+                        const auto next = bind(index);
+                        group.append(next.weight(0), next.output(0), next.columns(0));
+                    }
+                    groups.push_back(group);
+                }
+                for (const auto &group : groups)
+                    if (!runFixedKGroup(group, m, k, workspace ? workspace : workspace_))
+                        return false;
                 return true;
             }
             /*
@@ -1644,25 +1721,55 @@ namespace llaminar2
             return destination;
         }
 
-        bool ROCmFloatingPointGemmKernel::runFP16OperandProjection(
-            const void *half_input, float *output, int m, int n, int k, float alpha, float beta,
-            DeviceWorkspaceManager *workspace)
+        template<class Operand>
+        bool ROCmFloatingPointGemmKernel::runFixedKGroup(
+            const FixedRaggedProjectionGroup<Operand> &group, int m, int k, DeviceWorkspaceManager *workspace)
         {
-            if (!half_input || !output || !gpu_stream_ || !d_weights_ ||
-                precision_ != Precision::FP16 || operand_precision_ != FloatingActivationOperandPrecision::FP16RNE ||
-                n != static_cast<int>(N_) || k != static_cast<int>(K_))
-                throw std::invalid_argument("Half-operand GEMM has incompatible prepared geometry");
-            hipblas_kernel_->bindWorkspace(workspace);
-            const bool success = hipblas_kernel_->executeFP16AccumulateFP32OnStream(
-                ExplicitGPUStream{gpu_stream_}, half_input, d_weights_, output, m, n, k, alpha, beta);
+            constexpr bool half = std::is_same_v<Operand, std::uint16_t>;
+            if (!gpu_stream_ || m <= 0 || k != static_cast<int>(K_) ||
+                !validateROCmWorkspaceBinding(workspace, rocm_device_id_, "fixed-K projection"))
+                throw std::invalid_argument("ROCm fixed-K projection requires its prepared geometry, stream and workspace");
+            const auto operand = half ? fixedKHalfOperandForDevice(rocm_device_id_) : FixedKOperand::StrictFP32;
+            const auto schedule = selectFixedKSchedule(operand, m, group.totalColumns());
+            float *partials = nullptr;
+            std::size_t partial_bytes = 0;
+            if (fixedKScheduleNeedsPartials(schedule))
+            {
+                // The admitted bank is the shared policy bound at this row envelope.
+                if (!workspace->hasBuffer(GemmWorkspaceBuffers::FIXED_K_PARTIALS))
+                    throw std::invalid_argument("ROCm fixed-K projection lacks its admitted partial bank");
+                partials = static_cast<float *>(workspace->getBuffer(GemmWorkspaceBuffers::FIXED_K_PARTIALS));
+                partial_bytes = workspace->getBufferSize(GemmWorkspaceBuffers::FIXED_K_PARTIALS);
+            }
+            bool success = false;
+            if constexpr (half)
+                success = launchFixedKHalfProjection(group, m, k, rocm_device_id_, gpu_stream_, schedule, partials, partial_bytes);
+            else
+                success = launchFixedKFP32Projection(group, m, k, rocm_device_id_, gpu_stream_, schedule, partials, partial_bytes);
             if (success)
-                PerfStatsCollector::addCounter("gemm", "rocm_fp16_operand_compute32_calls", 1.0,
+            {
+                std::string widths;
+                for (int index = 0; index < group.size(); ++index)
+                {
+                    if (index) widths += "+";
+                    widths += std::to_string(group.columns(index));
+                }
+                PerfStatsCollector::addCounter("gemm", "rocm_fixed_k_projection_calls", 1.0,
                     "gemm", "rocm:" + std::to_string(rocm_device_id_),
-                    PerfStatsCollector::Tags{{"m", std::to_string(m)}, {"n", std::to_string(n)},
-                        {"k", std::to_string(k)}, {"activation", "fp16_rne"}, {"weight", "fp16"},
-                        {"accumulation", "fp32"}, {"output", "fp32"}, {"route", "hipblas_gemm_ex"}});
+                    PerfStatsCollector::Tags{{"m", std::to_string(m)}, {"k", std::to_string(k)}, {"widths", widths},
+                        {"projections", std::to_string(group.size())},
+                        {"schedule", std::string(fixedKScheduleName(schedule))},
+                        {"activation", half ? "fp16_rne" : "fp32"}, {"weight", half ? "fp16" : "fp32"},
+                        {"accumulation", "fp32"}, {"output", "fp32"},
+                        {"route", operand == FixedKOperand::HalfWmma ? "fixed_k_wmma" : "fixed_k_scalar_fma"}});
+            }
             return success;
         }
+
+        template bool ROCmFloatingPointGemmKernel::runFixedKGroup<std::uint16_t>(
+            const FixedHalfProjectionGroup &, int, int, DeviceWorkspaceManager *);
+        template bool ROCmFloatingPointGemmKernel::runFixedKGroup<float>(
+            const FixedStrictFP32ProjectionGroup &, int, int, DeviceWorkspaceManager *);
 
         // =====================================================================
         // IWorkspaceConsumer interface

@@ -5,7 +5,8 @@
  * Issue #74: with prefix caching on, a cold prompt is prefilled in different
  * chunks (for example 512+256+10 rows instead of 512+266) because recurrent
  * checkpoints split it. Each chunk runs a retained prefill graph whose physical
- * row count is the chunk's bucket. Explicit half-RNE GDN projections must give
+ * row count is the chunk's bucket. Explicit-operand (half-RNE or strict FP32)
+ * GDN projections must give
  * every prompt row identical bytes regardless of the chunk that carries it,
  * its bucket and its row offset within the chunk.
  *
@@ -15,7 +16,7 @@
  * chunk's live rows into the bucket input and poisons the padded rows, then
  * compares every live output row of every explicit-operand projection across
  * schedules byte for byte. Capture-time route counters prove that ordinary
- * half prefill used the fixed-K schedule family, never vendor BLAS.
+ * explicit-operand prefill used the fixed-K schedule family, never vendor BLAS.
  */
 #pragma once
 
@@ -73,18 +74,19 @@ namespace llaminar2::test
      * @param context Backend stage context bound to @p device.
      * @param graph_factory Native CUDA/HIP graph constructor.
      * @param worker Actual worker owning retained captures.
-     * @param wide_format Native format for QKV/Z when @p full_half is false.
+     * @param wide_format Native format for QKV/Z when @p full_explicit is false.
      * @param k Shared activation width.
      * @param columns QKV, Z, alpha and beta output widths.
-     * @param full_half True: all four projections use half-RNE operands (explicit
-     *        full-FP16 mode). False: only alpha/beta (default FP16MoEAlphaBeta).
+     * @param full_explicit True: all four projections use explicit operands (full
+     *        FP16/FP32 modes). False: only alpha/beta (default FP16MoEAlphaBeta).
+     * @param precision FP16RNE (half-RNE operands) or FP32 (strict FP32 operands).
      * @param schedules Chunkings of one prompt; every pair must agree.
      * @param route_counter PerfStats name the fixed-K route must publish.
      */
     inline void runFixedKChunkReplay(
         DeviceId device, IDeviceContext &context, const FixedKGraphFactory &graph_factory,
         IWorkerGPUContext *worker, const QuantizedVerifierFormatCase &wide_format,
-        int k, std::array<int, 4> columns, bool full_half,
+        int k, std::array<int, 4> columns, bool full_explicit, FloatingActivationOperandPrecision precision,
         std::span<const FixedKChunkSchedule> schedules, const std::string &route_counter)
     {
         ASSERT_FALSE(schedules.empty());
@@ -97,7 +99,8 @@ namespace llaminar2::test
             ASSERT_EQ(total, prompt) << schedule.label;
         }
         SCOPED_TRACE(::testing::Message() << "K=" << k << " N=" << columns[0] << "+" << columns[1]
-            << "+" << columns[2] << "+" << columns[3] << " full_half=" << full_half
+            << "+" << columns[2] << "+" << columns[3] << " full_explicit=" << full_explicit
+            << " half=" << (precision == FloatingActivationOperandPrecision::FP16RNE)
             << " device=" << device.toString());
 
         auto *backend = getBackendFor(device);
@@ -105,32 +108,38 @@ namespace llaminar2::test
         ScopedGPUStream stream_owner(device);
         void *stream = stream_owner.get();
 
-        // Prepared engines: alpha/beta (and QKV/Z in full-half mode) derive
-        // half-RNE weights from original FP32 sources exactly like setup.
-        const auto half = FloatingActivationOperandPrecision::FP16RNE;
+        // Prepared engines: alpha/beta (and QKV/Z in full modes) derive half-RNE
+        // weights from original FP32 sources exactly like setup, or keep the
+        // original FP32 values for the strict-FP32 mode.
+        ASSERT_TRUE(precision == FloatingActivationOperandPrecision::FP16RNE ||
+                    precision == FloatingActivationOperandPrecision::FP32);
+        const bool half = precision == FloatingActivationOperandPrecision::FP16RNE;
         std::array<std::shared_ptr<TensorBase>, 4> weights;
         for (size_t i = 0; i < 4; ++i)
         {
             const uint32_t seed = 74001u + static_cast<uint32_t>(i);
-            if (i < 2 && !full_half)
+            if (i < 2 && !full_explicit)
                 weights[i] = wide_format.create({size_t(columns[i]), size_t(k)}, seed);
             else
-                weights[i] = materializePreparedHalfWeights(*TestTensorFactory::createFP32Random(
-                    {size_t(columns[i]), size_t(k)}, -0.125f, 0.125f, seed));
+            {
+                std::shared_ptr<TensorBase> original = TestTensorFactory::createFP32Random(
+                    {size_t(columns[i]), size_t(k)}, -0.125f, 0.125f, seed);
+                weights[i] = half ? materializePreparedHalfWeights(*original) : original;
+            }
         }
         const std::array<const char *, 4> names{"qkv", "z", "alpha", "beta"};
         std::array<GpuPreparedGemm, 4> prepared;
         for (size_t i = 0; i < 4; ++i)
         {
             const std::string name = std::string("test.fixed_k.") + names[i];
-            const bool explicit_half = full_half || i >= 2;
-            prepared[i] = explicit_half
-                ? makeGpuPreparedFloatingPointGemm(weights[i].get(), device, name, ModelContextId{7400}, half)
+            const bool explicit_operand = full_explicit || i >= 2;
+            prepared[i] = explicit_operand
+                ? makeGpuPreparedFloatingPointGemm(weights[i].get(), device, name, ModelContextId{7400}, precision)
                 : makeGpuPreparedGemm(weights[i].get(), device, name);
             ASSERT_NE(prepared[i].kernel, nullptr);
         }
 
-        // Host prompt: FP32 rows the production cast rounds to half on device.
+        // Host prompt: FP32 rows (the production cast rounds them to half in half mode).
         std::vector<float> prompt_rows(size_t(prompt) * k);
         std::mt19937 rng(7474);
         std::uniform_real_distribution<float> values(-0.75f, 0.75f);
@@ -239,19 +248,18 @@ namespace llaminar2::test
             ASSERT_TRUE(entry.graph->instantiate());
         }
 
-        // Every captured explicit-half group used the fixed-K route at its bucket.
+        // Every captured explicit group used the fixed-K route at its bucket.
         double fixed_launches = 0.0;
         for (const auto &record : PerfStatsCollector::snapshot({route_counter}))
         {
             fixed_launches += record.value;
-            EXPECT_EQ(record.tags.at("activation"), "fp16_rne");
+            EXPECT_EQ(record.tags.at("activation"), half ? "fp16_rne" : "fp32");
             EXPECT_EQ(record.tags.at("accumulation"), "fp32");
         }
         EXPECT_GE(fixed_launches, static_cast<double>(graphs.size())) << route_counter;
+        // The retired vendor-BLAS explicit-operand routes must never reappear.
         for (const char *vendor : {"gemm.cuda_floating_operand_projection_calls", "gemm.rocm_fp16_operand_compute32_calls"})
-            for (const auto &record : PerfStatsCollector::snapshot({vendor}))
-                EXPECT_NE(record.tags.count("activation") ? record.tags.at("activation") : "", "fp16_rne")
-                    << "Ordinary half prefill reached vendor BLAS: " << vendor;
+            EXPECT_TRUE(PerfStatsCollector::snapshot({vendor}).empty()) << "Explicit prefill reached vendor BLAS: " << vendor;
         PerfStatsCollector::reset();
 
         // Replay every schedule and gather live rows for each explicit projection.
@@ -284,7 +292,7 @@ namespace llaminar2::test
 
         for (size_t i = 0; i < 4; ++i)
         {
-            if (!full_half && i < 2) continue;  // native codebooks are outside this contract
+            if (!full_explicit && i < 2) continue;  // native codebooks are outside this contract
             for (size_t s = 1; s < schedules.size(); ++s)
                 for (int row = 0; row < prompt; ++row)
                 {

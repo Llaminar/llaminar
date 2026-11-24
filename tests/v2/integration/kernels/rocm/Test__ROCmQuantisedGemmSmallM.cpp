@@ -8476,17 +8476,18 @@ TEST(Test__ROCmQuantisedGemmSmallM, GDNPhysicalHalfOperandsAccumulateIntoFP32Cap
         EXPECT_NO_THROW({ auto partition = engines[0]->beginOutputPartitionEquivalenceScope(widths[0], widths[0]); });
         stage.unbindWorkspace();
     }
-    const auto records = PerfStatsCollector::snapshot({"gemm.rocm_fp16_operand_compute32_calls"});
+    // Ordinary half prefill runs the fixed-K contract (#74), never hipBLAS.
+    const auto records = PerfStatsCollector::snapshot({"gemm.rocm_fixed_k_projection_calls"});
     EXPECT_FALSE(records.empty());
     double consumers = 0.0;
     for (const auto &record : records)
     {
-        consumers += record.value;
+        consumers += record.value * std::stoi(record.tags.at("projections"));
         EXPECT_EQ(record.tags.at("activation"), "fp16_rne");
         EXPECT_EQ(record.tags.at("weight"), "fp16");
         EXPECT_EQ(record.tags.at("accumulation"), "fp32");
         EXPECT_EQ(record.tags.at("output"), "fp32");
-        EXPECT_EQ(record.tags.at("route"), "hipblas_gemm_ex");
+        EXPECT_TRUE(record.tags.at("route") == "fixed_k_wmma" || record.tags.at("route") == "fixed_k_scalar_fma");
     }
     const auto fixed = PerfStatsCollector::snapshot({"kernel.rocm_fp16_short_projection_group_calls"});
     EXPECT_FALSE(fixed.empty());

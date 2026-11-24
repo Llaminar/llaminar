@@ -73,44 +73,6 @@ namespace llaminar2
                        CUBLAS_STATUS_SUCCESS;
             }
 
-            /**
-             * @brief Restore operation-local math before releasing the shared handle lock.
-             *
-             * @param handle Context-owned handle whose submission lock the caller holds.
-             * @param mode Exact arithmetic mode for this operation.
-             * @param enabled Native calls retain their existing configuration unchanged.
-             * @throws std::runtime_error A math-mode query/publication fails.
-             */
-            class ScopedBlasMathMode final
-            {
-            public:
-                ScopedBlasMathMode(cublasHandle_t handle, cublasMath_t mode, bool enabled)
-                    : handle_(handle), active_(enabled)
-                {
-                    cublasAtomicsMode_t atomics = CUBLAS_ATOMICS_NOT_ALLOWED;
-                    cublasPointerMode_t pointers = CUBLAS_POINTER_MODE_HOST;
-                    if (active_ && (cublasGetAtomicsMode(handle_, &atomics) != CUBLAS_STATUS_SUCCESS ||
-                        atomics != CUBLAS_ATOMICS_NOT_ALLOWED ||
-                        cublasGetPointerMode(handle_, &pointers) != CUBLAS_STATUS_SUCCESS || pointers != CUBLAS_POINTER_MODE_HOST))
-                        throw std::runtime_error("Explicit cuBLAS operands require non-atomic reduction and host coefficients");
-                    if (active_ && (cublasGetMathMode(handle_, &previous_) != CUBLAS_STATUS_SUCCESS ||
-                        cublasSetMathMode(handle_, mode) != CUBLAS_STATUS_SUCCESS))
-                        throw std::runtime_error("Cannot publish explicit cuBLAS operand arithmetic");
-                }
-                /** @brief Fatal restoration failure cannot leave another operation a stale math mode. */
-                ~ScopedBlasMathMode() noexcept
-                {
-                    if (active_ && cublasSetMathMode(handle_, previous_) != CUBLAS_STATUS_SUCCESS)
-                        std::terminate();
-                }
-                ScopedBlasMathMode(const ScopedBlasMathMode &) = delete;
-                ScopedBlasMathMode &operator=(const ScopedBlasMathMode &) = delete;
-            private:
-                cublasHandle_t handle_; ///< Borrowed under the context submission lock.
-                cublasMath_t previous_ = CUBLAS_DEFAULT_MATH; ///< Exact enclosing mode.
-                bool active_; ///< Native calls do not mutate the context configuration.
-            };
-
             __global__ void prepare_batched_same_a_pointer_arrays_kernel(
                 const float *d_A,
                 const float *d_B0,
@@ -237,8 +199,8 @@ namespace llaminar2
             bool transA, bool transB,
             float alpha, float beta)
         {
-            if (operand_precision_ == FloatingActivationOperandPrecision::FP16RNE)
-                throw std::invalid_argument("Half operands use the fixed-K projection contract, never cuBLAS");
+            if (operand_precision_ != FloatingActivationOperandPrecision::Native)
+                throw std::invalid_argument("Explicit operands use the fixed-K projection contract, never cuBLAS");
             const auto submission = device_ctx_->acquireBlasSubmission();
             const auto handle_ = static_cast<cublasHandle_t>(submission.handle());
             if (!handle_)
@@ -335,14 +297,6 @@ namespace llaminar2
             // cuBLAS call: gemm(opB, opA, N, M, K, alpha, B, ldb, A, lda, beta, C, ldc)
             // Computes: op(B_cm) @ op(A_cm) where B_cm, A_cm are cuBLAS's col-major views
 
-            if (operand_precision_ == FloatingActivationOperandPrecision::FP32)
-            {
-                ScopedBlasMathMode math(handle_, CUBLAS_PEDANTIC_MATH, true);
-                CUBLAS_CHECK(cublasGemmEx(handle_, opB, opA, N, M, K, &alpha,
-                    d_B, CUDA_R_32F, ldb, d_A, CUDA_R_32F, lda, &beta,
-                    d_C, CUDA_R_32F, ldc, CUBLAS_COMPUTE_32F_PEDANTIC, CUBLAS_GEMM_DEFAULT));
-                return true;
-            }
 
             CUBLAS_CHECK(cublasSgemm(
                 handle_,
@@ -699,17 +653,9 @@ namespace llaminar2
                 }
             }
 
-            ScopedBlasMathMode math(handle_, CUBLAS_PEDANTIC_MATH,
-                operand_precision_ == FloatingActivationOperandPrecision::FP32);
-            cublasStatus_t status;
-            if (operand_precision_ == FloatingActivationOperandPrecision::FP32)
-                status = cublasGemmBatchedEx(handle_, opB, opA, N, M, K, &alpha,
-                    reinterpret_cast<const void *const *>(d_B_array), CUDA_R_32F, ldb,
-                    reinterpret_cast<const void *const *>(d_A_array), CUDA_R_32F, lda, &beta,
-                    reinterpret_cast<void *const *>(d_C_array), CUDA_R_32F, ldc, batch_count,
-                    CUBLAS_COMPUTE_32F_PEDANTIC, CUBLAS_GEMM_DEFAULT);
-            else
-                status = cublasSgemmBatched(
+            if (operand_precision_ != FloatingActivationOperandPrecision::Native)
+                throw std::invalid_argument("Explicit operands use the fixed-K projection contract, never cuBLAS");
+            const cublasStatus_t status = cublasSgemmBatched(
                 handle_,
                 opB, opA,
                 N, M, K,

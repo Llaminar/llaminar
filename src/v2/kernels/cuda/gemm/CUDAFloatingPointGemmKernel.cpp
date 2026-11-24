@@ -453,7 +453,7 @@ namespace llaminar2
                 auto *effective_workspace = workspace ? workspace : bound_workspace_;
                 const void *operand = operand_precision_ == FloatingActivationOperandPrecision::FP16RNE
                     ? prepareFP16Operand(d_A, m, k, effective_workspace) : d_A;
-                bool success = ((operand_precision_ == FloatingActivationOperandPrecision::FP16RNE && m == 1) ||
+                bool success = (m == 1 ||
                     VerifierKernelModeScope::active() || currentProjectionRowWork(m) || fixed_columns || VerifierKernelModeScope::rowsFor(m))
                     ? submitFixedOperandProjection(operand, d_C, m, n, k, effective_workspace)
                     : submitOperandProjection(operand, d_C, m, n, k, effective_workspace);
@@ -752,7 +752,7 @@ namespace llaminar2
                         kernel->gpu_stream_ != gpu_stream_ || kernel->cuda_device_id_ != cuda_device_id_ || !kernel->d_weights_)
                         throw std::invalid_argument("Explicit fused CUDA operand descriptor is incompatible");
                 }
-                const bool fixed = (operand_precision_ == FloatingActivationOperandPrecision::FP16RNE && m == 1) ||
+                const bool fixed = m == 1 ||
                     VerifierKernelModeScope::active() || currentProjectionRowWork(m) || VerifierKernelModeScope::rowsFor(m) ||
                     std::any_of(projections.begin(), projections.end(), [](const auto &p) {
                         return FloatingOutputPartitionScope::requiresFixedColumns(*p.kernel, p.n);
@@ -791,12 +791,24 @@ namespace llaminar2
                             return false;
                     return true;
                 }
-                // Strict FP32 operands: one consumer per projection on this exact stream.
-                for (const auto &projection : projections)
+                // Strict FP32 operands: one fixed-K launch per group of at most eight.
+                for (size_t first = 0; first < projections.size(); first += floating_gemm_abi::kMaxBatchedProjections)
                 {
-                    auto *kernel = static_cast<CUDAFloatingPointGemmKernel *>(projection.kernel);
-                    if (!kernel->submitOperandProjection(source,
-                        static_cast<float *>(projection.output->gpu_data_ptr()), m, projection.n, k, effective_workspace))
+                    const size_t end = std::min(projections.size(), first + floating_gemm_abi::kMaxBatchedProjections);
+                    const auto bind = [&](size_t index) {
+                        const auto &p = projections[index];
+                        const auto *engine = static_cast<const CUDAFloatingPointGemmKernel *>(p.kernel);
+                        return FixedStrictFP32ProjectionGroup::single(source,
+                            static_cast<const float *>(engine->d_weights_),
+                            static_cast<float *>(p.output->gpu_data_ptr()), p.n);
+                    };
+                    auto group = bind(first);
+                    for (size_t index = first + 1; index < end; ++index)
+                    {
+                        const auto next = bind(index);
+                        group.append(next.weight(0), next.output(0), next.columns(0));
+                    }
+                    if (!submitFixedKFP32Group(group, m, k, effective_workspace))
                         return false;
                 }
                 return true;
@@ -1821,17 +1833,44 @@ namespace llaminar2
                 return submitFixedKHalfGroup(FixedHalfProjectionGroup::single(
                     static_cast<const std::uint16_t *>(input), static_cast<const std::uint16_t *>(d_weights_),
                     output, n), m, k, workspace);
-            cublas_kernel_->bindWorkspace(workspace);
-            const bool success = cublas_kernel_->execute(static_cast<const float *>(input),
-                static_cast<const float *>(d_weights_), output, m, n, k, false, true, 1.0f, 0.0f);
+            return submitFixedKFP32Group(FixedStrictFP32ProjectionGroup::single(
+                static_cast<const float *>(input), static_cast<const float *>(d_weights_), output, n), m, k, workspace);
+        }
+
+        bool CUDAFloatingPointGemmKernel::submitFixedKFP32Group(
+            const FixedStrictFP32ProjectionGroup &group, int m, int k, DeviceWorkspaceManager *workspace)
+        {
+            if (operand_precision_ != FloatingActivationOperandPrecision::FP32 || !gpu_stream_ || !workspace ||
+                workspace->device() != DeviceId::cuda(cuda_device_id_) || m <= 0 || k != static_cast<int>(K_))
+                throw std::invalid_argument("CUDA fixed-K FP32 projection requires its prepared geometry and workspace");
+            const auto schedule = selectFixedKFP32Schedule(m, group.totalColumns(), k);
+            float *partials = nullptr;
+            std::size_t partial_bytes = 0;
+            if (fixedKFP32ScheduleNeedsPartials(schedule))
+            {
+                if (!workspace->hasBuffer(GemmWorkspaceBuffers::FIXED_K_PARTIALS))
+                    throw std::invalid_argument("CUDA fixed-K FP32 projection lacks its admitted partial bank");
+                partials = static_cast<float *>(workspace->getBuffer(GemmWorkspaceBuffers::FIXED_K_PARTIALS));
+                partial_bytes = workspace->getBufferSize(GemmWorkspaceBuffers::FIXED_K_PARTIALS);
+            }
+            const bool success = launchFixedKFP32Projection(group, m, k, cuda_device_id_, gpu_stream_,
+                schedule, partials, partial_bytes);
             if (success)
-                PerfStatsCollector::addCounter("gemm", "cuda_floating_operand_projection_calls", 1.0,
+            {
+                std::string widths;
+                for (int index = 0; index < group.size(); ++index)
+                {
+                    if (index) widths += "+";
+                    widths += std::to_string(group.columns(index));
+                }
+                PerfStatsCollector::addCounter("gemm", "cuda_fixed_k_projection_calls", 1.0,
                     "gemm", "cuda:" + std::to_string(cuda_device_id_),
-                    {{"m", std::to_string(m)}, {"n", std::to_string(n)}, {"k", std::to_string(k)},
-                     {"activation", "fp32"}, {"weight", "fp32"},
-                     {"accumulation", "fp32"}, {"output", "fp32"},
-                     {"compute", "CUBLAS_COMPUTE_32F_PEDANTIC"},
-                     {"route", "cublas_gemm_ex"}});
+                    {{"m", std::to_string(m)}, {"k", std::to_string(k)}, {"widths", widths},
+                     {"projections", std::to_string(group.size())},
+                     {"schedule", std::string(fixedKFP32ScheduleName(schedule))},
+                     {"activation", "fp32"}, {"weight", "fp32"}, {"accumulation", "fp32"},
+                     {"output", "fp32"}, {"route", "fixed_k_scalar_fma"}});
+            }
             return success;
         }
 
@@ -1853,7 +1892,6 @@ namespace llaminar2
                 partials = static_cast<float *>(workspace->getBuffer(GemmWorkspaceBuffers::FIXED_K_PARTIALS));
                 partial_bytes = workspace->getBufferSize(GemmWorkspaceBuffers::FIXED_K_PARTIALS);
             }
-            CUDA_KERNEL_PROFILE_SCOPE_STREAM(CUDAKernelType::GEMM_CUBLAS, gpu_stream_);
             const bool success = launchFixedKHalfProjection(group, m, k, cuda_device_id_, gpu_stream_,
                 schedule, partials, partial_bytes);
             if (success)

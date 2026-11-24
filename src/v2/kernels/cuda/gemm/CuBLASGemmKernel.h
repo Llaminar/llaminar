@@ -25,10 +25,10 @@
  * ```
  *
  * Explicit operand modes borrow the same handle under its submission lock.
- * FP32 uses CUBLAS_COMPUTE_32F_PEDANTIC. FP16RNE engines never submit to
- * cuBLAS: ordinary half prefill uses the fixed-K contract, whose rows do not
- * depend on M (issue #74). Scoped math configuration is restored before the
- * submission view releases its lock; no context-wide default is changed.
+ * Explicit operand engines (FP32, FP16RNE) never submit to cuBLAS: ordinary
+ * prefill uses the fixed-K contract, whose rows do not depend on M (#74), and
+ * every entry point rejects a non-native operand policy. Scoped math
+ * configuration is restored before the submission view releases its lock.
  *
  * **Note**: For quantized tensors (Q4_0, Q8_0, IQ4_NL), use CudaQuantizedGemmKernel
  * with INT8 Tensor Cores instead of cuBLAS.
