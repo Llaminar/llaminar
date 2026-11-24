@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include "MoEOverlayRemoteProjectionProtocol.h"
+
 #include "ExpertTierSourceReadiness.h"
 #include "ExpertTierTransferMeasurement.h"
 #include "GPUExpertTransfer.h"
@@ -34,6 +36,7 @@
 
 namespace llaminar2
 {
+    namespace test { struct ExpertTierGpuBlobRelayFixtureAccess; }
     class MappedHostTransferRegion;
 
     /** @brief Named separated-array region carried by one packed blob chunk. */
@@ -46,7 +49,7 @@ namespace llaminar2
     };
 
     /**
-     * @brief One contiguous chunk that never crosses a separated-array boundary.
+     * @brief A contiguous raw range or a set of whole coded wire units.
      *
      * Keeping a chunk inside one region lets both DMA submissions use an exact
      * pointer and byte range without constructing a temporary packed envelope.
@@ -59,6 +62,8 @@ namespace llaminar2
         std::size_t destination_offset = 0; ///< Offset in the original destination region.
         std::size_t bytes = 0;
         std::uint64_t sequence = 0;
+        std::uint32_t first_unit = 0; ///< First coded wire unit (unused for raw planes).
+        std::uint32_t unit_count = 0; ///< Complete units represented by this coded chunk.
 
         /** @brief Return whether the chunk names a non-empty bounded operation. */
         [[nodiscard]] constexpr bool valid() const noexcept
@@ -76,6 +81,7 @@ namespace llaminar2
      * retry, byte accounting, and destination pointer validation unambiguous.
      * Rectangles additionally stop at either root's noncontiguous boundary;
      * their source and destination offsets need not equal the wire offset.
+     * Coded rectangles use whole compact units, including each touched header once.
      */
     class ExpertTierGpuBlobChunkProtocol final
     {
@@ -155,6 +161,9 @@ namespace llaminar2
             return submitted_bytes_;
         }
 
+        /** @return Authenticated pack/unpack pair when the cursor carries coded units. */
+        [[nodiscard]] const std::optional<CodedGpuProjectionRelayLayouts> &codedLayouts() const noexcept { return coded_layouts_; }
+
         /** @brief Return the immutable maximum chunk size. */
         [[nodiscard]] std::size_t chunkCapacityBytes() const noexcept
         {
@@ -168,6 +177,8 @@ namespace llaminar2
         void seekNextNonEmptyRegion() noexcept;
 
         std::size_t chunk_capacity_bytes_ = 0;
+        std::optional<CodedGpuProjectionRelayLayouts> coded_layouts_;
+        std::uint32_t next_unit_ = 0;
         std::array<std::size_t, 4> region_bytes_{};
         std::array<std::size_t, 4> element_bytes_{};
         std::optional<ExpertTierWeightProjectionIntersection> intersection_;
@@ -395,6 +406,18 @@ namespace llaminar2
             return !hasInFlightWork();
         }
 
+        /**
+         * @brief Check the same storage and geometry contract used by start, before reserving work.
+         * @param source Published native source projection.
+         * @param destination Inactive native destination projection.
+         * @param intersection Original ownership intersection covered by the relay.
+         * @param error Receives a format, capacity or backend diagnostic on failure.
+         * @return Whether this lane admits the native transfer protocol.
+         */
+        [[nodiscard]] bool accepts(const GpuExpertPackedDescriptor &source,
+            const GpuExpertPackedDescriptor &destination,
+            const ExpertTierWeightProjectionIntersection &intersection, std::string *error = nullptr) const noexcept;
+
         /** @return Exact payload quote retained by the bound production protocol, independent of observed counters. */
         [[nodiscard]] std::size_t quotedPayloadBytes() const noexcept
         { return protocol_.totalBytes(); }
@@ -418,6 +441,15 @@ namespace llaminar2
         }
 
     private:
+        friend struct test::ExpertTierGpuBlobRelayFixtureAccess;
+        /** @brief Fixture-only equivalent endpoints exercise the identical retained no-peer relay. */
+        ExpertTierGpuBlobTransferLane(Config config, bool fixture_same_cuda_device);
+
+        /** @brief Authenticate backend and original plane geometry through the single relay cursor. */
+        bool bindNativeProtocol(ExpertTierGpuBlobChunkProtocol &protocol, const GpuExpertPackedDescriptor &source,
+            const GpuExpertPackedDescriptor &destination, const ExpertTierWeightProjectionIntersection &intersection,
+            std::string *error) const noexcept;
+
         /** @brief State of one reusable double-buffer slot. */
         enum class SlotPhase : std::uint8_t
         {

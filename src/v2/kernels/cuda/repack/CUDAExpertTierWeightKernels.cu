@@ -189,6 +189,14 @@ namespace llaminar2
             nativeSingleScaleUnitsCUDAUnit<ToCpu>(source, destination, wire_in, wire_out, layout, first_unit, blockIdx.x);
         }
 
+        /** @brief Update only the live code bits at a possibly unaligned pooled plane address. */
+        __device__ __forceinline__ void storeResidentCode(void *plane, size_t bit, unsigned width, uint32_t code)
+        {
+            const auto address = reinterpret_cast<uintptr_t>(plane);
+            native_quantised_superblock::storePackedBits(reinterpret_cast<void *>(address & ~uintptr_t{3}),
+                bit + (address & 3u) * 8, width, code);
+        }
+
         /**
          * @brief Transpose one live coded CPU wire unit and its GPU plane coordinates.
          *
@@ -263,11 +271,7 @@ namespace llaminar2
                 else
                 {
                     const auto code = expertTierLoadCodedColumn(cpu_source + metadata, planes, columns, column);
-                    const auto byte_address = reinterpret_cast<uintptr_t>(destination.scales);
-                    // A pooled descriptor may point to an interior, unaligned
-                    // byte. Align the atomic word down and preserve other bits.
-                    sb::storePackedBits(reinterpret_cast<void *>(byte_address & ~uintptr_t{3}),
-                        address.linear * code_bits + bit_shift + (byte_address & 3u) * 8, code_bits, code);
+                    storeResidentCode(destination.scales, address.linear * code_bits + bit_shift, code_bits, code);
                 }
             }
             const auto wire = layout.cpuStorage().wireGeometry(columns);
@@ -656,7 +660,7 @@ namespace llaminar2
                 // host layout. These device checks protect the dynamic loop;
                 // exact word complements cover its immutable format metadata.
                 const bool coded = layout.cpuStorage().coded();
-                if (!description.device_staging || !description.scales ||
+                if ((!description.device_staging && !coded) || !description.scales ||
                     ((coded || layout.gpu_is_asymmetric) && !description.mins) ||
                     (!coded && layout.gpu_has_emins && !description.emins) ||
                     layout.N <= 0 || layout.K <= 0 || layout.K % 32 != 0 ||
@@ -745,8 +749,9 @@ namespace llaminar2
             {
                 const auto &description = work(command);
                 const auto &layout = description.layout;
-                auto *chunk = reinterpret_cast<std::uint8_t *>(description.device_staging);
                 const bool to_cpu = description.kind == MappedTransferWorkKind::PackedGpuToCpu;
+                auto *chunk = reinterpret_cast<std::uint8_t *>(description.device_staging ? description.device_staging :
+                    (to_cpu ? command.destination_address : command.source_address));
                 const auto gpu_address = to_cpu ? command.source_address : command.destination_address;
                 ExpertTierGpuConstProjectionView source{};
                 source.payload = reinterpret_cast<const std::uint8_t *>(gpu_address);
@@ -859,7 +864,7 @@ namespace llaminar2
                 const auto units=available_units<batch_units?available_units:batch_units;
                 const auto count = expertTierWireOffset(layout, first, units);
                 auto *staging = reinterpret_cast<unsigned char *>(description.device_staging);
-                if (description.kind == MappedTransferWorkKind::PackedCpuToGpu)
+                if (staging && description.kind == MappedTransferWorkKind::PackedCpuToGpu)
                     copy(staging + position, source + position, count);
                 __syncthreads();
                 const auto unit_groups = blockDim.x / kColumnsPerUnit;
@@ -874,7 +879,7 @@ namespace llaminar2
                     convertUnit(command, static_cast<std::uint32_t>(unit), active);
                     __syncthreads();
                 }
-                if (description.kind == MappedTransferWorkKind::PackedGpuToCpu)
+                if (staging && description.kind == MappedTransferWorkKind::PackedGpuToCpu)
                     copy(destination + position, staging + position, count);
                 return count;
             }
@@ -903,10 +908,8 @@ namespace llaminar2
             if (bit >= bits)
                 return;
             const auto width = static_cast<unsigned>(bits - bit < 8 ? bits - bit : 8);
-            const auto address = reinterpret_cast<uintptr_t>(destination);
-            auto *word = reinterpret_cast<void *>(address & ~uintptr_t{3});
             const auto value = sb::loadPackedBits(source, bit + source_shift, width);
-            sb::storePackedBits(word, bit + destination_shift + (address & 3u) * 8, width, value);
+            storeResidentCode(destination, bit + destination_shift, width, value);
         }
         /** @brief Copy one live block; only the first live block of each source superblock writes its header. */
         __global__ void copyCodedPeerRectangleCUDA(CUDACodedPeerProjectionRectangle r)
@@ -928,10 +931,8 @@ namespace llaminar2
             {
                 const auto src_bit = from.linear * bits + nativeQuantisedLayoutCodeBitShift(r.source.metadata_layout);
                 const auto code = sb::loadPackedBits(reinterpret_cast<const uint8_t *>(r.source.scales), src_bit, bits);
-                const auto address = reinterpret_cast<uintptr_t>(r.destination.scales);
-                auto *aligned = reinterpret_cast<void *>(address & ~uintptr_t{3});
-                const auto dst_bit = to.linear * bits + nativeQuantisedLayoutCodeBitShift(r.destination.metadata_layout) + (address & 3u) * 8;
-                sb::storePackedBits(aligned, dst_bit, bits, code);
+                const auto dst_bit = to.linear * bits + nativeQuantisedLayoutCodeBitShift(r.destination.metadata_layout);
+                storeResidentCode(r.destination.scales, dst_bit, bits, code);
             }
             if (kb == 0 || sb::superblockPhase(r.src_block + kb + nativeQuantisedLayoutPhase(r.source.metadata_layout)) == 0)
             {

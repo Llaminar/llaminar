@@ -357,6 +357,26 @@ namespace llaminar2
     [[nodiscard]] ExpertTierWeightDeviceLayout remoteCpuProjectionDeviceLayout(
         const MoEOverlayRemoteProjectionManifest &manifest);
 
+    /** @brief One exact compact wire with independently phased GPU roots. */
+    struct CodedGpuProjectionRelayLayouts
+    {
+        ExpertTierWeightDeviceLayout pack;
+        ExpertTierWeightDeviceLayout unpack;
+    };
+
+    /**
+     * @brief Bind the local host relay to the same coded wire geometry as the MPI relay.
+     * @param source Original GPU source descriptor.
+     * @param destination Original GPU destination descriptor, including its bit placement.
+     * @param intersection Equal original-coordinate extent of both roots.
+     * @param capacity Retained pinned bytes per relay slot.
+     * @return Matching wire units with independent source/destination GPU coordinates.
+     * @throws std::invalid_argument For incompatible formats or insufficient capacity.
+     */
+    [[nodiscard]] CodedGpuProjectionRelayLayouts makeCodedGpuProjectionRelayLayouts(
+        const GpuExpertPackedDescriptor &source, const GpuExpertPackedDescriptor &destination,
+        const ExpertTierWeightProjectionIntersection &intersection, std::uint32_t capacity);
+
     /**
      * @brief Recover one endpoint's CUDA repack layout for authenticated coded GPU relay.
      * @param manifest Complete two-CUDA endpoint manifest carrying compact source-coded units.

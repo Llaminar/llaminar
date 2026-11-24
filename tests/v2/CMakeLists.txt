@@ -12549,6 +12549,12 @@ add_v2_test(V2_Integration_CUDA_CodedShadowSlotRootPhase
     LABELS "V2;Integration;ProductionTestPreflight;CUDA;MoE;ExpertOverlay;Transfer;ByteExact;Regression"
     MPI_PROCS 1 NO_MODELS TIMEOUT 30)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDA_CodedShadowSlotRootPhase)
+add_v2_test(V2_Integration_CUDA_CodedNoPeerHostRelay
+    COMMAND $<TARGET_FILE:v2_integration_cuda_expert_tier_weight_kernels>
+        --gtest_filter=CUDAExpertTierWeightKernelsTest.CodedNoPeerHostRelayPreservesAllSourcePlanes
+    LABELS "V2;Integration;ProductionTestPreflight;CUDA;MoE;ExpertOverlay;Transfer;ByteExact;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDA_CodedNoPeerHostRelay)
 add_v2_test(V2_Integration_CUDA_CodedExpertRelay_MPI
     COMMAND $<TARGET_FILE:v2_integration_cuda_expert_tier_weight_kernels>
         --gtest_filter=CUDAExpertTierWeightKernelsTest.CodedMpiRelayPreservesOriginalGpuPlanes

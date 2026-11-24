@@ -133,8 +133,8 @@ namespace llaminar2
          * @param layout Canonical authenticated conversion geometry.
          * @param first_unit First complete CPU unit in the projection.
          * @param unit_count Complete units covered by this command.
-         * @param device_staging This lane's exclusive, already-owned scratch region.
-         * @param staging_capacity Exact capacity of that scratch region.
+         * @param device_staging Exclusive device scratch, or null to pack coded units directly in the mapped slot.
+         * @param staging_capacity Exact device scratch capacity, or zero when the mapped slot owns the wire.
          * @param dependency Exact source producer, or an already-published bank.
          * @return The generation whose receipt covers both conversion and copying.
          */
@@ -151,8 +151,8 @@ namespace llaminar2
          * @param layout Canonical authenticated conversion geometry.
          * @param first_unit First complete CPU unit in the projection.
          * @param unit_count Complete received units covered by this command.
-         * @param device_staging This lane's exclusive, already-owned scratch region.
-         * @param staging_capacity Exact capacity of that scratch region.
+         * @param device_staging Exclusive device scratch, or null to pack coded units directly in the mapped slot.
+         * @param staging_capacity Exact device scratch capacity, or zero when the mapped slot owns the wire.
          * @return The generation whose receipt covers both copying and conversion.
          */
         std::uint64_t publishPackedMappedHostToDevice(

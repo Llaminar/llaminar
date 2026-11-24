@@ -354,10 +354,11 @@ namespace llaminar2
             throw std::logic_error("Packed transfer requires an idle CUDA service slot");
         if (!source.validFor(layout) ||
             layout.direction != ExpertTierWeightConversionDirection::GpuToCpu ||
-            !device_staging || unit_count == 0u || first_unit >= layout.unit_count ||
+            (!device_staging && (!layout.cpuStorage().coded() || staging_capacity != 0u)) ||
+            unit_count == 0u || first_unit >= layout.unit_count ||
             unit_count > layout.unit_count - first_unit ||
             unit_count > layout.maximum_units_per_chunk ||
-            staging_capacity < layout.chunkBytes(unit_count,first_unit))
+            (device_staging && staging_capacity < layout.chunkBytes(unit_count,first_unit)))
             throw std::invalid_argument("Packed download exceeds its authenticated geometry or staging");
         if (next_generation_ == std::numeric_limits<std::uint64_t>::max())
             throw std::overflow_error("Packed transfer slot generation overflowed");
@@ -388,10 +389,11 @@ namespace llaminar2
             throw std::logic_error("Packed transfer requires an idle CUDA service slot");
         if (!destination.validFor(layout) ||
             layout.direction != ExpertTierWeightConversionDirection::CpuToGpu ||
-            !device_staging || unit_count == 0u || first_unit >= layout.unit_count ||
+            (!device_staging && (!layout.cpuStorage().coded() || staging_capacity != 0u)) ||
+            unit_count == 0u || first_unit >= layout.unit_count ||
             unit_count > layout.unit_count - first_unit ||
             unit_count > layout.maximum_units_per_chunk ||
-            staging_capacity < layout.chunkBytes(unit_count,first_unit))
+            (device_staging && staging_capacity < layout.chunkBytes(unit_count,first_unit)))
             throw std::invalid_argument("Packed upload exceeds its authenticated geometry or staging");
         if (next_generation_ == std::numeric_limits<std::uint64_t>::max())
             throw std::overflow_error("Packed transfer slot generation overflowed");

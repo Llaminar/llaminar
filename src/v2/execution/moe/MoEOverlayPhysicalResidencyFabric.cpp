@@ -1935,6 +1935,12 @@ namespace llaminar2
                     throw std::runtime_error(
                         "ExpertOverlay admitted GPU host-relay wave exhausted its pre-materialized parallel lane pool");
                 }
+                std::string error;
+                if (!lane_->lane()->accepts(source_, destination_, intersection_, &error))
+                {
+                    lane_->release(this);
+                    throw std::invalid_argument("ExpertOverlay cannot reserve GPU host-relay projection: " + error);
+                }
                 owns_lane_ = true;
             }
 
@@ -3570,7 +3576,7 @@ namespace llaminar2
             if (a.ptrs.d_vnni != b.ptrs.d_vnni || a.ptrs.d_scales != b.ptrs.d_scales ||
                 a.ptrs.d_mins != b.ptrs.d_mins || a.ptrs.d_emins != b.ptrs.d_emins || a.n != b.n || a.k != b.k ||
                 a.blocks_per_row != b.blocks_per_row || a.codebook_id != b.codebook_id ||
-                a.payload_bytes_per_block != b.payload_bytes_per_block || a.is_asymmetric != b.is_asymmetric ||
+                a.metadata_layout != b.metadata_layout || a.payload_bytes_per_block != b.payload_bytes_per_block || a.is_asymmetric != b.is_asymmetric ||
                 a.has_emins != b.has_emins || a.vnni_bytes != b.vnni_bytes || a.scales_bytes != b.scales_bytes ||
                 a.mins_bytes != b.mins_bytes || a.emins_bytes != b.emins_bytes)
                 throw std::invalid_argument("Physical pieces disagree on one final GPU role allocation/encoding");

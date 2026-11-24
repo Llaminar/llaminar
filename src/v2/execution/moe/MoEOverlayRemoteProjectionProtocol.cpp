@@ -179,15 +179,14 @@ namespace llaminar2
             return manifest;
         }
 
-        /** @brief Populate fields shared by every physical packing. */
-        MoEOverlayRemoteProjectionManifest baseManifest(
-            const MoEOverlayRemoteProjectionIdentity &identity,
+        /** @brief Populate native geometry independently of the transport's transaction identity. */
+        MoEOverlayRemoteProjectionManifest nativeManifestGeometry(
             NativeQuantisedSourceIdentity source_identity,
             int N,
             int K,
             std::uint32_t maximum_chunk_bytes)
         {
-            if (!identity.valid() || !source_identity.present || N <= 0 || N > std::numeric_limits<int32_t>::max() - 63 ||
+            if (!source_identity.present || N <= 0 || N > std::numeric_limits<int32_t>::max() - 63 ||
                 K <= 0 || (K % 32) != 0 || maximum_chunk_bytes == 0)
             {
                 throw std::invalid_argument(
@@ -204,7 +203,6 @@ namespace llaminar2
 
             MoEOverlayRemoteProjectionManifest manifest;
             manifest.format_kind = ExpertWeightFormatKind::NativeQuantised;
-            manifest.identity = identity;
             manifest.N = N;
             manifest.K = K;
             manifest.N_padded = ((N + 63) / 64) * 64;
@@ -226,6 +224,18 @@ namespace llaminar2
                     manifest.cpu_is_asymmetric != 0,
                     manifest.cpu_codebook_id));
             manifest.maximum_chunk_bytes = maximum_chunk_bytes;
+            return manifest;
+        }
+
+        /** @brief Author network geometry only for an authenticated transaction identity. */
+        MoEOverlayRemoteProjectionManifest baseManifest(
+            const MoEOverlayRemoteProjectionIdentity &identity,
+            NativeQuantisedSourceIdentity source, int n, int k, std::uint32_t capacity)
+        {
+            if (!identity.valid())
+                throw std::invalid_argument("Remote ExpertOverlay projection has an invalid transaction identity");
+            auto manifest = nativeManifestGeometry(source, n, k, capacity);
+            manifest.identity = identity;
             return manifest;
         }
 
@@ -1070,6 +1080,44 @@ namespace llaminar2
                 "Remote CPU/GPU projection fields do not form a supported device repack layout");
         }
         return layout;
+    }
+
+    CodedGpuProjectionRelayLayouts makeCodedGpuProjectionRelayLayouts(
+        const GpuExpertPackedDescriptor &source, const GpuExpertPackedDescriptor &destination,
+        const ExpertTierWeightProjectionIntersection &intersection, std::uint32_t capacity)
+    {
+        if (!source.valid() || !destination.valid() || !source.metadata_layout || !destination.metadata_layout ||
+            source.codebook_id != destination.codebook_id ||
+            source.payload_bytes_per_block != destination.payload_bytes_per_block ||
+            source.is_asymmetric != destination.is_asymmetric || source.has_emins != destination.has_emins ||
+            source.n != intersection.source().rows || source.k != intersection.source().columns ||
+            destination.n != intersection.destination().rows || destination.k != intersection.destination().columns ||
+            source.blocks_per_row != static_cast<unsigned>(source.k / 32) ||
+            destination.blocks_per_row != static_cast<unsigned>(destination.k / 32))
+            throw std::invalid_argument("Coded GPU relay requires matching original projection roots and formats");
+
+        // For coded representations, the physical codebook uniquely names a
+        // source; e.g. source IQ4_XS is physical 24 rather than ordinary IQ4_NL.
+        const auto &catalog = native_quantised_formats::kAllSourceFormats;
+        const auto found = std::find_if(catalog.begin(), catalog.end(), [&](const auto &entry) {
+            return cpu::native_quantised::migrationUsesSuperblockCodes(*entry.metadata) &&
+                canonicalDeviceVnniCodebookId(*entry.metadata) == source.codebook_id;
+        });
+        if (found == catalog.end())
+            throw std::invalid_argument("Coded GPU relay physical codebook has no original source encoding");
+        auto manifest = nativeManifestGeometry(
+            {.codebook_id = found->metadata->codebook_id, .is_superblock = found->metadata->is_superblock, .present = true},
+            intersection.rows(), intersection.columns(), capacity);
+        manifest.source_projection = intersection.source();
+        manifest.destination_projection = intersection.destination();
+        manifest.gpu_codebook_id = source.codebook_id;
+        manifest.gpu_payload_bytes_per_block = source.payload_bytes_per_block;
+        manifest.gpu_is_asymmetric = source.is_asymmetric;
+        manifest.gpu_has_emins = source.has_emins;
+        return {
+            .pack = codedGpuRelayLayout(manifest, ExpertTierWeightConversionDirection::GpuToCpu),
+            .unpack = codedGpuRelayLayout(manifest, ExpertTierWeightConversionDirection::CpuToGpu),
+        };
     }
 
     ExpertTierWeightDeviceLayout remoteCodedGpuProjectionDeviceLayout(
