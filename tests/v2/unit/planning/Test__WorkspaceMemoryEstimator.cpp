@@ -52,6 +52,7 @@
 #include <array>
 #include <climits>
 #include <stdexcept>
+#include <string_view>
 #include <utility>
 
 using namespace llaminar2;
@@ -200,9 +201,17 @@ TEST(Test__WorkspaceMemoryEstimator, CPUDownTransformUsesCanonicalShapeAndSerial
                 geometry.shard_index = shard;
                 const size_t width = size_t(4096 / shards) + (shard < 4096 % shards ? 1u : 0u);
                 auto requirements = cpuSwiGLUWorkspaceRequirements(31, width);
-                requirements.merge(CPUProjectionWorkspaceContract::sourceNative(format,
-                    {.rows = 31, .n = profile.d_model, .k = static_cast<int>(width),
-                     .workers = geometry.device_compute_units, .execution = geometry.cpu_execution}));
+                // Recompute the projection bank independently of the contract the
+                // estimator consumes. Quantized sources borrow one Q8 row bank:
+                // 31 rows x ceil(width / 32) blocks x 36 B.
+                if (std::string_view(format) == "Q4_K" || std::string_view(format) == "IQ2_S")
+                    requirements.buffers.push_back({kCPUProjectionQ8, 31 * ((width + 31) / 32) * sizeof(Q8_1Block), 64});
+                // 2*N*K stays below the 16M-FLOP split threshold, so K is never
+                // partitioned. Only Q4_K has an x86 panel: 31 rows >= 16 and 8
+                // AVX-512 strips >= one worker, every shard has >= 8 K blocks, and
+                // no carry: 8 K blocks x (8 dot + 2 factor) vectors x 16 lanes x 4 B.
+                if (std::string_view(format) == "Q4_K")
+                    requirements.buffers.push_back({kCPUProjectionPartials, 8 * (8 + 2) * 16 * sizeof(float), 64});
                 EXPECT_EQ(WorkspaceMemoryEstimator::estimate(profile, geometry) - empty,
                     requirements.total_bytes_with_alignment()) << format << " shard=" << shard << '/' << shards;
             }
@@ -245,11 +254,20 @@ TEST(Test__WorkspaceMemoryEstimator, CPUSparseFollowerAdmitsInvocationScratch)
             {.name = "blk.0.ffn_down_exps.weight", .quant_type = format,
              .elements = 8u * 128 * 512, .K = 512, .layer_index = 0}};
         auto requirements = cpuSwiGLUWorkspaceRequirements(2 * 15 * 3, 512);
-        for (const auto [n, k] : {std::pair{512, 128}, std::pair{128, 512}})
-            requirements.merge(CPUProjectionWorkspaceContract::sourceNative(format, {
-                .rows = 2 * 15 * 3, .n = n, .k = k, .workers = 8,
-                .execution = geometry.cpu_execution,
-                .numerical_policy = CPUProjectionNumericalPolicy::GPUAlignedExpert}));
+        // Recompute the expert projection banks independently of the contract
+        // the estimator consumes. None of these formats has an x86 panel.
+        if (std::string_view(format) != "F32" && std::string_view(format) != "F16" && std::string_view(format) != "BF16")
+        {
+            constexpr std::size_t rows = 2 * 15 * 3;
+            // The wider K=512 down projection sizes the shared Q8 bank: 16 blocks x 36 B per row.
+            requirements.buffers.push_back({kCPUProjectionQ8, rows * 16 * sizeof(Q8_1Block), 64});
+            // GPU-aligned ordered K partitions keep one 64-column FP32 partial
+            // per (row, N chunk, partition): gate/up have 8 chunks x 4
+            // partitions (K=128) and down has 2 chunks x 16 partitions (K=512),
+            // 32 vectors per row either way. Both exceed seven idle workers x
+            // four-row tiles x 64 columns x partitions, so the serial bank sizes the slab.
+            requirements.buffers.push_back({kCPUProjectionPartials, rows * 32 * 64 * sizeof(float), 64});
+        }
         EXPECT_EQ(WorkspaceMemoryEstimator::estimateRoutedExpertParticipant(profile, geometry),
             requirements.total_bytes_with_alignment()) << format;
     }
