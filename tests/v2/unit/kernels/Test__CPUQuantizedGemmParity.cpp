@@ -780,8 +780,8 @@ namespace
      * @brief Prove cache tiling uses prepared bytes, encoding, depth, and topology.
      *
      * A fixed injected 1 MiB, 16-way L2 makes every expected block count
-     * deterministic. The cases cover all five physical prepared footprints,
-     * the shallow/deep native-Q6 transition, and odd winning tile lengths that
+     * deterministic. The cases cover symmetric/asymmetric nibble and INT8,
+     * file-density Q5, the shallow/deep native-Q6 transition, and odd tile lengths that
      * must not be rounded to an invented cross-block alignment.
      */
     TEST(CPUQuantizedGemmParityRegression, PrefillTileGeometryUsesExactPreparedFootprint)
@@ -804,9 +804,13 @@ namespace
         const NativeQuantisedPreparedFootprint nibble_asymmetric_footprint =
             preparedFootprintForFormat(/*Q4_1=*/5, true);
         const NativeQuantisedPreparedFootprint expanded_symmetric_footprint =
-            preparedFootprintForFormat(/*Q5_0=*/6, false);
+            preparedFootprintForFormat(native_quantised_formats::Q4_0, /*rotation_enabled=*/true);
+        // Retain a synthetic expanded minimum as a distinct physical cache case;
+        // the ordinary Q5 sources now choose compact five-bit payloads below.
         const NativeQuantisedPreparedFootprint expanded_asymmetric_footprint =
-            preparedFootprintForFormat(/*Q5_1=*/7, true);
+            preparedFootprintForFormat(/*expanded codebook=*/7, true);
+        const auto q5_symmetric_footprint = preparedFootprintForFormat(native_quantised_formats::Q5_0);
+        const auto q5_asymmetric_footprint = preparedFootprintForFormat(native_quantised_formats::Q5_1);
         const NativeQuantisedPreparedFootprint q6_footprint =
             preparedFootprintForFormat(/*Q6_K=*/8, false);
 
@@ -881,12 +885,28 @@ namespace
         const NativeQuantisedTileConfig q6_deep = computeTileConfig(
             N, K, M, q6_footprint, threads, cache);
 
-        EXPECT_EQ(nibble_symmetric.k_tile_blocks, 181);
-        EXPECT_EQ(nibble_asymmetric.k_tile_blocks, 165);
-        EXPECT_EQ(expanded_symmetric.k_tile_blocks, 103);
-        EXPECT_EQ(expanded_asymmetric.k_tile_blocks, 97);
-        EXPECT_EQ(q6_shallow.k_tile_blocks, 65);
-        EXPECT_EQ(q6_deep.k_tile_blocks, 395);
+        // Compute the expected capacity independently from the two live rows:
+        // one reserved L2 way, two outputs, and two activation blocks per K unit.
+        const auto blocksIn = [&](const NativeQuantisedPreparedFootprint &footprint, std::uint64_t budget) {
+            return (budget - 2u * footprint.output_bytes_per_row_n_chunk) /
+                   (footprint.weight_bytes_per_n_chunk_k_block + 2u * footprint.activation_bytes_per_row_k_block);
+        };
+        constexpr auto usable_l2 = cache.private_l2_bytes * 15u / 16u;
+        constexpr auto default_budget = usable_l2 / 4u;
+        EXPECT_EQ(nibble_symmetric.k_tile_blocks, blocksIn(nibble_symmetric_footprint, default_budget));
+        EXPECT_EQ(nibble_asymmetric.k_tile_blocks, blocksIn(nibble_asymmetric_footprint, default_budget));
+        EXPECT_EQ(expanded_symmetric.k_tile_blocks, blocksIn(expanded_symmetric_footprint, default_budget));
+        EXPECT_EQ(expanded_asymmetric.k_tile_blocks, blocksIn(expanded_asymmetric_footprint, default_budget));
+        EXPECT_EQ(q6_shallow.k_tile_blocks, blocksIn(q6_footprint, usable_l2 / 8u));
+        EXPECT_EQ(q6_deep.k_tile_blocks, blocksIn(q6_footprint, usable_l2 * 3u / 4u));
+        for (const auto &footprint : {q5_symmetric_footprint, q5_asymmetric_footprint})
+        {
+            EXPECT_EQ(footprint.encoding, CPUNativeQuantisedEncoding::Q5NativeSingleScale);
+            const auto compact = computeTileConfig(N, K, M, footprint, threads, cache);
+            EXPECT_EQ(compact.k_tile_blocks, blocksIn(footprint, default_budget));
+            EXPECT_GT(compact.k_tile_blocks, footprint.is_asymmetric
+                ? expanded_asymmetric.k_tile_blocks : expanded_symmetric.k_tile_blocks);
+        }
 
         // Small full-K panels remain represented by zero (no tiling).
         EXPECT_EQ(

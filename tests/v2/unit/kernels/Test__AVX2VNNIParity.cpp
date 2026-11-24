@@ -1524,8 +1524,6 @@ TEST_F(AVX2VNNIParity, Q6KNativeDualScaleEncodingIsByteExactForAllRuntimeRows)
 {
     constexpr int N = 256;
     constexpr int K = 512;
-    constexpr int native_data_stride = 1536;
-    constexpr int native_block_stride = 1792;
     constexpr std::array<int, 17> runtime_rows = {
         2, 3, 4, 5, 6, 7, 8, 9,
         10, 11, 12, 13, 14, 15, 16, 17, 31};
@@ -1541,14 +1539,15 @@ TEST_F(AVX2VNNIParity, Q6KNativeDualScaleEncodingIsByteExactForAllRuntimeRows)
     EXPECT_FALSE(packed.usesNibbleLUT());
     EXPECT_FALSE(packed.usesExpandedInt8());
     EXPECT_FALSE(packed.usesInlineCompensation());
-    EXPECT_EQ(packed.data_stride, native_data_stride);
-    EXPECT_EQ(packed.interleaved_block_stride, native_block_stride);
+    ASSERT_TRUE(packed.superblockCoded());
+    const auto geometry = packed.readView().geometry();
+    EXPECT_EQ(packed.data_stride, 64u * native_quantised_formats::Q6_K.payload_bytes);
+    EXPECT_EQ(packed.interleaved_block_stride, geometry.block_stride);
     EXPECT_TRUE(packed.payload.empty());
     EXPECT_TRUE(packed.int8_flat.empty());
-    EXPECT_EQ(
-        packed.native_interleaved.size(),
-        static_cast<size_t>(packed.N_padded / 64) *
-            static_cast<size_t>(packed.blocks_per_row) * native_block_stride);
+    EXPECT_EQ(packed.native_interleaved.size(), packed.preparedBytes());
+    EXPECT_EQ(packed.preparedBytes(), geometry.matrixBytes(packed.N_padded / 64));
+    EXPECT_EQ(packed.preparedBytes(), static_cast<size_t>(N) * (K / Q6_KBlock::BLOCK_SIZE) * sizeof(Q6_KBlock));
 
     std::vector<Q8_1Block> activations(
         static_cast<size_t>(maximum_rows) * packed.blocks_per_row);

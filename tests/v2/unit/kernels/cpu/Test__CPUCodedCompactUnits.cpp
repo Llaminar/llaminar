@@ -741,7 +741,12 @@ namespace llaminar2::test
                     }
 #else
                     std::array<float, 4 * Blocks * 128> scratch{};
-                    gemm_native_quantised_preq(packed, activation.data(), output.data(), scratch, rows, N);
+                    // The ordered expert K tree remains active at M=1, but
+                    // only the serial GEMV entry admits a single live row.
+                    if (rows == 1)
+                        gemv_native_quantised_preq(packed, activation.data(), output.data(), scratch);
+                    else
+                        gemm_native_quantised_preq(packed, activation.data(), output.data(), scratch, rows, N);
 #endif
                     for (int row = 0; row < rows; ++row)
                         for (int column = 0; column < N; ++column)
