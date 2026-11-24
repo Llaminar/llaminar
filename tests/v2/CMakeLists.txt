@@ -31101,6 +31101,7 @@ if(HAVE_ROCM)
     set(V2_ROCM_EXPERT_TIER_WEIGHT_PREFLIGHT_TESTS)
     set(V2_ROCM_EXPERT_TIER_WEIGHT_GTESTS
         FileDensityPlanesRoundTripMatchesSourceNative
+        CodedShadowSlotRetainsOriginalRootPhase
         CapturedCodedPeerRectanglePreservesShiftedNeighbors
         CodedRemoteEndpointsPreserveOriginalGpuPlanes
         RectangularNativeMovementAllFormatsAndDirtyReplay
