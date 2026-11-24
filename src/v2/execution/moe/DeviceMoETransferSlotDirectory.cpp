@@ -397,45 +397,9 @@ namespace llaminar2
                 if (projection_set == DeviceMoEProjectionSet::GateUp &&
                     projection.projection == ExpertTierWeightProjection::Down)
                     continue;
-                if (projection.format.isFloating())
-                {
-                    specs.push_back({
-                        .label = projectionLabel(projection.projection),
-                        .N = projection.N,
-                        .K = projection.K,
-                        .format = projection.format,
-                    });
-                    continue;
-                }
-                const auto *source =
-                    native_quantised_formats::forSourceIdentity(
-                        projection.format.native_quantised.codebook_id,
-                        projection.format.native_quantised.is_superblock);
-                if (!source)
-                {
-                    throw std::invalid_argument(
-                        "DeviceMoETransferSlotDirectory manifest contains an uncatalogued NativeQuantised source format");
-                }
-
-                // Quote the same migration layout used by the prepared engine.
-                const auto reusable =
-                    gpuPreparedWeightPoolAllocation(*source, GPUPreparedWeightPoolLayout::MigrationReusable);
-                specs.push_back({
-                    .label = projectionLabel(projection.projection),
-                    .N = projection.N,
-                    .K = projection.K,
-                    .payload_bytes_per_block =
-                        static_cast<int>(
-                            reusable.payload_bytes_per_block),
-                    .is_asymmetric = reusable.has_mins,
-                    .has_emins = reusable.has_emins,
-                    .codebook_id =
-                        canonicalDeviceVnniCodebookId(*source),
-                    .scale_plane = nativeQuantisedScalePlaneWidth(
-                        canonicalDeviceVnniCodebookId(*source)),
-                    .format = projection.format,
-                    .gpu_superblock_phase = projection.gpuSuperblockPhase(),
-                });
+                specs.push_back(GpuExpertSlotPool::migrationProjectionSpec(
+                    projectionLabel(projection.projection), projection.N, projection.K,
+                    projection.format, projection.gpuSuperblockPhase()));
             }
             layer_formats.push_back(std::move(specs));
         }
