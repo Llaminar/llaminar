@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "tensors/NativeQuantisedFormatInfo.h"
 #include "tensors/NativeQuantisedSuperblockMetadata.h"
 
 namespace llaminar2::cpu::native_quantised
@@ -30,7 +31,7 @@ namespace llaminar2::cpu::native_quantised
      * the bytes and decode work seen by the hot kernel.
      */
     /**
-     * @brief Interpretation of the 16-bit primary scale word in CPU units.
+     * @brief Interpretation of the primary scale field in CPU units.
      *
      * Chosen from the prepared physical representation, never from the source
      * codebook alone: rotated (expanded INT8) MXFP4 keeps source codebook 25 but
@@ -38,8 +39,8 @@ namespace llaminar2::cpu::native_quantised
      */
     enum class CPUNativeQuantisedScaleEncoding : std::uint8_t
     {
-        FP16 = 0,           ///< IEEE binary16 scale (every format today).
-        PowerOfTwoBF16 = 1, ///< Native MXFP4 E8M0 as mxfp4::powerOfTwoBF16Word.
+        FP16 = 0,          ///< IEEE binary16 scale.
+        E8M0 = 1,          ///< Native MXFP4 exponent byte; 0 is the prepared zero marker.
     };
 
     enum class CPUNativeQuantisedEncoding : std::uint8_t
@@ -50,13 +51,33 @@ namespace llaminar2::cpu::native_quantised
         CompactMultiScale = 3, ///< Native payload, two scales, optional two minima.
         NibbleLUTSourceScale = 4, ///< IQ4_XS nibble payload, original half base, raw coefficient.
         IQ3SExpandedSourceScale = 5, ///< Original IQ3_S signed grid, base and raw nibble.
+        Q4KSuperblockCoded = 6, ///< Unsigned nibble payload, 12-bit code and a superblock d/dmin word.
+        Q5NativeSingleScale = 7, ///< Q5_0/Q5_1 low nibbles and fifth bits, with FP16 d and optional m.
+    };
+
+    /** @return Whether the original source uses the ordinary Q5 block, not Q5_K. */
+    [[nodiscard]] constexpr bool isQ5NativeSingleScaleSource(std::uint8_t codebook, bool superblock) noexcept
+    {
+        return !superblock && (codebook == 6 || codebook == 7);
+    }
+
+    /** @brief Q5's 16 nibble bytes plus four paired fifth-bit bytes per padded column. */
+    struct Q5NativePayload
+    {
+        static constexpr int groups = 4;
+        static constexpr int bytes = 64 * 20;
+
+        /** @return Offset of four original nibble bytes for one column and K group. */
+        static constexpr int nibbleOffset(int group, int column) noexcept { return group * 256 + column * 4; }
+        /** @return Offset of the fifth bits of groups @p group and @p group + 4 in one byte. */
+        static constexpr int fifthOffset(int group, int column) noexcept { return 1024 + column * 4 + group; }
     };
 
     /**
      * @brief Scale-word encoding of a prepared CPU unit, derived from its physical identity.
      * @param codebook_id Source codebook retained by the prepared matrix.
      * @param encoding Physical prepared encoding.
-     * @return PowerOfTwoBF16 only for MXFP4 in its native nibble encoding;
+     * @return E8M0 only for MXFP4 in its native nibble encoding;
      *         rotated (expanded INT8) MXFP4 and every other format carry FP16.
      *
      * Derived rather than stored, so no construction or import path can leave
@@ -66,7 +87,7 @@ namespace llaminar2::cpu::native_quantised
         std::uint8_t codebook_id, CPUNativeQuantisedEncoding encoding) noexcept
     {
         return codebook_id == 25 && encoding == CPUNativeQuantisedEncoding::NibbleLUT
-                   ? CPUNativeQuantisedScaleEncoding::PowerOfTwoBF16
+                   ? CPUNativeQuantisedScaleEncoding::E8M0
                    : CPUNativeQuantisedScaleEncoding::FP16;
     }
 
@@ -82,12 +103,14 @@ namespace llaminar2::cpu::native_quantised
     {
         switch (encoding)
         {
+        case CPUNativeQuantisedEncoding::Q4KSuperblockCoded:
         case CPUNativeQuantisedEncoding::NibbleLUT:
         case CPUNativeQuantisedEncoding::NibbleLUTSourceScale:
         case CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale:
         case CPUNativeQuantisedEncoding::ExpandedInt8:
         case CPUNativeQuantisedEncoding::Q6KNativeDualScale:
         case CPUNativeQuantisedEncoding::CompactMultiScale:
+        case CPUNativeQuantisedEncoding::Q5NativeSingleScale:
             return true;
         }
         return false;
@@ -106,10 +129,12 @@ namespace llaminar2::cpu::native_quantised
     {
         switch (codebook_id)
         {
+        case 7: return 20;   // Q5_K: 16 low-nibble bytes + 4 B/column in group-major bitplanes.
         case 9: case 12: return 12;  // Q3_K, IQ3_XXS
         case 13: case 14: return 9;  // IQ2_S, IQ2_XS
         case 10: case 15: return 8;  // Q2_K, IQ2_XXS
         case 16: case 17: return 6;  // IQ1_S, IQ1_M
+        case 11: return 13;  // IQ3_S: eight indices, one high-bit byte and four sign bytes.
         default: return 0;
         }
     }
@@ -120,10 +145,12 @@ namespace llaminar2::cpu::native_quantised
      * Whole 32-bit payload words are stored as `[word][64 columns]` (256 bytes
      * per word, as before); the remaining 1 or 2 bytes form one narrower
      * plane `[64 columns][tail]` that loads zero-extended into the same lane.
+     * Q5_K has four whole low-nibble words; its remaining 256 bytes are eight
+     * 32-byte high-bit planes, not a fifth word or a column-tail plane.
      */
     [[nodiscard]] constexpr std::uint32_t preparedCompactPayloadWords(int codebook_id) noexcept
     {
-        return preparedCompactPayloadBytes(codebook_id) / 4u;
+        return codebook_id == 7 ? 4u : preparedCompactPayloadBytes(codebook_id) / 4u;
     }
     /** @return Bytes per column of the narrower payload tail plane (0, 1 or 2). */
     [[nodiscard]] constexpr std::uint32_t preparedCompactPayloadTailBytes(int codebook_id) noexcept
@@ -136,6 +163,41 @@ namespace llaminar2::cpu::native_quantised
         return native_quantised_superblock::superblockCodePlaneBits(static_cast<std::uint8_t>(codebook_id));
     }
 
+#if defined(__CUDACC__) || defined(__HIPCC__)
+#define LLAMINAR_CPU_BLOCK_GEOMETRY_HD __host__ __device__
+#else
+#define LLAMINAR_CPU_BLOCK_GEOMETRY_HD
+#endif
+    /**
+     * @brief Physical superblock-coded metadata codebook of a prepared encoding.
+     *
+     * Most encodings use their source codebook directly as the codec's physical
+     * codebook (code plane width and `d`/`dmin` field bytes). IQ4_XS source-scale
+     * units are the exception: the source codebook is 4 (IQ4_NL payload), but the
+     * superblock codec's six-bit `ls` and single `d` fields use the IQ4_XS
+     * source-scale physical codebook 24 (kNativeQuantisedIQ4XSSourceScaleCodebook).
+     * @param encoding Physical prepared encoding.
+     * @param codebook_id Source codebook retained by the prepared matrix.
+     * @return Codebook passed to NativeQuantisedSuperblockMetadata for this unit.
+     */
+    [[nodiscard]] constexpr std::uint8_t superblockMetadataCodebook(
+        CPUNativeQuantisedEncoding encoding, int codebook_id) noexcept
+    {
+        return encoding == CPUNativeQuantisedEncoding::NibbleLUTSourceScale
+                   ? kNativeQuantisedIQ4XSSourceScaleCodebook
+                   : static_cast<std::uint8_t>(codebook_id);
+    }
+
+    /** @brief Offset of the first code plane in a superblock-coded CPU unit.
+     * @param data_stride Bytes of payload per 64-column unit.
+     * @return Byte offset relative to the admitted block; no column sums precede it.
+     */
+    [[nodiscard]] constexpr std::uint32_t preparedCodedPlaneOffset(
+        CPUNativeQuantisedEncoding, std::uint32_t data_stride) noexcept
+    {
+        return data_stride;
+    }
+
     /**
      * @brief Whether an encoding stores superblock-coded metadata.
      *
@@ -144,20 +206,24 @@ namespace llaminar2::cpu::native_quantised
      * superblock header follows the last block of each source superblock;
      * see CPUNativeQuantisedBlockGeometry.
      */
-    [[nodiscard]] constexpr bool preparedSuperblockCoded(CPUNativeQuantisedEncoding encoding) noexcept
+    [[nodiscard]] LLAMINAR_CPU_BLOCK_GEOMETRY_HD constexpr bool preparedSuperblockCoded(CPUNativeQuantisedEncoding encoding) noexcept
     {
-        return encoding == CPUNativeQuantisedEncoding::CompactMultiScale;
+        return encoding == CPUNativeQuantisedEncoding::CompactMultiScale ||
+               encoding == CPUNativeQuantisedEncoding::Q6KNativeDualScale ||
+               encoding == CPUNativeQuantisedEncoding::NibbleLUTSourceScale ||
+               encoding == CPUNativeQuantisedEncoding::Q4KSuperblockCoded;
     }
 
     /**
      * @brief Header bytes after each 64-column superblock unit (0 for per-block encodings).
-     * @return 64 columns x the superblock word (`d`, or `d | dmin << 16` for Q2_K).
+     * @return 64 columns x the superblock word (`d`, or `d | dmin << 16` for Q2_K and Q5_K).
      */
     [[nodiscard]] constexpr std::uint32_t preparedSuperblockHeaderBytes(
         CPUNativeQuantisedEncoding encoding, int codebook_id) noexcept
     {
         return preparedSuperblockCoded(encoding)
-            ? 64u * native_quantised_superblock::superblockFieldBytes(static_cast<std::uint8_t>(codebook_id))
+            ? 64u * native_quantised_superblock::superblockFieldBytes(
+                       superblockMetadataCodebook(encoding, codebook_id))
             : 0u;
     }
 
@@ -183,28 +249,34 @@ namespace llaminar2::cpu::native_quantised
         std::size_t phase = 0;          ///< First block's position in its source superblock (0..7).
 
         /** @return Superblock headers per chunk row (0 for per-block encodings). */
-        [[nodiscard]] constexpr std::size_t superblocksPerRow() const noexcept
+        [[nodiscard]] LLAMINAR_CPU_BLOCK_GEOMETRY_HD constexpr std::size_t superblocksPerRow() const noexcept
         {
             return header_bytes ? (blocks_per_row + phase + 7) / 8 : 0;
         }
         /** @return Bytes of one complete chunk row. */
-        [[nodiscard]] constexpr std::size_t rowBytes() const noexcept
+        [[nodiscard]] LLAMINAR_CPU_BLOCK_GEOMETRY_HD constexpr std::size_t rowBytes() const noexcept
         {
             return blocks_per_row * block_stride + superblocksPerRow() * header_bytes;
         }
         /** @return Offset of block @p block of chunk row @p chunk. */
-        [[nodiscard]] constexpr std::size_t blockOffset(std::size_t chunk, std::size_t block) const noexcept
+        [[nodiscard]] LLAMINAR_CPU_BLOCK_GEOMETRY_HD constexpr std::size_t blockOffset(std::size_t chunk, std::size_t block) const noexcept
         {
             const std::size_t headers = header_bytes ? (block + phase) / 8 : 0;
             return chunk * rowBytes() + block * block_stride + headers * header_bytes;
         }
         /** @return Whether @p block is the last block of its superblock inside the row. */
-        [[nodiscard]] constexpr bool closesSuperblock(std::size_t block) const noexcept
+        [[nodiscard]] LLAMINAR_CPU_BLOCK_GEOMETRY_HD constexpr bool closesSuperblock(std::size_t block) const noexcept
         {
             return header_bytes && (block + 1 == blocks_per_row || (block + phase) % 8 == 7);
         }
+        /** @return Exclusive logical end of the source superblock serving @p block, including a ragged tail. */
+        [[nodiscard]] constexpr std::size_t superblockEnd(std::size_t block) const noexcept
+        {
+            const std::size_t end = ((block + phase) / 8 + 1) * 8 - phase;
+            return end < blocks_per_row ? end : blocks_per_row;
+        }
         /** @return Offset of the header serving block @p block of chunk row @p chunk. */
-        [[nodiscard]] constexpr std::size_t headerOffset(std::size_t chunk, std::size_t block) const noexcept
+        [[nodiscard]] LLAMINAR_CPU_BLOCK_GEOMETRY_HD constexpr std::size_t headerOffset(std::size_t chunk, std::size_t block) const noexcept
         {
             const std::size_t superblock = (block + phase) / 8;
             const std::size_t last_end = superblock * 8 + 8 - phase; // one past the superblock's last block
@@ -212,11 +284,13 @@ namespace llaminar2::cpu::native_quantised
             return chunk * rowBytes() + end * block_stride + superblock * header_bytes;
         }
         /** @return Bytes of @p chunks complete chunk rows. */
-        [[nodiscard]] constexpr std::size_t matrixBytes(std::size_t chunks) const noexcept
+        [[nodiscard]] LLAMINAR_CPU_BLOCK_GEOMETRY_HD constexpr std::size_t matrixBytes(std::size_t chunks) const noexcept
         {
             return chunks * rowBytes();
         }
     };
+
+#undef LLAMINAR_CPU_BLOCK_GEOMETRY_HD
 
     /**
      * @brief Return the pure weight-data bytes in one prepared CPU unit.
@@ -230,18 +304,45 @@ namespace llaminar2::cpu::native_quantised
     {
         switch (encoding)
         {
+        case CPUNativeQuantisedEncoding::Q4KSuperblockCoded:
         case CPUNativeQuantisedEncoding::NibbleLUT:
         case CPUNativeQuantisedEncoding::NibbleLUTSourceScale:
             return 1024;
         case CPUNativeQuantisedEncoding::CompactMultiScale:
-            return preparedCompactPayloadWords(codebook_id) * 256u + preparedCompactPayloadTailBytes(codebook_id) * 64u;
+            return preparedCompactPayloadBytes(codebook_id) * 64u;
         case CPUNativeQuantisedEncoding::ExpandedInt8:
         case CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale:
             return 2048;
         case CPUNativeQuantisedEncoding::Q6KNativeDualScale:
             return 1536;
+        case CPUNativeQuantisedEncoding::Q5NativeSingleScale:
+            return Q5NativePayload::bytes;
         }
         return 0;
+    }
+
+    /**
+     * @brief Identify the expanded signed-Q8 units that need only payload and FP16 scale.
+     * @param encoding Physical CPU execution encoding.
+     * @param codebook_id Original source codebook for prepared CPU bytes.
+     * @return Whether the expanded unit omits its signed weight-sum plane.
+     * @details Rotation preserves the source identity and already uses the same
+     *          signed-byte payload and scale layout as ordinary Q8 preparation.
+     */
+    [[nodiscard]] constexpr bool preparedExpandedInt8OmitsCompensation(
+        CPUNativeQuantisedEncoding encoding, int codebook_id) noexcept
+    {
+        using namespace native_quantised_formats;
+        return encoding == CPUNativeQuantisedEncoding::ExpandedInt8 &&
+            (codebook_id == Q8_0.codebook_id || codebook_id == Q8_1.codebook_id || codebook_id == Q8_K.codebook_id);
+    }
+
+    /** @return Whether a block stores the legacy signed weight-sum plane. */
+    [[nodiscard]] constexpr bool preparedUsesInlineCompensation(
+        CPUNativeQuantisedEncoding encoding, int codebook_id) noexcept
+    {
+        return encoding == CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale ||
+            (encoding == CPUNativeQuantisedEncoding::ExpandedInt8 && !preparedExpandedInt8OmitsCompensation(encoding, codebook_id));
     }
 
     /**
@@ -257,18 +358,23 @@ namespace llaminar2::cpu::native_quantised
         const std::uint32_t data_stride = preparedDataStride(encoding, codebook_id);
         if (data_stride == 0)
             return 0;
-        if (encoding == CPUNativeQuantisedEncoding::NibbleLUTSourceScale)
-            return 1408;
         if (encoding == CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale)
             return 2432;
-        if (encoding == CPUNativeQuantisedEncoding::Q6KNativeDualScale)
-            return 1792;
-        // Coded compact blocks hold the exact payload and the exact-width code
-        // (64 columns x code bits); the superblock words follow each
-        // eight-block unit (preparedSuperblockHeaderBytes).
+        // Coded blocks hold the exact payload and the exact-width code plane
+        // (64 columns x code bits) inside the unit; the superblock words follow
+        // each eight-block unit (preparedSuperblockHeaderBytes).
+        if (encoding == CPUNativeQuantisedEncoding::Q6KNativeDualScale ||
+            encoding == CPUNativeQuantisedEncoding::NibbleLUTSourceScale)
+            return preparedCodedPlaneOffset(encoding, data_stride) +
+                   8u * native_quantised_superblock::superblockCodePlaneBits(superblockMetadataCodebook(encoding, codebook_id));
+        if (preparedScaleEncoding(codebook_id, encoding) == CPUNativeQuantisedScaleEncoding::E8M0)
+            return data_stride + 64u;
+        if (encoding == CPUNativeQuantisedEncoding::Q4KSuperblockCoded)
+            return data_stride + 8u * native_quantised_superblock::superblockCodePlaneBits(5);
         if (encoding == CPUNativeQuantisedEncoding::CompactMultiScale)
             return data_stride + 8u * preparedCompactCodeBits(codebook_id);
-        return data_stride + 256u + (is_asymmetric ? 128u : 0u);
+        return data_stride + (preparedUsesInlineCompensation(encoding, codebook_id) ? 128u : 0u) +
+            128u + (is_asymmetric ? 128u : 0u);
     }
 
     /**

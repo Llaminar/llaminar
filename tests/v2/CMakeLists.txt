@@ -2221,6 +2221,13 @@ add_v2_routed_expert_policy_unit(
     V2_Unit_MoEOverlayDistributedResidencyProtocol
     unit/execution/moe/Test__MoEOverlayDistributedResidencyProtocol.cpp
 )
+add_v2_test(V2_Integration_CodedGpuExpertRelayWire
+    COMMAND $<TARGET_FILE:v2_unit_moe_overlay_distributed_residency_protocol>
+        --gtest_filter=Test__MoEOverlayDistributedResidencyProtocol.CodedGpuRelayAuthenticatesExactPhasedWire
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MoE;Transfer;ByteExact;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CodedGpuExpertRelayWire)
+
 # MXFP4 remote GPU blobs carry exactly one E8M0 byte per block.
 add_v2_test(V2_Integration_MXFP4RemoteGpuProjectionPlanes
     COMMAND $<TARGET_FILE:v2_unit_moe_overlay_distributed_residency_protocol>
@@ -2669,10 +2676,14 @@ add_v2_test(V2_Unit_NativeQuantisedDispatchCache
 # Prefill task ownership is a pure geometry policy, independent of ISA or devices.
 add_executable(v2_test_native_quantised_prefill_schedule
     unit/kernels/Test__NativeQuantisedPrefillSchedule.cpp)
+target_compile_features(v2_test_native_quantised_prefill_schedule PRIVATE cxx_std_20)
 target_include_directories(v2_test_native_quantised_prefill_schedule PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/../../src/v2")
 target_link_libraries(v2_test_native_quantised_prefill_schedule PRIVATE
     GTest::gtest GTest::gtest_main)
+# The schedule includes the prepared-footprint header, whose format catalog
+# uses C++20 defaulted comparisons; this target does not inherit core's standard.
+target_compile_features(v2_test_native_quantised_prefill_schedule PRIVATE cxx_std_23)
 add_v2_test(V2_Unit_NativeQuantisedPrefillSchedule
     COMMAND $<TARGET_FILE:v2_test_native_quantised_prefill_schedule>
     LABELS "V2;Unit;CPU;NativeQuantised;Prefill;Scheduling;Regression"
@@ -3375,16 +3386,31 @@ add_v2_test(V2_Unit_PackedWeightsSerialization
     LABELS "V2;Unit;Kernels;Serialization;PackedWeights;MoE"
     MPI_PROCS 1
 )
-# Native MXFP4 tier reference: exact byte plane <-> BF16 unit words, odd counts, malformed words.
-add_v2_test(V2_Integration_MXFP4TierReferenceRoundTrip
+# Coded compact roots retain source bits in both archive and direct transfer.
+add_v2_test(V2_Integration_CPUCodedCompactPackedWeightsArchiveABI
+    COMMAND $<TARGET_FILE:v2_unit_packed_weights_serialization>
+        --gtest_filter=Test__PackedWeightsSerialization.CompactMultiScalePreservesEveryNativeMetadataBit
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;NativeQuantised;Serialization;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUCodedCompactPackedWeightsArchiveABI)
+# Q8 archives reject the retired expanded compensation plane before allocation.
+add_v2_test(V2_Integration_CPUQ8ExpandedArchiveABI
+    COMMAND $<TARGET_FILE:v2_unit_packed_weights_serialization>
+        --gtest_filter=Test__PackedWeightsSerialization.Q8ExpandedDensityRejectsLegacyCompensationPlane
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;NativeQuantised;Serialization;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUQ8ExpandedArchiveABI)
+# Native MXFP4 wire keeps the exact exponent-byte plane; GPU migration is not admitted.
+add_v2_test(V2_Integration_MXFP4CpuWireByteScale
     COMMAND $<TARGET_FILE:v2_test_expert_tier_weight_stream>
-        --gtest_filter=ExpertTierWeightStream.MXFP4NativeE8M0PlaneRoundTripsOddCountsAndRejectsMalformedWords:*EveryCpuPreparedEncoding*
+        --gtest_filter=ExpertTierWeightStream.MXFP4CpuWireKeepsOddLiveExponentBytes:*EveryCpuPreparedEncoding*
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MoE;MXFP4;Transfer;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60)
-# CPU packed-weight archive ABI 8: native MXFP4 unit scale words are BF16 powers of two.
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MXFP4CpuWireByteScale)
+# Native MXFP4 archive payload retains the original E8M0 scale bytes.
 add_v2_test(V2_Integration_MXFP4PackedWeightsArchiveABI
     COMMAND $<TARGET_FILE:v2_unit_packed_weights_serialization>
-        --gtest_filter=Test__PackedWeightsSerialization.MXFP4NativeUnitScaleWordsRoundTripAndRejectVersion7
+        --gtest_filter=Test__PackedWeightsSerialization.MXFP4NativeUnitE8M0BytesRoundTripAndRejectVersion7
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;MXFP4;Serialization;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 
@@ -7471,6 +7497,7 @@ add_executable(v2_test_native_quantised_trainer_evidence
     unit/utils/Test__NativeQuantisedTrainerEvidence.cpp
     unit/utils/Test__BenchmarkGeometrySelection.cpp
 )
+target_compile_features(v2_test_native_quantised_trainer_evidence PRIVATE cxx_std_20)
 target_include_directories(v2_test_native_quantised_trainer_evidence PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_SOURCE_DIR}
@@ -7479,6 +7506,9 @@ target_link_libraries(v2_test_native_quantised_trainer_evidence
     GTest::gtest
     GTest::gtest_main
 )
+# The probe plan reaches the prepared-footprint header (C++20 format catalog);
+# this core-free target needs the project standard explicitly.
+target_compile_features(v2_test_native_quantised_trainer_evidence PRIVATE cxx_std_23)
 add_v2_test(V2_Unit_NativeQuantisedTrainerEvidence
     COMMAND $<TARGET_FILE:v2_test_native_quantised_trainer_evidence>
     LABELS "V2;Unit;NativeQuantised;CPU;CUDA;ROCm;MTP;Trainer;Evidence;Regression"
@@ -10820,6 +10850,75 @@ add_v2_test(V2_Unit_CPUCodedCompactUnits
     LABELS "V2;Unit;CPU;DeviceFree;NativeQuantised;Memory;ByteExact;Regression"
     MPI_PROCS 1 NO_MODELS)
 
+# Q5_K and IQ3_S keep the expanded program's bytes across misaligned K-tree
+# boundaries, including grouped reuse and ragged superblock headers.
+add_v2_test(V2_Integration_CPUCodedQ5KIQ3SProjection
+    COMMAND $<TARGET_FILE:v2_unit_cpu_coded_compact_units>
+        --gtest_filter=CPUCodedCompactUnits.Q5KIQ3SPreserveExpandedOutputs
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;NativeQuantised;ByteExact;Regression"
+    MPI_PROCS 1 NO_MODELS)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUCodedQ5KIQ3SProjection)
+
+# Q6_K and IQ4_XS coded CPU units: exact file-density bytes and the coded code
+# plane plus superblock header reproduce the per-block source factors exactly.
+add_executable(v2_unit_cpu_coded_file_density_q6iq4 unit/kernels/cpu/Test__CPUCodedFileDensityQ6IQ4.cpp)
+target_link_libraries(v2_unit_cpu_coded_file_density_q6iq4
+    llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_CPUCodedFileDensityQ6IQ4
+    COMMAND $<TARGET_FILE:v2_unit_cpu_coded_file_density_q6iq4>
+    LABELS "V2;Unit;CPU;DeviceFree;NativeQuantised;Memory;ByteExact;Regression"
+    MPI_PROCS 1 NO_MODELS)
+
+add_v2_test(V2_Integration_CPUCodedFileDensityQ6IQ4
+    COMMAND $<TARGET_FILE:v2_unit_cpu_coded_file_density_q6iq4>
+    LABELS "V2;Integration;CPU;DeviceFree;NativeQuantised;Memory;ByteExact;Regression;ProductionTestPreflight"
+    MPI_PROCS 1 NO_MODELS)
+add_v2_test(V2_Integration_CPUCodedCompactPreparedAdmissionGeometry
+    COMMAND $<TARGET_FILE:v2_unit_cpu_coded_compact_units>
+        --gtest_filter=CPUCodedCompactUnits.PreparedBytesEqualFileDensity
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;NativeQuantised;Memory;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUCodedCompactPreparedAdmissionGeometry)
+
+add_v2_test(V2_Integration_CPUCompensationFreeUnits
+    COMMAND $<TARGET_FILE:v2_unit_cpu_coded_compact_units>
+        --gtest_filter=CPUCompensationFreeUnits.*:CPUCodedCompactUnits.SimdReconstructionEqualsCodecWordsExhaustively:CPUCodedCompactUnits.NeonQ4KReconstructionEqualsCodecBitsExhaustively:CPUCodedCompactUnits.NeonHalfQ4KReconstructionEqualsCodecBitsExhaustively:CPUCodedCompactUnits.NeonQ4KMixedHeaderAndCodeGatherEqualsCodecBits
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;NativeQuantised;Memory;ByteExact;Regression"
+    MPI_PROCS 1 NO_MODELS)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUCompensationFreeUnits)
+
+# Signed-byte endpoints through the production leaves for every GGUF source format.
+add_executable(v2_unit_cpu_native_extreme_byte_projection unit/kernels/cpu/Test__CPUNativeExtremeByteProjection.cpp)
+target_link_libraries(v2_unit_cpu_native_extreme_byte_projection llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_CPUNativeExtremeByteProjection
+    COMMAND $<TARGET_FILE:v2_unit_cpu_native_extreme_byte_projection>
+    LABELS "V2;Unit;CPU;DeviceFree;NativeQuantised;ByteExact;Regression"
+    MPI_PROCS 1 NO_MODELS NO_MPI)
+add_v2_test(V2_Integration_CPUNativeExtremeByteProjection
+    COMMAND $<TARGET_FILE:v2_unit_cpu_native_extreme_byte_projection>
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;NativeQuantised;ByteExact;Regression"
+    MPI_PROCS 1 NO_MODELS NO_MPI ENVIRONMENT "OMP_NUM_THREADS=4")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUNativeExtremeByteProjection)
+
+# Exhaustive file-density accounting; all CUDA plane calculations are device-free.
+add_executable(v2_unit_native_quantised_file_density_all_formats
+    unit/kernels/cpu/Test__NativeQuantisedFileDensityAllFormats.cpp)
+target_include_directories(v2_unit_native_quantised_file_density_all_formats PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(v2_unit_native_quantised_file_density_all_formats GTest::gtest GTest::gtest_main)
+target_compile_features(v2_unit_native_quantised_file_density_all_formats PRIVATE cxx_std_20)
+add_v2_test(V2_Unit_NativeQuantisedFileDensityAllFormats
+    COMMAND $<TARGET_FILE:v2_unit_native_quantised_file_density_all_formats>
+    LABELS "V2;Unit;CPU;DeviceFree;NativeQuantised;Memory;Regression;ProductionTestPreflight"
+    MPI_PROCS 1 NO_MODELS NO_MPI)
+
+# Native Q5 ordinary blocks retain file density and their original arithmetic.
+add_executable(v2_unit_cpu_q5_native_single_scale unit/kernels/cpu/Test__CPUQ5NativeSingleScale.cpp)
+target_link_libraries(v2_unit_cpu_q5_native_single_scale llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_CPUQ5NativeSingleScale
+    COMMAND $<TARGET_FILE:v2_unit_cpu_q5_native_single_scale>
+    LABELS "V2;Unit;CPU;DeviceFree;NativeQuantised;ByteExact;Regression;ProductionTestPreflight"
+    MPI_PROCS 1 NO_MODELS NO_MPI)
+
 # Original Q6 source factors remain exact without changing Q8 GEMM inputs.
 add_executable(v2_test_q6_source_scale unit/kernels/Test__Q6SourceScale.cpp)
 target_link_libraries(v2_test_q6_source_scale
@@ -12639,17 +12738,41 @@ add_v2_test(V2_Integration_CUDA_MoEFloatingSharedExpertTableDecode
     TIMEOUT 30
 )
 add_executable(v2_integration_cuda_expert_tier_weight_kernels
-    integration/kernels/cuda/Test__CUDAExpertTierWeightKernels.cpp)
+    integration/kernels/cuda/Test__CUDAExpertTierWeightKernels.cpp
+    integration/mpi_gtest_main.cpp)
 target_link_libraries(v2_integration_cuda_expert_tier_weight_kernels
-    llaminar2_core GTest::gtest GTest::gtest_main CUDA::cudart)
+    llaminar2_core GTest::gtest CUDA::cudart MPI::MPI_CXX)
 add_v2_test(V2_Integration_CUDA_ExpertTierWeightKernels
     COMMAND $<TARGET_FILE:v2_integration_cuda_expert_tier_weight_kernels>
-        --gtest_filter=*-CUDAExpertTierWeightKernelsTest.SecondaryDeviceRemoteProjectionRestoresOwningDeviceBeforeRepack
+        --gtest_filter=*-CUDAExpertTierWeightKernelsTest.SecondaryDeviceRemoteProjectionRestoresOwningDeviceBeforeRepack:CUDAExpertTierWeightKernelsTest.CodedMpiRelayPreservesOriginalGpuPlanes
     LABELS "V2;Integration;CUDA;MoE;ExpertOverlay;WeightStreaming;Repack;ByteExact;ExplicitStream"
     MPI_PROCS 1
     NO_MODELS
     TIMEOUT 30
 )
+add_v2_test(V2_Integration_CUDA_CodedCompactExpertTierPlanes
+    COMMAND $<TARGET_FILE:v2_integration_cuda_expert_tier_weight_kernels>
+        --gtest_filter=CUDAExpertTierWeightKernelsTest.FileDensityPlanesRoundTripMatchesSourceNative:CUDAExpertTierWeightKernelsTest.CapturedCodedPeerRectanglePreservesShiftedNeighbors:CUDAExpertTierWeightKernelsTest.CodedRemoteEndpointsPreserveOriginalGpuPlanes
+    LABELS "V2;Integration;ProductionTestPreflight;CUDA;MoE;ExpertOverlay;Transfer;ByteExact;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 60)
+add_v2_test(V2_Integration_CUDA_CodedShadowSlotRootPhase
+    COMMAND $<TARGET_FILE:v2_integration_cuda_expert_tier_weight_kernels>
+        --gtest_filter=CUDAExpertTierWeightKernelsTest.CodedShadowSlotRetainsOriginalRootPhase
+    LABELS "V2;Integration;ProductionTestPreflight;CUDA;MoE;ExpertOverlay;Transfer;ByteExact;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDA_CodedShadowSlotRootPhase)
+add_v2_test(V2_Integration_CUDA_CodedNoPeerHostRelay
+    COMMAND $<TARGET_FILE:v2_integration_cuda_expert_tier_weight_kernels>
+        --gtest_filter=CUDAExpertTierWeightKernelsTest.CodedNoPeerHostRelayPreservesAllSourcePlanes
+    LABELS "V2;Integration;ProductionTestPreflight;CUDA;MoE;ExpertOverlay;Transfer;ByteExact;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDA_CodedNoPeerHostRelay)
+add_v2_test(V2_Integration_CUDA_CodedExpertRelay_MPI
+    COMMAND $<TARGET_FILE:v2_integration_cuda_expert_tier_weight_kernels>
+        --gtest_filter=CUDAExpertTierWeightKernelsTest.CodedMpiRelayPreservesOriginalGpuPlanes
+    LABELS "V2;Integration;ProductionTestPreflight;CUDA;MoE;ExpertOverlay;MPI;Transfer;ByteExact;Regression"
+    MPI_PROCS 2 NO_MODELS TIMEOUT 60)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDA_CodedExpertRelay_MPI)
 add_v2_test(V2_Integration_CUDA_ExpertTierWeightKernels_MultiDevice
     COMMAND $<TARGET_FILE:v2_integration_cuda_expert_tier_weight_kernels>
         --gtest_filter=CUDAExpertTierWeightKernelsTest.SecondaryDeviceRemoteProjectionRestoresOwningDeviceBeforeRepack
@@ -18855,6 +18978,13 @@ add_v2_test(V2_Unit_ComputeStages
     LABELS "V2;Unit;ComputeStage;GEMM;RMSNorm;RoPE;SwiGLU;ResidualAdd;Precision"
     MPI_PROCS 1
 )
+
+add_v2_test(V2_Integration_DeviceMoERebalanceCodedSlotAdmission
+    COMMAND $<TARGET_FILE:v2_test_compute_stages>
+        --gtest_filter=ComputeStagesTest.MoEDeviceRebalanceFormatProfileSeparatesWireBytesFromStorageCapacity
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MoE;PhysicalMemory;Admission;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_DeviceMoERebalanceCodedSlotAdmission)
 
 # Test: StageDumpInfo (getDumpInfo() snapshot support for all compute stages)
 # Validates that each compute stage correctly reports inputs, outputs, weights, and scalars
@@ -28654,12 +28784,34 @@ target_link_libraries(v2_test_expert_tier_weight_stream
     llaminar2_core
     GTest::gtest
     GTest::gtest_main
+    ${CMAKE_DL_LIBS}
 )
 add_v2_test(V2_Unit_ExpertTierWeightStream
     COMMAND $<TARGET_FILE:v2_test_expert_tier_weight_stream>
     LABELS "V2;Unit;MoE;WeightLifecycle;ExpertOverlay;Streaming"
     NO_MODELS
 )
+add_v2_test(V2_Integration_ExpertTierCodedSourcePlanes
+    COMMAND $<TARGET_FILE:v2_test_expert_tier_weight_stream>
+        --gtest_filter=ExpertTierWeightStream.CodedSourcePlanesRoundTripWithoutRequantization:ExpertTierWeightStream.CodedMidSuperblockChunksRetainExactPlanes:ExpertTierWeightStream.ResidentCodedCpuOriginRequiresSourceSuperblockBoundary:ExpertTierWeightStream.DirectCPUOriginalRootsAllFormatsPreserveIndependentStridesAndDirtyNeighbours:ExpertTierWeightStream.NativeCpuRectanglesUseOnlyLivePlanesAndIndependentRootStrides
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;MoE;Transfer;ByteExact;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ExpertTierCodedSourcePlanes)
+
+
+add_v2_test(V2_Integration_ExpertTierWeightDensityAdmission
+    COMMAND $<TARGET_FILE:v2_test_expert_tier_weight_stream>
+        --gtest_filter=ExpertTierWeightStream.EveryCatalogedSourceFormatHasGpuToCpuContract:ExpertTierWeightStream.CodedDemotionRejectsLegacyPlanesBeforeAllocating:MoEOverlayPreparedWeightSource.AcceptsCanonicalAndCpuNormalizedGpuRepresentationsOnly
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MoE;WeightLifecycle;ExpertOverlay;Streaming"
+    NO_MODELS)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ExpertTierWeightDensityAdmission)
+
+# Native Q5 slots reject retired expanded GPU descriptors.
+add_v2_test(V2_Unit_NativeQ5GPUStreamAdmission
+    COMMAND $<TARGET_FILE:v2_test_expert_tier_weight_stream>
+        --gtest_filter=ExpertTierWeightStream.NativeQ5RejectsExpandedGpuDescriptor
+    LABELS "V2;Unit;CPU;DeviceFree;NativeQuantised;Movement;Regression;ProductionTestPreflight"
+    MPI_PROCS 1 NO_MODELS NO_MPI)
 
 # Test: device-free arbitrary-tier composite wave protocol
 add_executable(v2_test_moe_overlay_tier_migration_transport
@@ -31167,7 +31319,8 @@ if(HAVE_ROCM)
         PROPERTIES LANGUAGE HIP)
     add_executable(v2_integration_rocm_expert_tier_weight_kernels
         integration/kernels/rocm/Test__ROCmExpertTierWeightKernels.cpp
-        integration/kernels/rocm/ROCmOriginalM1ReducerOracle.hip)
+        integration/kernels/rocm/ROCmOriginalM1ReducerOracle.hip
+        integration/mpi_gtest_main.cpp)
     target_include_directories(
         v2_integration_rocm_expert_tier_weight_kernels
         PRIVATE ${CMAKE_SOURCE_DIR})
@@ -31177,8 +31330,8 @@ if(HAVE_ROCM)
     target_link_libraries(v2_integration_rocm_expert_tier_weight_kernels
         llaminar2_core
         GTest::gtest
-        GTest::gtest_main
-        hip::host)
+        hip::host
+        MPI::MPI_CXX)
     if(NOT LLAMINAR_SHARED_CORE)
         target_link_libraries(
             v2_integration_rocm_expert_tier_weight_kernels
@@ -31188,6 +31341,12 @@ if(HAVE_ROCM)
     # exact kernel/lifecycle invariant instead of the cumulative binary wall.
     set(V2_ROCM_EXPERT_TIER_WEIGHT_PREFLIGHT_TESTS)
     set(V2_ROCM_EXPERT_TIER_WEIGHT_GTESTS
+        FileDensityPlanesRoundTripMatchesSourceNative
+        CodedShadowSlotRetainsOriginalRootPhase
+        CapturedCodedPeerRectanglePreservesShiftedNeighbors
+        CodedNoPeerHostRelayPreservesAllSourcePlanes
+        CodedRemoteEndpointsPreserveOriginalGpuPlanes
+        RectangularNativeMovementAllFormatsAndDirtyReplay
         PreparedServiceViewsIsolateAllQuantizedExecutionBindings
         CapturedOrdinaryM1DeferredReductionsAllFormats
         CapturedOrdinaryM1ReductionSlotWavesAndBias
@@ -31223,6 +31382,12 @@ if(HAVE_ROCM)
         list(APPEND V2_ROCM_EXPERT_TIER_WEIGHT_PREFLIGHT_TESTS
             ${V2_ROCM_EXPERT_TIER_WEIGHT_CTEST})
     endforeach()
+    add_v2_test(V2_Integration_ROCm_CodedExpertRelay_MPI
+        COMMAND $<TARGET_FILE:v2_integration_rocm_expert_tier_weight_kernels>
+            --gtest_filter=ROCmExpertTierWeightKernelsTest.CodedMpiRelayPreservesOriginalGpuPlanes
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;ExpertOverlay;MPI;Transfer;ByteExact;Regression"
+        MPI_PROCS 2 NO_MODELS TIMEOUT 60)
+    list(APPEND V2_ROCM_EXPERT_TIER_WEIGHT_PREFLIGHT_TESTS V2_Integration_ROCm_CodedExpertRelay_MPI)
     # This proof constructs three independently prepared Q/K/V weights before
     # exercising the operation's own concurrent stream pool.  Cold gfx906
     # driver setup can take longer than the ordinary 30-second model-free
@@ -32057,6 +32222,7 @@ if(HAVE_CUDA)
     V2_Integration_GroupedVerifierRows_CUDA_GDNRequestBatch
     V2_Integration_GPUDeviceContext_CUDA
     V2_Integration_CUDA_ExpertTierWeightKernels
+    V2_Integration_CUDA_CodedCompactExpertTierPlanes
     V2_Integration_CUDA_CapturedExpertTierPackedTransferProgress
     V2_Integration_CUDA_MoEOverlayEpoch
     V2_Integration_CUDAEventSynchronization
@@ -32521,11 +32687,11 @@ add_v2_test(V2_Integration_NativeQuantizedRowViewExtent
     MPI_PROCS 1 NO_MODELS)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NativeQuantizedRowViewExtent)
 
-# IQ2_S source coefficients are raw words, not a maskable approximation.
+# Exact-width coded source metadata rejects malformed headers at publication.
 if(NOT LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
     add_v2_test(V2_Integration_CPUNativeSourceCoefficientMetadata_X86
         COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_gemv>
-            --gtest_filter=CPUNativeSourceMetadata.ReservedBitsRejectAtEveryVectorLane:CPUNativeSourceMetadata.PartialChunkPaddingIsNormalizedForX86Readers
+            --gtest_filter=CPUNativeSourceMetadata.CodedHeadersRequireExactExtent:CPUNativeSourceMetadata.CodedPaddingCannotInfluenceLiveColumns
         LABELS "V2;Integration;DeviceFree;CPU;NativeQuantised;Metadata;Regression"
         TIMEOUT 60 NO_MODELS MPI_PROCS 1)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUNativeSourceCoefficientMetadata_X86)
@@ -32538,6 +32704,21 @@ add_v2_test(V2_Integration_CPUPreparedNativeReadPublication
     LABELS "V2;Integration;DeviceFree;CPU;NativeQuantised;AllFormats;Movement;Regression"
     TIMEOUT 60 NO_MODELS MPI_PROCS 1)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUPreparedNativeReadPublication)
+
+# New coded Q5_K and IQ3_S units must not enter the legacy expert conversion.
+add_v2_test(V2_Integration_CPUCodedQ5KIQ3STierAdmission
+    COMMAND $<TARGET_FILE:v2_test_expert_tier_weight_stream>
+        --gtest_filter=ExpertTierWeightStream.CodedQ5KIQ3SRejectLegacyMigration
+    LABELS "V2;Integration;DeviceFree;CPU;NativeQuantised;Movement;Regression"
+    TIMEOUT 60 NO_MODELS MPI_PROCS 1)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUCodedQ5KIQ3STierAdmission)
+
+# Native Q5 CPU-only slots must seal the exact rectangle-installed payload.
+add_v2_test(V2_Unit_CPUExpertNativeQ5SlotPublication
+    COMMAND $<TARGET_FILE:v2_test_expert_tier_weight_stream>
+        --gtest_filter=CpuExpertSlotPool.NativeQ5SlotSealsExactPayloadAndRectangle
+    LABELS "V2;Unit;CPU;DeviceFree;NativeQuantised;Movement;Regression;ProductionTestPreflight"
+    MPI_PROCS 1 NO_MODELS NO_MPI)
 
 # Overlay slot reuse opens a new publication generation at the same address;
 # arrival admission is the only way the slot's engine becomes executable.
@@ -32563,9 +32744,9 @@ add_v2_test(V2_Integration_IQ4XSTupleFormatContract
         --gtest_filter=Test__NativeQuantisedFormatInfo.IQ4XSSourceTupleMappingAndCapacityAreExact:Test__NativeQuantisedFormatInfo.PackedRegionSizingMatchesCanonicalMetadata:Test__NativeQuantisedFormatInfo.MigrationStableAndReusableFormatsCoverEveryCodebook:Test__NativeQuantisedFormatInfo.RuntimeCaptureEnvelopeCoversEveryTierRepresentation
     LABELS "V2;Integration;DeviceFree;CPU;NativeQuantised;IQ4_XS;Metadata;Regression"
     TIMEOUT 60 NO_MODELS MPI_PROCS 1)
-add_v2_test(V2_Integration_IQ4XSTupleTierRoundTrip
+add_v2_test(V2_Integration_IQ4XSTupleTierAdmission
     COMMAND $<TARGET_FILE:v2_test_expert_tier_weight_stream>
-        --gtest_filter=ExpertTierWeightStream.IQ4XSTupleRoundTripAndPhysicalLayoutAreExact:ExpertTierWeightStream.IQ4XSExplicitExpandedMetadataRemainsAccepted
+        --gtest_filter=ExpertTierWeightStream.IQ4XSTupleRoundTripAndPhysicalLayoutAreExact:ExpertTierWeightStream.IQ4XSExplicitExpandedCannotEnterCodedMigration
     LABELS "V2;Integration;DeviceFree;CPU;NativeQuantised;IQ4_XS;Movement;Regression"
     TIMEOUT 60 NO_MODELS MPI_PROCS 1)
 add_v2_test(V2_Integration_IQ4XSTupleArchiveGeneration
@@ -32580,7 +32761,7 @@ add_v2_test(V2_Integration_PrefixCacheIQ4XSScaleArithmeticGeneration
     TIMEOUT 60 NO_MODELS MPI_PROCS 1)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_IQ4XSTupleFormatContract
-    V2_Integration_IQ4XSTupleTierRoundTrip
+    V2_Integration_IQ4XSTupleTierAdmission
     V2_Integration_IQ4XSTupleArchiveGeneration
     V2_Integration_PrefixCacheIQ4XSScaleArithmeticGeneration)
 
@@ -39597,6 +39778,12 @@ if(HAVE_ROCM)
         LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;DeviceResident;ByteExact;Regression"
         MPI_PROCS 1 NO_MODELS TIMEOUT 30)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCm_MoERebalanceCommandBytes)
+    add_v2_test(V2_Integration_ROCm_MoERebalanceCodedArrival
+        COMMAND $<TARGET_FILE:v2_integration_rocm_moe_kernel>
+            --gtest_filter=Test__ROCmMoEKernel.DeviceRebalanceCodedArrivalPreservesSlotLayout
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;Transfer;ByteExact;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCm_MoERebalanceCodedArrival)
 endif()
 
 if(NOT V2_PERF_TESTS_ONLY)

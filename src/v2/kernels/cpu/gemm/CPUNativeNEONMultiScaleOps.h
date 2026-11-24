@@ -219,6 +219,18 @@ namespace llaminar2::cpu::native_quantised::multi_scale
             high = std::bit_cast<I>(vuzp2q_u32(vreinterpretq_u32_u64(first), vreinterpretq_u32_u64(second)));
         }
 
+        /** @brief Gather one four-value grid entry per column without a stack staging buffer. */
+        static inline __attribute__((always_inline)) I grid4(const std::uint32_t *table, I index) noexcept
+        {
+            const auto indices = std::bit_cast<uint32x4_t>(index);
+            auto result = vdupq_n_u32(0);
+            result = vld1q_lane_u32(table + vgetq_lane_u32(indices, 0), result, 0);
+            result = vld1q_lane_u32(table + vgetq_lane_u32(indices, 1), result, 1);
+            result = vld1q_lane_u32(table + vgetq_lane_u32(indices, 2), result, 2);
+            result = vld1q_lane_u32(table + vgetq_lane_u32(indices, 3), result, 3);
+            return std::bit_cast<I>(result);
+        }
+
         /** @brief Widen four persisted halves without changing nonfinite payload bits.
          * @param source Four readable canonical half words.
          * @return Four exact binary32 conversions.
@@ -226,12 +238,16 @@ namespace llaminar2::cpu::native_quantised::multi_scale
         static F half(const std::uint16_t *source) noexcept
         { return expandHalfBits(vld1_u16(source)); }
 
-        /** @brief Widen four BF16 words exactly by placement (word << 16).
-         * @param source Four readable BF16 words, e.g. native MXFP4 E8M0 powers of two.
-         * @return Four exact binary32 values; no rounding or FP16 interpretation.
-         */
-        static F bf16(const std::uint16_t *source) noexcept
-        { return std::bit_cast<F>(vshll_n_u16(vld1_u16(source), 16)); }
+        /** @return Four E8M0 scales widened by exponent placement; byte 0 is the zero marker. */
+        static F e8m0(const std::uint8_t *source) noexcept
+        {
+            std::uint32_t four;
+            std::memcpy(&four, source, sizeof(four));
+            const auto bytes = vreinterpret_u8_u32(vdup_n_u32(four));
+            const auto exponent = vmovl_u16(vget_low_u16(vmovl_u8(bytes)));
+            const auto bits = vshlq_n_u32(vsubq_u32(exponent, vdupq_n_u32(1)), 23);
+            return std::bit_cast<F>(vbicq_u32(bits, vceqzq_u32(exponent)));
+        }
 
         /** @brief Widen opaque metadata without interpreting its half exponent.
          * @param source Four readable raw metadata words.
@@ -264,6 +280,38 @@ namespace llaminar2::cpu::native_quantised::multi_scale
          */
         static I halfBits(F value) noexcept
         { return std::bit_cast<I>(vmovl_u16(vreinterpret_u16_f16(vcvt_f16_f32(std::bit_cast<float32x4_t>(value))))); }
+
+        /** @return Widened half input for a product whose arithmetic already quiets NaNs. */
+        static F halfProductInput(I packed) noexcept requires (Dot == NEONByteDot::DotProd)
+        {
+            const auto half = vmovn_u32(std::bit_cast<uint32x4_t>(packed));
+            return std::bit_cast<F>(vcvt_f32_f16(vreinterpret_f16_u16(half)));
+        }
+
+        /** @return RNE half product widened immediately after canonicalizing negative zero.
+         * @details The input was a floating-point product, so any NaN is already
+         * quiet. A native widening preserves its staged quiet half payload.
+         */
+        static F stagedProduct(F value) noexcept
+        {
+            auto half = vreinterpret_u16_f16(vcvt_f16_f32(std::bit_cast<float32x4_t>(value)));
+            half = vbic_u16(half, vceq_u16(half, vdup_n_u16(0x8000)));
+            return std::bit_cast<F>(vcvt_f32_f16(vreinterpret_f16_u16(half)));
+        }
+
+        /** @return stagedProduct() of `-value`, with the sign flipped as an integer after rounding.
+         * @param value Exact `dmin * code` product.
+         * @details Matches the AArch64 codec's negated product `-(dmin * c)`
+         * (FNMUL) bit for bit, including the sign of a default NaN, and flips
+         * before the -0 -> +0 canonicalization. Rounding is sign-symmetric
+         * under the admitted round-to-nearest-even profile.
+         */
+        static F stagedNegatedProduct(F value) noexcept
+        {
+            auto half = veor_u16(vreinterpret_u16_f16(vcvt_f16_f32(std::bit_cast<float32x4_t>(value))), vdup_n_u16(0x8000));
+            half = vbic_u16(half, vceq_u16(half, vdup_n_u16(0x8000)));
+            return std::bit_cast<F>(vcvt_f32_f16(vreinterpret_f16_u16(half)));
+        }
 
     private:
         /** @brief Preserve the portable half contract while using native finite conversion.

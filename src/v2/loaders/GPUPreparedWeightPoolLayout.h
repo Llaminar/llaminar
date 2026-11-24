@@ -9,6 +9,7 @@
 #pragma once
 
 #include "backends/DeviceId.h"
+#include "kernels/cpu/gemm/CPUNativeQuantisedEncoding.h"
 #include "tensors/NativeQuantisedFormatInfo.h"
 #include "tensors/NativeQuantisedScalePlane.h"
 #include <stdexcept>
@@ -39,6 +40,8 @@ namespace llaminar2
             return {static_cast<uint8_t>(source.payload_bytes),
                 canonicalDeviceVnniFormat(source).is_asymmetric, source.has_emins};
         case GPUPreparedWeightPoolLayout::MigrationReusable:
+            if (cpu::native_quantised::migrationUsesSuperblockCodes(source))
+                return {static_cast<uint8_t>(source.payload_bytes), true, false}; // One superblock plane, no staged minima.
             return reusableDeviceVnniAllocationFormat(source);
         default:
             throw std::invalid_argument("Unknown GPU prepared weight pool layout");
@@ -48,13 +51,8 @@ namespace llaminar2
     /**
      * @brief Whether one prepared GPU matrix stores superblock-coded metadata.
      *
-     * Only immutable source-native matrices are coded: reusable migration slots
-     * hold the per-block union so CPU-tier arrivals and in-place movement keep
-     * their existing representation. Every CUDA and ROCm NativeQuantised reader
-     * consumes coded metadata through the shared loader
-     * (native_quantised_scale::loadBlockMetadata), so both GPU backends store
-     * immutable superblock weights at GGUF file density
-     * (docs/v2/projects/2026-11/GPU_SUPERBLOCK_METADATA_PLAN.md).
+     * CUDA and ROCm immutable source matrices use the native codec whenever supported.
+     * Reusable CUDA and ROCm migration slots use it when the CPU retains original codes.
      *
      * @param source Original GGUF codebook metadata.
      * @param layout Pool stride policy of the matrix.
@@ -63,6 +61,9 @@ namespace llaminar2
     [[nodiscard]] inline bool gpuPreparedSuperblockCoded(const NativeQuantisedFormatInfo &source,
         GPUPreparedWeightPoolLayout layout, DeviceId device)
     {
+        if (layout == GPUPreparedWeightPoolLayout::MigrationReusable &&
+            cpu::native_quantised::migrationUsesSuperblockCodes(source))
+            return device.is_cuda() || device.is_rocm();
         return layout == GPUPreparedWeightPoolLayout::SourceNative && (device.is_cuda() || device.is_rocm()) &&
                source.is_superblock &&
                nativeQuantisedSuperblockCodable(canonicalDeviceVnniCodebookId(source));

@@ -33,8 +33,7 @@ struct NativePackGroupScratch {
             result.primary=reserve(blocks*sizeof(uint16_t),alignof(uint16_t));
             result.secondary=reserve(blocks*sizeof(uint16_t),alignof(uint16_t));
         }
-        if(expanded || encoding==CPUNativeQuantisedEncoding::NibbleLUT ||
-            encoding==CPUNativeQuantisedEncoding::NibbleLUTSourceScale)
+        if(expanded)
             result.decoded=reserve((expanded?blocks:1)*32,1);
         if(expanded && !packed) {
             result.scales=reserve(blocks*sizeof(float),alignof(float));
@@ -66,9 +65,6 @@ inline void initializeNativeWindowOutput(const NativeQuantisedFormatInfo& format
     out.encoding=preparedEncodingForSource(format);out.data_stride=preparedDataStride(out.encoding,out.codebook_id);
     out.interleaved_block_stride=preparedInterleavedBlockStride(out.encoding,out.is_asymmetric,out.codebook_id);
     const auto chunks=size_t(out.N_padded/64),blocks=size_t(out.blocks_per_row);
-    // Coded units hold whole source superblocks (GGUF superblock rows are multiples of 256).
-    if(preparedSuperblockCoded(out.encoding) && blocks%native_quantised_superblock::kBlocksPerSuperblock)
-        throw std::invalid_argument("Superblock-coded CPU weights require whole source superblocks per row");
     const size_t unit_bytes=size_t(out.interleaved_block_stride)+out.superblockHeaderBytes();
     if(blocks && chunks>std::numeric_limits<size_t>::max()/blocks/unit_bytes)
         throw std::overflow_error("Native weight final extent overflows");
@@ -186,7 +182,10 @@ inline void appendNativeWeightGroups(const IINT8Unpackable& source,const NativeQ
                     // Whole words as [word][column], the 1-2 byte tail as [column][tail].
                     const int words=int(preparedCompactPayloadWords(out.codebook_id));
                     const int tail=int(preparedCompactPayloadTailBytes(out.codebook_id));
-                    for(int byte=0;byte<format.payload_bytes;++byte)
+                    if(out.codebook_id==7) {
+                        for(int word=0;word<4;++word)std::memcpy(target+word*256+column*4,input+word*4,4);
+                        coded_metadata::storeQ5HighBits(target+1024,column,input+16);
+                    } else for(int byte=0;byte<format.payload_bytes;++byte)
                         if(byte<4*words)target[(byte/4)*256+column*4+byte%4]=input[byte];
                         else target[words*256+column*tail+(byte-4*words)]=input[byte];
                     if(preparedCompactCodeBits(out.codebook_id))
@@ -194,6 +193,28 @@ inline void appendNativeWeightGroups(const IINT8Unpackable& source,const NativeQ
                     if(b==0)
                         coded_metadata::storeSuperblockWord(interleaved.data()+out.superblockHeaderOffset(chunk,output_first),
                             out.codebook_id,column,superblock[0]);
+                } else if(out.encoding==CPUNativeQuantisedEncoding::Q4KSuperblockCoded) {
+                    // Native nibble words, then the 12-bit code split into an 8-bit and a nibble plane.
+                    for(int g=0;g<4;++g)std::memcpy(target+g*256+column*4,input+g*4,4);
+                    coded_metadata::storeCode(target+out.data_stride,5,column,codes[b]);
+                    if(b==0)
+                        coded_metadata::storeSuperblockWord(interleaved.data()+out.superblockHeaderOffset(chunk,output_first),
+                            5,column,superblock[0]);
+                } else if(out.encoding==CPUNativeQuantisedEncoding::Q5NativeSingleScale) {
+                    // Four nibble groups and one group of four paired fifth-bit bytes.
+                    // Keeping every group four bytes wide per column lets the CPU
+                    // rectangle stream use its unchanged native plane copier.
+                    for(int g=0;g<Q5NativePayload::groups;++g) {
+                        std::memcpy(target+Q5NativePayload::nibbleOffset(g,column),input+g*4,4);
+                        target[Q5NativePayload::fifthOffset(g,column)]=uint8_t(((input[16+g/2]>>(4*(g%2)))&15) |
+                            (((input[18+g/2]>>(4*(g%2)))&15)<<4));
+                    }
+                    const uint16_t scale=fp32_to_fp16(fp16_to_fp32(primary[b]));
+                    std::memcpy(target+out.data_stride+column*2,&scale,2);
+                    if(out.is_asymmetric) {
+                        const uint16_t minimum=fp32_to_fp16(fp16_to_fp32(secondary[b]));
+                        std::memcpy(target+out.data_stride+128+column*2,&minimum,2);
+                    }
                 } else if(out.usesQ6KNativeDualScale()) {
                     for(int g=0;g<4;++g)std::memcpy(target+g*256+column*4,input+g*4,4);
                     for(int g=0;g<8;++g) {
@@ -206,26 +227,40 @@ inline void appendNativeWeightGroups(const IINT8Unpackable& source,const NativeQ
                         }
                         std::memcpy(planes,&low,8);std::memcpy(planes+8,&high,8);
                     }
-                    std::memcpy(target+1536+column*2,primary+b,2);
-                    std::memcpy(target+1664+column*2,secondary+b,2);
+                    coded_metadata::storeCode(target+out.data_stride,out.codebook_id,column,codes[b]);
+                    if(b==0)
+                        coded_metadata::storeSuperblockWord(interleaved.data()+out.superblockHeaderOffset(chunk,output_first),
+                            out.codebook_id,column,superblock[0]);
                 } else {
                     const bool nibble=out.usesNibbleLUT();
-                    const int8_t* values=nibble?decoded:decoded+b*32;
+                    const int8_t* values=nibble?nullptr:decoded+b*32;
                     if(nibble) {
-                        decode_native_block(format.codebook_id,input,decoded);values=decoded;
                         for(int g=0;g<4;++g)std::memcpy(target+g*256+column*4,input+g*4,4);
                     } else for(int g=0;g<8;++g)std::memcpy(target+g*256+column*4,values+g*4,4);
-                    int32_t sum=0;for(int k=0;k<32;++k)sum+=values[k];
-                    const auto compensation=static_cast<int16_t>(sum);
-                    std::memcpy(target+out.data_stride+column*2,&compensation,2);
+                    if(out.scaleEncoding()==CPUNativeQuantisedScaleEncoding::E8M0) {
+                        // The source packer already admitted the exponent and published
+                        // its exact byte, with zero as the all-zero block marker.
+                        target[out.data_stride+column]=reinterpret_cast<const uint8_t*>(primary)[b];
+                        continue;
+                    }
+                    const int comp_bytes=out.usesInlineCompensation()?128:0;
+                    if(comp_bytes) {
+                        int32_t sum=0;for(int k=0;k<32;++k)sum+=values[k];
+                        const auto compensation=static_cast<int16_t>(sum);
+                        std::memcpy(target+out.data_stride+column*2,&compensation,2);
+                    }
+                    if(out.usesNibbleLUTSourceScale()) {
+                        const auto codebook=superblockMetadataCodebook(out.encoding,out.codebook_id);
+                        coded_metadata::storeCode(target+preparedCodedPlaneOffset(out.encoding,out.data_stride),
+                            codebook,column,codes[b]);
+                        if(b==0)
+                            coded_metadata::storeSuperblockWord(interleaved.data()+out.superblockHeaderOffset(chunk,output_first),
+                                codebook,column,superblock[0]);
+                        continue;
+                    }
                     uint16_t scale=0,minimum=0;
-                    if(out.usesNibbleLUTSourceScale() || out.usesIQ3SExpandedSourceScale()) {
+                    if(out.usesIQ3SExpandedSourceScale()) {
                         scale=primary[b];minimum=secondary[b];
-                    } else if(nibble && format.codebook_id==kNativeQuantisedMXFP4Codebook) {
-                        // packVnniBlock already validated the block and published the unit's
-                        // exact scale word (BF16 power of two, out.primaryScaleLayout(); 0 for
-                        // ggml all-zero blocks). Re-rounding the FP32 source scale would be lossy.
-                        scale=primary[b];
                     } else if(nibble) {
                         scale=fp32_to_fp16(source.get_block_scale(actual_row,input_first+b));
                         minimum=fp32_to_fp16(source.get_block_min(actual_row,input_first+b));
@@ -235,9 +270,9 @@ inline void appendNativeWeightGroups(const IINT8Unpackable& source,const NativeQ
                     } else {scale=fp32_to_fp16(scales[b]);minimum=fp32_to_fp16(mins[b]);}
                     if(out.usesIQ3SExpandedSourceScale() && !native_quantised_iq3s_scale::valid(minimum))
                         throw std::invalid_argument("IQ3_S source nibble is invalid");
-                    std::memcpy(target+out.data_stride+128+column*2,&scale,2);
-                    if(out.is_asymmetric || out.usesNibbleLUTSourceScale() || out.usesIQ3SExpandedSourceScale())
-                        std::memcpy(target+out.data_stride+256+column*2,&minimum,2);
+                    std::memcpy(target+out.data_stride+comp_bytes+column*2,&scale,2);
+                    if(out.is_asymmetric || out.usesIQ3SExpandedSourceScale())
+                        std::memcpy(target+out.data_stride+comp_bytes+128+column*2,&minimum,2);
                 }
             }
         }

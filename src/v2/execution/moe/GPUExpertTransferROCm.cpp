@@ -216,5 +216,30 @@ namespace llaminar2::detail
         }
         return success;
     }
+
+    bool transferCodedExpertROCm(const GpuExpertPackedDescriptor &source, const GpuExpertPackedDescriptor &destination,
+        const DeviceId &source_device, const DeviceId &destination_device, void *stream)
+    {
+        if (reinterpret_cast<uintptr_t>(stream) <= 2)
+            return false;
+        const auto bits = source.blockCount() * native_quantised_superblock::superblockCodePlaneBits(source.codebook_id);
+        const auto src_shift = nativeQuantisedLayoutCodeBitShift(source.metadata_layout);
+        const auto dst_shift = nativeQuantisedLayoutCodeBitShift(destination.metadata_layout);
+        const bool whole_bytes = !src_shift && !dst_shift && (bits % 8 == 0);
+        if (!transferExpertROCmBackend(source.ptrs, destination.ptrs, source_device, destination_device,
+            source.vnni_bytes, whole_bytes ? bits / 8 : 0, source.mins_bytes, 0, stream))
+            return false;
+        if (!bits || whole_bytes)
+            return true;
+
+        // The admitted peer edge shares the code-plane addresses; only a bit
+        // copy can preserve neighboring packed matrices at unaligned endpoints.
+        const auto original = currentROCmDeviceOrdinal();
+        if (original < 0 || !restoreROCmDeviceOrdinal(destination_device.rocm_ordinal()))
+            return false;
+        const bool copied = launchCodedExpertBitCopyROCm(source.ptrs.d_scales, destination.ptrs.d_scales,
+            bits, src_shift, dst_shift, stream);
+        return restoreROCmDeviceOrdinal(original) && copied;
+    }
 }
 #endif

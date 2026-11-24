@@ -79,7 +79,7 @@ TEST(IQ3SSourceScale, MandatoryTupleMetadataAndOldGenerationsRejected)
 TEST(IQ3SSourceScale, OrdinaryAndExplicitRotationEncodingBoundaries)
 {
     using namespace cpu::native_quantised;
-    EXPECT_EQ(preparedEncodingForCodebook(11,false),CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale);
+    EXPECT_EQ(preparedEncodingForCodebook(11,false),CPUNativeQuantisedEncoding::CompactMultiScale);
     EXPECT_EQ(preparedEncodingForCodebook(11,true),CPUNativeQuantisedEncoding::ExpandedInt8);
     PackedWeightsHeader header{};header.codebook_id=11;header.is_superblock=1;
     header.prepared_encoding=static_cast<uint8_t>(CPUNativeQuantisedEncoding::ExpandedInt8);
@@ -88,8 +88,8 @@ TEST(IQ3SSourceScale, OrdinaryAndExplicitRotationEncodingBoundaries)
     // separately owned activation-rotation basis (an existing distinct concern).
     EXPECT_TRUE(packed_weights_serialization::validNativeSourceScaleTupleHeader(header));
 }
-/** @brief Raw source tuple bytes roundtrip in V7 and reject earlier V6 metadata. */
-TEST(IQ3SSourceScale, ArchiveRoundTripRejectsV6BeforeAdoption)
+/** @brief Raw grid, scale code and superblock bytes round-trip; earlier archive versions are inadmissible. */
+TEST(IQ3SSourceScale, CodedArchiveRoundTripRejectsOldVersionsBeforeAdoption)
 {
     using namespace cpu::native_quantised;using namespace packed_weights_serialization;
     IQ3_SBlock original{};original.d=0x3c01;original.scales[0]=1;
@@ -100,15 +100,19 @@ TEST(IQ3SSourceScale, ArchiveRoundTripRejectsV6BeforeAdoption)
     ASSERT_TRUE(prepared);CPUPackedWeights owner(std::move(packed));
     auto blob=serialize(owner);auto restored=deserialize(blob.data(),blob.size());
     ASSERT_NE(restored,nullptr);const auto *native=dynamic_cast<const CPUPackedWeights*>(restored.get());
-    ASSERT_NE(native,nullptr);EXPECT_TRUE(native->packed().usesIQ3SExpandedSourceScale());
+    ASSERT_NE(native,nullptr);
+    EXPECT_TRUE(native->packed().usesCompactMultiScale());
+    EXPECT_EQ(native->packed().geometry().header_bytes, 64u * sizeof(original.d));
     ASSERT_EQ(native->packed().native_interleaved.size(),owner.packed().native_interleaved.size());
     EXPECT_EQ(std::memcmp(native->packed().native_interleaved.data(),owner.packed().native_interleaved.data(),owner.packed().native_interleaved.size()),0);
-    const uint32_t old_version=6;
-    std::memcpy(blob.data()+offsetof(PackedWeightsHeader,version),&old_version,sizeof(old_version));
-    EXPECT_EQ(deserialize(blob.data(),blob.size()),nullptr);
-    PackedWeightsTransferDescriptor descriptor{};
-    std::memcpy(&descriptor.header,blob.data(),sizeof(descriptor.header));
-    std::memcpy(&descriptor.sections,blob.data()+sizeof(descriptor.header),sizeof(descriptor.sections));
-    EXPECT_THROW((void)allocateTransferTarget(descriptor),std::invalid_argument);
+    for (const uint32_t old_version : {6u, 7u, 8u})
+    {
+        std::memcpy(blob.data()+offsetof(PackedWeightsHeader,version),&old_version,sizeof(old_version));
+        EXPECT_EQ(deserialize(blob.data(),blob.size()),nullptr);
+        PackedWeightsTransferDescriptor descriptor{};
+        std::memcpy(&descriptor.header,blob.data(),sizeof(descriptor.header));
+        std::memcpy(&descriptor.sections,blob.data()+sizeof(descriptor.header),sizeof(descriptor.sections));
+        EXPECT_THROW((void)allocateTransferTarget(descriptor),std::invalid_argument);
+    }
 }
 } // namespace llaminar2::test

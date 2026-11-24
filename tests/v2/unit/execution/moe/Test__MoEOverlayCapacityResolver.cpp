@@ -179,35 +179,6 @@ namespace llaminar2
             return result;
         }
 
-        /** @return Independently expected CPU interleaved unit stride. */
-        [[nodiscard]] constexpr std::size_t expectedCpuStride(
-            const NativeQuantisedFormatInfo &format)
-        {
-            // Independently describe the compact multi-scale unit: per column,
-            // the source payload rounded up to whole 32-bit words, two half
-            // scales, and the effective-minimum pair only for Q2_K, its sole
-            // consumer.
-            if (format.codebook_id == 9 || format.codebook_id == 10 ||
-                (format.codebook_id >= 12 && format.codebook_id <= 17))
-                return 64 * (static_cast<std::size_t>((format.payload_bytes + 3) / 4) * sizeof(uint32_t) +
-                             2 * sizeof(uint16_t) + (format.codebook_id == 10 ? 2 * sizeof(uint16_t) : 0));
-            if (format.codebook_id == 8)
-                return 1792;
-            if (format.codebook_id == 11)
-                return 2048 + 128 + 128 + 128; // Signed grid + compensation + original d + raw4.
-            if (format.codebook_id == 4 && format.is_superblock)
-                return 1024 + 128 + 128 + 128; // Nibbles + compensation + original d + raw6.
-
-            if (format.codebook_id == 0 ||
-                format.codebook_id == 4 ||
-                format.codebook_id == 5 ||
-                format.codebook_id == kNativeQuantisedMXFP4Codebook)
-            {
-                return 1024 + 256 + (format.is_asymmetric ? 128 : 0);
-            }
-            return 2048 + 256 + (format.is_asymmetric ? 128 : 0);
-        }
-
         /** @return Independently expected allocation for one CPU projection. */
         [[nodiscard]] std::size_t expectedCpuProjectionBytes(
             const MoEOverlayProjectionWeightManifest &spec,
@@ -215,12 +186,10 @@ namespace llaminar2
         {
             const std::size_t padded_n = testAlignUp(
                 static_cast<std::size_t>(spec.N), 64);
-            const std::size_t units =
-                (padded_n / 64) * static_cast<std::size_t>(spec.K / 32);
-            // CPU expert slots are host-page aligned at every size
-            // (NUMAAllocator::externalRangeAlignment), including projections
-            // smaller than one page.
-            const std::size_t logical = units * expectedCpuStride(format);
+            using namespace cpu::native_quantised;
+            const auto geometry = preparedBlockGeometry(preparedEncodingForSource(format),
+                format.is_asymmetric, format.codebook_id, spec.K / 32);
+            const auto logical = geometry.matrixBytes(padded_n / 64);
             return testAlignUp(logical, hostPageBytes());
         }
 
@@ -666,10 +635,10 @@ namespace llaminar2
             if (source.quant_type == "IQ4_XS" && hostPageBytes() == kCpuPage)
             {
                 // N/K are gate96x64, up80x96, down64x128. Independent64-row
-                // CPU padding/page rounding gives8192+12288+8192 bytes.
+                // CPU padding/page rounding gives8192+8192+8192 bytes.
                 // Independent256-byte GPU region alignment gives4096+4864+5120.
-                EXPECT_EQ(expected.cpu_live_bytes, 28672u);
-                EXPECT_EQ(expected.cpu_shadow_bytes, 28672u);
+                EXPECT_EQ(expected.cpu_live_bytes, 24576u);
+                EXPECT_EQ(expected.cpu_shadow_bytes, 24576u);
                 EXPECT_EQ(expected.gpu_live_bytes, 14080u);
             }
             EXPECT_EQ(actual[0].layer_idx, 0);
@@ -3698,9 +3667,10 @@ namespace llaminar2
                 // small projections and is not this storage contract.
                 size_t fragment_bytes=0;
                 for(const auto &projection:cohort->localManifest(p).projections) {
-                    const size_t units=(testAlignUp(static_cast<size_t>(projection.N),64)/64)*
-                        static_cast<size_t>(projection.K/32);
-                    fragment_bytes+=testAlignUp(units*expectedCpuStride(format),kCpuPage);
+                    using namespace cpu::native_quantised;
+                    const auto geometry = preparedBlockGeometry(preparedEncodingForSource(format),
+                        format.is_asymmetric, format.codebook_id, projection.K / 32);
+                    fragment_bytes += testAlignUp(geometry.matrixBytes(testAlignUp(projection.N, 64) / 64), kCpuPage);
                 }
                 size_t serial_bytes = 0;
                 for (int expert = 0; expert < 17; ++expert)

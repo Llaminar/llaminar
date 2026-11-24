@@ -12,12 +12,13 @@
 
 #pragma once
 
-#include "kernels/cpu/gemm/CPUNativeQuantisedPreparedFootprint.h"
+#include "kernels/cpu/gemm/CPUNativeQuantisedEncoding.h"
 #include "tensors/NativeQuantisedFormatInfo.h"
 #include "MoEExpertProjectionOwnership.h"
 #include <algorithm>
 #include <stdexcept>
 #include <span>
+#include <string>
 
 #include <cstddef>
 #include <cstdint>
@@ -94,27 +95,121 @@ namespace llaminar2
         Projection source_,destination_;
     };
 
+    /**
+     * @brief Reject original K origins the resident coded CPU header cannot represent.
+     * @param source Authenticated original format, not the device decoder ID.
+     * @param original_k_origin First retained K value in original source coordinates.
+     * @throws std::invalid_argument If a coded root would straddle two source superblocks.
+     */
+    inline void requireExpertTierResidentCpuOrigin(const NativeQuantisedFormatInfo &source, int original_k_origin)
+    {
+        constexpr auto values_per_superblock = 32 * native_quantised_superblock::kBlocksPerSuperblock;
+        if (!cpu::native_quantised::migrationUsesSuperblockCodes(source) || original_k_origin % values_per_superblock == 0)
+            return;
+        std::string label = std::to_string(source.codebook_id);
+        for (const auto &entry : native_quantised_formats::kAllSourceFormats)
+            if (entry.metadata->codebook_id == source.codebook_id && entry.metadata->is_superblock == source.is_superblock)
+                label = entry.quant_type;
+        throw std::invalid_argument("Coded CPU expert " + label + " K origin " + std::to_string(original_k_origin) +
+            " is not aligned to the " + std::to_string(values_per_superblock) + "-value source superblock");
+    }
+
 #if defined(__CUDACC__) || defined(__HIPCC__)
 #define LLAMINAR_TIER_WEIGHT_HD __host__ __device__
 #else
 #define LLAMINAR_TIER_WEIGHT_HD
 #endif
-    /**
-     * @brief Common exact encoded-byte prefix; allocation padding is never traffic.
-     * @param rows Logical intersection N rows.
-     * @param blocks Intersection K blocks.
-     * @param stride Canonical resident 64-column unit bytes.
-     * @param columns_per_unit Positive live-column wire quantum, at most 64.
-     * @param count Complete wire units in this prefix.
-     * @return Exact encoded payload/metadata bytes for the logical prefix.
-     */
-    LLAMINAR_TIER_WEIGHT_HD constexpr size_t expertTierEncodedPrefix(
-        int rows,int blocks,uint32_t stride,unsigned columns_per_unit,uint64_t count) noexcept
+    /** @return Whether the resident CPU unit retains a native single-scale payload without compensation. */
+    [[nodiscard]] LLAMINAR_TIER_WEIGHT_HD constexpr bool expertTierPreservesNativeSingleScale(
+        cpu::native_quantised::CPUNativeQuantisedEncoding encoding, int codebook) noexcept
     {
-        const uint64_t full=uint64_t(rows/columns_per_unit)*blocks;
-        const uint64_t regular=count<full?count:full;
-        return size_t(regular)*(stride/64)*columns_per_unit+
-            size_t(count-regular)*(stride/64)*(rows%columns_per_unit);
+        using Encoding = cpu::native_quantised::CPUNativeQuantisedEncoding;
+        return encoding == Encoding::NibbleLUT || encoding == Encoding::Q5NativeSingleScale ||
+            cpu::native_quantised::preparedExpandedInt8OmitsCompensation(encoding, codebook);
+    }
+
+    /** @return One CPU Q5 byte holding the fifth bits for two four-lane groups. */
+    [[nodiscard]] LLAMINAR_TIER_WEIGHT_HD inline uint8_t expertTierQ5FifthFromGpu(const uint8_t *bits, unsigned group) noexcept
+    {
+        const auto shift = (group % 2) * 4;
+        return uint8_t(((bits[group / 2] >> shift) & 15) | (((bits[2 + group / 2] >> shift) & 15) << 4));
+    }
+
+    /** @return One original GPU Q5 fifth-bit byte reconstructed from its two CPU byte lanes. */
+    [[nodiscard]] LLAMINAR_TIER_WEIGHT_HD inline uint8_t expertTierQ5FifthFromCpu(const uint8_t *paired, unsigned byte) noexcept
+    {
+        const auto shift = (byte / 2) * 4;
+        return uint8_t(((paired[(byte % 2) * 2] >> shift) & 15) | (((paired[(byte % 2) * 2 + 1] >> shift) & 15) << 4));
+    }
+
+    /** @brief Live code planes in their native low/high order, independently rounded per plane. */
+    struct ExpertTierCodedPlanes
+    {
+        unsigned low_bits = 0, high_bits = 0;
+        /** @return Exact bytes of one plane for the specified live columns. */
+        [[nodiscard]] LLAMINAR_TIER_WEIGHT_HD static constexpr size_t bytes(unsigned columns, unsigned bits) noexcept
+        { return (size_t(columns) * bits + 7) / 8; }
+        /** @return Bytes of both live code planes, excluding GPU allocation guard bytes. */
+        [[nodiscard]] LLAMINAR_TIER_WEIGHT_HD constexpr size_t bytes(unsigned columns) const noexcept
+        { return bytes(columns, low_bits) + bytes(columns, high_bits); }
+    };
+
+    /** @return Native code-plane widths for a physical GPU codebook. */
+    [[nodiscard]] LLAMINAR_TIER_WEIGHT_HD constexpr ExpertTierCodedPlanes expertTierCodedPlanes(uint8_t codebook) noexcept
+    {
+        const auto bits = native_quantised_superblock::superblockCodePlaneBits(codebook);
+        return bits == 12 ? ExpertTierCodedPlanes{8, 4} : bits == 6 ? ExpertTierCodedPlanes{4, 2}
+             : ExpertTierCodedPlanes{bits, 0};
+    }
+
+    /** @return Byte offset of one column's payload byte in a resident or compact coded unit. */
+    [[nodiscard]] LLAMINAR_TIER_WEIGHT_HD constexpr size_t expertTierCodedPayloadOffset(
+        unsigned payload_bytes, unsigned columns, unsigned column, unsigned byte) noexcept
+    {
+        const auto tail = payload_bytes % 4;
+        const auto whole = payload_bytes - tail;
+        return byte < whole ? size_t(byte / 4) * columns * 4 + column * 4 + byte % 4
+            : size_t(whole) * columns + column * tail + byte - whole;
+    }
+
+    /** @return A column's complete code from the live split CPU planes (0 when in payload). */
+    [[nodiscard]] LLAMINAR_TIER_WEIGHT_HD inline uint32_t expertTierLoadCodedColumn(
+        const uint8_t *plane, ExpertTierCodedPlanes planes, unsigned columns, unsigned column) noexcept
+    {
+        using native_quantised_superblock::loadPackedBits;
+        const auto low = planes.low_bits ? loadPackedBits(plane, size_t(column) * planes.low_bits, planes.low_bits) : 0;
+        return planes.high_bits ? low | (loadPackedBits(plane + planes.bytes(columns, planes.low_bits),
+            size_t(column) * planes.high_bits, planes.high_bits) << planes.low_bits) : low;
+    }
+
+    /** @brief Root and wire geometry with exact coded per-plane extents. */
+    [[nodiscard]] LLAMINAR_TIER_WEIGHT_HD constexpr cpu::native_quantised::CPUNativeQuantisedBlockGeometry
+    expertTierBlockGeometry(unsigned blocks, unsigned columns, unsigned phase, unsigned data_stride,
+        unsigned block_stride, bool coded, uint8_t codebook) noexcept
+    {
+        return coded ? cpu::native_quantised::CPUNativeQuantisedBlockGeometry{
+            .block_stride = size_t(data_stride / 64) * columns + expertTierCodedPlanes(codebook).bytes(columns),
+            .header_bytes = size_t(native_quantised_superblock::superblockFieldBytes(codebook)) * columns,
+            .blocks_per_row = blocks, .phase = phase}
+            : cpu::native_quantised::CPUNativeQuantisedBlockGeometry{
+                .block_stride = size_t(block_stride / 64) * columns, .blocks_per_row = blocks};
+    }
+
+    /** @return Exact encoded byte prefix; a unit closing its wire superblock includes its header. */
+    template<class Layout>
+    [[nodiscard]] LLAMINAR_TIER_WEIGHT_HD constexpr size_t expertTierWirePrefix(const Layout &layout, unsigned units) noexcept
+    {
+        const auto cpu = layout.cpuStorage();
+        const auto blocks = static_cast<unsigned>(cpu.blocks_per_row);
+        const auto full = cpu.wire_columns_per_unit;
+        const auto complete = static_cast<unsigned>(cpu.N) / full;
+        const auto full_units = complete * blocks;
+        const auto geometry = cpu.wireGeometry(full);
+        if (units <= full_units)
+            return geometry.blockOffset(units / blocks, units % blocks);
+        const auto tail = cpu.wireGeometry(static_cast<unsigned>(cpu.N) % full);
+        const auto tail_units = units - full_units;
+        return geometry.matrixBytes(complete) + tail.blockOffset(tail_units / blocks, tail_units % blocks);
     }
 
     /**
@@ -133,26 +228,58 @@ namespace llaminar2
         cpu::native_quantised::CPUNativeQuantisedEncoding cpu_encoding=cpu::native_quantised::CPUNativeQuantisedEncoding::ExpandedInt8;
         uint32_t cpu_data_stride=0,cpu_block_stride=0,unit_count=0,maximum_units_per_chunk=0;
         unsigned wire_columns_per_unit=64;
+        /** @return The CPU-only endpoint of this layout. */
+        [[nodiscard]] LLAMINAR_TIER_WEIGHT_HD constexpr const ExpertTierWeightCPUStorageLayout &cpuStorage() const noexcept
+        { return *this; }
+        /** @return Whether this root contains codes and superblock words. */
+        [[nodiscard]] LLAMINAR_TIER_WEIGHT_HD constexpr bool coded() const noexcept
+        { return cpu::native_quantised::preparedSuperblockCoded(cpu_encoding); }
+        /** @return The physical codec ID (IQ4_XS uses the aliased physical ID24). */
+        [[nodiscard]] LLAMINAR_TIER_WEIGHT_HD constexpr uint8_t codedCodebook() const noexcept
+        { return cpu_codebook_id == 4 && cpu_is_superblock ? kNativeQuantisedIQ4XSSourceScaleCodebook : cpu_codebook_id; }
+        /** @return Geometry of a full CPU root, whose first source block is superblock-aligned. */
+        [[nodiscard]] LLAMINAR_TIER_WEIGHT_HD constexpr auto rootGeometry() const noexcept
+        {
+            return cpu::native_quantised::CPUNativeQuantisedBlockGeometry{
+                .block_stride = cpu_block_stride,
+                .header_bytes = coded() ? 64u * native_quantised_superblock::superblockFieldBytes(codedCodebook()) : 0u,
+                .blocks_per_row = static_cast<size_t>(cpu_K / 32)};
+        }
+        /** @return Geometry of one wire row with exactly @p columns live columns and the intersection's K phase. */
+        [[nodiscard]] LLAMINAR_TIER_WEIGHT_HD constexpr auto wireGeometry(unsigned columns) const noexcept
+        {
+            const auto phase = native_quantised_superblock::superblockPhase(cpu_first_column / 32);
+            return expertTierBlockGeometry(blocks_per_row, columns, phase, cpu_data_stride, cpu_block_stride, coded(), codedCodebook());
+        }
+        /** @return Largest live unit; one closing block includes one complete header. */
+        [[nodiscard]] constexpr size_t maximumWireUnitBytes() const noexcept
+        {
+            const auto geometry = wireGeometry(N < int(wire_columns_per_unit) ? N : wire_columns_per_unit);
+            return geometry.block_stride + geometry.header_bytes;
+        }
         /** @return Whether original local bounds, native physical traits and wire counts agree. */
         [[nodiscard]] constexpr bool valid() const noexcept
         {
+            const auto *source = native_quantised_formats::forSourceIdentity(cpu_codebook_id, cpu_is_superblock != 0);
+            if (!source || ((coded() || cpu::native_quantised::migrationUsesSuperblockCodes(*source)) &&
+                    cpu_encoding != cpu::native_quantised::preparedEncodingForSource(*source)))
+                return false;
             if(N<=0 || K<=0 || K%32 || blocks_per_row!=K/32 || cpu_N<=0 ||
                cpu_N>std::numeric_limits<int32_t>::max()-63 || cpu_K<=0 || cpu_K%32 ||
                cpu_first_row<0 || cpu_first_column<0 || cpu_first_column%32 ||
                cpu_first_row>cpu_N || N>cpu_N-cpu_first_row || cpu_first_column>cpu_K || K>cpu_K-cpu_first_column ||
                wire_columns_per_unit==0 || wire_columns_per_unit>64 || cpu_is_asymmetric>1 || cpu_is_superblock>1 ||
-               !native_quantised_formats::forSourceIdentity(cpu_codebook_id,cpu_is_superblock!=0) ||
                !cpu::native_quantised::isKnownPreparedEncoding(cpu_encoding) ||
-               cpu_data_stride!=cpu::native_quantised::preparedDataStride(cpu_encoding,cpu_codebook_id) ||
+                cpu_data_stride!=cpu::native_quantised::preparedDataStride(cpu_encoding,cpu_codebook_id) ||
                cpu_block_stride!=cpu::native_quantised::preparedInterleavedBlockStride(cpu_encoding,cpu_is_asymmetric!=0,cpu_codebook_id))return false;
             const uint64_t expected=((uint64_t(N)+wire_columns_per_unit-1)/wire_columns_per_unit)*blocks_per_row;
-            const uint64_t root_units=((uint64_t(cpu_N)+63)/64)*(cpu_K/32);
-            return root_units<=std::numeric_limits<size_t>::max()/cpu_block_stride && expected<=std::numeric_limits<uint32_t>::max() && unit_count==expected &&
+            const auto row_bytes = rootGeometry().rowBytes();
+            return row_bytes && ((uint64_t(cpu_N)+63)/64)<=std::numeric_limits<size_t>::max()/row_bytes && expected<=std::numeric_limits<uint32_t>::max() && unit_count==expected &&
                 maximum_units_per_chunk>0 && maximum_units_per_chunk<=unit_count;
         }
         /** @return Complete final CPU allocation bytes, independent of communicated extent. */
         constexpr size_t cpuStorageBytes() const noexcept
-        {return size_t((cpu_N+63)/64)*(cpu_K/32)*cpu_block_stride;}
+        { return rootGeometry().matrixBytes((cpu_N + 63) / 64); }
         /**
          * @brief Quote exact live encoded bytes for one ordered wire chunk.
          * @param units Number of complete live-column/K-block units.
@@ -160,8 +287,7 @@ namespace llaminar2
          * @return Compact encoded bytes, excluding inactive columns.
          */
         constexpr size_t chunkBytes(uint32_t units,uint32_t first_unit=0) const noexcept
-        {return expertTierEncodedPrefix(N,blocks_per_row,cpu_block_stride,wire_columns_per_unit,uint64_t(first_unit)+units)-
-                expertTierEncodedPrefix(N,blocks_per_row,cpu_block_stride,wire_columns_per_unit,first_unit);}
+        { return units ? expertTierWirePrefix(*this, first_unit + units) - expertTierWirePrefix(*this, first_unit) : 0; }
     };
 
     /** Direction in which one streamed CPU-format chunk is converted. */
@@ -202,6 +328,8 @@ namespace llaminar2
         std::uint8_t cpu_is_superblock = 0;
         std::uint8_t gpu_is_asymmetric = 0;
         std::uint8_t gpu_has_emins = 0;
+        std::uint8_t gpu_superblock_phase = 0;
+        std::uint8_t gpu_code_bit_shift = 0; ///< Live descriptor bit shift for captured transfer work.
         cpu::native_quantised::CPUNativeQuantisedEncoding cpu_encoding =
             cpu::native_quantised::CPUNativeQuantisedEncoding::ExpandedInt8;
         // CPU-unit and persistent staging capacity; no device allocation occurs.
@@ -211,7 +339,7 @@ namespace llaminar2
         std::uint32_t maximum_units_per_chunk = 0;
 
         /** @return Original CPU-only physical storage projection of this GPU-edge contract. */
-        [[nodiscard]] constexpr ExpertTierWeightCPUStorageLayout cpuStorage() const noexcept
+        [[nodiscard]] LLAMINAR_TIER_WEIGHT_HD constexpr ExpertTierWeightCPUStorageLayout cpuStorage() const noexcept
         {
             return {.N=N,.K=K,.blocks_per_row=blocks_per_row,.cpu_N=cpu_N,.cpu_K=cpu_K,
                 .cpu_first_row=cpu_first_row,.cpu_first_column=cpu_first_column,
@@ -287,6 +415,31 @@ namespace llaminar2
                 return false;
             }
 
+            const auto cpu = cpuStorage();
+            if (cpu.coded() != cpu::native_quantised::migrationUsesSuperblockCodes(*source_format))
+                return false;
+            if (cpu.coded())
+            {
+                const auto physical = canonicalDeviceVnniFormat(*source_format);
+                return cpu.valid() && cpu_encoding == cpu::native_quantised::preparedEncodingForSource(*source_format) &&
+                    gpu_superblock_phase < native_quantised_superblock::kBlocksPerSuperblock && gpu_code_bit_shift < 8 &&
+                    native_quantised_superblock::superblockPhase(gpu_superblock_phase + gpu_first_column / 32) ==
+                        cpu.wireGeometry(64).phase &&
+                    gpu_codebook_id == physical.codebook_id && gpu_payload_bytes_per_block == physical.payload_bytes_per_block &&
+                    gpu_is_asymmetric == physical.is_asymmetric && gpu_has_emins == physical.has_emins &&
+                    cpu_is_asymmetric == source_format->is_asymmetric;
+            }
+            if (gpu_superblock_phase != 0 || gpu_code_bit_shift != 0)
+                return false;
+            if (expertTierPreservesNativeSingleScale(cpu_encoding, cpu_codebook_id))
+            {
+                const auto physical = canonicalDeviceVnniFormat(*source_format);
+                return cpu.valid() && cpu_encoding == cpu::native_quantised::preparedEncodingForSource(*source_format) &&
+                    gpu_codebook_id == physical.codebook_id && gpu_payload_bytes_per_block == physical.payload_bytes_per_block &&
+                    gpu_is_asymmetric == physical.is_asymmetric && gpu_has_emins == physical.has_emins &&
+                    cpu_is_asymmetric == source_format->is_asymmetric;
+            }
+
             if (gpu_to_cpu)
             {
                 // A demotion kernel must decode the actual accelerator source,
@@ -342,6 +495,8 @@ namespace llaminar2
                 return false;
             switch (cpu_encoding)
             {
+            case Encoding::Q5NativeSingleScale:
+                return false; // Native Q5 requires file-density GPU slots and an explicit converter.
             case Encoding::IQ3SExpandedSourceScale:
                 return cpu_codebook_id == 11 && cpu_is_superblock == 1 &&
                        gpu_codebook_id == 11 && gpu_payload_bytes_per_block == 13 &&
@@ -372,14 +527,7 @@ namespace llaminar2
                        gpu_payload_bytes_per_block == 24 &&
                        cpu_is_asymmetric != 0 && gpu_is_asymmetric != 0;
             case Encoding::CompactMultiScale:
-                return hasCompactMultiScaleVnniPayload(cpu_codebook_id) &&
-                       gpu_codebook_id == cpu_codebook_id &&
-                       gpu_payload_bytes_per_block == source_format->payload_bytes &&
-                       // Secondary-plane presence follows the source: single-scale
-                       // IQ3_XXS/IQ2_XXS units carry none on either side.
-                       cpu_is_asymmetric == static_cast<uint8_t>(source_format->is_asymmetric) &&
-                       gpu_is_asymmetric == cpu_is_asymmetric &&
-                       gpu_has_emins == static_cast<uint8_t>(source_format->has_emins);
+                return false; // Coded endpoint admission is handled above.
             }
             return false;
         }
@@ -393,13 +541,12 @@ namespace llaminar2
         [[nodiscard]] constexpr std::size_t chunkBytes(
             std::uint32_t units, std::uint32_t first_unit = 0) const noexcept
         {
-            return expertTierEncodedPrefix(N,blocks_per_row,cpu_block_stride,64,uint64_t(first_unit)+units)-
-                expertTierEncodedPrefix(N,blocks_per_row,cpu_block_stride,64,first_unit);
+            return cpuStorage().chunkBytes(units, first_unit);
         }
         /** @return Exact final CPU allocation extent, independent of transfer bytes. */
         [[nodiscard]] constexpr std::size_t cpuStorageBytes() const noexcept
         {
-            return static_cast<std::size_t>((cpu_N+63)/64)*(cpu_K/32)*cpu_block_stride;
+            return cpuStorage().cpuStorageBytes();
         }
     };
 
@@ -415,12 +562,6 @@ namespace llaminar2
         const unsigned first=(unit/static_cast<unsigned>(layout.blocks_per_row))*quantum;
         return static_cast<unsigned>(layout.N)-first<quantum?static_cast<unsigned>(layout.N)-first:quantum;
     }
-    /** @brief Byte prefix of exact live column planes in the canonical ordered stream. */
-    template<class Layout>
-    LLAMINAR_TIER_WEIGHT_HD inline size_t expertTierWirePrefix(const Layout& layout,unsigned units) noexcept
-    {
-        return expertTierEncodedPrefix(layout.N,layout.blocks_per_row,layout.cpu_block_stride,expertTierWireColumnQuantum(layout),units);
-    }
     /** @brief Staging byte origin of a chunk-relative unit, including compact tail planes. */
     template<class Layout>
     LLAMINAR_TIER_WEIGHT_HD inline size_t expertTierWireOffset(const Layout& layout,unsigned first,unsigned local) noexcept
@@ -429,11 +570,27 @@ namespace llaminar2
     template<class Layout>
     LLAMINAR_TIER_WEIGHT_HD inline unsigned expertTierWireUnitAt(const Layout& layout,size_t bytes) noexcept
     {
-        const auto quantum=expertTierWireColumnQuantum(layout);
-        const unsigned regular=static_cast<unsigned>(layout.N/quantum)*layout.blocks_per_row;
-        const size_t stride=(layout.cpu_block_stride/64)*quantum,prefix=size_t(regular)*stride;
-        return bytes<prefix?static_cast<unsigned>(bytes/stride):
-            regular+static_cast<unsigned>((bytes-prefix)/((layout.cpu_block_stride/64)*(layout.N%quantum?layout.N%quantum:quantum)));
+        const auto cpu = layout.cpuStorage();
+        if (!cpu.coded())
+        {
+            const unsigned regular = (cpu.N / cpu.wire_columns_per_unit) * cpu.blocks_per_row;
+            const auto stride = cpu.wireGeometry(cpu.wire_columns_per_unit).block_stride;
+            const size_t prefix = size_t(regular) * stride;
+            if (bytes <= prefix)
+                return static_cast<unsigned>(bytes / stride);
+            return regular + static_cast<unsigned>((bytes - prefix) /
+                cpu.wireGeometry(cpu.N % cpu.wire_columns_per_unit).block_stride);
+        }
+        unsigned low = 0, high = layout.unit_count;
+        while (low < high)
+        {
+            const unsigned mid = low + (high - low) / 2;
+            if (expertTierWirePrefix(layout, mid) < bytes)
+                low = mid + 1;
+            else
+                high = mid;
+        }
+        return low;
     }
 #undef LLAMINAR_TIER_WEIGHT_HD
 
@@ -476,6 +633,7 @@ namespace llaminar2
         std::size_t scales_bytes = 0;
         std::size_t mins_bytes = 0;
         std::size_t emins_bytes = 0;
+        uint8_t metadata_layout = 0;
 
         /**
          * @brief Validate read-only regions against a scalar layout.
@@ -489,6 +647,23 @@ namespace llaminar2
             if (!layout.valid() || payload == nullptr || scales == nullptr)
                 return false;
             // GPU arrays omit padded N and are block-major over logical rows.
+            if (layout.cpuStorage().coded())
+            {
+                using namespace native_quantised_superblock;
+                if (!nativeQuantisedLayoutValid(layout.gpu_codebook_id, metadata_layout) ||
+                    nativeQuantisedLayoutRepresentation(metadata_layout) != NativeQuantisedMetadataRepresentation::SuperblockCoded ||
+                    nativeQuantisedLayoutPhase(metadata_layout) != layout.gpu_superblock_phase)
+                    return false;
+                const auto blocks = static_cast<unsigned>(layout.gpu_K / 32);
+                const auto bits = size_t(layout.gpu_N) * blocks * superblockCodePlaneBits(layout.gpu_codebook_id);
+                const auto bytes = planeBytes(layout.gpu_codebook_id, layout.gpu_N, blocks, layout.gpu_superblock_phase);
+                const auto shift = nativeQuantisedLayoutCodeBitShift(metadata_layout);
+                return payload_bytes == size_t(layout.gpu_N) * blocks * layout.gpu_payload_bytes_per_block &&
+                    scales_bytes == (bits ? (bits + shift + 7) / 8 : 0) && (bits || (!shift && scales == reinterpret_cast<const uint16_t *>(payload))) &&
+                    mins && mins_bytes == bytes.superblock && !emins && !emins_bytes;
+            }
+            if (metadata_layout)
+                return false;
             const std::size_t blocks =
                 static_cast<std::size_t>(layout.gpu_N) *
                 static_cast<std::size_t>(layout.gpu_K/32);
@@ -521,6 +696,7 @@ namespace llaminar2
         std::size_t scales_bytes = 0;
         std::size_t mins_bytes = 0;
         std::size_t emins_bytes = 0;
+        uint8_t metadata_layout = 0;
 
         /**
          * @brief Convert mutable ownership to a read-only launch view.
@@ -539,6 +715,7 @@ namespace llaminar2
                 .scales_bytes = scales_bytes,
                 .mins_bytes = mins_bytes,
                 .emins_bytes = emins_bytes,
+                .metadata_layout = metadata_layout,
             };
         }
 

@@ -577,6 +577,12 @@ namespace
             std::printf("\n");
         }
 #else
+        // CUDA-only builds share the population-profile reporting path below,
+        // which reads the ROCm-specific population flags; they are simply false
+        // when the ROCm engine is not compiled.
+        constexpr bool qwen_population = false;
+        constexpr bool compact_population = false;
+        constexpr int automatic_native_families = 0;
         if (native) GTEST_SKIP() << "ROCm support is not compiled";
 #endif
         auto *backend = getBackendFor(parameter.device);

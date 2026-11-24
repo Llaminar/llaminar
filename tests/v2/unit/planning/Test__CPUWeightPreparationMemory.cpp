@@ -13,6 +13,7 @@
 #include <gtest/gtest.h>
 #include <limits>
 #include <atomic>
+#include <tuple>
 
 using namespace llaminar2;
 
@@ -43,16 +44,26 @@ TEST(CPUWeightPreparationMemory, EveryNativeCodebookHasPaddedAllocationGeometry)
     }
 }
 
+/** @test The retained BOM uses native payload and header geometry, not the transient pack scratch. */
 TEST(CPUWeightPreparationMemory, NibbleSetupPayloadsRetireBeforePublication)
 {
-    const auto q4 = CPUWeightPreparationMemory::sourceNative("Q4_0", 64, 32);
-    EXPECT_EQ(q4.persistent_bytes,1280u);
-    EXPECT_EQ(q4.persistent_payload_bytes,1280u);
-    EXPECT_EQ(q4.temporary_bytes,64u*cpu::native_quantised::NativePackGroupScratch::checked(*native_quantised_formats::forQuantType("Q4_0")).bytes);
-    const auto q6 = CPUWeightPreparationMemory::sourceNative("Q6_K", 64, 256);
-    EXPECT_EQ(q6.persistent_payload_bytes,8u*1792u);
-    EXPECT_EQ(q6.persistent_bytes,AlignedVector<uint8_t>::requiredAllocationBytes(8u*1792u));
-    EXPECT_EQ(q6.temporary_bytes,64u*cpu::native_quantised::NativePackGroupScratch::checked(*native_quantised_formats::forQuantType("Q6_K")).bytes);
+    using namespace cpu::native_quantised;
+    for (const auto &[name, k, source_block_bytes] : {
+            std::tuple{"Q4_0", 32u, sizeof(Q4_0Block)},
+            std::tuple{"Q6_K", 256u, sizeof(Q6_KBlock)}})
+    {
+        SCOPED_TRACE(name);
+        const auto *format = native_quantised_formats::forQuantType(name);
+        ASSERT_NE(format, nullptr);
+        const auto geometry = preparedBlockGeometry(preparedEncodingForSource(*format),
+            format->is_asymmetric, format->codebook_id, k / 32);
+        const auto payload = geometry.matrixBytes(1);
+        EXPECT_EQ(payload, 64u * source_block_bytes);
+        const auto demand = CPUWeightPreparationMemory::sourceNative(name, 64, k);
+        EXPECT_EQ(demand.persistent_payload_bytes, payload);
+        EXPECT_EQ(demand.persistent_bytes, AlignedVector<uint8_t>::requiredAllocationBytes(payload));
+        EXPECT_EQ(demand.temporary_bytes, 64u * NativePackGroupScratch::checked(*format).bytes);
+    }
     EXPECT_GT(CPUWeightPreparationMemory::sourceNative("IQ2_S", 64, 256).temporary_bytes,0u);
 }
 

@@ -150,13 +150,15 @@ TEST(Test__PackedWeightsSerialization, CompactMultiScalePreservesEveryNativeMeta
     for (const auto &entry : native_quantised_formats::kAllSourceFormats)
     {
         const auto &format = *entry.metadata;
-        if (!hasCompactMultiScaleVnniPayload(format.codebook_id))
+        if (preparedEncodingForSource(format) != CPUNativeQuantisedEncoding::CompactMultiScale)
             continue;
         SCOPED_TRACE(std::string(entry.quant_type));
+        constexpr auto encoding = CPUNativeQuantisedEncoding::CompactMultiScale;
+        const auto geometry = preparedBlockGeometry(encoding, format.is_asymmetric, format.codebook_id, 17);
         auto packed = buildTestPacked(
-            67, 544, format.codebook_id, 17, format.payload_bytes,
-            false, true, true, 1024, 1536, 2 * 17 * 1536, 0, 0);
-        packed.encoding = CPUNativeQuantisedEncoding::CompactMultiScale;
+            67, 544, format.codebook_id, 17, format.payload_bytes, false, format.is_asymmetric, true,
+            preparedDataStride(encoding, format.codebook_id), geometry.block_stride, geometry.matrixBytes(2), 0, 0);
+        packed.encoding = encoding;
         CPUPackedWeights owner(std::move(packed));
         const auto blob = serialize(owner);
         ASSERT_FALSE(blob.empty());
@@ -173,6 +175,27 @@ TEST(Test__PackedWeightsSerialization, CompactMultiScalePreservesEveryNativeMeta
                               owner.packed().native_interleaved.data(),
                               received.native_interleaved.size()), 0);
         EXPECT_TRUE(received.int8_flat.empty());
+
+        PackedWeightsTransferDescriptor direct{};
+        PackedWeightsConstSectionViews views{};
+        ASSERT_TRUE(describeTransfer(owner, direct, views));
+        EXPECT_EQ(views.sizes[0], geometry.matrixBytes(2));
+        auto receive = allocateTransferTarget(direct);
+        ASSERT_EQ(receive.sizes[0], views.sizes[0]);
+        std::memcpy(receive.data[0], views.data[0], receive.sizes[0]);
+        const auto *adopted = dynamic_cast<const CPUPackedWeights *>(receive.weights.get());
+        ASSERT_NE(adopted, nullptr);
+        EXPECT_EQ(std::memcmp(adopted->packed().native_interleaved.data(), views.data[0], receive.sizes[0]), 0);
+        auto short_section = direct;
+        --short_section.sections.interleaved_size;
+        EXPECT_THROW((void)allocateTransferTarget(short_section), std::invalid_argument);
+        auto bad_blob = blob;
+        std::memcpy(bad_blob.data() + sizeof(PackedWeightsHeader), &short_section.sections, sizeof(short_section.sections));
+        EXPECT_EQ(deserialize(bad_blob.data(), bad_blob.size()), nullptr);
+        bad_blob = blob;
+        constexpr uint32_t uncoded_version = 8;
+        std::memcpy(bad_blob.data() + offsetof(PackedWeightsHeader, version), &uncoded_version, sizeof(uncoded_version));
+        EXPECT_EQ(deserialize(bad_blob.data(), bad_blob.size()), nullptr);
 
         // Older producers encoded these same source identities using a lossy
         // single-scale representation. The archive version is an arithmetic
@@ -423,7 +446,7 @@ TEST(Test__PackedWeightsSerialization, SerializeDeserialize_WithInt8Flat)
 {
     // Test with all three data sections populated.
     auto packed = buildTestPacked(
-        64, 128, /*codebook_id=*/19, /*blocks_per_row=*/4,
+        64, 128, /*codebook_id=*/0, /*blocks_per_row=*/4,
         /*payload_bytes=*/34, /*is_nibble_lut=*/false, /*is_asymmetric=*/false,
         /*is_superblock=*/false, /*data_stride=*/2048, /*interleaved_block_stride=*/2304,
         /*interleaved_sz=*/1 * 4 * 2304, /*payload_sz=*/1 * 4 * 64 * 34,
@@ -441,7 +464,7 @@ TEST(Test__PackedWeightsSerialization, SerializeDeserialize_WithInt8Flat)
     ASSERT_NE(cpu_result, nullptr);
 
     const auto& p = cpu_result->packed();
-    EXPECT_EQ(p.codebook_id, 19);
+    EXPECT_EQ(p.codebook_id, 0);
     EXPECT_EQ(p.data_stride, 2048);
     EXPECT_EQ(p.interleaved_block_stride, 2304);
     EXPECT_TRUE(p.usesExpandedInt8());
@@ -483,9 +506,11 @@ TEST(Test__PackedWeightsSerialization, SerializeDeserialize_SuperblockFormat)
 /** @brief Same-sized old Q6 metadata must not be adopted as source coefficients. */
 TEST(Test__PackedWeightsSerialization, Q6SourceFactorsRoundTripAndRejectVersion3)
 {
+    constexpr auto encoding = CPUNativeQuantisedEncoding::Q6KNativeDualScale;
+    constexpr auto geometry = preparedBlockGeometry(encoding, true, 8, 9);
     auto packed = buildTestPacked(67, 288, 8, 9, 24, false, true, true,
-        1536, 1792, 2 * 9 * 1792, 0, 0);
-    packed.encoding = CPUNativeQuantisedEncoding::Q6KNativeDualScale;
+        preparedDataStride(encoding, 8), geometry.block_stride, geometry.matrixBytes(2), 0, 0);
+    packed.encoding = encoding;
     CPUPackedWeights owner(std::move(packed));
     auto blob = serialize(owner);
     auto restored = deserialize(blob.data(), blob.size());
@@ -518,16 +543,25 @@ TEST(Test__PackedWeightsSerialization, IQ2SRawCoefficientWordsPreserveAllBytes)
 /** @brief Source-word archives roundtrip exactly and reject derived-half V4 first. */
 TEST(Test__PackedWeightsSerialization, IQ2SSourceFactorsRoundTripAndRejectVersion4)
 {
-    auto packed=buildTestPacked(67,288,13,9,9,false,true,true,
-        1024,1536,2*9*1536,0,0);
-    packed.encoding=CPUNativeQuantisedEncoding::CompactMultiScale;
-    for(int c=0;c<2;++c) for(int kb=0;kb<9;++kb) for(int n=0;n<64;++n)
-    {
-        const unsigned ordinal=unsigned(c*9*64+kb*64+n);
-        const_cast<uint16_t*>(packed.chunkScales(c,kb))[n]=
-            static_cast<uint16_t>((ordinal&1u)?0x8001u:0x3c01u);
-        const_cast<uint16_t*>(packed.chunkMins(c,kb))[n]=static_cast<uint8_t>(ordinal);
-    }
+    constexpr auto encoding = CPUNativeQuantisedEncoding::CompactMultiScale;
+    const auto &format = native_quantised_formats::IQ2_S;
+    const auto geometry = preparedBlockGeometry(encoding, format.is_asymmetric, format.codebook_id, 9);
+    auto packed = buildTestPacked(67, 288, format.codebook_id, 9, format.payload_bytes, false,
+        format.is_asymmetric, true, preparedDataStride(encoding, format.codebook_id),
+        geometry.block_stride, geometry.matrixBytes(2), 0, 0);
+    packed.encoding = encoding;
+    auto bytes = packed.native_interleaved.beginRewrite();
+    for (int c = 0; c < 2; ++c)
+        for (int kb = 0; kb < 9; ++kb)
+            for (int n = 0; n < 64; ++n)
+            {
+                const auto ordinal = unsigned((c * 9 + kb) * 64 + n);
+                coded_metadata::storeCode(bytes.data() + geometry.blockOffset(c, kb) + packed.data_stride,
+                    format.codebook_id, n, ordinal);
+                if (kb % 8 == 0)
+                    coded_metadata::storeSuperblockWord(bytes.data() + geometry.headerOffset(c, kb),
+                        format.codebook_id, n, (ordinal & 1u) ? 0x8001u : 0x3c01u);
+            }
     CPUPackedWeights owner(std::move(packed));
     auto blob=serialize(owner);
     ASSERT_FALSE(blob.empty());
@@ -586,15 +620,11 @@ TEST(Test__PackedWeightsSerialization, IQ2SGpuWireSourceFactorsRoundTripAndRejec
 /** @brief Raw IQ4_XS tuples survive CPU serialization and reject derived-half V5. */
 TEST(Test__PackedWeightsSerialization, IQ4XSSourceTupleRoundTripsAndRejectsVersion5)
 {
+    constexpr auto encoding = CPUNativeQuantisedEncoding::NibbleLUTSourceScale;
+    constexpr auto geometry = preparedBlockGeometry(encoding, false, 4, 9);
     auto packed = buildTestPacked(67, 288, 4, 9, 16, false, false, true,
-        1024, 1408, 2 * 9 * 1408, 0, 0);
-    packed.encoding = CPUNativeQuantisedEncoding::NibbleLUTSourceScale;
-    for (int c = 0; c < 2; ++c) for (int kb = 0; kb < 9; ++kb) for (int n = 0; n < 64; ++n)
-    {
-        const unsigned ordinal = unsigned(c * 9 * 64 + kb * 64 + n);
-        const_cast<uint16_t *>(packed.chunkScales(c, kb))[n] = ordinal & 1u ? 0x8001u : 0x3c01u;
-        const_cast<uint16_t *>(packed.chunkMins(c, kb))[n] = ordinal % 64;
-    }
+        preparedDataStride(encoding, 4), geometry.block_stride, geometry.matrixBytes(2), 0, 0);
+    packed.encoding = encoding;
     CPUPackedWeights owner(std::move(packed));
     auto blob = serialize(owner);
     auto restored = deserialize(blob.data(), blob.size());
@@ -614,33 +644,33 @@ TEST(Test__PackedWeightsSerialization, IQ4XSSourceTupleRoundTripsAndRejectsVersi
 }
 
 /**
- * @brief Native MXFP4 CPU units (BF16 power-of-two scale words) round-trip and
+ * @brief Native MXFP4 CPU units (E8M0 scale bytes) round-trip and
  * reject version-7 archives, whose identical codebook/encoding carried FP16 words.
  */
-TEST(Test__PackedWeightsSerialization, MXFP4NativeUnitScaleWordsRoundTripAndRejectVersion7)
+TEST(Test__PackedWeightsSerialization, MXFP4NativeUnitE8M0BytesRoundTripAndRejectVersion7)
 {
     auto packed = buildTestPacked(
         /*N=*/64, /*K=*/64, /*codebook_id=*/kNativeQuantisedMXFP4Codebook, /*blocks_per_row=*/2,
         /*payload_bytes=*/16, /*is_nibble_lut=*/true, /*is_asymmetric=*/false,
-        /*is_superblock=*/false, /*data_stride=*/1024, /*interleaved_block_stride=*/1280,
-        /*interleaved_sz=*/2 * 1280, /*payload_sz=*/0, /*int8_flat_sz=*/0);
-    ASSERT_EQ(packed.scaleEncoding(), CPUNativeQuantisedScaleEncoding::PowerOfTwoBF16);
+        /*is_superblock=*/false, /*data_stride=*/1024, /*interleaved_block_stride=*/1088,
+        /*interleaved_sz=*/2 * 1088, /*payload_sz=*/0, /*int8_flat_sz=*/0);
+    ASSERT_EQ(packed.scaleEncoding(), CPUNativeQuantisedScaleEncoding::E8M0);
     for (int kb = 0; kb < 2; ++kb)
         for (int n = 0; n < 64; ++n)
-            const_cast<uint16_t *>(packed.chunkScales(0, kb))[n] =
-                mxfp4::powerOfTwoBF16Word(static_cast<uint8_t>(n % 7 == 3 ? 0 : 2 + (kb * 64 + n) % 251));
+            packed.native_interleaved.beginRewrite()[packed.blockOffset(0, kb) + packed.data_stride + n] =
+                static_cast<uint8_t>(n % 7 == 3 ? 0 : 2 + (kb * 64 + n) % 251);
     CPUPackedWeights owner(std::move(packed));
     auto blob = serialize(owner);
     auto restored = deserialize(blob.data(), blob.size());
     ASSERT_NE(restored, nullptr);
     const auto *native = dynamic_cast<const CPUPackedWeights *>(restored.get());
     ASSERT_NE(native, nullptr);
-    EXPECT_EQ(native->packed().scaleEncoding(), CPUNativeQuantisedScaleEncoding::PowerOfTwoBF16);
+    EXPECT_EQ(native->packed().scaleEncoding(), CPUNativeQuantisedScaleEncoding::E8M0);
     EXPECT_EQ(std::memcmp(native->packed().native_interleaved.data(),
         owner.packed().native_interleaved.data(), owner.packed().native_interleaved.size()), 0);
     for (int n = 0; n < 64; ++n)
         EXPECT_EQ(native->packed().blockScale(0, 1, n), owner.packed().blockScale(0, 1, n)) << n;
-    // Fresh version-8 direct receive: describe, allocate, receive sections, adopt.
+    // Fresh direct receive: describe, allocate, receive sections, adopt.
     {
         PackedWeightsTransferDescriptor direct{};
         PackedWeightsConstSectionViews views{};
@@ -656,7 +686,7 @@ TEST(Test__PackedWeightsSerialization, MXFP4NativeUnitScaleWordsRoundTripAndReje
         }
         const auto *received = dynamic_cast<const CPUPackedWeights *>(target.weights.get());
         ASSERT_NE(received, nullptr);
-        EXPECT_EQ(received->packed().scaleEncoding(), CPUNativeQuantisedScaleEncoding::PowerOfTwoBF16);
+        EXPECT_EQ(received->packed().scaleEncoding(), CPUNativeQuantisedScaleEncoding::E8M0);
         EXPECT_EQ(std::memcmp(received->packed().native_interleaved.data(),
             owner.packed().native_interleaved.data(), owner.packed().native_interleaved.size()), 0);
         for (int kb = 0; kb < 2; ++kb)
@@ -671,6 +701,43 @@ TEST(Test__PackedWeightsSerialization, MXFP4NativeUnitScaleWordsRoundTripAndReje
     std::memcpy(&descriptor.header, blob.data(), sizeof(descriptor.header));
     std::memcpy(&descriptor.sections, blob.data() + sizeof(descriptor.header), sizeof(descriptor.sections));
     EXPECT_THROW((void)allocateTransferTarget(descriptor), std::invalid_argument);
+}
+
+/** @brief Exact Q8 archives round-trip and reject the old per-block weight-sum plane, even with a current header version. */
+TEST(Test__PackedWeightsSerialization, Q8ExpandedDensityRejectsLegacyCompensationPlane)
+{
+    using llaminar2::test::TestTensorFactory;
+    for (bool superblock : {false, true})
+    {
+        SCOPED_TRACE(superblock);
+        std::unique_ptr<TensorBase> source;
+        if (superblock)
+            source = TestTensorFactory::createQ8_KRandom({67, 256});
+        else
+            source = TestTensorFactory::createQ8_1Random({67, 256});
+        CPUNativeQuantisedPackedWeights packed;
+        ASSERT_TRUE(packWeightsCPUNativeQuantised(source.get(), packed));
+        CPUPackedWeights owner(std::move(packed));
+        auto blob = serialize(owner);
+        auto restored = deserialize(blob.data(), blob.size());
+        const auto *native = dynamic_cast<const CPUPackedWeights *>(restored.get());
+        ASSERT_NE(native, nullptr);
+        const auto &bytes = native->packed().native_interleaved;
+        ASSERT_EQ(bytes.size(), 128u * 8u * 34u);
+        EXPECT_EQ(std::memcmp(bytes.data(), owner.packed().native_interleaved.data(), bytes.size()), 0);
+
+        PackedWeightsTransferDescriptor direct{};
+        PackedWeightsConstSectionViews views{};
+        ASSERT_TRUE(describeTransfer(owner, direct, views));
+        EXPECT_NO_THROW((void)allocateTransferTarget(direct));
+        direct.header.interleaved_block_stride += 128;
+        direct.sections.interleaved_size += 2u * 8u * 128u;
+        EXPECT_THROW((void)allocateTransferTarget(direct), std::invalid_argument);
+        blob.resize(sizeof(PackedWeightsHeader) + sizeof(PackedWeightsSectionTable) + direct.sections.interleaved_size);
+        std::memcpy(blob.data(), &direct.header, sizeof(direct.header));
+        std::memcpy(blob.data() + sizeof(direct.header), &direct.sections, sizeof(direct.sections));
+        EXPECT_EQ(deserialize(blob.data(), blob.size()), nullptr);
+    }
 }
 
 /** @brief GPU tuple wire has20 bytes/block, authentic source4 and a distinct physical ID. */
@@ -839,16 +906,23 @@ TEST(Test__PackedWeightsSerialization, CPUPreparedBankAllocationAndArchiveReplay
             EXPECT_EQ(std::memcmp(reference.data(), scalar.data(), sizeof(reference)), 0);
             CPUPackedWeights legacy_owner(std::move(legacy));
             const auto legacy_blob = serialize(legacy_owner);
-            ASSERT_GT(legacy_blob.size(), canonical_blob.size());
-            EXPECT_EQ(KernelFactory::createExpertGemmFromTransferBlob(
-                legacy_blob.data(), legacy_blob.size() - 1), nullptr);
-            legacy_imported = KernelFactory::createExpertGemmFromTransferBlob(
-                legacy_blob.data(), legacy_blob.size());
-            ASSERT_TRUE(legacy_imported);
-            expectCanonicalCPUProjectionAllocation(*legacy_imported, *format);
-            // Attachment is a distinct publication boundary from construction.
-            ASSERT_TRUE(imported->attachWeights(deserialize(legacy_blob.data(), legacy_blob.size())));
-            expectCanonicalCPUProjectionAllocation(*imported, *format);
+            if (preparedSuperblockCoded(packed->encoding))
+            {
+                EXPECT_TRUE(legacy_blob.empty()) << "Coded archive must reject a redundant source shadow";
+            }
+            else
+            {
+                ASSERT_GT(legacy_blob.size(), canonical_blob.size());
+                EXPECT_EQ(KernelFactory::createExpertGemmFromTransferBlob(
+                    legacy_blob.data(), legacy_blob.size() - 1), nullptr);
+                legacy_imported = KernelFactory::createExpertGemmFromTransferBlob(
+                    legacy_blob.data(), legacy_blob.size());
+                ASSERT_TRUE(legacy_imported);
+                expectCanonicalCPUProjectionAllocation(*legacy_imported, *format);
+                // Attachment is a distinct publication boundary from construction.
+                ASSERT_TRUE(imported->attachWeights(deserialize(legacy_blob.data(), legacy_blob.size())));
+                expectCanonicalCPUProjectionAllocation(*imported, *format);
+            }
         }
         for (auto replay : {imported, legacy_imported})
         {

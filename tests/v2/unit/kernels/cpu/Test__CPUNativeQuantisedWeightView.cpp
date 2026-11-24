@@ -59,14 +59,34 @@ TEST(CPUNativeQuantisedWeightView, AllSourcesKeepTheirCanonicalRootAndMetadataCo
         EXPECT_EQ(view.is_superblock, source.metadata->is_superblock);
         EXPECT_EQ(view.interleavedBase(), fixture.bytes.data());
         EXPECT_EQ(view.bytes().size(), fixture.bytes.size());
-        const auto *unit = fixture.bytes.data() + 5 * view.interleaved_block_stride;
-        const std::size_t metadata = view.usesInlineCompensation() ? 128 : 0;
-        EXPECT_EQ(reinterpret_cast<const std::uint8_t *>(view.chunkScales(1, 2)), unit + view.data_stride + metadata);
-        if (view.is_asymmetric || view.usesNibbleLUTSourceScale() || view.usesIQ3SExpandedSourceScale() ||
-            view.usesQ6KNativeDualScale() || view.usesCompactMultiScale())
-            EXPECT_EQ(reinterpret_cast<const std::uint8_t *>(view.chunkMins(1, 2)), unit + view.data_stride + metadata + 128);
-        else
+        const auto *unit = fixture.bytes.data() + view.geometry().blockOffset(1, 2);
+        EXPECT_EQ(view.blockUnit(1, 2), unit);
+        if (view.superblockCoded())
+        {
+            EXPECT_EQ(unit, fixture.bytes.data() + 5 * view.interleaved_block_stride + view.superblock_header_bytes);
+            EXPECT_EQ(view.superblockHeader(1, 2), unit + view.interleaved_block_stride);
+            EXPECT_EQ(view.superblockHeader(1, 2), view.superblockHeader(1, 0));
+            EXPECT_THROW((void)view.chunkScales(1, 2), std::logic_error);
             EXPECT_THROW((void)view.chunkMins(1, 2), std::logic_error);
+        }
+        else
+        {
+            const std::size_t metadata = view.usesInlineCompensation() ? 128 : 0;
+            EXPECT_EQ(unit, fixture.bytes.data() + 5 * view.interleaved_block_stride);
+            if (view.scaleEncoding() == CPUNativeQuantisedScaleEncoding::E8M0)
+            {
+                EXPECT_EQ(view.admittedE8M0Scales(1, 2), unit + view.data_stride);
+                EXPECT_THROW((void)view.chunkScales(1, 2), std::logic_error);
+            }
+            else
+                EXPECT_EQ(reinterpret_cast<const std::uint8_t *>(view.chunkScales(1, 2)), unit + view.data_stride + metadata);
+            if (view.is_asymmetric || view.usesNibbleLUTSourceScale() || view.usesIQ3SExpandedSourceScale() ||
+                view.usesQ6KNativeDualScale())
+                EXPECT_EQ(reinterpret_cast<const std::uint8_t *>(view.chunkMins(1, 2)), unit + view.data_stride + metadata + 128);
+            else
+                EXPECT_THROW((void)view.chunkMins(1, 2), std::logic_error);
+            EXPECT_THROW((void)view.superblockHeader(1, 2), std::logic_error);
+        }
         EXPECT_EQ(view.interleavedB(1, 2, 0, 3), unit + 192);
         EXPECT_THROW((void)view.interleavedB(2, 0, 0, 0), std::out_of_range);
         EXPECT_THROW((void)view.interleavedB(0, 3, 0, 0), std::out_of_range);
@@ -75,20 +95,13 @@ TEST(CPUNativeQuantisedWeightView, AllSourcesKeepTheirCanonicalRootAndMetadataCo
     }
 }
 
-/** @test Raw source coefficients reproduce original half-factor arithmetic without new narrowing. */
-TEST(CPUNativeQuantisedWeightView, CompactStrideFollowsTheDecodedPayloadWords)
+/** @test Compact byte geometry independently accounts for payload, codes and ragged headers. */
+TEST(CPUNativeQuantisedWeightView, CompactStrideFollowsSourcePayloadAndCodeWidths)
 {
-    // The compact family reserves exactly the payload words each codebook
-    // decodes (two 32-bit words for 6-8 byte payloads, three for 9-12 byte
-    // payloads) plus two FP16 scale vectors and the effective-minimum vector.
-    // Proving the exact per-codebook extents keeps packing, execution,
-    // tier-stream geometry and memory planning on one layout authority.
-    struct Expected { int codebook; std::uint32_t data; std::uint32_t unit; };
-    // The effective-minimum vector is reserved only for Q2_K (codebook 10),
-    // the sole consumer of chunkEffectiveMins.
+    struct Expected { int codebook; std::uint32_t data; std::uint32_t unit; std::uint32_t header; };
     const Expected expected[] = {
-        {9, 768, 1024}, {10, 512, 1024}, {12, 768, 1024}, {13, 768, 1024},
-        {14, 768, 1024}, {15, 512, 768}, {16, 512, 768}, {17, 512, 768},
+        {9, 768, 864, 128}, {10, 512, 640, 256}, {12, 768, 768, 128}, {13, 576, 640, 128},
+        {14, 576, 576, 128}, {15, 512, 512, 128}, {16, 384, 384, 128}, {17, 384, 432, 128},
     };
     for (const auto &e : expected)
     {
@@ -111,7 +124,8 @@ TEST(CPUNativeQuantisedWeightView, CompactStrideFollowsTheDecodedPayloadWords)
         const auto view = fixture.view();
         EXPECT_EQ(view.data_stride, static_cast<int>(e.data));
         EXPECT_EQ(view.interleaved_block_stride, e.unit);
-        EXPECT_EQ(view.bytes().size(), std::size_t{e.unit}); // one 64x32 unit
+        EXPECT_EQ(view.superblock_header_bytes, e.header);
+        EXPECT_EQ(view.bytes().size(), std::size_t{e.unit} + e.header);
     }
 }
 
@@ -133,8 +147,19 @@ TEST(CPUNativeQuantisedWeightView, OriginalSourceFactorsRetainEveryRoundingBound
             if (source->codebook_id == 13 && word > 255) break;
             if (source->codebook_id == 4 && word > 63) break;
             if (source->codebook_id == 11 && word > 15) break;
-            storeHalf(fixture.bytes, primary, base_word);
-            storeHalf(fixture.bytes, secondary, static_cast<std::uint16_t>(word));
+            if (view.superblockCoded())
+            {
+                storeHalf(fixture.bytes, view.geometry().headerOffset(0, 0), base_word);
+                const auto book = superblockMetadataCodebook(view.encoding, view.codebook_id);
+                auto *plane = fixture.bytes.data() + preparedCodedPlaneOffset(view.encoding, view.data_stride);
+                std::memset(plane, 0, coded_metadata::codeBlockBytes(book));
+                coded_metadata::storeCode(plane, book, 0, word);
+            }
+            else
+            {
+                storeHalf(fixture.bytes, primary, base_word);
+                storeHalf(fixture.bytes, secondary, static_cast<std::uint16_t>(word));
+            }
             float first = 0, second = 0;
             if (source->codebook_id == 8)
             {
@@ -155,9 +180,9 @@ TEST(CPUNativeQuantisedWeightView, OriginalSourceFactorsRetainEveryRoundingBound
             expectFactor(view.blockScale(0, 0, 0), first, "primary");
             expectFactor(view.blockMin(0, 0, 0), second, "secondary");
         }
-        if (source->codebook_id != 8)
+        if (source->codebook_id != 8 && !view.superblockCoded())
         {
-            const auto invalid = source->codebook_id == 13 ? 256 : source->codebook_id == 4 ? 64 : 16;
+            const auto invalid = source->codebook_id == 4 ? 64 : 16;
             storeHalf(fixture.bytes, secondary, static_cast<std::uint16_t>(invalid));
             EXPECT_THROW((void)view.blockScale(0, 0, 0), std::invalid_argument);
         }
@@ -184,10 +209,7 @@ TEST(CPUNativeQuantisedWeightView, EverySingleFactorAndRotatedSourceHasBoundedZe
 
         // Rotation's canonical symmetric ExpandedInt8 stream has the same
         // physical span for every original source; provenance stays original.
-        PreparedBytes rotated(native_quantised_formats::Q8_0, 64, 32);
-        rotated.descriptor.source = {
-            .codebook_id = source.metadata->codebook_id,
-            .is_superblock = source.metadata->is_superblock, .present = true};
+        PreparedBytes rotated(*source.metadata, 64, 32, 4u * 1024u * 1024u, true);
         const auto rotated_view = rotated.view();
         EXPECT_EQ(rotated_view.payload_bytes, 32);
         EXPECT_EQ(rotated_view.source_payload_bytes, source.metadata->payload_bytes);

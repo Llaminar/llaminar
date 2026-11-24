@@ -13,6 +13,7 @@
 #include "kernels/cpu/CPUInvocationWorkspace.h"
 #include <climits>
 #include <stdexcept>
+#include <string>
 
 namespace llaminar2
 {

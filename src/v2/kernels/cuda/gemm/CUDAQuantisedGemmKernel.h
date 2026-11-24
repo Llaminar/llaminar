@@ -172,8 +172,8 @@ namespace llaminar2
              *        payload identifies an ordinary immutable allocation
              * @param metadata_layout Packed metadata layout written by the
              *        producer (nativeQuantisedMetadataLayout); zero is the
-             *        per-block-plane representation. A coded layout is
-             *        immutable source storage and cannot be reusable.
+             *        per-block-plane representation. Reusable coded slots
+             *        admit only arrivals with the same native representation.
              */
             CUDAQuantisedGemmKernel(
                 int N, int K, int cuda_device_id,

@@ -7,9 +7,9 @@
  * grouped MTP and ExpertOverlay additionally require serial-row byte identity.
  * Compact-format ordered reductions have an independent scalar decoder oracle
  * for one-block, multi-block and trailing-empty partitions on both x86 CPU ISAs.
- * Opaque source words must reject reserved bits instead of masking them into
- * valid coefficients. Rejection is fatal, not rollback of earlier vector stores;
- * the outer stage may publish only a successfully completed operation.
+ * Coded source metadata must reject incomplete headers before publication;
+ * SIMD readers must also isolate live outputs from inactive columns in a sealed
+ * partial chunk.
  *
  * @note Run with Integration build: ctest -R V2_Integration_CPUNativeQuantised_GEMV
  */
@@ -60,14 +60,14 @@ using namespace llaminar2::test;
 
 namespace
 {
-#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
-    /** @test Every x86 vector/lane rejects corrupt source words without hiding partial writes. */
-    TEST(CPUNativeSourceMetadata, ReservedBitsRejectAtEveryVectorLane)
+    /** @brief Borrow fixture geometry into a producer-owned, unsealed byte generation.
+     * @param fixture Original canonical source and complete seeded bytes.
+     * @param extent Byte extent to publish, including deliberately malformed cases.
+     * @return Owner suitable for exercising the actual publication seal.
+     */
+    CPUNativeQuantisedPackedWeights codedMetadataOwner(
+        const NativeQuantisedPreparedByteFixture &fixture, std::size_t extent)
     {
-        NativeQuantisedPreparedByteFixture fixture(native_quantised_formats::IQ2_S, 64, 32);
-        fixture.seedPayloadAndMetadata();
-        // x86 kernels consume the owner type, not a sealed view: the owner
-        // retains the per-block reserved-bit checks this test certifies.
         const auto layout = fixture.view();
         CPUNativeQuantisedPackedWeights packed;
         packed.N = layout.N; packed.K = layout.K; packed.N_padded = layout.N_padded;
@@ -76,156 +76,102 @@ namespace
         packed.is_asymmetric = layout.is_asymmetric; packed.encoding = layout.encoding;
         packed.numerical_policy = layout.numerical_policy; packed.data_stride = layout.data_stride;
         packed.interleaved_block_stride = layout.interleaved_block_stride;
-        packed.native_interleaved.resize(fixture.bytes.size());
+        packed.native_interleaved.resize(extent);
         const auto owned = packed.native_interleaved.beginRewrite();
-        std::copy(fixture.bytes.begin(), fixture.bytes.end(), owned.begin());
-        Q8_1Block activation{};
-        activation.d = 0x3c00;
-        activation.sum_qs = 32;
-        std::fill(std::begin(activation.qs), std::end(activation.qs), std::int8_t{1});
-        const std::array<const Q8_1Block *, 1> input{&activation};
-        const auto verify = [&]<int Lanes>() {
-            std::array<float, 64> result;
-            const std::array<float *, 1> output{result.data()};
-            multi_scale::dispatch<Lanes, 1>(packed, input, output, 0, 0, 1, false);
-            const auto reference = result;
-            for (int bad_column = 0; bad_column < 64; ++bad_column)
-            {
-                SCOPED_TRACE(::testing::Message() << "lanes=" << Lanes << " bad_column=" << bad_column);
-                auto *word = owned.data() + packed.data_stride + 128 + bad_column * 2;
-                std::uint16_t original = 0;
-                std::memcpy(&original, word, sizeof(original));
-                const std::uint16_t invalid = 0xffff;
-                std::memcpy(word, &invalid, sizeof(invalid));
-                result.fill(123.0f);
-                EXPECT_THROW((multi_scale::dispatch<Lanes, 1>(packed, input, output, 0, 0, 1, false)), std::invalid_argument);
-                const int failed_vector = bad_column / Lanes * Lanes;
-                for (int column = 0; column < 64; ++column)
-                    if (column < failed_vector)
-                        EXPECT_EQ(std::bit_cast<std::uint32_t>(result[column]), std::bit_cast<std::uint32_t>(reference[column]));
-                    else
-                        EXPECT_EQ(result[column], 123.0f);
-                std::memcpy(word, &original, sizeof(original));
-            }
-        };
-        verify.template operator()<8>();
-#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
-        verify.template operator()<16>();
-#endif
-        // IQ4_XS source-scale owners must reject all ten reserved bits as well;
-        // the historic SIMD accessors masked them into a plausible coefficient.
-        CPUNativeQuantisedPackedWeights source_scale;
-        source_scale.codebook_id = native_quantised_formats::IQ4_XS.codebook_id;
-        source_scale.is_superblock = true;
-        source_scale.encoding = CPUNativeQuantisedEncoding::NibbleLUTSourceScale;
-        alignas(64) std::array<std::uint16_t, 128> words;
-        words.fill(0x3c00);
-        std::fill(words.begin() + 64, words.end(), 32);
-        for (int bit = 6; bit < 16; ++bit)
-            for (int lane = 0; lane < 8; ++lane)
-            {
-                words[64 + lane] = std::uint16_t(32 | (1u << bit));
-                EXPECT_THROW((void)source_scale.loadScales256(words.data()), std::invalid_argument);
-                words[64 + lane] = 32;
-            }
-#if defined(__AVX512F__)
-        for (int bit = 6; bit < 16; ++bit)
-            for (int lane = 0; lane < 16; ++lane)
-            {
-                words[64 + lane] = std::uint16_t(32 | (1u << bit));
-                EXPECT_THROW((void)source_scale.loadScales512(words.data()), std::invalid_argument);
-                words[64 + lane] = 32;
-            }
-#endif
+        std::copy_n(fixture.bytes.begin(), std::min(extent, fixture.bytes.size()), owned.begin());
+        return packed;
     }
 
-
-    /**
-     * @test x86 readers load whole 64-column vectors, so a partial final chunk's
-     * padding is part of the publication contract. Two complementary fixtures:
-     * an owner whose padding words are raw poison, and an owner of the same
-     * bytes after producer normalization. Each compiled reader (IQ2_S dispatch
-     * at 8 and 16 lanes, IQ3_S/IQ4_XS scale loaders at 8 and 16 lanes) is
-     * invoked separately on the padding-bearing vector of every block: every
-     * one rejects the raw owner and accepts the normalized one; the seal agrees.
-     */
-    TEST(CPUNativeSourceMetadata, PartialChunkPaddingIsNormalizedForX86Readers)
+    /** @test Exact-width codes have no reserved bits to poison; the seal must
+     * reject a truncated, absent or oversized coded header extent instead. */
+    TEST(CPUNativeSourceMetadata, CodedHeadersRequireExactExtent)
     {
-        for (const auto *source : {&native_quantised_formats::IQ2_S, &native_quantised_formats::IQ3_S, &native_quantised_formats::IQ4_XS})
+        for (const auto *source : {&native_quantised_formats::IQ2_S, &native_quantised_formats::IQ3_S,
+                                   &native_quantised_formats::IQ4_XS})
+            for (const int n : {64, 97})
+                for (const int k : {32, 256, 288})
+                {
+                    SCOPED_TRACE(::testing::Message() << "codebook=" << int(source->codebook_id) << " N=" << n << " K=" << k);
+                    NativeQuantisedPreparedByteFixture fixture(*source, n, k);
+                    fixture.seedPayloadAndMetadata();
+                    const auto layout = fixture.view();
+                    ASSERT_TRUE(layout.superblockCoded());
+                    const auto size = fixture.bytes.size();
+                    const auto header = layout.geometry().headerOffset(layout.N_padded / 64 - 1, layout.blocks_per_row - 1);
+                    ASSERT_LT(header, size);
+                    for (const auto invalid : {header, size - 1, size + 1})
+                    {
+                        auto malformed = codedMetadataOwner(fixture, invalid);
+                        EXPECT_THROW(malformed.sealPublication(), std::invalid_argument);
+                        EXPECT_FALSE(malformed.publicationSealed());
+                    }
+                    auto valid = codedMetadataOwner(fixture, size);
+                    EXPECT_NO_THROW(valid.sealPublication());
+                    EXPECT_TRUE(valid.publicationSealed());
+                }
+    }
+
+    /** @test Nonzero, in-domain padding codes and headers must not affect any live
+     * column or output guard. Exercise both x86 reader widths when compiled. */
+    TEST(CPUNativeSourceMetadata, CodedPaddingCannotInfluenceLiveColumns)
+    {
+        for (const auto *source : {&native_quantised_formats::IQ2_S, &native_quantised_formats::IQ3_S,
+                                   &native_quantised_formats::IQ4_XS})
             for (const int n : {33, 61, 97})
             {
-                SCOPED_TRACE(::testing::Message() << "codebook=" << int(source->codebook_id) << " n=" << n);
-                constexpr int k = 64;
+                SCOPED_TRACE(::testing::Message() << "codebook=" << int(source->codebook_id) << " N=" << n);
+                // One full K superblock followed by a ragged one.
+                constexpr int k = 288, blocks = k / 32;
                 NativeQuantisedPreparedByteFixture fixture(*source, n, k);
                 fixture.seedPayloadAndMetadata();
-                const auto layout = fixture.view();
-                const int last = layout.N_padded / 64 - 1, live = n % 64;
-                const auto make = [&](bool normalized, int poisoned_block = -1) {
-                    CPUNativeQuantisedPackedWeights packed;
-                    packed.N = layout.N; packed.K = layout.K; packed.N_padded = layout.N_padded;
-                    packed.blocks_per_row = layout.blocks_per_row; packed.payload_bytes = layout.source_payload_bytes;
-                    packed.codebook_id = layout.codebook_id; packed.is_superblock = layout.is_superblock;
-                    packed.is_asymmetric = layout.is_asymmetric; packed.encoding = layout.encoding;
-                    packed.numerical_policy = layout.numerical_policy; packed.data_stride = layout.data_stride;
-                    packed.interleaved_block_stride = layout.interleaved_block_stride;
-                    packed.native_interleaved.resize(fixture.bytes.size());
-                    const auto owned = packed.native_interleaved.beginRewrite();
-                    std::copy(fixture.bytes.begin(), fixture.bytes.end(), owned.begin());
-                    const std::size_t secondary = std::size_t(layout.data_stride) + (layout.usesInlineCompensation() ? 256 : 128);
-                    for (int block = 0; block < layout.blocks_per_row; ++block)
-                        for (int column = live; column < 64; ++column)
-                        {
-                            if (poisoned_block >= 0 && block != poisoned_block)
-                                continue;
-                            const std::uint16_t poison = 0xffff;
-                            std::memcpy(owned.data() + (std::size_t(last) * layout.blocks_per_row + block) *
-                                layout.interleaved_block_stride + secondary + std::size_t(column) * 2, &poison, sizeof(poison));
-                        }
-                    if (normalized) packed.normalizePaddingMetadata();
-                    return packed;
-                };
-                auto raw = make(false);
-                auto normalized = make(true);
-                EXPECT_THROW(raw.sealPublication(), std::invalid_argument);
-                EXPECT_NO_THROW(normalized.sealPublication());
-
-                Q8_1Block activation[k / 32]{};
-                for (auto &a : activation) { a.d = 0x3c00; std::fill(std::begin(a.qs), std::end(a.qs), std::int8_t{1}); a.sum_qs = 32; }
-                std::array<float, 64> result{};
-                const std::array<const Q8_1Block *, 1> input{activation};
-                const std::array<float *, 1> output{result.data()};
-                if (source == &native_quantised_formats::IQ2_S)
-                {
-                    // Dispatch walks blocks in order, so each block is poisoned
-                    // alone: rejection is proved at every K block, not the first.
-                    for (int block = 0; block < layout.blocks_per_row; ++block)
+                auto clean = codedMetadataOwner(fixture, fixture.bytes.size());
+                clean.sealPublication();
+                const auto layout = clean.readView();
+                ASSERT_TRUE(layout.superblockCoded());
+                const auto book = superblockMetadataCodebook(layout.encoding, layout.codebook_id);
+                const auto code_offset = preparedCodedPlaneOffset(layout.encoding, layout.data_stride);
+                const auto last = layout.N_padded / 64 - 1;
+                for (int b = 0; b < blocks; ++b)
+                    for (int col = n % 64; col < 64; ++col)
                     {
-                        SCOPED_TRACE(block);
-                        const auto single = make(false, block);
-                        EXPECT_THROW((multi_scale::dispatch<8, 1>(single, input, output, last, 0, layout.blocks_per_row, false)), std::invalid_argument);
-#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
-                        EXPECT_THROW((multi_scale::dispatch<16, 1>(single, input, output, last, 0, layout.blocks_per_row, false)), std::invalid_argument);
-#endif
+                        coded_metadata::storeCode(fixture.bytes.data() + layout.geometry().blockOffset(last, b) + code_offset,
+                            book, col, 0xff);
+                        coded_metadata::storeSuperblockWord(fixture.bytes.data() + layout.geometry().headerOffset(last, b),
+                            book, col, 0x38003c00u); // Both half words finite.
                     }
-                    EXPECT_NO_THROW((multi_scale::dispatch<8, 1>(normalized, input, output, last, 0, layout.blocks_per_row, false)));
-#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
-                    EXPECT_NO_THROW((multi_scale::dispatch<16, 1>(normalized, input, output, last, 0, layout.blocks_per_row, false)));
-#endif
-                    continue;
-                }
-                for (int block = 0; block < layout.blocks_per_row; ++block)
+                auto dirty = codedMetadataOwner(fixture, fixture.bytes.size());
+                dirty.sealPublication();
+                Q8_1Block activation[blocks]{};
+                for (auto &a : activation)
                 {
-                    SCOPED_TRACE(block);
-                    EXPECT_THROW((void)raw.loadScales256(raw.chunkScales(last, block) + live / 8 * 8), std::invalid_argument);
-                    EXPECT_NO_THROW((void)normalized.loadScales256(normalized.chunkScales(last, block) + live / 8 * 8));
-#if defined(__AVX512F__)
-                    EXPECT_THROW((void)raw.loadScales512(raw.chunkScales(last, block) + live / 16 * 16), std::invalid_argument);
-                    EXPECT_NO_THROW((void)normalized.loadScales512(normalized.chunkScales(last, block) + live / 16 * 16));
-#endif
+                    a.d = 0x3c00;
+                    std::fill(std::begin(a.qs), std::end(a.qs), std::int8_t{1});
+                    a.sum_qs = 32;
                 }
+                const auto project = [&](ISAPath isa) {
+                    std::array<float, 2 * 64> clean_out, dirty_out;
+                    clean_out.fill(123.0f);
+                    dirty_out.fill(123.0f);
+                    std::array<float, 2 * 64 * blocks> partial{};
+                    gemv_native_quantised_preq(clean, activation, clean_out.data(), partial, isa);
+                    gemv_native_quantised_preq(dirty, activation, dirty_out.data(), partial, isa);
+                    EXPECT_EQ(std::memcmp(clean_out.data(), dirty_out.data(), sizeof(clean_out)), 0);
+                    for (std::size_t col = n; col < clean_out.size(); ++col)
+                    {
+                        EXPECT_EQ(clean_out[col], 123.0f);
+                        EXPECT_EQ(dirty_out[col], 123.0f);
+                    }
+                };
+#if defined(__aarch64__) && defined(__ARM_NEON)
+                project(ISAPath::AUTO);
+#else
+                project(ISAPath::AVX2);
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
+                project(ISAPath::AVX512);
+#endif
+#endif
             }
     }
-#endif
 
 #if !defined(__aarch64__)
     // x86 VNNI consumes unsigned activation words; ARM signed dots need no packing.

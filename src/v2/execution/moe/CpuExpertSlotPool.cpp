@@ -153,6 +153,7 @@ namespace llaminar2
             switch (packed.encoding)
             {
             case CpuEncoding::NibbleLUTSourceScale:
+            case CpuEncoding::Q4KSuperblockCoded:
             case CpuEncoding::NibbleLUT:
                 packed.payload_bytes = 16;
                 break;
@@ -165,26 +166,17 @@ namespace llaminar2
             case CpuEncoding::Q6KNativeDualScale:
                 packed.payload_bytes = 24;
                 break;
+            case CpuEncoding::Q5NativeSingleScale:
             case CpuEncoding::CompactMultiScale:
                 packed.payload_bytes = source->payload_bytes;
                 break;
             }
 
-            const std::uint64_t unit_count =
-                static_cast<std::uint64_t>(packed.N_padded / 64) *
-                static_cast<std::uint64_t>(packed.blocks_per_row);
-            if (unit_count == 0 ||
-                unit_count > std::numeric_limits<std::size_t>::max() /
-                                 static_cast<std::uint64_t>(
-                                     packed.interleaved_block_stride))
-            {
-                throw std::invalid_argument(
-                    "CPU expert slot projection byte capacity overflows size_t");
-            }
-            const std::size_t destination_bytes =
-                static_cast<std::size_t>(unit_count) *
-                static_cast<std::size_t>(
-                    packed.interleaved_block_stride);
+            const auto row_bytes = packed.geometry().rowBytes();
+            const auto chunks = static_cast<std::size_t>(packed.N_padded / 64);
+            if (row_bytes == 0 || chunks > std::numeric_limits<std::size_t>::max() / row_bytes)
+                throw std::invalid_argument("CPU expert slot projection byte capacity overflows size_t");
+            const auto destination_bytes = packed.preparedBytes();
             if (requires_dedicated_mapping)
             {
                 packed.native_interleaved.replace(

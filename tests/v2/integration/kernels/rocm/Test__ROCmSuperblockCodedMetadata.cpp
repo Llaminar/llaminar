@@ -15,7 +15,7 @@
  *    consumed secondary and Q2_K emin) from the coded planes at the
  *    production block-major addresses;
  *  - the coded plane sizes equal sb::planeBytes (file density), and a coded
- *    layout with the wrong phase is rejected without being written;
+ *    layout with the wrong phase or a pre-offset code plane is rejected without being written;
  *  - the production ROCm serial GEMV (M=1), grouped small-M verifier GEMV and
  *    dense prefill GEMM, captured in a graph and replayed onto poisoned
  *    outputs, produce bit-identical FP32 results from the two representations.
@@ -215,6 +215,12 @@ namespace llaminar2::test
                 *format, raw.data, coded_payload.as<uint8_t>(), codes.as<uint16_t>(), superblocks.as<uint16_t>(),
                 nullptr, N, K, N, 0, 0, payload_bytes, selection,
                 nativeQuantisedMetadataLayout(NativeQuantisedMetadataRepresentation::SuperblockCoded, (phase + 1) % 8),
+                stream_));
+            // Repack receives the whole run; only bound matrix views can start at a code-bit offset.
+            EXPECT_FALSE(launchVnniRepack(
+                *format, raw.data, coded_payload.as<uint8_t>(), codes.as<uint16_t>(), superblocks.as<uint16_t>(),
+                nullptr, N, K, N, 0, 0, payload_bytes, selection,
+                nativeQuantisedMetadataLayout(NativeQuantisedMetadataRepresentation::SuperblockCoded, phase, 4),
                 stream_));
             checked(hipStreamSynchronize(stream_));
 

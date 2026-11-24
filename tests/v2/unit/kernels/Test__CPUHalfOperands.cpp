@@ -512,7 +512,7 @@ TEST(CPUHalfOperands, FmlalLeafSelectionMatchesEnvelope){
             uint32_t(llaminar2::cpu::ARMCPUFeature::FP16FML)),
         std::runtime_error);
     // FPCR profile contract (F3): focused negative controls over synthetic
-    // control-words — only RNE with FZ, FZ16 and AHP off admits the leaf's
+    // control-words — only RNE with FZ, FZ16, AHP and DN off admits the leaf's
     // ambient conversion; each wrong bit (or rounding mode) is rejected.
     EXPECT_TRUE(fmlalFpcrProfileAdmitted(0x0ull));
     EXPECT_FALSE(fmlalFpcrProfileAdmitted(0x1ull << 19));  // FZ16
@@ -521,6 +521,7 @@ TEST(CPUHalfOperands, FmlalLeafSelectionMatchesEnvelope){
     EXPECT_FALSE(fmlalFpcrProfileAdmitted(0x1ull << 22));  // RMode=01
     EXPECT_FALSE(fmlalFpcrProfileAdmitted(0x2ull << 22));  // RMode=10
     EXPECT_FALSE(fmlalFpcrProfileAdmitted(0x3ull << 22));  // RMode=11
+    EXPECT_FALSE(fmlalFpcrProfileAdmitted(0x1ull << 25));  // DN
 #endif
 }
 /** @test The route probe discriminates on/off, zero-N, invalid pointers,

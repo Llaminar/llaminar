@@ -34,6 +34,7 @@
 #include "transfer/TransferEngine.h"
 
 #include "tensors/Tensors.h"
+#include "tensors/NativeQuantisedSuperblockMetadata.h"
 #include "kernels/common/DeviceHalfMetadataContract.h"
 #include <bit>
 #include "utils/Assertions.h"
@@ -12992,7 +12993,11 @@ TEST(Test__ROCmMoEKernel,
     ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
 }
 
-TEST(Test__ROCmMoEKernel, DeviceRebalanceCopyAndApplyArrivalUsesTransferSlot)
+/**
+ * @brief Exercise the real collective pack/unpack and slot publication state machine.
+ * @param coded Use phased Q4_K planes with different source and destination bit offsets.
+ */
+static void proveDeviceRebalanceCopyAndApplyArrival(bool coded)
 {
     SKIP_IF_NO_ROCM();
 
@@ -13031,6 +13036,9 @@ TEST(Test__ROCmMoEKernel, DeviceRebalanceCopyAndApplyArrivalUsesTransferSlot)
     constexpr size_t blocks = n * blocks_per_row;
     constexpr size_t payload_bytes = blocks * 16;
     constexpr size_t scales_bytes = blocks * sizeof(uint16_t);
+    constexpr size_t header_bytes = n * sizeof(uint32_t);
+    constexpr unsigned code_bits = 12, src_shift = 4, dst_shift = 0, phase = 3;
+    namespace sb = native_quantised_superblock;
 
     struct ProjectionBuffers
     {
@@ -13038,6 +13046,9 @@ TEST(Test__ROCmMoEKernel, DeviceRebalanceCopyAndApplyArrivalUsesTransferSlot)
         void *src_scales = nullptr;
         uint8_t *dst_payload = nullptr;
         void *dst_scales = nullptr;
+        void *src_headers = nullptr;
+        void *dst_headers = nullptr;
+        std::array<uint32_t, n> expected_headers{};
         std::vector<uint8_t> expected_payload;
         std::vector<uint16_t> expected_scales;
     };
@@ -13070,10 +13081,19 @@ TEST(Test__ROCmMoEKernel, DeviceRebalanceCopyAndApplyArrivalUsesTransferSlot)
                                  stream),
                   hipSuccess);
         ASSERT_EQ(hipMemsetAsync(projection.dst_payload, 0, payload_bytes, stream), hipSuccess);
-        ASSERT_EQ(hipMemsetAsync(projection.dst_scales, 0, scales_bytes, stream), hipSuccess);
+        ASSERT_EQ(hipMemsetAsync(projection.dst_scales, coded ? 0xa5 : 0, scales_bytes, stream), hipSuccess);
+        if (coded)
+        {
+            projection.expected_headers = {0x40003c00u + uint32_t(i), 0x44003800u + uint32_t(i)};
+            ASSERT_EQ(hipMalloc(&projection.src_headers, header_bytes), hipSuccess);
+            ASSERT_EQ(hipMalloc(&projection.dst_headers, header_bytes), hipSuccess);
+            ASSERT_EQ(hipMemcpyAsync(projection.src_headers, projection.expected_headers.data(),
+                                     header_bytes, hipMemcpyHostToDevice, stream), hipSuccess);
+            ASSERT_EQ(hipMemsetAsync(projection.dst_headers, 0xa5, header_bytes, stream), hipSuccess);
+        }
     }
 
-    auto matrix_desc = [](const ProjectionBuffers &projection, bool destination)
+    auto matrix_desc = [=](const ProjectionBuffers &projection, bool destination)
     {
         DeviceNativeQuantisedMatrixDesc desc;
         desc.payload = destination ? projection.dst_payload : projection.src_payload;
@@ -13081,11 +13101,20 @@ TEST(Test__ROCmMoEKernel, DeviceRebalanceCopyAndApplyArrivalUsesTransferSlot)
         desc.n = n;
         desc.k = k;
         desc.blocks_per_row = blocks_per_row;
-        desc.codebook_id = 0;
+        desc.codebook_id = coded ? 5 : 0;
+        if (coded)
+        {
+            desc.mins = destination ? projection.dst_headers : projection.src_headers;
+            desc.source_codebook_id = 5;
+            desc.source_is_superblock = 1;
+            desc.source_identity_present = 1;
+            desc.metadata_layout = nativeQuantisedMetadataLayout(NativeQuantisedMetadataRepresentation::SuperblockCoded,
+                                                                 phase, destination ? dst_shift : src_shift);
+        }
         if (destination)
         {
             desc.allocation_payload_bytes_per_block = 16;
-            desc.allocation_has_mins = 0;
+            desc.allocation_has_mins = coded;
             desc.allocation_has_emins = 0;
         }
         return desc;
@@ -13306,6 +13335,18 @@ TEST(Test__ROCmMoEKernel, DeviceRebalanceCopyAndApplyArrivalUsesTransferSlot)
     EXPECT_EQ(transfer_slots[0].epoch, 2u);
     EXPECT_EQ(transfer_slots[0].generation, 1u);
     EXPECT_EQ(transfer_slots[0].descriptor.logical_expert_id, 0);
+    if (coded)
+    {
+        EXPECT_EQ(transfer_slots[0].descriptor.gate.metadata_layout,
+                  nativeQuantisedMetadataLayout(NativeQuantisedMetadataRepresentation::SuperblockCoded, phase, dst_shift));
+        std::array<uint8_t, 3> wire_codes{};
+        ASSERT_EQ(hipMemcpy(wire_codes.data(), d_local_payload + sizeof(DeviceMoEExpertDirectoryEntry) + payload_bytes,
+                            wire_codes.size(), hipMemcpyDeviceToHost), hipSuccess);
+        const auto *original_codes = reinterpret_cast<const uint8_t *>(projections[0].expected_scales.data());
+        for (unsigned i = 0; i < n; ++i)
+            EXPECT_EQ(sb::loadPackedBits(wire_codes.data(), i * code_bits, code_bits),
+                      sb::loadPackedBits(original_codes, src_shift + i * code_bits, code_bits));
+    }
 
     DeviceMoELayerRuntime seeded_runtime{};
     ASSERT_EQ(hipMemcpy(&seeded_runtime,
@@ -13549,7 +13590,20 @@ TEST(Test__ROCmMoEKernel, DeviceRebalanceCopyAndApplyArrivalUsesTransferSlot)
                             hipMemcpyDeviceToHost),
                   hipSuccess);
         EXPECT_EQ(actual_payload, projection.expected_payload);
-        EXPECT_EQ(actual_scales, projection.expected_scales);
+        if (coded)
+        {
+            const auto *actual = reinterpret_cast<const uint8_t *>(actual_scales.data());
+            const auto *original = reinterpret_cast<const uint8_t *>(projection.expected_scales.data());
+            for (unsigned i = 0; i < n; ++i)
+                EXPECT_EQ(sb::loadPackedBits(actual, dst_shift + i * code_bits, code_bits),
+                          sb::loadPackedBits(original, src_shift + i * code_bits, code_bits));
+            EXPECT_EQ(actual[3], 0xa5); // Neighbor bits in the same allocation word remain dirty.
+            std::array<uint32_t, n> headers{};
+            ASSERT_EQ(hipMemcpy(headers.data(), projection.dst_headers, header_bytes, hipMemcpyDeviceToHost), hipSuccess);
+            EXPECT_EQ(headers, projection.expected_headers);
+        }
+        else
+            EXPECT_EQ(actual_scales, projection.expected_scales);
     }
 
     ASSERT_EQ(hipMemsetAsync(d_gathered_payload,
@@ -13827,8 +13881,25 @@ TEST(Test__ROCmMoEKernel, DeviceRebalanceCopyAndApplyArrivalUsesTransferSlot)
         EXPECT_EQ(hipFree(projection.src_scales), hipSuccess);
         EXPECT_EQ(hipFree(projection.dst_payload), hipSuccess);
         EXPECT_EQ(hipFree(projection.dst_scales), hipSuccess);
+        if (coded)
+        {
+            EXPECT_EQ(hipFree(projection.src_headers), hipSuccess);
+            EXPECT_EQ(hipFree(projection.dst_headers), hipSuccess);
+        }
     }
     ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
+}
+
+/** @test Legacy per-block metadata still follows the same production arrival lifecycle. */
+TEST(Test__ROCmMoEKernel, DeviceRebalanceCopyAndApplyArrivalUsesTransferSlot)
+{
+    proveDeviceRebalanceCopyAndApplyArrival(false);
+}
+
+/** @test Real rebalance jobs normalize wire bits and preserve the destination's code offset. */
+TEST(Test__ROCmMoEKernel, DeviceRebalanceCodedArrivalPreservesSlotLayout)
+{
+    proveDeviceRebalanceCopyAndApplyArrival(true);
 }
 
 /**

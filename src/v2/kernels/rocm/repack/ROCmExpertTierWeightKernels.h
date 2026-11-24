@@ -12,6 +12,20 @@
 
 namespace llaminar2
 {
+    /** @brief Root views and live K32/N intersection for a coded HIP peer copy. */
+    struct ROCmCodedPeerProjectionRectangle
+    {
+        unsigned rows, blocks, payload_bytes;
+        std::uint8_t codebook;
+        unsigned src_n, dst_n, src_row, dst_row, src_block, dst_block;
+        ExpertTierGpuConstProjectionView source;
+        ExpertTierGpuMutableProjectionView destination;
+    };
+
+    /** @brief Copy the exact live rectangle, preserving adjacent destination code bits. */
+    [[nodiscard]] bool launchROCmCodedPeerProjectionRectangle(ROCmCodedPeerProjectionRectangle rectangle,
+                                                             void *stream) noexcept;
+
     /**
      * @brief Publish host IQ codebook tables into this kernel translation unit.
      * @param device_id ROCm device whose constant memory receives the tables.

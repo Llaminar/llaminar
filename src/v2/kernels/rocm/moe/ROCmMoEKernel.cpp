@@ -13566,6 +13566,7 @@ public:
             mix(matrix.n);mix(matrix.k);mix(matrix.blocks_per_row);mix(matrix.codebook_id);
             mix(matrix.source_identity_present);mix(matrix.source_codebook_id);mix(matrix.source_is_superblock);
             mix(matrix.allocation_payload_bytes_per_block);mix(matrix.allocation_has_mins);mix(matrix.allocation_has_emins);
+            mix(matrix.metadata_layout);mix(matrix.reserved_tail);
         }
         const auto rows=args_.rows.captureIdentity();
         mix(reinterpret_cast<std::uintptr_t>(rows.count));mix(rows.count_capacity);mix(rows.first_physical_row);

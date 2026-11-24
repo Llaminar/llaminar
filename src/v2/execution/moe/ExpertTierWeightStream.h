@@ -53,10 +53,9 @@ namespace llaminar2
     {
         // Wire discriminator: receivers reject unknown layouts before parsing.
         static constexpr uint32_t kMagic = 0x45545753u; // "ETWS"
-        // Version 4: codebook-25 (MXFP4) units carry a BF16 power-of-two scale
-        // word and the GPU plane a native E8M0 byte (#26). Older records used
-        // FP16 for the same codebook/strides and are rejected, not reinterpreted.
-        static constexpr uint16_t kVersion = 4;
+        // Version 5: coded units carry live payload/code planes and one
+        // header at each source-superblock boundary (including intersections).
+        static constexpr uint16_t kVersion = 5;
 
         // Direction is explicit so CPU bytes cannot be replayed as GPU bytes.
         uint32_t magic = kMagic;
@@ -292,6 +291,10 @@ namespace llaminar2
         std::vector<uint16_t> scales;
         std::vector<uint16_t> mins;
         std::vector<uint32_t> emins;
+        // Coded endpoints use these exact planes in place of per-block metadata.
+        uint8_t metadata_layout = 0;
+        std::vector<uint8_t> codes;
+        std::vector<uint8_t> superblocks;
 
         /** @return Staged/CPU-unit scale word of block @p linear (FP16, or BF16 power of two). */
         [[nodiscard]] uint16_t scaleWord(size_t linear) const noexcept

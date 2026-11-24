@@ -28,6 +28,23 @@ namespace llaminar2
             return false;
         }
 
+        /** @return Scalar CPU endpoint geometry, before the enclosing protocol authenticates it. */
+        ExpertTierWeightCPUStorageLayout cpuWireLayout(const MoEOverlayRemoteProjectionManifest &manifest) noexcept
+        {
+            const auto &cpu = manifest.identity.source_device.is_cpu() ? manifest.source_projection : manifest.destination_projection;
+            const auto first = std::max(manifest.source_projection.first_column, manifest.destination_projection.first_column);
+            const auto units = ((uint64_t(manifest.N) + manifest.cpu_wire_columns_per_unit - 1) /
+                manifest.cpu_wire_columns_per_unit) * manifest.blocks_per_row;
+            return {.N = manifest.N, .K = manifest.K, .blocks_per_row = manifest.blocks_per_row,
+                .cpu_N = cpu.rows, .cpu_K = cpu.columns,
+                .cpu_first_row = std::max(manifest.source_projection.first_row, manifest.destination_projection.first_row) - cpu.first_row,
+                .cpu_first_column = first - cpu.first_column,
+                .cpu_codebook_id = manifest.cpu_codebook_id, .cpu_is_asymmetric = manifest.cpu_is_asymmetric,
+                .cpu_is_superblock = manifest.cpu_is_superblock, .cpu_encoding = manifest.cpu_encoding,
+                .cpu_data_stride = manifest.cpu_data_stride, .cpu_block_stride = manifest.cpu_block_stride,
+                .unit_count = static_cast<uint32_t>(units), .wire_columns_per_unit = manifest.cpu_wire_columns_per_unit};
+        }
+
         /** @brief Mix one byte into the stable manifest digest. */
         void hashByte(std::uint64_t &hash, std::uint8_t value) noexcept
         {
@@ -162,15 +179,14 @@ namespace llaminar2
             return manifest;
         }
 
-        /** @brief Populate fields shared by every physical packing. */
-        MoEOverlayRemoteProjectionManifest baseManifest(
-            const MoEOverlayRemoteProjectionIdentity &identity,
+        /** @brief Populate native geometry independently of the transport's transaction identity. */
+        MoEOverlayRemoteProjectionManifest nativeManifestGeometry(
             NativeQuantisedSourceIdentity source_identity,
             int N,
             int K,
             std::uint32_t maximum_chunk_bytes)
         {
-            if (!identity.valid() || !source_identity.present || N <= 0 || N > std::numeric_limits<int32_t>::max() - 63 ||
+            if (!source_identity.present || N <= 0 || N > std::numeric_limits<int32_t>::max() - 63 ||
                 K <= 0 || (K % 32) != 0 || maximum_chunk_bytes == 0)
             {
                 throw std::invalid_argument(
@@ -187,7 +203,6 @@ namespace llaminar2
 
             MoEOverlayRemoteProjectionManifest manifest;
             manifest.format_kind = ExpertWeightFormatKind::NativeQuantised;
-            manifest.identity = identity;
             manifest.N = N;
             manifest.K = K;
             manifest.N_padded = ((N + 63) / 64) * 64;
@@ -210,6 +225,61 @@ namespace llaminar2
                     manifest.cpu_codebook_id));
             manifest.maximum_chunk_bytes = maximum_chunk_bytes;
             return manifest;
+        }
+
+        /** @brief Author network geometry only for an authenticated transaction identity. */
+        MoEOverlayRemoteProjectionManifest baseManifest(
+            const MoEOverlayRemoteProjectionIdentity &identity,
+            NativeQuantisedSourceIdentity source, int n, int k, std::uint32_t capacity)
+        {
+            if (!identity.valid())
+                throw std::invalid_argument("Remote ExpertOverlay projection has an invalid transaction identity");
+            auto manifest = nativeManifestGeometry(source, n, k, capacity);
+            manifest.identity = identity;
+            return manifest;
+        }
+
+        /** @brief Derive both endpoint layouts from the one original-coordinate coded wire extent. */
+        ExpertTierWeightDeviceLayout codedGpuRelayLayout(
+            const MoEOverlayRemoteProjectionManifest &manifest, ExpertTierWeightConversionDirection direction)
+        {
+            using Direction = ExpertTierWeightConversionDirection;
+            namespace sb = native_quantised_superblock;
+            const bool packing = direction == Direction::GpuToCpu;
+            if (!packing && direction != Direction::CpuToGpu)
+                throw std::invalid_argument("Coded GPU relay requires a pack or unpack direction");
+            const auto overlap = ExpertTierWeightProjectionIntersection::between(manifest.source_projection, manifest.destination_projection);
+            const auto &gpu = packing ? manifest.source_projection : manifest.destination_projection;
+            if (gpu.columns % 32 || gpu.first_column % 32 || overlap.firstColumn() % 32 || manifest.K % 32)
+                throw std::invalid_argument("Coded GPU relay requires original 32-element K group boundaries");
+            const auto phase = sb::superblockPhase(overlap.firstColumn() / 32);
+            const auto units = std::uint64_t(manifest.N_padded / 64) * manifest.blocks_per_row;
+            if (units == 0 || units > UINT32_MAX || manifest.K > INT32_MAX - int(phase * 32))
+                throw std::invalid_argument("Coded GPU relay exceeds the bounded repack ABI");
+            // There is no CPU-resident operand. The repack kernel's wire coordinates
+            // use a compact origin with only the original source superblock phase.
+            ExpertTierWeightDeviceLayout layout{
+                .direction = direction, .N = manifest.N, .K = manifest.K,
+                .N_padded = manifest.N_padded, .blocks_per_row = manifest.blocks_per_row,
+                .cpu_N = manifest.N, .cpu_K = manifest.K + int(phase * 32), .cpu_first_column = int(phase * 32),
+                .gpu_N = gpu.rows, .gpu_K = gpu.columns,
+                .gpu_first_row = overlap.firstRow() - gpu.first_row, .gpu_first_column = overlap.firstColumn() - gpu.first_column,
+                .cpu_codebook_id = manifest.cpu_codebook_id, .gpu_source_codebook_id = manifest.source_codebook_id,
+                .gpu_source_is_superblock = manifest.source_is_superblock, .gpu_codebook_id = manifest.gpu_codebook_id,
+                .gpu_payload_bytes_per_block = manifest.gpu_payload_bytes_per_block,
+                .cpu_is_asymmetric = manifest.cpu_is_asymmetric, .cpu_is_superblock = manifest.cpu_is_superblock,
+                .gpu_is_asymmetric = manifest.gpu_is_asymmetric, .gpu_has_emins = manifest.gpu_has_emins,
+                .gpu_superblock_phase = static_cast<uint8_t>(sb::superblockPhase(gpu.first_column / 32)),
+                .cpu_encoding = manifest.cpu_encoding, .cpu_data_stride = manifest.cpu_data_stride,
+                .cpu_block_stride = manifest.cpu_block_stride, .unit_count = static_cast<uint32_t>(units)};
+            const auto maximum_unit_bytes = layout.cpuStorage().maximumWireUnitBytes();
+            if (!maximum_unit_bytes)
+                throw std::invalid_argument("Coded GPU relay has no complete live unit");
+            layout.maximum_units_per_chunk = static_cast<uint32_t>(std::min<uint64_t>(units,
+                manifest.maximum_chunk_bytes / maximum_unit_bytes));
+            if (!layout.valid())
+                throw std::invalid_argument("Coded GPU relay staging cannot admit a complete live repack unit");
+            return layout;
         }
 
         /** @brief Write one scalar in canonical little-endian order. */
@@ -369,14 +439,15 @@ namespace llaminar2
         auto result=*this; result.source_projection=intersection.source();result.destination_projection=intersection.destination();
         result.N=intersection.rows();result.K=intersection.columns();result.N_padded=(result.N+63)/64*64;
         result.blocks_per_row=result.K/32;
-        result.region_bytes[0]=uint64_t(result.N)*result.blocks_per_row*(result.cpu_block_stride/64);
+        const auto layout = cpuWireLayout(result);
+        result.region_bytes[0] = layout.chunkBytes(layout.unit_count);
         return seal(result);
     }
 
     MoEOverlayRemoteProjectionManifest MoEOverlayRemoteProjectionManifest::forGPUIntersection(
         const ExpertTierWeightProjectionIntersection& intersection) const
     {
-        if (!valid() || !carriesGpuBytes() || intersection.empty() ||
+        if (!valid() || (!carriesGpuBytes() && !carriesCodedGpuUnits()) || intersection.empty() ||
             intersection.source().rows != source_projection.rows ||
             intersection.source().columns != source_projection.columns ||
             intersection.source().columns % 32 || intersection.destination().columns % 32 ||
@@ -390,6 +461,12 @@ namespace llaminar2
         result.K = intersection.columns();
         result.N_padded = (result.N + 63) / 64 * 64;
         result.blocks_per_row = result.K / 32;
+        if (result.carriesCodedGpuUnits())
+        {
+            const auto layout = codedGpuRelayLayout(result, ExpertTierWeightConversionDirection::GpuToCpu);
+            result.region_bytes = {layout.chunkBytes(layout.unit_count), 0, 0, 0};
+            return seal(std::move(result));
+        }
         const auto blocks = std::uint64_t(result.N) * result.blocks_per_row;
         const auto planes = NativeQuantisedMetadataPlaneBytes::of(
             blocks, gpu_codebook_id, gpu_is_asymmetric, gpu_has_emins);
@@ -428,7 +505,7 @@ namespace llaminar2
             return false;
         if (destination_format.isFloating())
             return carriesFloatingBytes() && format_kind == destination_format.kind;
-        return (carriesGpuBytes() || carriesCpuBytes()) &&
+        return (carriesGpuBytes() || carriesCodedGpuUnits() || carriesCpuBytes()) &&
             source_codebook_id == destination_format.native_quantised.codebook_id &&
             (source_is_superblock != 0) == destination_format.native_quantised.is_superblock;
     }
@@ -541,11 +618,21 @@ namespace llaminar2
             if(cpu_wire_columns_per_unit==0 || cpu_wire_columns_per_unit>64 ||
                ((uint64_t(N)+cpu_wire_columns_per_unit-1)/cpu_wire_columns_per_unit)*blocks_per_row>UINT32_MAX)
                 return reject(error,"Native CPU compact wire unit population exceeds its bounded ABI");
-            // The checked32-bit unit population and canonical per-column stride
-            // make this product representable before any endpoint is admitted.
-            const std::uint64_t expected_bytes = static_cast<uint64_t>(N)*blocks_per_row*(cpu_block_stride/64);
+            try
+            {
+                if (identity.source_device.is_cpu())
+                    requireExpertTierResidentCpuOrigin(*source, source_projection.first_column);
+                if (identity.destination_device.is_cpu())
+                    requireExpertTierResidentCpuOrigin(*source, destination_projection.first_column);
+            }
+            catch (const std::invalid_argument &failure)
+            {
+                return reject(error, failure.what());
+            }
+            const auto layout = cpuWireLayout(*this);
+            const auto expected_bytes = layout.chunkBytes(layout.unit_count);
             if (region_bytes[0] != expected_bytes || region_bytes[1] || region_bytes[2] || region_bytes[3] ||
-                maximum_chunk_bytes < (cpu_block_stride/64)*std::min<uint32_t>(cpu_wire_columns_per_unit,N))
+                maximum_chunk_bytes < layout.maximumWireUnitBytes())
                 return reject(error,"CPU-format remote projection requires exact live native planes and bounded column groups");
             if (identity.source_device.is_gpu() ||
                 identity.destination_device.is_gpu())
@@ -564,8 +651,8 @@ namespace llaminar2
                  * mutating destination state.
                  */
                 if (cpu_wire_columns_per_unit != 64 || cpu_block_stride == 0 ||
-                    maximum_chunk_bytes < cpu_block_stride ||
-                    (maximum_chunk_bytes % cpu_block_stride) != 0)
+                    maximum_chunk_bytes < layout.maximumWireUnitBytes() ||
+                    (maximum_chunk_bytes % (layout.coded() ? layout.maximumWireUnitBytes() : cpu_block_stride)) != 0)
                 {
                     return reject(
                         error,
@@ -580,6 +667,22 @@ namespace llaminar2
                     error,
                     "CPU-to-CPU remote projection unexpectedly names a GPU format");
             }
+            }
+            else if (carriesCodedGpuUnits())
+            {
+                if (!identity.source_device.is_gpu() || identity.source_device.type != identity.destination_device.type ||
+                    cpu_wire_columns_per_unit != 64 || !cpu::native_quantised::migrationUsesSuperblockCodes(*source) ||
+                    gpu_codebook_id != canonicalDeviceVnniCodebookId(*source) || !validGpuExecutionFormat(*this, *source))
+                    return reject(error, "Coded GPU relay requires a matching GPU backend and the canonical source codec");
+                try
+                {
+                    const auto pack = codedGpuRelayLayout(*this, ExpertTierWeightConversionDirection::GpuToCpu);
+                    const auto unpack = codedGpuRelayLayout(*this, ExpertTierWeightConversionDirection::CpuToGpu);
+                    if (region_bytes != std::array<std::uint64_t, 4>{pack.chunkBytes(pack.unit_count), 0, 0, 0} ||
+                        unpack.chunkBytes(unpack.unit_count) != region_bytes[0])
+                        return reject(error, "Coded GPU relay region must carry the exact live packed units");
+                }
+                catch (const std::invalid_argument &failure) { return reject(error, failure.what()); }
             }
             else if (carriesGpuBytes())
             {
@@ -640,7 +743,7 @@ namespace llaminar2
             if (root.N_padded != format.N_padded || root.blocks_per_row != format.blocks_per_row ||
                 root.encoding != format.cpu_encoding || root.data_stride != static_cast<int>(format.cpu_data_stride) ||
                 root.interleaved_block_stride != format.cpu_block_stride || root.native_interleaved.size() !=
-                    uint64_t(format.N_padded / 64) * format.blocks_per_row * format.cpu_block_stride)
+                    root.preparedBytes())
                 throw std::invalid_argument("Remote CPU root does not match its genuine canonical final storage");
         }
         /** @brief Seal CPU-only wire geometry without claiming any source payload owner. */
@@ -648,11 +751,18 @@ namespace llaminar2
             uint32_t maximum_chunk_bytes)
         {
             manifest.packing = MoEOverlayRemoteProjectionPacking::CpuNativeQuantisedInterleaved;
-            if (maximum_chunk_bytes < manifest.cpu_block_stride / 64)
-                throw std::invalid_argument("Native CPU capacity cannot contain one exact encoded column");
-            manifest.cpu_wire_columns_per_unit = std::min<uint32_t>(64, maximum_chunk_bytes / (manifest.cpu_block_stride / 64));
-            manifest.region_bytes[0] = uint64_t(manifest.N) * manifest.blocks_per_row * (manifest.cpu_block_stride / 64);
-            return seal(std::move(manifest));
+            manifest.cpu_wire_columns_per_unit = 64;
+            for (; manifest.cpu_wire_columns_per_unit != 0; --manifest.cpu_wire_columns_per_unit)
+            {
+                const auto layout = cpuWireLayout(manifest);
+                const auto wire = layout.wireGeometry(manifest.cpu_wire_columns_per_unit);
+                if (wire.block_stride + wire.header_bytes <= maximum_chunk_bytes)
+                {
+                    manifest.region_bytes[0] = layout.chunkBytes(layout.unit_count);
+                    return seal(std::move(manifest));
+                }
+            }
+            throw std::invalid_argument("Native CPU capacity cannot contain one exact encoded column and header");
         }
     }
 
@@ -710,9 +820,9 @@ namespace llaminar2
             .is_superblock = stream.gpu_source_is_superblock != 0,
             .present = true,
         };
-        const std::uint64_t aligned_chunk_bytes =
-            static_cast<std::uint64_t>(stream.cpu_block_stride) *
-            stream.maximum_units_per_chunk;
+        const auto cpu_layout = stream.deviceLayout().cpuStorage();
+        const auto unit_capacity = cpu_layout.coded() ? cpu_layout.maximumWireUnitBytes() : stream.cpu_block_stride;
+        const std::uint64_t aligned_chunk_bytes = uint64_t(unit_capacity) * stream.maximum_units_per_chunk;
         if (aligned_chunk_bytes == 0 ||
             aligned_chunk_bytes > maximum_chunk_bytes ||
             aligned_chunk_bytes >
@@ -776,7 +886,7 @@ namespace llaminar2
         const MoEOverlayRemoteProjectionIdentity &identity,
         const GpuExpertPackedDescriptor &source,
         NativeQuantisedSourceIdentity source_identity,
-        std::uint32_t maximum_chunk_bytes)
+        std::uint32_t maximum_chunk_bytes, std::optional<ExpertTierWeightProjectionIntersection> intersection)
     {
         if (!source.valid() || !identity.source_device.is_gpu() ||
             !identity.destination_device.is_gpu())
@@ -797,13 +907,38 @@ namespace llaminar2
             source.payload_bytes_per_block;
         manifest.gpu_is_asymmetric = source.is_asymmetric ? 1u : 0u;
         manifest.gpu_has_emins = source.has_emins ? 1u : 0u;
+        if (source.metadata_layout)
+        {
+            manifest.packing = MoEOverlayRemoteProjectionPacking::GpuCodedProjectionUnits;
+            manifest.cpu_wire_columns_per_unit = 64;
+            manifest.source_projection = {MoEProjectionResidence::ExpertOwner, source.n, source.k, 0, source.n, 0, source.k};
+            manifest.destination_projection = manifest.source_projection;
+            if (intersection)
+            {
+                if (intersection->empty() || intersection->source().rows != source.n || intersection->source().columns != source.k)
+                    throw std::invalid_argument("Coded GPU relay intersection differs from its original source allocation");
+                manifest.source_projection = intersection->source();
+                manifest.destination_projection = intersection->destination();
+                manifest.N = intersection->rows();
+                manifest.K = intersection->columns();
+                manifest.N_padded = (manifest.N + 63) / 64 * 64;
+                manifest.blocks_per_row = manifest.K / 32;
+            }
+            const auto layout = codedGpuRelayLayout(manifest, ExpertTierWeightConversionDirection::GpuToCpu);
+            if (nativeQuantisedLayoutPhase(source.metadata_layout) != layout.gpu_superblock_phase ||
+                source.blocks_per_row != uint32_t(source.k / 32))
+                throw std::invalid_argument("Coded GPU relay source descriptor differs from its original superblock phase or K extent");
+            manifest.region_bytes = {layout.chunkBytes(layout.unit_count), 0, 0, 0};
+            return seal(std::move(manifest));
+        }
         manifest.region_bytes = {
             source.vnni_bytes,
             source.scales_bytes,
             source.mins_bytes,
             source.emins_bytes,
         };
-        return seal(std::move(manifest));
+        auto sealed = seal(std::move(manifest));
+        return intersection ? sealed.forGPUIntersection(*intersection) : sealed;
     }
 
     namespace {
@@ -883,8 +1018,9 @@ namespace llaminar2
             throw std::invalid_argument(
                 "Remote CPU projection device layout requires exactly one GPU endpoint");
         }
-        if (manifest.cpu_block_stride == 0 ||
-            (manifest.maximum_chunk_bytes % manifest.cpu_block_stride) != 0)
+        const auto cpu_layout = cpuWireLayout(manifest);
+        const auto unit_capacity = cpu_layout.coded() ? cpu_layout.maximumWireUnitBytes() : manifest.cpu_block_stride;
+        if (!unit_capacity || (manifest.maximum_chunk_bytes % unit_capacity) != 0)
         {
             throw std::invalid_argument(
                 "Remote CPU/GPU projection chunks must contain complete NativeQuantised units");
@@ -894,7 +1030,7 @@ namespace llaminar2
             static_cast<std::uint64_t>(manifest.N_padded / 64) *
             static_cast<std::uint64_t>(manifest.blocks_per_row);
         const std::uint64_t maximum_units =
-            manifest.maximum_chunk_bytes / manifest.cpu_block_stride;
+            manifest.maximum_chunk_bytes / unit_capacity;
         if (units == 0 ||
             units > std::numeric_limits<std::uint32_t>::max() ||
             maximum_units == 0 || maximum_units > units)
@@ -929,6 +1065,8 @@ namespace llaminar2
             .cpu_is_superblock = manifest.cpu_is_superblock,
             .gpu_is_asymmetric = manifest.gpu_is_asymmetric,
             .gpu_has_emins = manifest.gpu_has_emins,
+            .gpu_superblock_phase = cpu_layout.coded() ? static_cast<uint8_t>(
+                native_quantised_superblock::superblockPhase((gpu_to_cpu ? manifest.source_projection : manifest.destination_projection).first_column / 32)) : uint8_t{0},
             .cpu_encoding = manifest.cpu_encoding,
             .cpu_data_stride = manifest.cpu_data_stride,
             .cpu_block_stride = manifest.cpu_block_stride,
@@ -942,6 +1080,53 @@ namespace llaminar2
                 "Remote CPU/GPU projection fields do not form a supported device repack layout");
         }
         return layout;
+    }
+
+    CodedGpuProjectionRelayLayouts makeCodedGpuProjectionRelayLayouts(
+        const GpuExpertPackedDescriptor &source, const GpuExpertPackedDescriptor &destination,
+        const ExpertTierWeightProjectionIntersection &intersection, std::uint32_t capacity)
+    {
+        if (!source.valid() || !destination.valid() || !source.metadata_layout || !destination.metadata_layout ||
+            source.codebook_id != destination.codebook_id ||
+            source.payload_bytes_per_block != destination.payload_bytes_per_block ||
+            source.is_asymmetric != destination.is_asymmetric || source.has_emins != destination.has_emins ||
+            source.n != intersection.source().rows || source.k != intersection.source().columns ||
+            destination.n != intersection.destination().rows || destination.k != intersection.destination().columns ||
+            source.blocks_per_row != static_cast<unsigned>(source.k / 32) ||
+            destination.blocks_per_row != static_cast<unsigned>(destination.k / 32))
+            throw std::invalid_argument("Coded GPU relay requires matching original projection roots and formats");
+
+        // For coded representations, the physical codebook uniquely names a
+        // source; e.g. source IQ4_XS is physical 24 rather than ordinary IQ4_NL.
+        const auto &catalog = native_quantised_formats::kAllSourceFormats;
+        const auto found = std::find_if(catalog.begin(), catalog.end(), [&](const auto &entry) {
+            return cpu::native_quantised::migrationUsesSuperblockCodes(*entry.metadata) &&
+                canonicalDeviceVnniCodebookId(*entry.metadata) == source.codebook_id;
+        });
+        if (found == catalog.end())
+            throw std::invalid_argument("Coded GPU relay physical codebook has no original source encoding");
+        auto manifest = nativeManifestGeometry(
+            {.codebook_id = found->metadata->codebook_id, .is_superblock = found->metadata->is_superblock, .present = true},
+            intersection.rows(), intersection.columns(), capacity);
+        manifest.source_projection = intersection.source();
+        manifest.destination_projection = intersection.destination();
+        manifest.gpu_codebook_id = source.codebook_id;
+        manifest.gpu_payload_bytes_per_block = source.payload_bytes_per_block;
+        manifest.gpu_is_asymmetric = source.is_asymmetric;
+        manifest.gpu_has_emins = source.has_emins;
+        return {
+            .pack = codedGpuRelayLayout(manifest, ExpertTierWeightConversionDirection::GpuToCpu),
+            .unpack = codedGpuRelayLayout(manifest, ExpertTierWeightConversionDirection::CpuToGpu),
+        };
+    }
+
+    ExpertTierWeightDeviceLayout remoteCodedGpuProjectionDeviceLayout(
+        const MoEOverlayRemoteProjectionManifest &manifest, ExpertTierWeightConversionDirection direction)
+    {
+        std::string error;
+        if (!manifest.carriesCodedGpuUnits() || !manifest.valid(&error))
+            throw std::invalid_argument(error.empty() ? "Coded GPU relay requires a valid coded unit manifest" : error);
+        return codedGpuRelayLayout(manifest, direction);
     }
 
     bool encodeMoEOverlayRemoteProjectionManifest(

@@ -23,6 +23,7 @@
 #include <stdexcept>
 #if defined(__AVX2__) || defined(__AVX512F__)
 #include <immintrin.h>
+#include "CPUNativeQuantisedMultiScaleKernels.h"
 #endif
 
 namespace llaminar2::cpu::native_quantised
@@ -101,8 +102,8 @@ namespace llaminar2::cpu::native_quantised
         /// Pack-context layout that writes this unit's primary scale words.
         [[nodiscard]] VnniPrimaryScaleLayout primaryScaleLayout() const noexcept
         {
-            return scaleEncoding() == CPUNativeQuantisedScaleEncoding::PowerOfTwoBF16
-                       ? VnniPrimaryScaleLayout::PowerOfTwoBF16Words
+            return scaleEncoding() == CPUNativeQuantisedScaleEncoding::E8M0
+                       ? VnniPrimaryScaleLayout::NativeE8M0Bytes
                        : VnniPrimaryScaleLayout::FP16Words;
         }
 
@@ -120,13 +121,14 @@ namespace llaminar2::cpu::native_quantised
         int data_stride = 1024;
 
         /// Total bytes per K-block including inline metadata.
-        /// = data_stride + 128 (comp) + 128 (scales) [+ 128 (mins) if asymmetric]
+        /// ExpandedInt8: payload + optional compensation + primary and optional minimum scales.
         int interleaved_block_stride = 1280;
 
         /** @brief Return whether this matrix uses native four-bit interleaving. */
         [[nodiscard]] bool usesNibbleLUT() const noexcept
         {
-            return encoding == CPUNativeQuantisedEncoding::NibbleLUT || usesNibbleLUTSourceScale();
+            return encoding == CPUNativeQuantisedEncoding::NibbleLUT || usesNibbleLUTSourceScale() ||
+                encoding == CPUNativeQuantisedEncoding::Q4KSuperblockCoded;
         }
 
         /** @brief Whether raw IQ4_XS source factors accompany the nibble payload. */
@@ -181,15 +183,13 @@ namespace llaminar2::cpu::native_quantised
         /**
          * @brief Return whether each prepared block carries weight compensation.
          *
-         * Nibble and expanded-INT8 kernels bias signed weights by shifting the
-         * activation to unsigned bytes, and therefore need one per-column
-         * weight sum. Q6_K reverses the VNNI operands: unsigned six-bit weights
-         * multiply signed activations, so its centering correction depends only
-         * on the activation half sums and no weight compensation is stored.
+         * Expanded signed-Q8 units omit the column sum; legacy expanded units retain it.
+         * On x86 the compensation-free kernels consume signed activation bytes
+         * and correct any unsigned weight bias with the activation sum instead.
          */
         [[nodiscard]] bool usesInlineCompensation() const noexcept
         {
-            return !usesQ6KNativeDualScale() && !usesCompactMultiScale();
+            return preparedUsesInlineCompensation(encoding, codebook_id);
         }
 
         /**
@@ -261,17 +261,17 @@ namespace llaminar2::cpu::native_quantised
         void sealPublication() { native_interleaved.seal(descriptor()); }
 
         /**
-         * @brief Write the benign value into every padding metadata word of a partial final chunk.
+         * @brief Normalize metadata that admission checks in a partial final chunk's padding.
          * @throws std::invalid_argument For an unknown source/encoding or a non-canonical stored extent.
          * @throws std::overflow_error For unrepresentable geometry.
          * @throws std::logic_error If owner fields disagree with the canonical geometry.
          * @details Producers call this after their last live write and before
          * sealPublication(), inside the generation they own. Movement transfers
-         * live columns only; padding words of the final chunk would otherwise keep
-         * whatever the storage held, while every ISA's readers load whole vectors.
-         * Zero is in-domain for every secondary word (IQ3_S, IQ4_XS and IQ2_S
-         * coefficients, Q6_K coefficients, FP16 minima). Payload bytes, primary
-         * scales and live columns are untouched; nothing is allocated.
+         * live columns only; padding fields would otherwise retain arbitrary
+         * bytes in the retired slot, while the seal checks whole SIMD vectors.
+         * Inline secondary words accept zero, and the native MXFP4 exponent
+         * uses zero as its prepared zero-scale marker. Payload, unchecked
+         * metadata, and every live column remain untouched; nothing is allocated.
          */
         void normalizePaddingMetadata()
         {
@@ -283,8 +283,11 @@ namespace llaminar2::cpu::native_quantised
             if (geometry.padded_columns != N_padded || geometry.blocks_per_row != blocks_per_row ||
                 geometry.data_stride != data_stride || geometry.interleaved_block_stride != interleaved_block_stride)
                 throw std::logic_error("Native CPU padding normalization requires the descriptor-owned geometry");
-            if (!geometry.has_secondary || geometry.columns % 64 == 0)
+            const bool byte_scale = scaleEncoding() == CPUNativeQuantisedScaleEncoding::E8M0;
+            if ((!geometry.has_secondary && !byte_scale) || geometry.columns % 64 == 0)
                 return;
+            const std::size_t field_bytes = byte_scale ? 1u : sizeof(std::uint16_t);
+            const std::size_t field_offset = byte_scale ? geometry.data_stride : geometry.secondary_offset;
             const std::size_t chunks = std::size_t(geometry.padded_columns / 64);
             const std::size_t blocks = std::size_t(geometry.blocks_per_row);
             const std::size_t stride = std::size_t(geometry.interleaved_block_stride);
@@ -292,8 +295,8 @@ namespace llaminar2::cpu::native_quantised
             const auto bytes = native_interleaved.unsealedGenerationBytes();
             for (std::size_t block = 0; block < blocks; ++block)
             {
-                auto *words = bytes.data() + ((chunks - 1) * blocks + block) * stride + std::size_t(geometry.secondary_offset);
-                std::memset(words + live * sizeof(std::uint16_t), 0, (64 - live) * sizeof(std::uint16_t));
+                auto *plane = bytes.data() + ((chunks - 1) * blocks + block) * stride + field_offset;
+                std::memset(plane + live * field_bytes, 0, (64 - live) * field_bytes);
             }
         }
 
@@ -367,17 +370,64 @@ namespace llaminar2::cpu::native_quantised
         [[nodiscard]] native_quantised_superblock::StagedBlockMetadata codedBlockMetadata(int c, int kb, int column) const
         {
             const uint8_t *base = blockUnit(c, kb);
-            uint8_t source_payload[16]{};
-            compactColumnPayload(base, codebook_id, column, source_payload);
-            const auto code = coded_metadata::columnCode(base, static_cast<std::uint32_t>(data_stride), codebook_id,
-                                                         column, source_payload);
-            const auto word = coded_metadata::loadSuperblockWord(superblockHeader(c, kb), codebook_id, column);
-            return native_quantised_superblock::decodeSuperblockMetadata(codebook_id, code, word);
+            const auto sb_codebook = superblockMetadataCodebook(encoding, codebook_id);
+            uint8_t payload[16]{};
+            if (native_quantised_superblock::superblockCodeInPayload(sb_codebook))
+                compactColumnPayload(base, codebook_id, column, payload);
+            const auto code = coded_metadata::columnCode(base, preparedCodedPlaneOffset(encoding, data_stride),
+                                                         sb_codebook, column, payload);
+            const auto word = coded_metadata::loadSuperblockWord(superblockHeader(c, kb), sb_codebook, column);
+            return native_quantised_superblock::decodeSuperblockMetadata(sb_codebook, code, word);
         }
 
         // -------------------------------------------------------------------
         // Accessors for the kernel inner loop
         // -------------------------------------------------------------------
+
+#if defined(__AVX2__) || defined(__AVX512F__)
+        /**
+         * @brief Reconstruct an IQ4_XS source scale strip in registers.
+         * @tparam Columns Eight or sixteen output columns per SIMD strip.
+         * @param chunk 64-column chunk index.
+         * @param block Logical 32-value K block.
+         * @param column First column, aligned to the strip width.
+         * @return Original widened d multiplied by the signed six-bit factor.
+         * @details The caller has proved the physical encoding. Fixed strides
+         * avoid re-dispatching the format in every iteration of the K loop.
+         */
+        template <int Columns>
+        [[nodiscard, gnu::always_inline]] inline auto loadIQ4XSCodedScales(int chunk, int block, int column) const
+        {
+            constexpr auto codebook = kNativeQuantisedIQ4XSSourceScaleCodebook;
+            constexpr auto physical = CPUNativeQuantisedEncoding::NibbleLUTSourceScale;
+            constexpr auto source = native_quantised_formats::IQ4_XS.codebook_id;
+            using Ops = multi_scale::SIMD<Columns>;
+            using L = coded_metadata::Lanes<Ops>;
+            const CPUNativeQuantisedBlockGeometry geometry{preparedInterleavedBlockStride(physical, false, source),
+                preparedSuperblockHeaderBytes(physical, source), static_cast<std::size_t>(blocks_per_row)};
+            const auto *base = interleavedBase() + geometry.blockOffset(chunk, 0);
+            const auto *planes = base + geometry.blockOffset(0, block) +
+                preparedCodedPlaneOffset(physical, preparedDataStride(physical, source));
+            const auto *bases = base + geometry.headerOffset(0, block) + 2 * column;
+            if constexpr (Columns == 16)
+                return coded_metadata::sourceScaleFactors<codebook, Ops>(L::template code<codebook>(planes, column),
+                    _mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(bases)))).primary;
+            else
+            {
+                // BMI2 deposits the two narrow planes into byte slots before
+                // a single widening load; no shuffle masks occupy YMMs.
+                std::uint32_t low;
+                std::uint16_t high;
+                std::memcpy(&low, planes + column / 2, sizeof(low));
+                std::memcpy(&high, planes + 32 + column / 4, sizeof(high));
+                const auto bytes = _pdep_u64(low, 0x0f0f0f0f0f0f0f0full) |
+                    _pdep_u64(high, 0x3030303030303030ull);
+                const auto code = std::bit_cast<typename Ops::I>(_mm256_cvtepu8_epi32(_mm_cvtsi64_si128(bytes)));
+                return coded_metadata::sourceScaleFactors<codebook, Ops>(code,
+                    _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i *>(bases)))).primary;
+            }
+        }
+#endif
 
 #if defined(__AVX512F__)
         /**
@@ -399,58 +449,68 @@ namespace llaminar2::cpu::native_quantised
                 reinterpret_cast<const __m256i *>(primary)));
         }
 
-        /** @brief Load sixteen effective scales without rounding source products to half.
-         * @param primary Aligned inline primary words, within one64-column unit.
-         * @return Widened ordinary scale or exact IQ4_XS base times signed coefficient.
+        /** @brief Load 16 effective scales from an inline per-block plane.
+         * @param primary Aligned primary words of a per-block encoding.
+         * @return Widened scale or exact IQ3_S base times signed source factor.
          */
-        [[nodiscard]] inline __m512 loadScales512(const uint16_t *primary) const
+        [[nodiscard]] inline __m512 loadScales512(const std::uint16_t *primary) const
         {
-            // BF16 power-of-two words widen by placement alone (word << 16); never F16C.
-            const __m512 base = scaleEncoding() == CPUNativeQuantisedScaleEncoding::PowerOfTwoBF16
-                ? _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(
-                      _mm256_load_si256(reinterpret_cast<const __m256i *>(primary))), 16))
-                : loadPlainFP16Scales512(primary);
-            if (!usesNibbleLUTSourceScale() && !usesIQ3SExpandedSourceScale()) return base;
+            const __m512 base = loadPlainFP16Scales512(primary);
+            if (!usesIQ3SExpandedSourceScale()) return base;
             const __m512i raw = _mm512_cvtepu16_epi32(_mm256_load_si256(
                 reinterpret_cast<const __m256i *>(primary + 64)));
-            if (usesIQ3SExpandedSourceScale())
-            {
-                if (_mm512_test_epi32_mask(raw, _mm512_set1_epi32(~15)) != 0)
-                    throw std::invalid_argument("IQ3_S coefficient contains reserved bits");
-                return _mm512_mul_ps(base, _mm512_cvtepi32_ps(_mm512_add_epi32(
-                    _mm512_slli_epi32(raw, 1), _mm512_set1_epi32(1))));
-            }
-            if (_mm512_test_epi32_mask(raw, _mm512_set1_epi32(~63)) != 0)
-                throw std::invalid_argument("IQ4_XS coefficient contains reserved bits");
-            return _mm512_mul_ps(base, _mm512_cvtepi32_ps(
-                _mm512_sub_epi32(_mm512_and_si512(raw, _mm512_set1_epi32(63)), _mm512_set1_epi32(32))));
+            if (_mm512_test_epi32_mask(raw, _mm512_set1_epi32(~15)) != 0)
+                throw std::invalid_argument("IQ3_S coefficient contains reserved bits");
+            return _mm512_mul_ps(base, _mm512_cvtepi32_ps(_mm512_add_epi32(
+                _mm512_slli_epi32(raw, 1), _mm512_set1_epi32(1))));
+        }
+
+        /** @brief Load 16 effective scales from an admitted nibble block.
+         * @param chunk 64-column chunk index.
+         * @param block Logical 32-value K block.
+         * @param column First column of the strip, a multiple of 16.
+         * @return Exact FP32 source factors or widened ordinary scale words.
+         */
+        [[nodiscard, gnu::always_inline]] inline __m512 loadScales512(int chunk, int block, int column) const
+        {
+            if (usesNibbleLUTSourceScale())
+                return loadIQ4XSCodedScales<16>(chunk, block, column);
+            const auto *primary = interleavedB(chunk, block, 0, 0) + data_stride + 2 * column;
+            const __m256i words = _mm256_load_si256(reinterpret_cast<const __m256i *>(primary));
+            return _mm512_cvtph_ps(words);
         }
 #endif
 #if defined(__AVX2__)
-        /** @brief Load eight effective scales using the same original source equation.
-         * @param primary Aligned inline primary words, within one64-column unit.
-         * @return Separately rounded FP32 scale vector, shared across grouped rows.
+        /** @brief Load 8 effective scales from an inline per-block plane.
+         * @param primary Aligned primary words of a per-block encoding.
+         * @return Widened scale or exact IQ3_S base times signed source factor.
          */
-        [[nodiscard]] inline __m256 loadScales256(const uint16_t *primary) const
+        [[nodiscard]] inline __m256 loadScales256(const std::uint16_t *primary) const
         {
             const __m128i words = _mm_load_si128(reinterpret_cast<const __m128i *>(primary));
-            const __m256 base = scaleEncoding() == CPUNativeQuantisedScaleEncoding::PowerOfTwoBF16
-                ? _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(words), 16))
-                : _mm256_cvtph_ps(words);
-            if (!usesNibbleLUTSourceScale() && !usesIQ3SExpandedSourceScale()) return base;
+            const __m256 base = _mm256_cvtph_ps(words);
+            if (!usesIQ3SExpandedSourceScale()) return base;
             const __m256i raw = _mm256_cvtepu16_epi32(_mm_load_si128(
                 reinterpret_cast<const __m128i *>(primary + 64)));
-            if (usesIQ3SExpandedSourceScale())
-            {
-                if (!_mm256_testz_si256(raw, _mm256_set1_epi32(~15)))
-                    throw std::invalid_argument("IQ3_S coefficient contains reserved bits");
-                return _mm256_mul_ps(base, _mm256_cvtepi32_ps(_mm256_add_epi32(
-                    _mm256_slli_epi32(raw, 1), _mm256_set1_epi32(1))));
-            }
-            if (!_mm256_testz_si256(raw, _mm256_set1_epi32(~63)))
-                throw std::invalid_argument("IQ4_XS coefficient contains reserved bits");
-            return _mm256_mul_ps(base, _mm256_cvtepi32_ps(
-                _mm256_sub_epi32(_mm256_and_si256(raw, _mm256_set1_epi32(63)), _mm256_set1_epi32(32))));
+            if (!_mm256_testz_si256(raw, _mm256_set1_epi32(~15)))
+                throw std::invalid_argument("IQ3_S coefficient contains reserved bits");
+            return _mm256_mul_ps(base, _mm256_cvtepi32_ps(_mm256_add_epi32(
+                _mm256_slli_epi32(raw, 1), _mm256_set1_epi32(1))));
+        }
+
+        /** @brief Load 8 effective scales from an admitted nibble block.
+         * @param chunk 64-column chunk index.
+         * @param block Logical 32-value K block.
+         * @param column First column of the strip, a multiple of 8.
+         * @return Exact FP32 source factors or widened ordinary scale words.
+         */
+        [[nodiscard, gnu::always_inline]] inline __m256 loadScales256(int chunk, int block, int column) const
+        {
+            if (usesNibbleLUTSourceScale())
+                return loadIQ4XSCodedScales<8>(chunk, block, column);
+            const auto *primary = interleavedB(chunk, block, 0, 0) + data_stride + 2 * column;
+            const __m128i words = _mm_load_si128(reinterpret_cast<const __m128i *>(primary));
+            return _mm256_cvtph_ps(words);
         }
 #endif
 
@@ -467,6 +527,11 @@ namespace llaminar2::cpu::native_quantised
             {
                 const auto words = codedBlockMetadata(c, kb, n_local);
                 return nativeQuantisedPrimaryScale(encoding, codebook_id, words.primary, words.secondary);
+            }
+            if (scaleEncoding() == CPUNativeQuantisedScaleEncoding::E8M0)
+            {
+                const std::uint8_t e = blockUnit(c, kb)[data_stride + n_local];
+                return std::bit_cast<float>(e ? mxfp4::normalScaleFP32Bits(e) : 0u);
             }
             const bool source_scale = usesNibbleLUTSourceScale() || usesIQ3SExpandedSourceScale() ||
                 usesQ6KNativeDualScale() || (usesCompactMultiScale() && codebook_id == 13);
@@ -500,6 +565,8 @@ namespace llaminar2::cpu::native_quantised
         {
             if (superblockCoded())
                 throw std::logic_error("Superblock-coded CPU weights hold no per-block metadata words");
+            if (scaleEncoding() == CPUNativeQuantisedScaleEncoding::E8M0)
+                throw std::logic_error("Native MXFP4 weights have byte scales, not half words");
             size_t block_offset = blockOffset(c, kb);
             const size_t compensation_bytes = usesInlineCompensation() ? 128u : 0u;
             return reinterpret_cast<const uint16_t *>(
@@ -533,7 +600,7 @@ namespace llaminar2::cpu::native_quantised
         {
             if (!usesInlineCompensation())
                 throw std::logic_error(
-                    "Q6_K native dual-scale weights do not carry compensation metadata");
+                    "Prepared CPU encoding does not carry weight-sum compensation");
             size_t block_offset = blockOffset(c, kb);
             return reinterpret_cast<const int16_t *>(
                 interleavedBase() + block_offset + data_stride);

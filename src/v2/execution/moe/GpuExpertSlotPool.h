@@ -61,6 +61,10 @@ namespace llaminar2
             /// above, so the initializer sees it); unions max-merge explicitly.
             NativeQuantisedScalePlaneWidth scale_plane = nativeQuantisedScalePlaneWidth(codebook_id);
             ExpertWeightFormat format; ///< Original arithmetic identity.
+            std::uint8_t gpu_superblock_phase = 0; ///< Immutable phase shared by every expert in this projection shard.
+
+            /** @return Coded allocation identity, or no coded storage for a per-block format. */
+            [[nodiscard]] std::optional<WeightVRAMPool::SuperblockCodedMetadata> codedDeclaration() const;
         };
 
         /** @brief One projection's persistent allocation and exact geometry. */

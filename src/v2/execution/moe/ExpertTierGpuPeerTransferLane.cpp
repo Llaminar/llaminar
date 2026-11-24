@@ -11,6 +11,12 @@
 #include "ExpertTierGpuPeerTransferLane.h"
 #include "ExpertTierGpuBlobTransferLane.h"
 #include "GPUExpertTransferBackend.h"
+#ifdef HAVE_CUDA
+#include "kernels/cuda/repack/CUDAExpertTierWeightKernels.h"
+#endif
+#ifdef HAVE_ROCM
+#include "kernels/rocm/repack/ROCmExpertTierWeightKernels.h"
+#endif
 #include "backends/NativePeerTransferEventOwnership.h"
 #include "backends/ReadAheadNativeResourceObligation.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
@@ -361,6 +367,18 @@ namespace llaminar2
         const ExpertTierSourceReadiness& source_readiness,std::string* error) noexcept
     {
         ExpertTierGpuBlobChunkProtocol protocol(std::numeric_limits<std::size_t>::max());
+        if (source.metadata_layout || destination.metadata_layout)
+        {
+            if (!gpuExpertPackedDescriptorsCompatible(source, destination))
+            {
+                assignPeerError(error, "Coded GPU peer transfer requires matching source and destination codebooks, geometry and source phase");
+                return false;
+            }
+            const auto bits = source.blockCount() * native_quantised_superblock::superblockCodePlaneBits(source.codebook_id);
+            if (!protocol.beginContiguous(source.vnni_bytes + (bits + 7) / 8 + source.mins_bytes, error))
+                return false;
+            return startRegions(source.ptrs, destination.ptrs, protocol, source_readiness, error, &source, &destination);
+        }
         if(!protocol.begin(source,destination,error))return false;
         return startRegions(source.ptrs,destination.ptrs,protocol,source_readiness,error);
     }
@@ -370,6 +388,34 @@ namespace llaminar2
         const ExpertTierWeightProjectionIntersection& intersection,
         const ExpertTierSourceReadiness& source_readiness,std::string* error) noexcept
     {
+        if (source.metadata_layout || destination.metadata_layout)
+        {
+            namespace sb = native_quantised_superblock;
+            if (!config_.source_device.is_gpu() || config_.source_device.type != config_.destination_device.type ||
+                !source.valid() || !destination.valid() || !source.metadata_layout || !destination.metadata_layout ||
+                source.codebook_id != destination.codebook_id || source.payload_bytes_per_block != destination.payload_bytes_per_block ||
+                intersection.empty() || intersection.source().rows != source.n || intersection.source().columns != source.k ||
+                intersection.destination().rows != destination.n || intersection.destination().columns != destination.k ||
+                intersection.sourceColumnOrigin() % 32 || intersection.destinationColumnOrigin() % 32 || intersection.columns() % 32)
+            {
+                assignPeerError(error, "Coded peer rectangle requires matching GPU backends, formats and original 32-value block bounds");
+                return false;
+            }
+            const auto phase = sb::superblockPhase(nativeQuantisedLayoutPhase(source.metadata_layout) + intersection.sourceColumnOrigin() / 32);
+            if (phase != sb::superblockPhase(nativeQuantisedLayoutPhase(destination.metadata_layout) + intersection.destinationColumnOrigin() / 32))
+            {
+                assignPeerError(error, "Coded peer rectangle endpoints name different source superblock phases");
+                return false;
+            }
+            const auto blocks = intersection.columns() / 32;
+            const auto live = size_t(intersection.rows()) * blocks;
+            const auto bytes = live * source.payload_bytes_per_block + (live * sb::superblockCodePlaneBits(source.codebook_id) + 7) / 8 +
+                size_t(intersection.rows()) * sb::superblocksPerRow(blocks, phase) * sb::superblockFieldBytes(source.codebook_id);
+            ExpertTierGpuBlobChunkProtocol protocol(std::numeric_limits<std::size_t>::max());
+            if (!protocol.beginContiguous(bytes, error))
+                return false;
+            return startRegions(source.ptrs, destination.ptrs, protocol, source_readiness, error, &source, &destination, &intersection);
+        }
         ExpertTierGpuBlobChunkProtocol protocol(std::numeric_limits<std::size_t>::max());
         if(!protocol.begin(source,destination,intersection,error))return false;
         return startRegions(source.ptrs,destination.ptrs,protocol,source_readiness,error);
@@ -413,7 +459,10 @@ namespace llaminar2
         const GPUExpertPointers &destination,
         ExpertTierGpuBlobChunkProtocol& protocol,
         const ExpertTierSourceReadiness &source_readiness,
-        std::string *error) noexcept
+        std::string *error,
+        const GpuExpertPackedDescriptor *coded_source,
+        const GpuExpertPackedDescriptor *coded_destination,
+        const ExpertTierWeightProjectionIntersection *coded_rectangle) noexcept
     {
         const AmbientGpuDeviceGuard ambient_device(
             config_.destination_device);
@@ -470,7 +519,41 @@ namespace llaminar2
         // One readiness edge and one completion fence cover every exact run.
         // The same cursor drives host relay and MPI range mapping; no padded
         // allocation extent becomes a peer-copy extent.
-        while(copied) {
+        if (copied && coded_source)
+        {
+            if (!coded_rectangle)
+                copied = GPUExpertTransfer::transferExpert(*coded_source, *coded_destination,
+                    config_.source_device, config_.destination_device, transfer_stream_);
+            else
+            {
+                // Both native launches consume the same authenticated root and rectangle geometry.
+                const auto launch = [&]<class Rectangle>(auto select, auto enqueue) {
+                    const Rectangle rectangle{
+                    .rows = unsigned(coded_rectangle->rows()), .blocks = unsigned(coded_rectangle->columns() / 32),
+                    .payload_bytes = coded_source->payload_bytes_per_block, .codebook = coded_source->codebook_id,
+                    .src_n = unsigned(coded_source->n), .dst_n = unsigned(coded_destination->n),
+                    .src_row = unsigned(coded_rectangle->sourceRowOrigin()), .dst_row = unsigned(coded_rectangle->destinationRowOrigin()),
+                    .src_block = unsigned(coded_rectangle->sourceColumnOrigin() / 32), .dst_block = unsigned(coded_rectangle->destinationColumnOrigin() / 32),
+                    .source = {.payload = source.d_vnni, .scales = static_cast<const uint16_t *>(source.d_scales),
+                        .mins = static_cast<const uint16_t *>(source.d_mins), .metadata_layout = coded_source->metadata_layout},
+                    .destination = {.payload = destination.d_vnni, .scales = static_cast<uint16_t *>(destination.d_scales),
+                        .mins = static_cast<uint16_t *>(destination.d_mins), .metadata_layout = coded_destination->metadata_layout}};
+                    return select(destination_ordinal_) && enqueue(rectangle, transfer_stream_);
+                };
+                copied = false;
+#ifdef HAVE_CUDA
+                if (config_.destination_device.is_cuda())
+                    copied = launch.template operator()<CUDACodedPeerProjectionRectangle>(
+                        detail::restoreCUDADeviceOrdinal, launchCUDACodedPeerProjectionRectangle);
+#endif
+#ifdef HAVE_ROCM
+                if (config_.destination_device.is_rocm())
+                    copied = launch.template operator()<ROCmCodedPeerProjectionRectangle>(
+                        detail::restoreROCmDeviceOrdinal, launchROCmCodedPeerProjectionRectangle);
+#endif
+            }
+        }
+        while(copied && !coded_source) {
             const auto chunk=protocol.takeNext();if(!chunk)break;
             const auto region=static_cast<std::size_t>(chunk->region);
             GPUExpertPointers source_run,destination_run;

@@ -46,6 +46,7 @@
 #include "kernels/common/NativeTileCompletion.cuh"
 #include "kernels/rocm/common/ROCmSignedDot4.h"
 #include "tensors/NativeQuantisedScalePlane.h"
+#include "tensors/NativeQuantisedSuperblockMetadata.h"
 #include "kernels/rocm/moe/ROCmMoEWaveReduction.h"
 #include "kernels/rocm/moe/ROCmRouterQ8Prefill.h"
 #include "backends/rocm/ROCmHardwareMetadata.h"
@@ -7872,6 +7873,13 @@ namespace
             return false;
         }
 
+        if (src.metadata_layout || dst.metadata_layout)
+            return src.metadata_layout && dst.metadata_layout && src.codebook_id == dst.codebook_id &&
+                llaminar2::nativeQuantisedLayoutValid(src.codebook_id, src.metadata_layout) &&
+                llaminar2::nativeQuantisedLayoutValid(dst.codebook_id, dst.metadata_layout) &&
+                llaminar2::nativeQuantisedLayoutPhase(src.metadata_layout) == llaminar2::nativeQuantisedLayoutPhase(dst.metadata_layout) &&
+                src.payload && dst.payload && src.scales && dst.scales && src.mins && dst.mins && !src.emins && !dst.emins;
+
         uint8_t src_payload_bytes = 0u;
         uint8_t src_is_asymmetric = 0u;
         uint8_t src_has_emins = 0u;
@@ -7904,17 +7912,16 @@ namespace
         dst.source_codebook_id = src.source_codebook_id;
         dst.source_is_superblock = src.source_is_superblock;
         dst.source_identity_present = src.source_identity_present;
-        dst.metadata_layout = src.metadata_layout;
+        // The destination owns its packed code bit offset.
     }
 
     __device__ __forceinline__ bool rebalance_matrix_copy_ready(
         const DeviceNativeQuantisedMatrixDescView &desc,
         const DeviceMoEExpertDirectoryEntryView &entry)
     {
-        // Movement copies per-block planes only; superblock-coded matrices are
-        // loader-owned and never enter a reusable slot (fail closed).
-        if (desc.metadata_layout != 0u)
-            return false;
+        if (desc.metadata_layout)
+            return rebalance_matrix_desc_ready(desc) && llaminar2::nativeQuantisedLayoutValid(desc.codebook_id, desc.metadata_layout) &&
+                desc.mins && !desc.emins;
         (void)entry;
         uint8_t payload_bytes = 0u;
         uint8_t is_asymmetric = 0u;
@@ -7983,6 +7990,7 @@ namespace
                rebalance_directory_copy_ready(entry);
     }
 
+#if !defined(__gfx906__)
     __device__ __forceinline__ bool rebalance_transfer_slot_copy_complete(
         const DeviceMoEExpertDirectoryEntryView &entry,
         uint32_t participant,
@@ -7996,20 +8004,66 @@ namespace
                (entry.flags & kDeviceMoEDirectoryFlagResident) != 0u &&
                (entry.flags & kDeviceMoEDirectoryFlagCopyComplete) != 0u;
     }
+#endif
 
     /**
      * @brief Authenticate a completed transfer publication for one plan wave.
      *
-     * A slot may still contain a valid copy from an earlier command.  Requiring
+     * A slot may still contain a valid copy from an earlier command. Requiring
      * both the leased generation transition and current command epoch prevents
-     * that stale publication from satisfying a newer apply operation.
+     * that stale publication from satisfying a newer apply operation. The decode
+     * router only consumes this receipt; payload packing runs in separate kernels.
+     * On gfx906 keep the receipt check out of the router's register allocation,
+     * and check one projection at a time to bound the callee's live state.
      */
-    __device__ __forceinline__ bool rebalance_transfer_slot_copy_complete_for_plan(
+#if defined(__gfx906__)
+    __device__ __attribute__((noinline))
+#else
+    __device__ __forceinline__
+#endif
+    bool rebalance_transfer_slot_copy_complete_for_plan(
         const DeviceMoEExpertDirectoryEntryView &entry,
         const DeviceMoERebalancePlanEntryView &plan,
         uint32_t participant,
         uint32_t command_epoch)
     {
+#if defined(__gfx906__)
+        constexpr uint32_t flags = kDeviceMoEDirectoryFlagValid |
+            kDeviceMoEDirectoryFlagTransferSlot | kDeviceMoEDirectoryFlagResident |
+            kDeviceMoEDirectoryFlagCopyComplete;
+        const auto generation = plan.destination_generation + 1u;
+        // These are independent scalar reads of the two bound records. Combine
+        // the predicates without short-circuiting to avoid nested EXEC masks.
+        if (!((generation != 0u) & (entry.generation == generation) &
+              (entry.epoch == command_epoch) & (entry.participant == participant) &
+              (entry.slot_index != kDeviceMoEInvalidSlot) & ((entry.flags & flags) == flags) &
+              (entry.layer == plan.layer) & (entry.expert == plan.expert) &
+              (entry.descriptor.logical_expert_id == static_cast<int32_t>(plan.expert)) &
+              (entry.descriptor.local_slot >= 0)))
+            return false;
+
+        const auto &desc = entry.descriptor;
+        if (llaminar2::deviceMoEWeightFormatIsFloating(desc.weight_format))
+            return llaminar2::deviceMoEFloatingExpertCopyReady(desc);
+        if (desc.weight_format != llaminar2::DeviceMoEWeightFormat::NativeQuantised ||
+            !llaminar2::deviceMoEProjectionPayloadValid(desc))
+            return false;
+        const bool fragment = desc.projection_set == llaminar2::DeviceMoEProjectionSet::IntermediateShard;
+        const unsigned count = desc.projection_set == llaminar2::DeviceMoEProjectionSet::GateUp ? 2u : 3u;
+#pragma clang loop unroll(disable)
+        for (unsigned role = 0; role < count; ++role)
+        {
+            const auto &matrix = role == 0u ? desc.gate : role == 1u ? desc.up : desc.down;
+            // Matrix copy readiness includes the basic shape/plane checks;
+            // original intermediate shards also require source publication.
+            if (!rebalance_matrix_copy_ready(matrix, entry))
+                return false;
+            if (fragment && (matrix.source_identity_present != 1u ||
+                !llaminar2::NativeQuantisedDescriptorValidation::publishable(matrix)))
+                return false;
+        }
+        return true;
+#else
         return plan.destination_generation != 0xffffffffu &&
                entry.generation == plan.destination_generation + 1u &&
                entry.epoch == command_epoch &&
@@ -8018,6 +8072,7 @@ namespace
                    participant,
                    plan.layer,
                    plan.expert);
+#endif
     }
 
     __device__ __forceinline__ bool rebalance_directory_fits_transfer_capacity(
@@ -10763,6 +10818,47 @@ namespace
             dst_bytes[i] = src_bytes[i];
     }
 
+    /** @return Byte extents used on the wire, excluding code-plane allocation padding. */
+    __device__ __forceinline__ llaminar2::NativeQuantisedMetadataPlaneBytes rebalance_wire_planes(
+        const DeviceNativeQuantisedMatrixDescView &desc, bool asymmetric, bool emins)
+    {
+        namespace sb = llaminar2::native_quantised_superblock;
+        const auto blocks = rebalance_block_count(desc);
+        if (!desc.metadata_layout)
+            return llaminar2::NativeQuantisedMetadataPlaneBytes::of(blocks, desc.codebook_id, asymmetric, emins);
+        const auto phase = llaminar2::nativeQuantisedLayoutPhase(desc.metadata_layout);
+        return {(blocks * sb::superblockCodePlaneBits(desc.codebook_id) + 7) / 8,
+                sb::planeBytes(desc.codebook_id, desc.n, desc.blocks_per_row, phase).superblock, 0};
+    }
+
+    /** @brief Pack live bits only, normalizing a coalesced matrix's bit offset to zero on the wire. */
+    __device__ void rebalance_pack_coded_plane(const DeviceNativeQuantisedMatrixDescView &src, uint8_t *wire)
+    {
+        namespace sb = llaminar2::native_quantised_superblock;
+        const auto bits = rebalance_block_count(src) * sb::superblockCodePlaneBits(src.codebook_id);
+        const auto shift = llaminar2::nativeQuantisedLayoutCodeBitShift(src.metadata_layout);
+        for (auto bit = uint64_t(threadIdx.x) * 8; bit < bits; bit += uint64_t(blockDim.x) * 8)
+        {
+            const auto width = static_cast<unsigned>(bits - bit < 8 ? bits - bit : 8);
+            wire[bit / 8] = uint8_t(sb::loadPackedBits(static_cast<const uint8_t *>(src.scales), bit + shift, width));
+        }
+    }
+
+    /** @brief Update only this matrix's code bits, preserving neighbors in shared pool words. */
+    __device__ void rebalance_unpack_coded_plane(const uint8_t *wire, const DeviceNativeQuantisedMatrixDescView &dst)
+    {
+        namespace sb = llaminar2::native_quantised_superblock;
+        const auto bits = rebalance_block_count(dst) * sb::superblockCodePlaneBits(dst.codebook_id);
+        const auto address = reinterpret_cast<uintptr_t>(dst.scales);
+        const auto shift = llaminar2::nativeQuantisedLayoutCodeBitShift(dst.metadata_layout) + (address & 3u) * 8;
+        auto *aligned = reinterpret_cast<void *>(address & ~uintptr_t{3});
+        for (auto bit = uint64_t(threadIdx.x) * 8; bit < bits; bit += uint64_t(blockDim.x) * 8)
+        {
+            const auto width = static_cast<unsigned>(bits - bit < 8 ? bits - bit : 8);
+            sb::storePackedBits(aligned, bit + shift, width, wire[bit / 8]);
+        }
+    }
+
     __device__ __forceinline__ unsigned long long rebalance_projection_payload_bytes(
         const DeviceNativeQuantisedMatrixDescView &desc,
         const DeviceMoEExpertDirectoryEntryView &entry)
@@ -10774,8 +10870,7 @@ namespace
         if (!rebalance_projection_format(desc, payload_bytes_per_block, is_asymmetric, has_emins))
             return 0ULL;
         const unsigned long long blocks = rebalance_block_count(desc);
-        const auto planes = llaminar2::NativeQuantisedMetadataPlaneBytes::of(
-            blocks, desc.codebook_id, is_asymmetric != 0u, has_emins != 0u);
+        const auto planes = rebalance_wire_planes(desc, is_asymmetric != 0, has_emins != 0);
         return blocks * static_cast<unsigned long long>(payload_bytes_per_block) +
                planes.scales + planes.secondary + planes.emins;
     }
@@ -10796,7 +10891,7 @@ namespace
                     ? rebalance_projection_payload_bytes(entry.descriptor.down, entry) : 0ULL);
     }
 
-    __device__ __forceinline__ unsigned long long rebalance_pack_projection_to_payload(
+    __device__ unsigned long long rebalance_pack_projection_to_payload(
         const DeviceNativeQuantisedMatrixDescView &src,
         const DeviceMoEExpertDirectoryEntryView &entry,
         uint8_t *payload)
@@ -10811,8 +10906,7 @@ namespace
         const unsigned long long payload_bytes =
             blocks * static_cast<unsigned long long>(payload_bytes_per_block);
         // Packed transfer layout uses the same plane widths as allocation.
-        const auto planes = llaminar2::NativeQuantisedMetadataPlaneBytes::of(
-            blocks, src.codebook_id, is_asymmetric != 0u, has_emins != 0u);
+        const auto planes = rebalance_wire_planes(src, is_asymmetric != 0, has_emins != 0);
         const unsigned long long scales_bytes = planes.scales;
         const unsigned long long mins_bytes = planes.secondary;
         const unsigned long long emins_bytes = planes.emins;
@@ -10820,7 +10914,10 @@ namespace
         unsigned long long offset = 0ULL;
         rebalance_copy_bytes(src.payload, payload + offset, payload_bytes);
         offset += payload_bytes;
-        rebalance_copy_bytes(src.scales, payload + offset, scales_bytes);
+        if (src.metadata_layout)
+            rebalance_pack_coded_plane(src, payload + offset);
+        else
+            rebalance_copy_bytes(src.scales, payload + offset, scales_bytes);
         offset += scales_bytes;
         if (mins_bytes > 0ULL)
         {
@@ -10835,7 +10932,7 @@ namespace
         return offset;
     }
 
-    __device__ __forceinline__ unsigned long long rebalance_unpack_projection_from_payload(
+    __device__ unsigned long long rebalance_unpack_projection_from_payload(
         const uint8_t *payload,
         const DeviceNativeQuantisedMatrixDescView &dst,
         const DeviceMoEExpertDirectoryEntryView &entry)
@@ -10850,8 +10947,7 @@ namespace
         const unsigned long long payload_bytes =
             blocks * static_cast<unsigned long long>(payload_bytes_per_block);
         // Packed transfer layout uses the same plane widths as allocation.
-        const auto planes = llaminar2::NativeQuantisedMetadataPlaneBytes::of(
-            blocks, dst.codebook_id, is_asymmetric != 0u, has_emins != 0u);
+        const auto planes = rebalance_wire_planes(dst, is_asymmetric != 0, has_emins != 0);
         const unsigned long long scales_bytes = planes.scales;
         const unsigned long long mins_bytes = planes.secondary;
         const unsigned long long emins_bytes = planes.emins;
@@ -10859,7 +10955,10 @@ namespace
         unsigned long long offset = 0ULL;
         rebalance_copy_bytes(payload + offset, dst.payload, payload_bytes);
         offset += payload_bytes;
-        rebalance_copy_bytes(payload + offset, dst.scales, scales_bytes);
+        if (dst.metadata_layout)
+            rebalance_unpack_coded_plane(payload + offset, dst);
+        else
+            rebalance_copy_bytes(payload + offset, dst.scales, scales_bytes);
         offset += scales_bytes;
         if (mins_bytes > 0ULL)
         {

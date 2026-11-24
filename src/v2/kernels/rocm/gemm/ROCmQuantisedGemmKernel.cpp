@@ -35,6 +35,7 @@
  * or the enclosing whole HIP capture; no global ordinal resource pool survives.
  */
 
+#include "kernels/cpu/gemm/CPUNativeQuantisedEncoding.h"
 #include "kernels/common/HCDownOutputPublication.h"
 #include "kernels/common/ProjectionWorkLaunch.h"
 #include "ROCmQuantisedActivationProducers.h"
@@ -1214,14 +1215,10 @@ namespace llaminar2
             impl_->d_weights_native_emins = d_native_emins;
             impl_->native_quantised_codebook_id = codebook_id;
             impl_->native_quantised_blocks_per_row = blocks_per_row;
-            // Coded metadata is immutable source storage: never a reusable slot
-            // whose later arrivals carry per-block planes. Its superblock plane
-            // occupies the secondary slot.
             if (!nativeQuantisedLayoutValid(codebook_id, metadata_layout) ||
-                (metadata_layout != 0 && allocation_format.payload_bytes_per_block != 0) ||
-                (nativeQuantisedLayoutRepresentation(metadata_layout) ==
-                     NativeQuantisedMetadataRepresentation::SuperblockCoded &&
-                 !d_native_mins))
+                (metadata_layout && (!d_native_mins || d_native_emins || !d_native_scales ||
+                    (native_quantised_superblock::superblockCodeInPayload(codebook_id) &&
+                        d_native_scales != d_native_quantised))))
                 throw std::invalid_argument(
                     "[ROCmQuantisedGemmKernel] invalid metadata layout for prepared weights");
             impl_->native_metadata_layout = metadata_layout;
@@ -1243,6 +1240,11 @@ namespace llaminar2
             impl_->native_source_identity = source_identity;
             if (allocation_format.payload_bytes_per_block != 0)
             {
+                const bool coded = cpu::native_quantised::migrationUsesSuperblockCodes(*source_format);
+                if (coded != (metadata_layout != 0) || (coded &&
+                    (allocation_format.payload_bytes_per_block != source_format->payload_bytes ||
+                        !allocation_format.has_mins || allocation_format.has_emins)))
+                    throw std::invalid_argument("[ROCmQuantisedGemmKernel] Reusable slot does not preserve the source's migration metadata layout");
                 const auto execution_format =
                     codebook_id == canonicalDeviceVnniCodebookId(*source_format)
                         ? canonicalDeviceVnniFormat(*source_format)
@@ -1251,7 +1253,7 @@ namespace llaminar2
                         execution_format.payload_bytes_per_block ||
                     (execution_format.is_asymmetric &&
                      !allocation_format.has_mins) ||
-                    (execution_format.has_emins &&
+                    (!coded && execution_format.has_emins &&
                      !allocation_format.has_emins))
                 {
                     throw std::invalid_argument(
@@ -1736,19 +1738,8 @@ namespace llaminar2
             auto* row_scales=static_cast<float*>(requireBank(GemmWorkspaceBuffers::SCALES_A,sizeof(float)));
             (void)requireBank(GemmWorkspaceBuffers::SUMS_A_BLOCKWISE,static_cast<size_t>(k/32)*sizeof(std::int32_t));
             const auto blocks=static_cast<size_t>(n)*weights.blocks_per_row;
-            // A superblock-coded matrix reads a bit-packed code plane (plus read
-            // padding) and one d/dmin word per row and superblock, never the
-            // per-block planes; describe exactly the bytes its reader can touch.
             const auto weight_meta=native_quantised_scale::metadataPlanes(weights);
-            const auto coded_planes=weight_meta.coded()
-                ? native_quantised_superblock::planeBytes(weights.codebook_id,static_cast<size_t>(n),
-                      weights.blocks_per_row,weight_meta.superblock_phase)
-                : native_quantised_superblock::PlaneBytes{};
-            const size_t primary_bytes=weight_meta.coded()
-                ? coded_planes.code+((weight_meta.code_bit_shift+7u)/8u)
-                : blocks*sizeof(std::uint16_t);
-            const size_t secondary_bytes=weight_meta.coded()?coded_planes.superblock:
-                (weights.mins?blocks*sizeof(std::uint16_t):0);
+            const auto metadata_bytes=q8ResidualWeightMetadataBytes(weights);
             // Protect complete original capacities, including unused immutable
             // allocation planes and the scalar consumer's untouched sums bank.
             const std::array writes{
@@ -1762,9 +1753,11 @@ namespace llaminar2
                 Q8ResidualStorageSpan{input.gamma.gpu_data_ptr(),std::max(input.gamma.size_bytes(),size_t{128}*sizeof(float)),alignof(float)},
                 Q8ResidualStorageSpan{weights.payload,blocks*(weights.allocation_payload_bytes_per_block?
                     weights.allocation_payload_bytes_per_block:physical.payload_bytes_per_block),16},
-                Q8ResidualStorageSpan{weights.scales,primary_bytes,weight_meta.coded()?1u:alignof(std::uint16_t)},
-                Q8ResidualStorageSpan{weights.mins,secondary_bytes,alignof(std::uint16_t)},
-                Q8ResidualStorageSpan{weights.emins,weights.emins?blocks*sizeof(std::uint32_t):0,alignof(std::uint32_t)},
+                Q8ResidualStorageSpan{weights.scales,metadata_bytes.scales,
+                    weight_meta.coded()?1u:nativeQuantisedScalePlaneBytes(weights.codebook_id)},
+                Q8ResidualStorageSpan{weights.mins,metadata_bytes.secondary,
+                    weight_meta.coded()?native_quantised_superblock::superblockFieldBytes(weights.codebook_id):alignof(std::uint16_t)},
+                Q8ResidualStorageSpan{weights.emins,metadata_bytes.emins,alignof(std::uint32_t)},
                 Q8ResidualStorageSpan{workspace->getBuffer(GemmWorkspaceBuffers::SUMS_A_BLOCKWISE),
                     workspace->getBufferSize(GemmWorkspaceBuffers::SUMS_A_BLOCKWISE),alignof(std::int32_t)},
                 Q8ResidualStorageSpan{row_scales,workspace->getBufferSize(GemmWorkspaceBuffers::SCALES_A),alignof(float)}};
@@ -5664,14 +5657,8 @@ namespace llaminar2
                         (!slice || (slice->firstColumn() == 0 && slice->physicalColumns() == slice->policyColumns()));
                     if (valid)
                     {
-                        candidate.members[index] = {
-                            .weights = descriptor.payload,
-                            .scales = static_cast<const uint16_t *>(descriptor.scales),
-                            .mins = static_cast<const uint16_t *>(descriptor.mins),
-                            .emins = static_cast<const uint32_t *>(descriptor.emins),
-                            .output = static_cast<float *>(projection.output->gpu_data_ptr()),
-                            .n = projection.n,
-                            .source = {descriptor.source_codebook_id, bool(descriptor.source_is_superblock), true}};
+                        candidate.members[index] = NativeQuantisedVerifierBundleMember::bind(
+                            descriptor, static_cast<float *>(projection.output->gpu_data_ptr()));
                         valid = candidate.members[index].output != nullptr;
                     }
                 }
@@ -5710,11 +5697,8 @@ namespace llaminar2
                         valid=owner && owner->rocm_device_id_==rocm_device_id_ && output &&
                             owner->inspectPreparedNativeQuantisedMatrixDesc(descriptor) &&
                             descriptor.n==projection.n && descriptor.k==k && descriptor.source_identity_present;
-                        if(valid)*native_members[role]={.weights=descriptor.payload,
-                            .scales=static_cast<const uint16_t *>(descriptor.scales),
-                            .mins=static_cast<const uint16_t *>(descriptor.mins),
-                            .emins=static_cast<const uint32_t *>(descriptor.emins),.output=output,.n=projection.n,
-                            .source={descriptor.source_codebook_id,bool(descriptor.source_is_superblock),true}};
+                        if (valid)
+                            *native_members[role] = NativeQuantisedVerifierBundleMember::bind(descriptor, output);
                     }
                     else
                     {

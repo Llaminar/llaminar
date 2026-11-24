@@ -1638,16 +1638,14 @@ namespace llaminar2
         const DeviceNativeQuantisedMatrixDesc &src,
         const DeviceNativeQuantisedMatrixDesc &dst) noexcept
     {
-        // Transfer slots carry per-block planes only; a superblock-coded
-        // (loader-resident) matrix never enters movement.
-        if (src.metadata_layout != 0u || dst.metadata_layout != 0u)
+        if (src.n != dst.n || src.k != dst.k || src.blocks_per_row != dst.blocks_per_row)
             return false;
-        if (src.n != dst.n ||
-            src.k != dst.k ||
-            src.blocks_per_row != dst.blocks_per_row)
-        {
-            return false;
-        }
+        if (src.metadata_layout || dst.metadata_layout)
+            return src.metadata_layout && dst.metadata_layout && src.codebook_id == dst.codebook_id &&
+                nativeQuantisedLayoutValid(src.codebook_id, src.metadata_layout) &&
+                nativeQuantisedLayoutValid(dst.codebook_id, dst.metadata_layout) &&
+                nativeQuantisedLayoutPhase(src.metadata_layout) == nativeQuantisedLayoutPhase(dst.metadata_layout) &&
+                src.valid() && dst.valid() && src.mins && dst.mins && !src.emins && !dst.emins;
 
         uint8_t src_payload_bytes = 0;
         uint8_t src_is_asymmetric = 0;
@@ -1688,7 +1686,7 @@ namespace llaminar2
         dst.source_codebook_id = src.source_codebook_id;
         dst.source_is_superblock = src.source_is_superblock;
         dst.source_identity_present = src.source_identity_present;
-        dst.metadata_layout = src.metadata_layout;
+        // Representation and phase already agree; the destination owns its code bit offset.
     }
 
     inline uint64_t deviceMoEMatrixBlockCount(const DeviceNativeQuantisedMatrixDesc &desc) noexcept

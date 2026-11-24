@@ -12,6 +12,19 @@
 
 namespace llaminar2
 {
+    /** @brief Independent source and destination roots of a peer-transferred coded projection. */
+    struct CUDACodedPeerProjectionRectangle
+    {
+        uint32_t rows, blocks, payload_bytes;
+        uint8_t codebook;
+        uint32_t src_n, dst_n, src_row, dst_row, src_block, dst_block;
+        ExpertTierGpuConstProjectionView source;
+        ExpertTierGpuMutableProjectionView destination;
+    };
+
+    /** @brief Transpose no bytes: copy only the live intersection and touched coded headers on the destination stream. */
+    [[nodiscard]] bool launchCUDACodedPeerProjectionRectangle(CUDACodedPeerProjectionRectangle rectangle, void *stream) noexcept;
+
     /**
      * @brief Convert common GPU packed bytes into final CPU NativeQuantised units.
      *

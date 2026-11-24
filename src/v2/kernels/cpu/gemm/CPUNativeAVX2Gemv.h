@@ -28,6 +28,7 @@
 #include "CPUNativeQuantisedContributionContract.h"
 #include "CPUNativeQuantisedFP16.h"
 #include "CPUNativeQuantisedQ6Kernels.h"
+#include "CPUNativeQuantisedQ5X86Kernels.h"
 #include "CPUNativeQuantisedMultiScaleKernels.h"
 #include "VNNIEmulation.h"
 #include "tensors/BlockStructures.h"
@@ -59,6 +60,59 @@ namespace llaminar2::cpu::native_quantised
             0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
     } // namespace avx2_luts
 
+    /** @brief Choose the smallest uniform zero point of the native nibble decoder.
+     * @param codebook Original nibble codec (5 includes both Q4_1 and Q4_K).
+     * @return z such that the unsigned decoder publishes w + z.
+     * @details The previous sum((a+128)*w) - 128*sum(w) and the new
+     * sum(a*(w+z)) - z*sum(a) are both exactly sum(a*w) in INT32. At
+     * 32 terms, the biased dot has magnitude at most 32*128*255.
+     */
+    inline constexpr int nibbleWeightBias(uint8_t codebook) noexcept
+    {
+        return codebook == 5 ? 0 : codebook == 0 ? 8 : 128;
+    }
+
+    /** @return Four signed activation bytes, in native dot order. */
+    inline int32_t nativeActivationWord(const Q8_1Block &block, int first) noexcept
+    {
+        int32_t word;
+        std::memcpy(&word, block.qs + first, sizeof(word));
+        return word;
+    }
+
+    /** @brief Exact dot of unsigned weights and signed activations without pair saturation.
+     * @details Splitting off bit 7 bounds both maddubs pair sums to int16, even
+     * for a=-128 and w=255. Widen each sum before recombining the two parts.
+     */
+    inline __m256i dotUnsignedWeightsAVX2(__m256i dot, __m256i weight, __m256i activation) noexcept
+    {
+        const auto high_bit = _mm256_set1_epi8(-128);
+        const auto ones = _mm256_set1_epi16(1);
+        const auto low = _mm256_maddubs_epi16(_mm256_andnot_si256(high_bit, weight), activation);
+        const auto high = _mm256_maddubs_epi16(_mm256_and_si256(high_bit, weight), activation);
+        return _mm256_add_epi32(dot, _mm256_add_epi32(_mm256_madd_epi16(low, ones), _mm256_madd_epi16(high, ones)));
+    }
+
+    /** @brief Dot one expanded group using its admitted legacy or compensation-free layout. */
+    inline __m256i dotExpandedWeightsAVX2(__m256i dot, __m256i weights, const Q8_1Block &activation,
+                                          int first, bool compensated) noexcept
+    {
+        auto a = nativeActivationWord(activation, first);
+        if (compensated)
+            return isa::avx2_dpbusd_epi32(dot, _mm256_set1_epi32(a ^ std::int32_t(0x80808080u)), weights);
+        return dotUnsignedWeightsAVX2(dot, _mm256_xor_si256(weights, _mm256_set1_epi8(-128)), _mm256_set1_epi32(a));
+    }
+
+    /** @return The legacy per-column correction, or the compensation-free activation-side correction. */
+    inline __m256i expandedBiasAVX2(const CPUNativeQuantisedPackedWeights &packed, const Q8_1Block &activation,
+                                  int chunk, int block, int column)
+    {
+        if (!packed.usesInlineCompensation())
+            return _mm256_set1_epi32(128 * activation.sum_qs);
+        return _mm256_slli_epi32(_mm256_cvtepi16_epi32(_mm_load_si128(reinterpret_cast<const __m128i *>(
+            packed.chunkComp(chunk, block) + column))), 7);
+    }
+
     // =========================================================================
     // AVX2 decode LUT builder (selects correct LUT by codebook_id)
     // =========================================================================
@@ -83,7 +137,8 @@ namespace llaminar2::cpu::native_quantised
         default:
             throw std::invalid_argument("NativeQuantised AVX2 nibble LUT requested for a non-nibble codebook");
         }
-        return isa::build_decode_lut_avx2(lut_data);
+        return _mm256_add_epi8(isa::build_decode_lut_avx2(lut_data),
+            _mm256_set1_epi8(static_cast<int8_t>(nibbleWeightBias(codebook_id))));
     }
 
     /**
@@ -100,6 +155,29 @@ namespace llaminar2::cpu::native_quantised
         uint32_t raw = 0;
         std::memcpy(&raw, block.qs + base_index, sizeof(raw));
         return static_cast<int32_t>(raw ^ 0x80808080u);
+    }
+
+    /** @return Eight SIMD factors of a packed nibble block, on its exact source layout. */
+    inline coded_metadata::Factors<__m256> loadNibbleFactors256(
+        const CPUNativeQuantisedPackedWeights &packed, int chunk, int block, int column)
+    {
+        if (packed.encoding == CPUNativeQuantisedEncoding::Q4KSuperblockCoded)
+        {
+            using Ops = multi_scale::SIMD<8>;
+            using L = coded_metadata::Lanes<Ops>;
+            return coded_metadata::reconstruct<5, Ops>(
+                L::code<5>(packed.blockUnit(chunk, block) + packed.data_stride, column),
+                L::superblockWords<5>(packed.superblockHeader(chunk, block), column));
+        }
+        if (packed.scaleEncoding() == CPUNativeQuantisedScaleEncoding::E8M0)
+        {
+            const auto e = _mm_loadu_si64(packed.blockUnit(chunk, block) + packed.data_stride + column);
+            const auto biased = _mm_subs_epu8(e, _mm_set1_epi8(1));
+            return {.primary = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu8_epi32(biased), 23))};
+        }
+        return {.primary = packed.loadScales256(chunk, block, column),
+                .secondary = packed.is_asymmetric ? _mm256_cvtph_ps(_mm_load_si128(
+                    reinterpret_cast<const __m128i *>(packed.chunkMins(chunk, block) + column))) : _mm256_setzero_ps()};
     }
 
     // =========================================================================
@@ -139,13 +217,14 @@ namespace llaminar2::cpu::native_quantised
         int segment,
         __m256 accumulator)
     {
-        const __m256i bias_128_i32 = _mm256_set1_epi32(128);
+        const int weight_bias = nibbleWeightBias(packed.codebook_id);
         const __m256i mask_0F = _mm256_set1_epi8(0x0F);
         const int z = segment / 2;
         const int byte_offset = (segment % 2) * 32;
 
         for (int kb = kb_start; kb < kb_end; ++kb)
         {
+            const auto *unit = packed.admittedBlockUnit(chunk, kb);
             const Q8_1Block &activation = A_q8[kb];
             __m256i dot_low = _mm256_setzero_si256();
             __m256i dot_high = _mm256_setzero_si256();
@@ -157,8 +236,8 @@ namespace llaminar2::cpu::native_quantised
             for (int group = 0; group < 4; ++group)
             {
                 const uint8_t *base =
-                    packed.interleavedB(chunk, kb, group, z) + byte_offset;
-                const __m256i raw = _mm256_load_si256(
+                    unit + group * 256 + z * 64 + byte_offset;
+                const __m256i raw = _mm256_loadu_si256(
                     reinterpret_cast<const __m256i *>(base));
                 const __m256i low = _mm256_shuffle_epi8(
                     decode_lut, _mm256_and_si256(raw, mask_0F));
@@ -166,38 +245,24 @@ namespace llaminar2::cpu::native_quantised
                     decode_lut,
                     _mm256_and_si256(
                         _mm256_srli_epi16(raw, 4), mask_0F));
-                dot_low = isa::avx2_dpbusd_epi32(
-                    dot_low,
-                    _mm256_set1_epi32(pack_q8_1_unsigned_word_avx2(
-                        activation, group * 4)),
-                    low);
-                dot_high = isa::avx2_dpbusd_epi32(
-                    dot_high,
-                    _mm256_set1_epi32(pack_q8_1_unsigned_word_avx2(
-                        activation, group * 4 + 16)),
-                    high);
+                dot_low = dotUnsignedWeightsAVX2(dot_low, low, _mm256_set1_epi32(nativeActivationWord(activation, group * 4)));
+                dot_high = dotUnsignedWeightsAVX2(dot_high, high, _mm256_set1_epi32(nativeActivationWord(activation, group * 4 + 16)));
             }
 
-            const __m256i compensation = _mm256_cvtepi16_epi32(
-                _mm_load_si128(reinterpret_cast<const __m128i *>(
-                    packed.chunkComp(chunk, kb) + segment * 8)));
             const __m256i corrected = _mm256_sub_epi32(
                 _mm256_add_epi32(dot_low, dot_high),
-                _mm256_mullo_epi32(bias_128_i32, compensation));
-            const __m256 weight_scale = packed.loadScales256(packed.chunkScales(chunk, kb) + segment * 8);
+                _mm256_set1_epi32(weight_bias * activation.sum_qs));
+            const auto factors = loadNibbleFactors256(packed, chunk, kb, segment * 8);
             const float activation_scale =
                 nativeQuantisedFP16ScaleToFP32(activation.d);
             if (packed.is_asymmetric)
             {
-                const __m256 weight_min = _mm256_cvtph_ps(
-                    _mm_load_si128(reinterpret_cast<const __m128i *>(
-                        packed.chunkMins(chunk, kb) + segment * 8)));
                 accumulator = accumulateCorrectedSingleScaleBlockAVX2(
                     accumulator,
                     corrected,
-                    weight_scale,
+                    factors.primary,
                     activation.sum_qs,
-                    weight_min,
+                    factors.secondary,
                     activation_scale,
                     packed.numerical_policy);
             }
@@ -206,7 +271,7 @@ namespace llaminar2::cpu::native_quantised
                 accumulator = accumulateSingleScaleBlockAVX2(
                     accumulator,
                     corrected,
-                    weight_scale,
+                    factors.primary,
                     activation_scale,
                     packed.numerical_policy);
             }
@@ -274,6 +339,9 @@ namespace llaminar2::cpu::native_quantised
         int kb_end,
         bool accumulate = false)
     {
+        if (packed.encoding == CPUNativeQuantisedEncoding::Q5NativeSingleScale)
+            return q5::dispatch<8>(packed, std::array{A_q8}, std::array{C},
+                chunk, kb_start, kb_end, accumulate);
         if (packed.usesCompactMultiScale())
         {
             multi_scale::dispatch<8>(packed, std::array{A_q8}, std::array{C},
@@ -290,7 +358,7 @@ namespace llaminar2::cpu::native_quantised
             throw std::invalid_argument(
                 "AVX2 non-nibble GEMV received an unsupported packed encoding");
 
-        const __m256i bias_128_i32 = _mm256_set1_epi32(128);
+        const bool compensated = packed.usesInlineCompensation();
         for (int segment = 0; segment < 8; ++segment)
         {
             const int z = segment / 2;
@@ -318,24 +386,13 @@ namespace llaminar2::cpu::native_quantised
                         reinterpret_cast<const __m256i *>(
                             packed.interleavedB(
                                 chunk, kb, group + 1, z) + byte_offset));
-                    dot_even = isa::avx2_dpbusd_epi32(
-                        dot_even,
-                        _mm256_set1_epi32(pack_q8_1_unsigned_word_avx2(
-                            activation, group * 4)),
-                        weight_even);
-                    dot_odd = isa::avx2_dpbusd_epi32(
-                        dot_odd,
-                        _mm256_set1_epi32(pack_q8_1_unsigned_word_avx2(
-                            activation, (group + 1) * 4)),
-                        weight_odd);
+                    dot_even = dotExpandedWeightsAVX2(dot_even, weight_even, activation, group * 4, compensated);
+                    dot_odd = dotExpandedWeightsAVX2(dot_odd, weight_odd, activation, (group + 1) * 4, compensated);
                 }
 
-                const __m256i compensation = _mm256_cvtepi16_epi32(
-                    _mm_load_si128(reinterpret_cast<const __m128i *>(
-                        packed.chunkComp(chunk, kb) + segment * 8)));
                 const __m256i corrected = _mm256_sub_epi32(
                     _mm256_add_epi32(dot_even, dot_odd),
-                    _mm256_mullo_epi32(bias_128_i32, compensation));
+                    expandedBiasAVX2(packed, activation, chunk, kb, segment * 8));
                 const __m256 weight_scale = packed.loadScales256(packed.chunkScales(chunk, kb) + segment * 8);
                 const float activation_scale =
                     nativeQuantisedFP16ScaleToFP32(activation.d);
@@ -444,13 +501,14 @@ namespace llaminar2::cpu::native_quantised
         __m256 &fp0,
         __m256 &fp1)
     {
-        const __m256i bias_128_i32 = _mm256_set1_epi32(128);
+        const int weight_bias = nibbleWeightBias(packed.codebook_id);
         const __m256i mask_0F = _mm256_set1_epi8(0x0F);
         const int z = segment / 2;
         const int byte_offset = (segment % 2) * 32;
 
         for (int kb = kb_start; kb < kb_end; ++kb)
         {
+                const auto *unit = packed.admittedBlockUnit(chunk, kb);
                 const Q8_1Block &a0 = A_q8_row0[kb];
                 const Q8_1Block &a1 = A_q8_row1[kb];
                 __m256i dot0_low = _mm256_setzero_si256();
@@ -466,8 +524,8 @@ namespace llaminar2::cpu::native_quantised
                 for (int group = 0; group < 4; ++group)
                 {
                     const uint8_t *base =
-                        packed.interleavedB(chunk, kb, group, z) + byte_offset;
-                    const __m256i raw = _mm256_load_si256(
+                        unit + group * 256 + z * 64 + byte_offset;
+                    const __m256i raw = _mm256_loadu_si256(
                         reinterpret_cast<const __m256i *>(base));
                     const __m256i low = _mm256_shuffle_epi8(
                         decode_lut, _mm256_and_si256(raw, mask_0F));
@@ -475,59 +533,35 @@ namespace llaminar2::cpu::native_quantised
                         decode_lut,
                         _mm256_and_si256(
                             _mm256_srli_epi16(raw, 4), mask_0F));
-                    dot0_low = isa::avx2_dpbusd_epi32(
-                        dot0_low,
-                        _mm256_set1_epi32(pack_q8_1_unsigned_word_avx2(
-                            a0, group * 4)),
-                        low);
-                    dot1_low = isa::avx2_dpbusd_epi32(
-                        dot1_low,
-                        _mm256_set1_epi32(pack_q8_1_unsigned_word_avx2(
-                            a1, group * 4)),
-                        low);
-                    dot0_high = isa::avx2_dpbusd_epi32(
-                        dot0_high,
-                        _mm256_set1_epi32(pack_q8_1_unsigned_word_avx2(
-                            a0, group * 4 + 16)),
-                        high);
-                    dot1_high = isa::avx2_dpbusd_epi32(
-                        dot1_high,
-                        _mm256_set1_epi32(pack_q8_1_unsigned_word_avx2(
-                            a1, group * 4 + 16)),
-                        high);
+                    dot0_low = dotUnsignedWeightsAVX2(dot0_low, low, _mm256_set1_epi32(nativeActivationWord(a0, group * 4)));
+                    dot1_low = dotUnsignedWeightsAVX2(dot1_low, low, _mm256_set1_epi32(nativeActivationWord(a1, group * 4)));
+                    dot0_high = dotUnsignedWeightsAVX2(dot0_high, high, _mm256_set1_epi32(nativeActivationWord(a0, group * 4 + 16)));
+                    dot1_high = dotUnsignedWeightsAVX2(dot1_high, high, _mm256_set1_epi32(nativeActivationWord(a1, group * 4 + 16)));
                 }
 
-                const __m256i compensation = _mm256_cvtepi16_epi32(
-                    _mm_load_si128(reinterpret_cast<const __m128i *>(
-                        packed.chunkComp(chunk, kb) + segment * 8)));
-                const __m256i bias =
-                    _mm256_mullo_epi32(bias_128_i32, compensation);
                 const __m256i corrected0 = _mm256_sub_epi32(
-                    _mm256_add_epi32(dot0_low, dot0_high), bias);
+                    _mm256_add_epi32(dot0_low, dot0_high), _mm256_set1_epi32(weight_bias * a0.sum_qs));
                 const __m256i corrected1 = _mm256_sub_epi32(
-                    _mm256_add_epi32(dot1_low, dot1_high), bias);
-                const __m256 weight_scale = packed.loadScales256(packed.chunkScales(chunk, kb) + segment * 8);
+                    _mm256_add_epi32(dot1_low, dot1_high), _mm256_set1_epi32(weight_bias * a1.sum_qs));
+                const auto factors = loadNibbleFactors256(packed, chunk, kb, segment * 8);
                 const float a0_scale = nativeQuantisedFP16ScaleToFP32(a0.d);
                 const float a1_scale = nativeQuantisedFP16ScaleToFP32(a1.d);
                 if (packed.is_asymmetric)
                 {
-                    const __m256 weight_min = _mm256_cvtph_ps(
-                        _mm_load_si128(reinterpret_cast<const __m128i *>(
-                            packed.chunkMins(chunk, kb) + segment * 8)));
                     fp0 = accumulateCorrectedSingleScaleBlockAVX2(
-                        fp0, corrected0, weight_scale, a0.sum_qs,
-                        weight_min, a0_scale, packed.numerical_policy);
+                        fp0, corrected0, factors.primary, a0.sum_qs,
+                        factors.secondary, a0_scale, packed.numerical_policy);
                     fp1 = accumulateCorrectedSingleScaleBlockAVX2(
-                        fp1, corrected1, weight_scale, a1.sum_qs,
-                        weight_min, a1_scale, packed.numerical_policy);
+                        fp1, corrected1, factors.primary, a1.sum_qs,
+                        factors.secondary, a1_scale, packed.numerical_policy);
                 }
                 else
                 {
                     fp0 = accumulateSingleScaleBlockAVX2(
-                        fp0, corrected0, weight_scale, a0_scale,
+                        fp0, corrected0, factors.primary, a0_scale,
                         packed.numerical_policy);
                     fp1 = accumulateSingleScaleBlockAVX2(
-                        fp1, corrected1, weight_scale, a1_scale,
+                        fp1, corrected1, factors.primary, a1_scale,
                         packed.numerical_policy);
                 }
         }
@@ -594,6 +628,9 @@ namespace llaminar2::cpu::native_quantised
         int kb_end,
         bool accumulate)
     {
+        if (packed.encoding == CPUNativeQuantisedEncoding::Q5NativeSingleScale)
+            return q5::dispatch<8, SumPairs>(packed, std::array{A_q8_row0, A_q8_row1}, std::array{C_row0, C_row1},
+                chunk, kb_start, kb_end, accumulate);
         if (packed.usesCompactMultiScale())
         {
             multi_scale::dispatch<8>(packed, std::array{A_q8_row0, A_q8_row1},
@@ -618,7 +655,7 @@ namespace llaminar2::cpu::native_quantised
             throw std::invalid_argument(
                 "AVX2 non-nibble two-row kernel received an unsupported packed encoding");
 
-        const __m256i bias_128_i32 = _mm256_set1_epi32(128);
+        const bool compensated = packed.usesInlineCompensation();
         for (int segment = 0; segment < 8; ++segment)
         {
             const int z = segment / 2;
@@ -652,37 +689,16 @@ namespace llaminar2::cpu::native_quantised
                         reinterpret_cast<const __m256i *>(
                             packed.interleavedB(
                                 chunk, kb, group + 1, z) + byte_offset));
-                    dot0_even = isa::avx2_dpbusd_epi32(
-                        dot0_even,
-                        _mm256_set1_epi32(pack_q8_1_unsigned_word_avx2(
-                            a0, group * 4)),
-                        weight_even);
-                    dot1_even = isa::avx2_dpbusd_epi32(
-                        dot1_even,
-                        _mm256_set1_epi32(pack_q8_1_unsigned_word_avx2(
-                            a1, group * 4)),
-                        weight_even);
-                    dot0_odd = isa::avx2_dpbusd_epi32(
-                        dot0_odd,
-                        _mm256_set1_epi32(pack_q8_1_unsigned_word_avx2(
-                            a0, (group + 1) * 4)),
-                        weight_odd);
-                    dot1_odd = isa::avx2_dpbusd_epi32(
-                        dot1_odd,
-                        _mm256_set1_epi32(pack_q8_1_unsigned_word_avx2(
-                            a1, (group + 1) * 4)),
-                        weight_odd);
+                    dot0_even = dotExpandedWeightsAVX2(dot0_even, weight_even, a0, group * 4, compensated);
+                    dot1_even = dotExpandedWeightsAVX2(dot1_even, weight_even, a1, group * 4, compensated);
+                    dot0_odd = dotExpandedWeightsAVX2(dot0_odd, weight_odd, a0, (group + 1) * 4, compensated);
+                    dot1_odd = dotExpandedWeightsAVX2(dot1_odd, weight_odd, a1, (group + 1) * 4, compensated);
                 }
 
-                const __m256i compensation = _mm256_cvtepi16_epi32(
-                    _mm_load_si128(reinterpret_cast<const __m128i *>(
-                        packed.chunkComp(chunk, kb) + segment * 8)));
-                const __m256i bias =
-                    _mm256_mullo_epi32(bias_128_i32, compensation);
                 const __m256i corrected0 = _mm256_sub_epi32(
-                    _mm256_add_epi32(dot0_even, dot0_odd), bias);
+                    _mm256_add_epi32(dot0_even, dot0_odd), expandedBiasAVX2(packed, a0, chunk, kb, segment * 8));
                 const __m256i corrected1 = _mm256_sub_epi32(
-                    _mm256_add_epi32(dot1_even, dot1_odd), bias);
+                    _mm256_add_epi32(dot1_even, dot1_odd), expandedBiasAVX2(packed, a1, chunk, kb, segment * 8));
                 const __m256 weight_scale = packed.loadScales256(packed.chunkScales(chunk, kb) + segment * 8);
                 const float a0_scale = nativeQuantisedFP16ScaleToFP32(a0.d);
                 const float a1_scale = nativeQuantisedFP16ScaleToFP32(a1.d);

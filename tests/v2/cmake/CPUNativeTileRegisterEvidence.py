@@ -155,7 +155,7 @@ PROGRAM = re.compile(r"27CPUNativeNEONProjectionTileILm(\d)EE3runINS1_11multi_sc
                      r"Li(\d)E")
 INVENTORY = re.compile(r"llaminar-native-neon-tile-probe:([A-Za-z0-9,:]*)")
 # (encoding, nibble map, with-minimum) dispatched per policy by Tile::dispatch().
-DISPATCH = ((1, 0, 1), (1, 0, 0), (5, 0, 0), (2, 0, 0), (4, 2, 0), (0, 0, 0), (0, 2, 0), (0, 1, 1), (0, 3, 0))
+DISPATCH = ((1, 0, 1), (1, 0, 0), (5, 0, 0), (2, 0, 0), (4, 2, 0), (0, 0, 0), (0, 2, 0), (0, 1, 1), (0, 3, 0), (6, 1, 1), (7, 0, 0), (7, 1, 1))
 DOTS = {"ASIMD": 0, "DotProd": 1, "I8MM": 2}
 # The one never-returning diagnostic a tile may call, and abort. Both must also be proven never to return.
 FATAL_DIAGNOSTIC = "_ZN9llaminar23cpu16native_quantised28CPUNativeQuantisedWeightView32rejectOutsideAdmittedPublicationEv"
@@ -175,25 +175,25 @@ BRANCHES = ("b", "bl", "b.cond", "cbz", "cbnz", "tbz", "tbnz")
 # mem addressing, imm, shift, cond, sym label, reloc relocated symbol. Any other form is a structural failure.
 FORMS = frozenset(line.strip() for line in """
 add v,v,v|add w,w,imm|add w,w,w|add x,x,imm|add x,x,imm,shift|add x,x,reloc|add x,x,w,shift|add x,x,x|add x,x,x,shift
-addp v,v,v|adds x,x,imm|adrp x,reloc|adrp x,sym|and v,v,v|and w,w,imm|and x,x,imm|asr w,w,imm|b sym|b.cond sym|bic v,imm
+addp v,v,v|adds x,x,imm|adrp x,reloc|adrp x,sym|and v,v,v|and w,w,imm|and x,x,imm|asr w,w,imm|b sym|b.cond sym|bic v,imm|bic v,imm,shift
 bic v,v,v|bic w,w,w,shift|bics w,w,w|bif v,v,v|bit v,v,v|bfi w,w,imm,imm|bfi x,x,imm,imm|bfxil x,x,imm,imm|bl sym|bsl v,v,v
-cbnz w,sym|cbnz x,sym|cbz w,sym|cbz x,sym|ccmp w,w,imm,cond|cmeq v,v,imm|cmeq v,v,v|cmhi v,v,v|cmn w,imm
+cbnz w,sym|cbnz x,sym|cbz w,sym|cbz x,sym|ccmp w,w,imm,cond|cmeq v,v,imm|cmeq v,v,v|cmhi v,v,v|cmn w,imm|cmtst v,v,v
 cmp w,imm|cmp w,w|cmp w,w,shift|cmp x,imm|cmp x,w,shift|cmp x,x|csel w,w,w,cond|csel x,x,x,cond|csneg w,w,w,cond|cset x,cond|dup d,v[]
-dup v,v[]|dup v,w|dup v,x|eor x,x,x|ext v,v,v,imm|fadd v,v,v|fcvtl v,v|fmla v,v,v|fmov d,d|fmov d,x|fmov s,s
+dup v,v[]|dup v,w|dup v,x|eor v,v,v|eor x,x,x|ext v,v,v,imm|fadd v,v,v|fcsel s,s,s,cond|fcvtl v,v|fcvtn v,v|fmla v,v,v|fmov d,d|fmov d,x|fmov s,s
 fmov s,w|fmov w,s|fmov x,d|fmul s,s,s|fmul v,v,v|fmul v,v,v[]|fneg v,v|ins v[],v[]|ins v[],x|ld1 list,mem
 ld1 list,mem,imm|ld1 list[],mem|ld1 list[],mem,imm|ld1r list,mem|ld1r list,mem,imm|ld2 list,mem|ld2 list[],mem
 ld2r list,mem|ldp d,d,mem|ldp d,d,mem,imm|ldp q,q,mem|ldp q,q,mem,imm|ldp s,s,mem|ldp w,w,mem|ldp x,x,mem
 ldp x,x,mem,imm|ldpsw x,x,mem|ldr b,mem|ldr d,mem|ldr d,mem,imm|ldr h,mem|ldr q,mem|ldr q,mem,imm|ldr s,mem
-ldr w,mem|ldr x,mem|ldrb w,mem|ldrh w,mem|ldrsh w,mem|ldrsw x,mem|ldur d,mem|ldur q,mem|ldur w,mem|ldur x,mem|lsl w,w,imm|lsl x,x,imm
-lsr x,x,imm|lsr x,x,x|madd x,x,x,x|mov d,v[]|mov v,v|mov v[],v[]|mov w,imm|mov w,w|mov x,imm|mov x,x|movi d,imm|movi v,imm
-movi v,imm,shift|movk x,imm,shift|mul w,w,w|mul x,x,x|mvni v,imm|mvni v,imm,shift|negs w,w|nop|orr v,imm|orr v,v,v|orr w,w,imm
+ldr w,mem|ldr x,mem|ldrb w,mem|ldrh w,mem|ldrsh w,mem|ldrsw x,mem|ldur d,mem|ldur s,mem|ldur q,mem|ldur w,mem|ldur x,mem|lsl w,w,imm|lsl x,x,imm
+lsr x,x,imm|lsr x,x,x|madd x,x,x,x|mov d,v[]|mov v,v|mov v[],v[]|mov v[],w|mov w,imm|mov w,w|mov x,imm|mov x,x|movi d,imm|movi v,imm
+movi v,imm,shift|movk x,imm,shift|mul w,w,w|mul x,x,x|mvn v,v|mvni v,imm|mvni v,imm,shift|negs w,w|nop|orr v,imm|orr v,v,v|orr w,w,imm
 orr w,w,w|orr w,w,w,shift|orr x,x,imm|orr x,x,x,shift|ret|saddlp v,v|sbfiz x,x,imm,imm|scvtf s,w|scvtf v,v
-sdot v,v,v|sdot v,v,v[]|shl v,v,imm|shll v,v,imm|smaddl x,w,w,x|smmla v,v,v|smull v,v,v|smull x,w,w|smull2 v,v,v|sshll v,v,imm|sshr v,v,imm
+sdot v,v,v|sdot v,v,v[]|shl v,v,imm|sli v,v,imm|shrn v,v,imm|shll v,v,imm|smaddl x,w,w,x|smmla v,v,v|smull v,v,v|smull x,w,w|smull2 v,v,v|sshll v,v,imm|sshl v,v,v|sri v,v,imm|sshr v,v,imm
 st1 list,mem|st1 list,mem,imm|st1 list[],mem|stp d,d,mem|stp q,q,mem|stp w,w,mem|stp x,x,mem|str b,mem|str d,mem|str d,mem,imm|str q,mem,imm
 str h,mem|str q,mem|str s,mem|str w,mem|str x,mem|stur d,mem|stur q,mem|stur w,mem|stur x,mem|sub v,v,v|sub w,w,imm|sub w,w,w
-sub x,x,imm|sub x,x,imm,shift|sub x,x,x|subs w,w,imm|subs w,w,w|sxtw x,w|tbl v,list,v|tbnz w,imm,sym|tbnz x,imm,sym|tbz w,imm,sym
-uaddw v,v,v|ubfiz w,w,imm,imm|ubfiz x,x,imm,imm|ubfx w,w,imm,imm|ubfx x,x,imm,imm|ucvtf v,v|umaddl x,w,w,x|umull x,w,w|ushll v,v,imm|ushr v,v,imm
-usra v,v,imm|uxtw x,w|zip1 v,v,v|zip2 v,v,v
+sub x,x,imm|sub x,x,imm,shift|sub x,x,x|subs w,w,imm|subs w,w,w|sxth w,w|sxtw x,w|tbl v,list,v|tbnz w,imm,sym|tbnz x,imm,sym|tbz w,imm,sym
+uaddw v,v,v|ubfiz w,w,imm,imm|ubfiz x,x,imm,imm|ubfx w,w,imm,imm|ubfx x,x,imm,imm|ucvtf v,v|umaddl x,w,w,x|umull x,w,w|ushl v,v,v|ushll v,v,imm|ushr v,v,imm
+usra v,v,imm|uxtw x,w|xtn v,v|zip1 v,v,v|zip2 v,v,v
 """.replace("\n", "|").split("|") if line.strip())
 # Admitted instruction grammar. Anything else is a structural failure.
 LOADS = frozenset("ldr ldur ldp ldpsw ldrb ldrh ldrsb ldrsh ldrsw ldurb ldurh ldursb ldursh ldursw "
@@ -1326,7 +1326,9 @@ class Analysis:
         if base in NO_DESTINATION or not operands:
             return self.reads(instruction, state, operands)
         destination = operands[0]
-        inputs = operands if base in MERGE_DEFINITIONS else operands[1:]
+        merges_destination = (base in MERGE_DEFINITIONS or operand_kind(destination) == "v[]" or
+                              (base in {"bic", "orr"} and len(operands) > 1 and operand_kind(operands[1]) == "imm"))
+        inputs = operands if merges_destination else operands[1:]
         if not self.reads(instruction, state, inputs):
             return False
         values = [state.value(gp(operand)) for operand in inputs if gp(operand)]
@@ -1559,12 +1561,25 @@ def require_registers(counts: dict[str, int], identity: str, mode: str, budget: 
     limits = budget.get(identity, {}).get(mode)
     if limits is None:
         raise ValueError(f"no qualified tile register budget for compiler {identity} envelope {mode}")
+    # The coded Q4_K leaf replaces the former Q4_K identity-nibble leaf;
+    # its same-width Q4_1 neighbour retains the identical qualified ceiling.
+    limits = dict(limits)
+    for key, ceiling in tuple(limits.items()):
+        if key.endswith(":0:1:1"):
+            limits[key.removesuffix(":0:1:1") + ":6:1:1"] = ceiling
     failures = []
     for name, count in counts.items():
         key = program_key(name)
         if key.startswith("1:"):
             if count:
                 failures.append(f"{key} spills {count} (single-row programs must not spill)")
+        elif key.split(":")[3] == "7":
+            # Native Q5 replaces the corresponding expanded program. It can
+            # never require more stack traffic than that existing grouped bound.
+            rows, family, policy, _, _, minimum = key.split(":")
+            replaced = f"{rows}:{family}:{policy}:1:0:{minimum}"
+            if replaced not in limits or count > limits[replaced]:
+                failures.append(f"{key} spills {count} > replaced expanded budget {limits.get(replaced)}")
         elif key not in limits:
             failures.append(f"{key} has no budget")
         elif count > limits[key]:

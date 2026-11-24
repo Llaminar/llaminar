@@ -39,7 +39,7 @@ inline size_t cpuPreparedStoreTestBytes(const TensorBase &tensor, std::optional<
     if (!format) return 0;
     if (packed_source->shape().size() != 2)
         throw std::invalid_argument("CPU prepared fixture requires a matrix with native packing metadata");
-    const auto footprint = cpu::native_quantised::preparedFootprintForFormat(*format, packed_source->activationRotation() != nullptr);
+    const bool rotated = packed_source->activationRotation() != nullptr;
     const size_t rows = output_rows.value_or(packed_source->shape()[0]);
     if (rows == 0 || rows > packed_source->shape()[0])
         throw std::invalid_argument("CPU prepared fixture slice exceeds its actual source rows");
@@ -50,8 +50,10 @@ inline size_t cpuPreparedStoreTestBytes(const TensorBase &tensor, std::optional<
             throw std::overflow_error("CPU prepared fixture byte count overflows");
         return a * b;
     };
-    return CPUWeightStoragePlacement::local().requiredAllocationBytes<uint8_t>(
-        checked_product(checked_product(chunks, blocks), footprint.weight_bytes_per_n_chunk_k_block));
+    using namespace cpu::native_quantised;
+    const auto geometry = preparedBlockGeometry(preparedEncodingForSource(*format, rotated),
+        !rotated && format->is_asymmetric, format->codebook_id, blocks);
+    return CPUWeightStoragePlacement::local().requiredAllocationBytes<uint8_t>(checked_product(chunks, geometry.rowBytes()));
 }
 /**
  * @brief Quote the actual serialized immediate preparation workspace from its production owner.

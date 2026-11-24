@@ -8,6 +8,7 @@
  */
 
 #include "execution/moe/GpuExpertSlotPool.h"
+#include "loaders/GPUPreparedWeightPoolLayout.h"
 
 #include "../../backends/IBackend.h"
 #include "../../loaders/gpu_pipeline/LoadOrchestrator.h"
@@ -35,6 +36,23 @@ namespace llaminar2
             std::weak_ptr<GpuExpertSlotPool> pool;
         };
     } // namespace
+
+    std::optional<WeightVRAMPool::SuperblockCodedMetadata>
+    GpuExpertSlotPool::ProjectionSpec::codedDeclaration() const
+    {
+        if (format.isNativeQuantised())
+        {
+            const auto *source = native_quantised_formats::forSourceIdentity(
+                format.native_quantised.codebook_id, format.native_quantised.is_superblock);
+            if (source && cpu::native_quantised::migrationUsesSuperblockCodes(*source) &&
+                gpu_superblock_phase < native_quantised_superblock::kBlocksPerSuperblock)
+                return WeightVRAMPool::SuperblockCodedMetadata{
+                    canonicalDeviceVnniCodebookId(*source), gpu_superblock_phase};
+        }
+        if (gpu_superblock_phase != 0)
+            throw std::invalid_argument("GPU expert slot phase requires a valid coded source root");
+        return std::nullopt;
+    }
 
     std::shared_ptr<GpuExpertSlotPool> GpuExpertSlotPool::create(
         IBackend *backend,
@@ -159,17 +177,22 @@ namespace llaminar2
                             throw std::invalid_argument(
                                 "GpuExpertSlotPool NativeQuantised projection spec has invalid block geometry");
                         }
+                        const auto *format = native_quantised_formats::forSourceIdentity(
+                            spec.format.native_quantised.codebook_id, spec.format.native_quantised.is_superblock);
+                        const auto coded = spec.codedDeclaration();
+                        if (coded && !gpuPreparedSuperblockCoded(*format, GPUPreparedWeightPoolLayout::MigrationReusable, device))
+                            throw std::invalid_argument("GPU expert slot backend does not support coded migration storage");
                         orchestrator->planWeightForOwner(
                             device_ordinal,
                             slot_name_for(slot, spec.label),
                             spec.N,
                             spec.K,
-                            spec.payload_bytes_per_block,
+                            coded ? format->payload_bytes : spec.payload_bytes_per_block,
                             spec.is_asymmetric,
                             spec.has_emins,
                             spec.scale_plane,
                             /*raw_gguf_bytes=*/0,
-                            owner);
+                            owner, {}, coded);
                     }
                 }
             }

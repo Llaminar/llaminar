@@ -832,36 +832,54 @@ TEST_F(ComputeStagesTest, MoEDeviceRebalanceFormatProfileSeparatesWireBytesFromS
         return result;
     };
 
-    const std::vector<ProjectionSpec> q4_layer{
-        spec("gate", 16, false, false, 4, false),
+    const std::vector<ProjectionSpec> q8_layer{
+        spec("gate", 32, false, false, 19, false),
         spec("up", 16, false, false, 4, false),
         spec("down", 16, false, false, 4, false)};
-    const std::vector<ProjectionSpec> mixed_layer{
-        spec("gate", 32, false, false, 19, false),
-        spec("up", 8, true, true, 10, true),
-        spec("down", 9, true, false, 14, true)};
-
-    const auto profile =
-        DeviceMoETransferSlotDirectory::profileForLayerFormats(
-            {q4_layer, mixed_layer});
+    const std::vector<ProjectionSpec> q5_layer{
+        spec("gate", 16, false, false, 4, false),
+        spec("up", 20, true, false, 7, false),
+        spec("down", 20, true, false, 7, false)};
+    const auto profile = DeviceMoETransferSlotDirectory::profileForLayerFormats({q8_layer, q5_layer});
     ASSERT_EQ(profile.allocation_specs.size(), 3u);
     EXPECT_EQ(profile.allocation_specs[0].payload_bytes_per_block, 32);
-    EXPECT_EQ(profile.allocation_specs[1].payload_bytes_per_block, 16);
+    EXPECT_EQ(profile.allocation_specs[1].payload_bytes_per_block, 20);
     EXPECT_TRUE(profile.allocation_specs[1].is_asymmetric);
-    EXPECT_TRUE(profile.allocation_specs[1].has_emins);
-    EXPECT_EQ(profile.allocation_specs[2].payload_bytes_per_block, 16);
+    EXPECT_FALSE(profile.allocation_specs[1].has_emins);
+    EXPECT_EQ(profile.allocation_specs[2].payload_bytes_per_block, 20);
     EXPECT_TRUE(profile.allocation_specs[2].is_asymmetric);
-
-    EXPECT_EQ(profile.max_wire_payload_bytes, 252u)
+    EXPECT_EQ(profile.max_wire_payload_bytes, 280u)
         << "The collective wire slot should match the largest real layer payload";
 
-    constexpr size_t kBlocksPerProjection = 4;
-    constexpr size_t kCapacityBytesPerBlock =
-        (32 + 2) + (16 + 2 + 2 + 4) + (16 + 2 + 2);
-    EXPECT_EQ(
-        kBlocksPerProjection * kCapacityBytesPerBlock,
-        312u)
-        << "Component-wise storage capacity may exceed every realizable wire payload without inflating collectives";
+    const std::vector<ProjectionSpec> coded_layer{
+        spec("gate", 32, false, false, 19, false),
+        spec("up", 8, true, false, 10, true),
+        spec("down", 9, true, false, 14, true)};
+    const auto coded = DeviceMoETransferSlotDirectory::profileForLayerFormats({coded_layer});
+    EXPECT_EQ(coded.max_wire_payload_bytes, 4u * (34u + 8u + 2u + 4u + 9u + 2u));
+    const auto identical = DeviceMoETransferSlotDirectory::profileForLayerFormats({coded_layer, coded_layer});
+    EXPECT_EQ(identical.max_wire_payload_bytes, coded.max_wire_payload_bytes);
+    auto other_codebook = coded_layer;
+    other_codebook[1] = spec("up", 12, true, false, 9, true);
+    auto wrong_payload_width = coded_layer;
+    ++wrong_payload_width[1].payload_bytes_per_block;
+    auto other_phase = coded_layer;
+    other_phase[1].gpu_superblock_phase = 7;
+    for (const auto &layers : {std::vector{coded_layer, other_phase}, std::vector{q8_layer, coded_layer}, std::vector{coded_layer, q8_layer},
+                              std::vector{coded_layer, other_codebook}, std::vector{coded_layer, wrong_payload_width}})
+    {
+        try
+        {
+            (void)DeviceMoETransferSlotDirectory::profileForLayerFormats(layers);
+            ADD_FAILURE() << "Mixed coded slot families were admitted";
+        }
+        catch (const std::invalid_argument &error)
+        {
+            const std::string_view diagnostic = error.what();
+            EXPECT_NE(diagnostic.find("projection up at profile layer 1 requires a separate exact slot family"), std::string_view::npos);
+            EXPECT_NE(diagnostic.find("NativeQuantised/Q2_K (coded, phase 0, payload 8 bytes/block)"), std::string_view::npos);
+        }
+    }
 }
 
 /**
