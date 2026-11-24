@@ -26750,12 +26750,16 @@ bool OrchestrationRunner::publishPhysicalMemoryAuthority()
 
     int OrchestrationRunner::servingBatchCapacity() const
     {
-        if (!initialization_lifecycle_.readyForInference() || !runner_ ||
-            !runner_->supportsServingRows())
-            return 0;
+        return servingBatchUnsupportedReason().empty() ? runner_->batch_size() : 0;
+    }
+
+    std::string OrchestrationRunner::servingBatchUnsupportedReason() const
+    {
+        if (!initialization_lifecycle_.readyForInference() || !runner_)
+            return "the runner is not ready for inference";
         if (mpi_ctx_ && mpi_ctx_->world_size() > 1)
-            return 0;
-        return runner_->batch_size();
+            return "multi-rank continuous batching is not implemented yet";
+        return runner_->servingRowsUnsupportedReason();
     }
 
     bool OrchestrationRunner::beginServingBatch(int capacity)

@@ -1060,6 +1060,19 @@ namespace llaminar2
         // runs concurrently through a batched generation lane.
         std::unique_ptr<ServingBatchDriver> batch_driver;
         const int batch_capacity = mpi_coordinated ? 0 : runner->servingBatchCapacity();
+        if (config.batch_size > 1 && batch_capacity <= 1)
+        {
+            // --batch-size > 1 requests continuous batching; never silently
+            // serialize requests in its place.
+            LOG_ERROR("--batch-size " << config.batch_size << " requests continuous batching, which is unavailable: "
+                                      << (mpi_coordinated ? std::string("multi-rank continuous batching is not implemented yet")
+                                                          : runner->servingBatchUnsupportedReason()));
+            if (mpi_coordinated)
+                runner->shutdownMPIWorkers();
+            runner->shutdown();
+            flushPerfStatsFromEnv();
+            return 1;
+        }
         auto stream_observer = [&request_log_state](const httplib::Request &request, std::shared_ptr<std::string> body) {
             request_log_state.attachStreamedResponseBody(request, std::move(body));
         };

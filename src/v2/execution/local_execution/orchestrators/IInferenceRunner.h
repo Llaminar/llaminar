@@ -3180,7 +3180,18 @@ namespace llaminar2
          * position, so one forward can mix decode rows (one token) with a
          * prompt chunk of a newly entering request.
          */
-        virtual bool supportsServingRows() const { return false; }
+        virtual bool supportsServingRows() const { return servingRowsUnsupportedReason().empty(); }
+
+        /**
+         * @brief Why serving rows are unavailable; empty when supported.
+         *
+         * Lets serving fail closed with the precise missing capability instead
+         * of silently serializing requests.
+         */
+        virtual std::string servingRowsUnsupportedReason() const
+        {
+            return "this execution topology has no slot-addressed serving rows";
+        }
 
         /**
          * @brief One shared forward over the given resident slots.

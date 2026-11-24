@@ -4213,7 +4213,7 @@ namespace llaminar2
         bool forward_batch(const std::vector<std::vector<int>> &token_batches) override;
 
         /** @brief CPU serving rows: single-device main KV, no MTP, no recurrent state. */
-        bool supportsServingRows() const override;
+        std::string servingRowsUnsupportedReason() const override;
 
         /** @brief Ragged forward of the given resident serving slots (CPU). */
         bool forwardServingRows(const std::vector<int> &slots,

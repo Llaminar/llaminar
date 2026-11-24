@@ -61435,15 +61435,21 @@ namespace llaminar2
         return true;
     }
 
-    bool DeviceGraphOrchestrator::supportsServingRows() const
+    std::string DeviceGraphOrchestrator::servingRowsUnsupportedReason() const
     {
-        // CPU host-owned execution only. Rows are KV sequences 0..active-1, so
-        // compaction moves full-attention KV; recurrent (hybrid) state and the
-        // shifted-MTP cache have no row move yet and fail closed.
-        return state_.isInitialized() && state_.device_id.is_cpu() &&
-               state_.kv_cache != nullptr && state_.mtp_kv_caches.empty() &&
-               dynamic_cast<const IHybridKVCache *>(state_.kv_cache.get()) == nullptr &&
-               (!graph_builder_ || !graph_builder_->config().mtp.enabled);
+        // Each resident slot owns one KV sequence addressed by slot index.
+        // Missing per-slot state (GPU retained execution, recurrent hybrid
+        // state, MTP draft caches) fails closed with its precise reason.
+        if (!state_.isInitialized() || state_.kv_cache == nullptr)
+            return "the runner is not initialized";
+        if (!state_.device_id.is_cpu())
+            return "continuous batching on " + state_.device_id.toString() +
+                   " requires GPU retained serving execution, which is not implemented yet";
+        if (dynamic_cast<const IHybridKVCache *>(state_.kv_cache.get()) != nullptr)
+            return "hybrid recurrent state has no per-slot serving rows yet";
+        if (!state_.mtp_kv_caches.empty() || (graph_builder_ && graph_builder_->config().mtp.enabled))
+            return "MTP speculative decoding has no per-slot serving rows yet (use --no-mtp)";
+        return {};
     }
 
     bool DeviceGraphOrchestrator::forwardServingRows(

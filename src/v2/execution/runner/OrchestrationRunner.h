@@ -316,6 +316,7 @@ namespace llaminar2
         std::vector<ServingBatchEvent> stepServingBatch() override;
         bool servingBatchIdle() const override;
         bool servingBatchHasRunnableWork() const override;
+        std::string servingBatchUnsupportedReason() const override;
         void endServingBatch() override;
         GenerationResult generate(
             const std::vector<int32_t> &prompt_tokens,

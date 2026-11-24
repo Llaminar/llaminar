@@ -798,6 +798,9 @@ namespace llaminar2
          */
         virtual std::vector<ServingBatchEvent> stepServingBatch() { return {}; }
 
+        /** @brief Why servingBatchCapacity() is zero; empty when serving is supported. */
+        virtual std::string servingBatchUnsupportedReason() const { return "unsupported runner"; }
+
         /** @brief True when no request is resident or queued. */
         virtual bool servingBatchIdle() const { return true; }
 
