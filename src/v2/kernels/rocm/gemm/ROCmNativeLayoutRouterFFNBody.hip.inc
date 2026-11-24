@@ -76,10 +76,57 @@ __device__ __forceinline__ float sharedGate(const float* x,const float* weights,
     }
     workgroupJoin<WorkgroupJoinMemory::LDSOnly>();return scratch[0];
 }
-/** @brief Exact original hidden/activation Q8 publication, using original32lane groups. */
-__device__ __forceinline__ void quantize(const float* x,unsigned count,int8_t* codes,float* scales,int32_t* sums)
+__device__ __forceinline__ unsigned phasePhysicalLane64();
+/**
+ * @brief Workgroup thread coordinates read directly from the hardware work-item ID.
+ * @details The default for every caller: identical to reading threadIdx.x at
+ * each use, so kernels that do not opt in keep their exact code.
+ */
+struct HardwareThreadIdentity
 {
-    for(unsigned i=threadIdx.x;i<count;i+=1024)persistentMoEFFNQuantize<moe_wave_contract::QuantizerXorPolicy::TargetNative>(x[i],i,codes,scales,sums);
+    /** @return This lane's workgroup thread index. */
+    __device__ __forceinline__ unsigned index() const {return threadIdx.x;}
+    /** @return This lane's wave index, wave-uniform. */
+    __device__ __forceinline__ unsigned wave() const
+    {return waveMetadataValue(unsigned(threadIdx.x)/rocmOrderedWaveWidth);}
+    /** @return Whether this lane is its wave's first lane. */
+    __device__ __forceinline__ bool waveLeader() const {return threadIdx.x%rocmOrderedWaveWidth==0;}
+};
+/**
+ * @brief Workgroup thread coordinates rebuilt from a captured scalar wave base.
+ * @details The work-item ID arrives in a VGPR that would otherwise stay live
+ * through every later phase of a 1024-thread, 64-VGPR kernel. Capturing the
+ * wave base once in a scalar register and re-forming the lane with mbcnt lets
+ * that VGPR retire after the last direct work-item read. Values are identical:
+ * a 1-D workgroup's wave owns threads [wave_base, wave_base+64).
+ */
+struct PinnedThreadIdentity
+{
+    unsigned wave_base;
+    /** @brief Capture the scalar wave base while the work-item ID is still live. */
+    __device__ __forceinline__ static PinnedThreadIdentity capture()
+    {
+#if defined(__HIP_DEVICE_COMPILE__)
+        unsigned base=__builtin_amdgcn_readfirstlane(unsigned(threadIdx.x))&~(rocmOrderedWaveWidth-1u);
+        asm volatile("" : "+s"(base));
+        return {base};
+#else
+        return {unsigned(threadIdx.x)&~(rocmOrderedWaveWidth-1u)};
+#endif
+    }
+    /** @return This lane's workgroup thread index. */
+    __device__ __forceinline__ unsigned index() const {return wave_base+phasePhysicalLane64();}
+    /** @return This lane's wave index, wave-uniform. */
+    __device__ __forceinline__ unsigned wave() const {return wave_base/rocmOrderedWaveWidth;}
+    /** @return Whether this lane is its wave's first lane. */
+    __device__ __forceinline__ bool waveLeader() const {return phasePhysicalLane64()==0;}
+};
+/** @brief Exact original hidden/activation Q8 publication, using original32lane groups. */
+template<class Thread=HardwareThreadIdentity>
+__device__ __forceinline__ void quantize(const float* x,unsigned count,int8_t* codes,float* scales,int32_t* sums,
+    Thread thread={})
+{
+    for(unsigned i=thread.index();i<count;i+=1024)persistentMoEFFNQuantize<moe_wave_contract::QuantizerXorPolicy::TargetNative>(x[i],i,codes,scales,sums);
     workgroupJoin<WorkgroupJoinMemory::LDSOnly>();
 }
 /**
@@ -390,13 +437,13 @@ __device__ __forceinline__ float orderedWorkerZeroFold(float partial,unsigned pa
  * all wave items; the immediately following unconditional grid join retires it.
  * No partial plane, per-output-tile metadata publication, or task CTA join remains.
  */
-template<bool Shared,uint32_t Mask>
+template<bool Shared,uint32_t Mask,class Thread=HardwareThreadIdentity>
 __device__ __forceinline__ void gateUpWavePhase(unsigned width,unsigned hidden,unsigned routes,unsigned experts,bool live,
     unsigned maximum,
     const DeviceNativeQuantisedMatrixDesc* gates,const DeviceNativeQuantisedMatrixDesc* ups,const int* route_ids,
     const router_native::RuntimeDecodeExecutionBankStorage<DeviceMoELayerRuntimeView>* bank_storage,
     const int8_t* codes,const float* scales,const int32_t* sums,float* activated,size_t output_base,
-    float* gate_output,float* up_output,PhaseProjection* bindings)
+    float* gate_output,float* up_output,PhaseProjection* bindings,Thread thread={})
 {
     using Tasks=NativeLayoutGateUpGeometry;
     const auto resolved=NativeLayoutDownWaveGeometry::resolve(maximum);
@@ -414,7 +461,7 @@ __device__ __forceinline__ void gateUpWavePhase(unsigned width,unsigned hidden,u
         if(shared_range.begin==shared_range.end)return;
     }
     else if(Tasks::firstTask(blockIdx.x,0)>=tasks)return;
-    const unsigned leader=threadIdx.x;
+    const unsigned leader=thread.index();
     // Every nonempty shared CTA owns route0 after balancing; routed records
     // retain the original expert-major grid-stride ownership predicate.
     if(leader<phase_routes&&(Shared||Tasks::ctaOwnsRoute(leader,tiles,blockIdx.x,gridDim.x)))
@@ -461,7 +508,7 @@ __device__ __forceinline__ void gateUpWavePhase(unsigned width,unsigned hidden,u
         }
     }
     workgroupJoin<WorkgroupJoinMemory::LDSOnly>();
-    const unsigned wave=waveMetadataValue(unsigned(threadIdx.x)/rocmOrderedWaveWidth);
+    const unsigned wave=thread.wave();
     const unsigned lane=phasePhysicalLane64();
     const unsigned column=geometry.laneColumn(lane),worker=geometry.laneWorker(lane);
     // Shared items retain their exact source tile index but are distributed
@@ -508,11 +555,11 @@ enum class DownMetadataPublication : uint8_t { PacketLeaders, LiveWaveLeaders };
 /** @brief Default checked standalone descriptor source; no alternate storage. */
 struct CheckedDownProjectionSource {};
 template<DownMetadataPublication Schedule=DownMetadataPublication::PacketLeaders,
-    class Source=CheckedDownProjectionSource>
+    class Source=CheckedDownProjectionSource,class Thread=HardwareThreadIdentity>
 __device__ __forceinline__ void publishDownPhase(unsigned hidden,unsigned routed_width,unsigned shared_width,
     unsigned routes,unsigned experts,bool live,const DeviceNativeQuantisedMatrixDesc* descriptors,
     const DeviceNativeQuantisedMatrixDesc* shared,const int* ids,const float* weights,
-    PhaseProjection* bindings,float* route_weights,Source source={})
+    PhaseProjection* bindings,float* route_weights,Source source={},Thread thread={})
 {
     constexpr unsigned shared_slot=NativeLayoutDownGeometry::maximum_capacity-1;
     static_assert(Schedule==DownMetadataPublication::PacketLeaders||Schedule==DownMetadataPublication::LiveWaveLeaders);
@@ -520,11 +567,11 @@ __device__ __forceinline__ void publishDownPhase(unsigned hidden,unsigned routed
     const unsigned packets=(routes+3u)/4u;
     // Full-entry consumers read only actual routes and the fixed shared slot.
     // The default EB4 schedule continues authoring its final packet padding.
-    const unsigned first=wave_leaders?waveMetadataValue(unsigned(threadIdx.x)/rocmOrderedWaveWidth):unsigned(threadIdx.x);
+    const unsigned first=wave_leaders?thread.wave():thread.index();
     const unsigned count=wave_leaders?routes+1u:packets+1u;
     const unsigned stride=wave_leaders?NativeLayoutDownGeometry::waves:1024u;
     static_assert(kDeviceMoEMaxTopK<shared_slot);
-    if(!wave_leaders||threadIdx.x%rocmOrderedWaveWidth==0)
+    if(!wave_leaders||thread.waveLeader())
     for(unsigned item=first;item<count;item+=stride)
     {
         const bool is_shared=item==(wave_leaders?routes:packets);
@@ -745,11 +792,11 @@ __device__ __forceinline__ void routedPacket(const PhaseProjection* bindings,uns
  * any fold accumulator; no hypothetical future bank keeps another float4 alive
  * across EB4 payloads. Generic1..64 geometry proof does not select native policy.
  */
-template<uint32_t Mask>
+template<uint32_t Mask,class Thread=HardwareThreadIdentity>
 __device__ __forceinline__ void downWaveTasks(unsigned begin,unsigned outputs,unsigned hidden,
     unsigned routed_width,unsigned shared_width,unsigned routes,unsigned routed_maximum,unsigned shared_maximum,
     const int8_t* code,const float* scale,const int32_t* sums,const PhaseProjection* bindings,
-    const float* route_weights,float* shared_output,float* weighted)
+    const float* route_weights,float* shared_output,float* weighted,Thread thread={})
 {
     const auto routed_resolved=NativeLayoutDownWaveGeometry::resolve(routed_maximum);
     // These fields derive only from the immutable original policy maximum.
@@ -760,7 +807,7 @@ __device__ __forceinline__ void downWaveTasks(unsigned begin,unsigned outputs,un
     const unsigned routed_tasks=routed_geometry.routedTasks(outputs,routes);
     // Like the fork's wu_, every lane owns the same wave task. Column and
     // worker/P arithmetic below remain lane-private and are never broadcast.
-    const unsigned wave=waveMetadataValue(unsigned(threadIdx.x)/64);
+    const unsigned wave=thread.wave();
     const unsigned routed_lane=phasePhysicalLane64();
     for(unsigned task=wave;task<routed_tasks;task+=NativeLayoutDownGeometry::waves)
     {
@@ -869,6 +916,9 @@ __device__ __forceinline__ void nativeLayoutRouterFFNPhase(const NativeLayoutRou
     const auto& a=args.ffn;
     const bool live=a.rows.activeRows()!=0;
     const unsigned tid=threadIdx.x,column=tid%32;
+    // Every phase after expert selection re-forms thread coordinates from this
+    // scalar wave base, so the work-item VGPR retires with the selector.
+    const auto thread=PinnedThreadIdentity::capture();
     const unsigned H=a.hidden_columns,F=a.routed_columns,S=a.shared_columns,T=a.top_k;
     const auto* runtime=reinterpret_cast<const DeviceMoELayerRuntimeView*>(a.runtime);
     if(live&&(!runtime||runtime->expert_count!=unsigned(a.experts)||runtime->top_k!=unsigned(a.top_k)||
@@ -925,17 +975,17 @@ __device__ __forceinline__ void nativeLayoutRouterFFNPhase(const NativeLayoutRou
             a.rows.countOwner(),args.router_publication);
     gateUpWavePhase<false,Mask>(F,H,T,a.experts,live,max_parts,
         a.gates,a.ups,selection.selected_ids,&gate_state.bank,code,scale,sum,
-        LLAMINAR_PHASE_FFN_FIELD(gate_partials),0,nullptr,nullptr,gate_binding);
-    grid.sync();
+        LLAMINAR_PHASE_FFN_FIELD(gate_partials),0,nullptr,nullptr,gate_binding,thread);
+    grid.sync(thread.index()==0);
     // Every CTA has finished reading raw logits. Only now may the original
     // public probability array be overwritten; down never consumes it.
     if(blockIdx.x==0)
-        for(unsigned expert=tid;expert<unsigned(a.experts);expert+=1024)
+        for(unsigned expert=thread.index();expert<unsigned(a.experts);expert+=1024)
             args.router_logits[expert]=selection.expert_probs[expert];
     const size_t values=size_t(T)*F+S;
     code=reinterpret_cast<int8_t*>(storage);scale=reinterpret_cast<float*>(code+values);sum=reinterpret_cast<int32_t*>(scale+values/32);
     planes=reinterpret_cast<float*>(sum+values/32);
-    quantize(LLAMINAR_PHASE_FFN_FIELD(gate_partials),values,code,scale,sum);
+    quantize(LLAMINAR_PHASE_FFN_FIELD(gate_partials),values,code,scale,sum,thread);
     // Existing quantizer CTA join also retires CTA0's selection-output reads.
     auto* phase_binding=phase_storage.down;
     const auto routed_down_maximum=LLAMINAR_PHASE_MAXIMUM(routed_down_policy);
@@ -950,15 +1000,15 @@ __device__ __forceinline__ void nativeLayoutRouterFFNPhase(const NativeLayoutRou
     if(owned.begin==owned.end)return;
     publishDownPhase(H,F,S,T,a.experts,live,args.router_publication.down,
         LLAMINAR_PHASE_FFN_FIELD(shared_down),runtime->topk_expert_ids,runtime->topk_weights,
-        phase_binding,route_weights);
+        phase_binding,route_weights,CheckedDownProjectionSource{},thread);
     for(unsigned first_column=owned.begin;first_column<owned.end;first_column+=down_columns)
     {
         const unsigned outputs=min(down_columns,owned.end-first_column);
         downWaveTasks<Mask>(first_column,outputs,H,F,S,T,routed_down_maximum,shared_down_maximum,
-            code,scale,sum,phase_binding,route_weights,planes,weighted);
+            code,scale,sum,phase_binding,route_weights,planes,weighted,thread);
         // Keep publication-only coordinates at the actual consumer. This is
         // also the pending R38 final-thread predicate's exact late-lane form.
-        unsigned publication_thread=threadIdx.x;
+        unsigned publication_thread=thread.index();
         asm volatile("" : "+v"(publication_thread));
         const unsigned down_column=publication_thread;
         const unsigned n=publication_thread<outputs?first_column+publication_thread:H;
