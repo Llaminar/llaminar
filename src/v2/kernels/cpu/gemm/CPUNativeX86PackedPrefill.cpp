@@ -377,7 +377,7 @@ namespace llaminar2::cpu::native_quantised::x86_panel
                 auto *carry = needsCarry(w.blocks_per_row, parts)
                                   ? panel + std::min(w.blocks_per_row, depth) * blockFloats(format, Lanes)
                                   : nullptr;
-                const int strips = (w.N - 1) / Lanes + 1;
+                const int strips = columnStrips(w.N, Lanes);
 #pragma omp for schedule(static)
                 for (int strip = 0; strip < strips; ++strip)
                     stripe<Lanes, CB, P>(w, a, c, ldc, strip * Lanes, parts, grid, panel, carry);
@@ -420,10 +420,10 @@ namespace llaminar2::cpu::native_quantised::x86_panel
                  int rows, int output_stride, int partitions, int workers, int lanes, const CPUProjectionRowGrid &grid,
                  const ProjectionRowWork *work, std::span<float> scratch)
     {
-        if ((lanes != 8 && lanes != 16) || rows < min_rows || partitions <= 0 || output_stride < weights.N ||
-            format == Format::None || format != formatFor(weights.encoding, weights.codebook_id))
+        if (!supportsGeometry(format, lanes, rows, weights.N, workers) || partitions <= 0 || output_stride < weights.N ||
+            format != formatFor(weights.encoding, weights.codebook_id))
             throw std::invalid_argument("Native x86 prefill received invalid panel geometry");
-        const auto size = workspaceFloats(format, lanes, rows, weights.blocks_per_row, partitions, workers);
+        const auto size = workspaceFloats(format, lanes, rows, weights.N, weights.blocks_per_row, partitions, workers);
         if (scratch.size() < size)
             throw std::invalid_argument("Native x86 prefill requires its admitted per-worker panel storage");
         const storage_proof::Bytes writes{scratch.data(), size * sizeof(float)};

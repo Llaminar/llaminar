@@ -38,6 +38,7 @@
 #include "kernels/common/EmbeddingWorkspaceContract.h"
 #include "kernels/cpu/CPUInvocationWorkspace.h"
 #include "kernels/cpu/gemm/CPUProjectionWorkspaceContract.h"
+#include "kernels/cpu/gemm/CPUNativeX86PanelWorkspace.h"
 #include "../../utils/CPUExecutionTestGeometry.h"
 #include "kernels/common/FloatingPointGemmWorkspaceABI.h"
 #include "kernels/cuda/gemm/CUDAFloatingPointGemmWorkspaceContract.h"
@@ -117,7 +118,62 @@ TEST(Test__WorkspaceMemoryEstimator, CPUFusedPartialEnvelopeBoundsEveryOwnership
     EXPECT_THROW(cpuProjectionPartialEnvelopeFloats(1, 64, INT_MAX, INT_MAX, 4), std::overflow_error);
 }
 
-/** @test CPU admission and execution price one shared transform, independent of codebook and layer count. */
+/** @test The planner reserves the panel only for an eligible participant and physical shape. */
+TEST(Test__WorkspaceMemoryEstimator, CPUProjectionPanelUsesParticipantAndPhysicalStrips)
+{
+    namespace panel = cpu::native_quantised::x86_panel;
+    constexpr int rows = 31, k = 4096;
+    CPUProjectionWorkspaceGeometry geometry{.rows = rows, .n = 128, .k = k, .workers = 1,
+        .execution = test::kSyntheticCPUExecutionGeometry};
+    const auto expectPartials = [&](std::string_view format, std::size_t partial_floats) {
+        SCOPED_TRACE(format);
+        const auto requirements = CPUProjectionWorkspaceContract::sourceNative(format, geometry);
+        const auto expected_q8 = cpuProjectionQ8WorkspaceRequirements(geometry.rows, geometry.k);
+        ASSERT_EQ(requirements.buffers.size(), partial_floats ? 2u : 1u);
+        EXPECT_EQ(requirements.buffers.front().name, kCPUProjectionQ8);
+        EXPECT_EQ(requirements.buffers.front().size_bytes, expected_q8.buffers.front().size_bytes);
+        if (partial_floats)
+        {
+            EXPECT_EQ(requirements.buffers.back().name, kCPUProjectionPartials);
+            EXPECT_EQ(requirements.buffers.back().size_bytes, partial_floats * sizeof(float));
+        }
+    };
+    // Eight K blocks, eight dot vectors and two affine factor vectors each.
+    expectPartials("Q4_K", 8 * (8 + 2) * 16);
+    expectPartials("IQ2_S", 0);
+    geometry.rows = 15;
+    expectPartials("Q4_K", 0);
+    geometry.rows = rows;
+    geometry.workers = 2;
+    geometry.serial_n = 128; // Strip eligibility is based on physical N, not the serial policy's width.
+    geometry.n = 16;
+    expectPartials("Q4_K", 0);
+    geometry.n = 17; // A masked tail is the second AVX-512 worker's strip.
+    expectPartials("Q4_K", 2 * 8 * (8 + 2) * 16);
+    geometry.n = 16;
+    geometry.execution.active_isa = ISALevel::AVX2; // Same AVX-512 build, narrower runtime strips.
+    geometry.execution.maximum_native_row_tile = 2;
+    expectPartials("Q4_K", 2 * 8 * (8 + 2) * 8);
+    geometry.k = 4608;
+    geometry.numerical_policy = CPUProjectionNumericalPolicy::GPUAlignedExpert;
+    // Ordered replay and packed-panel carry share a bank, not the sum of both routes.
+    expectPartials("Q4_K", rows * 16 * 64);
+    geometry.k = k;
+    geometry.numerical_policy = CPUProjectionNumericalPolicy::BackendNative;
+    geometry.execution = {.maximum_native_row_tile = 4, .projection_abi = CPUProjectionScheduleABI::ARMRegisterK,
+        .compiled_isa = ISALevel::NEON, .active_isa = ISALevel::NEON};
+    expectPartials("Q4_K", 0); // Native ARM has no Q4_K panel on this route.
+    expectPartials("Q5_K", 2 * 16 * (128 + 8 * sizeof(float)) / sizeof(float)); // Existing ARM-only layout.
+
+    // 144 blocks over 16 partitions gives nine per partition and requires
+    // one carry vector per row, after the eight-block panel in each slot.
+    EXPECT_EQ(panel::workspaceFloats(panel::Format::Q4K, 8, rows, 16, 144, 16, 2),
+        2u * (8 * (8 + 2) * 8 + 32 * 8)); // 31 carry rows rounded to a cache line.
+    EXPECT_EQ(panel::workspaceFloats(panel::Format::Q4K, 16, rows, 17, 144, 16, 2),
+        2u * (8 * (8 + 2) * 16 + rows * 16));
+}
+
+/** @test CPU admission prices one shared transform and the production projection envelope across layers. */
 TEST(Test__WorkspaceMemoryEstimator, CPUDownTransformUsesCanonicalShapeAndSerialNameMerge)
 {
     ModelMemoryProfile profile;
@@ -144,10 +200,11 @@ TEST(Test__WorkspaceMemoryEstimator, CPUDownTransformUsesCanonicalShapeAndSerial
                 geometry.shard_index = shard;
                 const size_t width = size_t(4096 / shards) + (shard < 4096 % shards ? 1u : 0u);
                 auto requirements = cpuSwiGLUWorkspaceRequirements(31, width);
-                if (std::string_view(format) == "Q4_K" || std::string_view(format) == "IQ2_S")
-                    requirements.merge(cpuProjectionQ8WorkspaceRequirements(31, width));
+                requirements.merge(CPUProjectionWorkspaceContract::sourceNative(format,
+                    {.rows = 31, .n = profile.d_model, .k = static_cast<int>(width),
+                     .workers = geometry.device_compute_units, .execution = geometry.cpu_execution}));
                 EXPECT_EQ(WorkspaceMemoryEstimator::estimate(profile, geometry) - empty,
-                    requirements.total_bytes_with_alignment());
+                    requirements.total_bytes_with_alignment()) << format << " shard=" << shard << '/' << shards;
             }
         }
         geometry.total_shards = 1;

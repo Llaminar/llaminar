@@ -30050,6 +30050,12 @@ add_v2_test(V2_Unit_WorkspaceMemoryEstimator
     LABELS "V2;Unit;Planning;WorkspaceMemoryEstimator;Workspace"
     MPI_PROCS 1
 )
+add_v2_test(V2_Integration_CPUProjectionPanelWorkspaceAdmission
+    COMMAND $<TARGET_FILE:v2_test_workspace_memory_estimator>
+        --gtest_filter=Test__WorkspaceMemoryEstimator.CPUProjectionPanelUsesParticipantAndPhysicalStrips:Test__WorkspaceMemoryEstimator.CPUDownTransformUsesCanonicalShapeAndSerialNameMerge
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;Planning;Workspace;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUProjectionPanelWorkspaceAdmission)
 add_v2_test(V2_Integration_NativeSharedExpertWorkspaceAxis
     COMMAND $<TARGET_FILE:v2_test_workspace_memory_estimator>
         --gtest_filter=Test__WorkspaceMemoryEstimator.NativeSharedExpertWorkspaceUsesOriginalFFNAxis

@@ -85,13 +85,27 @@ namespace llaminar2::cpu::native_quantised::x86_panel
         return (panel + carry + 15) / 16 * 16;
     }
 
-    /** @return Checked shared slab extent for every worker; no panel for noneligible formats or M. */
-    inline std::size_t workspaceFloats(Format format, int lanes, int rows, int blocks, int partitions, int workers)
+    /** @return Number of output strips including one strip for any nonempty tail. */
+    constexpr int columnStrips(int columns, int lanes) noexcept
     {
-        if (format == Format::None || rows < min_rows)
-            return 0;
-        if ((lanes != 8 && lanes != 16) || blocks <= 0 || partitions < 0 || workers <= 0)
+        return (columns - 1) / lanes + 1; // Admitted positive N and SIMD width.
+    }
+
+    /** @return Whether ordinary prefill can keep every admitted worker on a distinct N strip. */
+    constexpr bool supportsGeometry(Format format, int lanes, int rows, int columns, int workers) noexcept
+    {
+        return format != Format::None && rows >= min_rows && (lanes == 8 || lanes == 16) &&
+            columns > 0 && workers > 0 && columnStrips(columns, lanes) >= workers;
+    }
+
+    /** @return Checked shared slab extent for every worker; zero if Auto cannot select the panel. */
+    inline std::size_t workspaceFloats(Format format, int lanes, int rows, int columns, int blocks,
+        int partitions, int workers)
+    {
+        if ((lanes != 8 && lanes != 16) || columns <= 0 || blocks <= 0 || partitions < 0 || workers <= 0)
             throw std::invalid_argument("Native x86 prefill panel requires positive admitted geometry");
+        if (!supportsGeometry(format, lanes, rows, columns, workers))
+            return 0;
         const auto slot = workerFloats(format, lanes, rows, blocks, partitions);
         if (static_cast<std::size_t>(workers) > std::numeric_limits<std::size_t>::max() / sizeof(float) / slot)
             throw std::overflow_error("Native x86 prefill panel exceeds admitted worker storage");

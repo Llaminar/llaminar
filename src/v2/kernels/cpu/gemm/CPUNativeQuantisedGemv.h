@@ -705,7 +705,7 @@ namespace llaminar2::cpu::native_quantised
         const auto config = serialTileConfigForPackedMatrix(
             packed, cpuNativeQuantisedSerialEquivalentPolicyN(packed.N), packed.K, workers);
         const auto panel = x86_panel::workspaceFloats(x86_panel::formatFor(packed.encoding, packed.codebook_id),
-            activeISALevel() >= ISALevel::AVX512 ? 16 : 8, rows, packed.blocks_per_row, config.k_tiles, workers);
+            activeISALevel() >= ISALevel::AVX512 ? 16 : 8, rows, packed.N, packed.blocks_per_row, config.k_tiles, workers);
         return std::max(cpuProjectionPartialFloats(rows, packed.N, config.k_tiles), panel);
     }
 
@@ -719,7 +719,7 @@ namespace llaminar2::cpu::native_quantised
         const bool wide = activeISALevel() >= ISALevel::AVX512;
         const auto ordinary = cpuProjectionPartialEnvelopeFloats(rows, packed.N, config.k_tiles, workers, wide ? 4 : 2);
         const auto panel = x86_panel::workspaceFloats(x86_panel::formatFor(packed.encoding, packed.codebook_id),
-            wide ? 16 : 8, rows, packed.blocks_per_row, config.k_tiles, workers);
+            wide ? 16 : 8, rows, packed.N, packed.blocks_per_row, config.k_tiles, workers);
         return std::max(ordinary, panel);
     }
 
@@ -5050,9 +5050,8 @@ namespace llaminar2::cpu::native_quantised
         const auto panel_format = x86_panel::formatFor(packed.encoding, packed.codebook_id);
         const int panel_lanes = use_avx512 ? 16 : 8;
         const auto &tile_override = debugEnv().cpu_vnni;
-        const bool use_packed_panel = isa_path == ISAPath::AUTO && (use_avx512 || use_avx2) && M >= x86_panel::min_rows &&
-            (N - 1) / panel_lanes + 1 >= num_threads &&
-            panel_format != x86_panel::Format::None && n_block_chunks_override == 0 &&
+        const bool use_packed_panel = isa_path == ISAPath::AUTO && (use_avx512 || use_avx2) &&
+            x86_panel::supportsGeometry(panel_format, panel_lanes, M, N, num_threads) && n_block_chunks_override == 0 &&
             tile_override.n_block_chunks <= 0 && tile_override.k_tile_blocks <= 0 && tile_override.m_unroll <= 0 &&
             schedule_override == PrefillSchedulePolicy::Auto && verifier_policy_override == VerifierRowsPolicy::Auto;
         if (use_packed_panel)
@@ -5066,7 +5065,8 @@ namespace llaminar2::cpu::native_quantised
                      {"route", "packed_panel"}, {"row_tile", "2"}, {"requested_policy", "Auto"},
                      {"effective_policy", "PackedPanel"}, {"n_block_chunks", "1"}, {"task_grid", "n_strip_all_rows"},
                      {"k_tile_blocks", std::to_string(std::min(x86_panel::depth, (K_blocks - 1) / partitions + 1))},
-                     {"k_tiles", std::to_string(partitions)}, {"parallel_tasks", std::to_string((N - 1) / panel_lanes + 1)},
+                     {"k_tiles", std::to_string(partitions)},
+                     {"parallel_tasks", std::to_string(x86_panel::columnStrips(N, panel_lanes))},
                      {"reduction_tasks", "0"}, {"threads", std::to_string(num_threads)}});
             return x86_panel::project(packed.readView(), panel_format, A_q8_all, C, M, ldc,
                 partitions, num_threads, panel_lanes, row_grid, work, partial_storage);

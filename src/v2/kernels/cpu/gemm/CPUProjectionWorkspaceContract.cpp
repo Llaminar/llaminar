@@ -70,10 +70,12 @@ namespace llaminar2
             codebook, geometry.numerical_policy, geometry.serial_n > 0 ? geometry.serial_n : geometry.n,
             geometry.k, geometry.workers, geometry.execution.cache);
         auto requirements = cpuProjectionQ8WorkspaceRequirements(geometry.rows, geometry.k);
+        // Use the participant's x86 ABI, not the planning host's build. An ARM
+        // participant returned above. Use physical N for strip ownership, not serial_n.
         namespace panel = cpu::native_quantised::x86_panel;
         const auto packed_panel = panel::workspaceFloats(panel::formatFor(footprint.encoding, codebook),
             geometry.execution.active_isa == ISALevel::AVX512 ? 16 : 8,
-            geometry.rows, (geometry.k + 31) / 32, config.k_tiles, geometry.workers);
+            geometry.rows, geometry.n, (geometry.k + 31) / 32, config.k_tiles, geometry.workers);
         const auto ordinary = cpuProjectionPartialEnvelopeFloats(geometry.rows, geometry.n, config.k_tiles,
             geometry.workers, static_cast<int>(geometry.execution.maximum_native_row_tile));
         const auto partials = cpuProjectionPartialWorkspaceRequirements(std::max(ordinary, packed_panel));

@@ -810,16 +810,23 @@ namespace llaminar2::test
                 CPUNativeQuantisedPackedWeights packed;
                 packed.numerical_policy = policy;
                 ASSERT_TRUE(packWeightsCPUNativeQuantised(&source, packed));
-                ASSERT_NE(x86_panel::formatFor(packed.encoding, packed.codebook_id), x86_panel::Format::None);
-                std::vector<float> scratch(nativeQuantisedProjectionPartialEnvelopeFloats(packed, max_rows), dirty);
+                const auto format = x86_panel::formatFor(packed.encoding, packed.codebook_id);
+                ASSERT_NE(format, x86_panel::Format::None);
+                const int workers = nativeQuantisedInvocationWorkerCount();
+                const int lanes = activeISALevel() >= ISALevel::AVX512 ? 16 : 8;
+                const auto config = serialTileConfigForPackedMatrix(packed, n, k, workers);
+                const auto panel = x86_panel::workspaceFloats(format, lanes, max_rows, n, blocks, config.k_tiles, workers);
+                const auto envelope = nativeQuantisedProjectionPartialEnvelopeFloats(packed, max_rows);
+                ASSERT_GE(envelope, panel);
+                std::vector<float> scratch(panel ? panel : envelope, dirty);
                 std::vector<float> serial_scratch(nativeQuantisedProjectionPartialFloats(packed, 1));
                 std::vector<float> actual(max_rows * stride, dirty), serial(max_rows * stride, dirty);
-                const int lanes = activeISALevel() >= ISALevel::AVX512 ? 16 : 8;
-                if (nativeQuantisedInvocationWorkerCount() <= (n - 1) / lanes + 1 &&
-                    policy == CPUProjectionNumericalPolicy::BackendNative && k == 1120)
+                if (panel)
                 {
-                    EXPECT_THROW(gemm_native_quantised_preq(packed, input.data(), actual.data(), {}, max_rows, stride),
-                        std::invalid_argument);
+                    // Validate the exact panel prefix, including ordered carry,
+                    // independently of a larger mutually exclusive partial bank.
+                    EXPECT_THROW(gemm_native_quantised_preq(packed, input.data(), actual.data(),
+                        std::span<float>(scratch).first(panel - 1), max_rows, stride), std::invalid_argument);
                     EXPECT_TRUE(std::all_of(actual.begin(), actual.end(), [dirty](float value) { return value == dirty; }));
                 }
                 for (int row = 0; row < max_rows; ++row)
