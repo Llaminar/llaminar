@@ -549,6 +549,15 @@ namespace llaminar2
     {
     }
 
+    bool ChatCompletionHandler::runMaintenanceOnRunnerThread(uint64_t committed_tokens)
+    {
+        bool ok = true;
+        withRunner([&](IOrchestrationRunner &runner) {
+            ok = runChatMoERebalanceMaintenance(runner, committed_tokens);
+        });
+        return ok;
+    }
+
     std::unique_ptr<IRequestGenerationLane> ChatCompletionHandler::makeGenerationLane()
     {
         if (lane_factory_)
@@ -1034,7 +1043,7 @@ namespace llaminar2
     bool ChatCompletionHandler::thinkingEnabled(const ChatCompletionRequest &request) const
     {
         return request.enable_thinking.value_or(
-            runner_.getDefaultThinkingMode() == ThinkingMode::Enabled);
+            (metadata_ ? metadata_->default_thinking : runner_.getDefaultThinkingMode()) == ThinkingMode::Enabled);
     }
 
     int ChatCompletionHandler::setupInference(
@@ -1052,8 +1061,10 @@ namespace llaminar2
         // and the same reasoning mode as the template: architecture-only defaults
         // incorrectly penalize Qwen3.8's thinking continuations.
         SamplingParams effective = request.sampling;
-        SamplingParams model_defaults = runner_.getRecommendedSamplingParams(
-            thinkingEnabled(request) ? ThinkingMode::Enabled : ThinkingMode::Disabled);
+        SamplingParams model_defaults = metadata_
+            ? (thinkingEnabled(request) ? metadata_->recommended_thinking : metadata_->recommended_plain)
+            : runner_.getRecommendedSamplingParams(
+                  thinkingEnabled(request) ? ThinkingMode::Enabled : ThinkingMode::Disabled);
         const auto &set_ = request.sampling_set;
 
         if (!set_.temperature)
@@ -1261,7 +1272,7 @@ namespace llaminar2
         // Pre-tokenize stop-thinking prompt if budget is active
         if (thinking_budget_active)
         {
-            std::string stop_prompt = runner_.getStopThinkingPrompt();
+            std::string stop_prompt = (metadata_ ? metadata_->stop_thinking_prompt : runner_.getStopThinkingPrompt());
             if (!stop_prompt.empty())
             {
                 /*
@@ -1446,8 +1457,7 @@ namespace llaminar2
 
             if (!step_tokens.empty())
             {
-                if (!runChatMoERebalanceMaintenance(
-                        runner_, step_tokens.size()))
+                if (!runMaintenanceOnRunnerThread(step_tokens.size()))
                     return rebalance_error();
             }
         }
@@ -1468,7 +1478,7 @@ namespace llaminar2
         bool has_tool_calls = false;
         if (toolCallParsingEnabled(request))
         {
-            ToolCallFormat format = runner_.getToolCallFormat();
+            ToolCallFormat format = (metadata_ ? metadata_->tool_call_format : runner_.getToolCallFormat());
             tool_result = parseToolCalls(content, format, admittedToolDefinitions(request));
             has_tool_calls = tool_result.hasToolCalls();
             if (has_tool_calls)
@@ -1526,15 +1536,18 @@ namespace llaminar2
         if (request.runtime_output == CompletionRuntimeOutput::Include)
         {
             json_response["runtime_summary"] = runtimeSummaryJson(runtime_summary);
-            json_response["runtime_summary"]["expert_optimization"] =
-                moeOptimizationStatusJson(runner_.moeOptimizationStatus());
+            // Mutable runner state is read on the runner's owning thread.
             // This is an immutable, already-published ledger, not a request
             // reset or maintenance join. Keep it out of routine INFO logging:
             // only an explicit terminal representation pays the copy cost.
-            json_response["runtime_summary"]["expert_movement"] =
-                moeMovementLedgerJson(runner_.moeOptimizationMovementLedger());
-            json_response["runtime_summary"]["expert_movement_topology"] =
-                moeMovementTopologyJson(runner_.moeOptimizationMovementTopology());
+            withRunner([&](IOrchestrationRunner &runner) {
+                json_response["runtime_summary"]["expert_optimization"] =
+                    moeOptimizationStatusJson(runner.moeOptimizationStatus());
+                json_response["runtime_summary"]["expert_movement"] =
+                    moeMovementLedgerJson(runner.moeOptimizationMovementLedger());
+                json_response["runtime_summary"]["expert_movement_topology"] =
+                    moeMovementTopologyJson(runner.moeOptimizationMovementTopology());
+            });
         }
 
         response.ok = true;
@@ -1674,7 +1687,7 @@ namespace llaminar2
         // only answer content can become an executable model-native call.
         const bool has_tools = toolCallParsingEnabled(request);
         const ToolCallFormat tool_format = has_tools
-            ? runner_.getToolCallFormat()
+            ? (metadata_ ? metadata_->tool_call_format : runner_.getToolCallFormat())
             : ToolCallFormat::NONE;
         StreamingToolCallSplitter tool_splitter(tool_format, admittedToolDefinitions(request));
         StreamingUtf8Text utf8_text;
@@ -1752,7 +1765,7 @@ namespace llaminar2
 
         if (thinking_budget_active)
         {
-            std::string stop_prompt = runner_.getStopThinkingPrompt();
+            std::string stop_prompt = (metadata_ ? metadata_->stop_thinking_prompt : runner_.getStopThinkingPrompt());
             if (!stop_prompt.empty())
             {
                 /*
@@ -1879,8 +1892,7 @@ namespace llaminar2
                 step_complete = result.is_complete;
             }
 
-            if (!runChatMoERebalanceMaintenance(
-                    runner_, step_tokens.size()))
+            if (!runMaintenanceOnRunnerThread(step_tokens.size()))
                 return emit_rebalance_error();
 
             committed_tokens += static_cast<int>(step_tokens.size());

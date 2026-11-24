@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <functional>
@@ -29,6 +30,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -257,6 +259,42 @@ namespace llaminar2
         }
 
         std::uint64_t nextRequestId() { return next_id_.fetch_add(1) + 1; }
+
+        /**
+         * @brief Run @p access on the driver thread (the runner's owner) and wait.
+         *
+         * For reads/maintenance of mutable runner state from handler threads.
+         * An exception from @p access is rethrown to the caller without
+         * sealing the session.
+         * @throws std::runtime_error when the driver is closed.
+         */
+        void call(const std::function<void(IOrchestrationRunner &)> &access)
+        {
+            auto done = std::make_shared<std::promise<void>>();
+            auto result = done->get_future();
+            if (!post([this, &access, done] {
+                    try
+                    {
+                        access(runner_);
+                        done->set_value();
+                    }
+                    catch (...)
+                    {
+                        done->set_exception(std::current_exception());
+                    }
+                }))
+                throw std::runtime_error("serving session closed: " + closeReason());
+            // The command alone owns the promise: if stop()/seal() drops it
+            // before it runs, the future resolves as a broken promise.
+            try
+            {
+                result.get();
+            }
+            catch (const std::future_error &)
+            {
+                throw std::runtime_error("serving session closed: " + closeReason());
+            }
+        }
 
         /** @brief True once stopped or sealed by a failure. */
         bool closed() const

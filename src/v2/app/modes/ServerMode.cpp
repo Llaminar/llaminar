@@ -1093,6 +1093,13 @@ namespace llaminar2
         if (batch_capacity > 1)
         {
             batch_driver = std::make_unique<ServingBatchDriver>(*runner, batch_capacity, config.max_seq_len);
+            // Install lanes (and snapshot request metadata) before the driver
+            // thread owns the runner.
+            handler.setGenerationLaneFactory(
+                [driver = batch_driver.get()] { return driver->makeLane(); },
+                [driver = batch_driver.get()](const std::function<void(IOrchestrationRunner &)> &access) {
+                    driver->call(access);
+                });
             std::string batch_error;
             if (!batch_driver->start(batch_error))
             {
@@ -1101,7 +1108,6 @@ namespace llaminar2
                 flushPerfStatsFromEnv();
                 return 1;
             }
-            handler.setGenerationLaneFactory([driver = batch_driver.get()] { return driver->makeLane(); });
             const std::size_t max_in_flight =
                 static_cast<std::size_t>(batch_capacity) + executor_queue_capacity;
             registerBatchedChatCompletionEndpoint(svr, handler, max_in_flight, stream_observer);

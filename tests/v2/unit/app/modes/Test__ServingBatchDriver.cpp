@@ -427,4 +427,24 @@ namespace llaminar2::test
         ASSERT_TRUE(forced.error.empty()) << forced.error;
         EXPECT_EQ(forced.tokens, std::vector<int32_t>{42});
     }
+
+    TEST(ServingBatchDriverLifecycle, RunnerAccessRunsOnTheDriverThreadAndFailsAfterStop)
+    {
+        FakeServingRunner runner;
+        ServingBatchDriver driver(runner, 4, kContext);
+        std::string error;
+        ASSERT_TRUE(driver.start(error)) << error;
+        std::thread::id seen;
+        bounded([&] {
+            driver.call([&](IOrchestrationRunner &) { seen = std::this_thread::get_id(); });
+            return 0;
+        });
+        EXPECT_NE(seen, std::thread::id{});
+        EXPECT_NE(seen, std::this_thread::get_id());
+        EXPECT_THROW(driver.call([](IOrchestrationRunner &) { throw std::logic_error("read failed"); }),
+                     std::logic_error);
+        EXPECT_FALSE(driver.closed()); // a failed read does not seal serving
+        driver.stop();
+        EXPECT_THROW(driver.call([](IOrchestrationRunner &) {}), std::runtime_error);
+    }
 } // namespace llaminar2::test

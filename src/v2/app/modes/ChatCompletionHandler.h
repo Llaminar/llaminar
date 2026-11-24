@@ -228,6 +228,36 @@ namespace llaminar2
     /** @brief Creates one request's generation lane. */
     using GenerationLaneFactory = std::function<std::unique_ptr<IRequestGenerationLane>()>;
 
+    /**
+     * @brief Runs a live-state runner read on the thread that owns the runner.
+     *
+     * Under continuous batching the driver thread exclusively owns the runner,
+     * so diagnostic reads of mutable state (MoE optimization) are serialized
+     * through it instead of racing a shared step.
+     */
+    using RunnerReadSerializer = std::function<void(const std::function<void(IOrchestrationRunner &)> &)>;
+
+    /** @brief Immutable request metadata, snapshotted before concurrent serving. */
+    struct ChatRunnerMetadata
+    {
+        ThinkingMode default_thinking = ThinkingMode::Enabled;
+        SamplingParams recommended_thinking;
+        SamplingParams recommended_plain;
+        std::string stop_thinking_prompt;
+        ToolCallFormat tool_call_format = ToolCallFormat::HERMES_2_PRO;
+
+        static ChatRunnerMetadata snapshot(const IOrchestrationRunner &runner)
+        {
+            ChatRunnerMetadata metadata;
+            metadata.default_thinking = runner.getDefaultThinkingMode();
+            metadata.recommended_thinking = runner.getRecommendedSamplingParams(ThinkingMode::Enabled);
+            metadata.recommended_plain = runner.getRecommendedSamplingParams(ThinkingMode::Disabled);
+            metadata.stop_thinking_prompt = runner.getStopThinkingPrompt();
+            metadata.tool_call_format = runner.getToolCallFormat();
+            return metadata;
+        }
+    };
+
     class ChatCompletionHandler
     {
     public:
@@ -299,7 +329,14 @@ namespace llaminar2
          * Without a factory every request uses the runner's scalar path and
          * must run on the serialized inference worker.
          */
-        void setGenerationLaneFactory(GenerationLaneFactory factory) { lane_factory_ = std::move(factory); }
+        void setGenerationLaneFactory(GenerationLaneFactory factory, RunnerReadSerializer serializer)
+        {
+            // Snapshot before any concurrent request runs: handler threads then
+            // never read the runner while the serving thread mutates it.
+            metadata_ = ChatRunnerMetadata::snapshot(runner_);
+            lane_factory_ = std::move(factory);
+            runner_reads_ = std::move(serializer);
+        }
 
         /// Generate a unique chat completion ID (e.g., "chatcmpl-a1b2c3d4e5f6")
         static std::string generateRequestId();
@@ -332,6 +369,20 @@ namespace llaminar2
         ITokenizer &tokenizer_;
         std::string model_name_;
         GenerationLaneFactory lane_factory_;
+        RunnerReadSerializer runner_reads_;
+        std::optional<ChatRunnerMetadata> metadata_;
+
+        /** @brief MoE maintenance after committed tokens, on the runner's owning thread. */
+        bool runMaintenanceOnRunnerThread(uint64_t committed_tokens);
+
+        /** @brief Run a mutable-state runner access on its owning thread. */
+        void withRunner(const std::function<void(IOrchestrationRunner &)> &read)
+        {
+            if (runner_reads_)
+                runner_reads_(read);
+            else
+                read(runner_);
+        }
     };
 
 } // namespace llaminar2
