@@ -613,14 +613,8 @@ namespace llaminar2
             ASSERT_EQ(activation.upload(std::vector<int8_t>(K, 13)), hipSuccess);
             ASSERT_EQ(activation_scales.upload(std::vector<float>(K / 32, 0.05f)), hipSuccess);
             unsigned qualified_coded = 0, qualified_single_scale = 0;
-            for (const auto &format : test::quantizedVerifierFormats())
-            {
-                const auto *source = native_quantised_formats::forSourceIdentity(format.source_codebook_id, format.source_is_superblock);
-                ASSERT_NE(source, nullptr);
-                const bool coded = migrationUsesSuperblockCodes(*source);
-                if (!coded && !expertTierPreservesNativeSingleScale(preparedEncodingForSource(*source), source->codebook_id))
-                    continue;
-                SCOPED_TRACE(format.label);
+            // A fatal assertion retires only this format, not the entire sweep.
+            const auto verify_format = [&](const auto &format, const NativeQuantisedFormatInfo &source, bool coded) {
                 const auto tensor = format.create({N, K}, 42);
                 CPUNativeQuantisedPackedWeights cpu;
                 ASSERT_TRUE(packWeightsCPUNativeQuantised(tensor.get(), cpu));
@@ -629,7 +623,7 @@ namespace llaminar2
                 ASSERT_TRUE(cpuToGpuExpertPackedReference(cpu, oracle, &error)) << error;
                 const auto cpu_bytes = cpu.readView().bytes();
                 const auto up = makeCpuToGpuExpertTierWeightStreamManifest(cpu, 11, 0, 4, ExpertTierWeightProjection::Down, chunk_units);
-                const auto down = makeGpuToCpuExpertTierWeightStreamManifest(*source, N, K, 12, 0, 4,
+                const auto down = makeGpuToCpuExpertTierWeightStreamManifest(source, N, K, 12, 0, 4,
                     ExpertTierWeightProjection::Down, chunk_units);
                 TestHIPBuffer<uint8_t> payload(oracle.payload.size()),
                     codes(coded ? oracle.codes.size() : oracle.scaleLiveBytes()),
@@ -637,7 +631,11 @@ namespace llaminar2
                 auto loaded = test::makeGpuPreparedGemm(tensor.get(), DeviceId::rocm(0));
                 DeviceNativeQuantisedMatrixDesc source_desc;
                 ASSERT_TRUE(loaded.kernel->exportNativeQuantisedMatrixDesc(source_desc));
-                const auto canonical = canonicalDeviceVnniFormat(*source);
+                ASSERT_TRUE(source_desc.source_identity_present);
+                ASSERT_EQ(source_desc.source_codebook_id, source.codebook_id);
+                ASSERT_EQ(bool(source_desc.source_is_superblock), source.is_superblock);
+                ASSERT_EQ(source_desc.codebook_id, oracle.codebook_id);
+                const auto canonical = canonicalDeviceVnniFormat(source);
                 const auto source_packed = makeGpuExpertPackedDescriptor(source_desc,
                     canonical.payload_bytes_per_block, canonical.is_asymmetric, canonical.has_emins);
                 const auto live_codes = coded && !oracle.codes.empty() ? oracle.codes.size() - sb::kSuperblockCodePlanePadBytes : codes.bytes();
@@ -687,19 +685,22 @@ namespace llaminar2
                     EXPECT_EQ(bytes, upload.chunkBytes(upload.unit_count));
                 };
                 std::vector<uint8_t> received(cpu_bytes.size(), 0);
-                run(up.deviceLayout(), down.deviceLayout(), gpu.asConst(), received);
+                ASSERT_NO_FATAL_FAILURE(run(up.deviceLayout(), down.deviceLayout(), gpu.asConst(), received));
                 EXPECT_EQ(std::memcmp(received.data(), cpu_bytes.data(), received.size()), 0);
                 std::fill(received.begin(), received.end(), 0);
-                run(up.deviceLayout(), down.deviceLayout(), source_view, received);
+                ASSERT_NO_FATAL_FAILURE(run(up.deviceLayout(), down.deviceLayout(), source_view, received));
                 ASSERT_EQ(std::memcmp(received.data(), cpu_bytes.data(), received.size()), 0)
                     << "SourceNative and CPU source packing diverged before the projection";
 
+                // Keep the physical decoder separate from the source's serial
+                // arithmetic policy (IQ4_XS: decoder 24, policy 4; MXFP4: 25, 4).
+                const auto policy = canonicalDeviceVnniCodebookId(source_desc.source_codebook_id);
                 const auto gemv_submit = [&](const ExpertTierGpuConstProjectionView &weights, float *output) {
                     const DeviceNativeQuantisedMatrixDesc descriptor{.payload = weights.payload, .scales = weights.scales,
                         .mins = weights.mins, .metadata_layout = weights.metadata_layout};
                     return rocmGemv_native_quantised_fp32_with_policy(activation.data(), weights.payload,
                         native_quantised_scale::metadataPlanes(descriptor), output, nullptr, partials.data(),
-                        N, K, oracle.codebook_id, canonicalDeviceVnniCodebookId(*source), 0,
+                        N, K, oracle.codebook_id, policy, 0,
                         stream.opaque(), activation_scales.data());
                 };
                 ASSERT_TRUE(gemv_submit(source_view, source_result.data()));
@@ -725,9 +726,28 @@ namespace llaminar2
                 upload.unit_count = download.unit_count = 2 * upload.blocks_per_row;
                 ASSERT_TRUE(upload.valid());
                 ASSERT_TRUE(download.valid());
-                run(upload, download, source_view, received, true);
+                ASSERT_NO_FATAL_FAILURE(run(upload, download, source_view, received, true));
                 if (coded) ++qualified_coded;
                 else ++qualified_single_scale;
+            };
+            for (const auto &format : test::quantizedVerifierFormats())
+            {
+                SCOPED_TRACE(format.label);
+                const auto *source = native_quantised_formats::forSourceIdentity(format.source_codebook_id, format.source_is_superblock);
+                EXPECT_NE(source, nullptr);
+                if (!source)
+                    continue;
+                const bool coded = migrationUsesSuperblockCodes(*source);
+                if (!coded && !expertTierPreservesNativeSingleScale(preparedEncodingForSource(*source), source->codebook_id))
+                    continue;
+                try
+                {
+                    verify_format(format, *source, coded);
+                }
+                catch (const std::exception &error)
+                {
+                    ADD_FAILURE() << error.what();
+                }
             }
             EXPECT_EQ(qualified_coded, 13u);
             EXPECT_EQ(qualified_single_scale, 9u);
