@@ -672,24 +672,42 @@ namespace llaminar2::cpu::native_quantised
             }
         }
 
-        /** @brief Widen a strip's original source factors once per partition/superblock intersection.
+        /** @brief Select the binary16 Q5_K factor program on tiles with room for its constants.
+         * @tparam Ops Admitted NEON instruction family.
+         * @return True for SDOT tiles of up to three rows and for SMMLA row pairs
+         *         under a binary16-arithmetic compiler envelope. Four-row SDOT
+         *         and ASIMD use the widened program to avoid vector spills.
+         */
+        template <typename Ops> static constexpr bool q5KUsesHalfStaging() noexcept
+        {
+#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+            return multi_scale::usesRowPairs<Ops> || (Ops::instruction == Dot::DotProd && Rows < 4);
+#else
+            return false;
+#endif
+        }
+
+        /** @brief Load a strip's original source factors once per partition/superblock intersection.
          * @tparam Codebook Q5_K (7) or IQ3_S (11).
          * @tparam Ops Admitted native lane operations.
          * @param header Sealed source superblock header owning the current K block.
          * @param column First of four consecutive column headers.
-         * @return Widened d/dmin for Q5_K, or source d for IQ3_S.
+         * @return Q5_K's Q4_K-compatible staging base, or widened source d for IQ3_S.
          */
         template <int Codebook, typename Ops>
         [[gnu::always_inline]] static auto codedBase(const std::uint8_t *header, int column) noexcept
         {
             if constexpr (Codebook == 7)
             {
-                using F = typename Ops::F;
-                // The header is d | dmin per column. Split it at the load,
-                // preserving the original binary16 payloads in both vectors.
-                const auto sources = vld2_u16(reinterpret_cast<const std::uint16_t *>(header) + column * 2);
-                return coded_metadata::Q4KBaseFactors<F>{std::bit_cast<F>(neon_fp16::widen(sources.val[0])),
-                    std::bit_cast<F>(neon_fp16::widen(sources.val[1]))};
+                if constexpr (q5KUsesHalfStaging<Ops>())
+                    return q4KStripBase<Ops>(header, column);
+                else
+                {
+                    using F = typename Ops::F;
+                    const auto sources = vld2_u16(reinterpret_cast<const std::uint16_t *>(header) + column * 2);
+                    return coded_metadata::Q4KBaseFactors<F>{std::bit_cast<F>(neon_fp16::widen(sources.val[0])),
+                        std::bit_cast<F>(neon_fp16::widen(sources.val[1]))};
+                }
             }
             else
             {
@@ -715,10 +733,16 @@ namespace llaminar2::cpu::native_quantised
             constexpr auto data_stride = preparedDataStride(Encoding::CompactMultiScale, Codebook);
             if constexpr (Codebook == 7)
             {
-                using L = coded_metadata::Lanes<Ops>;
-                // Q4_K and Q5_K use the same 6+6 code, signed minimum and
-                // FP16 staging. Their separate payload decoders do not affect it.
-                return coded_metadata::reconstruct<5, Ops>(L::template code<7>(unit + data_stride, column), base);
+                // Q4_K and Q5_K store the same 6+6 code and use the same
+                // signed minimum and binary16 staging. Share the exact
+                // binary16 multiply without changing either payload reader.
+                if constexpr (q5KUsesHalfStaging<Ops>())
+                    return q4KStripFactors<Ops>(unit + data_stride, column, base);
+                else
+                {
+                    using L = coded_metadata::Lanes<Ops>;
+                    return coded_metadata::reconstruct<5, Ops>(L::template code<7>(unit + data_stride, column), base);
+                }
             }
             else
             {
