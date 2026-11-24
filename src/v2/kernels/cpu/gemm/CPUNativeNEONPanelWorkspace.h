@@ -33,6 +33,10 @@ namespace llaminar2::cpu::native_quantised::neon_panel
             (encoding == CPUNativeQuantisedEncoding::Q5NativeSingleScale && !asymmetric);
     }
 
+    /** @return Panel slots the ordinary runtime may consume, including a serialized retained team. */
+    [[nodiscard]] constexpr int projectionWorkers(CPUNativeQuantisedEncoding encoding, int workers) noexcept
+    { return encoding == CPUNativeQuantisedEncoding::Q5NativeSingleScale ? 1 : workers; }
+
     /** @return True if a canonical ordered partition outlives one physical K panel. */
     [[nodiscard]] constexpr bool needsCarry(int k, CPUProjectionNumericalPolicy policy) noexcept
     {

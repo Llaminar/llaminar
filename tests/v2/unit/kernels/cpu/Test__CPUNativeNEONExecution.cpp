@@ -176,6 +176,8 @@ TEST_F(CPUNativeNEONExecution, AllOwnersSerialGroupedAndPrefillRetainBytes)
                 for (const int workers : {1, 3})
                 {
                     omp_set_num_threads(workers);
+                    if (source.metadata == &native_quantised_formats::Q5_0 && rows >= 16)
+                        EXPECT_EQ(neon_execution::usesPackedPrefill(packed, rows), workers == 1);
                     std::vector<float> actual(size + 4, 123456.0f);
                     gemm_native_quantised_preq_decode_equivalent_rows(packed, input.data(), actual.data(), {}, rows, stride);
                     bytes(actual, expected);

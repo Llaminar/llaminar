@@ -166,16 +166,23 @@ namespace llaminar2::cpu::native_quantised
             batch.execute<multi_scale::NEONByteDot::ASIMD>();
         }
 
-        /** @return Whether this source and row extent use transient packed panels. */
-        inline bool usesPackedPrefill(const CPUNativeQuantisedPackedWeights &w, int rows) noexcept
-        {
-            return rows >= neon_panel::min_rows &&
-                neon_panel::supports(w.preparedFootprint().encoding, w.codebook_id, w.is_asymmetric);
-        }
-
         /** @return Existing team width, including a serialized team, or the new team's budget. */
         inline int packedPrefillWorkers() noexcept
         { return llaminar::v2::inLexicalWorkshare() ? omp_get_num_threads() : omp_get_max_threads(); }
+
+        /** @return Whether this source, row extent and team use transient packed panels. */
+        inline bool usesPackedPrefill(const CPUNativeQuantisedPackedWeights &w, int rows) noexcept
+        {
+            if (rows < neon_panel::min_rows) return false;
+            const auto encoding = w.preparedFootprint().encoding;
+            if (!neon_panel::supports(encoding, w.codebook_id, w.is_asymmetric)) return false;
+            // Parallel Q5_0 loses at deep prefill even with smaller column jobs.
+            // Its cheaper on-demand decoder keeps the ordinary row-grid work
+            // sharing for parallel teams. Its one panel slot can still serve a
+            // serialized retained team without rebinding the stage.
+            const int workers = packedPrefillWorkers();
+            return workers == neon_panel::projectionWorkers(encoding, workers);
+        }
 
         /** @brief Launch an admitted panel binding with the invocation's native dot family. */
         inline void executePacked(const CPUNativeNEONPackedPrefill &binding, multi_scale::NEONByteDot dot)
@@ -260,8 +267,9 @@ namespace llaminar2::cpu::native_quantised
     inline std::size_t nativeQuantisedProjectionPartialFloats(const CPUNativeQuantisedPackedWeights &packed, int rows)
     {
         neon_execution::geometry(packed, rows, packed.N);
-        return neon_panel::workspaceFloats(packed.preparedFootprint().encoding, packed.codebook_id, packed.is_asymmetric,
-            rows, packed.K, neon_execution::packedPrefillWorkers(), packed.numerical_policy);
+        const auto encoding = packed.preparedFootprint().encoding;
+        return neon_panel::workspaceFloats(encoding, packed.codebook_id, packed.is_asymmetric, rows, packed.K,
+            neon_panel::projectionWorkers(encoding, neon_execution::packedPrefillWorkers()), packed.numerical_policy);
     }
 
     /** @copydoc nativeQuantisedProjectionPartialFloats */

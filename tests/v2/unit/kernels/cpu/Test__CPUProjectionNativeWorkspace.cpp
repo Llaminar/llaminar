@@ -92,7 +92,8 @@ TEST(CPUProjectionNativeWorkspace, PrefillWorkerPanelsAreChargedToTheNamedSlab)
                     const std::size_t carry = k > 8192 && policy == CPUProjectionNumericalPolicy::GPUAlignedExpert
                         ? (std::size_t(rows) * 16 + 63) / 64 * 64 : 0;
                     EXPECT_EQ(requirements.buffers[1].name, kCPUProjectionPartials);
-                    EXPECT_EQ(requirements.buffers[1].size_bytes, workers * (2560 + carry));
+                    const int slots = type == "Q5_0" ? 1 : workers;
+                    EXPECT_EQ(requirements.buffers[1].size_bytes, slots * (2560 + carry));
                 }
 }
 
