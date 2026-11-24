@@ -559,7 +559,7 @@ TEST(DeepSeekV4SwiGLUClamp, CPUMoEKernelClampAndActivation)
     ASSERT_TRUE(kernel->clampSwiGLUOperands(&gate_tensor, &up_tensor, n, 0.0f));
 
     std::vector<float> activated = gate;
-    kernel->setSwiGLULimit(10.0f);
+    kernel->setExpertSwiGLUActivationPolicy(llaminar2::ExpertSwiGLUActivationPolicy::fromOperandLimit(10.0f));
     kernel->swiGLU(activated.data(), up.data(), n);
     for (int i = 0; i < n; ++i)
         EXPECT_EQ(bits(activated[i]),

@@ -160,7 +160,7 @@ __device__ __forceinline__ void persistentMoEFFNPhase(const llaminar2::rocm::Res
             const float u=persistentMoEFFNFold(shared.up,column,columns,up_parts);
             if(is_shared){a.shared_gate_output[n]=g;a.shared_up_output[n]=u;}
             activated[(is_shared?routed_values:size_t(route)*F)+n]=
-                ready?llaminar2::rocm::decode_equivalent::swigluValue(g,u):0.f;
+                ready?llaminar2::rocm::decode_equivalent::swigluValue(g,u,is_shared?a.shared_swiglu_limit:a.routed_swiglu_limit):0.f;
         }
         __syncthreads(); // Retire both LDS planes before the next CTA-owned tile.
     }

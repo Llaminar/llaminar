@@ -275,6 +275,25 @@ TEST(
         device,
         stream.get());
 }
+
+class CUDAClampedExpertArithmetic : public ::testing::TestWithParam<int> {};
+
+TEST_P(CUDAClampedExpertArithmetic, AllQuantizedFormatsMatchCPU)
+{
+    using namespace llaminar2;
+    const auto device = DeviceId::cuda(0);
+    auto *backend = getBackendFor(device);
+    if (!backend || backend->deviceCount() <= 0)
+        GTEST_SKIP() << "No CUDA device available";
+    ScopedBackendStream stream(device);
+    const auto &formats = test::quantizedMoEVerifierFormats();
+    ASSERT_EQ(formats.size(), native_quantised_formats::kAllSourceFormats.size());
+    test::runCPUToGPUAllFormatExpertArithmeticParity(
+        "CUDA", device, stream.get(), formats, 1.0f, std::nullopt,
+        ExpertSwiGLUActivationPolicy::fromOperandLimit(static_cast<float>(GetParam())));
+}
+
+INSTANTIATE_TEST_SUITE_P(OperandLimits, CUDAClampedExpertArithmetic, ::testing::Values(7, 10));
 #endif
 
 #ifdef HAVE_ROCM
@@ -324,4 +343,33 @@ TEST_P(ROCmCrossTierExpertArithmeticParity, QuantizedExpertFormatsAreByteExactAc
 
 INSTANTIATE_TEST_SUITE_P(FormatGroups, ROCmCrossTierExpertArithmeticParity,
     ::testing::Range(std::size_t{0}, kROCmArithmeticFormatGroups));
+
+class ROCmClampedExpertArithmetic : public ::testing::TestWithParam<std::tuple<int, std::size_t>> {};
+
+TEST_P(ROCmClampedExpertArithmetic, QuantizedFormatsMatchCPU)
+{
+    using namespace llaminar2;
+    const auto device = DeviceId::rocm(0);
+    auto *backend = getBackendFor(device);
+    if (!backend || backend->deviceCount() <= 0)
+        GTEST_SKIP() << "No ROCm device available";
+    ScopedBackendStream stream(device);
+    const auto &formats = test::quantizedMoEVerifierFormats();
+    ASSERT_EQ(formats.size(), native_quantised_formats::kAllSourceFormats.size());
+    const auto [limit, group] = GetParam();
+    test::runCPUToGPUAllFormatExpertArithmeticParity(
+        "ROCm", device, stream.get(), formats, 1.0f,
+        test::CrossTierArithmeticFormatRange{
+            .begin = formats.size() * group / kROCmArithmeticFormatGroups,
+            .end = formats.size() * (group + 1) / kROCmArithmeticFormatGroups},
+        ExpertSwiGLUActivationPolicy::fromOperandLimit(static_cast<float>(limit)));
+}
+
+INSTANTIATE_TEST_SUITE_P(OperandLimits, ROCmClampedExpertArithmetic,
+    ::testing::Combine(::testing::Values(7, 10),
+        ::testing::Range(std::size_t{0}, kROCmArithmeticFormatGroups)),
+    [](const auto &info) {
+        return "Limit" + std::to_string(std::get<0>(info.param)) +
+               "Group" + std::to_string(std::get<1>(info.param));
+    });
 #endif

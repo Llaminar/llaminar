@@ -134,7 +134,8 @@ void groupedFFNFormatProgramGate(const int32_t* liveOwner,const int8_t* hiddenCo
                         output.sharedGateScratch[row*span+column]=values.gate;
                         output.sharedUpScratch[row*span+column]=values.up;
                     }
-                    published[owner][column%32]=decode_equivalent::swigluValue(values.gate,values.up);
+                    published[owner][column%32]=decode_equivalent::swigluValue(values.gate,values.up,
+                        routed?output.routedSwiGLULimit:output.sharedSwiGLULimit);
                 }
             } else {
                 float gateValue=0.0f;
@@ -172,7 +173,8 @@ void groupedFFNFormatProgramGate(const int32_t* liveOwner,const int8_t* hiddenCo
                             output.sharedGateScratch[row*span+column]=gateValue;
                             output.sharedUpScratch[row*span+column]=values.value[0];
                         }
-                        published[owner][column%32]=decode_equivalent::swigluValue(gateValue,values.value[0]);
+                        published[owner][column%32]=decode_equivalent::swigluValue(gateValue,values.value[0],
+                            routed?output.routedSwiGLULimit:output.sharedSwiGLULimit);
                     }
                 }
             }

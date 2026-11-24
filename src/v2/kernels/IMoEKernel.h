@@ -21,6 +21,8 @@
 
 #pragma once
 
+#include "kernels/common/ExpertSwiGLUActivationPolicy.h"
+
 #include "../execution/config/RoutedExpertPolicy.h"
 #include "../execution/moe/MoEOverlayActivationPacketABI.h"
 #include "../execution/moe/MoEOverlayNodeLocalRouteExchangeABI.h"
@@ -378,9 +380,9 @@ namespace llaminar2
                 throw std::invalid_argument("MoE router scoring policy is not implemented by this backend");
         }
         /** @brief Routed-expert and shared-expert SwiGLU clamp (0 = unclamped). */
-        virtual void setSwiGLULimit(float limit)
+        virtual void setExpertSwiGLUActivationPolicy(ExpertSwiGLUActivationPolicy policy)
         {
-            if (limit != 0.0f)
+            if (policy.clampsOperands())
                 throw std::invalid_argument("MoE SwiGLU clamp is not implemented by this backend");
         }
 

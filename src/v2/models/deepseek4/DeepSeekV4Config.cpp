@@ -173,8 +173,12 @@ DeepSeekV4Config::DeepSeekV4Config(const GGUFModel &model)
         default: reject("deepseek4.attention.compress_ratios", "unsupported ratio at layer " + std::to_string(il));
         }
         policy.hashRouted = il < hash_layers_;
-        policy.swigluLimit = limits[static_cast<std::size_t>(il)];
-        policy.sharedSwigluLimit = shared_limits[static_cast<std::size_t>(il)];
+        const auto activation = [&](const char *key, float limit) {
+            try { return ExpertSwiGLUActivationPolicy::fromOperandLimit(limit); }
+            catch (const std::invalid_argument &error) { reject(key, error.what()); }
+        };
+        policy.routedSwiGLU = activation("deepseek4.swiglu_clamp_exp", limits[static_cast<std::size_t>(il)]);
+        policy.sharedSwiGLU = activation("deepseek4.swiglu_clamp_shexp", shared_limits[static_cast<std::size_t>(il)]);
         policy.rope = policy.ratio != 0
             ? deepseek4::RopePolicy::make(rope_dim_, compress_base, original_context, factor, beta_fast, beta_slow)
             : deepseek4::RopePolicy::make(rope_dim_, rope_base, 0, 1.0f, beta_fast, beta_slow);
@@ -232,11 +236,11 @@ int DeepSeekV4Config::countLayers(DeepSeekV4AttentionKind kind) const noexcept
     return count;
 }
 
-float deepSeekV4RoutedSwiGLULimit(const GGUFModel &model, int layer)
+ExpertSwiGLUActivationPolicy deepSeekV4RoutedSwiGLU(const GGUFModel &model, int layer)
 {
     if (model.architecture != "deepseek4")
-        return 0.0f;
-    return DeepSeekV4Config(model).layer(layer).swigluLimit;
+        return {};
+    return DeepSeekV4Config(model).layer(layer).routedSwiGLU;
 }
 
 } // namespace llaminar2

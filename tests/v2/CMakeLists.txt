@@ -12722,6 +12722,22 @@ add_v2_test(V2_Integration_CUDA_MoEOverlayCPUArithmeticAllFormats
 )
 set(V2_CUDA_CROSS_TIER_EXPERT_ARITHMETIC_PREFLIGHT_TESTS
     V2_Integration_CUDA_MoEOverlayCPUArithmeticAllFormats)
+foreach(_operand_limit IN ITEMS 7 10)
+    if(_operand_limit EQUAL 7)
+        set(_parameter 0)
+    else()
+        set(_parameter 1)
+    endif()
+    set(_clamp_test V2_Integration_CUDA_MoEClampedExpertArithmetic_Limit${_operand_limit})
+    add_v2_test(${_clamp_test}
+        COMMAND $<TARGET_FILE:v2_integration_cross_tier_expert_arithmetic>
+            --gtest_filter=OperandLimits/CUDAClampedExpertArithmetic.AllQuantizedFormatsMatchCPU/${_parameter}
+            --gtest_brief=1
+        LABELS "V2;Integration;CUDA;CPU;MoE;AllFormats;Prefill;GroupedDecode;GroupedVerifierRows;ByteExact;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120
+    )
+    list(APPEND V2_CUDA_CROSS_TIER_EXPERT_ARITHMETIC_PREFLIGHT_TESTS ${_clamp_test})
+endforeach()
 if(LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
     # The native registration above exercises the configured AVX-512 path on
     # this build. Force the independently implemented AVX2 contribution tree
@@ -24554,6 +24570,18 @@ add_v2_test(V2_Integration_ROCmIQ2SFusedMoEOriginalEquation
         TIMEOUT 30
     )
     set(V2_ROCM_CROSS_TIER_EXPERT_ARITHMETIC_PREFLIGHT_TESTS)
+    foreach(_limit IN ITEMS 7 10)
+        foreach(_group IN ITEMS 0 1 2)
+            set(_clamp_test V2_Integration_ROCm_MoEClampedExpertArithmetic_Limit${_limit}Group${_group})
+            add_v2_test(${_clamp_test}
+                COMMAND $<TARGET_FILE:v2_integration_cross_tier_expert_arithmetic>
+                    --gtest_filter=OperandLimits/ROCmClampedExpertArithmetic.QuantizedFormatsMatchCPU/Limit${_limit}Group${_group}
+                    --gtest_brief=1
+                LABELS "V2;Integration;ROCm;CPU;MoE;AllFormats;Prefill;GroupedDecode;GroupedVerifierRows;ByteExact;Regression"
+                MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+            list(APPEND V2_ROCM_CROSS_TIER_EXPERT_ARITHMETIC_PREFLIGHT_TESTS ${_clamp_test})
+        endforeach()
+    endforeach()
     set(_cross_tier_cpu_isas Native)
     if(LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
         list(APPEND _cross_tier_cpu_isas AVX2)

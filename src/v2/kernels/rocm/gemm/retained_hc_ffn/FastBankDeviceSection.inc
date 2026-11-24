@@ -820,7 +820,7 @@ static_assert(!Packed||(Sense&&Instance),"Packed lifetime protocol requires inst
                     const float gate=folded.x,up=folded.y;
                     if(lane<2&&local_first+unsigned(lane)<unsigned(ns)) {
                         const unsigned row=unsigned(r0)+local_first+unsigned(lane);
-                        const float value=llaminar2::rocm::decode_equivalent::swigluValue(gate,up);
+                        const float value=llaminar2::rocm::decode_equivalent::swigluValue(gate,up,ffn.shared_swiglu_limit);
                         if constexpr(ClosedRetainedPolicy)g_hcp_mh[shared_start+row]=value;
                         else g_hcp_h[0][row]=value;
                         if constexpr(ObserveCanonical) {
@@ -1070,7 +1070,7 @@ static_assert(!Packed||(Sense&&Instance),"Packed lifetime protocol requires inst
                                 uu=canonical_gu::foldFourColumns(uu,parts,unsigned(lane));
                                 if(lane<int(WaveRows) && wave_row+unsigned(lane)<count) {
                                     const unsigned output=tile+wave_row+unsigned(lane);
-                                    const float value=llaminar2::rocm::decode_equivalent::swigluValue(gg,uu);
+                                    const float value=llaminar2::rocm::decode_equivalent::swigluValue(gg,uu,ffn.routed_swiglu_limit);
                                     g_hcp_mh[unsigned(slot)*routed_stride+output]=value;
                                     if constexpr(ObserveCanonical) {
                                         const unsigned index=unsigned(slot*ffr)+output;

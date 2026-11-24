@@ -10,6 +10,8 @@
  */
 #pragma once
 
+#include "kernels/common/ExpertSwiGLUActivationPolicy.h"
+
 #include "../../kernels/deepseek4/DeepSeekV4Kernels.h"
 
 #include <cstdint>
@@ -34,8 +36,8 @@ struct DeepSeekV4LayerPolicy
     DeepSeekV4AttentionKind kind = DeepSeekV4AttentionKind::Window;
     int ratio = 0;                 ///< 0, 4 or 128.
     bool hashRouted = false;       ///< First hash_layer_count layers route text tokens by token id.
-    float swigluLimit = 0.0f;      ///< Routed-expert SwiGLU clamp.
-    float sharedSwigluLimit = 0.0f;///< Shared-expert SwiGLU clamp.
+    ExpertSwiGLUActivationPolicy routedSwiGLU;      ///< Routed-expert SwiGLU clamp.
+    ExpertSwiGLUActivationPolicy sharedSwiGLU;///< Shared-expert SwiGLU clamp.
     deepseek4::RopePolicy rope;    ///< Layer rotation: YaRN + compress base when ratio != 0.
 };
 
@@ -105,6 +107,6 @@ private:
  *         model, 0 for every other architecture.
  * @throws std::invalid_argument when DeepSeek-V4 metadata is invalid.
  */
-float deepSeekV4RoutedSwiGLULimit(const GGUFModel &model, int layer);
+ExpertSwiGLUActivationPolicy deepSeekV4RoutedSwiGLU(const GGUFModel &model, int layer);
 
 } // namespace llaminar2

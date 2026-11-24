@@ -52,7 +52,7 @@ struct FullNativeHCFFNArgs {
 };
 static_assert(std::is_trivially_copyable_v<FullNativeHCFFNPrefixArgs>);
 #if INTPTR_MAX == INT64_MAX
-static_assert(sizeof(FullNativeHCFFNArgs)==992 && offsetof(FullNativeHCFFNArgs,prefix)==528);
+static_assert(sizeof(FullNativeHCFFNArgs)==1000 && offsetof(FullNativeHCFFNArgs,prefix)==536);
 #endif
 static_assert(std::is_trivially_copyable_v<FullNativeHCFFNArgs>);
 

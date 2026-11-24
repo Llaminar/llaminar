@@ -2538,7 +2538,7 @@ void moe_grouped_swiglu_quantize_prefill_kernel(
     int8_t*      __restrict__ A_int8_out,        // [total_slots, intermediate] quantized SwiGLU output
     float*       __restrict__ scales_out,        // [total_slots, blocks_per_intermediate]
     int intermediate,
-    ROCmMoEGroupedRouteAdmission admission)
+    ROCmMoEGroupedRouteAdmission admission, float swiglu_limit)
 {
     constexpr int blocks_per_workgroup = kMoESwiGLUQuantizeThreads / 32;
     const int blocks_per_row = intermediate / 32;
@@ -2558,7 +2558,7 @@ void moe_grouped_swiglu_quantize_prefill_kernel(
     const float g = gate_data[idx];
     const float u = up_data[idx];
     const float val =
-        llaminar2::rocm::decode_equivalent::swigluValue(g, u);
+        llaminar2::rocm::decode_equivalent::swigluValue(g, u, swiglu_limit);
 
     // Warp-cooperative max reduction for quantization
     float abs_val = fabsf(val);
@@ -4328,7 +4328,7 @@ bool rocmMoE_grouped_prefill_pipeline(
     llaminar2::rocm::MoEGroupedPrefillSubmission *submitted,
     llaminar2::rocm::MoEGroupedSourceTuple singleton_sources,
     const llaminar2::MoEPrefillGroupingProvenance::DirectoryBorrow *grouping_directory,
-    llaminar2::rocm::MoEGroupedSourceTuple routed_sources)
+    llaminar2::rocm::MoEGroupedSourceTuple routed_sources, float swiglu_limit)
 {
     if (submitted) *submitted = {};
     if (completed_observation) *completed_observation = {};
@@ -4962,7 +4962,7 @@ bool rocmMoE_grouped_prefill_pipeline(
             quant_grid, quant_block, 0, hip_stream,
             d_scratch_gate, d_scratch_up,
             d_scratch_swiglu_int8, d_scratch_swiglu_scales,
-            intermediate, admission);
+            intermediate, admission, swiglu_limit);
     }
 
     // =========================================================================

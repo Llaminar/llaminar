@@ -438,7 +438,8 @@ void groupedFFNPairedGatePublish(Args p)
                     p.output.sharedGateScratch[row*sharedWidth+column]=value.gate;
                     p.output.sharedUpScratch[row*sharedWidth+column]=value.up;
                 }
-                publication[owner][column%32]=decode_equivalent::swigluValue(value.gate,value.up);
+                publication[owner][column%32]=decode_equivalent::swigluValue(value.gate,value.up,
+                    routed?p.output.routedSwiGLULimit:p.output.sharedSwiGLULimit);
             }
         }
         __syncthreads();

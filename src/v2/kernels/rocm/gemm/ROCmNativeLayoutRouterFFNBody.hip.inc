@@ -396,7 +396,7 @@ __device__ __forceinline__ void gateUpWavePhase(unsigned width,unsigned hidden,u
     const DeviceNativeQuantisedMatrixDesc* gates,const DeviceNativeQuantisedMatrixDesc* ups,const int* route_ids,
     const router_native::RuntimeDecodeExecutionBankStorage<DeviceMoELayerRuntimeView>* bank_storage,
     const int8_t* codes,const float* scales,const int32_t* sums,float* activated,size_t output_base,
-    float* gate_output,float* up_output,PhaseProjection* bindings)
+    float* gate_output,float* up_output,PhaseProjection* bindings,float swiglu_limit)
 {
     using Tasks=NativeLayoutGateUpGeometry;
     const auto resolved=NativeLayoutDownWaveGeometry::resolve(maximum);
@@ -487,7 +487,7 @@ __device__ __forceinline__ void gateUpWavePhase(unsigned width,unsigned hidden,u
         {
             if constexpr(Shared){gate_output[n]=g;up_output[n]=u;}
             activated[output_base+(Shared?0:size_t(item.route)*width)+n]=
-                waveMetadataValue(gate.ready)&&waveMetadataValue(up.ready)?decode_equivalent::swigluValue(g,u):0.f;
+                waveMetadataValue(gate.ready)&&waveMetadataValue(up.ready)?decode_equivalent::swigluValue(g,u,swiglu_limit):0.f;
         }
     }
 }
@@ -910,7 +910,7 @@ __device__ __forceinline__ void nativeLayoutRouterFFNPhase(const NativeLayoutRou
     // only this role's scalar/pointer values; no enclosing args record escapes.
     gateUpWavePhase<true,Mask>(S,H,T,a.experts,live,max_parts,
         LLAMINAR_PHASE_FFN_FIELD(shared_gate),LLAMINAR_PHASE_FFN_FIELD(shared_up),nullptr,nullptr,code,scale,sum,LLAMINAR_PHASE_FFN_FIELD(gate_partials),size_t(T)*F,
-        LLAMINAR_PHASE_FFN_FIELD(shared_gate_output),LLAMINAR_PHASE_FFN_FIELD(shared_up_output),gate_binding);
+        LLAMINAR_PHASE_FFN_FIELD(shared_gate_output),LLAMINAR_PHASE_FFN_FIELD(shared_up_output),gate_binding,a.shared_swiglu_limit);
     grid.sync();
     // Only one global scalar load per CTA; the canonical selector's first
     // existing CTA barrier publishes this LDS value to every eventual consumer.
@@ -925,7 +925,7 @@ __device__ __forceinline__ void nativeLayoutRouterFFNPhase(const NativeLayoutRou
             a.rows.countOwner(),args.router_publication);
     gateUpWavePhase<false,Mask>(F,H,T,a.experts,live,max_parts,
         a.gates,a.ups,selection.selected_ids,&gate_state.bank,code,scale,sum,
-        LLAMINAR_PHASE_FFN_FIELD(gate_partials),0,nullptr,nullptr,gate_binding);
+        LLAMINAR_PHASE_FFN_FIELD(gate_partials),0,nullptr,nullptr,gate_binding,a.routed_swiglu_limit);
     grid.sync();
     // Every CTA has finished reading raw logits. Only now may the original
     // public probability array be overwritten; down never consumes it.

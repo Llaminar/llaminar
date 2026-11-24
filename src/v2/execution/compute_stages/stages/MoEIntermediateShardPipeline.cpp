@@ -171,6 +171,7 @@ namespace
             mix(reinterpret_cast<std::uintptr_t>(params.kernel_owner.get()));
             mix(static_cast<uint64_t>(route_authority));
             mix(static_cast<unsigned>(local_result));
+            mix(params.swiglu_activation.captureWord());
             mix(params.rows); mix(params.top_k); mix(original.modelColumns()); mix(original.localIntermediateColumns());
             mix(original.firstIntermediateColumn()); mix(static_cast<unsigned>(params.row_mode));
             mix(static_cast<unsigned>(params.row_policy)); mix(static_cast<unsigned>(params.demand));
@@ -327,6 +328,7 @@ namespace
             requireTensorAddresses();
             auto &kernel = *params.kernel_owner->kernel;
             kernel.setGPUStream(stream);
+            kernel.setExpertSwiGLUActivationPolicy(params.swiglu_activation);
             const int h = original.modelColumns(), f = original.localIntermediateColumns();
             // The candidate computed routed bytes under the compute leaf's
             // exact original stream. This unchanged terminal stage remains the

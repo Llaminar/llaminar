@@ -4993,6 +4993,8 @@ namespace llaminar2
         graph.addNode(router, ComputeStageFactory::createMoERouting(route), device);
         graph.addDependency(router, norm);
         MoEIntermediateShardPipelineParams local;
+        if (config_.deepseek_v4)
+            local.swiglu_activation = config_.deepseek_v4->layer(layer_idx).routedSwiGLU;
         local.family = declaration->family(); local.runtime = runtime; local.kernel_owner = owner;
         local.rows = rows; local.top_k = config_.moe.top_k; local.phase = phase;
         local.row_mode = grouped ? MoEIntermediateShardRowMode::Grouped : MoEIntermediateShardRowMode::Decode;
@@ -5032,6 +5034,8 @@ namespace llaminar2
         const auto *shared_up = original_shared.optionalLayerForDevice(layer_idx, "ffn_up_shexp.weight", device);
         const auto *shared_down = original_shared.optionalLayerForDevice(layer_idx, "ffn_down_shexp.weight", device);
         SharedExpertFFNStage::Params shared;
+        if (config_.deepseek_v4)
+            shared.swiglu_activation = config_.deepseek_v4->layer(layer_idx).sharedSwiGLU;
         shared.device_id = device; shared.input = buffers.normalized;
         shared.gate_w = legacyTensor(shared_gate);
         shared.up_w = legacyTensor(shared_up);
@@ -8075,8 +8079,10 @@ namespace llaminar2
                 expert_params.expert_intermediate = expert_intermediate;
                 expert_params.layer_idx = layer_idx;
                 // DeepSeek-V4 clamps routed-expert SwiGLU operands per layer.
-                expert_params.swiglu_limit = config_.deepseek_v4
-                    ? config_.deepseek_v4->layer(layer_idx).swigluLimit : 0.0f;
+                expert_params.swiglu_activation = config_.deepseek_v4
+                    ? config_.deepseek_v4->layer(layer_idx).routedSwiGLU : ExpertSwiGLUActivationPolicy{};
+                expert_params.shared_swiglu_activation = config_.deepseek_v4
+                    ? config_.deepseek_v4->layer(layer_idx).sharedSwiGLU : ExpertSwiGLUActivationPolicy{};
                 expert_params.routing_indices = routing_indices;
                 expert_params.routing_weights = routing_weights;
                 expert_params.routing_indices_buffer_id = buffers.idFor(BufferId::MOE_EXPERT_INDICES);
@@ -9852,6 +9858,8 @@ namespace llaminar2
                         publishInitialMoEIntermediateShardRuntimeLayer(*runtime, *owner_map_lifetime,
                             source, layer_idx, device_state_publication_stream);
                         MoEIntermediateShardPipelineParams local;
+                        if (config_.deepseek_v4)
+                            local.swiglu_activation = config_.deepseek_v4->layer(layer_idx).routedSwiGLU;
                         local.family = declaration->family();
                         local.runtime = runtime;
                         local.kernel_owner = routed_pipeline_kernel_owner;
@@ -10769,8 +10777,8 @@ namespace llaminar2
                     local_params.d_model = config_.d_model;
                     local_params.expert_intermediate = expert_intermediate;
                     local_params.layer_idx = layer_idx;
-                    local_params.swiglu_limit = config_.deepseek_v4
-                        ? config_.deepseek_v4->layer(layer_idx).swigluLimit : 0.0f;
+                    local_params.swiglu_activation = config_.deepseek_v4
+                        ? config_.deepseek_v4->layer(layer_idx).routedSwiGLU : ExpertSwiGLUActivationPolicy{};
                     local_params.expert_mask = std::move(participant_mask);
                     local_params.prepared_store = prepared_weight_store_;
                     local_params.physical_memory_authority = prepared_weight_store_
@@ -11835,8 +11843,8 @@ namespace llaminar2
                             local_params.d_model = config_.d_model;
                             local_params.expert_intermediate = expert_intermediate;
                             local_params.layer_idx = layer_idx;
-                            local_params.swiglu_limit = config_.deepseek_v4
-                                ? config_.deepseek_v4->layer(layer_idx).swigluLimit : 0.0f;
+                            local_params.swiglu_activation = config_.deepseek_v4
+                                ? config_.deepseek_v4->layer(layer_idx).routedSwiGLU : ExpertSwiGLUActivationPolicy{};
                             local_params.expert_mask = std::move(participant_mask);
                             local_params.prepared_store = prepared_weight_store_;
                             local_params.physical_memory_authority = prepared_weight_store_
@@ -14330,8 +14338,8 @@ namespace llaminar2
 
             SharedExpertFFNStage::Params shared_params;
             shared_params.device_id = shared_device;
-            shared_params.swiglu_limit = config_.deepseek_v4
-                ? config_.deepseek_v4->layer(layer_idx).sharedSwigluLimit : 0.0f;
+            shared_params.swiglu_activation = config_.deepseek_v4
+                ? config_.deepseek_v4->layer(layer_idx).sharedSwiGLU : ExpertSwiGLUActivationPolicy{};
             shared_params.input = buffers.normalized;
             shared_params.gate_w = layer.shared_expert_gate;
             shared_params.up_w = layer.shared_expert_up;

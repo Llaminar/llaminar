@@ -10,6 +10,8 @@
  * boundary, and this partial operation supplies no complete-FFN timing evidence.
  */
 #pragma once
+
+#include "kernels/common/ExpertSwiGLUActivationPolicy.h"
 #include "execution/moe/GPUExpertIntermediateTiling.h"
 #include "execution/config/RoutedExpertPolicy.h"
 #include "execution/moe/MoEGroupedPlanDemand.h"
@@ -52,6 +54,7 @@ namespace llaminar2
         std::shared_ptr<MoERoutedPipelineKernelOwner> kernel_owner;
         int rows = 0;
         int top_k = 0;
+        ExpertSwiGLUActivationPolicy swiglu_activation;
         MoEIntermediateShardRowMode row_mode = MoEIntermediateShardRowMode::Grouped;
         LocalGPUExpertKernelPolicy verifier_kernel_policy = LocalGPUExpertKernelPolicy::Generic;
         MoEGateUpPublicationPolicy gate_up_publication=MoEGateUpPublicationPolicy::Staged; ///< Explicit ordinary native M1 tile publication; other paths remain Staged.

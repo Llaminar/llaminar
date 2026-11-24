@@ -16838,14 +16838,21 @@ void rocm_moe_finalize_canonical_publication_kernel(
 __global__ void rocm_moe_swiglu_kernel(
     float *__restrict__ gate,
     const float *__restrict__ up,
-    int count)
+    int count, float swiglu_limit)
 {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= count) return;
 
     const float g = gate[idx];
     gate[idx] =
-        llaminar2::rocm::decode_equivalent::swigluValue(g, up[idx]);
+        llaminar2::rocm::decode_equivalent::swigluValue(g, up[idx], swiglu_limit);
+}
+
+__global__ void rocm_moe_clamp_swiglu_operands_kernel(float *gate, float *up, int count, float limit)
+{
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < count)
+        llaminar2::device_swiglu_contract::clampOperands(gate[idx], up[idx], limit);
 }
 
 // =========================================================================
@@ -18659,10 +18666,23 @@ bool rocmMoE_finalize_canonical_publication(
     return true;
 }
 
+bool hipMoE_clamp_swiglu_operands(float *gate, float *up, int count,
+                                int device_idx, void *stream, float limit)
+{
+    if (!gate || !up || count <= 0 || !stream)
+        return false;
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    constexpr int threads = 256;
+    hipLaunchKernelGGL(rocm_moe_clamp_swiglu_operands_kernel,
+        dim3((count - 1) / threads + 1), dim3(threads), 0, static_cast<hipStream_t>(stream),
+        gate, up, count, limit);
+    return hipGetLastError() == hipSuccess;
+}
+
 bool hipMoE_swiglu(
     float *gate, const float *up,
     int count,
-    int device_idx, void *stream)
+    int device_idx, void *stream, float swiglu_limit)
 {
     llaminar2::HipDeviceGuard::setDevice(device_idx);
     (void)hipGetLastError();
@@ -18673,7 +18693,7 @@ bool hipMoE_swiglu(
 
     hipLaunchKernelGGL(rocm_moe_swiglu_kernel,
         dim3(blocks), dim3(threads), 0, static_cast<hipStream_t>(stream),
-        gate, up, count);
+        gate, up, count, swiglu_limit);
 
     hipError_t err = hipGetLastError();
     if (err != hipSuccess)
@@ -22399,7 +22419,7 @@ void rocm_grouped_floating_swiglu_down_decode_kernel(
     int d_model,
     int intermediate,
     int num_experts,
-    llaminar2::DeviceMoEWeightFormat format)
+    llaminar2::DeviceMoEWeightFormat format, float swiglu_limit)
 {
     __shared__ float sums[kFloatingMoEThreads];
     const int n = static_cast<int>(blockIdx.x);
@@ -22434,7 +22454,7 @@ void rocm_grouped_floating_swiglu_down_decode_kernel(
                 const float up = up_rows[route][k];
                 const float swiglu =
                     llaminar2::rocm::decode_equivalent::swigluValue(
-                        gate, up);
+                        gate, up, swiglu_limit);
                 sum = fmaf(
                     swiglu,
                     rocm_load_floating_moe_weight(
@@ -22502,7 +22522,7 @@ void rocm_grouped_floating_gate_up_swiglu_prefill_kernel(
     int intermediate,
     int d_model,
     int num_experts,
-    llaminar2::DeviceMoEWeightFormat format)
+    llaminar2::DeviceMoEWeightFormat format, float swiglu_limit)
 {
     namespace warp = llaminar2::device_moe_floating_warp;
     const int lane = threadIdx.x % warp::width;
@@ -22550,7 +22570,7 @@ void rocm_grouped_floating_gate_up_swiglu_prefill_kernel(
     if (lane == 0)
     {
         const size_t index = static_cast<size_t>(grouped_slot) * intermediate + n;
-        grouped_swiglu[index] = ready ? llaminar2::rocm::decode_equivalent::swigluValue(gate_sum, up_sum) : 0.0f;
+        grouped_swiglu[index] = ready ? llaminar2::rocm::decode_equivalent::swigluValue(gate_sum, up_sum, swiglu_limit) : 0.0f;
     }
 }
 
@@ -24050,7 +24070,7 @@ __attribute__((visibility("default"))) bool rocmMoE_grouped_swiglu_down_floating
     int num_experts,
     llaminar2::DeviceMoEWeightFormat format,
     int device_idx,
-    void *stream)
+    void *stream, float swiglu_limit)
 {
     if (!gate_rows || !up_rows || !down_descs || !expert_ids ||
         !route_weights || (!output && !canonical_routes) ||
@@ -24082,7 +24102,7 @@ __attribute__((visibility("default"))) bool rocmMoE_grouped_swiglu_down_floating
         d_model,
         intermediate,
         num_experts,
-        format);
+        format, swiglu_limit);
 
     const hipError_t err = hipGetLastError();
     if (err != hipSuccess)
@@ -24122,7 +24142,7 @@ __attribute__((visibility("default"))) bool rocmMoE_grouped_floating_prefill_pip
     llaminar2::DeviceMoEWeightFormat format,
     int device_idx,
     void *stream,
-    const llaminar2::MoEPrefillProjectionExecution &execution)
+    const llaminar2::MoEPrefillProjectionExecution &execution, float swiglu_limit)
 {
     if ((execution.executesGateUp() && (!hidden || !gate_descs || !up_descs)) ||
         (execution.executesDown() && (!down_descs || !grouped_weights ||
@@ -24162,7 +24182,7 @@ __attribute__((visibility("default"))) bool rocmMoE_grouped_floating_prefill_pip
             intermediate,
             d_model,
             num_experts,
-            format);
+            format, swiglu_limit);
         hipError_t err = hipGetLastError();
         if (err != hipSuccess)
         {

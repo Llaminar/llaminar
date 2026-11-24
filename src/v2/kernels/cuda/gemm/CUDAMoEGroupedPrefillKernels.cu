@@ -1326,32 +1326,14 @@ namespace
         }
     }
 
-    /** @brief Clamp-free or DeepSeek-V4-clamped SwiGLU value for one weight codebook.
-     * The non-clamped path is compiled as a separate specialization so the
-     * shared IMMA schedule keeps its original register budget on every arch
-     * that carries no clamp (e.g. sm_121), while the clamped path stays
-     * available for DeepSeek-V4's MXFP4 codebook. */
-    template <bool Clamp>
-    __device__ __forceinline__ float swigluValueWithClamp(
-        float gate, float up, float limit)
-    {
-        if constexpr (Clamp)
-            return llaminar2::device_swiglu_contract::swigluValue(gate, up, limit);
-        else
-        {
-            (void)limit;
-            return llaminar2::device_swiglu_contract::swigluValue(gate, up);
-        }
-    }
-
     /**
      * @brief Execute the proven sixteen-row paired gate/up schedule.
      *
      * A warp owns eight output columns for both projections. It decodes the two
      * B fragments into disjoint shared ranges, loads the common A fragment once,
      * and evaluates the fixed partition tree without an intervening
-     * publication. Only the exact SwiGLU value enters shared memory for the
-     * unchanged 32-column blockwise quantizer.
+     * publication. The clamped epilogue stages both projections in shared memory
+     * so its activation work does not extend the MMA register lifetimes.
      */
     template <uint8_t CodebookId, int ColumnsPerBlock, bool Clamp>
     __global__ __launch_bounds__(
@@ -1438,9 +1420,11 @@ namespace
             CodebookId == 13 && ColumnsPerBlock == 32;
         constexpr int kStagedMetadataWords =
             kStageIQ2SMetadata ? 2 * kScaleColumns + kRows : 0;
-        __shared__ __align__(16) uint32_t shared_storage[
-            Geometry::gate_up_shared_bytes / sizeof(uint32_t) +
-            kStagedMetadataWords];
+        constexpr int kProjectionWords = kRows * ColumnsPerBlock;
+        constexpr int kSharedWords = Clamp ? 2 * kProjectionWords
+                                           : Geometry::gate_up_shared_bytes / sizeof(uint32_t);
+        static_assert(kSharedWords * sizeof(uint32_t) >= Geometry::gate_up_operand_bytes);
+        __shared__ __align__(16) uint32_t shared_storage[kSharedWords + kStagedMetadataWords];
         auto *shared_bytes = reinterpret_cast<int8_t *>(shared_storage);
         int8_t *shared_a = shared_bytes;
         constexpr int kWarpWeightBytes = kColumnsPerWarp * kQuantBlock;
@@ -1453,7 +1437,7 @@ namespace
 
         uint32_t *shared_gate_scale_pairs =
             shared_storage +
-            Geometry::gate_up_shared_bytes / sizeof(uint32_t);
+            kSharedWords;
         uint32_t *shared_up_scale_pairs =
             shared_gate_scale_pairs + kScaleColumns;
         float *shared_activation_scales = reinterpret_cast<float *>(
@@ -1821,13 +1805,17 @@ namespace
                 static_cast<int>(blockIdx.x) * ColumnsPerBlock + local_column;
             if (local_row < active_rows && column < N)
             {
-                // Keep the paired schedule byte-identical to serial decode and
-                // to the parallel gate/up schedule for every weight codebook.
-                shared_values[local_row * ColumnsPerBlock + local_column] =
-                    swigluValueWithClamp<Clamp>(
-                        gate_total[element],
-                        up_total[element],
-                        swiglu_limit);
+                const int index = local_row * ColumnsPerBlock + local_column;
+                if constexpr (Clamp)
+                {
+                    shared_values[index] = gate_total[element];
+                    shared_values[kProjectionWords + index] = up_total[element];
+                }
+                else
+                {
+                    shared_values[index] = llaminar2::device_swiglu_contract::swigluValue(
+                        gate_total[element], up_total[element]);
+                }
             }
         }
         __syncthreads();
@@ -1848,9 +1836,16 @@ namespace
             const int fragment_index =
                 local_row * ColumnsPerBlock +
                 local_quant_block * kQuantBlock + lane;
-            const float value = quant_column_active
-                                    ? shared_values[fragment_index]
-                                    : 0.0f;
+            float value = 0.0f;
+            if (quant_column_active)
+            {
+                if constexpr (Clamp)
+                    value = llaminar2::device_swiglu_contract::swigluValue(
+                        shared_values[fragment_index],
+                        shared_values[kProjectionWords + fragment_index], swiglu_limit);
+                else
+                    value = shared_values[fragment_index];
+            }
             float abs_value =
                 llaminar2::device_q8_activation_contract::maximumAbsoluteValue(
                     value, 0.0f);
@@ -2012,7 +2007,7 @@ namespace
     /** Launch one paired gate/up specialization when its mask bit exists.
      * @tparam Clamp Whether this codebook can carry DeepSeek-V4's operand clamp;
      *        non-clamped instantiation keeps the original register budget. */
-    template <uint8_t CodebookId, int ColumnsPerBlock, bool Clamp>
+    template <uint8_t CodebookId, int ColumnsPerBlock>
     bool launchCodebookPairedGateUpSwiGlu(
         uint32_t codebook_mask,
         const dim3 &grid,
@@ -2038,38 +2033,32 @@ namespace
     {
         if ((codebook_mask & (uint32_t{1} << CodebookId)) == 0)
             return true;
-        if constexpr (Clamp)
+        if (swiglu_limit > 0.0f)
         {
-            // DeepSeek-V4's clamp applies only to its MXFP4 codebook; the
-            // clamped specialization keeps its own register budget, while the
-            // ordinary path below stays identical to the unclamped build.
-            if (swiglu_limit > 0.0f)
-            {
-                groupedImmaPairedGateUpSwiGluKernel<CodebookId, ColumnsPerBlock, true><<<
-                    grid,
-                    PairedGateUpGeometry<ColumnsPerBlock>::gate_up_threads,
-                    0,
-                    stream>>>(
-                    A_int8,
-                    scales_A,
-                    source_rows,
-                    gate_descriptors,
-                    up_descriptors,
-                    group_counts,
-                    group_offsets,
-                    directory,
-                    swiglu_int8,
-                    swiglu_scales,
-                    directory_entries,
-                    num_experts,
-                    total_slots,
-                    N,
-                    K,
-                    k_partitions,
-                    swiglu_limit);
-                launched = true;
-                return cudaGetLastError() == cudaSuccess;
-            }
+            groupedImmaPairedGateUpSwiGluKernel<CodebookId, ColumnsPerBlock, true><<<
+                grid,
+                PairedGateUpGeometry<ColumnsPerBlock>::gate_up_threads,
+                0,
+                stream>>>(
+                A_int8,
+                scales_A,
+                source_rows,
+                gate_descriptors,
+                up_descriptors,
+                group_counts,
+                group_offsets,
+                directory,
+                swiglu_int8,
+                swiglu_scales,
+                directory_entries,
+                num_experts,
+                total_slots,
+                N,
+                K,
+                k_partitions,
+                swiglu_limit);
+            launched = true;
+            return cudaGetLastError() == cudaSuccess;
         }
         groupedImmaPairedGateUpSwiGluKernel<CodebookId, ColumnsPerBlock, false><<<
             grid,
@@ -2256,8 +2245,7 @@ namespace
 #define LAUNCH_PAIRED_GATE_UP_CODEBOOK(CB)                                      \
     do                                                                           \
     {                                                                            \
-        if (!launchCodebookPairedGateUpSwiGlu<CB, ColumnsPerBlock,              \
-                CB == llaminar2::kNativeQuantisedMXFP4Codebook>(                 \
+        if (!launchCodebookPairedGateUpSwiGlu<CB, ColumnsPerBlock>(               \
                 codebook_mask, grid, stream, A_int8, scales_A, source_rows,     \
                 gate_descriptors, up_descriptors, group_counts, group_offsets,  \
                 directory, swiglu_int8, swiglu_scales, directory_entries,       \

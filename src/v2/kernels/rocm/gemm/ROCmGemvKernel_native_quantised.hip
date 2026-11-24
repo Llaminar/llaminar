@@ -2714,7 +2714,7 @@ __global__ void moe_grouped_swiglu_quantize_blockwise_kernel(
     int8_t* __restrict__ A_int8,
     float* __restrict__ scales_A_blockwise,
     int num_active,
-    int K)
+    int K, float swiglu_limit)
 {
     const int slot = blockIdx.x;
     if (slot >= num_active) return;
@@ -2737,7 +2737,7 @@ __global__ void moe_grouped_swiglu_quantize_blockwise_kernel(
         const float g = gate[k_start + lane];
         const float u = up[k_start + lane];
         const float val =
-            llaminar2::rocm::decode_equivalent::swigluValue(g, u);
+            llaminar2::rocm::decode_equivalent::swigluValue(g, u, swiglu_limit);
 
         float abs_val = fabsf(val);
         #pragma unroll
@@ -4552,7 +4552,7 @@ __device__ __forceinline__ void moeGateUpOriginalFoldSwiGLUQ8Task(
     uint64_t policy_partitions_8_15,
     uint64_t policy_partitions_16_23,
     uint64_t policy_partitions_24_31,
-    unsigned logical_tile,unsigned logical_route,unsigned logical_lane)
+    unsigned logical_tile,unsigned logical_route,unsigned logical_lane, float swiglu_limit)
 {
     static_assert(Loads==MoEGateUpFoldLoads::Original||Loads==MoEGateUpFoldLoads::TwoPartialLookahead);
     constexpr int TILE_N = 64;
@@ -4648,7 +4648,7 @@ __device__ __forceinline__ void moeGateUpOriginalFoldSwiGLUQ8Task(
 
     const float swiglu = active_lane
                              ? llaminar2::rocm::decode_equivalent::swigluValue(
-                                   gate_sum, up_sum)
+                                   gate_sum, up_sum, swiglu_limit)
                              : 0.0f;
     float block_abs_max = fabsf(swiglu);
     #pragma unroll
@@ -4694,11 +4694,11 @@ moe_grouped_native_quantised_gate_up_descriptor_reduce_swiglu_q8_kernel(
     uint64_t policy_partitions_0_7,
     uint64_t policy_partitions_8_15,
     uint64_t policy_partitions_16_23,
-    uint64_t policy_partitions_24_31)
+    uint64_t policy_partitions_24_31, float swiglu_limit)
 {
     moeGateUpOriginalFoldSwiGLUQ8Task<RUNTIME_TABLE>(
         gate_partials, up_partials, gate_descs, up_descs, runtime, expert_ids, swiglu_int8, swiglu_scales, num_active, N, num_experts, policy_partitions_0_7, policy_partitions_8_15, policy_partitions_16_23, policy_partitions_24_31,
-        blockIdx.x,blockIdx.y,threadIdx.x);
+        blockIdx.x,blockIdx.y,threadIdx.x, swiglu_limit);
 }
 
 /**
@@ -4726,7 +4726,7 @@ __device__ __forceinline__ void moeGateUpLastProducerBody(
     uint64_t policy_partitions_16_23,
     uint64_t policy_partitions_24_31,
     int maximum_k_partitions,
-    int8_t* swiglu_int8,float* swiglu_scales,llaminar2::NativeTileCompletionView completion)
+    int8_t* swiglu_int8,float* swiglu_scales,llaminar2::NativeTileCompletionView completion, float swiglu_limit)
 {
     using llaminar2::NativeTileCompletionDecision;
     const unsigned tiles=(static_cast<unsigned>(N)+63u)/64u;
@@ -4756,7 +4756,7 @@ __device__ __forceinline__ void moeGateUpLastProducerBody(
         gate_partials,up_partials,gate_descs,up_descs,nullptr,expert_ids,
         swiglu_int8,swiglu_scales,num_active,N,num_experts,
         policy_partitions_0_7,policy_partitions_8_15,policy_partitions_16_23,policy_partitions_24_31,
-        blockIdx.x,blockIdx.y,threadIdx.x);
+        blockIdx.x,blockIdx.y,threadIdx.x, swiglu_limit);
     // Invalid routes still discharge and reset their protocol without reading
     // stale Q8 bytes. All valid publication writes finish before reset/reuse.
     __syncthreads();
@@ -4782,11 +4782,11 @@ __global__ __launch_bounds__(64) void moe_grouped_native_quantised_gate_up_last_
     uint64_t policy_partitions_16_23,
     uint64_t policy_partitions_24_31,
     int maximum_k_partitions,
-    int8_t* swiglu_int8,float* swiglu_scales,llaminar2::NativeTileCompletionView completion)
+    int8_t* swiglu_int8,float* swiglu_scales,llaminar2::NativeTileCompletionView completion, float swiglu_limit)
 {
     moeGateUpLastProducerBody<false>(A_int8,scales_A_blockwise,gate_descs,up_descs,runtime,expert_ids,gate_partials,up_partials,
         num_active,N,K,num_experts,policy_partitions_0_7,policy_partitions_8_15,
-        policy_partitions_16_23,policy_partitions_24_31,maximum_k_partitions,swiglu_int8,swiglu_scales,completion);
+        policy_partitions_16_23,policy_partitions_24_31,maximum_k_partitions,swiglu_int8,swiglu_scales,completion, swiglu_limit);
 }
 
 /** @brief Same exact original64-thread completion with paired K32 activation/sum consumption. */
@@ -4808,11 +4808,11 @@ __global__ __launch_bounds__(64) void moe_grouped_native_quantised_gate_up_paire
     uint64_t policy_partitions_16_23,
     uint64_t policy_partitions_24_31,
     int maximum_k_partitions,
-    int8_t* swiglu_int8,float* swiglu_scales,llaminar2::NativeTileCompletionView completion)
+    int8_t* swiglu_int8,float* swiglu_scales,llaminar2::NativeTileCompletionView completion, float swiglu_limit)
 {
     moeGateUpLastProducerBody<true>(A_int8,scales_A_blockwise,gate_descs,up_descs,runtime,expert_ids,gate_partials,up_partials,
         num_active,N,K,num_experts,policy_partitions_0_7,policy_partitions_8_15,
-        policy_partitions_16_23,policy_partitions_24_31,maximum_k_partitions,swiglu_int8,swiglu_scales,completion);
+        policy_partitions_16_23,policy_partitions_24_31,maximum_k_partitions,swiglu_int8,swiglu_scales,completion, swiglu_limit);
 }
 
 /**
@@ -5301,7 +5301,7 @@ __global__ __launch_bounds__(256,1) void rocmResidentMoEFFNKernel(const llaminar
                 const float g=residentMoEOrderedPartial(a.gate_partials,route,n,routes,F,residentMoEPartitions(gate,gate_policy,gate_execution));
                 const float u=residentMoEOrderedPartial(a.up_partials,route,n,routes,F,residentMoEPartitions(up,gate_policy,gate_execution));
                 if(shared){a.shared_gate_output[n]=g;a.shared_up_output[n]=u;}
-                value=llaminar2::rocm::decode_equivalent::swigluValue(g,u);
+                value=llaminar2::rocm::decode_equivalent::swigluValue(g,u,shared?a.shared_swiglu_limit:a.routed_swiglu_limit);
             }
             float maximum=fabsf(value);
             #pragma unroll
@@ -7358,7 +7358,7 @@ bool rocmMoE_grouped_gate_up_native_quantised_decode_table(
     uint32_t policy_codebook_mask,
     int device_id,
     void* stream,
-    const llaminar2::NativeTileCompletionView* completion)
+    const llaminar2::NativeTileCompletionView* completion, float swiglu_limit)
 {
     llaminar2::HipDeviceGuard::setDevice(device_id);
 
@@ -7427,7 +7427,7 @@ bool rocmMoE_grouped_gate_up_native_quantised_decode_table(
             static_cast<const DeviceMoELayerRuntimeView*>(nullptr),d_expert_ids,d_gate_partials,d_up_partials,
             num_active,N,K,num_experts,policy_table.k_partitions_0_7,policy_table.k_partitions_8_15,
             policy_table.k_partitions_16_23,policy_table.k_partitions_24_31,int(policy_table.maximum_k_partitions),
-            d_fused_swiglu_int8,d_fused_swiglu_scales,*completion);
+            d_fused_swiglu_int8,d_fused_swiglu_scales,*completion, swiglu_limit);
         }
         else
         {
@@ -7437,7 +7437,7 @@ bool rocmMoE_grouped_gate_up_native_quantised_decode_table(
             static_cast<const DeviceMoELayerRuntimeView*>(nullptr),d_expert_ids,d_gate_partials,d_up_partials,
             num_active,N,K,num_experts,policy_table.k_partitions_0_7,policy_table.k_partitions_8_15,
             policy_table.k_partitions_16_23,policy_table.k_partitions_24_31,int(policy_table.maximum_k_partitions),
-            d_fused_swiglu_int8,d_fused_swiglu_scales,*completion);
+            d_fused_swiglu_int8,d_fused_swiglu_scales,*completion, swiglu_limit);
         }
         return hipGetLastError()==hipSuccess;
     }
@@ -7482,7 +7482,7 @@ bool rocmMoE_grouped_gate_up_native_quantised_decode_table(
             static_cast<const DeviceMoELayerRuntimeView*>(nullptr),d_expert_ids,
             d_fused_swiglu_int8,d_fused_swiglu_scales,num_active,N,num_experts,
             policy_table.k_partitions_0_7,policy_table.k_partitions_8_15,
-            policy_table.k_partitions_16_23,policy_table.k_partitions_24_31);
+            policy_table.k_partitions_16_23,policy_table.k_partitions_24_31, swiglu_limit);
     }
     else
     {
@@ -7658,7 +7658,7 @@ bool rocmMoE_grouped_gate_up_native_quantised_decode_runtime(
  * @return True when the launch was accepted by HIP; false on invalid input or
  *         an immediate launch failure.
  */
-bool rocmMoE_grouped_swiglu_quantize_decode_equivalent(
+bool rocmMoE_grouped_swiglu_quantize_decode_equivalentWithLimit(
     const float* const* d_gate_ptrs,
     const float* const* d_up_ptrs,
     const int* d_expert_ids,
@@ -7667,7 +7667,7 @@ bool rocmMoE_grouped_swiglu_quantize_decode_equivalent(
     int num_active,
     int K,
     int device_id,
-    void* stream)
+    void* stream, float swiglu_limit)
 {
     llaminar2::HipDeviceGuard::setDevice(device_id);
 
@@ -7686,7 +7686,7 @@ bool rocmMoE_grouped_swiglu_quantize_decode_equivalent(
         moe_grouped_swiglu_quantize_blockwise_kernel,
         dim3(num_active), dim3(256), 0, static_cast<hipStream_t>(stream),
         d_gate_ptrs, d_up_ptrs, d_expert_ids,
-        d_swiglu_int8, d_swiglu_scales, num_active, K);
+        d_swiglu_int8, d_swiglu_scales, num_active, K, swiglu_limit);
 
     const hipError_t err = hipGetLastError();
     if (err != hipSuccess)
@@ -7698,6 +7698,14 @@ bool rocmMoE_grouped_swiglu_quantize_decode_equivalent(
         return false;
     }
     return true;
+}
+
+bool rocmMoE_grouped_swiglu_quantize_decode_equivalent(
+    const float* const* gate, const float* const* up, const int* experts,
+    int8_t* payload, float* scales, int rows, int K, int device, void* stream)
+{
+    return rocmMoE_grouped_swiglu_quantize_decode_equivalentWithLimit(
+        gate, up, experts, payload, scales, rows, K, device, stream, 0.0f);
 }
 
 bool rocmMoE_grouped_swiglu_down_native_quantised_decode(
@@ -7714,7 +7722,7 @@ bool rocmMoE_grouped_swiglu_down_native_quantised_decode(
     int K,
     uint8_t codebook_id,
     int device_id,
-    void* stream)
+    void* stream, float swiglu_limit)
 {
     llaminar2::HipDeviceGuard::setDevice(device_id);
 
@@ -7739,10 +7747,10 @@ bool rocmMoE_grouped_swiglu_down_native_quantised_decode(
     }
 
     hipStream_t hip_stream = static_cast<hipStream_t>(stream);
-    if (!rocmMoE_grouped_swiglu_quantize_decode_equivalent(
+    if (!rocmMoE_grouped_swiglu_quantize_decode_equivalentWithLimit(
             d_gate_ptrs, d_up_ptrs, nullptr,
             d_swiglu_int8, d_swiglu_scales,
-            num_active, K, device_id, stream))
+            num_active, K, device_id, stream, swiglu_limit))
     {
         fprintf(stderr,
                 "[rocmMoE_grouped_swiglu_down_native_quantised_decode] "
@@ -7884,7 +7892,7 @@ bool rocmMoE_grouped_swiglu_down_native_quantised_decode_table(
     uint32_t policy_codebook_mask,
     int device_id,
     void* stream,
-    const llaminar2::NativeDownCompletionView* completion)
+    const llaminar2::NativeDownCompletionView* completion, float swiglu_limit)
 {
     llaminar2::HipDeviceGuard::setDevice(device_id);
 
@@ -7921,10 +7929,10 @@ bool rocmMoE_grouped_swiglu_down_native_quantised_decode_table(
 
     hipStream_t hip_stream = static_cast<hipStream_t>(stream);
     if (!swiglu_prequantized &&
-        !rocmMoE_grouped_swiglu_quantize_decode_equivalent(
+        !rocmMoE_grouped_swiglu_quantize_decode_equivalentWithLimit(
             d_gate_ptrs, d_up_ptrs, d_expert_ids,
             d_swiglu_int8, d_swiglu_scales,
-            num_active, K, device_id, stream))
+            num_active, K, device_id, stream, swiglu_limit))
     {
         fprintf(stderr,
                 "[rocmMoE_grouped_swiglu_down_native_quantised_decode_table] "
@@ -8015,7 +8023,7 @@ bool rocmMoE_grouped_swiglu_down_native_quantised_decode_runtime(
     uint8_t codebook_id,
     uint32_t policy_codebook_mask,
     int device_id,
-    void* stream)
+    void* stream, float swiglu_limit)
 {
     llaminar2::HipDeviceGuard::setDevice(device_id);
 
@@ -8045,10 +8053,10 @@ bool rocmMoE_grouped_swiglu_down_native_quantised_decode_runtime(
         policy_codebook_mask, policy_table);
 
     hipStream_t hip_stream = static_cast<hipStream_t>(stream);
-    if (!rocmMoE_grouped_swiglu_quantize_decode_equivalent(
+    if (!rocmMoE_grouped_swiglu_quantize_decode_equivalentWithLimit(
             d_gate_ptrs, d_up_ptrs, d_expert_ids,
             d_swiglu_int8, d_swiglu_scales,
-            num_active, K, device_id, stream))
+            num_active, K, device_id, stream, swiglu_limit))
     {
         fprintf(stderr,
                 "[rocmMoE_grouped_swiglu_down_native_quantised_decode_runtime] "

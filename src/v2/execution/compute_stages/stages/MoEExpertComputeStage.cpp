@@ -2214,7 +2214,7 @@ namespace llaminar2
          * own clamp immediately before use, so each launch and each graph capture
          * records this layer's value.
          */
-        moe_kernel_->setSwiGLULimit(params_.swiglu_limit);
+        moe_kernel_->setExpertSwiGLUActivationPolicy(params_.swiglu_activation);
 
         if (params_.device_id.is_gpu() &&
             params_.routed_pipeline_kernel_owner)
@@ -4047,7 +4047,7 @@ namespace llaminar2
                             scratch_up_batch_[info.batch_idx].get(),
                             scratch_out_.get(),
                             down_gemm, /*m=*/1, d_model, intermediate,
-                            getWorkspace(), ensureMoEKernel(), params_.swiglu_limit))
+                            getWorkspace(), ensureMoEKernel(), params_.swiglu_activation.operandLimit()))
                     {
                         LOG_ERROR("[MoEExpertComputeStage] CUDA decode SwiGLU/down projection failed for expert "
                                   << info.expert_id << " layer " << params_.layer_idx);
@@ -4203,13 +4203,13 @@ namespace llaminar2
                      * see one route while another sees several, yet both must
                      * materialize the same logical expert activation bytes.
                      */
-                    if (params_.swiglu_limit > 0.0f)
+                    if (params_.swiglu_activation.clampsOperands())
                     {
                         // DeepSeek-V4: same contract program on clamped operands.
                         for (int c = 0; c < intermediate; ++c)
                             swiglu_scratch_batch_[i][static_cast<size_t>(c)] =
                                 device_swiglu_contract::swigluValue(
-                                    gate_fp32[c], up_fp32[c], params_.swiglu_limit);
+                                    gate_fp32[c], up_fp32[c], params_.swiglu_activation.operandLimit());
                     }
                     else
                     {
@@ -4282,7 +4282,7 @@ namespace llaminar2
                                 /*m=*/1,
                                 d_model,
                                 intermediate,
-                                getWorkspace(), ensureMoEKernel(), params_.swiglu_limit))
+                                getWorkspace(), ensureMoEKernel(), params_.swiglu_activation.operandLimit()))
                         {
                             LOG_ERROR("[MoEExpertComputeStage] Decode SwiGLU/down projection failed for expert "
                                       << info.expert_id << " layer " << params_.layer_idx);
@@ -5343,7 +5343,7 @@ namespace llaminar2
                             bound_workspace_, kCPUProjectionPartials),
                         cpu::native_quantised::FusedOutputJobOwnership::Auto,
                         cpu::native_quantised::FusedOutputJobOwnership::Auto,
-                        params_.swiglu_limit))
+                        params_.swiglu_activation.operandLimit()))
             {
                 LOG_ERROR("[MoEExpertComputeStage] CPU NativeQuantised layer-batched "
                           "grouped FFN transaction failed in layer "
@@ -5455,10 +5455,10 @@ namespace llaminar2
                 }
 
                 // Both down variants consume these materialized rows: clamp once.
-                if (params_.swiglu_limit > 0.0f &&
+                if (params_.swiglu_activation.clampsOperands() &&
                     !ensureMoEKernel()->clampSwiGLUOperands(
                         grouped_scratch_gate.get(), grouped_scratch_up.get(),
-                        expert_rows * intermediate, params_.swiglu_limit))
+                        expert_rows * intermediate, params_.swiglu_activation.operandLimit()))
                 {
                     LOG_ERROR("[MoEExpertComputeStage] CPU grouped-row SwiGLU operand clamp failed"
                               << " layer=" << params_.layer_idx);
@@ -7067,7 +7067,8 @@ namespace llaminar2
                       "shared grouped verifier setup failed");
             return false;
         }
-        if (!kernel->executeGroupedPrefillPipeline(
+        kernel->setExpertSwiGLUActivationPolicy(params_.shared_swiglu_activation);
+        const bool shared_ok = kernel->executeGroupedPrefillPipeline(
                 params_.input,
                 combined_shared_output_.get(),
                 combined_shared_gateup_desc_table_id_,
@@ -7076,7 +7077,9 @@ namespace llaminar2
                 d_model,
                 intermediate,
                 /*num_experts=*/1,
-                /*top_k=*/1))
+                /*top_k=*/1);
+        kernel->setExpertSwiGLUActivationPolicy(params_.swiglu_activation);
+        if (!shared_ok)
         {
             LOG_ERROR("[MoEExpertComputeStage::executeSafeCombinedSharedVerifierComposite] "
                       "shared grouped verifier failed");
@@ -10027,8 +10030,9 @@ namespace llaminar2
             if(moe_kernel_)(void)moe_kernel_->originalM1HiddenQ8BindingSignature();
             signature=(signature^0x4d31513800000001ULL)*kFNV1a64Prime;
         }
-        if (!signature) return 0;
+        if (!signature && !params_.swiglu_activation.clampsOperands()) return 0;
         const auto mix = [&](uint64_t value) { signature = (signature ^ value) * kFNV1a64Prime; };
+        mix(params_.swiglu_activation.captureWord());
         mix(params_.seq_len); mix(params_.d_model); mix(params_.intermediate);
         mix(params_.force_grouped_verifier_prefill_for_decode); mix(params_.force_decode_equivalent_verifier_prefill);
         mix(params_.disable_grouped_decode_shortcut);
@@ -10514,9 +10518,9 @@ namespace llaminar2
                 execution.publish(projection.output);
         }
 
-        if (params_.swiglu_limit > 0.0f &&
+        if (params_.swiglu_activation.clampsOperands() &&
             !ensureMoEKernel()->clampSwiGLUOperands(
-                scratch_gate_, scratch_up_, params_.seq_len * intermediate, params_.swiglu_limit))
+                scratch_gate_, scratch_up_, params_.seq_len * intermediate, params_.swiglu_activation.operandLimit()))
         {
             LOG_ERROR("[SharedExpertFFNStage] Shared SwiGLU operand clamp failed");
             return false;
@@ -10765,7 +10769,7 @@ namespace llaminar2
                 *this,
                 scratch_gate_, scratch_up_, params_.output,
                 cached_down_gemm_, seq_len, d_model, intermediate,
-                getWorkspace(), ensureMoEKernel(), params_.swiglu_limit))
+                getWorkspace(), ensureMoEKernel(), params_.swiglu_activation.operandLimit()))
         {
             LOG_ERROR("[SharedExpertFFNStage] Shared SwiGLU/down projection failed");
             return false;
@@ -10783,7 +10787,7 @@ namespace llaminar2
         }
         // Grouped shared-expert routes evaluate SwiGLU inside this kernel.
         if (moe_kernel_)
-            moe_kernel_->setSwiGLULimit(params_.swiglu_limit);
+            moe_kernel_->setExpertSwiGLUActivationPolicy(params_.swiglu_activation);
         if (params_.device_id.is_gpu() && params_.required_router_q8_publication&&
             (shouldUseGroupedVerifierPrefillRoute()||params_.required_router_q8_publication->requiredOriginalM1Source()))
         {

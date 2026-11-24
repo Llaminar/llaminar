@@ -11,6 +11,8 @@
  */
 
 #pragma once
+
+#include "kernels/common/ExpertSwiGLUActivationPolicy.h"
 #include "../../../loaders/ExpertGemmRegistry.h"
 #include "../../moe/MoEOverlayParticipantResidency.h"
 
@@ -326,7 +328,7 @@ namespace llaminar2
             TensorBase *down_exps = nullptr; ///< [num_experts, d_model, intermediate]
             int expert_intermediate = 0;
             /// DeepSeek-V4 SwiGLU operand clamp (`swiglu_clamp_exp`); 0 = plain SwiGLU.
-            float swiglu_limit = 0.0f;
+            ExpertSwiGLUActivationPolicy swiglu_activation;
 
             /**
              * @brief Authority used to resolve executable expert matrices.
@@ -506,6 +508,7 @@ namespace llaminar2
              * layer when this is enabled.
              */
             bool combine_shared_expert_in_verifier = false;
+            ExpertSwiGLUActivationPolicy shared_swiglu_activation;
             TensorBase *shared_gate_w = nullptr;
             TensorBase *shared_up_w = nullptr;
             TensorBase *shared_down_w = nullptr;
@@ -2088,7 +2091,7 @@ namespace llaminar2
             SharedExpertOutputRole output_role = SharedExpertOutputRole::CompleteContribution;
             MoEOverlayServicePhaseHint phase = MoEOverlayServicePhaseHint::Auto; ///< Required for a local-partial graph.
             /// DeepSeek-V4 SwiGLU operand clamp (`swiglu_clamp_shexp`); 0 = plain SwiGLU.
-            float swiglu_limit = 0.0f;
+            ExpertSwiGLUActivationPolicy swiglu_activation;
 
             BufferId input_buffer_id = BufferId::NORMALIZED;
             BufferId output_buffer_id = BufferId::MOE_SHARED_EXPERT_OUTPUT;

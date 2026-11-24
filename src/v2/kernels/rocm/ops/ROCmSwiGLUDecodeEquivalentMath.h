@@ -43,9 +43,9 @@ namespace llaminar2::rocm::decode_equivalent
  * @param up The corresponding up-projection value.
  * @return `silu(gate) * up` with the serial-decode operation sequence.
  */
-__device__ __forceinline__ float swigluValue(float gate, float up)
+__device__ __forceinline__ float swigluValue(float gate, float up, float limit = 0.0f)
 {
-    return llaminar2::device_swiglu_contract::swigluValue(gate, up);
+    return llaminar2::device_swiglu_contract::swigluValue(gate, up, limit);
 }
 
 /**

@@ -657,7 +657,7 @@ __device__ __forceinline__ void routedGateUp(const NativeLayoutRouterFFNArgs& ar
                 g=orderedWorkerZeroFold(g,waveMetadataValue(gate.parts),geometry,lane&3u,lane);
                 u=orderedWorkerZeroFold(u,waveMetadataValue(up.parts),geometry,lane&3u,lane);
                 if(lane<4&&local<count)
-                    a.gate_partials[std::size_t(route)*F+n]=decode_equivalent::swigluValue(g,u);
+                    a.gate_partials[std::size_t(route)*F+n]=decode_equivalent::swigluValue(g,u,a.routed_swiglu_limit);
             }
             // Covers record reuse for a later route as well as a later tile.
             if(last-tile>panel_rows||routes-route>cohorts)workgroupJoin<WorkgroupJoinMemory::LDSOnly>();
@@ -757,7 +757,7 @@ __device__ __forceinline__ void sharedItem(const NativeLayoutRouterFFNArgs& args
             const unsigned n=first+lane;
             if(output_demand.contains(FullNativeHCFFNOutputRole::SharedGate))a.shared_gate_output[n]=g;
             if(output_demand.contains(FullNativeHCFFNOutputRole::SharedUp))a.shared_up_output[n]=u;
-            a.gate_partials[std::size_t(a.top_k)*a.routed_columns+n]=decode_equivalent::swigluValue(g,u);
+            a.gate_partials[std::size_t(a.top_k)*a.routed_columns+n]=decode_equivalent::swigluValue(g,u,a.shared_swiglu_limit);
         }
     } else {
         const unsigned column=lane&3u,part=lane>>2,n=first+column;
@@ -771,7 +771,7 @@ __device__ __forceinline__ void sharedItem(const NativeLayoutRouterFFNArgs& args
         if(lane<rows) {
             if(output_demand.contains(FullNativeHCFFNOutputRole::SharedGate))a.shared_gate_output[n]=g;
             if(output_demand.contains(FullNativeHCFFNOutputRole::SharedUp))a.shared_up_output[n]=u;
-            a.gate_partials[std::size_t(a.top_k)*a.routed_columns+n]=decode_equivalent::swigluValue(g,u);
+            a.gate_partials[std::size_t(a.top_k)*a.routed_columns+n]=decode_equivalent::swigluValue(g,u,a.shared_swiglu_limit);
         }
     }
 }

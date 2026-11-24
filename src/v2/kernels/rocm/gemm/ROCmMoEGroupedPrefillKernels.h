@@ -85,7 +85,7 @@ bool rocmMoE_grouped_prefill_pipeline(
     llaminar2::rocm::MoEGroupedPrefillSubmission *submitted = nullptr,
     llaminar2::rocm::MoEGroupedSourceTuple singleton_sources = {},
     const llaminar2::MoEPrefillGroupingProvenance::DirectoryBorrow *grouping_directory = nullptr,
-    llaminar2::rocm::MoEGroupedSourceTuple routed_sources = {});
+    llaminar2::rocm::MoEGroupedSourceTuple routed_sources = {}, float swiglu_limit = 0.0f);
 
 /**
  * @brief Fold already-weighted route outputs in the original router order.

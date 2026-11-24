@@ -45,8 +45,8 @@ namespace llaminar2
 
         /** @copydoc IMoEKernel::setRouterScoringPolicy */
         void setRouterScoringPolicy(const MoERouterScoringPolicy &policy) override { router_scoring_ = policy; }
-        /** @copydoc IMoEKernel::setSwiGLULimit */
-        void setSwiGLULimit(float limit) override { swiglu_limit_ = limit; }
+        /** @copydoc IMoEKernel::setExpertSwiGLUActivationPolicy */
+        void setExpertSwiGLUActivationPolicy(ExpertSwiGLUActivationPolicy policy) override { swiglu_limit_ = policy.operandLimit(); }
         /** @copydoc IMoEKernel::clampSwiGLUOperands */
         bool clampSwiGLUOperands(ITensor *gate, ITensor *up, int count, float limit) override;
 
