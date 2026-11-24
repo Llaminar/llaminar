@@ -215,7 +215,7 @@ namespace llaminar2::cpu::native_quantised::x86_panel
          * @brief Consume a reusable panel with independent row dots and unchanged FP rounding.
          * @tparam Lanes Physical SIMD columns per row.
          * @tparam CB File-density source decoder that wrote the panel.
-         * @tparam Rows Number of independently accumulated rows, one or two.
+         * @tparam Rows Independently accumulated rows: one or two (AVX2), up to four (AVX-512).
          * @tparam P Original FP32 block and partition policy.
          * @param p Worker-local panel of decoded dot groups and widened factors.
          * @param n K blocks in this physical panel; zero for an empty serial partition.
@@ -237,26 +237,61 @@ namespace llaminar2::cpu::native_quantised::x86_panel
             using I = typename Ops::I;
             constexpr int stride = blockFloats(static_cast<Format>(CB), Lanes);
             std::array<F, Rows> acc{};
-#pragma GCC unroll 2
+#pragma GCC unroll 4
             for (int r = 0; r < Rows; ++r)
                 if (!first_panel)
                     acc[r] = fold_earlier ? loadOutput<Lanes>(carry[r], Lanes) : loadOutput<Lanes>(out[r], live);
             for (int i = 0; i < n; ++i, p += stride)
             {
                 I dots[Rows]{};
-#pragma GCC unroll 1
-                for (int g = 0; g < 8; ++g)
+                if constexpr (Lanes == 8)
                 {
-                    const I w = multi_scale::load<I>(p + g * Lanes);
+#pragma GCC unroll 1
+                    for (int g = 0; g < 8; ++g)
+                    {
+                        const I w = multi_scale::load<I>(p + g * Lanes);
+#pragma GCC unroll 4
+                        for (int r = 0; r < Rows; ++r)
+                        {
+                            const int word = multi_scale::load<int>(a[r][i].qs + g * 4);
+                            if constexpr (CB == 5 || CB == 6 || CB == 7)
+                                dots[r] = Ops::dotUnsignedQ5(dots[r], w, I{} + word);
+                            else
+                                dots[r] = Ops::dot(dots[r], w, I{} + word);
+                        }
+                    }
+                }
+                else
+                {
+                    // All eight groups unrolled, with even and odd groups in
+                    // separate INT32 chains: each row's VPDPBUSD sequence is
+                    // no longer one serial dependency, and every panel vector
+                    // feeds all rows of the tile. The exact integer sum is
+                    // order-free, so the dot equals the single-chain result.
+                    I odd[Rows]{};
+                    const auto group = [&]<int G>() {
+                        const I w = multi_scale::load<I>(p + G * Lanes);
+#pragma GCC unroll 4
+                        for (int r = 0; r < Rows; ++r)
+                        {
+                            const I word = I{} + multi_scale::load<int>(a[r][i].qs + G * 4);
+                            if constexpr (G % 2 == 0)
+                                dots[r] = Ops::dot(dots[r], w, word);
+                            else
+                                odd[r] = Ops::dot(odd[r], w, word);
+                        }
+                    };
+                    group.template operator()<0>();
+                    group.template operator()<1>();
+                    group.template operator()<2>();
+                    group.template operator()<3>();
+                    group.template operator()<4>();
+                    group.template operator()<5>();
+                    group.template operator()<6>();
+                    group.template operator()<7>();
 #pragma GCC unroll 4
                     for (int r = 0; r < Rows; ++r)
-                    {
-                        const int word = multi_scale::load<int>(a[r][i].qs + g * 4);
-                        if constexpr (Lanes == 8 && (CB == 5 || CB == 6 || CB == 7))
-                            dots[r] = Ops::dotUnsignedQ5(dots[r], w, I{} + word);
-                        else
-                            dots[r] = Ops::dot(dots[r], w, I{} + word);
-                    }
+                        dots[r] += odd[r];
                 }
 #pragma GCC unroll 4
                 for (int r = 0; r < Rows; ++r)
@@ -295,7 +330,7 @@ namespace llaminar2::cpu::native_quantised::x86_panel
 #endif
                 }
             }
-#pragma GCC unroll 2
+#pragma GCC unroll 4
             for (int r = 0; r < Rows; ++r)
             {
                 if (!fold_earlier)
@@ -349,13 +384,31 @@ namespace llaminar2::cpu::native_quantised::x86_panel
                         consume<Lanes, CB, Rows, P>(panel, next - begin, in, out, partial, live, begin == first,
                                                     next == end, kpart != 0);
                     };
-                    for (int tile = 0; tile < grid.tiles(2); ++tile)
+                    // AVX-512 reuses each panel vector across four rows; the
+                    // sixteen AVX2 registers keep the two-row tile.
+                    constexpr int width = Lanes == 16 ? 4 : 2;
+                    for (int tile = 0; tile < grid.tiles(width); ++tile)
                     {
-                        const auto span = grid.tileSpan(tile, 2);
-                        if (span.size() == 2)
+                        const auto span = grid.tileSpan(tile, width);
+                        switch (span.size())
+                        {
+                        case 4:
+                            if constexpr (width == 4)
+                                update.template operator()<4>(span.first);
+                            break;
+                        case 3:
+                            if constexpr (width == 4)
+                                update.template operator()<3>(span.first);
+                            break;
+                        case 2:
                             update.template operator()<2>(span.first);
-                        else if (span.size())
+                            break;
+                        case 1:
                             update.template operator()<1>(span.first);
+                            break;
+                        default:
+                            break;
+                        }
                     }
                     if (next == end)
                         break;
