@@ -9,6 +9,8 @@
  *
  * - the SIMD code/word readers equal the scalar plane readers for every
  *   code width and every aligned column vector;
+ * - the NEON binary16 Q4_K reader (FP16-arithmetic envelopes) equals the
+ *   codec's staged words for every 12-bit code and the same d/dmin sweep;
  * - the SIMD factor reconstruction equals widening the codec's staged word
  *   (decodeSuperblockMetadata, itself proven against the per-block packer by
  *   V2_Unit_VnniCodedPacking) for every code and a broad d/dmin sweep,
@@ -36,6 +38,7 @@
 #include "kernels/cpu/gemm/CPUWeightPreparationMemory.h"
 #include "tensors/NativeQuantisedSuperblockMetadata.h"
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cstdint>
@@ -270,6 +273,49 @@ namespace llaminar2::test
                 ASSERT_PRED2(sameFactor, laneBits(factor, 0), std::bit_cast<uint32_t>(expected));
             }
     }
+
+#if defined(__aarch64__) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+    /**
+     * The NEON binary16 Q4_K reader (one half multiply per block for scale and
+     * minimum) equals widening the codec's staged words for every 12-bit code
+     * read from real code planes, every column lane and a broad d/dmin sweep.
+     */
+    TEST(CPUCodedCompactUnits, NeonHalfQ4KReconstructionEqualsCodecWordsExhaustively)
+    {
+        const auto halves = halfSweep();
+        std::vector<std::uint8_t> planes(coded_metadata::codeBlockBytes(5), 0);
+        std::vector<std::uint8_t> header(coded_metadata::headerBytes(5), 0);
+        for (std::size_t h = 0; h < halves.size(); ++h)
+        {
+            const std::uint16_t d = halves[h];
+            for (int column = 0; column < 64; ++column)
+                coded_metadata::storeSuperblockWord(header.data(), 5, column,
+                    sb::packSuperblockWord(d, halves[(h * 7 + column * 13) % halves.size()]));
+            for (std::uint32_t first = 0; first < 4096; first += 64)
+            {
+                std::fill(planes.begin(), planes.end(), 0);
+                for (int column = 0; column < 64; ++column)
+                    coded_metadata::storeCode(planes.data(), 5, column, (first + column * 37) % 4096);
+                for (int column = 0; column < 64; column += 4)
+                {
+                    float32x4_t scale, minimum;
+                    coded_metadata::neon_half::q4KFactors(planes.data(), column,
+                        coded_metadata::neon_half::q4KHalfBase(header.data(), column), scale, minimum);
+                    for (int lane = 0; lane < 4; ++lane)
+                    {
+                        const std::uint32_t code = (first + (column + lane) * 37) % 4096;
+                        const auto word = coded_metadata::loadSuperblockWord(header.data(), 5, column + lane);
+                        const auto staged = sb::decodeSuperblockMetadata<5>(code, word);
+                        ASSERT_PRED2(sameFactor, laneBits(scale, lane), widenedBits(staged.primary))
+                            << "code=" << code << " word=" << word;
+                        ASSERT_PRED2(sameFactor, laneBits(minimum, lane), widenedBits(staged.secondary))
+                            << "code=" << code << " word=" << word;
+                    }
+                }
+            }
+        }
+    }
+#endif
 
     /** Compact matrices retain the exact file density of each original format. */
     TEST(CPUCodedCompactUnits, PreparedBytesEqualFileDensity)

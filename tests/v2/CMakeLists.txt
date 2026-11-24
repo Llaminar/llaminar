@@ -10683,7 +10683,7 @@ list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUCodedCompactPre
 
 add_v2_test(V2_Integration_CPUCompensationFreeUnits
     COMMAND $<TARGET_FILE:v2_unit_cpu_coded_compact_units>
-        --gtest_filter=CPUCompensationFreeUnits.*:CPUCodedCompactUnits.SimdReconstructionEqualsCodecWordsExhaustively
+        --gtest_filter=CPUCompensationFreeUnits.*:CPUCodedCompactUnits.SimdReconstructionEqualsCodecWordsExhaustively:CPUCodedCompactUnits.NeonHalfQ4KReconstructionEqualsCodecWordsExhaustively
     LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;NativeQuantised;Memory;ByteExact;Regression"
     MPI_PROCS 1 NO_MODELS)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUCompensationFreeUnits)

@@ -423,7 +423,8 @@ template <typename Ops> void verifyAllPanelWidths()
 {
     for (const auto &source : native_quantised_formats::kAllSourceFormats)
     {
-        if (preparedSuperblockCoded(preparedEncodingForSource(*source.metadata)))
+        // Compact multi-scale tiles keep their own column walk (no panel width).
+        if (preparedEncodingForSource(*source.metadata) == CPUNativeQuantisedEncoding::CompactMultiScale)
             continue;
         for (const int n : {1, 5, 8, 12, 15, 16, 17, 20, 31, 33, 47, 63, 64, 65, 100})
             for (const int blocks : {1, 3, 17})
@@ -696,6 +697,7 @@ template <std::size_t Rows> void verifyI8MMGrouping(const NativeQuantisedFormatI
                 ? Tile::template panelStrips<SDOTOps, CPUNativeQuantisedEncoding::Q5NativeSingleScale, true>()
                 : Tile::template panelStrips<SDOTOps, CPUNativeQuantisedEncoding::Q5NativeSingleScale, false>();
         case CPUNativeQuantisedEncoding::Q4KSuperblockCoded:
+            return Tile::template panelStrips<SDOTOps, CPUNativeQuantisedEncoding::Q4KSuperblockCoded, true>();
         case CPUNativeQuantisedEncoding::CompactMultiScale:
             return 1; // Own four-column strip walks; no panels.
         }

@@ -29,6 +29,12 @@
  * canonicalization (-0 -> +0), then widened by the ISA's existing metadata
  * widening. The result equals widening the per-block word the codec
  * reconstructs, so arithmetic downstream is unchanged.
+ *
+ * AArch64 envelopes with FP16 vector arithmetic additionally own a fused
+ * Q4_K reader (neon_half::q4KFactors): the binary16 product of the source
+ * half and the integer code is that same single RNE rounding, so the scale and
+ * minimum of four columns cost one table gather, one half multiply and two
+ * widenings per block instead of the generic binary32 program.
  */
 #pragma once
 
@@ -459,3 +465,78 @@ namespace llaminar2::cpu::native_quantised
     }
 
 } // namespace llaminar2::cpu::native_quantised
+
+#if defined(__aarch64__) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+#include <arm_neon.h>
+
+namespace llaminar2::cpu::native_quantised::coded_metadata::neon_half
+{
+    /**
+     * @brief Q4_K superblock factors of four columns as one binary16 vector.
+     * @details Lanes 0-3 hold the four columns' source `d`, lanes 4-7 their
+     * negated `dmin` (sign bit flipped, exactly the binary32 negation
+     * `-dmin` of reconstruct<5>() narrowed back). One vector serves every
+     * block of the superblock, so the per-block work is a single binary16
+     * multiply for the scale and the minimum together.
+     */
+    struct Q4KHalfBase
+    {
+        float16x8_t factors; ///< {d0..d3, -dmin0..-dmin3}.
+    };
+
+    /**
+     * @brief Load the Q4_K header words (d | dmin << 16) of four columns.
+     * @param header First byte of the 64-column superblock header (4-byte aligned).
+     * @param column First of four columns, a multiple of four.
+     * @return Binary16 base factors for q4KFactors().
+     */
+    [[gnu::always_inline]] inline Q4KHalfBase q4KHalfBase(const std::uint8_t *header, int column) noexcept
+    {
+        // De-interleave {d, dmin} pairs: val[0] = d, val[1] = dmin.
+        const auto words = vld2_u16(reinterpret_cast<const std::uint16_t *>(header + 4 * column));
+        const auto negated = veor_u16(words.val[1], vdup_n_u16(0x8000));
+        return {vreinterpretq_f16_u16(vcombine_u16(words.val[0], negated))};
+    }
+
+    /**
+     * @brief Reconstruct one block's staged Q4_K scale and minimum for four columns.
+     * @param codes First byte of the block's 12-bit code planes (u8[64], then a nibble plane).
+     * @param column First of four columns, a multiple of four.
+     * @param base Superblock factors from q4KHalfBase().
+     * @param scale Receives the widened staged scale words.
+     * @param minimum Receives the widened staged (negative) minimum words.
+     *
+     * @details Bit-identical to reconstruct<5>(): the codec forms the exact
+     * binary32 product `d * c` (an 11-bit significand times a 6-bit integer
+     * is exact in binary32) and rounds it once to binary16 with
+     * round-to-nearest-even. A binary16 multiply returns that same correctly
+     * rounded product, including overflow to infinity, subnormal results
+     * (FPCR.FZ16 is clear) and NaN propagation (a signalling `d` is quieted
+     * with its payload, as the binary32 widening quiets it). Adding +0 then
+     * performs the publication's -0 -> +0 canonicalization and leaves every
+     * other value, including quiet NaNs, unchanged. The 12-bit code is
+     * gathered with one two-register table lookup: lanes 0-3 take the low
+     * code byte (scale bits 0-5), lanes 4-7 the low byte below the column's
+     * high nibble so one shift by six yields minimum bits 0-5.
+     */
+    [[gnu::always_inline]] inline void q4KFactors(const std::uint8_t *codes, int column, const Q4KHalfBase &base,
+        float32x4_t &scale, float32x4_t &minimum) noexcept
+    {
+        // Bytes 0-3: low code bytes of the four columns; bytes 4-5: their two
+        // high-nibble bytes (columns c, c+1 in byte 4; c+2, c+3 in byte 5).
+        auto raw = vreinterpretq_u8_u32(vld1q_dup_u32(reinterpret_cast<const std::uint32_t *>(codes + column)));
+        raw = vreinterpretq_u8_u16(vld1q_lane_u16(reinterpret_cast<const std::uint16_t *>(codes + 64 + column / 2),
+                                                  vreinterpretq_u16_u8(raw), 2));
+        const uint8x16x2_t table{{raw, vshrq_n_u8(raw, 4)}};
+        // Halfword lanes: {b0, b1, b2, b3, b0 | n0 << 8, b1 | (n0 >> 4) << 8, b2 | n1 << 8, b3 | (n1 >> 4) << 8}.
+        const uint8x16_t gather{0, 255, 1, 255, 2, 255, 3, 255, 0, 4, 1, 20, 2, 5, 3, 21};
+        const auto words = vreinterpretq_u16_u8(vqtbl2q_u8(table, gather));
+        const int16x8_t shift{0, 0, 0, 0, -6, -6, -6, -6};
+        const auto code = vandq_u16(vshlq_u16(words, shift), vdupq_n_u16(63));
+        const auto product = vmulq_f16(vcvtq_f16_u16(code), base.factors);
+        const auto staged = vaddq_f16(product, vdupq_n_f16(0.0f));
+        scale = vcvt_f32_f16(vget_low_f16(staged));
+        minimum = vcvt_high_f32_f16(staged);
+    }
+} // namespace llaminar2::cpu::native_quantised::coded_metadata::neon_half
+#endif

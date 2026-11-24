@@ -872,19 +872,77 @@ namespace llaminar2::cpu::native_quantised
             publishPairs<Ops>(low01, low23, low);
         }
 
-        /** @brief Q4_K strip walk with source d/dmin hoisted above its block dots.
+#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+        /// Q4_K superblock factors held across one superblock's blocks (binary16 d and -dmin).
+        template <typename Ops> using Q4KBase = coded_metadata::neon_half::Q4KHalfBase;
+#else
+        /// Q4_K superblock factors held across one superblock's blocks (widened d and dmin).
+        template <typename Ops> using Q4KBase = coded_metadata::Q4KBaseFactors<typename Ops::F>;
+#endif
+
+        /**
+         * @brief Load the reusable Q4_K superblock factors of one four-column strip.
+         * @param header First byte of the 64-column superblock header.
+         * @param column First of four columns.
+         * @return Factors reused by every block of the superblock intersection.
+         */
+        template <typename Ops>
+        [[gnu::always_inline]] static Q4KBase<Ops> q4KStripBase(const std::uint8_t *header, int column) noexcept
+        {
+#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+            return coded_metadata::neon_half::q4KHalfBase(header, column);
+#else
+            using L = coded_metadata::Lanes<Ops>;
+            return coded_metadata::q4KBase<Ops>(L::template superblockWords<5>(header, column));
+#endif
+        }
+
+        /**
+         * @brief Reconstruct one block's staged Q4_K scale and minimum for one strip.
+         * @param codes First byte of the block's 12-bit code planes.
+         * @param column First of four columns.
+         * @param base Superblock factors from q4KStripBase().
+         * @return Exactly the widened per-block words of reconstruct<5>().
+         * @details FP16-arithmetic envelopes (NEON_I8MM) compute both factors
+         * with one binary16 multiply, which is the codec's single RNE rounding
+         * of the exact binary32 product (proven exhaustively by
+         * V2_Unit_CPUCodedCompactUnits); the baseline envelopes keep the
+         * binary32 program of reconstruct<5>().
+         */
+        template <typename Ops>
+        [[gnu::always_inline]] static coded_metadata::Factors<typename Ops::F> q4KStripFactors(
+            const std::uint8_t *codes, int column, const Q4KBase<Ops> &base) noexcept
+        {
+#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+            float32x4_t scale, minimum;
+            coded_metadata::neon_half::q4KFactors(codes, column, base, scale, minimum);
+            return {.primary = std::bit_cast<typename Ops::F>(scale), .secondary = std::bit_cast<typename Ops::F>(minimum)};
+#else
+            using L = coded_metadata::Lanes<Ops>;
+            return coded_metadata::reconstruct<5, Ops>(L::template code<5>(codes, column), base);
+#endif
+        }
+
+        /** @brief Q4_K panel walk with source d/dmin hoisted above its block dots.
          * @tparam Ops Selected signed SDOT/SMMLA/ASIMD family.
          * @tparam Policy Immutable FP32 contribution and K-fold policy.
-         * @details Partitions may split a source superblock. Each strip widens
+         * @tparam S Four-column strips per panel (installed: 2 for the single-row SDOT leaf).
+         *         Row-pair SMMLA tiles always walk one strip.
+         * @details Partitions may split a source superblock. Each strip loads
          * exactly one header for each partition intersection, then streams this
          * intersection's contiguous payloads and 12-bit codes. The final
          * ragged superblock ends at the same geometry-owned header as packing.
+         * A panel loads each row's activation block once and feeds every strip
+         * with lane-indexed dots; per column, the integer dot, the factor
+         * expressions, the per-block FP32 program, block order and partition
+         * tree are those of the one-strip walk. Strips in the chunk's sealed
+         * padding columns are computed but never stored.
          */
-        template <typename Ops, CPUProjectionNumericalPolicy Policy>
+        template <typename Ops, CPUProjectionNumericalPolicy Policy, int S>
         [[gnu::always_inline]] LLAMINAR_NEON_PROJECTION_EXACT inline void runQ4K() const noexcept
         {
+            static_assert(S == 1 || ((S == 2 || S == 4) && !multi_scale::usesRowPairs<Ops>));
             using I = typename Ops::I;
-            using L = coded_metadata::Lanes<Ops>;
             constexpr int superblock_blocks = native_quantised_superblock::kBlocksPerSuperblock;
             constexpr int data_bytes = preparedDataStride(Encoding::Q4KSuperblockCoded, 5);
             constexpr int block_bytes = preparedInterleavedBlockStride(Encoding::Q4KSuperblockCoded, true, 5);
@@ -892,13 +950,13 @@ namespace llaminar2::cpu::native_quantised
                 .block_stride = block_bytes, .header_bytes = preparedSuperblockHeaderBytes(Encoding::Q4KSuperblockCoded, 5),
                 .blocks_per_row = std::size_t(weights_.blocks_per_row)};
             const auto *root = weights_.interleavedBase() + std::size_t(chunk_) * geometry.rowBytes();
-            for (int column = 0; column < columns_; column += 4)
+            for (int column0 = 0; column0 < columns_; column0 += 4 * S)
             {
-                float32x4_t reduced[Rows]{};
+                float32x4_t reduced[Rows][S]{};
                 constexpr bool ordered = Policy == CPUProjectionNumericalPolicy::GPUAlignedExpert;
                 for (int partition = 0; partition < (ordered ? partitions_ : 1); ++partition)
                 {
-                    float32x4_t partial[Rows]{};
+                    float32x4_t partial[Rows][S]{};
                     const int first = ordered ? partition * blocks_per_partition_ : 0;
                     const int last = ordered ? std::min(first + blocks_per_partition_, weights_.blocks_per_row)
                                              : weights_.blocks_per_row;
@@ -906,65 +964,113 @@ namespace llaminar2::cpu::native_quantised
                     {
                         const int end = std::min(last, (block / superblock_blocks + 1) * superblock_blocks);
                         const auto *header = root + geometry.headerOffset(0, block);
-                        const auto base = coded_metadata::q4KBase<Ops>(L::template superblockWords<5>(header, column));
+                        Q4KBase<Ops> base[S];
+#pragma GCC unroll 4
+                        for (int strip = 0; strip < S; ++strip)
+                            base[strip] = q4KStripBase<Ops>(header, column0 + 4 * strip);
                         const auto *unit = root + geometry.blockOffset(0, block);
                         for (; block < end; ++block, unit += block_bytes)
                         {
-                            I dots[Rows]{};
-                            if constexpr (multi_scale::usesRowPairs<Ops>)
+                            I dots[Rows][S]{};
+                            if constexpr (S > 1)
                             {
-                                I unused[Rows]{};
-                                pairBlock<Ops, Encoding::Q4KSuperblockCoded, NibbleMap::Unsigned>(unit, column, block, dots, unused);
+                                // One activation block load per row; every strip
+                                // reads its groups by lane (exact integer sums).
+                                const auto blocks = activationBlocks<Ops>(block);
+                                forEachGroup<4>([&]<int Group>() __attribute__((always_inline)) {
+#pragma GCC unroll 4
+                                    for (int strip = 0; strip < S; ++strip)
+                                    {
+                                        const auto raw = vld1q_u8(unit + Group * 256 + (column0 + 4 * strip) * 4);
+                                        const auto low = std::bit_cast<I>(vandq_u8(raw, vdupq_n_u8(15)));
+                                        const auto high = std::bit_cast<I>(vshrq_n_u8(raw, 4));
+#pragma GCC unroll 4
+                                        for (std::size_t row = 0; row < Rows; ++row)
+                                        {
+                                            dots[row][strip] = Ops::template dotLane<Group>(dots[row][strip], low, blocks[row]);
+                                            dots[row][strip] = Ops::template dotLane<Group + 4>(dots[row][strip], high, blocks[row]);
+                                        }
+                                    }
+                                });
                             }
-                            else if constexpr (Rows >= 3 && Ops::instruction == Dot::ASIMD)
+                            else if constexpr (multi_scale::usesRowPairs<Ops>)
                             {
-                                // ASIMD widens each byte-product group. Keeping
-                                // only one decoded group live bounds the three-
-                                // and four-row block's temporary register usage.
-#pragma GCC unroll 1
-                                for (int group = 0; group < 8; ++group)
-                                {
-                                    const auto raw = vld1q_u8(unit + (group % 4) * 256 + column * 4);
-                                    const auto values = group < 4 ? vandq_u8(raw, vdupq_n_u8(15)) : vshrq_n_u8(raw, 4);
-                                    consume<Ops>(vreinterpretq_s8_u8(values), block, group, dots);
-                                }
+                                I strip_dots[Rows]{}, unused[Rows]{};
+                                pairBlock<Ops, Encoding::Q4KSuperblockCoded, NibbleMap::Unsigned>(
+                                    unit, column0, block, strip_dots, unused);
+#pragma GCC unroll 4
+                                for (std::size_t row = 0; row < Rows; ++row) dots[row][0] = strip_dots[row];
                             }
                             else
                             {
-#pragma GCC unroll 1
-                                for (int group = 0; group < 4; ++group)
+                                I strip_dots[Rows]{};
+                                if constexpr (Rows >= 3 && Ops::instruction == Dot::ASIMD)
                                 {
-                                    const auto raw = vld1q_u8(unit + group * 256 + column * 4);
-                                    consume<Ops>(vreinterpretq_s8_u8(vandq_u8(raw, vdupq_n_u8(15))), block, group, dots);
-                                    consume<Ops>(vreinterpretq_s8_u8(vshrq_n_u8(raw, 4)), block, group + 4, dots);
+                                    // ASIMD widens each byte-product group. Keeping
+                                    // only one decoded group live bounds the three-
+                                    // and four-row block's temporary register usage.
+#pragma GCC unroll 1
+                                    for (int group = 0; group < 8; ++group)
+                                    {
+                                        const auto raw = vld1q_u8(unit + (group % 4) * 256 + column0 * 4);
+                                        const auto values = group < 4 ? vandq_u8(raw, vdupq_n_u8(15)) : vshrq_n_u8(raw, 4);
+                                        consume<Ops>(vreinterpretq_s8_u8(values), block, group, strip_dots);
+                                    }
                                 }
+                                else
+                                {
+#pragma GCC unroll 1
+                                    for (int group = 0; group < 4; ++group)
+                                    {
+                                        const auto raw = vld1q_u8(unit + group * 256 + column0 * 4);
+                                        consume<Ops>(vreinterpretq_s8_u8(vandq_u8(raw, vdupq_n_u8(15))), block, group, strip_dots);
+                                        consume<Ops>(vreinterpretq_s8_u8(vshrq_n_u8(raw, 4)), block, group + 4, strip_dots);
+                                    }
+                                }
+#pragma GCC unroll 4
+                                for (std::size_t row = 0; row < Rows; ++row) dots[row][0] = strip_dots[row];
                             }
-                            const auto factors = coded_metadata::reconstruct<5, Ops>(
-                                L::template code<5>(unit + data_bytes, column), base);
+                            float activation_scale[Rows];
 #pragma GCC unroll 4
                             for (std::size_t row = 0; row < Rows; ++row)
+                                activation_scale[row] = nativeQuantisedFP16ScaleToFP32(activation_[row][block].d);
+#pragma GCC unroll 4
+                            for (int strip = 0; strip < S; ++strip)
                             {
-                                const auto &a = activation_[row][block];
-                                partial[row] = accumulateCorrectedSingleScaleBlockNEON(partial[row],
-                                    std::bit_cast<int32x4_t>(dots[row]), std::bit_cast<float32x4_t>(factors.primary), a.sum_qs,
-                                    std::bit_cast<float32x4_t>(factors.secondary), nativeQuantisedFP16ScaleToFP32(a.d), Policy);
+                                const auto factors = q4KStripFactors<Ops>(unit + data_bytes, column0 + 4 * strip, base[strip]);
+#pragma GCC unroll 4
+                                for (std::size_t row = 0; row < Rows; ++row)
+                                    partial[row][strip] = accumulateCorrectedSingleScaleBlockNEON(partial[row][strip],
+                                        std::bit_cast<int32x4_t>(dots[row][strip]), std::bit_cast<float32x4_t>(factors.primary),
+                                        activation_[row][block].sum_qs, std::bit_cast<float32x4_t>(factors.secondary),
+                                        activation_scale[row], Policy);
                             }
                         }
                     }
 #pragma GCC unroll 4
                     for (std::size_t row = 0; row < Rows; ++row)
-                        reduced[row] = !ordered || partition == 0 ? partial[row] : vaddq_f32(reduced[row], partial[row]);
+#pragma GCC unroll 4
+                        for (int strip = 0; strip < S; ++strip)
+                            reduced[row][strip] = !ordered || partition == 0 ? partial[row][strip]
+                                                                             : vaddq_f32(reduced[row][strip], partial[row][strip]);
                 }
 #pragma GCC unroll 4
-                for (std::size_t row = 0; row < Rows; ++row)
+                for (int strip = 0; strip < S; ++strip)
                 {
-                    auto *destination = output_[row].data() + column;
-                    if (column + 4 <= columns_) vst1q_f32(destination, reduced[row]);
-                    else
+                    const int column = column0 + 4 * strip;
+                    if (column >= columns_)
+                        break;
+#pragma GCC unroll 4
+                    for (std::size_t row = 0; row < Rows; ++row)
                     {
-                        vst1q_lane_f32(destination, reduced[row], 0);
-                        if (columns_ - column >= 2) vst1q_lane_f32(destination + 1, reduced[row], 1);
-                        if (columns_ - column == 3) vst1q_lane_f32(destination + 2, reduced[row], 2);
+                        auto *destination = output_[row].data() + column;
+                        if (column + 4 <= columns_) vst1q_f32(destination, reduced[row][strip]);
+                        else
+                        {
+                            vst1q_lane_f32(destination, reduced[row][strip], 0);
+                            if (columns_ - column >= 2) vst1q_lane_f32(destination + 1, reduced[row][strip], 1);
+                            if (columns_ - column == 3) vst1q_lane_f32(destination + 2, reduced[row][strip], 2);
+                        }
                     }
                 }
             }
@@ -1054,7 +1160,7 @@ namespace llaminar2::cpu::native_quantised
             // A panel never crosses its 64-column chunk: S strips must tile the chunk's 16.
             static_assert(S == 1 || S == 2 || S == 4);
             if constexpr (Physical == Encoding::Q4KSuperblockCoded)
-                return runQ4K<Ops, Policy>();
+                return runQ4K<Ops, Policy, multi_scale::usesRowPairs<Ops> ? 1 : S>();
             else if constexpr (S > 1 && !multi_scale::usesRowPairs<Ops>)
             {
                 // Panels cover the whole chunk: a final panel may extend into the
