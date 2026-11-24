@@ -593,10 +593,10 @@ namespace llaminar2
         {
             for (const auto type : {TensorType::FP16, TensorType::BF16, TensorType::FP32})
             {
+                SCOPED_TRACE(::testing::Message() << source.quant_type << " floating_type=" << static_cast<int>(type));
                 for (std::size_t role = 0; role < 3; ++role)
                 {
-                    SCOPED_TRACE(::testing::Message() << source.quant_type
-                        << " floating_type=" << static_cast<int>(type) << " role=" << role);
+                    SCOPED_TRACE(role);
                     auto model_manifest = manifest(3, *source.metadata);
                     model_manifest[1].projections[role].format = ExpertWeightFormat::floating(type);
                     try
@@ -619,13 +619,29 @@ namespace llaminar2
                         EXPECT_NE(message.find("not implemented"), std::string::npos);
                         EXPECT_NE(message.find("No weights were converted"), std::string::npos);
                     }
-
-                    // A quantized/floating transition BETWEEN layers is not
-                    // the unsupported within-payload mixture reported here.
-                    for (auto &projection : model_manifest[1].projections)
-                        projection.format = ExpertWeightFormat::floating(type);
-                    EXPECT_NO_THROW((void)Directory::profileForLayerWeightManifest(model_manifest));
                 }
+
+                // A quantized/floating transition BETWEEN layers is not
+                // the unsupported within-payload mixture reported here.
+                auto separate_layers = manifest(3, *source.metadata);
+                for (auto &projection : separate_layers[1].projections)
+                    projection.format = ExpertWeightFormat::floating(type);
+                const auto profile = Directory::profileForLayerWeightManifest(separate_layers);
+                ASSERT_EQ(profile.families.size(), 2u);
+                EXPECT_EQ(profile.layer_families, (std::vector<uint32_t>{0, 1, 0}));
+                EXPECT_EQ(profile.families[0].layer_count, 2u);
+                EXPECT_EQ(profile.families[1].layer_count, 1u);
+                std::size_t floating_bytes = 0;
+                for (const auto &projection : separate_layers[1].projections)
+                    floating_bytes += testAlignUp(static_cast<size_t>(projection.N) * projection.K *
+                        projection.format.floatingElementBytes(), kGpuAlignment);
+                const auto quantized_bytes = expectedFootprint(separate_layers[0], *source.metadata).gpu_live_bytes;
+                DeviceMoERebalanceConfig config;
+                config.num_layers = 3u;
+                config.max_hot_replicas_per_participant = 1u;
+                const auto bom = Directory::allocationBOM(
+                    Directory::planRuntimeCapacity(config, 0u, 1u, 2u), profile);
+                EXPECT_EQ(bom.payload_bytes, 4u * quantized_bytes + 3u * floating_bytes);
             }
         }
 

@@ -108,61 +108,55 @@ TEST(GPUPreparedWeightBinding, AllFormatsRejectTruncatedPoolRegions)
             }
 }
 
-/** @brief Missing raw source coefficients fail before any native GPU engine is constructed. */
+/** @brief Missing source coefficient storage fails before native GPU binding. */
 TEST(GPUPreparedWeightBinding, RejectsMissingSourceCoefficientPlane)
 {
-    for (DeviceType type : {DeviceType::CUDA, DeviceType::ROCm})
+    using Layout = GPUPreparedWeightPoolLayout;
+    for (const DeviceType type : {DeviceType::CUDA, DeviceType::ROCm})
         for (const char *label : {"IQ3_S", "IQ4_XS"})
-            for (auto layout : {GPUPreparedWeightPoolLayout::SourceNative,
-                                GPUPreparedWeightPoolLayout::MigrationReusable})
+            for (const auto layout : {Layout::SourceNative, Layout::MigrationReusable})
             {
                 SCOPED_TRACE(label);
                 SCOPED_TRACE(static_cast<int>(type));
                 SCOPED_TRACE(static_cast<int>(layout));
                 auto tensor = test::quantizedVerifierFormat(label).create({32, 256}, 42);
-                // Hard-coded source widths make missing-plane rejection
-                // independent of the physical-format helper under test.
                 const int payload_bytes = tensor->native_type() == TensorType::IQ3_S ? 13 : 16;
                 constexpr size_t blocks = 32 * (256 / 32);
                 test::MockBackend backend(type);
                 const DeviceId device{type, 0};
                 auto owner = std::make_shared<LoadOrchestrator>(&backend, kTestOnlyUnadmittedGPUAllocation);
                 owner->addDevice(0);
-                owner->planWeight(0, "missing.coefficients", 32, 256,
-                    payload_bytes, false, false, NativeQuantisedScalePlaneWidth::FP16Word, tensor->size_bytes());
-                // MockBackend supplies host backing only. Correct payload and
-                // scale bounds leave the absent secondary as the sole defect.
+                // Both original sources need a separate scale-code plane. Give
+                // them a correctly sized payload, coded layout and superblock
+                // headers, but borrow IQ3_XXS's code-in-payload plane plan to
+                // omit only the separate coefficient backing.
+                constexpr auto in_payload_codebook = native_quantised_formats::IQ3_XXS.codebook_id;
+                owner->planWeight(0, "missing.coefficients", 32, 256, payload_bytes,
+                    false, false, NativeQuantisedScalePlaneWidth::FP16Word, tensor->size_bytes(),
+                    {}, WeightVRAMPool::SuperblockCodedMetadata{in_payload_codebook, 0});
+                owner->planWeight(0, "wrong.layout", 32, 256, payload_bytes,
+                    false, false, NativeQuantisedScalePlaneWidth::FP16Word, tensor->size_bytes());
                 auto *pool = owner->getPool(0);
                 ASSERT_TRUE(pool->allocate(&backend, 0, 0));
+                try
+                {
+                    auto kernel = KernelFactory::createGemmFromGPUWeightPool(
+                        *tensor, device, owner, "wrong.layout", 0, layout);
+                    FAIL() << "Per-block slot was bound as superblock-coded metadata";
+                }
+                catch (const std::invalid_argument &error)
+                {
+                    EXPECT_NE(std::string(error.what()).find("metadata layout"), std::string::npos)
+                        << error.what();
+                }
                 const auto slot = pool->getSlot("missing.coefficients");
                 ASSERT_TRUE(slot.has_value());
                 ASSERT_NE(slot->d_native_quantised_payload, nullptr);
-                ASSERT_NE(slot->d_native_quantised_scales, nullptr);
                 ASSERT_EQ(slot->payload_bytes, blocks * static_cast<size_t>(payload_bytes));
-                ASSERT_EQ(slot->scales_bytes, blocks * sizeof(uint16_t));
-                ASSERT_EQ(slot->d_native_quantised_mins, nullptr);
-                ASSERT_EQ(slot->mins_bytes, 0u);
-                // Immutable CUDA source-native weights bind superblock-coded
-                // metadata, which has no per-block secondary plane: a slot
-                // planned with per-block planes must be rejected as a layout
-                // mismatch before any plane is read.
-                const auto *format = native_quantised_formats::forQuantType(label);
-                ASSERT_NE(format, nullptr);
-                if (gpuPreparedSuperblockCoded(*format, layout, device))
-                {
-                    try
-                    {
-                        auto kernel = KernelFactory::createGemmFromGPUWeightPool(
-                            *tensor, device, owner, "missing.coefficients", 0, layout);
-                        FAIL() << "Per-block slot was bound as superblock-coded metadata";
-                    }
-                    catch (const std::invalid_argument &error)
-                    {
-                        EXPECT_NE(std::string(error.what()).find("metadata layout"), std::string::npos)
-                            << error.what();
-                    }
-                    continue;
-                }
+                ASSERT_EQ(slot->d_native_quantised_scales, nullptr);
+                ASSERT_EQ(slot->scales_bytes, 0u);
+                ASSERT_NE(slot->d_native_quantised_mins, nullptr);
+                ASSERT_EQ(slot->mins_bytes, 32u * sizeof(uint16_t));
                 try
                 {
                     auto kernel = KernelFactory::createGemmFromGPUWeightPool(
@@ -171,7 +165,7 @@ TEST(GPUPreparedWeightBinding, RejectsMissingSourceCoefficientPlane)
                 }
                 catch (const std::out_of_range &error)
                 {
-                    EXPECT_NE(std::string(error.what()).find("minima region"), std::string::npos)
+                    EXPECT_NE(std::string(error.what()).find("scale codes region"), std::string::npos)
                         << error.what();
                 }
             }

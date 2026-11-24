@@ -2667,12 +2667,19 @@ TEST(Test__WorkspaceMemoryEstimator, NativeSharedExpertWorkspaceUsesOriginalFFNA
 
     auto foreign_generic_width = original;
     foreign_generic_width.d_ff = 1;
-    for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+    // ROCm's descriptor workspace is a device-free contract. The exact CUDA
+    // dispatch workspace is unavailable unless that implementation was built.
+    for (const auto backend : {DeviceType::ROCm
+#ifdef HAVE_CUDA
+        , DeviceType::CUDA
+#endif
+    })
     {
         SCOPED_TRACE(deviceTypeToString(backend));
         auto geometry = graphGeometry(DeviceId(backend, 1), 256, 2);
         geometry.shard_index = 1;
         geometry.runtime_device_policy_available = true;
+        geometry.device_compute_units = 80; // Recorded workspace policy; no hardware query.
         geometry.last_layer = original.mainLayerCount() - 1;
         geometry.has_exact_tensor_parallel_assignment = true;
         geometry.local_query_head_start = 4;

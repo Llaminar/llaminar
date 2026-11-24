@@ -19,7 +19,6 @@
 #include <gtest/gtest.h>
 #include <sstream>
 #include <type_traits>
-#include "backends/GPUFlatGraphStructure.h"
 namespace llaminar2::test {
 namespace {
 /** @return Complete recorded family with real original pthread geometry; never
@@ -155,14 +154,13 @@ TEST(PlanningNativeContextEvidence,
   native->freezeForPlanning();
   const auto key = Access::birthKey(native, device);
   const auto program = GPUWorkerStackProgram::originalDefaults();
-  PlanningNativeContextDeclaration declaration{device,
-                                               key->physical_uuid,
-                                               key->worker_stack_bytes,
-                                               key->worker_guard_bytes,
-                                               program.pageBytes(),
-                                               key->context_object_bytes,
-                                               key->context_object_alignment,
-                                               nativeGraphCaptureObjectBytes(device)};
+  auto declaration = recorded(device);
+  declaration.physical_uuid = key->physical_uuid;
+  declaration.stack_bytes = key->worker_stack_bytes;
+  declaration.guard_bytes = key->worker_guard_bytes;
+  declaration.page_bytes = program.pageBytes();
+  declaration.object_bytes = key->context_object_bytes;
+  declaration.object_alignment = key->context_object_alignment;
   PlanningGGUFFixture file;
   PlanningModelSource model(file.path());
   DevicePlanConfig cfg;
@@ -175,6 +173,9 @@ TEST(PlanningNativeContextEvidence,
   cfg.first_layer = 0;
   cfg.last_layer = model.metadata().memoryProfile().n_layers - 1;
   cfg.associated_host_memory = resources[0];
+  // The mock worker is not the owner of a compiled CUDA graph adapter.
+  // Publish the recorded owner's geometry before comparing the two BOMs.
+  cfg.native_graph_objects.publish({0, device}, declaration.graph_capture_object_bytes);
   cfg.native_context_preparation = native;
   const auto actual =
       MemoryPlanner::plan(model.metadata().memoryProfile(), {cfg})
