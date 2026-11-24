@@ -588,8 +588,9 @@ namespace llaminar2
         }
 
         /**
-         * Pack a real source tensor into the common CUDA/ROCm separated layout.
-         * This is the same `packVnniBlock` authority used by weight preparation.
+         * @brief Pack an independent GGUF source into the migration GPU layout.
+         * @param tensor Original source, not the CPU-prepared oracle.
+         * @return Exact block-major payload and the source format's persistent metadata planes.
          */
         [[nodiscard]] HostGpuExpertPackedProjection packGpuProjection(
             const TensorBase &tensor)
@@ -628,11 +629,29 @@ namespace llaminar2
             const std::size_t blocks =
                 static_cast<std::size_t>(N) * projection.blocks_per_row;
             projection.payload.resize(blocks * execution.payload_bytes_per_block);
-            projection.scales.assign(nativeQuantisedScalePlaneStorageWords(projection.codebook_id, blocks), 0);
-            if (execution.is_asymmetric)
-                projection.mins.resize(blocks);
-            if (execution.has_emins)
-                projection.emins.resize(blocks);
+            namespace sb = native_quantised_superblock;
+            const bool coded = cpu::native_quantised::migrationUsesSuperblockCodes(format);
+            const auto code_bits = sb::superblockCodePlaneBits(projection.codebook_id);
+            const auto field_bytes = sb::superblockFieldBytes(projection.codebook_id);
+            std::vector<uint32_t> source_codes, source_headers;
+            if (coded)
+            {
+                projection.metadata_layout = nativeQuantisedMetadataLayout(
+                    NativeQuantisedMetadataRepresentation::SuperblockCoded, 0, 0);
+                const auto bytes = sb::planeBytes(projection.codebook_id, N, K / 32, 0);
+                projection.codes.resize(bytes.code);
+                projection.superblocks.resize(bytes.superblock);
+                source_codes.resize(blocks);
+                source_headers.resize(bytes.superblock / field_bytes);
+            }
+            else
+            {
+                projection.scales.resize(nativeQuantisedScalePlaneStorageWords(projection.codebook_id, blocks));
+                if (execution.is_asymmetric)
+                    projection.mins.resize(blocks);
+                if (execution.has_emins)
+                    projection.emins.resize(blocks);
+            }
 
             VnniPackContext context{};
             context.N = N;
@@ -644,13 +663,31 @@ namespace llaminar2
             context.primary_layout = gpuPrimaryScaleLayout(projection.codebook_id);
             context.mins_array =
                 execution.is_asymmetric ? projection.mins.data() : nullptr;
-            context.emins_array =
-                execution.has_emins ? projection.emins.data() : nullptr;
+            context.emins_array = execution.has_emins ? projection.emins.data() : nullptr;
+            if (coded)
+            {
+                context.codes_array = source_codes.data();
+                context.superblocks_array = source_headers.data();
+            }
 
             for (int n = 0; n < N; ++n)
             {
                 for (int kb = 0; kb < context.blocks_per_row; ++kb)
                     unpackable->packVnniBlock(context, n, n, kb);
+            }
+
+            if (coded)
+            {
+                // Preserve exactly the source coefficient bits. Alignment
+                // guard bytes are never part of the live metadata extent.
+                for (size_t i = 0; code_bits && i < blocks; ++i)
+                    for (unsigned bit = 0; bit < code_bits; ++bit)
+                    {
+                        const auto at = i * code_bits + bit;
+                        projection.codes[at / 8] |= ((source_codes[i] >> bit) & 1u) << (at % 8);
+                    }
+                for (size_t i = 0; i < source_headers.size(); ++i)
+                    std::memcpy(projection.superblocks.data() + i * field_bytes, &source_headers[i], field_bytes);
             }
 
             std::string error;
@@ -709,6 +746,70 @@ namespace llaminar2
                 " expected=" +
                 std::to_string(static_cast<std::uint64_t>(*mismatch.second)));
         }
+
+        /** @brief Fixture-owned storage for one exact separated device projection. */
+        class BenchmarkGpuProjection final
+        {
+        public:
+            /** @brief Materialize the layout's full capacity before timing. */
+            explicit BenchmarkGpuProjection(const HostGpuExpertPackedProjection &host)
+                : coded_(host.metadata_layout != 0), layout_(host.metadata_layout),
+                  payload_(host.payload.size()),
+                  primary_(coded_ ? host.codes.size() : host.scales.size() * sizeof(uint16_t)),
+                  secondary_(coded_ ? host.superblocks.size() : host.mins.size() * sizeof(uint16_t)),
+                  emins_(host.emins.size()),
+                  primary_live_(coded_ ? (host.codes.empty() ? 0 : host.codes.size() -
+                      native_quantised_superblock::kSuperblockCodePlanePadBytes) : host.scaleLiveBytes()) {}
+
+            /** @brief Upload all source planes on the fixture's explicit stream. */
+            void upload(const HostGpuExpertPackedProjection &host, const BenchmarkStream &stream)
+            {
+                uploadVector(payload_, host.payload, stream);
+                copyHostToDeviceAsync(primary_.data(), coded_ ? static_cast<const void *>(host.codes.data()) : host.scales.data(),
+                    primary_.bytes(), stream);
+                copyHostToDeviceAsync(secondary_.data(), coded_ ? static_cast<const void *>(host.superblocks.data()) : host.mins.data(),
+                    secondary_.bytes(), stream);
+                uploadVector(emins_, host.emins, stream);
+            }
+
+            /** @brief Initialize all destination planes, including untouched rectangle regions. */
+            void zero(const BenchmarkStream &stream)
+            {
+                zeroDeviceAsync(payload_.data(), payload_.bytes(), stream);
+                zeroDeviceAsync(primary_.data(), primary_.bytes(), stream);
+                zeroDeviceAsync(secondary_.data(), secondary_.bytes(), stream);
+                zeroDeviceAsync(emins_.data(), emins_.bytes(), stream);
+            }
+
+            /** @return Exact live device descriptor, excluding allocation-only guard bytes. */
+            [[nodiscard]] ExpertTierGpuMutableProjectionView view()
+            {
+                return {.payload = payload_.data(),
+                    .scales = reinterpret_cast<uint16_t *>(primary_.bytes() ? primary_.data() : payload_.data()),
+                    .mins = reinterpret_cast<uint16_t *>(secondary_.data()), .emins = emins_.data(),
+                    .payload_bytes = payload_.bytes(), .scales_bytes = primary_live_,
+                    .mins_bytes = secondary_.bytes(), .emins_bytes = emins_.bytes(), .metadata_layout = layout_};
+            }
+
+            /** @brief Compare every destination plane, including unmodified rectangle regions. */
+            void check(const HostGpuExpertPackedProjection &host, const BenchmarkStream &stream) const
+            {
+                const auto byteView = [](const auto &v) {
+                    return std::span(reinterpret_cast<const uint8_t *>(v.data()), v.size() * sizeof(v[0]));
+                };
+                requireEqual<uint8_t>(downloadVector(payload_, stream), host.payload, "GPU payload");
+                requireEqual<uint8_t>(downloadVector(primary_, stream), coded_ ? byteView(host.codes) : byteView(host.scales), "GPU primary plane");
+                requireEqual<uint8_t>(downloadVector(secondary_, stream), coded_ ? byteView(host.superblocks) : byteView(host.mins), "GPU secondary plane");
+                requireEqual<uint32_t>(downloadVector(emins_, stream), host.emins, "GPU effective minima");
+            }
+
+        private:
+            bool coded_;
+            uint8_t layout_;
+            DeviceBuffer<uint8_t> payload_, primary_, secondary_;
+            DeviceBuffer<uint32_t> emins_;
+            size_t primary_live_;
+        };
 
         /** Runtime-neutral production demotion-kernel dispatch. */
         [[nodiscard]] bool launchGpuToCpu(
@@ -803,14 +904,8 @@ namespace llaminar2
                   promotion_manifest_(makePromotionManifest(units_per_chunk)),
                   promotion_layout_(promotion_manifest_.deviceLayout()),
                   destination_host_(makeDestinationReference()),
-                  source_payload_(source_host_.payload.size()),
-                  source_scales_(source_host_.scales.size()),
-                  source_mins_(source_host_.mins.size()),
-                  source_emins_(source_host_.emins.size()),
-                  destination_payload_(destination_host_.payload.size()),
-                  destination_scales_(destination_host_.scales.size()),
-                  destination_mins_(destination_host_.mins.size()),
-                  destination_emins_(destination_host_.emins.size()),
+                  source_device_(source_host_),
+                  destination_device_(destination_host_),
                   device_chunk_(std::max(
                       demotion_layout_.chunkBytes(
                           demotion_layout_.maximum_units_per_chunk),
@@ -829,26 +924,8 @@ namespace llaminar2
                     pinned_cpu_.data(),
                     wire_oracle_.data(),
                     pinned_cpu_.size());
-                uploadVector(source_payload_, source_host_.payload, stream_);
-                uploadVector(source_scales_, source_host_.scales, stream_);
-                uploadVector(source_mins_, source_host_.mins, stream_);
-                uploadVector(source_emins_, source_host_.emins, stream_);
-                zeroDeviceAsync(
-                    destination_payload_.data(),
-                    destination_payload_.bytes(),
-                    stream_);
-                zeroDeviceAsync(
-                    destination_scales_.data(),
-                    destination_scales_.bytes(),
-                    stream_);
-                zeroDeviceAsync(
-                    destination_mins_.data(),
-                    destination_mins_.bytes(),
-                    stream_);
-                zeroDeviceAsync(
-                    destination_emins_.data(),
-                    destination_emins_.bytes(),
-                    stream_);
+                source_device_.upload(source_host_, stream_);
+                destination_device_.zero(stream_);
                 stream_.synchronize();
 
                 if (!sourceView().validFor(demotion_layout_))
@@ -895,22 +972,7 @@ namespace llaminar2
 
                 enqueuePromotionStream();
                 stream_.synchronize();
-                requireEqual<std::uint8_t>(
-                    downloadVector(destination_payload_, stream_),
-                    destination_host_.payload,
-                    "CPU-to-GPU payload");
-                requireEqual<std::uint16_t>(
-                    downloadVector(destination_scales_, stream_),
-                    destination_host_.scales,
-                    "CPU-to-GPU scales");
-                requireEqual<std::uint16_t>(
-                    downloadVector(destination_mins_, stream_),
-                    destination_host_.mins,
-                    "CPU-to-GPU mins");
-                requireEqual<std::uint32_t>(
-                    downloadVector(destination_emins_, stream_),
-                    destination_host_.emins,
-                    "CPU-to-GPU emins");
+                destination_device_.check(destination_host_, stream_);
             }
 
             /**
@@ -1141,14 +1203,14 @@ namespace llaminar2
                     for (std::uint32_t first = 0u; first < layout.unit_count;)
                     {
                         const auto units = std::min(layout.maximum_units_per_chunk, layout.unit_count - first);
-                        const auto bytes = layout.chunkBytes(units);
+                        const auto bytes = layout.chunkBytes(units, first);
                         if (direction == Direction::GpuToCpu)
                             command.publishPackedDeviceToMappedHost(sourceView(), layout, first, units,
                                 device_chunk_.data(), device_chunk_.bytes());
                         else
                         {
                             std::memcpy(staging->mutableHostData(),
-                                cpu_host_.native_interleaved.data() + layout.chunkBytes(first), bytes);
+                                wire_oracle_.data() + expertTierWirePrefix(layout, first), bytes);
                             command.publishPackedMappedHostToDevice(destinationView(), layout, first, units,
                                 device_chunk_.data(), device_chunk_.bytes());
                         }
@@ -1169,7 +1231,7 @@ namespace llaminar2
                             std::this_thread::yield();
                         }
                         if (direction == Direction::GpuToCpu)
-                            std::memcpy(pinned_cpu_.data() + layout.chunkBytes(first),
+                            std::memcpy(pinned_cpu_.data() + expertTierWirePrefix(layout, first),
                                 staging->mutableHostData(), bytes);
                         first += units;
                     }
@@ -1187,19 +1249,9 @@ namespace llaminar2
                 // readback, never to unblock any measured transfer transaction.
                 retirement.reset();
                 if (direction == Direction::GpuToCpu)
-                    requireEqual<std::uint8_t>({pinned_cpu_.data(), pinned_cpu_.size()},
-                        cpu_host_.native_interleaved, "service CPU bytes");
+                    requireEqual<std::uint8_t>({pinned_cpu_.data(), pinned_cpu_.size()}, wire_oracle_, "service CPU wire bytes");
                 else
-                {
-                    requireEqual<std::uint8_t>(downloadVector(destination_payload_, stream_),
-                        destination_host_.payload, "service GPU payload");
-                    requireEqual<std::uint16_t>(downloadVector(destination_scales_, stream_),
-                        destination_host_.scales, "service GPU scales");
-                    requireEqual<std::uint16_t>(downloadVector(destination_mins_, stream_),
-                        destination_host_.mins, "service GPU minima");
-                    requireEqual<std::uint32_t>(downloadVector(destination_emins_, stream_),
-                        destination_host_.emins, "service GPU effective minima");
-                }
+                    destination_device_.check(destination_host_, stream_);
                 return result;
 #else
                 throw std::invalid_argument("The co-resident packed service benchmark is CUDA-specific");
@@ -1213,8 +1265,12 @@ namespace llaminar2
             [[nodiscard]] ExpertTierWeightProjectionIntersection rectangle(bool reverse=false) const
             {
                 using P=MoEExpertProjectionOwnership::Projection;using R=MoEProjectionResidence;
-                const P gpu{R::ParticipantOutputSlice,200,1024,11,70,32,512};
-                const P cpu{R::ParticipantInputSlice,200,1024,34,95,128,256};
+                // Benchmark host oracles prepare superblock-aligned roots.
+                // Keep the independent N strides and partial K overlap;
+                // phased coded roots are exercised by the native replay tests.
+                const bool coded = source_host_.metadata_layout != 0;
+                const P gpu{R::ParticipantOutputSlice,200,1024,11,70,coded ? 0 : 32,512};
+                const P cpu{R::ParticipantInputSlice,200,1024,34,95,coded ? 256 : 128,256};
                 return ExpertTierWeightProjectionIntersection::between(reverse?cpu:gpu,reverse?gpu:cpu);
             }
             /** @param units Existing bounded lane population. @return Original GPU→CPU manifest or explicit fixture overlap. */
@@ -1286,9 +1342,13 @@ namespace llaminar2
             {
                 if (requested == 0)
                     throw std::invalid_argument("units-per-chunk must be positive");
+                // Cap by the transferable intersection in both directions.
+                // The CPU root and GPU root have different capacities.
+                const auto live = shape_.rectangle ? std::optional(rectangle()) : std::nullopt;
+                const auto n = live ? live->rows() : shape_.N;
+                const auto k = live ? live->columns() : shape_.K;
                 const std::uint64_t units =
-                    static_cast<std::uint64_t>((shape_.N + 63) / 64) *
-                    static_cast<std::uint64_t>(shape_.K / 32);
+                    static_cast<std::uint64_t>((n + 63) / 64) * static_cast<std::uint64_t>(k / 32);
                 if (units == 0 ||
                     units > std::numeric_limits<std::uint32_t>::max())
                     throw std::invalid_argument("projection unit count is invalid");
@@ -1320,50 +1380,55 @@ namespace llaminar2
                 if (!cpuToGpuExpertPackedReference(cpu_host_, result, &error))
                     throw std::runtime_error(
                         "CPU-to-GPU reference conversion failed: " + error);
-                if(shape_.rectangle) {
-                    const auto& layout=promotion_layout_;
-                    for(int kb=0;kb<result.K/32;++kb)for(int n=0;n<result.N;++n) {
-                        if(n>=layout.gpu_first_row && n<layout.gpu_first_row+layout.N &&
-                           kb>=layout.gpu_first_column/32 && kb<(layout.gpu_first_column+layout.K)/32)continue;
-                        const size_t index=size_t(kb)*result.N+n;
-                        std::fill_n(result.payload.data()+index*result.payload_bytes_per_block,result.payload_bytes_per_block,0);
-                        result.scales[index]=0;
-                        if(!result.mins.empty())result.mins[index]=0;
-                        if(!result.emins.empty())result.emins[index]=0;
-                    }
+                if (shape_.rectangle)
+                {
+                    namespace sb = native_quantised_superblock;
+                    const auto &layout = promotion_layout_;
+                    const auto inside = [&](int n, int kb) {
+                        return n >= layout.gpu_first_row && n < layout.gpu_first_row + layout.N &&
+                               kb >= layout.gpu_first_column / 32 && kb < (layout.gpu_first_column + layout.K) / 32;
+                    };
+                    const auto code_bits = sb::superblockCodePlaneBits(result.codebook_id);
+                    const auto field_bytes = sb::superblockFieldBytes(result.codebook_id);
+                    for (int kb = 0; kb < result.K / 32; ++kb)
+                        for (int n = 0; n < result.N; ++n)
+                        {
+                            const size_t index = size_t(kb) * result.N + n;
+                            if (!inside(n, kb))
+                            {
+                                std::fill_n(result.payload.data() + index * result.payload_bytes_per_block,
+                                    result.payload_bytes_per_block, 0);
+                                if (result.metadata_layout)
+                                    for (unsigned bit = 0; bit < code_bits; ++bit)
+                                    {
+                                        const auto at = index * code_bits + bit;
+                                        result.codes[at / 8] &= ~(1u << (at % 8));
+                                    }
+                                else
+                                {
+                                    if (!result.setScaleWord(index, 0))
+                                        throw std::logic_error("Cannot initialize untouched GPU primary plane");
+                                    if (!result.mins.empty()) result.mins[index] = 0;
+                                    if (!result.emins.empty()) result.emins[index] = 0;
+                                }
+                            }
+                            if (result.metadata_layout && kb % sb::kBlocksPerSuperblock == 0 &&
+                                (kb + sb::kBlocksPerSuperblock <= layout.gpu_first_column / 32 ||
+                                 !inside(n, std::max(kb, layout.gpu_first_column / 32))))
+                            {
+                                const auto address = sb::blockMajorAddress(kb, n, result.N, 0);
+                                std::fill_n(result.superblocks.data() + address.superblock * field_bytes, field_bytes, 0);
+                            }
+                        }
                 }
                 return result;
             }
 
-            /** @return Exact read-only view over persistent source allocations. */
-            [[nodiscard]] ExpertTierGpuConstProjectionView sourceView() const
-            {
-                return ExpertTierGpuConstProjectionView{
-                    .payload = source_payload_.data(),
-                    .scales = source_scales_.data(),
-                    .mins = source_mins_.data(),
-                    .emins = source_emins_.data(),
-                    .payload_bytes = source_payload_.bytes(),
-                    .scales_bytes = source_scales_.bytes(),
-                    .mins_bytes = source_mins_.bytes(),
-                    .emins_bytes = source_emins_.bytes(),
-                };
-            }
+            /** @return Exact read-only descriptor of the fixture source. */
+            [[nodiscard]] ExpertTierGpuConstProjectionView sourceView() { return source_device_.view().asConst(); }
 
-            /** @return Exact writable view over persistent destination allocations. */
-            [[nodiscard]] ExpertTierGpuMutableProjectionView destinationView()
-            {
-                return ExpertTierGpuMutableProjectionView{
-                    .payload = destination_payload_.data(),
-                    .scales = destination_scales_.data(),
-                    .mins = destination_mins_.data(),
-                    .emins = destination_emins_.data(),
-                    .payload_bytes = destination_payload_.bytes(),
-                    .scales_bytes = destination_scales_.bytes(),
-                    .mins_bytes = destination_mins_.bytes(),
-                    .emins_bytes = destination_emins_.bytes(),
-                };
-            }
+            /** @return Exact writable descriptor of the fixture destination. */
+            [[nodiscard]] ExpertTierGpuMutableProjectionView destinationView() { return destination_device_.view(); }
 
             /** Enqueue one chunk conversion without any DMA for kernel profiling. */
             void enqueueOneKernel(Direction direction)
@@ -1488,14 +1553,7 @@ namespace llaminar2
             ExpertTierWeightDeviceLayout promotion_layout_;
             HostGpuExpertPackedProjection destination_host_;
             BenchmarkStream stream_;
-            DeviceBuffer<std::uint8_t> source_payload_;
-            DeviceBuffer<std::uint16_t> source_scales_;
-            DeviceBuffer<std::uint16_t> source_mins_;
-            DeviceBuffer<std::uint32_t> source_emins_;
-            DeviceBuffer<std::uint8_t> destination_payload_;
-            DeviceBuffer<std::uint16_t> destination_scales_;
-            DeviceBuffer<std::uint16_t> destination_mins_;
-            DeviceBuffer<std::uint32_t> destination_emins_;
+            BenchmarkGpuProjection source_device_, destination_device_;
             DeviceBuffer<std::uint8_t> device_chunk_;
             PinnedBytes pinned_cpu_;
             bool promotion_input_prepared_ = false;
