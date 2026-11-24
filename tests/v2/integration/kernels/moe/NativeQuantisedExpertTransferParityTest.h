@@ -1540,11 +1540,14 @@ namespace llaminar2::test
             }
 
             std::string error;
+            // The first chunk may omit a superblock header that a later
+            // chunk must send. Reserve for any allowed chunk, not the first.
+            const auto staging_bytes = layout.maximum_units_per_chunk * layout.cpuStorage().maximumWireUnitBytes();
             ExpertTierWeightTransferLane lane({
                 .device = device,
                 .staging = TransferEngine::instance()
                                .allocatePersistentTransferStagingSlices(
-                                   layout.chunkBytes(layout.maximum_units_per_chunk),
+                                   staging_bytes,
                                    1u,
                                    device)
                                .front(),
@@ -1587,6 +1590,7 @@ namespace llaminar2::test
             }
             result.stats = lane.stats();
             if (result.stats.transfers_completed != 1u ||
+                result.stats.bytes_submitted != layout.chunkBytes(layout.unit_count) ||
                 result.stats.timing_measurement_failures != 0u ||
                 !result.stats.last_measurement.valid() ||
                 result.stats.last_measurement.device_nanoseconds == 0u ||
@@ -1848,19 +1852,18 @@ namespace llaminar2::test
     } // namespace native_quantised_transfer_parity_detail
 
     /**
-     * @brief Prove promoted codebook-23 weights through grouped MoE execution.
+     * @brief Prove actual CPU-to-GPU Q5_K arrivals through grouped MoE execution.
      *
-         * Three real Q5_K projections are prepared twice: the ordinary compact GPU
-     * load path publishes codebook 7, while the CPU-cold promotion path streams
-     * the same mathematical weights into codebook 23. Both descriptor payloads
-     * then execute the production grouped route plan at verifier and long-prefill
-     * sizes. Final outputs and canonical route contributions must be byte equal.
+     * Prepare independent source-native and CPU-migrated Q5_K descriptors.
+     * Both must retain the original payload, codes and superblock headers.
+     * The production grouped route plan, at verifier and long-prefill sizes,
+     * must yield identical canonical route contributions and final outputs.
      *
      * @param backend_label Stable diagnostic label (CUDA or ROCm).
      * @param device Physical backend endpoint.
      * @param stream Explicit non-null production stream.
      */
-    inline void runExpandedAsymmetricGroupedMoEParity(
+    inline void runMigratedQ5KGroupedMoEParity(
         const char *backend_label,
         DeviceId device,
         void *stream)
@@ -1868,11 +1871,11 @@ namespace llaminar2::test
         using namespace native_quantised_transfer_parity_detail;
         if (!backend_label || !device.is_gpu() || !stream)
             throw std::invalid_argument(
-                "Grouped asymmetric parity requires a GPU and explicit stream");
+                "Grouped Q5_K migration parity requires a GPU and explicit stream");
         IBackend *backend = getBackendFor(device);
         if (!backend)
             throw std::runtime_error(
-                "Grouped asymmetric parity backend is unavailable");
+                "Grouped Q5_K migration parity backend is unavailable");
 
         constexpr int kDModel = 2048;
         constexpr int kIntermediate = 512;
@@ -1890,7 +1893,7 @@ namespace llaminar2::test
             device.is_cuda() ? 2910000u : 2920000u;
         const std::string prefix =
             std::string("test.") + backend_label +
-            ".expanded_asymmetric_grouped";
+            ".migrated_q5k_grouped";
         const DeviceNativeQuantisedMatrixDesc compact_gate =
             prepareMatrixDescriptor(
                 format,
@@ -1937,7 +1940,8 @@ namespace llaminar2::test
         {
             ASSERT_TRUE(cpu::native_quantised::packWeightsCPUNativeQuantised(
                 weights[index].get(), cpu_weights[index]));
-            ASSERT_TRUE(cpu_weights[index].usesExpandedInt8());
+            ASSERT_TRUE(cpu::native_quantised::preparedSuperblockCoded(cpu_weights[index].encoding));
+            ASSERT_EQ(cpu_weights[index].payload_bytes, native_quantised_formats::Q5_K.payload_bytes);
             ASSERT_TRUE(cpu_weights[index].is_asymmetric);
         }
         auto promoted_gate = promoteCPUProjection(
@@ -1958,6 +1962,20 @@ namespace llaminar2::test
             cpu_weights[2],
             ExpertTierWeightProjection::Down,
             model_base + 13u);
+
+        for (const auto [arrival, original] : {std::pair{&promoted_gate.descriptor, &compact_gate},
+                 std::pair{&promoted_up.descriptor, &compact_up}, std::pair{&promoted_down.descriptor, &compact_down}})
+        {
+            ASSERT_TRUE(arrival->valid());
+            ASSERT_NE(arrival->payload, original->payload);
+            ASSERT_EQ(arrival->codebook_id, original->codebook_id);
+            ASSERT_TRUE(arrival->source_identity_present);
+            ASSERT_EQ(arrival->source_codebook_id, original->source_codebook_id);
+            ASSERT_EQ(arrival->source_is_superblock, original->source_is_superblock);
+            ASSERT_NE(arrival->metadata_layout, 0u);
+            ASSERT_EQ(arrival->metadata_layout, original->metadata_layout);
+            ASSERT_EQ(arrival->allocation_payload_bytes_per_block, native_quantised_formats::Q5_K.payload_bytes);
+        }
 
         const auto make_experts = [&](
             const DeviceNativeQuantisedMatrixDesc &gate,

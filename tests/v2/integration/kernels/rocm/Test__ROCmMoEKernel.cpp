@@ -29690,16 +29690,15 @@ TEST(
 }
 
 /**
- * @brief Prove CPU-cold asymmetric experts remain exact after ROCm promotion.
+ * @brief Prove CPU-cold Q5_K experts retain exact ROCm grouped output.
  *
- * The shared regression streams real CPU ExpandedInt8 gate, up, and down
- * projections through the production transfer lane. It then compares compact
- * codebook-7 execution with promoted codebook-23 execution through the actual
- * grouped sparse-MoE kernels at verifier and long-prefill row counts.
+ * The shared regression moves real coded Q5_K through the production transfer
+ * lane, then compares grouped execution with independent source-native weights
+ * at verifier and long-prefill row counts.
  */
 TEST(
     Test__ROCmMoEKernel,
-    CPUColdPromotedAsymmetricGroupedDecodeAndPrefillMatchCompactBytes)
+    CPUColdMigratedQ5KGroupedDecodeAndPrefillMatchOriginalBytes)
 {
     int device_count = 0;
     ASSERT_EQ(hipGetDeviceCount(&device_count), hipSuccess);
@@ -29707,7 +29706,7 @@ TEST(
         GTEST_SKIP() << "No ROCm device available";
     ASSERT_EQ(hipSetDevice(0), hipSuccess);
 
-    llaminar2::test::runExpandedAsymmetricGroupedMoEParity(
+    llaminar2::test::runMigratedQ5KGroupedMoEParity(
         "ROCm",
         llaminar2::DeviceId::rocm(0),
         rocmMoETestStream());

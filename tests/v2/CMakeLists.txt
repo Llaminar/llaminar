@@ -12505,9 +12505,9 @@ add_v2_test(V2_Integration_CUDA_MoEAsyncHistogramBorrowedStreamRetirement
 )
 add_v2_test(V2_Integration_CUDA_MoEOverlayCPUColdPromotionGroupedParity
     COMMAND $<TARGET_FILE:v2_integration_cuda_moe_kernel>
-            --gtest_filter=Test__CUDAMoEKernel.CPUColdPromotedAsymmetricGroupedDecodeAndPrefillMatchCompactBytes
+            --gtest_filter=Test__CUDAMoEKernel.CPUColdMigratedQ5KGroupedDecodeAndPrefillMatchOriginalBytes
             --gtest_brief=1
-    LABELS "V2;Integration;CUDA;CPU;MoE;ExpertOverlay;CPUCold;Promotion;WeightStreaming;ExpandedInt8;GroupedDecode;GroupedVerifierRows;LongPrefill;Async;PerfStats;ByteExact;NoBlocking"
+    LABELS "V2;Integration;CUDA;CPU;MoE;ExpertOverlay;CPUCold;Promotion;WeightStreaming;FileDensity;GroupedDecode;GroupedVerifierRows;LongPrefill;Async;PerfStats;ByteExact;NoBlocking"
     MPI_PROCS 1
     NO_MODELS
     TIMEOUT 30
@@ -24345,9 +24345,9 @@ add_v2_test(V2_Integration_ROCmIQ2SFusedMoEOriginalEquation
     )
     add_v2_test(V2_Integration_ROCm_MoEOverlayCPUColdPromotionGroupedParity
         COMMAND $<TARGET_FILE:v2_integration_rocm_moe_kernel>
-                --gtest_filter=Test__ROCmMoEKernel.CPUColdPromotedAsymmetricGroupedDecodeAndPrefillMatchCompactBytes
+                --gtest_filter=Test__ROCmMoEKernel.CPUColdMigratedQ5KGroupedDecodeAndPrefillMatchOriginalBytes
                 --gtest_brief=1
-        LABELS "V2;Integration;ROCm;CPU;MoE;ExpertOverlay;CPUCold;Promotion;WeightStreaming;ExpandedInt8;GroupedDecode;GroupedVerifierRows;LongPrefill;Async;PerfStats;ByteExact;NoBlocking;PartialColumnTile"
+        LABELS "V2;Integration;ROCm;CPU;MoE;ExpertOverlay;CPUCold;Promotion;WeightStreaming;FileDensity;GroupedDecode;GroupedVerifierRows;LongPrefill;Async;PerfStats;ByteExact;NoBlocking;PartialColumnTile"
         MPI_PROCS 1
         NO_MODELS
         TIMEOUT 30

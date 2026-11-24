@@ -28318,16 +28318,15 @@ TEST_F(
 }
 
 /**
- * @brief Prove CPU-cold asymmetric experts remain exact after CUDA promotion.
+ * @brief Prove CPU-cold Q5_K experts retain exact CUDA grouped output.
  *
- * The shared regression streams real CPU ExpandedInt8 gate, up, and down
- * projections through the production transfer lane. It then compares compact
- * codebook-7 execution with promoted codebook-23 execution through the actual
- * grouped sparse-MoE kernels at verifier and long-prefill row counts.
+ * The shared regression moves real coded Q5_K through the production transfer
+ * lane, then compares grouped execution with independent source-native weights
+ * at verifier and long-prefill row counts.
  */
 TEST_F(
     Test__CUDAMoEKernel,
-    CPUColdPromotedAsymmetricGroupedDecodeAndPrefillMatchCompactBytes)
+    CPUColdMigratedQ5KGroupedDecodeAndPrefillMatchOriginalBytes)
 {
 #ifndef HAVE_CUDA
     GTEST_SKIP() << "CUDA support not compiled";
@@ -28335,7 +28334,7 @@ TEST_F(
     if (!hasCudaDevice())
         GTEST_SKIP() << "No CUDA device available";
 
-    llaminar2::test::runExpandedAsymmetricGroupedMoEParity(
+    llaminar2::test::runMigratedQ5KGroupedMoEParity(
         "CUDA",
         llaminar2::DeviceId::cuda(0),
         stream_);
