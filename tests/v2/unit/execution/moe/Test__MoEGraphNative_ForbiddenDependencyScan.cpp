@@ -3250,9 +3250,18 @@ namespace llaminar2::test
             << "Histogram sidebands and the legacy payload path use gathers, not activation allreduces.";
         EXPECT_NE(ffn_body.find("moe_rebalance_histogram_sideband"),
                   std::string::npos);
-        EXPECT_NE(ffn_body.find("std::max(1u, wave_count), binding.config.num_experts)"),
-                  std::string::npos)
-            << "Even diagnostic histogram sidebands must be sized by the rolling wave, not the full model.";
+        const auto histogram_sideband_begin = ffn_body.find("auto makeGraphRebalanceStateSidebands");
+        const auto histogram_sideband_end = ffn_body.find("auto takeGraphRebalanceStateSidebands");
+        ASSERT_NE(histogram_sideband_begin, std::string::npos);
+        ASSERT_NE(histogram_sideband_end, std::string::npos);
+        ASSERT_LT(histogram_sideband_begin, histogram_sideband_end);
+        const auto histogram_sideband = ffn_body.substr(histogram_sideband_begin,
+            histogram_sideband_end - histogram_sideband_begin);
+        EXPECT_NE(histogram_sideband.find("DeviceMoERebalanceWorkspaceCapacity::fromRuntime(binding.config"),
+                  std::string::npos);
+        EXPECT_NE(histogram_sideband.find("capacity.matchesHistogramConfig(binding.config)"), std::string::npos);
+        EXPECT_NE(histogram_sideband.find("capacity.localHistogramWords()"), std::string::npos)
+            << "Even diagnostic histogram sidebands must use the admitted rolling-wave wire extent.";
         EXPECT_EQ(ffn_body.find("moe_rebalance_directory_sideband"),
                   std::string::npos)
             << "Collective payload transfer should not allgather peer descriptor directories.";
