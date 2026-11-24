@@ -261,17 +261,17 @@ namespace llaminar2::cpu::native_quantised
         void sealPublication() { native_interleaved.seal(descriptor()); }
 
         /**
-         * @brief Write the benign value into every padding metadata word of a partial final chunk.
+         * @brief Normalize metadata that admission checks in a partial final chunk's padding.
          * @throws std::invalid_argument For an unknown source/encoding or a non-canonical stored extent.
          * @throws std::overflow_error For unrepresentable geometry.
          * @throws std::logic_error If owner fields disagree with the canonical geometry.
          * @details Producers call this after their last live write and before
          * sealPublication(), inside the generation they own. Movement transfers
-         * live columns only; padding words of the final chunk would otherwise keep
-         * whatever the storage held, while every ISA's readers load whole vectors.
-         * Zero is in-domain for every secondary word (IQ3_S, IQ4_XS and IQ2_S
-         * coefficients, Q6_K coefficients, FP16 minima). Payload bytes, primary
-         * scales and live columns are untouched; nothing is allocated.
+         * live columns only; padding fields would otherwise retain arbitrary
+         * bytes in the retired slot, while the seal checks whole SIMD vectors.
+         * Inline secondary words accept zero, and the native MXFP4 exponent
+         * uses zero as its prepared zero-scale marker. Payload, unchecked
+         * metadata, and every live column remain untouched; nothing is allocated.
          */
         void normalizePaddingMetadata()
         {
@@ -283,8 +283,11 @@ namespace llaminar2::cpu::native_quantised
             if (geometry.padded_columns != N_padded || geometry.blocks_per_row != blocks_per_row ||
                 geometry.data_stride != data_stride || geometry.interleaved_block_stride != interleaved_block_stride)
                 throw std::logic_error("Native CPU padding normalization requires the descriptor-owned geometry");
-            if (!geometry.has_secondary || geometry.columns % 64 == 0)
+            const bool byte_scale = scaleEncoding() == CPUNativeQuantisedScaleEncoding::E8M0;
+            if ((!geometry.has_secondary && !byte_scale) || geometry.columns % 64 == 0)
                 return;
+            const std::size_t field_bytes = byte_scale ? 1u : sizeof(std::uint16_t);
+            const std::size_t field_offset = byte_scale ? geometry.data_stride : geometry.secondary_offset;
             const std::size_t chunks = std::size_t(geometry.padded_columns / 64);
             const std::size_t blocks = std::size_t(geometry.blocks_per_row);
             const std::size_t stride = std::size_t(geometry.interleaved_block_stride);
@@ -292,8 +295,8 @@ namespace llaminar2::cpu::native_quantised
             const auto bytes = native_interleaved.unsealedGenerationBytes();
             for (std::size_t block = 0; block < blocks; ++block)
             {
-                auto *words = bytes.data() + ((chunks - 1) * blocks + block) * stride + std::size_t(geometry.secondary_offset);
-                std::memset(words + live * sizeof(std::uint16_t), 0, (64 - live) * sizeof(std::uint16_t));
+                auto *plane = bytes.data() + ((chunks - 1) * blocks + block) * stride + field_offset;
+                std::memset(plane + live * field_bytes, 0, (64 - live) * field_bytes);
             }
         }
 

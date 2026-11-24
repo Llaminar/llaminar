@@ -293,28 +293,19 @@ namespace
             }
             if (const auto *packed = projection.engine->exportCPUNativeQuantisedPackedWeights())
             {
-                // Real prepared experts carry admitted source coefficients:
-                // clamp the seeded words into their encoding's domain, then
-                // admit the publication like a producer does.
-                const std::uint16_t permitted = packed->usesIQ3SExpandedSourceScale() ? 15
-                    : packed->usesNibbleLUTSourceScale() ? 63
-                    : 0xffff;
-                if (permitted != 0xffff)
-                {
-                    const std::size_t units = std::size_t(packed->N_padded / 64) * std::size_t(packed->blocks_per_row);
-                    const std::size_t secondary = std::size_t(packed->data_stride) +
-                        (packed->usesInlineCompensation() ? 256u : 128u);
-                    for (std::size_t unit = 0; unit < units; ++unit)
-                        for (std::size_t column = 0; column < 64; ++column)
+                // Seed MXFP4's single-byte exponent plane inside its admitted
+                // range, including inactive columns that SIMD may read. Coded
+                // superblocks have no inline secondary words to normalize.
+                using namespace cpu::native_quantised;
+                if (packed->scaleEncoding() == CPUNativeQuantisedScaleEncoding::E8M0)
+                    for (int chunk = 0; chunk < packed->N_padded / 64; ++chunk)
+                        for (int block = 0; block < packed->blocks_per_row; ++block)
                         {
-                            auto *word = projection.destination_bytes.data() +
-                                unit * std::size_t(packed->interleaved_block_stride) + secondary + column * 2;
-                            std::uint16_t value = 0;
-                            std::memcpy(&value, word, sizeof(value));
-                            value &= permitted;
-                            std::memcpy(word, &value, sizeof(value));
+                            auto *exponents = projection.destination_bytes.data() +
+                                packed->geometry().blockOffset(chunk, block) + packed->data_stride;
+                            for (int column = 0; column < 64; ++column)
+                                exponents[column] = 112 + (exponents[column] % 32);
                         }
-                }
                 projection.engine->admitCPUNativeQuantisedPublication();
             }
             switch (projection.projection)
@@ -1999,6 +1990,51 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric, PreparedGPUServiceMissingResidentC
     }
 }
 
+/** @test A partial MXFP4 slot must seal after a live-only transfer, without repairing invalid live exponents. */
+TEST(Test__MoEOverlayPhysicalResidencyFabric, MXFP4PublicationNormalizesOnlyPaddingExponents)
+{
+    using namespace cpu::native_quantised;
+    const auto &source = native_quantised_formats::MXFP4;
+    const auto expert = makeSourceExpert(0, 0, 19, ExpertWeightFormat::nativeQuantised({
+        .codebook_id = source.codebook_id, .is_superblock = source.is_superblock, .present = true}));
+    const auto engine = expert.gate();
+    const auto *packed = engine->exportCPUNativeQuantisedPackedWeights();
+    ASSERT_NE(packed, nullptr);
+    ASSERT_EQ(packed->scaleEncoding(), CPUNativeQuantisedScaleEncoding::E8M0);
+    ASSERT_EQ(packed->N, 32);
+    ASSERT_GT(packed->blocks_per_row, 1);
+    const auto expected = livePreparedBytes(expert);
+    auto retired = engine->beginRetiredCPUNativeQuantisedRewrite();
+    ASSERT_FALSE(retired.empty());
+    EXPECT_FALSE(packed->publicationSealed());
+    for (int b = 0; b < packed->blocks_per_row; ++b)
+    {
+        const auto offset = packed->geometry().blockOffset(0, b);
+        // A compact transfer never writes this slot's padding. Leave a
+        // payload canary there too, proving that the repair touches only the
+        // actual field scanned at admission, not the whole padded column.
+        retired[offset + packed->N * 4] = 0x5a;
+        auto *plane = retired.data() + offset + packed->data_stride;
+        std::fill(plane + packed->N, plane + 64, std::uint8_t{0xff});
+    }
+    auto &live = retired[packed->data_stride];
+    const auto saved = live;
+    live = 0xff;
+    EXPECT_THROW(engine->admitCPUNativeQuantisedPublication(), std::invalid_argument);
+    EXPECT_FALSE(packed->publicationSealed());
+    EXPECT_EQ(live, 0xff);
+    live = saved;
+    ASSERT_NO_THROW(engine->admitCPUNativeQuantisedPublication());
+    EXPECT_EQ(livePreparedBytes(expert), expected);
+    const auto view = packed->readView();
+    for (int b = 0; b < packed->blocks_per_row; ++b)
+    {
+        const auto *plane = view.admittedE8M0Scales(0, b);
+        EXPECT_TRUE(std::all_of(plane + packed->N, plane + 64, [](auto e) { return e == 0; }));
+        EXPECT_EQ(view.bytes()[view.geometry().blockOffset(0, b) + packed->N * 4], 0x5a);
+    }
+}
+
 /** @test The independent equality oracle ignores only inactive padding and detects every live field class. */
 TEST(Test__MoEOverlayPhysicalResidencyFabric, LiveNativeOracleDistinguishesDirtyPaddingAndEveryEncodedField)
 {
@@ -2013,9 +2049,9 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric, LiveNativeOracleDistinguishesDirty
         auto engine=changed.gate();
         const auto* packed=engine->exportCPUNativeQuantisedPackedWeights();ASSERT_TRUE(packed);
         ASSERT_EQ(packed->N,32);ASSERT_GE(packed->N_padded,64);
-        // This source fixture has never been published. Its actual slot owner
-        // grants the retired-storage mutation API, not a const-cast/live write.
-        auto bytes=engine->exportRetiredCPUNativeQuantisedStorage();ASSERT_FALSE(bytes.empty());
+        // This source fixture has no readers. Its slot owner opens an unsealed
+        // rewrite generation; no const-cast or mutation of a published view.
+        auto bytes=engine->beginRetiredCPUNativeQuantisedRewrite();ASSERT_FALSE(bytes.empty());
         const size_t inactive_data_byte=size_t(packed->N)*4;
         const auto before=bytes[inactive_data_byte];bytes[inactive_data_byte]^=0x80;
         EXPECT_NE(bytes[inactive_data_byte],before);
@@ -2039,6 +2075,8 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric, LiveNativeOracleDistinguishesDirty
             for (unsigned byte = 0; byte < native_quantised_superblock::superblockFieldBytes(book); ++byte)
                 fields.push_back(header + byte);
         }
+        else if (packed->scaleEncoding() == cpu::native_quantised::CPUNativeQuantisedScaleEncoding::E8M0)
+            fields.push_back(packed->data_stride);
         else
             for(size_t plane=0;plane<(size_t(packed->interleaved_block_stride)-packed->data_stride)/128;++plane)
                 for(size_t byte=0;byte<2;++byte)fields.push_back(packed->data_stride+plane*128+byte);
