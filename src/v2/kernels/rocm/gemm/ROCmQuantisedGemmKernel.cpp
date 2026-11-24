@@ -35,6 +35,7 @@
  * or the enclosing whole HIP capture; no global ordinal resource pool survives.
  */
 
+#include "kernels/cpu/gemm/CPUNativeQuantisedEncoding.h"
 #include "kernels/common/HCDownOutputPublication.h"
 #include "kernels/common/ProjectionWorkLaunch.h"
 #include "ROCmQuantisedActivationProducers.h"
@@ -1214,14 +1215,10 @@ namespace llaminar2
             impl_->d_weights_native_emins = d_native_emins;
             impl_->native_quantised_codebook_id = codebook_id;
             impl_->native_quantised_blocks_per_row = blocks_per_row;
-            // Coded metadata is immutable source storage: never a reusable slot
-            // whose later arrivals carry per-block planes. Its superblock plane
-            // occupies the secondary slot.
             if (!nativeQuantisedLayoutValid(codebook_id, metadata_layout) ||
-                (metadata_layout != 0 && allocation_format.payload_bytes_per_block != 0) ||
-                (nativeQuantisedLayoutRepresentation(metadata_layout) ==
-                     NativeQuantisedMetadataRepresentation::SuperblockCoded &&
-                 !d_native_mins))
+                (metadata_layout && (!d_native_mins || d_native_emins || !d_native_scales ||
+                    (native_quantised_superblock::superblockCodeInPayload(codebook_id) &&
+                        d_native_scales != d_native_quantised))))
                 throw std::invalid_argument(
                     "[ROCmQuantisedGemmKernel] invalid metadata layout for prepared weights");
             impl_->native_metadata_layout = metadata_layout;
@@ -1243,6 +1240,11 @@ namespace llaminar2
             impl_->native_source_identity = source_identity;
             if (allocation_format.payload_bytes_per_block != 0)
             {
+                const bool coded = cpu::native_quantised::migrationUsesSuperblockCodes(*source_format);
+                if (coded != (metadata_layout != 0) || (coded &&
+                    (allocation_format.payload_bytes_per_block != source_format->payload_bytes ||
+                        !allocation_format.has_mins || allocation_format.has_emins)))
+                    throw std::invalid_argument("[ROCmQuantisedGemmKernel] Reusable slot does not preserve the source's migration metadata layout");
                 const auto execution_format =
                     codebook_id == canonicalDeviceVnniCodebookId(*source_format)
                         ? canonicalDeviceVnniFormat(*source_format)
@@ -1251,7 +1253,7 @@ namespace llaminar2
                         execution_format.payload_bytes_per_block ||
                     (execution_format.is_asymmetric &&
                      !allocation_format.has_mins) ||
-                    (execution_format.has_emins &&
+                    (!coded && execution_format.has_emins &&
                      !allocation_format.has_emins))
                 {
                     throw std::invalid_argument(

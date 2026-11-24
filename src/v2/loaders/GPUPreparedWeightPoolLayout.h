@@ -52,8 +52,7 @@ namespace llaminar2
      * @brief Whether one prepared GPU matrix stores superblock-coded metadata.
      *
      * CUDA and ROCm immutable source matrices use the native codec whenever supported.
-     * CUDA migration slots use it exactly when the CPU retains original codes.
-     * ROCm migration for coded CPU roots is unavailable until its native port lands.
+     * Reusable CUDA and ROCm migration slots use it when the CPU retains original codes.
      *
      * @param source Original GGUF codebook metadata.
      * @param layout Pool stride policy of the matrix.
@@ -64,11 +63,7 @@ namespace llaminar2
     {
         if (layout == GPUPreparedWeightPoolLayout::MigrationReusable &&
             cpu::native_quantised::migrationUsesSuperblockCodes(source))
-        {
-            if (device.is_rocm())
-                throw std::invalid_argument("ROCm migration-reusable slots require the HIP superblock-coded migration port");
-            return device.is_cuda();
-        }
+            return device.is_cuda() || device.is_rocm();
         return layout == GPUPreparedWeightPoolLayout::SourceNative && (device.is_cuda() || device.is_rocm()) &&
                source.is_superblock &&
                nativeQuantisedSuperblockCodable(canonicalDeviceVnniCodebookId(source));

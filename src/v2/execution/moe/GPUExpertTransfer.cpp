@@ -80,7 +80,11 @@ namespace llaminar2
             if (src_device.is_cuda() && dst_device.is_cuda() && stream)
                 return detail::transferCodedExpertCUDA(src, dst, src_device, dst_device, stream);
 #endif
-            LOG_ERROR("[GPUExpertTransfer] Coded expert movement requires CUDA and an explicit destination stream");
+#ifdef HAVE_ROCM
+            if (src_device.is_rocm() && dst_device.is_rocm() && stream)
+                return detail::transferCodedExpertROCm(src, dst, src_device, dst_device, stream);
+#endif
+            LOG_ERROR("[GPUExpertTransfer] Coded expert movement requires a matching GPU backend and an explicit destination stream");
             return false;
         }
         return transferExpert(src.ptrs, dst.ptrs, src_device, dst_device,

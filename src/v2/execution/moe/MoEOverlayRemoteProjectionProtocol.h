@@ -40,7 +40,7 @@ namespace llaminar2
         CpuNativeQuantisedInterleaved = 1, ///< Live native CPU column planes; resident padding is excluded.
         GpuSeparatedNativeQuantised = 2,   ///< Payload/scales/mins/emins blobs.
         ContiguousFloating = 3,       ///< One raw FP16/BF16/FP32 matrix blob.
-        GpuCodedProjectionUnits = 4,  ///< Compact payload, source codes and superblock words, repacked at each CUDA endpoint.
+        GpuCodedProjectionUnits = 4,  ///< Compact payload, source codes and superblock words, repacked at each GPU endpoint.
     };
 
     /**
@@ -91,7 +91,7 @@ namespace llaminar2
     struct MoEOverlayRemoteProjectionManifest
     {
         static constexpr std::uint32_t kMagic = 0x50524F4Du; // "MORP"
-        // ABI 7 adds the CUDA-to-CUDA coded projection wire packing.
+        // ABI 7 identifies coded projection wire packing between GPU endpoints.
         static constexpr std::uint16_t kABIVersion = 7u;
         static constexpr std::size_t kWireBytes = 244u;
 
@@ -378,8 +378,8 @@ namespace llaminar2
         const ExpertTierWeightProjectionIntersection &intersection, std::uint32_t capacity);
 
     /**
-     * @brief Recover one endpoint's CUDA repack layout for authenticated coded GPU relay.
-     * @param manifest Complete two-CUDA endpoint manifest carrying compact source-coded units.
+     * @brief Recover one endpoint's repack layout for authenticated coded GPU relay.
+     * @param manifest Complete same-backend GPU endpoint manifest carrying compact source-coded units.
      * @param direction Pack from the source GPU, or unpack into the destination GPU.
      * @return Layout borrowing the endpoint's original geometry and the shared compact wire addressing.
      */

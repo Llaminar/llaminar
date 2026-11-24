@@ -1473,12 +1473,13 @@ bool launchVnniRepack(
         llaminar2::nativeQuantisedLayoutRepresentation(metadata_layout) ==
         llaminar2::NativeQuantisedMetadataRepresentation::SuperblockCoded;
     if (!llaminar2::nativeQuantisedLayoutValid(repackSuperblockCodebook(format), metadata_layout) ||
-        (metadata_layout != 0 && (!coded ||
-            llaminar2::nativeQuantisedLayoutPhase(metadata_layout) !=
-                static_cast<uint32_t>(columns.firstBlock() % 8) ||
-            (!d_scales && !llaminar2::native_quantised_superblock::superblockCodeInPayload(
-                              repackSuperblockCodebook(format))) ||
-            !d_mins)))
+        (coded && (llaminar2::nativeQuantisedLayoutPhase(metadata_layout) !=
+                       static_cast<uint32_t>(columns.firstBlock() % 8) ||
+                   llaminar2::nativeQuantisedLayoutCodeBitShift(metadata_layout) != 0 ||
+                   allocation_payload_bytes_per_block != repackPayloadBytesPerBlock(format) ||
+                   (!d_scales && !llaminar2::native_quantised_superblock::superblockCodeInPayload(
+                                     repackSuperblockCodebook(format))) ||
+                   !d_mins || d_emins)))
         return false;
     const int source_K = columns.sourceColumns();
     const int blocks_per_row = source_K / 32;

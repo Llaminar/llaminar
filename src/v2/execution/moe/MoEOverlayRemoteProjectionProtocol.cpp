@@ -670,10 +670,10 @@ namespace llaminar2
             }
             else if (carriesCodedGpuUnits())
             {
-                if (!identity.source_device.is_cuda() || !identity.destination_device.is_cuda() ||
+                if (!identity.source_device.is_gpu() || identity.source_device.type != identity.destination_device.type ||
                     cpu_wire_columns_per_unit != 64 || !cpu::native_quantised::migrationUsesSuperblockCodes(*source) ||
                     gpu_codebook_id != canonicalDeviceVnniCodebookId(*source) || !validGpuExecutionFormat(*this, *source))
-                    return reject(error, "Coded GPU relay requires compatible CUDA endpoints and the canonical source codec");
+                    return reject(error, "Coded GPU relay requires a matching GPU backend and the canonical source codec");
                 try
                 {
                     const auto pack = codedGpuRelayLayout(*this, ExpertTierWeightConversionDirection::GpuToCpu);

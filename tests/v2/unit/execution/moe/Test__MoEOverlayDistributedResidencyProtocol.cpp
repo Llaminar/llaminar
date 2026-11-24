@@ -481,56 +481,62 @@ namespace llaminar2::test
         EXPECT_NE(error.find("GPU"), std::string::npos);
     }
 
-    /** @test GPU relay authenticates live source-code fields across independent, phased CUDA roots. */
-    TEST(Test__MoEOverlayDistributedResidencyProtocol, CodedCudaRelayAuthenticatesExactPhasedWire)
+    /** @test GPU relay authenticates live source-code fields across independent, phased GPU roots. */
+    TEST(Test__MoEOverlayDistributedResidencyProtocol, CodedGpuRelayAuthenticatesExactPhasedWire)
     {
         using Direction = ExpertTierWeightConversionDirection;
         using Projection = MoEExpertProjectionOwnership::Projection;
         using Residence = MoEProjectionResidence;
         auto fixture = makeTransaction();
-        const auto identity = remoteProjectionIdentity(fixture.transaction, DeviceId::cuda(0), DeviceId::cuda(1));
-        const Projection source{Residence::ParticipantInputSlice, 8, 512, 0, 5, 32, 288};
-        const Projection destination{Residence::ParticipantInputSlice, 8, 512, 1, 3, 96, 224};
-        const auto overlap = ExpertTierWeightProjectionIntersection::between(source, destination);
-        std::array<uint8_t, 1> payload{};
-        const GpuExpertPackedDescriptor descriptor{
-            .ptrs = {.d_vnni = payload.data(), .d_scales = payload.data(), .d_mins = payload.data()},
-            .n = 5, .k = 288, .blocks_per_row = 9, .codebook_id = 9, .payload_bytes_per_block = 12,
-            .is_asymmetric = true,
-            .metadata_layout = nativeQuantisedMetadataLayout(NativeQuantisedMetadataRepresentation::SuperblockCoded, 1, 4),
-            .vnni_bytes = 5 * 9 * 12, .scales_bytes = (5 * 9 * 12 + 4 + 7) / 8, .mins_bytes = 5 * 2 * 2};
-        const NativeQuantisedSourceIdentity provenance{.codebook_id = 9, .is_superblock = true, .present = true};
-        constexpr auto capacity = 2 * (3 * 12 + 3 + 2 + 3 * 2);
-        const auto manifest = makeMoEOverlayRemoteGpuProjectionManifest(identity, descriptor, provenance, capacity, overlap);
-        ASSERT_TRUE(manifest.carriesCodedGpuUnits());
-        ASSERT_TRUE(manifest.valid());
-        EXPECT_EQ(manifest.total_bytes, 7 * (3 * 12 + 3 + 2) + 2 * 3 * 2);
-        const auto pack = remoteCodedGpuProjectionDeviceLayout(manifest, Direction::GpuToCpu);
-        const auto unpack = remoteCodedGpuProjectionDeviceLayout(manifest, Direction::CpuToGpu);
-        EXPECT_EQ(pack.gpu_superblock_phase, 1);
-        EXPECT_EQ(unpack.gpu_superblock_phase, 3);
-        EXPECT_EQ(pack.gpu_first_column, 64);
-        EXPECT_EQ(unpack.gpu_first_column, 0);
-        EXPECT_EQ(pack.gpu_first_row, 1);
-        EXPECT_EQ(unpack.gpu_first_row, 0);
-        EXPECT_EQ(pack.maximum_units_per_chunk, 2u);
-        for (uint32_t first = 0; first < pack.unit_count; ++first)
-            EXPECT_EQ(pack.chunkBytes(1, first), unpack.chunkBytes(1, first));
-        EXPECT_FALSE(manifest.gpuRegionRange(0, 0, capacity));
-        std::array<uint8_t, MoEOverlayRemoteProjectionManifest::kWireBytes> packet{};
-        ASSERT_TRUE(encodeMoEOverlayRemoteProjectionManifest(manifest, packet));
-        MoEOverlayRemoteProjectionManifest decoded;
-        ASSERT_TRUE(decodeMoEOverlayRemoteProjectionManifest(packet, &decoded));
-        EXPECT_EQ(decoded, manifest);
-        auto malformed = manifest;
-        ++malformed.region_bytes[0];
-        ++malformed.total_bytes;
-        malformed.manifest_hash = malformed.computedHash();
-        EXPECT_FALSE(malformed.valid());
-        auto foreign = identity;
-        foreign.destination_device = DeviceId::rocm(0);
-        EXPECT_THROW((void)makeMoEOverlayRemoteGpuProjectionManifest(foreign, descriptor, provenance, capacity, overlap), std::invalid_argument);
-        EXPECT_THROW((void)makeMoEOverlayRemoteGpuProjectionManifest(identity, descriptor, provenance, 46, overlap), std::invalid_argument);
+        const std::array endpoints{std::pair{DeviceId::cuda(0), DeviceId::cuda(1)},
+                                   std::pair{DeviceId::rocm(0), DeviceId::rocm(1)}};
+        for (const auto &[origin, target] : endpoints)
+        {
+            SCOPED_TRACE(origin.toString());
+            const auto identity = remoteProjectionIdentity(fixture.transaction, origin, target);
+            const Projection source{Residence::ParticipantInputSlice, 8, 512, 0, 5, 32, 288};
+            const Projection destination{Residence::ParticipantInputSlice, 8, 512, 1, 3, 96, 224};
+            const auto overlap = ExpertTierWeightProjectionIntersection::between(source, destination);
+            std::array<uint8_t, 1> payload{};
+            const GpuExpertPackedDescriptor descriptor{
+                .ptrs = {.d_vnni = payload.data(), .d_scales = payload.data(), .d_mins = payload.data()},
+                .n = 5, .k = 288, .blocks_per_row = 9, .codebook_id = 9, .payload_bytes_per_block = 12,
+                .is_asymmetric = true,
+                .metadata_layout = nativeQuantisedMetadataLayout(NativeQuantisedMetadataRepresentation::SuperblockCoded, 1, 4),
+                .vnni_bytes = 5 * 9 * 12, .scales_bytes = (5 * 9 * 12 + 4 + 7) / 8, .mins_bytes = 5 * 2 * 2};
+            const NativeQuantisedSourceIdentity provenance{.codebook_id = 9, .is_superblock = true, .present = true};
+            constexpr auto capacity = 2 * (3 * 12 + 3 + 2 + 3 * 2);
+            const auto manifest = makeMoEOverlayRemoteGpuProjectionManifest(identity, descriptor, provenance, capacity, overlap);
+            ASSERT_TRUE(manifest.carriesCodedGpuUnits());
+            ASSERT_TRUE(manifest.valid());
+            EXPECT_EQ(manifest.total_bytes, 7 * (3 * 12 + 3 + 2) + 2 * 3 * 2);
+            const auto pack = remoteCodedGpuProjectionDeviceLayout(manifest, Direction::GpuToCpu);
+            const auto unpack = remoteCodedGpuProjectionDeviceLayout(manifest, Direction::CpuToGpu);
+            EXPECT_EQ(pack.gpu_superblock_phase, 1);
+            EXPECT_EQ(unpack.gpu_superblock_phase, 3);
+            EXPECT_EQ(pack.gpu_first_column, 64);
+            EXPECT_EQ(unpack.gpu_first_column, 0);
+            EXPECT_EQ(pack.gpu_first_row, 1);
+            EXPECT_EQ(unpack.gpu_first_row, 0);
+            EXPECT_EQ(pack.maximum_units_per_chunk, 2u);
+            for (uint32_t first = 0; first < pack.unit_count; ++first)
+                EXPECT_EQ(pack.chunkBytes(1, first), unpack.chunkBytes(1, first));
+            EXPECT_FALSE(manifest.gpuRegionRange(0, 0, capacity));
+            std::array<uint8_t, MoEOverlayRemoteProjectionManifest::kWireBytes> packet{};
+            ASSERT_TRUE(encodeMoEOverlayRemoteProjectionManifest(manifest, packet));
+            MoEOverlayRemoteProjectionManifest decoded;
+            ASSERT_TRUE(decodeMoEOverlayRemoteProjectionManifest(packet, &decoded));
+            EXPECT_EQ(decoded, manifest);
+            auto malformed = manifest;
+            ++malformed.region_bytes[0];
+            ++malformed.total_bytes;
+            malformed.manifest_hash = malformed.computedHash();
+            EXPECT_FALSE(malformed.valid());
+            auto foreign = identity;
+            foreign.destination_device = origin.is_cuda() ? DeviceId::rocm(0) : DeviceId::cuda(0);
+            EXPECT_THROW((void)makeMoEOverlayRemoteGpuProjectionManifest(foreign, descriptor, provenance, capacity, overlap), std::invalid_argument);
+            EXPECT_THROW((void)makeMoEOverlayRemoteGpuProjectionManifest(identity, descriptor, provenance, 46, overlap), std::invalid_argument);
+        }
     }
 
     /**

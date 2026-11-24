@@ -740,8 +740,6 @@ namespace llaminar2
         }
         auto &specs = format_profile.allocation_specs;
         validateSpecs(specs, format_profile.projection_set);
-        if (device.is_rocm() && std::any_of(specs.begin(), specs.end(), [](const auto &spec) { return spec.codedDeclaration().has_value(); }))
-            throw std::invalid_argument("ROCm device MoE rebalance slots require the HIP superblock-coded migration port");
         if (specs.front().format.isFloating() &&
             deviceMoEFloatingElementBytes(format_profile.floating_allocation_format) <
                 specs.front().format.floatingElementBytes())

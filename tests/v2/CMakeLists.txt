@@ -2176,12 +2176,12 @@ add_v2_routed_expert_policy_unit(
     V2_Unit_MoEOverlayDistributedResidencyProtocol
     unit/execution/moe/Test__MoEOverlayDistributedResidencyProtocol.cpp
 )
-add_v2_test(V2_Integration_CodedCudaExpertRelayWire
+add_v2_test(V2_Integration_CodedGpuExpertRelayWire
     COMMAND $<TARGET_FILE:v2_unit_moe_overlay_distributed_residency_protocol>
-        --gtest_filter=Test__MoEOverlayDistributedResidencyProtocol.CodedCudaRelayAuthenticatesExactPhasedWire
+        --gtest_filter=Test__MoEOverlayDistributedResidencyProtocol.CodedGpuRelayAuthenticatesExactPhasedWire
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MoE;Transfer;ByteExact;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
-list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CodedCudaExpertRelayWire)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CodedGpuExpertRelayWire)
 
 # MXFP4 remote GPU blobs carry exactly one E8M0 byte per block.
 add_v2_test(V2_Integration_MXFP4RemoteGpuProjectionPlanes
@@ -31099,6 +31099,10 @@ if(HAVE_ROCM)
     # exact kernel/lifecycle invariant instead of the cumulative binary wall.
     set(V2_ROCM_EXPERT_TIER_WEIGHT_PREFLIGHT_TESTS)
     set(V2_ROCM_EXPERT_TIER_WEIGHT_GTESTS
+        FileDensityPlanesRoundTripMatchesSourceNative
+        CapturedCodedPeerRectanglePreservesShiftedNeighbors
+        CodedRemoteEndpointsPreserveOriginalGpuPlanes
+        RectangularNativeMovementAllFormatsAndDirtyReplay
         PreparedServiceViewsIsolateAllQuantizedExecutionBindings
         CapturedOrdinaryM1DeferredReductionsAllFormats
         CapturedOrdinaryM1ReductionSlotWavesAndBias

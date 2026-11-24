@@ -14,6 +14,9 @@
 #ifdef HAVE_CUDA
 #include "kernels/cuda/repack/CUDAExpertTierWeightKernels.h"
 #endif
+#ifdef HAVE_ROCM
+#include "kernels/rocm/repack/ROCmExpertTierWeightKernels.h"
+#endif
 #include "backends/NativePeerTransferEventOwnership.h"
 #include "backends/ReadAheadNativeResourceObligation.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
@@ -388,14 +391,14 @@ namespace llaminar2
         if (source.metadata_layout || destination.metadata_layout)
         {
             namespace sb = native_quantised_superblock;
-            if (!config_.source_device.is_cuda() || !config_.destination_device.is_cuda() ||
+            if (!config_.source_device.is_gpu() || config_.source_device.type != config_.destination_device.type ||
                 !source.valid() || !destination.valid() || !source.metadata_layout || !destination.metadata_layout ||
                 source.codebook_id != destination.codebook_id || source.payload_bytes_per_block != destination.payload_bytes_per_block ||
                 intersection.empty() || intersection.source().rows != source.n || intersection.source().columns != source.k ||
                 intersection.destination().rows != destination.n || intersection.destination().columns != destination.k ||
                 intersection.sourceColumnOrigin() % 32 || intersection.destinationColumnOrigin() % 32 || intersection.columns() % 32)
             {
-                assignPeerError(error, "Coded peer rectangle requires matching CUDA formats and original 32-value block bounds");
+                assignPeerError(error, "Coded peer rectangle requires matching GPU backends, formats and original 32-value block bounds");
                 return false;
             }
             const auto phase = sb::superblockPhase(nativeQuantisedLayoutPhase(source.metadata_layout) + intersection.sourceColumnOrigin() / 32);
@@ -523,8 +526,9 @@ namespace llaminar2
                     config_.source_device, config_.destination_device, transfer_stream_);
             else
             {
-#ifdef HAVE_CUDA
-                copied = detail::restoreCUDADeviceOrdinal(destination_ordinal_) && launchCUDACodedPeerProjectionRectangle({
+                // Both native launches consume the same authenticated root and rectangle geometry.
+                const auto launch = [&]<class Rectangle>(auto select, auto enqueue) {
+                    const Rectangle rectangle{
                     .rows = unsigned(coded_rectangle->rows()), .blocks = unsigned(coded_rectangle->columns() / 32),
                     .payload_bytes = coded_source->payload_bytes_per_block, .codebook = coded_source->codebook_id,
                     .src_n = unsigned(coded_source->n), .dst_n = unsigned(coded_destination->n),
@@ -533,9 +537,19 @@ namespace llaminar2
                     .source = {.payload = source.d_vnni, .scales = static_cast<const uint16_t *>(source.d_scales),
                         .mins = static_cast<const uint16_t *>(source.d_mins), .metadata_layout = coded_source->metadata_layout},
                     .destination = {.payload = destination.d_vnni, .scales = static_cast<uint16_t *>(destination.d_scales),
-                        .mins = static_cast<uint16_t *>(destination.d_mins), .metadata_layout = coded_destination->metadata_layout}}, transfer_stream_);
-#else
+                        .mins = static_cast<uint16_t *>(destination.d_mins), .metadata_layout = coded_destination->metadata_layout}};
+                    return select(destination_ordinal_) && enqueue(rectangle, transfer_stream_);
+                };
                 copied = false;
+#ifdef HAVE_CUDA
+                if (config_.destination_device.is_cuda())
+                    copied = launch.template operator()<CUDACodedPeerProjectionRectangle>(
+                        detail::restoreCUDADeviceOrdinal, launchCUDACodedPeerProjectionRectangle);
+#endif
+#ifdef HAVE_ROCM
+                if (config_.destination_device.is_rocm())
+                    copied = launch.template operator()<ROCmCodedPeerProjectionRectangle>(
+                        detail::restoreROCmDeviceOrdinal, launchROCmCodedPeerProjectionRectangle);
 #endif
             }
         }

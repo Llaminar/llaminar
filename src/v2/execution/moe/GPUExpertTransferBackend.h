@@ -69,6 +69,14 @@ namespace llaminar2::detail
 #endif
 
 #ifdef HAVE_ROCM
+    /** @brief Submit payload, live code bits and superblock words on the destination HIP stream. */
+    bool transferCodedExpertROCm(const GpuExpertPackedDescriptor &source, const GpuExpertPackedDescriptor &destination,
+        const DeviceId &source_device, const DeviceId &destination_device, void *stream);
+
+    /** @brief Enqueue a bit-span copy without modifying adjacent allocation bits. */
+    bool launchCodedExpertBitCopyROCm(const void *source, void *destination, size_t bits,
+        unsigned source_shift, unsigned destination_shift, void *stream) noexcept;
+
     /** @brief Prepared capture-safe UVA byte body; expert migration keeps its explicit peer API.
      * @param destination Original destination pointer. @param destination_ordinal Exact destination GPU.
      * @param source Original source pointer. @param source_ordinal Exact source GPU.
