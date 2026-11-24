@@ -36,6 +36,15 @@
 #include "../../../../mocks/MockComputeStage.h" // MockDeviceContext
 #include "../../../../mocks/MockWorkerGPUContext.h"
 
+#ifdef HAVE_CUDA
+#include "backends/BackendManager.h"
+#include "backends/GPUDeviceContextPool.h"
+#include "execution/local_execution/graph/GraphCaptureGuard.h"
+#include "execution/moe/ICUDANativeArrivalCaptureStage.h"
+#include "kernels/cuda/moe/CUDAMoEKernel.h"
+#include <cuda_runtime.h>
+#endif
+
 using namespace llaminar2;
 
 // =========================================================================
@@ -5301,3 +5310,122 @@ TEST_F(Test__ForwardExecutionEngine, Execute_DecodeForkSummaryPublishesExactOwne
             "omp", llaminar::v2::kOpenMPTeamForkSummaryFamily));
     }
 }
+
+#ifdef HAVE_CUDA
+namespace
+{
+    /** @brief Retain the fixture's original native worker while the production engine owns capture. */
+    class CUDAArrivalForwardHost final : public MockForwardExecutionHost
+    {
+    public:
+        CUDAArrivalForwardHost(IDeviceContext &device, IWorkerGPUContext &worker)
+            : MockForwardExecutionHost(&device), worker_(worker) {}
+
+        IWorkerGPUContext *getWorkerGPUContext(DeviceId) override { return &worker_; }
+    private:
+        IWorkerGPUContext &worker_;
+    };
+
+    /** @brief Exercise the production CUDA arrival recorder under the engine's actual capture scope. */
+    class CUDAArrivalForwardStage final : public llaminar2::testing::MockComputeStage,
+                                          public ICUDANativeArrivalCaptureStage
+    {
+    public:
+        struct Storage
+        {
+            DeviceMoERebalancePlanEntry plan;
+            unsigned plan_count;
+            DeviceMoEExpertDirectoryEntry destination;
+            DeviceMoERebalanceApplyStatus status;
+            DeviceMoERebalanceArrivalScratch scratch[3];
+            uint8_t payload[sizeof(DeviceMoEExpertDirectoryEntry) + 16];
+        };
+
+        CUDAArrivalForwardStage(std::string name, DeviceId owner, Storage &storage, int &records)
+            : MockComputeStage(ComputeStageType::GEMM, std::move(name), owner),
+              storage_(storage), records_(records), kernel_(owner.ordinal) {}
+
+        std::size_t cudaLiveArrivalSites() const noexcept override { return 1; }
+
+        bool execute(IDeviceContext *) override
+        {
+            const auto stream = requireGPUStream();
+            if (!isGraphCaptureActive())
+                return false;
+            ++records_;
+            DeviceMoERebalanceConfig config;
+            config.num_layers = config.num_experts = config.top_k = config.window_size_tokens = 1u;
+            return kernel_.unpackDeviceRebalanceCollectivePayloads({.stream = stream},
+                &storage_.plan, &storage_.plan_count, 1u, nullptr, storage_.payload,
+                1u, sizeof(storage_.payload), &storage_.destination, 1u, config,
+                &storage_.status, storage_.scratch);
+        }
+    private:
+        Storage &storage_;
+        int &records_;
+        CUDAMoEKernel kernel_;
+    };
+}
+
+/** @test Cold prefix/LLEP forwards capture before any execution and replay the same native owner. */
+TEST_F(Test__ForwardExecutionEngine, CUDAColdPrefillArrivalsCaptureBeforeFirstSubmission)
+{
+    ScopedDebugEnv env({{"LLAMINAR_GPU_GRAPHS", "1"}, {"LLAMINAR_PREFILL_GRAPH_BUCKETS", "1"},
+        {"LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES", "64"}, {"LLAMINAR_PREFILL_GRAPH_MIN_SEQ", "1"},
+        {"LLAMINAR_VALIDATE_BUFFERS", "0"}, {"LLAMINAR_VALIDATE_INPUTS", "0"}, {"LLAMINAR_FAIL_ON_ZERO", "0"}});
+    ensureNvidiaFactoryRegistered();
+    const auto owner = DeviceId::cuda(0);
+    auto native_device = IDeviceContext::create(owner, 1);
+    ASSERT_NE(native_device, nullptr);
+    auto &worker = GPUDeviceContextPool::instance().getContext(owner);
+    worker.submitAndWait([&] {
+        struct State
+        {
+            int tokens[64], positions[64];
+            CUDAArrivalForwardStage::Storage arrivals[2];
+        };
+        const auto stream = static_cast<cudaStream_t>(worker.defaultStream());
+        State *device = nullptr;
+        ASSERT_EQ(cudaMalloc(&device, sizeof(State)), cudaSuccess);
+        std::unique_ptr<State, decltype(&cudaFree)> holder(device, cudaFree);
+        for (const auto [prefix, llep] : {std::pair{true, false}, std::pair{false, true}, std::pair{true, true}})
+        {
+            SCOPED_TRACE(::testing::Message() << prefix << '/' << llep);
+            ASSERT_EQ(cudaMemsetAsync(device, 0, sizeof(State), stream), cudaSuccess);
+            ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+            CUDAArrivalForwardHost host(*native_device, worker);
+            int records = 0;
+            const auto expected = int(prefix) + int(llep);
+            for (int i = 0; i < expected; ++i)
+                host.graph_stage_factories.push_back([&, i](const std::string &name, DeviceId stage_owner) {
+                    return std::make_unique<CUDAArrivalForwardStage>(name, stage_owner, device->arrivals[i], records);
+                });
+            auto engine = makeEngine();
+            auto input = makeTestInput(64, 1, owner, nullptr, nullptr);
+            input.token_ids_device = device->tokens;
+            input.position_ids_device = device->positions;
+            input.execution_phase = ForwardExecutionPhase::Prefill;
+            input.rehydrate_prefix_runtime_on_device = prefix;
+            ForwardOutput output{};
+            for (int replay = 0; replay < 2; ++replay)
+            {
+                ASSERT_TRUE(engine.execute(input, output, host));
+                ASSERT_NE(output.execution.stream, nullptr);
+                DeviceMoERebalanceApplyStatus status[2]{};
+                const auto producer = static_cast<cudaStream_t>(output.execution.stream);
+                for (int i = 0; i < expected; ++i)
+                {
+                    ASSERT_EQ(cudaMemcpyAsync(&status[i], &device->arrivals[i].status, sizeof(status[i]),
+                        cudaMemcpyDeviceToHost, producer), cudaSuccess);
+                    ASSERT_EQ(cudaMemsetAsync(&device->arrivals[i].status, 0, sizeof(status[i]), producer), cudaSuccess);
+                }
+                ASSERT_EQ(cudaStreamSynchronize(producer), cudaSuccess);
+                for (int i = 0; i < expected; ++i)
+                    EXPECT_EQ(status[i].local_transfer_slot_count, 1u);
+                EXPECT_EQ(records, expected);
+                EXPECT_EQ(host.build_forward_graph_calls, 1);
+            }
+        }
+    });
+}
+#endif

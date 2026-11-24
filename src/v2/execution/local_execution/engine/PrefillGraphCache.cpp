@@ -4,6 +4,9 @@
  */
 
 #include "PrefillGraphCache.h"
+#ifdef HAVE_CUDA
+#include "backends/cuda/CUDAGraphCapture.h"
+#endif
 #include "../../../utils/Logger.h"
 
 #include <chrono>
@@ -379,7 +382,8 @@ namespace llaminar2
         IWorkerGPUContext *gpu_ctx,
         void *stream,
         const std::function<bool()> &record_graph_body,
-        GraphCaptureDependencyLedger *dependency_ledger)
+        GraphCaptureDependencyLedger *dependency_ledger,
+        std::size_t expected_cuda_arrival_sites)
     {
         auto it = entries_.find(key);
         if (it == entries_.end() ||
@@ -481,6 +485,19 @@ namespace llaminar2
         {
             LOG_ERROR("[PrefillGraphCache] instantiate() failed");
             entry.capture.reset();
+            entry.phase = PrefillGraphPhase::Cold;
+            return false;
+        }
+
+        std::size_t lowered = 0u;
+#ifdef HAVE_CUDA
+        if (const auto *cuda = dynamic_cast<const CUDAGraphCapture *>(pending_capture.get()))
+            lowered = cuda->loweredLiveLaunchSiteCount();
+#endif
+        if (lowered != expected_cuda_arrival_sites)
+        {
+            LOG_ERROR("[PrefillGraphCache] CUDA arrival-site declaration differs from native bindings: declared="
+                << expected_cuda_arrival_sites << " lowered=" << lowered);
             entry.phase = PrefillGraphPhase::Cold;
             return false;
         }

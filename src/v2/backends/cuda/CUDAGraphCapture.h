@@ -391,7 +391,7 @@ namespace llaminar2
         GraphUpdateResult tryUpdate() override;
         [[nodiscard]] bool supportsExecutableUpdate() const noexcept override
         {
-            return recording_role_ == RecordingRole::Owner && !timeline_recording_ && deferred_launches_.empty() && !lowered_executable_;
+            return recording_role_ == RecordingRole::Owner && !timeline_recording_ && deferred_launches_.empty() && lowered_live_launch_sites_ == 0u;
         }
         bool hasExecutable() const override;
         [[nodiscard]] std::size_t residentMemoryBytes() const noexcept override
@@ -419,6 +419,8 @@ namespace llaminar2
 
         /** @return Incremental pool quote for the actual final-owner import inventory. */
         [[nodiscard]] std::size_t liveLaunchReservationBytes() const;
+        /** @return Distinct native update bindings authenticated during instantiation of this executable. */
+        [[nodiscard]] std::size_t loweredLiveLaunchSiteCount() const noexcept { return lowered_live_launch_sites_; }
 
         /** @brief Import a template into an exact native scope of this unfinished owner. */
         [[nodiscard]] cudaError_t importKernelLaunchTemplate(cudaGraphNode_t *node, cudaGraph_t destination,
@@ -452,7 +454,7 @@ namespace llaminar2
         void moveActiveCaptureRegistration(CUDAGraphCapture &source) noexcept;
 
         std::vector<DeferredLaunchSite> deferred_launches_;
-        bool lowered_executable_ = false; ///< The current executable owns device bindings; it cannot be updated.
+        std::size_t lowered_live_launch_sites_ = 0u; ///< Native update bindings on the current executable.
         bool definition_consumed_ = false; ///< Conditional-containing graphs are lowered in their original native scope.
 
         /** Unique cold recording lifetime, invalidated by reset/re-recording. */

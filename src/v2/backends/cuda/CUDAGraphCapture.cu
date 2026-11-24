@@ -2047,9 +2047,9 @@ namespace llaminar2
         // Transitive import/clone rejection is independent of the driver's
         // checks, which do not reject a raw clone of every enclosing graph.
         definition_consumed_ = consumes_definition;
+        std::unordered_set<cudaGraphDeviceNode_t> handles;
         const auto lower = [&]() -> cudaError_t
         {
-            std::unordered_set<cudaGraphDeviceNode_t> handles;
             for (const auto &site : deferredLaunchSites())
             {
                 DeferredLaunchSite mapped{};
@@ -2087,7 +2087,8 @@ namespace llaminar2
                     err = cudaGraphKernelNodeGetAttribute(work, cudaKernelNodeAttributeDeviceUpdatableKernelNode, &attribute);
                 if (err != cudaSuccess) return err;
                 auto handle = attribute.deviceUpdatableKernelNode.devNode;
-                if (!handle || !handles.insert(handle).second) return cudaErrorNotSupported;
+                if (!attribute.deviceUpdatableKernelNode.deviceUpdatable ||
+                    !handle || !handles.insert(handle).second) return cudaErrorNotSupported;
                 err = CUDASingleImportUpdateBinding(handle).bind(gate, control, mapped.control_argument_count);
                 if (err != cudaSuccess) return err;
             }
@@ -2104,7 +2105,7 @@ namespace llaminar2
         status = lower();
         if (!consumes_definition && cudaGraphDestroy(definition) != cudaSuccess)
             std::terminate();
-        lowered_executable_ = status == cudaSuccess;
+        lowered_live_launch_sites_ = status == cudaSuccess ? handles.size() : 0u;
         return status;
 #endif
     }
@@ -2165,7 +2166,7 @@ namespace llaminar2
         native_capture_active_ = std::exchange(other.native_capture_active_, false);
         moveActiveCaptureRegistration(other);
         deferred_launches_ = std::move(other.deferred_launches_);
-        lowered_executable_ = std::exchange(other.lowered_executable_, false);
+        lowered_live_launch_sites_ = std::exchange(other.lowered_live_launch_sites_, 0u);
         definition_consumed_ = std::exchange(other.definition_consumed_, false);
         if (other.projection_submission_)
         {
@@ -2210,7 +2211,7 @@ namespace llaminar2
             native_capture_active_ = std::exchange(other.native_capture_active_, false);
             moveActiveCaptureRegistration(other);
             deferred_launches_ = std::move(other.deferred_launches_);
-            lowered_executable_ = std::exchange(other.lowered_executable_, false);
+            lowered_live_launch_sites_ = std::exchange(other.lowered_live_launch_sites_, 0u);
             definition_consumed_ = std::exchange(other.definition_consumed_, false);
             if (other.projection_submission_)
             {
@@ -2528,6 +2529,7 @@ namespace llaminar2
                 return false;
             }
             exec_ = nullptr;
+            lowered_live_launch_sites_ = 0u;
             resident_memory_bytes_ = 0u;
         }
 
@@ -2623,6 +2625,7 @@ namespace llaminar2
                     << cudaGetErrorString(destroy_error));
             }
             exec_ = nullptr;
+            lowered_live_launch_sites_ = 0u;
             return false;
         }
         /*
@@ -2661,7 +2664,7 @@ namespace llaminar2
         if (!activateOwner("launchOnStream"))
             return false;
 
-        if (!exec_ || !stream || (lowered_executable_ && stream != stream_))
+        if (!exec_ || !stream || (lowered_live_launch_sites_ != 0u && stream != stream_))
         {
             LOG_ERROR("[CUDAGraphCapture] Cannot launch: executable or its exact admitted submission stream is missing");
             return false;
@@ -4235,7 +4238,7 @@ namespace llaminar2
             timeline_recording_->state = OrderedTimelineRecording::State::Failed;
         timeline_recording_.reset();
         deferred_launches_.clear();
-        lowered_executable_ = false;
+        lowered_live_launch_sites_ = 0u;
         definition_consumed_ = false;
         fragment_nodes_.clear();
         fragment_entry_ = nullptr;

@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include "execution/moe/ICUDANativeArrivalCaptureStage.h"
 #include "../IComputeStage.h"
 #include "../StageParamsBase.h"
 #include "../../../execution/moe/DeviceMoERebalanceController.h"
@@ -56,7 +57,8 @@ namespace llaminar2
      */
     class MoEGPUCurrentBatchLLEPStage final
         : public IComputeStage,
-          public IWorkspaceConsumer
+          public IWorkspaceConsumer,
+          public ICUDANativeArrivalCaptureStage
     {
     public:
         /** @brief Immutable topology and storage bindings for one phase. */
@@ -129,6 +131,13 @@ namespace llaminar2
          * @return true only when stable workspace and kernel state are bound.
          */
         bool isGraphCapturable() const override;
+
+        /** @copydoc ICUDANativeArrivalCaptureStage::cudaLiveArrivalSites */
+        std::size_t cudaLiveArrivalSites() const noexcept override
+        {
+            return params_.device_id.is_cuda() &&
+                params_.phase == GPUCurrentBatchLLEPPhase::UnpackApplyAndAssign ? 1u : 0u;
+        }
 
         /** @return true because prepareGraphLaunch creates stable kernel state. */
         bool supportsGraphCaptureAfterLaunchPreparation() const override

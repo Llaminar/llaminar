@@ -11,6 +11,7 @@
  */
 
 #pragma once
+#include "execution/moe/ICUDANativeArrivalCaptureStage.h"
 #include "../../../loaders/ExpertGemmRegistry.h"
 #include "../../moe/MoEOverlayParticipantResidency.h"
 
@@ -273,7 +274,8 @@ namespace llaminar2
      */
     class MoEExpertComputeStage : public IComputeStage,
                                   public IWorkspaceConsumer,
-                                  public IMoEGroupedVerifierHistogramPublisher
+                                  public IMoEGroupedVerifierHistogramPublisher,
+                                  public ICUDANativeArrivalCaptureStage
     {
     public:
         struct Params
@@ -1178,6 +1180,12 @@ namespace llaminar2
 
         bool supportsBackend(ComputeBackendType backend) const override;
         bool isGraphCapturable() const override;
+
+        /** @copydoc ICUDANativeArrivalCaptureStage::cudaLiveArrivalSites */
+        std::size_t cudaLiveArrivalSites() const noexcept override
+        {
+            return params_.device_id.is_cuda() && params_.prefix_runtime_device_rehydration ? 1u : 0u;
+        }
         /**
          * @brief Describe every routed-expert graph-capture readiness invariant.
          *

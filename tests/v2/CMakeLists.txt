@@ -27435,9 +27435,18 @@ target_compile_definitions(v2_test_forward_execution_engine PRIVATE
     LLAMINAR_DEVICE_GRAPH_CAPTURE_CONTROLLER_SOURCE="${CMAKE_SOURCE_DIR}/execution/local_execution/graph/DeviceGraphCaptureController.cpp")
 add_v2_test(V2_Unit_ForwardExecutionEngine
     COMMAND $<TARGET_FILE:v2_test_forward_execution_engine>
+        --gtest_filter=-Test__ForwardExecutionEngine.CUDAColdPrefillArrivalsCaptureBeforeFirstSubmission
     LABELS "V2;Unit;Execution;ForwardExecutionEngine;DGORefactor"
     MPI_PROCS 1
 )
+if(HAVE_CUDA)
+    add_v2_test(V2_Integration_CUDA_ColdPrefillArrivalsCaptureBeforeFirstSubmission
+        COMMAND $<TARGET_FILE:v2_test_forward_execution_engine>
+            --gtest_filter=Test__ForwardExecutionEngine.CUDAColdPrefillArrivalsCaptureBeforeFirstSubmission
+        LABELS "V2;Integration;ProductionTestPreflight;CUDA;MoE;Prefill;GraphCapture;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDA_ColdPrefillArrivalsCaptureBeforeFirstSubmission)
+endif()
 add_v2_test(V2_Integration_PrefillBucketHostTimers
     COMMAND $<TARGET_FILE:v2_test_forward_execution_engine>
         --gtest_filter=Test__ForwardExecutionEngine.RunPrefillChunkSchedule_PublishesHostChunkGapAndFamilyTimers
