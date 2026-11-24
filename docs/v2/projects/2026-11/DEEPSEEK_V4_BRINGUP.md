@@ -533,18 +533,26 @@ observations, not passing end-to-end gates.
   `Out of memory [NV_ERR_NO_MEMORY] (0x00000051) returned from _memdescAllocInternal(pMemDesc) @ mem_desc.c:1359`;
   46 of 48 occurred at 10:31:23–25 during GPU graph setup, with the other
   two at 10:30:27 and 10:30:43 during weight setup/load. The same warning
-  appeared singly in the A-image, A-32K and C-32K windows; temporal
-  correlation does not identify the specific failing allocation.
+  appeared singly in the A-image, A-32K and C-32K windows, as well as in
+  the repaired B load (10:57:53) and the new C cap-128 load (11:00:48).
+  Temporal correlation does not identify the specific failing allocation.
 
 ### Reproduction and scope
 
 The Spark Integration build ran `ctest -R
 'DeepSeek|NativeQuantisedFileDensity|CPUCodedCompactUnits|ExpertTierWeightStream'
---output-on-failure`; 19 of 20 passed, no skips, including all DeepSeek and
-density correctness cases. The regex also selects
-`V2_Perf_CUDA_ExpertTierWeightStreaming`, whose unchanged fixture failed
-validation when it supplied the legacy per-block metadata layout to the
-coded migration contract. This and the live failures are not waived.
+--output-on-failure`; the original merge passed 19 of 20, no skips,
+including all DeepSeek and density correctness checks. The remaining
+`V2_Perf_CUDA_ExpertTierWeightStreaming` failure reproduced on exact #73
+`26789300a`: the fixture supplied legacy per-block metadata for coded
+formats. Fixture-only fix `85103a6ec` prepares from the original tensor and
+checks all coded GPU metadata planes and the CPU wire before timing. The
+registered CUDA gate passed on its exact rebased head. After merge
+`496c9b2c3`, the Spark focused suite including the original pattern, the
+UMA host-demand regression, and the projection/capacity tests passed
+23/23 without skips. An additional unregistered rectangle diagnostic
+validated all 88 byte-check rows, but 75 missed the existing economy floors
+on GB10; those floors were unchanged.
 
 Use the GB10 `mxfp4-validation:gb10` image, `/src` mount for oneDNN, and
 NEON/CUDA Release build. The exact Docker commands, image request bytes,
