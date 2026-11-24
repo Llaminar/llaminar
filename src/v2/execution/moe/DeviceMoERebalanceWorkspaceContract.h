@@ -92,6 +92,9 @@ namespace llaminar2
         /** @return Number of histogram layers retained by one planning wave. */
         [[nodiscard]] std::size_t histogramLayerCount() const noexcept;
 
+        /** @return Exact INT32 collective words produced by each participant. */
+        [[nodiscard]] std::size_t localHistogramWords() const noexcept;
+
         /** @return Number of layer plans retained by parallel LLEP planning. */
         [[nodiscard]] std::size_t llepPlannerScratchCount() const noexcept;
 

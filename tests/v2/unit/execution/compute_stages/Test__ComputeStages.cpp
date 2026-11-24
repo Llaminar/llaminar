@@ -30,6 +30,7 @@
 #include "execution/local_execution/device/DeviceContext.h"
 #include "execution/moe/DeviceMoETransferSlotDirectory.h"
 #include "execution/moe/MoERuntimeTable.h"
+#include "loaders/GPUPreparedWeightPoolLayout.h"
 #include "tensors/Tensors.h"
 #include "tensors/TensorFactory.h"
 #include "tensors/SIMDHelpers.h"
@@ -347,6 +348,7 @@ TEST_F(ComputeStagesTest, MoEDeviceRebalanceStage_WorkspaceContract)
         compact_payload_local_bytes * static_cast<size_t>(compact_params.config.participant_count);
     EXPECT_EQ(compact_stage.estimatedMemoryBytes(),
               (compact_local_entries + compact_gathered_entries) * sizeof(uint64_t) +
+                  (1u + compact_params.config.participant_count) * sizeof(uint32_t) +
                   24u * sizeof(DeviceMoERebalanceMovementEdge) +
                   12u * sizeof(DeviceMoERebalanceMovementWave) +
                   transfer_command_buffers * compact_plan_entries * sizeof(DeviceMoERebalancePlanEntry) +
@@ -462,6 +464,7 @@ TEST_F(ComputeStagesTest, MoEDeviceRebalanceStage_WorkspaceContract)
         collective_payload_local_bytes * static_cast<size_t>(config.participant_count);
     EXPECT_EQ(transfer_stage.estimatedMemoryBytes(),
               (local_entries + gathered_entries) * sizeof(uint64_t) +
+                  config.num_layers * (1u + config.participant_count) * sizeof(uint32_t) +
                   24u * sizeof(DeviceMoERebalanceMovementEdge) +
                   12u * sizeof(DeviceMoERebalanceMovementWave) +
                   transfer_command_buffers * plan_entries * sizeof(DeviceMoERebalancePlanEntry) +
@@ -634,15 +637,18 @@ TEST_F(ComputeStagesTest,
     EXPECT_EQ(placement_scratch->size_bytes, moe_runtime_abi::kPlacementBankBytes);
     WorkspaceRequirements placement_only;
     placement_only.buffers.push_back(*placement_scratch);
-    // Other buffers retain the exact admitted 256-expert/live-one-slot geometry.
-    // Only the RCU placement generation has the ABI-wide expert capacity.
+    // One uint32 occupancy word for each of four live layers and three
+    // participant segments (one local + two gathered). Each of those two
+    // previously aligned buffers grows by one 256-byte allocation alignment.
+    constexpr size_t occupancy_wire_bytes = 4u * (1u + 2u) * sizeof(uint32_t);
+    constexpr size_t occupancy_alignment_bytes = 2u * 256u;
     EXPECT_EQ(
         DeviceMoERebalanceWorkspaceContract::logicalBytes(binding),
-        12348264u + moe_runtime_abi::kPlacementBankBytes +
+        12348264u + occupancy_wire_bytes + moe_runtime_abi::kPlacementBankBytes +
             sizeof(DeviceMoERebalanceCompletedDecision));
     EXPECT_EQ(
         DeviceMoERebalanceWorkspaceContract::allocationBytes(binding),
-        12349440u + placement_only.total_bytes_with_alignment());
+        12349440u + occupancy_alignment_bytes + placement_only.total_bytes_with_alignment());
     EXPECT_EQ(
         requirements.total_bytes_with_alignment(),
         DeviceMoERebalanceWorkspaceContract::allocationBytes(binding));
@@ -805,136 +811,66 @@ TEST_F(ComputeStagesTest, MoEDeviceRebalanceTransferCapacityRetargetsMixedProjec
         << "A Q8 source must fail closed when the stable destination allocation is too small";
 }
 
-TEST_F(ComputeStagesTest, MoEDeviceRebalanceFormatProfileSeparatesWireBytesFromStorageCapacity)
-{
-    using ProjectionSpec = DeviceMoETransferSlotDirectory::ProjectionSpec;
-    auto spec =
-        [](const char *label,
-           int payload_bytes,
-           bool has_mins,
-           bool has_emins,
-           uint8_t codebook_id,
-           bool is_superblock)
-    {
-        ProjectionSpec result;
-        result.label = label;
-        result.N = 4;
-        result.K = 32;
-        result.payload_bytes_per_block = payload_bytes;
-        result.is_asymmetric = has_mins;
-        result.has_emins = has_emins;
-        result.codebook_id = codebook_id;
-        result.format = ExpertWeightFormat::nativeQuantised({
-            .codebook_id = codebook_id,
-            .is_superblock = is_superblock,
-            .present = true,
-        });
-        return result;
-    };
-
-    const std::vector<ProjectionSpec> q8_layer{
-        spec("gate", 32, false, false, 19, false),
-        spec("up", 16, false, false, 4, false),
-        spec("down", 16, false, false, 4, false)};
-    const std::vector<ProjectionSpec> q5_layer{
-        spec("gate", 16, false, false, 4, false),
-        spec("up", 20, true, false, 7, false),
-        spec("down", 20, true, false, 7, false)};
-    const auto profile = DeviceMoETransferSlotDirectory::profileForLayerFormats({q8_layer, q5_layer});
-    ASSERT_EQ(profile.allocation_specs.size(), 3u);
-    EXPECT_EQ(profile.allocation_specs[0].payload_bytes_per_block, 32);
-    EXPECT_EQ(profile.allocation_specs[1].payload_bytes_per_block, 20);
-    EXPECT_TRUE(profile.allocation_specs[1].is_asymmetric);
-    EXPECT_FALSE(profile.allocation_specs[1].has_emins);
-    EXPECT_EQ(profile.allocation_specs[2].payload_bytes_per_block, 20);
-    EXPECT_TRUE(profile.allocation_specs[2].is_asymmetric);
-    EXPECT_EQ(profile.max_wire_payload_bytes, 280u)
-        << "The collective wire slot should match the largest real layer payload";
-
-    const std::vector<ProjectionSpec> coded_layer{
-        spec("gate", 32, false, false, 19, false),
-        spec("up", 8, true, false, 10, true),
-        spec("down", 9, true, false, 14, true)};
-    const auto coded = DeviceMoETransferSlotDirectory::profileForLayerFormats({coded_layer});
-    EXPECT_EQ(coded.max_wire_payload_bytes, 4u * (34u + 8u + 2u + 4u + 9u + 2u));
-    const auto identical = DeviceMoETransferSlotDirectory::profileForLayerFormats({coded_layer, coded_layer});
-    EXPECT_EQ(identical.max_wire_payload_bytes, coded.max_wire_payload_bytes);
-    auto other_codebook = coded_layer;
-    other_codebook[1] = spec("up", 12, true, false, 9, true);
-    auto wrong_payload_width = coded_layer;
-    ++wrong_payload_width[1].payload_bytes_per_block;
-    auto other_phase = coded_layer;
-    other_phase[1].gpu_superblock_phase = 7;
-    for (const auto &layers : {std::vector{coded_layer, other_phase}, std::vector{q8_layer, coded_layer}, std::vector{coded_layer, q8_layer},
-                              std::vector{coded_layer, other_codebook}, std::vector{coded_layer, wrong_payload_width}})
-    {
-        try
-        {
-            (void)DeviceMoETransferSlotDirectory::profileForLayerFormats(layers);
-            ADD_FAILURE() << "Mixed coded slot families were admitted";
-        }
-        catch (const std::invalid_argument &error)
-        {
-            const std::string_view diagnostic = error.what();
-            EXPECT_NE(diagnostic.find("projection up at profile layer 1 requires a separate exact slot family"), std::string_view::npos);
-            EXPECT_NE(diagnostic.find("NativeQuantised/Q2_K (coded, phase 0, payload 8 bytes/block)"), std::string_view::npos);
-        }
-    }
-}
-
-/**
- * @brief Prove scheduling windows never alter domain slot identity.
- *
- * Prefill starts at layer zero while decode maintenance starts after the first
- * routed layer. Both graphs publish into one runtime table, so they must derive
- * the same directory capacity despite their different scheduling windows.
- */
-TEST_F(ComputeStagesTest, MoEDeviceRebalanceFloatingAndQuantizedCapacityShareOneAllocation)
+/** @brief Quote only exact layout families, including their immutable membership. */
+TEST_F(ComputeStagesTest, MoEDeviceRebalanceExactSlotFamilies)
 {
     using Directory = DeviceMoETransferSlotDirectory;
-    const auto capacity = Directory::planBufferedCapacity(1, 1, 1);
-    std::vector<std::vector<Directory::ProjectionSpec>> layers;
-    for (const auto type : {TensorType::FP16, TensorType::BF16, TensorType::FP32})
+    const auto quantized = [](const NativeQuantisedFormatInfo &source)
     {
+        const auto layout = gpuPreparedWeightPoolAllocation(source, GPUPreparedWeightPoolLayout::MigrationReusable);
         std::vector<Directory::ProjectionSpec> specs;
-        for (const auto *label : {"gate", "up", "down"})
-            specs.push_back({.label = label, .N = 32, .K = 64,
-                             .format = ExpertWeightFormat::floating(type)});
-        const auto profile = Directory::profileForLayerFormats({specs});
-        EXPECT_EQ(profile.max_wire_payload_bytes,
-                  3u * 32u * 64u * (type == TensorType::FP32 ? 4u : 2u));
-        EXPECT_EQ(Directory::allocationBOM(capacity, profile).payload_bytes,
-                  capacity.total_slots * profile.max_wire_payload_bytes);
-        layers.push_back(std::move(specs));
-    }
-    const auto raw_profile = Directory::profileForLayerFormats(layers);
-    const auto raw_bytes = Directory::allocationBOM(capacity, raw_profile).payload_bytes;
-    for (const auto &source_format : native_quantised_formats::kAllSourceFormats)
-    {
-        const auto &format = *source_format.metadata;
-        std::vector<Directory::ProjectionSpec> quantized;
-        for (const auto *label : {"gate", "up", "down"})
-            quantized.push_back({.label = label, .N = 32, .K = 64,
-                .payload_bytes_per_block = format.payload_bytes,
-                .is_asymmetric = format.is_asymmetric, .has_emins = format.has_emins,
-                .codebook_id = format.codebook_id,
+        for (const char *role : {"gate", "up", "down"})
+            specs.push_back({.label = role, .N = 64, .K = 288,
+                .payload_bytes_per_block = layout.payload_bytes_per_block,
+                .is_asymmetric = layout.has_mins, .has_emins = layout.has_emins,
+                .codebook_id = canonicalDeviceVnniCodebookId(source),
                 .format = ExpertWeightFormat::nativeQuantised({
-                    .codebook_id = format.codebook_id,
-                    .is_superblock = format.is_superblock, .present = true})});
-        auto mixed = layers;
-        mixed.push_back(quantized);
-        const auto profile = Directory::profileForLayerFormats(mixed);
-        EXPECT_EQ(profile.floating_allocation_format, DeviceMoEWeightFormat::FP32);
-        EXPECT_EQ(profile.max_wire_payload_bytes, raw_profile.max_wire_payload_bytes);
-        EXPECT_EQ(Directory::allocationBOM(capacity, profile).payload_bytes, raw_bytes);
-        // Order must not alter either admission or the actual wire capacity.
-        std::reverse(mixed.begin(), mixed.end());
-        const auto reversed = Directory::profileForLayerFormats(mixed);
-        EXPECT_EQ(Directory::allocationBOM(capacity, reversed).payload_bytes, raw_bytes);
-        EXPECT_EQ(reversed.max_wire_payload_bytes, profile.max_wire_payload_bytes);
+                    .codebook_id = source.codebook_id, .is_superblock = source.is_superblock, .present = true})});
+        return specs;
+    };
+    const auto iq3 = quantized(native_quantised_formats::IQ3_XXS);
+    const auto q4 = quantized(native_quantised_formats::Q4_K);
+    const auto q8 = quantized(native_quantised_formats::Q8_0);
+    ASSERT_TRUE(iq3.front().codedDeclaration());
+    ASSERT_TRUE(q4.front().codedDeclaration());
+    ASSERT_FALSE(q8.front().codedDeclaration());
+    std::vector<Directory::ProjectionSpec> floating;
+    for (const char *role : {"gate", "up", "down"})
+        floating.push_back({.label = role, .N = 64, .K = 288,
+            .format = ExpertWeightFormat::floating(TensorType::FP16)});
+    const auto profile = Directory::profileForLayerFormats({iq3, q4, iq3, q8, floating});
+    ASSERT_EQ(profile.families.size(), 4u);
+    EXPECT_EQ(profile.layer_families, (std::vector<uint32_t>{0, 1, 0, 2, 3}));
+    DeviceMoERebalanceConfig config;
+    config.num_layers = 5u;
+    config.max_hot_replicas_per_participant = 3u;
+    const auto capacity = Directory::planRuntimeCapacity(config, 0u, 2u, 2u);
+    const auto bom = Directory::allocationBOM(capacity, profile);
+    EXPECT_EQ(bom.active_slots, 15u);
+    EXPECT_EQ(bom.total_slots, 31u);
+    size_t sum = 0u;
+    for (size_t index = 0; index < profile.families.size(); ++index)
+    {
+        const auto &family = profile.families[index];
+        const auto exact = Directory::allocationBOM(
+            Directory::planBufferedCapacity(family.layer_count * 3u, 2u, 2u),
+            Directory::profileForLayerFormats({family.projections}));
+        const auto &line = bom.families[index];
+        EXPECT_EQ(line.range.end - line.range.first, family.layer_count * 3u + 4u);
+        EXPECT_EQ(line.payload_bytes, exact.payload_bytes);
+        EXPECT_EQ(line.descriptor_bytes, exact.descriptor_bytes);
+        sum += line.totalBytes();
     }
-    layers.front()[1].format = ExpertWeightFormat::floating(TensorType::BF16);
-    EXPECT_THROW(Directory::profileForLayerFormats(layers), std::invalid_argument);
+    EXPECT_EQ(bom.total_bytes, sum + 5u * sizeof(DeviceMoETransferSlotRange));
+    const auto other_membership = Directory::profileForLayerFormats({iq3, q4, q8, iq3, floating});
+    EXPECT_NE(Directory::captureIdentity(profile, capacity), Directory::captureIdentity(other_membership, capacity));
+    auto other_phase = iq3;
+    other_phase.front().gpu_superblock_phase = 7u;
+    const auto phased = Directory::profileForLayerFormats({iq3, q4, other_phase, q8, floating});
+    EXPECT_EQ(phased.families.size(), 5u);
+    EXPECT_NE(Directory::captureIdentity(profile, capacity), Directory::captureIdentity(phased, capacity));
+    floating.front() = iq3.front();
+    EXPECT_THROW(Directory::profileForLayerFormats({iq3, floating}), std::invalid_argument);
 }
 
 /** @brief Scheduling windows must not change the runtime-domain allocation. */

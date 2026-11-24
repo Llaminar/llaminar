@@ -28216,7 +28216,7 @@ TEST_F(Test__CUDAMoEKernel, CapturedGateUpTransfersExcludeFixedDownStorage)
 }
 
 /** @brief Complete experts retain their existing all-format transfer contract. */
-TEST_F(Test__CUDAMoEKernel, CapturedMixedFormatTransfersRetainCapacityAndRejectStaleLeases)
+TEST_F(Test__CUDAMoEKernel, CapturedExactSlotFamiliesMoveMixedFormatsAndRejectStaleLeases)
 {
 #ifndef HAVE_CUDA
     GTEST_SKIP() << "CUDA support not compiled";

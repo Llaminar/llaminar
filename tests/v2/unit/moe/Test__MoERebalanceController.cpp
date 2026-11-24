@@ -313,7 +313,7 @@ TEST(Test__MoERebalanceController,
     static_assert(std::is_trivially_copyable_v<DeviceMoERebalancePlanEntry>);
     // Version 18 appends completed decisions to the controller; v17's exact
     // command payload/lease fields and zero-reserved word remain unchanged.
-    EXPECT_EQ(kDeviceMoERebalanceVersion, 18u);
+    EXPECT_EQ(kDeviceMoERebalanceVersion, 19u);
     EXPECT_NE(DeviceMoERebalanceWaveLifecycle::PreparedForPublication,
               DeviceMoERebalanceWaveLifecycle::Applied);
     EXPECT_EQ(

@@ -63,6 +63,9 @@ namespace llaminar2
             ExpertWeightFormat format; ///< Original arithmetic identity.
             std::uint8_t gpu_superblock_phase = 0; ///< Immutable phase shared by every expert in this projection shard.
 
+            /** @return Whether all immutable layout traits match. */
+            bool operator==(const ProjectionSpec &) const = default;
+
             /** @return Coded allocation identity, or no coded storage for a per-block format. */
             [[nodiscard]] std::optional<WeightVRAMPool::SuperblockCodedMetadata> codedDeclaration() const;
         };

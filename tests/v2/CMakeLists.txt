@@ -12466,7 +12466,7 @@ add_v2_test(V2_Integration_CUDA_MoEDeviceResidentGroupedVerifierPublication
 )
 add_v2_test(V2_Integration_CUDA_MoECompactTransferAllFormats
     COMMAND $<TARGET_FILE:v2_integration_cuda_moe_kernel>
-            --gtest_filter=Test__CUDAMoEKernel.TransferredCurrentBatchAllNativeFormatsPublishExactBytes:Test__CUDAMoEKernel.CapturedMixedFormatTransfersRetainCapacityAndRejectStaleLeases:Test__CUDAMoEKernel.CapturedGateUpTransfersExcludeFixedDownStorage
+            --gtest_filter=Test__CUDAMoEKernel.TransferredCurrentBatchAllNativeFormatsPublishExactBytes:Test__CUDAMoEKernel.CapturedExactSlotFamiliesMoveMixedFormatsAndRejectStaleLeases:Test__CUDAMoEKernel.CapturedGateUpTransfersExcludeFixedDownStorage
             --gtest_brief=1
     LABELS "V2;Integration;CUDA;MoE;Transfer;Publication;AllFormats;ByteExact;Regression"
     MPI_PROCS 1
@@ -18782,7 +18782,7 @@ add_v2_test(V2_Unit_ComputeStages
 
 add_v2_test(V2_Integration_DeviceMoERebalanceCodedSlotAdmission
     COMMAND $<TARGET_FILE:v2_test_compute_stages>
-        --gtest_filter=ComputeStagesTest.MoEDeviceRebalanceFormatProfileSeparatesWireBytesFromStorageCapacity
+        --gtest_filter=ComputeStagesTest.MoEDeviceRebalanceExactSlotFamilies
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MoE;PhysicalMemory;Admission;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_DeviceMoERebalanceCodedSlotAdmission)
@@ -24284,7 +24284,7 @@ add_v2_test(V2_Integration_ROCmIQ2SFusedMoEOriginalEquation
     )
     add_v2_test(V2_Integration_ROCm_MoECompactTransferAllFormats
         COMMAND $<TARGET_FILE:v2_integration_rocm_moe_kernel>
-            --gtest_filter=Test__ROCmMoEKernel.TransferredCurrentBatchAllNativeFormatsPublishExactBytes:Test__ROCmMoEKernel.CapturedMixedFormatTransfersRetainCapacityAndRejectStaleLeases:Test__ROCmMoEKernel.CapturedGateUpTransfersExcludeFixedDownStorage
+            --gtest_filter=Test__ROCmMoEKernel.TransferredCurrentBatchAllNativeFormatsPublishExactBytes:Test__ROCmMoEKernel.CapturedExactSlotFamiliesMoveMixedFormatsAndRejectStaleLeases:Test__ROCmMoEKernel.CapturedGateUpTransfersExcludeFixedDownStorage
                 --gtest_brief=1
         LABELS "V2;Integration;ROCm;MoE;Transfer;Publication;AllFormats;ByteExact;Regression"
         MPI_PROCS 1

@@ -20945,6 +20945,7 @@ TEST(Test__ROCmMoEKernel, RuntimeGroupedDecodeFusedPathMatchesTwoStepAndCaptures
     DeviceMoEExpertDescriptor transfer_descriptor;
     ASSERT_TRUE(transfer_directory->descriptorForSlot(
         /*slot_index=*/0,
+        /*layer=*/0,
         /*logical_expert=*/0,
         transfer_descriptor));
     transfer_descriptor.owner_participant = 0;
@@ -21463,6 +21464,7 @@ TEST(Test__ROCmMoEKernel, TransferSlotDirectoriesArePhysicallyParticipantLocal)
             DeviceMoEExpertDescriptor descriptor;
             ASSERT_TRUE(directory.descriptorForSlot(
                 slot,
+                /*layer=*/0,
                 /*logical_expert=*/slot,
                 descriptor));
             for (const auto *projection :
@@ -29620,7 +29622,7 @@ TEST(Test__ROCmMoEKernel, CapturedGateUpTransfersExcludeFixedDownStorage)
 }
 
 /** @brief Complete experts retain their existing all-format transfer contract. */
-TEST(Test__ROCmMoEKernel, CapturedMixedFormatTransfersRetainCapacityAndRejectStaleLeases)
+TEST(Test__ROCmMoEKernel, CapturedExactSlotFamiliesMoveMixedFormatsAndRejectStaleLeases)
 {
     int count = 0;
     ASSERT_EQ(hipGetDeviceCount(&count), hipSuccess);

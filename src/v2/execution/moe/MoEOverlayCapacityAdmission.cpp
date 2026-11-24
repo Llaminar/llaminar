@@ -19,6 +19,7 @@
 #include "MoEOverlayNoPeerResidency.h"
 #include "MoEOverlayPhysicalLaneDemand.h"
 #include "config/BackendSelector.h"
+#include "utils/VramBillOfMaterials.h"
 
 #include <algorithm>
 #include <limits>
@@ -506,6 +507,7 @@ namespace llaminar2
                 PhysicalKey{charge.world_rank, charge.device},
                 charge.bytes);
         }
+        std::optional<DeviceMoETransferSlotDirectory::AllocationBOM> family_bom;
         if (policy.usesDeviceTransferDirectory())
         {
             if (plan.routed_tiers.size() != 1u ||
@@ -523,11 +525,11 @@ namespace llaminar2
                         layer_weight_manifest,
                         moeOverlayMovableProjections(copyPolicy(
                             requireDomain(plan, plan.routed_tiers.front()))));
-            const auto directory_bom =
+            family_bom =
                 DeviceMoETransferSlotDirectory::allocationBOM(
                     policy.device_transfer_directory_capacity,
                     profile);
-            const auto &workspace_capacity =
+            auto workspace_capacity =
                 *policy.device_rebalance_workspace_capacity;
             if (workspace_capacity.num_layers != layer_count ||
                 workspace_capacity.num_experts !=
@@ -544,6 +546,7 @@ namespace llaminar2
                 throw std::invalid_argument(
                     "Device transfer-directory workspace capacity disagrees with its admitted topology or directory");
             }
+            workspace_capacity.local_transfer_slot_count = family_bom->total_slots;
             const DeviceMoERebalanceWorkspaceBinding workspace_binding{
                 .capacity = workspace_capacity,
                 .collective_payload_slot_bytes =
@@ -564,12 +567,6 @@ namespace llaminar2
                     throw std::invalid_argument(
                         "Device transfer-directory admission requires one rank-local homogeneous GPU domain");
                 }
-                auto &bytes = staging_by_key[PhysicalKey{
-                    participant.world_rank, participant.device}];
-                bytes = checkedAdd(
-                    bytes,
-                    directory_bom.total_bytes,
-                    "device transfer-directory storage");
                 auto &workspace = workspace_by_key[PhysicalKey{
                     participant.world_rank, participant.device}];
                 workspace = checkedAdd(
@@ -610,6 +607,19 @@ namespace llaminar2
             complete_builder.add(
                 PhysicalMemoryOwner::ExpertMigrationStaging,
                 canonical_staging);
+            if (family_bom && workspace_by_key.contains(key))
+            {
+                for (size_t family = 0; family < family_bom->families.size(); ++family)
+                {
+                    const auto &quote = family_bom->families[family];
+                    complete_builder.add(PhysicalMemoryOwner::ExpertMigrationStaging, quote.totalBytes());
+                    logVramBomLine("moe_device_transfer_slot_family_admission",
+                        "device=" + budget.device().to_string() + " rank=" + std::to_string(budget.worldRank()) +
+                        " family=" + std::to_string(family) + " payload_bytes=" + std::to_string(quote.payload_bytes) +
+                        " descriptor_bytes=" + std::to_string(quote.descriptor_bytes));
+                }
+                complete_builder.add(PhysicalMemoryOwner::ExpertMigrationStaging, family_bom->layer_range_bytes);
+            }
             const auto workspace = workspace_by_key.find(key);
             complete_builder.add(
                 PhysicalMemoryOwner::ExecutionWorkspace,
@@ -870,7 +880,8 @@ namespace llaminar2
             if (maximum > static_cast<std::uint32_t>(std::max(0, stage.num_experts)))
                 throw std::invalid_argument("Replica-cache upper bound exceeds the model expert count");
             const auto &directory = stage.policy.device_transfer_directory_capacity;
-            if (directory.active_slots != static_cast<std::uint64_t>(workspace.num_layers) * std::max(1u, maximum) ||
+            if (directory.active_slots != std::max<uint64_t>(directory.minimum_active_slots,
+                    static_cast<std::uint64_t>(workspace.num_layers) * std::max(1u, maximum)) ||
                 static_cast<std::uint64_t>(directory.active_slots) + directory.staging_slots != directory.total_slots ||
                 workspace.local_transfer_slot_count != directory.total_slots)
                 throw std::invalid_argument("Replica admission requires exact requested directory geometry");
@@ -901,14 +912,14 @@ namespace llaminar2
                     workspace.max_hot_replicas_per_participant = grants[index];
                     // Persistent replicas scale independently of the admitted
                     // rolling transfer pool and its actual communication extent.
-                    candidate.device_transfer_directory_capacity = DeviceMoETransferSlotDirectory::planBufferedCapacity(
-                        static_cast<std::uint64_t>(workspace.num_layers) * std::max(1u, grants[index]),
+                    DeviceMoERebalanceConfig config;
+                    config.num_layers = workspace.num_layers;
+                    config.max_hot_replicas_per_participant = grants[index];
+                    candidate.device_transfer_directory_capacity = DeviceMoETransferSlotDirectory::planRuntimeCapacity(
+                        config, stage.policy.device_transfer_directory_capacity.minimum_active_slots,
                         stage.policy.device_transfer_directory_capacity.staging_slots,
                         /*one already-combined staging pool=*/1u);
                     workspace.local_transfer_slot_count = candidate.device_transfer_directory_capacity.total_slots;
-                    workspace.collective_payload_slot_capacity = std::min(
-                        stage.policy.device_rebalance_workspace_capacity->collective_payload_slot_capacity,
-                        workspace.local_transfer_slot_count);
                 }
                 inputs.push_back(buildResolverInput(stage.plan, stage.num_experts,
                     stage.layer_weight_manifest, stage.physical_budgets, candidate));

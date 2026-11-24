@@ -713,6 +713,7 @@ namespace
         uint32_t transfer_slot_directory_capacity;
         uint32_t initial_maintenance_period_tokens;
         uint32_t maintenance_period_tokens;
+        const llaminar2::DeviceMoETransferSlotRange *transfer_slot_layer_ranges;
     };
     static_assert(
         sizeof(DeviceMoERebalanceConfigView) ==
@@ -1626,6 +1627,7 @@ namespace
                config.num_layers;
     }
 
+    /** @return Gathered expert evidence; participant strides can be odd INT32 words. */
     __device__ __forceinline__ unsigned long long rebalance_collected_state_word(
         const unsigned long long *histograms,
         const DeviceMoERebalanceConfigView &config,
@@ -1633,15 +1635,28 @@ namespace
         uint32_t wave_layer,
         uint32_t expert)
     {
-        const unsigned long long participant_stride =
-            static_cast<unsigned long long>(rebalance_layer_wave_count(config)) *
-            static_cast<unsigned long long>(config.num_experts);
-        const unsigned long long layer_stride =
-            static_cast<unsigned long long>(config.num_experts);
-        return histograms[
-            static_cast<unsigned long long>(participant) * participant_stride +
-            static_cast<unsigned long long>(wave_layer) * layer_stride +
-            static_cast<unsigned long long>(expert)];
+        namespace abi = llaminar2::moe_rebalance_abi;
+        const auto layout = abi::histogramLayout(config.transfer_slot_layer_ranges);
+        const uint64_t expert_index = uint64_t{wave_layer} * config.num_experts + expert;
+        if (layout == abi::HistogramLayout::ResidentOnly)
+            return histograms[uint64_t{participant} * rebalance_layer_wave_count(config) * config.num_experts + expert_index];
+        const auto *words = reinterpret_cast<const uint32_t *>(histograms);
+        const uint64_t offset = participant * abi::histogramWords(layout,
+            rebalance_layer_wave_count(config), config.num_experts) + 2u * expert_index;
+        return uint64_t{words[offset]} | (uint64_t{words[offset + 1u]} << 32u);
+    }
+
+    /** @return Exact occupancy from the metadata tail of a live participant segment. */
+    __device__ __forceinline__ uint32_t rebalance_collected_family_occupancy(
+        const unsigned long long *histograms, const DeviceMoERebalanceConfigView &config,
+        uint32_t participant, uint32_t wave_layer)
+    {
+        namespace abi = llaminar2::moe_rebalance_abi;
+        const uint32_t layers = rebalance_layer_wave_count(config);
+        const auto *words = reinterpret_cast<const uint32_t *>(histograms);
+        const uint64_t offset = participant * abi::histogramWords(abi::HistogramLayout::TransferFamilyOccupancy,
+            layers, config.num_experts) + 2u * uint64_t{layers} * config.num_experts + wave_layer;
+        return words[offset];
     }
 
     __device__ __forceinline__ unsigned long long rebalance_histogram_count(
@@ -1666,6 +1681,56 @@ namespace
             collectedStateActiveTransferSlots(
                 rebalance_collected_state_word(
                     histograms, config, participant, 0u, 0u));
+    }
+
+    /** @return Directory range usable by this runtime layer. */
+    __device__ __forceinline__ llaminar2::DeviceMoETransferSlotRange rebalance_layer_slot_range(
+        const DeviceMoERebalanceConfigView &config, uint32_t layer, uint32_t slot_count)
+    {
+        if (layer >= config.num_layers)
+            return {0u, 0u, 0u};
+        if (!config.transfer_slot_layer_ranges)
+            return {0u, slot_count, config.active_transfer_slot_capacity};
+        const auto range = config.transfer_slot_layer_ranges[layer];
+        return range.first < range.end && range.end <= slot_count
+            ? range : llaminar2::DeviceMoETransferSlotRange{0u, 0u, 0u};
+    }
+
+    /**
+     * @brief Reconstruct occupancy for this family before planning its next layer.
+     *
+     * Each gathered layer carries its family's durable baseline. Earlier commands
+     * in this wave are not yet visible in the active bank, so account for their
+     * acquisitions and transfer-backed ownership retirements exactly once.
+     */
+    __device__ __noinline__ void rebalance_family_planned_occupancy(
+        uint32_t *counts, const unsigned long long *histograms,
+        const DeviceMoERebalanceConfigView &config, uint32_t layer, uint32_t wave_layer,
+        uint32_t window_start, uint32_t window_count, uint32_t start_offset,
+        const DeviceMoERebalancePlanEntryView *plans, const uint32_t *plan_count)
+    {
+        const auto *ranges = config.transfer_slot_layer_ranges;
+        if (!ranges || !histograms)
+            return;
+        for (uint32_t participant = 0; participant < config.participant_count; ++participant)
+            counts[participant] = rebalance_collected_family_occupancy(histograms, config, participant, wave_layer);
+        for (uint32_t index = 0; plans && plan_count && index < *plan_count; ++index)
+        {
+            const auto &plan = plans[index];
+            if (!rebalance_plan_requires_payload(plan.op) ||
+                ranges[plan.layer].first != ranges[layer].first)
+                continue;
+            ++counts[plan.destination_participant];
+            if (plan.op == kDeviceMoERebalancePlanOwnershipTransfer)
+            {
+                const uint32_t relative_layer = (plan.layer + config.num_layers - window_start) % config.num_layers;
+                const uint32_t previous_wave_layer = (relative_layer + window_count - start_offset) % window_count;
+                if (llaminar2::moe_rebalance_policy::collectedStateTransferBacked(
+                        rebalance_collected_state_word(histograms, config, plan.source_participant,
+                            previous_wave_layer, plan.expert)))
+                    --counts[plan.source_participant];
+            }
+        }
     }
 
     __device__ __forceinline__ uint32_t
@@ -2394,7 +2459,7 @@ namespace
     __device__ __forceinline__ uint32_t
     rebalance_active_transfer_slot_expert_count(
         const DeviceMoELayerRuntimeView *runtime_layers,
-        const DeviceMoERebalanceConfigView &config)
+        const DeviceMoERebalanceConfigView &config, uint32_t target_layer)
     {
         if (!runtime_layers || !rebalance_config_ok(config))
             return 0u;
@@ -2405,6 +2470,9 @@ namespace
         uint32_t active_claims = 0u;
         for (uint32_t layer = 0u; layer < config.num_layers; ++layer)
         {
+            const auto *ranges = config.transfer_slot_layer_ranges;
+            if (ranges && ranges[layer].first != ranges[target_layer].first)
+                continue;
             const auto &runtime = runtime_layers[layer];
             if (runtime.active_bank > 1u ||
                 runtime.active_epoch == 0u ||
@@ -4384,6 +4452,9 @@ namespace
             DeviceMoELayerRuntimeView &runtime = runtime_layers[layer];
             if (leader)
             {
+                rebalance_family_planned_occupancy(shared_active_transfer_slot_counts,
+                    gathered_histograms, config, layer, window_index, layer_window_start,
+                    layer_window_count, start_offset, plan_entries, plan_count);
                 shared_layer_invalid =
                     (runtime.active_bank > 1u ||
                      runtime.expert_count != config.num_experts ||
@@ -4398,6 +4469,9 @@ namespace
             __syncthreads();
             if (shared_layer_invalid != 0u)
                 continue;
+            const uint32_t family_active_capacity = rebalance_layer_slot_range(
+                config, layer, config.transfer_slot_directory_capacity).active_capacity;
+
 
             uint32_t layer_command_count_before = 0u;
             if (leader && defer_runtime_apply && plan_count)
@@ -4674,6 +4748,13 @@ namespace
                             continue;
 
                         const bool ownership_transfer = !hot_replica_cache;
+                        if (!ownership_transfer && config.transfer_slot_layer_ranges &&
+                            shared_active_transfer_slot_counts[transfer.destination_participant] >= family_active_capacity)
+                        {
+                            if (status)
+                                ++status->capacity_limited_candidates;
+                            continue;
+                        }
                         if (ownership_transfer &&
                             (shared_expert_owners[transfer.expert] !=
                                  static_cast<int32_t>(
@@ -4686,7 +4767,7 @@ namespace
                                      transfer.source_participant,
                                      transfer.destination_participant,
                                      config.participant_count,
-                                     config.active_transfer_slot_capacity)))
+                                     family_active_capacity)))
                         {
                             if (status)
                                 ++status->capacity_limited_candidates;
@@ -4811,6 +4892,8 @@ namespace
                                 break;
                             }
                         }
+                        else if (config.transfer_slot_layer_ranges)
+                            ++shared_active_transfer_slot_counts[transfer.destination_participant];
                         ++accepted_transfers;
                     }
                 }
@@ -4965,7 +5048,7 @@ namespace
                             config.dynamic_min_improvement_per_mille,
                             shared_expert_transfer_backed_participant_mask,
                             shared_active_transfer_slot_counts,
-                            config.active_transfer_slot_capacity);
+                            family_active_capacity);
                     if (!swap_choice.valid)
                     {
                         ++dynamic_ownership_swap_rejections;
@@ -5516,6 +5599,7 @@ namespace
                                 uint32_t destination_slot = kDeviceMoEInvalidSlot;
                                 uint32_t payload_slot = kDeviceMoEInvalidSlot;
                                 if (destination_choice.destination_participant < kDeviceMoEMaxParticipants &&
+                                    (!config.transfer_slot_layer_ranges || shared_active_transfer_slot_counts[destination_choice.destination_participant] < family_active_capacity) &&
                                     shared_destination_transfer_slot_counts[
                                         destination_choice.destination_participant] < payload_slot_capacity &&
                                     source_participant >= 0 &&
@@ -5553,6 +5637,8 @@ namespace
                                 {
                                     ++shared_destination_transfer_slot_counts[
                                         destination_choice.destination_participant];
+                                    if (config.transfer_slot_layer_ranges)
+                                        ++shared_active_transfer_slot_counts[destination_choice.destination_participant];
                                     ++shared_source_payload_slot_counts[
                                         static_cast<uint32_t>(source_participant)];
                                     shared_post_policy_resident_mask[best_expert] =
@@ -5682,6 +5768,7 @@ namespace
                             uint32_t destination_slot = kDeviceMoEInvalidSlot;
                             uint32_t payload_slot = kDeviceMoEInvalidSlot;
                             if (config.participant_id < kDeviceMoEMaxParticipants &&
+                                (!config.transfer_slot_layer_ranges || shared_active_transfer_slot_counts[config.participant_id] < family_active_capacity) &&
                                 shared_destination_transfer_slot_counts[config.participant_id] < payload_slot_capacity &&
                                 source_participant >= 0 &&
                                 static_cast<uint32_t>(source_participant) < kDeviceMoEMaxParticipants &&
@@ -5715,6 +5802,8 @@ namespace
                                     status))
                             {
                                 ++shared_destination_transfer_slot_counts[config.participant_id];
+                                if (config.transfer_slot_layer_ranges)
+                                    ++shared_active_transfer_slot_counts[config.participant_id];
                                 ++shared_source_payload_slot_counts[
                                     static_cast<uint32_t>(source_participant)];
                                 shared_post_policy_resident_mask[best_expert] =
@@ -6682,6 +6771,9 @@ namespace
             DeviceMoELayerRuntimeView &runtime = runtime_layers[layer];
             if (leader)
             {
+                rebalance_family_planned_occupancy(shared_active_transfer_slot_counts,
+                    gathered_histograms, config, layer, window_index, layer_window_start,
+                    layer_window_count, start_offset, plan_entries, plan_count);
                 shared_layer_invalid =
                     (runtime.active_bank > 1u ||
                      runtime.expert_count != config.num_experts ||
@@ -6694,6 +6786,9 @@ namespace
             __syncthreads();
             if (shared_layer_invalid != 0u)
                 continue;
+            const uint32_t family_active_capacity = rebalance_layer_slot_range(
+                config, layer, config.transfer_slot_directory_capacity).active_capacity;
+
 
             uint32_t layer_command_count_before = 0u;
             if (leader && plan_count)
@@ -6769,7 +6864,7 @@ namespace
                             config.dynamic_min_improvement_per_mille,
                             shared_expert_transfer_backed_participant_mask,
                             shared_active_transfer_slot_counts,
-                            config.active_transfer_slot_capacity);
+                            family_active_capacity);
                     if (!swap_choice.valid)
                     {
                         ++dynamic_ownership_swap_rejections;
@@ -7256,6 +7351,12 @@ namespace
                 rebalance_actual_layer_for_wave_index(config, selected_wave_state, wave_layer);
             const DeviceMoELayerRuntimeView &runtime = runtime_layers[layer];
             unsigned long long value = 0ULL;
+            if (config.transfer_slot_layer_ranges && expert == 0u)
+            {
+                auto *words = reinterpret_cast<uint32_t *>(local_histograms);
+                words[2u * uint64_t{total} + wave_layer] =
+                    rebalance_active_transfer_slot_expert_count(runtime_layers, config, layer);
+            }
             if (runtime.active_bank <= 1u &&
                 runtime.expert_count == config.num_experts &&
                 runtime.top_k == config.top_k &&
@@ -7282,9 +7383,9 @@ namespace
                     bank.experts[expert].owner_participant ==
                     static_cast<int32_t>(config.participant_id);
                 const uint32_t active_transfer_slots =
-                    idx == 0u
+                    (!config.transfer_slot_layer_ranges && idx == 0u)
                         ? rebalance_active_transfer_slot_expert_count(
-                              runtime_layers, config)
+                              runtime_layers, config, layer)
                         : 0u;
                 unsigned long long cumulative_count = 0ULL;
                 for (uint32_t source = 0u;
@@ -8720,14 +8821,15 @@ namespace
             return false;
         }
 
+        const auto range = rebalance_layer_slot_range(config, plan.layer, local_transfer_slot_count);
         uint32_t selected_slot = kDeviceMoEInvalidSlot;
 
         /*
          * Reusing the current slot for the same logical expert preserves the
          * runtime pointer identity and is preferable to consuming a new slot.
          */
-        for (uint32_t slot = 0u;
-             slot < local_transfer_slot_count;
+        for (uint32_t slot = range.first;
+             slot < range.end;
              ++slot)
         {
             const auto &entry = local_transfer_slots[slot];
@@ -8755,9 +8857,9 @@ namespace
          * Otherwise consume only storage whose previous publication is already
          * retired.
          */
-        for (uint32_t slot = 0u;
+        for (uint32_t slot = range.first;
              selected_slot == kDeviceMoEInvalidSlot &&
-             slot < local_transfer_slot_count;
+             slot < range.end;
              ++slot)
         {
             const auto &entry = local_transfer_slots[slot];
@@ -8789,9 +8891,9 @@ namespace
          * collective payload. The generation ticket below then authenticates that
          * no other transaction changed the slot before incoming unpack.
          */
-        for (uint32_t slot = 0u;
+        for (uint32_t slot = range.first;
              selected_slot == kDeviceMoEInvalidSlot &&
-             slot < local_transfer_slot_count;
+             slot < range.end;
              ++slot)
         {
             const auto &entry = local_transfer_slots[slot];
@@ -8822,9 +8924,9 @@ namespace
          * only after a complete runtime scan proves that no owner, active
          * assignment, or duplicate descriptor protects the allocation.
          */
-        for (uint32_t slot = 0u;
+        for (uint32_t slot = range.first;
              selected_slot == kDeviceMoEInvalidSlot &&
-             slot < local_transfer_slot_count;
+             slot < range.end;
              ++slot)
         {
             const auto &entry = local_transfer_slots[slot];
@@ -8920,9 +9022,10 @@ namespace
             target_runtime.reserved_u64[2] > 0xffffffffULL
                 ? 0xffffffffu
                 : static_cast<uint32_t>(target_runtime.reserved_u64[2]);
+        const auto range = rebalance_layer_slot_range(config, plan.layer, local_transfer_slot_count);
         uint32_t selected_slot = kDeviceMoEInvalidSlot;
-        for (uint32_t slot_index = 0u;
-             slot_index < local_transfer_slot_count;
+        for (uint32_t slot_index = range.first;
+             slot_index < range.end;
              ++slot_index)
         {
             const auto &prior = local_transfer_slots[slot_index];
@@ -11008,7 +11111,9 @@ namespace
         if (threadIdx.x == 0)
         {
             shared_arrival_valid = 1u;
+            const auto family = rebalance_layer_slot_range(config, plan.layer, local_transfer_slot_count);
             const bool lease_matches =
+                destination_slot >= family.first && destination_slot < family.end &&
                 plan.destination_generation != 0xffffffffu &&
                 dst.generation == plan.destination_generation &&
                 dst.layer == plan.destination_previous_layer &&

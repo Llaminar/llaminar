@@ -2089,6 +2089,7 @@ namespace llaminar2
                 spec.is_asymmetric = has_mins != 0;
                 spec.has_emins = has_emins != 0;
                 spec.codebook_id = descriptor.codebook_id;
+                spec.scale_plane = nativeQuantisedScalePlaneWidth(descriptor.codebook_id);
                 spec.format =
                     ExpertWeightFormat::nativeQuantised(source_identity);
                 spec.gpu_superblock_phase = nativeQuantisedLayoutPhase(descriptor.metadata_layout);
@@ -5984,15 +5985,7 @@ namespace llaminar2
                         bound_runtime_table_layers, config_.moe.num_experts,
                         bound_runtime_first_layer), DeviceMoEProjectionSet::GateUp);
             }
-            /*
-             * One transfer directory is shared by the complete device-local MoE
-             * domain. Its slots retain arrivals from different layers, so sizing
-             * it from the current layer would either reject a later, wider
-             * codebook or force one full directory allocation per layer. Scan
-             * every compute-ready registry descriptor before any directory is
-             * created and merge those formats into one immutable capacity
-             * profile.
-             */
+            // Every owned runtime layer has exactly one authenticated tuple.
             std::vector<std::vector<DeviceMoETransferSlotDirectory::ProjectionSpec>>
                 layer_formats;
             layer_formats.reserve(
@@ -6060,7 +6053,10 @@ namespace llaminar2
                                 registry_scope + " on " +
                                 device.to_string());
                         }
-                        layer_formats.push_back(std::move(*exact_specs));
+                        if (layer_formats.size() == static_cast<size_t>(scan_layer - bound_runtime_first_layer))
+                            layer_formats.push_back(std::move(*exact_specs));
+                        else if (layer_formats.back() != *exact_specs)
+                            throw std::invalid_argument("Device rebalance requires one movable projection layout per layer");
                         found_complete_expert = true;
                     }
                     return found_complete_expert;
@@ -6629,42 +6625,16 @@ namespace llaminar2
                 return false;
             return graphRebalanceUsesTransferSlots();
         };
-        auto graphRebalanceTransferDirectoryKey =
-            [&](uint32_t transfer_slot_count) -> std::string
+        const auto graphTransferDirectoryCapacity = [&](const DeviceMoERebalanceConfig &rebalance_config)
         {
-            if (!graph_rebalance_transfer_profile.has_value())
-            {
-                throw std::logic_error(
-                    "Qwen35 MoE cannot identify a transfer directory without "
-                    "an expert weight format profile");
-            }
-
-            /*
-             * This key identifies physical storage, not only a logical TP
-             * domain. graphRebalanceDomainKey() already includes the exact
-             * DeviceId and participant. Keeping all remaining allocation
-             * discriminators in this one builder prevents prefill and decode
-             * maintenance from silently inventing different cache identities.
-             */
-            std::ostringstream key;
-            key << graphRebalanceDomainKey()
-                << ":slots=" << transfer_slot_count;
-            for (const auto &spec :
-                 graph_rebalance_transfer_profile->allocation_specs)
-            {
-                key << ':' << spec.label
-                    << '=' << spec.N << 'x' << spec.K
-                    << ":cb" << static_cast<int>(spec.codebook_id)
-                    << ":pb" << spec.payload_bytes_per_block
-                    << ":asym" << (spec.is_asymmetric ? 1 : 0)
-                    << ":emins" << (spec.has_emins ? 1 : 0)
-                    << ":format" << static_cast<int>(spec.format.kind);
-            }
-            key << ":floating_capacity=" << static_cast<int>(
-                graph_rebalance_transfer_profile->floating_allocation_format);
-            key << ":wire="
-                << graph_rebalance_transfer_profile->max_wire_payload_bytes;
-            return key.str();
+            const auto compact_slots = static_cast<uint32_t>(std::max(1,
+                env.moe_rebalance.device_rebalance_compact_payload_slots));
+            const auto minimum = DeviceMoETransferSlotDirectory::runtimeMinimumActiveSlots(
+                local_tp_ctx && isHomogeneousGpuLocalTPRebalanceDomain(*local_tp_ctx, device, config_.tp_device_idx),
+                config_.moe.routed_prefill_assignment_policy, config_.prefix_cache, compact_slots);
+            return DeviceMoETransferSlotDirectory::planRuntimeCapacity(rebalance_config, minimum,
+                static_cast<uint32_t>(std::max(1, env.moe_rebalance.gpu_direct_transfer_wave_experts)),
+                static_cast<uint32_t>(std::max(1, env.moe_rebalance.gpu_direct_transfer_buffers)));
         };
         auto getOrCreateGraphRebalanceTransferDirectory =
             [&](const DeviceMoERebalanceConfig &rebalance_config,
@@ -6682,9 +6652,6 @@ namespace llaminar2
                     "weight format profile");
             }
 
-            const uint32_t transfer_slot_count =
-                transfer_capacity.total_slots;
-
             IBackend *backend = getBackendFor(device);
             const int gpu_ordinal = gpuOrdinalForGraphDevice(device);
             if (!backend || gpu_ordinal < 0)
@@ -6697,8 +6664,7 @@ namespace llaminar2
                              : std::string{}));
             }
 
-            const std::string transfer_key =
-                graphRebalanceTransferDirectoryKey(transfer_slot_count);
+            const std::string transfer_key = graphRebalanceDomainKey();
             auto existing =
                 moe_transfer_slot_directories_.find(transfer_key);
             if (existing == moe_transfer_slot_directories_.end())
@@ -6746,6 +6712,7 @@ namespace llaminar2
                 device,
                 gpu_ordinal,
                 rebalance_config.participant_id);
+            existing->second->requireCaptureIdentity(*graph_rebalance_transfer_profile, transfer_capacity);
             return {transfer_key, existing->second};
         };
         auto ensureGraphRebalanceTransferBindingOnly =
@@ -6811,28 +6778,12 @@ namespace llaminar2
                     (context ? std::string(" (") + context + ")" : std::string{}));
             }
 
-            const uint64_t prefill_llep_slots =
-                prefill_llep_transfer_candidate
-                    ? static_cast<uint64_t>(
-                          std::max(1, env.moe_rebalance.device_rebalance_compact_payload_slots))
-                    : 1ULL;
-            const auto transfer_capacity =
-                DeviceMoETransferSlotDirectory::planRuntimeCapacity(
-                    rebalance_config,
-                    prefill_llep_slots,
-                    static_cast<uint32_t>(
-                        std::max(1, env.moe_rebalance.gpu_direct_transfer_wave_experts)),
-                    static_cast<uint32_t>(
-                        std::max(1, env.moe_rebalance.gpu_direct_transfer_buffers)));
-            rebalance_config.active_transfer_slot_capacity =
-                transfer_capacity.active_slots;
-            rebalance_config.transfer_slot_directory_capacity =
-                transfer_capacity.total_slots;
+            const auto transfer_capacity = graphTransferDirectoryCapacity(rebalance_config);
             auto [transfer_key, transfer_directory] =
-                getOrCreateGraphRebalanceTransferDirectory(
-                    rebalance_config,
-                    transfer_capacity,
-                    context);
+                getOrCreateGraphRebalanceTransferDirectory(rebalance_config, transfer_capacity, context);
+            rebalance_config.active_transfer_slot_capacity = transfer_directory->activeSlotCount();
+            rebalance_config.transfer_slot_directory_capacity = transfer_directory->slotCount();
+            rebalance_config.transfer_slot_layer_ranges = transfer_directory->deviceLayerRanges();
 
             const std::string rebalance_workspace = graphRebalanceWorkspaceName();
             /*
@@ -6935,6 +6886,7 @@ namespace llaminar2
                 binding->config.active_transfer_slot_capacity;
             invocation_config.transfer_slot_directory_capacity =
                 binding->config.transfer_slot_directory_capacity;
+            invocation_config.transfer_slot_layer_ranges = binding->config.transfer_slot_layer_ranges;
             if (deviceMoERebalanceModePlansMissingArrivals(
                     binding->transfer_mode))
             {
@@ -7043,10 +6995,10 @@ namespace llaminar2
                 binding.config.layer_wave_count == 0u
                     ? window_count
                     : std::min(binding.config.layer_wave_count, window_count);
-            const size_t local_histogram_entries =
-                static_cast<size_t>(std::max<uint32_t>(1u, wave_count)) *
-                static_cast<size_t>(binding.config.num_experts);
-            if (local_histogram_entries == 0)
+            const size_t local_histogram_words = moe_rebalance_abi::histogramWords(
+                moe_rebalance_abi::histogramLayout(binding.config.transfer_slot_layer_ranges),
+                std::max(1u, wave_count), binding.config.num_experts);
+            if (local_histogram_words == 0u)
                 return sidebands;
 
             TPAllreduceSidebandWorkspaceBinding histogram_sideband;
@@ -7059,8 +7011,7 @@ namespace llaminar2
                 MoEDeviceRebalanceStage::workspaceBufferName(
                     MoEDeviceRebalanceStage::WS_GATHERED_HISTOGRAM,
                     binding.workspace_name);
-            static_assert(sizeof(uint64_t) == 2 * sizeof(int32_t));
-            histogram_sideband.element_count = local_histogram_entries * 2u;
+            histogram_sideband.element_count = local_histogram_words;
             histogram_sideband.dtype = CollectiveDataType::INT32;
             histogram_sideband.root_device_index =
                 static_cast<int>(binding.config.root_participant);
@@ -7380,22 +7331,7 @@ namespace llaminar2
                             (context ? std::string(" (") + context + ")" : std::string{}));
                     }
 
-                    const auto transfer_capacity =
-                        DeviceMoETransferSlotDirectory::planRuntimeCapacity(
-                            rebalance_config,
-                            /*minimum_active_slots=*/0u,
-                            static_cast<uint32_t>(
-                                std::max(
-                                    1,
-                                    env.moe_rebalance.gpu_direct_transfer_wave_experts)),
-                            static_cast<uint32_t>(
-                                std::max(
-                                    1,
-                                    env.moe_rebalance.gpu_direct_transfer_buffers)));
-                    rebalance_config.active_transfer_slot_capacity =
-                        transfer_capacity.active_slots;
-                    rebalance_config.transfer_slot_directory_capacity =
-                        transfer_capacity.total_slots;
+                    const auto transfer_capacity = graphTransferDirectoryCapacity(rebalance_config);
                     auto directory_result =
                         getOrCreateGraphRebalanceTransferDirectory(
                             rebalance_config,
@@ -7405,6 +7341,9 @@ namespace llaminar2
                     auto transfer_directory =
                         std::move(directory_result.second);
 
+                    rebalance_config.active_transfer_slot_capacity = transfer_directory->activeSlotCount();
+                    rebalance_config.transfer_slot_directory_capacity = transfer_directory->slotCount();
+                    rebalance_config.transfer_slot_layer_ranges = transfer_directory->deviceLayerRanges();
                     local_transfer_slots = transfer_directory->deviceEntries();
                     local_transfer_slot_count = transfer_directory->slotCount();
                     collective_payload_slot_capacity =
@@ -7617,7 +7556,7 @@ namespace llaminar2
             apply_params.tp_ctx = local_tp_ctx;
             apply_params.moe_runtime_table = moe_runtime_table;
             apply_params.tp_device_idx = config_.tp_device_idx;
-            apply_params.config = rebalance_config;
+            apply_params.config = binding_it->second.config;
             apply_params.local_transfer_slots = apply_transfer_slots;
             apply_params.local_transfer_slot_count = apply_transfer_slot_count;
             apply_params.collective_payload_slot_bytes =
