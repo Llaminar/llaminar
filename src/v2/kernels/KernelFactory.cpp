@@ -3453,7 +3453,7 @@ namespace llaminar
                             static_cast<uint16_t *>(d.ptrs.d_mins),
                             static_cast<uint32_t *>(d.ptrs.d_emins),
                             d.codebook_id, d.blocks_per_row, source,
-                            prepared.format.native_quantised, allocation);
+                            prepared.format.native_quantised, allocation, d.metadata_layout);
                     }
 #endif
 #ifdef HAVE_ROCM

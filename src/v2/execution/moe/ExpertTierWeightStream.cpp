@@ -33,15 +33,17 @@ namespace llaminar2
 {
     namespace
     {
-        /** @brief Admission diagnostic shared by both directions and the host reference. */
-        constexpr char kDensityAwareExpertTierSlotsRequired[] =
-            "CPU prepared weight layout requires coded/compensation-free GPU migration slots";
-    }
-
-    namespace
-    {
         using CPUEncoding = cpu::native_quantised::CPUNativeQuantisedEncoding;
         using CPUWeights = cpu::native_quantised::CPUNativeQuantisedPackedWeights;
+        namespace sb = native_quantised_superblock;
+        namespace cm = cpu::native_quantised::coded_metadata;
+
+        /** @brief Fill a disjoint field in a zero-initialized, block-major host code plane. */
+        void writeHostCode(uint8_t *plane, size_t bit, unsigned width, uint32_t code) noexcept
+        {
+            for (unsigned i = 0; i < width; ++i)
+                plane[(bit + i) / 8] |= uint8_t(((code >> i) & 1u) << ((bit + i) % 8));
+        }
 
         /**
          * @brief Record an optional validation diagnostic and return failure.
@@ -93,9 +95,6 @@ namespace llaminar2
             return true;
         }
 
-        constexpr char kCodedQ5KIQ3SMigrationDiagnostic[] =
-            "Superblock-coded Q5_K and IQ3_S CPU units require coded GPU migration slots";
-
         /**
          * @brief Identify GPU formats retained as compact nibble CPU payloads.
          * @param codebook NativeQuantised execution codebook.
@@ -107,8 +106,6 @@ namespace llaminar2
                    codebook == kNativeQuantisedMXFP4Codebook;
         }
 
-        constexpr auto kNativeQ5GpuStreamUnsupported =
-            "Native Q5_0/Q5_1 CPU units require file-density GPU migration slots and a native Q5 converter";
 
         /**
          * @brief Derive the only lossless GPU execution representation for a
@@ -135,26 +132,26 @@ namespace llaminar2
         {
             // None of the currently normalized stream formats uses Q2_K emins.
             has_emins = false;
-            if (cpu::native_quantised::isQ5NativeSingleScaleSource(cpu.codebook_id, cpu.is_superblock))
-                return reject(error, kNativeQ5GpuStreamUnsupported);
-            switch (cpu.encoding)
+            const auto *source = native_quantised_formats::forSourceIdentity(cpu.codebook_id, cpu.is_superblock);
+            if (source && (cpu::native_quantised::migrationUsesSuperblockCodes(*source) ||
+                expertTierPreservesNativeSingleScale(cpu::native_quantised::preparedEncodingForSource(*source), cpu.codebook_id)))
             {
-            case CPUEncoding::Q5NativeSingleScale:
-                return reject(error, kNativeQ5GpuStreamUnsupported);
-            case CPUEncoding::CompactMultiScale:
-            {
-                const auto *format = native_quantised_formats::forSourceIdentity(
-                    cpu.codebook_id, cpu.is_superblock);
-                if (!format || !hasCompactMultiScaleVnniPayload(cpu.codebook_id) ||
-                    cpu.payload_bytes != format->payload_bytes || cpu.is_asymmetric != format->is_asymmetric)
-                    return reject(error, "Compact multi-scale CPU stream metadata is invalid");
-                codebook = cpu.codebook_id;
-                payload_bytes = static_cast<uint8_t>(format->payload_bytes);
-                // Single-scale compact units (IQ3_XXS/IQ2_XXS) have no secondary plane.
-                is_asymmetric = format->is_asymmetric;
-                has_emins = format->has_emins;
+                if (cpu.encoding != cpu::native_quantised::preparedEncodingForSource(*source) ||
+                    cpu.payload_bytes != source->payload_bytes || cpu.is_asymmetric != source->is_asymmetric)
+                    return reject(error, "Native GPU migration requires the canonical CPU source encoding");
+                const auto physical = canonicalDeviceVnniFormat(*source);
+                codebook = physical.codebook_id;
+                payload_bytes = physical.payload_bytes_per_block;
+                is_asymmetric = physical.is_asymmetric;
+                has_emins = physical.has_emins;
                 return true;
             }
+            switch (cpu.encoding)
+            {
+            case CPUEncoding::Q4KSuperblockCoded:
+            case CPUEncoding::Q5NativeSingleScale:
+            case CPUEncoding::CompactMultiScale:
+                return reject(error, "Coded CPU tier encoding has no matching source format");
             case CPUEncoding::IQ3SExpandedSourceScale:
                 if (cpu.codebook_id != 11 || !cpu.is_superblock || cpu.is_asymmetric || cpu.payload_bytes != 13)
                     return reject(error, "IQ3_S source-tuple CPU stream metadata is invalid");
@@ -222,11 +219,7 @@ namespace llaminar2
             int n,
             int kb) noexcept
         {
-            // CPU units are ordered by 64-column chunk, then by K block.
-            const size_t chunk = static_cast<size_t>(n / 64);
-            return (chunk * static_cast<size_t>(cpu.blocks_per_row) +
-                    static_cast<size_t>(kb)) *
-                   static_cast<size_t>(cpu.interleaved_block_stride);
+            return cpu.geometry().blockOffset(n / 64, kb);
         }
 
         /**
@@ -248,6 +241,13 @@ namespace llaminar2
             int value_index) noexcept
         {
             const int local_column = n % 64;
+            if (cpu::native_quantised::preparedSuperblockCoded(cpu.encoding))
+            {
+                const int full_words = cpu.data_stride / (64 * 4);
+                const int tail = cpu.data_stride / 64 % 4;
+                if (value_index >= full_words * 4)
+                    return cpuUnitOffset(cpu, n, kb) + full_words * 256 + local_column * tail + value_index - full_words * 4;
+            }
             const int group = value_index / 4;
             const int index = value_index % 4;
             const int zmm = local_column / 16;
@@ -281,6 +281,56 @@ namespace llaminar2
             std::memcpy(destination, &value, sizeof(value));
         }
 
+        /** @brief Read one canonical payload byte without assembling a temporary column. */
+        uint8_t readCodedResidentPayload(const uint8_t *block, uint8_t book, unsigned stride,
+            unsigned column, unsigned byte) noexcept
+        {
+            if (book == 7 && byte >= 16)
+            {
+                const auto *group = block + 1024 + (byte - 16) * 64 + column / 2;
+                const auto shift = (column % 2) * 4;
+                return uint8_t(((*group >> shift) & 15) | (((group[32] >> shift) & 15) << 4));
+            }
+            if (book == 8 && byte >= 16)
+            {
+                const auto *group = block + 1024 + (byte - 16) * 64 + (column / 16) * 16;
+                const auto shift = (column % 16) * 4;
+                const auto low = (loadU64(group) >> shift) & 15;
+                const auto high = (loadU64(group + 8) >> shift) & 15;
+                return uint8_t((low & 1) | ((high & 1) << 1) | ((low & 2) << 1) | ((high & 2) << 2) |
+                    ((low & 4) << 2) | ((high & 4) << 3) | ((low & 8) << 3) | ((high & 8) << 4));
+            }
+            return block[expertTierCodedPayloadOffset(stride / 64, 64, column, byte)];
+        }
+
+        /** @brief Write exactly one column's bits into a resident payload; shared words require caller-owned exclusion. */
+        void writeCodedResidentPayload(uint8_t *block, uint8_t book, unsigned stride,
+            unsigned column, unsigned byte, uint8_t value) noexcept
+        {
+            if (book == 7 && byte >= 16)
+            {
+                auto *group = block + 1024 + (byte - 16) * 64 + column / 2;
+                const auto shift = (column % 2) * 4;
+                const auto mask = 15u << shift;
+                group[0] = uint8_t((group[0] & ~mask) | ((value & 15u) << shift));
+                group[32] = uint8_t((group[32] & ~mask) | ((value >> 4) << shift));
+                return;
+            }
+            if (book == 8 && byte >= 16)
+            {
+                auto *group = block + 1024 + (byte - 16) * 64 + (column / 16) * 16;
+                const auto shift = (column % 16) * 4;
+                const auto extract = [](uint8_t code) {
+                    return uint64_t((code & 1u) | ((code & 4u) >> 1) | ((code & 16u) >> 2) | ((code & 64u) >> 3));
+                };
+                const auto mask = uint64_t{15} << shift;
+                storeU64(group, (loadU64(group) & ~mask) | (extract(value) << shift));
+                storeU64(group + 8, (loadU64(group + 8) & ~mask) | (extract(value >> 1) << shift));
+                return;
+            }
+            block[expertTierCodedPayloadOffset(stride / 64, 64, column, byte)] = value;
+        }
+
         /**
          * @brief Validate a materialized CPU projection before streaming it.
          * @param cpu Candidate prepared representation.
@@ -300,15 +350,6 @@ namespace llaminar2
             }
             if (!cpu::native_quantised::isKnownPreparedEncoding(cpu.encoding))
                 return reject(error, "CPU packed encoding is unknown");
-            if (const char *reason = codedSourceScaleStreamRejection(cpu.encoding))
-                return reject(error, reason);
-            if (cpu.usesCompactMultiScale() &&
-                requiresCodedQ5KIQ3SMigrationSlots(cpu.codebook_id, cpu.is_superblock))
-                return reject(error, kCodedQ5KIQ3SMigrationDiagnostic);
-            if (requiresDensityAwareExpertTierSlots(cpu.encoding, cpu.codebook_id))
-                return reject(error, kDensityAwareExpertTierSlotsRequired);
-            if (const char *reason = codedCpuWireRejection(cpu.encoding))
-                return reject(error, reason);
             // Source provenance must identify exactly one of the 21 cataloged
             // formats even when its final CPU bytes have been normalized.
             if (native_quantised_formats::forSourceIdentity(
@@ -332,16 +373,8 @@ namespace llaminar2
             }
 
             // Overflow-safe size reconstruction prevents truncated allocations.
-            uint64_t units = 0;
             uint64_t bytes = 0;
-            if (!checkedMultiply(
-                    static_cast<uint64_t>(cpu.N_padded / 64),
-                    static_cast<uint64_t>(cpu.blocks_per_row),
-                    units) ||
-                !checkedMultiply(
-                    units,
-                    static_cast<uint64_t>(cpu.interleaved_block_stride),
-                    bytes) ||
+            if (!checkedMultiply(static_cast<uint64_t>(cpu.N_padded / 64), cpu.geometry().rowBytes(), bytes) ||
                 bytes != cpu.native_interleaved.size())
             {
                 return reject(error, "CPU interleaved byte count does not match geometry");
@@ -378,7 +411,15 @@ namespace llaminar2
             cpu.is_superblock = gpu.is_superblock;
             cpu.is_asymmetric = gpu.is_asymmetric;
 
-            if (gpu.codebook_id == kNativeQuantisedIQ4XSSourceScaleCodebook)
+            const auto &source = *native_quantised_formats::forSourceIdentity(gpu.source_codebook_id, gpu.is_superblock);
+            if (gpu.metadata_layout != 0 || expertTierPreservesNativeSingleScale(
+                    cpu::native_quantised::preparedEncodingForSource(source), source.codebook_id))
+            {
+                cpu.encoding = cpu::native_quantised::preparedEncodingForSource(source);
+                cpu.is_asymmetric = source.is_asymmetric;
+                cpu.payload_bytes = source.payload_bytes;
+            }
+            else if (gpu.codebook_id == kNativeQuantisedIQ4XSSourceScaleCodebook)
             {
                 cpu.encoding = CPUEncoding::NibbleLUTSourceScale;
                 cpu.payload_bytes = 16;
@@ -497,13 +538,7 @@ namespace llaminar2
             }
             manifest.unit_count = static_cast<uint32_t>(units);
             manifest.maximum_units_per_chunk = maximum_units_per_chunk;
-            if (!checkedMultiply(
-                    static_cast<uint64_t>(manifest.N)*manifest.blocks_per_row,
-                    static_cast<uint64_t>(manifest.cpu_block_stride/64),
-                    manifest.total_stream_bytes))
-            {
-                throw std::invalid_argument("Tier stream byte count overflows uint64");
-            }
+            manifest.total_stream_bytes = manifest.deviceLayout().chunkBytes(manifest.unit_count);
             // Hash only after every semantic field has its final value.
             manifest.manifest_hash = manifest.computedHash();
             std::string error;
@@ -603,13 +638,16 @@ namespace llaminar2
         }
         try {
             const auto intersection=ExpertTierWeightProjectionIntersection::between(source_projection,destination_projection);
+            const auto *source = native_quantised_formats::forSourceIdentity(cpu_codebook_id, cpu_is_superblock != 0);
+            if (source)
+                requireExpertTierResidentCpuOrigin(*source, (cpu_to_gpu ? source_projection : destination_projection).first_column);
             if(intersection.empty() || intersection.rows()!=N || intersection.columns()!=K ||
                source_projection.first_column%32 || destination_projection.first_column%32 ||
                source_projection.columns%32 || destination_projection.columns%32 ||
                source_projection.source_columns%32)
                 return reject(error,"Tier stream original projection/native block geometry is inconsistent");
-        } catch(const std::invalid_argument&) {
-            return reject(error,"Tier stream original projection rectangles are invalid");
+        } catch(const std::invalid_argument &failure) {
+            return reject(error, failure.what());
         }
         // A native block contains exactly32 K values; N padding is never traffic.
         if (N <= 0 || K <= 0 || N_padded < N || (N_padded % 64) != 0 ||
@@ -619,16 +657,6 @@ namespace llaminar2
         }
         if (!cpu::native_quantised::isKnownPreparedEncoding(cpu_encoding))
             return reject(error, "Tier stream CPU encoding is invalid");
-        if (const char *reason = codedSourceScaleStreamRejection(cpu_encoding))
-            return reject(error, reason);
-        if ((destination_packing == ExpertTierWeightPacking::CpuNativeQuantisedInterleaved ||
-             cpu_encoding == CPUEncoding::CompactMultiScale) &&
-            requiresCodedQ5KIQ3SMigrationSlots(cpu_codebook_id, cpu_is_superblock != 0))
-            return reject(error, kCodedQ5KIQ3SMigrationDiagnostic);
-        if (requiresDensityAwareExpertTierSlots(cpu_encoding, cpu_codebook_id))
-            return reject(error, kDensityAwareExpertTierSlotsRequired);
-        if (const char *reason = codedCpuWireRejection(cpu_encoding))
-            return reject(error, reason);
         // Re-derive strides rather than accepting redundant wire fields on trust.
         const uint32_t expected_data_stride =
             cpu::native_quantised::preparedDataStride(cpu_encoding, cpu_codebook_id);
@@ -644,8 +672,7 @@ namespace llaminar2
         const uint64_t expected_units =
             static_cast<uint64_t>(N_padded / 64) *
             static_cast<uint64_t>(blocks_per_row);
-        const uint64_t expected_bytes =
-            static_cast<uint64_t>(N)*blocks_per_row*(cpu_block_stride/64);
+        const uint64_t expected_bytes = deviceLayout().chunkBytes(unit_count);
         if (expected_units == 0 ||
             expected_units > std::numeric_limits<uint32_t>::max() ||
             unit_count != expected_units || total_stream_bytes != expected_bytes ||
@@ -702,6 +729,9 @@ namespace llaminar2
             .cpu_is_superblock = cpu_is_superblock,
             .gpu_is_asymmetric = gpu_is_asymmetric,
             .gpu_has_emins = gpu_has_emins,
+            .gpu_superblock_phase = cpu::native_quantised::preparedSuperblockCoded(cpu_encoding)
+                ? static_cast<uint8_t>(sb::superblockPhase((source_packing == ExpertTierWeightPacking::GpuSeparatedNativeQuantised
+                    ? source_projection : destination_projection).first_column / 32)) : uint8_t{0},
             .cpu_encoding = cpu_encoding,
             .cpu_data_stride = cpu_data_stride,
             .cpu_block_stride = cpu_block_stride,
@@ -714,26 +744,26 @@ namespace llaminar2
         ExpertTierWeightCPUStorageLayout format, MoEExpertProjectionOwnership::Projection owned,
         const ExpertTierWeightProjectionIntersection &intersection, std::uint32_t capacity)
     {
-        if (const char *reason = codedCpuWireRejection(format.cpu_encoding))
-            throw std::invalid_argument(reason);
         if (intersection.empty() || (owned != intersection.source() && owned != intersection.destination()) ||
             intersection.columns() % 32 || intersection.firstColumn() % 32 ||
             intersection.firstColumn() < owned.first_column ||
             (intersection.firstColumn() - owned.first_column) % 32 ||
-            format.cpu_block_stride == 0 || format.cpu_block_stride % 64 ||
+            format.cpu_block_stride == 0 || (!format.coded() && format.cpu_block_stride % 64) ||
             format.wire_columns_per_unit == 0 || format.wire_columns_per_unit > 64)
             throw std::invalid_argument("CPU native intersection requires its original root and canonical format");
+        if (const auto *source = native_quantised_formats::forSourceIdentity(format.cpu_codebook_id, format.cpu_is_superblock != 0))
+            requireExpertTierResidentCpuOrigin(*source, owned.first_column);
         const auto units = ((uint64_t(intersection.rows()) + format.wire_columns_per_unit - 1) /
             format.wire_columns_per_unit) * (intersection.columns() / 32);
-        const auto unit_bytes = uint64_t(format.cpu_block_stride / 64) *
-            std::min<uint32_t>(intersection.rows(), format.wire_columns_per_unit);
-        if (units == 0 || units > UINT32_MAX || unit_bytes == 0 || capacity < unit_bytes)
-            throw std::invalid_argument("CPU native intersection exceeds its bounded lane geometry");
         format.N = intersection.rows(); format.K = intersection.columns();
         format.blocks_per_row = intersection.columns() / 32;
         format.cpu_N = owned.rows; format.cpu_K = owned.columns;
         format.cpu_first_row = intersection.firstRow() - owned.first_row;
         format.cpu_first_column = intersection.firstColumn() - owned.first_column;
+        const auto geometry = format.wireGeometry(std::min<uint32_t>(format.N, format.wire_columns_per_unit));
+        const auto unit_bytes = geometry.block_stride + geometry.header_bytes;
+        if (units == 0 || units > UINT32_MAX || unit_bytes == 0 || capacity < unit_bytes)
+            throw std::invalid_argument("CPU native intersection exceeds its bounded lane geometry");
         format.unit_count = static_cast<uint32_t>(units);
         format.maximum_units_per_chunk = static_cast<uint32_t>(std::min<uint64_t>(units, capacity / unit_bytes));
         if (!format.valid()) throw std::invalid_argument("CPU native intersection has invalid canonical storage traits");
@@ -793,6 +823,7 @@ namespace llaminar2
                     else destination[destination_base + 16 * destination_columns + group * destination_columns + destination_column] = value;
                 }
             using namespace cpu::native_quantised;
+            // Byte-scale MXFP4 is a plane in its own right, not a truncated half plane.
             const size_t field_bytes = preparedScaleEncoding(layout.cpu_codebook_id, layout.cpu_encoding) ==
                 CPUNativeQuantisedScaleEncoding::E8M0 ? 1 : 2;
             const size_t planes = (layout.cpu_block_stride - layout.cpu_data_stride) / (64 * field_bytes);
@@ -801,6 +832,60 @@ namespace llaminar2
                      destination_base + (payload_per_column + plane * field_bytes) * destination_columns + destination_column * field_bytes,
                      field_bytes);
         }
+        /** @brief Copy a coded column directly between a root and a wire tile, or between roots. */
+        template<bool SourceRoot, bool DestinationRoot>
+        void copyCPUCodedColumn(const ExpertTierWeightCPUStorageLayout &layout,
+            const uint8_t *source, unsigned source_columns, unsigned source_column, const uint8_t *source_header,
+            uint8_t *destination, unsigned destination_columns, unsigned destination_column, uint8_t *destination_header,
+            std::mutex *write_mutex) noexcept
+        {
+            using cpu::native_quantised::preparedCodedPlaneOffset;
+            const unsigned payload_bytes = layout.cpu_data_stride / 64;
+            const auto book = layout.codedCodebook();
+            const auto planes = expertTierCodedPlanes(book);
+            const auto code_offset = preparedCodedPlaneOffset(layout.cpu_encoding, layout.cpu_data_stride);
+            std::unique_lock<std::mutex> lock;
+            if (write_mutex)
+                lock = std::unique_lock<std::mutex>(*write_mutex);
+            for (unsigned byte = 0; byte < payload_bytes; ++byte)
+            {
+                const uint8_t value = SourceRoot
+                    ? readCodedResidentPayload(source, book, layout.cpu_data_stride, source_column, byte)
+                    : source[expertTierCodedPayloadOffset(payload_bytes, source_columns, source_column, byte)];
+                if constexpr (DestinationRoot)
+                    writeCodedResidentPayload(destination, book, layout.cpu_data_stride, destination_column, byte, value);
+                else
+                    destination[expertTierCodedPayloadOffset(payload_bytes, destination_columns, destination_column, byte)] = value;
+            }
+            const auto code = expertTierLoadCodedColumn(source + (SourceRoot ? code_offset : payload_bytes * source_columns),
+                planes, source_columns, source_column);
+            const auto put = [](uint8_t *plane, unsigned column, unsigned width, uint32_t word) {
+                if (!width)
+                    return;
+                const auto bit = size_t(column) * width;
+                if (width == 16)
+                {
+                    plane[bit / 8] = uint8_t(word);
+                    plane[bit / 8 + 1] = uint8_t(word >> 8);
+                }
+                else
+                {
+                    const auto mask = ((1u << width) - 1u) << (bit % 8);
+                    auto &byte = plane[bit / 8];
+                    byte = uint8_t((byte & ~mask) | ((word << (bit % 8)) & mask));
+                }
+            };
+            auto *dst = destination + (DestinationRoot ? code_offset : payload_bytes * destination_columns);
+            put(dst, destination_column, planes.low_bits, code);
+            put(dst + planes.bytes(destination_columns, planes.low_bits), destination_column, planes.high_bits,
+                code >> planes.low_bits);
+            if (source_header)
+            {
+                const auto field = sb::superblockFieldBytes(book);
+                std::memcpy(destination_header + destination_column * field, source_header + source_column * field, field);
+            }
+        }
+
         /** @brief Shared encoded plane copier; full and partial units use the same original coordinates. */
         template<bool Gather>
         bool copyCPUIntersection(const ExpertTierWeightCPUStorageLayout& layout,
@@ -820,6 +905,31 @@ namespace llaminar2
                 const size_t first_n=size_t(u/layout.blocks_per_row)*layout.wire_columns_per_unit;
                 const size_t columns=std::min(size_t(layout.wire_columns_per_unit),size_t(layout.N)-first_n);
                 const size_t kb=u%layout.blocks_per_row;
+                if (layout.coded())
+                {
+                    const auto root = layout.rootGeometry();
+                    const auto wire = layout.wireGeometry(columns);
+                    const bool header = wire.closesSuperblock(kb);
+                    if constexpr (Gather)
+                        std::memset(destination.data() + wire_offset + size_t(layout.cpu_data_stride / 64) * columns, 0,
+                            expertTierCodedPlanes(layout.codedCodebook()).bytes(columns));
+                    const auto cpu_kb = layout.cpu_first_column / 32 + kb;
+                    for (unsigned column = 0; column < columns; ++column)
+                    {
+                        const auto n = layout.cpu_first_row + first_n + column;
+                        const auto at = root.blockOffset(n / 64, cpu_kb);
+                        const auto root_header = root.headerOffset(n / 64, cpu_kb);
+                        const auto wire_header = wire_offset + wire.block_stride;
+                        if constexpr (Gather)
+                            copyCPUCodedColumn<true, false>(layout, source.data() + at, 64, n % 64, header ? source.data() + root_header : nullptr,
+                                destination.data() + wire_offset, columns, column, header ? destination.data() + wire_header : nullptr, nullptr);
+                        else
+                            copyCPUCodedColumn<false, true>(layout, source.data() + wire_offset, columns, column, header ? source.data() + wire_header : nullptr,
+                                destination.data() + at, 64, n % 64, header ? destination.data() + root_header : nullptr, write_mutex);
+                    }
+                    wire_offset += wire.block_stride + (header ? wire.header_bytes : 0);
+                    continue;
+                }
                 if(columns==64 && (size_t(layout.cpu_first_row)+first_n)%64==0) {
                     // Identity/aligned rectangles retain the original whole-unit
                     // memcpy economy; partial origins use the same plane mapper.
@@ -867,11 +977,29 @@ namespace llaminar2
         if (!x || !y || source.size() > std::numeric_limits<uintptr_t>::max() - x ||
             destination.size() > std::numeric_limits<uintptr_t>::max() - y ||
             (x < y + destination.size() && y < x + source.size())) return false;
+        if (from.coded() && from.wireGeometry(64).phase != to.wireGeometry(64).phase)
+            return false;
         for (uint32_t unit = first; unit < first + units; ++unit)
         {
             const size_t first_n = size_t(unit / from.blocks_per_row) * from.wire_columns_per_unit;
             const size_t columns = std::min(size_t(from.wire_columns_per_unit), size_t(from.N) - first_n);
             const size_t kb = unit % from.blocks_per_row;
+            if (from.coded())
+            {
+                const auto source_root = from.rootGeometry(), dest_root = to.rootGeometry();
+                const bool header = from.wireGeometry(columns).closesSuperblock(kb);
+                const auto source_kb = from.cpu_first_column / 32 + kb;
+                const auto dest_kb = to.cpu_first_column / 32 + kb;
+                for (unsigned column = 0; column < columns; ++column)
+                {
+                    const auto n = from.cpu_first_row + first_n + column, dest_n = to.cpu_first_row + first_n + column;
+                    copyCPUCodedColumn<true, true>(from, source.data() + source_root.blockOffset(n / 64, source_kb), 64, n % 64,
+                        header ? source.data() + source_root.headerOffset(n / 64, source_kb) : nullptr,
+                        destination.data() + dest_root.blockOffset(dest_n / 64, dest_kb), 64, dest_n % 64,
+                        header ? destination.data() + dest_root.headerOffset(dest_n / 64, dest_kb) : nullptr, write_mutex);
+                }
+                continue;
+            }
             if (columns == 64 && (size_t(from.cpu_first_row) + first_n) % 64 == 0 &&
                 (size_t(to.cpu_first_row) + first_n) % 64 == 0)
             {
@@ -921,6 +1049,8 @@ namespace llaminar2
         if(!valid(&error) || intersection.empty() || intersection.source().rows!=source_projection.rows ||
            intersection.source().columns!=source_projection.columns)
             throw std::invalid_argument("Expert transfer intersection differs from its original source allocation");
+        if (intersection.columns() % 32 || intersection.firstColumn() % 32)
+            throw std::invalid_argument("Tier stream intersection must retain complete 32-value K blocks");
         auto result=*this;
         result.source_projection=intersection.source();result.destination_projection=intersection.destination();
         result.N=intersection.rows();result.K=intersection.columns();
@@ -1045,13 +1175,6 @@ namespace llaminar2
         }
         const size_t blocks =
             static_cast<size_t>(N) * static_cast<size_t>(blocks_per_row);
-        if (payload.size() != blocks * payload_bytes_per_block ||
-            scales.size() != nativeQuantisedScalePlaneStorageWords(codebook_id, blocks) ||
-            mins.size() != (is_asymmetric ? blocks : 0) ||
-            emins.size() != (has_emins ? blocks : 0))
-        {
-            return reject(error, "Host GPU packed region sizes do not match the descriptor");
-        }
         // Source codebook plus superblock bit names exactly one of the 21
         // source tensor formats.  This catches ambiguous shared codebooks.
         const NativeQuantisedFormatInfo *source_format =
@@ -1060,13 +1183,33 @@ namespace llaminar2
         if (source_format == nullptr)
             return reject(error, "Host GPU source format identity is not cataloged");
 
+        if (payload.size() != blocks * payload_bytes_per_block)
+            return reject(error, "Host GPU payload size does not match the descriptor");
+        const bool expected_coded = cpu::native_quantised::migrationUsesSuperblockCodes(*source_format);
+        const bool coded = metadata_layout != 0;
+        if (expected_coded != coded || (coded && metadata_layout != nativeQuantisedMetadataLayout(
+            NativeQuantisedMetadataRepresentation::SuperblockCoded, 0, 0)))
+            return reject(error, "Host GPU migration metadata layout disagrees with the CPU source encoding");
+        if (coded)
+        {
+            const auto bytes = sb::planeBytes(codebook_id, N, blocks_per_row, 0);
+            if (codebook_id != canonicalDeviceVnniCodebookId(*source_format) ||
+                codes.size() != bytes.code || superblocks.size() != bytes.superblock ||
+                !scales.empty() || !mins.empty() || !emins.empty())
+                return reject(error, "Host GPU coded migration planes do not match the descriptor");
+        }
+        else if (!codes.empty() || !superblocks.empty() ||
+            scales.size() != nativeQuantisedScalePlaneStorageWords(codebook_id, blocks) ||
+            mins.size() != (is_asymmetric ? blocks : 0) || emins.size() != (has_emins ? blocks : 0))
+            return reject(error, "Host GPU per-block planes do not match the descriptor");
+
         const bool exact_source_representation =
             codebook_id == canonicalDeviceVnniCodebookId(*source_format) &&
             payload_bytes_per_block == source_format->payload_bytes &&
             is_asymmetric == canonicalDeviceVnniFormat(*source_format).is_asymmetric &&
             has_emins == source_format->has_emins;
-        if (exact_source_representation)
-            return true;
+        if (exact_source_representation || coded)
+            return exact_source_representation || reject(error, "Host GPU coded format must retain the canonical source payload");
 
         // The same canonical contract sizes recyclable slots and validates
         // arrivals. In particular, multi-scale sources never normalize to one
@@ -1118,19 +1261,9 @@ namespace llaminar2
                 "Tier stream GPU source descriptor is not a canonical catalog format");
         }
 
-        if (requiresCodedQ5KIQ3SMigrationSlots(source_format.codebook_id, source_format.is_superblock))
-            throw std::invalid_argument(kCodedQ5KIQ3SMigrationDiagnostic);
 
         const CPUEncoding cpu_encoding =
             cpu::native_quantised::preparedEncodingForSource(source_format);
-        if (requiresDensityAwareExpertTierSlots(cpu_encoding, source_format.codebook_id))
-            throw std::invalid_argument(kDensityAwareExpertTierSlotsRequired);
-        if (const char *reason = codedSourceScaleStreamRejection(cpu_encoding))
-            throw std::invalid_argument(reason);
-        if (const char *reason = codedCpuWireRejection(cpu_encoding))
-            throw std::invalid_argument(reason);
-        if (cpu_encoding == CPUEncoding::Q5NativeSingleScale)
-            throw std::invalid_argument(kNativeQ5GpuStreamUnsupported);
         ExpertTierWeightStreamManifest manifest;
         manifest.source_packing =
             ExpertTierWeightPacking::GpuSeparatedNativeQuantised;
@@ -1351,11 +1484,24 @@ namespace llaminar2
         const size_t block_count =
             static_cast<size_t>(output.N) * output.blocks_per_row;
         output.payload.resize(block_count * payload_bytes);
-        output.scales.assign(nativeQuantisedScalePlaneStorageWords(output.codebook_id, block_count), uint16_t{0});
-        if (gpu_asym)
-            output.mins.resize(block_count);
-        if (gpu_emins)
-            output.emins.resize(block_count);
+        const bool coded = cpu::native_quantised::preparedSuperblockCoded(cpu.encoding);
+        const auto code_bits = sb::superblockCodePlaneBits(gpu_codebook);
+        const auto field_bytes = sb::superblockFieldBytes(gpu_codebook);
+        if (coded)
+        {
+            output.metadata_layout = nativeQuantisedMetadataLayout(NativeQuantisedMetadataRepresentation::SuperblockCoded, 0, 0);
+            const auto bytes = sb::planeBytes(gpu_codebook, output.N, output.blocks_per_row, 0);
+            output.codes.resize(bytes.code);
+            output.superblocks.resize(bytes.superblock);
+        }
+        else
+        {
+            output.scales.assign(nativeQuantisedScalePlaneStorageWords(gpu_codebook, block_count), uint16_t{0});
+            if (gpu_asym)
+                output.mins.resize(block_count);
+            if (gpu_emins)
+                output.emins.resize(block_count);
+        }
 
         // Visit in GPU block-major order so `linear` matches production kernels.
         for (int kb = 0; kb < cpu.blocks_per_row; ++kb)
@@ -1368,47 +1514,40 @@ namespace llaminar2
                     output.payload.data() + linear * payload_bytes;
                 const size_t unit = cpuUnitOffset(cpu, n, kb);
 
-                if (cpu.usesCompactMultiScale())
+                if (coded)
                 {
-                    // This is a reversible transpose of the original payload,
-                    // not an expanded or requantized migration representation.
                     for (int byte = 0; byte < payload_bytes; ++byte)
-                        destination[byte] = cpu.native_interleaved[
-                            interleavedValueOffset(cpu, n, kb, byte)];
-                    // WIP(coded-migration): coded compact units move as codes.
-                    return reject(error, "Superblock-coded compact CPU units require coded GPU migration slots");
+                        destination[byte] = readCodedResidentPayload(cpu.blockUnit(n / 64, kb), gpu_codebook, cpu.data_stride, n % 64, byte);
+                    if (code_bits)
+                        writeHostCode(output.codes.data(), linear * code_bits, code_bits,
+                            cm::loadCode(cpu.blockUnit(n / 64, kb) + cpu::native_quantised::preparedCodedPlaneOffset(cpu.encoding, cpu.data_stride),
+                                gpu_codebook, n % 64));
+                    if (kb % sb::kBlocksPerSuperblock == 0)
+                    {
+                        const auto address = sb::blockMajorAddress(kb, n, output.N, 0);
+                        std::memcpy(output.superblocks.data() + address.superblock * field_bytes,
+                            cpu.superblockHeader(n / 64, kb) + (n % 64) * field_bytes, field_bytes);
+                    }
+                    continue;
                 }
 
-                if (cpu.usesNibbleLUT())
+                if (expertTierPreservesNativeSingleScale(cpu.encoding, cpu.codebook_id))
                 {
-                    // Compact nibbles are only transposed; quantized bits do not change.
-                    for (int value = 0; value < 16; ++value)
-                    {
-                        destination[value] =
-                            cpu.native_interleaved[
-                                interleavedValueOffset(cpu, n, kb, value)];
-                    }
-                    // Compensation is CPU-only derived metadata and is not returned.
-                    // The CPU unit word becomes the exact GPU plane element (one
-                    // E8M0 byte for MXFP4, the FP16 word otherwise).
-                    uint16_t cpu_scale_word = 0;
-                    std::memcpy(
-                        &cpu_scale_word,
-                        cpu.native_interleaved.data() +
-                            unit + cpu.data_stride + 128u +
-                            static_cast<size_t>(n % 64) * sizeof(uint16_t),
-                        sizeof(uint16_t));
-                    if (!output.setScaleWord(linear, cpu_scale_word))
-                        return reject(error, "CPU unit scale word is not an admitted native E8M0 power of two");
-                    if (cpu.is_asymmetric || cpu.usesNibbleLUTSourceScale())
-                    {
-                        std::memcpy(
-                            &output.mins[linear],
-                            cpu.native_interleaved.data() +
-                                unit + cpu.data_stride + 256u +
-                                static_cast<size_t>(n % 64) * sizeof(uint16_t),
-                            sizeof(uint16_t));
-                    }
+                    const bool q5 = cpu.encoding == CPUEncoding::Q5NativeSingleScale;
+                    const auto *root = cpu.native_interleaved.data() + unit;
+                    const unsigned column = n % 64;
+                    for (int value = 0; value < (q5 ? 16 : payload_bytes); ++value)
+                        destination[value] = cpu.native_interleaved[interleavedValueOffset(cpu, n, kb, value)];
+                    if (q5)
+                        for (unsigned byte = 0; byte < 4; ++byte)
+                            destination[16 + byte] = expertTierQ5FifthFromCpu(root + 1024 + column * 4, byte);
+                    const auto width = nativeQuantisedScalePlaneBytes(gpu_codebook);
+                    const auto *scale = root + cpu.data_stride + column * width;
+                    if (width == 1 && *scale && !mxfp4::exponentFitsNativeE8M0(*scale))
+                        return reject(error, "CPU MXFP4 exponent is outside the admitted E8M0 range");
+                    std::memcpy(reinterpret_cast<uint8_t *>(output.scales.data()) + linear * width, scale, width);
+                    if (gpu_asym)
+                        std::memcpy(&output.mins[linear], root + cpu.data_stride + 64 * width + column * 2, 2);
                     continue;
                 }
 
@@ -1539,11 +1678,7 @@ namespace llaminar2
         // Region and codebook validation prevents out-of-bounds source reads.
         if (!gpu.valid(error))
             return false;
-        if (requiresCodedQ5KIQ3SMigrationSlots(gpu.source_codebook_id, gpu.is_superblock))
-            return reject(error, kCodedQ5KIQ3SMigrationDiagnostic);
-        if (cpu::native_quantised::isQ5NativeSingleScaleSource(gpu.source_codebook_id, gpu.is_superblock))
-            return reject(error, kNativeQ5GpuStreamUnsupported);
-        if (!cpu::native_quantised::is_payload_decodable(gpu.codebook_id) &&
+        if (gpu.metadata_layout == 0 && !cpu::native_quantised::is_payload_decodable(gpu.codebook_id) &&
             gpu.codebook_id != kNativeQuantisedIQ4XSSourceScaleCodebook &&
             !hasCompactMultiScaleVnniPayload(gpu.codebook_id) && gpu.codebook_id != 8 &&
             !cpu::native_quantised::preparedExpandedInt8OmitsCompensation(CPUEncoding::ExpandedInt8, gpu.codebook_id) &&
@@ -1556,19 +1691,11 @@ namespace llaminar2
 
         CPUWeights output;
         configureCpuFromGpu(gpu, output);
-        if (const char *reason = codedSourceScaleStreamRejection(output.encoding))
-            return reject(error, reason);
-        if (requiresDensityAwareExpertTierSlots(output.encoding, output.codebook_id))
-            return reject(error, kDensityAwareExpertTierSlotsRequired);
-        if (const char *reason = codedCpuWireRejection(output.encoding))
-            return reject(error, reason);
-        const size_t unit_count =
-            static_cast<size_t>(output.N_padded / 64) *
-            static_cast<size_t>(output.blocks_per_row);
-        // Value-initialization fixes padding and reserved metadata bytes at zero.
-        output.native_interleaved.resize(
-            unit_count * static_cast<size_t>(output.interleaved_block_stride),
-            0);
+        // Value-initialization fixes resident padding at zero without sending it.
+        output.native_interleaved.resize(output.preparedBytes(), 0);
+        const bool coded = gpu.metadata_layout != 0;
+        const auto code_bits = sb::superblockCodePlaneBits(gpu.codebook_id);
+        const auto field_bytes = sb::superblockFieldBytes(gpu.codebook_id);
         const std::span<std::uint8_t> interleaved =
             output.native_interleaved.beginRewrite();
 
@@ -1585,62 +1712,40 @@ namespace llaminar2
                 const size_t unit = cpuUnitOffset(output, n, kb);
                 const int local_column = n % 64;
 
-                if (output.usesCompactMultiScale())
+                if (coded)
                 {
-                    // Reserved payload/metadata bytes remain deterministic zero.
+                    auto *block = interleaved.data() + unit;
+                    const auto code_offset = cpu::native_quantised::preparedCodedPlaneOffset(output.encoding, output.data_stride);
                     for (int byte = 0; byte < output.payload_bytes; ++byte)
-                        interleaved[
-                            interleavedValueOffset(output, n, kb, byte)] = source[byte];
-                    uint8_t *const metadata = interleaved.data() + unit + output.data_stride;
-                    std::memcpy(metadata + local_column * 2, &gpu.scales[linear], 2);
-                    // Single-scale units keep the reserved secondary vector zero,
-                    // matching the CUDA/ROCm demotion kernels.
-                    if (gpu.is_asymmetric)
-                        std::memcpy(metadata + 128 + local_column * 2, &gpu.mins[linear], 2);
-                    if (gpu.has_emins)
-                        std::memcpy(metadata + 256 + local_column * 4, &gpu.emins[linear], 4);
+                        writeCodedResidentPayload(block, gpu.codebook_id, output.data_stride, local_column, byte, source[byte]);
+                    if (code_bits)
+                        cm::storeCode(block + code_offset, gpu.codebook_id, local_column,
+                            sb::loadPackedBits(gpu.codes.data(), linear * code_bits, code_bits));
+                    if (kb % sb::kBlocksPerSuperblock == 0)
+                    {
+                        const auto address = sb::blockMajorAddress(kb, n, output.N, 0);
+                        std::memcpy(interleaved.data() + output.superblockHeaderOffset(n / 64, kb) + local_column * field_bytes,
+                            gpu.superblocks.data() + address.superblock * field_bytes, field_bytes);
+                    }
                     continue;
                 }
 
-                if (output.usesNibbleLUT())
+                if (expertTierPreservesNativeSingleScale(output.encoding, output.codebook_id))
                 {
-                    // Scatter compact bytes into the four-value VNNI lane groups.
-                    for (int value = 0; value < 16; ++value)
-                    {
-                        interleaved[
-                            interleavedValueOffset(output, n, kb, value)] =
-                            source[value];
-                    }
-                    // CPU dot-product correction consumes the sum of decoded weights.
-                    int8_t decoded[32]{};
-                    cpu::native_quantised::decode_native_block(
-                        output.codebook_id, source, decoded);
-                    int32_t sum = 0;
-                    for (int value : decoded)
-                        sum += value;
-                    const int16_t compensation = static_cast<int16_t>(sum);
-                    std::memcpy(
-                        interleaved.data() +
-                            unit + output.data_stride +
-                            static_cast<size_t>(local_column) * sizeof(int16_t),
-                        &compensation,
-                        sizeof(compensation));
-                    const uint16_t cpu_scale_word = gpu.scaleWord(linear);
-                    std::memcpy(
-                        interleaved.data() +
-                            unit + output.data_stride + 128u +
-                            static_cast<size_t>(local_column) * sizeof(uint16_t),
-                        &cpu_scale_word,
-                        sizeof(uint16_t));
-                    if (output.is_asymmetric || output.usesNibbleLUTSourceScale())
-                    {
-                        std::memcpy(
-                            interleaved.data() +
-                                unit + output.data_stride + 256u +
-                                static_cast<size_t>(local_column) * sizeof(uint16_t),
-                            &gpu.mins[linear],
-                            sizeof(uint16_t));
-                    }
+                    const bool q5 = output.encoding == CPUEncoding::Q5NativeSingleScale;
+                    auto *root = interleaved.data() + unit;
+                    for (int value = 0; value < (q5 ? 16 : output.payload_bytes); ++value)
+                        interleaved[interleavedValueOffset(output, n, kb, value)] = source[value];
+                    if (q5)
+                        for (unsigned group = 0; group < 4; ++group)
+                            root[1024 + local_column * 4 + group] = expertTierQ5FifthFromGpu(source + 16, group);
+                    const auto width = nativeQuantisedScalePlaneBytes(gpu.codebook_id);
+                    const auto *scale = reinterpret_cast<const uint8_t *>(gpu.scales.data()) + linear * width;
+                    if (width == 1 && *scale && !mxfp4::exponentFitsNativeE8M0(*scale))
+                        return reject(error, "GPU MXFP4 exponent is outside the admitted E8M0 range");
+                    std::memcpy(root + output.data_stride + local_column * width, scale, width);
+                    if (output.is_asymmetric)
+                        std::memcpy(root + output.data_stride + 64 * width + local_column * 2, &gpu.mins[linear], 2);
                     continue;
                 }
 

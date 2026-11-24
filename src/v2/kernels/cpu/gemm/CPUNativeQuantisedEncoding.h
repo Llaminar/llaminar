@@ -43,7 +43,7 @@ namespace llaminar2::cpu::native_quantised
      *        rotated values are requantized to the expanded INT8 encoding.
      * @return Physical encoding consumed by CPU GEMV/GEMM kernels.
      */
-    [[nodiscard]] inline CPUNativeQuantisedEncoding preparedEncodingForCodebook(
+    [[nodiscard]] inline constexpr CPUNativeQuantisedEncoding preparedEncodingForCodebook(
         uint8_t codebook_id,
         bool rotation_enabled = false) noexcept
     {
@@ -63,7 +63,7 @@ namespace llaminar2::cpu::native_quantised
      * @param rotation_enabled Explicit separately selected rotated INT8 policy.
      * @return Lossless ordinary encoding or the unchanged explicit rotation encoding.
      */
-    [[nodiscard]] inline CPUNativeQuantisedEncoding preparedEncodingForSource(
+    [[nodiscard]] inline constexpr CPUNativeQuantisedEncoding preparedEncodingForSource(
         const NativeQuantisedFormatInfo &source, bool rotation_enabled = false) noexcept
     {
         if (!rotation_enabled && source.codebook_id == 5 && source.is_superblock)
@@ -75,6 +75,12 @@ namespace llaminar2::cpu::native_quantised
         if (!rotation_enabled && source.codebook_id == 7 && source.is_superblock)
             return CPUNativeQuantisedEncoding::CompactMultiScale;
         return preparedEncodingForCodebook(source.codebook_id, rotation_enabled);
+    }
+
+    /** @return Whether migration must preserve this source's codes and superblock words, not staged products. */
+    [[nodiscard]] inline constexpr bool migrationUsesSuperblockCodes(const NativeQuantisedFormatInfo &source) noexcept
+    {
+        return preparedSuperblockCoded(preparedEncodingForSource(source));
     }
 
     /**

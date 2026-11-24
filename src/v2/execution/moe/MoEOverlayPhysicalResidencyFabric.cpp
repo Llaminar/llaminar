@@ -914,10 +914,14 @@ namespace llaminar2
                     .cpu_is_superblock = uint8_t(root.is_superblock),
                     .cpu_encoding = root.encoding, .cpu_data_stride = uint32_t(root.data_stride),
                     .cpu_block_stride = uint32_t(root.interleaved_block_stride)};
-                const size_t column_bytes = traits.cpu_block_stride / 64;
-                if (!column_bytes || capacity < column_bytes || capacity > UINT32_MAX)
-                    throw std::invalid_argument("CPU native worker capacity cannot contain one exact encoded column");
-                traits.wire_columns_per_unit = unsigned(std::min(size_t(64), capacity / column_bytes));
+                if (capacity > UINT32_MAX)
+                    throw std::invalid_argument("CPU native worker capacity exceeds its wire ABI");
+                for (; traits.wire_columns_per_unit != 0; --traits.wire_columns_per_unit)
+                {
+                    const auto geometry = traits.wireGeometry(traits.wire_columns_per_unit);
+                    if (geometry.block_stride + geometry.header_bytes <= capacity)
+                        break;
+                }
                 return traits;
             };
             if (source.N != intersection.source().rows || source.K != intersection.source().columns ||
@@ -3197,6 +3201,7 @@ namespace llaminar2
                 .scales_bytes = descriptor.scales_bytes,
                 .mins_bytes = descriptor.mins_bytes,
                 .emins_bytes = descriptor.emins_bytes,
+                .metadata_layout = descriptor.metadata_layout,
             };
         }
 
@@ -3216,6 +3221,7 @@ namespace llaminar2
                 .scales_bytes = descriptor.scales_bytes,
                 .mins_bytes = descriptor.mins_bytes,
                 .emins_bytes = descriptor.emins_bytes,
+                .metadata_layout = descriptor.metadata_layout,
             };
         }
 
@@ -3261,15 +3267,15 @@ namespace llaminar2
             std::size_t staging_capacity_bytes)
         {
             const auto layout = probe.deviceLayout();
-            if (!layout.valid() || layout.cpu_block_stride == 0 ||
-                staging_capacity_bytes < layout.cpu_block_stride)
+            const auto unit_bytes = layout.cpuStorage().maximumWireUnitBytes();
+            if (!layout.valid() || !unit_bytes || staging_capacity_bytes < unit_bytes)
             {
                 throw std::runtime_error(
                     "ExpertOverlay staging capacity cannot hold one CPU NativeQuantised unit");
             }
             return static_cast<std::uint32_t>(std::min<std::size_t>(
                 layout.unit_count,
-                staging_capacity_bytes / layout.cpu_block_stride));
+                staging_capacity_bytes / unit_bytes));
         }
 
         /** @brief Require identical final CPU representations before NUMA copy. */
@@ -3309,7 +3315,7 @@ namespace llaminar2
             if (projection.spec.N != N || projection.spec.K != K ||
                 projection.spec.payload_bytes_per_block < payload_bytes ||
                 (is_asymmetric && !projection.spec.is_asymmetric) ||
-                (has_emins && !projection.spec.has_emins))
+                (has_emins && !projection.spec.has_emins && !projection.slot.metadata_layout))
             {
                 throw std::runtime_error(
                     "ExpertOverlay GPU shadow slot cannot represent an arriving projection");
@@ -3317,11 +3323,13 @@ namespace llaminar2
 
             DeviceNativeQuantisedMatrixDesc descriptor;
             descriptor.payload = projection.slot.d_native_quantised_payload;
-            descriptor.scales = projection.slot.d_native_quantised_scales;
-            descriptor.mins = is_asymmetric
+            descriptor.metadata_layout = projection.slot.metadata_layout;
+            descriptor.scales = descriptor.metadata_layout && native_quantised_superblock::superblockCodeInPayload(execution_codebook)
+                ? descriptor.payload : projection.slot.d_native_quantised_scales;
+            descriptor.mins = (descriptor.metadata_layout || is_asymmetric)
                                   ? projection.slot.d_native_quantised_mins
                                   : nullptr;
-            descriptor.emins = has_emins
+            descriptor.emins = (!descriptor.metadata_layout && has_emins)
                                    ? projection.slot.d_native_quantised_emins
                                    : nullptr;
             descriptor.n = N;
@@ -3388,7 +3396,7 @@ namespace llaminar2
                             descriptor.allocation_payload_bytes_per_block,
                         .has_mins = descriptor.allocation_has_mins,
                         .has_emins = descriptor.allocation_has_emins,
-                    });
+                    }, descriptor.metadata_layout);
             }
 #endif
 #ifdef HAVE_ROCM
@@ -4417,7 +4425,14 @@ namespace llaminar2
                                 spec.has_emins = true;
                                 spec.codebook_id =
                                     canonicalDeviceVnniCodebookId(signature.format.native_quantised);
-                                // Shadow slots hold any catalogued format: widest plane.
+                                const auto *source = native_quantised_formats::forSourceIdentity(
+                                    signature.format.native_quantised.codebook_id, signature.format.native_quantised.is_superblock);
+                                if (source && cpu::native_quantised::migrationUsesSuperblockCodes(*source))
+                                {
+                                    spec.payload_bytes_per_block = source->payload_bytes;
+                                    spec.has_emins = false;
+                                }
+                                // Per-block shadow slots retain their original capacity union.
                                 spec.scale_plane = NativeQuantisedScalePlaneWidth::FP16Word;
                             }
                             specs.push_back(std::move(spec));
@@ -6196,7 +6211,7 @@ namespace llaminar2
                                             source.gpu_packed,
                                             source.format.native_quantised,
                                             static_cast<std::uint32_t>(
-                                                config_.staging_capacity_bytes)).forGPUIntersection(piece.intersection);
+                                                config_.staging_capacity_bytes), piece.intersection);
                                     ++local_remote_gpu_blob_operations;
                                 }
                                 const auto readiness =

@@ -298,7 +298,7 @@ namespace
                 // admit the publication like a producer does.
                 const std::uint16_t permitted = packed->usesIQ3SExpandedSourceScale() ? 15
                     : packed->usesNibbleLUTSourceScale() ? 63
-                    : packed->usesCompactMultiScale() && packed->codebook_id == 13 ? 255 : 0xffff;
+                    : 0xffff;
                 if (permitted != 0xffff)
                 {
                     const std::size_t units = std::size_t(packed->N_padded / 64) * std::size_t(packed->blocks_per_row);
@@ -514,15 +514,23 @@ namespace
                 // Native roots are N-padded for SIMD; only [0,N) columns
                 // execute or move. Inspect every live plane independently of
                 // the production copier, including comp/min/grid fields.
-                if(packed->N<=0 || packed->K<=0 || packed->K%32 || packed->interleaved_block_stride%64)
+                if(packed->N<=0 || packed->K<=0 || packed->K%32 || packed->preparedBytes() != packed->native_interleaved.size())
                     throw std::runtime_error("Native oracle received invalid physical geometry");
                 ExpertTierWeightCPUStorageLayout layout;
                 layout.cpu_K=packed->K;layout.cpu_data_stride=packed->data_stride;
                 layout.cpu_block_stride=packed->interleaved_block_stride;layout.cpu_encoding=packed->encoding;
+                layout.cpu_codebook_id=packed->codebook_id;layout.cpu_is_superblock=packed->is_superblock;
+                layout.cpu_is_asymmetric=packed->is_asymmetric;
                 const std::span<const uint8_t> root(packed->native_interleaved.data(),packed->native_interleaved.size());
                 for(int n=0;n<packed->N;++n)for(int kb=0;kb<packed->K/32;++kb) {
-                    const auto column=test::encodedTierColumn(root,layout,size_t(n),size_t(kb));
-                    if(column.size()!=size_t(packed->interleaved_block_stride)/64)
+                    auto column=test::encodedTierColumn(root,layout,size_t(n),size_t(kb));
+                    if (layout.coded())
+                    {
+                        const auto field = native_quantised_superblock::superblockFieldBytes(layout.codedCodebook());
+                        if (!packed->geometry().closesSuperblock(kb))
+                            column.resize(column.size() - field); // Headers are live once per touched superblock.
+                    }
+                    else if (column.size() != size_t(packed->interleaved_block_stride) / 64)
                         throw std::runtime_error("Independent native oracle omitted a live encoded field");
                     result[projection].insert(result[projection].end(),column.begin(),column.end());
                 }
@@ -2019,11 +2027,21 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric, LiveNativeOracleDistinguishesDirty
         if(q6)for(size_t group=0;group<8;++group) {
             fields.push_back(1024+group*64);fields.push_back(1024+group*64+8);
         }
-        const bool compact=packed->encoding==cpu::native_quantised::CPUNativeQuantisedEncoding::CompactMultiScale;
-        for(size_t plane=0;plane<(compact?2:(size_t(packed->interleaved_block_stride)-packed->data_stride)/128);++plane)
-            for(size_t byte=0;byte<2;++byte)fields.push_back(packed->data_stride+plane*128+byte);
-        // Only Q2_K's compact unit reserves the effective-minimum vector.
-        if(compact && packed->codebook_id==10)for(size_t byte=0;byte<4;++byte)fields.push_back(packed->data_stride+256+byte);
+        if (cpu::native_quantised::preparedSuperblockCoded(packed->encoding))
+        {
+            const auto book = canonicalDeviceVnniCodebookId(*format.metadata);
+            const auto planes = expertTierCodedPlanes(book);
+            if (planes.low_bits)
+                fields.push_back(packed->data_stride);
+            if (planes.high_bits)
+                fields.push_back(packed->data_stride + planes.bytes(64, planes.low_bits));
+            const auto header = packed->geometry().headerOffset(0, 0);
+            for (unsigned byte = 0; byte < native_quantised_superblock::superblockFieldBytes(book); ++byte)
+                fields.push_back(header + byte);
+        }
+        else
+            for(size_t plane=0;plane<(size_t(packed->interleaved_block_stride)-packed->data_stride)/128;++plane)
+                for(size_t byte=0;byte<2;++byte)fields.push_back(packed->data_stride+plane*128+byte);
         for(const size_t byte:fields) {
             SCOPED_TRACE(byte);const auto saved=bytes[byte];bytes[byte]^=1;
             EXPECT_NE(livePreparedBytes(changed),expected); // All data/comp/scale/min/grid classes must contribute.
@@ -2033,7 +2051,16 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric, LiveNativeOracleDistinguishesDirty
         for(size_t role=0;role<3;++role) {
             const auto& engine=role==0?original.gate():role==1?original.up():original.down();
             const auto* layout=engine->exportCPUNativeQuantisedPackedWeights();ASSERT_TRUE(layout);
-            EXPECT_EQ(expected[role].size(),size_t(layout->N)*(layout->K/32)*(layout->interleaved_block_stride/64));
+            if (cpu::native_quantised::preparedSuperblockCoded(layout->encoding))
+            {
+                const auto book = canonicalDeviceVnniCodebookId(*format.metadata);
+                const auto per_block = layout->payload_bytes + (native_quantised_superblock::superblockCodePlaneBits(book) + 7) / 8;
+                const auto field = native_quantised_superblock::superblockFieldBytes(book);
+                EXPECT_EQ(expected[role].size(), size_t(layout->N) *
+                    (layout->blocks_per_row * per_block + layout->geometry().superblocksPerRow() * field));
+            }
+            else
+                EXPECT_EQ(expected[role].size(),size_t(layout->N)*(layout->K/32)*(layout->interleaved_block_stride/64));
         }
     }
 }

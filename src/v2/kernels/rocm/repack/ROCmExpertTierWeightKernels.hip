@@ -14,6 +14,7 @@
 #include "kernels/common/NativeQuantisedScaleLoad.h"
 #include "backends/rocm/HipDeviceGuard.h"
 #include "tensors/NativeQuantisedIQ3SScale.h"
+#include "utils/Logger.h"
 #include "kernels/rocm/gemm/ROCmNativeQuantisedNibbleLUT.h"
 
 #include <hip/hip_fp16.h>
@@ -1030,6 +1031,11 @@ namespace llaminar2
         std::size_t device_cpu_chunk_capacity,
         void *stream) noexcept
     {
+        if (layout.cpuStorage().coded() || expertTierPreservesNativeSingleScale(layout.cpu_encoding, layout.cpu_codebook_id))
+        {
+            LOG_ERROR("ROCm expert tier movement requires the HIP file-density migration port");
+            return false;
+        }
         if (layout.direction !=
                 ExpertTierWeightConversionDirection::GpuToCpu ||
             device_cpu_chunk == nullptr || !source.validFor(layout) ||
@@ -1165,6 +1171,11 @@ namespace llaminar2
         const ExpertTierGpuMutableProjectionView &destination,
         void *stream) noexcept
     {
+        if (layout.cpuStorage().coded() || expertTierPreservesNativeSingleScale(layout.cpu_encoding, layout.cpu_codebook_id))
+        {
+            LOG_ERROR("ROCm expert tier movement requires the HIP file-density migration port");
+            return false;
+        }
         if (layout.direction !=
                 ExpertTierWeightConversionDirection::CpuToGpu ||
             device_cpu_chunk == nullptr || !destination.validFor(layout) ||

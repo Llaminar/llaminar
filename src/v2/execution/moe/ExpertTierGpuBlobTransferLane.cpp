@@ -82,6 +82,11 @@ namespace llaminar2
         const GpuExpertPackedDescriptor& destination, std::string* error) noexcept
     {
         reset();
+        if (source.metadata_layout || destination.metadata_layout)
+        {
+            assignBlobTransferError(error, "Coded GPU projections require a native code-bit transfer, not raw byte relay");
+            return false;
+        }
         if(!gpuExpertPackedDescriptorsCompatible(source,destination)) {
             assignBlobTransferError(error,"GPU blob transfer requires compatible whole descriptors");
             return false;
@@ -100,6 +105,11 @@ namespace llaminar2
         const ExpertTierWeightProjectionIntersection& intersection, std::string* error) noexcept
     {
         reset();
+        if (source.metadata_layout || destination.metadata_layout)
+        {
+            assignBlobTransferError(error, "Coded GPU projections require a native code-bit transfer, not raw byte relay");
+            return false;
+        }
         if(!source.valid() || !destination.valid() || !descriptorPointersCoverRegions(source) ||
             !descriptorPointersCoverRegions(destination) || source.codebook_id!=destination.codebook_id ||
             source.payload_bytes_per_block!=destination.payload_bytes_per_block ||

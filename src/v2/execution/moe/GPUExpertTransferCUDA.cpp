@@ -227,5 +227,28 @@ namespace llaminar2::detail
         }
         return success;
     }
+    bool transferCodedExpertCUDA(const GpuExpertPackedDescriptor &source, const GpuExpertPackedDescriptor &destination,
+        const DeviceId &source_device, const DeviceId &destination_device, void *stream)
+    {
+        namespace sb = native_quantised_superblock;
+        const auto bits = source.blockCount() * sb::superblockCodePlaneBits(source.codebook_id);
+        const auto src_shift = nativeQuantisedLayoutCodeBitShift(source.metadata_layout);
+        const auto dst_shift = nativeQuantisedLayoutCodeBitShift(destination.metadata_layout);
+        const bool whole_bytes = !src_shift && !dst_shift && (bits % 8 == 0);
+        if (!transferExpertCUDABackend(source.ptrs, destination.ptrs, source_device, destination_device,
+            source.vnni_bytes, whole_bytes ? bits / 8 : 0, source.mins_bytes, 0, stream))
+            return false;
+        if (whole_bytes)
+            return true;
+        // The sub-byte path reads the source directly via the admitted UVA
+        // peer edge. It must never write another matrix's shared edge bits.
+        const auto original = currentCUDADeviceOrdinal();
+        if (!restoreCUDADeviceOrdinal(destination_device.cuda_ordinal()))
+            return false;
+        const bool copied = launchCodedExpertBitCopyCUDA(source.ptrs.d_scales, destination.ptrs.d_scales,
+            bits, src_shift, dst_shift, stream);
+        return restoreCUDADeviceOrdinal(original) && copied;
+    }
+
 }
 #endif

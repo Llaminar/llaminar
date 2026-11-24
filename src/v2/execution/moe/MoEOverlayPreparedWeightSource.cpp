@@ -101,6 +101,21 @@ namespace llaminar2
                     error,
                     "GPU prepared source has invalid NativeQuantised geometry");
             }
+            if (!nativeQuantisedLayoutValid(descriptor.codebook_id, descriptor.metadata_layout))
+                return rejectPreparedSource(error, "GPU prepared source has an invalid metadata layout");
+            if (descriptor.metadata_layout)
+            {
+                // Coded Q2_K reconstructs extended minima from its original
+                // codes and header; no staged extended-minima allocation exists.
+                if (!descriptor.mins || descriptor.emins ||
+                    (native_quantised_superblock::superblockCodeInPayload(descriptor.codebook_id) &&
+                        descriptor.scales != descriptor.payload) ||
+                    (descriptor.allocation_payload_bytes_per_block &&
+                        (descriptor.allocation_payload_bytes_per_block != format.payload_bytes ||
+                            !descriptor.allocation_has_mins || descriptor.allocation_has_emins)))
+                    return rejectPreparedSource(error, "GPU prepared source does not retain exact coded metadata planes");
+                return true;
+            }
             if (format.is_asymmetric && !descriptor.mins)
             {
                 return rejectPreparedSource(

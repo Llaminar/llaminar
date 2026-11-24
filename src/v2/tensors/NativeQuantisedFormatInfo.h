@@ -441,10 +441,11 @@ namespace llaminar2
     {
         if (source.codebook_id == 0 || source.codebook_id == 4 ||
             source.codebook_id == 5 || source.codebook_id == 11 ||
-            source.codebook_id == kNativeQuantisedMXFP4Codebook)
+            source.codebook_id == kNativeQuantisedMXFP4Codebook ||
+            (!source.is_superblock && (source.codebook_id == 6 || source.codebook_id == 7)))
         {
-            // Nibble payloads, including MXFP4 codes with their exact FP16
-            // scale, survive a CPU-tier round trip unchanged.
+            // Nibbles and native Q5 retain their original payload and scale,
+            // including MXFP4 exponent bytes.
             return canonicalDeviceVnniFormat(source);
         }
         if (source.codebook_id == 8 ||

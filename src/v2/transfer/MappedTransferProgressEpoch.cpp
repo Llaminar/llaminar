@@ -366,6 +366,7 @@ namespace llaminar2
         work.kind = MappedTransferWorkKind::PackedGpuToCpu;
         work.first_unit = first_unit;
         work.layout = layout;
+        work.layout.gpu_code_bit_shift = nativeQuantisedLayoutCodeBitShift(source.metadata_layout);
         work.scales = reinterpret_cast<std::uintptr_t>(source.scales);
         work.mins = reinterpret_cast<std::uintptr_t>(source.mins);
         work.emins = reinterpret_cast<std::uintptr_t>(source.emins);
@@ -399,6 +400,7 @@ namespace llaminar2
         work.kind = MappedTransferWorkKind::PackedCpuToGpu;
         work.first_unit = first_unit;
         work.layout = layout;
+        work.layout.gpu_code_bit_shift = nativeQuantisedLayoutCodeBitShift(destination.metadata_layout);
         work.scales = reinterpret_cast<std::uintptr_t>(destination.scales);
         work.mins = reinterpret_cast<std::uintptr_t>(destination.mins);
         work.emins = reinterpret_cast<std::uintptr_t>(destination.emins);

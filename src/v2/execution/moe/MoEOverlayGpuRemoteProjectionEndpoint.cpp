@@ -78,6 +78,7 @@ namespace llaminar2
                 .scales_bytes = descriptor.scales_bytes,
                 .mins_bytes = descriptor.mins_bytes,
                 .emins_bytes = descriptor.emins_bytes,
+                .metadata_layout = descriptor.metadata_layout,
             };
         }
 
@@ -97,6 +98,7 @@ namespace llaminar2
                 .scales_bytes = descriptor.scales_bytes,
                 .mins_bytes = descriptor.mins_bytes,
                 .emins_bytes = descriptor.emins_bytes,
+                .metadata_layout = descriptor.metadata_layout,
             };
         }
 
@@ -122,7 +124,7 @@ namespace llaminar2
             const MoEExpertProjectionOwnership::Projection& owned,
             const MoEOverlayRemoteProjectionManifest& manifest) noexcept
         {
-            if (!descriptorPointersComplete(descriptor) || descriptor.n != owned.rows || descriptor.k != owned.columns ||
+            if (!descriptorPointersComplete(descriptor) || descriptor.metadata_layout || descriptor.n != owned.rows || descriptor.k != owned.columns ||
                 descriptor.blocks_per_row != owned.columns / 32 ||
                 manifest.gpu_codebook_id != descriptor.codebook_id ||
                 manifest.gpu_payload_bytes_per_block != descriptor.payload_bytes_per_block ||
@@ -1209,15 +1211,19 @@ namespace llaminar2
                 "Remote ExpertOverlay GPU source bank epoch differs from its transaction");
         }
 
-        if (manifest_.carriesCpuBytes())
+        if (manifest_.carriesCpuBytes() || manifest_.carriesCodedGpuUnits())
         {
-            cpu_layout_ = remoteCpuProjectionDeviceLayout(manifest_);
+            cpu_layout_ = manifest_.carriesCodedGpuUnits()
+                ? remoteCodedGpuProjectionDeviceLayout(manifest_, ExpertTierWeightConversionDirection::GpuToCpu)
+                : remoteCpuProjectionDeviceLayout(manifest_);
             if (cpu_layout_->direction !=
                     ExpertTierWeightConversionDirection::GpuToCpu ||
+                source_.codebook_id != cpu_layout_->gpu_codebook_id ||
+                source_.n != cpu_layout_->gpu_N || source_.k != cpu_layout_->gpu_K ||
                 !gpuConstView(source_).validFor(*cpu_layout_))
             {
                 throw std::invalid_argument(
-                    "Remote GPU-to-CPU source descriptor differs from its repack manifest");
+                    "Remote GPU source descriptor differs from its repack manifest");
             }
         }
         else if (manifest_.carriesGpuBytes())
@@ -1655,18 +1661,21 @@ namespace llaminar2
         }
 
         std::optional<ExpertTierWeightDeviceLayout> candidate_cpu_layout;
-        if (manifest.carriesCpuBytes())
+        if (manifest.carriesCpuBytes() || manifest.carriesCodedGpuUnits())
         {
             try
             {
-                candidate_cpu_layout = remoteCpuProjectionDeviceLayout(manifest);
+                candidate_cpu_layout = manifest.carriesCodedGpuUnits()
+                    ? remoteCodedGpuProjectionDeviceLayout(manifest, ExpertTierWeightConversionDirection::CpuToGpu)
+                    : remoteCpuProjectionDeviceLayout(manifest);
             }
             catch (const std::exception &exception)
             {
                 setGpuRemoteError(error, exception.what());
                 return false;
             }
-            if (!candidate.descriptor.valid() ||
+            if (!candidate.descriptor.valid() || candidate.descriptor.codebook_id != candidate_cpu_layout->gpu_codebook_id ||
+                candidate.descriptor.n != candidate_cpu_layout->gpu_N || candidate.descriptor.k != candidate_cpu_layout->gpu_K ||
                 candidate_cpu_layout->direction !=
                     ExpertTierWeightConversionDirection::CpuToGpu ||
                 !gpuMutableView(candidate.descriptor)
@@ -1674,7 +1683,7 @@ namespace llaminar2
             {
                 setGpuRemoteError(
                     error,
-                    "Remote CPU-to-GPU destination descriptor differs from its repack manifest");
+                    "Remote GPU destination descriptor differs from its repack manifest");
                 return false;
             }
         }

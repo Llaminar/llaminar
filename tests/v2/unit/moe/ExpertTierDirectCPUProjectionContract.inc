@@ -26,20 +26,17 @@ TEST(ExpertTierWeightStream, DirectCPUOriginalRootsAllFormatsPreserveIndependent
     using R = MoEProjectionResidence;
     const P from{R::ParticipantOutputSlice, 256, 256, 13, 128, 32, 96};
     const P to{R::ParticipantInputSlice, 256, 256, 72, 160, 64, 128};
-    const auto overlap = ExpertTierWeightProjectionIntersection::between(from, to);
     for (const auto &format : native_quantised_formats::kAllSourceFormats)
         for (const unsigned quantum : {1u, 3u, 17u, 64u})
         {
             SCOPED_TRACE(format.quant_type);
             SCOPED_TRACE(quantum);
             const auto traits = directCPUFormat(*format.metadata, quantum);
-            if (cpu::native_quantised::preparedSuperblockCoded(traits.cpu_encoding))
-            {
-                EXPECT_THROW((void)cpuExpertTierStorageLayoutForIntersection(traits, from, overlap, 65536), std::invalid_argument);
-                continue;
-            }
-            const auto source = cpuExpertTierStorageLayoutForIntersection(traits, from, overlap, 65536);
-            const auto destination = cpuExpertTierStorageLayoutForIntersection(traits, to, overlap, 65536);
+            const P original_source = traits.coded() ? P{R::ParticipantOutputSlice, 256, 768, 13, 128, 0, 512} : from;
+            const P original_destination = traits.coded() ? P{R::ParticipantInputSlice, 256, 768, 72, 160, 256, 512} : to;
+            const auto overlap = ExpertTierWeightProjectionIntersection::between(original_source, original_destination);
+            const auto source = cpuExpertTierStorageLayoutForIntersection(traits, original_source, overlap, 65536);
+            const auto destination = cpuExpertTierStorageLayoutForIntersection(traits, original_destination, overlap, 65536);
             std::vector<uint8_t> bytes(source.cpuStorageBytes());
             for (size_t index = 0; index < bytes.size(); ++index) bytes[index] = uint8_t(index * 37 + 11);
             std::vector<uint8_t> result(destination.cpuStorageBytes(), 0xa5);
@@ -53,12 +50,14 @@ TEST(ExpertTierWeightStream, DirectCPUOriginalRootsAllFormatsPreserveIndependent
                 live_bytes += source.chunkBytes(count, first);
                 first += count;
             }
-            EXPECT_EQ(live_bytes, size_t(69 * 2) * (traits.cpu_block_stride / 64));
+            EXPECT_EQ(live_bytes, source.chunkBytes(source.unit_count));
+            if (!traits.coded())
+                EXPECT_EQ(live_bytes, size_t(69 * 2) * (traits.cpu_block_stride / 64));
             for (size_t row = 0; row < 192; ++row)
-                for (size_t block = 0; block < 4; ++block)
-                    if (row < 69 && block < 2)
+                for (int block = 0; block < destination.cpu_K / 32; ++block)
+                    if (row < 69 && block < overlap.columns() / 32)
                         EXPECT_EQ(encodedTierColumn(result, destination, row, block),
-                            encodedTierColumn(bytes, source, 59 + row, 1 + block));
+                            encodedTierColumn(bytes, source, 59 + row, overlap.sourceColumnOrigin() / 32 + block));
                     else EXPECT_EQ(encodedTierColumn(result, destination, row, block),
                             encodedTierColumn(untouched, destination, row, block));
             const auto before = result;
@@ -85,11 +84,6 @@ TEST(ExpertTierWeightStream, DirectCPUParallelPiecesPreserveDirtyNeighborsAcross
     {
         SCOPED_TRACE(format.quant_type);
         const auto traits = directCPUFormat(*format.metadata, 1);
-        if (cpu::native_quantised::preparedSuperblockCoded(traits.cpu_encoding))
-        {
-            EXPECT_THROW((void)cpuExpertTierStorageLayoutForIntersection(traits, a, first, 65536), std::invalid_argument);
-            continue;
-        }
         const auto source_a = cpuExpertTierStorageLayoutForIntersection(traits, a, first, 65536);
         const auto source_b = cpuExpertTierStorageLayoutForIntersection(traits, b, second, 65536);
         const auto target_a = cpuExpertTierStorageLayoutForIntersection(traits, target, first, 65536);

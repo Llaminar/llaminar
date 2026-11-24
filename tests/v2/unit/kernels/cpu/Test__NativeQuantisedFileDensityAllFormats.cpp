@@ -59,33 +59,7 @@ namespace
         return gguf;
     }
 
-    /** @brief Temporary CUDA migration upper bounds in bytes per 256 values. */
-    struct PendingDensity
-    {
-        const NativeQuantisedFormatInfo *format;
-        std::size_t cuda_migration;
-        std::string_view lane;
-    };
-
-    constexpr PendingDensity pending_density[] = {
-        {&IQ4_XS, 160, "pending lane mig"},
-        {&Q6_K, 224, "pending lane mig"},
-        {&Q4_K, 160, "pending lane mig"},
-        {&Q5_K, 288, "pending lane mig"},
-        {&IQ3_S, 136, "pending lane mig"},
-        {&Q5_0, 272, "pending lane mig"},
-        {&Q5_1, 288, "pending lane mig"},
-        {&Q2_K, 128, "pending lane mig"},
-        {&Q3_K, 128, "pending lane mig"},
-        {&IQ2_XXS, 80, "pending lane mig"},
-        {&IQ2_XS, 104, "pending lane mig"},
-        {&IQ2_S, 104, "pending lane mig"},
-        {&IQ3_XXS, 112, "pending lane mig"},
-        {&IQ1_S, 80, "pending lane mig"},
-        {&IQ1_M, 80, "pending lane mig"},
-    };
-
-    TEST(NativeQuantisedFileDensityAllFormats, LogicalPreparedPlanesDoNotExceedGGUFUnlessExplicitlyPending)
+    TEST(NativeQuantisedFileDensityAllFormats, LogicalPreparedPlanesDoNotExceedGGUF)
     {
         constexpr unsigned k = 256; // One complete source superblock, or eight ordinary blocks.
         constexpr unsigned blocks = k / 32;
@@ -100,12 +74,6 @@ namespace
             ASSERT_TRUE(footprint.isValid());
             const auto geometry = cpu_nq::preparedBlockGeometry(
                 footprint.encoding, footprint.is_asymmetric, format->codebook_id, blocks);
-
-            PendingDensity pending{nullptr, 0, "no pending lane"};
-            for (const auto &entry : pending_density)
-                if (format == entry.format)
-                    pending = entry;
-            SCOPED_TRACE(pending.lane);
 
             for (const std::size_t n : {64u, 65u})
             {
@@ -139,7 +107,10 @@ namespace
                 const NativeQuantisedPackedRegionSizes migration{
                     n * blocks * allocation.payload_bytes_per_block,
                     migration_planes.scales, migration_planes.secondary, migration_planes.emins};
-                EXPECT_LE(migration.logicalBytes(), n * std::max(gguf, pending.cuda_migration) + migration_pad);
+                if (migration_coded || format == &Q5_0 || format == &Q5_1 || format == &Q8_1 || format == &Q8_K)
+                    EXPECT_EQ(migration.logicalBytes(), n * cpuBytesPer256Limit(format, gguf) + migration_pad);
+                else
+                    EXPECT_LE(migration.logicalBytes(), n * gguf);
 
                 if (n == 64)
                     std::cout << name << ' ' << double(gguf) / blocks << ' '

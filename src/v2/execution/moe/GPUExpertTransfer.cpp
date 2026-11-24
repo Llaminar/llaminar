@@ -74,6 +74,15 @@ namespace llaminar2
             return false;
         }
 
+        if (src.metadata_layout)
+        {
+#ifdef HAVE_CUDA
+            if (src_device.is_cuda() && dst_device.is_cuda() && stream)
+                return detail::transferCodedExpertCUDA(src, dst, src_device, dst_device, stream);
+#endif
+            LOG_ERROR("[GPUExpertTransfer] Coded expert movement requires CUDA and an explicit destination stream");
+            return false;
+        }
         return transferExpert(src.ptrs, dst.ptrs, src_device, dst_device,
                               src.vnni_bytes, src.scales_bytes,
                               src.mins_bytes, src.emins_bytes, stream);

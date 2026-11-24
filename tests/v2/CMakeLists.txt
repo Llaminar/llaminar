@@ -2176,6 +2176,13 @@ add_v2_routed_expert_policy_unit(
     V2_Unit_MoEOverlayDistributedResidencyProtocol
     unit/execution/moe/Test__MoEOverlayDistributedResidencyProtocol.cpp
 )
+add_v2_test(V2_Integration_CodedCudaExpertRelayWire
+    COMMAND $<TARGET_FILE:v2_unit_moe_overlay_distributed_residency_protocol>
+        --gtest_filter=Test__MoEOverlayDistributedResidencyProtocol.CodedCudaRelayAuthenticatesExactPhasedWire
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MoE;Transfer;ByteExact;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CodedCudaExpertRelayWire)
+
 # MXFP4 remote GPU blobs carry exactly one E8M0 byte per block.
 add_v2_test(V2_Integration_MXFP4RemoteGpuProjectionPlanes
     COMMAND $<TARGET_FILE:v2_unit_moe_overlay_distributed_residency_protocol>
@@ -12530,6 +12537,11 @@ add_v2_test(V2_Integration_CUDA_ExpertTierWeightKernels
     NO_MODELS
     TIMEOUT 30
 )
+add_v2_test(V2_Integration_CUDA_CodedCompactExpertTierPlanes
+    COMMAND $<TARGET_FILE:v2_integration_cuda_expert_tier_weight_kernels>
+        --gtest_filter=CUDAExpertTierWeightKernelsTest.FileDensityPlanesRoundTripMatchesSourceNative:CUDAExpertTierWeightKernelsTest.CapturedCodedPeerRectanglePreservesShiftedNeighbors:CUDAExpertTierWeightKernelsTest.CodedRemoteEndpointsPreserveOriginalGpuPlanes
+    LABELS "V2;Integration;ProductionTestPreflight;CUDA;MoE;ExpertOverlay;Transfer;ByteExact;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 60)
 add_v2_test(V2_Integration_CUDA_ExpertTierWeightKernels_MultiDevice
     COMMAND $<TARGET_FILE:v2_integration_cuda_expert_tier_weight_kernels>
         --gtest_filter=CUDAExpertTierWeightKernelsTest.SecondaryDeviceRemoteProjectionRestoresOwningDeviceBeforeRepack
@@ -18735,6 +18747,13 @@ add_v2_test(V2_Unit_ComputeStages
     LABELS "V2;Unit;ComputeStage;GEMM;RMSNorm;RoPE;SwiGLU;ResidualAdd;Precision"
     MPI_PROCS 1
 )
+
+add_v2_test(V2_Integration_DeviceMoERebalanceCodedSlotAdmission
+    COMMAND $<TARGET_FILE:v2_test_compute_stages>
+        --gtest_filter=ComputeStagesTest.MoEDeviceRebalanceFormatProfileSeparatesWireBytesFromStorageCapacity
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MoE;PhysicalMemory;Admission;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_DeviceMoERebalanceCodedSlotAdmission)
 
 # Test: StageDumpInfo (getDumpInfo() snapshot support for all compute stages)
 # Validates that each compute stage correctly reports inputs, outputs, weights, and scalars
@@ -28521,18 +28540,25 @@ add_v2_test(V2_Unit_ExpertTierWeightStream
     LABELS "V2;Unit;MoE;WeightLifecycle;ExpertOverlay;Streaming"
     NO_MODELS
 )
+add_v2_test(V2_Integration_ExpertTierCodedSourcePlanes
+    COMMAND $<TARGET_FILE:v2_test_expert_tier_weight_stream>
+        --gtest_filter=ExpertTierWeightStream.CodedSourcePlanesRoundTripWithoutRequantization:ExpertTierWeightStream.CodedMidSuperblockChunksRetainExactPlanes:ExpertTierWeightStream.ResidentCodedCpuOriginRequiresSourceSuperblockBoundary:ExpertTierWeightStream.DirectCPUOriginalRootsAllFormatsPreserveIndependentStridesAndDirtyNeighbours:ExpertTierWeightStream.NativeCpuRectanglesUseOnlyLivePlanesAndIndependentRootStrides
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;MoE;Transfer;ByteExact;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ExpertTierCodedSourcePlanes)
+
 
 add_v2_test(V2_Integration_ExpertTierWeightDensityAdmission
     COMMAND $<TARGET_FILE:v2_test_expert_tier_weight_stream>
-        --gtest_filter=ExpertTierWeightStream.DensityLayoutsRequireCompatibleMigrationSlots:ExpertTierWeightStream.EveryCatalogedSourceFormatHasGpuToCpuContract:ExpertTierWeightStream.SingleScaleNativeGridsRejectStagedMetadata
+        --gtest_filter=ExpertTierWeightStream.EveryCatalogedSourceFormatHasGpuToCpuContract:ExpertTierWeightStream.CodedDemotionRejectsLegacyPlanesBeforeAllocating:MoEOverlayPreparedWeightSource.AcceptsCanonicalAndCpuNormalizedGpuRepresentationsOnly
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MoE;WeightLifecycle;ExpertOverlay;Streaming"
     NO_MODELS)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ExpertTierWeightDensityAdmission)
 
-# Ordinary Q5 has no file-density GPU migration converter yet.
+# Native Q5 slots reject retired expanded GPU descriptors.
 add_v2_test(V2_Unit_NativeQ5GPUStreamAdmission
     COMMAND $<TARGET_FILE:v2_test_expert_tier_weight_stream>
-        --gtest_filter=ExpertTierWeightStream.NativeQ5RejectsBothGPUStreamDirections
+        --gtest_filter=ExpertTierWeightStream.NativeQ5RejectsExpandedGpuDescriptor
     LABELS "V2;Unit;CPU;DeviceFree;NativeQuantised;Movement;Regression;ProductionTestPreflight"
     MPI_PROCS 1 NO_MODELS NO_MPI)
 
@@ -31922,6 +31948,7 @@ if(HAVE_CUDA)
     V2_Integration_GroupedVerifierRows_CUDA_GDNRequestBatch
     V2_Integration_GPUDeviceContext_CUDA
     V2_Integration_CUDA_ExpertTierWeightKernels
+    V2_Integration_CUDA_CodedCompactExpertTierPlanes
     V2_Integration_CUDA_CapturedExpertTierPackedTransferProgress
     V2_Integration_CUDA_MoEOverlayEpoch
     V2_Integration_CUDAEventSynchronization
@@ -32445,7 +32472,7 @@ add_v2_test(V2_Integration_IQ4XSTupleFormatContract
     TIMEOUT 60 NO_MODELS MPI_PROCS 1)
 add_v2_test(V2_Integration_IQ4XSTupleTierAdmission
     COMMAND $<TARGET_FILE:v2_test_expert_tier_weight_stream>
-        --gtest_filter=ExpertTierWeightStream.IQ4XSStagedTupleCannotPublishCodedRoot:ExpertTierWeightStream.IQ4XSExplicitExpandedMetadataRemainsAccepted
+        --gtest_filter=ExpertTierWeightStream.IQ4XSTupleRoundTripAndPhysicalLayoutAreExact:ExpertTierWeightStream.IQ4XSExplicitExpandedCannotEnterCodedMigration
     LABELS "V2;Integration;DeviceFree;CPU;NativeQuantised;IQ4_XS;Movement;Regression"
     TIMEOUT 60 NO_MODELS MPI_PROCS 1)
 add_v2_test(V2_Integration_IQ4XSTupleArchiveGeneration

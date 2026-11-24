@@ -11,26 +11,25 @@ TEST_F(CUDAExpertTierWeightKernelsTest, RectangularNativeMovementAllFormatsAndDi
 {
     using P=MoEExpertProjectionOwnership::Projection;using R=MoEProjectionResidence;
     constexpr int N=70,K=512,targetN=95,targetK=256;
-    const P originalSource{R::ParticipantOutputSlice,200,1024,11,N,32,K};
-    const P originalTarget{R::ParticipantInputSlice,200,1024,34,targetN,128,targetK};
-    const auto forward=ExpertTierWeightProjectionIntersection::between(originalSource,originalTarget);
-    const auto backward=ExpertTierWeightProjectionIntersection::between(originalTarget,originalSource);
     TestCUDAStream transfer_stream;
     for(size_t format_index=0;format_index<test::quantizedVerifierFormats().size();++format_index) {
         const auto& format=test::quantizedVerifierFormats()[format_index];SCOPED_TRACE(format.label);
         auto source_tensor=format.create({N,K},static_cast<uint32_t>(30117+format_index));
-        auto source=packProductionGpuProjection(*source_tensor);
         cpu::native_quantised::CPUNativeQuantisedPackedWeights cpu;
         ASSERT_TRUE(cpu::native_quantised::packWeightsCPUNativeQuantised(source_tensor.get(),cpu));
-        const auto* originalFormat=native_quantised_formats::forSourceIdentity(source.source_codebook_id,source.is_superblock);
+        const auto* originalFormat=native_quantised_formats::forSourceIdentity(format.source_codebook_id,format.source_is_superblock);
         ASSERT_NE(originalFormat,nullptr);
+        const bool coded = cpu.superblockCoded();
+        const P originalSource{R::ParticipantOutputSlice,200,1024,11,N,coded ? 0 : 32,K};
+        const P originalTarget{R::ParticipantInputSlice,200,1024,34,targetN,coded ? 256 : 128,targetK};
+        const auto forward=ExpertTierWeightProjectionIntersection::between(originalSource,originalTarget);
+        const auto backward=ExpertTierWeightProjectionIntersection::between(originalTarget,originalSource);
         const auto demotionManifest=makeGpuToCpuExpertTierWeightStreamManifest(*originalFormat,N,K,81,0,7,ExpertTierWeightProjection::Down,2).forIntersection(forward);
         const auto down=demotionManifest.deviceLayout();
-        auto cpuOracle=down;cpuOracle.cpu_N=N;cpuOracle.cpu_K=K;cpuOracle.cpu_first_row=23;cpuOracle.cpu_first_column=96;
-        TestCUDABuffer<uint8_t> input(source.payload.size());TestCUDABuffer<uint16_t> scales(source.scales.size()),mins(source.mins.size());TestCUDABuffer<uint32_t> emins(source.emins.size());
-        ASSERT_EQ(input.upload(source.payload),cudaSuccess);ASSERT_EQ(scales.upload(source.scales),cudaSuccess);
-        ASSERT_EQ(mins.upload(source.mins),cudaSuccess);ASSERT_EQ(emins.upload(source.emins),cudaSuccess);
-        const ExpertTierGpuConstProjectionView in{input.data(),scales.data(),mins.data(),emins.data(),input.bytes(),scales.bytes(),mins.bytes(),emins.bytes()};
+        auto cpuOracle=down;cpuOracle.cpu_N=N;cpuOracle.cpu_K=K;cpuOracle.cpu_first_row=23;
+        cpuOracle.cpu_first_column=forward.sourceColumnOrigin();
+        auto loaded = test::makeGpuPreparedGemm(source_tensor.get(), DeviceId::cuda(0));
+        const auto in = sourceNativeTierView(*loaded.kernel, *originalFormat);
         ASSERT_TRUE(in.validFor(down));
         cpu::native_quantised::CPUNativeQuantisedPackedWeights destinationCPU;
         destinationCPU.N=targetN;destinationCPU.K=targetK;destinationCPU.N_padded=128;destinationCPU.blocks_per_row=targetK/32;
@@ -43,14 +42,22 @@ TEST_F(CUDAExpertTierWeightKernelsTest, RectangularNativeMovementAllFormatsAndDi
         const auto up=promotionManifest.deviceLayout();
         HostGpuExpertPackedProjection expected;
         ASSERT_TRUE(cpuToGpuExpertPackedReference(cpu,expected));
-        TestCUDABuffer<uint8_t> output(expected.payload.size());TestCUDABuffer<uint16_t> outputScales(expected.scales.size()),outputMins(expected.mins.size());TestCUDABuffer<uint32_t> outputEmins(expected.emins.size());
-        const ExpertTierGpuMutableProjectionView out{output.data(),outputScales.data(),outputMins.data(),outputEmins.data(),output.bytes(),outputScales.bytes(),outputMins.bytes(),outputEmins.bytes()};
+        namespace sb = native_quantised_superblock;
+        const auto primary_bytes = coded ? expected.codes.size() : expected.scaleLiveBytes();
+        const auto primary_live = coded && primary_bytes ? primary_bytes - sb::kSuperblockCodePlanePadBytes : primary_bytes;
+        const auto secondary_bytes = coded ? expected.superblocks.size() : expected.mins.size() * sizeof(uint16_t);
+        TestCUDABuffer<uint8_t> output(expected.payload.size()), outputScales(primary_bytes), outputMins(secondary_bytes);
+        TestCUDABuffer<uint32_t> outputEmins(expected.emins.size());
+        const ExpertTierGpuMutableProjectionView out{output.data(), reinterpret_cast<uint16_t *>(primary_bytes ? outputScales.data() : output.data()),
+            reinterpret_cast<uint16_t *>(outputMins.data()), outputEmins.data(), output.bytes(), primary_live, outputMins.bytes(),
+            outputEmins.bytes(), expected.metadata_layout};
         ASSERT_TRUE(out.validFor(up));
-        TestCUDABuffer<uint8_t> chunk(std::max(down.chunkBytes(2),up.chunkBytes(2)));
+        TestCUDABuffer<uint8_t> chunk(2 * std::max(down.cpuStorage().maximumWireUnitBytes(), up.cpuStorage().maximumWireUnitBytes()));
         for(unsigned replay=0;replay<3;++replay) {
             const unsigned perChunk=replay==1?1:2;size_t bytesMoved=0;
             ASSERT_EQ(cudaMemsetAsync(output.data(),0xa5,output.bytes(),transfer_stream.native()),cudaSuccess);
-            ASSERT_EQ(cudaMemsetAsync(outputScales.data(),0xa5,outputScales.bytes(),transfer_stream.native()),cudaSuccess);
+            if (primary_bytes)
+                ASSERT_EQ(cudaMemsetAsync(outputScales.data(),0xa5,outputScales.bytes(),transfer_stream.native()),cudaSuccess);
             if(outputMins.bytes())ASSERT_EQ(cudaMemsetAsync(outputMins.data(),0xa5,outputMins.bytes(),transfer_stream.native()),cudaSuccess);
             if(outputEmins.bytes())ASSERT_EQ(cudaMemsetAsync(outputEmins.data(),0xa5,outputEmins.bytes(),transfer_stream.native()),cudaSuccess);
             std::fill(finalCPU.begin(),finalCPU.end(),0xa5);
@@ -69,20 +76,51 @@ TEST_F(CUDAExpertTierWeightKernelsTest, RectangularNativeMovementAllFormatsAndDi
                 ASSERT_TRUE(launchCpuToGpuExpertTierChunkCUDA(chunk.data(),chunk.bytes(),up,first,count,out,transfer_stream.opaque()));
                 ASSERT_EQ(transfer_stream.synchronize(),cudaSuccess);bytesMoved+=bytes;
             }
-            EXPECT_EQ(bytesMoved,static_cast<size_t>(47*(256/32))*(down.cpu_block_stride/64));
-            std::vector<uint8_t> observed;std::vector<uint16_t> observedScales,observedMins;std::vector<uint32_t> observedEmins;
+            if (!coded)
+                EXPECT_EQ(bytesMoved,static_cast<size_t>(47*(256/32))*(down.cpu_block_stride/64));
+            else
+            {
+                const auto planes = expertTierCodedPlanes(expected.codebook_id);
+                const auto header = sb::superblockFieldBytes(expected.codebook_id) * size_t(47);
+                EXPECT_EQ(bytesMoved, 8 * (47 * expected.payload_bytes_per_block + planes.bytes(47)) + header);
+            }
+            std::vector<uint8_t> observed, observedScales, observedMins;std::vector<uint32_t> observedEmins;
             ASSERT_EQ(output.download(observed),cudaSuccess);ASSERT_EQ(outputScales.download(observedScales),cudaSuccess);
             ASSERT_EQ(outputMins.download(observedMins),cudaSuccess);ASSERT_EQ(outputEmins.download(observedEmins),cudaSuccess);
             for(int kb=0;kb<K/32;++kb)for(int row=0;row<N;++row) {
-                const size_t index=size_t(kb)*N+row;const bool active=row>=23 && kb>=3 && kb<11;
+                const size_t index=size_t(kb)*N+row;const bool active=row>=23 && kb>=up.gpu_first_column/32 && kb<(up.gpu_first_column+up.K)/32;
                 for(unsigned byte=0;byte<expected.payload_bytes_per_block;++byte)
                     EXPECT_EQ(observed[index*expected.payload_bytes_per_block+byte],active?expected.payload[index*expected.payload_bytes_per_block+byte]:uint8_t(0xa5));
-                // Compare the exact plane bytes (one byte per block for native MXFP4).
-                const size_t scaleWidth=nativeQuantisedScalePlaneBytes(expected.codebook_id);
-                for(size_t byte=0;byte<scaleWidth;++byte)
-                    EXPECT_EQ(reinterpret_cast<const uint8_t*>(observedScales.data())[index*scaleWidth+byte],
-                        active?reinterpret_cast<const uint8_t*>(expected.scales.data())[index*scaleWidth+byte]:uint8_t(0xa5));
-                if(!observedMins.empty())EXPECT_EQ(observedMins[index],active?expected.mins[index]:uint16_t(0xa5a5));
+                if (coded)
+                {
+                    const auto bits = sb::superblockCodePlaneBits(expected.codebook_id);
+                    if (bits)
+                    {
+                        unsigned dirty = 0;
+                        for (unsigned bit = 0; bit < bits; ++bit)
+                            dirty |= ((0xa5u >> ((index * bits + bit) % 8)) & 1u) << bit;
+                        EXPECT_EQ(sb::loadPackedBits(observedScales.data(), index * bits, bits), active
+                            ? sb::loadPackedBits(expected.codes.data(), index * bits, bits) : dirty);
+                    }
+                    if (kb % 8 == 0)
+                    {
+                        const auto field = sb::superblockFieldBytes(expected.codebook_id);
+                        const auto header = (size_t(kb / 8) * N + row) * field;
+                        for (unsigned byte = 0; byte < field; ++byte)
+                            EXPECT_EQ(observedMins[header + byte], active ? expected.superblocks[header + byte] : uint8_t(0xa5));
+                    }
+                }
+                else
+                {
+                    const size_t width = nativeQuantisedScalePlaneBytes(expected.codebook_id);
+                    for (unsigned byte = 0; byte < width; ++byte)
+                        EXPECT_EQ(observedScales[index * width + byte], active
+                            ? reinterpret_cast<const uint8_t *>(expected.scales.data())[index * width + byte] : uint8_t(0xa5));
+                    if (!observedMins.empty())
+                        for (unsigned byte = 0; byte < 2; ++byte)
+                            EXPECT_EQ(observedMins[index * 2 + byte], active
+                                ? reinterpret_cast<const uint8_t *>(expected.mins.data())[index * 2 + byte] : uint8_t(0xa5));
+                }
                 if(!observedEmins.empty())EXPECT_EQ(observedEmins[index],active?expected.emins[index]:uint32_t(0xa5a5a5a5));
             }
         }

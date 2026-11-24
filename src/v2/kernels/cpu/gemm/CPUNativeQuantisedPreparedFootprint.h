@@ -163,6 +163,11 @@ namespace llaminar2::cpu::native_quantised
         return native_quantised_superblock::superblockCodePlaneBits(static_cast<std::uint8_t>(codebook_id));
     }
 
+#if defined(__CUDACC__) || defined(__HIPCC__)
+#define LLAMINAR_CPU_BLOCK_GEOMETRY_HD __host__ __device__
+#else
+#define LLAMINAR_CPU_BLOCK_GEOMETRY_HD
+#endif
     /**
      * @brief Physical superblock-coded metadata codebook of a prepared encoding.
      *
@@ -201,7 +206,7 @@ namespace llaminar2::cpu::native_quantised
      * superblock header follows the last block of each source superblock;
      * see CPUNativeQuantisedBlockGeometry.
      */
-    [[nodiscard]] constexpr bool preparedSuperblockCoded(CPUNativeQuantisedEncoding encoding) noexcept
+    [[nodiscard]] LLAMINAR_CPU_BLOCK_GEOMETRY_HD constexpr bool preparedSuperblockCoded(CPUNativeQuantisedEncoding encoding) noexcept
     {
         return encoding == CPUNativeQuantisedEncoding::CompactMultiScale ||
                encoding == CPUNativeQuantisedEncoding::Q6KNativeDualScale ||
@@ -244,23 +249,23 @@ namespace llaminar2::cpu::native_quantised
         std::size_t phase = 0;          ///< First block's position in its source superblock (0..7).
 
         /** @return Superblock headers per chunk row (0 for per-block encodings). */
-        [[nodiscard]] constexpr std::size_t superblocksPerRow() const noexcept
+        [[nodiscard]] LLAMINAR_CPU_BLOCK_GEOMETRY_HD constexpr std::size_t superblocksPerRow() const noexcept
         {
             return header_bytes ? (blocks_per_row + phase + 7) / 8 : 0;
         }
         /** @return Bytes of one complete chunk row. */
-        [[nodiscard]] constexpr std::size_t rowBytes() const noexcept
+        [[nodiscard]] LLAMINAR_CPU_BLOCK_GEOMETRY_HD constexpr std::size_t rowBytes() const noexcept
         {
             return blocks_per_row * block_stride + superblocksPerRow() * header_bytes;
         }
         /** @return Offset of block @p block of chunk row @p chunk. */
-        [[nodiscard]] constexpr std::size_t blockOffset(std::size_t chunk, std::size_t block) const noexcept
+        [[nodiscard]] LLAMINAR_CPU_BLOCK_GEOMETRY_HD constexpr std::size_t blockOffset(std::size_t chunk, std::size_t block) const noexcept
         {
             const std::size_t headers = header_bytes ? (block + phase) / 8 : 0;
             return chunk * rowBytes() + block * block_stride + headers * header_bytes;
         }
         /** @return Whether @p block is the last block of its superblock inside the row. */
-        [[nodiscard]] constexpr bool closesSuperblock(std::size_t block) const noexcept
+        [[nodiscard]] LLAMINAR_CPU_BLOCK_GEOMETRY_HD constexpr bool closesSuperblock(std::size_t block) const noexcept
         {
             return header_bytes && (block + 1 == blocks_per_row || (block + phase) % 8 == 7);
         }
@@ -271,7 +276,7 @@ namespace llaminar2::cpu::native_quantised
             return end < blocks_per_row ? end : blocks_per_row;
         }
         /** @return Offset of the header serving block @p block of chunk row @p chunk. */
-        [[nodiscard]] constexpr std::size_t headerOffset(std::size_t chunk, std::size_t block) const noexcept
+        [[nodiscard]] LLAMINAR_CPU_BLOCK_GEOMETRY_HD constexpr std::size_t headerOffset(std::size_t chunk, std::size_t block) const noexcept
         {
             const std::size_t superblock = (block + phase) / 8;
             const std::size_t last_end = superblock * 8 + 8 - phase; // one past the superblock's last block
@@ -279,11 +284,13 @@ namespace llaminar2::cpu::native_quantised
             return chunk * rowBytes() + end * block_stride + superblock * header_bytes;
         }
         /** @return Bytes of @p chunks complete chunk rows. */
-        [[nodiscard]] constexpr std::size_t matrixBytes(std::size_t chunks) const noexcept
+        [[nodiscard]] LLAMINAR_CPU_BLOCK_GEOMETRY_HD constexpr std::size_t matrixBytes(std::size_t chunks) const noexcept
         {
             return chunks * rowBytes();
         }
     };
+
+#undef LLAMINAR_CPU_BLOCK_GEOMETRY_HD
 
     /**
      * @brief Return the pure weight-data bytes in one prepared CPU unit.

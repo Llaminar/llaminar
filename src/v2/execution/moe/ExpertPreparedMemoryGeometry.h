@@ -293,6 +293,18 @@ namespace llaminar2
             throw std::invalid_argument(
                 "GPU expert projection source codebook is not catalogued");
         }
+        if (cpu::native_quantised::migrationUsesSuperblockCodes(*source))
+        {
+            const auto planes = NativeQuantisedMetadataPlaneBytes::coded(canonicalDeviceVnniCodebookId(*source), N, K / 32, 0);
+            const auto payload = checkedMultiply(checkedMultiply(N, K / 32, "GPU coded expert blocks"),
+                source->payload_bytes, "GPU coded expert payload");
+            auto bytes = checkedAdd(alignGPUWeightLoadAllocation(payload),
+                alignGPUWeightLoadAllocation(planes.scales), "GPU coded expert codes");
+            bytes = checkedAdd(bytes, alignGPUWeightLoadAllocation(planes.secondary), "GPU coded expert superblocks");
+            result.gpu_live_bytes = bytes;
+            result.gpu_shadow_bytes = bytes;
+            return result;
+        }
         const auto live = gpuPreparedWeightPoolAllocation(*source, layout);
         result.gpu_live_bytes = gpuSeparatedProjectionBytes(
             N,

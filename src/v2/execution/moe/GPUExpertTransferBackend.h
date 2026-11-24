@@ -58,6 +58,14 @@ namespace llaminar2::detail
         size_t emins_bytes,
         void *stream);
 
+    /** @brief Submit the live bit span of one coded CUDA matrix on the destination stream. */
+    bool transferCodedExpertCUDA(const GpuExpertPackedDescriptor &source, const GpuExpertPackedDescriptor &destination,
+        const DeviceId &source_device, const DeviceId &destination_device, void *stream);
+
+    /** @brief CUDA kernel submission over an already admitted device-to-device code-plane edge. */
+    bool launchCodedExpertBitCopyCUDA(const void *source, void *destination, size_t bits,
+        unsigned source_shift, unsigned destination_shift, void *stream) noexcept;
+
 #endif
 
 #ifdef HAVE_ROCM

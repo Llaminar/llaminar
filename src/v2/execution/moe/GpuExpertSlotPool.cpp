@@ -8,6 +8,7 @@
  */
 
 #include "execution/moe/GpuExpertSlotPool.h"
+#include "loaders/GPUPreparedWeightPoolLayout.h"
 
 #include "../../backends/IBackend.h"
 #include "../../loaders/gpu_pipeline/LoadOrchestrator.h"
@@ -159,17 +160,22 @@ namespace llaminar2
                             throw std::invalid_argument(
                                 "GpuExpertSlotPool NativeQuantised projection spec has invalid block geometry");
                         }
+                        const auto *format = native_quantised_formats::forSourceIdentity(
+                            spec.format.native_quantised.codebook_id, spec.format.native_quantised.is_superblock);
+                        const auto coded = format && gpuPreparedSuperblockCoded(*format, GPUPreparedWeightPoolLayout::MigrationReusable, device)
+                            ? std::optional{WeightVRAMPool::SuperblockCodedMetadata{canonicalDeviceVnniCodebookId(*format), 0}}
+                            : std::nullopt;
                         orchestrator->planWeightForOwner(
                             device_ordinal,
                             slot_name_for(slot, spec.label),
                             spec.N,
                             spec.K,
-                            spec.payload_bytes_per_block,
+                            coded ? format->payload_bytes : spec.payload_bytes_per_block,
                             spec.is_asymmetric,
                             spec.has_emins,
                             spec.scale_plane,
                             /*raw_gguf_bytes=*/0,
-                            owner);
+                            owner, {}, coded);
                     }
                 }
             }

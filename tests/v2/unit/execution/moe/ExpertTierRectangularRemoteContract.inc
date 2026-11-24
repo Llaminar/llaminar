@@ -106,13 +106,14 @@ TEST(Test__MoEOverlayDistributedResidencyProtocol, NativeCpuRectanglesKeepStagin
     using P=MoEExpertProjectionOwnership::Projection;using R=MoEProjectionResidence;
     auto fixture=makeTransaction();
     const auto identity=remoteProjectionIdentity(fixture.transaction,DeviceId::cpu(),DeviceId(DeviceType::CPU,1));
-    const auto intersection=ExpertTierWeightProjectionIntersection::between(
-        P{R::ParticipantOutputSlice,256,256,13,128,32,96},
-        P{R::ParticipantInputSlice,256,256,72,160,64,128});
     for(const auto& format:native_quantised_formats::kAllSourceFormats) {
         SCOPED_TRACE(format.quant_type);
+        const bool coded = cpu::native_quantised::migrationUsesSuperblockCodes(*format.metadata);
+        const P source{R::ParticipantOutputSlice, 256, 768, 13, 128, coded ? 0 : 32, coded ? 512 : 96};
+        const P target{R::ParticipantInputSlice, 256, 768, 72, 160, coded ? 256 : 64, coded ? 384 : 128};
+        const auto intersection = ExpertTierWeightProjectionIntersection::between(source, target);
         cpu::native_quantised::CPUNativeQuantisedPackedWeights packed;
-        packed.N=128;packed.K=96;packed.N_padded=128;packed.blocks_per_row=3;
+        packed.N=source.rows;packed.K=source.columns;packed.N_padded=128;packed.blocks_per_row=packed.K / 32;
         packed.payload_bytes=format.metadata->payload_bytes;
         packed.codebook_id=format.metadata->codebook_id;packed.is_superblock=format.metadata->is_superblock;
         packed.is_asymmetric=format.metadata->is_asymmetric;
@@ -121,13 +122,10 @@ TEST(Test__MoEOverlayDistributedResidencyProtocol, NativeCpuRectanglesKeepStagin
         packed.interleaved_block_stride=cpu::native_quantised::preparedInterleavedBlockStride(packed.encoding,packed.is_asymmetric,packed.codebook_id);
         packed.native_interleaved.resize_uninitialized(packed.preparedBytes());
         {const auto written=packed.native_interleaved.beginRewrite();for(size_t i=0;i<written.size();++i)written[i]=uint8_t(i*37+11);}
-        if (cpu::native_quantised::preparedSuperblockCoded(packed.encoding))
-        {
-            EXPECT_THROW((void)makeMoEOverlayRemoteCpuProjectionManifest(identity, packed, 73), std::invalid_argument);
-            continue;
-        }
         const auto manifest=makeMoEOverlayRemoteCpuProjectionManifest(identity,packed,73).forCPUIntersection(intersection);
-        ASSERT_TRUE(manifest.valid());EXPECT_EQ(manifest.total_bytes,size_t(69*2)*(packed.interleaved_block_stride/64));
+        ASSERT_TRUE(manifest.valid());
+        if (!coded)
+            EXPECT_EQ(manifest.total_bytes,size_t(69*2)*(packed.interleaved_block_stride/64));
         EXPECT_LT(manifest.total_bytes,packed.native_interleaved.size());
         std::array<uint8_t,MoEOverlayRemoteProjectionManifest::kWireBytes> packet{};
         ASSERT_TRUE(encodeMoEOverlayRemoteProjectionManifest(manifest,packet));
@@ -135,7 +133,8 @@ TEST(Test__MoEOverlayDistributedResidencyProtocol, NativeCpuRectanglesKeepStagin
         EXPECT_EQ(restored,manifest);
         const auto sourceLayout=remoteCpuProjectionStorageLayout(manifest,MoEOverlayRemoteCPUStorageEndpoint::Source);
         const auto destinationLayout=remoteCpuProjectionStorageLayout(manifest,MoEOverlayRemoteCPUStorageEndpoint::Destination);
-        EXPECT_EQ(sourceLayout.cpu_first_row,59);EXPECT_EQ(sourceLayout.cpu_first_column,32);
+        EXPECT_EQ(sourceLayout.cpu_first_row,59);EXPECT_EQ(sourceLayout.cpu_first_column,coded ? 256 : 32);
+        EXPECT_EQ(manifest.total_bytes, sourceLayout.chunkBytes(sourceLayout.unit_count));
         EXPECT_EQ(destinationLayout.cpu_first_row,0);EXPECT_EQ(destinationLayout.cpu_first_column,0);
         std::vector<uint8_t> destination(destinationLayout.cpuStorageBytes(),0xa5),staging(manifest.maximum_chunk_bytes,0xcc);
         const auto dirty=destination;
@@ -167,8 +166,10 @@ TEST(Test__MoEOverlayDistributedResidencyProtocol, NativeCpuRectanglesKeepStagin
         }
         EXPECT_EQ(transferred,manifest.total_bytes);EXPECT_EQ(first,sourceLayout.unit_count);
         // Entire nonintersecting final tiles/K blocks remain dirty, including padding.
-        EXPECT_EQ(std::memcmp(destination.data()+size_t(2)*destinationLayout.cpu_block_stride,
-            dirty.data()+size_t(2)*destinationLayout.cpu_block_stride,size_t(2)*destinationLayout.cpu_block_stride),0);
+        const auto root = destinationLayout.rootGeometry();
+        const auto first_untouched = root.blockOffset(0, intersection.columns() / 32);
+        EXPECT_EQ(std::memcmp(destination.data() + first_untouched, dirty.data() + first_untouched,
+            root.rowBytes() - first_untouched), 0);
         auto changed=manifest;changed.cpu_wire_columns_per_unit=65;changed.manifest_hash=changed.computedHash();
         EXPECT_FALSE(changed.valid());
         EXPECT_THROW((void)makeMoEOverlayRemoteCpuProjectionManifest(identity,packed,1),std::invalid_argument);
@@ -214,9 +215,7 @@ TEST(Test__MoEOverlayDistributedResidencyProtocol, GpuArrivalAuthenticatesOrigin
             return makeCpuToGpuExpertTierWeightStreamManifest(packed, identity.candidate_epoch,
                 identity.layer_idx, identity.expert_id, identity.projection, 1).forIntersection(intersection);
         };
-        if (cpu::native_quantised::preparedSuperblockCoded(packed.encoding) ||
-            requiresDensityAwareExpertTierSlots(packed.encoding, packed.codebook_id) ||
-            cpu::native_quantised::isQ5NativeSingleScaleSource(packed.codebook_id, packed.is_superblock))
+        if (cpu::native_quantised::migrationUsesSuperblockCodes(*format.metadata) && source.first_column % 256)
         {
             EXPECT_THROW((void)makeStream(), std::invalid_argument);
             continue;

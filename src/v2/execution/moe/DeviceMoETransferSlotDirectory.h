@@ -79,7 +79,8 @@ namespace llaminar2
          * @param layer_formats Exact movable projection specs for each layer.
          * @param projection_set Complete expert or explicit gate/up-only ownership.
          * @throws std::invalid_argument when any layer lacks a required projection,
-         *         includes a fixed projection, or mixes incompatible matrix geometry.
+         *         includes a fixed projection, mixes incompatible matrix geometry, or
+         *         requires separate exact slots for a coded projection.
          */
         static FormatProfile profileForLayerFormats(
             const std::vector<std::vector<ProjectionSpec>> &layer_formats,
