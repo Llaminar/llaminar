@@ -50,19 +50,6 @@ namespace llaminar2
             return deviceMoEFloatingMatrixBytes({.n = spec.N, .k = spec.K}, format);
         }
 
-        /** @return Whether this exact source geometry requires coded admission for migration. */
-        std::optional<WeightVRAMPool::SuperblockCodedMetadata> directoryCodedDeclaration(
-            const DeviceMoETransferSlotDirectory::ProjectionSpec &spec)
-        {
-            if (!spec.format.isNativeQuantised())
-                return std::nullopt;
-            const auto *source = native_quantised_formats::forSourceIdentity(
-                spec.format.native_quantised.codebook_id, spec.format.native_quantised.is_superblock);
-            if (!source || !cpu::native_quantised::migrationUsesSuperblockCodes(*source))
-                return std::nullopt;
-            return WeightVRAMPool::SuperblockCodedMetadata{canonicalDeviceVnniCodebookId(*source), 0};
-        }
-
         /** @return Native plane view, absent when no quantized storage was planned. */
         DeviceNativeQuantisedMatrixDesc descriptorFromSlot(
             const WeightVRAMPool::WeightSlot &slot,
@@ -236,7 +223,7 @@ namespace llaminar2
                 return floatingBytes(spec, deviceFormat(spec.format));
             const size_t block_count =
                 static_cast<size_t>(spec.N) * static_cast<size_t>(spec.K / 32);
-            if (const auto coded = directoryCodedDeclaration(spec))
+            if (const auto coded = spec.codedDeclaration())
             {
                 namespace sb = native_quantised_superblock;
                 const auto bits = block_count * sb::superblockCodePlaneBits(coded->physical_codebook);
@@ -319,7 +306,7 @@ namespace llaminar2
                         spec.has_emins,
                         spec.scale_plane,
                         /*raw_gguf_bytes=*/0,
-                        {.bytes = floatingBytes(spec, floating_capacity)}, directoryCodedDeclaration(spec));
+                        {.bytes = floatingBytes(spec, floating_capacity)}, spec.codedDeclaration());
                 }
             }
         }
@@ -381,8 +368,8 @@ namespace llaminar2
 
                 // Retargeting per-block capacity cannot retarget a packed code plane.
                 // Reject this model during profile construction, before quoting or allocating slots.
-                const auto retained = directoryCodedDeclaration(allocation);
-                const auto incoming = directoryCodedDeclaration(*source_it);
+                const auto retained = allocation.codedDeclaration();
+                const auto incoming = source_it->codedDeclaration();
                 if (retained || incoming)
                 {
                     if (!retained || !incoming || allocation.format != source_it->format ||
@@ -396,9 +383,9 @@ namespace llaminar2
                         diagnostic << "Device MoE rebalance projection " << allocation.label
                                    << " at profile layer " << layer << " requires a separate exact slot family: "
                                    << projectionFormatName(allocation.format) << " (" << (retained ? "coded" : "per-block/floating")
-                                   << ", payload " << allocation.payload_bytes_per_block << " bytes/block) vs "
+                                   << ", phase " << unsigned(allocation.gpu_superblock_phase) << ", payload " << allocation.payload_bytes_per_block << " bytes/block) vs "
                                    << projectionFormatName(source_it->format) << " (" << (incoming ? "coded" : "per-block/floating")
-                                   << ", payload " << source_it->payload_bytes_per_block << " bytes/block)";
+                                   << ", phase " << unsigned(source_it->gpu_superblock_phase) << ", payload " << source_it->payload_bytes_per_block << " bytes/block)";
                         throw std::invalid_argument(diagnostic.str());
                     }
                     continue;
@@ -518,6 +505,7 @@ namespace llaminar2
                     .scale_plane = nativeQuantisedScalePlaneWidth(
                         canonicalDeviceVnniCodebookId(*source)),
                     .format = projection.format,
+                    .gpu_superblock_phase = projection.gpuSuperblockPhase(),
                 });
             }
             layer_formats.push_back(std::move(specs));
@@ -752,7 +740,7 @@ namespace llaminar2
         }
         auto &specs = format_profile.allocation_specs;
         validateSpecs(specs, format_profile.projection_set);
-        if (device.is_rocm() && std::any_of(specs.begin(), specs.end(), [](const auto &spec) { return directoryCodedDeclaration(spec).has_value(); }))
+        if (device.is_rocm() && std::any_of(specs.begin(), specs.end(), [](const auto &spec) { return spec.codedDeclaration().has_value(); }))
             throw std::invalid_argument("ROCm device MoE rebalance slots require the HIP superblock-coded migration port");
         if (specs.front().format.isFloating() &&
             deviceMoEFloatingElementBytes(format_profile.floating_allocation_format) <
@@ -797,7 +785,7 @@ namespace llaminar2
                     spec.has_emins,
                     spec.scale_plane,
                     /*raw_gguf_bytes=*/0,
-                    {.bytes = floatingBytes(spec, format_profile.floating_allocation_format)}, directoryCodedDeclaration(spec));
+                    {.bytes = floatingBytes(spec, format_profile.floating_allocation_format)}, spec.codedDeclaration());
             }
         orchestrator->allocate(/*pinned_slot_size=*/0, /*num_h2d_streams=*/0);
 

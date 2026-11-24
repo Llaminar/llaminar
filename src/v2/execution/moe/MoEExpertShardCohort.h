@@ -167,7 +167,15 @@ public:
      * @throws std::out_of_range For a foreign coordinate.
      */
     MoEOverlayLayerWeightManifest localManifest(std::size_t participant) const {
-        auto local=source_;for(auto& p:local.projections){auto view=ownership(participant).projection(weightRole(p.projection));p.N=view.rows;p.K=view.columns;}return local;
+        auto local = source_;
+        for (auto &projection : local.projections)
+        {
+            const auto view = ownership(participant).projection(weightRole(projection.projection));
+            projection.N = view.rows;
+            projection.K = view.columns;
+            projection.first_column = view.first_column;
+        }
+        return local;
     }
     /**
      * @param participant Original domain coordinate.

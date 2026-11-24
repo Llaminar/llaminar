@@ -74,11 +74,23 @@
 
 namespace llaminar2
 {
+    std::uint8_t MoEOverlayProjectionWeightManifest::gpuSuperblockPhase() const noexcept
+    {
+        if (format.isNativeQuantised())
+        {
+            const auto *source = native_quantised_formats::forSourceIdentity(
+                format.native_quantised.codebook_id, format.native_quantised.is_superblock);
+            if (source && cpu::native_quantised::migrationUsesSuperblockCodes(*source))
+                return static_cast<std::uint8_t>(native_quantised_superblock::superblockPhase(first_column / 32));
+        }
+        return 0;
+    }
+
     bool MoEOverlayProjectionWeightManifest::valid() const noexcept
     {
         const auto role = static_cast<std::size_t>(projection);
-        return role < 3 && N > 0 && K > 0 && format.valid() &&
-               (format.isFloating() || (K % 32) == 0);
+        return role < 3 && N > 0 && K > 0 && first_column >= 0 && format.valid() &&
+               (format.isFloating() || (K % 32 == 0 && first_column % 32 == 0));
     }
 
     bool MoEOverlayLayerWeightManifest::valid() const noexcept
@@ -4291,7 +4303,8 @@ namespace llaminar2
                         const auto local = family.cohort()->localManifest(family.participantIndex());
                         for (const auto &projection : local.projections)
                             signatures[projectionIndex(projection.projection)] = {
-                                .N = projection.N, .K = projection.K, .format = projection.format};
+                                .N = projection.N, .K = projection.K, .format = projection.format,
+                                .gpu_superblock_phase = projection.gpuSuperblockPhase()};
                     }
                     layers_by_geometry[ExpertGeometryKey{signatures}]
                         .push_back(layer_idx);
@@ -4411,6 +4424,7 @@ namespace llaminar2
                                 .N = signature.N,
                                 .K = signature.K,
                                 .format = signature.format,
+                                .gpu_superblock_phase = signature.gpu_superblock_phase,
                             };
                             if (signature.format.isNativeQuantised())
                             {

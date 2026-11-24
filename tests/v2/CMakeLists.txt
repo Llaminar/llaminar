@@ -12543,6 +12543,12 @@ add_v2_test(V2_Integration_CUDA_CodedCompactExpertTierPlanes
         --gtest_filter=CUDAExpertTierWeightKernelsTest.FileDensityPlanesRoundTripMatchesSourceNative:CUDAExpertTierWeightKernelsTest.CapturedCodedPeerRectanglePreservesShiftedNeighbors:CUDAExpertTierWeightKernelsTest.CodedRemoteEndpointsPreserveOriginalGpuPlanes
     LABELS "V2;Integration;ProductionTestPreflight;CUDA;MoE;ExpertOverlay;Transfer;ByteExact;Regression"
     MPI_PROCS 1 NO_MODELS TIMEOUT 60)
+add_v2_test(V2_Integration_CUDA_CodedShadowSlotRootPhase
+    COMMAND $<TARGET_FILE:v2_integration_cuda_expert_tier_weight_kernels>
+        --gtest_filter=CUDAExpertTierWeightKernelsTest.CodedShadowSlotRetainsOriginalRootPhase
+    LABELS "V2;Integration;ProductionTestPreflight;CUDA;MoE;ExpertOverlay;Transfer;ByteExact;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDA_CodedShadowSlotRootPhase)
 add_v2_test(V2_Integration_CUDA_CodedExpertRelay_MPI
     COMMAND $<TARGET_FILE:v2_integration_cuda_expert_tier_weight_kernels>
         --gtest_filter=CUDAExpertTierWeightKernelsTest.CodedMpiRelayPreservesOriginalGpuPlanes
@@ -28541,6 +28547,7 @@ target_link_libraries(v2_test_expert_tier_weight_stream
     llaminar2_core
     GTest::gtest
     GTest::gtest_main
+    ${CMAKE_DL_LIBS}
 )
 add_v2_test(V2_Unit_ExpertTierWeightStream
     COMMAND $<TARGET_FILE:v2_test_expert_tier_weight_stream>

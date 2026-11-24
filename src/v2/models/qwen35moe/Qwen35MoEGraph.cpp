@@ -2091,6 +2091,7 @@ namespace llaminar2
                 spec.codebook_id = descriptor.codebook_id;
                 spec.format =
                     ExpertWeightFormat::nativeQuantised(source_identity);
+                spec.gpu_superblock_phase = nativeQuantisedLayoutPhase(descriptor.metadata_layout);
                 return spec;
             };
 

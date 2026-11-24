@@ -32,6 +32,7 @@
 #include "kernels/cuda/gemm/CUDAGroupedVerifierLaunch.h"
 #include "execution/moe/ExpertTierWeightTransferLane.h"
 #include "execution/moe/GpuExpertSlotPool.h"
+#include "execution/moe/ExpertPreparedMemoryGeometry.h"
 #include "execution/moe/MoEOverlayGpuRemoteProjectionEndpoint.h"
 #include "execution/moe/MoEOverlayPhysicalResidencyFabric.h"
 #include "backends/BackendManager.h"
@@ -70,6 +71,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -822,6 +824,89 @@ namespace llaminar2
             }
             EXPECT_EQ(qualified_coded, 13u);
             EXPECT_EQ(qualified_single_scale, 9u);
+        }
+
+        /** @test Original GPU K origins determine real shadow-slot capacity and both conversion directions. */
+        TEST_F(CUDAExpertTierWeightKernelsTest, CodedShadowSlotRetainsOriginalRootPhase)
+        {
+            constexpr int n = 67, cpu_k = 768;
+            constexpr unsigned chunk_units = 2;
+            constexpr auto role = ExpertTierWeightProjection::Down;
+            const auto device = DeviceId::cuda(0);
+            const auto &source = native_quantised_formats::Q4_K;
+            const auto format = ExpertWeightFormat::nativeQuantised(
+                {.codebook_id = source.codebook_id, .is_superblock = true, .present = true});
+            auto tensor = test::quantizedVerifierFormat("Q4_K").create({n, cpu_k}, 143);
+            cpu::native_quantised::CPUNativeQuantisedPackedWeights cpu;
+            ASSERT_TRUE(cpu::native_quantised::packWeightsCPUNativeQuantised(tensor.get(), cpu));
+            const auto original = cpu.readView().bytes();
+            const auto upload_manifest = makeCpuToGpuExpertTierWeightStreamManifest(cpu, 1, 0, 0, role, chunk_units);
+            using Projection = MoEExpertProjectionOwnership::Projection;
+            const Projection whole{MoEProjectionResidence::ExpertOwner, n, cpu_k, 0, n, 0, cpu_k};
+            for (const auto [origin, k, header_words] : {std::tuple{32, 256, 2}, std::tuple{64, 224, 2}, std::tuple{224, 320, 3}})
+            {
+                SCOPED_TRACE(origin);
+                const Projection root{MoEProjectionResidence::ParticipantInputSlice, n, cpu_k, 0, n, origin, k};
+                const auto upload = upload_manifest.forIntersection(ExpertTierWeightProjectionIntersection::between(whole, root)).deviceLayout();
+                const auto download = makeGpuToCpuExpertTierWeightStreamManifest(source, n, k, 2, 0, 0, role, chunk_units).forIntersection(ExpertTierWeightProjectionIntersection::between(root, whole)).deviceLayout();
+                ASSERT_TRUE(upload.valid());
+                ASSERT_TRUE(download.valid());
+                const MoEOverlayProjectionWeightManifest local{.projection = role, .N = n, .K = k,
+                    .format = format, .first_column = origin};
+                const auto phase = local.gpuSuperblockPhase();
+                ASSERT_EQ(phase, origin / 32);
+                EXPECT_EQ(upload.gpu_superblock_phase, phase);
+                EXPECT_EQ(download.gpu_superblock_phase, phase);
+                auto pool = GpuExpertSlotPool::createForTest(getCUDABackend(), device, 0, 0, 1,
+                    {{.label = "down", .N = n, .K = k, .payload_bytes_per_block = 16,
+                      .is_asymmetric = true, .codebook_id = source.codebook_id, .format = format,
+                      .gpu_superblock_phase = phase}}, 0);
+                auto lease = pool->acquire(0);
+                ASSERT_TRUE(lease.has_value());
+                const auto &slot = lease->projections.front().slot;
+                const std::size_t payload = std::size_t(n) * (k / 32) * 16;
+                const std::size_t codes = (std::size_t(n) * (k / 32) * 12 + 7) / 8;
+                const std::size_t headers = n * header_words * sizeof(std::uint32_t);
+                ASSERT_EQ(slot.mins_bytes, headers);
+                ASSERT_EQ(nativeQuantisedLayoutPhase(slot.metadata_layout), phase);
+                const auto bom = resolveExpertPreparedProjectionMemoryGeometry(n, k, format,
+                    GPUPreparedWeightPoolLayout::MigrationReusable, phase);
+                EXPECT_EQ(bom.gpu_shadow_bytes, alignGPUWeightLoadAllocation(payload) +
+                    alignGPUWeightLoadAllocation(codes) + alignGPUWeightLoadAllocation(headers));
+                EXPECT_GT(bom.gpu_shadow_bytes, resolveExpertPreparedProjectionMemoryGeometry(n, k, format).gpu_shadow_bytes);
+                ExpertTierGpuMutableProjectionView gpu{
+                    .payload = slot.d_native_quantised_payload,
+                    .scales = static_cast<std::uint16_t *>(slot.d_native_quantised_scales),
+                    .mins = static_cast<std::uint16_t *>(slot.d_native_quantised_mins),
+                    .payload_bytes = payload, .scales_bytes = codes, .mins_bytes = headers,
+                    .metadata_layout = slot.metadata_layout};
+                ASSERT_TRUE(gpu.validFor(upload));
+                ASSERT_TRUE(gpu.validFor(download));
+                const auto capacity = chunk_units * upload.cpuStorage().maximumWireUnitBytes();
+                auto &transfers = TransferEngine::instance();
+                ExpertTierWeightTransferLane lane({.device = device,
+                    .staging = transfers.allocatePersistentTransferStagingSlices(capacity, 1, device).front(),
+                    .execution = test::ComponentTransferExecutionPoolFixtureAccess::allocate(transfers, 1, device,
+                        "cuda_phased_shadow_slot").front(),
+                    .progress = BackgroundTransferProgressBinding::nativeStream(),
+                    .lane_name = "cuda_phased_shadow_slot", .perf_device = device.toString()});
+                std::string error;
+                ASSERT_TRUE(lane.materialize(&error)) << error;
+                ASSERT_TRUE(lane.startCpuToGpu(upload, original, gpu, &error)) << error;
+                ASSERT_EQ(pollLaneToCompletion(lane), ExpertTierWeightTransferProgress::Ready);
+                std::vector<uint8_t> expected(original.size(), 0xa5), observed = expected;
+                for (unsigned first = 0; first < upload.unit_count; first += chunk_units)
+                {
+                    const auto count = std::min(chunk_units, upload.unit_count - first);
+                    std::vector<uint8_t> wire(upload.chunkBytes(count, first));
+                    ASSERT_TRUE(gatherExpertTierCPUWeightChunk(upload, original, first, count, wire));
+                    ASSERT_TRUE(scatterExpertTierCPUWeightChunk(download, wire, first, count, expected));
+                }
+                ASSERT_TRUE(lane.startGpuToCpu(download, gpu.asConst(), observed,
+                    ExpertTierSourceReadiness::publishedResidencyBank(1), &error)) << error;
+                ASSERT_EQ(pollLaneToCompletion(lane), ExpertTierWeightTransferProgress::Ready);
+                EXPECT_EQ(observed, expected);
+            }
         }
 
         /** @test A retained CUDA rectangle preserves neighboring code bits and untouched payload/header fields after reset. */

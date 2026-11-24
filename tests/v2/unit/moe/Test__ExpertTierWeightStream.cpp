@@ -7,6 +7,8 @@
  * scales/minima must survive conversion, not merely a lossy round trip.
  * Native read views also admit the real slot/demotion owners, separating source
  * codec widths from physical expanded payloads without changing publications.
+ * The Linux prepared-storage allocation probe observes the production aligned
+ * heap allocator even when the reference lives in the shared core.
  */
 
 #include "../../utils/TestTensorFactory.h"
@@ -28,6 +30,10 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
+#ifdef __linux__
+#include <dlfcn.h>
+#endif
 #include <limits>
 #include <span>
 #include <string>
@@ -35,6 +41,34 @@
 
 #include <tuple>
 #include <vector>
+
+#ifdef __linux__
+namespace
+{
+    thread_local std::size_t *prepared_allocation_count = nullptr;
+
+    /** @brief Count only prepared heap allocations made synchronously on this thread. */
+    class ScopedPreparedAllocationCount final
+    {
+    public:
+        /** @brief Arm the counter for a single reference conversion. */
+        explicit ScopedPreparedAllocationCount(std::size_t &count) { prepared_allocation_count = &count; }
+        /** @brief Retire the counter before running GTest or unrelated work. */
+        ~ScopedPreparedAllocationCount() { prepared_allocation_count = nullptr; }
+    };
+}
+
+/** @brief Count calls to the exact AlignedVector heap allocation boundary, then delegate to libc. */
+extern "C" void *aligned_alloc(std::size_t alignment, std::size_t bytes) noexcept
+{
+    static const auto allocate = reinterpret_cast<decltype(&std::aligned_alloc)>(dlsym(RTLD_NEXT, "aligned_alloc"));
+    if (!allocate)
+        std::abort();
+    if (prepared_allocation_count)
+        ++*prepared_allocation_count;
+    return allocate(alignment, bytes);
+}
+#endif
 
 namespace llaminar2
 {
@@ -376,7 +410,18 @@ namespace llaminar2
                 staged.has_emins = physical.has_emins;
                 CPUNativeQuantisedPackedWeights destination;
                 std::string error;
+#ifdef __linux__
+                std::size_t allocations = 0;
+                bool converted;
+                {
+                    ScopedPreparedAllocationCount count(allocations);
+                    converted = gpuToCpuExpertPackedReference(staged, destination, &error);
+                }
+                EXPECT_EQ(allocations, 0u);
+                EXPECT_FALSE(converted);
+#else
                 EXPECT_FALSE(gpuToCpuExpertPackedReference(staged, destination, &error));
+#endif
                 EXPECT_NE(error.find("metadata layout disagrees"), std::string::npos) << error;
                 EXPECT_EQ(destination.native_interleaved.data(), nullptr);
                 EXPECT_EQ(destination.N, 0);
@@ -416,6 +461,23 @@ namespace llaminar2
                 EXPECT_FALSE(scatterExpertTierCPUWeightChunk(layout, wire, 0, layout.unit_count, short_root));
                 EXPECT_EQ(short_root, untouched);
             }
+#ifdef __linux__
+            // Positive control uses the same out-of-line shared-core conversion,
+            // so a link configuration that defeats interposition cannot pass.
+            const auto tensor = test::quantizedVerifierFormat("Q2_K").create({n, k}, 37);
+            CPUNativeQuantisedPackedWeights original, result;
+            ASSERT_TRUE(packWeightsCPUNativeQuantised(tensor.get(), original));
+            HostGpuExpertPackedProjection coded;
+            ASSERT_TRUE(cpuToGpuExpertPackedReference(original, coded));
+            std::size_t allocations = 0;
+            bool converted;
+            {
+                ScopedPreparedAllocationCount count(allocations);
+                converted = gpuToCpuExpertPackedReference(coded, result);
+            }
+            EXPECT_TRUE(converted);
+            EXPECT_EQ(allocations, 1u);
+#endif
             EXPECT_EQ(formats, 13u);
         }
 

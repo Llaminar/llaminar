@@ -51,6 +51,10 @@ namespace llaminar2
         int N = 0; ///< Logical output columns.
         int K = 0; ///< Logical reduction dimension, divisible by 32.
         ExpertWeightFormat format; ///< Exact quantized or floating provenance.
+        int first_column = 0; ///< Original K coordinate of this local root, never a compacted-view offset.
+
+        /** @return Original eight-block phase for coded GPU roots; zero for per-block storage. */
+        [[nodiscard]] std::uint8_t gpuSuperblockPhase() const noexcept;
 
         /** @return Whether role, geometry, and provenance are catalogued. */
         [[nodiscard]] bool valid() const noexcept;

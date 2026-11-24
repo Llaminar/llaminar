@@ -863,7 +863,9 @@ TEST_F(ComputeStagesTest, MoEDeviceRebalanceFormatProfileSeparatesWireBytesFromS
     other_codebook[1] = spec("up", 12, true, false, 9, true);
     auto wrong_payload_width = coded_layer;
     ++wrong_payload_width[1].payload_bytes_per_block;
-    for (const auto &layers : {std::vector{q8_layer, coded_layer}, std::vector{coded_layer, q8_layer},
+    auto other_phase = coded_layer;
+    other_phase[1].gpu_superblock_phase = 7;
+    for (const auto &layers : {std::vector{coded_layer, other_phase}, std::vector{q8_layer, coded_layer}, std::vector{coded_layer, q8_layer},
                               std::vector{coded_layer, other_codebook}, std::vector{coded_layer, wrong_payload_width}})
     {
         try
@@ -875,7 +877,7 @@ TEST_F(ComputeStagesTest, MoEDeviceRebalanceFormatProfileSeparatesWireBytesFromS
         {
             const std::string_view diagnostic = error.what();
             EXPECT_NE(diagnostic.find("projection up at profile layer 1 requires a separate exact slot family"), std::string_view::npos);
-            EXPECT_NE(diagnostic.find("NativeQuantised/Q2_K (coded, payload 8 bytes/block)"), std::string_view::npos);
+            EXPECT_NE(diagnostic.find("NativeQuantised/Q2_K (coded, phase 0, payload 8 bytes/block)"), std::string_view::npos);
         }
     }
 }
