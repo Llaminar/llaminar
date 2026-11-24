@@ -577,33 +577,53 @@ namespace llaminar2::cpu::native_quantised
             }
         }
 
-        /** @brief Load four immutable IQ3_S codebook entries from independent table addresses.
-         * @param indices One native nine-bit grid index per output column.
-         * @return Four packed original magnitude bytes per output column.
+        /**
+         * @brief Build two adjacent IQ3_S groups' nine-bit indices together.
+         * @tparam Pair Eight-value K pair in [0,3].
+         * @tparam Ops Admitted SIMD operations for four columns.
+         * @param qs Four bytes per column, holding two pairs' low index bits.
+         * @param qh Column high bytes duplicated into the high byte of each
+         *        halfword, with the second group's bits pre-shifted by one.
+         * @return Four column indices for the first group, then four for the second.
+         * @details Use one byte shuffle for both groups, reusing its constant
+         * across pairs. One bit select supplies bit 8 without widening each
+         * group's indices or keeping two independent index vectors live.
          */
-        [[gnu::always_inline]] static uint32x4_t iq3Grid(uint32x4_t indices) noexcept
+        template <int Pair, typename Ops>
+        [[gnu::always_inline]] static uint16x8_t iq3PairIndices(typename Ops::I qs, uint16x8_t qh) noexcept
         {
-            return uint32x4_t{iq3s_grid[vgetq_lane_u32(indices, 0)], iq3s_grid[vgetq_lane_u32(indices, 1)],
-                iq3s_grid[vgetq_lane_u32(indices, 2)], iq3s_grid[vgetq_lane_u32(indices, 3)]};
+            const uint8x16_t pick{0, 255, 4, 255, 8, 255, 12, 255, 1, 255, 5, 255, 9, 255, 13, 255};
+            if constexpr (Pair % 2 != 0)
+                qs = std::bit_cast<typename Ops::I>(vshrq_n_u32(std::bit_cast<uint32x4_t>(qs), 16));
+            const auto indices = vreinterpretq_u16_u8(vqtbl1q_u8(std::bit_cast<uint8x16_t>(qs), pick));
+            if constexpr (Pair != 0)
+                qh = vshrq_n_u16(qh, 2 * Pair);
+            return vbslq_u16(vdupq_n_u16(256), qh, indices);
         }
 
-        /** @brief Decode one exact IQ3_S four-value group from preloaded column words.
-         * @tparam Group Four-value group in [0,7].
-         * @param qs Index words for the current half; one word per output column.
-         * @param metadata Packed ninth index bits and first three sign bytes per column.
-         * @param signs Already repeated sign byte, shared with the adjacent group.
+        /**
+         * @brief Decode one four-value group of a paired IQ3_S lookup.
+         * @tparam Half First or second group, 0 or 1.
+         * @tparam Ops Admitted SIMD operations for four columns.
+         * @param indices Register-resident halfword indices from iq3PairIndices().
+         * @param signs The source sign byte repeated across each column's four lanes.
          * @return Signed source bytes in production dot-lane order.
+         * @details The immutable 512-word grid is larger than a NEON TBL
+         * table. Look up each column's word directly and apply its four sign
+         * bits with the existing SIMD mask, without a scratch gather buffer.
          */
-        template <int Group, typename Ops>
-        [[gnu::always_inline]] static int8x16_t iq3sGroup(typename Ops::I qs, typename Ops::I metadata,
-            typename Ops::I signs) noexcept
+        template <int Half, typename Ops>
+        [[gnu::always_inline]] static int8x16_t iq3PairGroup(uint16x8_t indices, typename Ops::I signs) noexcept
         {
-            const auto index = ((qs >> (8 * (Group % 4))) & 255) | (((metadata >> Group) & 1) << 8);
-            const auto mag = std::bit_cast<typename Ops::I>(iq3Grid(std::bit_cast<uint32x4_t>(index)));
-            return std::bit_cast<int8x16_t>(Ops::template signGrid<Group % 2>(mag, signs));
+            constexpr int lane = 4 * Half;
+            const auto packed = uint32x4_t{
+                iq3s_grid[vgetq_lane_u16(indices, lane)], iq3s_grid[vgetq_lane_u16(indices, lane + 1)],
+                iq3s_grid[vgetq_lane_u16(indices, lane + 2)], iq3s_grid[vgetq_lane_u16(indices, lane + 3)]};
+            return std::bit_cast<int8x16_t>(Ops::template signGrid<Half>(std::bit_cast<typename Ops::I>(packed), signs));
         }
 
         /** @brief Decode one IQ3_S K block, sharing each decoded vector across all live rows.
+         * @tparam Ops Admitted SIMD operations for four columns.
          * @param unit Current native payload.
          * @param column First of four output columns.
          * @param block Logical K block.
@@ -615,9 +635,23 @@ namespace llaminar2::cpu::native_quantised
         {
             using I = typename Ops::I;
             const auto metadata = multi_scale::payloadWord<11, Ops>(unit, 2, column);
+            // Align both groups' first high bits to bit 8; each pair then
+            // shifts by 2 * Pair with an immediate rather than a live mask.
+            const uint8x16_t qh_gather{255, 0, 255, 4, 255, 8, 255, 12, 255, 0, 255, 4, 255, 8, 255, 12};
+            const int16x8_t align_groups{0, 0, 0, 0, -1, -1, -1, -1};
+            [[maybe_unused]] const auto packed_qh = vshlq_u16(
+                vreinterpretq_u16_u8(vqtbl1q_u8(std::bit_cast<uint8x16_t>(metadata), qh_gather)), align_groups);
             const auto signsFor = [&]<int Pair>() __attribute__((always_inline)) {
                 if constexpr (Pair == 3)
-                    return Ops::template repeatByte<0>(multi_scale::payloadWord<11, Ops>(unit, 3, column));
+                {
+                    // The last sign bytes are the one-byte tail plane, not
+                    // part of the interleaved metadata words. Duplicate its
+                    // contiguous four-byte slice directly into the vector file.
+                    const auto tail = vreinterpretq_u8_u32(vld1q_dup_u32(reinterpret_cast<const std::uint32_t *>(
+                        unit + preparedCompactPayloadWords(11) * 256 + column)));
+                    const uint8x16_t select{0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3};
+                    return std::bit_cast<I>(vqtbl1q_u8(tail, select));
+                }
                 else
                     return Ops::template repeatByte<1 + Pair>(metadata);
             };
@@ -640,8 +674,9 @@ namespace llaminar2::cpu::native_quantised
                         constexpr int group = Pair * 2;
                         const auto qs = multi_scale::payloadWord<11, Ops>(unit, Pair / 2, column);
                         const auto signs = signsFor.template operator()<Pair>();
-                        consumePair<Ops>(iq3sGroup<group, Ops>(qs, metadata, signs),
-                            iq3sGroup<group + 1, Ops>(qs, metadata, signs), block, group, columns01, columns23, dots);
+                        const auto indices = iq3PairIndices<Pair, Ops>(qs, packed_qh);
+                        consumePair<Ops>(iq3PairGroup<0, Ops>(indices, signs),
+                            iq3PairGroup<1, Ops>(indices, signs), block, group, columns01, columns23, dots);
                     });
                 }
                 publishPairs<Ops>(columns01, columns23, dots);
@@ -654,10 +689,9 @@ namespace llaminar2::cpu::native_quantised
                     constexpr int group = Pair * 2;
                     const auto qs = multi_scale::payloadWord<11, Ops>(unit, Pair / 2, column);
                     const auto signs = signsFor.template operator()<Pair>();
-                    even = Ops::template dotLane<group>(even,
-                        std::bit_cast<I>(iq3sGroup<group, Ops>(qs, metadata, signs)), a);
-                    odd = Ops::template dotLane<group + 1>(odd,
-                        std::bit_cast<I>(iq3sGroup<group + 1, Ops>(qs, metadata, signs)), a);
+                    const auto indices = iq3PairIndices<Pair, Ops>(qs, packed_qh);
+                    even = Ops::template dotLane<group>(even, std::bit_cast<I>(iq3PairGroup<0, Ops>(indices, signs)), a);
+                    odd = Ops::template dotLane<group + 1>(odd, std::bit_cast<I>(iq3PairGroup<1, Ops>(indices, signs)), a);
                 });
                 dots[0] = even + odd;
             }
