@@ -777,6 +777,12 @@ namespace llaminar2
         const std::vector<int> *sequence_lengths = nullptr;
 
         /**
+         * @brief Host KV sequence (slot) of each request row of a CPU serving
+         *        forward; nullptr means row b owns sequence b.
+         */
+        const std::vector<int> *request_kv_slots = nullptr;
+
+        /**
          * @brief Device owner for per-request valid row counts in a padded batch.
          *
          * The serving boundary uploads `sequence_lengths` once before GPU graph

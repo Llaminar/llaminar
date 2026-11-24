@@ -771,6 +771,24 @@ namespace llaminar2
         /** @brief Request cancellation; the request retires at the next step. */
         virtual void cancelServingRequest(std::uint64_t id) { (void)id; }
 
+        /** @brief Allow a paced request to produce @p tokens more tokens. */
+        virtual void grantServingTokens(std::uint64_t id, int tokens)
+        {
+            (void)id;
+            (void)tokens;
+        }
+
+        /**
+         * @brief Commit @p token as the request's next output token instead of
+         *        sampling (reasoning-budget injection). Forced tokens advance
+         *        model and history state exactly like a sampled token.
+         */
+        virtual void forceServingToken(std::uint64_t id, int32_t token)
+        {
+            (void)id;
+            (void)token;
+        }
+
         /**
          * @brief Run one shared execution step over every resident request.
          *

@@ -27,6 +27,13 @@ namespace llaminar2
         SamplingParams sampling;           ///< Request-local sampling law.
         int max_new_tokens = 0;            ///< Positive output-token budget.
         std::vector<int32_t> stop_tokens;  ///< Tokens that terminate the request.
+        /**
+         * @brief Output pacing: when true the request produces tokens only
+         *        against explicit grants (grantServingTokens) or forced tokens
+         *        (forceServingToken); its prompt still prefills immediately.
+         *        When false it decodes until it finishes.
+         */
+        bool paced = false;
     };
 
     /** @brief Why a serving request stopped producing tokens. */

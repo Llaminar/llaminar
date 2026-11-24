@@ -1058,9 +1058,13 @@ namespace llaminar2
                             ITensor *request_k = nullptr;
                             ITensor *request_v = nullptr;
                             int request_kv_len = 0;
+                            const int request_sequence =
+                                params_.request_kv_slots_host.empty()
+                                    ? request
+                                    : params_.request_kv_slots_host[static_cast<size_t>(request)];
                             if (!params_.kv_cache->get_kv(
                                     params_.layer_idx,
-                                    request,
+                                    request_sequence,
                                     &request_k,
                                     &request_v,
                                     &request_kv_len) ||
@@ -1091,7 +1095,7 @@ namespace llaminar2
                             const IKVCache::KVCacheSequenceState state =
                                 params_.kv_cache->sequenceState(
                                     params_.layer_idx,
-                                    request);
+                                    request_sequence);
                             if (state.cached_tokens != request_kv_len ||
                                 request_kv_len > physical_capacity ||
                                 state.implementation_head < 0 ||
@@ -1129,9 +1133,13 @@ namespace llaminar2
                     else
                     {
                         int kv_len_out = 0;
+                        const int single_sequence =
+                            params_.request_kv_slots_host.size() == 1
+                                ? params_.request_kv_slots_host.front()
+                                : 0;
                         if (!params_.kv_cache->get_kv(
                                 params_.layer_idx,
-                                /*seq_idx=*/0,
+                                single_sequence,
                                 &cache_k,
                                 &cache_v,
                                 &kv_len_out) ||
@@ -1155,7 +1163,7 @@ namespace llaminar2
                         const IKVCache::KVCacheSequenceState sequence_state =
                             params_.kv_cache->sequenceState(
                                 params_.layer_idx,
-                                /*seq_idx=*/0);
+                                single_sequence);
                         const int physical_capacity =
                             params_.kv_cache->max_seq_len();
                         /*

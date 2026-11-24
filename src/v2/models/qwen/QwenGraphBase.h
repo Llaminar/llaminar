@@ -523,6 +523,8 @@ namespace llaminar2
         ModelBuffers buffers_;
         /** @brief Real per-request lengths of the CPU host-token batch being built. */
         std::vector<int> host_request_real_lengths_;
+        /** @brief KV sequence of each request row of the CPU serving forward being built. */
+        std::vector<int> host_request_kv_slots_;
         StageSnapshotCallback snapshot_callback_;
         bool decode_replicated_dense_graph_active_ = false;
         bool mtp_replicated_dense_graph_active_ = false;

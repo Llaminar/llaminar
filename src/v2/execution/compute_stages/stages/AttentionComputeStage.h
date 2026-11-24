@@ -60,6 +60,8 @@ namespace llaminar2
             int seq_len = 0;
             /** @brief Host real query rows per request of a CPU ragged batch (empty: all real). */
             std::vector<int> request_real_lengths_host;
+            /** @brief Host KV sequence per request row (empty: row index). */
+            std::vector<int> request_kv_slots_host;
             int kv_len = 0;
             int n_heads = 0;
             int n_kv_heads = 0;

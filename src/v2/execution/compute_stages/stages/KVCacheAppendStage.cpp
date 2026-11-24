@@ -462,7 +462,7 @@ namespace llaminar2
                         : params_.request_real_lengths_host[static_cast<size_t>(request)];
                 if (real_rows <= 0 || real_rows > rows)
                     LLAMINAR_UNREACHABLE("Q16 ragged append real length outside its row slice");
-                if (!append_to_cache(params_.seq_idx + request, key, value, real_rows))
+                if (!append_to_cache(sequenceForRow(request), key, value, real_rows))
                     return false;
             }
             return true;
@@ -593,7 +593,7 @@ namespace llaminar2
             // Note: We create views/copies that the cache will copy from
             for (int b = 0; b < batch_size; ++b)
             {
-                const int seq_idx = params_.seq_idx + b;
+                const int seq_idx = sequenceForRow(b);
                 const size_t offset = b * seq_len * kv_dim;
                 // Ragged request rows: each sequence appends only its real
                 // tokens; the slice beyond them is padding of the widest row.

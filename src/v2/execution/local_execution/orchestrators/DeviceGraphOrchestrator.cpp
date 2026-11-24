@@ -18413,6 +18413,9 @@ namespace llaminar2
         {
             input.sequence_lengths = nullptr;
         }
+        // A serving forward addresses arbitrary resident slots.
+        input.request_kv_slots =
+            serving_row_slots_.empty() ? nullptr : &serving_row_slots_;
         if (execution_role == ForwardExecutionRole::GroupedMTPVerifier &&
             state_.device_id.is_gpu())
         {
@@ -61444,6 +61447,7 @@ namespace llaminar2
     }
 
     bool DeviceGraphOrchestrator::forwardServingRows(
+        const std::vector<int> &slots,
         const std::vector<std::vector<int>> &rows)
     {
         if (!supportsServingRows())
@@ -61451,27 +61455,34 @@ namespace llaminar2
             LOG_ERROR("[DeviceGraphOrchestrator] Serving rows are unsupported on this runner");
             return false;
         }
-        if (rows.empty() || static_cast<int>(rows.size()) > state_.batch_size)
+        if (rows.empty() || rows.size() != slots.size() ||
+            static_cast<int>(rows.size()) > state_.batch_size)
         {
             LOG_ERROR("[DeviceGraphOrchestrator] Serving rows " << rows.size()
                                                                << " outside capacity " << state_.batch_size);
             return false;
         }
+        serving_slot_positions_.resize(static_cast<size_t>(state_.batch_size), 0);
+        std::vector<bool> used(static_cast<size_t>(state_.batch_size), false);
         for (size_t row = 0; row < rows.size(); ++row)
         {
-            const int cached = row < state_.positions.size() ? state_.positions[row] : 0;
-            if (rows[row].empty() ||
-                cached + static_cast<int>(rows[row].size()) > state_.max_seq_len)
+            const int slot = slots[row];
+            if (slot < 0 || slot >= state_.batch_size || used[static_cast<size_t>(slot)] ||
+                rows[row].empty() ||
+                serving_slot_positions_[static_cast<size_t>(slot)] +
+                        static_cast<int>(rows[row].size()) > state_.max_seq_len)
             {
-                LOG_ERROR("[DeviceGraphOrchestrator] Serving row " << row
-                                                                  << " is empty or exceeds the context");
+                LOG_ERROR("[DeviceGraphOrchestrator] Serving row " << row << " (slot " << slot
+                                                                  << ") is invalid or exceeds the context");
                 return false;
             }
+            used[static_cast<size_t>(slot)] = true;
         }
+
         // The LM head ordinarily computes one row (the last physical row of
         // the whole batch). Serving needs each row's own last real token, so
-        // select exactly those terminal rows: row b's chunk is padded to the
-        // widest row, hence its terminal is b*width + len_b - 1.
+        // select exactly those terminal rows: row r is padded to the widest
+        // row, hence its terminal is r*width + len_r - 1.
         int width = 0;
         for (const auto &row : rows)
             width = std::max(width, static_cast<int>(row.size()));
@@ -61489,14 +61500,28 @@ namespace llaminar2
             return false;
         }
         request_batched_prefill_logits_row_count_ = row_count;
-        // The ragged host-token batch continues every row from its own
-        // position and appends only each row's real tokens.
+
+        // Rows address arbitrary slots: positions are presented in row order
+        // for this transaction and written back to each slot afterwards.
+        state_.positions.assign(rows.size(), 0);
+        state_.sequence_lengths.assign(rows.size(), 0);
+        for (size_t row = 0; row < rows.size(); ++row)
+        {
+            state_.positions[row] = serving_slot_positions_[static_cast<size_t>(slots[row])];
+            state_.sequence_lengths[row] = state_.positions[row];
+        }
+        serving_row_slots_ = slots;
         const bool ok = forwardHostTokenBatchImpl(rows, ForwardExecutionRole::MainInference);
+        serving_row_slots_.clear();
         graph_builder_->setRowIndexedAllPositionLogitRows({});
         setComputeRowIndexedAllPositionLogits(false, 0);
         setComputeAllPositionLogits(false);
         request_batched_prefill_logits_row_count_ = 0;
         serving_logits_rows_ = ok ? row_count : 0;
+        if (ok)
+            for (size_t row = 0; row < rows.size(); ++row)
+                serving_slot_positions_[static_cast<size_t>(slots[row])] +=
+                    static_cast<int>(rows[row].size());
         return ok;
     }
 
@@ -61508,67 +61533,18 @@ namespace llaminar2
         return base ? base + static_cast<size_t>(row) * static_cast<size_t>(state_.vocab_size) : nullptr;
     }
 
-    bool DeviceGraphOrchestrator::resetServingRow(int row)
+    bool DeviceGraphOrchestrator::resetServingRow(int slot)
     {
-        if (!supportsServingRows() || row < 0 || row >= state_.batch_size)
+        if (!supportsServingRows() || slot < 0 || slot >= state_.batch_size)
             return false;
         IKVCache::StateResetContext context;
         context.boundary = IKVCache::StateResetBoundary::SequenceRetirement;
-        context.reason = "serving row retirement";
-        if (!state_.kv_cache->resetSequenceState(row, context))
+        context.reason = "serving slot retirement";
+        if (!state_.kv_cache->resetSequenceState(slot, context))
             return false;
-        if (row < static_cast<int>(state_.positions.size()))
-            state_.positions[row] = 0;
-        if (row < static_cast<int>(state_.sequence_lengths.size()))
-            state_.sequence_lengths[row] = 0;
+        serving_slot_positions_.resize(static_cast<size_t>(state_.batch_size), 0);
+        serving_slot_positions_[static_cast<size_t>(slot)] = 0;
         return true;
-    }
-
-    bool DeviceGraphOrchestrator::moveServingRow(int src, int dst)
-    {
-        if (!supportsServingRows() || src == dst || src < 0 || dst < 0 ||
-            src >= state_.batch_size || dst >= state_.batch_size)
-            return false;
-        IKVCache &cache = *state_.kv_cache;
-        const int tokens = src < static_cast<int>(state_.positions.size()) ? state_.positions[src] : 0;
-        if (!resetServingRow(dst))
-            return false;
-        if (tokens > 0)
-        {
-            std::vector<uint8_t> k_payload;
-            std::vector<uint8_t> v_payload;
-            for (int offset = 0; offset < cache.n_layers(); ++offset)
-            {
-                const int layer = cache.first_layer_index() + offset;
-                const auto layout = cache.logicalBlockLayout(layer, tokens);
-                k_payload.resize(layout.k_bytes);
-                v_payload.resize(layout.v_bytes);
-                IKVCache::KVCacheLogicalBlockDescriptor desc;
-                desc.layer = layer;
-                desc.seq_idx = src;
-                desc.logical_token_start = 0;
-                desc.token_count = tokens;
-                if (!cache.exportLogicalBlock(desc, k_payload.data(), v_payload.data()))
-                {
-                    LOG_ERROR("[DeviceGraphOrchestrator] Serving row move export failed layer=" << layer);
-                    return false;
-                }
-                desc.seq_idx = dst;
-                if (!cache.importLogicalBlock(desc, k_payload.data(), v_payload.data()))
-                {
-                    LOG_ERROR("[DeviceGraphOrchestrator] Serving row move import failed layer=" << layer);
-                    return false;
-                }
-            }
-        }
-        if (dst >= static_cast<int>(state_.positions.size()))
-            state_.positions.resize(dst + 1, 0);
-        if (dst >= static_cast<int>(state_.sequence_lengths.size()))
-            state_.sequence_lengths.resize(dst + 1, 0);
-        state_.positions[dst] = tokens;
-        state_.sequence_lengths[dst] =
-            src < static_cast<int>(state_.sequence_lengths.size()) ? state_.sequence_lengths[src] : tokens;
-        return resetServingRow(src);
     }
 
     const float *DeviceGraphOrchestrator::getLogits(int seq_idx) const

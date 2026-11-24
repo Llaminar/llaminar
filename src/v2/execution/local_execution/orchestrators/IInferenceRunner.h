@@ -3175,24 +3175,24 @@ namespace llaminar2
         /**
          * @brief Whether this runner executes continuous-batching serving rows.
          *
-         * Serving rows are the compact set of resident request slots
-         * `[0, active)`: row `r` owns KV sequence `r`. Each row continues from
-         * its own cached position, so one forward can mix decode rows (one
-         * token) with a prompt chunk of a newly entering request.
+         * A serving forward advances any subset of resident request slots:
+         * row `r` continues KV sequence `slots[r]` from that slot's own cached
+         * position, so one forward can mix decode rows (one token) with a
+         * prompt chunk of a newly entering request.
          */
         virtual bool supportsServingRows() const { return false; }
 
         /**
-         * @brief One shared forward over the compact active serving rows.
-         *
-         * `rows[r]` holds the tokens row `r` appends at its own position.
-         * After success, servingRowLogits(r) is row `r`'s last-token logits.
-         *
-         * @param rows Token rows for slots `0..rows.size()-1`; none empty.
-         * @return true when the complete forward succeeded.
+         * @brief One shared forward over the given resident slots.
+         * @param slots Distinct slot (KV sequence) of each row.
+         * @param rows Tokens row `r` appends to `slots[r]`; none empty.
+         * @return true when the complete forward succeeded; then
+         *         servingRowLogits(r) is row `r`'s last-token logits.
          */
-        virtual bool forwardServingRows(const std::vector<std::vector<int>> &rows)
+        virtual bool forwardServingRows(const std::vector<int> &slots,
+                                        const std::vector<std::vector<int>> &rows)
         {
+            (void)slots;
             (void)rows;
             return false;
         }
@@ -3208,25 +3208,12 @@ namespace llaminar2
         }
 
         /**
-         * @brief Retire one serving row: its KV/state becomes empty.
-         * @param row Slot index below the runner's batch capacity.
+         * @brief Retire one serving slot: its KV/state becomes empty.
+         * @param slot Slot index below the runner's batch capacity.
          */
-        virtual bool resetServingRow(int row)
+        virtual bool resetServingRow(int slot)
         {
-            (void)row;
-            return false;
-        }
-
-        /**
-         * @brief Move a resident row's complete state into an empty slot.
-         *
-         * Keeps active rows compact when a middle row retires. `dst` must be
-         * empty; `src` is empty afterwards.
-         */
-        virtual bool moveServingRow(int src, int dst)
-        {
-            (void)src;
-            (void)dst;
+            (void)slot;
             return false;
         }
 

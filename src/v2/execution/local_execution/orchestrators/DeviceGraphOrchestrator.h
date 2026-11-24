@@ -4215,17 +4215,15 @@ namespace llaminar2
         /** @brief CPU serving rows: single-device main KV, no MTP, no recurrent state. */
         bool supportsServingRows() const override;
 
-        /** @brief Ragged forward of the compact active serving rows (CPU). */
-        bool forwardServingRows(const std::vector<std::vector<int>> &rows) override;
+        /** @brief Ragged forward of the given resident serving slots (CPU). */
+        bool forwardServingRows(const std::vector<int> &slots,
+                                const std::vector<std::vector<int>> &rows) override;
 
         /** @brief Row @p row's last-token logits from the latest serving forward. */
         const float *servingRowLogits(int row) const override;
 
-        /** @brief Retire one serving row's KV and logical position (CPU). */
-        bool resetServingRow(int row) override;
-
-        /** @brief Move one serving row's KV and position into an empty slot (CPU). */
-        bool moveServingRow(int src, int dst) override;
+        /** @brief Retire one serving slot's KV and logical position (CPU). */
+        bool resetServingRow(int slot) override;
 
         /**
          * @brief Get logits for a specific sequence in batch
@@ -9571,6 +9569,10 @@ namespace llaminar2
         int padded_seq_len_ = 0;
         /** @brief Rows of terminal logits published by the latest serving forward. */
         int serving_logits_rows_ = 0;
+        /** @brief Cached tokens of each serving slot (KV sequence). */
+        std::vector<int> serving_slot_positions_;
+        /** @brief KV sequence of each row of the serving forward in flight. */
+        std::vector<int> serving_row_slots_;
 
         // =========================================================================
         // Snapshot Capture Members

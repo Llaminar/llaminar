@@ -105,6 +105,8 @@ namespace llaminar2
              * every row is real (rectangular).
              */
             std::vector<int> request_real_lengths_host;
+            /** @brief Host KV sequence per request row (empty: seq_idx + row). */
+            std::vector<int> request_kv_slots_host;
 
             /// [Hybrid mode] Optional output for dequantized V (FP32)
             ITensor *V_dequant_out = nullptr;
@@ -370,6 +372,14 @@ namespace llaminar2
         bool shouldUseDecodeEquivalentVerifierAppend(int request_rows) const;
 
         Params params_;
+
+        /** @brief KV sequence owned by request row @p row of this append. */
+        int sequenceForRow(int row) const
+        {
+            return params_.request_kv_slots_host.empty()
+                       ? params_.seq_idx + row
+                       : params_.request_kv_slots_host[static_cast<size_t>(row)];
+        }
         std::unique_ptr<FP16Tensor> fp16_k_scratch_;
         std::unique_ptr<FP16Tensor> fp16_v_scratch_;
         std::unique_ptr<Q8_1Tensor> q8_k_scratch_;

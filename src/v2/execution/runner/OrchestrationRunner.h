@@ -63,6 +63,7 @@
 #include <unordered_map>
 #include <utility>
 #include <deque>
+#include <map>
 #include <vector>
 
 namespace llaminar2
@@ -310,6 +311,8 @@ namespace llaminar2
         bool beginServingBatch(int capacity) override;
         bool submitServingRequest(ServingBatchRequest request) override;
         void cancelServingRequest(std::uint64_t id) override;
+        void grantServingTokens(std::uint64_t id, int tokens) override;
+        void forceServingToken(std::uint64_t id, int32_t token) override;
         std::vector<ServingBatchEvent> stepServingBatch() override;
         bool servingBatchIdle() const override;
         void endServingBatch() override;
@@ -2355,30 +2358,43 @@ namespace llaminar2
         /**
          * @brief One resident request of the continuous-batching session.
          *
-         * Row index == runner slot == KV sequence. Rows stay compact
-         * (`[0, active)`): retiring a middle row moves the last row into it.
-         * Every row owns its sampler, history and position-keyed RNG, so its
-         * tokens do not depend on which other requests share the step.
+         * The request owns runner slot `slot` (its KV sequence) for its whole
+         * lifetime. It owns its sampler, history and position-keyed RNG, so
+         * its tokens do not depend on which other requests share a step. After
+         * a forward its next-token logits are retained until the request may
+         * decide (unpaced, granted or forced): deferring a position-keyed
+         * decision does not change it.
          */
         struct ServingRowState
         {
             ServingBatchRequest request;
+            int slot = -1;
             Sampler sampler;
             std::size_t prompt_consumed = 0; ///< Prompt tokens already in KV.
-            int cached_tokens = 0;           ///< KV length of this row.
+            int cached_tokens = 0;           ///< KV length of this slot.
             int completion_tokens = 0;
-            int32_t last_token = 0;
+            int32_t last_token = 0;          ///< Last committed token.
+            bool needs_feed = false;         ///< last_token is not yet in KV.
+            bool has_logits = false;         ///< next_logits holds the next decision.
+            std::vector<float> next_logits;
+            int grant = 0;                   ///< Paced tokens still allowed.
+            std::deque<int32_t> forced;      ///< Tokens to commit instead of sampling.
             bool cancelled = false;
         };
-        /** @brief Resident rows, compact; index is the runner slot. */
+        /** @brief Resident requests (any order); each owns its slot. */
         std::vector<ServingRowState> serving_rows_;
+        /** @brief Slot occupancy of the session. */
+        std::vector<bool> serving_slot_busy_;
         /** @brief Submitted requests waiting for a free slot (FIFO). */
         std::deque<ServingBatchRequest> serving_queue_;
         /** @brief Cancellation intents not yet applied. */
         std::vector<std::uint64_t> serving_cancellations_;
+        /** @brief Grants/forced tokens received while the request was queued. */
+        std::map<std::uint64_t, int> pending_serving_grants_;
+        std::map<std::uint64_t, std::vector<int32_t>> pending_serving_forced_;
         int serving_capacity_ = 0;
         bool serving_active_ = false;
-        /** @brief Max prompt tokens one entering row adds per shared step. */
+        /** @brief Max prompt tokens one entering request adds per shared step. */
         static constexpr int kServingPrefillChunk = 64;
         bool batched_decode_active_{false};
         int decode_step_token_budget_{0};                               // Optional per-step cap used by generate(); 0 means unlimited

@@ -200,4 +200,60 @@ namespace llaminar2::test
         EXPECT_LT(batched.at(2).tokens.size(), 24u);
         EXPECT_EQ(batched.at(1).tokens, a_solo.tokens);
     }
+    TEST_F(ContinuousBatchingCPU, PacedGrantsAndForcedTokensMatchScalarPath)
+    {
+        // Scalar reference: 3 sampled tokens, one forced token, 4 more.
+        auto paced = makeRequest(1, 11, 64, 0.0f, 1);
+        constexpr int32_t kForced = 151644;
+        runner_->setSamplingParams(paced.sampling);
+        ASSERT_TRUE(runner_->prefill(paced.prompt)) << runner_->lastError();
+        std::vector<int32_t> scalar;
+        for (int i = 0; i < 3; ++i)
+        {
+            const auto step = runner_->decodeStep();
+            ASSERT_TRUE(step.error.empty()) << step.error;
+            scalar.insert(scalar.end(), step.tokens.begin(), step.tokens.end());
+        }
+        const auto forced = runner_->forceDecodeToken(kForced);
+        ASSERT_TRUE(forced.error.empty()) << forced.error;
+        scalar.insert(scalar.end(), forced.tokens.begin(), forced.tokens.end());
+        for (int i = 0; i < 4; ++i)
+        {
+            const auto step = runner_->decodeStep();
+            ASSERT_TRUE(step.error.empty()) << step.error;
+            scalar.insert(scalar.end(), step.tokens.begin(), step.tokens.end());
+        }
+        runner_->clearCache();
+
+        // Batched: the paced request blocks between grants while another
+        // request keeps decoding beside it.
+        paced.paced = true;
+        const auto other = makeRequest(2, 17, 30, 0.0f, 1);
+        const auto other_solo = solo(other);
+        ASSERT_TRUE(runner_->beginServingBatch(kCapacity));
+        ASSERT_TRUE(runner_->submitServingRequest(paced));
+        ASSERT_TRUE(runner_->submitServingRequest(other));
+        runner_->grantServingTokens(1, 3);
+        std::vector<int32_t> got, other_got;
+        auto pump = [&](int steps) {
+            for (int i = 0; i < steps; ++i)
+                for (const auto &event : runner_->stepServingBatch())
+                {
+                    auto &sink = event.id == 1 ? got : other_got;
+                    sink.insert(sink.end(), event.tokens.begin(), event.tokens.end());
+                }
+        };
+        pump(8);
+        EXPECT_EQ(got.size(), 3u) << "paced request must block after its grant";
+        runner_->forceServingToken(1, kForced);
+        pump(2);
+        EXPECT_EQ(got.size(), 4u);
+        runner_->grantServingTokens(1, 4);
+        pump(40);
+        runner_->cancelServingRequest(1);
+        pump(1);
+        runner_->endServingBatch();
+        EXPECT_EQ(got, scalar);
+        EXPECT_EQ(other_got, other_solo.tokens);
+    }
 } // namespace llaminar2::test
