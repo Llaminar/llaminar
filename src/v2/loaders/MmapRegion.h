@@ -21,6 +21,7 @@
  *   }
  */
 
+#include "utils/NUMATopology.h"
 #include "utils/HostPageSize.h"
 #include "../utils/DebugEnv.h"
 #include "../utils/Logger.h"
@@ -583,7 +584,7 @@ namespace llaminar2
             // follows faulting-task/system policy and any existing cached pages,
             // not a VMA-locality guarantee from mbind. Binding must not imply
             // whole-file prefault or let an invalid node bypass validation.
-            if (numa_bind)
+            if (numa_bind && !nonNUMAKernelSingleNode(numa_node))
             {
                 if (numa_available() < 0)
                 {

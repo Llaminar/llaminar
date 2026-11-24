@@ -25,6 +25,17 @@
 
 namespace llaminar2
 {
+    /**
+     * @brief True on a kernel built without NUMA support (no sysfs node
+     *        directory): the single implicit node 0 is the whole machine, so
+     *        node-0 placement needs no policy binding.
+     */
+    inline bool nonNUMAKernelSingleNode(int numa_node) noexcept
+    {
+        return numa_node == 0 &&
+               !std::filesystem::exists("/sys/devices/system/node/online");
+    }
+
 
     /** @brief One actual hwloc core with independent OS and MPI logical identities. */
     struct MPICorePlacement

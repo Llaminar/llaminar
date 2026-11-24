@@ -9,6 +9,7 @@
  * @author David Sanftenberg
  */
 
+#include "utils/NUMATopology.h"
 #include "CPUBackend.h"
 #include "../utils/OpenMPUtils.h"
 #include "HostMemoryCapacity.h"
@@ -38,7 +39,10 @@ namespace llaminar2
         : local_numa_node_(local_numa_node)
     {
         // Validate NUMA node if specified
-        if (local_numa_node_ >= 0)
+        // A kernel without NUMA support has no node directory at all; its
+        // implicit node 0 is the whole machine and needs no binding.
+        const bool non_numa_kernel_node0 = nonNUMAKernelSingleNode(local_numa_node_);
+        if (local_numa_node_ >= 0 && !non_numa_kernel_node0)
         {
             if (numa_available() == -1)
             {
@@ -172,7 +176,7 @@ namespace llaminar2
             return nullptr;
         }
 
-        if (local_numa_node_ >= 0)
+        if (local_numa_node_ >= 0 && !nonNUMAKernelSingleNode(local_numa_node_))
         {
             struct bitmask *nodemask = numa_allocate_nodemask();
             if (!nodemask)

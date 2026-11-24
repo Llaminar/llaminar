@@ -16,6 +16,7 @@
  * @date 2026-01-21
  */
 
+#include "utils/NUMATopology.h"
 #include "NUMAAllocator.h"
 #include "FirstTouchBoundary.h"
 #include "NUMAPageQuery.h"
@@ -91,7 +92,10 @@ namespace llaminar2
     {
         if (numa_available() < 0)
         {
-            LOG_ERROR("NUMAAllocator: libnuma is present but NUMA policy APIs are unavailable");
+            if (nonNUMAKernelSingleNode(0))
+                LOG_INFO("NUMAAllocator: kernel has no NUMA support; node 0 is the whole machine");
+            else
+                LOG_ERROR("NUMAAllocator: libnuma is present but NUMA policy APIs are unavailable");
             numa_available_ = false;
             num_numa_nodes_ = 1;
             allocated_per_node_.resize(1, 0);
@@ -132,6 +136,8 @@ namespace llaminar2
             return getCurrentNUMANode();
         }
 
+        if (!numa_available_ && nonNUMAKernelSingleNode(numa_node))
+            return 0;
         if (!numa_available_)
         {
             LOG_ERROR("NUMAAllocator: NUMA node " << numa_node
@@ -244,6 +250,9 @@ namespace llaminar2
     {
         if (!ptr || bytes == 0)
             return true;
+        // No NUMA kernel: the single implicit node owns every page already.
+        if (!numa_available_ && nonNUMAKernelSingleNode(numa_node))
+            return true;
         if (!numa_available_)
         {
             LOG_ERROR("NUMAAllocator: Cannot prepare an external receive range because NUMA APIs are unavailable");
@@ -275,6 +284,14 @@ namespace llaminar2
     bool NUMAAllocator::firstTouchPageRangeOnNode(
         void *ptr, size_t page_bytes, int numa_node) const
     {
+        // No NUMA kernel: the single implicit node owns every page; first
+        // touch needs no policy window or placement certification.
+        if (!numa_available_ && nonNUMAKernelSingleNode(numa_node))
+        {
+            if (ptr && page_bytes)
+                std::memset(ptr, 0, page_bytes);
+            return ptr != nullptr;
+        }
         if (!ptr || page_bytes == 0 ||
             (reinterpret_cast<uintptr_t>(ptr) % hostPageBytes()) != 0 ||
             (page_bytes % hostPageBytes()) != 0 ||
@@ -444,6 +461,8 @@ namespace llaminar2
             return false;
         }
 
+        if (!numa_available_ && nonNUMAKernelSingleNode(numa_node))
+            return true;
         if (!numa_available_)
         {
             LOG_ERROR("NUMAAllocator: Cannot migrate pages because NUMA policy APIs are unavailable");
