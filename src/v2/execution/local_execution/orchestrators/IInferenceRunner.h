@@ -3173,6 +3173,64 @@ namespace llaminar2
         }
 
         /**
+         * @brief Whether this runner executes continuous-batching serving rows.
+         *
+         * Serving rows are the compact set of resident request slots
+         * `[0, active)`: row `r` owns KV sequence `r`. Each row continues from
+         * its own cached position, so one forward can mix decode rows (one
+         * token) with a prompt chunk of a newly entering request.
+         */
+        virtual bool supportsServingRows() const { return false; }
+
+        /**
+         * @brief One shared forward over the compact active serving rows.
+         *
+         * `rows[r]` holds the tokens row `r` appends at its own position.
+         * After success, servingRowLogits(r) is row `r`'s last-token logits.
+         *
+         * @param rows Token rows for slots `0..rows.size()-1`; none empty.
+         * @return true when the complete forward succeeded.
+         */
+        virtual bool forwardServingRows(const std::vector<std::vector<int>> &rows)
+        {
+            (void)rows;
+            return false;
+        }
+
+        /**
+         * @brief Logits of row @p row's last token from the latest
+         *        forwardServingRows() call (vocabulary-wide host row).
+         */
+        virtual const float *servingRowLogits(int row) const
+        {
+            (void)row;
+            return nullptr;
+        }
+
+        /**
+         * @brief Retire one serving row: its KV/state becomes empty.
+         * @param row Slot index below the runner's batch capacity.
+         */
+        virtual bool resetServingRow(int row)
+        {
+            (void)row;
+            return false;
+        }
+
+        /**
+         * @brief Move a resident row's complete state into an empty slot.
+         *
+         * Keeps active rows compact when a middle row retires. `dst` must be
+         * empty; `src` is empty afterwards.
+         */
+        virtual bool moveServingRow(int src, int dst)
+        {
+            (void)src;
+            (void)dst;
+            return false;
+        }
+
+        /**
          * @brief Whether this runner can initialize a benchmark request batch.
          *
          * Request-batched MTP decode requires every logical request slot to own

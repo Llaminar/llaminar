@@ -97,6 +97,14 @@ namespace llaminar2
              * pointer must remain valid for the lifetime of the captured graph.
              */
             const int32_t *request_sequence_lengths_device = nullptr;
+            /**
+             * @brief Host real length per request for CPU ragged batches.
+             *
+             * A host-owned request batch pads every row to the widest one;
+             * each sequence must append only its own real tokens. Empty means
+             * every row is real (rectangular).
+             */
+            std::vector<int> request_real_lengths_host;
 
             /// [Hybrid mode] Optional output for dequantized V (FP32)
             ITensor *V_dequant_out = nullptr;

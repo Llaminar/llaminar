@@ -22,6 +22,7 @@
 #pragma once
 #include "snapshots/SnapshotInfo.h"
 #include "execution/serving/ServingWindowDecode.h"
+#include "execution/serving/ServingBatch.h"
 
 #include "execution/prefix_cache/PrefixCacheTelemetry.h"
 #include "../../backends/DeviceId.h"
@@ -740,6 +741,51 @@ namespace llaminar2
         }
 
     public:
+        // =================================================================
+        // Continuous-batching serving session (runner-owned lifecycle)
+        // =================================================================
+
+        /**
+         * @brief Maximum resident requests of a serving session, or 0 when
+         *        this runner cannot serve continuous batches.
+         */
+        virtual int servingBatchCapacity() const { return 0; }
+
+        /**
+         * @brief Open the serving session with @p capacity resident slots.
+         * @return false (with lastError()) when unsupported or over capacity.
+         */
+        virtual bool beginServingBatch(int capacity)
+        {
+            (void)capacity;
+            return false;
+        }
+
+        /** @brief Queue one immutable prepared request for admission. */
+        virtual bool submitServingRequest(ServingBatchRequest request)
+        {
+            (void)request;
+            return false;
+        }
+
+        /** @brief Request cancellation; the request retires at the next step. */
+        virtual void cancelServingRequest(std::uint64_t id) { (void)id; }
+
+        /**
+         * @brief Run one shared execution step over every resident request.
+         *
+         * Admits queued requests into free slots, advances all resident
+         * rows in one forward, and retires finished/cancelled rows. Events
+         * carry each request's newly committed tokens and terminal outcome.
+         */
+        virtual std::vector<ServingBatchEvent> stepServingBatch() { return {}; }
+
+        /** @brief True when no request is resident or queued. */
+        virtual bool servingBatchIdle() const { return true; }
+
+        /** @brief Close the session; every resident row must already be retired. */
+        virtual void endServingBatch() {}
+
         /**
          * @brief Full generation loop
          *

@@ -26744,5 +26744,283 @@ bool OrchestrationRunner::publishPhysicalMemoryAuthority()
         return runner_ ? runner_->prefixCacheTelemetrySources() : PrefixCacheTelemetrySources{};
     }
 
+    // =========================================================================
+    // Continuous-batching serving session
+    // =========================================================================
+
+    int OrchestrationRunner::servingBatchCapacity() const
+    {
+        if (!initialization_lifecycle_.readyForInference() || !runner_ ||
+            !runner_->supportsServingRows())
+            return 0;
+        if (mpi_ctx_ && mpi_ctx_->world_size() > 1)
+            return 0;
+        return runner_->batch_size();
+    }
+
+    bool OrchestrationRunner::beginServingBatch(int capacity)
+    {
+        if (serving_active_)
+            return setError("Serving batch session is already open");
+        if (batched_decode_active_)
+            return setError("Serving batch cannot open over a fixed request batch");
+        const int supported = servingBatchCapacity();
+        if (supported <= 0)
+            return setError("Continuous-batching serving is unsupported on this runner");
+        if (capacity <= 0 || capacity > supported)
+            return setError("Serving batch capacity " + std::to_string(capacity) +
+                            " outside the runner's admitted " + std::to_string(supported) + " slots");
+        // Every slot starts empty; the scalar request path is retired for the
+        // session's lifetime because the rows own all live sequence state.
+        runner_->clear_cache();
+        for (int row = 0; row < supported; ++row)
+            if (!runner_->resetServingRow(row))
+                return setError("Serving batch could not reset slot " + std::to_string(row));
+        serving_rows_.clear();
+        serving_rows_.reserve(static_cast<std::size_t>(capacity));
+        serving_queue_.clear();
+        serving_cancellations_.clear();
+        serving_capacity_ = capacity;
+        serving_active_ = true;
+        return true;
+    }
+
+    bool OrchestrationRunner::submitServingRequest(ServingBatchRequest request)
+    {
+        if (!serving_active_)
+            return setError("Serving batch session is not open");
+        if (request.prompt.empty() || request.max_new_tokens <= 0)
+            return setError("Serving request requires a prompt and a positive output budget");
+        const int context = plan_.runtime.max_seq_len > 0 ? plan_.runtime.max_seq_len
+                                                          : config_.max_seq_len;
+        if (static_cast<int>(request.prompt.size()) >= context)
+            return setError("Serving request prompt exceeds the admitted context");
+        serving_queue_.push_back(std::move(request));
+        return true;
+    }
+
+    void OrchestrationRunner::cancelServingRequest(std::uint64_t id)
+    {
+        serving_cancellations_.push_back(id);
+    }
+
+    bool OrchestrationRunner::servingBatchIdle() const
+    {
+        return serving_rows_.empty() && serving_queue_.empty();
+    }
+
+    void OrchestrationRunner::endServingBatch()
+    {
+        for (int row = 0; row < static_cast<int>(serving_rows_.size()); ++row)
+            (void)runner_->resetServingRow(row);
+        serving_rows_.clear();
+        serving_queue_.clear();
+        serving_cancellations_.clear();
+        serving_active_ = false;
+        serving_capacity_ = 0;
+    }
+
+    std::vector<ServingBatchEvent> OrchestrationRunner::stepServingBatch()
+    {
+        std::vector<ServingBatchEvent> events;
+        if (!serving_active_)
+            return events;
+
+        auto event_for = [](const ServingRowState &row, ServingFinishReason finish) {
+            ServingBatchEvent event;
+            event.id = row.request.id;
+            event.finish = finish;
+            event.prompt_tokens = static_cast<int>(row.request.prompt.size());
+            event.completion_tokens = row.completion_tokens;
+            return event;
+        };
+
+        // Cancellation of a queued request completes without touching a slot;
+        // a resident request retires at this step's retirement boundary.
+        for (const std::uint64_t id : serving_cancellations_)
+        {
+            for (auto it = serving_queue_.begin(); it != serving_queue_.end(); ++it)
+                if (it->id == id)
+                {
+                    ServingBatchEvent event;
+                    event.id = id;
+                    event.finish = ServingFinishReason::Cancelled;
+                    event.prompt_tokens = static_cast<int>(it->prompt.size());
+                    events.push_back(std::move(event));
+                    serving_queue_.erase(it);
+                    break;
+                }
+            for (auto &row : serving_rows_)
+                if (row.request.id == id)
+                    row.cancelled = true;
+        }
+        serving_cancellations_.clear();
+
+        // Admission: new requests enter free slots while resident rows keep
+        // decoding. Each owns an immutable resolved seed (position-keyed
+        // draws), so batching never changes its token stream.
+        while (static_cast<int>(serving_rows_.size()) < serving_capacity_ &&
+               !serving_queue_.empty())
+        {
+            ServingRowState row;
+            row.request = std::move(serving_queue_.front());
+            serving_queue_.pop_front();
+            if (row.request.sampling.seed == 0)
+            {
+                std::random_device entropy;
+                unsigned int seed = 0;
+                while (seed == 0)
+                    seed = entropy();
+                row.request.sampling.seed = seed;
+            }
+            row.sampler = Sampler(row.request.sampling.seed);
+            if (row.request.sampling.repetition_penalty != 1.0f)
+                for (const int32_t token : row.request.prompt)
+                    row.sampler.record_prompt_token(token);
+            serving_rows_.push_back(std::move(row));
+        }
+
+        // Retire cancelled rows before execution: no work for them.
+        std::vector<bool> retire(serving_rows_.size(), false);
+        std::vector<ServingFinishReason> finish(serving_rows_.size(), ServingFinishReason::None);
+        for (std::size_t r = 0; r < serving_rows_.size(); ++r)
+            if (serving_rows_[r].cancelled)
+            {
+                retire[r] = true;
+                finish[r] = ServingFinishReason::Cancelled;
+            }
+
+        // One shared ragged forward: decode rows carry their last token;
+        // an entering row carries its next bounded prompt chunk.
+        std::vector<std::vector<int>> rows;
+        rows.reserve(serving_rows_.size());
+        bool any_work = false;
+        for (std::size_t r = 0; r < serving_rows_.size(); ++r)
+        {
+            const ServingRowState &row = serving_rows_[r];
+            std::vector<int> tokens;
+            if (row.prompt_consumed < row.request.prompt.size())
+            {
+                const std::size_t chunk = std::min<std::size_t>(
+                    kServingPrefillChunk, row.request.prompt.size() - row.prompt_consumed);
+                tokens.assign(row.request.prompt.begin() + static_cast<std::ptrdiff_t>(row.prompt_consumed),
+                              row.request.prompt.begin() + static_cast<std::ptrdiff_t>(row.prompt_consumed + chunk));
+            }
+            else
+            {
+                tokens.push_back(row.last_token);
+            }
+            any_work = any_work || !retire[r];
+            rows.push_back(std::move(tokens));
+        }
+
+        // A row retiring this step is still resident in the compact layout, so
+        // it executes one inert step only when other rows need the forward.
+        if (any_work && !rows.empty())
+        {
+            if (!runner_->forwardServingRows(rows))
+            {
+                const std::string error = "Serving forward failed: " + lastError();
+                for (std::size_t r = 0; r < serving_rows_.size(); ++r)
+                {
+                    auto event = event_for(serving_rows_[r], ServingFinishReason::Error);
+                    event.error = error;
+                    events.push_back(std::move(event));
+                    (void)runner_->resetServingRow(static_cast<int>(r));
+                }
+                serving_rows_.clear();
+                return events;
+            }
+            const int vocab = vocabSize();
+            const int context = plan_.runtime.max_seq_len > 0 ? plan_.runtime.max_seq_len
+                                                              : config_.max_seq_len;
+            for (std::size_t r = 0; r < serving_rows_.size(); ++r)
+            {
+                ServingRowState &row = serving_rows_[r];
+                row.cached_tokens += static_cast<int>(rows[r].size());
+                const bool in_prompt = row.prompt_consumed < row.request.prompt.size();
+                if (in_prompt)
+                    row.prompt_consumed += rows[r].size();
+                if (retire[r] || row.prompt_consumed < row.request.prompt.size())
+                    continue; // still streaming its prompt
+                const float *logits = runner_->servingRowLogits(static_cast<int>(r));
+                if (!logits || vocab <= 0)
+                {
+                    retire[r] = true;
+                    finish[r] = ServingFinishReason::Error;
+                    continue;
+                }
+                const int token = sampleHostLogitsAtLogicalPosition(
+                    row.sampler, logits, static_cast<size_t>(vocab), row.request.sampling,
+                    row.cached_tokens);
+                const bool stop = std::find(row.request.stop_tokens.begin(),
+                                            row.request.stop_tokens.end(),
+                                            token) != row.request.stop_tokens.end();
+                ServingBatchEvent event = event_for(row, ServingFinishReason::None);
+                if (stop)
+                {
+                    finish[r] = ServingFinishReason::Stop;
+                    retire[r] = true;
+                }
+                else
+                {
+                    row.sampler.record_token(token);
+                    row.last_token = token;
+                    ++row.completion_tokens;
+                    event.tokens.push_back(token);
+                    event.completion_tokens = row.completion_tokens;
+                    if (row.completion_tokens >= row.request.max_new_tokens ||
+                        row.cached_tokens + 1 >= context)
+                    {
+                        finish[r] = ServingFinishReason::Length;
+                        retire[r] = true;
+                    }
+                }
+                if (!event.tokens.empty())
+                    events.push_back(std::move(event));
+            }
+        }
+
+        // Retirement keeps rows compact: the last resident row moves into the
+        // freed slot, so the next step's rows are again 0..active-1.
+        for (int r = static_cast<int>(serving_rows_.size()) - 1; r >= 0; --r)
+        {
+            if (!retire[static_cast<std::size_t>(r)])
+                continue;
+            events.push_back(event_for(serving_rows_[static_cast<std::size_t>(r)],
+                                       finish[static_cast<std::size_t>(r)]));
+            const int last = static_cast<int>(serving_rows_.size()) - 1;
+            bool ok = true;
+            if (r != last)
+            {
+                ok = runner_->moveServingRow(last, r);
+                serving_rows_[static_cast<std::size_t>(r)] = std::move(serving_rows_.back());
+                retire[static_cast<std::size_t>(r)] = retire[static_cast<std::size_t>(last)];
+                finish[static_cast<std::size_t>(r)] = finish[static_cast<std::size_t>(last)];
+            }
+            else
+            {
+                ok = runner_->resetServingRow(r);
+            }
+            serving_rows_.pop_back();
+            retire.pop_back();
+            finish.pop_back();
+            if (!ok)
+            {
+                // Row state can no longer be trusted: fail every resident row.
+                for (std::size_t q = 0; q < serving_rows_.size(); ++q)
+                {
+                    auto event = event_for(serving_rows_[q], ServingFinishReason::Error);
+                    event.error = "Serving row retirement failed";
+                    events.push_back(std::move(event));
+                    (void)runner_->resetServingRow(static_cast<int>(q));
+                }
+                serving_rows_.clear();
+                break;
+            }
+        }
+        return events;
+    }
+
 } // namespace llaminar2
 #include "execution/mpi_orchestration/IExecutionPlanBuilder.h"

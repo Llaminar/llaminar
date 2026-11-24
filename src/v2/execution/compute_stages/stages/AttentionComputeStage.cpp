@@ -1065,7 +1065,10 @@ namespace llaminar2
                                     &request_v,
                                     &request_kv_len) ||
                                 !request_k || !request_v ||
-                                request_kv_len < params_.seq_len)
+                                request_kv_len <
+                                    (params_.request_real_lengths_host.empty()
+                                         ? params_.seq_len
+                                         : params_.request_real_lengths_host[static_cast<size_t>(request)]))
                             {
                                 LOG_ERROR("[AttentionComputeStage] Native CPU grouped cache retrieval failed"
                                           << " layer=" << params_.layer_idx
@@ -1802,7 +1805,11 @@ namespace llaminar2
                 params_.head_start,
                 params_.gqa_n_rep,
                 params_.execution_policy,
-                cpu_grouped_kv_logical_views_.data());
+                cpu_grouped_kv_logical_views_.data(),
+                params_.request_real_lengths_host.size() ==
+                        static_cast<size_t>(params_.batch_size)
+                    ? params_.request_real_lengths_host.data()
+                    : nullptr);
             if (!success)
             {
                 LOG_ERROR("[AttentionComputeStage] Backend lacks grouped request-cache decode attention"

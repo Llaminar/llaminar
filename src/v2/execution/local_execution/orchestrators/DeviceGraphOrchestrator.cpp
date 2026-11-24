@@ -61432,6 +61432,145 @@ namespace llaminar2
         return true;
     }
 
+    bool DeviceGraphOrchestrator::supportsServingRows() const
+    {
+        // CPU host-owned execution only. Rows are KV sequences 0..active-1, so
+        // compaction moves full-attention KV; recurrent (hybrid) state and the
+        // shifted-MTP cache have no row move yet and fail closed.
+        return state_.isInitialized() && state_.device_id.is_cpu() &&
+               state_.kv_cache != nullptr && state_.mtp_kv_caches.empty() &&
+               dynamic_cast<const IHybridKVCache *>(state_.kv_cache.get()) == nullptr &&
+               (!graph_builder_ || !graph_builder_->config().mtp.enabled);
+    }
+
+    bool DeviceGraphOrchestrator::forwardServingRows(
+        const std::vector<std::vector<int>> &rows)
+    {
+        if (!supportsServingRows())
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Serving rows are unsupported on this runner");
+            return false;
+        }
+        if (rows.empty() || static_cast<int>(rows.size()) > state_.batch_size)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Serving rows " << rows.size()
+                                                               << " outside capacity " << state_.batch_size);
+            return false;
+        }
+        for (size_t row = 0; row < rows.size(); ++row)
+        {
+            const int cached = row < state_.positions.size() ? state_.positions[row] : 0;
+            if (rows[row].empty() ||
+                cached + static_cast<int>(rows[row].size()) > state_.max_seq_len)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Serving row " << row
+                                                                  << " is empty or exceeds the context");
+                return false;
+            }
+        }
+        // The LM head ordinarily computes one row (the last physical row of
+        // the whole batch). Serving needs each row's own last real token, so
+        // select exactly those terminal rows: row b's chunk is padded to the
+        // widest row, hence its terminal is b*width + len_b - 1.
+        int width = 0;
+        for (const auto &row : rows)
+            width = std::max(width, static_cast<int>(row.size()));
+        std::vector<int> terminal_rows;
+        terminal_rows.reserve(rows.size());
+        for (size_t row = 0; row < rows.size(); ++row)
+            terminal_rows.push_back(static_cast<int>(row) * width +
+                                    static_cast<int>(rows[row].size()) - 1);
+        const int row_count = static_cast<int>(rows.size());
+        if (!graph_builder_ || !setComputeAllPositionLogits(true) ||
+            !setComputeRowIndexedAllPositionLogits(true, row_count) ||
+            !graph_builder_->setRowIndexedAllPositionLogitRows(terminal_rows))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Serving rows could not select terminal logits rows");
+            return false;
+        }
+        request_batched_prefill_logits_row_count_ = row_count;
+        // The ragged host-token batch continues every row from its own
+        // position and appends only each row's real tokens.
+        const bool ok = forwardHostTokenBatchImpl(rows, ForwardExecutionRole::MainInference);
+        graph_builder_->setRowIndexedAllPositionLogitRows({});
+        setComputeRowIndexedAllPositionLogits(false, 0);
+        setComputeAllPositionLogits(false);
+        request_batched_prefill_logits_row_count_ = 0;
+        serving_logits_rows_ = ok ? row_count : 0;
+        return ok;
+    }
+
+    const float *DeviceGraphOrchestrator::servingRowLogits(int row) const
+    {
+        if (row < 0 || row >= serving_logits_rows_)
+            return nullptr;
+        const float *base = getAllPositionLogits();
+        return base ? base + static_cast<size_t>(row) * static_cast<size_t>(state_.vocab_size) : nullptr;
+    }
+
+    bool DeviceGraphOrchestrator::resetServingRow(int row)
+    {
+        if (!supportsServingRows() || row < 0 || row >= state_.batch_size)
+            return false;
+        IKVCache::StateResetContext context;
+        context.boundary = IKVCache::StateResetBoundary::SequenceRetirement;
+        context.reason = "serving row retirement";
+        if (!state_.kv_cache->resetSequenceState(row, context))
+            return false;
+        if (row < static_cast<int>(state_.positions.size()))
+            state_.positions[row] = 0;
+        if (row < static_cast<int>(state_.sequence_lengths.size()))
+            state_.sequence_lengths[row] = 0;
+        return true;
+    }
+
+    bool DeviceGraphOrchestrator::moveServingRow(int src, int dst)
+    {
+        if (!supportsServingRows() || src == dst || src < 0 || dst < 0 ||
+            src >= state_.batch_size || dst >= state_.batch_size)
+            return false;
+        IKVCache &cache = *state_.kv_cache;
+        const int tokens = src < static_cast<int>(state_.positions.size()) ? state_.positions[src] : 0;
+        if (!resetServingRow(dst))
+            return false;
+        if (tokens > 0)
+        {
+            std::vector<uint8_t> k_payload;
+            std::vector<uint8_t> v_payload;
+            for (int offset = 0; offset < cache.n_layers(); ++offset)
+            {
+                const int layer = cache.first_layer_index() + offset;
+                const auto layout = cache.logicalBlockLayout(layer, tokens);
+                k_payload.resize(layout.k_bytes);
+                v_payload.resize(layout.v_bytes);
+                IKVCache::KVCacheLogicalBlockDescriptor desc;
+                desc.layer = layer;
+                desc.seq_idx = src;
+                desc.logical_token_start = 0;
+                desc.token_count = tokens;
+                if (!cache.exportLogicalBlock(desc, k_payload.data(), v_payload.data()))
+                {
+                    LOG_ERROR("[DeviceGraphOrchestrator] Serving row move export failed layer=" << layer);
+                    return false;
+                }
+                desc.seq_idx = dst;
+                if (!cache.importLogicalBlock(desc, k_payload.data(), v_payload.data()))
+                {
+                    LOG_ERROR("[DeviceGraphOrchestrator] Serving row move import failed layer=" << layer);
+                    return false;
+                }
+            }
+        }
+        if (dst >= static_cast<int>(state_.positions.size()))
+            state_.positions.resize(dst + 1, 0);
+        if (dst >= static_cast<int>(state_.sequence_lengths.size()))
+            state_.sequence_lengths.resize(dst + 1, 0);
+        state_.positions[dst] = tokens;
+        state_.sequence_lengths[dst] =
+            src < static_cast<int>(state_.sequence_lengths.size()) ? state_.sequence_lengths[src] : tokens;
+        return resetServingRow(src);
+    }
+
     const float *DeviceGraphOrchestrator::getLogits(int seq_idx) const
     {
         if (!state_.logits)

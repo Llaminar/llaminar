@@ -62,6 +62,7 @@
 #include <string_view>
 #include <unordered_map>
 #include <utility>
+#include <deque>
 #include <vector>
 
 namespace llaminar2
@@ -305,6 +306,13 @@ namespace llaminar2
         GenerationResult forceDecodeToken(int32_t token) override;
         bool supportsDecodeStepBatch(int request_batch) const override;
         GenerationBatchResult decodeStepBatch(int request_batch) override;
+        int servingBatchCapacity() const override;
+        bool beginServingBatch(int capacity) override;
+        bool submitServingRequest(ServingBatchRequest request) override;
+        void cancelServingRequest(std::uint64_t id) override;
+        std::vector<ServingBatchEvent> stepServingBatch() override;
+        bool servingBatchIdle() const override;
+        void endServingBatch() override;
         GenerationResult generate(
             const std::vector<int32_t> &prompt_tokens,
             int max_new_tokens,
@@ -2343,6 +2351,35 @@ namespace llaminar2
             bool is_complete = false;
         };
         std::vector<BatchedDecodeRequestState> batched_request_states_;
+
+        /**
+         * @brief One resident request of the continuous-batching session.
+         *
+         * Row index == runner slot == KV sequence. Rows stay compact
+         * (`[0, active)`): retiring a middle row moves the last row into it.
+         * Every row owns its sampler, history and position-keyed RNG, so its
+         * tokens do not depend on which other requests share the step.
+         */
+        struct ServingRowState
+        {
+            ServingBatchRequest request;
+            Sampler sampler;
+            std::size_t prompt_consumed = 0; ///< Prompt tokens already in KV.
+            int cached_tokens = 0;           ///< KV length of this row.
+            int completion_tokens = 0;
+            int32_t last_token = 0;
+            bool cancelled = false;
+        };
+        /** @brief Resident rows, compact; index is the runner slot. */
+        std::vector<ServingRowState> serving_rows_;
+        /** @brief Submitted requests waiting for a free slot (FIFO). */
+        std::deque<ServingBatchRequest> serving_queue_;
+        /** @brief Cancellation intents not yet applied. */
+        std::vector<std::uint64_t> serving_cancellations_;
+        int serving_capacity_ = 0;
+        bool serving_active_ = false;
+        /** @brief Max prompt tokens one entering row adds per shared step. */
+        static constexpr int kServingPrefillChunk = 64;
         bool batched_decode_active_{false};
         int decode_step_token_budget_{0};                               // Optional per-step cap used by generate(); 0 means unlimited
         bool mpi_coordinated_mode_{false};

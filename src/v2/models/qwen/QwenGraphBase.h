@@ -521,6 +521,8 @@ namespace llaminar2
         ModelWeightBindings weight_bindings_;
         ModelWeightBindings decode_replicated_dense_weight_bindings_;
         ModelBuffers buffers_;
+        /** @brief Real per-request lengths of the CPU host-token batch being built. */
+        std::vector<int> host_request_real_lengths_;
         StageSnapshotCallback snapshot_callback_;
         bool decode_replicated_dense_graph_active_ = false;
         bool mtp_replicated_dense_graph_active_ = false;

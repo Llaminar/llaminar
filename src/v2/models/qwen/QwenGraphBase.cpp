@@ -2269,6 +2269,13 @@ namespace llaminar2
             *this,
             input.execution_phase);
         DecodeReplicatedDenseScope decode_dense_scope(*this, total_tokens);
+        // CPU host-token request batches pad rows to the widest one; KV append
+        // must copy only each request's real tokens (this graph's lengths).
+        host_request_real_lengths_.clear();
+        if (input.device.is_cpu() && input.batch_size > 1 && input.sequence_lengths &&
+            input.execution_role == ForwardExecutionRole::MainInference &&
+            static_cast<int>(input.sequence_lengths->size()) == input.batch_size)
+            host_request_real_lengths_ = *input.sequence_lengths;
 
         LOG_DEBUG("[QwenGraphBase] Building full forward graph: "
                   << "batch_size=" << input.batch_size
@@ -5060,6 +5067,10 @@ namespace llaminar2
                                       : KVCacheAppendSemantics::Standard,
                               .request_sequence_lengths_device =
                                   kv_append_lengths_device,
+                              .request_real_lengths_host =
+                                  device.is_cpu() && batch_size > 1
+                                      ? host_request_real_lengths_
+                                      : std::vector<int>{},
                               .kv_cache_scale_k = config_.kv_cache_scale_k,
                               .kv_cache_scale_v = config_.kv_cache_scale_v,
                               .head_dim = config_.head_dim,
@@ -5273,6 +5284,9 @@ namespace llaminar2
             attn_params.batch_size = batch_size;
             attn_params.seq_len = seq_len;
             attn_params.kv_len = kv_len;
+            if (device.is_cpu() && batch_size > 1 &&
+                static_cast<int>(host_request_real_lengths_.size()) == batch_size)
+                attn_params.request_real_lengths_host = host_request_real_lengths_;
             attn_params.n_heads = local_n_heads;
             /*
              * Phase-split prefill seeds an unsharded cache so replicated decode

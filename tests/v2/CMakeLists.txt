@@ -19635,6 +19635,27 @@ add_v2_test(V2_Integration_StageDumpIntegrity
     LABELS "V2;Integration;StageDump;Debug;Infrastructure"
 )
 
+# Test: real-model continuous batching on CPU (requires LLAMINAR_CB_TEST_MODEL)
+add_executable(v2_integration_continuous_batching_cpu
+    integration/serving/Test__ContinuousBatchingCPU.cpp
+    integration/mpi_gtest_main.cpp
+)
+target_include_directories(v2_integration_continuous_batching_cpu PRIVATE
+    ${CMAKE_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+target_link_libraries(v2_integration_continuous_batching_cpu
+    llaminar2_core
+    v2_test_utils
+    GTest::gtest
+    MPI::MPI_CXX
+)
+add_v2_test(V2_Integration_ContinuousBatchingCPU
+    COMMAND $<TARGET_FILE:v2_integration_continuous_batching_cpu>
+    MPI_PROCS 1
+    LABELS "V2;Integration;Serving;ContinuousBatching;CPU"
+)
+
 # Test: Qwen2Pipeline Integration Tests (full pipeline, autoregressive decode, bias validation)
 # Validates end-to-end pipeline functionality including Q/K/V/O bias application
 

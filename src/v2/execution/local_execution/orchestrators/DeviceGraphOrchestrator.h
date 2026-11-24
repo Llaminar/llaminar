@@ -4212,6 +4212,21 @@ namespace llaminar2
          */
         bool forward_batch(const std::vector<std::vector<int>> &token_batches) override;
 
+        /** @brief CPU serving rows: single-device main KV, no MTP, no recurrent state. */
+        bool supportsServingRows() const override;
+
+        /** @brief Ragged forward of the compact active serving rows (CPU). */
+        bool forwardServingRows(const std::vector<std::vector<int>> &rows) override;
+
+        /** @brief Row @p row's last-token logits from the latest serving forward. */
+        const float *servingRowLogits(int row) const override;
+
+        /** @brief Retire one serving row's KV and logical position (CPU). */
+        bool resetServingRow(int row) override;
+
+        /** @brief Move one serving row's KV and position into an empty slot (CPU). */
+        bool moveServingRow(int src, int dst) override;
+
         /**
          * @brief Get logits for a specific sequence in batch
          *
@@ -9554,6 +9569,8 @@ namespace llaminar2
 
         /// Padded sequence length from last forward_batch() call
         int padded_seq_len_ = 0;
+        /** @brief Rows of terminal logits published by the latest serving forward. */
+        int serving_logits_rows_ = 0;
 
         // =========================================================================
         // Snapshot Capture Members

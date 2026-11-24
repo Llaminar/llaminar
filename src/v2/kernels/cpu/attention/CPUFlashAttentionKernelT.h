@@ -1112,7 +1112,8 @@ namespace llaminar2
             int head_start = 0,
             int gqa_n_rep = 0,
             const attention::AttentionExecutionPolicy &execution_policy = {},
-            const attention::AttentionKVLogicalView *kv_logical_views = nullptr) override
+            const attention::AttentionKVLogicalView *kv_logical_views = nullptr,
+            const int *query_rows_by_request = nullptr) override
         {
             (void)mpi_ctx;
             (void)device_idx;
@@ -1149,7 +1150,10 @@ namespace llaminar2
                 if (!K_by_request[request] || !V_by_request[request] ||
                     K_by_request[request]->native_type() != key_type ||
                     V_by_request[request]->native_type() != value_type ||
-                    kv_lens[request] < query_rows ||
+                    (query_rows_by_request &&
+                     (query_rows_by_request[request] <= 0 ||
+                      query_rows_by_request[request] > query_rows)) ||
+                    kv_lens[request] < (query_rows_by_request ? query_rows_by_request[request] : query_rows) ||
                     !kv_logical_views[request].validFor(kv_lens[request]))
                 {
                     LOG_ERROR("[CPUFlashAttentionKernelT] Invalid or heterogeneous native request-batch descriptor"
@@ -1223,18 +1227,32 @@ namespace llaminar2
                 LOG_ERROR("[CPUFlashAttentionKernelT] Native request batch failed whole-batch admission");
                 return false;
             }
+            // Ragged host batches: request r owns only its first real query
+            // rows; its padding rows are zeroed and never attend.
+            int request_query_rows = query_rows;
             const auto run_requests = [&](auto &&launch_request)
             {
                 for (int request = 0; request < request_count; ++request)
                 {
+                    request_query_rows = query_rows_by_request
+                                             ? query_rows_by_request[request]
+                                             : query_rows;
+                    float *request_out = out + static_cast<size_t>(request) * query_stride;
                     if (!launch_request(
                             request,
                             q + static_cast<size_t>(request) * query_stride,
-                            out + static_cast<size_t>(request) * query_stride,
+                            request_out,
                             kv_lens[request],
                             kv_logical_views[request]))
                     {
                         return false;
+                    }
+                    if (request_query_rows < query_rows)
+                    {
+                        const size_t row_elements =
+                            static_cast<size_t>(n_heads) * static_cast<size_t>(head_dim);
+                        std::fill(request_out + static_cast<size_t>(request_query_rows) * row_elements,
+                                  request_out + query_stride, 0.0f);
                     }
                 }
                 return true;
@@ -1261,14 +1279,14 @@ namespace llaminar2
                             key->data(),
                             value->data(),
                             request_output,
-                            query_rows,
+                            request_query_rows,
                             kv_len,
                             n_heads,
                             n_kv_heads,
                             head_dim,
                             causal,
                             window_size,
-                            std::max(0, kv_len - query_rows),
+                            std::max(0, kv_len - request_query_rows),
                             /*mask=*/nullptr,
                             head_start,
                             gqa_n_rep,
@@ -1297,14 +1315,14 @@ namespace llaminar2
                             key->typed_data(),
                             value->typed_data(),
                             request_output,
-                            query_rows,
+                            request_query_rows,
                             kv_len,
                             n_heads,
                             n_kv_heads,
                             head_dim,
                             causal,
                             window_size,
-                            std::max(0, kv_len - query_rows),
+                            std::max(0, kv_len - request_query_rows),
                             head_start,
                             gqa_n_rep,
                             execution_policy,
@@ -1332,14 +1350,14 @@ namespace llaminar2
                             key->typed_data(),
                             value->typed_data(),
                             request_output,
-                            query_rows,
+                            request_query_rows,
                             kv_len,
                             n_heads,
                             n_kv_heads,
                             head_dim,
                             causal,
                             window_size,
-                            std::max(0, kv_len - query_rows),
+                            std::max(0, kv_len - request_query_rows),
                             head_start,
                             gqa_n_rep,
                             execution_policy,
@@ -1353,8 +1371,8 @@ namespace llaminar2
                     int kv_len, const attention::AttentionKVLogicalView &view)
                 {
                     return compute_aq8kv(query, dynamic_cast<const AttentionKeyQ8Tensor *>(K_by_request[request]),
-                        V_by_request[request], result, query_rows, kv_len, n_heads, n_kv_heads, head_dim,
-                        causal, window_size, std::max(0, kv_len - query_rows), head_start, gqa_n_rep,
+                        V_by_request[request], result, request_query_rows, kv_len, n_heads, n_kv_heads, head_dim,
+                        causal, window_size, std::max(0, kv_len - request_query_rows), head_start, gqa_n_rep,
                         execution_policy, view);
                 });
             }
@@ -1379,14 +1397,14 @@ namespace llaminar2
                             key,
                             value,
                             request_output,
-                            query_rows,
+                            request_query_rows,
                             kv_len,
                             n_heads,
                             n_kv_heads,
                             head_dim,
                             causal,
                             window_size,
-                            std::max(0, kv_len - query_rows),
+                            std::max(0, kv_len - request_query_rows),
                             head_start,
                             gqa_n_rep,
                             execution_policy,
@@ -1421,14 +1439,14 @@ namespace llaminar2
                                        key,
                                        value,
                                        request_output,
-                                       query_rows,
+                                       request_query_rows,
                                        kv_len,
                                        n_heads,
                                        n_kv_heads,
                                        head_dim,
                                        causal,
                                        window_size,
-                                       std::max(0, kv_len - query_rows),
+                                       std::max(0, kv_len - request_query_rows),
                                        head_start,
                                        gqa_n_rep,
                                        execution_policy,
@@ -1472,7 +1490,7 @@ namespace llaminar2
                         if (!key || !value)
                             return false;
                         const int position_offset =
-                            std::max(0, kv_len - query_rows);
+                            std::max(0, kv_len - request_query_rows);
                         const std::size_t offset =
                             static_cast<std::size_t>(request) * query_stride * sizeof(float);
                         return compute_prefill_q16kv(
@@ -1480,7 +1498,7 @@ namespace llaminar2
                             key,
                             value,
                             request_output,
-                            query_rows,
+                            request_query_rows,
                             kv_len,
                             n_heads,
                             n_kv_heads,
@@ -1513,7 +1531,7 @@ namespace llaminar2
                 "decode",
                 "cpu",
                 {{"requests", std::to_string(request_count)},
-                 {"query_rows", std::to_string(query_rows)},
+                 {"request_query_rows", std::to_string(request_query_rows)},
                  {"cache_view", "per_request_native_ring"},
                  {"key_type", std::to_string(static_cast<int>(key_type))},
                  {"value_type", std::to_string(static_cast<int>(value_type))},

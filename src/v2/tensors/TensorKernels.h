@@ -2204,6 +2204,9 @@ namespace llaminar2
          *        callers use an all-zero element for a compact tensor rather
          *        than omitting ownership information.
          * @param output Row-major output tensor matching @p Q.
+         * @param query_rows_by_request Optional real query rows per request for
+         *        ragged host batches: request r attends only its first
+         *        `query_rows_by_request[r]` rows; its padding rows are zeroed.
          * @return true only when the grouped implementation executed.
          */
         virtual bool compute_request_batch_decode_equivalent(
@@ -2224,8 +2227,10 @@ namespace llaminar2
             int head_start = 0,
             int gqa_n_rep = 0,
             const attention::AttentionExecutionPolicy &execution_policy = {},
-            const attention::AttentionKVLogicalView *kv_logical_views = nullptr)
+            const attention::AttentionKVLogicalView *kv_logical_views = nullptr,
+            const int *query_rows_by_request = nullptr)
         {
+            (void)query_rows_by_request;
             (void)Q;
             (void)K_by_request;
             (void)V_by_request;
