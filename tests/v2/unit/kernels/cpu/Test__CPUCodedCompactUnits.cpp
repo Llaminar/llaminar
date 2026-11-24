@@ -917,13 +917,10 @@ namespace llaminar2::test
                 ASSERT_EQ(_mm256_extract_epi32(dot, 0) - 4 * 128 * a, 4 * product) << "a=" << a << " w=" << w;
 #endif
 #if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
-                for (const bool compensated : {false, true})
-                {
-                    const auto dot512 = dotExpandedWeights512(_mm512_setzero_si512(),
-                        _mm512_set1_epi8(static_cast<char>(a)), _mm512_set1_epi8(static_cast<char>(w)), compensated);
-                    ASSERT_EQ(_mm_cvtsi128_si32(_mm512_castsi512_si128(dot512)) - 4 * 128 * (compensated ? w : a), 4 * product)
-                        << "a=" << a << " w=" << w << " compensated=" << compensated;
-                }
+                const auto dot512 = dotSignedQ8Weights512(_mm512_setzero_si512(),
+                    _mm512_set1_epi8(static_cast<char>(a)), _mm512_set1_epi8(static_cast<char>(w)));
+                ASSERT_EQ(_mm_cvtsi128_si32(_mm512_castsi512_si128(dot512)) - 4 * 128 * a, 4 * product)
+                    << "a=" << a << " w=" << w;
 #endif
             }
     }
@@ -985,8 +982,8 @@ namespace llaminar2::test
                 std::fill_n(row1.qs, 32, static_cast<std::int8_t>(b));
                 row0.sum_qs = 32 * a;
                 row1.sum_qs = 32 * b;
-                const auto one = dotExpandedBlockAVX2(weights.data(), std::array<const Q8_1Block *, 1>{&row0});
-                const auto two = dotExpandedBlockAVX2(weights.data(), std::array<const Q8_1Block *, 2>{&row0, &row1});
+                const auto one = dotSignedQ8BlockAVX2(weights.data(), std::array<const Q8_1Block *, 1>{&row0});
+                const auto two = dotSignedQ8BlockAVX2(weights.data(), std::array<const Q8_1Block *, 2>{&row0, &row1});
                 ASSERT_EQ(_mm256_extract_epi32(one.values[0], 0), 32 * w * a);
                 ASSERT_EQ(_mm256_extract_epi32(two.values[0], 1), 32 * (-1 - w) * a);
                 ASSERT_EQ(_mm256_extract_epi32(two.values[1], 0), 32 * w * b);
