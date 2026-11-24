@@ -24,7 +24,10 @@
  * - the production SIMD projection equals the scalar codec reference for
  *   1..4 rows, ragged N/K tails and both contiguous and ordered K reductions.
  * - compensation-free nibble and Q8_0 layouts preserve the previous signed
- *   integer dot and per-block output bytes, including coded Q4_K ragged K.
+ *   integer dot and per-block output bytes, including coded Q4_K ragged K;
+ * - every production activation quantizer publishes `sum_qs` equal to the sum
+ *   of its 32 published bytes, which the AVX2/AVX-512 zero-point corrections
+ *   of the compensation-free nibble dots rely on.
  */
 #include <gtest/gtest.h>
 
@@ -923,6 +926,189 @@ namespace llaminar2::test
                     << "a=" << a << " w=" << w;
 #endif
             }
+    }
+
+    namespace
+    {
+        /**
+         * @brief Require a published Q8 block's sum to equal its 32 published bytes.
+         * @param block Publication under test.
+         * @param valid Live source values; every later byte must be zero padding.
+         * @param quantizer Production entry point named in a failure.
+         */
+        void expectExactActivationSum(const Q8_1Block &block, int valid, const std::string &quantizer)
+        {
+            int sum = 0;
+            for (int index = 0; index < 32; ++index)
+            {
+                if (index >= valid)
+                    ASSERT_EQ(block.qs[index], 0) << quantizer << " left padding byte " << index;
+                sum += block.qs[index];
+            }
+            ASSERT_EQ(int(block.sum_qs), sum) << quantizer << " valid=" << valid;
+        }
+
+        /** @return FP32 blocks covering random magnitudes, saturation endpoints, ties, signed zeros and subnormals. */
+        std::vector<std::array<float, 32>> activationSumBlocks()
+        {
+            std::vector<std::array<float, 32>> blocks;
+            std::mt19937 rng(4242);
+            std::uniform_real_distribution<float> unit(-1.0f, 1.0f);
+            for (const float magnitude : {1e-12f, 1e-6f, 1.0f, 3.0f, 1e4f, 1e30f})
+                for (int sample = 0; sample < 64; ++sample)
+                {
+                    std::array<float, 32> block{};
+                    for (auto &value : block)
+                        value = magnitude * unit(rng);
+                    blocks.push_back(block);
+                }
+            const auto add = [&](auto value) {
+                std::array<float, 32> block{};
+                for (int index = 0; index < 32; ++index)
+                    block[index] = value(index);
+                blocks.push_back(block);
+            };
+            add([](int) { return 1.0f; });
+            add([](int) { return -1.0f; });
+            add([](int index) { return index % 2 ? -2.5f : 2.5f; });
+            add([](int index) { return index ? (float(index) - 0.5f) / 127.0f : 1.0f; }); // Near-ties after scaling.
+            add([](int index) { return index < 16 ? 127.5f / 127.0f : -126.5f / 127.0f; });
+            add([](int index) { return index == 7 ? -3.0f : 0.0f; });
+            add([](int index) { return index % 3 ? -0.0f : 0.0f; });
+            add([](int index) { return std::ldexp(float(index - 16), -140); });
+            return blocks;
+        }
+    } // namespace
+
+    /**
+     * @test Every production activation quantizer publishes `sum_qs` equal to its 32 published bytes.
+     *
+     * Production activations are FP32, so CPU NativeQuantised projections
+     * receive Q8_1 rows only from these entry points: the backend-native SIMD
+     * block quantizer and its two-block form, the GPU-aligned expert program,
+     * the row driver and the fused SwiGLU publication. The AVX2 nibble dots use
+     * zero points 12 (MXFP4) and 0 (IQ4_NL/IQ4_XS) where AVX-512 uses 128; the
+     * corrections agree, and equal the signed dot, only for an exact sum. Every
+     * ISA variant compiled into this build is also called directly.
+     */
+    TEST(CPUCompensationFreeUnits, ProductionActivationQuantizersPublishExactSums)
+    {
+        using Policy = CPUProjectionNumericalPolicy;
+        constexpr std::array policies{Policy::BackendNative, Policy::GPUAlignedExpert};
+        const auto blocks = activationSumBlocks();
+        Q8_1Block first{}, second{};
+        const auto dirty = [](Q8_1Block &block) { std::memset(&block, 0x5a, sizeof(block)); };
+        for (const auto &values : blocks)
+        {
+            for (int valid = 0; valid <= 32; ++valid)
+            {
+                dirty(first);
+                simd::quantize_single_block(values.data(), first, valid);
+                expectExactActivationSum(first, valid, "simd::quantize_single_block");
+                dirty(first);
+                simd::quantize_single_block_scalar(values.data(), first, valid);
+                expectExactActivationSum(first, valid, "simd::quantize_single_block_scalar");
+                for (const auto policy : policies)
+                {
+                    // The GPU-aligned program admits only nonempty blocks.
+                    if (valid == 0 && policy == Policy::GPUAlignedExpert)
+                        continue;
+                    dirty(first);
+                    quantizeActivationBlock(values.data(), first, valid, policy);
+                    expectExactActivationSum(first, valid, "quantizeActivationBlock policy=" + std::to_string(int(policy)));
+                }
+                if (valid > 0)
+                {
+                    dirty(first);
+                    cpu::gpu_aligned_expert_q8::quantizeBlock(values.data(), first, valid);
+                    expectExactActivationSum(first, valid, "gpu_aligned_expert_q8::quantizeBlock");
+                }
+            }
+#if defined(__AVX2__)
+            if (cpu_supports_avx2())
+            {
+                dirty(first);
+                simd::quantize_single_block_avx2(values.data(), first);
+                expectExactActivationSum(first, 32, "simd::quantize_single_block_avx2");
+            }
+#endif
+#if defined(__AVX512F__)
+            if (cpu_supports_avx512())
+            {
+                dirty(first);
+                simd::quantize_single_block_avx512(values.data(), first);
+                expectExactActivationSum(first, 32, "simd::quantize_single_block_avx512");
+            }
+#endif
+#if defined(__aarch64__) && defined(__ARM_NEON)
+            dirty(first);
+            simd::quantize_single_block_neon(values.data(), first);
+            expectExactActivationSum(first, 32, "simd::quantize_single_block_neon");
+#endif
+        }
+        // Two-block forms over adjacent pairs, including a zero block beside a live one.
+        for (std::size_t index = 0; index + 1 < blocks.size(); ++index)
+        {
+            std::array<float, 64> pair{};
+            std::copy(blocks[index].begin(), blocks[index].end(), pair.begin());
+            std::copy(blocks[index + 1].begin(), blocks[index + 1].end(), pair.begin() + 32);
+            for (const auto policy : policies)
+            {
+                dirty(first);
+                dirty(second);
+                quantizeTwoActivationBlocks(pair.data(), first, second, policy);
+                expectExactActivationSum(first, 32, "quantizeTwoActivationBlocks first");
+                expectExactActivationSum(second, 32, "quantizeTwoActivationBlocks second");
+            }
+            dirty(first);
+            dirty(second);
+            cpu::gpu_aligned_expert_q8::quantizeTwoBlocks(pair.data(), first, second);
+            expectExactActivationSum(first, 32, "gpu_aligned_expert_q8::quantizeTwoBlocks first");
+            expectExactActivationSum(second, 32, "gpu_aligned_expert_q8::quantizeTwoBlocks second");
+#if defined(__AVX512F__)
+            if (cpu_supports_avx512())
+            {
+                dirty(first);
+                dirty(second);
+                simd::quantize_two_blocks_avx512(pair.data(), first, second);
+                expectExactActivationSum(first, 32, "simd::quantize_two_blocks_avx512 first");
+                expectExactActivationSum(second, 32, "simd::quantize_two_blocks_avx512 second");
+            }
+#endif
+        }
+        // Row drivers over ragged K and the fused SwiGLU publication.
+        constexpr int rows = 3;
+        std::mt19937 rng(77);
+        std::uniform_real_distribution<float> unit(-4.0f, 4.0f);
+        for (const int k : {32, 64, 97, 1000, 1024})
+        {
+            const int k_blocks = (k + 31) / 32;
+            std::vector<float> activation(std::size_t(rows) * k), gate(activation.size()), up(activation.size());
+            for (std::size_t index = 0; index < activation.size(); ++index)
+            {
+                activation[index] = blocks[index / 32 % blocks.size()][index % 32];
+                gate[index] = unit(rng);
+                up[index] = unit(rng);
+            }
+            std::vector<Q8_1Block> published(std::size_t(rows) * k_blocks);
+            for (const auto policy : policies)
+            {
+                SCOPED_TRACE("k=" + std::to_string(k) + " policy=" + std::to_string(int(policy)));
+                std::memset(published.data(), 0x5a, published.size() * sizeof(Q8_1Block));
+                cpu::native_quantised::quantize_activations_to_q8_1(
+                    activation.data(), published.data(), rows, k, k_blocks, policy);
+                for (std::size_t block = 0; block < published.size(); ++block)
+                    expectExactActivationSum(published[block], std::min(32, k - int(block % k_blocks) * 32),
+                        "quantize_activations_to_q8_1");
+                if (k % 32)
+                    continue;
+                std::memset(published.data(), 0x5a, published.size() * sizeof(Q8_1Block));
+                cpu::native_quantised::swiglu_quantize_activations_to_q8_1(
+                    gate.data(), up.data(), published.data(), rows, k, k_blocks, policy);
+                for (const auto &block : published)
+                    expectExactActivationSum(block, 32, "swiglu_quantize_activations_to_q8_1");
+            }
+        }
     }
 
 #if defined(__AVX2__)
