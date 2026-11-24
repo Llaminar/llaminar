@@ -445,7 +445,7 @@ an isolated GPU prefill measurement. This is not the canonical benchmark.
 | Cell | Weights observed (bytes) | Working storage | Movement | Prefill / decode (tok/s) | IDs |
 |---|---|---|---|---:|---|
 | A: CUDA only | 102,989,464,892 B PMA weight admission (99.990% of shard length); 101,354,585,856 B attested in the prepared pool | 734,455,124 B CUDA activation arena incl. state; 1,274,450,200 B allocated CUDA workspace; 0 generic KV payload | Not applicable | 15,306.43 / 12.68 | 768; identical to A at 1M |
-| B: dynamic CUDA+CPU | Dry-run after the UMA fix: 23,903,338,496 B CPU and 71,714,242,560 B CUDA live expert bytes | Passes PMA; live startup rejects adoption of the initial coded GPU slots | No request or transfer ran | — | No stream |
+| B: dynamic CUDA+CPU (Release, #71 `2d333ba6c`, `.80`) | 23,903,338,496 B CPU and 71,710,037,504 B CUDA materialized routed weights | PMA and `ServerReady` pass after both startup fixes | 130 committed live moves; 1,116,078,080 B of coded wire payload at retirement | 22.27 / 4.12 | 768; exact match to both static C runs |
 | C: static CUDA+CPU | 79,090,331,452 B CUDA admission; 77,451,247,360 B attested in the CUDA prepared pools. CPU live weights: **23,903,338,496 B** planned and materialized, exactly **1.000x** source bytes | Same 734,455,124 B primary CUDA activation arena; 1.274 GB CUDA workspace; 39,321,600 B CPU kernel workspace and 317,214,848 B CPU expert arena; 0 generic KV payload | Host ledger empty; 0 windows, transactions, commands and bytes | 30.70 / 5.31 | **Differs from A at index 5** |
 
 `generation_tokens.compare_tokens` reports the first differing completion ID
@@ -466,7 +466,49 @@ byte-identical for matched projection inputs and source weights across CPU,
 CUDA and ROCm (`V2_Integration_CUDA_MoEOverlayCPUArithmeticAllFormats`). It
 does not establish whole-model equality between different execution graph
 families. The drift remains a failed equality check, not an explanation of
-its cause. The exact old #71 (`5b3404439`) cap-192 control was rejected before
+its cause.
+
+A production-graph snapshot diagnostic on `.80` reproduced the same sixth-ID
+split in an eight-token request with the same 67 prompt IDs (A `[19,16,2619,11687,270,12709,344,8295]`,
+C `[19,16,2619,11687,270,27510,344,14817]`). The captured
+prefill embedding, layer 0 FFN input, and layer 0 routing IDs and weights are
+byte-identical. The first unequal published checkpoint is the **layer 0 routed
+expert output, prefill row 0** (the BOS token). Only that row differs at this
+checkpoint: 4,095 of 4,096 values differ, with max absolute error `0.1627693`.
+The route IDs for row 0 are `[222, 245, 35, 53, 254, 200]`. The assembled
+output differs immediately and the layer 1 FFN norm differs in all 67 rows.
+The final prefill logit vector differs (max absolute error `1.738716`, RMSE
+`0.3110376`). Each run also published 4,096 nonfinite elements at the FFN-norm
+checkpoint in each of layers 39–42; that observation is not a parity pass.
+The diagnostic published no intermediate decode checkpoints. A targeted
+layer 0 replay on `.79` captured C's preweighted route bank at the rooted
+reducer. All six BOS slots are populated: four arrive from CPU and two
+are identical to the continuation's local CUDA slots. A left-to-right FP32
+sum reconstructs C's routed output exactly for all 67 rows. A second control
+kept the overlay graph but put all 256 experts on CUDA. Its layer 0 output
+and eight-token response exactly match A. Against C, **401 of 402** weighted
+route rows match byte-for-byte. Only BOS route slot 0 (expert **222**) differs,
+by 4,095 lanes with max absolute error `0.1627693` and RMSE `0.03750190`.
+This rules out C's final route sum and shared-expert combine as the source.
+
+The same original GGUF gate/up IQ2_S and down IQ3_XXS projections and the four
+captured input rows for expert 222 were replayed through `GPUAlignedExpert`
+on old #71 (`5b3404439`, before the #73 merge) and `2d333ba6c`. Hidden Q8,
+gate, up, SwiGLU Q8, down, and weighted output match byte-for-byte across the
+CPU revisions, with the same prepared plane sizes. Both reproduce C's four
+weighted rows exactly at the GGUF clamp of `10.0`. Two pre-clamp BOS
+operands exceeded that limit (`gate max=10.0262651`, `up max=10.1084375`).
+A diagnostic replay changing only the clamp to zero exactly reproduces the
+four live CUDA rows. `launchGroupedImmaPairedGateUpTable` in
+`CUDAMoEGroupedPrefillKernels.cu` instantiates the clamped variant only for
+MXFP4; IQ2_S uses the unclamped variant despite the
+positive layer limit. The CPU representation is not the cause of the first
+divergence. This is a `GPUAlignedExpert` contract bug; it is not cleared by
+`AGENTS.md`'s fixed-reduction or grouped/serial rules. The clamp bug remains
+open. Evidence: `.80:~/dsv4-validation/logs/pr71-snapshot2-{A,C}` and
+`.79:~/dsv4-validation/logs/{pr71-layer0-A,pr71-layer0-A2,pr71-layer0-C,pr71-expert222}`.
+
+The exact old #71 (`5b3404439`) cap-192 control was rejected before
 inference: 123,846,400,836 B demanded versus 115,389,833,216 B in the shared
 pool. With a matched cap of 128, old #71 passed dry-run but failed in
 `buildComputeGraph`: live CPU expert allocation 2,686,976 B exceeded its
@@ -498,6 +540,31 @@ terminal ledger is empty. The semantic transfer helper did not qualify C's
 one new `NV_ERR_NO_MEMORY` kernel warning. These lifetimes are diagnostic
 observations, not passing end-to-end gates.
 
+### Dynamic live wire evidence
+
+Release B's HTTP response retains **120 live moves in 12 waves**
+(**1,030,225,920 B**). Normal retirement captures one additional wave:
+**130 live moves in 13 waves**, 65 promotions and 65 demotions, **390
+transfer pieces** and **1,116,078,080 B**. Each moved expert used exactly
+**8,585,216 B**, the original GGUF size of two 2,686,976 B IQ2_S pieces
+and one 3,211,264 B IQ3_XXS piece. The shared validator joined HTTP and
+retirement ledgers to completed physical transfers and owner publications.
+Release C on the same binary and host completed all 768 IDs exactly like B
+and recorded zero moves. B measured **22.27 prefill / 4.12 decode tok/s**
+versus C's **31.13 / 4.24**. These single requests show no measured Release
+payoff. B exited zero but had one new `NV_ERR_NO_MEMORY` driver warning;
+C exited zero and its driver window was clean.
+
+The separate Integration pair on `.79` also matched all IDs. Its B run
+selected different experts: 112 moves of 8,585,216 B and 18 of 11,665,408 B
+(**1,171,521,536 B** in 390 pieces), all exact matches to the GGUF sizes
+for those layers. Both runs validate completed byte lengths, not contents,
+planner estimates or aligned allocation sizes. `completed_decision_windows`
+reported zero in both B HTTP summaries despite the typed movement proof;
+that scalar does not prove window coverage. The Integration drivers each
+reported one NVIDIA warning. Evidence: `.80:~/dsv4-validation/logs/pr71-2d333ba6-{B,C}-32768-retire`
+and `.79:~/dsv4-validation/logs/pr71-2d333ba6-{B,C}-32768-integration-adoption`.
+
 ### Maximum context and vision
 
 - A on .80 admitted the model maximum **1,048,576** context and generated
@@ -520,11 +587,23 @@ observations, not passing end-to-end gates.
   auxiliary consumer reuse the sealed allocator observation (caps and full
   joint backing unchanged). `V2_Integration_MoEOverlayHostDemandAdmission`
   reproduces the original rejection model-free and passes after the fix.
-  The fixed 32K run on .80 passes dry-run admission, but the live host
-  physical fabric rejects its first IQ3_XXS down projection: the coded
-  header sets `allocation_has_mins=1` while initial-slot adoption tests
-  the legacy reusable descriptor's `has_mins=0`. Per-move wire size and
-  dynamic token equality remain unmeasured.
+  The port `9349a8210` on #73 passed all five focused Spark admission tests.
+  The next startup blocker was the initial IQ3_XXS down projection's coded
+  header (`allocation_has_mins=1`), which adoption compared against the
+  legacy `has_mins=0` descriptor. #73 `7b9206f59` makes initial adoption and
+  reusable slot construction derive the coded layout and phase from the
+  same projection family, with no change to PMA checks. The new device-free
+  `V2_Integration_MoEInitialGpuSlotAdoption` passed on `.79` alongside three
+  admission/residency tests. It checks all 13 coded formats (including a
+  nonzero phase), all per-block formats, and FP16/BF16/FP32 resident descriptors.
+  Both fixes are in #71 (`2d333ba6c`). The post-fix 32K Integration run on
+  `.79` reached `ServerReady` and returned all 768 requested IDs. It used the
+  same request and GPU cap as C, with 64-row base/max maintenance windows
+  and a 65,536-token payoff horizon. On a same-binary Integration comparison
+  on `.79`, B and C matched all 67 prompt and 768 completion IDs. B measured
+  28.39 prefill / 5.49 decode tok/s versus C's 26.75 / 4.25. Each server
+  retired normally, but each driver window had one new NVIDIA warning.
+  These single-request rates are diagnostic, not canonical benchmarks.
 - C on .79 (1M) was killed by the host OOM killer while preparing the
   retained prefill family and had new NVIDIA page-table allocation warnings.
   It did not reach `ServerReady` at that context. Kernel log on .79:
