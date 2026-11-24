@@ -8,12 +8,15 @@
  * before alignment, along with the shared library scratch and mapped redirect.
  * Explicit FP16RNE operands additionally own exactly rows*k half elements;
  * a sequential fused group casts once and shares that bank on its exact stream.
+ * Their fixed-K prefill policy may partition narrow groups; one bounded bank
+ * of partition chains covers every group at that row envelope.
  */
 #pragma once
 #include "interfaces/IWorkspaceConsumer.h"
 #include "kernels/FloatingActivationOperandPrecision.h"
 #include "execution/local_execution/device/WorkspaceDescriptor.h"
 #include "kernels/common/FloatingPointGemmWorkspaceABI.h"
+#include "kernels/cuda/gemm/CUDAFixedKProjectionLaunch.h"
 #include <limits>
 #include <cstdint>
 #include <stdexcept>
@@ -64,7 +67,8 @@ namespace llaminar2::cuda::floating_gemm_workspace
      * @param columns Output width used by the existing redirect declaration.
      * @param k Prepared activation reduction width.
      * @param operand Immutable arithmetic; only FP16RNE needs a half bank.
-     * @return Existing requirements plus exact rows*k*sizeof(uint16_t) when needed.
+     * @return Existing requirements plus exact rows*k*sizeof(uint16_t) and the
+     *         bounded fixed-K partial bank when FP16RNE is requested.
      * @throws std::invalid_argument Half operand geometry is not positive.
      * @throws std::overflow_error Named half bank bytes cannot be represented.
      */
@@ -80,6 +84,10 @@ namespace llaminar2::cuda::floating_gemm_workspace
                 throw std::overflow_error("CUDA FP16 activation operand extent overflow");
             result.buffers.push_back({GemmWorkspaceBuffers::FULL_A_FP16,
                 rows * k * sizeof(std::uint16_t), 256, true});
+            if (rows > static_cast<size_t>(std::numeric_limits<int>::max()))
+                throw std::overflow_error("CUDA fixed-K partial row envelope overflow");
+            result.buffers.push_back({GemmWorkspaceBuffers::FIXED_K_PARTIALS,
+                fixedKHalfPartialBound(static_cast<int>(rows)), 256, true});
         }
         return result;
     }

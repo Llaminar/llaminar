@@ -11,10 +11,12 @@
  * 2. Holds a CuBLASGemmKernel* that does the actual CUDA work
  * 3. Handles tensor type introspection in multiply_tensor()
  * 4. Explicit GDN operand modes preserve fixed serial/verifier row arithmetic. Half A
- *    uses exact named M*K storage, one same-stream cast per fused group;
- *    cuBLAS consumes real half A/B and writes FP32 C with FP32 accumulation.
- *    M1, live verifier rows and fixed columns use the existing fixed FP32 tree;
- *    ordinary M>1 retains BLAS. The FP32 control disables fast downconversion.
+ *    uses exact named M*K storage, one same-stream cast per fused group.
+ *    M1, live verifier rows and fixed columns use the existing fixed FP32 tree.
+ *    Ordinary half M>1 uses the fixed-K tensor-core contract
+ *    (kernels/common/FixedKProjectionContract.h): every prompt row has the same
+ *    bytes for any chunk, bucket or row offset, unlike vendor BLAS whose
+ *    reduction order follows M. The FP32 control disables fast downconversion.
  *
  * @author David Sanftenberg
  * @date January 2026
@@ -30,6 +32,7 @@
 #include "kernels/common/FloatingPointVerifierLaunch.h"
 #include "kernels/common/FloatingPointGemmWorkspaceABI.h"
 #include "CuBLASGemmKernel.h"
+#include "CUDAFixedKProjectionLaunch.h"
 #include "backends/ComputeBackend.h" // DeviceManager
 #include "tensors/Tensors.h"         // FP32Tensor, BF16Tensor, FP16Tensor
 #include "tensors/KernelSnapshotInfo.h"
@@ -757,14 +760,42 @@ namespace llaminar2
                 if (fixed)
                     return multiply_fused_verifier_rows_decode_equivalent(input, projections, m, k, mpi_ctx, effective_workspace);
                 const auto *source = static_cast<const float *>(input->gpu_data_ptr());
-                const void *operand = operand_precision_ == FloatingActivationOperandPrecision::FP16RNE
-                    ? prepareFP16Operand(source, m, k, effective_workspace) : source;
-                // One named half-A publication, then all consumers on this exact
-                // stream. No side stream can overwrite shared stage scratch.
+                if (operand_precision_ == FloatingActivationOperandPrecision::FP16RNE)
+                {
+                    // Bind every immutable owner before the one shared half
+                    // producer; each group of at most eight is one fixed-K launch.
+                    const auto *half_bank = static_cast<const std::uint16_t *>(
+                        effective_workspace->getBuffer(GemmWorkspaceBuffers::FULL_A_FP16));
+                    std::vector<FixedHalfProjectionGroup> groups;
+                    for (size_t first = 0; first < projections.size(); first += floating_gemm_abi::kMaxBatchedProjections)
+                    {
+                        const size_t end = std::min(projections.size(), first + floating_gemm_abi::kMaxBatchedProjections);
+                        const auto bind = [&](size_t index) {
+                            const auto &p = projections[index];
+                            const auto *engine = static_cast<const CUDAFloatingPointGemmKernel *>(p.kernel);
+                            return FixedHalfProjectionGroup::single(half_bank,
+                                static_cast<const std::uint16_t *>(engine->d_weights_),
+                                static_cast<float *>(p.output->gpu_data_ptr()), p.n);
+                        };
+                        auto group = bind(first);
+                        for (size_t index = first + 1; index < end; ++index)
+                        {
+                            const auto next = bind(index);
+                            group.append(next.weight(0), next.output(0), next.columns(0));
+                        }
+                        groups.push_back(group);
+                    }
+                    (void)prepareFP16Operand(source, m, k, effective_workspace);
+                    for (const auto &group : groups)
+                        if (!submitFixedKHalfGroup(group, m, k, effective_workspace))
+                            return false;
+                    return true;
+                }
+                // Strict FP32 operands: one consumer per projection on this exact stream.
                 for (const auto &projection : projections)
                 {
                     auto *kernel = static_cast<CUDAFloatingPointGemmKernel *>(projection.kernel);
-                    if (!kernel->submitOperandProjection(operand,
+                    if (!kernel->submitOperandProjection(source,
                         static_cast<float *>(projection.output->gpu_data_ptr()), m, projection.n, k, effective_workspace))
                         return false;
                 }
@@ -1786,20 +1817,61 @@ namespace llaminar2
                 m <= 0 || n != static_cast<int>(N_) || k != static_cast<int>(K_) ||
                 operand_precision_ == FloatingActivationOperandPrecision::Native)
                 throw std::invalid_argument("CUDA explicit operand GEMM geometry/workspace differs");
+            if (operand_precision_ == FloatingActivationOperandPrecision::FP16RNE)
+                return submitFixedKHalfGroup(FixedHalfProjectionGroup::single(
+                    static_cast<const std::uint16_t *>(input), static_cast<const std::uint16_t *>(d_weights_),
+                    output, n), m, k, workspace);
             cublas_kernel_->bindWorkspace(workspace);
-            const bool half = operand_precision_ == FloatingActivationOperandPrecision::FP16RNE;
-            const bool success = half
-                ? cublas_kernel_->executeFP16AccumulateFP32(input, d_weights_, output, m, n, k)
-                : cublas_kernel_->execute(static_cast<const float *>(input),
-                    static_cast<const float *>(d_weights_), output, m, n, k, false, true, 1.0f, 0.0f);
+            const bool success = cublas_kernel_->execute(static_cast<const float *>(input),
+                static_cast<const float *>(d_weights_), output, m, n, k, false, true, 1.0f, 0.0f);
             if (success)
                 PerfStatsCollector::addCounter("gemm", "cuda_floating_operand_projection_calls", 1.0,
                     "gemm", "cuda:" + std::to_string(cuda_device_id_),
                     {{"m", std::to_string(m)}, {"n", std::to_string(n)}, {"k", std::to_string(k)},
-                     {"activation", half ? "fp16_rne" : "fp32"}, {"weight", half ? "fp16" : "fp32"},
+                     {"activation", "fp32"}, {"weight", "fp32"},
                      {"accumulation", "fp32"}, {"output", "fp32"},
-                     {"compute", half ? "CUBLAS_COMPUTE_32F" : "CUBLAS_COMPUTE_32F_PEDANTIC"},
+                     {"compute", "CUBLAS_COMPUTE_32F_PEDANTIC"},
                      {"route", "cublas_gemm_ex"}});
+            return success;
+        }
+
+        bool CUDAFloatingPointGemmKernel::submitFixedKHalfGroup(
+            const FixedHalfProjectionGroup &group, int m, int k, DeviceWorkspaceManager *workspace)
+        {
+            if (operand_precision_ != FloatingActivationOperandPrecision::FP16RNE || !gpu_stream_ || !workspace ||
+                workspace->device() != DeviceId::cuda(cuda_device_id_) || m <= 0 || k != static_cast<int>(K_))
+                throw std::invalid_argument("CUDA fixed-K half projection requires its prepared geometry and workspace");
+            const auto schedule = selectFixedKHalfSchedule(m, group.totalColumns(), k);
+            float *partials = nullptr;
+            std::size_t partial_bytes = 0;
+            if (fixedKHalfScheduleNeedsPartials(schedule))
+            {
+                // The admitted bank is the policy's bound for this row envelope;
+                // the launch checks the exact extent of this group.
+                if (!workspace->hasBuffer(GemmWorkspaceBuffers::FIXED_K_PARTIALS))
+                    throw std::invalid_argument("CUDA fixed-K half projection lacks its admitted partial bank");
+                partials = static_cast<float *>(workspace->getBuffer(GemmWorkspaceBuffers::FIXED_K_PARTIALS));
+                partial_bytes = workspace->getBufferSize(GemmWorkspaceBuffers::FIXED_K_PARTIALS);
+            }
+            CUDA_KERNEL_PROFILE_SCOPE_STREAM(CUDAKernelType::GEMM_CUBLAS, gpu_stream_);
+            const bool success = launchFixedKHalfProjection(group, m, k, cuda_device_id_, gpu_stream_,
+                schedule, partials, partial_bytes);
+            if (success)
+            {
+                std::string widths;
+                for (int index = 0; index < group.size(); ++index)
+                {
+                    if (index) widths += "+";
+                    widths += std::to_string(group.columns(index));
+                }
+                PerfStatsCollector::addCounter("gemm", "cuda_fixed_k_projection_calls", 1.0,
+                    "gemm", "cuda:" + std::to_string(cuda_device_id_),
+                    {{"m", std::to_string(m)}, {"k", std::to_string(k)}, {"widths", widths},
+                     {"projections", std::to_string(group.size())},
+                     {"schedule", std::string(fixedKHalfScheduleName(schedule))},
+                     {"activation", "fp16_rne"}, {"weight", "fp16"}, {"accumulation", "fp32"},
+                     {"output", "fp32"}, {"route", "fixed_k_tensor_core"}});
+            }
             return success;
         }
 

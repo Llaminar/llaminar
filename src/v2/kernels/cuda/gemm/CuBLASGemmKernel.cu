@@ -238,7 +238,7 @@ namespace llaminar2
             float alpha, float beta)
         {
             if (operand_precision_ == FloatingActivationOperandPrecision::FP16RNE)
-                throw std::invalid_argument("Half operands require the typed half-A/half-B FP32-output API");
+                throw std::invalid_argument("Half operands use the fixed-K projection contract, never cuBLAS");
             const auto submission = device_ctx_->acquireBlasSubmission();
             const auto handle_ = static_cast<cublasHandle_t>(submission.handle());
             if (!handle_)
@@ -354,32 +354,6 @@ namespace llaminar2
                 &beta,
                 d_C, ldc));
 
-            return true;
-        }
-
-        bool CuBLASGemmKernel::executeFP16AccumulateFP32(
-            const void *d_A, const void *d_B, float *d_C, int M, int N, int K)
-        {
-            if (operand_precision_ != FloatingActivationOperandPrecision::FP16RNE || precision_ != Precision::FP16 ||
-                !d_A || !d_B || !d_C || M <= 0 || N <= 0 || K <= 0)
-                throw std::invalid_argument("Explicit half A/B GEMM requires valid FP32-output geometry");
-            const auto submission = device_ctx_->acquireBlasSubmission();
-            const auto handle = static_cast<cublasHandle_t>(submission.handle());
-            if (!handle) throw std::logic_error("Half GEMM has no context cuBLAS handle");
-            const auto stream = static_cast<cudaStream_t>(requireStream("CuBLAS FP16 A/B FP32 accumulation"));
-            CUDA_CHECK(cudaSetDevice(device_id_));
-            CUBLAS_CHECK(cublasSetStream(handle, stream));
-            if (!bindMatmulWorkspace(handle, workspace_)) return false;
-            // Real half operands are already prepared. FP32 C and compute type
-            // prevent the old Hgemm half-output contract. The flag additionally
-            // forbids lower-precision partial reduction even with tensor cores.
-            const auto mode = static_cast<cublasMath_t>(CUBLAS_TENSOR_OP_MATH |
-                CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION);
-            ScopedBlasMathMode math(handle, mode, true);
-            const float alpha = 1.0f, beta = 0.0f;
-            CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K,
-                &alpha, d_B, CUDA_R_16F, K, d_A, CUDA_R_16F, K, &beta,
-                d_C, CUDA_R_32F, N, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
             return true;
         }
 
@@ -849,10 +823,6 @@ namespace llaminar2
         {
             return false;
         }
-
-        bool CuBLASGemmKernel::executeFP16AccumulateFP32(
-            const void *, const void *, float *, int, int, int)
-        { return false; }
 
         bool CuBLASGemmKernel::execute_with_bias(
             const float *, const float *, float *,

@@ -15645,6 +15645,16 @@ add_v2_test(V2_Integration_PrefixCacheCUDAGroupedPhysicalRowsGeneration
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_PrefixCacheCUDAGroupedPhysicalRowsGeneration)
 
+# Fence persisted state from chunk-dependent vendor-BLAS half-operand prefill.
+add_v2_test(V2_Integration_PrefixCacheFixedKHalfPrefillGeneration
+    COMMAND $<TARGET_FILE:v2_test_prefix_cache_fingerprint>
+        --gtest_filter=Test__PrefixCacheFingerprint.FixedKHalfPrefillRejectsV18AndRestartsStably
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;PrefixCache;GatedDeltaNet;CUDA;ROCm;Regression"
+    MPI_PROCS 1 TIMEOUT 30 NO_MODELS NO_MPI
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+    V2_Integration_PrefixCacheFixedKHalfPrefillGeneration)
+
 add_v2_test(V2_Integration_Qwen4ExpHCUpPrefixIdentity
     COMMAND $<TARGET_FILE:v2_test_prefix_cache_fingerprint>
             --gtest_filter=Test__PrefixCacheFingerprint.FlashNextHCUpActivationSeparatesRestarts:Test__PrefixCacheFingerprint.FlashNextHCUpActivationRejectsDuplicateAuthority
@@ -28775,6 +28785,44 @@ if(HAVE_CUDA)
         MPI_PROCS 1
         NO_MODELS
         TIMEOUT 120
+    )
+endif()
+# Issue #74: explicit-operand GDN prefill rows must not depend on prefix-cache
+# chunking, bucket or row offset. Each backend proves its fixed-K schedules
+# and replays the real captured GDN stage under the issue's chunkings.
+if(HAVE_CUDA)
+    add_executable(v2_integration_cuda_fixed_k_prefill_projection
+        integration/kernels/Test__FixedKPrefillProjection.cpp)
+    v2_test_device_scope(v2_integration_cuda_fixed_k_prefill_projection FullInventory)
+    target_compile_definitions(v2_integration_cuda_fixed_k_prefill_projection
+        PRIVATE LLAMINAR_FIXED_K_CUDA=1)
+    target_link_libraries(v2_integration_cuda_fixed_k_prefill_projection
+        llaminar2_core GTest::gtest CUDA::cudart)
+    add_v2_test(V2_Integration_CUDAFixedKPrefillProjection
+        COMMAND $<TARGET_FILE:v2_integration_cuda_fixed_k_prefill_projection>
+        LABELS "V2;Integration;ProductionTestPreflight;CUDA;GDN;GEMM;PrefixCache;GraphCapture;Replay;ByteExact;Regression"
+        MPI_PROCS 1
+        NO_MODELS
+        TIMEOUT 300
+    )
+endif()
+if(HAVE_ROCM)
+    add_executable(v2_integration_rocm_fixed_k_prefill_projection
+        integration/kernels/Test__FixedKPrefillProjection.cpp)
+    v2_test_device_scope(v2_integration_rocm_fixed_k_prefill_projection FullInventory)
+    target_compile_definitions(v2_integration_rocm_fixed_k_prefill_projection
+        PRIVATE __HIP_PLATFORM_AMD__=1)
+    target_link_libraries(v2_integration_rocm_fixed_k_prefill_projection
+        llaminar2_core GTest::gtest hip::host)
+    if(NOT LLAMINAR_SHARED_CORE)
+        target_link_libraries(v2_integration_rocm_fixed_k_prefill_projection rocm_backend)
+    endif()
+    add_v2_test(V2_Integration_ROCmFixedKPrefillProjection
+        COMMAND $<TARGET_FILE:v2_integration_rocm_fixed_k_prefill_projection>
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;GDN;GEMM;PrefixCache;GraphCapture;Replay;ByteExact;Regression"
+        MPI_PROCS 1
+        NO_MODELS
+        TIMEOUT 300
     )
 endif()
 if(HAVE_ROCM)

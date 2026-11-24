@@ -284,6 +284,10 @@ namespace llaminar2
         // is sized before capture and shared only across non-concurrent graphs.
         constexpr const char *CUDA_NATIVE_QUANTISED_PREFILL_CANONICAL_KPART_PARTIALS = "cuda_native_quantised_prefill_canonical_kpart_partials"; ///< serial [kpart × M × N], concurrent [slot × kpart × M × max_N] FP32 partials
         constexpr const char *CUDA_CONCURRENT_PREFILL_ACC_INT32 = "cuda_concurrent_prefill_acc_int32";               ///< per-slot [M × max_N] INT32 accumulator
+
+        // Fixed-K explicit-operand prefill projections publish one FP32 chain per
+        // K partition before their ordered fold; bounded by the schedule policy.
+        constexpr const char *FIXED_K_PARTIALS = "gemm_fixed_k_partials"; ///< [partitions × M × group columns] FP32 partition chains
     }
 
     // =============================================================================

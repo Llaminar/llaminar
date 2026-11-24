@@ -397,6 +397,7 @@ if(HAVE_CUDA)
         kernels/cuda/gemm/CUDANativeQuantisedGemvShard6.cu
         kernels/cuda/gemm/CUDANativeQuantisedGemvShard7.cu
         kernels/cuda/gemm/CUDATinyFP32ProjectionKernels.cu  # deterministic tiny FP32 M<=4 verifier projections
+        kernels/cuda/gemm/CUDAFixedKHalfProjection.cu  # fixed-K chunk-invariant half-RNE prefill projections
         # NativeQuantised prefill is physically sharded by codebook pair, like
         # decode: eight complete, deterministic modules behind one host-only
         # dispatcher that owns the public ABI and the launch-policy state.
