@@ -21,6 +21,7 @@
 
 #pragma once
 #include "snapshots/SnapshotInfo.h"
+#include "execution/serving/ServingWindowDecode.h"
 
 #include "execution/prefix_cache/PrefixCacheTelemetry.h"
 #include "../../backends/DeviceId.h"
@@ -643,6 +644,102 @@ namespace llaminar2
             return GenerationBatchResult{{}, "decodeStepBatch unsupported"};
         }
 
+        /**
+         * @brief Whether the per-row serving-window decode is implemented.
+         *
+         * Continuous batching advances each admitted row by exactly its
+         * intrinsic window under the request's own sampling law, seed and
+         * response budget (design SS5.2/SS6/SS7). Explicit capability, like
+         * request batching: stricter per-row ownership than a loop around
+         * decodeStep().
+         */
+        virtual bool supportsServingWindowDecode() const
+        {
+            return false;
+        }
+
+        /**
+         * @brief Decode one admitted row by exactly its intrinsic window.
+         *
+         * Must honor the row's immutable window geometry and resolved seed;
+         * per-row sampling laws are runtime data (SS6.1), never a recapture
+         * trigger; the result must be row-invariant (identical to the serial
+         * decode of that row under the same law/geometry). Fail-closed: the
+         * base implementation returns the explicit diagnostic; no silent
+         * approximation or automatic alternate path.
+         */
+        /**
+         * @brief Decode one admitted row by exactly its intrinsic window.
+         *
+         * PUBLIC NON-VIRTUAL ENTRY: the ingress checks are MANDATORY for every
+         * implementation - they run before the private virtual dispatch, so an
+         * override can never bypass validation. The implementation must honor
+         * the row's immutable window geometry and resolved seed; per-row
+         * sampling laws are runtime data (SS6.1), never a recapture trigger; the
+         * result must be row-invariant (identical to the serial decode of that
+         * row under the same law/geometry). Fail-closed: the base
+         * implementation returns the explicit diagnostic; no silent
+         * approximation or automatic alternate path.
+         */
+        ServingWindowDecodeResult decodeServingWindow(const ServingWindowDecodeInput &request)
+        {
+            const auto err = servingWindowIngressError(request);
+            if (!err.empty())
+                return ServingWindowDecodeResult::failure(
+                    "invalid serving-window input: " + err);
+            return decodeServingWindowImpl(request);
+        }
+
+    private:
+        /** @brief MANDATORY ingress check (exact named diagnostics). */
+        [[nodiscard]] std::string servingWindowIngressError(
+            const ServingWindowDecodeInput &request) const
+        {
+            const auto &g = request.authority.current();
+            if (!request.authority.mayExecute())
+                return "grant not outstanding/backed";
+            if (g.generation == 0)
+                return "generation zero";
+            if (request.lawNode() == nullptr ||
+                request.lawNode()->admissionIdentity() == 0 ||
+                !request.lawNode()->authenticated() ||
+                request.lawNode()->issueIdentity() == 0 ||
+                request.lawNode()->epoch() == 0 || request.lawNode()->tableToken() == 0 ||
+                request.lawNode()->schemaVersion() == 0 ||
+                request.lawNode()->tableCapacity() == 0)
+                return "admitted law binding not live";
+            if (request.seed == 0)
+                return "resolved seed zero";
+            if (request.transaction_epoch == 0)
+                return "transaction epoch zero";
+            if (request.expected_authority == 0)
+                return "authority identity zero (dead authority)";
+            if (request.authority.authorityIdentity() != request.expected_authority ||
+                g.generation != request.expected_generation ||
+                g.grant_id != request.expected_grant_id ||
+                request.authority.issuanceNonce() != request.expected_nonce)
+                return "stale issuance (authority/generation/grant/nonce pin mismatch)";
+            if (request.window_start >= g.window.response_limit)
+                return "window start at/after response limit";
+            const bool terminal_geometry = servingWindowIsTerminal(
+                request.window_start, g.window.quantum, g.window.response_limit);
+            if (request.final_partial && !terminal_geometry)
+                return "final_partial requires the terminal window";
+            if (request.first_prefill_carry && request.window_start != 0)
+                return "first_prefill_carry requires the first window (start == 0)";
+            return std::string{};
+        }
+
+        /** @brief FAIL-CLOSED implementation seam (subclasses override; the base
+         *         is explicitly unsupported). */
+        virtual ServingWindowDecodeResult decodeServingWindowImpl(
+            const ServingWindowDecodeInput &request)
+        {
+            (void)request;
+            return ServingWindowDecodeResult::failure("serving-window decode unsupported");
+        }
+
+    public:
         /**
          * @brief Full generation loop
          *

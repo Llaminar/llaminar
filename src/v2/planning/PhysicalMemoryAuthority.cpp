@@ -15,6 +15,9 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <random>
+#include <map>
+#include <tuple>
 #include <exception>
 #include <limits>
 #include <mutex>
@@ -302,6 +305,20 @@ namespace llaminar2
          */
         struct PhysicalMemoryReservationState
         {
+            /// UNIQUE AGGREGATE ALLOCATION RECORDS (the authority's own ledger —
+            /// admitted storage, never a separate heap token): serial -> {bytes,
+            /// consumed}. The record is created at reserveAggregate; the token
+            /// holds the serial; the allocator's deallocate (or the token's
+            /// rollback dtor) consumes it ONCE under the state mutex — no F, no
+            /// H, no forgeable raw release (a fake serial has no record).
+            std::uint64_t next_aggregate_serial_ = 1u;
+            std::atomic<std::uint64_t> aggregate_nonce_pool_{0u};
+            std::map<std::uint64_t,
+                     std::tuple<std::size_t, bool, std::uint64_t, std::uint64_t,
+                                std::uint32_t, void *, bool, std::size_t>>
+                aggregate_records_; ///< {bytes, consumed, nonce, receiver, allocs, alloc_ptr, retiring, actual_size}
+            std::uint64_t next_aggregate_receiver_ = 1u;
+
             PhysicalMemoryReservationState(
                 std::shared_ptr<PhysicalMemoryMaterializationState> authority,
                 std::size_t resource_index,
@@ -2810,4 +2827,341 @@ namespace llaminar2
                    << " source_plan_admitted=false";
         return output.str();
     }
+
+    PhysicalMemoryAggregateHandle
+    PhysicalMemoryOwnerReservation::reserveAggregate(std::size_t bytes) const
+    {
+        if (!state_ || bytes == 0u)
+            throw std::invalid_argument(
+                "Aggregate admission requires an open reservation and positive bytes");
+        std::lock_guard lock(state_->authority->mutex);
+        if (state_->authority->phase != PhysicalMemoryAuthorityPhase::Admitted ||
+            !state_->registered)
+            throw std::logic_error(
+                "Ordinary aggregate admission requires published Admitted capacity");
+        const auto node_bytes =
+                                PhysicalMemoryAggregateHandle::aggregateRecordNodeBytes();
+        // #167: the addition is overflow-CHECKED BEFORE computing the charge
+        // (SIZE_MAX wraps to node-1 and would fit an ordinary small reserve —
+        // refused here).
+        if (bytes > std::numeric_limits<std::size_t>::max() - node_bytes)
+            throw std::invalid_argument(
+                "Aggregate admission charge overflows the size domain (#167)");
+        const auto charge = bytes + node_bytes;
+        // #167: the FULL CHECKED CHARGE (bytes + the record node) is validated.
+        if (state_->materialized_bytes > state_->capacity_bytes ||
+            state_->native_preclaimed_bytes > state_->capacity_bytes - state_->materialized_bytes ||
+            charge > state_->capacity_bytes - state_->materialized_bytes -
+                         state_->native_preclaimed_bytes)
+            throw std::logic_error(
+                "Aggregate admission exceeds reserved " +
+                std::string(toString(state_->owner)) + " capacity");
+        if (state_->next_aggregate_serial_ ==
+            std::numeric_limits<std::uint64_t>::max())
+            std::terminate(); // #180: serial exhaustion is fatal (never wrap/reuse)
+        const auto serial = state_->next_aggregate_serial_++;
+        std::random_device rd;
+        const auto nonce = (static_cast<std::uint64_t>(rd()) << 32u) ^
+                           static_cast<std::uint64_t>(rd()) ^
+                           (serial * 6364136223846793005ull); // random per-admission secret
+        const auto receiver = 0u; // TRANSFER-time (the allocator mints it)
+        // #170 (BOTH properties, NO fallible token allocation): the in-lock FIT
+        // + the CHILD PRECLAIM (the debit) + the UNIQUE ALLOCATION RECORD
+        // (serial -> {bytes, false, nonce}) are atomic in this mutex section;
+        // the record's map node is admitted BEFORE the debit (a throwing emplace
+        // leaves NO debit). The token is a stack view of the record.
+        // #170 (BOTH): the CHILD PRECLAIM (debit) FIRST; then the record emplace
+        // (may throw -> the catch rolls the debit back exactly).
+        state_->materialized_bytes += charge;
+        const auto index = static_cast<std::size_t>(state_->owner);
+        state_->authority->claims[state_->resource_index]
+            .new_reservation_materialized[index] += bytes + node_bytes;
+        try
+        {
+            const auto inserted =
+                state_->aggregate_records_.emplace(
+                    serial, std::make_tuple(bytes, false, nonce, receiver, 0u,
+                                            nullptr, false, 0u));
+            if (!inserted.second) // #180: duplicate serial -> never an invalid record
+                std::terminate();
+        }
+        catch (...)
+        {
+            state_->materialized_bytes -= charge;
+            auto &rolled = state_->authority->claims[state_->resource_index]
+                              .new_reservation_materialized[index];
+            if (rolled < charge)
+                std::terminate();
+            rolled -= charge;
+            throw; // exact rollback (no orphaned node charge)
+        }
+        return PhysicalMemoryAggregateHandle(state_, bytes, serial, nonce, 0u);
+    }
+
+    PhysicalMemoryAggregateHandle::PhysicalMemoryAggregateHandle(
+        std::shared_ptr<detail::PhysicalMemoryReservationState> state,
+        std::size_t bytes, std::uint64_t serial, std::uint64_t nonce,
+        std::uint64_t receiver)
+        : state_(std::move(state)), bytes_(bytes), serial_(serial), nonce_(nonce),
+          receiver_(receiver)
+    {
+    }
+
+    PhysicalMemoryAggregateHandle::
+        PhysicalMemoryAggregateHandle(PhysicalMemoryAggregateHandle &&other) noexcept
+        : state_(std::move(other.state_)), bytes_(other.bytes_),
+          serial_(other.serial_), nonce_(other.nonce_), receiver_(other.receiver_),
+          owned_(other.owned_)
+    {
+        other.bytes_ = 0u;
+        other.serial_ = 0u;
+        other.owned_ = false;
+    }
+
+    PhysicalMemoryAggregateHandle &
+    PhysicalMemoryAggregateHandle::operator=(
+        PhysicalMemoryAggregateHandle &&other) noexcept
+    {
+        if (this == &other)
+            return *this; // #178: self-move is a NO-OP
+        consume();
+        state_ = std::move(other.state_);
+        bytes_ = other.bytes_;
+        serial_ = other.serial_;
+        nonce_ = other.nonce_;
+        receiver_ = other.receiver_;
+        owned_ = other.owned_;
+        other.bytes_ = 0u;
+        other.serial_ = 0u;
+        other.receiver_ = 0u;
+        other.owned_ = false;
+        return *this;
+    }
+
+    PhysicalMemoryAggregateHandle::
+        ~PhysicalMemoryAggregateHandle()
+    {
+        // RECORD-AUTHORITATIVE rollback: only while the record's receiver is 0.
+        if (serial_ != 0u && recordReceiver(state(), serial_) == 0u)
+            rollbackRecord(state(), serial_, nonce_);
+    }
+
+    void PhysicalMemoryAggregateHandle::consume() noexcept
+    {
+        rollbackRecord(state(), serial_, nonce_);
+    }
+
+    std::uint64_t PhysicalMemoryAggregateHandle::recordReceiver(
+        const AggregateStateRef &state, std::uint64_t serial)
+    {
+        if (!state.valid() || serial == 0u)
+            return 0u;
+        auto st = state.state_;
+        std::lock_guard lock(st->authority->mutex);
+        auto it = st->aggregate_records_.find(serial);
+        return it == st->aggregate_records_.end() ? 0u : std::get<3>(it->second);
+    }
+
+    bool PhysicalMemoryAggregateHandle::beginRetirement(
+        const AggregateStateRef &state, std::uint64_t serial,
+        std::uint64_t nonce, void *ptr) noexcept
+    {
+        if (!state.valid() || serial == 0u || ptr == nullptr)
+            return false;
+        auto st = state.state_;
+        std::lock_guard lock(st->authority->mutex);
+        auto it = st->aggregate_records_.find(serial);
+        if (it == st->aggregate_records_.end() || std::get<1>(it->second))
+            return false;
+        if (std::get<2>(it->second) != nonce)
+            return false;
+        if (std::get<4>(it->second) != 1u || std::get<5>(it->second) != ptr)
+            return false;
+        if (std::get<6>(it->second))
+            return false;
+        std::get<6>(it->second) = true;
+        return true;
+    }
+
+    PhysicalMemoryAggregateHandle::RecordView
+    PhysicalMemoryAggregateHandle::recordView(
+        const AggregateStateRef &state, std::uint64_t serial) noexcept
+    {
+        if (!state.valid() || serial == 0u)
+            return {};
+        auto st = state.state_;
+        std::lock_guard lock(st->authority->mutex);
+        auto it = st->aggregate_records_.find(serial);
+        if (it == st->aggregate_records_.end())
+            return {};
+        RecordView view;
+        view.bytes = std::get<0>(it->second);
+        view.actual_size = std::get<7>(it->second);
+        view.alloc_ptr = std::get<5>(it->second);
+        view.retiring = std::get<6>(it->second);
+        view.present = true;
+        return view;
+    }
+
+    void PhysicalMemoryAggregateHandle::allocateAdmission(
+        const AggregateStateRef &state, std::uint64_t serial,
+        std::uint64_t nonce, std::size_t actual) noexcept
+    {
+        if (!state.valid() || serial == 0u)
+            return;
+        auto st = state.state_;
+        std::lock_guard lock(st->authority->mutex);
+        auto it = st->aggregate_records_.find(serial);
+        if (it == st->aggregate_records_.end() || std::get<1>(it->second))
+            std::terminate();
+        if (std::get<2>(it->second) != nonce)
+            std::terminate();
+        if (std::get<4>(it->second) != 0u || std::get<5>(it->second) != nullptr)
+            std::terminate();
+        // #149 ENFORCED GEOMETRY BEFORE ALLOCATION: the actual allocation's
+        // requested byte count must fit the admitted charge — checked BEFORE the
+        // fallible operator new (a late termination could not enforce the fit).
+        const auto admitted = std::get<0>(it->second);
+        if (actual > admitted)
+            std::terminate(); // over-admitted actual geometry; no allocation
+        std::get<7>(it->second) = actual;
+        std::get<4>(it->second) = 1u;
+    }
+
+    void PhysicalMemoryAggregateHandle::admitPointer(
+        const AggregateStateRef &state, std::uint64_t serial,
+        std::uint64_t nonce, void *ptr) noexcept
+    {
+        if (!state.valid() || serial == 0u || ptr == nullptr)
+            return;
+        auto st = state.state_;
+        std::lock_guard lock(st->authority->mutex);
+        auto it = st->aggregate_records_.find(serial);
+        if (it == st->aggregate_records_.end() || std::get<1>(it->second))
+            std::terminate();
+        if (std::get<2>(it->second) != nonce)
+            std::terminate();
+        if (std::get<4>(it->second) != 1u || std::get<5>(it->second) != nullptr)
+            std::terminate();
+        std::get<5>(it->second) = ptr;
+    }
+
+    void PhysicalMemoryAggregateHandle::releaseAdmission(
+        const AggregateStateRef &state, std::uint64_t serial,
+        std::uint64_t nonce, void *ptr) noexcept
+    {
+        if (!state.valid() || serial == 0u)
+            return;
+        auto st = state.state_;
+        std::lock_guard lock(st->authority->mutex);
+        auto it = st->aggregate_records_.find(serial);
+        if (it == st->aggregate_records_.end())
+            std::terminate();
+        if (std::get<2>(it->second) != nonce)
+            std::terminate();
+        if (std::get<4>(it->second) != 1u || std::get<5>(it->second) != ptr)
+            std::terminate();
+        std::get<4>(it->second) = 0u;
+        std::get<5>(it->second) = nullptr;
+        std::get<6>(it->second) = false;
+    }
+
+    std::uint64_t PhysicalMemoryAggregateHandle::transferRecord(
+        const AggregateStateRef &state, std::uint64_t serial,
+        std::uint64_t nonce) noexcept
+    {
+        if (!state.valid() || serial == 0u)
+            return 0u;
+        auto st = state.state_;
+        std::lock_guard lock(st->authority->mutex);
+        auto it = st->aggregate_records_.find(serial);
+        if (it == st->aggregate_records_.end() || std::get<1>(it->second))
+            return 0u;
+        if (std::get<2>(it->second) != nonce || std::get<3>(it->second) != 0u)
+            return 0u;
+        std::random_device rd;
+        const auto secret = (static_cast<std::uint64_t>(rd()) << 32u) ^
+                            static_cast<std::uint64_t>(rd()) ^
+                            (serial * 1099511628211ull) | 1ull;
+        std::get<3>(it->second) = secret;
+        return secret;
+    }
+
+    void PhysicalMemoryAggregateHandle::rollbackRecord(
+        const AggregateStateRef &state, std::uint64_t serial,
+        std::uint64_t nonce) noexcept
+    {
+        if (!state.valid() || serial == 0u)
+            return;
+        auto st = state.state_;
+        std::lock_guard lock(st->authority->mutex);
+        auto it = st->aggregate_records_.find(serial);
+        if (it == st->aggregate_records_.end() || std::get<1>(it->second))
+            return;
+        if (std::get<2>(it->second) != nonce || std::get<3>(it->second) != 0u)
+            return;
+        if (std::get<4>(it->second) != 0u || std::get<5>(it->second) != nullptr ||
+            std::get<6>(it->second))
+            return;
+        const auto bytes = std::get<0>(it->second);
+        const auto node_bytes =
+                                PhysicalMemoryAggregateHandle::aggregateRecordNodeBytes();
+        const auto index = static_cast<std::size_t>(st->owner);
+        auto &aggregate =
+            st->authority->claims[st->resource_index]
+                .new_reservation_materialized[index];
+        if (st->materialized_bytes < bytes + node_bytes ||
+            aggregate < bytes + node_bytes)
+            std::terminate();
+        st->aggregate_records_.erase(it);
+        st->materialized_bytes -= bytes + node_bytes;
+        aggregate -= bytes + node_bytes;
+    }
+
+    void PhysicalMemoryAggregateHandle::consumeRecord(
+        const AggregateStateRef &state, std::uint64_t serial,
+        std::uint64_t nonce, std::uint64_t receiver) noexcept
+    {
+        if (!state.valid() || serial == 0u)
+            return;
+        auto st = state.state_;
+        std::lock_guard lock(st->authority->mutex);
+        auto it = st->aggregate_records_.find(serial);
+        if (it == st->aggregate_records_.end())
+            return;
+        if (receiver == 0u)
+            return;
+        if (std::get<2>(it->second) != nonce || std::get<3>(it->second) != receiver)
+            return;
+        if (std::get<1>(it->second))
+            return;
+        if (std::get<6>(it->second))
+        {
+            if (std::get<4>(it->second) != 1u || std::get<5>(it->second) == nullptr)
+                return;
+        }
+        else if (std::get<4>(it->second) != 0u || std::get<5>(it->second) != nullptr)
+        {
+            return;
+        }
+        const auto bytes = std::get<0>(it->second);
+        const auto node_bytes =
+                                PhysicalMemoryAggregateHandle::aggregateRecordNodeBytes();
+        const auto index = static_cast<std::size_t>(st->owner);
+        auto &aggregate =
+            st->authority->claims[st->resource_index]
+                .new_reservation_materialized[index];
+        if (st->materialized_bytes < bytes + node_bytes ||
+            aggregate < bytes + node_bytes)
+            std::terminate();
+        st->aggregate_records_.erase(it);
+        st->materialized_bytes -= bytes + node_bytes;
+        aggregate -= bytes + node_bytes;
+    }
+
+    bool PhysicalMemoryAggregateHandle::valid() const noexcept
+    {
+        return state_ != nullptr && serial_ != 0u;
+    }
+
 } // namespace llaminar2

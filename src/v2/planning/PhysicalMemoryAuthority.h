@@ -778,6 +778,211 @@ namespace llaminar2
      * to new children; existing children retain the committed capacity until
      * the final physical allocation is retired.
      */
+    /**
+     * @brief UNIQUE (move-only) token-free AGGREGATE ADMISSION HANDLE: owns
+     *         the reservation state + the admitted byte count; the canonical
+     *         credit fires at the handle's destruction (the object is shared
+     *         only through shared_ptr — never copied). Used for claims whose
+     *         credit must be returned by the allocation's DEALLOCATOR after the
+     *         storage free. The handle is the single representation (no
+     *         separate claim lease, no per-admission lease object).
+     */
+    /**
+     * @brief UNIQUE (move-only) token-free AGGREGATE ADMISSION HANDLE: owns
+     *         the reservation state + the admitted byte count. The credit
+     *         fires ONLY through the authenticated consume (the authority-side
+     *         record + the random nonce + the TRANSFER secret, minted by the
+     *         reserve block's allocator AFTER the block allocation succeeded —
+     *         a pre-block abandon leaves the record's receiver 0 and the dtor
+     *         rolls back; a post-transfer abandon leaves the record bound to
+     *         the allocator). The token is a STACK view; the allocator state
+     *         is a TYPED opaque capability minted from the authority state (no
+     *         heap H, no heap F, no raw void).
+     */
+/**
+ * @brief UNIQUE (move-only) token-free AGGREGATE ADMISSION HANDLE + a TYPED
+ *         OPAQUE STATE CAPABILITY: the ONLY state representation is the exact
+ *         reservation-state shared handle (detail::PhysicalMemoryReservationState
+ *         — forward-declared; never a raw void in any public signature).
+ */
+    class PhysicalMemoryAggregateHandle final
+    {
+    public:
+        /** @brief TYPED OPAQUE STATE CAPABILITY: minted ONLY from the genuine
+         *         typed authority state (private ctor, friends only) — a
+         *         foreign/erased shared_ptr<void> can NEVER be constructed
+         *         into it; there is no public void-conversion path. */
+        class AggregateStateRef final
+        {
+        public:
+            AggregateStateRef() = default;
+            [[nodiscard]] bool valid() const noexcept { return state_ != nullptr; }
+            [[nodiscard]] const void *stateIdentity() const noexcept
+            {
+                return state_.get();
+            }
+            friend class PhysicalMemoryAggregateHandle;
+            friend class GroupedServingEngine;
+
+        private:
+            explicit AggregateStateRef(
+                std::shared_ptr<detail::PhysicalMemoryReservationState> state)
+                : state_(std::move(state))
+            {
+            }
+            std::shared_ptr<detail::PhysicalMemoryReservationState> state_;
+        };
+
+        PhysicalMemoryAggregateHandle() = default;
+        ~PhysicalMemoryAggregateHandle();
+
+        // #174: move-only.
+        PhysicalMemoryAggregateHandle(const PhysicalMemoryAggregateHandle &) = delete;
+        PhysicalMemoryAggregateHandle &operator=(const PhysicalMemoryAggregateHandle &) = delete;
+        PhysicalMemoryAggregateHandle(PhysicalMemoryAggregateHandle &&other) noexcept;
+        PhysicalMemoryAggregateHandle &operator=(PhysicalMemoryAggregateHandle &&) noexcept;
+        [[nodiscard]] bool valid() const noexcept;
+
+        /** @return This admission's exact own byte amount. */
+        [[nodiscard]] std::size_t bytes() const noexcept { return bytes_; }
+        /** @return This admission's unique record serial (authority-side key). */
+        [[nodiscard]] std::uint64_t serial() const noexcept { return serial_; }
+        /** @return The per-admission secret nonce. */
+        [[nodiscard]] std::uint64_t nonce() const noexcept { return nonce_; }
+
+        /** @return THE typed state capability (the authority-state handle; the
+         *         opaque cap — no raw void, no free-standing ownership). */
+        [[nodiscard]] AggregateStateRef state() const noexcept
+        {
+            return AggregateStateRef(state_);
+        }
+
+        /** @return The state identity (diagnostic/equality key — no ownership). */
+        [[nodiscard]] const void *stateIdentity() const noexcept
+        {
+            return state_.get();
+        }
+
+        /** @brief Owner-path consume (the token's own pending rollback). */
+        void consume() noexcept;
+        /** @brief Authenticated record consume (called by the deallocate
+         *         AFTER the physical free — the exact-p authentication is
+         *         beginRetirement's, NOT this function's; this is not an
+         *         independent physical-free certificate):
+         *         - the nonce and a NONZERO receiver must match the record
+         *           (the transferred secret);
+         *         - a NON-RETIRING outstanding allocation (allocs!=0 /
+         *           recorded pointer) is REFUSED;
+         *         - the EXCLUSIVE-RETIRING state is ACCEPTED (allocs==1 + the
+         *           recorded pointer non-null — the caller's transition);
+         *         - the record node is erased BEFORE the canonical credit. */
+        static void consumeRecord(const AggregateStateRef &state,
+                                  std::uint64_t serial,
+                                  std::uint64_t nonce,
+                                  std::uint64_t receiver) noexcept;
+
+    private:
+        friend class PhysicalMemoryOwnerReservation;
+        friend class GroupedServingEngine;
+        /** @brief Mint + bind the transfer secret (post-allocation; private). */
+        static std::uint64_t transferRecord(const AggregateStateRef &state,
+                                            std::uint64_t serial,
+                                            std::uint64_t nonce) noexcept;
+        /** @brief CURRENT record receiver (0 = pending/untransferred). */
+        static std::uint64_t recordReceiver(const AggregateStateRef &state,
+                                            std::uint64_t serial);
+        /** @brief PRIVATE PENDING-ROLLBACK (the token's own untransferred path):
+         *         consumes ONLY an unallocated pending record (allocs==0,
+         *         no pointer, not retiring) — a live/outstanding/retiring
+         *         record is refused; the node erase precedes the credit. */
+        static void rollbackRecord(const AggregateStateRef &state,
+                                   std::uint64_t serial,
+                                   std::uint64_t nonce) noexcept;
+        /** @brief EXCLUSIVE RETIREMENT TRANSITION (before any physical free):
+         *         atomically marks the record retiring for ITS exact admitting
+         *         pointer (nonce + allocs==1 + ptr match; a pending null or a
+         *         duplicate/retiring record is refused). */
+        static bool beginRetirement(const AggregateStateRef &state,
+                                    std::uint64_t serial,
+                                    std::uint64_t nonce,
+                                    void *ptr) noexcept;
+        /** @brief #149 AUTHENTICATED RECORD VIEW (read-only diagnostic): the
+         *         record's admitted bytes, ACTUAL allocation size, recorded
+         *         pointer and retiring flag — the identity/geometry the
+         *         authority bound to the admission (0/empty for a missing or
+         *         consumed record). */
+        struct RecordView
+        {
+            std::size_t bytes = 0u;
+            std::size_t actual_size = 0u;
+            void *alloc_ptr = nullptr;
+            bool retiring = false;
+            bool present = false;
+        };
+        static RecordView recordView(const AggregateStateRef &state,
+                                     std::uint64_t serial) noexcept;
+
+    public:
+        /** @brief #149 ONE PMA-OWNED TYPED RECORD-NODE CHARGE (the single
+         *         authority-side source consumed by the engine + the tests):
+         *         the aggregate_records_ std::map's rebound node = the 8-byte
+         *         KEY + the 8-field value tuple + the map's 3 pointers + the
+         *         node colour/padding (the observed 104-byte allocator-interface
+         *         REQUEST for this std lib — a request byte count, NOT a heap
+         *         footprint chunk measure). All fit/debit/credit arithmetic
+         *         derives from THIS one expression — no duplicated literals. */
+        static constexpr std::size_t aggregateRecordNodeBytes() noexcept
+        {
+            return sizeof(std::uint64_t) + // the map KEY
+                   sizeof(std::tuple<std::size_t, bool, std::uint64_t,
+                                     std::uint64_t, std::uint32_t, void *, bool,
+                                     std::size_t>) +
+                   3u * sizeof(void *) + // the map node's pointers
+                   8u; // the node colour/padding (observed, platform)
+        }
+
+    private:
+
+        /** @brief #149 PENDING-GEOMETRY admission BEFORE the fallible operator
+         *         new: admits the EXACT requested byte count (the standard's
+         *         allocate_shared n*sizeof(T)) and REFUSES an actual size
+         *         exceeding the admitted charge BEFORE any allocation (a
+         *         throwing new cancels via releaseAdmission(null); a second
+         *         admission under the record is fatal). */
+        static void allocateAdmission(const AggregateStateRef &state,
+                                      std::uint64_t serial,
+                                      std::uint64_t nonce,
+                                      std::size_t actual) noexcept;
+        /** @brief Bind the allocation pointer AFTER the new succeeded (only the
+         *         pending admission may bind). */
+        static void admitPointer(const AggregateStateRef &state,
+                                 std::uint64_t serial,
+                                 std::uint64_t nonce,
+                                 void *ptr) noexcept;
+        /** @brief Release the admission — the ONLY caller is the operator-new
+         *         failure catch (releaseAdmission with the null pointer). The
+         *         SUCCESSFUL path never calls it post-consume: the consume
+         *         ERASES the record (a later release on that key would
+         *         terminate — never invoked). The pointer must match
+         *         (null == the pending cancellation). */
+        static void releaseAdmission(const AggregateStateRef &state,
+                                     std::uint64_t serial,
+                                     std::uint64_t nonce,
+                                     void *ptr) noexcept;
+
+        PhysicalMemoryAggregateHandle(
+            std::shared_ptr<detail::PhysicalMemoryReservationState> state,
+            std::size_t bytes, std::uint64_t serial, std::uint64_t nonce,
+            std::uint64_t receiver);
+
+        std::shared_ptr<detail::PhysicalMemoryReservationState> state_;
+        std::size_t bytes_ = 0u;
+        std::uint64_t serial_ = 0u;
+        std::uint64_t nonce_ = 0u;
+        std::uint64_t receiver_ = 0u;
+        bool owned_ = true;
+    };
+
     class PhysicalMemoryOwnerReservation final
     {
     public:
@@ -795,6 +1000,15 @@ namespace llaminar2
 
         /** @return Whether this handle can issue child allocation claims. */
         [[nodiscard]] bool valid() const noexcept;
+
+        /** @brief TOKEN-FREE AGGREGATE ADMISSION: identical accounting to
+         *         claimAllocation but the returned UNIQUE (move-only) handle
+         *         owns the reservation state; the canonical credit fires at the
+         *         handle's destruction (the engine shares it through shared_ptr
+         *         — never copied), invoked by the allocation's deallocator
+         *         AFTER the storage free. @throws the same bounds diagnostics. */
+        [[nodiscard]] PhysicalMemoryAggregateHandle reserveAggregate(
+            std::size_t bytes) const;
 
         /** @return Exact new-allocation capacity committed to this pool. */
         [[nodiscard]] std::size_t capacityBytes() const noexcept;

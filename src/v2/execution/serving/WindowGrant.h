@@ -18,6 +18,8 @@
 #include "execution/serving/RequestIntrinsicCoordinates.h"
 
 #include <cstdint>
+#include <atomic>
+#include <limits>
 #include <set>
 #include <stdexcept>
 
@@ -106,9 +108,14 @@ namespace llaminar2
         // no per-authority instance state exists to lose or mismatch.
         WindowGrantAuthority(WindowGrantAuthority &&other)
             : grant_(std::move(other.grant_)), used_ids_(std::move(other.used_ids_)),
-              serving_instance_(other.serving_instance_), max_grants_(other.max_grants_)
+              serving_instance_(other.serving_instance_), max_grants_(other.max_grants_),
+              issuance_nonce_(other.issuance_nonce_),
+              authority_identity_(other.authority_identity_)
         {
             other.grant_ = WindowGrant{};
+            other.issuance_nonce_ = 0;      // moved-from identity is dead
+            other.authority_identity_ = 0;
+            other.moved_from_ = true;
         }
         WindowGrantAuthority &operator=(WindowGrantAuthority &&other)
         {
@@ -133,6 +140,12 @@ namespace llaminar2
                     max_grants_ = other.max_grants_;
                 }
                 grant_ = std::move(other.grant_);
+                issuance_nonce_ = other.issuance_nonce_;
+                authority_identity_ = other.authority_identity_;
+                moved_from_ = false; // the destination is a LIVE authority
+                other.issuance_nonce_ = 0;
+                other.authority_identity_ = 0;
+                other.moved_from_ = true;
                 used_ids_ = std::move(other.used_ids_);
                 other.grant_ = WindowGrant{};
             }
@@ -142,12 +155,49 @@ namespace llaminar2
 
         [[nodiscard]] const WindowGrant &current() const noexcept { return grant_; }
         [[nodiscard]] bool mayExecute() const noexcept { return grantMayExecute(grant_); }
+        /** @brief Monotonic per-issue nonce (pins the exact issuance; a
+         *         resolve->reissue with the same generation remains STALE). */
+        [[nodiscard]] std::uint64_t issuanceNonce() const noexcept { return issuance_nonce_; }
+        /** @brief Stable per-authority identity (moves carry it; the input pins
+         *         the FULL binding: authority identity + generation + grant id +
+         *         issuance nonce). */
+        [[nodiscard]] std::uint64_t authorityIdentity() const noexcept
+        {
+            return authority_identity_;
+        }
         /// @brief Bounded never-reused grant identity ledger (default ceiling).
         static constexpr std::size_t kDefaultMaxGrants = 4096;
 
         /** @brief Issue the sole outstanding grant (replace only after resolution). */
         void issue(WindowGrant new_grant)
         {
+            if (moved_from_)
+                throw std::logic_error(
+                    "Moved-from authority cannot issue (identity is dead)");
+            if (authority_identity_ == 0)
+            {
+                // ATOMIC BOUNDED RESERVATION: compare-exchange never wraps and
+                // never reuses: all racing issuers observe the exhaustion at
+                // max-1 and are refused (sticky).
+                auto cur = next_authority_identity_.load(std::memory_order_acquire);
+                bool assigned = false;
+                while (cur < std::numeric_limits<std::uint64_t>::max() - 1)
+                {
+                    if (next_authority_identity_.compare_exchange_weak(
+                            cur, cur + 1, std::memory_order_acq_rel))
+                    {
+                        authority_identity_ = cur + 1;
+                        assigned = true;
+                        break;
+                    }
+                }
+                if (!assigned)
+                {
+                    next_authority_identity_exhausted_.store(true,
+                                                             std::memory_order_release);
+                    throw std::logic_error("Authority identity space exhausted (sticky)");
+                }
+            }
             if (new_grant.grant_id == 0)
                 throw std::logic_error("Grant ID must be nonzero (non-reused identity)");
             if (new_grant.window.quantum == 0)
@@ -173,6 +223,7 @@ namespace llaminar2
             if (!used_ids_.insert(new_grant.grant_id).second)
                 throw std::logic_error("Grant IDs are never reused (already issued)");
             grant_ = new_grant;
+            issuance_nonce_ += 1;
         }
 
         void resolve() { resolveGrant(grant_); }
@@ -180,6 +231,12 @@ namespace llaminar2
 
     private:
         WindowGrant grant_;
+        std::uint64_t issuance_nonce_ = 0;
+        std::uint64_t authority_identity_ = 0; ///< Lazy-assigned ONCE at first issue.
+        bool moved_from_ = false;
+        static inline std::atomic<std::uint64_t> next_authority_identity_{0};
+        static inline std::atomic<bool> next_authority_identity_exhausted_{false};
+        friend struct AuthorityIdentityExhaustionProbe;
         std::uint64_t serving_instance_ = 0;
         std::size_t max_grants_ = kDefaultMaxGrants;
         std::set<std::uint64_t> used_ids_; ///< Bounded never-reused grant identity ledger.
@@ -197,4 +254,8 @@ namespace llaminar2
                 ++value;
         }
     };
+    /** @brief TEST-ONLY exhaustion probe is DEFINED IN TEST CODE (friend only;
+     *         no public rewind controls in production headers). */
+    struct AuthorityIdentityExhaustionProbe; // defined in tests
+
 } // namespace llaminar2

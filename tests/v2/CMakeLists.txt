@@ -44963,11 +44963,28 @@ add_v2_test(V2_Unit_AdmissionGate
     MPI_PROCS 1 NO_MODELS TIMEOUT 30)
 
 add_executable(v2_test_shared_execution_proof unit/execution/serving/Test__SharedExecutionProof.cpp)
-target_link_libraries(v2_test_shared_execution_proof llaminar2_core GTest::gtest GTest::gtest_main)
+target_include_directories(v2_test_shared_execution_proof PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path
+)
+target_link_libraries(v2_test_shared_execution_proof llaminar2_core GTest::gtest GTest::gtest_main GTest::gmock)
 add_v2_test(V2_Unit_SharedExecutionProof
     COMMAND $<TARGET_FILE:v2_test_shared_execution_proof>
     LABELS "V2;Unit;Serving;ContinuousBatching;SharedExecution;Acceptance;Regression"
     MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+
+add_executable(v2_test_serving_window_decode unit/execution/serving/Test__ServingWindowDecode.cpp)
+target_include_directories(v2_test_serving_window_decode PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path
+)
+target_link_libraries(v2_test_serving_window_decode llaminar2_core GTest::gtest GTest::gtest_main GTest::gmock)
+add_v2_test(V2_Unit_ServingWindowDecode
+    COMMAND $<TARGET_FILE:v2_test_serving_window_decode>
+    LABELS "V2;Unit;Serving;ContinuousBatching;WindowDecode;ABI;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_ServingWindowDecodeContract
+    COMMAND $<TARGET_FILE:v2_test_serving_window_decode>
+    LABELS "V2;Integration;ProductionTestPreflight;Serving;ContinuousBatching;WindowDecode;ABI;DeviceFree;Contract;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 60)
 
 add_executable(v2_test_ragged_row_compaction unit/execution/serving/Test__RaggedRowCompaction.cpp)
 target_link_libraries(v2_test_ragged_row_compaction llaminar2_core GTest::gtest GTest::gtest_main)
