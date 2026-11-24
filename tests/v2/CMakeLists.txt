@@ -8538,21 +8538,38 @@ add_v2_test(V2_Unit_KernelFactory
 # OpenMP default. One value owns both the compiled loop and CTest's reservation;
 # concurrent tests must not borrow the other 52 live workers' physical cores.
 set(V2_CPU_GEMM_PARITY_MAX_THREADS 56)
+set(V2_CPU_GEMM_PARITY_PATTERN_GROUPS 4)
 add_executable(v2_test_cpu_quantized_gemm_parity unit/kernels/Test__CPUQuantizedGemmParity.cpp)
 target_compile_definitions(v2_test_cpu_quantized_gemm_parity PRIVATE
-    LLAMINAR_TEST_CPU_GEMM_MAX_THREADS=${V2_CPU_GEMM_PARITY_MAX_THREADS})
+    LLAMINAR_TEST_CPU_GEMM_MAX_THREADS=${V2_CPU_GEMM_PARITY_MAX_THREADS}
+    LLAMINAR_TEST_CPU_GEMM_PATTERN_GROUPS=${V2_CPU_GEMM_PARITY_PATTERN_GROUPS})
 target_link_libraries(v2_test_cpu_quantized_gemm_parity
     llaminar2_core
     GTest::gtest
     GTest::gtest_main
 )
+set(V2_CPU_GEMM_PARITY_LABELS "V2;Unit;Kernels;GEMM;GEMV;Quantization;Parity;DeferredPacking;VNNI;LowThreadCount;Regression")
 add_v2_test(V2_Unit_CPUQuantizedGemmParity
     COMMAND $<TARGET_FILE:v2_test_cpu_quantized_gemm_parity>
-    LABELS "V2;Unit;Kernels;GEMM;GEMV;Quantization;Parity;DeferredPacking;VNNI;LowThreadCount;Regression"
+        --gtest_filter=-AllFormats/CPUQuantizedGemmParity.PatternedInputs/*
+    LABELS "${V2_CPU_GEMM_PARITY_LABELS}"
     MPI_PROCS 1
 )
+set(V2_CPU_GEMM_PARITY_TESTS V2_Unit_CPUQuantizedGemmParity)
+# The patterned sweep is long at full thread width. Shard only its format
+# axis, keeping the original fixture, time budget, and 56-worker reservation.
+math(EXPR V2_CPU_GEMM_PARITY_LAST_GROUP "${V2_CPU_GEMM_PARITY_PATTERN_GROUPS} - 1")
+foreach(V2_CPU_GEMM_PARITY_GROUP RANGE ${V2_CPU_GEMM_PARITY_LAST_GROUP})
+    set(V2_CPU_GEMM_PATTERN_TEST V2_Unit_CPUQuantizedGemmParity_PatternedInputs_Group${V2_CPU_GEMM_PARITY_GROUP})
+    add_v2_test(${V2_CPU_GEMM_PATTERN_TEST}
+        COMMAND $<TARGET_FILE:v2_test_cpu_quantized_gemm_parity>
+            --gtest_filter=AllFormats/CPUQuantizedGemmParity.PatternedInputs/Group${V2_CPU_GEMM_PARITY_GROUP}_*
+        LABELS "${V2_CPU_GEMM_PARITY_LABELS}"
+        MPI_PROCS 1)
+    list(APPEND V2_CPU_GEMM_PARITY_TESTS ${V2_CPU_GEMM_PATTERN_TEST})
+endforeach()
 if(NOT V2_PERF_TESTS_ONLY)
-    set_tests_properties(V2_Unit_CPUQuantizedGemmParity PROPERTIES
+    set_tests_properties(${V2_CPU_GEMM_PARITY_TESTS} PROPERTIES
         PROCESSORS ${V2_CPU_GEMM_PARITY_MAX_THREADS})
 endif()
 
@@ -28575,6 +28592,7 @@ foreach(V2_CPU_BUDGET_TEST IN ITEMS V2_Unit_UnitCpuBudget V2_Integration_UnitCpu
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_unit_cpu_budget.py
             --build-dir ${CMAKE_BINARY_DIR}
             --sweep-threads ${V2_CPU_GEMM_PARITY_MAX_THREADS}
+            --pattern-groups ${V2_CPU_GEMM_PARITY_PATTERN_GROUPS}
             --logical-per-core ${V2_TEST_THREADS_PER_CORE})
     set_tests_properties(${V2_CPU_BUDGET_TEST} PROPERTIES
         LABELS "V2;BuildSystem;CPU;Ownership;Regression;DeviceFree"

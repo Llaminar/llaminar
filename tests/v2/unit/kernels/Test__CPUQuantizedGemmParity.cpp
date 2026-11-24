@@ -962,6 +962,12 @@ namespace
             "IQ4_XS", "IQ3_S", "IQ3_XXS", "IQ2_S", "IQ2_XS", "IQ2_XXS",
             "IQ1_S", "IQ1_M", "MXFP4"),
         [](const ::testing::TestParamInfo<std::string> &info)
-        { return info.param; });
+        {
+            // CTest shards the slow PatternedInputs cases without maintaining a
+            // second format inventory. Every parameter belongs to one group.
+            constexpr int groups = LLAMINAR_TEST_CPU_GEMM_PATTERN_GROUPS;
+            static_assert(groups > 0);
+            return "Group" + std::to_string(info.index % groups) + "_" + info.param;
+        });
 
 } // anonymous namespace
