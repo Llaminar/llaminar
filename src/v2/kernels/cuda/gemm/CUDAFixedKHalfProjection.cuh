@@ -237,27 +237,43 @@ __global__ __launch_bounds__(WM * WN * 32, 1) void fixedKProjectionKernel(
     }
     auto stage = [&](int slot, int block) {
         const int k0 = block * kBlock;
-#pragma unroll
-        for (int i = 0; i < A_SLOTS; ++i)
+        if constexpr (Vector)
         {
-            if constexpr (Vector)
+#pragma unroll
+            for (int i = 0; i < A_SLOTS; ++i)
             {
                 const bool valid = a_ok[i] && k0 + a_k[i] < k;
                 copyAsync16(a_dst[i] + slot * A_STAGE_BYTES, valid ? a_src[i] + k0 : A, valid);
             }
-            else
-                gatherChunk(a_dst[i] + slot * A_STAGE_BYTES, a_src[i] + k0, k0 + a_k[i], k, a_ok[i]);
-        }
 #pragma unroll
-        for (int i = 0; i < B_SLOTS; ++i)
-        {
-            if constexpr (Vector)
+            for (int i = 0; i < B_SLOTS; ++i)
             {
                 const bool valid = b_ok[i] && k0 + b_k[i] < k;
                 copyAsync16(b_dst[i] + slot * B_STAGE_BYTES, valid ? b_src[i] + k0 : A, valid);
             }
-            else
-                gatherChunk(b_dst[i] + slot * B_STAGE_BYTES, b_src[i] + k0, k0 + b_k[i], k, b_ok[i]);
+        }
+        else
+        {
+            // Unaligned K is rare: re-derive each slot instead of keeping its
+            // addresses live, so the gather path adds no register pressure.
+#pragma unroll 1
+            for (int c = threadIdx.x; c < BM * CHUNKS; c += THREADS)
+            {
+                const int row = c / CHUNKS, chunk = c % CHUNKS;
+                const bool ok = m0 + row < m;
+                gatherChunk(sa + slot * A_STAGE_BYTES + swizzledChunk(row, chunk),
+                            A + static_cast<size_t>(ok ? m0 + row : 0) * k + chunk * 8 + k0, k0 + chunk * 8, k, ok);
+            }
+#pragma unroll 1
+            for (int c = threadIdx.x; c < BN * CHUNKS; c += THREADS)
+            {
+                const int row = c / CHUNKS, chunk = c % CHUNKS;
+                const bool ok = c0 + row < total;
+                int local = 0;
+                const int p = ok ? projectionOf(g, c0 + row, local) : 0;
+                gatherChunk(sb + slot * B_STAGE_BYTES + swizzledChunk(row, chunk),
+                            g.weight(p) + static_cast<size_t>(local) * k + chunk * 8 + k0, k0 + chunk * 8, k, ok);
+            }
         }
     };
 

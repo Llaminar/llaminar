@@ -11,6 +11,7 @@
 #include "kernels/cuda/gemm/CUDAFixedKProjectionLaunch.h"
 #include "kernels/cuda/gemm/CUDAFixedKScalarProjection.cuh"
 #include "kernels/common/FixedKScalarProjectionBody.cuh"
+#include "backends/cuda/CUDAHardwareMetadata.h"
 
 #include <array>
 #include <stdexcept>
@@ -67,12 +68,14 @@ namespace llaminar2::cuda
             static thread_local int cached_device = -1, cached_slots = 0;
             if (device_id != cached_device)
             {
-                int sms = 0, per_sm = 0;
+                // SM count comes from the canonical hardware inventory; occupancy
+                // is a property of this compiled kernel on that device.
+                const int sms = cudaHardwareMetadata().at(device_id).sm_count;
+                int per_sm = 0;
                 constexpr int bytes = sgemm::sgemmSharedBytes<128, 128, 16, 3>;
                 auto *kernel = sgemm::sgemmProjectionKernel<128, 128, 8, 8, 16, 3, true, 1>;
                 reserveShared(kernel, bytes);
-                if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device_id) != cudaSuccess ||
-                    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, kernel, 256, bytes) != cudaSuccess ||
+                if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, kernel, 256, bytes) != cudaSuccess ||
                     sms <= 0 || per_sm <= 0)
                     throw std::runtime_error("Fixed-K FP32 projection cannot read device wave geometry");
                 cached_device = device_id;
