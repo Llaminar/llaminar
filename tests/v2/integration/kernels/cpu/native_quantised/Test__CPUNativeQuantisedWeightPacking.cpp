@@ -8,8 +8,9 @@
  * stream from the public IINT8Unpackable contract and require exact equality for
  * every signed Q8 source. Coded integer grids use the native
  * prepared payload and exact metadata, not the older lossy INT8 export.
- * Multi-scale sources retain their native payload and metadata. The complete
- * 22-format catalog checks that every encoding is deterministic across teams.
+ * The compact multi-scale oracle places coded payloads and shared metadata
+ * independently of the production window packer, including ragged headers.
+ * The 22-format catalog checks deterministic packing across teams.
  *
  * The geometry deliberately combines a nonzero tensor-parallel row slice, a
  * partial 64-column output chunk, complete 256-value superblocks, and a trailing
@@ -40,6 +41,7 @@
 #include <thread>
 #include <barrier>
 
+#include "kernels/cpu/gemm/CPUNativeQuantisedCodedMetadata.h"
 #include "kernels/cpu/gemm/CPUNativeQuantisedWeightPacker.h"
 #include "kernels/cpu/gemm/CPUPreparedWeightWriter.h"
 #include "kernels/cpu/gemm/CPUNativeQuantisedGemmKernel.h"
@@ -269,8 +271,8 @@ namespace llaminar2::cpu::native_quantised::test
                     source.get(), parallel, kRowStart, kRowEnd));
             }
 
-            EXPECT_EQ(serial.N, kRowEnd - kRowStart);
-            EXPECT_EQ(serial.N_padded, 128);
+            ASSERT_EQ(serial.N, kRowEnd - kRowStart);
+            ASSERT_EQ(serial.N_padded, 128);
             EXPECT_EQ(serial.blocks_per_row, kK / 32);
             EXPECT_EQ(serial.encoding, parallel.encoding);
             EXPECT_EQ(serial.is_asymmetric, format.metadata->is_asymmetric);
@@ -288,47 +290,60 @@ namespace llaminar2::cpu::native_quantised::test
                 ++compact_formats;
                 const auto *unpackable = dynamic_cast<const IINT8Unpackable *>(source.get());
                 ASSERT_NE(unpackable, nullptr);
-                const int blocks = serial.blocks_per_row;
-                const int bytes = format.metadata->payload_bytes;
-                std::vector<uint8_t> oracle(serial.native_interleaved.size(), 0);
+                constexpr int columns = 64;
+                constexpr int blocks = kK / 32;
+                constexpr int blocks_per_superblock = native_quantised_superblock::kBlocksPerSuperblock;
+                constexpr int superblocks = (blocks + blocks_per_superblock - 1) / blocks_per_superblock;
+                const auto codebook = format.metadata->codebook_id;
+                const int bytes = preparedCompactPayloadBytes(codebook);
+                const int words = preparedCompactPayloadWords(codebook);
+                const int tail = preparedCompactPayloadTailBytes(codebook);
+                const int code_bits = preparedCompactCodeBits(codebook);
+                const int data_stride = columns * bytes;
+                const int unit_stride = data_stride + columns * code_bits / 8;
+                const int header_stride = columns * native_quantised_superblock::superblockFieldBytes(codebook);
+                const int chunk_stride = blocks * unit_stride + superblocks * header_stride;
+                ASSERT_EQ(serial.data_stride, data_stride);
+                ASSERT_EQ(serial.interleaved_block_stride, unit_stride);
+                ASSERT_EQ(serial.superblockHeaderBytes(), header_stride);
+                std::vector<uint8_t> oracle(serial.N_padded / columns * chunk_stride, 0);
                 std::vector<uint8_t> payload(blocks * bytes);
-                std::vector<uint16_t> scales(blocks), secondary(blocks);
-                std::vector<uint32_t> minima(blocks);
-                // The oracle packs whole source rows. It does not reuse the
-                // production CPU packer's one-block destination window.
+                std::vector<uint32_t> codes(blocks), headers(superblocks);
+                // Drive the source codec over a whole row independently of the
+                // production CPU packer's per-superblock destination window.
                 const VnniPackContext context{
                     .raw_bytes = nullptr, .N = 1, .K = kK,
                     .blocks_per_row = blocks, .payload_bytes = bytes,
-                    .payload_array = payload.data(), .scales_array = scales.data(),
-                    .mins_array = secondary.data(), .emins_array = minima.data(),
+                    .payload_array = payload.data(),
+                    .codes_array = codes.data(), .superblocks_array = headers.data(),
                 };
                 for (int column = 0; column < serial.N; ++column)
                 {
                     for (int kb = 0; kb < blocks; ++kb)
                         unpackable->packVnniBlock(context, column + kRowStart, 0, kb);
-                    // Independent unit geometry: whole 32-bit payload words
-                    // per column (256 bytes per word for 64 columns), then
-                    // the primary and secondary FP16 vectors and, for Q2_K
-                    // only, the effective-minimum vector.
-                    const int words = (bytes + 3) / 4;
-                    const int data_stride = words * 256;
-                    const int unit_stride = data_stride + 256 + (format.metadata->has_emins ? 256 : 0);
-                    ASSERT_EQ(serial.data_stride, data_stride);
-                    ASSERT_EQ(serial.interleaved_block_stride, unit_stride);
+                    auto *chunk = oracle.data() + (column / columns) * chunk_stride;
+                    const int lane = column % columns;
                     for (int kb = 0; kb < blocks; ++kb)
                     {
-                        auto *unit = oracle.data() + ((column / 64) * blocks + kb) * unit_stride;
-                        const int local = column % 64;
-                        for (int byte = 0; byte < bytes; ++byte)
-                            unit[(byte / 4) * 256 + local * 4 + byte % 4] = payload[kb * bytes + byte];
-                        std::memcpy(unit + data_stride + local * 2, &scales[kb], 2);
-                        std::memcpy(unit + data_stride + 128 + local * 2, &secondary[kb], 2);
-                        if (format.metadata->has_emins)
-                            std::memcpy(unit + data_stride + 256 + local * 4, &minima[kb], 4);
+                        auto *unit = chunk + kb * unit_stride + (kb / blocks_per_superblock) * header_stride;
+                        const auto *source_payload = payload.data() + kb * bytes;
+                        for (int word = 0; word < words; ++word)
+                            std::memcpy(unit + (word * columns + lane) * 4, source_payload + word * 4, 4);
+                        if (tail)
+                            std::memcpy(unit + words * columns * 4 + lane * tail, source_payload + words * 4, tail);
+                        if (codebook == native_quantised_formats::Q5_K.codebook_id)
+                            coded_metadata::storeQ5HighBits(unit + words * columns * 4, lane, source_payload + words * 4);
+                        if (code_bits)
+                            coded_metadata::storeCode(unit + data_stride, codebook, lane, codes[kb]);
+                    }
+                    for (int sb = 0; sb < superblocks; ++sb)
+                    {
+                        const int end = std::min((sb + 1) * blocks_per_superblock, blocks);
+                        coded_metadata::storeSuperblockWord(
+                            chunk + end * unit_stride + sb * header_stride, codebook, lane, headers[sb]);
                     }
                 }
-                EXPECT_EQ(std::memcmp(serial.native_interleaved.data(), oracle.data(), oracle.size()), 0)
-                    << "native payload/metadata or padded columns differ from whole-row preparation";
+                expectIdenticalBytes(serial.native_interleaved, oracle, format.quant_type);
             }
             if (!serial.usesSignedInt8SingleScale())
                 continue;
