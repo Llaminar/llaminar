@@ -12,7 +12,7 @@
  * - the NEON Q4_K staging (generic reconstruct<5> and, in FP16-arithmetic
  *   envelopes, the fused binary16 reader) equals the codec's staged words bit
  *   for bit, NaN sign and payload included, for every binary16 d/dmin and
- *   every six-bit code;
+ *   every six-bit code, and for mixed per-column d/dmin and 12-bit codes;
  * - the SIMD factor reconstruction equals widening the codec's staged word
  *   (decodeSuperblockMetadata, itself proven against the per-block packer by
  *   V2_Unit_VnniCodedPacking) for every code and a broad d/dmin sweep,
@@ -392,6 +392,64 @@ namespace llaminar2::test
         expectSameBits(actual, q4KCodecBits(), "neon_half::q4KFactors");
     }
 #endif
+
+    /**
+     * Mixed operands, complementing the diagonal sweeps above (which use d ==
+     * dmin and scale code == minimum code, so they cannot see a swapped or
+     * duplicated input): every column of a real header carries its own d and
+     * an unrelated dmin, and every column of a real code plane its own 12-bit
+     * code whose scale and minimum fields differ, covering all 4096 codes.
+     * Both the fused reader (FP16-arithmetic envelopes) and the generic
+     * reconstruct<5> must equal the codec's widened staged words in raw bits,
+     * NaN sign and payload included, lane by lane.
+     */
+    TEST(CPUCodedCompactUnits, NeonQ4KMixedHeaderAndCodeGatherEqualsCodecBits)
+    {
+        const auto halves = halfSweep();
+        std::vector<std::uint8_t> planes(coded_metadata::codeBlockBytes(5), 0);
+        std::vector<std::uint8_t> header(coded_metadata::headerBytes(5), 0);
+        for (std::size_t h = 0; h < halves.size(); ++h)
+        {
+            for (int column = 0; column < 64; ++column)
+                coded_metadata::storeSuperblockWord(header.data(), 5, column,
+                    sb::packSuperblockWord(halves[(h + column * 5) % halves.size()],
+                                           halves[(h * 7 + column * 13 + 1) % halves.size()]));
+            for (std::uint32_t first = 0; first < 4096; first += 64)
+            {
+                std::fill(planes.begin(), planes.end(), 0);
+                for (int column = 0; column < 64; ++column)
+                    coded_metadata::storeCode(planes.data(), 5, column, (first + column * 37) % 4096);
+                for (int column = 0; column < 64; column += 4)
+                {
+                    const auto generic = coded_metadata::reconstruct<5, Ops>(
+                        L::code<5>(planes.data(), column), L::superblockWords<5>(header.data(), column));
+#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+                    float32x4_t scale, minimum;
+                    coded_metadata::neon_half::q4KFactors(planes.data(), column,
+                        coded_metadata::neon_half::q4KHalfBase(header.data(), column), scale, minimum);
+#endif
+                    for (int lane = 0; lane < 4; ++lane)
+                    {
+                        const std::uint32_t code = (first + (column + lane) * 37) % 4096;
+                        const auto word = coded_metadata::loadSuperblockWord(header.data(), 5, column + lane);
+                        const auto staged = sb::decodeSuperblockMetadata<5>(code, word);
+                        const auto expected_scale = widenedBits(staged.primary);
+                        const auto expected_minimum = widenedBits(staged.secondary);
+                        ASSERT_EQ(laneBits(generic.primary, lane), expected_scale)
+                            << "reconstruct<5> code=" << code << " word=0x" << std::hex << word;
+                        ASSERT_EQ(laneBits(generic.secondary, lane), expected_minimum)
+                            << "reconstruct<5> code=" << code << " word=0x" << std::hex << word;
+#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+                        ASSERT_EQ(laneBits(scale, lane), expected_scale)
+                            << "neon_half code=" << code << " word=0x" << std::hex << word;
+                        ASSERT_EQ(laneBits(minimum, lane), expected_minimum)
+                            << "neon_half code=" << code << " word=0x" << std::hex << word;
+#endif
+                    }
+                }
+            }
+        }
+    }
 #endif
 
     /** Compact matrices retain the exact file density of each original format. */

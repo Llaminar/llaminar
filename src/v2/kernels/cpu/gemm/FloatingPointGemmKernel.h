@@ -112,7 +112,9 @@ inline constexpr unsigned long long fmlalLeafInvocations() noexcept { return 0; 
 /**
  * @brief The FPCR profile the FMLAL leaf's ambient conversion contract runs
  *        under: RNE rounding with flush-to-zero off for binary32 and
- *        binary16, and the IEEE binary16 format (AHP off).
+ *        binary16, the IEEE binary16 format (AHP off) and NaN propagation
+ *        (DN off, so NaN operands keep the sign/payload of the scalar
+ *        schedule's exact widening).
  *
  * FPCR.FZ16 is bit 19; bit 26 is AHP (the alternative half-precision
  * format), which would change every FCVT conversion's result format and is
@@ -1449,7 +1451,7 @@ namespace llaminar2
             if (!fmlalFpcrProfileAdmitted(fpcr))
             {
                 LOG_ERROR("FloatingPointGemmKernel - FMLAL leaf requires the "
-                          "process FP profile RNE with FZ/FZ16 off; observed "
+                          "process FP profile RNE with FZ/FZ16/AHP/DN off; observed "
                           "FPCR=0x" << std::hex << fpcr << std::dec);
                 std::abort();
             }

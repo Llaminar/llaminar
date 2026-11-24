@@ -264,11 +264,14 @@ namespace llaminar2::cpu
      * @brief The per-thread FPCR profile every native numerical contract is defined under.
      *
      * Round-to-nearest-even (FPCR.RMode = 0), no binary32 or binary16 flush to
-     * zero (FZ = 0, FZ16 = 0) and the IEEE binary16 format (AHP = 0). This is
-     * the process default. Binary32 products and sums, FCVT/FCVTN conversions
-     * and binary16 arithmetic all round or flush under these controls, so a
-     * kernel that uses them produces its contract bytes only under this
-     * profile. The admission is per thread because FPCR is per thread; it never
+     * zero (FZ = 0, FZ16 = 0), the IEEE binary16 format (AHP = 0) and NaN
+     * propagation (DN = 0). This is the process default; no Llaminar code or
+     * bundled library sets any of these bits. Binary32 products and sums,
+     * FCVT/FCVTN conversions and binary16 arithmetic all round, flush or
+     * replace NaNs under these controls, so a kernel that uses them produces
+     * its contract bytes only under this profile. DN = 1 would replace every
+     * NaN result (including a widening of a NaN half) by the positive default
+     * NaN, losing the sign and payload the software codecs preserve. The admission is per thread because FPCR is per thread; it never
      * changes FPCR (silently overwriting a caller's mode is forbidden).
      */
     struct ARMFloatingPointProfile
@@ -277,10 +280,11 @@ namespace llaminar2::cpu
         static constexpr std::uint64_t kFZ = 0x1ull << 24;        ///< Binary32/64 flush to zero.
         static constexpr std::uint64_t kFZ16 = 0x1ull << 19;      ///< Binary16 flush to zero.
         static constexpr std::uint64_t kAHP = 0x1ull << 26;       ///< Alternative half-precision format.
+        static constexpr std::uint64_t kDN = 0x1ull << 25;        ///< Default-NaN mode.
 
-        /** @return Whether @p fpcr carries the admitted rounding, flush and half-format controls. */
+        /** @return Whether @p fpcr carries the admitted rounding, flush, NaN and half-format controls. */
         [[nodiscard]] static constexpr bool admitted(std::uint64_t fpcr) noexcept
-        { return (fpcr & (kRModeMask | kFZ | kFZ16 | kAHP)) == 0; }
+        { return (fpcr & (kRModeMask | kFZ | kFZ16 | kAHP | kDN)) == 0; }
 
         /**
          * @return The calling thread's FPCR.
@@ -314,7 +318,7 @@ namespace llaminar2::cpu
         /** @brief Fatal diagnostic naming the entry and the observed FPCR. */
         [[noreturn, gnu::cold, gnu::noinline]] static void reject(const char *consumer, std::uint64_t fpcr) noexcept
         {
-            std::fprintf(stderr, "ERROR: %s requires the process FP profile FPCR.RMode=RNE, FZ=0, FZ16=0, AHP=0; "
+            std::fprintf(stderr, "ERROR: %s requires the process FP profile FPCR.RMode=RNE, FZ=0, FZ16=0, AHP=0, DN=0; "
                                  "observed FPCR=0x%llx\n", consumer, static_cast<unsigned long long>(fpcr));
             std::abort();
         }

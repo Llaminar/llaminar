@@ -13,6 +13,7 @@
  */
 #include "kernels/cpu/gemm/CPUNativeNEONPreparedProjection.h"
 #include "kernels/cpu/gemm/CPUNativeNEONProjectionBatch.h"
+#include "tensors/NativeQuantisedSuperblockMetadata.h"
 #include "utils/ARMCPUFeatures.h"
 #include "utils/CPUExplicitRoundingOracle.h"
 #include "utils/NativeQuantisedPreparedByteFixture.h"
@@ -1028,7 +1029,7 @@ template <typename Body> void underFpcrProfile(std::uint64_t profile, Body &&bod
 {
     using P = cpu::ARMFloatingPointProfile;
     const auto saved = readFpcr();
-    writeFpcr((saved & ~(P::kRModeMask | P::kFZ | P::kFZ16 | P::kAHP)) | profile);
+    writeFpcr((saved & ~(P::kRModeMask | P::kFZ | P::kFZ16 | P::kAHP | P::kDN)) | profile);
     body();
     writeFpcr(saved);
 }
@@ -1070,13 +1071,14 @@ struct Q4KEntryWorkload
 };
 } // namespace
 
-/** @test The shared profile predicate admits exactly RNE with FZ, FZ16 and AHP clear. */
+/** @test The shared profile predicate admits exactly RNE with FZ, FZ16, AHP and DN clear. */
 TEST(CPUNativeNEONFloatingPointProfile, AdmitsOnlyTheContractProfile)
 {
     using P = cpu::ARMFloatingPointProfile;
     EXPECT_TRUE(P::admitted(0));
-    EXPECT_TRUE(P::admitted(1ull << 25)); // FPCR.DN: NaN encodings only, outside the admitted controls.
-    for (const std::uint64_t foreign : std::initializer_list<std::uint64_t>{1ull << 22, 2ull << 22, 3ull << 22, P::kFZ, P::kFZ16, P::kAHP})
+    EXPECT_TRUE(P::admitted(1ull << 21)); // FPCR.IDE, an exception-trap enable outside the numeric controls.
+    for (const std::uint64_t foreign :
+         std::initializer_list<std::uint64_t>{1ull << 22, 2ull << 22, 3ull << 22, P::kFZ, P::kFZ16, P::kAHP, P::kDN})
         EXPECT_FALSE(P::admitted(foreign)) << std::hex << foreign;
     EXPECT_TRUE(P::admitted(readFpcr())) << "the test process must start in the contract profile";
 }
@@ -1084,8 +1086,10 @@ TEST(CPUNativeNEONFloatingPointProfile, AdmitsOnlyTheContractProfile)
 /**
  * @test The ambient-FPCR hazard the admission guards against is real on this
  * machine: binary16 products flush a live subnormal scale under FZ16, and the
- * hardware narrowing rounds toward the FPCR mode (the reader's -0
- * canonicalization alone could not fix either).
+ * hardware narrowing rounds toward the FPCR mode, and default-NaN mode
+ * replaces the sign and payload of a widened NaN half (the reader's -0
+ * canonicalization alone could not fix any of these). Under DN the coded Q4_K
+ * reader itself loses the codec's negative NaN minimum of `-(inf * 0)`.
  */
 TEST(CPUNativeNEONFloatingPointProfile, ForeignProfilesChangeNativeArithmetic)
 {
@@ -1096,7 +1100,40 @@ TEST(CPUNativeNEONFloatingPointProfile, ForeignProfilesChangeNativeArithmetic)
         [&] { narrowed_down = vget_lane_u16(vreinterpret_u16_f16(vcvt_f16_f32(vdupq_n_f32(third))), 0); });
     EXPECT_EQ(narrowed_nearest, 0xB555);
     EXPECT_EQ(narrowed_down, 0xB556);
+    // FCVT half -> single of a negative NaN with payload: propagated, or the default NaN.
+    volatile std::uint16_t nan_half = 0xFE01;
+    volatile std::uint32_t widened_propagated = 0, widened_default = 0;
+    const auto widen = [&] {
+        return vgetq_lane_u32(vreinterpretq_u32_f32(vcvt_f32_f16(vreinterpret_f16_u16(vdup_n_u16(nan_half)))), 0);
+    };
+    underFpcrProfile(0, [&] { widened_propagated = widen(); });
+    underFpcrProfile(cpu::ARMFloatingPointProfile::kDN, [&] { widened_default = widen(); });
+    EXPECT_EQ(widened_propagated, 0xFFC02000u);
+    EXPECT_EQ(widened_default, 0x7FC00000u);
 #if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+    {
+        // The fused Q4_K reader on d = 1.0, dmin = +inf, code 0: the codec's
+        // minimum is the negated product -(inf * 0) = 0xFFC00000.
+        alignas(16) std::array<std::uint8_t, 256> header{};
+        alignas(16) std::array<std::uint8_t, 96> codes{};
+        for (int column = 0; column < 64; ++column)
+            coded_metadata::storeSuperblockWord(header.data(), 5, column,
+                native_quantised_superblock::packSuperblockWord(0x3C00, 0x7C00));
+        const auto reader_minimum = [&] {
+            float32x4_t scale, minimum;
+            coded_metadata::neon_half::q4KFactors(codes.data(), 0,
+                coded_metadata::neon_half::q4KHalfBase(header.data(), 0), scale, minimum);
+            return vgetq_lane_u32(vreinterpretq_u32_f32(minimum), 0);
+        };
+        volatile std::uint32_t minimum_contract = 0, minimum_default_nan = 0;
+        underFpcrProfile(0, [&] { minimum_contract = reader_minimum(); });
+        underFpcrProfile(cpu::ARMFloatingPointProfile::kDN, [&] { minimum_default_nan = reader_minimum(); });
+        const auto staged = native_quantised_superblock::decodeSuperblockMetadata<5>(0,
+            native_quantised_superblock::packSuperblockWord(0x3C00, 0x7C00));
+        EXPECT_EQ(staged.secondary, 0xFE00);
+        EXPECT_EQ(minimum_contract, 0xFFC00000u);
+        EXPECT_EQ(minimum_default_nan, 0x7FC00000u);
+    }
     volatile std::uint16_t tiny = 0x0001, two = 0x4000, product_default = 0, product_flushed = 0;
     const auto multiply = [&] {
         return vget_lane_u16(vreinterpret_u16_f16(vmul_f16(vreinterpret_f16_u16(vdup_n_u16(tiny)),
@@ -1112,7 +1149,7 @@ TEST(CPUNativeNEONFloatingPointProfile, ForeignProfilesChangeNativeArithmetic)
 /**
  * @test The coded Q4_K projection runs only under the contract profile: its
  * tile and batch entries fail fatally, with the profile diagnostic, under
- * FPCR.RMode = toward -inf and under FPCR.FZ16 = 1, and execute normally (and
+ * FPCR.RMode = toward -inf, FPCR.FZ16 = 1 and FPCR.DN = 1, and execute normally (and
  * byte-identically) after the caller's profile is restored.
  */
 TEST(CPUNativeNEONFloatingPointProfile, Q4KEntriesRejectForeignFpcrProfiles)
@@ -1121,7 +1158,8 @@ TEST(CPUNativeNEONFloatingPointProfile, Q4KEntriesRejectForeignFpcrProfiles)
     Q4KEntryWorkload workload;
     workload.batch();
     const auto reference = workload.output;
-    for (const std::uint64_t foreign : std::initializer_list<std::uint64_t>{kRModeMinusInfinity, cpu::ARMFloatingPointProfile::kFZ16})
+    for (const std::uint64_t foreign : std::initializer_list<std::uint64_t>{
+             kRModeMinusInfinity, cpu::ARMFloatingPointProfile::kFZ16, cpu::ARMFloatingPointProfile::kDN})
     {
         SCOPED_TRACE(::testing::Message() << "FPCR controls 0x" << std::hex << foreign);
         EXPECT_DEATH(underFpcrProfile(foreign, [&] { workload.tile(); }),
