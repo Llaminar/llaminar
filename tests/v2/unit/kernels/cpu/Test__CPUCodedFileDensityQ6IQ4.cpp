@@ -253,35 +253,35 @@ TEST(CPUCodedFileDensityQ6IQ4, NEONProjectionEqualsPerBlockSourceOracle)
     verifyProjectionPolicies<kIQ4XS>();
 }
 #endif
-/** @test Reject old per-block wire layouts before either direction can reach a converter. */
-TEST(CPUCodedFileDensityQ6IQ4, CodedSourceScalesRejectUncodedTierStreams)
+/**
+ * @test Coded Q6_K and IQ4_XS units migrate in their coded form in both directions.
+ *
+ * Both manifest builders admit the coded CPU layout (the coded GPU migration
+ * slots now exist), carry the coded CPU encoding unchanged and size the wire
+ * from the coded geometry, so the stream never reintroduces per-block planes.
+ */
+TEST(CPUCodedFileDensityQ6IQ4, CodedSourceScalesMigrateAsCodedTierStreams)
 {
-    const auto verify = []<std::uint8_t Codebook>(const char *message) {
+    const auto verify = []<std::uint8_t Codebook>(const char *name) {
+        SCOPED_TRACE(name);
         auto tensor = source<Codebook>(256);
         CPUNativeQuantisedPackedWeights packed;
         ASSERT_TRUE(packWeightsCPUNativeQuantised(tensor.get(), packed));
-        SCOPED_TRACE(message);
-        const auto expectRejection = [message](auto make_manifest) {
-            try
-            {
-                (void)make_manifest();
-                ADD_FAILURE() << "Uncoded tier stream was admitted";
-            }
-            catch (const std::invalid_argument &error)
-            {
-                EXPECT_STREQ(error.what(), message);
-            }
-        };
-        expectRejection([&] {
-            return makeCpuToGpuExpertTierWeightStreamManifest(packed, 1, 0, 0,
-                ExpertTierWeightProjection::Down, 1);
-        });
-        expectRejection([&] {
-            return makeGpuToCpuExpertTierWeightStreamManifest(*tensor->vnniFormatInfo(), packed.N, packed.K,
-                1, 0, 0, ExpertTierWeightProjection::Down, 1);
-        });
+        ASSERT_TRUE(packed.superblockCoded());
+        const auto to_gpu = makeCpuToGpuExpertTierWeightStreamManifest(packed, 1, 0, 0,
+            ExpertTierWeightProjection::Down, 1);
+        const auto to_cpu = makeGpuToCpuExpertTierWeightStreamManifest(*tensor->vnniFormatInfo(), packed.N, packed.K,
+            1, 0, 0, ExpertTierWeightProjection::Down, 1);
+        std::string error;
+        EXPECT_TRUE(to_gpu.valid(&error)) << error;
+        EXPECT_TRUE(to_cpu.valid(&error)) << error;
+        EXPECT_EQ(to_gpu.cpu_encoding, packed.encoding);
+        EXPECT_EQ(to_cpu.cpu_encoding, packed.encoding);
+        EXPECT_EQ(to_gpu.cpu_block_stride, static_cast<std::uint32_t>(packed.interleaved_block_stride));
+        EXPECT_EQ(to_cpu.cpu_block_stride, static_cast<std::uint32_t>(packed.interleaved_block_stride));
+        EXPECT_EQ(to_gpu.total_stream_bytes, to_cpu.total_stream_bytes);
     };
-    verify.template operator()<8>("Superblock-coded Q6_K CPU encoding requires coded GPU migration slots");
-    verify.template operator()<kIQ4XS>("Superblock-coded IQ4_XS CPU encoding requires coded GPU migration slots");
+    verify.template operator()<8>("Q6_K");
+    verify.template operator()<kIQ4XS>("IQ4_XS");
 }
 } // namespace llaminar2::test
