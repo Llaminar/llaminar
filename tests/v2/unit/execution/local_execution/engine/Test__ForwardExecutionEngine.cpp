@@ -5428,4 +5428,73 @@ TEST_F(Test__ForwardExecutionEngine, CUDAColdPrefillArrivalsCaptureBeforeFirstSu
         }
     });
 }
+
+/** @test An attached CUDA prefix source replaces its executable on the old producer frontier. */
+TEST_F(Test__ForwardExecutionEngine, CUDAPrefixArrivalOwnerRetiresBeforePlacementReplacement)
+{
+    ScopedDebugEnv env({{"LLAMINAR_GPU_GRAPHS", "1"}, {"LLAMINAR_PREFILL_GRAPH_BUCKETS", "1"},
+        {"LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES", "64"}, {"LLAMINAR_PREFILL_GRAPH_MIN_SEQ", "1"},
+        {"LLAMINAR_VALIDATE_BUFFERS", "0"}, {"LLAMINAR_VALIDATE_INPUTS", "0"}, {"LLAMINAR_FAIL_ON_ZERO", "0"}});
+    ensureNvidiaFactoryRegistered();
+    const auto owner = DeviceId::cuda(0);
+    auto native_device = IDeviceContext::create(owner, 1);
+    ASSERT_NE(native_device, nullptr);
+    auto &worker = GPUDeviceContextPool::instance().getContext(owner);
+    worker.submitAndWait([&] {
+        struct State
+        {
+            int tokens[64], positions[64];
+            CUDAArrivalForwardStage::Storage placements[3];
+        };
+        const auto stream = static_cast<cudaStream_t>(worker.defaultStream());
+        State *device = nullptr;
+        ASSERT_EQ(cudaMalloc(&device, sizeof(State)), cudaSuccess);
+        std::unique_ptr<State, decltype(&cudaFree)> holder(device, cudaFree);
+        using Transaction = ForwardStateTransaction;
+        for (const auto [decode, transaction] : {std::pair{false, Transaction::Ordinary},
+                 std::pair{true, Transaction::Ordinary}, std::pair{true, Transaction::RestoredPrefixMTPDecodeBridge}})
+        {
+            SCOPED_TRACE(::testing::Message() << decode << '/' << static_cast<int>(transaction));
+            ASSERT_EQ(cudaMemsetAsync(device, 0, sizeof(State), stream), cudaSuccess);
+            ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+            CUDAArrivalForwardHost host(*native_device, worker);
+            host.mock_capture_policy.allow_fast_decode = true;
+            host.mock_capture_policy.allow_cached_graph_replay = true;
+            int records = 0;
+            host.graph_stage_factories.push_back([&](const std::string &name, DeviceId stage_owner) {
+                return std::make_unique<CUDAArrivalForwardStage>(name, stage_owner,
+                    device->placements[host.placement_epoch], records);
+            });
+            auto engine = makeEngine();
+            auto input = makeTestInput(decode ? 1 : 64, 1, owner, nullptr, nullptr);
+            input.token_ids_device = device->tokens;
+            input.position_ids_device = device->positions;
+            input.execution_phase = decode ? ForwardExecutionPhase::Decode : ForwardExecutionPhase::Prefill;
+            input.state_transaction = transaction;
+            input.rehydrate_prefix_runtime_on_device = true;
+            ForwardOutput output{};
+            // The repeated B reuses exact identity. Returning to A must record
+            // again because its previous native executable was already retired.
+            constexpr std::array epochs{0u, 1u, 1u, 0u, 2u};
+            constexpr std::array expected_records{1, 2, 2, 3, 4};
+            for (std::size_t i = 0; i < epochs.size(); ++i)
+            {
+                host.placement_epoch = epochs[i];
+                ASSERT_TRUE(engine.execute(input, output, host));
+                ASSERT_NE(output.execution.stream, nullptr);
+                const auto observations = engine.replayCacheObservations(0);
+                ASSERT_EQ(observations.size(), 1u);
+                EXPECT_EQ(observations.front().signature.moe_placement_epoch, epochs[i]);
+                DeviceMoERebalanceApplyStatus observed{};
+                auto *status = &device->placements[epochs[i]].status;
+                const auto producer = static_cast<cudaStream_t>(output.execution.stream);
+                ASSERT_EQ(cudaMemcpyAsync(&observed, status, sizeof(observed), cudaMemcpyDeviceToHost, producer), cudaSuccess);
+                ASSERT_EQ(cudaMemsetAsync(status, 0, sizeof(*status), producer), cudaSuccess);
+                ASSERT_EQ(cudaStreamSynchronize(producer), cudaSuccess);
+                EXPECT_EQ(observed.local_transfer_slot_count, 1u);
+                EXPECT_EQ(records, expected_records[i]);
+            }
+        }
+    });
+}
 #endif

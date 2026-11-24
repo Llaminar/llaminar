@@ -293,6 +293,7 @@ namespace llaminar2
         bool is_bucketed_prefill = false;
         int bucket_seq_len = 0;
         bool rehydrate_prefix_runtime_on_device = false;
+        /** Placement changes can change embedded expert-slot addresses; an old capture is never relabeled. */
         uint64_t moe_placement_epoch = 0;
         /** Semantic diagnostic-node topology embedded in the native graph. */
         uint64_t snapshot_configuration_identity = 1;
@@ -363,6 +364,18 @@ namespace llaminar2
                        other.snapshot_configuration_identity;
         }
     };
+
+    /** @brief Whether two complete signatures compete for one replaceable CUDA prefix owner. */
+    [[nodiscard]] inline bool sharesCUDARehydratingForwardOwner(
+        const ForwardGraphSignature &incoming, const ForwardGraphSignature &resident) noexcept
+    {
+        return incoming.device.is_cuda() && incoming.device == resident.device &&
+            incoming.rehydrate_prefix_runtime_on_device && resident.rehydrate_prefix_runtime_on_device &&
+            incoming.decode == resident.decode && incoming.execution_role == resident.execution_role &&
+            incoming.state_transaction == resident.state_transaction &&
+            incoming.sparse_query_execution_program == resident.sparse_query_execution_program &&
+            incoming.snapshot_configuration_identity == resident.snapshot_configuration_identity;
+    }
 
     /**
      * @brief Cold borrowed identity of an actually materialized finite forward graph.
@@ -925,6 +938,15 @@ namespace llaminar2
             stream = nullptr;
             ctx = nullptr;
         }
+
+        /** @brief Destroy this stream after its exact event fence has proven retirement. */
+        void destroyAfterEventFence()
+        {
+            if (stream && ctx)
+                ctx->destroyStream(stream);
+            stream = nullptr;
+            ctx = nullptr;
+        }
     };
 
     /**
@@ -1279,6 +1301,29 @@ namespace llaminar2
             gpu_stream = nullptr;
             gpu_ctx = nullptr;
             graph_replay_live_state_epoch = 0;
+        }
+
+        /** @brief Retire a replaced CUDA prefix executable before another recording owns its slot. */
+        void retireCUDARehydratingOwner(DeviceId device)
+        {
+            using Cache = DeviceGraphExecutor::GraphSegmentCache;
+            // Monolithic bucketed prefill may own a distinct producer stream.
+            // Retire it through the same exact event fence as segmented decode.
+            if (prefill_capture_stream.stream)
+            {
+                Cache frontier;
+                if (!frontier.bindBorrowedCaptureStream(prefill_capture_stream.ctx,
+                        prefill_capture_stream.stream, device))
+                    throw std::logic_error("CUDA prefix graph retirement lost its exact prefill producer");
+                frontier.reset(Cache::StreamResetPolicy::Destroy, Cache::HostFenceWaitPolicy::ActiveProgress);
+            }
+            segment_cache.reset(Cache::StreamResetPolicy::Destroy, Cache::HostFenceWaitPolicy::ActiveProgress);
+            if (prefill_graph_cache)
+                prefill_graph_cache->invalidateAll();
+            // The caller erases this entire cache entry. Drop any legacy owner
+            // while its exact producer stream still exists.
+            gpu_graph.reset();
+            prefill_capture_stream.destroyAfterEventFence();
         }
 
         void invalidate()

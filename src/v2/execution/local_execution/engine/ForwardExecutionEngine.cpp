@@ -2652,6 +2652,23 @@ namespace llaminar2
                 forward_signature.decode ? "decode" : "prefill",
                 forward_signature.device.toString(),
                 std::move(lookup_tags));
+            if (forward_signature.device.is_cuda() && forward_signature.rehydrate_prefix_runtime_on_device)
+            {
+                // The normal forward and its prefix-only alternative are
+                // separate owners. An alternative may change placement, rows,
+                // and bindings across restores without growing the native pool.
+                for (auto previous = cache_.begin(); previous != cache_.end();)
+                {
+                    if (sharesCUDARehydratingForwardOwner(forward_signature, previous->first) &&
+                        !(forward_signature == previous->first))
+                    {
+                        previous->second.retireCUDARehydratingOwner(forward_signature.device);
+                        previous = cache_.erase(previous);
+                    }
+                    else
+                        ++previous;
+                }
+            }
             auto [it, _inserted] = cache_.try_emplace(forward_signature);
             build_cache = &it->second;
             bindGraphSnapshotArenaReusePolicy(
