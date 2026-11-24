@@ -190,7 +190,11 @@ TEST(ROCmGroupedFFNFormatSelection, FixedQ5PitchRequiresMeasuredWidthsAndExactGa
         EXPECT_FALSE(classify(160,width,q5,q5k,sharedWeights(width,formats::Q8_0)));
     EXPECT_FALSE(classify(160,160,q5,sources(formats::Q5_K,formats::Q5_1,formats::Q8_0),exact));
     EXPECT_FALSE(classify(160,160,q5,q5k,sharedWeights(160,formats::Q8_K)));
-    EXPECT_FALSE(classify(160,160,reachable(formats::Q5_K),q5k,exact));
+    const auto movable_q5 = reachable(formats::Q5_K);
+    EXPECT_EQ(movable_q5.execution_codebook_mask,q5.execution_codebook_mask);
+    EXPECT_EQ(movable_q5.policy_codebook_mask,q5.policy_codebook_mask);
+    for(int width:{128,160,256})
+        EXPECT_EQ(classify(width,160,movable_q5,q5k,exact),static_cast<ffn::FixedQ5GatePitch>(width));
 }
 
 /** @test A fixed down reader must remain correct for every descriptor reachable after a move. */
@@ -218,7 +222,13 @@ TEST(ROCmGroupedFFNFormatSelection, PairedDownRequiresOriginalSourcePitchAndSing
                         q4,reachable(formats::Q5_K,false),formats::Q8_0));
     EXPECT_EQ(select(256,160,original,reachable(formats::Q4_K,true),q51,formats::Q8_0),
               ffn::FixedQ51DownPitch::F256);
-    EXPECT_FALSE(select(256,160,original,q4,reachable(formats::Q5_1,true),formats::Q8_0));
+    // CPU migration preserves the plain Q5_1 physical reader and K32 policy.
+    const auto movable_q51 = reachable(formats::Q5_1,true);
+    EXPECT_EQ(movable_q51.execution_codebook_mask,q51.execution_codebook_mask);
+    EXPECT_EQ(movable_q51.policy_codebook_mask,q51.policy_codebook_mask);
+    for(int width:{128,256})
+        EXPECT_EQ(select(width,160,original,q4,movable_q51,formats::Q8_0),
+                  static_cast<ffn::FixedQ51DownPitch>(width));
 }
 
 #endif

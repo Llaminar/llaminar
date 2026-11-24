@@ -14,6 +14,7 @@
 #include "execution/moe/MoEWorkspaceRequirements.h"
 #include "execution/moe/MoEExpertProjectionOwnership.h"
 #include "kernels/rocm/gemm/ROCmMoEGroupedPrefillKernels.h"
+#include "kernels/rocm/repack/ROCmExpertTierWeightKernels.h"
 #include "transfer/TransferEngine.h"
 #include "tensors/NativeQuantisedScalePlane.h"
 
@@ -322,14 +323,47 @@ namespace llaminar2::test
          *
          * The production decoder consumes K-block-major planes. A contiguous
          * byte-offset view would be wrong: each K block needs the selected N
-         * columns. Setup uses pitched D2D copies and retains original provenance.
+         * columns. Setup copies a coded rectangle or pitched per-block planes
+         * according to the original descriptor's layout.
          */
         DeviceNativeQuantisedMatrixDesc *slice(int begin, int count)
         {
+            if (begin < 0 || count <= 0 || begin > width || count > width - begin)
+                throw std::invalid_argument("projection slice exceeds its original rows");
             const auto &metadata = *native_quantised_formats::forQuantType(formats_.down.label);
             std::vector<DeviceNativeQuantisedMatrixDesc> result;
             for (const auto &source : down_host_)
             {
+                auto descriptor = source;
+                descriptor.n = count;
+                if (source.metadata_layout)
+                {
+                    namespace sb = native_quantised_superblock;
+                    const auto phase = nativeQuantisedLayoutPhase(source.metadata_layout);
+                    const auto planes = sb::planeBytes(source.codebook_id, count, source.blocks_per_row, phase);
+                    auto *payload = allocate<uint8_t>(size_t(count) * source.blocks_per_row * metadata.payload_bytes);
+                    auto *codes = planes.code ? allocate<uint8_t>(planes.code) : payload;
+                    auto *headers = allocate<uint8_t>(planes.superblock);
+                    descriptor.payload = payload;
+                    descriptor.scales = codes;
+                    descriptor.mins = headers;
+                    descriptor.metadata_layout = nativeQuantisedMetadataLayout(
+                        NativeQuantisedMetadataRepresentation::SuperblockCoded, phase);
+                    const ROCmCodedPeerProjectionRectangle rectangle{
+                        .rows = static_cast<unsigned>(count), .blocks = source.blocks_per_row,
+                        .payload_bytes = static_cast<unsigned>(metadata.payload_bytes), .codebook = source.codebook_id,
+                        .src_n = static_cast<unsigned>(source.n), .dst_n = static_cast<unsigned>(count),
+                        .src_row = static_cast<unsigned>(begin), .dst_row = 0, .src_block = 0, .dst_block = 0,
+                        .source = {.payload = source.payload, .scales = static_cast<const uint16_t *>(source.scales),
+                                   .mins = static_cast<const uint16_t *>(source.mins), .metadata_layout = source.metadata_layout},
+                        .destination = {.payload = payload, .scales = reinterpret_cast<uint16_t *>(codes),
+                                        .mins = reinterpret_cast<uint16_t *>(headers), .metadata_layout = descriptor.metadata_layout}};
+                    if (!launchROCmCodedPeerProjectionRectangle(rectangle, stream))
+                        throw std::runtime_error("copy native coded projection columns failed");
+                    result.push_back(descriptor);
+                    continue;
+                }
+
                 auto copy = [&](const void *plane, size_t block_bytes) -> const void *
                 {
                     if (!plane) return nullptr;
@@ -341,8 +375,6 @@ namespace llaminar2::test
                         destination_pitch, intermediate / 32, hipMemcpyDeviceToDevice, stream), "copy native projection columns");
                     return destination;
                 };
-                auto descriptor = source;
-                descriptor.n = count;
                 descriptor.payload = static_cast<const uint8_t *>(copy(source.payload, metadata.payload_bytes));
                 // The primary plane is one E8M0 byte per block for native MXFP4
                 // and one FP16 word otherwise; the column pitch must follow it.

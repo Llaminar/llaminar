@@ -9,6 +9,7 @@
 #include "../../../fixtures/transfer/ComponentTransferExecutionPoolFixtureAccess.h"
 #include "NativeQuantisedExpertTransferParityTest.h"
 #include "execution/compute_stages/stages/MoELocalExpertStage.h"
+#include "execution/moe/GPUExpertTransfer.h"
 #include "execution/local_execution/device/DeviceContext.h"
 #include "../../../utils/CPUProjectionTestWorkspace.h"
 #include "../../../utils/CPUSerialArenaTestAdmission.h"
@@ -216,26 +217,30 @@ namespace llaminar2::test::native_quantised_transfer_parity_detail
         for (size_t i = 0; i < roles.size(); ++i)
         {
             const auto &descriptor = descriptors[i];
+            const auto physical = canonicalDeviceVnniFormat(*source_format);
+            const auto packed = makeGpuExpertPackedDescriptor(descriptor,
+                physical.payload_bytes_per_block, physical.is_asymmetric, physical.has_emins);
             const auto layout = makeGpuToCpuExpertTierWeightStreamManifest(
-                *source_format, descriptor.n, descriptor.k,
+                *source_format, packed,
                 /*residency_epoch=*/1, /*layer_idx=*/0, /*expert_id=*/0,
                 roles[i], /*maximum_units_per_chunk=*/16).deviceLayout();
-            const size_t blocks = static_cast<size_t>(layout.N) * layout.blocks_per_row;
             const ExpertTierGpuConstProjectionView source{
                 .payload = descriptor.payload,
                 .scales = static_cast<const uint16_t *>(descriptor.scales),
                 .mins = static_cast<const uint16_t *>(descriptor.mins),
                 .emins = static_cast<const uint32_t *>(descriptor.emins),
-                .payload_bytes = blocks * layout.gpu_payload_bytes_per_block,
-                .scales_bytes = nativeQuantisedScalePlaneLiveBytes(layout.gpu_codebook_id, blocks),
-                .mins_bytes = layout.gpu_is_asymmetric ? blocks * sizeof(uint16_t) : 0u,
-                .emins_bytes = layout.gpu_has_emins ? blocks * sizeof(uint32_t) : 0u,
+                .payload_bytes = packed.vnni_bytes,
+                .scales_bytes = packed.scales_bytes,
+                .mins_bytes = packed.mins_bytes,
+                .emins_bytes = packed.emins_bytes,
+                .metadata_layout = packed.metadata_layout,
             };
             auto &transfer = TransferEngine::instance();
             ExpertTierWeightTransferLane lane({
                 .device = device,
                 .staging = transfer.allocatePersistentTransferStagingSlices(
-                    layout.chunkBytes(layout.maximum_units_per_chunk), 1u, device).front(),
+                    layout.maximum_units_per_chunk * layout.cpuStorage().maximumWireUnitBytes(),
+                    1u, device).front(),
                 .execution = ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(transfer,
                     1u, device, "cross-tier-demotion").front(),
                 .progress = BackgroundTransferProgressBinding::nativeStream(),
@@ -258,8 +263,8 @@ namespace llaminar2::test::native_quantised_transfer_parity_detail
             if (progress != ExpertTierWeightTransferProgress::Ready)
                 throw std::runtime_error("Demotion proof did not complete: " + error);
             const auto stats = lane.stats();
-            if (stats.transfers_completed != 1u || stats.blocking_synchronizations != 0u ||
-                stats.inference_stream_waits != 0u)
+            if (stats.transfers_completed != 1u || stats.bytes_submitted != layout.chunkBytes(layout.unit_count) ||
+                stats.blocking_synchronizations != 0u || stats.inference_stream_waits != 0u)
                 throw std::runtime_error("Demotion proof violated its asynchronous transfer contract");
         }
         // Publish each arrival exactly as MoEOverlayParticipantMigration does:
