@@ -18792,6 +18792,13 @@ add_v2_test(V2_Unit_ComputeStages
     MPI_PROCS 1
 )
 
+add_v2_test(V2_Integration_DeviceMoEArrivalForwardDeclaration
+    COMMAND $<TARGET_FILE:v2_test_compute_stages>
+        --gtest_filter=ComputeStagesTest.DeviceMoEArrivalForwardDeclaresIndependentSites
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MoE;GraphCapture;Admission;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_DeviceMoEArrivalForwardDeclaration)
+
 add_v2_test(V2_Integration_DeviceMoERebalanceCodedSlotAdmission
     COMMAND $<TARGET_FILE:v2_test_compute_stages>
         --gtest_filter=ComputeStagesTest.MoEDeviceRebalanceExactSlotFamilies:ComputeStagesTest.MoEDeviceRebalanceHistogramLayoutMatchesTransferAdmission

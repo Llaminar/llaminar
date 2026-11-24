@@ -29,6 +29,7 @@
 #include "../../../utils/CPURoPETestBinding.h"
 #include "execution/local_execution/device/DeviceContext.h"
 #include "execution/moe/DeviceMoETransferSlotDirectory.h"
+#include "execution/moe/DeviceMoEArrivalForwardDeclaration.h"
 #include "execution/moe/MoERuntimeTable.h"
 #include "loaders/GPUPreparedWeightPoolLayout.h"
 #include "tensors/Tensors.h"
@@ -871,6 +872,47 @@ TEST_F(ComputeStagesTest, MoEDeviceRebalanceExactSlotFamilies)
     EXPECT_NE(Directory::captureIdentity(profile, capacity), Directory::captureIdentity(phased, capacity));
     floating.front() = iq3.front();
     EXPECT_THROW(Directory::profileForLayerFormats({iq3, floating}), std::invalid_argument);
+}
+
+/** @test Arrival topology follows the exact forward phase, row policy and prefix attachment. */
+TEST_F(ComputeStagesTest, DeviceMoEArrivalForwardDeclaresIndependentSites)
+{
+    using Arrival = DeviceMoEArrivalForwardDeclaration;
+    Arrival::Request request{
+        .phase = Arrival::Phase::OrdinaryPrefill,
+        .prefix_payload = Arrival::PrefixPayload::Absent,
+        .row_execution = RoutedExpertRowExecutionPolicy::ParticipantAssigned,
+        .prefill_assignment = RoutedExpertAssignmentPolicy::LeastLoadedResident,
+        .row_count = 5,
+        .top_k = 3,
+        .minimum_routed_rows = 16,
+    };
+    constexpr auto native = Arrival::Transport::NativeLocalTP;
+    constexpr auto absent = Arrival::Transport::None;
+    EXPECT_EQ(Arrival::declare(request, absent).sites(), 0u);
+    request.row_count = 6;
+    EXPECT_EQ(Arrival::declare(request, native).sites(), 1u);
+    EXPECT_THROW((void)Arrival::declare(request, absent), std::invalid_argument);
+    request.prefix_payload = Arrival::PrefixPayload::Attached;
+    EXPECT_EQ(Arrival::declare(request, native).sites(), 2u);
+    for (const auto execution : {RoutedExpertRowExecutionPolicy::FullyReplicatedLocal,
+            RoutedExpertRowExecutionPolicy::IntermediateShardLocal})
+    {
+        request.row_execution = execution;
+        const auto declaration = Arrival::declare(request, native);
+        EXPECT_TRUE(declaration.prefix());
+        EXPECT_FALSE(declaration.currentBatch());
+    }
+    request.row_execution = RoutedExpertRowExecutionPolicy::ParticipantAssigned;
+    request.prefill_assignment = RoutedExpertAssignmentPolicy::StaticOwner;
+    EXPECT_EQ(Arrival::declare(request, native).sites(), 1u);
+    request.prefill_assignment = RoutedExpertAssignmentPolicy::LeastLoadedResident;
+    request.phase = Arrival::Phase::DecodeOrVerifier;
+    request.row_count = 1;
+    EXPECT_EQ(Arrival::declare(request, native).sites(), 1u);
+    EXPECT_THROW((void)Arrival::declare(request, absent), std::invalid_argument);
+    request.phase = Arrival::Phase::Predictor;
+    EXPECT_EQ(Arrival::declare(request, absent).sites(), 0u);
 }
 
 /** @brief Admit a range-bound planner only when its collective wire layout agrees. */

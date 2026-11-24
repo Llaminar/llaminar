@@ -9303,11 +9303,11 @@ namespace llaminar2::test
             std::string::npos)
             << "Graph lowering must consume the typed prefill economy boundary.";
         EXPECT_NE(
-            graph.find(
-                "if (gpu_llep_prefill_candidate &&\n"
-                "            !llep_prefill_transport_supported)"),
+            graph.find("if (gpu_llep_prefill_candidate && !native_arrival_transport)"),
             std::string::npos)
             << "Requested GPU LLEP must fail hard when full graph transport is unavailable.";
+        EXPECT_NE(graph.find("Arrival::declare("), std::string::npos)
+            << "Graph lowering must consume the typed arrival-site declaration.";
         EXPECT_NE(
             graph.find(
                 "if (llep_prefill_requested &&\n"

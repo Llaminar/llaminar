@@ -24,6 +24,7 @@
 #include "../../execution/moe/DeviceMoECommittedMaintenanceScope.h"
 #include "execution/moe/MoEOverlayHostServiceContract.h"
 #include "execution/moe/MoELocalTPMaintenanceDomain.h"
+#include "execution/moe/DeviceMoEArrivalForwardDeclaration.h"
 #include "Qwen35MoEGraph.h"
 #include "models/qwen4exp/Qwen4ExpConfig.h"
 #include "execution/compute_stages/stages/MoEIntermediateShardPipeline.h"
@@ -5552,11 +5553,20 @@ namespace llaminar2
             config_.moe.num_experts,
             /*dynamic_rebalance_enabled=*/true);
         const auto &env = debugEnv();
-        const bool prefix_runtime_device_rehydration =
-            prefixRuntimeRehydrationGraphActive() &&
-            !mtp_sidecar_context &&
-            device.is_gpu();
-        if (prefix_runtime_device_rehydration &&
+        using Arrival = DeviceMoEArrivalForwardDeclaration;
+        const Arrival::Request arrival_request{
+            .phase = mtp_sidecar_context ? Arrival::Phase::Predictor :
+                (ordinary_prefill_graph ? Arrival::Phase::OrdinaryPrefill : Arrival::Phase::DecodeOrVerifier),
+            .prefix_payload = prefixRuntimeRehydrationGraphActive() && device.is_gpu()
+                ? Arrival::PrefixPayload::Attached : Arrival::PrefixPayload::Absent,
+            .row_execution = routed_row_execution_policy,
+            .prefill_assignment = config_.moe.routed_prefill_assignment_policy,
+            .row_count = static_cast<uint64_t>(std::max(0, total_tokens)),
+            .top_k = static_cast<uint64_t>(std::max(0, config_.moe.top_k)),
+            .minimum_routed_rows = config_.moe.routed_prefill_config.least_loaded_min_routed_rows,
+        };
+        const bool prefix_rehydration_requested = arrival_request.requestsPrefix();
+        if (prefix_rehydration_requested &&
             layer_idx == config_.pp_layer_offset)
         {
             LOG_INFO("[Qwen35MoEGraph] Building dedicated prefix-runtime "
@@ -5565,24 +5575,8 @@ namespace llaminar2
                      << " total_tokens=" << total_tokens
                      << " first_layer=" << layer_idx);
         }
-        const bool llep_prefill_requested =
-            ordinary_prefill_graph &&
-            routed_row_execution_policy ==
-                RoutedExpertRowExecutionPolicy::ParticipantAssigned &&
-            config_.moe.routed_prefill_assignment_policy ==
-                RoutedExpertAssignmentPolicy::LeastLoadedResident;
-        const uint64_t llep_prefill_routed_rows =
-            llep_prefill_requested
-                ? static_cast<uint64_t>(std::max(0, total_tokens)) *
-                      static_cast<uint64_t>(std::max(0, config_.moe.top_k))
-                : 0ULL;
-        const uint64_t llep_prefill_min_routed_rows =
-            config_.moe.routed_prefill_config
-                .least_loaded_min_routed_rows;
-        const bool llep_prefill_cost_gate_passed =
-            !llep_prefill_requested ||
-            llep_prefill_min_routed_rows == 0ULL ||
-            llep_prefill_routed_rows >= llep_prefill_min_routed_rows;
+        const bool llep_prefill_requested = arrival_request.requestsCurrentBatch();
+        const bool llep_prefill_cost_gate_passed = arrival_request.passesCurrentBatchCostGate();
         const RoutedExpertDomain *cpu_llep_overlay_domain =
             use_expert_overlay && overlay_plan &&
                     overlay_plan->routed_tiers.size() == 1u
@@ -5624,22 +5618,10 @@ namespace llaminar2
         const bool llep_prefill_enabled =
             cpu_llep_prefill_transport_supported ||
             gpu_llep_prefill_candidate;
-        const bool llep_prefill_transport_supported =
-            gpu_llep_prefill_candidate &&
-            local_tp_ctx != nullptr &&
-            isHomogeneousGpuLocalTPRebalanceDomain(
-                *local_tp_ctx,
-                device,
-                config_.tp_device_idx);
-        const bool prefix_runtime_rehydration_transport_supported =
-            prefix_runtime_device_rehydration &&
-            local_tp_ctx &&
-            isHomogeneousGpuLocalTPRebalanceDomain(
-                *local_tp_ctx,
-                device,
-                config_.tp_device_idx);
-        if (gpu_llep_prefill_candidate &&
-            !llep_prefill_transport_supported)
+        const bool native_arrival_transport = device.is_gpu() && local_tp_ctx &&
+            (gpu_llep_prefill_candidate || prefix_rehydration_requested) &&
+            isHomogeneousGpuLocalTPRebalanceDomain(*local_tp_ctx, device, config_.tp_device_idx);
+        if (gpu_llep_prefill_candidate && !native_arrival_transport)
         {
             throw std::runtime_error(
                 "Qwen35 MoE least-loaded prefill requires "
@@ -5654,13 +5636,16 @@ namespace llaminar2
                 "Qwen35 MoE least-loaded prefill has no production "
                 "transaction authority for " + device.to_string());
         }
-        if (prefix_runtime_device_rehydration &&
-            !prefix_runtime_rehydration_transport_supported)
+        if (prefix_rehydration_requested && !native_arrival_transport)
         {
             throw std::runtime_error(
                 "Qwen35 MoE prefix-runtime payload rehydration requires a homogeneous graph-capturable NCCL/RCCL LocalTP domain for " +
                 device.to_string());
         }
+        const auto device_arrivals = device.is_gpu() ? std::optional{Arrival::declare(
+            arrival_request, native_arrival_transport ? Arrival::Transport::NativeLocalTP : Arrival::Transport::None)}
+            : std::nullopt;
+        const bool prefix_runtime_device_rehydration = device_arrivals && device_arrivals->prefix();
         const RoutedExpertAssignmentPolicy prefill_routed_expert_assignment_policy =
             (routed_row_execution_policy ==
                  RoutedExpertRowExecutionPolicy::ParticipantAssigned &&
@@ -5745,10 +5730,9 @@ namespace llaminar2
          * resident-only.
          */
         const bool current_batch_llep_transfer_candidate =
-            llep_prefill_transport_supported;
+            device_arrivals && device_arrivals->currentBatch();
         const bool prefill_llep_transfer_candidate =
-            current_batch_llep_transfer_candidate ||
-            prefix_runtime_rehydration_transport_supported;
+            current_batch_llep_transfer_candidate || prefix_runtime_device_rehydration;
         const GraphSideRebalanceBindingRole prefill_transfer_binding_role =
             current_batch_llep_transfer_candidate
                 ? GraphSideRebalanceBindingRole::CurrentBatchLLEPTransfer
