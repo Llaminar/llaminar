@@ -364,7 +364,9 @@ namespace llaminar2::cpu::native_quantised
         if (schedule == PrefillSchedulePolicy::Auto && policy == VerifierRowsPolicy::Auto && chunks == 0 &&
             neon_execution::usesPackedPrefill(packed, rows))
         {
+            requireNativeQuantisedISAPath(isa_path);
             neon_execution::geometry(packed, rows, stride);
+            (void)cpuNativeQuantisedSerialEquivalentPolicyN(packed.N);
             if (!CPUProjectionRowGrid(rows, work).beginWorkshare()) return;
             const auto dot = neon_execution::instruction(isa_path);
             const auto batch = neon_execution::bind(packed, input, output, rows, stride, NEONProjectionRowTile::Pair, 1, work);

@@ -225,6 +225,27 @@ TEST_F(CPUNativeNEONExecution, AllOwnersSerialGroupedAndPrefillRetainBytes)
         }
 }
 
+/** @test Packed prefill retains ISA and original-N admission even for empty work. */
+TEST_F(CPUNativeNEONExecution, PackedPrefillRejectsBadISAAndOriginalWidthBeforeWriting)
+{
+    constexpr int rows = 16, n = 65, k = 544;
+    const auto packed = owner(native_quantised_formats::Q5_K, n, k);
+    const auto input = q8Rows(rows, packed.blocks_per_row);
+    std::vector<float> output(rows * n, 123456.0f);
+    std::int32_t live = 0;
+    const auto work = ProjectionRowWork::fromPrefix(DeviceRowRange::deviceCounted(rows, &live));
+    const auto run = [&](ISAPath path) {
+        gemm_native_quantised_preq(packed, input.data(), output.data(), {}, rows, n,
+            path, VerifierRowsPolicy::Auto, PrefillSchedulePolicy::Auto, 0, &work);
+    };
+    EXPECT_THROW(run(ISAPath::AVX2), std::invalid_argument);
+    const int original = cpuNativeQuantisedSerialOutputPartitionN();
+    setCPUNativeQuantisedSerialOutputPartitionN(n + 1);
+    EXPECT_THROW(run(ISAPath::AUTO), std::logic_error);
+    setCPUNativeQuantisedSerialOutputPartitionN(original);
+    EXPECT_TRUE(std::all_of(output.begin(), output.end(), [](float x) { return x == 123456.0f; }));
+}
+
 /** @test Every explicit native N owner and admitted instruction family retains the serial program. */
 TEST_F(CPUNativeNEONExecution, NativeInstructionAndNChunkCandidatesStayExact)
 {
