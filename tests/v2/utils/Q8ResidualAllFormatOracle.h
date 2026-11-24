@@ -240,6 +240,19 @@ cpuWeights(const cpu::native_quantised::CPUNativeQuantisedPackedWeights &p) {
             const int bit = lane * 4 + i % 4;
             value =
                 (low | (((a >> bit) & 1) << 4) | (((c >> bit) & 1) << 5)) - 32;
+          } else if (p.encoding == cpu::native_quantised::CPUNativeQuantisedEncoding::Q5NativeSingleScale) {
+            // Four nibble groups share one fifth-bit byte per group and column.
+            // Treating groups 4-7 as expanded INT8 reads fifth bits, scales,
+            // and neighboring K blocks as though they were weight coefficients.
+            using Layout = cpu::native_quantised::Q5NativePayload;
+            const auto *unit = p.blockUnit(chunk, b);
+            const int group = (i % 16) / 4, element = i % 4, half = i / 16;
+            const auto nibble = unit[Layout::nibbleOffset(group, col) + element];
+            const auto fifth = unit[Layout::fifthOffset(group, col)];
+            value = ((nibble >> (4 * half)) & 15) |
+                    (((fifth >> (4 * half + element)) & 1) << 4);
+            if (!p.is_asymmetric)
+              value -= 16;
           } else if (p.usesNibbleLUT()) {
             const auto byte =
                 p.interleavedB(chunk, b, (i % 16) / 4, z)[lane * 4 + i % 4];
