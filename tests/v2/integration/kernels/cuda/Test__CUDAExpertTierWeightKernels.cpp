@@ -14,6 +14,8 @@
  * remains the independent physical4 control with no secondary plane.
  * Fixture uploads complete on an explicit stream before publishing storage to
  * independent non-blocking transfer lanes; pageable H2D staging is not completion.
+ * The coded MPI proof uses real rank-local CUDA endpoints and verifies the
+ * original device planes after transport publication, including untouched rows.
  */
 
 #include "../../../fixtures/transfer/ComponentTransferExecutionPoolFixtureAccess.h"
@@ -44,6 +46,7 @@
 #include "tensors/BlockStructures.h"
 #include "utils/DebugEnv.h"
 #include "utils/PerfStatsCollector.h"
+#include "utils/MPIContext.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "transfer/MappedTransferProgressEpoch.h"
 
@@ -52,6 +55,7 @@
 
 #include <cuda_runtime.h>
 #include <gtest/gtest.h>
+#include <mpi.h>
 #include "kernels/common/NativeQuantisedScaleLoad.h"
 
 #include <algorithm>
@@ -890,15 +894,23 @@ namespace llaminar2
             }
         }
 
-        /** @test Production CUDA endpoints relay only live source codes across an original-root rectangle. */
-        TEST_F(CUDAExpertTierWeightKernelsTest, CodedRemoteEndpointsPreserveOriginalGpuPlanes)
+        /**
+         * @brief Verify a compact CUDA relay rectangle against independent SourceNative allocations.
+         * @param name Source format fixture name.
+         * @param metadata Source format identity before device packing.
+         * @param expected_wire_bytes Exact live bytes across all chunks, including source headers.
+         * @param context Two real MPI ranks, or null for the in-process endpoint control.
+         * @param sender Rank that owns the original source in the MPI case.
+         */
+        void proveCodedRemoteGpuPlanes(const char *name, const NativeQuantisedFormatInfo &metadata,
+                                      std::size_t expected_wire_bytes,
+                                      const std::shared_ptr<MPIContext> &context = {}, int sender = 0)
         {
             namespace sb = native_quantised_superblock;
+            SCOPED_TRACE(name);
             const auto device = DeviceId::cuda(0);
             constexpr int src_n = 5, dst_n = 4, src_k = 512, dst_k = 256;
-            constexpr unsigned book = 9;
-            const auto &q3 = native_quantised_formats::Q3_K;
-            const auto &format = test::quantizedVerifierFormat("Q3_K");
+            const auto &format = test::quantizedVerifierFormat(name);
             const auto a = format.create({src_n, src_k}, 117);
             const auto b = format.create({dst_n, dst_k}, 193);
             const auto source_owner = std::make_shared<test::GpuPreparedGemm>(test::makeGpuPreparedGemm(a.get(), device));
@@ -906,58 +918,72 @@ namespace llaminar2
             DeviceNativeQuantisedMatrixDesc src_desc, dst_desc;
             ASSERT_TRUE(source_owner->kernel->exportNativeQuantisedMatrixDesc(src_desc));
             ASSERT_TRUE(destination_owner->kernel->exportNativeQuantisedMatrixDesc(dst_desc));
-            const auto src = makeGpuExpertPackedDescriptor(src_desc, q3.payload_bytes, q3.is_asymmetric, q3.has_emins);
-            const auto dst = makeGpuExpertPackedDescriptor(dst_desc, q3.payload_bytes, q3.is_asymmetric, q3.has_emins);
+            const auto src = makeGpuExpertPackedDescriptor(src_desc, metadata.payload_bytes, metadata.is_asymmetric, metadata.has_emins);
+            const auto dst = makeGpuExpertPackedDescriptor(dst_desc, metadata.payload_bytes, metadata.is_asymmetric, metadata.has_emins);
             const auto read = [](const void *pointer, size_t bytes) {
-                TestCUDAStream stream;
                 std::vector<uint8_t> result(bytes);
-                EXPECT_EQ(cudaMemcpyAsync(result.data(), pointer, bytes, cudaMemcpyDeviceToHost, stream.native()), cudaSuccess);
-                EXPECT_EQ(stream.synchronize(), cudaSuccess);
+                if (bytes != 0)
+                {
+                    TestCUDAStream stream;
+                    EXPECT_EQ(cudaMemcpyAsync(result.data(), pointer, bytes, cudaMemcpyDeviceToHost, stream.native()), cudaSuccess);
+                    EXPECT_EQ(stream.synchronize(), cudaSuccess);
+                }
                 return result;
             };
-            const auto before_payload = read(dst.ptrs.d_vnni, dst.vnni_bytes);
-            const auto before_codes = read(dst.ptrs.d_scales, dst.scales_bytes);
-            const auto before_headers = read(dst.ptrs.d_mins, dst.mins_bytes);
-            const auto source_payload = read(src.ptrs.d_vnni, src.vnni_bytes);
-            const auto source_codes = read(src.ptrs.d_scales, src.scales_bytes);
-            const auto source_headers = read(src.ptrs.d_mins, src.mins_bytes);
+            const bool sends = !context || context->rank() == sender;
+            const bool receives = !context || context->rank() != sender;
+            const auto before_payload = receives ? read(dst.ptrs.d_vnni, dst.vnni_bytes) : std::vector<uint8_t>{};
+            const auto before_codes = receives ? read(dst.ptrs.d_scales, dst.scales_bytes) : std::vector<uint8_t>{};
+            const auto before_headers = receives ? read(dst.ptrs.d_mins, dst.mins_bytes) : std::vector<uint8_t>{};
+            const auto source_payload = receives ? read(src.ptrs.d_vnni, src.vnni_bytes) : std::vector<uint8_t>{};
+            const auto source_codes = receives ? read(src.ptrs.d_scales, src.scales_bytes) : std::vector<uint8_t>{};
+            const auto source_headers = receives ? read(src.ptrs.d_mins, src.mins_bytes) : std::vector<uint8_t>{};
             using P = MoEExpertProjectionOwnership::Projection;
             using R = MoEProjectionResidence;
             const auto overlap = ExpertTierWeightProjectionIntersection::between(
                 P{R::ParticipantOutputSlice, 8, 512, 0, src_n, 0, src_k},
                 P{R::ParticipantInputSlice, 8, 512, 3, dst_n, 256, dst_k});
-            const NativeQuantisedSourceIdentity provenance{.codebook_id = book, .is_superblock = true, .present = true};
-            // Both logical rank endpoints use their local ordinal zero. This
-            // exercises native CUDA endpoint operations, with the test delivering MPI bytes.
+            const NativeQuantisedSourceIdentity provenance{.codebook_id = metadata.codebook_id, .is_superblock = true, .present = true};
             const MoEOverlayRemoteProjectionIdentity identity{
                 .expected_epoch = 811, .candidate_epoch = 812, .execution_fingerprint = {.low = 19, .high = 71},
                 .layer_idx = 0, .expert_id = 1, .projection = ExpertTierWeightProjection::Down,
-                .source_participant = 0, .destination_participant = 1,
-                .source_world_rank = 0, .destination_world_rank = 1, .source_device = device, .destination_device = device};
+                .source_participant = sender, .destination_participant = 1 - sender,
+                .source_world_rank = sender, .destination_world_rank = 1 - sender, .source_device = device, .destination_device = device};
             constexpr uint32_t capacity = 64;
             const auto manifest = makeMoEOverlayRemoteGpuProjectionManifest(identity, src, provenance, capacity, overlap);
             ASSERT_TRUE(manifest.carriesCodedGpuUnits());
+            ASSERT_EQ(manifest.total_bytes, expected_wire_bytes);
             auto &transfers = TransferEngine::instance();
-            const auto staging = transfers.allocatePersistentTransferStagingSlices(capacity, 2, device, HostTransferAccess::CrossProcessReadable);
-            const auto execution = test::ComponentTransferExecutionPoolFixtureAccess::allocate(transfers, 2, device, "cuda_coded_remote_relay");
+            const unsigned lane_count = context ? 1 : 2;
+            const auto staging = transfers.allocatePersistentTransferStagingSlices(capacity, lane_count, device, HostTransferAccess::CrossProcessReadable);
+            const auto execution = test::ComponentTransferExecutionPoolFixtureAccess::allocate(transfers, lane_count, device, "cuda_coded_remote_relay");
             const auto lane = [&](unsigned i) {
                 return std::make_shared<MoEOverlayGpuRemoteProjectionLane>(MoEOverlayGpuRemoteProjectionLane::Config{
                     .device = device, .staging = staging.at(i), .execution = execution.at(i),
                     .progress = BackgroundTransferProgressBinding::nativeStream(),
                     .lane_name = "cuda_coded_remote_relay_" + std::to_string(i), .perf_device = device.toString()});
             };
-            auto send = lane(0), receive = lane(1);
             std::string error;
-            ASSERT_TRUE(send->materialize(&error)) << error;
-            ASSERT_TRUE(receive->materialize(&error)) << error;
-            MoEOverlayGpuRemoteProjectionSource source(manifest, send, src,
-                ExpertTierSourceReadiness::publishedResidencyBank(identity.expected_epoch), source_owner);
-            MoEOverlayGpuRemoteProjectionDestination destination(identity, receive,
-                [&](const auto &, auto *binding, std::string *) {
-                    *binding = {.descriptor = dst, .engine = std::shared_ptr<ITensorGemm>(destination_owner, destination_owner->kernel)};
-                    return true;
-                }, destination_owner);
-            ASSERT_TRUE(destination.beginManifest(manifest, &error)) << error;
+            std::shared_ptr<MoEOverlayGpuRemoteProjectionLane> send, receive;
+            std::shared_ptr<MoEOverlayGpuRemoteProjectionSource> source;
+            std::shared_ptr<MoEOverlayGpuRemoteProjectionDestination> destination;
+            if (sends)
+            {
+                send = lane(0);
+                ASSERT_TRUE(send->materialize(&error)) << error;
+                source = std::make_shared<MoEOverlayGpuRemoteProjectionSource>(manifest, send, src,
+                    ExpertTierSourceReadiness::publishedResidencyBank(identity.expected_epoch), source_owner);
+            }
+            if (receives)
+            {
+                receive = lane(context ? 0 : 1);
+                ASSERT_TRUE(receive->materialize(&error)) << error;
+                destination = std::make_shared<MoEOverlayGpuRemoteProjectionDestination>(identity, receive,
+                    [&](const auto &, auto *binding, std::string *) {
+                        *binding = {.descriptor = dst, .engine = std::shared_ptr<ITensorGemm>(destination_owner, destination_owner->kernel)};
+                        return true;
+                    }, destination_owner);
+            }
             const auto wait = [&](const auto &poll) {
                 const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
                 auto progress = poll();
@@ -968,45 +994,102 @@ namespace llaminar2
                 }
                 return progress;
             };
-            size_t wire_bytes = 0, chunks = 0;
-            while (!destination.complete())
+            if (context)
             {
-                MoEOverlayRemoteProjectionChunkView chunk;
-                ASSERT_EQ(wait([&] { return source.pollNextChunk(&chunk, &error); }), MoEOverlayResidencyWaveProgress::Ready) << error;
-                ASSERT_GT(chunk.payload.size(), 0u);
-                ASSERT_LE(chunk.payload.size(), capacity);
-                auto progress = destination.beginChunk(chunk.header, chunk.payload, &error);
-                if (progress == MoEOverlayResidencyWaveProgress::Pending)
-                    progress = wait([&] { return destination.pollChunk(&error); });
-                ASSERT_EQ(progress, MoEOverlayResidencyWaveProgress::Ready) << error;
-                wire_bytes += chunk.payload.size();
-                ++chunks;
-                ASSERT_TRUE(source.acknowledgeChunkSent(chunk.header, &error)) << error;
+                // The peer owns the other endpoint; only the private MPI transport delivers chunks.
+                MoEOverlayMPIRemoteProjectionTransport transport({
+                    .mpi_context = context,
+                    .lane_budget = MoEOverlayRemoteProjectionLaneBudget::fromUniformCycles(1, 1, 1),
+                    .staging_capacity_bytes = capacity,
+                    .perf_device = "mpi_remote_projection_cuda_test",
+                });
+                auto reservation = transport.reserve(0, identity, source, destination);
+                ASSERT_EQ(reservation.status, MoEOverlayResidencyStageStartStatus::Started) << reservation.error;
+                ASSERT_NE(reservation.operation, nullptr);
+                ASSERT_EQ(wait([&] { return reservation.operation->poll(&error); }), MoEOverlayResidencyWaveProgress::Ready) << error;
+                const auto measurement = reservation.operation->completedMeasurement();
+                ASSERT_TRUE(measurement.has_value());
+                EXPECT_TRUE(measurement->valid());
+                EXPECT_EQ(measurement->bytes, expected_wire_bytes);
             }
-            ASSERT_TRUE(destination.publishFinal(&error)) << error;
-            EXPECT_GT(chunks, 1u);
-            EXPECT_EQ(wire_bytes, 8u * (2u * 12 + 2 + 1) + 2 * sizeof(uint16_t));
-            EXPECT_EQ(wire_bytes, manifest.total_bytes);
-            EXPECT_EQ(send->stats().device_to_host_submissions, chunks);
-            EXPECT_EQ(receive->stats().host_to_device_submissions, chunks);
+            else
+            {
+                ASSERT_TRUE(destination->beginManifest(manifest, &error)) << error;
+                size_t wire_bytes = 0;
+                while (!destination->complete())
+                {
+                    MoEOverlayRemoteProjectionChunkView chunk;
+                    ASSERT_EQ(wait([&] { return source->pollNextChunk(&chunk, &error); }), MoEOverlayResidencyWaveProgress::Ready) << error;
+                    ASSERT_GT(chunk.payload.size(), 0u);
+                    ASSERT_LE(chunk.payload.size(), capacity);
+                    auto progress = destination->beginChunk(chunk.header, chunk.payload, &error);
+                    if (progress == MoEOverlayResidencyWaveProgress::Pending)
+                        progress = wait([&] { return destination->pollChunk(&error); });
+                    ASSERT_EQ(progress, MoEOverlayResidencyWaveProgress::Ready) << error;
+                    wire_bytes += chunk.payload.size();
+                    ASSERT_TRUE(source->acknowledgeChunkSent(chunk.header, &error)) << error;
+                }
+                ASSERT_TRUE(destination->publishFinal(&error)) << error;
+                EXPECT_EQ(wire_bytes, expected_wire_bytes);
+                EXPECT_EQ(send->stats().device_to_host_submissions, receive->stats().host_to_device_submissions);
+            }
+            if (sends)
+                EXPECT_GT(send->stats().device_to_host_submissions, 1u);
+            if (!receives)
+                return;
+            EXPECT_GT(receive->stats().host_to_device_submissions, 1u);
+            ASSERT_TRUE(destination->complete());
+
+            // Compare original physical bytes, not decoded values that could
+            // conceal a changed scale code or damage to a neighbouring row.
             const auto payload_after = read(dst.ptrs.d_vnni, dst.vnni_bytes);
             const auto codes_after = read(dst.ptrs.d_scales, dst.scales_bytes);
             const auto headers_after = read(dst.ptrs.d_mins, dst.mins_bytes);
+            const auto code_bits = sb::superblockCodePlaneBits(metadata.codebook_id);
+            const auto header_bytes = sb::superblockFieldBytes(metadata.codebook_id);
+            const auto payload_bytes = metadata.payload_bytes;
+            if (code_bits == 0)
+            {
+                EXPECT_TRUE(codes_after.empty());
+                EXPECT_EQ(dst.ptrs.d_scales, static_cast<const void *>(dst.ptrs.d_vnni));
+            }
             for (unsigned block = 0; block < dst_k / 32; ++block)
                 for (unsigned row = 0; row < dst_n; ++row)
                 {
                     const auto index = block * dst_n + row;
                     const auto original = (block + 8) * src_n + row + 3;
                     const bool live = row < 2;
-                    EXPECT_EQ(std::memcmp(payload_after.data() + index * 12,
-                        live ? source_payload.data() + original * 12 : before_payload.data() + index * 12, 12), 0);
-                    EXPECT_EQ(sb::loadPackedBits(codes_after.data(), index * 12, 12), live
-                        ? sb::loadPackedBits(source_codes.data(), original * 12, 12)
-                        : sb::loadPackedBits(before_codes.data(), index * 12, 12));
+                    EXPECT_EQ(std::memcmp(payload_after.data() + index * payload_bytes,
+                        live ? source_payload.data() + original * payload_bytes : before_payload.data() + index * payload_bytes, payload_bytes), 0);
+                    if (code_bits != 0)
+                        EXPECT_EQ(sb::loadPackedBits(codes_after.data(), index * code_bits, code_bits), live
+                            ? sb::loadPackedBits(source_codes.data(), original * code_bits, code_bits)
+                            : sb::loadPackedBits(before_codes.data(), index * code_bits, code_bits));
                 }
             for (unsigned row = 0; row < dst_n; ++row)
-                EXPECT_EQ(std::memcmp(headers_after.data() + row * 2, row < 2 ? source_headers.data() + (src_n + row + 3) * 2
-                    : before_headers.data() + row * 2, 2), 0);
+                EXPECT_EQ(std::memcmp(headers_after.data() + row * header_bytes,
+                    row < 2 ? source_headers.data() + (src_n + row + 3) * header_bytes : before_headers.data() + row * header_bytes,
+                    header_bytes), 0);
+        }
+
+        /** @test The in-process control delivers the same native CUDA endpoint contract without MPI. */
+        TEST_F(CUDAExpertTierWeightKernelsTest, CodedRemoteEndpointsPreserveOriginalGpuPlanes)
+        {
+            proveCodedRemoteGpuPlanes("Q3_K", native_quantised_formats::Q3_K, 220);
+        }
+
+        /** @test Two real MPI ranks relay in-payload and separate source codes in opposite directions. */
+        TEST_F(CUDAExpertTierWeightKernelsTest, CodedMpiRelayPreservesOriginalGpuPlanes)
+        {
+            int rank = -1, size = 0;
+            ASSERT_EQ(MPI_Comm_rank(MPI_COMM_WORLD, &rank), MPI_SUCCESS);
+            ASSERT_EQ(MPI_Comm_size(MPI_COMM_WORLD, &size), MPI_SUCCESS);
+            ASSERT_EQ(size, 2);
+            const auto context = std::make_shared<MPIContext>(rank, size, MPI_COMM_WORLD);
+            // 16 live blocks plus two header words per transfer. Q4_K's
+            // 12-bit codes occupy three bytes for each pair of live columns.
+            ASSERT_NO_FATAL_FAILURE(proveCodedRemoteGpuPlanes("IQ2_XXS", native_quantised_formats::IQ2_XXS, 132, context, 0));
+            ASSERT_NO_FATAL_FAILURE(proveCodedRemoteGpuPlanes("Q4_K", native_quantised_formats::Q4_K, 288, context, 1));
         }
 
 #include "utils/ExpertTierCapturedPackedTransferContract.inc"

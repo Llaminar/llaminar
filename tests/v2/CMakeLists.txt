@@ -12526,12 +12526,13 @@ add_v2_test(V2_Integration_CUDA_MoEFloatingSharedExpertTableDecode
     TIMEOUT 30
 )
 add_executable(v2_integration_cuda_expert_tier_weight_kernels
-    integration/kernels/cuda/Test__CUDAExpertTierWeightKernels.cpp)
+    integration/kernels/cuda/Test__CUDAExpertTierWeightKernels.cpp
+    integration/mpi_gtest_main.cpp)
 target_link_libraries(v2_integration_cuda_expert_tier_weight_kernels
-    llaminar2_core GTest::gtest GTest::gtest_main CUDA::cudart)
+    llaminar2_core GTest::gtest CUDA::cudart MPI::MPI_CXX)
 add_v2_test(V2_Integration_CUDA_ExpertTierWeightKernels
     COMMAND $<TARGET_FILE:v2_integration_cuda_expert_tier_weight_kernels>
-        --gtest_filter=*-CUDAExpertTierWeightKernelsTest.SecondaryDeviceRemoteProjectionRestoresOwningDeviceBeforeRepack
+        --gtest_filter=*-CUDAExpertTierWeightKernelsTest.SecondaryDeviceRemoteProjectionRestoresOwningDeviceBeforeRepack:CUDAExpertTierWeightKernelsTest.CodedMpiRelayPreservesOriginalGpuPlanes
     LABELS "V2;Integration;CUDA;MoE;ExpertOverlay;WeightStreaming;Repack;ByteExact;ExplicitStream"
     MPI_PROCS 1
     NO_MODELS
@@ -12542,6 +12543,12 @@ add_v2_test(V2_Integration_CUDA_CodedCompactExpertTierPlanes
         --gtest_filter=CUDAExpertTierWeightKernelsTest.FileDensityPlanesRoundTripMatchesSourceNative:CUDAExpertTierWeightKernelsTest.CapturedCodedPeerRectanglePreservesShiftedNeighbors:CUDAExpertTierWeightKernelsTest.CodedRemoteEndpointsPreserveOriginalGpuPlanes
     LABELS "V2;Integration;ProductionTestPreflight;CUDA;MoE;ExpertOverlay;Transfer;ByteExact;Regression"
     MPI_PROCS 1 NO_MODELS TIMEOUT 60)
+add_v2_test(V2_Integration_CUDA_CodedExpertRelay_MPI
+    COMMAND $<TARGET_FILE:v2_integration_cuda_expert_tier_weight_kernels>
+        --gtest_filter=CUDAExpertTierWeightKernelsTest.CodedMpiRelayPreservesOriginalGpuPlanes
+    LABELS "V2;Integration;ProductionTestPreflight;CUDA;MoE;ExpertOverlay;MPI;Transfer;ByteExact;Regression"
+    MPI_PROCS 2 NO_MODELS TIMEOUT 60)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDA_CodedExpertRelay_MPI)
 add_v2_test(V2_Integration_CUDA_ExpertTierWeightKernels_MultiDevice
     COMMAND $<TARGET_FILE:v2_integration_cuda_expert_tier_weight_kernels>
         --gtest_filter=CUDAExpertTierWeightKernelsTest.SecondaryDeviceRemoteProjectionRestoresOwningDeviceBeforeRepack
