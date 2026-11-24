@@ -14,6 +14,7 @@
 #include "PipelineForwardGraphEdges.h"
 #include "execution/mtp/MTPMainForwardPolicy.h"
 #include "execution/moe/MoEOverlayInferenceTransactionService.h"
+#include "execution/moe/DeviceMoERebalanceCadenceRecipe.h"
 #include <functional>
 #include <array>
 #include <memory>
@@ -342,8 +343,8 @@ private:
     bool advanceHostedFollowerMaintenance();
     /** @brief Submit one complete original follower parent and publish its actual captured epoch release. */
     bool submitHostedFollowerCapture(size_t participant, const IGPUGraphCapture &capture);
-    /** @return This participant's complete retained CUDA cadence transaction, or null for inactive placement. */
-    const IGPUGraphCapture *nativeStageMaintenance(size_t participant) const;
+    /** @return Sources for recording cadence inside this native participant's own loop, absent when inactive. */
+    std::optional<DeviceMoERebalanceCadenceRecipe> nativeStageMaintenance(size_t participant) const;
     /** @return Frozen domain containing one flattened participant. */
     const Domain &domainFor(size_t participant) const;
     /** @return First participant of the terminal domain (not the last physical GPU). */

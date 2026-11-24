@@ -27242,6 +27242,12 @@ if(HAVE_CUDA)
         MPI_PROCS 1
         NO_MODELS
     )
+    add_v2_test(V2_Integration_CUDA_PipelineFollowerMoECadence
+        COMMAND $<TARGET_FILE:v2_integration_cuda_graph_capture>
+            --gtest_filter=Test__CUDAGraphCapture.FollowerCadenceUsesOriginalSourcesInNativeWhile
+        LABELS "V2;Integration;ProductionTestPreflight;CUDA;MoE;Pipeline;GraphCapture;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDA_PipelineFollowerMoECadence)
     add_v2_test(V2_Integration_CUDAGraphDependencyReduction
         COMMAND $<TARGET_FILE:v2_integration_cuda_graph_capture>
             --gtest_filter=Test__CUDAGraphCapture.DependencyReductionPreservesCapturedForkJoin

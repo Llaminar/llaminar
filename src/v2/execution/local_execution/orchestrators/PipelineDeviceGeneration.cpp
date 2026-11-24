@@ -1954,18 +1954,16 @@ bool PipelineDeviceGeneration::begin(const DeviceGenerationAdmissionRequest &req
     return true;
 }
 
-const IGPUGraphCapture *PipelineDeviceGeneration::nativeStageMaintenance(size_t participant) const
+std::optional<DeviceMoERebalanceCadenceRecipe> PipelineDeviceGeneration::nativeStageMaintenance(size_t participant) const
 {
     auto &stage = *stages_.at(participant);
     if (execution_policy_ != DeviceGenerationExecutionPolicy::NativeConditionalGraph ||
-        !stage.usesParticipantLocalDeviceMoERebalanceController()) return nullptr;
-    auto &cache = stage.device_moe_rebalance_maintenance_graph_;
+        !stage.usesParticipantLocalDeviceMoERebalanceController()) return std::nullopt;
     std::string error;
-    if (!cache.graph || cache.workspace_generation != stage.workspaceGeneration(stage.state_.device_id) ||
-        !stage.composeDeviceMoERebalanceCadenceTransaction(&error) || !cache.cadence_transaction_capture ||
-        !cache.cadence_transaction_capture->hasExecutable())
-        throw std::logic_error("Pipeline maintenance lost its complete original CUDA cadence transaction: " + error);
-    return cache.cadence_transaction_capture.get();
+    auto cadence = stage.nativeMoERebalanceCadenceRecipe(&error);
+    if (!cadence)
+        throw std::logic_error("Pipeline maintenance lost its original CUDA cadence sources: " + error);
+    return cadence;
 }
 
 bool PipelineDeviceGeneration::submitHostedFollowerCapture(size_t participant, const IGPUGraphCapture &capture)
@@ -2075,7 +2073,7 @@ bool PipelineDeviceGeneration::prepareParticipants(DeviceGenerationSamplingMode 
         if (transport_ == Transport::NativeDomains && stage.usesParticipantLocalDeviceMoERebalanceController() &&
             sparseQueryExecutionProgramIndex(stage.sparseQueryGraphProgram()) == 0 &&
             !stage.maybeRunDeviceMoERebalanceMaintenanceGraph()) return false;
-        const auto *maintenance = nativeStageMaintenance(index);
+        const auto maintenance = nativeStageMaintenance(index);
         const auto forward = stage.materializeOrdinaryGenerationForward(
             stage.device_resident_logical_sequence_state_storage_.next_condition_tokens_device,
             OrdinaryForwardRetentionKind::NativeComposable, &error);
@@ -2083,12 +2081,12 @@ bool PipelineDeviceGeneration::prepareParticipants(DeviceGenerationSamplingMode 
         auto &loop = stage.deviceGenerationLoopGraph();
         const auto generation = stage.workspaceGeneration(stage.state_.device_id);
         if (loop.valid && loop.workspace_generation == generation &&
-            loop.ordinary_forward_identity == forward->signature && loop.ordinary_maintenance_capture == maintenance && loop.source_fragments.size() == 1 &&
+            loop.ordinary_forward_identity == forward->signature && loop.ordinary_native_cadence == maintenance && loop.source_fragments.size() == 1 &&
             loop.source_fragments.front().capture == forward->native()->capture)
             return true;
         loop.invalidateGraph();
         loop.ordinary_forward_identity = forward->signature;
-        loop.ordinary_maintenance_capture = maintenance;
+        loop.ordinary_native_cadence = maintenance;
         loop.source_fragments.push_back({"pipeline_local_forward", forward->native()->capture});
         loop.workspace_generation = generation;
         loop.request_count = 1;
@@ -2223,8 +2221,8 @@ bool PipelineDeviceGeneration::composeParticipants()
         if (tail) {
             body.push_back({"tail sampler", loop.ordinary_children[OrdinaryGenerationGraphPlan::decode_sampler].get()});
         }
-        if (const auto *maintenance = nativeStageMaintenance(index))
-            body.push_back({.name = "original stage cadence and maintenance", .capture = maintenance});
+        if (const auto cadence = nativeStageMaintenance(index))
+            body.insert(body.end(), cadence->fragments().begin(), cadence->fragments().end());
         if (hosted)
         {
             (void)stage.retainedStorageTerminalFragments();

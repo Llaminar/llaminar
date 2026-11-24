@@ -839,9 +839,16 @@ bool DeviceGraphOrchestrator::materializeOrdinaryDeviceGenerationLoopGraph(
     std::string detail;
     const bool owns_maintenance =
         usesParticipantLocalDeviceMoERebalanceController();
+    std::optional<DeviceMoERebalanceCadenceRecipe> native_cadence;
     const uint32_t *maintenance_due = nullptr;
     const IGPUGraphCapture *maintenance_capture = nullptr;
-    if (owns_maintenance)
+    if (owns_maintenance && !hosted)
+    {
+        native_cadence = nativeMoERebalanceCadenceRecipe(&detail);
+        if (!native_cadence)
+            return fail(detail);
+    }
+    else if (owns_maintenance)
     {
         const auto &maintenance = device_moe_rebalance_maintenance_graph_;
         const auto *const controller =
@@ -896,6 +903,7 @@ bool DeviceGraphOrchestrator::materializeOrdinaryDeviceGenerationLoopGraph(
         loop.ordinary_sampling_identity == params && loop.ordinary_forward_identity == signature &&
         loop.read_ahead_resources == read_ahead &&
         loop.ordinary_composition == composition &&
+        loop.ordinary_native_cadence == native_cadence &&
         loop.ordinary_maintenance_capture == maintenance_capture &&
         loop.ordinary_maintenance_due == maintenance_due &&
         (hosted_overlay
@@ -958,25 +966,15 @@ bool DeviceGraphOrchestrator::materializeOrdinaryDeviceGenerationLoopGraph(
     }
     else if (!hosted)
     {
-        std::array<DeviceControlledLoopFragment, 3> iteration = {{
+        std::array<DeviceControlledLoopFragment, 2u + DeviceMoERebalanceCadenceRecipe::fragment_count> iteration = {{
             {.name = "ordinary_resident_forward", .capture = native_forward->capture},
             {.name = "ordinary_decode_sample", .capture = loop.ordinary_children[Plan::decode_sampler].get()},
-            {}}};
-        if (owns_maintenance)
-        {
-            // The model's final routed layer publishes the serial commit clock.
-            // Maintenance consumes that due word only after the sampled response
-            // and the forward's captured epoch release have completed.
-            iteration[2] = {
-                .name = "ordinary_device_moe_maintenance",
-                .capture = maintenance_capture,
-                .execution = DeviceControlledLoopFragmentExecution::IfDeviceWordNonZero,
-                .condition_word_device = maintenance_due};
-        }
+        }};
+        if (native_cadence)
+            std::copy(native_cadence->fragments().begin(), native_cadence->fragments().end(), iteration.begin() + 2u);
         if (!DeviceGenerationGraphProgram::native(*loop.capture, control,
                 {.initialization = initialization,
-                 .iteration = std::span<const DeviceControlledLoopFragment>(
-                     iteration.data(), 2u + static_cast<size_t>(owns_maintenance)),
+                 .iteration = std::span<const DeviceControlledLoopFragment>(iteration.data(), native_cadence ? iteration.size() : 2u),
                  .terminal=retainedStorageTerminalFragments()},
                 detail))
             return fail(detail);
@@ -1043,6 +1041,7 @@ bool DeviceGraphOrchestrator::materializeOrdinaryDeviceGenerationLoopGraph(
     loop.ordinary_forward_identity = signature;
     loop.read_ahead_resources = read_ahead;
     loop.ordinary_composition = composition;
+    loop.ordinary_native_cadence = native_cadence;
     loop.ordinary_maintenance_capture = maintenance_capture;
     loop.ordinary_maintenance_due = maintenance_due;
     loop.ordinary_leading = admission.initial_leading_row_disposition;

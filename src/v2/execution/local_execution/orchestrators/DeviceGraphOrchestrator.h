@@ -44,6 +44,7 @@
 #include "../../../backends/GPUDeviceContextPool.h"
 #include "IInferenceRunner.h"
 #include "execution/moe/NativeMoEMovementArchive.h"
+#include "execution/moe/DeviceMoERebalanceCadenceRecipe.h"
 #include "../graph/DeviceGraphExecutor.h"
 #include "../device/DeviceContext.h"
 #include "../device/WorkspaceAllocator.h"
@@ -6077,6 +6078,9 @@ namespace llaminar2
         bool composeDeviceMoERebalanceCadenceTransaction(
             std::string *error = nullptr);
 
+        /** @return The current native cadence's ordinary sources and device predicate, or a diagnostic. */
+        std::optional<DeviceMoERebalanceCadenceRecipe> nativeMoERebalanceCadenceRecipe(std::string *error = nullptr);
+
         /**
          * @brief Initialize the persistent MoE ticket on a request-reset stream.
          *
@@ -8532,7 +8536,9 @@ namespace llaminar2
             std::optional<ForwardGraphSignature> pipeline_verifier_identity;
             /** Exact ordinary ownership/lifecycle topology embedded in this parent. */
             std::optional<OrdinaryGenerationComposition> ordinary_composition;
-            /** Exact maintenance executable borrowed by an ordinary parent, if any. */
+            /** Exact native cadence sources and device predicate borrowed by an ordinary parent. */
+            std::optional<DeviceMoERebalanceCadenceRecipe> ordinary_native_cadence;
+            /** Exact hosted maintenance executable, if any. */
             const IGPUGraphCapture *ordinary_maintenance_capture = nullptr;
             /** Exact resident condition word embedded beside that executable. */
             const uint32_t *ordinary_maintenance_due = nullptr;
@@ -8618,6 +8624,7 @@ namespace llaminar2
                 pipeline_verifier_branches.clear();
                 pipeline_verifier_identity.reset();
                 ordinary_composition.reset();
+                ordinary_native_cadence.reset();
                 ordinary_maintenance_capture = nullptr;
                 ordinary_maintenance_due = nullptr;
                 workspace_generation = 0;
