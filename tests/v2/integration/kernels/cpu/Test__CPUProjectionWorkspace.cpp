@@ -4,10 +4,16 @@
  *
  * The real prepared kernels execute serial decode and grouped verification.
  * Shared weights see separate, reused arenas; missing or undersized storage
- * fails before any transform write. This is a model-free preflight regression,
- * not a replacement for captured model parity or a performance certificate.
+ * fails before any transform write. A missing partial bank fails exactly the
+ * invocations whose own row count needs it (an ordered K tree, or a prefill
+ * panel at or above 16 rows), with cells on both sides of that threshold.
+ * Workspaces are admitted for the exact team width of each worker sweep cell.
+ * This is a model-free preflight regression, not a replacement for captured
+ * model parity or a performance certificate.
  */
 #include "kernels/cpu/gemm/CPUNativeQuantisedGemmKernel.h"
+#include "kernels/cpu/gemm/CPUNativeNEONPanelWorkspace.h"
+#include "kernels/cpu/gemm/CPUNativeX86PanelWorkspace.h"
 #include "kernels/cpu/gemm/FloatingPointGemmKernel.h"
 #include "execution/compute_stages/stages/LMHeadStage.h"
 #include "utils/CPUProjectionTestWorkspace.h"
@@ -206,13 +212,51 @@ void proveWorkspace(ITensorGemm &kernel, int n, int k)
     EXPECT_EQ(consumer->getWorkspace(), nullptr);
 }
 
-/** @brief Alpha/beta preserve bytes under a retained workshare. */
-void proveOutputAccumulation(cpu::native_quantised::CPUNativeQuantisedGemmKernel &kernel, int n, int k)
+/**
+ * @brief Whether a missing partial bank must fail an invocation of @p rows.
+ * @param source Source tensor format of the prepared matrix.
+ * @param policy Prepared arithmetic policy.
+ * @param n,k Physical projection geometry.
+ * @param rows Physical invocation rows.
+ * @param workers Exact team width the workspace was admitted for.
+ * @return Independent restatement of the bank's two owners.
+ *
+ * Below the 16-row panel minimum only an ordered serial K tree borrows the
+ * bank (x86 only: native ARM rows own full-K register trees). At and above
+ * it, a format with a decode-once prefill panel also borrows it: on native
+ * ARM Q5_0, Q5_K and IQ3_S (Q5_0 quotes one slot for any team); on x86
+ * Q4_K, Q5_K, IQ3_S, IQ4_XS and Q5_0 when every worker owns an N strip.
+ */
+bool partialBankRequired(TensorType source, CPUProjectionNumericalPolicy policy, int n, int k, int rows, int workers)
+{
+    static_assert(cpu::native_quantised::neon_panel::min_rows == 16 && cpu::native_quantised::x86_panel::min_rows == 16);
+    const bool panel_rows = rows >= 16;
+#if defined(__aarch64__)
+    (void)policy, (void)n, (void)k, (void)workers;
+    return panel_rows && (source == TensorType::Q5_0 || source == TensorType::Q5_K || source == TensorType::IQ3_S);
+#else
+    // 2*n*k stays below the 16M-FLOP backend-native K split (checked by the
+    // caller); the GPU-aligned expert tree folds min(K/32, 16) partitions.
+    const bool ordered = policy == CPUProjectionNumericalPolicy::GPUAlignedExpert && k / 32 > 1;
+    const int lanes = activeISALevel() >= ISALevel::AVX512 ? 16 : 8;
+    const bool panel_format = source == TensorType::Q4_K || source == TensorType::Q5_K ||
+        source == TensorType::IQ3_S || source == TensorType::IQ4_XS || source == TensorType::Q5_0;
+    return ordered || (panel_rows && panel_format && (n + lanes - 1) / lanes >= workers);
+#endif
+}
+
+/** @brief Alpha/beta preserve bytes under a retained workshare.
+ * @param kernel Prepared projection under test.
+ * @param source Source tensor format of @p kernel.
+ * @param n,k Physical projection geometry.
+ */
+void proveOutputAccumulation(cpu::native_quantised::CPUNativeQuantisedGemmKernel &kernel, TensorType source, int n, int k)
 {
     constexpr int max_rows = 31;
+    ASSERT_LT(2LL * n * k, 16'000'000LL) << "geometry must stay below the backend-native K split";
     auto requirements = kernel.getWorkspaceRequirements(max_rows, n, k);
     kernel.appendOutputAccumulationWorkspaceRequirements(requirements, max_rows, n);
-    CPUProjectionTestWorkspace workspace(max_rows, k, requirements), missing_product(max_rows, k);
+    CPUProjectionTestWorkspace missing_product(max_rows, k);
     auto input = TestTensorFactory::createFP32Random({max_rows, size_t(k)}, -.6f, .6f, 661);
     auto initial = TestTensorFactory::createFP32Random({max_rows, size_t(n)}, -.8f, .8f, 673);
     auto direct = TestTensorFactory::createFP32({max_rows, size_t(n)});
@@ -221,49 +265,79 @@ void proveOutputAccumulation(cpu::native_quantised::CPUNativeQuantisedGemmKernel
     EXPECT_THROW(kernel.multiply_tensor(input.get(), team.get(), 2, n, k,
         true, -.75f, .25f, nullptr, nullptr, -1, missing_product.get()), std::runtime_error);
     EXPECT_EQ(std::memcmp(team->data(), initial->data(), team->size_bytes()), 0);
-    const auto partial_requirement = std::find_if(requirements.buffers.begin(), requirements.buffers.end(),
-        [](const auto &buffer) { return buffer.name == kCPUProjectionPartials; });
-    if (partial_requirement != requirements.buffers.end())
-    {
-        auto without_partials = requirements;
-        std::erase_if(without_partials.buffers,
-            [](const auto &buffer) { return buffer.name == kCPUProjectionPartials; });
-        CPUProjectionTestWorkspace missing_partials(max_rows, k, without_partials);
-        EXPECT_THROW(kernel.multiply_tensor(input.get(), team.get(), 2, n, k,
-            true, 1.f, 0.f, nullptr, nullptr, -1, missing_partials.get()), std::runtime_error);
-        EXPECT_EQ(std::memcmp(team->data(), initial->data(), team->size_bytes()), 0);
-    }
 
     WorkerScope restore;
-    for (int workers = 1; workers <= 8; ++workers)
-    for (const int rows : {1, 2, 3, 15, max_rows})
-    for (const float beta : {0.f, .25f})
+    // A bank-less workspace admitted for 31 rows at the exact team width: the
+    // invocation fails before any output write exactly when its own row count
+    // needs the bank, on both sides of the 16-row panel threshold.
+    for (const int workers : {1, 2})
     {
-        SCOPED_TRACE("epilogue workers=" + std::to_string(workers) + " rows=" + std::to_string(rows)
-            + " beta=" + std::to_string(beta));
         omp_set_num_threads(workers);
-        std::memcpy(direct->mutable_data(), initial->data(), initial->size_bytes());
-        std::memcpy(team->mutable_data(), initial->data(), initial->size_bytes());
-        ASSERT_TRUE(kernel.multiply_tensor(input.get(), direct.get(), rows, n, k,
-            true, -.75f, beta, nullptr, nullptr, -1, workspace.get()));
-        auto product = CPUInvocationWorkspace::require<float>(workspace.get(), kCPUProjectionProduct, max_rows * size_t(n));
-        std::fill(product.begin(), product.end(), 12345.f);
-        const size_t declared_partials = workspace.get()->getBufferSize(kCPUProjectionPartials) / sizeof(float);
-        auto partials = CPUInvocationWorkspace::require<float>(workspace.get(), kCPUProjectionPartials, declared_partials);
-        std::fill(partials.begin(), partials.end(), 12345.f);
-        std::atomic<bool> completed{true};
-#pragma omp parallel
+        const auto admitted = kernel.getWorkspaceRequirements(max_rows, n, k);
+        auto without_partials = admitted;
+        std::erase_if(without_partials.buffers,
+            [](const auto &buffer) { return buffer.name == kCPUProjectionPartials; });
+        CPUProjectionTestWorkspace complete(max_rows, k, admitted), missing_partials(max_rows, k, without_partials);
+        EXPECT_EQ(without_partials.buffers.size() != admitted.buffers.size(),
+            partialBankRequired(source, kernel.packedWeights().numerical_policy, n, k, max_rows, workers));
+        for (const int rows : {2, 15, 16, max_rows})
         {
-            if (!kernel.multiply_tensor(input.get(), team.get(), rows, n, k,
-                    true, -.75f, beta, nullptr, nullptr, -1, workspace.get()))
-                completed.store(false, std::memory_order_relaxed);
+            SCOPED_TRACE("missing partials workers=" + std::to_string(workers) + " rows=" + std::to_string(rows));
+            const bool required = partialBankRequired(source, kernel.packedWeights().numerical_policy, n, k, rows, workers);
+            EXPECT_EQ(cpu::native_quantised::nativeQuantisedProjectionPartialFloats(kernel.packedWeights(), rows) > 0, required);
+            std::memcpy(team->mutable_data(), initial->data(), initial->size_bytes());
+            if (required)
+            {
+                EXPECT_THROW(kernel.multiply_tensor(input.get(), team.get(), rows, n, k,
+                    true, 1.f, 0.f, nullptr, nullptr, -1, missing_partials.get()), std::runtime_error);
+                EXPECT_EQ(std::memcmp(team->data(), initial->data(), team->size_bytes()), 0);
+                continue;
+            }
+            std::memcpy(direct->mutable_data(), initial->data(), initial->size_bytes());
+            ASSERT_TRUE(kernel.multiply_tensor(input.get(), direct.get(), rows, n, k,
+                true, 1.f, 0.f, nullptr, nullptr, -1, complete.get()));
+            ASSERT_TRUE(kernel.multiply_tensor(input.get(), team.get(), rows, n, k,
+                true, 1.f, 0.f, nullptr, nullptr, -1, missing_partials.get()));
+            EXPECT_EQ(std::memcmp(team->data(), direct->data(), team->size_bytes()), 0);
         }
-        ASSERT_TRUE(completed.load());
-        EXPECT_EQ(std::memcmp(team->data(), direct->data(), team->size_bytes()), 0);
-        const size_t touched = beta == 0.f ? 0u : size_t(rows) * n;
-        EXPECT_TRUE(std::all_of(product.begin() + touched, product.end(), [](float x) { return x == 12345.f; }));
-        const size_t used_partials = cpu::native_quantised::nativeQuantisedProjectionPartialFloats(kernel.packedWeights(), rows);
-        EXPECT_TRUE(std::all_of(partials.begin() + used_partials, partials.end(), [](float x) { return x == 12345.f; }));
+    }
+
+    for (int workers = 1; workers <= 8; ++workers)
+    {
+        // Admit for the exact team width, as a participant does: an x86 panel
+        // needs one N strip per worker, so its quote is not monotone in width.
+        omp_set_num_threads(workers);
+        requirements = kernel.getWorkspaceRequirements(max_rows, n, k);
+        kernel.appendOutputAccumulationWorkspaceRequirements(requirements, max_rows, n);
+        CPUProjectionTestWorkspace workspace(max_rows, k, requirements);
+        for (const int rows : {1, 2, 3, 15, 16, max_rows})
+        for (const float beta : {0.f, .25f})
+        {
+            SCOPED_TRACE("epilogue workers=" + std::to_string(workers) + " rows=" + std::to_string(rows)
+                + " beta=" + std::to_string(beta));
+            std::memcpy(direct->mutable_data(), initial->data(), initial->size_bytes());
+            std::memcpy(team->mutable_data(), initial->data(), initial->size_bytes());
+            ASSERT_TRUE(kernel.multiply_tensor(input.get(), direct.get(), rows, n, k,
+                true, -.75f, beta, nullptr, nullptr, -1, workspace.get()));
+            auto product = CPUInvocationWorkspace::require<float>(workspace.get(), kCPUProjectionProduct, max_rows * size_t(n));
+            std::fill(product.begin(), product.end(), 12345.f);
+            const size_t declared_partials = workspace.get()->getBufferSize(kCPUProjectionPartials) / sizeof(float);
+            auto partials = CPUInvocationWorkspace::require<float>(workspace.get(), kCPUProjectionPartials, declared_partials);
+            std::fill(partials.begin(), partials.end(), 12345.f);
+            std::atomic<bool> completed{true};
+#pragma omp parallel
+            {
+                if (!kernel.multiply_tensor(input.get(), team.get(), rows, n, k,
+                        true, -.75f, beta, nullptr, nullptr, -1, workspace.get()))
+                    completed.store(false, std::memory_order_relaxed);
+            }
+            ASSERT_TRUE(completed.load());
+            EXPECT_EQ(std::memcmp(team->data(), direct->data(), team->size_bytes()), 0);
+            const size_t touched = beta == 0.f ? 0u : size_t(rows) * n;
+            EXPECT_TRUE(std::all_of(product.begin() + touched, product.end(), [](float x) { return x == 12345.f; }));
+            const size_t used_partials = cpu::native_quantised::nativeQuantisedProjectionPartialFloats(kernel.packedWeights(), rows);
+            EXPECT_TRUE(std::all_of(partials.begin() + used_partials, partials.end(), [](float x) { return x == 12345.f; }));
+        }
     }
 }
 
@@ -599,7 +673,7 @@ TEST(CPUProjectionWorkspace, AllQuantizedFormats)
         ASSERT_TRUE(kernel.isValid());
         proveQ8Workspace(kernel, 128, 256);
         proveWorkspace(kernel, 128, 256);
-        proveOutputAccumulation(kernel, 128, 256);
+        proveOutputAccumulation(kernel, format.tensor_type, 128, 256);
     }
 }
 
