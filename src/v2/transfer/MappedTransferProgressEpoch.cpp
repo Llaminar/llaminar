@@ -8,8 +8,8 @@
  * a free lane and enqueues a TransferEngine copy, and a later non-blocking event
  * query acquires completion. CUDA also owns a graph-bounded service branch: one
  * co-resident CTA continuously observes incrementally published inbox work and
- * retires at the primary graph terminal. ROCm retains native asynchronous SDMA
- * progress and therefore needs no captured service branch.
+ * retires at the primary graph terminal. ROCm uses asynchronous SDMA for raw
+ * transfers and finite compute on its background stream for coded mapped relay.
  */
 
 #include "MappedTransferProgressEpoch.h"
@@ -22,6 +22,10 @@
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "utils/Logger.h"
 #include "utils/PerfStatsCollector.h"
+#ifdef HAVE_ROCM
+#include "execution/moe/GPUExpertTransferBackend.h"
+#include "kernels/rocm/repack/ROCmExpertTierWeightKernels.h"
+#endif
 
 #include <algorithm>
 #include <array>
@@ -236,6 +240,59 @@ namespace llaminar2
                    command.bytes <= maximum_bytes &&
                    command.bytes_complement == ~command.bytes;
         }
+
+#ifdef HAVE_ROCM
+        /**
+         * @brief Enqueue coded conversion against the reserved slot's mapped alias.
+         * @param work Authenticated command geometry and separated metadata pointers.
+         * @param direction Immutable command-slot direction.
+         * @param device_payload Original GPU matrix payload bound by the command.
+         * @param wire Exclusive mapped host extent, in the GPU address space.
+         * @param bytes Exact live chunk extent.
+         * @param stream Background stream on which the caller records completion.
+         * @return Whether the exact native conversion was submitted.
+         */
+        bool enqueueROCmCodedMappedWork(const MappedTransferPackedWork &work,
+            MappedTransferDirection direction, std::uintptr_t device_payload, void *wire,
+            std::size_t bytes, void *stream)
+        {
+            const auto &layout = work.layout;
+            const bool download = direction == MappedTransferDirection::DeviceToHost;
+            if (work.kind != (download ? MappedTransferWorkKind::PackedGpuToCpu : MappedTransferWorkKind::PackedCpuToGpu) ||
+                work.device_staging || !layout.valid() || !layout.cpuStorage().coded() ||
+                work.first_unit >= layout.unit_count)
+                return false;
+            const auto first = expertTierWirePrefix(layout, work.first_unit);
+            if (bytes > expertTierWirePrefix(layout, layout.unit_count) - first)
+                return false;
+            const auto end = expertTierWireUnitAt(layout, first + bytes);
+            if (end <= work.first_unit || expertTierWirePrefix(layout, end) != first + bytes)
+                return false;
+            const auto count = end - work.first_unit;
+            const auto k_blocks = static_cast<std::uint32_t>(layout.gpu_K / 32);
+            const auto blocks = static_cast<std::size_t>(layout.gpu_N) * k_blocks;
+            namespace sb = native_quantised_superblock;
+            const auto bits = blocks * sb::superblockCodePlaneBits(layout.gpu_codebook_id);
+            const auto planes = sb::planeBytes(layout.gpu_codebook_id, layout.gpu_N, k_blocks, layout.gpu_superblock_phase);
+            // Publication authenticated these extents. Rebind the original GPU
+            // phase and bit offset, not the normalized CPU wire phase.
+            const ExpertTierGpuMutableProjectionView projection{
+                .payload = reinterpret_cast<std::uint8_t *>(device_payload),
+                .scales = reinterpret_cast<std::uint16_t *>(static_cast<std::uintptr_t>(work.scales)),
+                .mins = reinterpret_cast<std::uint16_t *>(static_cast<std::uintptr_t>(work.mins)),
+                .emins = reinterpret_cast<std::uint32_t *>(static_cast<std::uintptr_t>(work.emins)),
+                .payload_bytes = blocks * layout.gpu_payload_bytes_per_block,
+                .scales_bytes = bits ? (bits + layout.gpu_code_bit_shift + 7u) / 8u : 0u,
+                .mins_bytes = planes.superblock,
+                .metadata_layout = nativeQuantisedMetadataLayout(NativeQuantisedMetadataRepresentation::SuperblockCoded,
+                    layout.gpu_superblock_phase, layout.gpu_code_bit_shift)};
+            return download
+                ? launchGpuToCpuExpertTierChunkROCm(projection.asConst(), layout, work.first_unit, count,
+                    static_cast<std::uint8_t *>(wire), bytes, stream)
+                : launchCpuToGpuExpertTierChunkROCm(static_cast<const std::uint8_t *>(wire), bytes, layout,
+                    work.first_unit, count, projection, stream);
+        }
+#endif
     } // namespace
 
     MappedTransferProgressSlot::MappedTransferProgressSlot(
@@ -350,8 +407,9 @@ namespace llaminar2
         void *device_staging, std::size_t staging_capacity,
         TransferProducerDependency dependency)
     {
-        if (!valid() || pending_ || !epoch_->device().is_cuda())
-            throw std::logic_error("Packed transfer requires an idle CUDA service slot");
+        if (!valid() || pending_ || (!epoch_->device().is_cuda() &&
+            !(epoch_->device().is_rocm() && layout.cpuStorage().coded() && !device_staging)))
+            throw std::logic_error("Packed transfer requires an idle CUDA service or ROCm coded mapped slot");
         if (!source.validFor(layout) ||
             layout.direction != ExpertTierWeightConversionDirection::GpuToCpu ||
             (!device_staging && (!layout.cpuStorage().coded() || staging_capacity != 0u)) ||
@@ -385,8 +443,9 @@ namespace llaminar2
         std::uint32_t first_unit, std::uint32_t unit_count,
         void *device_staging, std::size_t staging_capacity)
     {
-        if (!valid() || pending_ || !epoch_->device().is_cuda())
-            throw std::logic_error("Packed transfer requires an idle CUDA service slot");
+        if (!valid() || pending_ || (!epoch_->device().is_cuda() &&
+            !(epoch_->device().is_rocm() && layout.cpuStorage().coded() && !device_staging)))
+            throw std::logic_error("Packed transfer requires an idle CUDA service or ROCm coded mapped slot");
         if (!destination.validFor(layout) ||
             layout.direction != ExpertTierWeightConversionDirection::CpuToGpu ||
             (!device_staging && (!layout.cpuStorage().coded() || staging_capacity != 0u)) ||
@@ -1125,6 +1184,7 @@ namespace llaminar2
         bool all_ok = true;
         bool observed_work = false;
         std::uint64_t submissions = 0u;
+        std::uint64_t coded_submissions = 0u;
         TransferEngine transfer_engine;
         const auto begin = std::chrono::steady_clock::now();
         // One timestamp per bounded worker pass is sufficient to distinguish
@@ -1345,17 +1405,32 @@ namespace llaminar2
                     ++submissions;
                     continue;
                 }
-                // The typed lease includes setup-time function preparation.
-                // The backend avoids the native queue that can be occupied by
-                // peer-held inference. Terminal events and slot lifecycle remain
-                // exactly the same in both directions and on both backends.
-                const auto address = runtime.direction == MappedTransferDirection::DeviceToHost
-                    ? entry.source_address : entry.destination_address;
-                transfer_engine.enqueueBackgroundMappedCopy(
-                    config_.execution_streams[lane_index % config_.execution_streams.size()],
-                    runtime.direction,
-                    reinterpret_cast<void *>(static_cast<std::uintptr_t>(address)),
-                    bytes, 0u, *runtime.mapped_region, 0u, bytes);
+                const auto address = static_cast<std::uintptr_t>(runtime.direction == MappedTransferDirection::HostToDevice
+                    ? entry.destination_address : entry.source_address);
+                const bool coded = entry.work[0] != 0u;
+                if (!coded)
+                {
+                    // Raw movement retains the original SDMA submission.
+                    transfer_engine.enqueueBackgroundMappedCopy(
+                        config_.execution_streams[lane_index % config_.execution_streams.size()],
+                        runtime.direction, reinterpret_cast<void *>(address),
+                        bytes, 0u, *runtime.mapped_region, 0u, bytes);
+                }
+                else
+                {
+#ifdef HAVE_ROCM
+                    MappedTransferPackedWork work;
+                    std::memcpy(static_cast<void *>(&work), entry.work, sizeof(work));
+                    const bool submitted = config_.device.is_rocm() &&
+                        detail::restoreROCmDeviceOrdinal(config_.device.rocm_ordinal()) &&
+                        enqueueROCmCodedMappedWork(work, runtime.direction, address,
+                            runtime.mapped_region->deviceAlias(config_.device), bytes, lane.stream);
+#else
+                    const bool submitted = false;
+#endif
+                    if (!submitted)
+                        throw std::runtime_error("could not enqueue coded mapped transfer on its owning ROCm stream");
+                }
                 if (!context_->recordEventChecked(
                         lane.terminal_event, lane.stream))
                 {
@@ -1363,6 +1438,7 @@ namespace llaminar2
                         "could not record the exact copy completion event");
                 }
                 ++submissions;
+                coded_submissions += coded;
             }
             catch (const std::exception &exception)
             {
@@ -1424,21 +1500,20 @@ namespace llaminar2
         if (submissions != 0u)
         {
             copy_submissions_.fetch_add(submissions, std::memory_order_relaxed);
-            PerfStatsCollector::addCounter(
-                "moe_overlay_residency",
-                "mapped_transfer_progress_epoch_copy_submissions",
-                static_cast<double>(submissions),
-                "maintenance",
-                config_.perf_device,
-                {{"device", config_.device.toString()},
-                 {"execution_lane_capacity",
-                  std::to_string(config_.execution_lane_capacity)},
-                 {"execution_stream_capacity",
-                  std::to_string(config_.execution_streams.size())},
-                 {"stream_class", "background_maintenance"},
-                 {"copy_mechanism", config_.device.is_cuda() ? "graph_bounded_service" : "native_sdma"},
-                 {"inference_wait", "false"},
-                 {"blocking", "false"}});
+            const auto record_submissions = [&](std::uint64_t count, const char *mechanism) {
+                if (!count) return;
+                PerfStatsCollector::addCounter(
+                    "moe_overlay_residency", "mapped_transfer_progress_epoch_copy_submissions",
+                    static_cast<double>(count), "maintenance", config_.perf_device,
+                    {{"device", config_.device.toString()},
+                     {"execution_lane_capacity", std::to_string(config_.execution_lane_capacity)},
+                     {"execution_stream_capacity", std::to_string(config_.execution_streams.size())},
+                     {"stream_class", "background_maintenance"}, {"copy_mechanism", mechanism},
+                     {"inference_wait", "false"}, {"blocking", "false"}});
+            };
+            record_submissions(coded_submissions, "native_coded_compute");
+            record_submissions(submissions - coded_submissions,
+                config_.device.is_cuda() ? "graph_bounded_service" : "native_sdma");
             if (PerfStatsCollector::isDomainEnabled(
                     "moe_overlay_residency"))
             {

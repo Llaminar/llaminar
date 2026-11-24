@@ -31103,6 +31103,7 @@ if(HAVE_ROCM)
         FileDensityPlanesRoundTripMatchesSourceNative
         CodedShadowSlotRetainsOriginalRootPhase
         CapturedCodedPeerRectanglePreservesShiftedNeighbors
+        CodedNoPeerHostRelayPreservesAllSourcePlanes
         CodedRemoteEndpointsPreserveOriginalGpuPlanes
         RectangularNativeMovementAllFormatsAndDirtyReplay
         PreparedServiceViewsIsolateAllQuantizedExecutionBindings

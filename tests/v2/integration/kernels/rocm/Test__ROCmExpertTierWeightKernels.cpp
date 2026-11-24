@@ -29,6 +29,7 @@
 #include "backends/GPUDeviceContextPool.h"
 #include "backends/IBackend.h"
 #include "execution/moe/ExpertTierWeightStream.h"
+#include "execution/moe/ExpertTierGpuBlobTransferLane.h"
 #include "kernels/KernelFactory.h"
 #include "loaders/GPUVramPreflight.h"
 #include "loaders/GPUPreparedWeightPoolLayout.h"
@@ -79,6 +80,17 @@
 #include <tuple>
 #include <utility>
 #include <vector>
+
+namespace llaminar2::test
+{
+    /** @brief Exercise the production no-peer protocol with disjoint roots on one real ROCm device. */
+    struct ExpertTierGpuBlobRelayFixtureAccess
+    {
+        /** @return A real retained relay, allowing its logical endpoints to share the test GPU. */
+        static std::unique_ptr<ExpertTierGpuBlobTransferLane> make(ExpertTierGpuBlobTransferLane::Config config)
+        { return std::unique_ptr<ExpertTierGpuBlobTransferLane>(new ExpertTierGpuBlobTransferLane(std::move(config), true)); }
+    };
+}
 
 extern "C"
 {
@@ -575,6 +587,16 @@ namespace llaminar2
                     << "all ROCm IQ decoder translation units must initialize";
             }
         };
+
+#include "utils/ExpertTierCodedNoPeerRelayContract.inc"
+        TEST_F(ROCmExpertTierWeightKernelsTest, CodedNoPeerHostRelayPreservesAllSourcePlanes)
+        {
+            proveCodedNoPeerHostRelay<TestHIPBuffer, TestHIPStream, hipSuccess>(
+                DeviceId::rocm(0),
+                [](void *output, const void *input, std::size_t bytes, hipStream_t stream) {
+                    return hipMemcpyAsync(output, input, bytes, hipMemcpyDeviceToHost, stream);
+                }, launchROCmCodedPeerProjectionRectangle);
+        }
 
         /** @test Native ROCm migration preserves every coded plane through a phased, partial intersection. */
         TEST_F(ROCmExpertTierWeightKernelsTest, FileDensityPlanesRoundTripMatchesSourceNative)

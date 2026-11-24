@@ -7,8 +7,8 @@
  * cross-runtime event waits are deliberately forbidden. Two persistent slots
  * let the source prepare a later chunk while the destination consumes an
  * earlier one, without allocation, synchronization, or inference-stream joins.
- * Coded CUDA edges use the same compact unit wire as cross-rank relay and
- * pack/unpack directly against the retained mapped slots, never a raw bit-plane DMA.
+ * Coded same-backend edges use the compact unit wire of cross-rank relay.
+ * Both endpoints convert against retained mapped slots, never raw bit-plane DMA.
  */
 
 #include "ExpertTierGpuBlobTransferLane.h"
@@ -49,7 +49,7 @@ namespace llaminar2
                     descriptor.ptrs.d_emins != nullptr);
         }
 
-        /** @return Exact live CUDA planes while preserving the backing allocation's layout byte and bit placement. */
+        /** @return Exact live GPU planes while preserving the backing allocation's layout byte and bit placement. */
         ExpertTierGpuMutableProjectionView blobProjectionView(const GpuExpertPackedDescriptor &packed)
         {
             return {.payload = packed.ptrs.d_vnni,
@@ -264,7 +264,7 @@ namespace llaminar2
     {
     }
 
-    ExpertTierGpuBlobTransferLane::ExpertTierGpuBlobTransferLane(Config config, bool fixture_same_cuda_device)
+    ExpertTierGpuBlobTransferLane::ExpertTierGpuBlobTransferLane(Config config, bool fixture_same_gpu_device)
         : config_(std::move(config)),
           protocol_(config_.staging_capacity_bytes)
     {
@@ -283,7 +283,7 @@ namespace llaminar2
                  ExpertTierGpuBlobRelayKind::SameBackendWithoutPeerAccess &&
              same_backend &&
              (config_.source_device != config_.destination_device ||
-              (fixture_same_cuda_device && config_.source_device.is_cuda())));
+              fixture_same_gpu_device));
         if (!topology_matches)
         {
             throw std::invalid_argument(
@@ -492,9 +492,9 @@ namespace llaminar2
         const ExpertTierWeightProjectionIntersection &intersection, std::string *error) const noexcept
     {
         if ((source.metadata_layout || destination.metadata_layout) &&
-            (!config_.source_device.is_cuda() || !config_.destination_device.is_cuda()))
+            config_.source_device.type != config_.destination_device.type)
         {
-            assignBlobTransferError(error, "Coded GPU host relay requires CUDA at both endpoints");
+            assignBlobTransferError(error, "Coded GPU host relay requires the same GPU backend at both endpoints");
             return false;
         }
         return protocol.begin(source, destination, intersection, error);

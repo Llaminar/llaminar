@@ -443,7 +443,7 @@ namespace llaminar2
     private:
         friend struct test::ExpertTierGpuBlobRelayFixtureAccess;
         /** @brief Fixture-only equivalent endpoints exercise the identical retained no-peer relay. */
-        ExpertTierGpuBlobTransferLane(Config config, bool fixture_same_cuda_device);
+        ExpertTierGpuBlobTransferLane(Config config, bool fixture_same_gpu_device);
 
         /** @brief Authenticate backend and original plane geometry through the single relay cursor. */
         bool bindNativeProtocol(ExpertTierGpuBlobChunkProtocol &protocol, const GpuExpertPackedDescriptor &source,

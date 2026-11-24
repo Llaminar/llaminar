@@ -129,6 +129,7 @@ namespace llaminar2
 
         /**
          * @brief Publish one indivisible GPU reformat-and-download command.
+         * CUDA admits staged work; ROCm admits only direct coded mapped work.
          * @param source Published separated projection, retained through completion.
          * @param layout Canonical authenticated conversion geometry.
          * @param first_unit First complete CPU unit in the projection.
@@ -147,6 +148,7 @@ namespace llaminar2
 
         /**
          * @brief Publish one indivisible upload-and-GPU-reformat command.
+         * CUDA admits staged work; ROCm admits only direct coded mapped work.
          * @param destination Inactive separated projection retained through completion.
          * @param layout Canonical authenticated conversion geometry.
          * @param first_unit First complete CPU unit in the projection.
@@ -257,8 +259,8 @@ namespace llaminar2
          * @brief Return the exact graph branch required by this backend's service.
          *
          * CUDA requires graph-resident progress when future event observers can
-         * occupy independent native queues. ROCm uses its proven native SDMA
-         * service and has no auxiliary compute branch. This is a backend-owned
+         * occupy independent native queues. ROCm uses native background streams
+         * for SDMA and finite coded work, with no captured service branch. This is a backend-owned
          * mechanism distinction, not a runtime retry or alternate inference mode.
          * The factory retains this authority; every cache owns one private
          * mapped lifetime word and one bounded co-resident service CTA.
