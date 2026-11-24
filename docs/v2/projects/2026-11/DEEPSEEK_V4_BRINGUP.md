@@ -434,7 +434,7 @@ routed experts. The 192/256 GPU cap leaves 64 experts per layer on CPU:
 payload, not a claim about the size of the entire CPU process. No whole-file
 hash or end-to-end raw-weight byte comparison was performed.
 
-### Greedy, 32,768-token context (.80)
+### Greedy, 32,768-token context before the clamp correction (.80)
 
 All text requests had the same 67 prompt IDs, seed 42, temperature 0,
 thinking off, no prefix cache, and a 768-token limit. Rates below are the
@@ -503,10 +503,76 @@ four live CUDA rows. `launchGroupedImmaPairedGateUpTable` in
 `CUDAMoEGroupedPrefillKernels.cu` instantiates the clamped variant only for
 MXFP4; IQ2_S uses the unclamped variant despite the
 positive layer limit. The CPU representation is not the cause of the first
-divergence. This is a `GPUAlignedExpert` contract bug; it is not cleared by
-`AGENTS.md`'s fixed-reduction or grouped/serial rules. The clamp bug remains
-open. Evidence: `.80:~/dsv4-validation/logs/pr71-snapshot2-{A,C}` and
-`.79:~/dsv4-validation/logs/{pr71-layer0-A,pr71-layer0-A2,pr71-layer0-C,pr71-expert222}`.
+divergence. The clamp defect was introduced on #71 by `91b902f0e`; the pinned
+`develop` `63b053401` contains the ordinary paired IMMA program and MXFP4
+weights, but no GPT-OSS expert clamp or format-based limit. The test limit
+`7.0` exercises the same operand clipping rule; it does not claim GPT-OSS
+model support.
+
+The correction selects the paired IMMA activation epilogue by the model's
+policy, not by codebook. The naive clamped specialization spilled for IQ2_S
+and IQ4_XS on sm_121. Staging the finished gate/up values in the now-dead MMA
+shared memory fixes that compile failure without changing the unclamped
+program. In the matched post-fix eight-token Integration probes, all 217
+published prefill checkpoints compare byte-for-byte, including layer 0's
+routed and combined values and the final prefill logits. A and C return the
+same eight IDs. The common nonfinite FFN-norm words in layers 39–42 remain;
+byte identity does not clear those observations. The previous B/C IDs are
+**not** a post-fix oracle:
+the CUDA-owned routes in those cells also used the defective prefill epilogue.
+The matched post-fix 32K Integration diagnostic on `.79` returned exactly
+identical IDs for **A, B and C**: 67 prompt IDs and 768 completion IDs, with
+completion-ID SHA-256 `6323bd09d22555bebfcabb5b1dad7f869799c0b39b0a08b11e12d4e7805a2e5f`.
+The uninstrumented A rerun from fix commit `e2cfb4558` independently
+matched both saved B/C ID arrays with the identical request and retired
+normally with a clean driver window. The earlier post-fix A/B/C windows
+had one new NVIDIA `NV_ERR_NO_MEMORY` finding each and are not E2E passes.
+Evidence: `.79:~/dsv4-validation/logs/pr71-e2cfb455-A-32768-integration-final`
+and `pr71-2d333ba6-{A,B,C}-32768-integration-clamp-pass2`, plus
+`.80:~/dsv4-validation/logs/pr71-snapshot2-{A,C}` and
+`.79:~/dsv4-validation/logs/{pr71-layer0-A,pr71-layer0-A2,pr71-layer0-C,pr71-expert222,pr71-clamp-stages-A,pr71-clamp-stages-C}`.
+
+### Expert activation policy audit
+
+For a nonzero limit, the policy clips the gate only from above and the up
+operand symmetrically, before SwiGLU and before any Q8 quantization. The
+model authenticates routed `swiglu_clamp_exp` and independent shared
+`swiglu_clamp_shexp` (falling back to the routed metadata only when absent).
+None of these choices depend on coded vs per-block storage or the codebook.
+
+| Activation owner | Before the correction | Corrected path |
+|---|---|---|
+| CUDA one-row decode: descriptor-table, runtime-bank, explicit packet, split GEMV, floating | Grouped down accepted the layer limit for all formats; split fused-down paths preclamped gate/up | Consume the typed policy at the stage/kernel boundary; clip before fused down or inside the grouped producer |
+| CUDA grouped prefill and small-row verifier | Ordered split-K, separate SwiGLU/Q8, floating and parallel IMMA applied the limit for all formats; paired IMMA clipped only MXFP4 | Paired IMMA selects plain/clamped epilogue from the policy; all formats share the clipping rule |
+| CUDA LLEP / current-batch / runtime-placement grouped prefill | Assignment and copies own no activation; grouped producer inherited the same paired-IMMA omission | Same clamped grouped production owner, independently of which residents serve the routes |
+| Shared expert, CUDA and CPU, including grouped verifier | Shared policy supplied independently; prepared fused-down path clamps materialized operands, grouped path uses its grouped kernel | Policy remains independent of the routed limit and of floating/native storage |
+| ROCm one-row decode, explicit packets and shared experts | Main stage rejected nonzero limits; split, ordinary grouped, prequantizing and last-producer epilogues were unclamped | Native and floating decode consume the limit at the actual activation; standalone fused-down stages clamp materialized operands |
+| ROCm grouped prefill, LLEP / current-batch, verifier/MTP | gfx906 and WMMA produced gate/up for a common unclamped SwiGLU/Q8 publisher | The common publisher now takes the policy; grouped floating execution clips at its own epilogue |
+| Intermediate-shard FFN / ROCm retained variants | Fragment producer bypassed the ordinary activation policy; resident ordinary/persistent, native-layout, HC suffix and grouped frontier computed plain SwiGLU | Fragment and retained graph owners carry the limit separately for routed and shared FFN; the final sum/collective does not evaluate an activation |
+| CPU serial, grouped prefill/verifier, CPU packet/overlay | Native `GPUAlignedExpert` applied limits before second Q8 quantization; floating fused-down clamped materialized operands | Same arithmetic; reads the model policy through the typed stage declaration |
+
+Focused native regression selectors for the 22-source-format sweep, each with
+nonvacuous limit-7 and limit-10 CPU/accelerator comparisons:
+
+- CUDA: `^V2_Integration_CUDA_MoEClampedExpertArithmetic_Limit(7|10)$`
+- ROCm: `^V2_Integration_ROCm_MoEClampedExpertArithmetic_Limit(7|10)Group[0-2]$`
+  (run on both gfx906 and WMMA hardware with the production spill guard).
+
+Spark `.79` rebuilt fix commit `e2cfb4558` and passed all nine selected
+Integration/Unit CTest registrations without skips. They include the CUDA
+limit-7, limit-10 and unclamped arithmetic sweeps and the DeepSeek CPU kernel,
+compact-KV, CUDA wide-norm, arena-admission and UD weight-density checks.
+The changed paired IMMA translation unit separately compiled under the
+production spill-as-error flags for sm_80, sm_86, sm_89, sm_90 and sm_121.
+The component sweep covers
+resident static and published runtime prefill, small-row grouped verifier,
+captured M=1 route/packet decode, and CPU packet execution. It is not a
+separate all-format certification of every LLEP, shared/floating, or retained
+fused topology. Host-only `g++-14 -fsyntax-only` with the ROCm 7.2 headers
+passed for the ROCm bridge, three production call-site TUs and the two
+cross-tier fixture TUs. This does not compile HIP device code or check the
+linker, spills or native execution on gfx906/gfx1100. Focused receipts:
+`.79:~/dsv4-validation/logs/clamp-e2cfb455/{source.txt,build.log,focused.xml,hip-host-syntax.log}`.
 
 The exact old #71 (`5b3404439`) cap-192 control was rejected before
 inference: 123,846,400,836 B demanded versus 115,389,833,216 B in the shared
@@ -546,8 +612,9 @@ Release B's HTTP response retains **120 live moves in 12 waves**
 (**1,030,225,920 B**). Normal retirement captures one additional wave:
 **130 live moves in 13 waves**, 65 promotions and 65 demotions, **390
 transfer pieces** and **1,116,078,080 B**. Each moved expert used exactly
-**8,585,216 B**, the original GGUF size of two 2,686,976 B IQ2_S pieces
-and one 3,211,264 B IQ3_XXS piece. The shared validator joined HTTP and
+**8,585,216 B**, the original GGUF size of gate and up at 2,686,976 B
+each (IQ2_S, `4096 × 2048 / 256 × 82 B`) and down at 3,211,264 B
+(IQ3_XXS, `2048 × 4096 / 256 × 98 B`). The shared validator joined HTTP and
 retirement ledgers to completed physical transfers and owner publications.
 Release C on the same binary and host completed all 768 IDs exactly like B
 and recorded zero moves. B measured **22.27 prefill / 4.12 decode tok/s**
@@ -564,6 +631,10 @@ reported zero in both B HTTP summaries despite the typed movement proof;
 that scalar does not prove window coverage. The Integration drivers each
 reported one NVIDIA warning. Evidence: `.80:~/dsv4-validation/logs/pr71-2d333ba6-{B,C}-32768-retire`
 and `.79:~/dsv4-validation/logs/pr71-2d333ba6-{B,C}-32768-integration-adoption`.
+With the clamp correction, B on `.79` again retained 130 live moves in 13
+waves. All 390 pieces matched their individual GGUF projection sizes:
+122 experts at 8,585,216 B and eight at 11,665,408 B (two 3,604,480 B IQ3_S
+projections and a 4,456,448 B MXFP4 down projection), totaling 1,140,719,616 B.
 
 ### Maximum context and vision
 
@@ -614,7 +685,37 @@ and `.79:~/dsv4-validation/logs/pr71-2d333ba6-{B,C}-32768-integration-adoption`.
   two at 10:30:27 and 10:30:43 during weight setup/load. The same warning
   appeared singly in the A-image, A-32K and C-32K windows, as well as in
   the repaired B load (10:57:53) and the new C cap-128 load (11:00:48).
-  Temporal correlation does not identify the specific failing allocation.
+  The 1M failures and the recovered single warning at 32K are different
+  observations; do not infer that they share a failing allocation.
+
+### Single NVIDIA warning at 32K
+
+On `.79`, the kernel journal and VRAM BOM place the single recovered
+`NV_ERR_NO_MEMORY` during synchronous allocation of CUDA's persistent
+weight region: **100,920,205,056 B** in A and **71,710,037,504 B** for the
+routed weight region in B/C. For example, the uninstrumented A run logged
+the kernel finding at 12:34:07.844 UTC; the successful weight allocation and
+512 MiB staging receipt followed at 12:34:15.730 and 12:34:15.760, and
+`ServerReady` at 12:34:46.515. The workspace/arena and model-owned KV backing
+were already logged before the weight allocation. B/C had also allocated
+their independent non-routed weight pool; the warning preceded the
+routed-pool completion, not that earlier pool's staging. This rules out
+later graph instantiate/upload and does not implicate a graph pool or
+`cudaMallocAsync` in the startup warning.
+
+The weight-pool owner makes one `cudaMalloc` through `CUDABackend::allocate`;
+a CUDA failure would log an error and return failure, not retry. CUPTI
+traces and a separate runtime API interposer observed the same A weight
+request complete in one successful synchronous allocation, with graph
+instantiation about 31 seconds later. Neither API trace nor the final
+commit's kernel-stack-only observation reproduced this OOM. The evidence
+supports a recovered driver-internal allocation during persistent-weight
+materialization on the shared memory pool, not a failed-and-retried
+application allocation. It does not establish a page-table failure or say
+which internal descriptor allocation failed. No allocator code or driver
+observer was changed. Evidence: `.79:~/dsv4-validation/logs/`,
+`pr71-699a60b0-A-32768-integration-{final,alloc-cache,alloc-preload}` and
+`clamp-e2cfb455/{kernel-journal.jsonl,kernel-stack.txt}`.
 
 ### Reproduction and scope
 
