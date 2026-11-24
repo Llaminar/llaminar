@@ -198,14 +198,11 @@ float appendPreparedReference(const CPUNativeQuantisedWeightView &packed, const 
  * @param blocks Logical K block count spanning partition boundaries.
  */
 template <std::size_t Rows, typename Ops, ms::Reduction Tree>
-void verifyPrepared(const NativeQuantisedFormatInfo &source, int n, int blocks, bool rotated = false)
+void verifyPrepared(const NativeQuantisedFormatInfo &source, int n, int blocks)
 {
     SCOPED_TRACE(::testing::Message() << "codebook=" << int(source.codebook_id)
-        << " rows=" << Rows << " n=" << n << " blocks=" << blocks << " tree=" << int(Tree)
-        << " rotated=" << rotated);
-    // Use the original source's rotated footprint: non-Q8 rotation still
-    // retains its compensation plane, while signed-Q8 shares the dense unit.
-    NativeQuantisedPreparedByteFixture fixture(source, n, blocks * 32, 4u * 1024u * 1024u, rotated);
+        << " rows=" << Rows << " n=" << n << " blocks=" << blocks << " tree=" << int(Tree));
+    NativeQuantisedPreparedByteFixture fixture(source, n, blocks * 32);
     if constexpr (Tree == ms::Reduction::Contiguous)
         fixture.descriptor.numerical_policy = CPUProjectionNumericalPolicy::BackendNative;
     fixture.seedPayloadAndMetadata();
@@ -912,21 +909,14 @@ TEST_F(CPUNativeNEONPreparedProjection, EveryAdmittedE8M0ByteWidensExactly)
     }
 }
 
-/** @test Rotated MXFP4 (source 25, ExpandedInt8) dispatches the expanded FP16 program, not the E8M0 nibble one. */
-TEST_F(CPUNativeNEONPreparedProjection, RotatedMXFP4ExecutesExpandedInt8WithFP16Scales)
+/** @test Non-Q8 expanded units must fail before selecting a NEON projection leaf. */
+TEST_F(CPUNativeNEONPreparedProjection, RotatedMXFP4IsRejectedBeforeDispatch)
 {
-    using Ops = ms::NEONMultiScaleOps<ms::NEONByteDot::ASIMD>;
-    for (const int n : {3, 65})
-        for (const int blocks : {1, 17})
-        {
-            verifyPrepared<1, Ops, ms::Reduction::Contiguous>(native_quantised_formats::MXFP4, n, blocks, true);
-            verifyPrepared<4, Ops, ms::Reduction::Contiguous>(native_quantised_formats::MXFP4, n, blocks, true);
-            verifyPrepared<2, Ops, ms::Reduction::OrderedPartitions>(native_quantised_formats::MXFP4, n, blocks, true);
-            verifyPrepared<3, Ops, ms::Reduction::OrderedPartitions>(native_quantised_formats::MXFP4, n, blocks, true);
-        }
+    NativeQuantisedPreparedByteFixture rotated(native_quantised_formats::MXFP4, 65, 64, 4u * 1024u * 1024u, true);
+    EXPECT_THROW((void)rotated.view(), std::invalid_argument);
 }
 
-/** @test Native MXFP4 and its rotated form keep distinct scale-word interpretations. */
+/** @test Native MXFP4 scale bytes remain distinct from FP16 words. */
 TEST_F(CPUNativeNEONPreparedProjection, MXFP4ScaleFieldsFollowThePreparedIdentity)
 {
     NativeQuantisedPreparedByteFixture native(native_quantised_formats::MXFP4, 65, 64);

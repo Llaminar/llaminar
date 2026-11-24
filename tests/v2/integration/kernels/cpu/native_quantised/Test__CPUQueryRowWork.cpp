@@ -119,9 +119,9 @@ TEST_P(CPUQueryRowWork, EverySourceRetainsSerialBytesAndUnwrittenRowsAcrossDirty
     for(const auto shape:{std::pair{65,512},std::pair{512,2560},std::pair{128,8192}})
         proveQueryRows(GetParam(),shape.first,shape.second,false);
 }
-TEST(CPUQueryRowWorkRotation, OriginalPreparedRotationSkipsUnusedRows) {
+TEST(CPUQueryRowWorkRotation, PreparedQ8RotationSkipsUnusedRows) {
     const auto &formats=quantizedVerifierFormats();
-    const auto format=std::find_if(formats.begin(),formats.end(),[](const auto &value){return value.tensor_type==TensorType::Q4_0;});
+    const auto format=std::find_if(formats.begin(),formats.end(),[](const auto &value){return value.tensor_type==TensorType::Q8_0;});
     ASSERT_NE(format,formats.end());proveQueryRows(*format,65,512,true);
 }
 TEST_P(CPUQueryRowWork, OrdinaryM1WorkNeverEnablesVerifierMathAndPreservesUnusedScratch) {

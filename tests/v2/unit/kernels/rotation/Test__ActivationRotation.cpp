@@ -1632,9 +1632,10 @@ TEST(Test__ActivationRotation, RotationChangesVector)
 
 #include "kernels/cpu/gemm/CPUNativeQuantisedGemmKernel.h"
 
-TEST(Test__ActivationRotation, FusedPacking_GEMM_Invariance_Q4_0)
+/** @test An admitted Q8 weight still supports explicit rotation without an inline weight-sum plane. */
+TEST(Test__ActivationRotation, FusedPacking_GEMM_Invariance_Q8_0)
 {
-    // Test that activating rotation on a Q4_0 weight produces the same
+    // Test that activating rotation on a Q8_0 weight produces the same
     // GEMM result as the manual approach: dequant → rotate → GEMM.
     const int M = 2;   // batch
     const int K = 128;  // hidden dim (must be multiple of block_dim)
@@ -1643,9 +1644,8 @@ TEST(Test__ActivationRotation, FusedPacking_GEMM_Invariance_Q4_0)
     // Create rotation
     ActivationRotation rot(K, 128);
 
-    // Create Q4_0 weight [N×K]
-    auto weight = TestTensorFactory::createQ4_0Random({static_cast<size_t>(N),
-                                                        static_cast<size_t>(K)});
+    // Create Q8_0 weight [N×K].
+    auto weight = TestTensorFactory::createQ8_0Random({static_cast<size_t>(N), static_cast<size_t>(K)});
 
     // Reference: dequantize weight to FP32
     std::vector<float> W_fp32(N * K);
@@ -1692,7 +1692,7 @@ TEST(Test__ActivationRotation, FusedPacking_GEMM_Invariance_Q4_0)
     const float *Y_fused = output_tensor->data();
 
     // Compare. The rotation-fused path introduces INT8 quantization noise,
-    // so we allow some tolerance (Q4_0 + rotation INT8 requant).
+    // so we allow some tolerance for the rotated INT8 requantization.
     float max_rel_err = 0.0f;
     for (int i = 0; i < M * N; ++i)
     {
@@ -1702,15 +1702,13 @@ TEST(Test__ActivationRotation, FusedPacking_GEMM_Invariance_Q4_0)
         float rel_err = (std::fabs(ref) > 1e-6f) ? abs_err / std::fabs(ref) : abs_err;
         max_rel_err = std::max(max_rel_err, rel_err);
 
-        // Q4_0 already has ~1-2% quantization noise from the original format,
-        // plus the rotation requant adds another layer. Allow generous tolerance.
         EXPECT_NEAR(got, ref, std::fabs(ref) * 0.15f + 0.5f)
             << "GEMM invariance failed at index " << i
             << " (ref=" << ref << ", got=" << got
             << ", rel_err=" << rel_err << ")";
     }
 
-    LOG_INFO("[FusedPacking_Q4_0] max_rel_err=" << max_rel_err);
+    LOG_INFO("[FusedPacking_Q8_0] max_rel_err=" << max_rel_err);
 }
 
 TEST(Test__ActivationRotation, FusedPacking_PreservesFormatForNonRotated)

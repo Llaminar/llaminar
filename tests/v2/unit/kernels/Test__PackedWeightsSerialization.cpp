@@ -22,12 +22,14 @@
 #include "kernels/KernelFactory.h"
 #include "execution/moe/ExpertPreparedMemoryGeometry.h"
 #include "../../utils/CPUProjectionTestWorkspace.h"
+#include "../../utils/QuantizedVerifierFormats.h"
 #include "../../utils/TestTensorFactory.h"
 #include <algorithm>
 #include <array>
 #include <cstring>
 #include <functional>
 #include <limits>
+#include <string_view>
 
 using namespace llaminar2;
 using namespace llaminar2::cpu::native_quantised;
@@ -444,13 +446,13 @@ TEST(Test__PackedWeightsSerialization, IPackedWeights_DefaultSerializeReturnsEmp
 
 TEST(Test__PackedWeightsSerialization, SerializeDeserialize_WithInt8Flat)
 {
-    // Test with all three data sections populated.
+    // Exercise all three data sections without claiming a retired CPU encoding.
     auto packed = buildTestPacked(
         64, 128, /*codebook_id=*/0, /*blocks_per_row=*/4,
-        /*payload_bytes=*/34, /*is_nibble_lut=*/false, /*is_asymmetric=*/false,
-        /*is_superblock=*/false, /*data_stride=*/2048, /*interleaved_block_stride=*/2304,
-        /*interleaved_sz=*/1 * 4 * 2304, /*payload_sz=*/1 * 4 * 64 * 34,
-        /*int8_flat_sz=*/1 * 4 * 64 * 32);
+        /*payload_bytes=*/16, /*is_nibble_lut=*/true, /*is_asymmetric=*/false,
+        /*is_superblock=*/false, /*data_stride=*/1024, /*interleaved_block_stride=*/1152,
+        /*interleaved_sz=*/4 * 1152, /*payload_sz=*/4 * 64 * 16,
+        /*int8_flat_sz=*/4 * 64 * 32);
 
     CPUPackedWeights weights(std::move(packed));
 
@@ -465,9 +467,9 @@ TEST(Test__PackedWeightsSerialization, SerializeDeserialize_WithInt8Flat)
 
     const auto& p = cpu_result->packed();
     EXPECT_EQ(p.codebook_id, 0);
-    EXPECT_EQ(p.data_stride, 2048);
-    EXPECT_EQ(p.interleaved_block_stride, 2304);
-    EXPECT_TRUE(p.usesExpandedInt8());
+    EXPECT_EQ(p.data_stride, 1024);
+    EXPECT_EQ(p.interleaved_block_stride, 1152);
+    EXPECT_TRUE(p.usesNibbleLUT());
 
     ASSERT_EQ(p.int8_flat.size(), static_cast<size_t>(1 * 4 * 64 * 32));
     for (size_t i = 0; i < p.int8_flat.size(); ++i)
@@ -477,13 +479,9 @@ TEST(Test__PackedWeightsSerialization, SerializeDeserialize_WithInt8Flat)
 
 TEST(Test__PackedWeightsSerialization, SerializeDeserialize_SuperblockFormat)
 {
-    // Q6_K superblock format.
-    auto packed = buildTestPacked(
-        256, 512, /*codebook_id=*/10, /*blocks_per_row=*/2,
-        /*payload_bytes=*/24, /*is_nibble_lut=*/false, /*is_asymmetric=*/false,
-        /*is_superblock=*/true, /*data_stride=*/2048, /*interleaved_block_stride=*/2304,
-        /*interleaved_sz=*/4 * 2 * 2304, /*payload_sz=*/4 * 2 * 64 * 24,
-        /*int8_flat_sz=*/4 * 2 * 64 * 32);
+    const auto source = llaminar2::test::TestTensorFactory::createQ6_KRandom({256, 512}, 2458);
+    CPUNativeQuantisedPackedWeights packed;
+    ASSERT_TRUE(packWeightsCPUNativeQuantised(source.get(), packed));
 
     CPUPackedWeights weights(std::move(packed));
 
@@ -497,7 +495,8 @@ TEST(Test__PackedWeightsSerialization, SerializeDeserialize_SuperblockFormat)
     ASSERT_NE(cpu_result, nullptr);
 
     const auto& p = cpu_result->packed();
-    EXPECT_EQ(p.codebook_id, 10);
+    EXPECT_EQ(p.codebook_id, native_quantised_formats::Q6_K.codebook_id);
+    EXPECT_TRUE(p.usesQ6KNativeDualScale());
     EXPECT_TRUE(p.is_superblock);
     EXPECT_EQ(p.N, 256);
     EXPECT_EQ(p.K, 512);
@@ -738,6 +737,104 @@ TEST(Test__PackedWeightsSerialization, Q8ExpandedDensityRejectsLegacyCompensatio
         std::memcpy(blob.data(), &direct.header, sizeof(direct.header));
         std::memcpy(blob.data() + sizeof(direct.header), &direct.sections, sizeof(direct.sections));
         EXPECT_EQ(deserialize(blob.data(), blob.size()), nullptr);
+    }
+}
+
+/** @test The v9 receive path can publish byte-identical weights for every canonical source. */
+TEST(Test__PackedWeightsSerialization, V9PublishesAllCanonicalCPUSources)
+{
+    using KernelFactory = llaminar::v2::kernels::KernelFactory;
+    const auto &catalog = native_quantised_formats::kAllSourceFormats;
+    const auto &fixtures = llaminar2::test::quantizedVerifierFormats();
+    ASSERT_EQ(catalog.size(), 22u);
+    for (const auto &[name, format] : catalog)
+    {
+        SCOPED_TRACE(std::string(name));
+        const auto fixture = std::find_if(fixtures.begin(), fixtures.end(), [&](const auto &candidate) {
+            return candidate.source_codebook_id == format->codebook_id &&
+                candidate.source_is_superblock == format->is_superblock;
+        });
+        ASSERT_NE(fixture, fixtures.end());
+        const auto source = fixture->create({65, 256}, 314159);
+        ASSERT_TRUE(source);
+        CPUNativeQuantisedPackedWeights packed;
+        ASSERT_TRUE(packWeightsCPUNativeQuantised(source.get(), packed));
+        CPUPackedWeights owner(std::move(packed));
+        const auto blob = serialize(owner);
+        ASSERT_FALSE(blob.empty());
+        auto restored = deserialize(blob.data(), blob.size());
+        ASSERT_TRUE(restored);
+        const auto engine = KernelFactory::createExpertGemmFromPackedWeights(std::move(restored));
+        ASSERT_TRUE(engine);
+        const auto *received = engine->exportCPUNativeQuantisedPackedWeights();
+        ASSERT_NE(received, nullptr);
+        ASSERT_TRUE(received->publicationSealed());
+        const auto view = received->readView();
+        EXPECT_EQ(view.codebook_id, format->codebook_id);
+        EXPECT_EQ(view.is_superblock, format->is_superblock);
+        EXPECT_EQ(view.encoding, preparedEncodingForSource(*format));
+        EXPECT_NE(view.encoding, CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale);
+        EXPECT_FALSE(view.usesInlineCompensation());
+        const auto &original = owner.packed().native_interleaved;
+        ASSERT_EQ(received->native_interleaved.size(), original.size());
+        EXPECT_EQ(std::memcmp(received->native_interleaved.data(), original.data(), original.size()), 0);
+    }
+}
+
+/** @test Legacy units fail v9 blob/direct receive and CPU publication with specific diagnostics. */
+TEST(Test__PackedWeightsSerialization, V9RejectsRetiredCPUPreparedLayoutsBeforePublication)
+{
+    using Encoding = CPUNativeQuantisedEncoding;
+    struct LegacyLayout
+    {
+        const NativeQuantisedFormatInfo &source;
+        Encoding encoding;
+        int declared_stride;
+        int actual_stride;
+        std::string_view diagnostic;
+    };
+    const std::array cases{
+        LegacyLayout{native_quantised_formats::IQ3_S, Encoding::IQ3SExpandedSourceScale, 2432, 2432, "encoding 5 (IQ3SExpandedSourceScale) is retired"},
+        LegacyLayout{native_quantised_formats::Q4_0, Encoding::ExpandedInt8, 2304, 2304, "requires a Q8_0, Q8_1, or Q8_K source; received codebook 0"},
+        LegacyLayout{native_quantised_formats::Q8_0, Encoding::ExpandedInt8, 2304, 2304, "does not admit a Q8 inline weight-sum compensation plane"},
+        LegacyLayout{native_quantised_formats::Q8_0, Encoding::ExpandedInt8, 2176, 2304, "does not admit a Q8 inline weight-sum compensation plane"},
+    };
+    for (const auto &[source, encoding, declared_stride, actual_stride, diagnostic] : cases)
+    {
+        SCOPED_TRACE(::testing::Message() << diagnostic << " stride=" << declared_stride);
+        // Build a complete current-version record independently of the serializer.
+        constexpr int n = 65, k = 64, units = 4;
+        const PackedWeightsTransferDescriptor direct{
+            .header = {.magic = PACKED_WEIGHTS_MAGIC, .version = PACKED_WEIGHTS_VERSION,
+                .format = static_cast<uint32_t>(PackedWeightsFormat::CPU_NATIVE_QUANTISED),
+                .N = n, .K = k, .N_padded = 128, .blocks_per_row = 2,
+                .codebook_id = source.codebook_id, .payload_bytes = uint8_t(source.payload_bytes),
+                .prepared_encoding = static_cast<uint8_t>(encoding), .is_superblock = uint8_t(source.is_superblock),
+                .data_stride = 2048, .interleaved_block_stride = declared_stride},
+            .sections = {.interleaved_size = uint64_t(units * actual_stride)},
+        };
+        alignas(64) const std::array<uint8_t, units * 2432> resident{};
+        const auto bytes = std::span(resident).first(direct.sections.interleaved_size);
+        std::vector<uint8_t> blob(sizeof(direct.header) + sizeof(direct.sections) + bytes.size());
+        std::memcpy(blob.data(), &direct.header, sizeof(direct.header));
+        std::memcpy(blob.data() + sizeof(direct.header), &direct.sections, sizeof(direct.sections));
+        std::memcpy(blob.data() + sizeof(direct.header) + sizeof(direct.sections), bytes.data(), bytes.size());
+        EXPECT_EQ(deserialize(blob.data(), blob.size()), nullptr);
+        const auto expectDiagnostic = [diagnostic](auto reject) {
+            try { reject(); }
+            catch (const std::invalid_argument &error)
+            {
+                EXPECT_NE(std::string_view(error.what()).find(diagnostic), std::string_view::npos) << error.what();
+                return;
+            }
+            ADD_FAILURE() << "Expected std::invalid_argument: " << diagnostic;
+        };
+        expectDiagnostic([&] { (void)allocateTransferTarget(direct); });
+        const CPUNativeQuantisedWeightDescriptor publication{
+            .columns = n, .reduction_width = k,
+            .source = {source.codebook_id, source.is_superblock, true}, .encoding = encoding,
+        };
+        expectDiagnostic([&] { (void)CPUNativeQuantisedMetadataSeal::validate(publication, bytes); });
     }
 }
 

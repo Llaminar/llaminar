@@ -53,6 +53,38 @@ namespace llaminar2::cpu::native_quantised
     };
 
     /**
+     * @brief Reject retired prepared layouts at CPU receive and publication.
+     * @param encoding Prepared encoding supplied by the sender or local owner.
+     * @param codebook Original CPU source codebook, not a GPU execution alias.
+     * @throws std::invalid_argument For encoding 5 or non-Q8 encoding 1.
+     */
+    inline void requireAdmittedCPUPreparedEncoding(CPUNativeQuantisedEncoding encoding, std::uint8_t codebook)
+    {
+        if (encoding == CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale)
+            throw std::invalid_argument("CPU prepared encoding 5 (IQ3SExpandedSourceScale) is retired; IQ3_S requires CompactMultiScale");
+        if (encoding == CPUNativeQuantisedEncoding::ExpandedInt8 &&
+            !preparedExpandedInt8OmitsCompensation(encoding, codebook))
+            throw std::invalid_argument("CPU prepared encoding 1 (ExpandedInt8) requires a Q8_0, Q8_1, or Q8_K source; received codebook " +
+                std::to_string(codebook));
+    }
+
+    /**
+     * @brief Identify an invalid Q8 byte extent matching the retired inline plane.
+     * @param encoding Prepared encoding supplied by the sender or local owner.
+     * @param codebook Original CPU source codebook.
+     * @param bytes Observed extent of the units, including any legacy plane.
+     * @param units Number of 64-column, 32-value units in the supplied extent.
+     * @throws std::invalid_argument For Q8 encoding 1 with the legacy compensation plane.
+     */
+    inline void rejectLegacyQ8WeightSumExtent(CPUNativeQuantisedEncoding encoding,
+        std::uint8_t codebook, std::uint64_t bytes, std::uint64_t units)
+    {
+        if (preparedExpandedInt8OmitsCompensation(encoding, codebook) && units != 0 &&
+            bytes / units == preparedInterleavedBlockStride(encoding, false, codebook) + 128u && bytes % units == 0)
+            throw std::invalid_argument("CPU prepared encoding 1 (ExpandedInt8) does not admit a Q8 inline weight-sum compensation plane");
+    }
+
+    /**
      * @brief Decode the primary metadata factor without narrowing source products.
      * @param encoding Physical prepared encoding.
      * @param codebook Original CPU source codebook.
@@ -537,19 +569,16 @@ namespace llaminar2::cpu::native_quantised
         {
             if (descriptor.columns <= 0 || descriptor.reduction_width <= 0 || !descriptor.source.present)
                 throw std::invalid_argument("Native CPU weight view requires positive geometry and original source identity");
+            requireAdmittedCPUPreparedEncoding(descriptor.encoding, descriptor.source.codebook_id);
             const auto *source = native_quantised_formats::forSourceIdentity(
                 descriptor.source.codebook_id, descriptor.source.is_superblock);
             if (!source || !isKnownPreparedEncoding(descriptor.encoding) ||
                 (descriptor.numerical_policy != CPUProjectionNumericalPolicy::BackendNative &&
                  descriptor.numerical_policy != CPUProjectionNumericalPolicy::GPUAlignedExpert))
                 throw std::invalid_argument("Native CPU weight view requires a known source, encoding and numerical policy");
-            // Explicit rotation may publish ExpandedInt8 for any original source.
-            // Other encodings must retain the source-aware canonical preparation.
-            if (descriptor.encoding != CPUNativeQuantisedEncoding::ExpandedInt8 &&
-                descriptor.encoding != preparedEncodingForSource(*source))
+            if (descriptor.encoding != preparedEncodingForSource(*source))
                 throw std::invalid_argument("Native CPU weight view encoding disagrees with original source");
-            if (descriptor.is_asymmetric != source->is_asymmetric &&
-                !(descriptor.encoding == CPUNativeQuantisedEncoding::ExpandedInt8 && !descriptor.is_asymmetric))
+            if (descriptor.is_asymmetric != source->is_asymmetric)
                 throw std::invalid_argument("Native CPU weight view has inconsistent secondary metadata");
             const std::int64_t padded = ((std::int64_t{descriptor.columns} + 63) / 64) * 64;
             const std::int64_t blocks = (std::int64_t{descriptor.reduction_width} + 31) / 32;
@@ -565,7 +594,11 @@ namespace llaminar2::cpu::native_quantised
                                            .matrixBytes(chunks);
             if (bytes.empty() || !bytes.data() || bytes.size() != extent ||
                 reinterpret_cast<std::uintptr_t>(bytes.data()) % alignof(std::uint32_t) != 0)
+            {
+                rejectLegacyQ8WeightSumExtent(descriptor.encoding, descriptor.source.codebook_id,
+                    bytes.size(), std::uint64_t(chunks) * blocks);
                 throw std::invalid_argument("Native CPU weight view requires the exact aligned resident byte extent");
+            }
             static_assert(std::endian::native == std::endian::little,
                           "Canonical CPU native weight metadata requires little-endian storage");
             return CPUNativeQuantisedWeightView(descriptor, *source, static_cast<int>(padded), static_cast<int>(blocks), bytes);

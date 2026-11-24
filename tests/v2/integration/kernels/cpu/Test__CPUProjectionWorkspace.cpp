@@ -603,8 +603,8 @@ TEST(CPUProjectionWorkspace, AllQuantizedFormats)
     }
 }
 
-/** @test Every source format's optional rotated representation retains participant isolation. */
-TEST(CPUProjectionWorkspace, RotatedQuantizedFormats)
+/** @test Only Q8 admits the rotated layout and its workspace retains participant isolation. */
+TEST(CPUProjectionWorkspace, RotatedQ8RetainsParticipantIsolation)
 {
     using namespace cpu::native_quantised;
     ActivationRotation rotation(256, 128);
@@ -613,6 +613,12 @@ TEST(CPUProjectionWorkspace, RotatedQuantizedFormats)
         SCOPED_TRACE(format.label);
         auto weight = format.create({128u, 256u}, 683);
         weight->setActivationRotation(&rotation);
+        if (format.tensor_type != TensorType::Q8_0 && format.tensor_type != TensorType::Q8_1 &&
+            format.tensor_type != TensorType::Q8_K)
+        {
+            EXPECT_THROW((void)CPUNativeQuantisedGemmKernel(weight.get()), std::invalid_argument);
+            continue;
+        }
         CPUNativeQuantisedGemmKernel kernel(weight.get());
         ASSERT_TRUE(kernel.isValid());
         const auto requirements = kernel.getWorkspaceRequirements(31);

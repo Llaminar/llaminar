@@ -191,7 +191,7 @@ TEST(CPUNativeQuantisedWeightView, OriginalSourceFactorsRetainEveryRoundingBound
 }
 
 /** @test Missing secondary vectors mean an exact zero, never a speculative metadata read. */
-TEST(CPUNativeQuantisedWeightView, EverySingleFactorAndRotatedSourceHasBoundedZeroMinimum)
+TEST(CPUNativeQuantisedWeightView, SingleFactorsAndAdmittedRotatedQ8HaveBoundedZeroMinimum)
 {
     for (const auto &source : native_quantised_formats::kAllSourceFormats)
     {
@@ -207,9 +207,12 @@ TEST(CPUNativeQuantisedWeightView, EverySingleFactorAndRotatedSourceHasBoundedZe
         EXPECT_THROW((void)view.blockMin(1, 0, 0), std::out_of_range);
         EXPECT_THROW((void)view.blockMin(0, 1, 0), std::out_of_range);
 
-        // Rotation's canonical symmetric ExpandedInt8 stream has the same
-        // physical span for every original source; provenance stays original.
         PreparedBytes rotated(*source.metadata, 64, 32, 4u * 1024u * 1024u, true);
+        if (!view.usesExpandedInt8())
+        {
+            EXPECT_THROW((void)rotated.view(), std::invalid_argument);
+            continue;
+        }
         const auto rotated_view = rotated.view();
         EXPECT_EQ(rotated_view.payload_bytes, 32);
         EXPECT_EQ(rotated_view.source_payload_bytes, source.metadata->payload_bytes);

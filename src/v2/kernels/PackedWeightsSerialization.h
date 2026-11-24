@@ -107,10 +107,8 @@ inline constexpr size_t PACKED_WEIGHT_SECTION_COUNT = 4;
 /**
  * @brief Decode and validate the prepared CPU encoding stored on the wire.
  *
- * The wire byte is not trusted merely because the surrounding codebook is
- * known: preparation may legitimately choose a different physical encoding
- * after activation rotation. Rejecting unknown ordinals here prevents a
- * transferred expert from reaching a kernel with guessed metadata offsets.
+ * This decodes the ordinal only. Receive admission separately checks the
+ * source identity and the resident CPU unit before allocating any sections.
  */
 inline cpu::native_quantised::CPUNativeQuantisedEncoding decodePreparedEncoding(
     uint8_t value)
@@ -137,6 +135,31 @@ inline cpu::native_quantised::CPUNativeQuantisedEncoding decodePreparedEncoding(
     default:
         throw std::invalid_argument(
             "Packed-weight transfer received an unknown prepared encoding");
+    }
+}
+
+/**
+ * @brief Reject retired CPU layouts before an incoming v9 record allocates sections.
+ * @param header Source, encoding, logical geometry and declared unit stride.
+ * @param sections Actual serialized section extents.
+ * @throws std::invalid_argument If the encoding or its inline weight-sum plane is retired.
+ */
+inline void requireAdmittedCPUReceiveEncoding(const PackedWeightsHeader &header,
+    const PackedWeightsSectionTable &sections)
+{
+    using namespace cpu::native_quantised;
+    const auto encoding = static_cast<CPUNativeQuantisedEncoding>(header.prepared_encoding);
+    requireAdmittedCPUPreparedEncoding(encoding, header.codebook_id);
+    if (encoding != CPUNativeQuantisedEncoding::ExpandedInt8)
+        return;
+    if (header.interleaved_block_stride > 0)
+        rejectLegacyQ8WeightSumExtent(encoding, header.codebook_id, uint64_t(header.interleaved_block_stride), 1);
+    if (header.N > 0 && header.K > 0)
+    {
+        // Check the extent independently of the sender's redundant stride.
+        const auto chunks = (uint64_t(header.N) + 63) / 64;
+        const auto blocks = (uint64_t(header.K) + 31) / 32;
+        rejectLegacyQ8WeightSumExtent(encoding, header.codebook_id, sections.interleaved_size, chunks * blocks);
     }
 }
 
@@ -359,13 +382,14 @@ inline PackedWeightsReceiveTarget allocateTransferTarget(
     const auto &sections = descriptor.sections;
     if (header.magic != PACKED_WEIGHTS_MAGIC ||
         header.version != PACKED_WEIGHTS_VERSION ||
-        !validNativeSourceScaleTupleHeader(header) || !validDensityCPUSection(header, sections) ||
-        header.format !=
-            static_cast<uint32_t>(PackedWeightsFormat::CPU_NATIVE_QUANTISED))
+        header.format != static_cast<uint32_t>(PackedWeightsFormat::CPU_NATIVE_QUANTISED))
     {
         throw std::invalid_argument(
             "Direct packed-weight transfer received invalid format metadata");
     }
+    requireAdmittedCPUReceiveEncoding(header, sections);
+    if (!validNativeSourceScaleTupleHeader(header) || !validDensityCPUSection(header, sections))
+        throw std::invalid_argument("Direct packed-weight transfer received invalid format metadata");
     if (header.N <= 0 || header.K <= 0 || header.N_padded < header.N ||
         header.blocks_per_row <= 0 || header.data_stride <= 0 ||
         header.interleaved_block_stride <= 0)
@@ -585,13 +609,21 @@ inline std::unique_ptr<IPackedWeights> deserialize(
         return nullptr;
     }
 
-    if (!validNativeSourceScaleTupleHeader(header))
-        return nullptr;
-
-    // Read section table.
+    // Read section metadata and reject retired layouts before allocating any receive storage.
     PackedWeightsSectionTable sections;
     std::memcpy(&sections, data + sizeof(header), sizeof(sections));
-    if (!validDensityCPUSection(header, sections))
+    cpu::native_quantised::CPUNativeQuantisedEncoding encoding;
+    try
+    {
+        requireAdmittedCPUReceiveEncoding(header, sections);
+        encoding = decodePreparedEncoding(header.prepared_encoding);
+    }
+    catch (const std::invalid_argument &error)
+    {
+        LOG_WARN("[PackedWeightsSerialization] " << error.what());
+        return nullptr;
+    }
+    if (!validNativeSourceScaleTupleHeader(header) || !validDensityCPUSection(header, sections))
         return nullptr;
 
     // Validate total size.
@@ -617,15 +649,7 @@ inline std::unique_ptr<IPackedWeights> deserialize(
     packed.codebook_id              = header.codebook_id;
     packed.payload_bytes            = header.payload_bytes;
     packed.is_asymmetric            = header.is_asymmetric != 0;
-    try
-    {
-        packed.encoding = decodePreparedEncoding(header.prepared_encoding);
-    }
-    catch (const std::invalid_argument &error)
-    {
-        LOG_WARN("[PackedWeightsSerialization] " << error.what());
-        return nullptr;
-    }
+    packed.encoding                 = encoding;
     packed.is_superblock            = header.is_superblock != 0;
     packed.data_stride              = header.data_stride;
     packed.interleaved_block_stride = header.interleaved_block_stride;

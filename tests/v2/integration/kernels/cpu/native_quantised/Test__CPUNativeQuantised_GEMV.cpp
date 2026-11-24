@@ -5387,7 +5387,7 @@ namespace
     }
 #endif // x86 NativeQuantised scheduler contract
 
-    TEST_F(CPUNativeQuantisedGemvTest, MTP_FusedProjectionWithActivationRotationMatchesSerialDecodeRows)
+    TEST_F(CPUNativeQuantisedGemvTest, MTP_FusedQ8ProjectionWithActivationRotationMatchesSerialDecodeRows)
     {
         const int K = 128;
         const int M = 2;
@@ -5395,8 +5395,8 @@ namespace
         const int N1 = 256;
 
         ActivationRotation rotation(K, 128);
-        auto weights0 = createWeightsForFormat("Q4_0", N0, K);
-        auto weights1 = createWeightsForFormat("Q4_0", N1, K);
+        auto weights0 = createWeightsForFormat("Q8_0", N0, K);
+        auto weights1 = createWeightsForFormat("Q8_0", N1, K);
         ASSERT_NE(weights0, nullptr);
         ASSERT_NE(weights1, nullptr);
         weights0->setActivationRotation(&rotation);
