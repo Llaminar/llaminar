@@ -50,7 +50,9 @@ namespace llaminar2
     struct ServingBatchEvent
     {
         std::uint64_t id = 0;
-        std::vector<int32_t> tokens;  ///< Tokens committed during this step.
+        /// Tokens committed during this step. A Stop finish ends with the
+        /// sampled stop token (as the scalar decodeStep() returns it).
+        std::vector<int32_t> tokens;
         ServingFinishReason finish = ServingFinishReason::None;
         int prompt_tokens = 0;        ///< Prompt length (reported once finished).
         int completion_tokens = 0;    ///< Total committed output tokens so far.

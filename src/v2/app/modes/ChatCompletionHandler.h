@@ -18,6 +18,7 @@
 
 #pragma once
 
+#include "app/modes/RequestGenerationLane.h"
 #include "app/modes/HttpRuntimeStats.h"
 #include "utils/Sampler.h"
 #include "utils/ChatTemplate.h"
@@ -224,6 +225,9 @@ namespace llaminar2
      * Depends only on IOrchestrationRunner and ITokenizer interfaces,
      * enabling full mock-based unit testing.
      */
+    /** @brief Creates one request's generation lane. */
+    using GenerationLaneFactory = std::function<std::unique_ptr<IRequestGenerationLane>()>;
+
     class ChatCompletionHandler
     {
     public:
@@ -289,6 +293,14 @@ namespace llaminar2
         ChatCompletionResponse handleRawRequest(const std::string &json_body,
                                                 const StreamChunkCallback &stream_cb = nullptr);
 
+        /**
+         * @brief Route generation through per-request lanes (continuous batching).
+         *
+         * Without a factory every request uses the runner's scalar path and
+         * must run on the serialized inference worker.
+         */
+        void setGenerationLaneFactory(GenerationLaneFactory factory) { lane_factory_ = std::move(factory); }
+
         /// Generate a unique chat completion ID (e.g., "chatcmpl-a1b2c3d4e5f6")
         static std::string generateRequestId();
 
@@ -303,7 +315,8 @@ namespace llaminar2
 
         /// Common setup: clear cache, merge sampling params, encode, prefill.
         /// Returns prompt_tokens on success, or sets error response and returns -1.
-        int setupInference(const ChatCompletionRequest &request,
+        int setupInference(IRequestGenerationLane &lane,
+                           const ChatCompletionRequest &request,
                            ChatCompletionResponse &error_out,
                            std::vector<int32_t> &input_ids,
                            HttpRuntimeStats::Request &observation);
@@ -312,9 +325,13 @@ namespace llaminar2
             const char *phase,
             const std::string &detail);
 
+        /** @brief This request's generation lane (factory, or the direct runner lane). */
+        std::unique_ptr<IRequestGenerationLane> makeGenerationLane();
+
         IOrchestrationRunner &runner_;
         ITokenizer &tokenizer_;
         std::string model_name_;
+        GenerationLaneFactory lane_factory_;
     };
 
 } // namespace llaminar2

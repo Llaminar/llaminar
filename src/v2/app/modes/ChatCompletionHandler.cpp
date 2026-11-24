@@ -135,43 +135,6 @@ namespace llaminar2
                               json::error_handler_t::replace);
         }
 
-        GenerationResult decodeStepWithBudget(IOrchestrationRunner &runner, int max_tokens)
-        {
-            struct BudgetGuard
-            {
-                IOrchestrationRunner &runner;
-                ~BudgetGuard() { runner.setDecodeStepTokenBudget(0); }
-            };
-
-            runner.setDecodeStepTokenBudget(max_tokens);
-            BudgetGuard guard{runner};
-            return runner.decodeStep();
-        }
-
-        class RequestCacheCleanup
-        {
-        public:
-            explicit RequestCacheCleanup(IOrchestrationRunner &runner) : runner_(runner) {}
-            ~RequestCacheCleanup() noexcept
-            {
-                try
-                {
-                    runner_.clearCache();
-                }
-                catch (const std::exception &e)
-                {
-                    LOG_WARN("[ChatCompletion] request cleanup failed: " << e.what());
-                }
-                catch (...)
-                {
-                    LOG_WARN("[ChatCompletion] request cleanup failed with unknown exception");
-                }
-            }
-
-        private:
-            IOrchestrationRunner &runner_;
-        };
-
         const char *boolString(bool value)
         {
             return value ? "true" : "false";
@@ -586,6 +549,13 @@ namespace llaminar2
     {
     }
 
+    std::unique_ptr<IRequestGenerationLane> ChatCompletionHandler::makeGenerationLane()
+    {
+        if (lane_factory_)
+            return lane_factory_();
+        return std::make_unique<DirectGenerationLane>(runner_);
+    }
+
     ChatCompletionResponse ChatCompletionHandler::handleUnhandledRequestException(
         const char *phase,
         const std::string &detail)
@@ -593,7 +563,8 @@ namespace llaminar2
         LOG_ERROR("[ChatCompletion] " << phase << " failed with unhandled exception: " << detail);
         try
         {
-            runner_.clearCache();
+            if (!lane_factory_)
+                runner_.clearCache();
         }
         catch (const std::exception &cleanup_error)
         {
@@ -1067,13 +1038,14 @@ namespace llaminar2
     }
 
     int ChatCompletionHandler::setupInference(
+        IRequestGenerationLane &lane,
         const ChatCompletionRequest &request,
         ChatCompletionResponse &error_out,
         std::vector<int32_t> &input_ids,
         HttpRuntimeStats::Request &observation)
     {
-        // Clear KV cache for fresh conversation
-        runner_.clearCache();
+        // Fresh generation state for this request
+        lane.beginRequest();
 
         // Per-field merge of model-recommended defaults: the model defaults apply to
         // any field the client did NOT explicitly set. Use the loaded revision
@@ -1119,7 +1091,7 @@ namespace llaminar2
 
         try
         {
-            runner_.setSamplingParams(effective);
+            lane.setSamplingParams(effective);
         }
         catch (const UnsupportedMTPSamplingRequest &error)
         {
@@ -1141,7 +1113,10 @@ namespace llaminar2
          * authority that clips a transaction after later verifier rows have
          * already mutated KV or recurrent state.
          */
-        runner_.setStopTokens(tokenizer_.stop_tokens());
+        {
+            const auto stop_tokens = tokenizer_.stop_tokens();
+            lane.setStopTokens(std::vector<int32_t>(stop_tokens.begin(), stop_tokens.end()));
+        }
 
         // Encode with chat template (pass tools for tool-aware templates)
         const json admitted_tools = admittedToolDefinitions(request);
@@ -1191,10 +1166,10 @@ namespace llaminar2
 
         const auto prefill_start = SteadyClock::now();
         observation.prefillStarted(prefill_start);
-        if (!runner_.prefill(input_ids))
+        if (!lane.prefill(input_ids))
         {
             error_out.http_status = 500;
-            json err = {{"error", {{"message", std::string("Prefill failed: ") + runner_.lastError()}, {"type", "server_error"}}}};
+            json err = {{"error", {{"message", std::string("Prefill failed: ") + lane.lastError()}, {"type", "server_error"}}}};
             error_out.json_body = dumpJsonForHttp(err);
             return -1;
         }
@@ -1228,10 +1203,12 @@ namespace llaminar2
             observation.fail(response.http_status);
             return response;
         }
-        RequestCacheCleanup request_cleanup(runner_);
+        // The lane owns this request's generation state and retires it.
+        const auto lane_owner = makeGenerationLane();
+        IRequestGenerationLane &lane = *lane_owner;
         std::vector<int32_t> input_ids;
 
-        int prompt_tokens = setupInference(request, response, input_ids, observation);
+        int prompt_tokens = setupInference(lane, request, response, input_ids, observation);
         if (prompt_tokens < 0)
         {
             observation.fail(response.http_status);
@@ -1335,7 +1312,7 @@ namespace llaminar2
                 step_forced = true;
                 const int32_t forced_token = stop_thinking_tokens[stop_thinking_idx++];
                 const auto forced_start = SteadyClock::now();
-                GenerationResult result = runner_.forceDecodeToken(forced_token);
+                GenerationResult result = lane.forceDecodeToken(forced_token);
                 if (traceGeneratedTokensEnabled())
                 {
                     LOG_INFO("[ChatCompletion/trace] forceDecodeToken token="
@@ -1362,7 +1339,7 @@ namespace llaminar2
                 const int remaining = effective_max_tokens - completion_tokens;
                 const int step_budget = thinking_budget_active ? 1 : remaining;
                 const auto decode_start = SteadyClock::now();
-                GenerationResult result = decodeStepWithBudget(runner_, step_budget);
+                GenerationResult result = lane.decodeStep(step_budget);
                 if (traceGeneratedTokensEnabled())
                 {
                     LOG_INFO("[ChatCompletion/trace] decodeStep budget="
@@ -1476,10 +1453,10 @@ namespace llaminar2
         }
 
         observation.decodeFinished();
-        runner_.flushStageTimeline();
+        lane.flushStageTimeline();
         // Read once after the terminal result, before RAII request cleanup.
         // Logging and the opt-in response see the same immutable outcome.
-        const auto runtime_summary = runner_.requestRuntimeSummary();
+        const auto runtime_summary = lane.requestRuntimeSummary();
         logRuntimeStateSummary(runtime_summary, "non-streaming");
 
         // HTTP and SSE share marker decisions, including token-split closes;
@@ -1608,10 +1585,12 @@ namespace llaminar2
             observation.fail(response.http_status);
             return response;
         }
-        RequestCacheCleanup request_cleanup(runner_);
+        // The lane owns this request's generation state and retires it.
+        const auto lane_owner = makeGenerationLane();
+        IRequestGenerationLane &lane = *lane_owner;
         std::vector<int32_t> input_ids;
 
-        int prompt_tokens = setupInference(request, response, input_ids, observation);
+        int prompt_tokens = setupInference(lane, request, response, input_ids, observation);
         if (prompt_tokens < 0)
         {
             observation.fail(response.http_status);
@@ -1826,7 +1805,7 @@ namespace llaminar2
                 step_forced = true;
                 const int32_t forced_token = stop_thinking_tokens[stop_thinking_idx++];
                 const auto forced_start = SteadyClock::now();
-                GenerationResult result = runner_.forceDecodeToken(forced_token);
+                GenerationResult result = lane.forceDecodeToken(forced_token);
                 if (traceGeneratedTokensEnabled())
                 {
                     LOG_INFO("[ChatCompletion/trace] stream forceDecodeToken token="
@@ -1866,7 +1845,7 @@ namespace llaminar2
                           ChatCompletionHandler::
                               kStreamingPublicationWindowTokens);
                 const auto decode_start = SteadyClock::now();
-                GenerationResult result = decodeStepWithBudget(runner_, step_budget);
+                GenerationResult result = lane.decodeStep(step_budget);
                 if (traceGeneratedTokensEnabled())
                 {
                     LOG_INFO("[ChatCompletion/trace] stream decodeStep budget="
@@ -2022,8 +2001,8 @@ namespace llaminar2
             emit_tool_events(tool_splitter.flush());
 
         observation.decodeFinished();
-        runner_.flushStageTimeline();
-        const auto runtime_summary = runner_.requestRuntimeSummary();
+        lane.flushStageTimeline();
+        const auto runtime_summary = lane.requestRuntimeSummary();
         logRuntimeStateSummary(runtime_summary, "streaming");
 
         if (!client_connected)

@@ -165,6 +165,8 @@ namespace llaminar2
         double reset_unix_seconds_ = std::chrono::duration<double>(
             std::chrono::system_clock::now().time_since_epoch()).count();
         std::optional<Clock::time_point> active_since_;
+        /** @brief Requests currently between beginRequest() and retirement. */
+        uint64_t active_requests_ = 0;
         const char *active_phase_ = "idle";
         std::optional<Terminal> last_;
     };

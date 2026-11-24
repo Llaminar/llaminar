@@ -801,6 +801,14 @@ namespace llaminar2
         /** @brief True when no request is resident or queued. */
         virtual bool servingBatchIdle() const { return true; }
 
+        /**
+         * @brief True when the next step would make progress: a queued
+         *        request can enter, a prompt is streaming in, or a resident
+         *        request may decide/feed (unpaced, granted, forced, cancelled).
+         *        False means every request is waiting for a grant.
+         */
+        virtual bool servingBatchHasRunnableWork() const { return false; }
+
         /** @brief Close the session; every resident row must already be retired. */
         virtual void endServingBatch() {}
 

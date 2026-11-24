@@ -315,6 +315,7 @@ namespace llaminar2
         void forceServingToken(std::uint64_t id, int32_t token) override;
         std::vector<ServingBatchEvent> stepServingBatch() override;
         bool servingBatchIdle() const override;
+        bool servingBatchHasRunnableWork() const override;
         void endServingBatch() override;
         GenerationResult generate(
             const std::vector<int32_t> &prompt_tokens,

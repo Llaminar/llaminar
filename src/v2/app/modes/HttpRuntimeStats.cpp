@@ -65,12 +65,13 @@ namespace llaminar2
     {
         (void)seconds(at, arrival.received);
         std::lock_guard lock(owner.mutex_);
-        if (owner.active_since_)
-            throw std::logic_error("HTTP inference statistics require serialized handler ownership");
+        // Continuous batching serves requests concurrently: track how many
+        // are active and since when the oldest one has been.
         epoch_ = owner.epoch_;
         sequence_ = ++owner.request_sequence_;
         owner.active_epoch_ = epoch_;
-        owner.active_since_ = at;
+        if (owner.active_requests_++ == 0)
+            owner.active_since_ = at;
         owner.active_phase_ = "setup";
         ++owner.counters_.started;
     }
@@ -208,15 +209,16 @@ namespace llaminar2
             throw std::logic_error("HTTP first output cannot follow request retirement");
 
         std::lock_guard lock(mutex_);
-        if (!active_since_) throw std::logic_error("HTTP terminal statistics have no active request");
-        // Reset does not cancel or inspect an active model. Its old request
-        // retires ownership, but cannot repopulate the new measurement epoch.
-        if (request.epoch_ != epoch_)
+        if (active_requests_ == 0) throw std::logic_error("HTTP terminal statistics have no active request");
+        if (--active_requests_ == 0)
         {
             active_since_.reset();
             active_phase_ = "idle";
-            return;
         }
+        // Reset does not cancel or inspect an active model. Its old request
+        // retires ownership, but cannot repopulate the new measurement epoch.
+        if (request.epoch_ != epoch_)
+            return;
         terminal.sequence = request.sequence_;
         terminal.retired_at = at;
         last_ = std::move(terminal);
@@ -272,8 +274,6 @@ namespace llaminar2
                 c.mtp_stochastic_accepts += m.stochastic_accepts;
             }
         }
-        active_since_.reset();
-        active_phase_ = "idle";
     }
 
     void HttpRuntimeStats::recordHttpResponse(int status)
@@ -302,7 +302,7 @@ namespace llaminar2
         std::optional<Terminal> last;
         std::optional<Clock::time_point> active;
         const char *phase;
-        uint64_t epoch, active_epoch, sequence;
+        uint64_t epoch, active_epoch, sequence, active_count;
         Clock::time_point reset_at;
         double reset_unix;
         json storage;
@@ -314,6 +314,7 @@ namespace llaminar2
             phase = active_phase_;
             epoch = epoch_;
             active_epoch = active_epoch_;
+            active_count = active_requests_;
             sequence = request_sequence_;
             reset_at = reset_at_;
             reset_unix = reset_unix_seconds_;
@@ -330,7 +331,7 @@ namespace llaminar2
             {"uptime_seconds", seconds(now, started_)},
             {"snapshot_unix_seconds", std::chrono::duration<double>(
                 std::chrono::system_clock::now().time_since_epoch()).count()},
-            {"requests", {{"started", c.started}, {"active", active ? 1 : 0},
+            {"requests", {{"started", c.started}, {"active", active_count},
                 {"completed", c.completed}, {"failed", c.failed}, {"disconnected", c.disconnected},
                 {"active_phase", phase}, {"active_sequence", active ? json(sequence) : json(nullptr)},
                 {"active_in_current_epoch", active && active_epoch == epoch ? 1 : 0},

@@ -18,6 +18,7 @@
 #include "utils/TestOrchestrationHelper.h"
 
 #include <cstdlib>
+#include <algorithm>
 #include <map>
 #include <memory>
 #include <vector>
@@ -142,6 +143,30 @@ namespace llaminar2::test
         const auto served = solo(request);
         EXPECT_EQ(served.finish, ServingFinishReason::Length);
         EXPECT_EQ(served.tokens, scalar.tokens);
+    }
+
+    TEST_F(ContinuousBatchingCPU, StopTokenIsReturnedAndRetiresOnlyItsRequest)
+    {
+        // Choose a stop token the greedy request actually produces, so its
+        // stream must end with (and include) the first occurrence.
+        const auto base = makeRequest(1, 14, 24, 0.0f, 1);
+        const auto free_run = solo(base);
+        ASSERT_GE(free_run.tokens.size(), 6u);
+        const int32_t stop = free_run.tokens[5];
+        const auto first = std::find(free_run.tokens.begin(), free_run.tokens.end(), stop);
+        const std::vector<int32_t> expected(free_run.tokens.begin(), first + 1);
+
+        auto stopping = base;
+        stopping.stop_tokens = {stop};
+        auto other = makeRequest(2, 30, 24, 0.0f, 1);
+        const auto other_solo = solo(other);
+
+        const auto batched = run({{0, {stopping, other}}});
+        EXPECT_EQ(batched.at(1).finish, ServingFinishReason::Stop);
+        EXPECT_EQ(batched.at(1).tokens, expected);
+        // The co-resident request is unaffected by the other row's stop.
+        EXPECT_EQ(batched.at(2).finish, ServingFinishReason::Length);
+        EXPECT_EQ(batched.at(2).tokens, other_solo.tokens);
     }
 
     TEST_F(ContinuousBatchingCPU, AContinuesBFinishesCEntersAndAllMatchSolo)

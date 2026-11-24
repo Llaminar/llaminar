@@ -225,7 +225,31 @@ TEST(Test__HttpRuntimeStats, EmptySnapshotAndActiveRequest)
     EXPECT_EQ(active["requests"]["active"], 1);
     EXPECT_EQ(active["requests"]["started"], 1);
     EXPECT_GE(active["requests"]["active_seconds"].get<double>(), 0.0);
-    EXPECT_THROW((void)stats.beginRequest(), std::logic_error);
+}
+
+/** @brief Continuous batching: concurrent requests are counted, each retires once. */
+TEST(Test__HttpRuntimeStats, ConcurrentRequestsAreCountedAndRetireIndependently)
+{
+    HttpRuntimeStats stats;
+    {
+        auto first = stats.beginRequest();
+        {
+            auto second = stats.beginRequest();
+            EXPECT_EQ(stats.snapshot()["requests"]["active"], 2);
+            EXPECT_EQ(stats.snapshot()["requests"]["started"], 2);
+            second.complete(10, 3, prefix(10, 0), HttpRuntimeStats::Delivery::Completed);
+        }
+        const auto one_left = stats.snapshot();
+        EXPECT_EQ(one_left["requests"]["active"], 1);
+        EXPECT_EQ(one_left["requests"]["completed"], 1);
+        EXPECT_FALSE(one_left["requests"]["active_seconds"].is_null());
+        first.complete(20, 4, prefix(20, 0), HttpRuntimeStats::Delivery::Completed);
+    }
+    const auto idle = stats.snapshot();
+    EXPECT_EQ(idle["requests"]["active"], 0);
+    EXPECT_EQ(idle["requests"]["completed"], 2);
+    EXPECT_EQ(idle["tokens"]["prompt"], 30);
+    EXPECT_TRUE(idle["requests"]["active_seconds"].is_null());
 }
 
 /** @brief Aggregate token reuse is weighted by prompt length and includes cold requests. */

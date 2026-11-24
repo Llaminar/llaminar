@@ -26840,6 +26840,25 @@ bool OrchestrationRunner::publishPhysicalMemoryAuthority()
         return serving_rows_.empty() && serving_queue_.empty();
     }
 
+    bool OrchestrationRunner::servingBatchHasRunnableWork() const
+    {
+        if (!serving_active_)
+            return false;
+        if (!serving_cancellations_.empty())
+            return true;
+        if (!serving_queue_.empty() &&
+            std::find(serving_slot_busy_.begin(), serving_slot_busy_.end(), false) != serving_slot_busy_.end())
+            return true;
+        for (const auto &row : serving_rows_)
+        {
+            const bool may_decide = !row.forced.empty() || !row.request.paced || row.grant > 0;
+            if (row.cancelled || row.prompt_consumed < row.request.prompt.size() ||
+                ((row.has_logits || row.needs_feed) && may_decide))
+                return true;
+        }
+        return false;
+    }
+
     void OrchestrationRunner::endServingBatch()
     {
         for (const auto &row : serving_rows_)
@@ -26965,6 +26984,13 @@ bool OrchestrationRunner::publishPhysicalMemoryAuthority()
             if (sampled && std::find(row.request.stop_tokens.begin(), row.request.stop_tokens.end(),
                                      token) != row.request.stop_tokens.end())
             {
+                // Like the scalar decodeStep(), the terminal stop token is
+                // returned (and counted) so consumers can tell a model EOS
+                // from a length boundary; it is never fed back.
+                ++row.completion_tokens;
+                auto &event = event_of(row);
+                event.tokens.push_back(token);
+                event.completion_tokens = row.completion_tokens;
                 finish[r] = ServingFinishReason::Stop;
                 return;
             }

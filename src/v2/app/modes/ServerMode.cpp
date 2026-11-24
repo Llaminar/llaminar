@@ -25,6 +25,7 @@
  * OpenMP initial thread's single-place mask and compete with model service.
  */
 
+#include "app/modes/ServingBatchDriver.h"
 #include "app/modes/ServerMode.h"
 #include "app/modes/ServerRankMembership.h"
 #include "app/modes/ServerExecutionEvidence.h"
@@ -725,6 +726,111 @@ namespace llaminar2
                  });
     }
 
+    /**
+     * @brief Chat endpoint for continuous batching.
+     *
+     * Each request runs its chat handler on its own thread; generation goes
+     * through the handler's batched lane into the runner-owned serving
+     * session, so concurrent requests share execution. Admission is bounded:
+     * at most @p max_in_flight requests (resident slots plus waiting room)
+     * are accepted; beyond that the server answers 503 without queueing.
+     */
+    void registerBatchedChatCompletionEndpoint(httplib::Server &server, ChatCompletionHandler &handler,
+                                               std::size_t max_in_flight,
+                                               HttpStreamObserver stream_observer)
+    {
+        auto in_flight = std::make_shared<std::atomic<std::size_t>>(0);
+        server.Post("/v1/chat/completions",
+                 [&handler, in_flight, max_in_flight, stream_observer = std::move(stream_observer)](
+                     const httplib::Request &req, httplib::Response &res)
+                 {
+                     const HttpRequestArrival arrival;
+                     ChatCompletionResponse parse_error;
+                     auto parsed_request = ChatCompletionHandler::parseRequest(req.body, parse_error);
+                     if (!parsed_request)
+                     {
+                         res.status = parse_error.http_status;
+                         res.set_content(parse_error.json_body, "application/json");
+                         return;
+                     }
+                     if (in_flight->fetch_add(1) >= max_in_flight)
+                     {
+                         in_flight->fetch_sub(1);
+                         res.status = 503;
+                         res.set_content(json{{"error", {{"message", "Inference request capacity is full"},
+                             {"type", "server_busy"}, {"code", "inference_queue_full"}}}}.dump(),
+                             "application/json");
+                         return;
+                     }
+                     // One admission token per accepted request; the last owner
+                     // (handler call or streaming producer) releases it once.
+                     auto admitted = std::shared_ptr<void>(
+                         nullptr, [in_flight](void *) { in_flight->fetch_sub(1); });
+
+                     if (!parsed_request->stream)
+                     {
+                         const auto response = handler.handleRequest(*parsed_request, arrival);
+                         res.status = response.http_status;
+                         res.set_content(response.json_body, "application/json");
+                         return;
+                     }
+
+                     auto streamed_response_body = traceAccessLoggingEnabled()
+                                                       ? std::make_shared<std::string>()
+                                                       : nullptr;
+                     if (stream_observer) stream_observer(req, streamed_response_body);
+                     auto stream_request = std::move(*parsed_request);
+                     auto channel = std::make_shared<SSEPublishChannel>(
+                         SSEPublishChannelBudget::forRequest(stream_request.max_tokens));
+                     auto transport_open = std::make_shared<std::atomic<bool>>(true);
+                     // The producer runs the handler; the provider thread is the
+                     // only socket writer. Closing the channel or the transport
+                     // retires the producer, which cancels its serving request.
+                     auto producer = std::make_shared<std::thread>(
+                         [&handler, channel, transport_open, admitted, arrival,
+                          stream_request = std::move(stream_request)]() mutable {
+                             try
+                             {
+                                 auto enqueue = [channel, transport_open](const std::string &line) -> bool {
+                                     return transport_open->load() && channel->push(line);
+                                 };
+                                 (void)handler.publishStreamingRequest(stream_request, enqueue, arrival);
+                             }
+                             catch (const std::exception &error)
+                             {
+                                 LOG_ERROR("[Server] batched streaming request failed: " << error.what());
+                             }
+                             channel->close();
+                         });
+                     res.set_chunked_content_provider(
+                         "text/event-stream",
+                         [channel, transport_open, streamed_response_body](size_t, httplib::DataSink &sink) -> bool {
+                             for (;;)
+                             {
+                                 auto line = channel->popOrClosed();
+                                 if (!line)
+                                     break;
+                                 if (streamed_response_body)
+                                     streamed_response_body->append(*line);
+                                 if (!sink.write(line->c_str(), line->size()))
+                                 {
+                                     transport_open->store(false);
+                                     channel->close();
+                                     return false;
+                                 }
+                             }
+                             sink.done();
+                             return true;
+                         },
+                         [producer, channel, transport_open](bool) {
+                             transport_open->store(false);
+                             channel->close();
+                             if (producer->joinable())
+                                 producer->join();
+                         });
+                 });
+    }
+
     int ServerMode::execute(AppContext &ctx)
     try
     {
@@ -949,10 +1055,36 @@ namespace llaminar2
 
         // ─── POST /v1/chat/completions ───────────────────────────────
 
-        registerChatCompletionEndpoint(svr, handler, inference_executor,
-            [&request_log_state](const httplib::Request &request, std::shared_ptr<std::string> body) {
-                request_log_state.attachStreamedResponseBody(request, std::move(body));
-            });
+        // Continuous batching: when the runner serves resident request slots,
+        // one driver thread owns its serving session and every chat request
+        // runs concurrently through a batched generation lane.
+        std::unique_ptr<ServingBatchDriver> batch_driver;
+        const int batch_capacity = mpi_coordinated ? 0 : runner->servingBatchCapacity();
+        auto stream_observer = [&request_log_state](const httplib::Request &request, std::shared_ptr<std::string> body) {
+            request_log_state.attachStreamedResponseBody(request, std::move(body));
+        };
+        if (batch_capacity > 1)
+        {
+            batch_driver = std::make_unique<ServingBatchDriver>(*runner, batch_capacity, config.max_seq_len);
+            std::string batch_error;
+            if (!batch_driver->start(batch_error))
+            {
+                LOG_ERROR("Continuous-batching session failed to open: " << batch_error);
+                runner->shutdown();
+                flushPerfStatsFromEnv();
+                return 1;
+            }
+            handler.setGenerationLaneFactory([driver = batch_driver.get()] { return driver->makeLane(); });
+            const std::size_t max_in_flight =
+                static_cast<std::size_t>(batch_capacity) + executor_queue_capacity;
+            registerBatchedChatCompletionEndpoint(svr, handler, max_in_flight, stream_observer);
+            LOG_INFO("Continuous batching: " << batch_capacity << " resident request slots, "
+                                              << max_in_flight << " admitted requests");
+        }
+        else
+        {
+            registerChatCompletionEndpoint(svr, handler, inference_executor, stream_observer);
+        }
 
         // Bind the socket before announcing readiness. cpp-httplib combines
         // bind(2) and listen(2) in bind_to_port(), then listen_after_bind()
@@ -1007,6 +1139,8 @@ namespace llaminar2
 
         // All HTTP workers have drained their responses. Join inference before
         // retiring model/MPI owners; no maintenance or GPU cancellation occurs.
+        if (batch_driver)
+            batch_driver->stop();
         inference_executor.shutdown();
         LOG_INFO("Server shut down.");
         g_server_ptr = nullptr;
