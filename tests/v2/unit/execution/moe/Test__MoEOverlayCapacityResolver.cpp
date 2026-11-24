@@ -3006,6 +3006,26 @@ namespace llaminar2
         const auto dynamic = test::planWithRecordedHostServices(capacity_input);
         ASSERT_TRUE(dynamic.host_demand_memory);
         EXPECT_FALSE(result.host_demand_memory);
+
+        // Regression: the CUDA continuation and dynamic transfer streams
+        // consume the same GB10 host-backed allocator. A Dedicated stream
+        // quote must fail the physical merge, even if its local cap matches.
+        auto &observed_gpu = inventory.gpus.front();
+        observed_gpu.memory_backing = PhysicalMemoryBacking::RankHostPool;
+        cluster.ranks[5].gpus.front().memory_backing = observed_gpu.memory_backing;
+        const auto unified = test::planWithRecordedHostServices(capacity_input);
+        const auto &unified_plan = unified.physical_memory_admission->plan();
+        const auto *unified_gpu = unified_plan.find({5, DeviceId::cuda(0)});
+        ASSERT_NE(unified_gpu, nullptr);
+        ASSERT_TRUE(unified.physical_gpu_lane_demand);
+        EXPECT_TRUE(unified_gpu->resource().sharesRankHostPool());
+        EXPECT_EQ(unified_gpu->resource().admission_available_bytes,
+                  *capacity_input.max_gpu_memory_bytes);
+        EXPECT_EQ(unified_gpu->resource().pool_available_bytes,
+                  observed_gpu.free_memory_bytes);
+        EXPECT_GT(unified_gpu->bytes(PhysicalMemoryOwner::NativeAuxiliaryStream), 0u);
+        observed_gpu.memory_backing = PhysicalMemoryBacking::Dedicated;
+        cluster.ranks[5].gpus.front().memory_backing = observed_gpu.memory_backing;
         EXPECT_EQ(dynamic.host_demand_memory->capacity().max_transaction_rows, 8u);
         EXPECT_EQ(dynamic.host_demand_memory->allocationBytes(),
             capacity_input.host_demand_memory->allocationBytes());
