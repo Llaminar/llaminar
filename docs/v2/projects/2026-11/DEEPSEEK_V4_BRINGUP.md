@@ -263,50 +263,20 @@ This is sampled evidence: it is not exhaustive checkpoint equality. It shows tha
 the converters keep the official FP4/E8M0 expert bytes and map FP8 (128x128
 E8M0 block scales) and BF16 exactly to BF16 for the sampled tensors.
 
-## Native-layout weight storage audit (2026-11-22)
+## Native-layout weight storage
 
-Header-only BOM audit on Spark GB10 (unified-pool honest, cache-flushed) and
-per-family byte ratios (CPU prepared vs file, real UD-IQ2_XXS inventory):
+PR #73 replaces the expanded/per-block-scale IQ preparation used by the
+old CPU expert tier and migration path (roughly 2.4x GGUF at the IQ3 model
+mix, or about 247 GB for a 103 GB file). CPU coded units and GPU superblock
+metadata retain the source code and scale bits; charge the live resident
+experts, staging, and shadow slots separately. The real GB10 observations
+below distinguish a source-byte estimate, a materialized tier, and a
+published transfer. A compact allocation or a passing byte-accounting test
+is not evidence that a live migration took place.
 
-- GPU MXFP4 is ALREADY the native 17 B/32 layout: `nativeQuantisedScalePlaneBytes(25)==1`
-  (E8M0 byte scale plane; `CUDAVnniRepackKernels.cu` `kRepackMXFP4` keeps codes
-  verbatim + E8M0). The earlier "18 B/32" note is superseded. No GPU MXFP4 work
-  remains for storage economy.
-- CPU prepared inflation is the defect: `preparedEncodingForCodebook()` sends the
-  low-bit IQ codebooks (IQ2_XS 2.59x, IQ3_XXS 2.94x, IQ1_*) to **ExpandedInt8**
-  because they are neither nibble-LUT (IQ4_NL/IQ4_XS/Q4_0/Q4_1) nor
-  `CompactMultiScale` (Q2_K/Q3_K/Q6_K); Q4_K/Q5_K/Q6_K/Q8_0/F32/BF16/I32 stay
-  ~1.00-1.11x. Totals: 90.69 GB file -> 229.99 GB CPU prepared.
-- Fix (landed on the DSV4 branch, feat/deepseek-v4-flash-vision):
-  `CompactMultiScale` storage now covers IQ3_XXS (12), IQ2_XXS (15) and IQ1_S (16)
-  in addition to Q2_K/Q3_K/IQ2_S/IQ2_XS/IQ1_M, and the compact unit is sized per
-  codebook: after the payload words each decoder actually reads (three 32-bit
-  words for 9-12 byte payloads, two for 6-8 byte payloads), plus fp16 scales and
-  the effective-minimum vector. Units: 1280 B per 64-column/K-block for
-  Q3_K/IQ2_S/IQ2_XS/IQ3_XXS (5 bits/value) and 1024 B for Q2_K/IQ2_XXS/IQ1_S/
-  IQ1_M (4 bits/value), down from one fixed 1536 B unit (6 bits/value). The
-  effective-minimum vector is reserved only for Q2_K (the sole consumer), which
-  shrinks the remaining units to 1024 B for Q3_K/IQ2_S/IQ2_XS/IQ3_XXS (4
-  bits/value) and 768 B for IQ2_XXS/IQ1_S/IQ1_M (3 bits/value). Measured
-  prepared/file ratios (header-only BOM on the real UD shards):
-  UD-IQ1_S 82.43 GB -> 109.61 GB (1.33x), UD-IQ1_M 86.86 -> 143.94 (1.66x),
-  UD-IQ2_XXS 90.69 -> 140.97 (1.55x); the IQ3_XXS and IQ2_XXS tensor classes
-  land at exactly 1.00x of their file bytes. The NEON tile-register witness
-  required the grid gathers to be always-inline (per-tile call overhead
-  removed too).
-- Remaining (tracked, small): the effective-minimum vector is still reserved for
-  every compact codebook though only IQ2_S consumes it (-0.5 to -1.0 bits/value
-  if conditioned); IQ3_S intentionally stays on `IQ3SExpandedSourceScale` (its
-  source-scale rounding contract is not the plain grid decode).
-- Consequences: CPU-only paths for IQ models are still memory-heavy on GB10/H100
-  CPU tiers (now ~1.6-2.6x the file instead of 2.6-5.9x); the 2xH100 vLLM
-  comparison uses GPU-only TP2 (Q8), where the storage is already honest (GPU
-  weights 150.7 GB for the 162 GB file).
-
-Related BOM evidence (all fits on .79, a8eab593b+):
-- One GB10 (unified ~117-125 GB): Q8 153.3 GB (one device) -> TP2 76.7/device;
-  IQ2_XXS 127.3 -> 56.3; IQ1_M 125.6 (both still > single-node budget).
-- CPU-only: IQ2_XXS 291.8 GB / IQ1_M 160? (280.6) vs 117.2 GB.
+GPU MXFP4 uses the native 17 B per 32 values (16 code bytes and an E8M0 byte
+scale plane). The earlier 18 B figures in the historical MXFP4 design and
+vLLM comparison describe the retired FP16-scale layout.
 
 ## Cluster run requirements (pending owner decision; no GPU window authorized)
 
@@ -452,23 +422,137 @@ greedy, prompt `[image] Describe the picture.`, thinking high):
 Not yet: GPU vision tower, multi-rank image requests, prefix caching of image
 prompts (prefix cache is rejected for DSV4), image-content-aware prefix keys.
 
-## Single-GB10 storage (file-density weights, PR #73)
+## Single-GB10 real-weight result (PR #71 + #73)
 
-Measured with `--dry-run --device cuda:0 -c 32768` on one GB10, real Unsloth
-DeepSeek-V4-Flash-Vision UD shard headers. Before file-density metadata,
-UD-IQ3_XXS needed 115.3 GiB of weights from a 103.0 GB file (IQ2_S experts
-+15.5 GB, IQ3_XXS +4.8 GB) and missed the 117.3 GiB pool by 0.56 GiB.
+Release `99319c088da99739cde0d7ab3608e31114e7336f` includes #73
+`3a34136b3f205228f6a5766a93dffb73326ed122`. One CUDA `sm_121` GB10 with NEON
+per run; the same Release executable and core DSO ran on both Sparks. The
+four real UD-IQ3_XXS shards total **102,999,936,000 B**. Their headers describe
+**102,994,586,972 B** of tensor payload, including **95,613,353,984 B** of
+routed experts. The 192/256 GPU cap leaves 64 experts per layer on CPU:
+**23,903,338,496 B** of source data. This is the expected CPU live weight
+payload, not a claim about the size of the entire CPU process. No whole-file
+hash or end-to-end raw-weight byte comparison was performed.
 
-With CUDA superblock-coded metadata every Spark-fitting UD variant is
-admitted at its GGUF bytes plus code-plane alignment (~11 KB per variant):
-UD-IQ1_S 82.4, UD-IQ1_M 86.9, UD-IQ2_XXS 90.7, UD-Q2_K_XL 96.8, UD-IQ3_XXS
-103.0 and UD-IQ3_S 114.4 GB (`V2_Integration_DeepSeekV4UDVariantWeightDensity`
-replays their real tensor inventories). UD-IQ3_XXS and UD-IQ1_M load and
-generate on one GB10; UD-IQ3_XXS with the BF16 mmproj describes images.
+### Greedy, 32,768-token context (.80)
 
-Non-KV GPU memory at 512 resident rows (UD-IQ3_XXS, 32K): the arena is
-700 MiB after dropping never-bound Qwen fa_q_raw/fa_gate/mtp_*/gdn_* roots
-(was 1.18 GiB), and the serial workspace family is 1.27 GB after declaring
-the 144 MiB CUDA Q8 router gate cache only for FP32 gates (was 1.43 GB). The
-KV/state pools are 110 MiB at 32K and 3.4 GiB at 1M.
+All text requests had the same 67 prompt IDs, seed 42, temperature 0,
+thinking off, no prefix cache, and a 768-token limit. Rates below are the
+HTTP `/stats` handler's prefill/decode rates. In A the device-owned request
+can defer prefill work into generation, so its handler prefill rate is not
+an isolated GPU prefill measurement. This is not the canonical benchmark.
 
+| Cell | Weights observed (bytes) | Working storage | Movement | Prefill / decode (tok/s) | IDs |
+|---|---|---|---|---:|---|
+| A: CUDA only | 102,989,464,892 B PMA weight admission (99.990% of shard length); 101,354,585,856 B attested in the prepared pool | 734,455,124 B CUDA activation arena incl. state; 1,274,450,200 B allocated CUDA workspace; 0 generic KV payload | Not applicable | 15,306.43 / 12.68 | 768; identical to A at 1M |
+| B: dynamic CUDA+CPU | No model materialized | Rejected at `overlay-candidate.fixed-bom` | No request or transfer ran | — | No stream |
+| C: static CUDA+CPU | 79,090,331,452 B CUDA admission; 77,451,247,360 B attested in the CUDA prepared pools. CPU live weights: **23,903,338,496 B** planned and materialized, exactly **1.000x** source bytes | Same 734,455,124 B primary CUDA activation arena; 1.274 GB CUDA workspace; 39,321,600 B CPU kernel workspace and 317,214,848 B CPU expert arena; 0 generic KV payload | Host ledger empty; 0 windows, transactions, commands and bytes | 30.70 / 5.31 | **Differs from A at index 5** |
+
+`generation_tokens.compare_tokens` reports the first differing completion ID
+at zero-based index **5** (sixth token): A **12709**, C **27510**. Both finish
+with `length`. Completion-ID SHA-256 (signed int32 little-endian):
+
+- A: `05ecbdea493d6ac6acf45564b62d9f87c40eb2bdaff345a5974ca0e589538c76`
+- C: `05b1bf59bcc0fe700b4f2afc2ee2673b2296c2c4f5fd0bcbaf5c1146b4c902dc`
+
+A begins “**Why the sky is blue:** Sunlight contains all colors, but air
+molecules scatter blue light more than red because blue has a shorter
+wavelength.” C begins “**Why the Sky is Blue**” and then “Sunlight contains
+all colors, but air molecules scatter blue light more than red because blue
+travels in shorter, wavier waves.” Full text and token IDs are in the
+retained responses. The drift is a failed equality check, not an explanation
+of its cause.
+
+A's 32K retirement repeat on .80 reproduced all IDs and exited zero via
+HTTP shutdown. PerfStats shows two full-graph `main_decode` materializations
+(2,270 native nodes each), one `single_async_native_while_launch` at draft
+depth 0, and a single terminal response bridge for all 768 IDs (two
+terminal D2H operations, one event wait, no stream synchronization).
+The semantic GPU host-transfer validator found no intermediate D2H; there
+were no segmented executions. The generic decode-replay matcher did not
+recognize the native while launch as a context-matched decode replay.
+
+C's 32K retirement repeat on .79 also exited zero and reproduced C's IDs.
+Its PMA ready attestation proves no inflation on the CPU tier (the old 2.4x
+ratio would have used roughly 57.4 GB for those same experts); summed CPU
+and CUDA weight admission was 102,993,669,948 B, 99.994% of shard length.
+PerfStats confirms the CPU expert service and captured heterogeneous parent
+(766 `main_decode` replays), `maintenance_not_started=1`,
+`static_no_movement_checks=1`, and `committed_expert_migrations=0`. The
+terminal ledger is empty. The semantic transfer helper did not qualify C's
+768 observed 52-byte scheduler tickets. Each retirement repeat still had
+one new `NV_ERR_NO_MEMORY` kernel warning. These lifetimes are diagnostic
+observations, not passing end-to-end gates.
+
+### Maximum context and vision
+
+- A on .80 admitted the model maximum **1,048,576** context and generated
+  768 tokens at 12.49 decode tok/s. Generic KV payload was zero. Packed
+  compressor + indexer pools used 3,684,958,208 B within the 4,370,842,964 B
+  CUDA activation arena; the workspace was 1,274,450,200 B. This admission
+  does not test a 1M-token prompt. The original lifetime had 48 new NVIDIA
+  driver findings (`NV_ERR_NO_MEMORY`) and no clean terminal PerfStats export.
+- A-image on .80 also admitted 1,048,576 context, using `mmproj-BF16.gguf`
+  and `docs/assets/llaminar-bot.png` (“Describe this image.”). It returned
+  128 tokens from 208 prompt IDs, at 9.26 decode tok/s. Answer excerpt:
+  “The image is a flat, vector-style illustration of a stylized animal head,
+  resembling a fluffy creature like a llama, alpaca, or sheep. It is designed
+  with a ‘cyborg’ or robotic theme, featuring a dark visor instead of normal
+  eyes.” Its driver window had one new NVIDIA warning.
+- B on .79 (1M) and .80 (32K) rejected CUDA:0 with “Physical memory
+  contributors disagree on allocator observation.” The dynamic stream/event
+  BOMs construct a Dedicated allocator observation where the fixed GB10 BOM
+  carries RankHostPool backing. This is an admission contract failure even
+  at 32K, not a measured memory deficit. Per-move wire size and dynamic
+  token equality remain unmeasured.
+- C on .79 (1M) was killed by the host OOM killer while preparing the
+  retained prefill family and had new NVIDIA page-table allocation warnings.
+  It did not reach `ServerReady` at that context.
+
+### Reproduction and scope
+
+The Spark Integration build ran `ctest -R
+'DeepSeek|NativeQuantisedFileDensity|CPUCodedCompactUnits|ExpertTierWeightStream'
+--output-on-failure`; 19 of 20 passed, no skips, including all DeepSeek and
+density correctness cases. The regex also selects
+`V2_Perf_CUDA_ExpertTierWeightStreaming`, whose unchanged fixture failed
+validation when it supplied the legacy per-block metadata layout to the
+coded migration contract. This and the live failures are not waived.
+
+Use the GB10 `mxfp4-validation:gb10` image, `/src` mount for oneDNN, and
+NEON/CUDA Release build. The exact Docker commands, image request bytes,
+`/stats`, logs, driver intervals, raw responses and available PerfStats are
+retained under `~/dsv4-validation/logs/pr71-99319c08-<cell>-<context>[-retire]/`
+on the Spark that ran each cell. The initial harness sent a POST without a
+`Content-Length` on shutdown; subsequent `-retire` runs send an explicit
+empty body for normal retirement. The runtime command (one `placement`
+variant per fresh lifetime):
+
+```bash
+model=/models/UD-IQ3_XXS/DeepSeek-V4-Flash-Vision-Exp-UD-IQ3_XXS-00001-of-00004.gguf
+context=32768  # 1048576 for the maximum-context trials
+placement=(--device cuda:0)  # A; add --mmproj /models/mmproj-BF16.gguf for A-image
+# B and C instead:
+# placement=(--expert-tier 'accelerator=cuda:0;priority=0;max-experts-per-layer=192'
+#            --expert-tier 'capacity=cpu:0;priority=10')
+# B: placement+=(--moe-residency-maintenance dynamic --moe-residency-maintenance-window 64
+#                --moe-residency-maintenance-max-window 64 --moe-migration-payoff-horizon-tokens 65536)
+# C: placement+=(--moe-residency-maintenance off)
+/build/release-pr71/llaminar2 serve -m "$model" "${placement[@]}" \
+    -c "$context" --no-prefix-cache --host 127.0.0.1 --port 18571
+curl --fail-with-body -H 'Content-Type: application/json' --data-binary @request.json \
+    http://127.0.0.1:18571/v1/chat/completions
+```
+
+`request.json` contains `stream:false`, `temperature:0`, `seed:42`,
+`enable_thinking:false`, `max_tokens:768`, `return_token_ids:true`,
+`return_runtime_summary:true`, and one user message:
+
+> Write a numbered field guide with 100 distinct, two-sentence entries about
+> common natural phenomena. Start with why the sky is blue, why clouds look
+> white, and how a rainbow forms. For each entry, explain the physical cause in
+> plain English. Start immediately at entry 1; do not add a preamble.
+
+These are focused diagnostics, not a frozen-history panel or a Release
+certificate. A/C exact output equality failed; B never published a stream
+or moved weights. The native driver findings remain red.
