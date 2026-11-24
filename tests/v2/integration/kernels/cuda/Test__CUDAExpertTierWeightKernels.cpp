@@ -464,9 +464,7 @@ namespace llaminar2
                 {
                     std::uint8_t value = static_cast<std::uint8_t>(
                         (block * 37u + byte * 19u + 11u) & 0xffu);
-                    if (format.codebook == 19 ||
-                        format.codebook ==
-                            kNativeQuantisedExpandedInt8MinCodebook)
+                    if (format.codebook == 19)
                     {
                         value = static_cast<std::uint8_t>(
                             static_cast<std::int8_t>(

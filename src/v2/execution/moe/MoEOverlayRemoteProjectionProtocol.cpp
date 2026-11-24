@@ -120,37 +120,11 @@ namespace llaminar2
             const MoEOverlayRemoteProjectionManifest &manifest,
             const NativeQuantisedFormatInfo &source) noexcept
         {
-            const std::uint8_t canonical =
-                canonicalDeviceVnniCodebookId(source);
-            if (manifest.gpu_codebook_id == canonical)
-            {
-                return manifest.gpu_payload_bytes_per_block ==
-                           source.payload_bytes &&
-                       manifest.gpu_is_asymmetric ==
-                           static_cast<std::uint8_t>(canonicalDeviceVnniFormat(source).is_asymmetric) &&
-                       manifest.gpu_has_emins ==
-                           static_cast<std::uint8_t>(source.has_emins);
-            }
-
-            /*
-             * A CPU promotion may no longer possess compact source bits.  Its
-             * destination GPU then executes normalized signed bytes while the
-             * source identity remains the mathematical GGUF provenance.
-             */
-            if (cpu::native_quantised::preparedEncodingForSource(source) !=
-                cpu::native_quantised::CPUNativeQuantisedEncoding::ExpandedInt8)
-            {
-                return false;
-            }
-            const std::uint8_t normalized =
-                source.is_asymmetric
-                    ? kNativeQuantisedExpandedInt8MinCodebook
-                    : static_cast<std::uint8_t>(19);
-            return manifest.gpu_codebook_id == normalized &&
-                   manifest.gpu_payload_bytes_per_block == 32u &&
-                   manifest.gpu_is_asymmetric ==
-                       static_cast<std::uint8_t>(source.is_asymmetric) &&
-                   manifest.gpu_has_emins == 0u;
+            const auto canonical = canonicalDeviceVnniFormat(source);
+            return manifest.gpu_codebook_id == canonical.codebook_id &&
+                manifest.gpu_payload_bytes_per_block == canonical.payload_bytes_per_block &&
+                manifest.gpu_is_asymmetric == canonical.is_asymmetric &&
+                manifest.gpu_has_emins == canonical.has_emins;
         }
 
         /** @brief Seal a constructed manifest and reject impossible capacities. */

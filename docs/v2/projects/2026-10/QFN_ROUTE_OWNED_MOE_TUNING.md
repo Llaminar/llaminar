@@ -470,6 +470,9 @@ evidence. These focused checks do not refresh complete production preflight.
 
 ### Historical CPU-promoted decoder23 (retired)
 
+The [producer audit](../2026-11/native-quantised-physical-23-retirement.md) records
+why current file-density preparation no longer compiles or advertises decoder 23.
+
 These measurements used the former expanded preparation. The current
 `prepared_representation: cpu-prepared-migrated` diagnostic instead measures
 the canonical CPU-to-GPU arrival for the authored source (including native

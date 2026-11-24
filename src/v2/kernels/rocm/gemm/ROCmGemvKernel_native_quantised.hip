@@ -228,10 +228,6 @@ struct NativeQuantisedDecodeGeneratedRuntimeConfig
 /**
  * @brief Select the historical policy for a self-describing execution format.
  *
- * Codebook 23 is a migration-only physical representation and therefore has
- * no independent tuning corpus. Legacy one-ID callers retain the prior
- * codebook-19 policy. Production callers carrying source provenance use the
- * explicit two-ID entrypoints below and never consult this default.
  */
 static constexpr uint8_t defaultNativeQuantisedArithmeticPolicyCodebook(
     uint8_t execution_codebook_id)
@@ -239,9 +235,6 @@ static constexpr uint8_t defaultNativeQuantisedArithmeticPolicyCodebook(
     return execution_codebook_id == llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook ||
                    execution_codebook_id == llaminar2::kNativeQuantisedMXFP4Codebook
                ? static_cast<uint8_t>(4)
-               : execution_codebook_id ==
-                   llaminar2::kNativeQuantisedExpandedInt8MinCodebook
-               ? static_cast<uint8_t>(19)
                : execution_codebook_id;
 }
 
@@ -502,8 +495,6 @@ enum NativeQuantisedFormat : uint8_t {
     NATIVE_QUANTISED_IQ1_S  = 16,  // IQ1 grid (8 elem/lookup), 11-bit index, signed values {-1,0,+1}, delta correction
     NATIVE_QUANTISED_IQ1_M  = 17,  // IQ1 grid (8 elem/lookup), 11-bit index, signed values {-1,0,+1}, dual-scale + delta
     NATIVE_QUANTISED_Q8_0   = 19,  // 8-bit symmetric, direct INT8 payload (32 bytes)
-    NATIVE_QUANTISED_EXPANDED_INT8_MIN =
-        llaminar2::kNativeQuantisedExpandedInt8MinCodebook,
 };
 
 // Compile-time format properties
@@ -512,7 +503,7 @@ struct NATIVE_QUANTISEDTraits {
     // Asymmetric formats have a min correction term: f_acc += sum_a * block_m
     static constexpr bool is_asymmetric =
         FMT == NATIVE_QUANTISED_Q4_1 || FMT == NATIVE_QUANTISED_Q5_1 ||
-        FMT == NATIVE_QUANTISED_IQ1_S || FMT == NATIVE_QUANTISED_EXPANDED_INT8_MIN;
+        FMT == NATIVE_QUANTISED_IQ1_S;
     // --- IQ grid format traits ---
     static constexpr bool is_iq3_grid = (FMT == NATIVE_QUANTISED_IQ3_S || FMT == NATIVE_QUANTISED_IQ3_XXS);
     static constexpr bool is_iq2_grid = (FMT == NATIVE_QUANTISED_IQ2_S || FMT == NATIVE_QUANTISED_IQ2_XS || FMT == NATIVE_QUANTISED_IQ2_XXS);
@@ -541,7 +532,7 @@ struct NATIVE_QUANTISEDTraits {
     static constexpr bool is_3bit       = (FMT == NATIVE_QUANTISED_Q3_K);
     static constexpr bool is_2bit       = (FMT == NATIVE_QUANTISED_Q2_K);
     static constexpr bool is_8bit =
-        FMT == NATIVE_QUANTISED_Q8_0 || FMT == NATIVE_QUANTISED_EXPANDED_INT8_MIN;
+        FMT == NATIVE_QUANTISED_Q8_0;
     static constexpr bool requires_secondary_metadata =
         is_asymmetric || is_dual_scale || FMT == NATIVE_QUANTISED_IQ3_S || FMT == NATIVE_QUANTISED_IQ4_XS_SOURCE;
     static constexpr bool uses_lut      = (FMT == NATIVE_QUANTISED_IQ4_NL || FMT == NATIVE_QUANTISED_IQ4_XS_SOURCE || FMT == NATIVE_QUANTISED_MXFP4);
@@ -653,7 +644,7 @@ struct NATIVE_QUANTISEDGroupedMoESupported {
         FMT == NATIVE_QUANTISED_Q3_K || FMT == NATIVE_QUANTISED_Q2_K || FMT == NATIVE_QUANTISED_IQ3_S ||
         FMT == NATIVE_QUANTISED_IQ3_XXS || FMT == NATIVE_QUANTISED_IQ2_S || FMT == NATIVE_QUANTISED_IQ2_XS ||
         FMT == NATIVE_QUANTISED_IQ2_XXS || FMT == NATIVE_QUANTISED_IQ1_S || FMT == NATIVE_QUANTISED_IQ1_M ||
-        FMT == NATIVE_QUANTISED_Q8_0 || FMT == NATIVE_QUANTISED_EXPANDED_INT8_MIN;
+        FMT == NATIVE_QUANTISED_Q8_0;
 };
 
 /**
@@ -3753,9 +3744,7 @@ __global__ void moe_grouped_native_quantised_down_runtime_kpart_kernel_t(
  * @brief Return the canonical source policy carried by a device descriptor.
  *
  * Q8_1 and Q8_K keep distinct source identities but intentionally share the
- * Q8_0 accelerator arithmetic policy, and MXFP4 shares IQ4_NL's.  Expanded codebook 23 never supplies a
- * policy of its own: its authoritative source identity selects the reduction
- * tree that existed before migration.
+ * Q8_0 accelerator arithmetic policy, and MXFP4 shares IQ4_NL's.
  */
 __device__ __forceinline__ uint8_t
 moe_native_quantised_descriptor_policy_codebook(
@@ -3926,11 +3915,6 @@ __device__ __forceinline__ float moe_native_quantised_dot_desc_range_dynamic(
             return moe_native_quantised_dot_desc_range<NATIVE_QUANTISED_Q8_0>(
                 *desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
         break;
-    case NATIVE_QUANTISED_EXPANDED_INT8_MIN:
-        if constexpr((DecoderMask&(1u<<NATIVE_QUANTISED_EXPANDED_INT8_MIN))!=0)
-            return moe_native_quantised_dot_desc_range<NATIVE_QUANTISED_EXPANDED_INT8_MIN>(
-                *desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
-        break;
     default:
         break;
     }
@@ -3965,7 +3949,6 @@ __device__ __forceinline__ float moe_native_quantised_dot_desc_range_dynamic(
     Apply(NATIVE_QUANTISED_IQ1_S,NATIVE_QUANTISED_IQ1_S) \
     Apply(NATIVE_QUANTISED_IQ1_M,NATIVE_QUANTISED_IQ1_M) \
     Apply(NATIVE_QUANTISED_Q8_0,NATIVE_QUANTISED_Q8_0) \
-    Apply(NATIVE_QUANTISED_EXPANDED_INT8_MIN,NATIVE_QUANTISED_EXPANDED_INT8_MIN) \
     Apply(NATIVE_QUANTISED_IQ4_NL,NATIVE_QUANTISED_IQ4_XS_SOURCE) \
     Apply(NATIVE_QUANTISED_IQ4_XS_SOURCE,NATIVE_QUANTISED_IQ4_NL)
 
@@ -5407,7 +5390,7 @@ const void* residentMoEFFNKernelFunction(ResidentMoEFFNDecoderProgram program,Re
     if(currentResidentMoEFFNProgram()==ResidentMoEFFNProgram::PartitionLocal)
     {
         if(program.groups()!=1)
-            throw std::invalid_argument("Partition-local FFN diagnostic requires the complete affine/byte execution envelope {5,7,19,23}");
+            throw std::invalid_argument("Partition-local FFN diagnostic requires the complete affine/byte execution envelope {5,7,19}");
         if(width!=ResidentMoEFFNSchedulerWidth::UInt32&&width!=ResidentMoEFFNSchedulerWidth::UInt64)
             throw std::invalid_argument("Partition-local FFN diagnostic scheduler width is unknown");
         return width==ResidentMoEFFNSchedulerWidth::UInt32
@@ -6978,10 +6961,6 @@ __global__ __launch_bounds__(TILE_N / CPT) void gemv_native_quantised_small_m_ba
         gemv_native_quantised_small_m_batched_shared_body<TILE_N, CPT, ROWS_PER_TILE, NATIVE_QUANTISED_Q8_0, Publication>(
             d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, projection, K, partition_blocks, active_m,row_first);
         break;
-    case NATIVE_QUANTISED_EXPANDED_INT8_MIN:
-        gemv_native_quantised_small_m_batched_shared_body<TILE_N, CPT, ROWS_PER_TILE, NATIVE_QUANTISED_EXPANDED_INT8_MIN, Publication>(
-            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, projection, K, partition_blocks, active_m,row_first);
-        break;
     default:
         break;
     }
@@ -7801,9 +7780,6 @@ bool rocmMoE_grouped_swiglu_down_native_quantised_decode(
     case NATIVE_QUANTISED_IQ1_S:    LAUNCH_GROUPED_DOWN_DIRECT(NATIVE_QUANTISED_IQ1_S);    break;
     case NATIVE_QUANTISED_IQ1_M:    LAUNCH_GROUPED_DOWN_DIRECT(NATIVE_QUANTISED_IQ1_M);    break;
     case NATIVE_QUANTISED_Q8_0:     LAUNCH_GROUPED_DOWN_DIRECT(NATIVE_QUANTISED_Q8_0);     break;
-    case NATIVE_QUANTISED_EXPANDED_INT8_MIN:
-        LAUNCH_GROUPED_DOWN_DIRECT(NATIVE_QUANTISED_EXPANDED_INT8_MIN);
-        break;
     default:
         fprintf(stderr, "[rocmMoE_grouped_swiglu_down_native_quantised_decode] unsupported codebook_id=%u\n",
                 static_cast<unsigned>(codebook_id));
@@ -8757,7 +8733,6 @@ static bool nativeQuantisedCodebookRequiresAux(uint8_t codebook_id)
     case NATIVE_QUANTISED_IQ2_XS:
     case NATIVE_QUANTISED_IQ1_S:
     case NATIVE_QUANTISED_IQ1_M:
-    case NATIVE_QUANTISED_EXPANDED_INT8_MIN:
         return true;
     default:
         return false;
@@ -8791,7 +8766,6 @@ static bool nativeQuantisedCodebookSupported(uint8_t codebook_id)
     case NATIVE_QUANTISED_IQ1_S:
     case NATIVE_QUANTISED_IQ1_M:
     case NATIVE_QUANTISED_Q8_0:
-    case NATIVE_QUANTISED_EXPANDED_INT8_MIN:
         return true;
     default:
         return false;
@@ -9197,8 +9171,6 @@ bool rocmGemv_native_quantised_small_m_fp32_with_sums_policy(
     case NATIVE_QUANTISED_IQ1_S:    LAUNCH_SMALL_M(NATIVE_QUANTISED_IQ1_S);
     case NATIVE_QUANTISED_IQ1_M:    LAUNCH_SMALL_M(NATIVE_QUANTISED_IQ1_M);
     case NATIVE_QUANTISED_Q8_0:     LAUNCH_SMALL_M(NATIVE_QUANTISED_Q8_0);
-    case NATIVE_QUANTISED_EXPANDED_INT8_MIN:
-        LAUNCH_SMALL_M(NATIVE_QUANTISED_EXPANDED_INT8_MIN);
     default:
         fprintf(stderr, "[rocmGemv_native_quantised_small_m_fp32] unsupported codebook_id=%u (M=%d N=%d K=%d)\n",
                 static_cast<unsigned>(codebook_id), M, N, K);
@@ -9390,8 +9362,6 @@ static bool rocmGemv_native_quantised_small_m_batched_fp32_with_sums_policy_impl
     case NATIVE_QUANTISED_IQ1_S:    DISPATCH_BATCHED_FMT(NATIVE_QUANTISED_IQ1_S);
     case NATIVE_QUANTISED_IQ1_M:    DISPATCH_BATCHED_FMT(NATIVE_QUANTISED_IQ1_M);
     case NATIVE_QUANTISED_Q8_0:     DISPATCH_BATCHED_FMT(NATIVE_QUANTISED_Q8_0);
-    case NATIVE_QUANTISED_EXPANDED_INT8_MIN:
-        DISPATCH_BATCHED_FMT(NATIVE_QUANTISED_EXPANDED_INT8_MIN);
     default:
         fprintf(stderr, "[rocmGemv_native_quantised_small_m_batched_fp32] unsupported codebook_id=%u (M=%d K=%d projections=%d)\n",
                 codebook_id, M, K, num_projections);
@@ -9606,8 +9576,7 @@ static bool nativeM1UsesIQLDS(std::uint8_t execution,int n,int k)
  * @brief Execute serial NativeQuantised GEMV with an explicit arithmetic policy.
  *
  * The execution codebook owns physical decoding; the arithmetic policy
- * codebook owns generated occupancy and split-K reduction order. These IDs
- * differ after compact CPU weights are promoted into expanded codebook 23.
+ * codebook owns generated occupancy and split-K reduction order.
  */
 static bool nativeM1WithReduction(
     const int8_t* d_A_int8,
@@ -9882,14 +9851,8 @@ static bool nativeM1WithReduction(
 
         constexpr int DEFAULT_TARGET_WAVES_PER_CU = 24;
 
-        // Both expanded INT8 representations have the same payload traffic
-        // and direct decode.  Codebook 23 adds only the already-vectorized
-        // asymmetric correction, so it intentionally inherits codebook 19's
-        // trained launch policy until its own certification corpus is added.
         constexpr int Q8_0_TARGET_WAVES_PER_CU = 4;
-        const bool uses_expanded_int8 =
-            codebook_id == static_cast<uint8_t>(NATIVE_QUANTISED_Q8_0) ||
-            codebook_id == static_cast<uint8_t>(NATIVE_QUANTISED_EXPANDED_INT8_MIN);
+        const bool uses_expanded_int8 = codebook_id == NATIVE_QUANTISED_Q8_0;
         const int default_waves = uses_expanded_int8
                                       ? Q8_0_TARGET_WAVES_PER_CU
                                       : DEFAULT_TARGET_WAVES_PER_CU;
@@ -9981,9 +9944,6 @@ static bool nativeM1WithReduction(
 #undef LAUNCH_NATIVE_Q8_GEOMETRY
             break;
         }
-        case NATIVE_QUANTISED_EXPANDED_INT8_MIN:
-            LAUNCH_NATIVE_QUANTISED(NATIVE_QUANTISED_EXPANDED_INT8_MIN);
-            break;
         default:
             fprintf(stderr, "[rocmGemv_native_quantised_fp32] Unknown codebook_id=%u (N=%d K=%d)\n",
                     static_cast<unsigned>(codebook_id), N, K);

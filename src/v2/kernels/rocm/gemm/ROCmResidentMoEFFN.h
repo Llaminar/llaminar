@@ -53,7 +53,7 @@ private:
 /** @brief Decoder structures bound into one finite family, independent of model/source residency. */
 enum class ResidentMoEFFNDecoderStructure : std::uint8_t
 {
-    AffineAndByte=1, ///< Q4/Q5 affine payloads, signed Q8 and expanded INT8/min.
+    AffineAndByte=1, ///< Q4/Q5 affine payloads and signed Q8.
     LinearPackedAndSubscale=2, ///< Linear packed Q4/Q5 and Q2/Q3/Q6 subscale payloads.
     IQ3AndIQ4Grid=4, ///< IQ3/IQ4 lookup grids, including original IQ4_XS metadata.
     IQ1AndIQ2Grid=8 ///< IQ1/IQ2 low-bit lookup grids and correction metadata.
@@ -79,8 +79,7 @@ struct ResidentMoEFFNExecutionMasks
 class ResidentMoEFFNDecoderProgram final
 {
 public:
-    static constexpr std::uint32_t affine_and_byte=(1u<<5)|(1u<<7)|(1u<<19)|
-        (1u<<kNativeQuantisedExpandedInt8MinCodebook);
+    static constexpr std::uint32_t affine_and_byte=(1u<<5)|(1u<<7)|(1u<<19);
     static constexpr std::uint32_t linear_packed_and_subscale=(1u<<0)|(1u<<6)|(1u<<8)|(1u<<9)|(1u<<10);
     static constexpr std::uint32_t iq3_and_iq4_grid=(1u<<4)|(1u<<11)|(1u<<12)|
         (1u<<kNativeQuantisedIQ4XSSourceScaleCodebook)|(1u<<kNativeQuantisedMXFP4Codebook);

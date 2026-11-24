@@ -57,7 +57,7 @@ struct PhaseProjectionValidation {
         NUMERIC_CASE(NATIVE_QUANTISED_IQ3_S) NUMERIC_CASE(NATIVE_QUANTISED_IQ3_XXS)
         NUMERIC_CASE(NATIVE_QUANTISED_IQ2_S) NUMERIC_CASE(NATIVE_QUANTISED_IQ2_XS) NUMERIC_CASE(NATIVE_QUANTISED_IQ2_XXS)
         NUMERIC_CASE(NATIVE_QUANTISED_IQ1_S) NUMERIC_CASE(NATIVE_QUANTISED_IQ1_M)
-        NUMERIC_CASE(NATIVE_QUANTISED_Q8_0) NUMERIC_CASE(NATIVE_QUANTISED_EXPANDED_INT8_MIN)
+        NUMERIC_CASE(NATIVE_QUANTISED_Q8_0)
         default:return State::Invalid;
         }
 #undef NUMERIC_CASE
@@ -187,7 +187,6 @@ template<NativeQuantisedFormat FMT> struct BlockOperand : BlockExtendedBits<NATI
 };
 static_assert(sizeof(BlockOperand<NATIVE_QUANTISED_Q5_1>)==24 &&
     sizeof(BlockOperand<NATIVE_QUANTISED_Q8_0>)==36 &&
-    sizeof(BlockOperand<NATIVE_QUANTISED_EXPANDED_INT8_MIN>)==36 &&
     sizeof(BlockOperand<NATIVE_QUANTISED_Q2_K>)==16,
     "Complete operands contain only aligned original payload and required metadata words");
 /**

@@ -188,11 +188,6 @@ static int serialEquivalentPolicyN(int actual_n)
 /**
  * @brief Resolve the trained policy identity for one execution codebook.
  *
- * Codebook 23 has the same 32-byte payload traffic and launch geometry as
- * codebook 19; its only additional work is the already-templated minimum
- * correction. Until the synthetic expanded-asymmetric format owns a separate
- * sealed dispatch corpus, it deliberately inherits the complete codebook-19
- * policy rather than entering an untrained generic route.
  */
 template <uint8_t ExecutionCodebook>
 inline constexpr uint8_t trainedPolicyCodebook()
@@ -200,10 +195,7 @@ inline constexpr uint8_t trainedPolicyCodebook()
     if constexpr (ExecutionCodebook == llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook ||
                   ExecutionCodebook == llaminar2::kNativeQuantisedMXFP4Codebook)
         return 4; // Exact source4 schedule; physical template/cache remains 24/25.
-    return ExecutionCodebook ==
-                   llaminar2::kNativeQuantisedExpandedInt8MinCodebook
-               ? static_cast<uint8_t>(19)
-               : ExecutionCodebook;
+    return ExecutionCodebook;
 }
 
 // =====================================================================
@@ -418,12 +410,9 @@ namespace
      *        be preserved.
      * @return Whether the source policy has an exact generated entry.
      *
-     * CPU residency normalizes decoded weights into execution codebook 19 or
-     * 23.  Their accelerator decoder changes, but their source-format launch
-     * geometry and ordered K-partition fold remain part of numerical identity.
-     * Only the normalized execution shard needs cross-codebook policy
-     * instantiations; compact formats require policy and execution identities
-     * to agree.
+     * Explicit expanded INT8 weights can use physical 19 while retaining the
+     * original source partition policy. Only that shard needs extra policy
+     * instantiations.
      */
     template <uint8_t ExecutionCodebook>
     bool selectCachedGeneratedDispatchForPolicy(
@@ -441,10 +430,7 @@ namespace
                 graph_captured, m, n, k, shape, tuning);
         }
 
-        if constexpr (
-            ExecutionCodebook == 19 ||
-            ExecutionCodebook ==
-                llaminar2::kNativeQuantisedExpandedInt8MinCodebook)
+        if constexpr (ExecutionCodebook == 19)
         {
             int shape_id = -1;
             if (!cudaNativeQuantisedGemvTuned_resolveArithmeticPolicy(
@@ -537,10 +523,7 @@ namespace
                 architecture, graph_captured, m, n, k, tuning);
         }
 
-        if constexpr (
-            ExecutionCodebook == 19 ||
-            ExecutionCodebook ==
-                llaminar2::kNativeQuantisedExpandedInt8MinCodebook)
+        if constexpr (ExecutionCodebook == 19)
         {
             int kernel = 0;
             if (!cudaNativeQuantisedGemvTuned_resolveGroupedArithmeticPolicy(
@@ -4222,9 +4205,8 @@ extern "C"
     /**
      * @brief Launch physical decode under the source-format reduction policy.
      *
-     * Normalized ExpertOverlay weights use codebook 19 or 23 for decoding but
-     * must retain the exact generated source-codebook partition tree. Keeping
-     * both identities explicit prevents residency from changing FP32 words.
+     * Physical decoding and the source partition tree remain independent for
+     * explicit expanded INT8 weights.
      */
     bool cudaNativeQuantisedGemvTuned_fp32_withPolicy(
         const int8_t *d_A_int8,

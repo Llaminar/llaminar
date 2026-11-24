@@ -394,7 +394,7 @@ TEST(Test__NativeQuantisedFormatInfo, PackedRegionSizingMatchesCanonicalMetadata
     }
 }
 
-TEST(Test__NativeQuantisedFormatInfo, MigrationStableAndReusableFormatsCoverEveryCodebook)
+TEST(Test__NativeQuantisedFormatInfo, ReusableAllocationMatchesCanonicalFormatForEverySource)
 {
     for (const auto &expected : kExpectations)
     {
@@ -403,48 +403,11 @@ TEST(Test__NativeQuantisedFormatInfo, MigrationStableAndReusableFormatsCoverEver
             native_quantised_formats::forQuantType(expected.name);
         ASSERT_NE(source, nullptr);
 
-        const auto migrated = migrationStableDeviceVnniFormat(*source);
-        const int expected_migrated_payload =
-            source->codebook_id == 8 || source->codebook_id == 11 || hasCompactMultiScaleVnniPayload(source->codebook_id) ||
-                (!source->is_superblock && (source->codebook_id == 6 || source->codebook_id == 7))
-                ? source->payload_bytes
-                : (source->codebook_id == 0 ||
-                           source->codebook_id == 4 ||
-                           source->codebook_id == 5 ||
-                           source->codebook_id == kNativeQuantisedMXFP4Codebook
-                       ? 16
-                       : 32);
-        const uint8_t expected_migrated_codebook =
-            expected_migrated_payload < 32
-                ? canonicalDeviceVnniCodebookId(*source)
-                : (source->is_asymmetric
-                       ? kNativeQuantisedExpandedInt8MinCodebook
-                       : static_cast<uint8_t>(19));
-        EXPECT_EQ(
-            migrated.payload_bytes_per_block,
-            expected_migrated_payload);
-        EXPECT_EQ(migrated.codebook_id, expected_migrated_codebook);
-        EXPECT_EQ(migrated.is_asymmetric, source->is_asymmetric || expected.name == "IQ4_XS" || expected.name == "IQ3_S");
-        EXPECT_EQ(migrated.has_emins, source->has_emins);
-        EXPECT_TRUE(deviceVnniExecutionCompatibleWithSource(
-            *source, migrated.codebook_id));
-        if (source->codebook_id == 8 || hasCompactMultiScaleVnniPayload(source->codebook_id))
-            EXPECT_FALSE(deviceVnniExecutionCompatibleWithSource(
-                *source, kNativeQuantisedExpandedInt8MinCodebook));
-
-        const auto allocation =
-            reusableDeviceVnniAllocationFormat(*source);
-        EXPECT_EQ(
-            allocation.payload_bytes_per_block,
-            std::max(source->payload_bytes, expected_migrated_payload));
+        const auto allocation = reusableDeviceVnniAllocationFormat(*source);
+        EXPECT_EQ(allocation.payload_bytes_per_block, expected.payload_bytes);
         EXPECT_EQ(allocation.has_mins, source->is_asymmetric || expected.name == "IQ4_XS" || expected.name == "IQ3_S");
         EXPECT_EQ(allocation.has_emins, source->has_emins);
-        EXPECT_GE(
-            allocation.payload_bytes_per_block,
-            source->payload_bytes);
-        EXPECT_GE(
-            allocation.payload_bytes_per_block,
-            migrated.payload_bytes_per_block);
+        EXPECT_FALSE(deviceVnniExecutionCompatibleWithSource(*source, 23));
     }
 }
 
@@ -462,15 +425,8 @@ TEST(Test__NativeQuantisedFormatInfo, DescriptorValidationCoversEveryReachablePh
     {
         SCOPED_TRACE(entry.quant_type);
         const auto canonical = canonicalDeviceVnniFormat(*entry.metadata);
-        const auto migrated = migrationStableDeviceVnniFormat(*entry.metadata);
-        for (const auto &[codebook, secondary] :
-             {std::pair{canonical.codebook_id, canonical.is_asymmetric},
-              std::pair{migrated.codebook_id, migrated.is_asymmetric}})
-        {
-            SCOPED_TRACE(static_cast<int>(codebook));
-            EXPECT_TRUE(NativeQuantisedDescriptorValidation::supported(codebook));
-            EXPECT_EQ(NativeQuantisedDescriptorValidation::secondary(codebook), secondary);
-        }
+        EXPECT_TRUE(NativeQuantisedDescriptorValidation::supported(canonical.codebook_id));
+        EXPECT_EQ(NativeQuantisedDescriptorValidation::secondary(canonical.codebook_id), canonical.is_asymmetric);
     }
 }
 
@@ -534,8 +490,6 @@ TEST(Test__NativeQuantisedFormatInfo, RuntimeCaptureEnvelopeCoversEveryTierRepre
         const NativeQuantisedFormatInfo &source = *entry.metadata;
         const uint8_t canonical_codebook =
             canonicalDeviceVnniCodebookId(source);
-        const uint8_t migration_codebook =
-            migrationStableDeviceVnniFormat(source).codebook_id;
         const NativeQuantisedSourceIdentity source_identity{
             .codebook_id = source.codebook_id,
             .is_superblock = source.is_superblock,
@@ -544,8 +498,7 @@ TEST(Test__NativeQuantisedFormatInfo, RuntimeCaptureEnvelopeCoversEveryTierRepre
         const uint32_t expected_policy_mask =
             nativeQuantisedCodebookMaskBit(canonicalDeviceVnniCodebookId(source.codebook_id));
         const uint32_t expected_runtime_mask =
-            nativeQuantisedCodebookMaskBit(canonical_codebook) |
-            nativeQuantisedCodebookMaskBit(migration_codebook);
+            nativeQuantisedCodebookMaskBit(canonical_codebook);
 
         NativeQuantisedExecutionFormatEnvelope immutable_envelope;
         ASSERT_TRUE(addNativeQuantisedExecutionFormat(
@@ -573,27 +526,8 @@ TEST(Test__NativeQuantisedFormatInfo, RuntimeCaptureEnvelopeCoversEveryTierRepre
             compact_runtime_envelope.policy_codebook_mask,
             expected_policy_mask);
 
-        // Publication may first observe either physical representation. Both
-        // must authenticate the same capture identity so tier movement never
-        // requires graph recapture or silently loses a decoder launch.
-        NativeQuantisedExecutionFormatEnvelope migrated_runtime_envelope;
-        ASSERT_TRUE(addNativeQuantisedExecutionFormat(
-            migrated_runtime_envelope,
-            migration_codebook,
-            source_identity,
-            true));
-        EXPECT_EQ(
-            migrated_runtime_envelope.execution_codebook_mask,
-            expected_runtime_mask);
-        EXPECT_EQ(
-            migrated_runtime_envelope.policy_codebook_mask,
-            expected_policy_mask);
-        EXPECT_EQ(
-            migrated_runtime_envelope.execution_codebook_mask,
-            compact_runtime_envelope.execution_codebook_mask);
-        EXPECT_EQ(
-            migrated_runtime_envelope.policy_codebook_mask,
-            compact_runtime_envelope.policy_codebook_mask);
+        NativeQuantisedExecutionFormatEnvelope retired_decoder;
+        EXPECT_FALSE(addNativeQuantisedExecutionFormat(retired_decoder, 23, source_identity, true));
     }
 }
 

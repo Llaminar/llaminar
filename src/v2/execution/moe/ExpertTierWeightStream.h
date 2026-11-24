@@ -362,11 +362,8 @@ namespace llaminar2
     /**
      * @brief Build a GPU-to-CPU stream from the live physical GPU descriptor.
      *
-     * A prior CPU promotion may have irreversibly normalized an expanded CPU
-     * representation into physical codebook 19 or 23 while retaining its
-     * original GGUF provenance. This overload authenticates that live physical
-     * layout and preserves the original CPU format in the outgoing stream, so
-     * arbitrary promotion/demotion cycles remain lossless.
+     * Authenticate the live canonical GPU layout and retain the original GGUF
+     * identity so demotion produces the same CPU encoding as direct loading.
      *
      * @param source_format Original catalogued GGUF format identity.
      * @param gpu_source Exact live separated GPU descriptor.
@@ -397,8 +394,7 @@ namespace llaminar2
      * @param expert_id Logical routed expert.
      * @param projection Gate/up/down identity.
      * @param maximum_units_per_chunk Persistent staging capacity in units.
-     * @return Complete authenticated stream manifest whose GPU destination is
-     *         compact when reversible and normalized INT8 otherwise.
+     * @return Complete authenticated stream manifest for the source's canonical GPU format.
      * @throws std::invalid_argument when the CPU representation cannot form a
      *         complete, allocation-stable cross-tier stream.
      */
@@ -414,9 +410,8 @@ namespace llaminar2
     /**
      * @brief Reference deinterleave from final CPU bytes to GPU separated data.
      *
-     * Expanded signed INT8 becomes codebook 19 when symmetric or the explicit
-     * ExpertOverlay INT8+minimum codebook when asymmetric. Nibble and Q6
-     * encodings preserve their compact device payload exactly.
+     * Canonical CPU storage preserves enough source information to reproduce
+     * the original GPU payload and metadata planes without requantization.
      * @param cpu_weights Valid final CPU execution representation.
      * @param gpu_weights Receives common separated GPU-format bytes.
      * @param error Optional exact rejection reason.
@@ -428,12 +423,10 @@ namespace llaminar2
         std::string *error = nullptr) noexcept;
 
     /**
-     * @brief Reference pack from a normalized GPU projection to CPU bytes.
+     * @brief Reference pack from a canonical GPU projection to CPU bytes.
      *
-     * Accepted sources are the reversible nibble encodings, native Q6_K, raw
-     * signed INT8, and ExpertOverlay signed INT8 with a per-block minimum.
-     * Source-codebook transcoding for other formats is owned by the backend
-     * GPU conversion kernels and is deliberately not guessed here.
+     * The authenticated source tuple determines the CPU encoding, including
+     * code-plane geometry for formats with retained superblock metadata.
      * @param gpu_weights Valid common separated GPU-format bytes.
      * @param cpu_weights Receives final padded CPU execution bytes.
      * @param error Optional exact rejection reason.

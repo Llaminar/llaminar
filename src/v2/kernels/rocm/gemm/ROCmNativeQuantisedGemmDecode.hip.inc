@@ -42,8 +42,6 @@ enum NativeQuantisedGemmFormat : uint8_t {
     NATIVE_QUANTISED_GEMM_IQ1_S   = 16,  // IQ1 grid, 11-bit index, asymmetric, embedded scales
     NATIVE_QUANTISED_GEMM_IQ1_M   = 17,  // IQ1 grid, 11-bit index, dual-scale + embedded mins
     NATIVE_QUANTISED_GEMM_Q8_0    = 19,  // 8-bit symmetric, direct INT8 payload (32 bytes)
-    NATIVE_QUANTISED_GEMM_EXPANDED_INT8_MIN =
-        llaminar2::kNativeQuantisedExpandedInt8MinCodebook,
 };
 
 // ============================================================================
@@ -55,7 +53,7 @@ template <NativeQuantisedGemmFormat FMT>
 struct NATIVE_QUANTISEDGemmTraits {
     static constexpr bool is_asymmetric =
         FMT == NATIVE_QUANTISED_GEMM_Q4_1 || FMT == NATIVE_QUANTISED_GEMM_Q5_1 ||
-        FMT == NATIVE_QUANTISED_GEMM_IQ1_S || FMT == NATIVE_QUANTISED_GEMM_EXPANDED_INT8_MIN;
+        FMT == NATIVE_QUANTISED_GEMM_IQ1_S;
     static constexpr bool is_iq3_grid = (FMT == NATIVE_QUANTISED_GEMM_IQ3_S || FMT == NATIVE_QUANTISED_GEMM_IQ3_XXS);
     static constexpr bool is_iq2_grid = (FMT == NATIVE_QUANTISED_GEMM_IQ2_S || FMT == NATIVE_QUANTISED_GEMM_IQ2_XS || FMT == NATIVE_QUANTISED_GEMM_IQ2_XXS);
     static constexpr bool is_iq1_grid = (FMT == NATIVE_QUANTISED_GEMM_IQ1_S || FMT == NATIVE_QUANTISED_GEMM_IQ1_M);
@@ -79,7 +77,7 @@ struct NATIVE_QUANTISEDGemmTraits {
     static constexpr bool is_3bit   = (FMT == NATIVE_QUANTISED_GEMM_Q3_K);
     static constexpr bool is_2bit   = (FMT == NATIVE_QUANTISED_GEMM_Q2_K);
     static constexpr bool is_8bit =
-        FMT == NATIVE_QUANTISED_GEMM_Q8_0 || FMT == NATIVE_QUANTISED_GEMM_EXPANDED_INT8_MIN;
+        FMT == NATIVE_QUANTISED_GEMM_Q8_0;
     static constexpr bool uses_lut  = (FMT == NATIVE_QUANTISED_GEMM_IQ4_NL || FMT == NATIVE_QUANTISED_GEMM_IQ4_XS_SOURCE ||
                                        FMT == NATIVE_QUANTISED_GEMM_MXFP4);
     static constexpr int  payload_bytes =

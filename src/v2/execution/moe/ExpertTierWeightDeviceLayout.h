@@ -397,139 +397,24 @@ namespace llaminar2
                 return false;
             }
 
-            // Both directions retain source provenance even when CPU→GPU
-            // promotion normalizes an expanded source into codebook 19 or 23.
-            const NativeQuantisedFormatInfo *source_format =
-                native_quantised_formats::forSourceIdentity(
-                    gpu_source_codebook_id,
-                    gpu_source_is_superblock != 0);
-            if (source_format == nullptr ||
-                cpu_codebook_id != gpu_source_codebook_id ||
-                cpu_is_superblock != gpu_source_is_superblock ||
-                ((cpu_codebook_id == 4 && cpu_is_superblock != 0) &&
-                 cpu_encoding == Encoding::NibbleLUT) ||
-                ((cpu_codebook_id == 8 ||
-                  hasCompactMultiScaleVnniPayload(cpu_codebook_id)) &&
-                 cpu_encoding == Encoding::ExpandedInt8))
-            {
+            const auto *source = native_quantised_formats::forSourceIdentity(
+                gpu_source_codebook_id, gpu_source_is_superblock != 0);
+            if (!source || cpu_codebook_id != gpu_source_codebook_id ||
+                cpu_is_superblock != gpu_source_is_superblock || cpu_is_asymmetric != source->is_asymmetric ||
+                cpu_encoding != cpu::native_quantised::preparedEncodingForSource(*source))
                 return false;
-            }
 
+            const auto physical = canonicalDeviceVnniFormat(*source);
             const auto cpu = cpuStorage();
-            if (cpu.coded() != cpu::native_quantised::migrationUsesSuperblockCodes(*source_format))
+            if (!cpu.valid() || gpu_codebook_id != physical.codebook_id ||
+                gpu_payload_bytes_per_block != physical.payload_bytes_per_block ||
+                gpu_is_asymmetric != physical.is_asymmetric || gpu_has_emins != physical.has_emins)
                 return false;
-            if (cpu.coded())
-            {
-                const auto physical = canonicalDeviceVnniFormat(*source_format);
-                return cpu.valid() && cpu_encoding == cpu::native_quantised::preparedEncodingForSource(*source_format) &&
-                    gpu_superblock_phase < native_quantised_superblock::kBlocksPerSuperblock && gpu_code_bit_shift < 8 &&
-                    native_quantised_superblock::superblockPhase(gpu_superblock_phase + gpu_first_column / 32) ==
-                        cpu.wireGeometry(64).phase &&
-                    gpu_codebook_id == physical.codebook_id && gpu_payload_bytes_per_block == physical.payload_bytes_per_block &&
-                    gpu_is_asymmetric == physical.is_asymmetric && gpu_has_emins == physical.has_emins &&
-                    cpu_is_asymmetric == source_format->is_asymmetric;
-            }
-            if (gpu_superblock_phase != 0 || gpu_code_bit_shift != 0)
-                return false;
-            if (expertTierPreservesNativeSingleScale(cpu_encoding, cpu_codebook_id))
-            {
-                const auto physical = canonicalDeviceVnniFormat(*source_format);
-                return cpu.valid() && cpu_encoding == cpu::native_quantised::preparedEncodingForSource(*source_format) &&
-                    gpu_codebook_id == physical.codebook_id && gpu_payload_bytes_per_block == physical.payload_bytes_per_block &&
-                    gpu_is_asymmetric == physical.is_asymmetric && gpu_has_emins == physical.has_emins &&
-                    cpu_is_asymmetric == source_format->is_asymmetric;
-            }
-
-            if (gpu_to_cpu)
-            {
-                // A demotion kernel must decode the actual accelerator source,
-                // including Q2_K effective minima and dual-scale codebooks.
-                // A previous CPU promotion may instead have normalized an
-                // ExpandedInt8 source to physical codebook 19/23. That is a
-                // first-class live representation, not a provenance change.
-                const bool canonical_source =
-                    gpu_codebook_id == canonicalDeviceVnniCodebookId(*source_format) &&
-                    gpu_payload_bytes_per_block ==
-                        source_format->payload_bytes &&
-                    gpu_is_asymmetric ==
-                        static_cast<std::uint8_t>(
-                            canonicalDeviceVnniFormat(*source_format).is_asymmetric) &&
-                    gpu_has_emins ==
-                        static_cast<std::uint8_t>(source_format->has_emins);
-                const bool normalized_source =
-                    cpu_encoding == Encoding::ExpandedInt8 &&
-                    gpu_payload_bytes_per_block == 32 &&
-                    gpu_has_emins == 0 &&
-                    gpu_is_asymmetric == cpu_is_asymmetric &&
-                    gpu_codebook_id ==
-                        (cpu_is_asymmetric != 0
-                             ? kNativeQuantisedExpandedInt8MinCodebook
-                             : static_cast<std::uint8_t>(19));
-                if ((!canonical_source && !normalized_source) ||
-                    cpu_is_asymmetric !=
-                        static_cast<std::uint8_t>(
-                            source_format->is_asymmetric))
-                {
-                    return false;
-                }
-
-                const Encoding expected_encoding =
-                    gpu_codebook_id == kNativeQuantisedIQ4XSSourceScaleCodebook
-                        ? Encoding::NibbleLUTSourceScale
-                        : gpu_codebook_id == 11 ? Encoding::IQ3SExpandedSourceScale
-                        : gpu_codebook_id == 0 || gpu_codebook_id == 4 ||
-                            gpu_codebook_id == 5 || gpu_codebook_id == kNativeQuantisedMXFP4Codebook
-                        ? Encoding::NibbleLUT
-                        : (gpu_codebook_id == 8
-                               ? Encoding::Q6KNativeDualScale
-                               : hasCompactMultiScaleVnniPayload(gpu_codebook_id)
-                                     ? Encoding::CompactMultiScale
-                                     : Encoding::ExpandedInt8);
-                return cpu_encoding == expected_encoding;
-            }
-
-            // Promotion consumes final CPU bytes. Expanded CPU encodings have
-            // deliberately lost their compact source representation and must
-            // therefore target the normalized signed-INT8 codebooks.
-            if (gpu_has_emins != 0 && cpu_encoding != Encoding::CompactMultiScale)
-                return false;
-            switch (cpu_encoding)
-            {
-            case Encoding::Q5NativeSingleScale:
-                return false; // Native Q5 requires file-density GPU slots and an explicit converter.
-            case Encoding::IQ3SExpandedSourceScale:
-                return cpu_codebook_id == 11 && cpu_is_superblock == 1 &&
-                       gpu_codebook_id == 11 && gpu_payload_bytes_per_block == 13 &&
-                       cpu_is_asymmetric == 0 && gpu_is_asymmetric == 1;
-            case Encoding::NibbleLUTSourceScale:
-                return cpu_codebook_id == 4 && cpu_is_superblock != 0 &&
-                       gpu_codebook_id == kNativeQuantisedIQ4XSSourceScaleCodebook &&
-                       gpu_payload_bytes_per_block == 16 &&
-                       cpu_is_asymmetric == 0 && gpu_is_asymmetric == 1;
-            case Encoding::NibbleLUT:
-                return gpu_payload_bytes_per_block == 16 &&
-                       gpu_is_asymmetric == cpu_is_asymmetric &&
-                       (((gpu_codebook_id == 0 || gpu_codebook_id == 4 ||
-                          gpu_codebook_id == kNativeQuantisedMXFP4Codebook) &&
-                         cpu_is_asymmetric == 0) ||
-                        (gpu_codebook_id == 5 && cpu_is_asymmetric != 0));
-            case Encoding::ExpandedInt8:
-                return gpu_payload_bytes_per_block == 32 &&
-                       gpu_codebook_id ==
-                           (cpu_is_asymmetric != 0
-                                ? kNativeQuantisedExpandedInt8MinCodebook
-                                : static_cast<std::uint8_t>(19)) &&
-                       gpu_is_asymmetric == cpu_is_asymmetric;
-            case Encoding::Q6KNativeDualScale:
-                return cpu_codebook_id == 8 &&
-                       gpu_source_codebook_id == 8 &&
-                       gpu_codebook_id == 8 &&
-                       gpu_payload_bytes_per_block == 24 &&
-                       cpu_is_asymmetric != 0 && gpu_is_asymmetric != 0;
-            case Encoding::CompactMultiScale:
-                return false; // Coded endpoint admission is handled above.
-            }
-            return false;
+            if (!cpu.coded())
+                return gpu_superblock_phase == 0 && gpu_code_bit_shift == 0;
+            return gpu_superblock_phase < native_quantised_superblock::kBlocksPerSuperblock && gpu_code_bit_shift < 8 &&
+                native_quantised_superblock::superblockPhase(gpu_superblock_phase + gpu_first_column / 32) ==
+                    cpu.wireGeometry(64).phase;
         }
 
         /**

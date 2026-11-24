@@ -292,8 +292,6 @@ enum NativeQuantisedFormatPrefill : uint8_t {
     NATIVE_QUANTISED_PF_IQ1_S   = 16,
     NATIVE_QUANTISED_PF_IQ1_M   = 17,
     NATIVE_QUANTISED_PF_Q8_0    = 19,
-    NATIVE_QUANTISED_PF_EXPANDED_INT8_MIN =
-        llaminar2::kNativeQuantisedExpandedInt8MinCodebook,
 };
 
 extern "C" bool rocmGemv_native_quantised_query_serial_m1_config(
@@ -308,7 +306,7 @@ template <NativeQuantisedFormatPrefill FMT>
 struct PrefillNATIVE_QUANTISEDTraits {
     static constexpr bool is_asymmetric =
         FMT == NATIVE_QUANTISED_PF_Q4_1 || FMT == NATIVE_QUANTISED_PF_Q5_1 ||
-        FMT == NATIVE_QUANTISED_PF_IQ1_S || FMT == NATIVE_QUANTISED_PF_EXPANDED_INT8_MIN;
+        FMT == NATIVE_QUANTISED_PF_IQ1_S;
     static constexpr bool is_iq3_grid = (FMT == NATIVE_QUANTISED_PF_IQ3_S || FMT == NATIVE_QUANTISED_PF_IQ3_XXS);
     static constexpr bool is_iq2_grid = (FMT == NATIVE_QUANTISED_PF_IQ2_S || FMT == NATIVE_QUANTISED_PF_IQ2_XS || FMT == NATIVE_QUANTISED_PF_IQ2_XXS);
     static constexpr bool is_iq1_grid = (FMT == NATIVE_QUANTISED_PF_IQ1_S || FMT == NATIVE_QUANTISED_PF_IQ1_M);
@@ -326,7 +324,7 @@ struct PrefillNATIVE_QUANTISEDTraits {
     static constexpr bool is_3bit = (FMT == NATIVE_QUANTISED_PF_Q3_K);
     static constexpr bool is_2bit = (FMT == NATIVE_QUANTISED_PF_Q2_K);
     static constexpr bool is_8bit =
-        FMT == NATIVE_QUANTISED_PF_Q8_0 || FMT == NATIVE_QUANTISED_PF_EXPANDED_INT8_MIN;
+        FMT == NATIVE_QUANTISED_PF_Q8_0;
     static constexpr bool requires_secondary_metadata =
         is_asymmetric || is_dual_scale || FMT == NATIVE_QUANTISED_PF_IQ3_S || FMT == NATIVE_QUANTISED_PF_IQ4_XS_SOURCE;
     static constexpr bool uses_lut = (FMT == NATIVE_QUANTISED_PF_IQ4_NL || FMT == NATIVE_QUANTISED_PF_IQ4_XS_SOURCE ||
@@ -2914,9 +2912,6 @@ __device__ __forceinline__ float moe_prefill_dot_desc_serial_m1_dispatch(
     case NATIVE_QUANTISED_PF_Q8_0:
         return moe_prefill_dot_desc_serial_m1<NATIVE_QUANTISED_PF_Q8_0>(
             desc, n, slot_A, slot_scales, N, k_partitions);
-    case NATIVE_QUANTISED_PF_EXPANDED_INT8_MIN:
-        return moe_prefill_dot_desc_serial_m1<NATIVE_QUANTISED_PF_EXPANDED_INT8_MIN>(
-            desc, n, slot_A, slot_scales, N, k_partitions);
     default:
         moe_prefill_fail_fast_invalid_grouped_index();
         return 0.0f;
@@ -3456,15 +3451,9 @@ namespace
         llaminar2::rocm::generated::ROCmMoEGroupedPrefillConfig generated{};
         const uint8_t role_id =
             role == MoEPrefillProjectionRole::GateUp ? 0u : 1u;
-        // Expanded asymmetric INT8 has codebook-19 payload traffic and the
-        // same launch geometry. It deliberately inherits the sealed codebook-
-        // 19 policy until a dedicated synthetic-format corpus is certified;
-        // execution and telemetry retain codebook 23.
         const uint8_t policy_codebook =
             format == NATIVE_QUANTISED_PF_IQ4_XS_SOURCE || format == NATIVE_QUANTISED_PF_MXFP4 ? static_cast<uint8_t>(NATIVE_QUANTISED_PF_IQ4_NL) :
-            format == NATIVE_QUANTISED_PF_EXPANDED_INT8_MIN
-                ? static_cast<uint8_t>(NATIVE_QUANTISED_PF_Q8_0)
-                : static_cast<uint8_t>(format);
+            static_cast<uint8_t>(format);
         if (!llaminar2::rocm::generated::selectROCmMoEGroupedPrefillGenerated(
                 policy_codebook, role_id, m, n, k, generated))
         {
@@ -3521,9 +3510,7 @@ namespace
         const auto policy_codebook = [](int codebook)
         {
             return codebook == NATIVE_QUANTISED_PF_IQ4_XS_SOURCE || codebook == NATIVE_QUANTISED_PF_MXFP4 ? static_cast<uint8_t>(NATIVE_QUANTISED_PF_IQ4_NL) :
-                   codebook == NATIVE_QUANTISED_PF_EXPANDED_INT8_MIN
-                       ? static_cast<uint8_t>(NATIVE_QUANTISED_PF_Q8_0)
-                       : static_cast<uint8_t>(codebook);
+            static_cast<uint8_t>(codebook);
         };
         if (!llaminar2::rocm::selectROCmMoEProductionPrefillOverlayForOperation(
                 operation,
@@ -3779,7 +3766,6 @@ auto selectMoERouteOwnedFormat(uint8_t codebook, Select select)
     case NATIVE_QUANTISED_PF_IQ1_S: return select.template operator()<NATIVE_QUANTISED_PF_IQ1_S>();
     case NATIVE_QUANTISED_PF_IQ1_M: return select.template operator()<NATIVE_QUANTISED_PF_IQ1_M>();
     case NATIVE_QUANTISED_PF_Q8_0: return select.template operator()<NATIVE_QUANTISED_PF_Q8_0>();
-    case NATIVE_QUANTISED_PF_EXPANDED_INT8_MIN: return select.template operator()<NATIVE_QUANTISED_PF_EXPANDED_INT8_MIN>();
     default: throw std::invalid_argument("unsupported physical ROCm route-owned native decoder");
     }
 }
@@ -4254,8 +4240,6 @@ bool rocmMoE_grouped_prefill_query_kernel_resources(
     case NATIVE_QUANTISED_PF_IQ1_S: QUERY_TILE_M(NATIVE_QUANTISED_PF_IQ1_S);
     case NATIVE_QUANTISED_PF_IQ1_M: QUERY_TILE_M(NATIVE_QUANTISED_PF_IQ1_M);
     case NATIVE_QUANTISED_PF_Q8_0: QUERY_TILE_M(NATIVE_QUANTISED_PF_Q8_0);
-    case NATIVE_QUANTISED_PF_EXPANDED_INT8_MIN:
-        QUERY_TILE_M(NATIVE_QUANTISED_PF_EXPANDED_INT8_MIN);
     default: break;
     }
 
@@ -4892,7 +4876,6 @@ bool rocmMoE_grouped_prefill_pipeline(
         LAUNCH_GATEUP_IF_PRESENT(NATIVE_QUANTISED_PF_IQ1_S);
         LAUNCH_GATEUP_IF_PRESENT(NATIVE_QUANTISED_PF_IQ1_M);
         LAUNCH_GATEUP_IF_PRESENT(NATIVE_QUANTISED_PF_Q8_0);
-        LAUNCH_GATEUP_IF_PRESENT(NATIVE_QUANTISED_PF_EXPANDED_INT8_MIN);
         if (!launched_gateup)
         {
                 fprintf(stderr, "[rocmMoE_grouped_prefill_pipeline] unsupported gate/up codebook mask=0x%x\n",
@@ -5055,7 +5038,6 @@ bool rocmMoE_grouped_prefill_pipeline(
             LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NATIVE_QUANTISED_PF_IQ1_S);
             LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NATIVE_QUANTISED_PF_IQ1_M);
             LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NATIVE_QUANTISED_PF_Q8_0);
-            LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NATIVE_QUANTISED_PF_EXPANDED_INT8_MIN);
             default:
                 if (down_codebook_mask == 0 ||
                     (down_codebook_mask & (down_codebook_mask - 1u)) == 0)
@@ -5199,7 +5181,6 @@ bool rocmMoE_grouped_prefill_pipeline(
                 LAUNCH_DOWN_IF_PRESENT(NATIVE_QUANTISED_PF_IQ1_S);
                 LAUNCH_DOWN_IF_PRESENT(NATIVE_QUANTISED_PF_IQ1_M);
                 LAUNCH_DOWN_IF_PRESENT(NATIVE_QUANTISED_PF_Q8_0);
-                LAUNCH_DOWN_IF_PRESENT(NATIVE_QUANTISED_PF_EXPANDED_INT8_MIN);
             }
 
             if (native_wmma)

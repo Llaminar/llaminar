@@ -9,7 +9,7 @@
  */
 
 /** @brief Closed diagnostic physical decoder scope, including native CPU promotions. */
-static constexpr std::uint32_t kPersistentMoEFFNDecoders=(1u<<5)|(1u<<7)|(1u<<19)|(1u<<23);
+static constexpr std::uint32_t kPersistentMoEFFNDecoders=(1u<<5)|(1u<<7)|(1u<<19);
 
 /** @brief One CTA's reusable partition plane; no global partial publication exists. */
 struct PersistentMoEFFNShared
@@ -60,7 +60,6 @@ __device__ __forceinline__ float persistentMoEFFNPartial(const DeviceNativeQuant
     case 5:return persistentMoEFFNPartial<static_cast<NativeQuantisedFormat>(5)>(descriptor,n,codes,scales,sums,N,K,part,partitions);
     case 7:return persistentMoEFFNPartial<static_cast<NativeQuantisedFormat>(7)>(descriptor,n,codes,scales,sums,N,K,part,partitions);
     case 19:return persistentMoEFFNPartial<static_cast<NativeQuantisedFormat>(19)>(descriptor,n,codes,scales,sums,N,K,part,partitions);
-    case 23:return persistentMoEFFNPartial<static_cast<NativeQuantisedFormat>(23)>(descriptor,n,codes,scales,sums,N,K,part,partitions);
     default:__builtin_trap();return 0.f;
     }
 }

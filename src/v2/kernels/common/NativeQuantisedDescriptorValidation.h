@@ -48,7 +48,7 @@ struct NativeQuantisedDescriptorValidation final {
         switch(code) {
         case 0: case 4: case 5: case 6: case 7: case 8: case 9: case 10:
         case 11: case 12: case 13: case 14: case 15: case 16: case 17:
-        case 19: case 23: case 24: case 25: return true;
+        case 19: case 24: case 25: return true;
         default: return false;
         }
     }
@@ -56,7 +56,7 @@ struct NativeQuantisedDescriptorValidation final {
     LLAMINAR_DESCRIPTOR_HD static constexpr bool secondary(unsigned code) noexcept {
         switch(code) {
         case 5: case 7: case 8: case 9: case 10: case 11: case 13:
-        case 14: case 16: case 17: case 23: case 24: return true;
+        case 14: case 16: case 17: case 24: return true;
         default: return false;
         }
     }

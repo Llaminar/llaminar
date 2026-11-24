@@ -1,0 +1,26 @@
+# Physical NativeQuantised decoder 23: producer audit and retirement
+
+Audited against `470f2a6f2`. Here **23** means the execution-only signed INT8
+payload plus an FP16 minimum, not a GGUF type, a tuning partition, or FP32
+exponent bits. The numbered source references below describe the pre-retirement
+tree so that removed code can be inspected with `git show 470f2a6f2:<path>`.
+
+| Boundary | Classification and producer evidence |
+| --- | --- |
+| CPU prepared writer | **Live, cannot produce 23.** `src/v2/kernels/cpu/gemm/CPUNativeQuantisedWindowPacking.inc:21,65,103` uses `preparedEncodingForSource`. The 13 coded source tuples keep source metadata; the other nine retain their native scalar payload or canonical Q8. `CPUNativeQuantisedWeightView.h:533–550` separately permits explicit expanded CPU storage; rotation does not produce an asymmetric GPU decoder. A physical 19 Q8 decoder is still live. |
+| CUDA and ROCm load/repack | **Live, cannot produce 23.** `src/v2/loaders/WeightManager.cpp:6672–6679,7047–7067` selects `SourceNative` or `MigrationReusable`; `GPUPreparedWeightPoolLayout.h:39–68` selects allocation and coded planes, not the decoder. `gpu_pipeline/LoadOrchestrator.cpp:557,565` and `DeviceLoadPipeline.cpp:1110` dispatch the source repack. The native Q4/Q5/Q8 arms are in `src/v2/kernels/cuda/repack/CUDAVnniRepackKernels.cu:1377–1459` and `src/v2/kernels/rocm/repack/VnniRepackKernels.hip:1519–1602`. The execution identity comes from `src/v2/tensors/NativeQuantisedFormatInfo.h` and distinguishes physical IQ4_XS 24 and MXFP4 25, while Q8_1/Q8_K normalize to 19. |
+| gfx1100 WMMA and gfx906 Dot4 | **Dead decoder arms, not producers.** `src/v2/kernels/rocm/gemm/ROCmNativeQuantisedWmma.hip:85` and `ROCmNativeQuantisedGemmShardImpl.hip.inc:2998` consumed a supplied 23 descriptor. Grouped, resident, verifier and ordinary GEMV schedules likewise dispatched an already prepared decoder; choosing WMMA or Dot4 did not create weight bytes. |
+| CPU-to-GPU conversion | **Live converters; only the noncanonical 23 arm was dead in production.** `src/v2/execution/moe/ExpertTierWeightStream.cpp:195–204` chose 23 for caller-supplied asymmetric `ExpandedInt8`, and `ExpertTierWeightDeviceLayout.h:401–535` admitted that geometry. CUDA and ROCm `*ExpertTierWeightKernels` had matching asymmetric promotion instantiations. No canonical CPU writer supplies that tuple. Q5_K follows the coded branch; Q4_1/Q5_1 retain their native payload. |
+| GPU-to-CPU and same-GPU movement | **Live converters, no independent producer.** `src/v2/execution/moe/ExpertTierWeightStream.cpp:1343–1364` could authenticate and preserve a *supplied* normalized descriptor, not originate it. `src/v2/execution/moe/MoEOverlayPreparedWeightSource.cpp:74–130` resolved such a pre-existing live descriptor. The actual residence producers call canonical stream builders (`MoEOverlayPhysicalResidencyFabric.cpp:6010–6022,6681–6692`). GPU-to-GPU copies preserve an admitted descriptor identity. |
+| Remote/MPI and CPU packed v9 | **Live transport, no independent producer.** `src/v2/execution/moe/MoEOverlayRemoteProjectionProtocol.h:95` is ABI v7. Its format check at `.cpp:119–150` and consumers at `:640,675,695` authenticate stream/source identity. CPU-packed v9 (`src/v2/kernels/PackedWeightsSerialization.h:59,478,552`) is an in-memory expert/MPI exchange. The GPU adoption path requires original GGUF blocks and resolves the repack from that source, not from the CPU interleaved payload (`src/v2/execution/moe/MoEExpertWeightService.cpp:1893–1928`). |
+| GPWT v5, saved plans and cache | **Test-only GPWT construction; no production restore.** `src/v2/loaders/gpu_pipeline/GpuPackedWeightsFormat.h:47,101,188` builds/parses test archives; `WeightTranslator` pack/upload callers are in `tests/v2/integration/Test__VnniUnpackKernels.cpp:1240–1270,1323–1344,1437–1451`. The parser now rejects retired physical IDs as unsupported. Saved plans serialize orchestration policy, not prepared bytes (`src/v2/config/OrchestrationConfigDocument.cpp:464`). Prefix/KV persistence carries attention/recurrent and request runtime sections, not prepared model weights (`src/v2/execution/prefix_cache/PrefixStorageBackend.h:42–46`). |
+| Synthetic tests and diagnostics | **Test-only.** `tests/v2/performance/kernels/rocm/Perf__NativeQuantised_Sweep.cpp:1712–1751` directly fabricated and executed 23. The gfx1100 replay now uses the native Q4_1 decoder with a nonzero minimum alongside symmetric Q4_0; it keeps the negative-subnormal oracle, signed-zero check, partial K and repeated graph launches. Other physical inventory sweeps use the canonical catalog; tests of malformed publication retain literal 23 as a negative control. |
+
+No production producer remained. Expert-tier admission now requires the exact
+CPU encoding and canonical GPU decoder for the authenticated source. Capture
+masks and reusable allocations no longer reserve or advertise the retired
+format. The device-free `V2_Integration_ExpertTierCanonicalDecoderInventory`
+preflight test observes the real CPU producer and both stream manifest directions
+for all 22 source tuples, including rejection of the former asymmetric expanded
+layout. `V2_Integration_GpuPackedWeightDecoderAdmission` rejects a complete
+synthetic v5 archive using the retired physical decoder.

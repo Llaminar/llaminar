@@ -174,8 +174,8 @@ void replayResidentParticipant(DeviceId device,int member,ILocalTPContext &tp,st
             if(expected_native_layout_groups) {
                 require(native_layout_router&&program.groups()==expected_native_layout_groups,
                     "original source selects the explicitly required NativeLayout decoder family");
-                require(expected_native_layout_groups!=15 || program.executionMask()==25952241u,
-                    "full-union original source selects all18 physical decoder implementations");
+                require(expected_native_layout_groups!=15 || program.executionMask()==17563633u,
+                    "full-union original source selects all 17 physical decoder implementations");
             }
             const auto maximum_tasks=rocm::ResidentMoEFFNTaskGeometry::projection(
                 std::max({kH,routed_columns,shared_columns}),kTopK,NativeQuantisedGroupedDecodePolicy::maximum_k_partitions);

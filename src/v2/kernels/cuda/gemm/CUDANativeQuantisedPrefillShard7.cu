@@ -1,6 +1,6 @@
 /**
  * @file CUDANativeQuantisedPrefillShard7.cu
- * @brief CUDA NativeQuantised prefill instantiations for codebooks 17, 19 and 23 (expanded INT8 minimum).
+ * @brief CUDA NativeQuantised prefill instantiations for codebooks 17 and 19.
  */
 #define LLAMINAR_CUDA_NATIVE_QUANTISED_PREFILL_SHARD 7
 #define LLAMINAR_CUDA_NATIVE_QUANTISED_PREFILL_SHARD_SYMBOL(NAME) \

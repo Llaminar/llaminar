@@ -294,8 +294,6 @@ std::map<int, int> formats()
     {
         const auto &f = *source.metadata;
         result.emplace(llaminar2::canonicalDeviceVnniCodebookId(f), f.payload_bytes);
-        const auto promoted = llaminar2::migrationStableDeviceVnniFormat(f);
-        result.emplace(promoted.codebook_id, promoted.payload_bytes_per_block);
     }
     return result;
 }
@@ -371,8 +369,9 @@ TEST(CUDACanonicalKpartFold, RejectsInvalidBindingsBeforeSubmission)
     EXPECT_FALSE(submit(0, execution.stream, 0, a.data + 1, 0, s.data));
     EXPECT_FALSE(submit(0, execution.stream, 0, a.data, 1, s.data));
     EXPECT_FALSE(submit(0, execution.stream, 0, a.data, 0, nullptr));
+    EXPECT_FALSE(submit(23, execution.stream, 0, a.data, 0, s.data));
     EXPECT_FALSE(submit(255, execution.stream, 0, a.data, 0, s.data));
-    for (uint8_t cb : {5, 7, 8, 9, 10, 13, 14, 16, 17, 23})
+    for (uint8_t cb : {5, 7, 8, 9, 10, 13, 14, 16, 17})
         EXPECT_FALSE(submit(cb, execution.stream, 0, a.data, 0, s.data));
     EXPECT_EQ(cudaGetLastError(), cudaSuccess);
     cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;

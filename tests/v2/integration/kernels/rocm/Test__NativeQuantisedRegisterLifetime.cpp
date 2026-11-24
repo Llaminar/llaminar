@@ -145,7 +145,7 @@ void verify(int codebook, int payload_bytes, int m, int n, int k,
         // IQ4_XS-source and MXFP4 physical tuples share IQ4_NL's certified policy.
         codebook == llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook ||
                 codebook == llaminar2::kNativeQuantisedMXFP4Codebook ? 4 :
-        codebook == llaminar2::kNativeQuantisedExpandedInt8MinCodebook ? 19 : codebook);
+        codebook);
     ASSERT_TRUE(rocmGemv_native_quantised_query_serial_m1_config_with_policy(
         policy, n, k, &partitions, &waves));
     ASSERT_GT(partitions, 0);
@@ -274,8 +274,6 @@ TEST(ROCmNativeQuantisedRegisterLifetime, WholeRowSignedZeroKeepsSerialReducerOr
     {
         const auto& format = *source.metadata;
         formats.emplace(canonicalDeviceVnniCodebookId(format), format.payload_bytes);
-        const auto promoted = migrationStableDeviceVnniFormat(format);
-        formats.emplace(promoted.codebook_id, promoted.payload_bytes_per_block);
     }
     for (const auto& [codebook, payload_bytes] : formats)
         for (int n : {1024, 16385})
@@ -307,8 +305,6 @@ TEST(ROCmNativeQuantisedRegisterLifetime, CapturedAllFormatsMatchSerialRows)
     {
         const auto& format = *source.metadata;
         formats.emplace(canonicalDeviceVnniCodebookId(format), format.payload_bytes);
-        const auto promoted = migrationStableDeviceVnniFormat(format);
-        formats.emplace(promoted.codebook_id, promoted.payload_bytes_per_block);
     }
     // Exercise exact tiles as well as tails: aligned Q6_K selects its
     // full-tile specialization, while large-N formats exercise streaming.

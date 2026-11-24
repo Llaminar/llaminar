@@ -136,7 +136,7 @@ inline Banks cpuBanks(const Q8_1Block *a, const Q8_1Block *b, int rows, int k) {
 inline std::array<int8_t, 32> integerPayload(uint8_t codebook,
                                              std::span<const uint8_t> bytes) {
   std::array<int8_t, 32> out{};
-  if (codebook == 19 || codebook == kNativeQuantisedExpandedInt8MinCodebook) {
+  if (codebook == 19) {
     if (bytes.size() < 32)
       throw std::invalid_argument("Short expanded payload");
     std::memcpy(out.data(), bytes.data(), 32);
@@ -190,8 +190,7 @@ inline std::array<double, 32> coefficients(uint8_t cb,
   for (int i = 0; i < 32; ++i) {
     const double factor = dual && i >= 16 ? hi : lo;
     out[i] = factor * q[i];
-    if (cb == 5 || cb == 7 || cb == 16 ||
-        cb == kNativeQuantisedExpandedInt8MinCodebook)
+    if (cb == 5 || cb == 7 || cb == 16)
       out[i] += hi;
     if (cb == 10)
       out[i] += fp16_to_fp32(uint16_t(emins >> (i < 16 ? 0 : 16)));

@@ -844,9 +844,8 @@ namespace llaminar2
             /**
              * @brief Resolve the serial arithmetic authority for prepared bytes.
              *
-             * Device execution may normalize source formats (notably a CPU
-             * promotion into codebook 23), but launch geometry must remain
-             * owned by the original source codebook. Constructors establish
+             * Device execution may share a decoder across source formats, but
+             * the original source codebook remains the arithmetic authority. Constructors establish
              * provenance once; reaching inference without it is a fatal
              * lifecycle violation rather than permission to guess.
              */
@@ -1230,7 +1229,7 @@ namespace llaminar2
                     : nullptr;
             if (!source_format ||
                 !deviceVnniExecutionCompatibleWithSource(*source_format, codebook_id) ||
-                ((codebook_id == 11 || codebook_id == kNativeQuantisedExpandedInt8MinCodebook ||
+                ((codebook_id == 11 ||
                   codebook_id == kNativeQuantisedIQ4XSSourceScaleCodebook) && !d_native_mins))
             {
                 throw std::invalid_argument(
@@ -1245,10 +1244,9 @@ namespace llaminar2
                     (allocation_format.payload_bytes_per_block != source_format->payload_bytes ||
                         !allocation_format.has_mins || allocation_format.has_emins)))
                     throw std::invalid_argument("[ROCmQuantisedGemmKernel] Reusable slot does not preserve the source's migration metadata layout");
-                const auto execution_format =
-                    codebook_id == canonicalDeviceVnniCodebookId(*source_format)
-                        ? canonicalDeviceVnniFormat(*source_format)
-                        : migrationStableDeviceVnniFormat(*source_format);
+                const auto execution_format = canonicalDeviceVnniFormat(*source_format);
+                if (codebook_id != execution_format.codebook_id)
+                    throw std::invalid_argument("Reusable slot requires the canonical NativeQuantised execution codebook");
                 if (allocation_format.payload_bytes_per_block <
                         execution_format.payload_bytes_per_block ||
                     (execution_format.is_asymmetric &&

@@ -81,9 +81,6 @@ namespace llaminar2
         case 19:
             visitor.template operator()<19>();
             return;
-        case 23:
-            visitor.template operator()<23>();
-            return;
         case 24:
             visitor.template operator()<24>();
             return;
@@ -102,7 +99,7 @@ namespace llaminar2
      * @return Exact consumed physical plane geometry.
      * @throws std::invalid_argument Before publication for an unsupported or malformed descriptor.
      */
-    inline NativeQuantisedMigrationStableDeviceFormat requireQ8ResidualNativeMatrix(
+    inline NativeQuantisedDeviceFormat requireQ8ResidualNativeMatrix(
         const DeviceNativeQuantisedMatrixDesc &d, int m, int n, int k)
     {
         visitQ8ResidualNativeCodebook(d.codebook_id, [&]<std::uint8_t>() {});
@@ -118,7 +115,7 @@ namespace llaminar2
             throw std::invalid_argument("TwoTerm GPU prepared source/execution identity or shape mismatch");
         auto physical = canonicalDeviceVnniFormat(source);
         if (d.codebook_id != physical.codebook_id)
-            physical = {d.codebook_id, 32, d.codebook_id == kNativeQuantisedExpandedInt8MinCodebook, false};
+            physical = {d.codebook_id, 32, false, false};
         // The original constructor permits a declared reusable superset. Its
         // real capacity/plane flags remain authoritative; source geometry only
         // proves that the current live decoder fits, never invents a slot size.

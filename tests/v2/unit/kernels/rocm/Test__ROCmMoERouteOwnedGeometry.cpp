@@ -49,7 +49,7 @@ TEST(ROCmMoERouteOwnedGeometry, OriginalEnvelopeAndLaunchFamilyAreDistinct)
     EXPECT_FALSE(moeRouteOwnedGateUpEnvelopeValid({0, bit(19)}));
     EXPECT_FALSE(moeRouteOwnedGateUpEnvelopeValid({bit(1), bit(19)}));
     EXPECT_FALSE(moeRouteOwnedGateUpEnvelopeValid({bit(19), bit(1)}));
-    EXPECT_FALSE(moeRouteOwnedGateUpEnvelopeValid({bit(19), bit(kNativeQuantisedExpandedInt8MinCodebook)}));
+    EXPECT_FALSE(moeRouteOwnedGateUpEnvelopeValid({bit(19), bit(23)}));
     for (const auto &source : native_quantised_formats::kAllSourceFormats)
     {
         NativeQuantisedExecutionFormatEnvelope envelope;
@@ -58,8 +58,7 @@ TEST(ROCmMoERouteOwnedGeometry, OriginalEnvelopeAndLaunchFamilyAreDistinct)
             canonicalDeviceVnniFormat(*source.metadata).codebook_id, original, true));
         EXPECT_TRUE(moeRouteOwnedGateUpEnvelopeValid(envelope)) << source.quant_type;
         EXPECT_EQ(envelope.execution_codebook_mask,
-            bit(canonicalDeviceVnniFormat(*source.metadata).codebook_id) |
-            bit(migrationStableDeviceVnniFormat(*source.metadata).codebook_id));
+            bit(canonicalDeviceVnniFormat(*source.metadata).codebook_id));
         const auto launch = moeRouteOwnedGateUpLaunchCodebookMask(envelope.execution_codebook_mask);
         EXPECT_NE(launch, 0u);
         EXPECT_EQ(moeRouteOwnedGateUpLaunchCodebookMask(launch), launch);
@@ -80,7 +79,7 @@ TEST(ROCmMoERouteOwnedGeometry, ParallelSourcePartitionContract)
     using namespace llaminar2;
     using P = MoERouteOwnedGateUpPartitionExecution;
     const auto bit = [](std::uint8_t cb) { return nativeQuantisedCodebookMaskBit(cb); };
-    const NativeQuantisedExecutionFormatEnvelope corrected{bit(7) | bit(kNativeQuantisedExpandedInt8MinCodebook), bit(7)};
+    const NativeQuantisedExecutionFormatEnvelope corrected{bit(7), bit(7)};
     EXPECT_TRUE(moeRouteOwnedGateUpPartitionExecutionValid(P::Serial, corrected, {}));
     EXPECT_FALSE(moeRouteOwnedGateUpPartitionExecutionValid(P::FourWorkerPlanes, corrected, {}));
     for (const int k : {32, 64, 96, 256, 640, 768, 2560})
@@ -143,29 +142,28 @@ TEST(ROCmMoERouteOwnedGeometry, AllFormatSharedLayoutHasDisjointGridAndPartials)
     using P = MoERouteOwnedGateUpPartitionExecution;
     std::set<std::uint8_t> seen;
     for (const auto &source : native_quantised_formats::kAllSourceFormats)
-        for (const auto cb : {canonicalDeviceVnniFormat(*source.metadata).codebook_id,
-                              migrationStableDeviceVnniFormat(*source.metadata).codebook_id})
+    {
+        const auto cb = canonicalDeviceVnniCodebookId(*source.metadata);
+        if (!seen.insert(cb).second) continue;
+        const auto serial = moeRouteOwnedGateUpK1SharedLayout(cb, P::Serial);
+        const auto grid = cb == 13 ? 1024u * sizeof(std::uint64_t) : 0u;
+        EXPECT_EQ(serial.codebook_bytes, grid);
+        EXPECT_EQ(serial.partial_offset, grid);
+        EXPECT_EQ(serial.partial_bytes, 0u);
+        EXPECT_EQ(serial.total_bytes, grid);
+        for (int count = 1; count <= NativeQuantisedGroupedDecodePolicy::maximum_k_partitions; ++count)
         {
-            if (!seen.insert(cb).second) continue;
-            const auto serial = moeRouteOwnedGateUpK1SharedLayout(cb, P::Serial);
-            const auto grid = cb == 13 ? 1024u * sizeof(std::uint64_t) : 0u;
-            EXPECT_EQ(serial.codebook_bytes, grid);
-            EXPECT_EQ(serial.partial_offset, grid);
-            EXPECT_EQ(serial.partial_bytes, 0u);
-            EXPECT_EQ(serial.total_bytes, grid);
-            for (int count = 1; count <= NativeQuantisedGroupedDecodePolicy::maximum_k_partitions; ++count)
-            {
-                const auto parallel = moeRouteOwnedGateUpK1SharedLayout(cb, P::FourWorkerPlanes, count);
-                EXPECT_EQ(parallel.codebook_bytes, serial.codebook_bytes);
-                EXPECT_GE(parallel.partial_offset, parallel.codebook_bytes);
-                EXPECT_EQ(parallel.partial_offset % alignof(float), 0u);
-                EXPECT_EQ(parallel.partial_bytes, moeRouteOwnedGateUpPartitionSharedBytes(count));
-                EXPECT_EQ(parallel.total_bytes, parallel.partial_offset + parallel.partial_bytes);
-            }
-            EXPECT_THROW((void)moeRouteOwnedGateUpK1SharedLayout(cb, P::FourWorkerPlanes, 0), std::invalid_argument);
-            EXPECT_THROW((void)moeRouteOwnedGateUpK1SharedLayout(cb, static_cast<P>(255), 16), std::invalid_argument);
+            const auto parallel = moeRouteOwnedGateUpK1SharedLayout(cb, P::FourWorkerPlanes, count);
+            EXPECT_EQ(parallel.codebook_bytes, serial.codebook_bytes);
+            EXPECT_GE(parallel.partial_offset, parallel.codebook_bytes);
+            EXPECT_EQ(parallel.partial_offset % alignof(float), 0u);
+            EXPECT_EQ(parallel.partial_bytes, moeRouteOwnedGateUpPartitionSharedBytes(count));
+            EXPECT_EQ(parallel.total_bytes, parallel.partial_offset + parallel.partial_bytes);
         }
-    EXPECT_EQ(seen.size(), 19u);
+        EXPECT_THROW((void)moeRouteOwnedGateUpK1SharedLayout(cb, P::FourWorkerPlanes, 0), std::invalid_argument);
+        EXPECT_THROW((void)moeRouteOwnedGateUpK1SharedLayout(cb, static_cast<P>(255), 16), std::invalid_argument);
+    }
+    EXPECT_EQ(seen.size(), 18u);
     EXPECT_THROW((void)moeRouteOwnedGateUpK1SharedLayout(255, P::Serial), std::invalid_argument);
 }
 
@@ -174,10 +172,11 @@ TEST(ROCmMoERouteOwnedGeometry, ImmutableOwnerPlanIdentityIsComplete)
 {
     using namespace llaminar2;
     using P = MoERouteOwnedGateUpPartitionExecution;
-    const NativeQuantisedExecutionFormatEnvelope envelope{(1u << 5) | (1u << 23), 1u << 5};
+    const NativeQuantisedExecutionFormatEnvelope envelope{(1u << 5) | (1u << 7), (1u << 5) | (1u << 7)};
     const MoERouteOwnedProjectionShape shape{.output_columns = 96, .reduction_columns = 256};
     std::array<std::uint8_t, 32> partitions{};
     partitions[5] = 8;
+    partitions[7] = 8;
     const auto identity = [&](auto geometry, auto formats, int device, auto execution, auto axes, auto source_partitions) {
         return moeRouteOwnedGateUpPlanIdentity(geometry, formats, device, execution, axes, source_partitions);
     };
@@ -193,7 +192,7 @@ TEST(ROCmMoERouteOwnedGeometry, ImmutableOwnerPlanIdentityIsComplete)
     auto different = partitions; different[5] = 4;
     EXPECT_NE(original, identity(MoERouteOwnedGateUpGeometry::TN64, envelope, 0, P::FourWorkerPlanes, shape, different));
     EXPECT_NE(original, identity(MoERouteOwnedGateUpGeometry::TN64,
-        NativeQuantisedExecutionFormatEnvelope{1u<<5, 1u<<5}, 0, P::FourWorkerPlanes, shape, partitions));
+        NativeQuantisedExecutionFormatEnvelope{1u<<5, envelope.policy_codebook_mask}, 0, P::FourWorkerPlanes, shape, partitions));
     const auto serial = identity(MoERouteOwnedGateUpGeometry::TN64, envelope, 0, P::Serial, shape, partitions);
     EXPECT_NE(serial, identity(MoERouteOwnedGateUpGeometry::TN128, envelope, 0, P::Serial, shape, partitions));
     static_assert(!std::is_default_constructible_v<MoERouteOwnedGateUpPlan>);

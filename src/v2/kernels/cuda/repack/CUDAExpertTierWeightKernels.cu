@@ -323,8 +323,7 @@ namespace llaminar2
 
         /**
          * @brief Losslessly expand a single-scale source into CPU unit bytes.
-         * @tparam Codebook One of 6, 7, 11, 12, 15, 16, raw-INT8 19, or normalized
-         *         asymmetric INT8+minimum 23.
+         * @tparam Codebook One of 6, 7, 11, 12, 15, 16, or raw-INT8 19.
          *
          * Each thread owns one logical output column.  The shared production
          * decoder reconstructs source integers; direct Q5/Q8 formats retain
@@ -372,7 +371,7 @@ namespace llaminar2
 
             static_assert(Codebook == 6 || Codebook == 7 || Codebook == 11 ||
                           Codebook == 12 || Codebook == 15 || Codebook == 16 ||
-                          Codebook == 19 || Codebook == kNativeQuantisedExpandedInt8MinCodebook);
+                          Codebook == 19);
             // These single-scale formats retain their exact integer domain.
             // Multi-scale sources use the native transposition kernel instead.
             for (int group = 0; group < 8; ++group)
@@ -393,8 +392,7 @@ namespace llaminar2
             reinterpret_cast<std::uint16_t *>(unit + (2176u/64)*columns)[local_column] =
                 scales[linear];
             if constexpr (
-                Codebook == 7 || Codebook == 11 || Codebook == 16 ||
-                Codebook == kNativeQuantisedExpandedInt8MinCodebook)
+                Codebook == 7 || Codebook == 11 || Codebook == 16)
             {
                 reinterpret_cast<std::uint16_t *>(unit + (2304u/64)*columns)[local_column] =
                     mins[linear];
@@ -484,7 +482,7 @@ namespace llaminar2
         }
 
         /** CPU expanded INT8 units to separated GPU projection. */
-        template <bool Asymmetric, uint8_t SourceCodebook = 19>
+        template <uint8_t SourceCodebook = 19>
         __device__ __forceinline__ void cpuToGpuExpandedUnitsCUDAUnit(
             const std::uint8_t *__restrict__ cpu_chunk,
             ExpertTierWeightDeviceLayout layout,
@@ -542,15 +540,10 @@ namespace llaminar2
             else gatherCpuPayloadVectors<32>(unit, local_column, destination, columns);
             scales[linear] =
                 reinterpret_cast<const std::uint16_t *>(unit + (2176u/64)*columns)[local_column];
-            if constexpr (Asymmetric)
-            {
-                const uint16_t secondary = reinterpret_cast<const std::uint16_t *>(unit+(2304u/64)*columns)[local_column];
-                mins[linear] = secondary;
-            }
         }
 
         /** Native entry retains the existing grid and forwards one complete unit. */
-        template <bool Asymmetric, uint8_t SourceCodebook = 19>
+        template <uint8_t SourceCodebook = 19>
         __global__ void cpuToGpuExpandedUnitsCUDA(
             const std::uint8_t *__restrict__ cpu_chunk,
             ExpertTierWeightDeviceLayout layout,
@@ -559,7 +552,7 @@ namespace llaminar2
             std::uint16_t *__restrict__ scales,
             std::uint16_t *__restrict__ mins)
         {
-            cpuToGpuExpandedUnitsCUDAUnit<Asymmetric, SourceCodebook>(
+            cpuToGpuExpandedUnitsCUDAUnit<SourceCodebook>(
                 cpu_chunk, layout, first_unit, payload, scales, mins, blockIdx.x);
         }
 
@@ -697,12 +690,10 @@ namespace llaminar2
                     return false; // Coded plane dispatch is checked above.
                 case Encoding::ExpandedInt8:
                     if (!to_cpu)
-                        return layout.gpu_codebook_id == 19 ||
-                            layout.gpu_codebook_id == kNativeQuantisedExpandedInt8MinCodebook;
+                        return layout.gpu_codebook_id == 19;
                     switch (layout.gpu_codebook_id)
                     {
                     case 6: case 7: case 11: case 12: case 15: case 16: case 19:
-                    case kNativeQuantisedExpandedInt8MinCodebook:
                         return true;
                     default:
                         return false;
@@ -798,7 +789,6 @@ namespace llaminar2
                         LLAMINAR_TRANSFER_DECODED_UNIT(15);
                         LLAMINAR_TRANSFER_DECODED_UNIT(16);
                         LLAMINAR_TRANSFER_DECODED_UNIT(19);
-                        LLAMINAR_TRANSFER_DECODED_UNIT(kNativeQuantisedExpandedInt8MinCodebook);
                         }
 #undef LLAMINAR_TRANSFER_DECODED_UNIT
                     }
@@ -810,24 +800,19 @@ namespace llaminar2
                 // Promotion has no internal CTA barrier. Demotion above must
                 // let unused tail groups join its initialization barrier first.
                 if (!active) return;
-#define LLAMINAR_TRANSFER_PROMOTE_UNIT(FUNCTION, ASYMMETRIC) \
-    FUNCTION<ASYMMETRIC>(chunk, layout, description.first_unit, destination.payload, destination.scales, destination.mins, unit)
                 if (layout.cpu_encoding == Encoding::IQ3SExpandedSourceScale)
                 {
-                    cpuToGpuExpandedUnitsCUDAUnit<false,11>(chunk,layout, description.first_unit,destination.payload,
+                    cpuToGpuExpandedUnitsCUDAUnit<11>(chunk,layout, description.first_unit,destination.payload,
                         destination.scales,destination.mins,unit);
                 }
                 else if (layout.cpu_encoding == Encoding::ExpandedInt8)
                 {
-                    if (layout.cpu_is_asymmetric)
-                        LLAMINAR_TRANSFER_PROMOTE_UNIT(cpuToGpuExpandedUnitsCUDAUnit, true);
-                    else
-                        LLAMINAR_TRANSFER_PROMOTE_UNIT(cpuToGpuExpandedUnitsCUDAUnit, false);
+                    cpuToGpuExpandedUnitsCUDAUnit<>(chunk, layout, description.first_unit,
+                        destination.payload, destination.scales, destination.mins, unit);
                 }
                 else
                     cpuToGpuQ6UnitsCUDAUnit(chunk, layout, description.first_unit,
                         destination.payload, destination.scales, destination.mins, unit);
-#undef LLAMINAR_TRANSFER_PROMOTE_UNIT
             }
 
             /**
@@ -1075,10 +1060,6 @@ namespace llaminar2
             case 19:
                 LLAMINAR_LAUNCH_DECODED_SOURCE(19);
                 break;
-            case kNativeQuantisedExpandedInt8MinCodebook:
-                LLAMINAR_LAUNCH_DECODED_SOURCE(
-                    kNativeQuantisedExpandedInt8MinCodebook);
-                break;
             default:
                 return false;
             }
@@ -1132,24 +1113,14 @@ namespace llaminar2
         }
         if (layout.cpu_encoding == cpu::native_quantised::CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale)
         {
-            cpuToGpuExpandedUnitsCUDA<false,11><<<grid,block,0,cuda_stream>>>(
+            cpuToGpuExpandedUnitsCUDA<11><<<grid,block,0,cuda_stream>>>(
                 device_cpu_chunk,layout, first_unit,destination.payload,destination.scales,destination.mins);
         }
         else if (layout.cpu_encoding ==
                  cpu::native_quantised::CPUNativeQuantisedEncoding::ExpandedInt8)
         {
-            if (layout.cpu_is_asymmetric != 0)
-            {
-                cpuToGpuExpandedUnitsCUDA<true><<<grid, block, 0, cuda_stream>>>(
-                    device_cpu_chunk, layout, first_unit, destination.payload,
-                    destination.scales, destination.mins);
-            }
-            else
-            {
-                cpuToGpuExpandedUnitsCUDA<false><<<grid, block, 0, cuda_stream>>>(
-                    device_cpu_chunk, layout, first_unit, destination.payload,
-                    destination.scales, destination.mins);
-            }
+            cpuToGpuExpandedUnitsCUDA<><<<grid, block, 0, cuda_stream>>>(
+                device_cpu_chunk, layout, first_unit, destination.payload, destination.scales, destination.mins);
         }
         else
         {

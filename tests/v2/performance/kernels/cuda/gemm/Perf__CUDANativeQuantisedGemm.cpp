@@ -377,7 +377,6 @@ namespace
         {
             const auto &format = *source.metadata;
             codebooks.insert(llaminar2::canonicalDeviceVnniCodebookId(format));
-            codebooks.insert(llaminar2::migrationStableDeviceVnniFormat(format).codebook_id);
             if (format.payload_bytes == 16 || format.payload_bytes == 20)
                 staged_codebooks.insert(llaminar2::canonicalDeviceVnniCodebookId(format));
         }
@@ -1624,7 +1623,7 @@ namespace
             // The public native quantizer publishes sums only for these physical
             // correction ABIs; IQ1_M instead consumes four independently scaled K8s.
             if (m_ > 1 && (weights.codebook_id == 5 || weights.codebook_id == 7 ||
-                weights.codebook_id == 16 || weights.codebook_id == llaminar2::kNativeQuantisedExpandedInt8MinCodebook))
+                weights.codebook_id == 16))
                 bank(GemmWorkspaceBuffers::SUMS_A_BLOCKWISE, block_bytes);
             int tile = -1, partitions = 0, bk256 = 0, canonical = 0;
             cudaNativeQuantisedPrefill_getLastLaunchSelection(&tile, &partitions, &bk256, &canonical);

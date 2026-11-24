@@ -20,7 +20,7 @@ namespace llaminar2
     enum class GPUPreparedWeightPoolLayout
     {
         SourceNative, ///< Exact canonical representation of the immutable source.
-        MigrationReusable, ///< Canonical initial/migrated representation union.
+        MigrationReusable, ///< Canonical physical decoder with planes sealed for tier arrivals.
     };
 
     /**

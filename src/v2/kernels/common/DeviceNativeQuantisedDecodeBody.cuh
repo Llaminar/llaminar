@@ -28,8 +28,7 @@
         static constexpr bool is_iq1_grid = (CODEBOOK_ID == 16 || CODEBOOK_ID == 17);
         static constexpr bool is_iq_grid = is_iq3_grid || is_iq2_grid || is_iq1_grid;
         static constexpr bool is_asymmetric =
-            CODEBOOK_ID == 5 || CODEBOOK_ID == 7 || CODEBOOK_ID == 16 ||
-            CODEBOOK_ID == kNativeQuantisedExpandedInt8MinCodebook;
+            CODEBOOK_ID == 5 || CODEBOOK_ID == 7 || CODEBOOK_ID == 16;
         static constexpr bool is_dual_scale = (CODEBOOK_ID == 8 || CODEBOOK_ID == 9 || CODEBOOK_ID == 10 ||
                                                CODEBOOK_ID == 13 || CODEBOOK_ID == 14 || CODEBOOK_ID == 17);
         // Storage presence is independent of additive/dual arithmetic.
@@ -38,9 +37,7 @@
         static constexpr bool is_dual_scale_asym = (CODEBOOK_ID == 10);
         static constexpr bool is_iq1_m = (CODEBOOK_ID == 17);
         static constexpr int payload_bytes =
-            (CODEBOOK_ID == 19 ||
-             CODEBOOK_ID == kNativeQuantisedExpandedInt8MinCodebook)
-                                                        ? 32
+            (CODEBOOK_ID == 19)                      ? 32
             : (CODEBOOK_ID == 6 || CODEBOOK_ID == 7)   ? 20
             : (CODEBOOK_ID == 8)                       ? 24
             : (CODEBOOK_ID == 9)                       ? 12
@@ -747,11 +744,9 @@
             packed_groups[7] = static_cast<int32_t>(static_cast<uint32_t>(grid8 >> 32));
         }
         else if constexpr (
-            CODEBOOK_ID == 19 ||
-            CODEBOOK_ID == kNativeQuantisedExpandedInt8MinCodebook)
+            CODEBOOK_ID == 19)
         {
-            // Both normalized INT8 formats store 32 signed bytes directly;
-            // codebook 23 adds its minimum only in the contribution helper.
+            // Q8 stores 32 signed bytes directly.
 #pragma unroll
             for (int g = 0; g < 8; ++g)
             {
@@ -816,11 +811,8 @@
             }
         }
         else if constexpr (
-            CODEBOOK_ID == 19 ||
-            CODEBOOK_ID == kNativeQuantisedExpandedInt8MinCodebook)
+            CODEBOOK_ID == 19)
         {
-            // Payload layout is identical; asymmetric correction consumes the
-            // separate minimum plane after these vectorized loads.
             const int4 v0 = *reinterpret_cast<const int4 *>(payload);
             const int4 v1 = *reinterpret_cast<const int4 *>(payload + 16);
             packed_groups[0] = v0.x;

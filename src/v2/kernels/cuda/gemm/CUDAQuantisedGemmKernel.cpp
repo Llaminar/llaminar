@@ -236,8 +236,7 @@ namespace llaminar2
             /**
              * @brief Execute physical NativeQuantised bytes with a source policy.
              *
-             * Expert promotion may normalize the byte decoder to codebook 23
-             * while retaining a compact source codebook's reduction order.
+             * The original source selects reduction order independently of decoding.
              */
             bool cudaNativeQuantisedPrefill_fp32_withPolicy(
                 const int8_t *d_A_int8,
@@ -899,7 +898,6 @@ namespace llaminar2
                 case 16:
                 case 17:
                 case 19:
-                case kNativeQuantisedExpandedInt8MinCodebook:
                     return true;
                 default:
                     return false;
@@ -913,7 +911,6 @@ namespace llaminar2
                 case 5:  // Q4_1 / Q4_K
                 case 7:  // Q5_1 / Q5_K
                 case 16: // IQ1_S
-                case kNativeQuantisedExpandedInt8MinCodebook:
                     return true;
                 default:
                     return false;
@@ -1271,7 +1268,7 @@ namespace llaminar2
             if (!source_format ||
                 !deviceVnniExecutionCompatibleWithSource(
                     *source_format, codebook_id) ||
-                ((codebook_id == 11 || codebook_id == kNativeQuantisedExpandedInt8MinCodebook ||
+                ((codebook_id == 11 ||
                   codebook_id == kNativeQuantisedIQ4XSSourceScaleCodebook) &&
                  d_mins == nullptr))
             {
@@ -1287,11 +1284,9 @@ namespace llaminar2
                     (allocation_format.payload_bytes_per_block != source_format->payload_bytes ||
                         !allocation_format.has_mins || allocation_format.has_emins)))
                     throw std::invalid_argument("[CUDAQuantisedGemmKernel] Reusable slot does not preserve the source's migration metadata layout");
-                const auto canonical_format = canonicalDeviceVnniFormat(*source_format);
-                const auto execution_format =
-                    codebook_id == canonical_format.codebook_id
-                        ? canonical_format
-                        : migrationStableDeviceVnniFormat(*source_format);
+                const auto execution_format = canonicalDeviceVnniFormat(*source_format);
+                if (codebook_id != execution_format.codebook_id)
+                    throw std::invalid_argument("Reusable slot requires the canonical NativeQuantised execution codebook");
                 if (allocation_format.payload_bytes_per_block <
                         execution_format.payload_bytes_per_block ||
                     (execution_format.is_asymmetric &&

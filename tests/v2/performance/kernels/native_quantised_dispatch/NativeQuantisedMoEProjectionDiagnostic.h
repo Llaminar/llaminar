@@ -84,8 +84,7 @@ enum class MoEProjectionPreparedRepresentation : std::uint8_t
 /** @return Execution codebook of an ordinary arrival from the original CPU source. */
 [[nodiscard]] inline constexpr std::uint8_t moeProjectionMigrationCodebook(const NativeQuantisedFormatInfo &source) noexcept
 {
-    return cpu::native_quantised::migrationUsesSuperblockCodes(source)
-        ? canonicalDeviceVnniCodebookId(source) : migrationStableDeviceVnniFormat(source).codebook_id;
+    return canonicalDeviceVnniCodebookId(source);
 }
 
 /** @brief One M1 owner gate/up contest and separately named fixed-down control. */

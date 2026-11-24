@@ -463,7 +463,6 @@ bool submitMoEGroupedWmma(MoEGroupedPrefillEngine engine, uint32_t codebooks,
     MOE_WMMA_FORMAT(NATIVE_QUANTISED_GEMM_IQ1_S);
     MOE_WMMA_FORMAT(NATIVE_QUANTISED_GEMM_IQ1_M);
     MOE_WMMA_FORMAT(NATIVE_QUANTISED_GEMM_Q8_0);
-    MOE_WMMA_FORMAT(NATIVE_QUANTISED_GEMM_EXPANDED_INT8_MIN);
 #undef MOE_WMMA_FORMAT
     if (!codebooks || remaining) return false;
     if (submitted) *submitted = pending;

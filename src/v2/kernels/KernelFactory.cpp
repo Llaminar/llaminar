@@ -3438,9 +3438,7 @@ namespace llaminar
                         .has_mins = d.allocation_has_mins,
                         .has_emins = d.allocation_has_emins,
                     };
-                    // Preserve both physical decoding and original arithmetic
-                    // provenance: a CPU-promoted expert can use normalized
-                    // codebook 19/23 without changing its source codebook.
+                    // A service view borrows the actual decoder and its original arithmetic policy.
 #ifdef HAVE_CUDA
                     if (device.is_cuda())
                     {

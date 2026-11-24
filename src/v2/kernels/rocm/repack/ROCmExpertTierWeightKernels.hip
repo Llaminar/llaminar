@@ -252,8 +252,7 @@ namespace llaminar2
                 Codebook == 13 || Codebook == 14 || Codebook == 15;
             static constexpr bool is_iq1 = Codebook == 16 || Codebook == 17;
             static constexpr bool is_int8 =
-                Codebook == 19 ||
-                Codebook == kNativeQuantisedExpandedInt8MinCodebook;
+                Codebook == 19;
             static constexpr int payload_bytes =
                 is_int8                           ? 32
                 : is_5bit                        ? 20
@@ -341,8 +340,7 @@ namespace llaminar2
 
         /**
          * @brief Decode one compact accelerator block into eight INT8x4 groups.
-         * @tparam Codebook One of 6, 7, 9 through 17, raw-INT8 19, or
-         *         normalized asymmetric INT8+minimum 23.
+         * @tparam Codebook One of 6, 7, 9 through 17, or raw-INT8 19.
          * @param payload Start of one production-packed NativeQuantised block.
          * @param groups Receives 32 decoded integers in logical K order.
          *
@@ -556,11 +554,8 @@ namespace llaminar2
             else
             {
                 static_assert(
-                    Codebook == 19 ||
-                    Codebook == kNativeQuantisedExpandedInt8MinCodebook);
-                // Normalized symmetric and asymmetric INT8 share the same
-                // direct 32-byte payload.  Codebook 23's affine minimum is
-                // carried separately and is restored with metadata below.
+                    Codebook == 19);
+                // Q8 keeps its direct signed INT8 payload.
 #pragma unroll
                 for (int group = 0; group < 8; ++group)
                 {
@@ -710,7 +705,7 @@ namespace llaminar2
 
         /**
          * @brief Losslessly expand one single-scale block per logical row.
-         * @tparam Codebook One of 6, 7, 11, 12, 15, 16, 19, or normalized 23.
+         * @tparam Codebook One of 6, 7, 11, 12, 15, 16, or 19.
          * @param payload Production-packed source payload array.
          * @param scales Source primary/low-half FP16 scale array.
          * @param mins Optional source secondary-scale/minimum array.
@@ -767,7 +762,7 @@ namespace llaminar2
 
             static_assert(Codebook == 6 || Codebook == 7 || Codebook == 11 ||
                           Codebook == 12 || Codebook == 15 || Codebook == 16 ||
-                          Codebook == 19 || Codebook == kNativeQuantisedExpandedInt8MinCodebook);
+                          Codebook == 19);
             // These single-scale formats retain their exact integer domain.
             // Multi-scale sources use the native transposition kernel instead.
             for (int value = 0; value < 32; ++value)
@@ -790,8 +785,7 @@ namespace llaminar2
             reinterpret_cast<std::uint16_t *>(unit + (2176u/64)*columns)[local_column] =
                 scales[linear];
             if constexpr (
-                Codebook == 7 || Codebook == 11 || Codebook == 16 ||
-                Codebook == kNativeQuantisedExpandedInt8MinCodebook)
+                Codebook == 7 || Codebook == 11 || Codebook == 16)
             {
                 reinterpret_cast<std::uint16_t *>(
                     unit + (2304u/64)*columns)[local_column] =
@@ -919,7 +913,6 @@ namespace llaminar2
 
         /**
          * @brief Deinterleave CPU expanded-INT8 units into separated GPU data.
-         * @tparam Asymmetric Existing expanded19/23 additive-minimum storage.
          * @tparam SourceCodebook Source11 restores exact IQ3_S grids;19 retains INT8.
          * @param cpu_chunk Borrowed CPU units, already ordered on this stream.
          * @param N Live output rows, excluding padded columns.
@@ -934,7 +927,7 @@ namespace llaminar2
          * before any destination block bytes are published; no approximation,
          * alternate format, host mirror or dynamic storage is introduced.
          */
-        template <bool Asymmetric, std::uint8_t SourceCodebook = 19>
+        template <std::uint8_t SourceCodebook = 19>
         __global__ void cpuToGpuExpandedUnitsROCm(
             const std::uint8_t *__restrict__ cpu_chunk,
             ExpertTierWeightDeviceLayout layout,
@@ -961,7 +954,6 @@ namespace llaminar2
                 static_cast<size_t>(kb+layout.gpu_first_column/32)*layout.gpu_N+n+layout.gpu_first_row;
             if constexpr (SourceCodebook == 11)
             {
-                static_assert(!Asymmetric, "IQ3_S raw source nibble is not an additive minimum");
                 const std::uint16_t raw = reinterpret_cast<const std::uint16_t *>(unit + (2304u/64)*columns)[local_column];
                 if (!native_quantised_iq3s_scale::valid(raw)) __builtin_trap();
                 std::uint8_t low[8]{};
@@ -1001,11 +993,6 @@ namespace llaminar2
             }
             scales[linear] =
                 reinterpret_cast<const std::uint16_t *>(unit + (2176u/64)*columns)[local_column];
-            if constexpr (Asymmetric)
-            {
-                mins[linear] = reinterpret_cast<const std::uint16_t *>(
-                    unit + (2304u/64)*columns)[local_column];
-            }
         }
 
         /**
@@ -1346,10 +1333,6 @@ namespace llaminar2
             case 19:
                 LLAMINAR_LAUNCH_ROCM_TIER_SOURCE(19);
                 break;
-            case kNativeQuantisedExpandedInt8MinCodebook:
-                LLAMINAR_LAUNCH_ROCM_TIER_SOURCE(
-                    kNativeQuantisedExpandedInt8MinCodebook);
-                break;
             default:
                 return false;
             }
@@ -1408,7 +1391,7 @@ namespace llaminar2
         }
         if (layout.cpu_encoding == cpu::native_quantised::CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale)
         {
-            hipLaunchKernelGGL((cpuToGpuExpandedUnitsROCm<false,11>), grid, block, 0,
+            hipLaunchKernelGGL((cpuToGpuExpandedUnitsROCm<11>), grid, block, 0,
                 hip_stream, device_cpu_chunk, layout, first_unit, destination.payload, destination.scales, destination.mins);
             return hipPeekAtLastError() == hipSuccess;
         }
@@ -1439,20 +1422,10 @@ namespace llaminar2
         else if (layout.cpu_encoding ==
                  cpu::native_quantised::CPUNativeQuantisedEncoding::ExpandedInt8)
         {
-            if (layout.cpu_is_asymmetric != 0)
-            {
-                hipLaunchKernelGGL(
-                    (cpuToGpuExpandedUnitsROCm<true>), grid, block, 0,
-                    hip_stream, device_cpu_chunk, layout, first_unit, destination.payload,
-                    destination.scales, destination.mins);
-            }
-            else
-            {
-                hipLaunchKernelGGL(
-                    (cpuToGpuExpandedUnitsROCm<false>), grid, block, 0,
-                    hip_stream, device_cpu_chunk, layout, first_unit, destination.payload,
-                    destination.scales, destination.mins);
-            }
+            hipLaunchKernelGGL(
+                (cpuToGpuExpandedUnitsROCm<>), grid, block, 0,
+                hip_stream, device_cpu_chunk, layout, first_unit, destination.payload,
+                destination.scales, destination.mins);
         }
         else
         {

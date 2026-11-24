@@ -963,7 +963,6 @@ namespace
         case 16:
         case 17:
         case 19:
-        case llaminar2::kNativeQuantisedExpandedInt8MinCodebook:
             return true;
         default:
             return false;
@@ -985,7 +984,6 @@ namespace
         case 14:
         case 16:
         case 17:
-        case llaminar2::kNativeQuantisedExpandedInt8MinCodebook:
             return true;
         default:
             return false;
@@ -1005,22 +1003,16 @@ namespace
     }
 
     /**
-     * @brief Validate source provenance against the physical execution format.
-     *
-     * Expanded INT8+minimum bytes are shared by several compact asymmetric
-     * codebooks. A descriptor using execution codebook 23 therefore cannot
-     * select an exact arithmetic contract unless the producer also publishes
-     * its source identity. Legacy immutable descriptors remain accepted for
-     * self-describing execution formats, while any supplied provenance is
-     * checked against the central NativeQuantised catalog.
+     * @brief Authenticate the physical decoder against original GGUF provenance.
+     * IQ4_XS cannot infer its source policy from the physical decoder alone;
+     * other immutable descriptors may carry a self-describing decoder.
      */
     bool validateCudaGroupedSourceIdentity(
         const llaminar2::DeviceNativeQuantisedMatrixDesc &desc)
     {
         if (!desc.source_identity_present)
         {
-            return desc.codebook_id != llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook &&
-                   desc.codebook_id != llaminar2::kNativeQuantisedExpandedInt8MinCodebook;
+            return desc.codebook_id != llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook;
         }
         const auto *source =
             llaminar2::native_quantised_formats::forSourceIdentity(

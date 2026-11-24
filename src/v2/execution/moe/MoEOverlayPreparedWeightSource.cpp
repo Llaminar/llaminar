@@ -32,58 +32,14 @@ namespace llaminar2
             bool has_emins = false;
         };
 
-        /**
-         * @brief Recover physical GPU bytes without confusing source identity.
-         *
-         * A GPU source may either retain its original prepared format or be a
-         * normalized promotion from CPU ExpandedInt8. The latter deliberately
-         * uses codebook 19/23 while keeping the original GGUF identity in the
-         * engine, so both cases must be recognized explicitly.
-         */
-        bool resolveGpuExecutionFormat(
-            const DeviceNativeQuantisedMatrixDesc &descriptor,
-            const NativeQuantisedFormatInfo &source,
-            GpuExecutionFormat &format,
-            std::string *error) noexcept
+        /** @brief Resolve the GPU planes for the exact original source tuple. */
+        bool resolveGpuExecutionFormat(const DeviceNativeQuantisedMatrixDesc &descriptor,
+            const NativeQuantisedFormatInfo &source, GpuExecutionFormat &format, std::string *error) noexcept
         {
-            const std::uint8_t canonical =
-                canonicalDeviceVnniCodebookId(source);
-            if (descriptor.codebook_id == canonical)
-            {
-                format = {
-                    .payload_bytes =
-                        static_cast<std::uint8_t>(source.payload_bytes),
-                    .is_asymmetric = canonicalDeviceVnniFormat(source).is_asymmetric,
-                    .has_emins = source.has_emins,
-                };
-                return true;
-            }
-
-            const auto cpu_encoding =
-                cpu::native_quantised::preparedEncodingForSource(source);
-            if (cpu_encoding !=
-                cpu::native_quantised::CPUNativeQuantisedEncoding::ExpandedInt8)
-            {
-                return rejectPreparedSource(
-                    error,
-                    "GPU execution codebook differs from non-normalizable source identity");
-            }
-
-            const std::uint8_t normalized =
-                source.is_asymmetric
-                    ? kNativeQuantisedExpandedInt8MinCodebook
-                    : static_cast<std::uint8_t>(19);
-            if (descriptor.codebook_id != normalized)
-            {
-                return rejectPreparedSource(
-                    error,
-                    "GPU execution codebook is neither canonical nor the exact CPU-promotion normalization");
-            }
-            format = {
-                .payload_bytes = 32,
-                .is_asymmetric = source.is_asymmetric,
-                .has_emins = false,
-            };
+            const auto physical = canonicalDeviceVnniFormat(source);
+            if (descriptor.codebook_id != physical.codebook_id)
+                return rejectPreparedSource(error, "GPU execution codebook differs from canonical source identity");
+            format = {physical.payload_bytes_per_block, physical.is_asymmetric, physical.has_emins};
             return true;
         }
 

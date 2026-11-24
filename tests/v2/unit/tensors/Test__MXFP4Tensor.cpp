@@ -383,7 +383,6 @@ TEST(MXFP4Format, CatalogAndRepackIdentity)
     EXPECT_EQ(canonicalDeviceVnniCodebookId(*format), kNativeQuantisedMXFP4Codebook);
     EXPECT_EQ(canonicalDeviceVnniCodebookId(kNativeQuantisedMXFP4Codebook), 4);
     EXPECT_EQ(nativeQuantisedPolicyCodebook(kNativeQuantisedMXFP4Codebook), 4);
-    EXPECT_EQ(migrationStableDeviceVnniFormat(*format).codebook_id, kNativeQuantisedMXFP4Codebook);
     EXPECT_FALSE(areNativeQuantisedGateUpCodebooksCompatible(4, kNativeQuantisedMXFP4Codebook));
     EXPECT_EQ(codebookIdToRepackFormat(kNativeQuantisedMXFP4Codebook, false), RepackFormat::MXFP4);
     EXPECT_EQ(repackPayloadBytesPerBlock(RepackFormat::MXFP4), 16);

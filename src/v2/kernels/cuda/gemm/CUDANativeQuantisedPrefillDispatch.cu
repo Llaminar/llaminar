@@ -291,8 +291,7 @@ extern "C"
      *
      * The execution codebook selects the physical decoder and any learned
      * prefill overlay. The arithmetic-policy codebook selects the serial-M1
-     * reduction tree that every row must reproduce. They differ after a cold
-     * CPU tier promotes a compact asymmetric matrix into codebook 23.
+     * reduction tree that every row must reproduce.
      */
     bool cudaNativeQuantisedPrefill_getWorkspacePlanWithPolicy(
         uint8_t codebook_id,

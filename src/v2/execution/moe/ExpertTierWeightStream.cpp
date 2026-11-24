@@ -108,103 +108,28 @@ namespace llaminar2
 
 
         /**
-         * @brief Derive the only lossless GPU execution representation for a
-         * prepared CPU projection.
-         * @param cpu Valid or partially constructed CPU representation.
-         * @param codebook Receives the GPU execution codebook.
-         * @param payload_bytes Receives bytes in one separated GPU block.
-         * @param is_asymmetric Receives whether a per-block minimum is present.
-         * @param has_emins Receives whether packed effective minima are present.
-         * @param error Optional rejection diagnostic.
-         * @return `true` only when CPU metadata names a supported exact mapping.
-         *
-         * Expanded CPU data cannot recover its original compact codebook, so it
-         * has explicit normalized GPU identities: codebook 19 when symmetric
-         * and codebook 23 when a minimum must also be retained.
+         * @brief Resolve an expert GPU endpoint only from canonical file-density CPU storage.
+         * @param cpu CPU source provenance and prepared geometry.
+         * @param codebook Receives the canonical physical GPU decoder.
+         * @param payload_bytes Receives the per-block GPU payload width.
+         * @param is_asymmetric Receives whether the GPU secondary plane is present.
+         * @param has_emins Receives whether the source uses effective minima.
+         * @param error Optional exact rejection diagnostic.
+         * @return Whether the original source authenticates the CPU encoding and GPU format.
          */
-        bool gpuFormatForCpu(
-            const CPUWeights &cpu,
-            uint8_t &codebook,
-            uint8_t &payload_bytes,
-            bool &is_asymmetric,
-            bool &has_emins,
-            std::string *error) noexcept
+        bool gpuFormatForCpu(const CPUWeights &cpu, uint8_t &codebook, uint8_t &payload_bytes,
+            bool &is_asymmetric, bool &has_emins, std::string *error) noexcept
         {
-            // None of the currently normalized stream formats uses Q2_K emins.
-            has_emins = false;
             const auto *source = native_quantised_formats::forSourceIdentity(cpu.codebook_id, cpu.is_superblock);
-            if (source && (cpu::native_quantised::migrationUsesSuperblockCodes(*source) ||
-                expertTierPreservesNativeSingleScale(cpu::native_quantised::preparedEncodingForSource(*source), cpu.codebook_id)))
-            {
-                if (cpu.encoding != cpu::native_quantised::preparedEncodingForSource(*source) ||
-                    cpu.payload_bytes != source->payload_bytes || cpu.is_asymmetric != source->is_asymmetric)
-                    return reject(error, "Native GPU migration requires the canonical CPU source encoding");
-                const auto physical = canonicalDeviceVnniFormat(*source);
-                codebook = physical.codebook_id;
-                payload_bytes = physical.payload_bytes_per_block;
-                is_asymmetric = physical.is_asymmetric;
-                has_emins = physical.has_emins;
-                return true;
-            }
-            switch (cpu.encoding)
-            {
-            case CPUEncoding::Q4KSuperblockCoded:
-            case CPUEncoding::Q5NativeSingleScale:
-            case CPUEncoding::CompactMultiScale:
-                return reject(error, "Coded CPU tier encoding has no matching source format");
-            case CPUEncoding::IQ3SExpandedSourceScale:
-                if (cpu.codebook_id != 11 || !cpu.is_superblock || cpu.is_asymmetric || cpu.payload_bytes != 13)
-                    return reject(error, "IQ3_S source-tuple CPU stream metadata is invalid");
-                codebook = 11; payload_bytes = 13; is_asymmetric = true;
-                return true;
-            case CPUEncoding::NibbleLUTSourceScale:
-                if (cpu.codebook_id != 4 || !cpu.is_superblock ||
-                    cpu.is_asymmetric || cpu.payload_bytes != 16)
-                    return reject(error, "IQ4_XS source-tuple CPU stream metadata is invalid");
-                codebook = kNativeQuantisedIQ4XSSourceScaleCodebook;
-                payload_bytes = 16;
-                is_asymmetric = true; // Physical secondary plane, not additive minima.
-                return true;
-            case CPUEncoding::NibbleLUT:
-                if ((cpu.codebook_id == 4 && cpu.is_superblock) ||
-                    !isNibbleCodebook(cpu.codebook_id) ||
-                    cpu.payload_bytes != 16)
-                {
-                    return reject(
-                        error,
-                        "Nibble CPU stream requires codebook 0, 4, 5 or 25 (MXFP4) and a 16-byte payload");
-                }
-                codebook = cpu.codebook_id;
-                payload_bytes = 16;
-                is_asymmetric = cpu.is_asymmetric;
-                return true;
-            case CPUEncoding::Q6KNativeDualScale:
-                if (cpu.codebook_id != 8 || cpu.payload_bytes != 24 ||
-                    !cpu.is_asymmetric)
-                {
-                    return reject(
-                        error,
-                        "Native Q6 CPU stream requires codebook 8, 24-byte payload, and dual-scale metadata");
-                }
-                codebook = 8;
-                payload_bytes = 24;
-                is_asymmetric = true;
-                return true;
-            case CPUEncoding::ExpandedInt8:
-                // A single scale/minimum cannot express these source families.
-                // Reject stale expanded layouts before they can be promoted.
-                if (cpu.codebook_id == 8 ||
-                    hasCompactMultiScaleVnniPayload(cpu.codebook_id))
-                    return reject(error, "Multi-scale CPU sources require their lossless native encoding");
-                // Promotion from CPU retains already-decoded signed values.
-                codebook = cpu.is_asymmetric
-                               ? kNativeQuantisedExpandedInt8MinCodebook
-                               : static_cast<uint8_t>(19);
-                payload_bytes = 32;
-                is_asymmetric = cpu.is_asymmetric;
-                return true;
-            }
-            return reject(error, "Unknown CPU prepared encoding");
+            if (!source || cpu.encoding != cpu::native_quantised::preparedEncodingForSource(*source) ||
+                cpu.payload_bytes != source->payload_bytes || cpu.is_asymmetric != source->is_asymmetric)
+                return reject(error, "Native expert migration requires the canonical CPU source encoding");
+            const auto physical = canonicalDeviceVnniFormat(*source);
+            codebook = physical.codebook_id;
+            payload_bytes = physical.payload_bytes_per_block;
+            is_asymmetric = physical.is_asymmetric;
+            has_emins = physical.has_emins;
+            return true;
         }
 
         /**
@@ -350,16 +275,6 @@ namespace llaminar2
             }
             if (!cpu::native_quantised::isKnownPreparedEncoding(cpu.encoding))
                 return reject(error, "CPU packed encoding is unknown");
-            // Source provenance must identify exactly one of the 21 cataloged
-            // formats even when its final CPU bytes have been normalized.
-            if (native_quantised_formats::forSourceIdentity(
-                    cpu.codebook_id, cpu.is_superblock) == nullptr)
-            {
-                return reject(
-                    error,
-                    "CPU packed source codebook/superblock identity is not cataloged");
-            }
-
             // Never trust serialized stride fields independently of encoding.
             const uint32_t expected_data_stride =
                 cpu::native_quantised::preparedDataStride(cpu.encoding, cpu.codebook_id);
@@ -394,8 +309,7 @@ namespace llaminar2
          * @param gpu Source common separated representation.
          * @param cpu Receives metadata only; payload allocation happens later.
          *
-         * This function selects physical CPU execution encoding, not the source
-         * GGUF format. Expanded INT8 therefore remains expanded after migration.
+         * The original source tuple selects the same CPU encoding as loading.
          */
         void configureCpuFromGpu(
             const HostGpuExpertPackedProjection &gpu,
@@ -409,57 +323,10 @@ namespace llaminar2
             cpu.blocks_per_row = static_cast<int>(gpu.blocks_per_row);
             cpu.codebook_id = gpu.source_codebook_id;
             cpu.is_superblock = gpu.is_superblock;
-            cpu.is_asymmetric = gpu.is_asymmetric;
-
             const auto &source = *native_quantised_formats::forSourceIdentity(gpu.source_codebook_id, gpu.is_superblock);
-            if (gpu.metadata_layout != 0 || expertTierPreservesNativeSingleScale(
-                    cpu::native_quantised::preparedEncodingForSource(source), source.codebook_id))
-            {
-                cpu.encoding = cpu::native_quantised::preparedEncodingForSource(source);
-                cpu.is_asymmetric = source.is_asymmetric;
-                cpu.payload_bytes = source.payload_bytes;
-            }
-            else if (gpu.codebook_id == kNativeQuantisedIQ4XSSourceScaleCodebook)
-            {
-                cpu.encoding = CPUEncoding::NibbleLUTSourceScale;
-                cpu.payload_bytes = 16;
-                cpu.is_asymmetric = false;
-            }
-            else if (gpu.codebook_id == 11)
-            {
-                cpu.encoding = CPUEncoding::IQ3SExpandedSourceScale;
-                cpu.payload_bytes = 13; cpu.is_asymmetric = false;
-            }
-            else if (isNibbleCodebook(gpu.codebook_id))
-            {
-                cpu.encoding = CPUEncoding::NibbleLUT;
-                cpu.payload_bytes = 16;
-            }
-            else if (gpu.codebook_id == 8)
-            {
-                cpu.encoding = CPUEncoding::Q6KNativeDualScale;
-                cpu.payload_bytes = 24;
-                cpu.is_asymmetric = true;
-                cpu.is_superblock = true;
-            }
-            else if (hasCompactMultiScaleVnniPayload(gpu.codebook_id))
-            {
-                cpu.encoding = CPUEncoding::CompactMultiScale;
-                cpu.payload_bytes = gpu.payload_bytes_per_block;
-            }
-            else
-            {
-                cpu.encoding = CPUEncoding::ExpandedInt8;
-                cpu.payload_bytes = 32;
-                /*
-                 * ExpandedInt8 describes the CPU execution bytes, while
-                 * `is_superblock` is part of the original GGUF provenance.
-                 * Keep the latter intact so a later CPU-to-GPU promotion can
-                 * distinguish, for example, Q8_0 from Q8_K even though both
-                 * execute from normalized signed-byte payloads.
-                 */
-                cpu.is_superblock = gpu.is_superblock;
-            }
+            cpu.encoding = cpu::native_quantised::preparedEncodingForSource(source);
+            cpu.is_asymmetric = source.is_asymmetric;
+            cpu.payload_bytes = source.payload_bytes;
             // Strides come from the CPU encoding's single source of truth.
             cpu.data_stride = static_cast<int>(
                 cpu::native_quantised::preparedDataStride(cpu.encoding, cpu.codebook_id));
@@ -1203,23 +1070,10 @@ namespace llaminar2
             mins.size() != (is_asymmetric ? blocks : 0) || emins.size() != (has_emins ? blocks : 0))
             return reject(error, "Host GPU per-block planes do not match the descriptor");
 
-        const bool exact_source_representation =
-            codebook_id == canonicalDeviceVnniCodebookId(*source_format) &&
-            payload_bytes_per_block == source_format->payload_bytes &&
-            is_asymmetric == canonicalDeviceVnniFormat(*source_format).is_asymmetric &&
-            has_emins == source_format->has_emins;
-        if (exact_source_representation || coded)
-            return exact_source_representation || reject(error, "Host GPU coded format must retain the canonical source payload");
-
-        // The same canonical contract sizes recyclable slots and validates
-        // arrivals. In particular, multi-scale sources never normalize to one
-        // scale/minimum: accepting that stale representation would lose math.
-        const auto migrated = migrationStableDeviceVnniFormat(*source_format);
-        if (codebook_id == migrated.codebook_id &&
-            payload_bytes_per_block == migrated.payload_bytes_per_block &&
-            is_asymmetric == migrated.is_asymmetric && has_emins == migrated.has_emins)
-            return true;
-        return reject(error, "Host GPU endpoint format is inconsistent with source provenance");
+        const auto physical = canonicalDeviceVnniFormat(*source_format);
+        return (codebook_id == physical.codebook_id && payload_bytes_per_block == physical.payload_bytes_per_block &&
+            is_asymmetric == physical.is_asymmetric && has_emins == physical.has_emins) ||
+            reject(error, "Host GPU endpoint does not retain its canonical source format");
     }
 
     /**
@@ -1232,8 +1086,7 @@ namespace llaminar2
      * @param expert_id Logical routed-expert identity.
      * @param projection Gate, up, or down projection identity.
      * @param maximum_units_per_chunk Persistent staging capacity in units.
-     * @return Fully validated version-3 manifest covering compact, dual-scale,
-     *         embedded-minimum, and normalized source formats.
+     * @return Sealed manifest for the original source's native GPU and CPU formats.
      */
     ExpertTierWeightStreamManifest
     makeGpuToCpuExpertTierWeightStreamManifest(
@@ -1316,52 +1169,14 @@ namespace llaminar2
             throw std::invalid_argument(
                 "Tier stream live GPU source descriptor is invalid");
 
-        auto manifest = makeGpuToCpuExpertTierWeightStreamManifest(
-            source_format,
-            gpu_source.n,
-            gpu_source.k,
-            residency_epoch,
-            layer_idx,
-            expert_id,
-            projection,
-            maximum_units_per_chunk);
+        const auto physical = canonicalDeviceVnniFormat(source_format);
+        if (gpu_source.codebook_id != physical.codebook_id ||
+            gpu_source.payload_bytes_per_block != physical.payload_bytes_per_block ||
+            gpu_source.is_asymmetric != physical.is_asymmetric || gpu_source.has_emins != physical.has_emins)
+            throw std::invalid_argument("Tier stream live GPU source is not its canonical source format");
 
-        const bool canonical_source =
-            gpu_source.codebook_id ==
-                canonicalDeviceVnniCodebookId(source_format) &&
-            gpu_source.payload_bytes_per_block ==
-                source_format.payload_bytes &&
-            gpu_source.is_asymmetric == canonicalDeviceVnniFormat(source_format).is_asymmetric &&
-            gpu_source.has_emins == source_format.has_emins;
-        const bool normalized_source =
-            manifest.cpu_encoding == CPUEncoding::ExpandedInt8 &&
-            gpu_source.payload_bytes_per_block == 32 &&
-            !gpu_source.has_emins &&
-            gpu_source.is_asymmetric == source_format.is_asymmetric &&
-            gpu_source.codebook_id ==
-                (source_format.is_asymmetric
-                     ? kNativeQuantisedExpandedInt8MinCodebook
-                     : static_cast<std::uint8_t>(19));
-        if (!canonical_source && !normalized_source)
-        {
-            throw std::invalid_argument(
-                "Tier stream live GPU source is neither canonical nor its exact CPU-promotion normalization");
-        }
-
-        /*
-         * CPU fields remain derived from immutable source provenance. Only the
-         * accelerator-facing fields describe the current physical bytes. This
-         * is what makes CPU -> GPU -> CPU cycles preserve the same final CPU
-         * representation even after compact source bits have been normalized.
-         */
-        manifest.gpu_codebook_id = gpu_source.codebook_id;
-        manifest.gpu_payload_bytes_per_block =
-            gpu_source.payload_bytes_per_block;
-        manifest.gpu_is_asymmetric =
-            static_cast<std::uint8_t>(gpu_source.is_asymmetric);
-        manifest.gpu_has_emins =
-            static_cast<std::uint8_t>(gpu_source.has_emins);
-        return sealManifest(manifest, maximum_units_per_chunk);
+        return makeGpuToCpuExpertTierWeightStreamManifest(source_format, gpu_source.n, gpu_source.k,
+            residency_epoch, layer_idx, expert_id, projection, maximum_units_per_chunk);
     }
 
     /**
@@ -1372,8 +1187,7 @@ namespace llaminar2
      * @param expert_id Logical routed-expert identity.
      * @param projection Gate, up, or down projection identity.
      * @param maximum_units_per_chunk Persistent staging capacity in units.
-     * @return Fully validated version-3 manifest with an explicit normalized
-     *         GPU destination when compact source bits are no longer present.
+     * @return Sealed manifest publishing the canonical device representation.
      */
     ExpertTierWeightStreamManifest
     makeCpuToGpuExpertTierWeightStreamManifest(
@@ -1593,15 +1407,6 @@ namespace llaminar2
                             unit + cpu.data_stride + 128u +
                             static_cast<size_t>(n % 64) * sizeof(uint16_t),
                         sizeof(uint16_t));
-                    if (cpu.is_asymmetric)
-                    {
-                        std::memcpy(
-                            &output.mins[linear],
-                            cpu.native_interleaved.data() +
-                                unit + cpu.data_stride + 256u +
-                                static_cast<size_t>(n % 64) * sizeof(uint16_t),
-                            sizeof(uint16_t));
-                    }
                     continue;
                 }
 
@@ -1681,8 +1486,7 @@ namespace llaminar2
         if (gpu.metadata_layout == 0 && !cpu::native_quantised::is_payload_decodable(gpu.codebook_id) &&
             gpu.codebook_id != kNativeQuantisedIQ4XSSourceScaleCodebook &&
             !hasCompactMultiScaleVnniPayload(gpu.codebook_id) && gpu.codebook_id != 8 &&
-            !cpu::native_quantised::preparedExpandedInt8OmitsCompensation(CPUEncoding::ExpandedInt8, gpu.codebook_id) &&
-            gpu.codebook_id != kNativeQuantisedExpandedInt8MinCodebook)
+            !cpu::native_quantised::preparedExpandedInt8OmitsCompensation(CPUEncoding::ExpandedInt8, gpu.codebook_id))
         {
             return reject(
                 error,

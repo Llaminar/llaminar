@@ -343,7 +343,6 @@ namespace
         case 16: // IQ1_S
         case 17: // IQ1_M
         case 19: // Q8_0
-        case llaminar2::kNativeQuantisedExpandedInt8MinCodebook:
             return true;
         default:
             return false;
@@ -366,7 +365,6 @@ namespace
         case 14: // IQ2_XS high half scale
         case 16: // IQ1_S min correction
         case 17: // IQ1_M high half scale
-        case llaminar2::kNativeQuantisedExpandedInt8MinCodebook: // Expanded asymmetric min correction
             return true;
         default:
             return false;
@@ -407,21 +405,16 @@ namespace
     }
 
     /**
-     * @brief Validate source provenance and its normalized execution format.
-     *
-     * Expanded INT8+minimum bytes are intentionally shared by several compact
-     * asymmetric sources, so codebook 23 is meaningless for exact arithmetic
-     * without provenance. Other descriptors retain compatibility with legacy
-     * immutable test fixtures, but authoritative provenance is validated when
-     * present rather than trusted as an unchecked policy-table index.
+     * @brief Authenticate the physical decoder against original GGUF provenance.
+     * IQ4_XS cannot infer its source policy from the physical decoder alone;
+     * other immutable descriptors may carry a self-describing decoder.
      */
     bool validateGroupedSourceIdentity(
         const llaminar2::DeviceNativeQuantisedMatrixDesc &desc)
     {
         if (!desc.source_identity_present)
         {
-            return desc.codebook_id != llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook &&
-                   desc.codebook_id != llaminar2::kNativeQuantisedExpandedInt8MinCodebook;
+            return desc.codebook_id != llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook;
         }
         const auto *source =
             llaminar2::native_quantised_formats::forSourceIdentity(

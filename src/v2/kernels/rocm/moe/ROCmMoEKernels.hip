@@ -7910,10 +7910,6 @@ namespace
         case 20:
             payload_bytes = 32u;
             return true;
-        case llaminar2::kNativeQuantisedExpandedInt8MinCodebook:
-            payload_bytes = 32u;
-            is_asymmetric = 1u;
-            return true;
         default:
             return false;
         }

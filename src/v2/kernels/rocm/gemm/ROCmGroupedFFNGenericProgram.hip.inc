@@ -504,7 +504,6 @@ bool launchFormatProgram(const RoutePlan& plan,const DeviceRowRange& rows,
         case nativeQuantisedCodebookMaskBit(NATIVE_QUANTISED_PF_IQ1_S): launchDown.template operator()<15,false,NATIVE_QUANTISED_PF_IQ1_S>();return hipGetLastError()==hipSuccess;
         case nativeQuantisedCodebookMaskBit(NATIVE_QUANTISED_PF_IQ1_M): launchDown.template operator()<15,false,NATIVE_QUANTISED_PF_IQ1_M>();return hipGetLastError()==hipSuccess;
         case nativeQuantisedCodebookMaskBit(NATIVE_QUANTISED_PF_Q8_0): launchDown.template operator()<15,false,NATIVE_QUANTISED_PF_Q8_0>();return hipGetLastError()==hipSuccess;
-        case nativeQuantisedCodebookMaskBit(NATIVE_QUANTISED_PF_EXPANDED_INT8_MIN): launchDown.template operator()<15,false,NATIVE_QUANTISED_PF_EXPANDED_INT8_MIN>();return hipGetLastError()==hipSuccess;
         default: break;
         }
     }

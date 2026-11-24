@@ -740,6 +740,21 @@ TEST(Test__PackedWeightsSerialization, Q8ExpandedDensityRejectsLegacyCompensatio
     }
 }
 
+/** @test A structurally complete GPWT buffer cannot resurrect retired physical storage. */
+TEST(Test__PackedWeightsSerialization, GpuWireRejectsRetiredPhysicalDecoder)
+{
+    using namespace llaminar2;
+    for (const auto &header : {
+             buildGpuPackedHeader(RepackFormat::Q4_1, 5, 16, true, false, false, 17, 96),
+             buildGpuPackedHeader(RepackFormat::Q4_1, 23, 32, true, false, false, 17, 96)})
+    {
+        std::vector<uint8_t> blob(gpuPackedTotalSize(header), 0);
+        std::memcpy(blob.data(), &header, sizeof(header));
+        GpuPackedWeightsView view{};
+        EXPECT_EQ(parseGpuPackedBuffer(blob.data(), blob.size(), view), header.codebook_id == 5);
+    }
+}
+
 /** @brief GPU tuple wire has20 bytes/block, authentic source4 and a distinct physical ID. */
 TEST(Test__PackedWeightsSerialization, IQ4XSGpuWireTupleRejectsVersion2AndSourceSubstitution)
 {

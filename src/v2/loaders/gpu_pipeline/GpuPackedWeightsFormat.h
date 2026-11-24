@@ -29,6 +29,7 @@
  */
 
 #include "loaders/gpu_pipeline/RepackFormat.h"
+#include "tensors/NativeQuantisedFormatInfo.h"
 #include "tensors/NativeQuantisedScalePlane.h"
 
 #include <cstdint>
@@ -137,6 +138,7 @@ inline bool validateGpuPackedHeader(const GpuPackedWeightsHeader& hdr, size_t bu
 {
     if (hdr.magic != GPU_PACKED_WEIGHTS_MAGIC) return false;
     if (hdr.version != GPU_PACKED_WEIGHTS_VERSION) return false;
+    if (!(kNativeQuantisedPhysicalCodebooks & nativeQuantisedCodebookMaskBit(hdr.codebook_id))) return false;
     if (hdr.N <= 0 || hdr.K <= 0 || hdr.blocks_per_row <= 0) return false;
     // IQ3_S physical11 owns original half base and mandatory raw nibble.
     if (hdr.codebook_id == 11 || hdr.format == static_cast<uint8_t>(RepackFormat::IQ3_S))

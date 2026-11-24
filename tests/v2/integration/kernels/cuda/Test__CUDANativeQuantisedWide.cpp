@@ -317,8 +317,6 @@ TEST(CUDANativeQuantisedWide, CapturedGroupedRegisterBoundsMatchSerialAllFormats
         const auto &format = *source.metadata;
         formats.emplace(llaminar2::canonicalDeviceVnniCodebookId(format),
                         format.payload_bytes);
-        const auto promoted = llaminar2::migrationStableDeviceVnniFormat(format);
-        formats.emplace(promoted.codebook_id, promoted.payload_bytes_per_block);
     }
     for (const auto &[codebook, payload_bytes] : formats)
         for (const auto &[tile, cpt] : std::array{
@@ -387,8 +385,6 @@ TEST(CUDANativeQuantisedWide, CapturedAllCodebooksAndTileTailsMatchSinglePartiti
         const auto &format = *source.metadata;
         formats.emplace(llaminar2::canonicalDeviceVnniCodebookId(format),
                         format.payload_bytes);
-        const auto promoted = llaminar2::migrationStableDeviceVnniFormat(format);
-        formats.emplace(promoted.codebook_id, promoted.payload_bytes_per_block);
     }
     for (const auto &[codebook, payload_bytes] : formats)
         for (const auto &[tile, cpt] : std::array{

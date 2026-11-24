@@ -52,24 +52,23 @@ TEST(ROCmGroupedFFNFormatSelection, AllSourceAndMigrationFormatsRetainIndependen
         const auto& source=*entry.metadata;
         const auto routed=reachable(source);
         const auto policy=nativeQuantisedCodebookMaskBit(canonicalDeviceVnniCodebookId(source.codebook_id));
-        for(auto physical:{canonicalDeviceVnniCodebookId(source),migrationStableDeviceVnniFormat(source).codebook_id}) {
-            for(unsigned role=0;role<3;++role) {
-                std::array weights{matrix(formats::Q8_0,19,false),matrix(formats::Q8_0,19,false),
-                                   matrix(formats::Q8_0,19,true)};
-                weights[role]=matrix(source,physical,role==2);
-                const auto program=ffn::declareSourceFormats(160,shared,routed,q8,sources(source,source,formats::Q8_0),weights);
-                EXPECT_EQ(program.routedColumns(),160);
-                EXPECT_EQ(program.sharedColumns(),shared);
-                EXPECT_EQ(program.formats().routedGateUp.policy_codebook_mask,policy);
-                EXPECT_EQ(program.formats().routedDown.execution_codebook_mask,q8.execution_codebook_mask);
-                for(unsigned index=0;index<3;++index) {
-                    EXPECT_EQ(program.formats().shared[index].execution_codebook_mask,
-                        index==role?nativeQuantisedCodebookMaskBit(physical):q8.execution_codebook_mask);
-                    EXPECT_EQ(program.formats().shared[index].policy_codebook_mask,index==role?policy:q8.policy_codebook_mask);
-                }
-                EXPECT_EQ(program.family(),rocm::ResidentMoEFFNDecoderProgram::fromExecutionMask(
-                    routed.execution_codebook_mask|q8.execution_codebook_mask|nativeQuantisedCodebookMaskBit(physical)).groups());
+        const auto physical=canonicalDeviceVnniCodebookId(source);
+        for(unsigned role=0;role<3;++role) {
+            std::array weights{matrix(formats::Q8_0,19,false),matrix(formats::Q8_0,19,false),
+                               matrix(formats::Q8_0,19,true)};
+            weights[role]=matrix(source,physical,role==2);
+            const auto program=ffn::declareSourceFormats(160,shared,routed,q8,sources(source,source,formats::Q8_0),weights);
+            EXPECT_EQ(program.routedColumns(),160);
+            EXPECT_EQ(program.sharedColumns(),shared);
+            EXPECT_EQ(program.formats().routedGateUp.policy_codebook_mask,policy);
+            EXPECT_EQ(program.formats().routedDown.execution_codebook_mask,q8.execution_codebook_mask);
+            for(unsigned index=0;index<3;++index) {
+                EXPECT_EQ(program.formats().shared[index].execution_codebook_mask,
+                    index==role?nativeQuantisedCodebookMaskBit(physical):q8.execution_codebook_mask);
+                EXPECT_EQ(program.formats().shared[index].policy_codebook_mask,index==role?policy:q8.policy_codebook_mask);
             }
+            EXPECT_EQ(program.family(),rocm::ResidentMoEFFNDecoderProgram::fromExecutionMask(
+                routed.execution_codebook_mask|q8.execution_codebook_mask|nativeQuantisedCodebookMaskBit(physical)).groups());
         }
     }
 }
@@ -78,13 +77,9 @@ TEST(ROCmGroupedFFNFormatSelection, AllSourceAndMigrationFormatsRetainIndependen
 TEST(ROCmGroupedFFNFormatSelection, IndexedGateReadersAreIndependentOfDownAndRejectMixedEncodings)
 {
     const auto& sharedGate=formats::IQ2_S;
-    // IQ3_XXS movement keeps its compact multi-scale encoding (codebook 12), so
-    // the original readers survive every move; Q5_K movement expands to
-    // codebook 23, so a movable Q5_K gate cannot keep the original readers.
-    struct Gate {const NativeQuantisedFormatInfo* format; bool movable_keeps_readers;};
-    for(const Gate g:{Gate{&formats::IQ3_XXS,true},Gate{&formats::Q5_K,false}})
+    for(const auto* gate_format:{&formats::IQ3_XXS,&formats::Q5_K})
     for(const auto* down:{&formats::Q5_1,&formats::Q6_K}) {
-        const auto& gate=*g.format;
+        const auto& gate=*gate_format;
         SCOPED_TRACE(::testing::Message()<<int(gate.codebook_id)<<' '<<int(down->codebook_id));
         const std::array weights{matrix(sharedGate,sharedGate.codebook_id,false),
             matrix(sharedGate,sharedGate.codebook_id,false),matrix(*down,down->codebook_id,true)};
@@ -94,7 +89,7 @@ TEST(ROCmGroupedFFNFormatSelection, IndexedGateReadersAreIndependentOfDownAndRej
         };
         const auto compact=declare(false);
         EXPECT_TRUE(compact.hasOriginalGateReaders(gate,sharedGate,weights));
-        EXPECT_EQ(declare(true).hasOriginalGateReaders(gate,sharedGate,weights),g.movable_keeps_readers);
+        EXPECT_TRUE(declare(true).hasOriginalGateReaders(gate,sharedGate,weights));
         EXPECT_FALSE(compact.hasOriginalGateReaders(formats::IQ3_S,sharedGate,weights));
         for(unsigned role=0;role<2;++role) {
             auto changed=weights;

@@ -53,7 +53,6 @@ std::set<std::uint8_t> compiledPhysicalCodebooks()
     for (const auto &source : native_quantised_formats::kAllSourceFormats)
     {
         result.insert(canonicalDeviceVnniFormat(*source.metadata).codebook_id);
-        result.insert(migrationStableDeviceVnniFormat(*source.metadata).codebook_id);
     }
     return result;
 }
@@ -63,13 +62,12 @@ std::map<std::uint8_t, NativeQuantisedExecutionFormatEnvelope> compiledPhysicalE
 {
     std::map<std::uint8_t, NativeQuantisedExecutionFormatEnvelope> result;
     for (const auto &source : native_quantised_formats::kAllSourceFormats)
-        for (const auto physical : {canonicalDeviceVnniFormat(*source.metadata).codebook_id,
-                                   migrationStableDeviceVnniFormat(*source.metadata).codebook_id})
-        {
-            const NativeQuantisedSourceIdentity original{source.metadata->codebook_id, source.metadata->is_superblock, true};
-            if (!addNativeQuantisedExecutionFormat(result[physical], physical, original, false))
-                throw std::logic_error("canonical source could not construct its native resource envelope");
-        }
+    {
+        const auto physical = canonicalDeviceVnniCodebookId(*source.metadata);
+        const NativeQuantisedSourceIdentity original{source.metadata->codebook_id, source.metadata->is_superblock, true};
+        if (!addNativeQuantisedExecutionFormat(result[physical], physical, original, false))
+            throw std::logic_error("canonical source could not construct its native resource envelope");
+    }
     return result;
 }
 

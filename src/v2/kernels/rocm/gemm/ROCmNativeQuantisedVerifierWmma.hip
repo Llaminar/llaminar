@@ -257,7 +257,6 @@ __device__ __forceinline__ void produce(
         LLAMINAR_VERIFIER_WMMA(NATIVE_QUANTISED_GEMM_IQ1_S);
         LLAMINAR_VERIFIER_WMMA(NATIVE_QUANTISED_GEMM_IQ1_M);
         LLAMINAR_VERIFIER_WMMA(NATIVE_QUANTISED_GEMM_Q8_0);
-        LLAMINAR_VERIFIER_WMMA(NATIVE_QUANTISED_GEMM_EXPANDED_INT8_MIN);
 #undef LLAMINAR_VERIFIER_WMMA
         default: __builtin_trap();
         }
@@ -330,7 +329,6 @@ void submitNativeQuantisedVerifierWmma(const NativeQuantisedVerifierWmmaArgument
         LLAMINAR_VALIDATE_VERIFIER(NATIVE_QUANTISED_GEMM_IQ1_S);
         LLAMINAR_VALIDATE_VERIFIER(NATIVE_QUANTISED_GEMM_IQ1_M);
         LLAMINAR_VALIDATE_VERIFIER(NATIVE_QUANTISED_GEMM_Q8_0);
-        LLAMINAR_VALIDATE_VERIFIER(NATIVE_QUANTISED_GEMM_EXPANDED_INT8_MIN);
 #undef LLAMINAR_VALIDATE_VERIFIER
         default: throw std::invalid_argument("Unknown native verifier WMMA physical codebook");
         }

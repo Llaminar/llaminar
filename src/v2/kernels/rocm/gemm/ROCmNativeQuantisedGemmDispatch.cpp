@@ -72,7 +72,6 @@ constexpr ROCmNativeQuantisedGemmShardFn shardForCodebook(uint8_t codebook_id)
         return rocmGemm_native_quantised_fp32_shard_6;
     case 17:
     case 19:
-    case llaminar2::kNativeQuantisedExpandedInt8MinCodebook:
         return rocmGemm_native_quantised_fp32_shard_7;
     default:
         return nullptr;
@@ -83,10 +82,7 @@ constexpr ROCmNativeQuantisedGemmShardFn shardForCodebook(uint8_t codebook_id)
 constexpr uint8_t defaultArithmeticPolicyCodebook(uint8_t codebook_id)
 {
     return codebook_id == llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook ||
-                   codebook_id == llaminar2::kNativeQuantisedMXFP4Codebook ? uint8_t{4} :
-           codebook_id == llaminar2::kNativeQuantisedExpandedInt8MinCodebook
-               ? static_cast<uint8_t>(19)
-               : codebook_id;
+                   codebook_id == llaminar2::kNativeQuantisedMXFP4Codebook ? uint8_t{4} : codebook_id;
 }
 
 constexpr std::array<ROCmNativeQuantisedGridInitShardFn, 10> kGridInitializers = {

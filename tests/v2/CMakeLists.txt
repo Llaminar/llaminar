@@ -28668,7 +28668,7 @@ list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ExpertTierCodedSou
 
 add_v2_test(V2_Integration_ExpertTierWeightDensityAdmission
     COMMAND $<TARGET_FILE:v2_test_expert_tier_weight_stream>
-        --gtest_filter=ExpertTierWeightStream.NativeQ5FileDensityRoundTrip:ExpertTierWeightStream.EveryCatalogedSourceFormatHasGpuToCpuContract:ExpertTierWeightStream.CodedDemotionRejectsLegacyPlanesBeforeAllocating:MoEOverlayPreparedWeightSource.AcceptsCanonicalAndCpuNormalizedGpuRepresentationsOnly
+        --gtest_filter=ExpertTierWeightStream.NativeQ5FileDensityRoundTrip:ExpertTierWeightStream.EveryCatalogedSourceFormatHasGpuToCpuContract:ExpertTierWeightStream.CodedDemotionRejectsLegacyPlanesBeforeAllocating:MoEOverlayPreparedWeightSource.AcceptsOnlyCanonicalGpuRepresentations
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MoE;WeightLifecycle;ExpertOverlay;Streaming"
     NO_MODELS)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ExpertTierWeightDensityAdmission)
@@ -32593,6 +32593,22 @@ add_v2_test(V2_Integration_CPUNativeQuantisedSlotReuseAdmission
     TIMEOUT 60 NO_MODELS MPI_PROCS 1)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUNativeQuantisedSlotReuseAdmission)
 
+# CPU file-density preparation drives the same physical decoders in both tier directions.
+add_v2_test(V2_Integration_ExpertTierCanonicalDecoderInventory
+    COMMAND $<TARGET_FILE:v2_test_expert_tier_weight_stream>
+        --gtest_filter=ExpertTierWeightStream.CanonicalPreparationNeverEmitsRetiredPhysicalDecoder
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;NativeQuantised;Movement;Regression"
+    TIMEOUT 60 NO_MODELS MPI_PROCS 1)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ExpertTierCanonicalDecoderInventory)
+
+# Diagnostic GPWT archives cannot publish retired physical storage either.
+add_v2_test(V2_Integration_GpuPackedWeightDecoderAdmission
+    COMMAND $<TARGET_FILE:v2_unit_packed_weights_serialization>
+        --gtest_filter=Test__PackedWeightsSerialization.GpuWireRejectsRetiredPhysicalDecoder
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;NativeQuantised;Serialization;Regression"
+    TIMEOUT 60 NO_MODELS MPI_PROCS 1)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_GpuPackedWeightDecoderAdmission)
+
 # Every physical decoder reachable from a source format, including MXFP4,
 # passes the shared descriptor validator used by MoE publication.
 add_v2_test(V2_Integration_NativeQuantisedDescriptorValidationInventory
@@ -32605,7 +32621,7 @@ list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NativeQuantisedDes
 # IQ4_XS source-tuple mapping, movement, serialization and arithmetic-generation fences.
 add_v2_test(V2_Integration_IQ4XSTupleFormatContract
     COMMAND $<TARGET_FILE:v2_test_native_quantised_format_info>
-        --gtest_filter=Test__NativeQuantisedFormatInfo.IQ4XSSourceTupleMappingAndCapacityAreExact:Test__NativeQuantisedFormatInfo.PackedRegionSizingMatchesCanonicalMetadata:Test__NativeQuantisedFormatInfo.MigrationStableAndReusableFormatsCoverEveryCodebook:Test__NativeQuantisedFormatInfo.RuntimeCaptureEnvelopeCoversEveryTierRepresentation
+        --gtest_filter=Test__NativeQuantisedFormatInfo.IQ4XSSourceTupleMappingAndCapacityAreExact:Test__NativeQuantisedFormatInfo.PackedRegionSizingMatchesCanonicalMetadata:Test__NativeQuantisedFormatInfo.ReusableAllocationMatchesCanonicalFormatForEverySource:Test__NativeQuantisedFormatInfo.RuntimeCaptureEnvelopeCoversEveryTierRepresentation
     LABELS "V2;Integration;DeviceFree;CPU;NativeQuantised;IQ4_XS;Metadata;Regression"
     TIMEOUT 60 NO_MODELS MPI_PROCS 1)
 add_v2_test(V2_Integration_IQ4XSTupleTierAdmission

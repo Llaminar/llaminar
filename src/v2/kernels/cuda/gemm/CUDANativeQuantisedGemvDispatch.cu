@@ -55,7 +55,6 @@ constexpr int shardIndexForCodebook(uint8_t codebook_id)
         return 6;
     case 17:
     case 19:
-    case llaminar2::kNativeQuantisedExpandedInt8MinCodebook:
         return 7;
     default:
         return -1;
@@ -191,9 +190,8 @@ bool cudaNativeQuantisedGemvTuned_queryGeneratedDispatch(
 /**
  * @brief Resolve a complete source arithmetic policy on its owning shard.
  *
- * Physical codebook 19/23 shards call this only when CPU residency changed the
- * execution representation.  Routing policy lookup back to the source shard
- * avoids multiplying generated selector instantiations across decoder shards.
+ * Routing arithmetic lookup to the source shard avoids multiplying generated
+ * selector instantiations for the explicit physical-19 representation.
  */
 bool cudaNativeQuantisedGemvTuned_resolveArithmeticPolicy(
     uint8_t codebook_id,
@@ -336,9 +334,8 @@ bool cudaNativeQuantisedGemvTuned_fp32(
 /**
  * @brief Route a physical CUDA decoder with an independent arithmetic policy.
  *
- * ExpertOverlay CPU residency may normalize compact source bytes into codebook
- * 19 or 23.  The physical codebook selects the decoder shard; the policy
- * codebook selects the source model's generated launch and reduction tree.
+ * The physical codebook selects the decoder shard; the policy codebook selects
+ * the original source format’s generated launch and reduction tree.
  */
 bool cudaNativeQuantisedGemvTuned_fp32_withPolicy(
     const int8_t *d_A_int8,

@@ -7559,10 +7559,6 @@ namespace
         case 20:
             payload_bytes = 32u;
             return true;
-        case llaminar2::kNativeQuantisedExpandedInt8MinCodebook:
-            payload_bytes = 32u;
-            is_asymmetric = 1u;
-            return true;
         default:
             return false;
         }
@@ -13215,7 +13211,6 @@ namespace
         case 16:
         case 17:
         case 19:
-        case llaminar2::kNativeQuantisedExpandedInt8MinCodebook:
             return true;
         default:
             return false;
@@ -13237,7 +13232,6 @@ namespace
         case 14:
         case 16:
         case 17:
-        case llaminar2::kNativeQuantisedExpandedInt8MinCodebook:
             return true;
         default:
             return false;
@@ -19796,10 +19790,6 @@ __global__ void softmax_topk_decode_descriptors_kernel(
             return native_quantised_dot_desc_range<17>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
         case 19:
             return native_quantised_dot_desc_range<19>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
-        case llaminar2::kNativeQuantisedExpandedInt8MinCodebook:
-            return native_quantised_dot_desc_range<
-                llaminar2::kNativeQuantisedExpandedInt8MinCodebook>(
-                desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
         default:
             return 0.0f;
         }
@@ -21599,8 +21589,6 @@ extern "C"
                 QUERY_GROUPED_PREFILL_CODEBOOK(16);
                 QUERY_GROUPED_PREFILL_CODEBOOK(17);
                 QUERY_GROUPED_PREFILL_CODEBOOK(19);
-                QUERY_GROUPED_PREFILL_CODEBOOK(
-                    llaminar2::kNativeQuantisedExpandedInt8MinCodebook);
             case kMixedCodebookSentinel:
                 if (component == 1 || component == 2)
                 {
@@ -24670,7 +24658,6 @@ __attribute__((visibility("default"))) bool cudaMoE_softmax_topk_decode_selected
         case 16: LAUNCH_GROUPED_GATE_UP_KPART(16); break;
         case 17: LAUNCH_GROUPED_GATE_UP_KPART(17); break;
         case 19: LAUNCH_GROUPED_GATE_UP_KPART(19); break;
-        case llaminar2::kNativeQuantisedExpandedInt8MinCodebook: LAUNCH_GROUPED_GATE_UP_KPART(llaminar2::kNativeQuantisedExpandedInt8MinCodebook); break;
         case kMixedCodebookSentinel: LAUNCH_GROUPED_GATE_UP_KPART(kMixedCodebookSentinel); break;
         default:
             std::fprintf(stderr, "[cudaMoE_grouped_gate_up_native_quantised_decode_table_kpart] unsupported codebook_id=%u\n",
@@ -24766,7 +24753,6 @@ __attribute__((visibility("default"))) bool cudaMoE_softmax_topk_decode_selected
         case 16: LAUNCH_GROUPED_GATE_UP_RUNTIME_KPART(16); break;
         case 17: LAUNCH_GROUPED_GATE_UP_RUNTIME_KPART(17); break;
         case 19: LAUNCH_GROUPED_GATE_UP_RUNTIME_KPART(19); break;
-        case llaminar2::kNativeQuantisedExpandedInt8MinCodebook: LAUNCH_GROUPED_GATE_UP_RUNTIME_KPART(llaminar2::kNativeQuantisedExpandedInt8MinCodebook); break;
         case kMixedCodebookSentinel: LAUNCH_GROUPED_GATE_UP_RUNTIME_KPART(kMixedCodebookSentinel); break;
         default:
             std::fprintf(stderr, "[cudaMoE_grouped_gate_up_native_quantised_decode_runtime_kpart] unsupported codebook_id=%u\n",
@@ -24872,7 +24858,6 @@ __attribute__((visibility("default"))) bool cudaMoE_softmax_topk_decode_selected
         case 16: LAUNCH_GROUPED_DOWN_KPART(16); break;
         case 17: LAUNCH_GROUPED_DOWN_KPART(17); break;
         case 19: LAUNCH_GROUPED_DOWN_KPART(19); break;
-        case llaminar2::kNativeQuantisedExpandedInt8MinCodebook: LAUNCH_GROUPED_DOWN_KPART(llaminar2::kNativeQuantisedExpandedInt8MinCodebook); break;
         case kMixedCodebookSentinel: LAUNCH_GROUPED_DOWN_KPART(kMixedCodebookSentinel); break;
         default:
             std::fprintf(stderr, "[cudaMoE_grouped_swiglu_down_native_quantised_decode_table_kpart] unsupported codebook_id=%u\n",
@@ -24982,7 +24967,6 @@ __attribute__((visibility("default"))) bool cudaMoE_softmax_topk_decode_selected
         case 16: LAUNCH_GROUPED_DOWN_RUNTIME_KPART(16); break;
         case 17: LAUNCH_GROUPED_DOWN_RUNTIME_KPART(17); break;
         case 19: LAUNCH_GROUPED_DOWN_RUNTIME_KPART(19); break;
-        case llaminar2::kNativeQuantisedExpandedInt8MinCodebook: LAUNCH_GROUPED_DOWN_RUNTIME_KPART(llaminar2::kNativeQuantisedExpandedInt8MinCodebook); break;
         case kMixedCodebookSentinel: LAUNCH_GROUPED_DOWN_RUNTIME_KPART(kMixedCodebookSentinel); break;
         default:
             std::fprintf(stderr, "[cudaMoE_grouped_swiglu_down_native_quantised_decode_runtime_kpart] unsupported codebook_id=%u\n",
@@ -25361,8 +25345,6 @@ __attribute__((visibility("default"))) bool cudaMoE_softmax_topk_decode_selected
                     LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(16);
                     LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(17);
                     LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(19);
-                    LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(
-                        llaminar2::kNativeQuantisedExpandedInt8MinCodebook);
                     if (!launched_gateup)
                     {
                         std::fprintf(
@@ -25464,8 +25446,6 @@ __attribute__((visibility("default"))) bool cudaMoE_softmax_topk_decode_selected
                 LAUNCH_GROUPED_GATEUP_IF_PRESENT(16);
                 LAUNCH_GROUPED_GATEUP_IF_PRESENT(17);
                 LAUNCH_GROUPED_GATEUP_IF_PRESENT(19);
-                LAUNCH_GROUPED_GATEUP_IF_PRESENT(
-                    llaminar2::kNativeQuantisedExpandedInt8MinCodebook);
                 if (!launched_gateup)
                 {
                     std::fprintf(
@@ -25633,8 +25613,6 @@ __attribute__((visibility("default"))) bool cudaMoE_softmax_topk_decode_selected
                     LAUNCH_GROUPED_DOWN_ORDERED_KPART_IF_PRESENT(16);
                     LAUNCH_GROUPED_DOWN_ORDERED_KPART_IF_PRESENT(17);
                     LAUNCH_GROUPED_DOWN_ORDERED_KPART_IF_PRESENT(19);
-                    LAUNCH_GROUPED_DOWN_ORDERED_KPART_IF_PRESENT(
-                        llaminar2::kNativeQuantisedExpandedInt8MinCodebook);
                 }
                 if (!launched_down)
                 {
@@ -25736,8 +25714,6 @@ __attribute__((visibility("default"))) bool cudaMoE_softmax_topk_decode_selected
             LAUNCH_GROUPED_DOWN_IF_PRESENT(16);
             LAUNCH_GROUPED_DOWN_IF_PRESENT(17);
             LAUNCH_GROUPED_DOWN_IF_PRESENT(19);
-            LAUNCH_GROUPED_DOWN_IF_PRESENT(
-                llaminar2::kNativeQuantisedExpandedInt8MinCodebook);
             if (!launched_down)
             {
                 std::fprintf(stderr,

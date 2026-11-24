@@ -113,12 +113,8 @@ namespace llaminar2
             projection.N = 70;
             projection.K = 96;
             projection.blocks_per_row = 3;
-            // Codebook 23 is a normalized asymmetric representation, not a
-            // source ID. Use Q4_1 provenance; both Q5_1 and Q5_K reject legacy migration.
             projection.source_codebook_id =
-                codebook == kNativeQuantisedExpandedInt8MinCodebook
-                    ? native_quantised_formats::Q4_1.codebook_id
-                    : codebook == kNativeQuantisedIQ4XSSourceScaleCodebook ? uint8_t{4} : codebook;
+                codebook == kNativeQuantisedIQ4XSSourceScaleCodebook ? uint8_t{4} : codebook;
             projection.codebook_id = codebook;
             projection.payload_bytes_per_block = payload_bytes;
             projection.is_asymmetric = asymmetric;
@@ -137,8 +133,7 @@ namespace llaminar2
                 {
                     uint8_t value = static_cast<uint8_t>(
                         (block * 37u + byte * 19u + 11u) & 0xffu);
-                    if (codebook == 19 ||
-                        codebook == kNativeQuantisedExpandedInt8MinCodebook)
+                    if (codebook == 19)
                     {
                         value = static_cast<uint8_t>(static_cast<int8_t>(
                             static_cast<int>((block * 13u + byte * 7u) % 127u) - 63));
@@ -187,7 +182,7 @@ namespace llaminar2
                     return projection;
                 };
                 const auto original = make(format->codebook_id, format->payload_bytes);
-                auto expanded = make(format->is_asymmetric ? kNativeQuantisedExpandedInt8MinCodebook : 19, 32);
+                auto expanded = make(format->is_asymmetric ? 23 : 19, 32);
                 ASSERT_TRUE(original.valid());
                 EXPECT_FALSE(expanded.valid());
                 const auto manifest = makeGpuToCpuExpertTierWeightStreamManifest(*format, original.N, original.K,
@@ -235,6 +230,69 @@ namespace llaminar2
                 ASSERT_EQ(restored.preparedBytes(), cpu.preparedBytes());
                 EXPECT_EQ(std::memcmp(restored.native_interleaved.data(), cpu.native_interleaved.data(), cpu.preparedBytes()), 0);
             }
+        }
+
+        /** @test Real CPU preparation and both stream directions preserve every canonical decoder. */
+        TEST(ExpertTierWeightStream, CanonicalPreparationNeverEmitsRetiredPhysicalDecoder)
+        {
+            using namespace cpu::native_quantised;
+            constexpr uint8_t retired_decoder = 23;
+            unsigned coded = 0, ordinary = 0;
+            for (const auto &entry : native_quantised_formats::kAllSourceFormats)
+            {
+                SCOPED_TRACE(entry.quant_type);
+                const auto &format = *entry.metadata;
+                const auto &fixtures = test::quantizedVerifierFormats();
+                const auto fixture = std::find_if(fixtures.begin(), fixtures.end(), [&](const auto &candidate) {
+                    return candidate.source_codebook_id == format.codebook_id &&
+                        candidate.source_is_superblock == format.is_superblock;
+                });
+                ASSERT_NE(fixture, fixtures.end());
+                const auto source = fixture->create({70, 512}, 314159);
+                ASSERT_NE(source, nullptr);
+                CPUNativeQuantisedPackedWeights cpu;
+                ASSERT_TRUE(packWeightsCPUNativeQuantised(source.get(), cpu));
+                ASSERT_EQ(cpu.encoding, preparedEncodingForSource(format));
+                (migrationUsesSuperblockCodes(format) ? coded : ordinary)++;
+
+                const auto to_gpu = makeCpuToGpuExpertTierWeightStreamManifest(cpu, 3, 0, 0,
+                    ExpertTierWeightProjection::Gate, 3);
+                const auto to_cpu = makeGpuToCpuExpertTierWeightStreamManifest(format, cpu.N, cpu.K,
+                    4, 0, 0, ExpertTierWeightProjection::Gate, 3);
+                HostGpuExpertPackedProjection gpu;
+                std::string error;
+                ASSERT_TRUE(cpuToGpuExpertPackedReference(cpu, gpu, &error)) << error;
+                const auto canonical = canonicalDeviceVnniFormat(format);
+                EXPECT_NE(gpu.codebook_id, retired_decoder);
+                EXPECT_EQ(gpu.codebook_id, canonical.codebook_id);
+                EXPECT_EQ(to_gpu.gpu_codebook_id, canonical.codebook_id);
+                EXPECT_EQ(to_cpu.gpu_codebook_id, canonical.codebook_id);
+                for (const auto &manifest : {to_gpu, to_cpu})
+                {
+                    auto layout = manifest.deviceLayout();
+                    ASSERT_TRUE(layout.valid());
+                    layout.gpu_codebook_id = retired_decoder;
+                    EXPECT_FALSE(layout.valid());
+                }
+            }
+            EXPECT_EQ(coded, 13u);
+            EXPECT_EQ(ordinary, 9u);
+
+            // The old converter admitted this caller-constructed representation.
+            // Reject it before submission in either direction; its CPU geometry
+            // alone is internally consistent, but it is not canonical Q4_1.
+            const auto manifest = makeGpuToCpuExpertTierWeightStreamManifest(
+                native_quantised_formats::Q4_1, 70, 96, 5, 0, 0, ExpertTierWeightProjection::Gate, 3);
+            auto expanded = manifest.deviceLayout();
+            expanded.cpu_encoding = CPUNativeQuantisedEncoding::ExpandedInt8;
+            expanded.cpu_data_stride = preparedDataStride(expanded.cpu_encoding, expanded.cpu_codebook_id);
+            expanded.cpu_block_stride = preparedInterleavedBlockStride(expanded.cpu_encoding, true, expanded.cpu_codebook_id);
+            expanded.gpu_codebook_id = retired_decoder;
+            expanded.gpu_payload_bytes_per_block = 32;
+            ASSERT_TRUE(expanded.cpuStorage().valid());
+            EXPECT_FALSE(expanded.valid());
+            expanded.direction = ExpertTierWeightConversionDirection::CpuToGpu;
+            EXPECT_FALSE(expanded.valid());
         }
 
         /** @return An ordinary source tensor with a ragged final output-column chunk. */
@@ -394,7 +452,7 @@ namespace llaminar2
                 SCOPED_TRACE(source.quant_type);
                 if (cpu::native_quantised::migrationUsesSuperblockCodes(*source.metadata))
                     continue; // The catalog-wide admission test asserts the exact rejection.
-                const auto physical = migrationStableDeviceVnniFormat(*source.metadata);
+                const auto physical = canonicalDeviceVnniFormat(*source.metadata);
                 auto gpu = makeProjection(physical.codebook_id, physical.payload_bytes_per_block,
                     physical.is_asymmetric, source.metadata->is_superblock);
                 gpu.source_codebook_id = source.metadata->codebook_id;
@@ -928,7 +986,7 @@ namespace llaminar2
                 layout.cpu_encoding = cpu::native_quantised::CPUNativeQuantisedEncoding::ExpandedInt8;
                 layout.cpu_data_stride = cpu::native_quantised::preparedDataStride(layout.cpu_encoding, layout.cpu_codebook_id);
                 layout.cpu_block_stride = cpu::native_quantised::preparedInterleavedBlockStride(layout.cpu_encoding, true, layout.cpu_codebook_id);
-                layout.gpu_codebook_id = kNativeQuantisedExpandedInt8MinCodebook;
+                layout.gpu_codebook_id = 23;
                 layout.gpu_payload_bytes_per_block = 32;
                 layout.gpu_has_emins = 0;
                 EXPECT_FALSE(layout.valid());
@@ -1423,7 +1481,7 @@ namespace llaminar2
 
         TEST(
             MoEOverlayPreparedWeightSource,
-            AcceptsCanonicalAndCpuNormalizedGpuRepresentationsOnly)
+            AcceptsOnlyCanonicalGpuRepresentations)
         {
             std::vector<std::uint8_t> payload(64 * 32);
             std::vector<std::uint16_t> scales(64);
@@ -1485,7 +1543,7 @@ namespace llaminar2
             MoEOverlayPreparedWeightSource normalized;
             ASSERT_FALSE(resolveMoEOverlayPreparedWeightSource(
                 std::make_shared<ExportingGpuGemm>(
-                    make_descriptor(kNativeQuantisedExpandedInt8MinCodebook),
+                    make_descriptor(23),
                     q2_source),
                 DeviceId::rocm(0),
                 normalized,

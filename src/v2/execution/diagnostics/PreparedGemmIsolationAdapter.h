@@ -112,16 +112,15 @@ public:
             !weight_.source_identity_present || weight_.n!=p.n || weight_.k!=p.k || p.k%32)
             throw std::invalid_argument("Initial isolation adapter requires exact prepared NativeQuantised metadata");
         std::optional<NativeQuantisedFormatInfo> physical;
-        for(const auto &source:native_quantised_formats::kAllSourceFormats)
-            if(source.metadata->codebook_id==weight_.source_codebook_id &&
-                source.metadata->is_superblock==bool(weight_.source_is_superblock))
-                for(const auto format:{canonicalDeviceVnniFormat(*source.metadata),migrationStableDeviceVnniFormat(*source.metadata)})
-                    if(format.codebook_id==weight_.codebook_id)
-                        // Physical storage view only; original source identity remains in weight_.
-                        physical=NativeQuantisedFormatInfo{.codebook_id=format.codebook_id,
-                            .payload_bytes=format.payload_bytes_per_block,.is_asymmetric=format.is_asymmetric,
-                            .is_superblock=false,.has_emins=format.has_emins,
-                            .max_abs_factor=source.metadata->max_abs_factor};
+        const auto *source = native_quantised_formats::forSourceIdentity(
+            weight_.source_codebook_id, weight_.source_is_superblock != 0);
+        if (source) {
+            const auto format = canonicalDeviceVnniFormat(*source);
+            if (format.codebook_id == weight_.codebook_id)
+                physical = NativeQuantisedFormatInfo{.codebook_id=format.codebook_id,
+                    .payload_bytes=format.payload_bytes_per_block,.is_asymmetric=format.is_asymmetric,
+                    .is_superblock=false,.has_emins=format.has_emins,.max_abs_factor=source->max_abs_factor};
+        }
         if(!physical) throw std::invalid_argument("Initial isolation adapter cannot authenticate prepared format regions");
         auto sizes=nativeQuantisedPackedRegionSizes(std::size_t(p.n),std::size_t(p.k),*physical);
         // Superblock-coded weights: code plane in `scales`, superblock plane in `mins`.

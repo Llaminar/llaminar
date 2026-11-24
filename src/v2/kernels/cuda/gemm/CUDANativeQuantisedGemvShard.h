@@ -5,8 +5,7 @@
  * The generated M=1/grouped policy is data, while physical template ownership
  * is build topology.  This ABI keeps those concerns separate: policy refreshes
  * replace one generated include, and eight fixed source shards continue to own
- * a small fixed codebook group apiece. The final shard additionally owns the
- * execution-only expanded asymmetric INT8 representation. Callers outside the
+ * a small fixed codebook group apiece. Callers outside the
  * dispatcher must use the ordinary public CUDA NativeQuantised entrypoints.
  */
 

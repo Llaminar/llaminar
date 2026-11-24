@@ -1705,15 +1705,19 @@ namespace
         ScopedGPUStream stream_owner(DeviceId::rocm(device_ordinal));
         const auto stream = static_cast<hipStream_t>(stream_owner.get());
         constexpr int m = 33, n = 65;
-        auto variants = trainerVariantsForFormat("Q4_0", DensePrefillWeightFamily::NativeQuantised, device_ordinal);
-        std::erase_if(variants, [](const auto &variant) {
-            return variant.producer != VNNIPrefillProducer::NativeWmma;
-        });
-        for (const uint8_t codebook : {uint8_t{0}, kNativeQuantisedExpandedInt8MinCodebook})
+        for (const auto *format : {&native_quantised_formats::Q4_0, &native_quantised_formats::Q4_1})
         for (const int k : {32, 96, 160, 256})
         for (const int partitions : {1, 3, 5})
         for (const float row_scale : {1.0f, 0x1p-126f})
         {
+            const auto physical = canonicalDeviceVnniFormat(*format);
+            const auto codebook = physical.codebook_id;
+            auto variants = trainerVariantsForFormat(physical.is_asymmetric ? "Q4_1" : "Q4_0",
+                DensePrefillWeightFamily::NativeQuantised, device_ordinal);
+            std::erase_if(variants, [](const auto &variant) {
+                return variant.producer != VNNIPrefillProducer::NativeWmma;
+            });
+            ASSERT_EQ(variants.size(), 4u);
             SCOPED_TRACE(::testing::Message() << "codebook=" << int(codebook) << " K=" << k << " partitions=" << partitions
                 << " row_scale=" << row_scale);
             mutableDebugEnv().rocm.native_quantised_gemv_kb = partitions;
@@ -1722,7 +1726,7 @@ namespace
             // The test intentionally supplies prequantized source bytes so the
             // whole-row scale ABI is exercised without activation requantization.
             auto a = TestTensorFactory::createFP32Zeros({size_t(m * k / 4)});
-            const int payload_bytes = codebook == 0 ? 16 : 32;
+            const int payload_bytes = physical.payload_bytes_per_block;
             auto payload = TestTensorFactory::createFP32({size_t(blocks * n * payload_bytes / 4)});
             auto scales = TestTensorFactory::createFP32Zeros({size_t((blocks * n + 1) / 2)});
             auto minima = TestTensorFactory::createFP32Zeros({size_t((blocks * n + 1) / 2)});
@@ -1734,10 +1738,17 @@ namespace
             std::fill_n(pb, blocks * n * payload_bytes, codebook == 0 ? uint8_t{0x88} : uint8_t{0});
             const std::vector<uint16_t> scale_bits(blocks * n, uint16_t{1}); // exact half 2^-24
             std::memcpy(scales->mutable_data(), scale_bits.data(), scale_bits.size() * sizeof(uint16_t));
+            if (physical.is_asymmetric)
+            {
+                // Native Q4_1: the first activation hits code 1. The nonzero
+                // minimum makes its exact weight 2^-24 - 2^-23 = -2^-24.
+                const std::vector<uint16_t> minimum_bits(blocks * n, uint16_t{0x8002});
+                std::memcpy(minima->mutable_data(), minimum_bits.data(), minimum_bits.size() * sizeof(uint16_t));
+            }
             std::fill_n(rows->mutable_data(), m, row_scale);
             for (int row = 0; row < m; ++row) ab[row * k] = 1;
             for (int column = 0; column < n; ++column)
-                pb[column * payload_bytes] = codebook == 0 ? 0x87 : 0xff;
+                pb[column * payload_bytes] = codebook == 0 ? 0x87 : 0x01;
             for (auto *tensor : {a.get(), payload.get(), scales.get(), minima.get(), rows.get()})
                 ASSERT_TRUE(tensor->ensureOnDevice(DeviceId::rocm(device_ordinal), stream));
             ASSERT_TRUE(output->allocateOnDevice(DeviceId::rocm(device_ordinal), stream));
@@ -1745,10 +1756,10 @@ namespace
             const auto launch = [&](FP32Tensor *destination) {
                 return rocmGemm_native_quantised_fp32_with_policy(
                     static_cast<const int8_t *>(a->gpu_data_ptr()),
-                    static_cast<const uint8_t *>(payload->gpu_data_ptr()), ::llaminar2::rocm_native_metadata::perBlockMetadataPlanes(scales->gpu_data_ptr(), codebook == kNativeQuantisedExpandedInt8MinCodebook ? minima->gpu_data_ptr() : nullptr, nullptr),
+                    static_cast<const uint8_t *>(payload->gpu_data_ptr()), ::llaminar2::rocm_native_metadata::perBlockMetadataPlanes(scales->gpu_data_ptr(), physical.is_asymmetric ? minima->gpu_data_ptr() : nullptr, nullptr),
                     static_cast<float *>(destination->gpu_data_ptr()),
                     static_cast<const float *>(rows->gpu_data_ptr()), nullptr, m, n, k,
-                    codebook, codebook == kNativeQuantisedExpandedInt8MinCodebook ? 5 : 0, device_ordinal, stream);
+                    codebook, codebook, device_ordinal, stream);
             };
             override.apply(VariantConfig{"Auto", -1, -1, -1, -1, -1, std::nullopt});
             ASSERT_TRUE(launch(oracle.get()));

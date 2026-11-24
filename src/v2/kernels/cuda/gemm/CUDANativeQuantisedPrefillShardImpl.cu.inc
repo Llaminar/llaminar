@@ -2125,17 +2125,6 @@ extern "C"
                 cuda_stream, prefill_ctx);
             break;
 
-        case llaminar2::kNativeQuantisedExpandedInt8MinCodebook:
-            if (!d_meta.secondary || !d_sums_A_block)
-                return false;
-            ok = ownedLaunchGenericPrefillBK64<
-                llaminar2::kNativeQuantisedExpandedInt8MinCodebook>(
-                d_A_int8, d_payload, prefillMetadataPlanes<llaminar2::kNativeQuantisedExpandedInt8MinCodebook>(d_meta), d_C_fp32,
-                d_scales_A_block, d_sums_A_block, M, N, K, alpha, beta,
-                d_C_existing, d_bias, serial_m1_k_partitions,
-                serial_m1_uses_ordered_reducer, cuda_stream, prefill_ctx);
-            break;
-
         default:
             return false;
         }
@@ -2199,8 +2188,6 @@ extern "C"
             QUERY_LAST_DENSE_PREFILL_CODEBOOK(16);
             QUERY_LAST_DENSE_PREFILL_CODEBOOK(17);
             QUERY_LAST_DENSE_PREFILL_CODEBOOK(19);
-            QUERY_LAST_DENSE_PREFILL_CODEBOOK(
-                llaminar2::kNativeQuantisedExpandedInt8MinCodebook);
         default:
             return false;
         }
@@ -2274,8 +2261,6 @@ extern "C"
             QUERY_DENSE_PREFILL_CANDIDATE_CODEBOOK(16);
             QUERY_DENSE_PREFILL_CANDIDATE_CODEBOOK(17);
             QUERY_DENSE_PREFILL_CANDIDATE_CODEBOOK(19);
-            QUERY_DENSE_PREFILL_CANDIDATE_CODEBOOK(
-                llaminar2::kNativeQuantisedExpandedInt8MinCodebook);
         default:
             return false;
         }
