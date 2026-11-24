@@ -423,7 +423,8 @@ namespace llaminar2::cpu::native_quantised::x86_panel
         if (!supportsGeometry(format, lanes, rows, weights.N, workers) || partitions <= 0 || output_stride < weights.N ||
             format != formatFor(weights.encoding, weights.codebook_id))
             throw std::invalid_argument("Native x86 prefill received invalid panel geometry");
-        const auto size = workspaceFloats(format, lanes, rows, weights.N, weights.blocks_per_row, partitions, workers);
+        // This invocation's own width; the admitted borrow covers every width up to the participant's.
+        const auto size = invocationFloats(format, lanes, rows, weights.N, weights.blocks_per_row, partitions, workers);
         if (scratch.size() < size)
             throw std::invalid_argument("Native x86 prefill requires its admitted per-worker panel storage");
         const storage_proof::Bytes writes{scratch.data(), size * sizeof(float)};

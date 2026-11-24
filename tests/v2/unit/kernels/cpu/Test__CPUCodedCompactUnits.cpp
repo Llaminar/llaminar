@@ -31,7 +31,8 @@
  * - on x86, the decode-once packed prefill panel is selected exactly for
  *   buckets with at least 16 live rows, reproduces independent serial rows
  *   at team widths 1-4 (including backend-native K partitions with carry),
- *   and each worker writes only its own slab slot.
+ *   each worker writes only its own slab slot, and a team narrower than the
+ *   admitted width never needs more than the admitted borrow.
  */
 #include <gtest/gtest.h>
 
@@ -907,24 +908,31 @@ namespace llaminar2::test
          * @param workers OpenMP team width; the serial reference uses the same width.
          * @param replay Bucket geometry and live cells.
          * @param require_k_partitions Whether the serial tree must fold several K partitions.
+         * @param admitted_workers Participant width the slab is admitted for; at least @p workers.
          *
          * Every cell is compared bitwise with independent serial M=1 rows at the
          * same width (the backend-native K tree depends on it); unauthored rows
          * and the N padding stay dirty. A bucket with at least 16 live rows must
-         * select the packed panel; a sparser bucket keeps the ordinary route even
-         * though its storage was admitted for the panel. On the panel route each
-         * worker writes only its own slot: its first panel, live carry rows and
-         * nothing past the slot's panel/carry extent or the whole panel quote.
+         * select the packed panel when every worker owns an N strip; a sparser
+         * bucket keeps the ordinary route even though its storage was admitted
+         * for the panel. The scratch is exactly the borrow admitted at
+         * @p admitted_workers, so a narrower team proves the admitted quote covers
+         * it. On the panel route each worker writes only its own slot: its first
+         * panel, live carry rows and nothing past the slot's panel/carry extent
+         * or the whole invocation demand.
          */
         void replayPackedPrefill(const TensorBase &source, CPUProjectionNumericalPolicy policy, int workers,
-            const PanelReplay &replay, bool require_k_partitions)
+            const PanelReplay &replay, bool require_k_partitions, int admitted_workers = 0)
         {
+            admitted_workers = admitted_workers ? admitted_workers : workers;
             constexpr float dirty = -12345.5f;
             constexpr auto dirty_bits = std::bit_cast<std::uint32_t>(dirty);
             const auto clean = [](float value) { return std::bit_cast<std::uint32_t>(value) == dirty_bits; };
             const int n = replay.n, k = replay.k, blocks = k / 32, stride = n + 5;
             const int rows = replay.requests * replay.rows_per_request;
-            SCOPED_TRACE("workers=" + std::to_string(workers) + " policy=" + std::to_string(int(policy)));
+            SCOPED_TRACE("workers=" + std::to_string(workers) + " admitted=" + std::to_string(admitted_workers) +
+                " policy=" + std::to_string(int(policy)));
+            ASSERT_GE(admitted_workers, workers);
             ScopedPanelTeam team(workers);
             ASSERT_EQ(nativeQuantisedInvocationWorkerCount(), workers);
 
@@ -948,11 +956,22 @@ namespace llaminar2::test
             const bool carry = partitions > 1 && (blocks + partitions - 1) / partitions > 8;
             const std::size_t carry_floats = carry ? std::size_t(rows) * lanes : 0;
             const std::size_t pitch = (panel_floats + carry_floats + 15) / 16 * 16;
-            const auto quoted = x86_panel::workspaceFloats(format, lanes, rows, n, blocks, config.k_tiles, workers);
-            ASSERT_EQ(quoted, pitch * workers);
-            const auto borrow = nativeQuantisedProjectionPartialFloats(packed, rows);
-            ASSERT_GE(borrow, quoted);
-            ASSERT_GE(nativeQuantisedProjectionPartialEnvelopeFloats(packed, rows), quoted);
+            // The panel needs one N strip per worker of this exact team.
+            const bool eligible = (n + lanes - 1) / lanes >= workers;
+            const auto quoted = x86_panel::invocationFloats(format, lanes, rows, n, blocks, config.k_tiles, workers);
+            ASSERT_EQ(quoted, eligible ? pitch * workers : 0u);
+            ASSERT_GE(nativeQuantisedProjectionPartialFloats(packed, rows), quoted);
+            std::size_t borrow = 0, envelope = 0;
+            {
+                // Admission happens once, at the participant's width.
+                ScopedPanelTeam admitted(admitted_workers);
+                ASSERT_EQ(nativeQuantisedInvocationWorkerCount(), admitted_workers);
+                borrow = nativeQuantisedProjectionPartialFloats(packed, rows);
+                envelope = nativeQuantisedProjectionPartialEnvelopeFloats(packed, rows);
+            }
+            ASSERT_EQ(nativeQuantisedInvocationWorkerCount(), workers);
+            ASSERT_GE(borrow, quoted) << "the admitted quote under-borrows a narrower team";
+            ASSERT_GE(envelope, quoted);
             constexpr std::size_t guard = 64;
             std::vector<float> scratch(borrow + guard, dirty);
 
@@ -974,8 +993,9 @@ namespace llaminar2::test
                     serial.data() + std::size_t(row) * stride, serial_scratch);
 
             // The exact panel prefix, including carry, is validated before any write.
-            EXPECT_THROW(gemm_native_quantised_preq(packed, input.data(), actual.data(),
-                std::span<float>(scratch).first(quoted - 1), rows, stride), std::invalid_argument);
+            if (eligible)
+                EXPECT_THROW(gemm_native_quantised_preq(packed, input.data(), actual.data(),
+                    std::span<float>(scratch).first(quoted - 1), rows, stride), std::invalid_argument);
             ASSERT_TRUE(std::all_of(actual.begin(), actual.end(), clean));
 
             for (const auto &lengths : replay.live)
@@ -1018,7 +1038,7 @@ namespace llaminar2::test
                 }
                 ASSERT_EQ(launch.count, 1u);
                 EXPECT_EQ(launch.threads, std::to_string(workers));
-                const bool panel = live >= x86_panel::min_rows;
+                const bool panel = eligible && live >= x86_panel::min_rows;
                 ASSERT_EQ(launch.route == "packed_panel", panel) << "route=" << launch.route;
                 if (!panel)
                 {
@@ -1082,6 +1102,20 @@ namespace llaminar2::test
                     for (int workers = 1; workers <= 4; ++workers)
                         replayPackedPrefill(*source, policy, workers, replay, false);
             }
+        }
+        // A participant admitted for four workers where N=17 has fewer strips
+        // (two AVX-512, three AVX2): four workers cannot select the panel, but
+        // narrower teams do and borrow from the four-worker admission. A quote
+        // of the admitted width alone was zero, so backend-native teams of one
+        // to three workers under-borrowed here.
+        const PanelReplay narrower{.n = 17, .k = 1120, .requests = 1, .rows_per_request = 17,
+            .live = {{17}, {3}}};
+        for (const auto &[name, source] : panelSources(narrower.n, narrower.k))
+        {
+            SCOPED_TRACE(name + " narrower than admitted");
+            for (const auto policy : {CPUProjectionNumericalPolicy::BackendNative, CPUProjectionNumericalPolicy::GPUAlignedExpert})
+                for (int workers = 1; workers <= 4; ++workers)
+                    replayPackedPrefill(*source, policy, workers, narrower, false, 4);
         }
         // The backend-native tree splits K only for at least 16M FLOPs with fewer
         // N tasks than workers. One 64-column chunk with 4104 K blocks gives 2..32

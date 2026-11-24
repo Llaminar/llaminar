@@ -148,7 +148,9 @@ TEST(Test__WorkspaceMemoryEstimator, CPUProjectionPanelUsesParticipantAndPhysica
     geometry.workers = 2;
     geometry.serial_n = 128; // Strip eligibility is based on physical N, not the serial policy's width.
     geometry.n = 16;
-    expectPartials("Q4_K", 0);
+    // One AVX-512 strip: the admitted two-worker team cannot select the panel,
+    // but a one-worker team can, so the quote still covers one slot.
+    expectPartials("Q4_K", 8 * (8 + 2) * 16);
     geometry.n = 17; // A masked tail is the second AVX-512 worker's strip.
     expectPartials("Q4_K", 2 * 8 * (8 + 2) * 16);
     geometry.n = 16;
@@ -168,10 +170,42 @@ TEST(Test__WorkspaceMemoryEstimator, CPUProjectionPanelUsesParticipantAndPhysica
 
     // 144 blocks over 16 partitions gives nine per partition and requires
     // one carry vector per row, after the eight-block panel in each slot.
-    EXPECT_EQ(panel::workspaceFloats(panel::Format::Q4K, 8, rows, 16, 144, 16, 2),
+    const auto sixteen = [](int) { return 16; };
+    EXPECT_EQ(panel::workspaceFloats(panel::Format::Q4K, 8, rows, 16, 144, 2, sixteen),
         2u * (8 * (8 + 2) * 8 + 32 * 8)); // 31 carry rows rounded to a cache line.
-    EXPECT_EQ(panel::workspaceFloats(panel::Format::Q4K, 16, rows, 17, 144, 16, 2),
+    EXPECT_EQ(panel::workspaceFloats(panel::Format::Q4K, 16, rows, 17, 144, 2, sixteen),
         2u * (8 * (8 + 2) * 16 + rows * 16));
+}
+
+/** @test The panel quote covers every team narrower than the admitted width and never shrinks with it. */
+TEST(Test__WorkspaceMemoryEstimator, CPUProjectionPanelQuoteCoversNarrowerTeams)
+{
+    namespace panel = cpu::native_quantised::x86_panel;
+    // Unpartitioned K: 8 K blocks x (8 dot + 2 factor) vectors x 8 AVX2 lanes per slot.
+    constexpr std::size_t slot = 8 * (8 + 2) * 8;
+    const auto contiguous = [](int) { return 0; };
+    // N=40 has five AVX2 strips. Admitted teams wider than five cannot select
+    // the panel, yet any narrower team can; the quote stays at five slots.
+    for (int workers = 1; workers <= 64; ++workers)
+    {
+        SCOPED_TRACE(workers);
+        EXPECT_EQ(panel::invocationFloats(panel::Format::Q4K, 8, 31, 40, 144, 0, workers),
+            workers <= 5 ? workers * slot : 0u);
+        EXPECT_EQ(panel::workspaceFloats(panel::Format::Q4K, 8, 31, 40, 144, workers, contiguous),
+            std::min(workers, 5) * slot);
+    }
+    // The carry depends on the width through the serial tree: here one worker
+    // folds two long partitions (one carry vector per each of 100 rows), two
+    // workers keep one contiguous partition. The admitted two-worker quote
+    // must cover the single-worker team, which a one-width quote missed.
+    const auto carry_only_alone = [](int width) { return width == 1 ? 2 : 0; };
+    EXPECT_EQ(panel::invocationFloats(panel::Format::Q4K, 8, 100, 16, 144, 0, 2), 2 * slot);
+    EXPECT_EQ(panel::invocationFloats(panel::Format::Q4K, 8, 100, 16, 144, 2, 1), slot + 100 * 8);
+    EXPECT_EQ(panel::workspaceFloats(panel::Format::Q4K, 8, 100, 16, 144, 2, carry_only_alone), slot + 100 * 8);
+    // Ineligible rows or formats quote nothing at any width.
+    EXPECT_EQ(panel::workspaceFloats(panel::Format::Q4K, 8, 15, 40, 144, 4, contiguous), 0u);
+    EXPECT_EQ(panel::workspaceFloats(panel::Format::None, 8, 31, 40, 144, 4, contiguous), 0u);
+    EXPECT_THROW(panel::workspaceFloats(panel::Format::Q4K, 8, 31, 40, 144, 0, contiguous), std::invalid_argument);
 }
 
 /** @test CPU admission prices one shared transform and the production projection envelope across layers. */

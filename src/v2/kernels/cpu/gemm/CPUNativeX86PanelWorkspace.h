@@ -6,12 +6,19 @@
  * existing projection bank. Only the original coded weight publication is
  * persistent. Sharing the slab with an invocation's ordered-partial bank is
  * safe because the two projection routes are mutually exclusive.
+ *
+ * One invocation's demand (invocationFloats) is not monotone in team width:
+ * the panel needs one N strip per worker, so a team wider than the strip count
+ * cannot select it while a narrower team can. The admitted quote
+ * (workspaceFloats) is therefore the maximum demand over every width from one
+ * to the admitted worker count; planning and the runtime borrow both call it.
  */
 #pragma once
 
 #include "CPUNativeQuantisedPreparedFootprint.h"
 
 #include <algorithm>
+#include <concepts>
 #include <limits>
 #include <stdexcept>
 
@@ -100,8 +107,20 @@ namespace llaminar2::cpu::native_quantised::x86_panel
             columns > 0 && workers > 0 && columnStrips(columns, lanes) >= workers;
     }
 
-    /** @return Checked shared slab extent for every worker; zero if Auto cannot select the panel. */
-    inline std::size_t workspaceFloats(Format format, int lanes, int rows, int columns, int blocks,
+    /**
+     * @brief Exact slab one invocation borrows at its own team width.
+     * @param format Admitted panel format.
+     * @param lanes Physical SIMD columns per worker.
+     * @param rows Physical invocation rows.
+     * @param columns Physical output columns.
+     * @param blocks Original logical K-block count.
+     * @param partitions Serial K partition count selected at this team width.
+     * @param workers Exact team width of the invocation.
+     * @return One slot per worker; zero if Auto cannot select the panel at this width.
+     * @throws std::invalid_argument For non-positive geometry.
+     * @throws std::overflow_error For unaddressable storage.
+     */
+    inline std::size_t invocationFloats(Format format, int lanes, int rows, int columns, int blocks,
         int partitions, int workers)
     {
         if ((lanes != 8 && lanes != 16) || columns <= 0 || blocks <= 0 || partitions < 0 || workers <= 0)
@@ -112,5 +131,47 @@ namespace llaminar2::cpu::native_quantised::x86_panel
         if (static_cast<std::size_t>(workers) > std::numeric_limits<std::size_t>::max() / sizeof(float) / slot)
             throw std::overflow_error("Native x86 prefill panel exceeds admitted worker storage");
         return slot * static_cast<std::size_t>(workers);
+    }
+
+    /**
+     * @brief Admitted slab quote covering every team width that can execute the panel.
+     * @tparam PartitionsAt Callable mapping a team width to its serial K partition count.
+     * @param format Admitted panel format.
+     * @param lanes Physical SIMD columns per worker.
+     * @param rows Physical invocation rows.
+     * @param columns Physical output columns.
+     * @param blocks Original logical K-block count.
+     * @param workers Admitted worker count of the participant.
+     * @param partitions_at The production serial tile policy evaluated at one width.
+     * @return max over w in [1, workers] of invocationFloats(..., partitions_at(w), w).
+     * @throws std::invalid_argument For non-positive geometry.
+     * @throws std::overflow_error For unaddressable storage.
+     *
+     * Non-decreasing in @p workers, so a team narrower than the admitted width
+     * (a serialized retained team, or a runtime team below the participant's
+     * admission) never borrows more than was admitted. Only widths with one N
+     * strip per worker can select the panel; the carry, and so the slot,
+     * depends on the width through the serial partition count. Two partitions
+     * give the largest slot of any count, which bounds the remaining widths.
+     */
+    template <class PartitionsAt>
+        requires std::invocable<PartitionsAt &, int>
+    std::size_t workspaceFloats(Format format, int lanes, int rows, int columns, int blocks, int workers,
+        PartitionsAt &&partitions_at)
+    {
+        if ((lanes != 8 && lanes != 16) || columns <= 0 || blocks <= 0 || workers <= 0)
+            throw std::invalid_argument("Native x86 prefill panel requires positive admitted geometry");
+        if (!supportsGeometry(format, lanes, rows, columns, 1))
+            return 0;
+        const auto largest_slot = workerFloats(format, lanes, rows, blocks, 2);
+        std::size_t quote = 0;
+        for (int width = std::min(workers, columnStrips(columns, lanes)); width >= 1; --width)
+        {
+            if (quote / static_cast<std::size_t>(width) >= largest_slot)
+                break; // No narrower team can exceed the quote.
+            quote = std::max(quote, invocationFloats(format, lanes, rows, columns, blocks,
+                static_cast<int>(partitions_at(width)), width));
+        }
+        return quote;
     }
 } // namespace llaminar2::cpu::native_quantised::x86_panel

@@ -692,6 +692,22 @@ namespace llaminar2::cpu::native_quantised
 
 
     /**
+     * @brief Admitted x86 packed-panel quote of one prepared matrix.
+     * @param packed Immutable prepared matrix and its arithmetic policy.
+     * @param rows Physical invocation rows.
+     * @param policy_n Logical serial output width that selects the K tree.
+     * @param workers Admitted (or current) worker count.
+     * @return The x86_panel::workspaceFloats quote, evaluating the serial K tree at every narrower width.
+     */
+    inline size_t nativeQuantisedPackedPanelFloats(
+        const CPUNativeQuantisedPackedWeights &packed, int rows, int policy_n, int workers)
+    {
+        return x86_panel::workspaceFloats(x86_panel::formatFor(packed.encoding, packed.codebook_id),
+            activeISALevel() >= ISALevel::AVX512 ? 16 : 8, rows, packed.N, packed.blocks_per_row, workers,
+            [&](int width) { return serialTileConfigForPackedMatrix(packed, policy_n, packed.K, width).k_tiles; });
+    }
+
+    /**
      * @brief Exact ordinary projection slab for the current participant geometry.
      * @param packed Immutable prepared matrix and its arithmetic policy.
      * @param rows Maximum simultaneously live rows.
@@ -702,11 +718,10 @@ namespace llaminar2::cpu::native_quantised
         const CPUNativeQuantisedPackedWeights &packed, int rows)
     {
         const int workers = nativeQuantisedInvocationWorkerCount();
-        const auto config = serialTileConfigForPackedMatrix(
-            packed, cpuNativeQuantisedSerialEquivalentPolicyN(packed.N), packed.K, workers);
-        const auto panel = x86_panel::workspaceFloats(x86_panel::formatFor(packed.encoding, packed.codebook_id),
-            activeISALevel() >= ISALevel::AVX512 ? 16 : 8, rows, packed.N, packed.blocks_per_row, config.k_tiles, workers);
-        return std::max(cpuProjectionPartialFloats(rows, packed.N, config.k_tiles), panel);
+        const int policy_n = cpuNativeQuantisedSerialEquivalentPolicyN(packed.N);
+        const auto config = serialTileConfigForPackedMatrix(packed, policy_n, packed.K, workers);
+        return std::max(cpuProjectionPartialFloats(rows, packed.N, config.k_tiles),
+            nativeQuantisedPackedPanelFloats(packed, rows, policy_n, workers));
     }
 
     /** @return This prepared member's contribution to the admitted serial/fused slab. */
@@ -714,13 +729,11 @@ namespace llaminar2::cpu::native_quantised
         const CPUNativeQuantisedPackedWeights &packed, int rows)
     {
         const int workers = nativeQuantisedInvocationWorkerCount();
-        const auto config = serialTileConfigForPackedMatrix(
-            packed, cpuNativeQuantisedSerialEquivalentPolicyN(packed.N), packed.K, workers);
+        const int policy_n = cpuNativeQuantisedSerialEquivalentPolicyN(packed.N);
+        const auto config = serialTileConfigForPackedMatrix(packed, policy_n, packed.K, workers);
         const bool wide = activeISALevel() >= ISALevel::AVX512;
         const auto ordinary = cpuProjectionPartialEnvelopeFloats(rows, packed.N, config.k_tiles, workers, wide ? 4 : 2);
-        const auto panel = x86_panel::workspaceFloats(x86_panel::formatFor(packed.encoding, packed.codebook_id),
-            wide ? 16 : 8, rows, packed.N, packed.blocks_per_row, config.k_tiles, workers);
-        return std::max(ordinary, panel);
+        return std::max(ordinary, nativeQuantisedPackedPanelFloats(packed, rows, policy_n, workers));
     }
 
     /** Return the requested N-chunk count for one explicit decode policy. */

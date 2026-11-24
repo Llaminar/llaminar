@@ -66,16 +66,21 @@ namespace llaminar2
             requirements.buffers.insert(requirements.buffers.end(), panel.buffers.begin(), panel.buffers.end());
             return requirements;
         }
-        const auto config = cpu::native_quantised::serialTileConfigForPreparedProjection(footprint,
-            codebook, geometry.numerical_policy, geometry.serial_n > 0 ? geometry.serial_n : geometry.n,
-            geometry.k, geometry.workers, geometry.execution.cache);
+        const auto configAt = [&](int workers) {
+            return cpu::native_quantised::serialTileConfigForPreparedProjection(footprint, codebook,
+                geometry.numerical_policy, geometry.serial_n > 0 ? geometry.serial_n : geometry.n,
+                geometry.k, workers, geometry.execution.cache);
+        };
+        const auto config = configAt(geometry.workers);
         auto requirements = cpuProjectionQ8WorkspaceRequirements(geometry.rows, geometry.k);
         // Use the participant's x86 ABI, not the planning host's build. An ARM
-        // participant returned above. Use physical N for strip ownership, not serial_n.
+        // participant returned above. Use physical N for strip ownership, not
+        // serial_n, and cover every team width up to the admitted workers.
         namespace panel = cpu::native_quantised::x86_panel;
         const auto packed_panel = panel::workspaceFloats(panel::formatFor(footprint.encoding, codebook),
             geometry.execution.active_isa == ISALevel::AVX512 ? 16 : 8,
-            geometry.rows, geometry.n, (geometry.k + 31) / 32, config.k_tiles, geometry.workers);
+            geometry.rows, geometry.n, (geometry.k + 31) / 32, geometry.workers,
+            [&](int workers) { return configAt(workers).k_tiles; });
         const auto ordinary = cpuProjectionPartialEnvelopeFloats(geometry.rows, geometry.n, config.k_tiles,
             geometry.workers, static_cast<int>(geometry.execution.maximum_native_row_tile));
         const auto partials = cpuProjectionPartialWorkspaceRequirements(std::max(ordinary, packed_panel));

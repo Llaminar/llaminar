@@ -7,7 +7,7 @@
  * fails before any transform write. A missing partial bank fails exactly the
  * invocations whose own row count needs it (an ordered K tree, or a prefill
  * panel at or above 16 rows), with cells on both sides of that threshold.
- * Workspaces are admitted for the exact team width of each worker sweep cell.
+ * The retained-team sweep borrows from one admission at its widest team.
  * This is a model-free preflight regression, not a replacement for captured
  * model parity or a performance certificate.
  */
@@ -225,7 +225,9 @@ void proveWorkspace(ITensorGemm &kernel, int n, int k)
  * bank (x86 only: native ARM rows own full-K register trees). At and above
  * it, a format with a decode-once prefill panel also borrows it: on native
  * ARM Q5_0, Q5_K and IQ3_S (Q5_0 quotes one slot for any team); on x86
- * Q4_K, Q5_K, IQ3_S, IQ4_XS and Q5_0 when every worker owns an N strip.
+ * Q4_K, Q5_K, IQ3_S, IQ4_XS and Q5_0. The x86 quote covers every team up to
+ * the admitted width, and a one-worker team always owns an N strip, so it
+ * does not depend on the strip count.
  */
 bool partialBankRequired(TensorType source, CPUProjectionNumericalPolicy policy, int n, int k, int rows, int workers)
 {
@@ -237,11 +239,11 @@ bool partialBankRequired(TensorType source, CPUProjectionNumericalPolicy policy,
 #else
     // 2*n*k stays below the 16M-FLOP backend-native K split (checked by the
     // caller); the GPU-aligned expert tree folds min(K/32, 16) partitions.
+    (void)n, (void)workers;
     const bool ordered = policy == CPUProjectionNumericalPolicy::GPUAlignedExpert && k / 32 > 1;
-    const int lanes = activeISALevel() >= ISALevel::AVX512 ? 16 : 8;
     const bool panel_format = source == TensorType::Q4_K || source == TensorType::Q5_K ||
         source == TensorType::IQ3_S || source == TensorType::IQ4_XS || source == TensorType::Q5_0;
-    return ordered || (panel_rows && panel_format && (n + lanes - 1) / lanes >= workers);
+    return ordered || (panel_rows && panel_format);
 #endif
 }
 
@@ -302,14 +304,15 @@ void proveOutputAccumulation(cpu::native_quantised::CPUNativeQuantisedGemmKernel
         }
     }
 
+    // One admission at the widest swept team: every narrower team borrows
+    // from it, as a serialized or narrower team would in production.
+    omp_set_num_threads(8);
+    requirements = kernel.getWorkspaceRequirements(max_rows, n, k);
+    kernel.appendOutputAccumulationWorkspaceRequirements(requirements, max_rows, n);
+    CPUProjectionTestWorkspace workspace(max_rows, k, requirements);
     for (int workers = 1; workers <= 8; ++workers)
     {
-        // Admit for the exact team width, as a participant does: an x86 panel
-        // needs one N strip per worker, so its quote is not monotone in width.
         omp_set_num_threads(workers);
-        requirements = kernel.getWorkspaceRequirements(max_rows, n, k);
-        kernel.appendOutputAccumulationWorkspaceRequirements(requirements, max_rows, n);
-        CPUProjectionTestWorkspace workspace(max_rows, k, requirements);
         for (const int rows : {1, 2, 3, 15, 16, max_rows})
         for (const float beta : {0.f, .25f})
         {
