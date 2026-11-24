@@ -445,7 +445,7 @@ an isolated GPU prefill measurement. This is not the canonical benchmark.
 | Cell | Weights observed (bytes) | Working storage | Movement | Prefill / decode (tok/s) | IDs |
 |---|---|---|---|---:|---|
 | A: CUDA only | 102,989,464,892 B PMA weight admission (99.990% of shard length); 101,354,585,856 B attested in the prepared pool | 734,455,124 B CUDA activation arena incl. state; 1,274,450,200 B allocated CUDA workspace; 0 generic KV payload | Not applicable | 15,306.43 / 12.68 | 768; identical to A at 1M |
-| B: dynamic CUDA+CPU | No model materialized | Rejected at `overlay-candidate.fixed-bom` | No request or transfer ran | — | No stream |
+| B: dynamic CUDA+CPU | Dry-run after the UMA fix: 23,903,338,496 B CPU and 71,714,242,560 B CUDA live expert bytes | Passes PMA; live startup rejects adoption of the initial coded GPU slots | No request or transfer ran | — | No stream |
 | C: static CUDA+CPU | 79,090,331,452 B CUDA admission; 77,451,247,360 B attested in the CUDA prepared pools. CPU live weights: **23,903,338,496 B** planned and materialized, exactly **1.000x** source bytes | Same 734,455,124 B primary CUDA activation arena; 1.274 GB CUDA workspace; 39,321,600 B CPU kernel workspace and 317,214,848 B CPU expert arena; 0 generic KV payload | Host ledger empty; 0 windows, transactions, commands and bytes | 30.70 / 5.31 | **Differs from A at index 5** |
 
 `generation_tokens.compare_tokens` reports the first differing completion ID
@@ -460,8 +460,22 @@ molecules scatter blue light more than red because blue has a shorter
 wavelength.” C begins “**Why the Sky is Blue**” and then “Sunlight contains
 all colors, but air molecules scatter blue light more than red because blue
 travels in shorter, wavier waves.” Full text and token IDs are in the
-retained responses. The drift is a failed equality check, not an explanation
-of its cause.
+retained responses. CPU routed projections are prepared as `GPUAlignedExpert`,
+not `BackendNative`. The numerical contract makes the same expert program
+byte-identical for matched projection inputs and source weights across CPU,
+CUDA and ROCm (`V2_Integration_CUDA_MoEOverlayCPUArithmeticAllFormats`). It
+does not establish whole-model equality between different execution graph
+families. The drift remains a failed equality check, not an explanation of
+its cause. The exact old #71 (`5b3404439`) cap-192 control was rejected before
+inference: 123,846,400,836 B demanded versus 115,389,833,216 B in the shared
+pool. With a matched cap of 128, old #71 passed dry-run but failed in
+`buildComputeGraph`: live CPU expert allocation 2,686,976 B exceeded its
+remaining 1,376,256 B owner budget. New #71 at cap 128 returned the eight-token
+probe, but old #71 never produced a comparable stream. The pre/post-
+representation question therefore remains unmeasured. A separate smaller
+Qwen3.6-35B-A3B UD-IQ3_S control on the source-pinned develop ARM64 image
+`63b053401` could not compare tokens either: develop rejects GB10's
+`GPU NUMA=-1` before execution, including in the GPU-only control.
 
 A's 32K retirement repeat on .80 reproduced all IDs and exited zero via
 HTTP shutdown. PerfStats shows two full-graph `main_decode` materializations
@@ -499,15 +513,28 @@ observations, not passing end-to-end gates.
   resembling a fluffy creature like a llama, alpaca, or sheep. It is designed
   with a ‘cyborg’ or robotic theme, featuring a dark visor instead of normal
   eyes.” Its driver window had one new NVIDIA warning.
-- B on .79 (1M) and .80 (32K) rejected CUDA:0 with “Physical memory
-  contributors disagree on allocator observation.” The dynamic stream/event
-  BOMs construct a Dedicated allocator observation where the fixed GB10 BOM
-  carries RankHostPool backing. This is an admission contract failure even
-  at 32K, not a measured memory deficit. Per-move wire size and dynamic
-  token equality remain unmeasured.
+- Dynamic B originally rejected at `overlay-candidate.fixed-bom` on old and
+  merged #71. The PMA builder correctly rejected a `Dedicated` quote for
+  CUDA streams/events against the main graph's `RankHostPool` observation.
+  The same omission exists in develop `63b053401`. `165569ef0` makes every
+  auxiliary consumer reuse the sealed allocator observation (caps and full
+  joint backing unchanged). `V2_Integration_MoEOverlayHostDemandAdmission`
+  reproduces the original rejection model-free and passes after the fix.
+  The fixed 32K run on .80 passes dry-run admission, but the live host
+  physical fabric rejects its first IQ3_XXS down projection: the coded
+  header sets `allocation_has_mins=1` while initial-slot adoption tests
+  the legacy reusable descriptor's `has_mins=0`. Per-move wire size and
+  dynamic token equality remain unmeasured.
 - C on .79 (1M) was killed by the host OOM killer while preparing the
   retained prefill family and had new NVIDIA page-table allocation warnings.
-  It did not reach `ServerReady` at that context.
+  It did not reach `ServerReady` at that context. Kernel log on .79:
+  `NVRM: failed to allocate page table!` and the Linux OOM kill at 10:32:43
+  local time. On .80, the A 1M driver findings are
+  `Out of memory [NV_ERR_NO_MEMORY] (0x00000051) returned from _memdescAllocInternal(pMemDesc) @ mem_desc.c:1359`;
+  46 of 48 occurred at 10:31:23–25 during GPU graph setup, with the other
+  two at 10:30:27 and 10:30:43 during weight setup/load. The same warning
+  appeared singly in the A-image, A-32K and C-32K windows; temporal
+  correlation does not identify the specific failing allocation.
 
 ### Reproduction and scope
 
