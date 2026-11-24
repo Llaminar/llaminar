@@ -102,6 +102,13 @@ if(LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
         COMMAND $<TARGET_FILE:v2_test_cpu_native_neon_prepared_projection>
             --gtest_filter=*TailPaddingContract
         LABELS V2 Integration ProductionTestPreflight CPU NEON NativeQuantised Metadata ByteExact Regression)
+    # Native quantized NEON entries admit the calling thread's FPCR profile
+    # (RNE, FZ/FZ16/AHP clear) and fail fatally under any other: the staged
+    # coded factors and the FP32 contribution program round under it.
+    v2_add_core_free_test(V2_Integration_CPUNativeNEONFloatingPointProfile
+        COMMAND $<TARGET_FILE:v2_test_cpu_native_neon_prepared_projection>
+            --gtest_filter=CPUNativeNEONFloatingPointProfile.*
+        LABELS V2 Integration ProductionTestPreflight CPU NEON NativeQuantised Numerics Regression)
     v2_add_core_free_test(V2_Integration_CPUNativeSourceCoefficientMetadata_NEON
         COMMAND $<TARGET_FILE:v2_test_cpu_native_neon_prepared_projection>
             --gtest_filter=CPUNativeNEONPreparedProjection.RejectsReservedSourceCoefficientBitsBeforeAnyWrite

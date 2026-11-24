@@ -9,8 +9,10 @@
  *
  * - the SIMD code/word readers equal the scalar plane readers for every
  *   code width and every aligned column vector;
- * - the NEON binary16 Q4_K reader (FP16-arithmetic envelopes) equals the
- *   codec's staged words for every 12-bit code and the same d/dmin sweep;
+ * - the NEON Q4_K staging (generic reconstruct<5> and, in FP16-arithmetic
+ *   envelopes, the fused binary16 reader) equals the codec's staged words bit
+ *   for bit, NaN sign and payload included, for every binary16 d/dmin and
+ *   every six-bit code;
  * - the SIMD factor reconstruction equals widening the codec's staged word
  *   (decodeSuperblockMetadata, itself proven against the per-block packer by
  *   V2_Unit_VnniCodedPacking) for every code and a broad d/dmin sweep,
@@ -274,47 +276,122 @@ namespace llaminar2::test
             }
     }
 
-#if defined(__aarch64__) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
-    /**
-     * The NEON binary16 Q4_K reader (one half multiply per block for scale and
-     * minimum) equals widening the codec's staged words for every 12-bit code
-     * read from real code planes, every column lane and a broad d/dmin sweep.
-     */
-    TEST(CPUCodedCompactUnits, NeonHalfQ4KReconstructionEqualsCodecWordsExhaustively)
+#if defined(__aarch64__) && defined(__ARM_NEON)
+    namespace
     {
-        const auto halves = halfSweep();
-        std::vector<std::uint8_t> planes(coded_metadata::codeBlockBytes(5), 0);
-        std::vector<std::uint8_t> header(coded_metadata::headerBytes(5), 0);
-        for (std::size_t h = 0; h < halves.size(); ++h)
+        constexpr std::size_t kQ4KSweepLanes = std::size_t(65536) * 64 * 2;
+
+        /** @brief Every binary16 word in 64-column headers, each column with every six-bit code. */
+        struct Q4KStagingSweep
         {
-            const std::uint16_t d = halves[h];
-            for (int column = 0; column < 64; ++column)
-                coded_metadata::storeSuperblockWord(header.data(), 5, column,
-                    sb::packSuperblockWord(d, halves[(h * 7 + column * 13) % halves.size()]));
-            for (std::uint32_t first = 0; first < 4096; first += 64)
-            {
-                std::fill(planes.begin(), planes.end(), 0);
+            std::vector<std::uint8_t> headers; ///< 1024 headers: column c of header h holds d = dmin = 64h + c.
+            std::vector<std::uint8_t> planes;  ///< 64 code blocks: block c holds code c | c << 6 in every column.
+        };
+
+        Q4KStagingSweep q4KStagingSweep()
+        {
+            Q4KStagingSweep sweep;
+            const std::size_t header_bytes = coded_metadata::headerBytes(5), plane_bytes = coded_metadata::codeBlockBytes(5);
+            sweep.headers.assign(1024 * header_bytes, 0);
+            sweep.planes.assign(64 * plane_bytes, 0);
+            for (std::uint32_t h = 0; h < 65536; ++h)
+                coded_metadata::storeSuperblockWord(sweep.headers.data() + (h / 64) * header_bytes, 5, int(h % 64),
+                    sb::packSuperblockWord(static_cast<std::uint16_t>(h), static_cast<std::uint16_t>(h)));
+            for (std::uint32_t c = 0; c < 64; ++c)
                 for (int column = 0; column < 64; ++column)
-                    coded_metadata::storeCode(planes.data(), 5, column, (first + column * 37) % 4096);
-                for (int column = 0; column < 64; column += 4)
-                {
-                    float32x4_t scale, minimum;
-                    coded_metadata::neon_half::q4KFactors(planes.data(), column,
-                        coded_metadata::neon_half::q4KHalfBase(header.data(), column), scale, minimum);
+                    coded_metadata::storeCode(sweep.planes.data() + c * plane_bytes, 5, column, c | (c << 6));
+            return sweep;
+        }
+
+        /**
+         * @return The codec's staged words, widened exactly (raw bits), for every
+         *         (binary16, code) pair: four consecutive halves per eight lanes,
+         *         scale lanes then minimum lanes, codes innermost.
+         */
+        std::vector<std::uint32_t> q4KCodecBits()
+        {
+            std::vector<std::uint32_t> bits(kQ4KSweepLanes);
+            std::size_t out = 0;
+            for (std::uint32_t h = 0; h < 65536; h += 4)
+                for (std::uint32_t c = 0; c < 64; ++c, out += 8)
                     for (int lane = 0; lane < 4; ++lane)
                     {
-                        const std::uint32_t code = (first + (column + lane) * 37) % 4096;
-                        const auto word = coded_metadata::loadSuperblockWord(header.data(), 5, column + lane);
-                        const auto staged = sb::decodeSuperblockMetadata<5>(code, word);
-                        ASSERT_PRED2(sameFactor, laneBits(scale, lane), widenedBits(staged.primary))
-                            << "code=" << code << " word=" << word;
-                        ASSERT_PRED2(sameFactor, laneBits(minimum, lane), widenedBits(staged.secondary))
-                            << "code=" << code << " word=" << word;
+                        const auto half = static_cast<std::uint16_t>(h + lane);
+                        const auto staged = sb::decodeSuperblockMetadata<5>(c | (c << 6), sb::packSuperblockWord(half, half));
+                        bits[out + lane] = widenedBits(staged.primary);
+                        bits[out + 4 + lane] = widenedBits(staged.secondary);
                     }
+            return bits;
+        }
+
+        /** @brief Assert raw bit equality and name the first differing lane. */
+        void expectSameBits(const std::vector<std::uint32_t> &actual, const std::vector<std::uint32_t> &expected,
+            const char *reader)
+        {
+            ASSERT_EQ(actual.size(), expected.size());
+            for (std::size_t i = 0; i < expected.size(); ++i)
+                ASSERT_EQ(actual[i], expected[i]) << reader << ": half 0x" << std::hex << (i / 512) * 4 + i % 4
+                    << " code " << std::dec << (i / 8) % 64 << (i % 8 < 4 ? " scale" : " minimum");
+        }
+    } // namespace
+
+    /**
+     * The generic NEON reconstruct<5> (Q5_K, and Q4_K outside FP16-arithmetic
+     * envelopes) equals widening the codec's staged words bit for bit, NaN sign
+     * and payload included, for every binary16 d/dmin and every six-bit code.
+     */
+    TEST(CPUCodedCompactUnits, NeonQ4KReconstructionEqualsCodecBitsExhaustively)
+    {
+        std::vector<std::uint32_t> actual(kQ4KSweepLanes);
+        std::size_t out = 0;
+        for (std::uint32_t h = 0; h < 65536; h += 4)
+            for (std::uint32_t c = 0; c < 64; ++c, out += 8)
+            {
+                I word{}, code{};
+                for (int lane = 0; lane < 4; ++lane)
+                {
+                    const auto half = static_cast<std::uint16_t>(h + lane);
+                    word[lane] = static_cast<int>(sb::packSuperblockWord(half, half));
+                    code[lane] = static_cast<int>(c | (c << 6));
+                }
+                const auto factors = coded_metadata::reconstruct<5, Ops>(code, word);
+                std::memcpy(actual.data() + out, &factors.primary, sizeof(factors.primary));
+                std::memcpy(actual.data() + out + 4, &factors.secondary, sizeof(factors.secondary));
+            }
+        expectSameBits(actual, q4KCodecBits(), "reconstruct<5>");
+    }
+
+#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+    /**
+     * The fused binary16 Q4_K reader (one half multiply per block for scale and
+     * minimum, integer sign flip and -0 select) equals widening the codec's
+     * staged words bit for bit, NaN sign and payload included, for every
+     * binary16 d/dmin, every six-bit code and every column lane of real code
+     * planes and headers. Runs under the admitted FPCR profile; the projection
+     * entries reject any other (CPUNativeNEONPreparedProjection tests).
+     */
+    TEST(CPUCodedCompactUnits, NeonHalfQ4KReconstructionEqualsCodecBitsExhaustively)
+    {
+        const auto sweep = q4KStagingSweep();
+        const std::size_t header_bytes = coded_metadata::headerBytes(5), plane_bytes = coded_metadata::codeBlockBytes(5);
+        std::vector<std::uint32_t> actual(kQ4KSweepLanes);
+        for (std::size_t header = 0; header < 1024; ++header)
+            for (int column = 0; column < 64; column += 4)
+            {
+                const auto base = coded_metadata::neon_half::q4KHalfBase(sweep.headers.data() + header * header_bytes, column);
+                // Lane order of q4KCodecBits(): first half = 64 * header + column.
+                std::size_t out = (header * 16 + std::size_t(column) / 4) * 64 * 8;
+                for (std::size_t c = 0; c < 64; ++c, out += 8)
+                {
+                    float32x4_t scale, minimum;
+                    coded_metadata::neon_half::q4KFactors(sweep.planes.data() + c * plane_bytes, column, base, scale, minimum);
+                    vst1q_u32(actual.data() + out, vreinterpretq_u32_f32(scale));
+                    vst1q_u32(actual.data() + out + 4, vreinterpretq_u32_f32(minimum));
                 }
             }
-        }
+        expectSameBits(actual, q4KCodecBits(), "neon_half::q4KFactors");
     }
+#endif
 #endif
 
     /** Compact matrices retain the exact file density of each original format. */

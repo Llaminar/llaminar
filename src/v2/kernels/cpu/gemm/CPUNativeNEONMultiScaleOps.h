@@ -299,6 +299,20 @@ namespace llaminar2::cpu::native_quantised::multi_scale
             return std::bit_cast<F>(vcvt_f32_f16(vreinterpret_f16_u16(half)));
         }
 
+        /** @return stagedProduct() of `-value`, with the sign flipped as an integer after rounding.
+         * @param value Exact `dmin * code` product.
+         * @details Matches the AArch64 codec's negated product `-(dmin * c)`
+         * (FNMUL) bit for bit, including the sign of a default NaN, and flips
+         * before the -0 -> +0 canonicalization. Rounding is sign-symmetric
+         * under the admitted round-to-nearest-even profile.
+         */
+        static F stagedNegatedProduct(F value) noexcept
+        {
+            auto half = veor_u16(vreinterpret_u16_f16(vcvt_f16_f32(std::bit_cast<float32x4_t>(value))), vdup_n_u16(0x8000));
+            half = vbic_u16(half, vceq_u16(half, vdup_n_u16(0x8000)));
+            return std::bit_cast<F>(vcvt_f32_f16(vreinterpret_f16_u16(half)));
+        }
+
     private:
         /** @brief Preserve the portable half contract while using native finite conversion.
          * @param half Four raw binary16 words.

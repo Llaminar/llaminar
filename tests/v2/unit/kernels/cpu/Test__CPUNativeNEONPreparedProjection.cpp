@@ -6,11 +6,13 @@
  * including the shared compact program, not row replay. Four-column ASIMD and
  * explicitly targeted DotProd implementations
  * share payload decode across up to four rows; the I8MM family consumes those
- * rows in SMMLA pairs and must reproduce the SDOT bytes and operand grouping. Logical N tails must neither
+ * rows in SMMLA pairs and must reproduce the SDOT bytes and operand grouping. Every entry
+ * admits the calling thread's FPCR profile and fails fatally under any other one. Logical N tails must neither
  * load nor publish outside the supplied output extent. Full factory/model and
  * worker-scaling certification remains a separate production integration gate.
  */
 #include "kernels/cpu/gemm/CPUNativeNEONPreparedProjection.h"
+#include "kernels/cpu/gemm/CPUNativeNEONProjectionBatch.h"
 #include "utils/ARMCPUFeatures.h"
 #include "utils/CPUExplicitRoundingOracle.h"
 #include "utils/NativeQuantisedPreparedByteFixture.h"
@@ -21,6 +23,7 @@
 #include <bit>
 #include <cstdint>
 #include <cmath>
+#include <initializer_list>
 #include <cstring>
 #include <span>
 #include <vector>
@@ -1013,6 +1016,123 @@ TEST(CPUNativeNEONMultiScaleOps, DotProdDotLaneEqualsBroadcastDot)
     verifyDotLanes<ms::NEONMultiScaleOps<ms::NEONByteDot::DotProd>>();
 }
 #endif
+
+namespace
+{
+/** @brief Test-only FPCR access; production code never writes FPCR. */
+std::uint64_t readFpcr() { return cpu::ARMFloatingPointProfile::current(); }
+void writeFpcr(std::uint64_t value) { asm volatile("msr fpcr, %0" :: "r"(value) : "memory"); }
+
+/** @brief Run @p body with only the rounding/flush/half-format FPCR controls replaced, then restore. */
+template <typename Body> void underFpcrProfile(std::uint64_t profile, Body &&body)
+{
+    using P = cpu::ARMFloatingPointProfile;
+    const auto saved = readFpcr();
+    writeFpcr((saved & ~(P::kRModeMask | P::kFZ | P::kFZ16 | P::kAHP)) | profile);
+    body();
+    writeFpcr(saved);
+}
+
+constexpr std::uint64_t kRModeMinusInfinity = 2ull << 22;
+
+/** @brief One coded Q4_K publication and an M = 2 workload bound to the tile and batch entries. */
+struct Q4KEntryWorkload
+{
+    NativeQuantisedPreparedByteFixture fixture{native_quantised_formats::Q4_K, 67, 288};
+    std::vector<Q8_1Block> activation = activationRows(9, 2);
+    std::vector<float> output = std::vector<float>(2 * 67);
+
+    Q4KEntryWorkload() { fixture.seedPayloadAndMetadata(); }
+
+    /** @brief Execute through the public tile entry (both rows of chunk 0). */
+    void tile()
+    {
+        const auto view = fixture.view();
+        std::array<std::span<const Q8_1Block>, 2> input{std::span<const Q8_1Block>(activation).first(9),
+                                                        std::span<const Q8_1Block>(activation).subspan(9, 9)};
+        std::array<std::span<float>, 2> out{std::span<float>(output).first(64), std::span<float>(output).subspan(67, 64)};
+        CPUNativeNEONProjectionTile<2>::bind(view, input, out, 0).execute();
+    }
+
+    /**
+     * @brief Execute every task of the batch entry on this thread.
+     * @details runTask() is the unit each worker of execute()'s workshare
+     * runs, and it admits that worker's FPCR. Driving it directly keeps this
+     * core-free test independent of an OpenMP runtime.
+     */
+    void batch()
+    {
+        const auto view = fixture.view();
+        const auto bound = CPUNativeNEONProjectionBatch::bind(view, activation, output, 2, 67, NEONProjectionRowTile::Pair);
+        for (std::int64_t task = 0; task < bound.taskCount(); ++task)
+            bound.runTask(task);
+    }
+};
+} // namespace
+
+/** @test The shared profile predicate admits exactly RNE with FZ, FZ16 and AHP clear. */
+TEST(CPUNativeNEONFloatingPointProfile, AdmitsOnlyTheContractProfile)
+{
+    using P = cpu::ARMFloatingPointProfile;
+    EXPECT_TRUE(P::admitted(0));
+    EXPECT_TRUE(P::admitted(1ull << 25)); // FPCR.DN: NaN encodings only, outside the admitted controls.
+    for (const std::uint64_t foreign : std::initializer_list<std::uint64_t>{1ull << 22, 2ull << 22, 3ull << 22, P::kFZ, P::kFZ16, P::kAHP})
+        EXPECT_FALSE(P::admitted(foreign)) << std::hex << foreign;
+    EXPECT_TRUE(P::admitted(readFpcr())) << "the test process must start in the contract profile";
+}
+
+/**
+ * @test The ambient-FPCR hazard the admission guards against is real on this
+ * machine: binary16 products flush a live subnormal scale under FZ16, and the
+ * hardware narrowing rounds toward the FPCR mode (the reader's -0
+ * canonicalization alone could not fix either).
+ */
+TEST(CPUNativeNEONFloatingPointProfile, ForeignProfilesChangeNativeArithmetic)
+{
+    volatile float third = -1.0f / 3.0f; // 0xB555 to nearest, 0xB556 toward -inf.
+    volatile std::uint16_t narrowed_nearest = 0, narrowed_down = 0;
+    underFpcrProfile(0, [&] { narrowed_nearest = vget_lane_u16(vreinterpret_u16_f16(vcvt_f16_f32(vdupq_n_f32(third))), 0); });
+    underFpcrProfile(kRModeMinusInfinity,
+        [&] { narrowed_down = vget_lane_u16(vreinterpret_u16_f16(vcvt_f16_f32(vdupq_n_f32(third))), 0); });
+    EXPECT_EQ(narrowed_nearest, 0xB555);
+    EXPECT_EQ(narrowed_down, 0xB556);
+#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+    volatile std::uint16_t tiny = 0x0001, two = 0x4000, product_default = 0, product_flushed = 0;
+    const auto multiply = [&] {
+        return vget_lane_u16(vreinterpret_u16_f16(vmul_f16(vreinterpret_f16_u16(vdup_n_u16(tiny)),
+                                                           vreinterpret_f16_u16(vdup_n_u16(two)))), 0);
+    };
+    underFpcrProfile(0, [&] { product_default = multiply(); });
+    underFpcrProfile(cpu::ARMFloatingPointProfile::kFZ16, [&] { product_flushed = multiply(); });
+    EXPECT_EQ(product_default, 0x0002);
+    EXPECT_EQ(product_flushed, 0x0000);
+#endif
+}
+
+/**
+ * @test The coded Q4_K projection runs only under the contract profile: its
+ * tile and batch entries fail fatally, with the profile diagnostic, under
+ * FPCR.RMode = toward -inf and under FPCR.FZ16 = 1, and execute normally (and
+ * byte-identically) after the caller's profile is restored.
+ */
+TEST(CPUNativeNEONFloatingPointProfile, Q4KEntriesRejectForeignFpcrProfiles)
+{
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    Q4KEntryWorkload workload;
+    workload.batch();
+    const auto reference = workload.output;
+    for (const std::uint64_t foreign : std::initializer_list<std::uint64_t>{kRModeMinusInfinity, cpu::ARMFloatingPointProfile::kFZ16})
+    {
+        SCOPED_TRACE(::testing::Message() << "FPCR controls 0x" << std::hex << foreign);
+        EXPECT_DEATH(underFpcrProfile(foreign, [&] { workload.tile(); }),
+            "Native NEON quantized projection requires the process FP profile");
+        EXPECT_DEATH(underFpcrProfile(foreign, [&] { workload.batch(); }),
+            "Native NEON quantized projection batch requires the process FP profile");
+    }
+    std::fill(workload.output.begin(), workload.output.end(), -1.0f);
+    workload.batch();
+    EXPECT_EQ(std::memcmp(workload.output.data(), reference.data(), reference.size() * sizeof(float)), 0);
+}
 
 #if defined(__ARM_FEATURE_MATMUL_INT8)
 /** @test The I8MM family's single-row lane leaf equals its broadcast SDOT leaf. */

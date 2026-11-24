@@ -179,7 +179,7 @@ addp v,v,v|adds x,x,imm|adrp x,reloc|adrp x,sym|and v,v,v|and w,w,imm|and x,x,im
 bic v,v,v|bic w,w,w,shift|bics w,w,w|bif v,v,v|bit v,v,v|bfi w,w,imm,imm|bfi x,x,imm,imm|bfxil x,x,imm,imm|bl sym|bsl v,v,v
 cbnz w,sym|cbnz x,sym|cbz w,sym|cbz x,sym|ccmp w,w,imm,cond|cmeq v,v,imm|cmeq v,v,v|cmhi v,v,v|cmn w,imm|cmtst v,v,v
 cmp w,imm|cmp w,w|cmp w,w,shift|cmp x,imm|cmp x,w,shift|cmp x,x|csel w,w,w,cond|csel x,x,x,cond|csneg w,w,w,cond|cset x,cond|dup d,v[]
-dup v,v[]|dup v,w|dup v,x|eor x,x,x|ext v,v,v,imm|fadd v,v,v|fcsel s,s,s,cond|fcvtl v,v|fcvtn v,v|fmla v,v,v|fmov d,d|fmov d,x|fmov s,s
+dup v,v[]|dup v,w|dup v,x|eor v,v,v|eor x,x,x|ext v,v,v,imm|fadd v,v,v|fcsel s,s,s,cond|fcvtl v,v|fcvtn v,v|fmla v,v,v|fmov d,d|fmov d,x|fmov s,s
 fmov s,w|fmov w,s|fmov x,d|fmul s,s,s|fmul v,v,v|fmul v,v,v[]|fneg v,v|ins v[],v[]|ins v[],x|ld1 list,mem
 ld1 list,mem,imm|ld1 list[],mem|ld1 list[],mem,imm|ld1r list,mem|ld1r list,mem,imm|ld2 list,mem|ld2 list[],mem
 ld2r list,mem|ldp d,d,mem|ldp d,d,mem,imm|ldp q,q,mem|ldp q,q,mem,imm|ldp s,s,mem|ldp w,w,mem|ldp x,x,mem

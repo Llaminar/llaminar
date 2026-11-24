@@ -34,7 +34,10 @@
  * Q4_K reader (neon_half::q4KFactors): the binary16 product of the source
  * half and the integer code is that same single RNE rounding, so the scale and
  * minimum of four columns cost one table gather, one half multiply and two
- * widenings per block instead of the generic binary32 program.
+ * widenings per block instead of the generic binary32 program. Like every
+ * native NEON projection program it is exact under the admitted per-thread
+ * FPCR profile (cpu::ARMFloatingPointProfile), which the projection entries
+ * require; signed-zero canonicalization is an integer select, never an add.
  */
 #pragma once
 
@@ -344,11 +347,19 @@ namespace llaminar2::cpu::native_quantised::coded_metadata
         // Code = 6-bit scale | 6-bit min << 6. Keep both old binary16
         // rounding points and signed-zero normalization of the source codec.
         const auto primary = base.d * L::toFloat(code & 63);
-        const auto minimum = -base.dmin * L::toFloat((code >> 6) & 63);
-        if constexpr (requires { Ops::stagedProduct(primary); })
-            return {.primary = Ops::stagedProduct(primary), .secondary = Ops::stagedProduct(minimum)};
+        if constexpr (requires { Ops::stagedNegatedProduct(primary); })
+        {
+            // AArch64: the codec evaluates `-dmin * c` as one negated product
+            // (FNMUL); staging `dmin * c` with an integer sign flip reproduces
+            // it bit for bit, including the sign of an inf * 0 default NaN.
+            return {.primary = Ops::stagedProduct(primary),
+                    .secondary = Ops::stagedNegatedProduct(base.dmin * L::toFloat((code >> 6) & 63))};
+        }
         else
+        {
+            const auto minimum = -base.dmin * L::toFloat((code >> 6) & 63);
             return {.primary = L::staged(primary), .secondary = L::staged(minimum)};
+        }
     }
 
     /**
@@ -474,14 +485,13 @@ namespace llaminar2::cpu::native_quantised::coded_metadata::neon_half
     /**
      * @brief Q4_K superblock factors of four columns as one binary16 vector.
      * @details Lanes 0-3 hold the four columns' source `d`, lanes 4-7 their
-     * negated `dmin` (sign bit flipped, exactly the binary32 negation
-     * `-dmin` of reconstruct<5>() narrowed back). One vector serves every
-     * block of the superblock, so the per-block work is a single binary16
-     * multiply for the scale and the minimum together.
+     * source `dmin`. One vector serves every block of the superblock, so the
+     * per-block work is a single binary16 multiply for the scale and the
+     * minimum together; q4KFactors() negates the minimum product.
      */
     struct Q4KHalfBase
     {
-        float16x8_t factors; ///< {d0..d3, -dmin0..-dmin3}.
+        float16x8_t factors; ///< {d0..d3, dmin0..dmin3}.
     };
 
     /**
@@ -494,8 +504,7 @@ namespace llaminar2::cpu::native_quantised::coded_metadata::neon_half
     {
         // De-interleave {d, dmin} pairs: val[0] = d, val[1] = dmin.
         const auto words = vld2_u16(reinterpret_cast<const std::uint16_t *>(header + 4 * column));
-        const auto negated = veor_u16(words.val[1], vdup_n_u16(0x8000));
-        return {vreinterpretq_f16_u16(vcombine_u16(words.val[0], negated))};
+        return {vreinterpretq_f16_u16(vcombine_u16(words.val[0], words.val[1]))};
     }
 
     /**
@@ -506,15 +515,20 @@ namespace llaminar2::cpu::native_quantised::coded_metadata::neon_half
      * @param scale Receives the widened staged scale words.
      * @param minimum Receives the widened staged (negative) minimum words.
      *
-     * @details Bit-identical to reconstruct<5>(): the codec forms the exact
+     * @details Bit-identical (raw bits, NaN sign and payload included) to
+     * widening the codec's staged words under the admitted FPCR profile
+     * (round-to-nearest-even, FZ16 = 0, AHP = 0; required by every projection
+     * entry through cpu::ARMFloatingPointProfile): the codec forms the exact
      * binary32 product `d * c` (an 11-bit significand times a 6-bit integer
      * is exact in binary32) and rounds it once to binary16 with
      * round-to-nearest-even. A binary16 multiply returns that same correctly
-     * rounded product, including overflow to infinity, subnormal results
-     * (FPCR.FZ16 is clear) and NaN propagation (a signalling `d` is quieted
-     * with its payload, as the binary32 widening quiets it). Adding +0 then
-     * performs the publication's -0 -> +0 canonicalization and leaves every
-     * other value, including quiet NaNs, unchanged. The 12-bit code is
+     * rounded product, including overflow to infinity, subnormal results and
+     * NaN propagation (a signalling `d` is quieted with its payload, as the
+     * binary32 product quiets it). The AArch64 codec evaluates `-dmin * c` as
+     * one negated product (FNMUL), so the minimum lanes' sign bit is flipped
+     * after the multiply as an integer (also the sign of an inf * 0 default
+     * NaN). The publication's -0 -> +0 canonicalization is an integer select
+     * on the half bits, independent of the rounding mode. The 12-bit code is
      * gathered with one two-register table lookup: lanes 0-3 take the low
      * code byte (scale bits 0-5), lanes 4-7 the low byte below the column's
      * high nibble so one shift by six yields minimum bits 0-5.
@@ -533,10 +547,11 @@ namespace llaminar2::cpu::native_quantised::coded_metadata::neon_half
         const auto words = vreinterpretq_u16_u8(vqtbl2q_u8(table, gather));
         const int16x8_t shift{0, 0, 0, 0, -6, -6, -6, -6};
         const auto code = vandq_u16(vshlq_u16(words, shift), vdupq_n_u16(63));
-        const auto product = vmulq_f16(vcvtq_f16_u16(code), base.factors);
-        const auto staged = vaddq_f16(product, vdupq_n_f16(0.0f));
-        scale = vcvt_f32_f16(vget_low_f16(staged));
-        minimum = vcvt_high_f32_f16(staged);
+        const uint16x8_t minimum_sign{0, 0, 0, 0, 0x8000, 0x8000, 0x8000, 0x8000};
+        auto staged = veorq_u16(vreinterpretq_u16_f16(vmulq_f16(vcvtq_f16_u16(code), base.factors)), minimum_sign);
+        staged = vbicq_u16(staged, vceqq_u16(staged, vdupq_n_u16(0x8000)));
+        scale = vcvt_f32_f16(vget_low_f16(vreinterpretq_f16_u16(staged)));
+        minimum = vcvt_high_f32_f16(vreinterpretq_f16_u16(staged));
     }
 } // namespace llaminar2::cpu::native_quantised::coded_metadata::neon_half
 #endif

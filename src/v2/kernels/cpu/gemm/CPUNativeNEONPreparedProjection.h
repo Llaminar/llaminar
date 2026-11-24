@@ -149,9 +149,13 @@ namespace llaminar2::cpu::native_quantised
          * @throws std::runtime_error If the machine lacks the requested family.
          * @details Selection occurs once per tile, never inside a byte-dot loop.
          * bind() admitted the publication, so the arithmetic itself cannot fail.
+         * The calling thread's FPCR must be the admitted profile
+         * (cpu::ARMFloatingPointProfile); any other profile is fatal, because
+         * the staged factors and the FP32 contribution program round under it.
          */
         template <Dot Instruction = Dot::ASIMD> void execute() const
         {
+            ARMFloatingPointProfile::require("Native NEON quantized projection");
             if constexpr (Instruction == Dot::DotProd || Instruction == Dot::I8MM)
                 ARMCPUCapabilities::native().require(ARMCPUFeature::DotProd);
             if constexpr (Instruction == Dot::I8MM)
@@ -170,8 +174,10 @@ namespace llaminar2::cpu::native_quantised
          */
         template <typename Ops, int Strips = 0> void executeWith() const
         {
-            // Every entry, including an observer seam, admits the full envelope.
+            // Every entry, including an observer seam, admits the full envelope
+            // and the calling thread's floating-point profile.
             ARMCPUCapabilities::native().requireCompiledEnvelope();
+            ARMFloatingPointProfile::require("Native NEON quantized projection");
             executeWithAdmitted<Ops, Strips>();
         }
 

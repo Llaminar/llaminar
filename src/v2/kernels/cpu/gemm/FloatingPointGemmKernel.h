@@ -68,10 +68,14 @@ inline constexpr bool fmlalLeafCompiledInEnvelope() noexcept
 #include <memory>
 #include <unordered_map>
 #include <type_traits>
+#if defined(__aarch64__)
+// Owns the shared FPCR profile admission (ARMFloatingPointProfile) used below
+// in every AArch64 envelope, not only the FMLAL one.
+#include "utils/ARMCPUFeatures.h"
+#endif
 #if defined(__aarch64__) && defined(__ARM_FEATURE_FP16_FML)
 #include <arm_neon.h>
 #include <atomic>
-#include "utils/ARMCPUFeatures.h"
 #endif
 #include "../../FloatingActivationOperandPrecision.h"
 /**
@@ -117,11 +121,9 @@ inline constexpr unsigned long long fmlalLeafInvocations() noexcept { return 0; 
 #if defined(__aarch64__)
 inline bool fmlalFpcrProfileAdmitted(std::uint64_t fpcr) noexcept
 {
-    constexpr std::uint64_t kRModeMask = 0x3ull << 22;
-    constexpr std::uint64_t kFZ = 0x1ull << 24;
-    constexpr std::uint64_t kFZ16 = 0x1ull << 19;
-    constexpr std::uint64_t kAHP = 0x1ull << 26;
-    return (fpcr & (kRModeMask | kFZ | kFZ16 | kAHP)) == 0;
+    // The one shared AArch64 profile authority (also admitted by the native
+    // quantized NEON projection entries).
+    return llaminar2::cpu::ARMFloatingPointProfile::admitted(fpcr);
 }
 #else
 inline constexpr bool fmlalFpcrProfileAdmitted(std::uint64_t) noexcept { return true; }
@@ -1443,8 +1445,7 @@ namespace llaminar2
             // contract only under the process profile this leaf admits, so a
             // worker running with any other profile fails fatally here rather
             // than silently changing bytes. No global FPCR writes anywhere.
-            std::uint64_t fpcr;
-            asm volatile("mrs %0, fpcr" : "=r"(fpcr));
+            const std::uint64_t fpcr = llaminar2::cpu::ARMFloatingPointProfile::current();
             if (!fmlalFpcrProfileAdmitted(fpcr))
             {
                 LOG_ERROR("FloatingPointGemmKernel - FMLAL leaf requires the "
