@@ -3,8 +3,8 @@
  * @brief Persistent packed-expert relay through retained GPU progress epochs.
  *
  * CUDA and ROCm consume the same separated NativeQuantised expert layout, so a
- * GPU edge must preserve the packed bytes instead of decoding and repacking
- * them. Cross-runtime edges cannot portably share events or allocations, while
+ * GPU edge must preserve the packed bytes without reconstructing scale factors.
+ * Coded edges assemble the same live-unit wire on either backend. Cross-runtime edges cannot portably share events or allocations, while
  * a same-runtime edge without driver-reported peer access must not rely on a
  * runtime's implicit `MemcpyPeerAsync` fallback. Both cases use this bounded,
  * double-buffered host relay. One retained source epoch writes into
@@ -445,10 +445,7 @@ namespace llaminar2
         /** @brief Fixture-only equivalent endpoints exercise the identical retained no-peer relay. */
         ExpertTierGpuBlobTransferLane(Config config, bool fixture_same_gpu_device);
 
-        /** @brief Authenticate backend and original plane geometry through the single relay cursor. */
-        bool bindNativeProtocol(ExpertTierGpuBlobChunkProtocol &protocol, const GpuExpertPackedDescriptor &source,
-            const GpuExpertPackedDescriptor &destination, const ExpertTierWeightProjectionIntersection &intersection,
-            std::string *error) const noexcept;
+
 
         /** @brief State of one reusable double-buffer slot. */
         enum class SlotPhase : std::uint8_t

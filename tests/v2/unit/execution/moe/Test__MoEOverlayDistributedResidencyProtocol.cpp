@@ -14,6 +14,7 @@
 #include "execution/moe/MoEOverlayRemoteProjectionProtocol.h"
 #include "execution/moe/MoEOverlayWireIO.h"
 #include "planning/PhysicalMemoryAuthority.h"
+#include "../../../utils/CodedGpuRelayWireFixture.h"
 
 #include <gtest/gtest.h>
 
@@ -532,11 +533,57 @@ namespace llaminar2::test
             ++malformed.total_bytes;
             malformed.manifest_hash = malformed.computedHash();
             EXPECT_FALSE(malformed.valid());
-            auto foreign = identity;
-            foreign.destination_device = origin.is_cuda() ? DeviceId::rocm(0) : DeviceId::cuda(0);
-            EXPECT_THROW((void)makeMoEOverlayRemoteGpuProjectionManifest(foreign, descriptor, provenance, capacity, overlap), std::invalid_argument);
             EXPECT_THROW((void)makeMoEOverlayRemoteGpuProjectionManifest(identity, descriptor, provenance, 46, overlap), std::invalid_argument);
         }
+    }
+
+    /** @test Mixed CUDA/ROCm endpoint identities must not change the coded payload wire. */
+    TEST(Test__MoEOverlayDistributedResidencyProtocol, CodedCrossBackendRelayUsesTheSameWireForAllFormats)
+    {
+        using Fixture = CodedGpuRelayWireFixture;
+        using Direction = ExpertTierWeightConversionDirection;
+        auto transaction = makeTransaction();
+        const auto overlap = ExpertTierWeightProjectionIntersection::between(Fixture::source_root, Fixture::destination_root);
+        unsigned covered = 0u;
+        for (const auto &entry : native_quantised_formats::kAllSourceFormats)
+        {
+            const auto &format = *entry.metadata;
+            if (!cpu::native_quantised::migrationUsesSuperblockCodes(format))
+                continue;
+            ++covered;
+            SCOPED_TRACE(entry.quant_type);
+            Fixture source(format, Fixture::source_root, 3u, 11u);
+            Fixture destination(format, Fixture::destination_root, 5u, 27u);
+            const auto src = source.descriptor();
+            const auto dst = destination.descriptor();
+            const NativeQuantisedSourceIdentity provenance{.codebook_id = format.codebook_id,
+                .is_superblock = format.is_superblock, .present = true};
+            ExpertTierGpuBlobChunkProtocol local(Fixture::chunk_capacity);
+            ASSERT_TRUE(local.begin(src, dst, overlap));
+            for (const auto &[origin, target] : {std::pair{DeviceId::cuda(0), DeviceId::rocm(1)},
+                                                  std::pair{DeviceId::rocm(0), DeviceId::cuda(1)}})
+            {
+                const auto identity = remoteProjectionIdentity(transaction.transaction, origin, target);
+                const auto remote = makeMoEOverlayRemoteGpuProjectionManifest(identity, src, provenance,
+                    Fixture::chunk_capacity, overlap);
+                ASSERT_TRUE(remote.valid());
+                const auto cross_pack = remoteCodedGpuProjectionDeviceLayout(remote, Direction::GpuToCpu);
+                const auto cross_unpack = remoteCodedGpuProjectionDeviceLayout(remote, Direction::CpuToGpu);
+                ASSERT_NE(cross_pack.gpu_superblock_phase, cross_unpack.gpu_superblock_phase);
+                ASSERT_TRUE(local.begin(src, dst, overlap));
+                size_t total = 0u;
+                while (const auto chunk = local.takeNext())
+                {
+                    const auto bytes = source.wire(cross_pack, chunk->first_unit, chunk->unit_count);
+                    EXPECT_EQ(bytes, source.wire(local.codedLayouts()->pack, chunk->first_unit, chunk->unit_count));
+                    EXPECT_EQ(bytes.size(), chunk->bytes);
+                    EXPECT_EQ(bytes.size(), cross_unpack.chunkBytes(chunk->unit_count, chunk->first_unit));
+                    total += bytes.size();
+                }
+                EXPECT_EQ(total, remote.total_bytes);
+            }
+        }
+        EXPECT_EQ(covered, 13u);
     }
 
     /**

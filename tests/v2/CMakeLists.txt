@@ -2178,7 +2178,7 @@ add_v2_routed_expert_policy_unit(
 )
 add_v2_test(V2_Integration_CodedGpuExpertRelayWire
     COMMAND $<TARGET_FILE:v2_unit_moe_overlay_distributed_residency_protocol>
-        --gtest_filter=Test__MoEOverlayDistributedResidencyProtocol.CodedGpuRelayAuthenticatesExactPhasedWire
+        --gtest_filter=Test__MoEOverlayDistributedResidencyProtocol.CodedGpuRelayAuthenticatesExactPhasedWire:Test__MoEOverlayDistributedResidencyProtocol.CodedCrossBackendRelayUsesTheSameWireForAllFormats
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MoE;Transfer;ByteExact;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CodedGpuExpertRelayWire)
@@ -24526,8 +24526,26 @@ if(HAVE_CUDA OR HAVE_ROCM)
     )
     target_include_directories(v2_unit_gpu_expert_transfer PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     include(cmake/V2OriginalExpertPeerTransferTests.cmake)
+    set(V2_CODED_CROSS_BACKEND_BLOB_TESTS
+        "ExpertTierGpuBlobTransferIntegration.CUDACodedCrossBackendSourceWireMatchesHost:ExpertTierGpuBlobTransferIntegration.CUDAAndROCmCodedRelayPreservesAllSourcePlanes")
     string(APPEND V2_GPU_EXPERT_TRANSFER_AGGREGATE_EXCLUSIONS
-        ":ExpertTierGpuBlobTransferIntegration.CUDAWithoutPeerAccessRelaysBothDirectionsByteExactlyInBackground")
+        ":ExpertTierGpuBlobTransferIntegration.CUDAWithoutPeerAccessRelaysBothDirectionsByteExactlyInBackground:${V2_CODED_CROSS_BACKEND_BLOB_TESTS}")
+    if(HAVE_CUDA)
+        add_v2_test(V2_Integration_CUDA_CodedCrossBackendSourceWire
+            COMMAND $<TARGET_FILE:v2_unit_gpu_expert_transfer>
+                --gtest_filter=ExpertTierGpuBlobTransferIntegration.CUDACodedCrossBackendSourceWireMatchesHost
+            LABELS "V2;Integration;ProductionTestPreflight;CUDA;MoE;ExpertOverlay;WeightStreaming;AllFormats;ByteExact;Regression"
+            MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDA_CodedCrossBackendSourceWire)
+    endif()
+    if(HAVE_CUDA AND HAVE_ROCM)
+        add_v2_test(V2_Integration_HeterogeneousGPUExpertCodedBlobTransfer
+            COMMAND $<TARGET_FILE:v2_unit_gpu_expert_transfer>
+                --gtest_filter=ExpertTierGpuBlobTransferIntegration.CUDAAndROCmCodedRelayPreservesAllSourcePlanes
+            LABELS "V2;Integration;ProductionTestPreflight;CUDA;ROCm;MoE;ExpertOverlay;WeightStreaming;Async;DoubleBuffered;AllFormats;ByteExact;NoBlocking"
+            MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_HeterogeneousGPUExpertCodedBlobTransfer)
+    endif()
     # Fresh original-source cases have exact named process-owned registrations
     # in V2FiniteStorageParentTests and V2OriginalExpertPeerTransferTests; legacy
     # ordinary workers cannot precede those admissions in the same process.
@@ -24540,7 +24558,7 @@ if(HAVE_CUDA OR HAVE_ROCM)
     )
     add_v2_test(V2_Integration_HeterogeneousGPUExpertBlobTransfer
         COMMAND $<TARGET_FILE:v2_unit_gpu_expert_transfer>
-                --gtest_filter=ExpertTierGpuBlobTransferIntegration.*-ExpertTierGpuBlobTransferIntegration.CUDAWithoutPeerAccessRelaysBothDirectionsByteExactlyInBackground
+                --gtest_filter=ExpertTierGpuBlobTransferIntegration.*-ExpertTierGpuBlobTransferIntegration.CUDAWithoutPeerAccessRelaysBothDirectionsByteExactlyInBackground:${V2_CODED_CROSS_BACKEND_BLOB_TESTS}
                 --gtest_brief=1
         LABELS "V2;Integration;CUDA;ROCm;MoE;ExpertOverlay;WeightStreaming;Async;DoubleBuffered;PerfStats;ByteExact;NoBlocking"
         MPI_PROCS 1

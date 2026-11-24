@@ -7,7 +7,7 @@
  * cross-runtime event waits are deliberately forbidden. Two persistent slots
  * let the source prepare a later chunk while the destination consumes an
  * earlier one, without allocation, synchronization, or inference-stream joins.
- * Coded same-backend edges use the compact unit wire of cross-rank relay.
+ * All coded edges use the same compact unit wire as cross-rank relay.
  * Both endpoints convert against retained mapped slots, never raw bit-plane DMA.
  */
 
@@ -484,20 +484,7 @@ namespace llaminar2
         std::string *error) const noexcept
     {
         ExpertTierGpuBlobChunkProtocol probe(config_.staging_capacity_bytes);
-        return bindNativeProtocol(probe, source, destination, intersection, error);
-    }
-
-    bool ExpertTierGpuBlobTransferLane::bindNativeProtocol(ExpertTierGpuBlobChunkProtocol &protocol,
-        const GpuExpertPackedDescriptor &source, const GpuExpertPackedDescriptor &destination,
-        const ExpertTierWeightProjectionIntersection &intersection, std::string *error) const noexcept
-    {
-        if ((source.metadata_layout || destination.metadata_layout) &&
-            config_.source_device.type != config_.destination_device.type)
-        {
-            assignBlobTransferError(error, "Coded GPU host relay requires the same GPU backend at both endpoints");
-            return false;
-        }
-        return protocol.begin(source, destination, intersection, error);
+        return probe.begin(source, destination, intersection, error);
     }
 
     bool ExpertTierGpuBlobTransferLane::start(
@@ -522,7 +509,7 @@ namespace llaminar2
                 "GPU host-relay lane is already occupied");
             return false;
         }
-        if (!bindNativeProtocol(protocol_, source, destination, intersection, error))
+        if (!protocol_.begin(source, destination, intersection, error))
             return false;
 
         source_ = source;

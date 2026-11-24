@@ -84,7 +84,7 @@ namespace llaminar2
             if (src_device.is_rocm() && dst_device.is_rocm() && stream)
                 return detail::transferCodedExpertROCm(src, dst, src_device, dst_device, stream);
 #endif
-            LOG_ERROR("[GPUExpertTransfer] Coded expert movement requires a matching GPU backend and an explicit destination stream");
+            LOG_ERROR("[GPUExpertTransfer] Direct coded expert copy requires matching GPU backends and an explicit destination stream; cross-backend edges use ExpertTierGpuBlobTransferLane");
             return false;
         }
         return transferExpert(src.ptrs, dst.ptrs, src_device, dst_device,
