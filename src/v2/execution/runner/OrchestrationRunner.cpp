@@ -26800,6 +26800,8 @@ bool OrchestrationRunner::publishPhysicalMemoryAuthority()
                                                           : config_.max_seq_len;
         if (static_cast<int>(request.prompt.size()) >= context)
             return setError("Serving request prompt exceeds the admitted context");
+        if (!serving_failure_.empty())
+            return setError("Serving session failed: " + serving_failure_);
         serving_queue_.push_back(std::move(request));
         return true;
     }
@@ -26836,7 +26838,14 @@ bool OrchestrationRunner::publishPhysicalMemoryAuthority()
                 row.forced.push_back(token);
                 return;
             }
-        pending_serving_forced_[id].push_back(token);
+        // Unknown or finished ids are ignored (like grants); only a queued
+        // request carries forced tokens into admission.
+        for (const auto &queued : serving_queue_)
+            if (queued.id == id)
+            {
+                pending_serving_forced_[id].push_back(token);
+                return;
+            }
     }
 
     bool OrchestrationRunner::servingBatchIdle() const
@@ -26875,6 +26884,7 @@ bool OrchestrationRunner::publishPhysicalMemoryAuthority()
         pending_serving_forced_.clear();
         serving_active_ = false;
         serving_capacity_ = 0;
+        serving_failure_.clear();
     }
 
     std::vector<ServingBatchEvent> OrchestrationRunner::stepServingBatch()
@@ -26892,6 +26902,8 @@ bool OrchestrationRunner::publishPhysicalMemoryAuthority()
             auto &event = step_events[row.request.id];
             event.id = row.request.id;
             event.prompt_tokens = static_cast<int>(row.request.prompt.size());
+            event.cached_prompt_tokens = row.cached_prompt_tokens;
+            event.prefix_cache_enabled = row.prefix_admission.cache_enabled && row.prefix_admission.supported;
             event.completion_tokens = row.completion_tokens;
             return event;
         };
@@ -26952,11 +26964,31 @@ bool OrchestrationRunner::publishPhysicalMemoryAuthority()
                 row.forced.assign(f->second.begin(), f->second.end());
                 pending_serving_forced_.erase(f);
             }
+            // Reuse the longest cached prefix in this slot only; at least
+            // one prompt token is still computed by the row's own forward.
+            const int restored =
+                runner_->restoreServingRowPrefix(slot, row.request.prompt, row.prefix_admission);
+            if (restored < 0)
+            {
+                ServingBatchEvent event;
+                event.id = row.request.id;
+                event.finish = ServingFinishReason::Error;
+                event.error = "Serving prefix restore failed";
+                event.prompt_tokens = static_cast<int>(row.request.prompt.size());
+                events.push_back(std::move(event));
+                (void)runner_->resetServingRow(slot);
+                --slot; // the slot is still free for the next queued request
+                continue;
+            }
+            row.prompt_consumed = static_cast<std::size_t>(restored);
+            row.cached_tokens = restored;
+            row.cached_prompt_tokens = restored;
             serving_slot_busy_[static_cast<std::size_t>(slot)] = true;
             serving_rows_.push_back(std::move(row));
         }
 
         std::vector<ServingFinishReason> finish(serving_rows_.size(), ServingFinishReason::None);
+        std::vector<std::string> finish_error(serving_rows_.size());
         for (std::size_t r = 0; r < serving_rows_.size(); ++r)
             if (serving_rows_[r].cancelled)
                 finish[r] = ServingFinishReason::Cancelled;
@@ -27014,72 +27046,78 @@ bool OrchestrationRunner::publishPhysicalMemoryAuthority()
                 may_decide(serving_rows_[r]))
                 decide(r);
 
-        // One shared ragged forward over every request that has work: a
-        // prompt chunk, or feeding its committed token when it may continue.
-        std::vector<std::size_t> executed;
-        std::vector<int> slots;
-        std::vector<std::vector<int>> rows;
+        // Shared forwards over every request that has work: a prompt chunk,
+        // or feeding its committed token when it may continue. Decode rows
+        // (one token each) and prompt chunks run as separate forwards so a
+        // decode row is never padded to a prompt chunk's width.
+        struct Work
+        {
+            std::size_t r;
+            std::vector<int> tokens;
+        };
+        std::vector<Work> decode_work;
+        std::vector<Work> prefill_work;
         for (std::size_t r = 0; r < serving_rows_.size(); ++r)
         {
             if (finish[r] != ServingFinishReason::None)
                 continue;
             const ServingRowState &row = serving_rows_[r];
-            std::vector<int> tokens;
             if (row.prompt_consumed < row.request.prompt.size())
             {
                 const std::size_t chunk = std::min<std::size_t>(
                     kServingPrefillChunk, row.request.prompt.size() - row.prompt_consumed);
-                tokens.assign(row.request.prompt.begin() + static_cast<std::ptrdiff_t>(row.prompt_consumed),
-                              row.request.prompt.begin() + static_cast<std::ptrdiff_t>(row.prompt_consumed + chunk));
+                prefill_work.push_back({r, std::vector<int>(
+                    row.request.prompt.begin() + static_cast<std::ptrdiff_t>(row.prompt_consumed),
+                    row.request.prompt.begin() + static_cast<std::ptrdiff_t>(row.prompt_consumed + chunk))});
             }
             else if (row.needs_feed && may_decide(row))
             {
-                tokens.push_back(row.last_token);
+                decode_work.push_back({r, {row.last_token}});
             }
-            else
-            {
-                continue; // blocked: waiting for a grant or a forced token
-            }
-            executed.push_back(r);
-            slots.push_back(row.slot);
-            rows.push_back(std::move(tokens));
+            // else blocked: waiting for a grant or a forced token
         }
 
-        if (!rows.empty())
-        {
-            if (!runner_->forwardServingRows(slots, rows))
+        auto run_forward = [&](const std::vector<Work> &work) -> bool {
+            if (work.empty())
+                return true;
+            std::vector<int> slots;
+            std::vector<std::vector<int>> rows;
+            slots.reserve(work.size());
+            rows.reserve(work.size());
+            for (const auto &item : work)
             {
-                const std::string error = "Serving forward failed";
-                for (std::size_t r = 0; r < serving_rows_.size(); ++r)
-                {
-                    ServingBatchEvent event;
-                    event.id = serving_rows_[r].request.id;
-                    event.finish = ServingFinishReason::Error;
-                    event.error = error;
-                    event.prompt_tokens = static_cast<int>(serving_rows_[r].request.prompt.size());
-                    event.completion_tokens = serving_rows_[r].completion_tokens;
-                    events.push_back(std::move(event));
-                    (void)runner_->resetServingRow(serving_rows_[r].slot);
-                }
-                serving_rows_.clear();
-                std::fill(serving_slot_busy_.begin(), serving_slot_busy_.end(), false);
-                return events;
+                slots.push_back(serving_rows_[item.r].slot);
+                rows.push_back(item.tokens);
             }
-            for (std::size_t e = 0; e < executed.size(); ++e)
+            if (!runner_->forwardServingRows(slots, rows))
+                return false;
+            for (std::size_t e = 0; e < work.size(); ++e)
             {
-                const std::size_t r = executed[e];
+                const std::size_t r = work[e].r;
                 ServingRowState &row = serving_rows_[r];
                 row.cached_tokens += static_cast<int>(rows[e].size());
                 if (row.prompt_consumed < row.request.prompt.size())
+                {
                     row.prompt_consumed += rows[e].size();
+                    if (row.prompt_consumed < row.request.prompt.size())
+                        continue; // still streaming its prompt
+                    // The whole prompt is in this slot's KV: archive it.
+                    if (!runner_->harvestServingRowPrefix(row.slot, row.prefix_admission, row.request.prompt))
+                    {
+                        finish[r] = ServingFinishReason::Error;
+                        finish_error[r] = "Serving prefix harvest failed";
+                        continue;
+                    }
+                }
                 else
+                {
                     row.needs_feed = false;
-                if (row.prompt_consumed < row.request.prompt.size())
-                    continue; // still streaming its prompt
+                }
                 const float *logits = runner_->servingRowLogits(static_cast<int>(e));
                 if (!logits || vocab <= 0)
                 {
                     finish[r] = ServingFinishReason::Error;
+                    finish_error[r] = "Serving row produced no logits";
                     continue;
                 }
                 row.next_logits.assign(logits, logits + vocab);
@@ -27087,6 +27125,37 @@ bool OrchestrationRunner::publishPhysicalMemoryAuthority()
                 if (may_decide(row))
                     decide(r);
             }
+            return true;
+        };
+
+        if (!run_forward(decode_work) || !run_forward(prefill_work))
+        {
+            // A failed shared forward leaves every resident slot's state
+            // unknown: fail all resident and queued requests and seal the
+            // session so nothing is admitted onto the failed runner state.
+            serving_failure_ = lastError().empty() ? std::string("Serving forward failed") : lastError();
+            auto fail = [&](std::uint64_t id, int prompt_tokens, int completion_tokens) {
+                ServingBatchEvent event;
+                event.id = id;
+                event.finish = ServingFinishReason::Error;
+                event.error = serving_failure_;
+                event.prompt_tokens = prompt_tokens;
+                event.completion_tokens = completion_tokens;
+                events.push_back(std::move(event));
+            };
+            for (const auto &row : serving_rows_)
+            {
+                fail(row.request.id, static_cast<int>(row.request.prompt.size()), row.completion_tokens);
+                (void)runner_->resetServingRow(row.slot);
+            }
+            for (const auto &queued : serving_queue_)
+                fail(queued.id, static_cast<int>(queued.prompt.size()), 0);
+            serving_rows_.clear();
+            serving_queue_.clear();
+            pending_serving_grants_.clear();
+            pending_serving_forced_.clear();
+            std::fill(serving_slot_busy_.begin(), serving_slot_busy_.end(), false);
+            return events;
         }
 
         // Retirement frees each finished request's slot.
@@ -27098,7 +27167,7 @@ bool OrchestrationRunner::publishPhysicalMemoryAuthority()
             auto &event = event_of(row);
             event.finish = finish[r];
             if (finish[r] == ServingFinishReason::Error)
-                event.error = "Serving row produced no logits";
+                event.error = finish_error[r];
             (void)runner_->resetServingRow(row.slot);
             serving_slot_busy_[static_cast<std::size_t>(row.slot)] = false;
             serving_rows_.erase(serving_rows_.begin() + static_cast<std::ptrdiff_t>(r));

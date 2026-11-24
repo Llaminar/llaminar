@@ -41,6 +41,9 @@ namespace llaminar2
         ServingFinishReason finish = ServingFinishReason::None;
         std::string error;
         bool admitted = false;          ///< Submission acknowledged.
+        int prompt_tokens = 0;          ///< From the latest event.
+        int cached_prompt_tokens = 0;   ///< Prefix-cache restored prompt tokens.
+        bool prefix_cache_enabled = false;
         std::string admission_error;    ///< Non-empty when admission failed.
     };
 
@@ -199,6 +202,9 @@ namespace llaminar2
             }
             std::lock_guard lock(mailbox->mutex);
             mailbox->tokens.insert(mailbox->tokens.end(), event.tokens.begin(), event.tokens.end());
+            mailbox->prompt_tokens = event.prompt_tokens;
+            mailbox->cached_prompt_tokens = event.cached_prompt_tokens;
+            mailbox->prefix_cache_enabled = event.prefix_cache_enabled;
             if (event.finished())
             {
                 mailbox->finish = event.finish;
@@ -318,6 +324,22 @@ namespace llaminar2
         }
 
         std::string lastError() const override { return error_; }
+
+        /** @brief Prefix reuse of this request (serving rows recompute >= 1 token). */
+        RequestRuntimeSummary requestRuntimeSummary() const override
+        {
+            RequestRuntimeSummary summary;
+            if (!mailbox_)
+                return summary;
+            std::lock_guard lock(mailbox_->mutex);
+            auto &prefix = summary.prefix_request;
+            prefix.enabled = mailbox_->prefix_cache_enabled;
+            prefix.requested_tokens = mailbox_->prompt_tokens;
+            prefix.matched_tokens = mailbox_->cached_prompt_tokens;
+            prefix.partial_hit = mailbox_->cached_prompt_tokens > 0;
+            prefix.storage_tier = mailbox_->cached_prompt_tokens > 0 ? "ram" : "none";
+            return summary;
+        }
 
     private:
         GenerationResult &drain(std::unique_lock<std::mutex> &, int max_tokens, GenerationResult &result)

@@ -48562,6 +48562,21 @@ namespace llaminar2
         const std::vector<int32_t> &tokens,
         int prompt_token_count)
     {
+        return harvestPrefixFromSequence(admission, tokens, prompt_token_count, 0, false);
+    }
+
+    bool DeviceGraphOrchestrator::harvestPrefixFromSequence(
+        const PrefixLookupResult &admission,
+        const std::vector<int32_t> &tokens,
+        int prompt_token_count,
+        int seq_idx,
+        bool serving_row)
+    {
+        if (seq_idx < 0 || seq_idx >= state_.batch_size || (seq_idx != 0 && !serving_row))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Prefix harvest sequence " << seq_idx << " is out of range");
+            return false;
+        }
         if (!admission.cache_enabled ||
             !admission.supported ||
             admission.fingerprint_key == 0)
@@ -48679,6 +48694,10 @@ namespace llaminar2
             parent_hash = key.stableHash();
             const bool terminal_block =
                 (key.token_start + key.token_count) == prompt_token_count;
+            // A serving row shares the forward with other rows, so the graph's
+            // terminal logits/hidden/runtime state are not this row's. Serving
+            // rows archive KV only; their restores always recompute >= 1 token.
+            const bool capture_terminal = terminal_block && !serving_row;
             if (!terminal_block && prefix_layout_.organization() ==
                     PrefixPayloadOrganization::RecurrentCheckpoint)
             {
@@ -48696,7 +48715,7 @@ namespace llaminar2
                     prompt_token_count) ==
                     PrefixTerminalHarvestDisposition::ReuseAdmittedArchive;
             if (key_already_installed &&
-                (!terminal_block || reuse_admitted_terminal))
+                (serving_row || !terminal_block || reuse_admitted_terminal))
             {
                 if (reuse_admitted_terminal)
                 {
@@ -48732,7 +48751,7 @@ namespace llaminar2
             }
 
             PrefixPayloadLayout block_layout = prefix_layout_;
-            if (!terminal_block)
+            if (!capture_terminal)
             {
                 block_layout.includes_hybrid_state = false;
                 block_layout.includes_terminal_hidden = false;
@@ -48740,13 +48759,13 @@ namespace llaminar2
             }
 
             applyPrefixAuxiliaryLayout(block_layout,*state_.kv_cache,
-                state_.mtp_kv_caches.empty()?nullptr:state_.mtp_kv_caches[0].get(),0,
-                key.token_start,key.token_count,key.token_start+key.token_count,terminal_block);
+                state_.mtp_kv_caches.empty()?nullptr:state_.mtp_kv_caches[0].get(),seq_idx,
+                key.token_start,key.token_count,key.token_start+key.token_count,capture_terminal);
 
-            applyHybridPrefixPayloadExtent(block_layout, *state_.kv_cache, 0);
+            applyHybridPrefixPayloadExtent(block_layout, *state_.kv_cache, seq_idx);
 
             std::shared_ptr<std::vector<uint8_t>> model_runtime_state;
-            if (terminal_block && graph_builder_)
+            if (capture_terminal && graph_builder_)
             {
                 auto captured = std::make_shared<std::vector<uint8_t>>();
                 if (!graph_builder_->capturePrefixCacheRuntimeState(*captured, stream))
@@ -48906,7 +48925,7 @@ namespace llaminar2
                                  static_cast<size_t>(local_layer) * prefix_layout_.bytes_per_fa_layer_v;
                 IKVCache::KVCacheLogicalBlockDescriptor desc;
                 desc.layer = global_layer;
-                desc.seq_idx = 0;
+                desc.seq_idx = seq_idx;
                 desc.logical_token_start = key.token_start;
                 desc.token_count = key.token_count;
                 desc.stream = stream;
@@ -49030,17 +49049,17 @@ namespace llaminar2
             }
 
             if(ok) {
-                exportPrefixAuxiliaryState(*state_.kv_cache,0,PrefixAuxiliaryLane::Main,handle,stream);
+                exportPrefixAuxiliaryState(*state_.kv_cache,seq_idx,PrefixAuxiliaryLane::Main,handle,stream);
                 if(device_hot_handle.valid())
-                    exportPrefixAuxiliaryState(*state_.kv_cache,0,PrefixAuxiliaryLane::Main,device_hot_handle,stream);
+                    exportPrefixAuxiliaryState(*state_.kv_cache,seq_idx,PrefixAuxiliaryLane::Main,device_hot_handle,stream);
                 if(block_layout.includes_mtp_state && !state_.mtp_kv_caches.empty()) {
-                    exportPrefixAuxiliaryState(*state_.mtp_kv_caches[0],0,PrefixAuxiliaryLane::ShiftedMTP,handle,stream);
+                    exportPrefixAuxiliaryState(*state_.mtp_kv_caches[0],seq_idx,PrefixAuxiliaryLane::ShiftedMTP,handle,stream);
                     if(device_hot_handle.valid())
-                        exportPrefixAuxiliaryState(*state_.mtp_kv_caches[0],0,PrefixAuxiliaryLane::ShiftedMTP,device_hot_handle,stream);
+                        exportPrefixAuxiliaryState(*state_.mtp_kv_caches[0],seq_idx,PrefixAuxiliaryLane::ShiftedMTP,device_hot_handle,stream);
                 }
             }
 
-            if (ok && terminal_block && prefix_layout_.includes_hybrid_state)
+            if (ok && capture_terminal && prefix_layout_.includes_hybrid_state)
             {
                 if (state_.device_id.is_gpu())
                 {
@@ -49062,7 +49081,7 @@ namespace llaminar2
                         desc.host_recurrence_layout = block_layout.hybrid_host_recurrence_layout;
                         desc.device_recurrence_layout =
                             block_layout.hybrid_device_recurrence_layout;
-                        desc.seq_idx = 0;
+                        desc.seq_idx = seq_idx;
                         desc.logical_token_count =
                             key.token_start + key.token_count;
                         desc.stream = stream;
@@ -49108,7 +49127,7 @@ namespace llaminar2
                 }
             }
 
-            if (ok && terminal_block && prefix_layout_.includes_terminal_hidden &&
+            if (ok && capture_terminal && prefix_layout_.includes_terminal_hidden &&
                 !state_.mtp_terminal_hidden_publication.current())
             {
                 /*
@@ -49144,7 +49163,7 @@ namespace llaminar2
             }
 
             const auto terminal_logits = currentPrefixArchiveLogits();
-            if (ok && terminal_block && prefix_layout_.includes_terminal_logits &&
+            if (ok && capture_terminal && prefix_layout_.includes_terminal_logits &&
                 !terminal_logits)
             {
                 LOG_ERROR(
@@ -49152,7 +49171,7 @@ namespace llaminar2
                     "scalar main-logits publication");
                 ok = false;
             }
-            if (ok && terminal_block && prefix_layout_.includes_terminal_logits &&
+            if (ok && capture_terminal && prefix_layout_.includes_terminal_logits &&
                 terminal_logits && handle.terminal_logits)
             {
                 // Slice the actual producer, not a dormant local allocation.
@@ -49209,7 +49228,7 @@ namespace llaminar2
                 }
             }
 
-            if (ok && terminal_block && prefix_layout_.includes_terminal_hidden &&
+            if (ok && capture_terminal && prefix_layout_.includes_terminal_hidden &&
                 state_.prefix_terminal_hidden &&
                 state_.mtp_terminal_hidden_publication.current() &&
                 handle.terminal_hidden)
@@ -49262,7 +49281,7 @@ namespace llaminar2
             }
 
             if (terminal_hidden_archival_refresh &&
-                terminal_block &&
+                capture_terminal &&
                 prefix_layout_.includes_terminal_hidden &&
                 handle.has_terminal_hidden)
             {
@@ -61449,7 +61468,78 @@ namespace llaminar2
             return "hybrid recurrent state has no per-slot serving rows yet";
         if (!state_.mtp_kv_caches.empty() || (graph_builder_ && graph_builder_->config().mtp.enabled))
             return "MTP speculative decoding has no per-slot serving rows yet (use --no-mtp)";
+        if (graph_builder_ && graph_builder_->config().prefix_cache.enabled &&
+            graph_builder_->prefixCacheRuntimeStateCapacity() > 0)
+            return "prefix caching of model runtime state has no per-slot serving rows yet "
+                   "(use --no-prefix-cache)";
         return {};
+    }
+
+    int DeviceGraphOrchestrator::restoreServingRowPrefix(int slot, const std::vector<int32_t> &prompt,
+                                                         PrefixLookupResult &admission)
+    {
+        admission = {};
+        if (!supportsServingRows() || slot < 0 || slot >= state_.batch_size)
+            return -1;
+        if (!graph_builder_ || !graph_builder_->config().prefix_cache.enabled)
+            return 0;
+        PrefixLookupResult hit = lookupPrefix(prompt);
+        if (!hit.cache_enabled || !hit.supported)
+            return 0;
+        // Leave at least one prompt token: its forward produces the row's
+        // first logits, so no terminal state is needed.
+        const int limit = static_cast<int>(prompt.size()) - 1;
+        PrefixLookupResult clamped = limit > 0 ? hit.clampedTo(limit) : PrefixLookupResult{};
+        if (!clamped.hit())
+        {
+            admission = hit.forHarvest(0);
+            return 0;
+        }
+
+        const std::vector<PrefixBlockHandle> blocks = clamped.materializeRestoreBlocks();
+        for (const PrefixBlockHandle &handle : blocks)
+        {
+            if (!handle.valid() || (prefix_layout_.fa_layers > 0 && (!handle.kvKData() || !handle.kvVData())))
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Serving prefix block is invalid");
+                return -1;
+            }
+            for (int local_layer = 0; local_layer < prefix_layout_.fa_layers; ++local_layer)
+            {
+                const int global_layer = prefixFALayerForIndex(*state_.kv_cache, local_layer);
+                if (global_layer < 0)
+                    return -1;
+                IKVCache::KVCacheLogicalBlockDescriptor desc;
+                desc.layer = global_layer;
+                desc.seq_idx = slot;
+                desc.logical_token_start = handle.key.token_start;
+                desc.token_count = handle.key.token_count;
+                const uint8_t *k_src = handle.kvKData() +
+                    static_cast<size_t>(local_layer) * prefix_layout_.bytes_per_fa_layer_k;
+                const uint8_t *v_src = handle.kvVData() +
+                    static_cast<size_t>(local_layer) * prefix_layout_.bytes_per_fa_layer_v;
+                if (!state_.kv_cache->importLogicalBlock(desc, k_src, v_src))
+                {
+                    LOG_ERROR("[DeviceGraphOrchestrator] Serving prefix KV import failed (slot " << slot << ")");
+                    return -1;
+                }
+            }
+        }
+        serving_slot_positions_.resize(static_cast<size_t>(state_.batch_size), 0);
+        serving_slot_positions_[static_cast<size_t>(slot)] = clamped.cached_tokens;
+        admission = clamped.forHarvest(clamped.cached_tokens);
+        PerfStatsCollector::addCounter("prefix_cache", "serving_row_restored_tokens",
+                                       static_cast<double>(clamped.cached_tokens), "restore",
+                                       state_.device_id.toString());
+        return clamped.cached_tokens;
+    }
+
+    bool DeviceGraphOrchestrator::harvestServingRowPrefix(int slot, const PrefixLookupResult &admission,
+                                                          const std::vector<int32_t> &prompt)
+    {
+        if (!admission.cache_enabled || !admission.supported || prompt.empty())
+            return true;
+        return harvestPrefixFromSequence(admission, prompt, static_cast<int>(prompt.size()), slot, true);
     }
 
     bool DeviceGraphOrchestrator::forwardServingRows(

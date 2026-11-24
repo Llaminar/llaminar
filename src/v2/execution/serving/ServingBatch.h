@@ -55,6 +55,8 @@ namespace llaminar2
         std::vector<int32_t> tokens;
         ServingFinishReason finish = ServingFinishReason::None;
         int prompt_tokens = 0;        ///< Prompt length (reported once finished).
+        int cached_prompt_tokens = 0; ///< Prompt tokens restored from the prefix cache.
+        bool prefix_cache_enabled = false; ///< The request was admitted through the prefix cache.
         int completion_tokens = 0;    ///< Total committed output tokens so far.
         std::string error;            ///< Diagnostic when finish == Error.
 

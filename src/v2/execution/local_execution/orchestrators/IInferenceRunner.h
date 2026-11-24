@@ -3194,6 +3194,41 @@ namespace llaminar2
         }
 
         /**
+         * @brief Restore the longest cached prefix of @p prompt into a fresh slot.
+         *
+         * At least one prompt token is always left to compute, so the row's
+         * first logits come from its own forward (serving rows never import
+         * terminal logits). Other slots are untouched.
+         *
+         * @param slot Freshly reset resident slot.
+         * @param prompt Complete prompt of the entering request.
+         * @param admission Receives the immutable prefix identity for the
+         *        later harvest (cache_enabled=false when no cache applies).
+         * @return Restored tokens (0 on miss/disabled), or -1 on failure.
+         */
+        virtual int restoreServingRowPrefix(int slot, const std::vector<int32_t> &prompt,
+                                            PrefixLookupResult &admission)
+        {
+            (void)slot;
+            (void)prompt;
+            admission = {};
+            return 0;
+        }
+
+        /**
+         * @brief Archive a slot's consumed prompt KV under its admission identity.
+         * @return false on archival failure; true when archived or not applicable.
+         */
+        virtual bool harvestServingRowPrefix(int slot, const PrefixLookupResult &admission,
+                                             const std::vector<int32_t> &prompt)
+        {
+            (void)slot;
+            (void)admission;
+            (void)prompt;
+            return true;
+        }
+
+        /**
          * @brief One shared forward over the given resident slots.
          * @param slots Distinct slot (KV sequence) of each row.
          * @param rows Tokens row `r` appends to `slots[r]`; none empty.

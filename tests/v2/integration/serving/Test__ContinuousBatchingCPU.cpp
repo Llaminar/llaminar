@@ -18,6 +18,7 @@
 #include "utils/TestOrchestrationHelper.h"
 
 #include <cstdlib>
+#include <unistd.h>
 #include <algorithm>
 #include <map>
 #include <memory>
@@ -62,11 +63,14 @@ namespace llaminar2::test
             ServingFinishReason finish = ServingFinishReason::None;
             int finished_at_step = -1;
             int first_token_step = -1;
+            int cached_prompt_tokens = 0;
         };
 
         class ContinuousBatchingCPU : public ::testing::Test
         {
         protected:
+            virtual bool prefixCache() const { return false; }
+
             void SetUp() override
             {
                 const char *model = std::getenv("LLAMINAR_CB_TEST_MODEL");
@@ -78,7 +82,15 @@ namespace llaminar2::test
                     TestOrchestrationHelper::buildSimpleConfig(model, DeviceId::cpu(), 1024);
                 config.batch_size = kCapacity;
                 config.deterministic = false;
-                config.prefix_cache.enabled = false;
+                config.prefix_cache.enabled = prefixCache();
+                if (prefixCache())
+                {
+                    // Hermetic tiers: the default disk tier persists across
+                    // processes, which would make a "cold" request warm.
+                    char dir[] = "/tmp/llaminar-cb-prefix-XXXXXX";
+                    ASSERT_NE(::mkdtemp(dir), nullptr);
+                    config.prefix_cache.disk_dir = dir;
+                }
                 runner_ = TestOrchestrationHelper::create(config);
                 ASSERT_NE(runner_, nullptr);
                 ASSERT_TRUE(runner_->initialize()) << runner_->lastError();
@@ -106,6 +118,8 @@ namespace llaminar2::test
                         if (!event.tokens.empty() && outcome.first_token_step < 0)
                             outcome.first_token_step = step;
                         outcome.tokens.insert(outcome.tokens.end(), event.tokens.begin(), event.tokens.end());
+                        outcome.cached_prompt_tokens = std::max(outcome.cached_prompt_tokens,
+                                                                event.cached_prompt_tokens);
                         if (event.finished())
                         {
                             EXPECT_EQ(outcome.finish, ServingFinishReason::None) << "finished twice";
@@ -131,6 +145,13 @@ namespace llaminar2::test
             }
 
             std::unique_ptr<IOrchestrationRunner> runner_;
+        };
+
+        /** Same session with the (default-on) prefix cache enabled. */
+        class ContinuousBatchingCPUPrefix : public ContinuousBatchingCPU
+        {
+        protected:
+            bool prefixCache() const override { return true; }
         };
     } // namespace
 
@@ -280,5 +301,37 @@ namespace llaminar2::test
         runner_->endServingBatch();
         EXPECT_EQ(got, scalar);
         EXPECT_EQ(other_got, other_solo.tokens);
+    }
+} // namespace llaminar2::test
+
+namespace llaminar2::test
+{
+    TEST_F(ContinuousBatchingCPUPrefix, SlotRestoresCachedPrefixWithoutDisturbingOthers)
+    {
+        // Cold: computes and harvests the prompt from its slot.
+        const auto b = makeRequest(11, 150, 12, 0.0f, 1);
+        const auto cold = solo(b);
+        EXPECT_EQ(cold.cached_prompt_tokens, 0);
+
+        // Warm, co-batched with an unrelated request: B restores its cached
+        // prefix into its own slot (at least one token is recomputed) and
+        // still produces the cold token stream; A is unaffected.
+        const auto a = makeRequest(12, 40, 20, 0.0f, 1);
+        const auto a_solo = solo(a);
+        const auto batched = run({{0, {a}}, {2, {b}}});
+        EXPECT_GT(batched.at(11).cached_prompt_tokens, 0);
+        EXPECT_LT(batched.at(11).cached_prompt_tokens, 150);
+        EXPECT_EQ(batched.at(11).tokens, cold.tokens);
+        EXPECT_EQ(batched.at(12).tokens, a_solo.tokens);
+
+        // A different suffix after the shared prefix reuses the common blocks.
+        auto c = b;
+        c.id = 13;
+        for (std::size_t i = 140; i < c.prompt.size(); ++i)
+            c.prompt[i] = static_cast<int32_t>(200 + i);
+        const auto c_out = solo(c);
+        EXPECT_GT(c_out.cached_prompt_tokens, 0);
+        EXPECT_LE(c_out.cached_prompt_tokens, 140);
+        EXPECT_EQ(c_out.finish, ServingFinishReason::Length);
     }
 } // namespace llaminar2::test

@@ -2382,6 +2382,8 @@ namespace llaminar2
             int grant = 0;                   ///< Paced tokens still allowed.
             std::deque<int32_t> forced;      ///< Tokens to commit instead of sampling.
             bool cancelled = false;
+            int cached_prompt_tokens = 0;    ///< Prompt tokens restored from the prefix cache.
+            PrefixLookupResult prefix_admission; ///< Immutable identity for the prompt harvest.
         };
         /** @brief Resident requests (any order); each owns its slot. */
         std::vector<ServingRowState> serving_rows_;
@@ -2396,6 +2398,8 @@ namespace llaminar2
         std::map<std::uint64_t, std::vector<int32_t>> pending_serving_forced_;
         int serving_capacity_ = 0;
         bool serving_active_ = false;
+        /** @brief A shared forward failed: the session admits nothing more. */
+        std::string serving_failure_;
         /** @brief Max prompt tokens one entering request adds per shared step. */
         static constexpr int kServingPrefillChunk = 64;
         bool batched_decode_active_{false};

@@ -4214,6 +4214,13 @@ namespace llaminar2
 
         /** @brief CPU serving rows: single-device main KV, no MTP, no recurrent state. */
         std::string servingRowsUnsupportedReason() const override;
+        int restoreServingRowPrefix(int slot, const std::vector<int32_t> &prompt,
+                                    PrefixLookupResult &admission) override;
+        bool harvestServingRowPrefix(int slot, const PrefixLookupResult &admission,
+                                     const std::vector<int32_t> &prompt) override;
+        /** @brief harvestPrefix() body for an explicit sequence; serving rows archive KV only. */
+        bool harvestPrefixFromSequence(const PrefixLookupResult &admission, const std::vector<int32_t> &tokens,
+                                       int prompt_token_count, int seq_idx, bool serving_row);
 
         /** @brief Ragged forward of the given resident serving slots (CPU). */
         bool forwardServingRows(const std::vector<int> &slots,
