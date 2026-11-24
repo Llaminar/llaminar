@@ -15,6 +15,7 @@
 #pragma once
 
 #include "backends/GPUGraphMemoryContract.h"
+#include "planning/CapturedCUDAArrivalOwnerInventory.h"
 
 #include <cstddef>
 #include <limits>
@@ -41,6 +42,8 @@ namespace llaminar2
         std::size_t auxiliary_executable_count = 0u;
         /** Separately certified flat helpers; excluded from the general count. */
         std::size_t bounded_helper_executable_count = 0u;
+        /** Additional pool geometry, included only on a CUDA owner of this family. */
+        CapturedCUDAArrivalOwnerInventory cuda_arrival_owners;
 
         /**
          * @brief Return whether the declaration has one unambiguous shape.
@@ -179,8 +182,11 @@ namespace llaminar2
                 "Captured graph executable inventory has mismatched graph identities and topology variants");
         }
         const auto total_count = inventory.residentExecutableCount();
+        const auto general_count = total_count - inventory.bounded_helper_executable_count;
+        if (device.is_cuda() && inventory.cuda_arrival_owners.ownerCount() > general_count)
+            throw std::invalid_argument("CUDA arrival executable census exceeds its base executable slots");
         const auto general_bytes = captured_graph_memory_detail::checkedMultiply(
-            total_count - inventory.bounded_helper_executable_count,
+            general_count,
             GPUGraphMemoryContract::reservationBytesPerExecutable(device),
             "Captured graph resident memory reservation overflows size_t");
         const auto helper_bytes = captured_graph_memory_detail::checkedMultiply(
@@ -191,7 +197,11 @@ namespace llaminar2
         if (helper_bytes > std::numeric_limits<std::size_t>::max() - general_bytes)
             throw std::overflow_error(
                 "Captured graph family memory reservation overflows size_t");
-        return general_bytes + helper_bytes;
+        const auto base_bytes = general_bytes + helper_bytes;
+        const auto arrival_bytes = device.is_cuda() ? inventory.cuda_arrival_owners.reservationBytes() : 0u;
+        if (arrival_bytes > std::numeric_limits<std::size_t>::max() - base_bytes)
+            throw std::overflow_error("Captured graph family with CUDA arrivals overflows size_t");
+        return base_bytes + arrival_bytes;
     }
 
     /**

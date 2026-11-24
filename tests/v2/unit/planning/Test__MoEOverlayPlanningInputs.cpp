@@ -13,6 +13,7 @@
 #include "planning/MoEOverlayPlanningInputs.h"
 #include "planning/MoEOverlayMemoryPlanInputs.h"
 #include "execution/moe/MoEOverlayActivationChannelPlan.h"
+#include "execution/local_execution/graph/GraphBuilderRegistry.h"
 #include "execution/moe/MoEOverlayPhysicalResidencyFabric.h"
 #include "config/OrchestrationConfig.h"
 #include "../models/qwen4exp/Qwen4ExpSidecarFixture.h"
@@ -71,6 +72,7 @@ namespace llaminar2
             /** @brief Prepare a declared rank namespace and model/retained MTP geometry. */
             explicit MemoryInputsFixture(DeviceType backend, int world_size = 1)
             {
+                model.architecture = "qwen35moe";
                 model.n_layers = 3;
                 model.mtp_layer_count = 1;
                 model.expert_count = 8;
@@ -395,6 +397,78 @@ namespace llaminar2
             ASSERT_FALSE(input.host_demand_memory);
             input.host_demand_memory = evidence;
             EXPECT_THROW((void)test::planWithRecordedHostServices(input), std::invalid_argument);
+        }
+    }
+
+    /** @test CUDA admission refuses an installed builder lacking its arrival declaration. */
+    TEST(MoEOverlayMemoryPlanInputs, CUDAArrivalAdmissionRequiresBuilderDeclaration)
+    {
+        MemoryInputsFixture fixture(DeviceType::CUDA);
+        fixture.model.architecture = "overlay-arrival-declaration-negative-control";
+        GraphBuilderRegistry::registerFactory(fixture.model.architecture,
+            [](const GraphConfig &, std::shared_ptr<IMPIContext>) { return std::shared_ptr<IGraphBuilder>{}; });
+        ASSERT_TRUE(GraphBuilderRegistry::isSupported(fixture.model.architecture));
+        try
+        {
+            (void)buildMoEOverlayMemoryPlanInputs(fixture.request(), 64);
+            FAIL() << "CUDA ExpertOverlay admission accepted a builder with no arrival declaration";
+        }
+        catch (const std::invalid_argument &error)
+        {
+            EXPECT_STREQ(error.what(), "CUDA ExpertOverlay graph builder 'overlay-arrival-declaration-negative-control' "
+                "has no native arrival-site declaration for physical-memory admission");
+        }
+    }
+
+    /** @test Native arrival increments require an actual base executable slot per owner. */
+    TEST(MoEOverlayMemoryPlanInputs, CUDAArrivalCensusRequiresBaseExecutableSlots)
+    {
+        const auto device = DeviceId::cuda(0);
+        auto inventory = CapturedGraphExecutableInventory::monolithic(2);
+        const auto base = estimateCapturedGraphExecutableBytes(device, inventory);
+        inventory.cuda_arrival_owners.add({CUDAArrivalOwnerRole::PrefixDecode, 1u, 1u});
+        inventory.cuda_arrival_owners.add({CUDAArrivalOwnerRole::RestoredPrefixBridge, 1u, 1u});
+        EXPECT_EQ(estimateCapturedGraphExecutableBytes(device, inventory) - base,
+            2u * quoteCUDALiveLaunchReservationBytes(1u));
+        inventory.cuda_arrival_owners.add({CUDAArrivalOwnerRole::PrefixRehydration, 1u, 1u});
+        EXPECT_THROW((void)estimateCapturedGraphExecutableBytes(device, inventory), std::invalid_argument);
+    }
+
+    /** @test Prefix policy cannot change epoch-owned CUDA arrival or physical executable counts. */
+    TEST(MoEOverlayMemoryPlanInputs, CUDAPrefixEnablementPreservesEpochOwnedArrivalBOM)
+    {
+        MemoryInputsFixture fixture(DeviceType::CUDA);
+        fixture.rank.runtime.moe_routed_prefill.least_loaded_min_routed_rows = 16;
+        auto &domain = fixture.config.moe_routed_expert_plan->domains.front();
+        fixture.rank.runtime.prefix_cache.storage_mode = PrefixCacheStorageMode::Ram;
+        using Role = CUDAArrivalOwnerRole;
+        for (const auto assignment : {RoutedExpertAssignmentPolicy::StaticOwner,
+                                      RoutedExpertAssignmentPolicy::LeastLoadedResident})
+        {
+            domain.routed_prefill_assignment_policy = assignment;
+            fixture.execution = resolveMoEExpertOverlayExecutionPlan(fixture.config.moe_routed_expert_plan,
+                {.current_world_rank = 0, .world_size = 1});
+            fixture.rank.runtime.prefix_cache.enabled = false;
+            const auto cold = buildMoEOverlayMemoryPlanInputs(fixture.request(), 64);
+            fixture.rank.runtime.prefix_cache.enabled = true;
+            const auto warm = buildMoEOverlayMemoryPlanInputs(fixture.request(), 64);
+            const auto &inventory = warm.local_capacity.captured_graph_plan.resident_executables;
+            const auto &control = cold.local_capacity.captured_graph_plan.resident_executables;
+            EXPECT_EQ(inventory.residentExecutableCount(), control.residentExecutableCount());
+            EXPECT_EQ(inventory.cuda_arrival_owners.reservationBytes(), control.cuda_arrival_owners.reservationBytes());
+            std::size_t prefill_owners = 0;
+            for (const auto &population : inventory.cuda_arrival_owners.populations())
+            {
+                EXPECT_NE(population.role, Role::PrefixDecode);
+                EXPECT_NE(population.role, Role::PrefixRehydration);
+                EXPECT_NE(population.role, Role::RestoredPrefixBridge);
+                if (population.role == Role::Prefill)
+                {
+                    prefill_owners += population.owners;
+                    EXPECT_EQ(population.sites_per_owner, 2u);
+                }
+            }
+            EXPECT_EQ(prefill_owners, assignment == RoutedExpertAssignmentPolicy::StaticOwner ? 0u : 4u);
         }
     }
 

@@ -71,6 +71,9 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
+#include <cstdlib>
+#include <iostream>
+#include <string_view>
 #include <mutex>
 #include <thread>
 #include <cstdio>
@@ -1017,6 +1020,118 @@ namespace
 
     INSTANTIATE_TEST_SUITE_P(Topologies, MoENoPeerHostTail,
         ::testing::ValuesIn(noPeerHostTailCases()), [](const auto &info) { return info.param.name; });
+
+#ifdef HAVE_CUDA
+    /** @test Production prefix restore must not add a ticketed ExpertOverlay arrival owner. */
+    TEST(MoEOverlayArrivalOwnerLifecycle, PrefixRestoreKeepsEpochOwnedArrivalsOutOfNativeBOM)
+    {
+        SharedPipelinePlanningGGUFFixture fixture(false, 2, true);
+        const auto observed = observedSingletonPipelinePlacement(DeviceType::CUDA);
+        initCPUBackend(observed.cpu_numa_node);
+        const auto mpi = MPIContextFactory::global();
+        const auto device = observed.gpu;
+        const char *const mode = std::getenv("LLAMINAR_TEST_MOE_ARRIVAL_PREFIX_CACHE");
+        ASSERT_NE(mode, nullptr);
+        ASSERT_TRUE(std::string_view(mode) == "off" || std::string_view(mode) == "on");
+        const bool prefix_enabled = std::string_view(mode) == "on";
+        std::array<std::vector<int32_t>, 2> outputs;
+        std::vector<std::string> arguments{"overlay-prefix-arrival-bom", "-m", fixture.path(),
+            "--mpi-procs", "1", "--context-length", "512", "--no-mtp",
+            "--expert-tier", "native=cuda:" + std::to_string(device.ordinal) + ";priority=0;max-experts-per-layer=6",
+            "--expert-tier", "host=cpu:" + std::to_string(observed.cpu_numa_node) + ";priority=10",
+            "--moe-residency-maintenance", "dynamic",
+            prefix_enabled ? "--prefix-cache" : "--no-prefix-cache"};
+        std::vector<char *> argv;
+        for (auto &argument : arguments) argv.push_back(argument.data());
+        auto config = OrchestrationConfigParser{}.parseArgs(argv.size(), argv.data());
+        config.prefill_max_bucket_size = 64;
+        config.prefix_cache.storage_mode = PrefixCacheStorageMode::Ram;
+        config.prefix_cache.ram_budget_bytes = 64ull << 20;
+        config.prefix_cache.disk_budget_bytes = 0;
+        publishOrchestrationStartupPolicy(config);
+        OrdinaryGraphEvidence evidence("generation,forward_graph,prefix_cache");
+        PipelinePreparedFixtureLifetime lifetime(config, true, mpi);
+        auto &runner = lifetime.runner();
+        ASSERT_TRUE(runner.initialize()) << runner.lastError();
+        ASSERT_EQ(runner.primaryDeviceId(), device);
+        const auto &contract = lifetime.exportContract();
+        ASSERT_TRUE(contract);
+        ASSERT_TRUE(contract->prepared_routed_weight_plan);
+        ASSERT_TRUE(contract->prepared_routed_weight_plan->usesExpertOverlayAuthority());
+        const auto &authority = contract->physical_memory_authority;
+        ASSERT_NE(authority, nullptr);
+        constexpr auto owner = PhysicalMemoryOwner::NativeGraphExecutable;
+        const auto family_bytes = authority->plannedBytes(device, owner);
+        ASSERT_GT(family_bytes, 0u);
+        EXPECT_EQ(authority->reservedBytes(device, owner), family_bytes);
+
+        SamplingParams sampling;
+        sampling.temperature = 0.0f;
+        runner.setSamplingParams(sampling);
+        runner.setStopTokens({});
+        std::vector<int32_t> prompt(96);
+        for (std::size_t i = 0; i < prompt.size(); ++i) prompt[i] = 11 + static_cast<int32_t>(i);
+        for (const bool restore : {false, true})
+        {
+            if (restore)
+            {
+                runner.clearCache();
+                prompt.push_back(137); // Same full blocks plus a live suffix.
+            }
+            ASSERT_TRUE(runner.prefill(prompt)) << runner.lastError();
+            for (int step = 0; step < 3; ++step)
+            {
+                runner.setDecodeStepTokenBudget(1);
+                const auto result = runner.decodeStep();
+                ASSERT_TRUE(result.success()) << result.error;
+                ASSERT_EQ(result.tokens.size(), 1u);
+                outputs[restore].push_back(result.tokens.front());
+                ASSERT_TRUE(runner.maybeApplyMoERebalance(1)) << runner.lastError();
+            }
+            const auto prefix = runner.requestRuntimeSummary().prefix_request;
+            ASSERT_EQ(prefix.enabled, prefix_enabled);
+            if (prefix_enabled && restore)
+            {
+                EXPECT_FALSE(prefix.bypassed) << prefix.bypass_reason;
+                EXPECT_TRUE(prefix.partial_hit);
+                EXPECT_GT(prefix.matched_tokens, 0);
+                EXPECT_EQ(prefix.storage_tier, "ram");
+            }
+            else
+                EXPECT_EQ(prefix.matched_tokens, 0);
+            EXPECT_EQ(authority->reservedBytes(device, owner), family_bytes);
+        }
+        bool declared = false, lowered = false, restored = false;
+        for (const auto &record : PerfStatsCollector::snapshot())
+        {
+            if (record.device != device.toString()) continue;
+            if (record.domain == "forward_graph" && record.name == "cuda_declared_forward_arrival_sites")
+            {
+                declared = true;
+                EXPECT_EQ(record.tags.at("prefix_sites"), "0");
+                EXPECT_DOUBLE_EQ(record.value, 0.0);
+            }
+            if (record.domain == "forward_graph" && record.name == "cuda_lowered_arrival_sites")
+            {
+                lowered = true;
+                EXPECT_DOUBLE_EQ(record.value, 0.0);
+            }
+            if (record.domain == "prefix_cache" && record.name == "lookup_results" &&
+                record.tags.at("hit_type") == "partial" && record.value > 0.0)
+                restored = true;
+        }
+        EXPECT_TRUE(declared);
+        EXPECT_TRUE(lowered);
+        EXPECT_EQ(restored, prefix_enabled);
+        // The external comparison runs each native process separately because
+        // context reset cannot discharge process-runtime PMA ownership.
+        std::cout << "CUDA ExpertOverlay prefix arrival BOM receipt: " << family_bytes;
+        for (const auto &tokens : outputs)
+            for (const auto token : tokens)
+                std::cout << ' ' << token;
+        std::cout << '\n';
+    }
+#endif
 
     TEST_P(MoEPipelineWeightPreparation, NativePreparationContract)
     {

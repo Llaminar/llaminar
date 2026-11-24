@@ -26485,6 +26485,14 @@ if(HAVE_CUDA OR HAVE_ROCM)
     target_include_directories(v2_integration_moe_pipeline_weight_preparation PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     target_link_libraries(v2_integration_moe_pipeline_weight_preparation PRIVATE
         llaminar2_core GTest::gtest MPI::MPI_CXX)
+    if(HAVE_CUDA)
+        add_v2_test(V2_Integration_CUDA_MoEOverlayPrefixRestoreArrivalBOM CUDA_DEVICES 1
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/scripts/run_cuda_moe_overlay_prefix_arrival_bom.py
+                $<TARGET_FILE:v2_integration_moe_pipeline_weight_preparation>
+            LABELS "V2;Integration;ProductionTestPreflight;CUDA;ExpertOverlay;PrefixCache;MemoryBudget;Regression"
+            MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 120)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDA_MoEOverlayPrefixRestoreArrivalBOM)
+    endif()
     set(_source_lifetime_backends "")
     if(HAVE_CUDA)
         list(APPEND _source_lifetime_backends CUDA)
@@ -30052,6 +30060,13 @@ add_executable(v2_test_memory_planner
     unit/planning/Test__MoEPipelineFixedMemory.cpp)
 target_link_libraries(v2_test_memory_planner llaminar2_core GTest::gtest GTest::gtest_main)
 target_include_directories(v2_test_memory_planner PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../external/vendor)
+add_v2_test(V2_Integration_CUDAArrivalOwnerMemoryAdmission
+    COMMAND $<TARGET_FILE:v2_test_memory_planner>
+        --gtest_filter=MoEOverlayMemoryPlanInputs.CUDAArrivalAdmissionRequiresBuilderDeclaration:MoEOverlayMemoryPlanInputs.CUDAArrivalCensusRequiresBaseExecutableSlots:MoEOverlayMemoryPlanInputs.CUDAPrefixEnablementPreservesEpochOwnedArrivalBOM
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;MemoryBudget;ExpertOverlay;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDAArrivalOwnerMemoryAdmission)
 # Runtime rank admission must price GPU workspace with the exact kernel
 # contract; the device-free envelope under-admitted large split-K partials.
 # Input-axis slices carry no source column origin; unequal 32-aligned TP can

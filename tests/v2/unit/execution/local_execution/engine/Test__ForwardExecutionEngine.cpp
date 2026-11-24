@@ -40,8 +40,11 @@
 #include "backends/BackendManager.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
+#include "execution/moe/DeviceMoEArrivalForwardDeclaration.h"
 #include "execution/moe/ICUDANativeArrivalCaptureStage.h"
 #include "kernels/cuda/moe/CUDAMoEKernel.h"
+#include "planning/CapturedGraphMemoryEstimator.h"
+#include "planning/PhysicalMemoryAuthority.h"
 #include <cuda_runtime.h>
 #endif
 
@@ -5326,6 +5329,22 @@ namespace
         IWorkerGPUContext &worker_;
     };
 
+    /** @brief Non-attached sibling, with real CUDA work but no live arrival site. */
+    class CUDAOrdinaryForwardStage final : public llaminar2::testing::MockComputeStage
+    {
+    public:
+        CUDAOrdinaryForwardStage(std::string name, DeviceId owner, int *output)
+            : MockComputeStage(ComputeStageType::GEMM, std::move(name), owner), output_(output) {}
+
+        bool execute(IDeviceContext *) override
+        {
+            const auto stream = static_cast<cudaStream_t>(requireGPUStream());
+            return stream && cudaMemsetAsync(output_, 0, sizeof(*output_), stream) == cudaSuccess;
+        }
+    private:
+        int *output_;
+    };
+
     /** @brief Exercise the production CUDA arrival recorder under the engine's actual capture scope. */
     class CUDAArrivalForwardStage final : public llaminar2::testing::MockComputeStage,
                                           public ICUDANativeArrivalCaptureStage
@@ -5365,6 +5384,17 @@ namespace
         int &records_;
         CUDAMoEKernel kernel_;
     };
+
+    /** @return Native bindings actually materialized since this evidence scope began. */
+    double loweredCUDAArrivalSites(DeviceId device)
+    {
+        double sites = 0;
+        for (const auto &record : PerfStatsCollector::snapshot())
+            if (record.domain == "forward_graph" && record.name == "cuda_lowered_arrival_sites" &&
+                record.device == device.toString())
+                sites += record.value;
+        return sites;
+    }
 }
 
 /** @test Cold prefix/LLEP forwards capture before any execution and replay the same native owner. */
@@ -5373,6 +5403,7 @@ TEST_F(Test__ForwardExecutionEngine, CUDAColdPrefillArrivalsCaptureBeforeFirstSu
     ScopedDebugEnv env({{"LLAMINAR_GPU_GRAPHS", "1"}, {"LLAMINAR_PREFILL_GRAPH_BUCKETS", "1"},
         {"LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES", "64"}, {"LLAMINAR_PREFILL_GRAPH_MIN_SEQ", "1"},
         {"LLAMINAR_VALIDATE_BUFFERS", "0"}, {"LLAMINAR_VALIDATE_INPUTS", "0"}, {"LLAMINAR_FAIL_ON_ZERO", "0"}});
+    ScopedForkEvidenceConfig evidence("forward_graph.cuda_lowered_arrival_sites");
     ensureNvidiaFactoryRegistered();
     const auto owner = DeviceId::cuda(0);
     auto native_device = IDeviceContext::create(owner, 1);
@@ -5391,11 +5422,21 @@ TEST_F(Test__ForwardExecutionEngine, CUDAColdPrefillArrivalsCaptureBeforeFirstSu
         for (const auto [prefix, llep] : {std::pair{true, false}, std::pair{false, true}, std::pair{true, true}})
         {
             SCOPED_TRACE(::testing::Message() << prefix << '/' << llep);
+            const auto lowered_before = loweredCUDAArrivalSites(owner);
             ASSERT_EQ(cudaMemsetAsync(device, 0, sizeof(State), stream), cudaSuccess);
             ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
             CUDAArrivalForwardHost host(*native_device, worker);
             int records = 0;
-            const auto expected = int(prefix) + int(llep);
+            using Arrival = DeviceMoEArrivalForwardDeclaration;
+            const auto declared = Arrival::declare({
+                .phase = Arrival::Phase::OrdinaryPrefill,
+                .prefix_payload = prefix ? Arrival::PrefixPayload::Attached : Arrival::PrefixPayload::Absent,
+                .row_execution = RoutedExpertRowExecutionPolicy::ParticipantAssigned,
+                .prefill_assignment = llep ? RoutedExpertAssignmentPolicy::LeastLoadedResident : RoutedExpertAssignmentPolicy::StaticOwner,
+                .row_count = 64, .top_k = 1, .minimum_routed_rows = 64,
+            }, Arrival::Transport::NativeLocalTP);
+            const auto expected = static_cast<int>(declared.sites());
+            ASSERT_EQ(expected, int(prefix) + int(llep));
             for (int i = 0; i < expected; ++i)
                 host.graph_stage_factories.push_back([&, i](const std::string &name, DeviceId stage_owner) {
                     return std::make_unique<CUDAArrivalForwardStage>(name, stage_owner, device->arrivals[i], records);
@@ -5423,6 +5464,7 @@ TEST_F(Test__ForwardExecutionEngine, CUDAColdPrefillArrivalsCaptureBeforeFirstSu
                 for (int i = 0; i < expected; ++i)
                     EXPECT_EQ(status[i].local_transfer_slot_count, 1u);
                 EXPECT_EQ(records, expected);
+                EXPECT_DOUBLE_EQ(loweredCUDAArrivalSites(owner) - lowered_before, declared.sites());
                 EXPECT_EQ(host.build_forward_graph_calls, 1);
             }
         }
@@ -5435,6 +5477,7 @@ TEST_F(Test__ForwardExecutionEngine, CUDAPrefixArrivalOwnerRetiresBeforePlacemen
     ScopedDebugEnv env({{"LLAMINAR_GPU_GRAPHS", "1"}, {"LLAMINAR_PREFILL_GRAPH_BUCKETS", "1"},
         {"LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES", "64"}, {"LLAMINAR_PREFILL_GRAPH_MIN_SEQ", "1"},
         {"LLAMINAR_VALIDATE_BUFFERS", "0"}, {"LLAMINAR_VALIDATE_INPUTS", "0"}, {"LLAMINAR_FAIL_ON_ZERO", "0"}});
+    ScopedForkEvidenceConfig evidence("forward_graph.cuda_lowered_arrival_sites");
     ensureNvidiaFactoryRegistered();
     const auto owner = DeviceId::cuda(0);
     auto native_device = IDeviceContext::create(owner, 1);
@@ -5443,7 +5486,7 @@ TEST_F(Test__ForwardExecutionEngine, CUDAPrefixArrivalOwnerRetiresBeforePlacemen
     worker.submitAndWait([&] {
         struct State
         {
-            int tokens[64], positions[64];
+            int tokens[64], positions[64], ordinary;
             CUDAArrivalForwardStage::Storage placements[3];
         };
         const auto stream = static_cast<cudaStream_t>(worker.defaultStream());
@@ -5455,13 +5498,45 @@ TEST_F(Test__ForwardExecutionEngine, CUDAPrefixArrivalOwnerRetiresBeforePlacemen
                  std::pair{true, Transaction::Ordinary}, std::pair{true, Transaction::RestoredPrefixMTPDecodeBridge}})
         {
             SCOPED_TRACE(::testing::Message() << decode << '/' << static_cast<int>(transaction));
+            using Arrival = DeviceMoEArrivalForwardDeclaration;
+            const auto declared = Arrival::declare({
+                .phase = decode ? Arrival::Phase::DecodeOrVerifier : Arrival::Phase::OrdinaryPrefill,
+                .prefix_payload = Arrival::PrefixPayload::Attached,
+                .row_execution = RoutedExpertRowExecutionPolicy::ParticipantAssigned,
+                .prefill_assignment = RoutedExpertAssignmentPolicy::StaticOwner,
+                .row_count = decode ? 1u : 64u, .top_k = 1, .minimum_routed_rows = 64,
+            }, Arrival::Transport::NativeLocalTP);
+            ASSERT_EQ(declared.sites(), 1u);
+            const auto lowered_before = loweredCUDAArrivalSites(owner);
+            const auto role = !decode ? CUDAArrivalOwnerRole::PrefixRehydration
+                : transaction == Transaction::Ordinary ? CUDAArrivalOwnerRole::PrefixDecode
+                                                       : CUDAArrivalOwnerRole::RestoredPrefixBridge;
+            // The ordinary sibling and one replaceable attached owner can
+            // coexist. Only the latter pays the arrival increment.
+            auto inventory = CapturedGraphExecutableInventory::monolithic(2);
+            inventory.cuda_arrival_owners.add({role, 1u, declared.sites()});
+            const auto family_bytes = estimateCapturedGraphExecutableBytes(owner, inventory);
+            constexpr auto memory_owner = PhysicalMemoryOwner::NativeGraphExecutable;
+            const PhysicalMemoryResource resource{.world_rank = 0, .device = owner,
+                .total_bytes = family_bytes, .admission_available_bytes = family_bytes};
+            PhysicalMemoryPlanBuilder plan;
+            plan.add(resource, memory_owner, family_bytes);
+            auto authority = std::make_shared<PhysicalMemoryAuthority>(
+                std::make_shared<const PhysicalMemoryPlanAdmissionCertificate>(plan.build()), 0);
+            // Opaque graph slabs are reserved once for the family, not leased
+            // per capture. The engine is destroyed before the family claim.
+            const auto reservation = authority->reserveNewAllocations(owner, memory_owner, family_bytes);
+            ASSERT_EQ(authority->reservedBytes(owner, memory_owner), family_bytes);
             ASSERT_EQ(cudaMemsetAsync(device, 0, sizeof(State), stream), cudaSuccess);
             ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
             CUDAArrivalForwardHost host(*native_device, worker);
             host.mock_capture_policy.allow_fast_decode = true;
             host.mock_capture_policy.allow_cached_graph_replay = true;
             int records = 0;
-            host.graph_stage_factories.push_back([&](const std::string &name, DeviceId stage_owner) {
+            bool attached = false;
+            host.graph_stage_factories.push_back([&](const std::string &name, DeviceId stage_owner) -> std::unique_ptr<IComputeStage> {
+                if (!attached)
+                    return std::make_unique<CUDAOrdinaryForwardStage>(name, stage_owner, &device->ordinary);
                 return std::make_unique<CUDAArrivalForwardStage>(name, stage_owner,
                     device->placements[host.placement_epoch], records);
             });
@@ -5471,8 +5546,13 @@ TEST_F(Test__ForwardExecutionEngine, CUDAPrefixArrivalOwnerRetiresBeforePlacemen
             input.position_ids_device = device->positions;
             input.execution_phase = decode ? ForwardExecutionPhase::Decode : ForwardExecutionPhase::Prefill;
             input.state_transaction = transaction;
-            input.rehydrate_prefix_runtime_on_device = true;
             ForwardOutput output{};
+            ASSERT_TRUE(engine.execute(input, output, host));
+            ASSERT_TRUE(engine.execute(input, output, host));
+            EXPECT_EQ(engine.replayCacheObservations(0).size(), 1u);
+            EXPECT_EQ(records, 0);
+            attached = true;
+            input.rehydrate_prefix_runtime_on_device = true;
             // The repeated B reuses exact identity. Returning to A must record
             // again because its previous native executable was already retired.
             constexpr std::array epochs{0u, 1u, 1u, 0u, 2u};
@@ -5480,11 +5560,17 @@ TEST_F(Test__ForwardExecutionEngine, CUDAPrefixArrivalOwnerRetiresBeforePlacemen
             for (std::size_t i = 0; i < epochs.size(); ++i)
             {
                 host.placement_epoch = epochs[i];
+                ASSERT_EQ(authority->reservedBytes(owner, memory_owner), family_bytes);
                 ASSERT_TRUE(engine.execute(input, output, host));
+                EXPECT_EQ(authority->reservedBytes(owner, memory_owner), family_bytes);
+                EXPECT_EQ(authority->remainingAdmittedNewAllocationBytes(owner, memory_owner), 0u);
                 ASSERT_NE(output.execution.stream, nullptr);
                 const auto observations = engine.replayCacheObservations(0);
-                ASSERT_EQ(observations.size(), 1u);
-                EXPECT_EQ(observations.front().signature.moe_placement_epoch, epochs[i]);
+                ASSERT_EQ(observations.size(), 2u);
+                const auto prefix_observation = std::find_if(observations.begin(), observations.end(),
+                    [](const auto &observation) { return observation.signature.rehydrate_prefix_runtime_on_device; });
+                ASSERT_NE(prefix_observation, observations.end());
+                EXPECT_EQ(prefix_observation->signature.moe_placement_epoch, epochs[i]);
                 DeviceMoERebalanceApplyStatus observed{};
                 auto *status = &device->placements[epochs[i]].status;
                 const auto producer = static_cast<cudaStream_t>(output.execution.stream);
@@ -5493,6 +5579,8 @@ TEST_F(Test__ForwardExecutionEngine, CUDAPrefixArrivalOwnerRetiresBeforePlacemen
                 ASSERT_EQ(cudaStreamSynchronize(producer), cudaSuccess);
                 EXPECT_EQ(observed.local_transfer_slot_count, 1u);
                 EXPECT_EQ(records, expected_records[i]);
+                EXPECT_DOUBLE_EQ(loweredCUDAArrivalSites(owner) - lowered_before,
+                    declared.sites() * static_cast<std::size_t>(expected_records[i]));
             }
         }
     });

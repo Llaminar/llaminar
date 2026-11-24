@@ -14,6 +14,8 @@
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "execution/moe/DeviceMoERebalanceCadenceRecipe.h"
 #include "kernels/cuda/moe/CUDAMoEKernel.h"
+#include "planning/CapturedGraphMemoryEstimator.h"
+#include "planning/PhysicalMemoryAuthority.h"
 #include <gtest/gtest.h>
 #include <array>
 #include <iostream>
@@ -31,9 +33,26 @@ namespace llaminar2::test
     /** @brief Record, instantiate and upload matched retained families on the original worker. */
     inline void proveCUDAMoEArrivalPool(IWorkerGPUContext &worker, DeviceId device,
         GPUGraphMemoryObservationScope scope, CUDAMoEArrivalPoolOwner kind,
-        bool mixed_families, std::size_t sites)
+        CUDAArrivalOwnerRole role, bool mixed_families, std::size_t sites)
     {
         worker.submitAndWait([&] {
+            constexpr std::size_t owner_count = 8;
+            constexpr auto memory_owner = PhysicalMemoryOwner::NativeGraphExecutable;
+            auto inventory = CapturedGraphExecutableInventory::monolithic(2 * owner_count + 1);
+            const auto base_bytes = estimateCapturedGraphExecutableBytes(device, inventory);
+            inventory.cuda_arrival_owners.add({role, owner_count, sites});
+            const auto family_bytes = estimateCapturedGraphExecutableBytes(device, inventory);
+            const PhysicalMemoryResource resource{.world_rank = 0, .device = device,
+                .total_bytes = family_bytes, .admission_available_bytes = family_bytes};
+            PhysicalMemoryPlanBuilder plan;
+            plan.add(resource, memory_owner, family_bytes);
+            auto authority = std::make_shared<PhysicalMemoryAuthority>(
+                std::make_shared<const PhysicalMemoryPlanAdmissionCertificate>(plan.build()), 0);
+            // Both measured families and one warm owner can coexist. Hold the
+            // single opaque family reservation before recording any of them.
+            const auto reservation = authority->reserveNewAllocations(device, memory_owner, family_bytes);
+            ASSERT_EQ(authority->plannedBytes(device, memory_owner), family_bytes);
+            ASSERT_EQ(authority->reservedBytes(device, memory_owner), family_bytes);
             const auto stream = static_cast<cudaStream_t>(worker.defaultStream());
             struct State
             {
@@ -168,8 +187,10 @@ namespace llaminar2::test
                     break;
                 }
                 }
+                ASSERT_EQ(authority->reservedBytes(device, memory_owner), family_bytes);
                 EXPECT_EQ(owner.liveLaunchReservationBytes(), exact ? incremental_quote : 0u);
                 ASSERT_TRUE(owner.instantiate());
+                EXPECT_EQ(owner.loweredLiveLaunchSiteCount(), exact ? sites : 0u);
                 if (!exact)
                     ASSERT_EQ(cudaGraphUpload(owner.executable(), stream), cudaSuccess);
             };
@@ -183,7 +204,6 @@ namespace llaminar2::test
                 ASSERT_NO_FATAL_FAILURE(build_owner(exact, warm));
                 ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
             }
-            constexpr std::size_t owner_count = 8;
             using Owners = std::vector<std::unique_ptr<CUDAGraphCapture>>;
             const auto measure = [&](bool exact, Owners &owners, std::size_t &growth) {
                 std::size_t before = 0u, after = 0u, total = 0u;
@@ -204,13 +224,25 @@ namespace llaminar2::test
             ASSERT_NO_FATAL_FAILURE(measure(false, fixed_owners, fixed));
             ASSERT_NO_FATAL_FAILURE(measure(true, live_owners, live));
             const auto growth = live > fixed ? live - fixed : 0u;
+            std::size_t materialized_quote = 0;
+            for (const auto &owner : live_owners)
+                materialized_quote += quoteCUDALiveLaunchReservationBytes(owner->loweredLiveLaunchSiteCount());
+            EXPECT_EQ(family_bytes - base_bytes, materialized_quote);
+            EXPECT_EQ(authority->reservedBytes(device, memory_owner), family_bytes);
             EXPECT_TRUE(GPUGraphMemoryContract::acceptsFamilyObservation(device,
-                {.bytes = growth, .scope = scope}, owner_count * incremental_quote));
+                {.bytes = growth, .scope = scope}, materialized_quote));
+            GPUGraphMemoryGrowth whole_family;
+            whole_family.add(fixed, scope);
+            whole_family.add(live, scope);
+            EXPECT_TRUE(GPUGraphMemoryContract::acceptsFamilyObservation(device, whole_family, family_bytes));
             std::cout << "[CUDA arrival graph pool certificate] owner=" << static_cast<int>(kind)
+                      << " role=" << static_cast<int>(role)
+                      << " scope=" << (scope == GPUGraphMemoryObservationScope::DevicePool ? "device-pool" : "system-wide")
                       << " mixed_families=" << mixed_families << " sites=" << sites
                       << " owner_count=" << owner_count << " fixed_bytes=" << fixed
                       << " live_bytes=" << live << " family_delta_bytes=" << growth
-                      << " admitted_delta_bytes=" << owner_count * incremental_quote << '\n';
+                      << " admitted_delta_bytes=" << materialized_quote
+                      << " reserved_family_bytes=" << family_bytes << '\n';
         });
     }
 } // namespace llaminar2::test

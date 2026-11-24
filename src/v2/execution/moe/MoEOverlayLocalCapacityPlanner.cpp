@@ -1571,6 +1571,8 @@ namespace llaminar2
                 const auto continuation = std::find_if(result.device_inputs.begin(), result.device_inputs.end(),
                     [&](const auto &config) { return config.device == device &&
                         config.execution_role == DeviceExecutionMemoryRole::ContinuationGraph; });
+                if (!device.is_cuda() || continuation == result.device_inputs.end())
+                    captured_inventory.cuda_arrival_owners = {};
                 if (device.is_gpu() && continuation != result.device_inputs.end())
                 {
                     const auto query_programs = profile.sparseQueryProgramCount();
@@ -1588,6 +1590,13 @@ namespace llaminar2
                     if (ordinary > std::numeric_limits<std::size_t>::max() - captured_inventory.auxiliary_executable_count)
                         throw std::overflow_error("ExpertOverlay ordinary native owner inventory overflows");
                     captured_inventory.auxiliary_executable_count += ordinary;
+                    // The copy source is itself executable, and the standalone
+                    // cadence imports it without retiring either owner. Native
+                    // generation/follower parents already pay their base slots.
+                    const auto maintenance = captured_inventory.cuda_arrival_owners.standaloneMaintenanceExecutableCount();
+                    if (maintenance > std::numeric_limits<std::size_t>::max() - captured_inventory.auxiliary_executable_count)
+                        throw std::overflow_error("ExpertOverlay CUDA maintenance owner inventory overflows");
+                    captured_inventory.auxiliary_executable_count += maintenance;
                 }
                 if(device.is_gpu() && endpoint_devices.contains(device) &&
                    rank_plan.runtime.moe_rebalance.mode==MoERebalanceRuntimeMode::Dynamic &&

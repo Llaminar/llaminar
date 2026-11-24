@@ -36,6 +36,7 @@
 #include "../NativeParallelGraphBranch.h"
 #include "../NativeGraphDependencyReduction.h"
 #include "../../utils/Logger.h"
+#include "../../utils/PerfStatsCollector.h"
 
 #include <cuda.h>
 #include <cuda/atomic>
@@ -2645,6 +2646,10 @@ namespace llaminar2
                 ? free_bytes_before - free_bytes_after
                 : 0u;
         resident_memory_bytes_ = resident_delta_bytes;
+        if (PerfStatsCollector::isRecordFamilyEnabled("forward_graph", "cuda_lowered_arrival_sites"))
+            PerfStatsCollector::addCounter("forward_graph", "cuda_lowered_arrival_sites",
+                static_cast<double>(lowered_live_launch_sites_), "graph_setup",
+                DeviceId::cuda(device_ordinal_).toString());
         LOG_DEBUG(
             "[CUDAGraphCapture] Instantiated graph executable ("
             << node_count_

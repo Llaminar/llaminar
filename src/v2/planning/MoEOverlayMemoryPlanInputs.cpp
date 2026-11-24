@@ -14,6 +14,8 @@
 #include "planning/MoEOverlayMemoryPlanInputs.h"
 #include "execution/moe/MoEOverlayActivationBatchInventory.h"
 #include "execution/local_execution/graph/IGraphBuilder.h"
+#include "execution/local_execution/graph/GraphBuilderRegistry.h"
+#include "utils/DebugEnv.h"
 #include "models/qwen/LayerGraphIdentity.h"
 #include "config/BackendSelector.h"
 #include "execution/local_execution/engine/PrefillBucketUtils.h"
@@ -264,6 +266,87 @@ std::vector<PhysicalMemoryResource> originalMoEOverlayNativePreparationResources
     return result;
 }
 
+namespace
+{
+/** @brief Project the CUDA continuation's physical arrival owners from its original source roster. */
+CapturedCUDAArrivalOwnerInventory cudaContinuationArrivalOwners(
+    const MoEOverlayMemoryPlanInputRequest &request,
+    const MoEOverlayActivationBatchInventory &sources,
+    const MTPGraphOwnerPlan &generation_owners,
+    DeviceGenerationExecutionDomain execution_domain,
+    MTPGenerationParentRole parent_role)
+{
+    CapturedCUDAArrivalOwnerInventory result;
+    const auto &plan = *request.config.moe_routed_expert_plan;
+    const auto &domains = request.execution.domains;
+    const auto continuation = std::find_if(domains.begin(), domains.end(),
+        [&](const auto &domain) { return domain.name == request.execution.base_model_domain; });
+    if (!request.execution.ownsContinuationGraph() || continuation == domains.end() ||
+        !std::any_of(continuation->participants.begin(), continuation->participants.end(),
+            [](const auto &member) { return member.owned_by_current_rank && member.local_device.is_cuda(); }))
+        return result;
+
+    const auto declare = GraphBuilderRegistry::requireArrivalDeclaration(request.model.architecture);
+    const auto &env = debugEnv().moe_rebalance;
+    if (!env.device_rebalance_maintenance_graph)
+        return result;
+    const bool native_transport = continuation->scope == ExecutionDomainScope::RANK_LOCAL &&
+        continuation->participants.size() > 1u && continuation->participants.size() <= kDeviceMoEMaxParticipants &&
+        (continuation->backend == CollectiveBackendType::AUTO || continuation->backend == CollectiveBackendType::NCCL) &&
+        std::all_of(continuation->participants.begin(), continuation->participants.end(),
+            [](const auto &member) { return member.owned_by_current_rank && member.local_device.is_cuda(); });
+    if (!native_transport)
+        return result;
+
+    const auto &policy = request.capacity_policy;
+    const bool maintenance = policy.usesDeviceTransferDirectory() &&
+        policy.device_rebalance_workspace_capacity->usesCollectivePayloadLane();
+    const auto &runtime = request.rank_plan.runtime;
+    using Arrival = DeviceMoEArrivalForwardDeclaration;
+    using Source = MoEOverlayActivationBatchInventory::SourceKind;
+    if (plan.routed_tiers.empty())
+        throw std::invalid_argument("CUDA arrival-site admission has no original routed tier");
+    const auto tier = std::find_if(plan.domains.begin(), plan.domains.end(),
+        [&](const auto &domain) { return domain.name == plan.routed_tiers.front().domain; });
+    if (tier == plan.domains.end())
+        throw std::invalid_argument("CUDA arrival-site admission has no original routed domain");
+    const auto row_execution = tier->usesParticipantAssignedPrefill()
+        ? RoutedExpertRowExecutionPolicy::ParticipantAssigned : RoutedExpertRowExecutionPolicy::FullyReplicatedLocal;
+    for (const auto &source : sources.sources())
+    {
+        // The overlay builder only declares sites in original ordinary prefill
+        // owners. Its epoch-owned archive role never emits an attached owner.
+        if (source.kind != Source::PrefillBucket && source.kind != Source::RequestPrefill)
+            continue;
+        const auto declaration = declare({
+            .phase = Arrival::Phase::OrdinaryPrefill,
+            .prefix_payload = Arrival::PrefixPayload::OverlayEpochOwned,
+            .row_execution = row_execution,
+            .prefill_assignment = tier->routed_prefill_assignment_policy,
+            .row_count = static_cast<std::uint64_t>(source.maximum_rows),
+            .top_k = static_cast<std::uint64_t>(request.model.expert_used_count),
+            .minimum_routed_rows = runtime.moe_routed_prefill.least_loaded_min_routed_rows,
+        }, Arrival::Transport::NativeLocalTP);
+        if (declaration.sites() != 0u && source.model_layers.size() >
+            std::numeric_limits<std::size_t>::max() / declaration.sites())
+            throw std::overflow_error("CUDA forward arrival-site count overflows size_t");
+        result.add({CUDAArrivalOwnerRole::Prefill, request.model_graph_topology_variant_count,
+            source.model_layers.size() * declaration.sites()});
+    }
+    if (maintenance)
+    {
+        result.add({CUDAArrivalOwnerRole::MaintenanceCopy, 1u, 1u});
+        result.add({CUDAArrivalOwnerRole::StandaloneCadence, 1u, 1u});
+        if (execution_domain == DeviceGenerationExecutionDomain::NativeDomain)
+            result.add({parent_role == MTPGenerationParentRole::PipelineFollower
+                    ? CUDAArrivalOwnerRole::PipelineFollower : CUDAArrivalOwnerRole::GenerationParent,
+                generation_owners.retainsGraphCapacity() ? generation_owners.generationParentGraphSlots()
+                    : request.model.sparseQueryProgramCount(), 1u});
+    }
+    return result;
+}
+} // namespace
+
 MoEOverlayMemoryPlanInputs buildMoEOverlayMemoryPlanInputs(
     const MoEOverlayMemoryPlanInputRequest &request, int resident_prefill_rows)
 {
@@ -442,11 +525,14 @@ MoEOverlayMemoryPlanInputs buildMoEOverlayMemoryPlanInputs(
     auto graph_owners = serving.mtp_graph_owners;
     if (request.native_pipeline_maintenance_budget && graph_owners.ownsControllerExecutables())
         graph_owners = graph_owners.withVerifierPreparationTopology(MTPGraphOwnerPlan::VerifierPreparationTopology::NativePipelineMaintenance);
-    const auto captured = resolveMoEOverlayCapturedGraphPlan(
+    auto captured = resolveMoEOverlayCapturedGraphPlan(
         family.main_layer_count, overlay->authority_execution, graph_identities,
         request.model_graph_topology_variant_count,
         family_count + graph_owners.generalAuxiliaryExecutableSlotCount(),
         graph_owners.boundedHelperExecutableSlotCount());
+
+    captured.resident_executables.cuda_arrival_owners = cudaContinuationArrivalOwners(
+        request, *batch_inventory, graph_owners, generation.domain(), parent_role);
 
     std::optional<MoEOverlayHostDemandMemoryPlan> host_demand;
     if (overlay->authority_execution == MoEOverlayAuthorityExecutionKind::HostResident &&

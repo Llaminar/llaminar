@@ -18,7 +18,14 @@ namespace llaminar2
     struct DeviceMoEArrivalForwardDeclaration
     {
         enum class Phase : uint8_t { OrdinaryPrefill, DecodeOrVerifier, Predictor };
-        enum class PrefixPayload : uint8_t { Absent, Attached };
+        /** @brief Only portable request-owned tables can attach prefix payload work.
+         *
+         * ExpertOverlay uses a model-lifetime epoch ticket. Prefix capture omits
+         * every ticketed table and restore rejects an archive naming one, so an
+         * epoch-owned forward cannot lower a prefix payload arrival even when
+         * the prefix cache or current-batch LLEP is enabled.
+         */
+        enum class PrefixPayload : uint8_t { Absent, Attached, OverlayEpochOwned };
         enum class Transport : uint8_t { None, NativeLocalTP };
 
         struct Request

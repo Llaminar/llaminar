@@ -5557,8 +5557,9 @@ namespace llaminar2
         const Arrival::Request arrival_request{
             .phase = mtp_sidecar_context ? Arrival::Phase::Predictor :
                 (ordinary_prefill_graph ? Arrival::Phase::OrdinaryPrefill : Arrival::Phase::DecodeOrVerifier),
-            .prefix_payload = prefixRuntimeRehydrationGraphActive() && device.is_gpu()
-                ? Arrival::PrefixPayload::Attached : Arrival::PrefixPayload::Absent,
+            .prefix_payload = use_expert_overlay ? Arrival::PrefixPayload::OverlayEpochOwned :
+                (prefixRuntimeRehydrationGraphActive() && device.is_gpu()
+                    ? Arrival::PrefixPayload::Attached : Arrival::PrefixPayload::Absent),
             .row_execution = routed_row_execution_policy,
             .prefill_assignment = config_.moe.routed_prefill_assignment_policy,
             .row_count = static_cast<uint64_t>(std::max(0, total_tokens)),
@@ -5646,6 +5647,10 @@ namespace llaminar2
             arrival_request, native_arrival_transport ? Arrival::Transport::NativeLocalTP : Arrival::Transport::None)}
             : std::nullopt;
         const bool prefix_runtime_device_rehydration = device_arrivals && device_arrivals->prefix();
+        if (device.is_cuda() && PerfStatsCollector::isRecordFamilyEnabled("forward_graph", "cuda_declared_forward_arrival_sites"))
+            PerfStatsCollector::addCounter("forward_graph", "cuda_declared_forward_arrival_sites",
+                static_cast<double>(device_arrivals->sites()), "graph_setup", device.toString(),
+                {{"prefix_sites", prefix_runtime_device_rehydration ? "1" : "0"}});
         const RoutedExpertAssignmentPolicy prefill_routed_expert_assignment_policy =
             (routed_row_execution_policy ==
                  RoutedExpertRowExecutionPolicy::ParticipantAssigned &&

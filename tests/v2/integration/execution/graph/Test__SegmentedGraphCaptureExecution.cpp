@@ -3035,18 +3035,28 @@ TEST_F(CachedGraphReplayExecutionTest, CUDAMoEArrivalFinalOwnersFitNativePool)
     for (const bool mixed_families : {false, true})
     {
         SCOPED_TRACE(mixed_families);
-        for (const auto owner : {Owner::StandaloneCopy, Owner::StandaloneCadence,
-                Owner::OrdinaryDecode, Owner::NativeMTPFixed, Owner::NativeMTPDynamic,
-                Owner::OrdinaryFollower, Owner::SpeculativeFollower, Owner::ForwardTimeline})
+        using Role = CUDAArrivalOwnerRole;
+        for (const auto [owner, role] : {
+                std::pair{Owner::StandaloneCopy, Role::MaintenanceCopy},
+                std::pair{Owner::StandaloneCadence, Role::StandaloneCadence},
+                std::pair{Owner::OrdinaryDecode, Role::GenerationParent},
+                std::pair{Owner::NativeMTPFixed, Role::GenerationParent},
+                std::pair{Owner::NativeMTPDynamic, Role::GenerationParent},
+                std::pair{Owner::OrdinaryFollower, Role::PipelineFollower},
+                std::pair{Owner::SpeculativeFollower, Role::PipelineFollower},
+                std::pair{Owner::ForwardTimeline, Role::PrefixDecode},
+                std::pair{Owner::ForwardTimeline, Role::RestoredPrefixBridge},
+                std::pair{Owner::ForwardTimeline, Role::PrefixRehydration}})
         {
             SCOPED_TRACE(static_cast<int>(owner));
-            ASSERT_NO_FATAL_FAILURE(proveCUDAMoEArrivalPool(*gpu_ctx_, device, scope, owner, mixed_families, 1u));
+            SCOPED_TRACE(static_cast<int>(role));
+            ASSERT_NO_FATAL_FAILURE(proveCUDAMoEArrivalPool(*gpu_ctx_, device, scope, owner, role, mixed_families, 1u));
         }
         for (const std::size_t sites : {64u, 1024u})
         {
             SCOPED_TRACE(sites);
             ASSERT_NO_FATAL_FAILURE(proveCUDAMoEArrivalPool(*gpu_ctx_, device, scope,
-                Owner::ForwardTimeline, mixed_families, sites));
+                Owner::ForwardTimeline, Role::Prefill, mixed_families, sites));
         }
     }
 }
