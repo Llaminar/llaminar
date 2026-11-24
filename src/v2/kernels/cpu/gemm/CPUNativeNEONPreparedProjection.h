@@ -728,6 +728,20 @@ namespace llaminar2::cpu::native_quantised
             }
         }
 
+        /**
+         * @brief Whether a per-block superblock-coded walk streams units and hoists its source header.
+         * @tparam Ops Admitted operation set.
+         * @tparam Physical Prepared encoding.
+         * @return True for IQ4_XS under the SDOT/SMMLA families. The ASIMD
+         * widening walk keeps per-block header addressing: its widened products
+         * already occupy the vector file, and a superblock-invariant header half
+         * would raise live vector state across the K traversal (the tile
+         * register witness admits no such pressure). Q6_K keeps its per-block
+         * addressing for the same reason.
+         */
+        template <typename Ops, Encoding Physical> static constexpr bool hoistsSourceHeader() noexcept
+        { return Physical == Encoding::NibbleLUTSourceScale && Ops::instruction != Dot::ASIMD; }
+
         /** @brief Visit increasing-K blocks without recomputing addresses or header factors in the K loop.
          * @tparam Physical Prepared encoding.
          * @tparam Coded Codebook of a coded source, or zero for the generic per-block tile.
@@ -735,12 +749,38 @@ namespace llaminar2::cpu::native_quantised
          * @param first First block of the current ordered partition.
          * @param last Exclusive end of the current ordered partition.
          * @param column First lane of the four-column strip.
-         * @param visit Always-inlined consumer of (block, unit, widened header factors).
+         * @param visit Always-inlined consumer of (block, unit, base): widened header
+         *        factors for compact coded sources, the superblock header address when
+         *        hoistsSourceHeader(), or nullptr (the visitor addresses any header per block).
          */
         template <Encoding Physical, int Coded, typename Ops, typename Visit>
         [[gnu::always_inline]] void forPartitionBlocks(int first, int last, [[maybe_unused]] int column, Visit &&visit) const noexcept
         {
-            if constexpr (Coded == 0)
+            if constexpr (Coded == 0 && hoistsSourceHeader<Ops, Physical>())
+            {
+                // IQ4_XS: per-block payload and code planes, one source header
+                // per superblock. Address the header and the first unit once per
+                // partition/superblock intersection and stream the units; the
+                // visitor receives the header so its source half is loaded and
+                // widened outside the per-block work.
+                // The admitted publication's stride and header width are the
+                // encoding's constants; building the geometry from them keeps the
+                // address arithmetic scalar.
+                constexpr std::size_t stride = preparedInterleavedBlockStride(Physical, false, 0);
+                const CPUNativeQuantisedBlockGeometry geometry{.block_stride = stride,
+                    .header_bytes = preparedSuperblockHeaderBytes(Physical, 0),
+                    .blocks_per_row = std::size_t(weights_.blocks_per_row)};
+                const auto *root = weights_.interleavedBase() + std::size_t(chunk_) * geometry.rowBytes();
+                for (int block = first; block < last; )
+                {
+                    const int end = std::min(last, static_cast<int>(geometry.superblockEnd(block)));
+                    const auto *unit = root + geometry.blockOffset(0, block);
+                    const auto *header = root + geometry.headerOffset(0, block);
+                    for (; block < end; ++block, unit += stride)
+                        visit(block, unit, header);
+                }
+            }
+            else if constexpr (Coded == 0)
             {
                 for (int block = first; block < last; ++block)
                 {
@@ -778,25 +818,39 @@ namespace llaminar2::cpu::native_quantised
          * @param column First of four output columns.
          * @param group Nibble group in [0,3] covering K groups @p group and @p group + 4.
          * @return The two signed-byte vectors consumed by the exact integer dot.
+         * @details One table lookup broadcasts each column's fifth-bit byte to its
+         * four value lanes; one bit test per half selects the lane's bit. Q5_0
+         * tests the complemented byte, so a clear fifth bit yields an all-ones
+         * lane whose upper nibble 0xF is inserted above the nibble value:
+         * `n | 0xF0` is exactly `n - 16` as a signed byte, and a set fifth bit
+         * leaves `n = (n + 16) - 16`. Q5_1 inserts bit 4 with one bitwise
+         * select. Both produce the original signed source bytes.
          */
         template <bool Centered> [[gnu::always_inline]] static inline std::array<int8x16_t, 2>
         ordinaryQ5Groups(const std::uint8_t *unit, int column, int group) noexcept
         {
             const auto raw = vld1q_u8(unit + Q5NativePayload::nibbleOffset(group, column));
-            const auto fifth = vld1q_u8(unit + Q5NativePayload::fifthOffset(0, column));
+            auto fifth = vld1q_u8(unit + Q5NativePayload::fifthOffset(0, column));
+            if constexpr (Centered)
+                fifth = vmvnq_u8(fifth);
             const uint8x16_t lane{0, 0, 0, 0, 4, 4, 4, 4, 8, 8, 8, 8, 12, 12, 12, 12};
             const uint8x16_t positions{1, 2, 4, 8, 1, 2, 4, 8, 1, 2, 4, 8, 1, 2, 4, 8};
             const auto bits = vqtbl1q_u8(fifth, vaddq_u8(lane, vdupq_n_u8(static_cast<std::uint8_t>(group))));
-            const auto low_set = vtstq_u8(bits, positions);
-            const auto high_set = vtstq_u8(bits, vshlq_n_u8(positions, 4));
-            const auto low = vandq_u8(raw, vdupq_n_u8(15));
-            const auto high = vshrq_n_u8(raw, 4);
+            const auto low_selected = vtstq_u8(bits, positions);
+            const auto high_selected = vtstq_u8(bits, vshlq_n_u8(positions, 4));
             if constexpr (Centered)
-                return {vreinterpretq_s8_u8(vsubq_u8(low, vbicq_u8(vdupq_n_u8(16), low_set))),
-                        vreinterpretq_s8_u8(vsubq_u8(high, vbicq_u8(vdupq_n_u8(16), high_set)))};
+            {
+                // Insert the all-ones/zero lane as the upper nibble: under the
+                // high nibble shifted down (SRI, raw stays intact), then over the
+                // low nibble kept in place (SLI, raw's last use), without
+                // separately extracting either nibble.
+                const auto high_value = vsriq_n_u8(high_selected, raw, 4);
+                const auto low_value = vsliq_n_u8(raw, low_selected, 4);
+                return {vreinterpretq_s8_u8(low_value), vreinterpretq_s8_u8(high_value)};
+            }
             else
-                return {vreinterpretq_s8_u8(vbslq_u8(vdupq_n_u8(16), low_set, low)),
-                        vreinterpretq_s8_u8(vbslq_u8(vdupq_n_u8(16), high_set, high))};
+                return {vreinterpretq_s8_u8(vbslq_u8(vdupq_n_u8(16), low_selected, vandq_u8(raw, vdupq_n_u8(15)))),
+                        vreinterpretq_s8_u8(vbslq_u8(vdupq_n_u8(16), high_selected, vshrq_n_u8(raw, 4)))};
         }
 
         /**
@@ -1100,16 +1154,25 @@ namespace llaminar2::cpu::native_quantised
          * @tparam Ops Admitted integer instruction implementation.
          * @tparam Physical Q6_K or IQ4_XS encoding.
          * @param unit Admitted block address of the current K block.
+         * @param header Source superblock header serving the current K block when
+         *        hoistsSourceHeader() (from forPartitionBlocks()); otherwise ignored
+         *        and addressed from @p block.
          * @param column First of four output columns.
          * @param block Logical K block owning the code plane.
          * @return Exact FP32 factors for the two Q6_K halves or the whole IQ4_XS block.
          */
         template <typename Ops, Encoding Physical>
-        [[gnu::always_inline]] auto codedScales(const std::uint8_t *unit, int column, int block) const noexcept
+        [[gnu::always_inline]] auto codedScales(const std::uint8_t *unit, [[maybe_unused]] const std::uint8_t *header,
+            int column, [[maybe_unused]] int block) const noexcept
         {
             constexpr auto codebook = superblockMetadataCodebook(Physical, 8);
             const auto *plane = unit + preparedCodedPlaneOffset(Physical, weights_.data_stride);
-            const auto *bases = reinterpret_cast<const std::uint16_t *>(weights_.admittedSuperblockHeader(chunk_, block));
+            const std::uint8_t *source_header;
+            if constexpr (hoistsSourceHeader<Ops, Physical>())
+                source_header = header;
+            else
+                source_header = weights_.admittedSuperblockHeader(chunk_, block);
+            const auto *bases = reinterpret_cast<const std::uint16_t *>(source_header);
             typename Ops::I code;
             if constexpr (Physical == Encoding::Q6KNativeDualScale)
                 code = Ops::words(reinterpret_cast<const std::uint16_t *>(plane) + column);
@@ -1328,7 +1391,7 @@ namespace llaminar2::cpu::native_quantised
                             }
                             else if constexpr (preparedSuperblockCoded(Physical))
                             {
-                                const auto factors = codedScales<Ops, Physical>(unit, column, block);
+                                const auto factors = codedScales<Ops, Physical>(unit, base, column, block);
                                 scale0 = factors.primary;
                                 scale1 = factors.secondary;
                             }
@@ -1478,7 +1541,7 @@ namespace llaminar2::cpu::native_quantised
                 const int first = partition * blocks_per_partition_;
                 const int last = std::min(first + blocks_per_partition_, weights_.blocks_per_row);
                 forPartitionBlocks<Physical, 0, Ops>(first, last, column0, [&](int block, const std::uint8_t *unit,
-                    std::nullptr_t) __attribute__((always_inline)) {
+                    [[maybe_unused]] const auto &base) __attribute__((always_inline)) {
                     I low[Rows][S]{}, high[Rows][S]{};
                     if constexpr (Physical == Encoding::Q6KNativeDualScale)
                     {
@@ -1505,11 +1568,12 @@ namespace llaminar2::cpu::native_quantised
                     }
                     else if constexpr (Physical == Encoding::Q5NativeSingleScale)
                     {
+                        // Strip-outer: one strip's fifth-bit bytes are live at a time
+                        // while every group of the shared activation block is consumed.
                         const auto blocks = activationBlocks<Ops>(block);
-                        forEachGroup<4>([&]<int Group>() __attribute__((always_inline)) {
 #pragma GCC unroll 4
-                            for (int strip = 0; strip < S; ++strip)
-                            {
+                        for (int strip = 0; strip < S; ++strip)
+                            forEachGroup<4>([&]<int Group>() __attribute__((always_inline)) {
                                 const auto weights = ordinaryQ5Groups<Map == NibbleMap::Centered>(unit, column0 + 4 * strip, Group);
 #pragma GCC unroll 4
                                 for (std::size_t row = 0; row < Rows; ++row)
@@ -1517,8 +1581,7 @@ namespace llaminar2::cpu::native_quantised
                                     low[row][strip] = Ops::template dotLane<Group>(low[row][strip], std::bit_cast<I>(weights[0]), blocks[row]);
                                     low[row][strip] = Ops::template dotLane<Group + 4>(low[row][strip], std::bit_cast<I>(weights[1]), blocks[row]);
                                 }
-                            }
-                        });
+                            });
                     }
                     else if constexpr (nibble)
                     {
@@ -1566,7 +1629,7 @@ namespace llaminar2::cpu::native_quantised
                         F scale0, scale1{};
                         if constexpr (preparedSuperblockCoded(Physical))
                         {
-                            const auto factors = codedScales<Ops, Physical>(unit, column, block);
+                            const auto factors = codedScales<Ops, Physical>(unit, base, column, block);
                             scale0 = factors.primary;
                             scale1 = factors.secondary;
                         }

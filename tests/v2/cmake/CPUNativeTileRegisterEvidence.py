@@ -186,9 +186,9 @@ ld2r list,mem|ldp d,d,mem|ldp d,d,mem,imm|ldp q,q,mem|ldp q,q,mem,imm|ldp s,s,me
 ldp x,x,mem,imm|ldpsw x,x,mem|ldr b,mem|ldr d,mem|ldr d,mem,imm|ldr h,mem|ldr q,mem|ldr q,mem,imm|ldr s,mem
 ldr w,mem|ldr x,mem|ldrb w,mem|ldrh w,mem|ldrsh w,mem|ldrsw x,mem|ldur d,mem|ldur s,mem|ldur q,mem|ldur w,mem|ldur x,mem|lsl w,w,imm|lsl x,x,imm
 lsr x,x,imm|lsr x,x,x|madd x,x,x,x|mov d,v[]|mov v,v|mov v[],v[]|mov v[],w|mov w,imm|mov w,w|mov x,imm|mov x,x|movi d,imm|movi v,imm
-movi v,imm,shift|movk x,imm,shift|mul w,w,w|mul x,x,x|mvni v,imm|mvni v,imm,shift|negs w,w|nop|orr v,imm|orr v,v,v|orr w,w,imm
+movi v,imm,shift|movk x,imm,shift|mul w,w,w|mul x,x,x|mvn v,v|mvni v,imm|mvni v,imm,shift|negs w,w|nop|orr v,imm|orr v,v,v|orr w,w,imm
 orr w,w,w|orr w,w,w,shift|orr x,x,imm|orr x,x,x,shift|ret|saddlp v,v|sbfiz x,x,imm,imm|scvtf s,w|scvtf v,v
-sdot v,v,v|sdot v,v,v[]|shl v,v,imm|shrn v,v,imm|shll v,v,imm|smaddl x,w,w,x|smmla v,v,v|smull v,v,v|smull x,w,w|smull2 v,v,v|sshll v,v,imm|sshl v,v,v|sshr v,v,imm
+sdot v,v,v|sdot v,v,v[]|shl v,v,imm|sli v,v,imm|shrn v,v,imm|shll v,v,imm|smaddl x,w,w,x|smmla v,v,v|smull v,v,v|smull x,w,w|smull2 v,v,v|sshll v,v,imm|sshl v,v,v|sri v,v,imm|sshr v,v,imm
 st1 list,mem|st1 list,mem,imm|st1 list[],mem|stp d,d,mem|stp q,q,mem|stp w,w,mem|stp x,x,mem|str b,mem|str d,mem|str d,mem,imm|str q,mem,imm
 str h,mem|str q,mem|str s,mem|str w,mem|str x,mem|stur d,mem|stur q,mem|stur w,mem|stur x,mem|sub v,v,v|sub w,w,imm|sub w,w,w
 sub x,x,imm|sub x,x,imm,shift|sub x,x,x|subs w,w,imm|subs w,w,w|sxth w,w|sxtw x,w|tbl v,list,v|tbnz w,imm,sym|tbnz x,imm,sym|tbz w,imm,sym
