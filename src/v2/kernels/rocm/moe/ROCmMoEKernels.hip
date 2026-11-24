@@ -7990,6 +7990,7 @@ namespace
                rebalance_directory_copy_ready(entry);
     }
 
+#if !defined(__gfx906__)
     __device__ __forceinline__ bool rebalance_transfer_slot_copy_complete(
         const DeviceMoEExpertDirectoryEntryView &entry,
         uint32_t participant,
@@ -8003,6 +8004,7 @@ namespace
                (entry.flags & kDeviceMoEDirectoryFlagResident) != 0u &&
                (entry.flags & kDeviceMoEDirectoryFlagCopyComplete) != 0u;
     }
+#endif
 
     /**
      * @brief Authenticate a completed transfer publication for one plan wave.
@@ -8011,8 +8013,8 @@ namespace
      * both the leased generation transition and current command epoch prevents
      * that stale publication from satisfying a newer apply operation. The decode
      * router only consumes this receipt; payload packing runs in separate kernels.
-     * On gfx906 keep the three role/plane checks in a cold callee so their
-     * temporaries do not share the router's register allocation.
+     * On gfx906 keep the receipt check out of the router's register allocation,
+     * and check one projection at a time to bound the callee's live state.
      */
 #if defined(__gfx906__)
     __device__ __attribute__((noinline))
@@ -8025,6 +8027,43 @@ namespace
         uint32_t participant,
         uint32_t command_epoch)
     {
+#if defined(__gfx906__)
+        constexpr uint32_t flags = kDeviceMoEDirectoryFlagValid |
+            kDeviceMoEDirectoryFlagTransferSlot | kDeviceMoEDirectoryFlagResident |
+            kDeviceMoEDirectoryFlagCopyComplete;
+        const auto generation = plan.destination_generation + 1u;
+        // These are independent scalar reads of the two bound records. Combine
+        // the predicates without short-circuiting to avoid nested EXEC masks.
+        if (!((generation != 0u) & (entry.generation == generation) &
+              (entry.epoch == command_epoch) & (entry.participant == participant) &
+              (entry.slot_index != kDeviceMoEInvalidSlot) & ((entry.flags & flags) == flags) &
+              (entry.layer == plan.layer) & (entry.expert == plan.expert) &
+              (entry.descriptor.logical_expert_id == static_cast<int32_t>(plan.expert)) &
+              (entry.descriptor.local_slot >= 0)))
+            return false;
+
+        const auto &desc = entry.descriptor;
+        if (llaminar2::deviceMoEWeightFormatIsFloating(desc.weight_format))
+            return llaminar2::deviceMoEFloatingExpertCopyReady(desc);
+        if (desc.weight_format != llaminar2::DeviceMoEWeightFormat::NativeQuantised ||
+            !llaminar2::deviceMoEProjectionPayloadValid(desc))
+            return false;
+        const bool fragment = desc.projection_set == llaminar2::DeviceMoEProjectionSet::IntermediateShard;
+        const unsigned count = desc.projection_set == llaminar2::DeviceMoEProjectionSet::GateUp ? 2u : 3u;
+#pragma clang loop unroll(disable)
+        for (unsigned role = 0; role < count; ++role)
+        {
+            const auto &matrix = role == 0u ? desc.gate : role == 1u ? desc.up : desc.down;
+            // Matrix copy readiness includes the basic shape/plane checks;
+            // original intermediate shards also require source publication.
+            if (!rebalance_matrix_copy_ready(matrix, entry))
+                return false;
+            if (fragment && (matrix.source_identity_present != 1u ||
+                !llaminar2::NativeQuantisedDescriptorValidation::publishable(matrix)))
+                return false;
+        }
+        return true;
+#else
         return plan.destination_generation != 0xffffffffu &&
                entry.generation == plan.destination_generation + 1u &&
                entry.epoch == command_epoch &&
@@ -8033,6 +8072,7 @@ namespace
                    participant,
                    plan.layer,
                    plan.expert);
+#endif
     }
 
     __device__ __forceinline__ bool rebalance_directory_fits_transfer_capacity(
