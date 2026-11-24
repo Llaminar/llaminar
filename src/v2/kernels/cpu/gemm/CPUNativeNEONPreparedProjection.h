@@ -492,15 +492,33 @@ namespace llaminar2::cpu::native_quantised
 
         /** @brief Merge four columns' contiguous Q5_K high-plane slice into the dot bytes.
          * @param low Sixteen unpacked low nibbles in dot-lane order.
-         * @param plane Two readable bytes, holding four high bits per column.
+         * @param plane Two payload bytes holding four high bits per column. The
+         *        single-row reader may also read six adjacent bytes in the unit.
+         * @tparam LoadLowHalf Use a scalar SIMD load for the single-row SDOT schedule.
          * @return Sixteen complete unsigned five-bit source values.
+         * @details The lookup reads only SIMD bytes 0 and 1, so the decode leaf
+         * can load a low SIMD half and avoid broadcasting a halfword before TBL.
+         * Retain the existing load schedule for the multi-row and widening leaves.
          */
+        template <bool LoadLowHalf = false>
         [[gnu::always_inline]] static uint8x16_t q5KMerge(uint8x16_t low, const std::uint8_t *plane) noexcept
         {
-            std::uint16_t packed;
-            std::memcpy(&packed, plane, sizeof(packed));
             const uint8x16_t select{0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1};
-            const auto bits = vqtbl1q_u8(vreinterpretq_u8_u16(vdupq_n_u16(packed)), select);
+            uint8x16_t source;
+            if constexpr (LoadLowHalf)
+            {
+                // Every plane slice belongs to a sealed unit with the code
+                // bytes immediately after the plane, including the last slice
+                // of the last column strip. TBL ignores bytes 2 through 15.
+                source = vcombine_u8(vld1_u8(plane), vdup_n_u8(0));
+            }
+            else
+            {
+                std::uint16_t packed;
+                std::memcpy(&packed, plane, sizeof(packed));
+                source = vreinterpretq_u8_u16(vdupq_n_u16(packed));
+            }
+            const auto bits = vqtbl1q_u8(source, select);
             const auto mask = vreinterpretq_u8_u64(vdupq_n_u64(0x8040201008040201ull));
             return vbslq_u8(vdupq_n_u8(16), vtstq_u8(bits, mask), low);
         }
@@ -539,14 +557,15 @@ namespace llaminar2::cpu::native_quantised
             }
             else if constexpr (Ops::instruction == Dot::DotProd && Rows == 1)
             {
+                static_assert(preparedInterleavedBlockStride(Encoding::CompactMultiScale, true, 7) >= 1024 + 256 + 6);
                 // Read the activation once and keep the two independent dot
                 // chains until the exact integer sum is consumed by FP32.
                 const auto a = Ops::activationBlock(activation_[0][block].qs);
                 I lo{}, hi{};
                 forEachGroup<4>([&]<int Group>() __attribute__((always_inline)) {
                     const auto raw = vld1q_u8(nibbles + Group * 256);
-                    const auto low = q5KMerge(vandq_u8(raw, vdupq_n_u8(15)), planes + Group * 32);
-                    const auto high = q5KMerge(vshrq_n_u8(raw, 4), planes + (Group + 4) * 32);
+                    const auto low = q5KMerge<true>(vandq_u8(raw, vdupq_n_u8(15)), planes + Group * 32);
+                    const auto high = q5KMerge<true>(vshrq_n_u8(raw, 4), planes + (Group + 4) * 32);
                     lo = Ops::template dotLane<Group>(lo, std::bit_cast<I>(low), a);
                     hi = Ops::template dotLane<Group + 4>(hi, std::bit_cast<I>(high), a);
                 });
