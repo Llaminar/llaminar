@@ -78,6 +78,9 @@
 
 #include "../../../utils/TestTensorFactory.h"
 #include "../../../utils/GraphArenaTestHarness.h"
+#if defined(GPU_CONTEXT_TEST_BACKEND_CUDA)
+#include "../../backends/CUDAMoEArrivalPoolProof.h"
+#endif
 
 using namespace llaminar2;
 using namespace llaminar2::test;
@@ -3018,6 +3021,36 @@ TEST_F(CachedGraphReplayExecutionTest, BoundedHelperRejectsOversizedNativeGraph)
         if (segment.capture)
             EXPECT_FALSE(segment.capture->hasExecutable());
 }
+
+#if defined(GPU_CONTEXT_TEST_BACKEND_CUDA)
+/** @test Final-owner CUDA arrival lowering fits the same opaque pool admission model. */
+TEST_F(CachedGraphReplayExecutionTest, CUDAMoEArrivalFinalOwnersFitNativePool)
+{
+    SKIP_IF_NO_GPU();
+    ASSERT_NE(gpu_ctx_, nullptr);
+    ASSERT_NE(device_ctx_, nullptr);
+    using Owner = CUDAMoEArrivalPoolOwner;
+    const auto device = device_ctx_->deviceId();
+    const auto scope = graphObservationScope(device);
+    for (const bool mixed_families : {false, true})
+    {
+        SCOPED_TRACE(mixed_families);
+        for (const auto owner : {Owner::StandaloneCopy, Owner::StandaloneCadence,
+                Owner::OrdinaryDecode, Owner::NativeMTPFixed, Owner::NativeMTPDynamic,
+                Owner::OrdinaryFollower, Owner::SpeculativeFollower, Owner::ForwardTimeline})
+        {
+            SCOPED_TRACE(static_cast<int>(owner));
+            ASSERT_NO_FATAL_FAILURE(proveCUDAMoEArrivalPool(*gpu_ctx_, device, scope, owner, mixed_families, 1u));
+        }
+        for (const std::size_t sites : {64u, 1024u})
+        {
+            SCOPED_TRACE(sites);
+            ASSERT_NO_FATAL_FAILURE(proveCUDAMoEArrivalPool(*gpu_ctx_, device, scope,
+                Owner::ForwardTimeline, mixed_families, sites));
+        }
+    }
+}
+#endif
 
 /**
  * @test Production-scale checkpoint capture remains VRAM-local and publishes

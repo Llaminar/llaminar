@@ -27767,6 +27767,12 @@ foreach(_cached_backend CUDA ROCm)
     endif()
 endforeach()
 if(HAVE_CUDA)
+    add_v2_test(V2_Integration_CUDA_MoEArrivalNativeGraphPool
+        COMMAND $<TARGET_FILE:v2_test_cached_graph_replay_execution_cuda>
+            --gtest_filter=CachedGraphReplayExecutionTest.CUDAMoEArrivalFinalOwnersFitNativePool
+        LABELS "V2;Integration;ProductionTestPreflight;CUDA;MoE;GraphCapture;MemoryAccounting;FullDeviceInventory;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDA_MoEArrivalNativeGraphPool)
     add_v2_test(V2_Integration_MoEOverlayTicketSegments_CUDA
         COMMAND $<TARGET_FILE:v2_test_cached_graph_replay_execution_cuda>
                 --gtest_filter=CachedGraphReplayExecutionTest.HeterogeneousTicketSegmentsReuseCapturedBucketAcrossLogicalLengths

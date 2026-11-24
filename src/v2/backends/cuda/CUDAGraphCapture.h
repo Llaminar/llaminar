@@ -417,6 +417,9 @@ namespace llaminar2
         /// @return The immutable CUDA device owning this capture.
         int deviceOrdinal() const noexcept { return device_ordinal_; }
 
+        /** @return Incremental pool quote for the actual final-owner import inventory. */
+        [[nodiscard]] std::size_t liveLaunchReservationBytes() const;
+
         /** @brief Import a template into an exact native scope of this unfinished owner. */
         [[nodiscard]] cudaError_t importKernelLaunchTemplate(cudaGraphNode_t *node, cudaGraph_t destination,
             const cudaGraphNode_t *dependencies, std::size_t count, const CUDAGraphCapture &source);

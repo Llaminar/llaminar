@@ -26,6 +26,7 @@
 
 #ifdef HAVE_CUDA
 
+#include "backends/cuda/CUDALiveLaunchMemoryContract.h"
 #include "backends/detail/GPUFlatGraphInspection.h"
 #include "CUDAGraphCapture.h"
 #include "NvidiaDeviceContext.h"
@@ -2008,6 +2009,11 @@ namespace llaminar2
     }
 #endif
 
+    std::size_t CUDAGraphCapture::liveLaunchReservationBytes() const
+    {
+        return quoteCUDALiveLaunchReservationBytes(deferredLaunchSites().size());
+    }
+
     cudaError_t CUDAGraphCapture::instantiateDeferredLaunches()
     {
 #if CUDART_VERSION < 13000
@@ -2551,6 +2557,7 @@ namespace llaminar2
          * headers retain the bounded diagnostic buffer because they cannot
          * express node-priority instantiation.
          */
+        const auto live_launch_pool_quote = liveLaunchReservationBytes();
         cudaGraphNode_t error_node = nullptr;
         std::array<char, 8192> instantiate_log{};
         std::size_t free_bytes_before = 0u;
@@ -2639,8 +2646,8 @@ namespace llaminar2
             "[CUDAGraphCapture] Instantiated graph executable ("
             << node_count_
             << " nodes, captured node priorities requested, resident_delta_bytes="
-            << resident_delta_bytes
-            << ", free_bytes_after=" << free_bytes_after << ")");
+            << resident_delta_bytes << ", live_launch_pool_quote_bytes="
+            << live_launch_pool_quote << ", free_bytes_after=" << free_bytes_after << ")");
         return true;
     }
 
