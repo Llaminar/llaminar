@@ -53,6 +53,8 @@ struct BundleFixture
             const int p=packet.num_projections++;
             const auto &original=operation.members[member];
             packet.payload[p]=original.weights;packet.scales[p]=original.scales;
+            packet.mins[p]=original.mins;packet.emins[p]=original.emins;
+            packet.metadata_layout[p]=original.metadata_layout;
             packet.output[p]=original.output;packet.N[p]=original.n;
             packet.codebook[p]=canonicalDeviceVnniCodebookId(original.source);
         }
@@ -72,6 +74,31 @@ TEST(ROCmVerifierBundlePolicy, OrderedSubgroupsAndResetKeepOriginalIdentity)
         EXPECT_TRUE(matchesNativeQuantisedVerifierBundle(f.operation,f.work,0));
     }
     EXPECT_TRUE(measuredNativeQuantisedVerifierBundle(f.operation));
+}
+
+/** @test The production member binding preserves a coded slice's complete plane identity. */
+TEST(ROCmVerifierBundlePolicy, CodedMemberPreservesPhaseAndBitOffset)
+{
+    BundleFixture f;
+    // Q4_K uses packed 12-bit codes, so starting on an odd code has bit offset 4.
+    const auto layout = nativeQuantisedMetadataLayout(NativeQuantisedMetadataRepresentation::SuperblockCoded, 3, 4);
+    const DeviceNativeQuantisedMatrixDesc matrix{
+        .payload = &f.weights[1], .scales = &f.scales[1], .mins = &f.scales[3],
+        .n = 1024, .k = 5120, .blocks_per_row = 160, .codebook_id = 5,
+        .source_codebook_id = 5, .source_is_superblock = 1, .source_identity_present = 1,
+        .metadata_layout = layout};
+    f.operation.members[1] = NativeQuantisedVerifierBundleMember::bind(matrix, &f.outputs[1]);
+    f.subgroup(2);
+    // The packet describes the actual producer, not the member snapshot.
+    f.packet.metadata_layout[0] = layout;
+    ASSERT_TRUE(matchesNativeQuantisedVerifierBundle(f.operation, f.work, 0));
+    for (const auto different : {uint8_t{0},
+        nativeQuantisedMetadataLayout(NativeQuantisedMetadataRepresentation::SuperblockCoded, 2, 4),
+        nativeQuantisedMetadataLayout(NativeQuantisedMetadataRepresentation::SuperblockCoded, 3, 0)})
+    {
+        f.packet.metadata_layout[0] = different;
+        EXPECT_FALSE(matchesNativeQuantisedVerifierBundle(f.operation, f.work, 0));
+    }
 }
 
 /** @test A same-shaped leaf cannot borrow a foreign row, operand, member or arithmetic policy. */

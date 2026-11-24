@@ -5664,14 +5664,8 @@ namespace llaminar2
                         (!slice || (slice->firstColumn() == 0 && slice->physicalColumns() == slice->policyColumns()));
                     if (valid)
                     {
-                        candidate.members[index] = {
-                            .weights = descriptor.payload,
-                            .scales = static_cast<const uint16_t *>(descriptor.scales),
-                            .mins = static_cast<const uint16_t *>(descriptor.mins),
-                            .emins = static_cast<const uint32_t *>(descriptor.emins),
-                            .output = static_cast<float *>(projection.output->gpu_data_ptr()),
-                            .n = projection.n,
-                            .source = {descriptor.source_codebook_id, bool(descriptor.source_is_superblock), true}};
+                        candidate.members[index] = NativeQuantisedVerifierBundleMember::bind(
+                            descriptor, static_cast<float *>(projection.output->gpu_data_ptr()));
                         valid = candidate.members[index].output != nullptr;
                     }
                 }
@@ -5710,11 +5704,8 @@ namespace llaminar2
                         valid=owner && owner->rocm_device_id_==rocm_device_id_ && output &&
                             owner->inspectPreparedNativeQuantisedMatrixDesc(descriptor) &&
                             descriptor.n==projection.n && descriptor.k==k && descriptor.source_identity_present;
-                        if(valid)*native_members[role]={.weights=descriptor.payload,
-                            .scales=static_cast<const uint16_t *>(descriptor.scales),
-                            .mins=static_cast<const uint16_t *>(descriptor.mins),
-                            .emins=static_cast<const uint32_t *>(descriptor.emins),.output=output,.n=projection.n,
-                            .source={descriptor.source_codebook_id,bool(descriptor.source_is_superblock),true}};
+                        if (valid)
+                            *native_members[role] = NativeQuantisedVerifierBundleMember::bind(descriptor, output);
                     }
                     else
                     {

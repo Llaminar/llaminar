@@ -13,14 +13,17 @@ namespace generic {
  * @brief Register value for a role already authenticated by one of the two authorities.
  * @details Shared fields originate from immutable capture kernargs. Materialize
  * fields separately to avoid selecting a shared-descriptor address in private
- * memory. A routed construction requires the real acquired-bank role view.
+ * memory. The plane pointers and layout are one binding: a coded role cannot
+ * be consumed as per-block metadata. A routed construction requires the real
+ * acquired-bank role view.
  */
 class ReadyProjectionFields final {
     friend class ::llaminar2::rocm::grouped_ffn::PreparedGroupedSharedRole;
     DeviceNativeQuantisedMatrixDesc descriptor_;
     __device__ explicit ReadyProjectionFields(const DeviceNativeQuantisedMatrixDesc& source)
         : descriptor_{.payload=source.payload,.scales=source.scales,.mins=source.mins,
-                      .emins=source.emins,.n=source.n,.codebook_id=source.codebook_id} {}
+                      .emins=source.emins,.n=source.n,.codebook_id=source.codebook_id,
+                      .metadata_layout=source.metadata_layout} {}
 public:
     /** @return Independent immutable fields from the original published role. */
     __device__ static ReadyProjectionFields from(PublishedNativeProjection projection)

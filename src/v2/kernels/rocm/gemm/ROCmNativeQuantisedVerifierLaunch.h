@@ -10,6 +10,7 @@
 #pragma once
 #include "kernels/common/ProjectionRowWork.h"
 #include "kernels/common/CapturedVerifierExtent.h"
+#include "kernels/common/DeviceNativeQuantisedMatrixDesc.h"
 #include "tensors/NativeQuantisedFormatInfo.h"
 #include <cstdint>
 #include <optional>
@@ -125,6 +126,25 @@ struct NativeQuantisedVerifierBundleMember {
     float *output = nullptr;
     int n = 0;
     NativeQuantisedSourceIdentity source{};
+
+    /**
+     * @brief Record the complete prepared plane binding for bundle and GDN authentication.
+     * @param matrix Admitted original matrix, before policy subgrouping.
+     * @param output Original destination for this projection.
+     * @return Exact member identity, including coded phase and code-bit offset.
+     */
+    [[nodiscard]] static constexpr NativeQuantisedVerifierBundleMember bind(
+        const DeviceNativeQuantisedMatrixDesc &matrix, float *output) noexcept
+    {
+        return {.weights = matrix.payload,
+                .scales = static_cast<const uint16_t *>(matrix.scales),
+                .mins = static_cast<const uint16_t *>(matrix.mins),
+                .emins = static_cast<const uint32_t *>(matrix.emins),
+                .metadata_layout = matrix.metadata_layout,
+                .output = output, .n = matrix.n,
+                .source = {matrix.source_codebook_id, bool(matrix.source_is_superblock),
+                           bool(matrix.source_identity_present)}};
+    }
 };
 /** @brief Fixed-size source and activation provenance for one complete stage operation. */
 struct NativeQuantisedVerifierBundleOperation {
