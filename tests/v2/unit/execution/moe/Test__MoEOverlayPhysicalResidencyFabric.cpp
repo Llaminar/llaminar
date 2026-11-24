@@ -9,6 +9,8 @@
  */
 
 #include "execution/moe/CpuExpertSlotPool.h"
+#include "execution/moe/GpuExpertSlotPool.h"
+#include "execution/moe/DeviceMoETransferSlotDirectory.h"
 #include "backends/BackendManager.h"
 #include "execution/moe/MoEOverlayCPUHostMaintenance.h"
 #include "loaders/ModelContext.h"
@@ -1659,6 +1661,76 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric,
             seal->compacted_shadow_experts)
             << "A sealed fabric returns the immutable terminal value instead of "
                "replaying physical copies";
+    }
+}
+
+/** @test Recycle installed GPU residents using the family's exact allocation identity.
+ * The descriptors borrow aligned backing here, without requiring a GPU context.
+ * The companion CPU fabric test runs actual resident preparation and slot recycling.
+ */
+TEST(Test__MoEOverlayPhysicalResidencyFabric, InitialGpuSlotAdoptionUsesExactFamily)
+{
+    using Pool = GpuExpertSlotPool;
+    namespace sb = native_quantised_superblock;
+    constexpr int N = 64, K = 256;
+    alignas(8) std::array<uint8_t, N * K> payload{}, primary{}, secondary{}, effective{};
+    unsigned coded_formats = 0, per_block_formats = 0;
+    for (const auto &entry : native_quantised_formats::kAllSourceFormats)
+    {
+        SCOPED_TRACE(entry.quant_type);
+        const auto &source = *entry.metadata;
+        const auto format = ExpertWeightFormat::nativeQuantised({source.codebook_id, source.is_superblock, true});
+        const auto exec = canonicalDeviceVnniFormat(source);
+        const bool coded = cpu::native_quantised::migrationUsesSuperblockCodes(source);
+        coded ? ++coded_formats : ++per_block_formats;
+        for (const auto phase : {uint8_t{0}, uint8_t{3}})
+        {
+            if (!coded && phase) continue;
+            auto family = Pool::migrationProjectionSpec("gate", N, K, format, phase);
+            const auto info = gpuPreparedWeightPoolAllocation(source, GPUPreparedWeightPoolLayout::MigrationReusable);
+            const bool in_payload = coded && sb::superblockCodeInPayload(exec.codebook_id);
+            const auto layout = coded ? nativeQuantisedMetadataLayout(NativeQuantisedMetadataRepresentation::SuperblockCoded, phase) : uint8_t{0};
+            const auto resident = makeGpuExpertPackedDescriptor({
+                .payload = payload.data(), .scales = in_payload ? payload.data() : primary.data(),
+                .mins = info.has_mins ? secondary.data() : nullptr, .emins = info.has_emins ? effective.data() : nullptr,
+                .n = N, .k = K, .blocks_per_row = K / 32, .codebook_id = exec.codebook_id,
+                .allocation_payload_bytes_per_block = info.payload_bytes_per_block,
+                .allocation_has_mins = uint8_t(info.has_mins), .allocation_has_emins = uint8_t(info.has_emins),
+                .metadata_layout = layout}, exec.payload_bytes_per_block, exec.is_asymmetric, exec.has_emins);
+            const auto adopted = Pool::adoptResidentProjection(family, resident);
+            EXPECT_EQ(adopted.spec, family);
+            EXPECT_EQ(adopted.slot.metadata_layout, layout);
+            EXPECT_EQ(adopted.slot.payload_bytes, resident.allocationPayloadBytes());
+            EXPECT_EQ(adopted.slot.mins_bytes, resident.allocationMinsBytes());
+            EXPECT_EQ(adopted.slot.d_native_quantised_payload, payload.data());
+            EXPECT_EQ(adopted.slot.d_native_quantised_scales, resident.ptrs.d_scales);
+            auto wrong = resident;
+            if (coded)
+            {
+                wrong.metadata_layout = nativeQuantisedMetadataLayout(NativeQuantisedMetadataRepresentation::SuperblockCoded, (phase + 1) % 8);
+                EXPECT_THROW((void)Pool::adoptResidentProjection(family, wrong), std::invalid_argument);
+                wrong = resident;
+                wrong.allocation_has_mins = false; // A legacy symmetric slot cannot hold the coded header.
+            }
+            else
+                wrong.allocation_payload_bytes_per_block = 0; // Immutable, non-recyclable packed root.
+            EXPECT_THROW((void)Pool::adoptResidentProjection(family, wrong), std::invalid_argument);
+        }
+    }
+    EXPECT_EQ(coded_formats, 13u);
+    EXPECT_EQ(coded_formats + per_block_formats, native_quantised_formats::kAllSourceFormats.size());
+    for (const auto type : {TensorType::FP16, TensorType::BF16, TensorType::FP32})
+    {
+        constexpr int Width = 32;
+        const auto format = ExpertWeightFormat::floating(type);
+        auto family = Pool::migrationProjectionSpec("down", N, Width, format, 0);
+        const ContiguousFloatingPointWeightDescriptor resident{
+            payload.data(), type, N, Width, N * Width * format.floatingElementBytes()};
+        const auto adopted = Pool::adoptResidentProjection(family, resident);
+        EXPECT_EQ(adopted.spec, family);
+        EXPECT_EQ(adopted.slot.payload_bytes, resident.bytes);
+        EXPECT_EQ(adopted.slot.d_native_quantised_payload, payload.data());
+        EXPECT_EQ(adopted.slot.metadata_layout, 0u);
     }
 }
 

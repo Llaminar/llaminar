@@ -8,6 +8,7 @@
  */
 
 #include "execution/moe/GpuExpertSlotPool.h"
+#include "GPUExpertTransfer.h"
 #include "loaders/GPUPreparedWeightPoolLayout.h"
 
 #include "../../backends/IBackend.h"
@@ -52,6 +53,82 @@ namespace llaminar2
         if (gpu_superblock_phase != 0)
             throw std::invalid_argument("GPU expert slot phase requires a valid coded source root");
         return std::nullopt;
+    }
+
+    GpuExpertSlotPool::ProjectionSpec GpuExpertSlotPool::migrationProjectionSpec(
+        std::string label, int n, int k, ExpertWeightFormat format, uint8_t phase)
+    {
+        ProjectionSpec spec{.label = std::move(label), .N = n, .K = k,
+                            .format = format, .gpu_superblock_phase = phase};
+        if (!format.valid() || n <= 0 || k <= 0 || (format.isNativeQuantised() && k % 32))
+            throw std::invalid_argument("Invalid reusable GPU expert projection geometry");
+        if (format.isNativeQuantised())
+        {
+            const auto *source = native_quantised_formats::forSourceIdentity(
+                format.native_quantised.codebook_id, format.native_quantised.is_superblock);
+            if (!source)
+                throw std::invalid_argument("Reusable GPU expert projection source format is not catalogued");
+            const auto storage = gpuPreparedWeightPoolAllocation(*source, GPUPreparedWeightPoolLayout::MigrationReusable);
+            spec.payload_bytes_per_block = storage.payload_bytes_per_block;
+            spec.is_asymmetric = storage.has_mins;
+            spec.has_emins = storage.has_emins;
+            spec.codebook_id = canonicalDeviceVnniCodebookId(*source);
+            spec.scale_plane = nativeQuantisedScalePlaneWidth(spec.codebook_id);
+        }
+        if (phase >= native_quantised_superblock::kBlocksPerSuperblock || (phase && !spec.codedDeclaration()))
+            throw std::invalid_argument("Invalid reusable GPU expert projection phase");
+        return spec;
+    }
+
+    GpuExpertSlotPool::ProjectionSlot GpuExpertSlotPool::adoptResidentProjection(
+        ProjectionSpec family, const GpuExpertPackedDescriptor &resident)
+    {
+        const auto fail = [&family]() {
+            throw std::invalid_argument("Initial GPU expert does not match its reusable slot family: " + family.label);
+        };
+        if (!family.format.isNativeQuantised() || !resident.valid() ||
+            resident.n != family.N || resident.k != family.K || resident.blocks_per_row != uint32_t(family.K / 32) ||
+            resident.codebook_id != family.codebook_id ||
+            resident.allocation_payload_bytes_per_block != family.payload_bytes_per_block ||
+            resident.allocation_has_mins != family.is_asymmetric || resident.allocation_has_emins != family.has_emins)
+            fail();
+        const auto coded = family.codedDeclaration();
+        if (coded)
+        {
+            namespace sb = native_quantised_superblock;
+            const auto bits = resident.blockCount() * sb::superblockCodePlaneBits(family.codebook_id);
+            const auto shift = nativeQuantisedLayoutCodeBitShift(resident.metadata_layout);
+            const auto planes = sb::planeBytes(family.codebook_id, family.N, resident.blocks_per_row, coded->superblock_phase);
+            if (!resident.metadata_layout || nativeQuantisedLayoutPhase(resident.metadata_layout) != coded->superblock_phase ||
+                resident.vnni_bytes != resident.allocationPayloadBytes() || resident.mins_bytes != planes.superblock ||
+                resident.scales_bytes != (bits ? (bits + shift + 7u) / 8u : 0u) ||
+                (!bits && resident.ptrs.d_scales != resident.ptrs.d_vnni))
+                fail();
+        }
+        else if (resident.metadata_layout)
+            fail();
+        return {.spec = std::move(family),
+                .slot = {.d_native_quantised_payload = resident.ptrs.d_vnni,
+                         .d_native_quantised_scales = resident.ptrs.d_scales,
+                         .d_native_quantised_mins = resident.ptrs.d_mins,
+                         .d_native_quantised_emins = resident.ptrs.d_emins,
+                         .payload_bytes = resident.allocationPayloadBytes(),
+                         .scales_bytes = resident.scales_bytes,
+                         .mins_bytes = resident.allocationMinsBytes(),
+                         .emins_bytes = resident.allocationEminsBytes(),
+                         .metadata_layout = resident.metadata_layout},
+                .blocks_per_row = resident.blocks_per_row};
+    }
+
+    GpuExpertSlotPool::ProjectionSlot GpuExpertSlotPool::adoptResidentProjection(
+        ProjectionSpec family, const ContiguousFloatingPointWeightDescriptor &resident)
+    {
+        if (!family.format.isFloating() || !resident.valid() || family.N != resident.n || family.K != resident.k ||
+            family.format.floatingTensorType() != resident.type)
+            throw std::invalid_argument("Initial GPU floating expert does not match its reusable slot family: " + family.label);
+        return {.spec = std::move(family),
+                .slot = {.d_native_quantised_payload = static_cast<uint8_t *>(const_cast<void *>(resident.data)),
+                         .payload_bytes = resident.bytes}};
     }
 
     std::shared_ptr<GpuExpertSlotPool> GpuExpertSlotPool::create(

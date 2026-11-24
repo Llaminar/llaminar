@@ -2514,6 +2514,12 @@ add_v2_test(V2_Integration_MoEPipelineStagePhysicalResidency
     LABELS "V2;Integration;ProductionTestPreflight;MoE;Pipeline;Residency;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS
 )
+add_v2_test(V2_Integration_MoEInitialGpuSlotAdoption
+    COMMAND $<TARGET_FILE:v2_unit_moe_overlay_physical_residency_fabric>
+        --gtest_filter=Test__MoEOverlayPhysicalResidencyFabric.InitialGpuSlotAdoptionUsesExactFamily
+    LABELS "V2;Integration;ProductionTestPreflight;MoE;ExpertOverlay;WeightLifecycle;DeviceFree;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+)
 add_v2_test(V2_Integration_MoEPipelineCPUHostOwnerScope
     COMMAND $<TARGET_FILE:v2_test_moe_pipeline_stage_binding>
         --gtest_filter=Test__MoEOverlayPipelineStageBinding.CpuTPTailRejectsMissingStageHostMaintenance
