@@ -113,15 +113,15 @@ namespace llaminar2::cpu::native_quantised
     /**
      * @brief Append a nibble dot without splitting even the nonlinear IQ4 weights.
      * @tparam Domain Whether decoded bytes are small unsigned or native signed IQ4.
-     * @param dot Exact INT32 vector accumulated from earlier groups.
+     * @param dot Register chain for at most four groups of one nibble plane.
      * @param weight Decoded nibble values in VNNI lane order.
      * @param activation Four signed activation bytes broadcast to each column.
-     * @return The original exact dot plus this group.
+     * @return Two INT16 pair sums per column, or a single INT32 sum for signed IQ4.
      *
-     * Linear nibbles and offset MXFP4 are [0,15] and [0,24]; neither can
-     * saturate VPMADDUBSW. IQ4's signed range [-127,113] excludes -128,
-     * so SIMD<8>::dot transfers the activation sign onto the weights and
-     * handles even -128 activations exactly without a correction.
+     * Linear and offset MXFP4 weights are bounded by 15 and 24. Four groups
+     * contribute eight products per INT16 lane, bounded by 8*24*128=24576.
+     * IQ4's signed range [-127,113] excludes -128, so SIMD<8>::dot transfers
+     * the activation sign exactly but widens each group before accumulating.
      */
     template <NibbleDotAVX2 Domain>
     inline __m256i dotNibbleAVX2(__m256i dot, __m256i weight, __m256i activation) noexcept
@@ -134,8 +134,24 @@ namespace llaminar2::cpu::native_quantised
                 std::bit_cast<I>(activation)));
         }
         else
-            return _mm256_add_epi32(dot, _mm256_madd_epi16(
-                _mm256_maddubs_epi16(weight, activation), _mm256_set1_epi16(1)));
+            return _mm256_add_epi16(dot, _mm256_maddubs_epi16(weight, activation));
+    }
+
+    /** @brief Finish the exact 32-term dot without narrowing a nonlinear codebook's sum.
+     * Linear nibbles can merge their two chains before widening (16*15*128 < 32768).
+     * Offset MXFP4 instead widens each chain independently before the merge.
+     */
+    template <NibbleDotAVX2 Domain>
+    inline __m256i finishNibbleDotAVX2(__m256i low, __m256i high) noexcept
+    {
+        if constexpr (Domain == NibbleDotAVX2::Linear)
+            return _mm256_madd_epi16(_mm256_add_epi16(low, high), _mm256_set1_epi16(1));
+        if constexpr (Domain == NibbleDotAVX2::SmallLUT)
+        {
+            const auto ones = _mm256_set1_epi16(1);
+            return _mm256_add_epi32(_mm256_madd_epi16(low, ones), _mm256_madd_epi16(high, ones));
+        }
+        return _mm256_add_epi32(low, high);
     }
 
     /** @brief Decode one nibble per byte after low/high extraction.
@@ -172,6 +188,101 @@ namespace llaminar2::cpu::native_quantised
         if (compensated)
             return isa::avx2_dpbusd_epi32(dot, _mm256_set1_epi32(a ^ std::int32_t(0x80808080u)), weights);
         return dotUnsignedWeightsAVX2(dot, _mm256_xor_si256(weights, _mm256_set1_epi8(-128)), _mm256_set1_epi32(a));
+    }
+
+    /** @brief Exact compensation-free expanded dot, with two bounded INT16 planes per row.
+     * Split the unsigned form of each signed weight into two nibbles. Each
+     * plane accumulates 16 products per pair lane in [-30720,30480] before
+     * widening once. Multiplying the upper dot by 16 and subtracting the
+     * usual activation-side bias recovers the signed result in INT32.
+     * @param weights First group of the selected eight-column strip in an admitted block.
+     * @param activation Independently owned activation blocks for the live rows.
+     * @return One signed INT32 dot vector per row, in the original column order.
+     */
+    template <std::size_t Rows>
+    inline auto dotExpandedBlockAVX2(const uint8_t *weights,
+        const std::array<const Q8_1Block *, Rows> &activation) noexcept
+    {
+        static_assert(Rows == 1 || Rows == 2);
+        struct Dots { __m256i values[Rows]; };
+        Dots low{}, high{};
+        const auto mask = _mm256_set1_epi8(15);
+        const auto bias = _mm256_set1_epi8(8);
+#if defined(__clang__)
+#pragma clang loop unroll(disable)
+#elif defined(__GNUC__)
+#pragma GCC unroll 1
+#endif
+        for (int g = 0; g < 8; ++g)
+        {
+            const auto raw = _mm256_load_si256(reinterpret_cast<const __m256i *>(weights + g * 256));
+            const auto lo = _mm256_and_si256(raw, mask);
+            const auto hi = _mm256_xor_si256(_mm256_and_si256(_mm256_srli_epi16(raw, 4), mask), bias);
+#pragma GCC unroll 2
+            for (std::size_t row = 0; row < Rows; ++row)
+            {
+                const auto a = _mm256_set1_epi32(nativeActivationWord(*activation[row], g * 4));
+                low.values[row] = _mm256_add_epi16(low.values[row], _mm256_maddubs_epi16(lo, a));
+                high.values[row] = _mm256_add_epi16(high.values[row], _mm256_maddubs_epi16(hi, a));
+            }
+        }
+        Dots result;
+        const auto ones = _mm256_set1_epi16(1);
+#pragma GCC unroll 2
+        for (std::size_t row = 0; row < Rows; ++row)
+        {
+            const auto lo = _mm256_madd_epi16(low.values[row], ones);
+            const auto hi = _mm256_slli_epi32(_mm256_madd_epi16(high.values[row], ones), 4);
+            result.values[row] = _mm256_sub_epi32(_mm256_add_epi32(lo, hi),
+                _mm256_set1_epi32(128 * activation[row]->sum_qs));
+        }
+        return result;
+    }
+
+    /** @brief Project one symmetric Q8 chunk with a shared block dot.
+     * The output accumulator for each row visits K in the identical serial
+     * order and uses the original prepared FP scale and policy.
+     * @tparam Rows Number of independently accumulated output rows.
+     * @tparam SumPairs Publish only the sum of two final output rows.
+     * @param packed Admitted symmetric Q8 expanded stream without weight sums.
+     * @param a,c Activation and output pointers in original row order.
+     * @param chunk,kb_start,kb_end Original chunk and half-open block interval.
+     * @param accumulate Whether the destinations own a previous FP partial.
+     */
+    template <std::size_t Rows, bool SumPairs = false>
+    inline void projectExpandedFreeAVX2(const CPUNativeQuantisedPackedWeights &packed,
+        const std::array<const Q8_1Block *, Rows> &a, const std::array<float *, Rows> &c,
+        int chunk, int kb_start, int kb_end, bool accumulate)
+    {
+        static_assert(!SumPairs || Rows == 2);
+        for (int column = 0; column < 64; column += 8)
+        {
+            __m256 fp[Rows]{};
+#pragma GCC unroll 2
+            for (std::size_t row = 0; accumulate && row < Rows; ++row)
+                fp[row] = _mm256_loadu_ps(c[row] + column);
+            for (int kb = kb_start; kb < kb_end; ++kb)
+            {
+                std::array<const Q8_1Block *, Rows> block;
+#pragma GCC unroll 2
+                for (std::size_t row = 0; row < Rows; ++row)
+                    block[row] = a[row] + kb;
+                const auto dots = dotExpandedBlockAVX2(packed.admittedBlockUnit(chunk, kb) + 4 * column, block);
+                const auto scale = packed.loadScales256(packed.chunkScales(chunk, kb) + column);
+#pragma GCC unroll 2
+                for (std::size_t row = 0; row < Rows; ++row)
+                    fp[row] = accumulateSingleScaleBlockAVX2(fp[row], dots.values[row], scale,
+                        nativeQuantisedFP16ScaleToFP32(block[row]->d), packed.numerical_policy);
+            }
+            if constexpr (SumPairs)
+                _mm256_storeu_ps(c[0] + column, _mm256_add_ps(fp[0], fp[1]));
+            else
+            {
+#pragma GCC unroll 2
+                for (std::size_t row = 0; row < Rows; ++row)
+                    _mm256_storeu_ps(c[row] + column, fp[row]);
+            }
+        }
     }
 
     /** @return The legacy per-column correction, or the compensation-free activation-side correction. */
@@ -350,7 +461,7 @@ namespace llaminar2::cpu::native_quantised
             }
 
             const __m256i corrected = _mm256_sub_epi32(
-                _mm256_add_epi32(dot_low, dot_high),
+                finishNibbleDotAVX2<Domain>(dot_low, dot_high),
                 _mm256_set1_epi32(weight_bias * activation.sum_qs));
             const auto factors = loadNibbleFactors256<Domain>(packed, chunk, kb, segment * 8);
             const float activation_scale =
@@ -480,8 +591,9 @@ namespace llaminar2::cpu::native_quantised
         if (!packed.usesExpandedInt8())
             throw std::invalid_argument(
                 "AVX2 non-nibble GEMV received an unsupported packed encoding");
-
         const bool compensated = packed.usesInlineCompensation();
+        if (!compensated && !packed.is_asymmetric && packed.codebook_id == native_quantised_formats::Q8_0.codebook_id)
+            return projectExpandedFreeAVX2(packed, std::array{A_q8}, std::array{C}, chunk, kb_start, kb_end, accumulate);
         for (int segment = 0; segment < 8; ++segment)
         {
             const int z = segment / 2;
@@ -663,9 +775,9 @@ namespace llaminar2::cpu::native_quantised
                 }
 
                 const __m256i corrected0 = _mm256_sub_epi32(
-                    _mm256_add_epi32(dot0_low, dot0_high), _mm256_set1_epi32(weight_bias * a0.sum_qs));
+                    finishNibbleDotAVX2<Domain>(dot0_low, dot0_high), _mm256_set1_epi32(weight_bias * a0.sum_qs));
                 const __m256i corrected1 = _mm256_sub_epi32(
-                    _mm256_add_epi32(dot1_low, dot1_high), _mm256_set1_epi32(weight_bias * a1.sum_qs));
+                    finishNibbleDotAVX2<Domain>(dot1_low, dot1_high), _mm256_set1_epi32(weight_bias * a1.sum_qs));
                 const auto factors = loadNibbleFactors256<Domain>(packed, chunk, kb, segment * 8);
                 const float a0_scale = nativeQuantisedFP16ScaleToFP32(a0.d);
                 const float a1_scale = nativeQuantisedFP16ScaleToFP32(a1.d);
@@ -802,8 +914,10 @@ namespace llaminar2::cpu::native_quantised
         if (!packed.usesExpandedInt8())
             throw std::invalid_argument(
                 "AVX2 non-nibble two-row kernel received an unsupported packed encoding");
-
         const bool compensated = packed.usesInlineCompensation();
+        if (!compensated && !packed.is_asymmetric && packed.codebook_id == native_quantised_formats::Q8_0.codebook_id)
+            return projectExpandedFreeAVX2<2, SumPairs>(packed, std::array{A_q8_row0, A_q8_row1},
+                std::array{C_row0, C_row1}, chunk, kb_start, kb_end, accumulate);
         for (int segment = 0; segment < 8; ++segment)
         {
             const int z = segment / 2;

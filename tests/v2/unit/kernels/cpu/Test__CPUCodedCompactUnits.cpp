@@ -947,9 +947,14 @@ namespace llaminar2::test
                         {
                             const auto ab = static_cast<std::int8_t>(a), bb = static_cast<std::int8_t>(b);
                             const auto word = _mm256_set1_epi32(std::bit_cast<std::int32_t>(std::array{ab, bb, bb, ab}));
-                            const auto result = dotNibbleAVX2<Domain>(_mm256_setzero_si256(), weight, word);
-                            ASSERT_EQ(_mm256_extract_epi32(result, 0) - bias * (2 * a + 2 * b),
-                                2 * (a * reference[0] + b * reference[16]));
+                            auto plane = _mm256_setzero_si256();
+                            for (int group = 0; group < 4; ++group)
+                                plane = dotNibbleAVX2<Domain>(plane, weight, word);
+                            // Identical planes exercise the worst-case intermediate range
+                            // (including the MXFP4 domain that cannot merge in INT16).
+                            const auto result = finishNibbleDotAVX2<Domain>(plane, plane);
+                            ASSERT_EQ(_mm256_extract_epi32(result, 0) - bias * 16 * (a + b),
+                                16 * (a * reference[0] + b * reference[16]));
                         }
                 }
         };
@@ -957,6 +962,33 @@ namespace llaminar2::test
         check.template operator()<NibbleDotAVX2::Linear>(native_quantised_formats::Q4_1.codebook_id);
         check.template operator()<NibbleDotAVX2::SmallLUT>(kNativeQuantisedMXFP4Codebook);
         check.template operator()<NibbleDotAVX2::SignedLUT>(native_quantised_formats::IQ4_NL.codebook_id);
+    }
+
+    /** @test Deferred widening stays exact for signed bytes even at the INT16 chain bounds. */
+    TEST(CPUCompensationFreeUnits, AVX2Q8DotsWidenAfterEightGroups)
+    {
+        alignas(32) std::array<std::uint8_t, 8 * 256> weights{};
+        Q8_1Block row0{}, row1{};
+        for (int w = -128; w <= 127; ++w)
+        {
+            for (int group = 0; group < 8; ++group)
+                for (int column = 0; column < 8; ++column)
+                    std::fill_n(weights.data() + group * 256 + column * 4, 4,
+                        static_cast<std::uint8_t>(column % 2 ? -1 - w : w));
+            for (int a = -128; a <= 127; ++a)
+            {
+                const int b = -1 - a;
+                std::fill_n(row0.qs, 32, static_cast<std::int8_t>(a));
+                std::fill_n(row1.qs, 32, static_cast<std::int8_t>(b));
+                row0.sum_qs = 32 * a;
+                row1.sum_qs = 32 * b;
+                const auto one = dotExpandedBlockAVX2(weights.data(), std::array<const Q8_1Block *, 1>{&row0});
+                const auto two = dotExpandedBlockAVX2(weights.data(), std::array<const Q8_1Block *, 2>{&row0, &row1});
+                ASSERT_EQ(_mm256_extract_epi32(one.values[0], 0), 32 * w * a);
+                ASSERT_EQ(_mm256_extract_epi32(two.values[0], 1), 32 * (-1 - w) * a);
+                ASSERT_EQ(_mm256_extract_epi32(two.values[1], 0), 32 * w * b);
+            }
+        }
     }
 #endif
 
