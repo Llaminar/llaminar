@@ -238,9 +238,15 @@ namespace llaminar2::cpu::native_quantised::coded_metadata
         template <int Width> static I fields(const std::uint8_t *plane, int column)
         {
             constexpr int per_byte = 8 / Width;
-            typename NarrowVectors<kLanes>::U8 packed{};
-            std::memcpy(&packed, plane + column / per_byte, kLanes / per_byte);
-            return spread<Width>(packed, std::make_index_sequence<kLanes>{});
+            const auto *source = plane + column / per_byte;
+            if constexpr (Width == 4 && requires { Ops::unpackNibbles(source); })
+                return Ops::unpackNibbles(source);
+            else
+            {
+                typename NarrowVectors<kLanes>::U8 packed{};
+                std::memcpy(&packed, source, kLanes / per_byte);
+                return spread<Width>(packed, std::make_index_sequence<kLanes>{});
+            }
         }
         /** @return Nibble-plane field of columns [column, column + kLanes). */
         static I nibbles(const std::uint8_t *plane, int column) { return fields<4>(plane, column); }
@@ -302,9 +308,14 @@ namespace llaminar2::cpu::native_quantised::coded_metadata
         /** @return FP32 widening of round-to-nearest-even binary16 with -0 canonicalized to +0. */
         static F staged(F value)
         {
-            I bits = Ops::halfBits(value);
-            bits &= ~(bits == 0x8000);
-            return Ops::halfWords(bits);
+            if constexpr (requires { Ops::stagedHalf(value); })
+                return Ops::stagedHalf(value);
+            else
+            {
+                I bits = Ops::halfBits(value);
+                bits &= ~(bits == 0x8000);
+                return Ops::halfWords(bits);
+            }
         }
         /** @return FP32 widening of the low binary16 of each lane. */
         static F half(I word) { return Ops::halfWords(word & 0xFFFF); }

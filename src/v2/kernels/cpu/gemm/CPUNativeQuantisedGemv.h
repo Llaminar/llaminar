@@ -1484,8 +1484,14 @@ namespace llaminar2::cpu::native_quantised
             return _mm512_shuffle_epi8(decode_lut, hi);
     }
 
-    /** @return Sixteen SIMD factors of a packed nibble block, on its exact source layout. */
-    inline coded_metadata::Factors<__m512> loadNibbleFactors512(
+    /** @brief Decode nibble factors in the caller's registers, without a hidden result buffer.
+     * @param packed Prepared nibble matrix owning the source factor representation.
+     * @param chunk Physical 64-column chunk.
+     * @param block Logical 32-value reduction block.
+     * @param column First of sixteen SIMD columns.
+     * @return Exact primary and secondary factor lanes from the admitted representation.
+     */
+    [[gnu::always_inline]] inline coded_metadata::Factors<__m512> loadNibbleFactors512(
         const CPUNativeQuantisedPackedWeights &packed, int chunk, int block, int column)
     {
         if (packed.encoding == CPUNativeQuantisedEncoding::Q4KSuperblockCoded)

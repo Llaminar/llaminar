@@ -93,6 +93,43 @@ namespace llaminar2::cpu::native_quantised
         return _mm256_add_epi32(dot, _mm256_add_epi32(_mm256_madd_epi16(low, ones), _mm256_madd_epi16(high, ones)));
     }
 
+    /**
+     * @brief Append a nibble dot specialized for an immutable unsigned identity codebook.
+     * @tparam Identity Codebook 5: Q4_1 or Q4_K, weights in [0,15] without bias.
+     * @param dot Exact INT32 vector accumulated from earlier groups.
+     * @param weight Decoded nibble values in VNNI lane order.
+     * @param activation The corresponding four signed activation bytes broadcast to each column.
+     * @return The original exact dot plus this group.
+     *
+     * Identity nibbles cannot saturate the signed 16-bit pair sum (2*15*128).
+     * Other nibble LUTs can publish biased bytes above 127 and retain the
+     * two-part full-range dot.
+     */
+    template <bool Identity>
+    inline __m256i dotNibbleAVX2(__m256i dot, __m256i weight, __m256i activation) noexcept
+    {
+        if constexpr (!Identity)
+            return dotUnsignedWeightsAVX2(dot, weight, activation);
+        else
+            return _mm256_add_epi32(dot, _mm256_madd_epi16(
+                _mm256_maddubs_epi16(weight, activation), _mm256_set1_epi16(1)));
+    }
+
+    /** @brief Decode one unsigned nibble per byte after low/high extraction.
+     * @tparam Identity The source codec uses the nibble indices directly.
+     * @param indices Values in [0,15] in prepared column order.
+     * @param lut Biased byte lookup table for nonlinear or shifted decoders.
+     * @return The original indices for codebook 5, or decoded biased bytes.
+     */
+    template <bool Identity>
+    inline __m256i decodeNibbleAVX2(__m256i indices, __m256i lut) noexcept
+    {
+        if constexpr (Identity)
+            return indices;
+        else
+            return _mm256_shuffle_epi8(lut, indices);
+    }
+
     /** @brief Dot one expanded group using its admitted legacy or compensation-free layout. */
     inline __m256i dotExpandedWeightsAVX2(__m256i dot, __m256i weights, const Q8_1Block &activation,
                                           int first, bool compensated) noexcept
@@ -157,8 +194,14 @@ namespace llaminar2::cpu::native_quantised
         return static_cast<int32_t>(raw ^ 0x80808080u);
     }
 
-    /** @return Eight SIMD factors of a packed nibble block, on its exact source layout. */
-    inline coded_metadata::Factors<__m256> loadNibbleFactors256(
+    /** @brief Decode nibble factors in the caller's registers, without a hidden result buffer.
+     * @param packed Prepared nibble matrix owning the source factor representation.
+     * @param chunk Physical 64-column chunk.
+     * @param block Logical 32-value reduction block.
+     * @param column First of eight SIMD columns.
+     * @return Exact primary and secondary factor lanes from the admitted representation.
+     */
+    [[gnu::always_inline]] inline coded_metadata::Factors<__m256> loadNibbleFactors256(
         const CPUNativeQuantisedPackedWeights &packed, int chunk, int block, int column)
     {
         if (packed.encoding == CPUNativeQuantisedEncoding::Q4KSuperblockCoded)
@@ -180,8 +223,10 @@ namespace llaminar2::cpu::native_quantised
                     reinterpret_cast<const __m128i *>(packed.chunkMins(chunk, block) + column))) : _mm256_setzero_ps()};
     }
 
+    static_assert(native_quantised_formats::Q4_K.codebook_id == native_quantised_formats::Q4_1.codebook_id);
+
     // =========================================================================
-    // AVX2 GEMV: nibble-LUT path (Q4_0, IQ4_NL, Q4_1, IQ4_XS)
+    // AVX2 GEMV: nibble path (Q4_0, IQ4_NL, Q4_1/Q4_K, IQ4_XS)
     // =========================================================================
     //
     // Processes one 64-column N-chunk using 8 YMM accumulators (8 cols each).
@@ -206,8 +251,10 @@ namespace llaminar2::cpu::native_quantised
      * @param segment Eight-column segment within the chunk.
      * @param accumulator Initial FP32 value for the segment.
      * @return Updated FP32 segment.
+     * @tparam Identity The prepared codebook admits unsigned identity nibbles.
      */
-    inline __m256 accumulateNibbleSegmentAVX2(
+    template <bool Identity>
+    inline __m256 accumulateNibbleSegmentAVX2Impl(
         const CPUNativeQuantisedPackedWeights &packed,
         const Q8_1Block *A_q8,
         int chunk,
@@ -217,7 +264,7 @@ namespace llaminar2::cpu::native_quantised
         int segment,
         __m256 accumulator)
     {
-        const int weight_bias = nibbleWeightBias(packed.codebook_id);
+        const int weight_bias = Identity ? 0 : nibbleWeightBias(packed.codebook_id);
         const __m256i mask_0F = _mm256_set1_epi8(0x0F);
         const int z = segment / 2;
         const int byte_offset = (segment % 2) * 32;
@@ -239,14 +286,12 @@ namespace llaminar2::cpu::native_quantised
                     unit + group * 256 + z * 64 + byte_offset;
                 const __m256i raw = _mm256_loadu_si256(
                     reinterpret_cast<const __m256i *>(base));
-                const __m256i low = _mm256_shuffle_epi8(
-                    decode_lut, _mm256_and_si256(raw, mask_0F));
-                const __m256i high = _mm256_shuffle_epi8(
-                    decode_lut,
-                    _mm256_and_si256(
-                        _mm256_srli_epi16(raw, 4), mask_0F));
-                dot_low = dotUnsignedWeightsAVX2(dot_low, low, _mm256_set1_epi32(nativeActivationWord(activation, group * 4)));
-                dot_high = dotUnsignedWeightsAVX2(dot_high, high, _mm256_set1_epi32(nativeActivationWord(activation, group * 4 + 16)));
+                const __m256i low = decodeNibbleAVX2<Identity>(
+                    _mm256_and_si256(raw, mask_0F), decode_lut);
+                const __m256i high = decodeNibbleAVX2<Identity>(
+                    _mm256_and_si256(_mm256_srli_epi16(raw, 4), mask_0F), decode_lut);
+                dot_low = dotNibbleAVX2<Identity>(dot_low, low, _mm256_set1_epi32(nativeActivationWord(activation, group * 4)));
+                dot_high = dotNibbleAVX2<Identity>(dot_high, high, _mm256_set1_epi32(nativeActivationWord(activation, group * 4 + 16)));
             }
 
             const __m256i corrected = _mm256_sub_epi32(
@@ -277,6 +322,22 @@ namespace llaminar2::cpu::native_quantised
             }
         }
         return accumulator;
+    }
+
+    /** @brief Select the immutable nibble domain once before the K traversal. */
+    inline __m256 accumulateNibbleSegmentAVX2(
+        const CPUNativeQuantisedPackedWeights &packed,
+        const Q8_1Block *A_q8,
+        int chunk,
+        int kb_start,
+        int kb_end,
+        const __m256i decode_lut,
+        int segment,
+        __m256 accumulator)
+    {
+        if (packed.codebook_id == native_quantised_formats::Q4_K.codebook_id)
+            return accumulateNibbleSegmentAVX2Impl<true>(packed, A_q8, chunk, kb_start, kb_end, decode_lut, segment, accumulator);
+        return accumulateNibbleSegmentAVX2Impl<false>(packed, A_q8, chunk, kb_start, kb_end, decode_lut, segment, accumulator);
     }
 
     /**
@@ -488,8 +549,10 @@ namespace llaminar2::cpu::native_quantised
      * @param segment Eight-column segment within the chunk.
      * @param fp0 Running first-row FP32 value, updated in place.
      * @param fp1 Running second-row FP32 value, updated in place.
+     * @tparam Identity The prepared codebook admits unsigned identity nibbles.
      */
-    inline void accumulateTwoRowsNibbleSegmentAVX2(
+    template <bool Identity>
+    inline void accumulateTwoRowsNibbleSegmentAVX2Impl(
         const CPUNativeQuantisedPackedWeights &packed,
         const Q8_1Block *A_q8_row0,
         const Q8_1Block *A_q8_row1,
@@ -501,7 +564,7 @@ namespace llaminar2::cpu::native_quantised
         __m256 &fp0,
         __m256 &fp1)
     {
-        const int weight_bias = nibbleWeightBias(packed.codebook_id);
+        const int weight_bias = Identity ? 0 : nibbleWeightBias(packed.codebook_id);
         const __m256i mask_0F = _mm256_set1_epi8(0x0F);
         const int z = segment / 2;
         const int byte_offset = (segment % 2) * 32;
@@ -527,16 +590,14 @@ namespace llaminar2::cpu::native_quantised
                         unit + group * 256 + z * 64 + byte_offset;
                     const __m256i raw = _mm256_loadu_si256(
                         reinterpret_cast<const __m256i *>(base));
-                    const __m256i low = _mm256_shuffle_epi8(
-                        decode_lut, _mm256_and_si256(raw, mask_0F));
-                    const __m256i high = _mm256_shuffle_epi8(
-                        decode_lut,
-                        _mm256_and_si256(
-                            _mm256_srli_epi16(raw, 4), mask_0F));
-                    dot0_low = dotUnsignedWeightsAVX2(dot0_low, low, _mm256_set1_epi32(nativeActivationWord(a0, group * 4)));
-                    dot1_low = dotUnsignedWeightsAVX2(dot1_low, low, _mm256_set1_epi32(nativeActivationWord(a1, group * 4)));
-                    dot0_high = dotUnsignedWeightsAVX2(dot0_high, high, _mm256_set1_epi32(nativeActivationWord(a0, group * 4 + 16)));
-                    dot1_high = dotUnsignedWeightsAVX2(dot1_high, high, _mm256_set1_epi32(nativeActivationWord(a1, group * 4 + 16)));
+                    const __m256i low = decodeNibbleAVX2<Identity>(
+                        _mm256_and_si256(raw, mask_0F), decode_lut);
+                    const __m256i high = decodeNibbleAVX2<Identity>(
+                        _mm256_and_si256(_mm256_srli_epi16(raw, 4), mask_0F), decode_lut);
+                    dot0_low = dotNibbleAVX2<Identity>(dot0_low, low, _mm256_set1_epi32(nativeActivationWord(a0, group * 4)));
+                    dot1_low = dotNibbleAVX2<Identity>(dot1_low, low, _mm256_set1_epi32(nativeActivationWord(a1, group * 4)));
+                    dot0_high = dotNibbleAVX2<Identity>(dot0_high, high, _mm256_set1_epi32(nativeActivationWord(a0, group * 4 + 16)));
+                    dot1_high = dotNibbleAVX2<Identity>(dot1_high, high, _mm256_set1_epi32(nativeActivationWord(a1, group * 4 + 16)));
                 }
 
                 const __m256i corrected0 = _mm256_sub_epi32(
@@ -565,6 +626,24 @@ namespace llaminar2::cpu::native_quantised
                         packed.numerical_policy);
                 }
         }
+    }
+
+    /** @brief Select the immutable nibble domain once before the K traversal. */
+    inline void accumulateTwoRowsNibbleSegmentAVX2(
+        const CPUNativeQuantisedPackedWeights &packed,
+        const Q8_1Block *A_q8_row0,
+        const Q8_1Block *A_q8_row1,
+        int chunk,
+        int kb_start,
+        int kb_end,
+        const __m256i decode_lut,
+        int segment,
+        __m256 &fp0,
+        __m256 &fp1)
+    {
+        if (packed.codebook_id == native_quantised_formats::Q4_K.codebook_id)
+            return accumulateTwoRowsNibbleSegmentAVX2Impl<true>(packed, A_q8_row0, A_q8_row1, chunk, kb_start, kb_end, decode_lut, segment, fp0, fp1);
+        return accumulateTwoRowsNibbleSegmentAVX2Impl<false>(packed, A_q8_row0, A_q8_row1, chunk, kb_start, kb_end, decode_lut, segment, fp0, fp1);
     }
 
     /**

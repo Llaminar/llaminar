@@ -254,6 +254,35 @@ namespace llaminar2::test
         }
     }
 
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
+    /** @test The AVX-512 Q5_K mask addresses every weight byte, including column and group boundaries. */
+    TEST(CPUCodedCompactUnits, AVX512Q5KFifthBitMaskMatchesScalar)
+    {
+        using Wide = multi_scale::SIMD<16>;
+        constexpr int columns = 64, groups = 8;
+        for (int first = 0; first < columns; first += 16)
+            for (int group = 0; group < groups; ++group)
+                for (int bit = 0; bit < 64; ++bit)
+                {
+                    std::array<std::uint8_t, groups * columns / 2> planes{};
+                    // Exercise both halves of each source high-bit byte through
+                    // the real publisher, with exactly one bit set per probe.
+                    const int column = first + bit / 4;
+                    uint8_t qh[4]{};
+                    qh[group / 2] = 1u << (4 * (group % 2) + bit % 4);
+                    coded_metadata::storeQ5HighBits(planes.data(), column, qh);
+                    const auto *mask = planes.data() + group * columns / 2 + first / 2;
+                    const auto result = Wide::insertQ5High(Wide::I{} + 0x0F070300, mask);
+                    for (int lane = 0; lane < 16; ++lane)
+                    {
+                        const unsigned expected = 0x0F070300u |
+                            (lane == bit / 4 ? 16u << (8 * (bit % 4)) : 0u);
+                        ASSERT_EQ(laneBits(result, lane), expected) << "group=" << group << " bit=" << bit;
+                    }
+                }
+    }
+#endif
+
     /** SIMD reconstruction equals widening the codec's staged words for every derived-scale compact format. */
     TEST(CPUCodedCompactUnits, SimdReconstructionEqualsCodecWordsExhaustively)
     {

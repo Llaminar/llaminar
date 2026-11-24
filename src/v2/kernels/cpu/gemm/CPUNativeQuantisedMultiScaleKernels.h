@@ -68,6 +68,19 @@ namespace llaminar2::cpu::native_quantised::multi_scale
     template <int Lanes> struct SIMD;
 
 #if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
+    /**
+     * @brief Interleave each packed byte's low and high nibble as adjacent bytes.
+     * @param packed Low 4 or 8 bytes hold the source nibbles, in column order.
+     * @return The low 8 or 16 bytes hold the unpacked nibbles, in column order.
+     *
+     * Unpacking before widening avoids scalar byte assembly on GCC x86.
+     * Padding in the unused upper bytes is never read by a caller.
+     */
+    static inline __m128i x86UnpackNibbles(__m128i packed)
+    {
+        return _mm_and_si128(_mm_unpacklo_epi8(packed, _mm_srli_epi16(packed, 4)), _mm_set1_epi8(15));
+    }
+
     /** @brief Eight-column AVX2 implementation, including saturation-safe VNNI. */
     template <> struct SIMD<8>
     {
@@ -167,6 +180,23 @@ namespace llaminar2::cpu::native_quantised::multi_scale
             return std::bit_cast<I>(_mm256_i32gather_epi32(
                 reinterpret_cast<const int *>(table), std::bit_cast<__m256i>(index), 4));
         }
+        /** @param source Four readable bytes of column-ordered nibbles.
+         * @return Eight adjacent column nibbles widened to INT32.
+         */
+        static I unpackNibbles(const uint8_t *source)
+        {
+            return std::bit_cast<I>(_mm256_cvtepu8_epi32(x86UnpackNibbles(_mm_loadu_si32(source))));
+        }
+        /** @param value Eight FP32 products before binary16 staging.
+         * @return Eight staged values; canonicalize negative zero in the narrow FP16 register.
+         */
+        static F stagedHalf(F value)
+        {
+            const auto words = _mm256_cvtps_ph(std::bit_cast<__m256>(value),
+                _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+            const auto nonzero = _mm_andnot_si128(_mm_cmpeq_epi16(words, _mm_set1_epi16(-32768)), words);
+            return std::bit_cast<F>(_mm256_cvtph_ps(nonzero));
+        }
         /** @return Eight exact FP16-to-FP32 conversions. */
         static F half(const uint16_t *source)
         {
@@ -196,11 +226,6 @@ namespace llaminar2::cpu::native_quantised::multi_scale
             const __m256i bits = std::bit_cast<__m256i>(words & 65535);
             return std::bit_cast<F>(_mm256_cvtph_ps(_mm_packus_epi32(
                 _mm256_castsi256_si128(bits), _mm256_extracti128_si256(bits, 1))));
-        }        /** @return Round-to-nearest-even binary16 bits of each lane, zero-extended (F16C). */
-        static I halfBits(F value)
-        {
-            return std::bit_cast<I>(_mm256_cvtepu16_epi32(_mm256_cvtps_ph(
-                std::bit_cast<__m256>(value), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC)));
         }
     };
 
@@ -280,6 +305,37 @@ namespace llaminar2::cpu::native_quantised::multi_scale
             return std::bit_cast<I>(_mm512_i32gather_epi32(
                 std::bit_cast<__m512i>(index), table, 4));
         }
+        /** @param source Eight readable bytes of column-ordered nibbles.
+         * @return Sixteen adjacent column nibbles widened to INT32.
+         */
+        static I unpackNibbles(const uint8_t *source)
+        {
+            return std::bit_cast<I>(_mm512_cvtepu8_epi32(x86UnpackNibbles(_mm_loadu_si64(source))));
+        }
+        /**
+         * @brief Insert sixteen columns' fifth bits directly into their VNNI bytes.
+         * @param low Four low-nibble weights per INT32 lane.
+         * @param source Eight readable bytes, one bit per weight byte in lane order.
+         * @return Exact unsigned five-bit weights in VNNI byte order.
+         */
+        static I insertQ5High(I low, const uint8_t *source)
+        {
+            uint64_t bits;
+            std::memcpy(&bits, source, sizeof(bits));
+            const auto values = std::bit_cast<__m512i>(low);
+            return std::bit_cast<I>(_mm512_mask_add_epi8(values, static_cast<__mmask64>(bits),
+                values, _mm512_set1_epi8(16)));
+        }
+        /** @param value Sixteen FP32 products before binary16 staging.
+         * @return Sixteen staged values; canonicalize negative zero in the narrow FP16 register.
+         */
+        static F stagedHalf(F value)
+        {
+            const auto words = _mm512_cvtps_ph(std::bit_cast<__m512>(value),
+                _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+            const auto keep = _mm256_cmpneq_epi16_mask(words, _mm256_set1_epi16(-32768));
+            return std::bit_cast<F>(_mm512_maskz_cvtph_ps(keep, words));
+        }
         /** @return Sixteen exact FP16-to-FP32 conversions. */
         static F half(const uint16_t *source)
         {
@@ -308,11 +364,6 @@ namespace llaminar2::cpu::native_quantised::multi_scale
         {
             return std::bit_cast<F>(_mm512_cvtph_ps(
                 _mm512_cvtepi32_epi16(std::bit_cast<__m512i>(words))));
-        }        /** @return Round-to-nearest-even binary16 bits of each lane, zero-extended. */
-        static I halfBits(F value)
-        {
-            return std::bit_cast<I>(_mm512_cvtepu16_epi32(_mm512_cvtps_ph(
-                std::bit_cast<__m512>(value), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC)));
         }
     };
 #endif
@@ -676,6 +727,8 @@ namespace llaminar2::cpu::native_quantised::multi_scale
                     // widest tiles so the dot and FP32 state stay in registers.
                     weights = low | Ops::template q5High<Rows == 4 || (Rows == 3 && Tree == Reduction::OrderedPartitions)>(
                         unit + 1024 + 32 * group + column / 2);
+                else if constexpr (Lanes == 16)
+                    weights = Ops::insertQ5High(low, unit + 1024 + 32 * group + column / 2);
                 else
                 {
                     const I high = coded_metadata::Lanes<Ops>::nibbles(unit + 1024 + 32 * group, column);
