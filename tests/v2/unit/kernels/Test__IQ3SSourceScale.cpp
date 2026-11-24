@@ -63,10 +63,10 @@ TEST(IQ3SSourceScale, MandatoryTupleMetadataAndOldGenerationsRejected)
 {
     auto header=buildGpuPackedHeader(RepackFormat::IQ3_S,11,13,true,true,false,1,32);
     const size_t total=gpuPackedTotalSize(header);
-    ASSERT_TRUE(validateGpuPackedHeader(header,total));
-    auto old=header;old.version=3;EXPECT_FALSE(validateGpuPackedHeader(old,total));
-    auto absent=header;absent.is_asymmetric=0;absent.mins_size=0;EXPECT_FALSE(validateGpuPackedHeader(absent,total));
-    auto wrong=header;wrong.payload_bytes=32;EXPECT_FALSE(validateGpuPackedHeader(wrong,total));
+    ASSERT_EQ(validateGpuPackedHeader(header,total), GpuPackedParseStatus::Success);
+    auto old=header;old.version=3;EXPECT_EQ(validateGpuPackedHeader(old,total), GpuPackedParseStatus::UnsupportedVersion);
+    auto absent=header;absent.is_asymmetric=0;absent.mins_size=0;EXPECT_EQ(validateGpuPackedHeader(absent,total), GpuPackedParseStatus::MalformedInput);
+    auto wrong=header;wrong.payload_bytes=32;EXPECT_EQ(validateGpuPackedHeader(wrong,total), GpuPackedParseStatus::MalformedInput);
     PackedWeightsHeader cpu_header{};using Encoding=cpu::native_quantised::CPUNativeQuantisedEncoding;
     cpu_header.codebook_id=11;cpu_header.is_superblock=1;cpu_header.payload_bytes=13;
     cpu_header.prepared_encoding=static_cast<uint8_t>(Encoding::IQ3SExpandedSourceScale);

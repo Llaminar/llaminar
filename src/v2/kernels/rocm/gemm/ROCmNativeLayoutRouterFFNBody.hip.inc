@@ -614,8 +614,8 @@ __device__ __forceinline__ void finishRoutedPartial(float partial,const Binding&
  * @pre The present-format bit was built from these same immutable records.
  * All64 lanes execute each matching record's fold; only the final store is lane-masked.
  * @details Non-eight-bit formats retain canonical EB4 payload-first loads. Q8
- * and physical23 retire one expert's canonical partial/fold/store before reading
- * the next, exactly as the fork's sequential arm. No cross-format result survives.
+ * (physical decoder 19) completes one expert's canonical partial/fold/store
+ * before reading the next. No cross-format result survives.
  */
 template<NativeQuantisedFormat FMT>
 __device__ __forceinline__ void routedFormat(const PhaseProjection* bindings,unsigned first_route,unsigned routes,

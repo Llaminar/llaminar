@@ -271,6 +271,14 @@ namespace llaminar2
                 {
                     auto layout = manifest.deviceLayout();
                     ASSERT_TRUE(layout.valid());
+                    const bool single_scale = expertTierPreservesNativeSingleScale(layout.cpu_encoding, layout.cpu_codebook_id);
+                    EXPECT_TRUE(layout.cpuStorage().coded() || single_scale ||
+                        layout.cpu_encoding == CPUNativeQuantisedEncoding::Q6KNativeDualScale);
+                    if (layout.cpu_encoding == CPUNativeQuantisedEncoding::ExpandedInt8)
+                    {
+                        EXPECT_TRUE(single_scale);
+                        EXPECT_EQ(layout.gpu_codebook_id, 19u);
+                    }
                     layout.gpu_codebook_id = retired_decoder;
                     EXPECT_FALSE(layout.valid());
                 }

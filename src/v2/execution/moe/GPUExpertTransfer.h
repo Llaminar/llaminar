@@ -63,11 +63,10 @@ struct GpuExpertPackedDescriptor {
     /**
      * Physical capacity of the persistent allocation backing this live view.
      *
-     * These fields are deliberately distinct from the execution fields above:
-     * an initially compact expert can occupy a slot large enough for a later
-     * CPU-normalized promotion without changing the bytes consumed by GEMM.
-     * Zero identifies an ordinary immutable allocation with no recycling
-     * contract.
+     * A recyclable slot reserves the canonical device layout for its original
+     * source format, independently of the live execution view above. CPU-tier
+     * promotion preserves that layout. Zero identifies an immutable allocation
+     * with no recycling contract.
      */
     uint8_t allocation_payload_bytes_per_block = 0;
     bool allocation_has_mins = false;

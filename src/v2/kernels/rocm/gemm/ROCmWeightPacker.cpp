@@ -31,7 +31,6 @@
 #include "tensors/IQQuantTables.h"   // iq3s_grid, ksigns_iq2xs, etc. (for IQ grid init)
 #include "tensors/TensorType.h"      // isNativeQuantisedFormat, isInt8VnniFormat
 #include "loaders/gpu_pipeline/RepackFormat.h"
-#include "kernels/rocm/repack/ROCmExpertTierWeightKernels.h"
 #include "utils/Logger.h"
 #include "utils/DebugEnv.h"
 
@@ -149,21 +148,6 @@ namespace llaminar2
                     llaminar2::iq1s_grid))
             {
                 LOG_ERROR("[ROCmWeightPacker] IQ grid MoE prefill init failed on device " << device_id);
-                return false;
-            }
-            if (!initializeExpertTierIQGridTablesROCm(
-                    device_id,
-                    llaminar2::iq3s_grid,
-                    llaminar2::iq3xxs_grid,
-                    llaminar2::iq2s_grid,
-                    llaminar2::iq2xs_grid,
-                    llaminar2::iq2xxs_grid,
-                    llaminar2::iq1s_grid))
-            {
-                LOG_ERROR(
-                    "[ROCmWeightPacker] IQ grid ExpertOverlay tier-stream "
-                    "init failed on device "
-                    << device_id);
                 return false;
             }
 

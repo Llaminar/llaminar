@@ -4298,8 +4298,8 @@ bool rocmMoE_grouped_prefill_pipeline(
     // in each descriptor table. Mixed-codebook expert tables remain supported.
     uint32_t gateup_codebook_mask,
     uint32_t down_codebook_mask,
-    // Policy masks retain the original source codebooks after representation
-    // normalization (for example compact Q5_1 promoted to expanded INT8+min).
+    // Policy masks select the source arithmetic independently of the physical
+    // decoder (for example IQ4_XS uses policy 4 and physical decoder 24).
     uint32_t gateup_policy_codebook_mask,
     uint32_t down_policy_codebook_mask,
     int device_id,

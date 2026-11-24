@@ -35,6 +35,8 @@
 #include <cstdint>
 #include <cstddef>
 #include <cstring>
+#include <initializer_list>
+#include <string>
 
 namespace llaminar2 {
 
@@ -132,14 +134,29 @@ inline GpuPackedWeightsHeader buildGpuPackedHeader(
     return hdr;
 }
 
-/// Validate a header read from a byte buffer.  Returns true if all
-/// invariants hold (magic, version, non-negative sizes).
-inline bool validateGpuPackedHeader(const GpuPackedWeightsHeader& hdr, size_t buffer_size)
+/** @brief Compatibility and structural outcomes of reading a GPWT archive. */
+enum class GpuPackedParseStatus
 {
-    if (hdr.magic != GPU_PACKED_WEIGHTS_MAGIC) return false;
-    if (hdr.version != GPU_PACKED_WEIGHTS_VERSION) return false;
-    if (!(kNativeQuantisedPhysicalCodebooks & nativeQuantisedCodebookMaskBit(hdr.codebook_id))) return false;
-    if (hdr.N <= 0 || hdr.K <= 0 || hdr.blocks_per_row <= 0) return false;
+    Success,
+    UnsupportedVersion,
+    UnsupportedPhysicalDecoder,
+    MalformedInput,
+};
+
+/**
+ * @brief Check compatibility before interpreting the decoder-specific fields and section extents.
+ * @param hdr Header decoded from a complete GPWT header.
+ * @param buffer_size Total available bytes, including the header.
+ * @return Compatibility rejection, malformed input, or success.
+ */
+[[nodiscard]] inline GpuPackedParseStatus validateGpuPackedHeader(
+    const GpuPackedWeightsHeader& hdr, size_t buffer_size)
+{
+    if (hdr.magic != GPU_PACKED_WEIGHTS_MAGIC) return GpuPackedParseStatus::MalformedInput;
+    if (hdr.version != GPU_PACKED_WEIGHTS_VERSION) return GpuPackedParseStatus::UnsupportedVersion;
+    if (!(kNativeQuantisedPhysicalCodebooks & nativeQuantisedCodebookMaskBit(hdr.codebook_id)))
+        return GpuPackedParseStatus::UnsupportedPhysicalDecoder;
+    if (hdr.N <= 0 || hdr.K <= 0 || hdr.blocks_per_row <= 0) return GpuPackedParseStatus::MalformedInput;
     // IQ3_S physical11 owns original half base and mandatory raw nibble.
     if (hdr.codebook_id == 11 || hdr.format == static_cast<uint8_t>(RepackFormat::IQ3_S))
     {
@@ -148,29 +165,59 @@ inline bool validateGpuPackedHeader(const GpuPackedWeightsHeader& hdr, size_t bu
             hdr.payload_bytes != 13 || hdr.is_asymmetric != 1 || hdr.is_superblock != 1 || hdr.has_emins != 0 ||
             hdr.K % 32 != 0 || hdr.blocks_per_row != hdr.K / 32 || blocks > UINT64_MAX / 17u ||
             hdr.payload_size != blocks * 13u || hdr.scales_size != blocks * 2u ||
-            hdr.mins_size != blocks * 2u || hdr.emins_size != 0u) return false;
+            hdr.mins_size != blocks * 2u || hdr.emins_size != 0u) return GpuPackedParseStatus::MalformedInput;
     }
     // Source4+superblock is distinct from IQ4_NL despite sharing the LUT.
     // This is metadata-only rejection before a wire payload can be adopted.
     if (hdr.format == static_cast<uint8_t>(RepackFormat::IQ4_XS) &&
         (hdr.codebook_id != kNativeQuantisedIQ4XSSourceScaleCodebook ||
          hdr.payload_bytes != 16 || hdr.is_asymmetric != 1 ||
-         hdr.is_superblock != 1 || hdr.has_emins != 0)) return false;
+         hdr.is_superblock != 1 || hdr.has_emins != 0)) return GpuPackedParseStatus::MalformedInput;
     if (hdr.codebook_id == kNativeQuantisedIQ4XSSourceScaleCodebook &&
-        hdr.format != static_cast<uint8_t>(RepackFormat::IQ4_XS)) return false;
+        hdr.format != static_cast<uint8_t>(RepackFormat::IQ4_XS)) return GpuPackedParseStatus::MalformedInput;
     if (hdr.codebook_id == kNativeQuantisedIQ4XSSourceScaleCodebook)
     {
         const uint64_t blocks = uint64_t(hdr.N) * uint64_t(hdr.blocks_per_row);
         if (hdr.K % 32 != 0 || hdr.blocks_per_row != hdr.K / 32 ||
             blocks > UINT64_MAX / 20u ||
             hdr.payload_size != blocks * 16u || hdr.scales_size != blocks * 2u ||
-            hdr.mins_size != blocks * 2u || hdr.emins_size != 0u) return false;
+            hdr.mins_size != blocks * 2u || hdr.emins_size != 0u) return GpuPackedParseStatus::MalformedInput;
     }
     // The primary plane width follows the physical decoder (1 byte for MXFP4).
     if (hdr.scales_size != uint64_t(hdr.N) * uint64_t(hdr.blocks_per_row) *
-                               nativeQuantisedScalePlaneBytes(hdr.codebook_id)) return false;
-    if (buffer_size < gpuPackedTotalSize(hdr)) return false;
-    return true;
+                               nativeQuantisedScalePlaneBytes(hdr.codebook_id)) return GpuPackedParseStatus::MalformedInput;
+    if (buffer_size < sizeof(hdr)) return GpuPackedParseStatus::MalformedInput;
+    auto remaining = buffer_size - sizeof(hdr);
+    for (const auto bytes : {hdr.payload_size, hdr.scales_size, hdr.mins_size, hdr.emins_size})
+    {
+        if (bytes > remaining) return GpuPackedParseStatus::MalformedInput;
+        remaining -= bytes;
+    }
+    return GpuPackedParseStatus::Success;
+}
+
+/**
+ * @brief Explain a rejected GPWT archive without inspecting any section bytes.
+ * @param status Outcome of GPWT validation or parsing.
+ * @param hdr Observed header for version and decoder rejections.
+ * @return Diagnostic containing the rejected identifier where applicable.
+ */
+[[nodiscard]] inline std::string gpuPackedParseDiagnostic(
+    GpuPackedParseStatus status, const GpuPackedWeightsHeader& hdr)
+{
+    switch (status)
+    {
+    case GpuPackedParseStatus::Success:
+        return {};
+    case GpuPackedParseStatus::UnsupportedVersion:
+        return "Unsupported GPWT version " + std::to_string(hdr.version) +
+            " (expected " + std::to_string(GPU_PACKED_WEIGHTS_VERSION) + ")";
+    case GpuPackedParseStatus::UnsupportedPhysicalDecoder:
+        return "Unsupported GPWT physical decoder " + std::to_string(hdr.codebook_id);
+    case GpuPackedParseStatus::MalformedInput:
+        return "Malformed GPWT input";
+    }
+    return "Unknown GPWT parse status";
 }
 
 /// Pointers into a GPU packed weight buffer (either host or device memory).
@@ -184,15 +231,23 @@ struct GpuPackedWeightsView
     const uint32_t* emins   = nullptr;   ///< [bpr * N] or nullptr
 };
 
-/// Parse a serialized GPU packed weight buffer into a view.
-/// The view points into the provided buffer (no copy).
-/// Returns false if validation fails.
-inline bool parseGpuPackedBuffer(const void* buffer, size_t size, GpuPackedWeightsView& out)
+/**
+ * @brief Parse a GPWT buffer without copying its sections.
+ * @param buffer Readable archive bytes.
+ * @param size Available bytes.
+ * @param out Replaced on each call. A complete header is retained for diagnostics;
+ *            section pointers borrow from @p buffer and are set only on success.
+ * @return Compatibility rejection, malformed input, or success.
+ */
+[[nodiscard]] inline GpuPackedParseStatus parseGpuPackedBuffer(
+    const void* buffer, size_t size, GpuPackedWeightsView& out)
 {
-    if (!buffer || size < sizeof(GpuPackedWeightsHeader)) return false;
+    out = {};
+    if (!buffer || size < sizeof(GpuPackedWeightsHeader)) return GpuPackedParseStatus::MalformedInput;
 
     std::memcpy(&out.header, buffer, sizeof(GpuPackedWeightsHeader));
-    if (!validateGpuPackedHeader(out.header, size)) return false;
+    const auto status = validateGpuPackedHeader(out.header, size);
+    if (status != GpuPackedParseStatus::Success) return status;
 
     const auto* base = static_cast<const uint8_t*>(buffer) + sizeof(GpuPackedWeightsHeader);
     size_t offset = 0;
@@ -212,7 +267,7 @@ inline bool parseGpuPackedBuffer(const void* buffer, size_t size, GpuPackedWeigh
         out.emins = reinterpret_cast<const uint32_t*>(base + offset);
     }
 
-    return true;
+    return GpuPackedParseStatus::Success;
 }
 
 } // namespace llaminar2

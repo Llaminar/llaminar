@@ -596,7 +596,8 @@ TEST(Test__PackedWeightsSerialization, IQ2SGpuWireSourceFactorsRoundTripAndRejec
         std::memcpy(blob.data()+secondary+index*sizeof(uint16_t),&coefficient,sizeof(coefficient));
     }
     GpuPackedWeightsView view{};
-    ASSERT_TRUE(parseGpuPackedBuffer(blob.data(),blob.size(),view));
+    const auto status = parseGpuPackedBuffer(blob.data(),blob.size(), view);
+    ASSERT_EQ(status, GpuPackedParseStatus::Success) << gpuPackedParseDiagnostic(status, view.header);
     ASSERT_NE(view.scales,nullptr); ASSERT_NE(view.mins,nullptr);
     for(size_t index=0;index<words;++index)
     {
@@ -611,7 +612,7 @@ TEST(Test__PackedWeightsSerialization, IQ2SGpuWireSourceFactorsRoundTripAndRejec
     const uint32_t old_version=1;
     std::memcpy(blob.data()+offsetof(GpuPackedWeightsHeader,version),&old_version,sizeof(old_version));
     GpuPackedWeightsView rejected{};
-    EXPECT_FALSE(parseGpuPackedBuffer(blob.data(),blob.size(),rejected));
+    EXPECT_EQ(parseGpuPackedBuffer(blob.data(), blob.size(), rejected), GpuPackedParseStatus::UnsupportedVersion);
     EXPECT_EQ(rejected.payload,nullptr);
     EXPECT_EQ(rejected.scales,nullptr);
     EXPECT_EQ(rejected.mins,nullptr);
@@ -740,19 +741,52 @@ TEST(Test__PackedWeightsSerialization, Q8ExpandedDensityRejectsLegacyCompensatio
     }
 }
 
-/** @test A structurally complete GPWT buffer cannot resurrect retired physical storage. */
+/** @test GPWT rejects old versions before decoder checks and never publishes rejected sections. */
 TEST(Test__PackedWeightsSerialization, GpuWireRejectsRetiredPhysicalDecoder)
 {
     using namespace llaminar2;
-    for (const auto &header : {
-             buildGpuPackedHeader(RepackFormat::Q4_1, 5, 16, true, false, false, 17, 96),
-             buildGpuPackedHeader(RepackFormat::Q4_1, 23, 32, true, false, false, 17, 96)})
-    {
+    const auto current = buildGpuPackedHeader(RepackFormat::Q4_1, 5, 16, true, false, false, 17, 96);
+    const auto retired = buildGpuPackedHeader(RepackFormat::Q4_1, 23, 32, true, false, false, 17, 96);
+    auto old = retired;
+    old.version = 4;
+    const auto archive = [](const GpuPackedWeightsHeader &header) {
         std::vector<uint8_t> blob(gpuPackedTotalSize(header), 0);
         std::memcpy(blob.data(), &header, sizeof(header));
-        GpuPackedWeightsView view{};
-        EXPECT_EQ(parseGpuPackedBuffer(blob.data(), blob.size(), view), header.codebook_id == 5);
-    }
+        return blob;
+    };
+
+    const auto valid = archive(current);
+    GpuPackedWeightsView view{};
+    const auto status = parseGpuPackedBuffer(valid.data(), valid.size(), view);
+    ASSERT_EQ(status, GpuPackedParseStatus::Success) << gpuPackedParseDiagnostic(status, view.header);
+    EXPECT_EQ(view.header.version, 5u);
+    ASSERT_EQ(view.payload, valid.data() + sizeof(current));
+    ASSERT_NE(view.scales, nullptr);
+    ASSERT_NE(view.mins, nullptr);
+
+    const auto expectRejected = [&](const auto &blob, GpuPackedParseStatus expected, const char *diagnostic) {
+        const auto result = parseGpuPackedBuffer(blob.data(), blob.size(), view);
+        EXPECT_EQ(result, expected);
+        EXPECT_EQ(gpuPackedParseDiagnostic(result, view.header), diagnostic);
+        EXPECT_EQ(view.payload, nullptr);
+        EXPECT_EQ(view.scales, nullptr);
+        EXPECT_EQ(view.mins, nullptr);
+        EXPECT_EQ(view.emins, nullptr);
+    };
+    expectRejected(archive(old), GpuPackedParseStatus::UnsupportedVersion,
+        "Unsupported GPWT version 4 (expected 5)");
+    expectRejected(archive(retired), GpuPackedParseStatus::UnsupportedPhysicalDecoder,
+        "Unsupported GPWT physical decoder 23");
+    auto truncated = valid;
+    truncated.pop_back();
+    expectRejected(truncated, GpuPackedParseStatus::MalformedInput, "Malformed GPWT input");
+
+    // A wrapped total must not permit an out-of-buffer section pointer.
+    auto oversized = current;
+    oversized.payload_size = std::numeric_limits<uint64_t>::max();
+    auto bad_extent = valid;
+    std::memcpy(bad_extent.data(), &oversized, sizeof(oversized));
+    expectRejected(bad_extent, GpuPackedParseStatus::MalformedInput, "Malformed GPWT input");
 }
 
 /** @brief GPU tuple wire has20 bytes/block, authentic source4 and a distinct physical ID. */
@@ -764,20 +798,21 @@ TEST(Test__PackedWeightsSerialization, IQ4XSGpuWireTupleRejectsVersion2AndSource
     std::vector<uint8_t> blob(gpuPackedTotalSize(header), 0);
     std::memcpy(blob.data(), &header, sizeof(header));
     GpuPackedWeightsView view{};
-    ASSERT_TRUE(parseGpuPackedBuffer(blob.data(), blob.size(), view));
+    const auto status = parseGpuPackedBuffer(blob.data(), blob.size(), view);
+    ASSERT_EQ(status, GpuPackedParseStatus::Success) << gpuPackedParseDiagnostic(status, view.header);
     ASSERT_NE(view.mins, nullptr);
     auto wrong = header; wrong.version = 2;
-    EXPECT_FALSE(validateGpuPackedHeader(wrong, blob.size()));
+    EXPECT_EQ(validateGpuPackedHeader(wrong, blob.size()), GpuPackedParseStatus::UnsupportedVersion);
     wrong = header; wrong.codebook_id = 4;
-    EXPECT_FALSE(validateGpuPackedHeader(wrong, blob.size()));
+    EXPECT_EQ(validateGpuPackedHeader(wrong, blob.size()), GpuPackedParseStatus::MalformedInput);
     wrong = header; wrong.format = static_cast<uint8_t>(RepackFormat::IQ4_NL);
-    EXPECT_FALSE(validateGpuPackedHeader(wrong, blob.size()));
+    EXPECT_EQ(validateGpuPackedHeader(wrong, blob.size()), GpuPackedParseStatus::MalformedInput);
     wrong = header; wrong.is_asymmetric = 0;
-    EXPECT_FALSE(validateGpuPackedHeader(wrong, blob.size()));
+    EXPECT_EQ(validateGpuPackedHeader(wrong, blob.size()), GpuPackedParseStatus::MalformedInput);
     wrong = header; wrong.mins_size = 0;
-    EXPECT_FALSE(validateGpuPackedHeader(wrong, blob.size()));
+    EXPECT_EQ(validateGpuPackedHeader(wrong, blob.size()), GpuPackedParseStatus::MalformedInput);
     const auto nl = buildGpuPackedHeader(RepackFormat::IQ4_NL, 4, 16, false, false, false, 17, 288);
-    EXPECT_TRUE(validateGpuPackedHeader(nl, gpuPackedTotalSize(nl)));
+    EXPECT_EQ(validateGpuPackedHeader(nl, gpuPackedTotalSize(nl)), GpuPackedParseStatus::Success);
 }
 
 namespace
