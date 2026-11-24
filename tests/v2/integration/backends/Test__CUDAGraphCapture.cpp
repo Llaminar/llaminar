@@ -24,6 +24,8 @@
 #include "backends/IGPUGraphCapture.h"
 #include "backends/cuda/CUDAGraphCapture.h"
 #include "execution/moe/DeviceMoERebalanceCadenceRecipe.h"
+#include "execution/mtp/DeviceGenerationGraphProgram.h"
+#include "kernels/cuda/moe/CUDAMoEKernel.h"
 #include "backends/BackendManager.h"
 #include "MTPTerminalScratchCaptureProof.h"
 #include "MTPMainForwardReadRetirementProof.h"
@@ -78,7 +80,7 @@ TEST_F(Test__CUDAGraphCapture, StreamMembershipCycleRetiresAcyclicCapture)
 }
 
 /** @brief Record the native test kernels compiled with the pinned CUDA toolchain. */
-cudaError_t recordCUDALiveLaunchProof(cudaStream_t, const unsigned *, unsigned *, unsigned *);
+cudaError_t recordCUDALiveLaunchProof(cudaStream_t, const unsigned *, unsigned *, unsigned *, unsigned *coverage = nullptr);
 
 /** @test The original cadence sources compose directly inside the follower WHILE, not as a nested conditional child. */
 TEST_F(Test__CUDAGraphCapture, FollowerCadenceUsesOriginalSourcesInNativeWhile)
@@ -175,6 +177,99 @@ TEST_F(Test__CUDAGraphCapture, FinalImportsDoNotAliasLiveLaunchBindings)
             ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
             EXPECT_EQ(actual[1], 2u * live);
             EXPECT_EQ(actual[2], 0u);
+        }
+    });
+}
+
+/** @test A real request reset changes the first submitted grid, not the retained executable. */
+TEST_F(Test__CUDAGraphCapture, FirstArrivalReplayAfterRequestResetUsesNewGrid)
+{
+    using namespace sampling_math;
+    ctx().submitAndWait([&] {
+        auto stream = static_cast<cudaStream_t>(ctx().defaultStream());
+        struct State
+        {
+            DeviceMoERebalanceGraphControllerState controller;
+            DeviceMoERebalanceCommandBufferHeader header;
+            DeviceMoERebalanceWaveState wave;
+            unsigned live;
+            int generation[kDeviceGenerationControlCount];
+            unsigned due, count, coverage, error;
+        };
+        State *state = nullptr;
+        ASSERT_EQ(cudaMalloc(&state, sizeof(State)), cudaSuccess);
+        std::unique_ptr<State, decltype(&cudaFree)> storage(state, cudaFree);
+        ASSERT_EQ(cudaMemsetAsync(state, 0, sizeof(State), stream), cudaSuccess);
+        CUDAMoEKernel kernel(0);
+        DeviceMoERebalanceConfig config;
+        config.num_layers = config.num_experts = config.top_k = config.window_size_tokens = 1;
+        const auto record = [&](IGPUGraphCapture &capture, const auto &enqueue) {
+            ScopedBackendGraphCapture transaction(ctx(), capture, "first arrival after reset fixture");
+            ASSERT_TRUE(transaction.begin());
+            const auto status = enqueue();
+            transaction.finish();
+            ASSERT_EQ(status, cudaSuccess);
+        };
+        auto publish = ctx().createGraphCapture(stream);
+        ASSERT_NO_FATAL_FAILURE(record(*publish, [&] { return cudaMemsetAsync(&state->due, 1, sizeof(unsigned), stream); }));
+        auto work = ctx().createGraphCapture(stream);
+        ASSERT_NO_FATAL_FAILURE(record(*work, [&] {
+            return recordCUDALiveLaunchProof(stream, &state->live, &state->count, &state->error, &state->coverage);
+        }));
+        auto acknowledge = ctx().createGraphCapture(stream);
+        ASSERT_NO_FATAL_FAILURE(record(*acknowledge, [&] { return cudaMemsetAsync(&state->due, 0, sizeof(unsigned), stream); }));
+        auto terminal = ctx().createGraphCapture(stream);
+        ASSERT_NO_FATAL_FAILURE(record(*terminal, [&] {
+            return cudaMemsetAsync(state->generation + kDeviceGenerationControlRequestComplete, 1, sizeof(int), stream);
+        }));
+        const DeviceMoERebalanceCadenceRecipe recipe(*publish, *work, *acknowledge, &state->due);
+        std::vector body(recipe.fragments().begin(), recipe.fragments().end());
+        body.push_back({.name = "complete generation iteration", .capture = terminal.get()});
+        const DeviceControlledLoopProgram program{.iteration = body};
+        for (bool follower : {false, true})
+        {
+            SCOPED_TRACE(follower ? "pipeline follower cadence" : "ordinary generation");
+            auto parent = ctx().createGraphCapture(stream);
+            std::string error;
+            if (follower)
+            {
+                ASSERT_TRUE(parent->buildDeviceControlledWhileLoop(program,
+                    {state->generation, kDeviceGenerationControlCount, 1,
+                        kDeviceGenerationControlOk, kDeviceGenerationControlRequestComplete}));
+                ASSERT_TRUE(parent->instantiate());
+            }
+            else
+            {
+                ASSERT_TRUE(DeviceGenerationGraphProgram::native(*parent,
+                    {DeviceGenerationPolicy::ordinary(), state->generation, kDeviceGenerationControlCount, 1},
+                    program, error)) << error;
+            }
+            const auto executable = dynamic_cast<CUDAGraphCapture &>(*parent).executable();
+            for (unsigned live : {23u, 0u, 17u, 3u, 0u, 7u})
+            {
+                SCOPED_TRACE(live);
+                // The production reset retires the previous plan count. A zero-work
+                // request intentionally leaves that count untouched after reset.
+                ASSERT_TRUE(kernel.resetDeviceRebalanceGraphTransactionForRequest({.stream = stream},
+                    &state->controller, &state->header, &state->wave, &state->live, 1u, config));
+                if (live)
+                    ASSERT_EQ(cudaMemcpyAsync(&state->live, &live, sizeof(live), cudaMemcpyHostToDevice, stream), cudaSuccess);
+                std::array<int, kDeviceGenerationControlCount> generation{};
+                generation[kDeviceGenerationControlOk] = 1;
+                ASSERT_EQ(cudaMemcpyAsync(state->generation, generation.data(), sizeof(generation), cudaMemcpyHostToDevice, stream), cudaSuccess);
+                ASSERT_EQ(cudaMemsetAsync(&state->count, 0, 2u * sizeof(unsigned), stream), cudaSuccess);
+                ASSERT_EQ(cudaMemsetAsync(&state->error, 0xff, sizeof(unsigned), stream), cudaSuccess);
+                ASSERT_TRUE(parent->launch());
+                State observed{};
+                ASSERT_EQ(cudaMemcpyAsync(&observed, state, sizeof(observed), cudaMemcpyDeviceToHost, stream), cudaSuccess);
+                ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+                EXPECT_EQ(dynamic_cast<CUDAGraphCapture &>(*parent).executable(), executable);
+                EXPECT_EQ(observed.live, live);
+                EXPECT_EQ(observed.due, 0u);
+                EXPECT_EQ(observed.count, live);
+                EXPECT_EQ(observed.coverage, (1u << live) - 1u);
+                EXPECT_EQ(observed.error, 0u);
+            }
         }
     });
 }

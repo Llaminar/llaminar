@@ -18,15 +18,20 @@ namespace
     }
 
     /** @brief All submitted blocks execute this observable work. */
-    __global__ void countBlocks(unsigned *count) { atomicAdd(count, 1u); }
+    __global__ void countBlocks(unsigned *count, unsigned *coverage)
+    {
+        atomicAdd(count, 1u);
+        if (coverage && blockIdx.x < 32u)
+            atomicOr(coverage, 1u << blockIdx.x);
+    }
 }
 #endif
 
 /** @brief Record a real launch binding into the production capture owner's frontier. */
-cudaError_t recordCUDALiveLaunchProof(cudaStream_t stream, const unsigned *live, unsigned *count, unsigned *failure)
+cudaError_t recordCUDALiveLaunchProof(cudaStream_t stream, const unsigned *live, unsigned *count, unsigned *failure, unsigned *coverage)
 {
 #if CUDART_VERSION < 13000
-    (void)stream; (void)live; (void)count; (void)failure;
+    (void)stream; (void)live; (void)count; (void)failure; (void)coverage;
     return cudaErrorNotSupported;
 #else
     cudaGraphDeviceNode_t unbound{};
@@ -35,7 +40,7 @@ cudaError_t recordCUDALiveLaunchProof(cudaStream_t stream, const unsigned *live,
     control.func = reinterpret_cast<void *>(selectGrid);
     control.gridDim = control.blockDim = dim3(1);
     control.kernelParams = control_args;
-    void *work_args[]{&count};
+    void *work_args[]{&count, &coverage};
     cudaKernelNodeParams work{};
     work.func = reinterpret_cast<void *>(countBlocks);
     work.gridDim = work.blockDim = dim3(1);

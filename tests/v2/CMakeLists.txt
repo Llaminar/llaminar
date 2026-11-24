@@ -27255,6 +27255,12 @@ if(HAVE_CUDA)
         LABELS "V2;Integration;ProductionTestPreflight;CUDA;MoE;Pipeline;GraphCapture;Regression"
         MPI_PROCS 1 NO_MODELS TIMEOUT 30)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDA_PipelineFollowerMoECadence)
+    add_v2_test(V2_Integration_CUDA_MoEArrivalFirstReplayAfterRequestReset
+        COMMAND $<TARGET_FILE:v2_integration_cuda_graph_capture>
+            --gtest_filter=Test__CUDAGraphCapture.FirstArrivalReplayAfterRequestResetUsesNewGrid
+        LABELS "V2;Integration;ProductionTestPreflight;CUDA;MoE;Pipeline;GraphCapture;RequestReset;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDA_MoEArrivalFirstReplayAfterRequestReset)
     add_v2_test(V2_Integration_CUDAGraphDependencyReduction
         COMMAND $<TARGET_FILE:v2_integration_cuda_graph_capture>
             --gtest_filter=Test__CUDAGraphCapture.DependencyReductionPreservesCapturedForkJoin
