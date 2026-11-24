@@ -26,7 +26,9 @@ namespace llaminar2::cpu::native_quantised::x86_panel
         Q5K = 7,
         IQ3S = 11
     };
-    inline constexpr int min_rows = 16; ///< Start sharing a panel across at least eight row pairs.
+    /// Start sharing a panel across at least eight row pairs. Storage quotes apply
+    /// it to the physical capacity; dispatch additionally requires as many live rows.
+    inline constexpr int min_rows = 16;
     inline constexpr int depth = 8;     ///< At most eight source blocks in one worker's L1 tile.
 
     /** @return Supported panel format selected from the admitted physical encoding and source codebook. */
@@ -91,7 +93,7 @@ namespace llaminar2::cpu::native_quantised::x86_panel
         return (columns - 1) / lanes + 1; // Admitted positive N and SIMD width.
     }
 
-    /** @return Whether ordinary prefill can keep every admitted worker on a distinct N strip. */
+    /** @return Whether a physical bucket can keep every admitted worker on a distinct N strip. */
     constexpr bool supportsGeometry(Format format, int lanes, int rows, int columns, int workers) noexcept
     {
         return format != Format::None && rows >= min_rows && (lanes == 8 || lanes == 16) &&

@@ -4753,11 +4753,17 @@ namespace llaminar2::cpu::native_quantised
         // A packed panel is an ordinary prefill route, not a verifier replay.
         // Keep explicit diagnostic policies and their physical tile overrides
         // on the original resolvers. Each worker needs at least one N strip.
+        // The planner and the runtime borrow admit the panel slab for the
+        // physical capacity M (its carry is addressed by original row), but
+        // the route itself follows the authored rows: a short live prefix in a
+        // large bucket would pack every panel for a few row pairs. Both routes
+        // reproduce the serial M=1 K tree, so this choice never changes bytes.
         const auto panel_format = x86_panel::formatFor(packed.encoding, packed.codebook_id);
         const int panel_lanes = use_avx512 ? 16 : 8;
         const auto &tile_override = debugEnv().cpu_vnni;
         const bool use_packed_panel = isa_path == ISAPath::AUTO && (use_avx512 || use_avx2) &&
-            x86_panel::supportsGeometry(panel_format, panel_lanes, M, N, num_threads) && n_block_chunks_override == 0 &&
+            x86_panel::supportsGeometry(panel_format, panel_lanes, M, N, num_threads) &&
+            row_grid.liveRows() >= x86_panel::min_rows && n_block_chunks_override == 0 &&
             tile_override.n_block_chunks <= 0 && tile_override.k_tile_blocks <= 0 && tile_override.m_unroll <= 0 &&
             schedule_override == PrefillSchedulePolicy::Auto && verifier_policy_override == VerifierRowsPolicy::Auto;
         if (use_packed_panel)

@@ -10691,13 +10691,21 @@ add_v2_test(V2_Integration_CPUCodedQ5KIQ3SProjection
     MPI_PROCS 1 NO_MODELS)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUCodedQ5KIQ3SProjection)
 
-if(LLAMINAR_CPU_ISA_UPPER MATCHES "^AVX(2|512)$")
-    add_v2_test(V2_Integration_CPUCodedX86PackedPrefill
-        COMMAND $<TARGET_FILE:v2_unit_cpu_coded_compact_units>
-            --gtest_filter=CPUCodedCompactUnits.X86PackedPrefillKeepsSerialAndTailBytes
-        LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;NativeQuantised;ByteExact;Regression"
-        MPI_PROCS 1 NO_MODELS NO_MPI ENVIRONMENT "OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
-    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUCodedX86PackedPrefill)
+# x86 decode-once prefill panels: live-row route selection, serial-row bytes
+# and per-worker slab ownership at team widths 1-4 for every runtime ISA cell
+# (an AVX-512 build also replays its AVX2 leaves). The test binds each width
+# itself; the default four-slot Integration reservation covers the widest team.
+if(V2_CPU_TARGET_X86)
+    foreach(V2_X86_PANEL_ISA IN LISTS V2_CPU_NATIVE_ISA_CELLS)
+        v2_cpu_native_isa_runtime("${V2_X86_PANEL_ISA}" V2_X86_PANEL_RUNTIME_ISA)
+        add_v2_test(V2_Integration_CPUCodedX86PackedPrefill_${V2_X86_PANEL_ISA}
+            COMMAND $<TARGET_FILE:v2_unit_cpu_coded_compact_units>
+                --gtest_filter=CPUCodedCompactUnits.X86PackedPrefillKeepsSerialAndTailBytes
+            LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;NativeQuantised;Prefill;${V2_X86_PANEL_ISA};ByteExact;Regression"
+            MPI_PROCS 1 NO_MODELS NO_MPI
+            ENVIRONMENT "OMP_NUM_THREADS=4;OMP_DYNAMIC=false;LLAMINAR_ISA_LEVEL=${V2_X86_PANEL_RUNTIME_ISA}")
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUCodedX86PackedPrefill_${V2_X86_PANEL_ISA})
+    endforeach()
 endif()
 
 # Q6_K and IQ4_XS coded CPU units: exact file-density bytes and the coded code

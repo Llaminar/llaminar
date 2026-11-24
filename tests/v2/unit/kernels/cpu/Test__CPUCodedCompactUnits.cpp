@@ -27,7 +27,11 @@
  *   integer dot and per-block output bytes, including coded Q4_K ragged K;
  * - every production activation quantizer publishes `sum_qs` equal to the sum
  *   of its 32 published bytes, which the AVX2/AVX-512 zero-point corrections
- *   of the compensation-free nibble dots rely on.
+ *   of the compensation-free nibble dots rely on;
+ * - on x86, the decode-once packed prefill panel is selected exactly for
+ *   buckets with at least 16 live rows, reproduces independent serial rows
+ *   at team widths 1-4 (including backend-native K partitions with carry),
+ *   and each worker writes only its own slab slot.
  */
 #include <gtest/gtest.h>
 
@@ -42,17 +46,24 @@
 #endif
 #include "kernels/cpu/gemm/CPUWeightPreparationMemory.h"
 #include "tensors/NativeQuantisedSuperblockMetadata.h"
+#include "utils/PerfStatsCollector.h"
+
+#include <omp.h>
 
 #include <algorithm>
 #include <array>
 #include <bit>
 #include <cstdint>
+#include <cstdlib>
 #include <cmath>
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <numeric>
+#include <optional>
 #include <random>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace llaminar2::test
@@ -787,15 +798,166 @@ namespace llaminar2::test
 
     /** The resident layout pays only for payload, source/staged factors and live superblock headers. */
 #if defined(__AVX2__)
-    /** @test Replay the installed x86 packed prefill route against independent serial rows. */
-    TEST(CPUCodedCompactUnits, X86PackedPrefillKeepsSerialAndTailBytes)
+    namespace
     {
-        constexpr int n = 67, stride = n + 5, max_rows = 17;
-        constexpr float dirty = -12345.5f;
-        const auto exercise = [&](const TensorBase &source, int k) {
-            const int blocks = k / 32;
-            std::mt19937 rng(2323);
-            std::vector<Q8_1Block> input(max_rows * blocks);
+        /** @brief Bind one exact OpenMP team width and restore the caller's policy on exit. */
+        class ScopedPanelTeam final
+        {
+        public:
+            /** @param workers Positive team width selected for this replay. */
+            explicit ScopedPanelTeam(int workers)
+                : previous_threads_(omp_get_max_threads()), previous_dynamic_(omp_get_dynamic())
+            {
+                omp_set_dynamic(0);
+                omp_set_num_threads(workers);
+            }
+            ~ScopedPanelTeam()
+            {
+                omp_set_num_threads(previous_threads_);
+                omp_set_dynamic(previous_dynamic_);
+            }
+            ScopedPanelTeam(const ScopedPanelTeam &) = delete;
+            ScopedPanelTeam &operator=(const ScopedPanelTeam &) = delete;
+
+        private:
+            int previous_threads_;
+            int previous_dynamic_;
+        };
+
+        /** @brief Collect only the production prefill launch family; restore the collection policy on exit. */
+        class ScopedPrefillLaunchObservation final
+        {
+        public:
+            ScopedPrefillLaunchObservation()
+                : json_(prior("LLAMINAR_PERF_STATS_JSON")), filter_(prior("LLAMINAR_PERF_STATS_FILTER"))
+            {
+                setenv("LLAMINAR_PERF_STATS_JSON", "1", 1);
+                setenv("LLAMINAR_PERF_STATS_FILTER", "kernel.cpu_native_quantised_prefill_gemm_launch", 1);
+                PerfStatsCollector::reloadConfigurationFromEnvironment();
+                PerfStatsCollector::reset();
+            }
+            ~ScopedPrefillLaunchObservation()
+            {
+                PerfStatsCollector::reset();
+                restore("LLAMINAR_PERF_STATS_JSON", json_);
+                restore("LLAMINAR_PERF_STATS_FILTER", filter_);
+                PerfStatsCollector::reloadConfigurationFromEnvironment();
+            }
+            ScopedPrefillLaunchObservation(const ScopedPrefillLaunchObservation &) = delete;
+            ScopedPrefillLaunchObservation &operator=(const ScopedPrefillLaunchObservation &) = delete;
+
+        private:
+            /** @return Original optional environment value, preserving absence. */
+            static std::optional<std::string> prior(const char *name)
+            {
+                const char *value = std::getenv(name);
+                return value ? std::optional<std::string>{value} : std::nullopt;
+            }
+            /** @brief Restore one original environment value exactly. */
+            static void restore(const char *name, const std::optional<std::string> &value)
+            {
+                if (value)
+                    setenv(name, value->c_str(), 1);
+                else
+                    unsetenv(name);
+            }
+            std::optional<std::string> json_, filter_;
+        };
+
+        /** @brief Route evidence published by one production prefill launch. */
+        struct PrefillLaunch
+        {
+            std::uint64_t count = 0; ///< Matching launches since the last reset.
+            std::string route;       ///< Physical route name.
+            std::string threads;     ///< Worker count the route was admitted for.
+            std::string k_tiles;     ///< Serial K partitions folded by the route.
+        };
+
+        /** @return The prefill launch recorded since the last collector reset. */
+        PrefillLaunch observedPrefillLaunch()
+        {
+            PrefillLaunch launch;
+            for (const auto &record : PerfStatsCollector::snapshot({"kernel.cpu_native_quantised_prefill_gemm_launch"}))
+            {
+                if (record.domain != "kernel" || record.name != "cpu_native_quantised_prefill_gemm_launch" ||
+                    record.kind != PerfStatRecord::Kind::Counter)
+                    continue;
+                launch.count += record.count;
+                launch.route = record.tags.at("route");
+                launch.threads = record.tags.at("threads");
+                launch.k_tiles = record.tags.at("k_tiles");
+            }
+            return launch;
+        }
+
+        /** @brief One bucket of original requests and the live request lengths replayed through it in order. */
+        struct PanelReplay
+        {
+            int n = 0;                ///< Physical output columns, including a masked SIMD tail.
+            int k = 0;                ///< Logical K, a multiple of 32.
+            int requests = 1;         ///< Independent original requests sharing the bucket.
+            int rows_per_request = 0; ///< Physical rows owned by each request.
+            std::vector<std::vector<std::int32_t>> live; ///< One length per request for each replayed cell.
+        };
+
+        /**
+         * @brief Replay one source through production Auto prefill at one exact team width.
+         * @param source GGUF-layout source tensor of shape {n, k}.
+         * @param policy Arithmetic policy of the prepared matrix.
+         * @param workers OpenMP team width; the serial reference uses the same width.
+         * @param replay Bucket geometry and live cells.
+         * @param require_k_partitions Whether the serial tree must fold several K partitions.
+         *
+         * Every cell is compared bitwise with independent serial M=1 rows at the
+         * same width (the backend-native K tree depends on it); unauthored rows
+         * and the N padding stay dirty. A bucket with at least 16 live rows must
+         * select the packed panel; a sparser bucket keeps the ordinary route even
+         * though its storage was admitted for the panel. On the panel route each
+         * worker writes only its own slot: its first panel, live carry rows and
+         * nothing past the slot's panel/carry extent or the whole panel quote.
+         */
+        void replayPackedPrefill(const TensorBase &source, CPUProjectionNumericalPolicy policy, int workers,
+            const PanelReplay &replay, bool require_k_partitions)
+        {
+            constexpr float dirty = -12345.5f;
+            constexpr auto dirty_bits = std::bit_cast<std::uint32_t>(dirty);
+            const auto clean = [](float value) { return std::bit_cast<std::uint32_t>(value) == dirty_bits; };
+            const int n = replay.n, k = replay.k, blocks = k / 32, stride = n + 5;
+            const int rows = replay.requests * replay.rows_per_request;
+            SCOPED_TRACE("workers=" + std::to_string(workers) + " policy=" + std::to_string(int(policy)));
+            ScopedPanelTeam team(workers);
+            ASSERT_EQ(nativeQuantisedInvocationWorkerCount(), workers);
+
+            CPUNativeQuantisedPackedWeights packed;
+            packed.numerical_policy = policy;
+            ASSERT_TRUE(packWeightsCPUNativeQuantised(&source, packed));
+            const auto format = x86_panel::formatFor(packed.encoding, packed.codebook_id);
+            ASSERT_NE(format, x86_panel::Format::None);
+            const int lanes = activeISALevel() >= ISALevel::AVX512 ? 16 : 8;
+            const auto config = serialTileConfigForPackedMatrix(packed, n, k, workers);
+            if (require_k_partitions)
+                ASSERT_GT(config.k_tiles, 1) << "the replay must fold several serial K partitions";
+            const int partitions = std::max(1, config.k_tiles);
+
+            // Independent slot geometry: up to eight K blocks of eight dot-group
+            // vectors plus a scale vector (and a minimum vector for Q4_K/Q5_K),
+            // then one carry vector per original row when a later partition spans
+            // several panels; each slot is padded to a 64-byte line.
+            const bool affine = format == x86_panel::Format::Q4K || format == x86_panel::Format::Q5K;
+            const std::size_t panel_floats = std::size_t(std::min(blocks, 8)) * (affine ? 10 : 9) * lanes;
+            const bool carry = partitions > 1 && (blocks + partitions - 1) / partitions > 8;
+            const std::size_t carry_floats = carry ? std::size_t(rows) * lanes : 0;
+            const std::size_t pitch = (panel_floats + carry_floats + 15) / 16 * 16;
+            const auto quoted = x86_panel::workspaceFloats(format, lanes, rows, n, blocks, config.k_tiles, workers);
+            ASSERT_EQ(quoted, pitch * workers);
+            const auto borrow = nativeQuantisedProjectionPartialFloats(packed, rows);
+            ASSERT_GE(borrow, quoted);
+            ASSERT_GE(nativeQuantisedProjectionPartialEnvelopeFloats(packed, rows), quoted);
+            constexpr std::size_t guard = 64;
+            std::vector<float> scratch(borrow + guard, dirty);
+
+            std::mt19937 rng(2323u + static_cast<std::uint32_t>(k));
+            std::vector<Q8_1Block> input(std::size_t(rows) * blocks);
             for (auto &block : input)
             {
                 block.d = static_cast<std::uint16_t>(0x2000 + rng() % 0x1000);
@@ -805,62 +967,133 @@ namespace llaminar2::test
                     block.sum_qs += byte;
                 }
             }
-            for (const auto policy : {CPUProjectionNumericalPolicy::BackendNative, CPUProjectionNumericalPolicy::GPUAlignedExpert})
+            std::vector<float> serial(std::size_t(rows) * stride, dirty), actual(serial.size(), dirty);
+            std::vector<float> serial_scratch(nativeQuantisedProjectionPartialFloats(packed, 1));
+            for (int row = 0; row < rows; ++row)
+                gemv_native_quantised_preq(packed, input.data() + std::size_t(row) * blocks,
+                    serial.data() + std::size_t(row) * stride, serial_scratch);
+
+            // The exact panel prefix, including carry, is validated before any write.
+            EXPECT_THROW(gemm_native_quantised_preq(packed, input.data(), actual.data(),
+                std::span<float>(scratch).first(quoted - 1), rows, stride), std::invalid_argument);
+            ASSERT_TRUE(std::all_of(actual.begin(), actual.end(), clean));
+
+            for (const auto &lengths : replay.live)
             {
-                CPUNativeQuantisedPackedWeights packed;
-                packed.numerical_policy = policy;
-                ASSERT_TRUE(packWeightsCPUNativeQuantised(&source, packed));
-                const auto format = x86_panel::formatFor(packed.encoding, packed.codebook_id);
-                ASSERT_NE(format, x86_panel::Format::None);
-                const int workers = nativeQuantisedInvocationWorkerCount();
-                const int lanes = activeISALevel() >= ISALevel::AVX512 ? 16 : 8;
-                const auto config = serialTileConfigForPackedMatrix(packed, n, k, workers);
-                const auto panel = x86_panel::workspaceFloats(format, lanes, max_rows, n, blocks, config.k_tiles, workers);
-                const auto envelope = nativeQuantisedProjectionPartialEnvelopeFloats(packed, max_rows);
-                ASSERT_GE(envelope, panel);
-                std::vector<float> scratch(panel ? panel : envelope, dirty);
-                std::vector<float> serial_scratch(nativeQuantisedProjectionPartialFloats(packed, 1));
-                std::vector<float> actual(max_rows * stride, dirty), serial(max_rows * stride, dirty);
-                if (panel)
+                ASSERT_EQ(lengths.size(), std::size_t(replay.requests));
+                const int live = std::accumulate(lengths.begin(), lengths.end(), 0);
+                std::string cell = "live=";
+                for (const auto length : lengths)
+                    cell += std::to_string(length) + ",";
+                SCOPED_TRACE(cell);
+                const auto work = replay.requests == 1
+                    ? ProjectionRowWork::fromPrefix(DeviceRowRange::deviceCounted(rows, lengths.data()))
+                    : ProjectionRowWork::fromRequests(
+                          DeviceRequestRowRanges::deviceCounted(replay.requests, replay.rows_per_request, lengths.data()));
+                std::fill(actual.begin(), actual.end(), dirty);
+                std::fill(scratch.begin(), scratch.end(), dirty);
+                PerfStatsCollector::reset();
+                gemm_native_quantised_preq(packed, input.data(), actual.data(), scratch, rows, stride, ISAPath::AUTO,
+                    VerifierRowsPolicy::Auto, PrefillSchedulePolicy::Auto, 0, &work);
+                const auto launch = observedPrefillLaunch();
+
+                const auto authored = [&](int row) {
+                    return row % replay.rows_per_request < lengths[std::size_t(row / replay.rows_per_request)];
+                };
+                for (int row = 0; row < rows; ++row)
+                    for (int col = 0; col < stride; ++col)
+                    {
+                        const auto index = std::size_t(row) * stride + col;
+                        const auto expected = authored(row) ? serial[index] : dirty;
+                        ASSERT_EQ(std::bit_cast<std::uint32_t>(actual[index]), std::bit_cast<std::uint32_t>(expected))
+                            << "row=" << row << " column=" << col;
+                    }
+                for (std::size_t index = borrow; index < scratch.size(); ++index)
+                    ASSERT_TRUE(clean(scratch[index])) << "write past the admitted projection borrow at " << index;
+
+                if (live == 0)
                 {
-                    // Validate the exact panel prefix, including ordered carry,
-                    // independently of a larger mutually exclusive partial bank.
-                    EXPECT_THROW(gemm_native_quantised_preq(packed, input.data(), actual.data(),
-                        std::span<float>(scratch).first(panel - 1), max_rows, stride), std::invalid_argument);
-                    EXPECT_TRUE(std::all_of(actual.begin(), actual.end(), [dirty](float value) { return value == dirty; }));
+                    EXPECT_EQ(launch.count, 0u) << "an empty bucket must not launch";
+                    continue;
                 }
-                for (int row = 0; row < max_rows; ++row)
-                    gemv_native_quantised_preq(packed, input.data() + row * blocks, serial.data() + row * stride, serial_scratch);
-                for (const int live : {max_rows, 0, 3, max_rows - 1, max_rows})
+                ASSERT_EQ(launch.count, 1u);
+                EXPECT_EQ(launch.threads, std::to_string(workers));
+                const bool panel = live >= x86_panel::min_rows;
+                ASSERT_EQ(launch.route == "packed_panel", panel) << "route=" << launch.route;
+                if (!panel)
                 {
-                    SCOPED_TRACE(live);
-                    std::fill(actual.begin(), actual.end(), dirty);
-                    const auto work = ProjectionRowWork::fromPrefix(DeviceRowRange::deviceCounted(max_rows, &live));
-                    gemm_native_quantised_preq(packed, input.data(), actual.data(), scratch, max_rows, stride, ISAPath::AUTO,
-                        VerifierRowsPolicy::Auto, PrefillSchedulePolicy::Auto, 0, &work);
-                    for (int row = 0; row < max_rows; ++row)
-                        for (int col = 0; col < stride; ++col)
-                        {
-                            const auto expected = row < live ? serial[row * stride + col] : dirty;
-                            ASSERT_EQ(std::bit_cast<std::uint32_t>(actual[row * stride + col]), std::bit_cast<std::uint32_t>(expected))
-                                << "row=" << row << " column=" << col << " policy=" << static_cast<int>(policy);
-                        }
+                    if (require_k_partitions)
+                        EXPECT_EQ(launch.route, "decode_equivalent_kpart_rows");
+                    continue;
+                }
+                EXPECT_EQ(launch.k_tiles, std::to_string(partitions));
+                for (std::size_t index = quoted; index < borrow; ++index)
+                    ASSERT_TRUE(clean(scratch[index])) << "panel write past its quote at " << index;
+                for (int worker = 0; worker < workers; ++worker)
+                {
+                    const auto base = std::size_t(worker) * pitch;
+                    // Every worker owns at least one N strip and packs its first panel here.
+                    EXPECT_FALSE(clean(scratch[base])) << "worker " << worker << " did not pack into its own slot";
+                    for (int row = 0; row < rows; ++row)
+                        if (carry && !authored(row))
+                            for (int lane = 0; lane < lanes; ++lane)
+                                ASSERT_TRUE(clean(scratch[base + panel_floats + std::size_t(row) * lanes + lane]))
+                                    << "worker " << worker << " carried unauthored row " << row;
+                    for (auto index = base + panel_floats + carry_floats; index < base + pitch; ++index)
+                        ASSERT_TRUE(clean(scratch[index])) << "worker " << worker << " wrote slot padding " << index;
                 }
             }
-        };
-        for (const int k : {1120, 4768})
+        }
+
+        /** @return One source of every x86 panel format (Q5_K, IQ3_S, Q4_K, IQ4_XS, Q5_0) with shape {n, k}. */
+        std::vector<std::pair<std::string, std::unique_ptr<TensorBase>>> panelSources(int n, int k)
         {
-            SCOPED_TRACE(k);
-            const std::vector<std::size_t> shape{n, static_cast<std::size_t>(k)};
+            const std::vector<std::size_t> shape{static_cast<std::size_t>(n), static_cast<std::size_t>(k)};
+            std::vector<std::pair<std::string, std::unique_ptr<TensorBase>>> sources;
             for (const auto &format : compactSources())
                 if (format.codebook == 7 || format.codebook == 11)
-                {
-                    SCOPED_TRACE(format.name);
-                    exercise(*format.make(shape, 121), k);
-                }
-            exercise(*q4KSource(shape, 321), k);
-            exercise(*Factory::createIQ4_XSRandom(shape, 789), k);
-            exercise(*Factory::createQ5_0Random(shape, 201), k);
+                    sources.emplace_back(format.name, format.make(shape, 121));
+            sources.emplace_back("Q4_K", q4KSource(shape, 321));
+            sources.emplace_back("IQ4_XS", Factory::createIQ4_XSRandom(shape, 789));
+            sources.emplace_back("Q5_0", Factory::createQ5_0Random(shape, 201));
+            return sources;
+        }
+    } // namespace
+
+    /** @test Replay the installed x86 packed prefill route against independent serial rows at team widths 1-4. */
+    TEST(CPUCodedCompactUnits, X86PackedPrefillKeepsSerialAndTailBytes)
+    {
+        ScopedPrefillLaunchObservation observation;
+        // Two original requests of 17 rows share one 34-row bucket. Live totals
+        // 34, 16, 17 and 33 select the panel, including a 9+7 split across the
+        // request boundary; 3 and 15 are sparse prefixes of a bucket admitted for
+        // the panel and keep the ordinary route; 0 launches nothing. The
+        // GPU-aligned tree always has 16 partitions: K=1120 (35 blocks) leaves
+        // empty trailing partitions and K=4768 (149 blocks, ten per partition)
+        // carries partials across panels.
+        for (const int k : {1120, 4768})
+        {
+            const PanelReplay replay{.n = 67, .k = k, .requests = 2, .rows_per_request = 17,
+                .live = {{17, 17}, {0, 0}, {3, 0}, {9, 6}, {9, 7}, {16, 0}, {0, 17}, {17, 16}}};
+            for (const auto &[name, source] : panelSources(replay.n, k))
+            {
+                SCOPED_TRACE(name + " k=" + std::to_string(k));
+                for (const auto policy : {CPUProjectionNumericalPolicy::BackendNative, CPUProjectionNumericalPolicy::GPUAlignedExpert})
+                    for (int workers = 1; workers <= 4; ++workers)
+                        replayPackedPrefill(*source, policy, workers, replay, false);
+            }
+        }
+        // The backend-native tree splits K only for at least 16M FLOPs with fewer
+        // N tasks than workers. One 64-column chunk with 4104 K blocks gives 2..32
+        // partitions at every width >= 2 (cache-regime dependent), each longer
+        // than one panel, so partials fold and carry across panels.
+        const PanelReplay partitioned{.n = 61, .k = 4104 * 32, .requests = 1, .rows_per_request = 17,
+            .live = {{17}, {3}}};
+        for (const auto &[name, source] : panelSources(partitioned.n, partitioned.k))
+        {
+            SCOPED_TRACE(name + " backend-native K partitions");
+            for (int workers = 2; workers <= 4; ++workers)
+                replayPackedPrefill(*source, CPUProjectionNumericalPolicy::BackendNative, workers, partitioned, true);
         }
     }
 #endif
