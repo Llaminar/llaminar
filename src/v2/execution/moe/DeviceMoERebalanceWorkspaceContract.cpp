@@ -167,6 +167,13 @@ namespace llaminar2
         return static_cast<std::size_t>(std::max<std::uint32_t>(1u, wave_count));
     }
 
+    std::size_t DeviceMoERebalanceWorkspaceCapacity::localHistogramWords() const noexcept
+    {
+        const auto layout = usesTransferSlots() ? moe_rebalance_abi::HistogramLayout::TransferFamilyOccupancy
+                                               : moe_rebalance_abi::HistogramLayout::ResidentOnly;
+        return moe_rebalance_abi::histogramWords(layout, histogramLayerCount(), num_experts);
+    }
+
     std::size_t
     DeviceMoERebalanceWorkspaceCapacity::llepPlannerScratchCount() const noexcept
     {
@@ -318,10 +325,7 @@ namespace llaminar2
         const std::size_t participants = capacity.participant_count;
         const std::size_t command_buffers = capacity.commandBufferCount();
         const std::size_t plan_entries = capacity.transferPlanCapacity();
-        const std::size_t local_histogram_entries = checkedMultiply(
-            capacity.histogramLayerCount(),
-            capacity.num_experts,
-            "local histogram entries");
+        const std::size_t local_histogram_entries = capacity.localHistogramWords();
         const std::size_t gathered_histogram_entries = checkedMultiply(
             local_histogram_entries,
             participants,
@@ -333,7 +337,7 @@ namespace llaminar2
             binding.workspace_suffix,
             checkedMultiply(
                 local_histogram_entries,
-                sizeof(std::uint64_t),
+                sizeof(std::uint32_t),
                 "local histogram bytes"));
         append(
             requirements,
@@ -341,7 +345,7 @@ namespace llaminar2
             binding.workspace_suffix,
             checkedMultiply(
                 gathered_histogram_entries,
-                sizeof(std::uint64_t),
+                sizeof(std::uint32_t),
                 "gathered histogram bytes"));
         append(
             requirements,

@@ -80,19 +80,6 @@ namespace llaminar2
             directory_config.max_hot_replicas_per_participant =
                 static_cast<std::uint32_t>(std::min(
                     hot_replica_cap, num_experts));
-            directory_capacity =
-                DeviceMoETransferSlotDirectory::planRuntimeCapacity(
-                    directory_config,
-                    /*minimum_active_slots=*/0u,
-                    static_cast<std::uint32_t>(std::max(
-                        1,
-                        env.moe_rebalance
-                            .gpu_direct_transfer_wave_experts)),
-                    static_cast<std::uint32_t>(std::max(
-                        1,
-                        env.moe_rebalance
-                            .gpu_direct_transfer_buffers)));
-
             if (plan.routed_tiers.size() != 1u)
             {
                 throw std::logic_error(
@@ -114,6 +101,23 @@ namespace llaminar2
                 throw std::logic_error(
                     "Device transfer-directory workspace has no valid homogeneous participant domain");
             }
+
+            const auto collective_payload_slot_capacity = static_cast<uint32_t>(std::max(
+                1, env.moe_rebalance.device_rebalance_compact_payload_slots));
+            directory_capacity =
+                DeviceMoETransferSlotDirectory::planRuntimeCapacity(
+                    directory_config,
+                    DeviceMoETransferSlotDirectory::runtimeMinimumActiveSlots(true,
+                        domain->routed_prefill_assignment_policy, config.prefix_cache,
+                        collective_payload_slot_capacity),
+                    static_cast<std::uint32_t>(std::max(
+                        1,
+                        env.moe_rebalance
+                            .gpu_direct_transfer_wave_experts)),
+                    static_cast<std::uint32_t>(std::max(
+                        1,
+                        env.moe_rebalance
+                            .gpu_direct_transfer_buffers)));
 
             std::uint32_t workspace_flags =
                 static_cast<std::uint32_t>(
@@ -161,13 +165,7 @@ namespace llaminar2
                     .flags = workspace_flags,
                     .local_transfer_slot_count =
                         directory_capacity.total_slots,
-                    .collective_payload_slot_capacity =
-                        std::min<std::uint32_t>(
-                            directory_capacity.total_slots,
-                            static_cast<std::uint32_t>(std::max(
-                                1,
-                                env.moe_rebalance
-                                    .device_rebalance_compact_payload_slots))),
+                    .collective_payload_slot_capacity = collective_payload_slot_capacity,
                     .phase = DeviceMoERebalanceStagePhase::PlanCopyApply,
                     .transfer_mode =
                         DeviceMoERebalanceTransferMode::CompactTransferSlots,

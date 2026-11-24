@@ -297,6 +297,9 @@ void replayFullNativeHCFFN(DeviceId device,int member,ILocalTPContext& tp,std::b
         require(!timing||!outside_reader,"outside reader is a functional scope, never a timing substitution");
         const std::array<std::size_t,planes> widths{K,K,R,R,K,H,std::size_t(shape.experts),H,middle?4u:0u,middle?K:0u,
             std::size_t(shape.top_k)*H,H,H,std::size_t(shape.shared),std::size_t(shape.shared)};
+        constexpr std::array<const char*,planes> plane_names{"post", "normalized", "hc_down", "hc_activated",
+            "hc_up", "mixed", "route_logits_workspace", "combined", "injection", "next_trunk",
+            "route_contributions", "routed", "shared", "shared_gate", "shared_up"};
         std::array<FullProductionHCPrefix,2> prefix;
         std::array<std::unique_ptr<Lane>,2> lanes;
         std::array<std::unique_ptr<IGPUGraphCapture>,2> captures,children,timed;
@@ -655,7 +658,19 @@ void replayFullNativeHCFFN(DeviceId device,int member,ILocalTPContext& tp,std::b
                 restore_previous_inputs(side);require(captures[side]->launch(),"launch retained original full production region");observe(side);
                 baseline[side]=observed[side];baseline_ids[side]=ids[side];baseline_weights[side]=weights[side];
                 restore_previous_inputs(side);require(captures[side]->launch(),"repeat retained original full production region");observe(side);
-                for(unsigned plane=0;plane<planes;++plane)require(same(observed[side][plane],baseline[side][plane]),"same-engine repeated public plane");
+                for(unsigned plane=0;plane<planes;++plane) {
+                    const auto& before=baseline[side][plane];
+                    const auto& after=observed[side][plane];
+                    if(same(before,after))continue;
+                    const auto context=std::string("same-engine repeated public plane ")+plane_names[plane]+
+                        " arm="+(side?(retained?"retained":"full"):"staged")+" history="+std::to_string(history);
+                    require(before.size()==after.size(),context+" changed extent");
+                    const auto mismatch=std::mismatch(before.begin(),before.end(),after.begin(),
+                        [](const float& a,const float& b){return std::bit_cast<std::uint32_t>(a)==std::bit_cast<std::uint32_t>(b);});
+                    require(false,context+" element="+std::to_string(mismatch.first-before.begin())+
+                        " first_u32="+std::to_string(std::bit_cast<std::uint32_t>(*mismatch.first))+
+                        " repeat_u32="+std::to_string(std::bit_cast<std::uint32_t>(*mismatch.second)));
+                }
                 require(same(ids[side],baseline_ids[side])&&same(weights[side],baseline_weights[side]),"same-engine repeated route bytes");
             }
             exact("active replay");

@@ -11,6 +11,7 @@
  */
 
 #include "../../fixtures/transfer/ComponentTransferExecutionPoolFixtureAccess.h"
+#include "../../utils/CodedGpuRelayWireFixture.h"
 #include "../../fixtures/backends/OriginalRankLocalNativeReplay.h"
 #include "backends/BackendManager.h"
 #include "backends/ComputeBackend.h"
@@ -1900,6 +1901,193 @@ namespace llaminar2
             source_backend->destroyEvent(
                 source_ready_event,
                 source_device.gpu_ordinal());
+        }
+
+        /** @brief Prepare exact coded planes on one endpoint and retire them on that backend. */
+        class CodedDeviceProjection final
+        {
+        public:
+            using Host = test::CodedGpuRelayWireFixture;
+
+            /** @brief Establish stable native root identity before publishing any commands. */
+            CodedDeviceProjection(DeviceId device, const Host &root, const std::string &identity)
+                : backend_(getBackendFor(device)), ordinal_(device.gpu_ordinal()),
+                  stream_(GPUDeviceContextPool::instance().getContext(device).getOrCreateAuxiliaryStream(identity)),
+                  payload_(plane(root.payload)), codes_(plane(root.codes)), headers_(plane(root.headers)),
+                  descriptor_(root.descriptor(payload_.get(), codes_.get(), headers_.get()))
+            {
+                if (!backend_->synchronizeStream(stream_, ordinal_))
+                    throw std::runtime_error("Could not close coded projection fixture upload");
+            }
+
+            /** @return Immutable descriptor for exact native planes on this backend. */
+            const GpuExpertPackedDescriptor &descriptor() const noexcept { return descriptor_; }
+
+            /** @return Read-only view for native packed download through a retained epoch. */
+            ExpertTierGpuConstProjectionView view() const noexcept
+            {
+                return {.payload = descriptor_.ptrs.d_vnni,
+                    .scales = static_cast<const uint16_t *>(descriptor_.ptrs.d_scales),
+                    .mins = static_cast<const uint16_t *>(descriptor_.ptrs.d_mins),
+                    .payload_bytes = descriptor_.vnni_bytes, .scales_bytes = descriptor_.scales_bytes,
+                    .mins_bytes = descriptor_.mins_bytes, .metadata_layout = descriptor_.metadata_layout};
+            }
+
+            /** @brief Compare all resident bytes, including unintersected fields and reader guards. */
+            void expectExact(const Host &expected) const
+            {
+                const auto compare = [&](const auto &pointer, const auto &bytes) {
+                    if (bytes.empty())
+                        return;
+                    std::vector<uint8_t> actual(bytes.size());
+                    ASSERT_TRUE(backend_->deviceToHostOnStream(actual.data(), pointer.get(), actual.size(), ordinal_, stream_));
+                    ASSERT_TRUE(backend_->synchronizeStream(stream_, ordinal_));
+                    EXPECT_EQ(actual, bytes);
+                };
+                compare(payload_, expected.payload);
+                compare(codes_, expected.codes);
+                compare(headers_, expected.headers);
+            }
+
+        private:
+            struct PlaneDeleter
+            {
+                IBackend *backend;
+                int ordinal;
+                void operator()(uint8_t *bytes) const { backend->free(bytes, ordinal); }
+            };
+            using Plane = std::unique_ptr<uint8_t, PlaneDeleter>;
+
+            /** @return One plane whose immutable pattern is published on the owned setup stream. */
+            Plane plane(const std::vector<uint8_t> &bytes) const
+            {
+                Plane result(nullptr, {backend_, ordinal_});
+                if (!bytes.empty())
+                {
+                    result.reset(static_cast<uint8_t *>(backend_->allocate(bytes.size(), ordinal_)));
+                    if (!result || !backend_->hostToDeviceOnStream(result.get(), bytes.data(), bytes.size(), ordinal_, stream_))
+                        throw std::runtime_error("Could not upload coded projection fixture plane");
+                }
+                return result;
+            }
+
+            IBackend *backend_;
+            int ordinal_;
+            void *stream_;
+            Plane payload_, codes_, headers_;
+            GpuExpertPackedDescriptor descriptor_;
+        };
+
+        /** @test The CUDA producer writes exactly the backend-neutral coded wire for all formats. */
+        TEST(ExpertTierGpuBlobTransferIntegration, CUDACodedCrossBackendSourceWireMatchesHost)
+        {
+#ifndef HAVE_CUDA
+            GTEST_SKIP() << "CUDA is required";
+#else
+            const auto device = DeviceId::cuda(0);
+            ASSERT_NE(getBackendFor(device), nullptr);
+            using Fixture = test::CodedGpuRelayWireFixture;
+            const auto overlap = ExpertTierWeightProjectionIntersection::between(Fixture::source_root, Fixture::destination_root);
+            constexpr auto capacity = Fixture::chunk_capacity;
+            auto staging = TransferEngine::instance().allocateMappedHostTransferSlices(capacity, 1u, device);
+            const auto epoch = MappedTransferProgressEpoch::create({.device = device, .slot_capacity = 1,
+                .execution_lane_capacity = 1, .execution_streams = test::ComponentTransferExecutionPoolFixtureAccess::allocate(
+                    TransferEngine::instance(), 1u, device, "coded_cross_backend_source"),
+                .maximum_bytes = capacity, .name = "coded_cross_backend_source"});
+            auto slot = epoch->reserveSlot(MappedTransferDirection::DeviceToHost, staging[0], "coded_cross_backend_wire");
+            unsigned covered = 0u;
+            for (const auto &source_format : native_quantised_formats::kAllSourceFormats)
+            {
+                if (!cpu::native_quantised::migrationUsesSuperblockCodes(*source_format.metadata))
+                    continue;
+                ++covered;
+                SCOPED_TRACE(source_format.quant_type);
+                Fixture source(*source_format.metadata, Fixture::source_root, 3u, 11u);
+                Fixture destination(*source_format.metadata, Fixture::destination_root, 5u, 27u);
+                CodedDeviceProjection native(device, source, "coded_cross_backend_source_fixture");
+                ExpertTierGpuBlobChunkProtocol protocol(capacity);
+                ASSERT_TRUE(protocol.begin(native.descriptor(), destination.descriptor(), overlap));
+                const auto &pack = protocol.codedLayouts()->pack;
+                while (const auto chunk = protocol.takeNext())
+                {
+                    const auto expected = source.wire(pack, chunk->first_unit, chunk->unit_count);
+                    auto *mapped = static_cast<uint8_t *>(staging[0]->mutableHostData());
+                    std::fill_n(mapped, capacity, 0xa3u);
+                    slot.publishPackedDeviceToMappedHost(native.view(), pack, chunk->first_unit, chunk->unit_count, nullptr, 0u);
+                    auto progress = MappedTransferProgress::Pending;
+                    std::string error;
+                    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+                    while (progress == MappedTransferProgress::Pending && std::chrono::steady_clock::now() < deadline)
+                    {
+                        ASSERT_TRUE(epoch->submitOutstandingProgress());
+                        progress = slot.poll(&error);
+                        std::this_thread::yield();
+                    }
+                    ASSERT_EQ(progress, MappedTransferProgress::Ready) << error;
+                    EXPECT_TRUE(std::equal(expected.begin(), expected.end(), mapped));
+                    EXPECT_TRUE(std::all_of(mapped + expected.size(), mapped + capacity, [](uint8_t b) { return b == 0xa3u; }));
+                }
+            }
+            EXPECT_EQ(covered, 13u);
+#endif
+        }
+
+        /** @test Both real vendor directions preserve phased layouts, live bytes and neighboring code bits. */
+        TEST(ExpertTierGpuBlobTransferIntegration, CUDAAndROCmCodedRelayPreservesAllSourcePlanes)
+        {
+#if !defined(HAVE_CUDA) || !defined(HAVE_ROCM)
+            GTEST_SKIP() << "CUDA and ROCm are both required";
+#else
+            ASSERT_NE(getBackendFor(DeviceId::cuda(0)), nullptr);
+            ASSERT_NE(getBackendFor(DeviceId::rocm(0)), nullptr);
+            using Fixture = test::CodedGpuRelayWireFixture;
+            const auto overlap = ExpertTierWeightProjectionIntersection::between(Fixture::source_root, Fixture::destination_root);
+            constexpr auto capacity = Fixture::chunk_capacity;
+            for (const auto &[src, dst] : {std::pair{DeviceId::cuda(0), DeviceId::rocm(0)},
+                                          std::pair{DeviceId::rocm(0), DeviceId::cuda(0)}})
+            {
+                const auto identity = src.to_string() + "_coded_to_" + dst.to_string();
+                auto epochs = makeRetainedRelayEpochs(src, dst, capacity, identity);
+                const auto source_staging = TransferEngine::instance().allocateMappedHostTransferSlices(capacity, 2u, src);
+                const auto dest_staging = TransferEngine::instance().allocateMappedHostTransferSlices(capacity, 2u, dst);
+                ExpertTierGpuBlobTransferLane lane({.source_device = src, .destination_device = dst,
+                    .relay_kind = ExpertTierGpuBlobRelayKind::CrossBackend, .staging_capacity_bytes = capacity,
+                    .source_mapped_staging = {source_staging[0], source_staging[1]},
+                    .destination_mapped_staging = {dest_staging[0], dest_staging[1]},
+                    .source_progress_epoch = epochs.source, .destination_progress_epoch = epochs.destination, .lane_name = identity});
+                std::string error;
+                ASSERT_TRUE(lane.materialize(&error)) << error;
+                unsigned epoch = 0u;
+                for (const auto &source_format : native_quantised_formats::kAllSourceFormats)
+                {
+                    if (!cpu::native_quantised::migrationUsesSuperblockCodes(*source_format.metadata))
+                        continue;
+                    SCOPED_TRACE(identity + ":" + std::string(source_format.quant_type));
+                    Fixture source(*source_format.metadata, Fixture::source_root, 3u, 11u);
+                    Fixture destination(*source_format.metadata, Fixture::destination_root, 5u, 27u);
+                    CodedDeviceProjection native_source(src, source, identity + ":source"),
+                        native_destination(dst, destination, identity + ":destination");
+                    ASSERT_TRUE(lane.accepts(native_source.descriptor(), native_destination.descriptor(), overlap, &error)) << error;
+                    const auto before = lane.stats().host_relay_bytes;
+                    ASSERT_TRUE(lane.start(native_source.descriptor(), native_destination.descriptor(), overlap,
+                        ExpertTierSourceReadiness::publishedResidencyBank(++epoch), &error)) << error;
+                    auto progress = ExpertTierGpuBlobTransferProgress::Pending;
+                    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+                    while (progress == ExpertTierGpuBlobTransferProgress::Pending && std::chrono::steady_clock::now() < deadline)
+                    {
+                        ASSERT_TRUE(epochs.source->submitOutstandingProgress());
+                        ASSERT_TRUE(epochs.destination->submitOutstandingProgress());
+                        progress = lane.poll(&error);
+                        std::this_thread::yield();
+                    }
+                    ASSERT_EQ(progress, ExpertTierGpuBlobTransferProgress::Ready) << error;
+                    EXPECT_EQ(lane.stats().host_relay_bytes - before, lane.quotedPayloadBytes());
+                    destination.copyIntersectionFrom(source, overlap);
+                    native_destination.expectExact(destination);
+                }
+                EXPECT_EQ(epoch, 13u);
+            }
+#endif
         }
 
         TEST(

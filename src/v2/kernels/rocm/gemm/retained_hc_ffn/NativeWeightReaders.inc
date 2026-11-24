@@ -381,10 +381,14 @@ __device__ __forceinline__ void native_q4_panel_publish(const Descriptor& matrix
 {
     constexpr unsigned Packet=NativeQ4PanelContract::rows_per_packet;
     const unsigned packets=(rows+Packet-1)/Packet;
-    if(rows==0 || tid>=blocks*packets)return;
+    if(rows==0)return;
+    const uint8_t layout=native_descriptor_layout(matrix);
+    // The coded writer owns individual coefficient words, not eight-row
+    // packets. Apply the early exit to the same work extent as its loop so
+    // the subsequent CTA join publishes a fully overwritten live LDS panel.
+    if(tid>=blocks*(layout!=0?rows:packets))return;
     unsigned columns;const uint8_t* payload;const unsigned short *scales,*mins;
     native_descriptor_fields<true>(matrix,columns,payload,scales,mins);
-    const uint8_t layout=native_descriptor_layout(matrix);
     if(layout!=0) {
         const unsigned codebook=native_weight_uniform(unsigned(native_weight_uniform(matrix)->codebook_id));
         // Superblock-coded Q4_K/Q5_K: reconstruct each real (block,row) word; the

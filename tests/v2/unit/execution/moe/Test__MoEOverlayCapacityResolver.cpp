@@ -9,6 +9,7 @@
  * expectations independently count its1408-byte CPU unit and20-byte GPU block.
  */
 
+#include "loaders/GPUPreparedWeightPoolLayout.h"
 #include "execution/moe/MoEOverlayActivationBatchResources.h"
 #include "execution/moe/MoEOverlayPhysicalLaneDemand.h"
 #include "../../../fixtures/planning/RecordedHostServicePlanning.h"
@@ -224,6 +225,22 @@ namespace llaminar2
             return testAlignUp(cursor, kGpuAlignment);
         }
 
+        /** @return Aligned coded payload, separately stored code bits and original headers. */
+        [[nodiscard]] std::size_t expectedGpuCodedProjectionBytes(
+            const MoEOverlayProjectionWeightManifest &spec, const NativeQuantisedFormatInfo &source)
+        {
+            namespace sb = native_quantised_superblock;
+            const auto book = canonicalDeviceVnniCodebookId(source);
+            const auto blocks_per_row = spec.K / 32;
+            const auto blocks = std::size_t(spec.N) * blocks_per_row;
+            const auto code_bits = blocks * sb::superblockCodePlaneBits(book);
+            const auto headers = std::size_t(spec.N) * ((blocks_per_row + spec.gpuSuperblockPhase() + 7) / 8) *
+                sb::superblockFieldBytes(book);
+            return testAlignUp(blocks * source.payload_bytes, kGpuAlignment) +
+                testAlignUp(code_bits ? (code_bits + 7) / 8 + sb::kSuperblockCodePlanePadBytes : 0u, kGpuAlignment) +
+                testAlignUp(headers, kGpuAlignment);
+        }
+
         /** @return Migration-stable GPU payload width for a CPU round trip. */
         [[nodiscard]] constexpr int expectedMigrationPayload(
             const NativeQuantisedFormatInfo &format)
@@ -235,6 +252,8 @@ namespace llaminar2
                 format.codebook_id == 14 || format.codebook_id == 15 ||
                 format.codebook_id == 16 || format.codebook_id == 17)
                 return format.payload_bytes;
+            if (!format.is_superblock && (format.codebook_id == 6 || format.codebook_id == 7))
+                return 20;
             if (format.codebook_id == 8)
                 return 24;
             if (format.codebook_id == 11)
@@ -262,6 +281,13 @@ namespace llaminar2
                     expectedCpuProjectionBytes(spec, format);
                 expected.cpu_live_bytes += cpu;
                 expected.cpu_shadow_bytes += cpu;
+                if (cpu::native_quantised::migrationUsesSuperblockCodes(format))
+                {
+                    const auto coded = expectedGpuCodedProjectionBytes(spec, format);
+                    expected.gpu_live_bytes += coded;
+                    expected.gpu_shadow_bytes += coded;
+                    continue;
+                }
                 expected.gpu_live_bytes += expectedGpuProjectionBytes(
                     spec,
                     std::max(
@@ -541,7 +567,7 @@ namespace llaminar2
             const auto profile = Directory::profileForLayerWeightManifest(model_manifest);
             EXPECT_EQ(profile.max_wire_payload_bytes, wire_bytes);
             for (uint32_t slot = 0; slot < capacity.total_slots; ++slot)
-                for (const auto &spec : profile.allocation_specs)
+                for (const auto &spec : profile.families.front().projections)
                     planner.planRawWeight(std::to_string(slot) + spec.label, spec.N, spec.K,
                         static_cast<size_t>(spec.N) * spec.K * spec.format.floatingElementBytes());
             EXPECT_EQ(Directory::allocationBOM(capacity, profile).payload_bytes,
@@ -636,10 +662,10 @@ namespace llaminar2
             {
                 // N/K are gate96x64, up80x96, down64x128. Independent64-row
                 // CPU padding/page rounding gives8192+8192+8192 bytes.
-                // Independent256-byte GPU region alignment gives4096+4864+5120.
+                // Coded GPU payloads, nibble planes and headers align independently.
                 EXPECT_EQ(expected.cpu_live_bytes, 24576u);
                 EXPECT_EQ(expected.cpu_shadow_bytes, 24576u);
-                EXPECT_EQ(expected.gpu_live_bytes, 14080u);
+                EXPECT_EQ(expected.gpu_live_bytes, 12544u);
             }
             EXPECT_EQ(actual[0].layer_idx, 0);
             EXPECT_EQ(actual[0].cpu_live_bytes, expected.cpu_live_bytes);
@@ -656,17 +682,17 @@ namespace llaminar2
             const auto directory_profile =
                 DeviceMoETransferSlotDirectory::
                     profileForLayerWeightManifest(model_manifest);
-            ASSERT_EQ(directory_profile.allocation_specs.size(), 3u);
-            const auto reusable = reusableDeviceVnniAllocationFormat(
-                *source.metadata);
+            ASSERT_EQ(directory_profile.families.front().projections.size(), 3u);
+            const auto reusable = gpuPreparedWeightPoolAllocation(
+                *source.metadata, GPUPreparedWeightPoolLayout::MigrationReusable);
             std::size_t expected_slot_bytes = 0u;
             for (std::size_t projection_index = 0;
-                 projection_index < directory_profile.allocation_specs.size();
+                 projection_index < directory_profile.families.front().projections.size();
                  ++projection_index)
             {
                 const auto &allocation =
                     directory_profile
-                        .allocation_specs[projection_index];
+                        .families.front().projections[projection_index];
                 EXPECT_EQ(
                     allocation.payload_bytes_per_block,
                     reusable.payload_bytes_per_block);
@@ -681,15 +707,16 @@ namespace llaminar2
                     source.quant_type == "IQ4_XS" ? 24 :
                         (source.metadata->codebook_id == 20 || source.metadata->codebook_id == 21
                             ? 19 : source.metadata->codebook_id));
-                const auto &projection =
-                    model_manifest.front()
-                        .projections[projection_index];
-                expected_slot_bytes += expectedGpuProjectionBytes(
-                    projection,
-                    reusable.payload_bytes_per_block,
-                    reusable.has_mins,
-                    reusable.has_emins,
-                    nativeQuantisedScalePlaneBytes(allocation.codebook_id));
+                const auto &projections = model_manifest.front().projections;
+                const auto &projection = *std::find_if(projections.begin(), projections.end(), [&](const auto &p) {
+                    return allocation.label == (p.projection == ExpertTierWeightProjection::Gate ? "gate" :
+                        p.projection == ExpertTierWeightProjection::Up ? "up" : "down");
+                });
+                if (allocation.codedDeclaration())
+                    expected_slot_bytes += expectedGpuCodedProjectionBytes(projection, *source.metadata);
+                else
+                    expected_slot_bytes += expectedGpuProjectionBytes(projection, reusable.payload_bytes_per_block,
+                        reusable.has_mins, reusable.has_emins, nativeQuantisedScalePlaneBytes(allocation.codebook_id));
             }
 
             const auto capacity =
@@ -711,7 +738,7 @@ namespace llaminar2
             EXPECT_EQ(
                 directory_bom.total_bytes,
                 directory_bom.payload_bytes +
-                    directory_bom.descriptor_bytes);
+                    directory_bom.descriptor_bytes + directory_bom.layer_range_bytes);
 
             const DeviceMoERebalanceWorkspaceCapacity workspace_capacity{
                 .num_layers = 1u,

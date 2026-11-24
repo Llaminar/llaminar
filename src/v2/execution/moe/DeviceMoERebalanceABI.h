@@ -15,8 +15,44 @@
 #include <cstdint>
 #include <type_traits>
 
+namespace llaminar2
+{
+    /** @brief Immutable physical address range and durable occupancy limit for a layer's family. */
+    struct DeviceMoETransferSlotRange
+    {
+        uint32_t first;
+        uint32_t end;
+        uint32_t active_capacity;
+    };
+}
+
 namespace llaminar2::moe_rebalance_abi
 {
+    /** @brief Live collective evidence layout, measured in INT32 transport words. */
+    enum class HistogramLayout : uint32_t
+    {
+        ResidentOnly = 1u,
+        TransferFamilyOccupancy = 2u,
+    };
+
+#if defined(__CUDACC__) || defined(__HIPCC__)
+    __host__ __device__
+#endif
+    /** @return Exact words per participant: two per expert plus one per live transfer layer. */
+    constexpr size_t histogramWords(HistogramLayout layout, size_t layers, size_t experts) noexcept
+    {
+        return layers * (2u * experts + (layout == HistogramLayout::TransferFamilyOccupancy ? 1u : 0u));
+    }
+
+#if defined(__CUDACC__) || defined(__HIPCC__)
+    __host__ __device__
+#endif
+    /** @return Layout selected by the graph's immutable transfer range binding. */
+    constexpr HistogramLayout histogramLayout(const DeviceMoETransferSlotRange *ranges) noexcept
+    {
+        return ranges ? HistogramLayout::TransferFamilyOccupancy : HistogramLayout::ResidentOnly;
+    }
+
     /** Native record identity shared by the host controller and minimal GPU views. */
     inline constexpr uint32_t kMagic = 0x4d4f4552u;
     /** Planner success/window-poll wire codes consumed by completed-decision publication. */
@@ -33,7 +69,8 @@ namespace llaminar2::moe_rebalance_abi
     // v17 gives the former plan alignment gap an explicit zero-reserved authority.
     // Existing live-field offsets and the 64-byte command extent are unchanged.
     // v18 appends the completed native decision receipt to the original controller.
-    inline constexpr uint32_t kVersion = 18u;
+    // v19 binds immutable slot ranges and exact per-layer occupancy evidence.
+    inline constexpr uint32_t kVersion = 19u;
 
     /**
      * @brief Exact byte size of one device-owned rebalance command.
@@ -68,7 +105,7 @@ namespace llaminar2::moe_rebalance_abi
      * durable resident slot, so every backend must preserve both capacities in
      * exactly the same ABI order.
      */
-    inline constexpr uint32_t kConfigBytes = 140u;
+    inline constexpr uint32_t kConfigBytes = 152u;
 
     /**
      * @brief Exact byte size of DeviceMoERebalanceStatus and device views.

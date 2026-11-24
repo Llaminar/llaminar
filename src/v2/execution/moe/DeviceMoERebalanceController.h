@@ -566,6 +566,8 @@ namespace llaminar2
         uint32_t initial_maintenance_period_tokens = 1;
         /** Recurring serial-visible decode period after the first boundary. */
         uint32_t maintenance_period_tokens = 1;
+        /// Immutable layer-indexed transfer family ranges; null for resident-only or raw kernel fixtures.
+        const DeviceMoETransferSlotRange *transfer_slot_layer_ranges = nullptr;
     };
 
     /**
@@ -1762,6 +1764,12 @@ namespace llaminar2
         const DeviceNativeQuantisedMatrixDesc &desc,
         const DeviceMoEExpertDirectoryEntry &entry) noexcept
     {
+        if (desc.metadata_layout)
+        {
+            // Coded Q2_K owns original superblock headers, not per-block emins.
+            return desc.valid() && nativeQuantisedLayoutValid(desc.codebook_id, desc.metadata_layout) &&
+                desc.mins && !desc.emins;
+        }
         (void)entry;
         uint8_t payload_bytes_per_block = 0;
         uint8_t is_asymmetric = 0;
