@@ -23,7 +23,7 @@ namespace llaminar2
         size_t persistent_payload_bytes; ///< Logical engine payload, excluding allocator rounding.
 
         /**
-         * @brief Describe the canonical unrotated CPU expert preparation path.
+         * @brief Describe the canonical CPU expert preparation path.
          * @param format Exact native source name, including F32/F16/BF16.
          * @param n Complete matrix output rows before 64-column packing padding.
          * @param k Source-codebook-aligned inner dimension.
@@ -32,10 +32,8 @@ namespace llaminar2
          * @throws std::invalid_argument for unsupported formats or geometry.
          * @throws std::overflow_error for unrepresentable allocation geometry.
          *
-         * The source-native observation path does not enable activation rotation.
-         * Rotated preparation has a different scratch contract and must not be
-         * admitted with this value. No ISA, thread count or device capacity is
-         * guessed here; these packing buffers are independent of worker count.
+         * No ISA, thread count or device capacity is guessed here; these packing
+         * buffers are independent of worker count.
          */
         static CPUWeightPreparationMemory sourceNative(std::string_view format, size_t n, size_t k);
     };

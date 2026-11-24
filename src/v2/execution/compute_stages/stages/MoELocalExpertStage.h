@@ -642,7 +642,7 @@ namespace llaminar2
             /**
              * Source declaration required when a registry-only CPU endpoint can
              * start without engines. Resident engines additionally contribute
-             * their actual prepared requirements, including rotated encodings.
+             * their actual prepared requirements.
              */
             std::optional<CPUExpertWorkspaceSource> cpu_workspace_source;
             /// Retains extracted per-expert views used by non-store engines.

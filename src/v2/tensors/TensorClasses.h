@@ -1860,10 +1860,6 @@ namespace llaminar2
         virtual void setLayout(TensorLayout layout) { layout_ = layout; }
 
         // =========================================================================
-        // Activation Rotation (kurtosis reduction before Q8_1 quantization)
-        // =========================================================================
-
-        // =========================================================================
         // Backend Dependency Injection (for testing)
         // =========================================================================
 

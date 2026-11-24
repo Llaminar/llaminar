@@ -48,7 +48,7 @@ namespace llaminar2::cpu::native_quantised
          *
          * MXFP4 is a distinct map (doubled OCP E2M1 magnitudes with a sign bit),
          * never IQ4_NL's grid, although both are sixteen-entry signed tables.
-         * Native MXFP4 stores E8M0 scale bytes; rotated MXFP4 uses FP16.
+         * Prepared MXFP4 stores the native E8M0 scale bytes.
          */
         enum class NibbleMap { Centered, Unsigned, NonLinear, MXFP4 };
         using ScaleWords = CPUNativeQuantisedScaleEncoding;
