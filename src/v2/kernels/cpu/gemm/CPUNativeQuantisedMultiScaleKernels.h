@@ -1170,6 +1170,17 @@ namespace llaminar2::cpu::native_quantised::multi_scale
         }
     }
 
+#if defined(__AVX2__)
+    namespace x86
+    {
+        /** @brief Contiguous AVX2/AVX-512 Q5_K or IQ3_S tile (CPUNativeQuantisedSingleScaleX86Kernels.h). */
+        template <int Codebook, int Lanes, std::size_t Rows, typename Packed>
+        inline void singleScaleRows(const Packed &packed, const std::array<const Q8_1Block *, Rows> &activation,
+                                    const std::array<float *, Rows> &output, int chunk, int begin, int end,
+                                    bool accumulate);
+    }
+#endif
+
     /**
      * @brief Dispatch native format once outside the entire K traversal.
      * @param packed Compact multi-scale representation; other encodings fail.
@@ -1189,6 +1200,22 @@ namespace llaminar2::cpu::native_quantised::multi_scale
     {
         if (!packed.usesCompactMultiScale())
             throw std::invalid_argument("Compact multi-scale kernel requires its native encoding");
+#if defined(__AVX2__)
+        // x86 owns dedicated contiguous leaves for the whole-block single-scale
+        // codebooks; their padded callers always pass complete 64-column chunks.
+        // Multi-row AVX2 tiles keep the traversal below: with all groups
+        // unrolled their accumulators and decode constants exceed the sixteen
+        // YMM registers and would spill in the K loop.
+        if constexpr (Lanes == 16 || (Lanes == 8 && Rows == 1))
+            if (packed.codebook_id == 7 || packed.codebook_id == 11)
+            {
+                if (columns != 64)
+                    throw std::invalid_argument("x86 single-scale compact tiles require complete 64-column chunks");
+                if (packed.codebook_id == 7)
+                    return x86::singleScaleRows<7, Lanes, Rows>(packed, activation, output, chunk, begin, end, accumulate);
+                return x86::singleScaleRows<11, Lanes, Rows>(packed, activation, output, chunk, begin, end, accumulate);
+            }
+#endif
         switch (packed.codebook_id)
         {
 #define LLAMINAR_MULTISCALE_CASE(C) case C: return rows<C, Lanes, Rows, Reduction::Contiguous, Packed, Ops>(packed, activation, output, chunk, begin, end, accumulate, 1, 0, columns)
@@ -1254,5 +1281,9 @@ namespace llaminar2::cpu::native_quantised::multi_scale
         }
         throw std::invalid_argument("Unsupported native multi-scale codebook");
     }
-#undef LLAMINAR_MULTISCALE_EXACT
 }
+
+#if defined(__AVX2__)
+#include "CPUNativeQuantisedSingleScaleX86Kernels.h"
+#endif
+#undef LLAMINAR_MULTISCALE_EXACT
