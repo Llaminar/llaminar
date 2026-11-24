@@ -8007,11 +8007,19 @@ namespace
     /**
      * @brief Authenticate a completed transfer publication for one plan wave.
      *
-     * A slot may still contain a valid copy from an earlier command.  Requiring
+     * A slot may still contain a valid copy from an earlier command. Requiring
      * both the leased generation transition and current command epoch prevents
-     * that stale publication from satisfying a newer apply operation.
+     * that stale publication from satisfying a newer apply operation. The decode
+     * router only consumes this receipt; payload packing runs in separate kernels.
+     * On gfx906 keep the three role/plane checks in a cold callee so their
+     * temporaries do not share the router's register allocation.
      */
-    __device__ __forceinline__ bool rebalance_transfer_slot_copy_complete_for_plan(
+#if defined(__gfx906__)
+    __device__ __attribute__((noinline))
+#else
+    __device__ __forceinline__
+#endif
+    bool rebalance_transfer_slot_copy_complete_for_plan(
         const DeviceMoEExpertDirectoryEntryView &entry,
         const DeviceMoERebalancePlanEntryView &plan,
         uint32_t participant,
