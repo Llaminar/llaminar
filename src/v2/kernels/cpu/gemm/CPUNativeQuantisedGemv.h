@@ -1486,13 +1486,7 @@ namespace llaminar2::cpu::native_quantised
         const CPUNativeQuantisedPackedWeights &packed, int chunk, int block, int column)
     {
         if (packed.encoding == CPUNativeQuantisedEncoding::Q4KSuperblockCoded)
-        {
-            using Ops = multi_scale::SIMD<16>;
-            using L = coded_metadata::Lanes<Ops>;
-            return coded_metadata::reconstruct<5, Ops>(
-                L::code<5>(packed.blockUnit(chunk, block) + packed.data_stride, column),
-                L::superblockWords<5>(packed.superblockHeader(chunk, block), column));
-        }
+            return packed.loadQ4KCodedFactors<16>(chunk, block, column);
         if (packed.scaleEncoding() == CPUNativeQuantisedScaleEncoding::E8M0)
         {
             const auto e = _mm_loadu_si128(reinterpret_cast<const __m128i *>(
@@ -2555,6 +2549,31 @@ namespace llaminar2::cpu::native_quantised
     }
 
     /**
+     * @brief Route a superblock-coded nibble tile to its dedicated AVX-512 leaf.
+     * @tparam Rows Rows sharing each decoded weight vector.
+     * @return Whether @p packed is Q4_K or IQ4_XS coded and the tile was executed.
+     *
+     * Their layout, policy and decode are fixed before the K traversal in
+     * multi_scale::x86::nibbleSingleScaleRows(); the same integer dots and
+     * per-block FP32 program as the generic nibble chunks below.
+     */
+    template <std::size_t Rows>
+    inline bool projectCodedNibbleAVX512(const CPUNativeQuantisedPackedWeights &packed,
+        const std::array<const Q8_1Block *, Rows> &activation, const std::array<float *, Rows> &output,
+        int chunk, int kb_start, int kb_end, __m512i decode_lut, bool accumulate)
+    {
+        if (packed.encoding == CPUNativeQuantisedEncoding::Q4KSuperblockCoded)
+            multi_scale::x86::nibbleSingleScaleRows<5, Rows>(packed, activation, output, chunk, kb_start, kb_end,
+                accumulate, decode_lut, nibbleWeightBias(packed.codebook_id));
+        else if (packed.encoding == CPUNativeQuantisedEncoding::NibbleLUTSourceScale)
+            multi_scale::x86::nibbleSingleScaleRows<4, Rows>(packed, activation, output, chunk, kb_start, kb_end,
+                accumulate, decode_lut, nibbleWeightBias(packed.codebook_id));
+        else
+            return false;
+        return true;
+    }
+
+    /**
      * @brief Dispatch immutable prepared-tensor properties outside the K loop.
      *
      * Decode semantics, numerical policy, and asymmetric layout cannot change
@@ -2573,6 +2592,9 @@ namespace llaminar2::cpu::native_quantised
         const __m512i decode_lut,
         bool accumulate = false)
     {
+        if (projectCodedNibbleAVX512(packed, std::array{A_q8}, std::array{C}, chunk, kb_start, kb_end,
+                                     decode_lut, accumulate))
+            return;
         switch (nibbleDecodeKind(packed.codebook_id))
         {
         case NibbleDecodeKind::LUT:
@@ -3546,6 +3568,9 @@ namespace llaminar2::cpu::native_quantised
         const __m512i decode_lut,
         bool accumulate)
     {
+        if (projectCodedNibbleAVX512(packed, std::array{A_q8_row0, A_q8_row1}, std::array{C_row0, C_row1},
+                                     chunk, kb_start, kb_end, decode_lut, accumulate))
+            return;
         switch (nibbleDecodeKind(packed.codebook_id))
         {
         case NibbleDecodeKind::Q4_0_LINEAR:
@@ -4107,6 +4132,9 @@ namespace llaminar2::cpu::native_quantised
         const __m512i decode_lut,
         bool accumulate)
     {
+        if (projectCodedNibbleAVX512(packed, std::array{A_q8_row0, A_q8_row1, A_q8_row2},
+                                     std::array{C_row0, C_row1, C_row2}, chunk, kb_start, kb_end, decode_lut, accumulate))
+            return;
 
         const NibbleDecodeKind decode_kind = nibbleDecodeKind(packed.codebook_id);
         const int weight_bias = nibbleWeightBias(packed.codebook_id);
@@ -4382,6 +4410,10 @@ namespace llaminar2::cpu::native_quantised
         const __m512i decode_lut,
         bool accumulate)
     {
+        if (projectCodedNibbleAVX512(packed, std::array{A_q8_row0, A_q8_row1, A_q8_row2, A_q8_row3},
+                                     std::array{C_row0, C_row1, C_row2, C_row3}, chunk, kb_start, kb_end,
+                                     decode_lut, accumulate))
+            return;
 
         const NibbleDecodeKind decode_kind = nibbleDecodeKind(packed.codebook_id);
         const int weight_bias = nibbleWeightBias(packed.codebook_id);

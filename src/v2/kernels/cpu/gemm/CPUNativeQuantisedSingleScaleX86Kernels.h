@@ -1,21 +1,26 @@
 /**
  * @file CPUNativeQuantisedSingleScaleX86Kernels.h
- * @brief AVX2/AVX-512 contiguous leaves of the whole-block single-scale compact formats Q5_K and IQ3_S.
+ * @brief AVX2/AVX-512 contiguous leaves of the whole-block single-scale coded formats.
  *
  * These leaves replace the generic multi_scale::rows() traversal on x86 for
- * the two compact codebooks whose 32 values share one source scale. They
- * read the same file-density units (Q5_K: four nibble words, eight bit planes,
- * a 12-bit code and a d|dmin superblock word; IQ3_S: two index words, a qh and
- * sign word, a sign tail byte, a 4-bit code and a d superblock word) and keep
- * the exact arithmetic of rows(): an exact INT32 dot per column and block,
- * then the unchanged per-policy FP32 block contribution in ascending K.
+ * the two compact codebooks whose 32 values share one source scale, Q5_K and
+ * IQ3_S, and (AVX-512) the generic nibble chunks for the superblock-coded
+ * nibble formats Q4_K and IQ4_XS. They read the same file-density units
+ * (Q5_K: four nibble words, eight bit planes, a 12-bit code and a d|dmin
+ * superblock word; IQ3_S: two index words, a qh and sign word, a sign tail
+ * byte, a 4-bit code and a d superblock word; Q4_K: four nibble words, a
+ * 12-bit code and a d|dmin word; IQ4_XS: four nibble words, a 6-bit code and
+ * a d word) and keep the exact arithmetic of the kernels they replace: an
+ * exact INT32 dot per column and block, then the unchanged per-policy FP32
+ * block contribution in ascending K.
  *
  * Only the physical traversal and integer formulation differ:
  * - register-bounded groups of column strips share one sequential walk of the
  *   chunk row, with all eight K groups unrolled (fixed-stride loads);
  * - superblock headers and block units are addressed once per superblock,
  *   without per-block geometry branches;
- * - the policy is fixed before the K traversal;
+ * - the policy and the physical layout are fixed before the K traversal, so
+ *   the K loop holds no format, encoding or policy branch;
  * - weights enter the dot unsigned. IQ3_S grid bytes are biased by sixteen
  *   (an immutable derived copy of the source grid, [17,31] or [1,15] after
  *   the sign), and sixteen times the exact activation sum is removed again;
@@ -75,7 +80,23 @@ namespace llaminar2::cpu::native_quantised::multi_scale::x86
      * AVX-512 has 32 vector registers, AVX2 sixteen.
      */
     template <int Codebook, int Lanes, std::size_t Rows>
-    inline constexpr int kSingleScaleStrips = Lanes == 16 && Rows == 1 ? (Codebook == 7 ? 4 : 2) : 1;
+    inline constexpr int kSingleScaleStrips = Lanes == 16 && Rows == 1 ? (Codebook == 11 ? 2 : 4) : 1;
+
+    /**
+     * @brief Physical identity of a single-scale coded leaf.
+     * @tparam Codebook 4 (IQ4_XS), 5 (Q4_K), 7 (Q5_K) or 11 (IQ3_S).
+     */
+    template <int Codebook> struct SingleScaleLayout
+    {
+        static_assert(Codebook == 4 || Codebook == 5 || Codebook == 7 || Codebook == 11);
+        static constexpr auto encoding = Codebook == 5 ? CPUNativeQuantisedEncoding::Q4KSuperblockCoded
+            : Codebook == 4 ? CPUNativeQuantisedEncoding::NibbleLUTSourceScale
+                            : CPUNativeQuantisedEncoding::CompactMultiScale;
+        /// Whether the block contribution carries an additive minimum.
+        static constexpr bool affine = Codebook == 5 || Codebook == 7;
+        /// Whether the payload is four plain nibble words (low: groups 0..3, high: 4..7).
+        static constexpr bool nibbles = Codebook == 4 || Codebook == 5;
+    };
 
     /** @return One signed Q8 activation word, replicated to every lane. */
     template <typename I>
@@ -281,18 +302,19 @@ namespace llaminar2::cpu::native_quantised::multi_scale::x86
 #pragma clang fp contract(off)
 #pragma clang fp reassociate(off)
 #endif
-        static_assert(Codebook == 7 || Codebook == 11);
+        using Layout = SingleScaleLayout<Codebook>;
+        static_assert(!Layout::nibbles, "Q4_K and IQ4_XS use nibblePolicy()");
         using Ops = SIMD<Lanes>;
         using I = typename Ops::I;
         using F = typename Ops::F;
         using L = coded_metadata::Lanes<Ops>;
         constexpr int strips = kSingleScaleStrips<Codebook, Lanes, Rows>;
-        constexpr auto encoding = CPUNativeQuantisedEncoding::CompactMultiScale;
+        constexpr auto encoding = Layout::encoding;
         constexpr std::size_t data_stride = preparedDataStride(encoding, Codebook);
-        constexpr std::size_t block_stride = preparedInterleavedBlockStride(encoding, Codebook == 7, Codebook);
+        constexpr std::size_t block_stride = preparedInterleavedBlockStride(encoding, Layout::affine, Codebook);
         // IQ3_S weights enter the dot as 16 + w; Q5_K values are unsigned already.
         constexpr int center = Codebook == 11 ? 16 : 0;
-        const auto geometry = preparedBlockGeometry(encoding, Codebook == 7, Codebook,
+        const auto geometry = preparedBlockGeometry(encoding, Layout::affine, Codebook,
                                                     static_cast<std::size_t>(packed.blocks_per_row));
         const std::uint8_t *const row_base = packed.interleavedBase() + geometry.blockOffset(chunk, 0);
         for (int pass = 0; pass < 64; pass += Lanes * strips)
@@ -322,7 +344,7 @@ namespace llaminar2::cpu::native_quantised::multi_scale::x86
                     {
                         const int column = pass + strip * Lanes;
                         I dots[Rows]{};
-                        I code;
+                        [[maybe_unused]] I code;
                         if constexpr (Codebook == 11)
                         {
                             dotGroups<Lanes, Rows>(std::integer_sequence<int, 0, 1, 2, 3, 4, 5, 6, 7>{}, activation, kb,
@@ -340,12 +362,15 @@ namespace llaminar2::cpu::native_quantised::multi_scale::x86
                                    (L::nibbles(unit + data_stride + 64, column) << 8);
                         }
                         // The codec's widened factors: iq3sSourceScale() and reconstruct<7>().
-                        const I word = L::template superblockWords<static_cast<std::uint8_t>(Codebook)>(block_header, column);
                         F scale0, scale1{};
                         if constexpr (Codebook == 11)
+                        {
+                            const I word = L::template superblockWords<11>(block_header, column);
                             scale0 = L::half(word) * L::toFloat(2 * (code & 15) + 1);
+                        }
                         else
                         {
+                            const I word = L::template superblockWords<7>(block_header, column);
                             const F dmin = L::half(word >> 16);
                             scale0 = L::staged(L::half(word) * L::toFloat(code & 63));
                             scale1 = L::staged(-dmin * L::toFloat((code >> 6) & 63));
@@ -358,7 +383,7 @@ namespace llaminar2::cpu::native_quantised::multi_scale::x86
                             const float scale_a = nativeQuantisedFP16ScaleToFP32(a.d);
                             if constexpr (Lanes == 8)
                             {
-                                if constexpr (Codebook == 7)
+                                if constexpr (Layout::affine)
                                     acc[row][strip] = std::bit_cast<F>(accumulateCorrectedSingleScaleBlockAVX2(
                                         std::bit_cast<__m256>(acc[row][strip]), std::bit_cast<__m256i>(dot),
                                         std::bit_cast<__m256>(scale0), a.sum_qs, std::bit_cast<__m256>(scale1), scale_a, Policy));
@@ -370,7 +395,7 @@ namespace llaminar2::cpu::native_quantised::multi_scale::x86
 #if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
                             else
                             {
-                                if constexpr (Codebook == 7)
+                                if constexpr (Layout::affine)
                                     acc[row][strip] = std::bit_cast<F>(accumulateCorrectedSingleScaleBlockAVX512(
                                         std::bit_cast<__m512>(acc[row][strip]), std::bit_cast<__m512i>(dot),
                                         std::bit_cast<__m512>(scale0), a.sum_qs, std::bit_cast<__m512>(scale1), scale_a, Policy));
@@ -391,6 +416,161 @@ namespace llaminar2::cpu::native_quantised::multi_scale::x86
                     std::memcpy(output[row] + pass + strip * Lanes, &acc[row][strip], sizeof(F));
         }
     }
+
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
+    /**
+     * @brief AVX-512 Q4_K / IQ4_XS tile under one fixed FP32 policy.
+     * @tparam Codebook 5 (Q4_K) or 4 (IQ4_XS).
+     * @tparam Rows Rows sharing each decoded weight vector.
+     * @tparam Policy Prepared numerical policy.
+     *
+     * Traversal: chunk row -> source superblock -> block -> 16-column strip, so
+     * the chunk row streams once in order. Each strip widens its superblock d
+     * once and keeps it in registers for the superblock's blocks; the codec
+     * then combines it with each block's code exactly as reconstruct<5>()
+     * (with q4KBase()) and sourceScaleFactors() do. Every column still visits
+     * ascending K with its own accumulator, so the bytes are unchanged.
+     */
+    template <int Codebook, std::size_t Rows, CPUProjectionNumericalPolicy Policy, typename Packed>
+    LLAMINAR_MULTISCALE_EXACT inline void nibblePolicy(const Packed &packed,
+        const std::array<const Q8_1Block *, Rows> &activation, const std::array<float *, Rows> &output, int chunk,
+        int begin, int end, bool accumulate, __m512i decode_lut, int lut_bias)
+    {
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#pragma clang fp reassociate(off)
+#endif
+        using Layout = SingleScaleLayout<Codebook>;
+        static_assert(Layout::nibbles);
+        using Ops = SIMD<16>;
+        using I = typename Ops::I;
+        using F = typename Ops::F;
+        using L = coded_metadata::Lanes<Ops>;
+        constexpr int strips = Rows == 1 ? 4 : 1;
+        constexpr auto encoding = Layout::encoding;
+        constexpr std::size_t data_stride = preparedDataStride(encoding, Codebook);
+        constexpr std::size_t block_stride = preparedInterleavedBlockStride(encoding, Layout::affine, Codebook);
+        // IQ4_XS LUT bytes are lut_bias + w; Q4_K nibbles are unsigned already.
+        const int center = Codebook == 4 ? lut_bias : 0;
+        const auto geometry = preparedBlockGeometry(encoding, Layout::affine, Codebook,
+                                                    static_cast<std::size_t>(packed.blocks_per_row));
+        const std::uint8_t *const row_base = packed.interleavedBase() + geometry.blockOffset(chunk, 0);
+        for (int pass = 0; pass < 64; pass += 16 * strips)
+        {
+            F acc[Rows][strips];
+#pragma GCC unroll 4
+            for (std::size_t row = 0; row < Rows; ++row)
+#pragma GCC unroll 4
+                for (int strip = 0; strip < strips; ++strip)
+                    acc[row][strip] = accumulate ? load<F>(output[row] + pass + strip * 16) : F{};
+            for (int kb = begin; kb < end;)
+            {
+                const int superblock_end = std::min(end, static_cast<int>(geometry.superblockEnd(kb)));
+                const std::uint8_t *const header = row_base + geometry.headerOffset(0, kb);
+                const std::uint8_t *const first_unit = row_base + geometry.blockOffset(0, kb);
+                // Widen every strip's superblock d once; it stays in registers
+                // for the superblock's blocks. Q4_K's dmin is re-widened per
+                // block from the L1-resident header: four more hoisted vectors
+                // would not fit beside the accumulators and would spill.
+                F base[strips];
+#pragma GCC unroll 4
+                for (int strip = 0; strip < strips; ++strip)
+                {
+                    if constexpr (Codebook == 5)
+                        base[strip] = L::half(L::template superblockWords<5>(header, pass + strip * 16));
+                    else
+                        base[strip] = Packed::template iq4xsBases<16>(header, pass + strip * 16);
+                }
+                const std::uint8_t *unit = first_unit;
+                for (int k = kb; k < superblock_end; ++k, unit += block_stride)
+                {
+#pragma GCC unroll 4
+                    for (int strip = 0; strip < strips; ++strip)
+                    {
+                        const int column = pass + strip * 16;
+                        I dots[Rows]{};
+                        // Groups g and g + 4 share nibble word g: visit them together.
+                        dotGroups<16, Rows>(std::integer_sequence<int, 0, 4, 1, 5, 2, 6, 3, 7>{}, activation, k,
+                            [&]<int Group>() {
+                                const I raw = load<I>(unit + (Group % 4) * 256 + column * 4);
+                                const I nibble = (Group < 4 ? raw : raw >> 4) & 0x0F0F0F0F;
+                                if constexpr (Codebook == 4)
+                                    return std::bit_cast<I>(_mm512_shuffle_epi8(decode_lut, std::bit_cast<__m512i>(nibble)));
+                                else
+                                    return nibble;
+                            }, dots);
+                        const std::uint8_t *const planes = unit + data_stride;
+                        F scale0, scale1{};
+                        if constexpr (Codebook == 5)
+                        {
+                            const std::uint8_t *block_header = header;
+                            asm("" : "+r"(block_header));
+                            const coded_metadata::Q4KBaseFactors<F> q4k{
+                                base[strip], L::half(L::template superblockWords<5>(block_header, column) >> 16)};
+                            const auto factors = coded_metadata::reconstruct<5, Ops>(
+                                Packed::template q4kCodes<16>(planes, column), q4k);
+                            scale0 = factors.primary;
+                            scale1 = factors.secondary;
+                        }
+                        else
+                            scale0 = coded_metadata::sourceScaleFactors<kNativeQuantisedIQ4XSSourceScaleCodebook, Ops>(
+                                Packed::template iq4xsCodes<16>(planes, column), base[strip]).primary;
+#pragma GCC unroll 4
+                        for (std::size_t row = 0; row < Rows; ++row)
+                        {
+                            const Q8_1Block &a = activation[row][k];
+                            const auto dot = dots[row] - center * static_cast<int>(a.sum_qs);
+                            const float scale_a = nativeQuantisedFP16ScaleToFP32(a.d);
+                            if constexpr (Layout::affine)
+                                acc[row][strip] = std::bit_cast<F>(accumulateCorrectedSingleScaleBlockAVX512(
+                                    std::bit_cast<__m512>(acc[row][strip]), std::bit_cast<__m512i>(dot),
+                                    std::bit_cast<__m512>(scale0), a.sum_qs, std::bit_cast<__m512>(scale1), scale_a, Policy));
+                            else
+                                acc[row][strip] = std::bit_cast<F>(accumulateSingleScaleBlockAVX512(
+                                    std::bit_cast<__m512>(acc[row][strip]), std::bit_cast<__m512i>(dot),
+                                    std::bit_cast<__m512>(scale0), scale_a, Policy));
+                        }
+                    }
+                }
+                kb = superblock_end;
+            }
+#pragma GCC unroll 4
+            for (std::size_t row = 0; row < Rows; ++row)
+#pragma GCC unroll 4
+                for (int strip = 0; strip < strips; ++strip)
+                    std::memcpy(output[row] + pass + strip * 16, &acc[row][strip], sizeof(F));
+        }
+    }
+
+    /**
+     * @brief AVX-512 Q4_K (5) or IQ4_XS (4) superblock-coded nibble tile.
+     * @param packed Admitted Q4KSuperblockCoded or NibbleLUTSourceScale matrix.
+     * @param activation One persistent Q8_1 row per tile row.
+     * @param output Sixty-four writable FP32 columns per row.
+     * @param chunk Output-column chunk.
+     * @param begin,end Logical K-block interval.
+     * @param accumulate Start from the existing output instead of positive zero.
+     * @param decode_lut The caller's broadcast nibble table, biased by @p lut_bias.
+     * @param lut_bias Unsigned zero point of @p decode_lut, removed via the activation sum.
+     * @throws std::invalid_argument For a mismatched encoding or geometry.
+     */
+    template <int Codebook, std::size_t Rows, typename Packed>
+    inline void nibbleSingleScaleRows(const Packed &packed, const std::array<const Q8_1Block *, Rows> &activation,
+                                      const std::array<float *, Rows> &output, int chunk, int begin, int end,
+                                      bool accumulate, __m512i decode_lut, int lut_bias)
+    {
+        static_assert(Codebook == 4 || Codebook == 5);
+        static_assert(Rows >= 1 && Rows <= 4);
+        if (packed.encoding != SingleScaleLayout<Codebook>::encoding || chunk < 0 || chunk >= packed.N_padded / 64 ||
+            (end > begin && (begin < 0 || end > packed.blocks_per_row)))
+            throw std::invalid_argument("x86 coded nibble tile is outside its admitted encoding or geometry");
+        if (packed.numerical_policy == CPUProjectionNumericalPolicy::GPUAlignedExpert)
+            return nibblePolicy<Codebook, Rows, CPUProjectionNumericalPolicy::GPUAlignedExpert>(
+                packed, activation, output, chunk, begin, end, accumulate, decode_lut, lut_bias);
+        return nibblePolicy<Codebook, Rows, CPUProjectionNumericalPolicy::BackendNative>(
+            packed, activation, output, chunk, begin, end, accumulate, decode_lut, lut_bias);
+    }
+#endif
 
     /**
      * @brief Contiguous x86 single-scale compact tile; fixes the policy before the traversal.

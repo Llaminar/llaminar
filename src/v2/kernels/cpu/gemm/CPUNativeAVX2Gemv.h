@@ -325,13 +325,7 @@ namespace llaminar2::cpu::native_quantised
         if constexpr (Domain == NibbleDotAVX2::Linear)
         {
             if (packed.encoding == CPUNativeQuantisedEncoding::Q4KSuperblockCoded)
-            {
-                using Ops = multi_scale::SIMD<8>;
-                using L = coded_metadata::Lanes<Ops>;
-                return coded_metadata::reconstruct<5, Ops>(
-                    L::code<5>(packed.admittedBlockUnit(chunk, block) + packed.data_stride, column),
-                    L::superblockWords<5>(packed.admittedSuperblockHeader(chunk, block), column));
-            }
+                return packed.loadQ4KCodedFactors<8>(chunk, block, column);
         }
         if constexpr (Domain == NibbleDotAVX2::SmallLUT)
         {

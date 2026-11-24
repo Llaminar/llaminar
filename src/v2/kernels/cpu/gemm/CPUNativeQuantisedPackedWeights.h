@@ -330,6 +330,82 @@ namespace llaminar2::cpu::native_quantised
 
 #if defined(__AVX2__) || defined(__AVX512F__)
         /**
+         * @brief Widen the six-bit IQ4_XS codes of one SIMD strip.
+         * @tparam Columns Eight or sixteen output columns per SIMD strip.
+         * @param planes The block's code planes: a nibble plane, then a two-bit plane at byte 32.
+         * @param column First column, aligned to the strip width.
+         * @return One code in [0,63] per column.
+         * @details BMI2 deposits the two narrow planes into byte slots before
+         * one widening move; no shuffle masks occupy vector registers and no
+         * byte is assembled with scalar inserts.
+         */
+        template <int Columns>
+        [[nodiscard, gnu::always_inline]] static inline auto iq4xsCodes(const std::uint8_t *planes, int column)
+        {
+            using I = typename multi_scale::SIMD<Columns>::I;
+            if constexpr (Columns == 16)
+            {
+                std::uint64_t low;
+                std::uint32_t high;
+                std::memcpy(&low, planes + column / 2, sizeof(low));
+                std::memcpy(&high, planes + 32 + column / 4, sizeof(high));
+                const auto first = _pdep_u64(low & 0xffffffffull, 0x0f0f0f0f0f0f0f0full) |
+                    _pdep_u64(high & 0xffffu, 0x3030303030303030ull);
+                const auto second = _pdep_u64(low >> 32, 0x0f0f0f0f0f0f0f0full) |
+                    _pdep_u64(high >> 16, 0x3030303030303030ull);
+                return std::bit_cast<I>(_mm512_cvtepu8_epi32(
+                    _mm_set_epi64x(static_cast<long long>(second), static_cast<long long>(first))));
+            }
+            else
+            {
+                std::uint32_t low;
+                std::uint16_t high;
+                std::memcpy(&low, planes + column / 2, sizeof(low));
+                std::memcpy(&high, planes + 32 + column / 4, sizeof(high));
+                const auto bytes = _pdep_u64(low, 0x0f0f0f0f0f0f0f0full) |
+                    _pdep_u64(high, 0x3030303030303030ull);
+                return std::bit_cast<I>(_mm256_cvtepu8_epi32(_mm_cvtsi64_si128(bytes)));
+            }
+        }
+
+        /**
+         * @brief Widen the original IQ4_XS superblock d of one SIMD strip.
+         * @param header The superblock header: one binary16 word per column.
+         * @param column First column, aligned to the strip width.
+         */
+        template <int Columns>
+        [[nodiscard, gnu::always_inline]] static inline auto iq4xsBases(const std::uint8_t *header, int column)
+        {
+            const auto *bases = header + 2 * column;
+            using F = typename multi_scale::SIMD<Columns>::F;
+            if constexpr (Columns == 16)
+                return std::bit_cast<F>(_mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(bases))));
+            else
+                return std::bit_cast<F>(_mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i *>(bases))));
+        }
+
+        /**
+         * @brief Widen the twelve-bit Q4_K codes of one SIMD strip.
+         * @param planes The block's code planes: a byte plane, then a nibble plane at byte 64.
+         * @param column First column, aligned to the strip width.
+         * @return code = byte | nibble << 8 per column; one VPMOVZXBD widens the bytes.
+         */
+        template <int Columns>
+        [[nodiscard, gnu::always_inline]] static inline auto q4kCodes(const std::uint8_t *planes, int column)
+        {
+            using Ops = multi_scale::SIMD<Columns>;
+            using L = coded_metadata::Lanes<Ops>;
+            typename Ops::I low;
+            if constexpr (Columns == 16)
+                low = std::bit_cast<typename Ops::I>(_mm512_cvtepu8_epi32(
+                    _mm_loadu_si128(reinterpret_cast<const __m128i *>(planes + column))));
+            else
+                low = std::bit_cast<typename Ops::I>(_mm256_cvtepu8_epi32(
+                    _mm_loadl_epi64(reinterpret_cast<const __m128i *>(planes + column))));
+            return low | (L::nibbles(planes + 64, column) << 8);
+        }
+
+        /**
          * @brief Reconstruct an IQ4_XS source scale strip in registers.
          * @tparam Columns Eight or sixteen output columns per SIMD strip.
          * @param chunk 64-column chunk index.
@@ -346,30 +422,39 @@ namespace llaminar2::cpu::native_quantised
             constexpr auto physical = CPUNativeQuantisedEncoding::NibbleLUTSourceScale;
             constexpr auto source = native_quantised_formats::IQ4_XS.codebook_id;
             using Ops = multi_scale::SIMD<Columns>;
-            using L = coded_metadata::Lanes<Ops>;
             const CPUNativeQuantisedBlockGeometry geometry{preparedInterleavedBlockStride(physical, false, source),
                 preparedSuperblockHeaderBytes(physical, source), static_cast<std::size_t>(blocks_per_row)};
             const auto *base = interleavedBase() + geometry.blockOffset(chunk, 0);
             const auto *planes = base + geometry.blockOffset(0, block) +
                 preparedCodedPlaneOffset(physical, preparedDataStride(physical, source));
-            const auto *bases = base + geometry.headerOffset(0, block) + 2 * column;
-            if constexpr (Columns == 16)
-                return coded_metadata::sourceScaleFactors<codebook, Ops>(L::template code<codebook>(planes, column),
-                    _mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(bases)))).primary;
-            else
-            {
-                // BMI2 deposits the two narrow planes into byte slots before
-                // a single widening load; no shuffle masks occupy YMMs.
-                std::uint32_t low;
-                std::uint16_t high;
-                std::memcpy(&low, planes + column / 2, sizeof(low));
-                std::memcpy(&high, planes + 32 + column / 4, sizeof(high));
-                const auto bytes = _pdep_u64(low, 0x0f0f0f0f0f0f0f0full) |
-                    _pdep_u64(high, 0x3030303030303030ull);
-                const auto code = std::bit_cast<typename Ops::I>(_mm256_cvtepu8_epi32(_mm_cvtsi64_si128(bytes)));
-                return coded_metadata::sourceScaleFactors<codebook, Ops>(code,
-                    _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i *>(bases)))).primary;
-            }
+            return coded_metadata::sourceScaleFactors<codebook, Ops>(iq4xsCodes<Columns>(planes, column),
+                iq4xsBases<Columns>(base + geometry.headerOffset(0, block), column)).primary;
+        }
+
+        /**
+         * @brief Reconstruct a Q4_K coded scale/minimum strip in registers.
+         * @tparam Columns Eight or sixteen output columns per SIMD strip.
+         * @param chunk 64-column chunk index.
+         * @param block Logical 32-value K block.
+         * @param column First column, aligned to the strip width.
+         * @return Exactly coded_metadata::reconstruct<5>() of the block's
+         *         12-bit codes and its superblock d|dmin words.
+         * @details The caller has proved the physical encoding. Fixed strides
+         * address the unit and header without per-block layout branches.
+         */
+        template <int Columns>
+        [[nodiscard, gnu::always_inline]] inline auto loadQ4KCodedFactors(int chunk, int block, int column) const
+        {
+            constexpr auto physical = CPUNativeQuantisedEncoding::Q4KSuperblockCoded;
+            constexpr auto source = native_quantised_formats::Q4_K.codebook_id;
+            using Ops = multi_scale::SIMD<Columns>;
+            using L = coded_metadata::Lanes<Ops>;
+            const CPUNativeQuantisedBlockGeometry geometry{preparedInterleavedBlockStride(physical, true, source),
+                preparedSuperblockHeaderBytes(physical, source), static_cast<std::size_t>(blocks_per_row)};
+            const auto *base = interleavedBase() + geometry.blockOffset(chunk, 0);
+            const auto *planes = base + geometry.blockOffset(0, block) + preparedDataStride(physical, source);
+            return coded_metadata::reconstruct<5, Ops>(q4kCodes<Columns>(planes, column),
+                                                       L::template superblockWords<5>(base + geometry.headerOffset(0, block), column));
         }
 #endif
 
