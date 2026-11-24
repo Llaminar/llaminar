@@ -18248,6 +18248,30 @@ add_v2_test(V2_Integration_QwenRevisionChatTemplate
     LABELS "V2;Integration;ProductionTestPreflight;Qwen;ChatTemplate;Reasoning;Regression"
     MPI_PROCS 1 NO_MODELS TIMEOUT 30)
 
+# Continuous-batching HTTP driver: exactly-once mailbox outcomes on finish,
+# cancellation (incl. transport close while queued), shutdown with pending
+# submissions, throwing steps and shared-forward failure; device-free.
+add_executable(v2_test_serving_batch_driver unit/app/modes/Test__ServingBatchDriver.cpp)
+target_include_directories(v2_test_serving_batch_driver PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/mocks
+)
+target_link_libraries(v2_test_serving_batch_driver llaminar2_core GTest::gtest GTest::gtest_main GTest::gmock)
+add_v2_test(V2_Unit_ServingBatchDriver
+    COMMAND $<TARGET_FILE:v2_test_serving_batch_driver>
+    LABELS "V2;Unit;Server;ContinuousBatching;Threading"
+    MPI_PROCS 1
+    NO_MODELS
+    TIMEOUT 120
+)
+add_v2_test(V2_Integration_ServingBatchDriverLifecycle
+    COMMAND $<TARGET_FILE:v2_test_serving_batch_driver>
+        --gtest_filter=ServingBatchDriverLifecycle.*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Server;ContinuousBatching;Regression"
+    MPI_PROCS 1
+    NO_MODELS
+    TIMEOUT 120
+)
+
 add_executable(v2_test_chat_completion_handler unit/app/modes/Test__ChatCompletionHandler.cpp)
 target_include_directories(v2_test_chat_completion_handler PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path

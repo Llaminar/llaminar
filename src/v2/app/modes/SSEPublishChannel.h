@@ -17,6 +17,7 @@
  */
 #pragma once
 
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <limits>
@@ -188,6 +189,30 @@ namespace llaminar2
             buffered_bytes_ -= line.size();
             not_full_.notify_all();
             return line;
+        }
+
+        /** @brief Result of a bounded writer drain. */
+        enum class PopStatus { Line, Closed, TimedOut };
+
+        /**
+         * @brief Writer drain bounded by @p timeout, so the writer can check
+         *        its transport (client disconnect) while no output exists.
+         */
+        PopStatus popOrClosedFor(std::chrono::milliseconds timeout, std::string &line)
+        {
+            std::unique_lock lock(mutex_);
+            std::optional<WaitRegistration> registration;
+            if (lines_.empty() && !closed_)
+                registration.emplace(blocked_consumers_);
+            if (!not_empty_.wait_for(lock, timeout, [&] { return closed_ || !lines_.empty(); }))
+                return PopStatus::TimedOut;
+            if (lines_.empty())
+                return PopStatus::Closed;
+            line = std::move(lines_.front());
+            lines_.pop_front();
+            buffered_bytes_ -= line.size();
+            not_full_.notify_all();
+            return PopStatus::Line;
         }
 
         /** @brief Producer close (exactly once; all waiting drains wake). */

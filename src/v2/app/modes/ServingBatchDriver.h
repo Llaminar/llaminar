@@ -9,6 +9,10 @@
  * tokens to that request's mailbox. Each HTTP request runs its unchanged chat
  * handler on its own thread through a BatchedGenerationLane, which pulls
  * tokens with one-window grants so slow consumers never stall other requests.
+ *
+ * Exactly-once outcome: every mailbox handed out by submit() reaches exactly
+ * one terminal state — admission failure, a runner finish event, or a driver
+ * failure (shutdown, sealed session, exception) — so no lane can wait forever.
  */
 #pragma once
 
@@ -16,16 +20,15 @@
 #include "execution/runner/IOrchestrationRunner.h"
 #include "utils/Logger.h"
 
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <deque>
-#include <algorithm>
 #include <functional>
 #include <future>
 #include <map>
 #include <memory>
 #include <mutex>
-#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -40,11 +43,75 @@ namespace llaminar2
         std::deque<int32_t> tokens;
         ServingFinishReason finish = ServingFinishReason::None;
         std::string error;
-        bool admitted = false;          ///< Submission acknowledged.
+        bool admitted = false;          ///< Submission resolved (accepted or failed).
+        std::string admission_error;    ///< Non-empty when admission failed.
         int prompt_tokens = 0;          ///< From the latest event.
         int cached_prompt_tokens = 0;   ///< Prefix-cache restored prompt tokens.
         bool prefix_cache_enabled = false;
-        std::string admission_error;    ///< Non-empty when admission failed.
+
+        /** @brief Resolve as failed unless already terminal; wakes the lane. */
+        void fail(const std::string &reason)
+        {
+            std::lock_guard lock(mutex);
+            if (!admitted)
+            {
+                admitted = true;
+                admission_error = reason;
+            }
+            if (finish == ServingFinishReason::None)
+            {
+                finish = ServingFinishReason::Error;
+                error = reason;
+            }
+            cv.notify_all();
+        }
+    };
+
+    /**
+     * @brief Cancellation handle of one HTTP request.
+     *
+     * The transport owns it; the request's lane binds its serving id when it
+     * submits. Cancelling before submission makes the lane refuse to submit;
+     * cancelling after posts a runner cancellation immediately, whether the
+     * request is queued, resident or blocked on its consumer.
+     */
+    class ServingRequestCancellation
+    {
+    public:
+        void cancel()
+        {
+            std::function<void()> action;
+            {
+                std::lock_guard lock(mutex_);
+                if (cancelled_)
+                    return;
+                cancelled_ = true;
+                action = std::move(on_cancel_);
+            }
+            if (action)
+                action();
+        }
+
+        /** @brief Bind the cancel action; false (unbound) when already cancelled. */
+        bool bind(std::function<void()> on_cancel)
+        {
+            std::lock_guard lock(mutex_);
+            if (cancelled_)
+                return false;
+            on_cancel_ = std::move(on_cancel);
+            return true;
+        }
+
+        bool cancelled() const
+        {
+            std::lock_guard lock(mutex_);
+            return cancelled_;
+        }
+
+    private:
+        mutable std::mutex mutex_;
+        bool cancelled_ = false;
+        std::function<void()> on_cancel_;
     };
 
     class ServingBatchDriver
@@ -86,82 +153,171 @@ namespace llaminar2
             if (!error.empty())
             {
                 thread_.join();
+                std::lock_guard lock(mutex_);
+                closed_ = true;
+                close_reason_ = "serving session failed to open: " + error;
                 return false;
             }
             return true;
         }
 
+        /**
+         * @brief Close the session: join the driver thread, then fail every
+         *        unresolved mailbox. Idempotent; later commands fail at once.
+         */
         void stop()
         {
             {
                 std::lock_guard lock(mutex_);
-                stopping_ = true;
+                closed_ = true;
+                if (close_reason_.empty())
+                    close_reason_ = "server shutting down";
             }
             cv_.notify_all();
             if (thread_.joinable())
                 thread_.join();
-            // Unblock any lane still waiting for output.
-            std::lock_guard lock(mutex_);
-            for (auto &[id, mailbox] : mailboxes_)
-            {
-                std::lock_guard mailbox_lock(mailbox->mutex);
-                if (mailbox->finish == ServingFinishReason::None)
-                {
-                    mailbox->finish = ServingFinishReason::Error;
-                    mailbox->error = "server shutting down";
-                }
-                mailbox->admitted = true;
-                mailbox->cv.notify_all();
-            }
+            failAll(closeReason());
         }
 
-        /** @brief Lane factory for the chat handler. */
+        /** @brief Lane factory for the chat handler (binds the calling thread's cancellation). */
         std::unique_ptr<IRequestGenerationLane> makeLane();
+
+        /**
+         * @brief Binds a request's cancellation to lanes created on this thread.
+         *
+         * The HTTP producer thread installs its request's handle while running
+         * the handler, so makeLane() needs no extra handler plumbing.
+         */
+        class RequestScope
+        {
+        public:
+            explicit RequestScope(std::shared_ptr<ServingRequestCancellation> cancellation)
+                : previous_(current())
+            {
+                current() = std::move(cancellation);
+            }
+            ~RequestScope() { current() = std::move(previous_); }
+            RequestScope(const RequestScope &) = delete;
+            RequestScope &operator=(const RequestScope &) = delete;
+
+            static std::shared_ptr<ServingRequestCancellation> &current()
+            {
+                thread_local std::shared_ptr<ServingRequestCancellation> handle;
+                return handle;
+            }
+
+        private:
+            std::shared_ptr<ServingRequestCancellation> previous_;
+        };
 
         // ----- Lane commands (any thread) -----
 
+        /** @brief Submit; the returned mailbox always reaches a terminal state. */
         std::shared_ptr<ServingMailbox> submit(ServingBatchRequest request)
         {
             auto mailbox = std::make_shared<ServingMailbox>();
-            post([this, mailbox, request = std::move(request)]() mutable {
-                const std::uint64_t id = request.id;
+            const std::uint64_t id = request.id;
+            const bool posted = post([this, mailbox, id, request = std::move(request)]() mutable {
+                // The mailbox stays in unadmitted_ until it is resolved, so a
+                // throwing submission is still failed by seal()/stop().
                 const bool ok = runner_.submitServingRequest(std::move(request));
-                std::lock_guard lock(mailbox->mutex);
-                mailbox->admitted = true;
                 if (ok)
+                {
                     mailboxes_[id] = mailbox;
+                    std::lock_guard lock(mailbox->mutex);
+                    mailbox->admitted = true;
+                    mailbox->cv.notify_all();
+                }
                 else
-                    mailbox->admission_error = runner_.lastError();
-                mailbox->cv.notify_all();
-            });
+                {
+                    mailbox->fail(runner_.lastError().empty() ? "serving submission rejected"
+                                                              : runner_.lastError());
+                }
+                std::lock_guard lock(mutex_);
+                unadmitted_.erase(id);
+            }, [&] { unadmitted_[id] = mailbox; });
+            if (!posted)
+                mailbox->fail(closeReason());
             return mailbox;
         }
 
         void grant(std::uint64_t id, int tokens)
         {
-            post([this, id, tokens] { runner_.grantServingTokens(id, tokens); });
+            (void)post([this, id, tokens] { runner_.grantServingTokens(id, tokens); });
         }
 
         void force(std::uint64_t id, int32_t token)
         {
-            post([this, id, token] { runner_.forceServingToken(id, token); });
+            (void)post([this, id, token] { runner_.forceServingToken(id, token); });
         }
 
         void cancel(std::uint64_t id)
         {
-            post([this, id] { runner_.cancelServingRequest(id); });
+            (void)post([this, id] { runner_.cancelServingRequest(id); });
         }
 
         std::uint64_t nextRequestId() { return next_id_.fetch_add(1) + 1; }
 
+        /** @brief True once stopped or sealed by a failure. */
+        bool closed() const
+        {
+            std::lock_guard lock(mutex_);
+            return closed_;
+        }
+
     private:
-        void post(std::function<void()> command)
+        /**
+         * @brief Queue a command; false when the driver is closed.
+         * @param while_locked Runs under the queue lock on success, so
+         *        bookkeeping is atomic with acceptance.
+         */
+        bool post(std::function<void()> command, const std::function<void()> &while_locked = {})
         {
             {
                 std::lock_guard lock(mutex_);
+                if (closed_)
+                    return false;
                 commands_.push_back(std::move(command));
+                if (while_locked)
+                    while_locked();
             }
             cv_.notify_all();
+            return true;
+        }
+
+        std::string closeReason() const
+        {
+            std::lock_guard lock(mutex_);
+            return close_reason_;
+        }
+
+        /** @brief Seal after a failure: nothing more is accepted or stepped. */
+        void seal(const std::string &reason)
+        {
+            {
+                std::lock_guard lock(mutex_);
+                if (!closed_)
+                    close_reason_ = reason;
+                closed_ = true;
+            }
+            LOG_ERROR("[ServingBatchDriver] session sealed: " << reason);
+            failAll(reason);
+        }
+
+        /** @brief Fail every unresolved mailbox (driver thread joined or sealing on it). */
+        void failAll(const std::string &reason)
+        {
+            std::map<std::uint64_t, std::shared_ptr<ServingMailbox>> pending;
+            {
+                std::lock_guard lock(mutex_);
+                pending.swap(unadmitted_);
+                commands_.clear();
+            }
+            for (auto &[id, mailbox] : pending)
+                mailbox->fail(reason);
+            for (auto &[id, mailbox] : mailboxes_)
+                mailbox->fail(reason);
+            mailboxes_.clear();
         }
 
         /** @brief Driver thread: apply commands, step while anything can progress. */
@@ -172,40 +328,47 @@ namespace llaminar2
                 std::deque<std::function<void()>> commands;
                 {
                     std::unique_lock lock(mutex_);
-                    cv_.wait(lock, [&] { return stopping_ || !commands_.empty() || runnable_; });
-                    if (stopping_)
+                    cv_.wait(lock, [&] { return closed_ || !commands_.empty() || runnable_; });
+                    if (closed_)
                         return;
                     commands.swap(commands_);
                 }
-                for (auto &command : commands)
-                    command();
-                if (runner_.servingBatchHasRunnableWork())
+                try
                 {
-                    for (const auto &event : runner_.stepServingBatch())
-                        dispatch(event);
+                    for (auto &command : commands)
+                        command();
+                    if (runner_.servingBatchHasRunnableWork())
+                        for (const auto &event : runner_.stepServingBatch())
+                            dispatch(event);
+                    runnable_ = runner_.servingBatchHasRunnableWork();
                 }
-                runnable_ = runner_.servingBatchHasRunnableWork();
+                catch (const std::exception &error)
+                {
+                    seal(std::string("serving step failed: ") + error.what());
+                    return;
+                }
+                catch (...)
+                {
+                    seal("serving step failed with an unknown exception");
+                    return;
+                }
             }
         }
 
         void dispatch(const ServingBatchEvent &event)
         {
-            std::shared_ptr<ServingMailbox> mailbox;
-            {
-                // mailboxes_ is touched only on this thread after admission.
-                auto it = mailboxes_.find(event.id);
-                if (it == mailboxes_.end())
-                    return;
-                mailbox = it->second;
-                if (event.finished())
-                    mailboxes_.erase(it);
-            }
+            auto it = mailboxes_.find(event.id);
+            if (it == mailboxes_.end())
+                return;
+            std::shared_ptr<ServingMailbox> mailbox = it->second;
+            if (event.finished())
+                mailboxes_.erase(it);
             std::lock_guard lock(mailbox->mutex);
             mailbox->tokens.insert(mailbox->tokens.end(), event.tokens.begin(), event.tokens.end());
             mailbox->prompt_tokens = event.prompt_tokens;
             mailbox->cached_prompt_tokens = event.cached_prompt_tokens;
             mailbox->prefix_cache_enabled = event.prefix_cache_enabled;
-            if (event.finished())
+            if (event.finished() && mailbox->finish == ServingFinishReason::None)
             {
                 mailbox->finish = event.finish;
                 mailbox->error = event.error;
@@ -217,11 +380,15 @@ namespace llaminar2
         const int capacity_;
         const int context_tokens_;
         std::thread thread_;
-        std::mutex mutex_;
+        mutable std::mutex mutex_;
         std::condition_variable cv_;
         std::deque<std::function<void()>> commands_;
-        bool stopping_ = false;
+        bool closed_ = false;
+        std::string close_reason_;
+        /** @brief Submitted, not yet applied by the driver thread (mutex_). */
+        std::map<std::uint64_t, std::shared_ptr<ServingMailbox>> unadmitted_;
         bool runnable_ = false; ///< Driver-thread only.
+        /** @brief Admitted requests (driver thread; read by stop() after join). */
         std::map<std::uint64_t, std::shared_ptr<ServingMailbox>> mailboxes_;
         std::atomic<std::uint64_t> next_id_{0};
     };
@@ -236,21 +403,23 @@ namespace llaminar2
     class BatchedGenerationLane final : public IRequestGenerationLane
     {
     public:
-        BatchedGenerationLane(ServingBatchDriver &driver, int context_tokens)
-            : driver_(driver), context_tokens_(context_tokens)
+        BatchedGenerationLane(ServingBatchDriver &driver, int context_tokens,
+                              std::shared_ptr<ServingRequestCancellation> cancellation)
+            : driver_(driver), context_tokens_(context_tokens), cancellation_(std::move(cancellation))
         {
         }
 
+        /** @brief Retires an unfinished request (cancellation is idempotent). */
         ~BatchedGenerationLane() override
         {
-            if (mailbox_)
+            if (id_ == 0 || !mailbox_)
+                return;
             {
                 std::lock_guard lock(mailbox_->mutex);
                 if (mailbox_->finish != ServingFinishReason::None)
                     return;
             }
-            if (id_ != 0)
-                driver_.cancel(id_);
+            driver_.cancel(id_);
         }
 
         BatchedGenerationLane(const BatchedGenerationLane &) = delete;
@@ -262,6 +431,11 @@ namespace llaminar2
 
         bool prefill(const std::vector<int32_t> &tokens) override
         {
+            if (mailbox_)
+            {
+                error_ = "prefill called twice for one serving request";
+                return false;
+            }
             ServingBatchRequest request;
             request.id = driver_.nextRequestId();
             request.prompt = tokens;
@@ -269,8 +443,17 @@ namespace llaminar2
             request.stop_tokens = stop_tokens_;
             request.max_new_tokens = std::max(1, context_tokens_ - static_cast<int>(tokens.size()));
             request.paced = true;
+            if (cancellation_ && cancellation_->cancelled())
+            {
+                error_ = "request cancelled by the client";
+                return false;
+            }
             id_ = request.id;
             mailbox_ = driver_.submit(std::move(request));
+            // A transport close from now on cancels the serving request at
+            // once, whether it is queued, resident or waiting on its consumer.
+            if (cancellation_ && !cancellation_->bind([driver = &driver_, id = id_] { driver->cancel(id); }))
+                driver_.cancel(id_);
             std::unique_lock lock(mailbox_->mutex);
             mailbox_->cv.wait(lock, [&] { return mailbox_->admitted; });
             if (!mailbox_->admission_error.empty())
@@ -302,7 +485,7 @@ namespace llaminar2
             mailbox_->cv.wait(lock, [&] {
                 return !mailbox_->tokens.empty() || mailbox_->finish != ServingFinishReason::None;
             });
-            return drain(lock, max_tokens, result);
+            return drain(max_tokens, result);
         }
 
         GenerationResult forceDecodeToken(int32_t token) override
@@ -314,13 +497,22 @@ namespace llaminar2
                 return result;
             }
             std::unique_lock lock(mailbox_->mutex);
+            // A forced token must be the very next output. With a live grant
+            // or undelivered sampled tokens it would not be: fail fast.
+            if (outstanding_ > 0 || !mailbox_->tokens.empty())
+            {
+                result.error = "forceDecodeToken with an outstanding sampled-token grant";
+                return result;
+            }
+            if (mailbox_->finish != ServingFinishReason::None)
+                return drain(1, result);
             lock.unlock();
             driver_.force(id_, token);
             lock.lock();
             mailbox_->cv.wait(lock, [&] {
                 return !mailbox_->tokens.empty() || mailbox_->finish != ServingFinishReason::None;
             });
-            return drain(lock, 1, result);
+            return drain(1, result);
         }
 
         std::string lastError() const override { return error_; }
@@ -342,14 +534,17 @@ namespace llaminar2
         }
 
     private:
-        GenerationResult &drain(std::unique_lock<std::mutex> &, int max_tokens, GenerationResult &result)
+        /** @brief Move up to @p max_tokens delivered tokens out (mailbox lock held). */
+        GenerationResult &drain(int max_tokens, GenerationResult &result)
         {
             while (!mailbox_->tokens.empty() && static_cast<int>(result.tokens.size()) < max_tokens)
             {
                 result.tokens.push_back(mailbox_->tokens.front());
                 mailbox_->tokens.pop_front();
             }
-            outstanding_ = std::max(0, outstanding_ - static_cast<int>(result.tokens.size()));
+            outstanding_ = mailbox_->finish != ServingFinishReason::None
+                               ? 0
+                               : std::max(0, outstanding_ - static_cast<int>(result.tokens.size()));
             if (mailbox_->finish == ServingFinishReason::Error && result.tokens.empty())
                 result.error = mailbox_->error.empty() ? "serving request failed" : mailbox_->error;
             if (mailbox_->finish == ServingFinishReason::Cancelled && result.tokens.empty())
@@ -365,6 +560,7 @@ namespace llaminar2
 
         ServingBatchDriver &driver_;
         const int context_tokens_;
+        std::shared_ptr<ServingRequestCancellation> cancellation_;
         SamplingParams sampling_;
         std::vector<int32_t> stop_tokens_;
         std::uint64_t id_ = 0;
@@ -375,7 +571,6 @@ namespace llaminar2
 
     inline std::unique_ptr<IRequestGenerationLane> ServingBatchDriver::makeLane()
     {
-        // The session's runner context (config) is immutable after start.
-        return std::make_unique<BatchedGenerationLane>(*this, context_tokens_);
+        return std::make_unique<BatchedGenerationLane>(*this, context_tokens_, RequestScope::current());
     }
 } // namespace llaminar2

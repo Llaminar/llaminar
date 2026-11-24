@@ -786,9 +786,13 @@ namespace llaminar2
                      // The producer runs the handler; the provider thread is the
                      // only socket writer. Closing the channel or the transport
                      // retires the producer, which cancels its serving request.
+                     // Transport close cancels the serving request at once,
+                     // even while it is queued or waiting for its consumer.
+                     auto cancellation = std::make_shared<ServingRequestCancellation>();
                      auto producer = std::make_shared<std::thread>(
-                         [&handler, channel, transport_open, admitted, arrival,
+                         [&handler, channel, transport_open, admitted, arrival, cancellation,
                           stream_request = std::move(stream_request)]() mutable {
+                             ServingBatchDriver::RequestScope scope(cancellation);
                              try
                              {
                                  auto enqueue = [channel, transport_open](const std::string &line) -> bool {
@@ -804,26 +808,36 @@ namespace llaminar2
                          });
                      res.set_chunked_content_provider(
                          "text/event-stream",
-                         [channel, transport_open, streamed_response_body](size_t, httplib::DataSink &sink) -> bool {
+                         [channel, transport_open, cancellation, streamed_response_body](size_t, httplib::DataSink &sink) -> bool {
                              for (;;)
                              {
-                                 auto line = channel->popOrClosed();
-                                 if (!line)
+                                 std::string line;
+                                 const auto status =
+                                     channel->popOrClosedFor(std::chrono::milliseconds(200), line);
+                                 if (status == SSEPublishChannel::PopStatus::Closed)
                                      break;
-                                 if (streamed_response_body)
-                                     streamed_response_body->append(*line);
-                                 if (!sink.write(line->c_str(), line->size()))
+                                 // While the request waits (queued, prefilling or
+                                 // paced) probe the client so a disconnect frees
+                                 // its slot without waiting for the next token.
+                                 const bool alive = status == SSEPublishChannel::PopStatus::Line
+                                                        ? sink.write(line.c_str(), line.size())
+                                                        : sink.is_writable();
+                                 if (!alive)
                                  {
                                      transport_open->store(false);
+                                     cancellation->cancel();
                                      channel->close();
                                      return false;
                                  }
+                                 if (status == SSEPublishChannel::PopStatus::Line && streamed_response_body)
+                                     streamed_response_body->append(line);
                              }
                              sink.done();
                              return true;
                          },
-                         [producer, channel, transport_open](bool) {
+                         [producer, channel, transport_open, cancellation](bool) {
                              transport_open->store(false);
+                             cancellation->cancel();
                              channel->close();
                              if (producer->joinable())
                                  producer->join();
@@ -1113,6 +1127,8 @@ namespace llaminar2
             }
             if (mpi_coordinated)
                 runner->shutdownMPIWorkers();
+            if (batch_driver)
+                batch_driver->stop(); // the driver thread must stop using the runner first
             runner->shutdown();
             flushPerfStatsFromEnv();
             return 1;
@@ -1144,6 +1160,8 @@ namespace llaminar2
                 LOG_ERROR("Server stopped unexpectedly while serving on " << serve_endpoint);
                 if (mpi_coordinated)
                     runner->shutdownMPIWorkers();
+                if (batch_driver)
+                    batch_driver->stop(); // the driver thread must stop using the runner first
                 runner->shutdown();
                 flushPerfStatsFromEnv();
                 return 1;
