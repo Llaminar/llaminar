@@ -853,6 +853,41 @@ namespace llaminar2::test
             }
     }
 
+#if defined(__AVX2__)
+    /** @test The AVX2 nibble domains preserve signed-byte endpoints for every adjacent pair. */
+    TEST(CPUCompensationFreeUnits, AVX2NibbleDotsMatchEveryAdjacentSelectorPair)
+    {
+        const auto check = []<NibbleDotAVX2 Domain>(std::uint8_t cb) {
+            const auto lut = build_decode_lut_avx2_for_codebook(cb);
+            const int bias = nibbleWeightBiasAVX2<Domain>(cb);
+            for (int lo = 0; lo < 16; ++lo)
+                for (int hi = 0; hi < 16; ++hi)
+                {
+                    const std::uint8_t selector = lo | (hi << 4);
+                    std::uint8_t payload[16];
+                    std::fill_n(payload, 16, selector);
+                    std::int8_t reference[32];
+                    decode_native_block(cb, payload, reference);
+                    const auto indices = _mm256_set1_epi32(lo | (hi << 8) | (hi << 16) | (lo << 24));
+                    const auto weight = decodeNibbleAVX2<Domain>(indices, lut);
+                    for (const int a : {-128, -127, 0, 127})
+                        for (const int b : {-128, -127, 0, 127})
+                        {
+                            const auto ab = static_cast<std::int8_t>(a), bb = static_cast<std::int8_t>(b);
+                            const auto word = _mm256_set1_epi32(std::bit_cast<std::int32_t>(std::array{ab, bb, bb, ab}));
+                            const auto result = dotNibbleAVX2<Domain>(_mm256_setzero_si256(), weight, word);
+                            ASSERT_EQ(_mm256_extract_epi32(result, 0) - bias * (2 * a + 2 * b),
+                                2 * (a * reference[0] + b * reference[16]));
+                        }
+                }
+        };
+        check.template operator()<NibbleDotAVX2::Linear>(native_quantised_formats::Q4_0.codebook_id);
+        check.template operator()<NibbleDotAVX2::Linear>(native_quantised_formats::Q4_1.codebook_id);
+        check.template operator()<NibbleDotAVX2::SmallLUT>(kNativeQuantisedMXFP4Codebook);
+        check.template operator()<NibbleDotAVX2::SignedLUT>(native_quantised_formats::IQ4_NL.codebook_id);
+    }
+#endif
+
     /** Real SIMD leaves preserve old projection bytes at M=1..4, including a partial N tile and ordered K folds. */
     TEST(CPUCompensationFreeUnits, SimdProjectionMatchesPreviousPerBlockProgram)
     {

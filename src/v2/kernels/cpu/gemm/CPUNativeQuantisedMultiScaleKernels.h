@@ -928,6 +928,25 @@ namespace llaminar2::cpu::native_quantised::multi_scale
         // center correction.
         constexpr int center = Lanes != 16 || Codebook == 10 || Codebook == 7
             ? 0 : Codebook == 9 ? 4 : 128;
+#if defined(__AVX2__)
+        // Bind the already-admitted layout from the shared geometry authority.
+        // Keep the traversal's additional address state within the budget
+        // of each emitted tile. In particular the AVX2 grouped Q5_K tile
+        // would save live vectors; the AVX-512 grouped contiguously folded
+        // tile does not have the extra ordered partition accumulators.
+        constexpr bool fixed_layout = (Lanes == 8 && Codebook == 7 && Rows == 1) ||
+            (Lanes == 16 && Codebook == 11 && (Tree == Reduction::Contiguous || Rows <= 2)) ||
+            (Lanes == 16 && Codebook == 7 && Rows > 1 && Tree == Reduction::Contiguous);
+        constexpr auto encoding = CPUNativeQuantisedEncoding::CompactMultiScale;
+        constexpr auto data_stride = preparedDataStride(encoding, Codebook);
+        const auto geometry = preparedBlockGeometry(encoding, Codebook == 7, Codebook, packed.blocks_per_row);
+        const auto *chunk_base = [&] {
+            if constexpr (fixed_layout)
+                return packed.interleavedBase() + static_cast<std::size_t>(chunk) * geometry.rowBytes();
+            else
+                return static_cast<const uint8_t *>(nullptr);
+        }();
+#endif
         for (int column = 0; column < columns; column += Lanes)
         {
             F reduced[Rows]{};
@@ -954,7 +973,16 @@ namespace llaminar2::cpu::native_quantised::multi_scale
                     Tree == Reduction::OrderedPartitions ? std::min(first + blocks_per_partition, end) : end;
                 for (int kb = first; kb < last; ++kb)
                 {
+#if defined(__AVX2__)
+                    const auto *unit = [&] {
+                        if constexpr (fixed_layout)
+                            return chunk_base + geometry.blockOffset(0, kb);
+                        else
+                            return packed.admittedBlockUnit(chunk, kb);
+                    }();
+#else
                     const uint8_t *const unit = packed.admittedBlockUnit(chunk, kb);
+#endif
                     I low[Rows]{}, high[Rows]{};
                     if constexpr (Codebook == 7 || Codebook == 11)
                         dotSingleScale<Codebook, Lanes, Rows, Tree, Ops>(unit, column, activation, kb, low);
@@ -966,9 +994,20 @@ namespace llaminar2::cpu::native_quantised::multi_scale
                     // Coded metadata: the block's code and its superblock word
                     // reconstruct exactly the factors the per-block words held.
                     using L = coded_metadata::Lanes<Ops>;
+#if defined(__AVX2__)
+                    const auto *header = [&] {
+                        if constexpr (fixed_layout)
+                            return chunk_base + geometry.headerOffset(0, kb);
+                        else
+                            return packed.admittedSuperblockHeader(chunk, kb);
+                    }();
+                    const I superblock_word = L::template superblockWords<static_cast<std::uint8_t>(Codebook)>(header, column);
+                    const I code = compactCode<Codebook, Ops>(unit, fixed_layout ? data_stride : packed.data_stride, column);
+#else
                     const I superblock_word = L::template superblockWords<static_cast<std::uint8_t>(Codebook)>(
                         packed.admittedSuperblockHeader(chunk, kb), column);
                     const I code = compactCode<Codebook, Ops>(unit, packed.data_stride, column);
+#endif
                     F scale0, scale1;
                     [[maybe_unused]] coded_metadata::Factors<F> factors;
                     if constexpr (Codebook == 13)

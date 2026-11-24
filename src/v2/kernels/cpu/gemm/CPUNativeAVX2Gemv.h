@@ -40,27 +40,21 @@ namespace llaminar2::cpu::native_quantised
     // =========================================================================
     // Decode LUT tables for nibble → signed int8 mapping
     // =========================================================================
-    // These are duplicated from CPUNativeQuantisedGemv.h so this header is
-    // self-contained. The values are identical to the AVX512 versions.
+    // Only nonlinear codebooks consume a lookup. Q4_0 and Q4_1/Q4_K
+    // decode directly to their unsigned nibble indices.
     // =========================================================================
 
     namespace avx2_luts
     {
-        // Q4_0: nibble → [-8..7]
-        alignas(16) static constexpr int8_t Q4_0_DECODE_LUT[16] = {
-            -8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7};
         // IQ4_NL: nibble → non-linear codebook
         alignas(16) static constexpr int8_t IQ4_NL_DECODE_LUT[16] = {
             -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
-        // Q4_1: nibble → [0..15] unsigned identity
-        alignas(16) static constexpr int8_t Q4_1_DECODE_LUT[16] = {
-            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
         // MXFP4: nibble → doubled E2M1 value (mxfp4::kValues)
         alignas(16) static constexpr int8_t MXFP4_DECODE_LUT[16] = {
             0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
     } // namespace avx2_luts
 
-    /** @brief Choose the smallest uniform zero point of the native nibble decoder.
+    /** @brief Choose the established unsigned zero point of the AVX-512 nibble decoder.
      * @param codebook Original nibble codec (5 includes both Q4_1 and Q4_K).
      * @return z such that the unsigned decoder publishes w + z.
      * @details The previous sum((a+128)*w) - 128*sum(w) and the new
@@ -93,41 +87,81 @@ namespace llaminar2::cpu::native_quantised
         return _mm256_add_epi32(dot, _mm256_add_epi32(_mm256_madd_epi16(low, ones), _mm256_madd_epi16(high, ones)));
     }
 
+    /** @brief Integer domain of an admitted AVX2 nibble codebook. */
+    enum class NibbleDotAVX2 { Linear, SmallLUT, SignedLUT };
+
+    /** @brief Select the AVX2 dot from the immutable source codebook.
+     * @param codebook Original codebook retained in admitted nibble weights.
+     * @return Domain of the decoded bytes feeding the exact integer dot.
+     * @throws std::invalid_argument If a non-nibble codebook reached this leaf.
+     */
+    inline NibbleDotAVX2 nibbleDotAVX2(uint8_t codebook)
+    {
+        switch (codebook)
+        {
+        case native_quantised_formats::Q4_0.codebook_id:
+        case native_quantised_formats::Q4_1.codebook_id:
+            return NibbleDotAVX2::Linear;
+        case kNativeQuantisedMXFP4Codebook:
+            return NibbleDotAVX2::SmallLUT;
+        case native_quantised_formats::IQ4_NL.codebook_id:
+            return NibbleDotAVX2::SignedLUT;
+        }
+        throw std::invalid_argument("NativeQuantised AVX2 nibble dot requires a nibble codebook");
+    }
+
     /**
-     * @brief Append a nibble dot specialized for an immutable unsigned identity codebook.
-     * @tparam Identity Codebook 5: Q4_1 or Q4_K, weights in [0,15] without bias.
+     * @brief Append a nibble dot without splitting even the nonlinear IQ4 weights.
+     * @tparam Domain Whether decoded bytes are small unsigned or native signed IQ4.
      * @param dot Exact INT32 vector accumulated from earlier groups.
      * @param weight Decoded nibble values in VNNI lane order.
-     * @param activation The corresponding four signed activation bytes broadcast to each column.
+     * @param activation Four signed activation bytes broadcast to each column.
      * @return The original exact dot plus this group.
      *
-     * Identity nibbles cannot saturate the signed 16-bit pair sum (2*15*128).
-     * Other nibble LUTs can publish biased bytes above 127 and retain the
-     * two-part full-range dot.
+     * Linear nibbles and offset MXFP4 are [0,15] and [0,24]; neither can
+     * saturate VPMADDUBSW. IQ4's signed range [-127,113] excludes -128,
+     * so SIMD<8>::dot transfers the activation sign onto the weights and
+     * handles even -128 activations exactly without a correction.
      */
-    template <bool Identity>
+    template <NibbleDotAVX2 Domain>
     inline __m256i dotNibbleAVX2(__m256i dot, __m256i weight, __m256i activation) noexcept
     {
-        if constexpr (!Identity)
-            return dotUnsignedWeightsAVX2(dot, weight, activation);
+        if constexpr (Domain == NibbleDotAVX2::SignedLUT)
+        {
+            using Ops = multi_scale::SIMD<8>;
+            using I = Ops::I;
+            return std::bit_cast<__m256i>(Ops::dot(std::bit_cast<I>(dot), std::bit_cast<I>(weight),
+                std::bit_cast<I>(activation)));
+        }
         else
             return _mm256_add_epi32(dot, _mm256_madd_epi16(
                 _mm256_maddubs_epi16(weight, activation), _mm256_set1_epi16(1)));
     }
 
-    /** @brief Decode one unsigned nibble per byte after low/high extraction.
-     * @tparam Identity The source codec uses the nibble indices directly.
+    /** @brief Decode one nibble per byte after low/high extraction.
+     * @tparam Domain Linear codebook or a nonlinear lookup program.
      * @param indices Values in [0,15] in prepared column order.
-     * @param lut Biased byte lookup table for nonlinear or shifted decoders.
-     * @return The original indices for codebook 5, or decoded biased bytes.
+     * @param lut Immutable byte lookup table for nonlinear codebooks.
+     * @return The original indices for linear codebooks or decoded LUT bytes.
      */
-    template <bool Identity>
+    template <NibbleDotAVX2 Domain>
     inline __m256i decodeNibbleAVX2(__m256i indices, __m256i lut) noexcept
     {
-        if constexpr (Identity)
+        if constexpr (Domain == NibbleDotAVX2::Linear)
             return indices;
         else
             return _mm256_shuffle_epi8(lut, indices);
+    }
+
+    /** @return Activation-sum multiplier needed by the AVX2 integer operand domain. */
+    template <NibbleDotAVX2 Domain>
+    inline int nibbleWeightBiasAVX2(uint8_t codebook) noexcept
+    {
+        if constexpr (Domain == NibbleDotAVX2::Linear)
+            return codebook == native_quantised_formats::Q4_0.codebook_id ? 8 : 0;
+        if constexpr (Domain == NibbleDotAVX2::SmallLUT)
+            return 12;
+        return 0;
     }
 
     /** @brief Dot one expanded group using its admitted legacy or compensation-free layout. */
@@ -154,28 +188,23 @@ namespace llaminar2::cpu::native_quantised
     // AVX2 decode LUT builder (selects correct LUT by codebook_id)
     // =========================================================================
 
+    /** @brief Publish the AVX2 operand table associated with a nibble domain.
+     * @param codebook_id Original nibble codebook, including its source aliases.
+     * @return Native signed IQ4 table, offset MXFP4 table, or unused zero for linear decode.
+     */
     inline __m256i build_decode_lut_avx2_for_codebook(uint8_t codebook_id)
     {
-        const int8_t *lut_data;
-        switch (codebook_id)
+        switch (nibbleDotAVX2(codebook_id))
         {
-        case 4: // IQ4_NL / IQ4_XS
-            lut_data = avx2_luts::IQ4_NL_DECODE_LUT;
-            break;
-        case kNativeQuantisedMXFP4Codebook:
-            lut_data = avx2_luts::MXFP4_DECODE_LUT;
-            break;
-        case 5: // Q4_1
-            lut_data = avx2_luts::Q4_1_DECODE_LUT;
-            break;
-        case 0: // Q4_0
-            lut_data = avx2_luts::Q4_0_DECODE_LUT;
-            break;
-        default:
-            throw std::invalid_argument("NativeQuantised AVX2 nibble LUT requested for a non-nibble codebook");
+        case NibbleDotAVX2::Linear:
+            return _mm256_setzero_si256();
+        case NibbleDotAVX2::SmallLUT:
+            return _mm256_add_epi8(isa::build_decode_lut_avx2(avx2_luts::MXFP4_DECODE_LUT),
+                _mm256_set1_epi8(nibbleWeightBiasAVX2<NibbleDotAVX2::SmallLUT>(codebook_id)));
+        case NibbleDotAVX2::SignedLUT:
+            return isa::build_decode_lut_avx2(avx2_luts::IQ4_NL_DECODE_LUT);
         }
-        return _mm256_add_epi8(isa::build_decode_lut_avx2(lut_data),
-            _mm256_set1_epi8(static_cast<int8_t>(nibbleWeightBias(codebook_id))));
+        throw std::logic_error("Invalid NativeQuantised AVX2 nibble dot domain");
     }
 
     /**
@@ -195,35 +224,61 @@ namespace llaminar2::cpu::native_quantised
     }
 
     /** @brief Decode nibble factors in the caller's registers, without a hidden result buffer.
+     * @tparam Domain Admitted nibble family which determines the possible factor layouts.
      * @param packed Prepared nibble matrix owning the source factor representation.
      * @param chunk Physical 64-column chunk.
      * @param block Logical 32-value reduction block.
      * @param column First of eight SIMD columns.
      * @return Exact primary and secondary factor lanes from the admitted representation.
      */
+    template <NibbleDotAVX2 Domain>
     [[gnu::always_inline]] inline coded_metadata::Factors<__m256> loadNibbleFactors256(
         const CPUNativeQuantisedPackedWeights &packed, int chunk, int block, int column)
     {
-        if (packed.encoding == CPUNativeQuantisedEncoding::Q4KSuperblockCoded)
+        if constexpr (Domain == NibbleDotAVX2::Linear)
         {
-            using Ops = multi_scale::SIMD<8>;
-            using L = coded_metadata::Lanes<Ops>;
-            return coded_metadata::reconstruct<5, Ops>(
-                L::code<5>(packed.blockUnit(chunk, block) + packed.data_stride, column),
-                L::superblockWords<5>(packed.superblockHeader(chunk, block), column));
+            if (packed.encoding == CPUNativeQuantisedEncoding::Q4KSuperblockCoded)
+            {
+                using Ops = multi_scale::SIMD<8>;
+                using L = coded_metadata::Lanes<Ops>;
+                return coded_metadata::reconstruct<5, Ops>(
+                    L::code<5>(packed.admittedBlockUnit(chunk, block) + packed.data_stride, column),
+                    L::superblockWords<5>(packed.admittedSuperblockHeader(chunk, block), column));
+            }
         }
-        if (packed.scaleEncoding() == CPUNativeQuantisedScaleEncoding::E8M0)
+        if constexpr (Domain == NibbleDotAVX2::SmallLUT)
         {
-            const auto e = _mm_loadu_si64(packed.blockUnit(chunk, block) + packed.data_stride + column);
+            const auto e = _mm_loadu_si64(packed.admittedBlockUnit(chunk, block) + packed.data_stride + column);
             const auto biased = _mm_subs_epu8(e, _mm_set1_epi8(1));
             return {.primary = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu8_epi32(biased), 23))};
         }
-        return {.primary = packed.loadScales256(chunk, block, column),
-                .secondary = packed.is_asymmetric ? _mm256_cvtph_ps(_mm_load_si128(
-                    reinterpret_cast<const __m128i *>(packed.chunkMins(chunk, block) + column))) : _mm256_setzero_ps()};
+        else
+        {
+            if constexpr (Domain == NibbleDotAVX2::SignedLUT)
+            {
+                if (packed.usesNibbleLUTSourceScale())
+                    return {.primary = packed.loadIQ4XSCodedScales<8>(chunk, block, column)};
+            }
+
+            // The remaining ordinary nibble encodings have adjacent half
+            // planes. The dispatch has already excluded every coded layout.
+            const auto *scale = reinterpret_cast<const uint16_t *>(
+                packed.admittedBlockUnit(chunk, block) + packed.data_stride) + column;
+            return {.primary = _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i *>(scale))),
+                    .secondary = packed.is_asymmetric ? _mm256_cvtph_ps(_mm_loadu_si128(
+                        reinterpret_cast<const __m128i *>(scale + 64))) : _mm256_setzero_ps()};
+        }
     }
 
     static_assert(native_quantised_formats::Q4_K.codebook_id == native_quantised_formats::Q4_1.codebook_id);
+    static_assert(native_quantised_formats::IQ4_XS.codebook_id == native_quantised_formats::IQ4_NL.codebook_id);
+    static_assert([] {
+        for (int value : avx2_luts::IQ4_NL_DECODE_LUT)
+            if (value == -128) return false;
+        for (int value : avx2_luts::MXFP4_DECODE_LUT)
+            if (value < -12 || value > 12) return false;
+        return true;
+    }(), "Native nibble tables must fit their exact AVX2 dot domains");
 
     // =========================================================================
     // AVX2 GEMV: nibble path (Q4_0, IQ4_NL, Q4_1/Q4_K, IQ4_XS)
@@ -251,9 +306,9 @@ namespace llaminar2::cpu::native_quantised
      * @param segment Eight-column segment within the chunk.
      * @param accumulator Initial FP32 value for the segment.
      * @return Updated FP32 segment.
-     * @tparam Identity The prepared codebook admits unsigned identity nibbles.
+     * @tparam Domain Exact integer operand domain of the prepared nibble weights.
      */
-    template <bool Identity>
+    template <NibbleDotAVX2 Domain>
     inline __m256 accumulateNibbleSegmentAVX2Impl(
         const CPUNativeQuantisedPackedWeights &packed,
         const Q8_1Block *A_q8,
@@ -264,7 +319,7 @@ namespace llaminar2::cpu::native_quantised
         int segment,
         __m256 accumulator)
     {
-        const int weight_bias = Identity ? 0 : nibbleWeightBias(packed.codebook_id);
+        const int weight_bias = nibbleWeightBiasAVX2<Domain>(packed.codebook_id);
         const __m256i mask_0F = _mm256_set1_epi8(0x0F);
         const int z = segment / 2;
         const int byte_offset = (segment % 2) * 32;
@@ -286,18 +341,18 @@ namespace llaminar2::cpu::native_quantised
                     unit + group * 256 + z * 64 + byte_offset;
                 const __m256i raw = _mm256_loadu_si256(
                     reinterpret_cast<const __m256i *>(base));
-                const __m256i low = decodeNibbleAVX2<Identity>(
+                const __m256i low = decodeNibbleAVX2<Domain>(
                     _mm256_and_si256(raw, mask_0F), decode_lut);
-                const __m256i high = decodeNibbleAVX2<Identity>(
+                const __m256i high = decodeNibbleAVX2<Domain>(
                     _mm256_and_si256(_mm256_srli_epi16(raw, 4), mask_0F), decode_lut);
-                dot_low = dotNibbleAVX2<Identity>(dot_low, low, _mm256_set1_epi32(nativeActivationWord(activation, group * 4)));
-                dot_high = dotNibbleAVX2<Identity>(dot_high, high, _mm256_set1_epi32(nativeActivationWord(activation, group * 4 + 16)));
+                dot_low = dotNibbleAVX2<Domain>(dot_low, low, _mm256_set1_epi32(nativeActivationWord(activation, group * 4)));
+                dot_high = dotNibbleAVX2<Domain>(dot_high, high, _mm256_set1_epi32(nativeActivationWord(activation, group * 4 + 16)));
             }
 
             const __m256i corrected = _mm256_sub_epi32(
                 _mm256_add_epi32(dot_low, dot_high),
                 _mm256_set1_epi32(weight_bias * activation.sum_qs));
-            const auto factors = loadNibbleFactors256(packed, chunk, kb, segment * 8);
+            const auto factors = loadNibbleFactors256<Domain>(packed, chunk, kb, segment * 8);
             const float activation_scale =
                 nativeQuantisedFP16ScaleToFP32(activation.d);
             if (packed.is_asymmetric)
@@ -335,9 +390,16 @@ namespace llaminar2::cpu::native_quantised
         int segment,
         __m256 accumulator)
     {
-        if (packed.codebook_id == native_quantised_formats::Q4_K.codebook_id)
-            return accumulateNibbleSegmentAVX2Impl<true>(packed, A_q8, chunk, kb_start, kb_end, decode_lut, segment, accumulator);
-        return accumulateNibbleSegmentAVX2Impl<false>(packed, A_q8, chunk, kb_start, kb_end, decode_lut, segment, accumulator);
+        switch (nibbleDotAVX2(packed.codebook_id))
+        {
+        case NibbleDotAVX2::Linear:
+            return accumulateNibbleSegmentAVX2Impl<NibbleDotAVX2::Linear>(packed, A_q8, chunk, kb_start, kb_end, decode_lut, segment, accumulator);
+        case NibbleDotAVX2::SmallLUT:
+            return accumulateNibbleSegmentAVX2Impl<NibbleDotAVX2::SmallLUT>(packed, A_q8, chunk, kb_start, kb_end, decode_lut, segment, accumulator);
+        case NibbleDotAVX2::SignedLUT:
+            return accumulateNibbleSegmentAVX2Impl<NibbleDotAVX2::SignedLUT>(packed, A_q8, chunk, kb_start, kb_end, decode_lut, segment, accumulator);
+        }
+        throw std::logic_error("Invalid NativeQuantised AVX2 nibble dot domain");
     }
 
     /**
@@ -549,9 +611,9 @@ namespace llaminar2::cpu::native_quantised
      * @param segment Eight-column segment within the chunk.
      * @param fp0 Running first-row FP32 value, updated in place.
      * @param fp1 Running second-row FP32 value, updated in place.
-     * @tparam Identity The prepared codebook admits unsigned identity nibbles.
+     * @tparam Domain Exact integer operand domain of the prepared nibble weights.
      */
-    template <bool Identity>
+    template <NibbleDotAVX2 Domain>
     inline void accumulateTwoRowsNibbleSegmentAVX2Impl(
         const CPUNativeQuantisedPackedWeights &packed,
         const Q8_1Block *A_q8_row0,
@@ -564,7 +626,7 @@ namespace llaminar2::cpu::native_quantised
         __m256 &fp0,
         __m256 &fp1)
     {
-        const int weight_bias = Identity ? 0 : nibbleWeightBias(packed.codebook_id);
+        const int weight_bias = nibbleWeightBiasAVX2<Domain>(packed.codebook_id);
         const __m256i mask_0F = _mm256_set1_epi8(0x0F);
         const int z = segment / 2;
         const int byte_offset = (segment % 2) * 32;
@@ -590,21 +652,21 @@ namespace llaminar2::cpu::native_quantised
                         unit + group * 256 + z * 64 + byte_offset;
                     const __m256i raw = _mm256_loadu_si256(
                         reinterpret_cast<const __m256i *>(base));
-                    const __m256i low = decodeNibbleAVX2<Identity>(
+                    const __m256i low = decodeNibbleAVX2<Domain>(
                         _mm256_and_si256(raw, mask_0F), decode_lut);
-                    const __m256i high = decodeNibbleAVX2<Identity>(
+                    const __m256i high = decodeNibbleAVX2<Domain>(
                         _mm256_and_si256(_mm256_srli_epi16(raw, 4), mask_0F), decode_lut);
-                    dot0_low = dotNibbleAVX2<Identity>(dot0_low, low, _mm256_set1_epi32(nativeActivationWord(a0, group * 4)));
-                    dot1_low = dotNibbleAVX2<Identity>(dot1_low, low, _mm256_set1_epi32(nativeActivationWord(a1, group * 4)));
-                    dot0_high = dotNibbleAVX2<Identity>(dot0_high, high, _mm256_set1_epi32(nativeActivationWord(a0, group * 4 + 16)));
-                    dot1_high = dotNibbleAVX2<Identity>(dot1_high, high, _mm256_set1_epi32(nativeActivationWord(a1, group * 4 + 16)));
+                    dot0_low = dotNibbleAVX2<Domain>(dot0_low, low, _mm256_set1_epi32(nativeActivationWord(a0, group * 4)));
+                    dot1_low = dotNibbleAVX2<Domain>(dot1_low, low, _mm256_set1_epi32(nativeActivationWord(a1, group * 4)));
+                    dot0_high = dotNibbleAVX2<Domain>(dot0_high, high, _mm256_set1_epi32(nativeActivationWord(a0, group * 4 + 16)));
+                    dot1_high = dotNibbleAVX2<Domain>(dot1_high, high, _mm256_set1_epi32(nativeActivationWord(a1, group * 4 + 16)));
                 }
 
                 const __m256i corrected0 = _mm256_sub_epi32(
                     _mm256_add_epi32(dot0_low, dot0_high), _mm256_set1_epi32(weight_bias * a0.sum_qs));
                 const __m256i corrected1 = _mm256_sub_epi32(
                     _mm256_add_epi32(dot1_low, dot1_high), _mm256_set1_epi32(weight_bias * a1.sum_qs));
-                const auto factors = loadNibbleFactors256(packed, chunk, kb, segment * 8);
+                const auto factors = loadNibbleFactors256<Domain>(packed, chunk, kb, segment * 8);
                 const float a0_scale = nativeQuantisedFP16ScaleToFP32(a0.d);
                 const float a1_scale = nativeQuantisedFP16ScaleToFP32(a1.d);
                 if (packed.is_asymmetric)
@@ -641,9 +703,16 @@ namespace llaminar2::cpu::native_quantised
         __m256 &fp0,
         __m256 &fp1)
     {
-        if (packed.codebook_id == native_quantised_formats::Q4_K.codebook_id)
-            return accumulateTwoRowsNibbleSegmentAVX2Impl<true>(packed, A_q8_row0, A_q8_row1, chunk, kb_start, kb_end, decode_lut, segment, fp0, fp1);
-        return accumulateTwoRowsNibbleSegmentAVX2Impl<false>(packed, A_q8_row0, A_q8_row1, chunk, kb_start, kb_end, decode_lut, segment, fp0, fp1);
+        switch (nibbleDotAVX2(packed.codebook_id))
+        {
+        case NibbleDotAVX2::Linear:
+            return accumulateTwoRowsNibbleSegmentAVX2Impl<NibbleDotAVX2::Linear>(packed, A_q8_row0, A_q8_row1, chunk, kb_start, kb_end, decode_lut, segment, fp0, fp1);
+        case NibbleDotAVX2::SmallLUT:
+            return accumulateTwoRowsNibbleSegmentAVX2Impl<NibbleDotAVX2::SmallLUT>(packed, A_q8_row0, A_q8_row1, chunk, kb_start, kb_end, decode_lut, segment, fp0, fp1);
+        case NibbleDotAVX2::SignedLUT:
+            return accumulateTwoRowsNibbleSegmentAVX2Impl<NibbleDotAVX2::SignedLUT>(packed, A_q8_row0, A_q8_row1, chunk, kb_start, kb_end, decode_lut, segment, fp0, fp1);
+        }
+        throw std::logic_error("Invalid NativeQuantised AVX2 nibble dot domain");
     }
 
     /**
