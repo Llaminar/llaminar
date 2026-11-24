@@ -39,6 +39,7 @@
 #include "execution/moe/GpuExpertSlotPool.h"
 #include "execution/moe/ExpertPreparedMemoryGeometry.h"
 #include "execution/moe/MoEOverlayGpuRemoteProjectionEndpoint.h"
+#include "execution/moe/MoEOverlayPhysicalResidencyFabric.h"
 #include "kernels/common/MoEProjectionNumericalContract.h"
 #include "kernels/common/NativeQuantisedGroupedDecodePolicy.h"
 #include "kernels/cpu/gemm/CPUNativeQuantisedGemmKernel.h"
