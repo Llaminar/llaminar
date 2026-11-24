@@ -12,6 +12,10 @@
  */
 #include "NativeQuantisedExpertTransferParityTest.h"
 #include "execution/config/RuntimeConfig.h"
+#include <limits>
+#ifdef HAVE_ROCM
+#include "backends/rocm/ROCmHardwareMetadata.h"
+#endif
 
 namespace llaminar2::test
 {
@@ -249,8 +253,48 @@ namespace llaminar2::test
             ASSERT_TRUE(described);
             ASSERT_TRUE(packed);
             ASSERT_TRUE(unpacked);
+#ifdef HAVE_ROCM
+            if (device.is_rocm())
+            {
+                std::vector<GPUGraphKernelNodeInfo> nodes;
+                std::string error;
+                ASSERT_TRUE(graph->inspectKernelNodes(nodes, &error)) << error;
+                const auto unpack_node = std::find_if(nodes.begin(), nodes.end(), [](const auto &node) {
+                    return node.name.find("unpack_rebalance_collective_payloads_kernel") != std::string::npos;
+                });
+                ASSERT_NE(unpack_node, nodes.end());
+                const auto cus = rocmHardwareMetadata().at(device.ordinal).compute_units;
+                EXPECT_GE(cus * unpack_node->max_active_blocks_per_sm, 1u);
+                EXPECT_EQ(unpack_node->grid_x, 1u) << "The captured plan admits only one distinct arrival";
+                EXPECT_EQ(unpack_node->grid_y, 1u);
+                EXPECT_EQ(unpack_node->grid_z, 1u);
+                EXPECT_EQ(std::count_if(nodes.begin(), nodes.end(), [](const auto &node) {
+                    return node.name.find("unpack_rebalance_collective_payloads_kernel") != std::string::npos;
+                }), 1);
+            }
+#endif
             ASSERT_TRUE(graph->instantiate());
 
+            const auto replay_empty_arrival_wave = [&] {
+                DeviceMoERebalanceApplyStatus reset{};
+                DeviceMoERebalanceCommandBufferHeader empty;
+                empty.participant_count = 2u;
+                empty.command_capacity = 1u;
+                const std::array source_commands{empty, empty};
+                empty.participant_id = 1u;
+                ASSERT_NO_FATAL_FAILURE(upload(status.get(), &reset, sizeof(reset)));
+                ASSERT_NO_FATAL_FAILURE(upload(header.get(), source_commands.data(), sizeof(source_commands)));
+                ASSERT_NO_FATAL_FAILURE(upload(destination_header.get(), &empty, sizeof(empty)));
+                ASSERT_TRUE(graph->launch());
+                std::uint32_t live = std::numeric_limits<std::uint32_t>::max();
+                DeviceMoERebalanceApplyStatus actual;
+                ASSERT_NO_FATAL_FAILURE(download(&live, arrival_scratch.get(), sizeof(live)));
+                ASSERT_NO_FATAL_FAILURE(download(&actual, status.get(), sizeof(actual)));
+                EXPECT_EQ(live, 0u);
+                EXPECT_EQ(actual.copied_arrivals, 0u);
+                EXPECT_EQ(actual.copied_payload_bytes, 0u);
+            };
+            ASSERT_NO_FATAL_FAILURE(replay_empty_arrival_wave());
             uint32_t epoch = 0;
             for (const auto &specs : formats)
             {
@@ -466,6 +510,7 @@ namespace llaminar2::test
                 DeviceMoEExpertDirectoryEntry after_stale;
                 ASSERT_NO_FATAL_FAILURE(download(&after_stale, destination_entry, sizeof(after_stale)));
                 EXPECT_EQ(std::memcmp(&after_stale, &observed, sizeof(observed)), 0);
+                ASSERT_NO_FATAL_FAILURE(replay_empty_arrival_wave());
             }
         }
     }

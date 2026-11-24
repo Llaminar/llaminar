@@ -50,6 +50,7 @@
 #include "kernels/rocm/moe/ROCmMoEWaveReduction.h"
 #include "kernels/rocm/moe/ROCmRouterQ8Prefill.h"
 #include "backends/rocm/ROCmHardwareMetadata.h"
+#include "ROCmLiveArrivalGrid.h"
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_bfloat16.h>
@@ -11351,9 +11352,23 @@ namespace
         (void)rebalance_pack_expert_to_payload(src, payload_data);
     }
 
+#include "kernels/common/DeviceMoERebalanceArrivalIndices.inl"
+
+    /** @brief Publish the compact live command list before HIP's fixed-grid node consumes it. */
+    __global__ void plan_rebalance_collective_payload_unpack_kernel(
+        const DeviceMoERebalancePlanEntryView *plan_entries, const uint32_t *plan_count, uint32_t plan_capacity,
+        const DeviceMoERebalanceCommandBufferHeaderView *command_header, uint32_t local_payload_slot_count,
+        uint32_t local_transfer_slot_count, DeviceMoERebalanceConfigView config,
+        DeviceMoERebalanceApplyStatusView *status, llaminar2::DeviceMoERebalanceArrivalScratch *scratch,
+        uint32_t command_buffer_count)
+    {
+        rebalance_collect_local_arrival_indices(plan_entries, plan_count, plan_capacity, command_header,
+            local_payload_slot_count, local_transfer_slot_count, config, status, scratch, command_buffer_count);
+    }
+
+    /** @brief Transfer every live arrival exactly once; the native grid is admitted from active hardware. */
     __global__ __launch_bounds__(256, 2) void unpack_rebalance_collective_payloads_kernel(
         const DeviceMoERebalancePlanEntryView *plan_entries,
-        const uint32_t *plan_count,
         uint32_t plan_capacity,
         const DeviceMoERebalanceCommandBufferHeaderView *command_header,
         const uint8_t *gathered_payload,
@@ -11363,249 +11378,137 @@ namespace
         uint32_t local_transfer_slot_count,
         DeviceMoERebalanceConfigView config,
         DeviceMoERebalanceApplyStatusView *status,
-        DeviceMoERebalanceGraphControllerStateView *controller_state,
-        uint32_t command_buffer_count)
+        const llaminar2::DeviceMoERebalanceArrivalScratch *scratch)
     {
-        const uint32_t command_wave_index =
-            status->transaction_wave_index;
-        if (command_wave_index >=
-            rebalance_command_buffer_count(command_buffer_count))
-        {
+        const auto count = scratch->live_count;
+        if (blockIdx.x >= count)
             return;
-        }
-        if (plan_entries)
-            plan_entries += static_cast<unsigned long long>(command_wave_index) * plan_capacity;
-        if (plan_count)
-            plan_count += command_wave_index;
-        if (command_header)
-            command_header += command_wave_index;
-
-        if (!status || !plan_entries || (!plan_count && !command_header) ||
-            !gathered_payload || !local_transfer_slots ||
-            plan_capacity == 0u ||
-            payload_slot_bytes <= sizeof(DeviceMoEExpertDirectoryEntryView))
-            return;
-
-        const uint32_t count = rebalance_command_count(plan_count, plan_capacity, command_header);
-
-        if (blockIdx.x == 0)
+        const auto wave = status->transaction_wave_index;
+        plan_entries += static_cast<uint64_t>(wave) * plan_capacity;
+        if (command_header) command_header += wave;
+        const auto *arrival_indices = reinterpret_cast<const uint32_t *>(scratch + 1) + local_transfer_slot_count;
+        __shared__ uint32_t shared_arrival_valid;
+        for (uint32_t arrival = blockIdx.x; arrival < count; arrival += gridDim.x)
         {
+            const auto &plan = plan_entries[arrival_indices[arrival]];
+            const uint32_t destination_slot = plan.destination_slot;
+            const unsigned long long gathered_slot =
+                (static_cast<unsigned long long>(plan.source_participant) *
+                     static_cast<unsigned long long>(local_payload_slot_count) +
+                 static_cast<unsigned long long>(plan.payload_slot));
+            const uint8_t *payload_slot = gathered_payload + gathered_slot * payload_slot_bytes;
+            const auto &src =
+                *reinterpret_cast<const DeviceMoEExpertDirectoryEntryView *>(payload_slot);
+            const unsigned long long payload_data_bytes =
+                payload_slot_bytes - sizeof(DeviceMoEExpertDirectoryEntryView);
+            auto &dst = local_transfer_slots[destination_slot];
+
             if (threadIdx.x == 0)
             {
-                atomicAdd(&status->plan_entries_seen, count);
-                status->local_transfer_slot_count =
-                    local_transfer_slot_count;
-            }
-            for (uint32_t plan_index = threadIdx.x;
-                 plan_index < count;
-                 plan_index += blockDim.x)
-            {
-                const auto &plan = plan_entries[plan_index];
-                if (plan.op == 0u)
-                    continue;
-                if (!rebalance_plan_applies_runtime(plan.op) ||
-                    plan.layer >= config.num_layers ||
-                    plan.expert >= config.num_experts ||
-                    plan.source_participant >= config.participant_count ||
-                    plan.destination_participant >= config.participant_count)
+                shared_arrival_valid = 1u;
+                const auto family = rebalance_layer_slot_range(config, plan.layer, local_transfer_slot_count);
+                const bool lease_matches =
+                    destination_slot >= family.first && destination_slot < family.end &&
+                    plan.destination_generation != 0xffffffffu &&
+                    dst.generation == plan.destination_generation &&
+                    dst.layer == plan.destination_previous_layer &&
+                    dst.expert == plan.destination_previous_expert &&
+                    rebalance_transfer_slot_identity_ok(
+                        dst,
+                        destination_slot,
+                        config);
+                if (!lease_matches)
                 {
-                    atomicAdd(&status->invalid_plan_entries, 1u);
-                    continue;
+                    shared_arrival_valid = 0u;
+                    atomicAdd(&status->descriptor_mismatches, 1u);
                 }
-
-                /*
-                 * ResidentExpertAssignment is already fully represented by
-                 * command metadata. It must reach the apply kernel, but this
-                 * byte-unpack phase has no payload work to validate or copy.
-                 */
-                if (!rebalance_plan_requires_payload(plan.op))
-                    continue;
-
-                if ((plan.source_resident_mask &
-                     runtime_participant_bit(static_cast<int>(plan.source_participant))) == 0u)
+                else if (!rebalance_source_entry_ready(
+                             src,
+                             plan.source_participant,
+                             plan.layer,
+                             plan.expert))
                 {
-                    atomicAdd(&status->invalid_plan_entries, 1u);
-                    continue;
+                    shared_arrival_valid = 0u;
+                    atomicAdd(&status->missing_source_descriptors, 1u);
                 }
-                if (plan.destination_participant != config.participant_id)
+                else if (!rebalance_directory_fits_transfer_capacity(src, dst) ||
+                         rebalance_expert_payload_bytes(src) > payload_data_bytes)
                 {
-                    atomicAdd(&status->skipped_wrong_destination, 1u);
-                    continue;
-                }
-                if (plan.destination_slot >= local_transfer_slot_count)
-                {
-                    atomicAdd(&status->missing_destination_slots, 1u);
-                    if (atomicCAS(
-                            &status->first_missing_destination_layer,
-                            kDeviceMoEInvalidSlot,
-                            plan.layer) == kDeviceMoEInvalidSlot)
-                    {
-                        status->first_missing_destination_slot =
-                            plan.destination_slot;
-                        status->first_missing_destination_expert =
-                            plan.expert;
-                        status->first_missing_destination_source =
-                            plan.source_participant;
-                    }
-                    continue;
-                }
-                if (plan.payload_slot >= local_payload_slot_count)
-                {
-                    atomicAdd(&status->invalid_plan_entries, 1u);
-                    continue;
+                    shared_arrival_valid = 0u;
+                    atomicAdd(&status->descriptor_mismatches, 1u);
                 }
             }
-            return;
-        }
+            __syncthreads();
+            const bool valid = shared_arrival_valid != 0u;
+            __syncthreads();
+            if (!valid)
+                continue;
 
-        const uint32_t destination_slot = blockIdx.x - 1u;
-        if (destination_slot >= local_transfer_slot_count)
-            return;
-
-        __shared__ uint32_t shared_plan_index;
-        if (threadIdx.x == 0)
-            shared_plan_index = kDeviceMoEInvalidSlot;
-        __syncthreads();
-
-        for (uint32_t plan_index = threadIdx.x;
-             plan_index < count;
-             plan_index += blockDim.x)
-        {
-            const auto &plan = plan_entries[plan_index];
-            if (plan.op != 0u &&
-                rebalance_plan_requires_payload(plan.op) &&
-                plan.layer < config.num_layers &&
-                plan.expert < config.num_experts &&
-                plan.source_participant < config.participant_count &&
-                (plan.source_resident_mask &
-                 runtime_participant_bit(static_cast<int>(plan.source_participant))) != 0u &&
-                plan.destination_participant == config.participant_id &&
-                plan.destination_slot == destination_slot &&
-                plan.payload_slot < local_payload_slot_count)
-            {
-                atomicMin(&shared_plan_index, plan_index);
-            }
-        }
-        __syncthreads();
-        if (shared_plan_index == kDeviceMoEInvalidSlot)
-            return;
-
-        const auto &plan = plan_entries[shared_plan_index];
-
-        const unsigned long long gathered_slot =
-            (static_cast<unsigned long long>(plan.source_participant) *
-                 static_cast<unsigned long long>(local_payload_slot_count) +
-             static_cast<unsigned long long>(plan.payload_slot));
-        const uint8_t *payload_slot = gathered_payload + gathered_slot * payload_slot_bytes;
-        const auto &src =
-            *reinterpret_cast<const DeviceMoEExpertDirectoryEntryView *>(payload_slot);
-        const unsigned long long payload_data_bytes =
-            payload_slot_bytes - sizeof(DeviceMoEExpertDirectoryEntryView);
-        auto &dst = local_transfer_slots[destination_slot];
-
-        __shared__ uint32_t shared_arrival_valid;
-        if (threadIdx.x == 0)
-        {
-            shared_arrival_valid = 1u;
-            const auto family = rebalance_layer_slot_range(config, plan.layer, local_transfer_slot_count);
-            const bool lease_matches =
-                destination_slot >= family.first && destination_slot < family.end &&
-                plan.destination_generation != 0xffffffffu &&
-                dst.generation == plan.destination_generation &&
-                dst.layer == plan.destination_previous_layer &&
-                dst.expert == plan.destination_previous_expert &&
-                rebalance_transfer_slot_identity_ok(
-                    dst,
-                    destination_slot,
-                    config);
-            if (!lease_matches)
-            {
-                shared_arrival_valid = 0u;
-                atomicAdd(&status->descriptor_mismatches, 1u);
-            }
-            else if (!rebalance_source_entry_ready(
-                         src,
-                         plan.source_participant,
-                         plan.layer,
-                         plan.expert))
-            {
-                shared_arrival_valid = 0u;
-                atomicAdd(&status->missing_source_descriptors, 1u);
-            }
-            else if (!rebalance_directory_fits_transfer_capacity(src, dst) ||
-                     rebalance_expert_payload_bytes(src) > payload_data_bytes)
-            {
-                shared_arrival_valid = 0u;
-                atomicAdd(&status->descriptor_mismatches, 1u);
-            }
-        }
-        __syncthreads();
-        if (shared_arrival_valid == 0u)
-            return;
-
-        /*
-         * A rejected source or stale lease must leave the prior publication
-         * untouched. Clear logical occupancy only after every validation has
-         * succeeded.
-         */
-        if (threadIdx.x == 0)
-        {
-            dst.layer = kDeviceMoEInvalidSlot;
-            dst.expert = kDeviceMoEInvalidSlot;
-            dst.descriptor.logical_expert_id = -1;
-            dst.resident_mask &= ~runtime_participant_bit(static_cast<int>(config.participant_id));
-            dst.flags &= ~(kDeviceMoEDirectoryFlagResident |
-                           kDeviceMoEDirectoryFlagCopyComplete);
-        }
-        __syncthreads();
-
-        if (threadIdx.x == 0)
-            rebalance_retarget_transfer_directory(dst, src);
-        __syncthreads();
-
-        unsigned long long offset = 0ULL;
-        const uint8_t *payload_data = payload_slot + sizeof(DeviceMoEExpertDirectoryEntryView);
-        offset = rebalance_unpack_expert_from_payload(payload_data, dst);
-        (void)offset;
-        __syncthreads();
-        __threadfence();
-        __syncthreads();
-
-        if (threadIdx.x == 0)
-        {
-            dst.layer = plan.layer;
-            dst.expert = plan.expert;
-            dst.descriptor.logical_expert_id = static_cast<int32_t>(plan.expert);
             /*
-             * The transfer directory and the runtime bank are two publications
-             * of the same physical slot.  An ownership-transfer arrival changes
-             * the authoritative participant as soon as the destination bytes
-             * are installed.  Publishing the source's old owner here while the
-             * apply kernel published the destination owner left those views
-             * permanently incoherent: capacity accounting still saw a live
-             * transfer-backed expert, but a later destination-slot lease
-             * rejected the directory entry because its owner disagreed with the
-             * runtime descriptor.
-             *
-             * Payload-only replication deliberately preserves the source owner.
-             * F fragments retain joint ownership: the directory's physical
-             * destination participant is never a scalar logical expert owner.
-             * Both cases are derived from the immutable plan so no host mirror
-             * or post-apply repair is involved.
+             * A rejected source or stale lease must leave the prior publication
+             * untouched. Clear logical occupancy only after every validation has
+             * succeeded.
              */
-            dst.descriptor.owner_participant =
-                src.descriptor.projection_set == llaminar2::DeviceMoEProjectionSet::IntermediateShard
-                    ? -1 : plan.op == kDeviceMoERebalancePlanOwnershipTransfer
-                    ? static_cast<int32_t>(plan.destination_participant)
-                    : src.descriptor.owner_participant;
-            dst.descriptor.flags |= kDeviceMoEFlagTransferSlot;
-            dst.resident_mask |= runtime_participant_bit(static_cast<int>(config.participant_id));
-            dst.epoch = command_header ? command_header->epoch : 0u;
-            dst.generation = plan.destination_generation + 1u;
-            dst.flags |= kDeviceMoEDirectoryFlagResident |
-                         kDeviceMoEDirectoryFlagCopyComplete;
-            atomicAdd(&status->copied_arrivals, 1u);
-            atomicAdd(reinterpret_cast<unsigned long long *>(&status->copied_payload_bytes), offset);
+            if (threadIdx.x == 0)
+            {
+                dst.layer = kDeviceMoEInvalidSlot;
+                dst.expert = kDeviceMoEInvalidSlot;
+                dst.descriptor.logical_expert_id = -1;
+                dst.resident_mask &= ~runtime_participant_bit(static_cast<int>(config.participant_id));
+                dst.flags &= ~(kDeviceMoEDirectoryFlagResident |
+                               kDeviceMoEDirectoryFlagCopyComplete);
+            }
+            __syncthreads();
+
+            if (threadIdx.x == 0)
+                rebalance_retarget_transfer_directory(dst, src);
+            __syncthreads();
+
+            unsigned long long offset = 0ULL;
+            const uint8_t *payload_data = payload_slot + sizeof(DeviceMoEExpertDirectoryEntryView);
+            offset = rebalance_unpack_expert_from_payload(payload_data, dst);
+            (void)offset;
+            __syncthreads();
+            __threadfence();
+            __syncthreads();
+
+            if (threadIdx.x == 0)
+            {
+                dst.layer = plan.layer;
+                dst.expert = plan.expert;
+                dst.descriptor.logical_expert_id = static_cast<int32_t>(plan.expert);
+                /*
+                 * The transfer directory and the runtime bank are two publications
+                 * of the same physical slot.  An ownership-transfer arrival changes
+                 * the authoritative participant as soon as the destination bytes
+                 * are installed.  Publishing the source's old owner here while the
+                 * apply kernel published the destination owner left those views
+                 * permanently incoherent: capacity accounting still saw a live
+                 * transfer-backed expert, but a later destination-slot lease
+                 * rejected the directory entry because its owner disagreed with the
+                 * runtime descriptor.
+                 *
+                 * Payload-only replication deliberately preserves the source owner.
+                 * F fragments retain joint ownership: the directory's physical
+                 * destination participant is never a scalar logical expert owner.
+                 * Both cases are derived from the immutable plan so no host mirror
+                 * or post-apply repair is involved.
+                 */
+                dst.descriptor.owner_participant =
+                    src.descriptor.projection_set == llaminar2::DeviceMoEProjectionSet::IntermediateShard
+                        ? -1 : plan.op == kDeviceMoERebalancePlanOwnershipTransfer
+                        ? static_cast<int32_t>(plan.destination_participant)
+                        : src.descriptor.owner_participant;
+                dst.descriptor.flags |= kDeviceMoEFlagTransferSlot;
+                dst.resident_mask |= runtime_participant_bit(static_cast<int>(config.participant_id));
+                dst.epoch = command_header ? command_header->epoch : 0u;
+                dst.generation = plan.destination_generation + 1u;
+                dst.flags |= kDeviceMoEDirectoryFlagResident |
+                             kDeviceMoEDirectoryFlagCopyComplete;
+                atomicAdd(&status->copied_arrivals, 1u);
+                atomicAdd(reinterpret_cast<unsigned long long *>(&status->copied_payload_bytes), offset);
+            }
+            __syncthreads();
         }
     }
 
@@ -19450,51 +19353,61 @@ bool hipMoE_unpack_rebalance_collective_payloads(
     unsigned long long payload_slot_bytes,
     void *local_transfer_slots,
     uint32_t local_transfer_slot_count,
-        const void *config,
-        void *status,
-        void *controller_state,
-        uint32_t command_buffer_count,
-        int device_idx,
-        void *stream)
+    const void *config,
+    void *status,
+    void *arrival_scratch,
+    uint32_t command_buffer_count,
+    int device_idx,
+    void *stream)
 {
-    if (!plan_entries || (!plan_count && !command_header) ||
-        !gathered_payload || !local_transfer_slots || !config || !status ||
-        !stream || plan_capacity == 0u || local_payload_slot_count == 0u ||
+    if (!plan_entries || (!plan_count && !command_header) || !gathered_payload || !local_transfer_slots ||
+        !config || !status || !arrival_scratch || !stream || plan_capacity == 0u ||
+        local_payload_slot_count == 0u || local_transfer_slot_count == 0u ||
         payload_slot_bytes <= sizeof(DeviceMoEExpertDirectoryEntryView))
         return false;
 
     llaminar2::HipDeviceGuard::setDevice(device_idx);
-    (void)hipGetLastError();
-
-    const auto cfg = *static_cast<const DeviceMoERebalanceConfigView *>(config);
-    if (local_transfer_slot_count == 0xffffffffu)
-        return false;
-    const uint32_t unpack_block_count = local_transfer_slot_count + 1u;
-    // Deliberately preserve the status initialized by the matching pack call.
-    // Pack and unpack are two halves of one transfer wave and both must
-    // contribute counters to the same status record.
-    hipLaunchKernelGGL(unpack_rebalance_collective_payloads_kernel,
-        dim3(unpack_block_count), dim3(256), 0, static_cast<hipStream_t>(stream),
-        static_cast<const DeviceMoERebalancePlanEntryView *>(plan_entries),
-        plan_count,
-        plan_capacity,
-        const_cast<DeviceMoERebalanceCommandBufferHeaderView *>(
-            static_cast<const DeviceMoERebalanceCommandBufferHeaderView *>(command_header)),
-        static_cast<const uint8_t *>(gathered_payload),
-        local_payload_slot_count,
-        payload_slot_bytes,
-        static_cast<DeviceMoEExpertDirectoryEntryView *>(local_transfer_slots),
-            local_transfer_slot_count,
-            cfg,
-            static_cast<DeviceMoERebalanceApplyStatusView *>(status),
-            static_cast<DeviceMoERebalanceGraphControllerStateView *>(controller_state),
-            command_buffer_count);
-
-    hipError_t err = hipGetLastError();
-    if (err != hipSuccess)
+    const auto &hardware = llaminar2::rocmHardwareMetadata().at(device_idx);
+    int occupancy = 0;
+    if (const auto error = hipOccupancyMaxActiveBlocksPerMultiprocessor(&occupancy,
+            unpack_rebalance_collective_payloads_kernel, llaminar2::ROCmLiveArrivalGrid::threads, 0);
+        error != hipSuccess)
     {
-        fprintf(stderr, "HIP MoE unpack_rebalance_collective_payloads kernel launch failed: %s\n",
-                hipGetErrorString(err));
+        fprintf(stderr, "HIP MoE unpack occupancy admission on device %d failed: %s\n", device_idx, hipGetErrorString(error));
+        return false;
+    }
+    const auto hardware_grid = llaminar2::ROCmLiveArrivalGrid::admit(
+        {.active_cus = hardware.compute_units, .blocks_per_cu = occupancy},
+        {.plan_entries = plan_capacity, .destination_slots = local_transfer_slot_count});
+    if (!hardware_grid)
+    {
+        fprintf(stderr, "HIP MoE unpack has no resident grid on device %d: active CUs=%d, blocks/CU=%d\n",
+            device_idx, hardware.compute_units, occupancy);
+        return false;
+    }
+    const auto cfg = *static_cast<const DeviceMoERebalanceConfigView *>(config);
+    auto *scratch = static_cast<llaminar2::DeviceMoERebalanceArrivalScratch *>(arrival_scratch);
+    const auto native_stream = static_cast<hipStream_t>(stream);
+    hipLaunchKernelGGL(plan_rebalance_collective_payload_unpack_kernel,
+        dim3(1), dim3(llaminar2::ROCmLiveArrivalGrid::threads), 0, native_stream,
+        static_cast<const DeviceMoERebalancePlanEntryView *>(plan_entries), plan_count, plan_capacity,
+        static_cast<const DeviceMoERebalanceCommandBufferHeaderView *>(command_header), local_payload_slot_count,
+        local_transfer_slot_count, cfg, static_cast<DeviceMoERebalanceApplyStatusView *>(status), scratch, command_buffer_count);
+    if (const auto error = hipGetLastError(); error != hipSuccess)
+    {
+        fprintf(stderr, "HIP MoE live-arrival planning failed: %s\n", hipGetErrorString(error));
+        return false;
+    }
+    hipLaunchKernelGGL(unpack_rebalance_collective_payloads_kernel,
+        dim3(hardware_grid->blocks()), dim3(llaminar2::ROCmLiveArrivalGrid::threads), 0, native_stream,
+        static_cast<const DeviceMoERebalancePlanEntryView *>(plan_entries), plan_capacity,
+        static_cast<const DeviceMoERebalanceCommandBufferHeaderView *>(command_header),
+        static_cast<const uint8_t *>(gathered_payload), local_payload_slot_count, payload_slot_bytes,
+        static_cast<DeviceMoEExpertDirectoryEntryView *>(local_transfer_slots), local_transfer_slot_count, cfg,
+        static_cast<DeviceMoERebalanceApplyStatusView *>(status), scratch);
+    if (const auto error = hipGetLastError(); error != hipSuccess)
+    {
+        fprintf(stderr, "HIP MoE unpack_rebalance_collective_payloads kernel launch failed: %s\n", hipGetErrorString(error));
         return false;
     }
     return true;

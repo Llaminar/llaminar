@@ -18,6 +18,7 @@
  * - Snapshot info generation
  */
 
+#include "kernels/rocm/moe/ROCmLiveArrivalGrid.h"
 #include <gtest/gtest.h>
 #include <algorithm>
 #include <cmath>
@@ -954,6 +955,27 @@ TEST_F(ComputeStagesTest, MoEDeviceRebalanceHistogramLayoutMatchesTransferAdmiss
     ASSERT_NE(gathered, nullptr);
     EXPECT_EQ(local->size_bytes, 9u * sizeof(uint32_t));
     EXPECT_EQ(gathered->size_bytes, 27u * sizeof(uint32_t));
+}
+
+/** @brief Admission bounds HIP work by hardware, commands and distinct destination slots. */
+TEST_F(ComputeStagesTest, ROCmLiveArrivalGridUsesActiveHardwareBound)
+{
+    const ROCmLiveArrivalGrid::Hardware hardware{.active_cus = 64, .blocks_per_cu = 2};
+    for (const auto &[capacity, expected] : std::array{
+            std::pair{ROCmLiveArrivalGrid::ArrivalCapacity{4u, 256u}, 4u},
+            std::pair{ROCmLiveArrivalGrid::ArrivalCapacity{256u, 5u}, 5u},
+            std::pair{ROCmLiveArrivalGrid::ArrivalCapacity{256u, 384u}, 128u},
+            std::pair{ROCmLiveArrivalGrid::ArrivalCapacity{0u, 384u}, 0u},
+            std::pair{ROCmLiveArrivalGrid::ArrivalCapacity{256u, 0u}, 0u}})
+    {
+        const auto grid = ROCmLiveArrivalGrid::admit(hardware, capacity);
+        ASSERT_TRUE(grid);
+        EXPECT_EQ(grid->blocks(), expected);
+    }
+    EXPECT_FALSE(ROCmLiveArrivalGrid::admit({0, 1}, {4u, 4u}));
+    EXPECT_FALSE(ROCmLiveArrivalGrid::admit({17, 0}, {4u, 4u}));
+    EXPECT_FALSE(ROCmLiveArrivalGrid::admit({std::numeric_limits<int>::max(), 2},
+        {std::numeric_limits<uint32_t>::max(), std::numeric_limits<uint32_t>::max()}));
 }
 
 /** @brief Scheduling windows must not change the runtime-domain allocation. */
