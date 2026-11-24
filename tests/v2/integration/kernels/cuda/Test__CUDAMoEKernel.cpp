@@ -9383,7 +9383,7 @@ TEST_F(Test__CUDAMoEKernel, DeviceRebalanceControllerPlansMissingReplicaArrivals
 }
 
 TEST_F(Test__CUDAMoEKernel,
-       DeviceRebalanceDeferredPlannerUsesScratchAndPlansCapacityReleasingOwnershipTransfers)
+       DeviceRebalanceDeferredPlannerHonorsOddFamilyStrideAndSaturation)
 {
 #ifndef HAVE_CUDA
     GTEST_SKIP() << "CUDA support not compiled";
@@ -9394,7 +9394,7 @@ TEST_F(Test__CUDAMoEKernel,
     using llaminar2::DeviceMoERuntimeTable;
     DeviceMoERuntimeTable::Config table_config;
     table_config.device_id = llaminar2::DeviceId::cuda(0);
-    table_config.num_layers = 1;
+    table_config.num_layers = 2;
     table_config.num_experts = 4;
     table_config.top_k = 2;
     table_config.mirror_to_device = true;
@@ -9405,7 +9405,8 @@ TEST_F(Test__CUDAMoEKernel,
     ASSERT_TRUE(runtime_table.flipActiveBank(0, update.epoch, stream_));
 
     llaminar2::DeviceMoERebalanceConfig config;
-    config.num_layers = 1;
+    config.num_layers = 2;
+    config.layer_wave_count = 1;
     config.num_experts = 4;
     config.top_k = 2;
     config.participant_id = 0;
@@ -9416,29 +9417,40 @@ TEST_F(Test__CUDAMoEKernel,
     config.dynamic_max_plan_entries_per_wave = 2;
     config.min_wave_spread_improvement_per_payload_slot = 30;
     config.active_transfer_slot_capacity = 1;
-    config.transfer_slot_directory_capacity = 1;
+    config.transfer_slot_directory_capacity = 2;
     config.flags = 0;
     config.flags |= static_cast<uint32_t>(llaminar2::DeviceMoERebalanceFlags::HotReplicaCache);
     config.flags |= static_cast<uint32_t>(llaminar2::DeviceMoERebalanceFlags::PlanMissingArrivals);
     config.flags |= static_cast<uint32_t>(llaminar2::DeviceMoERebalanceFlags::CollectLoadStats);
     config.flags |= static_cast<uint32_t>(llaminar2::DeviceMoERebalanceFlags::DeferRuntimeApply);
 
-    std::vector<uint64_t> gathered(static_cast<size_t>(config.participant_count) *
-                                       config.num_layers * config.num_experts,
-                                   0);
-    gathered[0] = llaminar2::moe_rebalance_policy::packCollectedState(
-        70, 1, /*physically_resident=*/true, /*transfer_backed=*/false);
-    gathered[1] = llaminar2::moe_rebalance_policy::packCollectedState(
-        30, 0, /*physically_resident=*/true, /*transfer_backed=*/true);
-    gathered[config.num_experts] =
-        llaminar2::moe_rebalance_policy::packCollectedState(
-            0, 1, /*physically_resident=*/false, /*transfer_backed=*/false);
-    gathered[config.num_experts + 2] =
-        llaminar2::moe_rebalance_policy::packCollectedState(
-            1, 0, /*physically_resident=*/true, /*transfer_backed=*/false);
-    gathered[config.num_experts + 3] =
-        llaminar2::moe_rebalance_policy::packCollectedState(
-            9, 0, /*physically_resident=*/true, /*transfer_backed=*/true);
+    using llaminar2::moe_rebalance_abi::HistogramLayout;
+    config.histogram_layout = HistogramLayout::TransferFamilyOccupancy;
+    constexpr std::array ranges{llaminar2::DeviceMoETransferSlotRange{0u, 2u, 1u},
+                                llaminar2::DeviceMoETransferSlotRange{0u, 2u, 1u}};
+    llaminar2::DeviceMoETransferSlotRange *d_ranges = nullptr;
+    ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&d_ranges), sizeof(ranges)), cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(d_ranges, ranges.data(), sizeof(ranges), cudaMemcpyHostToDevice, stream_), cudaSuccess);
+    config.transfer_slot_layer_ranges = d_ranges;
+
+    // Two participants, one live layer: participant 1 begins at an odd word.
+    // The second layer shares the same family but is outside this replay wave.
+    constexpr std::size_t words_per_participant = 9;
+    std::array<uint32_t, 2 * words_per_participant> gathered{};
+    const auto setEvidence = [&](std::size_t participant, std::size_t expert,
+                                 uint32_t count, bool resident, bool transfer_backed) {
+        const uint64_t evidence = llaminar2::moe_rebalance_policy::packCollectedState(
+            count, /*active_transfer_slots=*/0, resident, transfer_backed);
+        const auto first = participant * words_per_participant + 2u * expert;
+        gathered[first] = static_cast<uint32_t>(evidence);
+        gathered[first + 1u] = static_cast<uint32_t>(evidence >> 32u);
+    };
+    setEvidence(0, 0, 70, true, false);
+    setEvidence(0, 1, 30, true, true);
+    setEvidence(1, 2, 1, true, false);
+    setEvidence(1, 3, 9, true, true);
+    gathered[words_per_participant - 1u] = 1u;
+    gathered.back() = 1u;
 
     uint64_t *d_gathered = nullptr;
     llaminar2::DeviceMoERebalanceStatus *d_status = nullptr;
@@ -9450,7 +9462,7 @@ TEST_F(Test__CUDAMoEKernel,
     llaminar2::DeviceMoEPlacementBank *d_placement_plan_scratch = nullptr;
     const auto controller_state = makeControllerDueOnNextBoundary(config);
     ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&d_gathered),
-                         gathered.size() * sizeof(uint64_t)),
+                         sizeof(gathered)),
               cudaSuccess);
     ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&d_status),
                          sizeof(llaminar2::DeviceMoERebalanceStatus)),
@@ -9474,7 +9486,7 @@ TEST_F(Test__CUDAMoEKernel,
                          sizeof(llaminar2::DeviceMoEPlacementBank)),
               cudaSuccess);
     ASSERT_EQ(cudaMemcpyAsync(d_gathered, gathered.data(),
-                              gathered.size() * sizeof(uint64_t),
+                              sizeof(gathered),
                               cudaMemcpyHostToDevice, stream_),
               cudaSuccess);
     ASSERT_EQ(cudaMemcpyAsync(d_controller_state,
@@ -9491,24 +9503,30 @@ TEST_F(Test__CUDAMoEKernel,
                          cudaMemcpyDeviceToHost),
               cudaSuccess);
 
-    ASSERT_TRUE(cuda_kernel_->runDeviceRebalanceController(
-        launchContext(),
-        runtime_table.deviceLayerState(0),
-        d_gathered,
-        d_status,
-        config,
-        d_plan,
-        d_plan_count,
-        2,
-        1,
-        d_command_header,
-        d_wave_state,
-        d_controller_state,
-        1u,
-        nullptr,
-        0u,
-        nullptr,
-        d_placement_plan_scratch));
+    const llaminar2::DeviceMoERebalanceWaveState initial_wave{.participant_count = 2u};
+    const auto runPlanner = [&] {
+        if (cudaMemcpyAsync(d_wave_state, &initial_wave, sizeof(initial_wave), cudaMemcpyHostToDevice, stream_) != cudaSuccess)
+            return false;
+        return cuda_kernel_->runDeviceRebalanceController(
+            launchContext(),
+            runtime_table.deviceLayerState(0),
+            d_gathered,
+            d_status,
+            config,
+            d_plan,
+            d_plan_count,
+            2,
+            1,
+            d_command_header,
+            d_wave_state,
+            d_controller_state,
+            1u,
+            nullptr,
+            0u,
+            nullptr,
+            d_placement_plan_scratch);
+    };
+    ASSERT_TRUE(runPlanner());
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
 
     llaminar2::DeviceMoERebalanceStatus status;
@@ -9603,6 +9621,20 @@ TEST_F(Test__CUDAMoEKernel,
         0)
         << "deferred planning must never use either durable RCU bank as speculative scratch";
 
+    // Move participant 1's existing family claim to the other layer.
+    // Whole-family occupancy is still one; this layer no longer releases it.
+    setEvidence(1, 3, 9, true, false);
+    ASSERT_EQ(cudaMemcpyAsync(d_gathered, gathered.data(), sizeof(gathered), cudaMemcpyHostToDevice, stream_), cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(d_controller_state, &controller_state, sizeof(controller_state), cudaMemcpyHostToDevice, stream_), cudaSuccess);
+    ASSERT_TRUE(runPlanner());
+    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+    ASSERT_EQ(cudaMemcpy(&status, d_status, sizeof(status), cudaMemcpyDeviceToHost), cudaSuccess);
+    ASSERT_EQ(cudaMemcpy(&plan_count, d_plan_count, sizeof(plan_count), cudaMemcpyDeviceToHost), cudaSuccess);
+    EXPECT_EQ(status.pre_policy_load_total, 110u);
+    EXPECT_GT(status.dynamic_ownership_swap_rejections, 0u);
+    EXPECT_EQ(plan_count, 0u) << "A saturated family cannot accept a swap that does not free its existing claim";
+
+    cudaFree(d_ranges);
     cudaFree(d_gathered);
     cudaFree(d_status);
     cudaFree(d_plan);

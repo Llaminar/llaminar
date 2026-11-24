@@ -47,10 +47,12 @@ namespace llaminar2::moe_rebalance_abi
 #if defined(__CUDACC__) || defined(__HIPCC__)
     __host__ __device__
 #endif
-    /** @return Layout selected by the graph's immutable transfer range binding. */
-    constexpr HistogramLayout histogramLayout(const DeviceMoETransferSlotRange *ranges) noexcept
+    /** @return Whether the typed wire layout has exactly its required immutable family metadata. */
+    constexpr bool histogramLayoutMatchesRanges(
+        HistogramLayout layout, const DeviceMoETransferSlotRange *ranges) noexcept
     {
-        return ranges ? HistogramLayout::TransferFamilyOccupancy : HistogramLayout::ResidentOnly;
+        return ranges ? layout == HistogramLayout::TransferFamilyOccupancy
+                      : layout == HistogramLayout::ResidentOnly;
     }
 
     /** Native record identity shared by the host controller and minimal GPU views. */
@@ -70,7 +72,8 @@ namespace llaminar2::moe_rebalance_abi
     // Existing live-field offsets and the 64-byte command extent are unchanged.
     // v18 appends the completed native decision receipt to the original controller.
     // v19 binds immutable slot ranges and exact per-layer occupancy evidence.
-    inline constexpr uint32_t kVersion = 19u;
+    // v20 assigns the config padding word to the explicit histogram layout.
+    inline constexpr uint32_t kVersion = 20u;
 
     /**
      * @brief Exact byte size of one device-owned rebalance command.
@@ -106,6 +109,8 @@ namespace llaminar2::moe_rebalance_abi
      * exactly the same ABI order.
      */
     inline constexpr uint32_t kConfigBytes = 152u;
+    /** Explicit histogram layout occupies the former padding before the range pointer. */
+    inline constexpr uint32_t kConfigHistogramLayoutOffset = 140u;
 
     /**
      * @brief Exact byte size of DeviceMoERebalanceStatus and device views.

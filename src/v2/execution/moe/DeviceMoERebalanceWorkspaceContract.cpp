@@ -167,11 +167,17 @@ namespace llaminar2
         return static_cast<std::size_t>(std::max<std::uint32_t>(1u, wave_count));
     }
 
+    bool DeviceMoERebalanceWorkspaceCapacity::matchesHistogramConfig(
+        const DeviceMoERebalanceConfig &config) const noexcept
+    {
+        return config.histogram_layout == deviceMoERebalanceHistogramLayout(transfer_mode) &&
+               moe_rebalance_abi::histogramLayoutMatchesRanges(config.histogram_layout, config.transfer_slot_layer_ranges);
+    }
+
     std::size_t DeviceMoERebalanceWorkspaceCapacity::localHistogramWords() const noexcept
     {
-        const auto layout = usesTransferSlots() ? moe_rebalance_abi::HistogramLayout::TransferFamilyOccupancy
-                                               : moe_rebalance_abi::HistogramLayout::ResidentOnly;
-        return moe_rebalance_abi::histogramWords(layout, histogramLayerCount(), num_experts);
+        return moe_rebalance_abi::histogramWords(deviceMoERebalanceHistogramLayout(transfer_mode),
+            histogramLayerCount(), num_experts);
     }
 
     std::size_t

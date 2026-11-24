@@ -713,12 +713,15 @@ namespace
         uint32_t transfer_slot_directory_capacity;
         uint32_t initial_maintenance_period_tokens;
         uint32_t maintenance_period_tokens;
+        llaminar2::moe_rebalance_abi::HistogramLayout histogram_layout;
         const llaminar2::DeviceMoETransferSlotRange *transfer_slot_layer_ranges;
     };
     static_assert(
         sizeof(DeviceMoERebalanceConfigView) ==
             llaminar2::moe_rebalance_abi::kConfigBytes,
         "CUDA rebalance config ABI must match the shared host/device record");
+    static_assert(offsetof(DeviceMoERebalanceConfigView, histogram_layout) ==
+        llaminar2::moe_rebalance_abi::kConfigHistogramLayoutOffset);
 
     struct DeviceMoERebalanceStatusView
     {
@@ -1636,7 +1639,7 @@ namespace
         uint32_t expert)
     {
         namespace abi = llaminar2::moe_rebalance_abi;
-        const auto layout = abi::histogramLayout(config.transfer_slot_layer_ranges);
+        const auto layout = config.histogram_layout;
         const uint64_t expert_index = uint64_t{wave_layer} * config.num_experts + expert;
         if (layout == abi::HistogramLayout::ResidentOnly)
             return histograms[uint64_t{participant} * rebalance_layer_wave_count(config) * config.num_experts + expert_index];
@@ -1654,7 +1657,7 @@ namespace
         namespace abi = llaminar2::moe_rebalance_abi;
         const uint32_t layers = rebalance_layer_wave_count(config);
         const auto *words = reinterpret_cast<const uint32_t *>(histograms);
-        const uint64_t offset = participant * abi::histogramWords(abi::HistogramLayout::TransferFamilyOccupancy,
+        const uint64_t offset = participant * abi::histogramWords(config.histogram_layout,
             layers, config.num_experts) + 2u * uint64_t{layers} * config.num_experts + wave_layer;
         return words[offset];
     }
@@ -7351,7 +7354,7 @@ namespace
                 rebalance_actual_layer_for_wave_index(config, selected_wave_state, wave_layer);
             const DeviceMoELayerRuntimeView &runtime = runtime_layers[layer];
             unsigned long long value = 0ULL;
-            if (config.transfer_slot_layer_ranges && expert == 0u)
+            if (config.histogram_layout == llaminar2::moe_rebalance_abi::HistogramLayout::TransferFamilyOccupancy && expert == 0u)
             {
                 auto *words = reinterpret_cast<uint32_t *>(local_histograms);
                 words[2u * uint64_t{total} + wave_layer] =
@@ -7383,7 +7386,7 @@ namespace
                     bank.experts[expert].owner_participant ==
                     static_cast<int32_t>(config.participant_id);
                 const uint32_t active_transfer_slots =
-                    (!config.transfer_slot_layer_ranges && idx == 0u)
+                    (config.histogram_layout == llaminar2::moe_rebalance_abi::HistogramLayout::ResidentOnly && idx == 0u)
                         ? rebalance_active_transfer_slot_expert_count(
                               runtime_layers, config, layer)
                         : 0u;

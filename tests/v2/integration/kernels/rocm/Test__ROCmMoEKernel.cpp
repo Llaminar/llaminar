@@ -7545,7 +7545,7 @@ TEST(Test__ROCmMoEKernel, DeviceRebalanceControllerPlansMissingReplicaArrivals)
 }
 
 TEST(Test__ROCmMoEKernel,
-     DeviceRebalanceDeferredPlannerUsesScratchAndPlansCapacityReleasingOwnershipTransfers)
+     DeviceRebalanceDeferredPlannerHonorsOddFamilyStrideAndSaturation)
 {
     SKIP_IF_NO_ROCM();
 
@@ -7556,7 +7556,7 @@ TEST(Test__ROCmMoEKernel,
 
     DeviceMoERuntimeTable::Config table_config;
     table_config.device_id = device;
-    table_config.num_layers = 1;
+    table_config.num_layers = 2;
     table_config.num_experts = 4;
     table_config.top_k = 2;
     table_config.mirror_to_device = true;
@@ -7567,7 +7567,8 @@ TEST(Test__ROCmMoEKernel,
     ASSERT_TRUE(runtime_table.flipActiveBank(0, update.epoch, stream));
 
     DeviceMoERebalanceConfig config;
-    config.num_layers = 1;
+    config.num_layers = 2;
+    config.layer_wave_count = 1;
     config.num_experts = 4;
     config.top_k = 2;
     config.participant_id = 0;
@@ -7578,29 +7579,40 @@ TEST(Test__ROCmMoEKernel,
     config.dynamic_max_plan_entries_per_wave = 2;
     config.min_wave_spread_improvement_per_payload_slot = 30;
     config.active_transfer_slot_capacity = 1;
-    config.transfer_slot_directory_capacity = 1;
+    config.transfer_slot_directory_capacity = 2;
     config.flags = 0;
     config.flags |= static_cast<uint32_t>(DeviceMoERebalanceFlags::HotReplicaCache);
     config.flags |= static_cast<uint32_t>(DeviceMoERebalanceFlags::PlanMissingArrivals);
     config.flags |= static_cast<uint32_t>(DeviceMoERebalanceFlags::CollectLoadStats);
     config.flags |= static_cast<uint32_t>(DeviceMoERebalanceFlags::DeferRuntimeApply);
 
-    std::vector<uint64_t> gathered(static_cast<size_t>(config.participant_count) *
-                                       config.num_layers * config.num_experts,
-                                   0);
-    gathered[0] = moe_rebalance_policy::packCollectedState(
-        70, 1, /*physically_resident=*/true, /*transfer_backed=*/false);
-    gathered[1] = moe_rebalance_policy::packCollectedState(
-        30, 0, /*physically_resident=*/true, /*transfer_backed=*/true);
-    gathered[config.num_experts] =
-        moe_rebalance_policy::packCollectedState(
-            0, 1, /*physically_resident=*/false, /*transfer_backed=*/false);
-    gathered[config.num_experts + 2] =
-        moe_rebalance_policy::packCollectedState(
-            1, 0, /*physically_resident=*/true, /*transfer_backed=*/false);
-    gathered[config.num_experts + 3] =
-        moe_rebalance_policy::packCollectedState(
-            9, 0, /*physically_resident=*/true, /*transfer_backed=*/true);
+    using moe_rebalance_abi::HistogramLayout;
+    config.histogram_layout = HistogramLayout::TransferFamilyOccupancy;
+    constexpr std::array ranges{DeviceMoETransferSlotRange{0u, 2u, 1u},
+                                DeviceMoETransferSlotRange{0u, 2u, 1u}};
+    DeviceMoETransferSlotRange *d_ranges = nullptr;
+    ASSERT_EQ(hipMalloc(reinterpret_cast<void **>(&d_ranges), sizeof(ranges)), hipSuccess);
+    ASSERT_EQ(hipMemcpyAsync(d_ranges, ranges.data(), sizeof(ranges), hipMemcpyHostToDevice, stream), hipSuccess);
+    config.transfer_slot_layer_ranges = d_ranges;
+
+    // Two participants, one live layer: participant 1 begins at an odd word.
+    // The second layer shares the same family but is outside this replay wave.
+    constexpr std::size_t words_per_participant = 9;
+    std::array<uint32_t, 2 * words_per_participant> gathered{};
+    const auto setEvidence = [&](std::size_t participant, std::size_t expert,
+                                 uint32_t count, bool resident, bool transfer_backed) {
+        const uint64_t evidence = moe_rebalance_policy::packCollectedState(
+            count, /*active_transfer_slots=*/0, resident, transfer_backed);
+        const auto first = participant * words_per_participant + 2u * expert;
+        gathered[first] = static_cast<uint32_t>(evidence);
+        gathered[first + 1u] = static_cast<uint32_t>(evidence >> 32u);
+    };
+    setEvidence(0, 0, 70, true, false);
+    setEvidence(0, 1, 30, true, true);
+    setEvidence(1, 2, 1, true, false);
+    setEvidence(1, 3, 9, true, true);
+    gathered[words_per_participant - 1u] = 1u;
+    gathered.back() = 1u;
 
     uint64_t *d_gathered = nullptr;
     DeviceMoERebalanceStatus *d_status = nullptr;
@@ -7612,7 +7624,7 @@ TEST(Test__ROCmMoEKernel,
     DeviceMoEPlacementBank *d_placement_plan_scratch = nullptr;
     const auto controller_state = makeControllerDueOnNextBoundary(config);
     ASSERT_EQ(hipMalloc(reinterpret_cast<void **>(&d_gathered),
-                        gathered.size() * sizeof(uint64_t)),
+                        sizeof(gathered)),
               hipSuccess);
     ASSERT_EQ(hipMalloc(reinterpret_cast<void **>(&d_status),
                         sizeof(DeviceMoERebalanceStatus)),
@@ -7636,7 +7648,7 @@ TEST(Test__ROCmMoEKernel,
                         sizeof(DeviceMoEPlacementBank)),
               hipSuccess);
     ASSERT_EQ(hipMemcpyAsync(d_gathered, gathered.data(),
-                             gathered.size() * sizeof(uint64_t),
+                             sizeof(gathered),
                              hipMemcpyHostToDevice, stream),
               hipSuccess);
     ASSERT_EQ(hipMemcpyAsync(d_controller_state,
@@ -7655,24 +7667,30 @@ TEST(Test__ROCmMoEKernel,
                         hipMemcpyDeviceToHost),
               hipSuccess);
 
-    ASSERT_TRUE(gpu_kernel.runDeviceRebalanceController(
-        moeLaunchContext(stream),
-        runtime_table.deviceLayerState(0),
-        d_gathered,
-        d_status,
-        config,
-        d_plan,
-        d_plan_count,
-        2,
-        1,
-        d_command_header,
-        d_wave_state,
-        d_controller_state,
-        1u,
-        nullptr,
-        0u,
-        nullptr,
-        d_placement_plan_scratch));
+    const DeviceMoERebalanceWaveState initial_wave{.participant_count = 2u};
+    const auto runPlanner = [&] {
+        if (hipMemcpyAsync(d_wave_state, &initial_wave, sizeof(initial_wave), hipMemcpyHostToDevice, stream) != hipSuccess)
+            return false;
+        return gpu_kernel.runDeviceRebalanceController(
+            moeLaunchContext(stream),
+            runtime_table.deviceLayerState(0),
+            d_gathered,
+            d_status,
+            config,
+            d_plan,
+            d_plan_count,
+            2,
+            1,
+            d_command_header,
+            d_wave_state,
+            d_controller_state,
+            1u,
+            nullptr,
+            0u,
+            nullptr,
+            d_placement_plan_scratch);
+    };
+    ASSERT_TRUE(runPlanner());
     ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 
     DeviceMoERebalanceStatus status;
@@ -7767,6 +7785,20 @@ TEST(Test__ROCmMoEKernel,
         0)
         << "deferred planning must never use either durable RCU bank as speculative scratch";
 
+    // Move participant 1's existing family claim to the other layer.
+    // Whole-family occupancy is still one; this layer no longer releases it.
+    setEvidence(1, 3, 9, true, false);
+    ASSERT_EQ(hipMemcpyAsync(d_gathered, gathered.data(), sizeof(gathered), hipMemcpyHostToDevice, stream), hipSuccess);
+    ASSERT_EQ(hipMemcpyAsync(d_controller_state, &controller_state, sizeof(controller_state), hipMemcpyHostToDevice, stream), hipSuccess);
+    ASSERT_TRUE(runPlanner());
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+    ASSERT_EQ(hipMemcpy(&status, d_status, sizeof(status), hipMemcpyDeviceToHost), hipSuccess);
+    ASSERT_EQ(hipMemcpy(&plan_count, d_plan_count, sizeof(plan_count), hipMemcpyDeviceToHost), hipSuccess);
+    EXPECT_EQ(status.pre_policy_load_total, 110u);
+    EXPECT_GT(status.dynamic_ownership_swap_rejections, 0u);
+    EXPECT_EQ(plan_count, 0u) << "A saturated family cannot accept a swap that does not free its existing claim";
+
+    hipFree(d_ranges);
     EXPECT_EQ(hipFree(d_gathered), hipSuccess);
     EXPECT_EQ(hipFree(d_status), hipSuccess);
     EXPECT_EQ(hipFree(d_plan), hipSuccess);

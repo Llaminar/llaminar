@@ -6770,8 +6770,9 @@ namespace llaminar2
              * never enter graph-driver memory admission.
              */
             const size_t device_generation_dynamic_fragment_capacity =
-                resolveMTPRetainedDeviceGenerationFragmentCapacity(
-                    mtp_max_draft_depth_);
+                std::max(resolveMTPRetainedDeviceGenerationFragmentCapacity(mtp_max_draft_depth_),
+                    2u * static_cast<std::size_t>(mtp_max_draft_depth_) + 8u +
+                        DeviceMoERebalanceCadenceRecipe::fragment_count);
             mtp_device_generation_loop_fragment_scratch_.clear();
             mtp_device_generation_loop_fragment_scratch_.reserve(
                 device_generation_dynamic_fragment_capacity);
@@ -13769,62 +13770,11 @@ namespace llaminar2
             // The first production maintenance transaction owns source capture.
             return true;
         }
-        if (!cache.cadence_boundary_publication_capture ||
-            !cache.cadence_boundary_acknowledgement_capture)
-        {
-            if (error)
-                *error = "native cadence parent has incomplete source fragments";
+        const auto recipe = nativeMoERebalanceCadenceRecipe(error);
+        if (!recipe)
             return false;
-        }
-
-        std::string template_error;
-        const auto maintenance = cache.segment_cache.deviceLoopGraphTemplate(
-            *cache.graph,
-            &template_error);
-        if (!maintenance || !maintenance->capture)
-        {
-            if (error)
-                *error = "maintenance graph cannot be composed: " +
-                         template_error;
-            return false;
-        }
-        std::string controller_error;
-        const DeviceMoERebalanceGraphControllerState *const controller =
-            deviceMoERebalanceControllerStateDevice(&controller_error);
-        if (!controller)
-        {
-            if (error)
-                *error = "cadence composition has no controller: " +
-                         controller_error;
-            return false;
-        }
-        const auto *const due = reinterpret_cast<const uint32_t *>(
-            reinterpret_cast<const std::byte *>(controller) +
-            offsetof(
-                DeviceMoERebalanceGraphControllerState,
-                maintenance_due));
-        const std::array<DeviceControlledLoopFragment, 3> fragments = {{
-            {
-                .name = "decode boundary publication",
-                .capture =
-                    cache.cadence_boundary_publication_capture.get(),
-            },
-            {
-                .name = "conditional device MoE maintenance",
-                .capture = maintenance->capture,
-                .execution =
-                    DeviceControlledLoopFragmentExecution::
-                        IfDeviceWordNonZero,
-                .condition_word_device = due,
-            },
-            {
-                .name = "decode boundary acknowledgement",
-                .capture =
-                    cache.cadence_boundary_acknowledgement_capture.get(),
-            },
-        }};
         if (!cache.cadence_transaction_capture
-                 ->buildDeviceControlledTransaction(fragments) ||
+                 ->buildDeviceControlledTransaction(recipe->fragments()) ||
             !cache.cadence_transaction_capture->instantiate() ||
             !cache.cadence_transaction_capture->hasExecutable())
         {
@@ -13841,13 +13791,39 @@ namespace llaminar2
             state_.device_id.toString(),
             {{"backend",
               cache.cadence_transaction_capture->backendName()},
-             {"fragments", "3"},
+             {"fragments", std::to_string(recipe->fragments().size())},
              {"conditional_fragments", "1"},
              {"maintenance_nodes",
-              std::to_string(maintenance->captured_node_count)},
+              std::to_string(recipe->fragments()[1].capture->nodeCount())},
              {"workspace_generation",
               std::to_string(cache.workspace_generation)}});
         return true;
+    }
+
+    std::optional<DeviceMoERebalanceCadenceRecipe>
+    DeviceGraphOrchestrator::nativeMoERebalanceCadenceRecipe(std::string *error)
+    {
+        const auto reject = [&](const std::string &message) -> std::optional<DeviceMoERebalanceCadenceRecipe> {
+            if (error) *error = message;
+            return std::nullopt;
+        };
+        const auto &cache = device_moe_rebalance_maintenance_graph_;
+        if (error) error->clear();
+        if (deviceMoERebalanceMaintenanceExecutionPolicy() !=
+                DeviceMoERebalanceMaintenanceExecutionPolicy::NativeConditionalGraph ||
+            !cache.cadence_transaction_capability_checked || !cache.graph ||
+            cache.workspace_generation != workspaceGeneration(state_.device_id) ||
+            !cache.cadence_boundary_publication_capture || !cache.cadence_boundary_acknowledgement_capture)
+            return reject("native MoE cadence has no current admitted source family");
+        std::string detail;
+        const auto maintenance = cache.segment_cache.deviceLoopGraphTemplate(*cache.graph, &detail);
+        if (!maintenance || !maintenance->capture)
+            return reject("maintenance graph cannot be composed: " + detail);
+        const auto *controller = deviceMoERebalanceControllerStateDevice(&detail);
+        if (!controller)
+            return reject("cadence composition has no controller: " + detail);
+        return DeviceMoERebalanceCadenceRecipe(*cache.cadence_boundary_publication_capture,
+            *maintenance->capture, *cache.cadence_boundary_acknowledgement_capture, &controller->maintenance_due);
     }
 
     bool DeviceGraphOrchestrator::maybeRunDeviceMoERebalanceMaintenanceGraph(
@@ -24138,7 +24114,9 @@ namespace llaminar2
                     ? 2u
                     : 0u;
             return common_fragment_count + stochastic_fragment_count +
-                   (include_device_moe_maintenance ? 1u : 0u) +
+                   (include_device_moe_maintenance
+                       ? (hosted_execution ? 1u : DeviceMoERebalanceCadenceRecipe::fragment_count)
+                       : 0u) +
                    (include_overlay_epoch_boundaries
                         ? 2u
                         : 0u);
@@ -24688,7 +24666,16 @@ namespace llaminar2
              * before starting the next body; it does not reuse native body
              * ordering with a predicate sampled one transaction earlier.
              */
-            if (include_device_moe_maintenance)
+            if (include_device_moe_maintenance && !hosted_execution)
+            {
+                const auto cadence = nativeMoERebalanceCadenceRecipe(&fragment_error);
+                if (!cadence)
+                    return fail(fragment_error);
+                const auto &fragments = cadence->fragments();
+                mtp_device_generation_loop_fragment_scratch_.insert(
+                    mtp_device_generation_loop_fragment_scratch_.end(), fragments.begin(), fragments.end());
+            }
+            else if (include_device_moe_maintenance)
             {
                 const auto &maintenance =
                     device_moe_rebalance_maintenance_graph_;

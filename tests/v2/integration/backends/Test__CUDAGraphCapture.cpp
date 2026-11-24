@@ -23,6 +23,7 @@
 #include "backends/IWorkerGPUContext.h"
 #include "backends/IGPUGraphCapture.h"
 #include "backends/cuda/CUDAGraphCapture.h"
+#include "execution/moe/DeviceMoERebalanceCadenceRecipe.h"
 #include "backends/BackendManager.h"
 #include "MTPTerminalScratchCaptureProof.h"
 #include "MTPMainForwardReadRetirementProof.h"
@@ -74,6 +75,63 @@ TEST_F(Test__CUDAGraphCapture, StreamMembershipCycleRetiresAcyclicCapture)
     auto* backend=getCUDABackend();
     ASSERT_NE(backend,nullptr);
     ctx().submitAndWait([&]{test::proveNativeCaptureStreamReentry(ctx(),*backend,DeviceId::cuda(0));});
+}
+
+/** @test The original cadence sources compose directly inside the follower WHILE, not as a nested conditional child. */
+TEST_F(Test__CUDAGraphCapture, FollowerCadenceUsesOriginalSourcesInNativeWhile)
+{
+    ctx().submitAndWait([&] {
+        auto stream = static_cast<cudaStream_t>(ctx().defaultStream());
+        uint32_t *words = nullptr;
+        ASSERT_EQ(cudaMalloc(&words, 6u * sizeof(uint32_t)), cudaSuccess);
+        std::unique_ptr<uint32_t, decltype(&cudaFree)> storage(words, cudaFree);
+        auto publish = ctx().createGraphCapture(stream);
+        auto maintenance = ctx().createGraphCapture(stream);
+        auto ack = ctx().createGraphCapture(stream);
+        auto complete = ctx().createGraphCapture(stream);
+        const auto record = [&](IGPUGraphCapture &source, const auto &operations) {
+            ASSERT_TRUE(source.beginCapture());
+            operations();
+            ASSERT_TRUE(source.endCapture());
+        };
+        ASSERT_NO_FATAL_FAILURE(record(*publish, [&] {
+            ASSERT_EQ(cudaMemsetAsync(words + 3, 0x12, sizeof(uint32_t), stream), cudaSuccess);
+        }));
+        ASSERT_NO_FATAL_FAILURE(record(*maintenance, [&] {
+            ASSERT_EQ(cudaMemcpyAsync(words + 4, words + 3, sizeof(uint32_t), cudaMemcpyDeviceToDevice, stream), cudaSuccess);
+        }));
+        ASSERT_NO_FATAL_FAILURE(record(*ack, [&] {
+            ASSERT_EQ(cudaMemcpyAsync(words + 5, words + 4, sizeof(uint32_t), cudaMemcpyDeviceToDevice, stream), cudaSuccess);
+        }));
+        ASSERT_NO_FATAL_FAILURE(record(*complete, [&] {
+            ASSERT_EQ(cudaMemcpyAsync(words + 1, words + 3, sizeof(uint32_t), cudaMemcpyDeviceToDevice, stream), cudaSuccess);
+        }));
+        const DeviceMoERebalanceCadenceRecipe recipe(*publish, *maintenance, *ack, words + 2);
+        const DeviceControlledLoopPredicate predicate{reinterpret_cast<int *>(words), 3, 1, 0, 1};
+        auto legacy = ctx().createGraphCapture(stream);
+        ASSERT_TRUE(legacy->buildDeviceControlledTransaction(recipe.fragments()));
+        ASSERT_TRUE(legacy->instantiate());
+        auto follower = ctx().createGraphCapture(stream);
+        const std::array rejected{DeviceControlledLoopFragment{.name = "legacy cadence child", .capture = legacy.get()}};
+        EXPECT_FALSE(follower->buildDeviceControlledWhileLoop({.iteration = rejected}, predicate));
+
+        std::vector body(recipe.fragments().begin(), recipe.fragments().end());
+        body.push_back({.name = "terminal pipeline command", .capture = complete.get()});
+        ASSERT_TRUE(follower->buildDeviceControlledWhileLoop({.iteration = body}, predicate));
+        ASSERT_TRUE(follower->instantiate());
+        for (uint32_t due : {1u, 0u, 1u, 0u})
+        {
+            std::array<uint32_t, 6> observed{1u, 0u, due, 0u, 0u, 0u};
+            ASSERT_EQ(cudaMemcpyAsync(words, observed.data(), sizeof(observed), cudaMemcpyHostToDevice, stream), cudaSuccess);
+            ASSERT_TRUE(follower->launch());
+            ASSERT_EQ(cudaMemcpyAsync(observed.data(), words, sizeof(observed), cudaMemcpyDeviceToHost, stream), cudaSuccess);
+            ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+            EXPECT_EQ(observed[1], 0x12121212u);
+            EXPECT_EQ(observed[3], 0x12121212u);
+            EXPECT_EQ(observed[4], due ? 0x12121212u : 0u);
+            EXPECT_EQ(observed[5], observed[4]);
+        }
+    });
 }
 
 /** @test Complete retained imports coexist with in-place local recording fragments. */

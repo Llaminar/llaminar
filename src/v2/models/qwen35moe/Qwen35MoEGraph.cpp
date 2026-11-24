@@ -6786,6 +6786,8 @@ namespace llaminar2
             rebalance_config.active_transfer_slot_capacity = transfer_directory->activeSlotCount();
             rebalance_config.transfer_slot_directory_capacity = transfer_directory->slotCount();
             rebalance_config.transfer_slot_layer_ranges = transfer_directory->deviceLayerRanges();
+            rebalance_config.histogram_layout =
+                deviceMoERebalanceHistogramLayout(graph_rebalance_transfer_mode.value());
 
             const std::string rebalance_workspace = graphRebalanceWorkspaceName();
             /*
@@ -6889,6 +6891,7 @@ namespace llaminar2
             invocation_config.transfer_slot_directory_capacity =
                 binding->config.transfer_slot_directory_capacity;
             invocation_config.transfer_slot_layer_ranges = binding->config.transfer_slot_layer_ranges;
+            invocation_config.histogram_layout = binding->config.histogram_layout;
             if (deviceMoERebalanceModePlansMissingArrivals(
                     binding->transfer_mode))
             {
@@ -6988,18 +6991,12 @@ namespace llaminar2
                 return sidebands;
             }
 
-            const uint32_t window_count =
-                binding.config.layer_window_count == 0u
-                    ? binding.config.num_layers
-                    : std::min(binding.config.layer_window_count,
-                               binding.config.num_layers);
-            const uint32_t wave_count =
-                binding.config.layer_wave_count == 0u
-                    ? window_count
-                    : std::min(binding.config.layer_wave_count, window_count);
-            const size_t local_histogram_words = moe_rebalance_abi::histogramWords(
-                moe_rebalance_abi::histogramLayout(binding.config.transfer_slot_layer_ranges),
-                std::max(1u, wave_count), binding.config.num_experts);
+            const auto capacity = DeviceMoERebalanceWorkspaceCapacity::fromRuntime(binding.config,
+                binding.local_transfer_slot_count, binding.collective_payload_slot_capacity,
+                DeviceMoERebalanceStagePhase::CollectState, binding.transfer_mode);
+            if (!capacity.matchesHistogramConfig(binding.config))
+                throw std::logic_error("Qwen35 MoE histogram sideband layout does not match the admitted transport");
+            const size_t local_histogram_words = capacity.localHistogramWords();
             if (local_histogram_words == 0u)
                 return sidebands;
 
@@ -7346,6 +7343,8 @@ namespace llaminar2
                     rebalance_config.active_transfer_slot_capacity = transfer_directory->activeSlotCount();
                     rebalance_config.transfer_slot_directory_capacity = transfer_directory->slotCount();
                     rebalance_config.transfer_slot_layer_ranges = transfer_directory->deviceLayerRanges();
+                    rebalance_config.histogram_layout =
+                        deviceMoERebalanceHistogramLayout(graph_rebalance_transfer_mode.value());
                     local_transfer_slots = transfer_directory->deviceEntries();
                     local_transfer_slot_count = transfer_directory->slotCount();
                     collective_payload_slot_capacity =

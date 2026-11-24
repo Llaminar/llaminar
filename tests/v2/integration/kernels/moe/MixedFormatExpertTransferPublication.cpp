@@ -68,6 +68,7 @@ namespace llaminar2::test
             config.active_transfer_slot_capacity = 900u;
             config.transfer_slot_directory_capacity = 903u;
             config.transfer_slot_layer_ranges = device_ranges.as<DeviceMoETransferSlotRange>();
+            config.histogram_layout = moe_rebalance_abi::HistogramLayout::TransferFamilyOccupancy;
             auto &context = GPUDeviceContextPool::instance().getContext(device);
             auto graph = context.createGraphCapture(stream);
             ASSERT_NE(graph, nullptr);
@@ -184,6 +185,7 @@ namespace llaminar2::test
             auto destination_config = source_config;
             destination_config.participant_id = 1u;
             destination_config.transfer_slot_layer_ranges = directory->deviceLayerRanges();
+            destination_config.histogram_layout = moe_rebalance_abi::HistogramLayout::TransferFamilyOccupancy;
             const size_t payload_bytes = sizeof(DeviceMoEExpertDirectoryEntry) + directory->wirePayloadBytes();
             DeviceAllocation source_weights(backend, device.ordinal, source_bytes);
             DeviceAllocation source_runtime(backend, device.ordinal, formats.size() * sizeof(DeviceMoELayerRuntime));
