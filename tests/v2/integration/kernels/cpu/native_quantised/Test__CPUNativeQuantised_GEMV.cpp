@@ -3061,7 +3061,14 @@ namespace
             EXPECT_TRUE(
                 record.tags.at("route") == "row_chunk_grid" ||
                 record.tags.at("route") == "two_row_n_major" ||
-                record.tags.at("route") == "two_row_pair_grid");
+                record.tags.at("route") == "two_row_pair_grid" ||
+                record.tags.at("route") == "packed_panel");
+            if (record.tags.at("route") == "packed_panel")
+            {
+                EXPECT_EQ(record.tags.at("requested_policy"), "Auto");
+                EXPECT_EQ(record.tags.at("task_grid"), "n_strip_all_rows");
+                EXPECT_GE(std::stoi(record.tags.at("m")), x86_panel::min_rows);
+            }
             EXPECT_GT(std::stoi(record.tags.at("parallel_tasks")), 0);
             if (record.tags.at("route") == "two_row_pair_grid")
                 EXPECT_EQ(record.tags.at("row_tile"), "2");
@@ -3872,6 +3879,7 @@ namespace
         uint64_t kpart_launches = 0;
         uint64_t pairwise_launches = 0;
         uint64_t wide_rows_launches = 0;
+        uint64_t packed_panel_launches = 0;
         for (const auto &record : records)
         {
             if (record.domain != "kernel" ||
@@ -3880,10 +3888,19 @@ namespace
             {
                 continue;
             }
-            EXPECT_EQ(
-                record.tags.at("route"),
-                "decode_equivalent_kpart_rows");
             EXPECT_GT(std::stoi(record.tags.at("k_tiles")), 1);
+            if (record.tags.at("route") == "packed_panel")
+            {
+                // Only ordinary Auto prefill may substitute an N strip and
+                // fold the same serial K partitions in its worker slot.
+                EXPECT_EQ(record.tags.at("requested_policy"), "Auto");
+                EXPECT_EQ(record.tags.at("task_grid"), "n_strip_all_rows");
+                EXPECT_EQ(record.tags.at("m"), "64");
+                packed_panel_launches += record.count;
+                kpart_launches += record.count;
+                continue;
+            }
+            EXPECT_EQ(record.tags.at("route"), "decode_equivalent_kpart_rows");
             EXPECT_TRUE(
                 record.tags.at("effective_policy") == "Pairwise" ||
                 record.tags.at("effective_policy") == "WideRows");
@@ -3898,9 +3915,8 @@ namespace
         if (activeISALevel() >= ISALevel::AVX512)
         {
             const uint64_t m2_cells = ALL_FORMATS.size();
-            EXPECT_EQ(wide_rows_launches, cells - m2_cells)
-                << "Every forceable native-AVX512 Auto cell is exhaustively "
-                   "trained to the WideRows winner";
+            EXPECT_EQ(wide_rows_launches + packed_panel_launches, cells - m2_cells)
+                << "Auto uses the packed panel for eligible formats or the existing AVX-512 WideRows route";
             EXPECT_EQ(pairwise_launches, cells + m2_cells)
                 << "The diagnostic call exercises Pairwise for every cell, and "
                    "M2 explicitly selects its unique forceable Pairwise route";
@@ -3909,8 +3925,8 @@ namespace
 #endif
         {
             EXPECT_EQ(wide_rows_launches, 0u);
-            EXPECT_EQ(pairwise_launches, cells * 2u)
-                << "Pairwise is the unique forceable AVX2 K-part schedule";
+            EXPECT_EQ(pairwise_launches + packed_panel_launches, cells * 2u)
+                << "Packed panels may replace only Auto; explicit AVX2 K-part schedules remain Pairwise";
         }
         EXPECT_EQ(
             kpart_launches,

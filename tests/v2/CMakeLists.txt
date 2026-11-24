@@ -10674,6 +10674,15 @@ add_v2_test(V2_Integration_CPUCodedQ5KIQ3SProjection
     MPI_PROCS 1 NO_MODELS)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUCodedQ5KIQ3SProjection)
 
+if(LLAMINAR_CPU_ISA_UPPER MATCHES "^AVX(2|512)$")
+    add_v2_test(V2_Integration_CPUCodedX86PackedPrefill
+        COMMAND $<TARGET_FILE:v2_unit_cpu_coded_compact_units>
+            --gtest_filter=CPUCodedCompactUnits.X86PackedPrefillKeepsSerialAndTailBytes
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;NativeQuantised;ByteExact;Regression"
+        MPI_PROCS 1 NO_MODELS NO_MPI ENVIRONMENT "OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUCodedX86PackedPrefill)
+endif()
+
 # Q6_K and IQ4_XS coded CPU units: exact file-density bytes and the coded code
 # plane plus superblock header reproduce the per-block source factors exactly.
 add_executable(v2_unit_cpu_coded_file_density_q6iq4 unit/kernels/cpu/Test__CPUCodedFileDensityQ6IQ4.cpp)

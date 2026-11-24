@@ -786,6 +786,78 @@ namespace llaminar2::test
     } // namespace
 
     /** The resident layout pays only for payload, source/staged factors and live superblock headers. */
+#if defined(__AVX2__)
+    /** @test Replay the installed x86 packed prefill route against independent serial rows. */
+    TEST(CPUCodedCompactUnits, X86PackedPrefillKeepsSerialAndTailBytes)
+    {
+        constexpr int n = 67, stride = n + 5, max_rows = 17;
+        constexpr float dirty = -12345.5f;
+        const auto exercise = [&](const TensorBase &source, int k) {
+            const int blocks = k / 32;
+            std::mt19937 rng(2323);
+            std::vector<Q8_1Block> input(max_rows * blocks);
+            for (auto &block : input)
+            {
+                block.d = static_cast<std::uint16_t>(0x2000 + rng() % 0x1000);
+                for (auto &byte : block.qs)
+                {
+                    byte = static_cast<std::int8_t>(int(rng() % 256) - 128);
+                    block.sum_qs += byte;
+                }
+            }
+            for (const auto policy : {CPUProjectionNumericalPolicy::BackendNative, CPUProjectionNumericalPolicy::GPUAlignedExpert})
+            {
+                CPUNativeQuantisedPackedWeights packed;
+                packed.numerical_policy = policy;
+                ASSERT_TRUE(packWeightsCPUNativeQuantised(&source, packed));
+                ASSERT_NE(x86_panel::formatFor(packed.encoding, packed.codebook_id), x86_panel::Format::None);
+                std::vector<float> scratch(nativeQuantisedProjectionPartialEnvelopeFloats(packed, max_rows), dirty);
+                std::vector<float> serial_scratch(nativeQuantisedProjectionPartialFloats(packed, 1));
+                std::vector<float> actual(max_rows * stride, dirty), serial(max_rows * stride, dirty);
+                const int lanes = activeISALevel() >= ISALevel::AVX512 ? 16 : 8;
+                if (nativeQuantisedInvocationWorkerCount() <= (n - 1) / lanes + 1 &&
+                    policy == CPUProjectionNumericalPolicy::BackendNative && k == 1120)
+                {
+                    EXPECT_THROW(gemm_native_quantised_preq(packed, input.data(), actual.data(), {}, max_rows, stride),
+                        std::invalid_argument);
+                    EXPECT_TRUE(std::all_of(actual.begin(), actual.end(), [dirty](float value) { return value == dirty; }));
+                }
+                for (int row = 0; row < max_rows; ++row)
+                    gemv_native_quantised_preq(packed, input.data() + row * blocks, serial.data() + row * stride, serial_scratch);
+                for (const int live : {max_rows, 0, 3, max_rows - 1, max_rows})
+                {
+                    SCOPED_TRACE(live);
+                    std::fill(actual.begin(), actual.end(), dirty);
+                    const auto work = ProjectionRowWork::fromPrefix(DeviceRowRange::deviceCounted(max_rows, &live));
+                    gemm_native_quantised_preq(packed, input.data(), actual.data(), scratch, max_rows, stride, ISAPath::AUTO,
+                        VerifierRowsPolicy::Auto, PrefillSchedulePolicy::Auto, 0, &work);
+                    for (int row = 0; row < max_rows; ++row)
+                        for (int col = 0; col < stride; ++col)
+                        {
+                            const auto expected = row < live ? serial[row * stride + col] : dirty;
+                            ASSERT_EQ(std::bit_cast<std::uint32_t>(actual[row * stride + col]), std::bit_cast<std::uint32_t>(expected))
+                                << "row=" << row << " column=" << col << " policy=" << static_cast<int>(policy);
+                        }
+                }
+            }
+        };
+        for (const int k : {1120, 4768})
+        {
+            SCOPED_TRACE(k);
+            const std::vector<std::size_t> shape{n, static_cast<std::size_t>(k)};
+            for (const auto &format : compactSources())
+                if (format.codebook == 7 || format.codebook == 11)
+                {
+                    SCOPED_TRACE(format.name);
+                    exercise(*format.make(shape, 121), k);
+                }
+            exercise(*q4KSource(shape, 321), k);
+            exercise(*Factory::createIQ4_XSRandom(shape, 789), k);
+            exercise(*Factory::createQ5_0Random(shape, 201), k);
+        }
+    }
+#endif
+
     TEST(CPUCompensationFreeUnits, PreparedBytesMatchCompensationFreeLayout)
     {
         for (const auto &source : compensationFreeSources())

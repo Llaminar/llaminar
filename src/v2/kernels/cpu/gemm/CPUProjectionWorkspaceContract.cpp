@@ -11,6 +11,7 @@
 #include "CPUNativeQuantisedTileConfig.h"
 #include "CPUNativeQuantisedEncoding.h"
 #include "CPUNativeNEONPanelWorkspace.h"
+#include "CPUNativeX86PanelWorkspace.h"
 #include "kernels/cpu/CPUInvocationWorkspace.h"
 #include <climits>
 #include <stdexcept>
@@ -69,9 +70,13 @@ namespace llaminar2
             codebook, geometry.numerical_policy, geometry.serial_n > 0 ? geometry.serial_n : geometry.n,
             geometry.k, geometry.workers, geometry.execution.cache);
         auto requirements = cpuProjectionQ8WorkspaceRequirements(geometry.rows, geometry.k);
-        const auto partials = cpuProjectionPartialWorkspaceRequirements(cpuProjectionPartialEnvelopeFloats(
-            geometry.rows, geometry.n, config.k_tiles, geometry.workers,
-            static_cast<int>(geometry.execution.maximum_native_row_tile)));
+        namespace panel = cpu::native_quantised::x86_panel;
+        const auto packed_panel = panel::workspaceFloats(panel::formatFor(footprint.encoding, codebook),
+            geometry.execution.active_isa == ISALevel::AVX512 ? 16 : 8,
+            geometry.rows, (geometry.k + 31) / 32, config.k_tiles, geometry.workers);
+        const auto ordinary = cpuProjectionPartialEnvelopeFloats(geometry.rows, geometry.n, config.k_tiles,
+            geometry.workers, static_cast<int>(geometry.execution.maximum_native_row_tile));
+        const auto partials = cpuProjectionPartialWorkspaceRequirements(std::max(ordinary, packed_panel));
         // These are distinct canonical projection names (Q8 versus partials),
         // not grouped-MoE root-layout merges. Keep this pure BOM independent of
         // the unrelated storage-layout materialization/composition machinery.

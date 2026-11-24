@@ -118,6 +118,7 @@
 
 // AVX2 GEMV/GEMM kernels (same packed weight format, uses emulated VNNI)
 #include "CPUNativeAVX2Gemv.h"
+#include "CPUNativeX86PackedPrefill.h"
 #include "kernels/cpu/gemm/CPUNativeQuantisedDecodePolicyGenerated.inc"
 #include "kernels/cpu/gemm/CPUNativeQuantisedVerifierRowsPolicyGenerated.inc"
 
@@ -691,7 +692,7 @@ namespace llaminar2::cpu::native_quantised
 
 
     /**
-     * @brief Exact ordered-partial bank for the current participant geometry.
+     * @brief Exact ordinary projection slab for the current participant geometry.
      * @param packed Immutable prepared matrix and its arithmetic policy.
      * @param rows Maximum simultaneously live rows.
      * @return Physical partial extent; worker count and logical TP width select
@@ -703,7 +704,9 @@ namespace llaminar2::cpu::native_quantised
         const int workers = nativeQuantisedInvocationWorkerCount();
         const auto config = serialTileConfigForPackedMatrix(
             packed, cpuNativeQuantisedSerialEquivalentPolicyN(packed.N), packed.K, workers);
-        return cpuProjectionPartialFloats(rows, packed.N, config.k_tiles);
+        const auto panel = x86_panel::workspaceFloats(x86_panel::formatFor(packed.encoding, packed.codebook_id),
+            activeISALevel() >= ISALevel::AVX512 ? 16 : 8, rows, packed.blocks_per_row, config.k_tiles, workers);
+        return std::max(cpuProjectionPartialFloats(rows, packed.N, config.k_tiles), panel);
     }
 
     /** @return This prepared member's contribution to the admitted serial/fused slab. */
@@ -713,8 +716,11 @@ namespace llaminar2::cpu::native_quantised
         const int workers = nativeQuantisedInvocationWorkerCount();
         const auto config = serialTileConfigForPackedMatrix(
             packed, cpuNativeQuantisedSerialEquivalentPolicyN(packed.N), packed.K, workers);
-        return cpuProjectionPartialEnvelopeFloats(rows, packed.N, config.k_tiles, workers,
-            activeISALevel() >= ISALevel::AVX512 ? 4 : 2);
+        const bool wide = activeISALevel() >= ISALevel::AVX512;
+        const auto ordinary = cpuProjectionPartialEnvelopeFloats(rows, packed.N, config.k_tiles, workers, wide ? 4 : 2);
+        const auto panel = x86_panel::workspaceFloats(x86_panel::formatFor(packed.encoding, packed.codebook_id),
+            wide ? 16 : 8, rows, packed.blocks_per_row, config.k_tiles, workers);
+        return std::max(ordinary, panel);
     }
 
     /** Return the requested N-chunk count for one explicit decode policy. */
@@ -5037,6 +5043,34 @@ namespace llaminar2::cpu::native_quantised
                 packed, policy_n, packed.K, num_threads);
         const bool use_decode_equivalent_kpart =
             nativeQuantisedUsesKPartitions(serial_cfg.k_tiles);
+
+        // A packed panel is an ordinary prefill route, not a verifier replay.
+        // Keep explicit diagnostic policies and their physical tile overrides
+        // on the original resolvers. Each worker needs at least one N strip.
+        const auto panel_format = x86_panel::formatFor(packed.encoding, packed.codebook_id);
+        const int panel_lanes = use_avx512 ? 16 : 8;
+        const auto &tile_override = debugEnv().cpu_vnni;
+        const bool use_packed_panel = isa_path == ISAPath::AUTO && (use_avx512 || use_avx2) && M >= x86_panel::min_rows &&
+            (N - 1) / panel_lanes + 1 >= num_threads &&
+            panel_format != x86_panel::Format::None && n_block_chunks_override == 0 &&
+            tile_override.n_block_chunks <= 0 && tile_override.k_tile_blocks <= 0 && tile_override.m_unroll <= 0 &&
+            schedule_override == PrefillSchedulePolicy::Auto && verifier_policy_override == VerifierRowsPolicy::Auto;
+        if (use_packed_panel)
+        {
+            const int partitions = std::max(1, serial_cfg.k_tiles);
+            if ((!omp_in_parallel() || omp_get_thread_num() == 0) && PerfStatsCollector::isDomainEnabled("kernel"))
+                PerfStatsCollector::addCounter("kernel", "cpu_native_quantised_prefill_gemm_launch", 1.0, "gemm", {},
+                    {{"m", std::to_string(M)}, {"n", std::to_string(N)}, {"policy_n", std::to_string(policy_n)},
+                     {"k", std::to_string(packed.K)}, {"codebook", std::to_string(packed.codebook_id)},
+                     {"build_isa", compiledNativeQuantisedBuildISAName()}, {"isa", use_avx512 ? "AVX512" : "AVX2"},
+                     {"route", "packed_panel"}, {"row_tile", "2"}, {"requested_policy", "Auto"},
+                     {"effective_policy", "PackedPanel"}, {"n_block_chunks", "1"}, {"task_grid", "n_strip_all_rows"},
+                     {"k_tile_blocks", std::to_string(std::min(x86_panel::depth, (K_blocks - 1) / partitions + 1))},
+                     {"k_tiles", std::to_string(partitions)}, {"parallel_tasks", std::to_string((N - 1) / panel_lanes + 1)},
+                     {"reduction_tasks", "0"}, {"threads", std::to_string(num_threads)}});
+            return x86_panel::project(packed.readView(), panel_format, A_q8_all, C, M, ldc,
+                partitions, num_threads, panel_lanes, row_grid, work, partial_storage);
+        }
 
         int n_block_chunks = cfg.n_block_chunks;
         if (n_block_chunks_override < 0)
