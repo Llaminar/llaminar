@@ -66,7 +66,7 @@ CPUNativeQuantisedPackedWeights buildTestPacked(
     packed.payload_bytes            = payload_bytes_val;
     packed.encoding = is_nibble_lut
                           ? CPUNativeQuantisedEncoding::NibbleLUT
-                          : CPUNativeQuantisedEncoding::ExpandedInt8;
+                          : CPUNativeQuantisedEncoding::SignedInt8SingleScale;
     packed.is_asymmetric            = is_asymmetric;
     packed.is_superblock            = is_superblock;
     packed.data_stride              = data_stride;
@@ -170,7 +170,6 @@ TEST(Test__PackedWeightsSerialization, CompactMultiScalePreservesEveryNativeMeta
         ASSERT_NE(native, nullptr);
         const auto &received = native->packed();
         ASSERT_TRUE(received.usesCompactMultiScale());
-        EXPECT_FALSE(received.usesInlineCompensation());
         EXPECT_EQ(received.payload_bytes, format.payload_bytes);
         ASSERT_EQ(received.native_interleaved.size(), owner.packed().native_interleaved.size());
         EXPECT_EQ(std::memcmp(received.native_interleaved.data(),
@@ -704,7 +703,7 @@ TEST(Test__PackedWeightsSerialization, MXFP4NativeUnitE8M0BytesRoundTripAndRejec
 }
 
 /** @brief Exact Q8 archives round-trip and reject the old per-block weight-sum plane, even with a current header version. */
-TEST(Test__PackedWeightsSerialization, Q8ExpandedDensityRejectsLegacyCompensationPlane)
+TEST(Test__PackedWeightsSerialization, SignedInt8SingleScaleRejectsLegacyCompensationPlane)
 {
     using llaminar2::test::TestTensorFactory;
     for (bool superblock : {false, true})
@@ -773,8 +772,9 @@ TEST(Test__PackedWeightsSerialization, V9PublishesAllCanonicalCPUSources)
         EXPECT_EQ(view.codebook_id, format->codebook_id);
         EXPECT_EQ(view.is_superblock, format->is_superblock);
         EXPECT_EQ(view.encoding, preparedEncodingForSource(*format));
-        EXPECT_NE(view.encoding, CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale);
-        EXPECT_FALSE(view.usesInlineCompensation());
+        EXPECT_NE(static_cast<uint8_t>(view.encoding), 5u);
+        if (view.usesSignedInt8SingleScale())
+            EXPECT_EQ(view.interleaved_block_stride, 64 * (32 + 2));
         const auto &original = owner.packed().native_interleaved;
         ASSERT_EQ(received->native_interleaved.size(), original.size());
         EXPECT_EQ(std::memcmp(received->native_interleaved.data(), original.data(), original.size()), 0);
@@ -794,10 +794,10 @@ TEST(Test__PackedWeightsSerialization, V9RejectsRetiredCPUPreparedLayoutsBeforeP
         std::string_view diagnostic;
     };
     const std::array cases{
-        LegacyLayout{native_quantised_formats::IQ3_S, Encoding::IQ3SExpandedSourceScale, 2432, 2432, "encoding 5 (IQ3SExpandedSourceScale) is retired"},
-        LegacyLayout{native_quantised_formats::Q4_0, Encoding::ExpandedInt8, 2304, 2304, "requires a Q8_0, Q8_1, or Q8_K source; received codebook 0"},
-        LegacyLayout{native_quantised_formats::Q8_0, Encoding::ExpandedInt8, 2304, 2304, "does not admit a Q8 inline weight-sum compensation plane"},
-        LegacyLayout{native_quantised_formats::Q8_0, Encoding::ExpandedInt8, 2176, 2304, "does not admit a Q8 inline weight-sum compensation plane"},
+        LegacyLayout{native_quantised_formats::IQ3_S, static_cast<Encoding>(5), 2432, 2432, "encoding 5 (IQ3SExpandedSourceScale) is retired"},
+        LegacyLayout{native_quantised_formats::Q4_0, Encoding::SignedInt8SingleScale, 2304, 2304, "requires a Q8_0, Q8_1, or Q8_K source; received codebook 0"},
+        LegacyLayout{native_quantised_formats::Q8_0, Encoding::SignedInt8SingleScale, 2304, 2304, "does not admit a Q8 inline weight-sum compensation plane"},
+        LegacyLayout{native_quantised_formats::Q8_0, Encoding::SignedInt8SingleScale, 2176, 2304, "does not admit a Q8 inline weight-sum compensation plane"},
     };
     for (const auto &[source, encoding, declared_stride, actual_stride, diagnostic] : cases)
     {

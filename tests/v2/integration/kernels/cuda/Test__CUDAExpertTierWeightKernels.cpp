@@ -1575,7 +1575,7 @@ namespace llaminar2
                 FormatCase{kNativeQuantisedIQ4XSSourceScaleCodebook, 16, true, true, "IQ4XS"},
                 FormatCase{5, 16, true, true, "Q4K"},
                 FormatCase{8, 24, true, true, "Q6K"},
-                FormatCase{19, 32, false, false, "ExpandedInt8"}),
+                FormatCase{19, 32, false, false, "SignedInt8SingleScale"}),
             [](const ::testing::TestParamInfo<FormatCase> &info)
             {
                 return info.param.name;
@@ -1692,7 +1692,7 @@ namespace llaminar2
             CUDAExpertTierWeightKernelsTest,
             PersistentBackgroundLaneRoundTripsWithoutBlockingSynchronization)
         {
-            const FormatCase format{19, 32, false, false, "ExpandedInt8"};
+            const FormatCase format{19, 32, false, false, "SignedInt8SingleScale"};
             const HostGpuExpertPackedProjection source =
                 makeProjection(format, 192, 256);
             cpu::native_quantised::CPUNativeQuantisedPackedWeights expected_cpu;

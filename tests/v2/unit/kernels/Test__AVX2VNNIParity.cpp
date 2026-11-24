@@ -1537,8 +1537,7 @@ TEST_F(AVX2VNNIParity, Q6KNativeDualScaleEncodingIsByteExactForAllRuntimeRows)
 
     ASSERT_TRUE(packed.usesQ6KNativeDualScale());
     EXPECT_FALSE(packed.usesNibbleLUT());
-    EXPECT_FALSE(packed.usesExpandedInt8());
-    EXPECT_FALSE(packed.usesInlineCompensation());
+    EXPECT_FALSE(packed.usesSignedInt8SingleScale());
     ASSERT_TRUE(packed.superblockCoded());
     const auto geometry = packed.readView().geometry();
     EXPECT_EQ(packed.data_stride, 64u * native_quantised_formats::Q6_K.payload_bytes);

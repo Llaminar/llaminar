@@ -29,10 +29,6 @@ namespace llaminar2
     {
         constexpr int kColumnsPerUnit = 64;
 
-        __device__ __constant__ std::int8_t kTierIQ4ValuesROCm[16] = {
-            -127, -104, -83, -65, -49, -35, -22, -10,
-            1, 13, 25, 38, 53, 69, 89, 113};
-
         __device__ __forceinline__ void initializeCpuUnitROCm(std::uint8_t *, std::uint32_t);
 
         /** @brief Transpose a compensation-free CPU unit without decoding payloads or staging scale words. */
@@ -256,90 +252,6 @@ namespace llaminar2
         }
 
         /**
-         * @brief Decode one compact value for the CPU compensation vector.
-         * @tparam Codebook Nibble execution codebook 0, 4, 5 or 25 (MXFP4).
-         * @param value Four-bit quantized value.
-         * @return Signed/unsigned decoded integer consumed by CPU VNNI.
-         */
-        template <std::uint8_t Codebook>
-        __device__ __forceinline__ int decodeNibbleForCompensationROCm(
-            std::uint8_t value)
-        {
-            if constexpr (Codebook == 0)
-                return static_cast<int>(value) - 8;
-            if constexpr (Codebook == 4)
-                return static_cast<int>(kTierIQ4ValuesROCm[value]);
-            if constexpr (Codebook == kNativeQuantisedMXFP4Codebook)
-            {
-                // Register lookup of the doubled E2M1 values (no constant-memory table).
-                constexpr auto lut = rocm::nibble_lut::words<kNativeQuantisedMXFP4Codebook>();
-                const std::uint32_t packed = value < 4u ? lut.lo_a : value < 8u ? lut.lo_b
-                    : value < 12u ? lut.hi_a : lut.hi_b;
-                return static_cast<int>(static_cast<std::int8_t>(packed >> ((value & 3u) * 8u)));
-            }
-            return static_cast<int>(value);
-        }
-
-        /**
-         * @brief Transpose separated compact nibbles into final CPU units.
-         * @tparam Codebook Nibble execution codebook.
-         * @tparam HasSecondaryMetadata Whether a raw secondary word region is present.
-         * IQ4_XS copies encoded coefficients unchanged; ordinary asymmetric
-         * formats copy their existing binary16 minima.
-         */
-        template <std::uint8_t Codebook, bool HasSecondaryMetadata>
-        __global__ void gpuToCpuNibbleUnitsROCm(
-            const std::uint8_t *__restrict__ payload,
-            const std::uint16_t *__restrict__ scales,
-            const std::uint16_t *__restrict__ mins,
-            ExpertTierWeightDeviceLayout layout,
-            std::uint32_t first_unit,
-            std::uint8_t *__restrict__ cpu_chunk)
-        {
-            const std::uint32_t global_unit = first_unit + blockIdx.x;
-            const int N=layout.N,blocks_per_row=layout.blocks_per_row;
-            const unsigned columns=expertTierWireColumns(layout,global_unit);
-            const unsigned cpu_stride=(layout.cpu_block_stride/64)*columns;
-            const int n_chunk =
-                static_cast<int>(global_unit / blocks_per_row);
-            const int kb = static_cast<int>(global_unit % blocks_per_row);
-            const int local_column = static_cast<int>(threadIdx.x);
-            std::uint8_t *unit =
-                cpu_chunk + expertTierWireOffset(layout,first_unit,blockIdx.x);
-
-            // Zero padding and metadata gaps before real columns publish bytes.
-            initializeCpuUnitROCm(unit, cpu_stride);
-            __syncthreads();
-            const int n = n_chunk * kColumnsPerUnit + local_column;
-            if (n >= N)
-                return;
-
-            const std::size_t linear =
-                static_cast<size_t>(kb+layout.gpu_first_column/32)*layout.gpu_N+n+layout.gpu_first_row;
-            const std::uint8_t *source = payload + linear * 16u;
-            int compensation = 0;
-            for (int value = 0; value < 16; ++value)
-            {
-                const std::uint8_t packed = source[value];
-                unit[interleavedValueOffsetROCm(local_column, value, columns)] = packed;
-                compensation += decodeNibbleForCompensationROCm<Codebook>(
-                    static_cast<std::uint8_t>(packed & 0x0fu));
-                compensation += decodeNibbleForCompensationROCm<Codebook>(
-                    static_cast<std::uint8_t>(packed >> 4));
-            }
-            reinterpret_cast<std::int16_t *>(unit + (1024u/64)*columns)[local_column] =
-                static_cast<std::int16_t>(compensation);
-            // CPU unit word: FP16 for 2-byte planes, BF16 power of two for E8M0 planes.
-            reinterpret_cast<std::uint16_t *>(unit + (1152u/64)*columns)[local_column] =
-                ::llaminar2::native_quantised_scale::loadStagedPrimary<Codebook>(scales, linear);
-            if constexpr (HasSecondaryMetadata)
-            {
-                reinterpret_cast<std::uint16_t *>(unit + (1280u/64)*columns)[local_column] =
-                    mins[linear];
-            }
-        }
-
-        /**
          * @brief Transpose Q6 payload and original factor words into CPU units.
          * @details Metadata is copied verbatim: original half d and two signed
          * subscales. CPU and GPU consumers share that encoding; no half conversion
@@ -403,58 +315,6 @@ namespace llaminar2
             }
             reinterpret_cast<uint16_t*>(unit+24*columns)[column]=scales[linear];
             reinterpret_cast<uint16_t*>(unit+26*columns)[column]=secondary_scales[linear];
-        }
-
-        /**
-         * @brief Deinterleave CPU compact-nibble units into separated GPU data.
-         * @tparam HasSecondaryMetadata Whether a raw secondary word region is present.
-         * IQ4_XS copies encoded coefficients unchanged; ordinary asymmetric
-         * formats copy their existing binary16 minima.
-         */
-        template <bool HasSecondaryMetadata>
-        __global__ void cpuToGpuNibbleUnitsROCm(
-            const std::uint8_t *__restrict__ cpu_chunk,
-            ExpertTierWeightDeviceLayout layout,
-            std::uint32_t first_unit,
-            std::uint8_t *__restrict__ payload,
-            std::uint16_t *__restrict__ scales,
-            std::uint16_t *__restrict__ mins)
-        {
-            const std::uint32_t global_unit = first_unit + blockIdx.x;
-            const int N=layout.N,blocks_per_row=layout.blocks_per_row;
-            const unsigned columns=expertTierWireColumns(layout,global_unit);
-            const unsigned cpu_stride=(layout.cpu_block_stride/64)*columns;
-            const int n_chunk =
-                static_cast<int>(global_unit / blocks_per_row);
-            const int kb = static_cast<int>(global_unit % blocks_per_row);
-            const int local_column = static_cast<int>(threadIdx.x);
-            const int n = n_chunk * kColumnsPerUnit + local_column;
-            if (n >= N)
-                return;
-
-            const std::uint8_t *unit =
-                cpu_chunk + expertTierWireOffset(layout,first_unit,blockIdx.x);
-            const std::size_t linear =
-                static_cast<size_t>(kb+layout.gpu_first_column/32)*layout.gpu_N+n+layout.gpu_first_row;
-            std::uint8_t *destination = payload + linear * 16u;
-            for (int value = 0; value < 16; ++value)
-            {
-                destination[value] =
-                    unit[interleavedValueOffsetROCm(local_column, value, columns)];
-            }
-            // Exact inverse of the GPU->CPU scale word; a malformed unit is fatal.
-            if (!::llaminar2::native_quantised_scale::storePrimaryFromCpuWord(
-                    layout.gpu_codebook_id, scales, linear,
-                    reinterpret_cast<const std::uint16_t *>(unit + (1152u/64)*columns)[local_column]))
-            {
-                __builtin_trap();
-                return;
-            }
-            if constexpr (HasSecondaryMetadata)
-            {
-                mins[linear] = reinterpret_cast<const std::uint16_t *>(
-                    unit + (1280u/64)*columns)[local_column];
-            }
         }
 
         /**
@@ -661,52 +521,7 @@ namespace llaminar2
                 source, {}, nullptr, device_cpu_chunk, layout, first_unit);
             return hipPeekAtLastError() == hipSuccess;
         }
-        if (layout.cpu_encoding == cpu::native_quantised::CPUNativeQuantisedEncoding::NibbleLUTSourceScale)
-        {
-            hipLaunchKernelGGL((gpuToCpuNibbleUnitsROCm<4, true>), grid, block, 0,
-                hip_stream, source.payload, source.scales, source.mins, layout, first_unit, device_cpu_chunk);
-            return hipPeekAtLastError() == hipSuccess;
-        }
-        if (layout.cpu_encoding ==
-            cpu::native_quantised::CPUNativeQuantisedEncoding::NibbleLUT)
-        {
-            if (layout.gpu_codebook_id == 0)
-            {
-                hipLaunchKernelGGL(
-                    (gpuToCpuNibbleUnitsROCm<0, false>), grid, block, 0,
-                    hip_stream, source.payload, source.scales, source.mins,
-                    layout, first_unit, device_cpu_chunk);
-            }
-            else if (layout.gpu_codebook_id == 4)
-            {
-                hipLaunchKernelGGL(
-                    (gpuToCpuNibbleUnitsROCm<4, false>), grid, block, 0,
-                    hip_stream, source.payload, source.scales, source.mins,
-                    layout, first_unit, device_cpu_chunk);
-            }
-            else if (layout.gpu_codebook_id == kNativeQuantisedMXFP4Codebook)
-            {
-                // Symmetric FP16 scale, no secondary plane; only the lookup differs from 4.
-                hipLaunchKernelGGL(
-                    (gpuToCpuNibbleUnitsROCm<kNativeQuantisedMXFP4Codebook, false>), grid, block, 0,
-                    hip_stream, source.payload, source.scales, source.mins,
-                    layout, first_unit, device_cpu_chunk);
-            }
-            else if (layout.gpu_codebook_id == 5)
-            {
-                hipLaunchKernelGGL(
-                    (gpuToCpuNibbleUnitsROCm<5, true>), grid, block, 0,
-                    hip_stream, source.payload, source.scales, source.mins,
-                    layout, first_unit, device_cpu_chunk);
-            }
-            else
-            {
-                // A nibble layout names exactly one of the decoders above; never
-                // reinterpret an unknown codebook as Q4_1 with a nonexistent min plane.
-                return false;
-            }
-        }
-        else if (layout.cpu_encoding == cpu::native_quantised::CPUNativeQuantisedEncoding::Q6KNativeDualScale)
+        if (layout.cpu_encoding == cpu::native_quantised::CPUNativeQuantisedEncoding::Q6KNativeDualScale)
         {
             hipLaunchKernelGGL(
                 gpuToCpuQ6UnitsROCm, grid, block, 0, hip_stream,
@@ -759,31 +574,7 @@ namespace llaminar2
                 {}, destination, device_cpu_chunk, nullptr, layout, first_unit);
             return hipPeekAtLastError() == hipSuccess;
         }
-        if (layout.cpu_encoding == cpu::native_quantised::CPUNativeQuantisedEncoding::NibbleLUTSourceScale)
-        {
-            hipLaunchKernelGGL((cpuToGpuNibbleUnitsROCm<true>), grid, block, 0,
-                hip_stream, device_cpu_chunk, layout, first_unit, destination.payload, destination.scales, destination.mins);
-            return hipPeekAtLastError() == hipSuccess;
-        }
-        if (layout.cpu_encoding ==
-            cpu::native_quantised::CPUNativeQuantisedEncoding::NibbleLUT)
-        {
-            if (layout.cpu_is_asymmetric != 0)
-            {
-                hipLaunchKernelGGL(
-                    (cpuToGpuNibbleUnitsROCm<true>), grid, block, 0,
-                    hip_stream, device_cpu_chunk, layout, first_unit, destination.payload,
-                    destination.scales, destination.mins);
-            }
-            else
-            {
-                hipLaunchKernelGGL(
-                    (cpuToGpuNibbleUnitsROCm<false>), grid, block, 0,
-                    hip_stream, device_cpu_chunk, layout, first_unit, destination.payload,
-                    destination.scales, destination.mins);
-            }
-        }
-        else if (layout.cpu_encoding == cpu::native_quantised::CPUNativeQuantisedEncoding::Q6KNativeDualScale)
+        if (layout.cpu_encoding == cpu::native_quantised::CPUNativeQuantisedEncoding::Q6KNativeDualScale)
         {
             hipLaunchKernelGGL(
                 cpuToGpuQ6UnitsROCm, grid, block, 0, hip_stream,

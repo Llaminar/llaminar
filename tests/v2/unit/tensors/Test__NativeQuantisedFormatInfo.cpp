@@ -160,7 +160,7 @@ TEST(Test__NativeQuantisedFormatInfo, ExpandedSingleScaleGridsRetainNativeScaleA
         const auto *identity = native_quantised_formats::forSourceIdentity(format.codebook_id, format.is_superblock);
         ASSERT_NE(identity, nullptr);
         if (!is_payload_decodable(format.codebook_id) ||
-            preparedEncodingForSource(*identity) != CPUNativeQuantisedEncoding::ExpandedInt8)
+            preparedEncodingForSource(*identity) != CPUNativeQuantisedEncoding::SignedInt8SingleScale)
             continue;
         SCOPED_TRACE(format.name);
         auto tensor = format.create();
@@ -216,7 +216,6 @@ TEST(Test__NativeQuantisedFormatInfo, CompactMultiScaleRetainsNativePayloadAndEv
         // Source row one makes the destination row origin observably different.
         ASSERT_TRUE(packWeightsCPUNativeQuantised(tensor.get(), packed, 1, 2));
         ASSERT_TRUE(packed.usesCompactMultiScale());
-        EXPECT_FALSE(packed.usesInlineCompensation());
         // Coded compact units carry the source payload at its exact width, the
         // exact-width code planes, and one d/dmin word per (column, source
         // superblock) behind each eight-block unit (CPUNativeQuantisedBlockGeometry).

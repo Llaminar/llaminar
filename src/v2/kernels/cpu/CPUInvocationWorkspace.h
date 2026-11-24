@@ -28,7 +28,6 @@ namespace llaminar2
     /** @brief CPU-native activation blocks, shared only by serial projections. */
     inline const std::string kCPUProjectionQ8 = "cpu_projection_q8";
     /** @brief Rotated FP32 inputs coexist with the unmodified caller's input. */
-    inline const std::string kCPUProjectionRotation = "cpu_projection_rotation";
     /** @brief Unscaled product retained while the beta epilogue reads prior output. */
     inline const std::string kCPUProjectionProduct = "cpu_projection_product";
     /** @brief Shared producer/reducer bank for ordered CPU K partitions. */

@@ -121,7 +121,7 @@ namespace llaminar2
         std::uint8_t gpu_is_asymmetric = 0;
         std::uint8_t gpu_has_emins = 0;
         cpu::native_quantised::CPUNativeQuantisedEncoding cpu_encoding =
-            cpu::native_quantised::CPUNativeQuantisedEncoding::ExpandedInt8;
+            cpu::native_quantised::CPUNativeQuantisedEncoding::SignedInt8SingleScale;
         std::uint8_t reserved_format[2]{};
 
         std::uint32_t cpu_data_stride = 0;

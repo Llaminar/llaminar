@@ -206,7 +206,7 @@ void proveWorkspace(ITensorGemm &kernel, int n, int k)
     EXPECT_EQ(consumer->getWorkspace(), nullptr);
 }
 
-/** @brief Alpha/beta and optional rotation preserve bytes under a retained workshare. */
+/** @brief Alpha/beta preserve bytes under a retained workshare. */
 void proveOutputAccumulation(cpu::native_quantised::CPUNativeQuantisedGemmKernel &kernel, int n, int k)
 {
     constexpr int max_rows = 31;
@@ -598,34 +598,6 @@ TEST(CPUProjectionWorkspace, AllQuantizedFormats)
         CPUNativeQuantisedGemmKernel kernel(weight.get(), 0, -1, policy);
         ASSERT_TRUE(kernel.isValid());
         proveQ8Workspace(kernel, 128, 256);
-        proveWorkspace(kernel, 128, 256);
-        proveOutputAccumulation(kernel, 128, 256);
-    }
-}
-
-/** @test Only Q8 admits the rotated layout and its workspace retains participant isolation. */
-TEST(CPUProjectionWorkspace, RotatedQ8RetainsParticipantIsolation)
-{
-    using namespace cpu::native_quantised;
-    ActivationRotation rotation(256, 128);
-    for (const auto &format : quantizedMoEVerifierFormats())
-    {
-        SCOPED_TRACE(format.label);
-        auto weight = format.create({128u, 256u}, 683);
-        weight->setActivationRotation(&rotation);
-        if (format.tensor_type != TensorType::Q8_0 && format.tensor_type != TensorType::Q8_1 &&
-            format.tensor_type != TensorType::Q8_K)
-        {
-            EXPECT_THROW((void)CPUNativeQuantisedGemmKernel(weight.get()), std::invalid_argument);
-            continue;
-        }
-        CPUNativeQuantisedGemmKernel kernel(weight.get());
-        ASSERT_TRUE(kernel.isValid());
-        const auto requirements = kernel.getWorkspaceRequirements(31);
-        const auto found = std::find_if(requirements.buffers.begin(), requirements.buffers.end(),
-            [](const auto &buffer) { return buffer.name == kCPUProjectionRotation; });
-        ASSERT_NE(found, requirements.buffers.end());
-        EXPECT_EQ(found->size_bytes, 31u * 256u * sizeof(float));
         proveWorkspace(kernel, 128, 256);
         proveOutputAccumulation(kernel, 128, 256);
     }

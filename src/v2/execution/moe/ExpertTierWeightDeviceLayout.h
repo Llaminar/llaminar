@@ -125,7 +125,7 @@ namespace llaminar2
     {
         using Encoding = cpu::native_quantised::CPUNativeQuantisedEncoding;
         return encoding == Encoding::NibbleLUT || encoding == Encoding::Q5NativeSingleScale ||
-            cpu::native_quantised::preparedExpandedInt8OmitsCompensation(encoding, codebook);
+            (encoding == Encoding::SignedInt8SingleScale && cpu::native_quantised::isSignedInt8SingleScaleSource(codebook));
     }
 
     /** @return One CPU Q5 byte holding the fifth bits for two four-lane groups. */
@@ -225,7 +225,7 @@ namespace llaminar2
         int32_t N=0,K=0,blocks_per_row=0;
         int32_t cpu_N=0,cpu_K=0,cpu_first_row=0,cpu_first_column=0;
         uint8_t cpu_codebook_id=0,cpu_is_asymmetric=0,cpu_is_superblock=0;
-        cpu::native_quantised::CPUNativeQuantisedEncoding cpu_encoding=cpu::native_quantised::CPUNativeQuantisedEncoding::ExpandedInt8;
+        cpu::native_quantised::CPUNativeQuantisedEncoding cpu_encoding=cpu::native_quantised::CPUNativeQuantisedEncoding::SignedInt8SingleScale;
         uint32_t cpu_data_stride=0,cpu_block_stride=0,unit_count=0,maximum_units_per_chunk=0;
         unsigned wire_columns_per_unit=64;
         /** @return The CPU-only endpoint of this layout. */
@@ -331,7 +331,7 @@ namespace llaminar2
         std::uint8_t gpu_superblock_phase = 0;
         std::uint8_t gpu_code_bit_shift = 0; ///< Live descriptor bit shift for captured transfer work.
         cpu::native_quantised::CPUNativeQuantisedEncoding cpu_encoding =
-            cpu::native_quantised::CPUNativeQuantisedEncoding::ExpandedInt8;
+            cpu::native_quantised::CPUNativeQuantisedEncoding::SignedInt8SingleScale;
         // CPU-unit and persistent staging capacity; no device allocation occurs.
         std::uint32_t cpu_data_stride = 0;
         std::uint32_t cpu_block_stride = 0;

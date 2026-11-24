@@ -155,7 +155,7 @@ PROGRAM = re.compile(r"27CPUNativeNEONProjectionTileILm(\d)EE3runINS1_11multi_sc
                      r"Li(\d)E")
 INVENTORY = re.compile(r"llaminar-native-neon-tile-probe:([A-Za-z0-9,:]*)")
 # (encoding, nibble map, with-minimum) dispatched per policy by Tile::dispatch().
-DISPATCH = ((1, 0, 1), (1, 0, 0), (5, 0, 0), (2, 0, 0), (4, 2, 0), (0, 0, 0), (0, 2, 0), (0, 1, 1), (0, 3, 0), (6, 1, 1), (7, 0, 0), (7, 1, 1))
+DISPATCH = ((1, 0, 0), (2, 0, 0), (4, 2, 0), (0, 0, 0), (0, 2, 0), (0, 1, 1), (0, 3, 0), (6, 1, 1), (7, 0, 0), (7, 1, 1))
 DOTS = {"ASIMD": 0, "DotProd": 1, "I8MM": 2}
 # The one never-returning diagnostic a tile may call, and abort. Both must also be proven never to return.
 FATAL_DIAGNOSTIC = "_ZN9llaminar23cpu16native_quantised28CPUNativeQuantisedWeightView32rejectOutsideAdmittedPublicationEv"
@@ -1573,13 +1573,6 @@ def require_registers(counts: dict[str, int], identity: str, mode: str, budget: 
         if key.startswith("1:"):
             if count:
                 failures.append(f"{key} spills {count} (single-row programs must not spill)")
-        elif key.split(":")[3] == "7":
-            # Native Q5 replaces the corresponding expanded program. It can
-            # never require more stack traffic than that existing grouped bound.
-            rows, family, policy, _, _, minimum = key.split(":")
-            replaced = f"{rows}:{family}:{policy}:1:0:{minimum}"
-            if replaced not in limits or count > limits[replaced]:
-                failures.append(f"{key} spills {count} > replaced expanded budget {limits.get(replaced)}")
         elif key not in limits:
             failures.append(f"{key} has no budget")
         elif count > limits[key]:

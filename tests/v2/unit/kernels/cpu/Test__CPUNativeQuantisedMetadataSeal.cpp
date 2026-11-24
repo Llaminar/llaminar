@@ -46,20 +46,19 @@ static_assert(!CanRebindSeal<CPUNativeQuantisedMetadataSeal>,
 std::size_t secondaryOffset(const CPUNativeQuantisedWeightView &view, int chunk, int block, int column)
 {
     const std::size_t unit = view.geometry().blockOffset(chunk, block);
-    return unit + view.data_stride + (view.usesInlineCompensation() ? 256 : 128) + std::size_t(column) * 2;
+    return unit + view.data_stride + 128 + std::size_t(column) * 2;
 }
 
 /** @return Whether the encoding owns a secondary metadata word. */
 bool hasSecondary(const CPUNativeQuantisedWeightView &view)
 {
     return !view.superblockCoded() && (view.is_asymmetric || view.usesNibbleLUTSourceScale() ||
-        view.usesIQ3SExpandedSourceScale() || view.usesQ6KNativeDualScale());
+        view.usesQ6KNativeDualScale());
 }
 
 /** @return Reserved-bit mask the former in-loop check enforced, or zero where none existed. */
 std::uint16_t reservedMask(const CPUNativeQuantisedWeightView &view)
 {
-    if (view.usesIQ3SExpandedSourceScale()) return 0xfff0u;
     if (view.usesNibbleLUTSourceScale()) return 0xffc0u;
     return 0;
 }
@@ -185,7 +184,7 @@ TEST(CPUNativeQuantisedMetadataSeal, PaddingNormalizationSeparatesRawFromNormali
             {
                 const std::size_t unit = byte / std::size_t(view.interleaved_block_stride);
                 const std::size_t offset = byte % std::size_t(view.interleaved_block_stride);
-                const std::size_t secondary = std::size_t(view.data_stride) + (view.usesInlineCompensation() ? 256 : 128);
+                const std::size_t secondary = std::size_t(view.data_stride) + 128;
                 const bool padding_word = int(unit / std::size_t(view.blocks_per_row)) == last &&
                     offset >= secondary + std::size_t(live) * 2 && offset < secondary + 128;
                 ASSERT_EQ(packed.native_interleaved[byte], padding_word ? 0 : raw[byte]) << "byte " << byte;

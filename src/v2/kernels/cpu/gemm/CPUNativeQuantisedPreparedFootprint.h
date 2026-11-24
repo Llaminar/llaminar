@@ -4,10 +4,8 @@
  *
  * NativeQuantised kernels consume a prepared representation, not the source GGUF
  * payload.  Cache policy therefore must be expressed in bytes of the prepared
- * interleaved stream and its live activation/output panels. IQ3_S source-scale
- * encoding retains decoded grid bytes and adds one raw coefficient vector.  Keeping those
- * quantities in a typed value prevents a compact source block size from being
- * mistaken for the substantially different execution layout.
+ * interleaved stream and its live activation/output panels. A typed footprint
+ * distinguishes each prepared unit from the original source block geometry.
  */
 
 #pragma once
@@ -25,17 +23,15 @@ namespace llaminar2::cpu::native_quantised
      * @brief Physical encoding consumed by CPU NativeQuantised decode kernels.
      *
      * Source GGUF codebooks and prepared CPU encodings are deliberately
-     * separate concepts. Several source formats share one prepared encoding,
-     * while rotation converts every source format to expanded signed INT8.
+     * separate concepts. Several source formats share one prepared encoding;
+     * the three Q8 formats retain one signed byte per logical weight.
      * Cache policy belongs to this execution encoding because it determines
      * the bytes and decode work seen by the hot kernel.
      */
     /**
      * @brief Interpretation of the primary scale field in CPU units.
      *
-     * Chosen from the prepared physical representation, never from the source
-     * codebook alone: rotated (expanded INT8) MXFP4 keeps source codebook 25 but
-     * carries ordinary FP16 scales.
+     * MXFP4 is the only prepared format with exponent-byte scales.
      */
     enum class CPUNativeQuantisedScaleEncoding : std::uint8_t
     {
@@ -46,14 +42,17 @@ namespace llaminar2::cpu::native_quantised
     enum class CPUNativeQuantisedEncoding : std::uint8_t
     {
         NibbleLUT = 0,          ///< Four-bit payload decoded in the hot loop.
-        ExpandedInt8 = 1,       ///< One prepared signed byte per logical weight.
+        SignedInt8SingleScale = 1,       ///< One prepared signed byte per logical weight.
         Q6KNativeDualScale = 2, ///< Six-bit payload, original half base, two int8 coefficients.
         CompactMultiScale = 3, ///< Native payload, two scales, optional two minima.
         NibbleLUTSourceScale = 4, ///< IQ4_XS nibble payload, original half base, raw coefficient.
-        IQ3SExpandedSourceScale = 5, ///< Original IQ3_S signed grid, base and raw nibble.
+        // Value 5 is reserved for the rejected historical IQ3_S layout.
         Q4KSuperblockCoded = 6, ///< Unsigned nibble payload, 12-bit code and a superblock d/dmin word.
         Q5NativeSingleScale = 7, ///< Q5_0/Q5_1 low nibbles and fifth bits, with FP16 d and optional m.
     };
+
+    /// Reserved packed-weight ID; never a valid prepared CPU encoding.
+    inline constexpr std::uint8_t kRetiredIQ3SExpandedSourceScaleEncoding = 5;
 
     /** @return Whether the original source uses the ordinary Q5 block, not Q5_K. */
     [[nodiscard]] constexpr bool isQ5NativeSingleScaleSource(std::uint8_t codebook, bool superblock) noexcept
@@ -77,8 +76,7 @@ namespace llaminar2::cpu::native_quantised
      * @brief Scale-word encoding of a prepared CPU unit, derived from its physical identity.
      * @param codebook_id Source codebook retained by the prepared matrix.
      * @param encoding Physical prepared encoding.
-     * @return E8M0 only for MXFP4 in its native nibble encoding;
-     *         rotated (expanded INT8) MXFP4 and every other format carry FP16.
+     * @return E8M0 for native MXFP4; FP16 for every other prepared format.
      *
      * Derived rather than stored, so no construction or import path can leave
      * it stale; archives and wire records seal it through their version.
@@ -106,8 +104,7 @@ namespace llaminar2::cpu::native_quantised
         case CPUNativeQuantisedEncoding::Q4KSuperblockCoded:
         case CPUNativeQuantisedEncoding::NibbleLUT:
         case CPUNativeQuantisedEncoding::NibbleLUTSourceScale:
-        case CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale:
-        case CPUNativeQuantisedEncoding::ExpandedInt8:
+        case CPUNativeQuantisedEncoding::SignedInt8SingleScale:
         case CPUNativeQuantisedEncoding::Q6KNativeDualScale:
         case CPUNativeQuantisedEncoding::CompactMultiScale:
         case CPUNativeQuantisedEncoding::Q5NativeSingleScale:
@@ -310,8 +307,7 @@ namespace llaminar2::cpu::native_quantised
             return 1024;
         case CPUNativeQuantisedEncoding::CompactMultiScale:
             return preparedCompactPayloadBytes(codebook_id) * 64u;
-        case CPUNativeQuantisedEncoding::ExpandedInt8:
-        case CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale:
+        case CPUNativeQuantisedEncoding::SignedInt8SingleScale:
             return 2048;
         case CPUNativeQuantisedEncoding::Q6KNativeDualScale:
             return 1536;
@@ -321,28 +317,11 @@ namespace llaminar2::cpu::native_quantised
         return 0;
     }
 
-    /**
-     * @brief Identify the expanded signed-Q8 units that need only payload and FP16 scale.
-     * @param encoding Physical CPU execution encoding.
-     * @param codebook_id Original source codebook for prepared CPU bytes.
-     * @return Whether the expanded unit omits its signed weight-sum plane.
-     * @details Rotation preserves the source identity and already uses the same
-     *          signed-byte payload and scale layout as ordinary Q8 preparation.
-     */
-    [[nodiscard]] constexpr bool preparedExpandedInt8OmitsCompensation(
-        CPUNativeQuantisedEncoding encoding, int codebook_id) noexcept
+    /** @return Whether the original source carries one signed Q8 byte per value. */
+    [[nodiscard]] constexpr bool isSignedInt8SingleScaleSource(int codebook_id) noexcept
     {
         using namespace native_quantised_formats;
-        return encoding == CPUNativeQuantisedEncoding::ExpandedInt8 &&
-            (codebook_id == Q8_0.codebook_id || codebook_id == Q8_1.codebook_id || codebook_id == Q8_K.codebook_id);
-    }
-
-    /** @return Whether a block stores the legacy signed weight-sum plane. */
-    [[nodiscard]] constexpr bool preparedUsesInlineCompensation(
-        CPUNativeQuantisedEncoding encoding, int codebook_id) noexcept
-    {
-        return encoding == CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale ||
-            (encoding == CPUNativeQuantisedEncoding::ExpandedInt8 && !preparedExpandedInt8OmitsCompensation(encoding, codebook_id));
+        return codebook_id == Q8_0.codebook_id || codebook_id == Q8_1.codebook_id || codebook_id == Q8_K.codebook_id;
     }
 
     /**
@@ -358,8 +337,6 @@ namespace llaminar2::cpu::native_quantised
         const std::uint32_t data_stride = preparedDataStride(encoding, codebook_id);
         if (data_stride == 0)
             return 0;
-        if (encoding == CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale)
-            return 2432;
         // Coded blocks hold the exact payload and the exact-width code plane
         // (64 columns x code bits) inside the unit; the superblock words follow
         // each eight-block unit (preparedSuperblockHeaderBytes).
@@ -373,8 +350,7 @@ namespace llaminar2::cpu::native_quantised
             return data_stride + 8u * native_quantised_superblock::superblockCodePlaneBits(5);
         if (encoding == CPUNativeQuantisedEncoding::CompactMultiScale)
             return data_stride + 8u * preparedCompactCodeBits(codebook_id);
-        return data_stride + (preparedUsesInlineCompensation(encoding, codebook_id) ? 128u : 0u) +
-            128u + (is_asymmetric ? 128u : 0u);
+        return data_stride + 128u + (is_asymmetric ? 128u : 0u);
     }
 
     /**
@@ -397,14 +373,14 @@ namespace llaminar2::cpu::native_quantised
      *
      * A weight unit is one 64-column N chunk by one 32-element K block and
      * includes every inline datum consumed by the kernel: packed values,
-     * compensation, scales, and optional minima.  Activation and output units
+     * scales and optional minima.  Activation and output units
      * describe one M row so a scheduler can account for the physical row tile
      * independently of the matrix's source codebook.
      */
     struct NativeQuantisedPreparedFootprint
     {
         CPUNativeQuantisedEncoding encoding =
-            CPUNativeQuantisedEncoding::ExpandedInt8;
+            CPUNativeQuantisedEncoding::SignedInt8SingleScale;
         bool is_asymmetric = false;
         std::uint64_t weight_bytes_per_n_chunk_k_block = 0;
         std::uint64_t activation_bytes_per_row_k_block = 0;

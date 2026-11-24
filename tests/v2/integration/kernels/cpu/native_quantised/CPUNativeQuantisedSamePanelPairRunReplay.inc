@@ -361,11 +361,11 @@ TEST(CPUNativeQuantisedFusedCompletion, AutoPanelBlocksContract)
 {
     using namespace cpu::native_quantised;
     namespace policy=cpu::native_quantised::detail;
-    auto footprint=preparedFootprintForFormat(5,true);
+    auto footprint=preparedFootprintForFormat(native_quantised_formats::Q4_1);
     const auto estimate=policy::outputJobWorkingSetEstimate(footprint,39,2,4,80,16);
     EXPECT_EQ(estimate,80u*footprint.weight_bytes_per_n_chunk_k_block+
         8u*80u*footprint.activation_bytes_per_row_k_block+8u*footprint.output_bytes_per_row_n_chunk);
-    auto compact=preparedFootprintForFormat(9,false);
+    auto compact=preparedFootprintForFormat(native_quantised_formats::Q3_K);
     EXPECT_EQ(policy::outputJobWorkingSetEstimate(compact,39,4,1,24,16),
         24u*compact.weight_bytes_per_n_chunk_k_block+4u*24u*compact.activation_bytes_per_row_k_block+
         4u*compact.output_bytes_per_row_n_chunk+4u*16u*64u*sizeof(float));

@@ -55,7 +55,6 @@ template <std::uint8_t Codebook> void verifyExtent()
         const std::size_t row_bytes = payload_and_codes * blocks + header * superblocks;
         EXPECT_EQ(packed.interleaved_block_stride, payload_and_codes);
         EXPECT_EQ(packed.native_interleaved.size(), padded_columns / 64 * row_bytes);
-        EXPECT_FALSE(packed.usesInlineCompensation());
         const auto view = packed.readView();
         EXPECT_EQ(view.superblockHeader(1, blocks - 1) - view.bytes().data(), 2 * row_bytes - header);
         if (k % 256 == 0)

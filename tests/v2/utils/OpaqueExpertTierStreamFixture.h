@@ -27,7 +27,7 @@ namespace llaminar2::test
         // expanded ABI; the bytes deliberately do not encode a source tensor.
         packed.codebook_id = native_quantised_formats::Q4_0.codebook_id;
         packed.payload_bytes = 32;
-        packed.encoding = CPUNativeQuantisedEncoding::ExpandedInt8;
+        packed.encoding = CPUNativeQuantisedEncoding::SignedInt8SingleScale;
         packed.data_stride = preparedDataStride(packed.encoding, packed.codebook_id);
         packed.interleaved_block_stride = preparedInterleavedBlockStride(packed.encoding, false, packed.codebook_id);
         packed.native_interleaved.resize(packed.preparedBytes(), 0);

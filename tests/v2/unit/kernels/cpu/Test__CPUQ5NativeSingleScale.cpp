@@ -159,7 +159,6 @@ namespace
             packed.numerical_policy = policy;
             ASSERT_TRUE(packWeightsCPUNativeQuantised(&source, packed));
             ASSERT_EQ(packed.encoding, CPUNativeQuantisedEncoding::Q5NativeSingleScale);
-            EXPECT_FALSE(packed.usesInlineCompensation());
             EXPECT_EQ(packed.preparedBytes(), packed.N_padded * blocks * sizeof(*raw));
             EXPECT_EQ(packed.native_interleaved.size(), packed.preparedBytes());
             for (int chunk = 0; chunk < packed.N_padded / 64; ++chunk)

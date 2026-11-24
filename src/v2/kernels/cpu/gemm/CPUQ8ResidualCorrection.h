@@ -69,7 +69,7 @@ inline void validateCPUQ8ResidualSource(const CPUNativeQuantisedPackedWeights&pa
   NativeQuantisedSourceIdentity{packed.codebook_id,packed.is_superblock,true},m,n,k);
  if(packed.N!=n||packed.K!=k||packed.blocks_per_row!=k/32||!packed.hasInterleavedData()||
     packed.is_asymmetric!=format.is_asymmetric||
-    (packed.payload_bytes!=format.payload_bytes&&!(packed.usesExpandedInt8()&&packed.payload_bytes==32))||
+    (packed.payload_bytes!=format.payload_bytes&&!(packed.usesSignedInt8SingleScale()&&packed.payload_bytes==32))||
     packed.encoding!=preparedEncodingForSource(format)||
     std::int64_t(packed.data_stride)!=preparedDataStride(packed.encoding,packed.codebook_id)||
     std::int64_t(packed.interleaved_block_stride)!=preparedInterleavedBlockStride(packed.encoding,packed.is_asymmetric,packed.codebook_id)||
@@ -201,7 +201,7 @@ inline void cpuQ8ResidualProjectionWorkshare(const CPUNativeQuantisedPackedWeigh
    // Preserve the original Q8_0 kernel and its register-store fold exactly.
    // All other canonical encodings retain their own source arithmetic above.
    if(packed.codebook_id!=native_quantised_formats::Q8_0.codebook_id||packed.is_superblock||
-      packed.is_asymmetric||!packed.usesExpandedInt8())
+      packed.is_asymmetric||!packed.usesSignedInt8SingleScale())
    {
     const bool second=row+1<live;
     cpuNativeResidualChunk(packed,primary.data()+row*bpr,residual.data()+row*bpr,

@@ -180,17 +180,15 @@ namespace llaminar2::cpu::native_quantised
         return 0;
     }
 
-    /** @brief Dot one expanded group using its admitted legacy or compensation-free layout. */
-    inline __m256i dotExpandedWeightsAVX2(__m256i dot, __m256i weights, const Q8_1Block &activation,
-                                          int first, bool compensated) noexcept
+    /** @brief Dot one native signed Q8 group using a recentered unsigned weight operand. */
+    inline __m256i dotSignedQ8WeightsAVX2(__m256i dot, __m256i weights, const Q8_1Block &activation,
+                                          int first) noexcept
     {
         auto a = nativeActivationWord(activation, first);
-        if (compensated)
-            return isa::avx2_dpbusd_epi32(dot, _mm256_set1_epi32(a ^ std::int32_t(0x80808080u)), weights);
         return dotUnsignedWeightsAVX2(dot, _mm256_xor_si256(weights, _mm256_set1_epi8(-128)), _mm256_set1_epi32(a));
     }
 
-    /** @brief Exact compensation-free expanded dot, with two bounded INT16 planes per row.
+    /** @brief Exact signed Q8 dot, with two bounded INT16 planes per row.
      * Split the unsigned form of each signed weight into two nibbles. Each
      * plane accumulates 16 products per pair lane in [-30720,30480] before
      * widening once. Multiplying the upper dot by 16 and subtracting the
@@ -200,7 +198,7 @@ namespace llaminar2::cpu::native_quantised
      * @return One signed INT32 dot vector per row, in the original column order.
      */
     template <std::size_t Rows>
-    inline auto dotExpandedBlockAVX2(const uint8_t *weights,
+    inline auto dotSignedQ8BlockAVX2(const uint8_t *weights,
         const std::array<const Q8_1Block *, Rows> &activation) noexcept
     {
         static_assert(Rows == 1 || Rows == 2);
@@ -244,13 +242,13 @@ namespace llaminar2::cpu::native_quantised
      * order and uses the original prepared FP scale and policy.
      * @tparam Rows Number of independently accumulated output rows.
      * @tparam SumPairs Publish only the sum of two final output rows.
-     * @param packed Admitted symmetric Q8 expanded stream without weight sums.
+     * @param packed Admitted signed Q8 stream.
      * @param a,c Activation and output pointers in original row order.
      * @param chunk,kb_start,kb_end Original chunk and half-open block interval.
      * @param accumulate Whether the destinations own a previous FP partial.
      */
     template <std::size_t Rows, bool SumPairs = false>
-    inline void projectExpandedFreeAVX2(const CPUNativeQuantisedPackedWeights &packed,
+    inline void projectSignedQ8AVX2(const CPUNativeQuantisedPackedWeights &packed,
         const std::array<const Q8_1Block *, Rows> &a, const std::array<float *, Rows> &c,
         int chunk, int kb_start, int kb_end, bool accumulate)
     {
@@ -267,7 +265,7 @@ namespace llaminar2::cpu::native_quantised
 #pragma GCC unroll 2
                 for (std::size_t row = 0; row < Rows; ++row)
                     block[row] = a[row] + kb;
-                const auto dots = dotExpandedBlockAVX2(packed.admittedBlockUnit(chunk, kb) + 4 * column, block);
+                const auto dots = dotSignedQ8BlockAVX2(packed.admittedBlockUnit(chunk, kb) + 4 * column, block);
                 const auto scale = packed.loadScales256(packed.chunkScales(chunk, kb) + column);
 #pragma GCC unroll 2
                 for (std::size_t row = 0; row < Rows; ++row)
@@ -285,15 +283,9 @@ namespace llaminar2::cpu::native_quantised
         }
     }
 
-    /** @return The legacy per-column correction, or the compensation-free activation-side correction. */
-    inline __m256i expandedBiasAVX2(const CPUNativeQuantisedPackedWeights &packed, const Q8_1Block &activation,
-                                  int chunk, int block, int column)
-    {
-        if (!packed.usesInlineCompensation())
-            return _mm256_set1_epi32(128 * activation.sum_qs);
-        return _mm256_slli_epi32(_mm256_cvtepi16_epi32(_mm_load_si128(reinterpret_cast<const __m128i *>(
-            packed.chunkComp(chunk, block) + column))), 7);
-    }
+    /** @return Recenter the unsigned Q8 weight operand using only the activation sum. */
+    inline __m256i q8WeightBiasAVX2(const Q8_1Block &activation) noexcept
+    { return _mm256_set1_epi32(128 * activation.sum_qs); }
 
     // =========================================================================
     // AVX2 decode LUT builder (selects correct LUT by codebook_id)
@@ -316,22 +308,6 @@ namespace llaminar2::cpu::native_quantised
             return isa::build_decode_lut_avx2(avx2_luts::IQ4_NL_DECODE_LUT);
         }
         throw std::logic_error("Invalid NativeQuantised AVX2 nibble dot domain");
-    }
-
-    /**
-     * @brief Pack four signed Q8_1 bytes as unsigned VNNI input lanes.
-     *
-     * Flipping each sign bit is exactly equivalent to adding 128 modulo 256,
-     * but keeps activation preparation in general-purpose registers.  The
-     * corresponding `128 * sum(weights)` compensation is applied after every
-     * complete INT32 dot product.
-     */
-    inline int32_t pack_q8_1_unsigned_word_avx2(
-        const Q8_1Block &block, int base_index) noexcept
-    {
-        uint32_t raw = 0;
-        std::memcpy(&raw, block.qs + base_index, sizeof(raw));
-        return static_cast<int32_t>(raw ^ 0x80808080u);
     }
 
     /** @brief Decode nibble factors in the caller's registers, without a hidden result buffer.
@@ -557,11 +533,11 @@ namespace llaminar2::cpu::native_quantised
      * @brief Dispatch one non-nibble AVX2 chunk by its typed prepared encoding.
      *
      * Q6_K consumes its native dual-scale payload. Remaining codebooks use the
-     * explicitly expanded INT8 encoding below. Keeping the decision here makes
+     * signed Q8 encoding below. Keeping the decision here makes
      * every serial and K-partition caller exhaustive over the packed ABI.
      *
      * @param accumulate Load `C` as the initial FP32 accumulator. The flag is
-     *        forwarded to native Q6 as well as the expanded-INT8 path so every
+     *        forwarded to native Q6 as well as the signed Q8 path so every
      *        prepared encoding has identical tile-boundary semantics.
      */
     inline void gemv_avx2_chunk_non_nibble(
@@ -588,12 +564,11 @@ namespace llaminar2::cpu::native_quantised
                 packed, A_q8, C, chunk, kb_start, kb_end, accumulate);
             return;
         }
-        if (!packed.usesExpandedInt8())
+        if (!packed.usesSignedInt8SingleScale())
             throw std::invalid_argument(
                 "AVX2 non-nibble GEMV received an unsupported packed encoding");
-        const bool compensated = packed.usesInlineCompensation();
-        if (!compensated && !packed.is_asymmetric && packed.codebook_id == native_quantised_formats::Q8_0.codebook_id)
-            return projectExpandedFreeAVX2(packed, std::array{A_q8}, std::array{C}, chunk, kb_start, kb_end, accumulate);
+        if (packed.codebook_id == native_quantised_formats::Q8_0.codebook_id)
+            return projectSignedQ8AVX2(packed, std::array{A_q8}, std::array{C}, chunk, kb_start, kb_end, accumulate);
         for (int segment = 0; segment < 8; ++segment)
         {
             const int z = segment / 2;
@@ -621,40 +596,22 @@ namespace llaminar2::cpu::native_quantised
                         reinterpret_cast<const __m256i *>(
                             packed.interleavedB(
                                 chunk, kb, group + 1, z) + byte_offset));
-                    dot_even = dotExpandedWeightsAVX2(dot_even, weight_even, activation, group * 4, compensated);
-                    dot_odd = dotExpandedWeightsAVX2(dot_odd, weight_odd, activation, (group + 1) * 4, compensated);
+                    dot_even = dotSignedQ8WeightsAVX2(dot_even, weight_even, activation, group * 4);
+                    dot_odd = dotSignedQ8WeightsAVX2(dot_odd, weight_odd, activation, (group + 1) * 4);
                 }
 
                 const __m256i corrected = _mm256_sub_epi32(
                     _mm256_add_epi32(dot_even, dot_odd),
-                    expandedBiasAVX2(packed, activation, chunk, kb, segment * 8));
+                    q8WeightBiasAVX2(activation));
                 const __m256 weight_scale = packed.loadScales256(packed.chunkScales(chunk, kb) + segment * 8);
                 const float activation_scale =
                     nativeQuantisedFP16ScaleToFP32(activation.d);
-                if (packed.is_asymmetric)
-                {
-                    const __m256 weight_min = _mm256_cvtph_ps(
-                        _mm_load_si128(reinterpret_cast<const __m128i *>(
-                            packed.chunkMins(chunk, kb) + segment * 8)));
-                    fp_accumulator =
-                        accumulateCorrectedSingleScaleBlockAVX2(
-                            fp_accumulator,
-                            corrected,
-                            weight_scale,
-                            activation.sum_qs,
-                            weight_min,
-                            activation_scale,
-                            packed.numerical_policy);
-                }
-                else
-                {
-                    fp_accumulator = accumulateSingleScaleBlockAVX2(
-                        fp_accumulator,
-                        corrected,
-                        weight_scale,
-                        activation_scale,
-                        packed.numerical_policy);
-                }
+                fp_accumulator = accumulateSingleScaleBlockAVX2(
+                    fp_accumulator,
+                    corrected,
+                    weight_scale,
+                    activation_scale,
+                    packed.numerical_policy);
             }
             _mm256_storeu_ps(C + segment * 8, fp_accumulator);
         }
@@ -911,12 +868,11 @@ namespace llaminar2::cpu::native_quantised
                 accumulate);
             return;
         }
-        if (!packed.usesExpandedInt8())
+        if (!packed.usesSignedInt8SingleScale())
             throw std::invalid_argument(
                 "AVX2 non-nibble two-row kernel received an unsupported packed encoding");
-        const bool compensated = packed.usesInlineCompensation();
-        if (!compensated && !packed.is_asymmetric && packed.codebook_id == native_quantised_formats::Q8_0.codebook_id)
-            return projectExpandedFreeAVX2<2, SumPairs>(packed, std::array{A_q8_row0, A_q8_row1},
+        if (packed.codebook_id == native_quantised_formats::Q8_0.codebook_id)
+            return projectSignedQ8AVX2<2, SumPairs>(packed, std::array{A_q8_row0, A_q8_row1},
                 std::array{C_row0, C_row1}, chunk, kb_start, kb_end, accumulate);
         for (int segment = 0; segment < 8; ++segment)
         {
@@ -951,40 +907,25 @@ namespace llaminar2::cpu::native_quantised
                         reinterpret_cast<const __m256i *>(
                             packed.interleavedB(
                                 chunk, kb, group + 1, z) + byte_offset));
-                    dot0_even = dotExpandedWeightsAVX2(dot0_even, weight_even, a0, group * 4, compensated);
-                    dot1_even = dotExpandedWeightsAVX2(dot1_even, weight_even, a1, group * 4, compensated);
-                    dot0_odd = dotExpandedWeightsAVX2(dot0_odd, weight_odd, a0, (group + 1) * 4, compensated);
-                    dot1_odd = dotExpandedWeightsAVX2(dot1_odd, weight_odd, a1, (group + 1) * 4, compensated);
+                    dot0_even = dotSignedQ8WeightsAVX2(dot0_even, weight_even, a0, group * 4);
+                    dot1_even = dotSignedQ8WeightsAVX2(dot1_even, weight_even, a1, group * 4);
+                    dot0_odd = dotSignedQ8WeightsAVX2(dot0_odd, weight_odd, a0, (group + 1) * 4);
+                    dot1_odd = dotSignedQ8WeightsAVX2(dot1_odd, weight_odd, a1, (group + 1) * 4);
                 }
 
                 const __m256i corrected0 = _mm256_sub_epi32(
-                    _mm256_add_epi32(dot0_even, dot0_odd), expandedBiasAVX2(packed, a0, chunk, kb, segment * 8));
+                    _mm256_add_epi32(dot0_even, dot0_odd), q8WeightBiasAVX2(a0));
                 const __m256i corrected1 = _mm256_sub_epi32(
-                    _mm256_add_epi32(dot1_even, dot1_odd), expandedBiasAVX2(packed, a1, chunk, kb, segment * 8));
+                    _mm256_add_epi32(dot1_even, dot1_odd), q8WeightBiasAVX2(a1));
                 const __m256 weight_scale = packed.loadScales256(packed.chunkScales(chunk, kb) + segment * 8);
                 const float a0_scale = nativeQuantisedFP16ScaleToFP32(a0.d);
                 const float a1_scale = nativeQuantisedFP16ScaleToFP32(a1.d);
-                if (packed.is_asymmetric)
-                {
-                    const __m256 weight_min = _mm256_cvtph_ps(
-                        _mm_load_si128(reinterpret_cast<const __m128i *>(
-                            packed.chunkMins(chunk, kb) + segment * 8)));
-                    fp0 = accumulateCorrectedSingleScaleBlockAVX2(
-                        fp0, corrected0, weight_scale, a0.sum_qs,
-                        weight_min, a0_scale, packed.numerical_policy);
-                    fp1 = accumulateCorrectedSingleScaleBlockAVX2(
-                        fp1, corrected1, weight_scale, a1.sum_qs,
-                        weight_min, a1_scale, packed.numerical_policy);
-                }
-                else
-                {
-                    fp0 = accumulateSingleScaleBlockAVX2(
-                        fp0, corrected0, weight_scale, a0_scale,
-                        packed.numerical_policy);
-                    fp1 = accumulateSingleScaleBlockAVX2(
-                        fp1, corrected1, weight_scale, a1_scale,
-                        packed.numerical_policy);
-                }
+                fp0 = accumulateSingleScaleBlockAVX2(
+                    fp0, corrected0, weight_scale, a0_scale,
+                    packed.numerical_policy);
+                fp1 = accumulateSingleScaleBlockAVX2(
+                    fp1, corrected1, weight_scale, a1_scale,
+                    packed.numerical_policy);
             }
             if constexpr(SumPairs) _mm256_storeu_ps(C_row0 + segment * 8,_mm256_add_ps(fp0,fp1));
             else { _mm256_storeu_ps(C_row0 + segment * 8, fp0);
@@ -1027,7 +968,7 @@ namespace llaminar2::cpu::native_quantised
      *
      * The encoding's established AVX2 microkernel produces one partition from
      * positive zero. Immediate task-local folding avoids the complete partial
-     * plane and applies equally to nibble, expanded-INT8, and native-Q6 weights.
+     * plane and applies equally to nibble, signed Q8, and native Q6 weights.
      *
      * @param packed Prepared matrix carrying its typed physical encoding.
      * @param row Q8_1 activation row.

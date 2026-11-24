@@ -174,7 +174,7 @@ namespace
     }
 
 #if !defined(__aarch64__)
-    // x86 VNNI consumes unsigned activation words; ARM signed dots need no packing.
+    // x86 dots broadcast four original signed activation bytes without requantization.
     /** Prove integer activation packing independently of serial/grouped kernel agreement. */
     TEST(CPUActivationWordPacking, AllSignedBytesAndOffsetsMatchScalar)
     {
@@ -191,16 +191,9 @@ namespace
                 block.qs[i] = static_cast<int8_t>((i * 73 + 19) % 256 - 128);
             block.qs[offset + lane] = static_cast<int8_t>(value);
             const auto before = block;
-            std::array<uint8_t, 4> expected{};
-            for (int i = 0; i < 4; ++i)
-                expected[i] = static_cast<uint8_t>(static_cast<int>(block.qs[offset + i]) + 128);
-            const int32_t avx2 = pack_q8_1_unsigned_word_avx2(block, offset);
-            ASSERT_EQ(std::memcmp(&avx2, expected.data(), expected.size()), 0)
+            const int32_t word = nativeActivationWord(block, offset);
+            ASSERT_EQ(std::memcmp(&word, block.qs + offset, sizeof(word)), 0)
                 << "offset=" << offset << " lane=" << lane << " value=" << value;
-#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
-            const int32_t avx512 = pack_q8_1_unsigned_word(block, offset);
-            ASSERT_EQ(std::memcmp(&avx512, expected.data(), expected.size()), 0);
-#endif
             ASSERT_EQ(std::memcmp(&block, &before, sizeof(block)), 0);
         }
     }
@@ -5402,83 +5395,6 @@ namespace
         unsetenv("LLAMINAR_PERF_STATS_JSON");
     }
 #endif // x86 NativeQuantised scheduler contract
-
-    TEST_F(CPUNativeQuantisedGemvTest, MTP_FusedQ8ProjectionWithActivationRotationMatchesSerialDecodeRows)
-    {
-        const int K = 128;
-        const int M = 2;
-        const int N0 = 384;
-        const int N1 = 256;
-
-        ActivationRotation rotation(K, 128);
-        auto weights0 = createWeightsForFormat("Q8_0", N0, K);
-        auto weights1 = createWeightsForFormat("Q8_0", N1, K);
-        ASSERT_NE(weights0, nullptr);
-        ASSERT_NE(weights1, nullptr);
-        weights0->setActivationRotation(&rotation);
-        weights1->setActivationRotation(&rotation);
-
-        CPUNativeQuantisedGemmKernel kernel0(weights0.get());
-        CPUNativeQuantisedGemmKernel kernel1(weights1.get());
-        ASSERT_TRUE(kernel0.isValid());
-        ASSERT_TRUE(kernel1.isValid());
-
-        auto input = TestTensorFactory::createFP32Random(
-            {static_cast<size_t>(M), static_cast<size_t>(K)}, -1.0f, 1.0f, 3101);
-        ASSERT_NE(input, nullptr);
-
-        FP32Tensor grouped0({static_cast<size_t>(M), static_cast<size_t>(N0)});
-        FP32Tensor grouped1({static_cast<size_t>(M), static_cast<size_t>(N1)});
-        std::vector<ITensorGemm::TensorProjectionDesc> grouped_projections = {
-            {&kernel0, &grouped0, N0, nullptr, "proj0"},
-            {&kernel1, &grouped1, N1, nullptr, "proj1"}};
-
-        CPUProjectionTestWorkspace workspace(M, K, kernel0.getWorkspaceRequirements(M));
-        ASSERT_TRUE(kernel0.multiply_fused_verifier_rows_decode_equivalent(
-            input.get(), grouped_projections, M, K, nullptr, workspace.get()))
-            << "Grouped verifier projection should support rotated CPU NativeQuantised weights";
-
-        std::vector<float> serial0(static_cast<size_t>(M) * static_cast<size_t>(N0), 0.0f);
-        std::vector<float> serial1(static_cast<size_t>(M) * static_cast<size_t>(N1), 0.0f);
-        for (int row = 0; row < M; ++row)
-        {
-            FP32Tensor row_input({1, static_cast<size_t>(K)});
-            std::memcpy(
-                row_input.mutable_data(),
-                input->data() + static_cast<size_t>(row) * static_cast<size_t>(K),
-                static_cast<size_t>(K) * sizeof(float));
-
-            FP32Tensor row0({1, static_cast<size_t>(N0)});
-            FP32Tensor row1({1, static_cast<size_t>(N1)});
-            std::vector<ITensorGemm::TensorProjectionDesc> row_projections = {
-                {&kernel0, &row0, N0, nullptr, "proj0"},
-                {&kernel1, &row1, N1, nullptr, "proj1"}};
-
-            ASSERT_TRUE(kernel0.multiply_fused_tensor(&row_input, row_projections, 1, K, nullptr, workspace.get()))
-                << "Serial decode projection failed for row " << row;
-            std::memcpy(
-                serial0.data() + static_cast<size_t>(row) * static_cast<size_t>(N0),
-                row0.data(),
-                static_cast<size_t>(N0) * sizeof(float));
-            std::memcpy(
-                serial1.data() + static_cast<size_t>(row) * static_cast<size_t>(N1),
-                row1.data(),
-                static_cast<size_t>(N1) * sizeof(float));
-        }
-
-        expectBitwiseEqualFloatRows(
-            "CPU rotated grouped verifier projection 0",
-            grouped0.data(),
-            serial0.data(),
-            static_cast<size_t>(M) * static_cast<size_t>(N0),
-            static_cast<size_t>(N0));
-        expectBitwiseEqualFloatRows(
-            "CPU rotated grouped verifier projection 1",
-            grouped1.data(),
-            serial1.data(),
-            static_cast<size_t>(M) * static_cast<size_t>(N1),
-            static_cast<size_t>(N1));
-    }
 
     TEST_F(CPUNativeQuantisedGemvTest, MTP_SmallM_Qwen36ShapesMatchSerialDecodeRows)
     {

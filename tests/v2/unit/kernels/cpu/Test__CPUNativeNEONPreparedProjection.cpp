@@ -91,7 +91,7 @@ int sourceInteger(const CPUNativeQuantisedWeightView &packed, int column, int bl
 {
     const int local = column % 64;
     const auto *unit = packed.blockUnit(column / 64, block);
-    if (packed.usesExpandedInt8())
+    if (packed.usesSignedInt8SingleScale())
     {
         const int raw = unit[(k / 4) * 256 + local * 4 + k % 4];
         return raw < 128 ? raw : raw - 256;
@@ -317,24 +317,6 @@ template <typename Ops> void verifyTailPadding(const NativeQuantisedFormatInfo &
             // Every bit pattern fits the coded planes, but no header bytes may be missing.
             EXPECT_THROW((void)CPUNativeQuantisedMetadataSeal::validate(fixture.descriptor,
                 fixture.bytes.first(fixture.bytes.size() - 1)), std::invalid_argument);
-        }
-        else if (view.usesIQ3SExpandedSourceScale())
-        {
-            const int last = view.N_padded / 64 - 1, live = n % 64 == 0 ? 64 : n % 64;
-            const std::size_t secondary = std::size_t(view.data_stride) + (view.usesInlineCompensation() ? 256 : 128);
-            // Lanes loaded with the last live column's vector, and the next vector.
-            for (int column = live; column < std::min(64, (live + 3) / 4 * 4 + 4); ++column)
-                for (int block : {0, blocks - 1})
-                {
-                    auto *word = fixture.bytes.data() + view.geometry().blockOffset(last, block) +
-                        secondary + std::size_t(column) * 2;
-                    std::uint16_t original = 0;
-                    std::memcpy(&original, word, sizeof(original));
-                    const std::uint16_t poison = 0xffff;
-                    std::memcpy(word, &poison, sizeof(poison));
-                    EXPECT_THROW((void)fixture.view(), std::invalid_argument) << "column=" << column << " block=" << block;
-                    std::memcpy(word, &original, sizeof(original));
-                }
         }
     }
     // Row tiles 1..4 under both policies (contiguous backend-native and
@@ -681,12 +663,8 @@ template <std::size_t Rows> void verifyI8MMGrouping(const NativeQuantisedFormatI
         using Tile = CPUNativeNEONProjectionTile<1>;
         switch (packed.encoding)
         {
-        case CPUNativeQuantisedEncoding::ExpandedInt8:
-            return packed.is_asymmetric
-                ? Tile::template panelStrips<SDOTOps, CPUNativeQuantisedEncoding::ExpandedInt8, true>()
-                : Tile::template panelStrips<SDOTOps, CPUNativeQuantisedEncoding::ExpandedInt8, false>();
-        case CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale:
-            return Tile::template panelStrips<SDOTOps, CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale>();
+        case CPUNativeQuantisedEncoding::SignedInt8SingleScale:
+            return Tile::template panelStrips<SDOTOps, CPUNativeQuantisedEncoding::SignedInt8SingleScale>();
         case CPUNativeQuantisedEncoding::Q6KNativeDualScale:
             return Tile::template panelStrips<SDOTOps, CPUNativeQuantisedEncoding::Q6KNativeDualScale>();
         case CPUNativeQuantisedEncoding::NibbleLUTSourceScale:
@@ -833,24 +811,6 @@ TEST_F(CPUNativeNEONPreparedProjection, RejectsInvalidSourceMetadataBeforeAnyWri
                 fixture.bytes.first(fixture.bytes.size() - 1)), std::invalid_argument);
             for (const float value : result) EXPECT_EQ(value, 123.0f);
         }
-        else
-        {
-            const auto secondary = weights.data_stride + (weights.usesInlineCompensation() ? 256 : 128);
-            // Every lane of the unit, including the 56 padding columns past N=8.
-            for (int bad_column = 0; bad_column < 64; ++bad_column)
-            {
-                SCOPED_TRACE(bad_column);
-                std::uint16_t original = 0;
-                auto *word = fixture.bytes.data() + secondary + bad_column * 2;
-                std::memcpy(&original, word, sizeof(original));
-                const std::uint16_t invalid = 0xffff;
-                std::memcpy(word, &invalid, sizeof(invalid));
-                result.fill(123.0f);
-                EXPECT_THROW((void)fixture.view(), std::invalid_argument);
-                for (const float value : result) EXPECT_EQ(value, 123.0f);
-                std::memcpy(word, &original, sizeof(original));
-            }
-        }
         result.fill(123.0f);
         CPUNativeNEONProjectionTile<1>::bind(fixture.view(), input, output, 0).execute();
         for (int column = 0; column < 8; ++column)
@@ -909,13 +869,6 @@ TEST_F(CPUNativeNEONPreparedProjection, EveryAdmittedE8M0ByteWidensExactly)
     }
 }
 
-/** @test Non-Q8 expanded units must fail before selecting a NEON projection leaf. */
-TEST_F(CPUNativeNEONPreparedProjection, RotatedMXFP4IsRejectedBeforeDispatch)
-{
-    NativeQuantisedPreparedByteFixture rotated(native_quantised_formats::MXFP4, 65, 64, 4u * 1024u * 1024u, true);
-    EXPECT_THROW((void)rotated.view(), std::invalid_argument);
-}
-
 /** @test Native MXFP4 scale bytes remain distinct from FP16 words. */
 TEST_F(CPUNativeNEONPreparedProjection, MXFP4ScaleFieldsFollowThePreparedIdentity)
 {
@@ -938,7 +891,7 @@ TEST_F(CPUNativeNEONPreparedProjection, MXFP4ScaleFieldsFollowThePreparedIdentit
         native.bytes[view.data_stride] = static_cast<std::uint8_t>(invalid);
         EXPECT_THROW((void)native.view(), std::invalid_argument);
     }
-    EXPECT_EQ(preparedScaleEncoding(kNativeQuantisedMXFP4Codebook, CPUNativeQuantisedEncoding::ExpandedInt8),
+    EXPECT_EQ(preparedScaleEncoding(native_quantised_formats::Q8_0.codebook_id, CPUNativeQuantisedEncoding::SignedInt8SingleScale),
         CPUNativeQuantisedScaleEncoding::FP16);
     EXPECT_EQ(preparedScaleEncoding(4, CPUNativeQuantisedEncoding::NibbleLUT), CPUNativeQuantisedScaleEncoding::FP16);
 }

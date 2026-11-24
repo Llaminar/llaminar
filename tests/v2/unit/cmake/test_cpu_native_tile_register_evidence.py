@@ -40,7 +40,7 @@ CHECKER = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(CHECKER)
 
 # Tile::dispatch() programs per policy: (encoding, nibble map, with-minimum), written out independently.
-DISPATCHED = [(1, 0, 1), (1, 0, 0), (5, 0, 0), (2, 0, 0), (4, 2, 0), (0, 0, 0), (0, 2, 0), (0, 1, 1), (0, 3, 0), (6, 1, 1), (7, 0, 0), (7, 1, 1)]
+DISPATCHED = [(1, 0, 0), (2, 0, 0), (4, 2, 0), (0, 0, 0), (0, 2, 0), (0, 1, 1), (0, 3, 0), (6, 1, 1), (7, 0, 0), (7, 1, 1)]
 NEON_KEYS = sorted((rows, 0, policy, encoding, nibble_map, minimum)
                    for rows in (1, 2, 3, 4) for policy in (0, 1) for encoding, nibble_map, minimum in DISPATCHED)
 NEON_INVENTORY = "1:ASIMD,2:ASIMD,3:ASIMD,4:ASIMD"
@@ -343,7 +343,7 @@ def audit_witness(bodies: dict[tuple, str] | None = None, extra: list[tuple[str,
 
 def budget(limit: int = 4) -> dict:
     """Budget naming every grouped NEON program."""
-    limits = {":".join(map(str, key)): limit for key in NEON_KEYS if key[0] != 1 and key[3] != 7}
+    limits = {":".join(map(str, key)): limit for key in NEON_KEYS if key[0] != 1}
     return {"GNU-14": {"NEON": limits}}
 
 
@@ -999,7 +999,7 @@ class InventoryTest(unittest.TestCase):
         for macho in (False, True):
             counts = audit_witness(macho=macho)
             self.assertEqual(sorted(tuple(map(int, CHECKER.program_key(n).split(":"))) for n in counts), NEON_KEYS)
-        self.assertEqual(len(NEON_KEYS), 96)
+        self.assertEqual(len(NEON_KEYS), 80)
 
     def test_missing_duplicate_empty_and_unexpected_programs(self) -> None:
         with self.assertRaisesRegex(ValueError, "missing"):
@@ -1039,7 +1039,7 @@ class InventoryTest(unittest.TestCase):
             audit_witness(inventory=None)
 
     def test_structural_failure_is_not_paid_from_a_budget(self) -> None:
-        key = (2, 0, 0, 1, 0, 1)
+        key = (2, 0, 0, 1, 0, 0)
         with self.assertRaisesRegex(ValueError, "structurally"):
             audit_witness({key: "\tbl helper\n\tret"}, extra=[("helper", "\tret\n")])
         with self.assertRaisesRegex(ValueError, "structurally"):
@@ -1069,15 +1069,15 @@ class PolicyTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "3:0:0:6:1:1 spills 5 > budget 4"):
             CHECKER.require_registers(counts, "GNU-14", "NEON", budget())
 
-    def test_native_q5_inherits_matching_expanded_grouped_bound(self) -> None:
+    def test_native_q5_uses_its_own_grouped_bound(self) -> None:
         limits = budget()
-        limits["GNU-14"]["NEON"]["3:0:1:1:0:1"] = 2
+        limits["GNU-14"]["NEON"]["3:0:1:7:1:1"] = 2
         counts = self.counts(0, 0)
         q5 = name(3, 0, 1, 7, 1, 1)
         counts[q5] = 2
         CHECKER.require_registers(counts, "GNU-14", "NEON", limits)
         counts[q5] = 3
-        with self.assertRaisesRegex(ValueError, "replaced expanded budget 2"):
+        with self.assertRaisesRegex(ValueError, "3:0:1:7:1:1 spills 3 > budget 2"):
             CHECKER.require_registers(counts, "GNU-14", "NEON", limits)
 
     def test_unknown_identity_envelope_missing_and_stale_budget_fail_closed(self) -> None:
@@ -1085,7 +1085,7 @@ class PolicyTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "no qualified"):
                 CHECKER.require_registers(self.counts(0, 0), identity, mode, budget())
         missing = budget()
-        missing["GNU-14"]["NEON"].pop("2:0:0:1:0:1")
+        missing["GNU-14"]["NEON"].pop("2:0:0:1:0:0")
         with self.assertRaisesRegex(ValueError, "no budget"):
             CHECKER.require_registers(self.counts(0, 0), "GNU-14", "NEON", missing)
         stale = budget()

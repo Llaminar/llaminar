@@ -622,9 +622,9 @@ namespace
     /**
      * @test Measure topology-derived K tiles against neighboring exact tiles.
      *
-     * The five formats represent every distinct prepared-memory footprint:
+     * The five formats exercise distinct prepared-memory footprints:
      * symmetric/asymmetric native nibble, native dual-scale Q6, and
-     * symmetric/asymmetric expanded INT8. The Qwen-32B FFN-down geometry makes
+     * symmetric/asymmetric native Q5. The Qwen-32B FFN-down geometry makes
      * each prepared panel larger than one private L2, so every format genuinely
      * exercises cache tiling rather than normalizing to full K.
      *

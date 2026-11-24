@@ -31,17 +31,16 @@ public:
      * @param n Logical output columns.
      * @param k Logical reduction elements.
      * @param max_bytes Allocation bound; the default is the Unit budget.
-     * @param rotation_enabled Select explicit symmetric rotated storage before allocating bytes.
      * @throws std::invalid_argument For nonpositive geometry.
      * @throws std::overflow_error If the requested fixture exceeds @p max_bytes.
      */
     explicit NativeQuantisedPreparedByteFixture(const NativeQuantisedFormatInfo &source, int n = 65, int k = 65,
-        std::size_t max_bytes = 4u * 1024u * 1024u, bool rotation_enabled = false)
+        std::size_t max_bytes = 4u * 1024u * 1024u)
         : descriptor{.columns = n, .reduction_width = k,
             .source = {.codebook_id = source.codebook_id, .is_superblock = source.is_superblock, .present = true},
-            .encoding = cpu::native_quantised::preparedEncodingForSource(source, rotation_enabled),
+            .encoding = cpu::native_quantised::preparedEncodingForSource(source),
             .numerical_policy = CPUProjectionNumericalPolicy::GPUAlignedExpert,
-            .is_asymmetric = !rotation_enabled && source.is_asymmetric}
+            .is_asymmetric = source.is_asymmetric}
     {
         if (n <= 0 || k <= 0)
             throw std::invalid_argument("Native CPU byte fixture requires positive geometry");
@@ -103,25 +102,6 @@ public:
                         static_cast<std::uint8_t>(seed >> 16), static_cast<std::uint8_t>(seed >> 24)};
                     coded_metadata::storeQ5HighBits(bytes.data() + unit + 1024, local, qh);
                 }
-                if (layout.usesInlineCompensation())
-                {
-                    int sum = 0;
-                    for (int byte = 0; byte < layout.payload_bytes; ++byte)
-                    {
-                        const auto value = bytes[unit + (byte / 4) * 256 + local * 4 + byte % 4];
-                        if (layout.usesExpandedInt8())
-                            sum += value < 128 ? value : int(value) - 256;
-                        else if (layout.codebook_id == 4)
-                            sum += kvalues_iq4nl_i8[value & 15] + kvalues_iq4nl_i8[value >> 4];
-                        else if (layout.codebook_id == kNativeQuantisedMXFP4Codebook)
-                            sum += mxfp4::kValues[value & 15] + mxfp4::kValues[value >> 4];
-                        else
-                            sum += (value & 15) + (value >> 4) - (layout.codebook_id == 0 ? 16 : 0);
-                    }
-                    const auto compensation = static_cast<std::int16_t>(sum);
-                    std::memcpy(bytes.data() + unit + layout.data_stride + local * 2,
-                        &compensation, sizeof(compensation));
-                }
                 if (layout.superblockCoded())
                 {
                     const auto codebook = superblockMetadataCodebook(layout.encoding, layout.codebook_id);
@@ -137,16 +117,15 @@ public:
                     }
                     continue;
                 }
-                const auto primary = unit + layout.data_stride + (layout.usesInlineCompensation() ? 128 : 0) + local * 2;
+                const auto primary = unit + layout.data_stride + local * 2;
                 if (layout.scaleEncoding() == CPUNativeQuantisedScaleEncoding::E8M0)
                 {
                     bytes[unit + layout.data_stride + local] = seed % 29u == 7u ? 0u : 2u + (seed >> 8) % 199u;
                     continue;
                 }
                 writeWord(primary, static_cast<std::uint16_t>(0x2401u + (seed & 0x1fffu)));
-                if (layout.is_asymmetric || layout.usesIQ3SExpandedSourceScale())
-                    writeWord(primary + 128, layout.usesIQ3SExpandedSourceScale() ? static_cast<std::uint16_t>(seed & 15u)
-                        : static_cast<std::uint16_t>(0xa301u + (seed & 0x0fffu)));
+                if (layout.is_asymmetric)
+                    writeWord(primary + 128, static_cast<std::uint16_t>(0xa301u + (seed & 0x0fffu)));
             }
     }
 

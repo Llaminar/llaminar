@@ -67,26 +67,6 @@ TEST(IQ3SSourceScale, MandatoryTupleMetadataAndOldGenerationsRejected)
     auto old=header;old.version=3;EXPECT_EQ(validateGpuPackedHeader(old,total), GpuPackedParseStatus::UnsupportedVersion);
     auto absent=header;absent.is_asymmetric=0;absent.mins_size=0;EXPECT_EQ(validateGpuPackedHeader(absent,total), GpuPackedParseStatus::MalformedInput);
     auto wrong=header;wrong.payload_bytes=32;EXPECT_EQ(validateGpuPackedHeader(wrong,total), GpuPackedParseStatus::MalformedInput);
-    PackedWeightsHeader cpu_header{};using Encoding=cpu::native_quantised::CPUNativeQuantisedEncoding;
-    cpu_header.codebook_id=11;cpu_header.is_superblock=1;cpu_header.payload_bytes=13;
-    cpu_header.prepared_encoding=static_cast<uint8_t>(Encoding::IQ3SExpandedSourceScale);
-    cpu_header.data_stride=2048;cpu_header.interleaved_block_stride=2432;
-    ASSERT_TRUE(packed_weights_serialization::validNativeSourceScaleTupleHeader(cpu_header));
-    cpu_header.interleaved_block_stride=2304;EXPECT_FALSE(packed_weights_serialization::validNativeSourceScaleTupleHeader(cpu_header));
-    cpu_header.interleaved_block_stride=2432;cpu_header.codebook_id=12;EXPECT_FALSE(packed_weights_serialization::validNativeSourceScaleTupleHeader(cpu_header));
-}
-/** @brief Keep explicit rotation encoding separate from ordinary source-factor preservation. */
-TEST(IQ3SSourceScale, OrdinaryAndExplicitRotationEncodingBoundaries)
-{
-    using namespace cpu::native_quantised;
-    EXPECT_EQ(preparedEncodingForCodebook(11,false),CPUNativeQuantisedEncoding::CompactMultiScale);
-    EXPECT_EQ(preparedEncodingForCodebook(11,true),CPUNativeQuantisedEncoding::ExpandedInt8);
-    PackedWeightsHeader header{};header.codebook_id=11;header.is_superblock=1;
-    header.prepared_encoding=static_cast<uint8_t>(CPUNativeQuantisedEncoding::ExpandedInt8);
-    header.payload_bytes=32;header.data_stride=2048;header.interleaved_block_stride=2304;
-    // This checks encoding validity only; archive metadata does not restore the
-    // separately owned activation-rotation basis (an existing distinct concern).
-    EXPECT_TRUE(packed_weights_serialization::validNativeSourceScaleTupleHeader(header));
 }
 /** @brief Raw grid, scale code and superblock bytes round-trip; earlier archive versions are inadmissible. */
 TEST(IQ3SSourceScale, CodedArchiveRoundTripRejectsOldVersionsBeforeAdoption)

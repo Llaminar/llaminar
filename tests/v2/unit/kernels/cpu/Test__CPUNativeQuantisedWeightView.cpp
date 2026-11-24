@@ -55,7 +55,7 @@ TEST(CPUNativeQuantisedWeightView, AllSourcesKeepTheirCanonicalRootAndMetadataCo
         EXPECT_EQ(view.blocks_per_row, 3);
         EXPECT_EQ(view.codebook_id, source.metadata->codebook_id);
         EXPECT_EQ(view.source_payload_bytes, source.metadata->payload_bytes);
-        EXPECT_EQ(view.payload_bytes, view.usesExpandedInt8() ? 32 : source.metadata->payload_bytes);
+        EXPECT_EQ(view.payload_bytes, view.usesSignedInt8SingleScale() ? 32 : source.metadata->payload_bytes);
         EXPECT_EQ(view.is_superblock, source.metadata->is_superblock);
         EXPECT_EQ(view.interleavedBase(), fixture.bytes.data());
         EXPECT_EQ(view.bytes().size(), fixture.bytes.size());
@@ -71,7 +71,6 @@ TEST(CPUNativeQuantisedWeightView, AllSourcesKeepTheirCanonicalRootAndMetadataCo
         }
         else
         {
-            const std::size_t metadata = view.usesInlineCompensation() ? 128 : 0;
             EXPECT_EQ(unit, fixture.bytes.data() + 5 * view.interleaved_block_stride);
             if (view.scaleEncoding() == CPUNativeQuantisedScaleEncoding::E8M0)
             {
@@ -79,10 +78,10 @@ TEST(CPUNativeQuantisedWeightView, AllSourcesKeepTheirCanonicalRootAndMetadataCo
                 EXPECT_THROW((void)view.chunkScales(1, 2), std::logic_error);
             }
             else
-                EXPECT_EQ(reinterpret_cast<const std::uint8_t *>(view.chunkScales(1, 2)), unit + view.data_stride + metadata);
-            if (view.is_asymmetric || view.usesNibbleLUTSourceScale() || view.usesIQ3SExpandedSourceScale() ||
+                EXPECT_EQ(reinterpret_cast<const std::uint8_t *>(view.chunkScales(1, 2)), unit + view.data_stride);
+            if (view.is_asymmetric || view.usesNibbleLUTSourceScale() ||
                 view.usesQ6KNativeDualScale())
-                EXPECT_EQ(reinterpret_cast<const std::uint8_t *>(view.chunkMins(1, 2)), unit + view.data_stride + metadata + 128);
+                EXPECT_EQ(reinterpret_cast<const std::uint8_t *>(view.chunkMins(1, 2)), unit + view.data_stride + 128);
             else
                 EXPECT_THROW((void)view.chunkMins(1, 2), std::logic_error);
             EXPECT_THROW((void)view.superblockHeader(1, 2), std::logic_error);
@@ -138,7 +137,7 @@ TEST(CPUNativeQuantisedWeightView, OriginalSourceFactorsRetainEveryRoundingBound
     {
         PreparedBytes fixture(*source, 64, 32);
         const auto view = fixture.view();
-        const std::size_t primary = view.data_stride + (view.usesInlineCompensation() ? 128 : 0);
+        const std::size_t primary = view.data_stride;
         const std::size_t secondary = primary + 128;
         constexpr std::uint16_t base_word = 0x1235;
         const float base = fp16_to_fp32(base_word);
@@ -191,14 +190,14 @@ TEST(CPUNativeQuantisedWeightView, OriginalSourceFactorsRetainEveryRoundingBound
 }
 
 /** @test Missing secondary vectors mean an exact zero, never a speculative metadata read. */
-TEST(CPUNativeQuantisedWeightView, SingleFactorsAndAdmittedRotatedQ8HaveBoundedZeroMinimum)
+TEST(CPUNativeQuantisedWeightView, SingleFactorsHaveBoundedZeroMinimum)
 {
     for (const auto &source : native_quantised_formats::kAllSourceFormats)
     {
         SCOPED_TRACE(std::string(source.quant_type));
         PreparedBytes fixture(*source.metadata, 64, 32);
         const auto view = fixture.view();
-        const bool zero_minimum = view.usesNibbleLUTSourceScale() || view.usesIQ3SExpandedSourceScale() ||
+        const bool zero_minimum = view.usesNibbleLUTSourceScale() ||
             (!view.is_asymmetric && !view.usesQ6KNativeDualScale() && !view.usesCompactMultiScale());
         if (zero_minimum)
             expectFactor(view.blockMin(0, 0, 0), 0.0f, "single-factor zero");
@@ -206,19 +205,6 @@ TEST(CPUNativeQuantisedWeightView, SingleFactorsAndAdmittedRotatedQ8HaveBoundedZ
         EXPECT_THROW((void)view.blockMin(0, -1, 0), std::out_of_range);
         EXPECT_THROW((void)view.blockMin(1, 0, 0), std::out_of_range);
         EXPECT_THROW((void)view.blockMin(0, 1, 0), std::out_of_range);
-
-        PreparedBytes rotated(*source.metadata, 64, 32, 4u * 1024u * 1024u, true);
-        if (!view.usesExpandedInt8())
-        {
-            EXPECT_THROW((void)rotated.view(), std::invalid_argument);
-            continue;
-        }
-        const auto rotated_view = rotated.view();
-        EXPECT_EQ(rotated_view.payload_bytes, 32);
-        EXPECT_EQ(rotated_view.source_payload_bytes, source.metadata->payload_bytes);
-        expectFactor(rotated_view.blockMin(0, 0, 63), 0.0f, "rotated zero");
-        EXPECT_THROW((void)rotated_view.chunkMins(0, 0), std::logic_error);
-        EXPECT_THROW((void)rotated_view.blockMin(-1, -1, 0), std::out_of_range);
     }
 }
 

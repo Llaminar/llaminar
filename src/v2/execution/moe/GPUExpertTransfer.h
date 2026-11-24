@@ -14,7 +14,7 @@
  *
  *   CPU interleaved:
  *     Per K-block across 64 rows (N-chunk): [1024B payload (4 groups × 4 ZMMs,
- *     transposed)] [128B comp_int16] [128B scales_fp16] [128B mins_fp16]
+ *     transposed)] [128B scales_fp16] [128B mins_fp16]
  *     - Payload bytes are transposed into VNNI register layout for AVX-512
  *     - stride = 1280B (symmetric) or 1408B (asymmetric)
  *

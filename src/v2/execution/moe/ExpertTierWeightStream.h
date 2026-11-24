@@ -91,7 +91,7 @@ namespace llaminar2
         uint8_t gpu_is_asymmetric = 0;
         uint8_t gpu_has_emins = 0;
         cpu::native_quantised::CPUNativeQuantisedEncoding cpu_encoding =
-            cpu::native_quantised::CPUNativeQuantisedEncoding::ExpandedInt8;
+            cpu::native_quantised::CPUNativeQuantisedEncoding::SignedInt8SingleScale;
 
         // Allocation and ordered-chunk geometry derived from endpoint formats.
         uint32_t cpu_data_stride = 0;

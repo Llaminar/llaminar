@@ -39,3 +39,76 @@ Audited at `6c7a490d669e19e4a54290f13b4ac9cd72aace57` on PR #73. Source referenc
 ## Phase A validation
 
 Two temporary Apple arm64 `clang++ -std=c++20 -Isrc/v2` probes used the production headers. The first executed the selector and footprint for all 22 source tuples: only Q8_0, Q8_1 and Q8_K returned 1; no tuple returned 5 or stored compensation; the explicit rotation flag would put compensation on exactly 19 non-Q8 tuples. The second exercised the real metadata seal: it admitted a compensated Q4_0-source value-1 unit and rejected a correctly sized IQ3_S value-5 unit with `Native CPU weight view encoding disagrees with original source`. The packed MPI receive-to-publication path is source-traced, not replayed end to end. No source/kernel edits, CTest, native profiling or WSL runs were needed for this audit.
+
+## Phase B: installed layout
+
+The v9 receive and CPU publication fence landed in `1773c0696`. The remaining
+retirement removes the weight-preparation rotation mode and the stored signed
+weight-sum plane. Encoding 5 remains reserved and receives the same diagnostic;
+value 1 is now `SignedInt8SingleScale`, used only by Q8_0, Q8_1 and Q8_K. Its
+resident unit and v9 wire layout still hold 32 signed bytes and one FP16 scale
+per column. Per-row activation sums used to recenter x86 signed Q8 dots are
+still live; they are not a stored weight plane. Native IQ3_S keeps its coded
+payload and metadata, and KV rotation is unchanged.
+
+`V2_Integration_CPUPackedWeightsV9Admission` still seals all 22 source layouts
+after byte-identical v9 round trips and verifies early rejection of both
+retired encodings and the old compensated Q8 extent. The audit above records
+the pre-retirement tree; its historical symbols and line numbers are intentional.
+
+### Local Q8 code-generation and byte comparison
+
+Baseline: `6b600509a` (the landed x86 panel stack). GCC 14 `-O3` emitted
+identical disassembly, including relocations, for the eight baseline ASIMD
+Q8 tile leaves (M=1–4, both policies), and for all 22 Q8 tile leaves in the
+ASIMD/SDOT/I8MM compiler envelope. AVX2 and AVX-512/VNNI compiled the
+projection and packed-prefill objects. The x86 dispatchers contain multiple
+formats and formerly held both signed-byte operand orders, so entire-symbol
+identity is not the comparison target. The surviving Q8 branches still use
+signed activation bytes, unsigned weight bytes obtained by XOR with 128, and
+subtract `128 * sum(activation)` before FP conversion. AVX2 Q8_0 retains its
+two bounded INT16 nibble accumulators and the same widening/merge. AVX-512
+retains `vpdpbusd` and the scale widening; under BackendNative the two
+scales are multiplied before the converted dot enters the FMA. GPUAlignedExpert
+keeps separate combined-scale, scaled-dot and add rounding steps, followed by
+the original ordered partition fold. Removing irrelevant branches lets GCC unroll or reschedule independent
+dot chains; neither the dependency order nor the FP rounding boundaries move.
+
+A local Rosetta AVX2 replay drove the before/after production chunk and ordered
+partition leaves with the same resident byte layout for Q8_0, Q8_1 and Q8_K,
+both policies, M=1–4 and 1–4 workers over seven N-chunks and 17 K blocks. All 96
+cases matched (`430080` bytes; SHA-256
+`00de47d969cc79f308ba7cd88b8b900d11889b42c1e7f19e82b88eced2371ae0`).
+This is a byte replay, not a throughput measurement or native AVX-512 run.
+
+The raw x86 symbol extents below include non-Q8 dispatch/other formats as
+well as the affected loops. Stack counts are conservative static maxima over
+back-edge ranges containing both an integer dot and an FP contribution in
+those symbols, not per-token memory traffic. They include mixed dispatch and
+alternate workspace code paths, so they do not claim that every listed
+reference executes for a typical admitted Q8 matrix.
+
+| GCC 14 probe | Bytes before → after (hex) | Vector stack references, max before → after |
+| --- | ---: | ---: |
+| AVX2 one-row non-nibble | `1c88` → `15e5` | 0 → 0 |
+| AVX2 two-row non-nibble | `20c1` → `1dc8` | 20 → 20 |
+| AVX-512 one-row non-nibble | `1fef` → `1321` | 72 → 2 |
+| AVX-512 two-row non-nibble | `2100` → `22e1` | 144 → 42 |
+| AVX-512 three-row non-nibble | `2ef1` → `22eb` | 59 → 29 |
+| AVX-512 four-row non-nibble | `2e9d` → `295e` | 85 → 39 |
+| AVX-512 Q8 ordered-pair wrapper | `1d53` → `0959` | 1 → 0 |
+
+The AVX-512 two-row mixed symbol grew as GCC unrolled the surviving inner
+program. Following the Q8 dot and FP contribution instructions through the
+K-loop back-edges showed no new stack traffic for dot or accumulator vectors
+in AVX2 one-/two-row, AVX-512 one-/two-/three-/four-row, or the AVX-512
+ordered-pair program. The three-row assembly does move one 64-bit layout
+scalar through an XMM register (`vmovq`) for a block-offset multiply; it is
+not a dot, scale, or accumulator spill. No Q8 leaf gains a scratch output or
+a post-loop scratch copy; the original accumulator writes directly to the
+row or ordered partial it owns.
+
+The local GNU-14 NEON register-proof target passes with the retired programs
+absent. Native Q5 is now named directly in the same ratchet: its numeric
+ceilings are copied unchanged from the corresponding former fallback
+programs.

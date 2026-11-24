@@ -274,7 +274,7 @@ namespace llaminar2
                     const bool single_scale = expertTierPreservesNativeSingleScale(layout.cpu_encoding, layout.cpu_codebook_id);
                     EXPECT_TRUE(layout.cpuStorage().coded() || single_scale ||
                         layout.cpu_encoding == CPUNativeQuantisedEncoding::Q6KNativeDualScale);
-                    if (layout.cpu_encoding == CPUNativeQuantisedEncoding::ExpandedInt8)
+                    if (layout.cpu_encoding == CPUNativeQuantisedEncoding::SignedInt8SingleScale)
                     {
                         EXPECT_TRUE(single_scale);
                         EXPECT_EQ(layout.gpu_codebook_id, 19u);
@@ -292,7 +292,7 @@ namespace llaminar2
             const auto manifest = makeGpuToCpuExpertTierWeightStreamManifest(
                 native_quantised_formats::Q4_1, 70, 96, 5, 0, 0, ExpertTierWeightProjection::Gate, 3);
             auto expanded = manifest.deviceLayout();
-            expanded.cpu_encoding = CPUNativeQuantisedEncoding::ExpandedInt8;
+            expanded.cpu_encoding = CPUNativeQuantisedEncoding::SignedInt8SingleScale;
             expanded.cpu_data_stride = preparedDataStride(expanded.cpu_encoding, expanded.cpu_codebook_id);
             expanded.cpu_block_stride = preparedInterleavedBlockStride(expanded.cpu_encoding, true, expanded.cpu_codebook_id);
             expanded.gpu_codebook_id = retired_decoder;
@@ -484,7 +484,7 @@ namespace llaminar2
                 EXPECT_EQ(view.N, cpu.N);
                 EXPECT_EQ(view.K, cpu.K);
                 EXPECT_EQ(view.source_payload_bytes, source.metadata->payload_bytes);
-                EXPECT_EQ(view.payload_bytes, view.usesExpandedInt8() ? 32 : source.metadata->payload_bytes);
+                EXPECT_EQ(view.payload_bytes, view.usesSignedInt8SingleScale() ? 32 : source.metadata->payload_bytes);
                 EXPECT_EQ(view.encoding, cpu.encoding);
                 EXPECT_EQ(view.numerical_policy, cpu.numerical_policy);
             }
@@ -543,7 +543,7 @@ namespace llaminar2
                     .mins_bytes = staged.mins.size() * sizeof(uint16_t), .emins_bytes = staged.emins.size() * sizeof(uint32_t)};
                 EXPECT_FALSE(legacy_view.validFor(layout));
                 auto legacy_layout = layout;
-                legacy_layout.cpu_encoding = CPUNativeQuantisedEncoding::ExpandedInt8;
+                legacy_layout.cpu_encoding = CPUNativeQuantisedEncoding::SignedInt8SingleScale;
                 legacy_layout.cpu_data_stride = preparedDataStride(legacy_layout.cpu_encoding, source.codebook_id);
                 legacy_layout.cpu_block_stride = preparedInterleavedBlockStride(legacy_layout.cpu_encoding,
                     source.is_asymmetric, source.codebook_id);
@@ -991,7 +991,7 @@ namespace llaminar2
                 layout.cpu_codebook_id = layout.gpu_source_codebook_id = id;
                 layout.cpu_is_superblock = layout.gpu_source_is_superblock = 1;
                 layout.cpu_is_asymmetric = layout.gpu_is_asymmetric = 1;
-                layout.cpu_encoding = cpu::native_quantised::CPUNativeQuantisedEncoding::ExpandedInt8;
+                layout.cpu_encoding = cpu::native_quantised::CPUNativeQuantisedEncoding::SignedInt8SingleScale;
                 layout.cpu_data_stride = cpu::native_quantised::preparedDataStride(layout.cpu_encoding, layout.cpu_codebook_id);
                 layout.cpu_block_stride = cpu::native_quantised::preparedInterleavedBlockStride(layout.cpu_encoding, true, layout.cpu_codebook_id);
                 layout.gpu_codebook_id = 23;
@@ -1197,7 +1197,7 @@ namespace llaminar2
                     EXPECT_EQ(view.interleavedBase(), projection.destination_bytes.data());
                     EXPECT_EQ(view.bytes().size(), projection.destination_bytes.size());
                     EXPECT_EQ(view.source_payload_bytes, entry.metadata->payload_bytes);
-                    EXPECT_EQ(view.payload_bytes, view.usesExpandedInt8() ? 32 : entry.metadata->payload_bytes);
+                    EXPECT_EQ(view.payload_bytes, view.usesSignedInt8SingleScale() ? 32 : entry.metadata->payload_bytes);
                 }
                 lease.reset();
                 EXPECT_EQ(pool->usedSlots(), 0u);

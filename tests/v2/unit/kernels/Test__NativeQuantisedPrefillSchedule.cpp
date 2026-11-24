@@ -50,7 +50,7 @@ namespace
         for (int columns : {1, 31, 63, 64, 128})
         {
             const PrefillScheduleGeometry shape{32, columns, columns, 1, 28,
-                CPUNativeQuantisedEncoding::ExpandedInt8, PrefillRowKernelSet::WideRows};
+                CPUNativeQuantisedEncoding::SignedInt8SingleScale, PrefillRowKernelSet::WideRows};
             EXPECT_EQ(resolvePrefillSchedule(PrefillSchedulePolicy::Auto, shape),
                       PrefillSchedulePolicy::RowChunkGrid);
             for (auto forced : {PrefillSchedulePolicy::RowChunkGrid,
@@ -81,7 +81,7 @@ namespace
     TEST(NativeQuantisedPrefillSchedule, LongCompactGridReusesFourRowsOnlyOnWideISA)
     {
         for (const auto encoding : {CPUNativeQuantisedEncoding::NibbleLUT,
-                                   CPUNativeQuantisedEncoding::ExpandedInt8,
+                                   CPUNativeQuantisedEncoding::SignedInt8SingleScale,
                                    CPUNativeQuantisedEncoding::Q6KNativeDualScale,
                                    CPUNativeQuantisedEncoding::CompactMultiScale})
         for (const auto kernels : {PrefillRowKernelSet::Pairwise, PrefillRowKernelSet::WideRows})

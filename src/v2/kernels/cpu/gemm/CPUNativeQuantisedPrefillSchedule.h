@@ -74,7 +74,7 @@ namespace llaminar2::cpu::native_quantised
         int row_stride = 0;     ///< Output stride in floats, at least N.
         int n_block_chunks = 0; ///< Positive number of 64-column chunks per task.
         int workers = 0;        ///< Actual invocation's positive worker budget.
-        CPUNativeQuantisedEncoding encoding = CPUNativeQuantisedEncoding::ExpandedInt8;
+        CPUNativeQuantisedEncoding encoding = CPUNativeQuantisedEncoding::SignedInt8SingleScale;
         PrefillRowKernelSet row_kernels = PrefillRowKernelSet::Pairwise;
     };
 
@@ -94,7 +94,7 @@ namespace llaminar2::cpu::native_quantised
      * and single workers likewise retain column reuse.
      * Long grid launches with native dual-scale/compact multi-scale weights
      * amortize their expensive bitplane/grid decoding over four rows. The
-     * all-format comparison does not justify widening nibble/expanded INT8
+     * all-format comparison does not justify widening nibble/signed Q8
      * encodings. Require 128 rows and four complete worker waves so smaller
      * batches retain the two-row kernel's greater column-level parallelism.
      * All intermediates are widened before rounding or multiplication.

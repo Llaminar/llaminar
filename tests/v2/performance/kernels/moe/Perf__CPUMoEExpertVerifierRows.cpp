@@ -1656,7 +1656,7 @@ TEST(Perf_CPUMoEExpertVerifierRows, MixedGateCandidateContract)
     EXPECT_EQ(eligibleThreeGatePolicy(descriptor,plan,true),VerifierRowsPolicy::Auto);
     packed.numerical_policy=CPUProjectionNumericalPolicy::GPUAlignedExpert;descriptor.purpose=ProjectionRowsPurpose::MTPVerifier;
     EXPECT_EQ(eligibleThreeGatePolicy(descriptor,plan,true),VerifierRowsPolicy::Auto);
-    descriptor.purpose=ProjectionRowsPurpose::Prefill;packed.encoding=CPUNativeQuantisedEncoding::ExpandedInt8;
+    descriptor.purpose=ProjectionRowsPurpose::Prefill;packed.encoding=CPUNativeQuantisedEncoding::SignedInt8SingleScale;
     EXPECT_EQ(eligibleThreeGatePolicy(descriptor,plan,true),VerifierRowsPolicy::Auto);
 #endif
     MixedGateRouteCounts remaining{{{"3","320","2560","5","OrderedThreeRows"},2},{{"1","320","2560","5","Auto"},2}};

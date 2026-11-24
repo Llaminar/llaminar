@@ -105,17 +105,15 @@ TEST(CPUNativeBlockDecode, AllSourceFormatsRetainTheirPreparedEncodingIdentity)
         {
             const unsigned scale = preparedScaleEncoding(format.codebook_id, encoding) ==
                 CPUNativeQuantisedScaleEncoding::E8M0 ? 1u : 2u;
-            const unsigned comp = preparedUsesInlineCompensation(encoding, format.codebook_id) ? 2u : 0u;
-            EXPECT_EQ(geometry.block_stride - data, 64u * (scale + comp + (format.is_asymmetric ? 2u : 0u)));
+            EXPECT_EQ(geometry.block_stride - data, 64u * (scale + (format.is_asymmetric ? 2u : 0u)));
             EXPECT_EQ(geometry.header_bytes, 0u);
         }
         EXPECT_EQ(native_quantised_formats::forSourceIdentity(format.codebook_id, format.is_superblock),
                   source.metadata);
-        EXPECT_EQ(preparedEncodingForSource(format, true), CPUNativeQuantisedEncoding::ExpandedInt8);
         encodings.insert(encoding);
     }
     using Encoding = CPUNativeQuantisedEncoding;
-    const std::set expected{Encoding::NibbleLUT, Encoding::ExpandedInt8, Encoding::Q6KNativeDualScale,
+    const std::set expected{Encoding::NibbleLUT, Encoding::SignedInt8SingleScale, Encoding::Q6KNativeDualScale,
         Encoding::CompactMultiScale, Encoding::NibbleLUTSourceScale, Encoding::Q4KSuperblockCoded,
         Encoding::Q5NativeSingleScale};
     EXPECT_EQ(encodings, expected);

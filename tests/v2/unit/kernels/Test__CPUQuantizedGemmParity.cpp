@@ -723,18 +723,8 @@ namespace
             {5120, 17408},
             {248320, 7168},
         };
-        struct PreparedFormatCase
-        {
-            uint8_t codebook;
-            bool asymmetric;
-        };
-        constexpr PreparedFormatCase prepared_formats[] = {
-            {0, false},  // Nibble symmetric: 1280 bytes.
-            {5, true},   // Nibble asymmetric: 1408 bytes.
-            {6, false},  // Expanded INT8 symmetric: 2304 bytes.
-            {7, true},   // Expanded INT8 asymmetric: 2432 bytes.
-            {8, false},  // Native Q6 dual-scale: 1792 bytes.
-        };
+        using namespace native_quantised_formats;
+        const std::array prepared_formats{&Q4_0, &Q4_1, &Q8_0, &Q5_0, &Q5_1, &Q6_K};
 
         for (const int threads : thread_counts)
         {
@@ -742,11 +732,10 @@ namespace
             {
                 for (const auto &shape : shapes)
                 {
-                    for (const PreparedFormatCase format : prepared_formats)
+                    for (const auto *format : prepared_formats)
                     {
                         const NativeQuantisedPreparedFootprint footprint =
-                            preparedFootprintForFormat(
-                                format.codebook, format.asymmetric);
+                            preparedFootprintForFormat(*format);
                         SCOPED_TRACE(
                             ::testing::Message()
                             << "threads=" << threads << " M=" << M
@@ -767,7 +756,7 @@ namespace
         }
 
         const NativeQuantisedPreparedFootprint footprint =
-            preparedFootprintForFormat(/*Q4_0=*/0, false);
+            preparedFootprintForFormat(native_quantised_formats::Q4_0);
         EXPECT_THROW(
             (void)computeTileConfig(896, 896, 32, footprint, 0),
             std::invalid_argument);
@@ -800,19 +789,15 @@ namespace
         constexpr int threads = 28;
 
         const NativeQuantisedPreparedFootprint nibble_symmetric_footprint =
-            preparedFootprintForFormat(/*Q4_0=*/0, false);
+            preparedFootprintForFormat(native_quantised_formats::Q4_0);
         const NativeQuantisedPreparedFootprint nibble_asymmetric_footprint =
-            preparedFootprintForFormat(/*Q4_1=*/5, true);
-        const NativeQuantisedPreparedFootprint expanded_symmetric_footprint =
-            preparedFootprintForFormat(native_quantised_formats::Q4_0, /*rotation_enabled=*/true);
-        // Retain a synthetic expanded minimum as a distinct physical cache case;
-        // the ordinary Q5 sources now choose compact five-bit payloads below.
-        const NativeQuantisedPreparedFootprint expanded_asymmetric_footprint =
-            preparedFootprintForFormat(/*expanded codebook=*/7, true);
+            preparedFootprintForFormat(native_quantised_formats::Q4_1);
+        const NativeQuantisedPreparedFootprint signed_q8_footprint =
+            preparedFootprintForFormat(native_quantised_formats::Q8_0);
         const auto q5_symmetric_footprint = preparedFootprintForFormat(native_quantised_formats::Q5_0);
         const auto q5_asymmetric_footprint = preparedFootprintForFormat(native_quantised_formats::Q5_1);
         const NativeQuantisedPreparedFootprint q6_footprint =
-            preparedFootprintForFormat(/*Q6_K=*/8, false);
+            preparedFootprintForFormat(native_quantised_formats::Q6_K);
 
         EXPECT_EQ(
             nibble_symmetric_footprint.encoding,
@@ -823,24 +808,12 @@ namespace
             CPUNativeQuantisedEncoding::NibbleLUT);
         EXPECT_TRUE(nibble_asymmetric_footprint.is_asymmetric);
         EXPECT_EQ(
-            expanded_symmetric_footprint.encoding,
-            CPUNativeQuantisedEncoding::ExpandedInt8);
-        EXPECT_FALSE(expanded_symmetric_footprint.is_asymmetric);
-        EXPECT_EQ(
-            expanded_asymmetric_footprint.encoding,
-            CPUNativeQuantisedEncoding::ExpandedInt8);
-        EXPECT_TRUE(expanded_asymmetric_footprint.is_asymmetric);
+            signed_q8_footprint.encoding,
+            CPUNativeQuantisedEncoding::SignedInt8SingleScale);
+        EXPECT_FALSE(signed_q8_footprint.is_asymmetric);
         EXPECT_EQ(
             q6_footprint.encoding,
             CPUNativeQuantisedEncoding::Q6KNativeDualScale);
-
-        const NativeQuantisedPreparedFootprint rotated_nibble =
-            preparedFootprintForFormat(
-                /*Q4_0=*/0, false, /*rotation_enabled=*/true);
-        EXPECT_EQ(
-            rotated_nibble.encoding,
-            CPUNativeQuantisedEncoding::ExpandedInt8);
-        EXPECT_FALSE(rotated_nibble.is_asymmetric);
 
         EXPECT_EQ(
             prefillL2ResidencyFraction(nibble_symmetric_footprint, M),
@@ -866,18 +839,11 @@ namespace
             nibble_asymmetric_footprint,
             threads,
             cache);
-        const NativeQuantisedTileConfig expanded_symmetric = computeTileConfig(
+        const NativeQuantisedTileConfig signed_q8 = computeTileConfig(
             N,
             K,
             M,
-            expanded_symmetric_footprint,
-            threads,
-            cache);
-        const NativeQuantisedTileConfig expanded_asymmetric = computeTileConfig(
-            N,
-            K,
-            M,
-            expanded_asymmetric_footprint,
+            signed_q8_footprint,
             threads,
             cache);
         const NativeQuantisedTileConfig q6_shallow = computeTileConfig(
@@ -895,8 +861,7 @@ namespace
         constexpr auto default_budget = usable_l2 / 4u;
         EXPECT_EQ(nibble_symmetric.k_tile_blocks, blocksIn(nibble_symmetric_footprint, default_budget));
         EXPECT_EQ(nibble_asymmetric.k_tile_blocks, blocksIn(nibble_asymmetric_footprint, default_budget));
-        EXPECT_EQ(expanded_symmetric.k_tile_blocks, blocksIn(expanded_symmetric_footprint, default_budget));
-        EXPECT_EQ(expanded_asymmetric.k_tile_blocks, blocksIn(expanded_asymmetric_footprint, default_budget));
+        EXPECT_EQ(signed_q8.k_tile_blocks, blocksIn(signed_q8_footprint, default_budget));
         EXPECT_EQ(q6_shallow.k_tile_blocks, blocksIn(q6_footprint, usable_l2 / 8u));
         EXPECT_EQ(q6_deep.k_tile_blocks, blocksIn(q6_footprint, usable_l2 * 3u / 4u));
         for (const auto &footprint : {q5_symmetric_footprint, q5_asymmetric_footprint})
@@ -904,8 +869,7 @@ namespace
             EXPECT_EQ(footprint.encoding, CPUNativeQuantisedEncoding::Q5NativeSingleScale);
             const auto compact = computeTileConfig(N, K, M, footprint, threads, cache);
             EXPECT_EQ(compact.k_tile_blocks, blocksIn(footprint, default_budget));
-            EXPECT_GT(compact.k_tile_blocks, footprint.is_asymmetric
-                ? expanded_asymmetric.k_tile_blocks : expanded_symmetric.k_tile_blocks);
+            EXPECT_GT(compact.k_tile_blocks, signed_q8.k_tile_blocks);
         }
 
         // Small full-K panels remain represented by zero (no tiling).
@@ -927,7 +891,7 @@ namespace
             std::invalid_argument);
 
         NativeQuantisedPreparedFootprint invalid_encoding =
-            expanded_symmetric_footprint;
+            signed_q8_footprint;
         invalid_encoding.encoding =
             static_cast<CPUNativeQuantisedEncoding>(255);
         EXPECT_THROW(
@@ -942,7 +906,7 @@ namespace
                 N,
                 K,
                 M,
-                preparedFootprintForFormat(/*Q4_0=*/0, false),
+                preparedFootprintForFormat(native_quantised_formats::Q4_0),
                 threads,
                 invalid_cache),
             std::invalid_argument);

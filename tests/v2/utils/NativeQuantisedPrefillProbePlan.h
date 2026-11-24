@@ -67,7 +67,7 @@ namespace llaminar2::test::trainer
         int N,
         int threads,
         cpu::native_quantised::CPUNativeQuantisedEncoding encoding =
-            cpu::native_quantised::CPUNativeQuantisedEncoding::ExpandedInt8)
+            cpu::native_quantised::CPUNativeQuantisedEncoding::SignedInt8SingleScale)
     {
         if (M < 2 || N <= 0 || threads <= 0)
         {

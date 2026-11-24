@@ -125,7 +125,7 @@ TEST(CPUWeightPreparationMemory, ImmediateNativePackingChargesBoundedOriginalScr
     }
     StagingObservedQ4 source(source_rows,k,std::move(raw),memory,allocator);
     cpu::native_quantised::CPUNativeQuantisedPackedWeights packed;
-    ASSERT_TRUE(cpu::native_quantised::packWeightsCPUNativeQuantised(&source,packed,7,72,nullptr,
+    ASSERT_TRUE(cpu::native_quantised::packWeightsCPUNativeQuantised(&source,packed,7,72,
         CPUWeightStoragePlacement::accounted(memory,allocator,PhysicalMemoryOwner::PrimaryModelWeights,
             CPUWeightStoragePlacement::local())));
     EXPECT_EQ(source.observed_bytes.load(),bytes.temporary_bytes);

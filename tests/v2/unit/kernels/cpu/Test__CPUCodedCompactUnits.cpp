@@ -503,9 +503,6 @@ namespace llaminar2::test
                               .weight_bytes_per_n_chunk_k_block, source.prepared_bytes_per_32 * 64.0);
         }
         EXPECT_EQ(preparedEncodingForSource(native_quantised_formats::Q5_1), CPUNativeQuantisedEncoding::Q5NativeSingleScale);
-        EXPECT_EQ(preparedEncodingForSource(native_quantised_formats::Q5_1, true), CPUNativeQuantisedEncoding::ExpandedInt8);
-        EXPECT_EQ(preparedEncodingForSource(native_quantised_formats::Q5_K, true), CPUNativeQuantisedEncoding::ExpandedInt8);
-        EXPECT_EQ(preparedEncodingForSource(native_quantised_formats::IQ3_S, true), CPUNativeQuantisedEncoding::ExpandedInt8);
     }
 
     /** The production SIMD projection equals the scalar codec reference for every compact format. */
@@ -755,7 +752,7 @@ namespace llaminar2::test
                 .primary_layout=packed.codebook_id == 25 ? VnniPrimaryScaleLayout::PowerOfTwoBF16Words
                                                         : VnniPrimaryScaleLayout::FP16Words}, column, 0, block);
             std::int8_t weight[32];
-            if (packed.usesExpandedInt8())
+            if (packed.usesSignedInt8SingleScale())
                 std::memcpy(weight, payload, sizeof(weight));
             else
                 decode_native_block(packed.codebook_id, payload, weight);
@@ -873,7 +870,6 @@ namespace llaminar2::test
             SCOPED_TRACE(source.name);
             CPUNativeQuantisedPackedWeights packed;
             ASSERT_TRUE(packWeightsCPUNativeQuantised(tensor.get(), packed));
-            EXPECT_FALSE(packed.usesInlineCompensation());
             EXPECT_EQ(packed.native_interleaved.size(), source.prepared_bytes_per_32 * 128 * 16);
             if (source.name == "Q4_K")
                 EXPECT_TRUE(packed.superblockCoded());

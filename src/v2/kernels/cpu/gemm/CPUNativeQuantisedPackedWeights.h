@@ -28,19 +28,6 @@
 
 namespace llaminar2::cpu::native_quantised
 {
-    /**
-     * @brief Integer coefficient interpretation guaranteed by canonical preparation.
-     *
-     * This describes the unscaled integer payload, not its final FP32 weight.
-     * Other asymmetric families may have negative decoded bytes and therefore
-     * cannot infer unsigned operands merely from minimum-plane presence.
-     */
-    enum class CPUNativeQuantisedCoefficientDomain : uint8_t
-    {
-        SignedInt8,     ///< General decoded coefficients in [-128, 127].
-        UnsignedFiveBit, ///< Canonical Q5_1/Q5_K coefficients in [0, 31].
-    };
-
     /** @brief Sole retained backing and metadata for an admitted prepared CPU matrix. */
     struct CPUNativeQuantisedPackedWeights
     {
@@ -50,11 +37,11 @@ namespace llaminar2::cpu::native_quantised
 
         /// VNNI-interleaved weight data with inline metadata (64-byte aligned).
         ///
-        /// Each K-block contains group data followed by comp, scales, and optionally mins:
-        ///   [groups × 4 ZMMs × 64B | 128B comp_int16 | 128B scales_fp16 | 128B mins_fp16]
+        /// Each K-block contains group data followed by scales and optionally minima:
+        ///   [groups × 4 ZMMs × 64B | 128B scales_fp16 | 128B mins_fp16]
         ///
-        /// For nibble-LUT formats: 4 groups (1024B data) + 256B metadata = 1280B (symmetric)
-        /// For INT8 pre-decoded: 8 groups (2048B data) + 256B metadata = 2304B (symmetric)
+        /// For nibble-LUT formats: 4 groups (1024B data) + 128B metadata = 1152B (symmetric)
+        /// For Q8: 8 groups (2048B data) + 128B metadata = 2176B (symmetric)
         /// Asymmetric formats add 128B for mins.
         ///
         /// When deferred packing is active (workspace_data_ is set), this may be empty.
@@ -91,7 +78,7 @@ namespace llaminar2::cpu::native_quantised
         bool is_superblock = false;
 
         /// Physical prepared encoding consumed by serial and grouped kernels.
-        CPUNativeQuantisedEncoding encoding = CPUNativeQuantisedEncoding::ExpandedInt8;
+        CPUNativeQuantisedEncoding encoding = CPUNativeQuantisedEncoding::SignedInt8SingleScale;
 
         /// Interpretation of the primary scale words, derived from codebook and encoding.
         [[nodiscard]] CPUNativeQuantisedScaleEncoding scaleEncoding() const noexcept
@@ -121,7 +108,7 @@ namespace llaminar2::cpu::native_quantised
         int data_stride = 1024;
 
         /// Total bytes per K-block including inline metadata.
-        /// ExpandedInt8: payload + optional compensation + primary and optional minimum scales.
+        /// SignedInt8SingleScale: signed Q8 payload plus primary FP16 scale.
         int interleaved_block_stride = 1280;
 
         /** @brief Return whether this matrix uses native four-bit interleaving. */
@@ -137,35 +124,10 @@ namespace llaminar2::cpu::native_quantised
             return encoding == CPUNativeQuantisedEncoding::NibbleLUTSourceScale;
         }
 
-        /** @brief Return whether this matrix was expanded to signed INT8. */
-        [[nodiscard]] bool usesExpandedInt8() const noexcept
+        /** @brief Return whether this matrix retains native signed Q8 bytes. */
+        [[nodiscard]] bool usesSignedInt8SingleScale() const noexcept
         {
-            return encoding == CPUNativeQuantisedEncoding::ExpandedInt8 || usesIQ3SExpandedSourceScale();
-        }
-
-        /**
-         * @brief Resolve signedness from the immutable canonical prepared tuple.
-         * @return UnsignedFiveBit only for ordinary expanded Q5 coefficients.
-         *
-         * Both Q5_1 and Q5_K keep their original nonnegative five-bit codes;
-         * scale/minimum terms stay separate. Signed Q5_0/Q8 and source-factor
-         * encodings retain the general signed interpretation. No payload scan,
-         * cache, capability probe, storage change or numerical-policy override
-         * is needed to choose VNNI's unsigned operand.
-         */
-        [[nodiscard]] CPUNativeQuantisedCoefficientDomain coefficientDomain() const noexcept
-        {
-            return encoding == CPUNativeQuantisedEncoding::ExpandedInt8 &&
-                    codebook_id == native_quantised_formats::Q5_1.codebook_id &&
-                    is_asymmetric
-                ? CPUNativeQuantisedCoefficientDomain::UnsignedFiveBit
-                : CPUNativeQuantisedCoefficientDomain::SignedInt8;
-        }
-
-        /** @brief Whether decoded IQ3_S grid bytes retain original source factors. */
-        [[nodiscard]] bool usesIQ3SExpandedSourceScale() const noexcept
-        {
-            return encoding == CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale;
+            return encoding == CPUNativeQuantisedEncoding::SignedInt8SingleScale;
         }
 
         /** @brief Return whether this matrix retains native dual-scale Q6_K. */
@@ -178,18 +140,6 @@ namespace llaminar2::cpu::native_quantised
         [[nodiscard]] bool usesCompactMultiScale() const noexcept
         {
             return encoding == CPUNativeQuantisedEncoding::CompactMultiScale;
-        }
-
-        /**
-         * @brief Return whether each prepared block carries weight compensation.
-         *
-         * Expanded signed-Q8 units omit the column sum; legacy expanded units retain it.
-         * On x86 the compensation-free kernels consume signed activation bytes
-         * and correct any unsigned weight bias with the activation sum instead.
-         */
-        [[nodiscard]] bool usesInlineCompensation() const noexcept
-        {
-            return preparedUsesInlineCompensation(encoding, codebook_id);
         }
 
         /**
@@ -228,14 +178,8 @@ namespace llaminar2::cpu::native_quantised
             if (workspace_data_)
                 throw std::logic_error("Native CPU read view requires resident prepared weights, not a deferred workspace binding");
             const auto view = native_interleaved.admittedView(descriptor());
-            // Direct preparation retains the input codec width; migrated/slot
-            // ExpandedInt8 owners publish 32. The read view separates original
-            // codec width from physical execution width without changing either
-            // producer's existing serialization or the resident bytes.
-            const bool payload_matches = payload_bytes == view.source_payload_bytes ||
-                (view.usesExpandedInt8() && payload_bytes == view.payload_bytes);
             if (view.N_padded != N_padded || view.blocks_per_row != blocks_per_row ||
-                !payload_matches || view.data_stride != data_stride ||
+                payload_bytes != view.source_payload_bytes || view.data_stride != data_stride ||
                 view.interleaved_block_stride != interleaved_block_stride)
                 throw std::logic_error("Native CPU prepared owner and resident publication geometry disagree");
             return view;
@@ -313,7 +257,7 @@ namespace llaminar2::cpu::native_quantised
         mutable const uint8_t *workspace_data_ = nullptr;
 
         /// Set the workspace pointer for deferred packing.
-        /// After calling this, all accessor methods (interleavedB, chunkComp, etc.)
+        /// After calling this, all accessor methods (interleavedB, chunkScales, etc.)
         /// will read from the workspace buffer instead of native_interleaved.
         void setWorkspace(const uint8_t *data) const { workspace_data_ = data; }
 
@@ -435,13 +379,8 @@ namespace llaminar2::cpu::native_quantised
          * @param primary Thirty-two-byte-aligned half words from one inline scale plane.
          * @return The original sixteen half values widened to FP32.
          *
-         * General source-factor formats still call loadScales512. Direct use
-         * requires a prepared-type proof that the scale plane contains plain
-         * halves: the unsigned-five-bit domain guarantees ordinary ExpandedInt8.
-         * The original nibble dispatcher also proves plain NibbleLUT for its
-         * Q4_0 linear and Q4_1/Q4_K identity decoder kinds. IQ4_XS remains LUT
-         * with source factors; IQ3_S and rotated operands use expanded paths.
-         * Neither asymmetry nor a model name supplies this layout proof.
+         * This is only for per-block FP16 units. Coded scale/coefficients
+         * and MXFP4 exponent bytes have their own layout-aware readers.
          */
         [[nodiscard]] static inline __m512 loadPlainFP16Scales512(const uint16_t *primary)
         {
@@ -451,18 +390,11 @@ namespace llaminar2::cpu::native_quantised
 
         /** @brief Load 16 effective scales from an inline per-block plane.
          * @param primary Aligned primary words of a per-block encoding.
-         * @return Widened scale or exact IQ3_S base times signed source factor.
+         * @return Widened FP16 scale.
          */
         [[nodiscard]] inline __m512 loadScales512(const std::uint16_t *primary) const
         {
-            const __m512 base = loadPlainFP16Scales512(primary);
-            if (!usesIQ3SExpandedSourceScale()) return base;
-            const __m512i raw = _mm512_cvtepu16_epi32(_mm256_load_si256(
-                reinterpret_cast<const __m256i *>(primary + 64)));
-            if (_mm512_test_epi32_mask(raw, _mm512_set1_epi32(~15)) != 0)
-                throw std::invalid_argument("IQ3_S coefficient contains reserved bits");
-            return _mm512_mul_ps(base, _mm512_cvtepi32_ps(_mm512_add_epi32(
-                _mm512_slli_epi32(raw, 1), _mm512_set1_epi32(1))));
+            return loadPlainFP16Scales512(primary);
         }
 
         /** @brief Load 16 effective scales from an admitted nibble block.
@@ -483,19 +415,12 @@ namespace llaminar2::cpu::native_quantised
 #if defined(__AVX2__)
         /** @brief Load 8 effective scales from an inline per-block plane.
          * @param primary Aligned primary words of a per-block encoding.
-         * @return Widened scale or exact IQ3_S base times signed source factor.
+         * @return Widened FP16 scale.
          */
         [[nodiscard]] inline __m256 loadScales256(const std::uint16_t *primary) const
         {
             const __m128i words = _mm_load_si128(reinterpret_cast<const __m128i *>(primary));
-            const __m256 base = _mm256_cvtph_ps(words);
-            if (!usesIQ3SExpandedSourceScale()) return base;
-            const __m256i raw = _mm256_cvtepu16_epi32(_mm_load_si128(
-                reinterpret_cast<const __m128i *>(primary + 64)));
-            if (!_mm256_testz_si256(raw, _mm256_set1_epi32(~15)))
-                throw std::invalid_argument("IQ3_S coefficient contains reserved bits");
-            return _mm256_mul_ps(base, _mm256_cvtepi32_ps(_mm256_add_epi32(
-                _mm256_slli_epi32(raw, 1), _mm256_set1_epi32(1))));
+            return _mm256_cvtph_ps(words);
         }
 
         /** @brief Load 8 effective scales from an admitted nibble block.
@@ -533,7 +458,7 @@ namespace llaminar2::cpu::native_quantised
                 const std::uint8_t e = blockUnit(c, kb)[data_stride + n_local];
                 return std::bit_cast<float>(e ? mxfp4::normalScaleFP32Bits(e) : 0u);
             }
-            const bool source_scale = usesNibbleLUTSourceScale() || usesIQ3SExpandedSourceScale() ||
+            const bool source_scale = usesNibbleLUTSourceScale() ||
                 usesQ6KNativeDualScale() || (usesCompactMultiScale() && codebook_id == 13);
             const auto secondary = source_scale ? chunkMins(c, kb)[n_local] : 0;
             return nativeQuantisedPrimaryScale(encoding, codebook_id, chunkScales(c, kb)[n_local], secondary);
@@ -553,7 +478,7 @@ namespace llaminar2::cpu::native_quantised
                 const auto words = codedBlockMetadata(c, kb, n_local);
                 return nativeQuantisedSecondaryScale(encoding, codebook_id, words.primary, words.secondary);
             }
-            if (usesNibbleLUTSourceScale() || usesIQ3SExpandedSourceScale() ||
+            if (usesNibbleLUTSourceScale() ||
                 (!is_asymmetric && !usesQ6KNativeDualScale() && !usesCompactMultiScale()))
                 return 0.0f;
             return nativeQuantisedSecondaryScale(encoding, codebook_id,
@@ -568,9 +493,8 @@ namespace llaminar2::cpu::native_quantised
             if (scaleEncoding() == CPUNativeQuantisedScaleEncoding::E8M0)
                 throw std::logic_error("Native MXFP4 weights have byte scales, not half words");
             size_t block_offset = blockOffset(c, kb);
-            const size_t compensation_bytes = usesInlineCompensation() ? 128u : 0u;
             return reinterpret_cast<const uint16_t *>(
-                interleavedBase() + block_offset + data_stride + compensation_bytes);
+                interleavedBase() + block_offset + data_stride);
         }
 
         /// Secondary words for one chunk: FP16 minimum/scale, or Q6_K/IQ2_S/IQ3_S/IQ4_XS raw coefficients.
@@ -579,10 +503,8 @@ namespace llaminar2::cpu::native_quantised
             if (superblockCoded())
                 throw std::logic_error("Superblock-coded CPU weights hold no per-block metadata words");
             size_t block_offset = blockOffset(c, kb);
-            const size_t metadata_offset =
-                usesInlineCompensation() ? 256u : 128u;
             return reinterpret_cast<const uint16_t *>(
-                interleavedBase() + block_offset + data_stride + metadata_offset);
+                interleavedBase() + block_offset + data_stride + 128u);
         }
 
         /// Native-interleaved B data for N-chunk c, K-block kb, group g, ZMM z (0..3)
@@ -593,17 +515,6 @@ namespace llaminar2::cpu::native_quantised
         {
             size_t block_offset = blockOffset(c, kb);
             return interleavedBase() + block_offset + group * 256 + z * 64;
-        }
-
-        /// Pre-computed compensation for N-chunk c, K-block kb (contiguous 64 INT16, inline in native_interleaved)
-        inline const int16_t *chunkComp(int c, int kb) const
-        {
-            if (!usesInlineCompensation())
-                throw std::logic_error(
-                    "Prepared CPU encoding does not carry weight-sum compensation");
-            size_t block_offset = blockOffset(c, kb);
-            return reinterpret_cast<const int16_t *>(
-                interleavedBase() + block_offset + data_stride);
         }
 
         /**
@@ -638,15 +549,6 @@ namespace llaminar2::cpu::native_quantised
                    static_cast<size_t>(z) * 16u;
         }
 
-        /// Flat INT8 values for N-chunk c, K-block kb, column n_local (32 INT8 values)
-        /// Only valid for ExpandedInt8 preparation.
-        /// Only available if keepDecodedBuffer was true during packing.
-        inline const int8_t *blockInt8(int c, int kb, int n_local) const
-        {
-            size_t offset = ((size_t)c * blocks_per_row * 64 + (size_t)kb * 64 + n_local) * 32;
-            return int8_flat.data() + offset;
-        }
-
         /**
          * @brief Retire optional legacy source-order bytes at execution publication.
          *
@@ -658,20 +560,13 @@ namespace llaminar2::cpu::native_quantised
         {
             AlignedVector<uint8_t> empty;
             payload.swap(empty);
-        }
-
-        /// Release the intermediate INT8 decode buffer to save memory.
-        /// The AVX-512 GEMV hot path only uses native_interleaved, not int8_flat.
-        /// After calling this, blockInt8() is invalid.
-        void releaseDecodedBuffer()
-        {
-            int8_flat.clear();
-            int8_flat.shrink_to_fit();
+            AlignedVector<int8_t> decoded;
+            int8_flat.swap(decoded);
         }
 
         /// Release the permanent interleaved data to save memory.
         /// Used with deferred packing: after this, GEMM/GEMV must set workspace_data_
-        /// before accessing interleaved accessors (interleavedB, chunkComp, etc.).
+        /// before accessing interleaved accessors (interleavedB, chunkScales, etc.).
         /// Also releases the payload array since native blocks are the primary storage.
         void releaseInterleavedData()
         {
@@ -687,7 +582,7 @@ namespace llaminar2::cpu::native_quantised
         }
     };
 
-    /// Compute the workspace buffer size needed for repackNativeBlocksToInterleaved().
+    /// Return the extent of the complete interleaved matrix.
     inline size_t interleavedWorkspaceSize(const CPUNativeQuantisedPackedWeights &meta)
     {
         return meta.preparedBytes();

@@ -3355,12 +3355,12 @@ add_v2_test(V2_Integration_CPUCodedCompactPackedWeightsArchiveABI
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUCodedCompactPackedWeightsArchiveABI)
 # Q8 archives reject the retired expanded compensation plane before allocation.
-add_v2_test(V2_Integration_CPUQ8ExpandedArchiveABI
+add_v2_test(V2_Integration_CPUSignedInt8SingleScaleArchiveABI
     COMMAND $<TARGET_FILE:v2_unit_packed_weights_serialization>
-        --gtest_filter=Test__PackedWeightsSerialization.Q8ExpandedDensityRejectsLegacyCompensationPlane
+        --gtest_filter=Test__PackedWeightsSerialization.SignedInt8SingleScaleRejectsLegacyCompensationPlane
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;NativeQuantised;Serialization;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
-list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUQ8ExpandedArchiveABI)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUSignedInt8SingleScaleArchiveABI)
 # V9 receive and CPU publication agree on all cataloged and retired layouts.
 add_v2_test(V2_Integration_CPUPackedWeightsV9Admission
     COMMAND $<TARGET_FILE:v2_unit_packed_weights_serialization>
@@ -20159,7 +20159,7 @@ foreach(V2_VERIFIER_WORKER_ISA IN LISTS V2_CPU_NATIVE_ISA_CELLS)
     v2_cpu_native_isa_runtime("${V2_VERIFIER_WORKER_ISA}" V2_VERIFIER_WORKER_RUNTIME_ISA)
     add_v2_test(V2_Integration_CPU_QueryRowWork_${V2_VERIFIER_WORKER_ISA}
         COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_verifier_workers>
-            --gtest_filter=AllFormats/CPUQueryRowWork.*:CPUQueryRowWorkRotation.*:CPUQueryRowWorkAdmission.*
+            --gtest_filter=AllFormats/CPUQueryRowWork.*:CPUQueryRowWorkAdmission.*
             --gtest_brief=1
         LABELS "V2;Integration;ProductionTestPreflight;CPU;QwenFlashNext;AllFormats;${V2_VERIFIER_WORKER_ISA};ByteExact;Regression"
         MPI_PROCS 1 NO_MODELS
@@ -20173,7 +20173,7 @@ foreach(V2_VERIFIER_WORKER_ISA IN LISTS V2_CPU_NATIVE_ISA_CELLS)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPU_NativeQuantisedProjectionCapacity_${V2_VERIFIER_WORKER_ISA})
     add_v2_test(V2_Integration_CPU_NativeQuantisedVerifierWorkers_${V2_VERIFIER_WORKER_ISA}
         COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_verifier_workers> --gtest_brief=1
-            --gtest_filter=-CPUNativeQuantisedVerifierWorkers.DisabledDiagnosticsDoNotAllocate:CPUNativeQuantisedVerifierWorkers.MixedFormatExpertTransactionPreservesEveryProjection:AllFormats/CPUQueryRowWork.*:CPUQueryRowWorkRotation.*:CPUQueryRowWorkAdmission.*
+            --gtest_filter=-CPUNativeQuantisedVerifierWorkers.DisabledDiagnosticsDoNotAllocate:CPUNativeQuantisedVerifierWorkers.MixedFormatExpertTransactionPreservesEveryProjection:AllFormats/CPUQueryRowWork.*:CPUQueryRowWorkAdmission.*
         LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeQuantised;MTP;AllFormats;${V2_VERIFIER_WORKER_ISA};ByteExact;Regression"
         MPI_PROCS 1
         NO_MODELS
@@ -20640,6 +20640,11 @@ add_v2_test(V2_Integration_CPU_NativeQuantisedWeightPackingAllFormats
     MPI_PROCS 1
     NO_MODELS
 )
+add_v2_test(V2_Integration_CPUSignedInt8SingleScalePacking
+    COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_weight_packing>
+        --gtest_filter=CPUNativeQuantisedWeightPacking.SignedInt8SingleScaleRetainsNativeQ8Bytes
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;NativeQuantised;WeightPacking;ByteExact;Regression"
+    MPI_PROCS 1 NO_MODELS NO_MPI TIMEOUT 30)
 add_v2_test(V2_Integration_CPUNativeWeightWindowContract
     COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_weight_packing>
             --gtest_filter=NativeWindowPackingContract.*:NativeWindowWriterContract.*
@@ -29685,7 +29690,7 @@ add_v2_test(V2_Integration_GlobalAllreducePrecision
 
 # Test: ActivationRotation — Block-diagonal rotation for kurtosis reduction
 # Tests orthogonality (norm preservation), identity (rotate+inverse), kurtosis
-# reduction, GEMM invariance (X@W^T == X@R@(W@R)^T), ModelWeightRotation
+# reduction, GEMM invariance (X@W^T == X@R@(W@R)^T)
 # weight replacement and metadata wiring.
 add_executable(v2_test_activation_rotation unit/kernels/rotation/Test__ActivationRotation.cpp)
 target_link_libraries(v2_test_activation_rotation
@@ -32036,6 +32041,7 @@ set(V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     ${V2_OVERLAY_SINGLETON_LOCAL_PREFLIGHT_TESTS}
     ${V2_CPU_SPARSE_TICKET_PREFLIGHT_TESTS}
     V2_Integration_CPU_NativeQuantisedWeightPackingAllFormats
+    V2_Integration_CPUSignedInt8SingleScalePacking
     V2_Integration_CPUNativeWeightWindowContract
     V2_Integration_CPUNativeSourceAssemblyContract
     V2_Integration_CPUNativeResidentRankContract
@@ -39060,7 +39066,7 @@ foreach(_source_factor_isa IN ITEMS AVX2 AVX512)
     string(TOLOWER "${_source_factor_isa}" _source_factor_runtime_isa)
     add_v2_test(V2_Integration_CPU_NativeQuantisedSourceFactors_${_source_factor_isa}
         COMMAND $<TARGET_FILE:v2_perf_cpu_native_quantised_gemv>
-            --gtest_filter=CPUNativeQuantisedGemvTest.DispatchEvidencePreparedWeights_MatchProductionLayout_AllFormats:CPUNativeQuantisedGemvTest.DispatchEvidenceSourceFactors_DecodeReplayRejectsReservedBits
+            --gtest_filter=CPUNativeQuantisedGemvTest.DispatchEvidencePreparedWeights_MatchProductionLayout_AllFormats
         LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeQuantised;AllFormats;Replay;Regression"
         MPI_PROCS 1 NO_MODELS TIMEOUT 30
         ENVIRONMENT "LLAMINAR_ISA_LEVEL=${_source_factor_runtime_isa}" "OMP_NUM_THREADS=2"

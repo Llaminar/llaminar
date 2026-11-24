@@ -20,22 +20,19 @@ struct NativePackGroupScratch {
         };
         const auto encoding=preparedEncodingForSource(format);
         const size_t blocks=format.is_superblock?8:1;
-        const bool expanded=encoding==CPUNativeQuantisedEncoding::ExpandedInt8 ||
-            encoding==CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale;
-        const bool packed=!expanded || is_payload_decodable(format.codebook_id);
-        if(packed && preparedSuperblockCoded(encoding)) {
+        const bool q8=encoding==CPUNativeQuantisedEncoding::SignedInt8SingleScale;
+        if(preparedSuperblockCoded(encoding)) {
             // Coded units: exact payload, one code per block, one word per superblock.
             result.payload=reserve(blocks*size_t(format.payload_bytes),1);
             result.codes=reserve(blocks*sizeof(uint32_t),alignof(uint32_t));
             result.superblock=reserve(sizeof(uint32_t),alignof(uint32_t));
-        } else if(packed) {
+        } else if(!q8) {
             result.payload=reserve(blocks*size_t(format.payload_bytes),1);
             result.primary=reserve(blocks*sizeof(uint16_t),alignof(uint16_t));
             result.secondary=reserve(blocks*sizeof(uint16_t),alignof(uint16_t));
         }
-        if(expanded)
-            result.decoded=reserve((expanded?blocks:1)*32,1);
-        if(expanded && !packed) {
+        if(q8) {
+            result.decoded=reserve(blocks*32,1);
             result.scales=reserve(blocks*sizeof(float),alignof(float));
             result.mins=reserve(blocks*sizeof(float),alignof(float));
         }
@@ -58,7 +55,7 @@ inline void initializeNativeWindowOutput(const NativeQuantisedFormatInfo& format
     CPUWeightStoragePlacement placement,CPUNativeQuantisedPackedWeights& out) {
     if(n<=0 || k<=0 || n>std::numeric_limits<int>::max()-63 || k>std::numeric_limits<int>::max()-31)
         throw std::invalid_argument("Native weight writer requires representable positive geometry");
-    out.releaseSourcePayload();out.releaseDecodedBuffer();
+    out.releaseSourcePayload();
     out.N=n;out.K=k;out.N_padded=(n+63)/64*64;out.blocks_per_row=(k+31)/32;
     out.payload_bytes=format.payload_bytes;out.codebook_id=format.codebook_id;
     out.is_asymmetric=format.is_asymmetric;out.is_superblock=format.is_superblock;
@@ -151,9 +148,7 @@ inline void appendNativeWeightGroups(const IINT8Unpackable& source,const NativeQ
             auto* scales=reinterpret_cast<float*>(memory+layout.scales);
             auto* mins=reinterpret_cast<float*>(memory+layout.mins);
             const int actual_row=source_row+local_row;
-            const bool expanded=out.usesExpandedInt8();
-            const bool native_payload=!expanded || is_payload_decodable(format.codebook_id);
-            if(native_payload) {
+            if(!out.usesSignedInt8SingleScale()) {
                 // Coded units receive the same codes/words the GPU repack
                 // publishes (one window = one source superblock, so its word
                 // lands in superblock[0]); per-block units their staged words.
@@ -166,7 +161,6 @@ inline void appendNativeWeightGroups(const IINT8Unpackable& source,const NativeQ
                     .codes_array=coded?codes:nullptr,.superblocks_array=coded?superblock:nullptr};
                 for(int b=0;b<count;++b) {
                     source.packVnniBlock(context,actual_row,0,input_first+b);
-                    if(expanded)decode_native_block(format.codebook_id,payload+size_t(b)*format.payload_bytes,decoded+b*32);
                 }
             } else if(group_blocks==8 && count==8) {
                 source.unpack_superblock_to_int8(actual_row,input_first/8,decoded,scales,mins);
@@ -243,12 +237,6 @@ inline void appendNativeWeightGroups(const IINT8Unpackable& source,const NativeQ
                         target[out.data_stride+column]=reinterpret_cast<const uint8_t*>(primary)[b];
                         continue;
                     }
-                    const int comp_bytes=out.usesInlineCompensation()?128:0;
-                    if(comp_bytes) {
-                        int32_t sum=0;for(int k=0;k<32;++k)sum+=values[k];
-                        const auto compensation=static_cast<int16_t>(sum);
-                        std::memcpy(target+out.data_stride+column*2,&compensation,2);
-                    }
                     if(out.usesNibbleLUTSourceScale()) {
                         const auto codebook=superblockMetadataCodebook(out.encoding,out.codebook_id);
                         coded_metadata::storeCode(target+preparedCodedPlaneOffset(out.encoding,out.data_stride),
@@ -259,20 +247,13 @@ inline void appendNativeWeightGroups(const IINT8Unpackable& source,const NativeQ
                         continue;
                     }
                     uint16_t scale=0,minimum=0;
-                    if(out.usesIQ3SExpandedSourceScale()) {
-                        scale=primary[b];minimum=secondary[b];
-                    } else if(nibble) {
+                    if(nibble) {
                         scale=fp32_to_fp16(source.get_block_scale(actual_row,input_first+b));
                         minimum=fp32_to_fp16(source.get_block_min(actual_row,input_first+b));
-                    } else if(native_payload) {
-                        scale=fp32_to_fp16(fp16_to_fp32(primary[b]));
-                        minimum=fp32_to_fp16(fp16_to_fp32(secondary[b]));
                     } else {scale=fp32_to_fp16(scales[b]);minimum=fp32_to_fp16(mins[b]);}
-                    if(out.usesIQ3SExpandedSourceScale() && !native_quantised_iq3s_scale::valid(minimum))
-                        throw std::invalid_argument("IQ3_S source nibble is invalid");
-                    std::memcpy(target+out.data_stride+comp_bytes+column*2,&scale,2);
-                    if(out.is_asymmetric || out.usesIQ3SExpandedSourceScale())
-                        std::memcpy(target+out.data_stride+comp_bytes+128+column*2,&minimum,2);
+                    std::memcpy(target+out.data_stride+column*2,&scale,2);
+                    if(out.is_asymmetric)
+                        std::memcpy(target+out.data_stride+128+column*2,&minimum,2);
                 }
             }
         }

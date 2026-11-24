@@ -10,7 +10,7 @@
  * engine never retains another participant's workspace binding: the owning
  * stage supplies admitted activation scratch with each invocation.
  * Query projection work is borrowed before OpenMP and retains original request
- * coordinates through rotation, quantization and fixed-order products.
+ * coordinates through quantization and fixed-order products.
  * HC two-term input publication retains the original activated FP32 value,
  * backend nonlinear arithmetic and prepared projection/workspace authority.
  * Imported optional source-order archive payloads are retired at engine
@@ -36,7 +36,6 @@
 #include "tensors/TensorKernels.h"
 #include "tensors/TensorClasses.h"
 #include "kernels/cpu/primitives/SwiGLUPrimitives.h"
-#include "kernels/cpu/rotation/ActivationRotation.h"
 #include "utils/Logger.h"
 #include "utils/PerfStatsCollector.h"
 #include "kernels/cpu/CPUInvocationWorkspace.h"
@@ -210,15 +209,8 @@ namespace llaminar2::cpu::native_quantised
                                          CPUWeightStoragePlacement placement = CPUWeightStoragePlacement::local())
             : numerical_policy_(numerical_policy)
         {
-            // Pick up activation rotation from the weight tensor (if set).
-            // When present, activations will be rotated before Q8_1 quantization
-            // to reduce kurtosis and improve int8 fidelity.
-            // The rotation is also fused into weight packing (dequant→rotate→requant)
-            // so that the original tensor format is preserved.
-            activation_rotation_ = weights->activationRotation();
-
             if (!packWeightsCPUNativeQuantised(weights, packed_, row_start, row_end,
-                                          activation_rotation_, placement))
+                                          placement))
             {
                 LOG_ERROR("[CPUNativeQuantisedGemmKernel] Failed to pack weights");
                 valid_ = false;
@@ -232,7 +224,6 @@ namespace llaminar2::cpu::native_quantised
                       << " weights (codebook=" << (int)packed_.codebook_id
                       << ", payload=" << packed_.payload_bytes << " B/block"
                       << ", asymmetric=" << packed_.is_asymmetric
-                      << ", rotation=" << (activation_rotation_ != nullptr)
                       << ", permanent_interleaved=true)");
         }
 
@@ -259,7 +250,7 @@ namespace llaminar2::cpu::native_quantised
          * @brief Declare the input bank without retaining a participant binding.
          * @param m Maximum simultaneous input rows for this projection.
          * @param k Explicit K geometry, or zero to use the prepared matrix width.
-         * @return Q8 and ordered-partial banks, plus the optional rotated input tile.
+         * @return Q8 and ordered-partial banks.
          */
         WorkspaceRequirements getWorkspaceRequirements(int m, int = 0, int k = 0) const override
         {
@@ -272,8 +263,6 @@ namespace llaminar2::cpu::native_quantised
             // An explicit wider input bank may be shared with another serial
             // projection; it cannot shrink this engine's physical requirement.
             if (columns != packed_.K) requirements.merge(cpuProjectionQ8WorkspaceRequirements(m, columns));
-            if (activation_rotation_)
-                requirements.merge(cpuProjectionFP32WorkspaceRequirements(kCPUProjectionRotation, m, columns));
             return requirements;
         }
 
@@ -288,14 +277,12 @@ namespace llaminar2::cpu::native_quantised
         /** @copydoc ITensorGemm::q8ResidualCorrectionWorkspaceRequirements */
         WorkspaceRequirements q8ResidualCorrectionWorkspaceRequirements(int m,int n,int k) const override {
             cpu::native_quantised::validateCPUQ8ResidualSource(packed_,m,n,k);
-            if(activation_rotation_)throw std::invalid_argument("Two-term quantized activation cannot silently change a rotated source contract");
             return cpuQ8ResidualCorrectionWorkspaceRequirements(m,n,k);
         }
         /** @copydoc ITensorGemm::multiply_q8_residual_corrected */
         void multiply_q8_residual_corrected(const TensorBase*input,TensorBase*output,DeviceRowRange rows,
             int n,int k,DeviceWorkspaceManager*workspace) override {
             cpu::native_quantised::validateCPUQ8ResidualSource(packed_,rows.physicalRows(),n,k);
-            if(activation_rotation_)throw std::invalid_argument("Two-term quantized activation requires its unrotated prepared source");
             if(!input||!output||input->native_type()!=TensorType::FP32||output->native_type()!=TensorType::FP32||
                 !input->isHostValid()||!output->isHostValid())
                 throw std::invalid_argument("Two-term CPU Q8 requires prepared host-owned FP32 tensors");
@@ -311,7 +298,6 @@ namespace llaminar2::cpu::native_quantised
             const auto*input=&hc.raw;auto*activated=&hc.activated;
             validateHCResidualDownRows(rows,rows.physicalRows());
             cpu::native_quantised::validateCPUQ8ResidualSource(packed_,rows.physicalRows(),n,k);
-            if(activation_rotation_)throw std::invalid_argument("Two-term quantized activation requires its unrotated prepared source");
             if(!input||!output||input->native_type()!=TensorType::FP32||output->native_type()!=TensorType::FP32||
                 !input->isHostValid()||!output->isHostValid())
                 throw std::invalid_argument("Two-term CPU Q8 requires prepared host-owned FP32 tensors");
@@ -450,11 +436,9 @@ namespace llaminar2::cpu::native_quantised
             const float *A_data = A->data() + static_cast<size_t>(activation_row_offset) * k;
             float *C_data = C->mutable_data();
 
-            // Apply activation rotation for kurtosis reduction (if configured)
             const auto activation_storage = q8Workspace(workspace, m, k);
             const auto product_storage = productWorkspace(workspace, m, n, beta);
             const auto partial_storage = partialWorkspace(workspace, m);
-            A_data = maybe_rotate_activation(A_data, m, k, workspace,work);
 
             multiply_native_quantised_with_epilogue(
                 packed_, A_data, C_data, m, n, alpha, beta,
@@ -745,8 +729,7 @@ namespace llaminar2::cpu::native_quantised
                     static_cast<int>(input_size));
             }
 
-            // Apply activation rotation for kurtosis reduction (if configured)
-            const float *gemm_input = maybe_rotate_activation(swiglu_scratch.data(), m, k, workspace);
+            const float *gemm_input = swiglu_scratch.data();
 
             multiply_native_quantised_with_epilogue(
                 packed_, gemm_input, output_fp32, m, n, alpha, beta,
@@ -811,8 +794,6 @@ namespace llaminar2::cpu::native_quantised
                 workspace, kCPUSwiGLUInput, input_size);
             auto shared_q8 = q8Workspace(workspace, m, k);
             (void)partialWorkspace(workspace, m);
-            if (activation_rotation_)
-                (void)CPUInvocationWorkspace::require<float>(workspace, kCPUProjectionRotation, input_size);
             const auto live_input_size = static_cast<size_t>(live_rows) * k;
             const float *gate_fp32 = gate->data();
             const float *up_fp32 = up->data();
@@ -853,7 +834,7 @@ namespace llaminar2::cpu::native_quantised
                 k,
                 1);
 
-            const float *gemm_input = maybe_rotate_activation(swiglu_scratch.data(), live_rows, k, workspace);
+            const float *gemm_input = swiglu_scratch.data();
             const int K_blocks = (k + 31) / 32;
             perf_start = perf_enabled ? PerfStatsCollector::Clock::now()
                                       : PerfStatsCollector::Clock::time_point{};
@@ -957,7 +938,6 @@ namespace llaminar2::cpu::native_quantised
                 if (!vnni || !vnni->valid_ || !projection.output ||
                     projection.n <= 0 || vnni->packed_.K != k ||
                     vnni->packed_.N != projection.n ||
-                    vnni->activation_rotation_ != activation_rotation_ ||
                     projection.output->numel() <
                         static_cast<size_t>(m) * projection.n ||
                     (projection.bias &&
@@ -975,7 +955,6 @@ namespace llaminar2::cpu::native_quantised
                     return false;
             }
 
-            input_data = maybe_rotate_activation(input_data, m, k, workspace);
             const int K_blocks = (k + Q8_1Block::BLOCK_SIZE - 1) /
                                  Q8_1Block::BLOCK_SIZE;
             auto shared_q8 = q8Workspace(workspace, m, k);
@@ -1122,18 +1101,6 @@ namespace llaminar2::cpu::native_quantised
                     return false;
                 }
 
-                /*
-                 * The fused projection API shares one activation transform.
-                 * If a future model ever mixes differently rotated weights in
-                 * one fused group, that is a real contract gap and must be
-                 * handled explicitly rather than silently producing drift.
-                 */
-                if (vnni->activation_rotation_ != activation_rotation_)
-                {
-                    LOG_ERROR("[CPUNativeQuantisedGemmKernel] grouped verifier projection rejected at projection "
-                              << i << ": mixed activation rotation contracts");
-                    return false;
-                }
                 vnni_kernels[i] = vnni;
             }
             for (size_t i = 0; i < projections.size(); ++i)
@@ -1189,9 +1156,6 @@ namespace llaminar2::cpu::native_quantised
                 if (fused_partials.size() < required)
                     throw std::runtime_error("CPU fused projection requires admitted ordered-partial storage");
             }
-            if (activation_rotation_)
-                (void)CPUInvocationWorkspace::require<float>(workspace, kCPUProjectionRotation,
-                    static_cast<size_t>(m) * k);
             if(live_rows==0) {
                 (void)llaminar::v2::beginWorkshare(false);
                 return true;
@@ -1202,7 +1166,6 @@ namespace llaminar2::cpu::native_quantised
                 PerfStatsCollector::isDomainEnabled("kernel");
             auto perf_start = perf_enabled ? PerfStatsCollector::Clock::now()
                                            : PerfStatsCollector::Clock::time_point{};
-            input_data = maybe_rotate_activation(input_data, live_rows, k, workspace,work);
 
             const int K_blocks = (k + 31) / 32;
             quantize_activations_to_q8_1(
@@ -1380,7 +1343,7 @@ namespace llaminar2::cpu::native_quantised
          * @param partial_storage Admitted invocation bank shared by every team worker.
          * @param job_ownership Independent explicit ordinary-prefill output ownership.
          * @return `true` after every projection completes; `false` when the
-         *         explicit eager/unrotated NativeQuantised contract is invalid.
+         *         explicit eager NativeQuantised contract is invalid.
          * @throws std::invalid_argument Before phase writes for unsupported explicit ownership.
          */
         static bool multiply_batched_preq_decode_equivalent(
@@ -1423,8 +1386,7 @@ namespace llaminar2::cpu::native_quantised
                 if (!kernel || !kernel->valid_ || !source.input_q8 ||
                     !source.output || source.rows <= 0 || source.n <= 0 ||
                     source.ldc < source.n || kernel->packed_.K != k ||
-                    kernel->packed_.N != source.n ||
-                    kernel->activation_rotation_ != nullptr)
+                    kernel->packed_.N != source.n)
                 {
                     LOG_ERROR("[CPUNativeQuantisedGemmKernel] batched pre-quantized "
                               "projection contract mismatch at descriptor "
@@ -1568,8 +1530,7 @@ namespace llaminar2::cpu::native_quantised
                         !source.output || source.rows <= 0 || source.n <= 0 ||
                         source.ldc < source.n ||
                         kernel->packed_.K != expected_k ||
-                        kernel->packed_.N != source.n ||
-                        kernel->activation_rotation_ != nullptr)
+                        kernel->packed_.N != source.n)
                     {
                         LOG_ERROR("[CPUNativeQuantisedGemmKernel] MoE grouped FFN "
                                   << phase << " descriptor " << projection
@@ -1670,7 +1631,7 @@ namespace llaminar2::cpu::native_quantised
          * M=1 batches use the ordinary fused decode GEMV kernel. Multi-row
          * batches use the grouped decode-equivalent kernel, whose per-row K
          * reduction order is identical to M=1 decode. The method has no FP32
-         * alternative: every projection must be an eager, unrotated
+         * alternative: every projection must be an eager
          * NativeQuantised kernel with a compatible matrix shape.
          *
          * @param input_q8 Contiguous Q8_1 rows in `[m, ceil(k / 32)]` layout.
@@ -1716,13 +1677,6 @@ namespace llaminar2::cpu::native_quantised
                 {
                     LOG_ERROR("[CPUNativeQuantisedGemmKernel] router-Q8 projection "
                               "contract mismatch at index "
-                              << i);
-                    return false;
-                }
-                if (vnni->activation_rotation_ != nullptr)
-                {
-                    LOG_ERROR("[CPUNativeQuantisedGemmKernel] router-Q8 publication "
-                              "cannot feed a rotated activation contract at projection "
                               << i);
                     return false;
                 }
@@ -1834,8 +1788,7 @@ namespace llaminar2::cpu::native_quantised
                 auto *vnni = dynamic_cast<CPUNativeQuantisedGemmKernel *>(descs[i].kernel);
                 if (!vnni || !vnni->valid_ || !descs[i].input ||
                     !descs[i].output || descs[i].n <= 0 ||
-                    vnni->packed_.K != k || vnni->packed_.N != descs[i].n ||
-                    vnni->activation_rotation_ != nullptr)
+                    vnni->packed_.K != k || vnni->packed_.N != descs[i].n)
                     return false;
             }
 
@@ -2050,55 +2003,6 @@ namespace llaminar2::cpu::native_quantised
         /** Arithmetic identity retained across detach/attach lifecycle events. */
         CPUProjectionNumericalPolicy numerical_policy_ =
             CPUProjectionNumericalPolicy::BackendNative;
-
-        /**
-         * @brief Optional block-diagonal activation transform paired with weights.
-         *
-         * The pointer is immutable after construction and is shared safely by
-         * concurrent callers. Each participant supplies its own admitted scratch.
-         */
-        const ActivationRotation *activation_rotation_ = nullptr;
-
-        /**
-         * @brief Copy and rotate each input row exactly once into borrowed storage.
-         * @param input Immutable source; never modified by this projection.
-         * @param m Simultaneously live rows.
-         * @param k Logical row width paired with the prepared rotation.
-         * @param workspace Participant-owned storage declared by this engine.
-         * @param work Optional original-row admission borrowed before the workshare.
-         * @return Original input for an unrotated engine, otherwise the rotated bank.
-         *
-         * Copy and rotation share one row owner. Existing OpenMP teams enter
-         * the same workshare and its completion barrier publishes the full bank
-         * before quantization. A standalone single row needs no extra team.
-         */
-        const float *maybe_rotate_activation(const float *input, int m, int k, DeviceWorkspaceManager *workspace,
-            const ProjectionRowWork *work = nullptr) const
-        {
-            if (!activation_rotation_)
-                return input;
-
-            const CPUProjectionRowGrid row_grid(m,work);
-            if(!row_grid.beginWorkshare())return input;
-            const size_t len = static_cast<size_t>(m) * k;
-            auto rotated = CPUInvocationWorkspace::require<float>(workspace, kCPUProjectionRotation, len);
-            auto rotate_row = [&](int row) {
-                if(!row_grid.active(row))return;
-                float *destination = rotated.data() + static_cast<size_t>(row) * k;
-                std::memcpy(destination, input + static_cast<size_t>(row) * k, static_cast<size_t>(k) * sizeof(float));
-                activation_rotation_->rotate_inplace(destination, k);
-            };
-            if (m == 1 && !omp_in_parallel()) rotate_row(0);
-            else
-            {
-                auto work = [&]() {
-#pragma omp for schedule(static)
-                    for (int row = 0; row < m; ++row) rotate_row(row);
-                };
-                OMP_WORKSHARE_REGION(work);
-            }
-            return rotated.data();
-        }
 
         /**
          * @brief Record one coarse verifier-kernel timing sample.

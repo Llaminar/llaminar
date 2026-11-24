@@ -120,8 +120,7 @@ namespace llaminar2::cpu::native_quantised
             switch (weights.encoding)
             {
             case Encoding::Q5NativeSingleScale:
-            case Encoding::ExpandedInt8:
-            case Encoding::IQ3SExpandedSourceScale:
+            case Encoding::SignedInt8SingleScale:
             case Encoding::Q6KNativeDualScale:
             case Encoding::Q4KSuperblockCoded:
             case Encoding::NibbleLUTSourceScale:
@@ -198,27 +197,16 @@ namespace llaminar2::cpu::native_quantised
          * @tparam Physical Non-compact execution encoding of the program.
          * @tparam WithMinimum Whether the program applies an additive minimum.
          * @return For the single-row SDOT leaf (DotProd, and the I8MM family's
-         * lone row): 4 for the symmetric expanded encodings (ExpandedInt8
-         * without a minimum, IQ3SExpandedSourceScale); 2 for ExpandedInt8 with
-         * a minimum and for the nibble and Q6_K encodings. 1 (the strip walk)
-         * for ASIMD, row-pair (SMMLA) tiles and shared-row tiles.
-         * @details Every column keeps its own block/partition FP32 program, so
-         * the width changes only which columns share one activation-block load
-         * and how many independent INT32 chains are in flight. Each entry is
-         * the widest panel that keeps that single-row program free of register
-         * spills on every qualified compiler (the tile register witness
-         * enforces it): expanded encodings hold one decoded vector per strip,
-         * while nibble decoding and the Q6_K dual-scale walk need more live
-         * registers per strip and spill at four strips, as does the minimum
-         * correction of ExpandedInt8 under AppleClang. Entries were measured
-         * against narrower widths in the GB10 panel tournament.
+         * lone row): four for signed Q8, whose native byte payload needs no
+         * inline decode, and two for the remaining formats. Wider panels are
+         * profitable only when their live vectors fit the register budget.
+         * Entries were measured in the GB10 panel tournament.
          */
         template <typename Ops, Encoding Physical, bool WithMinimum = false> static constexpr int panelStrips() noexcept
         {
             if constexpr (multi_scale::usesRowPairs<Ops>) return 1;
             else if constexpr (Rows != 1 || Ops::instruction == multi_scale::NEONByteDot::ASIMD) return 1;
-            else if constexpr ((Physical == Encoding::ExpandedInt8 && !WithMinimum) ||
-                               Physical == Encoding::IQ3SExpandedSourceScale)
+            else if constexpr (Physical == Encoding::SignedInt8SingleScale)
                 return 4;
             else return 2;
         }
@@ -328,16 +316,12 @@ namespace llaminar2::cpu::native_quantised
         {
             switch (weights_.encoding)
             {
-            case Encoding::ExpandedInt8:
-                if (weights_.is_asymmetric)
-                    return run<Ops, Policy, Encoding::ExpandedInt8, NibbleMap::Centered, true, Strips>();
-                return run<Ops, Policy, Encoding::ExpandedInt8, NibbleMap::Centered, false, Strips>();
+            case Encoding::SignedInt8SingleScale:
+                return run<Ops, Policy, Encoding::SignedInt8SingleScale, NibbleMap::Centered, false, Strips>();
             case Encoding::Q5NativeSingleScale:
                 if (weights_.is_asymmetric)
                     return run<Ops, Policy, Encoding::Q5NativeSingleScale, NibbleMap::Unsigned, true, Strips>();
                 return run<Ops, Policy, Encoding::Q5NativeSingleScale, NibbleMap::Centered, false, Strips>();
-            case Encoding::IQ3SExpandedSourceScale:
-                return run<Ops, Policy, Encoding::IQ3SExpandedSourceScale, NibbleMap::Centered, false, Strips>();
             case Encoding::Q6KNativeDualScale:
                 return run<Ops, Policy, Encoding::Q6KNativeDualScale, NibbleMap::Centered, false, Strips>();
             case Encoding::Q4KSuperblockCoded:
@@ -351,9 +335,6 @@ namespace llaminar2::cpu::native_quantised
                 case 4: return run<Ops, Policy, Encoding::NibbleLUT, NibbleMap::NonLinear, false, Strips>();
                 case 5: return run<Ops, Policy, Encoding::NibbleLUT, NibbleMap::Unsigned, true, Strips>();
                 case kNativeQuantisedMXFP4Codebook:
-                    // The prepared identity, not the codebook alone, owns the scale
-                    // words: native nibble MXFP4 carries E8M0 bytes, while
-                    // rotated MXFP4 is ExpandedInt8 with FP16 scales (case above).
                     if (weights_.scaleEncoding() != ScaleWords::E8M0)
                         break;
                     return run<Ops, Policy, Encoding::NibbleLUT, NibbleMap::MXFP4, false, Strips>();
@@ -1450,15 +1431,6 @@ namespace llaminar2::cpu::native_quantised
                                     consume<Ops>(nibbles<Map>(vshrq_n_u8(raw, 4)), block, group + 4, low);
                                 }
                             }
-                            else if constexpr (Physical == Encoding::IQ3SExpandedSourceScale &&
-                                Rows == 4 && Ops::instruction == multi_scale::NEONByteDot::ASIMD)
-                            {
-                                // Bound baseline ASIMD register pressure across eight expanded groups.
-#pragma GCC unroll 1
-                                for (int group = 0; group < 8; ++group)
-                                    consume<Ops>(vld1q_s8(reinterpret_cast<const std::int8_t *>(unit + group * 256 + column * 4)),
-                                        block, group, low);
-                            }
                             else
                             {
 #pragma GCC unroll 8
@@ -1491,12 +1463,7 @@ namespace llaminar2::cpu::native_quantised
                                 scale0 = kE8M0Scales<Map>
                                     ? Ops::e8m0(weights_.admittedE8M0Scales(chunk_, block) + column)
                                     : Ops::half(weights_.admittedPerBlockPrimary<Physical, WithMinimum>(chunk_, block) + column);
-                                if constexpr (Physical == Encoding::IQ3SExpandedSourceScale)
-                                {
-                                    const I metadata = Ops::words(weights_.admittedPerBlockSecondary<Physical>(chunk_, block) + column);
-                                    scale0 = scale0 * __builtin_convertvector(metadata * 2 + 1, F);
-                                }
-                                else if constexpr (WithMinimum)
+                                if constexpr (WithMinimum)
                                     scale1 = Ops::half(weights_.admittedPerBlockSecondary<Physical>(chunk_, block) + column);
                             }
                             [[maybe_unused]] float32x4_t activation_scales;
@@ -1729,12 +1696,7 @@ namespace llaminar2::cpu::native_quantised
                             scale0 = kE8M0Scales<Map>
                                 ? Ops::e8m0(weights_.admittedE8M0Scales(chunk_, block) + column)
                                 : Ops::half(weights_.admittedPerBlockPrimary<Physical, WithMinimum>(chunk_, block) + column);
-                            if constexpr (Physical == Encoding::IQ3SExpandedSourceScale)
-                            {
-                                const I metadata = Ops::words(weights_.admittedPerBlockSecondary<Physical>(chunk_, block) + column);
-                                scale0 = scale0 * __builtin_convertvector(metadata * 2 + 1, F);
-                            }
-                            else if constexpr (WithMinimum)
+                            if constexpr (WithMinimum)
                                 scale1 = Ops::half(weights_.admittedPerBlockSecondary<Physical>(chunk_, block) + column);
                         }
 #pragma GCC unroll 4

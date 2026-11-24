@@ -277,7 +277,7 @@ TEST(MXFP4CPUScaleLoaders, NativeE8M0BytesAndFP16WordsWidenExactlyOnEveryISA)
             EXPECT_EQ(bits(packed.blockScale(0, 0, col)), expected[col]);
         vector_check(nullptr, expected, packed);
     }
-    // FP16 (every other format, and rotated/expanded source-25 weights) is unchanged.
+    // FP16 (every other format) is unchanged.
     std::array<uint16_t, 64> half_words{};
     std::array<uint32_t, 64> half_expected{};
     for (int column = 0; column < 64; ++column)
@@ -288,12 +288,7 @@ TEST(MXFP4CPUScaleLoaders, NativeE8M0BytesAndFP16WordsWidenExactlyOnEveryISA)
     const auto fp16 = cpuUnitWithScales(half_words, 4);
     ASSERT_EQ(fp16.scaleEncoding(), CPUNativeQuantisedScaleEncoding::FP16);
     expectColumns(fp16, half_expected, [&](const uint16_t *p, const auto &x) { vector_check(p, x, fp16); });
-    // Rotated MXFP4 keeps source codebook 25 but is expanded INT8 with FP16 scales.
-    // Every column goes through the scalar reader and each ISA's vector loader.
-    const auto rotated = cpuUnitWithScales(half_words, kNativeQuantisedMXFP4Codebook, CPUNativeQuantisedEncoding::ExpandedInt8);
-    ASSERT_EQ(rotated.scaleEncoding(), CPUNativeQuantisedScaleEncoding::FP16);
-    ASSERT_EQ(rotated.primaryScaleLayout(), VnniPrimaryScaleLayout::FP16Words);
-    expectColumns(rotated, half_expected, [&](const uint16_t *p, const auto &x) { vector_check(p, x, rotated); });
+
 }
 
 TEST(MXFP4ScaleCarrier, StagedWordsDecodeExactlyAndFP16CallbacksAreUntouched)

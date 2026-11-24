@@ -1365,51 +1365,6 @@ namespace llaminar2
                     continue;
                 }
 
-                if (cpu.usesIQ3SExpandedSourceScale())
-                {
-                    // Invert only the exact existing grid; never normalize to19.
-                    uint8_t high = 0;
-                    uint8_t signs[4]{};
-                    for (int group = 0; group < 8; ++group)
-                    {
-                        int8_t values[4];
-                        for (int lane = 0; lane < 4; ++lane)
-                            values[lane] = static_cast<int8_t>(cpu.native_interleaved[
-                                interleavedValueOffset(cpu,n,kb,4*group+lane)]);
-                        const auto encoded = native_quantised_iq3s_scale::encodeGridQuartet(values, iq3s_grid);
-                        if (!encoded.valid()) return reject(error, "IQ3_S CPU payload is outside original grid");
-                        destination[group] = static_cast<uint8_t>(encoded.index);
-                        high |= static_cast<uint8_t>((encoded.index >> 8) << group);
-                        signs[group/2] |= static_cast<uint8_t>(encoded.signs << (4*(group%2)));
-                    }
-                    destination[8] = high;
-                    std::memcpy(destination+9, signs, sizeof(signs));
-                    output.scales[linear] = cpu.chunkScales(n/64,kb)[n%64];
-                    output.mins[linear] = cpu.chunkMins(n/64,kb)[n%64];
-                    if (!native_quantised_iq3s_scale::valid(output.mins[linear]))
-                        return reject(error, "IQ3_S source nibble is invalid");
-                    continue;
-                }
-
-                if (cpu.encoding == CPUEncoding::ExpandedInt8)
-                {
-                    // Expanded signed bytes use the same VNNI lane transpose.
-                    for (int value = 0; value < 32; ++value)
-                    {
-                        destination[value] =
-                            cpu.native_interleaved[
-                                interleavedValueOffset(cpu, n, kb, value)];
-                    }
-                    // Expanded INT8 units carry ordinary FP16 scales (2-byte plane).
-                    std::memcpy(
-                        &output.scales[linear],
-                        cpu.native_interleaved.data() +
-                            unit + cpu.data_stride + 128u +
-                            static_cast<size_t>(n % 64) * sizeof(uint16_t),
-                        sizeof(uint16_t));
-                    continue;
-                }
-
                 // Q6 low nibbles occupy the ordinary first four VNNI groups.
                 for (int value = 0; value < 16; ++value)
                 {
@@ -1473,7 +1428,7 @@ namespace llaminar2
      * @return `true` when the GPU format has an exact CPU execution mapping.
      *
      * GPU-to-CPU device kernels use this function as their byte oracle. It
-     * includes CPU compensation vectors and deterministic zeros for padded N.
+     * preserves deterministic zeros for padded N.
      */
     bool gpuToCpuExpertPackedReference(
         const HostGpuExpertPackedProjection &gpu,
@@ -1486,7 +1441,7 @@ namespace llaminar2
         if (gpu.metadata_layout == 0 && !cpu::native_quantised::is_payload_decodable(gpu.codebook_id) &&
             gpu.codebook_id != kNativeQuantisedIQ4XSSourceScaleCodebook &&
             !hasCompactMultiScaleVnniPayload(gpu.codebook_id) && gpu.codebook_id != 8 &&
-            !cpu::native_quantised::preparedExpandedInt8OmitsCompensation(CPUEncoding::ExpandedInt8, gpu.codebook_id))
+            !cpu::native_quantised::isSignedInt8SingleScaleSource(gpu.codebook_id))
         {
             return reject(
                 error,
@@ -1550,49 +1505,6 @@ namespace llaminar2
                     std::memcpy(root + output.data_stride + local_column * width, scale, width);
                     if (output.is_asymmetric)
                         std::memcpy(root + output.data_stride + 64 * width + local_column * 2, &gpu.mins[linear], 2);
-                    continue;
-                }
-
-                if (output.usesExpandedInt8())
-                {
-                    // Native single-scale grids expand exactly to signed
-                    // bytes. Their scale/minimum remain untouched, just like
-                    // an already-expanded projection returning from CPU.
-                    int8_t decoded[32];
-                    if (cpu::native_quantised::is_payload_decodable(gpu.codebook_id))
-                        cpu::native_quantised::decode_native_block(gpu.codebook_id, source, decoded);
-                    else
-                        std::memcpy(decoded, source, sizeof(decoded));
-                    int32_t sum = 0;
-                    for (int value = 0; value < 32; ++value)
-                    {
-                        interleaved[
-                            interleavedValueOffset(output, n, kb, value)] =
-                            static_cast<uint8_t>(decoded[value]);
-                        sum += decoded[value];
-                    }
-                    const int16_t compensation = static_cast<int16_t>(sum);
-                    std::memcpy(
-                        interleaved.data() +
-                            unit + output.data_stride +
-                            static_cast<size_t>(local_column) * sizeof(int16_t),
-                        &compensation,
-                        sizeof(compensation));
-                    std::memcpy(
-                        interleaved.data() +
-                            unit + output.data_stride + 128u +
-                            static_cast<size_t>(local_column) * sizeof(uint16_t),
-                        &gpu.scales[linear],
-                        sizeof(uint16_t));
-                    if (output.is_asymmetric || output.usesIQ3SExpandedSourceScale())
-                    {
-                        std::memcpy(
-                            interleaved.data() +
-                                unit + output.data_stride + 256u +
-                                static_cast<size_t>(local_column) * sizeof(uint16_t),
-                            &gpu.mins[linear],
-                            sizeof(uint16_t));
-                    }
                     continue;
                 }
 

@@ -52,7 +52,7 @@ static constexpr uint32_t PACKED_WEIGHTS_MAGIC = 0x5457504C; // "LPWT" in little
 /// Version-3 Q6 and version-2 expanded multi-scale archives also remain rejected.
 /// Version6 preserves IQ4_XS original half bases and encoded signed coefficients.
 /// Version5 and earlier archives are rejected before any section is adopted.
-/// Version7 retains IQ3_S original half bases and raw nibbles in CPU encoding5.
+/// Version 7 used the now-reserved CPU encoding 5 for IQ3_S.
 /// Version 9 uses exact-density CPU units, including native MXFP4 exponent
 /// bytes and coded source metadata instead of expanded per-block words.
 /// Earlier archives are rejected before any payload is adopted.
@@ -116,14 +116,12 @@ inline cpu::native_quantised::CPUNativeQuantisedEncoding decodePreparedEncoding(
     using Encoding = cpu::native_quantised::CPUNativeQuantisedEncoding;
     switch (value)
     {
-    case static_cast<uint8_t>(Encoding::IQ3SExpandedSourceScale):
-        return Encoding::IQ3SExpandedSourceScale;
     case static_cast<uint8_t>(Encoding::NibbleLUTSourceScale):
         return Encoding::NibbleLUTSourceScale;
     case static_cast<uint8_t>(Encoding::NibbleLUT):
         return Encoding::NibbleLUT;
-    case static_cast<uint8_t>(Encoding::ExpandedInt8):
-        return Encoding::ExpandedInt8;
+    case static_cast<uint8_t>(Encoding::SignedInt8SingleScale):
+        return Encoding::SignedInt8SingleScale;
     case static_cast<uint8_t>(Encoding::Q6KNativeDualScale):
         return Encoding::Q6KNativeDualScale;
     case static_cast<uint8_t>(Encoding::CompactMultiScale):
@@ -139,18 +137,18 @@ inline cpu::native_quantised::CPUNativeQuantisedEncoding decodePreparedEncoding(
 }
 
 /**
- * @brief Reject retired CPU layouts before an incoming v9 record allocates sections.
+ * @brief Reject retired CPU layouts before serializing or materializing a v9 record.
  * @param header Source, encoding, logical geometry and declared unit stride.
  * @param sections Actual serialized section extents.
  * @throws std::invalid_argument If the encoding or its inline weight-sum plane is retired.
  */
-inline void requireAdmittedCPUReceiveEncoding(const PackedWeightsHeader &header,
+inline void requireAdmittedCPUArchiveEncoding(const PackedWeightsHeader &header,
     const PackedWeightsSectionTable &sections)
 {
     using namespace cpu::native_quantised;
     const auto encoding = static_cast<CPUNativeQuantisedEncoding>(header.prepared_encoding);
     requireAdmittedCPUPreparedEncoding(encoding, header.codebook_id);
-    if (encoding != CPUNativeQuantisedEncoding::ExpandedInt8)
+    if (encoding != CPUNativeQuantisedEncoding::SignedInt8SingleScale)
         return;
     if (header.interleaved_block_stride > 0)
         rejectLegacyQ8WeightSumExtent(encoding, header.codebook_id, uint64_t(header.interleaved_block_stride), 1);
@@ -163,7 +161,7 @@ inline void requireAdmittedCPUReceiveEncoding(const PackedWeightsHeader &header,
     }
 }
 
-/** @brief Validate IQ3_S/IQ4_XS source tuples before adopting CPU sections.
+/** @brief Validate the IQ4_XS source tuple before adopting CPU sections.
  * @param header Archive or direct-transfer scalar header.
  * @return Whether encoding4 identifies exactly the IQ4_XS source tuple, and
  *         ordinary IQ4_XS does not claim the retired derived-half nibble encoding.
@@ -171,12 +169,6 @@ inline void requireAdmittedCPUReceiveEncoding(const PackedWeightsHeader &header,
 inline bool validNativeSourceScaleTupleHeader(const PackedWeightsHeader &header) noexcept
 {
     using Encoding = cpu::native_quantised::CPUNativeQuantisedEncoding;
-    if (header.prepared_encoding == static_cast<uint8_t>(Encoding::IQ3SExpandedSourceScale))
-        return header.codebook_id == 11 && header.is_superblock == 1 &&
-               header.is_asymmetric == 0 && header.payload_bytes == 13 &&
-               header.data_stride == static_cast<int32_t>(cpu::native_quantised::preparedDataStride(Encoding::IQ3SExpandedSourceScale, header.codebook_id)) &&
-               header.interleaved_block_stride == static_cast<int32_t>(cpu::native_quantised::preparedInterleavedBlockStride(Encoding::IQ3SExpandedSourceScale, false, header.codebook_id)) &&
-               header.has_native_blocks == 0;
     if (header.prepared_encoding == static_cast<uint8_t>(Encoding::NibbleLUTSourceScale))
         return header.codebook_id == 4 && header.is_superblock == 1 &&
                header.is_asymmetric == 0 && header.payload_bytes == 16 &&
@@ -198,7 +190,7 @@ inline bool validDensityCPUSection(const PackedWeightsHeader &header, const Pack
 {
     using namespace cpu::native_quantised;
     const auto encoding = static_cast<CPUNativeQuantisedEncoding>(header.prepared_encoding);
-    if (!preparedSuperblockCoded(encoding) && !preparedExpandedInt8OmitsCompensation(encoding, header.codebook_id))
+    if (!preparedSuperblockCoded(encoding) && encoding != CPUNativeQuantisedEncoding::SignedInt8SingleScale)
         return true;
     const auto *source = native_quantised_formats::forSourceIdentity(header.codebook_id, header.is_superblock == 1);
     if (!source || header.is_superblock != uint8_t(source->is_superblock) || header.is_asymmetric != uint8_t(source->is_asymmetric) ||
@@ -326,6 +318,15 @@ inline bool describeTransfer(
     sections.payload_size = packed.payload.size();
     sections.int8_flat_size = packed.int8_flat.size();
     sections.native_blocks_size = native_blocks.size();
+    try
+    {
+        requireAdmittedCPUArchiveEncoding(header, sections);
+    }
+    catch (const std::invalid_argument &error)
+    {
+        LOG_WARN("[PackedWeightsSerialization] " << error.what());
+        return false;
+    }
     if (!validDensityCPUSection(header, sections))
         return false;
 
@@ -387,7 +388,7 @@ inline PackedWeightsReceiveTarget allocateTransferTarget(
         throw std::invalid_argument(
             "Direct packed-weight transfer received invalid format metadata");
     }
-    requireAdmittedCPUReceiveEncoding(header, sections);
+    requireAdmittedCPUArchiveEncoding(header, sections);
     if (!validNativeSourceScaleTupleHeader(header) || !validDensityCPUSection(header, sections))
         throw std::invalid_argument("Direct packed-weight transfer received invalid format metadata");
     if (header.N <= 0 || header.K <= 0 || header.N_padded < header.N ||
@@ -615,7 +616,7 @@ inline std::unique_ptr<IPackedWeights> deserialize(
     cpu::native_quantised::CPUNativeQuantisedEncoding encoding;
     try
     {
-        requireAdmittedCPUReceiveEncoding(header, sections);
+        requireAdmittedCPUArchiveEncoding(header, sections);
         encoding = decodePreparedEncoding(header.prepared_encoding);
     }
     catch (const std::invalid_argument &error)
