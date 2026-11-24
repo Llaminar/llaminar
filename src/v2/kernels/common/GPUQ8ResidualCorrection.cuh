@@ -466,6 +466,10 @@ inline Q8R_STREAM validate(const GPUQ8ResidualCorrectionArgs &a, void *stream, N
     const auto values = static_cast<std::size_t>(a.rows.physicalRows()) * a.weights.k;
     const auto outputValues = static_cast<std::size_t>(a.rows.physicalRows()) * a.weights.n;
     const auto weightBlocks = static_cast<std::size_t>(a.weights.n) * a.weights.blocks_per_row;
+    const auto metadataBytes = q8ResidualWeightMetadataBytes(a.weights);
+    const auto primaryAlignment = a.weights.metadata_layout ? 1u : nativeQuantisedScalePlaneBytes(a.weights.codebook_id);
+    const auto secondaryAlignment = a.weights.metadata_layout
+        ? native_quantised_superblock::superblockFieldBytes(a.weights.codebook_id) : alignof(std::uint16_t);
     const std::array writes{
         Q8ResidualStorageSpan{a.output, outputValues * sizeof(float), alignof(float)},
         Q8ResidualStorageSpan{a.primary, values, 16}, Q8ResidualStorageSpan{a.residual, values, 16},
@@ -487,11 +491,9 @@ inline Q8R_STREAM validate(const GPUQ8ResidualCorrectionArgs &a, void *stream, N
                                                   ? a.weights.allocation_payload_bytes_per_block
                                                   : physical.payload_bytes_per_block),
                               16},
-        Q8ResidualStorageSpan{a.weights.scales, weightBlocks * sizeof(std::uint16_t), alignof(std::uint16_t)},
-        Q8ResidualStorageSpan{a.weights.mins, a.weights.mins ? weightBlocks * sizeof(std::uint16_t) : 0,
-                              alignof(std::uint16_t)},
-        Q8ResidualStorageSpan{a.weights.emins, a.weights.emins ? weightBlocks * sizeof(std::uint32_t) : 0,
-                              alignof(std::uint32_t)},
+        Q8ResidualStorageSpan{a.weights.scales, metadataBytes.scales, primaryAlignment},
+        Q8ResidualStorageSpan{a.weights.mins, metadataBytes.secondary, secondaryAlignment},
+        Q8ResidualStorageSpan{a.weights.emins, metadataBytes.emins, alignof(std::uint32_t)},
         Q8ResidualStorageSpan{a.rows.countOwner(), a.rows.countOwner() ? sizeof(std::int32_t) : 0,
                               alignof(std::int32_t)},
         Q8ResidualStorageSpan{tables.iq3s, grids ? 512 * sizeof(std::uint32_t) : 0, alignof(std::uint32_t)},

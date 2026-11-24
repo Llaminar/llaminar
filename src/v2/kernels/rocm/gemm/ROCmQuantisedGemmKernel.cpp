@@ -1738,19 +1738,8 @@ namespace llaminar2
             auto* row_scales=static_cast<float*>(requireBank(GemmWorkspaceBuffers::SCALES_A,sizeof(float)));
             (void)requireBank(GemmWorkspaceBuffers::SUMS_A_BLOCKWISE,static_cast<size_t>(k/32)*sizeof(std::int32_t));
             const auto blocks=static_cast<size_t>(n)*weights.blocks_per_row;
-            // A superblock-coded matrix reads a bit-packed code plane (plus read
-            // padding) and one d/dmin word per row and superblock, never the
-            // per-block planes; describe exactly the bytes its reader can touch.
             const auto weight_meta=native_quantised_scale::metadataPlanes(weights);
-            const auto coded_planes=weight_meta.coded()
-                ? native_quantised_superblock::planeBytes(weights.codebook_id,static_cast<size_t>(n),
-                      weights.blocks_per_row,weight_meta.superblock_phase)
-                : native_quantised_superblock::PlaneBytes{};
-            const size_t primary_bytes=weight_meta.coded()
-                ? coded_planes.code+((weight_meta.code_bit_shift+7u)/8u)
-                : blocks*sizeof(std::uint16_t);
-            const size_t secondary_bytes=weight_meta.coded()?coded_planes.superblock:
-                (weights.mins?blocks*sizeof(std::uint16_t):0);
+            const auto metadata_bytes=q8ResidualWeightMetadataBytes(weights);
             // Protect complete original capacities, including unused immutable
             // allocation planes and the scalar consumer's untouched sums bank.
             const std::array writes{
@@ -1764,9 +1753,11 @@ namespace llaminar2
                 Q8ResidualStorageSpan{input.gamma.gpu_data_ptr(),std::max(input.gamma.size_bytes(),size_t{128}*sizeof(float)),alignof(float)},
                 Q8ResidualStorageSpan{weights.payload,blocks*(weights.allocation_payload_bytes_per_block?
                     weights.allocation_payload_bytes_per_block:physical.payload_bytes_per_block),16},
-                Q8ResidualStorageSpan{weights.scales,primary_bytes,weight_meta.coded()?1u:alignof(std::uint16_t)},
-                Q8ResidualStorageSpan{weights.mins,secondary_bytes,alignof(std::uint16_t)},
-                Q8ResidualStorageSpan{weights.emins,weights.emins?blocks*sizeof(std::uint32_t):0,alignof(std::uint32_t)},
+                Q8ResidualStorageSpan{weights.scales,metadata_bytes.scales,
+                    weight_meta.coded()?1u:nativeQuantisedScalePlaneBytes(weights.codebook_id)},
+                Q8ResidualStorageSpan{weights.mins,metadata_bytes.secondary,
+                    weight_meta.coded()?native_quantised_superblock::superblockFieldBytes(weights.codebook_id):alignof(std::uint16_t)},
+                Q8ResidualStorageSpan{weights.emins,metadata_bytes.emins,alignof(std::uint32_t)},
                 Q8ResidualStorageSpan{workspace->getBuffer(GemmWorkspaceBuffers::SUMS_A_BLOCKWISE),
                     workspace->getBufferSize(GemmWorkspaceBuffers::SUMS_A_BLOCKWISE),alignof(std::int32_t)},
                 Q8ResidualStorageSpan{row_scales,workspace->getBufferSize(GemmWorkspaceBuffers::SCALES_A),alignof(float)}};

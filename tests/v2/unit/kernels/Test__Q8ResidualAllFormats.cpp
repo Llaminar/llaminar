@@ -118,6 +118,41 @@ TEST(Q8ResidualAllFormats, NativeDescriptorRejectsForeignAndMalformedPlanes) {
   }
 }
 
+/** @test TwoTerm admits coded reusable slots and protects only the bound metadata regions. */
+TEST(Q8ResidualAllFormats, NativeCodedSlotsPreserveExactPlaneExtents) {
+  alignas(256) std::array<uint8_t, 4096> storage{};
+  namespace sb = native_quantised_superblock;
+  constexpr auto coded = NativeQuantisedMetadataRepresentation::SuperblockCoded;
+  // Nine K32 blocks at phase three touch two source superblocks. Packed
+  // Q3_K codes start on an interior nibble of a coalesced code run.
+  DeviceNativeQuantisedMatrixDesc d{
+      .payload = storage.data(), .scales = storage.data() + 1025,
+      .mins = storage.data() + 2048, .n = 5, .k = 288, .blocks_per_row = 9,
+      .codebook_id = 9, .allocation_payload_bytes_per_block = 12,
+      .allocation_has_mins = 1, .source_codebook_id = 9,
+      .source_is_superblock = 1, .source_identity_present = 1,
+      .metadata_layout = nativeQuantisedMetadataLayout(coded, 3, 4)};
+  EXPECT_NO_THROW((void)requireQ8ResidualNativeMatrix(d, 3, 5, 288));
+  const auto planes = q8ResidualWeightMetadataBytes(d);
+  EXPECT_EQ(planes.scales, 68 + sb::kSuperblockCodePlanePadBytes);
+  EXPECT_EQ(planes.secondary, 20u);
+  EXPECT_EQ(planes.emins, 0u);
+  auto missing = d;
+  missing.allocation_has_mins = 0;
+  EXPECT_THROW((void)requireQ8ResidualNativeMatrix(missing, 3, 5, 288), std::invalid_argument);
+  missing = d;
+  missing.allocation_payload_bytes_per_block = 32;
+  EXPECT_THROW((void)requireQ8ResidualNativeMatrix(missing, 3, 5, 288), std::invalid_argument);
+
+  d.codebook_id = d.source_codebook_id = 15;
+  d.allocation_payload_bytes_per_block = 8;
+  d.metadata_layout = nativeQuantisedMetadataLayout(coded, 3, 0);
+  EXPECT_THROW((void)requireQ8ResidualNativeMatrix(d, 3, 5, 288), std::invalid_argument);
+  d.scales = d.payload;
+  EXPECT_NO_THROW((void)requireQ8ResidualNativeMatrix(d, 3, 5, 288));
+  EXPECT_EQ(q8ResidualWeightMetadataBytes(d).scales, 0u);
+}
+
 /** @test Large declared capacity is legal; unrepresentable actual spans fail
  * without allocating. */
 TEST(Q8ResidualAllFormats, NativeDeclaredCapacitySpanCannotOverflow) {

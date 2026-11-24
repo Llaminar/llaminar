@@ -31078,7 +31078,8 @@ if(HAVE_ROCM)
         PROPERTIES LANGUAGE HIP)
     add_executable(v2_integration_rocm_expert_tier_weight_kernels
         integration/kernels/rocm/Test__ROCmExpertTierWeightKernels.cpp
-        integration/kernels/rocm/ROCmOriginalM1ReducerOracle.hip)
+        integration/kernels/rocm/ROCmOriginalM1ReducerOracle.hip
+        integration/mpi_gtest_main.cpp)
     target_include_directories(
         v2_integration_rocm_expert_tier_weight_kernels
         PRIVATE ${CMAKE_SOURCE_DIR})
@@ -31088,8 +31089,8 @@ if(HAVE_ROCM)
     target_link_libraries(v2_integration_rocm_expert_tier_weight_kernels
         llaminar2_core
         GTest::gtest
-        GTest::gtest_main
-        hip::host)
+        hip::host
+        MPI::MPI_CXX)
     if(NOT LLAMINAR_SHARED_CORE)
         target_link_libraries(
             v2_integration_rocm_expert_tier_weight_kernels
@@ -31138,6 +31139,12 @@ if(HAVE_ROCM)
         list(APPEND V2_ROCM_EXPERT_TIER_WEIGHT_PREFLIGHT_TESTS
             ${V2_ROCM_EXPERT_TIER_WEIGHT_CTEST})
     endforeach()
+    add_v2_test(V2_Integration_ROCm_CodedExpertRelay_MPI
+        COMMAND $<TARGET_FILE:v2_integration_rocm_expert_tier_weight_kernels>
+            --gtest_filter=ROCmExpertTierWeightKernelsTest.CodedMpiRelayPreservesOriginalGpuPlanes
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;ExpertOverlay;MPI;Transfer;ByteExact;Regression"
+        MPI_PROCS 2 NO_MODELS TIMEOUT 60)
+    list(APPEND V2_ROCM_EXPERT_TIER_WEIGHT_PREFLIGHT_TESTS V2_Integration_ROCm_CodedExpertRelay_MPI)
     # This proof constructs three independently prepared Q/K/V weights before
     # exercising the operation's own concurrent stream pool.  Cold gfx906
     # driver setup can take longer than the ordinary 30-second model-free
@@ -39521,6 +39528,12 @@ if(HAVE_ROCM)
         LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;DeviceResident;ByteExact;Regression"
         MPI_PROCS 1 NO_MODELS TIMEOUT 30)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCm_MoERebalanceCommandBytes)
+    add_v2_test(V2_Integration_ROCm_MoERebalanceCodedArrival
+        COMMAND $<TARGET_FILE:v2_integration_rocm_moe_kernel>
+            --gtest_filter=Test__ROCmMoEKernel.DeviceRebalanceCodedArrivalPreservesSlotLayout
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;Transfer;ByteExact;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCm_MoERebalanceCodedArrival)
 endif()
 
 if(NOT V2_PERF_TESTS_ONLY)

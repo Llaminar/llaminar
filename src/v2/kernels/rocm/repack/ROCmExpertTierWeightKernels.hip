@@ -1136,7 +1136,8 @@ namespace llaminar2
     bool launchCodedExpertBitCopyROCm(const void *source, void *destination, size_t bits,
         unsigned source_shift, unsigned destination_shift, void *stream) noexcept
     {
-        if (!stream || !source || !destination || !bits || source == destination)
+        if (reinterpret_cast<uintptr_t>(stream) <= 2 || !source || !destination || !bits ||
+            source == destination || source_shift > 7 || destination_shift > 7)
             return false;
         constexpr unsigned threads = 128;
         const auto blocks = (bits - 1) / (threads * 8) + 1;
@@ -1151,7 +1152,16 @@ namespace llaminar2
 
     bool launchROCmCodedPeerProjectionRectangle(ROCmCodedPeerProjectionRectangle rectangle, void *stream) noexcept
     {
-        if (!stream || !rectangle.rows || !rectangle.blocks || !rectangle.payload_bytes)
+        const auto &r = rectangle;
+        if (reinterpret_cast<uintptr_t>(stream) <= 2 || !r.rows || !r.blocks || !r.payload_bytes ||
+            r.src_row > r.src_n || r.rows > r.src_n - r.src_row ||
+            r.dst_row > r.dst_n || r.rows > r.dst_n - r.dst_row ||
+            !r.source.payload || !r.destination.payload || !r.source.scales || !r.destination.scales ||
+            !r.source.mins || !r.destination.mins || !r.source.metadata_layout || !r.destination.metadata_layout ||
+            !nativeQuantisedLayoutValid(r.codebook, r.source.metadata_layout) ||
+            !nativeQuantisedLayoutValid(r.codebook, r.destination.metadata_layout) ||
+            native_quantised_superblock::superblockPhase(r.src_block + nativeQuantisedLayoutPhase(r.source.metadata_layout)) !=
+                native_quantised_superblock::superblockPhase(r.dst_block + nativeQuantisedLayoutPhase(r.destination.metadata_layout)))
             return false;
         constexpr size_t threads = 128;
         const auto grid = (size_t(rectangle.rows) * rectangle.blocks - 1) / threads + 1;

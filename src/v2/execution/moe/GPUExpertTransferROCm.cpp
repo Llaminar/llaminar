@@ -220,6 +220,8 @@ namespace llaminar2::detail
     bool transferCodedExpertROCm(const GpuExpertPackedDescriptor &source, const GpuExpertPackedDescriptor &destination,
         const DeviceId &source_device, const DeviceId &destination_device, void *stream)
     {
+        if (reinterpret_cast<uintptr_t>(stream) <= 2)
+            return false;
         const auto bits = source.blockCount() * native_quantised_superblock::superblockCodePlaneBits(source.codebook_id);
         const auto src_shift = nativeQuantisedLayoutCodeBitShift(source.metadata_layout);
         const auto dst_shift = nativeQuantisedLayoutCodeBitShift(destination.metadata_layout);
