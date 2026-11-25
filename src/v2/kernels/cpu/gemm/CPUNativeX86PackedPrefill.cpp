@@ -23,6 +23,9 @@
 #include "CPUNativeX86PackedPrefill.h"
 
 #include <algorithm>
+#include <array>
+#include <bit>
+#include <cstdint>
 #include "CPUNativeAVX2Gemv.h"
 #include "CPUProjectionStorageProof.h"
 
@@ -841,9 +844,14 @@ namespace llaminar2::cpu::native_quantised::x86_panel
 
         /**
          * @brief Immutable operands of one register-folded strip, passed by reference.
-         * @details stripeOrdered() and consumePanelTiles() read these through
-         * one pointer instead of eight scalar/pointer arguments, so their loop
-         * control needs no vector-register or stack spill slots.
+         * @details run() and pooledChunk() materialize one per strip on their
+         * stack (eight field stores) and pass its address, so every field read
+         * through the reference by stripeOrdered() or orderedPanel() is
+         * caller-stack memory traffic, not
+         * register-resident. Under GCC 14, stripeOrdered() reads its fields
+         * once per strip; orderedPanel() reads the pack operands (weight view,
+         * N coordinate, slot) once per panel and the row roots once per row
+         * tile.
          */
         struct OrderedStrip
         {
@@ -858,19 +866,69 @@ namespace llaminar2::cpu::native_quantised::x86_panel
         };
 
         /**
-         * @brief Consume one packed panel of whole partitions across every live row tile of a strip.
+         * @brief Decode the K interval [begin, end) of every sub-strip of a strip into the worker's panel.
+         * @tparam Lanes,Subs,CB As pack().
+         * @param w Admitted weight view.
+         * @param n First original N coordinate of the strip.
+         * @param begin,end Increasing K-block interval of whole partitions, at most @ref depth blocks.
+         * @param panel The calling worker's slot.
+         * @details Inlined into orderedPanel(); pack() itself stays out of
+         * line. A separate noinline function here changed GCC 14's
+         * translation-unit inlining decisions for unrelated dense-panel code.
+         */
+        template <int Lanes, int Subs, int CB>
+        [[gnu::always_inline]] inline void packPanel(const CPUNativeQuantisedWeightView &w, int n, int begin, int end,
+                                                     float *panel)
+        {
+            // A wide strip is one whole chunk: decode its four
+            // sixteen-column vectors into their interleaved planes.
+            pack<Lanes, Subs, 0, CB>(w, n / 64, n % 64, begin, end, panel);
+            if constexpr (Subs == 4)
+            {
+                pack<Lanes, Subs, 1, CB>(w, n / 64, Lanes, begin, end, panel);
+                pack<Lanes, Subs, 2, CB>(w, n / 64, 2 * Lanes, begin, end, panel);
+                pack<Lanes, Subs, 3, CB>(w, n / 64, 3 * Lanes, begin, end, panel);
+            }
+        }
+
+        /**
+         * @brief One 64-bit register word of a PanelFold: two consecutive int fields.
+         * @param low,high The fields in declaration order (x86-64 is little-endian).
+         * @return std::uint32_t(low) | std::uint64_t(std::uint32_t(high)) << 32.
+         * @details orderedPanels() forms each panel's PanelFold from two such
+         * words. Constructing the aggregate field by field in the panel loop
+         * made GCC 14 insert every field into the previous panel's register
+         * words, a false loop-carried dependency that cost three callee-saved
+         * registers and per-panel stack reloads of the strip pointer and
+         * width. (GCC still merges the second word with a mask; one reload of
+         * the strip pointer per panel remains.)
+         */
+        [[gnu::always_inline]] inline std::uint64_t foldWord(int low, int high) noexcept
+        {
+            return std::uint64_t(std::uint32_t(low)) | std::uint64_t(std::uint32_t(high)) << 32;
+        }
+
+        /**
+         * @brief Pack one panel of whole partitions once, then consume it across every live row tile of a strip.
          * @tparam Lanes,Strip,CB,P As stripe(); P is GPU-aligned.
          * @tparam TileRows Register-tile height (panelRowTile()).
          * @tparam Single Whether every partition is one block (wide leaf only).
-         * @param s Strip operands.
+         * @param s Strip operands (caller-stack object, see OrderedStrip).
          * @param fold Partition width, panel blocks, first-panel flag, empty trailing partitions.
-         * @param begin First K block of the panel.
+         * @param begin,end The panel's K-block interval [begin, end); end - begin == fold.n.
+         * @details The former consumePanelTiles() with the panel's pack()
+         * calls moved in from stripeOrdered(): the panel is decoded before any
+         * row tile reads it and reused unchanged by all of them, in the same
+         * row-tile order with the same leaf calls. Its row-tile loops keep the
+         * stack and caller-stack access counts of consumePanelTiles() (GCC
+         * 14); the three pack operands are read through @p s once per panel.
          */
         template <int Lanes, int Strip, int CB, Policy P, int TileRows, bool Single>
         [[gnu::noinline, gnu::optimize("no-tree-slp-vectorize")]]
-        void consumePanelTiles(const OrderedStrip &s, PanelFold fold, int begin)
+        void orderedPanel(const OrderedStrip &s, PanelFold fold, int begin, int end)
         {
             constexpr int Subs = Strip / Lanes;
+            packPanel<Lanes, Subs, CB>(*s.w, s.n, begin, end, s.panel);
             eachRowTile<TileRows>(*s.grid, [&]<int Rows>(int row)
             {
                 const int blocks = s.w->blocks_per_row;
@@ -891,6 +949,29 @@ namespace llaminar2::cpu::native_quantised::x86_panel
         }
 
         /**
+         * @brief Walk the panels of one strip with a single K-block cursor.
+         * @tparam Lanes,Strip,CB,P,TileRows,Single As orderedPanel().
+         * @param s Strip operands.
+         * @param blocks K blocks per row.
+         * @param width Blocks per arithmetic partition, 1 <= width <= @ref depth.
+         * @param empty Empty trailing partitions, parts - ceil(blocks / width).
+         * @details See stripeOrdered() for the panel intervals and fold flags.
+         */
+        template <int Lanes, int Strip, int CB, Policy P, int TileRows, bool Single>
+        [[gnu::always_inline]] inline void orderedPanels(const OrderedStrip &s, int blocks, int width, int empty)
+        {
+            const int step = depth / width * width;
+            for (int begin = 0; begin < blocks;)
+            {
+                const int next = begin + std::min(step, blocks - begin);
+                orderedPanel<Lanes, Strip, CB, P, TileRows, Single>(s, std::bit_cast<PanelFold>(
+                    std::array<std::uint64_t, 2>{foldWord(width, next - begin),
+                                                 foldWord(begin == 0, next == blocks ? empty : 0)}), begin, next);
+                begin = next;
+            }
+        }
+
+        /**
          * @brief stripe() for GPU-aligned trees whose partitions fit one panel, on a complete strip.
          * @tparam Lanes,Strip,CB,P As stripe(); P is GPU-aligned and foldsInRegisters() holds.
          * @param s Strip operands (no carry is needed).
@@ -898,9 +979,18 @@ namespace llaminar2::cpu::native_quantised::x86_panel
          * them in registers (consumeOrdered / consumeWideOrdered) with the
          * serial tree's exact ordered operations. A separate function, so that
          * stripe()'s per-partition program and its frame stay those of
-         * 67dac67f7. Its loop control is scalar; the row-tile walk is the
-         * separate consumePanelTiles(), so neither keeps more live scalars than
-         * general registers (no vector-register or stack spill slots).
+         * 67dac67f7.
+         *
+         * One K-block cursor walks the panels. Panel i holds partitions
+         * [i * (depth / width), min((i + 1) * (depth / width), ceil(blocks / width))),
+         * i.e. with step = (depth / width) * width the K blocks
+         * [begin, begin + min(step, blocks - begin)), the last partition
+         * possibly ragged. begin == 0 holds exactly for the panel with
+         * partition 0, and next == blocks exactly for the panel with the last
+         * nonempty partition, after which the empty ones fold +0. blocks -
+         * begin is positive inside the loop, so no sum overflows. The row-tile
+         * program depends only on the width, so it is selected once per strip;
+         * the loop makes one call per panel (orderedPanel()).
          */
         template <int Lanes, int Strip, int CB, Policy P>
         [[gnu::noinline, gnu::optimize("no-tree-slp-vectorize")]]
@@ -911,36 +1001,20 @@ namespace llaminar2::cpu::native_quantised::x86_panel
             static_assert(P == Policy::GPUAlignedExpert);
             const int blocks = s.w->blocks_per_row;
             const int width = (blocks - 1) / s.parts + 1;
-            // Partitions [0, nonempty) hold blocks; the remaining ones are
-            // empty and fold +0 after the last nonempty partition.
-            const int per_panel = depth / width, nonempty = (blocks - 1) / width + 1;
-            for (int first = 0; first < nonempty; first += per_panel)
+            // Partitions [0, ceil(blocks / width)) hold blocks; the remaining
+            // ones are empty and fold +0 after the last nonempty partition.
+            const int empty = s.parts - ((blocks - 1) / width + 1);
+            constexpr int tile_rows = rowTile(Strip);
+            if constexpr (Subs == 4)
             {
-                const int last = std::min(nonempty, first + per_panel);
-                const int begin = first * width, next = std::min(last * width, blocks);
-                const PanelFold fold{width, next - begin, first == 0, last == nonempty ? s.parts - nonempty : 0};
-                // A wide strip is one whole chunk: decode its four
-                // sixteen-column vectors into their interleaved planes.
-                pack<Lanes, Subs, 0, CB>(*s.w, s.n / 64, s.n % 64, begin, next, s.panel);
-                if constexpr (Subs == 4)
-                {
-                    pack<Lanes, Subs, 1, CB>(*s.w, s.n / 64, Lanes, begin, next, s.panel);
-                    pack<Lanes, Subs, 2, CB>(*s.w, s.n / 64, 2 * Lanes, begin, next, s.panel);
-                    pack<Lanes, Subs, 3, CB>(*s.w, s.n / 64, 3 * Lanes, begin, next, s.panel);
-                }
-                // The tile height is panelRowTile(), which the launch evidence reports.
-                constexpr int tile_rows = rowTile(Strip);
-                if constexpr (Subs == 4)
-                {
-                    constexpr bool split = wideOrderedSplitsRows(static_cast<Format>(CB));
-                    if (width == 1)
-                        consumePanelTiles<Lanes, Strip, CB, P, tile_rows, true>(s, fold, begin);
-                    else
-                        consumePanelTiles<Lanes, Strip, CB, P, split ? 1 : tile_rows, false>(s, fold, begin);
-                }
+                constexpr bool split = wideOrderedSplitsRows(static_cast<Format>(CB));
+                if (width == 1)
+                    orderedPanels<Lanes, Strip, CB, P, tile_rows, true>(s, blocks, width, empty);
                 else
-                    consumePanelTiles<Lanes, Strip, CB, P, tile_rows, false>(s, fold, begin);
+                    orderedPanels<Lanes, Strip, CB, P, split ? 1 : tile_rows, false>(s, blocks, width, empty);
             }
+            else
+                orderedPanels<Lanes, Strip, CB, P, tile_rows, false>(s, blocks, width, empty);
         }
 
         /**
