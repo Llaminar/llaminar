@@ -50,6 +50,7 @@
 namespace llaminar2
 {
     class IServingTraceRecorder;
+    class PhysicalMemorySuballocationLease;
     class ITokenizer;          // Forward declaration
     class IMPIContext;         // Forward declaration
     class IModelContext;       // Forward declaration
@@ -759,11 +760,21 @@ namespace llaminar2
 
         /**
          * @brief Open the serving session with @p capacity resident slots.
-         * @return false (with lastError()) when unsupported or over capacity.
+         *
+         * @param decision_storage PMA claim (ServingResponsePool) that backs the
+         *        session's per-slot decision-logits store; HTTP serving always
+         *        supplies it. Callers without an admitted serving pool (direct
+         *        runner use, tests) pass null and the store is unadmitted heap.
+         * @return false (with lastError()) when unsupported, over capacity or
+         *         when the claim does not cover the store.
          */
-        virtual bool beginServingBatch(int capacity)
+        bool beginServingBatch(int capacity) { return beginServingBatch(capacity, nullptr); }
+
+        virtual bool beginServingBatch(int capacity,
+                                       std::shared_ptr<PhysicalMemorySuballocationLease> decision_storage)
         {
             (void)capacity;
+            (void)decision_storage;
             return false;
         }
 

@@ -309,7 +309,9 @@ namespace llaminar2
         bool supportsDecodeStepBatch(int request_batch) const override;
         GenerationBatchResult decodeStepBatch(int request_batch) override;
         int servingBatchCapacity() const override;
-        bool beginServingBatch(int capacity) override;
+        using IOrchestrationRunner::beginServingBatch;
+        bool beginServingBatch(int capacity,
+                               std::shared_ptr<PhysicalMemorySuballocationLease> decision_storage) override;
         bool submitServingRequest(ServingBatchRequest request) override;
         void cancelServingRequest(std::uint64_t id) override;
         void grantServingTokens(std::uint64_t id, int tokens) override;

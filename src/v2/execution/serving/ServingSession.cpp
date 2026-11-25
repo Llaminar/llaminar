@@ -15,7 +15,8 @@ namespace llaminar2
     {
     }
 
-    bool ServingSession::begin(int capacity, int slots_to_reset, std::string &error)
+    bool ServingSession::begin(int capacity, int slots_to_reset, std::string &error,
+                               std::shared_ptr<PhysicalMemorySuballocationLease> decision_storage)
     {
         if (active_)
         {
@@ -33,10 +34,20 @@ namespace llaminar2
                 error = "Serving batch could not reset slot " + std::to_string(slot);
                 return false;
             }
+        const std::size_t decision_floats = static_cast<std::size_t>(capacity) * static_cast<std::size_t>(vocab_);
+        if (decision_storage &&
+            (!decision_storage->valid() || decision_storage->bytes() < decision_floats * sizeof(float)))
+        {
+            error = "Serving decision storage claim does not cover " + std::to_string(decision_floats * sizeof(float)) +
+                    " bytes";
+            return false;
+        }
         rows_.clear();
         rows_.reserve(static_cast<std::size_t>(capacity));
         slot_busy_.assign(static_cast<std::size_t>(capacity), false);
-        decision_logits_.assign(static_cast<std::size_t>(capacity) * static_cast<std::size_t>(vocab_), 0.0f);
+        // The claim is held for the store's whole lifetime (released in end()).
+        decision_storage_ = std::move(decision_storage);
+        decision_logits_.assign(decision_floats, 0.0f);
         queue_.clear();
         cancellations_.clear();
         pending_grants_.clear();
@@ -139,6 +150,7 @@ namespace llaminar2
         failure_.clear();
         decision_logits_.clear();
         decision_logits_.shrink_to_fit();
+        decision_storage_.reset(); // after the store is freed
     }
 
     std::vector<ServingBatchEvent> ServingSession::sealAll(const std::string &reason,

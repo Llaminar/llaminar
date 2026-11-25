@@ -66,7 +66,7 @@ namespace llaminar2::test
                 return cancelled_;
             }
 
-            bool beginServingBatch(int) override { return true; }
+            bool beginServingBatch(int, std::shared_ptr<PhysicalMemorySuballocationLease>) override { return true; }
             void endServingBatch() override { ended = true; }
             int servingBatchCapacity() const override { return resident_capacity; }
             const std::string &lastError() const override { return error_; }

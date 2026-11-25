@@ -26801,7 +26801,8 @@ bool OrchestrationRunner::publishPhysicalMemoryAuthority()
         };
     } // namespace
 
-    bool OrchestrationRunner::beginServingBatch(int capacity)
+    bool OrchestrationRunner::beginServingBatch(
+        int capacity, std::shared_ptr<PhysicalMemorySuballocationLease> decision_storage)
     {
         if (serving_session_ && serving_session_->active())
             return setError("Serving batch session is already open");
@@ -26821,7 +26822,7 @@ bool OrchestrationRunner::publishPhysicalMemoryAuthority()
         serving_session_ = std::make_unique<ServingSession>(*serving_rows_adapter_, context, vocabSize());
         serving_session_->setTraceRecorder(serving_trace_recorder_);
         std::string error;
-        if (!serving_session_->begin(capacity, supported, error))
+        if (!serving_session_->begin(capacity, supported, error, std::move(decision_storage)))
         {
             serving_session_.reset();
             serving_rows_adapter_.reset();

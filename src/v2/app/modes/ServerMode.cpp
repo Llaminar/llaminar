@@ -1166,7 +1166,12 @@ namespace llaminar2
         };
         if (batch_capacity > 1)
         {
-            batch_driver = std::make_unique<ServingBatchDriver>(*runner, batch_capacity, config.max_seq_len);
+            // The decision store is materialized from the committed serving
+            // pool (one FP32 vocabulary row per resident slot).
+            batch_driver = std::make_unique<ServingBatchDriver>(
+                *runner, batch_capacity, config.max_seq_len,
+                response_leases->claimDecisionStorage(
+                    ServingSlotDecisionGeometry::forVocabulary(runner->vocabSize()).bytesFor(batch_capacity)));
             // Install lanes (and snapshot request metadata) before the driver
             // thread owns the runner.
             handler.setGenerationLaneFactory(
@@ -1195,7 +1200,8 @@ namespace llaminar2
                             {"executing", lease_state.executing},
                             {"resident_slots", driver->capacity()},
                             {"active", occupancy.resident}, {"queued", occupancy.queued},
-                            {"committed_bytes", lease_state.committed_bytes}};
+                            {"committed_bytes", lease_state.committed_bytes},
+                            {"materialized_bytes", lease_state.materialized_bytes}};
             };
             LOG_INFO("Continuous batching: S=" << batch_capacity << " resident slots, R="
                      << resolved_capacity->responseLeases() << " response leases, Q="

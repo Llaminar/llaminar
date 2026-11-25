@@ -27,6 +27,7 @@
 
 #include "execution/prefix_cache/PrefixStateSnapshot.h"
 #include "execution/serving/ServingBatch.h"
+#include "planning/PhysicalMemoryAuthority.h"
 #include "utils/Sampler.h"
 
 #include <cstddef>
@@ -116,7 +117,8 @@ namespace llaminar2
          * @brief Open with @p capacity resident slots (all reset).
          * @param slots_to_reset Slots owned by the executor (>= capacity).
          */
-        bool begin(int capacity, int slots_to_reset, std::string &error);
+        bool begin(int capacity, int slots_to_reset, std::string &error,
+                   std::shared_ptr<PhysicalMemorySuballocationLease> decision_storage = nullptr);
         bool active() const noexcept { return active_; }
 
         /** @brief Queue a request; false with @p error when invalid or sealed. */
@@ -193,6 +195,8 @@ namespace llaminar2
          *        the serving pool's ServingSlotDecisionGeometry.
          */
         std::vector<float> decision_logits_;
+        /// PMA claim backing decision_logits_ (released after the store is freed).
+        std::shared_ptr<PhysicalMemorySuballocationLease> decision_storage_;
         std::string failure_;
         std::shared_ptr<IServingTraceRecorder> recorder_;
     };

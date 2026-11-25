@@ -171,8 +171,10 @@ namespace llaminar2
          * @param capacity Resident request slots of the session.
          * @param context_tokens Admitted context; bounds each request's output.
          */
-        ServingBatchDriver(IOrchestrationRunner &runner, int capacity, int context_tokens)
-            : runner_(runner), capacity_(capacity), context_tokens_(context_tokens)
+        ServingBatchDriver(IOrchestrationRunner &runner, int capacity, int context_tokens,
+                           std::shared_ptr<PhysicalMemorySuballocationLease> decision_storage = nullptr)
+            : runner_(runner), capacity_(capacity), context_tokens_(context_tokens),
+              decision_storage_(std::move(decision_storage))
         {
         }
 
@@ -187,7 +189,7 @@ namespace llaminar2
             std::promise<std::string> opened;
             auto result = opened.get_future();
             thread_ = std::thread([this, &opened] {
-                if (!runner_.beginServingBatch(capacity_))
+                if (!runner_.beginServingBatch(capacity_, decision_storage_))
                 {
                     opened.set_value(runner_.lastError().empty() ? "serving batch rejected"
                                                                  : runner_.lastError());
@@ -515,6 +517,7 @@ namespace llaminar2
         IOrchestrationRunner &runner_;
         const int capacity_;
         const int context_tokens_;
+        std::shared_ptr<PhysicalMemorySuballocationLease> decision_storage_;
         std::thread thread_;
         mutable std::mutex mutex_;
         std::condition_variable cv_;

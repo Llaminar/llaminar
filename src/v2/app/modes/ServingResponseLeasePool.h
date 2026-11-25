@@ -88,6 +88,7 @@ namespace llaminar2
             std::size_t responses;           ///< Admitted response leases.
             std::size_t executing;           ///< Resident or waiting requests.
             std::uint64_t committed_bytes;   ///< PMA ServingResponsePool commitment.
+            std::uint64_t materialized_bytes; ///< Bytes claimed inside the commitment.
         };
 
         /**
@@ -147,10 +148,23 @@ namespace llaminar2
             return {static_cast<std::size_t>(state_->capacity.responseLeases()),
                     static_cast<std::size_t>(state_->capacity.residentSlots() + state_->capacity.queueCapacity()),
                     state_->responses, state_->executing,
-                    state_->reservation.valid() ? state_->reservation.capacityBytes() : 0u};
+                    state_->reservation.valid() ? state_->reservation.capacityBytes() : 0u,
+                    state_->reservation.valid() ? state_->reservation.materializedBytes() : 0u};
         }
 
         [[nodiscard]] const ResolvedServingCapacity &capacity() const noexcept { return state_->capacity; }
+
+        /**
+         * @brief Claim the session's decision store from the committed pool.
+         * @return Null for a device-free pool without a PMA reservation.
+         * @throws std::logic_error When the claim would exceed the reservation.
+         */
+        [[nodiscard]] std::shared_ptr<PhysicalMemorySuballocationLease> claimDecisionStorage(std::size_t bytes) const
+        {
+            if (!state_->reservation.valid())
+                return nullptr;
+            return std::make_shared<PhysicalMemorySuballocationLease>(state_->reservation.claimAllocation(bytes));
+        }
 
     private:
         std::shared_ptr<State> state_;
