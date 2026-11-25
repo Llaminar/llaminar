@@ -48,6 +48,17 @@ namespace llaminar2
             return left + right;
         }
 
+        /** @brief Reject byte-count overflow of a product. */
+        [[nodiscard]] std::size_t checkedMultiply(
+            std::size_t left,
+            std::size_t right,
+            const char *what)
+        {
+            if (left != 0 && right > std::numeric_limits<std::size_t>::max() / left)
+                throw std::overflow_error(std::string("Persistent-state ") + what + " overflows size_t");
+            return left * right;
+        }
+
         /** @brief Check an exact layer's tensor directory for an architecture marker. */
         bool layerHasTensor(
             const ModelMemoryProfile &profile,
@@ -228,8 +239,12 @@ namespace llaminar2
             }
             else
             {
-                result.live_recurrent_state_bytes =
-                    geometry.localPayloadBytes(resident_gdn_layers);
+                // The CPU hybrid cache owns one recurrent/conv state per
+                // admitted sequence (continuous-batching slots).
+                result.live_recurrent_state_bytes = checkedMultiply(
+                    geometry.localPayloadBytes(resident_gdn_layers),
+                    static_cast<size_t>(std::max(1, batch_size)),
+                    "CPU recurrent state per admitted sequence");
             }
         }
 

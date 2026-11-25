@@ -185,6 +185,19 @@ namespace llaminar2
         /// Returns nullptr for FA layers and every GPU cache.
         virtual float *getRecurrenceState(int layer) = 0;
 
+        /**
+         * @brief GDN state of one admitted sequence (serving slot).
+         *
+         * Sequence 0 is getGDNState(). CPU caches admitted for several
+         * sequences own one recurrent/conv state per sequence so continuous
+         * batching rows keep independent recurrent history.
+         * @return Null when the sequence has no recurrent state of its own.
+         */
+        virtual HybridGDNLayerState *getGDNSequenceState(int layer, int seq_idx)
+        {
+            return seq_idx == 0 ? getGDNState(layer) : nullptr;
+        }
+
         /// Get CPU-owned conv state [qkv_dim, conv_kernel-1].
         /// Returns nullptr for FA layers and every GPU cache.
         virtual float *getConvState(int layer) = 0;

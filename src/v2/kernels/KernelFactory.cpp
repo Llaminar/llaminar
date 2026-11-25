@@ -4118,10 +4118,12 @@ namespace llaminar
                     if (config.device.is_cpu() && config.hybrid_config &&
                         config.hybrid_config->countGDNLayers() > 0)
                     {
+                        // One recurrent/conv state per admitted sequence.
                         const size_t recurrent_bytes =
                             config.hybrid_config->gdnStateGeometry()
                                 .localPayloadBytes(
-                                    config.hybrid_config->countGDNLayers());
+                                    config.hybrid_config->countGDNLayers()) *
+                            static_cast<size_t>(std::max(1, config.batch_size));
                         if (recurrent_bytes > 0)
                         {
                             auto typed_lease =

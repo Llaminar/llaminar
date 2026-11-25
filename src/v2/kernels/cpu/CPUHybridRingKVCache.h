@@ -409,6 +409,42 @@ namespace llaminar2
         }
 
         /// Get GDN state for a layer (nullptr if FA layer)
+        HybridGDNLayerState *getGDNSequenceState(int layer, int seq_idx) override
+        {
+            if (seq_idx == 0)
+                return getGDNState(layer);
+            const int gdn_idx = layer_map_.toGDNIndex(normalizeLayerIndex(layer));
+            if (gdn_idx < 0 || seq_idx < 1 || seq_idx > static_cast<int>(sequence_gdn_states_.size()))
+                return nullptr;
+            auto &states = sequence_gdn_states_[static_cast<size_t>(seq_idx - 1)];
+            return gdn_idx < static_cast<int>(states.size()) ? &states[static_cast<size_t>(gdn_idx)] : nullptr;
+        }
+
+        /**
+         * @brief Retire one sequence: its KV rows and, for sequences other than
+         *        request zero's live state, its recurrent and conv state.
+         */
+        bool resetSequenceState(
+            int seq_idx,
+            const typename IKVCache::StateResetContext &context) override
+        {
+            if (!Base::resetSequenceState(seq_idx, context))
+                return false;
+            if (seq_idx >= 1 && seq_idx <= static_cast<int>(sequence_gdn_states_.size()))
+                for (auto &state : sequence_gdn_states_[static_cast<size_t>(seq_idx - 1)])
+                {
+                    std::fill(state.recurrence_state.begin(), state.recurrence_state.end(), 0.0f);
+                    std::fill(state.conv_state.begin(), state.conv_state.end(), 0.0f);
+                }
+            else if (seq_idx == 0)
+                for (auto &state : gdn_states_)
+                {
+                    std::fill(state.recurrence_state.begin(), state.recurrence_state.end(), 0.0f);
+                    std::fill(state.conv_state.begin(), state.conv_state.end(), 0.0f);
+                }
+            return true;
+        }
+
         HybridGDNLayerState *getGDNState(int layer) override
         {
             int gdn_idx = layer_map_.toGDNIndex(normalizeLayerIndex(layer));
@@ -585,6 +621,9 @@ namespace llaminar2
         int first_layer_index_ = 0;
         HybridLayerMap layer_map_;
         std::vector<HybridGDNLayerState> gdn_states_;
+        /// Recurrent/conv state of sequences 1..batch_size-1 (serving slots);
+        /// sequence 0 is gdn_states_. Each holds CPU vectors only (no kernels).
+        std::vector<std::vector<HybridGDNLayerState>> sequence_gdn_states_;
 
         struct HostStateCopySpan
         {
@@ -1012,6 +1051,26 @@ namespace llaminar2
                 state.full_conv_state_size =
                     geometry.full_conv_state_floats;
                 state.initializeCPUState(geometry.local_qkv_dim);
+            }
+            // One independent recurrent/conv state per additional admitted
+            // sequence (continuous-batching slots). RecurrentLiveState is
+            // admitted for every sequence (KernelFactory claims batch_size x).
+            sequence_gdn_states_.assign(static_cast<size_t>(std::max(0, this->batch_size() - 1)), {});
+            for (auto &sequence : sequence_gdn_states_)
+            {
+                sequence.resize(static_cast<size_t>(n_gdn));
+                for (auto &state : sequence)
+                {
+                    state.n_v_heads = geometry.local_value_heads;
+                    state.n_k_heads = geometry.local_key_heads;
+                    state.recurrence_layout = geometry.recurrence_layout;
+                    state.d_k = geometry.d_k;
+                    state.d_v = geometry.d_v;
+                    state.conv_kernel_size = config.gdn_conv_kernel_size;
+                    state.full_recurrence_state_size = geometry.cpuFullRecurrenceStateFloats();
+                    state.full_conv_state_size = geometry.full_conv_state_floats;
+                    state.initializeCPUState(geometry.local_qkv_dim);
+                }
             }
 
             LOG_DEBUG("[CPUHybridRingKVCache] Created: " << total_layers_ << " total layers, "

@@ -1228,6 +1228,37 @@ namespace llaminar2
         auto *gdn_state = hybrid_cache->getGDNState(layer_idx);
         LLAMINAR_ASSERTF(gdn_state != nullptr,
                          "No GDN state found for layer " << layer_idx);
+        // CPU continuous-batching rows: each row advances its own slot's
+        // persistent recurrent/conv state. One row binds that slot's state
+        // directly; several rows bind per-row slot tables for the batched call.
+        HybridGDNLayerState *live_state = gdn_state;
+        const std::vector<float *> *serving_row_recurrence = nullptr;
+        const std::vector<float *> *serving_row_conv = nullptr;
+        if (device.is_cpu() && !host_request_kv_slots_.empty())
+        {
+            if (batch_size == 1)
+            {
+                live_state = hybrid_cache->getGDNSequenceState(layer_idx, host_request_kv_slots_.front());
+                LLAMINAR_ASSERTF(live_state != nullptr,
+                                 "No GDN state for serving slot " << host_request_kv_slots_.front());
+            }
+            else
+            {
+                auto &recurrence = serving_row_recurrence_states_[layer_idx];
+                auto &conv = serving_row_conv_states_[layer_idx];
+                recurrence.clear();
+                conv.clear();
+                for (const int slot : host_request_kv_slots_)
+                {
+                    auto *slot_state = hybrid_cache->getGDNSequenceState(layer_idx, slot);
+                    LLAMINAR_ASSERTF(slot_state != nullptr, "No GDN state for serving slot " << slot);
+                    recurrence.push_back(slot_state->recurrence_state.data());
+                    conv.push_back(slot_state->conv_state.data());
+                }
+                serving_row_recurrence = &recurrence;
+                serving_row_conv = &conv;
+            }
+        }
 
         const bool scalar_rocm_qk_pair=device.is_rocm() && batch_size==1 && seq_len==1 &&
             !config_.grouped_mtp_verifier &&
@@ -1503,7 +1534,7 @@ namespace llaminar2
         // CPU kernels own live state in the cache vector. GPU kernels own stable
         // device banks and must never adopt a host pointer as live state.
         conv_params.conv_state = device.is_cpu()
-                                     ? gdn_state->conv_state.data()
+                                     ? live_state->conv_state.data()
                                      : nullptr;
         conv_params.seq_len = total_tokens;
         conv_params.request_count = batch_size;
@@ -1521,6 +1552,7 @@ namespace llaminar2
 
         // Use kernel instance from hybrid cache (lifetime tied to cache)
         conv_params.kernel = gdn_state->conv_kernel.get();
+        conv_params.serving_row_states = serving_row_conv;
 
         conv_params.qk_contract=qk_contract;
         conv_params.input_buffer_id = BufferId::GDN_QKV;
@@ -1563,7 +1595,7 @@ namespace llaminar2
         rec_params.dt_bias = gdn_layer->ssm_dt_bias;
         rec_params.output = buffers.attn_output;
         rec_params.recurrence_state = device.is_cpu()
-                                          ? gdn_state->recurrence_state.data()
+                                          ? live_state->recurrence_state.data()
                                           : nullptr;
         rec_params.seq_len = total_tokens;
         rec_params.request_count = batch_size;
@@ -1600,6 +1632,7 @@ namespace llaminar2
 
         // Use kernel instance from hybrid cache (lifetime tied to cache)
         rec_params.kernel = gdn_state->rec_kernel.get();
+        rec_params.serving_row_states = serving_row_recurrence;
         rec_params.sequence_state_cache = kv_cache;
 
         graph.addNode(prefix + "gdn_recurrence",

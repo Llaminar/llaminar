@@ -1096,9 +1096,25 @@ namespace llaminar2
         }
         if (verifier_state_capture_ && shared_slots_ &&
             byteRangesOverlap(state,static_cast<size_t>(layout.floats())*sizeof(float),shared_slots_,shared_slot_floats_*sizeof(float))) return false;
-        if (!ensureRequestStateBank(request_count, layout.floats(), state)) return false;
-        for (int request = 0; request < request_count; ++request)
-            if (!layout.valid(request_state_bank_.data() + static_cast<size_t>(request)*layout.floats())) return false;
+        // Serving rows: each request advances its own persistent slot state in
+        // place; there is no request bank and no request-zero mirror.
+        const std::vector<float *> *row_states = serving_row_states_;
+        if (row_states)
+        {
+            if (verifier_state_capture_ || static_cast<int>(row_states->size()) != request_count) return false;
+            for (float *slot_state : *row_states)
+                if (!slot_state || !layout.valid(slot_state)) return false;
+        }
+        else
+        {
+            if (!ensureRequestStateBank(request_count, layout.floats(), state)) return false;
+            for (int request = 0; request < request_count; ++request)
+                if (!layout.valid(request_state_bank_.data() + static_cast<size_t>(request)*layout.floats())) return false;
+        }
+        auto request_state = [&](int request) -> float * {
+            return row_states ? (*row_states)[static_cast<size_t>(request)]
+                              : request_state_bank_.data() + static_cast<size_t>(request)*layout.floats();
+        };
         const bool capture = verifier_state_capture_ != nullptr;
         if (capture && (!shared_slots_ || verifier_state_capture_!=shared_slots_))
             throw std::invalid_argument("CPU GDN production verifier requires bound shared epoch slots; dense snapshots require explicit serialization API");
@@ -1123,7 +1139,7 @@ namespace llaminar2
                 if (failed.load(std::memory_order_relaxed)) return CPUFixedEpochObservations{};
                 const int request=task/n_heads,head=task%n_heads,rows=host_request_seq_lens[request];
                 const size_t first=static_cast<size_t>(request)*request_seq_len;
-                float *initial=request_state_bank_.data()+static_cast<size_t>(request)*layout.floats()+static_cast<size_t>(head)*layout.headFloats();
+                float *initial=request_state(request)+static_cast<size_t>(head)*layout.headFloats();
                 if (shared_capture && rows==0) {
                     const size_t span=CPUSharedGDNSnapshots::headFloats(layout,shared_width_);
                     CPUSharedGDNSnapshots(layout,shared_slots_+static_cast<size_t>(task)*span,shared_width_).retire();
@@ -1193,7 +1209,7 @@ namespace llaminar2
         if (observe_epoch) OMP_SINGLE([&]() { publishEpochCounterObservations(d_k, d_v); });
         if (failed.load(std::memory_order_relaxed)) return false;
         if (shared_capture) shared_valid_=true;
-        if (!capture) std::memcpy(state,request_state_bank_.data(),static_cast<size_t>(layout.floats())*sizeof(float));
+        if (!capture && !row_states) std::memcpy(state,request_state_bank_.data(),static_cast<size_t>(layout.floats())*sizeof(float));
         return true;
     }
 

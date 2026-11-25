@@ -73,16 +73,20 @@ namespace llaminar2::test
         {
         protected:
             virtual bool prefixCache() const { return false; }
+            /** Canonical fixture model under the project root. */
+            virtual std::string defaultModel() const { return "models/qwen2.5-0.5b-instruct-q4_0.gguf"; }
+            virtual const char *modelOverrideVariable() const { return "LLAMINAR_CB_TEST_MODEL"; }
+            virtual void adjust(OrchestrationConfig &) const {}
 
             void SetUp() override
             {
                 // The V2_Models fixture provides the canonical model under the
                 // project root (the test's working directory); the variable
                 // only overrides it. A missing model fails: never a skip.
-                const char *override_model = std::getenv("LLAMINAR_CB_TEST_MODEL");
+                const char *override_model = std::getenv(modelOverrideVariable());
                 const std::string model = override_model && *override_model
                                               ? std::string(override_model)
-                                              : std::string("models/qwen2.5-0.5b-instruct-q4_0.gguf");
+                                              : defaultModel();
                 ASSERT_TRUE(std::filesystem::exists(model)) << "continuous-batching test model missing: " << model;
                 if (!hasCPUBackend())
                     initCPUBackend(0);
@@ -91,6 +95,7 @@ namespace llaminar2::test
                 config.batch_size = kCapacity;
                 config.deterministic = false;
                 config.prefix_cache.enabled = prefixCache();
+                adjust(config);
                 if (prefixCache())
                 {
                     // Hermetic tiers: the default disk tier persists across
@@ -155,6 +160,19 @@ namespace llaminar2::test
             }
 
             std::unique_ptr<IOrchestrationRunner> runner_;
+        };
+
+        /** Hybrid recurrent (GDN) model: per-slot recurrent and conv state. */
+        class ContinuousBatchingCPUHybrid : public ContinuousBatchingCPU
+        {
+        protected:
+            std::string defaultModel() const override { return "models/Qwen3.5-4B-Q8_0.gguf"; }
+            const char *modelOverrideVariable() const override { return "LLAMINAR_CB_HYBRID_TEST_MODEL"; }
+            void adjust(OrchestrationConfig &config) const override
+            {
+                config.mtp.enabled = false; // as --no-mtp: MTP serving rows are not implemented yet
+                config.mtp_activation_policy = MTPActivationPolicy::Disabled;
+            }
         };
 
         /** Same session with the (default-on) prefix cache enabled. */
@@ -487,5 +505,40 @@ namespace llaminar2::test
         EXPECT_EQ(ServingStepTraceReplayer::replay(trace), "");
         if (const char *path = std::getenv("LLAMINAR_CB_RECORD_TRACE"); path && *path)
             trace.write(path);
+    }
+} // namespace llaminar2::test
+
+namespace llaminar2::test
+{
+    TEST_F(ContinuousBatchingCPUHybrid, SoloServingMatchesScalarGeneration)
+    {
+        const auto request = makeRequest(1, 20, 10, 0.0f, 1);
+        SamplingParams greedy = request.sampling;
+        const auto scalar = runner_->generate(request.prompt, request.max_new_tokens, greedy);
+        ASSERT_TRUE(scalar.error.empty()) << scalar.error;
+        const auto served = solo(request);
+        EXPECT_EQ(served.tokens, scalar.tokens);
+    }
+
+    TEST_F(ContinuousBatchingCPUHybrid, RecurrentStatePerSlotIsIndependentOfComposition)
+    {
+        // A continues while B finishes and C enters B's retired slot; every
+        // request's tokens and decision logits equal its solo run, so no slot
+        // reads or advances another slot's recurrent/conv state.
+        auto a = makeRequest(1, 9, 16, 0.0f, 1);
+        auto b = makeRequest(2, 21, 4, 0.0f, 1);
+        auto c = makeRequest(3, 70, 6, 0.8f, 5);
+        for (auto *r : {&a, &b, &c})
+            r->record_logit_digests = true;
+        std::map<std::uint64_t, Outcome> reference;
+        for (const auto &request : {a, b, c})
+            reference[request.id] = solo(request);
+        const auto batched = run({{0, {a, b}}, {3, {c}}});
+        for (const auto &request : {a, b, c})
+        {
+            EXPECT_EQ(batched.at(request.id).tokens, reference.at(request.id).tokens) << "request " << request.id;
+            EXPECT_EQ(batched.at(request.id).logit_digests, reference.at(request.id).logit_digests)
+                << "request " << request.id;
+        }
     }
 } // namespace llaminar2::test

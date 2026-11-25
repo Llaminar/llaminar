@@ -3901,6 +3901,20 @@ namespace llaminar2
         }
 
         /**
+         * @brief Bind serving-row states: request r of the next request-batched
+         *        call reads and advances @p states[r] in place (no request bank,
+         *        no request-zero mirror). Null unbinds.
+         *
+         * Continuous-batching rows address persistent per-slot state, so a
+         * request's state never depends on which other slots share the call.
+         * @return false when the kernel cannot address external states.
+         */
+        virtual bool bindServingRowStates(const std::vector<float *> *states)
+        {
+            return states == nullptr;
+        }
+
+        /**
          * @brief Return true if this kernel can isolate live conv state per request.
          *
          * Batched MTP verifier publication is only correct when every request
@@ -4492,6 +4506,20 @@ namespace llaminar2
         {
             (void)workspace;
             (void)state_size;
+        }
+
+        /**
+         * @brief Bind serving-row states: request r of the next request-batched
+         *        call reads and advances @p states[r] in place (no request bank,
+         *        no request-zero mirror). Null unbinds.
+         *
+         * Continuous-batching rows address persistent per-slot state, so a
+         * request's state never depends on which other slots share the call.
+         * @return false when the kernel cannot address external states.
+         */
+        virtual bool bindServingRowStates(const std::vector<float *> *states)
+        {
+            return states == nullptr;
         }
 
         /**

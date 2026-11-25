@@ -83,6 +83,12 @@ namespace llaminar2
          * `(request, SIMD-channel-block)` pairs while each pair walks its real
          * rows in serial decode order.
          */
+        bool bindServingRowStates(const std::vector<float *> *states) override
+        {
+            serving_row_states_ = states;
+            return true;
+        }
+
         bool forwardBatchedRequestsWithHostSeqLens(
             const float *input, const float *weight, const float *bias,
             float *output, float *conv_state,
@@ -131,6 +137,8 @@ namespace llaminar2
         float *speculative_state_work_ = nullptr;
         int speculative_state_work_size_ = 0;
         std::vector<float> owned_speculative_state_work_;
+        /// Serving-row states bound for the next request-batched call (not owned).
+        const std::vector<float *> *serving_row_states_ = nullptr;
         std::vector<float> request_state_bank_;
         int request_state_size_ = 0;
         int request_state_capacity_ = 0;

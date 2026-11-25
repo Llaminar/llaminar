@@ -61464,8 +61464,10 @@ namespace llaminar2
         if (!state_.device_id.is_cpu())
             return "continuous batching on " + state_.device_id.toString() +
                    " requires GPU retained serving execution, which is not implemented yet";
-        if (dynamic_cast<const IHybridKVCache *>(state_.kv_cache.get()) != nullptr)
-            return "hybrid recurrent state has no per-slot serving rows yet";
+        if (dynamic_cast<const IHybridKVCache *>(state_.kv_cache.get()) != nullptr &&
+            graph_builder_ && graph_builder_->config().prefix_cache.enabled)
+            return "prefix caching of hybrid recurrent state has no per-slot serving rows yet "
+                   "(use --no-prefix-cache)";
         if (!state_.mtp_kv_caches.empty() || (graph_builder_ && graph_builder_->config().mtp.enabled))
             return "MTP speculative decoding has no per-slot serving rows yet (use --no-mtp)";
         if (graph_builder_ && graph_builder_->config().prefix_cache.enabled &&

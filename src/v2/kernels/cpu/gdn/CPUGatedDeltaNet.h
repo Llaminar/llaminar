@@ -170,6 +170,12 @@ namespace llaminar2
             float *state_snapshots, int snapshot_stride_floats,
             int max_snapshot_rows) override;
 
+        bool bindServingRowStates(const std::vector<float *> *states) override
+        {
+            serving_row_states_ = states;
+            return true;
+        }
+
         bool chunkForwardBatchedRequestsWithHostSeqLens(
             const float *Q, const float *K, const float *V,
             const float *alpha, const float *beta_raw,
@@ -204,6 +210,9 @@ namespace llaminar2
             bool use_qk_l2norm) override;
 
     private:
+        /// Serving-row states bound for the next request-batched call (not owned).
+        const std::vector<float *> *serving_row_states_ = nullptr;
+
         /** @brief Same-kernel per-call telemetry, reset/reduced/published by its existing team. */
         CPUFixedEpochObservations epoch_counter_observations_{};
         /** @brief One team-owner-sealed choice for this call, never model policy. */
