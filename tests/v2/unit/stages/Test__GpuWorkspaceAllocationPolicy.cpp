@@ -12285,16 +12285,16 @@ TEST(Test__GpuWorkspaceAllocationPolicy, AttentionSnapshotDescriptorsNeverObserv
         std::string::npos)
         << "captured snapshot metadata must use the cache view published by execute()";
     EXPECT_NE(
-        dump_body.find("elseif(params_.kv_cache&&params_.layer_idx>=0&&!params_.device_id.is_gpu())"),
+        dump_body.find("if(params_.kv_cache&&params_.layer_idx>=0&&params_.device_id.is_cpu())"),
         std::string::npos)
         << "host sequence-state inspection must be confined to host-owned CPU caches";
 
     const auto gpu_branch_end = dump_body.find(
         "if(params_.Q)",
-        dump_body.find("if(debug_effective_k_tensor_"));
+        dump_body.find("debug_effective_k_tensor_"));
     ASSERT_NE(gpu_branch_end, std::string::npos);
     const auto descriptor_selection = dump_body.substr(0, gpu_branch_end);
-    const auto cpu_branch = descriptor_selection.find("!params_.device_id.is_gpu()");
+    const auto cpu_branch = descriptor_selection.find("params_.device_id.is_cpu()");
     ASSERT_NE(cpu_branch, std::string::npos);
     EXPECT_EQ(
         descriptor_selection.substr(0, cpu_branch).find("get_cached_tokens("),

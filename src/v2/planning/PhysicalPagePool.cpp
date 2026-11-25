@@ -161,7 +161,7 @@ PhysicalPagePool::FrameHandle PhysicalPagePool::assign(const Grant &grant)
     for (std::size_t i = 0; i < frames_.size(); ++i)
     {
         auto &frame = frames_[i];
-        if (frame.owned) continue;
+        if (!assignable(frame)) continue;
         if (frame.generation == std::numeric_limits<std::uint64_t>::max())
             throw std::overflow_error("Physical page incarnation exhausted");
         auto &request = requests_[grant.record_];
@@ -173,6 +173,8 @@ PhysicalPagePool::FrameHandle PhysicalPagePool::assign(const Grant &grant)
         frame.committed_version = 0;
         frame.readers_closed = false;
         frame.owned = true;
+        frame.shared = false;
+        frame.shared_references = 0;
         const FrameHandle handle{pool_identity_, i, frame.generation};
         request_frames_[grant.record_ * geometry_.max_pages_per_request + request.assigned] = handle;
         ++request.assigned;
@@ -190,9 +192,10 @@ void PhysicalPagePool::release(const Grant &grant) noexcept
         for (const auto &handle : grant.assignedFrames())
         {
             auto &frame = frames_[handle.index];
-            if (handle.pool_identity != pool_identity_ || !frame.owned ||
+            if (handle.pool_identity != pool_identity_ || (!frame.owned && !frame.shared) ||
                 frame.record != grant.record_ || frame.request_generation != grant.generation_ || frame.generation != handle.generation)
                 std::terminate();
+            if (frame.shared) continue; // Shared frames retire only with their last shared reference.
             if (frame.pins)
                 frame.retiring = true;
             else
@@ -228,15 +231,24 @@ void PhysicalPagePool::unpin(FrameHandle handle) noexcept
     if (handle.pool_identity != pool_identity_ || handle.index >= frames_.size())
         std::terminate();
     auto &frame = frames_[handle.index];
-    if (!frame.owned || frame.generation != handle.generation || !frame.pins)
+    // A finally retiring shared frame is neither owned nor shared while its
+    // last publication pin remains; identity and pin count still authenticate.
+    if (frame.generation != handle.generation || !frame.pins ||
+        (frame.retiring ? false : (!frame.owned && !frame.shared)))
         std::terminate();
     --frame.pins;
-    if (!frame.pins && frame.retiring) reclaim(frame);
+    if (!frame.pins && frame.retiring && frame.owned) reclaim(frame);
+    else if (!frame.pins && frame.retiring && !frame.owned && !frame.shared)
+    {
+        if (!protected_pages_) std::terminate();
+        --protected_pages_; // Final shared-frame retirement after the last pin drops.
+        frame.retiring = false;
+    }
 }
 
 void PhysicalPagePool::reclaim(Frame &frame) noexcept
 {
-    if (!frame.owned || !frame.retiring || frame.pins || frame.writer || !protected_pages_)
+    if (!frame.owned || frame.shared || !frame.retiring || frame.pins || frame.writer || !protected_pages_)
         std::terminate();
     auto &original = requests_[frame.record];
     if (frame.return_commitment && original.live && original.generation == frame.request_generation)
@@ -255,6 +267,8 @@ void PhysicalPagePool::discard(const Grant &grant, FrameHandle handle)
 {
     (void)require(grant);
     auto &frame = requireFrame(handle);
+    if (frame.shared)
+        throw std::logic_error("Page discard cannot retire a shared immutable frame");
     if (frame.record != grant.record_ || frame.request_generation != grant.generation_ || frame.retiring || frame.writer)
         throw std::logic_error("Page discard lacks its original private request owner");
     auto &request = requests_[grant.record_];
@@ -278,7 +292,7 @@ PhysicalPagePool::Frame &PhysicalPagePool::requireFrame(FrameHandle handle)
     if (handle.pool_identity != pool_identity_ || handle.index >= frames_.size())
         throw std::logic_error("Page access has a foreign pool or frame");
     auto &frame = frames_[handle.index];
-    if (!frame.owned || frame.generation != handle.generation)
+    if ((!frame.owned && !frame.shared) || frame.generation != handle.generation)
         throw std::logic_error("Page access has a stale frame incarnation");
     return frame;
 }
@@ -288,7 +302,7 @@ std::optional<PhysicalPagePool::AppendPlan> PhysicalPagePool::prepareAppend(
 {
     (void)require(grant);
     auto &frame = requireFrame(handle);
-    if (frame.record != grant.record_ || frame.request_generation != grant.generation_ ||
+    if (frame.shared || frame.record != grant.record_ || frame.request_generation != grant.generation_ ||
         frame.retiring || !bytes || bytes > geometry_.frame_bytes - frame.valid_bytes)
         throw std::invalid_argument("Page append lacks private ownership or exceeds its exact writable extent");
     if (frame.writer || frame.pins) return std::nullopt;
@@ -323,15 +337,39 @@ void PhysicalPagePool::AppendPlan::copyFrom(std::span<const std::byte> source)
 {
     if (!pool_ || copied_ || source.size() != count_)
         throw std::logic_error("Page append copy requires one complete original write extent");
+    copyNext(source);
+}
+bool PhysicalPagePool::AppendPlan::overlaps(std::span<const std::byte> source) const
+{
+    if (!pool_) throw std::logic_error("Page append alias query uses an empty write plan");
     const auto &frame = pool_->requireFrame(handle_);
     if (!frame.writer || frame.retiring || frame.next_content_version != version_)
         throw std::logic_error("Page append copy has revoked or obsolete write ownership");
-    std::memcpy(pool_->backing_.data() + handle_.index * pool_->geometry_.frame_bytes + start_, source.data(), count_);
-    copied_ = true;
+    const auto target = reinterpret_cast<std::uintptr_t>(pool_->backing_.data() +
+        handle_.index * pool_->geometry_.frame_bytes + start_);
+    const auto input = reinterpret_cast<std::uintptr_t>(source.data());
+    if (source.empty()) return false;
+    return input <= target ? target - input < source.size() : input - target < count_;
+}
+bool PhysicalPagePool::AppendPlan::destinationAligned(std::size_t alignment) const
+{
+    if (!alignment) throw std::invalid_argument("CPU page destination alignment must be positive");
+    (void)overlaps({}); // Authenticate the original exclusive write before observing its address.
+    return reinterpret_cast<std::uintptr_t>(pool_->backing_.data() +
+        handle_.index * pool_->geometry_.frame_bytes + start_) % alignment == 0;
+}
+void PhysicalPagePool::AppendPlan::copyNext(std::span<const std::byte> source)
+{
+    if (!pool_ || !source.data() || source.empty() || source.size() > count_ - copied_)
+        throw std::logic_error("Page append fragment exceeds its remaining original write extent");
+    if (overlaps(source)) throw std::invalid_argument("Page append source aliases its exclusive destination");
+    std::memcpy(pool_->backing_.data() + handle_.index * pool_->geometry_.frame_bytes + start_ + copied_,
+        source.data(), source.size());
+    copied_ += source.size();
 }
 PhysicalPagePool::CommittedPage PhysicalPagePool::AppendPlan::commit()
 {
-    if (!pool_ || !copied_)
+    if (!pool_ || copied_ != count_)
         throw std::logic_error("Page publication requires a completed original CPU write");
     auto &frame = pool_->requireFrame(handle_);
     if (!frame.writer || frame.retiring || frame.next_content_version != version_ || frame.valid_bytes != start_)
@@ -452,6 +490,290 @@ void PhysicalPagePool::CommittedPage::release() noexcept
     if (pool_) { pool_->unpin(handle_); pool_.reset(); }
 }
 
+PhysicalPagePool::SharedPage PhysicalPagePool::CommittedPage::share() const
+{
+    if (!pool_) throw std::logic_error("Page sharing uses an empty publication");
+    return pool_->share(*this);
+}
+
+PhysicalPagePool::SharedPage PhysicalPagePool::share(const CommittedPage &page)
+{
+    if (!page.pool_) throw std::logic_error("Page sharing uses an empty publication");
+    auto &frame = requireFrame(page.handle_);
+    if (frame.writer || frame.retiring || frame.shared ||
+        frame.committed_version != page.version_ || frame.valid_bytes != page.bytes_)
+        throw std::logic_error("Page sharing requires an original private committed publication");
+    auto &request = requests_[frame.record];
+    const size_t base = frame.record * geometry_.max_pages_per_request;
+    size_t ordinal = 0;
+    while (ordinal < request.assigned && request_frames_[base + ordinal] != page.handle_) ++ordinal;
+    if (ordinal == request.assigned)
+        throw std::logic_error("Page sharing lost its original private frame grant");
+    for (size_t next = ordinal + 1; next < request.assigned; ++next)
+        request_frames_[base + next - 1] = request_frames_[base + next];
+    --request.assigned;
+    // O unchanged: the frame stays occupied, owned by the shared reference group
+    // instead of one private request. Its grant no longer observes it.
+    frame.owned = false;
+    frame.shared = true;
+    frame.shared_references = 1;
+    return SharedPage(page.pool_, page.handle_, page.version_, page.bytes_);
+}
+
+PhysicalPagePool::SharedPage::SharedPage(std::shared_ptr<PhysicalPagePool> pool, FrameHandle handle,
+    std::uint64_t version, std::size_t bytes)
+    : pool_(std::move(pool)), handle_(handle), version_(version), bytes_(bytes) {}
+PhysicalPagePool::SharedPage::~SharedPage() { release(); }
+PhysicalPagePool::SharedPage::SharedPage(SharedPage &&other) noexcept
+    : pool_(std::move(other.pool_)), handle_(other.handle_), version_(other.version_), bytes_(other.bytes_) {}
+PhysicalPagePool::SharedPage &PhysicalPagePool::SharedPage::operator=(SharedPage &&other) noexcept
+{
+    if (this != &other)
+    {
+        release();
+        pool_ = std::move(other.pool_); handle_ = other.handle_;
+        version_ = other.version_; bytes_ = other.bytes_;
+    }
+    return *this;
+}
+std::span<const std::byte> PhysicalPagePool::SharedPage::read() const
+{
+    if (!pool_) throw std::logic_error("Shared page read uses an empty reference");
+    const auto &frame = pool_->requireFrame(handle_);
+    if (!frame.shared || frame.writer || frame.committed_version != version_ || frame.valid_bytes != bytes_)
+        throw std::logic_error("Shared page read lost its immutable content");
+    return {pool_->backing_.data() + handle_.index * pool_->geometry_.frame_bytes, bytes_};
+}
+const PhysicalMemoryAuthority *PhysicalPagePool::SharedPage::issuer() const noexcept
+{
+    return pool_ ? pool_->authority_.get() : nullptr;
+}
+PhysicalPagePool::ReadAccess PhysicalPagePool::SharedPage::registerRead() const
+{
+    if (!pool_) throw std::logic_error("Shared page registration uses an empty reference");
+    auto &frame = pool_->requireFrame(handle_);
+    if (!frame.shared || frame.retiring || frame.readers_closed || frame.writer ||
+        frame.committed_version != version_ || frame.valid_bytes != bytes_)
+        throw std::logic_error("Shared page registration uses a closed or obsolete publication");
+    if (frame.pins == std::numeric_limits<std::size_t>::max())
+        throw std::overflow_error("Shared page reader registration count exhausted");
+    auto self = pool_->shared_from_this();
+    ++frame.pins;
+    return ReadAccess(std::move(self), handle_, version_, bytes_);
+}
+PhysicalPagePool::SharedPage PhysicalPagePool::SharedPage::cloneForBorrow() const
+{
+    if (!pool_) throw std::logic_error("Shared page clone uses an empty reference");
+    auto &frame = pool_->requireFrame(handle_);
+    if (!frame.shared || frame.retiring ||
+        frame.committed_version != version_ || frame.valid_bytes != bytes_)
+        throw std::logic_error("Shared page clone uses a retired or obsolete publication");
+    if (frame.shared_references == std::numeric_limits<std::size_t>::max())
+        throw std::overflow_error("Shared page reference count exhausted");
+    ++frame.shared_references;
+    return SharedPage(std::shared_ptr<PhysicalPagePool>(pool_->shared_from_this()),
+        handle_, version_, bytes_);
+}
+void PhysicalPagePool::SharedPage::release() noexcept
+{
+    if (pool_) { pool_->unshare(handle_); pool_.reset(); }
+}
+
+void PhysicalPagePool::unshare(FrameHandle handle) noexcept
+{
+    if (handle.pool_identity != pool_identity_ || handle.index >= frames_.size())
+        std::terminate();
+    auto &frame = frames_[handle.index];
+    if (!frame.shared || frame.generation != handle.generation || !frame.shared_references)
+        std::terminate();
+    --frame.shared_references;
+    if (!frame.shared_references)
+    {
+        // Last shared reference: retire only after its last borrower pin also
+        // drops; otherwise the frame stays occupied and unassignable.
+        frame.shared = false;
+        if (frame.pins)
+            frame.retiring = true;
+        else
+        {
+            if (!protected_pages_) std::terminate();
+            --protected_pages_;
+        }
+    }
+}
+
+std::optional<PhysicalPagePool::SharedPage> PhysicalPagePool::adoptShared(const Grant &grant, const SharedPage &source)
+{
+    (void)require(grant);
+    if (!source.pool_ || source.pool_.get() != this)
+        throw std::logic_error("Shared page adoption requires its original pool authority");
+    auto &frame = requireFrame(source.handle_);
+    if (!frame.shared || frame.retiring ||
+        frame.committed_version != source.version_ || frame.valid_bytes != source.bytes_)
+        throw std::logic_error("Shared page adoption uses a retired or obsolete reference");
+    if (frame.shared_references == std::numeric_limits<std::size_t>::max())
+        throw std::overflow_error("Shared page reference count exhausted");
+    ++frame.shared_references;
+    return SharedPage(std::shared_ptr<PhysicalPagePool>(shared_from_this()),
+        source.handle_, source.version_, source.bytes_);
+}
+
+std::optional<PhysicalPagePool::COWPlan> PhysicalPagePool::prepareCOW(
+    const Grant &grant, const SharedPage &source, std::size_t fresh_bytes)
+{
+    (void)require(grant);
+    if (!source.pool_ || source.pool_.get() != this)
+        throw std::logic_error("Copy-on-write requires the original pool authority");
+    auto &source_frame = requireFrame(source.handle_);
+    if (!source_frame.shared || source_frame.retiring ||
+        source_frame.committed_version != source.version_ || source_frame.valid_bytes != source.bytes_)
+        throw std::logic_error("Copy-on-write uses a retired or obsolete shared source");
+    if (!fresh_bytes || source.bytes_ + fresh_bytes > geometry_.frame_bytes)
+        throw std::invalid_argument("Copy-on-write fresh extent exceeds the destination frame");
+    auto &request = requests_[grant.record_];
+    if (!request.remaining)
+        return std::nullopt; // No protected destination growth; refuse before any mutation.
+    std::size_t frame_index = frames_.size();
+    for (std::size_t i = 0; i < frames_.size(); ++i)
+        if (assignable(frames_[i])) { frame_index = i; break; }
+    if (frame_index == frames_.size())
+        return std::nullopt; // No free physical frame; refuse before any mutation.
+    auto &frame = frames_[frame_index];
+    if (frame.generation == std::numeric_limits<std::uint64_t>::max() ||
+        frame.next_content_version == std::numeric_limits<std::uint64_t>::max())
+        throw std::overflow_error("Copy-on-write identity issuance exhausted");
+    // All checks passed: convert G -> O exactly once and open the write plan.
+    ++frame.generation;
+    frame.record = grant.record_;
+    frame.request_generation = grant.generation_;
+    frame.return_commitment = false;
+    frame.valid_bytes = 0;
+    frame.committed_version = 0;
+    frame.readers_closed = true;
+    frame.owned = true;
+    frame.shared = false;
+    frame.shared_references = 0;
+    frame.retiring = false;
+    ++frame.next_content_version;
+    frame.writer = true;
+    frame.pins = 1;
+    const FrameHandle destination{pool_identity_, frame_index, frame.generation};
+    request_frames_[grant.record_ * geometry_.max_pages_per_request + request.assigned] = destination;
+    ++request.assigned;
+    --request.remaining;
+    // Keep the shared source alive through the copy, independent of the caller's reference.
+    ++source_frame.shared_references;
+    return COWPlan(std::shared_ptr<PhysicalPagePool>(shared_from_this()), destination,
+        source.handle_, frame.next_content_version, source.version_, source.bytes_, fresh_bytes);
+}
+
+PhysicalPagePool::COWPlan::COWPlan(std::shared_ptr<PhysicalPagePool> pool, FrameHandle destination,
+    FrameHandle source, std::uint64_t destination_version, std::uint64_t source_version,
+    std::size_t source_bytes, std::size_t fresh_bytes)
+    : pool_(std::move(pool)), destination_(destination), source_(source),
+      destination_version_(destination_version), source_version_(source_version),
+      source_bytes_(source_bytes), fresh_bytes_(fresh_bytes) {}
+PhysicalPagePool::COWPlan::~COWPlan() { release(); }
+PhysicalPagePool::COWPlan::COWPlan(COWPlan &&other) noexcept
+    : pool_(std::move(other.pool_)), destination_(other.destination_), source_(other.source_),
+      destination_version_(other.destination_version_), source_version_(other.source_version_),
+      source_bytes_(other.source_bytes_), fresh_bytes_(other.fresh_bytes_), copied_(other.copied_),
+      source_copied_(other.source_copied_) {}
+PhysicalPagePool::COWPlan &PhysicalPagePool::COWPlan::operator=(COWPlan &&other) noexcept
+{
+    if (this != &other)
+    {
+        release();
+        pool_ = std::move(other.pool_); destination_ = other.destination_;
+        source_ = other.source_; destination_version_ = other.destination_version_;
+        source_version_ = other.source_version_; source_bytes_ = other.source_bytes_;
+        fresh_bytes_ = other.fresh_bytes_; copied_ = other.copied_;
+        source_copied_ = other.source_copied_;
+    }
+    return *this;
+}
+void PhysicalPagePool::COWPlan::copySource()
+{
+    if (!pool_ || copied_ || source_copied_)
+        throw std::logic_error("Copy-on-write source copy must start once from its original empty destination");
+    auto &destination = pool_->requireFrame(destination_);
+    auto &source = pool_->requireFrame(source_);
+    if (!destination.writer || destination.retiring || destination.next_content_version != destination_version_)
+        throw std::logic_error("Copy-on-write destination write ownership was revoked");
+    if (!source.shared || source.committed_version != source_version_ || source.valid_bytes != source_bytes_)
+        throw std::logic_error("Copy-on-write source lost its immutable shared content");
+    std::memcpy(pool_->backing_.data() + destination_.index * pool_->geometry_.frame_bytes,
+        pool_->backing_.data() + source_.index * pool_->geometry_.frame_bytes, source_bytes_);
+    copied_ = source_bytes_;
+    source_copied_ = true;
+}
+bool PhysicalPagePool::COWPlan::overlaps(std::span<const std::byte> source) const
+{
+    if (!pool_) throw std::logic_error("Copy-on-write alias query uses an empty plan");
+    const auto &destination = pool_->requireFrame(destination_);
+    if (!destination.writer || destination.retiring || destination.next_content_version != destination_version_)
+        throw std::logic_error("Copy-on-write destination write ownership was revoked");
+    const auto target = reinterpret_cast<std::uintptr_t>(pool_->backing_.data() +
+        destination_.index * pool_->geometry_.frame_bytes + source_bytes_);
+    const auto input = reinterpret_cast<std::uintptr_t>(source.data());
+    if (source.empty()) return false;
+    return input <= target ? target - input < source.size() : input - target < fresh_bytes_;
+}
+void PhysicalPagePool::COWPlan::copyNext(std::span<const std::byte> source)
+{
+    if (!pool_ || !source.data() || source.empty())
+        throw std::logic_error("Copy-on-write fresh fragment has no original bytes");
+    // Typed phase: fresh rows may only follow the authenticated shared source copy.
+    if (!source_copied_ || !source.data() || source.size() > fresh_bytes_ - (copied_ - source_bytes_))
+        throw std::logic_error("Copy-on-write fresh fragment precedes its source copy or exceeds the remaining extent");
+    if (overlaps(source)) throw std::invalid_argument("Copy-on-write fresh rows alias the destination frame");
+    std::memcpy(pool_->backing_.data() + destination_.index * pool_->geometry_.frame_bytes +
+        source_bytes_ + (copied_ - source_bytes_), source.data(), source.size());
+    copied_ += source.size();
+}
+PhysicalPagePool::CommittedPage PhysicalPagePool::COWPlan::commit()
+{
+    if (!pool_ || copied_ != source_bytes_ + fresh_bytes_)
+        throw std::logic_error("Copy-on-write publication requires the complete shared and fresh bytes");
+    auto &destination = pool_->requireFrame(destination_);
+    auto &source = pool_->requireFrame(source_);
+    if (!destination.writer || destination.retiring || destination.next_content_version != destination_version_ ||
+        destination.valid_bytes != 0)
+        throw std::logic_error("Copy-on-write publication has revoked or reused destination ownership");
+    if (!source.shared || source.committed_version != source_version_ || source.valid_bytes != source_bytes_)
+        throw std::logic_error("Copy-on-write publication lost its shared source");
+    destination.valid_bytes = source_bytes_ + fresh_bytes_;
+    destination.committed_version = destination_version_;
+    destination.writer = false;
+    destination.readers_closed = false;
+    // Release the plan's extra shared-source reference, then transfer the
+    // destination pin to the new private publication.
+    pool_->unshare(source_);
+    return CommittedPage(std::move(pool_), destination_, destination_version_, source_bytes_ + fresh_bytes_);
+}
+void PhysicalPagePool::COWPlan::release() noexcept
+{
+    if (!pool_) return;
+    // Drop the plan's extra shared-source reference first, matching prepareCOW.
+    if (source_.index < pool_->frames_.size())
+    {
+        auto &source = pool_->frames_[source_.index];
+        if (source.shared && source.shared_references)
+            pool_->unshare(source_);
+    }
+    if (destination_.index < pool_->frames_.size())
+    {
+        auto &destination = pool_->frames_[destination_.index];
+        if (destination.writer && destination.generation == destination_.generation &&
+            destination.next_content_version == destination_version_)
+        {
+            destination.writer = false;
+            pool_->unpin(destination_);
+        }
+    }
+    pool_.reset();
+}
+
 PhysicalPagePool::FramePin::FramePin(std::shared_ptr<PhysicalPagePool> pool, FrameHandle handle)
     : pool_(std::move(pool)), handle_(handle) {}
 PhysicalPagePool::FramePin::~FramePin() { release(); }
@@ -515,12 +837,35 @@ std::optional<PhysicalPagePool::AppendPlan> PhysicalPagePool::Grant::prepareAppe
     return pool_->prepareAppend(*this, handle, bytes);
 }
 
+std::optional<PhysicalPagePool::AppendPlan> PhysicalPagePool::Grant::prepareFreshWrite(FrameHandle handle, std::size_t bytes)
+{
+    if (!pool_) throw std::logic_error("Fresh write uses an empty page grant");
+    (void)pool_->require(*this);
+    if (pool_->requireFrame(handle).valid_bytes)
+        throw std::logic_error("Fresh native page write cannot reinterpret an existing byte prefix");
+    return pool_->prepareAppend(*this, handle, bytes);
+}
+std::optional<PhysicalPagePool::SharedPage> PhysicalPagePool::Grant::adoptShared(const SharedPage &source)
+{
+    if (!pool_) throw std::logic_error("Shared adoption uses an empty page grant");
+    return pool_->adoptShared(*this, source);
+}
+std::optional<PhysicalPagePool::COWPlan> PhysicalPagePool::Grant::prepareCOW(const SharedPage &source, std::size_t fresh_bytes)
+{
+    if (!pool_) throw std::logic_error("Copy-on-write uses an empty page grant");
+    return pool_->prepareCOW(*this, source, fresh_bytes);
+}
+const PhysicalMemoryAuthority *PhysicalPagePool::Grant::issuer() const noexcept
+{
+    return pool_ ? pool_->authority_.get() : nullptr;
+}
+
 void PhysicalPagePool::Grant::closeReaders(FrameHandle handle)
 {
     if (!pool_) throw std::logic_error("Page closure uses an empty grant");
     (void)pool_->require(*this);
     auto &frame = pool_->requireFrame(handle);
-    if (frame.record != record_ || frame.request_generation != generation_ || frame.retiring || frame.writer)
+    if (frame.shared || frame.record != record_ || frame.request_generation != generation_ || frame.retiring || frame.writer)
         throw std::logic_error("Page closure has no original private owner");
     frame.readers_closed = true;
 }

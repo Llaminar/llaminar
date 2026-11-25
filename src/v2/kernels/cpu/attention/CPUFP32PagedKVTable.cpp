@@ -107,6 +107,19 @@ CPUFP32PagedKVTable::Update &CPUFP32PagedKVTable::Update::operator=(Update &&oth
     if (this != &other) { release(); table_ = std::move(other.table_); bank_ = other.bank_; version_ = other.version_; }
     return *this;
 }
+void CPUFP32PagedKVTable::Update::appendShared(PhysicalPagePool::SharedPage &&shared, int heads, int dimension)
+{
+    if (!table_) throw std::logic_error("CPU page-table shared append uses an empty update");
+    auto &state = table_->require(bank_, version_, Phase::Preparing);
+    if (state.pages == table_->geometry_.page_capacity)
+        throw std::logic_error("CPU page-table shared append exceeds its admitted metadata cells");
+    CPUFP32KVPage entry(std::move(shared), heads, dimension);
+    if (entry.issuer() != table_->authority_.get())
+        throw std::invalid_argument("CPU page-table shared attachment has a foreign physical authority");
+    table_->pages_[bank_ * table_->geometry_.page_capacity + state.pages] = std::move(entry);
+    ++state.pages;
+}
+
 void CPUFP32PagedKVTable::Update::append(CPUFP32KVPage &&page)
 {
     if (!table_) throw std::logic_error("CPU page-table append uses an empty update");

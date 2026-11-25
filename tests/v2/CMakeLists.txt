@@ -8931,7 +8931,8 @@ add_executable(v2_test_cpu_flash_attention_kernel_t
     unit/kernels/cpu/attention/Test__CPUFlashAttentionKernelT.cpp
     unit/kernels/cpu/attention/Test__CPUFlashAttentionPaged.cpp
     unit/kernels/cpu/attention/Test__CPUFlashAttentionPagedReplay.cpp
-    unit/kernels/cpu/attention/Test__CPUFP32PagedKVTable.cpp)
+    unit/kernels/cpu/attention/Test__CPUFP32PagedKVTable.cpp
+    unit/kernels/cpu/attention/Test__CPUFP32PagedKVAppend.cpp)
 target_include_directories(v2_test_cpu_flash_attention_kernel_t PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 target_link_libraries(v2_test_cpu_flash_attention_kernel_t
     llaminar2_core
@@ -8954,7 +8955,7 @@ add_v2_test(V2_Integration_CPUFlashAttentionPagedFP32
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUFlashAttentionPagedFP32)
 add_v2_test(V2_Integration_CPUFlashAttentionPagedReplay
     COMMAND $<TARGET_FILE:v2_test_cpu_flash_attention_kernel_t>
-        --gtest_filter=CPUFlashAttentionPaged.RecordedFP32InputsReplayExactly:CPUFlashAttentionPaged.IncompleteRecordedInputsAreRejected
+        --gtest_filter=CPUFlashAttentionPaged.RecordedFP32InputsReplayExactly:CPUFlashAttentionPaged.RecordedNativeAppendInputsReplayExactly:CPUFlashAttentionPaged.IncompleteRecordedInputsAreRejected
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;KVCache;Attention;Replay;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
     ENVIRONMENT "OMP_NUM_THREADS=4;OMP_DYNAMIC=false;LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
@@ -8966,6 +8967,20 @@ add_v2_test(V2_Integration_CPUFP32PagedKVTableLifecycle
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
     ENVIRONMENT "OMP_NUM_THREADS=4;OMP_DYNAMIC=false;LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUFP32PagedKVTableLifecycle)
+add_v2_test(V2_Integration_CPUFP32PagedKVAppendContract
+    COMMAND $<TARGET_FILE:v2_test_cpu_flash_attention_kernel_t>
+        --gtest_filter=CPUFP32PagedKVAppend.*
+    LABELS "V2;Integration;CPU;DeviceFree;KVCache;Contract;Ownership;Regression;ProductionTestPreflight"
+    NO_MODELS NO_MPI MPI_PROCS 1 TIMEOUT 30
+    ENVIRONMENT "OMP_NUM_THREADS=4;OMP_DYNAMIC=false;LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+add_v2_test(V2_Integration_PhysicalPagePoolSharingContract
+    COMMAND $<TARGET_FILE:v2_test_physical_memory_authority>
+        --gtest_filter=PhysicalPagePoolSharing.*
+    LABELS "V2;Integration;CPU;DeviceFree;KVCache;Contract;Ownership;Sharing;COW;Regression;ProductionTestPreflight"
+    NO_MODELS NO_MPI MPI_PROCS 1 TIMEOUT 30
+    ENVIRONMENT "OMP_NUM_THREADS=4;OMP_DYNAMIC=false;LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUFP32PagedKVAppendContract)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PhysicalPagePoolSharingContract)
 # Flash-attention entry points admit banks, head mapping and output
 # disjointness before any team, returning false without writes otherwise:
 # raw batches, native request batches and Q16 tensor/verifier entries admit
@@ -30368,6 +30383,7 @@ add_v2_test(V2_Integration_RecurrentOnlyPipelinePrefixAdmission
 add_executable(v2_test_physical_memory_authority
     unit/planning/Test__PhysicalMemoryAuthority.cpp
     unit/planning/Test__PhysicalPagePoolReplay.cpp
+    unit/planning/Test__PhysicalPagePoolSharing.cpp
     unit/planning/Test__PhysicalMemoryRankHostPool.cpp
     unit/planning/Test__NativeStoragePreparing.cpp
     unit/backends/Test__PreparedGPUWorkerThread.cpp
@@ -30387,12 +30403,14 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     "${PMA_TRACE_ROOT}/private_append_v1.txt"
     "${PMA_TRACE_ROOT}/private_readers_v1.txt"
     "${PMA_TRACE_ROOT}/attention_fp32_v1.txt"
-    "${PMA_TRACE_ROOT}/private_tables_v2.txt")
+    "${PMA_TRACE_ROOT}/private_tables_v2.txt"
+    "${PMA_TRACE_ROOT}/attention_append_fp32_v2.txt")
 file(READ "${PMA_TRACE_ROOT}/private_ownership_v1.txt" PMA_OWNERSHIP_TRACE)
 file(READ "${PMA_TRACE_ROOT}/private_append_v1.txt" PMA_APPEND_TRACE)
 file(READ "${PMA_TRACE_ROOT}/private_readers_v1.txt" PMA_READER_TRACE)
 file(READ "${PMA_TRACE_ROOT}/attention_fp32_v1.txt" PMA_ATTENTION_TRACE)
 file(READ "${PMA_TRACE_ROOT}/private_tables_v2.txt" PMA_TABLE_TRACE)
+file(READ "${PMA_TRACE_ROOT}/attention_append_fp32_v2.txt" PMA_APPEND_ATTENTION_TRACE)
 configure_file("${PMA_TRACE_ROOT}/PhysicalPagePoolTraceData.h.in"
     "${CMAKE_CURRENT_BINARY_DIR}/PhysicalPagePoolTraceData.h" @ONLY)
 target_include_directories(v2_test_physical_memory_authority PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")

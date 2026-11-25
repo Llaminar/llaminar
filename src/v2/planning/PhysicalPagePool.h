@@ -93,6 +93,8 @@ public:
         Phase phase_ = Phase::Registered;
     };
 
+    class SharedPage;
+    class COWPlan;
     /** @brief Immutable completed CPU byte publication, retaining its exact frame incarnation. */
     class CommittedPage final
     {
@@ -109,6 +111,13 @@ public:
         const PhysicalMemoryAuthority *issuer() const noexcept;
         /** @brief Register one new consumer before view closure or request retirement. */
         ReadAccess registerRead() const;
+        /**
+         * @brief Convert this private publication into one immutable shared reference.
+         * @return The original logical reference; peers may adopt further references.
+         * @throws std::logic_error If the frame is already shared, retiring, still
+         * written, or the publication is stale.
+         */
+        SharedPage share() const;
         /** @return The immutable content version; aborted write versions are never reused. */
         std::uint64_t version() const noexcept { return version_; }
     private:
@@ -120,6 +129,75 @@ public:
         FrameHandle handle_;
         std::uint64_t version_ = 0;
         std::size_t bytes_ = 0;
+    };
+
+    /** @brief One immutable shared content reference; the frame retires with its last reference. */
+    class SharedPage final
+    {
+    public:
+        SharedPage() = default;
+        ~SharedPage();
+        SharedPage(SharedPage &&other) noexcept;
+        SharedPage &operator=(SharedPage &&other) noexcept;
+        SharedPage(const SharedPage &) = delete;
+        SharedPage &operator=(const SharedPage &) = delete;
+        /** @return Shared original byte extent; never unwritten capacity. */
+        std::span<const std::byte> read() const;
+        /** @return Original physical issuer, never a second capacity ledger. */
+        const PhysicalMemoryAuthority *issuer() const noexcept;
+        /** @brief Register one consumer of the shared content before any closure or retirement. */
+        ReadAccess registerRead() const;
+        /** @return Immutable shared content version. */
+        std::uint64_t version() const noexcept { return version_; }
+        /** @return Shared valid byte extent. */
+        std::size_t bytes() const noexcept { return bytes_; }
+        /** @return Another logical reference to the same immutable shared content. */
+        SharedPage cloneForBorrow() const;
+    private:
+        friend class PhysicalPagePool;
+        SharedPage(std::shared_ptr<PhysicalPagePool> pool, FrameHandle handle,
+            std::uint64_t version, std::size_t bytes);
+        void release() noexcept;
+        std::shared_ptr<PhysicalPagePool> pool_;
+        FrameHandle handle_;
+        std::uint64_t version_ = 0;
+        std::size_t bytes_ = 0;
+    };
+
+    /** @brief Copy-on-write destination: exact shared bytes first, then fresh private rows. */
+    class COWPlan final
+    {
+    public:
+        COWPlan() = default;
+        ~COWPlan();
+        COWPlan(COWPlan &&other) noexcept;
+        COWPlan &operator=(COWPlan &&other) noexcept;
+        COWPlan(const COWPlan &) = delete;
+        COWPlan &operator=(const COWPlan &) = delete;
+        /** @brief Copy the shared source's complete valid extent into the new empty destination. */
+        void copySource();
+        /** @brief Copy the writer's fresh private rows after the shared source bytes. */
+        void copyNext(std::span<const std::byte> source);
+        /** @return Whether fresh rows alias any byte of the exclusive destination. */
+        bool overlaps(std::span<const std::byte> source) const;
+        /** @brief Publish the completed copy-on-write page as this writer's private publication. */
+        CommittedPage commit();
+    private:
+        friend class PhysicalPagePool;
+        COWPlan(std::shared_ptr<PhysicalPagePool> pool, FrameHandle destination,
+            FrameHandle source, std::uint64_t destination_version,
+            std::uint64_t source_version, std::size_t source_bytes,
+            std::size_t fresh_bytes);
+        void release() noexcept;
+        std::shared_ptr<PhysicalPagePool> pool_;
+        FrameHandle destination_;
+        FrameHandle source_;
+        std::uint64_t destination_version_ = 0;
+        std::uint64_t source_version_ = 0;
+        std::size_t source_bytes_ = 0;
+        std::size_t fresh_bytes_ = 0;
+        std::size_t copied_ = 0; ///< Shared bytes plus completed fresh rows.
+        bool source_copied_ = false; ///< Typed phase: fresh fragments require the authenticated source first.
     };
     /** @brief Exclusive CPU append destination; not a readable page or committed history. */
     class AppendPlan final
@@ -133,6 +211,12 @@ public:
         AppendPlan &operator=(const AppendPlan &) = delete;
         /** @brief Copy exactly the granted new byte extent; old committed bytes are never overwritten. */
         void copyFrom(std::span<const std::byte> source);
+        /** @brief Copy one next nonempty fragment; publication still requires the complete original extent. */
+        void copyNext(std::span<const std::byte> source);
+        /** @return Whether source aliases any byte of this original exclusive write extent. */
+        bool overlaps(std::span<const std::byte> source) const;
+        /** @return Whether the original CPU destination satisfies the producer's positive byte alignment. */
+        bool destinationAligned(std::size_t alignment) const;
         /** @brief Publish only after the exact CPU copy completed; cancellation cannot publish. */
         CommittedPage commit();
     private:
@@ -145,7 +229,7 @@ public:
         std::uint64_t version_ = 0;
         std::size_t start_ = 0;
         std::size_t count_ = 0;
-        bool copied_ = false;
+        std::size_t copied_ = 0; ///< Completed sequential bytes, never a readiness guess.
     };
 
     /** @brief Move-only unpublished request commitment; destruction rolls it back. */
@@ -164,10 +248,18 @@ public:
         FrameHandle assignFrame();
         /** @brief Retire one private frame, restoring protected growth only after its last borrower completes. */
         void discardFrame(FrameHandle handle);
+        /** @brief Adopt one more immutable shared reference into this request's logical view. */
+        std::optional<SharedPage> adoptShared(const SharedPage &source);
+        /** @brief Prepare a copy-on-write destination, or empty before mutation when it cannot fit. */
+        std::optional<COWPlan> prepareCOW(const SharedPage &source, std::size_t fresh_bytes);
         /** @brief Retain an original private frame without exposing payload or readiness. */
         FramePin pinFrame(FrameHandle handle);
         /** @brief Prepare an exact private append, or defer while an existing borrower pins the frame. */
         std::optional<AppendPlan> prepareAppend(FrameHandle handle, std::size_t bytes);
+        /** @brief Prepare bytes only in an empty original private frame; never reinterpret older codec data. */
+        std::optional<AppendPlan> prepareFreshWrite(FrameHandle handle, std::size_t bytes);
+        /** @return Original physical issuer identity, not another capacity ledger. */
+        const PhysicalMemoryAuthority *issuer() const noexcept;
         /** @brief Freeze admission of new readers before joining the existing access frontier. */
         void closeReaders(FrameHandle handle);
         /** @return Current private frame grants in issuance order, not a request's logical KV table. */
@@ -230,11 +322,18 @@ private:
         bool readers_closed = false;
         bool owned = false;
         bool retiring = false;
+        bool shared = false;
+        std::size_t shared_references = 0;
     };
     /** @brief One bounded request commitment, distinct from physical frame capacity. */
     struct Request { std::uint64_t generation = 0; std::size_t remaining = 0; std::size_t assigned = 0; bool live = false; };
     PhysicalPagePool(std::shared_ptr<PhysicalMemoryAuthority> authority, DeviceId device,
         PhysicalPagePoolGeometry geometry, CPUStoragePlacement placement, std::uint64_t pool_identity);
+    /** @brief Canonical assignability predicate shared by every frame-acquisition path. */
+    bool assignable(const Frame &frame) const noexcept
+    {
+        return !frame.owned && !frame.shared && !frame.retiring && !frame.pins && !frame.writer;
+    }
     /** @brief Validate one original grant incarnation before observing its metadata. */
     const Request &require(const Grant &grant) const;
     /** @brief Retire only unpublished private ownership; no native access API exists yet. */
@@ -248,6 +347,10 @@ private:
     std::optional<AppendPlan> prepareAppend(const Grant &grant, FrameHandle handle, std::size_t bytes);
     Frame &requireFrame(FrameHandle handle);
     ReadAccess registerRead(const CommittedPage &page);
+    SharedPage share(const CommittedPage &page);
+    std::optional<SharedPage> adoptShared(const Grant &grant, const SharedPage &source);
+    std::optional<COWPlan> prepareCOW(const Grant &grant, const SharedPage &source, std::size_t fresh_bytes);
+    void unshare(FrameHandle handle) noexcept;
     std::shared_ptr<PhysicalMemoryAuthority> authority_; ///< Exact issuer, never an independent capacity observation.
     const std::uint64_t pool_identity_; ///< Non-reused process incarnation, issued at setup only.
     PhysicalPagePoolGeometry geometry_;

@@ -7,10 +7,13 @@
  * while exercising nonconstant native K/V rows and permuted pages. Cross-ISA
  * replay evidence remains separate from the local capture. Broader nonzero
  * score/shape byte comparisons live in the companion native sweep. This trace
- * does not qualify quantized operands, native append or serving integration.
+ * does not qualify quantized operands or serving integration. A separate v2
+ * recording preserves the exact inputs/oracle while recording native separated
+ * row production, one partial-tail copy and its additional scratch-frame state.
  */
 #include "v2/kernels/cpu/attention/CPUFlashAttentionKernelT.h"
 #include "PhysicalPagePoolTraceData.h"
+#include "kernels/cpu/attention/CPUFP32PagedKVAppend.h"
 #include <gtest/gtest.h>
 #include <bit>
 #include <cstdlib>
@@ -22,11 +25,16 @@
 using namespace llaminar2;
 namespace
 {
+/** @brief Distinct recorded production algorithms; neither is selected after an execution failure. */
+enum class FP32PageProducer { RetainedRawBytes, NativeSeparatedRows };
 /** @brief Complete recording with explicit empty initial pool and immutable operands. */
 struct PagedFP32Trace
 {
     int queries = 3, tokens = 17, heads = 4, kv_heads = 2, dimension = 64, page_tokens = 16;
+    FP32PageProducer producer = FP32PageProducer::RetainedRawBytes;
     std::vector<size_t> frames{1, 0};
+    size_t scratch_frame = 2;
+    int first_append_rows = 8;
     std::vector<float> query, key, value, expected;
 };
 /** @brief Capture/replay actual native paged execution, never reconstruct a contiguous history. */
@@ -34,7 +42,12 @@ std::vector<float> execute(const PagedFP32Trace &trace)
 {
     const size_t width = static_cast<size_t>(trace.kv_heads * trace.dimension);
     const size_t count = trace.frames.size();
-    const PhysicalPagePoolGeometry geometry{count, static_cast<size_t>(trace.page_tokens) * 2 * width * sizeof(float), 1, count};
+    if (trace.producer != FP32PageProducer::RetainedRawBytes && trace.producer != FP32PageProducer::NativeSeparatedRows)
+        throw std::invalid_argument("Unknown recorded FP32 page producer");
+    const bool native = trace.producer == FP32PageProducer::NativeSeparatedRows;
+    const size_t physical_frames = count + (native ? 1u : 0u);
+    const PhysicalPagePoolGeometry geometry{physical_frames,
+        static_cast<size_t>(trace.page_tokens) * 2 * width * sizeof(float), 1, physical_frames};
     const auto device = DeviceId::cpu();
     const auto bytes = PhysicalPagePool::physicalBytes(geometry, device);
     PhysicalMemoryPlanBuilder plan;
@@ -43,16 +56,43 @@ std::vector<float> execute(const PagedFP32Trace &trace)
     auto authority = std::make_shared<PhysicalMemoryAuthority>(
         std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()), 0);
     auto pool = authority->createCPUPagePool(device, geometry, CPUStoragePlacement::local());
-    auto request = pool->tryAdmit(count);
+    auto request = pool->tryAdmit(physical_frames);
     if (!request) throw std::logic_error("Recorded exact-fit page grant refused");
     std::vector<PhysicalPagePool::FrameHandle> frames;
-    for (size_t i = 0; i < count; ++i) frames.push_back(request->assignFrame());
+    for (size_t i = 0; i < physical_frames; ++i) frames.push_back(request->assignFrame());
     std::vector<CPUFP32KVPage> pages;
     pages.reserve(count);
     for (size_t page = 0; page < count; ++page)
     {
         const size_t first = page * trace.page_tokens;
         const size_t live = std::min(static_cast<size_t>(trace.page_tokens), static_cast<size_t>(trace.tokens) - first);
+        if (native)
+        {
+            std::optional<CPUFP32KVPage> tail;
+            size_t appended = 0;
+            if (page == 0)
+            {
+                appended = static_cast<size_t>(trace.first_append_rows);
+                tail = appendCPUFP32KVPage(*request, frames.at(trace.scratch_frame), {
+                    .keys=std::span(trace.key).subspan(first * width, appended * width),
+                    .values=std::span(trace.value).subspan(first * width, appended * width),
+                    .heads=trace.kv_heads, .dimension=trace.dimension, .page_tokens=trace.page_tokens});
+                if (!tail) throw std::logic_error("Recorded native partial writer refused");
+            }
+            auto result = appendCPUFP32KVPage(*request, frames.at(trace.frames.at(page)), {
+                .keys=std::span(trace.key).subspan((first + appended) * width, (live - appended) * width),
+                .values=std::span(trace.value).subspan((first + appended) * width, (live - appended) * width),
+                .heads=trace.kv_heads, .dimension=trace.dimension, .page_tokens=trace.page_tokens,
+                .tail=tail ? std::optional(std::cref(*tail)) : std::nullopt});
+            if (!result) throw std::logic_error("Recorded native page writer refused");
+            pages.emplace_back(std::move(*result));
+            if (tail)
+            {
+                tail.reset();
+                request->discardFrame(frames.at(trace.scratch_frame));
+            }
+            continue;
+        }
         std::vector<float> packed(live * 2 * width);
         for (size_t token = 0; token < live; ++token)
         {
@@ -93,9 +133,11 @@ PagedFP32Trace parse(std::istream &input)
 {
     PagedFP32Trace trace;
     std::string schema, initial, policy;
-    if (!(input >> schema >> initial >> policy) || schema != "paged-fp32-v1" ||
-        initial != "empty-zero-generations" || policy != "uniform-zero-score-panel-v1")
+    if (!(input >> schema >> initial >> policy) || initial != "empty-zero-generations" ||
+        !((schema == "paged-fp32-v1" && policy == "uniform-zero-score-panel-v1") ||
+          (schema == "paged-fp32-v2" && policy == "native-append-half-page-v1")))
         throw std::invalid_argument("Incompatible native paged-attention trace policy/state");
+    trace.producer = schema == "paged-fp32-v2" ? FP32PageProducer::NativeSeparatedRows : FP32PageProducer::RetainedRawBytes;
     if (!(input >> trace.queries >> trace.tokens >> trace.heads >> trace.kv_heads >> trace.dimension >> trace.page_tokens) ||
         trace.queries != 3 || trace.tokens != 17 || trace.heads != 4 || trace.kv_heads != 2 ||
         trace.dimension != 64 || trace.page_tokens != 16)
@@ -106,6 +148,13 @@ PagedFP32Trace parse(std::istream &input)
     trace.frames.resize(count);
     for (auto &frame : trace.frames) if (!(input >> frame) || frame >= count) throw std::invalid_argument("Invalid recorded native frame");
     if (trace.frames[0] == trace.frames[1]) throw std::invalid_argument("Aliased recorded writable frames");
+    if (trace.producer == FP32PageProducer::NativeSeparatedRows)
+    {
+        std::string split;
+        if (!(input >> tag >> trace.scratch_frame >> split >> trace.first_append_rows) ||
+            tag != "scratch" || split != "split" || trace.scratch_frame != 2 || trace.first_append_rows != 8)
+            throw std::invalid_argument("Incompatible recorded native append scratch/split configuration");
+    }
     const size_t query_values = static_cast<size_t>(trace.queries * trace.heads * trace.dimension);
     const size_t kv_values = static_cast<size_t>(trace.tokens * trace.kv_heads * trace.dimension);
     trace.query = readBank(input, "query", query_values);
@@ -118,9 +167,15 @@ PagedFP32Trace parse(std::istream &input)
 /** @brief Retain exact native observed bits after explicit diagnostic capture only. */
 void write(std::ostream &output, const PagedFP32Trace &trace)
 {
-    output << "paged-fp32-v1 empty-zero-generations uniform-zero-score-panel-v1\n"
+    if (trace.producer != FP32PageProducer::RetainedRawBytes && trace.producer != FP32PageProducer::NativeSeparatedRows)
+        throw std::invalid_argument("Unknown recorded FP32 page producer");
+    output << std::dec << (trace.producer == FP32PageProducer::NativeSeparatedRows ?
+        "paged-fp32-v2 empty-zero-generations native-append-half-page-v1\n" :
+        "paged-fp32-v1 empty-zero-generations uniform-zero-score-panel-v1\n")
         << trace.queries << ' ' << trace.tokens << ' ' << trace.heads << ' ' << trace.kv_heads << ' '
         << trace.dimension << ' ' << trace.page_tokens << "\nframes 2 " << trace.frames[0] << ' ' << trace.frames[1] << '\n';
+    if (trace.producer == FP32PageProducer::NativeSeparatedRows)
+        output << "scratch " << trace.scratch_frame << " split " << trace.first_append_rows << '\n';
     const auto bank = [&](const char *name, const std::vector<float> &values) {
         output << name << ' ' << std::dec << values.size() << '\n';
         bool first = true;
@@ -172,11 +227,42 @@ TEST(CPUFlashAttentionPaged, RecordedFP32InputsReplayExactly)
     EXPECT_EQ(std::memcmp(actual.data(), trace.expected.data(), actual.size() * sizeof(float)), 0);
 }
 
+/** @test Recorded native inputs replay through partial-tail production and optimized attention without rebaselining. */
+TEST(CPUFlashAttentionPaged, RecordedNativeAppendInputsReplayExactly)
+{
+    if (const char *path = std::getenv("LLAMINAR_RECORD_PAGED_FP32_APPEND_TRACE"))
+    {
+        // The prior native recording is the numerical oracle, not a new expected
+        // stream. Only the explicitly recorded producer/scratch configuration changes.
+        std::istringstream original(llaminar2::test::pagedFP32AttentionTrace);
+        auto trace = parse(original);
+        trace.producer = FP32PageProducer::NativeSeparatedRows;
+        const auto observed = execute(trace);
+        ASSERT_EQ(observed.size(), trace.expected.size());
+        ASSERT_EQ(std::memcmp(observed.data(), trace.expected.data(), observed.size() * sizeof(float)), 0);
+        trace.expected = observed;
+        std::ofstream output(path);
+        ASSERT_TRUE(output.good()); write(output, trace); output.close(); ASSERT_TRUE(output.good());
+        std::ifstream captured(path);
+        const auto retained = parse(captured);
+        const auto repeated = execute(retained);
+        EXPECT_EQ(std::memcmp(repeated.data(), retained.expected.data(), repeated.size() * sizeof(float)), 0);
+        return;
+    }
+    std::istringstream input(llaminar2::test::pagedFP32AppendTrace);
+    const auto trace = parse(input);
+    ASSERT_EQ(trace.producer, FP32PageProducer::NativeSeparatedRows);
+    const auto observed = execute(trace);
+    EXPECT_EQ(std::memcmp(observed.data(), trace.expected.data(), observed.size() * sizeof(float)), 0);
+}
+
 /** @test Missing state, changed policy/geometry and truncated payloads fail before kernel submission. */
 TEST(CPUFlashAttentionPaged, IncompleteRecordedInputsAreRejected)
 {
     for (const std::string text : {"", "paged-fp32-v2 empty-zero-generations uniform-zero-score-panel-v1\n",
-        "paged-fp32-v1 empty-zero-generations uniform-zero-score-panel-v1\n3 17 4 2 64 16\nframes 2 1 0\nquery 768\n"})
+        "paged-fp32-v1 empty-zero-generations uniform-zero-score-panel-v1\n3 17 4 2 64 16\nframes 2 1 0\nquery 768\n",
+        "paged-fp32-v2 empty-zero-generations native-append-half-page-v1\n3 17 4 2 64 16\nframes 2 1 0\nscratch 0 split 8\n",
+        "paged-fp32-v2 empty-zero-generations native-append-half-page-v1\n3 17 4 2 64 16\nframes 2 1 0\nscratch 2 split 0\n"})
     {
         std::istringstream input(text);
         EXPECT_THROW(parse(input), std::exception);

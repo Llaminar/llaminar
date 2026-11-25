@@ -67,6 +67,8 @@ public:
         Update &operator=(const Update &) = delete;
         /** @brief Transfer one immutable page publication into the next logical table position. */
         void append(CPUFP32KVPage &&page);
+        /** @brief Adopt one shared immutable page reference into the next logical table position. */
+        void appendShared(PhysicalPagePool::SharedPage &&shared, int heads, int dimension);
         /** @brief Validate and publish a complete nonempty operation bank, without an unowned interval. */
         Snapshot commit();
     private:

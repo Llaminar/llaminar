@@ -14,4 +14,5 @@ inline constexpr const char *privatePageAppendTrace = R"PMA_TRACE(@PMA_APPEND_TR
 inline constexpr const char *privatePageReaderTrace = R"PMA_TRACE(@PMA_READER_TRACE@)PMA_TRACE";
 inline constexpr const char *privatePageTableTrace = R"PMA_TRACE(@PMA_TABLE_TRACE@)PMA_TRACE";
 inline constexpr const char *pagedFP32AttentionTrace = R"PMA_TRACE(@PMA_ATTENTION_TRACE@)PMA_TRACE";
+inline constexpr const char *pagedFP32AppendTrace = R"PMA_TRACE(@PMA_APPEND_ATTENTION_TRACE@)PMA_TRACE";
 }

@@ -32,26 +32,17 @@ public:
      * @throws std::invalid_argument For padding/non-token extents or misalignment.
      */
     CPUFP32KVPage(PhysicalPagePool::CommittedPage publication, int heads, int dimension)
-        : publication_(std::move(publication)), heads_(heads), dimension_(dimension)
+        : kind_(Kind::Private), publication_(std::move(publication)), heads_(heads), dimension_(dimension)
     {
-        const auto layout = KVNativeStorageLayout::resolve(KVCacheFamily::AttentionOnly,
-            heads, dimension, "fp32", DeviceId::cpu());
-        const auto pair = layout.pagePayload(1);
-        const auto bytes = publication_.read();
-        const auto stride = pair.totalBytes();
-        if (!bytes.size() || bytes.size() % stride ||
-            reinterpret_cast<std::uintptr_t>(bytes.data()) % alignof(float) ||
-            bytes.size() / stride > static_cast<size_t>(std::numeric_limits<int>::max()))
-            throw std::invalid_argument("Native FP32 page must expose exact aligned live K/V token rows");
-        rows_ = static_cast<int>(bytes.size() / stride);
+        adoptRows(publication_.read());
         // The retained immutable publication prevents mutation/reuse. Cache
         // these checked addresses once; a dot-product never reopens ownership.
-        data_ = reinterpret_cast<const float *>(bytes.data());
-        row_width_ = pair.k_bytes / sizeof(float);
     }
     /** @brief Transfer the publication and revoke every moved-from pointer/extent. */
     CPUFP32KVPage(CPUFP32KVPage &&other) noexcept
-        : publication_(std::move(other.publication_)), data_(std::exchange(other.data_, nullptr)),
+        : kind_(std::exchange(other.kind_, Kind::Empty)),
+          publication_(std::move(other.publication_)), shared_(std::move(other.shared_)),
+          data_(std::exchange(other.data_, nullptr)),
           row_width_(std::exchange(other.row_width_, 0)), heads_(std::exchange(other.heads_, 0)),
           dimension_(std::exchange(other.dimension_, 0)), rows_(std::exchange(other.rows_, 0)) {}
     /** @brief Retire the previous publication before adopting a new page owner. */
@@ -60,6 +51,8 @@ public:
         if (this != &other)
         {
             publication_ = std::move(other.publication_);
+            shared_ = std::move(other.shared_);
+            kind_ = std::exchange(other.kind_, Kind::Empty);
             data_ = std::exchange(other.data_, nullptr);
             row_width_ = std::exchange(other.row_width_, 0);
             heads_ = std::exchange(other.heads_, 0);
@@ -68,10 +61,27 @@ public:
         }
         return *this;
     }
+    /**
+     * @brief Adopt one immutable shared page reference as native FP32 operands.
+     * @param shared Exact retained shared content/version, not a raw pointer.
+     * @param heads Actual local KV head count.
+     * @param dimension Coordinates per head.
+     * @throws std::invalid_argument For padding/non-token extents or misalignment.
+     */
+    CPUFP32KVPage(PhysicalPagePool::SharedPage shared, int heads, int dimension)
+        : kind_(Kind::Shared), shared_(std::move(shared)), heads_(heads), dimension_(dimension)
+    {
+        adoptRows(shared_.read());
+    }
+    /** @return Whether this entry backs an immutable shared page rather than a private publication. */
+    bool sharedBacked() const noexcept { return kind_ == Kind::Shared; }
     CPUFP32KVPage(const CPUFP32KVPage &) = delete;
     CPUFP32KVPage &operator=(const CPUFP32KVPage &) = delete;
     /** @return Original PMA issuer; table publication rejects foreign instance ownership. */
-    const PhysicalMemoryAuthority *issuer() const noexcept { return publication_.issuer(); }
+    const PhysicalMemoryAuthority *issuer() const noexcept
+    {
+        return kind_ == Kind::Shared ? shared_.issuer() : publication_.issuer();
+    }
     /** @return Exact interleaved K/V byte bank for whole-invocation bounds/alias admission. */
     std::span<const std::byte> storage() const noexcept
     {
@@ -98,6 +108,22 @@ public:
     }
 private:
     friend class CPUFP32PagedKVTable;
+    enum class Kind : std::uint8_t { Empty, Private, Shared };
+    /** @brief Shared construction validates the exact native row geometry and alignment. */
+    void adoptRows(std::span<const std::byte> bytes)
+    {
+        const auto layout = KVNativeStorageLayout::resolve(KVCacheFamily::AttentionOnly,
+            heads_, dimension_, "fp32", DeviceId::cpu());
+        const auto pair = layout.pagePayload(1);
+        const auto stride = pair.totalBytes();
+        if (!bytes.size() || bytes.size() % stride ||
+            reinterpret_cast<std::uintptr_t>(bytes.data()) % alignof(float) ||
+            bytes.size() / stride > static_cast<size_t>(std::numeric_limits<int>::max()))
+            throw std::invalid_argument("Native FP32 shared page must expose exact aligned live K/V token rows");
+        rows_ = static_cast<int>(bytes.size() / stride);
+        data_ = reinterpret_cast<const float *>(bytes.data());
+        row_width_ = pair.k_bytes / sizeof(float);
+    }
     /** @brief Empty metadata cell, constructible only by the bounded page-table owner. */
     CPUFP32KVPage() noexcept = default;
     /** @brief Reject attempts to address another request, page padding or invalid head. */
@@ -106,7 +132,9 @@ private:
         if (!data_ || row < 0 || row >= rows_ || head < 0 || head >= heads_)
             throw std::out_of_range("Native FP32 page access exceeds its live token/head extent");
     }
+    Kind kind_ = Kind::Empty;
     PhysicalPagePool::CommittedPage publication_;
+    PhysicalPagePool::SharedPage shared_;
     const float *data_ = nullptr;
     size_t row_width_ = 0;
     int heads_ = 0, dimension_ = 0, rows_ = 0;
