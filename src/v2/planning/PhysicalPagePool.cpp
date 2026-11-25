@@ -55,6 +55,10 @@ std::size_t PhysicalPagePool::physicalBytes(PhysicalPagePoolGeometry g, DeviceId
     add(CPUStorageRoot<Frame>(g.frames, PhysicalMemoryOwner::KVCache, device, p).physicalBytes());
     add(CPUStorageRoot<Request>(g.request_records, PhysicalMemoryOwner::KVCache, device, p).physicalBytes());
     add(CPUStorageRoot<FrameHandle>(g.request_records * g.max_pages_per_request, PhysicalMemoryOwner::KVCache, device, p).physicalBytes());
+    // Bounded witness workspace: fixed request/step/refusal cells, priced once
+    // in the authority BOM rather than allocated per admission.
+    add(CPUStorageRoot<std::byte>(planning::witnessWorkspaceBytes(g.request_records),
+        PhysicalMemoryOwner::KVCache, device, p).physicalBytes());
     return result;
 }
 
@@ -69,6 +73,14 @@ PhysicalPagePool::PhysicalPagePool(std::shared_ptr<PhysicalMemoryAuthority> auth
     requests_ = CPUStorageRoot<Request>(geometry.request_records, PhysicalMemoryOwner::KVCache, device, placement).allocate(authority);
     request_frames_ = CPUStorageRoot<FrameHandle>(geometry.request_records * geometry.max_pages_per_request,
         PhysicalMemoryOwner::KVCache, device, placement).allocate(authority);
+    witness_cells_ = CPUStorageRoot<std::byte>(planning::witnessWorkspaceBytes(geometry.request_records),
+        PhysicalMemoryOwner::KVCache, device, placement, CPUStorageInitialization::Uninitialized).allocate(authority);
+    static_assert(alignof(planning::WitnessWorkspace) <= AlignedVector<std::byte>::ALIGNMENT);
+    witness_workspace_ = new (witness_cells_.data()) planning::WitnessWorkspace(geometry.request_records);
+}
+PhysicalPagePool::~PhysicalPagePool()
+{
+    if (witness_workspace_) witness_workspace_->~WitnessWorkspace();
 }
 
 std::shared_ptr<PhysicalPagePool> PhysicalMemoryAuthority::createCPUPagePool(DeviceId device,
@@ -124,7 +136,10 @@ void PhysicalPagePool::fillWitnessRequests(std::span<planning::WitnessRequest> o
     // Conservatively treat every outstanding finite grant (G = remaining) as
     // already occupied: admission must prove the worst case where all grants
     // convert to frames, never only the currently assigned O subset. Fixed
-    // output span: no per-admission heap allocation.
+    // output span: no per-admission heap allocation. The span is zeroed first
+    // because the workspace is reused across admissions; stale entries must
+    // never be interpreted as live requests.
+    for (auto &cell : out) cell = {};
     std::size_t count = 0;
     for (std::size_t record = 0; record < requests_.size() && count < out.size(); ++record)
     {
@@ -162,7 +177,7 @@ std::optional<PhysicalPagePool::Grant> PhysicalPagePool::tryAdmitWithWitness(
     // Proof before mutation using the fixed workspace: the proposed live set
     // must have a completion order. The new request enters with its finite
     // initial grant as occupied because that grant converts to O immediately.
-    planning::WitnessWorkspace workspace(geometry_.request_records);
+    auto &workspace = *witness_workspace_;
     fillWitnessRequests(workspace.requests());
     std::size_t live = workspace.requests().size();
     for (std::size_t i = 0; i < workspace.requests().size(); ++i)
@@ -206,7 +221,7 @@ bool PhysicalPagePool::extendWithWitness(Grant &grant, std::size_t pages)
     // Revalidate the PROPOSED state in the fixed workspace: this request's
     // outstanding grant grows by `pages`; every other live request keeps its
     // current committed occupancy.
-    planning::WitnessWorkspace workspace(geometry_.request_records);
+    auto &workspace = *witness_workspace_;
     fillWitnessRequests(workspace.requests());
     std::size_t live = workspace.requests().size();
     for (std::size_t i = 0; i < workspace.requests().size(); ++i)
