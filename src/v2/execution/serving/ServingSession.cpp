@@ -311,10 +311,12 @@ namespace llaminar2
             if (finish[r] == ServingFinishReason::None && rows_[r].has_logits && may_decide(rows_[r]))
                 decide(r);
 
-        // 4. Shared forwards over every request that has work: a prompt
-        //    chunk, or feeding its committed token when it may continue.
-        //    Decode rows (one token each) and prompt chunks run as separate
-        //    forwards so a decode row is never padded to a chunk's width.
+        // 4. Shared forwards: one decode forward over every request feeding its
+        //    committed token, then one prefill transaction carrying ONE
+        //    request's next prompt chunk (the oldest prefilling request, in
+        //    admission order). Decode rows are never padded to a chunk's width,
+        //    and prompt chunks of different requests are never aggregated
+        //    (design: one chunk per prefill transaction).
         struct Work
         {
             std::size_t r;
@@ -329,6 +331,8 @@ namespace llaminar2
             const Row &row = rows_[r];
             if (row.prompt_consumed < row.request.prompt.size())
             {
+                if (!prefill_work.empty())
+                    continue; // a later request's chunk waits for a following step
                 const std::size_t chunk =
                     std::min<std::size_t>(kPrefillChunk, row.request.prompt.size() - row.prompt_consumed);
                 prefill_work.push_back(

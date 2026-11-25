@@ -15,8 +15,8 @@ Provenance:
   (sha256 `7671c0c304e6ce5a7fc577bcb12aba01e2c155cc2efd29b2213c95b18edaf6ed`),
   CPU, context 1024, capacity 3, prefix cache off;
 - recorded by `ContinuousBatchingCPU.RecordedServingTraceReplaysExactly`
-  (which replays its own recording) on source `69aafd547` plus the uncommitted
-  session extraction, Docker Desktop aarch64:
+  (which replays its own recording) on source `bc3f1f527` plus the
+  one-chunk-per-prefill-transaction change, Docker Desktop aarch64:
 
   ```bash
   LLAMINAR_CB_RECORD_TRACE=<path> LLAMINAR_CB_TEST_MODEL=<model> \

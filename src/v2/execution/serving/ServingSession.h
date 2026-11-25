@@ -16,8 +16,9 @@
  *  2. admit queued requests into free slots, restoring cached prefixes;
  *  3. decide from retained logits where allowed (forced token, unpaced or
  *     granted), committing tokens and finishing on stop/length;
- *  4. one decode forward (one token per row), then one prompt-chunk forward;
- *     rows whose prompt completes archive their prefix and decide;
+ *  4. one decode forward (one token per row), then one prefill transaction
+ *     with the oldest prefilling request's next chunk; a row whose prompt
+ *     completes archives its prefix and decides;
  *  5. retire finished rows, freeing their slots.
  * A failed shared forward fails every resident and queued request and seals
  * the session.
