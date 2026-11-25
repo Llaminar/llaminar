@@ -98,6 +98,7 @@ namespace llaminar2::test
         constexpr Layout kIQ2XS{"IQ2_XS", Encoding::CompactMultiScale, 14, true, true, 9};
         constexpr Layout kIQ2XXS{"IQ2_XXS", Encoding::CompactMultiScale, 15, false, true, 8};
         constexpr Layout kIQ1S{"IQ1_S", Encoding::CompactMultiScale, 16, true, true, 6};
+        constexpr Layout kQ6K{"Q6_K", Encoding::Q6KNativeDualScale, 8, true, true, 24};
         constexpr Layout kIQ1M{"IQ1_M", Encoding::CompactMultiScale, 17, true, true, 6};
 
         /** @brief Scale-word content of one prepared matrix. */
@@ -856,11 +857,14 @@ namespace llaminar2::test
                 out[0].data(), out[1].data(), out[2].data(), 0, blocks, 16, 2, lut));
         }
 #endif
-        for (const Layout &layout : {kQ5K, kIQ3S})
+        // Compact multi-scale (Q5_K, IQ3_S) and native dual-scale Q6_K have
+        // no paired program; each must be rejected on every paired entry.
+        for (const Layout &layout : {kQ5K, kIQ3S, kQ6K})
         {
             SCOPED_TRACE(layout.name);
             CPUNativeQuantisedPackedWeights packed;
             makeWeights(packed, layout, n, blocks, Policy::GPUAlignedExpert, Scales::Finite, 61u + layout.codebook);
+            ASSERT_EQ(packed.encoding, layout.encoding);
             std::vector<std::array<float, 64>> out(4);
             for (auto &r : out)
                 r.fill(dirty);
