@@ -156,3 +156,44 @@ TEST(CPUFlashAttentionPagedRunner, InsufficientGrowthRefusesBeforePublication)
     auto grant = fx.pool->tryAdmit(1);
     EXPECT_FALSE(grant);
 }
+
+/** @test Two mixed-length requests and long-over-equal-share stay byte-exact, plus cancellation. */
+TEST(CPUFlashAttentionPagedRunner, MixedLengthsAndLongOverEqualShareRemainByteExact)
+{
+    constexpr int page_tokens = 16;
+    constexpr int heads = 1, dimension = 64;
+    constexpr int short_tokens = 7, long_tokens = 150; // Short + long-over-equal-share.
+    const size_t short_frames = (static_cast<size_t>(short_tokens) + page_tokens - 1) / page_tokens;
+    const size_t long_frames = (static_cast<size_t>(long_tokens) + page_tokens - 1) / page_tokens;
+    const int max_pages = static_cast<int>(short_frames + long_frames + 1);
+    RunnerFixture fx(page_tokens, max_pages, dimension);
+    std::mt19937 random(23);
+    std::uniform_real_distribution<float> values(-0.6f, 0.6f);
+    const size_t width = static_cast<size_t>(heads * dimension);
+    std::vector<float> k_short(static_cast<size_t>(short_tokens) * width), v_short(k_short.size());
+    std::vector<float> k_long(static_cast<size_t>(long_tokens) * width), v_long(k_long.size());
+    for (auto *bank : {&k_short, &v_short, &k_long, &v_long})
+        for (auto &value : *bank) value = values(random);
+    std::vector<float> q_short(static_cast<size_t>(heads * dimension)), q_long(q_short.size());
+    for (auto &value : q_short) value = values(random);
+    for (auto &value : q_long) value = values(random);
+
+    auto short_snapshot = publishRunnerSet(fx, k_short, v_short, page_tokens, heads, dimension);
+    auto long_snapshot = publishRunnerSet(fx, k_long, v_long, page_tokens, heads, dimension);
+    fx.pool.reset();
+    fx.table.reset(); // Snapshot retention is proof.
+
+    CPUFlashAttentionKernelT<ActivationPrecision::FP32> kernel;
+    std::vector<float> expected_short(q_short.size(), -99.0f), actual_short(q_short.size(), -88.0f);
+    std::vector<float> expected_long(q_long.size(), -99.0f), actual_long(q_long.size(), -88.0f);
+    ASSERT_TRUE(kernel.compute_decode(q_short.data(), k_short.data(), v_short.data(), expected_short.data(),
+        1, short_tokens, heads, heads, dimension, true, short_tokens - 1));
+    ASSERT_TRUE(kernel.compute_paged_snapshot_fp32(q_short, short_snapshot, actual_short, 1, heads,
+        true, -1, short_tokens - 1));
+    EXPECT_EQ(std::memcmp(expected_short.data(), actual_short.data(), actual_short.size() * sizeof(float)), 0);
+    ASSERT_TRUE(kernel.compute_decode(q_long.data(), k_long.data(), v_long.data(), expected_long.data(),
+        1, long_tokens, heads, heads, dimension, true, long_tokens - 1));
+    ASSERT_TRUE(kernel.compute_paged_snapshot_fp32(q_long, long_snapshot, actual_long, 1, heads,
+        true, -1, long_tokens - 1));
+    EXPECT_EQ(std::memcmp(expected_long.data(), actual_long.data(), actual_long.size() * sizeof(float)), 0);
+}
