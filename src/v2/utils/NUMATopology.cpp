@@ -34,6 +34,7 @@
 #include <hwloc.h>
 #include <hwloc/plugins.h>
 #include <set>
+#include <mutex>
 #include <unistd.h>
 #include <sys/syscall.h>
 #include <cerrno>
@@ -92,13 +93,50 @@ namespace llaminar2
         return evidence;
     }
 
+    namespace
+    {
+        std::mutex &nonNUMAKernelOverrideMutex()
+        {
+            static std::mutex mutex;
+            return mutex;
+        }
+        std::optional<NonNUMAKernelEvidence> &nonNUMAKernelOverride()
+        {
+            static std::optional<NonNUMAKernelEvidence> evidence;
+            return evidence;
+        }
+    } // namespace
+
+    NonNUMAKernelEvidence effectiveNonNUMAKernelEvidence()
+    {
+        {
+            std::lock_guard lock(nonNUMAKernelOverrideMutex());
+            if (nonNUMAKernelOverride())
+                return *nonNUMAKernelOverride();
+        }
+        return observedNonNUMAKernelEvidence();
+    }
+
+    ScopedNonNUMAKernelEvidenceForTest::ScopedNonNUMAKernelEvidenceForTest(NonNUMAKernelEvidence evidence)
+    {
+        std::lock_guard lock(nonNUMAKernelOverrideMutex());
+        previous_ = nonNUMAKernelOverride();
+        nonNUMAKernelOverride() = evidence;
+    }
+
+    ScopedNonNUMAKernelEvidenceForTest::~ScopedNonNUMAKernelEvidenceForTest()
+    {
+        std::lock_guard lock(nonNUMAKernelOverrideMutex());
+        nonNUMAKernelOverride() = previous_;
+    }
+
     bool nonNUMAKernelSingleNode(int numa_node) noexcept
     {
         if (numa_node != 0)
             return false;
         try
         {
-            return classifyNonNUMAKernel(observedNonNUMAKernelEvidence());
+            return classifyNonNUMAKernel(effectiveNonNUMAKernelEvidence());
         }
         catch (...)
         {

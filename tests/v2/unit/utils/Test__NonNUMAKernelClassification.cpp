@@ -38,4 +38,19 @@ namespace llaminar2::test
         EXPECT_FALSE(nonNUMAKernelSingleNode(-1));
         EXPECT_EQ(nonNUMAKernelSingleNode(0), classifyNonNUMAKernel(first));
     }
+
+    TEST(NonNUMAKernelClassification, TestEvidenceOverridesTheObservationWhileScoped)
+    {
+        const bool observed = nonNUMAKernelSingleNode(0);
+        {
+            ScopedNonNUMAKernelEvidenceForTest numa(ScopedNonNUMAKernelEvidenceForTest::numaKernel());
+            EXPECT_FALSE(nonNUMAKernelSingleNode(0));
+            {
+                ScopedNonNUMAKernelEvidenceForTest none(ScopedNonNUMAKernelEvidenceForTest::nonNUMAKernel());
+                EXPECT_TRUE(nonNUMAKernelSingleNode(0));
+            }
+            EXPECT_FALSE(nonNUMAKernelSingleNode(0)) << "scopes nest";
+        }
+        EXPECT_EQ(nonNUMAKernelSingleNode(0), observed);
+    }
 } // namespace llaminar2::test

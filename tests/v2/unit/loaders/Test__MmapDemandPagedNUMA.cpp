@@ -7,6 +7,7 @@
  * neither case may touch the file. No models, accelerators, timing threshold,
  * payload checksum, or test-only execution substitute are used.
  */
+#include "utils/NUMATopology.h"
 #include "loaders/MmapRegion.h"
 #include <gtest/gtest.h>
 #include <algorithm>
@@ -66,6 +67,9 @@ size_t residentPages(const MmapRegion &mapping)
 /** @test A NUMA hint cannot convert a demand-paged mapping into a whole-file first-touch. */
 TEST(MmapDemandPagedNUMA, BoundOrRejectedSourceNeverPrefaultsUnselectedPages)
 {
+    // State the kernel under test: strict NUMA binding, independent of host.
+    llaminar2::ScopedNonNUMAKernelEvidenceForTest numa_kernel(
+        llaminar2::ScopedNonNUMAKernelEvidenceForTest::numaKernel());
     SparseFile file;
     const int node=numa_available()<0?0:numa_max_node();
     const auto allowed=canBind(node);

@@ -292,6 +292,8 @@ extern "C" long move_pages(int pid, unsigned long count, void **pages, const int
 
 TEST(Test__NUMAAllocator, FirstTouchPlacementPreparesBeforeBorrowingAndRestoresExactCaller)
 {
+    // The probe observes the memory-policy protocol of a NUMA kernel.
+    ScopedNonNUMAKernelEvidenceForTest numa_kernel(ScopedNonNUMAKernelEvidenceForTest::numaKernel());
     auto &allocator = NUMAAllocator::instance();
     const auto incoming = placementCallerMask();
     for (int lifetime = 0; lifetime < 20; ++lifetime)
@@ -326,6 +328,8 @@ TEST(Test__NUMAAllocator, FirstTouchPlacementPreparesBeforeBorrowingAndRestoresE
 
 TEST(Test__NUMAAllocator, FirstTouchPlacementPolicyRejectionRestoresBothSettings)
 {
+    // The probe observes the memory-policy protocol of a NUMA kernel.
+    ScopedNonNUMAKernelEvidenceForTest numa_kernel(ScopedNonNUMAKernelEvidenceForTest::numaKernel());
     auto &allocator = NUMAAllocator::instance();
     const auto incoming = placementCallerMask();
     PlacementProbe probe; probe.fault = PlacementFault::RejectPolicy;
@@ -348,6 +352,8 @@ TEST(Test__NUMAAllocator, FirstTouchPlacementPolicyRejectionRestoresBothSettings
 
 TEST(Test__NUMAAllocator, FirstTouchPlacementExceptionsReleaseUnpublishedStorage)
 {
+    // The probe observes the memory-policy protocol of a NUMA kernel.
+    ScopedNonNUMAKernelEvidenceForTest numa_kernel(ScopedNonNUMAKernelEvidenceForTest::numaKernel());
     auto &allocator = NUMAAllocator::instance();
     const int node = allocator.getCurrentNUMANode();
     const auto prior_level = Logger::getInstance().getLogLevel();
@@ -377,6 +383,8 @@ TEST(Test__NUMAAllocator, FirstTouchPlacementExceptionsReleaseUnpublishedStorage
 
 TEST(Test__NUMAAllocator, FirstTouchPlacementRestorationErrorsAndContradictionsAreFatal)
 {
+    // The probe observes the memory-policy protocol of a NUMA kernel.
+    ScopedNonNUMAKernelEvidenceForTest numa_kernel(ScopedNonNUMAKernelEvidenceForTest::numaKernel());
     for (const auto fault : {PlacementFault::RestoreAffinity, PlacementFault::RestorePolicy,
                              PlacementFault::ReadAffinity, PlacementFault::ReadPolicy,
                              PlacementFault::ContradictAffinity, PlacementFault::ContradictPolicy})

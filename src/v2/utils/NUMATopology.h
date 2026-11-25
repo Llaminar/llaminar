@@ -50,6 +50,32 @@ namespace llaminar2
     /** @brief The process's one cached observation (taken on first use). */
     const NonNUMAKernelEvidence &observedNonNUMAKernelEvidence();
 
+    /** @brief The evidence placement decisions use: a test override, else the observation. */
+    NonNUMAKernelEvidence effectiveNonNUMAKernelEvidence();
+
+    /**
+     * @brief Test seam: placement uses @p evidence while this scope lives.
+     *
+     * Lets binding tests state the kernel they exercise (NUMA or not)
+     * independently of the executing host. Not for concurrent placement.
+     */
+    class ScopedNonNUMAKernelEvidenceForTest
+    {
+    public:
+        explicit ScopedNonNUMAKernelEvidenceForTest(NonNUMAKernelEvidence evidence);
+        ~ScopedNonNUMAKernelEvidenceForTest();
+        ScopedNonNUMAKernelEvidenceForTest(const ScopedNonNUMAKernelEvidenceForTest &) = delete;
+        ScopedNonNUMAKernelEvidenceForTest &operator=(const ScopedNonNUMAKernelEvidenceForTest &) = delete;
+
+        /** @brief Evidence of a NUMA kernel: strict binding everywhere. */
+        static constexpr NonNUMAKernelEvidence numaKernel() noexcept { return {false, false, 2}; }
+        /** @brief Evidence of a kernel without NUMA: node 0 is the machine. */
+        static constexpr NonNUMAKernelEvidence nonNUMAKernel() noexcept { return {true, true, 1}; }
+
+    private:
+        std::optional<NonNUMAKernelEvidence> previous_;
+    };
+
     /**
      * @brief True on a kernel built without NUMA support, for node 0 only:
      *        the single implicit node is the whole machine, so node-0
