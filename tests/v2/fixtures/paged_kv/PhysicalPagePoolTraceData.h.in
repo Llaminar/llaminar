@@ -1,0 +1,15 @@
+/**
+ * @file PhysicalPagePoolTraceData.h
+ * @brief Build-bound copies of small retained page-authority recordings.
+ *
+ * Embedding these exact fixture bytes lets installed compiler/source-free test
+ * runners replay the same inputs without relying on builder filesystem paths.
+ * Edit recordings only through explicit capture and review, not failing replay.
+ */
+#pragma once
+namespace llaminar2::test
+{
+inline constexpr const char *privatePageOwnershipTrace = R"PMA_TRACE(@PMA_OWNERSHIP_TRACE@)PMA_TRACE";
+inline constexpr const char *privatePageAppendTrace = R"PMA_TRACE(@PMA_APPEND_TRACE@)PMA_TRACE";
+inline constexpr const char *privatePageReaderTrace = R"PMA_TRACE(@PMA_READER_TRACE@)PMA_TRACE";
+}

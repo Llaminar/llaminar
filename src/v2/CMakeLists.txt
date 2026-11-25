@@ -1810,6 +1810,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     backends/GPUFlatGraphStructure.cpp
     backends/RetainedParticipantGraphExecutable.cpp
     planning/PhysicalMemoryAuthority.cpp
+    planning/PhysicalPagePool.cpp
     planning/MemoryPlanner.cpp
     planning/ImmutableRowTablePlacementPlanner.cpp
     planning/ImmutableRowTableAdmissionWire.cpp

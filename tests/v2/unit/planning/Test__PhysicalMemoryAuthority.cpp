@@ -9,6 +9,8 @@
  */
 
 #include "planning/PhysicalMemoryAuthority.h"
+#include "planning/PhysicalPagePool.h"
+#include <limits>
 #include "utils/FinalPhysicalMemoryCostEvidence.h"
 #include <sstream>
 
@@ -48,6 +50,258 @@ namespace
             .admission_available_bytes = available,
         };
     }
+}
+
+/** @test PMA page commitments are fungible and assign real nonoverlapping frame incarnations. */
+TEST(PhysicalMemoryAuthority, PagePoolUnpublishedCommitmentLifecycle)
+{
+    const PhysicalPagePoolGeometry geometry{.frames=8, .frame_bytes=128,
+        .request_records=4, .max_pages_per_request=8};
+    const auto device = DeviceId::cpu();
+    const auto bytes = PhysicalPagePool::physicalBytes(geometry, device);
+    PhysicalMemoryPlanBuilder builder;
+    builder.add(resource(0, device, bytes, bytes), PhysicalMemoryOwner::KVCache, bytes);
+    auto authority = std::make_shared<PhysicalMemoryAuthority>(
+        std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(builder.build()), 0);
+    auto pool = authority->createCPUPagePool(device, geometry, CPUStoragePlacement::local());
+    EXPECT_EQ(authority->claimedBytes(device, PhysicalMemoryOwner::KVCache,
+        PhysicalMemoryMaterializationKind::NewAllocation), bytes);
+    auto long_request = pool->tryAdmit(6);
+    auto short_request = pool->tryAdmit(2);
+    ASSERT_TRUE(long_request);
+    ASSERT_TRUE(short_request);
+    EXPECT_FALSE(pool->tryAdmit(1));
+    EXPECT_TRUE(long_request->assignedFrames().empty());
+    const auto first = long_request->assignFrame();
+    const auto peer = short_request->assignFrame();
+    EXPECT_NE(first.index, peer.index);
+    for (int i = 0; i < 5; ++i) long_request->assignFrame();
+    EXPECT_EQ(long_request->remainingCommitment(), 0u);
+    EXPECT_EQ(long_request->assignedFrames().size(), 6u); // More than an equal 8/4 share.
+    EXPECT_THROW(long_request->assignFrame(), std::logic_error);
+    EXPECT_FALSE(pool->tryAdmit(1));
+    long_request.reset();
+    auto replacement = pool->tryAdmit(6);
+    ASSERT_TRUE(replacement);
+    const auto reused = replacement->assignFrame();
+    EXPECT_EQ(reused.index, first.index);
+    EXPECT_GT(reused.generation, first.generation);
+    EXPECT_EQ(short_request->assignedFrames().front(), peer);
+    replacement.reset();
+    short_request.reset();
+    pool.reset();
+    EXPECT_EQ(authority->claimedBytes(device, PhysicalMemoryOwner::KVCache,
+        PhysicalMemoryMaterializationKind::NewAllocation), 0u);
+}
+
+/** @test Registration before CPU submission retains old bytes across closure, cancellation and delayed execution. */
+TEST(PhysicalMemoryAuthority, PagePoolRegisteredReadersCloseBeforeRetirement)
+{
+    const auto device = DeviceId::cpu();
+    const PhysicalPagePoolGeometry geometry{1, 32, 3, 1};
+    const auto bytes = PhysicalPagePool::physicalBytes(geometry, device);
+    PhysicalMemoryPlanBuilder builder;
+    builder.add(resource(0, device, bytes, bytes), PhysicalMemoryOwner::KVCache, bytes);
+    auto authority = std::make_shared<PhysicalMemoryAuthority>(
+        std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(builder.build()), 0);
+    auto pool = authority->createCPUPagePool(device, geometry, CPUStoragePlacement::local());
+    auto request = pool->tryAdmit(1);
+    ASSERT_TRUE(request);
+    const auto frame = request->assignFrame();
+    auto write = request->prepareAppend(frame, 4);
+    ASSERT_TRUE(write);
+    const std::byte payload[]{std::byte{1}, std::byte{2}, std::byte{3}, std::byte{4}};
+    write->copyFrom(payload);
+    auto page = write->commit();
+    auto first = page.registerRead();
+    auto delayed = page.registerRead();
+    EXPECT_THROW(delayed.completeCPU(), std::logic_error);
+    request->closeReaders(frame);
+    EXPECT_THROW(page.registerRead(), std::logic_error);
+    const auto first_bytes = first.beginCPU();
+    EXPECT_TRUE(std::equal(first_bytes.begin(), first_bytes.end(), std::begin(payload)));
+    EXPECT_THROW(first.beginCPU(), std::logic_error);
+    first.completeCPU();
+    page = {};
+    EXPECT_FALSE(request->prepareAppend(frame, 1));
+    request.reset();
+    EXPECT_FALSE(pool->tryAdmit(1));
+    // It was registered before closure/cancel; it still owns the exact old bytes.
+    const auto delayed_bytes = delayed.beginCPU();
+    EXPECT_TRUE(std::equal(delayed_bytes.begin(), delayed_bytes.end(), std::begin(payload)));
+    EXPECT_FALSE(pool->tryAdmit(1));
+    delayed.completeCPU();
+    EXPECT_THROW(delayed.completeCPU(), std::logic_error);
+    auto replacement = pool->tryAdmit(1);
+    ASSERT_TRUE(replacement);
+    const auto next = replacement->assignFrame();
+    EXPECT_GT(next.generation, frame.generation);
+}
+
+/** @test Completed byte publications are immutable; aborted appends never advance visible extents. */
+TEST(PhysicalMemoryAuthority, PagePoolExclusiveAppendPublicationLifecycle)
+{
+    const auto device = DeviceId::cpu();
+    const PhysicalPagePoolGeometry geometry{1, 16, 3, 1};
+    const auto bytes = PhysicalPagePool::physicalBytes(geometry, device);
+    PhysicalMemoryPlanBuilder builder;
+    builder.add(resource(0, device, bytes, bytes), PhysicalMemoryOwner::KVCache, bytes);
+    auto authority = std::make_shared<PhysicalMemoryAuthority>(
+        std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(builder.build()), 0);
+    auto pool = authority->createCPUPagePool(device, geometry, CPUStoragePlacement::local());
+    auto request = pool->tryAdmit(1);
+    ASSERT_TRUE(request);
+    const auto frame = request->assignFrame();
+    const std::byte first[]{std::byte{1}, std::byte{2}, std::byte{3}, std::byte{4}};
+    auto plan = request->prepareAppend(frame, 4);
+    ASSERT_TRUE(plan);
+    EXPECT_THROW(plan->commit(), std::logic_error);
+    EXPECT_THROW(request->pinFrame(frame), std::logic_error);
+    EXPECT_FALSE(request->prepareAppend(frame, 1));
+    EXPECT_THROW(plan->copyFrom(std::span(first, 3)), std::logic_error);
+    plan->copyFrom(first);
+    auto page = plan->commit();
+    EXPECT_THROW(plan->commit(), std::logic_error);
+    EXPECT_EQ(page.read().size(), 4u);
+    EXPECT_TRUE(std::equal(page.read().begin(), page.read().end(), std::begin(first)));
+    EXPECT_FALSE(request->prepareAppend(frame, 1));
+    const auto initial_version = page.version();
+    page = {};
+    auto aborted = request->prepareAppend(frame, 4);
+    ASSERT_TRUE(aborted);
+    const std::byte rejected[]{std::byte{9}, std::byte{9}, std::byte{9}, std::byte{9}};
+    aborted->copyFrom(rejected);
+    aborted.reset();
+    auto correction = request->prepareAppend(frame, 2);
+    ASSERT_TRUE(correction);
+    const std::byte suffix[]{std::byte{5}, std::byte{6}};
+    correction->copyFrom(suffix);
+    auto corrected = correction->commit();
+    EXPECT_GT(corrected.version(), initial_version + 1);
+    EXPECT_EQ(corrected.read().size(), 6u);
+    EXPECT_TRUE(std::equal(corrected.read().begin(), corrected.read().begin() + 4, std::begin(first)));
+    EXPECT_TRUE(std::equal(corrected.read().begin() + 4, corrected.read().end(), std::begin(suffix)));
+    request.reset();
+    EXPECT_FALSE(pool->tryAdmit(1));
+    EXPECT_EQ(corrected.read().size(), 6u);
+    corrected = {};
+    request = pool->tryAdmit(1);
+    ASSERT_TRUE(request);
+    const auto next_frame = request->assignFrame();
+    EXPECT_GT(next_frame.generation, frame.generation);
+    EXPECT_THROW(request->prepareAppend(frame, 1), std::logic_error);
+    auto cancelled = request->prepareAppend(next_frame, 4);
+    ASSERT_TRUE(cancelled);
+    cancelled->copyFrom(first);
+    request.reset();
+    EXPECT_THROW(cancelled->commit(), std::logic_error);
+    EXPECT_FALSE(pool->tryAdmit(1));
+    cancelled.reset();
+    EXPECT_TRUE(pool->tryAdmit(1));
+}
+
+/** @test Logical request retirement cannot reuse a frame still pinned by an original borrower. */
+TEST(PhysicalMemoryAuthority, PagePoolPrivatePinsDeferRealRetirement)
+{
+    const auto device = DeviceId::cpu();
+    const PhysicalPagePoolGeometry geometry{1, 128, 3, 1};
+    const auto bytes = PhysicalPagePool::physicalBytes(geometry, device);
+    PhysicalMemoryPlanBuilder builder;
+    builder.add(resource(0, device, bytes, bytes), PhysicalMemoryOwner::KVCache, bytes);
+    auto authority = std::make_shared<PhysicalMemoryAuthority>(
+        std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(builder.build()), 0);
+    auto pool = authority->createCPUPagePool(device, geometry, CPUStoragePlacement::local());
+    auto request = pool->tryAdmit(1);
+    ASSERT_TRUE(request);
+    const auto original = request->assignFrame();
+    auto first = request->pinFrame(original);
+    auto second = request->pinFrame(original);
+    request.reset();
+    EXPECT_FALSE(pool->tryAdmit(1));
+    first = {};
+    EXPECT_FALSE(pool->tryAdmit(1));
+    second = {};
+    auto replacement = pool->tryAdmit(1);
+    ASSERT_TRUE(replacement);
+    const auto next = replacement->assignFrame();
+    EXPECT_EQ(next.index, original.index);
+    EXPECT_GT(next.generation, original.generation);
+    EXPECT_THROW(replacement->pinFrame(original), std::logic_error);
+    auto retained = replacement->pinFrame(next);
+    replacement.reset();
+    std::weak_ptr<PhysicalPagePool> lifetime = pool;
+    pool.reset();
+    EXPECT_FALSE(lifetime.expired());
+    EXPECT_EQ(authority->claimedBytes(device, PhysicalMemoryOwner::KVCache,
+        PhysicalMemoryMaterializationKind::NewAllocation), bytes);
+    retained = {};
+    EXPECT_TRUE(lifetime.expired());
+    EXPECT_EQ(authority->claimedBytes(device, PhysicalMemoryOwner::KVCache,
+        PhysicalMemoryMaterializationKind::NewAllocation), 0u);
+}
+
+/** @test Partial multi-class admission rolls back new grants and leaves every original owner untouched. */
+TEST(PhysicalMemoryAuthority, PagePoolMultiClassAdmissionIsAtomic)
+{
+    const auto device = DeviceId::cpu();
+    const PhysicalPagePoolGeometry geometry{3, 96, 3, 3};
+    const auto bytes = PhysicalPagePool::physicalBytes(geometry, device);
+    PhysicalMemoryPlanBuilder builder;
+    builder.add(resource(0, device, 2 * bytes, 2 * bytes), PhysicalMemoryOwner::KVCache, 2 * bytes);
+    auto authority = std::make_shared<PhysicalMemoryAuthority>(
+        std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(builder.build()), 0);
+    auto main = authority->createCPUPagePool(device, geometry, CPUStoragePlacement::local());
+    auto predictor = authority->createCPUPagePool(device, geometry, CPUStoragePlacement::local());
+    auto prior = predictor->tryAdmit(2);
+    ASSERT_TRUE(prior);
+    const auto prior_frame = prior->assignFrame();
+    PhysicalPagePool::Demand demands[]{{main, 2}, {predictor, 2}};
+    std::optional<PhysicalPagePool::Grant> results[2];
+    EXPECT_FALSE(PhysicalPagePool::tryAdmitTogether(demands, results));
+    EXPECT_FALSE(results[0]);
+    EXPECT_FALSE(results[1]);
+    EXPECT_EQ(prior->assignedFrames().front(), prior_frame);
+    EXPECT_EQ(prior->remainingCommitment(), 1u);
+    // The first owner's unpublished prepare was rolled back in full.
+    auto exact = main->tryAdmit(3);
+    ASSERT_TRUE(exact);
+    exact.reset();
+    prior.reset();
+    ASSERT_TRUE(PhysicalPagePool::tryAdmitTogether(demands, results));
+    EXPECT_EQ(results[0]->remainingCommitment(), 2u);
+    EXPECT_EQ(results[1]->remainingCommitment(), 2u);
+    const auto main_frame = results[0]->assignFrame();
+    const auto predictor_frame = results[1]->assignFrame();
+    EXPECT_NE(main_frame.pool_identity, predictor_frame.pool_identity);
+    EXPECT_NE(main_frame, predictor_frame);
+    EXPECT_THROW(PhysicalPagePool::tryAdmitTogether(demands, results), std::invalid_argument);
+    results[0].reset();
+    results[1].reset();
+    demands[1].pool = main;
+    EXPECT_THROW(PhysicalPagePool::tryAdmitTogether(demands, results), std::invalid_argument);
+    EXPECT_FALSE(results[0]);
+    EXPECT_FALSE(results[1]);
+}
+
+/** @test Pool geometry and physical construction refuse invalid or one-byte-short admission atomically. */
+TEST(PhysicalMemoryAuthority, PagePoolGeometryAndConstructionRollback)
+{
+    const auto device = DeviceId::cpu();
+    for (const auto geometry : {PhysicalPagePoolGeometry{},
+        PhysicalPagePoolGeometry{1, 64, 1, 2},
+        PhysicalPagePoolGeometry{2, 0, 1, 1}})
+        EXPECT_THROW(PhysicalPagePool::physicalBytes(geometry, device), std::invalid_argument);
+    EXPECT_THROW(PhysicalPagePool::physicalBytes(
+        PhysicalPagePoolGeometry{2, std::numeric_limits<size_t>::max(), 1, 1}, device), std::overflow_error);
+    const PhysicalPagePoolGeometry geometry{3, 96, 5, 3};
+    const auto bytes = PhysicalPagePool::physicalBytes(geometry, device);
+    PhysicalMemoryPlanBuilder builder;
+    builder.add(resource(0, device, bytes, bytes), PhysicalMemoryOwner::KVCache, bytes - 1);
+    auto authority = std::make_shared<PhysicalMemoryAuthority>(
+        std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(builder.build()), 0);
+    EXPECT_THROW(authority->createCPUPagePool(device, geometry, CPUStoragePlacement::local()), std::exception);
+    EXPECT_EQ(authority->claimedBytes(device, PhysicalMemoryOwner::KVCache,
+        PhysicalMemoryMaterializationKind::NewAllocation), 0u);
 }
 
 /** @test The actual API accepts retained lvalues and rejects both mutable and const temporary plan borrows. */

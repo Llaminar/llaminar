@@ -30333,6 +30333,7 @@ add_v2_test(V2_Integration_RecurrentOnlyPipelinePrefixAdmission
 # Test: canonical topology-wide CPU/GPU admission and live allocation ledger
 add_executable(v2_test_physical_memory_authority
     unit/planning/Test__PhysicalMemoryAuthority.cpp
+    unit/planning/Test__PhysicalPagePoolReplay.cpp
     unit/planning/Test__PhysicalMemoryRankHostPool.cpp
     unit/planning/Test__NativeStoragePreparing.cpp
     unit/backends/Test__PreparedGPUWorkerThread.cpp
@@ -30345,12 +30346,47 @@ target_link_libraries(v2_test_physical_memory_authority
     llaminar2_core GTest::gtest GTest::gtest_main)
 target_include_directories(v2_test_physical_memory_authority PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR})
+# Embed small controller recordings so installed runners do not need builder source paths.
+set(PMA_TRACE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/paged_kv")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${PMA_TRACE_ROOT}/private_ownership_v1.txt"
+    "${PMA_TRACE_ROOT}/private_append_v1.txt"
+    "${PMA_TRACE_ROOT}/private_readers_v1.txt")
+file(READ "${PMA_TRACE_ROOT}/private_ownership_v1.txt" PMA_OWNERSHIP_TRACE)
+file(READ "${PMA_TRACE_ROOT}/private_append_v1.txt" PMA_APPEND_TRACE)
+file(READ "${PMA_TRACE_ROOT}/private_readers_v1.txt" PMA_READER_TRACE)
+configure_file("${PMA_TRACE_ROOT}/PhysicalPagePoolTraceData.h.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/PhysicalPagePoolTraceData.h" @ONLY)
+target_include_directories(v2_test_physical_memory_authority PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 add_v2_test(V2_Unit_PhysicalMemoryAuthority
     COMMAND $<TARGET_FILE:v2_test_physical_memory_authority>
     LABELS "V2;Unit;Planning;MemoryPlan;MemoryBudget;Regression"
     MPI_PROCS 1
     NO_MODELS
 )
+# Aggregate CPU payload ownership must not require explicit NUMA hardware admission.
+add_v2_test(V2_Integration_PreparedNativeLookupAggregateCPU
+    COMMAND $<TARGET_FILE:v2_test_physical_memory_authority>
+        --gtest_filter=PreparedNativeLookupFixture.OriginalSourceFreezeAdmitAndPayloadResetReplay
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;PhysicalMemoryAuthority;Replay;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PreparedNativeLookupAggregateCPU)
+# Initial unpublished page grants: no native KV view or serving cutover yet.
+add_v2_test(V2_Integration_PMAPagePoolUnpublishedContract
+    COMMAND $<TARGET_FILE:v2_test_physical_memory_authority>
+        --gtest_filter=PhysicalMemoryAuthority.PagePoolUnpublishedCommitmentLifecycle:PhysicalMemoryAuthority.PagePoolPrivatePinsDeferRealRetirement:PhysicalMemoryAuthority.PagePoolMultiClassAdmissionIsAtomic:PhysicalMemoryAuthority.PagePoolGeometryAndConstructionRollback:PhysicalMemoryAuthority.PagePoolExclusiveAppendPublicationLifecycle:PhysicalMemoryAuthority.PagePoolRegisteredReadersCloseBeforeRetirement
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Planning;PhysicalMemoryAuthority;Contract;Lifecycle;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PMAPagePoolUnpublishedContract)
+add_v2_test(V2_Integration_PMAPagePoolUnpublishedReplay
+    COMMAND $<TARGET_FILE:v2_test_physical_memory_authority>
+        --gtest_filter=PhysicalMemoryAuthority.PagePoolRecordedUnpublishedOwnershipReplay:PhysicalMemoryAuthority.PagePoolReplayRejectsIncompleteInitialState
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Planning;PhysicalMemoryAuthority;Replay;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PMAPagePoolUnpublishedReplay)
 # Shared CPU+integrated-GPU pool (GB10/APU) joint admission; device-free preflight.
 add_v2_test(V2_Integration_PhysicalMemoryRankHostPool
     COMMAND $<TARGET_FILE:v2_test_physical_memory_authority>

@@ -1,0 +1,490 @@
+/**
+ * @file PhysicalPagePool.cpp
+ * @brief Materialize exact PMA page roots and convert fungible growth into private frames.
+ *
+ * Refusal precedes mutation. All arrays are bounded and materialized at setup;
+ * assignment and rollback allocate nothing. No frame is published to a native
+ * consumer in this initial slice, so rollback cannot race a submitted reader.
+ */
+#include "PhysicalPagePool.h"
+#include <atomic>
+#include <cstring>
+#include <limits>
+#include <stdexcept>
+#include <utility>
+
+namespace llaminar2
+{
+namespace
+{
+/** @brief Issue immutable setup identity; failed construction never recycles an incarnation. */
+std::uint64_t issuePoolIdentity()
+{
+    static std::atomic<std::uint64_t> next{1};
+    auto value = next.load(std::memory_order_relaxed);
+    for (;;)
+    {
+        if (value == std::numeric_limits<std::uint64_t>::max())
+            throw std::overflow_error("Physical page pool identity exhausted");
+        if (next.compare_exchange_weak(value, value + 1, std::memory_order_relaxed))
+            return value;
+    }
+}
+}
+
+void PhysicalPagePoolGeometry::validate() const
+{
+    if (!frames || !frame_bytes || !request_records || !max_pages_per_request ||
+        max_pages_per_request > frames)
+        throw std::invalid_argument("Page pool requires positive exact geometry within frame capacity");
+    if (frames > std::numeric_limits<std::size_t>::max() / frame_bytes ||
+        request_records > std::numeric_limits<std::size_t>::max() / max_pages_per_request)
+        throw std::overflow_error("Page pool physical or table geometry overflows");
+}
+
+std::size_t PhysicalPagePool::physicalBytes(PhysicalPagePoolGeometry g, DeviceId device, CPUStoragePlacement p)
+{
+    g.validate();
+    std::size_t result = 0;
+    const auto add = [&](std::size_t bytes) {
+        if (bytes > std::numeric_limits<std::size_t>::max() - result)
+            throw std::overflow_error("Page pool physical BOM overflows");
+        result += bytes;
+    };
+    add(CPUStorageRoot<std::byte>(g.frames * g.frame_bytes, PhysicalMemoryOwner::KVCache, device, p).physicalBytes());
+    add(CPUStorageRoot<Frame>(g.frames, PhysicalMemoryOwner::KVCache, device, p).physicalBytes());
+    add(CPUStorageRoot<Request>(g.request_records, PhysicalMemoryOwner::KVCache, device, p).physicalBytes());
+    add(CPUStorageRoot<FrameHandle>(g.request_records * g.max_pages_per_request, PhysicalMemoryOwner::KVCache, device, p).physicalBytes());
+    return result;
+}
+
+PhysicalPagePool::PhysicalPagePool(std::shared_ptr<PhysicalMemoryAuthority> authority, DeviceId device,
+    PhysicalPagePoolGeometry geometry, CPUStoragePlacement placement, std::uint64_t pool_identity)
+    : authority_(authority), pool_identity_(pool_identity), geometry_(geometry)
+{
+    (void)physicalBytes(geometry, device, placement);
+    backing_ = CPUStorageRoot<std::byte>(geometry.frames * geometry.frame_bytes,
+        PhysicalMemoryOwner::KVCache, device, placement).allocate(authority);
+    frames_ = CPUStorageRoot<Frame>(geometry.frames, PhysicalMemoryOwner::KVCache, device, placement).allocate(authority);
+    requests_ = CPUStorageRoot<Request>(geometry.request_records, PhysicalMemoryOwner::KVCache, device, placement).allocate(authority);
+    request_frames_ = CPUStorageRoot<FrameHandle>(geometry.request_records * geometry.max_pages_per_request,
+        PhysicalMemoryOwner::KVCache, device, placement).allocate(authority);
+}
+
+std::shared_ptr<PhysicalPagePool> PhysicalMemoryAuthority::createCPUPagePool(DeviceId device,
+    PhysicalPagePoolGeometry geometry, const CPUStoragePlacement &placement)
+{
+    if (!device.is_cpu() || !contains(device))
+        throw std::invalid_argument("CPU page pool requires an original admitted local CPU allocator");
+    return std::shared_ptr<PhysicalPagePool>(new PhysicalPagePool(shared_from_this(), device, geometry, placement, issuePoolIdentity()));
+}
+
+bool PhysicalPagePool::tryAdmitTogether(std::span<const Demand> demands,
+    std::span<std::optional<Grant>> results)
+{
+    if (demands.empty() || demands.size() != results.size())
+        throw std::invalid_argument("Page transaction requires exact nonempty demand/output geometry");
+    // Validate every original input before issuing a grant or touching output.
+    for (std::size_t i = 0; i < demands.size(); ++i)
+    {
+        const auto &demand = demands[i];
+        if (results[i] || !demand.pool || !demand.pages ||
+            demand.pages > demand.pool->geometry_.max_pages_per_request ||
+            demand.pool->authority_ != demands.front().pool->authority_)
+            throw std::invalid_argument("Page transaction has nonempty output, invalid demand or foreign PMA");
+        for (std::size_t prior = 0; prior < i; ++prior)
+            if (demand.pool == demands[prior].pool)
+                throw std::invalid_argument("Page transaction repeats a storage owner instead of a combined demand");
+    }
+    // CPU authority is single runner-thread owned. No published views or
+    // native consumers exist in this interface; partial grants are invisible
+    // until this call returns, and their RAII rollback preserves old owners.
+    try
+    {
+        for (std::size_t i = 0; i < demands.size(); ++i)
+        {
+            results[i] = demands[i].pool->tryAdmit(demands[i].pages);
+            if (!results[i])
+            {
+                for (auto &result : results) result.reset();
+                return false;
+            }
+        }
+    }
+    catch (...)
+    {
+        for (auto &result : results) result.reset();
+        throw;
+    }
+    return true;
+}
+
+std::optional<PhysicalPagePool::Grant> PhysicalPagePool::tryAdmit(std::size_t pages)
+{
+    if (!pages || pages > geometry_.max_pages_per_request)
+        throw std::invalid_argument("Page commitment is outside the declared per-request bound");
+    if (pages > geometry_.frames - protected_pages_)
+        return std::nullopt;
+    for (std::size_t i = 0; i < requests_.size(); ++i)
+    {
+        auto &request = requests_[i];
+        if (request.live) continue;
+        if (request.generation == std::numeric_limits<std::uint64_t>::max())
+            throw std::overflow_error("Page grant generation exhausted");
+        // Acquire retained ownership before mutating the request record.
+        auto self = shared_from_this();
+        ++request.generation;
+        request.remaining = pages;
+        request.assigned = 0;
+        request.live = true;
+        protected_pages_ += pages;
+        return Grant(std::move(self), i, request.generation);
+    }
+    return std::nullopt;
+}
+
+const PhysicalPagePool::Request &PhysicalPagePool::require(const Grant &grant) const
+{
+    if (grant.pool_.get() != this || grant.record_ >= requests_.size())
+        throw std::logic_error("Page grant belongs to another authority");
+    const auto &request = requests_[grant.record_];
+    if (!request.live || request.generation != grant.generation_)
+        throw std::logic_error("Page grant is stale or retired");
+    return request;
+}
+
+PhysicalPagePool::FrameHandle PhysicalPagePool::assign(const Grant &grant)
+{
+    const auto &original = require(grant);
+    if (!original.remaining)
+        throw std::logic_error("Page assignment exceeds the protected completion commitment");
+    for (std::size_t i = 0; i < frames_.size(); ++i)
+    {
+        auto &frame = frames_[i];
+        if (frame.owned) continue;
+        if (frame.generation == std::numeric_limits<std::uint64_t>::max())
+            throw std::overflow_error("Physical page incarnation exhausted");
+        auto &request = requests_[grant.record_];
+        ++frame.generation;
+        frame.record = grant.record_;
+        frame.valid_bytes = 0;
+        frame.committed_version = 0;
+        frame.readers_closed = false;
+        frame.owned = true;
+        const FrameHandle handle{pool_identity_, i, frame.generation};
+        request_frames_[grant.record_ * geometry_.max_pages_per_request + request.assigned] = handle;
+        ++request.assigned;
+        --request.remaining;
+        return handle;
+    }
+    throw std::logic_error("Protected page growth has no free physical frame");
+}
+
+void PhysicalPagePool::release(const Grant &grant) noexcept
+{
+    try
+    {
+        const auto &request = require(grant);
+        for (const auto &handle : grant.assignedFrames())
+        {
+            auto &frame = frames_[handle.index];
+            if (handle.pool_identity != pool_identity_ || !frame.owned ||
+                frame.record != grant.record_ || frame.generation != handle.generation)
+                std::terminate();
+            if (frame.pins)
+                frame.retiring = true;
+            else
+            {
+                frame.owned = false;
+                --protected_pages_;
+            }
+        }
+        protected_pages_ -= request.remaining;
+        requests_[grant.record_].live = false;
+    }
+    catch (...) { std::terminate(); }
+}
+
+PhysicalPagePool::FramePin PhysicalPagePool::pin(const Grant &grant, FrameHandle handle)
+{
+    (void)require(grant);
+    if (handle.pool_identity != pool_identity_ || handle.index >= frames_.size())
+        throw std::logic_error("Private frame pin belongs to a foreign pool");
+    auto &frame = frames_[handle.index];
+    if (!frame.owned || frame.retiring || frame.writer || frame.record != grant.record_ || frame.generation != handle.generation)
+        throw std::logic_error("Private frame pin is stale, retiring or owned by another request");
+    if (frame.pins == std::numeric_limits<std::size_t>::max())
+        throw std::overflow_error("Private frame pin count exhausted");
+    auto self = shared_from_this();
+    ++frame.pins;
+    return FramePin(std::move(self), handle);
+}
+
+void PhysicalPagePool::unpin(FrameHandle handle) noexcept
+{
+    if (handle.pool_identity != pool_identity_ || handle.index >= frames_.size())
+        std::terminate();
+    auto &frame = frames_[handle.index];
+    if (!frame.owned || frame.generation != handle.generation || !frame.pins)
+        std::terminate();
+    --frame.pins;
+    if (!frame.pins && frame.retiring)
+    {
+        frame.owned = false;
+        frame.retiring = false;
+        --protected_pages_;
+    }
+}
+
+PhysicalPagePool::Frame &PhysicalPagePool::requireFrame(FrameHandle handle)
+{
+    if (handle.pool_identity != pool_identity_ || handle.index >= frames_.size())
+        throw std::logic_error("Page access has a foreign pool or frame");
+    auto &frame = frames_[handle.index];
+    if (!frame.owned || frame.generation != handle.generation)
+        throw std::logic_error("Page access has a stale frame incarnation");
+    return frame;
+}
+
+std::optional<PhysicalPagePool::AppendPlan> PhysicalPagePool::prepareAppend(
+    const Grant &grant, FrameHandle handle, std::size_t bytes)
+{
+    (void)require(grant);
+    auto &frame = requireFrame(handle);
+    if (frame.record != grant.record_ || frame.retiring || !bytes || bytes > geometry_.frame_bytes - frame.valid_bytes)
+        throw std::invalid_argument("Page append lacks private ownership or exceeds its exact writable extent");
+    if (frame.writer || frame.pins) return std::nullopt;
+    if (frame.next_content_version == std::numeric_limits<std::uint64_t>::max())
+        throw std::overflow_error("Page content version exhausted");
+    auto self = shared_from_this();
+    ++frame.next_content_version;
+    frame.writer = true;
+    frame.readers_closed = true;
+    frame.pins = 1;
+    return AppendPlan(std::move(self), handle, frame.next_content_version, frame.valid_bytes, bytes);
+}
+
+PhysicalPagePool::AppendPlan::AppendPlan(std::shared_ptr<PhysicalPagePool> pool, FrameHandle handle,
+    std::uint64_t version, std::size_t start, std::size_t count)
+    : pool_(std::move(pool)), handle_(handle), version_(version), start_(start), count_(count) {}
+PhysicalPagePool::AppendPlan::~AppendPlan() { release(); }
+PhysicalPagePool::AppendPlan::AppendPlan(AppendPlan &&other) noexcept
+    : pool_(std::move(other.pool_)), handle_(other.handle_), version_(other.version_),
+      start_(other.start_), count_(other.count_), copied_(other.copied_) {}
+PhysicalPagePool::AppendPlan &PhysicalPagePool::AppendPlan::operator=(AppendPlan &&other) noexcept
+{
+    if (this != &other)
+    {
+        release();
+        pool_ = std::move(other.pool_); handle_ = other.handle_; version_ = other.version_;
+        start_ = other.start_; count_ = other.count_; copied_ = other.copied_;
+    }
+    return *this;
+}
+void PhysicalPagePool::AppendPlan::copyFrom(std::span<const std::byte> source)
+{
+    if (!pool_ || copied_ || source.size() != count_)
+        throw std::logic_error("Page append copy requires one complete original write extent");
+    const auto &frame = pool_->requireFrame(handle_);
+    if (!frame.writer || frame.retiring || frame.next_content_version != version_)
+        throw std::logic_error("Page append copy has revoked or obsolete write ownership");
+    std::memcpy(pool_->backing_.data() + handle_.index * pool_->geometry_.frame_bytes + start_, source.data(), count_);
+    copied_ = true;
+}
+PhysicalPagePool::CommittedPage PhysicalPagePool::AppendPlan::commit()
+{
+    if (!pool_ || !copied_)
+        throw std::logic_error("Page publication requires a completed original CPU write");
+    auto &frame = pool_->requireFrame(handle_);
+    if (!frame.writer || frame.retiring || frame.next_content_version != version_ || frame.valid_bytes != start_)
+        throw std::logic_error("Page publication has revoked or obsolete write ownership");
+    frame.valid_bytes = start_ + count_;
+    frame.committed_version = version_;
+    frame.writer = false;
+    frame.readers_closed = false;
+    // Transfer the plan's pin, without an unowned interval, to the publication.
+    return CommittedPage(std::move(pool_), handle_, version_, start_ + count_);
+}
+void PhysicalPagePool::AppendPlan::release() noexcept
+{
+    if (!pool_) return;
+    auto &frame = pool_->frames_[handle_.index];
+    if (!frame.writer || frame.generation != handle_.generation || frame.next_content_version != version_)
+        std::terminate();
+    frame.writer = false;
+    pool_->unpin(handle_);
+    pool_.reset();
+}
+
+PhysicalPagePool::ReadAccess PhysicalPagePool::registerRead(const CommittedPage &page)
+{
+    auto &frame = requireFrame(page.handle_);
+    if (frame.retiring || frame.readers_closed || frame.writer ||
+        frame.committed_version != page.version_ || frame.valid_bytes != page.bytes_)
+        throw std::logic_error("Page reader registration uses a closed, retiring or obsolete publication");
+    if (frame.pins == std::numeric_limits<std::size_t>::max())
+        throw std::overflow_error("Page reader registration count exhausted");
+    auto self = shared_from_this();
+    ++frame.pins;
+    return ReadAccess(std::move(self), page.handle_, page.version_, page.bytes_);
+}
+
+PhysicalPagePool::ReadAccess::ReadAccess(std::shared_ptr<PhysicalPagePool> pool, FrameHandle handle,
+    std::uint64_t version, std::size_t bytes)
+    : pool_(std::move(pool)), handle_(handle), version_(version), bytes_(bytes) {}
+PhysicalPagePool::ReadAccess::~ReadAccess() { release(); }
+PhysicalPagePool::ReadAccess::ReadAccess(ReadAccess &&other) noexcept
+    : pool_(std::move(other.pool_)), handle_(other.handle_), version_(other.version_),
+      bytes_(other.bytes_), phase_(other.phase_) {}
+PhysicalPagePool::ReadAccess &PhysicalPagePool::ReadAccess::operator=(ReadAccess &&other) noexcept
+{
+    if (this != &other)
+    {
+        release();
+        pool_ = std::move(other.pool_); handle_ = other.handle_; version_ = other.version_;
+        bytes_ = other.bytes_; phase_ = other.phase_;
+    }
+    return *this;
+}
+std::span<const std::byte> PhysicalPagePool::ReadAccess::beginCPU()
+{
+    if (!pool_ || phase_ != Phase::Registered)
+        throw std::logic_error("CPU page access must begin from its original registered lease");
+    const auto &frame = pool_->requireFrame(handle_);
+    if (frame.writer || frame.committed_version != version_ || frame.valid_bytes != bytes_)
+        throw std::logic_error("Registered CPU page reader lost its immutable content");
+    // Closure/retirement rejects new readers, never an already registered one.
+    phase_ = Phase::Executing;
+    return {pool_->backing_.data() + handle_.index * pool_->geometry_.frame_bytes, bytes_};
+}
+void PhysicalPagePool::ReadAccess::completeCPU()
+{
+    if (!pool_ || phase_ != Phase::Executing)
+        throw std::logic_error("CPU page completion has no original executing consumer");
+    phase_ = Phase::Completed;
+    pool_->unpin(handle_);
+    pool_.reset();
+}
+void PhysicalPagePool::ReadAccess::release() noexcept
+{
+    if (!pool_) return;
+    // Destruction may cancel a not-yet-submitted registration. It is never
+    // evidence that executing work completed: losing that owner fails fatally.
+    if (phase_ == Phase::Executing) std::terminate();
+    pool_->unpin(handle_);
+    pool_.reset();
+}
+
+PhysicalPagePool::CommittedPage::CommittedPage(std::shared_ptr<PhysicalPagePool> pool, FrameHandle handle,
+    std::uint64_t version, std::size_t bytes)
+    : pool_(std::move(pool)), handle_(handle), version_(version), bytes_(bytes) {}
+PhysicalPagePool::CommittedPage::~CommittedPage() { release(); }
+PhysicalPagePool::CommittedPage::CommittedPage(CommittedPage &&other) noexcept
+    : pool_(std::move(other.pool_)), handle_(other.handle_), version_(other.version_), bytes_(other.bytes_) {}
+PhysicalPagePool::CommittedPage &PhysicalPagePool::CommittedPage::operator=(CommittedPage &&other) noexcept
+{
+    if (this != &other)
+    {
+        release();
+        pool_ = std::move(other.pool_); handle_ = other.handle_; version_ = other.version_; bytes_ = other.bytes_;
+    }
+    return *this;
+}
+std::span<const std::byte> PhysicalPagePool::CommittedPage::read() const
+{
+    if (!pool_) throw std::logic_error("Page read uses an empty publication");
+    const auto &frame = pool_->requireFrame(handle_);
+    if (frame.writer || frame.committed_version != version_ || frame.valid_bytes != bytes_)
+        throw std::logic_error("Page read uses an incomplete or obsolete content publication");
+    return {pool_->backing_.data() + handle_.index * pool_->geometry_.frame_bytes, bytes_};
+}
+PhysicalPagePool::ReadAccess PhysicalPagePool::CommittedPage::registerRead() const
+{
+    if (!pool_) throw std::logic_error("Page registration uses an empty publication");
+    return pool_->registerRead(*this);
+}
+
+void PhysicalPagePool::CommittedPage::release() noexcept
+{
+    if (pool_) { pool_->unpin(handle_); pool_.reset(); }
+}
+
+PhysicalPagePool::FramePin::FramePin(std::shared_ptr<PhysicalPagePool> pool, FrameHandle handle)
+    : pool_(std::move(pool)), handle_(handle) {}
+PhysicalPagePool::FramePin::~FramePin() { release(); }
+PhysicalPagePool::FramePin::FramePin(FramePin &&other) noexcept
+    : pool_(std::move(other.pool_)), handle_(other.handle_) {}
+PhysicalPagePool::FramePin &PhysicalPagePool::FramePin::operator=(FramePin &&other) noexcept
+{
+    if (this != &other)
+    {
+        release();
+        pool_ = std::move(other.pool_);
+        handle_ = other.handle_;
+    }
+    return *this;
+}
+void PhysicalPagePool::FramePin::release() noexcept
+{
+    if (pool_) { pool_->unpin(handle_); pool_.reset(); }
+}
+
+PhysicalPagePool::Grant::Grant(std::shared_ptr<PhysicalPagePool> pool, std::size_t record, std::uint64_t generation)
+    : pool_(std::move(pool)), record_(record), generation_(generation) {}
+PhysicalPagePool::Grant::~Grant() { release(); }
+PhysicalPagePool::Grant::Grant(Grant &&other) noexcept
+    : pool_(std::move(other.pool_)), record_(other.record_), generation_(other.generation_) {}
+PhysicalPagePool::Grant &PhysicalPagePool::Grant::operator=(Grant &&other) noexcept
+{
+    if (this != &other)
+    {
+        release();
+        pool_ = std::move(other.pool_);
+        record_ = other.record_;
+        generation_ = other.generation_;
+    }
+    return *this;
+}
+void PhysicalPagePool::Grant::release() noexcept
+{
+    if (pool_) { pool_->release(*this); pool_.reset(); }
+}
+PhysicalPagePool::FrameHandle PhysicalPagePool::Grant::assignFrame()
+{
+    if (!pool_) throw std::logic_error("Page assignment uses an empty grant");
+    return pool_->assign(*this);
+}
+PhysicalPagePool::FramePin PhysicalPagePool::Grant::pinFrame(FrameHandle handle)
+{
+    if (!pool_) throw std::logic_error("Private frame pin uses an empty grant");
+    return pool_->pin(*this, handle);
+}
+
+std::optional<PhysicalPagePool::AppendPlan> PhysicalPagePool::Grant::prepareAppend(FrameHandle handle, std::size_t bytes)
+{
+    if (!pool_) throw std::logic_error("Page append uses an empty grant");
+    return pool_->prepareAppend(*this, handle, bytes);
+}
+
+void PhysicalPagePool::Grant::closeReaders(FrameHandle handle)
+{
+    if (!pool_) throw std::logic_error("Page closure uses an empty grant");
+    (void)pool_->require(*this);
+    auto &frame = pool_->requireFrame(handle);
+    if (frame.record != record_ || frame.retiring || frame.writer)
+        throw std::logic_error("Page closure has no original private owner");
+    frame.readers_closed = true;
+}
+
+std::span<const PhysicalPagePool::FrameHandle> PhysicalPagePool::Grant::assignedFrames() const
+{
+    if (!pool_) throw std::logic_error("Page view uses an empty grant");
+    const auto &request = pool_->require(*this);
+    return {pool_->request_frames_.data() + record_ * pool_->geometry_.max_pages_per_request, request.assigned};
+}
+std::size_t PhysicalPagePool::Grant::remainingCommitment() const
+{
+    if (!pool_) throw std::logic_error("Page commitment uses an empty grant");
+    return pool_->require(*this).remaining;
+}
+}

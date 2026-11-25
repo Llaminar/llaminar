@@ -1,0 +1,18 @@
+pma-private-pages-v1 3 128 4 3 empty-zero-generations
+admit A 2 | accepted
+assign A | 0:1
+pin P A 0 | pinned
+admit B 1 | accepted
+assign B | 1:1
+admit C 1 | refused
+drop-request A | retired
+admit C 1 | accepted
+assign C | 2:1
+admit D 1 | refused
+drop-pin P | released
+admit D 1 | accepted
+assign D | 0:2
+drop-request B | retired
+drop-request C | retired
+drop-request D | retired
+end | idle

@@ -1,7 +1,10 @@
 /** @file Test__PreparedNativeLookupFixture.cpp
  * @brief Device-free actual source acquisition/freeze/admission with original mapped worker and payload roots.
+ *
+ * The payload contract uses aggregate CPU allocator identity, not an explicit
+ * NUMA placement. Kernel NUMA availability must not prevent this ownership
+ * replay; hardware placement contracts retain their separate native tests.
  */
-#include "../../utils/HostNUMANodes.h"
 #include "fixtures/backends/PreparedNativeLookupFixtureReplayAccess.h"
 #include "fixtures/backends/NativeLookupCaseAdmission.h"
 #include "mocks/MockWorkerGPUContext.h"
@@ -19,7 +22,7 @@ private:PreparedGPUWorkerThread thread_;
 }
 /** @test Original source and physical CPU payload remain on the same authority through actual admission. */
 TEST(PreparedNativeLookupFixture, OriginalSourceFreezeAdmitAndPayloadResetReplay){
-    if(!hasCPUBackend())initCPUBackend(llaminar2::test::hostLastNUMANode());
+    if(!hasCPUBackend())initCPUBackend(-1);
     using Source=NativeContextPreparationReplayAccess;using Fixture=PreparedNativeLookupFixtureReplayAccess;
     for(const auto device:{DeviceId::cuda(49),DeviceId::rocm(49)}){
         testing::installHardwareFreeGPUContextFactories();

@@ -66,6 +66,30 @@ Migration inspection starts from `feat/continuous-batching` commit
 whole-tree milestone. Concurrent implementation work must be preserved and
 inventoried separately before integration.
 
+### Current private implementation checkpoint
+
+The [P0 migration inventory](paged_kv_migration_inventory_20261125.md) and
+[authority transition draft](paged_kv_authority_transitions_20261125.md) track
+new source work and independent PKV-01–09 findings. P0 and P1 exits remain open.
+In particular, the proposed pressure policy is not unconditionally adopted;
+the owner referred the choice to the existing reviewer, whose bounded-pressure
+safe-order recommendation remains a recommendation pending owner resolution.
+No default output cap or overcommit policy has been installed.
+
+A private PMA-issued CPU prototype materializes page backing/metadata, protects
+fungible explicitly supplied commitments, issues frame incarnations, rolls back
+multi-class prepares, and pins retirement through exclusive CPU byte writes,
+completed byte publications and registered CPU consumers. It is not wired to
+KV kernels, page tables, serving admission, prefix sharing or GPU execution.
+These interfaces are an implementation checkpoint, not the frozen P1 ABI.
+
+The complete PMA Unit registration (147 tests) and three focused preflight
+registrations pass in `CB-checkpoints/paged-p1-foundation-checkpoint.ZmLTUE`.
+Small native-recorded ownership/append/registered-reader traces are retained and
+embedded into the test binary for compiler/source-free runners. Earlier failures
+remain preserved. This is not complete Unit/preflight or independent P1
+acceptance, numerical model qualification or measured serving economy.
+
 ### 3.1 Useful existing structure
 
 - `OrchestrationRunner` owns `ServingSession`; `IServingRowExecutor` connects
