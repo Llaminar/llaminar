@@ -661,6 +661,19 @@ namespace llaminar2
 
         std::string lastError() const override { return error_; }
 
+        /** @brief Publish the runner's stage timeline on its owning (driver) thread. */
+        void flushStageTimeline() override
+        {
+            try
+            {
+                driver_.call([](IOrchestrationRunner &runner) { runner.flushStageTimeline(); });
+            }
+            catch (const std::exception &error)
+            {
+                LOG_WARN("[ServingBatchDriver] stage timeline not published: " << error.what());
+            }
+        }
+
         /** @brief Prefix reuse of this request (serving rows recompute >= 1 token). */
         RequestRuntimeSummary requestRuntimeSummary() const override
         {

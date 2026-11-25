@@ -4,6 +4,7 @@
  */
 
 #include "execution/serving/ServingSession.h"
+#include "utils/PerfStatsCollector.h"
 
 #include <algorithm>
 #include <random>
@@ -159,6 +160,7 @@ namespace llaminar2
         // Fail every resident and queued request exactly once, reset what can
         // be reset, and admit nothing more.
         failure_ = reason;
+        PerfStatsCollector::addCounter("serving", "seals", 1.0, "serving_rows", "cpu");
         auto fail = [&](std::uint64_t id, int prompt_tokens, int completion_tokens) {
             ServingBatchEvent event;
             event.id = id;
@@ -190,6 +192,7 @@ namespace llaminar2
         std::vector<ServingBatchEvent> events;
         if (!active_)
             return events;
+        PerfStatsCollector::addCounter("serving", "steps", 1.0, "serving_rows", "cpu");
 
         // Per-request output of this step, merged into one event per request.
         std::map<std::uint64_t, ServingBatchEvent> step_events;
@@ -288,6 +291,7 @@ namespace llaminar2
             row.cached_prompt_tokens = restored;
             if (recorder_)
                 recorder_->admitted(row.request, slot, restored);
+            PerfStatsCollector::addCounter("serving", "row_admissions", 1.0, "serving_rows", "cpu");
             slot_busy_[static_cast<std::size_t>(slot)] = true;
             rows_.push_back(std::move(row));
         }
@@ -395,7 +399,7 @@ namespace llaminar2
             // else blocked: waiting for a grant or a forced token
         }
 
-        auto run_forward = [&](const std::vector<Work> &work) -> bool {
+        auto run_forward = [&](const std::vector<Work> &work, const char *kind) -> bool {
             if (work.empty())
                 return true;
             std::vector<int> slots;
@@ -409,6 +413,11 @@ namespace llaminar2
             }
             if (!executor_.forwardServingRows(slots, rows))
                 return false;
+            // PerfStats proof the serving-row path ran: one count per shared
+            // forward and its live rows (decode rows are width one).
+            PerfStatsCollector::addCounter("serving", kind, 1.0, "serving_rows", "cpu");
+            PerfStatsCollector::addCounter("serving", "forward_rows", static_cast<double>(rows.size()),
+                                           "serving_rows", "cpu");
             if (recorder_)
             {
                 std::vector<const float *> row_logits;
@@ -454,7 +463,7 @@ namespace llaminar2
             return true;
         };
 
-        if (!run_forward(decode_work) || !run_forward(prefill_work))
+        if (!run_forward(decode_work, "decode_forwards") || !run_forward(prefill_work, "prefill_forwards"))
         {
             // A failed shared forward leaves every resident slot's state
             // unknown: fail all resident and queued requests and seal.
@@ -480,6 +489,7 @@ namespace llaminar2
                 reset_failure = "Serving slot " + std::to_string(row.slot) + " could not be reset";
             slot_busy_[static_cast<std::size_t>(row.slot)] = false;
             rows_.erase(rows_.begin() + static_cast<std::ptrdiff_t>(r));
+            PerfStatsCollector::addCounter("serving", "row_retirements", 1.0, "serving_rows", "cpu");
         }
         if (!reset_failure.empty())
         {

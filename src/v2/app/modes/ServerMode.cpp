@@ -1071,6 +1071,13 @@ namespace llaminar2
             flushPerfStatsFromEnv();
             return 1;
         }
+        PerfStatsCollector::addCounter("server", "serving_path", 1.0, "startup", {},
+                                       {{"path", serving_rows ? "serving_rows" : "serialized"},
+                                        {"resident_slots", std::to_string(batch_capacity)}});
+        if (!serving_rows)
+            LOG_INFO("Serving path: serialized executor (" << (mpi_coordinated ? std::string("multi-rank")
+                                                                              : runner->servingBatchUnsupportedReason())
+                                                           << ")");
         std::optional<SerializedInferenceExecutor> serialized_executor;
         std::unique_ptr<ServingResponseLeasePool> response_leases;
         if (serving_rows)
