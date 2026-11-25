@@ -26794,6 +26794,7 @@ bool OrchestrationRunner::publishPhysicalMemoryAuthority()
             {
                 return runner_.harvestServingRowPrefix(slot, admission, prompt);
             }
+            std::string servingRowError() const override { return runner_.servingRowError(); }
 
         private:
             IInferenceRunner &runner_;

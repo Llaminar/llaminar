@@ -61546,17 +61546,19 @@ namespace llaminar2
         const std::vector<int> &slots,
         const std::vector<std::vector<int>> &rows)
     {
-        if (!supportsServingRows())
-        {
-            LOG_ERROR("[DeviceGraphOrchestrator] Serving rows are unsupported on this runner");
+        serving_row_error_.clear();
+        auto fail = [&](const std::string &reason) {
+            serving_row_error_ = reason;
+            LOG_ERROR("[DeviceGraphOrchestrator] " << reason);
             return false;
-        }
+        };
+        if (!supportsServingRows())
+            return fail("Serving rows are unsupported on this runner: " + servingRowsUnsupportedReason());
         if (rows.empty() || rows.size() != slots.size() ||
             static_cast<int>(rows.size()) > state_.batch_size)
         {
-            LOG_ERROR("[DeviceGraphOrchestrator] Serving rows " << rows.size()
-                                                               << " outside capacity " << state_.batch_size);
-            return false;
+            return fail("Serving rows " + std::to_string(rows.size()) + " outside capacity " +
+                        std::to_string(state_.batch_size));
         }
         serving_slot_positions_.resize(static_cast<size_t>(state_.batch_size), 0);
         std::vector<bool> used(static_cast<size_t>(state_.batch_size), false);
@@ -61568,9 +61570,8 @@ namespace llaminar2
                 serving_slot_positions_[static_cast<size_t>(slot)] +
                         static_cast<int>(rows[row].size()) > state_.max_seq_len)
             {
-                LOG_ERROR("[DeviceGraphOrchestrator] Serving row " << row << " (slot " << slot
-                                                                  << ") is invalid or exceeds the context");
-                return false;
+                return fail("Serving row " + std::to_string(row) + " (slot " + std::to_string(slot) +
+                            ") is invalid or exceeds the context");
             }
             used[static_cast<size_t>(slot)] = true;
         }
@@ -61592,8 +61593,7 @@ namespace llaminar2
             !setComputeRowIndexedAllPositionLogits(true, row_count) ||
             !graph_builder_->setRowIndexedAllPositionLogitRows(terminal_rows))
         {
-            LOG_ERROR("[DeviceGraphOrchestrator] Serving rows could not select terminal logits rows");
-            return false;
+            return fail("Serving rows could not select terminal logits rows");
         }
         request_batched_prefill_logits_row_count_ = row_count;
 
@@ -61614,6 +61614,8 @@ namespace llaminar2
         setComputeAllPositionLogits(false);
         request_batched_prefill_logits_row_count_ = 0;
         serving_logits_rows_ = ok ? row_count : 0;
+        if (!ok)
+            serving_row_error_ = "Serving forward failed in the graph executor (see the preceding error)";
         if (ok)
             for (size_t row = 0; row < rows.size(); ++row)
                 serving_slot_positions_[static_cast<size_t>(slots[row])] +=

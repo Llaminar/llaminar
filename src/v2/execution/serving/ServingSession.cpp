@@ -124,6 +124,8 @@ namespace llaminar2
 
     void ServingSession::end()
     {
+        // Closing retires every slot; the next begin() resets all slots again
+        // and fails if any reset fails, so no stale state can be admitted.
         for (const auto &row : rows_)
             (void)executor_.resetServingRow(row.slot);
         rows_.clear();
@@ -137,6 +139,38 @@ namespace llaminar2
         failure_.clear();
         decision_logits_.clear();
         decision_logits_.shrink_to_fit();
+    }
+
+    std::vector<ServingBatchEvent> ServingSession::sealAll(const std::string &reason,
+                                                           std::vector<ServingBatchEvent> events)
+    {
+        // Fail every resident and queued request exactly once, reset what can
+        // be reset, and admit nothing more.
+        failure_ = reason;
+        auto fail = [&](std::uint64_t id, int prompt_tokens, int completion_tokens) {
+            ServingBatchEvent event;
+            event.id = id;
+            event.finish = ServingFinishReason::Error;
+            event.error = failure_;
+            event.prompt_tokens = prompt_tokens;
+            event.completion_tokens = completion_tokens;
+            events.push_back(std::move(event));
+        };
+        for (const auto &row : rows_)
+        {
+            fail(row.request.id, static_cast<int>(row.request.prompt.size()), row.completion_tokens);
+            (void)executor_.resetServingRow(row.slot);
+        }
+        for (const auto &queued : queue_)
+            fail(queued.id, static_cast<int>(queued.prompt.size()), 0);
+        rows_.clear();
+        queue_.clear();
+        pending_grants_.clear();
+        pending_forced_.clear();
+        std::fill(slot_busy_.begin(), slot_busy_.end(), false);
+        if (recorder_)
+            recorder_->stepped(events);
+        return events;
     }
 
     std::vector<ServingBatchEvent> ServingSession::step()
@@ -231,7 +265,9 @@ namespace llaminar2
                 event.error = "Serving prefix restore failed";
                 event.prompt_tokens = static_cast<int>(row.request.prompt.size());
                 events.push_back(std::move(event));
-                (void)executor_.resetServingRow(slot);
+                if (!executor_.resetServingRow(slot))
+                    return sealAll("Serving slot " + std::to_string(slot) +
+                                   " could not be reset after a failed prefix restore", events);
                 --slot; // the slot is still free for the next queued request
                 continue;
             }
@@ -409,33 +445,9 @@ namespace llaminar2
         if (!run_forward(decode_work) || !run_forward(prefill_work))
         {
             // A failed shared forward leaves every resident slot's state
-            // unknown: fail all resident and queued requests and seal the
-            // session so nothing is admitted onto the failed runner state.
+            // unknown: fail all resident and queued requests and seal.
             const auto detail = executor_.servingRowError();
-            failure_ = detail.empty() ? std::string("Serving forward failed") : detail;
-            auto fail = [&](std::uint64_t id, int prompt_tokens, int completion_tokens) {
-                ServingBatchEvent event;
-                event.id = id;
-                event.finish = ServingFinishReason::Error;
-                event.error = failure_;
-                event.prompt_tokens = prompt_tokens;
-                event.completion_tokens = completion_tokens;
-                events.push_back(std::move(event));
-            };
-            for (const auto &row : rows_)
-            {
-                fail(row.request.id, static_cast<int>(row.request.prompt.size()), row.completion_tokens);
-                (void)executor_.resetServingRow(row.slot);
-            }
-            for (const auto &queued : queue_)
-                fail(queued.id, static_cast<int>(queued.prompt.size()), 0);
-            rows_.clear();
-            queue_.clear();
-            pending_grants_.clear();
-            pending_forced_.clear();
-            std::fill(slot_busy_.begin(), slot_busy_.end(), false);
-            step_events.clear();
-            return publish();
+            return sealAll(detail.empty() ? std::string("Serving forward failed") : detail, events);
         }
 
         // 5. Retirement frees each finished request's slot.
@@ -448,7 +460,18 @@ namespace llaminar2
             event.finish = finish[r];
             if (finish[r] == ServingFinishReason::Error)
                 event.error = finish_error[r];
-            (void)executor_.resetServingRow(row.slot);
+            if (!executor_.resetServingRow(row.slot))
+            {
+                // A slot that cannot be emptied may still hold this request's
+                // state: never admit onto it. Publish the step, then seal.
+                const std::string reason = "Serving slot " + std::to_string(row.slot) + " could not be reset";
+                slot_busy_[static_cast<std::size_t>(row.slot)] = false;
+                rows_.erase(rows_.begin() + static_cast<std::ptrdiff_t>(r));
+                for (auto &[id, event] : step_events)
+                    events.push_back(std::move(event));
+                step_events.clear();
+                return sealAll(reason, events);
+            }
             slot_busy_[static_cast<std::size_t>(row.slot)] = false;
             rows_.erase(rows_.begin() + static_cast<std::ptrdiff_t>(r));
         }

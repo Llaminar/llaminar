@@ -51,10 +51,24 @@ namespace llaminar2
         int prompt_tokens = 0;          ///< From the latest event.
         int cached_prompt_tokens = 0;   ///< Prefix-cache restored prompt tokens.
         bool prefix_cache_enabled = false;
+        /// Response lease whose execution claim ends at the terminal event.
+        std::shared_ptr<ServingResponseLeasePool::Lease> lease;
+
+        /**
+         * @brief The request's row retired (terminal event): free its
+         *        execution claim. Only the runner's terminal outcome releases
+         *        it, so resident + queued never exceeds S + Q.
+         */
+        void releaseExecution() noexcept
+        {
+            if (lease)
+                lease->executionFinished();
+        }
 
         /** @brief Resolve as failed unless already terminal; wakes the lane. */
         void fail(const std::string &reason)
         {
+            releaseExecution();
             std::lock_guard lock(mutex);
             if (!admitted)
             {
@@ -256,9 +270,11 @@ namespace llaminar2
         // ----- Lane commands (any thread) -----
 
         /** @brief Submit; the returned mailbox always reaches a terminal state. */
-        std::shared_ptr<ServingMailbox> submit(ServingBatchRequest request)
+        std::shared_ptr<ServingMailbox> submit(ServingBatchRequest request,
+                                               std::shared_ptr<ServingResponseLeasePool::Lease> lease = {})
         {
             auto mailbox = std::make_shared<ServingMailbox>();
+            mailbox->lease = std::move(lease);
             const std::uint64_t id = request.id;
             const bool posted = post([this, mailbox, id, request = std::move(request)]() mutable {
                 // The mailbox stays in unadmitted_ until it is resolved, so a
@@ -491,6 +507,7 @@ namespace llaminar2
             {
                 mailbox->finish = event.finish;
                 mailbox->error = event.error;
+                mailbox->releaseExecution();
             }
             mailbox->cv.notify_all();
         }
@@ -535,9 +552,10 @@ namespace llaminar2
         /** @brief Retires an unfinished request (cancellation is idempotent). */
         ~BatchedGenerationLane() override
         {
-            // The lane is done executing either way; the response lease itself
-            // stays with the transport until publication completes.
-            if (lease_)
+            // Never submitted: nothing executes for this request. Otherwise
+            // the execution claim ends only at the runner's terminal event
+            // (dispatch or failure), after the posted cancel retired the row.
+            if (!mailbox_ && lease_)
                 lease_->executionFinished();
             if (id_ == 0 || !mailbox_)
                 return;
@@ -576,7 +594,7 @@ namespace llaminar2
                 return false;
             }
             id_ = request.id;
-            mailbox_ = driver_.submit(std::move(request));
+            mailbox_ = driver_.submit(std::move(request), lease_);
             // A transport close from now on cancels the serving request at
             // once, whether it is queued, resident or waiting on its consumer.
             if (cancellation_ && !cancellation_->bind([driver = &driver_, id = id_] { driver->cancel(id); }))
@@ -700,10 +718,6 @@ namespace llaminar2
             if (mailbox_->tokens.empty() && (mailbox_->finish == ServingFinishReason::Stop ||
                                              mailbox_->finish == ServingFinishReason::Length))
                 result.is_complete = true;
-            // The serving row retired: its execution claim is free for the
-            // next request while this response may still be publishing.
-            if (mailbox_->finish != ServingFinishReason::None && lease_)
-                lease_->executionFinished();
             return result;
         }
 

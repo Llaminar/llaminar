@@ -81,4 +81,87 @@ namespace llaminar2::test
         ASSERT_TRUE(changed);
         EXPECT_NE(ServingStepTraceReplayer::replay(trace), "");
     }
+
+    namespace
+    {
+        /** @brief Minimal scripted rows: token 3 always wins; failures on demand. */
+        class ScriptedRows final : public IServingRowExecutor
+        {
+        public:
+            static constexpr int kVocab = 8;
+            bool fail_forward = false;
+            bool fail_reset = false;
+            bool forwardServingRows(const std::vector<int> &, const std::vector<std::vector<int>> &rows) override
+            {
+                if (fail_forward)
+                    return false;
+                logits_.assign(rows.size() * kVocab, 0.0f);
+                for (std::size_t r = 0; r < rows.size(); ++r)
+                    logits_[r * kVocab + 3] = 1.0f;
+                return true;
+            }
+            const float *servingRowLogits(int row) const override { return logits_.data() + row * kVocab; }
+            bool resetServingRow(int) override { return !fail_reset; }
+            int restoreServingRowPrefix(int, const std::vector<int32_t> &, PrefixLookupResult &admission) override
+            {
+                admission = {};
+                return 0;
+            }
+            bool harvestServingRowPrefix(int, const PrefixLookupResult &, const std::vector<int32_t> &) override
+            {
+                return true;
+            }
+            std::string servingRowError() const override { return fail_forward ? "scripted forward failure" : ""; }
+
+        private:
+            std::vector<float> logits_;
+        };
+
+        ServingBatchRequest greedy(std::uint64_t id, int max_new)
+        {
+            ServingBatchRequest request;
+            request.id = id;
+            request.prompt = {1, 2, 3};
+            request.max_new_tokens = max_new;
+            request.sampling.temperature = 0.0f;
+            request.sampling.top_k = 1;
+            request.sampling.seed = 1;
+            return request;
+        }
+    } // namespace
+
+    TEST(ServingSessionLifecycle, FailedSlotResetAtRetirementSealsTheSession)
+    {
+        ScriptedRows rows;
+        ServingSession session(rows, 64, ScriptedRows::kVocab);
+        std::string error;
+        ASSERT_TRUE(session.begin(2, 2, error)) << error;
+        ASSERT_TRUE(session.submit(greedy(1, 1), error));
+        ASSERT_TRUE(session.submit(greedy(2, 30), error));
+        rows.fail_reset = true; // the finishing slot cannot be emptied
+        std::map<std::uint64_t, ServingFinishReason> finished;
+        for (int step = 0; step < 4 && finished.size() < 2; ++step)
+            for (const auto &event : session.step())
+                if (event.finished())
+                    finished[event.id] = event.finish;
+        EXPECT_EQ(finished[1], ServingFinishReason::Length) << "the finished request keeps its outcome";
+        EXPECT_EQ(finished[2], ServingFinishReason::Error) << "co-resident requests fail with the seal";
+        EXPECT_NE(session.failure().find("could not be reset"), std::string::npos) << session.failure();
+        EXPECT_FALSE(session.submit(greedy(3, 1), error)) << "nothing is admitted onto stale slot state";
+    }
+
+    TEST(ServingSessionLifecycle, ForwardFailureSealsWithTheRunnerDiagnostic)
+    {
+        ScriptedRows rows;
+        ServingSession session(rows, 64, ScriptedRows::kVocab);
+        std::string error;
+        ASSERT_TRUE(session.begin(1, 1, error)) << error;
+        ASSERT_TRUE(session.submit(greedy(1, 4), error));
+        rows.fail_forward = true;
+        const auto events = session.step();
+        ASSERT_EQ(events.size(), 1u);
+        EXPECT_EQ(events[0].finish, ServingFinishReason::Error);
+        EXPECT_EQ(events[0].error, "scripted forward failure");
+        EXPECT_EQ(session.failure(), "scripted forward failure");
+    }
 } // namespace llaminar2::test

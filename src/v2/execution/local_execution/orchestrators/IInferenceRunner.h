@@ -3188,6 +3188,9 @@ namespace llaminar2
          * Lets serving fail closed with the precise missing capability instead
          * of silently serializing requests.
          */
+        /** @brief Why the last forwardServingRows() failed (empty after success). */
+        virtual std::string servingRowError() const { return {}; }
+
         virtual std::string servingRowsUnsupportedReason() const
         {
             return "this execution topology has no slot-addressed serving rows";

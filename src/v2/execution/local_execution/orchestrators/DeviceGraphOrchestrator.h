@@ -4214,6 +4214,7 @@ namespace llaminar2
 
         /** @brief CPU serving rows: single-device main KV, no MTP, no recurrent state. */
         std::string servingRowsUnsupportedReason() const override;
+        std::string servingRowError() const override { return serving_row_error_; }
         int restoreServingRowPrefix(int slot, const std::vector<int32_t> &prompt,
                                     PrefixLookupResult &admission) override;
         bool harvestServingRowPrefix(int slot, const PrefixLookupResult &admission,
@@ -9578,6 +9579,8 @@ namespace llaminar2
         int serving_logits_rows_ = 0;
         /** @brief Cached tokens of each serving slot (KV sequence). */
         std::vector<int> serving_slot_positions_;
+        /** @brief Diagnostic of the last failed serving forward. */
+        std::string serving_row_error_;
         /** @brief KV sequence of each row of the serving forward in flight. */
         std::vector<int> serving_row_slots_;
 

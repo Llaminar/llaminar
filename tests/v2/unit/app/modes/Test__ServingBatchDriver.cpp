@@ -526,6 +526,40 @@ namespace llaminar2::test
         EXPECT_FALSE(pool.tryAcquire());
     }
 
+    TEST(ServingResponseLeasePool, ExecutionClaimOutlivesTheLaneUntilTheRowRetires)
+    {
+        // S + Q = 1: a destroyed lane posts a cancel, but its claim stays held
+        // until the runner's terminal event, so a new request cannot be
+        // admitted onto a row that is still resident (hard Q bound).
+        FakeServingRunner runner;
+        ServingBatchDriver driver(runner, 4, kContext);
+        std::string error;
+        ASSERT_TRUE(driver.start(error)) << error;
+        ServingResponseLeasePool pool(resolveInstalledServingCapacity(ServingCapacityRequest::authored(1, 2, 0)));
+        auto lease = pool.tryAcquire();
+        ASSERT_TRUE(lease);
+        {
+            std::unique_ptr<IRequestGenerationLane> lane;
+            {
+                ServingBatchDriver::RequestScope scope(std::make_shared<ServingRequestCancellation>(), lease);
+                lane = driver.makeLane();
+            }
+            ASSERT_TRUE(lane->prefill(prompt(4)));
+            runner.block_steps = true; // the cancel cannot retire the row yet
+            driver.grant(1, 1);
+            std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        } // lane destroyed: cancel posted
+        EXPECT_FALSE(pool.tryAcquire()) << "the row is still resident";
+        runner.releaseSteps();
+        std::shared_ptr<ServingResponseLeasePool::Lease> next;
+        for (int i = 0; i < 300 && !next; ++i)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            next = pool.tryAcquire();
+        }
+        EXPECT_TRUE(next) << "the terminal (cancel) event frees the claim";
+    }
+
     TEST(ServingResponseLeasePool, LaneReleasesItsExecutionClaimWhenTheRowFinishes)
     {
         FakeServingRunner runner;

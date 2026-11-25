@@ -168,6 +168,9 @@ namespace llaminar2
             PrefixLookupResult prefix_admission; ///< Immutable identity for the prompt harvest.
         };
 
+        /** @brief Fail all resident and queued requests, seal, and return @p events. */
+        std::vector<ServingBatchEvent> sealAll(const std::string &reason, std::vector<ServingBatchEvent> events);
+
         float *decisionLogits(int slot)
         {
             return decision_logits_.data() + static_cast<std::size_t>(slot) * static_cast<std::size_t>(vocab_);
