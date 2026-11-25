@@ -16735,7 +16735,7 @@ add_v2_test(V2_Unit_MTPGraphConstruction
 # Sidecar construction retains arbitrary resident slots without leaking maps into later graphs.
 add_v2_test(V2_Integration_MTPServingSlotMappingLifecycle
     COMMAND $<TARGET_FILE:v2_test_mtp_graph_construction>
-        --gtest_filter=Test__MTPGraphConstruction.ServingSidecarSlotAdmission:Test__MTPGraphConstruction.ServingSidecarSlotMappingLifecycle:Test__MTPGraphConstruction.ServingSidecarCacheIdentityIncludesSlots:Test__MTPGraphConstruction.ResidentHiddenPublicationLifecycle
+        --gtest_filter=Test__MTPGraphConstruction.ServingSidecarSlotAdmission:Test__MTPGraphConstruction.ServingSidecarSlotMappingLifecycle:Test__MTPGraphConstruction.ServingSidecarCacheIdentityIncludesSlots:Test__MTPGraphConstruction.ResidentHiddenPublicationLifecycle:Test__MTPGraphConstruction.ResidentMainHiddenTracksProductionForward
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;MTP;Lifecycle;Regression"
     MPI_PROCS 1 NO_MODELS TIMEOUT 60
     ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")

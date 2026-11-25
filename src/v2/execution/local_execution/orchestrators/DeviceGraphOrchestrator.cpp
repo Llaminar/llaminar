@@ -21618,6 +21618,29 @@ namespace llaminar2
                 seq_len);
         }
         state_.last_forward_request_lengths = std::move(request_lengths);
+        if (cpu_resident_mtp_hidden_)
+        {
+            if (!state_.hidden || seq_len <= 0 || batch_size <= 0 ||
+                state_.last_forward_request_lengths.size() != static_cast<size_t>(batch_size) ||
+                (!serving_row_slots_.empty() && serving_row_slots_.size() != static_cast<size_t>(batch_size)))
+                throw std::logic_error("CPU resident MTP main publication lacks exact request geometry");
+            const size_t width = static_cast<size_t>(graph_builder_->config().residualWidth());
+            const float *source = state_.hidden->fp32_data();
+            if (!source || state_.hidden->numel() / width < static_cast<size_t>(batch_size) * seq_len)
+                throw std::logic_error("CPU resident MTP main publication exceeds its hidden producer");
+            // Copy the actual terminal row, never the padded row or compact
+            // batch index. Existing slots not participating keep their state.
+            for (int row = 0; row < batch_size; ++row)
+            {
+                const int length = state_.last_forward_request_lengths[static_cast<size_t>(row)];
+                if (length <= 0 || length > seq_len)
+                    throw std::logic_error("CPU resident MTP main publication has invalid live length");
+                const int slot = serving_row_slots_.empty() ? row : serving_row_slots_[static_cast<size_t>(row)];
+                const size_t offset = (static_cast<size_t>(row) * seq_len + length - 1) * width;
+                cpu_resident_mtp_hidden_->publish(slot, CPUResidentMTPHidden::Bank::Main,
+                    std::span<const float>(source + offset, width));
+            }
+        }
         if (terminal_hidden_source ==
             MTPTerminalHiddenPublication::Source::MainForward)
             state_.mtp_terminal_hidden_publication.publishMainForward();

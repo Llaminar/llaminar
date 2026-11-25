@@ -3777,6 +3777,8 @@ namespace llaminar2
                 RequestStateResetTransaction::Phase::
                     ResetReplaySessions);
             admitted_sparse_query_program_.reset();
+            if (cpu_resident_mtp_hidden_)
+                cpu_resident_mtp_hidden_->retireAll();
             for (auto &entry : layer_graph_cache_)
             {
                 entry.resetSessionState();

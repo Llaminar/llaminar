@@ -104,9 +104,19 @@ gauges or economy evidence.
   Seven focused MTP/activation/arena CTest registrations pass at
   `CB-checkpoints/mtp-resident-publications-r2.6WTRiU`. Initial fixture failures
   remain preserved; these are not full preflight or runtime MTP qualification.
-- Next: publish actual forward terminal rows into resident banks, shifted
-  predictor KV state, independent sampling/depth and shared verifier transactions.
-  No MTP capability advertisement changes in these checkpoints.
+- Main-forward completion now publishes each actual CPU request terminal row
+  into its resident bank, using true lengths and explicit slot mapping when
+  present. Whole-request reset invalidates both banks without rebinding storage.
+  The native regression compares published bytes with real main-forward output,
+  exercises the production publication boundary with noncontiguous and partial
+  maps, and proves reset/republication cannot revive old receipts. The mapped
+  boundary portion is not a shared mapped forward or continuous-MTP proof.
+  Complete MTP graph tests (103) and the explicit five-test slot/publication
+  preflight registration pass; evidence:
+  `CB-checkpoints/mtp-main-publications-r3.04R7P5`.
+- Next: shifted predictor KV state, independent sampling/depth and shared
+  draft/verifier transactions. No MTP capability advertisement changes in these
+  checkpoints.
 
 ## Next
 

@@ -64,6 +64,15 @@ public:
         return {this, index, publication.generation};
     }
 
+    /** @brief Acquire the current slot publication, rejecting absent or retired state. */
+    Lease acquire(int slot, Bank bank) const
+    {
+        const auto index = checkedIndex(slot, bank);
+        if (!publications_[index].current)
+            throw std::logic_error("CPU resident MTP hidden slot has no current publication");
+        return {this, index, publications_[index].generation};
+    }
+
     /** @brief Read exactly a current publication; stale or foreign receipts fail closed. */
     std::span<const float> read(const Lease &lease) const
     {
@@ -86,6 +95,18 @@ public:
         {
             ++publications_[index].generation;
             publications_[index].current = false;
+        }
+    }
+
+    /** @brief Reset a complete request session without rebinding retained storage. */
+    void retireAll()
+    {
+        for (const auto &publication : publications_)
+            requireAdvance(publication);
+        for (auto &publication : publications_)
+        {
+            ++publication.generation;
+            publication.current = false;
         }
     }
 

@@ -89,6 +89,29 @@ namespace llaminar2
 /** @brief Exercise the production sidecar cache with explicit CPU slot ownership. */
 struct DeviceGraphOrchestratorMTPSlotsTestAccess
 {
+    /** @brief Inspect the production-owned publication metadata without replacing its storage. */
+    static CPUResidentMTPHidden &resident(DeviceGraphOrchestrator &owner)
+    {
+        if (!owner.cpu_resident_mtp_hidden_)
+            throw std::logic_error("Fixture lacks the production resident hidden owner");
+        return *owner.cpu_resident_mtp_hidden_;
+    }
+    /** @brief Route an actual produced hidden tensor through the production slot publication boundary. */
+    static void publishMain(DeviceGraphOrchestrator &owner, const std::vector<int> &slots,
+                            int width, std::vector<int> lengths)
+    {
+        auto prior = std::exchange(owner.serving_row_slots_, slots);
+        try
+        {
+            owner.noteMainForwardHiddenProducedForMTP(width, static_cast<int>(slots.size()), std::move(lengths));
+        }
+        catch (...)
+        {
+            owner.serving_row_slots_ = std::move(prior);
+            throw;
+        }
+        owner.serving_row_slots_ = std::move(prior);
+    }
     /** @brief Submit one real sidecar row; all graph selection remains production-owned. */
     static bool execute(DeviceGraphOrchestrator &owner, int token, int position,
                         const std::vector<int> *slots)
@@ -5064,6 +5087,12 @@ TEST(Test__MTPGraphConstruction, ResidentHiddenPublicationLifecycle)
         EXPECT_THROW(foreign.read(replacement), std::logic_error);
         EXPECT_THROW(CPUResidentMTPHidden(storage, 0, 5), std::invalid_argument);
         EXPECT_THROW(CPUResidentMTPHidden(storage, slots, 4), std::invalid_argument);
+        const auto *address = owner.read(replacement).data();
+        owner.retireAll();
+        EXPECT_THROW(owner.read(replacement), std::logic_error);
+        const auto after_reset = owner.publish(0, Bank::Main, a);
+        EXPECT_EQ(owner.read(after_reset).data(), address);
+        EXPECT_THROW(owner.read(replacement), std::logic_error);
     }
 }
 
@@ -5487,6 +5516,58 @@ TEST(Test__MTPGraphConstruction, WorkspaceFamilyDeclaresCompleteVerifierOutputs)
  * metadata only, flattening both requests into sequence zero, or appending the
  * padded row will all fail this regression.
  */
+/** @test Production forward terminal rows publish byte-exactly to persistent noncontiguous slots. */
+TEST(Test__MTPGraphConstruction, ResidentMainHiddenTracksProductionForward)
+{
+    DeviceManager::instance().initialize(-1, false);
+    TinyQwen35MTPForwardFixture fixture;
+    fixture.config.mtp.max_request_batch = 5;
+    auto builder = std::make_shared<Qwen35Graph>(fixture.config, fixture.mpi);
+    auto owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuInferenceFixtureDependencies(builder, fixture.mpi, 5, fixture.config.max_seq_len,
+            fixture.config.max_seq_len,
+            test::cpuFixtureTensorInventory(*makeTinyQwen35MTPFrozenWeightSet(fixture), fixture.config.n_layers)));
+    ASSERT_TRUE(owner->initializeInferenceStateFromArena(5, fixture.config.max_seq_len, DeviceId::cpu()));
+    owner->setFrozenWeightSet(makeTinyQwen35MTPFrozenWeightSet(fixture));
+    PreparedWeightStore store;
+    prepareFrozenGemmWeightsForCPU(*owner->frozenWeightSet(), store);
+    builder->setPreparedWeightStore(&store);
+    ASSERT_TRUE(owner->forward_batch({{1, 2}, {3, 4, 5}}));
+    auto &resident = DeviceGraphOrchestratorMTPSlotsTestAccess::resident(*owner);
+    using Bank = CPUResidentMTPHidden::Bank;
+    const auto first = resident.acquire(0, Bank::Main);
+    const auto second = resident.acquire(1, Bank::Main);
+    const size_t width = static_cast<size_t>(fixture.config.residualWidth());
+    const auto *hidden = owner->inferenceState().hidden->fp32_data();
+    ASSERT_NE(hidden, nullptr);
+    EXPECT_EQ(std::memcmp(resident.read(first).data(), hidden + width, width * sizeof(float)), 0);
+    EXPECT_EQ(std::memcmp(resident.read(second).data(), hidden + 5 * width, width * sizeof(float)), 0);
+    EXPECT_THROW(resident.acquire(4, Bank::Main), std::logic_error);
+    EXPECT_THROW(resident.acquire(0, Bank::Draft), std::logic_error);
+    DeviceGraphOrchestratorMTPSlotsTestAccess::publishMain(*owner, {4, 2}, 3, {2, 3});
+    EXPECT_EQ(std::memcmp(resident.read(resident.acquire(4, Bank::Main)).data(), hidden + width,
+        width * sizeof(float)), 0);
+    EXPECT_EQ(std::memcmp(resident.read(resident.acquire(2, Bank::Main)).data(), hidden + 5 * width,
+        width * sizeof(float)), 0);
+    EXPECT_NO_THROW(resident.read(first));
+    EXPECT_NO_THROW(resident.read(second));
+    // A shorter subsequent publication invalidates only its own old receipt.
+    DeviceGraphOrchestratorMTPSlotsTestAccess::publishMain(*owner, {4}, 1, {1});
+    EXPECT_EQ(std::memcmp(resident.read(resident.acquire(4, Bank::Main)).data(), hidden,
+        width * sizeof(float)), 0);
+    EXPECT_NO_THROW(resident.read(first));
+    EXPECT_NO_THROW(resident.read(second));
+    resident.retire(4);
+    EXPECT_THROW(resident.acquire(4, Bank::Main), std::logic_error);
+    EXPECT_NO_THROW(resident.read(first));
+    owner->resetInferenceState(InferenceStateResetRequest::requestBoundary("resident-hidden-test"));
+    EXPECT_THROW(resident.read(first), std::logic_error);
+    EXPECT_THROW(resident.read(second), std::logic_error);
+    ASSERT_TRUE(owner->forward_batch({{1, 2}, {3, 4, 5}}));
+    EXPECT_NO_THROW(resident.acquire(0, Bank::Main));
+    EXPECT_THROW(resident.read(first), std::logic_error);
+}
+
 TEST(Test__MTPGraphConstruction, Qwen35RequestBatchedPrefillPublishesPerRequestShiftedPayloads)
 {
     DeviceManager::instance().initialize(-1, false);
