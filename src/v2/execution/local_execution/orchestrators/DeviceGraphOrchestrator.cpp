@@ -61468,6 +61468,8 @@ namespace llaminar2
             graph_builder_ && graph_builder_->config().prefix_cache.enabled)
             return "prefix caching of hybrid recurrent state has no per-slot serving rows yet "
                    "(use --no-prefix-cache)";
+        if ((graph_builder_ && graph_builder_->config().isMoE()) || isPrefixCacheMoEModel())
+            return "routed-expert (MoE) models have no qualified serving rows yet";
         if (!state_.mtp_kv_caches.empty() || (graph_builder_ && graph_builder_->config().mtp.enabled))
             return "MTP speculative decoding has no per-slot serving rows yet (use --no-mtp)";
         if (graph_builder_ && graph_builder_->config().prefix_cache.enabled &&

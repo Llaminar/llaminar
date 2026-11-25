@@ -47,6 +47,14 @@ namespace llaminar2
         std::size_t max_entries = 0;
         /** @brief 0 = unbounded (observation only); >0 = explicit byte cap. */
         std::size_t max_buffered_bytes = 0;
+        /** @brief Handling of one line larger than the whole byte cap. */
+        enum class OversizedLine
+        {
+            Reject,              ///< Typed std::length_error (default).
+            AdmitAloneWhenEmpty, ///< Wait until the queue drained, then queue it alone:
+                                 ///< buffered bytes stay <= max(cap, that already-built line).
+        };
+        OversizedLine oversized_line = OversizedLine::Reject;
 
         /** @brief PRODUCTION QUOTA POLICY (PROVISIONAL — NOT certified geometry).
          *
@@ -108,7 +116,8 @@ namespace llaminar2
             // With max_buffered_bytes == 0 (production/unbounded) no line is ever
             // rejected by a fabricated cap.
             const bool byte_capped = budget_.max_buffered_bytes != 0;
-            if (byte_capped && line.size() > budget_.max_buffered_bytes)
+            const bool oversized = byte_capped && line.size() > budget_.max_buffered_bytes;
+            if (oversized && budget_.oversized_line != SSEPublishChannelBudget::OversizedLine::AdmitAloneWhenEmpty)
             {
                 throw std::length_error(
                     "SSE publish line exceeds the request's queued-payload byte window; "
@@ -126,8 +135,11 @@ namespace llaminar2
             const auto blocked = [&] {
                 if (lines_.size() >= budget_.max_entries)
                     return true;
+                if (oversized)
+                    return !lines_.empty(); // admitted alone into an empty queue
                 return byte_capped &&
-                       line.size() > budget_.max_buffered_bytes - buffered_bytes_;
+                       (buffered_bytes_ >= budget_.max_buffered_bytes ||
+                        line.size() > budget_.max_buffered_bytes - buffered_bytes_);
             };
             if (blocked() && !closed_)
                 registration.emplace(blocked_pushers_);
@@ -151,7 +163,8 @@ namespace llaminar2
             std::lock_guard lock(mutex_);
             if (closed_ || lines_.size() >= budget_.max_entries)
                 return false;
-            if (byte_capped && line.size() > budget_.max_buffered_bytes - buffered_bytes_)
+            if (byte_capped && (buffered_bytes_ >= budget_.max_buffered_bytes ||
+                        line.size() > budget_.max_buffered_bytes - buffered_bytes_))
                 return false;
             lines_.push_back(line);
             buffered_bytes_ += line.size();

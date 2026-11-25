@@ -677,3 +677,26 @@ TEST(SSEPublishChannel, ProductionFactoryPreservesLongFrames)
         EXPECT_FALSE(channel.closed());
     } // guard performs the close+join (completion is NOT the join)
 }
+
+// Continuous batching: a tool call larger than the per-response byte budget is
+// one SSE event; it waits for the queue to drain and is then queued alone,
+// never truncating a valid response.
+TEST(Test__SSEPublishChannelOversized, LargeLineIsAdmittedAloneOnceDrained)
+{
+    llaminar2::SSEPublishChannelBudget budget{/*max_entries*/ 8, /*max_buffered_bytes*/ 64};
+    budget.oversized_line = llaminar2::SSEPublishChannelBudget::OversizedLine::AdmitAloneWhenEmpty;
+    llaminar2::SSEPublishChannel channel(budget);
+    ASSERT_TRUE(channel.push(std::string(16, 'a')));
+    const std::string tool_call(1000, 't');
+    std::atomic<bool> pushed{false};
+    std::thread producer([&] { pushed = channel.push(tool_call); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    EXPECT_FALSE(pushed.load()) << "waits while other lines are queued";
+    ASSERT_EQ(channel.tryPop().value_or(""), std::string(16, 'a'));
+    producer.join();
+    EXPECT_TRUE(pushed.load());
+    EXPECT_EQ(channel.bufferedBytes(), tool_call.size());
+    EXPECT_FALSE(channel.tryPush("x")) << "nothing joins the oversized line";
+    EXPECT_EQ(channel.tryPop().value_or(""), tool_call);
+    EXPECT_TRUE(channel.tryPush("x"));
+}

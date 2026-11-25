@@ -150,6 +150,34 @@ namespace llaminar2::test
         EXPECT_FALSE(session.submit(greedy(3, 1), error)) << "nothing is admitted onto stale slot state";
     }
 
+    TEST(ServingSessionLifecycle, FinishedPeersKeepTheirOutcomeWhenAResetFails)
+    {
+        // Requests 1 and 2 finish in the same step (3 and 2 tokens, one
+        // prompt chunk per step); request 3 is still live. A failed reset must
+        // not turn the finished peers' Length into Error.
+        ScriptedRows rows;
+        ServingSession session(rows, 64, ScriptedRows::kVocab);
+        std::string error;
+        ASSERT_TRUE(session.begin(3, 3, error)) << error;
+        ASSERT_TRUE(session.submit(greedy(1, 3), error));
+        ASSERT_TRUE(session.submit(greedy(2, 2), error));
+        ASSERT_TRUE(session.submit(greedy(3, 30), error));
+        std::map<std::uint64_t, ServingFinishReason> finished;
+        for (int step = 0; step < 2; ++step)
+            for (const auto &event : session.step())
+                if (event.finished())
+                    finished[event.id] = event.finish;
+        ASSERT_TRUE(finished.empty());
+        rows.fail_reset = true;
+        for (const auto &event : session.step())
+            if (event.finished())
+                finished[event.id] = event.finish;
+        EXPECT_EQ(finished[1], ServingFinishReason::Length);
+        EXPECT_EQ(finished[2], ServingFinishReason::Length);
+        EXPECT_EQ(finished[3], ServingFinishReason::Error);
+        EXPECT_FALSE(session.failure().empty());
+    }
+
     TEST(ServingSessionLifecycle, ForwardFailureSealsWithTheRunnerDiagnostic)
     {
         ScriptedRows rows;

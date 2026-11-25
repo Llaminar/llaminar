@@ -462,7 +462,11 @@ namespace llaminar2
             return sealAll(detail.empty() ? std::string("Serving forward failed") : detail, events);
         }
 
-        // 5. Retirement frees each finished request's slot.
+        // 5. Retirement frees each finished request's slot. Every finished
+        //    request keeps its real terminal event; a slot that cannot be
+        //    emptied may still hold state, so afterwards the session seals
+        //    (failing only the still-live requests).
+        std::string reset_failure;
         for (std::size_t r = rows_.size(); r-- > 0;)
         {
             if (finish[r] == ServingFinishReason::None)
@@ -472,20 +476,17 @@ namespace llaminar2
             event.finish = finish[r];
             if (finish[r] == ServingFinishReason::Error)
                 event.error = finish_error[r];
-            if (!executor_.resetServingRow(row.slot))
-            {
-                // A slot that cannot be emptied may still hold this request's
-                // state: never admit onto it. Publish the step, then seal.
-                const std::string reason = "Serving slot " + std::to_string(row.slot) + " could not be reset";
-                slot_busy_[static_cast<std::size_t>(row.slot)] = false;
-                rows_.erase(rows_.begin() + static_cast<std::ptrdiff_t>(r));
-                for (auto &[id, event] : step_events)
-                    events.push_back(std::move(event));
-                step_events.clear();
-                return sealAll(reason, events);
-            }
+            if (!executor_.resetServingRow(row.slot) && reset_failure.empty())
+                reset_failure = "Serving slot " + std::to_string(row.slot) + " could not be reset";
             slot_busy_[static_cast<std::size_t>(row.slot)] = false;
             rows_.erase(rows_.begin() + static_cast<std::ptrdiff_t>(r));
+        }
+        if (!reset_failure.empty())
+        {
+            for (auto &[id, event] : step_events)
+                events.push_back(std::move(event));
+            step_events.clear();
+            return sealAll(reset_failure, events);
         }
         return publish();
     }

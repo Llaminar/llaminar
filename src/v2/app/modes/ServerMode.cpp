@@ -822,6 +822,9 @@ namespace llaminar2
                      auto budget = SSEPublishChannelBudget::forRequest(stream_request.max_tokens);
                      budget.max_buffered_bytes =
                          static_cast<std::size_t>(ServingPoolPerResponseBudget::defaultPolicy().bytes_per_response);
+                     // An SSE event cannot be split: a larger already-built line
+                     // (e.g. a big tool call) is queued alone once drained.
+                     budget.oversized_line = SSEPublishChannelBudget::OversizedLine::AdmitAloneWhenEmpty;
                      auto channel = std::make_shared<SSEPublishChannel>(budget);
                      auto transport_open = std::make_shared<std::atomic<bool>>(true);
                      // The producer runs the handler; the provider thread is the
