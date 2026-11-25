@@ -47,6 +47,13 @@ namespace llaminar2
     };
 
     /** @brief Output of one request during one shared execution step. */
+    /** @brief Serving session occupancy (resident slots in use, waiting requests). */
+    struct ServingBatchOccupancy
+    {
+        int resident = 0;
+        int queued = 0;
+    };
+
     struct ServingBatchEvent
     {
         std::uint64_t id = 0;

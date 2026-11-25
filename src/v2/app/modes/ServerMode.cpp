@@ -456,9 +456,30 @@ namespace llaminar2
         return server.listen_after_bind();
     }
 
+    InferenceQueueStatsSource serializedInferenceQueueStats(const SerializedInferenceExecutor &executor)
+    {
+        return std::make_shared<std::function<json()>>([&executor] {
+            const auto queue = executor.snapshot();
+            return json{{"mode", "serialized"}, {"capacity", queue.capacity}, {"admitted", queue.admitted},
+                        {"queued", queue.queued}, {"active", queue.active}};
+        });
+    }
+
     void registerRuntimeStatsEndpoint(httplib::Server &server,
                                       ChatCompletionHandler &handler,
                                       const SerializedInferenceExecutor &executor,
+                                      std::string model_name, json description,
+                                      HttpResponseObserver response_observer,
+                                      std::shared_ptr<HttpProcessStats> process_stats)
+    {
+        registerRuntimeStatsEndpoint(server, handler, serializedInferenceQueueStats(executor),
+                                     std::move(model_name), std::move(description),
+                                     std::move(response_observer), std::move(process_stats));
+    }
+
+    void registerRuntimeStatsEndpoint(httplib::Server &server,
+                                      ChatCompletionHandler &handler,
+                                      InferenceQueueStatsSource queue_stats,
                                       std::string model_name, json description,
                                       HttpResponseObserver response_observer,
                                       std::shared_ptr<HttpProcessStats> process_stats)
@@ -480,17 +501,15 @@ namespace llaminar2
         server.Options("/stats", [](const httplib::Request &, httplib::Response &response) {
             response.status = 204;
         });
-        server.Get("/stats", [&handler, &executor, model_name = std::move(model_name),
+        server.Get("/stats", [&handler, queue_stats, model_name = std::move(model_name),
                               description = std::move(description), process_stats = std::move(process_stats)](
                                const httplib::Request &, httplib::Response &response) {
             auto result = handler.runtimeStats();
-            const auto queue = executor.snapshot();
             result["model"] = model_name;
             result["topology"] = description.at("topology");
             result["configuration"] = description.at("configuration");
             result["resources"] = process_stats->snapshot();
-            result["inference_queue"] = {{"capacity", queue.capacity}, {"admitted", queue.admitted},
-                                         {"queued", queue.queued}, {"active", queue.active}};
+            result["inference_queue"] = (*queue_stats)();
             response.set_header("Cache-Control", "no-store");
             response.set_content(result.dump(), "application/json");
         });
@@ -735,9 +754,9 @@ namespace llaminar2
      * at most @p max_in_flight requests (resident slots plus waiting room)
      * are accepted; beyond that the server answers 503 without queueing.
      */
-    void registerBatchedChatCompletionEndpoint(httplib::Server &server, ChatCompletionHandler &handler,
-                                               std::size_t max_in_flight,
-                                               HttpStreamObserver stream_observer)
+    std::shared_ptr<std::atomic<std::size_t>> registerBatchedChatCompletionEndpoint(
+        httplib::Server &server, ChatCompletionHandler &handler, std::size_t max_in_flight,
+        HttpStreamObserver stream_observer)
     {
         auto in_flight = std::make_shared<std::atomic<std::size_t>>(0);
         server.Post("/v1/chat/completions",
@@ -843,6 +862,7 @@ namespace llaminar2
                                  producer->join();
                          });
                  });
+        return in_flight;
     }
 
     int ServerMode::execute(AppContext &ctx)
@@ -1043,7 +1063,9 @@ namespace llaminar2
         if (runner->executionPlan().runtime.prefix_cache.enabled &&
             runner->executionPlan().runtime.prefix_cache.disk_budget_bytes != 0)
             process_options.filesystems.push_back(runner->executionPlan().runtime.prefix_cache.disk_dir);
-        registerRuntimeStatsEndpoint(svr, handler, inference_executor, model_name,
+        // The serving mode chosen below replaces this source before listening.
+        auto queue_stats = serializedInferenceQueueStats(inference_executor);
+        registerRuntimeStatsEndpoint(svr, handler, queue_stats, model_name,
             serverRuntimeDescription(runner->executionPlan(), runner->config(), mpi_ctx->world_size()),
             [&request_log_state](const httplib::Request &req, const httplib::Response &res) {
                 logServedRequest(req, res, request_log_state);
@@ -1110,7 +1132,14 @@ namespace llaminar2
             }
             const std::size_t max_in_flight =
                 static_cast<std::size_t>(batch_capacity) + executor_queue_capacity;
-            registerBatchedChatCompletionEndpoint(svr, handler, max_in_flight, stream_observer);
+            const auto in_flight =
+                registerBatchedChatCompletionEndpoint(svr, handler, max_in_flight, stream_observer);
+            *queue_stats = [in_flight, max_in_flight, driver = batch_driver.get()] {
+                const auto occupancy = driver->occupancy();
+                return json{{"mode", "continuous_batching"}, {"capacity", max_in_flight},
+                            {"admitted", in_flight->load()}, {"resident_slots", driver->capacity()},
+                            {"active", occupancy.resident}, {"queued", occupancy.queued}};
+            };
             LOG_INFO("Continuous batching: " << batch_capacity << " resident request slots, "
                                               << max_in_flight << " admitted requests");
         }

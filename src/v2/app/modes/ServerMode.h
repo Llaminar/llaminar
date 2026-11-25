@@ -103,6 +103,27 @@ namespace llaminar2
                                       std::shared_ptr<HttpProcessStats> process_stats = {});
 
     /**
+     * @brief Produces the /stats "inference_queue" section of the active serving mode.
+     *
+     * Serialized serving reports its executor; continuous batching reports
+     * admitted in-flight requests and the session's resident/queued occupancy.
+     * The source may be replaced before the server starts listening.
+     */
+    using InferenceQueueStatsSource = std::shared_ptr<std::function<nlohmann::json()>>;
+
+    /** @brief The serialized executor's queue section (mode "serialized"). */
+    InferenceQueueStatsSource serializedInferenceQueueStats(const SerializedInferenceExecutor &executor);
+
+    /** @brief registerRuntimeStatsEndpoint() reading its queue section from @p queue_stats. */
+    void registerRuntimeStatsEndpoint(httplib::Server &server,
+                                      ChatCompletionHandler &handler,
+                                      InferenceQueueStatsSource queue_stats,
+                                      std::string model_name,
+                                      nlohmann::json description,
+                                      HttpResponseObserver response_observer = {},
+                                      std::shared_ptr<HttpProcessStats> process_stats = {});
+
+    /**
      * @brief Couple HTTP capacity to bounded, serialized inference admission.
      *
      * The HTTP pool has two more workers than admitted inference responses.

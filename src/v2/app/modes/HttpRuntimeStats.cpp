@@ -69,10 +69,7 @@ namespace llaminar2
         // are active and since when the oldest one has been.
         epoch_ = owner.epoch_;
         sequence_ = ++owner.request_sequence_;
-        owner.active_epoch_ = epoch_;
-        if (owner.active_requests_++ == 0)
-            owner.active_since_ = at;
-        owner.active_phase_ = "setup";
+        owner.active_[sequence_] = Active{at, "setup", epoch_};
         ++owner.counters_.started;
     }
 
@@ -94,7 +91,7 @@ namespace llaminar2
         if (delivery_ || prefill_started_) throw std::logic_error("HTTP prefill observation already started");
         (void)seconds(at, started_);
         prefill_started_ = at;
-        owner_->setPhase("prefill");
+        owner_->setPhase(sequence_, "prefill");
     }
 
     void HttpRuntimeStats::Request::prefillFinished(Clock::time_point at)
@@ -103,7 +100,7 @@ namespace llaminar2
             throw std::logic_error("HTTP prefill observation has no unfinished prefill");
         (void)seconds(at, *prefill_started_);
         prefill_ended_ = at;
-        owner_->setPhase("decode");
+        owner_->setPhase(sequence_, "decode");
     }
 
     void HttpRuntimeStats::Request::modelTokenObserved(std::optional<Clock::time_point> at)
@@ -125,7 +122,7 @@ namespace llaminar2
             throw std::logic_error("HTTP decode observation has no unfinished decode");
         (void)seconds(at, *prefill_ended_);
         decode_ended_ = at;
-        owner_->setPhase("finishing");
+        owner_->setPhase(sequence_, "finishing");
     }
 
     void HttpRuntimeStats::Request::complete(int prompt_tokens, int completion_tokens,
@@ -165,10 +162,11 @@ namespace llaminar2
         return Request(*this, arrival, at.value_or(Clock::now()));
     }
 
-    void HttpRuntimeStats::setPhase(const char *phase)
+    void HttpRuntimeStats::setPhase(uint64_t sequence, const char *phase)
     {
         std::lock_guard lock(mutex_);
-        active_phase_ = phase;
+        if (auto it = active_.find(sequence); it != active_.end())
+            it->second.phase = phase;
     }
 
     void HttpRuntimeStats::Distribution::add(double value)
@@ -209,12 +207,8 @@ namespace llaminar2
             throw std::logic_error("HTTP first output cannot follow request retirement");
 
         std::lock_guard lock(mutex_);
-        if (active_requests_ == 0) throw std::logic_error("HTTP terminal statistics have no active request");
-        if (--active_requests_ == 0)
-        {
-            active_since_.reset();
-            active_phase_ = "idle";
-        }
+        if (active_.erase(request.sequence_) != 1)
+            throw std::logic_error("HTTP terminal statistics have no such active request");
         // Reset does not cancel or inspect an active model. Its old request
         // retires ownership, but cannot repopulate the new measurement epoch.
         if (request.epoch_ != epoch_)
@@ -300,9 +294,8 @@ namespace llaminar2
     {
         Counters c;
         std::optional<Terminal> last;
-        std::optional<Clock::time_point> active;
-        const char *phase;
-        uint64_t epoch, active_epoch, sequence, active_count;
+        uint64_t epoch, sequence;
+        std::map<uint64_t, Active> active_requests;
         Clock::time_point reset_at;
         double reset_unix;
         json storage;
@@ -310,17 +303,28 @@ namespace llaminar2
             std::lock_guard lock(mutex_);
             c = counters_;
             last = last_;
-            active = active_since_;
-            phase = active_phase_;
+            active_requests = active_;
             epoch = epoch_;
-            active_epoch = active_epoch_;
-            active_count = active_requests_;
+
             sequence = request_sequence_;
             reset_at = reset_at_;
             reset_unix = reset_unix_seconds_;
             storage = prefix_storage_stats_.snapshot();
         }
         const auto now = Clock::now();
+        // Sequences increase with arrival, so the first entry is the oldest.
+        const auto oldest = active_requests.empty()
+            ? std::optional<std::pair<uint64_t, Active>>{}
+            : std::optional<std::pair<uint64_t, Active>>{*active_requests.begin()};
+        uint64_t in_epoch = 0;
+        json active_list = json::array();
+        for (const auto &[active_sequence, active] : active_requests)
+        {
+            in_epoch += active.epoch == epoch ? 1u : 0u;
+            active_list.push_back({{"sequence", active_sequence}, {"phase", active.phase},
+                                   {"seconds", seconds(now, active.since)},
+                                   {"in_current_epoch", active.epoch == epoch}});
+        }
         json status_codes = json::object();
         for (size_t i = 0; i < c.http_status_codes.size(); ++i)
             if (c.http_status_codes[i]) status_codes[std::to_string(i + 100)] = c.http_status_codes[i];
@@ -331,11 +335,16 @@ namespace llaminar2
             {"uptime_seconds", seconds(now, started_)},
             {"snapshot_unix_seconds", std::chrono::duration<double>(
                 std::chrono::system_clock::now().time_since_epoch()).count()},
-            {"requests", {{"started", c.started}, {"active", active_count},
+            {"requests", {{"started", c.started}, {"active", active_requests.size()},
                 {"completed", c.completed}, {"failed", c.failed}, {"disconnected", c.disconnected},
-                {"active_phase", phase}, {"active_sequence", active ? json(sequence) : json(nullptr)},
-                {"active_in_current_epoch", active && active_epoch == epoch ? 1 : 0},
-                {"active_seconds", active ? json(seconds(now, *active)) : json(nullptr)}}},
+                // Continuous batching serves requests concurrently. The scalar
+                // fields describe the OLDEST active request; "active_requests"
+                // lists every one with its own phase and age.
+                {"active_phase", oldest ? oldest->second.phase : "idle"},
+                {"active_sequence", oldest ? json(oldest->first) : json(nullptr)},
+                {"active_in_current_epoch", in_epoch},
+                {"active_seconds", oldest ? json(seconds(now, oldest->second.since)) : json(nullptr)},
+                {"active_requests", active_list}}},
             {"http", {{"scope", "finished_http_responses_all_routes"}, {"responses", c.http_responses},
                 {"status_codes", std::move(status_codes)}, {"unclassified", c.http_unclassified}}},
             {"tokens", {{"scope", "requests_with_terminal_summary"},

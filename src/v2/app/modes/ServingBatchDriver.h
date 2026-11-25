@@ -296,6 +296,11 @@ namespace llaminar2
             }
         }
 
+        /** @brief Occupancy published by the driver thread after its last step. */
+        ServingBatchOccupancy occupancy() const { return {resident_.load(), queued_.load()}; }
+
+        int capacity() const { return capacity_; }
+
         /** @brief True once stopped or sealed by a failure. */
         bool closed() const
         {
@@ -379,6 +384,9 @@ namespace llaminar2
                         for (const auto &event : runner_.stepServingBatch())
                             dispatch(event);
                     runnable_ = runner_.servingBatchHasRunnableWork();
+                    const auto occupancy = runner_.servingBatchOccupancy();
+                    resident_.store(occupancy.resident);
+                    queued_.store(occupancy.queued);
                 }
                 catch (const std::exception &error)
                 {
@@ -429,6 +437,8 @@ namespace llaminar2
         /** @brief Admitted requests (driver thread; read by stop() after join). */
         std::map<std::uint64_t, std::shared_ptr<ServingMailbox>> mailboxes_;
         std::atomic<std::uint64_t> next_id_{0};
+        std::atomic<int> resident_{0};
+        std::atomic<int> queued_{0};
     };
 
     /**

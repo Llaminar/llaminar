@@ -235,14 +235,26 @@ TEST(Test__HttpRuntimeStats, ConcurrentRequestsAreCountedAndRetireIndependently)
         auto first = stats.beginRequest();
         {
             auto second = stats.beginRequest();
-            EXPECT_EQ(stats.snapshot()["requests"]["active"], 2);
-            EXPECT_EQ(stats.snapshot()["requests"]["started"], 2);
+            second.prefillStarted();
+            const auto both = stats.snapshot()["requests"];
+            EXPECT_EQ(both["active"], 2);
+            EXPECT_EQ(both["started"], 2);
+            // Scalar fields describe the oldest request; each request keeps
+            // its own phase instead of the last writer's.
+            EXPECT_EQ(both["active_sequence"], 1);
+            EXPECT_EQ(both["active_phase"], "setup");
+            ASSERT_EQ(both["active_requests"].size(), 2u);
+            EXPECT_EQ(both["active_requests"][0]["phase"], "setup");
+            EXPECT_EQ(both["active_requests"][1]["phase"], "prefill");
+            EXPECT_EQ(both["active_in_current_epoch"], 2);
+            second.prefillFinished();
             second.complete(10, 3, prefix(10, 0), HttpRuntimeStats::Delivery::Completed);
         }
         const auto one_left = stats.snapshot();
         EXPECT_EQ(one_left["requests"]["active"], 1);
         EXPECT_EQ(one_left["requests"]["completed"], 1);
         EXPECT_FALSE(one_left["requests"]["active_seconds"].is_null());
+        EXPECT_EQ(one_left["requests"]["active_sequence"], 1);
         first.complete(20, 4, prefix(20, 0), HttpRuntimeStats::Delivery::Completed);
     }
     const auto idle = stats.snapshot();
@@ -250,6 +262,8 @@ TEST(Test__HttpRuntimeStats, ConcurrentRequestsAreCountedAndRetireIndependently)
     EXPECT_EQ(idle["requests"]["completed"], 2);
     EXPECT_EQ(idle["tokens"]["prompt"], 30);
     EXPECT_TRUE(idle["requests"]["active_seconds"].is_null());
+    EXPECT_EQ(idle["requests"]["active_phase"], "idle");
+    EXPECT_TRUE(idle["requests"]["active_requests"].empty());
 }
 
 /** @brief Aggregate token reuse is weighted by prompt length and includes cold requests. */

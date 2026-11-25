@@ -317,6 +317,10 @@ namespace llaminar2
         bool servingBatchIdle() const override;
         bool servingBatchHasRunnableWork() const override;
         std::string servingBatchUnsupportedReason() const override;
+        ServingBatchOccupancy servingBatchOccupancy() const override
+        {
+            return {static_cast<int>(serving_rows_.size()), static_cast<int>(serving_queue_.size())};
+        }
         void endServingBatch() override;
         GenerationResult generate(
             const std::vector<int32_t> &prompt_tokens,
