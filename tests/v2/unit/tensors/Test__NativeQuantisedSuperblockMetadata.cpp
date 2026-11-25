@@ -10,15 +10,21 @@
  * with the literal repack expression. The reference widens binary16 through
  * the compiler's `_Float16`, independent of the codec's integer widening.
  * Address helpers and plane extents are checked for both matrix layouts,
- * nonzero superblock phases and ragged K.
+ * nonzero superblock phases and ragged K. The compile-time read forms used
+ * by the CUDA prefill hot loops (loadBlockMetadataAs) are checked against the
+ * runtime representation loader for both representations and every shift.
  */
 #include "tensors/NativeQuantisedSuperblockMetadata.h"
+#include "kernels/common/NativeQuantisedScaleLoad.h"
 
 #include <gtest/gtest.h>
 
 #include <bit>
 #include <cstdint>
+#include <cstring>
+#include <random>
 #include <set>
+#include <string>
 #include <vector>
 
 namespace llaminar2::native_quantised_superblock::test
@@ -489,5 +495,116 @@ namespace llaminar2::native_quantised_superblock::test
                     ASSERT_EQ(emin[a.linear], want.emin);
                 }
         }
+    }
+    namespace
+    {
+        namespace nqs = ::llaminar2::native_quantised_scale;
+        using Form = nqs::NativeQuantisedMetadataReadForm;
+
+        /** @return The read form withMetadataRepresentation() hands its body for @p planes. */
+        template <std::uint8_t CB>
+        Form selectedForm(const nqs::NativeQuantisedMetadataPlanes &planes)
+        {
+            return nqs::withMetadataRepresentation<CB>(planes, [](auto form) { return decltype(form)::value; });
+        }
+
+        bool sameWords(const StagedBlockMetadata &a, const StagedBlockMetadata &b)
+        {
+            return a.primary == b.primary && a.secondary == b.secondary && a.emin == b.emin;
+        }
+
+        /**
+         * @brief Every compile-time read form equals the runtime loader on random planes.
+         *
+         * Coded planes are filled with random code bytes and superblock words
+         * for every code bit shift 0..7 and superblock phase 0..7; per-block
+         * planes with random primary/secondary/emin words. The coded form
+         * must equal loadBlockMetadata() at every block, the byte-aligned form
+         * (8/16-bit code planes) must equal it whenever the shift is zero,
+         * and withMetadataRepresentation() must select exactly that form.
+         */
+        template <std::uint8_t CB>
+        void expectReadFormsMatchRuntimeLoader()
+        {
+            SCOPED_TRACE("codebook " + std::to_string(CB));
+            constexpr std::uint32_t rows = 9, blocks = 21;
+            std::mt19937 rng(77u + CB);
+            const auto random_bytes = [&](std::size_t n) {
+                std::vector<std::uint8_t> v(n);
+                for (auto &b : v) b = static_cast<std::uint8_t>(rng());
+                return v;
+            };
+            for (std::uint32_t shift = 0; shift < 8; ++shift)
+                for (std::uint32_t phase = 0; phase < 8; ++phase)
+                {
+                    const auto bytes = planeBytes(CB, rows, blocks, phase);
+                    // Shifted matrices start `shift` bits into their first byte.
+                    auto codes = random_bytes(bytes.code + 1);
+                    auto supers = random_bytes(bytes.superblock + 4);
+                    std::vector<std::uint32_t> super_words((supers.size() + 3) / 4);
+                    std::memcpy(super_words.data(), supers.data(), supers.size());
+                    std::vector<std::uint16_t> code_words((codes.size() + 1) / 2 + 1);
+                    std::memcpy(code_words.data(), codes.data(), codes.size());
+                    const nqs::NativeQuantisedMetadataPlanes coded{
+                        code_words.data(), super_words.data(), nullptr, phase,
+                        NativeQuantisedMetadataRepresentation::SuperblockCoded, shift};
+                    const Form expected_form = nqs::nativeQuantisedByteAlignedCodePlane(CB) && shift == 0
+                                                   ? Form::CodedByteAligned
+                                                   : Form::Coded;
+                    ASSERT_EQ(selectedForm<CB>(coded), expected_form) << "shift " << shift;
+                    for (std::uint32_t block = 0; block < blocks; ++block)
+                        for (std::uint32_t row = 0; row < rows; ++row)
+                        {
+                            const auto address = nqs::blockMajorAddress(coded, block, row, rows);
+                            const auto want = nqs::loadBlockMetadata<CB>(coded, address);
+                            ASSERT_TRUE(sameWords(nqs::loadBlockMetadataAs<CB, Form::Coded>(coded, address), want))
+                                << "shift " << shift << " phase " << phase << " block " << block << " row " << row;
+                            if constexpr (nqs::nativeQuantisedByteAlignedCodePlane(CB))
+                                if (shift == 0)
+                                    ASSERT_TRUE(sameWords(
+                                        nqs::loadBlockMetadataAs<CB, Form::CodedByteAligned>(coded, address), want))
+                                        << "phase " << phase << " block " << block << " row " << row;
+                        }
+                }
+            const std::size_t count = std::size_t{rows} * blocks;
+            std::vector<std::uint16_t> primary(count), secondary(count);
+            std::vector<std::uint32_t> emins(count);
+            for (auto &w : primary) w = static_cast<std::uint16_t>(rng());
+            for (auto &w : secondary) w = static_cast<std::uint16_t>(rng());
+            for (auto &w : emins) w = rng();
+            for (const bool with_secondary : {false, true})
+            {
+                const nqs::NativeQuantisedMetadataPlanes per_block{
+                    primary.data(), with_secondary ? secondary.data() : nullptr, CB == 10 ? emins.data() : nullptr, 0,
+                    NativeQuantisedMetadataRepresentation::PerBlockPlanes, 0};
+                ASSERT_EQ(selectedForm<CB>(per_block), Form::PerBlock);
+                for (std::uint32_t block = 0; block < blocks; ++block)
+                    for (std::uint32_t row = 0; row < rows; ++row)
+                    {
+                        const auto address = nqs::blockMajorAddress(per_block, block, row, rows);
+                        ASSERT_TRUE(sameWords(nqs::loadBlockMetadataAs<CB, Form::PerBlock>(per_block, address),
+                                              nqs::loadBlockMetadata<CB>(per_block, address)));
+                    }
+            }
+        }
+    } // namespace
+
+    /**
+     * The CUDA prefill hot loops branch once on the matrix representation and
+     * read metadata through loadBlockMetadataAs(); that must return exactly
+     * the runtime loader's words for every separate-code-plane codebook,
+     * every code bit shift and every superblock phase.
+     */
+    TEST(NativeQuantisedSuperblockMetadata, CompileTimeReadFormsMatchTheRuntimeLoader)
+    {
+        expectReadFormsMatchRuntimeLoader<5>();
+        expectReadFormsMatchRuntimeLoader<7>();
+        expectReadFormsMatchRuntimeLoader<8>();
+        expectReadFormsMatchRuntimeLoader<9>();
+        expectReadFormsMatchRuntimeLoader<10>();
+        expectReadFormsMatchRuntimeLoader<11>();
+        expectReadFormsMatchRuntimeLoader<13>();
+        expectReadFormsMatchRuntimeLoader<17>();
+        expectReadFormsMatchRuntimeLoader<24>();
     }
 } // namespace llaminar2::native_quantised_superblock::test

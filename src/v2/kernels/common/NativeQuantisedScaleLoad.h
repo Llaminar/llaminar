@@ -42,6 +42,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <type_traits>
 
 #if defined(__CUDACC__) || defined(__HIPCC__)
 #define LLAMINAR_NATIVE_QUANTISED_SCALE_HD __host__ __device__ __forceinline__
@@ -225,6 +226,118 @@ namespace llaminar2::native_quantised_scale
     }
 
     /**
+     * @brief Compile-time read form of one matrix's block metadata.
+     *
+     * `PerBlock` reads the per-block planes. `Coded` reads the superblock-coded
+     * planes through native_quantised_superblock::loadCode(). `CodedByteAligned`
+     * is the same coded read for a separate code plane whose code width is 8
+     * or 16 bits and whose code bit shift is zero: every code is then exactly
+     * one aligned plane element, so one element load replaces loadCode()'s two
+     * or three byte loads (bit-identical: the shift is zero and the mask keeps
+     * the whole element).
+     */
+    enum class NativeQuantisedMetadataReadForm : std::uint8_t
+    {
+        PerBlock = 0,
+        Coded = 1,
+        CodedByteAligned = 2,
+    };
+
+    /** @return Whether codebook @p codebook has a separate 8- or 16-bit code plane. */
+    LLAMINAR_NATIVE_QUANTISED_SCALE_HD constexpr bool nativeQuantisedByteAlignedCodePlane(std::uint8_t codebook)
+    {
+        return native_quantised_superblock::superblockCodePlaneBits(codebook) == 8u ||
+               native_quantised_superblock::superblockCodePlaneBits(codebook) == 16u;
+    }
+
+    /**
+     * @brief Load one block's staged metadata words with the read form fixed at compile time.
+     * @tparam Codebook Physical execution codebook.
+     * @tparam Form Read form; withMetadataRepresentation() selects it from the
+     *         matrix's uniform representation and code bit shift.
+     * @param planes Matrix planes, phase and representation.
+     * @param address Block address (linear plus superblock index).
+     * @return Exactly loadBlockMetadata() for a matrix of that form.
+     *
+     * loadBlockMetadata() is the runtime composition of these instantiations.
+     * Hot loops that read several blocks or matrices per step (BK64 operand
+     * decode, paired gate/up IMMA staging) branch once on the uniform form and
+     * call this, so every load of the step sits in one straight-line block the
+     * scheduler can overlap, as the per-block kernels did before the coded
+     * representation. A branch per read instead ends each read's basic block
+     * with its own reconstruction and serializes one global-load latency per
+     * read (PR #73 GB10 prefill regression).
+     */
+    template <std::uint8_t Codebook, NativeQuantisedMetadataReadForm Form>
+    LLAMINAR_NATIVE_QUANTISED_SCALE_HD StagedBlockMetadata loadBlockMetadataAs(
+        const NativeQuantisedMetadataPlanes &planes, BlockAddress address)
+    {
+        namespace sb = native_quantised_superblock;
+        if constexpr (Form == NativeQuantisedMetadataReadForm::CodedByteAligned)
+        {
+            static_assert(nativeQuantisedSuperblockCodable(Codebook) && nativeQuantisedByteAlignedCodePlane(Codebook),
+                          "byte-aligned reads need a separate 8- or 16-bit code plane");
+            using Element = std::conditional_t<sb::superblockCodePlaneBits(Codebook) == 16u, std::uint16_t,
+                                               std::uint8_t>;
+            const std::uint32_t code =
+                static_cast<const Element *>(static_cast<const void *>(planes.primary))[address.linear];
+            return sb::decodeSuperblockMetadata<Codebook>(code,
+                                                          sb::loadSuperblock<Codebook>(planes.secondary,
+                                                                                       address.superblock));
+        }
+        else if constexpr (Form == NativeQuantisedMetadataReadForm::Coded)
+        {
+            static_assert(nativeQuantisedSuperblockCodable(Codebook),
+                          "only superblock-codable codebooks have a coded representation");
+            return sb::loadBlockMetadata<Codebook>(planes.primary, planes.secondary, address, planes.code_bit_shift);
+        }
+        else
+        {
+            StagedBlockMetadata out;
+            out.primary = loadStagedPrimary<Codebook>(planes.primary, address.linear);
+            out.secondary = planes.secondary ? static_cast<const std::uint16_t *>(planes.secondary)[address.linear]
+                                             : std::uint16_t{0};
+            // Only Q2_K owns an effective-minimum plane; never keep the pointer live otherwise.
+            if constexpr (Codebook == 10)
+                out.emin = planes.emins ? planes.emins[address.linear] : std::uint32_t{0};
+            return out;
+        }
+    }
+
+    /** @brief Compile-time read-form tag passed to withMetadataRepresentation() bodies. */
+    template <NativeQuantisedMetadataReadForm Form>
+    using NativeQuantisedMetadataReadFormTag = std::integral_constant<NativeQuantisedMetadataReadForm, Form>;
+
+    /**
+     * @brief Invoke @p body with the matrix's metadata read form as a compile-time constant.
+     * @param planes Matrix planes whose uniform representation and code bit shift select the form.
+     * @param body Callable taking a NativeQuantisedMetadataReadFormTag; codebooks
+     *        that cannot be coded instantiate only the per-block form.
+     * @return The value @p body returns.
+     *
+     * One uniform branch per call replaces one branch per metadata read inside
+     * @p body (see loadBlockMetadataAs()).
+     */
+    template <std::uint8_t Codebook, class Body>
+    LLAMINAR_NATIVE_QUANTISED_SCALE_HD decltype(auto) withMetadataRepresentation(
+        const NativeQuantisedMetadataPlanes &planes, Body &&body)
+    {
+        if constexpr (nativeQuantisedSuperblockCodable(Codebook))
+        {
+            if (planes.coded())
+            {
+                if constexpr (nativeQuantisedByteAlignedCodePlane(Codebook))
+                {
+                    if (planes.code_bit_shift == 0)
+                        return body(NativeQuantisedMetadataReadFormTag<NativeQuantisedMetadataReadForm::CodedByteAligned>{});
+                }
+                return body(NativeQuantisedMetadataReadFormTag<NativeQuantisedMetadataReadForm::Coded>{});
+            }
+        }
+        return body(NativeQuantisedMetadataReadFormTag<NativeQuantisedMetadataReadForm::PerBlock>{});
+    }
+
+    /**
      * @brief Load one block's staged metadata words through the representation authority.
      * @tparam Codebook Physical execution codebook.
      * @param planes Matrix planes, phase and representation.
@@ -243,17 +356,9 @@ namespace llaminar2::native_quantised_scale
         if constexpr (nativeQuantisedSuperblockCodable(Codebook))
         {
             if (planes.coded())
-                return native_quantised_superblock::loadBlockMetadata<Codebook>(planes.primary, planes.secondary,
-                                                                                address, planes.code_bit_shift);
+                return loadBlockMetadataAs<Codebook, NativeQuantisedMetadataReadForm::Coded>(planes, address);
         }
-        StagedBlockMetadata out;
-        out.primary = loadStagedPrimary<Codebook>(planes.primary, address.linear);
-        out.secondary = planes.secondary ? static_cast<const std::uint16_t *>(planes.secondary)[address.linear]
-                                         : std::uint16_t{0};
-        // Only Q2_K owns an effective-minimum plane; never keep the pointer live otherwise.
-        if constexpr (Codebook == 10)
-            out.emin = planes.emins ? planes.emins[address.linear] : std::uint32_t{0};
-        return out;
+        return loadBlockMetadataAs<Codebook, NativeQuantisedMetadataReadForm::PerBlock>(planes, address);
     }
 
     /** @brief Load and decode block @p linear directly from the global plane. */
