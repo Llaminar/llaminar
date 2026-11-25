@@ -125,22 +125,64 @@ std::vector<planning::WitnessRequest> PhysicalPagePool::liveWitnessRequests() co
     for (const auto &request : requests_)
         if (request.live)
             requests.push_back({.generation=request.generation,
-                .peak_frames=request.requested,
+                .peak_frames=request.declared_peak,
                 .occupied_frames=request.assigned,
                 .preserved=false});
     return requests;
 }
 
-std::optional<PhysicalPagePool::Grant> PhysicalPagePool::tryAdmitWithWitness(std::size_t pages)
+std::optional<PhysicalPagePool::Grant> PhysicalPagePool::tryAdmitWithWitness(
+    std::size_t declared_peak, std::size_t initial_grant)
 {
-    if (!pages || pages > geometry_.max_pages_per_request)
-        throw std::invalid_argument("Witness page commitment is outside the declared per-request bound");
-    // Prove the completion order for the proposed live set before mutation.
+    if (!declared_peak || declared_peak > geometry_.max_pages_per_request)
+        throw std::invalid_argument("Witness peak is outside the declared per-request bound");
+    if (!initial_grant || initial_grant > declared_peak)
+        throw std::invalid_argument("Initial witness grant must be positive and within the declared peak");
+    // Proof before mutation: the proposed live set must have a completion
+    // order. The new request enters with its finite initial grant as occupied,
+    // because that grant converts to O immediately after admission.
     auto live = liveWitnessRequests();
-    live.push_back({.generation=0, .peak_frames=pages, .occupied_frames=0, .preserved=false});
+    live.push_back({.generation=0, .peak_frames=declared_peak, .occupied_frames=initial_grant, .preserved=false});
     if (!planning::proveCompletionOrder(geometry_.frames, live).valid())
         return std::nullopt;
-    return tryAdmit(pages);
+    // Conservation under the INFINITE-GRANT model is the finite-operation
+    // sum; the witness bounds the peak promise, never the converted grant.
+    if (initial_grant > geometry_.frames - protected_pages_)
+        return std::nullopt;
+    for (std::size_t i = 0; i < requests_.size(); ++i)
+    {
+        auto &request = requests_[i];
+        if (request.live) continue;
+        if (request.generation == std::numeric_limits<std::uint64_t>::max())
+            throw std::overflow_error("Page grant generation exhausted");
+        auto self = shared_from_this();
+        ++request.generation;
+        request.declared_peak = declared_peak;
+        request.remaining = initial_grant;
+        request.assigned = 0;
+        request.live = true;
+        protected_pages_ += initial_grant;
+        return Grant(std::move(self), i, request.generation);
+    }
+    return std::nullopt;
+}
+
+bool PhysicalPagePool::extendWithWitness(Grant &grant, std::size_t pages)
+{
+    (void)require(grant);
+    auto &request = requests_[grant.record_];
+    if (!pages || request.remaining > geometry_.max_pages_per_request - pages ||
+        request.assigned + request.remaining + pages > request.declared_peak)
+        throw std::logic_error("Witness extension exceeds the declared peak");
+    // Revalidate the witness for the proposed state before converting grant.
+    auto live = liveWitnessRequests();
+    if (!planning::proveCompletionOrder(geometry_.frames, live).valid())
+        return false;
+    if (pages > geometry_.frames - protected_pages_)
+        return false;
+    request.remaining += pages;
+    protected_pages_ += pages;
+    return true;
 }
 
 std::optional<PhysicalPagePool::Grant> PhysicalPagePool::tryAdmit(std::size_t pages)
@@ -158,7 +200,7 @@ std::optional<PhysicalPagePool::Grant> PhysicalPagePool::tryAdmit(std::size_t pa
         // Acquire retained ownership before mutating the request record.
         auto self = shared_from_this();
         ++request.generation;
-        request.requested = pages;
+        request.declared_peak = pages;
         request.remaining = pages;
         request.assigned = 0;
         request.live = true;

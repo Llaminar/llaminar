@@ -97,10 +97,12 @@ TEST(CompletionWitness, PreservedRequestContinuesAtCurrentExtent)
     EXPECT_EQ(witness.steps.front().kind, WitnessStep::Kind::Preserve);
 }
 
-/** @test tryAdmitWithWitness refuses the design's impossible exact-fit case before mutation. */
-TEST(CompletionWitness, PoolAdmissionRefusesBeforeMutationWhenSummedMaximaExceed)
+/** @test tryAdmitWithWitness uses finite grants plus a proved order, never summed maxima. */
+TEST(CompletionWitness, PoolAdmissionUsesFiniteGrantsWithProvedOrder)
 {
     const auto device = DeviceId::cpu();
+    // 32-frame pool: two requests with peak 32 each holding one frame cannot
+    // both be witness-admitted (order proof fails); refusal mutates nothing.
     const PhysicalPagePoolGeometry geometry32{32, 64, 4, 32};
     const auto bytes32 = PhysicalPagePool::physicalBytes(geometry32, device);
     PhysicalMemoryPlanBuilder plan32;
@@ -109,23 +111,43 @@ TEST(CompletionWitness, PoolAdmissionRefusesBeforeMutationWhenSummedMaximaExceed
     auto authority32 = std::make_shared<PhysicalMemoryAuthority>(
         std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan32.build()), 0);
     auto pool32 = authority32->createCPUPagePool(device, geometry32, CPUStoragePlacement::local());
-    auto first = pool32->tryAdmitWithWitness(32);
+    auto first = pool32->tryAdmitWithWitness(32, 1);
     ASSERT_TRUE(first);
     (void)first->assignFrame();
-    EXPECT_FALSE(pool32->tryAdmitWithWitness(32));
+    // Design §5.3: with A holding 1K, B's finite 1K admission enters with 1K
+    // occupied, so A would need 31K but only 30K is free -> refused exactly.
+    EXPECT_FALSE(pool32->tryAdmitWithWitness(32, 1));
     EXPECT_EQ(first->assignedFrames().size(), 1u);
-    // Non-witness admission also refuses at the same summed-maximum bound.
-    EXPECT_FALSE(pool32->tryAdmit(32));
+
+    // Design §5.3's 40K example: two peak-32 requests holding four each.
+    // Finite initial grants (1 each) plus a proved completion order admit both;
+    // summed maxima (32+32 > 40) never blocks because no request converts its
+    // whole peak before an order exists.
+    const PhysicalPagePoolGeometry geometry40{40, 64, 4, 32};
+    const auto bytes40 = PhysicalPagePool::physicalBytes(geometry40, device);
+    PhysicalMemoryPlanBuilder plan40;
+    plan40.add({.world_rank=0, .device=device, .total_bytes=bytes40, .admission_available_bytes=bytes40},
+        PhysicalMemoryOwner::KVCache, bytes40);
+    auto authority40 = std::make_shared<PhysicalMemoryAuthority>(
+        std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan40.build()), 0);
+    auto pool40 = authority40->createCPUPagePool(device, geometry40, CPUStoragePlacement::local());
+    auto a = pool40->tryAdmitWithWitness(32, 1);
+    ASSERT_TRUE(a);
+    auto b = pool40->tryAdmitWithWitness(32, 1);
+    ASSERT_TRUE(b);
+    // Extend each to its occupied four without summing maxima: the order proof
+    // still holds (each advance fits after the other's current extent).
+    EXPECT_TRUE(pool40->extendWithWitness(*a, 3));
+    EXPECT_TRUE(pool40->extendWithWitness(*b, 3));
+    for (int i = 0; i < 4; ++i) (void)a->assignFrame();
+    for (int i = 0; i < 4; ++i) (void)b->assignFrame();
+    EXPECT_EQ(a->assignedFrames().size(), 4u);
+    EXPECT_EQ(b->assignedFrames().size(), 4u);
 }
 
-/** @test O-based witness accounting for the design's 40K case is the open next step. */
-TEST(CompletionWitness, FortyFrameOrderAccountingRemainsOpenRequirement)
+/** @test Witness extension refuses once the order would break or the peak is exceeded. */
+TEST(CompletionWitness, WitnessExtensionRefusesWhenOrderOrPeakBreaks)
 {
-    // Design §5.3: 40K pool, two requests holding 4K each, one needs 28K -> an
-    // order exists. Current tryAdmitWithWitness protects summed declared maxima
-    // (32+32 > 40) and therefore still refuses. This documents the honest gap:
-    // witness-based optimistic admission must not sum independent maxima; the
-    // pool's O/G/T accounting must integrate the witness first.
     const auto device = DeviceId::cpu();
     const PhysicalPagePoolGeometry geometry40{40, 64, 4, 32};
     const auto bytes40 = PhysicalPagePool::physicalBytes(geometry40, device);
@@ -135,12 +157,11 @@ TEST(CompletionWitness, FortyFrameOrderAccountingRemainsOpenRequirement)
     auto authority40 = std::make_shared<PhysicalMemoryAuthority>(
         std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan40.build()), 0);
     auto pool40 = authority40->createCPUPagePool(device, geometry40, CPUStoragePlacement::local());
-    auto a = pool40->tryAdmitWithWitness(32);
+    auto a = pool40->tryAdmitWithWitness(32, 1);
     ASSERT_TRUE(a);
-    for (int i = 0; i < 4; ++i) (void)a->assignFrame();
-    // Currently refused under summed-maximum accounting; this assertion documents
-    // the open requirement rather than pretending the order path is done.
-    EXPECT_FALSE(pool40->tryAdmitWithWitness(32));
+    EXPECT_THROW(pool40->extendWithWitness(*a, 32), std::logic_error); // Beyond declared peak.
+    EXPECT_TRUE(pool40->extendWithWitness(*a, 31));                     // Exactly the peak.
+    EXPECT_THROW(pool40->extendWithWitness(*a, 1), std::logic_error);   // Peak already reached.
 }
 
 /** @test Impossible geometry and inconsistent requests are typed refusals, never guessed orders. */

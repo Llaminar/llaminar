@@ -305,14 +305,22 @@ public:
     std::optional<Grant> tryAdmit(std::size_t pages);
     /**
      * @brief Try to admit under a bounded completion-order witness.
-     * @param pages Declared peak pages for the new request.
+     * @param declared_peak Maximum pages the request may reach (design §5.3).
+     * @param initial_grant Finite-operation pages granted immediately (G).
      * @return A grant only when a completion order exists for the whole
      * resulting live set; otherwise empty and nothing was mutated.
      * @note The witness is the page-frame resource subset; the complete
      * all-resource/topology witness must be composed by the caller before
      * execution admission (design §5.3).
      */
-    std::optional<Grant> tryAdmitWithWitness(std::size_t pages);
+    std::optional<Grant> tryAdmitWithWitness(std::size_t declared_peak, std::size_t initial_grant);
+    /**
+     * @brief Convert one more finite-operation page under a revalidated witness.
+     * @param grant Original live grant to extend.
+     * @return True when protected growth increased and the witness still holds.
+     * @throws std::logic_error For a stale/foreign grant or peak overflow.
+     */
+    bool extendWithWitness(Grant &grant, std::size_t pages);
     /** @return Current live requests as witness inputs; no observed frame copies. */
     std::vector<planning::WitnessRequest> liveWitnessRequests() const;
     /** @return Immutable dimensions; not an observation of device state. */
@@ -342,9 +350,9 @@ private:
     struct Request
     {
         std::uint64_t generation = 0;
-        std::size_t requested = 0; ///< Declared peak pages admitted with this grant.
-        std::size_t remaining = 0;
-        std::size_t assigned = 0;
+        std::size_t declared_peak = 0; ///< Declared maximum pages, witness input only.
+        std::size_t remaining = 0;     ///< Unconverted finite-operation grant (G).
+        std::size_t assigned = 0;      ///< Occupied frames (O contribution).
         bool live = false;
     };
     PhysicalPagePool(std::shared_ptr<PhysicalMemoryAuthority> authority, DeviceId device,
