@@ -161,6 +161,8 @@ namespace llaminar2
         // be reset, and admit nothing more.
         failure_ = reason;
         PerfStatsCollector::addCounter("serving", "seals", 1.0, "serving_rows", "cpu");
+        PerfStatsCollector::addCounter("serving", "sealed_rows", static_cast<double>(rows_.size() + queue_.size()),
+                                       "serving_rows", "cpu");
         auto fail = [&](std::uint64_t id, int prompt_tokens, int completion_tokens) {
             ServingBatchEvent event;
             event.id = id;
@@ -420,7 +422,12 @@ namespace llaminar2
             // PerfStats proof the serving-row path ran: one count per shared
             // forward and its live rows (decode rows are width one).
             PerfStatsCollector::addCounter("serving", kind, 1.0, "serving_rows", "cpu");
-            PerfStatsCollector::addCounter("serving", "forward_rows", static_cast<double>(rows.size()),
+            std::size_t tokens = 0;
+            for (const auto &row : rows)
+                tokens += row.size();
+            PerfStatsCollector::addCounter("serving", "forward_sequences", static_cast<double>(rows.size()),
+                                           "serving_rows", "cpu");
+            PerfStatsCollector::addCounter("serving", "forward_tokens", static_cast<double>(tokens),
                                            "serving_rows", "cpu");
             if (recorder_)
             {
