@@ -799,8 +799,11 @@ namespace llaminar2
 
                      if (!parsed_request->stream)
                      {
-                         ServingBatchDriver::RequestScope scope(
-                             std::make_shared<ServingRequestCancellation>(), admitted);
+                         // Non-streaming clients are never written to while
+                         // waiting: probe the socket so a disconnect cancels.
+                         auto cancellation = std::make_shared<ServingRequestCancellation>();
+                         cancellation->setConnectionProbe(req.is_connection_closed);
+                         ServingBatchDriver::RequestScope scope(cancellation, admitted);
                          const auto response = handler.handleRequest(*parsed_request, arrival);
                          res.status = response.http_status;
                          res.set_content(response.json_body, "application/json");
@@ -841,6 +844,9 @@ namespace llaminar2
                      res.set_chunked_content_provider(
                          "text/event-stream",
                          [channel, transport_open, cancellation, streamed_response_body](size_t, httplib::DataSink &sink) -> bool {
+                             // Idle polls between SSE keep-alive comments (10 s).
+                             constexpr int kHeartbeatPolls = 50;
+                             int idle_polls = 0;
                              for (;;)
                              {
                                  std::string line;
@@ -849,11 +855,27 @@ namespace llaminar2
                                  if (status == SSEPublishChannel::PopStatus::Closed)
                                      break;
                                  // While the request waits (queued, prefilling or
-                                 // paced) probe the client so a disconnect frees
-                                 // its slot without waiting for the next token.
-                                 const bool alive = status == SSEPublishChannel::PopStatus::Line
-                                                        ? sink.write(line.c_str(), line.size())
-                                                        : sink.is_writable();
+                                 // paced) probe the client (writability plus a
+                                 // socket liveness peek) so a disconnect frees
+                                 // its slot without waiting for the next token,
+                                 // and periodically send an SSE comment, which a
+                                 // reset connection turns into a write error.
+                                 bool alive = true;
+                                 if (status == SSEPublishChannel::PopStatus::Line)
+                                 {
+                                     idle_polls = 0;
+                                     alive = sink.write(line.c_str(), line.size());
+                                 }
+                                 else if (++idle_polls >= kHeartbeatPolls)
+                                 {
+                                     idle_polls = 0;
+                                     static constexpr char kHeartbeat[] = ": keep-alive\n\n";
+                                     alive = sink.write(kHeartbeat, sizeof(kHeartbeat) - 1);
+                                 }
+                                 else
+                                 {
+                                     alive = sink.is_writable();
+                                 }
                                  if (!alive)
                                  {
                                      transport_open->store(false);

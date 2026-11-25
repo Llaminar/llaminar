@@ -1338,9 +1338,20 @@ explicit, rather than reporting zero usage. PUT does not reset OS gauges.
 It resets counters and the last-request record without clearing the prefix
 cache, changing the model, or interrupting inference. A request already
 executing remains visible under `requests.active`, but its eventual outcome
-is excluded from the new epoch. `active_in_current_epoch` makes that boundary
-explicit. Queued requests are counted when the inference worker starts them.
+is excluded from the new epoch. `active_in_current_epoch` counts the active
+requests that started in the current epoch, making that boundary explicit.
+Queued requests are counted when the inference worker starts them.
 Uptime and request sequence numbers continue across resets.
+
+With continuous batching (`--serving-resident-slots` S > 1) several requests
+are active at once: `requests.active` is their count, `active_requests` lists
+each with its own `sequence`, `phase`, `seconds` and `in_current_epoch`, and
+the scalar `active_phase`, `active_sequence` and `active_seconds` describe the
+oldest active request. `inference_queue.mode` is `serialized` (S = 1: the
+executor's `capacity`, `admitted`, `queued`, `active`) or
+`continuous_batching` (`response_leases` R and admitted `responses`,
+`execution_capacity` S + Q and `executing` requests, `resident_slots`, the
+session's resident `active` and `queued` rows, and the PMA `committed_bytes`).
 
 | Field | Meaning |
 |---|---|

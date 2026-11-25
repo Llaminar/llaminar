@@ -18283,6 +18283,8 @@ add_v2_test(V2_Integration_ServingStepReplay
 add_executable(v2_test_serving_batch_driver unit/app/modes/Test__ServingBatchDriver.cpp)
 target_include_directories(v2_test_serving_batch_driver PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/mocks
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../external/vendor
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../external/vendor/cpp-httplib
 )
 target_link_libraries(v2_test_serving_batch_driver llaminar2_core GTest::gtest GTest::gtest_main GTest::gmock)
 add_v2_test(V2_Unit_ServingBatchDriver

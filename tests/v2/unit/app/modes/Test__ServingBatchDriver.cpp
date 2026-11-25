@@ -11,6 +11,15 @@
 
 #include "app/modes/ServingBatchDriver.h"
 #include "MockOrchestrationRunner.h"
+#include "MockTokenizer.h"
+#include "app/modes/ChatCompletionHandler.h"
+#include "app/modes/ServerMode.h"
+#include "httplib.h"
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include <gtest/gtest.h>
 
@@ -539,5 +548,67 @@ namespace llaminar2::test
         ASSERT_TRUE(complete);
         auto next = pool.tryAcquire();
         EXPECT_TRUE(next) << "row finished: the execution claim is free while the response publishes";
+    }
+
+    TEST(BatchedServingEndpoint, DisconnectWhileQueuedReleasesAdmissionWithinABound)
+    {
+        // Real HTTP serving over the scripted runner: the request can never
+        // enter a slot (resident capacity 0), so only the transport probe can
+        // retire it. A client that disconnects must free its lease quickly.
+        FakeServingRunner runner;
+        runner.resident_capacity = 0;
+        ::testing::NiceMock<MockTokenizer> tokenizer;
+        ON_CALL(tokenizer, encodeChat(::testing::_, ::testing::_, ::testing::_, ::testing::_))
+            .WillByDefault(::testing::Return(std::vector<int>(8, 7)));
+        ON_CALL(tokenizer, decode_token(::testing::_)).WillByDefault(::testing::Return("x"));
+        ChatCompletionHandler handler(runner, tokenizer, "fixture-model");
+        ServingBatchDriver driver(runner, 2, kContext);
+        handler.setGenerationLaneFactory(
+            [&driver] { return driver.makeLane(); },
+            [&driver](const std::function<void(IOrchestrationRunner &)> &access) { driver.call(access); });
+        std::string error;
+        ASSERT_TRUE(driver.start(error)) << error;
+        ServingResponseLeasePool leases(resolveInstalledServingCapacity(ServingCapacityRequest::authored(2, 4, 2)));
+        httplib::Server server;
+        configureInferenceHttpServer(server, std::size_t{6});
+        registerBatchedChatCompletionEndpoint(server, handler, leases, {}, [] { return std::string{}; });
+        const int port = server.bind_to_any_port("127.0.0.1");
+        ASSERT_GT(port, 0);
+        std::thread listener([&] { listenInferenceHttpServer(server); });
+
+        const std::string body = R"({"messages":[{"role":"user","content":"hello"}],"max_tokens":8})";
+        const std::string request = "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                                    "Content-Type: application/json\r\nContent-Length: " +
+                                    std::to_string(body.size()) + "\r\n\r\n" + body;
+        const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        ASSERT_GE(fd, 0);
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_port = htons(static_cast<uint16_t>(port));
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        ASSERT_EQ(::connect(fd, reinterpret_cast<sockaddr *>(&address), sizeof(address)), 0);
+        ASSERT_EQ(::send(fd, request.data(), request.size(), 0), static_cast<ssize_t>(request.size()));
+
+        auto eventually = [](auto predicate) {
+            for (int i = 0; i < 300; ++i) // 3 s bound
+            {
+                if (predicate())
+                    return true;
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+            return predicate();
+        };
+        ASSERT_TRUE(eventually([&] { return leases.snapshot().executing == 1; })) << "request admitted and queued";
+        ::close(fd); // the client goes away while its request is queued
+        EXPECT_TRUE(eventually([&] { return runner.cancelled() == std::vector<std::uint64_t>{1}; }))
+            << "transport probe cancels the queued serving request";
+        EXPECT_TRUE(eventually([&] {
+            const auto state = leases.snapshot();
+            return state.executing == 0 && state.responses == 0;
+        })) << "execution claim and response lease are released";
+
+        server.stop();
+        listener.join();
+        driver.stop();
     }
 } // namespace llaminar2::test

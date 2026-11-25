@@ -14,6 +14,7 @@
 
 #include <string>
 #include <functional>
+#include "app/modes/ServingResponseLeasePool.h"
 #include <memory>
 #include <nlohmann/json.hpp>
 
@@ -54,6 +55,16 @@ namespace llaminar2
      * @param executor Sole inference worker and response reservation authority.
      * @param stream_observer Optional trace-only body attachment, never a token/state probe.
      */
+    /**
+     * @brief Chat endpoint for continuous batching (S > 1): every request runs
+     *        concurrently through the handler's batched lane, admitted against
+     *        PMA-backed response leases; @p serving_failure reports a sealed
+     *        session (answered 503).
+     */
+    void registerBatchedChatCompletionEndpoint(
+        httplib::Server &server, ChatCompletionHandler &handler, ServingResponseLeasePool &leases,
+        HttpStreamObserver stream_observer, std::function<std::string()> serving_failure);
+
     void registerChatCompletionEndpoint(httplib::Server &server, ChatCompletionHandler &handler,
                                         SerializedInferenceExecutor &executor,
                                         HttpStreamObserver stream_observer = {});

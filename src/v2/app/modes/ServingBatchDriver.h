@@ -111,10 +111,41 @@ namespace llaminar2
             return cancelled_;
         }
 
+        /**
+         * @brief Transport liveness probe (true once the client is gone).
+         *
+         * Waiting lanes poll it, so a disconnect is noticed while the request
+         * is queued or between tokens even when nothing is written.
+         */
+        void setConnectionProbe(std::function<bool()> connection_closed)
+        {
+            std::lock_guard lock(mutex_);
+            connection_closed_ = std::move(connection_closed);
+        }
+
+        /** @brief Cancel when the probe reports a closed connection; true when cancelled. */
+        bool pollConnection()
+        {
+            std::function<bool()> probe;
+            {
+                std::lock_guard lock(mutex_);
+                if (cancelled_)
+                    return true;
+                probe = connection_closed_;
+            }
+            if (probe && probe())
+            {
+                cancel();
+                return true;
+            }
+            return false;
+        }
+
     private:
         mutable std::mutex mutex_;
         bool cancelled_ = false;
         std::function<void()> on_cancel_;
+        std::function<bool()> connection_closed_;
     };
 
     class ServingBatchDriver
@@ -578,9 +609,7 @@ namespace llaminar2
                 driver_.grant(id_, max_tokens);
                 lock.lock();
             }
-            mailbox_->cv.wait(lock, [&] {
-                return !mailbox_->tokens.empty() || mailbox_->finish != ServingFinishReason::None;
-            });
+            waitForOutput(lock);
             return drain(max_tokens, result);
         }
 
@@ -605,9 +634,7 @@ namespace llaminar2
             lock.unlock();
             driver_.force(id_, token);
             lock.lock();
-            mailbox_->cv.wait(lock, [&] {
-                return !mailbox_->tokens.empty() || mailbox_->finish != ServingFinishReason::None;
-            });
+            waitForOutput(lock);
             return drain(1, result);
         }
 
@@ -630,6 +657,28 @@ namespace llaminar2
         }
 
     private:
+        /** @brief Poll interval of the transport probe while waiting for output. */
+        static constexpr std::chrono::milliseconds kConnectionPoll{200};
+
+        /**
+         * @brief Wait (mailbox lock held) for output or a terminal state,
+         *        polling the transport so a vanished client cancels the request.
+         */
+        void waitForOutput(std::unique_lock<std::mutex> &lock)
+        {
+            auto ready = [&] {
+                return !mailbox_->tokens.empty() || mailbox_->finish != ServingFinishReason::None;
+            };
+            while (!mailbox_->cv.wait_for(lock, kConnectionPoll, ready))
+            {
+                if (!cancellation_)
+                    continue;
+                lock.unlock();
+                (void)cancellation_->pollConnection(); // posts the runner cancellation once
+                lock.lock();
+            }
+        }
+
         /** @brief Move up to @p max_tokens delivered tokens out (mailbox lock held). */
         GenerationResult &drain(int max_tokens, GenerationResult &result)
         {
