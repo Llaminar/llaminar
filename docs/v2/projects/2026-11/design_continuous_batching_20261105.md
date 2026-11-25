@@ -1,515 +1,720 @@
-# Continuous batching: proposed serving design
+# Continuous batching with pooled, paged KV
 
-**Date:** 2026-11-05
+**Revision 4 — replacement design, 2026-11-25.** The owner-directed target is
+pooled, paged KV from the first replacement implementation. This revision
+supersedes revision 3 in full, including its fixed-slot/full-context first mode
+and its deferral of live prefix sharing. Logical request records remain;
+dedicated full-context KV partitions do not. Full refactoring is permitted.
 
-**Status:** Revision 3, responding to both independent reviews, including the original CB-01 through CB-20, their second-pass residuals, and CB-21 through CB-26. Proposed contracts only; **not implementation-ready or runtime-qualified**. The user authorized documenting a narrow serving-boundary policy proposal, not adoption of that proposal. Current project maxims remain unchanged. No document correction closes a native proof.
+This is a detailed design, not a dashboard or a capability certificate. The
+companion [implementation plan](plan_continuous_batching_implementation_20261125.md)
+owns sequencing, current gaps and evidence requirements. Earlier
+[research](research_continuous_batching_20261105.md) and
+[reviews](review_continuous_batching_20261105.md) retain their historical,
+source-pinned meaning; their fixed-slot recommendations no longer select the
+target architecture. Historical review seals and failed attempts remain intact.
 
-**Related records:** [Research and pinned source evidence](research_continuous_batching_20261105.md) · [Independent review and finding dispositions](review_continuous_batching_20261105.md).
+The previously adopted serving-boundary decisions remain the starting policy:
+immutable ingress, request-local bounded generation windows, authenticated
+terminal/ticket receipts, and separate execution/response lifetimes. Paging
+adds storage ownership, not another host permission to inspect or control GPU
+execution. Project maxims, native correctness/economy gates and release policy
+still apply. Documentation publication neither implements paging nor qualifies
+an increased serving capacity.
 
-**Provenance:** The isolated branch `feat/continuous-batching-design` starts at develop `ef1f54b0962d63531a9b33e06ca676e5124d05cc`. The initial research inspected `5e2a881aa99a9a4b428110a64b8ff64694c8b6b8`, an **unmerged descendant 100 commits ahead**, not an older develop snapshot. The research distinguishes its original descendant-pinned evidence from the explicitly develop-pinned follow-up controller/capacity audit; review evidence identifies its baseline. No ARM changes are imported by these documents.
+## 1. Decision and scope
 
-This design adopts recorded-input controller/kernel replay and the distinction between detailed records and size-limited dashboards as explicit requirements. Those policy statements exist in the inspected descendant but are absent from the develop policy text. This is a detailed design record, not a tuning dashboard.
+Independent requests share model work and a common pool of physical KV pages.
+A request's logical token positions map to page references; its compute row,
+request-record index and physical page addresses are different coordinates.
+Requests grow, finish and release references independently. Compatible prefixes
+share immutable pages; every append has exclusive writable ownership.
 
-## 1. Goal, decisions, and remaining proof obligations
-
-The goal is **batched serving / continuous batching**: independent client requests share useful execution work, and new requests enter as others finish without waiting for the entire cohort. Merely accepting concurrent sockets is insufficient.
-
-The revised direction is:
-
-> Extend `OrchestrationRunner` into the single multi-request lifecycle authority. Keep persistent request slots separate from compact work rows, and let the execution authority—not HTTP—own generation decisions.
-
-Proposed decisions:
-
-| Concern | Revision-3 proposal | Qualification status |
-|---|---|---|
-| Lifecycle owner | Existing `OrchestrationRunner`; every mode/topology migrates to its per-row seam at capacity one before capacity increases | No second owner or automatic scalar fallback |
-| Serving boundary | Closed typed ingress and bounded-window terminal completions for streaming and non-streaming | Proposed policy amendment only; adoption remains blocked at G1 |
-| First physical mode | Fixed-slot, full-context KV, plus independently sized response storage | Its own PMA/capacity/economy gate; not paged KV |
-| First multi-request shape | One request's canonical prefill chunk per prefill transaction, alternating with grouped decode windows | Aggregated prefill and fused prefill/decode are separate unqualified optimizations |
-| First capacity increase | One CPU endpoint, one CUDA device, or one ROCm device | Development target; all existing topologies first retain capacity-one parity |
-| Pipeline | One model transaction in flight per domain/request; independent event-ordered lifecycle I/O | No speculative host model submissions; copy ownership in §9.6 |
-| HIP selection | Lifecycle/selector after ingress, before the named model transaction | Extra selector receipt explicitly counted; native branch tickets may add more |
-| Publication | Two shared staging banks; detached queues/framing/accumulation sized per response lease | Slot reuse does not release response storage |
-| Numerical policy | Request-intrinsic windows/chunks/depth learning; explicit prefix/placement trace | Same-plan no-movement solo/batch token-byte guarantee is a required proof |
-| Retirement | Distinct lifecycle-only operation; output eligibility uses host-owned one-window grants | Neither operation invents an empty generation |
-
-Phase A preserves currently supported rank-local TP, PP, global/cross-rank TP, multi-domain ExpertOverlay and heterogeneous operation through the same capacity-one seam. **Capacity greater than one on those topologies remains unqualified** until its own gates pass. Capability one is an explicit implementation bound, not a fallback when a higher requested capacity fails.
-
-The first increased-capacity envelope and the smaller diagnostic proof in §14 are not release modes. Default penalties, stochastic sampling, thinking budgets, prefix caching, optimized kernels and currently supported frontend behavior cannot be dropped to advertise batching.
-
-## 2. Existing source does not yet provide this interface
-
-The research documents the positive foundations, but several current contracts are cohort-wide or scalar:
-
-- `DeviceGenerationAdmissionRequest` carries one budget, admission kind, depth policy and ordinary sampling law for its rows. `DeviceGenerationInitialization` carries one kind and session epoch. Current continuation checks require a fixed cohort to enter together and reject mixed completion/host-stepped state.
-- The ordinary captured sampler binds scalar law values, `request_count = 1`, and one penalty-history view. A law-identity change invalidates/rebuilds that graph; this is not a per-row dynamic sampler table.
-- Public batched setup uses one `active_sampling_params_`. A lower-level seed array does not establish independently supplied per-request laws/seeds at the serving interface.
-- Batched verifier continuation rejects penalty-mutated sampling. Model defaults include nonzero presence penalties for important Qwen profiles, so this is a default-traffic gap, not an obscure option.
-- Thinking-budget handling currently reduces the host loop to a one-token budget and injects forced tokens through `forceDecodeToken`. SSE publication currently calls `sink.write` inside the sole inference worker's admitted job.
-- Ring KV backing is allocated per slot and full context. Prefix restore copies into a slot. PMA's existing child allocation claims describe physical backing allocations, not logical page grants inside an already materialized allocation.
-- `IKVCache::StateResetBoundary::SequenceRetirement` is a useful existing seam, but it does not alone retire sampler, MTP, recurrent, publication, or model-runtime ownership.
-- The MPI command vocabulary and several prefix/runtime-summary interfaces are single-request. Terminal prefill logits, ready/pending conditions and prelaunched sidecar handoffs also have runner-global ownership today; interleaving requests requires persistent slot state, not shared scratch.
-- Resident capacity, generation request capacity, HTTP response admission and the fixed-cohort benchmark use different inputs/interfaces. They do not constitute one resolved serving envelope.
-- `MTPSpecRequestBatchOwner` is a host per-call helper with an in-flight mutation lockout, not the GPU serving controller.
-
-These are mandatory implementation prerequisites. Wrapping the current runner in an asynchronous queue would not solve them. See the review record for pinned source paths and concrete failure scenarios.
-
-## 3. One lifecycle owner and one application-facing seam
-
-`OrchestrationRunner` already owns model context, request lifecycle, sampling policy, MTP control and the MPI follower loop. Keep that ownership. Its backend implementation places CPU state on the host and GPU state on the device; the semantic lifecycle is still singular.
-
-The former proposed `ContinuousBatchEngine` above the runner is **withdrawn as a second owner**. A transport/preparation adapter may handle parsing and delivery, but it cannot own another execution controller, KV lifecycle, placement policy, memory ledger, or model scheduler.
-
-```mermaid
-flowchart TD
-    F["HTTP/SSE, completion, oneshot, interactive, benchmark"]
-    P["Bounded preparation: immutable defaults, template, tokenizer"]
-    O["OrchestrationRunner: sole lifecycle and admission authority"]
-    L["Host leases, one-window grants and ordered ingress"]
-    E["Execution authority: CPU host or GPU device"]
-    G["Complete retained execution policy and participant-local graphs"]
-    S["Slot state: KV, handoffs, sampling, MTP, stop/think"]
-    T["TransferEngine and event-qualified terminal staging"]
-    D["Bounded demux into independent request publications"]
-    W["Independent transport writers / result consumers"]
-    M["PhysicalMemoryAuthority: backing and typed BOM"]
-    F --> P --> O
-    O --> L --> E
-    E --> G
-    G <--> S
-    G --> T --> D --> W
-    W -->|"release publication or cancel intent"| L
-    E -->|"immutable outcome / retirement / permitted ticket"| O
-    M -.-> G
-    M -.-> S
-    M -.-> T
-    M -.-> D
-```
-
-The host does not infer live execution state from the diagram's arrows. The permitted payloads are enumerated in §5.
-
-### 3.1 Proposed external interface semantics
-
-| Operation | Meaning | Excluded interpretation |
-|---|---|---|
-| Submit immutable prepared intent | Validate request compatibility and reserve bounded queue/response ownership, or reject explicitly | A GPU slot is already active; caller may mutate runner policy |
-| Consume a publication lease | Observe immutable committed output or a terminal record | Borrow live device state or retain shared batch staging |
-| Cancel a request handle | Submit lifecycle intent for that immutable request lifetime | Free an in-flight slot or interrupt an arbitrary kernel |
-
-A `RequestHandle` identifies an external `RequestId`; it exists before execution admission. The sole lifecycle owner later creates a `ServingSlotBinding = (serving instance, slot, generation)`. The serving-instance identity prevents an old handle/ticket authenticating a reloaded runtime. One binding is replicated across all participants when multi-device support is implemented; per-domain physical addresses are derived from it. Domains must not mint independent generations for the same request.
-
-All application modes migrate: Benchmark, Completion, SingleShot, Interactive, HTTP streaming and HTTP non-streaming. The sequence is explicit:
-
-1. **Phase A — ownership refactor at capacity one:** move every currently supported topology/mode to the same per-row lifecycle, preserving its existing observable behavior, admission semantics and numerical policy. Prove existing gates and recorded parity before removing the replaced scalar ownership/API plumbing. Do not bundle a changed window or delimiter policy into a “no behavior change” claim.
-2. **Policy qualification at capacity one:** after formal adoption of §5, qualify the shared window/control policy and device-native reasoning semantics for all existing topologies/modes. A changed policy gets an explicit version and reviewed evidence; historical token baselines are never silently regenerated. If old streaming/non-streaming semantics disagree, resolve the discrepancy explicitly rather than claiming both are unchanged.
-3. **Phase B — qualified capacity increases:** raise resident capacity only within a typed `ServingCapacityCapability` and the resolved plan. Initially target single endpoints. An explicit higher request is rejected when unqualified, never clamped to one. Capacity one and larger capacities use the same owner, interface and supported kernels.
-
-The unmodified scalar implementation is only the pre-migration starting point. It is not retained as a runtime alternative after replacement. Native semantics, feature parity and policy adoption—not merely interface compilation—gate cutover.
-
-### 3.2 Preparation is not model execution
-
-Preparation uses an immutable model-policy/template/tokenizer snapshot, merges defaults, validates stop/think/tool/sampling intent, and produces immutable prompt data. It cannot call `setSamplingParams`, `setStopTokens`, `clearCache`, or a generation operation.
-
-Either prove the tokenizer/template implementation is safe for concurrent reads, or use a dedicated bounded preparation owner separate from inference submission. Unsupported combinations and malformed requests are rejected before execution mutation and before committing an SSE success response. Queue acceptance and execution admission remain distinct; queue cancellation/overload does not create GPU state.
-
-## 4. Two state machines, not a host mirror
-
-The host record is a **product of independent ownership machines**, not one request-progress enum:
-
-| Component | Host-owned states/facts |
+| Concern | Selected target |
 |---|---|
-| Response lease | Preparing → Queued/Attached → Delivering → Closed; may outlive execution |
-| Execution lease | Unbound → Admitting → Resident → TerminalObserved → Retiring → Released |
-| Publications | Bounded set of reserved/in-flight/detached/drained publication leases for that response |
-| Window grant | At most one outstanding permission per slot-generation, backed by destination storage |
+| Lifecycle | One runner-owned `ServingSession`, through `OrchestrationRunner`; CPU authority on host, GPU authority on device |
+| Physical KV | PMA-admitted pooled pages, consumed directly by append/attention kernels; no per-request full-context backing |
+| Logical capacity | Request records, response leases, queue bounds and pool page geometry are distinct admitted resources |
+| Prefix reuse | Reference compatible resident immutable pages; import nonresident archives once into pooled backing; copy-on-write for a shared tail |
+| Initial pressure policy | Resident-only, guaranteed-completion admission using pooled growth commitments; no implicit overcommit, preemption or offload |
+| Work | One request-intrinsic prefill chunk or a genuinely grouped decode/verifier operation; live extents, never capacity-sized compute |
+| GPU execution | Complete retained transactions; device-owned page selection, tables and lifecycle; no count readbacks or recapture |
+| Future offload | Versioned page identity, source/destination leases, exact read/write frontiers, coherent replicas and effective-use recency designed now |
+| Delivery | Detached, bounded response storage; slow sockets retain neither shared staging nor execution ownership |
 
-For example, `(response=Delivering, execution=Released, publications={p1,p2})` is valid. Terminal response closure waits for its own publications/framer and terminal delivery outcome; execution release waits for its state/event borrowers, not the socket.
+The resident-only pressure choice preserves the existing guarantee that an
+execution-admitted request can reach its declared limit. It is **not** a promise
+of vLLM-style overcommit. Dynamic assignment and shared prefixes are required
+now; elastic admission relying on live-request offload is a later, explicitly
+qualified policy over the same page implementation (§5 and §11).
 
-`Resident` means a host execution lease is held. It says nothing about the GPU row's phase, current position, learner or selected work. Host transitions consume its own reservations and authenticated immutable receipts.
+CPU, CUDA and ROCm, ordinary decode and MTP, dense and MoE, hybrid recurrent
+models and admitted TP/EP/PP topologies all belong to the final target. Work may
+land in qualified slices, but missing combinations remain unqualified rather
+than silently using fixed partitions, scalar serving, disabled prefix caching,
+disabled MTP or a weaker sampling law. Capacity one uses the same paged seam.
+Existing supported behavior must be preserved before replacement cutover.
 
-The execution authority separately owns the slot machine, conceptually:
+## 2. Logical identities, not physical lanes
+
+Use generation-qualified identities with distinct meanings:
+
+| Identity | Meaning |
+|---|---|
+| Request handle | External request lifetime, including queued and completed delivery states |
+| Request binding | Serving-instance identity, request-record index and monotonic generation |
+| Work row | Temporary compact coordinate for one operation; maps back to a request binding and logical token position |
+| Logical KV block | A token interval in a request's ordered history, with its cache-family/role identity |
+| Physical page handle | Pool, participant, storage class, frame index and non-reused frame generation |
+| Published page view | Page handles, valid extents and table version pinned for specified consumers |
+| Archive/replica identity | Immutable content/version and placement/format identity, plus a distinct storage incarnation |
+
+An index retained for request-local sampler or recurrent state is not a KV
+partition. No address formula may recover KV as `slot * full_context_bytes`.
+One long request can use more than `pool_pages / request_capacity` pages while
+other requests use fewer, subject to admission. Repacking live work must not
+move request identity or copy an entire KV history.
+
+Request, frame, grant and table generations never wrap or silently reuse an
+incarnation. Exhaustion fails before admission. Duplicate live external IDs
+are rejected before mutation. Valid late external cancellation is idempotent
+through the old response lifetime; it cannot become a command against a reused
+record. Stale internal handles fail before accessing storage.
+
+## 3. Ownership and interfaces
 
 ```text
-Vacant -> Initializing -> PrefillReady / DecodeReady / OutputBlocked
-       -> Executing -> Ready or Terminal -> Retiring -> Vacant
+frontends -> bounded immutable preparation -> OrchestrationRunner / ServingSession
+                                               |
+                                      execution authority
+                                       |               |
+                               paged request views   live work selection
+                              |                          |
+                 PMA-owned page arena       participant-local model graphs
+                              |                          |
+                    TransferEngine <---- exact producer/consumer frontiers
+                              |
+                 detached publications -> independent response consumers
 ```
 
-GPU phases, lengths, learner state, work selection, stop/think state, and commit decisions never become mutable host fields. `OutputBlocked` means the execution owner has no usable window grant; the host never writes that phase. The host does not track per-request `RunningTransaction` or `Committed` as decoded GPU progress.
+The implementation should concentrate page behavior behind a small, typed
+interface rather than expose free lists, raw reference counts and event edits
+to model files. Names below describe required semantics, not installed classes.
 
-Three leases remain distinct:
-
-| Lease | Retains | Retirement rule |
-|---|---|---|
-| Response | Preparation/queue, detached output, framer and external response lifetime | Delivery outcome and all response-owned publications retire |
-| Execution | One serving-slot generation and its request state | Exact execution/state/transfer borrowers retire |
-| Publication | Detached immutable request output | That request's consumer/framer releases it |
-
-Cache reader leases are separate. A terminal execution does not imply all borrowed storage is free; a slow consumer does not retain a slot once output is detached and execution borrowers are gone.
-
-Slot generations are at least 64-bit, monotonic for their slot, and never reused. Exhaustion fails closed before admission; wrapping is not permitted. A stale execution ticket or invalid internal binding is fatal before state mutation. A legitimate external cancellation of an already terminal request is handled through its terminal identity, not converted into a raw command against a reused slot.
-
-## 5. Normative proposed host/device boundary
-
-**Policy proposal, not adopted policy.** On 2026-11-05 the user selected “Document narrow proposal”. This authorizes writing the proposal below; it does not amend maxims 8/9/11, approve forbidden operations, or authorize runtime changes. G1 has two separate prerequisites: formal policy adoption and then native proof. Tests cannot substitute for the first.
-
-The proposed narrow amendment would:
-- Define the bounded serving transaction as a complete bounded-generation unit for streaming **and non-streaming**, with request-local windows (§7). Non-streaming delivery may accumulate multiple immutable window results.
-- Permit only the enumerated typed admission/policy-install, cancellation and output-grant ingress at declared boundaries; it never authorizes a host model planner or controller shadow.
-- Permit awaiting an exact terminal result/control receipt at that boundary, plus the backend's explicitly enumerated HIP selection/branch tickets. HIP's additional selector completion is a real cost, not hidden in “one wait per window”.
-- Continue to forbid per-token/per-stage/per-leaf waits, stream/device-wide synchronization, live-state polling, host callbacks, hot-path allocation/rebinding, eager execution, recapture and ordinary model-state H2D/D2H.
-
-The intended exception is one completion observation per actual terminal operation/required ticket—not a license to split model work into arbitrary operations and wait on each. §8 enumerates the proposed operation catalog and receipt count. Until adopted, the design is policy-blocked, even if a prototype could be made to run.
-
-A source sanitizer must enforce the closed ingress enum and narrowly owned terminal-completion API, rejecting raw synchronization and unlisted host/device transfers elsewhere. Replay must authenticate epochs/generations and prove that token values, controller state and timing-derived priorities cannot enter the control ingress.
-
-| Direction and payload | Permitted authority and timing | Prohibited use |
-|---|---|---|
-| H2D initial prompt/admission data | Immutable prepared request, serving slot/generation, admitted envelope, ordered before activation | Rebinding captured pointers or deriving a new prompt from observed decode progress |
-| H2D sampling/stop/think policy rows | Complete policy at new-slot admission; generation-qualified reset installs a new lifetime | Changing a resident sampler or forcing tokens because host text parsing observed progress |
-| H2D cancellation | External lifecycle intent, ordered and bound to the original request lifetime | Interrupting a kernel, freeing a live slot, or directing model control |
-| H2D window grant | One host-owned permission per slot-generation, backed by reserved response destination storage; ordered, single-use identity | Writing positions, depth, phase, live counts, or selecting participating rows |
-| D2H window-terminal publication | Committed live tokens, bounded reasoning/injection framing positions, typed outcome/accounting and grant-completion receipts | A mutable controller/KV/verifier/sampler snapshot or arbitrary progress polling |
-| D2H lifecycle/selection terminal receipt | Command acknowledgement, native retirement receipt, and the allowed retained-operation ticket | A readback of model position, selected row list, live learner state or scheduler age |
-| D2H permitted HIP scheduler ticket | Fixed-size authenticated identity naming an already retained complete transaction; only metadata authorized by that backend policy | Carrying token contents, positions, learner vectors, or host-authored branching decisions |
-| Explicit prefix/KV tier I/O | Existing intentional storage boundary, with TransferEngine, leases and producer/consumer events | Ad hoc in-window D2H/H2D to manufacture a missing snapshot |
-
-Policy rows are installed only for a new generation-qualified lifetime, never as a mid-request update channel. Output-credit release is entirely host-owned; it may enable a new grant, not a device credit-counter write. Scheduling age is device-derived (§11); host timestamps/priorities are not an additional ingress class. The host validates only known identity (§6) and submits a device-named retained branch, never one inferred from decoded output.
-
-The existing HIP ticket includes narrowly scoped committed-token cadence evidence. That does not authorize reconstructing model state. In the target design, the device/domain authority determines maintenance due; the host may submit/forward only the authenticated maintenance edge allowed by the backend contract. Counting SSE tokens to decide `maybeApplyMoERebalance` is not retained as a serving control loop.
-
-### 5.1 Thinking budgets and forced sequences
-
-Reasoning-budget enforcement and reasoning-phase classification have **one execution authority**. The canonical token-level rule consumes the exact tokenizer pieces for committed token IDs and matches the model template's exact closing marker across piece boundaries. It is not equality against one preferred delimiter tokenization. The admitted immutable tokenizer/marker transducer must handle alternate segmentations, partial bytes and marker spans inside a piece; any unsupported tokenizer semantics are a qualification gap, not permission to let host parsing disagree.
-
-Execution publishes bounded marker-close/removal spans and forced-injection positions in the terminal output metadata. Coordinates are committed-output token ordinal plus byte offset where needed, not a live KV/controller position channel. Host UTF-8/reasoning presentation consumes those coordinates as authoritative, including repeated structural closes and end-of-response partial fragments; it does not rediscover a competing phase. It retains a bounded presentation tail sufficient for a marker spanning two publications instead of prematurely emitting potential marker bytes; that storage joins the response/framer BOM, not a host reasoning controller. Tool presentation remains separately defined and cannot feed model decisions.
-
-The versioned rule counts committed, non-forced reasoning tokens, including the declared treatment of a token that completes a delimiter. The proposed rule excludes that closing token; partial-marker tokens before it still count. Budget zero begins the prescribed continuation-encoded injection at the first eligible position. An earlier committed stop/cancel wins terminal arbitration. Empty injection policy and template-free requests have explicit admitted semantics, not guessed delimiter evidence.
-
-At a forced position the execution policy overrides the target sample with the prescribed token and rejects speculative drafts at that position. Earlier valid drafts may commit; later speculative state rolls back. Forced tokens update model/history/output state exactly once, do not consume an ordinary sampled-token decision, and do not count as sampled reasoning. A transaction clipped by or containing forced positions skips adaptive depth learning rather than treating forced rejection as poor model acceptance; the same versioned rule applies in solo/batch and every backend. The composed trace includes these force positions and skipped observations. Exact device matcher, tokenizer-piece metadata, sampler/verification interaction and formatting parity remain G1/G2/G7 proofs.
-
-The current host `forceDecodeToken`/one-token-budget loops must retire with the shared policy. Canonical semantics and any historical frontend discrepancy must be reviewed at capacity one before increasing capacity (§3.1); no exclusive reasoning-budget singleton path is installed.
-
-### 5.2 One-window execution grants
-
-The runner's **host-owned destination reservation** is the sole authority to issue a `WindowGrant`. It binds serving instance, slot/generation, a non-reused grant ID, the immutable window policy and an opaque destination reservation. At most one is outstanding per binding. It permits at most one complete request-local output window; it does not supply a target position, mutable remaining count or depth.
-
-A grant may remain unspent while that request executes its canonical prefill chunks. The reserved output destination remains held until the first window completes or cancellation/retirement returns the unused grant. Device selection may defer the request, but cannot consume the grant twice, resize its window, or produce output without it. Generation eligibility is derived from a usable grant plus device-owned readiness.
-
-Window completion/retirement returns a typed receipt for the grant. The host releases unused reservation extent or transfers ownership of committed payload into the response's detached publications. It issues the next grant only after the previous one is resolved and sufficient response storage exists. A publication drain can make storage available, but never writes a model phase. Counts here describe leases/reservations, not a second physical-memory ledger.
-
-## 6. Required per-row ABI and sampling substrate
-
-The current cohort ABI must be replaced or extended through one typed authority. The following is a semantic sketch, not a finalized binary layout:
-
-| Per-row field/family | Required meaning |
+| Owner/module | Responsibility and interface |
 |---|---|
-| Serving instance, slot and 64-bit generation | Stable logical identity shared by all participants; no reuse across runtime replacement |
-| Admission kind | NewRequest or ContinueResponse independently per row; inactive rows are explicit |
-| Immutable request policy identity | Model/template/sampling/control-policy version and admitted envelope |
-| Response/context/window budgets | Per-request response limit; intrinsic window quantum and commit boundary; never resized by load |
-| Sampling-law row | Greedy/stochastic mode, temperature, top-k/top-p, penalties and supported sequence-history policy |
-| Resolved seed | Nonzero immutable request seed after admission-time entropy resolution |
-| Stop/think row | Device-owned stop matching, reasoning budget and forced-sequence state |
-| MTP row | Per-request depth policy, learner state, verifier/publication and rollback ownership |
-| Persistent state references | Slot-addressed KV/recurrent/history and bounded terminal scratch, with immutable storage geometry |
-| Prefill/decode/MTP handoff | Persistent terminal logits/hidden state, sampled/unsampled condition ownership and sidecar completion (§9.5) |
-| Lifecycle/publication identity | Command ordering, outstanding grant identity, terminal arbitration and retirement dependencies |
+| `PhysicalMemoryAuthority` | Sole physical admission/reservation/materialization/release ledger; owns typed page-pool resources and their logical grant authority |
+| Paged-KV arena | PMA-owned suballocation implementation: atomic admit/append/COW/commit/retire operations and immutable typed views; no independent byte budget |
+| `ServingSession` | Request lifecycle, request-local policy and operation ordering; asks the page authority for grants, never allocates KV itself |
+| KV kernel interface | Reads/writes typed paged views and live extents; cannot manufacture page ownership |
+| Prefix coordinator | Compatibility lookup and retention policy; obtains immutable page/checkpoint leases, not writable aliases |
+| `TransferEngine` | Public movement/coherence authority; consumes source/destination leases and exact stream/event dependencies |
+| Rank/global orchestration | One topology-wide logical decision and participant-local grants; no remote GPU ownership or nested multi-device compute stage |
+| HTTP/other frontend | Immutable input, output credit and external cancellation; no execution controller, page ledger or live GPU-state mirror |
 
-A serving-window epoch qualifies the transaction, but it does not replace slot generations. Continuing A and admitting C in the same serving window must not reset A's learner or authorize C using B's prior ticket.
+CPU and GPU adapters implement the same ownership semantics. GPU page metadata,
+free-page selection, logical commitments, live lengths and table mutations are
+device-owned after admission. PMA's host-side physical allocation records do
+not mirror that device state: they retain the preallocated backing and immutable
+geometry. Its device-resident arena is the canonical suballocation authority.
+Host admission receipts report acceptance/ownership outcomes, not free-page
+counts used to reconstruct allocation decisions.
 
-Host ticket validation binds only host-known facts: serving-instance identity, sealed ingress/window epoch, retained catalog/workspace generation and a digest of the **admitted binding snapshot owned by the host execution leases**. The ticket names that exact immutable snapshot, not whichever host set exists after processing retirement receipts. Host snapshots may include a binding still retiring; device selection checks actual readiness and generation.
+Preparation consumes an immutable model-policy/template/tokenizer snapshot and
+cannot mutate runner sampling, stops or cache state. Prove concurrent-read
+safety or use a bounded preparation owner separate from inference submission.
+Validate incompatible requests and acquire their storage before copying input
+or committing a successful streaming response.
 
-The host does **not** validate a device-selected participation set, row count or depth trajectory. A device-authored participation digest may be compared across participants for agreement, in the spirit of `hasSameDispatchDecision`, but is never a host-selected-set oracle. Per-row generation checks happen on device before state access. Exact fixed-size encoding and agreement are still native proofs; slot selection is device data, not an embedded `seq_idx`.
+Existing PMA allocation leases retain actual allocations through free. They
+are not already a logical-page allocator. Extend the authority explicitly;
+relabeling its present `claimAllocation` calls is insufficient. Free lists and
+reference counts inside that authority describe ownership within charged
+backing, not a second subtraction from device capacity.
 
-### 6.1 Sampler law is runtime request data
+## 4. Pool geometry and complete physical admission
 
-Temperature, top-k/top-p, penalties and seeds must be read through admitted per-row tables on CPU, CUDA and ROCm. Different request laws must not trigger recapture or singleton serialization. The retained graph identity still includes table addresses **and** schema, capacity, precision, device, workspace generation, geometry, kernel/launch policy, and every genuinely embedded scalar. It is not reduced to addresses alone.
+A resolved plan contains independent, typed dimensions:
 
-Per-request penalty state is a separate BOM obligation. A vocabulary-sized INT32 count table costs `4 × vocabulary_size` bytes per slot—about 608,000 bytes (0.58 MiB) at 152,000 tokens—before sequence-history, DRY, rollback, or sampler workspaces. A count table alone does not implement DRY's sequence-history semantics.
+- `S`: maximum execution-attached request records; `Q`: preparing/queued limit;
+  `R`: total response lifetimes, including detached deliveries.
+- Per-request context/output bounds and request-local window policy.
+- Per-participant, per-storage-class page size, page count, native layout,
+  precision/codebook and alignment; bounded page-table/reference capacity.
+- Prefill token-row and decode/verifier work envelopes; recurrent, history,
+  sampler and terminal-handoff capacity.
+- Capture families, metadata/table banks, transfer lanes, staging and response
+  storage, each sized by its real concurrency.
 
-The typed compatibility key includes only genuine immutable execution incompatibilities. Mutable request laws and explicit seeds must not be included merely because today's captured sampler embeds them. Greedy and stochastic co-scheduling must have a genuine grouped implementation; a series of exclusive homogeneous cohorts is not feature parity by itself.
+`S >= 1`, `Q >= 0`, `R >= S + Q`; the total preparing, queued,
+execution-attached and detached-delivering responses never exceeds `R`.
+An explicit positive authored limit is exact or rejected, not clamped.
+Automatic capacity comes from admitted topology and PMA, not local test-device
+counts. `S` does not promise that every possible set of S maximum-length
+requests can enter execution simultaneously; §5 owns memory admission.
 
-## 7. Numerical and RNG contract
+Page geometry is derived from model layers, actual TP shards, PP intervals,
+KV-head dimensions, cache family and numerical format. K/V, quantization
+scales/anchors, TurboQuant metadata, alignment, guards and page-management
+storage are all priced. A logical block may comprise multiple local physical
+pages; incompatible layer/format classes have explicit separate pools.
+Attention-only, hybrid main and shifted predictor caches retain their actual
+roles. An all-recurrent participant allocates no dummy attention pages.
 
-For the same admitted plan—including capacity, kernels, precision and policy version—co-scheduling must not change a request's target/verifier arithmetic or committed/harvested state. **On one endpoint with no placement moves, the same immutable request, resolved seed, prefix-restore boundary and external control trace must produce committed token bytes identical to solo serving under that plan**, whether streamed or accumulated. Ordinary completion comparisons have no external cancellation; cancelling after the same wall-clock delay is not the same logical control trace.
+The BOM includes, once per physical owner:
 
-The comparison trace is closed rather than “whatever decisions happened”:
+1. Complete pool backing, including unused frames and alignment.
+2. Frame descriptors, generations, references, retirement queues, growth
+   commitments, table versions and bounded concurrent table snapshots.
+3. Request state: GDN/short-conv, history/DRY, RNG/controller state, rollback,
+   terminal logits/hidden state and sidecar handoffs.
+4. Live-work maps, graph/workspace families and collective metadata/buffers.
+5. Prefix metadata/checkpoints and each additional RAM/GPU/archive staging
+   allocation; shared live pages are not charged again as cache copies.
+6. Preparation, input/parser/tokenizer storage, response queues, framers,
+   non-streaming accumulation and producer/consumer overlap.
 
-| Trace field | Authority and invariance |
-|---|---|
-| Prompt/tokenizer/model, kernel/precision and policy identities | Immutable admitted input/configuration |
-| Resolved seed, sampler law, stop/think/injection policy | Immutable request input; seed-zero entropy resolves once |
-| Prefix-restore boundary and checkpoint identity | Explicit comparison precondition; cache availability may change the boundary |
-| Absolute prefill chunk/checkpoint/LLEP grid | Request/configuration-intrinsic; not remaining batch capacity |
-| Request-window boundaries and internal MTP budgets/depth decisions | Request-intrinsic policy and its own committed observations; never host load/timing |
-| Forced-sequence and terminal positions | Derived from the same request policy/committed token stream; external cancellation is explicit trace input |
-| Placement epochs and switch positions | Explicit domain trace, applied at the same logical request positions |
+Pool backing and hot-path metadata are materialized before serving/capture.
+Logical page assignment during a transaction does not call CPU/GPU allocation
+or rebind graph pointers. Growing or replacing physical pools requires a new
+admitted instance and retirement of the old one, not hot-path arena growth.
+Metadata may cover a worst-case request context without reserving a matching
+private KV payload for each record.
 
-Prefix boundary **remains in this contract**. This design does not claim unproved cold-prefill versus cache-hit byte identity at different boundaries; existing prefix correctness requirements still apply. A stronger cross-boundary byte guarantee needs exact canonical checkpoint/export/import evidence, not a change to the comparator after a failure.
+For storage class k with B tokens per logical block, unshared live history
+uses approximately `ceil(live_tokens / B)` blocks, plus explicitly priced
+speculative/COW transients. Several readers of one immutable block consume one
+physical copy in that participant's pool. This logical occupancy is distinct
+from the already materialized pool's bytes and from promised growth (§5).
+Do not advertise unused-but-reserved pool bytes as returned system memory.
 
-Dynamic residency remains the production default. For moving/heterogeneous deployments the oracle replays the same placement-epoch sequence and switch positions. A different placement history is not called a batching-equivalent trace, and unsupported topologies receive no weaker arithmetic guarantee.
+## 5. Admission, growth and memory pressure
 
-### 7.1 Request-local work and window plans
+### 5.1 Resident-only completion guarantee
 
-- A prefill transaction carries **one request's next canonical chunk**, never an aggregate of unrelated prompts in this first design. Chunk/checkpoint boundaries are an absolute-position grid derived from request/configuration and required prefix/recurrent/LLEP checkpoints.
-- Thus prefill M equals that request's solo chunk M. Prove every supported solo prefill geometry and interleaved handoff, but do not claim aggregate-prefill invariance. Decode/verifier kernels must be row-invariant across all admitted `resident_slots × verifier_rows` geometries, including each expert's live M and all applicable N/K/formats.
-- LLEP locality concerns **assignment**, not just aligned windows: choice depends only on that request's window and placement epoch, or every eligible replica must be byte-equivalent with the same numerical kernels and row-invariant live-M dispatch.
-- Prefill and grouped decode alternate as complete operations. Single-request chunks deliberately bound the new numerical surface, but burst arrivals queue chunks and may worsen TTFT/prefill throughput. Measure that cost; do not claim aggregated-prefill economics.
-- Aggregated prefill and fused prefill/decode require separately admitted implementations and their larger M-range, arithmetic and economy proofs. They are not automatic alternate paths.
+Queue acceptance reserves bounded preparation/response ownership; it does not
+promise a live KV binding. Execution admission atomically obtains a request
+record, compatible prefix references, initial page grants and a **growth
+commitment** sufficient for that request's declared maximum lifetime.
 
-Define a positive window quantum `W` once from the admitted model/control envelope, independent of load, response form or batch occupancy. The existing 16-token streaming quantum is a candidate baseline, not a new unmeasured universal default; `W` must accommodate the maximum admitted new-commit/correction bound. Its exact value and version are sealed in the plan.
+Commitments are fungible capacity within the PMA-owned page arena, not assigned
+frames, full-context per-slot regions or another physical allocation. Actual
+pages are assigned only when append/COW needs them. For every storage class,
+admission protects the union of pinned live/shared pages plus all admitted
+requests' worst-case remaining private growth and simultaneous speculative,
+COW, copy and retirement overlap. A shared prefix is counted once; each future
+private tail is counted separately. Pending-retirement pages are unavailable
+until their actual consumers finish. Retained cache-only pages may be evicted
+under their policy, but are not free until references and events permit reuse.
 
-If `c` is this request's committed generated-token count, its next regular window ends at `W × (floor(c/W) + 1)`, bounded by its immutable response limit. First prefill-produced output and carried correction rows count once under the same ownership rule. Scheduling may defer the window but cannot shorten or extend it. EOS, admitted forced/stop semantics and external cancellation are explicit terminal/control exceptions, not load-budget clipping.
+The authority derives the checked geometry and performs this decision once.
+Callers cannot estimate free bytes or decrement a mirrored credit counter.
+Converting a growth commitment into a page, releasing an unused commitment,
+or rolling back an unpublished multi-class reservation is one typed operation.
+It must leave every participant unchanged on refusal.
 
-Internal MTP budgets use this intrinsic remaining window, the request's policy and any replayed placement boundary. Budget-limited learning skips are therefore identical in solo/batch; no transaction-wide spare capacity enters the learner. A common policy applies to streaming and non-streaming alike. Adoption of this policy is separate from Phase A's behavior-preserving refactor because current non-streaming generation normally uses the full remaining response budget.
+The unspecified output limit remains the real remaining-context limit unless
+the public request policy is explicitly changed. Consequently, several requests
+that each reserve almost the entire pool may queue even if their current live
+KV is small. Paging alone cannot guarantee all of those futures simultaneously.
+Publish committed headroom separately from live occupancy; do not present a
+full-context commitment as merely next-token admission.
 
-### 7.2 RNG coordinates
+This policy still removes physical partitioning. For example, a 32K-token-equivalent
+pool with four request records can admit maximum retained histories of 20K,
+4K, 4K and 4K when format rounding and separately priced transients fit. A 20K
+request is not constrained by an 8K partition. These are illustrative units,
+not an actual model's byte estimate. Shared prefix blocks further reduce the
+union of required physical histories without changing the per-request context
+contract.
 
-The stochastic key is:
+### 5.2 Progress and refusal
+
+Before each finite model operation, reserve every required append/COW/tentative
+page and table-publication resource, then publish the new view. No kernel may
+write beyond its grant. Current work may await an exact pending retirement or
+storage completion, but it cannot wait for unrelated future generation to
+free capacity needed to honor its own admitted guarantee.
+
+On new admission pressure: reclaim eligible cache-only references, wait for
+specific already-submitted retirements where appropriate, otherwise retain the
+request in the bounded queue or return explicit overload. Never partially
+activate it, evict live request history, truncate context, silently disable MTP,
+or enter a scalar/fixed-slot path. An inability to honor an existing valid
+commitment is an invariant failure, not normal mid-response OOM handling.
+Output-blocked requests retain their commitments until completion/cancellation;
+bounded delivery policy ensures they cannot retain them forever.
+
+### 5.3 Future elastic admission
+
+Admitting only current/next-operation pages can increase concurrency, but needs
+a proved pressure escape when all live requests require growth. Merely parking
+all of them deadlocks. Future live-request offload must provide bounded
+suspend/restore, backing-tier capacity, progress/fairness and full recurrent/MTP
+state preservation before such an admission policy is enabled. It must not
+silently replace the resident-only guarantee. The same paged substrate serves
+that versioned policy; fixed-slot storage is not retained as an alternative.
+
+## 6. Page lifecycle and immutable views
+
+A frame's lifecycle is conceptually:
 
 ```text
-(request-resolved seed, logical output position, draw purpose)
+Free(g) -> GrantedPrivate(g) -> Writing(g) -> Published(g, valid_extent)
+                                           |                  |
+                                     private append      ImmutableShared
+                                           |                  |
+                                           +-----> Retiring(g)
+                                                        |
+                                      all references and access frontiers retire
+                                                        |
+                                                    Free(g + 1)
 ```
 
-RequestId, slot, slot generation, batch row, arrival order and request ordinal **do not enter that key**. An explicit nonzero seed is preserved across submissions. Seed-zero entropy is resolved once at admission and stored with that request; it is not regenerated at each batch transaction or slot reuse within the lifetime.
+This is a typed state machine, not permission for callers to set enums. A
+private append can mutate only its exclusive valid tail. A sealed shared page
+never becomes writable while a cache, request, graph, transfer or archive
+reader can still reach it. Appending to a shared partial page requires COW:
+grant a new private frame, copy only the valid extent with its format metadata,
+publish readiness, then replace that request's table entry. Other readers keep
+the old page unchanged. Whole immutable pages can remain shared indefinitely
+subject to references and retention policy.
 
-MTP verification remains byte-equivalent to serial-row evaluation of the same recorded inputs/policy. Depth decisions are recorded to check replay, not supplied retrospectively to excuse load-dependent behavior: under the intrinsic-window policy they must derive from that request's identical observations. A different speculative policy has a different trace and may preserve a distribution without preserving token bytes. No load-aware depth policy is part of this first design.
+A publication carries valid-token extents, content/version identity, table
+version and exact readiness. Reserved unwritten bytes are not KV. Truncate or
+speculative rejection changes logical visibility first; discarded pages become
+reusable only after queued work using the old view retires. Partial accepted
+tails retain only valid committed history; rejected tokens cannot enter prefix
+keys, exports, attention lengths or later request histories.
 
-## 8. Complete transactions and pipeline depth
+Logical reference count zero is necessary but not sufficient for reuse.
+Submitted readers/writers retain access leases through their completion
+frontiers. A request cancelling, finishing, or releasing its table does not
+cancel already queued native work. Freeze admission of old-view readers before
+closing a generation's frontier; otherwise an overwrite can race a reader
+submitted after the purported last-reader event.
 
-Operation kinds are typed: `LifecycleSelect`, `PrefillChunk`, `DecodeWindow`, and terminal `Idle` outcome. Lifecycle/selector work is not an empty generation; it never invokes the generation commit that rejects `EmptyTransaction`. Vacant, prefilling, retiring and no-grant rows are Inactive to decode. A selected prefill chunk may validly emit no output without masquerading as a decode transaction.
+Stable table storage has bounded banks/versions for the actual pipeline depth.
+Publish a new version only after its preparation; retain the old version until
+all readers finish. A graph cannot observe half an append, partially updated
+K/V mappings or a table reused while its previous consumer remains queued.
+Table exhaustion is handled before submission, not by allocating another bank.
 
-Ingress is sealed before selection. The execution authority applies it, selects eligible work and either reports lifecycle/idle completion or executes the complete admitted model operation. A conditional-capable backend includes selection and the selected complete work in its retained parent. HIP uses the explicitly chosen selector-first protocol below. Neither path is a host loop over model layers or live row counts.
+## 7. Native paged access and capture identity
 
-Initial execution pipeline depth is **one model transaction per domain**, and at most one per request. There is no speculative t+1 model submission formed from incomplete t state. Two publication banks permit safe staging/demux overlap; they do not imply two in-flight model transactions.
+Append, attention, rollback, export/import and diagnostics all consume the same
+typed page geometry. Attention traverses a request's logical token order across
+arbitrary frame order and attends only its valid tokens. Other requests' pages,
+unwritten tails and alignment padding are inaccessible through the view.
 
-Slot reuse requires the actual retirement receipt and event frontier, not an arbitrary number of elapsed windows. If deeper pipelining is introduced, admission lag, command epochs, event ownership, stale-command behavior and exclusive arenas must be redesigned and proved. A blanket two-window delay is not a substitute for those lifetimes.
+CPU kernels must retain useful vectorization, work sharing and physical-core
+scaling. CUDA/ROCm kernels use native page indirection in their optimized
+attention/append paths, with tensor-core prefill where beneficial as required
+by project policy. A full-history gather into a private contiguous scratch
+buffer is not the implementation. Bounded tile staging intrinsic to a kernel
+is permitted when admitted, live-sized and measured; it cannot reconstruct
+fixed partitions or duplicate all retained KV.
 
-New ingress is applied at the next selector/parent boundary, not halfway through its selected model operation. Cancellation may wait for the current finite operation and its actual retirement frontier, but never for a new output grant or token. No wall-clock bound is claimed without measurement. Measure selector, required HIP branch-ticket, terminal-publication, demux, ingress and submission bubbles separately. Pending lifecycle I/O is accounted independently (§9.6).
+Page boundaries must preserve quantization/anchor/codebook semantics. FP32,
+FP16/BF16 where supported, quantized KV and TurboQuant each need native layout,
+partial-tail, COW, restore and rollback coverage. A convenient floating-format
+adapter cannot qualify another format. Preserve fixed arithmetic order across
+page-frame permutations, request row compaction, batching and supported live
+M/N/K geometry; page size changes need their own numerical qualification.
 
-### 8.1 HIP selector-first protocol and branch inventory
+Captured identity includes pool and table storage addresses, devices, storage
+and workspace generations, formats, page geometry, schema/version, immutable
+policy scalars and every embedded launch mode. Logical page IDs, valid lengths,
+request laws and current table contents are runtime device data, not reasons
+to recapture. If an implementation embeds any such value, it must instead
+complete the runtime-data implementation before supporting changing requests.
 
-Choose **selection after ingress**, not tail selection based on old grants:
+Every launch covers actual live rows, page spans, tiles or experts. No
+capacity-sized grids with wholly inactive blocks, no empty compute families,
+no padding communications, no host live-count readback and no per-request row
+replay disguised as batching. Device-selected retained branches must cover the
+supported shape space economically; catalog size and capture bytes are proof
+obligations, not assumptions.
 
-1. Seal ordered ingress and its host-known binding snapshot in persistent storage. Submit the retained `LifecycleSelect` graph.
-2. Obtain its fixed-size authenticated terminal ticket/receipts. Validate only §6's host-known identity.
-3. Submit the named retained complete model operation, or park after a terminal Idle/lifecycle-only result. Do not modify the sealed ingress while that operation owns it.
-4. Resolve terminal output/grants and admit the next ingress epoch. If native MTP requires additional device-selected retained branches, submit only those authenticated tickets; their receipts are counted too.
+## 8. Shared prefix caching
 
-A selector followed by one model graph requires **two terminal completion observations**, not one. A window requiring additional native HIP branch tickets costs more; the catalog must state that decomposition and count exactly rather than promising “two waits per window”. No new ordinary model-state readback is permitted. These boundary observations are within the **unadopted** proposal in §5, not a claim existing maxims already authorize them.
+Prefix identity binds exact token ancestry, model/weights and graph policy,
+positions/RoPE, KV family/layout/precision/codebook, required placement history,
+checkpoint semantics and trust domain. A hash match alone does not authorize
+sharing incompatible content or crossing a tenant isolation boundary.
 
-The selector and lifecycle-only/Idle cases join the graph/receipt inventory. Before implementation approval, enumerate the retained catalog across:
+Resident hits acquire immutable page references instead of restoring full
+private copies. A nonresident archive imports its valid payload into exclusive
+pooled destinations, then publishes a reusable immutable representation. A
+concurrent duplicate import joins the same incarnation or retires its own
+unpublished candidate; it must not create unaccounted duplicate ownership.
+Cache retention and a request's live reference refer to the same resident
+physical bytes when they really share backing. Separate device/RAM replicas
+are distinct charged allocations even when their content keys agree.
 
-- canonical prefill buckets and execution geometry;
-- ordinary and admitted MTP depth/control forms;
-- precision/KV formats and true immutable policies;
-- required maintenance/lifecycle variants.
+Complete blocks are natural sharing units. A partial sealed block records its
+exact valid extent and compatibility; extending it requires COW. Prefix lookup
+while queued is provisional; execution admission atomically validates and pins
+the selected incarnation. Eviction removes retention eligibility, not live
+readers. One request finishing drops its reference without invalidating peers.
 
-State the exact graph count, persistent capture/workspace bytes, generation/identity rules and PMA BOM lines. Do not assume mixed per-row depths fit the current single-depth ticket. Host preparation may establish a deterministic prompt-derived chunk grid; after admission, live work selection and depth decisions remain device-owned. Alternation avoids requiring fused prefill/decode combinations, but does not itself prove the catalog is small or economical.
+Full-hit terminal logits, the last-token recomputation rule and any recurrent
+checkpoint must describe the same logical prefix boundary. Reuse does not
+import another request's sampled condition, RNG, penalties, DRY history, depth
+learner, output counters or delivery state. New requests initialize their own
+policy/history. Domain placement and rebalance state are not request snapshots.
 
-## 9. Physical memory modes and prefix ownership
+Hybrid models require their GDN/short-conv checkpoints alongside the matching
+paged attention prefix. Recurrent state is not interchangeable with K/V pages:
+immutable snapshots may be shared, but active mutable recurrent state is
+request-owned. Restore, terminal state and page tables activate coherently
+across all required families. Never rewind a live peer or replay a missed
+checkpoint to manufacture a hit.
 
-### 9.1 First mode: fixed-slot, full-context backing
+Record actual per-request matched blocks, matched/restored tokens, tier,
+checkpoint, bypass/discard reason and harvest outcomes. Logical matched blocks
+are not necessarily physical record counts for all-recurrent participants.
+Carry those observations through terminal summaries to HTTP; reconstructing a
+summary with `matched_blocks = 0` loses evidence.
 
-This is the existing ring-cache physical model, named explicitly. Plan admission accounts per execution slot for full configured main KV, recurrent/history/MTP and handoff state plus bounded terminal scratch. Shared staging is sized by admitted transaction geometry; detached output, framers and non-streaming accumulation are sized by **response leases**, which can outlive/reuse execution slots. Runtime request admission assigns preadmitted ownership without charging the same backing again.
+## 9. Request state, MTP and numerical behavior
 
-The lifecycle slot catalogue records logical occupancy, not another free-byte ledger. PMA retains the backing allocation authority. Its existing suballocation leases must not be presented as a logical-page grant primitive they do not implement.
+Paging separates attention history from request-local mutable state; it does
+not eliminate that state. Classify every field:
 
-In this mode, guaranteed growth means the occupied slot can satisfy the admitted request's context/output bounds. The current unspecified output limit resolves to remaining context; no extra concurrency is gained by pretending that default is a short output. Fixed slots need a real Release capacity/economy gate. If their footprint is unacceptable, the mode is not a finished solution.
-
-Prefix-cache resident backing can be charged once for multiple readers. **Live fixed slots contain private restored copies**, so their bytes remain charged separately. This design does not claim zero-copy live-prefix sharing in the current caches.
-
-The serving-owned host preparation, response, staging and framer BOM uses existing PMA **owner reservations plus `claimAllocation` for each actual backing allocation**, retaining the physical lease through final free. No new PMA primitive is needed for that backing. Complete HTTP/library integration is still unimplemented; numeric queue/credit limits alone do not prove it. Logical page grants inside already materialized KV storage remain the separate missing primitive in §9.2.
-
-### 9.2 Paged KV is a separate unqualified physical mode
-
-Paged storage requires native append, attention, export/import, prefix, rollback and retirement contracts for every supported KV format, including TurboQuant, on CPU/CUDA/ROCm. It cannot appear as an implicit consequence of adding request slots.
-
-A future logical grant inside materialized backing must be a typed PMA-owned primitive with exact consume/return ownership and event-ordered retirement, not a private allocator subtracting free bytes. Multi-rank admission must issue one topology-wide ordered grant decision while materialization stays with each rank's real backing authority; participants cannot independently reorder grant consumption.
-
-Elastic oversubscription/preemption/offload is another explicit policy requiring complete recurrent/MTP/transfer/capture contracts. It is not an emergency response to a failed fixed-slot or paged admission.
-
-### 9.3 Classify state before implementing reset or restore
-
-Every affected field must be classified before Phase A's ownership refactor is considered complete:
-
-| Ownership class | Examples | Reset/harvest rule |
+| Class | Examples | Lifetime |
 |---|---|---|
-| Slot | KV, GDN/short-conv, terminal logits/hidden state, ready/pending conditions, sidecar handoff, sampler history, stop/think state, MTP learner and request-local demand | Slot-qualified reset; only request-neutral model state enters reusable prefix snapshots |
-| Transaction | Compact row maps, scratch, collective operands, temporary commit metadata | Retire at the exact transaction/event frontier |
-| Domain | Durable expert placement, global rebalance policy/cadence, prepared assets, communicator/runtime ownership | Never reset or import from another request's prefix snapshot |
+| Request | Sampler/history/DRY, stop/think transducer, GDN/conv, MTP learner, terminal logits/hidden, pending correction/sidecar | Request generation and exact borrowers |
+| Shared immutable content | Sealed KV pages, compatible recurrent/terminal checkpoints | Last content reference and access frontier |
+| Transaction | Compact work rows, temporary speculative chain, scratch and collective operands | Exact submitted operation frontier |
+| Domain | Prepared weights, durable expert placement, communicators and maintenance authority | Admitted instance/domain; never restored from a request prefix |
 
-Current graph-builder reset/restore and model-runtime snapshot hooks span these categories. Adding a new slot must not restore archived placement or histograms over a live sibling. Domain state is excluded from mutable slot snapshots; immutable compatibility/placement-epoch identity remains part of their fingerprint. If a required dependency cannot be separated, that path stays unqualified rather than replaying an old domain snapshot.
+Terminal prefill logits and hidden state survive intervening requests. A typed
+handoff distinguishes unsampled logits, an already sampled/recorded condition,
+and pending/completed predictor work. Replace runner-global ready/pending flags
+and slot-address arithmetic with generation-qualified ownership. Price actual
+FP32 vocabulary rows, hidden state, history and events; no per-request state is
+hidden in nominal KV savings.
 
-Prefix lookup may be provisional while queued, but blocks are pinned only at execution admission. Harvest/restore are slot-generation-qualified lifecycle operations at canonical checkpoints, outside model capture, using TransferEngine and ordered events. The current `harvestPrefix` interface lacks the required slot identity and must change. Recurrent state cannot be rewound to invent a missed checkpoint.
+MTP uses explicit main and shifted-predictor page roles. Proposals/verification
+reserve bounded tentative pages before work. Accepted history and visible
+lengths commit together; rejection retires unpublished suffixes after their
+read/write frontiers. COW protects shared prefixes during speculative append,
+truncate and correction. A correction updates KV, history and output once;
+reusing published token output as a host shadow of device condition is invalid.
+Per-request depths, seeds, laws and learner observations remain independent in
+one grouped verifier operation.
 
-Do not relabel stale harvests under a newer placement epoch or rewind domain placement to make a hit usable. Record actual hit, restore, discard, eviction and checkpoint rates under concurrent movement; a low hit rate cannot be hidden by a correctness-only test.
+For the same admitted execution/numerical policy, resolved seed, prefix boundary,
+external control trace and placement epochs, a request must produce the same
+committed bytes alone or co-scheduled. Physical frame assignment, page reuse,
+request-record index, batch row and queue timing do not alter its arithmetic,
+RNG coordinates or learner. Prefix-hit versus cold-prefill at different restore
+boundaries remains a separately proved numerical question, not an excuse to
+change the comparison boundary after a failure.
 
-### 9.4 One typed serving-capacity input
+The stochastic key remains `(resolved seed, logical output position, draw
+purpose)`. Seed zero resolves once; explicit seeds are preserved. Sampler laws
+are per-request data, including model-default penalties and supported DRY,
+not graph-specialization/cohort keys used to serialize incompatible laws.
 
-A proposed `ServingCapacityRequest` contains intent for resident slots `S`, maximum response leases `R`, and queued/preparing requests `Q`. Automatic intent is explicit; an authored positive capacity is exact, never silently reduced. Planning resolves one immutable `ResolvedServingCapacity` through the qualified capability and PMA BOM. All consumers borrow that result.
+Prefill chunk/checkpoint grids and positive output-window quantum W are
+request/configuration-intrinsic. The next window ends at the next W-aligned
+committed-output boundary, bounded by the real response limit. Co-scheduling,
+page pressure and output timing may defer an operation but cannot shorten its
+window, change its prefill chunk or clip MTP learning using spare batch space.
+Placement switches and external cancellation have explicit logical trace
+positions. LLEP assignment is request-local or its eligible replicas must be
+byte-equivalent under the selected arithmetic.
 
-Resolved constraints include `S ≥ 1`, `Q ≥ 0`, `R ≥ S + Q`, and the hard total `preparing-or-queued + execution-attached + detached-delivering responses ≤ R`. Detached deliveries compete for response leases, not execution slots; a full response pool can explicitly reject new admission even when a model slot is free. Bounded delivery deadlines prevent abandoned consumers holding it forever. These are ownership counts, not independent free-byte estimates.
+Reasoning phase and budget enforcement have one execution authority. The
+versioned token-piece matcher handles alternate delimiter tokenizations and
+markers spanning pieces/publications. It publishes bounded close/removal and
+forced-injection coordinates for presentation. Host text parsing cannot force
+model tokens. The declared rule excludes the marker-closing token from sampled
+reasoning counts; forced tokens update state once without consuming an ordinary
+sample, and clipped/forced speculative transactions skip depth learning under
+the same solo/batch policy. Any change from existing frontend semantics is
+versioned and qualified, never silently rebaselined.
 
-The result fixes KV slot geometry, per-row controller/sampler/handoff capacity, verifier M, shared terminal staging, response/queue backing, dependent terminal-head policy and capture identity. Canonical prefill token-row geometry is a distinct typed execution-geometry input, not another spelling of request concurrency. Window policy and response byte bounds are sealed alongside the capacity.
+## 10. GPU control and finite complete transactions
 
-Implementation must retire or disambiguate `--batch-size`, `--mtp-max-request-batch`, their duplicate runtime/planning capacities and the HTTP-only hard-coded limit. The current `kDefaultCapacity = 32` counts **accepted responses including active and queued**, not 32 extra queued requests; preserve its actual admission semantics during Phase A rather than copying the number into a different unit. Proposed public spellings are `--serving-resident-slots`, `--serving-response-leases`, `--serving-queue-capacity` under one typed config object; **none is an implemented CLI option**. Update parser, lossless config, planner, help, docs and tests together when implemented, without permanent aliases.
+The host owns immutable request preparation, external lifetime intents,
+destination-backed output grants and delivery. The GPU execution authority
+owns active phases, page grants/tables, lengths, sampling, MTP verification,
+stop/think decisions and selection. No mutable host copy is maintained.
 
-Retire fixed-cohort `*ForBenchmark`/decode-request-batch plumbing in the same migration. The replacement benchmark submits ordinary immutable requests through the installed seam: closed-concurrency refill and offered-arrival-rate workloads, including capacity one. It measures queue-inclusive TTFT/E2E, actual output gaps, SLO goodput, completed/unfinished work, memory and path counters. Isolated kernel/cohort diagnostics may remain separately named, but cannot certify serving performance.
+| Permitted exchange | Meaning |
+|---|---|
+| Initial admission/policy ingress | Immutable prompt, generation-qualified binding, policy and admitted envelope; not a live table update |
+| Cancellation ingress | External intent for the original request lifetime; never immediate free |
+| Window grant ingress | Unique permission backed by response destination storage; no positions, live counts, depths or selected rows |
+| Terminal publication | Committed live output, bounded framing/accounting, typed outcomes and ownership receipts |
+| HIP scheduler ticket | Fixed-size authenticated identity naming an already retained complete transaction; host submits only that named branch |
+| Explicit KV/prefix tier I/O | TransferEngine-owned storage movement and identity-bound completion; not a general GPU state readback channel |
 
-### 9.5 Persistent prefill/decode handoff
+Page allocation is not an added host ingress kind. A storage receipt cannot be
+repurposed to choose model work from downloaded page/row occupancy. Source
+sanitizers enforce the closed interfaces and exact non-null streams.
 
-Terminal prefill logits and hidden state survive every intervening request's work. A typed slot-owned handoff distinguishes unsampled ready logits from an already sampled/recorded condition and from a completed/pending first sidecar. It replaces runner-global `prefill_logits_ready_`, `ready_mtp_condition_`, `pending_mtp_condition_*` and `prelaunched_mtp_first_sidecar_*` ownership, not merely their booleans.
+Operation kinds remain typed: lifecycle/selection, one canonical prefill chunk,
+complete decode window, and terminal idle. Lifecycle-only progress never calls
+an empty generation commit. Initially allow one model transaction in flight per
+domain and per request; independent disjoint lifecycle I/O may overlap. Two
+publication banks do not authorize two speculative model submissions.
 
-The BOM includes at least `sizeof(float) × vocabulary_size` per slot for FP32 terminal logits (about 608,000 bytes at 152,000 vocabulary), plus actual hidden, native sidecar, metadata and event storage. No unrelated request may overwrite these banks. A sampled correction is not sampled, emitted or inserted into history twice; GPU continuation uses the device-owned condition, never its host-published token as a shadow source.
+Conditional-capable execution retains selection and complete chosen work in
+its parent. HIP uses selector-after-ingress, validates only host-known instance,
+ingress, binding-snapshot and retained-catalog identities, then submits the
+named complete operation. The selector receipt is an additional observation;
+native MTP branch tickets may add more. Enumerate and measure every receipt,
+graph and retained byte rather than claiming one wait per window. Neither
+backend may host-step layers, poll live counts, synchronize whole streams,
+recapture, allocate or rebind during execution.
 
-Any prelaunch belongs to an admitted complete transaction/event tree; it is not eager next-request work outside the one-in-flight rule. Per-slot handoff remains valid until its exact consumer/event retires. Prefix snapshots may contain proven request-neutral terminal model state, but not a prior request's sampled condition, penalty/RNG/learner state or sample-dependent sidecar. New request admission installs its own policy.
+Ingress is sealed for the operation using it. Request/table generations are
+validated on device before access. Terminal/retirement receipts may refer to
+bindings still retiring in the immutable ingress snapshot; the host cannot
+replace that snapshot with its latest set. GPU readiness gates only the work
+that needs the associated pages, not unrelated ready requests.
 
-### 9.6 Prefix/lifecycle I/O concurrency
+## 11. Future offload: ordering and tier semantics
 
-Choose **overlap on disjoint slot/storage ownership**, not whole-domain serial restore/harvest. Pre-admit persistent restore and harvest copy lanes, exact non-null streams, independent staging and their PMA bounds. One in-flight model transaction is not a ban on those explicit tier-I/O operations.
+The following contracts are mandatory in the page substrate now. Existing
+prefix-tier import/export must obey them. They do not claim that transparent
+live-request offload, SSD paging or elastic admission is implemented.
 
-- Restore C into C's exclusive initializing slot while A computes. All required KV/recurrent/handoff families publish their exact completion frontier. C is not eligible until event-aware publication proves readiness; A must not wait on C's unfinished copies.
-- At C's canonical harvest point, freeze its source until an exact producer event permits copy into exclusive immutable snapshot staging. C resumes only after that copy releases its source. Slower RAM/SSD publication then borrows the detached snapshot, not C's mutable slot. A can continue throughout.
-- If staging is unavailable, C remains at that checkpoint until its bounded lease is available; do not allocate secretly, rewind state, or silently disable required harvesting. Existing explicit cache-admission/eviction policy is not replaced by an undocumented skip.
-- Cancellation/reuse waits for the old generation's actual copy/snapshot borrowers. TransferEngine owns copies, source retirement and readiness; no direct dirty-state edits, guessed streams or host polling of model progress.
-- The native implementation must express selective readiness without putting a wait for an unselected C on A's whole-domain execution path. If it cannot, this concurrent path is unqualified; serialized copies are not an automatic substitute.
+### 11.1 Prior readers, overwrite, subsequent consumers
 
-Measure copy bandwidth contention, snapshot-source freeze, staging backpressure, initial hit latency and decode stalls. Lifecycle I/O completions may wake the host as explicit storage-ownership facts; they are not a new source of model scheduling priorities.
-
-## 10. Publication storage, credits, and terminal arbitration
-
-### 10.1 Separate staging from consumer ownership
-
-The current whole-window materialization and synchronous SSE write are not the target publication interface. The proposed chain is:
+For every destination incarnation, the required dependency chain is:
 
 ```text
-GPU terminal staging -> event-ordered D2H -> host batch staging
-                    -> bounded demux -> per-request immutable queues
-                    -> request-local framers -> independent writers
+all prior readers/writers of the destination's old view
+    -> exclusive destination ownership / retired old-view frontier
+    -> restore, COW copy, clear or overwrite on its exact transfer stream
+    -> exact completion publication and coherent new table/view
+    -> subsequent consumers on their actual execution streams
 ```
 
-- GPU staging is reusable only after the exact transfer/source-consumer completion event, never after a socket acknowledges data.
-- Host batch staging is reusable after demux has finished reading it; an event alone cannot retire an outstanding CPU reader.
-- Per-request consumers receive detached storage or separately owned immutable views that do not pin shared batch staging.
-- A window grant reserves that response lease's maximum complete-window commitment before eligible model work; it never reserves the whole response against an execution slot.
-- Credit includes token payload, encoding/escaping, tool/UTF-8/reasoning framer retention, non-streaming accumulation and other retained copies. Framer memory is not an off-ledger exception.
-- Transfers contain only committed live payload and required metadata. Worst-case reserved space is not the transfer extent.
+The transfer waits for the destination's **prior access frontier**, not merely
+its last writer. The new consumer waits for transfer completion. Both edges
+are necessary. A copy-stream FIFO does not order a queued compute reader on
+another stream, and slow SSD I/O is not synchronization. A submitted graph,
+sidecar, verifier, collective or exporter remains a reader even if the request
+was logically cancelled meanwhile.
 
-Two staging banks are a proposed shared admission cost, not proof that demux is nonblocking or economical. Detached output/framing/accumulation uses the response-capacity BOM, independent of slot reuse. No network writer runs on the inference submission owner.
+Close the old view to new submissions before recording/joining its frontier.
+For several compute streams, join all relevant access events; a guessed main
+stream event cannot stand in for independent readers. Event handles and their
+generations remain owned until their waiters retire. CPU adapters express the
+same happens-before relation through actual task/reader completion.
 
-### 10.2 Lifecycle progress must not require model progress
+TransferEngine consumes a typed destination-overwrite lease with that frontier
+and a pinned source-ready lease. It returns a generation-bound completion
+publication; callers cannot fabricate readiness by changing dirty flags.
+A new frame/table incarnation is visible only after successful publication.
+Delayed completion for an obsolete incarnation cannot attach bytes to a reused
+frame. I/O failure withdraws the unpublished destination and preserves native
+borrowers until retirement; it never exposes a partially restored page or
+silently recomputes through another execution path.
 
-If every slot lacks a grant, cancellation and retirement still execute through typed **LifecycleSelect**, with preadmitted storage and reserved control/terminal receipt capacity independent of normal output. It never calls generation commit with zero emitted tokens. `SequenceRetirement` is one KV sub-operation; all state and I/O owners join the composite retirement.
+### 11.2 Export, staging and selective overlap
 
-Host credit return releases host publication ownership and may issue a new grant. The host submits lifecycle/selection work from pending intents, newly issued or outstanding grants, or permitted storage-ownership completions. On an authenticated Idle receipt it parks until one of those facts changes; it never polls row phases/positions or spins empty generation. Deferred grants remain explicitly outstanding; an Idle outcome cannot silently discard them. Idle with outstanding grants requires a concrete pending ownership/completion wake source; returning Idle while eligible granted work exists is a controller error, not permission to park forever.
+Export waits for the source producer and keeps its immutable source reference
+until transfer completion. Mutable recurrent checkpoints freeze at their
+canonical boundary and copy into admitted exclusive snapshot storage before
+that request resumes mutation. Slower persistence owns detached bytes rather
+than a mutable request buffer. A different ready request continues throughout.
 
-A consumer that never reads cannot hold shutdown forever. Host transport clocks enforce the declared delivery deadline/slow-consumer policy, produce a delivery outcome, release transport-owned buffers and submit cancellation intent when required. These are I/O deadlines, not hidden inference deadlines or oversized collective timeouts. Draining shutdown closes admission, resolves bounded transport lifetimes and retires native owners; it does not kill arbitrary kernels.
+Pre-admit copy lanes, events, staging, table banks and retirement queues. If a
+required snapshot cannot obtain bounded staging, defer that request at the
+checkpoint rather than allocate secretly, miss the checkpoint, or rewind it.
+Storage progress is independent of normal output credit and can wake the
+scheduler through immutable ownership receipts. Its dependencies must not
+block unrelated model roots behind an unselected restore.
 
-### 10.3 Exactly-once outcomes
+Cancellation during load/store revokes future activation, not submitted DMA or
+filesystem I/O. The old source, destination, staging and completion records
+remain owned until real consumers finish. Shutdown joins actual owners before
+free; timeout does not establish retirement.
 
-Maintain separate typed outcomes:
+### 11.3 Replica identity, recency and later pressure policy
 
-- `ExecutionOutcome`: committed completion, cancellation or execution failure, owned by execution/lifecycle authority.
-- `DeliveryOutcome`: delivered, disconnected, timed out or framing/transport failure, owned by transport.
+A logical content version can have several separately charged physical
+replicas. A tier directory distinguishes clean immutable copies, private dirty
+state, pending copies, invalidated incarnations and durable archive receipts.
+An old backing copy cannot restore over newer committed content. Disk extent
+ownership and capacity are explicit storage contracts; memory allocations and
+pinned staging remain in PMA, never a second RAM/VRAM reserve.
 
-**First terminal committed in transaction/lifecycle order wins.** An EOS committed in t followed by cancellation in t+1 returns `AlreadyTerminal`; it does not publish another execution terminal or double-count usage. A disconnect after execution completion may change delivery outcome, not execution history.
+Eviction recency follows **effective logical use**, not just transfers into a
+tier. Reusing a GPU-resident prefix refreshes the retention value of its valid
+backing replica even when no RAM/SSD load occurs. Keep a versioned monotonic
+use observation, propagate it through the declared cache/storage protocol and
+apply a defined eviction ordering before reclaiming. This must not require
+per-token host polling or a D2H shadow of page state. Test hot-GPU/cold-backing
+competition separately from overwrite safety: recency is policy, events are
+correctness, and neither proves the other.
 
-Completed-request identity remains valid for idempotent external operations while its response lease exists. It cannot authorize a stale execution ticket. All generation-qualified command handling must distinguish a valid already-terminal request operation from corrupted/stale internal execution state before touching a reused slot.
+Any future GPU/RAM/SSD chain declares its real stages. RAM and SSD alternative
+backends do not prove a measured SSD-to-RAM-to-GPU promotion path. Before live
+request offload is enabled, qualify complete page/recurrent/MTP suspend and
+resume, backing and staging admission, bounded pressure progress, dirty-version
+publication, faults/cancellation and native capture/transport behavior. No
+pressure-triggered offload is entered automatically to hide a failed resident
+implementation.
 
-## 11. Scheduling and request isolation
+## 12. Publication, liveness and terminal outcomes
 
-Keep queue count/bytes, resident slots, transaction work, and outstanding output as separate constraints. Physical storage for each remains admitted through its canonical owner.
+Request state and KV retire independently from response delivery:
 
-The first policy gives granted decode windows regular service, schedules one canonical prefill chunk with anti-starvation, and charges MTP for verifier/proposal work rather than accepted-token percentage. Age is a device-owned, saturating 64-bit count of completed serving operations since admission/last service, with a stable admission-order tie break—not host wall-clock priority. Saturation never wraps a waiting request back to age zero. Host queue age remains passive observability. Scheduling may defer a request but never resize its intrinsic window/chunk or change request-local assignment. No-grant/inactive rows do not block healthy rows or lifecycle progress.
+```text
+execution terminal staging -> event-ordered transfer -> bounded host demux
+    -> detached immutable request publications -> framer -> socket/result sink
+```
 
-Equal token counts do not guarantee equal time. Attention context, model routing and precision matter. Strict prefill/decode isolation may require separately admitted compute; it cannot be claimed from chunking alone.
+GPU staging retires after its exact copy/source-consumer edge. Host batch
+staging retires after demux's CPU readers. Detached publications do not pin
+shared staging, KV pages or an execution record. A response lease can outlive
+and overlap several uses of that record.
 
-A compatibility key must be typed and minimal. Do not use request IDs, seeds, temperatures, or penalties as convenient grouping keys to disguise missing row-wise execution. Unsupported input is rejected precisely before state mutation; accepting default traffic only through exclusive singleton cohorts is not continuous-batching qualification.
+One output grant reserves the maximum complete request-local window before
+eligible model work. It binds serving instance, request generation, non-reused
+grant ID, immutable window policy and destination ownership. At most one is
+outstanding per binding. A grant can remain unspent across prefill chunks;
+selection can defer it but cannot spend it twice or resize the window. Only its
+terminal completion or retirement receipt releases unused reservation or
+transfers committed payload to detached publications. Credit return permits a
+new grant, never a host write to device phase, position or depth.
 
-## 12. Multi-device extension requirements
+Credit covers simultaneous producer, queued and consumer
+payloads, escaping/framing, retained UTF-8/reasoning/tool state, metadata and
+non-streaming accumulation. Popping a queue transfers its byte ownership to
+the consumer; it does not release credit while `sink.write` still borrows it.
+Lazy fragmentation is necessary but does not bound arbitrary metadata or all
+producer transients. Remove admit-arbitrarily-large-when-empty policies from
+bounded production channels. Derive a maximum from admitted geometry or reject
+unsupported input before success; preserve semantic and framing boundaries.
 
-Capacity-one migration must preserve every currently supported topology. Higher multi-device capacity additionally requires:
+Non-streaming results need an admitted complete-response bound or a checked
+accumulation cap with defined failure semantics. A fixed nominal price per
+response is not proof. Preparation/parser/tokenizer buffers and simultaneous
+copies belong in the same complete host-memory account.
 
-1. One serving-slot identity/generation maps to every TP shard, PP stage and expert tier. Only the declared continuation owns sampling/control state.
-2. Slot-qualified MPI commands carry ordered lifecycle/serving epochs and membership consensus; today's global setters/clear command are insufficient.
-3. Graphs remain participant-local with explicit collectives and exact producer streams/events.
-4. Ragged request work uses device-authored compaction/scatter to original coordinates or a proved native ragged protocol. Passing the first request's live count for a whole ragged bank is invalid.
-5. Existing per-bank collective lowering is a useful correctness/economy comparator, not an automatic fallback. Measure launch count, latency, bytes and arithmetic order; no universal request-count crossover is asserted.
-6. PP requires a specified microbatch schedule, exclusive concurrent arenas and at most one in-flight transaction per request. A single global in-flight transaction does not certify pipeline utilization.
-7. Shared domain state and placement-epoch changes obey the numerical and snapshot contracts above.
+Lifecycle operations have reserved control/terminal storage independent of
+output grants. All-output-blocked cancellation and retirement still progress.
+Idle is valid only with a concrete pending wake source or genuinely absent
+eligible work; it cannot discard an outstanding grant. Delivery deadlines
+resolve abandoned consumers without inventing model deadlines or killing
+arbitrary kernels.
 
-Compact collectives must prove arithmetic equivalence as well as live communication volume; changing message geometry can change native reduction selection/order. Correct final tokens alone do not certify either invariant.
+Execution outcome and delivery outcome are distinct. The first execution
+terminal committed in operation order wins; a later disconnect changes only
+delivery. Completed peers keep their real outcomes if another request's reset
+fails. A shared execution invariant failure seals the session; service health
+and inference fail closed until supervisor restart. Do not continue on an
+unproven subset of state.
 
-## 13. Feature parity and observability before cutover
+## 13. Scheduling and multi-participant execution
 
-Separate **cutover parity** from **target feature expansion**. Every result below remains unqualified for this proposed implementation. Each backend column expands over supported formats, greedy/stochastic policies, fixed/dynamic MTP depth and every currently supported topology. Existing response-form restrictions remain explicit.
+Decode service and single-request prefill chunks use a bounded anti-starvation
+policy. Execution age is a saturating count of completed operations with a
+stable admission-order tie break, not host timing. Output- or storage-blocked
+requests do not prevent other eligible work or lifecycle progress. Page growth
+is secured before selection; headroom does not alter request arithmetic.
+Measure long-context attention and routing cost, not token counts alone.
+Aggregated prefill/fused prefill-decode are future separately qualified
+optimizations, not automatic alternate implementations.
 
-### 13.1 Cutover matrix — blocks Phase A/policy cutover at G7
+One request binding and ordered admission/commit epoch spans the admitted
+participant set. Each participant retains only its actual shard's pages and
+state; physical page IDs need not match between participants. A global logical
+block maps to typed participant-local handles. Multi-pool/multi-rank admission
+is atomic: prepare all real owners, agree the decision, publish coherently or
+roll back every unpublished grant. Independent rank-local grant reordering
+cannot create divergent histories.
 
-“Preserve” means prove every currently supported case and preserve its precise admission restrictions, not assume every possible combination already works.
+Preserve original MPI rank and NUMA ownership. Native GPU collectives remain
+within real homogeneous rank-local domains; CPU/cross-rank communication uses
+the existing MPI/shmemspin machinery. Only the declared continuation owns
+sampling/control. Expert-only participants do not acquire dummy KV histories.
 
-| Feature | CPU ordinary | CPU MTP | CUDA ordinary | CUDA MTP | ROCm ordinary | ROCm MTP |
-|---|---|---|---|---|---|---|
-| Laws/seeds, budgets, stops, model-default penalties | Preserve | Preserve | Preserve | Preserve | Preserve | Preserve |
-| Active DRY | Prove existing support | Prove existing support | Preserve explicit resident rejection | Preserve explicit rejection | Preserve explicit resident rejection | Preserve explicit rejection |
-| Thinking budget, prescribed sequence and framing | Preserve/version declared policy changes | Preserve/version declared policy changes | Preserve/version declared policy changes | Preserve/version declared policy changes | Preserve/version declared policy changes | Preserve/version declared policy changes |
-| Prefix, recurrent checkpoints, supported KV formats/tiers | Preserve | Preserve | Preserve | Preserve | Preserve | Preserve |
-| Tool choice, reasoning/tool framing and stream usage | Preserve | Preserve | Preserve | Preserve | Preserve | Preserve |
-| Token IDs/runtime summaries in supported response forms | Preserve | Preserve | Preserve | Preserve | Preserve | Preserve |
-| Cancel, delivery, stats epochs, shutdown and capacity-one topology | Preserve | Preserve | Preserve | Preserve | Preserve | Preserve |
+Collectives carry only actual live rows/spans plus necessary protocol metadata.
+Page-table capacity, unowned shards and inactive sequences are not wire extents.
+PP requires an explicit microbatch schedule and exclusive concurrent arenas;
+its publication/retirement joins every actual participant. One global in-flight
+transaction alone does not certify pipeline utilization. Test singleton, odd
+and larger participant counts, unequal widths, more than two stages and valid
+CPU/GPU compositions; local test hardware does not set support limits.
 
-Inventory the exact current cases before cutover; this matrix is not a capability advertisement. No new rejection, silent penalty/prefix disablement or exclusive alternate implementation is permitted. G1 policy adoption and G3's versioned numerical/control contract also gate policy cutover. All modes, including benchmark, use the same installed seam.
+## 14. Observability and qualification
 
-### 13.2 Complete target — additional implementation gates
+Report separately: materialized pool bytes; free, private, shared, cache-only,
+tentative and retiring pages; logical references; protected growth commitments;
+COW bytes; valid imported/exported bytes; staging occupancy; admission refusals
+and reasons. Define non-overlapping occupancy categories and orthogonal aliases
+rather than summing references as physical pages. Passive reports come from
+permitted immutable observations, not live GPU probes or a host admission
+ledger. Expose a complete physical BOM and high-water evidence independently.
 
-| Additional capability | CPU ordinary/MTP | CUDA ordinary/MTP | ROCm ordinary/MTP | Gate |
-|---|---|---|---|---|
-| Genuine independently admitted multi-request capacity | Required | Required | Required | G2–G8 per qualified topology; G9 for multi-device growth |
-| Native per-request DRY sequence history where currently absent | Close any audited gap | Required new feature | Required new feature | G2 history/BOM plus G7 feature proof |
+Per-request summaries preserve actual prefix observations, committed tokens,
+draft/verifier work, terminal causes and delivery outcome. Shared kernel time
+and shared bytes cannot be charged in full to every request and then summed.
+Record real submitted launch dimensions, transfer/collective extents, graph
+reuse and forbidden-path counters. A path counter is not an economy receipt.
+Stats epoch reset cannot cancel requests, clear caches or let old requests
+repopulate new counters.
 
-The currently rejected GPU DRY cases are **new features**, not prerequisites to a behavior-preserving capacity-one ownership refactor. They block claims of the complete target, not the narrower G7 cutover-parity claim. At higher capacities, supported laws/defaults still cannot be routed through hidden exclusive cohorts; a grouped sampler and its history are real implementation obligations.
+The following are qualification obligations, not existing test names:
 
-Per-request accounting must define committed tokens, draft/verification work, stop reasons, prefix observations and execution/delivery outcomes. A shared kernel's wall time or shared physical bytes must not be charged in full to every request and then summed as if independent. Keep non-additive/shared costs at the domain level or use an explicit measured attribution definition. Existing per-request verifier fields are inputs to this design, not permission to duplicate global summaries.
+| Contract | Required adversarial evidence |
+|---|---|
+| Pooled geometry/admission | One request exceeds an equal-share partition; mixed lengths, exact fit/refusal, overflow, all-class rollback, S independent of pool size, full-default-output commitments |
+| Shared prefixes/COW | Multiple readers of actual identical frames, private divergence, partial tails, one reader cancellation, eviction with surviving aliases, no private full-prefix clones |
+| Lifetime/reuse | Delayed queued readers, multiple streams, stale generations, cancel/restore/retire races, repeated reuse and reset; no early reuse after reference count zero |
+| Native paged arithmetic | Noncontiguous/permuted frames, page-edge and partial extents, supported formats/codebooks, all live M and relevant N/K, ordinary/MTP and optimized dispatch |
+| MTP/hybrid | Tentative pages, accept/reject/correction, shifted caches, per-request recurrence, checkpoint/hidden/logit handoff under interleaving |
+| Offload-ready protocol | Prior-reader -> overwrite -> new-consumer edges; missing-edge negative controls; hot GPU hits refresh valid backing recency; obsolete/failing completions cannot publish |
+| Response memory/liveness | Oversized semantic event plus slow consumer retaining a prior payload; exact reconstruction and simultaneous byte bound; no-grant cancellation and bounded shutdown |
+| Distributed execution | Atomic participant admission, real rank/NUMA ownership, ragged live communication, arithmetic order and topology-generic lifecycle |
 
-Passive stats derive host lease/queue age from host-owned facts and execution work from immutable permitted publications. They never probe GPU state. Measurement-epoch reset cannot cancel requests, clear caches, or let an old request repopulate the new epoch.
+Replay recorded inputs and initial state through the actual production
+controller/kernel, preserving schema/policy, geometry, formats, ordering,
+sampler laws, page/table identities and relevant completions. Expected outcomes
+must include decisions, ownership transitions and outputs. Reject incomplete
+traces; synthetic repetitions are lifecycle/contract tests, not recorded replay.
+Every changed controller/kernel and discovered production defect receives an
+explicit focused `ProductionTestPreflight` registration. Fast Unit tests remain
+device-free; native kernels/capture use explicit integration suites.
 
-## 14. Smallest useful proofs and delivery sequence
+Complete Unit/preflight, source-to-loaded-code identity and canonical multi-prompt
+frozen-history final-logit panels remain separate gates. Focused passes or
+legacy fixed-slot traces cannot certify the new allocator or paged kernels.
+Large corpora belong in `Llaminar/corpora`, not this source repository.
 
-Documents first: approve the host/device table, numerical/placement contract, per-row ABI and lifecycle ownership. No runtime implementation or test run is authorized by this review response.
+Economy uses matched Release binaries and production defaults: solo and mixed
+lengths, prefix-sharing and miss-heavy traffic, burst/steady offered load,
+streaming and non-streaming, slow consumers, long/short coexistence and
+cancellation/replacement. Measure queue-inclusive TTFT/E2E, output gaps, SLO
+goodput, unfinished work, pool/commitment high water, copy/attention overhead
+and pressure behavior. Profile new CPU/CUDA/ROCm kernels and compile all shipping
+GPU targets with spill guards. Numerical correctness and economical execution
+must pass together.
 
-After those contracts are accepted, the first controller proof should replay **recorded** scalar inputs/initial state through the actual shared controller arithmetic extended per row:
+## 15. Replacement and completion rule
 
-- A continues while B reaches EOS.
-- C enters B's retired slot at a new generation with NewRequest while A retains ContinueResponse.
-- Old B execution tickets cannot authenticate C; late valid cancellation is already-terminal rather than a second outcome.
-- Penalty history, seed coordinates, learner state and outputs match A's solo reference under the enumerated intrinsic-window/prefix/placement trace. Replay budget-limited learner skips at identical request-local boundaries.
-- C's persistent logits/hidden/condition/sidecar handoff survives A's intervening windows without duplicate sampling/emission/history mutation.
-- Output eligibility derives from a unique host-backed grant; withholding/draining a response queue changes timing, never window length. Repeated or stale grants cannot authorize new work.
-- All-output-blocked cancellation and lifecycle-only retirement progress without a model token or normal output credit.
+Refactor or replace existing slot-addressed cache, graph-binding, prefix,
+controller, estimator and test machinery wherever necessary. Accepted old
+source is reusable only where its contract survives; acceptance does not freeze
+an unsuitable interface. Retain useful numerical or lifecycle oracles while
+replacing tests that assert the retired physical layout.
 
-Do not invent observations for unimplemented paths or call repeated synthetic fixtures replay. New/changed controllers and GPU kernels require recorded-input replay registered explicitly in `ProductionTestPreflight`, alongside focused lifecycle/geometry tests and native integration gates.
+The finished implementation has one paged KV path for supported serving,
+including S = 1, and one authority for each live value and physical byte.
+Fixed full-context request partitions, their capacity arithmetic, copy-per-hit
+resident-prefix restoration and alternate serving launchers retire at cutover.
+Historical source remains in Git and sealed evidence, not as a runtime fallback.
 
-The smallest subsequent GPU experiment may use one CUDA device and one ROCm device, fixed slots, greedy/stochastic MTP without penalties, prefix off, and alternating complete transactions. It proves only the named controller/capture subset. **It is not a supported mode and cannot certify default production traffic.** Production counters must show no recapture, only permitted publication/ticket transfers, and the applicable solo byte contract. The cutover matrix then closes existing penalties, reasoning, prefix and optimized behavior; the separate complete-target matrix closes new GPU history and capacity capabilities. CPU and absent hardware remain explicitly qualified or unqualified by actual evidence.
-
-Economy gates use Release, actual shared execution, all supported M/N/K and positive CPU thread counts, live collective bytes, memory BOM, and isolated kernel profiling. Measure offered-load goodput, queue/active age, output-event gaps, cancellation/retirement latency, prefix hit/discard rates and pipeline bubbles. Completed-only percentiles or a throughput increase hiding growing queues are insufficient.
-
-## 15. Open gates and decision register
-
-All proof gates below remain open; none is closed by this document.
-
-| Gate | Required decision/proof before qualification | Review findings |
-|---|---|---|
-| G1 Host/device serving contract | Formal adoption of the narrow policy proposal, then proof of typed ingress, terminal/ticket completion, shared phase/injection authority and source sanitizers | CB-01/01R, CB-08, CB-09, CB-21 |
-| G2 Per-row controller/sampler ABI | Mixed admission, host-known ticket authentication, independent budgets/laws/history/grants, device forcing, finite identity | CB-02, CB-04, CB-05, CB-18R, CB-21, CB-24 |
-| G3 Numerical invariance | Intrinsic windows/chunks/depth learning, closed trace, same-prefix/no-move solo byte contract, request-local LLEP and admitted-M dispatch | CB-03/03R, CB-16, CB-22 |
-| G4 Physical mode and storage | One resolved serving capacity; fixed-slot and response-lifetime BOM/economy; separate future page-grant protocol | CB-06, CB-08R, CB-23, CB-26 |
-| G5 State and prefix lifecycle | Slot/domain classification, persistent prefill/MTP handoff, selective event-ordered concurrent restore/harvest and exact retirement | CB-07, CB-16, CB-25, CB-26 |
-| G6 Output and lifecycle liveness | Composite leases, one-window grants, inclusive credits, reserved control receipts, non-generation lifecycle operations, exactly-once outcomes | CB-08/08R, CB-09/09R, CB-21 |
-| G7 Owner migration and cutover parity | Every current topology/mode at capacity one; separately qualify the shared policy; distinguish preserved support from target expansion | CB-12/12R, CB-14/14R, CB-15, CB-23 |
-| G8 Native catalog and economy | HIP selector-first and all branch receipts, graph/workspace BOM, single-request-prefill TTFT, model/copy pipeline stalls | CB-13, CB-18/18R, CB-22, CB-25 |
-| G9 Multi-device capacity qualification | Slot-qualified commands, consensus, compact/ragged collectives, stable arithmetic, PP scheduling and concurrent arenas | CB-10, CB-11, CB-17, CB-24 |
-
-Product inputs also remain to be set: workload/context/output distributions, concurrency demand, TTFT/output-gap/E2E objectives, trust-domain prefix policy, queue limits, and delivery deadlines. They determine capacity/economy acceptance, not exemptions from ownership or numerical contracts.
-
-The second review found the direction coherent but not implementation-ready. Revision 3 records proposed decisions and the requested narrow policy proposal; it is not a third independent approval. Formal policy adoption, detailed native contracts and all G1–G9 evidence remain outstanding. No runtime change, build/test run, commit or push is authorized by this document.
+The implementation plan gives the dependency order and exit evidence. No gate
+is closed by rewriting this design; no new runtime support, capacity increase,
+PR readiness, release or image publication is asserted here.
