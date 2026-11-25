@@ -388,7 +388,7 @@ TEST(Test__ActivationMemoryEstimator, CpuTinyRootsMatchLivePhysicalArena)
         PhysicalMemoryMaterializationKind::NewAllocation),estimated);
 }
 
-/** @test CPU retained MTP admission includes the exact independently owned terminal-hidden mailbox. */
+/** @test CPU retained MTP admission prices separate archival and resident hidden roots exactly. */
 TEST(Test__ActivationMemoryEstimator, CpuRetainedMtpTerminalHiddenMatchesActualRoot)
 {
     ModelMemoryProfile profile;
@@ -415,13 +415,17 @@ TEST(Test__ActivationMemoryEstimator, CpuRetainedMtpTerminalHiddenMatchesActualR
         const auto absent = ActivationMemoryEstimator::estimate(profile, geometry, DeviceId::cpu());
         EXPECT_EQ(gpu_retained, ActivationMemoryEstimator::estimate(profile, geometry, DeviceId::cuda(0)));
         const auto rows = static_cast<size_t>(resolveMTPTerminalHiddenRowCapacity(geometry.batch_size, mtp));
-        const auto bytes = AlignedVector<float>::requiredAllocationBytes(rows * profile.d_model);
+        const auto resident_rows = static_cast<size_t>(2 * geometry.batch_size);
+        const auto bytes = AlignedVector<float>::requiredAllocationBytes(rows * profile.d_model) +
+            AlignedVector<float>::requiredAllocationBytes(resident_rows * profile.d_model);
         EXPECT_EQ(retained - absent, bytes);
         auto config = test::cpuArenaFixtureConfig(nullptr, bytes);
         auto authority = config.physical_memory_authority;
         {
             BufferArena arena(config);
             ASSERT_TRUE(arena.registerBuffer(BufferId::PREFIX_TERMINAL_HIDDEN, rows,
+                profile.d_model, "FP32", DeviceId::cpu()));
+            ASSERT_TRUE(arena.registerBuffer(BufferId::MTP_SERVING_HIDDEN, resident_rows,
                 profile.d_model, "FP32", DeviceId::cpu()));
             ASSERT_TRUE(arena.allocate());
             EXPECT_EQ(authority->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::ActivationArena,

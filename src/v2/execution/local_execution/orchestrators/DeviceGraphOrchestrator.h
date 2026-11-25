@@ -30,6 +30,7 @@
 
 #pragma once
 #include "execution/mtp/OrdinaryForwardRetention.h"
+#include "execution/mtp/CPUResidentMTPHidden.h"
 #include "execution/mtp/HostedDeviceGenerationFragment.h"
 #include "../../../execution/moe/MoEOverlayFinitePlacementGraphs.h"
 #include "backends/ReadAheadNativeResourceFamily.h"
@@ -9584,6 +9585,8 @@ namespace llaminar2
         int serving_logits_rows_ = 0;
         /** @brief Cached tokens of each serving slot (KV sequence). */
         std::vector<int> serving_slot_positions_;
+        /// Metadata only: borrows the arena's disjoint CPU main/draft hidden root.
+        std::unique_ptr<CPUResidentMTPHidden> cpu_resident_mtp_hidden_;
         /** @brief Diagnostic of the last failed serving forward. */
         std::string serving_row_error_;
         /** @brief KV sequence of each row of the serving forward in flight. */

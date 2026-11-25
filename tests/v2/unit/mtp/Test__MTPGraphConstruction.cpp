@@ -5026,6 +5026,47 @@ TEST(Test__MTPGraphConstruction, BuildsOverlayMoESidecarWithMTPCollectiveNamespa
         DeviceId::cpu(), nullptr), std::invalid_argument);
 }
 
+/** @test Hidden-bank publications survive unrelated slot activity, but never retirement or overwrite. */
+TEST(Test__MTPGraphConstruction, ResidentHiddenPublicationLifecycle)
+{
+    using Bank = CPUResidentMTPHidden::Bank;
+    for (const size_t slots : {1u, 3u, 7u, 17u})
+    {
+        std::vector<float> storage(2 * slots * 5, -1.0f);
+        CPUResidentMTPHidden owner(storage, slots, 5);
+        const std::array<float, 5> a{1, 2, 3, 4, 5}, b{6, 7, 8, 9, 10};
+        const auto main = owner.publish(0, Bank::Main, a);
+        const auto draft = owner.publish(0, Bank::Draft, b);
+        EXPECT_TRUE(std::equal(owner.read(main).begin(), owner.read(main).end(), a.begin()));
+        EXPECT_TRUE(std::equal(owner.read(draft).begin(), owner.read(draft).end(), b.begin()));
+        for (size_t slot = 1; slot < slots; ++slot)
+        {
+            owner.publish(static_cast<int>(slot), Bank::Main, b);
+            owner.retire(static_cast<int>(slot));
+        }
+        EXPECT_NO_THROW(owner.read(main));
+        EXPECT_NO_THROW(owner.read(draft));
+        const auto draft2 = owner.publish(0, Bank::Draft, a);
+        EXPECT_THROW(owner.read(draft), std::logic_error);
+        EXPECT_NO_THROW(owner.read(main));
+        owner.retire(0);
+        EXPECT_THROW(owner.read(main), std::logic_error);
+        EXPECT_THROW(owner.read(draft2), std::logic_error);
+        const auto replacement = owner.publish(0, Bank::Main, b);
+        EXPECT_THROW(owner.read(main), std::logic_error);
+        EXPECT_TRUE(std::equal(owner.read(replacement).begin(), owner.read(replacement).end(), b.begin()));
+        EXPECT_THROW(owner.publish(-1, Bank::Main, a), std::invalid_argument);
+        EXPECT_THROW(owner.publish(static_cast<int>(slots), Bank::Main, a), std::invalid_argument);
+        EXPECT_THROW(owner.publish(0, static_cast<Bank>(9), a), std::invalid_argument);
+        EXPECT_THROW(owner.publish(0, Bank::Main, std::span<const float>(a.data(), 4)), std::invalid_argument);
+        EXPECT_NO_THROW(owner.read(replacement));
+        CPUResidentMTPHidden foreign(storage, slots, 5);
+        EXPECT_THROW(foreign.read(replacement), std::logic_error);
+        EXPECT_THROW(CPUResidentMTPHidden(storage, 0, 5), std::invalid_argument);
+        EXPECT_THROW(CPUResidentMTPHidden(storage, slots, 4), std::invalid_argument);
+    }
+}
+
 /** @test Explicit sidecar maps reject aliasing, foreign ownership and invalid geometry. */
 TEST(Test__MTPGraphConstruction, ServingSidecarSlotAdmission)
 {

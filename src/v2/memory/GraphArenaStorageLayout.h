@@ -24,6 +24,7 @@ struct GraphArenaSupplementalStorage
     bool full_prefill_kv_handoff = false; ///< Separate full-width K/V banks for phase-split prefill.
     size_t terminal_hidden_rows = 0; ///< Zero when no retained MTP capacity exists.
     size_t terminal_hidden_columns = 0; ///< Residual width, including the QFN trunk.
+    size_t cpu_mtp_resident_slots = 0; ///< Main/draft banks per CPU request; never alias prefix archival.
 };
 
 /** @brief One independently allocated arena root and its stable graph identity. */

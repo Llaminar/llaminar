@@ -64,6 +64,19 @@ GraphArenaStorageLayout GraphArenaStorageLayout::resolve(const GraphSchema &sche
         append(BufferId::PREFIX_TERMINAL_HIDDEN, {.name="prefix_terminal_hidden",
             .shape={supplemental.terminal_hidden_rows, supplemental.terminal_hidden_columns},
             .tensor_type=BufferTensorType::FP32, .device=resolver.default_device});
+    if (supplemental.cpu_mtp_resident_slots)
+    {
+        if (!resolver.default_device.is_cpu() || !supplemental.terminal_hidden_columns ||
+            supplemental.cpu_mtp_resident_slots > supplemental.terminal_hidden_rows)
+            throw std::invalid_argument("Resident CPU MTP hidden banks require admitted slots and residual width");
+        if (supplemental.cpu_mtp_resident_slots > std::numeric_limits<size_t>::max() / 2)
+            throw std::overflow_error("Resident CPU MTP hidden bank rows overflow");
+        // Main publications survive speculative work; draft publications are
+        // independently replaceable while requests advance to different depths.
+        append(BufferId::MTP_SERVING_HIDDEN, {.name="mtp_serving_hidden",
+            .shape={2 * supplemental.cpu_mtp_resident_slots, supplemental.terminal_hidden_columns},
+            .tensor_type=BufferTensorType::FP32, .device=resolver.default_device});
+    }
     return layout;
 }
 

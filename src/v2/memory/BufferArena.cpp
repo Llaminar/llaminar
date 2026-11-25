@@ -470,6 +470,8 @@ namespace llaminar2
             return BufferId::PREFIX_MTP_V_STAGING;
         if (name == "prefix_terminal_hidden")
             return BufferId::PREFIX_TERMINAL_HIDDEN;
+        if (name == "mtp_serving_hidden")
+            return BufferId::MTP_SERVING_HIDDEN;
         if (name == "prefix_terminal_logits")
             return BufferId::PREFIX_TERMINAL_LOGITS;
 

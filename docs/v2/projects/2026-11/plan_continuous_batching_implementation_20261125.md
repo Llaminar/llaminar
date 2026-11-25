@@ -91,9 +91,22 @@ gauges or economy evidence.
   Evidence: `CB-checkpoints/mtp-slot-cache-native-r3.IgTgxD`, with earlier
   diagnostic failures preserved. These are implementation-checkpoint results,
   not independent milestone acceptance or full qualification.
-- Next: slot-owned terminal-hidden publication, shifted predictor KV state,
-  independent sampling/depth and shared verifier transactions. No MTP capability
-  advertisement changes in this checkpoint.
+- CPU resident main/draft hidden banks now have a distinct PMA-priced arena
+  root, separate from the prefix archival mailbox. Admission, allocation and
+  CPU fixture BOMs resolve the same root. No GPU host-control bank is added.
+- `CPUResidentMTPHidden` borrows that root and versions each slot/bank publication;
+  overwrite/retirement invalidates old receipts without clearing topology or
+  copying model state into a second owner. The orchestrator binds metadata after
+  materialization and retires it before arena replacement/destruction.
+- Native arena tests prove distinct resident/archive storage, exact materialized
+  physical bytes, release and one-byte-short admission rejection. Slot lifecycle
+  tests cover independent main/draft state and singleton/odd/larger capacities.
+  Seven focused MTP/activation/arena CTest registrations pass at
+  `CB-checkpoints/mtp-resident-publications-r2.6WTRiU`. Initial fixture failures
+  remain preserved; these are not full preflight or runtime MTP qualification.
+- Next: publish actual forward terminal rows into resident banks, shifted
+  predictor KV state, independent sampling/depth and shared verifier transactions.
+  No MTP capability advertisement changes in these checkpoints.
 
 ## Next
 

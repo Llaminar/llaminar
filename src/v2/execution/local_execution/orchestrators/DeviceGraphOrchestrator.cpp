@@ -6396,6 +6396,8 @@ namespace llaminar2
         mtp_verifier_position_ids_dev_ = nullptr;
         mtp_verifier_request_lengths_dev_ = nullptr;
 
+        // Retire borrowed publication metadata before replacing its arena owner.
+        cpu_resident_mtp_hidden_.reset();
         // Create BufferArena with config
         arena_ = std::make_unique<BufferArena>(arena_config);
 
@@ -6408,7 +6410,9 @@ namespace llaminar2
                 config.dense_tp_decode_replicated && config.qkv_column_parallel,
             .terminal_hidden_rows = retained_mtp
                 ? static_cast<size_t>(resolveMTPTerminalHiddenRowCapacity(state_.batch_size, config.mtp)) : 0,
-            .terminal_hidden_columns = retained_mtp ? static_cast<size_t>(config.residualWidth()) : 0});
+            .terminal_hidden_columns = retained_mtp ? static_cast<size_t>(config.residualWidth()) : 0,
+            .cpu_mtp_resident_slots = retained_mtp && state_.device_id.is_cpu()
+                ? static_cast<size_t>(state_.batch_size) : 0});
         for (const auto &entry : arena_layout.entries())
         {
             if (!arena_->registerBuffer(entry.id, entry.descriptor))
@@ -7009,6 +7013,16 @@ namespace llaminar2
          */
         if (retainsMTPGraphCapacity(graph_builder_->config().mtp))
         {
+            if (state_.device_id.is_cpu())
+            {
+                const auto root = arena_->getSharedTensor(BufferId::MTP_SERVING_HIDDEN);
+                if (!root || !root->mutable_data())
+                    throw std::logic_error("CPU MTP resident hidden root is absent after arena materialization");
+                cpu_resident_mtp_hidden_ = std::make_unique<CPUResidentMTPHidden>(
+                    std::span<float>(root->mutable_data(), root->numel()),
+                    static_cast<size_t>(state_.batch_size),
+                    static_cast<size_t>(graph_builder_->config().residualWidth()));
+            }
             if (!arena_->isRegistered(BufferId::PREFIX_TERMINAL_HIDDEN))
             {
                 LOG_ERROR("[DeviceGraphOrchestrator] MTP requires an arena-owned terminal-hidden archive");
@@ -8470,6 +8484,7 @@ namespace llaminar2
         moe_overlay_external_sequence_identity_.reset();
         moe_overlay_epoch_forward_submission_stream_ = nullptr;
         moe_overlay_epoch_execution_binding_ = {};
+        cpu_resident_mtp_hidden_.reset();
         if (arena_)
         {
             arena_.reset();
@@ -61653,6 +61668,8 @@ namespace llaminar2
             return false;
         serving_slot_positions_.resize(static_cast<size_t>(state_.batch_size), 0);
         serving_slot_positions_[static_cast<size_t>(slot)] = 0;
+        if (cpu_resident_mtp_hidden_)
+            cpu_resident_mtp_hidden_->retire(slot);
         return true;
     }
 
