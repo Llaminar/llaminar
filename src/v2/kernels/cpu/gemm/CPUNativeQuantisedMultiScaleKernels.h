@@ -368,6 +368,36 @@ namespace llaminar2::cpu::native_quantised::multi_scale
     };
 #endif
 
+#if defined(__AVX2__)
+    /**
+     * @brief Fold a later ordered K partition into the earlier ones.
+     * @tparam Lanes Eight AVX2 or sixteen AVX-512 columns.
+     * @param earlier Left fold of all preceding partitions.
+     * @param later This partition's partial, started at positive zero.
+     * @return One rounded VADDPS with @p earlier as source one.
+     *
+     * The same addOrderedAVX2() / addOrderedAVX512() every other x86 ordered
+     * fold uses: a plain vector `+` leaves the operand order to the compiler,
+     * and VADDPS returns its first operand's payload when both are NaN. The
+     * earlier partition's NaN therefore always wins. Finite sums are unchanged.
+     * Used by the dedicated x86 leaves (CPUNativeQuantisedSingleScaleX86Kernels.h).
+     * rows() keeps its plain `+`: pinning it there moved the IQ1_M AVX-512
+     * one-row ordered accumulator to the stack in GCC 14.
+     */
+    template <int Lanes>
+    [[nodiscard, gnu::always_inline]] inline typename SIMD<Lanes>::F foldOrdered(typename SIMD<Lanes>::F earlier,
+                                                                                typename SIMD<Lanes>::F later) noexcept
+    {
+        using F = typename SIMD<Lanes>::F;
+        if constexpr (Lanes == 8)
+            return std::bit_cast<F>(addOrderedAVX2(std::bit_cast<__m256>(earlier), std::bit_cast<__m256>(later)));
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
+        else
+            return std::bit_cast<F>(addOrderedAVX512(std::bit_cast<__m512>(earlier), std::bit_cast<__m512>(later)));
+#endif
+    }
+#endif
+
 #endif // native x86 SIMD operations
 
     /**

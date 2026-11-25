@@ -23,8 +23,15 @@
  *   the K loop holds no format, encoding or policy branch;
  * - weights enter the dot unsigned. IQ3_S grid bytes are biased by sixteen
  *   (an immutable derived copy of the source grid, [17,31] or [1,15] after
- *   the sign), and sixteen times the exact activation sum is removed again;
- *   AVX2 keeps four groups' bounded INT16 pair sums before widening.
+ *   the sign), and sixteen times the activation sum is removed again. This
+ *   requires Q8_1Block::sum_qs to equal the sum of the 32 published bytes on
+ *   both widths (AVX2 formerly used a signed dot that never read it), which
+ *   every production quantizer guarantees and
+ *   CPUCompensationFreeUnits.ProductionActivationQuantizersPublishExactSums
+ *   (V2_Integration_CPUCompensationFreeUnits, ProductionTestPreflight) proves;
+ *   AVX2 keeps four groups' bounded INT16 pair sums before widening;
+ * - ordered K partitions fold through addOrderedAVX2()/addOrderedAVX512(),
+ *   so the earlier partition's NaN payload wins as in every other x86 tree.
  * No decoded weights are stored, nothing is allocated and NEON is unaffected.
  */
 #pragma once
@@ -417,7 +424,7 @@ namespace llaminar2::cpu::native_quantised::multi_scale::x86
                                             std::bit_cast<__m512>(acc[row][strip]), std::bit_cast<__m512i>(dot),
                                             std::bit_cast<__m512>(scale0), scale_a, Policy));
                                 }
-    #endif
+#endif
                             }
                         }
                     }
@@ -426,7 +433,7 @@ namespace llaminar2::cpu::native_quantised::multi_scale::x86
                 for (std::size_t row = 0; row < Rows; ++row)
 #pragma GCC unroll 4
                     for (int strip = 0; strip < strips; ++strip)
-                        reduced[row][strip] = partition == 0 ? acc[row][strip] : reduced[row][strip] + acc[row][strip];
+                        reduced[row][strip] = partition == 0 ? acc[row][strip] : foldOrdered<Lanes>(reduced[row][strip], acc[row][strip]);
             }
 #pragma GCC unroll 4
             for (std::size_t row = 0; row < Rows; ++row)
@@ -567,7 +574,7 @@ namespace llaminar2::cpu::native_quantised::multi_scale::x86
                 for (std::size_t row = 0; row < Rows; ++row)
 #pragma GCC unroll 4
                     for (int strip = 0; strip < strips; ++strip)
-                        reduced[row][strip] = partition == 0 ? acc[row][strip] : reduced[row][strip] + acc[row][strip];
+                        reduced[row][strip] = partition == 0 ? acc[row][strip] : foldOrdered<16>(reduced[row][strip], acc[row][strip]);
             }
 #pragma GCC unroll 4
             for (std::size_t row = 0; row < Rows; ++row)
