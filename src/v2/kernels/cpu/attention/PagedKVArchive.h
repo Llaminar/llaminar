@@ -29,6 +29,7 @@ struct PagedKVArchiveMeta
     int dimension = 0;
     int page_tokens = 0;
     std::size_t rows = 0;
+    std::uint64_t terminal_boundary = 0; ///< Coherent terminal token boundary of the section.
     bool operator==(const PagedKVArchiveMeta &) const = default;
 };
 

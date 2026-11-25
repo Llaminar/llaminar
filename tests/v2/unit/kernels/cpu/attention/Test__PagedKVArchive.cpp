@@ -251,3 +251,22 @@ TEST(PagedKVArchive, AttachArchivedPrefixStagesPrivatePagesAndGatesProvenance)
     EXPECT_THROW(update2->attachArchivedPrefix(other_archive, *grant2, 4), std::invalid_argument);
     EXPECT_EQ(grant2->remainingCommitment(), 1u);
 }
+
+/** @test Terminal boundary round-trips and a clamped boundary rejects. */
+TEST(PagedKVArchive, TerminalBoundaryIsAuthenticatedAndClampedRejects)
+{
+    ArchiveFixture fx;
+    constexpr int heads = 1, dimension = 8, tokens = 4;
+    std::vector<float> rows(static_cast<size_t>(tokens) * 2 * static_cast<size_t>(heads) * static_cast<size_t>(dimension), 0.1f);
+    auto snapshot = publishPage(fx, rows, heads, dimension);
+    auto archive = PagedKVArchive::fromView(snapshot.view());
+    EXPECT_EQ(archive.meta().terminal_boundary, 4u);
+    auto bytes = archive.serialize();
+    auto parsed = PagedKVArchive::parse(bytes);
+    EXPECT_EQ(parsed.meta().terminal_boundary, 4u);
+    // Clamp the terminal boundary below rows: parse must reject before payload.
+    auto corrupt = bytes;
+    const size_t terminal_offset = 8 + 4 + 4 + 4 + 4 + 4 + 8;
+    for (size_t i = 0; i < 8; ++i) corrupt[terminal_offset + i] = std::byte{0x00};
+    EXPECT_THROW(PagedKVArchive::parse(corrupt), std::invalid_argument);
+}

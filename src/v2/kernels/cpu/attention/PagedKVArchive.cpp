@@ -21,7 +21,7 @@ namespace
 constexpr std::uint64_t kArchiveMagic = 0x4C4B564450474156ULL; // "LKVDPGAV" in memory order.
 constexpr std::size_t kHeaderBytes =
     sizeof(std::uint64_t) + sizeof(std::uint32_t) + sizeof(std::uint32_t) +
-    sizeof(std::int32_t) * 3 + sizeof(std::uint64_t);
+    sizeof(std::int32_t) * 3 + sizeof(std::uint64_t) * 2;
 constexpr std::size_t kMaxBytes = 1ull << 32; // Hard bound for one decodable section.
 
 std::uint32_t familyCode(KVCacheFamily family)
@@ -72,6 +72,7 @@ PagedKVArchive PagedKVArchive::fromView(const CPUFP32PagedKVView &view)
         .dimension = view.dimension(),
         .page_tokens = view.pages().empty() ? 0 : view.rows(),
         .rows = static_cast<std::size_t>(view.rows()),
+        .terminal_boundary = static_cast<std::uint64_t>(view.rows()),
     };
     if (view.pages().empty())
         return PagedKVArchive(meta, {});
@@ -120,10 +121,12 @@ PagedKVArchive PagedKVArchive::parse(std::span<const std::byte> bytes)
         .dimension = readI32(),
         .page_tokens = readI32(),
         .rows = readU64(),
+        .terminal_boundary = readU64(),
     };
     if (meta.heads <= 0 || meta.dimension <= 0 || meta.page_tokens <= 0 ||
-        meta.rows > std::numeric_limits<std::size_t>::max() / sizeof(float) / 2)
-        throw std::invalid_argument("Paged archive has invalid native geometry");
+        meta.rows > std::numeric_limits<std::size_t>::max() / sizeof(float) / 2 ||
+        meta.terminal_boundary < meta.rows)
+        throw std::invalid_argument("Paged archive has invalid native geometry or terminal boundary");
     const auto layout = KVNativeStorageLayout::resolve(meta.family, meta.heads,
         meta.dimension, KVStorageFormatName(meta.format), DeviceId::cpu());
     const auto stride = layout.pagePayload(1).totalBytes();
@@ -215,6 +218,7 @@ std::vector<std::byte> PagedKVArchive::serialize() const
     const std::int32_t dimension = meta_.dimension;
     const std::int32_t page_tokens = meta_.page_tokens;
     const std::uint64_t rows = meta_.rows;
+    const std::uint64_t terminal = meta_.terminal_boundary;
     appendRaw(&magic, sizeof(magic));
     appendRaw(&family, sizeof(family));
     appendRaw(&format, sizeof(format));
@@ -222,6 +226,7 @@ std::vector<std::byte> PagedKVArchive::serialize() const
     appendRaw(&dimension, sizeof(dimension));
     appendRaw(&page_tokens, sizeof(page_tokens));
     appendRaw(&rows, sizeof(rows));
+    appendRaw(&terminal, sizeof(terminal));
     appendRaw(payload_.data(), payload_.size());
     return output;
 }
