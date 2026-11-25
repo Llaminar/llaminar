@@ -364,6 +364,39 @@ namespace llaminar2::test
         EXPECT_LE(c_out.cached_prompt_tokens, 140);
         EXPECT_EQ(c_out.finish, ServingFinishReason::Length);
     }
+
+    TEST_F(ContinuousBatchingCPUPrefix, RestoredRowLogitsBytesMatchColdServing)
+    {
+        // Byte equality must include prefix-restored rows: decisions after a
+        // restored prefix see exactly the logits of cold serving.
+        auto b = makeRequest(21, 150, 10, 0.0f, 1);
+        b.record_logit_digests = true;
+        const auto cold = solo(b);
+        ASSERT_EQ(cold.cached_prompt_tokens, 0);
+        const auto other = makeRequest(22, 33, 16, 0.7f, 3);
+        const auto warm = run({{0, {other}}, {1, {b}}}).at(21);
+        ASSERT_GT(warm.cached_prompt_tokens, 0);
+        EXPECT_EQ(warm.tokens, cold.tokens);
+        EXPECT_EQ(warm.logit_digests, cold.logit_digests);
+    }
+
+    TEST_F(ContinuousBatchingCPUPrefix, ScalarConsumerRecomputesServingArchivedTerminalBlocks)
+    {
+        // Serving rows archive KV only (no terminal logits/hidden). A later
+        // capacity-one consumer of the same prompt must treat those blocks as
+        // non-terminal and recompute, producing the cold result.
+        const auto request = makeRequest(31, 128, 12, 0.0f, 1); // block-aligned: a full hit
+        const auto served = solo(request);
+        ASSERT_EQ(served.finish, ServingFinishReason::Length);
+        SamplingParams greedy = request.sampling;
+        const auto scalar = runner_->generate(request.prompt, request.max_new_tokens, greedy);
+        ASSERT_TRUE(scalar.error.empty()) << scalar.error;
+        EXPECT_EQ(scalar.tokens, served.tokens);
+        const auto prefix = runner_->requestRuntimeSummary().prefix_request;
+        EXPECT_TRUE(prefix.enabled);
+        EXPECT_GT(prefix.matched_tokens, 0) << "the scalar request reused the serving-archived blocks";
+        EXPECT_FALSE(prefix.terminal_logits_restored) << "serving archives carry no terminal logits";
+    }
 } // namespace llaminar2::test
 
 namespace llaminar2::test
