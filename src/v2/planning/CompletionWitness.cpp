@@ -34,19 +34,33 @@ bool proveCompletionOrderInto(WitnessWorkspace &workspace, std::size_t frames,
     const WitnessBaseOccupancy &base, std::span<const WitnessRequest> requests)
 {
     // Fixed workspace only: refusal in the supplied buffer, steps in fixed cells.
+    if (!workspace.valid() || requests.size() > workspace.requests().size() ||
+        requests.size() * 2 + 1 > workspace.steps().size())
+    {
+        std::snprintf(workspace.refusal(), workspace.refusalCapacity(),
+            "workspace cell capacity cannot hold the supplied request set");
+        return false;
+    }
+    for (auto &step : workspace.steps()) step = {};
     const auto decide = [&]() -> bool {
         if (!frames)
         {
-            std::snprintf(workspace.refusal(), WitnessWorkspace::refusalCapacity(),
+            std::snprintf(workspace.refusal(), workspace.refusalCapacity(),
                 "zero materialized frames");
             return false;
         }
-        std::size_t total_occupied = base.total();
+        std::size_t total_occupied = 0;
+        if (!base.checkedTotal(total_occupied))
+        {
+            std::snprintf(workspace.refusal(), workspace.refusalCapacity(),
+                "base occupancy overflows");
+            return false;
+        }
         if (requests.empty())
         {
             if (total_occupied > frames)
             {
-                std::snprintf(workspace.refusal(), WitnessWorkspace::refusalCapacity(),
+                std::snprintf(workspace.refusal(), workspace.refusalCapacity(),
                     "base occupancy exceeds the materialized pool");
                 return false;
             }
@@ -56,19 +70,19 @@ bool proveCompletionOrderInto(WitnessWorkspace &workspace, std::size_t frames,
         {
             if (!request.peak_frames || request.peak_frames > frames)
             {
-                std::snprintf(workspace.refusal(), WitnessWorkspace::refusalCapacity(),
+                std::snprintf(workspace.refusal(), workspace.refusalCapacity(),
                     "declared request cannot fit any single resident phase");
                 return false;
             }
             if (request.occupied_frames > request.peak_frames)
             {
-                std::snprintf(workspace.refusal(), WitnessWorkspace::refusalCapacity(),
+                std::snprintf(workspace.refusal(), workspace.refusalCapacity(),
                     "occupied frames exceed the declared request peak");
                 return false;
             }
             if (request.occupied_frames > std::numeric_limits<std::size_t>::max() - total_occupied)
             {
-                std::snprintf(workspace.refusal(), WitnessWorkspace::refusalCapacity(),
+                std::snprintf(workspace.refusal(), workspace.refusalCapacity(),
                     "occupied frame total overflows");
                 return false;
             }
@@ -76,7 +90,7 @@ bool proveCompletionOrderInto(WitnessWorkspace &workspace, std::size_t frames,
         }
         if (total_occupied > frames)
         {
-            std::snprintf(workspace.refusal(), WitnessWorkspace::refusalCapacity(),
+            std::snprintf(workspace.refusal(), workspace.refusalCapacity(),
                 "currently occupied frames exceed the materialized pool");
             return false;
         }
@@ -96,7 +110,7 @@ bool proveCompletionOrderInto(WitnessWorkspace &workspace, std::size_t frames,
             const bool fits = demand <= free_now || demand - free_now <= freed;
             if (!fits)
             {
-                std::snprintf(workspace.refusal(), WitnessWorkspace::refusalCapacity(),
+                std::snprintf(workspace.refusal(), workspace.refusalCapacity(),
                     "no completion order: request peak exceeds capacity available after prior completions");
                 return false;
             }
@@ -114,13 +128,28 @@ bool proveCompletionOrderInto(WitnessWorkspace &workspace, std::size_t frames,
 
 std::size_t witnessWorkspaceBytes(std::size_t records)
 {
-    // Exact fixed-cell footprint. The workspace rejects geometries beyond its
-    // fixed arrays in its constructor; the BOM prices the same canonical size
-    // so admission and allocation never disagree.
-    if (records + 1 > WitnessWorkspace::kMaxRequests ||
-        (records + 1) * 2 + 1 > WitnessWorkspace::kMaxSteps)
-        throw std::invalid_argument("Witness workspace geometry exceeds fixed cells");
-    return sizeof(WitnessWorkspace);
+    // Exact membership-sized bytes: records+1 request cells, 2*(records+1)+1
+    // step cells, fixed refusal buffer. No arbitrary cap; every intermediate
+    // multiplication/addition is checked so a huge membership refuses.
+    if (records == std::numeric_limits<std::size_t>::max())
+        throw std::overflow_error("Witness workspace membership overflows");
+    const std::size_t request_cells = records + 1;
+    if (request_cells > std::numeric_limits<std::size_t>::max() / 2 - 1 ||
+        request_cells > std::numeric_limits<std::size_t>::max() / sizeof(WitnessRequest))
+        throw std::overflow_error("Witness workspace request cells overflow");
+    const std::size_t step_cells = request_cells * 2 + 1;
+    if (step_cells > std::numeric_limits<std::size_t>::max() / sizeof(WitnessStep))
+        throw std::overflow_error("Witness workspace step cells overflow");
+    std::size_t total = 0;
+    auto add = [&](std::size_t bytes) {
+        if (bytes > std::numeric_limits<std::size_t>::max() - total)
+            throw std::overflow_error("Witness workspace byte total overflows");
+        total += bytes;
+    };
+    add(request_cells * sizeof(WitnessRequest));
+    add(step_cells * sizeof(WitnessStep));
+    add(kWitnessRefusalBytes);
+    return total;
 }
 
 CompletionWitness proveCompletionOrder(std::size_t frames, const WitnessBaseOccupancy &base,
@@ -132,7 +161,12 @@ CompletionWitness proveCompletionOrder(std::size_t frames, const WitnessBaseOccu
         witness.refusal = "zero materialized frames";
         return witness;
     }
-    std::size_t total_occupied = base.total();
+    std::size_t total_occupied = 0;
+    if (!base.checkedTotal(total_occupied))
+    {
+        witness.refusal = "base occupancy overflows";
+        return witness;
+    }
     if (requests.empty())
     {
         if (total_occupied <= frames)

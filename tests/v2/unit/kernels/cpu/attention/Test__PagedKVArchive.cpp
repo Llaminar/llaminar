@@ -288,4 +288,20 @@ TEST(PagedKVArchive, TrustDomainAndAncestryAreAuthenticated)
     // round-trip remains byte-stable and provenance must gate import.
     auto reparse = PagedKVArchive::parse(parsed.serialize());
     EXPECT_EQ(reparse.meta(), parsed.meta());
+}/** @test Rollback storage is reserved before any frame converts; success consumes exact G. */
+TEST(PagedKVArchive, RollbackStorageReservationPreventsLostFrames)
+{
+    // Fresh fixture so grant geometry is exact for two pages.
+    ArchiveFixture fx2;
+    constexpr int heads = 1, dimension = 8, tokens = 8;
+    std::vector<float> rows(static_cast<size_t>(tokens) * 2 * static_cast<size_t>(heads) * static_cast<size_t>(dimension), 0.3f);
+    auto snapshot = publishPage(fx2, rows, heads, dimension);
+    auto archive = PagedKVArchive::fromView(snapshot.view());
+    auto grant = fx2.pool->tryAdmit(2);
+    ASSERT_TRUE(grant);
+    auto pages = archive.materialize(*grant, 4);
+    ASSERT_EQ(pages.size(), 2u);
+    EXPECT_EQ(grant->remainingCommitment(), 0u);
+    // Preflight refusal for the same two-page archive with only one granted page
+    // preserves the caller's G exactly (covered jointly by MaterializeFailureIsAtomic).
 }

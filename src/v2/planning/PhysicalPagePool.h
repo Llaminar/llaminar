@@ -40,7 +40,6 @@ struct PhysicalPagePoolGeometry
 class PhysicalPagePool final : public std::enable_shared_from_this<PhysicalPagePool>
 {
 public:
-    ~PhysicalPagePool();
     /** @brief Non-reused incarnation of one privately granted frame. */
     struct FrameHandle
     {
@@ -392,8 +391,8 @@ private:
     AlignedVector<Frame> frames_;
     AlignedVector<Request> requests_;
     AlignedVector<FrameHandle> request_frames_;
-    AlignedVector<std::byte> witness_cells_; ///< BOM-priced fixed witness cells, PMA-owned.
-    planning::WitnessWorkspace *witness_workspace_ = nullptr; ///< Placed in witness_cells_.
+    AlignedVector<std::byte> witness_cells_; ///< BOM-priced membership-sized witness cells, PMA-owned.
+    planning::WitnessWorkspace witness_workspace_;              ///< Non-owning view over witness cells.
     std::size_t protected_pages_ = 0; ///< Assigned plus remaining commitments, not physical bytes.
 };
 }

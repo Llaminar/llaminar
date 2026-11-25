@@ -75,12 +75,18 @@ PhysicalPagePool::PhysicalPagePool(std::shared_ptr<PhysicalMemoryAuthority> auth
         PhysicalMemoryOwner::KVCache, device, placement).allocate(authority);
     witness_cells_ = CPUStorageRoot<std::byte>(planning::witnessWorkspaceBytes(geometry.request_records),
         PhysicalMemoryOwner::KVCache, device, placement, CPUStorageInitialization::Uninitialized).allocate(authority);
-    static_assert(alignof(planning::WitnessWorkspace) <= AlignedVector<std::byte>::ALIGNMENT);
-    witness_workspace_ = new (witness_cells_.data()) planning::WitnessWorkspace(geometry.request_records);
-}
-PhysicalPagePool::~PhysicalPagePool()
-{
-    if (witness_workspace_) witness_workspace_->~WitnessWorkspace();
+    // Bind the non-owning workspace over the exact cell layout:
+    // request cells, then step cells, then the refusal buffer.
+    const std::size_t request_cells = geometry.request_records + 1;
+    std::byte *cursor = witness_cells_.data();
+    auto *requests = reinterpret_cast<planning::WitnessRequest *>(cursor);
+    cursor += request_cells * sizeof(planning::WitnessRequest);
+    auto *steps = reinterpret_cast<planning::WitnessStep *>(cursor);
+    cursor += (request_cells * 2 + 1) * sizeof(planning::WitnessStep);
+    auto *refusal = reinterpret_cast<char *>(cursor);
+    witness_workspace_ = planning::WitnessWorkspace(
+        {requests, request_cells}, {steps, request_cells * 2 + 1},
+        {refusal, planning::kWitnessRefusalBytes});
 }
 
 std::shared_ptr<PhysicalPagePool> PhysicalMemoryAuthority::createCPUPagePool(DeviceId device,
@@ -177,7 +183,7 @@ std::optional<PhysicalPagePool::Grant> PhysicalPagePool::tryAdmitWithWitness(
     // Proof before mutation using the fixed workspace: the proposed live set
     // must have a completion order. The new request enters with its finite
     // initial grant as occupied because that grant converts to O immediately.
-    auto &workspace = *witness_workspace_;
+    auto &workspace = witness_workspace_;
     fillWitnessRequests(workspace.requests());
     std::size_t live = workspace.requests().size();
     for (std::size_t i = 0; i < workspace.requests().size(); ++i)
@@ -221,7 +227,7 @@ bool PhysicalPagePool::extendWithWitness(Grant &grant, std::size_t pages)
     // Revalidate the PROPOSED state in the fixed workspace: this request's
     // outstanding grant grows by `pages`; every other live request keeps its
     // current committed occupancy.
-    auto &workspace = *witness_workspace_;
+    auto &workspace = witness_workspace_;
     fillWitnessRequests(workspace.requests());
     std::size_t live = workspace.requests().size();
     for (std::size_t i = 0; i < workspace.requests().size(); ++i)

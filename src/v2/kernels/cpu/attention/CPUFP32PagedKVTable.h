@@ -75,11 +75,16 @@ public:
          * @param archive Authenticated FP32 attention section (provenance checked).
          * @param grant Caller request with protected growth for every page.
          * @param page_tokens Native block size for page slicing.
+         * @param trust_domain Required authenticated isolation domain; any other
+         * value refuses before a single byte is staged.
+         * @param ancestry_id Required exact ancestry proof identity; a mismatch
+         * refuses as an incompatible section, never an interpretation.
          * @note The prefix is materialized privately; no sampler/RNG/history or
          * domain-wide placement state is restored, and the attachment is fully
          * gated by the archive provenance before any byte is copied.
          */
-        void attachArchivedPrefix(const PagedKVArchive &archive, PhysicalPagePool::Grant &grant, int page_tokens);
+        void attachArchivedPrefix(const PagedKVArchive &archive, PhysicalPagePool::Grant &grant, int page_tokens,
+            std::uint64_t trust_domain = 0, std::uint64_t ancestry_id = 0);
         /** @brief Validate and publish a complete nonempty operation bank, without an unowned interval. */
         Snapshot commit();
     private:

@@ -166,10 +166,12 @@ std::vector<CPUFP32KVPage> PagedKVArchive::materialize(PhysicalPagePool::Grant &
     const std::size_t pages_needed = (total_bytes + page_bytes - 1) / page_bytes;
     if (pages_needed > grant.remainingCommitment())
         throw std::invalid_argument("Paged archive materialization grant lacks protected growth for every page");
-    // Typed rollback: if any page fails after an earlier commit, discard the
-    // newly assigned frames and restore the caller's protected G exactly once.
+    // All rollback storage is reserved BEFORE any frame is assigned, so a bad
+    // allocation cannot lose track of a newly converted frame.
     std::vector<CPUFP32KVPage> pages;
     std::vector<PhysicalPagePool::FrameHandle> handles;
+    pages.reserve(pages_needed);
+    handles.reserve(pages_needed);
     try
     {
         for (std::size_t offset = 0; offset < total_bytes;)
@@ -178,7 +180,9 @@ std::vector<CPUFP32KVPage> PagedKVArchive::materialize(PhysicalPagePool::Grant &
             const std::size_t rows = count / stride;
             if (!rows)
                 throw std::logic_error("Paged archive materialization produced an empty page");
-            auto handle = grant.assignFrame(); // G -> O exactly once for this private page.
+            // Assign AFTER capacity is reserved; the handle is recorded before
+            // any later step can throw, so rollback covers every converted frame.
+            PhysicalPagePool::FrameHandle handle = grant.assignFrame();
             handles.push_back(handle);
             auto plan = grant.prepareFreshWrite(handle, count);
             if (!plan)

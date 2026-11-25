@@ -108,14 +108,20 @@ CPUFP32PagedKVTable::Update &CPUFP32PagedKVTable::Update::operator=(Update &&oth
     return *this;
 }
 void CPUFP32PagedKVTable::Update::attachArchivedPrefix(const PagedKVArchive &archive,
-    PhysicalPagePool::Grant &grant, int page_tokens)
+    PhysicalPagePool::Grant &grant, int page_tokens, std::uint64_t trust_domain,
+    std::uint64_t ancestry_id)
 {
     if (!table_) throw std::logic_error("CPU page-table prefix attach uses an empty update");
     // Provenance gate before any mutation: FP32 attention only, exact
-    // heads/dimension must match the declared table geometry.
+    // heads/dimension must match the declared table geometry, and the
+    // authenticated trust domain / ancestry must agree with the caller.
     if (archive.empty() || archive.meta().format != KVStorageFormat::FP32 ||
         archive.meta().family != KVCacheFamily::AttentionOnly)
         throw std::invalid_argument("Archived prefix attach requires a nonempty FP32 attention section");
+    if (trust_domain != archive.meta().trust_domain)
+        throw std::invalid_argument("Archived prefix trust domain disagrees with the authenticated isolation policy");
+    if (ancestry_id != archive.meta().ancestry_id)
+        throw std::invalid_argument("Archived prefix ancestry disagrees with the required exact provenance");
     auto &state = table_->require(bank_, version_, Phase::Preparing);
     // Provenance must agree with any page geometry already staged in this
     // update; the view constructor on commit rejects mixed geometry anyway.

@@ -16,6 +16,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <limits>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -39,7 +40,14 @@ struct WitnessBaseOccupancy
 {
     std::size_t shared_frames = 0;   ///< Immutable shared frames retained by references.
     std::size_t retiring_frames = 0; ///< Pinned frames awaiting final borrower retirement.
-    std::size_t total() const noexcept { return shared_frames + retiring_frames; }
+    /** @return Total base occupancy, or false when the sum overflows. */
+    bool checkedTotal(std::size_t &out) const noexcept
+    {
+        if (shared_frames > std::numeric_limits<std::size_t>::max() - retiring_frames)
+            return false;
+        out = shared_frames + retiring_frames;
+        return true;
+    }
     bool operator==(const WitnessBaseOccupancy &) const = default;
 };
 
@@ -62,32 +70,34 @@ struct CompletionWitness
     bool valid() const noexcept { return !steps.empty(); }
 };
 
-/** @brief Fixed-size witness scratch; no heap anywhere (constructor or admission). */
+/** @brief Fixed refusal buffer size for the witness workspace (BOM-priced). */
+inline constexpr std::size_t kWitnessRefusalBytes = 256;
+
+/** @brief Non-owning witness scratch sized exactly from admitted membership. */
 class WitnessWorkspace final
 {
 public:
-    /** @brief Bound exactly from admitted request-record geometry. */
-    explicit WitnessWorkspace(std::size_t records)
-        : records_(records), request_count_(records + 1), step_count_((records + 1) * 2 + 1)
-    {
-        if (records + 1 > kMaxRequests || (records + 1) * 2 + 1 > kMaxSteps)
-            throw std::invalid_argument("Witness workspace exceeds its fixed cells");
-    }
-    std::span<WitnessRequest> requests() noexcept { return {requests_, request_count_}; }
+    /** @brief Bind caller-provided cell storage; nothing is allocated or owned. */
+    WitnessWorkspace(std::span<WitnessRequest> requests, std::span<WitnessStep> steps,
+        std::span<char> refusal)
+        : requests_(requests), steps_(steps), refusal_(refusal) {}
+    /** @brief Default-construct an empty workspace; every access is invalid. */
+    WitnessWorkspace() = default;
+    std::span<WitnessRequest> requests() noexcept { return requests_; }
     /** @return Fixed step cells (at most 2 per request + terminal). */
-    std::span<WitnessStep> steps() noexcept { return {steps_, step_count_}; }
+    std::span<WitnessStep> steps() noexcept { return steps_; }
     /** @return Typed refusal buffer, fixed size. */
-    char *refusal() noexcept { return refusal_; }
-    static constexpr std::size_t refusalCapacity() noexcept { return sizeof(refusal_); }
-    static constexpr std::size_t kMaxRequests = 257;  ///< Bounded by request-record geometry.
-    static constexpr std::size_t kMaxSteps = 517;
+    char *refusal() noexcept { return refusal_.empty() ? nullptr : refusal_.data(); }
+    std::size_t refusalCapacity() const noexcept { return refusal_.size(); }
+    bool valid() const noexcept
+    {
+        return !requests_.empty() && !steps_.empty() &&
+            steps_.size() >= requests_.size() * 2 + 1 && !refusal_.empty();
+    }
 private:
-    std::size_t records_;
-    std::size_t request_count_;
-    std::size_t step_count_;
-    WitnessRequest requests_[kMaxRequests] = {};
-    WitnessStep steps_[kMaxSteps] = {};
-    char refusal_[256] = {0};
+    std::span<WitnessRequest> requests_;
+    std::span<WitnessStep> steps_;
+    std::span<char> refusal_;
 };
 
 /**

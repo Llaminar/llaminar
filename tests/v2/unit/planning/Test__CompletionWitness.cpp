@@ -20,7 +20,11 @@ using llaminar2::planning::CompletionWitness;
 using llaminar2::planning::WitnessRequest;
 using llaminar2::planning::WitnessStep;
 using llaminar2::planning::proveCompletionOrder;
+using llaminar2::planning::proveCompletionOrderInto;
 using llaminar2::planning::phaseFits;
+using llaminar2::planning::WitnessBaseOccupancy;
+using llaminar2::planning::WitnessWorkspace;
+using llaminar2::planning::witnessWorkspaceBytes;
 
 /** @test The design's 32K/40K token-equivalent cases follow phase arithmetic exactly. */
 TEST(CompletionWitness, ResidentOnlySafeOrderDesignExamples)
@@ -330,4 +334,56 @@ TEST(CompletionWitness, PhysicalBaseOccupancyBlocksUnprovableAdmission)
     auto after = pool->tryAdmitWithWitness(2, 1);
     EXPECT_TRUE(after);
     (void)after->assignFrame();
+}
+
+/** @test Reviewer seq103 repros: overflow base, no arbitrary caps, stale cells and OOB guard. */
+TEST(CompletionWitness, WitnessStorageAndOverflowContractsHold)
+{
+    // (1) witnessWorkspaceBytes(SIZE_MAX) must refuse, not accept wrapped sizes.
+    EXPECT_THROW(planning::witnessWorkspaceBytes(std::numeric_limits<std::size_t>::max()),
+        std::overflow_error);
+    EXPECT_THROW(planning::witnessWorkspaceBytes(std::numeric_limits<std::size_t>::max() / 2),
+        std::overflow_error);
+    // Membership-sized accounting: exact cells for small membership.
+    const std::size_t small = planning::witnessWorkspaceBytes(3);
+    EXPECT_GT(small, 0u);
+
+    // (2) base occupancy {SIZE_MAX, 1} must refuse (total overflows), not wrap to 0.
+    CompletionWitness wrapped = proveCompletionOrder(1,
+        WitnessBaseOccupancy{.shared_frames=std::numeric_limits<std::size_t>::max(),
+            .retiring_frames=1}, {});
+    EXPECT_FALSE(wrapped.valid());
+    EXPECT_FALSE(wrapped.refusal.empty());
+    // Empty requests with a valid base still prove.
+    CompletionWitness empty_ok = proveCompletionOrder(1,
+        WitnessBaseOccupancy{.shared_frames=1, .retiring_frames=0}, {});
+    EXPECT_TRUE(empty_ok.valid());
+
+    // (3) after success then refusal, the workspace must not retain prior steps.
+    WitnessRequest one{.generation=1, .record=1, .peak_frames=1, .occupied_frames=1};
+    WitnessWorkspace ws({}, {}, {});
+    std::vector<WitnessRequest> cells(4);
+    std::vector<WitnessStep> steps(9);
+    std::vector<char> refusal(256);
+    ws = WitnessWorkspace({cells.data(), cells.size()}, {steps.data(), steps.size()},
+        {refusal.data(), refusal.size()});
+    // Success: one request at occupied==peak completes.
+    EXPECT_TRUE(proveCompletionOrderInto(ws, 1, {}, std::span<const WitnessRequest>(&one, 1)));
+    EXPECT_GT(ws.steps().size(), 0u);
+    // Refusal: zero frames -> no steps may remain.
+    EXPECT_FALSE(proveCompletionOrderInto(ws, 0, {}, std::span<const WitnessRequest>(&one, 1)));
+    EXPECT_TRUE(std::all_of(ws.steps().begin(), ws.steps().end(),
+        [](const WitnessStep &s) { return s.kind == WitnessStep::Kind::RetireResident &&
+            s.frames_required == 0 && s.frames_freed == 0; }));
+    EXPECT_FALSE(std::string(ws.refusal()).empty());
+
+    // (4) oversized request span against workspace capacity must refuse, never OOB.
+    std::vector<WitnessRequest> one_cell(1);
+    std::vector<WitnessStep> three_steps(3);
+    std::vector<char> small_refusal(256);
+    WitnessWorkspace tiny({one_cell.data(), one_cell.size()}, {three_steps.data(), three_steps.size()},
+        {small_refusal.data(), small_refusal.size()});
+    std::vector<WitnessRequest> many(4, one);
+    EXPECT_FALSE(proveCompletionOrderInto(tiny, 4, {}, std::span<const WitnessRequest>(many)));
+    EXPECT_FALSE(std::string(tiny.refusal()).empty());
 }
