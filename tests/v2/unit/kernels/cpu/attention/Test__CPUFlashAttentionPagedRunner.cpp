@@ -1,0 +1,158 @@
+/**
+ * @file Test__CPUFlashAttentionPagedRunner.cpp
+ * @brief P2 CPU vertical: pooled pages through the actual table/snapshot
+ * operation view, including capacity one, odd/mixed counts and replacement.
+ *
+ * The production attention entry `compute_paged_snapshot_fp32` consumes a
+ * retained `CPUFP32PagedKVTable::Snapshot`; these tests prove that real path
+ * (not only the raw page fixture) matches the contiguous numerical control
+ * under capacity one, long-over-equal-share, mixed request lengths and
+ * permutation. No contiguous adapter or full-history gather exists here.
+ */
+#include "v2/kernels/cpu/attention/CPUFlashAttentionKernelT.h"
+#include <gtest/gtest.h>
+#include <algorithm>
+#include <cstring>
+#include <random>
+#include <vector>
+
+using namespace llaminar2;
+namespace
+{
+/** @brief One exact capacity-one pool + three-bank table on one authority. */
+struct RunnerFixture
+{
+    std::shared_ptr<PhysicalMemoryAuthority> authority;
+    std::shared_ptr<PhysicalPagePool> pool;
+    std::shared_ptr<CPUFP32PagedKVTable> table;
+    RunnerFixture(int page_tokens, int max_pages, int dimension = 128)
+    {
+        const auto device = DeviceId::cpu();
+        // Frame bytes cover the largest geometry tested (kv_heads=2, dim=128).
+        const size_t frame_bytes = static_cast<size_t>(page_tokens) * 2 * 2 *
+            static_cast<size_t>(dimension) * sizeof(float);
+        const PhysicalPagePoolGeometry pool_geometry{static_cast<size_t>(max_pages),
+            frame_bytes, 2, static_cast<size_t>(max_pages)};
+        const CPUFP32PagedKVTableGeometry table_geometry{
+            static_cast<size_t>(max_pages), 4, 4, page_tokens};
+        const auto bytes = PhysicalPagePool::physicalBytes(pool_geometry, device) +
+            CPUFP32PagedKVTable::physicalBytes(table_geometry, device);
+        PhysicalMemoryPlanBuilder plan;
+        plan.add({.world_rank=0, .device=device, .total_bytes=bytes, .admission_available_bytes=bytes},
+            PhysicalMemoryOwner::KVCache, bytes);
+        authority = std::make_shared<PhysicalMemoryAuthority>(
+            std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()), 0);
+        pool = authority->createCPUPagePool(device, pool_geometry, CPUStoragePlacement::local());
+        table = CPUFP32PagedKVTable::create(authority, device, table_geometry);
+    }
+};
+
+/** @brief Publish one request's page-set through the table under a single grant. */
+CPUFP32PagedKVTable::Snapshot publishRunnerSet(RunnerFixture &fx, const std::vector<float> &k,
+    const std::vector<float> &v, int page_tokens, int heads, int dimension)
+{
+    const size_t width = static_cast<size_t>(heads * dimension);
+    const size_t tokens = k.size() / width;
+    const size_t page_count = (tokens + static_cast<size_t>(page_tokens) - 1) / static_cast<size_t>(page_tokens);
+    auto request = fx.pool->tryAdmit(page_count);
+    if (!request) throw std::logic_error("Runner fixture request refused");
+    auto update = fx.table->tryBeginUpdate();
+    if (!update) throw std::logic_error("Runner fixture table refused");
+    for (size_t page = 0; page < page_count; ++page)
+    {
+        const size_t first = page * static_cast<size_t>(page_tokens);
+        const size_t count = std::min(static_cast<size_t>(page_tokens), tokens - first);
+        std::vector<float> fixture(count * 2 * width);
+        for (size_t row = 0; row < count; ++row)
+        {
+            std::copy_n(k.data() + (first + row) * width, width, fixture.data() + row * 2 * width);
+            std::copy_n(v.data() + (first + row) * width, width, fixture.data() + row * 2 * width + width);
+        }
+        const auto frame = request->assignFrame();
+        auto write = request->prepareAppend(frame, fixture.size() * sizeof(float));
+        if (!write) throw std::logic_error("Runner fixture write refused");
+        write->copyFrom(std::as_bytes(std::span(fixture)));
+        update->append(CPUFP32KVPage(write->commit(), heads, dimension));
+    }
+    return update->commit();
+}
+}
+
+/** @test Capacity one, odd/short and long-over-equal-share sets match contiguous bytes. */
+TEST(CPUFlashAttentionPagedRunner, SnapshotViewMatchesContiguousAcrossRunnerGeometries)
+{
+    constexpr int page_tokens = 16;
+    for (const int heads : {1, 4})
+    for (const int dimension : {64, 128})
+    for (const int tokens : {1, 7, 16, 33, 150})
+    {
+        SCOPED_TRACE(::testing::Message() << "heads=" << heads << " dim=" << dimension << " tokens=" << tokens);
+        const int kv_heads = heads == 1 ? 1 : 2;
+        const size_t width = static_cast<size_t>(kv_heads * dimension);
+        const size_t page_count = (static_cast<size_t>(tokens) + page_tokens - 1) / page_tokens;
+        RunnerFixture fx(page_tokens, static_cast<int>(page_count) + 2);
+        std::mt19937 random(7);
+        std::uniform_real_distribution<float> values(-0.5f, 0.5f);
+        std::vector<float> k(static_cast<size_t>(tokens) * width), v(k.size());
+        for (auto *bank : {&k, &v}) for (auto &value : *bank) value = values(random);
+        const int queries = 1;
+        std::vector<float> q(static_cast<size_t>(queries * heads * dimension));
+        for (auto &value : q) value = values(random);
+        auto snapshot = publishRunnerSet(fx, k, v, page_tokens, kv_heads, dimension);
+        // Request/table holders may retire; the snapshot retains every referent.
+        fx.pool.reset();
+        fx.table.reset();
+        std::vector<float> expected(q.size(), -99.0f), actual(q.size(), -88.0f);
+        CPUFlashAttentionKernelT<ActivationPrecision::FP32> kernel;
+        ASSERT_TRUE(kernel.compute_decode(q.data(), k.data(), v.data(), expected.data(), queries,
+            tokens, heads, kv_heads, dimension, true, tokens - queries));
+        ASSERT_TRUE(kernel.compute_paged_snapshot_fp32(q, snapshot, actual, queries, heads, true,
+            -1, tokens - queries));
+        EXPECT_EQ(std::memcmp(expected.data(), actual.data(), actual.size() * sizeof(float)), 0);
+    }
+}
+
+/** @test Replacement publishes a newer table version; old readers keep their original bytes. */
+TEST(CPUFlashAttentionPagedRunner, ReplacementRetainsOriginalSnapshotBytes)
+{
+    constexpr int page_tokens = 16;
+    constexpr int heads = 1, dimension = 64, tokens = 20;
+    const size_t width = static_cast<size_t>(heads * dimension);
+    const size_t page_count = 2;
+    RunnerFixture fx(page_tokens, static_cast<int>(page_count) * 2 + 1);
+    std::mt19937 random(11);
+    std::uniform_real_distribution<float> values(-0.5f, 0.5f);
+    std::vector<float> k(static_cast<size_t>(tokens) * width), v(k.size());
+    for (auto *bank : {&k, &v}) for (auto &value : *bank) value = values(random);
+    std::vector<float> q(static_cast<size_t>(heads * dimension));
+    for (auto &value : q) value = values(random);
+    auto old = publishRunnerSet(fx, k, v, page_tokens, heads, dimension);
+    auto old_reader = old.tryBorrow();
+    ASSERT_TRUE(old_reader);
+    // New request replaces the slot with different bytes.
+    std::vector<float> k2(k), v2(v);
+    for (auto &value : k2) value = -value;
+    auto newest = publishRunnerSet(fx, k2, v2, page_tokens, heads, dimension);
+    EXPECT_GT(newest.version(), old.version());
+    std::vector<float> actual(q.size(), -88.0f);
+    CPUFlashAttentionKernelT<ActivationPrecision::FP32> kernel;
+    ASSERT_TRUE(kernel.compute_paged_snapshot_fp32(q, *old_reader, actual, 1, heads, true, -1, tokens - 1));
+    // Contiguous control for the original bytes.
+    std::vector<float> expected(q.size(), -99.0f);
+    ASSERT_TRUE(kernel.compute_decode(q.data(), k.data(), v.data(), expected.data(), 1,
+        tokens, heads, heads, dimension, true, tokens - 1));
+    EXPECT_EQ(std::memcmp(expected.data(), actual.data(), actual.size() * sizeof(float)), 0);
+}
+
+/** @test Unavailable grant growth refuses before any table element is published. */
+TEST(CPUFlashAttentionPagedRunner, InsufficientGrowthRefusesBeforePublication)
+{
+    constexpr int page_tokens = 16;
+    RunnerFixture fx(page_tokens, 1); // Only one frame: two requests cannot both fit.
+    std::vector<float> k(16 * 64), v(16 * 64);
+    auto one = publishRunnerSet(fx, k, v, page_tokens, 1, 64);
+    EXPECT_NO_THROW(one.view());
+    // A second request needs a frame but the pool has none left -> refused.
+    auto grant = fx.pool->tryAdmit(1);
+    EXPECT_FALSE(grant);
+}

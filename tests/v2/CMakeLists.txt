@@ -8931,6 +8931,7 @@ add_executable(v2_test_cpu_flash_attention_kernel_t
     unit/kernels/cpu/attention/Test__CPUFlashAttentionKernelT.cpp
     unit/kernels/cpu/attention/Test__CPUFlashAttentionPaged.cpp
     unit/kernels/cpu/attention/Test__CPUFlashAttentionPagedReplay.cpp
+    unit/kernels/cpu/attention/Test__CPUFlashAttentionPagedRunner.cpp
     unit/kernels/cpu/attention/Test__CPUFP32PagedKVTable.cpp
     unit/kernels/cpu/attention/Test__CPUFP32PagedKVAppend.cpp
     unit/kernels/cpu/attention/Test__PagedKVArchive.cpp)
@@ -8961,6 +8962,13 @@ add_v2_test(V2_Integration_CPUFlashAttentionPagedReplay
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
     ENVIRONMENT "OMP_NUM_THREADS=4;OMP_DYNAMIC=false;LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUFlashAttentionPagedReplay)
+add_v2_test(V2_Integration_CPUFlashAttentionPagedRunner
+    COMMAND $<TARGET_FILE:v2_test_cpu_flash_attention_kernel_t>
+        --gtest_filter=CPUFlashAttentionPagedRunner.*
+    LABELS "V2;Integration;CPU;DeviceFree;KVCache;Attention;Runner;Regression;ProductionTestPreflight"
+    NO_MODELS NO_MPI MPI_PROCS 1 TIMEOUT 60
+    ENVIRONMENT "OMP_NUM_THREADS=4;OMP_DYNAMIC=false;LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUFlashAttentionPagedRunner)
 add_v2_test(V2_Integration_CPUFP32PagedKVTableLifecycle
     COMMAND $<TARGET_FILE:v2_test_cpu_flash_attention_kernel_t>
         --gtest_filter=CPUFP32PagedKVTable.*
