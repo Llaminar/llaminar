@@ -11,6 +11,7 @@
 #include "planning/CompletionWitness.h"
 #include "planning/PhysicalPagePool.h"
 #include <gtest/gtest.h>
+#include <limits>
 #include <vector>
 
 using namespace llaminar2;
@@ -19,6 +20,7 @@ using llaminar2::planning::CompletionWitness;
 using llaminar2::planning::WitnessRequest;
 using llaminar2::planning::WitnessStep;
 using llaminar2::planning::proveCompletionOrder;
+using llaminar2::planning::phaseFits;
 
 /** @test The design's 32K/40K token-equivalent cases follow phase arithmetic exactly. */
 TEST(CompletionWitness, ResidentOnlySafeOrderDesignExamples)
@@ -85,16 +87,50 @@ TEST(CompletionWitness, TwoFrameSimultaneousPlanRefusesInFrameSubset)
     EXPECT_EQ(serial.steps.back().kind, WitnessStep::Kind::FinalRetire);
 }
 
-/** @test Preservation lets a request continue without reaching a peak in this witness. */
+/** @test Preservation lets a request continue at its current extent while another advances. */
 TEST(CompletionWitness, PreservedRequestContinuesAtCurrentExtent)
 {
+    // Preserved request holds 2 of 4 peak frames; the second request advances
+    // into the remaining 2 without the first releasing anything.
     std::vector<WitnessRequest> requests{
-        {.generation=1, .peak_frames=4, .occupied_frames=4, .preserved=true},
+        {.generation=1, .peak_frames=4, .occupied_frames=2, .preserved=true},
         {.generation=2, .peak_frames=2, .occupied_frames=0, .preserved=false},
     };
     CompletionWitness witness = proveCompletionOrder(4, requests);
     ASSERT_TRUE(witness.valid());
     EXPECT_EQ(witness.steps.front().kind, WitnessStep::Kind::Preserve);
+    // Fully occupied preserved request leaves no usable capacity: refusal is
+    // correct and must not leave a partial plan.
+    std::vector<WitnessRequest> blocked{
+        {.generation=1, .peak_frames=4, .occupied_frames=4, .preserved=true},
+        {.generation=2, .peak_frames=2, .occupied_frames=0, .preserved=false},
+    };
+    CompletionWitness refused = proveCompletionOrder(4, blocked);
+    EXPECT_FALSE(refused.valid());
+    EXPECT_TRUE(refused.steps.empty());
+}
+
+/** @test Fail-closed: refusal leaves no partial steps; checked arithmetic never overflows. */
+TEST(CompletionWitness, RefusalClearsPartialPlanAndPhaseArithmeticIsChecked)
+{
+    // Reviewer repro 1: phaseFits(SIZE_MAX, SIZE_MAX, 1) must be false.
+    EXPECT_FALSE(phaseFits(std::numeric_limits<std::size_t>::max(),
+        std::numeric_limits<std::size_t>::max(), 1));
+    EXPECT_FALSE(phaseFits(std::numeric_limits<std::size_t>::max(),
+        std::numeric_limits<std::size_t>::max(), std::numeric_limits<std::size_t>::max()));
+    EXPECT_TRUE(phaseFits(4, 1, 3));
+    EXPECT_FALSE(phaseFits(4, 1, 4));
+
+    // Reviewer repro 2: a preserved request's Preserve step must not survive a
+    // later refusal as a usable partial plan.
+    std::vector<WitnessRequest> requests{
+        {.generation=1, .peak_frames=3, .occupied_frames=3, .preserved=true},
+        {.generation=2, .peak_frames=4, .occupied_frames=1, .preserved=false},
+    };
+    CompletionWitness witness = proveCompletionOrder(4, requests);
+    EXPECT_FALSE(witness.valid());
+    EXPECT_TRUE(witness.steps.empty()); // No lingering Preserve step after refusal.
+    EXPECT_FALSE(witness.refusal.empty());
 }
 
 /** @test tryAdmitWithWitness uses finite grants plus a proved order, never summed maxima. */

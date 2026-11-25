@@ -19,8 +19,9 @@ namespace llaminar2::planning
 {
 bool phaseFits(std::size_t frames, std::size_t occupied, std::size_t needed)
 {
-    if (needed > frames) return false;
-    return occupied + needed <= frames; // Explicit sum; no subtraction underflow.
+    if (needed > frames || occupied > frames) return false;
+    // Checked subtraction form: no addition overflow, no underflow.
+    return needed <= frames - occupied;
 }
 
 CompletionWitness proveCompletionOrder(std::size_t frames, std::span<const WitnessRequest> requests)
@@ -76,9 +77,13 @@ CompletionWitness proveCompletionOrder(std::size_t frames, std::span<const Witne
             continue;
         }
         const std::size_t demand = request.peak_frames - request.occupied_frames;
-        if (demand > free_now + freed)
+        // Capacity available now plus frames released by earlier completions.
+        // Checked form: no overflow in the sum, no underflow in the difference.
+        const bool fits = demand <= free_now || demand - free_now <= freed;
+        if (!fits)
         {
             witness.refusal = "no completion order: request peak exceeds capacity available after prior completions";
+            witness.steps.clear(); // Fail closed: no usable partial plan after refusal.
             return witness;
         }
         witness.steps.push_back({WitnessStep::Kind::Advance, request.generation,
