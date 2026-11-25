@@ -119,6 +119,30 @@ bool PhysicalPagePool::tryAdmitTogether(std::span<const Demand> demands,
     return true;
 }
 
+std::vector<planning::WitnessRequest> PhysicalPagePool::liveWitnessRequests() const
+{
+    std::vector<planning::WitnessRequest> requests;
+    for (const auto &request : requests_)
+        if (request.live)
+            requests.push_back({.generation=request.generation,
+                .peak_frames=request.requested,
+                .occupied_frames=request.assigned,
+                .preserved=false});
+    return requests;
+}
+
+std::optional<PhysicalPagePool::Grant> PhysicalPagePool::tryAdmitWithWitness(std::size_t pages)
+{
+    if (!pages || pages > geometry_.max_pages_per_request)
+        throw std::invalid_argument("Witness page commitment is outside the declared per-request bound");
+    // Prove the completion order for the proposed live set before mutation.
+    auto live = liveWitnessRequests();
+    live.push_back({.generation=0, .peak_frames=pages, .occupied_frames=0, .preserved=false});
+    if (!planning::proveCompletionOrder(geometry_.frames, live).valid())
+        return std::nullopt;
+    return tryAdmit(pages);
+}
+
 std::optional<PhysicalPagePool::Grant> PhysicalPagePool::tryAdmit(std::size_t pages)
 {
     if (!pages || pages > geometry_.max_pages_per_request)
@@ -134,6 +158,7 @@ std::optional<PhysicalPagePool::Grant> PhysicalPagePool::tryAdmit(std::size_t pa
         // Acquire retained ownership before mutating the request record.
         auto self = shared_from_this();
         ++request.generation;
+        request.requested = pages;
         request.remaining = pages;
         request.assigned = 0;
         request.live = true;

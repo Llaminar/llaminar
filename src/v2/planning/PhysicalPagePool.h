@@ -10,6 +10,7 @@
  */
 #pragma once
 #include "memory/CPUStorageRoot.h"
+#include "planning/CompletionWitness.h"
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -302,6 +303,18 @@ public:
      * @throws std::invalid_argument For zero/excess authored demand.
      */
     std::optional<Grant> tryAdmit(std::size_t pages);
+    /**
+     * @brief Try to admit under a bounded completion-order witness.
+     * @param pages Declared peak pages for the new request.
+     * @return A grant only when a completion order exists for the whole
+     * resulting live set; otherwise empty and nothing was mutated.
+     * @note The witness is the page-frame resource subset; the complete
+     * all-resource/topology witness must be composed by the caller before
+     * execution admission (design §5.3).
+     */
+    std::optional<Grant> tryAdmitWithWitness(std::size_t pages);
+    /** @return Current live requests as witness inputs; no observed frame copies. */
+    std::vector<planning::WitnessRequest> liveWitnessRequests() const;
     /** @return Immutable dimensions; not an observation of device state. */
     const PhysicalPagePoolGeometry &geometry() const noexcept { return geometry_; }
 
@@ -326,7 +339,14 @@ private:
         std::size_t shared_references = 0;
     };
     /** @brief One bounded request commitment, distinct from physical frame capacity. */
-    struct Request { std::uint64_t generation = 0; std::size_t remaining = 0; std::size_t assigned = 0; bool live = false; };
+    struct Request
+    {
+        std::uint64_t generation = 0;
+        std::size_t requested = 0; ///< Declared peak pages admitted with this grant.
+        std::size_t remaining = 0;
+        std::size_t assigned = 0;
+        bool live = false;
+    };
     PhysicalPagePool(std::shared_ptr<PhysicalMemoryAuthority> authority, DeviceId device,
         PhysicalPagePoolGeometry geometry, CPUStoragePlacement placement, std::uint64_t pool_identity);
     /** @brief Canonical assignability predicate shared by every frame-acquisition path. */

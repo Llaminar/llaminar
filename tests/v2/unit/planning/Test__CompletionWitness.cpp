@@ -9,8 +9,11 @@
  * sharing/transients; the real witness uses the complete resource vector.
  */
 #include "planning/CompletionWitness.h"
+#include "planning/PhysicalPagePool.h"
 #include <gtest/gtest.h>
 #include <vector>
+
+using namespace llaminar2;
 
 using llaminar2::planning::CompletionWitness;
 using llaminar2::planning::WitnessRequest;
@@ -92,6 +95,52 @@ TEST(CompletionWitness, PreservedRequestContinuesAtCurrentExtent)
     CompletionWitness witness = proveCompletionOrder(4, requests);
     ASSERT_TRUE(witness.valid());
     EXPECT_EQ(witness.steps.front().kind, WitnessStep::Kind::Preserve);
+}
+
+/** @test tryAdmitWithWitness refuses the design's impossible exact-fit case before mutation. */
+TEST(CompletionWitness, PoolAdmissionRefusesBeforeMutationWhenSummedMaximaExceed)
+{
+    const auto device = DeviceId::cpu();
+    const PhysicalPagePoolGeometry geometry32{32, 64, 4, 32};
+    const auto bytes32 = PhysicalPagePool::physicalBytes(geometry32, device);
+    PhysicalMemoryPlanBuilder plan32;
+    plan32.add({.world_rank=0, .device=device, .total_bytes=bytes32, .admission_available_bytes=bytes32},
+        PhysicalMemoryOwner::KVCache, bytes32);
+    auto authority32 = std::make_shared<PhysicalMemoryAuthority>(
+        std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan32.build()), 0);
+    auto pool32 = authority32->createCPUPagePool(device, geometry32, CPUStoragePlacement::local());
+    auto first = pool32->tryAdmitWithWitness(32);
+    ASSERT_TRUE(first);
+    (void)first->assignFrame();
+    EXPECT_FALSE(pool32->tryAdmitWithWitness(32));
+    EXPECT_EQ(first->assignedFrames().size(), 1u);
+    // Non-witness admission also refuses at the same summed-maximum bound.
+    EXPECT_FALSE(pool32->tryAdmit(32));
+}
+
+/** @test O-based witness accounting for the design's 40K case is the open next step. */
+TEST(CompletionWitness, FortyFrameOrderAccountingRemainsOpenRequirement)
+{
+    // Design §5.3: 40K pool, two requests holding 4K each, one needs 28K -> an
+    // order exists. Current tryAdmitWithWitness protects summed declared maxima
+    // (32+32 > 40) and therefore still refuses. This documents the honest gap:
+    // witness-based optimistic admission must not sum independent maxima; the
+    // pool's O/G/T accounting must integrate the witness first.
+    const auto device = DeviceId::cpu();
+    const PhysicalPagePoolGeometry geometry40{40, 64, 4, 32};
+    const auto bytes40 = PhysicalPagePool::physicalBytes(geometry40, device);
+    PhysicalMemoryPlanBuilder plan40;
+    plan40.add({.world_rank=0, .device=device, .total_bytes=bytes40, .admission_available_bytes=bytes40},
+        PhysicalMemoryOwner::KVCache, bytes40);
+    auto authority40 = std::make_shared<PhysicalMemoryAuthority>(
+        std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan40.build()), 0);
+    auto pool40 = authority40->createCPUPagePool(device, geometry40, CPUStoragePlacement::local());
+    auto a = pool40->tryAdmitWithWitness(32);
+    ASSERT_TRUE(a);
+    for (int i = 0; i < 4; ++i) (void)a->assignFrame();
+    // Currently refused under summed-maximum accounting; this assertion documents
+    // the open requirement rather than pretending the order path is done.
+    EXPECT_FALSE(pool40->tryAdmitWithWitness(32));
 }
 
 /** @test Impossible geometry and inconsistent requests are typed refusals, never guessed orders. */
