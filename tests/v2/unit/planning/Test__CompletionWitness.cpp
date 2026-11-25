@@ -287,3 +287,47 @@ TEST(CompletionWitness, InvalidInputsRefuseWithoutInventingSteps)
         EXPECT_FALSE(proveCompletionOrder(1, requests).valid());
     }
 }
+
+/** @test Reviewer seq102: base occupancy (shared/retiring frames) blocks admission proof. */
+TEST(CompletionWitness, PhysicalBaseOccupancyBlocksUnprovableAdmission)
+{
+    const auto device = DeviceId::cpu();
+    const PhysicalPagePoolGeometry geometry{4, 64, 4, 4};
+    const auto bytes = PhysicalPagePool::physicalBytes(geometry, device);
+    PhysicalMemoryPlanBuilder plan;
+    plan.add({.world_rank=0, .device=device, .total_bytes=bytes, .admission_available_bytes=bytes},
+        PhysicalMemoryOwner::KVCache, bytes);
+    auto authority = std::make_shared<PhysicalMemoryAuthority>(
+        std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()), 0);
+    auto pool = authority->createCPUPagePool(device, geometry, CPUStoragePlacement::local());
+    // Three immutable shared frames retained outside any live request: they are
+    // canonical physical occupancy and must count in the completion proof.
+    std::vector<PhysicalPagePool::SharedPage> shared;
+    for (int i = 0; i < 3; ++i)
+    {
+        auto owner = pool->tryAdmit(1);
+        ASSERT_TRUE(owner);
+        std::vector<std::byte> payload(8, static_cast<std::byte>(i + 1));
+        const auto frame = owner->assignFrame();
+        auto write = owner->prepareFreshWrite(frame, payload.size());
+        ASSERT_TRUE(write);
+        write->copyFrom(payload);
+        shared.emplace_back(write->commit().share());
+        owner.reset(); // Share is retained; the request record retires.
+    }
+    auto base = pool->physicalBaseOccupancy();
+    EXPECT_EQ(base.shared_frames, 3u);
+    // A new peak-4 request with one granted frame cannot be witness-admitted:
+    // the proof must see 3 shared base + 1 new + peak 4 requiring 4 free.
+    auto candidate = pool->tryAdmitWithWitness(4, 1);
+    EXPECT_FALSE(candidate);
+    // Peak-2 also refuses: base 3 + grant 1 = 4 occupied, so the request can
+    // never obtain its second frame without unrelated owners releasing.
+    auto small = pool->tryAdmitWithWitness(2, 1);
+    EXPECT_FALSE(small);
+    // Releasing the base occupancy re-opens exactly one admission.
+    shared.clear();
+    auto after = pool->tryAdmitWithWitness(2, 1);
+    EXPECT_TRUE(after);
+    (void)after->assignFrame();
+}

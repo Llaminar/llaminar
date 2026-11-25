@@ -26,18 +26,27 @@ bool phaseFits(std::size_t frames, std::size_t occupied, std::size_t needed)
 
 CompletionWitness proveCompletionOrder(std::size_t frames, std::span<const WitnessRequest> requests)
 {
+    return proveCompletionOrder(frames, {}, requests);
+}
+
+CompletionWitness proveCompletionOrder(std::size_t frames, const WitnessBaseOccupancy &base,
+    std::span<const WitnessRequest> requests)
+{
     CompletionWitness witness;
     if (!frames)
     {
         witness.refusal = "zero materialized frames";
         return witness;
     }
+    std::size_t total_occupied = base.total();
     if (requests.empty())
     {
-        witness.steps.push_back({WitnessStep::Kind::FinalRetire, 0, 0, 0});
+        if (total_occupied <= frames)
+            witness.steps.push_back({WitnessStep::Kind::FinalRetire, 0, 0, 0});
+        else
+            witness.refusal = "base occupancy exceeds the materialized pool";
         return witness;
     }
-    std::size_t total_occupied = 0;
     for (const auto &request : requests)
     {
         if (!request.peak_frames || request.peak_frames > frames)
@@ -62,7 +71,7 @@ CompletionWitness proveCompletionOrder(std::size_t frames, std::span<const Witne
         witness.refusal = "currently occupied frames exceed the materialized pool";
         return witness;
     }
-    std::size_t free_now = frames - total_occupied; // Frames not occupied by any live request.
+    std::size_t free_now = frames - total_occupied; // Frames not occupied by base or live requests.
     std::size_t freed = 0;                           // Frames released by completed requests.
     for (std::size_t index = 0; index < requests.size(); ++index)
     {
@@ -96,4 +105,5 @@ CompletionWitness proveCompletionOrder(std::size_t frames, std::span<const Witne
     }
     return witness;
 }
+
 } // namespace llaminar2::planning

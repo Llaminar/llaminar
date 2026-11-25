@@ -122,3 +122,51 @@ TEST(CPUFP32PagedKVTable, PublishedBanksRetainOriginalNativeOperands)
     EXPECT_EQ(authority->claimedBytes(device, PhysicalMemoryOwner::KVCache,
         PhysicalMemoryMaterializationKind::NewAllocation), 0u);
 }
+
+/** @test Nonce/version issuance stops before exhaustion; aborted versions burn, never recycle. */
+TEST(CPUFP32PagedKVTable, VersionIssuanceStopsAndBurnedVersionsNeverRecycle)
+{
+    constexpr int dimension = 64;
+    const auto device = DeviceId::cpu();
+    const PhysicalPagePoolGeometry pool_geometry{2, 2 * 2 * dimension * sizeof(float), 3, 1};
+    const CPUFP32PagedKVTableGeometry table_geometry{1, 2, 2, 2};
+    const auto bytes = PhysicalPagePool::physicalBytes(pool_geometry, device) +
+        CPUFP32PagedKVTable::physicalBytes(table_geometry, device);
+    PhysicalMemoryPlanBuilder plan;
+    plan.add({.world_rank=0, .device=device, .total_bytes=bytes, .admission_available_bytes=bytes},
+        PhysicalMemoryOwner::KVCache, bytes);
+    auto authority = std::make_shared<PhysicalMemoryAuthority>(
+        std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()), 0);
+    auto pool = authority->createCPUPagePool(device, pool_geometry, CPUStoragePlacement::local());
+    auto table = CPUFP32PagedKVTable::create(authority, device, table_geometry);
+    const auto page = [&](float value) {
+        auto grant = pool->tryAdmit(1);
+        if (!grant) throw std::logic_error("Fixture page grant refused");
+        const auto frame = grant->assignFrame();
+        std::vector<float> input(2 * 2 * dimension, 0.0f);
+        std::fill_n(input.data() + dimension, dimension, value);
+        auto write = grant->prepareAppend(frame, input.size() * sizeof(float));
+        if (!write) throw std::logic_error("Fixture page write refused");
+        write->copyFrom(std::as_bytes(std::span(input)));
+        return CPUFP32KVPage(write->commit(), 1, dimension);
+    };
+    // Bank 0: publish (keep the snapshot borrower alive). Bank 1: begin and
+    // HOLD it open, so both banks are occupied: admission stops before mutation.
+    auto first_update = table->tryBeginUpdate();
+    ASSERT_TRUE(first_update);
+    first_update->append(page(1.0f));
+    auto snapshot = first_update->commit();
+    EXPECT_GT(snapshot.version(), 0u);
+    auto held = table->tryBeginUpdate();
+    ASSERT_TRUE(held);
+    EXPECT_FALSE(table->tryBeginUpdate()); // Admission stops at bank exhaustion.
+    held.reset();                          // Abort burns the issued version.
+    // Draining the held bank re-opens exactly one admission; the burned
+    // version is never recycled (next issuance is strictly greater).
+    auto fresh = table->tryBeginUpdate();
+    ASSERT_TRUE(fresh);
+    fresh->append(page(2.0f));
+    auto newest = fresh->commit();
+    EXPECT_GT(newest.version(), 1u); // Burned version 2 is not reused.
+    EXPECT_EQ(newest.version(), 3u); // 1 published, 2 burned, 3 issued now.
+}

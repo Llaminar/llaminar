@@ -323,6 +323,8 @@ public:
     bool extendWithWitness(Grant &grant, std::size_t pages);
     /** @return Current live requests as witness inputs; no observed frame copies. */
     std::vector<planning::WitnessRequest> liveWitnessRequests() const;
+    /** @return Canonical physical occupancy outside live request records, each frame once. */
+    planning::WitnessBaseOccupancy physicalBaseOccupancy() const;
     /** @return Immutable dimensions; not an observation of device state. */
     const PhysicalPagePoolGeometry &geometry() const noexcept { return geometry_; }
     /** @return Original PMA instance identity for same-authority admission checks. */

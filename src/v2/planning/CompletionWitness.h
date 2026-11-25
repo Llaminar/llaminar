@@ -33,6 +33,15 @@ struct WitnessRequest
     bool operator==(const WitnessRequest &) const = default;
 };
 
+/** @brief Physical occupancy outside any live request record, counted once each. */
+struct WitnessBaseOccupancy
+{
+    std::size_t shared_frames = 0;   ///< Immutable shared frames retained by references.
+    std::size_t retiring_frames = 0; ///< Pinned frames awaiting final borrower retirement.
+    std::size_t total() const noexcept { return shared_frames + retiring_frames; }
+    bool operator==(const WitnessBaseOccupancy &) const = default;
+};
+
 /** @brief One enforceable ordered phase in the completion proof. */
 struct WitnessStep
 {
@@ -64,6 +73,15 @@ struct CompletionWitness
  * at its current extent while another advances, but never creates frames.
  */
 CompletionWitness proveCompletionOrder(std::size_t frames,
+    std::span<const WitnessRequest> requests);
+/**
+ * @brief Decide a completion order with canonical physical occupancy included.
+ * @param frames Total materialized frames P.
+ * @param base Occupancy outside live request records (shared, retiring, cache), counted once each.
+ * @param requests Declared peak/occupied frame demand, one per live request.
+ * @return A bounded witness (or a typed refusal with no invented order).
+ */
+CompletionWitness proveCompletionOrder(std::size_t frames, const WitnessBaseOccupancy &base,
     std::span<const WitnessRequest> requests);
 
 /** @brief Exact per-phase arithmetic check used by the proof and its tests. */

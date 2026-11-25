@@ -154,22 +154,45 @@ std::vector<CPUFP32KVPage> PagedKVArchive::materialize(PhysicalPagePool::Grant &
     const std::size_t total_bytes = meta_.rows * stride;
     if (payload_.size() != total_bytes)
         throw std::logic_error("Paged archive payload does not match its provenance");
+    // Complete geometry/grant preflight BEFORE any mutation: every page count
+    // and final-page extent must fit the caller's protected growth.
+    const std::size_t pages_needed = (total_bytes + page_bytes - 1) / page_bytes;
+    if (pages_needed > grant.remainingCommitment())
+        throw std::invalid_argument("Paged archive materialization grant lacks protected growth for every page");
+    // Typed rollback: if any page fails after an earlier commit, discard the
+    // newly assigned frames and restore the caller's protected G exactly once.
     std::vector<CPUFP32KVPage> pages;
-    for (std::size_t offset = 0; offset < total_bytes;)
+    std::vector<PhysicalPagePool::FrameHandle> handles;
+    try
     {
-        const std::size_t count = std::min(page_bytes, total_bytes - offset);
-        const std::size_t rows = count / stride;
-        if (!rows)
-            throw std::logic_error("Paged archive materialization produced an empty page");
-        auto handle = grant.assignFrame(); // G -> O exactly once for this private page.
-        auto plan = grant.prepareFreshWrite(handle, count);
-        if (!plan)
-            throw std::logic_error("Paged archive materialization destination is not writable");
-        plan->copyFrom({payload_.data() + offset, count});
-        pages.emplace_back(plan->commit(), meta_.heads, meta_.dimension);
-        offset += count;
+        for (std::size_t offset = 0; offset < total_bytes;)
+        {
+            const std::size_t count = std::min(page_bytes, total_bytes - offset);
+            const std::size_t rows = count / stride;
+            if (!rows)
+                throw std::logic_error("Paged archive materialization produced an empty page");
+            auto handle = grant.assignFrame(); // G -> O exactly once for this private page.
+            handles.push_back(handle);
+            auto plan = grant.prepareFreshWrite(handle, count);
+            if (!plan)
+                throw std::logic_error("Paged archive materialization destination is not writable");
+            plan->copyFrom({payload_.data() + offset, count});
+            pages.emplace_back(plan->commit(), meta_.heads, meta_.dimension);
+            offset += count;
+        }
+        // Success: publish the complete page set; frames belong to the caller now.
+        handles.clear();
+        return pages;
     }
-    return pages;
+    catch (...)
+    {
+        // Release publications first (they pin frames), then retire each frame
+        // back to the original protected grant. No early reuse is possible.
+        pages.clear();
+        for (auto it = handles.rbegin(); it != handles.rend(); ++it)
+            grant.discardFrame(*it);
+        throw;
+    }
 }
 
 std::vector<std::byte> PagedKVArchive::serialize() const

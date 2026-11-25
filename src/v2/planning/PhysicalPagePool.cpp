@@ -137,6 +137,21 @@ std::vector<planning::WitnessRequest> PhysicalPagePool::liveWitnessRequests() co
     return requests;
 }
 
+planning::WitnessBaseOccupancy PhysicalPagePool::physicalBaseOccupancy() const
+{
+    // Canonical physical count, one frame exactly once: every frame that is
+    // occupied outside a live request record is either shared (immutable,
+    // retained by its reference group) or retiring (pinned, awaiting the last
+    // borrower). Aliases are logical, never a second frame.
+    std::size_t shared = 0, retiring = 0;
+    for (const auto &frame : frames_)
+    {
+        if (frame.shared) { ++shared; continue; }
+        if (frame.retiring && (frame.pins || frame.readers_closed)) ++retiring;
+    }
+    return {.shared_frames=shared, .retiring_frames=retiring};
+}
+
 std::optional<PhysicalPagePool::Grant> PhysicalPagePool::tryAdmitWithWitness(
     std::size_t declared_peak, std::size_t initial_grant)
 {
@@ -149,7 +164,7 @@ std::optional<PhysicalPagePool::Grant> PhysicalPagePool::tryAdmitWithWitness(
     // because that grant converts to O immediately after admission.
     auto live = liveWitnessRequests();
     live.push_back({.generation=0, .peak_frames=declared_peak, .occupied_frames=initial_grant, .preserved=false});
-    if (!planning::proveCompletionOrder(geometry_.frames, live).valid())
+    if (!planning::proveCompletionOrder(geometry_.frames, physicalBaseOccupancy(), live).valid())
         return std::nullopt;
     // Conservation under the INFINITE-GRANT model is the finite-operation
     // sum; the witness bounds the peak promise, never the converted grant.
@@ -188,7 +203,7 @@ bool PhysicalPagePool::extendWithWitness(Grant &grant, std::size_t pages)
     for (auto &entry : live)
         if (entry.record == grant.record_)
             entry.occupied_frames += pages;
-    if (!planning::proveCompletionOrder(geometry_.frames, live).valid())
+    if (!planning::proveCompletionOrder(geometry_.frames, physicalBaseOccupancy(), live).valid())
         return false;
     request.remaining += pages;
     protected_pages_ += pages;

@@ -188,3 +188,28 @@ TEST(PagedKVArchive, ArchiveOfTruncatedPrefixIsByteExact)
     EXPECT_EQ(parsed.meta().rows, 3u);
     EXPECT_EQ(std::memcmp(parsed.payload().data(), rows.data(), parsed.payload().size()), 0);
 }
+
+/** @test Failure-atomic materialize: insufficient grant and geometry reject before mutation. */
+TEST(PagedKVArchive, MaterializeFailureIsAtomicAndPreservesOriginalGrant)
+{
+    ArchiveFixture fx;
+    constexpr int heads = 1, dimension = 8, tokens = 8;
+    std::vector<float> rows(static_cast<size_t>(tokens) * 2 * static_cast<size_t>(heads) * static_cast<size_t>(dimension), 0.25f);
+    auto snapshot = publishPage(fx, rows, heads, dimension);
+    auto archive = PagedKVArchive::fromView(snapshot.view());
+    // One protected page cannot hold an 8-token two-page section: reject before mutation.
+    auto short_grant = fx.pool->tryAdmit(1);
+    ASSERT_TRUE(short_grant);
+    EXPECT_THROW(archive.materialize(*short_grant, 4), std::invalid_argument);
+    EXPECT_EQ(short_grant->remainingCommitment(), 1u); // G preserved exactly.
+    short_grant.reset();                                // Release the reserved growth.
+    // Geometry mismatch: a 5-token page geometry cannot divide the 8-row payload.
+    auto ok_grant = fx.pool->tryAdmit(2);
+    ASSERT_TRUE(ok_grant);
+    EXPECT_THROW(archive.materialize(*ok_grant, 3), std::invalid_argument);
+    EXPECT_EQ(ok_grant->remainingCommitment(), 2u); // Nothing assigned.
+    // Successful two-page materialization consumes both and publishes exact rows.
+    auto pages = archive.materialize(*ok_grant, 4);
+    ASSERT_EQ(pages.size(), 2u);
+    EXPECT_EQ(ok_grant->remainingCommitment(), 0u);
+}
