@@ -8927,7 +8927,11 @@ add_v2_test(V2_Unit_Q16VNNISafeNormalization
 )
 
 # Test: CPUFlashAttentionKernelT (exact FP32/Q16 attention, causal, GQA, window)
-add_executable(v2_test_cpu_flash_attention_kernel_t unit/kernels/cpu/attention/Test__CPUFlashAttentionKernelT.cpp)
+add_executable(v2_test_cpu_flash_attention_kernel_t
+    unit/kernels/cpu/attention/Test__CPUFlashAttentionKernelT.cpp
+    unit/kernels/cpu/attention/Test__CPUFlashAttentionPaged.cpp
+    unit/kernels/cpu/attention/Test__CPUFlashAttentionPagedReplay.cpp)
+target_include_directories(v2_test_cpu_flash_attention_kernel_t PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 target_link_libraries(v2_test_cpu_flash_attention_kernel_t
     llaminar2_core
     GTest::gtest
@@ -8939,6 +8943,21 @@ add_v2_test(V2_Unit_CPUFlashAttentionKernelT
     MPI_PROCS 1
 )
 
+# Direct paged FP32 optimized arithmetic witness, not serving/native append qualification.
+add_v2_test(V2_Integration_CPUFlashAttentionPagedFP32
+    COMMAND $<TARGET_FILE:v2_test_cpu_flash_attention_kernel_t>
+        --gtest_filter=CPUFlashAttentionPaged.PermutedPagesMatchContiguousBytes
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;KVCache;Attention;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60
+    ENVIRONMENT "OMP_NUM_THREADS=4;OMP_DYNAMIC=false;LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUFlashAttentionPagedFP32)
+add_v2_test(V2_Integration_CPUFlashAttentionPagedReplay
+    COMMAND $<TARGET_FILE:v2_test_cpu_flash_attention_kernel_t>
+        --gtest_filter=CPUFlashAttentionPaged.RecordedFP32InputsReplayExactly:CPUFlashAttentionPaged.IncompleteRecordedInputsAreRejected
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;KVCache;Attention;Replay;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "OMP_NUM_THREADS=4;OMP_DYNAMIC=false;LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUFlashAttentionPagedReplay)
 # Flash-attention entry points admit banks, head mapping and output
 # disjointness before any team, returning false without writes otherwise:
 # raw batches, native request batches and Q16 tensor/verifier entries admit
@@ -30358,10 +30377,12 @@ set(PMA_TRACE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/paged_kv")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     "${PMA_TRACE_ROOT}/private_ownership_v1.txt"
     "${PMA_TRACE_ROOT}/private_append_v1.txt"
-    "${PMA_TRACE_ROOT}/private_readers_v1.txt")
+    "${PMA_TRACE_ROOT}/private_readers_v1.txt"
+    "${PMA_TRACE_ROOT}/attention_fp32_v1.txt")
 file(READ "${PMA_TRACE_ROOT}/private_ownership_v1.txt" PMA_OWNERSHIP_TRACE)
 file(READ "${PMA_TRACE_ROOT}/private_append_v1.txt" PMA_APPEND_TRACE)
 file(READ "${PMA_TRACE_ROOT}/private_readers_v1.txt" PMA_READER_TRACE)
+file(READ "${PMA_TRACE_ROOT}/attention_fp32_v1.txt" PMA_ATTENTION_TRACE)
 configure_file("${PMA_TRACE_ROOT}/PhysicalPagePoolTraceData.h.in"
     "${CMAKE_CURRENT_BINARY_DIR}/PhysicalPagePoolTraceData.h" @ONLY)
 target_include_directories(v2_test_physical_memory_authority PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
@@ -30379,7 +30400,14 @@ add_v2_test(V2_Integration_PreparedNativeLookupAggregateCPU
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
     ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PreparedNativeLookupAggregateCPU)
-# Initial unpublished page grants: no native KV view or serving cutover yet.
+# Native operand geometry over retained publications; no attention kernel or serving cutover yet.
+add_v2_test(V2_Integration_CPUFP32PagedKVViewContract
+    COMMAND $<TARGET_FILE:v2_test_physical_memory_authority>
+        --gtest_filter=PhysicalMemoryAuthority.PagePoolFP32OperandsUseLogicalPagesNotPhysicalStride
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;KVCache;Geometry;Ownership;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUFP32PagedKVViewContract)
+# Initial private page grants: no native kernel or serving cutover yet.
 add_v2_test(V2_Integration_PMAPagePoolUnpublishedContract
     COMMAND $<TARGET_FILE:v2_test_physical_memory_authority>
         --gtest_filter=PhysicalMemoryAuthority.PagePoolUnpublishedCommitmentLifecycle:PhysicalMemoryAuthority.PagePoolPrivatePinsDeferRealRetirement:PhysicalMemoryAuthority.PagePoolMultiClassAdmissionIsAtomic:PhysicalMemoryAuthority.PagePoolGeometryAndConstructionRollback:PhysicalMemoryAuthority.PagePoolExclusiveAppendPublicationLifecycle:PhysicalMemoryAuthority.PagePoolRegisteredReadersCloseBeforeRetirement

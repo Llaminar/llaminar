@@ -198,6 +198,64 @@ and existing planning tests, not native append/attention or a final page layout
 ABI. QFN auxiliary paging, provenance/trust, numerical boundary compatibility,
 quantized COW and all-target native evidence remain open.
 
+## First direct FP32 operand witness (in progress)
+
+`kernels/cpu/attention/CPUFP32PagedKVView.h` now provides a private CPU operand
+view over actual retained `CommittedPage` owners. Each token stores native local
+K then V; logical page order is independent of frame order. The final page may
+have a partial live extent; padding/invalid head/token coordinates are rejected.
+Moved-from page wrappers revoke their raw pointer/extent. No full-history gather
+or payload allocation occurs in the view.
+
+A production-type contract fixture assigns frames in physical order, publishes
+logical pages in order 2/0/1, then reads five native FP32 tokens across a partial
+tail after original request/pool handles retire. It checks actual source address
+identity, bytes, padding refusal, moved-from access and malformed partial-page
+ordering. Complete PMA Unit (148 tests) and the explicit
+`V2_Integration_CPUFP32PagedKVViewContract` pass at
+`CB-checkpoints/paged-fp32-operands.OLqOKN`.
+
+This is **operand geometry/ownership**, not attention execution, a stable
+versioned table bank, producer-ordered query visibility, native append, or P2
+acceptance. The borrowed table must remain immutable through the operation;
+that ownership still needs the bounded table/version authority before serving.
+The existing optimized `CPUFlashAttentionKernelT::compute_flash_fp32` now has
+an explicit paged entry point and native key/value row accessors. Both canonical
+summary and single-summary branches retain their original dot, softmax, value
+accumulation and reduction arithmetic. Admission validates each real interleaved
+page bank and actual query/output extents before a worker team; it never asserts
+that all history occupies one contiguous bank. No scalar replacement or full
+history gather was introduced.
+
+Native tests compare actual paged output bytes with the contiguous production
+control over page-edge lengths, partial tails, GQA, grouped queries and lengths
+257/513 crossing summary boundaries. All 56 CPU attention Unit tests and the
+explicit `V2_Integration_CPUFlashAttentionPagedFP32` witness pass at
+`CB-checkpoints/paged-fp32-attention.BpcBIc` (local Integration/aarch64). Malformed
+query extents and query/output aliasing refuse before writes. Tests populate
+native pages as fixtures; they do not implement production paged append.
+
+Recorded-input native kernel replay now retains actual Q/K/V input bits,
+initial pool/frame order and observed output bits in `attention_fp32_v1.txt`.
+Capture first verified byte equality with the contiguous kernel; normal replay
+does not regenerate expected output. Complete CPU attention Unit (58 tests),
+byte-equality sweep and explicit replay preflight pass at
+`CB-checkpoints/paged-fp32-kernel-replay.jcOmZH`; native capture is retained at
+`paged-fp32-kernel-recording.tOAwPi`. The fixed replay panel is not a cross-ISA
+or all-format certificate.
+
+CPU profiling was attempted separately from correctness: `perf stat` could not
+start (exit 127, profiler executable absent in `cb-run`). The shared VM is not a
+dedicated economy host. Profiling/economy are unqualified, not waived. Work
+is a private implementation checkpoint; ISA/thread qualification, native append,
+stable table/version ownership, quantized paged operands and serving integration
+remain open. The address source is now compile-time specialized so existing
+contiguous calls do not acquire a runtime page-dispatch branch in their inner
+loops. Final local evidence `paged-fp32-kernel-final.HQGWHb` passes CPU attention
+Unit58, PMA Unit148, operand geometry, native paged byte comparison and recorded
+kernel replay (five registrations). No throughput or latency win is asserted. These results do
+not qualify P1/P2 exits or the default inference path.
+
 ## Independent findings carried into P0/P1
 
 | Finding | Required resolution |

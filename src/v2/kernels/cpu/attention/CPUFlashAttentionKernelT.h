@@ -40,6 +40,7 @@
  */
 
 #pragma once
+#include "CPUFP32PagedKVView.h"
 
 #include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "../../../execution/config/RuntimeConfig.h"
@@ -1772,6 +1773,52 @@ namespace llaminar2
                 .withScalar("n_kv_heads", "number of key/value heads", KernelBufferDtype::INT32)
                 .withScalar("head_dim", "dimension per head", KernelBufferDtype::INT32)
                 .withScalar("causal", "apply causal masking", KernelBufferDtype::INT32);
+        }
+
+        /**
+         * @brief Execute optimized FP32 attention directly over retained native pages.
+         * @param query Exact FP32 query bank, including its actual extent.
+         * @param pages Immutable logical page order, retained through this synchronous CPU operation.
+         * @param output Exact disjoint output bank.
+         * @param query_rows Live query rows.
+         * @param query_heads Local query heads.
+         * @param causal Apply the existing causal arithmetic/mask policy.
+         * @param window_size Existing sliding window, or zero.
+         * @param position_offset Absolute first query position.
+         * @param head_start Original TP global query-head offset.
+         * @param gqa_n_rep Original global query/KV ratio, or zero to derive it.
+         * @param policy Original arithmetic/parallel policy; paging changes only addresses.
+         * @return False before any output write on malformed or overlapping banks.
+         */
+        bool compute_paged_fp32(std::span<const float> query, const CPUFP32PagedKVView &pages,
+            std::span<float> output, int query_rows, int query_heads, bool causal,
+            int window_size = 0, int position_offset = 0, int head_start = 0, int gqa_n_rep = 0,
+            const attention::AttentionExecutionPolicy &policy = {})
+        {
+            if constexpr (Precision != ActivationPrecision::FP32) return false;
+            for (const auto &page : pages.pages())
+            {
+                const auto bank = page.storage();
+                // K and V share this exact interleaved native bank. Its row
+                // stride includes both, so coverage/alias checks never invent
+                // a full-history contiguous allocation or a padded value row.
+                cpu::CPUAttentionInvocationRequest request;
+                request.query = {query.data(), query.size_bytes()};
+                request.output = {output.data(), output.size_bytes()};
+                request.key = request.value = {bank.data(), bank.size()};
+                request.query_rows = query_rows;
+                request.kv_physical_rows = page.rows();
+                request.query_heads = query_heads;
+                request.kv_heads = pages.heads();
+                request.head_dim = pages.dimension();
+                request.head_start = head_start;
+                request.gqa_n_rep = gqa_n_rep;
+                request.key_row_bytes = request.value_row_bytes = page.tokenStrideBytes();
+                if (!admitInvocation(request)) return false;
+            }
+            return compute_flash_fp32<true>(query.data(), nullptr, nullptr, output.data(), query_rows, pages.rows(),
+                query_heads, pages.heads(), pages.dimension(), causal, window_size, position_offset,
+                nullptr, head_start, gqa_n_rep, policy, {}, &pages);
         }
 
         // Allow parity tests to call private static helpers directly
@@ -5004,9 +5051,10 @@ namespace llaminar2
          * `OMP_WORKSHARE_REGION`.  Each head is fully independent, so this
          * achieves near-linear scaling across CPU cores.
          *
+         * @tparam Paged Compile-time native row-address source; contiguous calls retain no runtime page-dispatch branch.
          * @param Q               Query data, row-major [seq_len, n_heads * head_dim].
-         * @param K               Key data,   row-major [kv_len, n_kv_heads * head_dim].
-         * @param V               Value data, row-major [kv_len, n_kv_heads * head_dim].
+         * @param K               Contiguous key rows; null only in the separately admitted paged specialization.
+         * @param V               Contiguous value rows; null only in the separately admitted paged specialization.
          * @param output          Output buffer,       [seq_len, n_heads * head_dim].
          * @param seq_len         Number of query positions.
          * @param kv_len          Number of key/value positions.
@@ -5019,8 +5067,14 @@ namespace llaminar2
          *                        (non-zero during decode where q_pos 0 is not
          *                        the beginning of the sequence).
          * @param mask            Optional additive mask [seq_len, kv_len] or nullptr.
+         * @param head_start      Original TP global query-head origin.
+         * @param gqa_n_rep       Original global query/KV ratio, or zero to derive it.
+         * @param execution_policy Original arithmetic and parallel ownership policy.
+         * @param kv_logical_view Original contiguous/ring address contract; absent for pages.
+         * @param paged           Exact operation-retained native pages, admitted bank-by-bank by compute_paged_fp32.
          * @return true on success, false if pointers are null or dimensions invalid.
          */
+        template <bool Paged = false>
         bool compute_flash_fp32(
             const float *Q, const float *K, const float *V, float *output,
             int seq_len, int kv_len,
@@ -5030,12 +5084,13 @@ namespace llaminar2
             int head_start = 0,
             int gqa_n_rep = 0,
             const attention::AttentionExecutionPolicy &execution_policy = {},
-            const attention::AttentionKVLogicalView &kv_logical_view = {})
+            const attention::AttentionKVLogicalView &kv_logical_view = {},
+            const CPUFP32PagedKVView *paged = nullptr)
         {
             KERNEL_PROFILE_SCOPE(KernelType::ATTENTION);
 
             // --- Input validation ---
-            if (!Q || !K || !V || !output)
+            if (!Q || (!Paged && (!K || !V)) || (Paged && !paged) || !output)
             {
                 return false;
             }
@@ -5052,7 +5107,7 @@ namespace llaminar2
             }
             if (!kv_logical_view.validFor(kv_len))
                 return false;
-            if (!admitInvocation(declaredRequest(Q, K, V, output, seq_len,
+            if (!Paged && !admitInvocation(declaredRequest(Q, K, V, output, seq_len,
                     physicalKVRows(kv_logical_view, kv_len), n_heads, n_kv_heads, head_dim,
                     head_start, gqa_n_rep, sizeof(float))))
                 return false;
@@ -5088,6 +5143,14 @@ namespace llaminar2
             // Row strides in the flat [seq_len, heads*head_dim] layout.
             const int q_stride = n_heads * head_dim;     // Q row = all Q heads concatenated
             const int kv_stride = n_kv_heads * head_dim; // K/V row = all KV heads concatenated
+            const auto key_row = [&](int logical, int head) {
+                if constexpr (Paged) return paged->key(logical, head);
+                else return K + physical_kv_row(logical) * kv_stride + static_cast<size_t>(head) * head_dim;
+            };
+            const auto value_row = [&](int logical, int head) {
+                if constexpr (Paged) return paged->value(logical, head);
+                else return V + physical_kv_row(logical) * kv_stride + static_cast<size_t>(head) * head_dim;
+            };
 
             // Profiling: track QK dot-product and V accumulation times separately.
             const bool profiling_enabled = KernelProfiler::isEnabled();
@@ -5122,8 +5185,7 @@ namespace llaminar2
                 struct FP32RowScratch
                 {
                     const float *query = nullptr;
-                    const float *key = nullptr;
-                    const float *value = nullptr;
+                    int kv_head = 0;
                     const float *mask = nullptr;
                     int query_position = 0;
                     int visible_kv_rows = 0;
@@ -5140,10 +5202,7 @@ namespace llaminar2
                     scratch.query =
                         Q + static_cast<std::size_t>(query_position) * q_stride +
                         static_cast<std::size_t>(head) * head_dim;
-                    scratch.key =
-                        K + static_cast<std::size_t>(kv_head) * head_dim;
-                    scratch.value =
-                        V + static_cast<std::size_t>(kv_head) * head_dim;
+                    scratch.kv_head = kv_head;
                     scratch.mask = mask
                                        ? mask +
                                              static_cast<std::size_t>(query_position) *
@@ -5198,14 +5257,10 @@ namespace llaminar2
                             float score3 = 0.0f;
                             dot_fp32_4row(
                                 scratch.query,
-                                scratch.key +
-                                    physical_kv_row(kv_row + 0) * kv_stride,
-                                scratch.key +
-                                    physical_kv_row(kv_row + 1) * kv_stride,
-                                scratch.key +
-                                    physical_kv_row(kv_row + 2) * kv_stride,
-                                scratch.key +
-                                    physical_kv_row(kv_row + 3) * kv_stride,
+                                key_row(kv_row + 0, scratch.kv_head),
+                                key_row(kv_row + 1, scratch.kv_head),
+                                key_row(kv_row + 2, scratch.kv_head),
+                                key_row(kv_row + 3, scratch.kv_head),
                                 head_dim,
                                 score0,
                                 score1,
@@ -5231,8 +5286,7 @@ namespace llaminar2
 
                         float score = dot_fp32(
                                           scratch.query,
-                                          scratch.key +
-                                              physical_kv_row(kv_row) * kv_stride,
+                                          key_row(kv_row, scratch.kv_head),
                                           head_dim) *
                                       scale;
                         if (scratch.mask)
@@ -5271,17 +5325,13 @@ namespace llaminar2
                                  probabilities[2] + probabilities[3];
                         accum_weighted_v_4row(
                             partial,
-                            scratch.value +
-                                physical_kv_row(kv_row + 0) * kv_stride,
+                            value_row(kv_row + 0, scratch.kv_head),
                             probabilities[0],
-                            scratch.value +
-                                physical_kv_row(kv_row + 1) * kv_stride,
+                            value_row(kv_row + 1, scratch.kv_head),
                             probabilities[1],
-                            scratch.value +
-                                physical_kv_row(kv_row + 2) * kv_stride,
+                            value_row(kv_row + 2, scratch.kv_head),
                             probabilities[2],
-                            scratch.value +
-                                physical_kv_row(kv_row + 3) * kv_stride,
+                            value_row(kv_row + 3, scratch.kv_head),
                             probabilities[3],
                             head_dim);
                     }
@@ -5293,8 +5343,7 @@ namespace llaminar2
                         new_l += probability;
                         accum_weighted_v(
                             partial,
-                            scratch.value +
-                                physical_kv_row(kv_row) * kv_stride,
+                            value_row(kv_row, scratch.kv_head),
                             probability,
                             head_dim,
                             use_avx512);
@@ -5471,14 +5520,13 @@ namespace llaminar2
                                 // Batched 4-row dot products for ILP.
                                 if (k + 3 < valid_end)
                                 {
-                                    const float *kbase = K + static_cast<size_t>(kv_h) * head_dim;
                                     float s0, s1, s2, s3;
                                     dot_fp32_4row(
                                         q_ptr,
-                                        kbase + physical_kv_row(k + 0) * kv_stride,
-                                        kbase + physical_kv_row(k + 1) * kv_stride,
-                                        kbase + physical_kv_row(k + 2) * kv_stride,
-                                        kbase + physical_kv_row(k + 3) * kv_stride,
+                                        key_row(k + 0, kv_h),
+                                        key_row(k + 1, kv_h),
+                                        key_row(k + 2, kv_h),
+                                        key_row(k + 3, kv_h),
                                         head_dim, s0, s1, s2, s3);
                                     s0 *= scale;
                                     s1 *= scale;
@@ -5502,8 +5550,7 @@ namespace llaminar2
                                 // Scalar / tail path
                                 float s = dot_fp32(
                                     q_ptr,
-                                    K + physical_kv_row(k) * kv_stride +
-                                        static_cast<size_t>(kv_h) * head_dim,
+                                    key_row(k, kv_h),
                                     head_dim);
                                 s *= scale;
 
@@ -5546,7 +5593,6 @@ namespace llaminar2
                             const auto v_start = profiling_enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
 
                             {
-                                const float *v_base = V + static_cast<size_t>(kv_h) * head_dim;
                                 int k = valid_start;
                                 // 4-wide batched: vectorized exp + batched V accumulation
                                 for (; k + 3 < valid_end; k += 4)
@@ -5562,10 +5608,10 @@ namespace llaminar2
 
                                     accum_weighted_v_4row(
                                         out,
-                                        v_base + physical_kv_row(k + 0) * kv_stride, pp[0],
-                                        v_base + physical_kv_row(k + 1) * kv_stride, pp[1],
-                                        v_base + physical_kv_row(k + 2) * kv_stride, pp[2],
-                                        v_base + physical_kv_row(k + 3) * kv_stride, pp[3],
+                                        value_row(k + 0, kv_h), pp[0],
+                                        value_row(k + 1, kv_h), pp[1],
+                                        value_row(k + 2, kv_h), pp[2],
+                                        value_row(k + 3, kv_h), pp[3],
                                         head_dim);
                                 }
                                 // Scalar tail: remaining valid positions
@@ -5575,7 +5621,7 @@ namespace llaminar2
                                     new_l += p;
                                     accum_weighted_v(
                                         out,
-                                        v_base + physical_kv_row(k) * kv_stride,
+                                        value_row(k, kv_h),
                                         p,
                                         head_dim,
                                         use_avx512);

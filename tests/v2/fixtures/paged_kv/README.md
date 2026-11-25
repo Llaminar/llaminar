@@ -35,3 +35,23 @@ Logical KV-table/operation-readable views, sharing/COW, tentative verifier
 causality, native access/transfer completion and GPU traces remain separate
 future requirements. The raw-byte publication trace does not qualify a native
 KV codec, append kernel or attention consumer.
+
+## Native FP32 attention recording
+
+`attention_fp32_v1.txt` records actual query/key/value bit patterns, initial
+empty pool geometry, logical-to-physical frame order and native optimized
+attention output bits. Capture: `CB-checkpoints/paged-fp32-kernel-recording.tOAwPi`,
+using the uncommitted native paged implementation over base `7d58769f3`.
+The capture verified byte equality with the original contiguous kernel before
+saving the observed paged output. The stored text removes only trailing line
+spaces from the retained capture; every geometry/input/output token is unchanged.
+The diagnostic writer now emits that whitespace-clean framing directly. The
+fixed panel uses nonconstant K/V data
+with exact cancelling key scores; broader nonzero-score/shape checks remain in
+the native sweep. It is not evidence of cross-ISA or all-format qualification.
+
+Ordinary replay reads build-embedded fixture bytes, never regenerates expected
+output, and rejects missing initial state, incompatible policy/geometry,
+malformed bit vectors or trailing/truncated data before execution. Explicit
+capture requires `LLAMINAR_RECORD_PAGED_FP32_TRACE` plus a destination path.
+The schema's fixed panel geometry restricts this recording, not engine support.

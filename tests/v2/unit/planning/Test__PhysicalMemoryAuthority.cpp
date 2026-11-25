@@ -10,6 +10,7 @@
 
 #include "planning/PhysicalMemoryAuthority.h"
 #include "planning/PhysicalPagePool.h"
+#include "kernels/cpu/attention/CPUFP32PagedKVView.h"
 #include <limits>
 #include "utils/FinalPhysicalMemoryCostEvidence.h"
 #include <sstream>
@@ -92,6 +93,55 @@ TEST(PhysicalMemoryAuthority, PagePoolUnpublishedCommitmentLifecycle)
     pool.reset();
     EXPECT_EQ(authority->claimedBytes(device, PhysicalMemoryOwner::KVCache,
         PhysicalMemoryMaterializationKind::NewAllocation), 0u);
+}
+
+/** @test Native FP32 operands address the actual permuted frames and partial live tail without gathering. */
+TEST(PhysicalMemoryAuthority, PagePoolFP32OperandsUseLogicalPagesNotPhysicalStride)
+{
+    const auto device = DeviceId::cpu();
+    const PhysicalPagePoolGeometry geometry{3, 128, 1, 3};
+    const auto bytes = PhysicalPagePool::physicalBytes(geometry, device);
+    PhysicalMemoryPlanBuilder builder;
+    builder.add(resource(0, device, bytes, bytes), PhysicalMemoryOwner::KVCache, bytes);
+    auto authority = std::make_shared<PhysicalMemoryAuthority>(
+        std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(builder.build()), 0);
+    auto pool = authority->createCPUPagePool(device, geometry, CPUStoragePlacement::local());
+    auto request = pool->tryAdmit(3);
+    ASSERT_TRUE(request);
+    const auto a = request->assignFrame(), b = request->assignFrame(), c = request->assignFrame();
+    const PhysicalPagePool::FrameHandle logical_order[]{c, a, b};
+    const float source[][8]{{1, 2, 11, 12, 3, 4, 13, 14}, {5, 6, 15, 16, 7, 8, 17, 18}, {9, 10, 19, 20, 0, 0, 0, 0}};
+    std::vector<CPUFP32KVPage> pages;
+    pages.reserve(3);
+    for (size_t page = 0; page < 3; ++page)
+    {
+        const size_t values = page == 2 ? 4 : 8;
+        auto write = request->prepareAppend(logical_order[page], values * sizeof(float));
+        ASSERT_TRUE(write);
+        write->copyFrom(std::as_bytes(std::span(source[page], values)));
+        pages.emplace_back(write->commit(), 1, 2);
+    }
+    CPUFP32PagedKVView view(pages, 2);
+    EXPECT_EQ(view.rows(), 5);
+    request.reset();
+    pool.reset();
+    for (int token = 0; token < 5; ++token)
+    {
+        EXPECT_EQ(view.key(token, 0)[0], float(2 * token + 1));
+        EXPECT_EQ(view.key(token, 0)[1], float(2 * token + 2));
+        EXPECT_EQ(view.value(token, 0)[0], float(2 * token + 11));
+        EXPECT_EQ(view.key(token, 0), pages[static_cast<size_t>(token / 2)].key(token % 2, 0));
+    }
+    EXPECT_THROW(view.key(5, 0), std::out_of_range);
+    EXPECT_THROW(view.value(-1, 0), std::out_of_range);
+    EXPECT_THROW(view.key(0, 1), std::out_of_range);
+    EXPECT_THROW(pages[2].key(1, 0), std::out_of_range);
+    std::vector<CPUFP32KVPage> invalid;
+    invalid.emplace_back(std::move(pages[2]));
+    invalid.emplace_back(std::move(pages[0]));
+    EXPECT_EQ(pages[2].rows(), 0);
+    EXPECT_THROW(pages[2].key(0, 0), std::out_of_range);
+    EXPECT_THROW(CPUFP32PagedKVView(invalid, 2), std::invalid_argument);
 }
 
 /** @test Registration before CPU submission retains old bytes across closure, cancellation and delayed execution. */
