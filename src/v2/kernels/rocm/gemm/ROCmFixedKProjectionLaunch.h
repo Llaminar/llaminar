@@ -38,7 +38,6 @@ namespace llaminar2::rocm
         WmmaTiled128x64,      ///< gfx1100 half: 128x64 tiles, register partition fold.
         ScalarPartitioned64x64, ///< Scalar FMA: 64x64 partition tiles plus fold.
         ScalarTiled64x64,       ///< Scalar FMA: 64x64 tiles, register partition fold.
-        ScalarTiled128x64,      ///< Scalar FMA: 128x64 tiles, register partition fold.
     };
 
     /** @brief Operand arithmetic of a fixed-K launch. */
@@ -61,17 +60,33 @@ namespace llaminar2::rocm
      * @brief Economy policy; every candidate evaluates identical arithmetic.
      * @param operand Operand arithmetic. @param m Physical rows. @param columns Group columns.
      * @return Schedule to submit. Device-free, so admission can bound workspace.
-     * @details gfx906 and gfx1100 tile choices await native measurements on the
-     * qualification host; the partitioned/tiled split is the shared contract rule.
+     * @details Scalar (gfx906): partitioning beat walking K per tile for every
+     * measured narrow group up to M=1024 (e.g. 48+48 at M=1024: 217 vs 309 us),
+     * so every group of at most 128 columns partitions, in bounded row slabs
+     * (fixedKPartialRows()); 64x64 tiles beat 128x64 for every wide group and M.
+     * gfx1100 WMMA tile choices await native measurements; it keeps the shared
+     * partitioned/tiled rule.
      */
     constexpr FixedKSchedule selectFixedKSchedule(FixedKOperand operand, int m, int columns) noexcept
     {
-        const bool partitioned = fixed_k_projection::usesPartitionedSchedule(m, columns);
         if (operand == FixedKOperand::HalfWmma)
-            return partitioned ? FixedKSchedule::WmmaPartitioned64x64
+            return fixed_k_projection::usesPartitionedSchedule(m, columns) ? FixedKSchedule::WmmaPartitioned64x64
                  : m <= 256 ? FixedKSchedule::WmmaTiled64x64 : FixedKSchedule::WmmaTiled128x64;
-        return partitioned ? FixedKSchedule::ScalarPartitioned64x64
-             : m <= 256 ? FixedKSchedule::ScalarTiled64x64 : FixedKSchedule::ScalarTiled128x64;
+        return columns <= 128 ? FixedKSchedule::ScalarPartitioned64x64 : FixedKSchedule::ScalarTiled64x64;
+    }
+
+    /**
+     * @brief Rows of one partitioned launch slab; the chain bank must hold partialBytes(rows, columns).
+     * @param schedule Partitioned schedule. @param m Physical rows. @param columns Group columns.
+     * @return m for WMMA (its rule already bounds the bank); for scalar groups at
+     *         most fixed_k_projection::partitionedSlabRows(columns).
+     */
+    constexpr int fixedKPartialRows(FixedKSchedule schedule, int m, int columns) noexcept
+    {
+        if (schedule != FixedKSchedule::ScalarPartitioned64x64)
+            return m;
+        const int slab = fixed_k_projection::partitionedSlabRows(columns);
+        return m < slab ? m : slab;
     }
 
     /**

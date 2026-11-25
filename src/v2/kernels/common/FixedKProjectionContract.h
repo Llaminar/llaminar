@@ -70,6 +70,9 @@ namespace llaminar2::fixed_k_projection
         return static_cast<int>(static_cast<long long>(p) * blocks / kPartitions);
     }
 
+    /** @brief Chains per partition that one admitted bank covers (see partialBound()). */
+    inline constexpr int kPartitionedOutputCap = 65536;
+
     /**
      * @brief Whether a group is narrow enough to need K partitions spread over CTAs.
      * @param m Physical rows. @param columns Total group columns.
@@ -106,8 +109,28 @@ namespace llaminar2::fixed_k_projection
     LLAMINAR_FIXED_K_HD constexpr unsigned long long partialBound(int m) noexcept
     {
         const unsigned long long rows = static_cast<unsigned long long>(m > 0 ? m : 0);
-        const unsigned long long outputs = rows * 128ull < 65536ull ? rows * 128ull : 65536ull;
+        const unsigned long long cap = static_cast<unsigned long long>(kPartitionedOutputCap);
+        const unsigned long long outputs = rows * 128ull < cap ? rows * 128ull : cap;
         return static_cast<unsigned long long>(kPartitions) * outputs * 4ull;
+    }
+
+    /**
+     * @brief Height of one bounded row slab when a narrow group is partitioned beyond the tile rule.
+     * @param columns Positive total group columns.
+     * @return Largest multiple of 64 with rows * columns <= kPartitionedOutputCap
+     *         (at least 512 for the at most 128 columns any policy partitions),
+     *         and never below 64 so explicitly forced wide partitioned launches progress.
+     *
+     * Rows are independent, so a backend may partition a taller narrow group as
+     * consecutive slabs of at most this height, each publishing and folding its
+     * own chains, without changing bytes. A slab of min(m, slab) rows needs at
+     * most min(128 m, kPartitionedOutputCap) chains per partition, so it fits
+     * partialBound(m) and the admitted bank is unchanged.
+     */
+    LLAMINAR_FIXED_K_HD constexpr int partitionedSlabRows(int columns) noexcept
+    {
+        const int rows = kPartitionedOutputCap / (columns > 0 ? columns : 1) / 64 * 64;
+        return rows > 64 ? rows : 64;
     }
 
     /**

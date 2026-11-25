@@ -1,9 +1,9 @@
 # Fixed-K Explicit-Operand Prefill Projections (issue #74)
 
-Status: in progress (draft PR #75). CUDA half-RNE and strict-FP32 paths
-complete and verified on GB10. ROCm (gfx906 scalar, gfx1100 WMMA) implemented;
-native compile/qualification pending on the ROCm host (gfx1100 has no
-hardware and is reported runtime-unqualified).
+Status: in progress (PR #75). CUDA half-RNE and strict-FP32 paths complete
+and verified on GB10. ROCm (gfx906 scalar, gfx1100 WMMA) compiled spill-free
+and preflight-green on gfx906; gfx1100 has no hardware and is reported
+runtime-unqualified. gfx906 wide-group economy is being tuned natively.
 
 ## Problem
 
@@ -144,7 +144,32 @@ body. Bytes differ between architectures (different hardware arithmetic) but
 each is chunk-, bucket- and offset-invariant. hipBLAS half `GemmEx` is
 retired; strict FP32 wide groups no longer use hipBLAS.
 
+### gfx906 economy (graph replay, rotated weights, µs; ratio = selected / retired hipBLAS)
+
+Measured at a2f4b3e8b (`tune_rocm`, single MI50-class gfx906). Byte
+invariance across every schedule, M in {1..512} and offsets {0,7,256}:
+0 differing rows over 72 cases.
+
+| Group (K) | M=16 | 128 | 256 | 512 | 1024 |
+|---|---|---|---|---|---|
+| half 32+32 (2048) | 0.29 | 0.30 | 0.28 | 0.43 | 0.63 |
+| half 12+12 (2560) | 0.31 | 0.44 | 0.30 | 0.87 | 0.64 |
+| half 48+48 (2560) | 0.33 | 0.29 | 0.50 | 0.75 | 1.20* |
+| fp32 32+32 (2048) | 0.14 | 0.10 | 0.11 | 0.22 | 0.60 |
+| half 2560+1536+12+12 (2560) | 1.29 | 1.22 | 1.20 | 1.43* | 1.51* |
+| fp32 2560+1536+12+12 (2560) | 0.74 | 1.01 | 1.18 | 1.13* | 1.42* |
+
+`*` = the measured time of the schedule the fixed selection now picks, to
+be re-measured with the slabbed launch (partitioned 217 µs instead of tiled 128x64
+531 µs for 48+48 at M=1024; tiled 64x64 instead of 128x64 for wide groups,
+which was 2.0-2.9x hipBLAS). Policy: every scalar group of at most 128
+columns partitions; groups taller than one bounded slab
+(`fixed_k_projection::partitionedSlabRows`, ≥512 rows) run as consecutive
+row slabs reusing the unchanged admitted bank. Wide groups use tiled 64x64;
+scalar tiled 128x64 was never faster and is retired.
+
 ## Remaining
 
-- ROCm native compile, spill guard (gfx906, gfx1100) and preflight on the
-  ROCm host; gfx906 schedule economy versus the retired hipBLAS paths.
+- gfx906 wide full-FP16/FP32 groups at M ≥ 128 are 1.2-1.5x hipBLAS; native
+  tuning on the ROCm host (larger register tiles, conflict-free LDS reads,
+  `v_dot2_f32_f16` pair chains for half) is in progress.

@@ -15,6 +15,7 @@
 #pragma once
 
 #include "kernels/common/FloatingPointGemmWorkspaceABI.h"
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
@@ -86,6 +87,21 @@ public:
         outputs_[count_] = output;
         ends_[count_] = totalColumns() + columns;
         ++count_;
+    }
+
+    /**
+     * @brief The same projections restricted to rows starting at @p row.
+     * @param row First physical row of the slab. @param k Input row width.
+     * @return Group whose input and outputs begin at that row; rows are
+     *         independent, so a slab evaluates exactly the original bytes.
+     */
+    [[nodiscard]] FixedRaggedProjectionGroup rowsFrom(int row, int k) const noexcept
+    {
+        FixedRaggedProjectionGroup slab = *this;
+        slab.input_ += static_cast<std::size_t>(row) * static_cast<std::size_t>(k);
+        for (int index = 0; index < count_; ++index)
+            slab.outputs_[index] += static_cast<std::size_t>(row) * static_cast<std::size_t>(columns(index));
+        return slab;
     }
 
     /** @return Borrowed shared input matrix, never a downloaded host value. */

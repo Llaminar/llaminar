@@ -280,25 +280,39 @@ void launchWmma(const HalfGroup &group, int m, int k, hipStream_t stream, float 
     }
 }
 
-/** @brief Launch one scalar instantiation and, for partitioned mode, its fold. */
+/**
+ * @brief Launch one scalar instantiation and, for partitioned mode, its fold.
+ * @details Partitioned groups run as consecutive row slabs of at most
+ * fixedKPartialRows() rows, each publishing to the start of the bank and
+ * folding before the next slab reuses it (same stream, so ordered). Rows are
+ * independent, so slabbing never changes bytes; every slab grid covers only
+ * its live tiles.
+ */
 template<class Operand, int BM, int BN, int TM, int TN, int BK, scalar::Mode Mode>
 void launchScalar(const FixedRaggedProjectionGroup<Operand> &group, int m, int k, hipStream_t stream, float *partials)
 {
-    const unsigned row_tiles = (m + BM - 1) / BM, col_tiles = (group.totalColumns() + BN - 1) / BN;
-    const bool partial = Mode == scalar::Mode::Partial;
-    const dim3 grid(row_tiles, col_tiles, partial ? contract::kPartitions : 1);
+    constexpr bool partial = Mode == scalar::Mode::Partial;
+    const int total = group.totalColumns();
+    const int slab = partial ? fixedKPartialRows(FixedKSchedule::ScalarPartitioned64x64, m, total) : m;
+    const unsigned col_tiles = (total + BN - 1) / BN;
     const dim3 block((BM / TM) * (BN / TN));
-    if (!partial && scalar::scalarPartitionsAligned<BK>(k))
-        hipLaunchKernelGGL((scalar::scalarProjectionKernel<Operand, BM, BN, TM, TN, BK, Mode, true>), grid, block, 0,
-                           stream, group, m, k, partials);
-    else
-        hipLaunchKernelGGL((scalar::scalarProjectionKernel<Operand, BM, BN, TM, TN, BK, Mode, false>), grid, block, 0,
-                           stream, group, m, k, partials);
-    if (partial)
+    for (int row = 0; row < m; row += slab)
     {
-        const size_t outputs = static_cast<size_t>(m) * group.totalColumns();
-        hipLaunchKernelGGL((scalar::foldScalarPartialsKernel<Operand>), dim3((outputs + 255) / 256), dim3(256), 0,
-                           stream, group, m, partials);
+        const int rows = m - row < slab ? m - row : slab;
+        const auto part = row ? group.rowsFrom(row, k) : group;
+        const dim3 grid((rows + BM - 1) / BM, col_tiles, partial ? contract::kPartitions : 1);
+        if (!partial && scalar::scalarPartitionsAligned<BK>(k))
+            hipLaunchKernelGGL((scalar::scalarProjectionKernel<Operand, BM, BN, TM, TN, BK, Mode, true>), grid, block, 0,
+                               stream, part, rows, k, partials);
+        else
+            hipLaunchKernelGGL((scalar::scalarProjectionKernel<Operand, BM, BN, TM, TN, BK, Mode, false>), grid, block, 0,
+                               stream, part, rows, k, partials);
+        if (partial)
+        {
+            const size_t outputs = static_cast<size_t>(rows) * total;
+            hipLaunchKernelGGL((scalar::foldScalarPartialsKernel<Operand>), dim3((outputs + 255) / 256), dim3(256), 0,
+                               stream, part, rows, partials);
+        }
     }
 }
 
@@ -310,14 +324,13 @@ void validate(int m, int k, void *stream, FixedKSchedule schedule, int columns, 
     if (m <= 0 || k <= 0)
         throw std::invalid_argument("ROCm fixed-K projection requires positive rows and K");
     if (fixedKScheduleNeedsPartials(schedule) &&
-        (!partials || bytes < contract::partialBytes(m, columns)))
+        (!partials || bytes < contract::partialBytes(fixedKPartialRows(schedule, m, columns), columns)))
         throw std::invalid_argument("Partitioned ROCm fixed-K projection lacks its admitted partial workspace");
 }
 
 constexpr std::array kWmmaSchedules{FixedKSchedule::WmmaPartitioned64x64, FixedKSchedule::WmmaTiled64x64,
                                     FixedKSchedule::WmmaTiled128x64};
-constexpr std::array kScalarSchedules{FixedKSchedule::ScalarPartitioned64x64, FixedKSchedule::ScalarTiled64x64,
-                                      FixedKSchedule::ScalarTiled128x64};
+constexpr std::array kScalarSchedules{FixedKSchedule::ScalarPartitioned64x64, FixedKSchedule::ScalarTiled64x64};
 } // namespace
 
 std::string_view fixedKScheduleName(FixedKSchedule schedule) noexcept
@@ -329,7 +342,6 @@ std::string_view fixedKScheduleName(FixedKSchedule schedule) noexcept
     case FixedKSchedule::WmmaTiled128x64: return "wmma_tiled_128x64";
     case FixedKSchedule::ScalarPartitioned64x64: return "scalar_partitioned_64x64";
     case FixedKSchedule::ScalarTiled64x64: return "scalar_tiled_64x64";
-    case FixedKSchedule::ScalarTiled128x64: return "scalar_tiled_128x64";
     }
     return "invalid";
 }
@@ -367,8 +379,6 @@ bool launchFixedKHalfProjection(const FixedHalfProjectionGroup &group, int m, in
         launchScalar<uint16_t, 64, 64, 4, 4, 16, scalar::Mode::Partial>(group, m, k, native, partials); break;
     case FixedKSchedule::ScalarTiled64x64:
         launchScalar<uint16_t, 64, 64, 4, 4, 32, scalar::Mode::Tiled>(group, m, k, native, nullptr); break;
-    case FixedKSchedule::ScalarTiled128x64:
-        launchScalar<uint16_t, 128, 64, 8, 4, 32, scalar::Mode::Tiled>(group, m, k, native, nullptr); break;
     default: throw std::invalid_argument("Unknown ROCm fixed-K schedule");
     }
     return completeLaunch(native);
@@ -387,8 +397,6 @@ bool launchFixedKFP32Projection(const FixedStrictFP32ProjectionGroup &group, int
         launchScalar<float, 64, 64, 4, 4, 16, scalar::Mode::Partial>(group, m, k, native, partials); break;
     case FixedKSchedule::ScalarTiled64x64:
         launchScalar<float, 64, 64, 4, 4, 32, scalar::Mode::Tiled>(group, m, k, native, nullptr); break;
-    case FixedKSchedule::ScalarTiled128x64:
-        launchScalar<float, 128, 64, 8, 4, 32, scalar::Mode::Tiled>(group, m, k, native, nullptr); break;
     default: throw std::invalid_argument("Strict-FP32 ROCm fixed-K projections use scalar schedules only");
     }
     return completeLaunch(native);

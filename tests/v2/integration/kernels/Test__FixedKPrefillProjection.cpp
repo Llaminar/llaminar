@@ -254,11 +254,15 @@ namespace
         EXPECT_TRUE(Native::destroy(stream));
     }
 
-    /** @brief Narrow, QFN, ragged, K-tail, empty-partition and wide geometries. */
+    /**
+     * @brief Narrow, QFN, ragged, K-tail, empty-partition and wide geometries.
+     * @details 48+48 and 120+8 exceed one bounded partitioned slab at M=1024
+     * (slabs of 640 and 512 rows), so slab boundaries are compared too.
+     */
     const std::vector<Shape> &sweepShapes()
     {
         static const std::vector<Shape> shapes{{2048, {32, 32}}, {2560, {48, 48}}, {2056, {13, 21}},
-            {2048, {520, 264, 8, 8}}, {192, {100, 36}}, {65, {16, 300}}, {2044, {32, 32}}};
+            {2048, {520, 264, 8, 8}}, {192, {100, 36}}, {65, {16, 300}}, {2044, {32, 32}}, {1024, {120, 8}}};
         return shapes;
     }
 
@@ -404,6 +408,18 @@ TEST(FixedKPrefillProjection, RejectsMismatchedArithmeticAndUnadmittedPartials)
         EXPECT_THROW(rocm::launchFixedKHalfProjection(group, 64, 2048, device, stream, partitioned, nullptr, 0), std::invalid_argument);
         EXPECT_THROW(rocm::launchFixedKHalfProjection(group, 64, 2048, device, stream, partitioned, d_c, exact - 1), std::invalid_argument);
         EXPECT_THROW(rocm::launchFixedKHalfProjection(group, 64, 2048, device, nullptr, partitioned, d_c, exact), std::invalid_argument);
+        // Scalar partitions every narrow group in bounded slabs that fit the admitted bank.
+        for (int m : {1, 64, 511, 512, 513, 640, 1024, 4096, 16384})
+            for (int columns : {1, 8, 64, 96, 120, 127, 128})
+            {
+                for (auto arithmetic : {rocm::FixedKOperand::HalfScalar, rocm::FixedKOperand::StrictFP32})
+                    EXPECT_EQ(rocm::selectFixedKSchedule(arithmetic, m, columns), rocm::FixedKSchedule::ScalarPartitioned64x64);
+                const int rows = rocm::fixedKPartialRows(rocm::FixedKSchedule::ScalarPartitioned64x64, m, columns);
+                EXPECT_TRUE(rows >= 1 && rows <= m && (rows == m || rows % 64 == 0)) << "m=" << m << " columns=" << columns;
+                EXPECT_LE(fixed_k_projection::partialBytes(rows, columns), fixed_k_projection::partialBound(m))
+                    << "m=" << m << " columns=" << columns;
+            }
+        EXPECT_EQ(rocm::selectFixedKSchedule(rocm::FixedKOperand::StrictFP32, 1024, 129), rocm::FixedKSchedule::ScalarTiled64x64);
         EXPECT_EQ(hipFree(d_a), hipSuccess);
         EXPECT_EQ(hipFree(d_c), hipSuccess);
         EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
