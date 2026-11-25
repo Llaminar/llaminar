@@ -370,3 +370,33 @@ TEST(PhysicalPagePoolSharing, AbortedCopyOnWriteCannotPublishPartialBytes)
     auto plan2 = writer.prepareCOW(shared_page, 7);
     ASSERT_TRUE(plan2);
 }
+
+/** @test Plan P1 same-frame reappend is refused while old readers pin; resumes after retirement. */
+TEST(PhysicalPagePoolSharing, SameFrameReappendWaitsForOldReaderRetirement)
+{
+    ShareFixture fx(2, 128, 2);
+    std::vector<std::byte> write(32, std::byte{0x11});
+    auto grant = *fx.pool->tryAdmit(1);
+    auto frame = grant.assignFrame();
+    auto plan = grant.prepareFreshWrite(frame, write.size());
+    ASSERT_TRUE(plan);
+    plan->copyFrom(write);
+    auto page = plan->commit();
+    // A registered reader pins the frame; a same-frame rewrite is refused
+    // because the frame already holds a live prefix (throws, no mutation).
+    auto reader = page.registerRead();
+    auto bytes = reader.beginCPU();
+    EXPECT_THROW(grant.prepareFreshWrite(frame, 32), std::logic_error);
+    EXPECT_EQ(std::memcmp(bytes.data(), write.data(), write.size()), 0);
+    reader.completeCPU();
+    page = PhysicalPagePool::CommittedPage();
+    // After the reader retires the prefix still exists: prepareAppend on the
+    // same frame extends it without rewriting the original bytes.
+    auto next = grant.prepareAppend(frame, 32);
+    ASSERT_TRUE(next);
+    std::vector<std::byte> next_bytes(32, std::byte{0x22});
+    next->copyFrom(next_bytes);
+    auto next_page = next->commit();
+    ASSERT_EQ(std::memcmp(next_page.read().data(), write.data(), write.size()), 0);
+    ASSERT_EQ(std::memcmp(next_page.read().data() + write.size(), next_bytes.data(), next_bytes.size()), 0);
+}
