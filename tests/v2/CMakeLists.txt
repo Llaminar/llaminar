@@ -8930,7 +8930,8 @@ add_v2_test(V2_Unit_Q16VNNISafeNormalization
 add_executable(v2_test_cpu_flash_attention_kernel_t
     unit/kernels/cpu/attention/Test__CPUFlashAttentionKernelT.cpp
     unit/kernels/cpu/attention/Test__CPUFlashAttentionPaged.cpp
-    unit/kernels/cpu/attention/Test__CPUFlashAttentionPagedReplay.cpp)
+    unit/kernels/cpu/attention/Test__CPUFlashAttentionPagedReplay.cpp
+    unit/kernels/cpu/attention/Test__CPUFP32PagedKVTable.cpp)
 target_include_directories(v2_test_cpu_flash_attention_kernel_t PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 target_link_libraries(v2_test_cpu_flash_attention_kernel_t
     llaminar2_core
@@ -8958,6 +8959,13 @@ add_v2_test(V2_Integration_CPUFlashAttentionPagedReplay
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
     ENVIRONMENT "OMP_NUM_THREADS=4;OMP_DYNAMIC=false;LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUFlashAttentionPagedReplay)
+add_v2_test(V2_Integration_CPUFP32PagedKVTableLifecycle
+    COMMAND $<TARGET_FILE:v2_test_cpu_flash_attention_kernel_t>
+        --gtest_filter=CPUFP32PagedKVTable.*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;KVCache;Lifecycle;Ownership;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "OMP_NUM_THREADS=4;OMP_DYNAMIC=false;LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUFP32PagedKVTableLifecycle)
 # Flash-attention entry points admit banks, head mapping and output
 # disjointness before any team, returning false without writes otherwise:
 # raw batches, native request batches and Q16 tensor/verifier entries admit
@@ -30378,11 +30386,13 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     "${PMA_TRACE_ROOT}/private_ownership_v1.txt"
     "${PMA_TRACE_ROOT}/private_append_v1.txt"
     "${PMA_TRACE_ROOT}/private_readers_v1.txt"
-    "${PMA_TRACE_ROOT}/attention_fp32_v1.txt")
+    "${PMA_TRACE_ROOT}/attention_fp32_v1.txt"
+    "${PMA_TRACE_ROOT}/private_tables_v2.txt")
 file(READ "${PMA_TRACE_ROOT}/private_ownership_v1.txt" PMA_OWNERSHIP_TRACE)
 file(READ "${PMA_TRACE_ROOT}/private_append_v1.txt" PMA_APPEND_TRACE)
 file(READ "${PMA_TRACE_ROOT}/private_readers_v1.txt" PMA_READER_TRACE)
 file(READ "${PMA_TRACE_ROOT}/attention_fp32_v1.txt" PMA_ATTENTION_TRACE)
+file(READ "${PMA_TRACE_ROOT}/private_tables_v2.txt" PMA_TABLE_TRACE)
 configure_file("${PMA_TRACE_ROOT}/PhysicalPagePoolTraceData.h.in"
     "${CMAKE_CURRENT_BINARY_DIR}/PhysicalPagePoolTraceData.h" @ONLY)
 target_include_directories(v2_test_physical_memory_authority PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
@@ -30410,14 +30420,14 @@ list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUFP32PagedKVView
 # Initial private page grants: no native kernel or serving cutover yet.
 add_v2_test(V2_Integration_PMAPagePoolUnpublishedContract
     COMMAND $<TARGET_FILE:v2_test_physical_memory_authority>
-        --gtest_filter=PhysicalMemoryAuthority.PagePoolUnpublishedCommitmentLifecycle:PhysicalMemoryAuthority.PagePoolPrivatePinsDeferRealRetirement:PhysicalMemoryAuthority.PagePoolMultiClassAdmissionIsAtomic:PhysicalMemoryAuthority.PagePoolGeometryAndConstructionRollback:PhysicalMemoryAuthority.PagePoolExclusiveAppendPublicationLifecycle:PhysicalMemoryAuthority.PagePoolRegisteredReadersCloseBeforeRetirement
+        --gtest_filter=PhysicalMemoryAuthority.PagePoolUnpublishedCommitmentLifecycle:PhysicalMemoryAuthority.PagePoolPrivatePinsDeferRealRetirement:PhysicalMemoryAuthority.PagePoolMultiClassAdmissionIsAtomic:PhysicalMemoryAuthority.PagePoolGeometryAndConstructionRollback:PhysicalMemoryAuthority.PagePoolExclusiveAppendPublicationLifecycle:PhysicalMemoryAuthority.PagePoolRegisteredReadersCloseBeforeRetirement:PhysicalMemoryAuthority.PagePoolPrivateFrameReturnIsGenerationQualified
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Planning;PhysicalMemoryAuthority;Contract;Lifecycle;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
     ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PMAPagePoolUnpublishedContract)
 add_v2_test(V2_Integration_PMAPagePoolUnpublishedReplay
     COMMAND $<TARGET_FILE:v2_test_physical_memory_authority>
-        --gtest_filter=PhysicalMemoryAuthority.PagePoolRecordedUnpublishedOwnershipReplay:PhysicalMemoryAuthority.PagePoolReplayRejectsIncompleteInitialState
+        --gtest_filter=PhysicalMemoryAuthority.PagePoolRecordedUnpublishedOwnershipReplay:PhysicalMemoryAuthority.PagePoolRecordedTableBanksReplayExactly:PhysicalMemoryAuthority.PagePoolTableReplayRejectsAlteredStateAndObservations:PhysicalMemoryAuthority.PagePoolReplayRejectsIncompleteInitialState
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Planning;PhysicalMemoryAuthority;Replay;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
     ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")

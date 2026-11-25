@@ -9,9 +9,12 @@
  * This does not replay native KV kernels, published views or GPU accesses.
  */
 #include "planning/PhysicalPagePool.h"
+#include "kernels/cpu/attention/CPUFP32PagedKVTable.h"
 #include "PhysicalPagePoolTraceData.h"
 #include <gtest/gtest.h>
 #include <cstdlib>
+#include <bit>
+#include <limits>
 #include <fstream>
 #include <iomanip>
 #include <map>
@@ -27,16 +30,22 @@ class PrivatePageReplay
 {
 public:
     /** @brief Bind the trace's exact empty initial pool through the production factory. */
-    explicit PrivatePageReplay(PhysicalPagePoolGeometry geometry)
+    explicit PrivatePageReplay(PhysicalPagePoolGeometry geometry,
+        std::optional<CPUFP32PagedKVTableGeometry> table_geometry = std::nullopt)
     {
         const auto device = DeviceId::cpu();
-        const auto bytes = PhysicalPagePool::physicalBytes(geometry, device);
+        const auto page_bytes = PhysicalPagePool::physicalBytes(geometry, device);
+        const auto table_bytes = table_geometry ? CPUFP32PagedKVTable::physicalBytes(*table_geometry, device) : 0u;
+        if (table_bytes > std::numeric_limits<size_t>::max() - page_bytes)
+            throw std::overflow_error("Recorded page/table BOM overflows");
+        const auto bytes = page_bytes + table_bytes;
         PhysicalMemoryPlanBuilder plan;
         plan.add({.world_rank=0, .device=device, .total_bytes=bytes, .admission_available_bytes=bytes},
             PhysicalMemoryOwner::KVCache, bytes);
         authority_ = std::make_shared<PhysicalMemoryAuthority>(
             std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()), 0);
         pool_ = authority_->createCPUPagePool(device, geometry, CPUStoragePlacement::local());
+        if (table_geometry) table_ = CPUFP32PagedKVTable::create(authority_, device, *table_geometry);
     }
     /** @brief Execute a recorded command, returning only actual observed results. */
     std::string execute(const std::string &command)
@@ -177,9 +186,79 @@ public:
             if (!(input >> name) || pages_.erase(name) != 1) fail();
             outcome = "released";
         }
+        else if (kind == "discard")
+        {
+            size_t ordinal;
+            if (!(input >> name >> ordinal) || !requests_.contains(name)) fail();
+            auto &grant = requests_.at(name);
+            if (ordinal >= grant.assignedFrames().size()) fail();
+            grant.discardFrame(grant.assignedFrames()[ordinal]);
+            outcome = std::to_string(grant.remainingCommitment());
+        }
+        else if (kind == "remaining")
+        {
+            if (!(input >> name) || !requests_.contains(name)) fail();
+            outcome = std::to_string(requests_.at(name).remainingCommitment());
+        }
+        else if (kind == "table-begin")
+        {
+            if (!(input >> name) || !table_ || updates_.contains(name)) fail();
+            auto update = table_->tryBeginUpdate();
+            outcome = update ? "ready" : "busy";
+            if (update) updates_.emplace(name, std::move(*update));
+        }
+        else if (kind == "table-append")
+        {
+            std::string page; int heads, dimension;
+            if (!(input >> name >> page >> heads >> dimension) || !updates_.contains(name) || !pages_.contains(page)) fail();
+            updates_.at(name).append(CPUFP32KVPage(std::move(pages_.at(page)), heads, dimension));
+            pages_.erase(page);
+            outcome = "attached";
+        }
+        else if (kind == "table-commit")
+        {
+            std::string snapshot;
+            if (!(input >> name >> snapshot) || !updates_.contains(name) || snapshots_.contains(snapshot)) fail();
+            snapshots_.emplace(snapshot, updates_.at(name).commit());
+            updates_.erase(name);
+            outcome = std::to_string(snapshots_.at(snapshot).version());
+        }
+        else if (kind == "table-borrow")
+        {
+            std::string source;
+            if (!(input >> name >> source) || snapshots_.contains(name) || !snapshots_.contains(source)) fail();
+            auto borrow = snapshots_.at(source).tryBorrow();
+            outcome = borrow ? "accepted" : "refused";
+            if (borrow) snapshots_.emplace(name, std::move(*borrow));
+        }
+        else if (kind == "table-close")
+        {
+            if (!(input >> name) || !table_ || !snapshots_.contains(name)) fail();
+            table_->closeBorrowers(snapshots_.at(name));
+            outcome = "closed";
+        }
+        else if (kind == "table-read")
+        {
+            if (!(input >> name) || !snapshots_.contains(name)) fail();
+            const auto &snapshot = snapshots_.at(name);
+            const auto view = snapshot.view();
+            outcome = std::to_string(snapshot.version()) + ":" + std::to_string(view.rows()) + ":" +
+                std::to_string(view.key(0, 0)[0]) + ":" + std::to_string(view.value(0, 0)[0]);
+        }
+        else if (kind == "table-drop")
+        {
+            if (!(input >> name) || snapshots_.erase(name) != 1) fail();
+            outcome = "retired";
+        }
+        else if (kind == "table-abort")
+        {
+            if (!(input >> name) || updates_.erase(name) != 1) fail();
+            outcome = "aborted";
+        }
         else if (kind == "end")
         {
-            if (!requests_.empty() || !pins_.empty() || !plans_.empty() || !pages_.empty() || !reads_.empty()) fail();
+            if (!requests_.empty() || !pins_.empty() || !plans_.empty() || !pages_.empty() || !reads_.empty() ||
+                !updates_.empty() || !snapshots_.empty()) fail();
             outcome = "idle";
         }
         else fail();
@@ -192,11 +271,14 @@ private:
     [[noreturn]] static void fail() { throw std::invalid_argument("Invalid private-page replay command/state"); }
     std::shared_ptr<PhysicalMemoryAuthority> authority_;
     std::shared_ptr<PhysicalPagePool> pool_;
+    std::shared_ptr<CPUFP32PagedKVTable> table_;
     std::map<std::string, PhysicalPagePool::Grant> requests_;
     std::map<std::string, PhysicalPagePool::FramePin> pins_;
     std::map<std::string, PhysicalPagePool::AppendPlan> plans_;
     std::map<std::string, PhysicalPagePool::CommittedPage> pages_;
     std::map<std::string, PhysicalPagePool::ReadAccess> reads_;
+    std::map<std::string, CPUFP32PagedKVTable::Update> updates_;
+    std::map<std::string, CPUFP32PagedKVTable::Snapshot> snapshots_;
 };
 
 /** @brief Parse an explicitly versioned complete trace and compare the production authority's observations. */
@@ -208,10 +290,23 @@ void replay(std::istream &input)
     std::string version, initial, extra;
     PhysicalPagePoolGeometry geometry;
     if (!(geometry_line >> version >> geometry.frames >> geometry.frame_bytes >> geometry.request_records >>
-        geometry.max_pages_per_request >> initial) || version != "pma-private-pages-v1" ||
-        initial != "empty-zero-generations" || (geometry_line >> extra))
+        geometry.max_pages_per_request >> initial) ||
+        (version != "pma-private-pages-v1" && version != "pma-private-pages-v2") || initial != "empty-zero-generations")
         throw std::invalid_argument("Incompatible private-page trace initial state");
-    PrivatePageReplay runner(geometry);
+    std::optional<CPUFP32PagedKVTableGeometry> table;
+    if (version == "pma-private-pages-v2")
+    {
+        CPUFP32PagedKVTableGeometry parsed;
+        std::string tag, state, codec;
+        if (!(geometry_line >> tag >> parsed.page_capacity >> parsed.bank_count >> parsed.readers_per_bank >>
+            parsed.page_tokens >> state >> codec) || tag != "table" || state != "empty-zero-versions" ||
+            codec != "fp32-le" || std::endian::native != std::endian::little)
+            throw std::invalid_argument("Incompatible native table initial state or byte order");
+        parsed.validate();
+        table = parsed;
+    }
+    if (geometry_line >> extra) throw std::invalid_argument("Trailing page/table geometry");
+    PrivatePageReplay runner(geometry, table);
     std::string line;
     bool ended = false;
     while (std::getline(input, line))
@@ -262,6 +357,57 @@ TEST(PhysicalMemoryAuthority, PagePoolRecordedUnpublishedOwnershipReplay)
     EXPECT_NO_THROW(replay(appended));
     std::istringstream readers(llaminar2::test::privatePageReaderTrace);
     EXPECT_NO_THROW(replay(readers));
+}
+
+/** @test Recorded immutable table banks, late borrowers and private-frame return replay through real owners. */
+TEST(PhysicalMemoryAuthority, PagePoolRecordedTableBanksReplayExactly)
+{
+    if (const char *record = std::getenv("LLAMINAR_RECORD_PRIVATE_TABLE_TRACE"))
+    {
+        std::ofstream output(record);
+        ASSERT_TRUE(output.good());
+        output << "pma-private-pages-v2 3 128 4 3 empty-zero-generations table 1 2 2 2 empty-zero-versions fp32-le\n";
+        PrivatePageReplay runner({3, 128, 4, 3}, CPUFP32PagedKVTableGeometry{1, 2, 2, 2});
+        for (const std::string command : {"admit A 2", "assign A", "plan W A 0 32",
+            "copy W 0000803f00000040000030410000404100004040000080400000504100006041", "commit W P",
+            "table-begin U", "table-append U P 1 2", "table-commit U S", "table-borrow B S",
+            "table-begin U2", "assign A", "plan W2 A 1 32",
+            "copy W2 0000a0400000c04000007041000080410000e040000000410000884100009041", "commit W2 P2",
+            "table-append U2 P2 1 2", "table-commit U2 T", "table-begin Busy", "table-close S", "table-drop S",
+            "table-borrow C B", "table-read B", "table-drop B", "table-begin Abort", "table-abort Abort",
+            "table-begin U3", "discard A 0", "remaining A", "assign A", "plan W3 A 1 32",
+            "copy W3 0000803f00000040000030410000404100004040000080400000504100006041", "commit W3 P3",
+            "table-append U3 P3 1 2", "table-commit U3 New", "table-read New", "table-read T",
+            "table-drop T", "table-drop New", "drop-request A", "admit Hold 1", "assign Hold",
+            "pin H Hold 0", "discard Hold 0", "remaining Hold", "drop-request Hold", "admit Replace 1",
+            "remaining Replace", "drop-pin H", "remaining Replace", "assign Replace", "drop-request Replace", "end"})
+            output << command << " | " << runner.execute(command) << '\n';
+        output.close(); ASSERT_TRUE(output.good());
+        std::ifstream captured(record);
+        EXPECT_NO_THROW(replay(captured));
+        return;
+    }
+    std::istringstream input(llaminar2::test::privatePageTableTrace);
+    EXPECT_NO_THROW(replay(input));
+}
+
+/** @test Table replay rejects invented version/credit observations and absent initial/terminal state. */
+TEST(PhysicalMemoryAuthority, PagePoolTableReplayRejectsAlteredStateAndObservations)
+{
+    for (const auto &[original, changed] : std::vector<std::pair<std::string, std::string>>{
+        {"table-commit U3 New | 4", "table-commit U3 New | 3"},
+        {"table-borrow C B | refused", "table-borrow C B | accepted"},
+        {"remaining Replace | 1", "remaining Replace | 2"},
+        {"empty-zero-versions", "missing-table-state"},
+        {"end | idle\n", ""}})
+    {
+        std::string corrupt(llaminar2::test::privatePageTableTrace);
+        const auto position = corrupt.find(original);
+        ASSERT_NE(position, std::string::npos);
+        corrupt.replace(position, original.size(), changed);
+        std::istringstream input(corrupt);
+        EXPECT_THROW(replay(input), std::exception);
+    }
 }
 
 /** @test Incomplete and incompatible recordings are rejected before inventing observations. */

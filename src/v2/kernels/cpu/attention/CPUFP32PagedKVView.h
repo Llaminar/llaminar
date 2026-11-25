@@ -70,6 +70,8 @@ public:
     }
     CPUFP32KVPage(const CPUFP32KVPage &) = delete;
     CPUFP32KVPage &operator=(const CPUFP32KVPage &) = delete;
+    /** @return Original PMA issuer; table publication rejects foreign instance ownership. */
+    const PhysicalMemoryAuthority *issuer() const noexcept { return publication_.issuer(); }
     /** @return Exact interleaved K/V byte bank for whole-invocation bounds/alias admission. */
     std::span<const std::byte> storage() const noexcept
     {
@@ -95,6 +97,9 @@ public:
         return key(row, head) + row_width_;
     }
 private:
+    friend class CPUFP32PagedKVTable;
+    /** @brief Empty metadata cell, constructible only by the bounded page-table owner. */
+    CPUFP32KVPage() noexcept = default;
     /** @brief Reject attempts to address another request, page padding or invalid head. */
     void require(int row, int head) const
     {

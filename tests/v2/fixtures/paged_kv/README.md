@@ -36,6 +36,25 @@ causality, native access/transfer completion and GPU traces remain separate
 future requirements. The raw-byte publication trace does not qualify a native
 KV codec, append kernel or attention consumer.
 
+## Bounded CPU table-controller recording
+
+`private_tables_v2.txt` records actual PMA/page-table inputs and observations:
+explicit empty request/frame/bank generations, native little-endian FP32 bytes,
+two immutable versions, bank pressure, bounded borrowers, closure and original
+referent reads after publisher retirement. Aborted preparation burns version3;
+the next publication is version4. Private-frame return converts occupied storage
+to the original live request's growth only on real final-pin retirement. A later
+panel retires the original request, reuses its request record and verifies an old
+pin completion does not credit the replacement.
+
+Capture: `CB-checkpoints/paged-table-controller-recording-r2.2EQ6hF`. This extends
+`paged-table-controller-recording.orSXd3` with request-record reuse, not changed
+expectations for old inputs. All v1 fixtures remain unchanged. Explicit capture
+requires `LLAMINAR_RECORD_PRIVATE_TABLE_TRACE`; ordinary replay never writes
+expected observations. Altered version/credit/borrower observations and missing
+initial/terminal state are rejected. This is controller/native-address replay,
+not attention-output, model, COW, transfer or serving-admission qualification.
+
 ## Native FP32 attention recording
 
 `attention_fp32_v1.txt` records actual query/key/value bit patterns, initial

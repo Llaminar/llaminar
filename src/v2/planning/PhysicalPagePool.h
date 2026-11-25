@@ -105,6 +105,8 @@ public:
         CommittedPage &operator=(const CommittedPage &) = delete;
         /** @return Only the completed valid byte extent, never unwritten capacity. */
         std::span<const std::byte> read() const;
+        /** @return Original allocation/suballocation issuer identity, never a free-capacity observation. */
+        const PhysicalMemoryAuthority *issuer() const noexcept;
         /** @brief Register one new consumer before view closure or request retirement. */
         ReadAccess registerRead() const;
         /** @return The immutable content version; aborted write versions are never reused. */
@@ -160,13 +162,15 @@ public:
         bool valid() const noexcept { return pool_ != nullptr; }
         /** @brief Convert protected growth into one private frame without a physical allocation. */
         FrameHandle assignFrame();
+        /** @brief Retire one private frame, restoring protected growth only after its last borrower completes. */
+        void discardFrame(FrameHandle handle);
         /** @brief Retain an original private frame without exposing payload or readiness. */
         FramePin pinFrame(FrameHandle handle);
         /** @brief Prepare an exact private append, or defer while an existing borrower pins the frame. */
         std::optional<AppendPlan> prepareAppend(FrameHandle handle, std::size_t bytes);
         /** @brief Freeze admission of new readers before joining the existing access frontier. */
         void closeReaders(FrameHandle handle);
-        /** @return Assigned frame identities in logical append order, never physical stride order. */
+        /** @return Current private frame grants in issuance order, not a request's logical KV table. */
         std::span<const FrameHandle> assignedFrames() const;
         /** @return Remaining guaranteed private growth for this unpublished request. */
         std::size_t remainingCommitment() const;
@@ -216,6 +220,8 @@ private:
     {
         std::uint64_t generation = 0;
         std::size_t record = 0;
+        std::uint64_t request_generation = 0;
+        bool return_commitment = false;
         std::size_t pins = 0;
         std::uint64_t next_content_version = 0;
         std::uint64_t committed_version = 0;
@@ -236,6 +242,9 @@ private:
     FrameHandle assign(const Grant &grant);
     FramePin pin(const Grant &grant, FrameHandle handle);
     void unpin(FrameHandle handle) noexcept;
+    /** @brief Return one actually retired frame to its original live request's fungible growth, or to free capacity. */
+    void reclaim(Frame &frame) noexcept;
+    void discard(const Grant &grant, FrameHandle handle);
     std::optional<AppendPlan> prepareAppend(const Grant &grant, FrameHandle handle, std::size_t bytes);
     Frame &requireFrame(FrameHandle handle);
     ReadAccess registerRead(const CommittedPage &page);

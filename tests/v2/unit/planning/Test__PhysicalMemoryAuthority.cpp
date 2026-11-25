@@ -95,6 +95,56 @@ TEST(PhysicalMemoryAuthority, PagePoolUnpublishedCommitmentLifecycle)
         PhysicalMemoryMaterializationKind::NewAllocation), 0u);
 }
 
+/** @test Actual private-frame retirement restores only its original live commitment, never a reused record. */
+TEST(PhysicalMemoryAuthority, PagePoolPrivateFrameReturnIsGenerationQualified)
+{
+    const auto device = DeviceId::cpu();
+    for (const bool reuse_request_record : {false, true})
+    {
+        const PhysicalPagePoolGeometry geometry{3, 128, 1, reuse_request_record ? 1u : 2u};
+        const auto bytes = PhysicalPagePool::physicalBytes(geometry, device);
+        PhysicalMemoryPlanBuilder plan;
+        plan.add(resource(0, device, bytes, bytes), PhysicalMemoryOwner::KVCache, bytes);
+        auto authority = std::make_shared<PhysicalMemoryAuthority>(
+            std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()), 0);
+        auto pool = authority->createCPUPagePool(device, geometry, CPUStoragePlacement::local());
+        auto original = pool->tryAdmit(geometry.max_pages_per_request);
+        ASSERT_TRUE(original);
+        const auto retired = original->assignFrame();
+        auto pin = original->pinFrame(retired);
+        original->discardFrame(retired);
+        EXPECT_TRUE(original->assignedFrames().empty());
+        EXPECT_THROW(original->discardFrame(retired), std::logic_error);
+        EXPECT_THROW(original->pinFrame(retired), std::logic_error);
+        if (reuse_request_record)
+        {
+            original.reset();
+            auto replacement = pool->tryAdmit(1);
+            ASSERT_TRUE(replacement);
+            EXPECT_EQ(replacement->remainingCommitment(), 1u);
+            pin = {};
+            EXPECT_EQ(replacement->remainingCommitment(), 1u); // Old generation cannot credit this record.
+            const auto fresh = replacement->assignFrame();
+            EXPECT_EQ(fresh.index, retired.index);
+            EXPECT_GT(fresh.generation, retired.generation);
+            EXPECT_EQ(replacement->remainingCommitment(), 0u);
+        }
+        else
+        {
+            EXPECT_EQ(original->remainingCommitment(), 1u); // One frame is still occupied by the original pin.
+            const auto peer = original->assignFrame();
+            EXPECT_NE(peer.index, retired.index);
+            EXPECT_THROW(original->assignFrame(), std::logic_error);
+            pin = {};
+            EXPECT_EQ(original->remainingCommitment(), 1u);
+            const auto fresh = original->assignFrame();
+            EXPECT_EQ(fresh.index, retired.index);
+            EXPECT_GT(fresh.generation, retired.generation);
+            EXPECT_EQ(original->remainingCommitment(), 0u);
+        }
+    }
+}
+
 /** @test Native FP32 operands address the actual permuted frames and partial live tail without gathering. */
 TEST(PhysicalMemoryAuthority, PagePoolFP32OperandsUseLogicalPagesNotPhysicalStride)
 {

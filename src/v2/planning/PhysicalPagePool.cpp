@@ -167,6 +167,8 @@ PhysicalPagePool::FrameHandle PhysicalPagePool::assign(const Grant &grant)
         auto &request = requests_[grant.record_];
         ++frame.generation;
         frame.record = grant.record_;
+        frame.request_generation = grant.generation_;
+        frame.return_commitment = false;
         frame.valid_bytes = 0;
         frame.committed_version = 0;
         frame.readers_closed = false;
@@ -189,7 +191,7 @@ void PhysicalPagePool::release(const Grant &grant) noexcept
         {
             auto &frame = frames_[handle.index];
             if (handle.pool_identity != pool_identity_ || !frame.owned ||
-                frame.record != grant.record_ || frame.generation != handle.generation)
+                frame.record != grant.record_ || frame.request_generation != grant.generation_ || frame.generation != handle.generation)
                 std::terminate();
             if (frame.pins)
                 frame.retiring = true;
@@ -211,7 +213,8 @@ PhysicalPagePool::FramePin PhysicalPagePool::pin(const Grant &grant, FrameHandle
     if (handle.pool_identity != pool_identity_ || handle.index >= frames_.size())
         throw std::logic_error("Private frame pin belongs to a foreign pool");
     auto &frame = frames_[handle.index];
-    if (!frame.owned || frame.retiring || frame.writer || frame.record != grant.record_ || frame.generation != handle.generation)
+    if (!frame.owned || frame.retiring || frame.writer || frame.record != grant.record_ ||
+        frame.request_generation != grant.generation_ || frame.generation != handle.generation)
         throw std::logic_error("Private frame pin is stale, retiring or owned by another request");
     if (frame.pins == std::numeric_limits<std::size_t>::max())
         throw std::overflow_error("Private frame pin count exhausted");
@@ -228,12 +231,46 @@ void PhysicalPagePool::unpin(FrameHandle handle) noexcept
     if (!frame.owned || frame.generation != handle.generation || !frame.pins)
         std::terminate();
     --frame.pins;
-    if (!frame.pins && frame.retiring)
+    if (!frame.pins && frame.retiring) reclaim(frame);
+}
+
+void PhysicalPagePool::reclaim(Frame &frame) noexcept
+{
+    if (!frame.owned || !frame.retiring || frame.pins || frame.writer || !protected_pages_)
+        std::terminate();
+    auto &original = requests_[frame.record];
+    if (frame.return_commitment && original.live && original.generation == frame.request_generation)
     {
-        frame.owned = false;
-        frame.retiring = false;
-        --protected_pages_;
+        if (original.remaining >= geometry_.max_pages_per_request) std::terminate();
+        ++original.remaining; // Occupied -> unconverted promise: protected_pages_ is unchanged.
     }
+    else
+        --protected_pages_; // The original request retired; no later incarnation receives its promise.
+    frame.owned = false;
+    frame.retiring = false;
+    frame.return_commitment = false;
+}
+
+void PhysicalPagePool::discard(const Grant &grant, FrameHandle handle)
+{
+    (void)require(grant);
+    auto &frame = requireFrame(handle);
+    if (frame.record != grant.record_ || frame.request_generation != grant.generation_ || frame.retiring || frame.writer)
+        throw std::logic_error("Page discard lacks its original private request owner");
+    auto &request = requests_[grant.record_];
+    const size_t base = grant.record_ * geometry_.max_pages_per_request;
+    size_t ordinal = 0;
+    while (ordinal < request.assigned && request_frames_[base + ordinal] != handle) ++ordinal;
+    if (ordinal == request.assigned) throw std::logic_error("Page discard has no original frame grant");
+    // Remove only allocation ownership metadata. A versioned native KV table
+    // separately owns logical order and its readers still pin the old referent.
+    for (size_t next = ordinal + 1; next < request.assigned; ++next)
+        request_frames_[base + next - 1] = request_frames_[base + next];
+    --request.assigned;
+    frame.retiring = true;
+    frame.return_commitment = true;
+    frame.readers_closed = true;
+    if (!frame.pins) reclaim(frame);
 }
 
 PhysicalPagePool::Frame &PhysicalPagePool::requireFrame(FrameHandle handle)
@@ -251,7 +288,8 @@ std::optional<PhysicalPagePool::AppendPlan> PhysicalPagePool::prepareAppend(
 {
     (void)require(grant);
     auto &frame = requireFrame(handle);
-    if (frame.record != grant.record_ || frame.retiring || !bytes || bytes > geometry_.frame_bytes - frame.valid_bytes)
+    if (frame.record != grant.record_ || frame.request_generation != grant.generation_ ||
+        frame.retiring || !bytes || bytes > geometry_.frame_bytes - frame.valid_bytes)
         throw std::invalid_argument("Page append lacks private ownership or exceeds its exact writable extent");
     if (frame.writer || frame.pins) return std::nullopt;
     if (frame.next_content_version == std::numeric_limits<std::uint64_t>::max())
@@ -398,6 +436,11 @@ std::span<const std::byte> PhysicalPagePool::CommittedPage::read() const
         throw std::logic_error("Page read uses an incomplete or obsolete content publication");
     return {pool_->backing_.data() + handle_.index * pool_->geometry_.frame_bytes, bytes_};
 }
+const PhysicalMemoryAuthority *PhysicalPagePool::CommittedPage::issuer() const noexcept
+{
+    return pool_ ? pool_->authority_.get() : nullptr;
+}
+
 PhysicalPagePool::ReadAccess PhysicalPagePool::CommittedPage::registerRead() const
 {
     if (!pool_) throw std::logic_error("Page registration uses an empty publication");
@@ -454,6 +497,12 @@ PhysicalPagePool::FrameHandle PhysicalPagePool::Grant::assignFrame()
     if (!pool_) throw std::logic_error("Page assignment uses an empty grant");
     return pool_->assign(*this);
 }
+void PhysicalPagePool::Grant::discardFrame(FrameHandle handle)
+{
+    if (!pool_) throw std::logic_error("Page discard uses an empty grant");
+    pool_->discard(*this, handle);
+}
+
 PhysicalPagePool::FramePin PhysicalPagePool::Grant::pinFrame(FrameHandle handle)
 {
     if (!pool_) throw std::logic_error("Private frame pin uses an empty grant");
@@ -471,7 +520,7 @@ void PhysicalPagePool::Grant::closeReaders(FrameHandle handle)
     if (!pool_) throw std::logic_error("Page closure uses an empty grant");
     (void)pool_->require(*this);
     auto &frame = pool_->requireFrame(handle);
-    if (frame.record != record_ || frame.retiring || frame.writer)
+    if (frame.record != record_ || frame.request_generation != generation_ || frame.retiring || frame.writer)
         throw std::logic_error("Page closure has no original private owner");
     frame.readers_closed = true;
 }

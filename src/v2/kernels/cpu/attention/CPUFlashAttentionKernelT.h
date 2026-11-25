@@ -41,6 +41,7 @@
 
 #pragma once
 #include "CPUFP32PagedKVView.h"
+#include "CPUFP32PagedKVTable.h"
 
 #include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "../../../execution/config/RuntimeConfig.h"
@@ -1819,6 +1820,32 @@ namespace llaminar2
             return compute_flash_fp32<true>(query.data(), nullptr, nullptr, output.data(), query_rows, pages.rows(),
                 query_heads, pages.heads(), pages.dimension(), causal, window_size, position_offset,
                 nullptr, head_start, gqa_n_rep, policy, {}, &pages);
+        }
+
+        /**
+         * @brief Execute native paged attention while an immutable table-bank snapshot retains every referent.
+         * @param query Exact original FP32 query bank.
+         * @param snapshot Original version/borrower retaining stable table and page storage through this call.
+         * @param output Exact disjoint output bank.
+         * @param query_rows Live query positions.
+         * @param query_heads Local query heads.
+         * @param causal Preserve the original causal policy.
+         * @param window_size Sliding window, or zero/unlimited.
+         * @param position_offset Absolute first query position.
+         * @param head_start Original TP query-head offset.
+         * @param gqa_n_rep Original TP GQA ratio, or zero to derive it.
+         * @param policy Original arithmetic/parallel policy, unchanged by table version.
+         * @return Whether the exact admitted CPU operation completed.
+         */
+        bool compute_paged_snapshot_fp32(std::span<const float> query,
+            const CPUFP32PagedKVTable::Snapshot &snapshot, std::span<float> output,
+            int query_rows, int query_heads, bool causal, int window_size = 0,
+            int position_offset = 0, int head_start = 0, int gqa_n_rep = 0,
+            const attention::AttentionExecutionPolicy &policy = {})
+        {
+            const auto view = snapshot.view();
+            return compute_paged_fp32(query, view, output, query_rows, query_heads, causal,
+                window_size, position_offset, head_start, gqa_n_rep, policy);
         }
 
         // Allow parity tests to call private static helpers directly

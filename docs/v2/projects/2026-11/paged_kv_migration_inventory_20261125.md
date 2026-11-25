@@ -256,6 +256,78 @@ Unit58, PMA Unit148, operand geometry, native paged byte comparison and recorded
 kernel replay (five registrations). No throughput or latency win is asserted. These results do
 not qualify P1/P2 exits or the default inference path.
 
+## Bounded CPU native table banks (in progress)
+
+`CPUFP32PagedKVTable.*` now materializes exact PMA-owned native page-object
+cells and bounded bank metadata through `CPUStorageRoot`. Attachments authenticate the original PMA instance before
+consuming a page; foreign-instance refusal preserves the supplied page owner.
+Unpublished updates
+cannot expose views; commit validates complete page geometry before publishing
+an immutable snapshot. Snapshot versions are monotonic across all banks,
+including aborted prepares. Banks and their actual page referents remain owned
+until the last bounded snapshot borrower retires; no update allocates metadata
+or copies a retained KV history.
+
+The table authority can close an exact version to new borrowers before joining
+its frontier. Existing snapshots remain readable after closure; a released
+publisher does not authorize metadata reuse while another original borrower
+survives. Native attention has an explicit snapshot-retaining entry point so
+its synchronous operation retains a stable bank and every page publication.
+This is CPU actor ownership, not GPU access/event or topology publication.
+
+Native lifecycle tests exercise old/new bank outputs (4, 9 and 7) through the
+actual optimized attention, two-bank exhaustion, reader limits, closure after
+registration, aborted-version nonreuse, final PMA release, and one-byte-short
+metadata rollback for bank counts 1/3/5. CPU attention Unit60 and explicit table
+lifecycle preflight pass at `CB-checkpoints/paged-fp32-table-closure.YPd5as`.
+These are lifecycle/geometry tests, not recorded table-controller replay.
+
+Independent acceptance and full qualification are pending. Empty-history lifecycle tables, operation-specific causal
+views, sharing/COW/reference liabilities, request-generation binding, atomic
+page/table multi-class prepare/commit, native append, transfer frontiers remain open. Recorded table-controller replay now covers the
+bounded private subset below. No P1/P2 exit or serving capacity is
+qualified by this bounded CPU subset.
+
+## Private-frame return before native append (in progress)
+
+`PhysicalPagePool::Grant::discardFrame` now retires an original private frame
+and removes only its allocation-ownership record, not a request's logical KV
+table. Unused growth is restored only after the actual final pin retires. This
+converts occupied capacity back into the original request's unconverted promise
+without a second physical allocation or a duplicate debit. Pending retirement
+cannot be used as immediately assignable growth.
+
+Each frame records its original request generation. If that request retires
+and its record is reused before the last old pin completes, the old completion
+returns the frame to free capacity rather than crediting the replacement's
+promise. Frame/pool generations still authenticate physical reuse independently.
+This is required for bounded private-tail replacement; shared immutable prefix
+adoption/COW liability policy is not implemented by this operation.
+
+Complete PMA Unit149, CPU attention Unit60, seven page contracts, existing
+private replay and table lifecycle pass at
+`CB-checkpoints/paged-private-frame-return.5eNoVO`. The focused new test checks
+pending-pin refusal, occupied-to-growth conversion, private frame reuse and no
+credit to a reused request record. Actual native append remains open; these
+changes are an implementation checkpoint, not accepted serving support.
+
+### Recorded table/controller inputs
+
+`private_tables_v2.txt` retains native FP32 input bytes, pool/table geometry,
+empty request/frame/bank incarnations, borrower pressure and observed decisions
+from the actual PMA/table implementations. It covers two simultaneous versions,
+closed-version late refusal after publisher retirement, actual original page
+reads, aborted version3 followed by publication4, real frame retirement and
+reuse, and no credit to a replacement after the original request record retires.
+Capture evidence is `paged-table-controller-recording-r2.2EQ6hF`; it extends the
+retained first capture `paged-table-controller-recording.orSXd3` with the
+request-record reuse panel, not a changed expected result for an old input.
+Ordinary replay uses embedded observations and never writes new expectations.
+The grammar rejects incompatible initial bank state, missing terminal state and
+altered version, borrower or growth-credit observations. This is recorded
+controller/native-address replay, not a model inference trace or Release economy
+qualification.
+
 ## Independent findings carried into P0/P1
 
 | Finding | Required resolution |
