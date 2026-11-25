@@ -83,6 +83,7 @@
 #include "../../moe/MoERebalanceController.h"
 #include "../../moe/RoutedExpertOwnerAssignment.h"
 #include "../../mtp/MTPCheckpointPolicy.h"
+#include "../../mtp/MTPForwardConstruction.h"
 #include "../../mtp/MTPDeviceGenerationPolicy.h"
 #include "../../mtp/MTPServingForwardCaptureGeometry.h"
 #include "../../mtp/MTPSpecKVPublisher.h"
@@ -25101,7 +25102,8 @@ namespace llaminar2
         int draft_condition_ready_stride,
         int device_position_offset,
         int first_seq_idx,
-        DeviceGraphExecutor::GraphInitialSubmissionPolicy submission)
+        DeviceGraphExecutor::GraphInitialSubmissionPolicy submission,
+        const std::vector<int> *request_kv_slots)
     {
         if (state_.device_id.is_gpu() && !mtp_graph_owner_plan_.ownsControllerExecutables())
         {
@@ -25551,6 +25553,7 @@ namespace llaminar2
         input.batch_size = request_batch;
         input.seq_len = token_count;
         input.first_sequence_index = first_seq_idx;
+        input.request_kv_slots = request_kv_slots;
         input.device_state_publication_stream =
             state_.device_id.is_gpu()
                 ? explicitGPUStreamForOperation(
@@ -25567,6 +25570,7 @@ namespace llaminar2
         input.device = state_.device_id;
         input.terminal_hidden_buffer_id = terminal_hidden_buffer_id;
         input.kv_cache_only = kv_cache_only;
+        validateMTPRequestKVSlots(input);
 
         const uint64_t current_moe_placement_epoch = moePlacementEpoch();
         const bool sidecar_moe_epoch_sensitive = mtp_moe_sidecar && !kv_cache_only;
@@ -25579,7 +25583,9 @@ namespace llaminar2
         const bool graph_shape_changed =
             sidecar_cache.seq_len != token_count ||
             sidecar_cache.batch_size != request_batch ||
-            sidecar_cache.first_seq_idx != first_seq_idx;
+            sidecar_cache.first_seq_idx != first_seq_idx ||
+            (request_kv_slots ? sidecar_cache.request_kv_slots != *request_kv_slots
+                              : !sidecar_cache.request_kv_slots.empty());
         const bool token_binding_changed =
             sidecar_cache.uses_device_token_ids != use_device_condition_tokens ||
             sidecar_cache.condition_token_slot != condition_token_slot ||
@@ -25640,6 +25646,7 @@ namespace llaminar2
             sidecar_cache.seq_len = token_count;
             sidecar_cache.batch_size = request_batch;
             sidecar_cache.first_seq_idx = first_seq_idx;
+            sidecar_cache.request_kv_slots = request_kv_slots ? *request_kv_slots : std::vector<int>{};
             sidecar_cache.uses_device_token_ids = use_device_condition_tokens;
             sidecar_cache.uses_device_position_ids = use_device_position_ids;
             sidecar_cache.condition_token_slot = condition_token_slot;

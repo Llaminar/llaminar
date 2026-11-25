@@ -74,6 +74,27 @@ gauges or economy evidence.
   full backend/model qualification and measured Release economy. The earlier
   full AVX512 gate remains FAIL; full AVX2 qualification remains pending.
 
+## CPU MTP slot-mapping groundwork
+
+- Sidecar inputs carry validated explicit CPU resident-KV-slot mappings. Shared
+  graph-construction scopes restore row maps and live lengths, preventing a
+  sidecar from borrowing stale main-forward bindings.
+- CPU sidecar cache identity includes the complete copied map. Native execution
+  checks unchanged-map reuse and changed-map/contiguous transitions against
+  physical cache contents and cache hit/miss counters. This does not establish
+  GPU capture identity or enable continuous MTP serving.
+- CPU attention diagnostic metadata describes each actual cache slot's live
+  extent instead of multiplying a single slot-zero view by batch width.
+- Focused results: all 101 MTP graph tests and the explicit three-test
+  `V2_Integration_MTPServingSlotMappingLifecycle` registration pass. Dense/prefix
+  serving passed 12/12 before the subsequent private sidecar-cache extension.
+  Evidence: `CB-checkpoints/mtp-slot-cache-native-r3.IgTgxD`, with earlier
+  diagnostic failures preserved. These are implementation-checkpoint results,
+  not independent milestone acceptance or full qualification.
+- Next: slot-owned terminal-hidden publication, shifted predictor KV state,
+  independent sampling/depth and shared verifier transactions. No MTP capability
+  advertisement changes in this checkpoint.
+
 ## Next
 
 1. Migrate S = 1 onto serving rows and retire the scalar serving path once rows

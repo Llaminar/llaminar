@@ -358,6 +358,12 @@ namespace llaminar2
           cpu_grouped_kv_logical_views_(
               static_cast<size_t>(std::max(0, params_.batch_size)))
     {
+        if (params_.device_id.is_cpu() && params_.kv_cache)
+            for (int row = 0; row < params_.batch_size; ++row)
+            {
+                cpu_cache_k_dump_names_.push_back(params_.batch_size == 1 ? "K" : "K_request_" + std::to_string(row));
+                cpu_cache_v_dump_names_.push_back(params_.batch_size == 1 ? "V" : "V_request_" + std::to_string(row));
+            }
         const auto &key_cache_policy = params_.execution_policy.key_cache;
         if (key_cache_policy.transformsOnRead())
         {
@@ -2103,37 +2109,34 @@ namespace llaminar2
             debugEnv().attention.debug_effective_kv_snapshot &&
             debugEnv().attention.debugEffectiveKVSnapshotLayerSelected(params_.layer_idx))
             prepareEffectiveKVDumpStorage();
-        if (debug_effective_k_tensor_ && debug_effective_v_tensor_)
+        if (params_.kv_cache && params_.layer_idx >= 0 && params_.device_id.is_cpu())
+        {
+            // A cache view owns one sequence, not batch_size sequences.
+            // Describe every actual owner separately, including noncontiguous
+            // serving slots and unequal live cache lengths.
+            dump_K = nullptr;
+            dump_V = nullptr;
+            total_kv_tokens = 0;
+            for (int row = 0; row < params_.batch_size; ++row)
+            {
+                const int slot = params_.request_kv_slots_host.empty() ? row : params_.request_kv_slots_host.at(row);
+                if (params_.kv_cache->get_cached_tokens(params_.layer_idx, slot) == 0)
+                    continue;
+                ITensor *cache_k = nullptr;
+                ITensor *cache_v = nullptr;
+                int length = 0;
+                if (!params_.kv_cache->get_kv(params_.layer_idx, slot, &cache_k, &cache_v, &length) ||
+                    !cache_k || !cache_v || length <= 0)
+                    throw std::logic_error("CPU attention diagnostic cache owner has no live view");
+                info.addInput(cpu_cache_k_dump_names_.at(row).c_str(), cache_k, length, params_.n_kv_heads * params_.head_dim);
+                info.addInput(cpu_cache_v_dump_names_.at(row).c_str(), cache_v, length, params_.n_kv_heads * params_.head_dim);
+            }
+        }
+        else if (debug_effective_k_tensor_ && debug_effective_v_tensor_)
         {
             dump_K = debug_effective_k_tensor_;
             dump_V = debug_effective_v_tensor_;
             total_kv_tokens = debug_effective_k_rows_;
-        }
-        else if (params_.kv_cache && params_.layer_idx >= 0 &&
-                 !params_.device_id.is_gpu())
-        {
-            const int cached_tokens = params_.kv_cache->get_cached_tokens(params_.layer_idx, 0);
-            const bool should_read_cache = cached_tokens > 0;
-
-            if (should_read_cache)
-            {
-                ITensor *cache_k = nullptr;
-                ITensor *cache_v = nullptr;
-                int cache_kv_len = 0;
-                if (params_.kv_cache->get_kv(params_.layer_idx, 0, &cache_k, &cache_v, &cache_kv_len) &&
-                    cache_k && cache_v && cache_kv_len > 0)
-                {
-                    dump_K = cache_k;
-                    dump_V = cache_v;
-                    total_kv_tokens = static_cast<size_t>(params_.batch_size * cache_kv_len);
-                }
-                else if (cache_kv_len == 0)
-                {
-                    dump_K = nullptr;
-                    dump_V = nullptr;
-                    total_kv_tokens = 0;
-                }
-            }
         }
 
         if (params_.Q)

@@ -2269,17 +2269,8 @@ namespace llaminar2
             *this,
             input.execution_phase);
         DecodeReplicatedDenseScope decode_dense_scope(*this, total_tokens);
-        // CPU host-token request batches pad rows to the widest one; KV append
-        // must copy only each request's real tokens (this graph's lengths).
-        host_request_kv_slots_.clear();
-        if (input.device.is_cpu() && input.request_kv_slots &&
-            static_cast<int>(input.request_kv_slots->size()) == input.batch_size)
-            host_request_kv_slots_ = *input.request_kv_slots;
-        host_request_real_lengths_.clear();
-        if (input.device.is_cpu() && input.batch_size > 1 && input.sequence_lengths &&
-            input.execution_role == ForwardExecutionRole::MainInference &&
-            static_cast<int>(input.sequence_lengths->size()) == input.batch_size)
-            host_request_real_lengths_ = *input.sequence_lengths;
+        // The construction scope owns the CPU row map and live lengths for
+        // main and sidecar graphs, restoring any enclosing builder on return.
 
         LOG_DEBUG("[QwenGraphBase] Building full forward graph: "
                   << "batch_size=" << input.batch_size

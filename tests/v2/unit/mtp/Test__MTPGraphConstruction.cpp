@@ -84,6 +84,24 @@
 using namespace llaminar2;
 using namespace llaminar2::test;
 
+namespace llaminar2
+{
+/** @brief Exercise the production sidecar cache with explicit CPU slot ownership. */
+struct DeviceGraphOrchestratorMTPSlotsTestAccess
+{
+    /** @brief Submit one real sidecar row; all graph selection remains production-owned. */
+    static bool execute(DeviceGraphOrchestrator &owner, int token, int position,
+                        const std::vector<int> *slots)
+    {
+        return owner.executeMTPDepth0Batched(&token, 1, owner.state_.hidden.get(),
+            position, "serving_slot_test", false, BufferId::HIDDEN_STATE,
+            false, nullptr, -1, false, 1, nullptr, nullptr, nullptr, 0, nullptr, 0,
+            -1, 0, nullptr, 1, 1, 1, 0, 0,
+            DeviceGraphExecutor::GraphInitialSubmissionPolicy::CaptureInstantiateAndLaunch, slots);
+    }
+};
+}
+
 namespace
 {
     /**
@@ -5008,6 +5026,93 @@ TEST(Test__MTPGraphConstruction, BuildsOverlayMoESidecarWithMTPCollectiveNamespa
         DeviceId::cpu(), nullptr), std::invalid_argument);
 }
 
+/** @test Explicit sidecar maps reject aliasing, foreign ownership and invalid geometry. */
+TEST(Test__MTPGraphConstruction, ServingSidecarSlotAdmission)
+{
+    DenseMTPGraphFixture fixture(5);
+    Qwen35Graph builder(fixture.config, fixture.mpi);
+    builder.setWeights(fixture.modelWeights());
+    auto input = fixture.input();
+    input.batch_size = 2;
+    auto output = fixture.output();
+    std::vector<int> slots{4, 1};
+    input.request_kv_slots = &slots;
+    EXPECT_GT(builder.buildMTPGraph(0, fixture.mtpWeights(), input, output).size(), 0u);
+    for (const auto &invalid : {std::vector<int>{}, std::vector<int>{1},
+                               std::vector<int>{1, 1}, std::vector<int>{-1, 0},
+                               std::vector<int>{0, 5}})
+    {
+        slots = invalid;
+        EXPECT_THROW(builder.buildMTPGraph(0, fixture.mtpWeights(), input, output), std::invalid_argument);
+    }
+    slots = {4, 1};
+    input.first_sequence_index = 1;
+    EXPECT_THROW(builder.buildMTPGraph(0, fixture.mtpWeights(), input, output), std::invalid_argument);
+    input.first_sequence_index = 0;
+    input.device = DeviceId::cuda(0);
+    EXPECT_THROW(builder.buildMTPGraph(0, fixture.mtpWeights(), input, output), std::invalid_argument);
+    input.device = DeviceId::cpu();
+    input.kv_cache = nullptr;
+    EXPECT_THROW(builder.buildMTPGraph(0, fixture.mtpWeights(), input, output), std::invalid_argument);
+}
+
+/** @test Retained sidecar graphs own their row mapping, independently of later construction. */
+TEST(Test__MTPGraphConstruction, ServingSidecarSlotMappingLifecycle)
+{
+    for (const bool kv_only : {false, true})
+    {
+        DenseMTPGraphFixture fixture(2);
+        fixture.kv_cache = createCPURingKVCache(ActivationPrecision::FP32, *fixture.mpi,
+            1, 5, 8, fixture.config.n_kv_heads, fixture.config.head_dim, DeviceId::cpu());
+        Qwen35Graph builder(fixture.config, fixture.mpi);
+        auto frozen = makeDenseMTPFrozenWeightSet(fixture);
+        auto bindings = makeModelWeightBindings(*frozen);
+        builder.setWeightBindings(bindings);
+        builder.setWeights(toLegacyModelWeights(bindings));
+        PreparedWeightStore store;
+        prepareFrozenGemmWeightsForCPU(*frozen, store);
+        builder.setPreparedWeightStore(&store);
+        const std::array<int, 2> tokens{17, 23};
+        const std::array<int, 2> positions{0, 0};
+        std::vector<int> slots{4, 1};
+        auto input = fixture.input();
+        input.batch_size = 2;
+        input.draft_token_ids = tokens.data();
+        input.position_ids = positions.data();
+        input.request_kv_slots = &slots;
+        input.kv_cache_only = kv_only;
+        auto output = fixture.output();
+        auto mapped = builder.buildMTPGraph(0, bindings.mtp.depths[0], input, output);
+        ASSERT_GT(mapped.size(), 0u);
+        // A borrowed vector is not the retained graph's mutable identity.
+        slots = {3, 2};
+        input.request_kv_slots = nullptr;
+        auto contiguous = builder.buildMTPGraph(0, bindings.mtp.depths[0], input, output);
+        ASSERT_GT(contiguous.size(), 0u);
+        CPUDeviceContext ctx(DeviceId::cpu());
+        DeviceGraphExecutor executor;
+        {
+            WorkspaceAllocator workspace;
+            workspace.installPhysicalMemoryAuthority(admitCPUSidecarWorkspace(mapped));
+            ASSERT_TRUE(workspace.allocateForGraph(mapped, {.max_seq_len = 1}));
+            ASSERT_TRUE(executor.execute(mapped, &ctx));
+        }
+        for (int slot = 0; slot < 5; ++slot)
+            EXPECT_EQ(fixture.kv_cache->get_cached_tokens(0, slot), slot == 4 || slot == 1 ? 1 : 0);
+        {
+            WorkspaceAllocator workspace;
+            workspace.installPhysicalMemoryAuthority(admitCPUSidecarWorkspace(contiguous));
+            ASSERT_TRUE(workspace.allocateForGraph(contiguous, {.max_seq_len = 1}));
+            ASSERT_TRUE(executor.execute(contiguous, &ctx));
+        }
+        EXPECT_EQ(fixture.kv_cache->get_cached_tokens(0, 0), 1);
+        EXPECT_EQ(fixture.kv_cache->get_cached_tokens(0, 1), 2);
+        EXPECT_EQ(fixture.kv_cache->get_cached_tokens(0, 2), 0);
+        EXPECT_EQ(fixture.kv_cache->get_cached_tokens(0, 3), 0);
+        EXPECT_EQ(fixture.kv_cache->get_cached_tokens(0, 4), 1);
+    }
+}
+
 TEST(Test__MTPGraphConstruction, DenseSidecarExecutionAppendsRealKVPayload)
 {
     // The bound tensor shape and admission describe this one-row invocation.
@@ -5678,6 +5783,55 @@ TEST(Test__MTPGraphConstruction, CPUSidecarGraphCacheSurvivesRequestClearWhenMoE
     ASSERT_NE(plain, nullptr);
     EXPECT_DOUBLE_EQ(plain->value, 2.0);
 
+    PerfStatsCollector::reset();
+}
+
+/** @test A warm sidecar cache cannot replay a graph bound to another resident slot. */
+TEST(Test__MTPGraphConstruction, ServingSidecarCacheIdentityIncludesSlots)
+{
+    DeviceManager::instance().initialize(-1, false);
+    ScopedDebugEnv env({{"LLAMINAR_PERF_STATS_JSON", "1"}});
+    PerfStatsCollector::reset();
+    TinyQwen35MTPForwardFixture fixture;
+    fixture.config.mtp.max_request_batch = 5;
+    auto builder = std::make_shared<Qwen35Graph>(fixture.config, fixture.mpi);
+    auto owner = DeviceGraphOrchestrator::createForTest(
+        test::cpuInferenceFixtureDependencies(builder, fixture.mpi, 5, fixture.config.max_seq_len,
+            fixture.config.max_seq_len,
+            test::cpuFixtureTensorInventory(*makeTinyQwen35MTPFrozenWeightSet(fixture), fixture.config.n_layers)));
+    ASSERT_TRUE(owner->initializeInferenceStateFromArena(5, fixture.config.max_seq_len, DeviceId::cpu()));
+    auto hidden = owner->inferenceState().hidden;
+    ASSERT_NE(hidden, nullptr);
+    for (int i = 0; i < fixture.config.d_model; ++i)
+        hidden->mutable_data()[i] = 0.01f * (i % 19 + 1);
+    owner->markMainForwardHiddenProducedForTesting(1, 1);
+    owner->setFrozenWeightSet(makeTinyQwen35MTPFrozenWeightSet(fixture));
+    PreparedWeightStore store;
+    prepareFrozenGemmWeightsForCPU(*owner->frozenWeightSet(), store);
+    builder->setPreparedWeightStore(&store);
+    ASSERT_TRUE(owner->forwardMTP(3));
+    std::vector<int> slots{4};
+    ASSERT_TRUE(DeviceGraphOrchestratorMTPSlotsTestAccess::execute(*owner, 4, 0, &slots));
+    ASSERT_TRUE(DeviceGraphOrchestratorMTPSlotsTestAccess::execute(*owner, 5, 1, &slots));
+    slots = {1};
+    ASSERT_TRUE(DeviceGraphOrchestratorMTPSlotsTestAccess::execute(*owner, 6, 0, &slots));
+    ASSERT_TRUE(DeviceGraphOrchestratorMTPSlotsTestAccess::execute(*owner, 7, 1, nullptr));
+    auto &cache = *owner->inferenceState().mtp_kv_caches.at(0);
+    EXPECT_EQ(cache.get_cached_tokens(0, 0), 2);
+    EXPECT_EQ(cache.get_cached_tokens(0, 1), 1);
+    EXPECT_EQ(cache.get_cached_tokens(0, 2), 0);
+    EXPECT_EQ(cache.get_cached_tokens(0, 3), 0);
+    EXPECT_EQ(cache.get_cached_tokens(0, 4), 2);
+    const auto records = PerfStatsCollector::snapshot({"mtp"});
+    const PerfStatsCollector::Tags tags{{"context", "serving_slot_test"}, {"depth", "0"},
+        {"device_tokens", "false"}, {"device_positions", "false"}, {"kv_cache_only", "false"},
+        {"moe_placement_epoch", "0"}, {"seq_len", "1"}};
+    const auto *misses = findMTPRecord(records, PerfStatRecord::Kind::Counter, "sidecar_graph_cache_misses", tags);
+    const auto *hits = findMTPRecord(records, PerfStatRecord::Kind::Counter, "sidecar_graph_cache_hits", tags);
+    ASSERT_NE(misses, nullptr);
+    ASSERT_NE(hits, nullptr);
+    EXPECT_DOUBLE_EQ(misses->value, 3.0);
+    EXPECT_DOUBLE_EQ(hits->value, 1.0);
     PerfStatsCollector::reset();
 }
 

@@ -294,6 +294,9 @@ namespace llaminar2
         /// host materialization; attention execute() never performs D2H reads.
         mutable const ITensor *debug_effective_k_tensor_ = nullptr;
         mutable const ITensor *debug_effective_v_tensor_ = nullptr;
+        /// Stable diagnostic names for individual CPU cache owners; never flatten separate slots.
+        std::vector<std::string> cpu_cache_k_dump_names_;
+        std::vector<std::string> cpu_cache_v_dump_names_;
         mutable size_t debug_effective_k_rows_ = 0;
         mutable size_t debug_effective_k_cols_ = 0;
         mutable size_t debug_effective_v_rows_ = 0;

@@ -9,9 +9,29 @@
 #pragma once
 #include "models/GraphTypes.h"
 #include "execution/local_execution/graph/IGraphBuilder.h"
+#include "kernels/IKVCache.h"
+#include <algorithm>
 
 namespace llaminar2
 {
+/**
+ * @brief Validate explicit host-owned sidecar slots before cache lookup or construction.
+ * @param input Original row geometry and authoritative cache owner.
+ * @throws std::invalid_argument For foreign, aliased, or out-of-capacity slots.
+ */
+inline void validateMTPRequestKVSlots(const MTPForwardInput &input)
+{
+    if (!input.request_kv_slots)
+        return;
+    if (!input.device.is_cpu() || !input.kv_cache || input.first_sequence_index != 0 ||
+        input.batch_size <= 0 || input.request_kv_slots->size() != static_cast<std::size_t>(input.batch_size))
+        throw std::invalid_argument("Explicit MTP KV slots require CPU cache ownership and exact row geometry");
+    const int capacity = input.kv_cache->request_capacity();
+    for (auto it = input.request_kv_slots->begin(); it != input.request_kv_slots->end(); ++it)
+        if (*it < 0 || *it >= capacity || std::find(input.request_kv_slots->begin(), it, *it) != it)
+            throw std::invalid_argument("Explicit MTP KV slots must be distinct admitted cache slots");
+}
+
 /**
  * @brief Project the original sidecar input for existing reusable graph builders.
  * @param input Exact MTP pointer, geometry and construction-purpose declaration.
@@ -35,7 +55,9 @@ inline ForwardInput mtpForwardConstructionInput(const MTPForwardInput &input)
     default:
         throw std::invalid_argument("Unknown original sidecar cache role");
     }
+    validateMTPRequestKVSlots(input);
     ForwardInput result;
+    result.request_kv_slots = input.request_kv_slots;
     result.mtp_sidecar_capture_role = input.kv_cache_only
         ? MTPSidecarCaptureRole::KVOnly : input.capture_role;
     result.graph_submission_intent = input.graph_submission_intent;

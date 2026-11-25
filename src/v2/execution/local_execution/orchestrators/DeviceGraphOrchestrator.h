@@ -4562,6 +4562,7 @@ namespace llaminar2
         friend struct DeviceGraphOrchestratorLiveStateTestAccess;
         /** @brief Device-free peer of the actual CPU bootstrap producer and mailbox read lease. */
         friend struct DeviceGraphOrchestratorMTPZeroHiddenTestAccess;
+        friend struct DeviceGraphOrchestratorMTPSlotsTestAccess;
         /** @brief Device-free peer of the actual cold serving-family buffer scope. */
         friend struct DeviceGraphOrchestratorServingBuffersTestAccess;
         /** @brief Device-free peer of exact publication-child ownership and retirement. */
@@ -7197,6 +7198,7 @@ namespace llaminar2
          * @param device_position_offset Offset added by the device composer.
          * @param first_seq_idx First shifted-KV sequence owned by this batch.
          * @param submission Execute normally, or seal an authenticated scalar chained sibling without publishing input data.
+         * @param request_kv_slots Optional explicit CPU resident-slot map, copied into sidecar cache identity.
          * @return `true` after ordinary execution publishes every required event,
          *         or after cold-only submission seals the complete chained graph without executing it.
          */
@@ -7227,7 +7229,8 @@ namespace llaminar2
                                      int device_position_offset = 0,
                                      int first_seq_idx = 0,
                                      DeviceGraphExecutor::GraphInitialSubmissionPolicy submission =
-                                         DeviceGraphExecutor::GraphInitialSubmissionPolicy::CaptureInstantiateAndLaunch);
+                                         DeviceGraphExecutor::GraphInitialSubmissionPolicy::CaptureInstantiateAndLaunch,
+                                     const std::vector<int> *request_kv_slots = nullptr);
 
         /**
          * @brief Populate CPU shifted-MTP KV from one completed main prefill.
@@ -7404,6 +7407,8 @@ namespace llaminar2
             int seq_len = 0;
             int batch_size = 1;
             int first_seq_idx = 0;
+            /// CPU graph identity owns its exact row-to-cache-slot mapping.
+            std::vector<int> request_kv_slots;
             bool uses_device_token_ids = false;
             bool uses_device_position_ids = false;
             int condition_token_slot = -1;
