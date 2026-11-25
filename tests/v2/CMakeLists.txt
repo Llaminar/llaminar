@@ -10724,10 +10724,23 @@ if(V2_CPU_TARGET_X86)
         v2_cpu_native_isa_runtime("${V2_X86_LEAF_ISA}" V2_X86_LEAF_RUNTIME_ISA)
         add_v2_test(V2_Integration_CPUX86CodedLeaves_${V2_X86_LEAF_ISA}
             COMMAND $<TARGET_FILE:v2_unit_cpu_x86_coded_leaves>
+                --gtest_filter=-CPUX86CodedLeaves.FusedPrefillMembersStreamPanelsAndRetainSerialBytes
             LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;NativeQuantised;${V2_X86_LEAF_ISA};ByteExact;Regression"
             MPI_PROCS 1 NO_MODELS NO_MPI
             ENVIRONMENT "OMP_NUM_THREADS=1;OMP_DYNAMIC=false;LLAMINAR_ISA_LEVEL=${V2_X86_LEAF_RUNTIME_ISA}")
         list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUX86CodedLeaves_${V2_X86_LEAF_ISA})
+        # Pooled packed panels of the batched expert route (ordinary-prefill
+        # members from two rows): serial-row bytes, bias, one and three
+        # workers, new and retained teams, slab admission before any write.
+        # The test binds its team widths itself; the default four-slot
+        # Integration reservation covers the widest team.
+        add_v2_test(V2_Integration_CPUX86FusedPrefillPanels_${V2_X86_LEAF_ISA}
+            COMMAND $<TARGET_FILE:v2_unit_cpu_x86_coded_leaves>
+                --gtest_filter=CPUX86CodedLeaves.FusedPrefillMembersStreamPanelsAndRetainSerialBytes
+            LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;NativeQuantised;MoE;Prefill;${V2_X86_LEAF_ISA};ByteExact;Regression"
+            MPI_PROCS 1 NO_MODELS NO_MPI
+            ENVIRONMENT "OMP_NUM_THREADS=3;OMP_DYNAMIC=false;LLAMINAR_ISA_LEVEL=${V2_X86_LEAF_RUNTIME_ISA}")
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUX86FusedPrefillPanels_${V2_X86_LEAF_ISA})
     endforeach()
 endif()
 

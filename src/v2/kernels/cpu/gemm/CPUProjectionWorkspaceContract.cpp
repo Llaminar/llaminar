@@ -13,6 +13,7 @@
 #include "CPUNativeNEONPanelWorkspace.h"
 #include "CPUNativeX86PanelWorkspace.h"
 #include "kernels/cpu/CPUInvocationWorkspace.h"
+#include <algorithm>
 #include <climits>
 #include <stdexcept>
 #include <string>
@@ -78,14 +79,21 @@ namespace llaminar2
         // Use the participant's x86 ABI, not the planning host's build. An ARM
         // participant returned above. Use physical N for strip ownership, not
         // serial_n, and cover every team width up to the admitted workers.
+        // The declaration does not know the invocation's purpose: a stage
+        // whose rows reach x86_panel::min_pooled_rows may carry pooled
+        // ordinary-prefill members of the batched expert route, so it admits
+        // their slot slab as well as the dense panel (from min_rows rows).
         namespace panel = cpu::native_quantised::x86_panel;
-        const auto packed_panel = panel::workspaceFloats(panel::formatFor(footprint.encoding, codebook),
-            geometry.execution.active_isa == ISALevel::AVX512 ? 16 : 8,
-            geometry.rows, geometry.n, (geometry.k + 31) / 32, geometry.workers,
-            [&](int workers) { return configAt(workers).k_tiles; });
+        const auto format = panel::formatFor(footprint.encoding, codebook);
+        const int lanes = geometry.execution.active_isa == ISALevel::AVX512 ? 16 : 8;
+        const auto partitionsAt = [&](int workers) { return configAt(workers).k_tiles; };
+        const auto packed_panel = panel::workspaceFloats(format, lanes, geometry.rows, geometry.n,
+            (geometry.k + 31) / 32, geometry.workers, partitionsAt);
+        const auto pooled_panel = panel::pooledWorkspaceFloats(format, lanes, geometry.rows, (geometry.k + 31) / 32,
+            geometry.workers, partitionsAt);
         const auto ordinary = cpuProjectionPartialEnvelopeFloats(geometry.rows, geometry.n, config.k_tiles,
             geometry.workers, static_cast<int>(geometry.execution.maximum_native_row_tile));
-        const auto partials = cpuProjectionPartialWorkspaceRequirements(std::max(ordinary, packed_panel));
+        const auto partials = cpuProjectionPartialWorkspaceRequirements(std::max({ordinary, packed_panel, pooled_panel}));
         // These are distinct canonical projection names (Q8 versus partials),
         // not grouped-MoE root-layout merges. Keep this pure BOM independent of
         // the unrelated storage-layout materialization/composition machinery.

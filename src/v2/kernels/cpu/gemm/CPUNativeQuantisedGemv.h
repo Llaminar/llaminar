@@ -88,6 +88,7 @@
 #include <new>
 #include <type_traits>
 #include <omp.h>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -96,6 +97,7 @@
 #include "kernels/common/ProjectionRowWork.h"
 #include "CPUProjectionRowGrid.h"
 #include "CPUProjectionQ8Publication.h"
+#include "CPUProjectionStorageProof.h"
 #include "CPUNativeQuantisedExecutionContract.h"
 #include "CPUNativeQuantisedContributionContract.h"
 #include "CPUNativeQuantisedFP16.h"
@@ -708,6 +710,22 @@ namespace llaminar2::cpu::native_quantised
     }
 
     /**
+     * @brief Admitted x86 pooled-panel quote of one prepared member of a batched launch.
+     * @param packed Immutable prepared matrix and its arithmetic policy.
+     * @param rows Physical member rows (or the declaring stage's row capacity).
+     * @param policy_n Logical serial output width that selects the K tree.
+     * @param workers Admitted (or current) worker count.
+     * @return The x86_panel::pooledWorkspaceFloats quote at every team width up to @p workers.
+     */
+    inline size_t nativeQuantisedPooledPanelFloats(
+        const CPUNativeQuantisedPackedWeights &packed, int rows, int policy_n, int workers)
+    {
+        return x86_panel::pooledWorkspaceFloats(x86_panel::formatFor(packed.encoding, packed.codebook_id),
+            activeISALevel() >= ISALevel::AVX512 ? 16 : 8, rows, packed.blocks_per_row, workers,
+            [&](int width) { return serialTileConfigForPackedMatrix(packed, policy_n, packed.K, width).k_tiles; });
+    }
+
+    /**
      * @brief Exact ordinary projection slab for the current participant geometry.
      * @param packed Immutable prepared matrix and its arithmetic policy.
      * @param rows Maximum simultaneously live rows.
@@ -724,7 +742,14 @@ namespace llaminar2::cpu::native_quantised
             nativeQuantisedPackedPanelFloats(packed, rows, policy_n, workers));
     }
 
-    /** @return This prepared member's contribution to the admitted serial/fused slab. */
+    /**
+     * @brief This prepared member's contribution to the admitted serial/fused slab.
+     * @param packed Immutable prepared matrix and its arithmetic policy.
+     * @param rows Physical row capacity of the member (or of the declaring stage).
+     * @return The maximum of the ordinary partial envelope, the dense packed-panel
+     *         quote and the pooled packed-panel quote (from x86_panel::min_pooled_rows
+     *         rows), matching CPUProjectionWorkspaceContract's declaration.
+     */
     inline size_t nativeQuantisedProjectionPartialEnvelopeFloats(
         const CPUNativeQuantisedPackedWeights &packed, int rows)
     {
@@ -733,7 +758,8 @@ namespace llaminar2::cpu::native_quantised
         const auto config = serialTileConfigForPackedMatrix(packed, policy_n, packed.K, workers);
         const bool wide = activeISALevel() >= ISALevel::AVX512;
         const auto ordinary = cpuProjectionPartialEnvelopeFloats(rows, packed.N, config.k_tiles, workers, wide ? 4 : 2);
-        return std::max(ordinary, nativeQuantisedPackedPanelFloats(packed, rows, policy_n, workers));
+        return std::max({ordinary, nativeQuantisedPackedPanelFloats(packed, rows, policy_n, workers),
+            nativeQuantisedPooledPanelFloats(packed, rows, policy_n, workers)});
     }
 
     /** Return the requested N-chunk count for one explicit decode policy. */
@@ -5972,6 +5998,13 @@ namespace llaminar2::cpu::native_quantised
             VerifierRowsPolicy::Pairwise;
         VerifierRowsScheduleResolution verifier_resolution{};
         bool execution_exact_hit = false; ///< One full-key installed observation selected this row policy.
+        /**
+         * Ordinary-prefill member streamed as pooled x86 packed-panel chunk
+         * tasks (x86_panel::projectPooledChunk): each 64-column chunk decodes
+         * every weight strip once for all of the member's rows. Its row/tile
+         * schedule fields above stay resolved but are not executed.
+         */
+        bool packed_panel = false;
     };
 
 
@@ -5996,6 +6029,7 @@ namespace llaminar2::cpu::native_quantised
         VerifierRowsTaskGrid task_grid;
         int64_t producer_tasks, reduction_tasks;
         bool layer_global_full_k;
+        bool packed_panel; ///< Pooled x86 packed-panel chunk tasks replace the row tiles.
 
         /** @brief Compare every emitted semantic dimension using its native type.
          * @param other Another projection's complete immutable dimensions.
@@ -6008,7 +6042,8 @@ namespace llaminar2::cpu::native_quantised
          * @param plan Original resolved serial arithmetic and task geometry.
          * @param isa Resolved native ISA shared by this invocation.
          * @param full_k Original bundle-wide scheduler identity.
-         * @return All 21 dimensions that determine the existing retained record key.
+         * @return All dimensions that determine the retained record key; a pooled
+         *         panel member reports its chunk tasks and panel row tile.
          */
         static FusedProjectionEvidenceDimensions from(
             const FusedVerifierRowsDesc &descriptor, const FusedVerifierRowsPlan &plan,
@@ -6040,11 +6075,15 @@ namespace llaminar2::cpu::native_quantised
                 .reduction_tasks = plan.rows == 1
                     ? (grouped_k_parallel ? plan.n_chunks : 0)
                     : plan.verifier_resolution.reduction_tasks,
-                .layer_global_full_k = full_k};
+                .layer_global_full_k = full_k,
+                .packed_panel = plan.packed_panel};
         }
 
-        /** @brief Construct the unchanged public schema once per distinct numeric group.
-         * @return Complete original 21-tag map; no observation is dropped or filtered.
+        /** @brief Construct the public schema once per distinct numeric group.
+         * @return Complete 21-tag map; no observation is dropped or filtered. A
+         *         pooled panel member reports route prefill_x86_packed_panel_rows,
+         *         task grid n_chunk_all_rows, one producer task per 64-column chunk
+         *         and the panel's two-row tile (its tile fields are not executed).
          */
         PerfStatsCollector::Tags tags() const
         {
@@ -6061,11 +6100,11 @@ namespace llaminar2::cpu::native_quantised
                 {"effective_decode_policy", decodeSchedulePolicyName(effective_decode)},
                 {"requested_verifier_policy", verifierRowsPolicyName(requested_verifier)},
                 {"effective_verifier_policy", verifierRowsPolicyName(effective_verifier)},
-                {"physical_row_tile", std::to_string(physical_row_tile)},
-                {"route", verifierRowsExecutionRouteName(route)},
-                {"task_grid", verifierRowsTaskGridName(task_grid)},
-                {"producer_tasks", std::to_string(producer_tasks)},
-                {"reduction_tasks", std::to_string(reduction_tasks)},
+                {"physical_row_tile", packed_panel ? "2" : std::to_string(physical_row_tile)},
+                {"route", packed_panel ? "prefill_x86_packed_panel_rows" : verifierRowsExecutionRouteName(route)},
+                {"task_grid", packed_panel ? "n_chunk_all_rows" : verifierRowsTaskGridName(task_grid)},
+                {"producer_tasks", std::to_string(packed_panel ? (n + 63) / 64 : producer_tasks)},
+                {"reduction_tasks", packed_panel ? "0" : std::to_string(reduction_tasks)},
                 {"bundle_scheduler", layer_global_full_k ? "layer_global_full_k" : "projection_ordered"}};
         }
     };
@@ -6097,12 +6136,19 @@ namespace llaminar2::cpu::native_quantised
         bool use_avx2 = false; ///< Resolved hardware ISA, not a lifecycle flag.
         bool all_k_partitioned = false; ///< Every member owns an ordered reduction tree.
         CPUExecutionExactBundleClass execution_exact_class = CPUExecutionExactBundleClass::None;
+        size_t panel_slot_floats = 0; ///< Uniform pooled-panel worker slot over every panel member; zero without panels.
+        int panel_workers = 0; ///< Admitted pooled-panel slots (the planned team width); zero without panels.
 
-        /** @return Exact shared arena demand; private/full-K routes allocate none. */
+        /**
+         * @return Exact shared arena demand: the shared/worker partial bank, or
+         * the pooled panel slots. Panels are planned only for bundles whose
+         * route borrows no bank, so the two demands never coexist.
+         */
         size_t sharedPartialFloats() const noexcept
         {
-            return partial_route == NativeQuantisedFusedPartialRoute::SharedBank ||
+            const size_t bank = partial_route == NativeQuantisedFusedPartialRoute::SharedBank ||
                 partial_route == NativeQuantisedFusedPartialRoute::OutputTileWorkspace ? partial_floats : 0;
+            return std::max(bank, static_cast<size_t>(panel_workers) * panel_slot_floats);
         }
     };
 
@@ -6118,12 +6164,15 @@ namespace llaminar2::cpu::native_quantised
             bool use_avx2 = false;
             bool all_k_partitioned = false;
             CPUExecutionExactBundleClass execution_exact_class = CPUExecutionExactBundleClass::None;
+            size_t panel_slot_floats = 0; ///< Pooled-panel worker slot, as the public plan.
+            int panel_workers = 0; ///< Pooled-panel slots, as the public plan.
 
-            /** @return Same exact shared-bank demand as the unchanged public value API. */
+            /** @return Same exact shared demand as the public value API (bank or pooled panel slots). */
             size_t sharedPartialFloats() const noexcept
             {
-                return partial_route == NativeQuantisedFusedPartialRoute::SharedBank ||
+                const size_t bank = partial_route == NativeQuantisedFusedPartialRoute::SharedBank ||
                     partial_route == NativeQuantisedFusedPartialRoute::OutputTileWorkspace ? partial_floats : 0;
+                return std::max(bank, static_cast<size_t>(panel_workers) * panel_slot_floats);
             }
         };
 
@@ -6252,6 +6301,7 @@ namespace llaminar2::cpu::native_quantised
      * @param M Default positive row count when a descriptor inherits its rows.
      * @param num_threads Actual workers that will execute this invocation.
      * @param isa_path Runtime ISA policy; shared with execution and diagnostics.
+     * @param job_ownership Requested bundle ownership; explicit ownership keeps every member on its tiles.
      * @tparam ExactPolicyLookup Immutable generated lookup; tests may instantiate
      *         the same planner with a frozen observation, never mutate live policy.
      * @return Small scalar summary; projection geometry remains in the borrowed prefix.
@@ -6268,7 +6318,8 @@ namespace llaminar2::cpu::native_quantised
     inline NativeQuantisedFusedRowsPlanSummary fillNativeQuantisedFusedRowsPlans(
         std::span<FusedVerifierRowsPlan> plans,
         std::span<const FusedVerifierRowsDesc> descriptors,
-        int M, int num_threads, ISAPath isa_path = ISAPath::AUTO)
+        int M, int num_threads, ISAPath isa_path = ISAPath::AUTO,
+        FusedOutputJobOwnership job_ownership = FusedOutputJobOwnership::Auto)
     {
         requireNativeQuantisedISAPath(isa_path);
         requireNativeQuantisedFusedRowsPlanInput(descriptors,M,num_threads);
@@ -6548,6 +6599,51 @@ namespace llaminar2::cpu::native_quantised
         result.use_avx512 = use_avx512;
         result.use_avx2 = use_avx2;
         result.all_k_partitioned = all_k_partitioned;
+
+        /*
+         * Pooled packed panels. An ordinary-prefill member with automatic
+         * schedules whose source has an x86 panel program and at least
+         * x86_panel::min_pooled_rows rows contributes one task per 64-column
+         * chunk instead of its row tiles: the task decodes each K panel of a
+         * strip once into the worker's slot and consumes it for all of the
+         * member's rows. A register row tile re-decodes every weight once per
+         * tile, so with file-density IQ3_S an expert of M routed prefill rows
+         * decoded each weight ceil(M/4) times. Panel slots borrow the
+         * invocation's projection slab, so only bundles whose route borrows
+         * no partial bank (full K, or task-local ordered trees) take panels;
+         * the tiles stay for shared/worker partial banks. Decode/MTP members,
+         * explicit schedules, explicit ISA or ownership candidates and CPU tile
+         * overrides keep their tiles. Both routes reproduce the serial M=1 tree
+         * of the member's own partition count, so this choice changes no byte.
+         */
+        const auto &tile_override = debugEnv().cpu_vnni;
+        if (isa_path == ISAPath::AUTO && job_ownership == FusedOutputJobOwnership::Auto &&
+            result.sharedPartialFloats() == 0 && tile_override.n_block_chunks <= 0 &&
+            tile_override.k_tile_blocks <= 0 && tile_override.m_unroll <= 0)
+        {
+            const int strip = x86_panel::pooledStrip(use_avx512 ? 16 : 8);
+            size_t slot = 0;
+            for (int p = 0; p < num_descs; ++p)
+            {
+                const auto &d = descs[p];
+                auto &plan = plans[static_cast<size_t>(p)];
+                const auto format = x86_panel::formatFor(d.packed->encoding, d.packed->codebook_id);
+                if (d.purpose != ProjectionRowsPurpose::Prefill || d.verifier_schedule != VerifierRowsPolicy::Auto ||
+                    d.decode_schedule != DecodeSchedulePolicy::Auto || plan.rows < x86_panel::min_pooled_rows ||
+                    format == x86_panel::Format::None)
+                    continue;
+                plan.packed_panel = true;
+                slot = std::max(slot, x86_panel::workerFloats(format, strip, plan.rows, K_blocks,
+                    std::max(1, plan.k_tiles)));
+            }
+            if (slot)
+            {
+                if (slot > std::numeric_limits<size_t>::max() / sizeof(float) / static_cast<size_t>(num_threads))
+                    throw std::overflow_error("CPU fused pooled panel workspace exceeds addressable storage");
+                result.panel_slot_floats = slot;
+                result.panel_workers = num_threads;
+            }
+        }
         return result;
     }
 
@@ -6559,6 +6655,7 @@ namespace llaminar2::cpu::native_quantised
      * @param M Positive inherited rows.
      * @param num_threads Actual positive invocation workers, including existing-team identity.
      * @param isa_path Original runtime ISA policy.
+     * @param job_ownership Requested bundle ownership (explicit ownership plans no pooled panels).
      * @tparam ExactPolicyLookup Same immutable generated policy used by execution.
      * @return Original capacity/default/copy-safe value with exact scratch/task geometry.
      * @throws std::invalid_argument For incomplete geometry or incompatible scheduling.
@@ -6568,12 +6665,13 @@ namespace llaminar2::cpu::native_quantised
     template <auto ExactPolicyLookup = generated::selectCPUExecutionExactPolicy>
     inline NativeQuantisedFusedRowsPlan planNativeQuantisedFusedRows(
         std::span<const FusedVerifierRowsDesc> descriptors,
-        int M,int num_threads,ISAPath isa_path = ISAPath::AUTO)
+        int M,int num_threads,ISAPath isa_path = ISAPath::AUTO,
+        FusedOutputJobOwnership job_ownership = FusedOutputJobOwnership::Auto)
     {
         detail::requireNativeQuantisedFusedRowsPlanInput(descriptors,M,num_threads);
         NativeQuantisedFusedRowsPlan result;
         const auto summary = detail::fillNativeQuantisedFusedRowsPlans<ExactPolicyLookup>(
-            std::span(result.projections).first(descriptors.size()),descriptors,M,num_threads,isa_path);
+            std::span(result.projections).first(descriptors.size()),descriptors,M,num_threads,isa_path,job_ownership);
         result.partial_route = summary.partial_route;
         result.partial_floats = summary.partial_floats;
         result.worker_partial_stride = summary.worker_partial_stride;
@@ -6581,6 +6679,8 @@ namespace llaminar2::cpu::native_quantised
         result.use_avx2 = summary.use_avx2;
         result.all_k_partitioned = summary.all_k_partitioned;
         result.execution_exact_class = summary.execution_exact_class;
+        result.panel_slot_floats = summary.panel_slot_floats;
+        result.panel_workers = summary.panel_workers;
         return result;
     }
 
@@ -6914,7 +7014,7 @@ namespace llaminar2::cpu::native_quantised
             sizeof(FusedVerifierRowsPlan) * kMaxFusedVerifierProjections> plan_storage;
         detail::NativeQuantisedFusedRowsLiveView live_plan(plan_storage,static_cast<size_t>(num_descs));
         const auto bundle = detail::fillNativeQuantisedFusedRowsPlans(
-            live_plan.mutableProjections(),{descs,static_cast<size_t>(num_descs)},M,num_threads,isa_path);
+            live_plan.mutableProjections(),{descs,static_cast<size_t>(num_descs)},M,num_threads,isa_path,job_ownership);
         const auto plans = live_plan.projections();
         detail::requireFusedOutputJobOwnership(job_ownership,
             {descs, static_cast<size_t>(num_descs)}, plans, bundle.partial_route);
@@ -6934,8 +7034,87 @@ namespace llaminar2::cpu::native_quantised
             bundle.partial_route == NativeQuantisedFusedPartialRoute::OutputTileLocal ||
             bundle.partial_route == NativeQuantisedFusedPartialRoute::OutputTileWorkspace;
         const size_t fused_partial_sum_floats = bundle.sharedPartialFloats();
+        /*
+         * Pooled packed-panel members (see fillNativeQuantisedFusedRowsPlans)
+         * borrow one uniformly strided worker slot each of the invocation's
+         * slab. Tile members run concurrently with panel tasks, so the slab
+         * may alias no member's publication. Everything is checked before the
+         * team writes anything; the team is never wider than num_threads.
+         */
+        const bool has_pooled_panels = bundle.panel_workers > 0;
+        if (has_pooled_panels)
+        {
+            if (bundle.panel_workers != num_threads || partial_storage.size() < fused_partial_sum_floats)
+                throw std::invalid_argument("CPU fused pooled prefill panels require their admitted per-worker projection slab");
+            const storage_proof::Bytes writes{partial_storage.data(), fused_partial_sum_floats * sizeof(float)};
+            storage_proof::requireDisjoint(writes, {descs, static_cast<size_t>(num_descs) * sizeof(FusedVerifierRowsDesc)});
+            for (int projection = 0; projection < num_descs; ++projection)
+            {
+                const auto &d = descs[projection];
+                const auto &plan = plans[static_cast<size_t>(projection)];
+                const auto view = d.packed->readView();
+                storage_proof::requireDisjoint(writes, {d.packed, sizeof(*d.packed)});
+                storage_proof::requireDisjoint(writes, {view.interleavedBase(), view.bytes().size()});
+                storage_proof::requireDisjoint(writes, {d.input ? d.input : A_q8_all,
+                    static_cast<size_t>(plan.rows) * static_cast<size_t>(K_blocks) * sizeof(Q8_1Block)});
+                storage_proof::requireDisjoint(writes, {d.output,
+                    (static_cast<size_t>(plan.rows - 1) * static_cast<size_t>(d.ldc) + static_cast<size_t>(d.N)) *
+                        sizeof(float)});
+                if (d.bias)
+                    storage_proof::requireDisjoint(writes, {d.bias, static_cast<size_t>(d.N) * sizeof(float)});
+            }
+        }
         if (partial_storage.size() < fused_partial_sum_floats)
             throw std::runtime_error("CPU fused projection requires admitted ordered-partial storage");
+        if (has_pooled_panels && bundle.partial_route != NativeQuantisedFusedPartialRoute::FullK &&
+            bundle.partial_route != NativeQuantisedFusedPartialRoute::OutputTileLocal)
+            throw std::logic_error("CPU fused pooled panels were planned for a partial-bank route");
+        // One task per 64-column chunk of every panel member, member-major.
+        std::array<size_t, kMaxFusedVerifierProjections> panel_task_ends;
+        size_t total_panel_tasks = 0;
+        for (int projection = 0; projection < num_descs; ++projection)
+        {
+            const auto &plan = plans[static_cast<size_t>(projection)];
+            total_panel_tasks += plan.packed_panel ? static_cast<size_t>(plan.n_chunks) : 0u;
+            panel_task_ends[static_cast<size_t>(projection)] = total_panel_tasks;
+        }
+        /*
+         * Pooled panel workshare, entered by every team member after its share
+         * of the tile tasks (nowait on both sides): dynamic chunk tasks absorb
+         * the static tile imbalance. Each task decodes its chunk's strips once
+         * into the calling worker's slot and writes only that chunk of the
+         * member's rows; no task synchronizes. A bias consumer still waits at
+         * the layer epilogue's barrier.
+         */
+        const auto execute_pooled_panels = [&]()
+        {
+            if (!has_pooled_panels)
+                return;
+            float *slot = partial_storage.data() +
+                static_cast<size_t>(omp_get_thread_num()) * bundle.panel_slot_floats;
+            const int lanes = use_avx512 ? 16 : 8;
+            int bound = -1; // Member whose admitted view this worker holds.
+            std::optional<CPUNativeQuantisedWeightView> view;
+#pragma omp for schedule(dynamic, 1) nowait
+            for (long long global_task = 0; global_task < static_cast<long long>(total_panel_tasks); ++global_task)
+            {
+                const size_t task = static_cast<size_t>(global_task);
+                const int projection = static_cast<int>(std::upper_bound(panel_task_ends.begin(),
+                    panel_task_ends.begin() + num_descs, task) - panel_task_ends.begin());
+                const auto &d = descs[projection];
+                const auto &plan = plans[static_cast<size_t>(projection)];
+                if (projection != bound)
+                {
+                    // Already admitted above; the same sealed generation cannot fail here.
+                    view.emplace(d.packed->readView());
+                    bound = projection;
+                }
+                const size_t prior = projection == 0 ? 0u : panel_task_ends[static_cast<size_t>(projection - 1)];
+                x86_panel::projectPooledChunk(*view, x86_panel::formatFor(view->encoding, view->codebook_id),
+                    d.input ? d.input : A_q8_all, d.output, plan.rows, d.ldc, std::max(1, plan.k_tiles), lanes,
+                    static_cast<int>(task - prior), slot);
+            }
+        };
 
         if(job_ownership==FusedOutputJobOwnership::Auto && effective_ownership==FusedOutputJobOwnership::Current &&
             (!omp_in_parallel() || omp_get_thread_num()==0) &&
@@ -7024,8 +7203,11 @@ namespace llaminar2::cpu::native_quantised
                     plan.verifier_resolution.task_grid == VerifierRowsTaskGrid::RowTileNBlock
                 ? static_cast<size_t>((plan.rows - 1) / row_width + 1)
                 : 1u;
-            shared_weight_task_run = std::min(shared_weight_task_run, adjacent_weight_users);
-            total_full_k_tasks += static_cast<size_t>(
+            // Pooled panel members own no tile task; their chunk tasks run in
+            // execute_pooled_panels().
+            if (!plan.packed_panel)
+                shared_weight_task_run = std::min(shared_weight_task_run, adjacent_weight_users);
+            total_full_k_tasks += plan.packed_panel ? 0u : static_cast<size_t>(
                 plan.rows == 1
                     ? plan.total_blocks
                     : plan.verifier_resolution.producer_tasks);
@@ -7109,7 +7291,7 @@ namespace llaminar2::cpu::native_quantised
             for (int projection = 0; projection < num_descs; ++projection)
             {
                 const auto &plan = plans[static_cast<size_t>(projection)];
-                if (plan.rows == 1)
+                if (plan.rows == 1 || plan.packed_panel)
                     continue;
                 switch (plan.verifier_resolution.task_grid)
                 {
@@ -7489,6 +7671,7 @@ namespace llaminar2::cpu::native_quantised
                     }
                 }
 
+                execute_pooled_panels();
                 publish_layer_bias();
             };
 
@@ -7549,6 +7732,16 @@ namespace llaminar2::cpu::native_quantised
             for (int projection = 0; projection < num_descs; ++projection)
             {
                 const auto &plan = plans[static_cast<size_t>(projection)];
+                if (plan.packed_panel)
+                {
+                    // Pooled panel members (OutputTileLocal bundles only) own
+                    // no producer, reducer or local-tree job; their chunk
+                    // tasks run in execute_pooled_panels().
+                    producer_task_ends[static_cast<size_t>(projection)] = total_producer_tasks;
+                    reduction_task_ends[static_cast<size_t>(projection)] = total_reduction_tasks;
+                    local_tree_task_ends[static_cast<size_t>(projection)] = total_local_tree_tasks;
+                    continue;
+                }
                 const int row_tile_width =
                     plan.rows == 1 ? 1 : plan.verifier_resolution.physical_row_tile;
                 const int row_tiles =
@@ -7889,6 +8082,11 @@ namespace llaminar2::cpu::native_quantised
                     for (int projection = 0; projection < num_descs; ++projection)
                     {
                         const auto &plan = plans[static_cast<size_t>(projection)];
+                        if (plan.packed_panel)
+                        {
+                            local_tree_task_ends[static_cast<size_t>(projection)] = total_local_tree_tasks;
+                            continue;
+                        }
                         const int row_width = plan.rows == 1 ? 1 : plan.verifier_resolution.physical_row_tile;
                         const auto row_tiles = static_cast<size_t>((plan.rows - 1) / row_width + 1);
                         const auto run_width = pair_run_width(projection, maximum_pair_run);
@@ -7902,6 +8100,7 @@ namespace llaminar2::cpu::native_quantised
                 if(job_ownership==FusedOutputJobOwnership::Auto && panel_blocks)
                     for(int projection=0;projection<num_descs;++projection) {
                         const auto& plan=plans[static_cast<size_t>(projection)];
+                        if(plan.packed_panel)continue; // No tile job; its panel tasks are not block-owned.
                         const auto run_width=use_pair_runs?pair_run_width(projection,maximum_pair_run):1u;
                         maximum_job_working_set=std::max(maximum_job_working_set,detail::outputJobWorkingSetEstimate(
                             descs[projection].packed->preparedFootprint(),static_cast<size_t>(plan.rows),
@@ -7970,7 +8169,7 @@ namespace llaminar2::cpu::native_quantised
                     auto worker_effective=effective_ownership;
                     auto worker_reason=auto_domain;
                     detail::AutoPanelBlockChoice cache_choice{};
-                    if(panel_blocks) {
+                    if(panel_blocks && total_local_tree_tasks>0) {
                         if(job_ownership==FusedOutputJobOwnership::Auto) {
                             cache_choice=detail::autoPanelBlockChoice(total_local_tree_tasks,workers,
                                 maximum_job_working_set,CPUExecutionGeometry::local().cache);
@@ -8395,6 +8594,7 @@ namespace llaminar2::cpu::native_quantised
                         if(range.block_stride>=range.end-block_begin)break;
                         block_begin+=range.block_stride;
                     }
+                    execute_pooled_panels();
                     // Empty workers retain the original bias and completion edges.
                     publish_layer_bias();
                 };

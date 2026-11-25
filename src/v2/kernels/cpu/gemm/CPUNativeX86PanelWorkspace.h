@@ -20,6 +20,14 @@
  * point correction) serve four vectors instead of one, which the consume needs
  * to match the expanded INT8 kernels' instruction count per dot product;
  * narrower strips keep the panel available to teams wider than N / 64.
+ *
+ * Pooled members of a multi-projection launch (the batched MoE expert route)
+ * form a second domain: every member runs one task per 64-column chunk on the
+ * calling worker's slot, so it needs no column parallelism of its own and
+ * streams panels from min_pooled_rows rows. Their strip is always a whole
+ * chunk on AVX-512 and eight columns on AVX2 (pooledStrip()), and the stage
+ * declaration admits the pooled slab (pooledWorkspaceFloats) independently of
+ * the dense quote; an invocation borrows the larger of the two routes.
  */
 #pragma once
 
@@ -44,6 +52,15 @@ namespace llaminar2::cpu::native_quantised::x86_panel
     /// Start sharing a panel across at least eight row pairs. Storage quotes apply
     /// it to the physical capacity; dispatch additionally requires as many live rows.
     inline constexpr int min_rows = 16;
+    /**
+     * Smallest rows of one ordinary-prefill member of a pooled launch (the
+     * batched MoE expert route) that streams panels. Members share one
+     * workshare, so a member needs no column parallelism of its own, and a
+     * register row tile re-decodes every weight once per tile while the panel
+     * decodes it once for all of the member's rows. A single row keeps its
+     * register tile: it has no second row to share the decode with.
+     */
+    inline constexpr int min_pooled_rows = 2;
     inline constexpr int depth = 8;     ///< At most eight source blocks in one worker's L1 tile.
 
     /** @return Supported panel format selected from the admitted physical encoding and source codebook. */
@@ -160,6 +177,59 @@ namespace llaminar2::cpu::native_quantised::x86_panel
         if (static_cast<std::size_t>(workers) > std::numeric_limits<std::size_t>::max() / sizeof(float) / slot)
             throw std::overflow_error("Native x86 prefill panel exceeds admitted worker storage");
         return slot * static_cast<std::size_t>(workers);
+    }
+
+    /**
+     * @brief Columns one pooled chunk task streams per strip.
+     * @param lanes Physical SIMD width (8 AVX2, 16 AVX-512).
+     * @return One whole 64-column chunk on AVX-512 (two rows by four vectors), eight columns on AVX2.
+     */
+    constexpr int pooledStrip(int lanes) noexcept
+    {
+        return lanes == 16 ? wide_strip : lanes;
+    }
+
+    /**
+     * @brief Admitted pooled-member slab quote covering every team width up to the admitted one.
+     * @tparam PartitionsAt Callable mapping a team width to its serial K partition count.
+     * @param format Admitted panel format.
+     * @param lanes Physical SIMD width (8 AVX2, 16 AVX-512).
+     * @param rows Physical member rows (a declaration passes its largest member/stage rows).
+     * @param blocks Original logical K-block count.
+     * @param workers Admitted worker count of the participant.
+     * @param partitions_at The production serial tile policy evaluated at one width.
+     * @return max over w in [1, workers] of w slots of pooledStrip() columns; zero outside the pooled domain.
+     * @throws std::invalid_argument For non-positive geometry.
+     * @throws std::overflow_error For unaddressable storage.
+     *
+     * A pooled launch needs no strip per worker, so every width can select
+     * the panel. The slot is the panel plus, when a later partition spans
+     * several panels, one carry per row; only the carry depends on the width
+     * (through the serial partition count), so the quote is non-decreasing in
+     * @p workers and a narrower retained team never borrows more.
+     */
+    template <class PartitionsAt>
+        requires std::invocable<PartitionsAt &, int>
+    std::size_t pooledWorkspaceFloats(Format format, int lanes, int rows, int blocks, int workers,
+        PartitionsAt &&partitions_at)
+    {
+        if ((lanes != 8 && lanes != 16) || blocks <= 0 || workers <= 0)
+            throw std::invalid_argument("Native x86 pooled prefill panel requires positive admitted geometry");
+        if (format == Format::None || rows < min_pooled_rows)
+            return 0;
+        const int strip = pooledStrip(lanes);
+        const auto largest_slot = workerFloats(format, strip, rows, blocks, 2);
+        if (static_cast<std::size_t>(workers) > std::numeric_limits<std::size_t>::max() / sizeof(float) / largest_slot)
+            throw std::overflow_error("Native x86 pooled prefill panel exceeds admitted worker storage");
+        std::size_t quote = 0;
+        for (int width = workers; width >= 1; --width)
+        {
+            if (quote / static_cast<std::size_t>(width) >= largest_slot)
+                break; // No narrower team can exceed the quote.
+            quote = std::max(quote, static_cast<std::size_t>(width) *
+                workerFloats(format, strip, rows, blocks, static_cast<int>(partitions_at(width))));
+        }
+        return quote;
     }
 
     /**

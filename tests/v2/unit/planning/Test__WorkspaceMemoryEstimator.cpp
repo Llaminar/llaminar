@@ -144,19 +144,24 @@ TEST(Test__WorkspaceMemoryEstimator, CPUProjectionPanelUsesParticipantAndPhysica
     // 64-column chunk.
     expectPartials("Q4_K", 8 * (8 + 2) * 64);
     expectPartials("IQ2_S", 0);
+    // Below the dense panel's sixteen rows the stage may still carry pooled
+    // ordinary-prefill members of the batched expert route (from two rows):
+    // one whole-chunk AVX-512 slot per worker, here one worker.
     geometry.rows = 15;
+    expectPartials("Q4_K", 8 * (8 + 2) * 64);
+    geometry.rows = 1; // One row has no pooled panel and no dense panel.
     expectPartials("Q4_K", 0);
     geometry.rows = rows;
     geometry.workers = 2;
     geometry.serial_n = 128; // Strip eligibility is based on physical N, not the serial policy's width.
     geometry.n = 16;
     // One sixteen-column AVX-512 strip: the admitted two-worker team cannot
-    // select the panel, but a one-worker team can, with one 64-column slot.
-    expectPartials("Q4_K", 8 * (8 + 2) * 64);
+    // select the dense panel (a one-worker team can, with one 64-column slot),
+    // but pooled members need no strip per worker: two whole-chunk slots.
+    expectPartials("Q4_K", 2 * 8 * (8 + 2) * 64);
     geometry.n = 17; // A masked tail is the second worker's sixteen-column strip.
-    // Two workers own sixteen-column strips (two slots); one worker owns the
-    // chunk (one wide slot, twice as large), which the quote must cover.
-    expectPartials("Q4_K", std::max(2 * 8 * (8 + 2) * 16, 8 * (8 + 2) * 64));
+    // Dense: two sixteen-column slots or one wide slot; pooled: two wide slots.
+    expectPartials("Q4_K", std::max({2 * 8 * (8 + 2) * 16, 8 * (8 + 2) * 64, 2 * 8 * (8 + 2) * 64}));
     geometry.n = 129; // Three chunks: both widths of the team own whole-chunk strips.
     expectPartials("Q4_K", 2 * 8 * (8 + 2) * 64);
     geometry.n = 16;
@@ -190,6 +195,41 @@ TEST(Test__WorkspaceMemoryEstimator, CPUProjectionPanelUsesParticipantAndPhysica
     EXPECT_EQ(panel::stripColumns(16, 129, 3), 64);
     EXPECT_EQ(panel::stripColumns(16, 128, 3), 16);
     EXPECT_EQ(panel::stripColumns(8, 4096, 1), 8);
+}
+
+/** @test Pooled expert-prefill panels are quoted from two rows, one whole-chunk (AVX-512) or eight-column (AVX2) slot per worker. */
+TEST(Test__WorkspaceMemoryEstimator, CPUProjectionPooledPanelQuoteStartsAtTwoRows)
+{
+    namespace panel = cpu::native_quantised::x86_panel;
+    static_assert(panel::min_pooled_rows == 2 && panel::min_pooled_rows <= panel::min_rows);
+    EXPECT_EQ(panel::pooledStrip(16), panel::wide_strip);
+    EXPECT_EQ(panel::pooledStrip(8), 8);
+    const auto contiguous = [](int) { return 0; };
+    const auto sixteen = [](int) { return 16; };
+    for (int workers = 1; workers <= 64; ++workers)
+    {
+        SCOPED_TRACE(workers);
+        // Sixteen K blocks: at most eight in the panel, no carry in either tree.
+        EXPECT_EQ(panel::pooledWorkspaceFloats(panel::Format::IQ3S, 16, 2, 16, workers, contiguous),
+            std::size_t(workers) * 8 * (8 + 1) * 64);
+        EXPECT_EQ(panel::pooledWorkspaceFloats(panel::Format::Q5K, 8, 3, 16, workers, sixteen),
+            std::size_t(workers) * 8 * (8 + 2) * 8);
+        EXPECT_EQ(panel::pooledWorkspaceFloats(panel::Format::Q4K, 16, 1, 16, workers, contiguous), 0u);
+        EXPECT_EQ(panel::pooledWorkspaceFloats(panel::Format::None, 16, 31, 16, workers, contiguous), 0u);
+        // 144 blocks over 16 partitions of nine: one carry partial per row and
+        // strip column after the eight-block panel, rounded to a cache line.
+        EXPECT_EQ(panel::pooledWorkspaceFloats(panel::Format::Q4K, 8, 31, 144, workers, sixteen),
+            std::size_t(workers) * (8 * (8 + 2) * 8 + 32 * 8));
+    }
+    // Only a narrower team folds long partitions here: the admitted quote
+    // still covers its carry, and never shrinks with the admitted width.
+    const auto carry_only_alone = [](int width) { return width == 1 ? 2 : 0; };
+    EXPECT_EQ(panel::pooledWorkspaceFloats(panel::Format::Q4K, 16, 100, 144, 1, carry_only_alone),
+        8u * (8 + 2) * 64 + 100u * 64);
+    EXPECT_EQ(panel::pooledWorkspaceFloats(panel::Format::Q4K, 16, 100, 144, 2, carry_only_alone),
+        std::max(2u * 8 * (8 + 2) * 64, 8u * (8 + 2) * 64 + 100u * 64));
+    EXPECT_THROW(panel::pooledWorkspaceFloats(panel::Format::Q4K, 16, 31, 144, 0, contiguous), std::invalid_argument);
+    EXPECT_THROW(panel::pooledWorkspaceFloats(panel::Format::Q4K, 12, 31, 144, 1, contiguous), std::invalid_argument);
 }
 
 /** @test The panel quote covers every team narrower than the admitted width and never shrinks with it. */

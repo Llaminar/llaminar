@@ -1524,9 +1524,31 @@ namespace
                     packed.usesCompactMultiScale()
                         ? selectSerialKPartPrefillRowsPolicy(prefill.use_avx512, rows)
                         : expected_decode);
+                // An ordinary Prefill member with an x86 panel source streams
+                // pooled packed panels from two rows whenever its route borrows
+                // no partial bank: one slot of a whole 64-column chunk (AVX-512)
+                // or eight columns (AVX2) per worker. Decode and an equally large
+                // MTP batch never acquire that prompt scheduling.
+                namespace panel = llaminar2::cpu::native_quantised::x86_panel;
+                const auto panel_format = panel::formatFor(packed.encoding, packed.codebook_id);
+                const bool bankless = prefill.partial_route == NativeQuantisedFusedPartialRoute::FullK ||
+                    prefill.partial_route == NativeQuantisedFusedPartialRoute::OutputTileLocal;
+                const bool pooled = panel_format != panel::Format::None && rows >= panel::min_pooled_rows && bankless;
+                EXPECT_EQ(prefill.projections[0].packed_panel, pooled);
+                EXPECT_FALSE(decode.projections[0].packed_panel);
+                if (pooled)
+                    EXPECT_EQ(prefill.sharedPartialFloats(), 7u * panel::workerFloats(panel_format,
+                        panel::pooledStrip(prefill.use_avx512 ? 16 : 8), rows, packed.blocks_per_row,
+                        std::max(1, prefill.projections[0].k_tiles)));
+                descriptor.purpose = ProjectionRowsPurpose::MTPVerifier;
+                const auto verifier = planNativeQuantisedFusedRows({&descriptor, 1}, rows, 7);
+                EXPECT_FALSE(verifier.projections[0].packed_panel);
+                EXPECT_EQ(verifier.panel_workers, 0);
+                descriptor.purpose = ProjectionRowsPurpose::Prefill;
                 descriptor.verifier_schedule = VerifierRowsPolicy::Pairwise;
                 EXPECT_EQ(planNativeQuantisedFusedRows({&descriptor, 1}, rows, 7)
                     .projections[0].effective_verifier_schedule, VerifierRowsPolicy::Pairwise);
+                EXPECT_FALSE(planNativeQuantisedFusedRows({&descriptor, 1}, rows, 7).projections[0].packed_panel);
                 descriptor.purpose = static_cast<ProjectionRowsPurpose>(-1);
                 EXPECT_THROW(planNativeQuantisedFusedRows({&descriptor, 1}, rows, 7), std::invalid_argument);
 #endif

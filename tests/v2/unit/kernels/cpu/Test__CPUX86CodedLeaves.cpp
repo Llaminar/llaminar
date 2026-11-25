@@ -17,7 +17,11 @@
  * - packed prefill panels: whole 64-column AVX-512 strips (two rows by four
  *   vectors) when every worker owns one, sixteen-column strips (four rows)
  *   otherwise, and two-row AVX2 strips, including explicit backend-native and
- *   GPU-aligned K partition trees that carry partials across panels.
+ *   GPU-aligned K partition trees that carry partials across panels, and
+ *   trees whose whole partitions fit one panel and fold in registers;
+ * - pooled packed panels of the batched expert route: ordinary-prefill members
+ *   of a multi-projection launch from two rows stream one 64-column chunk per
+ *   task through a uniformly strided worker slot of the invocation's slab.
  *
  * Each case builds sealed prepared publications directly (random payloads and
  * codes, controlled scale words) and compares the production entry bitwise
@@ -945,31 +949,54 @@ namespace llaminar2::test
     /** @test Panels fold explicit backend-native and GPU-aligned K trees exactly like serial partial banks. */
     TEST(CPUX86CodedLeaves, PanelPartitionedTreesEqualSerialPartials)
     {
-        // A ragged N tail (122 = 64 + 58) on both strip widths; 149 blocks in
+        // A ragged N tail (122 = 64 + 58) on both strip widths. 149 blocks in
         // three partitions of 50 or sixteen of 10 carry partials across panels.
-        constexpr int n = 128, live_n = 122, blocks = 149, rows = 17, stride = live_n + 3;
+        // Partitions that fit one eight-block panel pack whole partitions and
+        // fold them in registers: 37 blocks in five of eight (one per panel),
+        // sixteen of three (two per panel, three empty trailing partitions) or
+        // 37 of one; 17 blocks in sixteen of two (seven empty trailing); the
+        // register fold applies to GPU-aligned trees only. Two NaN superblocks
+        // of different payloads prove that every GPU-aligned fold keeps the
+        // earlier partition's NaN (its ordered-add contract), as the serial
+        // partial bank does. Backend-native NaN cells are not compared here:
+        // its fold is a plain FP32 add whose NaN operand order the compiler
+        // picks, and the unchanged per-partition panel program already
+        // publishes other NaN payloads than the serial bank at 67dac67f7
+        // (pre-existing, see the PR's x86 expert-panel evidence). This change
+        // keeps that program byte for byte; finite cells cover both policies.
+        constexpr int n = 128, live_n = 122, rows = 17, stride = live_n + 3;
         constexpr float dirty = -12345.5f;
         const int lanes = activeISALevel() >= ISALevel::AVX512 ? 16 : 8;
-        const auto activation = makeActivations(rows, blocks, 1313u);
-        for (const Layout &layout : {kQ5K, kIQ3S, kQ4K, kIQ4XS, kQ50})
-            for (const Policy policy : kPolicies)
-            {
-                SCOPED_TRACE(std::string(layout.name) + " policy=" + std::to_string(int(policy)));
-                CPUNativeQuantisedPackedWeights packed;
-                makeWeights(packed, layout, n, blocks, policy, Scales::Finite, 131u + layout.codebook, live_n);
-                const auto format = x86_panel::formatFor(packed.encoding, packed.codebook_id);
-                const auto view = packed.readView();
-                const CPUProjectionRowGrid grid(rows, nullptr);
-                for (const int partitions : {3, 16})
+        struct Tree
+        {
+            int blocks, partitions;
+        };
+        for (const Tree tree : {Tree{149, 3}, Tree{149, 16}, Tree{37, 5}, Tree{37, 16}, Tree{37, 37}, Tree{17, 16}})
+        {
+            const int blocks = tree.blocks, partitions = tree.partitions;
+            const auto activation = makeActivations(rows, blocks, 1313u + blocks);
+            for (const Layout &layout : {kQ5K, kIQ3S, kQ4K, kIQ4XS, kQ50})
+                for (const Policy policy : kPolicies)
+                for (const Scales scales : {Scales::Finite, Scales::TwoNaNSources})
                 {
+                    if (scales == Scales::TwoNaNSources && policy != Policy::GPUAlignedExpert)
+                        continue;
+                    SCOPED_TRACE(std::string(layout.name) + " policy=" + std::to_string(int(policy)) + " blocks=" +
+                                 std::to_string(blocks) + " partitions=" + std::to_string(partitions) +
+                                 " nan=" + std::to_string(scales == Scales::TwoNaNSources));
+                    CPUNativeQuantisedPackedWeights packed;
+                    makeWeights(packed, layout, n, blocks, policy, scales, 131u + layout.codebook, live_n);
+                    const auto format = x86_panel::formatFor(packed.encoding, packed.codebook_id);
+                    const auto view = packed.readView();
+                    const CPUProjectionRowGrid grid(rows, nullptr);
                     const auto serial = partitionedSerialRows(packed, activation, rows, stride, partitions, dirty);
+                    // Carry exactly when a partition is longer than one panel.
+                    ASSERT_EQ(x86_panel::needsCarry(blocks, partitions), (blocks - 1) / partitions + 1 > x86_panel::depth);
                     for (const int workers : {1, 2, 3})
                     {
-                        SCOPED_TRACE("partitions=" + std::to_string(partitions) + " workers=" +
-                                     std::to_string(workers) + " strip=" +
+                        SCOPED_TRACE("workers=" + std::to_string(workers) + " strip=" +
                                      std::to_string(x86_panel::stripColumns(lanes, live_n, workers)));
                         ScopedTeam team(workers);
-                        ASSERT_TRUE(x86_panel::needsCarry(blocks, partitions));
                         std::vector<float> actual(std::size_t(rows) * stride, dirty);
                         std::vector<float> scratch(
                             x86_panel::invocationFloats(format, lanes, rows, live_n, blocks, partitions, workers), dirty);
@@ -980,13 +1007,163 @@ namespace llaminar2::test
                             for (int column = 0; column < stride; ++column)
                             {
                                 const auto index = std::size_t(row) * stride + column;
-                                ASSERT_EQ(std::bit_cast<std::uint32_t>(actual[index]),
-                                          std::bit_cast<std::uint32_t>(serial[index]))
+                                ASSERT_PRED2(sameOutput, std::bit_cast<std::uint32_t>(actual[index]),
+                                             std::bit_cast<std::uint32_t>(serial[index]))
                                     << "row=" << row << " column=" << column;
                             }
                     }
                 }
-            }
+        }
+    }
+
+    /**
+     * @test Ordinary-prefill fused members stream pooled packed panels from the admitted slab and keep serial bytes.
+     * @details The batched MoE expert route pools many small expert projections
+     * in one team. A Prefill member with automatic schedules, an x86 panel
+     * source and at least two rows takes one task per 64-column chunk that
+     * decodes each weight strip once for all of its rows, instead of register
+     * row tiles that re-decode every weight per tile (the file-density IQ3_S
+     * expert down-projection prefill regression). Every byte still equals
+     * independent serial M=1 decode, with and without bias, for both policies,
+     * one and three workers, a new and a retained team, 16-, 17- and 40-block
+     * K (one-block, two-block-with-empty-tail and three-block GPU-aligned
+     * partitions), a masked N tail and single-row members beside panel
+     * members. The launch borrows one uniformly strided slot per worker of the
+     * invocation's slab, never more than the members' admitted envelope; a
+     * one-float-short slab is rejected before any write. Decode members,
+     * explicit ISA and explicit ownership keep their register tiles.
+     */
+    TEST(CPUX86CodedLeaves, FusedPrefillMembersStreamPanelsAndRetainSerialBytes)
+    {
+        constexpr std::array<int, 5> member_rows{17, 3, 33, 16, 1};
+        constexpr int members = static_cast<int>(member_rows.size()), n = 128, live_n = 65;
+        constexpr float dirty = 123456.0f;
+        const int lanes = activeISALevel() >= ISALevel::AVX512 ? 16 : 8;
+        for (const Layout &layout : {kIQ3S, kQ5K, kQ50, kQ4K, kIQ4XS})
+            for (const Policy policy : kPolicies)
+                for (const int blocks : {16, 17, 40})
+                    for (const int workers : {1, 3})
+                    {
+                        SCOPED_TRACE(std::string(layout.name) + " policy=" + std::to_string(int(policy)) + " blocks=" +
+                                     std::to_string(blocks) + " workers=" + std::to_string(workers));
+                        ScopedTeam team(workers);
+                        std::array<CPUNativeQuantisedPackedWeights, members> packed;
+                        std::array<std::vector<Q8_1Block>, members> input;
+                        std::array<std::vector<float>, members> actual, expected, bias;
+                        std::array<FusedVerifierRowsDesc, members> descriptors;
+                        for (int p = 0; p < members; ++p)
+                        {
+                            makeWeights(packed[p], layout, n, blocks, policy, Scales::Finite, 401u + 17u * p + blocks,
+                                        live_n);
+                            const int m = member_rows[p], stride = live_n + 3;
+                            input[p] = makeActivations(m, blocks, 777u + 29u * p + blocks);
+                            expected[p].assign(std::size_t(m - 1) * stride + live_n + 4, dirty);
+                            {
+                                std::vector<float> scratch(nativeQuantisedProjectionPartialFloats(packed[p], 1));
+                                for (int row = 0; row < m; ++row)
+                                    gemv_native_quantised_preq(packed[p], input[p].data() + std::size_t(row) * blocks,
+                                                               expected[p].data() + std::size_t(row) * stride, scratch);
+                            }
+                            if (p % 2 == 0)
+                            {
+                                // The fused epilogue adds bias after each row's complete K result.
+                                bias[p].resize(live_n);
+                                for (int column = 0; column < live_n; ++column)
+                                    bias[p][column] = float(column - 31) * 0.0193f;
+                                for (int row = 0; row < m; ++row)
+                                    for (int column = 0; column < live_n; ++column)
+                                    {
+                                        volatile float sum = expected[p][std::size_t(row) * stride + column] + bias[p][column];
+                                        expected[p][std::size_t(row) * stride + column] = sum;
+                                    }
+                            }
+                            actual[p].assign(expected[p].size(), dirty);
+                            descriptors[p] = {.packed = &packed[p], .output = actual[p].data(),
+                                .bias = bias[p].empty() ? nullptr : bias[p].data(), .N = live_n, .ldc = stride,
+                                .rows = m, .input = input[p].data(), .purpose = ProjectionRowsPurpose::Prefill};
+                        }
+                        // Independent slot geometry: up to eight K blocks of eight
+                        // dot-group planes plus a scale plane (and a minimum plane
+                        // for Q4_K/Q5_K) of a whole 64-column chunk (AVX-512) or
+                        // eight columns (AVX2); no partition here spans a panel, so
+                        // no carry; one slot per worker padded to a cache line.
+                        const auto plan = planNativeQuantisedFusedRows(descriptors, 1, workers);
+                        const bool affine = layout.codebook == 5 || layout.codebook == 7;
+                        const std::size_t slot = (std::size_t(std::min(blocks, 8)) * (affine ? 10 : 9) *
+                                                  (lanes == 16 ? 64 : 8) + 15) / 16 * 16;
+                        std::size_t envelope = 0;
+                        for (int p = 0; p < members; ++p)
+                        {
+                            EXPECT_EQ(plan.projections[p].packed_panel, member_rows[p] >= x86_panel::min_pooled_rows) << p;
+                            envelope = std::max(envelope, nativeQuantisedProjectionPartialEnvelopeFloats(packed[p], member_rows[p]));
+                        }
+                        ASSERT_EQ(plan.panel_workers, workers);
+                        EXPECT_EQ(plan.panel_slot_floats, slot);
+                        const std::size_t demand = plan.sharedPartialFloats();
+                        EXPECT_EQ(demand, std::size_t(workers) * slot);
+                        EXPECT_LE(demand, envelope) << "the members' admitted envelope must cover the launch";
+                        const auto reset = [&] { for (auto &bank : actual) std::fill(bank.begin(), bank.end(), dirty); };
+                        const auto check = [&]
+                        {
+                            for (int p = 0; p < members; ++p)
+                                for (std::size_t i = 0; i < actual[p].size(); ++i)
+                                    ASSERT_PRED2(sameOutput, std::bit_cast<std::uint32_t>(actual[p][i]),
+                                                 std::bit_cast<std::uint32_t>(expected[p][i]))
+                                        << "member=" << p << " index=" << i;
+                        };
+                        constexpr std::size_t guard = 64;
+                        std::vector<float> slab(demand + guard);
+                        const std::span<float> exact(slab.data(), demand);
+                        const auto poison = [&] { std::fill(slab.begin(), slab.end(), std::bit_cast<float>(0x7fa00ee1u)); };
+                        const auto guarded = [&]
+                        {
+                            for (std::size_t i = demand; i < slab.size(); ++i)
+                                ASSERT_EQ(std::bit_cast<std::uint32_t>(slab[i]), 0x7fa00ee1u) << "slab overrun at " << i;
+                        };
+                        // A short slab is rejected before any output write.
+                        reset();
+                        EXPECT_THROW((void)gemm_native_quantised_fused_verifier_rows_preq(nullptr, descriptors.data(),
+                            exact.first(demand - 1), members, 1, blocks), std::invalid_argument);
+                        for (const auto &bank : actual)
+                            for (const float value : bank)
+                                ASSERT_EQ(value, dirty);
+                        reset();
+                        poison();
+                        ASSERT_TRUE(gemm_native_quantised_fused_verifier_rows_preq(nullptr, descriptors.data(), exact,
+                                                                                   members, 1, blocks));
+                        check();
+                        guarded();
+                        // A retained team indexes the same slots by its member ids.
+                        reset();
+                        poison();
+#pragma omp parallel
+                        {
+                            (void)gemm_native_quantised_fused_verifier_rows_preq(nullptr, descriptors.data(), exact,
+                                                                                 members, 1, blocks);
+                        }
+                        check();
+                        guarded();
+                        // Decode members, an explicit ISA and explicit ownership keep their tiles.
+                        auto decode = descriptors;
+                        for (auto &d : decode)
+                            d.purpose = ProjectionRowsPurpose::Decode;
+                        const auto unpooled = [&](std::span<const FusedVerifierRowsDesc> bundle, ISAPath path,
+                                                  FusedOutputJobOwnership ownership)
+                        {
+                            const auto other = planNativeQuantisedFusedRows(bundle, 1, workers, path, ownership);
+                            for (int p = 0; p < members; ++p)
+                                EXPECT_FALSE(other.projections[p].packed_panel) << p;
+                            EXPECT_EQ(other.panel_workers, 0);
+                            std::vector<float> bank(std::max<std::size_t>(other.sharedPartialFloats(), 1));
+                            reset();
+                            ASSERT_TRUE(gemm_native_quantised_fused_verifier_rows_preq(nullptr, bundle.data(), bank,
+                                                                                       members, 1, blocks, path, ownership));
+                            check();
+                        };
+                        unpooled(decode, ISAPath::AUTO, FusedOutputJobOwnership::Auto);
+                        unpooled(descriptors, ISAPath::AVX2, FusedOutputJobOwnership::Auto);
+                        unpooled(descriptors, ISAPath::AUTO, FusedOutputJobOwnership::Current);
+                    }
     }
 } // namespace llaminar2::test
 #endif // __AVX2__

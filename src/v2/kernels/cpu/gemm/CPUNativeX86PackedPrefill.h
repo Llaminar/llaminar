@@ -4,6 +4,9 @@
  *
  * The caller selects this route only for ordinary prefill. Verifiers and
  * explicit alternative schedules retain their original arithmetic leaves.
+ * Dense projections workshare their own strips (project()); pooled members
+ * of the batched expert route contribute one task per 64-column chunk to
+ * their launch's workshare (projectPooledChunk()).
  */
 #pragma once
 
@@ -33,4 +36,28 @@ namespace llaminar2::cpu::native_quantised::x86_panel
     void project(const CPUNativeQuantisedWeightView &weights, Format format, const Q8_1Block *activation, float *output,
                  int rows, int output_stride, int partitions, int workers, int lanes, const CPUProjectionRowGrid &grid,
                  const ProjectionRowWork *work, std::span<float> scratch);
+
+    /**
+     * @brief Execute one 64-column chunk task of a pooled member on the calling worker's slot.
+     * @param weights Borrowed admitted resident weights of the member.
+     * @param format Exact decoder for those weights (formatFor() of their encoding).
+     * @param activation The member's Q8 rows; every row is live.
+     * @param output The member's output; only this chunk's columns of its rows are written.
+     * @param rows The member's rows (at least min_pooled_rows).
+     * @param output_stride The member's output row stride, in floats.
+     * @param partitions The member's serial K partition count (at least one).
+     * @param lanes Runtime x86 vector width (8 AVX2, 16 AVX-512); the strip is pooledStrip(lanes).
+     * @param chunk Physical 64-column chunk owned by this task.
+     * @param slot The calling worker's slot of the launch's admitted slab, at least
+     *        workerFloats(format, pooledStrip(lanes), rows, blocks, partitions) floats.
+     * @details The launcher admits geometry, slab extent, alignment and
+     * aliasing for every member before its team writes anything; a task has
+     * no synchronization and writes only its chunk and its own slot, so tasks
+     * of different members and chunks interleave freely in one workshare.
+     * Each strip decodes every K panel once and reuses it for all rows, with
+     * the dense panel program's exact serial M=1 arithmetic.
+     */
+    void projectPooledChunk(const CPUNativeQuantisedWeightView &weights, Format format, const Q8_1Block *activation,
+                            float *output, int rows, int output_stride, int partitions, int lanes, int chunk,
+                            float *slot);
 } // namespace llaminar2::cpu::native_quantised::x86_panel

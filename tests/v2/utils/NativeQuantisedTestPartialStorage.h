@@ -43,7 +43,7 @@ namespace llaminar2::test
         /** @return One address shared by every worker entering the invocation. */
         std::span<float> span() noexcept { return {storage_.data(), storage_.size()}; }
 
-        /** @return Maximum of each actual member's serial/fused slab contribution. */
+        /** @return Maximum of each actual member's serial/fused slab contribution, including pooled panel slots. */
         template<class Descriptor>
         static size_t bundleFloats(const Descriptor *descriptors, int count, int rows)
         {
@@ -66,10 +66,13 @@ namespace llaminar2::test
                 maximum = std::max(maximum, nativeQuantisedProjectionPartialEnvelopeFloats(*packed, member_rows));
 #else
                 const int workers = nativeQuantisedInvocationWorkerCount();
-                const auto config = serialTileConfigForPackedMatrix(*packed,
-                    cpuNativeQuantisedSerialEquivalentPolicyN(packed->N), packed->K, workers);
-                maximum = std::max(maximum, cpuProjectionPartialEnvelopeFloats(
-                    member_rows, packed->N, config.k_tiles, workers, 4));
+                const int policy_n = cpuNativeQuantisedSerialEquivalentPolicyN(packed->N);
+                const auto config = serialTileConfigForPackedMatrix(*packed, policy_n, packed->K, workers);
+                // Ordinary-prefill members from two rows stream pooled panels
+                // from worker slots of the same slab.
+                maximum = std::max({maximum, cpuProjectionPartialEnvelopeFloats(
+                    member_rows, packed->N, config.k_tiles, workers, 4),
+                    nativeQuantisedPooledPanelFloats(*packed, member_rows, policy_n, workers)});
 #endif
             }
             return maximum;
