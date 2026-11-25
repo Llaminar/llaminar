@@ -325,6 +325,8 @@ public:
     std::vector<planning::WitnessRequest> liveWitnessRequests() const;
     /** @return Immutable dimensions; not an observation of device state. */
     const PhysicalPagePoolGeometry &geometry() const noexcept { return geometry_; }
+    /** @return Original PMA instance identity for same-authority admission checks. */
+    const PhysicalMemoryAuthority *issuerForAdmission() const noexcept { return authority_.get(); }
 
 private:
     friend class PhysicalMemoryAuthority;

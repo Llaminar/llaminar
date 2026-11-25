@@ -8996,6 +8996,13 @@ add_v2_test(V2_Integration_PagedKVArchiveContract
     NO_MODELS NO_MPI MPI_PROCS 1 TIMEOUT 30
     ENVIRONMENT "OMP_NUM_THREADS=4;OMP_DYNAMIC=false;LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PagedKVArchiveContract)
+add_v2_test(V2_Integration_PageTableAdmissionContract
+    COMMAND $<TARGET_FILE:v2_test_physical_memory_authority>
+        --gtest_filter=PageTableAdmission.*
+    LABELS "V2;Integration;CPU;DeviceFree;Planning;Contract;Admission;Conservation;Regression;ProductionTestPreflight"
+    NO_MODELS NO_MPI MPI_PROCS 1 TIMEOUT 30
+    ENVIRONMENT "OMP_NUM_THREADS=1;OMP_DYNAMIC=false;LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PageTableAdmissionContract)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PhysicalPagePoolSharingContract)
 add_v2_test(V2_Integration_CompletionWitnessContract
     COMMAND $<TARGET_FILE:v2_test_physical_memory_authority>
@@ -30408,6 +30415,7 @@ add_executable(v2_test_physical_memory_authority
     unit/planning/Test__PhysicalPagePoolReplay.cpp
     unit/planning/Test__PhysicalPagePoolSharing.cpp
     unit/planning/Test__CompletionWitness.cpp
+    unit/planning/Test__PageTableAdmission.cpp
     unit/planning/Test__PhysicalMemoryRankHostPool.cpp
     unit/planning/Test__NativeStoragePreparing.cpp
     unit/backends/Test__PreparedGPUWorkerThread.cpp

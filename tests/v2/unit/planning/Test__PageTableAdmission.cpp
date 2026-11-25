@@ -1,0 +1,115 @@
+/**
+ * @file Test__PageTableAdmission.cpp
+ * @brief All-class table+pool atomic admission contracts (plan P1).
+ *
+ * Constructed lifecycle tests. They verify that a combined pool growth +
+ * table bank admission either returns both cells or refuses without leaving a
+ * usable partial reservation, across exact fit, exhaustion, aborted update and
+ * foreign-authority rejection.
+ */
+#include "planning/PageTableAdmission.h"
+#include <gtest/gtest.h>
+#include <vector>
+
+using namespace llaminar2;
+namespace
+{
+/** @brief One exact PMA authority with a small pool + table. */
+struct CombinedFixture
+{
+    std::shared_ptr<PhysicalMemoryAuthority> authority;
+    std::shared_ptr<PhysicalPagePool> pool;
+    std::shared_ptr<CPUFP32PagedKVTable> table;
+    CombinedFixture(size_t frames = 3, size_t banks = 2)
+    {
+        const auto device = DeviceId::cpu();
+        const PhysicalPagePoolGeometry pool_geometry{frames, 64, 4, frames};
+        const CPUFP32PagedKVTableGeometry table_geometry{1, banks, 2, 1};
+        const auto bytes = PhysicalPagePool::physicalBytes(pool_geometry, device) +
+            CPUFP32PagedKVTable::physicalBytes(table_geometry, device);
+        PhysicalMemoryPlanBuilder plan;
+        plan.add({.world_rank=0, .device=device, .total_bytes=bytes, .admission_available_bytes=bytes},
+            PhysicalMemoryOwner::KVCache, bytes);
+        authority = std::make_shared<PhysicalMemoryAuthority>(
+            std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()), 0);
+        pool = authority->createCPUPagePool(device, pool_geometry, CPUStoragePlacement::local());
+        table = CPUFP32PagedKVTable::create(authority, device, table_geometry);
+    }
+};
+}
+
+/** @test Combined admission returns both cells; refusal before pool exhaustion rolls back. */
+TEST(PageTableAdmission, CombinedAdmissionReturnsBothOrRollsBack)
+{
+    CombinedFixture fx;
+    auto admitted = admitPoolAndTable(*fx.pool, *fx.table, 2);
+    ASSERT_TRUE(admitted);
+    EXPECT_EQ(admitted->grant.remainingCommitment(), 2u);
+    // Attach one page and publish through the reserved bank.
+    std::vector<float> rows(2 * 4, 1.0f);
+    auto frame = admitted->grant.assignFrame();
+    auto plan = admitted->grant.prepareFreshWrite(frame, rows.size() * sizeof(float));
+    ASSERT_TRUE(plan);
+    plan->copyFrom(std::as_bytes(std::span(rows)));
+    admitted->table_update.append(CPUFP32KVPage(plan->commit(), 1, 4));
+    auto snapshot = admitted->table_update.commit();
+    EXPECT_NO_THROW(snapshot.view());
+}
+
+/** @test Pool exhaustion refuses before the table reservation is usable. */
+TEST(PageTableAdmission, PoolExhaustionRollsBackTableReservation)
+{
+    CombinedFixture fx(/*frames=*/1, /*banks=*/2);
+    // Consume the only frame.
+    auto holder = fx.pool->tryAdmit(1);
+    ASSERT_TRUE(holder);
+    (void)holder->assignFrame();
+    // Combined admission must refuse; no table bank may remain reserved.
+    auto refused = admitPoolAndTable(*fx.pool, *fx.table, 1);
+    EXPECT_FALSE(refused);
+    // The table must still offer a fresh bank afterwards.
+    auto update = fx.table->tryBeginUpdate();
+    ASSERT_TRUE(update);
+}
+
+/** @test Table-bank exhaustion refuses before the pool grant is usable. */
+TEST(PageTableAdmission, TableExhaustionRollsBackPoolGrant)
+{
+    CombinedFixture fx(3, /*banks=*/1);
+    auto first = admitPoolAndTable(*fx.pool, *fx.table, 1);
+    ASSERT_TRUE(first);
+    // Holding the only bank; a second combined admission must refuse and roll
+    // back the pool grant (no leaked protection).
+    auto second = admitPoolAndTable(*fx.pool, *fx.table, 1);
+    EXPECT_FALSE(second);
+    // No protected growth leaked by the refusal: one frame is already held by
+    // the first admission, so exactly two remain available.
+    auto check = fx.pool->tryAdmit(2);
+    ASSERT_TRUE(check);
+    EXPECT_EQ(check->remainingCommitment(), 2u);
+}
+
+/** @test Foreign-authority combination is rejected before acquiring anything. */
+TEST(PageTableAdmission, ForeignAuthorityIsRejectedBeforeAcquisition)
+{
+    CombinedFixture fx;
+    CombinedFixture foreign;
+    EXPECT_THROW(admitPoolAndTable(*fx.pool, *foreign.table, 1), std::invalid_argument);
+    auto check = fx.pool->tryAdmit(3);
+    ASSERT_TRUE(check);
+    EXPECT_EQ(check->remainingCommitment(), 3u);
+}
+
+/** @test Aborted combined admission keeps both classes available for the next attempt. */
+TEST(PageTableAdmission, AbortedCombinedAdmissionLeavesBothClassesAvailable)
+{
+    CombinedFixture fx;
+    {
+        auto admitted = admitPoolAndTable(*fx.pool, *fx.table, 1);
+        ASSERT_TRUE(admitted);
+        // Abort both cells: grant + reserved table bank roll back by RAII.
+    }
+    auto again = admitPoolAndTable(*fx.pool, *fx.table, 1);
+    ASSERT_TRUE(again);
+    EXPECT_EQ(again->grant.remainingCommitment(), 1u);
+}

@@ -91,6 +91,8 @@ public:
     std::optional<Update> tryBeginUpdate();
     /** @brief Freeze new borrows of an exact published version before joining its existing readers. */
     void closeBorrowers(const Snapshot &snapshot);
+    /** @return Original PMA instance identity for same-authority admission checks. */
+    const PhysicalMemoryAuthority *issuerForAdmission() const noexcept { return authority_.get(); }
 private:
     enum class Phase : std::uint8_t { Free, Preparing, Published };
     /** @brief Exact CPU ownership state within the charged metadata root. */
