@@ -335,6 +335,117 @@ TEST_F(CPUNativeNEONExecution, FusedActualOwnersRetainMemberGeometryAndInputs)
     for (const auto &bank : actual) for (const auto value : bank) EXPECT_EQ(value, 123456.0f);
 }
 
+/**
+ * @test Ordinary-prefill fused members stream packed panels from the admitted slab and keep serial bytes.
+ * @details The batched MoE expert route pools many small expert projections in
+ * one team. A Prefill member whose source, rows and team admit the dense
+ * packed-panel route must take it here too, decoding each weight strip once for
+ * all of its rows instead of once per register row tile (the IQ3_S expert
+ * down-projection prefill regression), while every byte still equals
+ * independent serial M=1 decode, with and without bias, for both policies,
+ * every compiled dot family, a new and a retained team, and ragged K.
+ * Panel and tile members share one workshare and one uniformly strided slab;
+ * a short slab is rejected before any write; Decode members never borrow it.
+ */
+TEST_F(CPUNativeNEONExecution, FusedPrefillMembersStreamPanelsAndRetainSerialBytes)
+{
+    const Budget budget;
+    constexpr std::array<int, 5> member_rows{17, 3, 33, 16, 1};
+    constexpr int members = static_cast<int>(member_rows.size());
+    for (const auto *source : {&native_quantised_formats::IQ3_S, &native_quantised_formats::Q5_K,
+         &native_quantised_formats::Q5_0, &native_quantised_formats::IQ4_XS})
+        for (const auto policy : {CPUProjectionNumericalPolicy::BackendNative, CPUProjectionNumericalPolicy::GPUAlignedExpert})
+            for (const int k : {512, 544})
+                for (const int workers : {1, 3})
+                {
+                    SCOPED_TRACE(::testing::Message() << "codebook=" << int(source->codebook_id) << " policy="
+                        << int(policy) << " k=" << k << " workers=" << workers);
+                    std::array<CPUNativeQuantisedPackedWeights, members> packed;
+                    std::array<std::vector<Q8_1Block>, members> input;
+                    std::array<std::vector<float>, members> actual, expected, bias;
+                    std::array<FusedVerifierRowsDesc, members> descriptors;
+                    for (int p = 0; p < members; ++p)
+                    {
+                        packed[p] = owner(*source, 65, k, policy);
+                        const int m = member_rows[p], stride = packed[p].N + 3;
+                        input[p] = q8Rows(m, packed[p].blocks_per_row, 29 * p);
+                        expected[p].assign(std::size_t(m - 1) * stride + packed[p].N + 4, 123456.0f);
+                        serial(packed[p], input[p], expected[p], m, stride, m);
+                        if (p % 2 == 0)
+                        {
+                            bias[p].resize(packed[p].N);
+                            for (int n = 0; n < packed[p].N; ++n) bias[p][n] = float(n - 31) * 0.0193f;
+                            for (int row = 0; row < m; ++row)
+                                for (int n = 0; n < packed[p].N; ++n)
+                                    expected[p][std::size_t(row) * stride + n] =
+                                        memoryRoundedAdd(expected[p][std::size_t(row) * stride + n], bias[p][n]);
+                        }
+                        actual[p].assign(expected[p].size(), 123456.0f);
+                        descriptors[p] = {.packed = &packed[p], .output = actual[p].data(),
+                            .bias = bias[p].empty() ? nullptr : bias[p].data(), .N = packed[p].N, .ldc = stride,
+                            .rows = m, .input = input[p].data(), .purpose = ProjectionRowsPurpose::Prefill};
+                    }
+                    omp_set_num_threads(workers);
+                    const bool supported = source != &native_quantised_formats::IQ4_XS &&
+                        (source != &native_quantised_formats::Q5_0 || workers == 1);
+                    const auto plan = planNativeQuantisedFusedRows(descriptors, 1, workers);
+                    std::size_t demand = 0;
+                    for (int p = 0; p < members; ++p)
+                    {
+                        EXPECT_EQ(plan.panels[p], supported && member_rows[p] >= neon_panel::min_rows) << p;
+                        if (plan.panels[p])
+                            demand = std::max(demand, nativeQuantisedProjectionPartialFloats(packed[p], member_rows[p]));
+                    }
+                    // The launch borrows exactly what the stage's admitted slab declares.
+                    EXPECT_EQ(plan.sharedPartialFloats(), demand);
+                    const auto reset = [&] { for (auto &bank : actual) std::fill(bank.begin(), bank.end(), 123456.0f); };
+                    const auto check = [&] { for (int p = 0; p < members; ++p) bytes(actual[p], expected[p]); };
+                    AlignedVector<float> slab;
+                    slab.resize_uninitialized(demand + 32);
+                    const std::span<float> exact(slab.data(), demand);
+                    const auto poison = [&] { std::fill(slab.data(), slab.data() + slab.size(), std::bit_cast<float>(0x7fa00ee1u)); };
+                    if (demand)
+                    {
+                        reset();
+                        EXPECT_THROW((void)gemm_native_quantised_fused_verifier_rows_preq(nullptr, descriptors.data(),
+                            exact.first(demand - 1), members, 1, packed[0].blocks_per_row), std::invalid_argument);
+                        for (const auto &bank : actual) for (const auto value : bank) EXPECT_EQ(value, 123456.0f);
+                    }
+                    const auto run = [&](ISAPath path) {
+                        reset(); poison();
+                        EXPECT_TRUE(gemm_native_quantised_fused_verifier_rows_preq(nullptr, descriptors.data(), exact,
+                            members, 1, packed[0].blocks_per_row, path));
+                        check();
+                    };
+                    run(ISAPath::AUTO);
+                    run(ISAPath::NEON);
+#if defined(__ARM_FEATURE_DOTPROD)
+                    run(ISAPath::NEON_DOTPROD);
+#endif
+#if LLAMINAR_COMPILED_WITH_NEON_I8MM
+                    run(ISAPath::NEON_I8MM);
+#endif
+                    // A retained team indexes the same slots by its member ids.
+                    reset(); poison();
+#pragma omp parallel
+                    {
+                        (void)gemm_native_quantised_fused_verifier_rows_preq(nullptr, descriptors.data(), exact,
+                            members, 1, packed[0].blocks_per_row);
+                    }
+                    check();
+                    // Decode members keep their register tiles and borrow no slab.
+                    auto decode = descriptors;
+                    for (auto &d : decode) d.purpose = ProjectionRowsPurpose::Decode;
+                    const auto decode_plan = planNativeQuantisedFusedRows(decode, 1, workers);
+                    for (int p = 0; p < members; ++p) EXPECT_FALSE(decode_plan.panels[p]);
+                    EXPECT_EQ(decode_plan.sharedPartialFloats(), 0u);
+                    reset();
+                    EXPECT_TRUE(gemm_native_quantised_fused_verifier_rows_preq(nullptr, decode.data(), {}, members, 1,
+                        packed[0].blocks_per_row));
+                    check();
+                }
+}
+
 /** @test FP32 publication/BLAS and paired-Q8 operation use real owner bindings for every format. */
 TEST_F(CPUNativeNEONExecution, AllSourcesFP32EpilogueAndTwoTermRetainOriginalRows)
 {

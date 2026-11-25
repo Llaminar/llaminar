@@ -8,6 +8,13 @@
  * Native FP32 state rolls directly through the destination between panels;
  * an ordered partition spanning panels keeps its unfinished sum separate from
  * the already folded destination. No output tile is staged and then copied.
+ *
+ * One 64-column chunk is the unit of work. A dense projection workshares its
+ * own chunks; a pooled multi-projection launch (the batched MoE expert route)
+ * interleaves the chunk tasks of several admitted bindings in one workshare,
+ * every binding using the same uniform slot stride of one shared slab. An
+ * optional bias row is added after each row's complete K result, with the
+ * same FP32 operation and operand order as the register tile route.
  */
 #pragma once
 
@@ -34,49 +41,88 @@ namespace llaminar2::cpu::native_quantised
     public:
         /**
          * @brief Check the stage-owned worker bank before any quantizer or dot writes.
-         * @param batch Admitted original-coordinate projection with no attached bias.
+         * @param batch Admitted original-coordinate projection; an attached bias is
+         *        added after each row's complete K result.
          * @param scratch Persistent slab, disjoint from all invocation inputs and outputs.
          * @param workers Budget for the active or prospective OpenMP team.
          * @return Binding that uses only the admitted slab prefix.
+         * @throws std::invalid_argument For ineligible geometry, a short or misaligned
+         *         slab, or a slab aliasing any invocation publication.
          */
         static CPUNativeNEONPackedPrefill bind(const CPUNativeNEONProjectionBatch &batch,
             std::span<float> scratch, int workers)
         {
             const auto &w = batch.weights_;
-            const int rows = static_cast<int>(batch.activation_.size() / w.blocks_per_row);
-            if (workers <= 0 || !batch.bias_.empty() || !neon_panel::supports(w.encoding, w.codebook_id, w.is_asymmetric) ||
-                rows < neon_panel::min_rows)
-                throw std::invalid_argument("Native NEON prefill requires eligible retained panel geometry");
-            const auto used = neon_panel::workspaceFloats(w.encoding, w.codebook_id, w.is_asymmetric,
-                rows, w.K, workers, w.numerical_policy);
-            if (scratch.size() < used || reinterpret_cast<std::uintptr_t>(scratch.data()) % 64)
-                throw std::invalid_argument("Native NEON prefill requires its aligned per-worker projection slab");
-            const storage_proof::Bytes writes{scratch.data(), used * sizeof(float)};
-            storage_proof::requireDisjoint(writes, {batch.activation_.data(), batch.activation_.size_bytes()});
-            storage_proof::requireDisjoint(writes, {batch.output_.data(), batch.output_.size_bytes()});
-            storage_proof::requireDisjoint(writes, {w.bytes().data(), w.bytes().size()});
-            storage_proof::requireOriginalWorkReadOnly(writes, batch.grid_.publication());
-            return {batch, scratch.data(), neon_panel::workerFloats(rows, w.K, w.numerical_policy), workers};
+            const auto slot = neon_panel::workerFloats(rowsOf(batch), w.K, w.numerical_policy);
+            admit(batch, scratch, workers, slot);
+            return {batch, scratch.data(), slot, workers};
+        }
+
+        /**
+         * @brief Admit one member of a pooled multi-projection launch before any team write.
+         * @param batch Admitted original-coordinate member projection.
+         * @param scratch The launch's single slab; worker w owns [w*slot_floats, (w+1)*slot_floats).
+         * @param workers Admitted slot count; the executing team must not exceed it.
+         * @param slot_floats Launch-uniform slot stride, at least this member's own worker demand,
+         *        so that concurrently running members of one launch never share a slot.
+         * @return Binding whose chunk tasks touch only the calling worker's slot.
+         * @throws std::invalid_argument For ineligible geometry, a short stride or slab,
+         *         misalignment, or a slab aliasing this member's publications.
+         */
+        static CPUNativeNEONPackedPrefill bindPooled(const CPUNativeNEONProjectionBatch &batch,
+            std::span<float> scratch, int workers, std::size_t slot_floats)
+        {
+            admit(batch, scratch, workers, slot_floats);
+            return {batch, scratch.data(), slot_floats, workers};
         }
 
         /** @brief Execute the checked packed panel binding with its admitted native dot family. */
         template<Dot Instruction> void execute() const
         {
             if (!batch_.grid_.beginWorkshare()) return;
-            const int team = llaminar::v2::inLexicalWorkshare() ? omp_get_num_threads() : omp_get_max_threads();
-            if (team > workers_)
-                throw std::invalid_argument("Native NEON prefill team exceeds its admitted projection slab");
+            requireTeam(llaminar::v2::inLexicalWorkshare() ? omp_get_num_threads() : omp_get_max_threads());
             if constexpr (Instruction != Dot::ASIMD)
                 ARMCPUCapabilities::native().require(ARMCPUFeature::DotProd);
             if constexpr (Instruction == Dot::I8MM)
                 ARMCPUCapabilities::native().require(ARMCPUFeature::IntegerMatMul);
-            const auto &w = batch_.weights_;
-            if (w.usesCompactMultiScale())
-            {
-                if (w.codebook_id == 11) return dispatch<Instruction, 11>();
-                return dispatch<Instruction, 7>();
-            }
-            dispatch<Instruction, 0>();
+            const int chunks = batch_.weights_.N_padded / 64;
+            auto work = [&] {
+                ARMFloatingPointProfile::require("Native NEON packed prefill");
+#pragma omp for schedule(dynamic, 1)
+                for (int chunk = 0; chunk < chunks; ++chunk)
+                    runAdmittedTask<Instruction>(chunk);
+            };
+            OMP_WORKSHARE_REGION(work);
+        }
+
+        /**
+         * @brief Reject a team wider than the admitted slot count, before any team write.
+         * @param team Width of the active or prospective team.
+         * @throws std::invalid_argument When a worker id could index past the slab.
+         */
+        void requireTeam(int team) const
+        {
+            if (team > workers_)
+                throw std::invalid_argument("Native NEON prefill team exceeds its admitted projection slab");
+        }
+
+        /** @return Independent 64-column chunk tasks; zero when no original row is active. */
+        [[nodiscard]] std::int64_t taskCount() const noexcept
+        { return batch_.grid_.hasAny() ? batch_.weights_.N_padded / 64 : 0; }
+
+        /**
+         * @brief Execute one chunk task of a pooled launch on the calling worker's slot.
+         * @tparam Instruction Native dot family whose CPU features the launcher admitted.
+         * @param chunk Index in [0, taskCount()); no synchronization, no shared writes.
+         * @details Each task streams every four-column strip of its chunk through
+         * the worker's slot and writes only that chunk of every active row, so
+         * pooled tasks of different members and chunks never conflict. FPCR is
+         * per thread, so every task admits its worker's floating-point profile.
+         */
+        template<Dot Instruction> void runTask(std::int64_t chunk) const noexcept
+        {
+            ARMFloatingPointProfile::require("Native NEON packed prefill");
+            runAdmittedTask<Instruction>(static_cast<int>(chunk));
         }
 
     private:
@@ -84,6 +130,53 @@ namespace llaminar2::cpu::native_quantised
         CPUNativeNEONPackedPrefill(const CPUNativeNEONProjectionBatch &batch, float *scratch,
             std::size_t worker_floats, int workers) noexcept
             : batch_(batch), scratch_(scratch), worker_floats_(worker_floats), workers_(workers) {}
+
+        /** @return Physical row capacity of an admitted binding. */
+        static int rowsOf(const CPUNativeNEONProjectionBatch &batch) noexcept
+        { return static_cast<int>(batch.activation_.size() / batch.weights_.blocks_per_row); }
+
+        /**
+         * @brief Shared admission of dense and pooled bindings.
+         * @param batch Admitted original-coordinate projection.
+         * @param scratch Slab whose first workers*slot_floats floats this binding may write.
+         * @param workers Positive admitted slot count.
+         * @param slot_floats Slot stride, at least this binding's own worker demand.
+         * @throws std::invalid_argument For any ineligible, short, misaligned or aliasing input.
+         */
+        static void admit(const CPUNativeNEONProjectionBatch &batch, std::span<float> scratch, int workers,
+            std::size_t slot_floats)
+        {
+            const auto &w = batch.weights_;
+            const int rows = rowsOf(batch);
+            if (workers <= 0 || !neon_panel::supports(w.encoding, w.codebook_id, w.is_asymmetric) ||
+                rows < neon_panel::min_rows || slot_floats < neon_panel::workerFloats(rows, w.K, w.numerical_policy) ||
+                slot_floats % neon_panel::line_floats)
+                throw std::invalid_argument("Native NEON prefill requires eligible retained panel geometry");
+            if (slot_floats > std::numeric_limits<std::size_t>::max() / sizeof(float) / std::size_t(workers))
+                throw std::overflow_error("Native NEON packed panel workspace exceeds addressable storage");
+            const auto used = std::size_t(workers) * slot_floats;
+            if (scratch.size() < used || reinterpret_cast<std::uintptr_t>(scratch.data()) % 64)
+                throw std::invalid_argument("Native NEON prefill requires its aligned per-worker projection slab");
+            const storage_proof::Bytes writes{scratch.data(), used * sizeof(float)};
+            storage_proof::requireDisjoint(writes, {batch.activation_.data(), batch.activation_.size_bytes()});
+            storage_proof::requireDisjoint(writes, {batch.output_.data(), batch.output_.size_bytes()});
+            storage_proof::requireDisjoint(writes, {w.bytes().data(), w.bytes().size()});
+            if (!batch.bias_.empty()) storage_proof::requireDisjoint(writes, {batch.bias_.data(), batch.bias_.size_bytes()});
+            storage_proof::requireOriginalWorkReadOnly(writes, batch.grid_.publication());
+        }
+
+        /** @brief Resolve the source program and arithmetic policy for one chunk on this worker's slot. */
+        template<Dot Instruction> void runAdmittedTask(int chunk) const noexcept
+        {
+            auto *panel = scratch_ + std::size_t(omp_get_thread_num()) * worker_floats_;
+            const auto &w = batch_.weights_;
+            if (w.usesCompactMultiScale())
+            {
+                if (w.codebook_id == 11) return dispatch<Instruction, 11>(chunk, panel);
+                return dispatch<Instruction, 7>(chunk, panel);
+            }
+            dispatch<Instruction, 0>(chunk, panel);
+        }
 
         /**
          * @brief Decode one 32-value K block for four columns directly into its slab slot.
@@ -318,8 +411,46 @@ namespace llaminar2::cpu::native_quantised
             if constexpr (Rows == 2) storeOutput(out1, w, nc);
         }
 
-        /** @brief Stream private K panels across all useful row pairs owned by a column strip. */
-        template<Dot Instruction, int C, Policy P> void run() const
+        /**
+         * @brief Add the retained bias to one completed chunk of every active row.
+         * @param chunk Physical 64-column chunk whose complete K results are final.
+         * @details The register tile route adds bias after a row's full K tree:
+         * out = out + bias per lane. This is the same FP32 operation with the
+         * same operand order, so attaching a bias never changes the route's bytes.
+         */
+        LLAMINAR_NEON_PREFILL_EXACT void addBias(int chunk) const noexcept
+        {
+            const auto &w = batch_.weights_;
+            const int columns = std::min(64, w.N - 64 * chunk);
+            const float *bias = batch_.bias_.data() + std::size_t(chunk) * 64;
+            const int pairs = batch_.grid_.tiles(2);
+            for (int pair = 0; pair < pairs; ++pair)
+            {
+                const auto rows = batch_.grid_.tileSpan(pair, 2);
+                for (int row = rows.first; row < rows.end; ++row)
+                {
+                    float *out = batch_.output_.data() + std::size_t(row) * batch_.stride_ + std::size_t(chunk) * 64;
+                    int column = 0;
+                    for (; column + 4 <= columns; column += 4)
+                        vst1q_f32(out + column, vaddq_f32(vld1q_f32(out + column), vld1q_f32(bias + column)));
+                    for (; column < columns; ++column) out[column] += bias[column];
+                }
+            }
+        }
+
+        /**
+         * @brief Stream private K panels of one 64-column chunk across all useful row pairs.
+         * @tparam Instruction Admitted native dot family.
+         * @tparam C IQ3_S (11), Q5_K (7), or Q5_0 (0).
+         * @tparam P Immutable projection arithmetic identity.
+         * @param chunk Physical output chunk owned by this task.
+         * @param panel The calling worker's slot: one weight panel, then its ordered carry.
+         * @details Each four-column strip decodes one K panel once and reuses it
+         * for every row pair, so native payload decode is paid once per weight
+         * tile rather than once per row tile. Rows keep their own increasing-K
+         * (or canonical ordered-partition) tree; the strip/panel order changes no byte.
+         */
+        template<Dot Instruction, int C, Policy P> void runChunk(int chunk, float *panel) const noexcept
         {
             using Ops = multi_scale::NEONMultiScaleOps<Instruction>;
             const auto &w = batch_.weights_;
@@ -329,55 +460,49 @@ namespace llaminar2::cpu::native_quantised
             const int pairs = batch_.grid_.tiles(2);
             const int partitions = Tile::partitionsFor(w);
             const int per_partition = (w.blocks_per_row + partitions - 1) / partitions;
-            auto work = [&] {
-                ARMFloatingPointProfile::require("Native NEON packed prefill");
-                auto *panel = scratch_ + std::size_t(omp_get_thread_num()) * worker_floats_;
-                auto *carry = neon_panel::needsCarry(w.K, P) ? panel + neon_panel::panel_floats : nullptr;
-#pragma omp for schedule(dynamic, 1)
-                for (int chunk = 0; chunk < w.N_padded / 64; ++chunk)
-                    for (int c = 0; c < std::min(64, w.N - 64 * chunk); c += 4)
+            auto *carry = neon_panel::needsCarry(w.K, P) ? panel + neon_panel::panel_floats : nullptr;
+            for (int c = 0; c < std::min(64, w.N - 64 * chunk); c += 4)
+            {
+                const int n = 64 * chunk + c, nc = std::min(4, w.N - n);
+                for (int p = 0; p < partitions; ++p)
+                {
+                    // The legacy fold includes empty trailing partitions. They
+                    // contribute +0 (including FP sign/payload behavior).
+                    const int first = std::min(p * per_partition, w.blocks_per_row);
+                    const int end = std::min(first + per_partition, w.blocks_per_row);
+                    for (int b = first;;)
                     {
-                        const int n = 64 * chunk + c, nc = std::min(4, w.N - n);
-                        for (int p = 0; p < partitions; ++p)
+                        const int last = b + std::min(neon_panel::depth, end - b);
+                        if (last > b) pack<C, Ops>(w, chunk, c, b, last, panel);
+                        for (int pair = 0; pair < pairs; ++pair)
                         {
-                            // The legacy fold includes empty trailing partitions. They
-                            // contribute +0 (including FP sign/payload behavior).
-                            const int first = std::min(p * per_partition, w.blocks_per_row);
-                            const int end = std::min(first + per_partition, w.blocks_per_row);
-                            for (int b = first;;)
-                            {
-                                const int last = b + std::min(neon_panel::depth, end - b);
-                                if (last > b) pack<C, Ops>(w, chunk, c, b, last, panel);
-                                for (int pair = 0; pair < pairs; ++pair)
-                                {
-                                    const auto rows = batch_.grid_.tileSpan(pair, 2);
-                                    if (!rows.size()) continue;
-                                    const auto r = std::size_t(rows.first);
-                                    const auto *q = a + r * w.blocks_per_row + b;
-                                    auto *o = out + r * stride + n;
-                                    auto *s = carry ? carry + r * 4 : nullptr;
-                                    if (rows.size() == 2)
-                                        compute<2, Ops, P, C == 7>(panel, last - b, q, q + w.blocks_per_row, o, o + stride, nc,
-                                            s, b == first, last == end, p != 0);
-                                    else
-                                        compute<1, Ops, P, C == 7>(panel, last - b, q, nullptr, o, nullptr, nc,
-                                            s, b == first, last == end, p != 0);
-                                }
-                                if (last == end) break;
-                                b = last;
-                            }
+                            const auto rows = batch_.grid_.tileSpan(pair, 2);
+                            if (!rows.size()) continue;
+                            const auto r = std::size_t(rows.first);
+                            const auto *q = a + r * w.blocks_per_row + b;
+                            auto *o = out + r * stride + n;
+                            auto *s = carry ? carry + r * 4 : nullptr;
+                            if (rows.size() == 2)
+                                compute<2, Ops, P, C == 7>(panel, last - b, q, q + w.blocks_per_row, o, o + stride, nc,
+                                    s, b == first, last == end, p != 0);
+                            else
+                                compute<1, Ops, P, C == 7>(panel, last - b, q, nullptr, o, nullptr, nc,
+                                    s, b == first, last == end, p != 0);
                         }
+                        if (last == end) break;
+                        b = last;
                     }
-            };
-            OMP_WORKSHARE_REGION(work);
+                }
+            }
+            if (!batch_.bias_.empty()) addBias(chunk);
         }
 
-        /** @brief Resolve the two different arithmetic programs once before worksharing. */
-        template<Dot Instruction, int C> void dispatch() const
+        /** @brief Resolve the two different arithmetic programs for one chunk task. */
+        template<Dot Instruction, int C> void dispatch(int chunk, float *panel) const noexcept
         {
             if (batch_.weights_.numerical_policy == Policy::GPUAlignedExpert)
-                return run<Instruction, C, Policy::GPUAlignedExpert>();
-            run<Instruction, C, Policy::BackendNative>();
+                return runChunk<Instruction, C, Policy::GPUAlignedExpert>(chunk, panel);
+            runChunk<Instruction, C, Policy::BackendNative>(chunk, panel);
         }
 
         const CPUNativeNEONProjectionBatch &batch_; ///< Synchronous original-coordinate binding.

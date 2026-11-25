@@ -121,6 +121,9 @@ namespace llaminar2::cpu::native_quantised
      * share one key and contribute their multiplicity as observations.
      * Shared-row I8MM members report isa NEON_I8MM and a grouped_neon_i8mm_*
      * route, proving row-pair SMMLA ran; their lone rows report the SDOT leaf.
+     * Ordinary-prefill members on the packed-panel route report
+     * prefill_neon_packed_panel_rows over an n_chunk_all_rows task grid: one
+     * task per 64-column chunk decodes each weight strip once for all rows.
      * @param descriptors Complete executed members.
      * @param count Positive member count.
      * @param plan The native schedule the launcher executed.
@@ -139,6 +142,7 @@ namespace llaminar2::cpu::native_quantised
         {
             const auto &d = descriptors[p];
             const int rows = plan.rows[p];
+            const bool panel = plan.panels[p];
             const int tile = rows == 1 ? 1 : (plan.tiles[p] == NEONProjectionRowTile::Pair ? 2 : 4);
             // A lone I8MM row executes the SDOT leaf; shared-row tiles run SMMLA pairs.
             const bool row_pairs = dot == multi_scale::NEONByteDot::I8MM && rows > 1;
@@ -162,10 +166,11 @@ namespace llaminar2::cpu::native_quantised
                 {"requested_verifier_policy", verifierRowsPolicyName(d.verifier_schedule)},
                 {"effective_verifier_policy", effective_verifier},
                 {"physical_row_tile", std::to_string(tile)},
-                {"route", rows == 1 ? "decode_neon_full_k_row"
+                {"route", panel ? "prefill_neon_packed_panel_rows"
+                    : rows == 1 ? "decode_neon_full_k_row"
                     : row_pairs ? (tile == 2 ? "grouped_neon_i8mm_pair_rows" : "grouped_neon_i8mm_four_rows")
                     : (tile == 2 ? "grouped_neon_full_k_pair_rows" : "grouped_neon_full_k_four_rows")},
-                {"task_grid", "row_tile_n_block"},
+                {"task_grid", panel ? "n_chunk_all_rows" : "row_tile_n_block"},
                 {"producer_tasks", std::to_string(tasks[p])},
                 {"reduction_tasks", "0"},
                 {"bundle_scheduler", "layer_global_full_k"}};
