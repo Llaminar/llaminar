@@ -3654,6 +3654,8 @@ namespace llaminar2::cpu::native_quantised
      * @param kb_start First complete32-value K block.
      * @param kb_end Exclusive K-block end.
      * @param accumulate Start from existing output instead of positive zero.
+     * @throws std::invalid_argument Before any write when SumPairs is requested
+     *         for a compact multi-scale or native Q6 encoding (no paired program).
      *
      * The signed Q8 path retains each block's original scale and FP32 order.
      */
@@ -3669,6 +3671,14 @@ namespace llaminar2::cpu::native_quantised
         int kb_end,
         bool accumulate)
     {
+        // A paired publication (row0 + row1 into C_row0, C_row1 untouched)
+        // exists only in the Q5 single-scale and signed-Q8 programs. Compact
+        // multi-scale and native Q6 tiles publish each row; they fail closed
+        // before any write rather than silently writing the wrong rows.
+        if constexpr (SumPairs)
+            if (packed.usesCompactMultiScale() || packed.usesQ6KNativeDualScale())
+                throw std::invalid_argument(
+                    "Paired NativeQuantised publication requires a Q5 single-scale or signed-Q8 prepared encoding");
         if (packed.usesCompactMultiScale())
         {
             multi_scale::dispatch<16>(packed, std::array{A_q8_row0, A_q8_row1},
@@ -4582,6 +4592,14 @@ namespace llaminar2::cpu::native_quantised
         int kb_end,
         bool accumulate)
     {
+        // A paired publication (row0 + row1 into C_row0, C_row1 untouched)
+        // exists only in the Q5 single-scale and signed-Q8 programs. Compact
+        // multi-scale and native Q6 tiles publish each row; they fail closed
+        // before any write rather than silently writing the wrong rows.
+        if constexpr (SumPairs)
+            if (packed.usesCompactMultiScale() || packed.usesQ6KNativeDualScale())
+                throw std::invalid_argument(
+                    "Paired NativeQuantised publication requires a Q5 single-scale or signed-Q8 prepared encoding");
         if (packed.usesCompactMultiScale())
         {
             multi_scale::dispatch<16>(packed, std::array{A_q8_row0, A_q8_row1, A_q8_row2, A_q8_row3},

@@ -797,6 +797,117 @@ namespace llaminar2::test
         }
     }
 
+    /**
+     * @test Malformed coded nibble owners and unsupported paired publications fail before any write.
+     * @details Two PR #73 defects found natively at 16fe7fc44 (both present at
+     * 67dac67f7):
+     * - cad35f70a routed coded Q4_K/IQ4_XS through the unrolled
+     *   nibbleSingleScaleRows() leaf before the ordered three-row entry's
+     *   asymmetry check, so an owner whose asymmetry bit contradicts its
+     *   encoding executed and overwrote the destinations. The leaf now
+     *   rejects it for every entry (1-4 rows, contiguous and ordered).
+     * - 57d294a79 moved file-density Q5_K (and native Q6_K) to tiles with no
+     *   paired (row0 + row1) publication, yet the SumPairs entries silently
+     *   wrote each row instead (row 1 into the "inert" destination). Those
+     *   encodings now throw; Q5_0 keeps its paired program, checked against
+     *   the per-row sum.
+     */
+    TEST(CPUX86CodedLeaves, MalformedOrUnpairedEntriesRejectBeforeAnyWrite)
+    {
+        constexpr int n = 128, blocks = 24;
+        constexpr float dirty = -12345.0f;
+        const auto activation = makeActivations(4, blocks, 2401u);
+        const auto row = [&](int r) { return activation.data() + std::size_t(r) * blocks; };
+        const auto clean = [&](const std::vector<std::array<float, 64>> &out) {
+            for (const auto &r : out)
+                for (const float v : r)
+                    if (std::bit_cast<std::uint32_t>(v) != std::bit_cast<std::uint32_t>(dirty))
+                        return false;
+            return true;
+        };
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
+        for (const Layout &layout : {kQ4K, kIQ4XS})
+        {
+            SCOPED_TRACE(layout.name);
+            CPUNativeQuantisedPackedWeights packed;
+            makeWeights(packed, layout, n, blocks, Policy::GPUAlignedExpert, Scales::Finite, 41u + layout.codebook);
+            auto malformed = packed;
+            malformed.is_asymmetric = !packed.is_asymmetric;
+            const __m512i lut = build_decode_lut(packed.codebook_id);
+            std::vector<std::array<float, 64>> out(4);
+            for (auto &r : out)
+                r.fill(dirty);
+            // GPU-aligned tree of 16 partitions of two blocks (K = 768).
+            EXPECT_THROW(dispatch_3row_native_avx512_ordered_partitions(malformed, row(0), row(1), row(2), out[0].data(),
+                             out[1].data(), out[2].data(), 0, blocks, 16, 2, lut),
+                         std::logic_error);
+            EXPECT_THROW(dispatch_2row_native_avx512_ordered_partitions(malformed, row(0), row(1), out[0].data(),
+                             out[1].data(), 0, blocks, 16, 2, lut),
+                         std::logic_error);
+            EXPECT_THROW(gemm_4row_native_1z_chunk(malformed, row(0), row(1), row(2), row(3), out[0].data(),
+                             out[1].data(), out[2].data(), out[3].data(), 0, 0, blocks, lut, false),
+                         std::logic_error);
+            EXPECT_THROW(gemv_native_quantised_avx512_chunk_native(malformed, row(0), out[0].data(), 0, 0, blocks, lut,
+                             false),
+                         std::logic_error);
+            EXPECT_TRUE(clean(out)) << "a malformed owner reached a destination";
+            // The well-formed owner still runs the same entry.
+            EXPECT_NO_THROW(dispatch_3row_native_avx512_ordered_partitions(packed, row(0), row(1), row(2),
+                out[0].data(), out[1].data(), out[2].data(), 0, blocks, 16, 2, lut));
+        }
+#endif
+        for (const Layout &layout : {kQ5K, kIQ3S})
+        {
+            SCOPED_TRACE(layout.name);
+            CPUNativeQuantisedPackedWeights packed;
+            makeWeights(packed, layout, n, blocks, Policy::GPUAlignedExpert, Scales::Finite, 61u + layout.codebook);
+            std::vector<std::array<float, 64>> out(4);
+            for (auto &r : out)
+                r.fill(dirty);
+            EXPECT_THROW(gemm_2row_non_nibble_chunk_avx2<true>(packed, row(0), row(1), out[0].data(), out[1].data(), 0,
+                             0, blocks, false),
+                         std::invalid_argument);
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
+            EXPECT_THROW(gemm_2row_non_nibble_chunk<true>(packed, row(0), row(1), out[0].data(), out[1].data(), 0, 0,
+                             blocks, false),
+                         std::invalid_argument);
+            EXPECT_THROW(gemm_4row_non_nibble_2z_chunk<true>(packed, row(0), row(1), row(2), row(3), out[0].data(),
+                             out[1].data(), out[2].data(), out[3].data(), 0, 0, blocks, false),
+                         std::invalid_argument);
+#endif
+            EXPECT_TRUE(clean(out)) << "an unpaired encoding wrote a destination";
+        }
+        // Positive control: Q5_0 publishes row0 + row1 into the first
+        // destination and leaves the second untouched.
+        for (const Policy policy : kPolicies)
+        {
+            SCOPED_TRACE("Q5_0 policy=" + std::to_string(int(policy)));
+            CPUNativeQuantisedPackedWeights packed;
+            makeWeights(packed, kQ50, n, blocks, policy, Scales::Finite, 77u);
+            const auto check = [&](auto plain, auto paired)
+            {
+                std::vector<std::array<float, 64>> rows(2), sum(2);
+                plain(rows[0].data(), rows[1].data());
+                sum[0].fill(dirty);
+                sum[1].fill(dirty);
+                paired(sum[0].data(), sum[1].data());
+                for (int c = 0; c < 64; ++c)
+                {
+                    volatile float expected = rows[0][c] + rows[1][c];
+                    ASSERT_EQ(std::bit_cast<std::uint32_t>(sum[0][c]), std::bit_cast<std::uint32_t>(float(expected)))
+                        << "column=" << c;
+                    ASSERT_EQ(std::bit_cast<std::uint32_t>(sum[1][c]), std::bit_cast<std::uint32_t>(dirty));
+                }
+            };
+            check([&](float *a, float *b) { gemm_2row_non_nibble_chunk_avx2(packed, row(0), row(1), a, b, 1, 0, blocks, false); },
+                  [&](float *a, float *b) { gemm_2row_non_nibble_chunk_avx2<true>(packed, row(0), row(1), a, b, 1, 0, blocks, false); });
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
+            check([&](float *a, float *b) { gemm_2row_non_nibble_chunk(packed, row(0), row(1), a, b, 1, 0, blocks, false); },
+                  [&](float *a, float *b) { gemm_2row_non_nibble_chunk<true>(packed, row(0), row(1), a, b, 1, 0, blocks, false); });
+#endif
+        }
+    }
+
 #if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
     /** @test Routed AVX-512 Q4_K/IQ4_XS entries (1-4 rows, contiguous and ordered) equal generic rows. */
     TEST(CPUX86CodedLeaves, AVX512CodedNibbleLeafEqualsGenericChunks)

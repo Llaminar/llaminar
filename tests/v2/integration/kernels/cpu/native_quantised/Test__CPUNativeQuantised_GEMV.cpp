@@ -3460,6 +3460,10 @@ namespace
                 test_case.active_rows == test_case.bucket_rows ? 1u : 2u;
         }
 
+        // Formats whose prepared encoding has an x86 decode-once panel. Every
+        // launch here has at least 17 live rows and one worker, so Auto must
+        // select the dense packed panel for exactly these formats.
+        [[maybe_unused]] size_t panel_formats = 0;
         for (const auto &format : ALL_FORMATS)
         {
             SCOPED_TRACE(format.name);
@@ -3467,6 +3471,10 @@ namespace
             ASSERT_NE(weights, nullptr) << format.name;
             CPUNativeQuantisedGemmKernel kernel(weights.get());
             ASSERT_TRUE(kernel.isValid()) << format.name;
+#if !defined(__aarch64__)
+            panel_formats += x86_panel::formatFor(kernel.packedWeights().encoding,
+                kernel.packedWeights().codebook_id) != x86_panel::Format::None;
+#endif
 
             std::vector<float> serial(
                 static_cast<size_t>(maximum_bucket_rows) * N,
@@ -3534,6 +3542,7 @@ namespace
 #if !defined(__aarch64__)
         // x86 prefill launch telemetry; the byte-exact sweep above is ISA-neutral.
         uint64_t observed_prefill_launches = 0;
+        uint64_t observed_panel_launches = 0;
         for (const auto &record : PerfStatsCollector::snapshot(
                  {"kernel.cpu_native_quantised_prefill_gemm_launch"}))
         {
@@ -3546,11 +3555,21 @@ namespace
             EXPECT_EQ(record.tags.at("n"), std::to_string(N));
             EXPECT_EQ(record.tags.at("k"), std::to_string(K));
             EXPECT_GE(std::stoi(record.tags.at("m")), 17);
-            EXPECT_TRUE(
-                record.tags.at("route") == "row_chunk_grid" ||
-                record.tags.at("route") == "two_row_n_major" ||
-                record.tags.at("route") == "two_row_pair_grid" ||
-                record.tags.at("route") == "decode_equivalent_kpart_rows");
+            if (record.tags.at("route") == "packed_panel")
+            {
+                // The decode-once panel replaces only ordinary Auto prefill.
+                EXPECT_EQ(record.tags.at("requested_policy"), "Auto");
+                EXPECT_EQ(record.tags.at("task_grid"), "n_strip_all_rows");
+                EXPECT_EQ(record.tags.at("threads"), "1");
+                observed_panel_launches += record.count;
+            }
+            else
+                EXPECT_TRUE(
+                    record.tags.at("route") == "row_chunk_grid" ||
+                    record.tags.at("route") == "two_row_n_major" ||
+                    record.tags.at("route") == "two_row_pair_grid" ||
+                    record.tags.at("route") == "decode_equivalent_kpart_rows")
+                    << "route=" << record.tags.at("route");
             observed_prefill_launches += record.count;
         }
         EXPECT_EQ(
@@ -3558,6 +3577,9 @@ namespace
             ALL_FORMATS.size() * expected_prefill_launches_per_format)
             << "Every CPU all-format M-totality cell must execute one real "
                "production grouped prefill route";
+        EXPECT_GT(panel_formats, 0u);
+        EXPECT_EQ(observed_panel_launches, panel_formats * expected_prefill_launches_per_format)
+            << "Exactly the panel formats' launches (all >= 16 live rows, one worker) take the packed panel";
 
         #endif
         PerfStatsCollector::reset();
@@ -3787,6 +3809,13 @@ namespace
         constexpr int N = 1536;
         constexpr int K = 8960;
         constexpr std::array<int, 4> runtime_rows = {2, 5, 15, 64};
+        // The serial M=1 tree splits K only while the 24 N tasks (one chunk
+        // each at N = 1536) are fewer than the team (memory-bound host) or
+        // twice the team (compute-bound host). The host's own width did not
+        // guarantee that (Q4_0 resolved one partition natively). Thirty-two
+        // workers give K partitions in both cache regimes: 2 (memory-bound)
+        // or 11 (compute-bound) partitions of at least 26 blocks.
+        ScopedOMPThreadCount kpart_team(32);
         constexpr std::array<VerifierRowsPolicy, 7> full_k_policies = {{
             VerifierRowsPolicy::FullKRowChunkGrid,
             VerifierRowsPolicy::FullKTwoRowNbc1,

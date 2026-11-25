@@ -279,8 +279,31 @@ TEST(CPUNativeQuantisedFusedCompletion, UnsignedWeightDotAllFormatByteLifecycle)
                                 // The optional paired publication uses the same
                                 // unsigned dots, then the ORIGINAL final row add.
                                 // These widths have one block per fixed partition.
+                                // Only the Q5 single-scale program (Q5_1) has a
+                                // paired publication; file-density Q5_K is a
+                                // compact multi-scale unit and must be rejected
+                                // before any write (it previously published row 1
+                                // into the inert destination and row 0 alone).
+                                if (packed.usesCompactMultiScale())
+                                {
+                                    alignas(64) float paired[64], inert[64];
+                                    std::fill_n(paired, 64, guard);
+                                    std::fill_n(inert, 64, guard);
+                                    EXPECT_THROW(gemm_2row_non_nibble_chunk<true>(packed,
+                                        input.data(), input.data() + packed.blocks_per_row,
+                                        paired, inert, 0, 0, packed.blocks_per_row, false), std::invalid_argument);
+                                    EXPECT_THROW(gemm_2row_non_nibble_chunk_avx2<true>(packed,
+                                        input.data(), input.data() + packed.blocks_per_row,
+                                        paired, inert, 0, 0, packed.blocks_per_row, false), std::invalid_argument);
+                                    EXPECT_TRUE(std::all_of(paired, paired + 64,
+                                        [](float value) { return value == guard; }));
+                                    EXPECT_TRUE(std::all_of(inert, inert + 64,
+                                        [](float value) { return value == guard; }));
+                                }
+                                else
                                 for (int chunk : {0, (geometry.n - 1) / 64})
                                 {
+                                    ASSERT_EQ(packed.encoding, CPUNativeQuantisedEncoding::Q5NativeSingleScale);
                                     alignas(64) float paired[64], inert[64];
                                     std::fill_n(paired, 64, guard);
                                     std::fill_n(inert, 64, guard);

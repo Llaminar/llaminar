@@ -826,7 +826,12 @@ namespace llaminar2::cpu::native_quantised
     /**
      * @brief AVX2 2-row INT8 pre-decoded GEMM microkernel for one 64-col chunk.
      */
-    /** @brief Dispatch a two-row non-nibble AVX2 verifier chunk. */
+    /**
+     * @brief Dispatch a two-row non-nibble AVX2 verifier chunk.
+     * @tparam SumPairs Publish row0 + row1 into C_row0 and leave C_row1 untouched
+     *         (Q5 single-scale and signed-Q8 programs only; compact multi-scale
+     *         and native Q6 encodings throw before any write).
+     */
     template<bool SumPairs=false>
     inline void gemm_2row_non_nibble_chunk_avx2(
         const CPUNativeQuantisedPackedWeights &packed,
@@ -839,6 +844,14 @@ namespace llaminar2::cpu::native_quantised
         int kb_end,
         bool accumulate)
     {
+        // A paired publication (row0 + row1 into C_row0, C_row1 untouched)
+        // exists only in the Q5 single-scale and signed-Q8 programs. Compact
+        // multi-scale and native Q6 tiles publish each row; they fail closed
+        // before any write rather than silently writing the wrong rows.
+        if constexpr (SumPairs)
+            if (packed.usesCompactMultiScale() || packed.usesQ6KNativeDualScale())
+                throw std::invalid_argument(
+                    "Paired NativeQuantised publication requires a Q5 single-scale or signed-Q8 prepared encoding");
         if (packed.encoding == CPUNativeQuantisedEncoding::Q5NativeSingleScale)
             return q5::dispatch<8, SumPairs>(packed, std::array{A_q8_row0, A_q8_row1}, std::array{C_row0, C_row1},
                 chunk, kb_start, kb_end, accumulate);

@@ -619,7 +619,7 @@ namespace llaminar2::cpu::native_quantised::multi_scale::x86
      * @param partitions,blocks_per_partition Exact ordered tree; one and zero for Contiguous.
      * @param decode_lut The caller's broadcast nibble table, biased by @p lut_bias.
      * @param lut_bias Unsigned zero point of @p decode_lut, removed via the activation sum.
-     * @throws std::invalid_argument For a mismatched encoding, geometry or tree.
+     * @throws std::invalid_argument For a mismatched encoding or asymmetry bit, geometry or tree.
      *
      * Contiguous tiles follow the prepared policy; the ordered tree always
      * applies the GPU-aligned expert program, as the generic ordered kernels do.
@@ -632,8 +632,11 @@ namespace llaminar2::cpu::native_quantised::multi_scale::x86
     {
         static_assert(Codebook == 4 || Codebook == 5);
         static_assert(Rows >= 1 && Rows <= 4);
-        if (packed.encoding != SingleScaleLayout<Codebook>::encoding)
-            throw std::invalid_argument("x86 coded nibble tile requires its admitted encoding");
+        // Q4_K carries a minimum, IQ4_XS does not: a prepared owner whose
+        // asymmetry bit disagrees with its encoding is malformed and is
+        // rejected before any weight read or output store.
+        if (packed.encoding != SingleScaleLayout<Codebook>::encoding || packed.is_asymmetric != (Codebook == 5))
+            throw std::invalid_argument("x86 coded nibble tile requires its admitted encoding and asymmetry");
         requireSingleScaleTile<Tree>(packed, chunk, begin, end, partitions, blocks_per_partition);
         // The ordered nibble tree is by definition the GPU-aligned expert
         // program, exactly like gemv_native_avx512_ordered_partitions().
