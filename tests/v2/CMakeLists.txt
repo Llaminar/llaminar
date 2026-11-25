@@ -20305,7 +20305,7 @@ add_v2_test(V2_Integration_CPUNativeQuantised_GEMV
     LABELS "V2;Integration;GEMM;GEMV;NativeQuantised;CPU;Q4_0;IQ4_NL;Decode"
     MPI_PROCS 1
 )
-if(V2_CPU_TARGET_X86)
+if(V2_CPU_TARGET_X86 AND TEST V2_Integration_CPUNativeQuantised_GEMV)
     set_tests_properties(V2_Integration_CPUNativeQuantised_GEMV PROPERTIES
         PROCESSORS ${V2_NATIVE_PAYLOAD_KPART_THREADS})
 endif()
@@ -20374,8 +20374,10 @@ add_v2_test(V2_Integration_CPU_NativeQuantised_PrefillHeuristic
     LABELS "V2;Integration;CPU;GEMM;Prefill;Heuristic;AllFormats;NativeQuantised;DecodeEquivalent;Regression"
     MPI_PROCS 1
 )
-set_tests_properties(V2_Integration_CPU_NativeQuantised_PrefillHeuristic PROPERTIES
-    PROCESSORS ${V2_NATIVE_PAYLOAD_KPART_THREADS})
+if(TEST V2_Integration_CPU_NativeQuantised_PrefillHeuristic)
+    set_tests_properties(V2_Integration_CPU_NativeQuantised_PrefillHeuristic PROPERTIES
+        PROCESSORS ${V2_NATIVE_PAYLOAD_KPART_THREADS})
+endif()
 endif()
 foreach(V2_PREFILL_ISA IN LISTS V2_CPU_NATIVE_ISA_CELLS)
     v2_cpu_native_isa_runtime("${V2_PREFILL_ISA}" V2_PREFILL_RUNTIME_ISA)
