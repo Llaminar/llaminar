@@ -100,6 +100,8 @@ TEST(PagedKVArchive, CorruptAndMismatchedSectionsAreRejected)
     // Truncated header/payload.
     EXPECT_THROW(PagedKVArchive::parse({bytes.data(), bytes.size() - 1}), std::exception);
     EXPECT_THROW(PagedKVArchive::parse({bytes.data(), 4}), std::exception);
+    // Empty section has no public constructor; parse of a zero-row header is
+    // covered by the rows==0 geometry rejection below.
     // Inconsistent declared rows vs payload: zero rows is invalid geometry.
     auto inconsistent = bytes;
     const size_t rows_offset = 8 + 4 + 4 + 4 + 4 + 4;
@@ -135,6 +137,37 @@ TEST(PagedKVArchive, TruncatePublishesShorterVisibleRows)
     EXPECT_THROW(view.prefix(5), std::invalid_argument);
     // Empty prefix is refused.
     EXPECT_THROW(view.prefix(0), std::invalid_argument);
+}
+
+/** @test Archive materializes into fresh private pages with byte-exact rows and no shared state. */
+TEST(PagedKVArchive, MaterializeProducesExactPrivatePages)
+{
+    ArchiveFixture fx;
+    constexpr int heads = 1, dimension = 8, tokens = 4;
+    std::vector<float> rows(static_cast<size_t>(tokens) * 2 * static_cast<size_t>(heads) * static_cast<size_t>(dimension));
+    for (size_t i = 0; i < rows.size(); ++i)
+        rows[i] = static_cast<float>(static_cast<int>(i % 7) - 3);
+    auto snapshot = publishPage(fx, rows, heads, dimension);
+    auto archive = PagedKVArchive::fromView(snapshot.view());
+
+    // New request with enough protected growth materializes exact private pages.
+    auto grant = fx.pool->tryAdmit(1);
+    ASSERT_TRUE(grant);
+    auto pages = archive.materialize(*grant, 4);
+    ASSERT_EQ(pages.size(), 1u);
+    EXPECT_EQ(pages.front().rows(), 4);
+    const size_t row_stride = 2 * static_cast<size_t>(heads) * static_cast<size_t>(dimension);
+    EXPECT_EQ(std::memcmp(pages.front().key(0, 0), rows.data(), 4 * row_stride * sizeof(float)), 0);
+    // A second independent request materializes the same archive into its own
+    // private pages without sharing any referent state.
+    auto second_grant = fx.pool->tryAdmit(1);
+    ASSERT_TRUE(second_grant);
+    auto second_pages = archive.materialize(*second_grant, 4);
+    ASSERT_EQ(second_pages.size(), 1u);
+    EXPECT_EQ(std::memcmp(second_pages.front().key(0, 0), rows.data(), 4 * row_stride * sizeof(float)), 0);
+    EXPECT_EQ(std::memcmp(pages.front().key(0, 0), second_pages.front().key(0, 0), 4 * row_stride * sizeof(float)), 0);
+    EXPECT_FALSE(pages.front().sharedBacked());
+    EXPECT_FALSE(second_pages.front().sharedBacked());
 }
 
 /** @test Truncated prefix then archive preserves the exact prefix bytes. */

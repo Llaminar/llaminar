@@ -9,6 +9,7 @@
  * and payload/length mismatches before exposing any bytes.
  */
 #include "PagedKVArchive.h"
+#include <algorithm>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -133,6 +134,42 @@ PagedKVArchive PagedKVArchive::parse(std::span<const std::byte> bytes)
         throw std::invalid_argument("Paged archive payload extent does not match its declared rows");
     std::vector<std::byte> payload(bytes.begin() + static_cast<std::ptrdiff_t>(offset), bytes.end());
     return PagedKVArchive(meta, std::move(payload));
+}
+
+std::vector<CPUFP32KVPage> PagedKVArchive::materialize(PhysicalPagePool::Grant &grant, int page_tokens) const
+{
+    if (empty() || meta_.format != KVStorageFormat::FP32 ||
+        meta_.family != KVCacheFamily::AttentionOnly)
+        throw std::invalid_argument("Paged archive materialization requires a nonempty FP32 attention section");
+    if (page_tokens <= 0)
+        throw std::invalid_argument("Paged archive materialization requires positive page geometry");
+    const auto layout = KVNativeStorageLayout::resolve(meta_.family, meta_.heads,
+        meta_.dimension, KVStorageFormatName(meta_.format), DeviceId::cpu());
+    const auto stride = layout.pagePayload(1).totalBytes();
+    if (page_tokens > std::numeric_limits<std::size_t>::max() / stride)
+        throw std::invalid_argument("Paged archive page geometry overflows");
+    const std::size_t page_bytes = static_cast<std::size_t>(page_tokens) * stride;
+    if (meta_.rows > std::numeric_limits<std::size_t>::max() / stride)
+        throw std::invalid_argument("Paged archive row geometry overflows");
+    const std::size_t total_bytes = meta_.rows * stride;
+    if (payload_.size() != total_bytes)
+        throw std::logic_error("Paged archive payload does not match its provenance");
+    std::vector<CPUFP32KVPage> pages;
+    for (std::size_t offset = 0; offset < total_bytes;)
+    {
+        const std::size_t count = std::min(page_bytes, total_bytes - offset);
+        const std::size_t rows = count / stride;
+        if (!rows)
+            throw std::logic_error("Paged archive materialization produced an empty page");
+        auto handle = grant.assignFrame(); // G -> O exactly once for this private page.
+        auto plan = grant.prepareFreshWrite(handle, count);
+        if (!plan)
+            throw std::logic_error("Paged archive materialization destination is not writable");
+        plan->copyFrom({payload_.data() + offset, count});
+        pages.emplace_back(plan->commit(), meta_.heads, meta_.dimension);
+        offset += count;
+    }
+    return pages;
 }
 
 std::vector<std::byte> PagedKVArchive::serialize() const

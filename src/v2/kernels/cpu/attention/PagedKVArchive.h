@@ -47,6 +47,18 @@ public:
     /** @return Exact native payload bytes (K/V interleaved, no padding). */
     std::span<const std::byte> payload() const noexcept { return payload_; }
     bool empty() const noexcept { return payload_.empty(); }
+
+    /**
+     * @brief Materialize this archive into exact private pages under one grant.
+     * @param grant Caller request with protected page growth for every page.
+     * @param page_tokens Native logical block size for page slicing.
+     * @return One committed immutable page per logical block, exact live rows.
+     * @throws std::invalid_argument If the archive is empty, its provenance is
+     * not FP32 attention, or the grant has insufficient protected growth.
+     * @note This is private materialization; it never restores another request's
+     * sampler/history/placement and does not adopt any shared referent.
+     */
+    std::vector<CPUFP32KVPage> materialize(PhysicalPagePool::Grant &grant, int page_tokens) const;
 private:
     PagedKVArchive(PagedKVArchiveMeta meta, std::vector<std::byte> payload)
         : meta_(meta), payload_(std::move(payload)) {}
