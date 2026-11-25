@@ -10,6 +10,8 @@
  * Retained original rank-bank publication guards all route/bank/guard bytes
  * at QFN prefill geometry, including nonfinite copies and dirty live prefixes.
  * Disabled paired events and event-free profile modes isolate one real bridge.
+ * CPU router references bind the production-declared Q8_1 publication root at
+ * each routed shape before routing, exactly as the CPU routing stage does.
  */
 #include "../../../utils/IQ2SFusedMoEGpuSourceWitness.h"
 #include <gtest/gtest.h>
@@ -54,6 +56,7 @@
 #include "utils/DebugEnv.h"
 #include "utils/PerfStatsCollector.h"
 
+#include "../../../utils/CPURouterKernelTestAdmission.h"
 #include "../../../utils/GpuPreparedGemmHarness.h"
 #include "../../../utils/MoEOverlayServiceTelemetryCoverageTest.h"
 #include "../../../utils/QuantizedVerifierFormats.h"
@@ -2166,6 +2169,26 @@ namespace
         bool old_cuda_moe_router_q8_ = true;
         bool old_cuda_moe_reuse_router_q8_hidden_ = true;
 #endif
+        /**
+         * @brief Bind the CPU reference router's publication root for one routed shape.
+         *
+         * The CPU router quantizes every routed hidden row into a declared Q8_1
+         * root and never grows it while routing. `MoERoutingStage::bindWorkspace`
+         * declares that root with `CPURouterQ8StorageLayout::declare(rows, width)`
+         * before any route; the reference kernel receives the same declaration,
+         * admitted by its own physical-memory authority.
+         * @param rows Rows the next reference route publishes.
+         * @param width Hidden width of that route.
+         * @throws std::logic_error If the fixture's CPU kernel is not the CPU MoE kernel.
+         */
+        void admitCPUReferenceRouter(int rows, int width)
+        {
+            auto *cpu_router = dynamic_cast<llaminar2::CPUMoEKernel *>(cpu_kernel_);
+            if (!cpu_router)
+                throw std::logic_error("CPU reference router is not the CPU MoE kernel");
+            llaminar2::test::admitCPURouterKernelForTest(*cpu_router, rows, width);
+        }
+
         std::unique_ptr<llaminar2::IMoEKernel> cuda_kernel_owner_;
         std::unique_ptr<llaminar2::IMoEKernel> cpu_kernel_owner_;
         llaminar2::CUDAMoEKernel *cuda_kernel_ = nullptr;
@@ -7741,6 +7764,7 @@ TEST_F(Test__CUDAMoEKernel, RuntimePrefillGatherScatter_ZeroCountExpertNoOps)
         true, cuda_indices.get(), cuda_weights.get(), true, true, nullptr,
         llaminar2::RoutedExpertRowExecutionPolicy::ParticipantAssigned));
     llaminar2::MoERoutingResult cpu_host_result;
+    admitCPUReferenceRouter(seq_len, d_model);
     ASSERT_TRUE(cpu_kernel_->routeWithTensors(hidden.get(), gate.get(), seq_len, d_model,
                                               num_experts, top_k, true,
                                               cpu_indices.get(), cpu_weights.get(), cpu_host_result));
@@ -16170,6 +16194,7 @@ TEST_F(Test__CUDAMoEKernel, DecodeRouteSelectBF16GateMatchesCPU)
         true, cuda_indices.get(), cuda_weights.get(), true, true, nullptr,
         llaminar2::RoutedExpertRowExecutionPolicy::ParticipantAssigned));
     llaminar2::MoERoutingResult cpu_host_result;
+    admitCPUReferenceRouter(seq_len, d_model);
     ASSERT_TRUE(cpu_kernel_->routeWithTensors(hidden.get(), cpu_gate.get(), seq_len, d_model,
                                               num_experts, top_k, true,
                                               cpu_indices.get(), cpu_weights.get(), cpu_host_result));
@@ -16289,6 +16314,7 @@ TEST_F(Test__CUDAMoEKernel, DecodeRouteSelectRuntimeOnlyDoesNotRequireLegacyOutp
         nullptr, llaminar2::RoutedExpertRowExecutionPolicy::ParticipantAssigned));
 
     llaminar2::MoERoutingResult cpu_host_result;
+    admitCPUReferenceRouter(seq_len, d_model);
     ASSERT_TRUE(cpu_kernel_->routeWithTensors(hidden.get(), gate.get(), seq_len, d_model,
                                               num_experts, top_k, true,
                                               cpu_indices.get(), cpu_weights.get(), cpu_host_result));
@@ -16787,6 +16813,7 @@ TEST_F(Test__CUDAMoEKernel, DecodeRouteSelectQwenScaleRuntimeTopKMatchesCPU)
         llaminar2::RoutedExpertRowExecutionPolicy::ParticipantAssigned));
 
     llaminar2::MoERoutingResult cpu_host_result;
+    admitCPUReferenceRouter(seq_len, d_model);
     ASSERT_TRUE(cpu_kernel_->routeWithTensors(hidden.get(), gate.get(), seq_len, d_model,
                                               num_experts, top_k, true,
                                               cpu_indices.get(), cpu_weights.get(), cpu_host_result));
@@ -16929,6 +16956,7 @@ TEST_F(Test__CUDAMoEKernel, DecodeRouteSelectUsesWorkspaceAcrossRebind)
         llaminar2::RoutedExpertRowExecutionPolicy::ParticipantAssigned));
 
     llaminar2::MoERoutingResult cpu_host_result;
+    admitCPUReferenceRouter(seq_len, d_model);
     ASSERT_TRUE(cpu_kernel_->routeWithTensors(hidden.get(), gate.get(), seq_len, d_model,
                                               num_experts, top_k, true,
                                               cpu_indices.get(), cpu_weights.get(), cpu_host_result));
@@ -17062,6 +17090,7 @@ TEST_F(Test__CUDAMoEKernel, RouteWithTensorsMatchesCPU)
     ASSERT_TRUE(cuda_kernel_->routeWithTensors(hidden.get(), gate.get(), seq_len, d_model,
                                                num_experts, top_k, true,
                                                cuda_indices.get(), cuda_weights.get(), cuda_host_result));
+    admitCPUReferenceRouter(seq_len, d_model);
     ASSERT_TRUE(cpu_kernel_->routeWithTensors(hidden.get(), gate.get(), seq_len, d_model,
                                               num_experts, top_k, true,
                                               cpu_indices.get(), cpu_weights.get(), cpu_host_result));
@@ -17142,6 +17171,7 @@ TEST_F(Test__CUDAMoEKernel, RouteWithTensorsAcceptsMappedActivationBuffers)
     ASSERT_TRUE(cuda_kernel_->routeWithTensors(hidden.get(), gate.get(), seq_len, d_model,
                                                num_experts, top_k, true,
                                                cuda_indices.get(), cuda_weights.get(), cuda_host_result));
+    admitCPUReferenceRouter(seq_len, d_model);
     ASSERT_TRUE(cpu_kernel_->routeWithTensors(cpu_hidden.get(), gate.get(), seq_len, d_model,
                                               num_experts, top_k, true,
                                               cpu_indices.get(), cpu_weights.get(), cpu_host_result));
@@ -17190,6 +17220,7 @@ TEST_F(Test__CUDAMoEKernel, RouteWithTensorsTiledPrefillMatchesCPU)
     ASSERT_TRUE(cuda_kernel_->routeWithTensors(hidden.get(), gate.get(), seq_len, d_model,
                                                num_experts, top_k, true,
                                                cuda_indices.get(), cuda_weights.get(), cuda_host_result));
+    admitCPUReferenceRouter(seq_len, d_model);
     ASSERT_TRUE(cpu_kernel_->routeWithTensors(hidden.get(), gate.get(), seq_len, d_model,
                                               num_experts, top_k, true,
                                               cpu_indices.get(), cpu_weights.get(), cpu_host_result));
@@ -17283,6 +17314,7 @@ TEST_F(Test__CUDAMoEKernel, RouteWithTensorsTiledPrefillCapturesAfterWarmup)
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
 
     llaminar2::MoERoutingResult cpu_host_result;
+    admitCPUReferenceRouter(seq_len, d_model);
     ASSERT_TRUE(cpu_kernel_->routeWithTensors(hidden.get(), gate.get(), seq_len, d_model,
                                               num_experts, top_k, true,
                                               cpu_indices.get(), cpu_weights.get(), cpu_host_result));
@@ -17389,6 +17421,7 @@ TEST_F(Test__CUDAMoEKernel, RouteWithTensorsEffectiveSeqLenMasksPaddedRowsAcross
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
 
     llaminar2::MoERoutingResult cpu_result;
+    admitCPUReferenceRouter(bucket_seq_len, d_model);
     ASSERT_TRUE(cpu_kernel_->routeWithTensors(hidden.get(), gate.get(), bucket_seq_len, d_model,
                                               num_experts, top_k, true,
                                               cpu_indices.get(), cpu_weights.get(), cpu_result));
@@ -17836,6 +17869,7 @@ TEST_F(Test__CUDAMoEKernel, RouteWithTensorsSingleTokenQwenScaleKeepsOutputsDevi
     ASSERT_TRUE(cuda_kernel_->routeWithTensors(hidden.get(), gate.get(), seq_len, d_model,
                                                num_experts, top_k, true,
                                                cuda_indices.get(), cuda_weights.get(), cuda_host_result));
+    admitCPUReferenceRouter(seq_len, d_model);
     ASSERT_TRUE(cpu_kernel_->routeWithTensors(hidden.get(), gate.get(), seq_len, d_model,
                                               num_experts, top_k, true,
                                               cpu_indices.get(), cpu_weights.get(), cpu_host_result));
@@ -17908,6 +17942,7 @@ TEST_F(Test__CUDAMoEKernel, RouteWithTensorsSingleTokenIsCudaGraphCapturableDevi
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
 
     llaminar2::MoERoutingResult cpu_host_result;
+    admitCPUReferenceRouter(seq_len, d_model);
     ASSERT_TRUE(cpu_kernel_->routeWithTensors(hidden.get(), gate.get(), seq_len, d_model,
                                               num_experts, top_k, true,
                                               cpu_indices.get(), cpu_weights.get(), cpu_host_result));
@@ -17989,6 +18024,7 @@ TEST_F(Test__CUDAMoEKernel, RouteVerifierRowsDecodeEquivalentUsesDecodeKernelAnd
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
 
     llaminar2::MoERoutingResult cpu_host_result;
+    admitCPUReferenceRouter(seq_len, d_model);
     ASSERT_TRUE(cpu_kernel_->routeWithTensors(hidden.get(), gate.get(), seq_len, d_model,
                                               num_experts, top_k, true,
                                               cpu_indices.get(), cpu_weights.get(), cpu_host_result));
@@ -18370,6 +18406,7 @@ TEST_F(Test__CUDAMoEKernel, RouteWithTensorsBF16GateMatchesCPU)
     ASSERT_TRUE(cuda_kernel_->routeWithTensors(hidden.get(), gate_bf16.get(), seq_len, d_model,
                                                num_experts, top_k, true,
                                                cuda_indices.get(), cuda_weights.get(), cuda_host_result));
+    admitCPUReferenceRouter(seq_len, d_model);
     ASSERT_TRUE(cpu_kernel_->routeWithTensors(hidden.get(), cpu_gate.get(), seq_len, d_model,
                                               num_experts, top_k, true,
                                               cpu_indices.get(), cpu_weights.get(), cpu_host_result));
