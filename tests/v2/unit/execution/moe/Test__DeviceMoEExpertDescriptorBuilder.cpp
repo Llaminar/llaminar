@@ -625,9 +625,22 @@ namespace llaminar2::test
             EXPECT_LT(pair_bom.total_bytes, triple_bom.total_bytes);
             EXPECT_THROW(Directory::profileForLayerFormats({pair}), std::invalid_argument);
             EXPECT_THROW(Directory::profileForLayerFormats({triple}, DeviceMoEProjectionSet::GateUp), std::invalid_argument);
+            // The quote stamps projection_set into every slot descriptor, so a
+            // profile whose families disagree with it must never be priced.
             auto forged = projected;
             forged.projection_set = DeviceMoEProjectionSet::CompleteExpert;
             EXPECT_THROW(Directory::allocationBOM(capacity, forged), std::invalid_argument);
+            auto forged_complete = complete;
+            forged_complete.projection_set = DeviceMoEProjectionSet::GateUp;
+            EXPECT_THROW(Directory::allocationBOM(capacity, forged_complete), std::invalid_argument);
+            // An arrival wire larger than every family slot, or no wire at all,
+            // is rejected; the exact largest-family wire remains admissible.
+            auto oversized_wire = projected;
+            ++oversized_wire.max_wire_payload_bytes;
+            EXPECT_THROW(Directory::allocationBOM(capacity, oversized_wire), std::invalid_argument);
+            auto empty_wire = projected;
+            empty_wire.max_wire_payload_bytes = 0u;
+            EXPECT_THROW(Directory::allocationBOM(capacity, empty_wire), std::invalid_argument);
             pair[0].label = "up";
             EXPECT_THROW(Directory::profileForLayerFormats({pair}, DeviceMoEProjectionSet::GateUp), std::invalid_argument);
         }

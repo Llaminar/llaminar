@@ -499,6 +499,21 @@ namespace llaminar2
             profile.families.empty() || profile.layer_families.empty())
             throw std::invalid_argument("Transfer directory quote requires coherent slot capacity and families");
 
+        // The quote is the single authority shared by admission and
+        // createImpl(), which stamps profile.projection_set into every slot
+        // descriptor. Each family must therefore hold exactly that ownership
+        // contract's movable projections, and the arrival wire must fit the
+        // largest family slot; otherwise a forged profile could publish
+        // complete-expert descriptors over gate/up-only storage.
+        size_t largest_family_payload = 0;
+        for (const auto &family : profile.families)
+        {
+            validateSpecs(family.projections, profile.projection_set);
+            largest_family_payload = std::max(largest_family_payload, expertPayloadBytes(family.projections));
+        }
+        if (profile.max_wire_payload_bytes == 0u || profile.max_wire_payload_bytes > largest_family_payload)
+            throw std::invalid_argument("Transfer directory wire payload capacity exceeds every slot family");
+
         std::vector<uint32_t> members(profile.families.size());
         for (const auto family : profile.layer_families)
             ++members.at(family);

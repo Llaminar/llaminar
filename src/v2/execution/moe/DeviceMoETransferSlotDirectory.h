@@ -197,7 +197,9 @@ namespace llaminar2
          * @param capacity Typed active/staging directory capacity.
          * @param format_profile Exact reusable projection profile.
          * @return Payload, descriptor, and total physical bytes.
-         * @throws std::invalid_argument for incoherent capacity or format data.
+         * @throws std::invalid_argument for incoherent capacity or format data,
+         *         a family whose projections differ from the profile's
+         *         projection set, or a wire capacity that fits no family slot.
          * @throws std::overflow_error when the complete allocation cannot be
          *         represented by `size_t`.
          */
