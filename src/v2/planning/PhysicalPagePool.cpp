@@ -121,13 +121,19 @@ bool PhysicalPagePool::tryAdmitTogether(std::span<const Demand> demands,
 
 std::vector<planning::WitnessRequest> PhysicalPagePool::liveWitnessRequests() const
 {
+    // Conservatively treat every outstanding finite grant (G = remaining) as
+    // already occupied: admission must prove the worst case where all grants
+    // convert to frames, never only the currently assigned O subset.
     std::vector<planning::WitnessRequest> requests;
-    for (const auto &request : requests_)
+    for (std::size_t record = 0; record < requests_.size(); ++record)
+    {
+        const auto &request = requests_[record];
         if (request.live)
-            requests.push_back({.generation=request.generation,
+            requests.push_back({.generation=request.generation, .record=record,
                 .peak_frames=request.declared_peak,
-                .occupied_frames=request.assigned,
+                .occupied_frames=request.assigned + request.remaining,
                 .preserved=false});
+    }
     return requests;
 }
 
@@ -174,11 +180,15 @@ bool PhysicalPagePool::extendWithWitness(Grant &grant, std::size_t pages)
     if (!pages || request.remaining > geometry_.max_pages_per_request - pages ||
         request.assigned + request.remaining + pages > request.declared_peak)
         throw std::logic_error("Witness extension exceeds the declared peak");
-    // Revalidate the witness for the proposed state before converting grant.
-    auto live = liveWitnessRequests();
-    if (!planning::proveCompletionOrder(geometry_.frames, live).valid())
-        return false;
     if (pages > geometry_.frames - protected_pages_)
+        return false;
+    // Revalidate the PROPOSED state: this request's outstanding grant grows by
+    // `pages`; every other live request keeps its current committed occupancy.
+    auto live = liveWitnessRequests();
+    for (auto &entry : live)
+        if (entry.record == grant.record_)
+            entry.occupied_frames += pages;
+    if (!planning::proveCompletionOrder(geometry_.frames, live).valid())
         return false;
     request.remaining += pages;
     protected_pages_ += pages;

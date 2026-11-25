@@ -29,8 +29,8 @@ TEST(CompletionWitness, ResidentOnlySafeOrderDesignExamples)
     // only 30 is free -> no order.
     {
         std::vector<WitnessRequest> requests{
-            {.generation=1, .peak_frames=32, .occupied_frames=1, .preserved=false},
-            {.generation=2, .peak_frames=32, .occupied_frames=1, .preserved=false},
+            {.generation=1, .record=1, .peak_frames=32, .occupied_frames=1, .preserved=false},
+            {.generation=2, .record=2, .peak_frames=32, .occupied_frames=1, .preserved=false},
         };
         CompletionWitness witness = proveCompletionOrder(32, requests);
         EXPECT_FALSE(witness.valid());
@@ -41,8 +41,8 @@ TEST(CompletionWitness, ResidentOnlySafeOrderDesignExamples)
     // -> order exists, and the second request finishes after the first.
     {
         std::vector<WitnessRequest> requests{
-            {.generation=1, .peak_frames=32, .occupied_frames=4, .preserved=false},
-            {.generation=2, .peak_frames=32, .occupied_frames=4, .preserved=false},
+            {.generation=1, .record=1, .peak_frames=32, .occupied_frames=4, .preserved=false},
+            {.generation=2, .record=2, .peak_frames=32, .occupied_frames=4, .preserved=false},
         };
         CompletionWitness witness = proveCompletionOrder(40, requests);
         ASSERT_TRUE(witness.valid());
@@ -57,8 +57,8 @@ TEST(CompletionWitness, ExactFitSharedTailThreeFramePool)
     // O=1 (nine sealed tokens), two writers require one private replacement each
     // to reach their tail: three frames admit both; two frames cannot.
     std::vector<WitnessRequest> simultaneous{
-        {.generation=1, .peak_frames=2, .occupied_frames=1, .preserved=false},
-        {.generation=2, .peak_frames=2, .occupied_frames=1, .preserved=false},
+        {.generation=1, .record=1, .peak_frames=2, .occupied_frames=1, .preserved=false},
+        {.generation=2, .record=2, .peak_frames=2, .occupied_frames=1, .preserved=false},
     };
     ASSERT_TRUE(proveCompletionOrder(3, simultaneous).valid());
     EXPECT_FALSE(proveCompletionOrder(2, simultaneous).valid());
@@ -73,15 +73,15 @@ TEST(CompletionWitness, TwoFrameSimultaneousPlanRefusesInFrameSubset)
     // requires the complete all-resource witness (design §5.3), not a guessed
     // order in this subset. The three-frame simultaneous plan proves.
     std::vector<WitnessRequest> simultaneous{
-        {.generation=1, .peak_frames=2, .occupied_frames=1, .preserved=false},
-        {.generation=2, .peak_frames=2, .occupied_frames=1, .preserved=false},
+        {.generation=1, .record=1, .peak_frames=2, .occupied_frames=1, .preserved=false},
+        {.generation=2, .record=2, .peak_frames=2, .occupied_frames=1, .preserved=false},
     };
     CompletionWitness witness = proveCompletionOrder(2, simultaneous);
     EXPECT_FALSE(witness.valid());
     EXPECT_FALSE(witness.refusal.empty());
     // Serial admission where only one request is live at a time proves.
     CompletionWitness serial = proveCompletionOrder(2,
-        std::vector<WitnessRequest>{{.generation=1, .peak_frames=2, .occupied_frames=1, .preserved=false}});
+        std::vector<WitnessRequest>{{.generation=1, .record=1, .peak_frames=2, .occupied_frames=1, .preserved=false}});
     ASSERT_TRUE(serial.valid());
     EXPECT_EQ(serial.steps.front().kind, WitnessStep::Kind::Advance);
     EXPECT_EQ(serial.steps.back().kind, WitnessStep::Kind::FinalRetire);
@@ -93,8 +93,8 @@ TEST(CompletionWitness, PreservedRequestContinuesAtCurrentExtent)
     // Preserved request holds 2 of 4 peak frames; the second request advances
     // into the remaining 2 without the first releasing anything.
     std::vector<WitnessRequest> requests{
-        {.generation=1, .peak_frames=4, .occupied_frames=2, .preserved=true},
-        {.generation=2, .peak_frames=2, .occupied_frames=0, .preserved=false},
+        {.generation=1, .record=1, .peak_frames=4, .occupied_frames=2, .preserved=true},
+        {.generation=2, .record=2, .peak_frames=2, .occupied_frames=0, .preserved=false},
     };
     CompletionWitness witness = proveCompletionOrder(4, requests);
     ASSERT_TRUE(witness.valid());
@@ -102,8 +102,8 @@ TEST(CompletionWitness, PreservedRequestContinuesAtCurrentExtent)
     // Fully occupied preserved request leaves no usable capacity: refusal is
     // correct and must not leave a partial plan.
     std::vector<WitnessRequest> blocked{
-        {.generation=1, .peak_frames=4, .occupied_frames=4, .preserved=true},
-        {.generation=2, .peak_frames=2, .occupied_frames=0, .preserved=false},
+        {.generation=1, .record=1, .peak_frames=4, .occupied_frames=4, .preserved=true},
+        {.generation=2, .record=2, .peak_frames=2, .occupied_frames=0, .preserved=false},
     };
     CompletionWitness refused = proveCompletionOrder(4, blocked);
     EXPECT_FALSE(refused.valid());
@@ -124,8 +124,8 @@ TEST(CompletionWitness, RefusalClearsPartialPlanAndPhaseArithmeticIsChecked)
     // Reviewer repro 2: a preserved request's Preserve step must not survive a
     // later refusal as a usable partial plan.
     std::vector<WitnessRequest> requests{
-        {.generation=1, .peak_frames=3, .occupied_frames=3, .preserved=true},
-        {.generation=2, .peak_frames=4, .occupied_frames=1, .preserved=false},
+        {.generation=1, .record=1, .peak_frames=3, .occupied_frames=3, .preserved=true},
+        {.generation=2, .record=2, .peak_frames=4, .occupied_frames=1, .preserved=false},
     };
     CompletionWitness witness = proveCompletionOrder(4, requests);
     EXPECT_FALSE(witness.valid());
@@ -229,25 +229,57 @@ TEST(CompletionWitness, AdmissionStopsBeforeExhaustionAndDrainingResumesIt)
     (void)fourth->assignFrame();
 }
 
+/** @test Reviewer seq101: witness counts outstanding grants and proposed extensions before mutation. */
+TEST(CompletionWitness, WitnessAccountsOutstandingGrantsAndProposedExtensions)
+{
+    const auto device = DeviceId::cpu();
+    const PhysicalPagePoolGeometry geometry{40, 64, 3, 32};
+    const auto bytes = PhysicalPagePool::physicalBytes(geometry, device);
+    PhysicalMemoryPlanBuilder plan;
+    plan.add({.world_rank=0, .device=device, .total_bytes=bytes, .admission_available_bytes=bytes},
+        PhysicalMemoryOwner::KVCache, bytes);
+    auto authority = std::make_shared<PhysicalMemoryAuthority>(
+        std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()), 0);
+    auto pool = authority->createCPUPagePool(device, geometry, CPUStoragePlacement::local());
+    auto a = pool->tryAdmitWithWitness(32, 1);
+    ASSERT_TRUE(a);
+    auto b = pool->tryAdmitWithWitness(32, 1);
+    ASSERT_TRUE(b);
+    // Reviewer seq101 repro: extend before assignment. A alone to 20 is
+    // provable (a completion order exists with B at its initial grant), but B
+    // to 20 makes combined committed occupancy 40/40 with peaks 32: neither
+    // can reach peak, so the second extension must refuse before mutation.
+    EXPECT_TRUE(pool->extendWithWitness(*a, 19));
+    EXPECT_FALSE(pool->extendWithWitness(*b, 19));
+    EXPECT_EQ(a->remainingCommitment(), 20u);
+    EXPECT_EQ(b->remainingCommitment(), 1u); // Nothing converted by refusal.
+    // Alternating growth at the bound: A can still extend (its order remains),
+    // but B's extension would push combined occupancy beyond a provable order.
+    EXPECT_TRUE(pool->extendWithWitness(*a, 10));
+    EXPECT_FALSE(pool->extendWithWitness(*b, 10));
+    EXPECT_EQ(a->remainingCommitment(), 30u);
+    EXPECT_EQ(b->remainingCommitment(), 1u);
+}
+
 /** @test Impossible geometry and inconsistent requests are typed refusals, never guessed orders. */
 TEST(CompletionWitness, InvalidInputsRefuseWithoutInventingSteps)
 {
     EXPECT_FALSE(proveCompletionOrder(0, {}).valid());
     {
-        std::vector<WitnessRequest> requests{{.generation=1, .peak_frames=0, .occupied_frames=0}};
+        std::vector<WitnessRequest> requests{{.generation=1, .record=1, .peak_frames=0, .occupied_frames=0}};
         EXPECT_FALSE(proveCompletionOrder(4, requests).valid());
     }
     {
-        std::vector<WitnessRequest> requests{{.generation=1, .peak_frames=2, .occupied_frames=3}};
+        std::vector<WitnessRequest> requests{{.generation=1, .record=1, .peak_frames=2, .occupied_frames=3}};
         EXPECT_FALSE(proveCompletionOrder(4, requests).valid());
     }
     {
-        std::vector<WitnessRequest> requests{{.generation=1, .peak_frames=8, .occupied_frames=1}};
+        std::vector<WitnessRequest> requests{{.generation=1, .record=1, .peak_frames=8, .occupied_frames=1}};
         EXPECT_FALSE(proveCompletionOrder(4, requests).valid());
     }
     {
-        std::vector<WitnessRequest> requests{{.generation=1, .peak_frames=2, .occupied_frames=1},
-            {.generation=2, .peak_frames=2, .occupied_frames=1}};
+        std::vector<WitnessRequest> requests{{.generation=1, .record=1, .peak_frames=2, .occupied_frames=1},
+            {.generation=2, .record=2, .peak_frames=2, .occupied_frames=1}};
         // Three frames with 1+1 occupied leave one free; the first request
         // advances (needs 1), frees its frame, then the second advances. Valid.
         EXPECT_TRUE(proveCompletionOrder(3, requests).valid());

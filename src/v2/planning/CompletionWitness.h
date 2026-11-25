@@ -25,9 +25,10 @@ namespace llaminar2::planning
 /** @brief One request's page-frame demand at its declared peak. */
 struct WitnessRequest
 {
-    std::uint64_t generation = 0;
+    std::uint64_t generation = 0;  ///< Request generation (may repeat across records).
+    std::size_t record = 0;        ///< Unique pool request-record identity for matching.
     std::size_t peak_frames = 0;   ///< Complete resident working set at peak.
-    std::size_t occupied_frames = 0; ///< Currently live private frames (O contribution).
+    std::size_t occupied_frames = 0; ///< Live private frames plus outstanding grants when labelled.
     bool preserved = false;        ///< Lower-tier preservation available for this request.
     bool operator==(const WitnessRequest &) const = default;
 };
