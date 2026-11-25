@@ -798,6 +798,9 @@ namespace llaminar2
          */
         virtual std::vector<ServingBatchEvent> stepServingBatch() { return {}; }
 
+        /** @brief Why the serving session sealed after a failed shared forward; empty while healthy. */
+        virtual std::string servingBatchFailure() const { return {}; }
+
         /** @brief Current session occupancy (owning thread only). */
         virtual ServingBatchOccupancy servingBatchOccupancy() const { return {}; }
 

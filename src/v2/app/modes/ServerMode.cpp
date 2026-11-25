@@ -756,13 +756,21 @@ namespace llaminar2
      */
     std::shared_ptr<std::atomic<std::size_t>> registerBatchedChatCompletionEndpoint(
         httplib::Server &server, ChatCompletionHandler &handler, std::size_t max_in_flight,
-        HttpStreamObserver stream_observer)
+        HttpStreamObserver stream_observer, std::function<std::string()> serving_failure)
     {
         auto in_flight = std::make_shared<std::atomic<std::size_t>>(0);
         server.Post("/v1/chat/completions",
-                 [&handler, in_flight, max_in_flight, stream_observer = std::move(stream_observer)](
+                 [&handler, in_flight, max_in_flight, stream_observer = std::move(stream_observer),
+                  serving_failure = std::move(serving_failure)](
                      const httplib::Request &req, httplib::Response &res)
                  {
+                     if (const auto failure = serving_failure(); !failure.empty())
+                     {
+                         res.status = 503;
+                         res.set_content(json{{"error", {{"message", failure}, {"type", "server_error"},
+                             {"code", "serving_failed"}}}}.dump(), "application/json");
+                         return;
+                     }
                      const HttpRequestArrival arrival;
                      ChatCompletionResponse parse_error;
                      auto parsed_request = ChatCompletionHandler::parseRequest(req.body, parse_error);
@@ -1048,9 +1056,17 @@ namespace llaminar2
                     });
 
         // ─── GET /health ─────────────────────────────────────────────
-        svr.Get("/health", [](const httplib::Request &, httplib::Response &res)
+        // Fatal serving policy: a failed continuous-batching session keeps the
+        // process up but reports 503 on /health and inference, so the
+        // operator's supervisor restarts it. Installed below when batching.
+        auto serving_failure = std::make_shared<std::function<std::string()>>([] { return std::string{}; });
+        svr.Get("/health", [serving_failure](const httplib::Request &, httplib::Response &res)
                 {
-            json response = {{"status", "ok"}};
+            const auto failure = (*serving_failure)();
+            json response = failure.empty() ? json{{"status", "ok"}}
+                                             : json{{"status", "failed"}, {"reason", failure}};
+            if (!failure.empty())
+                res.status = 503;
             res.set_content(response.dump(), "application/json"); });
 
         // ─── GET /v1/models ──────────────────────────────────────────
@@ -1137,8 +1153,10 @@ namespace llaminar2
             // (checked at resolution) sizes the HTTP response pool.
             const std::size_t max_in_flight =
                 static_cast<std::size_t>(batch_capacity) + executor_queue_capacity;
+            *serving_failure = [driver = batch_driver.get()] { return driver->failure(); };
             const auto in_flight =
-                registerBatchedChatCompletionEndpoint(svr, handler, max_in_flight, stream_observer);
+                registerBatchedChatCompletionEndpoint(svr, handler, max_in_flight, stream_observer,
+                                                      [driver = batch_driver.get()] { return driver->failure(); });
             *queue_stats = [in_flight, max_in_flight, driver = batch_driver.get()] {
                 const auto occupancy = driver->occupancy();
                 return json{{"mode", "continuous_batching"}, {"capacity", max_in_flight},

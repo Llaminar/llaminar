@@ -61,6 +61,11 @@ namespace llaminar2::test
             void endServingBatch() override { ended = true; }
             int servingBatchCapacity() const override { return resident_capacity; }
             const std::string &lastError() const override { return error_; }
+            std::string servingBatchFailure() const override
+            {
+                std::lock_guard lock(mutex_);
+                return failure_;
+            }
 
             bool submitServingRequest(ServingBatchRequest request) override
             {
@@ -146,6 +151,7 @@ namespace llaminar2::test
                     queue_.clear();
                     resident_.clear();
                     fail_forward = false;
+                    failure_ = "fake forward failure"; // the runner session seals
                     return events;
                 }
                 while (!queue_.empty() && static_cast<int>(resident_.size()) < resident_capacity)
@@ -205,6 +211,7 @@ namespace llaminar2::test
             std::vector<std::uint64_t> cancels_;
             std::vector<std::uint64_t> cancelled_;
             std::string error_;
+            std::string failure_;
             std::mutex gate_mutex_;
             std::condition_variable gate_;
         };
@@ -396,6 +403,14 @@ namespace llaminar2::test
         EXPECT_EQ(failed.error, "fake forward failure");
         ASSERT_EQ(waiting.wait_for(std::chrono::seconds(10)), std::future_status::ready);
         EXPECT_EQ(waiting.get().error, "fake forward failure");
+        // The runner seal closes the driver: serving reports the failure and
+        // admits nothing more.
+        for (int i = 0; i < 200 && !driver.closed(); ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        EXPECT_TRUE(driver.closed());
+        EXPECT_NE(driver.failure().find("fake forward failure"), std::string::npos) << driver.failure();
+        auto late = driver.makeLane();
+        EXPECT_FALSE(bounded([&] { return late->prefill(prompt(4)); }));
     }
 
     TEST(ServingBatchDriverLifecycle, ForcedTokenFailsFastWithAnOutstandingGrant)

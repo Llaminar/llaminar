@@ -301,6 +301,13 @@ namespace llaminar2
 
         int capacity() const { return capacity_; }
 
+        /** @brief Why serving failed (sealed); empty while healthy or after an orderly stop. */
+        std::string failure() const
+        {
+            std::lock_guard lock(mutex_);
+            return failure_;
+        }
+
         /** @brief True once stopped or sealed by a failure. */
         bool closed() const
         {
@@ -340,7 +347,10 @@ namespace llaminar2
             {
                 std::lock_guard lock(mutex_);
                 if (!closed_)
+                {
                     close_reason_ = reason;
+                    failure_ = reason;
+                }
                 closed_ = true;
             }
             LOG_ERROR("[ServingBatchDriver] session sealed: " << reason);
@@ -383,6 +393,14 @@ namespace llaminar2
                     if (runner_.servingBatchHasRunnableWork())
                         for (const auto &event : runner_.stepServingBatch())
                             dispatch(event);
+                    // A sealed runner session (failed shared forward) is
+                    // fatal for serving: close the driver too, so new
+                    // requests and /health report the failure.
+                    if (const auto failure = runner_.servingBatchFailure(); !failure.empty())
+                    {
+                        seal("serving session failed: " + failure);
+                        return;
+                    }
                     runnable_ = runner_.servingBatchHasRunnableWork();
                     const auto occupancy = runner_.servingBatchOccupancy();
                     resident_.store(occupancy.resident);
@@ -431,6 +449,7 @@ namespace llaminar2
         std::deque<std::function<void()>> commands_;
         bool closed_ = false;
         std::string close_reason_;
+        std::string failure_;
         /** @brief Submitted, not yet applied by the driver thread (mutex_). */
         std::map<std::uint64_t, std::shared_ptr<ServingMailbox>> unadmitted_;
         bool runnable_ = false; ///< Driver-thread only.

@@ -317,6 +317,7 @@ namespace llaminar2
         bool servingBatchIdle() const override;
         bool servingBatchHasRunnableWork() const override;
         std::string servingBatchUnsupportedReason() const override;
+        std::string servingBatchFailure() const override { return serving_failure_; }
         ServingBatchOccupancy servingBatchOccupancy() const override
         {
             return {static_cast<int>(serving_rows_.size()), static_cast<int>(serving_queue_.size())};
