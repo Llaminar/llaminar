@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <cstring>
 #include <array>
+#include <cstddef>
 #include <initializer_list>
 #include <iterator>
 #include <string>
@@ -313,12 +314,21 @@ TEST(Test__MoERebalanceController,
     static_assert(std::is_trivially_copyable_v<DeviceMoERebalancePlanEntry>);
     // Version 18 appends completed decisions to the controller; v17's exact
     // command payload/lease fields and zero-reserved word remain unchanged.
-    EXPECT_EQ(kDeviceMoERebalanceVersion, 19u);
+    // v20 assigns the former config padding word to the explicit histogram
+    // layout without changing the config extent, so a default (raw-kernel)
+    // config stays resident-only and has no transfer family ranges.
+    EXPECT_EQ(kDeviceMoERebalanceVersion, 20u);
     EXPECT_NE(DeviceMoERebalanceWaveLifecycle::PreparedForPublication,
               DeviceMoERebalanceWaveLifecycle::Applied);
     EXPECT_EQ(
         sizeof(DeviceMoERebalanceConfig),
         moe_rebalance_abi::kConfigBytes);
+    EXPECT_EQ(offsetof(DeviceMoERebalanceConfig, histogram_layout),
+              moe_rebalance_abi::kConfigHistogramLayoutOffset);
+    const DeviceMoERebalanceConfig config{};
+    EXPECT_EQ(config.histogram_layout,
+              moe_rebalance_abi::HistogramLayout::ResidentOnly);
+    EXPECT_EQ(config.transfer_slot_layer_ranges, nullptr);
 
     const DeviceMoERebalancePlanEntry plan{};
     EXPECT_EQ(plan.destination_slot, kDeviceMoEInvalidSlot);
