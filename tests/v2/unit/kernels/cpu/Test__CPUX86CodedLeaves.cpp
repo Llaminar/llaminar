@@ -44,7 +44,7 @@
  * The GPU-aligned program of the generic multi_scale::rows() (the other
  * compact codebooks: IQ2_XXS, IQ1_S, IQ2_XS, IQ1_M, ...) pins both its
  * per-block accumulation and its partition fold the same way
- * (accumulateOrdered()); backend-native rows keep their unchanged plain `+`
+ * (accumulateBlockOrdered(), accumulateOrdered()); backend-native rows keep their unchanged plain `+`
  * program. FusedOrderedPartitionNaNsKeepEarlierPartitionAndSerialBytes drives
  * it through the fused batched entry with two NaN activation scales per row,
  * in different partitions or inside one partition, and checks the earlier
@@ -1051,16 +1051,21 @@ namespace llaminar2::test
     TEST(CPUX86CodedLeaves, FusedPrefillMembersStreamPanelsAndRetainSerialBytes)
     {
         constexpr std::array<int, 5> member_rows{17, 3, 33, 16, 1};
-        constexpr int members = static_cast<int>(member_rows.size()), n = 128, live_n = 65;
+        constexpr int members = static_cast<int>(member_rows.size());
         constexpr float dirty = 123456.0f;
         const int lanes = activeISALevel() >= ISALevel::AVX512 ? 16 : 8;
+        // N = 65: one complete 64-column strip and a one-column tail strip;
+        // N = 40: only a tail strip (AVX-512 runs every chunk as a tail).
+        for (const int live_n : {65, 40})
         for (const Layout &layout : {kIQ3S, kQ5K, kQ50, kQ4K, kIQ4XS})
             for (const Policy policy : kPolicies)
                 for (const int blocks : {16, 17, 40})
                     for (const int workers : {1, 3})
                     {
+                        const int n = live_n > 64 ? 128 : 64;
                         SCOPED_TRACE(std::string(layout.name) + " policy=" + std::to_string(int(policy)) + " blocks=" +
-                                     std::to_string(blocks) + " workers=" + std::to_string(workers));
+                                     std::to_string(blocks) + " workers=" + std::to_string(workers) +
+                                     " N=" + std::to_string(live_n));
                         ScopedTeam team(workers);
                         std::array<CPUNativeQuantisedPackedWeights, members> packed;
                         std::array<std::vector<Q8_1Block>, members> input;
@@ -1119,10 +1124,11 @@ namespace llaminar2::test
                         EXPECT_LE(demand, envelope) << "the members' admitted envelope must cover the launch";
                         // The reported tile is the one complete strips execute:
                         // one row for wide multi-block GPU-aligned Q4_K/Q5_K/Q5_0
-                        // register folds, otherwise two (restated independently).
+                        // register folds, otherwise two; N < 64 has no complete
+                        // wide strip, only a tail strip of two-row tiles.
                         const bool gpu = policy == Policy::GPUAlignedExpert;
                         const int partition_width = (blocks - 1) / std::max(1, plan.projections[0].k_tiles) + 1;
-                        const bool split = lanes == 16 && gpu && plan.projections[0].k_tiles > 1 &&
+                        const bool split = lanes == 16 && live_n >= 64 && gpu && plan.projections[0].k_tiles > 1 &&
                             partition_width > 1 && partition_width <= x86_panel::depth &&
                             (layout.codebook == 5 || layout.codebook == 7 || layout.codebook == 6);
                         for (int p = 0; p < members; ++p)

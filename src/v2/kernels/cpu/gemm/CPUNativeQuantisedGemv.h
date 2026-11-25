@@ -4843,7 +4843,7 @@ namespace llaminar2::cpu::native_quantised
                      {"k", std::to_string(packed.K)}, {"codebook", std::to_string(packed.codebook_id)},
                      {"build_isa", compiledNativeQuantisedBuildISAName()}, {"isa", use_avx512 ? "AVX512" : "AVX2"},
                      {"route", "packed_panel"},
-                     {"row_tile", std::to_string(x86_panel::panelRowTile(panel_format, panel_strip,
+                     {"row_tile", std::to_string(x86_panel::panelRowTile(panel_format, panel_strip, N,
                          packed.numerical_policy == CPUProjectionNumericalPolicy::GPUAlignedExpert, K_blocks, partitions))},
                      {"strip_columns", std::to_string(panel_strip)}, {"requested_policy", "Auto"},
                      {"effective_policy", "PackedPanel"}, {"n_block_chunks", "1"}, {"task_grid", "n_strip_all_rows"},
@@ -6082,7 +6082,7 @@ namespace llaminar2::cpu::native_quantised
                 .packed_panel = plan.packed_panel,
                 .panel_row_tile = plan.packed_panel
                     ? x86_panel::panelRowTile(x86_panel::formatFor(descriptor.packed->encoding, descriptor.packed->codebook_id),
-                          x86_panel::pooledStrip(isa == ISAPath::AVX512 ? 16 : 8),
+                          x86_panel::pooledStrip(isa == ISAPath::AVX512 ? 16 : 8), descriptor.packed->N,
                           descriptor.packed->numerical_policy == CPUProjectionNumericalPolicy::GPUAlignedExpert,
                           descriptor.packed->blocks_per_row, std::max(1, plan.k_tiles))
                     : 0};
@@ -6094,7 +6094,8 @@ namespace llaminar2::cpu::native_quantised
          *         task grid n_chunk_all_rows, one producer task per 64-column chunk
          *         and the row tile its complete strips execute (panelRowTile(): two,
          *         or one for wide multi-block GPU-aligned Q4_K/Q5_K/Q5_0 folds; an
-         *         N-tail strip runs two). Its verifier tile fields are not executed.
+         *         N-tail strip runs two, and N < 64 has only that strip, so two).
+         *         Its verifier tile fields are not executed.
          */
         PerfStatsCollector::Tags tags() const
         {

@@ -129,22 +129,27 @@ namespace llaminar2::cpu::native_quantised::x86_panel
     }
 
     /**
-     * @brief Physical rows one register tile of a complete panel strip consumes.
+     * @brief Physical rows one register tile of the projection's complete panel strips consumes.
      * @param format Admitted panel format.
      * @param strip Strip columns (stripColumns() or pooledStrip()).
+     * @param columns Live output columns N of the projection.
      * @param gpu_aligned Whether the projection uses the GPU-aligned ordered tree.
      * @param blocks Logical K blocks.
      * @param partitions Serial K partition count (at most one for contiguous K).
      * @return rowTile(strip), or one for the wide register-folded GPU-aligned
      *         program of wideOrderedSplitsRows() formats with multi-block partitions.
      * @details The single source of the executed tile and of its evidence.
-     * Register folding needs partitions of at most @ref depth blocks; an
-     * N-tail strip keeps the per-partition program and rowTile(strip).
+     * Register folding needs partitions of at most @ref depth blocks and a
+     * complete strip; an N-tail strip keeps the per-partition program and
+     * rowTile(strip). A projection with N < strip has only a tail strip and
+     * reports rowTile(strip); one with complete strips reports their tile
+     * (its N-tail strip, if any, runs rowTile(strip)).
      */
-    constexpr int panelRowTile(Format format, int strip, bool gpu_aligned, int blocks, int partitions) noexcept
+    constexpr int panelRowTile(Format format, int strip, int columns, bool gpu_aligned, int blocks,
+                               int partitions) noexcept
     {
         const int width = partitions > 1 ? (blocks - 1) / partitions + 1 : blocks;
-        const bool folds = gpu_aligned && partitions > 1 && width <= depth;
+        const bool folds = gpu_aligned && partitions > 1 && width <= depth && columns >= strip;
         return strip == wide_strip && folds && width > 1 && wideOrderedSplitsRows(format) ? 1 : rowTile(strip);
     }
 
