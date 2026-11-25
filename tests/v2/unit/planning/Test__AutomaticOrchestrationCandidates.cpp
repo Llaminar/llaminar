@@ -1228,7 +1228,8 @@ TEST(AutomaticOrchestrationCandidates, OverlayServingPoolAdmitsOwnerLineForConti
             const int authority = compiled.overlayExecution()->continuation_root_rank;
             const auto demand = servingPoolDemandForRank(
                 true, authority, plan.rank,
-                compiled.config().servingCapacityRequest(), ServingSlotDecisionGeometry{});
+                compiled.config().servingCapacityRequest(),
+                ServingSlotDecisionGeometry::forVocabulary(source.metadata().memoryProfile().vocab_size));
             if (plan.rank == authority)
             {
                 ASSERT_TRUE(demand.has_value());
@@ -1323,7 +1324,8 @@ TEST(AutomaticOrchestrationCandidates, ServingPoolOwnershipTypedDecision)
             // installed envelope R x the default per-response policy).
             const auto expected = servingPoolMemoryDemand(
                 resolveInstalledServingCapacity(request.config.servingCapacityRequest()),
-                ServingPoolPerResponseBudget::defaultPolicy(), ServingSlotDecisionGeometry{});
+                ServingPoolPerResponseBudget::defaultPolicy(),
+                ServingSlotDecisionGeometry::forVocabulary(request.model.vocab_size));
             EXPECT_EQ(*demand, expected);
         }
         // NON-CONTRIBUTING STAGE: none.

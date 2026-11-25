@@ -51,10 +51,11 @@ namespace llaminar2
     /**
      * @brief Geometry of the per-slot decision state of continuous batching.
      *
-     * With S > 1 resident slots each slot retains its next decision's
-     * full-vocabulary FP32 logits between shared forwards (a paced request
-     * may wait for its grant). S = 1 serving decides from the runner's own
-     * logits buffer and retains none.
+     * Serving rows retain each resident slot's next-decision full-vocabulary
+     * FP32 logits between shared forwards (a paced request may wait for its
+     * grant). Planning prices one row per slot (S >= 1) because the serving
+     * path is chosen after admission; the serialized S = 1 executor, which
+     * decides from the runner's own logits, prices none (unset vocabulary).
      */
     struct ServingSlotDecisionGeometry
     {
@@ -72,14 +73,21 @@ namespace llaminar2
             return ServingSlotDecisionGeometry{static_cast<std::uint64_t>(vocab_size)};
         }
 
-        /** @return Retained decision-logits bytes for @p resident_slots slots. */
+        /**
+         * @return Retained decision-logits bytes for @p resident_slots slots.
+         * @throws std::invalid_argument For S > 1 without a vocabulary.
+         */
         [[nodiscard]] std::uint64_t bytesFor(int resident_slots) const
         {
-            if (resident_slots <= 1)
+            if (resident_slots <= 0)
                 return 0;
             const auto slots = static_cast<std::uint64_t>(resident_slots);
             if (vocab_size == 0)
+            {
+                if (resident_slots == 1)
+                    return 0; // serialized capacity-one executor: no retained rows
                 throw std::invalid_argument("Serving slot decision geometry is unset");
+            }
             if (vocab_size > std::numeric_limits<std::uint64_t>::max() / sizeof(float) / slots)
                 throw std::overflow_error("Serving slot decision storage overflows uint64");
             return slots * vocab_size * sizeof(float);

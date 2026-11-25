@@ -1048,6 +1048,10 @@ namespace llaminar2
         // executor's stable worker; S > 1 (continuous batching) admits against
         // PMA-backed response leases and per-slot decision storage.
         const int batch_capacity = resolved_capacity->residentSlots();
+        // Serving rows serve every resolved S (including S = 1) wherever the
+        // runner provides them; the serialized executor remains only for
+        // topologies without serving rows yet (GPU, MTP, hybrid, multi-rank).
+        const bool serving_rows = !mpi_coordinated && runner->servingBatchCapacity() >= batch_capacity;
         if (batch_capacity > 1 &&
             (mpi_coordinated || runner->servingBatchCapacity() < batch_capacity))
         {
@@ -1066,7 +1070,7 @@ namespace llaminar2
         }
         std::optional<SerializedInferenceExecutor> serialized_executor;
         std::unique_ptr<ServingResponseLeasePool> response_leases;
-        if (batch_capacity > 1)
+        if (serving_rows)
             response_leases = std::make_unique<ServingResponseLeasePool>(
                 *resolved_capacity, serving_memory_authority, ServingPoolPerResponseBudget::defaultPolicy(),
                 ServingSlotDecisionGeometry::forVocabulary(runner->vocabSize()));
@@ -1170,7 +1174,7 @@ namespace llaminar2
         auto stream_observer = [&request_log_state](const httplib::Request &request, std::shared_ptr<std::string> body) {
             request_log_state.attachStreamedResponseBody(request, std::move(body));
         };
-        if (batch_capacity > 1)
+        if (serving_rows)
         {
             // The decision store is materialized from the committed serving
             // pool (one FP32 vocabulary row per resident slot).
@@ -1209,7 +1213,7 @@ namespace llaminar2
                             {"committed_bytes", lease_state.committed_bytes},
                             {"materialized_bytes", lease_state.materialized_bytes}};
             };
-            LOG_INFO("Continuous batching: S=" << batch_capacity << " resident slots, R="
+            LOG_INFO("Serving rows (continuous batching): S=" << batch_capacity << " resident slots, R="
                      << resolved_capacity->responseLeases() << " response leases, Q="
                      << resolved_capacity->queueCapacity() << " (PMA serving pool "
                      << response_leases->snapshot().committed_bytes << " bytes)");

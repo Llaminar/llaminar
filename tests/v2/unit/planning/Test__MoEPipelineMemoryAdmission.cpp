@@ -338,10 +338,11 @@ TEST(MoEPipelineMemoryAdmission, ServingPoolChargedOnceForParentStage)
 {
     PlanningGGUFFixture file(true, true, PlanningGGUFFixture::sourceType(TensorType::FP32));
     PlanningModelSource source(file.path());
-    const auto serving_expected = [](const OrchestrationConfig &cfg) {
+    const auto serving_expected = [&source](const OrchestrationConfig &cfg) {
         return servingPoolMemoryDemand(
             resolveInstalledServingCapacity(cfg.servingCapacityRequest()),
-            ServingPoolPerResponseBudget::defaultPolicy(), ServingSlotDecisionGeometry{});
+            ServingPoolPerResponseBudget::defaultPolicy(),
+            ServingSlotDecisionGeometry::forVocabulary(source.metadata().memoryProfile().vocab_size));
     };
     // SERVING 2-STAGE local pipeline: exactly one owner line, exact demand.
     {
@@ -392,7 +393,8 @@ TEST(MoEPipelineMemoryAdmission, ServingPoolChargedOnceForParentStage)
         // D+D charge — the total must equal the single parent-stage demand).
         const auto wide_expected = servingPoolMemoryDemand(
             resolveInstalledServingCapacity(input.config.servingCapacityRequest()),
-            ServingPoolPerResponseBudget::defaultPolicy(), ServingSlotDecisionGeometry{});
+            ServingPoolPerResponseBudget::defaultPolicy(),
+            ServingSlotDecisionGeometry::forVocabulary(wide_source.metadata().memoryProfile().vocab_size));
         EXPECT_EQ(total, wide_expected);
     }
 }

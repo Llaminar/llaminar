@@ -87,10 +87,11 @@ namespace llaminar2::test
         const auto slots = ServingSlotDecisionGeometry::forVocabulary(151936);
         EXPECT_EQ(servingPoolMemoryDemand(batched, budget, slots),
                   40u * budget.bytes_per_response + 4u * 151936u * sizeof(float));
-        // S = 1 decides from the runner's logits: no retained slot rows.
+        // Planning prices one row for S = 1 (serving rows may serve it); the
+        // serialized executor's own demand (unset vocabulary) retains none.
         const auto serial = resolveInstalledServingCapacity(ServingCapacityRequest::automatic());
         EXPECT_EQ(servingPoolMemoryDemand(serial, budget, slots),
-                  servingPoolMemoryDemand(serial, budget, ServingSlotDecisionGeometry{}));
+                  servingPoolMemoryDemand(serial, budget, ServingSlotDecisionGeometry{}) + 151936u * sizeof(float));
         // Batched demand without a vocabulary is a pricing error, never zero.
         EXPECT_THROW((void)servingPoolMemoryDemand(batched, budget, ServingSlotDecisionGeometry{}),
                      std::invalid_argument);
