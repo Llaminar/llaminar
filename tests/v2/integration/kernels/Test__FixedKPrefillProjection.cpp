@@ -58,7 +58,10 @@ namespace
     {
         static bool alloc(void **p, size_t bytes) { return cudaMalloc(p, bytes) == cudaSuccess; }
         static bool free(void *p) { return cudaFree(p) == cudaSuccess; }
-        static bool upload(void *d, const void *h, size_t bytes) { return cudaMemcpy(d, h, bytes, cudaMemcpyHostToDevice) == cudaSuccess; }
+        // Ordered on the launch stream: a pageable cudaMemcpy may return before
+        // its DMA lands, and the non-blocking launch stream would not wait for it.
+        static bool upload(void *d, const void *h, size_t bytes, NativeStream s)
+        { return cudaMemcpyAsync(d, h, bytes, cudaMemcpyHostToDevice, s) == cudaSuccess && cudaStreamSynchronize(s) == cudaSuccess; }
         static bool download(void *h, const void *d, size_t bytes, NativeStream s)
         { return cudaMemcpyAsync(h, d, bytes, cudaMemcpyDeviceToHost, s) == cudaSuccess && cudaStreamSynchronize(s) == cudaSuccess; }
         static bool poison(void *d, size_t bytes, NativeStream s) { return cudaMemsetAsync(d, 0xff, bytes, s) == cudaSuccess; }
@@ -73,7 +76,8 @@ namespace
     {
         static bool alloc(void **p, size_t bytes) { return hipMalloc(p, bytes) == hipSuccess; }
         static bool free(void *p) { return hipFree(p) == hipSuccess; }
-        static bool upload(void *d, const void *h, size_t bytes) { return hipMemcpy(d, h, bytes, hipMemcpyHostToDevice) == hipSuccess; }
+        static bool upload(void *d, const void *h, size_t bytes, NativeStream s)
+        { return hipMemcpyAsync(d, h, bytes, hipMemcpyHostToDevice, s) == hipSuccess && hipStreamSynchronize(s) == hipSuccess; }
         static bool download(void *h, const void *d, size_t bytes, NativeStream s)
         { return hipMemcpyAsync(h, d, bytes, hipMemcpyDeviceToHost, s) == hipSuccess && hipStreamSynchronize(s) == hipSuccess; }
         static bool poison(void *d, size_t bytes, NativeStream s) { return hipMemsetAsync(d, 0xff, bytes, s) == hipSuccess; }
@@ -185,8 +189,8 @@ namespace
             ASSERT_TRUE(Native::alloc(&d_b, host_b.size() * sizeof(Operand)));
             ASSERT_TRUE(Native::alloc(&d_c, c_bytes));
             ASSERT_TRUE(Native::alloc(&d_p, p_bytes));
-            ASSERT_TRUE(Native::upload(d_a, host_a.data(), host_a.size() * sizeof(Operand)));
-            ASSERT_TRUE(Native::upload(d_b, host_b.data(), host_b.size() * sizeof(Operand)));
+            ASSERT_TRUE(Native::upload(d_a, host_a.data(), host_a.size() * sizeof(Operand), stream));
+            ASSERT_TRUE(Native::upload(d_b, host_b.data(), host_b.size() * sizeof(Operand), stream));
             const auto *A = static_cast<const Operand *>(d_a);
             const auto *B = static_cast<const Operand *>(d_b);
             auto *C = static_cast<float *>(d_c);
