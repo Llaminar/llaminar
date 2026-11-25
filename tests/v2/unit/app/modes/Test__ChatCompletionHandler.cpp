@@ -15,6 +15,7 @@
  */
 
 #include <gtest/gtest.h>
+#include "app/modes/SSEPublishChannel.h"
 #include <gmock/gmock.h>
 
 #include "app/modes/ChatCompletionHandler.h"
@@ -5383,4 +5384,43 @@ TEST_F(Test__ChatCompletionHandler, RuntimeStatsFreshnessIncludesCleanupRetireme
     EXPECT_EQ(complete["last_request"]["completion_tokens"], usage["completion_tokens"]);
     EXPECT_EQ(complete["tokens"]["completion"], 1);
     EXPECT_EQ(complete["timings"]["latency"]["samples"], 1);
+}
+
+/** Streamed events are bounded: long text becomes several deltas that reconstruct it exactly. */
+TEST_F(Test__ChatCompletionHandler, StreamingSplitsLongTextIntoBoundedEvents)
+{
+    ON_CALL(*tokenizer_, encodeChat(_, _, _)).WillByDefault(Return(std::vector<int>{1, 2}));
+    ON_CALL(*runner_, prefill(_)).WillByDefault(Return(true));
+    ON_CALL(*tokenizer_, is_stop_token(_)).WillByDefault(Return(false));
+    std::string big;
+    for (int i = 0; i < 2500; ++i)
+        big += "\xC3\xA9\"x"; // multi-byte + JSON-escaped characters
+    ON_CALL(*tokenizer_, decode_token(10)).WillByDefault(Return(big));
+    ON_CALL(*tokenizer_, decode_token(11)).WillByDefault(Return(""));
+    int steps = 0;
+    ON_CALL(*runner_, decodeStep()).WillByDefault(Invoke([&] {
+        return ++steps == 1 ? makeTokens({10}) : makeTokens({11}, true);
+    }));
+    ChatCompletionRequest request;
+    request.messages = {{"user", "long"}};
+    request.max_tokens = 4;
+    request.enable_thinking = false;
+    request.stream = true;
+    std::string reconstructed;
+    std::size_t largest_event = 0;
+    const auto response = makeHandler()->handleStreamingRequest(request, [&](const std::string &line) {
+        largest_event = std::max(largest_event, line.size());
+        if (line.rfind("data: {", 0) == 0)
+        {
+            const auto chunk = json::parse(line.substr(6));
+            const auto &delta = chunk.at("choices")[0].at("delta");
+            if (delta.contains("content"))
+                reconstructed += delta.at("content").get<std::string>();
+        }
+        return true;
+    });
+    ASSERT_TRUE(response.ok);
+    ASSERT_EQ(reconstructed.size(), big.size());
+    EXPECT_TRUE(reconstructed == big);
+    EXPECT_LE(largest_event, SSEPublishChannelBudget::kMaxEventBytes);
 }

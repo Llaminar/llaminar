@@ -47,14 +47,30 @@ namespace llaminar2
         std::size_t max_entries = 0;
         /** @brief 0 = unbounded (observation only); >0 = explicit byte cap. */
         std::size_t max_buffered_bytes = 0;
-        /** @brief Handling of one line larger than the whole byte cap. */
-        enum class OversizedLine
+        /**
+         * @brief Largest raw text bytes one streamed delta carries. Longer
+         *        content/reasoning/tool-argument text is split into several
+         *        protocol-valid deltas (clients concatenate them).
+         */
+        static constexpr std::size_t kMaxDeltaTextBytes = 2048;
+        /**
+         * @brief Admitted maximum bytes of one SSE event: delta text with
+         *        worst-case JSON escaping (6x for \uXXXX) plus framing.
+         */
+        static constexpr std::size_t kMaxEventBytes = kMaxDeltaTextBytes * 6 + 1024;
+
+        /**
+         * @brief Queue byte cap so that the producer's line being built, the
+         *        queued lines and the writer's in-flight line together stay
+         *        within @p response_bytes (two events are outside the queue).
+         * @throws std::invalid_argument When the budget cannot hold them.
+         */
+        static std::size_t queuedBytesWithin(std::size_t response_bytes)
         {
-            Reject,              ///< Typed std::length_error (default).
-            AdmitAloneWhenEmpty, ///< Wait until the queue drained, then queue it alone:
-                                 ///< buffered bytes stay <= max(cap, that already-built line).
-        };
-        OversizedLine oversized_line = OversizedLine::Reject;
+            if (response_bytes <= 3 * kMaxEventBytes)
+                throw std::invalid_argument("Per-response budget too small for bounded SSE events");
+            return response_bytes - 2 * kMaxEventBytes;
+        }
 
         /** @brief PRODUCTION QUOTA POLICY (PROVISIONAL — NOT certified geometry).
          *
@@ -116,8 +132,7 @@ namespace llaminar2
             // With max_buffered_bytes == 0 (production/unbounded) no line is ever
             // rejected by a fabricated cap.
             const bool byte_capped = budget_.max_buffered_bytes != 0;
-            const bool oversized = byte_capped && line.size() > budget_.max_buffered_bytes;
-            if (oversized && budget_.oversized_line != SSEPublishChannelBudget::OversizedLine::AdmitAloneWhenEmpty)
+            if (byte_capped && line.size() > budget_.max_buffered_bytes)
             {
                 throw std::length_error(
                     "SSE publish line exceeds the request's queued-payload byte window; "
@@ -135,8 +150,6 @@ namespace llaminar2
             const auto blocked = [&] {
                 if (lines_.size() >= budget_.max_entries)
                     return true;
-                if (oversized)
-                    return !lines_.empty(); // admitted alone into an empty queue
                 return byte_capped &&
                        (buffered_bytes_ >= budget_.max_buffered_bytes ||
                         line.size() > budget_.max_buffered_bytes - buffered_bytes_);

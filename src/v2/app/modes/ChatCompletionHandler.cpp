@@ -25,6 +25,7 @@
  */
 
 #include "app/modes/ChatCompletionHandler.h"
+#include "app/modes/SSEPublishChannel.h"
 #include "app/modes/MoEMovementLedgerJson.h"
 #include "app/modes/PrefixMovementJson.h"
 #include "execution/runner/IOrchestrationRunner.h"
@@ -347,6 +348,28 @@ namespace llaminar2
                 cache["movement_epochs"] = prefixMovementStagesJson(prefix.movement_stages);
             }
             return result;
+        }
+
+        /**
+         * @brief Split text into pieces of at most @p max_bytes on UTF-8
+         *        code-point boundaries (streamed deltas concatenate exactly).
+         */
+        std::vector<std::string> splitUtf8Text(const std::string &text, std::size_t max_bytes)
+        {
+            std::vector<std::string> pieces;
+            std::size_t start = 0;
+            while (start < text.size())
+            {
+                std::size_t end = std::min(text.size(), start + max_bytes);
+                while (end < text.size() && end > start &&
+                       (static_cast<unsigned char>(text[end]) & 0xC0u) == 0x80u)
+                    --end; // never split inside a multi-byte sequence
+                if (end == start)
+                    end = std::min(text.size(), start + max_bytes);
+                pieces.push_back(text.substr(start, end - start));
+                start = end;
+            }
+            return pieces;
         }
 
         bool runChatMoERebalanceMaintenance(
@@ -1644,11 +1667,56 @@ namespace llaminar2
             std::string sse_line = "data: " + dumpJsonForHttp(chunk) + "\n\n";
             return chunk_cb(sse_line);
         };
-        auto emit_chunk = [&](const json &delta, const char *finish_reason) -> bool
+        auto emit_one_chunk = [&](const json &delta, const char *finish_reason) -> bool
         {
             json choice = {{"index", 0}, {"delta", delta},
                            {"finish_reason", finish_reason ? json(finish_reason) : json(nullptr)}};
-            const bool delivered = emit_payload(json::array({choice}), nullptr);
+            return emit_payload(json::array({choice}), nullptr);
+        };
+        // Every streamed event is bounded (SSEPublishChannelBudget::
+        // kMaxEventBytes): long text is published as several deltas that
+        // clients concatenate; tool-call arguments continue under the same
+        // index without repeating id/name (OpenAI streaming protocol).
+        auto emit_bounded = [&](const json &delta, const char *finish_reason) -> bool
+        {
+            constexpr std::size_t kMax = SSEPublishChannelBudget::kMaxDeltaTextBytes;
+            for (const char *field : {"content", "reasoning_content"})
+                if (delta.contains(field) && delta[field].is_string() &&
+                    delta[field].get_ref<const std::string &>().size() > kMax)
+                {
+                    const auto pieces = splitUtf8Text(delta[field].get_ref<const std::string &>(), kMax);
+                    for (std::size_t i = 0; i < pieces.size(); ++i)
+                    {
+                        json part = delta;
+                        part[field] = pieces[i];
+                        if (!emit_one_chunk(part, i + 1 == pieces.size() ? finish_reason : nullptr))
+                            return false;
+                    }
+                    return true;
+                }
+            if (delta.contains("tool_calls") && delta["tool_calls"].is_array() && delta["tool_calls"].size() == 1)
+            {
+                const auto &call = delta["tool_calls"][0];
+                const std::string arguments = call.value("/function/arguments"_json_pointer, std::string{});
+                if (arguments.size() > kMax)
+                {
+                    const auto pieces = splitUtf8Text(arguments, kMax);
+                    for (std::size_t i = 0; i < pieces.size(); ++i)
+                    {
+                        json part_call = i == 0 ? call : json{{"index", call["index"]}, {"function", json::object()}};
+                        part_call["function"]["arguments"] = pieces[i];
+                        if (!emit_one_chunk({{"tool_calls", json::array({part_call})}},
+                                            i + 1 == pieces.size() ? finish_reason : nullptr))
+                            return false;
+                    }
+                    return true;
+                }
+            }
+            return emit_one_chunk(delta, finish_reason);
+        };
+        auto emit_chunk = [&](const json &delta, const char *finish_reason) -> bool
+        {
+            const bool delivered = emit_bounded(delta, finish_reason);
             if (delivered && (delta.contains("content") || delta.contains("reasoning_content") ||
                               delta.contains("tool_calls")))
                 observation.outputPublished();
