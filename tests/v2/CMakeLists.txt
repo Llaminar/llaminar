@@ -10708,6 +10708,29 @@ if(V2_CPU_TARGET_X86)
     endforeach()
 endif()
 
+# Dedicated x86 coded decode leaves (unrolled Q5_0/Q5_1, Q5_K/IQ3_S, AVX-512
+# Q4_K/IQ4_XS per superblock, four-row AVX-512 prefill panels) against the
+# generic traversals they replace, including non-finite scales, partial-chunk
+# rejection and the ordered fold's NaN precedence (earlier partition wins).
+# Every runtime ISA cell runs: an AVX-512 build also replays its AVX2 dispatch.
+if(V2_CPU_TARGET_X86)
+    add_executable(v2_unit_cpu_x86_coded_leaves unit/kernels/cpu/Test__CPUX86CodedLeaves.cpp)
+    target_link_libraries(v2_unit_cpu_x86_coded_leaves llaminar2_core GTest::gtest GTest::gtest_main)
+    add_v2_test(V2_Unit_CPUX86CodedLeaves
+        COMMAND $<TARGET_FILE:v2_unit_cpu_x86_coded_leaves>
+        LABELS "V2;Unit;CPU;DeviceFree;NativeQuantised;ByteExact;Regression"
+        MPI_PROCS 1 NO_MODELS NO_MPI)
+    foreach(V2_X86_LEAF_ISA IN LISTS V2_CPU_NATIVE_ISA_CELLS)
+        v2_cpu_native_isa_runtime("${V2_X86_LEAF_ISA}" V2_X86_LEAF_RUNTIME_ISA)
+        add_v2_test(V2_Integration_CPUX86CodedLeaves_${V2_X86_LEAF_ISA}
+            COMMAND $<TARGET_FILE:v2_unit_cpu_x86_coded_leaves>
+            LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;NativeQuantised;${V2_X86_LEAF_ISA};ByteExact;Regression"
+            MPI_PROCS 1 NO_MODELS NO_MPI
+            ENVIRONMENT "OMP_NUM_THREADS=1;OMP_DYNAMIC=false;LLAMINAR_ISA_LEVEL=${V2_X86_LEAF_RUNTIME_ISA}")
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUX86CodedLeaves_${V2_X86_LEAF_ISA})
+    endforeach()
+endif()
+
 # Q6_K and IQ4_XS coded CPU units: exact file-density bytes and the coded code
 # plane plus superblock header reproduce the per-block source factors exactly.
 add_executable(v2_unit_cpu_coded_file_density_q6iq4 unit/kernels/cpu/Test__CPUCodedFileDensityQ6IQ4.cpp)
