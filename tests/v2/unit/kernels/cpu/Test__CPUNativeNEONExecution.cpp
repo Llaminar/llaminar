@@ -343,7 +343,8 @@ TEST_F(CPUNativeNEONExecution, FusedActualOwnersRetainMemberGeometryAndInputs)
  * all of its rows instead of once per register row tile (the IQ3_S expert
  * down-projection prefill regression), while every byte still equals
  * independent serial M=1 decode, with and without bias, for both policies,
- * every compiled dot family, a new and a retained team, and ragged K.
+ * every compiled dot family, a new and a retained team, ragged K and
+ * GPU-aligned partition trees whose partitions do not divide the panel.
  * Panel and tile members share one workshare and one uniformly strided slab;
  * a short slab is rejected before any write; Decode members never borrow it.
  */
@@ -355,7 +356,9 @@ TEST_F(CPUNativeNEONExecution, FusedPrefillMembersStreamPanelsAndRetainSerialByt
     for (const auto *source : {&native_quantised_formats::IQ3_S, &native_quantised_formats::Q5_K,
          &native_quantised_formats::Q5_0, &native_quantised_formats::IQ4_XS})
         for (const auto policy : {CPUProjectionNumericalPolicy::BackendNative, CPUProjectionNumericalPolicy::GPUAlignedExpert})
-            for (const int k : {512, 544})
+            // 16 one-block, 17 (two-block, ragged, empty tail) and 40 (three-block
+            // partitions straddling the sixteen-block panel, empty tail) K blocks.
+            for (const int k : {512, 544, 1280})
                 for (const int workers : {1, 3})
                 {
                     SCOPED_TRACE(::testing::Message() << "codebook=" << int(source->codebook_id) << " policy="

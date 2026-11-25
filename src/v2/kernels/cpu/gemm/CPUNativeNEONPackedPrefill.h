@@ -7,7 +7,9 @@
  * row tile before reusing that slot. We never publish an expanded weight bank.
  * Native FP32 state rolls directly through the destination between panels;
  * an ordered partition spanning panels keeps its unfinished sum separate from
- * the already folded destination. No output tile is staged and then copied.
+ * the already folded destination. Ordered (GPU-aligned) partitions that fit a
+ * panel are packed whole and folded in registers, publishing the running
+ * total once per panel. No output tile is staged and then copied.
  *
  * One 64-column chunk is the unit of work. A dense projection workshares its
  * own chunks; a pooled multi-projection launch (the batched MoE expert route)
@@ -350,7 +352,6 @@ namespace llaminar2::cpu::native_quantised
 #pragma clang fp contract(off)
 #pragma clang fp reassociate(off)
 #endif
-            using I = typename Ops::I;
             constexpr bool ordered = P == Policy::GPUAlignedExpert;
             auto v = start ? vdupq_n_f32(0) : loadOutput(ordered ? carry : out, ordered ? 4 : nc);
             auto w = vdupq_n_f32(0);
@@ -358,38 +359,8 @@ namespace llaminar2::cpu::native_quantised
                 if (!start) w = loadOutput(ordered ? carry + 4 : out1, ordered ? 4 : nc);
             for (int b = 0; b < count; ++b, packed += block_floats)
             {
-                auto x = vdupq_n_s32(0), y = vdupq_n_s32(0);
-#if defined(__ARM_FEATURE_MATMUL_INT8)
-                if constexpr (multi_scale::usesRowPairs<Ops>)
-                {
-                    auto lo = vdupq_n_s32(0), hi = vdupq_n_s32(0);
-                    Tile::forEachGroup<4>([&]<int G>() __attribute__((always_inline)) {
-                        const auto q = [&]() __attribute__((always_inline)) {
-                            if constexpr (Rows == 2)
-                                return std::bit_cast<int8x16_t>(Ops::activationPair(a[b].qs + 8 * G, a1[b].qs + 8 * G));
-                            else
-                                return vcombine_s8(vld1_s8(a[b].qs + 8 * G), vdup_n_s8(0));
-                        }();
-                        lo = vmmlaq_s32(lo, q, dotOperand(packed, 2 * G));
-                        hi = vmmlaq_s32(hi, q, dotOperand(packed, 2 * G + 1));
-                    });
-                    splitRowPairI8MM(lo, hi, x, y);
-                }
-                else
-#endif
-                {
-                    const auto a0 = Ops::activationBlock(a[b].qs);
-                    typename Ops::ActivationBlock second{};
-                    if constexpr (Rows == 2) second = Ops::activationBlock(a1[b].qs);
-                    I d0{}, d1{};
-                    Tile::forEachGroup<8>([&]<int G>() __attribute__((always_inline)) {
-                        const auto weight = std::bit_cast<I>(dotOperand(packed, G));
-                        d0 = Ops::template dotLane<G>(d0, weight, a0);
-                        if constexpr (Rows == 2) d1 = Ops::template dotLane<G>(d1, weight, second);
-                    });
-                    x = std::bit_cast<int32x4_t>(d0);
-                    y = std::bit_cast<int32x4_t>(d1);
-                }
+                int32x4_t x, y;
+                blockDots<Rows, Ops>(packed, a + b, a1 + (Rows == 2 ? b : 0), x, y);
                 v = update<P, Minimum>(v, x, packed, a[b]);
                 if constexpr (Rows == 2) w = update<P, Minimum>(w, y, packed, a1[b]);
             }
@@ -409,6 +380,117 @@ namespace llaminar2::cpu::native_quantised
             }
             storeOutput(out, v, nc);
             if constexpr (Rows == 2) storeOutput(out1, w, nc);
+        }
+
+        /**
+         * @brief Consume one panel of whole canonical ordered partitions, folding them in registers.
+         * @param packed Packed INT8 groups and widened FP32 factors of blocks [first, first+count).
+         * @param first Absolute first block of the panel, a multiple of @p per_partition.
+         * @param count Blocks in the panel, whole partitions except the final ragged one.
+         * @param per_partition Canonical blocks per ordered partition (at most one panel deep).
+         * @param empties Empty trailing canonical partitions to fold after the last block (final panel only).
+         * @param a,a1 First block of each live activation row for the current panel.
+         * @param out,out1 Destination strips in original row order; only nc lanes are writable.
+         * @param nc Actual live N lanes in [1,4].
+         * @details The GPU-aligned tree forms every partition from +0 and folds
+         * it as total = total + partial, partition 0 seeding the total, then
+         * folds +0 once per empty trailing partition. compute() executes that
+         * tree one partition per call through the destination; this executes
+         * the identical operations with the same operands in the same order
+         * while the total stays in a register, publishing it once per panel.
+         * A later panel resumes from the published FP32 total, which a store
+         * and reload return bit-exactly.
+         */
+        template<int Rows, typename Ops, bool Minimum>
+        [[gnu::noinline]] LLAMINAR_NEON_PREFILL_EXACT static void computeOrdered(const float *packed, int first,
+            int count, int per_partition, int empties, const Q8_1Block *a, const Q8_1Block *a1,
+            float *out, float *out1, int nc) noexcept
+        {
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#pragma clang fp reassociate(off)
+#endif
+            constexpr Policy P = Policy::GPUAlignedExpert;
+            auto t = first ? loadOutput(out, nc) : vdupq_n_f32(0);
+            auto u = vdupq_n_f32(0);
+            if constexpr (Rows == 2)
+                if (first) u = loadOutput(out1, nc);
+            for (int b = 0; b < count; )
+            {
+                const int begin = b, end = std::min(count, b + per_partition);
+                auto v = vdupq_n_f32(0), w = vdupq_n_f32(0);
+                for (; b < end; ++b, packed += block_floats)
+                {
+                    int32x4_t x, y;
+                    blockDots<Rows, Ops>(packed, a + b, a1 + (Rows == 2 ? b : 0), x, y);
+                    v = update<P, Minimum>(v, x, packed, a[b]);
+                    if constexpr (Rows == 2) w = update<P, Minimum>(w, y, packed, a1[b]);
+                }
+                // Partition 0 seeds the total; every later one folds into it.
+                if (first + begin == 0)
+                {
+                    t = v;
+                    if constexpr (Rows == 2) u = w;
+                }
+                else
+                {
+                    t = vaddq_f32(t, v);
+                    if constexpr (Rows == 2) u = vaddq_f32(u, w);
+                }
+            }
+            for (int e = 0; e < empties; ++e)
+            {
+                t = vaddq_f32(t, vdupq_n_f32(0));
+                if constexpr (Rows == 2) u = vaddq_f32(u, vdupq_n_f32(0));
+            }
+            storeOutput(out, t, nc);
+            if constexpr (Rows == 2) storeOutput(out1, u, nc);
+        }
+
+        /**
+         * @brief Exact INT32 dot of one packed block with one row or a row pair.
+         * @param packed Packed INT8 groups of the block (SMMLA-zipped for row-pair families).
+         * @param a0 First row's activation block.
+         * @param a1 Second row's activation block; read only for a row pair.
+         * @param x,y Receive the first/second row's four column dots.
+         */
+        template<int Rows, typename Ops>
+        [[gnu::always_inline]] static void blockDots(const float *packed, const Q8_1Block *a0, const Q8_1Block *a1,
+            int32x4_t &x, int32x4_t &y) noexcept
+        {
+            using I = typename Ops::I;
+            x = vdupq_n_s32(0); y = vdupq_n_s32(0);
+#if defined(__ARM_FEATURE_MATMUL_INT8)
+            if constexpr (multi_scale::usesRowPairs<Ops>)
+            {
+                auto lo = vdupq_n_s32(0), hi = vdupq_n_s32(0);
+                Tile::forEachGroup<4>([&]<int G>() __attribute__((always_inline)) {
+                    const auto q = [&]() __attribute__((always_inline)) {
+                        if constexpr (Rows == 2)
+                            return std::bit_cast<int8x16_t>(Ops::activationPair(a0->qs + 8 * G, a1->qs + 8 * G));
+                        else
+                            return vcombine_s8(vld1_s8(a0->qs + 8 * G), vdup_n_s8(0));
+                    }();
+                    lo = vmmlaq_s32(lo, q, dotOperand(packed, 2 * G));
+                    hi = vmmlaq_s32(hi, q, dotOperand(packed, 2 * G + 1));
+                });
+                splitRowPairI8MM(lo, hi, x, y);
+            }
+            else
+#endif
+            {
+                const auto row0 = Ops::activationBlock(a0->qs);
+                typename Ops::ActivationBlock row1{};
+                if constexpr (Rows == 2) row1 = Ops::activationBlock(a1->qs);
+                I d0{}, d1{};
+                Tile::forEachGroup<8>([&]<int G>() __attribute__((always_inline)) {
+                    const auto weight = std::bit_cast<I>(dotOperand(packed, G));
+                    d0 = Ops::template dotLane<G>(d0, weight, row0);
+                    if constexpr (Rows == 2) d1 = Ops::template dotLane<G>(d1, weight, row1);
+                });
+                x = std::bit_cast<int32x4_t>(d0);
+                y = std::bit_cast<int32x4_t>(d1);
+            }
         }
 
         /**
@@ -464,6 +546,42 @@ namespace llaminar2::cpu::native_quantised
             for (int c = 0; c < std::min(64, w.N - 64 * chunk); c += 4)
             {
                 const int n = 64 * chunk + c, nc = std::min(4, w.N - n);
+                if constexpr (P == Policy::GPUAlignedExpert)
+                {
+                    if (per_partition <= neon_panel::depth)
+                    {
+                        // Whole canonical partitions per panel: one decode of
+                        // up to sixteen blocks, then one in-register ordered
+                        // fold per row pair instead of one call (and one
+                        // destination round trip) per partition. Only trees
+                        // whose partition outgrows a panel (K > 8192) take
+                        // the carry program below.
+                        const int span = per_partition * (neon_panel::depth / per_partition);
+                        const int filled = (w.blocks_per_row + per_partition - 1) / per_partition;
+                        for (int b = 0; b < w.blocks_per_row; )
+                        {
+                            const int last = std::min(w.blocks_per_row, b + span);
+                            pack<C, Ops>(w, chunk, c, b, last, panel);
+                            const int empties = last == w.blocks_per_row ? partitions - filled : 0;
+                            for (int pair = 0; pair < pairs; ++pair)
+                            {
+                                const auto rows = batch_.grid_.tileSpan(pair, 2);
+                                if (!rows.size()) continue;
+                                const auto r = std::size_t(rows.first);
+                                const auto *q = a + r * w.blocks_per_row + b;
+                                auto *o = out + r * stride + n;
+                                if (rows.size() == 2)
+                                    computeOrdered<2, Ops, C == 7>(panel, b, last - b, per_partition, empties,
+                                        q, q + w.blocks_per_row, o, o + stride, nc);
+                                else
+                                    computeOrdered<1, Ops, C == 7>(panel, b, last - b, per_partition, empties,
+                                        q, nullptr, o, nullptr, nc);
+                            }
+                            b = last;
+                        }
+                        continue;
+                    }
+                }
                 for (int p = 0; p < partitions; ++p)
                 {
                     // The legacy fold includes empty trailing partitions. They
