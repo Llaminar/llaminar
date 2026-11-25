@@ -29857,6 +29857,13 @@ add_v2_test(V2_Unit_KVCacheMemoryEstimator
     MPI_PROCS 1
 )
 
+add_v2_test(V2_Integration_KVNativePageGeometry
+    COMMAND $<TARGET_FILE:v2_test_kvcache_memory_estimator>
+        --gtest_filter=Test__KVCacheMemoryEstimator.NativePagedPayloadKeepsRequestBasisOutsideFrames:Test__KVCacheMemoryEstimator.NativeStorageLayoutRejectsInvalidGeometry
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;KVCache;Planning;Geometry;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_KVNativePageGeometry)
+
 # Test: ActivationMemoryEstimator — activation buffer peak estimation
 add_executable(v2_test_activation_memory_estimator
     unit/planning/Test__ActivationMemoryEstimator.cpp

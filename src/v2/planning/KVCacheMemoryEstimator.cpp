@@ -24,17 +24,6 @@ namespace llaminar2
 {
     namespace
     {
-        enum class KVStorageFormat
-        {
-            FP32,
-            BF16,
-            FP16,
-            Q8_1,
-            Q16_1,
-            TQ4,
-            TQ8,
-        };
-
         [[nodiscard]] std::size_t checkedAdd(
             std::size_t left,
             std::size_t right,
@@ -70,37 +59,6 @@ namespace llaminar2
                 throw std::invalid_argument("KV-cache divisor must be positive");
             return numerator / denominator +
                    static_cast<std::size_t>(numerator % denominator != 0);
-        }
-
-        [[nodiscard]] std::string normalizedPrecision(std::string value)
-        {
-            std::transform(
-                value.begin(), value.end(), value.begin(),
-                [](unsigned char ch)
-                { return static_cast<char>(std::tolower(ch)); });
-            return value;
-        }
-
-        [[nodiscard]] KVStorageFormat parseFormat(
-            const std::string &precision)
-        {
-            const std::string value = normalizedPrecision(precision);
-            if (value == "fp32")
-                return KVStorageFormat::FP32;
-            if (value == "bf16")
-                return KVStorageFormat::BF16;
-            if (value == "fp16")
-                return KVStorageFormat::FP16;
-            if (value == "q8_1")
-                return KVStorageFormat::Q8_1;
-            if (value == "q16_1")
-                return KVStorageFormat::Q16_1;
-            if (value == "tq4")
-                return KVStorageFormat::TQ4;
-            if (value == "tq" || value == "tq8")
-                return KVStorageFormat::TQ8;
-            throw std::invalid_argument(
-                "Unsupported KV-cache precision token '" + precision + "'");
         }
 
         void requireSupportedDevice(DeviceId device)
@@ -330,7 +288,7 @@ namespace llaminar2
 
     TensorType KVCacheMemoryEstimator::attentionExecutionFormat(const std::string &kv_precision)
     {
-        switch (parseFormat(kv_precision))
+        switch (parseKVStorageFormat(kv_precision))
         {
         case KVStorageFormat::FP32: return TensorType::FP32;
         case KVStorageFormat::BF16: return TensorType::BF16;
@@ -346,7 +304,7 @@ namespace llaminar2
     float KVCacheMemoryEstimator::getBytesPerElement(
         const std::string &kv_precision)
     {
-        switch (parseFormat(kv_precision))
+        switch (parseKVStorageFormat(kv_precision))
         {
         case KVStorageFormat::FP32:
             return 4.0f;
@@ -386,112 +344,8 @@ namespace llaminar2
         KVCacheFamily family, int token_count, int n_kv_heads, int head_dim,
         const std::string &kv_precision, DeviceId device)
     {
-        requireSupportedDevice(device);
-        if (family != KVCacheFamily::AttentionOnly && family != KVCacheFamily::Hybrid)
-            throw std::invalid_argument("Unknown logical KV payload family");
-        if (token_count <= 0 || n_kv_heads <= 0 || head_dim <= 0)
-        {
-            throw std::invalid_argument(
-                "Logical KV payload geometry must be positive");
-        }
-
-        const KVStorageFormat format = parseFormat(kv_precision);
-        if (family == KVCacheFamily::Hybrid &&
-            (format == KVStorageFormat::TQ4 || format == KVStorageFormat::TQ8))
-            throw std::invalid_argument("Hybrid KV caches do not implement TurboQuant storage");
-        const std::size_t tokens = static_cast<std::size_t>(token_count);
-        const std::size_t heads = static_cast<std::size_t>(n_kv_heads);
-        const std::size_t dimensions = static_cast<std::size_t>(head_dim);
-        const std::size_t kv_dim = checkedMultiply(
-            heads, dimensions, "logical-block KV dimension");
-
-        LogicalKVPayload result;
-        switch (format)
-        {
-        case KVStorageFormat::FP32:
-        case KVStorageFormat::BF16:
-        case KVStorageFormat::FP16:
-        {
-            const std::size_t element_bytes =
-                format == KVStorageFormat::FP32
-                    ? sizeof(float)
-                    : sizeof(std::uint16_t);
-            const std::size_t row_bytes = checkedMultiply(
-                kv_dim, element_bytes, "logical linear row bytes");
-            result.k_bytes = checkedMultiply(
-                tokens, row_bytes, "logical linear key bytes");
-            result.v_bytes = checkedMultiply(
-                tokens, row_bytes, "logical linear value bytes");
-            break;
-        }
-        case KVStorageFormat::Q8_1:
-        case KVStorageFormat::TQ4:
-        case KVStorageFormat::TQ8:
-        {
-            if (family == KVCacheFamily::Hybrid && device.is_gpu())
-            {
-                // Hybrid GPU caches serialize their native linear Q8_1 rows;
-                // unlike attention-only caches they have no AQ8 request anchor.
-                const std::size_t row_bytes = checkedMultiply(
-                    ceilDivide(kv_dim, Q8_1Block::BLOCK_SIZE),
-                    sizeof(Q8_1Block), "hybrid Q8_1 row bytes");
-                result.k_bytes = result.v_bytes = checkedMultiply(
-                    tokens, row_bytes, "hybrid Q8_1 logical payload");
-                break;
-            }
-            const std::size_t key_position_bytes = checkedMultiply(
-                heads,
-                aq8KeyBlockBytes(head_dim),
-                "logical AQ8 key-position bytes");
-            std::size_t value_head_bytes = 0;
-            if (format == KVStorageFormat::Q8_1)
-            {
-                value_head_bytes = checkedMultiply(
-                    ceilDivide(dimensions, Q8_1Block::BLOCK_SIZE),
-                    sizeof(Q8_1Block),
-                    "logical Q8_1 value-head bytes");
-            }
-            else if (format == KVStorageFormat::TQ4)
-            {
-                value_head_bytes = tq4BlockBytes(head_dim);
-            }
-            else
-            {
-                value_head_bytes = tq8BlockBytes(head_dim);
-            }
-
-            const std::size_t anchor_bytes = checkedMultiply(
-                kv_dim, sizeof(float), "logical AQ8 anchor bytes");
-            result.k_bytes = checkedAdd(
-                anchor_bytes,
-                checkedMultiply(
-                    tokens,
-                    key_position_bytes,
-                    "logical AQ8 key payload bytes"),
-                "logical AQ8 key payload plus anchor");
-            result.v_bytes = checkedMultiply(
-                tokens,
-                checkedMultiply(
-                    heads,
-                    value_head_bytes,
-                    "logical compressed value-position bytes"),
-                "logical compressed value payload bytes");
-            break;
-        }
-        case KVStorageFormat::Q16_1:
-            if (!device.is_cpu())
-                throw std::invalid_argument("Q16_1 has no CUDA/ROCm KV-cache implementation");
-            // Reuse the CPU codec's head-block calculation. Its two tensors
-            // have identical extents and contain no metadata or scratch.
-            result.k_bytes = result.v_bytes = estimateCPUQ16(1, tokens, heads, head_dim) / 2;
-            break;
-        }
-
-        (void)checkedAdd(
-            result.k_bytes,
-            result.v_bytes,
-            "logical GPU K/V block bytes");
-        return result;
+        return KVNativeStorageLayout::resolve(family, n_kv_heads, head_dim, kv_precision, device)
+            .archivePayload(token_count);
     }
 
     std::size_t KVCacheMemoryEstimator::estimate(
@@ -510,7 +364,7 @@ namespace llaminar2
             return 0;
         }
         requireSupportedDevice(device);
-        const KVStorageFormat format = parseFormat(kv_precision);
+        const KVStorageFormat format = parseKVStorageFormat(kv_precision);
         if (family == KVCacheFamily::Hybrid &&
             (format == KVStorageFormat::TQ4 || format == KVStorageFormat::TQ8))
             throw std::invalid_argument("Hybrid KV caches do not implement TurboQuant storage");

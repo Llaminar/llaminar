@@ -1798,6 +1798,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     planning/PlanningImmutableLookupWork.cpp
     planning/PlanningForwardStateWork.cpp
     planning/KVCacheMemoryEstimator.cpp
+    kernels/kvcache/KVStorageLayout.cpp
     planning/PersistentStateMemoryEstimator.cpp
     planning/ActivationMemoryEstimator.cpp
     planning/WorkspaceMemoryEstimator.cpp

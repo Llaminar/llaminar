@@ -160,6 +160,44 @@ preflight registrations pass. Registered-reader recording is retained at
 `paged-p1-reader-recording.U0jSsn`; all three small traces are embedded into the
 binary rather than loading builder-local fixture paths.
 
+## Native storage-family closure in progress
+
+`kernels/kvcache/KVStorageLayout.*` now owns the canonical typed cache family,
+codec parser and immutable native token/basis payload layout. Planning's
+`KVCacheMemoryEstimator::logicalPayload` consumes that factory rather than
+owning a second codec definition. Existing case/alias semantics and archive
+bytes remain unchanged. `pagePayload` excludes the separate request-wide basis;
+`archivePayload` includes its serialized copy. No page allocator may use an empty
+frame as permission to select a new AQ8 basis.
+
+The factory covers the existing FP32/FP16/BF16/Q8_1/Q16_1/TQ4/TQ8 payload rules
+for declared CPU/CUDA/ROCm devices and actual attention/hybrid families. It
+retains GPU hybrid linear Q8, anchored CPU/attention-only Q8/TQ, CPU-only Q16
+head blocks and existing hybrid-TQ rejection. Layout validation is device-free;
+it does not qualify native paged execution or expand any supported combination.
+
+Source inspection establishes additional distinct owners still to transform:
+
+- `CPURingKVCacheAnchored.inl:49–85`: each layer/head's first serial key is the
+  request basis; pages/COW/import retain that original basis. Page-local mean
+  or first-token initialization would change encoded keys.
+- `QwenSparseAttention.h:112–198`: QFN's persistent pooled indexer keys and raw
+  four-position partial tail are separate from native K/V codec banks and
+  per-query selected-index/count work. Dense paging alone cannot qualify or
+  eliminate those full-history owners. Its current addressing enum lacks a
+  native page-view case; a full-history gather is not the replacement.
+- `MTPShiftedCacheOrigin.h:25–65`: successor-pair families offset by depth+1;
+  QFN's visible-zero bootstrap has offset zero at depth0 and rejects other
+  depths. Page ordinal/absolute-position/archive identity must retain the
+  model-authenticated convention, not apply a universal main-minus-one rule.
+
+Complete KV-cache estimator Unit, the new explicit native-page geometry
+preflight and the complete PMA Unit registration pass at
+`CB-checkpoints/paged-native-layout.inQG9J`. This verifies payload arithmetic
+and existing planning tests, not native append/attention or a final page layout
+ABI. QFN auxiliary paging, provenance/trust, numerical boundary compatibility,
+quantized COW and all-target native evidence remain open.
+
 ## Independent findings carried into P0/P1
 
 | Finding | Required resolution |
