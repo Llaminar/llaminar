@@ -8981,6 +8981,13 @@ add_v2_test(V2_Integration_PhysicalPagePoolSharingContract
     ENVIRONMENT "OMP_NUM_THREADS=4;OMP_DYNAMIC=false;LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUFP32PagedKVAppendContract)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PhysicalPagePoolSharingContract)
+add_v2_test(V2_Integration_CompletionWitnessContract
+    COMMAND $<TARGET_FILE:v2_test_physical_memory_authority>
+        --gtest_filter=CompletionWitness.*
+    LABELS "V2;Integration;CPU;DeviceFree;Planning;Contract;Witness;Conservation;Regression;ProductionTestPreflight"
+    NO_MODELS NO_MPI MPI_PROCS 1 TIMEOUT 30
+    ENVIRONMENT "OMP_NUM_THREADS=1;OMP_DYNAMIC=false;LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CompletionWitnessContract)
 # Flash-attention entry points admit banks, head mapping and output
 # disjointness before any team, returning false without writes otherwise:
 # raw batches, native request batches and Q16 tensor/verifier entries admit
@@ -30384,6 +30391,7 @@ add_executable(v2_test_physical_memory_authority
     unit/planning/Test__PhysicalMemoryAuthority.cpp
     unit/planning/Test__PhysicalPagePoolReplay.cpp
     unit/planning/Test__PhysicalPagePoolSharing.cpp
+    unit/planning/Test__CompletionWitness.cpp
     unit/planning/Test__PhysicalMemoryRankHostPool.cpp
     unit/planning/Test__NativeStoragePreparing.cpp
     unit/backends/Test__PreparedGPUWorkerThread.cpp
