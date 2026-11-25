@@ -2,6 +2,19 @@
 
 Baseline: implementation `a0b69f633`, adopting exact revision-4 design and
 P0–P10 plan from `770bade4d1c6fc2f8566aef9de59f2ba7b812659`.
+
+**Revision-5 reconcile (2026-11-25):** reviewer rewrite
+`tiered-paged-design-rewrite.L7ICwq` delivered owner-approved design
+`debc78dac0728194455e25cd461e8e1784af313aa29d10d39206f7847c1ff911` and plan
+`925dc4d8e37ec57d4893b7cbcc70b094396834021ac88922808cd2d89ee18b35`
+(diff `f1614994120883f0f7833641c71a7cacc5ee891423f7ff7db63ca2e416706c2f`).
+Revision 5 is the current target: maximal PMA-admitted shared GPU KV residency
+with configurable caps/tiers, UMA single accounting, complete S-held
+suspension, a bounded all-resource completion witness and preserve/restore
+first. PKV-01 is now owner-selected (§§1, 5), not pending. No numeric defaults
+or installed CLI spellings are invented here; revision-4 language below is
+retained as historical evidence, not current policy.
+
 This is a source-linked working inventory, not P0 exit acceptance or P1
 implementation evidence. Full refactoring is authorized by the replacement
 plan. Historical fixed-partition tests remain oracles until replacement
@@ -68,22 +81,26 @@ All source paths below are relative to the repository root.
 | `src/v2/app/modes/ServingBatchDriver.h`, `ServingResponseLeasePool.h`, `RequestGenerationLane.h`, `SSEPublishChannel.h`, frontends | Existing detached response/grant protocol with open aggregate bounds | Keep lifecycle contracts, close R1/R2/F5 through P5; no frontend page ledger or GPU control |
 | `tests/v2/CMakeLists.txt`, cache/attention/prefix/MTP/serving/planning suites | Many tests assert fixed backing, ring wrap and sequence aliases | Classify each registration as preserved behavior/numerical oracle or replaced physical contract; add explicit production paging replay, geometry and access-lifetime entries |
 
-## P1 prototype boundary and unresolved pressure decision
+## P1 prototype boundary and pressure decision history
 
-Independent design review at exact `770bade4d` blocks treating P1 as an
-unconditional contract (PKV-01/02/03). The retained review is
+Independent design review at exact `770bade4d` historically blocked treating
+P1 as an unconditional contract (PKV-01/02/03). The retained review is
 `CB-checkpoints/paged-kv-design-review-770bade4d.bv0UfJ/REVIEW.md`, SHA256
 `95d3072625cb849e8cb51642332bce88bb59f25d28323f33943fb093eef473b2`.
-The implementation has not adopted a different pressure policy. Asked to choose
-the guarantee/default-output tradeoff, the operator answered **“ask the
-reviewer”**; that decision request has been sent to the existing reviewer.
+Prior to revision 5 the implementation had not adopted a different pressure
+policy and the operator answered **“ask the reviewer”**; that decision request
+and the revision-4 resident-only proposal remain the historical record below.
 
-Revision 4 proposes **resident-only independent guaranteed completion**, not
-next-token overcommit. That proposal remains subject to explicit resolution: A request's declared maximum history (including default
-remaining-context output) and simultaneous COW/speculative overlap acquire
-fungible commitments across all required storage classes before activation.
-They do not acquire fixed frame ranges. One long request may consume more than
-an equal share of a pool. Pending-retirement frames remain unavailable.
+**Current direction (owner-selected in revision 5):** bounded optimistic
+retain/restore across GPU/RAM/disk with a concrete all-resource/topology
+completion witness (design §§5.1–5.3), finite operation grants, cache-aware
+bounded fairness and no-copy refresh. Old summed-maximum wording is not the
+policy. Revision-4 proposal (historical): A request's declared maximum history
+(including default remaining-context output) and simultaneous
+COW/speculative overlap acquire fungible commitments across all required
+storage classes before activation. They do not acquire fixed frame ranges. One
+long request may consume more than an equal share of a pool.
+Pending-retirement frames remain unavailable.
 
 PMA will retain the actual pool and bounded metadata allocations. Its CPU
 page-arena implementation owns frame/table generations, logical references,
@@ -125,9 +142,11 @@ original peer owner and never recycles issued pool incarnations. Latest evidence
 `CB-checkpoints/paged-p1-multiclass.6dWosx`. The initial two-test packet
 `CB-checkpoints/paged-p1-private-grants-r2.hXnQRq` remains preserved.
 
-The reviewer recommends a bounded-pressure common safe-completion-order policy,
-but explicitly says this is **not owner adoption**. Policy integration remains
-pending. The working [authority transition specification](paged_kv_authority_transitions_20261125.md)
+The reviewer's bounded-pressure recommendation was recorded as **not owner
+adoption** at that time; revision 5 now records owner adoption of the bounded
+optimistic retain/restore policy with completion witness. Policy integration
+remains an implementation obligation (P0 decision record + P5 proof), not a
+completed one. The working [authority transition specification](paged_kv_authority_transitions_20261125.md)
 spells out conservation debits/returns, the pinned nine-token shared-tail case,
 and separate write/operation-readable/committed objects. Those additional
 semantics are not yet implemented or independently accepted.
@@ -330,9 +349,15 @@ qualification.
 
 ## Independent findings carried into P0/P1
 
+Findings map to the revision-5 design and plan sections in the resolved
+canonical documents; implementation obligations remain attached to the
+milestones below. Explicit PKV-01–09 section mappings are owned by the
+canonical plan’s ownership-map design-reconciliation table (`plan_continuous_batching_implementation_20261125.md` §4);
+the table below states obligations, not a duplicate mapping.
+
 | Finding | Required resolution |
 |---|---|
-| PKV-01 | Owner/reviewer confirmation of pressure guarantee, default remaining-context effect, pool sizing/concurrency objective and queue-inclusive acceptance; no silent output cap |
+| PKV-01 | Owner-selected in revision 5: bounded optimistic retain/restore with all-resource completion witness (design §§1, 5; plan P0 decision record; P5 proof incl. tiers off/full) |
 | PKV-02 | Per-participant/class conservation: unique occupied (including retiring) + unconverted private growth + unoccupied concurrent transients ≤ pool; explicit seal/share/COW/tentative/commit/cancel/real-retirement debits and returns; issuance exhaustion before admission |
 | PKV-03 | Distinct exclusive write plan, producer-ordered operation-readable view with per-query visibility, and atomic committed publication; registered-but-not-enqueued readers close atomically; same-frame reject/reappend waits for real borrowers |
 | PKV-04 | Early native CUDA/HIP live-shape/receipt/catalog feasibility witnesses before freezing ABI; late-known work inside complete transactions must launch economically |
@@ -348,6 +373,10 @@ observations still require proof and cannot be inferred from restored tokens.
 
 ## Remaining P0 closure work
 
+Revision-5 plan P0 (“Reconcile inventory and freeze explicit contracts”) owns
+this closure; the list below is implementation-owned and keeps the same
+obligations:
+
 1. Resolve every census candidate to one of the owners above, including indirect
    template/device kernels, QFN sparse attention, native collective buffers and
    checkpoint/transfer closures; investigate gaps rather than whitelist them.
@@ -355,7 +384,10 @@ observations still require proof and cannot be inferred from restored tokens.
    alignment, including request-anchor semantics and TurboQuant metadata.
 3. Specify bounded table banks and access/retirement capacity from actual
    concurrency, plus the shared numerical/window policy version at cutover.
-4. Reconcile canonical config inputs and per-participant pool BOM, including
-   metadata and complete response state. No pool-count default is invented here.
+4. Reconcile canonical config inputs (GPU cap, RAM off/auto/cap, disk
+   capacity/directory, UMA domain identity) and per-participant pool BOM,
+   including metadata and complete response state. No numeric default or
+   installed CLI spelling is invented here; revision-5 config contract §4.3 is
+   authoritative.
 5. Implement P1 through the actual PMA factory and add production contract and
    recorded-input replay tests before claiming page support. P0/P1 remain open.

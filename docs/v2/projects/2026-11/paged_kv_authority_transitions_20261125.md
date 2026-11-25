@@ -1,9 +1,16 @@
 # P0/P1 authority transition specification — working draft
 
-This specification responds to PKV-02/03, not an accepted P1 exit. It is separate
-from selecting a request-pressure policy (PKV-01). The initial unpublished
-`PhysicalPagePool` prototype implements only the private-grant subset below;
-it exposes no payload address or readable view and is not used by inference.
+**Revision-5 reconcile (2026-11-25):** PKV-01 is now owner-selected in the
+rewritten design/plan (`tiered-paged-design-rewrite.L7ICwq`): bounded
+optimistic retain/restore with a concrete all-resource/topology completion
+witness (design §§5.1–5.3, §10, §13.2). The summed-maximum O+G+T≤P form below
+remains a conservation sub-contract inside charged backing, not the
+completion policy; the selected policy replaces it as the admission witness.
+
+This specification responds to PKV-02/03, not an accepted P1 exit. The initial
+unpublished `PhysicalPagePool` prototype implements only the private-grant
+subset below; it exposes no payload address or readable view and is not used
+by inference.
 
 ## Conservation domain
 
@@ -15,24 +22,37 @@ Every count belongs to one real participant and native storage class. Let:
 - T = unconverted simultaneous transient allowance not already included in G.
 - P = materialized pool frame count.
 
-For independent completion the necessary accounting invariant is O+G+T≤P.
-This is logical ownership inside already PMA-charged backing, not a second
-physical-byte ledger. Resource vectors also include bounded table snapshots,
-access/retirement records, descriptors, staging and completion objects. A page
-transaction that fits payload but cannot acquire its publication resources
-cannot submit. No resource count is copied into a second scheduler balance.
+In revision 5, G and T are outstanding finite-operation and progress
+obligations: each is the concrete work of an admitted complete transaction
+(one exclusive write, one COW destination, one queued progress grant), not an
+independently reserved eventual request maximum. The accounting invariant
+O+G+T≤P is a current conservation requirement for any admitted transaction
+state, not a historical or replaced inequality. This is logical ownership
+inside already PMA-charged backing, not a second physical-byte ledger.
+Resource vectors also include bounded table snapshots, access/retirement
+records, descriptors, staging and completion objects. A page transaction that
+fits payload but cannot acquire its publication resources cannot submit. No
+resource count is copied into a second scheduler balance.
 
-A different owner-selected safe-completion-order policy would replace summed
-maximum promises with a common topology-wide resource-vector witness. It may
-reuse the same finite transaction grants, but it is not implemented by merely
-changing this inequality or accepting every next-token fit. Until the owner
-resolves PKV-01, no such policy is installed or inferred from this draft.
+Revision 5 selects exactly that common topology-wide resource-vector witness
+(non-simultaneous finite grants plus all-resource/participant completion
+witness); it is not implemented by merely changing this inequality or accepting
+every next-token fit, and the witness algorithm itself remains an open
+implementation obligation, not an installed default. Summed-maximum wording
+above is historical pre-selection context.
 
-## Required logical transitions
+## Required logical transitions (finite-operation form)
+
+The current requirement is the finite-operation form below: each row protects
+or releases one outstanding admitted transaction, and the completion witness
+is the authority for admitting further work. The earlier prototype API reserved
+per-request eventual maximum pages; those rows are retained as prototype
+history under [Prototype maximum-reservation subset history](#prototype-maximum-reservation-subset-history)
+and are not the revision-5 current requirement.
 
 | Operation | Occupancy / promise transition | Publication / refusal obligation |
 |---|---|---|
-| Protect unpublished private maximum | G += requested pages, after all-class feasibility | No frame assignment; refuse without changing existing owners |
+| Protect one outstanding finite private-operation grant | G += one transaction's concrete pages, after all-class feasibility | No frame assignment; refuse without changing existing owners |
 | Assign one protected private frame | O += 1; G -= 1 | Increment non-reused frame incarnation; no readable bytes yet |
 | Reserve extra bounded transient | T += allowance only if not part of G | Derive from allowed overlap, not sum mutually exclusive peaks |
 | Assign transient destination | O += 1; T -= 1 | Exclusive write plan; no consumer sees unwritten bytes |
@@ -42,10 +62,20 @@ resolves PKV-01, no such policy is installed or inferred from this draft.
 | Publish COW replacement | O unchanged; new reference replaces this writer's old reference | Source may remain occupied for peers/cache/queued readers; table-version publication is atomic |
 | Accept tentative retained frames | Reclassify occupied tentative frames as committed; no extra O debit | Commit table/content/checkpoint/visible length together |
 | Reject tentative suffix | Remove logical visibility, but keep O for every borrowed frame | Queue retirement; never credit cancellation/length rollback as physical reuse |
-| Finish/cancel unpublished maximum | Release unused G/T; assigned private frames release only if there are provably no consumers | Prototype rollback is legal because its API cannot publish or register access |
+| Finish/cancel outstanding finite private-operation grant | Release unused G/T; assigned private frames release only if there are provably no consumers | Unpublished rollback is legal because the unpublished API cannot publish or register access |
 | Finish/cancel published request | Release future liability after revoking new work; drop request references | Existing queued work and access receipts keep the old incarnation alive |
 | Real last-reference/access retirement | O -= 1, only when closed frontier actually completes | Frame becomes assignable under a fresh incarnation; old completion cannot publish into it |
 | Aborted all-class prepare | Release only newly acquired unpublished ownership | Existing published owners/promises unchanged; issued nonces/generations are not rolled back |
+
+### Prototype maximum-reservation subset history
+
+The initial unpublished `PhysicalPagePool` API instead reserved a request's
+eventual maximum pages and released them as unpublished private maximum. It
+implemented only the private-grant subset, exposed no payload address or
+readable view, and was never used by inference. Under revision 5 those rows
+are superseded: maximum holding periods are not admitted as fungible
+reservations, and only finite-operation/progress obligations are protected
+under a complete witness.
 
 No transition converts the same destination from both G and T. Retained cache
 frames remain in O until real eviction retirement. A change in reference
@@ -56,8 +86,15 @@ classification cannot manufacture a free frame.
 Use 16-token pages. One sealed page contains nine tokens and is pinned by an
 exporter. Two writers may each reach token 16. Neither may append into the
 shared page. Occupancy is initially O=1 and each writer requires one private
-replacement, so G=2, total 3 frames. A three-frame pool can protect the state;
-a two-frame pool must refuse the new liability before publishing the alias.
+replacement, so G=2 while both one-page private-operation grants are
+outstanding together, total 3 frames simultaneously. A three-frame pool can
+protect the simultaneous state; a two-frame pool cannot grant both together
+and must refuse the second new liability before publishing the alias. This
+refusal is scoped to simultaneous protected grants: a separately proved
+complete witness may permit ordering such that the first operation actually
+finishes and retires its frame before the second grant is admitted, while the
+exporter's source remains pinned. No serial or ordered completion is claimed
+by this example or proven here.
 
 After writer A receives its destination: O=2,G=1. After writer B receives its
 destination: O=3,G=0. Accepting either retained private tail does not add another
@@ -67,7 +104,8 @@ independently when its actual transfer completes. Late sealing of a formerly
 exclusive tail must obtain these replacement liabilities, not assume the
 original admission already contained them.
 
-This is a constructed contract example, **not recorded replay evidence**.
+This is a constructed contract example, **not recorded replay evidence**, and
+does not prove any ordering policy.
 
 ## Three distinct typed objects required before native access
 
