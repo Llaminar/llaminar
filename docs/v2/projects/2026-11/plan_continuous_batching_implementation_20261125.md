@@ -38,7 +38,12 @@ reviewer dispositions and the project's `IMPLEMENTATION_PLAN.md`.
 
 | Supported (CPU, single rank) | Fails closed at startup with the precise reason |
 |---|---|
-| Dense full-attention models, greedy and seeded stochastic sampling, stop tokens, paced grants, forced tokens, cancellation, slow consumers, prefix cache (KV-only per slot) | MTP draft state, hybrid recurrent state, model-runtime prefix state, GPU retained execution, multi-rank |
+| Dense full-attention and hybrid recurrent (GDN, prefix cache off) models, greedy and seeded stochastic sampling, stop tokens, paced grants, forced tokens, cancellation, slow consumers, prefix cache (KV-only per slot, dense) | MTP draft state, hybrid + prefix cache, routed-expert (MoE) models, model-runtime prefix state, GPU retained execution, multi-rank |
+
+Serving rows serve every resolved S, including the automatic S = 1 pool, so
+default CPU serving reports `inference_queue.mode = continuous_batching`; the
+topologies in the right column keep the serialized executor (logged and
+recorded as PerfStats `server/serving_path` at startup).
 
 ## Next
 
