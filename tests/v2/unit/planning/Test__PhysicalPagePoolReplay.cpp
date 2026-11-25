@@ -255,10 +255,82 @@ public:
             if (!(input >> name) || updates_.erase(name) != 1) fail();
             outcome = "aborted";
         }
+        else if (kind == "share")
+        {
+            std::string page;
+            if (!(input >> name >> page) || shareds_.contains(name) || !pages_.contains(page)) fail();
+            // Sharing converts the private publication into one immutable shared
+            // reference; the original publication remains a pin until dropped.
+            shareds_.emplace(name, pages_.at(page).share());
+            outcome = std::to_string(shareds_.at(name).version()) + ":" + std::to_string(shareds_.at(name).bytes());
+        }
+        else if (kind == "drop-shared")
+        {
+            if (!(input >> name) || shareds_.erase(name) != 1) fail();
+            outcome = "released";
+        }
+        else if (kind == "adopt")
+        {
+            std::string source, request;
+            if (!(input >> name >> request >> source) || adopted_.contains(name) || !shareds_.contains(source) || !requests_.contains(request)) fail();
+            auto reference = requests_.at(request).adoptShared(shareds_.at(source));
+            outcome = reference ? "accepted" : "refused";
+            if (reference) adopted_.emplace(name, std::move(*reference));
+        }
+        else if (kind == "drop-adopted")
+        {
+            if (!(input >> name) || adopted_.erase(name) != 1) fail();
+            outcome = "released";
+        }
+        else if (kind == "cow")
+        {
+            std::string request, source;
+            size_t fresh;
+            if (!(input >> name >> request >> source >> fresh) || cowplans_.contains(name) || !shareds_.contains(source) || !requests_.contains(request)) fail();
+            auto plan = requests_.at(request).prepareCOW(shareds_.at(source), fresh);
+            outcome = plan ? "ready" : "busy";
+            if (plan) cowplans_.emplace(name, std::move(*plan));
+        }
+        else if (kind == "cow-source")
+        {
+            if (!(input >> name) || !cowplans_.contains(name)) fail();
+            cowplans_.at(name).copySource();
+            outcome = "copied-source";
+        }
+        else if (kind == "cow-next")
+        {
+            std::string hex;
+            if (!(input >> name >> hex) || !cowplans_.contains(name) || hex.size() % 2) fail();
+            std::vector<std::byte> bytes;
+            for (size_t i = 0; i < hex.size(); i += 2)
+            {
+                const auto digit = [](char c) -> int {
+                    if (c >= '0' && c <= '9') return c - '0';
+                    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+                    throw std::invalid_argument("Noncanonical recorded cow byte");
+                };
+                bytes.push_back(static_cast<std::byte>(16 * digit(hex[i]) + digit(hex[i + 1])));
+            }
+            cowplans_.at(name).copyNext(bytes);
+            outcome = "copied-fresh";
+        }
+        else if (kind == "cow-commit")
+        {
+            std::string page;
+            if (!(input >> name >> page) || !cowplans_.contains(name) || pages_.contains(page)) fail();
+            pages_.emplace(page, cowplans_.at(name).commit());
+            cowplans_.erase(name);
+            outcome = "published";
+        }
+        else if (kind == "drop-cow")
+        {
+            if (!(input >> name) || cowplans_.erase(name) != 1) fail();
+            outcome = "aborted";
+        }
         else if (kind == "end")
         {
             if (!requests_.empty() || !pins_.empty() || !plans_.empty() || !pages_.empty() || !reads_.empty() ||
-                !updates_.empty() || !snapshots_.empty()) fail();
+                !updates_.empty() || !snapshots_.empty() || !shareds_.empty() || !adopted_.empty() || !cowplans_.empty()) fail();
             outcome = "idle";
         }
         else fail();
@@ -279,6 +351,9 @@ private:
     std::map<std::string, PhysicalPagePool::ReadAccess> reads_;
     std::map<std::string, CPUFP32PagedKVTable::Update> updates_;
     std::map<std::string, CPUFP32PagedKVTable::Snapshot> snapshots_;
+    std::map<std::string, PhysicalPagePool::SharedPage> shareds_;
+    std::map<std::string, PhysicalPagePool::SharedPage> adopted_;
+    std::map<std::string, PhysicalPagePool::COWPlan> cowplans_;
 };
 
 /** @brief Parse an explicitly versioned complete trace and compare the production authority's observations. */
@@ -357,6 +432,54 @@ TEST(PhysicalMemoryAuthority, PagePoolRecordedUnpublishedOwnershipReplay)
     EXPECT_NO_THROW(replay(appended));
     std::istringstream readers(llaminar2::test::privatePageReaderTrace);
     EXPECT_NO_THROW(replay(readers));
+}
+
+/** @test Recorded sharing, adoption and partial-tail COW transitions replay through real owners. */
+TEST(PhysicalMemoryAuthority, PagePoolRecordedSharingAndCOWReplayExactly)
+{
+    if (const char *record = std::getenv("LLAMINAR_RECORD_PRIVATE_SHARE_TRACE"))
+    {
+        std::ofstream output(record);
+        ASSERT_TRUE(output.good());
+        output << "pma-private-pages-v1 3 128 4 3 empty-zero-generations\n";
+        PrivatePageReplay runner({3, 128, 4, 3});
+        for (const std::string command : {"admit Exporter 1", "assign Exporter",
+            "plan W Exporter 0 9", "copy W 010203040506070809", "commit W P0",
+            "share SH0 P0", "read P0", "adopt P0A Exporter SH0", "drop-adopted P0A",
+            "admit Writer1 1", "cow C1 Writer1 SH0 7", "cow-source C1", "cow-next C1 0a0b0c0d0e0f10",
+            "cow-commit C1 PW1", "read PW1", "read P0",
+            "admit Writer2 1", "cow C2 Writer2 SH0 7", "cow-source C2", "cow-next C2 11121314151617",
+            "cow-commit C2 PW2", "read PW2", "read P0",
+            "adopt P0B Exporter SH0", "drop-adopted P0B", "drop-shared SH0", "drop-page P0",
+            "drop-page PW1", "drop-page PW2", "drop-request Exporter", "drop-request Writer1",
+            "drop-request Writer2", "end"})
+            output << command << " | " << runner.execute(command) << '\n';
+        output.close();
+        ASSERT_TRUE(output.good());
+        std::ifstream captured(record);
+        EXPECT_NO_THROW(replay(captured));
+        return;
+    }
+    std::istringstream input(llaminar2::test::privatePageShareTrace);
+    EXPECT_NO_THROW(replay(input));
+}
+
+/** @test Shared/COW replay rejects invented observations and missing terminal state. */
+TEST(PhysicalMemoryAuthority, PagePoolSharingReplayRejectsAlteredObservations)
+{
+    for (const auto &[original, changed] : std::vector<std::pair<std::string, std::string>>{
+        {"cow C2 Writer2 SH0 7 | ready", "cow C2 Writer2 SH0 7 | busy"},
+        {"share SH0 P0 | 1:9", "share SH0 P0 | 2:9"},
+        {"adopt P0A Exporter SH0 | accepted", "adopt P0A Exporter SH0 | refused"},
+        {"end | idle\n", ""}})
+    {
+        std::string corrupt(llaminar2::test::privatePageShareTrace);
+        const auto position = corrupt.find(original);
+        ASSERT_NE(position, std::string::npos);
+        corrupt.replace(position, original.size(), changed);
+        std::istringstream input(corrupt);
+        EXPECT_THROW(replay(input), std::exception);
+    }
 }
 
 /** @test Recorded immutable table banks, late borrowers and private-frame return replay through real owners. */
