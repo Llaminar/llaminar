@@ -965,16 +965,20 @@ namespace llaminar2::test
             }
             const int partitions = std::max(1, config.k_tiles);
 
-            // Independent slot geometry: up to eight K blocks of eight dot-group
-            // vectors plus a scale vector (and a minimum vector for Q4_K/Q5_K),
-            // then one carry vector per original row when a later partition spans
-            // several panels; each slot is padded to a 64-byte line.
+            // Independent slot geometry: a worker's strip is a whole 64-column
+            // chunk on AVX-512 when every worker of this team can own one, else
+            // one SIMD vector wide. Up to eight K blocks of eight dot-group
+            // planes plus a scale plane (and a minimum plane for Q4_K/Q5_K),
+            // then one carry partial of the strip width per original row when a
+            // later partition spans several panels; each slot is padded to a
+            // 64-byte line.
+            const int strip = lanes == 16 && (n + 63) / 64 >= workers ? 64 : lanes;
             const bool affine = format == x86_panel::Format::Q4K || format == x86_panel::Format::Q5K;
-            const std::size_t panel_floats = std::size_t(std::min(blocks, 8)) * (affine ? 10 : 9) * lanes;
+            const std::size_t panel_floats = std::size_t(std::min(blocks, 8)) * (affine ? 10 : 9) * strip;
             const bool carry = partitions > 1 && (blocks + partitions - 1) / partitions > 8;
-            const std::size_t carry_floats = carry ? std::size_t(rows) * lanes : 0;
+            const std::size_t carry_floats = carry ? std::size_t(rows) * strip : 0;
             const std::size_t pitch = (panel_floats + carry_floats + 15) / 16 * 16;
-            // The panel needs one N strip per worker of this exact team.
+            // The panel needs one N strip of at least one vector per worker of this exact team.
             const bool eligible = (n + lanes - 1) / lanes >= workers;
             const auto quoted = x86_panel::invocationFloats(format, lanes, rows, n, blocks, config.k_tiles, workers);
             ASSERT_EQ(quoted, eligible ? pitch * workers : 0u);
@@ -1074,8 +1078,8 @@ namespace llaminar2::test
                     EXPECT_FALSE(clean(scratch[base])) << "worker " << worker << " did not pack into its own slot";
                     for (int row = 0; row < rows; ++row)
                         if (carry && !authored(row))
-                            for (int lane = 0; lane < lanes; ++lane)
-                                ASSERT_TRUE(clean(scratch[base + panel_floats + std::size_t(row) * lanes + lane]))
+                            for (int lane = 0; lane < strip; ++lane)
+                                ASSERT_TRUE(clean(scratch[base + panel_floats + std::size_t(row) * strip + lane]))
                                     << "worker " << worker << " carried unauthored row " << row;
                     for (auto index = base + panel_floats + carry_floats; index < base + pitch; ++index)
                         ASSERT_TRUE(clean(scratch[index])) << "worker " << worker << " wrote slot padding " << index;
@@ -1108,7 +1112,9 @@ namespace llaminar2::test
         // the panel and keep the ordinary route; 0 launches nothing. The
         // GPU-aligned tree always has 16 partitions: K=1120 (35 blocks) leaves
         // empty trailing partitions and K=4768 (149 blocks, ten per partition)
-        // carries partials across panels.
+        // carries partials across panels. On AVX-512, teams of one and two
+        // workers own whole 64-column strips and teams of three and four own
+        // sixteen-column strips, so both strip widths are replayed.
         for (const int k : {1120, 4768})
         {
             const PanelReplay replay{.n = 67, .k = k, .requests = 2, .rows_per_request = 17,
@@ -1122,7 +1128,8 @@ namespace llaminar2::test
             }
         }
         // A participant admitted for four workers where N=17 has fewer strips
-        // (two AVX-512, three AVX2): four workers cannot select the panel, but
+        // (two sixteen-column AVX-512 strips, or one whole chunk for a single
+        // worker; three AVX2 strips): four workers cannot select the panel, but
         // narrower teams do and borrow from the four-worker admission. A quote
         // of the admitted width alone was zero, so backend-native teams of one
         // to three workers under-borrowed here.

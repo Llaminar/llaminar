@@ -6,9 +6,17 @@
  * writes directly to the worker-owned slab. The next stage only reads that
  * bounded panel and writes final output (or an unfinished ordered partial).
  * No expanded weight publication or per-invocation allocation exists.
+ *
+ * Strip widths follow x86_panel::stripColumns(): AVX2 strips are eight
+ * columns consumed two rows at a time; AVX-512 strips are a whole 64-column
+ * chunk consumed two rows by four vectors (the shape of the expanded INT8
+ * kernels, one broadcast and one per-row scale/correction per four dots)
+ * whenever every worker owns one, else sixteen columns four rows at a time.
  */
 #if defined(__AVX2__)
 #include "CPUNativeX86PackedPrefill.h"
+
+#include <algorithm>
 #include "CPUNativeAVX2Gemv.h"
 #include "CPUProjectionStorageProof.h"
 
@@ -25,22 +33,31 @@ namespace llaminar2::cpu::native_quantised::x86_panel
                       : CPUNativeQuantisedEncoding::CompactMultiScale;
 
         /**
-         * @brief Decode directly into the current worker's reserved panel.
-         * @tparam Lanes Eight AVX2 or sixteen AVX-512 output columns.
+         * @brief Decode one SIMD-wide sub-strip directly into the current worker's reserved panel.
+         * @tparam Lanes Eight AVX2 or sixteen AVX-512 output columns per vector.
+         * @tparam Subs Vectors per panel strip (one, or four for a 64-column AVX-512 strip).
+         * @tparam Sub This call's vector within the strip.
          * @tparam CB Source factor and payload decoder.
          * @param w Admitted file-density publication, retained for the invocation.
-         * @param chunk,col Physical original coordinates of the column strip.
+         * @param chunk,col Physical original coordinates of this sub-strip's first column.
          * @param begin,end Increasing logical K-block interval inside one arithmetic partition.
          * @param out Worker slot, large enough for all intervals up to @ref depth.
+         *
+         * A block of the panel holds ten (or nine) strip-wide planes: the eight
+         * dot groups, the scale and the minimum. Plane i of sub-strip Sub starts
+         * at (i * Subs + Sub) * Lanes, so a one-vector strip keeps its original
+         * i * Lanes layout and each consume load reads one contiguous vector.
          */
-        template <int Lanes, int CB>
+        template <int Lanes, int Subs, int Sub, int CB>
         [[gnu::noinline]]
         void pack(const CPUNativeQuantisedWeightView &w, int chunk, int col, int begin, int end, float *out)
         {
             using Ops = multi_scale::SIMD<Lanes>;
             using I = typename Ops::I;
             using L = coded_metadata::Lanes<Ops>;
-            constexpr int stride = blockFloats(static_cast<Format>(CB), Lanes);
+            static_assert(Sub >= 0 && Sub < Subs);
+            constexpr int stride = blockFloats(static_cast<Format>(CB), Lanes * Subs);
+            constexpr auto plane = [](int index) { return (index * Subs + Sub) * Lanes; };
             const auto storeVector = [](float *where, auto value) { std::memcpy(where, &value, sizeof(value)); };
             constexpr auto geom = preparedBlockGeometry(encoding<CB>, affine(static_cast<Format>(CB)), CB, 0);
             constexpr auto data = preparedDataStride(encoding<CB>, CB);
@@ -65,7 +82,7 @@ namespace llaminar2::cpu::native_quantised::x86_panel
                     {
 #pragma GCC unroll 1
                         for (int g = 0; g < 8; ++g)
-                            storeVector(out + Lanes * g, multi_scale::decodeIQ3SGroup<Lanes, Ops>(u, col, g));
+                            storeVector(out + plane(g), multi_scale::decodeIQ3SGroup<Lanes, Ops>(u, col, g));
                     }
                     else
                     {
@@ -77,15 +94,15 @@ namespace llaminar2::cpu::native_quantised::x86_panel
                                 if constexpr (Lanes == 8)
                                 {
                                     auto [l, h] = q5::decode8(u, col, g);
-                                    storeVector(out + Lanes * g, l);
-                                    storeVector(out + Lanes * (g + 4), h);
+                                    storeVector(out + plane(g), l);
+                                    storeVector(out + plane(g + 4), h);
                                 }
 #if defined(__AVX512VNNI__)
                                 else
                                 {
                                     auto [l, h] = q5::decode16(u, col, g);
-                                    storeVector(out + Lanes * g, l);
-                                    storeVector(out + Lanes * (g + 4), h);
+                                    storeVector(out + plane(g), l);
+                                    storeVector(out + plane(g + 4), h);
                                 }
 #endif
                             }
@@ -125,7 +142,7 @@ namespace llaminar2::cpu::native_quantised::x86_panel
                                         }
 #endif
                                     }
-                                    storeVector(out + Lanes * group, low);
+                                    storeVector(out + plane(group), low);
                                 };
                                 store(raw, g);
                                 store(raw >> 4, g + 4);
@@ -133,13 +150,13 @@ namespace llaminar2::cpu::native_quantised::x86_panel
                         }
                     }
                     if constexpr (CB == 6)
-                        storeVector(out + 8 * Lanes, Ops::half(reinterpret_cast<const uint16_t *>(u + data) + col));
+                        storeVector(out + plane(8), Ops::half(reinterpret_cast<const uint16_t *>(u + data) + col));
                     else if constexpr (CB == 11)
-                        storeVector(out + 8 * Lanes, d * L::toFloat(2 * L::nibbles(u + data, col) + 1));
+                        storeVector(out + plane(8), d * L::toFloat(2 * L::nibbles(u + data, col) + 1));
                     else if constexpr (CB == 4)
                     {
                         constexpr auto key = kNativeQuantisedIQ4XSSourceScaleCodebook;
-                        storeVector(out + 8 * Lanes, coded_metadata::sourceScaleFactors<key, Ops>(
+                        storeVector(out + plane(8), coded_metadata::sourceScaleFactors<key, Ops>(
                                                          L::template code<key>(u + data, col), d)
                                                          .primary);
                     }
@@ -147,8 +164,8 @@ namespace llaminar2::cpu::native_quantised::x86_panel
                     {
                         const auto factors =
                             coded_metadata::reconstruct<5, Ops>(L::template code<CB>(u + data, col), {d, min});
-                        storeVector(out + 8 * Lanes, factors.primary);
-                        storeVector(out + 9 * Lanes, factors.secondary);
+                        storeVector(out + plane(8), factors.primary);
+                        storeVector(out + plane(9), factors.secondary);
                     }
                 }
             }
@@ -341,6 +358,111 @@ namespace llaminar2::cpu::native_quantised::x86_panel
                     writeOutput<Lanes>(out[r], live, fold<Lanes, P>(loadOutput<Lanes>(out[r], live), acc[r]));
             }
         }
+#if defined(__AVX512VNNI__)
+        /**
+         * @brief Consume a 64-column AVX-512 panel with two rows of four independent vectors.
+         * @tparam CB File-density source decoder that wrote the panel.
+         * @tparam Rows One or two rows sharing every panel vector.
+         * @tparam P Original FP32 block and partition policy.
+         * @param p,n,a,out,carry,live,first_panel,last_panel,fold_earlier As consume().
+         *
+         * The two-row, four-vector tile of the expanded INT8 kernels: each
+         * activation broadcast feeds four VPDPBUSD, and each row's activation
+         * scale and zero-point correction are computed once per block for all
+         * 64 columns instead of once per 16. Four vectors per row are already
+         * independent dependency chains. Every column keeps consume()'s exact
+         * INT32 dot, correction, FP32 block program and partition fold.
+         */
+        template <int CB, int Rows, Policy P>
+        [[gnu::noinline]]
+        void consumeWide(const float *p, int n, const std::array<const Q8_1Block *, Rows> &a,
+                         const std::array<float *, Rows> &out, const std::array<float *, Rows> &carry, int live,
+                         bool first_panel, bool last_panel, bool fold_earlier)
+        {
+            constexpr int Lanes = 16, Subs = wide_strip / Lanes;
+            using Ops = multi_scale::SIMD<Lanes>;
+            using F = typename Ops::F;
+            using I = typename Ops::I;
+            constexpr int stride = blockFloats(static_cast<Format>(CB), wide_strip);
+            // Live lanes of each 16-column vector of the strip's (possibly partial) tail.
+            int lives[Subs];
+#pragma GCC unroll 4
+            for (int s = 0; s < Subs; ++s)
+                lives[s] = std::clamp(live - s * Lanes, 0, Lanes);
+            F acc[Rows][Subs]{};
+#pragma GCC unroll 2
+            for (int r = 0; r < Rows; ++r)
+#pragma GCC unroll 4
+                for (int s = 0; s < Subs; ++s)
+                    if (!first_panel)
+                        acc[r][s] = fold_earlier ? loadOutput<Lanes>(carry[r] + s * Lanes, Lanes)
+                                                 : loadOutput<Lanes>(out[r] + s * Lanes, lives[s]);
+            for (int i = 0; i < n; ++i, p += stride)
+            {
+                I dots[Rows][Subs]{};
+                const auto group = [&]<int G>() {
+                    I w[Subs];
+#pragma GCC unroll 4
+                    for (int s = 0; s < Subs; ++s)
+                        w[s] = multi_scale::load<I>(p + (G * Subs + s) * Lanes);
+#pragma GCC unroll 2
+                    for (int r = 0; r < Rows; ++r)
+                    {
+                        const I word = I{} + multi_scale::load<int>(a[r][i].qs + G * 4);
+#pragma GCC unroll 4
+                        for (int s = 0; s < Subs; ++s)
+                            dots[r][s] = Ops::dot(dots[r][s], w[s], word);
+                    }
+                };
+                group.template operator()<0>();
+                group.template operator()<1>();
+                group.template operator()<2>();
+                group.template operator()<3>();
+                group.template operator()<4>();
+                group.template operator()<5>();
+                group.template operator()<6>();
+                group.template operator()<7>();
+#pragma GCC unroll 2
+                for (int r = 0; r < Rows; ++r)
+                {
+                    const auto &act = a[r][i];
+                    int correction = 0;
+                    if constexpr (CB == 6)
+                        correction = 16 * q5::sumQ8(act.qs);
+                    if constexpr (CB == 4 || CB == 11)
+                        correction = 128 * int(act.sum_qs);
+                    const auto s_a = nativeQuantisedFP16ScaleToFP32(act.d);
+#pragma GCC unroll 4
+                    for (int s = 0; s < Subs; ++s)
+                    {
+                        const auto dot = dots[r][s] - correction;
+                        const auto scale = std::bit_cast<__m512>(multi_scale::load<F>(p + (8 * Subs + s) * Lanes));
+                        if constexpr (affine(static_cast<Format>(CB)))
+                            acc[r][s] = std::bit_cast<F>(accumulateCorrectedSingleScaleBlockAVX512(
+                                std::bit_cast<__m512>(acc[r][s]), std::bit_cast<__m512i>(dot), scale, act.sum_qs,
+                                std::bit_cast<__m512>(multi_scale::load<F>(p + (9 * Subs + s) * Lanes)), s_a, P));
+                        else
+                            acc[r][s] = std::bit_cast<F>(accumulateSingleScaleBlockAVX512(
+                                std::bit_cast<__m512>(acc[r][s]), std::bit_cast<__m512i>(dot), scale, s_a, P));
+                    }
+                }
+            }
+#pragma GCC unroll 2
+            for (int r = 0; r < Rows; ++r)
+#pragma GCC unroll 4
+                for (int s = 0; s < Subs; ++s)
+                {
+                    if (!fold_earlier)
+                        writeOutput<Lanes>(out[r] + s * Lanes, lives[s], acc[r][s]);
+                    else if (!last_panel)
+                        writeOutput<Lanes>(carry[r] + s * Lanes, Lanes, acc[r][s]);
+                    else
+                        writeOutput<Lanes>(out[r] + s * Lanes, lives[s],
+                                           fold<Lanes, P>(loadOutput<Lanes>(out[r] + s * Lanes, lives[s]), acc[r][s]));
+                }
+        }
+#endif
+
         /**
          * @brief Own one original N strip across all live rows and the complete K tree.
          * @tparam Lanes Physical SIMD columns per row.
@@ -354,11 +476,13 @@ namespace llaminar2::cpu::native_quantised::x86_panel
          * @param grid Read-only live row ownership, including request boundaries.
          * @param panel,carry Exclusive worker slot (carry present only when needed).
          */
-        template <int Lanes, int CB, Policy P>
+        template <int Lanes, int Strip, int CB, Policy P>
         void stripe(const CPUNativeQuantisedWeightView &w, const Q8_1Block *a, float *c, int ldc, int n, int parts,
                     const CPUProjectionRowGrid &grid, float *panel, float *carry)
         {
-            const int live = std::min(Lanes, w.N - n);
+            constexpr int Subs = Strip / Lanes;
+            static_assert(Subs == 1 || (Lanes == 16 && Strip == wide_strip));
+            const int live = std::min(Strip, w.N - n);
             const int blocks = w.blocks_per_row;
             const int width = (blocks - 1) / parts + 1;
             for (int kpart = 0; kpart < parts; ++kpart)
@@ -369,7 +493,17 @@ namespace llaminar2::cpu::native_quantised::x86_panel
                 {
                     const int next = std::min(end, begin + depth);
                     if (next > begin)
-                        pack<Lanes, CB>(w, n / 64, n % 64, begin, next, panel);
+                    {
+                        // A wide strip is one whole chunk: decode its four
+                        // sixteen-column vectors into their interleaved planes.
+                        pack<Lanes, Subs, 0, CB>(w, n / 64, n % 64, begin, next, panel);
+                        if constexpr (Subs == 4)
+                        {
+                            pack<Lanes, Subs, 1, CB>(w, n / 64, Lanes, begin, next, panel);
+                            pack<Lanes, Subs, 2, CB>(w, n / 64, 2 * Lanes, begin, next, panel);
+                            pack<Lanes, Subs, 3, CB>(w, n / 64, 3 * Lanes, begin, next, panel);
+                        }
+                    }
                     auto update = [&]<int Rows>(int row)
                     {
                         std::array<const Q8_1Block *, Rows> in{};
@@ -379,25 +513,32 @@ namespace llaminar2::cpu::native_quantised::x86_panel
                             out[r] = c + std::size_t(row + r) * ldc + n;
                             in[r] = a + std::size_t(row + r) * blocks + begin;
                             if (carry)
-                                partial[r] = carry + std::size_t(row + r) * Lanes;
+                                partial[r] = carry + std::size_t(row + r) * Strip;
                         }
-                        consume<Lanes, CB, Rows, P>(panel, next - begin, in, out, partial, live, begin == first,
-                                                    next == end, kpart != 0);
+#if defined(__AVX512VNNI__)
+                        if constexpr (Subs == 4)
+                            consumeWide<CB, Rows, P>(panel, next - begin, in, out, partial, live, begin == first,
+                                                     next == end, kpart != 0);
+                        else
+#endif
+                            consume<Lanes, CB, Rows, P>(panel, next - begin, in, out, partial, live, begin == first,
+                                                        next == end, kpart != 0);
                     };
-                    // AVX-512 reuses each panel vector across four rows; the
-                    // sixteen AVX2 registers keep the two-row tile.
-                    constexpr int width = Lanes == 16 ? 4 : 2;
+                    // A sixteen-column AVX-512 strip reuses each panel vector
+                    // across four rows; AVX2 and the four-vector wide strip
+                    // keep two rows within their register budgets.
+                    constexpr int width = rowTile(Strip);
                     for (int tile = 0; tile < grid.tiles(width); ++tile)
                     {
                         const auto span = grid.tileSpan(tile, width);
                         switch (span.size())
                         {
                         case 4:
-                            if constexpr (width == 4)
+                            if constexpr (width >= 4)
                                 update.template operator()<4>(span.first);
                             break;
                         case 3:
-                            if constexpr (width == 4)
+                            if constexpr (width >= 3)
                                 update.template operator()<3>(span.first);
                             break;
                         case 2:
@@ -418,28 +559,28 @@ namespace llaminar2::cpu::native_quantised::x86_panel
         }
 
         /** Workshare over stripes, not row replay: each packed panel is consumed across the row grid. */
-        template <int Lanes, int CB, Policy P>
+        template <int Lanes, int Strip, int CB, Policy P>
         void run(const CPUNativeQuantisedWeightView &w, const Q8_1Block *a, float *c, int ldc, int rows, int parts,
                  const CPUProjectionRowGrid &grid, float *scratch)
         {
             auto task = [&]
             {
                 constexpr auto format = static_cast<Format>(CB);
-                const auto pitch = workerFloats(format, Lanes, rows, w.blocks_per_row, parts);
+                const auto pitch = workerFloats(format, Strip, rows, w.blocks_per_row, parts);
                 auto *panel = scratch + static_cast<std::size_t>(omp_get_thread_num()) * pitch;
                 auto *carry = needsCarry(w.blocks_per_row, parts)
-                                  ? panel + std::min(w.blocks_per_row, depth) * blockFloats(format, Lanes)
+                                  ? panel + std::min(w.blocks_per_row, depth) * blockFloats(format, Strip)
                                   : nullptr;
-                const int strips = columnStrips(w.N, Lanes);
+                const int strips = columnStrips(w.N, Strip);
 #pragma omp for schedule(static)
                 for (int strip = 0; strip < strips; ++strip)
-                    stripe<Lanes, CB, P>(w, a, c, ldc, strip * Lanes, parts, grid, panel, carry);
+                    stripe<Lanes, Strip, CB, P>(w, a, c, ldc, strip * Strip, parts, grid, panel, carry);
             };
             OMP_WORKSHARE_REGION(task);
         }
 
         /** @brief Dispatch a validated panel format and FP policy before entering the team. */
-        template <int Lanes>
+        template <int Lanes, int Strip>
         void dispatch(Format format, const CPUNativeQuantisedWeightView &w, const Q8_1Block *a, float *out, int rows,
                       int stride, int partitions, const CPUProjectionRowGrid &grid, float *scratch)
         {
@@ -447,8 +588,9 @@ namespace llaminar2::cpu::native_quantised::x86_panel
             {
                 constexpr auto cb = static_cast<int>(F);
                 if (w.numerical_policy == Policy::GPUAlignedExpert)
-                    return run<Lanes, cb, Policy::GPUAlignedExpert>(w, a, out, stride, rows, partitions, grid, scratch);
-                return run<Lanes, cb, Policy::BackendNative>(w, a, out, stride, rows, partitions, grid, scratch);
+                    return run<Lanes, Strip, cb, Policy::GPUAlignedExpert>(w, a, out, stride, rows, partitions, grid,
+                                                                           scratch);
+                return run<Lanes, Strip, cb, Policy::BackendNative>(w, a, out, stride, rows, partitions, grid, scratch);
             };
             switch (format)
             {
@@ -488,10 +630,15 @@ namespace llaminar2::cpu::native_quantised::x86_panel
         storage_proof::requireDisjoint(writes, {weights.interleavedBase(), weights.bytes().size()});
         storage_proof::requireOriginalWorkReadOnly(writes, work);
         if (lanes == 8)
-            return dispatch<8>(format, weights, activation, output, rows, output_stride, partitions, grid,
-                               scratch.data());
+            return dispatch<8, 8>(format, weights, activation, output, rows, output_stride, partitions, grid,
+                                  scratch.data());
 #if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
-        return dispatch<16>(format, weights, activation, output, rows, output_stride, partitions, grid, scratch.data());
+        // The same rule as the borrowed quote: a whole chunk per worker when possible.
+        if (stripColumns(lanes, weights.N, workers) == wide_strip)
+            return dispatch<16, wide_strip>(format, weights, activation, output, rows, output_stride, partitions, grid,
+                                            scratch.data());
+        return dispatch<16, 16>(format, weights, activation, output, rows, output_stride, partitions, grid,
+                                scratch.data());
 #else
         throw std::invalid_argument("Native x86 prefill cannot select AVX-512 in its AVX2 envelope");
 #endif

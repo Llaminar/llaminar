@@ -4810,16 +4810,18 @@ namespace llaminar2::cpu::native_quantised
         if (use_packed_panel)
         {
             const int partitions = std::max(1, serial_cfg.k_tiles);
+            const int panel_strip = x86_panel::stripColumns(panel_lanes, N, num_threads);
             if ((!omp_in_parallel() || omp_get_thread_num() == 0) && PerfStatsCollector::isDomainEnabled("kernel"))
                 PerfStatsCollector::addCounter("kernel", "cpu_native_quantised_prefill_gemm_launch", 1.0, "gemm", {},
                     {{"m", std::to_string(M)}, {"n", std::to_string(N)}, {"policy_n", std::to_string(policy_n)},
                      {"k", std::to_string(packed.K)}, {"codebook", std::to_string(packed.codebook_id)},
                      {"build_isa", compiledNativeQuantisedBuildISAName()}, {"isa", use_avx512 ? "AVX512" : "AVX2"},
-                     {"route", "packed_panel"}, {"row_tile", "2"}, {"requested_policy", "Auto"},
+                     {"route", "packed_panel"}, {"row_tile", std::to_string(x86_panel::rowTile(panel_strip))},
+                     {"strip_columns", std::to_string(panel_strip)}, {"requested_policy", "Auto"},
                      {"effective_policy", "PackedPanel"}, {"n_block_chunks", "1"}, {"task_grid", "n_strip_all_rows"},
                      {"k_tile_blocks", std::to_string(std::min(x86_panel::depth, (K_blocks - 1) / partitions + 1))},
                      {"k_tiles", std::to_string(partitions)},
-                     {"parallel_tasks", std::to_string(x86_panel::columnStrips(N, panel_lanes))},
+                     {"parallel_tasks", std::to_string(x86_panel::columnStrips(N, panel_strip))},
                      {"reduction_tasks", "0"}, {"threads", std::to_string(num_threads)}});
             return x86_panel::project(packed.readView(), panel_format, A_q8_all, C, M, ldc,
                 partitions, num_threads, panel_lanes, row_grid, work, partial_storage);

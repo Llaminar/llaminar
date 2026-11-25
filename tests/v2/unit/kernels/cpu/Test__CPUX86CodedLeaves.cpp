@@ -14,7 +14,10 @@
  * - AVX-512 Q4_K and IQ4_XS (multi_scale::x86::nibbleSingleScaleRows): per
  *   superblock bases, routed from the one- to four-row nibble chunks and the
  *   ordered GPU-aligned trees;
- * - AVX-512 packed prefill panels: four rows per decoded panel vector.
+ * - packed prefill panels: whole 64-column AVX-512 strips (two rows by four
+ *   vectors) when every worker owns one, sixteen-column strips (four rows)
+ *   otherwise, and two-row AVX2 strips, including explicit backend-native and
+ *   GPU-aligned K partition trees that carry partials across panels.
  *
  * Each case builds sealed prepared publications directly (random payloads and
  * codes, controlled scale words) and compares the production entry bitwise
@@ -128,12 +131,14 @@ namespace llaminar2::test
          * @param policy Arithmetic policy.
          * @param scales Scale-word content.
          * @param seed Payload and scale seed.
+         * @param live_columns Logical N (at most @p n); padding metadata is normalized before the seal.
          */
         void makeWeights(CPUNativeQuantisedPackedWeights &packed, const Layout &layout, int n, int blocks,
-                         Policy policy, Scales scales, std::uint32_t seed)
+                         Policy policy, Scales scales, std::uint32_t seed, int live_columns = 0)
         {
             ASSERT_EQ(n % 64, 0);
-            packed.N = n;
+            ASSERT_LE(live_columns, n);
+            packed.N = live_columns > 0 ? live_columns : n;
             packed.N_padded = n;
             packed.K = blocks * 32;
             packed.blocks_per_row = blocks;
@@ -209,6 +214,7 @@ namespace llaminar2::test
                         }
                 }
             }
+            packed.normalizePaddingMetadata();
             packed.sealPublication();
             ASSERT_TRUE(packed.publicationSealed());
         }
@@ -803,16 +809,84 @@ namespace llaminar2::test
     }
 #endif
 
-    /** @test Packed prefill panels (four-row AVX-512 tiles, two-row AVX2 tiles) reproduce serial rows. */
+    namespace
+    {
+        /** @brief Bind one exact OpenMP team width and restore the caller's policy on exit. */
+        class ScopedTeam final
+        {
+        public:
+            explicit ScopedTeam(int workers)
+                : previous_threads_(omp_get_max_threads()), previous_dynamic_(omp_get_dynamic())
+            {
+                omp_set_dynamic(0);
+                omp_set_num_threads(workers);
+            }
+            ~ScopedTeam()
+            {
+                omp_set_num_threads(previous_threads_);
+                omp_set_dynamic(previous_dynamic_);
+            }
+            ScopedTeam(const ScopedTeam &) = delete;
+            ScopedTeam &operator=(const ScopedTeam &) = delete;
+
+        private:
+            int previous_threads_;
+            int previous_dynamic_;
+        };
+
+        /**
+         * @brief Serial M=1 rows through an explicit K-partition tree, independent of the panel.
+         * @details Every partition is one production chunk kernel call from
+         * positive zero, folded by reduceNativeQuantisedKTilePartialsExact():
+         * the same partial bank and left fold serial decode uses for a K split.
+         */
+        std::vector<float> partitionedSerialRows(const CPUNativeQuantisedPackedWeights &packed,
+                                                 const std::vector<Q8_1Block> &activation, int rows, int stride,
+                                                 int partitions, float dirty)
+        {
+            const int blocks = packed.blocks_per_row, width = (blocks - 1) / partitions + 1;
+            const bool wide = activeISALevel() >= ISALevel::AVX512;
+            std::vector<float> result(std::size_t(rows) * stride, dirty);
+            std::vector<float> bank(std::size_t(partitions) * 64);
+            for (int row = 0; row < rows; ++row)
+            {
+                const Q8_1Block *a = activation.data() + std::size_t(row) * blocks;
+                for (int chunk = 0; chunk < packed.N_padded / 64; ++chunk)
+                {
+                    for (int part = 0; part < partitions; ++part)
+                    {
+                        const int first = std::min(part * width, blocks), last = std::min(first + width, blocks);
+                        float *partial = bank.data() + std::size_t(part) * 64;
+                        if (wide)
+                        {
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
+                            if (packed.usesNibbleLUT())
+                                gemv_native_quantised_avx512_chunk_native(packed, a, partial, chunk, first, last,
+                                                                          build_decode_lut(packed.codebook_id), false);
+                            else
+                                gemv_native_quantised_avx512_chunk_non_nibble(packed, a, partial, chunk, first, last,
+                                                                              false);
+#endif
+                        }
+                        else if (packed.usesNibbleLUT())
+                            gemv_avx2_chunk_native(packed, a, partial, chunk, first, last,
+                                                   build_decode_lut_avx2_for_codebook(packed.codebook_id), false);
+                        else
+                            gemv_avx2_chunk_non_nibble(packed, a, partial, chunk, first, last, false);
+                    }
+                    const int columns = std::min(64, packed.N - chunk * 64);
+                    reduceNativeQuantisedKTilePartialsExact(bank.data(),
+                        result.data() + std::size_t(row) * stride + chunk * 64, columns, partitions, wide,
+                        packed.numerical_policy);
+                }
+            }
+            return result;
+        }
+    } // namespace
+
+    /** @test Packed prefill panels reproduce serial rows for every strip width and row tile. */
     TEST(CPUX86CodedLeaves, PanelRowTilesEqualSerialRows)
     {
-        struct Team
-        {
-            int previous_threads = omp_get_max_threads();
-            int previous_dynamic = omp_get_dynamic();
-            Team() { omp_set_dynamic(0); omp_set_num_threads(1); }
-            ~Team() { omp_set_num_threads(previous_threads); omp_set_dynamic(previous_dynamic); }
-        } team;
         constexpr int n = 128, stride = n + 5;
         constexpr float dirty = -12345.5f;
         const int lanes = activeISALevel() >= ISALevel::AVX512 ? 16 : 8;
@@ -831,29 +905,88 @@ namespace llaminar2::test
                         const auto format = x86_panel::formatFor(packed.encoding, packed.codebook_id);
                         const auto activation = makeActivations(19, blocks, 909u + blocks);
                         std::vector<float> serial(std::size_t(19) * stride, dirty);
-                        std::vector<float> serial_scratch(nativeQuantisedProjectionPartialFloats(packed, 1));
-                        for (int row = 0; row < 19; ++row)
-                            gemv_native_quantised_preq(packed, activation.data() + std::size_t(row) * blocks,
-                                                       serial.data() + std::size_t(row) * stride, serial_scratch);
-                        // Sixteen to nineteen rows: full four-row tiles and tails of one to three rows.
-                        for (int rows = 16; rows <= 19; ++rows)
                         {
-                            SCOPED_TRACE("rows=" + std::to_string(rows));
-                            ASSERT_TRUE(x86_panel::supportsGeometry(format, lanes, rows, n, 1))
-                                << "the production Auto route must select the packed panel";
-                            std::vector<float> actual(std::size_t(rows) * stride, dirty);
-                            std::vector<float> scratch(nativeQuantisedProjectionPartialFloats(packed, rows), dirty);
-                            gemm_native_quantised_preq(packed, activation.data(), actual.data(), scratch, rows, stride);
-                            for (int row = 0; row < rows; ++row)
-                                for (int column = 0; column < stride; ++column)
-                                {
-                                    const auto index = std::size_t(row) * stride + column;
-                                    ASSERT_PRED2(sameOutput, std::bit_cast<std::uint32_t>(actual[index]),
-                                                 std::bit_cast<std::uint32_t>(serial[index]))
-                                        << "row=" << row << " column=" << column;
-                                }
+                            ScopedTeam team(1);
+                            std::vector<float> serial_scratch(nativeQuantisedProjectionPartialFloats(packed, 1));
+                            for (int row = 0; row < 19; ++row)
+                                gemv_native_quantised_preq(packed, activation.data() + std::size_t(row) * blocks,
+                                                           serial.data() + std::size_t(row) * stride, serial_scratch);
+                        }
+                        // One worker owns whole 64-column AVX-512 strips (two rows by
+                        // four vectors); three workers own sixteen-column strips (four
+                        // rows). Sixteen to nineteen rows cover every row-tile tail.
+                        for (const int workers : {1, 3})
+                        {
+                            ScopedTeam team(workers);
+                            SCOPED_TRACE("workers=" + std::to_string(workers) + " strip=" +
+                                         std::to_string(x86_panel::stripColumns(lanes, n, workers)));
+                            for (int rows = 16; rows <= 19; ++rows)
+                            {
+                                SCOPED_TRACE("rows=" + std::to_string(rows));
+                                ASSERT_TRUE(x86_panel::supportsGeometry(format, lanes, rows, n, workers))
+                                    << "the production Auto route must select the packed panel";
+                                std::vector<float> actual(std::size_t(rows) * stride, dirty);
+                                std::vector<float> scratch(nativeQuantisedProjectionPartialFloats(packed, rows), dirty);
+                                gemm_native_quantised_preq(packed, activation.data(), actual.data(), scratch, rows,
+                                                           stride);
+                                for (int row = 0; row < rows; ++row)
+                                    for (int column = 0; column < stride; ++column)
+                                    {
+                                        const auto index = std::size_t(row) * stride + column;
+                                        ASSERT_PRED2(sameOutput, std::bit_cast<std::uint32_t>(actual[index]),
+                                                     std::bit_cast<std::uint32_t>(serial[index]))
+                                            << "row=" << row << " column=" << column;
+                                    }
+                            }
                         }
                     }
+    }
+
+    /** @test Panels fold explicit backend-native and GPU-aligned K trees exactly like serial partial banks. */
+    TEST(CPUX86CodedLeaves, PanelPartitionedTreesEqualSerialPartials)
+    {
+        // A ragged N tail (122 = 64 + 58) on both strip widths; 149 blocks in
+        // three partitions of 50 or sixteen of 10 carry partials across panels.
+        constexpr int n = 128, live_n = 122, blocks = 149, rows = 17, stride = live_n + 3;
+        constexpr float dirty = -12345.5f;
+        const int lanes = activeISALevel() >= ISALevel::AVX512 ? 16 : 8;
+        const auto activation = makeActivations(rows, blocks, 1313u);
+        for (const Layout &layout : {kQ5K, kIQ3S, kQ4K, kIQ4XS, kQ50})
+            for (const Policy policy : kPolicies)
+            {
+                SCOPED_TRACE(std::string(layout.name) + " policy=" + std::to_string(int(policy)));
+                CPUNativeQuantisedPackedWeights packed;
+                makeWeights(packed, layout, n, blocks, policy, Scales::Finite, 131u + layout.codebook, live_n);
+                const auto format = x86_panel::formatFor(packed.encoding, packed.codebook_id);
+                const auto view = packed.readView();
+                const CPUProjectionRowGrid grid(rows, nullptr);
+                for (const int partitions : {3, 16})
+                {
+                    const auto serial = partitionedSerialRows(packed, activation, rows, stride, partitions, dirty);
+                    for (const int workers : {1, 2, 3})
+                    {
+                        SCOPED_TRACE("partitions=" + std::to_string(partitions) + " workers=" +
+                                     std::to_string(workers) + " strip=" +
+                                     std::to_string(x86_panel::stripColumns(lanes, live_n, workers)));
+                        ScopedTeam team(workers);
+                        ASSERT_TRUE(x86_panel::needsCarry(blocks, partitions));
+                        std::vector<float> actual(std::size_t(rows) * stride, dirty);
+                        std::vector<float> scratch(
+                            x86_panel::invocationFloats(format, lanes, rows, live_n, blocks, partitions, workers), dirty);
+                        ASSERT_FALSE(scratch.empty());
+                        x86_panel::project(view, format, activation.data(), actual.data(), rows, stride, partitions,
+                                           workers, lanes, grid, nullptr, scratch);
+                        for (int row = 0; row < rows; ++row)
+                            for (int column = 0; column < stride; ++column)
+                            {
+                                const auto index = std::size_t(row) * stride + column;
+                                ASSERT_EQ(std::bit_cast<std::uint32_t>(actual[index]),
+                                          std::bit_cast<std::uint32_t>(serial[index]))
+                                    << "row=" << row << " column=" << column;
+                            }
+                    }
+                }
+            }
     }
 } // namespace llaminar2::test
 #endif // __AVX2__

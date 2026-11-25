@@ -140,7 +140,9 @@ TEST(Test__WorkspaceMemoryEstimator, CPUProjectionPanelUsesParticipantAndPhysica
         }
     };
     // Eight K blocks, eight dot vectors and two affine factor vectors each.
-    expectPartials("Q4_K", 8 * (8 + 2) * 16);
+    // N=128 gives each of the one-worker team's AVX-512 strips a whole
+    // 64-column chunk.
+    expectPartials("Q4_K", 8 * (8 + 2) * 64);
     expectPartials("IQ2_S", 0);
     geometry.rows = 15;
     expectPartials("Q4_K", 0);
@@ -148,11 +150,15 @@ TEST(Test__WorkspaceMemoryEstimator, CPUProjectionPanelUsesParticipantAndPhysica
     geometry.workers = 2;
     geometry.serial_n = 128; // Strip eligibility is based on physical N, not the serial policy's width.
     geometry.n = 16;
-    // One AVX-512 strip: the admitted two-worker team cannot select the panel,
-    // but a one-worker team can, so the quote still covers one slot.
-    expectPartials("Q4_K", 8 * (8 + 2) * 16);
-    geometry.n = 17; // A masked tail is the second AVX-512 worker's strip.
-    expectPartials("Q4_K", 2 * 8 * (8 + 2) * 16);
+    // One sixteen-column AVX-512 strip: the admitted two-worker team cannot
+    // select the panel, but a one-worker team can, with one 64-column slot.
+    expectPartials("Q4_K", 8 * (8 + 2) * 64);
+    geometry.n = 17; // A masked tail is the second worker's sixteen-column strip.
+    // Two workers own sixteen-column strips (two slots); one worker owns the
+    // chunk (one wide slot, twice as large), which the quote must cover.
+    expectPartials("Q4_K", std::max(2 * 8 * (8 + 2) * 16, 8 * (8 + 2) * 64));
+    geometry.n = 129; // Three chunks: both widths of the team own whole-chunk strips.
+    expectPartials("Q4_K", 2 * 8 * (8 + 2) * 64);
     geometry.n = 16;
     geometry.execution.active_isa = ISALevel::AVX2; // Same AVX-512 build, narrower runtime strips.
     geometry.execution.maximum_native_row_tile = 2;
@@ -173,8 +179,17 @@ TEST(Test__WorkspaceMemoryEstimator, CPUProjectionPanelUsesParticipantAndPhysica
     const auto sixteen = [](int) { return 16; };
     EXPECT_EQ(panel::workspaceFloats(panel::Format::Q4K, 8, rows, 16, 144, 2, sixteen),
         2u * (8 * (8 + 2) * 8 + 32 * 8)); // 31 carry rows rounded to a cache line.
+    // AVX-512 N=17: two workers own sixteen-column strips, one worker the
+    // whole chunk; each slot carries one partial row per strip column.
     EXPECT_EQ(panel::workspaceFloats(panel::Format::Q4K, 16, rows, 17, 144, 2, sixteen),
-        2u * (8 * (8 + 2) * 16 + rows * 16));
+        std::max(2u * (8 * (8 + 2) * 16 + rows * 16), 1u * (8 * (8 + 2) * 64 + rows * 64)));
+    EXPECT_EQ(panel::workspaceFloats(panel::Format::Q4K, 16, rows, 128, 144, 2, sixteen),
+        2u * (8 * (8 + 2) * 64 + rows * 64));
+    // The strip rule itself: a chunk per worker when every worker can own one.
+    EXPECT_EQ(panel::stripColumns(16, 128, 2), 64);
+    EXPECT_EQ(panel::stripColumns(16, 129, 3), 64);
+    EXPECT_EQ(panel::stripColumns(16, 128, 3), 16);
+    EXPECT_EQ(panel::stripColumns(8, 4096, 1), 8);
 }
 
 /** @test The panel quote covers every team narrower than the admitted width and never shrinks with it. */
@@ -241,11 +256,12 @@ TEST(Test__WorkspaceMemoryEstimator, CPUDownTransformUsesCanonicalShapeAndSerial
                 if (std::string_view(format) == "Q4_K" || std::string_view(format) == "IQ2_S")
                     requirements.buffers.push_back({kCPUProjectionQ8, 31 * ((width + 31) / 32) * sizeof(Q8_1Block), 64});
                 // 2*N*K stays below the 16M-FLOP split threshold, so K is never
-                // partitioned. Only Q4_K has an x86 panel: 31 rows >= 16 and 8
-                // AVX-512 strips >= one worker, every shard has >= 8 K blocks, and
-                // no carry: 8 K blocks x (8 dot + 2 factor) vectors x 16 lanes x 4 B.
+                // partitioned. Only Q4_K has an x86 panel: 31 rows >= 16 and the
+                // one worker owns whole 64-column AVX-512 strips, every shard has
+                // >= 8 K blocks, and no carry:
+                // 8 K blocks x (8 dot + 2 factor) planes x 64 columns x 4 B.
                 if (std::string_view(format) == "Q4_K")
-                    requirements.buffers.push_back({kCPUProjectionPartials, 8 * (8 + 2) * 16 * sizeof(float), 64});
+                    requirements.buffers.push_back({kCPUProjectionPartials, 8 * (8 + 2) * 64 * sizeof(float), 64});
                 EXPECT_EQ(WorkspaceMemoryEstimator::estimate(profile, geometry) - empty,
                     requirements.total_bytes_with_alignment()) << format << " shard=" << shard << '/' << shards;
             }
