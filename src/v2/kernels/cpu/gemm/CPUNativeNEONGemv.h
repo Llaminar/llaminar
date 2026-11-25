@@ -172,15 +172,16 @@ namespace llaminar2::cpu::native_quantised
         { return llaminar::v2::inLexicalWorkshare() ? omp_get_num_threads() : omp_get_max_threads(); }
 
         /**
-         * @brief Decide the ordinary-prefill panel route for one source, row extent and team.
+         * @brief Shared source/team rule of both packed-panel prefill routes.
          * @param w Actual prepared source and arithmetic identity.
-         * @param rows Physical rows of this projection (one expert's rows in a pooled launch).
+         * @param rows Physical rows of this projection.
          * @param workers Width of the team that will execute the projection.
+         * @param minimum_rows The route's measured row domain.
          * @return Whether the projection streams transient packed panels.
          */
-        inline bool usesPackedPrefill(const CPUNativeQuantisedPackedWeights &w, int rows, int workers) noexcept
+        inline bool panelEligible(const CPUNativeQuantisedPackedWeights &w, int rows, int workers, int minimum_rows) noexcept
         {
-            if (rows < neon_panel::min_rows) return false;
+            if (rows < minimum_rows) return false;
             const auto encoding = w.preparedFootprint().encoding;
             if (!neon_panel::supports(encoding, w.codebook_id, w.is_asymmetric)) return false;
             // Parallel Q5_0 loses at deep prefill even with smaller column jobs.
@@ -189,6 +190,28 @@ namespace llaminar2::cpu::native_quantised
             // serialized retained team without rebinding the stage.
             return workers == neon_panel::projectionWorkers(encoding, workers);
         }
+
+        /**
+         * @brief Decide the dense ordinary-prefill panel route for one source, row extent and team.
+         * @param w Actual prepared source and arithmetic identity.
+         * @param rows Physical rows of the projection.
+         * @param workers Width of the team that will execute the projection.
+         * @return Whether the projection streams transient packed panels.
+         */
+        inline bool usesPackedPrefill(const CPUNativeQuantisedPackedWeights &w, int rows, int workers) noexcept
+        { return panelEligible(w, rows, workers, neon_panel::min_rows); }
+
+        /**
+         * @brief Decide the panel route of one ordinary-prefill member of a pooled launch.
+         * @param w Actual prepared source and arithmetic identity.
+         * @param rows The member's own physical rows (one routed expert's rows).
+         * @param workers Width of the team that executes the whole launch.
+         * @return Whether the member streams transient packed panels.
+         * @details Members share one workshare, so the pooled domain starts at
+         * neon_panel::min_pooled_rows rather than the dense domain's min_rows.
+         */
+        inline bool usesPooledPackedPrefill(const CPUNativeQuantisedPackedWeights &w, int rows, int workers) noexcept
+        { return panelEligible(w, rows, workers, neon_panel::min_pooled_rows); }
 
         /** @return Whether this source, row extent and the current/new team use transient packed panels. */
         inline bool usesPackedPrefill(const CPUNativeQuantisedPackedWeights &w, int rows) noexcept
@@ -269,22 +292,32 @@ namespace llaminar2::cpu::native_quantised
         }
     }
 
-    /** @brief Resolve the existing slab's worker-owned packed prefill extent.
+    /** @brief Resolve the slab one dense projection invocation borrows.
      * @param packed Actual source/arithmetic geometry.
      * @param rows Physical invocation row capacity.
-     * @return Zero outside the packed prefill domain; otherwise exact FP32 slab units.
+     * @return Zero outside the dense packed prefill domain; otherwise exact FP32 slab units.
      */
     inline std::size_t nativeQuantisedProjectionPartialFloats(const CPUNativeQuantisedPackedWeights &packed, int rows)
+    {
+        neon_execution::geometry(packed, rows, packed.N);
+        const auto encoding = packed.preparedFootprint().encoding;
+        return neon_panel::invocationFloats(encoding, packed.codebook_id, packed.is_asymmetric, rows, packed.K,
+            neon_panel::projectionWorkers(encoding, neon_execution::packedPrefillWorkers()), packed.numerical_policy);
+    }
+
+    /** @brief This prepared member's contribution to an admitted serial/fused slab.
+     * @param packed Actual source/arithmetic geometry.
+     * @param rows Physical row capacity of the member (or of the declaring stage).
+     * @return Zero outside every panel domain; covers pooled ordinary-prefill members
+     *         from neon_panel::min_pooled_rows rows, matching the stage declaration.
+     */
+    inline std::size_t nativeQuantisedProjectionPartialEnvelopeFloats(const CPUNativeQuantisedPackedWeights &packed, int rows)
     {
         neon_execution::geometry(packed, rows, packed.N);
         const auto encoding = packed.preparedFootprint().encoding;
         return neon_panel::workspaceFloats(encoding, packed.codebook_id, packed.is_asymmetric, rows, packed.K,
             neon_panel::projectionWorkers(encoding, neon_execution::packedPrefillWorkers()), packed.numerical_policy);
     }
-
-    /** @copydoc nativeQuantisedProjectionPartialFloats */
-    inline std::size_t nativeQuantisedProjectionPartialEnvelopeFloats(const CPUNativeQuantisedPackedWeights &packed, int rows)
-    { return nativeQuantisedProjectionPartialFloats(packed, rows); }
 
     /** @brief Execute the canonical native M1 prequantized entrypoint.
      * @param packed Retained prepared source.
@@ -522,13 +555,13 @@ namespace llaminar2::cpu::native_quantised
      * @brief Bounded native fused planning, with no payload reads.
      *
      * Register-tile members need no shared memory. Ordinary-prefill members
-     * (typed Prefill purpose, automatic schedules) whose source and row count
-     * select the packed-panel route of a dense prefill projection take the
-     * same route here: each decodes a weight panel once per four-column strip
-     * into a worker slot of the invocation's admitted projection slab and
-     * reuses it for all of the member's rows. Every panel member of one launch
-     * uses one uniform slot stride, so concurrently running members never
-     * share a slot.
+     * (typed Prefill purpose, automatic schedules) whose source admits the
+     * dense prefill route's packed panels take that program here from two
+     * rows up (neon_panel::min_pooled_rows): each decodes a weight panel once
+     * per four-column strip into a worker slot of the invocation's admitted
+     * projection slab and reuses it for all of the member's rows. Every panel
+     * member of one launch uses one uniform slot stride, so concurrently
+     * running members never share a slot.
      */
     struct NativeQuantisedFusedRowsPlan
     {
@@ -593,13 +626,13 @@ namespace llaminar2::cpu::native_quantised
                 throw std::invalid_argument("Native ARM fused members require the same physical K width");
             blocks = d.packed->blocks_per_row;
             if (d.policy_n == 0) (void)cpuNativeQuantisedSerialEquivalentPolicyN(d.N);
-            // An ordinary-prefill member is scheduled exactly as the dense
-            // prefill entry schedules the same projection: automatic selection
-            // takes the packed-panel route whenever its source, rows and team
-            // admit it. Decode/MTP purposes and explicit candidates keep tiles.
+            // An ordinary-prefill member takes the dense prefill entry's
+            // packed-panel program whenever its source, rows and team admit it
+            // (pooled domain: two rows up, see neon_panel::min_pooled_rows).
+            // Decode/MTP purposes and explicit candidates keep tiles.
             plan.panels[p] = d.purpose == ProjectionRowsPurpose::Prefill &&
                 d.verifier_schedule == VerifierRowsPolicy::Auto && d.decode_schedule == DecodeSchedulePolicy::Auto &&
-                neon_execution::usesPackedPrefill(*d.packed, plan.rows[p], workers);
+                neon_execution::usesPooledPackedPrefill(*d.packed, plan.rows[p], workers);
             if (plan.panels[p])
             {
                 // The panel consumes row pairs over whole 64-column chunks.

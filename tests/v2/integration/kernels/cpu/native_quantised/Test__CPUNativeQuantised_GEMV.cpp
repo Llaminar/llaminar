@@ -1489,15 +1489,16 @@ namespace
                 const auto decode = planNativeQuantisedFusedRows({&descriptor, 1}, rows, 7);
 #if defined(__aarch64__)
                 // ARM register tiles follow only the verifier schedule. An ordinary
-                // Prefill member takes the dense prefill route instead: when its
+                // Prefill member takes the prefill panel program instead: when its
                 // source and rows admit packed panels it streams them from the
                 // admitted slab (decode once per weight strip for all rows). An
                 // equally large MTP batch never acquires that prompt scheduling.
                 descriptor.purpose = ProjectionRowsPurpose::Prefill;
                 const auto prefill = planNativeQuantisedFusedRows({&descriptor, 1}, rows, 7);
-                const bool panel = llaminar2::cpu::native_quantised::neon_execution::usesPackedPrefill(packed, rows, 7);
+                const bool panel = llaminar2::cpu::native_quantised::neon_execution::usesPooledPackedPrefill(packed, rows, 7);
                 // Seven workers: only the measured parallel panel sources qualify (Q5_0 serializes).
-                EXPECT_EQ(panel, rows >= 16 && (std::string(format.label) == "Q5_K" || std::string(format.label) == "IQ3_S"));
+                EXPECT_EQ(panel, rows >= llaminar2::cpu::native_quantised::neon_panel::min_pooled_rows &&
+                    (std::string(format.label) == "Q5_K" || std::string(format.label) == "IQ3_S"));
                 EXPECT_EQ(prefill.panels[0], panel);
                 EXPECT_EQ(prefill.tiles[0], panel ? NEONProjectionRowTile::Pair : decode.tiles[0]);
                 EXPECT_EQ(prefill.sharedPartialFloats(), panel

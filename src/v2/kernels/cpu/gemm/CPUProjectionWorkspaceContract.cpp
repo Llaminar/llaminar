@@ -57,8 +57,10 @@ namespace llaminar2
                 (geometry.numerical_policy == CPUProjectionNumericalPolicy::GPUAlignedExpert && geometry.k % 32 != 0))
                 throw std::invalid_argument("Native ARM projection workspace requires a supported source and complete expert K blocks");
             auto requirements = cpuProjectionQ8WorkspaceRequirements(geometry.rows, geometry.k);
-            // Decode retains its register-only contract. The prefill panel is
-            // a worker-indexed borrow of the existing named projection slab.
+            // Single-row decode retains its register-only contract. The prefill
+            // panel is a worker-indexed borrow of the existing named projection
+            // slab, admitted from the pooled expert-prefill domain (two rows)
+            // because this declaration does not know the invocation's purpose.
             namespace panel_policy = cpu::native_quantised::neon_panel;
             const auto panel = cpuProjectionPartialWorkspaceRequirements(panel_policy::workspaceFloats(
                 footprint.encoding, codebook, footprint.is_asymmetric, geometry.rows, geometry.k,

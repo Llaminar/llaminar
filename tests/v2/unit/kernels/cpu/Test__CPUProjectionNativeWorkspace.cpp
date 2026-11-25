@@ -33,7 +33,7 @@ TEST(CPUProjectionNativeWorkspace, CompilerRuntimePairsAreArchitectureExact)
         }
 }
 
-/** @test Short row tiles use the native Q8-only workspace authority for every source. */
+/** @test Single-row register tiles use the native Q8-only workspace authority for every source. */
 TEST(CPUProjectionNativeWorkspace, NativeRegisterTreesNeverReserveX86SharedPartials)
 {
     constexpr CPUExecutionGeometry native{.maximum_native_row_tile = 4,
@@ -44,13 +44,14 @@ TEST(CPUProjectionNativeWorkspace, NativeRegisterTreesNeverReserveX86SharedParti
     for (const auto &source : native_quantised_formats::kAllSourceFormats)
         for (const auto policy : {CPUProjectionNumericalPolicy::BackendNative, CPUProjectionNumericalPolicy::GPUAlignedExpert})
         {
-            CPUProjectionWorkspaceGeometry geometry{.rows = 15, .n = 65, .k = 1056, .workers = 10,
+            // One row is below every panel domain (pooled prefill starts at two).
+            CPUProjectionWorkspaceGeometry geometry{.rows = 1, .n = 65, .k = 1056, .workers = 10,
                 .execution = native, .numerical_policy = policy};
             const auto footprint = cpu::native_quantised::preparedFootprintForFormat(*source.metadata);
             const auto requirements = CPUProjectionWorkspaceContract::prepared(footprint, source.metadata->codebook_id, geometry);
             ASSERT_EQ(requirements.buffers.size(), 1u);
             EXPECT_EQ(requirements.buffers[0].name, kCPUProjectionQ8);
-            EXPECT_EQ(requirements.buffers[0].size_bytes, 15u * 33 * sizeof(Q8_1Block));
+            EXPECT_EQ(requirements.buffers[0].size_bytes, 33u * sizeof(Q8_1Block));
             auto unrelated = geometry;
             unrelated.execution.cache = kSyntheticCPUExecutionGeometry.cache;
             const auto same = CPUProjectionWorkspaceContract::prepared(footprint, source.metadata->codebook_id, unrelated);
@@ -59,14 +60,17 @@ TEST(CPUProjectionNativeWorkspace, NativeRegisterTreesNeverReserveX86SharedParti
         }
 }
 
-/** @test A remote ARM executor gets a panel per worker only in the supported prefill domain. */
+/** @test A remote ARM executor gets a panel per worker only in the supported prefill domain.
+ * @details The declaration is purpose-agnostic, so it starts at the pooled
+ * expert-prefill domain (two rows), below the dense domain (sixteen rows).
+ */
 TEST(CPUProjectionNativeWorkspace, PrefillWorkerPanelsAreChargedToTheNamedSlab)
 {
     constexpr CPUExecutionGeometry native{.maximum_native_row_tile = 4,
         .projection_abi = CPUProjectionScheduleABI::ARMRegisterK,
         .compiled_isa = ISALevel::NEONDotProd, .active_isa = ISALevel::NEONDotProd};
     for (const auto format : {"IQ3_S", "Q5_K", "Q5_0", "Q5_1", "Q8_0"})
-        for (int rows : {15, 16, 19})
+        for (int rows : {1, 2, 15, 16, 19})
             for (int k : {512, 8224})
                 for (auto policy : {CPUProjectionNumericalPolicy::BackendNative, CPUProjectionNumericalPolicy::GPUAlignedExpert})
                 {
@@ -85,7 +89,7 @@ TEST(CPUProjectionNativeWorkspace, PrefillWorkerPanelsAreChargedToTheNamedSlab)
                         EXPECT_EQ(asimd.buffers[i].size_bytes, requirements.buffers[i].size_bytes);
                     }
                     const std::string_view type = format;
-                    const bool packed = rows >= 16 && (type == "IQ3_S" || type == "Q5_K" || type == "Q5_0");
+                    const bool packed = rows >= 2 && (type == "IQ3_S" || type == "Q5_K" || type == "Q5_0");
                     ASSERT_EQ(requirements.buffers.size(), packed ? 2u : 1u);
                     EXPECT_EQ(requirements.buffers[0].size_bytes, std::size_t(rows * (k / 32)) * sizeof(Q8_1Block));
                     if (!packed) continue;

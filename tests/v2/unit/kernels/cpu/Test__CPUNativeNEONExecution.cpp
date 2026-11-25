@@ -395,11 +395,11 @@ TEST_F(CPUNativeNEONExecution, FusedPrefillMembersStreamPanelsAndRetainSerialByt
                     std::size_t demand = 0;
                     for (int p = 0; p < members; ++p)
                     {
-                        EXPECT_EQ(plan.panels[p], supported && member_rows[p] >= neon_panel::min_rows) << p;
+                        EXPECT_EQ(plan.panels[p], supported && member_rows[p] >= neon_panel::min_pooled_rows) << p;
                         if (plan.panels[p])
-                            demand = std::max(demand, nativeQuantisedProjectionPartialFloats(packed[p], member_rows[p]));
+                            demand = std::max(demand, nativeQuantisedProjectionPartialEnvelopeFloats(packed[p], member_rows[p]));
                     }
-                    // The launch borrows exactly what the stage's admitted slab declares.
+                    // The launch borrows exactly its members' admitted slab envelope.
                     EXPECT_EQ(plan.sharedPartialFloats(), demand);
                     const auto reset = [&] { for (auto &bank : actual) std::fill(bank.begin(), bank.end(), 123456.0f); };
                     const auto check = [&] { for (int p = 0; p < members; ++p) bytes(actual[p], expected[p]); };

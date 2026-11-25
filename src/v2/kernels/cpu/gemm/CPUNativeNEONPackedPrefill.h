@@ -56,7 +56,7 @@ namespace llaminar2::cpu::native_quantised
         {
             const auto &w = batch.weights_;
             const auto slot = neon_panel::workerFloats(rowsOf(batch), w.K, w.numerical_policy);
-            admit(batch, scratch, workers, slot);
+            admit(batch, scratch, workers, slot, neon_panel::min_rows);
             return {batch, scratch.data(), slot, workers};
         }
 
@@ -74,7 +74,7 @@ namespace llaminar2::cpu::native_quantised
         static CPUNativeNEONPackedPrefill bindPooled(const CPUNativeNEONProjectionBatch &batch,
             std::span<float> scratch, int workers, std::size_t slot_floats)
         {
-            admit(batch, scratch, workers, slot_floats);
+            admit(batch, scratch, workers, slot_floats, neon_panel::min_pooled_rows);
             return {batch, scratch.data(), slot_floats, workers};
         }
 
@@ -143,15 +143,16 @@ namespace llaminar2::cpu::native_quantised
          * @param scratch Slab whose first workers*slot_floats floats this binding may write.
          * @param workers Positive admitted slot count.
          * @param slot_floats Slot stride, at least this binding's own worker demand.
+         * @param minimum_rows The route's measured panel domain: dense or pooled prefill.
          * @throws std::invalid_argument For any ineligible, short, misaligned or aliasing input.
          */
         static void admit(const CPUNativeNEONProjectionBatch &batch, std::span<float> scratch, int workers,
-            std::size_t slot_floats)
+            std::size_t slot_floats, int minimum_rows)
         {
             const auto &w = batch.weights_;
             const int rows = rowsOf(batch);
             if (workers <= 0 || !neon_panel::supports(w.encoding, w.codebook_id, w.is_asymmetric) ||
-                rows < neon_panel::min_rows || slot_floats < neon_panel::workerFloats(rows, w.K, w.numerical_policy) ||
+                rows < minimum_rows || slot_floats < neon_panel::workerFloats(rows, w.K, w.numerical_policy) ||
                 slot_floats % neon_panel::line_floats)
                 throw std::invalid_argument("Native NEON prefill requires eligible retained panel geometry");
             if (slot_floats > std::numeric_limits<std::size_t>::max() / sizeof(float) / std::size_t(workers))
