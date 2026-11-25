@@ -815,8 +815,14 @@ namespace llaminar2
                                                        : nullptr;
                      if (stream_observer) stream_observer(req, streamed_response_body);
                      auto stream_request = std::move(*parsed_request);
-                     auto channel = std::make_shared<SSEPublishChannel>(
-                         SSEPublishChannelBudget::forRequest(stream_request.max_tokens));
+                     // The queued SSE bytes of one response are bounded by the
+                     // per-response budget the PMA serving pool committed: a
+                     // slow reader blocks its own producer (and so its grants),
+                     // never other requests and never unpriced memory.
+                     auto budget = SSEPublishChannelBudget::forRequest(stream_request.max_tokens);
+                     budget.max_buffered_bytes =
+                         static_cast<std::size_t>(ServingPoolPerResponseBudget::defaultPolicy().bytes_per_response);
+                     auto channel = std::make_shared<SSEPublishChannel>(budget);
                      auto transport_open = std::make_shared<std::atomic<bool>>(true);
                      // The producer runs the handler; the provider thread is the
                      // only socket writer. Closing the channel or the transport
