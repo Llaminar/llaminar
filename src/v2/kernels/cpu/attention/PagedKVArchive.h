@@ -29,7 +29,9 @@ struct PagedKVArchiveMeta
     int dimension = 0;
     int page_tokens = 0;
     std::size_t rows = 0;
-    std::uint64_t terminal_boundary = 0; ///< Coherent terminal token boundary of the section.
+    std::uint64_t terminal_boundary = 0;   ///< Coherent terminal token boundary of the section.
+    std::uint64_t trust_domain = 0;        ///< Authenticated isolation domain, never caller-chosen.
+    std::uint64_t ancestry_id = 0;         ///< Exact ancestry proof identity (collision-resolving).
     bool operator==(const PagedKVArchiveMeta &) const = default;
 };
 

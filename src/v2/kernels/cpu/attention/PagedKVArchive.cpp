@@ -21,7 +21,7 @@ namespace
 constexpr std::uint64_t kArchiveMagic = 0x4C4B564450474156ULL; // "LKVDPGAV" in memory order.
 constexpr std::size_t kHeaderBytes =
     sizeof(std::uint64_t) + sizeof(std::uint32_t) + sizeof(std::uint32_t) +
-    sizeof(std::int32_t) * 3 + sizeof(std::uint64_t) * 2;
+    sizeof(std::int32_t) * 3 + sizeof(std::uint64_t) * 4;
 constexpr std::size_t kMaxBytes = 1ull << 32; // Hard bound for one decodable section.
 
 std::uint32_t familyCode(KVCacheFamily family)
@@ -73,6 +73,8 @@ PagedKVArchive PagedKVArchive::fromView(const CPUFP32PagedKVView &view)
         .page_tokens = view.pages().empty() ? 0 : view.rows(),
         .rows = static_cast<std::size_t>(view.rows()),
         .terminal_boundary = static_cast<std::uint64_t>(view.rows()),
+        .trust_domain = 0,      ///< Set by the exporting authority at publish.
+        .ancestry_id = 0,
     };
     if (view.pages().empty())
         return PagedKVArchive(meta, {});
@@ -122,6 +124,8 @@ PagedKVArchive PagedKVArchive::parse(std::span<const std::byte> bytes)
         .page_tokens = readI32(),
         .rows = readU64(),
         .terminal_boundary = readU64(),
+        .trust_domain = readU64(),
+        .ancestry_id = readU64(),
     };
     if (meta.heads <= 0 || meta.dimension <= 0 || meta.page_tokens <= 0 ||
         meta.rows > std::numeric_limits<std::size_t>::max() / sizeof(float) / 2 ||
@@ -219,6 +223,8 @@ std::vector<std::byte> PagedKVArchive::serialize() const
     const std::int32_t page_tokens = meta_.page_tokens;
     const std::uint64_t rows = meta_.rows;
     const std::uint64_t terminal = meta_.terminal_boundary;
+    const std::uint64_t trust = meta_.trust_domain;
+    const std::uint64_t ancestry = meta_.ancestry_id;
     appendRaw(&magic, sizeof(magic));
     appendRaw(&family, sizeof(family));
     appendRaw(&format, sizeof(format));
@@ -227,6 +233,8 @@ std::vector<std::byte> PagedKVArchive::serialize() const
     appendRaw(&page_tokens, sizeof(page_tokens));
     appendRaw(&rows, sizeof(rows));
     appendRaw(&terminal, sizeof(terminal));
+    appendRaw(&trust, sizeof(trust));
+    appendRaw(&ancestry, sizeof(ancestry));
     appendRaw(payload_.data(), payload_.size());
     return output;
 }

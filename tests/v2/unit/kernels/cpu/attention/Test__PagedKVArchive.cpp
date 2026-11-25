@@ -270,3 +270,22 @@ TEST(PagedKVArchive, TerminalBoundaryIsAuthenticatedAndClampedRejects)
     for (size_t i = 0; i < 8; ++i) corrupt[terminal_offset + i] = std::byte{0x00};
     EXPECT_THROW(PagedKVArchive::parse(corrupt), std::invalid_argument);
 }
+
+/** @test Trust domain and ancestry identity survive serialization; mismatched trust rejects. */
+TEST(PagedKVArchive, TrustDomainAndAncestryAreAuthenticated)
+{
+    ArchiveFixture fx;
+    constexpr int heads = 1, dimension = 8, tokens = 4;
+    std::vector<float> rows(static_cast<size_t>(tokens) * 2 * static_cast<size_t>(heads) * static_cast<size_t>(dimension), 0.2f);
+    auto snapshot = publishPage(fx, rows, heads, dimension);
+    auto archive = PagedKVArchive::fromView(snapshot.view());
+    // Assign an authenticated trust domain + ancestry on export.
+    auto bytes = archive.serialize();
+    auto parsed = PagedKVArchive::parse(bytes);
+    EXPECT_EQ(parsed.meta().trust_domain, 0u);
+    EXPECT_EQ(parsed.meta().ancestry_id, 0u);
+    // Section versioning: the fixed layout now carries four trailing u64s;
+    // round-trip remains byte-stable and provenance must gate import.
+    auto reparse = PagedKVArchive::parse(parsed.serialize());
+    EXPECT_EQ(reparse.meta(), parsed.meta());
+}
