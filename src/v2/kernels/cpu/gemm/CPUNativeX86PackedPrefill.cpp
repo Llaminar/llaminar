@@ -13,7 +13,7 @@
  * kernels, one broadcast and one per-row scale/correction per four dots)
  * whenever every worker owns one, else sixteen columns four rows at a time.
  *
- * GPU-aligned partitioned trees whose partitions fit one panel pack whole
+ * GPU-aligned partitioned trees of complete strips whose partitions fit one panel pack whole
  * partitions and fold them in registers (consumeOrdered / consumeWideOrdered)
  * with the serial tree's exact ordered operations. Pooled members of the batched
  * expert route run the same strips as one task per 64-column chunk on the
@@ -480,19 +480,31 @@ namespace llaminar2::cpu::native_quantised::x86_panel
             }
         }
         /**
+         * @brief Scalar geometry of one register-folded panel, passed in two registers.
+         * @details Sixteen bytes of integers travel in two general registers
+         * (SysV x86-64), so the folded leaves take five register arguments and
+         * no outgoing stack argument.
+         */
+        struct PanelFold
+        {
+            int width;      ///< Blocks per arithmetic partition (the last partition of K may be shorter).
+            int n;          ///< K blocks in this panel; whole partitions' blocks.
+            int first;      ///< Nonzero when this panel starts with partition 0 of the serial tree.
+            int empty_tail; ///< Empty trailing partitions folded after the last nonempty one (last panel only).
+        };
+        static_assert(sizeof(PanelFold) == 16);
+
+        /**
          * @brief Consume whole GPU-aligned arithmetic partitions of one panel and fold them in registers.
          * @tparam Lanes Physical SIMD columns per row.
          * @tparam CB File-density source decoder that wrote the panel.
          * @tparam Rows Independently accumulated rows: one or two (AVX2), up to four (AVX-512).
          * @tparam P Original FP32 block and partition policy.
          * @param p Worker-local panel holding the blocks of consecutive whole partitions.
-         * @param width Blocks per arithmetic partition (the last partition of K may be shorter).
-         * @param n K blocks in this panel; a positive count of whole partitions' blocks.
+         * @param fold Partition width, panel blocks, first-panel flag and empty trailing partitions.
          * @param a First activation block of each row's panel interval.
-         * @param out Live destinations; they hold the folded total of every earlier panel.
-         * @param live Valid output lanes in each destination.
-         * @param first Whether this panel starts with partition 0 of the serial tree.
-         * @param empty_tail Empty trailing partitions folded after the last nonempty one (last panel only).
+         * @param out Destinations of complete strips (every lane live); they hold the
+         *        folded total of every earlier panel.
          * @details The serial M=1 tree forms every partition from +0, seeds the
          * total with partition 0, then folds each later partition and each
          * empty trailing partition (+0) as total + partial. consume() ran that
@@ -500,14 +512,17 @@ namespace llaminar2::cpu::native_quantised::x86_panel
          * partition; here each partition is formed in registers and folded at
          * once, with the identical operations, operands and order. The total
          * is published once per panel, and a later panel resumes from that
-         * FP32 value, which round-trips exactly. Lanes beyond @p live never
-         * reach memory, and every operation is lane-wise.
+         * FP32 value, which round-trips exactly. Only complete strips take
+         * this leaf: an N-tail strip keeps consume(), so no tail count or lane
+         * mask is live here (it was reloaded from the stack in the epilogue).
          */
         template <int Lanes, int CB, int Rows, Policy P>
         [[gnu::noinline]]
-        void consumeOrdered(const float *p, int width, int n, const std::array<const Q8_1Block *, Rows> &a,
-                            const std::array<float *, Rows> &out, int live, bool first, int empty_tail)
+        void consumeOrdered(const float *p, PanelFold fold_geometry, const std::array<const Q8_1Block *, Rows> &a,
+                            const std::array<float *, Rows> &out)
         {
+            const int width = fold_geometry.width, n = fold_geometry.n, empty_tail = fold_geometry.empty_tail;
+            bool first = fold_geometry.first != 0;
             static_assert(P == Policy::GPUAlignedExpert, "Only operand-ordered folds may move into registers");
             using F = typename multi_scale::SIMD<Lanes>::F;
             constexpr int stride = blockFloats(static_cast<Format>(CB), Lanes);
@@ -515,7 +530,7 @@ namespace llaminar2::cpu::native_quantised::x86_panel
 #pragma GCC unroll 4
             for (int r = 0; r < Rows; ++r)
                 if (!first)
-                    total[r] = loadOutput<Lanes>(out[r], live);
+                    total[r] = multi_scale::load<F>(out[r]);
             for (int i = 0; i < n;)
             {
                 const int end = std::min(n, i + width);
@@ -533,7 +548,7 @@ namespace llaminar2::cpu::native_quantised::x86_panel
                     total[r] = fold<Lanes, P>(total[r], F{});
 #pragma GCC unroll 4
             for (int r = 0; r < Rows; ++r)
-                writeOutput<Lanes>(out[r], live, total[r]);
+                std::memcpy(out[r], &total[r], sizeof(F));
         }
 #if defined(__AVX512VNNI__)
         /**
@@ -718,31 +733,29 @@ namespace llaminar2::cpu::native_quantised::x86_panel
          * @tparam Rows One or two rows sharing every panel vector.
          * @tparam P Original FP32 block and partition policy.
          * @tparam Single Whether every partition is one block (width == 1, GPU-aligned K <= 512).
-         * @param p,width,n,a,out,live,first,empty_tail As consumeOrdered().
+         * @param p,fold_geometry,a,out As consumeOrdered(): a complete 64-column strip.
          * @details consumeWideBlock()'s exact block program; partitions start
          * from +0, partition 0 seeds the total, later and empty trailing
          * partitions fold as total + partial in increasing order.
          */
         template <int CB, int Rows, Policy P, bool Single>
         [[gnu::noinline]]
-        void consumeWideOrdered(const float *p, int width, int n, const std::array<const Q8_1Block *, Rows> &a,
-                                const std::array<float *, Rows> &out, int live, bool first, int empty_tail)
+        void consumeWideOrdered(const float *p, PanelFold fold_geometry, const std::array<const Q8_1Block *, Rows> &a,
+                                const std::array<float *, Rows> &out)
         {
+            const int width = fold_geometry.width, n = fold_geometry.n, empty_tail = fold_geometry.empty_tail;
+            bool first = fold_geometry.first != 0;
             static_assert(P == Policy::GPUAlignedExpert, "Only operand-ordered folds may move into registers");
             constexpr int Lanes = 16, Subs = wide_strip / Lanes;
             using F = typename multi_scale::SIMD<Lanes>::F;
             constexpr int stride = blockFloats(static_cast<Format>(CB), wide_strip);
-            int lives[Subs];
-#pragma GCC unroll 4
-            for (int s = 0; s < Subs; ++s)
-                lives[s] = std::clamp(live - s * Lanes, 0, Lanes);
             F total[Rows][Subs]{};
 #pragma GCC unroll 2
             for (int r = 0; r < Rows; ++r)
 #pragma GCC unroll 4
                 for (int s = 0; s < Subs; ++s)
                     if (!first)
-                        total[r][s] = loadOutput<Lanes>(out[r] + s * Lanes, lives[s]);
+                        total[r][s] = multi_scale::load<F>(out[r] + s * Lanes);
             for (int i = 0; i < n;)
             {
                 // A one-block partition (Single) is folded as soon as it is
@@ -769,7 +782,7 @@ namespace llaminar2::cpu::native_quantised::x86_panel
             for (int r = 0; r < Rows; ++r)
 #pragma GCC unroll 4
                 for (int s = 0; s < Subs; ++s)
-                    writeOutput<Lanes>(out[r] + s * Lanes, lives[s], total[r][s]);
+                    std::memcpy(out[r] + s * Lanes, &total[r][s], sizeof(F));
         }
 #endif
 
@@ -812,32 +825,40 @@ namespace llaminar2::cpu::native_quantised::x86_panel
             }
         }
 
+        /** @return Whether a strip takes the register-folded GPU-aligned program (stripeOrdered()). */
+        template <int Strip, Policy P>
+        inline bool foldsInRegisters(const CPUNativeQuantisedWeightView &w, int n, int parts) noexcept
+        {
+            // Only the GPU-aligned tree has an operand-ordered fold
+            // (addOrdered*), so only it may move its folds into registers and
+            // keep every byte, NaN payloads included; a backend-native fold is
+            // a plain FP32 add whose NaN operand the compiler chooses. Only
+            // complete strips: an N-tail strip keeps stripe()'s per-partition
+            // program, whose masked tail publication is unchanged.
+            const int width = (w.blocks_per_row - 1) / parts + 1;
+            return P == Policy::GPUAlignedExpert && parts > 1 && width <= depth && w.N - n >= Strip;
+        }
+
         /**
-         * @brief Own one original N strip across all live rows and the complete K tree.
-         * @tparam Lanes Physical SIMD columns per row.
-         * @tparam CB Admitted source decoder.
-         * @tparam P Original FP32 block and partition policy.
-         * @param w Admitted weight view.
-         * @param a,c Original row-major input and output roots.
-         * @param ldc Original output row stride.
-         * @param n First original N coordinate in this strip.
-         * @param parts Exact serial K partition count.
-         * @param grid Read-only live row ownership, including request boundaries.
-         * @param panel,carry Exclusive worker slot (carry present only when needed).
-         *
-         * GPU-aligned trees whose partitions fit one panel (at most @ref depth
-         * blocks each: every expert tree up to K = 4096) pack as many whole
-         * partitions as fit and fold them in registers (consumeOrdered);
-         * deeper partitions, backend-native trees and contiguous K keep the
-         * per-partition program with its carry.
+         * @brief stripe() for GPU-aligned trees whose partitions fit one panel, on a complete strip.
+         * @tparam Lanes,Strip,CB,P As stripe(); P is GPU-aligned and foldsInRegisters() holds.
+         * @param w,a,c,ldc,n,parts,grid,panel As stripe(); no carry is needed.
+         * @details Packs as many whole partitions as fit one panel and folds
+         * them in registers (consumeOrdered / consumeWideOrdered) with the
+         * serial tree's exact ordered operations. A separate function, so that
+         * stripe()'s per-partition program and its frame stay those of
+         * 67dac67f7. Its loop control is scalar: superword vectorization of
+         * the per-row-tile pointer arrays only moved pointers through vector
+         * registers and stack slots (no arithmetic is affected).
          */
         template <int Lanes, int Strip, int CB, Policy P>
-        void stripe(const CPUNativeQuantisedWeightView &w, const Q8_1Block *a, float *c, int ldc, int n, int parts,
-                    const CPUProjectionRowGrid &grid, float *panel, float *carry)
+        [[gnu::noinline, gnu::optimize("no-tree-slp-vectorize")]]
+        void stripeOrdered(const CPUNativeQuantisedWeightView &w, const Q8_1Block *a, float *c, int ldc, int n,
+                           int parts, const CPUProjectionRowGrid &grid, float *panel)
         {
             constexpr int Subs = Strip / Lanes;
             static_assert(Subs == 1 || (Lanes == 16 && Strip == wide_strip));
-            const int live = std::min(Strip, w.N - n);
+            static_assert(P == Policy::GPUAlignedExpert);
             const int blocks = w.blocks_per_row;
             const int width = (blocks - 1) / parts + 1;
             // A wide strip is one whole chunk: decode its four sixteen-column
@@ -852,64 +873,78 @@ namespace llaminar2::cpu::native_quantised::x86_panel
                     pack<Lanes, Subs, 3, CB>(w, n / 64, 3 * Lanes, begin, next, panel);
                 }
             };
-            // Only the GPU-aligned tree has an operand-ordered fold
-            // (addOrdered*), so only it may move its folds into registers and
-            // keep every byte, NaN payloads included. A backend-native fold is
-            // a plain FP32 add whose NaN operand order the compiler chooses;
-            // it keeps the per-partition program below unchanged.
-            if constexpr (P == Policy::GPUAlignedExpert)
-            if (parts > 1 && width <= depth)
+            // Partitions [0, nonempty) hold blocks; the remaining ones are
+            // empty and fold +0 after the last nonempty partition.
+            const int per_panel = depth / width, nonempty = (blocks - 1) / width + 1;
+            for (int first = 0; first < nonempty; first += per_panel)
             {
-                // Partitions [0, nonempty) hold blocks; the remaining ones are
-                // empty and fold +0 after the last nonempty partition.
-                const int per_panel = depth / width, nonempty = (blocks - 1) / width + 1;
-                for (int first = 0; first < nonempty; first += per_panel)
+                const int last = std::min(nonempty, first + per_panel);
+                const int begin = first * width, next = std::min(last * width, blocks);
+                const int empty_tail = last == nonempty ? parts - nonempty : 0;
+                packPanel(begin, next);
+                const auto consumeTiles = [&]<int TileRows, bool Single>()
                 {
-                    const int last = std::min(nonempty, first + per_panel);
-                    const int begin = first * width, next = std::min(last * width, blocks);
-                    const int empty_tail = last == nonempty ? parts - nonempty : 0;
-                    packPanel(begin, next);
-                    const auto consumeTiles = [&]<int TileRows, bool Single>()
+                    eachRowTile<TileRows>(grid, [&]<int Rows>(int row)
                     {
-                        eachRowTile<TileRows>(grid, [&]<int Rows>(int row)
+                        std::array<const Q8_1Block *, Rows> in{};
+                        std::array<float *, Rows> out{};
+                        for (int r = 0; r < Rows; ++r)
                         {
-                            std::array<const Q8_1Block *, Rows> in{};
-                            std::array<float *, Rows> out{};
-                            for (int r = 0; r < Rows; ++r)
-                            {
-                                out[r] = c + std::size_t(row + r) * ldc + n;
-                                in[r] = a + std::size_t(row + r) * blocks + begin;
-                            }
+                            out[r] = c + std::size_t(row + r) * ldc + n;
+                            in[r] = a + std::size_t(row + r) * blocks + begin;
+                        }
 #if defined(__AVX512VNNI__)
-                            if constexpr (Subs == 4)
-                                consumeWideOrdered<CB, Rows, P, Single>(panel, width, next - begin, in, out, live,
-                                                                        first == 0, empty_tail);
-                            else
-#endif
-                                consumeOrdered<Lanes, CB, Rows, P>(panel, width, next - begin, in, out, live,
-                                                                   first == 0, empty_tail);
-                        });
-                    };
-                    constexpr int tile_rows = rowTile(Strip);
-                    if constexpr (Subs == 4)
-                    {
-                        // Wide strips keep eight folded totals besides the
-                        // partials. The Q5_0 sum and the affine minimum need
-                        // more temporaries than the nibble/grid corrections,
-                        // so their multi-block partitions run one row per
-                        // tile to stay within 32 vector registers; one-block
-                        // partitions fold at once and keep two rows.
-                        constexpr bool light = CB == 4 || CB == 11;
-                        if (width == 1)
-                            consumeTiles.template operator()<tile_rows, true>();
+                        if constexpr (Subs == 4)
+                            consumeWideOrdered<CB, Rows, P, Single>(panel, {width, next - begin, first == 0, empty_tail},
+                                                                    in, out);
                         else
-                            consumeTiles.template operator()<light ? tile_rows : 1, false>();
-                    }
+#endif
+                            consumeOrdered<Lanes, CB, Rows, P>(panel, {width, next - begin, first == 0, empty_tail}, in,
+                                                               out);
+                    });
+                };
+                // The tile height is panelRowTile(), which the launch evidence reports.
+                constexpr int tile_rows = rowTile(Strip);
+                if constexpr (Subs == 4)
+                {
+                    constexpr bool split = wideOrderedSplitsRows(static_cast<Format>(CB));
+                    if (width == 1)
+                        consumeTiles.template operator()<tile_rows, true>();
                     else
-                        consumeTiles.template operator()<tile_rows, false>();
+                        consumeTiles.template operator()<split ? 1 : tile_rows, false>();
                 }
-                return;
+                else
+                    consumeTiles.template operator()<tile_rows, false>();
             }
+        }
+
+        /**
+         * @brief Own one original N strip across all live rows and the complete K tree.
+         * @tparam Lanes Physical SIMD columns per row.
+         * @tparam CB Admitted source decoder.
+         * @tparam P Original FP32 block and partition policy.
+         * @param w Admitted weight view.
+         * @param a,c Original row-major input and output roots.
+         * @param ldc Original output row stride.
+         * @param n First original N coordinate in this strip.
+         * @param parts Exact serial K partition count.
+         * @param grid Read-only live row ownership, including request boundaries.
+         * @param panel,carry Exclusive worker slot (carry present only when needed).
+         *
+         * The per-partition program of 67dac67f7, unchanged. Callers route
+         * complete strips of GPU-aligned trees whose partitions fit one panel
+         * (at most @ref depth blocks each: every expert tree up to K = 4096) to
+         * stripeOrdered() instead (foldsInRegisters()).
+         */
+        template <int Lanes, int Strip, int CB, Policy P>
+        void stripe(const CPUNativeQuantisedWeightView &w, const Q8_1Block *a, float *c, int ldc, int n, int parts,
+                    const CPUProjectionRowGrid &grid, float *panel, float *carry)
+        {
+            constexpr int Subs = Strip / Lanes;
+            static_assert(Subs == 1 || (Lanes == 16 && Strip == wide_strip));
+            const int live = std::min(Strip, w.N - n);
+            const int blocks = w.blocks_per_row;
+            const int width = (blocks - 1) / parts + 1;
             for (int kpart = 0; kpart < parts; ++kpart)
             {
                 const int first = static_cast<int>(std::min(std::int64_t(kpart) * width, std::int64_t(blocks))),
@@ -918,8 +953,18 @@ namespace llaminar2::cpu::native_quantised::x86_panel
                 {
                     const int next = std::min(end, begin + depth);
                     if (next > begin)
-                        packPanel(begin, next);
-                    eachRowTile<rowTile(Strip)>(grid, [&]<int Rows>(int row)
+                    {
+                        // A wide strip is one whole chunk: decode its four
+                        // sixteen-column vectors into their interleaved planes.
+                        pack<Lanes, Subs, 0, CB>(w, n / 64, n % 64, begin, next, panel);
+                        if constexpr (Subs == 4)
+                        {
+                            pack<Lanes, Subs, 1, CB>(w, n / 64, Lanes, begin, next, panel);
+                            pack<Lanes, Subs, 2, CB>(w, n / 64, 2 * Lanes, begin, next, panel);
+                            pack<Lanes, Subs, 3, CB>(w, n / 64, 3 * Lanes, begin, next, panel);
+                        }
+                    }
+                    auto update = [&]<int Rows>(int row)
                     {
                         std::array<const Q8_1Block *, Rows> in{};
                         std::array<float *, Rows> out{}, partial{};
@@ -938,7 +983,34 @@ namespace llaminar2::cpu::native_quantised::x86_panel
 #endif
                             consume<Lanes, CB, Rows, P>(panel, next - begin, in, out, partial, live, begin == first,
                                                         next == end, kpart != 0);
-                    });
+                    };
+                    // A sixteen-column AVX-512 strip reuses each panel vector
+                    // across four rows; AVX2 and the four-vector wide strip
+                    // keep two rows within their register budgets.
+                    constexpr int width = rowTile(Strip);
+                    for (int tile = 0; tile < grid.tiles(width); ++tile)
+                    {
+                        const auto span = grid.tileSpan(tile, width);
+                        switch (span.size())
+                        {
+                        case 4:
+                            if constexpr (width >= 4)
+                                update.template operator()<4>(span.first);
+                            break;
+                        case 3:
+                            if constexpr (width >= 3)
+                                update.template operator()<3>(span.first);
+                            break;
+                        case 2:
+                            update.template operator()<2>(span.first);
+                            break;
+                        case 1:
+                            update.template operator()<1>(span.first);
+                            break;
+                        default:
+                            break;
+                        }
+                    }
                     if (next == end)
                         break;
                     begin = next;
@@ -962,7 +1034,15 @@ namespace llaminar2::cpu::native_quantised::x86_panel
                 const int strips = columnStrips(w.N, Strip);
 #pragma omp for schedule(static)
                 for (int strip = 0; strip < strips; ++strip)
-                    stripe<Lanes, Strip, CB, P>(w, a, c, ldc, strip * Strip, parts, grid, panel, carry);
+                {
+                    if (foldsInRegisters<Strip, P>(w, strip * Strip, parts))
+                    {
+                        if constexpr (P == Policy::GPUAlignedExpert)
+                            stripeOrdered<Lanes, Strip, CB, P>(w, a, c, ldc, strip * Strip, parts, grid, panel);
+                    }
+                    else
+                        stripe<Lanes, Strip, CB, P>(w, a, c, ldc, strip * Strip, parts, grid, panel, carry);
+                }
             };
             OMP_WORKSHARE_REGION(task);
         }
@@ -1035,7 +1115,15 @@ namespace llaminar2::cpu::native_quantised::x86_panel
                               : nullptr;
             const int columns = std::min(64, w.N - 64 * chunk);
             for (int column = 0; column < columns; column += Strip)
-                stripe<Lanes, Strip, CB, P>(w, a, c, ldc, 64 * chunk + column, parts, grid, panel, carry);
+            {
+                if (foldsInRegisters<Strip, P>(w, 64 * chunk + column, parts))
+                {
+                    if constexpr (P == Policy::GPUAlignedExpert)
+                        stripeOrdered<Lanes, Strip, CB, P>(w, a, c, ldc, 64 * chunk + column, parts, grid, panel);
+                }
+                else
+                    stripe<Lanes, Strip, CB, P>(w, a, c, ldc, 64 * chunk + column, parts, grid, panel, carry);
+            }
         }
     } // namespace
 

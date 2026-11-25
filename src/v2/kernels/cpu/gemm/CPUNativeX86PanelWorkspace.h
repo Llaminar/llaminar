@@ -115,6 +115,39 @@ namespace llaminar2::cpu::native_quantised::x86_panel
         return strip == 16 ? 4 : 2;
     }
 
+    /**
+     * @return Whether wide (64-column) register-folded GPU-aligned panels of
+     *         @p format run one row per tile for multi-block partitions.
+     * @details Those leaves keep eight folded totals beside the partials; the
+     * Q5_0 sum and the affine minimum need more temporaries than the
+     * nibble/grid corrections, so their two-row tile would exceed 32 vector
+     * registers. One-block partitions fold at once and keep two rows.
+     */
+    constexpr bool wideOrderedSplitsRows(Format format) noexcept
+    {
+        return affine(format) || format == Format::Q50;
+    }
+
+    /**
+     * @brief Physical rows one register tile of a complete panel strip consumes.
+     * @param format Admitted panel format.
+     * @param strip Strip columns (stripColumns() or pooledStrip()).
+     * @param gpu_aligned Whether the projection uses the GPU-aligned ordered tree.
+     * @param blocks Logical K blocks.
+     * @param partitions Serial K partition count (at most one for contiguous K).
+     * @return rowTile(strip), or one for the wide register-folded GPU-aligned
+     *         program of wideOrderedSplitsRows() formats with multi-block partitions.
+     * @details The single source of the executed tile and of its evidence.
+     * Register folding needs partitions of at most @ref depth blocks; an
+     * N-tail strip keeps the per-partition program and rowTile(strip).
+     */
+    constexpr int panelRowTile(Format format, int strip, bool gpu_aligned, int blocks, int partitions) noexcept
+    {
+        const int width = partitions > 1 ? (blocks - 1) / partitions + 1 : blocks;
+        const bool folds = gpu_aligned && partitions > 1 && width <= depth;
+        return strip == wide_strip && folds && width > 1 && wideOrderedSplitsRows(format) ? 1 : rowTile(strip);
+    }
+
     /** @return Slab elements for eight dot groups and the exact factor planes of one K block of @p strip columns. */
     constexpr int blockFloats(Format format, int strip) noexcept
     {

@@ -50,8 +50,12 @@ namespace llaminar2::cpu::native_quantised::x86_panel
      * @param chunk Physical 64-column chunk owned by this task.
      * @param slot The calling worker's slot of the launch's admitted slab, at least
      *        workerFloats(format, pooledStrip(lanes), rows, blocks, partitions) floats.
-     * @details The launcher admits geometry, slab extent, alignment and
-     * aliasing for every member before its team writes anything; a task has
+     * @details The launcher admits geometry, slab extent, team width and
+     * aliasing for every member before its team writes anything. Alignment is
+     * not part of the contract: slots are whole 64-byte multiples apart
+     * relative to the slab base, every slot access is unaligned-safe, and
+     * production workspace slabs are 64-byte aligned so that slots never share
+     * a cache line. A task has
      * no synchronization and writes only its chunk and its own slot, so tasks
      * of different members and chunks interleave freely in one workshare.
      * Each strip decodes every K panel once and reuses it for all rows, with

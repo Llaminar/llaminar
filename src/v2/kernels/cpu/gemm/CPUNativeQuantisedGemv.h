@@ -4842,7 +4842,9 @@ namespace llaminar2::cpu::native_quantised
                     {{"m", std::to_string(M)}, {"n", std::to_string(N)}, {"policy_n", std::to_string(policy_n)},
                      {"k", std::to_string(packed.K)}, {"codebook", std::to_string(packed.codebook_id)},
                      {"build_isa", compiledNativeQuantisedBuildISAName()}, {"isa", use_avx512 ? "AVX512" : "AVX2"},
-                     {"route", "packed_panel"}, {"row_tile", std::to_string(x86_panel::rowTile(panel_strip))},
+                     {"route", "packed_panel"},
+                     {"row_tile", std::to_string(x86_panel::panelRowTile(panel_format, panel_strip,
+                         packed.numerical_policy == CPUProjectionNumericalPolicy::GPUAlignedExpert, K_blocks, partitions))},
                      {"strip_columns", std::to_string(panel_strip)}, {"requested_policy", "Auto"},
                      {"effective_policy", "PackedPanel"}, {"n_block_chunks", "1"}, {"task_grid", "n_strip_all_rows"},
                      {"k_tile_blocks", std::to_string(std::min(x86_panel::depth, (K_blocks - 1) / partitions + 1))},
@@ -6030,6 +6032,7 @@ namespace llaminar2::cpu::native_quantised
         int64_t producer_tasks, reduction_tasks;
         bool layer_global_full_k;
         bool packed_panel; ///< Pooled x86 packed-panel chunk tasks replace the row tiles.
+        int panel_row_tile; ///< x86_panel::panelRowTile() of a pooled member's complete strips; zero otherwise.
 
         /** @brief Compare every emitted semantic dimension using its native type.
          * @param other Another projection's complete immutable dimensions.
@@ -6076,14 +6079,22 @@ namespace llaminar2::cpu::native_quantised
                     ? (grouped_k_parallel ? plan.n_chunks : 0)
                     : plan.verifier_resolution.reduction_tasks,
                 .layer_global_full_k = full_k,
-                .packed_panel = plan.packed_panel};
+                .packed_panel = plan.packed_panel,
+                .panel_row_tile = plan.packed_panel
+                    ? x86_panel::panelRowTile(x86_panel::formatFor(descriptor.packed->encoding, descriptor.packed->codebook_id),
+                          x86_panel::pooledStrip(isa == ISAPath::AVX512 ? 16 : 8),
+                          descriptor.packed->numerical_policy == CPUProjectionNumericalPolicy::GPUAlignedExpert,
+                          descriptor.packed->blocks_per_row, std::max(1, plan.k_tiles))
+                    : 0};
         }
 
         /** @brief Construct the public schema once per distinct numeric group.
          * @return Complete 21-tag map; no observation is dropped or filtered. A
          *         pooled panel member reports route prefill_x86_packed_panel_rows,
          *         task grid n_chunk_all_rows, one producer task per 64-column chunk
-         *         and the panel's two-row tile (its tile fields are not executed).
+         *         and the row tile its complete strips execute (panelRowTile(): two,
+         *         or one for wide multi-block GPU-aligned Q4_K/Q5_K/Q5_0 folds; an
+         *         N-tail strip runs two). Its verifier tile fields are not executed.
          */
         PerfStatsCollector::Tags tags() const
         {
@@ -6100,7 +6111,7 @@ namespace llaminar2::cpu::native_quantised
                 {"effective_decode_policy", decodeSchedulePolicyName(effective_decode)},
                 {"requested_verifier_policy", verifierRowsPolicyName(requested_verifier)},
                 {"effective_verifier_policy", verifierRowsPolicyName(effective_verifier)},
-                {"physical_row_tile", packed_panel ? "2" : std::to_string(physical_row_tile)},
+                {"physical_row_tile", std::to_string(packed_panel ? panel_row_tile : physical_row_tile)},
                 {"route", packed_panel ? "prefill_x86_packed_panel_rows" : verifierRowsExecutionRouteName(route)},
                 {"task_grid", packed_panel ? "n_chunk_all_rows" : verifierRowsTaskGridName(task_grid)},
                 {"producer_tasks", std::to_string(packed_panel ? (n + 63) / 64 : producer_tasks)},
@@ -7039,7 +7050,10 @@ namespace llaminar2::cpu::native_quantised
          * borrow one uniformly strided worker slot each of the invocation's
          * slab. Tile members run concurrently with panel tasks, so the slab
          * may alias no member's publication. Everything is checked before the
-         * team writes anything; the team is never wider than num_threads.
+         * team writes anything; the team is never wider than num_threads. The
+         * slot stride is a whole number of 64-byte lines relative to the slab
+         * base; no base alignment is required (all slot accesses are
+         * unaligned-safe; production slabs are 64-byte aligned).
          */
         const bool has_pooled_panels = bundle.panel_workers > 0;
         if (has_pooled_panels)

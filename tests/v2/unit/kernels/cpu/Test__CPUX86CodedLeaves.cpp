@@ -1041,8 +1041,12 @@ namespace llaminar2::test
      * partitions), a masked N tail and single-row members beside panel
      * members. The launch borrows one uniformly strided slot per worker of the
      * invocation's slab, never more than the members' admitted envelope; a
-     * one-float-short slab is rejected before any write. Decode members,
-     * explicit ISA and explicit ownership keep their register tiles.
+     * one-float-short slab, a team wider than the slab was planned for, and a
+     * slab overlapping a sibling's output, activation or bias or the
+     * descriptor table are rejected before any write; a slab base off a cache
+     * line keeps every byte (relative slot contract). The reported row tile
+     * is the executed one. Decode members, explicit ISA and explicit ownership
+     * keep their register tiles.
      */
     TEST(CPUX86CodedLeaves, FusedPrefillMembersStreamPanelsAndRetainSerialBytes)
     {
@@ -1113,6 +1117,25 @@ namespace llaminar2::test
                         const std::size_t demand = plan.sharedPartialFloats();
                         EXPECT_EQ(demand, std::size_t(workers) * slot);
                         EXPECT_LE(demand, envelope) << "the members' admitted envelope must cover the launch";
+                        // The reported tile is the one complete strips execute:
+                        // one row for wide multi-block GPU-aligned Q4_K/Q5_K/Q5_0
+                        // register folds, otherwise two (restated independently).
+                        const bool gpu = policy == Policy::GPUAlignedExpert;
+                        const int partition_width = (blocks - 1) / std::max(1, plan.projections[0].k_tiles) + 1;
+                        const bool split = lanes == 16 && gpu && plan.projections[0].k_tiles > 1 &&
+                            partition_width > 1 && partition_width <= x86_panel::depth &&
+                            (layout.codebook == 5 || layout.codebook == 7 || layout.codebook == 6);
+                        for (int p = 0; p < members; ++p)
+                        {
+                            if (!plan.projections[p].packed_panel)
+                                continue;
+                            const auto dims = FusedProjectionEvidenceDimensions::from(descriptors[p], plan.projections[p],
+                                lanes == 16 ? ISAPath::AVX512 : ISAPath::AVX2, true);
+                            EXPECT_EQ(dims.panel_row_tile, split ? 1 : 2) << p;
+                            const auto tags = dims.tags();
+                            EXPECT_EQ(tags.at("physical_row_tile"), split ? "1" : "2") << p;
+                            EXPECT_EQ(tags.at("route"), "prefill_x86_packed_panel_rows") << p;
+                        }
                         const auto reset = [&] { for (auto &bank : actual) std::fill(bank.begin(), bank.end(), dirty); };
                         const auto check = [&]
                         {
@@ -1123,7 +1146,8 @@ namespace llaminar2::test
                                         << "member=" << p << " index=" << i;
                         };
                         constexpr std::size_t guard = 64;
-                        std::vector<float> slab(demand + guard);
+                        AlignedVector<float> slab;
+                        slab.resize_uninitialized(demand + guard);
                         const std::span<float> exact(slab.data(), demand);
                         const auto poison = [&] { std::fill(slab.begin(), slab.end(), std::bit_cast<float>(0x7fa00ee1u)); };
                         const auto guarded = [&]
@@ -1154,6 +1178,72 @@ namespace llaminar2::test
                         }
                         check();
                         guarded();
+                        // The slab contract is relative: worker w owns floats
+                        // [w*slot, (w+1)*slot), slots being whole 64-byte lines
+                        // apart; every panel access is unaligned-safe, so a slab
+                        // base off a cache line keeps every byte (production
+                        // workspaces are 64-byte aligned, so slots never share
+                        // a line there).
+                        {
+                            AlignedVector<float> offset_slab;
+                            offset_slab.resize_uninitialized(demand + 1);
+                            reset();
+                            ASSERT_TRUE(gemm_native_quantised_fused_verifier_rows_preq(nullptr, descriptors.data(),
+                                std::span<float>(offset_slab.data() + 1, demand), members, 1, blocks));
+                            check();
+                        }
+                        // Adversarial admission, all before any output write: a
+                        // team wider than the slab was sized for, and a slab
+                        // that overlaps a sibling's output, activation or bias,
+                        // or the descriptor table.
+                        const auto rejectedBeforeWrite = [&](const char *what, const FusedVerifierRowsDesc *bundle,
+                                                             std::span<float> bank)
+                        {
+                            SCOPED_TRACE(what);
+                            reset();
+                            EXPECT_THROW((void)gemm_native_quantised_fused_verifier_rows_preq(nullptr, bundle, bank,
+                                members, 1, blocks), std::invalid_argument);
+                            for (const auto &out : actual)
+                                for (const float value : out)
+                                    ASSERT_EQ(value, dirty);
+                        };
+                        {
+                            ScopedTeam wider(workers + 1);
+                            rejectedBeforeWrite("team wider than the planned slab", descriptors.data(), exact);
+                        }
+                        // One buffer holds the slab and, inside its used prefix,
+                        // the aliased object; the single-row member 4 (a tile
+                        // member running concurrently with panel tasks) and the
+                        // biased panel member 0 are the victims.
+                        const auto aliased = [&](const char *what, auto bind)
+                        {
+                            AlignedVector<float> shared;
+                            shared.resize_uninitialized(demand + 4096);
+                            std::fill(shared.data(), shared.data() + shared.size(), dirty);
+                            auto bundle = descriptors;
+                            bind(bundle, shared.data());
+                            rejectedBeforeWrite(what, bundle.data(), std::span<float>(shared.data(), demand));
+                            // Nothing inside the shared buffer was written either.
+                            for (std::size_t i = 0; i < 64; ++i)
+                                ASSERT_EQ(shared.data()[i], dirty) << what;
+                        };
+                        aliased("sibling output", [&](auto &bundle, float *base) { bundle[4].output = base; });
+                        aliased("sibling activation", [&](auto &bundle, float *base) {
+                            std::memcpy(base + 64, input[4].data(), input[4].size() * sizeof(Q8_1Block));
+                            bundle[4].input = reinterpret_cast<const Q8_1Block *>(base + 64);
+                        });
+                        aliased("panel member bias", [&](auto &bundle, float *base) {
+                            std::memcpy(base + 64, bias[0].data(), bias[0].size() * sizeof(float));
+                            bundle[0].bias = base + 64;
+                        });
+                        {
+                            AlignedVector<float> shared;
+                            shared.resize_uninitialized(demand + 4096);
+                            std::fill(shared.data(), shared.data() + shared.size(), dirty);
+                            auto *table = reinterpret_cast<FusedVerifierRowsDesc *>(shared.data() + 64);
+                            std::copy(descriptors.begin(), descriptors.end(), table);
+                            rejectedBeforeWrite("descriptor table", table, std::span<float>(shared.data(), demand));
+                        }
                         // Decode members, an explicit ISA and explicit ownership keep their tiles.
                         auto decode = descriptors;
                         for (auto &d : decode)
