@@ -5,25 +5,31 @@
  * A trace captures, from a real model run of the production ServingSession:
  * every client command (submit/grant/force/cancel) with the step it preceded,
  * every admission (slot, resolved seed, restored prefix), every shared forward
- * the session issued (slots, token rows) with each row's TOP-K logits, and
+ * the session issued (slots, token rows) with explicitly selected logit coverage, and
  * every step's events. Replay feeds the recorded logits back through the same
  * production ServingSession and requires identical forwards and events.
  *
- * Exactness: logits are stored as hex floats (bit-exact). Only the top-K
- * entries are kept; a replayed row holds them and a floor strictly below all
+ * Exactness: logits are stored as hex floats (bit-exact). v2-full retains every
+ * vocabulary entry and all penalty parameters. Legacy v1 retains only top-K
+ * entries; a replayed row holds them and a floor strictly below all
  * of them elsewhere. Decisions are then identical for requests whose sampler
  * depends only on the top-k candidates: greedy, or top_k <= K without
- * repetition/presence/frequency penalties. The recorder rejects other laws.
+ * repetition/presence/frequency penalties. That restriction applies only to
+ * v1. Full-vocabulary recording retains the observations needed for penalties
+ * and unrestricted nucleus sampling; native DRY execution needs separate proof.
  */
 #pragma once
 
 #include "execution/serving/ServingSession.h"
 
+#include <nlohmann/json.hpp>
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <fstream>
 #include <limits>
 #include <map>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -35,6 +41,9 @@ namespace llaminar2::test
     struct ServingStepTrace
     {
         static constexpr int kTopK = 64;
+        /** @brief Full vocabulary preserves every candidate under history-dependent sampling. */
+        enum class LogitCoverage { TopK, FullVocabulary };
+        LogitCoverage coverage = LogitCoverage::TopK;
 
         struct Command
         {
@@ -55,7 +64,7 @@ namespace llaminar2::test
         {
             std::vector<int> slots;
             std::vector<std::vector<int>> rows;
-            std::vector<std::vector<std::pair<int, float>>> top; ///< Per row, descending.
+            std::vector<std::vector<std::pair<int, float>>> top; ///< Token/value pairs: v1 ranked, v2-full vocabulary order.
         };
         struct Step
         {
@@ -86,9 +95,26 @@ namespace llaminar2::test
             return top;
         }
 
-        /** @brief Dense replay row: recorded entries, a floor below them elsewhere. */
-        static void denseRow(const std::vector<std::pair<int, float>> &top, int vocab, std::vector<float> &out)
+        /** @brief Reconstruct a validated row; full coverage never synthesizes missing observations.
+         * @param top Recorded token/value pairs.
+         * @param vocab Admitted vocabulary size.
+         * @param out Destination row.
+         * @param coverage Required recorded coverage.
+         * @throws std::invalid_argument For missing, duplicate, nonfinite or out-of-range observations.
+         */
+        static void denseRow(const std::vector<std::pair<int, float>> &top, int vocab, std::vector<float> &out,
+                             LogitCoverage coverage = LogitCoverage::TopK)
         {
+            if (vocab <= 0 || top.empty() ||
+                (coverage == LogitCoverage::FullVocabulary && top.size() != static_cast<std::size_t>(vocab)))
+                throw std::invalid_argument("incomplete serving trace logits");
+            std::vector<bool> seen(static_cast<std::size_t>(vocab), false);
+            for (const auto &[index, value] : top)
+            {
+                if (index < 0 || index >= vocab || seen[static_cast<std::size_t>(index)] || !std::isfinite(value))
+                    throw std::invalid_argument("invalid serving trace logit observation");
+                seen[static_cast<std::size_t>(index)] = true;
+            }
             float floor_value = std::numeric_limits<float>::max();
             for (const auto &[index, value] : top)
                 floor_value = std::min(floor_value, value);
@@ -98,8 +124,11 @@ namespace llaminar2::test
         }
 
         /** @throws std::invalid_argument When a law depends on more than the top-K logits. */
-        static void requireReplayableLaw(const SamplingParams &params)
+        static void requireReplayableLaw(const SamplingParams &params,
+                                         LogitCoverage coverage = LogitCoverage::TopK)
         {
+            if (coverage == LogitCoverage::FullVocabulary)
+                return;
             if (params.has_penalties())
                 throw std::invalid_argument("trace replay requires sampling without penalties");
             if (!params.is_greedy() && (params.top_k <= 0 || params.top_k > kTopK))
@@ -116,7 +145,8 @@ namespace llaminar2::test
         void write(const std::string &path) const
         {
             std::ofstream out(path);
-            out << "llaminar-serving-trace v1\n";
+            out << (coverage == LogitCoverage::FullVocabulary ? "llaminar-serving-trace v2-full\n"
+                                                             : "llaminar-serving-trace v1\n");
             out << "geometry " << context << ' ' << vocab << ' ' << capacity << '\n';
             for (const auto &c : commands)
             {
@@ -134,6 +164,19 @@ namespace llaminar2::test
                     for (const auto t : r.prompt)
                         out << ' ' << t;
                     out << '\n';
+                    requireReplayableLaw(r.sampling, coverage);
+                    if (coverage == LogitCoverage::FullVocabulary)
+                    {
+                        const auto &p = r.sampling;
+                        // JSON escapes embedded newlines in DRY breakers; floats use the
+                        // same exact hexadecimal spelling as recorded logits.
+                        nlohmann::json law = {
+                            {"presence", hexFloat(p.presence_penalty)}, {"frequency", hexFloat(p.frequency_penalty)},
+                            {"repetition", hexFloat(p.repetition_penalty)}, {"dry_multiplier", hexFloat(p.dry_multiplier)},
+                            {"dry_base", hexFloat(p.dry_base)}, {"dry_allowed_length", p.dry_allowed_length},
+                            {"dry_penalty_last_n", p.dry_penalty_last_n}, {"dry_sequence_breakers", p.dry_sequence_breakers}};
+                        out << "law " << law.dump() << '\n';
+                    }
                     break;
                 }
                 case Command::Kind::Grant: out << "grant " << c.step << ' ' << c.id << ' ' << c.value << '\n'; break;
@@ -173,8 +216,42 @@ namespace llaminar2::test
                     out << '\n';
                 }
             }
+            if (coverage == LogitCoverage::FullVocabulary)
+                out << "end\n";
             if (!out)
                 throw std::runtime_error("cannot write serving trace " + path);
+        }
+
+        /** @brief Reject commands that cannot be issued by this complete-session recording.
+         * @throws std::runtime_error When a command is outside the recorded step domain.
+         */
+        void validateSchedule() const
+        {
+            for (const auto &command : commands)
+            {
+                if (command.step < 0 || static_cast<std::size_t>(command.step) >= steps.size())
+                    throw std::runtime_error("recorded command lies outside recorded steps");
+                switch (command.kind)
+                {
+                case Command::Kind::Submit:
+                case Command::Kind::Grant:
+                case Command::Kind::Force:
+                case Command::Kind::Cancel: break;
+                default: throw std::runtime_error("unknown recorded command kind");
+                }
+            }
+            std::set<std::uint64_t> admitted_ids;
+            for (const auto &admission : admissions)
+            {
+                if (!admitted_ids.insert(admission.id).second || admission.seed == 0)
+                    throw std::runtime_error("duplicate admission or unresolved seed");
+                const auto submitted = std::find_if(commands.begin(), commands.end(), [&](const Command &c) {
+                    return c.kind == Command::Kind::Submit && c.request.id == admission.id;
+                });
+                if (submitted == commands.end() ||
+                    (submitted->request.sampling.seed != 0 && submitted->request.sampling.seed != admission.seed))
+                    throw std::runtime_error("admission identity or authored seed disagrees with submit");
+            }
         }
 
         static ServingStepTrace read(const std::string &path)
@@ -185,20 +262,46 @@ namespace llaminar2::test
             ServingStepTrace trace;
             std::string line;
             std::getline(in, line);
-            if (line != "llaminar-serving-trace v1")
+            if (line == "llaminar-serving-trace v2-full")
+                trace.coverage = LogitCoverage::FullVocabulary;
+            else if (line != "llaminar-serving-trace v1")
                 throw std::runtime_error("unsupported serving trace header: " + line);
+            std::size_t laws = 0;
+            bool needs_law = false;
+            bool geometry_seen = false;
+            bool ended = false;
+            std::size_t pending_events = 0;
             auto hexf = [](std::istringstream &s) {
                 std::string token;
                 s >> token;
-                return std::strtof(token.c_str(), nullptr);
+                char *end = nullptr;
+                const float value = std::strtof(token.c_str(), &end);
+                if (!s || end == token.c_str() || end != token.c_str() + token.size() || !std::isfinite(value))
+                    throw std::runtime_error("invalid recorded floating-point value");
+                return value;
             };
             while (std::getline(in, line))
             {
                 std::istringstream s(line);
                 std::string kind;
                 s >> kind;
+                if (ended)
+                    throw std::runtime_error("record after serving trace end");
+                if (!geometry_seen && kind != "geometry")
+                    throw std::runtime_error("serving trace requires geometry first");
+                if (pending_events != 0 && kind != "event")
+                    throw std::runtime_error("missing recorded step events");
+                if (needs_law && kind != "law")
+                    throw std::runtime_error("missing recorded sampling law after submit");
                 if (kind == "geometry")
+                {
+                    if (geometry_seen)
+                        throw std::runtime_error("duplicate serving trace geometry");
                     s >> trace.context >> trace.vocab >> trace.capacity;
+                    if (trace.context <= 0 || trace.vocab <= 0 || trace.capacity <= 0)
+                        throw std::runtime_error("invalid serving trace geometry");
+                    geometry_seen = true;
+                }
                 else if (kind == "submit")
                 {
                     Command c;
@@ -221,6 +324,62 @@ namespace llaminar2::test
                         s >> t;
                     c.id = r.id;
                     trace.commands.push_back(std::move(c));
+                    needs_law = trace.coverage == LogitCoverage::FullVocabulary;
+                }
+                else if (kind == "law")
+                {
+                    if (!needs_law || trace.coverage != LogitCoverage::FullVocabulary || trace.commands.empty() ||
+                        trace.commands.back().kind != Command::Kind::Submit)
+                        throw std::runtime_error("sampling law without full-trace submit");
+                    std::string encoded_law;
+                    std::getline(s, encoded_law);
+                    std::set<std::string> keys;
+                    const auto law = nlohmann::json::parse(encoded_law,
+                        [&](int, nlohmann::json::parse_event_t event, nlohmann::json &value) {
+                            if (event == nlohmann::json::parse_event_t::key &&
+                                !keys.insert(value.get<std::string>()).second)
+                                throw std::runtime_error("duplicate recorded sampling law key");
+                            return true;
+                        });
+                    const std::set<std::string> expected_keys = {"presence", "frequency", "repetition",
+                        "dry_multiplier", "dry_base", "dry_allowed_length", "dry_penalty_last_n", "dry_sequence_breakers"};
+                    if (!law.is_object() || keys != expected_keys || law.size() != expected_keys.size())
+                        throw std::runtime_error("recorded sampling law has missing or unknown fields");
+                    auto &p = trace.commands.back().request.sampling;
+                    auto number = [&](const char *key) {
+                        const auto value = law.at(key).get<std::string>();
+                        char *end = nullptr;
+                        const float parsed = std::strtof(value.c_str(), &end);
+                        if (end != value.c_str() + value.size() || end == value.c_str() || !std::isfinite(parsed))
+                            throw std::runtime_error("invalid recorded sampling scalar");
+                        return parsed;
+                    };
+                    p.presence_penalty = number("presence");
+                    p.frequency_penalty = number("frequency");
+                    p.repetition_penalty = number("repetition");
+                    p.dry_multiplier = number("dry_multiplier");
+                    p.dry_base = number("dry_base");
+                    auto integer = [&](const char *key) {
+                        const auto &value = law.at(key);
+                        if (!value.is_number_integer())
+                            throw std::runtime_error("recorded sampling integer has non-integral type");
+                        if (value.is_number_unsigned())
+                        {
+                            const auto wide = value.get<std::uint64_t>();
+                            if (wide > static_cast<std::uint64_t>(std::numeric_limits<int>::max()))
+                                throw std::runtime_error("recorded sampling integer overflows int");
+                            return static_cast<int>(wide);
+                        }
+                        const auto wide = value.get<std::int64_t>();
+                        if (wide < std::numeric_limits<int>::min() || wide > std::numeric_limits<int>::max())
+                            throw std::runtime_error("recorded sampling integer overflows int");
+                        return static_cast<int>(wide);
+                    };
+                    p.dry_allowed_length = integer("dry_allowed_length");
+                    p.dry_penalty_last_n = integer("dry_penalty_last_n");
+                    p.dry_sequence_breakers = law.at("dry_sequence_breakers").get<std::vector<std::string>>();
+                    ++laws;
+                    needs_law = false;
                 }
                 else if (kind == "grant" || kind == "force" || kind == "cancel")
                 {
@@ -244,12 +403,17 @@ namespace llaminar2::test
                     Forward f;
                     std::size_t rows = 0;
                     s >> rows;
+                    if (rows == 0 || rows > static_cast<std::size_t>(trace.capacity))
+                        throw std::runtime_error("invalid serving trace forward width");
                     f.slots.resize(rows);
                     f.rows.resize(rows);
                     for (std::size_t r = 0; r < rows; ++r)
                     {
                         std::size_t n = 0;
                         s >> f.slots[r] >> n;
+                        if (f.slots[r] < 0 || f.slots[r] >= trace.capacity || n == 0 ||
+                            n > static_cast<std::size_t>(trace.context))
+                            throw std::runtime_error("invalid serving trace forward geometry");
                         f.rows[r].resize(n);
                         for (auto &t : f.rows[r])
                             s >> t;
@@ -260,6 +424,8 @@ namespace llaminar2::test
                 {
                     std::size_t n = 0;
                     s >> n;
+                    if (n == 0 || n > static_cast<std::size_t>(trace.vocab))
+                        throw std::runtime_error("invalid serving trace logit count");
                     std::vector<std::pair<int, float>> row(n);
                     for (auto &[index, value] : row)
                     {
@@ -271,7 +437,16 @@ namespace llaminar2::test
                     trace.forwards.back().top.push_back(std::move(row));
                 }
                 else if (kind == "step")
+                {
+                    s >> pending_events;
                     trace.steps.emplace_back();
+                }
+                else if (kind == "end")
+                {
+                    if (trace.coverage != LogitCoverage::FullVocabulary)
+                        throw std::runtime_error("end marker requires full trace version");
+                    ended = true;
+                }
                 else if (kind == "event")
                 {
                     ServingBatchEvent e;
@@ -282,13 +457,35 @@ namespace llaminar2::test
                     e.tokens.resize(n);
                     for (auto &t : e.tokens)
                         s >> t;
-                    if (trace.steps.empty())
-                        throw std::runtime_error("serving trace event without a step");
+                    if (trace.steps.empty() || pending_events == 0)
+                        throw std::runtime_error("serving trace event without a declared step event");
+                    --pending_events;
                     trace.steps.back().events.push_back(std::move(e));
                 }
-                else if (!kind.empty())
+                else
                     throw std::runtime_error("unknown serving trace record: " + kind);
+                if (s.fail())
+                    throw std::runtime_error("incomplete serving trace record: " + kind);
+                std::string extra;
+                if (s >> extra)
+                    throw std::runtime_error("trailing serving trace fields: " + kind);
             }
+            if (!geometry_seen || pending_events != 0 ||
+                (trace.coverage == LogitCoverage::FullVocabulary && !ended))
+                throw std::runtime_error("incomplete serving trace");
+            const auto submissions = std::count_if(trace.commands.begin(), trace.commands.end(),
+                [](const Command &c) { return c.kind == Command::Kind::Submit; });
+            if (needs_law || (trace.coverage == LogitCoverage::FullVocabulary && laws != static_cast<std::size_t>(submissions)))
+                throw std::runtime_error("incomplete recorded sampling laws");
+            for (const auto &f : trace.forwards)
+            {
+                if (f.slots.size() != f.top.size())
+                    throw std::runtime_error("incomplete recorded forward logits");
+                std::vector<float> checked;
+                for (const auto &row : f.top)
+                    denseRow(row, trace.vocab, checked, trace.coverage);
+            }
+            trace.validateSchedule();
             return trace;
         }
     };
@@ -301,7 +498,7 @@ namespace llaminar2::test
 
         void admitted(const ServingBatchRequest &request, int slot, int restored) override
         {
-            ServingStepTrace::requireReplayableLaw(request.sampling);
+            ServingStepTrace::requireReplayableLaw(request.sampling, trace_.coverage);
             trace_.admissions.push_back({request.id, slot, request.sampling.seed, restored});
         }
 
@@ -312,7 +509,17 @@ namespace llaminar2::test
             forward.slots = slots;
             forward.rows = rows;
             for (const float *logits : row_logits)
-                forward.top.push_back(ServingStepTrace::topOf(logits, vocab));
+            {
+                if (trace_.coverage == ServingStepTrace::LogitCoverage::FullVocabulary)
+                {
+                    auto &row = forward.top.emplace_back();
+                    row.reserve(static_cast<std::size_t>(vocab));
+                    for (int i = 0; i < vocab; ++i)
+                        row.emplace_back(i, logits[i]);
+                }
+                else
+                    forward.top.push_back(ServingStepTrace::topOf(logits, vocab));
+            }
             trace_.forwards.push_back(std::move(forward));
         }
 
@@ -333,7 +540,7 @@ namespace llaminar2::test
      * logits. replay() re-issues the recorded commands at their steps and
      * compares every step's events with the recording.
      */
-    class ServingStepTraceReplayer final : public IServingRowExecutor
+    class ServingStepTraceReplayer final : public IServingRowExecutor, public IServingTraceRecorder
     {
     public:
         explicit ServingStepTraceReplayer(const ServingStepTrace &trace) : trace_(trace) {}
@@ -348,7 +555,7 @@ namespace llaminar2::test
                                          " differs from the recording (slots/rows)");
             dense_.resize(recorded.top.size());
             for (std::size_t r = 0; r < recorded.top.size(); ++r)
-                ServingStepTrace::denseRow(recorded.top[r], trace_.vocab, dense_[r]);
+                ServingStepTrace::denseRow(recorded.top[r], trace_.vocab, dense_[r], trace_.coverage);
             ++next_forward_;
             return true;
         }
@@ -359,6 +566,22 @@ namespace llaminar2::test
                        ? dense_[static_cast<std::size_t>(row)].data()
                        : nullptr;
         }
+
+        /** @brief Bind the actual production admission to its recorded identity and resolved policy. */
+        void admitted(const ServingBatchRequest &request, int slot, int restored) override
+        {
+            if (observed_admissions_ >= trace_.admissions.size())
+                throw std::runtime_error("unrecorded production admission");
+            const auto &expected = trace_.admissions[observed_admissions_++];
+            if (request.id != expected.id || slot != expected.slot ||
+                request.sampling.seed != expected.seed || restored != expected.restored)
+                throw std::runtime_error("production admission differs from recorded identity");
+        }
+        /** @brief Forwards are checked by the executor before publishing logits. */
+        void forwarded(const std::vector<int> &, const std::vector<std::vector<int>> &,
+                       const std::vector<const float *> &, int) override {}
+        /** @brief Step outcomes are checked by replay after the production call returns. */
+        void stepped(const std::vector<ServingBatchEvent> &) override {}
 
         bool resetServingRow(int) override { return true; }
 
@@ -388,8 +611,11 @@ namespace llaminar2::test
          */
         static std::string replay(const ServingStepTrace &trace)
         {
-            ServingStepTraceReplayer executor(trace);
-            ServingSession session(executor, trace.context, trace.vocab);
+            try { trace.validateSchedule(); }
+            catch (const std::exception &failure) { return failure.what(); }
+            auto executor = std::make_shared<ServingStepTraceReplayer>(trace);
+            ServingSession session(*executor, trace.context, trace.vocab);
+            session.setTraceRecorder(executor);
             std::string error;
             if (!session.begin(trace.capacity, trace.capacity, error))
                 return "begin failed: " + error;
@@ -409,8 +635,9 @@ namespace llaminar2::test
                         case ServingStepTrace::Command::Kind::Submit:
                         {
                             auto request = c.request;
+                            ServingStepTrace::requireReplayableLaw(request.sampling, trace.coverage);
                             // The recorded resolved seed (entropy for seed 0).
-                            if (auto it = seeds.find(request.id); it != seeds.end())
+                            if (auto it = seeds.find(request.id); it != seeds.end() && request.sampling.seed == 0)
                                 request.sampling.seed = it->second;
                             if (!session.submit(std::move(request), error))
                                 return "submit failed: " + error;
@@ -441,11 +668,15 @@ namespace llaminar2::test
             {
                 return failure.what();
             }
-            if (executor.forwardsConsumed() != trace.forwards.size())
-                return "replay issued " + std::to_string(executor.forwardsConsumed()) + " of " +
+            if (!session.idle())
+                return "complete-session trace ended with live requests";
+            if (executor->forwardsConsumed() != trace.forwards.size())
+                return "replay issued " + std::to_string(executor->forwardsConsumed()) + " of " +
                        std::to_string(trace.forwards.size()) + " recorded forwards";
-            if (executor.admissionsConsumed() != trace.admissions.size())
-                return "replay admitted " + std::to_string(executor.admissionsConsumed()) + " of " +
+            if (executor->observed_admissions_ != trace.admissions.size())
+                return "replay did not observe every recorded admission";
+            if (executor->admissionsConsumed() != trace.admissions.size())
+                return "replay admitted " + std::to_string(executor->admissionsConsumed()) + " of " +
                        std::to_string(trace.admissions.size()) + " recorded requests";
             return {};
         }
@@ -454,6 +685,7 @@ namespace llaminar2::test
         const ServingStepTrace &trace_;
         std::size_t next_forward_ = 0;
         std::size_t next_admission_ = 0;
+        std::size_t observed_admissions_ = 0;
         std::vector<std::vector<float>> dense_;
     };
 } // namespace llaminar2::test

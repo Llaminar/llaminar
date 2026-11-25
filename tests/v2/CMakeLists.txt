@@ -18277,6 +18277,12 @@ add_v2_test(V2_Integration_ServingStepReplay
     LABELS "V2;Integration;ProductionTestPreflight;Serving;ContinuousBatching;TraceReplay;DeviceFree;Regression"
     MPI_PROCS 1 NO_MODELS TIMEOUT 60)
 
+add_v2_test(V2_Integration_ServingLiveIdentityLifecycle
+    COMMAND $<TARGET_FILE:v2_test_serving_step_replay>
+        --gtest_filter=ServingSessionLifecycle.DuplicateLiveIdentityIsRejectedBeforeMutation
+    LABELS "V2;Integration;ProductionTestPreflight;Serving;ContinuousBatching;DeviceFree;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+
 # Continuous-batching HTTP driver: exactly-once mailbox outcomes on finish,
 # cancellation (incl. transport close while queued), shutdown with pending
 # submissions, throwing steps and shared-forward failure; device-free.
@@ -18302,6 +18308,18 @@ add_v2_test(V2_Integration_ServingBatchDriverLifecycle
     NO_MODELS
     TIMEOUT 120
 )
+
+# Dedicated process confines replacement allocation operators to this witness.
+add_executable(v2_test_streaming_fragment_allocations unit/app/modes/Test__StreamingFragmentAllocations.cpp)
+target_include_directories(v2_test_streaming_fragment_allocations PRIVATE
+    ${CMAKE_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../../external/vendor)
+target_link_libraries(v2_test_streaming_fragment_allocations PRIVATE GTest::gtest_main)
+add_v2_test(V2_Unit_StreamingFragmentAllocations
+    COMMAND $<TARGET_FILE:v2_test_streaming_fragment_allocations>
+    LABELS "V2;Unit;HTTP;Streaming;Regression" NO_MPI NO_MODELS)
+add_v2_test(V2_Integration_StreamingFragmentAllocations
+    COMMAND $<TARGET_FILE:v2_test_streaming_fragment_allocations>
+    LABELS "V2;Integration;ProductionTestPreflight;HTTP;Streaming;Regression" MPI_PROCS 1 NO_MPI NO_MODELS)
 
 add_executable(v2_test_chat_completion_handler unit/app/modes/Test__ChatCompletionHandler.cpp)
 target_include_directories(v2_test_chat_completion_handler PRIVATE
@@ -18352,6 +18370,12 @@ add_v2_test(V2_Integration_HTTPStreamingUnicodeAndErrorFraming
         --gtest_filter=Test__ChatCompletionHandler.EmojiChatMessagesParseLiteralAndEscapedJSONExactly:Test__ChatCompletionHandler.EmojiByteFragmentsSurviveJSONAndSSEAtEveryBoundary:Test__ChatCompletionHandler.StreamingTransportErrorsTerminateExactlyOnce
     LABELS "V2;Integration;ProductionTestPreflight;HTTP;Streaming;Unicode;Regression"
     NO_MODELS)
+# Long deltas reconstruct exactly and stop at the first rejected fragment.
+add_v2_test(V2_Integration_HTTPStreamingTextFragmentation
+    COMMAND $<TARGET_FILE:v2_test_chat_completion_handler>
+        --gtest_filter=Test__ChatCompletionHandler.StreamingSplitsLongTextIntoBoundedEvents:Test__ChatCompletionHandler.StreamingLongTextStopsAtRejectedFragment:Test__ChatCompletionHandler.StreamingLongToolArgumentsReconstructAndCancel
+    LABELS "V2;Integration;ProductionTestPreflight;HTTP;Streaming;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
 add_v2_test(V2_Integration_HTTPStreamingUsageAccounting
     COMMAND $<TARGET_FILE:v2_test_chat_completion_handler>
         --gtest_filter=Test__ChatCompletionHandler.StreamingUsageOptionsAreTypedAndModeBound:Test__ChatCompletionHandler.StreamingUsagePublishesExactCountsAfterTerminalChoice:Test__ChatCompletionHandler.StreamingUsageErrorsAndDisconnectsCannotPublishSuccessTail

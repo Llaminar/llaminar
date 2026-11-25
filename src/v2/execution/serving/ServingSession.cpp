@@ -69,8 +69,16 @@ namespace llaminar2
             error = "Serving request prompt exceeds the admitted context";
         else if (!failure_.empty())
             error = "Serving session failed: " + failure_;
+        else if (std::any_of(rows_.begin(), rows_.end(), [&](const Row &row) {
+                     return row.request.id == request.id;
+                 }) || std::any_of(queue_.begin(), queue_.end(), [&](const ServingBatchRequest &queued) {
+                     return queued.id == request.id;
+                 }))
+            error = "Serving request id is already live: " + std::to_string(request.id);
         else
         {
+            // Grants, forces and cancellation address this identity, so accepting
+            // another live owner would make those operations ambiguous.
             queue_.push_back(std::move(request));
             return true;
         }

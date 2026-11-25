@@ -431,15 +431,78 @@ namespace llaminar2::test
 
 namespace llaminar2::test
 {
+    /** Resident cancellation is replayed through production retirement and slot replacement. */
+    TEST_F(ContinuousBatchingCPU, RecordedResidentCancellationReplaysExactly)
+    {
+        ServingStepTrace trace;
+        trace.context = 1024;
+        trace.vocab = runner_->vocabSize();
+        trace.capacity = 2;
+        auto submit = [&](int step, ServingBatchRequest request) {
+            ServingStepTrace::Command command;
+            command.kind = ServingStepTrace::Command::Kind::Submit;
+            command.step = step;
+            command.id = request.id;
+            command.request = std::move(request);
+            trace.commands.push_back(std::move(command));
+        };
+        submit(0, makeRequest(1, 9, 20, 0.0f, 1));
+        submit(0, makeRequest(2, 70, 20, 0.0f, 1));
+        ServingStepTrace::Command cancel;
+        cancel.kind = ServingStepTrace::Command::Kind::Cancel;
+        cancel.step = 1;
+        cancel.id = 2;
+        trace.commands.push_back(cancel);
+        submit(1, makeRequest(3, 12, 4, 0.0f, 1));
+        runner_->setServingTraceRecorder(std::make_shared<ServingStepTraceRecorder>(trace));
+        ASSERT_TRUE(runner_->beginServingBatch(trace.capacity)) << runner_->lastError();
+        bool saw_cancel = false;
+        bool a_finished = false;
+        bool replacement_before_a_finished = false;
+        for (int step = 0; step < 100; ++step)
+        {
+            for (const auto &command : trace.commands)
+            {
+                if (command.step != step) continue;
+                if (command.kind == ServingStepTrace::Command::Kind::Submit)
+                    ASSERT_TRUE(runner_->submitServingRequest(command.request)) << runner_->lastError();
+                else
+                    runner_->cancelServingRequest(command.id);
+            }
+            const auto events = runner_->stepServingBatch();
+            if (trace.admissions.size() == 3 && !a_finished)
+                replacement_before_a_finished = true;
+            for (const auto &event : events)
+            {
+                if (event.id == 2 && event.finish == ServingFinishReason::Cancelled) saw_cancel = true;
+                if (event.id == 1 && event.finished()) a_finished = true;
+            }
+            if (step >= 1 && runner_->servingBatchIdle()) break;
+        }
+        EXPECT_TRUE(runner_->servingBatchIdle());
+        runner_->endServingBatch();
+        runner_->setServingTraceRecorder(nullptr);
+        ASSERT_EQ(trace.admissions.size(), 3u);
+        EXPECT_EQ(trace.admissions[1].id, 2u);
+        EXPECT_EQ(trace.admissions[2].id, 3u);
+        EXPECT_EQ(trace.admissions[1].slot, trace.admissions[2].slot);
+        EXPECT_TRUE(saw_cancel);
+        EXPECT_TRUE(a_finished);
+        EXPECT_TRUE(replacement_before_a_finished);
+        EXPECT_EQ(ServingStepTraceReplayer::replay(trace), "");
+    }
+
     /**
      * Records the production serving session on the real model for the
      * device-free recorded-input replay (V2_Unit_ServingStepReplay) and
      * replays the recording at once through a fresh ServingSession. With
-     * LLAMINAR_CB_RECORD_TRACE=<path> the trace is written there (fixture).
+     * LLAMINAR_CB_RECORD_TRACE=<path> the full-vocabulary trace is written
+     * there as diagnostic evidence; the legacy top-K fixture is not replaced.
      */
     TEST_F(ContinuousBatchingCPU, RecordedServingTraceReplaysExactly)
     {
         ServingStepTrace trace;
+        trace.coverage = ServingStepTrace::LogitCoverage::FullVocabulary;
         trace.context = 1024;
         trace.vocab = runner_->vocabSize();
         trace.capacity = 3;
@@ -462,7 +525,12 @@ namespace llaminar2::test
             trace.commands.push_back(c);
         };
         auto a = makeRequest(1, 9, 14, 0.0f, 1);   // greedy, unpaced
-        auto b = makeRequest(2, 70, 10, 0.8f, 7);  // seeded stochastic, two prompt chunks
+        auto b = makeRequest(2, 70, 10, 0.8f, 7);  // history-dependent nucleus sampling
+        b.sampling.top_k = 0;
+        b.sampling.top_p = 0.91f;
+        b.sampling.presence_penalty = 0.3f;
+        b.sampling.frequency_penalty = 0.2f;
+        b.sampling.repetition_penalty = 1.1f;
         auto c = makeRequest(3, 21, 6, 0.0f, 1);   // greedy, paced with grants + forced token
         c.paced = true;
         auto d = makeRequest(4, 12, 8, 0.9f, 0);   // entropy seed resolved at admission
@@ -502,6 +570,7 @@ namespace llaminar2::test
             if (step >= last_command_step && runner_->servingBatchIdle())
                 break;
         }
+        EXPECT_TRUE(runner_->servingBatchIdle()) << "recording must finish before teardown clears the session";
         runner_->endServingBatch();
         runner_->setServingTraceRecorder(nullptr);
 
@@ -510,7 +579,14 @@ namespace llaminar2::test
         EXPECT_NE(trace.admissions.back().seed, 0u) << "entropy seed is resolved and recorded";
         EXPECT_EQ(ServingStepTraceReplayer::replay(trace), "");
         if (const char *path = std::getenv("LLAMINAR_CB_RECORD_TRACE"); path && *path)
+        {
             trace.write(path);
+            const auto stored = ServingStepTrace::read(path);
+            ASSERT_EQ(stored.commands.size(), trace.commands.size());
+            for (std::size_t i = 0; i < stored.commands.size(); ++i)
+                EXPECT_EQ(stored.commands[i].request.sampling, trace.commands[i].request.sampling);
+            EXPECT_EQ(ServingStepTraceReplayer::replay(stored), "");
+        }
     }
 } // namespace llaminar2::test
 

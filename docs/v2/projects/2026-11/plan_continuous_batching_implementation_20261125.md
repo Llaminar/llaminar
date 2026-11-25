@@ -30,7 +30,8 @@ reviewer dispositions and the project's `IMPLEMENTATION_PLAN.md`.
   `BatchedGenerationLane`s with one-window grants. Admission takes a
   `ServingResponseLeasePool` lease (R responses, S + Q executing) over the
   PMA `ServingResponsePool` line, which also prices one decision-logits row per
-  slot. S = 1 keeps `SerializedInferenceExecutor`.
+  slot. Supported CPU topologies use these rows at S = 1 too; unsupported
+  topologies retain the transitional serialized S = 1 executor.
 - A sealed session reports 503 on `/health` and inference (documented fatal
   policy; the supervisor restarts the server).
 
@@ -51,11 +52,33 @@ PerfStats `serving/*` counters: `steps`, `decode_forwards`, `prefill_forwards`,
 (requests failed by a seal). They prove the path ran; they are not live
 gauges or economy evidence.
 
+## CPU serving robustness checkpoint (2026-11-25)
+
+- The operator reconfirmed implementation-first checkpoints: focused tests at
+  slice end, `--no-verify` commits pushed to the draft branch, asynchronous
+  milestone reviews. This does not waive final qualification or required PR checks.
+- Lazy streaming fragmentation avoids copying the complete selected large field
+  and stops construction on rejected delivery. The production-helper allocation
+  witness detects reinstated eager splitting and full-field copying. Oversized
+  tool arguments reconstruct byte-exactly with terminal publication ordering.
+- Recorded-input replay now supports complete vocabulary logits and lossless
+  sampling penalties, rejects malformed/incomplete schedules and laws, and
+  authenticates actual admission identities. Native recordings cover penalized
+  top-p and resident cancellation/slot replacement; DRY is serialization-only.
+- Duplicate queued/resident request IDs are rejected before mutation.
+- Independent source/regression reviews accepted these narrow changes. Focused
+  streaming checks passed 4/4; session replay/identity checks passed 3/3; native
+  dense/prefix tests passed 12/12 on aarch64. These are not complete gates.
+- Open: aggregate response/parser/metadata memory bounds and non-streaming
+  materialization; MTP, GPU/distributed execution, broader replay coverage,
+  full backend/model qualification and measured Release economy. The earlier
+  full AVX512 gate remains FAIL; full AVX2 qualification remains pending.
+
 ## Next
 
 1. Migrate S = 1 onto serving rows and retire the scalar serving path once rows
    cover every serving topology (G7).
-2. MTP and hybrid rows on CPU.
+2. Per-request MTP and hybrid prefix-state ownership on CPU.
 3. GPU retained continuous execution through the DecodeWindow seam (requires
    CUDA/ROCm hardware).
 4. Distributed batching and the Release benchmark matrix (requires hardware).

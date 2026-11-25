@@ -4941,6 +4941,116 @@ TEST_F(Test__ChatCompletionHandler, QwenStringToolArgumentsSurviveJSONAndSSE)
         }
 }
 
+/** Oversized tool arguments preserve metadata once and stop on rejected continuations. */
+TEST_F(Test__ChatCompletionHandler, StreamingLongToolArgumentsReconstructAndCancel)
+{
+    ON_CALL(*tokenizer_, encodeChat(_, _, _)).WillByDefault(Return(std::vector<int>{1}));
+    ON_CALL(*runner_, prefill(_)).WillByDefault(Return(true));
+    ON_CALL(*runner_, getToolCallFormat()).WillByDefault(Return(ToolCallFormat::QWEN_3_XML));
+    ON_CALL(*tokenizer_, is_stop_token(_)).WillByDefault(Return(false));
+    // Odd byte period straddles the 2048-byte boundary, unlike the content fixture.
+    std::string value;
+    for (int i = 0; i < 2500; ++i)
+        value += "a\xC3\xA9";
+    const auto output = "<tool_call>\n<function=write>\n<parameter=content>\n" + value +
+                        "\n</parameter>\n</function>\n</tool_call>";
+    ON_CALL(*tokenizer_, decode_token(100)).WillByDefault(Return(output));
+    ON_CALL(*tokenizer_, decode_token(0)).WillByDefault(Return(""));
+    for (bool reject_continuation : {false, true})
+    {
+        SCOPED_TRACE(reject_continuation);
+        int steps = 0;
+        ON_CALL(*runner_, decodeStep()).WillByDefault(Invoke([&] {
+            return ++steps == 1 ? makeToken(100) : makeToken(0, true);
+        }));
+        ChatCompletionRequest request;
+        request.messages = {{"user", "write"}};
+        request.max_tokens = 4;
+        request.enable_thinking = false;
+        request.stream = true;
+        request.tools = json::parse(R"([{"type":"function","function":{"name":"write","parameters":{"type":"object","properties":{"content":{"type":"string"}}}}}])");
+        std::string arguments;
+        request.streaming_usage = StreamingUsageOutput::Include;
+        int fragments = 0, finished = 0, done = 0, after_rejection = 0, usage = 0;
+        enum class PublicationPhase { Fragments, Finished, Usage, Done };
+        auto phase = PublicationPhase::Fragments;
+        const auto expected_arguments = json{{"content", value}}.dump();
+        bool rejected = false;
+        makeHandler()->handleStreamingRequest(request, [&](const std::string &line) {
+            if (rejected) ++after_rejection;
+            EXPECT_NE(phase, PublicationPhase::Done) << "publication after DONE";
+            EXPECT_TRUE(line.ends_with("\n\n"));
+            if (line.starts_with("data: [DONE]"))
+            {
+                EXPECT_EQ(line, "data: [DONE]\n\n");
+                EXPECT_EQ(phase, PublicationPhase::Usage);
+                phase = PublicationPhase::Done;
+                ++done;
+                return true;
+            }
+            const auto payload = json::parse(line.substr(6));
+            if (payload["choices"].empty())
+            {
+                ++usage;
+                EXPECT_EQ(finished, 1);
+                EXPECT_EQ(phase, PublicationPhase::Finished);
+                phase = PublicationPhase::Usage;
+                return true;
+            }
+            EXPECT_EQ(phase, PublicationPhase::Fragments) << "choice after terminal publication";
+            const auto &choice = payload["choices"][0];
+            if (!choice["finish_reason"].is_null())
+            {
+                ++finished;
+                EXPECT_GT(fragments, 1);
+                EXPECT_EQ(choice["finish_reason"], "tool_calls");
+                EXPECT_EQ(arguments, expected_arguments) << "finish before all argument bytes";
+                phase = PublicationPhase::Finished;
+            }
+            if (choice["delta"].contains("tool_calls"))
+            {
+                EXPECT_EQ(phase, PublicationPhase::Fragments);
+                const auto &call = choice["delta"]["tool_calls"][0];
+                EXPECT_EQ(call["index"], 0);
+                if (fragments++ == 0)
+                {
+                    EXPECT_TRUE(call.contains("id"));
+                    EXPECT_EQ(call["type"], "function");
+                    EXPECT_EQ(call["function"]["name"], "write");
+                }
+                else
+                {
+                    EXPECT_FALSE(call.contains("id"));
+                    EXPECT_FALSE(call.contains("type"));
+                    EXPECT_FALSE(call["function"].contains("name"));
+                }
+                arguments += call["function"]["arguments"].get<std::string>();
+                if (reject_continuation && fragments == 2) { rejected = true; return false; }
+            }
+            return true;
+        });
+        EXPECT_EQ(after_rejection, 0);
+        if (reject_continuation)
+        {
+            EXPECT_TRUE(rejected);
+            EXPECT_EQ(fragments, 2);
+            EXPECT_EQ(finished, 0);
+            EXPECT_EQ(usage, 0);
+            EXPECT_EQ(done, 0);
+        }
+        else
+        {
+            EXPECT_GT(fragments, 2);
+            EXPECT_EQ(arguments, expected_arguments);
+            EXPECT_EQ(phase, PublicationPhase::Done);
+            EXPECT_EQ(json::parse(arguments)["content"], value);
+            EXPECT_EQ(finished, 1);
+            EXPECT_EQ(usage, 1);
+            EXPECT_EQ(done, 1);
+        }
+    }
+}
+
 TEST_F(Test__ChatCompletionHandler, HandleRequest_RequiredChoicePublishesPromptPolicy)
 {
     auto handler = makeHandler();
@@ -5423,4 +5533,44 @@ TEST_F(Test__ChatCompletionHandler, StreamingSplitsLongTextIntoBoundedEvents)
     ASSERT_EQ(reconstructed.size(), big.size());
     EXPECT_TRUE(reconstructed == big);
     EXPECT_LE(largest_event, SSEPublishChannelBudget::kMaxEventBytes);
+}
+
+/** A failed fragment delivery must stop publication before subsequent fragments. */
+TEST_F(Test__ChatCompletionHandler, StreamingLongTextStopsAtRejectedFragment)
+{
+    ON_CALL(*tokenizer_, encodeChat(_, _, _)).WillByDefault(Return(std::vector<int>{1, 2}));
+    ON_CALL(*runner_, prefill(_)).WillByDefault(Return(true));
+    ON_CALL(*tokenizer_, is_stop_token(_)).WillByDefault(Return(false));
+    const std::string text(10000, 'x');
+    ON_CALL(*tokenizer_, decode_token(10)).WillByDefault(Return(text));
+    ON_CALL(*runner_, decodeStep()).WillByDefault(Invoke([&] { return makeTokens({10}); }));
+    ChatCompletionRequest request;
+    request.messages = {{"user", "long"}};
+    request.max_tokens = 4;
+    request.enable_thinking = false;
+    request.stream = true;
+    std::size_t fragments = 0;
+    std::size_t callbacks_after_rejection = 0;
+    bool rejected = false;
+    makeHandler()->handleStreamingRequest(request, [&](const std::string &line) {
+        if (rejected)
+            ++callbacks_after_rejection;
+        if (line.rfind("data: {", 0) == 0)
+        {
+            const auto chunk = json::parse(line.substr(6));
+            const auto &delta = chunk.at("choices")[0].at("delta");
+            if (delta.contains("content"))
+            {
+                ++fragments;
+                EXPECT_LE(delta["content"].get_ref<const std::string &>().size(),
+                          SSEPublishChannelBudget::kMaxDeltaTextBytes);
+                rejected = true;
+                return false;
+            }
+        }
+        return true;
+    });
+    EXPECT_TRUE(rejected);
+    EXPECT_EQ(fragments, 1);
+    EXPECT_EQ(callbacks_after_rejection, 0);
 }
