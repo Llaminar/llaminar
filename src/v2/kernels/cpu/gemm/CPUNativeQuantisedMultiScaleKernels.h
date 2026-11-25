@@ -1173,11 +1173,11 @@ namespace llaminar2::cpu::native_quantised::multi_scale
 #if defined(__AVX2__)
     namespace x86
     {
-        /** @brief Contiguous AVX2/AVX-512 Q5_K or IQ3_S tile (CPUNativeQuantisedSingleScaleX86Kernels.h). */
-        template <int Codebook, int Lanes, std::size_t Rows, typename Packed>
+        /** @brief AVX2/AVX-512 Q5_K or IQ3_S tile (CPUNativeQuantisedSingleScaleX86Kernels.h). */
+        template <int Codebook, int Lanes, std::size_t Rows, Reduction Tree, typename Packed>
         inline void singleScaleRows(const Packed &packed, const std::array<const Q8_1Block *, Rows> &activation,
                                     const std::array<float *, Rows> &output, int chunk, int begin, int end,
-                                    bool accumulate);
+                                    bool accumulate, int partitions, int blocks_per_partition);
     }
 #endif
 
@@ -1212,8 +1212,10 @@ namespace llaminar2::cpu::native_quantised::multi_scale
                 if (columns != 64)
                     throw std::invalid_argument("x86 single-scale compact tiles require complete 64-column chunks");
                 if (packed.codebook_id == 7)
-                    return x86::singleScaleRows<7, Lanes, Rows>(packed, activation, output, chunk, begin, end, accumulate);
-                return x86::singleScaleRows<11, Lanes, Rows>(packed, activation, output, chunk, begin, end, accumulate);
+                    return x86::singleScaleRows<7, Lanes, Rows, Reduction::Contiguous>(
+                        packed, activation, output, chunk, begin, end, accumulate, 1, 0);
+                return x86::singleScaleRows<11, Lanes, Rows, Reduction::Contiguous>(
+                    packed, activation, output, chunk, begin, end, accumulate, 1, 0);
             }
 #endif
         switch (packed.codebook_id)
@@ -1264,6 +1266,21 @@ namespace llaminar2::cpu::native_quantised::multi_scale
             static_cast<int64_t>(partitions) * blocks_per_partition < blocks ||
             static_cast<int64_t>(partitions) * blocks_per_partition > INT32_MAX)
             throw std::invalid_argument("Compact ordered dot requires its exact admitted K tree");
+#if defined(__AVX2__)
+        // The x86 single-scale leaves also own the ordered tree (GPU-aligned
+        // expert decode), with the same partition starts and left fold.
+        if constexpr (Lanes == 16 || (Lanes == 8 && Rows == 1))
+            if (packed.codebook_id == 7 || packed.codebook_id == 11)
+            {
+                if (columns != 64)
+                    throw std::invalid_argument("x86 single-scale compact tiles require complete 64-column chunks");
+                if (packed.codebook_id == 7)
+                    return x86::singleScaleRows<7, Lanes, Rows, Reduction::OrderedPartitions>(
+                        packed, activation, output, chunk, 0, blocks, false, partitions, blocks_per_partition);
+                return x86::singleScaleRows<11, Lanes, Rows, Reduction::OrderedPartitions>(
+                    packed, activation, output, chunk, 0, blocks, false, partitions, blocks_per_partition);
+            }
+#endif
         switch (packed.codebook_id)
         {
 #define LLAMINAR_MULTISCALE_ORDERED_CASE(C) case C: return rows<C, Lanes, Rows, Reduction::OrderedPartitions, Packed, Ops>(packed, activation, output, chunk, 0, blocks, false, partitions, blocks_per_partition, columns)

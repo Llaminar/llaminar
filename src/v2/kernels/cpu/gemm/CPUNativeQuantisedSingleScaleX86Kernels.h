@@ -291,12 +291,15 @@ namespace llaminar2::cpu::native_quantised::multi_scale::x86
      * @param chunk Output-column chunk.
      * @param begin First logical K block; may start inside a superblock.
      * @param end One-past-last logical K block.
-     * @param accumulate Start from the existing output instead of positive zero.
+     * @param accumulate Start from the existing output instead of positive zero (Contiguous only).
+     * @param partitions Exact ordered partition count; one for Contiguous.
+     * @param blocks_per_partition Consecutive K blocks per ordered partition; unused for Contiguous.
      */
-    template <int Codebook, int Lanes, std::size_t Rows, CPUProjectionNumericalPolicy Policy, typename Packed>
+    template <int Codebook, int Lanes, std::size_t Rows, Reduction Tree, CPUProjectionNumericalPolicy Policy,
+              typename Packed>
     LLAMINAR_MULTISCALE_EXACT inline void singleScalePolicy(const Packed &packed,
         const std::array<const Q8_1Block *, Rows> &activation, const std::array<float *, Rows> &output, int chunk,
-        int begin, int end, bool accumulate)
+        int begin, int end, bool accumulate, int partitions, int blocks_per_partition)
     {
 #if defined(__clang__)
 #pragma clang fp contract(off)
@@ -319,107 +322,123 @@ namespace llaminar2::cpu::native_quantised::multi_scale::x86
         const std::uint8_t *const row_base = packed.interleavedBase() + geometry.blockOffset(chunk, 0);
         for (int pass = 0; pass < 64; pass += Lanes * strips)
         {
-            F acc[Rows][strips];
-#pragma GCC unroll 4
-            for (std::size_t row = 0; row < Rows; ++row)
-#pragma GCC unroll 4
-                for (int strip = 0; strip < strips; ++strip)
-                    acc[row][strip] = accumulate ? load<F>(output[row] + pass + strip * Lanes) : F{};
-            for (int kb = begin; kb < end;)
+            F reduced[Rows][strips];
+            // Ordered trees start every partition at positive zero and fold it
+            // into the earlier ones in ascending order, exactly as rows() and
+            // the nibble ordered kernels do. Contiguous K is one partition.
+            const int partition_count = Tree == Reduction::OrderedPartitions ? partitions : 1;
+            for (int partition = 0; partition < partition_count; ++partition)
             {
-                // One superblock (or its ragged/partial intersection) at a time:
-                // its header stays resident in L1 and is widened per block, so
-                // no factor vector has to survive the block's decode.
-                const int superblock_end = std::min(end, static_cast<int>(geometry.superblockEnd(kb)));
-                const std::uint8_t *const header = row_base + geometry.headerOffset(0, kb);
-                const std::uint8_t *unit = row_base + geometry.blockOffset(0, kb);
-                for (; kb < superblock_end; ++kb, unit += block_stride)
-                {
-                    // Re-read the L1-resident header in every block: hoisting its
-                    // widened factors out of the block loop would only spill them.
-                    const std::uint8_t *block_header = header;
-                    asm("" : "+r"(block_header));
+                F acc[Rows][strips];
+#pragma GCC unroll 4
+                for (std::size_t row = 0; row < Rows; ++row)
 #pragma GCC unroll 4
                     for (int strip = 0; strip < strips; ++strip)
+                        acc[row][strip] = Tree == Reduction::Contiguous && accumulate
+                            ? load<F>(output[row] + pass + strip * Lanes) : F{};
+                const int first = Tree == Reduction::OrderedPartitions ? begin + partition * blocks_per_partition : begin;
+                const int last = Tree == Reduction::OrderedPartitions ? std::min(first + blocks_per_partition, end) : end;
+                for (int kb = first; kb < last;)
+                {
+                    // One superblock (or its ragged/partial intersection) at a time:
+                    // its header stays resident in L1 and is widened per block, so
+                    // no factor vector has to survive the block's decode.
+                    const int superblock_end = std::min(last, static_cast<int>(geometry.superblockEnd(kb)));
+                    const std::uint8_t *const header = row_base + geometry.headerOffset(0, kb);
+                    const std::uint8_t *unit = row_base + geometry.blockOffset(0, kb);
+                    for (; kb < superblock_end; ++kb, unit += block_stride)
                     {
-                        const int column = pass + strip * Lanes;
-                        I dots[Rows]{};
-                        [[maybe_unused]] I code;
-                        if constexpr (Codebook == 11)
+                        // Re-read the L1-resident header in every block: hoisting its
+                        // widened factors out of the block loop would only spill them.
+                        const std::uint8_t *block_header = header;
+                        asm("" : "+r"(block_header));
+    #pragma GCC unroll 4
+                        for (int strip = 0; strip < strips; ++strip)
                         {
-                            dotGroups<Lanes, Rows>(std::integer_sequence<int, 0, 1, 2, 3, 4, 5, 6, 7>{}, activation, kb,
-                                [&]<int Group>() { return decodeIQ3S<Lanes, Group>(unit, column); }, dots);
-                            code = L::nibbles(unit + data_stride, column);
-                        }
-                        else
-                        {
-                            // Groups g and g + 4 share nibble word g: visit them together.
-                            dotGroups<Lanes, Rows>(std::integer_sequence<int, 0, 4, 1, 5, 2, 6, 3, 7>{}, activation, kb,
-                                [&]<int Group>() {
-                                    return decodeQ5K<Lanes, Group>(unit, column, load<I>(unit + (Group % 4) * 256 + column * 4));
-                                }, dots);
-                            code = zeroExtendBytes<Lanes>(unit + data_stride + column) |
-                                   (L::nibbles(unit + data_stride + 64, column) << 8);
-                        }
-                        // The codec's widened factors: iq3sSourceScale() and reconstruct<7>().
-                        F scale0, scale1{};
-                        if constexpr (Codebook == 11)
-                        {
-                            const I word = L::template superblockWords<11>(block_header, column);
-                            scale0 = L::half(word) * L::toFloat(2 * (code & 15) + 1);
-                        }
-                        else
-                        {
-                            const I word = L::template superblockWords<7>(block_header, column);
-                            const F dmin = L::half(word >> 16);
-                            scale0 = L::staged(L::half(word) * L::toFloat(code & 63));
-                            scale1 = L::staged(-dmin * L::toFloat((code >> 6) & 63));
-                        }
-#pragma GCC unroll 4
-                        for (std::size_t row = 0; row < Rows; ++row)
-                        {
-                            const Q8_1Block &a = activation[row][kb];
-                            const auto dot = dots[row] - center * static_cast<int>(a.sum_qs);
-                            const float scale_a = nativeQuantisedFP16ScaleToFP32(a.d);
-                            if constexpr (Lanes == 8)
+                            const int column = pass + strip * Lanes;
+                            I dots[Rows]{};
+                            [[maybe_unused]] I code;
+                            if constexpr (Codebook == 11)
                             {
-                                if constexpr (Layout::affine)
-                                    acc[row][strip] = std::bit_cast<F>(accumulateCorrectedSingleScaleBlockAVX2(
-                                        std::bit_cast<__m256>(acc[row][strip]), std::bit_cast<__m256i>(dot),
-                                        std::bit_cast<__m256>(scale0), a.sum_qs, std::bit_cast<__m256>(scale1), scale_a, Policy));
-                                else
-                                    acc[row][strip] = std::bit_cast<F>(accumulateSingleScaleBlockAVX2(
-                                        std::bit_cast<__m256>(acc[row][strip]), std::bit_cast<__m256i>(dot),
-                                        std::bit_cast<__m256>(scale0), scale_a, Policy));
+                                dotGroups<Lanes, Rows>(std::integer_sequence<int, 0, 1, 2, 3, 4, 5, 6, 7>{}, activation, kb,
+                                    [&]<int Group>() { return decodeIQ3S<Lanes, Group>(unit, column); }, dots);
+                                code = L::nibbles(unit + data_stride, column);
                             }
-#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
                             else
                             {
-                                if constexpr (Layout::affine)
-                                    acc[row][strip] = std::bit_cast<F>(accumulateCorrectedSingleScaleBlockAVX512(
-                                        std::bit_cast<__m512>(acc[row][strip]), std::bit_cast<__m512i>(dot),
-                                        std::bit_cast<__m512>(scale0), a.sum_qs, std::bit_cast<__m512>(scale1), scale_a, Policy));
-                                else
-                                    acc[row][strip] = std::bit_cast<F>(accumulateSingleScaleBlockAVX512(
-                                        std::bit_cast<__m512>(acc[row][strip]), std::bit_cast<__m512i>(dot),
-                                        std::bit_cast<__m512>(scale0), scale_a, Policy));
+                                // Groups g and g + 4 share nibble word g: visit them together.
+                                dotGroups<Lanes, Rows>(std::integer_sequence<int, 0, 4, 1, 5, 2, 6, 3, 7>{}, activation, kb,
+                                    [&]<int Group>() {
+                                        return decodeQ5K<Lanes, Group>(unit, column, load<I>(unit + (Group % 4) * 256 + column * 4));
+                                    }, dots);
+                                code = zeroExtendBytes<Lanes>(unit + data_stride + column) |
+                                       (L::nibbles(unit + data_stride + 64, column) << 8);
                             }
-#endif
+                            // The codec's widened factors: iq3sSourceScale() and reconstruct<7>().
+                            F scale0, scale1{};
+                            if constexpr (Codebook == 11)
+                            {
+                                const I word = L::template superblockWords<11>(block_header, column);
+                                scale0 = L::half(word) * L::toFloat(2 * (code & 15) + 1);
+                            }
+                            else
+                            {
+                                const I word = L::template superblockWords<7>(block_header, column);
+                                const F dmin = L::half(word >> 16);
+                                scale0 = L::staged(L::half(word) * L::toFloat(code & 63));
+                                scale1 = L::staged(-dmin * L::toFloat((code >> 6) & 63));
+                            }
+    #pragma GCC unroll 4
+                            for (std::size_t row = 0; row < Rows; ++row)
+                            {
+                                const Q8_1Block &a = activation[row][kb];
+                                const auto dot = dots[row] - center * static_cast<int>(a.sum_qs);
+                                const float scale_a = nativeQuantisedFP16ScaleToFP32(a.d);
+                                if constexpr (Lanes == 8)
+                                {
+                                    if constexpr (Layout::affine)
+                                        acc[row][strip] = std::bit_cast<F>(accumulateCorrectedSingleScaleBlockAVX2(
+                                            std::bit_cast<__m256>(acc[row][strip]), std::bit_cast<__m256i>(dot),
+                                            std::bit_cast<__m256>(scale0), a.sum_qs, std::bit_cast<__m256>(scale1), scale_a, Policy));
+                                    else
+                                        acc[row][strip] = std::bit_cast<F>(accumulateSingleScaleBlockAVX2(
+                                            std::bit_cast<__m256>(acc[row][strip]), std::bit_cast<__m256i>(dot),
+                                            std::bit_cast<__m256>(scale0), scale_a, Policy));
+                                }
+    #if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
+                                else
+                                {
+                                    if constexpr (Layout::affine)
+                                        acc[row][strip] = std::bit_cast<F>(accumulateCorrectedSingleScaleBlockAVX512(
+                                            std::bit_cast<__m512>(acc[row][strip]), std::bit_cast<__m512i>(dot),
+                                            std::bit_cast<__m512>(scale0), a.sum_qs, std::bit_cast<__m512>(scale1), scale_a, Policy));
+                                    else
+                                        acc[row][strip] = std::bit_cast<F>(accumulateSingleScaleBlockAVX512(
+                                            std::bit_cast<__m512>(acc[row][strip]), std::bit_cast<__m512i>(dot),
+                                            std::bit_cast<__m512>(scale0), scale_a, Policy));
+                                }
+    #endif
+                            }
                         }
                     }
                 }
+#pragma GCC unroll 4
+                for (std::size_t row = 0; row < Rows; ++row)
+#pragma GCC unroll 4
+                    for (int strip = 0; strip < strips; ++strip)
+                        reduced[row][strip] = partition == 0 ? acc[row][strip] : reduced[row][strip] + acc[row][strip];
             }
 #pragma GCC unroll 4
             for (std::size_t row = 0; row < Rows; ++row)
 #pragma GCC unroll 4
                 for (int strip = 0; strip < strips; ++strip)
-                    std::memcpy(output[row] + pass + strip * Lanes, &acc[row][strip], sizeof(F));
+                    std::memcpy(output[row] + pass + strip * Lanes, &reduced[row][strip], sizeof(F));
         }
     }
 
 #if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
     /**
-     * @brief AVX-512 Q4_K / IQ4_XS tile under one fixed FP32 policy.
+     * @brief AVX-512 Q4_K / IQ4_XS tile under one fixed FP32 policy and K tree.
      * @tparam Codebook 5 (Q4_K) or 4 (IQ4_XS).
      * @tparam Rows Rows sharing each decoded weight vector.
      * @tparam Policy Prepared numerical policy.
@@ -431,10 +450,10 @@ namespace llaminar2::cpu::native_quantised::multi_scale::x86
      * (with q4KBase()) and sourceScaleFactors() do. Every column still visits
      * ascending K with its own accumulator, so the bytes are unchanged.
      */
-    template <int Codebook, std::size_t Rows, CPUProjectionNumericalPolicy Policy, typename Packed>
+    template <int Codebook, std::size_t Rows, Reduction Tree, CPUProjectionNumericalPolicy Policy, typename Packed>
     LLAMINAR_MULTISCALE_EXACT inline void nibblePolicy(const Packed &packed,
         const std::array<const Q8_1Block *, Rows> &activation, const std::array<float *, Rows> &output, int chunk,
-        int begin, int end, bool accumulate, __m512i decode_lut, int lut_bias)
+        int begin, int end, bool accumulate, int partitions, int blocks_per_partition, __m512i decode_lut, int lut_bias)
     {
 #if defined(__clang__)
 #pragma clang fp contract(off)
@@ -457,137 +476,189 @@ namespace llaminar2::cpu::native_quantised::multi_scale::x86
         const std::uint8_t *const row_base = packed.interleavedBase() + geometry.blockOffset(chunk, 0);
         for (int pass = 0; pass < 64; pass += 16 * strips)
         {
-            F acc[Rows][strips];
-#pragma GCC unroll 4
-            for (std::size_t row = 0; row < Rows; ++row)
-#pragma GCC unroll 4
-                for (int strip = 0; strip < strips; ++strip)
-                    acc[row][strip] = accumulate ? load<F>(output[row] + pass + strip * 16) : F{};
-            for (int kb = begin; kb < end;)
+            F reduced[Rows][strips];
+            // Ordered trees start every partition at positive zero and fold it
+            // into the earlier ones in ascending order, exactly as rows() and
+            // the nibble ordered kernels do. Contiguous K is one partition.
+            const int partition_count = Tree == Reduction::OrderedPartitions ? partitions : 1;
+            for (int partition = 0; partition < partition_count; ++partition)
             {
-                const int superblock_end = std::min(end, static_cast<int>(geometry.superblockEnd(kb)));
-                const std::uint8_t *const header = row_base + geometry.headerOffset(0, kb);
-                const std::uint8_t *const first_unit = row_base + geometry.blockOffset(0, kb);
-                // Widen every strip's superblock d once; it stays in registers
-                // for the superblock's blocks. Q4_K's dmin is re-widened per
-                // block from the L1-resident header: four more hoisted vectors
-                // would not fit beside the accumulators and would spill.
-                F base[strips];
+                F acc[Rows][strips];
 #pragma GCC unroll 4
-                for (int strip = 0; strip < strips; ++strip)
-                {
-                    if constexpr (Codebook == 5)
-                        base[strip] = L::half(L::template superblockWords<5>(header, pass + strip * 16));
-                    else
-                        base[strip] = Packed::template iq4xsBases<16>(header, pass + strip * 16);
-                }
-                const std::uint8_t *unit = first_unit;
-                for (int k = kb; k < superblock_end; ++k, unit += block_stride)
-                {
+                for (std::size_t row = 0; row < Rows; ++row)
 #pragma GCC unroll 4
                     for (int strip = 0; strip < strips; ++strip)
+                        acc[row][strip] = Tree == Reduction::Contiguous && accumulate
+                            ? load<F>(output[row] + pass + strip * 16) : F{};
+                const int first = Tree == Reduction::OrderedPartitions ? begin + partition * blocks_per_partition : begin;
+                const int last = Tree == Reduction::OrderedPartitions ? std::min(first + blocks_per_partition, end) : end;
+                for (int kb = first; kb < last;)
+                {
+                    const int superblock_end = std::min(last, static_cast<int>(geometry.superblockEnd(kb)));
+                    const std::uint8_t *const header = row_base + geometry.headerOffset(0, kb);
+                    const std::uint8_t *const first_unit = row_base + geometry.blockOffset(0, kb);
+                    // Widen every strip's superblock d once; it stays in registers
+                    // for the superblock's blocks. Q4_K's dmin is re-widened per
+                    // block from the L1-resident header: four more hoisted vectors
+                    // would not fit beside the accumulators and would spill.
+                    F base[strips];
+    #pragma GCC unroll 4
+                    for (int strip = 0; strip < strips; ++strip)
                     {
-                        const int column = pass + strip * 16;
-                        I dots[Rows]{};
-                        // Groups g and g + 4 share nibble word g: visit them together.
-                        dotGroups<16, Rows>(std::integer_sequence<int, 0, 4, 1, 5, 2, 6, 3, 7>{}, activation, k,
-                            [&]<int Group>() {
-                                const I raw = load<I>(unit + (Group % 4) * 256 + column * 4);
-                                const I nibble = (Group < 4 ? raw : raw >> 4) & 0x0F0F0F0F;
-                                if constexpr (Codebook == 4)
-                                    return std::bit_cast<I>(_mm512_shuffle_epi8(decode_lut, std::bit_cast<__m512i>(nibble)));
-                                else
-                                    return nibble;
-                            }, dots);
-                        const std::uint8_t *const planes = unit + data_stride;
-                        F scale0, scale1{};
                         if constexpr (Codebook == 5)
-                        {
-                            const std::uint8_t *block_header = header;
-                            asm("" : "+r"(block_header));
-                            const coded_metadata::Q4KBaseFactors<F> q4k{
-                                base[strip], L::half(L::template superblockWords<5>(block_header, column) >> 16)};
-                            const auto factors = coded_metadata::reconstruct<5, Ops>(
-                                Packed::template q4kCodes<16>(planes, column), q4k);
-                            scale0 = factors.primary;
-                            scale1 = factors.secondary;
-                        }
+                            base[strip] = L::half(L::template superblockWords<5>(header, pass + strip * 16));
                         else
-                            scale0 = coded_metadata::sourceScaleFactors<kNativeQuantisedIQ4XSSourceScaleCodebook, Ops>(
-                                Packed::template iq4xsCodes<16>(planes, column), base[strip]).primary;
-#pragma GCC unroll 4
-                        for (std::size_t row = 0; row < Rows; ++row)
+                            base[strip] = Packed::template iq4xsBases<16>(header, pass + strip * 16);
+                    }
+                    const std::uint8_t *unit = first_unit;
+                    for (int k = kb; k < superblock_end; ++k, unit += block_stride)
+                    {
+    #pragma GCC unroll 4
+                        for (int strip = 0; strip < strips; ++strip)
                         {
-                            const Q8_1Block &a = activation[row][k];
-                            const auto dot = dots[row] - center * static_cast<int>(a.sum_qs);
-                            const float scale_a = nativeQuantisedFP16ScaleToFP32(a.d);
-                            if constexpr (Layout::affine)
-                                acc[row][strip] = std::bit_cast<F>(accumulateCorrectedSingleScaleBlockAVX512(
-                                    std::bit_cast<__m512>(acc[row][strip]), std::bit_cast<__m512i>(dot),
-                                    std::bit_cast<__m512>(scale0), a.sum_qs, std::bit_cast<__m512>(scale1), scale_a, Policy));
+                            const int column = pass + strip * 16;
+                            I dots[Rows]{};
+                            // Groups g and g + 4 share nibble word g: visit them together.
+                            dotGroups<16, Rows>(std::integer_sequence<int, 0, 4, 1, 5, 2, 6, 3, 7>{}, activation, k,
+                                [&]<int Group>() {
+                                    const I raw = load<I>(unit + (Group % 4) * 256 + column * 4);
+                                    const I nibble = (Group < 4 ? raw : raw >> 4) & 0x0F0F0F0F;
+                                    if constexpr (Codebook == 4)
+                                        return std::bit_cast<I>(_mm512_shuffle_epi8(decode_lut, std::bit_cast<__m512i>(nibble)));
+                                    else
+                                        return nibble;
+                                }, dots);
+                            const std::uint8_t *const planes = unit + data_stride;
+                            F scale0, scale1{};
+                            if constexpr (Codebook == 5)
+                            {
+                                const std::uint8_t *block_header = header;
+                                asm("" : "+r"(block_header));
+                                const coded_metadata::Q4KBaseFactors<F> q4k{
+                                    base[strip], L::half(L::template superblockWords<5>(block_header, column) >> 16)};
+                                const auto factors = coded_metadata::reconstruct<5, Ops>(
+                                    Packed::template q4kCodes<16>(planes, column), q4k);
+                                scale0 = factors.primary;
+                                scale1 = factors.secondary;
+                            }
                             else
-                                acc[row][strip] = std::bit_cast<F>(accumulateSingleScaleBlockAVX512(
-                                    std::bit_cast<__m512>(acc[row][strip]), std::bit_cast<__m512i>(dot),
-                                    std::bit_cast<__m512>(scale0), scale_a, Policy));
+                                scale0 = coded_metadata::sourceScaleFactors<kNativeQuantisedIQ4XSSourceScaleCodebook, Ops>(
+                                    Packed::template iq4xsCodes<16>(planes, column), base[strip]).primary;
+    #pragma GCC unroll 4
+                            for (std::size_t row = 0; row < Rows; ++row)
+                            {
+                                const Q8_1Block &a = activation[row][k];
+                                const auto dot = dots[row] - center * static_cast<int>(a.sum_qs);
+                                const float scale_a = nativeQuantisedFP16ScaleToFP32(a.d);
+                                if constexpr (Layout::affine)
+                                    acc[row][strip] = std::bit_cast<F>(accumulateCorrectedSingleScaleBlockAVX512(
+                                        std::bit_cast<__m512>(acc[row][strip]), std::bit_cast<__m512i>(dot),
+                                        std::bit_cast<__m512>(scale0), a.sum_qs, std::bit_cast<__m512>(scale1), scale_a, Policy));
+                                else
+                                    acc[row][strip] = std::bit_cast<F>(accumulateSingleScaleBlockAVX512(
+                                        std::bit_cast<__m512>(acc[row][strip]), std::bit_cast<__m512i>(dot),
+                                        std::bit_cast<__m512>(scale0), scale_a, Policy));
+                            }
                         }
                     }
+                    kb = superblock_end;
                 }
-                kb = superblock_end;
+#pragma GCC unroll 4
+                for (std::size_t row = 0; row < Rows; ++row)
+#pragma GCC unroll 4
+                    for (int strip = 0; strip < strips; ++strip)
+                        reduced[row][strip] = partition == 0 ? acc[row][strip] : reduced[row][strip] + acc[row][strip];
             }
 #pragma GCC unroll 4
             for (std::size_t row = 0; row < Rows; ++row)
 #pragma GCC unroll 4
                 for (int strip = 0; strip < strips; ++strip)
-                    std::memcpy(output[row] + pass + strip * 16, &acc[row][strip], sizeof(F));
+                    std::memcpy(output[row] + pass + strip * 16, &reduced[row][strip], sizeof(F));
         }
     }
 
+#endif
+
+    /**
+     * @brief Validate a requested K interval and, for ordered trees, its exact partition geometry.
+     * @throws std::invalid_argument For a chunk, K interval or partition tree outside the admitted matrix.
+     *
+     * The same admission as rows(): empty trailing partitions of a short K are
+     * legal and contribute positive zero.
+     */
+    template <Reduction Tree, typename Packed>
+    inline void requireSingleScaleTile(const Packed &packed, int chunk, int begin, int end, int partitions,
+                                       int blocks_per_partition)
+    {
+        if (chunk < 0 || chunk >= packed.N_padded / 64 || (end > begin && (begin < 0 || end > packed.blocks_per_row)))
+            throw std::invalid_argument("Multi-scale CPU tile is outside its admitted geometry");
+        if constexpr (Tree == Reduction::OrderedPartitions)
+            if (partitions <= 0 || blocks_per_partition <= 0 ||
+                static_cast<std::int64_t>(partitions) * blocks_per_partition < end - begin ||
+                static_cast<std::int64_t>(begin) + static_cast<std::int64_t>(partitions) * blocks_per_partition > INT32_MAX)
+                throw std::invalid_argument("Multi-scale CPU tile requires an exact bounded ordered K tree");
+    }
+
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
     /**
      * @brief AVX-512 Q4_K (5) or IQ4_XS (4) superblock-coded nibble tile.
+     * @tparam Tree Contiguous K or the admitted ordered partition tree.
      * @param packed Admitted Q4KSuperblockCoded or NibbleLUTSourceScale matrix.
      * @param activation One persistent Q8_1 row per tile row.
      * @param output Sixty-four writable FP32 columns per row.
      * @param chunk Output-column chunk.
      * @param begin,end Logical K-block interval.
-     * @param accumulate Start from the existing output instead of positive zero.
+     * @param accumulate Start from the existing output instead of positive zero (Contiguous only).
+     * @param partitions,blocks_per_partition Exact ordered tree; one and zero for Contiguous.
      * @param decode_lut The caller's broadcast nibble table, biased by @p lut_bias.
      * @param lut_bias Unsigned zero point of @p decode_lut, removed via the activation sum.
-     * @throws std::invalid_argument For a mismatched encoding or geometry.
+     * @throws std::invalid_argument For a mismatched encoding, geometry or tree.
+     *
+     * Contiguous tiles follow the prepared policy; the ordered tree always
+     * applies the GPU-aligned expert program, as the generic ordered kernels do.
      */
-    template <int Codebook, std::size_t Rows, typename Packed>
+    template <int Codebook, std::size_t Rows, Reduction Tree = Reduction::Contiguous, typename Packed>
     inline void nibbleSingleScaleRows(const Packed &packed, const std::array<const Q8_1Block *, Rows> &activation,
                                       const std::array<float *, Rows> &output, int chunk, int begin, int end,
-                                      bool accumulate, __m512i decode_lut, int lut_bias)
+                                      bool accumulate, __m512i decode_lut, int lut_bias, int partitions = 1,
+                                      int blocks_per_partition = 0)
     {
         static_assert(Codebook == 4 || Codebook == 5);
         static_assert(Rows >= 1 && Rows <= 4);
-        if (packed.encoding != SingleScaleLayout<Codebook>::encoding || chunk < 0 || chunk >= packed.N_padded / 64 ||
-            (end > begin && (begin < 0 || end > packed.blocks_per_row)))
-            throw std::invalid_argument("x86 coded nibble tile is outside its admitted encoding or geometry");
-        if (packed.numerical_policy == CPUProjectionNumericalPolicy::GPUAlignedExpert)
-            return nibblePolicy<Codebook, Rows, CPUProjectionNumericalPolicy::GPUAlignedExpert>(
-                packed, activation, output, chunk, begin, end, accumulate, decode_lut, lut_bias);
-        return nibblePolicy<Codebook, Rows, CPUProjectionNumericalPolicy::BackendNative>(
-            packed, activation, output, chunk, begin, end, accumulate, decode_lut, lut_bias);
+        if (packed.encoding != SingleScaleLayout<Codebook>::encoding)
+            throw std::invalid_argument("x86 coded nibble tile requires its admitted encoding");
+        requireSingleScaleTile<Tree>(packed, chunk, begin, end, partitions, blocks_per_partition);
+        // The ordered nibble tree is by definition the GPU-aligned expert
+        // program, exactly like gemv_native_avx512_ordered_partitions().
+        if (Tree == Reduction::OrderedPartitions ||
+            packed.numerical_policy == CPUProjectionNumericalPolicy::GPUAlignedExpert)
+            return nibblePolicy<Codebook, Rows, Tree, CPUProjectionNumericalPolicy::GPUAlignedExpert>(
+                packed, activation, output, chunk, begin, end, accumulate, partitions, blocks_per_partition,
+                decode_lut, lut_bias);
+        return nibblePolicy<Codebook, Rows, Tree, CPUProjectionNumericalPolicy::BackendNative>(
+            packed, activation, output, chunk, begin, end, accumulate, partitions, blocks_per_partition,
+            decode_lut, lut_bias);
     }
 #endif
 
     /**
-     * @brief Contiguous x86 single-scale compact tile; fixes the policy before the traversal.
-     * @throws std::invalid_argument For a chunk or nonempty K interval outside the matrix.
+     * @brief x86 Q5_K (7) or IQ3_S (11) tile; fixes the policy before the traversal.
+     * @tparam Tree Contiguous K or the admitted ordered partition tree.
+     * @param partitions,blocks_per_partition Exact ordered tree; one and zero for Contiguous.
+     * @throws std::invalid_argument For a chunk, nonempty K interval or tree outside the matrix.
      */
-    template <int Codebook, int Lanes, std::size_t Rows, typename Packed>
+    template <int Codebook, int Lanes, std::size_t Rows, Reduction Tree, typename Packed>
     inline void singleScaleRows(const Packed &packed, const std::array<const Q8_1Block *, Rows> &activation,
-                                const std::array<float *, Rows> &output, int chunk, int begin, int end, bool accumulate)
+                                const std::array<float *, Rows> &output, int chunk, int begin, int end, bool accumulate,
+                                int partitions, int blocks_per_partition)
     {
         static_assert(Rows >= 1 && Rows <= 4);
-        if (chunk < 0 || chunk >= packed.N_padded / 64 || (end > begin && (begin < 0 || end > packed.blocks_per_row)))
-            throw std::invalid_argument("Multi-scale CPU tile is outside its admitted geometry");
+        requireSingleScaleTile<Tree>(packed, chunk, begin, end, partitions, blocks_per_partition);
         if (packed.numerical_policy == CPUProjectionNumericalPolicy::GPUAlignedExpert)
-            return singleScalePolicy<Codebook, Lanes, Rows, CPUProjectionNumericalPolicy::GPUAlignedExpert>(
-                packed, activation, output, chunk, begin, end, accumulate);
-        return singleScalePolicy<Codebook, Lanes, Rows, CPUProjectionNumericalPolicy::BackendNative>(
-            packed, activation, output, chunk, begin, end, accumulate);
+            return singleScalePolicy<Codebook, Lanes, Rows, Tree, CPUProjectionNumericalPolicy::GPUAlignedExpert>(
+                packed, activation, output, chunk, begin, end, accumulate, partitions, blocks_per_partition);
+        return singleScalePolicy<Codebook, Lanes, Rows, Tree, CPUProjectionNumericalPolicy::BackendNative>(
+            packed, activation, output, chunk, begin, end, accumulate, partitions, blocks_per_partition);
     }
 }
 

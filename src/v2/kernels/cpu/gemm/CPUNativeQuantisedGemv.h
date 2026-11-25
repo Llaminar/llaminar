@@ -1789,6 +1789,34 @@ namespace llaminar2::cpu::native_quantised
     }
 
     /**
+     * @brief Route a superblock-coded nibble tile to its dedicated AVX-512 leaf.
+     * @tparam Rows Rows sharing each decoded weight vector.
+     * @tparam Tree Contiguous K, or the ordered GPU-aligned partition tree.
+     * @param partitions,blocks_per_partition Exact ordered tree; ignored for Contiguous.
+     * @return Whether @p packed is Q4_K or IQ4_XS coded and the tile was executed.
+     *
+     * Their layout, policy and decode are fixed before the K traversal in
+     * multi_scale::x86::nibbleSingleScaleRows(); the same integer dots,
+     * per-block FP32 program and partition fold as the generic nibble kernels.
+     */
+    template <std::size_t Rows, multi_scale::Reduction Tree = multi_scale::Reduction::Contiguous>
+    inline bool projectCodedNibbleAVX512(const CPUNativeQuantisedPackedWeights &packed,
+        const std::array<const Q8_1Block *, Rows> &activation, const std::array<float *, Rows> &output,
+        int chunk, int kb_start, int kb_end, __m512i decode_lut, bool accumulate, int partitions = 1,
+        int blocks_per_partition = 0)
+    {
+        if (packed.encoding == CPUNativeQuantisedEncoding::Q4KSuperblockCoded)
+            multi_scale::x86::nibbleSingleScaleRows<5, Rows, Tree>(packed, activation, output, chunk, kb_start, kb_end,
+                accumulate, decode_lut, nibbleWeightBias(packed.codebook_id), partitions, blocks_per_partition);
+        else if (packed.encoding == CPUNativeQuantisedEncoding::NibbleLUTSourceScale)
+            multi_scale::x86::nibbleSingleScaleRows<4, Rows, Tree>(packed, activation, output, chunk, kb_start, kb_end,
+                accumulate, decode_lut, nibbleWeightBias(packed.codebook_id), partitions, blocks_per_partition);
+        else
+            return false;
+        return true;
+    }
+
+    /**
      * @brief Execute the fixed GPU-aligned K tree without materializing partials.
      *
      * One worker owns this output chunk, so all partition accumulators and the
@@ -1887,6 +1915,9 @@ namespace llaminar2::cpu::native_quantised
         int k_blocks_per_tile,
         const __m512i decode_lut)
     {
+        if (projectCodedNibbleAVX512<1, multi_scale::Reduction::OrderedPartitions>(packed, std::array{A_q8},
+                std::array{C}, chunk, 0, K_blocks, decode_lut, false, k_tiles, k_blocks_per_tile))
+            return;
 #define DISPATCH_ORDERED_NIBBLE(DECODE_KIND)                                   \
         if (packed.is_asymmetric)                                              \
             return gemv_native_avx512_ordered_partitions<                      \
@@ -2162,6 +2193,10 @@ namespace llaminar2::cpu::native_quantised
         int k_blocks_per_tile,
         const __m512i decode_lut)
     {
+        if (projectCodedNibbleAVX512<2, multi_scale::Reduction::OrderedPartitions>(packed,
+                std::array{A_q8_row0, A_q8_row1}, std::array{C_row0, C_row1}, chunk, 0, K_blocks, decode_lut, false,
+                k_tiles, k_blocks_per_tile))
+            return;
 #define DISPATCH_ORDERED_2ROW(DECODE_KIND)                                     \
         if (packed.is_asymmetric)                                              \
             return gemm_2row_native_avx512_ordered_partitions<                 \
@@ -2435,6 +2470,10 @@ namespace llaminar2::cpu::native_quantised
         if (!packed.usesNibbleLUT() || !is_nibble_lut_format(packed.codebook_id))
             throw std::logic_error(
                 "CPU ordered three-row dispatch requires canonical nibble prepared encoding");
+        if (projectCodedNibbleAVX512<3, multi_scale::Reduction::OrderedPartitions>(packed,
+                std::array{A_q8_row0, A_q8_row1, A_q8_row2}, std::array{C_row0, C_row1, C_row2}, chunk, 0, K_blocks,
+                decode_lut, false, k_tiles, k_blocks_per_tile))
+            return;
         static_assert(native_quantised_formats::IQ4_XS.is_asymmetric ==
                       native_quantised_formats::IQ4_NL.is_asymmetric);
         static_assert(native_quantised_formats::Q4_K.is_asymmetric ==
@@ -2546,31 +2585,6 @@ namespace llaminar2::cpu::native_quantised
                 accumulate);
         }
         throw std::logic_error("Unknown CPU projection numerical policy");
-    }
-
-    /**
-     * @brief Route a superblock-coded nibble tile to its dedicated AVX-512 leaf.
-     * @tparam Rows Rows sharing each decoded weight vector.
-     * @return Whether @p packed is Q4_K or IQ4_XS coded and the tile was executed.
-     *
-     * Their layout, policy and decode are fixed before the K traversal in
-     * multi_scale::x86::nibbleSingleScaleRows(); the same integer dots and
-     * per-block FP32 program as the generic nibble chunks below.
-     */
-    template <std::size_t Rows>
-    inline bool projectCodedNibbleAVX512(const CPUNativeQuantisedPackedWeights &packed,
-        const std::array<const Q8_1Block *, Rows> &activation, const std::array<float *, Rows> &output,
-        int chunk, int kb_start, int kb_end, __m512i decode_lut, bool accumulate)
-    {
-        if (packed.encoding == CPUNativeQuantisedEncoding::Q4KSuperblockCoded)
-            multi_scale::x86::nibbleSingleScaleRows<5, Rows>(packed, activation, output, chunk, kb_start, kb_end,
-                accumulate, decode_lut, nibbleWeightBias(packed.codebook_id));
-        else if (packed.encoding == CPUNativeQuantisedEncoding::NibbleLUTSourceScale)
-            multi_scale::x86::nibbleSingleScaleRows<4, Rows>(packed, activation, output, chunk, kb_start, kb_end,
-                accumulate, decode_lut, nibbleWeightBias(packed.codebook_id));
-        else
-            return false;
-        return true;
     }
 
     /**
