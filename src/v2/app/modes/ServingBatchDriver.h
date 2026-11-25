@@ -51,6 +51,7 @@ namespace llaminar2
         int prompt_tokens = 0;          ///< From the latest event.
         int cached_prompt_tokens = 0;   ///< Prefix-cache restored prompt tokens.
         bool prefix_cache_enabled = false;
+        int prefix_matched_blocks = 0;
         /// Response lease whose execution claim ends at the terminal event.
         std::shared_ptr<ServingResponseLeasePool::Lease> lease;
 
@@ -505,6 +506,7 @@ namespace llaminar2
             mailbox->prompt_tokens = event.prompt_tokens;
             mailbox->cached_prompt_tokens = event.cached_prompt_tokens;
             mailbox->prefix_cache_enabled = event.prefix_cache_enabled;
+            mailbox->prefix_matched_blocks = event.prefix_matched_blocks;
             if (event.finished() && mailbox->finish == ServingFinishReason::None)
             {
                 mailbox->finish = event.finish;
@@ -685,6 +687,7 @@ namespace llaminar2
             prefix.enabled = mailbox_->prefix_cache_enabled;
             prefix.requested_tokens = mailbox_->prompt_tokens;
             prefix.matched_tokens = mailbox_->cached_prompt_tokens;
+            prefix.matched_blocks = mailbox_->prefix_matched_blocks;
             prefix.partial_hit = mailbox_->cached_prompt_tokens > 0;
             prefix.storage_tier = mailbox_->cached_prompt_tokens > 0 ? "ram" : "none";
             return summary;

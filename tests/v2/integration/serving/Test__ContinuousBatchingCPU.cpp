@@ -67,6 +67,7 @@ namespace llaminar2::test
             int first_token_step = -1;
             int cached_prompt_tokens = 0;
             std::vector<std::uint64_t> logit_digests;
+            int prefix_matched_blocks = 0;
         };
 
         class ContinuousBatchingCPU : public ::testing::Test
@@ -133,6 +134,8 @@ namespace llaminar2::test
                         outcome.tokens.insert(outcome.tokens.end(), event.tokens.begin(), event.tokens.end());
                         outcome.cached_prompt_tokens = std::max(outcome.cached_prompt_tokens,
                                                                 event.cached_prompt_tokens);
+                        outcome.prefix_matched_blocks =
+                            std::max(outcome.prefix_matched_blocks, event.prefix_matched_blocks);
                         outcome.logit_digests.insert(outcome.logit_digests.end(),
                                                      event.logit_digests.begin(), event.logit_digests.end());
                         if (event.finished())
@@ -375,6 +378,9 @@ namespace llaminar2::test
         const auto batched = run({{0, {a}}, {2, {b}}});
         EXPECT_GT(batched.at(11).cached_prompt_tokens, 0);
         EXPECT_LT(batched.at(11).cached_prompt_tokens, 150);
+        // 150 tokens with 64-token blocks: the restore spans two blocks.
+        EXPECT_EQ(batched.at(11).prefix_matched_blocks, (batched.at(11).cached_prompt_tokens + 63) / 64);
+        EXPECT_GE(batched.at(11).prefix_matched_blocks, 2);
         EXPECT_EQ(batched.at(11).tokens, cold.tokens);
         EXPECT_EQ(batched.at(12).tokens, a_solo.tokens);
 

@@ -70,6 +70,7 @@ namespace llaminar2
         int prompt_tokens = 0;        ///< Prompt length (reported once finished).
         int cached_prompt_tokens = 0; ///< Prompt tokens restored from the prefix cache.
         bool prefix_cache_enabled = false; ///< The request was admitted through the prefix cache.
+        int prefix_matched_blocks = 0;     ///< Prefix-cache blocks restored into the slot.
         /// FNV-1a digests of the logits bytes of each decision in this step
         /// (only with ServingBatchRequest::record_logit_digests).
         std::vector<std::uint64_t> logit_digests;

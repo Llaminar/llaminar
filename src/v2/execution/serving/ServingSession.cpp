@@ -202,6 +202,10 @@ namespace llaminar2
             event.prompt_tokens = static_cast<int>(row.request.prompt.size());
             event.cached_prompt_tokens = row.cached_prompt_tokens;
             event.prefix_cache_enabled = row.prefix_admission.cache_enabled && row.prefix_admission.supported;
+            event.prefix_matched_blocks =
+                row.cached_prompt_tokens > 0 && row.prefix_admission.block_size > 0
+                    ? (row.cached_prompt_tokens + row.prefix_admission.block_size - 1) / row.prefix_admission.block_size
+                    : 0;
             event.completion_tokens = row.completion_tokens;
             return event;
         };
