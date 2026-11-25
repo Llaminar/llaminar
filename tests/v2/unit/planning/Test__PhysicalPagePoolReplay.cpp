@@ -9,6 +9,7 @@
  * This does not replay native KV kernels, published views or GPU accesses.
  */
 #include "planning/PhysicalPagePool.h"
+#include "planning/PageTableAdmission.h"
 #include "kernels/cpu/attention/CPUFP32PagedKVTable.h"
 #include "PhysicalPagePoolTraceData.h"
 #include <gtest/gtest.h>
@@ -327,6 +328,21 @@ public:
             if (!(input >> name) || cowplans_.erase(name) != 1) fail();
             outcome = "aborted";
         }
+        else if (kind == "combined")
+        {
+            size_t pages;
+            if (!(input >> name >> pages) || combinations_.contains(name)) fail();
+            auto admitted = admitPoolAndTable(*pool_, *table_, pages);
+            outcome = admitted ? "accepted" : "refused";
+            if (admitted)
+                combinations_.emplace(name, PageTableAdmission{
+                    std::move(admitted->grant), std::move(admitted->table_update)});
+        }
+        else if (kind == "combined-abort")
+        {
+            if (!(input >> name) || combinations_.erase(name) != 1) fail();
+            outcome = "aborted";
+        }
         else if (kind == "admit-witness")
         {
             std::string request;
@@ -347,7 +363,8 @@ public:
         else if (kind == "end")
         {
             if (!requests_.empty() || !pins_.empty() || !plans_.empty() || !pages_.empty() || !reads_.empty() ||
-                !updates_.empty() || !snapshots_.empty() || !shareds_.empty() || !adopted_.empty() || !cowplans_.empty()) fail();
+                !updates_.empty() || !snapshots_.empty() || !shareds_.empty() || !adopted_.empty() || !cowplans_.empty() ||
+                !combinations_.empty()) fail();
             outcome = "idle";
         }
         else fail();
@@ -371,6 +388,7 @@ private:
     std::map<std::string, PhysicalPagePool::SharedPage> shareds_;
     std::map<std::string, PhysicalPagePool::SharedPage> adopted_;
     std::map<std::string, PhysicalPagePool::COWPlan> cowplans_;
+    std::map<std::string, PageTableAdmission> combinations_;
 };
 
 /** @brief Parse an explicitly versioned complete trace and compare the production authority's observations. */
@@ -562,6 +580,46 @@ TEST(PhysicalMemoryAuthority, PagePoolWitnessReplayRejectsAlteredObservations)
         {"end | idle\n", ""}})
     {
         std::string corrupt(llaminar2::test::privatePageWitnessTrace);
+        const auto position = corrupt.find(original);
+        ASSERT_NE(position, std::string::npos);
+        corrupt.replace(position, original.size(), changed);
+        std::istringstream input(corrupt);
+        EXPECT_THROW(replay(input), std::exception);
+    }
+}
+
+/** @test Recorded all-class pool+table admission replay through real owners. */
+TEST(PhysicalMemoryAuthority, PagePoolRecordedCombinedAdmissionReplayExactly)
+{
+    if (const char *record = std::getenv("LLAMINAR_RECORD_PRIVATE_COMBINED_TRACE"))
+    {
+        std::ofstream output(record);
+        ASSERT_TRUE(output.good());
+        output << "pma-private-pages-v2 2 64 3 2 empty-zero-generations table 1 2 2 1 empty-zero-versions fp32-le\n";
+        PrivatePageReplay runner({2, 64, 3, 2}, CPUFP32PagedKVTableGeometry{1, 2, 2, 1});
+        for (const std::string command : {"combined one 1", "combined two 1", "combined three 1",
+            "combined-abort one", "combined-abort two", "combined three 1",
+            "combined-abort three", "end"})
+            output << command << " | " << runner.execute(command) << '\n';
+        output.close();
+        ASSERT_TRUE(output.good());
+        std::ifstream captured(record);
+        EXPECT_NO_THROW(replay(captured));
+        return;
+    }
+    std::istringstream input(llaminar2::test::privatePageCombinedTrace);
+    EXPECT_NO_THROW(replay(input));
+}
+
+/** @test Combined-admission replay rejects invented acceptance/refusal observations. */
+TEST(PhysicalMemoryAuthority, PagePoolCombinedReplayRejectsAlteredObservations)
+{
+    for (const auto &[original, changed] : std::vector<std::pair<std::string, std::string>>{
+        {"combined three 1 | refused", "combined three 1 | accepted"},
+        {"combined-abort one | aborted", "combined-abort one | retired"},
+        {"end | idle\n", ""}})
+    {
+        std::string corrupt(llaminar2::test::privatePageCombinedTrace);
         const auto position = corrupt.find(original);
         ASSERT_NE(position, std::string::npos);
         corrupt.replace(position, original.size(), changed);

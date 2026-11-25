@@ -30438,7 +30438,8 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     "${PMA_TRACE_ROOT}/private_tables_v2.txt"
     "${PMA_TRACE_ROOT}/attention_append_fp32_v2.txt"
     "${PMA_TRACE_ROOT}/private_sharing_v1.txt"
-    "${PMA_TRACE_ROOT}/private_witness_v1.txt")
+    "${PMA_TRACE_ROOT}/private_witness_v1.txt"
+    "${PMA_TRACE_ROOT}/private_combined_v1.txt")
 file(READ "${PMA_TRACE_ROOT}/private_ownership_v1.txt" PMA_OWNERSHIP_TRACE)
 file(READ "${PMA_TRACE_ROOT}/private_append_v1.txt" PMA_APPEND_TRACE)
 file(READ "${PMA_TRACE_ROOT}/private_readers_v1.txt" PMA_READER_TRACE)
@@ -30447,6 +30448,7 @@ file(READ "${PMA_TRACE_ROOT}/private_tables_v2.txt" PMA_TABLE_TRACE)
 file(READ "${PMA_TRACE_ROOT}/attention_append_fp32_v2.txt" PMA_APPEND_ATTENTION_TRACE)
 file(READ "${PMA_TRACE_ROOT}/private_sharing_v1.txt" PMA_SHARING_TRACE)
 file(READ "${PMA_TRACE_ROOT}/private_witness_v1.txt" PMA_WITNESS_TRACE)
+file(READ "${PMA_TRACE_ROOT}/private_combined_v1.txt" PMA_COMBINED_TRACE)
 configure_file("${PMA_TRACE_ROOT}/PhysicalPagePoolTraceData.h.in"
     "${CMAKE_CURRENT_BINARY_DIR}/PhysicalPagePoolTraceData.h" @ONLY)
 target_include_directories(v2_test_physical_memory_authority PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")

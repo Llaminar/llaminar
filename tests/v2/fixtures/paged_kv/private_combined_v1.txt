@@ -1,0 +1,9 @@
+pma-private-pages-v2 2 64 3 2 empty-zero-generations table 1 2 2 1 empty-zero-versions fp32-le
+combined one 1 | accepted
+combined two 1 | accepted
+combined three 1 | refused
+combined-abort one | aborted
+combined-abort two | aborted
+combined three 1 | accepted
+combined-abort three | aborted
+end | idle
