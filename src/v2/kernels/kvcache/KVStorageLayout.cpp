@@ -51,6 +51,21 @@ KVStorageFormat parseKVStorageFormat(const std::string &precision)
     throw std::invalid_argument("Unsupported KV-cache precision token '" + precision + "'");
 }
 
+const char *KVStorageFormatName(KVStorageFormat format)
+{
+    switch (format)
+    {
+        case KVStorageFormat::FP32: return "fp32";
+        case KVStorageFormat::BF16: return "bf16";
+        case KVStorageFormat::FP16: return "fp16";
+        case KVStorageFormat::Q8_1: return "q8_1";
+        case KVStorageFormat::Q16_1: return "q16_1";
+        case KVStorageFormat::TQ4: return "tq4";
+        case KVStorageFormat::TQ8: return "tq8";
+    }
+    throw std::invalid_argument("Unknown KV-cache format code");
+}
+
 KVNativeStorageLayout KVNativeStorageLayout::resolve(KVCacheFamily family, int heads, int head_dim,
     const std::string &precision, DeviceId device)
 {

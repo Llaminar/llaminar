@@ -75,6 +75,16 @@ public:
     }
     /** @return Whether this entry backs an immutable shared page rather than a private publication. */
     bool sharedBacked() const noexcept { return kind_ == Kind::Shared; }
+    /**
+     * @brief Borrow this page's immutable content as a shared reference.
+     * @return A new logical reference; the caller retains it as long as needed.
+     * @throws std::logic_error For a moved-from page.
+     */
+    PhysicalPagePool::SharedPage share() const
+    {
+        if (!data_) throw std::logic_error("Shared borrow uses an empty page");
+        return kind_ == Kind::Shared ? shared_.cloneForBorrow() : publication_.share();
+    }
     CPUFP32KVPage(const CPUFP32KVPage &) = delete;
     CPUFP32KVPage &operator=(const CPUFP32KVPage &) = delete;
     /** @return Original PMA issuer; table publication rejects foreign instance ownership. */
@@ -166,6 +176,20 @@ public:
     }
     /** @return Actual retained page banks, for per-bank admission rather than a fictitious contiguous extent. */
     std::span<const CPUFP32KVPage> pages() const noexcept { return pages_; }
+    /**
+     * @brief A shorter logical view over the same retained pages (truncate).
+     * @param visible_rows New visible live token count; never enlarges the source.
+     * @return A view borrowing the same page referents with the shortened extent.
+     * @throws std::invalid_argument If the prefix exceeds the source rows or is empty.
+     */
+    CPUFP32PagedKVView prefix(std::size_t visible_rows) const
+    {
+        if (!visible_rows || visible_rows > static_cast<std::size_t>(rows_))
+            throw std::invalid_argument("Native paged view prefix requires an exact nonempty visible extent");
+        CPUFP32PagedKVView clipped(pages_, page_tokens_);
+        clipped.rows_ = static_cast<int>(visible_rows);
+        return clipped;
+    }
     /** @return Total live tokens, excluding every physical frame's padding. */
     int rows() const noexcept { return rows_; }
     /** @return Participant-local KV heads. */

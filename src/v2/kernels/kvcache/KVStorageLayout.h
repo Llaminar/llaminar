@@ -21,6 +21,8 @@ enum class KVCacheFamily { AttentionOnly, Hybrid };
 enum class KVStorageFormat { FP32, BF16, FP16, Q8_1, Q16_1, TQ4, TQ8 };
 /** @brief Resolve existing public codec tokens with their established case/alias behavior. */
 KVStorageFormat parseKVStorageFormat(const std::string &precision);
+/** @brief Canonical installed codec token; the inverse of parseKVStorageFormat. */
+const char *KVStorageFormatName(KVStorageFormat format);
 /** @brief Native logical payload extent; fixed basis bytes are included once when serialized. */
 struct LogicalKVPayload
 {

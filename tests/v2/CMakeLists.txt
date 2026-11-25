@@ -8932,7 +8932,8 @@ add_executable(v2_test_cpu_flash_attention_kernel_t
     unit/kernels/cpu/attention/Test__CPUFlashAttentionPaged.cpp
     unit/kernels/cpu/attention/Test__CPUFlashAttentionPagedReplay.cpp
     unit/kernels/cpu/attention/Test__CPUFP32PagedKVTable.cpp
-    unit/kernels/cpu/attention/Test__CPUFP32PagedKVAppend.cpp)
+    unit/kernels/cpu/attention/Test__CPUFP32PagedKVAppend.cpp
+    unit/kernels/cpu/attention/Test__PagedKVArchive.cpp)
 target_include_directories(v2_test_cpu_flash_attention_kernel_t PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 target_link_libraries(v2_test_cpu_flash_attention_kernel_t
     llaminar2_core
@@ -8980,6 +8981,13 @@ add_v2_test(V2_Integration_PhysicalPagePoolSharingContract
     NO_MODELS NO_MPI MPI_PROCS 1 TIMEOUT 30
     ENVIRONMENT "OMP_NUM_THREADS=4;OMP_DYNAMIC=false;LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUFP32PagedKVAppendContract)
+add_v2_test(V2_Integration_PagedKVArchiveContract
+    COMMAND $<TARGET_FILE:v2_test_cpu_flash_attention_kernel_t>
+        --gtest_filter=PagedKVArchive.*
+    LABELS "V2;Integration;CPU;DeviceFree;KVCache;Contract;Archive;Provenance;Regression;ProductionTestPreflight"
+    NO_MODELS NO_MPI MPI_PROCS 1 TIMEOUT 30
+    ENVIRONMENT "OMP_NUM_THREADS=4;OMP_DYNAMIC=false;LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PagedKVArchiveContract)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PhysicalPagePoolSharingContract)
 add_v2_test(V2_Integration_CompletionWitnessContract
     COMMAND $<TARGET_FILE:v2_test_physical_memory_authority>

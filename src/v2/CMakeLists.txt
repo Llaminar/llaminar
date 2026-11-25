@@ -1815,6 +1815,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     planning/PhysicalPagePool.cpp
     planning/CompletionWitness.cpp
     planning/MemoryPlanner.cpp
+    kernels/cpu/attention/PagedKVArchive.cpp
     planning/ImmutableRowTablePlacementPlanner.cpp
     planning/ImmutableRowTableAdmissionWire.cpp
     planning/PipelineTransferMemory.cpp
