@@ -732,7 +732,12 @@ namespace llaminar2
         }
 
         /** @brief FAIL-CLOSED implementation seam (subclasses override; the base
-         *         is explicitly unsupported). */
+         *         is explicitly unsupported).
+         *
+         *  UNIMPLEMENTED IN PRODUCTION: no runner overrides this yet. It is the
+         *  reserved DecodeWindow seam for GPU retained continuous execution;
+         *  CPU continuous batching executes through the serving session below
+         *  (beginServingBatch/stepServingBatch). */
         virtual ServingWindowDecodeResult decodeServingWindowImpl(
             const ServingWindowDecodeInput &request)
         {

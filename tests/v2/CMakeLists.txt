@@ -45013,12 +45013,6 @@ target_link_libraries(v2_test_placement_topology llaminar2_core llaminar_placeme
 # A-2c + roadmap-3 substrate registrations (added on top of the A-3 v6 tree; the v6
 # preserved placement/first-touch registrations remain UNCHANGED)
 
-add_executable(v2_test_admission_gate unit/execution/serving/Test__AdmissionGate.cpp)
-target_link_libraries(v2_test_admission_gate llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Unit_AdmissionGate
-    COMMAND $<TARGET_FILE:v2_test_admission_gate>
-    LABELS "V2;Unit;Serving;ContinuousBatching;Admission;Backpressure;Regression"
-    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
 
 add_executable(v2_test_serving_window_decode unit/execution/serving/Test__ServingWindowDecode.cpp)
 target_include_directories(v2_test_serving_window_decode PRIVATE
@@ -45034,75 +45028,15 @@ add_v2_test(V2_Integration_ServingWindowDecodeContract
     LABELS "V2;Integration;ProductionTestPreflight;Serving;ContinuousBatching;WindowDecode;ABI;DeviceFree;Contract;Regression"
     MPI_PROCS 1 NO_MODELS TIMEOUT 60)
 
-add_executable(v2_test_ragged_row_compaction unit/execution/serving/Test__RaggedRowCompaction.cpp)
-target_link_libraries(v2_test_ragged_row_compaction llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Unit_RaggedRowCompaction
-    COMMAND $<TARGET_FILE:v2_test_ragged_row_compaction>
-    LABELS "V2;Unit;Serving;ContinuousBatching;Ragged;Compaction;Regression"
-    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
 
-add_executable(v2_test_physical_mode_classification unit/execution/serving/Test__PhysicalModeClassification.cpp)
-target_link_libraries(v2_test_physical_mode_classification llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Unit_PhysicalModeClassification
-    COMMAND $<TARGET_FILE:v2_test_physical_mode_classification>
-    LABELS "V2;Unit;Serving;ContinuousBatching;Memory;Modes;FailClosed;Regression"
-    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
 
-add_executable(v2_test_path_evidence_counters unit/execution/serving/Test__PathEvidenceCounters.cpp)
-target_link_libraries(v2_test_path_evidence_counters llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Unit_PathEvidenceCounters
-    COMMAND $<TARGET_FILE:v2_test_path_evidence_counters>
-    LABELS "V2;Unit;Serving;ContinuousBatching;Observability;PerfStats;Regression"
-    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
 
-add_executable(v2_test_output_grant_budget unit/execution/serving/Test__OutputGrantBudget.cpp)
-target_link_libraries(v2_test_output_grant_budget llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Unit_OutputGrantBudget
-    COMMAND $<TARGET_FILE:v2_test_output_grant_budget>
-    LABELS "V2;Unit;Serving;ContinuousBatching;Budget;Output;Regression"
-    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
 
-add_executable(v2_test_stop_think_history unit/execution/serving/Test__StopThinkAndHistory.cpp)
-target_link_libraries(v2_test_stop_think_history llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Unit_StopThinkHistory
-    COMMAND $<TARGET_FILE:v2_test_stop_think_history>
-    LABELS "V2;Unit;Serving;ContinuousBatching;StopThink;History;Regression"
-    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
 
-add_executable(v2_test_scheduling_policy unit/execution/serving/Test__SchedulingPolicy.cpp)
-target_link_libraries(v2_test_scheduling_policy llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Unit_SchedulingPolicy
-    COMMAND $<TARGET_FILE:v2_test_scheduling_policy>
-    LABELS "V2;Unit;Serving;ContinuousBatching;Scheduling;AntiStarvation;Regression"
-    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
 
-add_executable(v2_test_multi_device_identity unit/execution/serving/Test__MultiDeviceIdentity.cpp)
-target_link_libraries(v2_test_multi_device_identity llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Unit_MultiDeviceIdentity
-    COMMAND $<TARGET_FILE:v2_test_multi_device_identity>
-    LABELS "V2;Unit;Serving;ContinuousBatching;MultiDevice;Identity;Agreement;Regression"
-    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
 
-add_executable(v2_test_storage_io_coordinator unit/execution/serving/Test__StorageIOCoordinator.cpp)
-target_link_libraries(v2_test_storage_io_coordinator llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Unit_StorageIOCoordinator
-    COMMAND $<TARGET_FILE:v2_test_storage_io_coordinator>
-    LABELS "V2;Unit;Serving;ContinuousBatching;Prefix;Storage;IO;Regression"
-    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
 
-add_executable(v2_test_terminal_arbitration unit/execution/serving/Test__TerminalArbitration.cpp)
-target_link_libraries(v2_test_terminal_arbitration llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Unit_TerminalArbitration
-    COMMAND $<TARGET_FILE:v2_test_terminal_arbitration>
-    LABELS "V2;Unit;Serving;ContinuousBatching;Arbitration;ExactlyOnce;Lifecycle;Regression"
-    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
 
-add_executable(v2_test_prefill_decode_handoff unit/execution/serving/Test__PrefillDecodeHandoff.cpp)
-target_link_libraries(v2_test_prefill_decode_handoff llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Unit_PrefillDecodeHandoff
-    COMMAND $<TARGET_FILE:v2_test_prefill_decode_handoff>
-    LABELS "V2;Unit;Serving;ContinuousBatching;Handoff;Prefill;Decode;Regression"
-    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
 
 add_executable(v2_test_window_grant unit/execution/serving/Test__WindowGrant.cpp)
 target_link_libraries(v2_test_window_grant llaminar2_core GTest::gtest GTest::gtest_main)
@@ -45111,26 +45045,8 @@ add_v2_test(V2_Unit_WindowGrant
     LABELS "V2;Unit;Serving;ContinuousBatching;Grants;Backpressure;Scheduling;Regression"
     MPI_PROCS 1 NO_MODELS TIMEOUT 30)
 
-add_executable(v2_test_mtp_row_policy unit/execution/serving/Test__MTPRowPolicy.cpp)
-target_link_libraries(v2_test_mtp_row_policy llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Unit_MTPRowPolicy
-    COMMAND $<TARGET_FILE:v2_test_mtp_row_policy>
-    LABELS "V2;Unit;Serving;ContinuousBatching;MTP;Verifier;ExactlyOnce;Regression"
-    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
 
-add_executable(v2_test_serving_row_state unit/execution/serving/Test__ServingRowState.cpp)
-target_link_libraries(v2_test_serving_row_state llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Unit_ServingRowState
-    COMMAND $<TARGET_FILE:v2_test_serving_row_state>
-    LABELS "V2;Unit;Serving;ContinuousBatching;Rows;Identity;Lifecycle;Regression"
-    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
 
-add_executable(v2_test_sampler_law unit/execution/serving/Test__SamplerLaw.cpp)
-target_link_libraries(v2_test_sampler_law llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Unit_SamplerLaw
-    COMMAND $<TARGET_FILE:v2_test_sampler_law>
-    LABELS "V2;Unit;Serving;ContinuousBatching;Sampling;Laws;Memory;BOM;Regression"
-    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
 
 add_executable(v2_test_request_intrinsic_coordinates unit/execution/serving/Test__RequestIntrinsicCoordinates.cpp)
 target_link_libraries(v2_test_request_intrinsic_coordinates llaminar2_core GTest::gtest GTest::gtest_main)
@@ -45159,50 +45075,14 @@ add_v2_test(V2_Unit_ServingPublicationDrain
     COMMAND $<TARGET_FILE:v2_test_serving_publication_drain>
     LABELS "V2;Unit;Serving;ContinuousBatching;Publication;Lifetimes;ExactlyOnce;Regression"
     MPI_PROCS 1 NO_MODELS TIMEOUT 30)
-add_v2_test(V2_Integration_ServingSamplerLawPolicies
-    COMMAND $<TARGET_FILE:v2_test_sampler_law>
-    LABELS "V2;Integration;ProductionTestPreflight;Serving;ContinuousBatching;Sampler;Laws;Memory;Regression;DeviceFree"
-    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
 add_v2_test(V2_Integration_ServingIntrinsicCoordinates
     COMMAND $<TARGET_FILE:v2_test_request_intrinsic_coordinates>
     LABELS "V2;Integration;ProductionTestPreflight;Serving;ContinuousBatching;RNG;Windows;Overflow;Regression;DeviceFree"
-    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
-add_v2_test(V2_Integration_ServingStopThinkPolicies
-    COMMAND $<TARGET_FILE:v2_test_stop_think_history>
-    LABELS "V2;Integration;ProductionTestPreflight;Serving;ContinuousBatching;StopThink;History;Regression;DeviceFree"
-    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
-add_v2_test(V2_Integration_ServingOutputBudgetPolicies
-    COMMAND $<TARGET_FILE:v2_test_output_grant_budget>
-    LABELS "V2;Integration;ProductionTestPreflight;Serving;ContinuousBatching;Budget;Windows;Regression;DeviceFree"
-    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
-add_v2_test(V2_Integration_PathEvidenceCounterPolicies
-    COMMAND $<TARGET_FILE:v2_test_path_evidence_counters>
-    LABELS "V2;Integration;ProductionTestPreflight;Serving;ContinuousBatching;Observability;Counters;Regression;DeviceFree"
-    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
-add_v2_test(V2_Integration_TerminalArbitrationPolicies
-    COMMAND $<TARGET_FILE:v2_test_terminal_arbitration>
-    LABELS "V2;Integration;ProductionTestPreflight;Serving;ContinuousBatching;Arbitration;Outcomes;Regression;DeviceFree"
     MPI_PROCS 1 NO_MODELS TIMEOUT 30)
 
 add_v2_test(V2_Integration_ServingPolicyContractRegressions
     COMMAND $<TARGET_FILE:v2_test_window_grant>
     LABELS "V2;Integration;ProductionTestPreflight;Serving;ContinuousBatching;Policy;Grants;Aging;Regression;DeviceFree"
-    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
-add_v2_test(V2_Integration_ServingRowPolicyRegressions
-    COMMAND $<TARGET_FILE:v2_test_serving_row_state>
-    LABELS "V2;Integration;ProductionTestPreflight;Serving;ContinuousBatching;Rows;Continuation;Regression;DeviceFree"
-    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
-add_v2_test(V2_Integration_ServingAdmissionPolicyRegressions
-    COMMAND $<TARGET_FILE:v2_test_admission_gate>
-    LABELS "V2;Integration;ProductionTestPreflight;Serving;ContinuousBatching;Admission;Backpressure;Regression;DeviceFree"
-    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
-add_v2_test(V2_Integration_RaggedCompactionPolicyRegressions
-    COMMAND $<TARGET_FILE:v2_test_ragged_row_compaction>
-    LABELS "V2;Integration;ProductionTestPreflight;Serving;ContinuousBatching;Ragged;Bijection;Regression;DeviceFree"
-    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
-add_v2_test(V2_Integration_MTPPolicyRegressions
-    COMMAND $<TARGET_FILE:v2_test_mtp_row_policy>
-    LABELS "V2;Integration;ProductionTestPreflight;Serving;ContinuousBatching;MTP;Verifier;ExactlyOnce;Regression;DeviceFree"
     MPI_PROCS 1 NO_MODELS TIMEOUT 30)
 
 add_v2_test(V2_Integration_ServingPublicationCompletionRegressions

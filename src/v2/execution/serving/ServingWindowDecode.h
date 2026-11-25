@@ -2,6 +2,10 @@
  * @file ServingWindowDecode.h
  * @brief TYPED per-row serving-window decode ABI (design §2/§5.2/§6/§7/§8).
  *
+ * STATUS: reserved GPU retained-execution seam; no production runner
+ * implements decodeServingWindowImpl yet. CPU continuous batching runs
+ * through OrchestrationRunner's serving session (ServingBatch.h).
+ *
  * The current cohort ABI (prefillBatch/decodeStepBatch) advances logical
  * request batches. Continuous batching advances one admitted row by EXACTLY
  * its grant-issued intrinsic window under the request's own admitted
