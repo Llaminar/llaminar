@@ -345,23 +345,50 @@ TEST_F(CPUNativeNEONExecution, FusedActualOwnersRetainMemberGeometryAndInputs)
  * independent serial M=1 decode, with and without bias, for both policies,
  * every compiled dot family, a new and a retained team, ragged K and
  * GPU-aligned partition trees whose partitions do not divide the panel.
- * Panel and tile members share one workshare and one uniformly strided slab;
- * a short slab is rejected before any write; Decode members never borrow it.
+ * Member rows straddle the pooled boundary (neon_panel::min_pooled_rows) and
+ * the dense one; a K beyond 8192 makes every GPU-aligned partition outgrow a
+ * panel, so its unfinished sum lives in each worker slot's carry. Panel and
+ * tile members share one workshare and one uniformly strided slab, also when
+ * one launch mixes panel sources with register-only sources; a short slab is
+ * rejected before any write, the floats past the admitted demand are never
+ * written, and Decode members never borrow the slab.
  */
 TEST_F(CPUNativeNEONExecution, FusedPrefillMembersStreamPanelsAndRetainSerialBytes)
 {
     const Budget budget;
-    constexpr std::array<int, 5> member_rows{17, 3, 33, 16, 1};
+    constexpr std::array<int, 7> member_rows{17, 3, 33, 16, neon_panel::min_pooled_rows - 1,
+        neon_panel::min_pooled_rows, neon_panel::min_pooled_rows};
     constexpr int members = static_cast<int>(member_rows.size());
-    for (const auto *source : {&native_quantised_formats::IQ3_S, &native_quantised_formats::Q5_K,
-         &native_quantised_formats::Q5_0, &native_quantised_formats::IQ4_XS})
+    // 257 K blocks: each canonical 17-block GPU-aligned partition spans two
+    // panels (the carry program); the native sum rolls through 17 panels.
+    constexpr int carry_k = 8224;
+    static_assert(neon_panel::needsCarry(carry_k, CPUProjectionNumericalPolicy::GPUAlignedExpert));
+    static_assert(!neon_panel::needsCarry(8192, CPUProjectionNumericalPolicy::GPUAlignedExpert));
+    static_assert(!neon_panel::needsCarry(carry_k, CPUProjectionNumericalPolicy::BackendNative));
+    using Sources = std::array<const NativeQuantisedFormatInfo *, members>;
+    struct Bundle { const char *name; Sources sources; };
+    const auto uniform = [](const char *name, const NativeQuantisedFormatInfo &source) {
+        Bundle bundle{name, {}};
+        bundle.sources.fill(&source);
+        return bundle;
+    };
+    const auto &iq3s = native_quantised_formats::IQ3_S, &q5k = native_quantised_formats::Q5_K;
+    const auto &q50 = native_quantised_formats::Q5_0, &iq4xs = native_quantised_formats::IQ4_XS;
+    const std::array<Bundle, 5> bundles{uniform("IQ3_S", iq3s), uniform("Q5_K", q5k), uniform("Q5_0", q50),
+        uniform("IQ4_XS", iq4xs),
+        // One launch interleaving panel sources (Q5_0 only on one worker) with
+        // register-only IQ4_XS members, multi-row ones included.
+        Bundle{"mixed", {&iq3s, &iq4xs, &q5k, &q50, &iq3s, &iq4xs, &q5k}}};
+    constexpr std::uint32_t poison_bits = 0x7fa00ee1u;
+    for (const auto &bundle : bundles)
         for (const auto policy : {CPUProjectionNumericalPolicy::BackendNative, CPUProjectionNumericalPolicy::GPUAlignedExpert})
             // 16 one-block, 17 (two-block, ragged, empty tail) and 40 (three-block
-            // partitions straddling the sixteen-block panel, empty tail) K blocks.
-            for (const int k : {512, 544, 1280})
+            // partitions straddling the sixteen-block panel, empty tail) K blocks,
+            // then the carried 257-block tree.
+            for (const int k : {512, 544, 1280, carry_k})
                 for (const int workers : {1, 3})
                 {
-                    SCOPED_TRACE(::testing::Message() << "codebook=" << int(source->codebook_id) << " policy="
+                    SCOPED_TRACE(::testing::Message() << "bundle=" << bundle.name << " policy="
                         << int(policy) << " k=" << k << " workers=" << workers);
                     std::array<CPUNativeQuantisedPackedWeights, members> packed;
                     std::array<std::vector<Q8_1Block>, members> input;
@@ -369,7 +396,7 @@ TEST_F(CPUNativeNEONExecution, FusedPrefillMembersStreamPanelsAndRetainSerialByt
                     std::array<FusedVerifierRowsDesc, members> descriptors;
                     for (int p = 0; p < members; ++p)
                     {
-                        packed[p] = owner(*source, 65, k, policy);
+                        packed[p] = owner(*bundle.sources[p], 65, k, policy);
                         const int m = member_rows[p], stride = packed[p].N + 3;
                         input[p] = q8Rows(m, packed[p].blocks_per_row, 29 * p);
                         expected[p].assign(std::size_t(m - 1) * stride + packed[p].N + 4, 123456.0f);
@@ -389,12 +416,12 @@ TEST_F(CPUNativeNEONExecution, FusedPrefillMembersStreamPanelsAndRetainSerialByt
                             .rows = m, .input = input[p].data(), .purpose = ProjectionRowsPurpose::Prefill};
                     }
                     omp_set_num_threads(workers);
-                    const bool supported = source != &native_quantised_formats::IQ4_XS &&
-                        (source != &native_quantised_formats::Q5_0 || workers == 1);
                     const auto plan = planNativeQuantisedFusedRows(descriptors, 1, workers);
                     std::size_t demand = 0;
                     for (int p = 0; p < members; ++p)
                     {
+                        const auto *source = bundle.sources[p];
+                        const bool supported = source != &iq4xs && (source != &q50 || workers == 1);
                         EXPECT_EQ(plan.panels[p], supported && member_rows[p] >= neon_panel::min_pooled_rows) << p;
                         if (plan.panels[p])
                             demand = std::max(demand, nativeQuantisedProjectionPartialEnvelopeFloats(packed[p], member_rows[p]));
@@ -406,7 +433,16 @@ TEST_F(CPUNativeNEONExecution, FusedPrefillMembersStreamPanelsAndRetainSerialByt
                     AlignedVector<float> slab;
                     slab.resize_uninitialized(demand + 32);
                     const std::span<float> exact(slab.data(), demand);
-                    const auto poison = [&] { std::fill(slab.data(), slab.data() + slab.size(), std::bit_cast<float>(0x7fa00ee1u)); };
+                    const auto poison = [&] { std::fill(slab.data(), slab.data() + slab.size(), std::bit_cast<float>(poison_bits)); };
+                    // No worker slot, panel or carry may reach past the admitted demand.
+                    const auto guard = [&] {
+                        for (std::size_t i = demand; i < slab.size(); ++i)
+                        {
+                            std::uint32_t bits;
+                            std::memcpy(&bits, slab.data() + i, sizeof(bits));
+                            EXPECT_EQ(bits, poison_bits) << "slab float " << i << " past demand " << demand;
+                        }
+                    };
                     if (demand)
                     {
                         reset();
@@ -419,6 +455,7 @@ TEST_F(CPUNativeNEONExecution, FusedPrefillMembersStreamPanelsAndRetainSerialByt
                         EXPECT_TRUE(gemm_native_quantised_fused_verifier_rows_preq(nullptr, descriptors.data(), exact,
                             members, 1, packed[0].blocks_per_row, path));
                         check();
+                        guard();
                     };
                     run(ISAPath::AUTO);
                     run(ISAPath::NEON);
@@ -436,6 +473,7 @@ TEST_F(CPUNativeNEONExecution, FusedPrefillMembersStreamPanelsAndRetainSerialByt
                             members, 1, packed[0].blocks_per_row);
                     }
                     check();
+                    guard();
                     // Decode members keep their register tiles and borrow no slab.
                     auto decode = descriptors;
                     for (auto &d : decode) d.purpose = ProjectionRowsPurpose::Decode;
