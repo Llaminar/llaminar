@@ -27000,6 +27000,16 @@ bool OrchestrationRunner::publishPhysicalMemoryAuthority()
         };
         auto decide = [&](std::size_t r) {
             ServingRowState &row = serving_rows_[r];
+            if (row.request.record_logit_digests)
+            {
+                // Byte-exact identity of the decision's inputs: any change of
+                // arithmetic by batch composition changes the digest.
+                std::uint64_t digest = 1469598103934665603ull;
+                const auto *bytes = reinterpret_cast<const unsigned char *>(row.next_logits.data());
+                for (std::size_t i = 0; i < row.next_logits.size() * sizeof(float); ++i)
+                    digest = (digest ^ bytes[i]) * 1099511628211ull;
+                event_of(row).logit_digests.push_back(digest);
+            }
             int32_t token = 0;
             bool sampled = false;
             if (!row.forced.empty())

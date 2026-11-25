@@ -64,6 +64,7 @@ namespace llaminar2::test
             int finished_at_step = -1;
             int first_token_step = -1;
             int cached_prompt_tokens = 0;
+            std::vector<std::uint64_t> logit_digests;
         };
 
         class ContinuousBatchingCPU : public ::testing::Test
@@ -120,6 +121,8 @@ namespace llaminar2::test
                         outcome.tokens.insert(outcome.tokens.end(), event.tokens.begin(), event.tokens.end());
                         outcome.cached_prompt_tokens = std::max(outcome.cached_prompt_tokens,
                                                                 event.cached_prompt_tokens);
+                        outcome.logit_digests.insert(outcome.logit_digests.end(),
+                                                     event.logit_digests.begin(), event.logit_digests.end());
                         if (event.finished())
                         {
                             EXPECT_EQ(outcome.finish, ServingFinishReason::None) << "finished twice";
@@ -164,6 +167,32 @@ namespace llaminar2::test
         const auto served = solo(request);
         EXPECT_EQ(served.finish, ServingFinishReason::Length);
         EXPECT_EQ(served.tokens, scalar.tokens);
+    }
+
+    TEST_F(ContinuousBatchingCPU, LogitsBytesAreIndependentOfBatchComposition)
+    {
+        // Serial-row byte equivalence: the exact logits behind every decision
+        // of request A are identical alone, with a co-prefilling request, with
+        // a request entering mid-decode and at full capacity.
+        auto a = makeRequest(1, 37, 24, 0.0f, 1);
+        a.record_logit_digests = true;
+        const auto alone = solo(a);
+        ASSERT_EQ(alone.logit_digests.size(), alone.tokens.size());
+
+        const auto b = makeRequest(2, 150, 30, 0.7f, 5);  // long prompt: 3 chunks
+        const auto c = makeRequest(3, 12, 30, 0.0f, 1);
+        const auto d = makeRequest(4, 70, 30, 0.9f, 9);
+        const std::vector<std::pair<const char *, std::map<int, std::vector<ServingBatchRequest>>>> compositions = {
+            {"co-prefill", {{0, {a, b}}}},
+            {"enters mid-decode", {{0, {a}}, {4, {c}}}},
+            {"full capacity, staggered", {{0, {b, a}}, {2, {c}}, {5, {d}}}},
+        };
+        for (const auto &[name, entries] : compositions)
+        {
+            const auto outcome = run(entries).at(1);
+            EXPECT_EQ(outcome.tokens, alone.tokens) << name;
+            EXPECT_EQ(outcome.logit_digests, alone.logit_digests) << name;
+        }
     }
 
     TEST_F(ContinuousBatchingCPU, StopTokenIsReturnedAndRetiresOnlyItsRequest)

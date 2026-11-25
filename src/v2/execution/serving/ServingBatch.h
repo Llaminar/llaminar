@@ -34,6 +34,12 @@ namespace llaminar2
          *        When false it decodes until it finishes.
          */
         bool paced = false;
+        /**
+         * @brief Diagnostic: report a digest of the exact logits bytes behind
+         *        every token decision (ServingBatchEvent::logit_digests), to
+         *        prove batch composition never changes a request's arithmetic.
+         */
+        bool record_logit_digests = false;
     };
 
     /** @brief Why a serving request stopped producing tokens. */
@@ -64,6 +70,9 @@ namespace llaminar2
         int prompt_tokens = 0;        ///< Prompt length (reported once finished).
         int cached_prompt_tokens = 0; ///< Prompt tokens restored from the prefix cache.
         bool prefix_cache_enabled = false; ///< The request was admitted through the prefix cache.
+        /// FNV-1a digests of the logits bytes of each decision in this step
+        /// (only with ServingBatchRequest::record_logit_digests).
+        std::vector<std::uint64_t> logit_digests;
         int completion_tokens = 0;    ///< Total committed output tokens so far.
         std::string error;            ///< Diagnostic when finish == Error.
 
