@@ -29,9 +29,9 @@
  * SCOPE (narrowed honestly): typed forwarding + enclosing ingress,
  * correspondence and state checks on the accepted ABI mint/ingress machinery.
  * It is NOT production grouped decode, NOT engine lifecycle and NOT
- * production output publication. The GroupedServingEngine binding and the
- * production row-invariant decode/observable-provenance path are subsequent
- * slices.
+ * production output publication. It is the retained DecodeWindow seam for
+ * GPU serving; CPU continuous batching executes through OrchestrationRunner's
+ * slot-addressed serving rows.
  */
 
 #pragma once

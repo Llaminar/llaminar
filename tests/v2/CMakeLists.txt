@@ -18248,6 +18248,19 @@ add_v2_test(V2_Integration_QwenRevisionChatTemplate
     LABELS "V2;Integration;ProductionTestPreflight;Qwen;ChatTemplate;Reasoning;Regression"
     MPI_PROCS 1 NO_MODELS TIMEOUT 30)
 
+# Node-0 binding is skipped only when sysfs, memory-policy syscalls and hwloc
+# all agree the kernel has no NUMA (never on a hidden-sysfs NUMA container).
+add_executable(v2_test_non_numa_kernel unit/utils/Test__NonNUMAKernelClassification.cpp)
+target_link_libraries(v2_test_non_numa_kernel llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_NonNUMAKernelClassification
+    COMMAND $<TARGET_FILE:v2_test_non_numa_kernel>
+    LABELS "V2;Unit;NUMA;DeviceFree;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_NonNUMAKernelClassification
+    COMMAND $<TARGET_FILE:v2_test_non_numa_kernel>
+    LABELS "V2;Integration;ProductionTestPreflight;NUMA;DeviceFree;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+
 # Continuous-batching HTTP driver: exactly-once mailbox outcomes on finish,
 # cancellation (incl. transport close while queued), shutdown with pending
 # submissions, throwing steps and shared-forward failure; device-free.
@@ -45007,16 +45020,6 @@ add_v2_test(V2_Unit_AdmissionGate
     LABELS "V2;Unit;Serving;ContinuousBatching;Admission;Backpressure;Regression"
     MPI_PROCS 1 NO_MODELS TIMEOUT 30)
 
-add_executable(v2_test_shared_execution_proof unit/execution/serving/Test__SharedExecutionProof.cpp)
-target_include_directories(v2_test_shared_execution_proof PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path
-)
-target_link_libraries(v2_test_shared_execution_proof llaminar2_core GTest::gtest GTest::gtest_main GTest::gmock)
-add_v2_test(V2_Unit_SharedExecutionProof
-    COMMAND $<TARGET_FILE:v2_test_shared_execution_proof>
-    LABELS "V2;Unit;Serving;ContinuousBatching;SharedExecution;Acceptance;Regression"
-    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
-
 add_executable(v2_test_serving_window_decode unit/execution/serving/Test__ServingWindowDecode.cpp)
 target_include_directories(v2_test_serving_window_decode PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path
@@ -45201,11 +45204,6 @@ add_v2_test(V2_Integration_MTPPolicyRegressions
     COMMAND $<TARGET_FILE:v2_test_mtp_row_policy>
     LABELS "V2;Integration;ProductionTestPreflight;Serving;ContinuousBatching;MTP;Verifier;ExactlyOnce;Regression;DeviceFree"
     MPI_PROCS 1 NO_MODELS TIMEOUT 30)
-
-add_v2_test(V2_Integration_ServingSemanticContractRegressions
-    COMMAND $<TARGET_FILE:v2_test_shared_execution_proof>
-    LABELS "V2;Integration;ProductionTestPreflight;Serving;ContinuousBatching;Semantic;Lifecycle;Grants;Restore;Regression;DeviceFree"
-    MPI_PROCS 1 NO_MODELS TIMEOUT 60)
 
 add_v2_test(V2_Integration_ServingPublicationCompletionRegressions
     COMMAND $<TARGET_FILE:v2_test_serving_publication_drain>

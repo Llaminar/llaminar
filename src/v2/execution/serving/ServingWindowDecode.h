@@ -180,7 +180,6 @@ namespace llaminar2
         friend class ServingLawAdmission;
         friend class ServingWindowCommandFactory;
         friend class ServingWindowDecodeInput;
-        friend class GroupedServingEngine; // engine adopts the row's law node+owner
         friend class ServingLawNodePin;    // RAII pin owner (retain/release)
         /** @brief Retain the node (adds a holder pin; no retirement). */
         [[nodiscard]] static std::shared_ptr<ServingLawBindingNode> retain(
@@ -524,7 +523,6 @@ namespace llaminar2
         }
 
     private:
-        friend class GroupedServingEngine;
         friend class ServingWindowDecodeInput;
         /** @brief ENGINE-ONLY retained handle (the pin owner mints the ABI input
          *         through this; the input RETAINS before using). */
