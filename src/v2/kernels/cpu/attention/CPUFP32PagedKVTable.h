@@ -11,6 +11,7 @@
  */
 #pragma once
 #include "CPUFP32PagedKVView.h"
+#include "PagedKVArchive.h"
 #include <memory>
 #include <optional>
 
@@ -69,6 +70,16 @@ public:
         void append(CPUFP32KVPage &&page);
         /** @brief Adopt one shared immutable page reference into the next logical table position. */
         void appendShared(PhysicalPagePool::SharedPage &&shared, int heads, int dimension);
+        /**
+         * @brief Attach a validated archived prefix into fresh private pages.
+         * @param archive Authenticated FP32 attention section (provenance checked).
+         * @param grant Caller request with protected growth for every page.
+         * @param page_tokens Native block size for page slicing.
+         * @note The prefix is materialized privately; no sampler/RNG/history or
+         * domain-wide placement state is restored, and the attachment is fully
+         * gated by the archive provenance before any byte is copied.
+         */
+        void attachArchivedPrefix(const PagedKVArchive &archive, PhysicalPagePool::Grant &grant, int page_tokens);
         /** @brief Validate and publish a complete nonempty operation bank, without an unowned interval. */
         Snapshot commit();
     private:

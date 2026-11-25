@@ -107,6 +107,39 @@ CPUFP32PagedKVTable::Update &CPUFP32PagedKVTable::Update::operator=(Update &&oth
     if (this != &other) { release(); table_ = std::move(other.table_); bank_ = other.bank_; version_ = other.version_; }
     return *this;
 }
+void CPUFP32PagedKVTable::Update::attachArchivedPrefix(const PagedKVArchive &archive,
+    PhysicalPagePool::Grant &grant, int page_tokens)
+{
+    if (!table_) throw std::logic_error("CPU page-table prefix attach uses an empty update");
+    // Provenance gate before any mutation: FP32 attention only, exact
+    // heads/dimension must match the declared table geometry.
+    if (archive.empty() || archive.meta().format != KVStorageFormat::FP32 ||
+        archive.meta().family != KVCacheFamily::AttentionOnly)
+        throw std::invalid_argument("Archived prefix attach requires a nonempty FP32 attention section");
+    auto &state = table_->require(bank_, version_, Phase::Preparing);
+    // Provenance must agree with any page geometry already staged in this
+    // update; the view constructor on commit rejects mixed geometry anyway.
+    if (state.pages)
+    {
+        const auto &first = table_->pages_[bank_ * table_->geometry_.page_capacity];
+        if (first.heads() != archive.meta().heads || first.dimension() != archive.meta().dimension)
+            throw std::invalid_argument("Archived prefix provenance disagrees with the staged destination geometry");
+    }
+    // Private materialization under the caller grant; the returned pages are
+    // moved into this update. No sampler/RNG/history/placement state is
+    // restored by this attachment — only native K/V bytes enter the bank.
+    auto pages = archive.materialize(grant, page_tokens);
+    for (auto &page : pages)
+    {
+        if (state.pages == table_->geometry_.page_capacity)
+            throw std::logic_error("CPU page-table prefix attach exceeds its admitted metadata cells");
+        if (page.issuer() != table_->authority_.get())
+            throw std::invalid_argument("CPU page-table prefix attach has a foreign physical authority");
+        table_->pages_[bank_ * table_->geometry_.page_capacity + state.pages] = std::move(page);
+        ++state.pages;
+    }
+}
+
 void CPUFP32PagedKVTable::Update::appendShared(PhysicalPagePool::SharedPage &&shared, int heads, int dimension)
 {
     if (!table_) throw std::logic_error("CPU page-table shared append uses an empty update");

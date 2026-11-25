@@ -213,3 +213,41 @@ TEST(PagedKVArchive, MaterializeFailureIsAtomicAndPreservesOriginalGrant)
     ASSERT_EQ(pages.size(), 2u);
     EXPECT_EQ(ok_grant->remainingCommitment(), 0u);
 }
+/** @test Attaching an archived prefix stages private pages; provenance gates before mutation. */
+TEST(PagedKVArchive, AttachArchivedPrefixStagesPrivatePagesAndGatesProvenance)
+{
+    ArchiveFixture fx;
+    constexpr int heads = 1, dimension = 8, tokens = 4;
+    std::vector<float> rows(static_cast<size_t>(tokens) * 2 * static_cast<size_t>(heads) * static_cast<size_t>(dimension), 0.75f);
+    auto snapshot = publishPage(fx, rows, heads, dimension);
+    auto archive = PagedKVArchive::fromView(snapshot.view());
+    auto grant = fx.pool->tryAdmit(1);
+    ASSERT_TRUE(grant);
+    auto update = fx.table->tryBeginUpdate();
+    ASSERT_TRUE(update);
+    update->attachArchivedPrefix(archive, *grant, 4);
+    auto attached = update->commit();
+    auto view = attached.view();
+    ASSERT_EQ(view.rows(), 4);
+    const size_t row_stride = 2 * static_cast<size_t>(heads) * static_cast<size_t>(dimension);
+    EXPECT_EQ(std::memcmp(view.key(0, 0), rows.data(), 4 * row_stride * sizeof(float)), 0);
+    // Staging mismatched geometry into the same update refuses before appending.
+    // Use a fresh fixture with enough pages for snapshot + staged + grants.
+    ArchiveFixture fx2;
+    std::vector<float> other_rows(4 * 2 * 2 * static_cast<size_t>(dimension), 0.5f);
+    auto other_snapshot = publishPage(fx2, other_rows, 2, dimension);
+    auto other_archive = PagedKVArchive::fromView(other_snapshot.view());
+    auto grant1b = fx2.pool->tryAdmit(1);
+    ASSERT_TRUE(grant1b);
+    auto staged = archive.materialize(*grant1b, 4);
+    ASSERT_EQ(staged.size(), 1u);
+    auto grant2 = fx2.pool->tryAdmit(1);
+    ASSERT_TRUE(grant2);
+    auto update2 = fx2.table->tryBeginUpdate();
+    ASSERT_TRUE(update2);
+    update2->append(std::move(staged.front()));
+    // Mismatched provenance (heads 2 vs staged heads 1) refuses before staging
+    // a single byte; the caller's grant is untouched.
+    EXPECT_THROW(update2->attachArchivedPrefix(other_archive, *grant2, 4), std::invalid_argument);
+    EXPECT_EQ(grant2->remainingCommitment(), 1u);
+}
