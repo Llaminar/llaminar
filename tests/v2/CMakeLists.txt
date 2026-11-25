@@ -10731,7 +10731,7 @@ if(V2_CPU_TARGET_X86)
         v2_cpu_native_isa_runtime("${V2_X86_LEAF_ISA}" V2_X86_LEAF_RUNTIME_ISA)
         add_v2_test(V2_Integration_CPUX86CodedLeaves_${V2_X86_LEAF_ISA}
             COMMAND $<TARGET_FILE:v2_unit_cpu_x86_coded_leaves>
-                --gtest_filter=-CPUX86CodedLeaves.FusedPrefillMembersStreamPanelsAndRetainSerialBytes:CPUX86CodedLeaves.FusedOrderedPartitionNaNsKeepEarlierPartitionAndSerialBytes:CPUX86CodedLeaves.MalformedOrUnpairedEntriesRejectBeforeAnyWrite
+                --gtest_filter=-CPUX86CodedLeaves.FusedPrefillMembersStreamPanelsAndRetainSerialBytes:CPUX86CodedLeaves.FusedOrderedPartitionNaNsKeepEarlierPartitionAndSerialBytes:CPUX86CodedLeaves.Q6KOrderedNaNsKeepEarlierBlockAndSerialBytes:CPUX86CodedLeaves.MalformedOrUnpairedEntriesRejectBeforeAnyWrite
             LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;NativeQuantised;${V2_X86_LEAF_ISA};ByteExact;Regression"
             MPI_PROCS 1 NO_MODELS NO_MPI
             ENVIRONMENT "OMP_NUM_THREADS=1;OMP_DYNAMIC=false;LLAMINAR_ISA_LEVEL=${V2_X86_LEAF_RUNTIME_ISA}")
@@ -10753,7 +10753,7 @@ if(V2_CPU_TARGET_X86)
         # (nonpanel-only and mixed pooled-panel bundles, one and three workers).
         add_v2_test(V2_Integration_CPUX86FusedOrderedNaN_${V2_X86_LEAF_ISA}
             COMMAND $<TARGET_FILE:v2_unit_cpu_x86_coded_leaves>
-                --gtest_filter=CPUX86CodedLeaves.FusedOrderedPartitionNaNsKeepEarlierPartitionAndSerialBytes
+                --gtest_filter=CPUX86CodedLeaves.FusedOrderedPartitionNaNsKeepEarlierPartitionAndSerialBytes:CPUX86CodedLeaves.Q6KOrderedNaNsKeepEarlierBlockAndSerialBytes
             LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;NativeQuantised;MoE;Prefill;${V2_X86_LEAF_ISA};ByteExact;Regression"
             MPI_PROCS 1 NO_MODELS NO_MPI
             ENVIRONMENT "OMP_NUM_THREADS=3;OMP_DYNAMIC=false;LLAMINAR_ISA_LEVEL=${V2_X86_LEAF_RUNTIME_ISA}")

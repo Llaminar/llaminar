@@ -127,6 +127,16 @@ file(WRITE "${CMAKE_BINARY_DIR}/preflight.txt" "${V2_PRODUCTION_TEST_PREFLIGHT_T
                             if selected("CPUX86CodedLeaves.MalformedOrUnpairedEntriesRejectBeforeAnyWrite", expr):
                                 owners.append(test["name"])
                         self.assertEqual(owners, [name])
+                        q6 = "CPUX86CodedLeaves.Q6KOrderedNaNsKeepEarlierBlockAndSerialBytes"
+                        q6_owners = []
+                        for test in tests:
+                            if not test["name"].startswith("V2_Integration_CPUX86") or not test["name"].endswith("_" + isa):
+                                continue
+                            expr = next(arg.split("=", 1)[1] for arg in test["command"]
+                                        if arg.startswith("--gtest_filter="))
+                            if selected(q6, expr):
+                                q6_owners.append(test["name"])
+                        self.assertEqual(q6_owners, ["V2_Integration_CPUX86FusedOrderedNaN_" + isa])
                 else:
                     self.assertFalse(any("CPUX86CodedTileAdmission" in n for n in by_name))
 
