@@ -235,6 +235,19 @@ namespace llaminar2
             return ServingCapacityCapability(1, kDefaultServingResponsePool,
                                              kDefaultServingResponsePool - 1);
         }
+
+        /**
+         * @brief Envelope of authored continuous-batching capacity.
+         *
+         * Counts are bounded only by integer representation (R >= S + Q must
+         * stay representable); physical admission of the resolved counts is
+         * PMA's, not this envelope's.
+         */
+        [[nodiscard]] static ServingCapacityCapability continuousBatchingEnvelope() noexcept
+        {
+            constexpr int kAxis = std::numeric_limits<int>::max() / 4;
+            return ServingCapacityCapability(kAxis, 2 * kAxis, kAxis);
+        }
     };
 
     /**
@@ -448,8 +461,21 @@ namespace llaminar2
         return capacity.responseLeases() + control_headroom;
     }
 
+    /**
+     * @brief Resolve intent against the installed implementation.
+     *
+     * Automatic intent keeps the preserved capacity-one envelope (S = 1 with
+     * the 32-response pool). Authored intent is exact against the continuous-
+     * batching envelope: resident slots are served by OrchestrationRunner's
+     * slot-addressed rows and response leases by the detached per-request
+     * mailboxes, so the envelope adds no count limit of its own — the runner's
+     * PMA admission of S slots (KV and serving-pool bytes) is the physical
+     * bound, and unsupported runner topologies fail at serving startup.
+     */
     inline ResolvedServingCapacity resolveInstalledServingCapacity(const ServingCapacityRequest &request)
     {
-        return resolveServingCapacity(request, ServingCapacityQualificationOwner::installedEnvelope());
+        return resolveServingCapacity(request, request.isAutomatic()
+                                                   ? ServingCapacityQualificationOwner::installedEnvelope()
+                                                   : ServingCapacityQualificationOwner::continuousBatchingEnvelope());
     }
 } // namespace llaminar2

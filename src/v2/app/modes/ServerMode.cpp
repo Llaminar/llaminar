@@ -1091,18 +1091,21 @@ namespace llaminar2
 
         // ─── POST /v1/chat/completions ───────────────────────────────
 
-        // Continuous batching: when the runner serves resident request slots,
-        // one driver thread owns its serving session and every chat request
-        // runs concurrently through a batched generation lane.
+        // Continuous batching (§9.4): resolved resident slots S > 1 run every
+        // chat request concurrently through the runner-owned serving session;
+        // one driver thread owns it. S = 1 keeps the serialized executor.
         std::unique_ptr<ServingBatchDriver> batch_driver;
-        const int batch_capacity = mpi_coordinated ? 0 : runner->servingBatchCapacity();
-        if (config.batch_size > 1 && batch_capacity <= 1)
+        const int batch_capacity = resolved_capacity->residentSlots();
+        if (batch_capacity > 1 &&
+            (mpi_coordinated || runner->servingBatchCapacity() < batch_capacity))
         {
-            // --batch-size > 1 requests continuous batching; never silently
-            // serialize requests in its place.
-            LOG_ERROR("--batch-size " << config.batch_size << " requests continuous batching, which is unavailable: "
-                                      << (mpi_coordinated ? std::string("multi-rank continuous batching is not implemented yet")
-                                                          : runner->servingBatchUnsupportedReason()));
+            // Authored S > 1 is exact: never silently serialize requests.
+            LOG_ERROR("--serving-resident-slots " << batch_capacity
+                      << " requests continuous batching, which is unavailable: "
+                      << (mpi_coordinated ? std::string("multi-rank continuous batching is not implemented yet")
+                          : runner->servingBatchCapacity() > 0
+                              ? "the runner admitted " + std::to_string(runner->servingBatchCapacity()) + " request slots"
+                              : runner->servingBatchUnsupportedReason()));
             if (mpi_coordinated)
                 runner->shutdownMPIWorkers();
             runner->shutdown();
@@ -1130,6 +1133,8 @@ namespace llaminar2
                 flushPerfStatsFromEnv();
                 return 1;
             }
+            // Admission bound S + Q: at most Q requests wait for a slot. R >= S + Q
+            // (checked at resolution) sizes the HTTP response pool.
             const std::size_t max_in_flight =
                 static_cast<std::size_t>(batch_capacity) + executor_queue_capacity;
             const auto in_flight =

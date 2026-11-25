@@ -431,6 +431,20 @@ namespace llaminar2
          */
         [[nodiscard]] ServingCapacityRequest servingCapacityRequest() const;
 
+        /**
+         * @brief Bind serve-mode capacity to the runner before it is built.
+         *
+         * Authored resident slots S become the runner's request slots
+         * (batch_size), so PMA admits KV for every slot. Outside serve mode
+         * authored capacity has no consumer and is rejected; in serve mode a
+         * --batch-size above one without §9.4 intent is rejected because
+         * serving slots have exactly one authority.
+         * @param serving_consumer True for serve and for plan (whose document
+         *        serve applies); false for modes without a serving pool.
+         * @throws std::invalid_argument For the rejected combinations.
+         */
+        void bindServingCapacityToRunnerSlots(bool serving_consumer);
+
         // =========================================================================
         // Sampling Configuration
         // =========================================================================

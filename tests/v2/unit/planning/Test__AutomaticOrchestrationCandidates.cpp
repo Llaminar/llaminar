@@ -37,6 +37,7 @@
 #include "../models/qwen4exp/Qwen4ExpSidecarFixture.h"
 #include "../../utils/PlanningHostServiceFixture.h"
 #include "../../fixtures/backends/NativeOrderingEventGroupReplayAccess.h"
+#include <limits>
 #include <gtest/gtest.h>
 #include <array>
 #include <map>
@@ -1368,7 +1369,9 @@ TEST(AutomaticOrchestrationCandidates, ServingPoolOwnershipTypedDecision)
             auto inadmissible_config = compiled.config();
             inadmissible_config.serve_mode = true;
             inadmissible_config.serving_resident_slots = 1;
-            inadmissible_config.serving_response_leases = 1 << 20;
+            // Beyond the continuous-batching envelope (R stays representable
+            // with S + Q); smaller counts resolve and are priced by PMA.
+            inadmissible_config.serving_response_leases = std::numeric_limits<int>::max();
             inadmissible_config.serving_queue_capacity = 0;
             MoEOverlayMemoryPlanInputRequest inadmissible{
                 .model = request.model, .rank_plan = request.rank_plan,

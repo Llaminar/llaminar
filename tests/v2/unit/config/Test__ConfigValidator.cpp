@@ -904,31 +904,50 @@ TEST(Test__ConfigValidator, ServingCapacityPartialAuthoringIsRejected)
     }
 }
 
-TEST(Test__ConfigValidator, ServingCapacityAuthoredIntentFailsClosedUntilLeaseLifetime)
+TEST(Test__ConfigValidator, ServingCapacityAuthoredIntentIsAcceptedWithOneSlotAuthority)
 {
-    // §9.4 defines R through detached delivery; until the typed publication
-    // lease (design §4/§10.1) is installed, authored exposure must fail closed
-    // at the shared validation boundary rather than silently ignore selectable
-    // policy (reviewer seq 148-152 dispositions).
+    // Continuous batching installs the detached response lease, so coherent
+    // authored S/R/Q is valid. --batch-size may not name a different slot count.
     const auto validator = ConfigValidator::createStandard();
     OrchestrationConfig config;
-    config.serving_resident_slots = 1;
-    config.serving_response_leases = 1;
-    config.serving_queue_capacity = 0;
-    const auto errors = validator.validate(config);
-    EXPECT_TRUE(std::any_of(errors.begin(), errors.end(), [](const auto &e) {
-        return e.rule_id == "serving-capacity-lease-lifetime";
-    }));
-    EXPECT_FALSE(std::any_of(errors.begin(), errors.end(), [](const auto &e) {
-        return e.rule_id == "serving-capacity-all-or-none" || e.rule_id == "serving-capacity-coherent";
-    }));
+    config.serving_resident_slots = 4;
+    config.serving_response_leases = 8;
+    config.serving_queue_capacity = 4;
+    auto has = [](const auto &errors, const char *id) {
+        return std::any_of(errors.begin(), errors.end(), [&](const auto &e) { return e.rule_id == id; });
+    };
+    EXPECT_TRUE(validator.validate(config).empty());
+    config.batch_size = 4; // same authority value: accepted
+    EXPECT_FALSE(has(validator.validate(config), "serving-capacity-runner-slots"));
+    config.batch_size = 2; // conflicting slot authority
+    EXPECT_TRUE(has(validator.validate(config), "serving-capacity-runner-slots"));
+}
 
-    // Automatic intent stays valid.
+TEST(Test__ConfigValidator, ServeBindsResidentSlotsToTheRunner)
+{
+    OrchestrationConfig serve;
+    serve.serve_mode = true;
+    serve.serving_resident_slots = 3;
+    serve.serving_response_leases = 5;
+    serve.serving_queue_capacity = 2;
+    serve.bindServingCapacityToRunnerSlots(true);
+    EXPECT_EQ(serve.batch_size, 3);
+
+    OrchestrationConfig legacy;
+    legacy.serve_mode = true;
+    legacy.batch_size = 4; // serve has one slot authority: S
+    EXPECT_THROW(legacy.bindServingCapacityToRunnerSlots(true), std::invalid_argument);
+
+    OrchestrationConfig oneshot;
+    oneshot.serving_resident_slots = 2;
+    oneshot.serving_response_leases = 2;
+    oneshot.serving_queue_capacity = 0;
+    EXPECT_THROW(oneshot.bindServingCapacityToRunnerSlots(false), std::invalid_argument);
+
     OrchestrationConfig automatic;
-    const auto automatic_errors = validator.validate(automatic);
-    EXPECT_FALSE(std::any_of(automatic_errors.begin(), automatic_errors.end(), [](const auto &e) {
-        return e.rule_id == "serving-capacity-lease-lifetime";
-    }));
+    automatic.serve_mode = true;
+    automatic.bindServingCapacityToRunnerSlots(true);
+    EXPECT_EQ(automatic.batch_size, 1);
 }
 
 TEST(Test__ConfigValidator, ServingCapacityIncoherentEnvelopeIsRejected)
@@ -950,9 +969,6 @@ TEST(Test__ConfigValidator, ServingCapacityPartialAuthoringFiresStructuralAndSer
     OrchestrationConfig config;
     config.serving_resident_slots = 1; // only one axis; serve mode off
     const auto errors = validator.validate(config);
-    EXPECT_TRUE(std::any_of(errors.begin(), errors.end(), [](const auto &e) {
-        return e.rule_id == "serving-capacity-lease-lifetime";
-    }));
     EXPECT_TRUE(std::any_of(errors.begin(), errors.end(), [](const auto &e) {
         return e.rule_id == "serving-capacity-all-or-none";
     }));

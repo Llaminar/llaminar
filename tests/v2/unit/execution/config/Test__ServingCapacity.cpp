@@ -214,13 +214,25 @@ namespace llaminar2::test
         EXPECT_EQ(resolved.queueCapacity(), 31);
     }
 
-    TEST(ServingCapacity, InstalledResolutionRejectsUnqualifiedAuthoring)
+    TEST(ServingCapacity, InstalledResolutionServesAuthoredContinuousBatchingExactly)
     {
-        EXPECT_THROW(resolveInstalledServingCapacity(ServingCapacityRequest::authored(2, 33, 31)),
-                     ServingCapacityUnqualified); // resident > 1
-        EXPECT_THROW(resolveInstalledServingCapacity(ServingCapacityRequest::authored(1, 64, 0)),
-                     ServingCapacityUnqualified); // response leases > pool
-        EXPECT_THROW(resolveInstalledServingCapacity(ServingCapacityRequest::authored(1, 41, 40)),
-                     ServingCapacityUnqualified); // queue > Q bound
+        // Continuous batching: authored S > 1, R and Q resolve exactly (never
+        // clamped); physical admission of the slots belongs to PMA.
+        const auto batched = resolveInstalledServingCapacity(ServingCapacityRequest::authored(4, 40, 36));
+        EXPECT_EQ(batched.residentSlots(), 4);
+        EXPECT_EQ(batched.responseLeases(), 40);
+        EXPECT_EQ(batched.queueCapacity(), 36);
+        const auto wide = resolveInstalledServingCapacity(ServingCapacityRequest::authored(1, 64, 0));
+        EXPECT_EQ(wide.responseLeases(), 64);
+        // Incoherent authored intent is still rejected (R < S + Q).
+        EXPECT_THROW(resolveInstalledServingCapacity(ServingCapacityRequest::authored(4, 5, 2)),
+                     std::invalid_argument);
+        // Automatic intent keeps the preserved capacity-one pool.
+        EXPECT_EQ(resolveInstalledServingCapacity(ServingCapacityRequest::automatic()).residentSlots(), 1);
+    }
+
+    TEST(ServingCapacity, ContinuousBatchingEnvelopeIsSelfConsistent)
+    {
+        EXPECT_TRUE(ServingCapacityQualificationOwner::continuousBatchingEnvelope().isSelfConsistent());
     }
 } // namespace llaminar2::test

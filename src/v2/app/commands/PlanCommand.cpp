@@ -83,6 +83,8 @@ namespace llaminar2
                     "Apply the result with: llaminar2 serve --config plan.json");
                 return 0;
             }
+            // A plan is applied by serve: price the same request slots.
+            request.bindServingCapacityToRunnerSlots(/*serving_consumer=*/true);
             const auto errors = request.validate();
             if (!errors.empty())
             {

@@ -1494,14 +1494,14 @@ namespace llaminar2
             .long_name = "--batch-size",
             .category = "Inference Configuration",
             .value_label = "<n>",
-            .description = "Batch size (default: 1)",
+            .description = "Request batch slots for non-serving modes (default: 1). Serve sizes concurrent requests with --serving-resident-slots instead.",
             .setter = setters::parseInt(&OrchestrationConfig::batch_size, "--batch-size"),
         });
         spec.add({
             .long_name = "--serving-resident-slots",
             .category = "Serving Configuration",
             .value_label = "<n>",
-            .description = "Authored resident execution slots S (design §9.4). Exact, never auto-reduced. Supply with --serving-response-leases and --serving-queue-capacity, or omit all three for automatic resolution. Not yet exposable: authored intent is rejected until the detached response-lease lifetime is installed; omit all three for the preserved automatic pool.",
+            .description = "Authored resident execution slots S (design §9.4): S > 1 serves requests concurrently with continuous batching (serve only; the runner admits S request slots). Exact, never auto-reduced. Supply with --serving-response-leases and --serving-queue-capacity, or omit all three for the automatic capacity-one pool.",
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &config, const std::string &value)
                 {
@@ -1513,7 +1513,7 @@ namespace llaminar2
             .long_name = "--serving-response-leases",
             .category = "Serving Configuration",
             .value_label = "<n>",
-            .description = "Authored maximum response/output leases R (design §9.4). Exact, never auto-reduced. Supply with --serving-resident-slots and --serving-queue-capacity, or omit all three for automatic resolution. Not yet exposable: authored intent is rejected until the detached response-lease lifetime is installed; omit all three for the preserved automatic pool.",
+            .description = "Authored maximum response/output leases R (design §9.4, R >= S + Q): sizes the HTTP response pool. Exact, never auto-reduced. Supply with --serving-resident-slots and --serving-queue-capacity, or omit all three for the automatic capacity-one pool.",
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &config, const std::string &value)
                 {
@@ -1525,7 +1525,7 @@ namespace llaminar2
             .long_name = "--serving-queue-capacity",
             .category = "Serving Configuration",
             .value_label = "<n>",
-            .description = "Authored queue/preparing capacity Q (design §9.4, zero allowed). Exact, never auto-reduced. Supply with --serving-resident-slots and --serving-response-leases, or omit all three for automatic resolution. Not yet exposable: authored intent is rejected until the detached response-lease lifetime is installed; omit all three for the preserved automatic pool.",
+            .description = "Authored queue/preparing capacity Q (design §9.4, zero allowed): requests waiting for a resident slot; admission beyond S + Q answers 503. Exact, never auto-reduced. Supply with --serving-resident-slots and --serving-response-leases, or omit all three for the automatic capacity-one pool.",
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &config, const std::string &value)
                 {

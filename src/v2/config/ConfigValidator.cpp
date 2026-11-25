@@ -279,21 +279,21 @@ namespace llaminar2
             { return "Context length must be positive."; },
         });
 
-        // §9.4 defines response leases R through detached delivery. The
-        // detached delivery lifetime (typed PublicationLease, design §4/§10.1)
-        // is not installed yet, so authored exposure would bound semantics the
-        // runtime cannot honor. Fail closed at the shared validation boundary
-        // (serve/oneshot/benchmark/plan/apply and every programmatic
-        // config.validate() caller) instead of silently ignoring it; the
-        // automatic envelope (preserved 32-response pool) remains fully valid.
+        // §9.4 resident slots S are the runner's admitted request slots. One
+        // authority: --batch-size may not name a different slot count.
         v.addRule({
-            .id = "serving-capacity-lease-lifetime",
-            .description = "Authored §9.4 serving capacity requires the detached response-lease lifetime (not yet installed)",
-            .fix_hint = "Omit --serving-resident-slots/--serving-response-leases/--serving-queue-capacity for automatic preserved capacity; authored exposure lands with the typed response/publication lease (A-3)",
-            .applies = [](const OrchestrationConfig &c) { return c.hasServingCapacityIntent(); },
-            .check = [](const OrchestrationConfig &) -> std::optional<std::string>
+            .id = "serving-capacity-runner-slots",
+            .description = "Authored resident slots S are the runner's request slots; --batch-size may not differ",
+            .fix_hint = "Omit --batch-size when authoring --serving-resident-slots",
+            .applies = [](const OrchestrationConfig &c) {
+                return c.serving_resident_slots.has_value() && c.batch_size != 1 &&
+                       c.batch_size != *c.serving_resident_slots;
+            },
+            .check = [](const OrchestrationConfig &c) -> std::optional<std::string>
             {
-                return "Authored serving-capacity intent is rejected until the detached response-lease lifetime (design §4/§10.1) is installed; omit all three axes for automatic capacity.";
+                return "--batch-size " + std::to_string(c.batch_size) + " conflicts with --serving-resident-slots " +
+                       std::to_string(*c.serving_resident_slots) +
+                       "; serving request slots are set only by --serving-resident-slots.";
             },
         });
 
