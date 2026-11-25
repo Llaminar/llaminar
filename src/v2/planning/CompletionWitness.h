@@ -61,6 +61,25 @@ struct CompletionWitness
     bool valid() const noexcept { return !steps.empty(); }
 };
 
+/** @brief Fixed-size witness scratch; no per-admission heap allocation. */
+class WitnessWorkspace final
+{
+public:
+    /** @brief Bound exactly from admitted request-record geometry. */
+    explicit WitnessWorkspace(std::size_t records)
+        : requests_(records + 1), steps_((records + 1) * 2 + 1) {}
+    std::span<WitnessRequest> requests() noexcept { return requests_; }
+    /** @return Fixed step cells (at most 2 per request + terminal). */
+    std::span<WitnessStep> steps() noexcept { return steps_; }
+    /** @return Typed refusal buffer, fixed size. */
+    char *refusal() noexcept { return refusal_; }
+    static constexpr std::size_t refusalCapacity() noexcept { return sizeof(refusal_); }
+private:
+    std::vector<WitnessRequest> requests_;
+    std::vector<WitnessStep> steps_;
+    char refusal_[256] = {0};
+};
+
 /**
  * @brief Decide whether a completion order exists under the supplied geometry.
  * @param frames Total materialized frames P.
@@ -83,6 +102,15 @@ CompletionWitness proveCompletionOrder(std::size_t frames,
  */
 CompletionWitness proveCompletionOrder(std::size_t frames, const WitnessBaseOccupancy &base,
     std::span<const WitnessRequest> requests);
+/**
+ * @brief No-heap witness decision into a fixed workspace.
+ * @param workspace Preallocated request/step/refusal cells, no allocation here.
+ * @return True when a completion order exists; refusal text lands in workspace.
+ */
+bool proveCompletionOrderInto(WitnessWorkspace &workspace, std::size_t frames,
+    const WitnessBaseOccupancy &base, std::span<const WitnessRequest> requests);
+/** @brief Bytes of one fixed workspace for the authority BOM. */
+std::size_t witnessWorkspaceBytes(std::size_t records);
 
 /** @brief Exact per-phase arithmetic check used by the proof and its tests. */
 bool phaseFits(std::size_t frames, std::size_t occupied, std::size_t needed);

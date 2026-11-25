@@ -13,6 +13,7 @@
  */
 #include "CompletionWitness.h"
 #include <algorithm>
+#include <cstdio>
 #include <limits>
 
 namespace llaminar2::planning
@@ -27,6 +28,95 @@ bool phaseFits(std::size_t frames, std::size_t occupied, std::size_t needed)
 CompletionWitness proveCompletionOrder(std::size_t frames, std::span<const WitnessRequest> requests)
 {
     return proveCompletionOrder(frames, {}, requests);
+}
+
+bool proveCompletionOrderInto(WitnessWorkspace &workspace, std::size_t frames,
+    const WitnessBaseOccupancy &base, std::span<const WitnessRequest> requests)
+{
+    // Fixed workspace only: refusal in the supplied buffer, steps in fixed cells.
+    const auto decide = [&]() -> bool {
+        if (!frames)
+        {
+            std::snprintf(workspace.refusal(), WitnessWorkspace::refusalCapacity(),
+                "zero materialized frames");
+            return false;
+        }
+        std::size_t total_occupied = base.total();
+        if (requests.empty())
+        {
+            if (total_occupied > frames)
+            {
+                std::snprintf(workspace.refusal(), WitnessWorkspace::refusalCapacity(),
+                    "base occupancy exceeds the materialized pool");
+                return false;
+            }
+            return true;
+        }
+        for (const auto &request : requests)
+        {
+            if (!request.peak_frames || request.peak_frames > frames)
+            {
+                std::snprintf(workspace.refusal(), WitnessWorkspace::refusalCapacity(),
+                    "declared request cannot fit any single resident phase");
+                return false;
+            }
+            if (request.occupied_frames > request.peak_frames)
+            {
+                std::snprintf(workspace.refusal(), WitnessWorkspace::refusalCapacity(),
+                    "occupied frames exceed the declared request peak");
+                return false;
+            }
+            if (request.occupied_frames > std::numeric_limits<std::size_t>::max() - total_occupied)
+            {
+                std::snprintf(workspace.refusal(), WitnessWorkspace::refusalCapacity(),
+                    "occupied frame total overflows");
+                return false;
+            }
+            total_occupied += request.occupied_frames;
+        }
+        if (total_occupied > frames)
+        {
+            std::snprintf(workspace.refusal(), WitnessWorkspace::refusalCapacity(),
+                "currently occupied frames exceed the materialized pool");
+            return false;
+        }
+        std::size_t free_now = frames - total_occupied;
+        std::size_t freed = 0;
+        std::size_t step_count = 0;
+        for (std::size_t index = 0; index < requests.size(); ++index)
+        {
+            const auto &request = requests[index];
+            if (request.preserved)
+            {
+                workspace.steps()[step_count++] = {WitnessStep::Kind::Preserve,
+                    request.generation, request.occupied_frames, 0};
+                continue;
+            }
+            const std::size_t demand = request.peak_frames - request.occupied_frames;
+            const bool fits = demand <= free_now || demand - free_now <= freed;
+            if (!fits)
+            {
+                std::snprintf(workspace.refusal(), WitnessWorkspace::refusalCapacity(),
+                    "no completion order: request peak exceeds capacity available after prior completions");
+                return false;
+            }
+            workspace.steps()[step_count++] = {WitnessStep::Kind::Advance,
+                request.generation, demand, 0};
+            freed += request.occupied_frames;
+            if (freed > frames) freed = frames;
+            workspace.steps()[step_count++] = {WitnessStep::Kind::FinalRetire,
+                request.generation, 0, request.occupied_frames};
+        }
+        return true;
+    };
+    return decide();
+}
+
+std::size_t witnessWorkspaceBytes(std::size_t records)
+{
+    const std::size_t requests = records + 1;
+    const std::size_t steps = (records + 1) * 2 + 1;
+    return requests * sizeof(WitnessRequest) + steps * sizeof(WitnessStep) + 256;
 }
 
 CompletionWitness proveCompletionOrder(std::size_t frames, const WitnessBaseOccupancy &base,

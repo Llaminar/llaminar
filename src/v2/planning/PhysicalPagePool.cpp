@@ -119,22 +119,22 @@ bool PhysicalPagePool::tryAdmitTogether(std::span<const Demand> demands,
     return true;
 }
 
-std::vector<planning::WitnessRequest> PhysicalPagePool::liveWitnessRequests() const
+void PhysicalPagePool::fillWitnessRequests(std::span<planning::WitnessRequest> out) const
 {
     // Conservatively treat every outstanding finite grant (G = remaining) as
     // already occupied: admission must prove the worst case where all grants
-    // convert to frames, never only the currently assigned O subset.
-    std::vector<planning::WitnessRequest> requests;
-    for (std::size_t record = 0; record < requests_.size(); ++record)
+    // convert to frames, never only the currently assigned O subset. Fixed
+    // output span: no per-admission heap allocation.
+    std::size_t count = 0;
+    for (std::size_t record = 0; record < requests_.size() && count < out.size(); ++record)
     {
         const auto &request = requests_[record];
-        if (request.live)
-            requests.push_back({.generation=request.generation, .record=record,
-                .peak_frames=request.declared_peak,
-                .occupied_frames=request.assigned + request.remaining,
-                .preserved=false});
+        if (!request.live) continue;
+        out[count++] = {.generation=request.generation, .record=record,
+            .peak_frames=request.declared_peak,
+            .occupied_frames=request.assigned + request.remaining,
+            .preserved=false};
     }
-    return requests;
 }
 
 planning::WitnessBaseOccupancy PhysicalPagePool::physicalBaseOccupancy() const
@@ -159,12 +159,18 @@ std::optional<PhysicalPagePool::Grant> PhysicalPagePool::tryAdmitWithWitness(
         throw std::invalid_argument("Witness peak is outside the declared per-request bound");
     if (!initial_grant || initial_grant > declared_peak)
         throw std::invalid_argument("Initial witness grant must be positive and within the declared peak");
-    // Proof before mutation: the proposed live set must have a completion
-    // order. The new request enters with its finite initial grant as occupied,
-    // because that grant converts to O immediately after admission.
-    auto live = liveWitnessRequests();
-    live.push_back({.generation=0, .peak_frames=declared_peak, .occupied_frames=initial_grant, .preserved=false});
-    if (!planning::proveCompletionOrder(geometry_.frames, physicalBaseOccupancy(), live).valid())
+    // Proof before mutation using the fixed workspace: the proposed live set
+    // must have a completion order. The new request enters with its finite
+    // initial grant as occupied because that grant converts to O immediately.
+    planning::WitnessWorkspace workspace(geometry_.request_records);
+    fillWitnessRequests(workspace.requests());
+    std::size_t live = workspace.requests().size();
+    for (std::size_t i = 0; i < workspace.requests().size(); ++i)
+        if (!workspace.requests()[i].peak_frames) { live = i; break; }
+    workspace.requests()[live] =
+        {.generation=0, .peak_frames=declared_peak, .occupied_frames=initial_grant, .preserved=false};
+    if (!planning::proveCompletionOrderInto(workspace, geometry_.frames,
+        physicalBaseOccupancy(), workspace.requests().first(live + 1)))
         return std::nullopt;
     // Conservation under the INFINITE-GRANT model is the finite-operation
     // sum; the witness bounds the peak promise, never the converted grant.
@@ -197,13 +203,19 @@ bool PhysicalPagePool::extendWithWitness(Grant &grant, std::size_t pages)
         throw std::logic_error("Witness extension exceeds the declared peak");
     if (pages > geometry_.frames - protected_pages_)
         return false;
-    // Revalidate the PROPOSED state: this request's outstanding grant grows by
-    // `pages`; every other live request keeps its current committed occupancy.
-    auto live = liveWitnessRequests();
-    for (auto &entry : live)
-        if (entry.record == grant.record_)
-            entry.occupied_frames += pages;
-    if (!planning::proveCompletionOrder(geometry_.frames, physicalBaseOccupancy(), live).valid())
+    // Revalidate the PROPOSED state in the fixed workspace: this request's
+    // outstanding grant grows by `pages`; every other live request keeps its
+    // current committed occupancy.
+    planning::WitnessWorkspace workspace(geometry_.request_records);
+    fillWitnessRequests(workspace.requests());
+    std::size_t live = workspace.requests().size();
+    for (std::size_t i = 0; i < workspace.requests().size(); ++i)
+        if (!workspace.requests()[i].peak_frames) { live = i; break; }
+    for (std::size_t i = 0; i < live; ++i)
+        if (workspace.requests()[i].record == grant.record_)
+            workspace.requests()[i].occupied_frames += pages;
+    if (!planning::proveCompletionOrderInto(workspace, geometry_.frames,
+        physicalBaseOccupancy(), workspace.requests().first(live)))
         return false;
     request.remaining += pages;
     protected_pages_ += pages;
