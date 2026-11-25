@@ -18261,6 +18261,22 @@ add_v2_test(V2_Integration_NonNUMAKernelClassification
     LABELS "V2;Integration;ProductionTestPreflight;NUMA;DeviceFree;Regression"
     MPI_PROCS 1 NO_MODELS TIMEOUT 30)
 
+# Recorded-input replay of the continuous-batching serving step: a real-model
+# trace replayed device-free through the production ServingSession.
+add_executable(v2_test_serving_step_replay unit/execution/serving/Test__ServingStepReplay.cpp)
+target_include_directories(v2_test_serving_step_replay PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_definitions(v2_test_serving_step_replay PRIVATE
+    LLAMINAR_SERVING_TRACE_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/serving_step_replay/qwen2.5-0.5b-instruct-q4_0.cpu.trace")
+target_link_libraries(v2_test_serving_step_replay llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_ServingStepReplay
+    COMMAND $<TARGET_FILE:v2_test_serving_step_replay>
+    LABELS "V2;Unit;Serving;ContinuousBatching;TraceReplay;DeviceFree;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 60)
+add_v2_test(V2_Integration_ServingStepReplay
+    COMMAND $<TARGET_FILE:v2_test_serving_step_replay>
+    LABELS "V2;Integration;ProductionTestPreflight;Serving;ContinuousBatching;TraceReplay;DeviceFree;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 60)
+
 # Continuous-batching HTTP driver: exactly-once mailbox outcomes on finish,
 # cancellation (incl. transport close while queued), shutdown with pending
 # submissions, throwing steps and shared-forward failure; device-free.

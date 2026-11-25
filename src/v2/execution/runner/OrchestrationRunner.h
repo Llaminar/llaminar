@@ -29,6 +29,7 @@
 
 #pragma once
 
+#include "execution/serving/ServingSession.h"
 #include "../../models/ModelGenerationPolicy.h"
 
 #include "IOrchestrationRunner.h"
@@ -317,11 +318,15 @@ namespace llaminar2
         bool servingBatchIdle() const override;
         bool servingBatchHasRunnableWork() const override;
         std::string servingBatchUnsupportedReason() const override;
-        std::string servingBatchFailure() const override { return serving_failure_; }
+        std::string servingBatchFailure() const override
+        {
+            return serving_session_ ? serving_session_->failure() : std::string{};
+        }
         ServingBatchOccupancy servingBatchOccupancy() const override
         {
-            return {static_cast<int>(serving_rows_.size()), static_cast<int>(serving_queue_.size())};
+            return serving_session_ ? serving_session_->occupancy() : ServingBatchOccupancy{};
         }
+        void setServingTraceRecorder(std::shared_ptr<IServingTraceRecorder> recorder) override;
         void endServingBatch() override;
         GenerationResult generate(
             const std::vector<int32_t> &prompt_tokens,
@@ -2363,61 +2368,14 @@ namespace llaminar2
         std::vector<BatchedDecodeRequestState> batched_request_states_;
 
         /**
-         * @brief One resident request of the continuous-batching session.
+         * @brief The continuous-batching session (runner-owned lifecycle).
          *
-         * The request owns runner slot `slot` (its KV sequence) for its whole
-         * lifetime. It owns its sampler, history and position-keyed RNG, so
-         * its tokens do not depend on which other requests share a step. After
-         * a forward its next-token logits are retained until the request may
-         * decide (unpaced, granted or forced): deferring a position-keyed
-         * decision does not change it.
+         * Exists while a serving batch is open; it drives slot-addressed rows
+         * of runner_ through serving_rows_adapter_.
          */
-        struct ServingRowState
-        {
-            ServingBatchRequest request;
-            int slot = -1;
-            Sampler sampler;
-            std::size_t prompt_consumed = 0; ///< Prompt tokens already in KV.
-            int cached_tokens = 0;           ///< KV length of this slot.
-            int completion_tokens = 0;
-            int32_t last_token = 0;          ///< Last committed token.
-            bool needs_feed = false;         ///< last_token is not yet in KV.
-            bool has_logits = false;         ///< The slot's decision row holds the next decision.
-            int grant = 0;                   ///< Paced tokens still allowed.
-            std::deque<int32_t> forced;      ///< Tokens to commit instead of sampling.
-            bool cancelled = false;
-            int cached_prompt_tokens = 0;    ///< Prompt tokens restored from the prefix cache.
-            PrefixLookupResult prefix_admission; ///< Immutable identity for the prompt harvest.
-        };
-        /** @brief Resident requests (any order); each owns its slot. */
-        std::vector<ServingRowState> serving_rows_;
-        /** @brief Slot occupancy of the session. */
-        std::vector<bool> serving_slot_busy_;
-        /** @brief Submitted requests waiting for a free slot (FIFO). */
-        std::deque<ServingBatchRequest> serving_queue_;
-        /** @brief Cancellation intents not yet applied. */
-        std::vector<std::uint64_t> serving_cancellations_;
-        /** @brief Grants/forced tokens received while the request was queued. */
-        std::map<std::uint64_t, int> pending_serving_grants_;
-        std::map<std::uint64_t, std::vector<int32_t>> pending_serving_forced_;
-        int serving_capacity_ = 0;
-        bool serving_active_ = false;
-        /**
-         * @brief One retained decision-logits row per resident slot (capacity x
-         *        vocab FP32), allocated when the session opens and priced by
-         *        the serving pool's ServingSlotDecisionGeometry: no per-step
-         *        allocation.
-         */
-        std::vector<float> serving_decision_logits_;
-        float *servingDecisionLogits(int slot)
-        {
-            return serving_decision_logits_.data() +
-                   static_cast<std::size_t>(slot) * static_cast<std::size_t>(vocabSize());
-        }
-        /** @brief A shared forward failed: the session admits nothing more. */
-        std::string serving_failure_;
-        /** @brief Max prompt tokens one entering request adds per shared step. */
-        static constexpr int kServingPrefillChunk = 64;
+        std::unique_ptr<IServingRowExecutor> serving_rows_adapter_;
+        std::unique_ptr<ServingSession> serving_session_;
+        std::shared_ptr<IServingTraceRecorder> serving_trace_recorder_;
         bool batched_decode_active_{false};
         int decode_step_token_budget_{0};                               // Optional per-step cap used by generate(); 0 means unlimited
         bool mpi_coordinated_mode_{false};

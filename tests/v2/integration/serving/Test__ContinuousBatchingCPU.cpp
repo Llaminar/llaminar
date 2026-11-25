@@ -15,6 +15,7 @@
 
 #include "backends/BackendManager.h"
 #include "execution/runner/IOrchestrationRunner.h"
+#include "utils/ServingStepTrace.h"
 #include "utils/TestOrchestrationHelper.h"
 
 #include <cstdlib>
@@ -362,5 +363,90 @@ namespace llaminar2::test
         EXPECT_GT(c_out.cached_prompt_tokens, 0);
         EXPECT_LE(c_out.cached_prompt_tokens, 140);
         EXPECT_EQ(c_out.finish, ServingFinishReason::Length);
+    }
+} // namespace llaminar2::test
+
+namespace llaminar2::test
+{
+    /**
+     * Records the production serving session on the real model for the
+     * device-free recorded-input replay (V2_Unit_ServingStepReplay) and
+     * replays the recording at once through a fresh ServingSession. With
+     * LLAMINAR_CB_RECORD_TRACE=<path> the trace is written there (fixture).
+     */
+    TEST_F(ContinuousBatchingCPU, RecordedServingTraceReplaysExactly)
+    {
+        ServingStepTrace trace;
+        trace.context = 1024;
+        trace.vocab = runner_->vocabSize();
+        trace.capacity = 3;
+        runner_->setServingTraceRecorder(std::make_shared<ServingStepTraceRecorder>(trace));
+
+        auto submit = [&](int step, ServingBatchRequest request) {
+            ServingStepTrace::Command c;
+            c.kind = ServingStepTrace::Command::Kind::Submit;
+            c.step = step;
+            c.id = request.id;
+            c.request = std::move(request);
+            trace.commands.push_back(std::move(c));
+        };
+        auto command = [&](ServingStepTrace::Command::Kind kind, int step, std::uint64_t id, int value = 0) {
+            ServingStepTrace::Command c;
+            c.kind = kind;
+            c.step = step;
+            c.id = id;
+            c.value = value;
+            trace.commands.push_back(c);
+        };
+        auto a = makeRequest(1, 9, 14, 0.0f, 1);   // greedy, unpaced
+        auto b = makeRequest(2, 70, 10, 0.8f, 7);  // seeded stochastic, two prompt chunks
+        auto c = makeRequest(3, 21, 6, 0.0f, 1);   // greedy, paced with grants + forced token
+        c.paced = true;
+        auto d = makeRequest(4, 12, 8, 0.9f, 0);   // entropy seed resolved at admission
+        d.sampling.top_k = 20;
+        auto e = makeRequest(5, 30, 30, 0.0f, 1);  // queued, cancelled before entering
+        submit(0, a);
+        submit(0, b);
+        submit(0, c);
+        command(ServingStepTrace::Command::Kind::Grant, 1, 3, 2);
+        submit(2, e);
+        submit(3, d);
+        command(ServingStepTrace::Command::Kind::Force, 4, 3, 42);
+        command(ServingStepTrace::Command::Kind::Grant, 5, 3, 4);
+        command(ServingStepTrace::Command::Kind::Cancel, 7, 5);
+
+        ASSERT_TRUE(runner_->beginServingBatch(trace.capacity)) << runner_->lastError();
+        int last_command_step = 0;
+        for (const auto &cmd : trace.commands)
+            last_command_step = std::max(last_command_step, cmd.step);
+        for (int step = 0; step < 200; ++step)
+        {
+            for (const auto &cmd : trace.commands)
+            {
+                if (cmd.step != step)
+                    continue;
+                switch (cmd.kind)
+                {
+                case ServingStepTrace::Command::Kind::Submit:
+                    ASSERT_TRUE(runner_->submitServingRequest(cmd.request)) << runner_->lastError();
+                    break;
+                case ServingStepTrace::Command::Kind::Grant: runner_->grantServingTokens(cmd.id, cmd.value); break;
+                case ServingStepTrace::Command::Kind::Force: runner_->forceServingToken(cmd.id, cmd.value); break;
+                case ServingStepTrace::Command::Kind::Cancel: runner_->cancelServingRequest(cmd.id); break;
+                }
+            }
+            (void)runner_->stepServingBatch();
+            if (step >= last_command_step && runner_->servingBatchIdle())
+                break;
+        }
+        runner_->endServingBatch();
+        runner_->setServingTraceRecorder(nullptr);
+
+        ASSERT_TRUE(runner_->servingBatchIdle());
+        EXPECT_EQ(trace.admissions.size(), 4u) << "E is cancelled while queued";
+        EXPECT_NE(trace.admissions.back().seed, 0u) << "entropy seed is resolved and recorded";
+        EXPECT_EQ(ServingStepTraceReplayer::replay(trace), "");
+        if (const char *path = std::getenv("LLAMINAR_CB_RECORD_TRACE"); path && *path)
+            trace.write(path);
     }
 } // namespace llaminar2::test

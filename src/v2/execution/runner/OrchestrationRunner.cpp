@@ -635,7 +635,7 @@ namespace llaminar2
          * decode reaches it. The existing shared MTP distribution primitive
          * preserves the arithmetic order without adding another CDF algorithm.
          */
-        int sampleHostLogitsAtLogicalPosition(
+        int sampleHostLogitsAtLogicalPositionImpl(
             Sampler &sampler, const float *logits, size_t vocab_size,
             const SamplingParams &params, int logical_position)
         {
@@ -647,6 +647,13 @@ namespace llaminar2
                 sampler.compute_distribution(logits, vocab_size, params),
                 mtpSpecStochasticThresholdForPosition(
                     params, sampler, logical_position, MTPSpecStochasticDrawPurpose::Sample));
+        }
+
+        int sampleHostLogitsAtLogicalPosition(
+            Sampler &sampler, const float *logits, size_t vocab_size,
+            const SamplingParams &params, int logical_position)
+        {
+            return sampleHostLogitsAtLogicalPositionImpl(sampler, logits, vocab_size, params, logical_position);
         }
 
 
@@ -26763,9 +26770,39 @@ bool OrchestrationRunner::publishPhysicalMemoryAuthority()
         return runner_->servingRowsUnsupportedReason();
     }
 
+    namespace
+    {
+        /** @brief The session's row-execution seam over the inference runner. */
+        class InferenceRunnerServingRows final : public IServingRowExecutor
+        {
+        public:
+            explicit InferenceRunnerServingRows(IInferenceRunner &runner) : runner_(runner) {}
+            bool forwardServingRows(const std::vector<int> &slots,
+                                    const std::vector<std::vector<int>> &rows) override
+            {
+                return runner_.forwardServingRows(slots, rows);
+            }
+            const float *servingRowLogits(int row) const override { return runner_.servingRowLogits(row); }
+            bool resetServingRow(int slot) override { return runner_.resetServingRow(slot); }
+            int restoreServingRowPrefix(int slot, const std::vector<int32_t> &prompt,
+                                        PrefixLookupResult &admission) override
+            {
+                return runner_.restoreServingRowPrefix(slot, prompt, admission);
+            }
+            bool harvestServingRowPrefix(int slot, const PrefixLookupResult &admission,
+                                         const std::vector<int32_t> &prompt) override
+            {
+                return runner_.harvestServingRowPrefix(slot, admission, prompt);
+            }
+
+        private:
+            IInferenceRunner &runner_;
+        };
+    } // namespace
+
     bool OrchestrationRunner::beginServingBatch(int capacity)
     {
-        if (serving_active_)
+        if (serving_session_ && serving_session_->active())
             return setError("Serving batch session is already open");
         if (batched_decode_active_)
             return setError("Serving batch cannot open over a fixed request batch");
@@ -26778,420 +26815,80 @@ bool OrchestrationRunner::publishPhysicalMemoryAuthority()
         // Every slot starts empty; the scalar request path is retired for the
         // session's lifetime because the slots own all live sequence state.
         runner_->clear_cache();
-        for (int slot = 0; slot < supported; ++slot)
-            if (!runner_->resetServingRow(slot))
-                return setError("Serving batch could not reset slot " + std::to_string(slot));
-        serving_rows_.clear();
-        serving_rows_.reserve(static_cast<std::size_t>(capacity));
-        serving_slot_busy_.assign(static_cast<std::size_t>(capacity), false);
-        if (vocabSize() <= 0)
-            return setError("Serving batch requires the model vocabulary");
-        serving_decision_logits_.assign(
-            static_cast<std::size_t>(capacity) * static_cast<std::size_t>(vocabSize()), 0.0f);
-        serving_queue_.clear();
-        serving_cancellations_.clear();
-        serving_capacity_ = capacity;
-        serving_active_ = true;
+        const int context = plan_.runtime.max_seq_len > 0 ? plan_.runtime.max_seq_len : config_.max_seq_len;
+        serving_rows_adapter_ = std::make_unique<InferenceRunnerServingRows>(*runner_);
+        serving_session_ = std::make_unique<ServingSession>(*serving_rows_adapter_, context, vocabSize());
+        serving_session_->setTraceRecorder(serving_trace_recorder_);
+        std::string error;
+        if (!serving_session_->begin(capacity, supported, error))
+        {
+            serving_session_.reset();
+            serving_rows_adapter_.reset();
+            return setError(error);
+        }
         return true;
     }
 
     bool OrchestrationRunner::submitServingRequest(ServingBatchRequest request)
     {
-        if (!serving_active_)
+        if (!serving_session_)
             return setError("Serving batch session is not open");
-        if (request.prompt.empty() || request.max_new_tokens <= 0)
-            return setError("Serving request requires a prompt and a positive output budget");
-        const int context = plan_.runtime.max_seq_len > 0 ? plan_.runtime.max_seq_len
-                                                          : config_.max_seq_len;
-        if (static_cast<int>(request.prompt.size()) >= context)
-            return setError("Serving request prompt exceeds the admitted context");
-        if (!serving_failure_.empty())
-            return setError("Serving session failed: " + serving_failure_);
-        serving_queue_.push_back(std::move(request));
-        return true;
+        std::string error;
+        return serving_session_->submit(std::move(request), error) || setError(error);
     }
 
     void OrchestrationRunner::cancelServingRequest(std::uint64_t id)
     {
-        serving_cancellations_.push_back(id);
+        if (serving_session_)
+            serving_session_->cancel(id);
     }
 
     void OrchestrationRunner::grantServingTokens(std::uint64_t id, int tokens)
     {
-        if (tokens <= 0)
-            return;
-        for (auto &row : serving_rows_)
-            if (row.request.id == id)
-            {
-                row.grant += tokens;
-                return;
-            }
-        for (auto &queued : serving_queue_)
-            if (queued.id == id)
-            {
-                // Admission carries the grant: a queued request has no row yet.
-                pending_serving_grants_[id] += tokens;
-                return;
-            }
+        if (serving_session_)
+            serving_session_->grant(id, tokens);
     }
 
     void OrchestrationRunner::forceServingToken(std::uint64_t id, int32_t token)
     {
-        for (auto &row : serving_rows_)
-            if (row.request.id == id)
-            {
-                row.forced.push_back(token);
-                return;
-            }
-        // Unknown or finished ids are ignored (like grants); only a queued
-        // request carries forced tokens into admission.
-        for (const auto &queued : serving_queue_)
-            if (queued.id == id)
-            {
-                pending_serving_forced_[id].push_back(token);
-                return;
-            }
+        if (serving_session_)
+            serving_session_->force(id, token);
     }
 
     bool OrchestrationRunner::servingBatchIdle() const
     {
-        return serving_rows_.empty() && serving_queue_.empty();
+        return !serving_session_ || serving_session_->idle();
     }
 
     bool OrchestrationRunner::servingBatchHasRunnableWork() const
     {
-        if (!serving_active_)
-            return false;
-        if (!serving_cancellations_.empty())
-            return true;
-        if (!serving_queue_.empty() &&
-            std::find(serving_slot_busy_.begin(), serving_slot_busy_.end(), false) != serving_slot_busy_.end())
-            return true;
-        for (const auto &row : serving_rows_)
-        {
-            const bool may_decide = !row.forced.empty() || !row.request.paced || row.grant > 0;
-            if (row.cancelled || row.prompt_consumed < row.request.prompt.size() ||
-                ((row.has_logits || row.needs_feed) && may_decide))
-                return true;
-        }
-        return false;
+        return serving_session_ && serving_session_->hasRunnableWork();
     }
 
     void OrchestrationRunner::endServingBatch()
     {
-        for (const auto &row : serving_rows_)
-            (void)runner_->resetServingRow(row.slot);
-        serving_rows_.clear();
-        serving_slot_busy_.clear();
-        serving_queue_.clear();
-        serving_cancellations_.clear();
-        pending_serving_grants_.clear();
-        pending_serving_forced_.clear();
-        serving_active_ = false;
-        serving_capacity_ = 0;
-        serving_failure_.clear();
-        serving_decision_logits_.clear();
-        serving_decision_logits_.shrink_to_fit();
+        if (serving_session_)
+            serving_session_->end();
+        serving_session_.reset();
+        serving_rows_adapter_.reset();
+    }
+
+    void OrchestrationRunner::setServingTraceRecorder(std::shared_ptr<IServingTraceRecorder> recorder)
+    {
+        serving_trace_recorder_ = std::move(recorder);
+        if (serving_session_)
+            serving_session_->setTraceRecorder(serving_trace_recorder_);
+    }
+
+    int sampleServingDecision(Sampler &sampler, const float *logits, std::size_t vocab_size,
+                              const SamplingParams &params, int logical_position)
+    {
+        return sampleHostLogitsAtLogicalPositionImpl(sampler, logits, vocab_size, params, logical_position);
     }
 
     std::vector<ServingBatchEvent> OrchestrationRunner::stepServingBatch()
     {
-        std::vector<ServingBatchEvent> events;
-        if (!serving_active_)
-            return events;
-        const int context = plan_.runtime.max_seq_len > 0 ? plan_.runtime.max_seq_len
-                                                          : config_.max_seq_len;
-        const int vocab = vocabSize();
-
-        // Per-request output of this step, merged into one event per request.
-        std::map<std::uint64_t, ServingBatchEvent> step_events;
-        auto event_of = [&](const ServingRowState &row) -> ServingBatchEvent & {
-            auto &event = step_events[row.request.id];
-            event.id = row.request.id;
-            event.prompt_tokens = static_cast<int>(row.request.prompt.size());
-            event.cached_prompt_tokens = row.cached_prompt_tokens;
-            event.prefix_cache_enabled = row.prefix_admission.cache_enabled && row.prefix_admission.supported;
-            event.completion_tokens = row.completion_tokens;
-            return event;
-        };
-
-        // Cancellation of a queued request completes without a slot; a
-        // resident request retires at this step's retirement boundary.
-        for (const std::uint64_t id : serving_cancellations_)
-        {
-            for (auto it = serving_queue_.begin(); it != serving_queue_.end(); ++it)
-                if (it->id == id)
-                {
-                    ServingBatchEvent event;
-                    event.id = id;
-                    event.finish = ServingFinishReason::Cancelled;
-                    event.prompt_tokens = static_cast<int>(it->prompt.size());
-                    events.push_back(std::move(event));
-                    serving_queue_.erase(it);
-                    pending_serving_grants_.erase(id);
-                    pending_serving_forced_.erase(id);
-                    break;
-                }
-            for (auto &row : serving_rows_)
-                if (row.request.id == id)
-                    row.cancelled = true;
-        }
-        serving_cancellations_.clear();
-
-        // Admission: new requests take free slots while resident requests keep
-        // decoding. Each owns an immutable resolved seed (position-keyed
-        // draws), so batching never changes its token stream.
-        for (int slot = 0; slot < serving_capacity_ && !serving_queue_.empty(); ++slot)
-        {
-            if (serving_slot_busy_[static_cast<std::size_t>(slot)])
-                continue;
-            ServingRowState row;
-            row.request = std::move(serving_queue_.front());
-            serving_queue_.pop_front();
-            row.slot = slot;
-            if (row.request.sampling.seed == 0)
-            {
-                std::random_device entropy;
-                unsigned int seed = 0;
-                while (seed == 0)
-                    seed = entropy();
-                row.request.sampling.seed = seed;
-            }
-            row.sampler = Sampler(row.request.sampling.seed);
-            if (row.request.sampling.repetition_penalty != 1.0f)
-                for (const int32_t token : row.request.prompt)
-                    row.sampler.record_prompt_token(token);
-            if (auto g = pending_serving_grants_.find(row.request.id); g != pending_serving_grants_.end())
-            {
-                row.grant = g->second;
-                pending_serving_grants_.erase(g);
-            }
-            if (auto f = pending_serving_forced_.find(row.request.id); f != pending_serving_forced_.end())
-            {
-                row.forced.assign(f->second.begin(), f->second.end());
-                pending_serving_forced_.erase(f);
-            }
-            // Reuse the longest cached prefix in this slot only; at least
-            // one prompt token is still computed by the row's own forward.
-            const int restored =
-                runner_->restoreServingRowPrefix(slot, row.request.prompt, row.prefix_admission);
-            if (restored < 0)
-            {
-                ServingBatchEvent event;
-                event.id = row.request.id;
-                event.finish = ServingFinishReason::Error;
-                event.error = "Serving prefix restore failed";
-                event.prompt_tokens = static_cast<int>(row.request.prompt.size());
-                events.push_back(std::move(event));
-                (void)runner_->resetServingRow(slot);
-                --slot; // the slot is still free for the next queued request
-                continue;
-            }
-            row.prompt_consumed = static_cast<std::size_t>(restored);
-            row.cached_tokens = restored;
-            row.cached_prompt_tokens = restored;
-            serving_slot_busy_[static_cast<std::size_t>(slot)] = true;
-            serving_rows_.push_back(std::move(row));
-        }
-
-        std::vector<ServingFinishReason> finish(serving_rows_.size(), ServingFinishReason::None);
-        std::vector<std::string> finish_error(serving_rows_.size());
-        for (std::size_t r = 0; r < serving_rows_.size(); ++r)
-            if (serving_rows_[r].cancelled)
-                finish[r] = ServingFinishReason::Cancelled;
-
-        // Decide the next token from retained logits when allowed: a forced
-        // token wins; otherwise sample when unpaced or granted.
-        auto may_decide = [](const ServingRowState &row) {
-            return !row.forced.empty() || !row.request.paced || row.grant > 0;
-        };
-        auto decide = [&](std::size_t r) {
-            ServingRowState &row = serving_rows_[r];
-            if (row.request.record_logit_digests)
-            {
-                // Byte-exact identity of the decision's inputs: any change of
-                // arithmetic by batch composition changes the digest.
-                std::uint64_t digest = 1469598103934665603ull;
-                const auto *bytes = reinterpret_cast<const unsigned char *>(servingDecisionLogits(row.slot));
-                for (std::size_t i = 0; i < static_cast<std::size_t>(vocab) * sizeof(float); ++i)
-                    digest = (digest ^ bytes[i]) * 1099511628211ull;
-                event_of(row).logit_digests.push_back(digest);
-            }
-            int32_t token = 0;
-            bool sampled = false;
-            if (!row.forced.empty())
-            {
-                token = row.forced.front();
-                row.forced.pop_front();
-            }
-            else
-            {
-                token = static_cast<int32_t>(sampleHostLogitsAtLogicalPosition(
-                    row.sampler, servingDecisionLogits(row.slot), static_cast<std::size_t>(vocab),
-                    row.request.sampling, row.cached_tokens));
-                sampled = true;
-                if (row.request.paced)
-                    --row.grant;
-            }
-            row.has_logits = false;
-            if (sampled && std::find(row.request.stop_tokens.begin(), row.request.stop_tokens.end(),
-                                     token) != row.request.stop_tokens.end())
-            {
-                // Like the scalar decodeStep(), the terminal stop token is
-                // returned (and counted) so consumers can tell a model EOS
-                // from a length boundary; it is never fed back.
-                ++row.completion_tokens;
-                auto &event = event_of(row);
-                event.tokens.push_back(token);
-                event.completion_tokens = row.completion_tokens;
-                finish[r] = ServingFinishReason::Stop;
-                return;
-            }
-            row.sampler.record_token(token);
-            row.last_token = token;
-            row.needs_feed = true;
-            ++row.completion_tokens;
-            auto &event = event_of(row);
-            event.tokens.push_back(token);
-            event.completion_tokens = row.completion_tokens;
-            if (row.completion_tokens >= row.request.max_new_tokens ||
-                row.cached_tokens + 1 >= context)
-                finish[r] = ServingFinishReason::Length;
-        };
-        for (std::size_t r = 0; r < serving_rows_.size(); ++r)
-            if (finish[r] == ServingFinishReason::None && serving_rows_[r].has_logits &&
-                may_decide(serving_rows_[r]))
-                decide(r);
-
-        // Shared forwards over every request that has work: a prompt chunk,
-        // or feeding its committed token when it may continue. Decode rows
-        // (one token each) and prompt chunks run as separate forwards so a
-        // decode row is never padded to a prompt chunk's width.
-        struct Work
-        {
-            std::size_t r;
-            std::vector<int> tokens;
-        };
-        std::vector<Work> decode_work;
-        std::vector<Work> prefill_work;
-        for (std::size_t r = 0; r < serving_rows_.size(); ++r)
-        {
-            if (finish[r] != ServingFinishReason::None)
-                continue;
-            const ServingRowState &row = serving_rows_[r];
-            if (row.prompt_consumed < row.request.prompt.size())
-            {
-                const std::size_t chunk = std::min<std::size_t>(
-                    kServingPrefillChunk, row.request.prompt.size() - row.prompt_consumed);
-                prefill_work.push_back({r, std::vector<int>(
-                    row.request.prompt.begin() + static_cast<std::ptrdiff_t>(row.prompt_consumed),
-                    row.request.prompt.begin() + static_cast<std::ptrdiff_t>(row.prompt_consumed + chunk))});
-            }
-            else if (row.needs_feed && may_decide(row))
-            {
-                decode_work.push_back({r, {row.last_token}});
-            }
-            // else blocked: waiting for a grant or a forced token
-        }
-
-        auto run_forward = [&](const std::vector<Work> &work) -> bool {
-            if (work.empty())
-                return true;
-            std::vector<int> slots;
-            std::vector<std::vector<int>> rows;
-            slots.reserve(work.size());
-            rows.reserve(work.size());
-            for (const auto &item : work)
-            {
-                slots.push_back(serving_rows_[item.r].slot);
-                rows.push_back(item.tokens);
-            }
-            if (!runner_->forwardServingRows(slots, rows))
-                return false;
-            for (std::size_t e = 0; e < work.size(); ++e)
-            {
-                const std::size_t r = work[e].r;
-                ServingRowState &row = serving_rows_[r];
-                row.cached_tokens += static_cast<int>(rows[e].size());
-                if (row.prompt_consumed < row.request.prompt.size())
-                {
-                    row.prompt_consumed += rows[e].size();
-                    if (row.prompt_consumed < row.request.prompt.size())
-                        continue; // still streaming its prompt
-                    // The whole prompt is in this slot's KV: archive it.
-                    if (!runner_->harvestServingRowPrefix(row.slot, row.prefix_admission, row.request.prompt))
-                    {
-                        finish[r] = ServingFinishReason::Error;
-                        finish_error[r] = "Serving prefix harvest failed";
-                        continue;
-                    }
-                }
-                else
-                {
-                    row.needs_feed = false;
-                }
-                const float *logits = runner_->servingRowLogits(static_cast<int>(e));
-                if (!logits || vocab <= 0)
-                {
-                    finish[r] = ServingFinishReason::Error;
-                    finish_error[r] = "Serving row produced no logits";
-                    continue;
-                }
-                std::copy(logits, logits + vocab, servingDecisionLogits(row.slot));
-                row.has_logits = true;
-                if (may_decide(row))
-                    decide(r);
-            }
-            return true;
-        };
-
-        if (!run_forward(decode_work) || !run_forward(prefill_work))
-        {
-            // A failed shared forward leaves every resident slot's state
-            // unknown: fail all resident and queued requests and seal the
-            // session so nothing is admitted onto the failed runner state.
-            serving_failure_ = lastError().empty() ? std::string("Serving forward failed") : lastError();
-            auto fail = [&](std::uint64_t id, int prompt_tokens, int completion_tokens) {
-                ServingBatchEvent event;
-                event.id = id;
-                event.finish = ServingFinishReason::Error;
-                event.error = serving_failure_;
-                event.prompt_tokens = prompt_tokens;
-                event.completion_tokens = completion_tokens;
-                events.push_back(std::move(event));
-            };
-            for (const auto &row : serving_rows_)
-            {
-                fail(row.request.id, static_cast<int>(row.request.prompt.size()), row.completion_tokens);
-                (void)runner_->resetServingRow(row.slot);
-            }
-            for (const auto &queued : serving_queue_)
-                fail(queued.id, static_cast<int>(queued.prompt.size()), 0);
-            serving_rows_.clear();
-            serving_queue_.clear();
-            pending_serving_grants_.clear();
-            pending_serving_forced_.clear();
-            std::fill(serving_slot_busy_.begin(), serving_slot_busy_.end(), false);
-            return events;
-        }
-
-        // Retirement frees each finished request's slot.
-        for (std::size_t r = serving_rows_.size(); r-- > 0;)
-        {
-            if (finish[r] == ServingFinishReason::None)
-                continue;
-            ServingRowState &row = serving_rows_[r];
-            auto &event = event_of(row);
-            event.finish = finish[r];
-            if (finish[r] == ServingFinishReason::Error)
-                event.error = finish_error[r];
-            (void)runner_->resetServingRow(row.slot);
-            serving_slot_busy_[static_cast<std::size_t>(row.slot)] = false;
-            serving_rows_.erase(serving_rows_.begin() + static_cast<std::ptrdiff_t>(r));
-        }
-        for (auto &[id, event] : step_events)
-            events.push_back(std::move(event));
-        return events;
+        return serving_session_ ? serving_session_->step() : std::vector<ServingBatchEvent>{};
     }
 
 } // namespace llaminar2

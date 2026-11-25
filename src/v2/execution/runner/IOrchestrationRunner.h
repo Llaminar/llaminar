@@ -49,6 +49,7 @@
 
 namespace llaminar2
 {
+    class IServingTraceRecorder;
     class ITokenizer;          // Forward declaration
     class IMPIContext;         // Forward declaration
     class IModelContext;       // Forward declaration
@@ -805,6 +806,12 @@ namespace llaminar2
 
         /** @brief Why the serving session sealed after a failed shared forward; empty while healthy. */
         virtual std::string servingBatchFailure() const { return {}; }
+
+        /**
+         * @brief Diagnostic: observe the serving session (trace recording for
+         *        recorded-input replay). Applies to the open and later sessions.
+         */
+        virtual void setServingTraceRecorder(std::shared_ptr<IServingTraceRecorder> /*recorder*/) {}
 
         /** @brief Current session occupancy (owning thread only). */
         virtual ServingBatchOccupancy servingBatchOccupancy() const { return {}; }
