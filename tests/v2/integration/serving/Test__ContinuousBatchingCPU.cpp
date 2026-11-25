@@ -19,6 +19,7 @@
 #include "utils/TestOrchestrationHelper.h"
 
 #include <cstdlib>
+#include <filesystem>
 #include <unistd.h>
 #include <algorithm>
 #include <map>
@@ -75,9 +76,14 @@ namespace llaminar2::test
 
             void SetUp() override
             {
-                const char *model = std::getenv("LLAMINAR_CB_TEST_MODEL");
-                if (!model || !*model)
-                    GTEST_SKIP() << "LLAMINAR_CB_TEST_MODEL not set";
+                // The V2_Models fixture provides the canonical model under the
+                // project root (the test's working directory); the variable
+                // only overrides it. A missing model fails: never a skip.
+                const char *override_model = std::getenv("LLAMINAR_CB_TEST_MODEL");
+                const std::string model = override_model && *override_model
+                                              ? std::string(override_model)
+                                              : std::string("models/qwen2.5-0.5b-instruct-q4_0.gguf");
+                ASSERT_TRUE(std::filesystem::exists(model)) << "continuous-batching test model missing: " << model;
                 if (!hasCPUBackend())
                     initCPUBackend(0);
                 OrchestrationConfig config =
