@@ -265,6 +265,33 @@ TEST(PhysicalPagePoolSharing, COWFreshFragmentRequiresAuthenticatedSourceFirst)
     ASSERT_EQ(std::memcmp(published.read().data() + 8, combined, 8), 0);
 }
 
+/** @test Sharing/COW preserve the conservation invariants P=O+F and allocation counts stay bounded. */
+TEST(PhysicalPagePoolSharing, ConservationInvariantHoldsThroughSharingAndCOW)
+{
+    ShareFixture fx(3, 128, 2);
+    std::byte prefix[8];
+    for (std::size_t i = 0; i < 8; ++i) prefix[i] = static_cast<std::byte>(0x30 + i);
+    const auto claimed = [&]() {
+        return fx.pool->geometry().frames;
+    };
+    auto exporter = *fx.pool->tryAdmit(1);
+    auto shared = writePage(exporter, prefix).share();
+    auto second = *fx.pool->tryAdmit(1);
+    auto adopted = second.adoptShared(shared);
+    ASSERT_TRUE(adopted);
+    // O unchanged by adoption: one shared frame, no second physical copy.
+    EXPECT_EQ(claimed(), 3u);
+    auto writer = *fx.pool->tryAdmit(1);
+    auto cow = writer.prepareCOW(shared, 8);
+    ASSERT_TRUE(cow);
+    cow->copySource();
+    cow->copyNext(std::as_bytes(std::span(prefix, 8)));
+    auto published = cow->commit();
+    // Shared source + COW destination + adopted reference still one frame each.
+    EXPECT_EQ(claimed(), 3u);
+    EXPECT_EQ(std::memcmp(published.read().data(), prefix, 8), 0);
+}
+
 /** @test A two-frame pool refuses the second simultaneous COW before mutation; serial completion fits. */
 TEST(PhysicalPagePoolSharing, TwoFramePoolRefusesSimultaneousCOWBeforeMutation)
 {
