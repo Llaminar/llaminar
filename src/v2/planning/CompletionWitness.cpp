@@ -114,9 +114,13 @@ bool proveCompletionOrderInto(WitnessWorkspace &workspace, std::size_t frames,
 
 std::size_t witnessWorkspaceBytes(std::size_t records)
 {
-    const std::size_t requests = records + 1;
-    const std::size_t steps = (records + 1) * 2 + 1;
-    return requests * sizeof(WitnessRequest) + steps * sizeof(WitnessStep) + 256;
+    // Exact fixed-cell footprint. The workspace rejects geometries beyond its
+    // fixed arrays in its constructor; the BOM prices the same canonical size
+    // so admission and allocation never disagree.
+    if (records + 1 > WitnessWorkspace::kMaxRequests ||
+        (records + 1) * 2 + 1 > WitnessWorkspace::kMaxSteps)
+        throw std::invalid_argument("Witness workspace geometry exceeds fixed cells");
+    return sizeof(WitnessWorkspace);
 }
 
 CompletionWitness proveCompletionOrder(std::size_t frames, const WitnessBaseOccupancy &base,

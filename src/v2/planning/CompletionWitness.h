@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -61,22 +62,31 @@ struct CompletionWitness
     bool valid() const noexcept { return !steps.empty(); }
 };
 
-/** @brief Fixed-size witness scratch; no per-admission heap allocation. */
+/** @brief Fixed-size witness scratch; no heap anywhere (constructor or admission). */
 class WitnessWorkspace final
 {
 public:
     /** @brief Bound exactly from admitted request-record geometry. */
     explicit WitnessWorkspace(std::size_t records)
-        : requests_(records + 1), steps_((records + 1) * 2 + 1) {}
-    std::span<WitnessRequest> requests() noexcept { return requests_; }
+        : records_(records), request_count_(records + 1), step_count_((records + 1) * 2 + 1)
+    {
+        if (records + 1 > kMaxRequests || (records + 1) * 2 + 1 > kMaxSteps)
+            throw std::invalid_argument("Witness workspace exceeds its fixed cells");
+    }
+    std::span<WitnessRequest> requests() noexcept { return {requests_, request_count_}; }
     /** @return Fixed step cells (at most 2 per request + terminal). */
-    std::span<WitnessStep> steps() noexcept { return steps_; }
+    std::span<WitnessStep> steps() noexcept { return {steps_, step_count_}; }
     /** @return Typed refusal buffer, fixed size. */
     char *refusal() noexcept { return refusal_; }
     static constexpr std::size_t refusalCapacity() noexcept { return sizeof(refusal_); }
+    static constexpr std::size_t kMaxRequests = 257;  ///< Bounded by request-record geometry.
+    static constexpr std::size_t kMaxSteps = 517;
 private:
-    std::vector<WitnessRequest> requests_;
-    std::vector<WitnessStep> steps_;
+    std::size_t records_;
+    std::size_t request_count_;
+    std::size_t step_count_;
+    WitnessRequest requests_[kMaxRequests] = {};
+    WitnessStep steps_[kMaxSteps] = {};
     char refusal_[256] = {0};
 };
 
