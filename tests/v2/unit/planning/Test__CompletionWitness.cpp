@@ -200,6 +200,35 @@ TEST(CompletionWitness, WitnessExtensionRefusesWhenOrderOrPeakBreaks)
     EXPECT_THROW(pool40->extendWithWitness(*a, 1), std::logic_error);   // Peak already reached.
 }
 
+/** @test New admission and witness extension stop before exhaustion; draining permits the next request. */
+TEST(CompletionWitness, AdmissionStopsBeforeExhaustionAndDrainingResumesIt)
+{
+    const auto device = DeviceId::cpu();
+    const PhysicalPagePoolGeometry geometry{2, 64, 3, 2};
+    const auto bytes = PhysicalPagePool::physicalBytes(geometry, device);
+    PhysicalMemoryPlanBuilder plan;
+    plan.add({.world_rank=0, .device=device, .total_bytes=bytes, .admission_available_bytes=bytes},
+        PhysicalMemoryOwner::KVCache, bytes);
+    auto authority = std::make_shared<PhysicalMemoryAuthority>(
+        std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()), 0);
+    auto pool = authority->createCPUPagePool(device, geometry, CPUStoragePlacement::local());
+    auto first = pool->tryAdmitWithWitness(1, 1);
+    ASSERT_TRUE(first);
+    (void)first->assignFrame();
+    // Second witness admission fits (one free frame).
+    auto second = pool->tryAdmitWithWitness(1, 1);
+    ASSERT_TRUE(second);
+    (void)second->assignFrame();
+    // Pool exhausted: a new witness admission must refuse before mutation.
+    auto third = pool->tryAdmitWithWitness(1, 1);
+    EXPECT_FALSE(third);
+    // Draining one request re-opens exactly one admission.
+    first = PhysicalPagePool::Grant();
+    auto fourth = pool->tryAdmitWithWitness(1, 1);
+    ASSERT_TRUE(fourth);
+    (void)fourth->assignFrame();
+}
+
 /** @test Impossible geometry and inconsistent requests are typed refusals, never guessed orders. */
 TEST(CompletionWitness, InvalidInputsRefuseWithoutInventingSteps)
 {
