@@ -4989,9 +4989,8 @@ list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ReleaseNativeAlias
 add_v2_test(V2_Unit_CPUPublicationAdmissionRegistration
     COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cpu_publication_admission_registration.py
-    LABELS "V2;Unit;ProductionTestPreflight;DeviceFree;BuildSystem;CPU;Publication;Regression"
+    LABELS "V2;Unit;DeviceFree;BuildSystem;CPU;Publication;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS)
-list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Unit_CPUPublicationAdmissionRegistration)
 # Actual included modules must obey the same Release/Integration target policy.
 foreach(_native_module_selection_kind Unit Integration)
     set(_native_module_selection_labels "V2;${_native_module_selection_kind};BuildSystem;Regression;DeviceFree")
