@@ -50,7 +50,7 @@ namespace llaminar2
         {
             std::vector<SlotFamily> families;
             std::vector<uint32_t> layer_families;
-            size_t max_wire_payload_bytes = 0;
+            size_t max_wire_payload_bytes = 0; ///< Exactly the largest family payload; allocationBOM() rejects any other value.
             DeviceMoEProjectionSet projection_set = DeviceMoEProjectionSet::CompleteExpert;
         };
 
@@ -199,7 +199,8 @@ namespace llaminar2
          * @return Payload, descriptor, and total physical bytes.
          * @throws std::invalid_argument for incoherent capacity or format data,
          *         a family whose projections differ from the profile's
-         *         projection set, or a wire capacity that fits no family slot.
+         *         projection set, or a wire capacity other than the largest
+         *         family payload that profileForLayerFormats() derives.
          * @throws std::overflow_error when the complete allocation cannot be
          *         represented by `size_t`.
          */

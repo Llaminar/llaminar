@@ -502,17 +502,24 @@ namespace llaminar2
         // The quote is the single authority shared by admission and
         // createImpl(), which stamps profile.projection_set into every slot
         // descriptor. Each family must therefore hold exactly that ownership
-        // contract's movable projections, and the arrival wire must fit the
-        // largest family slot; otherwise a forged profile could publish
-        // complete-expert descriptors over gate/up-only storage.
+        // contract's movable projections; otherwise a forged profile could
+        // publish complete-expert descriptors over gate/up-only storage.
         size_t largest_family_payload = 0;
         for (const auto &family : profile.families)
         {
             validateSpecs(family.projections, profile.projection_set);
             largest_family_payload = std::max(largest_family_payload, expertPayloadBytes(family.projections));
         }
-        if (profile.max_wire_payload_bytes == 0u || profile.max_wire_payload_bytes > largest_family_payload)
-            throw std::invalid_argument("Transfer directory wire payload capacity exceeds every slot family");
+        // The wire maximum is not an independent quantity: profileForLayerFormats()
+        // derives it as exactly the largest family payload. Admission prices the
+        // collective payload slots from it and the directory hands it to the
+        // model's transfer machinery as wirePayloadBytes(), so a larger value
+        // fits no slot and any smaller one (including zero) underprices every
+        // arrival of the largest family. Only the derived value is admissible.
+        if (largest_family_payload == 0u || profile.max_wire_payload_bytes != largest_family_payload)
+            throw std::invalid_argument(
+                "Transfer directory wire payload capacity " + std::to_string(profile.max_wire_payload_bytes) +
+                " differs from its largest slot family payload " + std::to_string(largest_family_payload));
 
         std::vector<uint32_t> members(profile.families.size());
         for (const auto family : profile.layer_families)
