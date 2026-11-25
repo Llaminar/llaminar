@@ -17357,9 +17357,16 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
         composer.find(
             "sampling_mode==DeviceGenerationSamplingMode::Stochastic?2u:0u"),
         std::string::npos);
+    // Native parents compose the complete participant-local cadence
+    // (publication, guarded maintenance, acknowledgement) directly; hosted
+    // ticket publishers retain one maintenance transaction per depth.
     EXPECT_NE(
-        composer.find("include_device_moe_maintenance?1u:0u"),
-        std::string::npos);
+        composer.find(
+            "include_device_moe_maintenance?(hosted_execution?1u:"
+            "DeviceMoERebalanceCadenceRecipe::fragment_count):0u"),
+        std::string::npos)
+        << "Fragment reservation must count every maintenance fragment the "
+           "parent actually composes.";
     EXPECT_NE(
         composer.find("source_fragments.capacity()<expected_fragment_count"),
         std::string::npos)
@@ -17401,6 +17408,12 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
     EXPECT_LT(state_publication, terminal_hidden);
     EXPECT_LT(terminal_hidden, maintenance)
         << "Dynamic maintenance must consume exactly the transaction committed by the preceding parent fragments.";
+    const size_t native_cadence = composer.find(
+        "nativeMoERebalanceCadenceRecipe(&fragment_error)");
+    ASSERT_NE(native_cadence, std::string::npos)
+        << "Native parents must embed the shared cadence recipe, not a lent conditional graph.";
+    EXPECT_LT(terminal_hidden, native_cadence)
+        << "The native cadence must also consume the transaction committed by the preceding parent fragments.";
     EXPECT_NE(
         composer.find(
             "DeviceControlledLoopFragmentExecution::IfDeviceWordNonZero"),
