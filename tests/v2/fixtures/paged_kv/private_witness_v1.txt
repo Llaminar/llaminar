@@ -1,0 +1,36 @@
+pma-private-pages-v1 32 64 4 32 empty-zero-generations
+admit-witness A A 32 31 | accepted
+assign A | 0:1
+assign A | 1:1
+assign A | 2:1
+assign A | 3:1
+assign A | 4:1
+assign A | 5:1
+assign A | 6:1
+assign A | 7:1
+assign A | 8:1
+assign A | 9:1
+assign A | 10:1
+assign A | 11:1
+assign A | 12:1
+assign A | 13:1
+assign A | 14:1
+assign A | 15:1
+assign A | 16:1
+assign A | 17:1
+assign A | 18:1
+assign A | 19:1
+assign A | 20:1
+assign A | 21:1
+assign A | 22:1
+assign A | 23:1
+assign A | 24:1
+assign A | 25:1
+assign A | 26:1
+assign A | 27:1
+assign A | 28:1
+assign A | 29:1
+assign A | 30:1
+admit-witness B B 32 1 | refused
+drop-request A | retired
+end | idle

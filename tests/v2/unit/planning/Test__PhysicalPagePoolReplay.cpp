@@ -327,6 +327,23 @@ public:
             if (!(input >> name) || cowplans_.erase(name) != 1) fail();
             outcome = "aborted";
         }
+        else if (kind == "admit-witness")
+        {
+            std::string request;
+            size_t peak, grant_pages;
+            if (!(input >> name >> request >> peak >> grant_pages) || requests_.contains(name)) fail();
+            auto granted = pool_->tryAdmitWithWitness(peak, grant_pages);
+            outcome = granted ? "accepted" : "refused";
+            if (granted) requests_.emplace(name, std::move(*granted));
+        }
+        else if (kind == "extend-witness")
+        {
+            std::string request;
+            size_t pages;
+            if (!(input >> name >> request >> pages) || !requests_.contains(request)) fail();
+            auto &grant = requests_.at(request);
+            outcome = pool_->extendWithWitness(grant, pages) ? "accepted" : "refused";
+        }
         else if (kind == "end")
         {
             if (!requests_.empty() || !pins_.empty() || !plans_.empty() || !pages_.empty() || !reads_.empty() ||
@@ -474,6 +491,77 @@ TEST(PhysicalMemoryAuthority, PagePoolSharingReplayRejectsAlteredObservations)
         {"end | idle\n", ""}})
     {
         std::string corrupt(llaminar2::test::privatePageShareTrace);
+        const auto position = corrupt.find(original);
+        ASSERT_NE(position, std::string::npos);
+        corrupt.replace(position, original.size(), changed);
+        std::istringstream input(corrupt);
+        EXPECT_THROW(replay(input), std::exception);
+    }
+}
+
+/** @test Recorded finite-grant witness admission and extension replay through real owners. */
+TEST(PhysicalMemoryAuthority, PagePoolRecordedWitnessAdmissionReplayExactly)
+{
+    if (const char *record = std::getenv("LLAMINAR_RECORD_PRIVATE_WITNESS_TRACE"))
+    {
+        std::ofstream output(record);
+        ASSERT_TRUE(output.good());
+        output << "pma-private-pages-v1 32 64 4 32 empty-zero-generations\n";
+        PrivatePageReplay runner({32, 64, 4, 32});
+        const std::string assign_a = [&]() {
+            std::string result;
+            for (int i = 0; i < 31; ++i) result += "assign A\n";
+            return result;
+        }();
+        std::ostringstream commands;
+        // A holds 31 of 32 frames (peak 32); B cannot enter with any finite
+        // grant because A would need one more frame before it can complete.
+        commands << "admit-witness A A 32 31\n" << assign_a
+                 << "admit-witness B B 32 1\n"
+                 << "drop-request A\n" << "drop-request B\n" << "end\n";
+        std::istringstream sequence(commands.str());
+        bool admitted_b_ = false;
+        std::string line;
+        while (std::getline(sequence, line))
+        {
+            if (line.empty()) continue;
+            std::istringstream row(line);
+            std::string kind, name;
+            row >> kind >> name;
+            if (kind == "admit-witness")
+            {
+                size_t peak, grant_pages;
+                row >> name >> peak >> grant_pages;
+                const auto observed = runner.execute("admit-witness " + name + " " + name + " " +
+                    std::to_string(peak) + " " + std::to_string(grant_pages));
+                output << "admit-witness " << name << " " << name << " " << peak << " " << grant_pages
+                       << " | " << observed << '\n';
+                admitted_b_ = admitted_b_ || (name == "B" && observed == "accepted");
+            }
+            else if (kind == "drop-request" && name == "B" && !admitted_b_)
+                continue; // Refused requests own no record; nothing to retire.
+            else
+                output << line << " | " << runner.execute(line) << '\n';
+        }
+        output.close();
+        ASSERT_TRUE(output.good());
+        std::ifstream captured(record);
+        EXPECT_NO_THROW(replay(captured));
+        return;
+    }
+    std::istringstream input(llaminar2::test::privatePageWitnessTrace);
+    EXPECT_NO_THROW(replay(input));
+}
+
+/** @test Witness replay rejects invented acceptance/refusal observations. */
+TEST(PhysicalMemoryAuthority, PagePoolWitnessReplayRejectsAlteredObservations)
+{
+    for (const auto &[original, changed] : std::vector<std::pair<std::string, std::string>>{
+        {"admit-witness B B 32 1 | refused", "admit-witness B B 32 1 | accepted"},
+        {"drop-request A | retired", "drop-request A | refused"},
+        {"end | idle\n", ""}})
+    {
+        std::string corrupt(llaminar2::test::privatePageWitnessTrace);
         const auto position = corrupt.find(original);
         ASSERT_NE(position, std::string::npos);
         corrupt.replace(position, original.size(), changed);
