@@ -49,6 +49,12 @@
  * it through the fused batched entry with two NaN activation scales per row,
  * in different partitions or inside one partition, and checks the earlier
  * NaN analytically as well as serial-row bytes.
+ *
+ * Native Q6_K has its own block kernels, whose accumulation is the partition
+ * fold when every GPU-aligned partition is one block;
+ * Q6KOrderedNaNsKeepEarlierBlockAndSerialBytes checks the same analytic
+ * earlier NaN and serial bytes through the fused entry for one- and
+ * multi-block partitions.
  */
 #include <gtest/gtest.h>
 
@@ -1549,6 +1555,135 @@ namespace llaminar2::test
                     }
                     check("retained");
                 }
+    }
+
+    /**
+     * @brief GPU-aligned native Q6_K keeps the earlier NaN and serial bytes through the fused batched entry.
+     *
+     * Native Q6_K (Q6KNativeDualScale) has its own block kernels. For K of at
+     * most sixteen blocks every GPU-aligned partition is one block, and the
+     * tree calls those kernels over the whole K range, so their running
+     * `output + contribution` is the partition fold. Before the kernels
+     * accumulated GPU-aligned matrices through addOrderedAVX2()/
+     * addOrderedAVX512(), GCC 14 emitted that plain vector `+` with the later
+     * contribution as VADDPS source one in some row-tile positions (the second
+     * row of the AVX2 two-row tile, AVX-512 row tiles): those rows published the
+     * later NaN, while other rows and serial decode kept the earlier one. The
+     * fused replay recorded the defect only at K = 9 and 16 blocks.
+     *
+     * Rows r % 3 == 1 carry differently signed, different-payload NaN
+     * activation scales in blocks 1 and K - 2 (different partitions); rows
+     * r % 3 == 2 carry two in consecutive blocks @c width and @c width + 1
+     * (the same partition when it holds two blocks). Every NaN row must
+     * publish the earlier NaN in every live lane (an analytic oracle that does
+     * not depend on any CPU program), and every row must equal independent
+     * serial M=1 decode, for one- and multi-block partitions, one and three
+     * workers, standalone and in a retained team. Members of 1 to 17 rows
+     * exercise every one- to four-row tile of both ISAs.
+     */
+    TEST(CPUX86CodedLeaves, Q6KOrderedNaNsKeepEarlierBlockAndSerialBytes)
+    {
+        constexpr int n = 128, live_n = 67;
+        constexpr float dirty = 123456.0f;
+        const std::vector<int> member_rows{2, 1, 5, 17, 3, 4};
+        const int count = static_cast<int>(member_rows.size());
+        for (const int blocks : {9, 16, 17, 40})
+            for (const int workers : {1, 3})
+            {
+                SCOPED_TRACE("blocks=" + std::to_string(blocks) + " workers=" + std::to_string(workers));
+                ScopedTeam team(workers);
+                const int width = (blocks - 1) / MoEProjectionNumericalContract::ordered_k_partitions + 1;
+                std::vector<CPUNativeQuantisedPackedWeights> packed(count);
+                std::vector<std::vector<Q8_1Block>> input(count);
+                std::vector<std::vector<float>> actual(count), expected(count);
+                std::vector<std::vector<std::uint32_t>> earlier(count);
+                std::vector<FusedVerifierRowsDesc> descriptors(count);
+                const int stride = live_n + 3;
+                for (int p = 0; p < count; ++p)
+                {
+                    const int m = member_rows[p];
+                    makeWeights(packed[p], kQ6K, n, blocks, Policy::GPUAlignedExpert, Scales::Finite,
+                                1301u + 17u * p + blocks, live_n);
+                    input[p] = makeActivations(m, blocks, 2301u + 29u * p + blocks);
+                    earlier[p].assign(m, 0);
+                    for (int row = 0; row < m; ++row)
+                    {
+                        const auto nan = [&](int block, std::uint16_t half) {
+                            input[p][std::size_t(row) * blocks + block].d = half;
+                        };
+                        std::uint16_t first = 0;
+                        if (row % 3 == 1)
+                        {
+                            first = static_cast<std::uint16_t>(0x7E00u | (1u + row));
+                            nan(1, first);
+                            nan(blocks - 2, static_cast<std::uint16_t>(0xFE00u | (0x1F0u - row)));
+                        }
+                        else if (row % 3 == 2)
+                        {
+                            first = static_cast<std::uint16_t>(0xFE00u | (3u + row));
+                            nan(width, first);
+                            nan(width + 1, static_cast<std::uint16_t>(0x7E00u | (0x1E0u - row)));
+                        }
+                        if (first)
+                            earlier[p][row] = std::bit_cast<std::uint32_t>(nativeQuantisedFP16ScaleToFP32(first));
+                    }
+                    expected[p].assign(std::size_t(m - 1) * stride + live_n + 4, dirty);
+                    {
+                        std::vector<float> scratch(nativeQuantisedProjectionPartialFloats(packed[p], 1));
+                        for (int row = 0; row < m; ++row)
+                            gemv_native_quantised_preq(packed[p], input[p].data() + std::size_t(row) * blocks,
+                                                       expected[p].data() + std::size_t(row) * stride, scratch);
+                    }
+                    actual[p].assign(expected[p].size(), dirty);
+                    descriptors[p] = {.packed = &packed[p], .output = actual[p].data(), .N = live_n, .ldc = stride,
+                        .rows = m, .input = input[p].data(), .purpose = ProjectionRowsPurpose::Prefill};
+                }
+                // The analytic oracle also binds independent serial decode.
+                for (int p = 0; p < count; ++p)
+                    for (int row = 0; row < member_rows[p]; ++row)
+                        if (earlier[p][row])
+                            for (int column = 0; column < live_n; ++column)
+                            {
+                                const auto bits = std::bit_cast<std::uint32_t>(
+                                    expected[p][std::size_t(row) * stride + column]);
+                                ASSERT_EQ(bits, earlier[p][row]) << "serial member=" << p << " row=" << row
+                                                                 << " column=" << column << " got=" << hexBits(bits);
+                            }
+                const auto plan = planNativeQuantisedFusedRows(descriptors, 1, workers);
+                std::vector<float> slab(std::max<std::size_t>(plan.sharedPartialFloats(), 1));
+                const auto check = [&](const char *mode)
+                {
+                    for (int p = 0; p < count; ++p)
+                        for (int row = 0; row < member_rows[p]; ++row)
+                            for (int column = 0; column < stride; ++column)
+                            {
+                                const auto index = std::size_t(row) * stride + column;
+                                const auto got = std::bit_cast<std::uint32_t>(actual[p][index]);
+                                if (earlier[p][row] && column < live_n)
+                                    ASSERT_EQ(got, earlier[p][row])
+                                        << mode << " member=" << p << " rows=" << member_rows[p] << " row=" << row
+                                        << " column=" << column << " got=" << hexBits(got)
+                                        << " earlier=" << hexBits(earlier[p][row]);
+                                ASSERT_EQ(got, std::bit_cast<std::uint32_t>(expected[p][index]))
+                                    << mode << " member=" << p << " rows=" << member_rows[p] << " row=" << row
+                                    << " column=" << column << " got=" << hexBits(got)
+                                    << " serial=" << hexBits(std::bit_cast<std::uint32_t>(expected[p][index]));
+                            }
+                };
+                for (auto &bank : actual)
+                    std::fill(bank.begin(), bank.end(), dirty);
+                ASSERT_TRUE(gemm_native_quantised_fused_verifier_rows_preq(nullptr, descriptors.data(), slab, count,
+                                                                           1, blocks));
+                check("standalone");
+                for (auto &bank : actual)
+                    std::fill(bank.begin(), bank.end(), dirty);
+#pragma omp parallel
+                {
+                    (void)gemm_native_quantised_fused_verifier_rows_preq(nullptr, descriptors.data(), slab, count, 1,
+                                                                         blocks);
+                }
+                check("retained");
+            }
     }
 } // namespace llaminar2::test
 #endif // __AVX2__

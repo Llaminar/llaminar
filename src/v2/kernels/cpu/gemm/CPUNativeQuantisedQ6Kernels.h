@@ -25,6 +25,18 @@
  * by a common `32 * activation_half_sum` centering correction.  This removes
  * all per-column compensation bytes. Each block holds 1536 payload bytes
  * and 128 coefficient bytes; 128 base bytes serve the entire superblock.
+ *
+ * `output + contribution` is the running K accumulation. For a GPU-aligned
+ * expert it is also the device tree's ordered partition fold whenever every
+ * partition is one block (K <= 16 blocks, where the tree calls these kernels
+ * for the whole K range), so its NaN precedence is part of the contract: the
+ * earlier block's NaN must win. A plain vector `+` lets the compiler choose
+ * the VADDPS source order, and GCC 14 put the later contribution first in the
+ * second row of the AVX2 two-row tile (and in AVX-512 row tiles), publishing
+ * the later NaN. The GPU-aligned instantiations (`Ordered = true`) therefore
+ * accumulate through addOrderedAVX2()/addOrderedAVX512(); backend-native
+ * instantiations keep the unchanged plain `+` program. Finite results are
+ * identical either way.
  */
 
 #pragma once
@@ -37,6 +49,7 @@
 
 #include <immintrin.h>
 
+#include "CPUNativeQuantisedContributionContract.h"
 #include "CPUNativeQuantisedFP16.h"
 #include "CPUNativeQuantisedWeightPacker.h"
 #include "VNNIEmulation.h"
@@ -199,6 +212,55 @@ namespace llaminar2::cpu::native_quantised
         }
 
         /**
+         * @brief Append one block contribution to an AVX-512 Q6 accumulator.
+         * @tparam Ordered GPU-aligned operand order (earlier accumulator as VADDPS source one).
+         * @param accumulator Running FP32 output for sixteen columns.
+         * @param contribution This block's rounded contribution.
+         * @return The rounded sum; with @p Ordered the earlier NaN payload wins.
+         */
+        template <bool Ordered>
+        [[gnu::always_inline]] inline __m512 accumulateQ6AVX512(__m512 accumulator, __m512 contribution) noexcept
+        {
+            if constexpr (Ordered)
+                return addOrderedAVX512(accumulator, contribution);
+            else
+                return _mm512_add_ps(accumulator, contribution);
+        }
+#endif
+
+        /**
+         * @brief Append one block contribution to an AVX2 Q6 accumulator.
+         * @tparam Ordered GPU-aligned operand order (earlier accumulator as VADDPS source one).
+         * @param accumulator Running FP32 output for eight columns.
+         * @param contribution This block's rounded contribution.
+         * @return The rounded sum; with @p Ordered the earlier NaN payload wins.
+         * @details In an AVX-512VL build (the AVX2 kernels then serve a forced
+         * AVX2 runtime) the ordered add is the same VADDPS with the same source
+         * order (accumulator as source one), written in place into the
+         * accumulator and free to name ymm16..ymm31 (EVEX encoding), as
+         * addOrderedAVX512() may. With addOrderedAVX2() GCC 14 reloaded a
+         * spilled constant once more per block and row in the two-row tile;
+         * this form keeps that tile's frame accesses equal to the plain-`+`
+         * program's.
+         */
+        template <bool Ordered>
+        [[gnu::always_inline]] inline __m256 accumulateQ6AVX2(__m256 accumulator, __m256 contribution) noexcept
+        {
+            if constexpr (Ordered)
+            {
+#if defined(__AVX512VL__) && (defined(__GNUC__) || defined(__clang__))
+                asm("vaddps {%1, %0, %0|%0, %0, %1}" : "+v"(accumulator) : "v"(contribution));
+                return accumulator;
+#else
+                return addOrderedAVX2(accumulator, contribution);
+#endif
+            }
+            else
+                return _mm256_add_ps(accumulator, contribution);
+        }
+#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
+
+        /**
          * @brief Apply one native-Q6 K-block contribution to one output vector.
          *
          * The helper is shared by the explicit three- and four-row kernels so
@@ -214,8 +276,10 @@ namespace llaminar2::cpu::native_quantised
          * @param activation Source Q8_1 activation block for this row and K.
          * @param scale_low Native Q6 scale for values 0..15.
          * @param scale_high Native Q6 scale for values 16..31.
+         * @tparam Ordered GPU-aligned accumulation order (accumulateQ6AVX512()).
          * @return Updated accumulator with exactly one K-block contribution.
          */
+        template <bool Ordered>
         LLAMINAR_Q6K_EXACT_FP
         inline __m512 addScaledDotsAVX512(
             __m512 accumulator,
@@ -247,7 +311,7 @@ namespace llaminar2::cpu::native_quantised
             const __m512 activation_scale = _mm512_set1_ps(activation_factor);
             const __m512 contribution =
                 _mm512_mul_ps(activation_scale, dot_term);
-            return _mm512_add_ps(accumulator, contribution);
+            return accumulateQ6AVX512<Ordered>(accumulator, contribution);
         }
 
         /**
@@ -263,7 +327,7 @@ namespace llaminar2::cpu::native_quantised
          * @param kb_end One-past-last logical K block.
          * @param accumulate Load existing outputs before adding this K range.
          */
-        template <int Rows, int ZSpan>
+        template <int Rows, int ZSpan, bool Ordered>
         LLAMINAR_Q6K_EXACT_FP
         inline void rowsChunkAVX512(
             const CPUNativeQuantisedPackedWeights &packed,
@@ -425,7 +489,7 @@ namespace llaminar2::cpu::native_quantised
                                 _mm512_add_ps(low_term, high_term);
                             const __m512 contribution =
                                 _mm512_mul_ps(activation_scale, dot_term);
-                            fp_accumulators[row][zi] = _mm512_add_ps(
+                            fp_accumulators[row][zi] = accumulateQ6AVX512<Ordered>(
                                 fp_accumulators[row][zi], contribution);
                         }
                     }
@@ -470,6 +534,7 @@ namespace llaminar2::cpu::native_quantised
          * @param kb_end One-past-last logical K block.
          * @param accumulate Load existing outputs before adding this K range.
          */
+        template <bool Ordered>
         LLAMINAR_Q6K_EXACT_FP
         inline void twoRowsTwoVectorsChunkAVX512(
             const CPUNativeQuantisedPackedWeights &packed,
@@ -624,16 +689,16 @@ namespace llaminar2::cpu::native_quantised
                     const __m512 scale_low1 = source_scales1.low;
                     const __m512 scale_high1 = source_scales1.high;
 
-                    fp00 = addScaledDotsAVX512(
+                    fp00 = addScaledDotsAVX512<Ordered>(
                         fp00, dot_low00, dot_high00, activation0[kb],
                         scale_low0, scale_high0);
-                    fp01 = addScaledDotsAVX512(
+                    fp01 = addScaledDotsAVX512<Ordered>(
                         fp01, dot_low01, dot_high01, activation0[kb],
                         scale_low1, scale_high1);
-                    fp10 = addScaledDotsAVX512(
+                    fp10 = addScaledDotsAVX512<Ordered>(
                         fp10, dot_low10, dot_high10, activation1[kb],
                         scale_low0, scale_high0);
-                    fp11 = addScaledDotsAVX512(
+                    fp11 = addScaledDotsAVX512<Ordered>(
                         fp11, dot_low11, dot_high11, activation1[kb],
                         scale_low1, scale_high1);
                 }
@@ -675,7 +740,7 @@ namespace llaminar2::cpu::native_quantised
          * @param kb_end One-past-last logical K block.
          * @param accumulate Load existing outputs before adding this K range.
          */
-        template <int Rows>
+        template <int Rows, bool Ordered>
         LLAMINAR_Q6K_EXACT_FP
         inline void wideRowsChunkAVX512(
             const CPUNativeQuantisedPackedWeights &packed,
@@ -817,18 +882,18 @@ namespace llaminar2::cpu::native_quantised
                             bases + z * 16, coefficients + z * 16);
                         const __m512 scale_low = source_scales.low;
                         const __m512 scale_high = source_scales.high;
-                        fp0 = addScaledDotsAVX512(
+                        fp0 = addScaledDotsAVX512<Ordered>(
                             fp0, dot_low0, dot_high0, activation0[kb],
                             scale_low, scale_high);
-                        fp1 = addScaledDotsAVX512(
+                        fp1 = addScaledDotsAVX512<Ordered>(
                             fp1, dot_low1, dot_high1, activation1[kb],
                             scale_low, scale_high);
-                        fp2 = addScaledDotsAVX512(
+                        fp2 = addScaledDotsAVX512<Ordered>(
                             fp2, dot_low2, dot_high2, activation2[kb],
                             scale_low, scale_high);
                         if constexpr (Rows == 4)
                         {
-                            fp3 = addScaledDotsAVX512(
+                            fp3 = addScaledDotsAVX512<Ordered>(
                                 fp3, dot_low3, dot_high3, activation3[kb],
                                 scale_low, scale_high);
                         }
@@ -915,7 +980,7 @@ namespace llaminar2::cpu::native_quantised
          * whole 64-column/two-row tile would force stack spills.  Weight bytes
          * remain sequential and each loaded vector is reused across all rows.
          */
-        template <int Rows>
+        template <int Rows, bool Ordered>
         LLAMINAR_Q6K_EXACT_FP
         inline void rowsChunkAVX2(
             const CPUNativeQuantisedPackedWeights &packed,
@@ -1026,7 +1091,7 @@ namespace llaminar2::cpu::native_quantised
                                 _mm256_set1_ps(
                                     nativeQuantisedFP16ScaleToFP32(activation.d)),
                                 dot_term);
-                            fp_accumulators[row] = _mm256_add_ps(
+                            fp_accumulators[row] = accumulateQ6AVX2<Ordered>(
                                 fp_accumulators[row], contribution);
                         }
                     }
@@ -1040,6 +1105,22 @@ namespace llaminar2::cpu::native_quantised
                         fp_accumulators[row]);
                 }
             }
+        }
+        /**
+         * @brief Invoke @p body with the arithmetic order of the matrix's numerical policy.
+         * @param packed Prepared Q6_K matrix carrying its typed policy.
+         * @param body Generic callable invoked as body.template operator()<Ordered>().
+         * @details GPU-aligned experts take the ordered instantiation (earlier
+         * NaN wins, see the file comment); backend-native matrices take the
+         * unchanged plain-`+` instantiation. Resolved once per chunk call.
+         */
+        template <class Body>
+        [[gnu::always_inline]] inline void withQ6Order(const CPUNativeQuantisedPackedWeights &packed, Body &&body)
+        {
+            if (packed.numerical_policy == CPUProjectionNumericalPolicy::GPUAlignedExpert)
+                body.template operator()<true>();
+            else
+                body.template operator()<false>();
         }
     } // namespace q6k_detail
 
@@ -1060,14 +1141,10 @@ namespace llaminar2::cpu::native_quantised
         int kb_end,
         bool accumulate = false)
     {
-        q6k_detail::rowsChunkAVX512<1, 4>(
-            packed,
-            {activation},
-            {output},
-            chunk,
-            kb_start,
-            kb_end,
-            accumulate);
+        q6k_detail::withQ6Order(packed, [&]<bool Ordered>() {
+            q6k_detail::rowsChunkAVX512<1, 4, Ordered>(
+                packed, {activation}, {output}, chunk, kb_start, kb_end, accumulate);
+        });
     }
 
     /**
@@ -1092,16 +1169,10 @@ namespace llaminar2::cpu::native_quantised
         int kb_end,
         bool accumulate)
     {
-        q6k_detail::twoRowsTwoVectorsChunkAVX512(
-            packed,
-            activation0,
-            activation1,
-            output0,
-            output1,
-            chunk,
-            kb_start,
-            kb_end,
-            accumulate);
+        q6k_detail::withQ6Order(packed, [&]<bool Ordered>() {
+            q6k_detail::twoRowsTwoVectorsChunkAVX512<Ordered>(
+                packed, activation0, activation1, output0, output1, chunk, kb_start, kb_end, accumulate);
+        });
     }
 
     /** @brief Native Q6_K three-row AVX-512 verifier chunk. */
@@ -1118,20 +1189,11 @@ namespace llaminar2::cpu::native_quantised
         int kb_end,
         bool accumulate)
     {
-        q6k_detail::wideRowsChunkAVX512<3>(
-            packed,
-            activation0,
-            activation1,
-            activation2,
-            nullptr,
-            output0,
-            output1,
-            output2,
-            nullptr,
-            chunk,
-            kb_start,
-            kb_end,
-            accumulate);
+        q6k_detail::withQ6Order(packed, [&]<bool Ordered>() {
+            q6k_detail::wideRowsChunkAVX512<3, Ordered>(
+                packed, activation0, activation1, activation2, nullptr, output0, output1, output2, nullptr,
+                chunk, kb_start, kb_end, accumulate);
+        });
     }
 
     /** @brief Native Q6_K four-row AVX-512 verifier chunk. */
@@ -1150,20 +1212,11 @@ namespace llaminar2::cpu::native_quantised
         int kb_end,
         bool accumulate)
     {
-        q6k_detail::wideRowsChunkAVX512<4>(
-            packed,
-            activation0,
-            activation1,
-            activation2,
-            activation3,
-            output0,
-            output1,
-            output2,
-            output3,
-            chunk,
-            kb_start,
-            kb_end,
-            accumulate);
+        q6k_detail::withQ6Order(packed, [&]<bool Ordered>() {
+            q6k_detail::wideRowsChunkAVX512<4, Ordered>(
+                packed, activation0, activation1, activation2, activation3, output0, output1, output2, output3,
+                chunk, kb_start, kb_end, accumulate);
+        });
     }
 #endif
 
@@ -1183,14 +1236,10 @@ namespace llaminar2::cpu::native_quantised
         int kb_end,
         bool accumulate = false)
     {
-        q6k_detail::rowsChunkAVX2<1>(
-            packed,
-            {activation},
-            {output},
-            chunk,
-            kb_start,
-            kb_end,
-            accumulate);
+        q6k_detail::withQ6Order(packed, [&]<bool Ordered>() {
+            q6k_detail::rowsChunkAVX2<1, Ordered>(
+                packed, {activation}, {output}, chunk, kb_start, kb_end, accumulate);
+        });
     }
 
     /** @brief Native Q6_K two-row AVX2 verifier chunk. */
@@ -1205,9 +1254,10 @@ namespace llaminar2::cpu::native_quantised
         int kb_end,
         bool accumulate)
     {
-        q6k_detail::rowsChunkAVX2<2>(
-            packed, {activation0, activation1}, {output0, output1},
-            chunk, kb_start, kb_end, accumulate);
+        q6k_detail::withQ6Order(packed, [&]<bool Ordered>() {
+            q6k_detail::rowsChunkAVX2<2, Ordered>(
+                packed, {activation0, activation1}, {output0, output1}, chunk, kb_start, kb_end, accumulate);
+        });
     }
 
 #undef LLAMINAR_Q6K_EXACT_FP

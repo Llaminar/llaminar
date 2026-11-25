@@ -1164,16 +1164,25 @@ namespace
                     switch (spans[candidate])
                     {
                     case 1:
-                        q6k_detail::rowsChunkAVX512<1, 1>(packed, activation,
-                            output, chunk, 0, packed.blocks_per_row, false);
+                        // The matrix's own policy selects the accumulation order.
+                        q6k_detail::withQ6Order(packed, [&]<bool Ordered>() {
+                            q6k_detail::rowsChunkAVX512<1, 1, Ordered>(packed, activation,
+                                output, chunk, 0, packed.blocks_per_row, false);
+                        });
                         break;
                     case 2:
-                        q6k_detail::rowsChunkAVX512<1, 2>(packed, activation,
-                            output, chunk, 0, packed.blocks_per_row, false);
+                        // The matrix's own policy selects the accumulation order.
+                        q6k_detail::withQ6Order(packed, [&]<bool Ordered>() {
+                            q6k_detail::rowsChunkAVX512<1, 2, Ordered>(packed, activation,
+                                output, chunk, 0, packed.blocks_per_row, false);
+                        });
                         break;
                     case 4:
-                        q6k_detail::rowsChunkAVX512<1, 4>(packed, activation,
-                            output, chunk, 0, packed.blocks_per_row, false);
+                        // The matrix's own policy selects the accumulation order.
+                        q6k_detail::withQ6Order(packed, [&]<bool Ordered>() {
+                            q6k_detail::rowsChunkAVX512<1, 4, Ordered>(packed, activation,
+                                output, chunk, 0, packed.blocks_per_row, false);
+                        });
                         break;
                     }
                 }
