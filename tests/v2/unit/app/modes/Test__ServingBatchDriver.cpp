@@ -463,6 +463,33 @@ namespace llaminar2::test
         EXPECT_THROW(driver.call([](IOrchestrationRunner &) {}), std::runtime_error);
     }
 
+    TEST(ServingBatchDriverLifecycle, MaintenanceRunsPerStepOnTheDriverAndFailureSeals)
+    {
+        FakeServingRunner runner;
+        std::atomic<std::uint64_t> maintained{0};
+        std::atomic<bool> fail{false};
+        ON_CALL(runner, maybeApplyMoERebalance(::testing::_))
+            .WillByDefault(::testing::Invoke([&](std::uint64_t tokens) {
+                maintained += tokens;
+                return !fail.load();
+            }));
+        ServingBatchDriver driver(runner, 4, kContext);
+        std::string error;
+        ASSERT_TRUE(driver.start(error)) << error;
+        auto lane = driver.makeLane();
+        ASSERT_TRUE(lane->prefill(prompt(4)));
+        const auto first = bounded([&] { return lane->decodeStep(2); });
+        ASSERT_GE(first.tokens.size(), 1u);
+        EXPECT_GE(maintained.load(), first.tokens.size()) << "committed tokens reach maintenance from the driver";
+        fail = true;
+        const auto failed = bounded([&] { return lane->decodeStep(2); });
+        for (int i = 0; i < 200 && !driver.closed(); ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        EXPECT_TRUE(driver.closed());
+        EXPECT_NE(driver.failure().find("maintenance"), std::string::npos) << driver.failure();
+        (void)failed;
+    }
+
     TEST(ServingResponseLeasePool, ExecutionClaimsEndAtRowFinishResponsesAtPublication)
     {
         // S = 2, R = 4, Q = 0: two requests may execute; four responses may

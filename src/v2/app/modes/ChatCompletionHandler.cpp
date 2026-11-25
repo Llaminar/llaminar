@@ -551,6 +551,10 @@ namespace llaminar2
 
     bool ChatCompletionHandler::runMaintenanceOnRunnerThread(uint64_t committed_tokens)
     {
+        // Continuous batching: the serving driver runs maintenance once per
+        // shared step on the runner's thread; no per-request round-trip.
+        if (lane_factory_)
+            return true;
         bool ok = true;
         withRunner([&](IOrchestrationRunner &runner) {
             ok = runChatMoERebalanceMaintenance(runner, committed_tokens);

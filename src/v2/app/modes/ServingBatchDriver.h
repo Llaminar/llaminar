@@ -401,8 +401,22 @@ namespace llaminar2
                     for (auto &command : commands)
                         command();
                     if (runner_.servingBatchHasRunnableWork())
+                    {
+                        std::uint64_t committed = 0;
                         for (const auto &event : runner_.stepServingBatch())
+                        {
+                            committed += event.tokens.size();
                             dispatch(event);
+                        }
+                        // MoE maintenance is driven by committed tokens; the
+                        // driver thread owns the runner, so it runs here once
+                        // per step instead of per handler call.
+                        if (committed > 0 && !runner_.maybeApplyMoERebalance(committed))
+                        {
+                            seal("serving maintenance failed: " + runner_.lastError());
+                            return;
+                        }
+                    }
                     // A sealed runner session (failed shared forward) is
                     // fatal for serving: close the driver too, so new
                     // requests and /health report the failure.
