@@ -3809,13 +3809,12 @@ namespace
         constexpr int N = 1536;
         constexpr int K = 8960;
         constexpr std::array<int, 4> runtime_rows = {2, 5, 15, 64};
-        // The serial M=1 tree splits K only while the 24 N tasks (one chunk
-        // each at N = 1536) are fewer than the team (memory-bound host) or
-        // twice the team (compute-bound host). The host's own width did not
-        // guarantee that (Q4_0 resolved one partition natively). Thirty-two
-        // workers give K partitions in both cache regimes: 2 (memory-bound)
-        // or 11 (compute-bound) partitions of at least 26 blocks.
-        ScopedOMPThreadCount kpart_team(32);
+        // The 24 N tasks must be fewer than the team in either cache regime
+        // so the serial control actually splits K. CMake binds this width to
+        // every selecting CTest registration's processor reservation.
+        constexpr int kpart_workers = LLAMINAR_TEST_NATIVE_PAYLOAD_KPART_THREADS;
+        static_assert(kpart_workers > N / 64);
+        ScopedOMPThreadCount kpart_team(kpart_workers);
         constexpr std::array<VerifierRowsPolicy, 7> full_k_policies = {{
             VerifierRowsPolicy::FullKRowChunkGrid,
             VerifierRowsPolicy::FullKTwoRowNbc1,

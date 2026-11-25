@@ -10731,7 +10731,7 @@ if(V2_CPU_TARGET_X86)
         v2_cpu_native_isa_runtime("${V2_X86_LEAF_ISA}" V2_X86_LEAF_RUNTIME_ISA)
         add_v2_test(V2_Integration_CPUX86CodedLeaves_${V2_X86_LEAF_ISA}
             COMMAND $<TARGET_FILE:v2_unit_cpu_x86_coded_leaves>
-                --gtest_filter=-CPUX86CodedLeaves.FusedPrefillMembersStreamPanelsAndRetainSerialBytes:CPUX86CodedLeaves.FusedOrderedPartitionNaNsKeepEarlierPartitionAndSerialBytes
+                --gtest_filter=-CPUX86CodedLeaves.FusedPrefillMembersStreamPanelsAndRetainSerialBytes:CPUX86CodedLeaves.FusedOrderedPartitionNaNsKeepEarlierPartitionAndSerialBytes:CPUX86CodedLeaves.MalformedOrUnpairedEntriesRejectBeforeAnyWrite
             LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;NativeQuantised;${V2_X86_LEAF_ISA};ByteExact;Regression"
             MPI_PROCS 1 NO_MODELS NO_MPI
             ENVIRONMENT "OMP_NUM_THREADS=1;OMP_DYNAMIC=false;LLAMINAR_ISA_LEVEL=${V2_X86_LEAF_RUNTIME_ISA}")
@@ -10758,6 +10758,13 @@ if(V2_CPU_TARGET_X86)
             MPI_PROCS 1 NO_MODELS NO_MPI
             ENVIRONMENT "OMP_NUM_THREADS=3;OMP_DYNAMIC=false;LLAMINAR_ISA_LEVEL=${V2_X86_LEAF_RUNTIME_ISA}")
         list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUX86FusedOrderedNaN_${V2_X86_LEAF_ISA})
+        add_v2_test(V2_Integration_CPUX86CodedTileAdmission_${V2_X86_LEAF_ISA}
+            COMMAND $<TARGET_FILE:v2_unit_cpu_x86_coded_leaves>
+                --gtest_filter=CPUX86CodedLeaves.MalformedOrUnpairedEntriesRejectBeforeAnyWrite
+            LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;NativeQuantised;${V2_X86_LEAF_ISA};ByteExact;Admission;Regression"
+            MPI_PROCS 1 NO_MODELS NO_MPI
+            ENVIRONMENT "OMP_NUM_THREADS=1;OMP_DYNAMIC=false;LLAMINAR_ISA_LEVEL=${V2_X86_LEAF_RUNTIME_ISA}")
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUX86CodedTileAdmission_${V2_X86_LEAF_ISA})
     endforeach()
 endif()
 
@@ -20281,7 +20288,10 @@ include(cmake/V2NativePayloadFusedTests.cmake)
 
 include(cmake/V2CPUExecutionExactPolicyTests.cmake)
 
+set(V2_NATIVE_PAYLOAD_KPART_THREADS 32)
 add_executable(v2_integration_cpu_native_quantised_gemv integration/kernels/cpu/native_quantised/Test__CPUNativeQuantised_GEMV.cpp)
+target_compile_definitions(v2_integration_cpu_native_quantised_gemv PRIVATE
+    LLAMINAR_TEST_NATIVE_PAYLOAD_KPART_THREADS=${V2_NATIVE_PAYLOAD_KPART_THREADS})
 target_link_libraries(v2_integration_cpu_native_quantised_gemv
     llaminar2_core
     GTest::gtest
@@ -20295,6 +20305,10 @@ add_v2_test(V2_Integration_CPUNativeQuantised_GEMV
     LABELS "V2;Integration;GEMM;GEMV;NativeQuantised;CPU;Q4_0;IQ4_NL;Decode"
     MPI_PROCS 1
 )
+if(V2_CPU_TARGET_X86)
+    set_tests_properties(V2_Integration_CPUNativeQuantised_GEMV PROPERTIES
+        PROCESSORS ${V2_NATIVE_PAYLOAD_KPART_THREADS})
+endif()
 # Every CPU NativeQuantised entry rejects unsealed or stale publications, on
 # each native runtime ISA of this build (NEON, AVX2, AVX512).
 set(V2_CPU_PUBLICATION_ADMISSION_ISAS ${V2_CPU_BASELINE_RUNTIME_ISA})
@@ -20360,6 +20374,8 @@ add_v2_test(V2_Integration_CPU_NativeQuantised_PrefillHeuristic
     LABELS "V2;Integration;CPU;GEMM;Prefill;Heuristic;AllFormats;NativeQuantised;DecodeEquivalent;Regression"
     MPI_PROCS 1
 )
+set_tests_properties(V2_Integration_CPU_NativeQuantised_PrefillHeuristic PROPERTIES
+    PROCESSORS ${V2_NATIVE_PAYLOAD_KPART_THREADS})
 endif()
 foreach(V2_PREFILL_ISA IN LISTS V2_CPU_NATIVE_ISA_CELLS)
     v2_cpu_native_isa_runtime("${V2_PREFILL_ISA}" V2_PREFILL_RUNTIME_ISA)
