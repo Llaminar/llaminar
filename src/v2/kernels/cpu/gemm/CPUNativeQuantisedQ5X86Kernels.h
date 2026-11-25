@@ -12,6 +12,7 @@
  */
 #pragma once
 
+#include <algorithm>
 #include <bit>
 #include <utility>
 
@@ -152,7 +153,10 @@ namespace llaminar2::cpu::native_quantised::q5
      * @brief Expand one compile-time K group of an eight-column strip.
      * @tparam Group Low-nibble group in [0,3]; its high nibbles form group + 4.
      * @param unit First byte of the 64-column Q5 block.
+     * @tparam Aligned Select the group's byte from the strip's aligned fifth-bit
+     *         vector @p fifth instead of a shifted load.
      * @param column First column of the strip.
+     * @param fifth The strip's aligned fifth-bit plane (Aligned only).
      * @return Exact unsigned five-bit weights of groups @p Group and @p Group + 4.
      *
      * The same bytes as decode8(). Loading the fifth-bit plane @p Group
@@ -161,14 +165,19 @@ namespace llaminar2::cpu::native_quantised::q5
      * live across groups; the load stays inside the unit (its scale plane
      * follows). This keeps the sixteen AVX2 registers for the accumulators.
      */
-    template <int Group>
+    template <int Group, bool Aligned = false>
     [[nodiscard, gnu::always_inline]] inline std::pair<__m256i, __m256i> decodeGroup8(
-        const std::uint8_t *unit, int column) noexcept
+        const std::uint8_t *unit, int column, [[maybe_unused]] __m256i fifth = {}) noexcept
     {
         using Ops = multi_scale::SIMD<8>;
         const auto nibbles = multi_scale::load<__m256i>(unit + Q5NativePayload::nibbleOffset(Group, column));
-        const auto bits = std::bit_cast<__m256i>(Ops::repeatByte<0>(
-            multi_scale::load<Ops::I>(unit + Q5NativePayload::fifthOffset(Group, column))));
+        const auto bits = [&] {
+            if constexpr (Aligned)
+                return std::bit_cast<__m256i>(Ops::repeatByte<Group>(std::bit_cast<Ops::I>(fifth)));
+            else
+                return std::bit_cast<__m256i>(Ops::repeatByte<0>(
+                    multi_scale::load<Ops::I>(unit + Q5NativePayload::fifthOffset(Group, column))));
+        }();
         // A byte whose tested fifth bit is set gets sixteen, exactly as in
         // decode8(). The high half reuses the low mask after a word shift
         // (the bits shifted across bytes land outside the tested low nibble).
@@ -238,7 +247,7 @@ namespace llaminar2::cpu::native_quantised::q5
      * are computed once per row and block instead of once per strip.
      */
     template <int Lanes, bool Asymmetric, bool SumPairs, CPUProjectionNumericalPolicy Policy, std::size_t Rows>
-    inline void projectPolicy(const CPUNativeQuantisedPackedWeights &packed,
+    inline void projectRange(const CPUNativeQuantisedPackedWeights &packed,
         const std::array<const Q8_1Block *, Rows> &input, const std::array<float *, Rows> &output,
         int chunk, int first, int last, bool accumulate)
     {
@@ -263,7 +272,7 @@ namespace llaminar2::cpu::native_quantised::q5
             if (accumulate)
 #pragma GCC unroll 4
                 for (std::size_t row = 0; row < Rows; ++row)
-#pragma GCC unroll 4
+#pragma GCC unroll 8
                     for (int strip = 0; strip < strips; ++strip)
                         partial[row][strip] = multi_scale::load<F>(output[row] + pass + strip * Lanes);
             const std::uint8_t *unit = chunk_base + static_cast<std::size_t>(first) * stride;
@@ -280,14 +289,19 @@ namespace llaminar2::cpu::native_quantised::q5
                     // would not fit the sixteen AVX2 registers.
                     constexpr bool defer = Rows == 1;
                     const auto pair = [&]<int G>() {
-#pragma GCC unroll 4
+#pragma GCC unroll 8
                         for (int strip = 0; strip < strips; ++strip)
                         {
                             const int column = pass + strip * Lanes;
                             [[maybe_unused]] __m256i sums[Rows];
+                            // One-row tiles cover the whole block: load the strip's
+                            // fifth-bit plane once, aligned, without line splits.
+                            [[maybe_unused]] __m256i fifth{};
+                            if constexpr (Rows == 1)
+                                fifth = multi_scale::load<__m256i>(unit + Q5NativePayload::fifthOffset(0, column));
                             // Decode one group at a time; only its two vectors are live.
                             const auto group = [&]<int Group>() {
-                                const auto [low, high] = decodeGroup8<Group>(unit, column);
+                                const auto [low, high] = decodeGroup8<Group, Rows == 1>(unit, column, fifth);
 #pragma GCC unroll 4
                                 for (std::size_t row = 0; row < Rows; ++row)
                                 {
@@ -317,7 +331,7 @@ namespace llaminar2::cpu::native_quantised::q5
                 else
                 {
                     const auto group = [&]<int G>() {
-#pragma GCC unroll 4
+#pragma GCC unroll 8
                         for (int strip = 0; strip < strips; ++strip)
                         {
                             const int column = pass + strip * Lanes;
@@ -349,7 +363,7 @@ namespace llaminar2::cpu::native_quantised::q5
                     [[maybe_unused]] int center = 0;
                     if constexpr (!Asymmetric)
                         center = 16 * sumQ8(a.qs);
-#pragma GCC unroll 4
+#pragma GCC unroll 8
                     for (int strip = 0; strip < strips; ++strip)
                     {
                         const auto *scale_words = d + strip * Lanes;
@@ -382,7 +396,7 @@ namespace llaminar2::cpu::native_quantised::q5
                     }
                 }
             }
-#pragma GCC unroll 4
+#pragma GCC unroll 8
             for (int strip = 0; strip < strips; ++strip)
             {
                 const int column = pass + strip * Lanes;
@@ -401,6 +415,45 @@ namespace llaminar2::cpu::native_quantised::q5
                         std::memcpy(output[row] + column, &partial[row][strip], sizeof(F));
             }
         }
+    }
+
+    /// K blocks per AVX2 one-row cache tile: 16 x 1408 B units stay L1-resident for all eight strips.
+    inline constexpr int kAVX2KTileBlocks = 16;
+
+    /**
+     * @brief Run projectRange(), cache-tiling K for the AVX2 one-row decode tile.
+     * @tparam Lanes Physical AVX2 or AVX-512 output width.
+     * @tparam Asymmetric Q5_1 minimum term, instead of Q5_0 centering.
+     * @tparam SumPairs Publish the two-row fused epilogue sum in the corresponding even row.
+     * @tparam Policy Prepared FP32 contribution program, fixed before the K traversal.
+     * @tparam Rows Number of live activation and output rows.
+     * @param packed,input,output,chunk,first,last,accumulate As projectRange().
+     *
+     * AVX-512 one-row tiles already cover all 64 columns of a block in one
+     * pass. Sixteen YMM registers cannot hold eight strips' accumulators, so
+     * the AVX2 one-row tile instead visits kAVX2KTileBlocks blocks for each of
+     * its eight strips before moving on: every weight line is fetched once
+     * into L1 and reused by both strips sharing it, and the chunk row streams
+     * from memory in order. Each strip carries its FP32 accumulator across
+     * tiles in its own output columns (an exact binary32 store and reload),
+     * so every column still accumulates the same contributions in ascending
+     * K with unchanged rounding. Paired-sum tiles publish only a row sum and
+     * keep the single walk.
+     */
+    template <int Lanes, bool Asymmetric, bool SumPairs, CPUProjectionNumericalPolicy Policy, std::size_t Rows>
+    inline void projectPolicy(const CPUNativeQuantisedPackedWeights &packed,
+        const std::array<const Q8_1Block *, Rows> &input, const std::array<float *, Rows> &output,
+        int chunk, int first, int last, bool accumulate)
+    {
+        if constexpr (Lanes == 8 && Rows == 1 && !SumPairs)
+        {
+            for (int begin = first; begin < last; begin += kAVX2KTileBlocks)
+                projectRange<Lanes, Asymmetric, SumPairs, Policy>(packed, input, output, chunk, begin,
+                    std::min(last, begin + kAVX2KTileBlocks), accumulate || begin != first);
+            if (first < last)
+                return;
+        }
+        projectRange<Lanes, Asymmetric, SumPairs, Policy>(packed, input, output, chunk, first, last, accumulate);
     }
 
     /** @brief Select symmetric or asymmetric Q5 and the FP32 policy once before the K traversal. */
