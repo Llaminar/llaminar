@@ -25,16 +25,37 @@
 
 namespace llaminar2
 {
-    /**
-     * @brief True on a kernel built without NUMA support (no sysfs node
-     *        directory): the single implicit node 0 is the whole machine, so
-     *        node-0 placement needs no policy binding.
-     */
-    inline bool nonNUMAKernelSingleNode(int numa_node) noexcept
+    /** @brief Independent observations of whether the kernel has NUMA at all. */
+    struct NonNUMAKernelEvidence
     {
-        return numa_node == 0 &&
-               !std::filesystem::exists("/sys/devices/system/node/online");
+        bool sysfs_node_directory_absent = false; ///< /sys/devices/system/node missing.
+        bool memory_policy_syscalls_absent = false; ///< get_mempolicy() fails with ENOSYS.
+        int hwloc_numa_nodes = -1; ///< hwloc NUMANODE objects; -1 when unobserved.
+    };
+
+    /**
+     * @brief Classify a kernel without NUMA support.
+     *
+     * Only when every observation agrees — no sysfs node directory, no memory
+     * policy syscalls and at most one hwloc NUMA node — is the machine one
+     * implicit node 0. A container that merely hides sysfs on a NUMA kernel
+     * still has the syscalls and keeps strict binding.
+     */
+    constexpr bool classifyNonNUMAKernel(const NonNUMAKernelEvidence &evidence) noexcept
+    {
+        return evidence.sysfs_node_directory_absent && evidence.memory_policy_syscalls_absent &&
+               evidence.hwloc_numa_nodes >= 0 && evidence.hwloc_numa_nodes <= 1;
     }
+
+    /** @brief The process's one cached observation (taken on first use). */
+    const NonNUMAKernelEvidence &observedNonNUMAKernelEvidence();
+
+    /**
+     * @brief True on a kernel built without NUMA support, for node 0 only:
+     *        the single implicit node is the whole machine, so node-0
+     *        placement needs no memory-policy binding.
+     */
+    bool nonNUMAKernelSingleNode(int numa_node) noexcept;
 
 
     /** @brief One actual hwloc core with independent OS and MPI logical identities. */

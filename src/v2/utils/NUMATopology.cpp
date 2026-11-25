@@ -34,6 +34,9 @@
 #include <hwloc.h>
 #include <hwloc/plugins.h>
 #include <set>
+#include <unistd.h>
+#include <sys/syscall.h>
+#include <cerrno>
 #include <stdexcept>
 
 // GPU headers - CANNOT include both CUDA and HIP in same translation unit (type conflicts)
@@ -56,6 +59,53 @@
 
 namespace llaminar2
 {
+    const NonNUMAKernelEvidence &observedNonNUMAKernelEvidence()
+    {
+        static const NonNUMAKernelEvidence evidence = [] {
+            NonNUMAKernelEvidence observed;
+            std::error_code ec;
+            observed.sysfs_node_directory_absent =
+                !std::filesystem::exists("/sys/devices/system/node", ec) && !ec;
+#if defined(__linux__) && defined(SYS_get_mempolicy)
+            errno = 0;
+            const long status = ::syscall(SYS_get_mempolicy, nullptr, nullptr, 0UL, nullptr, 0UL);
+            observed.memory_policy_syscalls_absent = status == -1 && errno == ENOSYS;
+#endif
+            hwloc_topology_t topology = nullptr;
+            if (hwloc_topology_init(&topology) == 0)
+            {
+                if (hwloc_topology_set_io_types_filter(topology, HWLOC_TYPE_FILTER_KEEP_NONE) == 0 &&
+                    hwloc_topology_load(topology) == 0)
+                    observed.hwloc_numa_nodes = hwloc_get_nbobjs_by_type(topology, HWLOC_OBJ_NUMANODE);
+                hwloc_topology_destroy(topology);
+            }
+            if (observed.sysfs_node_directory_absent != observed.memory_policy_syscalls_absent)
+                LOG_WARN("[NUMATopology] NUMA observations disagree (sysfs node directory "
+                         << (observed.sysfs_node_directory_absent ? "absent" : "present")
+                         << ", memory-policy syscalls "
+                         << (observed.memory_policy_syscalls_absent ? "absent" : "present")
+                         << "); NUMA binding stays strict");
+            else if (classifyNonNUMAKernel(observed))
+                LOG_INFO("[NUMATopology] Kernel without NUMA support: node 0 is the whole machine");
+            return observed;
+        }();
+        return evidence;
+    }
+
+    bool nonNUMAKernelSingleNode(int numa_node) noexcept
+    {
+        if (numa_node != 0)
+            return false;
+        try
+        {
+            return classifyNonNUMAKernel(observedNonNUMAKernelEvidence());
+        }
+        catch (...)
+        {
+            return false; // unobservable means strict binding
+        }
+    }
+
     std::vector<MPICorePlacement> NUMATopology::observeMPICorePlacement()
     {
         struct TopologyOwner
