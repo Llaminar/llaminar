@@ -840,39 +840,77 @@ namespace llaminar2::cpu::native_quantised::x86_panel
         }
 
         /**
+         * @brief Immutable operands of one register-folded strip, passed by reference.
+         * @details stripeOrdered() and consumePanelTiles() read these through
+         * one pointer instead of eight scalar/pointer arguments, so their loop
+         * control needs no vector-register or stack spill slots.
+         */
+        struct OrderedStrip
+        {
+            const CPUNativeQuantisedWeightView *w; ///< Admitted weight view.
+            const Q8_1Block *a;                    ///< Original row-major Q8 input root.
+            float *c;                              ///< Original output root.
+            const CPUProjectionRowGrid *grid;      ///< Read-only live row ownership.
+            float *panel;                          ///< The calling worker's slot.
+            int ldc;                               ///< Output row stride.
+            int n;                                 ///< First original N coordinate of the (complete) strip.
+            int parts;                             ///< Serial K partition count.
+        };
+
+        /**
+         * @brief Consume one packed panel of whole partitions across every live row tile of a strip.
+         * @tparam Lanes,Strip,CB,P As stripe(); P is GPU-aligned.
+         * @tparam TileRows Register-tile height (panelRowTile()).
+         * @tparam Single Whether every partition is one block (wide leaf only).
+         * @param s Strip operands.
+         * @param fold Partition width, panel blocks, first-panel flag, empty trailing partitions.
+         * @param begin First K block of the panel.
+         */
+        template <int Lanes, int Strip, int CB, Policy P, int TileRows, bool Single>
+        [[gnu::noinline, gnu::optimize("no-tree-slp-vectorize")]]
+        void consumePanelTiles(const OrderedStrip &s, PanelFold fold, int begin)
+        {
+            constexpr int Subs = Strip / Lanes;
+            eachRowTile<TileRows>(*s.grid, [&]<int Rows>(int row)
+            {
+                const int blocks = s.w->blocks_per_row;
+                std::array<const Q8_1Block *, Rows> in{};
+                std::array<float *, Rows> out{};
+                for (int r = 0; r < Rows; ++r)
+                {
+                    out[r] = s.c + std::size_t(row + r) * s.ldc + s.n;
+                    in[r] = s.a + std::size_t(row + r) * blocks + begin;
+                }
+#if defined(__AVX512VNNI__)
+                if constexpr (Subs == 4)
+                    consumeWideOrdered<CB, Rows, P, Single>(s.panel, fold, in, out);
+                else
+#endif
+                    consumeOrdered<Lanes, CB, Rows, P>(s.panel, fold, in, out);
+            });
+        }
+
+        /**
          * @brief stripe() for GPU-aligned trees whose partitions fit one panel, on a complete strip.
          * @tparam Lanes,Strip,CB,P As stripe(); P is GPU-aligned and foldsInRegisters() holds.
-         * @param w,a,c,ldc,n,parts,grid,panel As stripe(); no carry is needed.
+         * @param s Strip operands (no carry is needed).
          * @details Packs as many whole partitions as fit one panel and folds
          * them in registers (consumeOrdered / consumeWideOrdered) with the
          * serial tree's exact ordered operations. A separate function, so that
          * stripe()'s per-partition program and its frame stay those of
-         * 67dac67f7. Its loop control is scalar: superword vectorization of
-         * the per-row-tile pointer arrays only moved pointers through vector
-         * registers and stack slots (no arithmetic is affected).
+         * 67dac67f7. Its loop control is scalar; the row-tile walk is the
+         * separate consumePanelTiles(), so neither keeps more live scalars than
+         * general registers (no vector-register or stack spill slots).
          */
         template <int Lanes, int Strip, int CB, Policy P>
         [[gnu::noinline, gnu::optimize("no-tree-slp-vectorize")]]
-        void stripeOrdered(const CPUNativeQuantisedWeightView &w, const Q8_1Block *a, float *c, int ldc, int n,
-                           int parts, const CPUProjectionRowGrid &grid, float *panel)
+        void stripeOrdered(const OrderedStrip &s)
         {
             constexpr int Subs = Strip / Lanes;
             static_assert(Subs == 1 || (Lanes == 16 && Strip == wide_strip));
             static_assert(P == Policy::GPUAlignedExpert);
-            const int blocks = w.blocks_per_row;
-            const int width = (blocks - 1) / parts + 1;
-            // A wide strip is one whole chunk: decode its four sixteen-column
-            // vectors into their interleaved planes.
-            const auto packPanel = [&](int begin, int next)
-            {
-                pack<Lanes, Subs, 0, CB>(w, n / 64, n % 64, begin, next, panel);
-                if constexpr (Subs == 4)
-                {
-                    pack<Lanes, Subs, 1, CB>(w, n / 64, Lanes, begin, next, panel);
-                    pack<Lanes, Subs, 2, CB>(w, n / 64, 2 * Lanes, begin, next, panel);
-                    pack<Lanes, Subs, 3, CB>(w, n / 64, 3 * Lanes, begin, next, panel);
-                }
-            };
+            const int blocks = s.w->blocks_per_row;
+            const int width = (blocks - 1) / s.parts + 1;
             // Partitions [0, nonempty) hold blocks; the remaining ones are
             // empty and fold +0 after the last nonempty partition.
             const int per_panel = depth / width, nonempty = (blocks - 1) / width + 1;
@@ -880,41 +918,28 @@ namespace llaminar2::cpu::native_quantised::x86_panel
             {
                 const int last = std::min(nonempty, first + per_panel);
                 const int begin = first * width, next = std::min(last * width, blocks);
-                const int empty_tail = last == nonempty ? parts - nonempty : 0;
-                packPanel(begin, next);
-                const auto consumeTiles = [&]<int TileRows, bool Single>()
+                const PanelFold fold{width, next - begin, first == 0, last == nonempty ? s.parts - nonempty : 0};
+                // A wide strip is one whole chunk: decode its four
+                // sixteen-column vectors into their interleaved planes.
+                pack<Lanes, Subs, 0, CB>(*s.w, s.n / 64, s.n % 64, begin, next, s.panel);
+                if constexpr (Subs == 4)
                 {
-                    eachRowTile<TileRows>(grid, [&]<int Rows>(int row)
-                    {
-                        std::array<const Q8_1Block *, Rows> in{};
-                        std::array<float *, Rows> out{};
-                        for (int r = 0; r < Rows; ++r)
-                        {
-                            out[r] = c + std::size_t(row + r) * ldc + n;
-                            in[r] = a + std::size_t(row + r) * blocks + begin;
-                        }
-#if defined(__AVX512VNNI__)
-                        if constexpr (Subs == 4)
-                            consumeWideOrdered<CB, Rows, P, Single>(panel, {width, next - begin, first == 0, empty_tail},
-                                                                    in, out);
-                        else
-#endif
-                            consumeOrdered<Lanes, CB, Rows, P>(panel, {width, next - begin, first == 0, empty_tail}, in,
-                                                               out);
-                    });
-                };
+                    pack<Lanes, Subs, 1, CB>(*s.w, s.n / 64, Lanes, begin, next, s.panel);
+                    pack<Lanes, Subs, 2, CB>(*s.w, s.n / 64, 2 * Lanes, begin, next, s.panel);
+                    pack<Lanes, Subs, 3, CB>(*s.w, s.n / 64, 3 * Lanes, begin, next, s.panel);
+                }
                 // The tile height is panelRowTile(), which the launch evidence reports.
                 constexpr int tile_rows = rowTile(Strip);
                 if constexpr (Subs == 4)
                 {
                     constexpr bool split = wideOrderedSplitsRows(static_cast<Format>(CB));
                     if (width == 1)
-                        consumeTiles.template operator()<tile_rows, true>();
+                        consumePanelTiles<Lanes, Strip, CB, P, tile_rows, true>(s, fold, begin);
                     else
-                        consumeTiles.template operator()<split ? 1 : tile_rows, false>();
+                        consumePanelTiles<Lanes, Strip, CB, P, split ? 1 : tile_rows, false>(s, fold, begin);
                 }
                 else
-                    consumeTiles.template operator()<tile_rows, false>();
+                    consumePanelTiles<Lanes, Strip, CB, P, tile_rows, false>(s, fold, begin);
             }
         }
 
@@ -1018,11 +1043,39 @@ namespace llaminar2::cpu::native_quantised::x86_panel
             }
         }
 
-        /** Workshare over stripes, not row replay: each packed panel is consumed across the row grid. */
-        template <int Lanes, int Strip, int CB, Policy P>
-        void run(const CPUNativeQuantisedWeightView &w, const Q8_1Block *a, float *c, int ldc, int rows, int parts,
-                 const CPUProjectionRowGrid &grid, float *scratch)
+        /**
+         * @brief Invocation operands of one dense panel launch, passed by reference.
+         * @details One pointer replaces seven arguments, so the format dispatch
+         * and run() pass everything in general registers (no outgoing stack
+         * argument staged through a vector register).
+         */
+        struct PanelIO
         {
+            const Q8_1Block *a;               ///< Original row-major Q8 input root.
+            float *c;                         ///< Original output root.
+            const CPUProjectionRowGrid *grid; ///< Read-only live row ownership.
+            float *scratch;                   ///< Admitted projection slab.
+            int ldc;                          ///< Output row stride.
+            int rows;                         ///< Physical rows.
+            int parts;                        ///< Serial K partition count.
+        };
+
+        /**
+         * Workshare over stripes, not row replay: each packed panel is consumed across the row grid.
+         * Superword vectorization is off: it only stored the OrderedStrip
+         * pointers through vector registers into the frame. Not inlined into
+         * the format dispatch, so each launch keeps its operands in general
+         * registers.
+         */
+        template <int Lanes, int Strip, int CB, Policy P>
+        [[gnu::noinline, gnu::optimize("no-tree-slp-vectorize")]]
+        void run(const CPUNativeQuantisedWeightView &w, const PanelIO &io)
+        {
+            const Q8_1Block *const a = io.a;
+            float *const c = io.c;
+            const CPUProjectionRowGrid &grid = *io.grid;
+            float *const scratch = io.scratch;
+            const int ldc = io.ldc, rows = io.rows, parts = io.parts;
             auto task = [&]
             {
                 constexpr auto format = static_cast<Format>(CB);
@@ -1038,7 +1091,7 @@ namespace llaminar2::cpu::native_quantised::x86_panel
                     if (foldsInRegisters<Strip, P>(w, strip * Strip, parts))
                     {
                         if constexpr (P == Policy::GPUAlignedExpert)
-                            stripeOrdered<Lanes, Strip, CB, P>(w, a, c, ldc, strip * Strip, parts, grid, panel);
+                            stripeOrdered<Lanes, Strip, CB, P>({&w, a, c, &grid, panel, ldc, strip * Strip, parts});
                     }
                     else
                         stripe<Lanes, Strip, CB, P>(w, a, c, ldc, strip * Strip, parts, grid, panel, carry);
@@ -1083,11 +1136,9 @@ namespace llaminar2::cpu::native_quantised::x86_panel
 
         /** @brief Dispatch a validated panel format and FP policy before entering the team. */
         template <int Lanes, int Strip>
-        void dispatch(Format format, const CPUNativeQuantisedWeightView &w, const Q8_1Block *a, float *out, int rows,
-                      int stride, int partitions, const CPUProjectionRowGrid &grid, float *scratch)
+        void dispatch(Format format, const CPUNativeQuantisedWeightView &w, const PanelIO &io)
         {
-            visitProgram(format, w.numerical_policy, [&]<int CB, Policy P>()
-                         { run<Lanes, Strip, CB, P>(w, a, out, stride, rows, partitions, grid, scratch); });
+            visitProgram(format, w.numerical_policy, [&]<int CB, Policy P>() { run<Lanes, Strip, CB, P>(w, io); });
         }
 
         /**
@@ -1105,6 +1156,7 @@ namespace llaminar2::cpu::native_quantised::x86_panel
          * @param panel Calling worker's slot: panel, then (only when needed) one carry per row.
          */
         template <int Lanes, int Strip, int CB, Policy P>
+        [[gnu::noinline, gnu::optimize("no-tree-slp-vectorize")]]
         void pooledChunk(const CPUNativeQuantisedWeightView &w, const Q8_1Block *a, float *c, int ldc, int rows,
                          int parts, int chunk, float *panel)
         {
@@ -1119,7 +1171,7 @@ namespace llaminar2::cpu::native_quantised::x86_panel
                 if (foldsInRegisters<Strip, P>(w, 64 * chunk + column, parts))
                 {
                     if constexpr (P == Policy::GPUAlignedExpert)
-                        stripeOrdered<Lanes, Strip, CB, P>(w, a, c, ldc, 64 * chunk + column, parts, grid, panel);
+                        stripeOrdered<Lanes, Strip, CB, P>({&w, a, c, &grid, panel, ldc, 64 * chunk + column, parts});
                 }
                 else
                     stripe<Lanes, Strip, CB, P>(w, a, c, ldc, 64 * chunk + column, parts, grid, panel, carry);
@@ -1145,16 +1197,14 @@ namespace llaminar2::cpu::native_quantised::x86_panel
                                        {output, (std::size_t(rows - 1) * output_stride + weights.N) * sizeof(float)});
         storage_proof::requireDisjoint(writes, {weights.interleavedBase(), weights.bytes().size()});
         storage_proof::requireOriginalWorkReadOnly(writes, work);
+        const PanelIO io{activation, output, &grid, scratch.data(), output_stride, rows, partitions};
         if (lanes == 8)
-            return dispatch<8, 8>(format, weights, activation, output, rows, output_stride, partitions, grid,
-                                  scratch.data());
+            return dispatch<8, 8>(format, weights, io);
 #if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
         // The same rule as the borrowed quote: a whole chunk per worker when possible.
         if (stripColumns(lanes, weights.N, workers) == wide_strip)
-            return dispatch<16, wide_strip>(format, weights, activation, output, rows, output_stride, partitions, grid,
-                                            scratch.data());
-        return dispatch<16, 16>(format, weights, activation, output, rows, output_stride, partitions, grid,
-                                scratch.data());
+            return dispatch<16, wide_strip>(format, weights, io);
+        return dispatch<16, 16>(format, weights, io);
 #else
         throw std::invalid_argument("Native x86 prefill cannot select AVX-512 in its AVX2 envelope");
 #endif

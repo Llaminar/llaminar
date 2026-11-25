@@ -1153,8 +1153,8 @@ namespace llaminar2::test
      * members. The launch borrows one uniformly strided slot per worker of the
      * invocation's slab, never more than the members' admitted envelope; a
      * one-float-short slab, a team wider than the slab was planned for, and a
-     * slab overlapping a sibling's output, activation or bias or the
-     * descriptor table are rejected before any write; a slab base off a cache
+     * slab overlapping a sibling's output, activation, bias, prepared object
+     * or packed bytes or the descriptor table are rejected before any write; a slab base off a cache
      * line keeps every byte (relative slot contract). The reported row tile
      * is the executed one. Decode members, explicit ISA and explicit ownership
      * keep their register tiles.
@@ -1163,6 +1163,8 @@ namespace llaminar2::test
     {
         constexpr std::array<int, 5> member_rows{17, 3, 33, 16, 1};
         constexpr int members = static_cast<int>(member_rows.size());
+        int packed_alias_cells = 0; // cells whose packed bytes can hold the whole slab
+
         constexpr float dirty = 123456.0f;
         const int lanes = activeISALevel() >= ISALevel::AVX512 ? 16 : 8;
         // N = 65: one complete 64-column strip and a one-column tail strip;
@@ -1361,6 +1363,37 @@ namespace llaminar2::test
                             std::copy(descriptors.begin(), descriptors.end(), table);
                             rejectedBeforeWrite("descriptor table", table, std::span<float>(shared.data(), demand));
                         }
+                        // A slab overlapping a sibling's prepared object (a
+                        // copy constructed inside the shared buffer) or its
+                        // resident packed bytes is rejected before any write,
+                        // and the packed bytes are unchanged.
+                        {
+                            AlignedVector<float> shared;
+                            shared.resize_uninitialized(demand + 4096);
+                            std::fill(shared.data(), shared.data() + shared.size(), dirty);
+                            static_assert(alignof(CPUNativeQuantisedPackedWeights) <= 64);
+                            auto *object = ::new (static_cast<void *>(shared.data() + 64)) CPUNativeQuantisedPackedWeights(packed[4]);
+                            object->sealPublication();
+                            auto bundle = descriptors;
+                            bundle[4].packed = object;
+                            rejectedBeforeWrite("sibling prepared object", bundle.data(), std::span<float>(shared.data(), demand));
+                            object->~CPUNativeQuantisedPackedWeights();
+                        }
+                        {
+                            const auto view = packed[4].readView();
+                            const auto bytes = view.bytes();
+                            const std::vector<std::uint8_t> before(bytes.begin(), bytes.end());
+                            // Only the first demand floats would be written; keep the probe
+                            // inside the packed bytes so a failing admission cannot escape them.
+                            if (bytes.size() >= demand * sizeof(float))
+                            {
+                                auto *weights = reinterpret_cast<float *>(const_cast<std::uint8_t *>(bytes.data()));
+                                rejectedBeforeWrite("sibling packed bytes", descriptors.data(), std::span<float>(weights, demand));
+                                ++packed_alias_cells;
+                            }
+                            EXPECT_TRUE(std::equal(before.begin(), before.end(), bytes.begin()))
+                                << "rejected launch modified the packed bytes";
+                        }
                         // Decode members, an explicit ISA and explicit ownership keep their tiles.
                         auto decode = descriptors;
                         for (auto &d : decode)
@@ -1382,6 +1415,7 @@ namespace llaminar2::test
                         unpooled(descriptors, ISAPath::AVX2, FusedOutputJobOwnership::Auto);
                         unpooled(descriptors, ISAPath::AUTO, FusedOutputJobOwnership::Current);
                     }
+        EXPECT_GT(packed_alias_cells, 0) << "no cell exercised the packed-bytes alias rejection";
     }
     /**
      * @test The fused batched route keeps the earlier ordered partition's NaN for nonpanel and panel members.

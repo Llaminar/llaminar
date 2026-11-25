@@ -1052,7 +1052,31 @@ namespace llaminar2::cpu::native_quantised::multi_scale
         // of each emitted tile. In particular the AVX2 grouped Q5_K tile
         // would save live vectors; the AVX-512 grouped contiguously folded
         // tile does not have the extra ordered partition accumulators.
-        constexpr bool fixed_layout = (Lanes == 8 && Codebook == 7 && Rows == 1) ||
+        // The GPU-aligned program's pinned additions (accumulateOrdered and
+        // accumulateBlockOrdered) are asm barriers that shift GCC 14's register
+        // allocation. Per emitted AVX-512-envelope tile, the fixed layout or
+        // the block form of the partition fold is selected where it keeps the
+        // tile's K loop and every enclosing loop at or below the stack
+        // references (scalar and vector) of the plain program of 67dac67f7;
+        // elsewhere the original layout and fold already do. Both layouts
+        // address the same bytes (CompactMultiScale strides do not depend on
+        // asymmetry), both folds are the same VADDPS with the same operands.
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
+        constexpr bool avx512_envelope = true;
+#else
+        constexpr bool avx512_envelope = false;
+#endif
+        constexpr bool contiguous = Tree == Reduction::Contiguous;
+        constexpr bool ordered_fixed_layout = OrderedNaN && avx512_envelope &&
+            ((Lanes == 8 && contiguous &&
+              ((Codebook == 9 && Rows == 2) || (Codebook == 17 && Rows == 1))) ||
+             (Lanes == 16 && !contiguous &&
+              ((Codebook == 10 && Rows == 2) || (Codebook == 12 && Rows == 2) || (Codebook == 14 && Rows == 1) ||
+               (Codebook == 17 && Rows <= 2))) ||
+             (Lanes == 16 && contiguous && ((Codebook == 15 && Rows == 2) || (Codebook == 16 && Rows == 4))));
+        [[maybe_unused]] constexpr bool block_form_fold = OrderedNaN && avx512_envelope && Lanes == 16 &&
+            Codebook == 9 && Rows == 2 && !contiguous;
+        constexpr bool fixed_layout = ordered_fixed_layout || (Lanes == 8 && Codebook == 7 && Rows == 1) ||
             (Lanes == 16 && Codebook == 11 && (Tree == Reduction::Contiguous || Rows <= 2)) ||
             (Lanes == 16 && Codebook == 7 && Rows > 1 && Tree == Reduction::Contiguous);
         constexpr auto encoding = CPUNativeQuantisedEncoding::CompactMultiScale;
@@ -1289,7 +1313,13 @@ namespace llaminar2::cpu::native_quantised::multi_scale
                     {
 #if defined(__AVX2__)
                         if constexpr (OrderedNaN)
-                            reduced[row] = partition == 0 ? acc[row] : accumulateOrdered<Lanes>(reduced[row], acc[row]);
+                        {
+                            if constexpr (block_form_fold)
+                                reduced[row] = partition == 0 ? acc[row]
+                                                              : accumulateBlockOrdered<Lanes>(reduced[row], acc[row]);
+                            else
+                                reduced[row] = partition == 0 ? acc[row] : accumulateOrdered<Lanes>(reduced[row], acc[row]);
+                        }
                         else
 #endif
                             reduced[row] = partition == 0 ? acc[row] : reduced[row] + acc[row];
