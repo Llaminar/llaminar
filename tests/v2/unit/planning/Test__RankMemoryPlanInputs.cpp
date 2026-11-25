@@ -308,9 +308,9 @@ TEST(RankMemoryPlanInputs, OwnerFollowerServingBomJoin)
     const auto request = ServingCapacityRequest::authored(1, 2, 0);
     const ServingPoolPerResponseBudget budget{1024};
     const auto owner_demand =
-        servingPoolDemandForRank(serve_mode, owner_rank, owner_rank, request, budget);
+        servingPoolDemandForRank(serve_mode, owner_rank, owner_rank, request, ServingSlotDecisionGeometry{}, budget);
     const auto follower_demand =
-        servingPoolDemandForRank(serve_mode, owner_rank, 0, request, budget);
+        servingPoolDemandForRank(serve_mode, owner_rank, 0, request, ServingSlotDecisionGeometry{}, budget);
     ASSERT_TRUE(owner_demand.has_value());
     ASSERT_FALSE(follower_demand.has_value());
     EXPECT_EQ(*owner_demand, 2048u);

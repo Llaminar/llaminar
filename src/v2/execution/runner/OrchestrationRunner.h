@@ -2382,8 +2382,7 @@ namespace llaminar2
             int completion_tokens = 0;
             int32_t last_token = 0;          ///< Last committed token.
             bool needs_feed = false;         ///< last_token is not yet in KV.
-            bool has_logits = false;         ///< next_logits holds the next decision.
-            std::vector<float> next_logits;
+            bool has_logits = false;         ///< The slot's decision row holds the next decision.
             int grant = 0;                   ///< Paced tokens still allowed.
             std::deque<int32_t> forced;      ///< Tokens to commit instead of sampling.
             bool cancelled = false;
@@ -2403,6 +2402,18 @@ namespace llaminar2
         std::map<std::uint64_t, std::vector<int32_t>> pending_serving_forced_;
         int serving_capacity_ = 0;
         bool serving_active_ = false;
+        /**
+         * @brief One retained decision-logits row per resident slot (capacity x
+         *        vocab FP32), allocated when the session opens and priced by
+         *        the serving pool's ServingSlotDecisionGeometry: no per-step
+         *        allocation.
+         */
+        std::vector<float> serving_decision_logits_;
+        float *servingDecisionLogits(int slot)
+        {
+            return serving_decision_logits_.data() +
+                   static_cast<std::size_t>(slot) * static_cast<std::size_t>(vocabSize());
+        }
         /** @brief A shared forward failed: the session admits nothing more. */
         std::string serving_failure_;
         /** @brief Max prompt tokens one entering request adds per shared step. */

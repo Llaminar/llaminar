@@ -22678,7 +22678,8 @@ bool OrchestrationRunner::publishPhysicalMemoryAuthority()
             // the authority's rank-local host BOM carries the owner line.
             .serving_pool_demand_bytes = servingPoolDemandForRank(
                 config_.serve_mode, sealed_request_authority_rank_, plan_.rank,
-                config_.servingCapacityRequest()),
+                config_.servingCapacityRequest(),
+                ServingSlotDecisionGeometry::forVocabulary(profile.vocab_size)),
         });
 
         // CPU threads are not needed to observe GPUs. Only immutable role/BOM
@@ -26783,6 +26784,10 @@ bool OrchestrationRunner::publishPhysicalMemoryAuthority()
         serving_rows_.clear();
         serving_rows_.reserve(static_cast<std::size_t>(capacity));
         serving_slot_busy_.assign(static_cast<std::size_t>(capacity), false);
+        if (vocabSize() <= 0)
+            return setError("Serving batch requires the model vocabulary");
+        serving_decision_logits_.assign(
+            static_cast<std::size_t>(capacity) * static_cast<std::size_t>(vocabSize()), 0.0f);
         serving_queue_.clear();
         serving_cancellations_.clear();
         serving_capacity_ = capacity;
@@ -26885,6 +26890,8 @@ bool OrchestrationRunner::publishPhysicalMemoryAuthority()
         serving_active_ = false;
         serving_capacity_ = 0;
         serving_failure_.clear();
+        serving_decision_logits_.clear();
+        serving_decision_logits_.shrink_to_fit();
     }
 
     std::vector<ServingBatchEvent> OrchestrationRunner::stepServingBatch()
@@ -27005,8 +27012,8 @@ bool OrchestrationRunner::publishPhysicalMemoryAuthority()
                 // Byte-exact identity of the decision's inputs: any change of
                 // arithmetic by batch composition changes the digest.
                 std::uint64_t digest = 1469598103934665603ull;
-                const auto *bytes = reinterpret_cast<const unsigned char *>(row.next_logits.data());
-                for (std::size_t i = 0; i < row.next_logits.size() * sizeof(float); ++i)
+                const auto *bytes = reinterpret_cast<const unsigned char *>(servingDecisionLogits(row.slot));
+                for (std::size_t i = 0; i < static_cast<std::size_t>(vocab) * sizeof(float); ++i)
                     digest = (digest ^ bytes[i]) * 1099511628211ull;
                 event_of(row).logit_digests.push_back(digest);
             }
@@ -27020,7 +27027,7 @@ bool OrchestrationRunner::publishPhysicalMemoryAuthority()
             else
             {
                 token = static_cast<int32_t>(sampleHostLogitsAtLogicalPosition(
-                    row.sampler, row.next_logits.data(), row.next_logits.size(),
+                    row.sampler, servingDecisionLogits(row.slot), static_cast<std::size_t>(vocab),
                     row.request.sampling, row.cached_tokens));
                 sampled = true;
                 if (row.request.paced)
@@ -27130,7 +27137,7 @@ bool OrchestrationRunner::publishPhysicalMemoryAuthority()
                     finish_error[r] = "Serving row produced no logits";
                     continue;
                 }
-                row.next_logits.assign(logits, logits + vocab);
+                std::copy(logits, logits + vocab, servingDecisionLogits(row.slot));
                 row.has_logits = true;
                 if (may_decide(row))
                     decide(r);

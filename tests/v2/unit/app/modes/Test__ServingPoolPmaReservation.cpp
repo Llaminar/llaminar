@@ -65,7 +65,7 @@ TEST(ServingPoolPmaReservation, ReservesExactTypedDemand)
 {
     const auto budget = ServingPoolPerResponseBudget{1000};
     const auto resolved = capacity2(); // R=2 -> demand = 2000 bytes
-    const std::uint64_t demand = servingPoolMemoryDemand(resolved, budget);
+    const std::uint64_t demand = servingPoolMemoryDemand(resolved, budget, ServingSlotDecisionGeometry{});
     ASSERT_EQ(demand, 2000u);
 
     auto authority = makeAuthority(demand);
@@ -171,18 +171,18 @@ TEST(ServingPoolPmaReservation, FailClosedServingDemandForRank)
     // Owner rank (2 == sealed 2) -> exact demand (store first, ASSERT the
     // optional is engaged, then compare — never unchecked disengagement).
     {
-        const auto demand = servingPoolDemandForRank(true, 2, 2, request, budget);
+        const auto demand = servingPoolDemandForRank(true, 2, 2, request, ServingSlotDecisionGeometry{}, budget);
         ASSERT_TRUE(demand.has_value());
         EXPECT_EQ(*demand, 2000u);
     }
     // Follower rank -> no demand.
-    EXPECT_FALSE(servingPoolDemandForRank(true, 2, 0, request, budget).has_value());
+    EXPECT_FALSE(servingPoolDemandForRank(true, 2, 0, request, ServingSlotDecisionGeometry{}, budget).has_value());
     // Mismatched seal (sealed 2, rank 3) is a follower: no demand.
-    EXPECT_FALSE(servingPoolDemandForRank(true, 2, 3, request, budget).has_value());
+    EXPECT_FALSE(servingPoolDemandForRank(true, 2, 3, request, ServingSlotDecisionGeometry{}, budget).has_value());
     // Non-serving -> no demand (even unsealed).
-    EXPECT_FALSE(servingPoolDemandForRank(false, std::nullopt, 0, request, budget).has_value());
+    EXPECT_FALSE(servingPoolDemandForRank(false, std::nullopt, 0, request, ServingSlotDecisionGeometry{}, budget).has_value());
     // Serving + UNSEALED -> FATAL (not a silent non-owner).
-    EXPECT_THROW((void)servingPoolDemandForRank(true, std::nullopt, 0, request, budget),
+    EXPECT_THROW((void)servingPoolDemandForRank(true, std::nullopt, 0, request, ServingSlotDecisionGeometry{}, budget),
                  std::logic_error);
 }
 

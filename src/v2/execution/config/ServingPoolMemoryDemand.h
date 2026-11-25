@@ -49,6 +49,44 @@ namespace llaminar2
     };
 
     /**
+     * @brief Geometry of the per-slot decision state of continuous batching.
+     *
+     * With S > 1 resident slots each slot retains its next decision's
+     * full-vocabulary FP32 logits between shared forwards (a paced request
+     * may wait for its grant). S = 1 serving decides from the runner's own
+     * logits buffer and retains none.
+     */
+    struct ServingSlotDecisionGeometry
+    {
+        std::uint64_t vocab_size = 0;
+
+        /**
+         * @brief Geometry of a model's vocabulary; zero leaves it unset, which
+         *        prices capacity-one serving but rejects S > 1 (bytesFor()).
+         * @throws std::invalid_argument For a negative vocabulary.
+         */
+        [[nodiscard]] static ServingSlotDecisionGeometry forVocabulary(int vocab_size)
+        {
+            if (vocab_size < 0)
+                throw std::invalid_argument("Serving slot decision geometry requires a nonnegative vocabulary");
+            return ServingSlotDecisionGeometry{static_cast<std::uint64_t>(vocab_size)};
+        }
+
+        /** @return Retained decision-logits bytes for @p resident_slots slots. */
+        [[nodiscard]] std::uint64_t bytesFor(int resident_slots) const
+        {
+            if (resident_slots <= 1)
+                return 0;
+            const auto slots = static_cast<std::uint64_t>(resident_slots);
+            if (vocab_size == 0)
+                throw std::invalid_argument("Serving slot decision geometry is unset");
+            if (vocab_size > std::numeric_limits<std::uint64_t>::max() / sizeof(float) / slots)
+                throw std::overflow_error("Serving slot decision storage overflows uint64");
+            return slots * vocab_size * sizeof(float);
+        }
+    };
+
+    /**
      * @brief Compute the exact serving-pool physical demand for one resolved capacity.
      *
      * The pool hosts one budgeted region per accepted response lease (the
@@ -65,7 +103,8 @@ namespace llaminar2
      */
     [[nodiscard]] inline std::uint64_t servingPoolMemoryDemand(
         const ResolvedServingCapacity &capacity,
-        const ServingPoolPerResponseBudget &budget)
+        const ServingPoolPerResponseBudget &budget,
+        const ServingSlotDecisionGeometry &slots)
     {
         if (budget.bytes_per_response == 0)
             throw std::invalid_argument("Serving pool per-response budget must be positive");
@@ -75,7 +114,11 @@ namespace llaminar2
         if (budget.bytes_per_response >
             std::numeric_limits<std::uint64_t>::max() / leases)
             throw std::overflow_error("Serving pool memory demand overflows uint64");
-        return budget.bytes_per_response * leases;
+        const std::uint64_t responses = budget.bytes_per_response * leases;
+        const std::uint64_t decisions = slots.bytesFor(capacity.residentSlots());
+        if (decisions > std::numeric_limits<std::uint64_t>::max() - responses)
+            throw std::overflow_error("Serving pool memory demand overflows uint64");
+        return responses + decisions;
     }
 
     /**
@@ -97,6 +140,7 @@ namespace llaminar2
         const std::optional<int> &sealed_authority,
         int rank,
         const ServingCapacityRequest &request,
+        const ServingSlotDecisionGeometry &slots,
         const ServingPoolPerResponseBudget &budget = ServingPoolPerResponseBudget::defaultPolicy())
     {
         if (!serve_mode)
@@ -106,7 +150,7 @@ namespace llaminar2
                 "Serve mode requires a sealed request authority before BOM admission");
         if (rank != *sealed_authority)
             return std::nullopt; // follower rank: no serving pool charge
-        return servingPoolMemoryDemand(resolveInstalledServingCapacity(request), budget);
+        return servingPoolMemoryDemand(resolveInstalledServingCapacity(request), budget, slots);
     }
 
     /**
@@ -118,9 +162,10 @@ namespace llaminar2
      */
     inline void addServingPoolDemand(PhysicalMemoryBOMBuilder &builder,
                                      const ResolvedServingCapacity &capacity,
-                                     const ServingPoolPerResponseBudget &budget)
+                                     const ServingPoolPerResponseBudget &budget,
+                                     const ServingSlotDecisionGeometry &slots)
     {
         builder.add(PhysicalMemoryOwner::ServingResponsePool,
-                    servingPoolMemoryDemand(capacity, budget));
+                    servingPoolMemoryDemand(capacity, budget, slots));
     }
 } // namespace llaminar2

@@ -462,4 +462,55 @@ namespace llaminar2::test
         driver.stop();
         EXPECT_THROW(driver.call([](IOrchestrationRunner &) {}), std::runtime_error);
     }
+
+    TEST(ServingResponseLeasePool, ExecutionClaimsEndAtRowFinishResponsesAtPublication)
+    {
+        // S = 2, R = 4, Q = 0: two requests may execute; four responses may
+        // be outstanding while finished rows still publish.
+        ServingResponseLeasePool pool(resolveInstalledServingCapacity(ServingCapacityRequest::authored(2, 4, 0)));
+        auto a = pool.tryAcquire();
+        auto b = pool.tryAcquire();
+        ASSERT_TRUE(a && b);
+        EXPECT_FALSE(pool.tryAcquire()) << "S + Q = 2 executing";
+        a->executionFinished();
+        a->executionFinished(); // idempotent
+        auto c = pool.tryAcquire();
+        ASSERT_TRUE(c) << "a finished executing; its response still publishes";
+        b->executionFinished();
+        c->executionFinished();
+        auto d = pool.tryAcquire();
+        ASSERT_TRUE(d);
+        EXPECT_FALSE(pool.tryAcquire()) << "R = 4 responses outstanding";
+        a.reset();
+        EXPECT_TRUE(pool.tryAcquire()) << "publication completed frees a response lease";
+        const auto snapshot = pool.snapshot();
+        EXPECT_EQ(snapshot.response_leases, 4u);
+        EXPECT_EQ(snapshot.execution_capacity, 2u);
+        pool.close();
+        EXPECT_FALSE(pool.tryAcquire());
+    }
+
+    TEST(ServingResponseLeasePool, LaneReleasesItsExecutionClaimWhenTheRowFinishes)
+    {
+        FakeServingRunner runner;
+        ServingBatchDriver driver(runner, 4, kContext);
+        std::string error;
+        ASSERT_TRUE(driver.start(error)) << error;
+        ServingResponseLeasePool pool(resolveInstalledServingCapacity(ServingCapacityRequest::authored(1, 2, 0)));
+        auto lease = pool.tryAcquire();
+        ASSERT_TRUE(lease);
+        std::unique_ptr<IRequestGenerationLane> lane;
+        {
+            ServingBatchDriver::RequestScope scope(std::make_shared<ServingRequestCancellation>(), lease);
+            lane = driver.makeLane();
+        }
+        ASSERT_TRUE(lane->prefill(prompt(62))); // max_new = 2
+        EXPECT_FALSE(pool.tryAcquire()) << "executing";
+        bool complete = false;
+        for (int i = 0; i < 4 && !complete; ++i)
+            complete = bounded([&] { return lane->decodeStep(1); }).is_complete;
+        ASSERT_TRUE(complete);
+        auto next = pool.tryAcquire();
+        EXPECT_TRUE(next) << "row finished: the execution claim is free while the response publishes";
+    }
 } // namespace llaminar2::test

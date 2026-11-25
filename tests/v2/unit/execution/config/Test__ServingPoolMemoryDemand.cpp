@@ -28,7 +28,7 @@ namespace llaminar2::test
                 .total_bytes = 1u << 30u,
                 .admission_available_bytes = 1u << 30u,
             });
-            addServingPoolDemand(bom, capacity, budget);
+            addServingPoolDemand(bom, capacity, budget, ServingSlotDecisionGeometry{});
             return bom.build();
         }
     } // namespace
@@ -39,7 +39,7 @@ namespace llaminar2::test
         const auto resolved =
             resolveServingCapacity(ServingCapacityRequest::automatic(), capability);
         const ServingPoolPerResponseBudget budget{4096};
-        const auto demand = servingPoolMemoryDemand(resolved, budget);
+        const auto demand = servingPoolMemoryDemand(resolved, budget, ServingSlotDecisionGeometry{});
         EXPECT_EQ(demand, static_cast<std::uint64_t>(resolved.responseLeases()) * 4096u);
         const auto bom = buildPoolBom(resolved, budget);
         const auto &line = bom.charge(PhysicalMemoryOwner::ServingResponsePool);
@@ -53,7 +53,7 @@ namespace llaminar2::test
         const auto resolved =
             resolveServingCapacity(ServingCapacityRequest::authored(1, 8, 4), capability);
         const ServingPoolPerResponseBudget budget{2048};
-        const auto demand = servingPoolMemoryDemand(resolved, budget);
+        const auto demand = servingPoolMemoryDemand(resolved, budget, ServingSlotDecisionGeometry{});
         EXPECT_EQ(demand, 8u * 2048u);
         const auto bom = buildPoolBom(resolved, budget);
         // Only the serving pool line is charged: every other owner is zero.
@@ -73,10 +73,29 @@ namespace llaminar2::test
         const auto capability = ServingCapacityQualificationOwner::installedEnvelope();
         const auto resolved =
             resolveServingCapacity(ServingCapacityRequest::automatic(), capability);
-        EXPECT_THROW(servingPoolMemoryDemand(resolved, ServingPoolPerResponseBudget{0}),
+        EXPECT_THROW(servingPoolMemoryDemand(resolved, ServingPoolPerResponseBudget{0}, ServingSlotDecisionGeometry{}),
                      std::invalid_argument);
         EXPECT_THROW(servingPoolMemoryDemand(
-                         resolved, ServingPoolPerResponseBudget{std::numeric_limits<std::uint64_t>::max()}),
+                         resolved, ServingPoolPerResponseBudget{std::numeric_limits<std::uint64_t>::max()}, ServingSlotDecisionGeometry{}),
                      std::overflow_error);
+    }
+
+    TEST(ServingPoolMemoryDemand, ContinuousBatchingPricesOneDecisionRowPerResidentSlot)
+    {
+        const auto batched = resolveInstalledServingCapacity(ServingCapacityRequest::authored(4, 40, 36));
+        const auto budget = ServingPoolPerResponseBudget::defaultPolicy();
+        const auto slots = ServingSlotDecisionGeometry::forVocabulary(151936);
+        EXPECT_EQ(servingPoolMemoryDemand(batched, budget, slots),
+                  40u * budget.bytes_per_response + 4u * 151936u * sizeof(float));
+        // S = 1 decides from the runner's logits: no retained slot rows.
+        const auto serial = resolveInstalledServingCapacity(ServingCapacityRequest::automatic());
+        EXPECT_EQ(servingPoolMemoryDemand(serial, budget, slots),
+                  servingPoolMemoryDemand(serial, budget, ServingSlotDecisionGeometry{}));
+        // Batched demand without a vocabulary is a pricing error, never zero.
+        EXPECT_THROW((void)servingPoolMemoryDemand(batched, budget, ServingSlotDecisionGeometry{}),
+                     std::invalid_argument);
+        EXPECT_THROW((void)servingPoolMemoryDemand(batched, budget, ServingSlotDecisionGeometry::forVocabulary(0)),
+                     std::invalid_argument);
+        EXPECT_THROW((void)ServingSlotDecisionGeometry::forVocabulary(-1), std::invalid_argument);
     }
 } // namespace llaminar2::test

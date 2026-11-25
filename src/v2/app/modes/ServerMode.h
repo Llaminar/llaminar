@@ -134,6 +134,9 @@ namespace llaminar2
      * @param server Server configured before listening.
      * @param executor Sole inference ownership and admission authority.
      */
+    /** @brief Size the HTTP pool to @p workers (R plus control headroom). */
+    void configureInferenceHttpServer(httplib::Server &server, std::size_t workers);
+
     void configureInferenceHttpServer(httplib::Server &server,
                                       const SerializedInferenceExecutor &executor);
 

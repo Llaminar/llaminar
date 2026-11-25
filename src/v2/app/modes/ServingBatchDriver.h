@@ -17,6 +17,7 @@
 #pragma once
 
 #include "app/modes/RequestGenerationLane.h"
+#include "app/modes/ServingResponseLeasePool.h"
 #include "execution/runner/IOrchestrationRunner.h"
 #include "utils/Logger.h"
 
@@ -190,26 +191,35 @@ namespace llaminar2
          * The HTTP producer thread installs its request's handle while running
          * the handler, so makeLane() needs no extra handler plumbing.
          */
+        /** @brief Transport-owned handles of the request running on this thread. */
+        struct RequestContext
+        {
+            std::shared_ptr<ServingRequestCancellation> cancellation;
+            /// Response lease whose execution claim ends when the row finishes.
+            std::shared_ptr<ServingResponseLeasePool::Lease> lease;
+        };
+
         class RequestScope
         {
         public:
-            explicit RequestScope(std::shared_ptr<ServingRequestCancellation> cancellation)
+            explicit RequestScope(std::shared_ptr<ServingRequestCancellation> cancellation,
+                                  std::shared_ptr<ServingResponseLeasePool::Lease> lease = {})
                 : previous_(current())
             {
-                current() = std::move(cancellation);
+                current() = RequestContext{std::move(cancellation), std::move(lease)};
             }
             ~RequestScope() { current() = std::move(previous_); }
             RequestScope(const RequestScope &) = delete;
             RequestScope &operator=(const RequestScope &) = delete;
 
-            static std::shared_ptr<ServingRequestCancellation> &current()
+            static RequestContext &current()
             {
-                thread_local std::shared_ptr<ServingRequestCancellation> handle;
-                return handle;
+                thread_local RequestContext context;
+                return context;
             }
 
         private:
-            std::shared_ptr<ServingRequestCancellation> previous_;
+            RequestContext previous_;
         };
 
         // ----- Lane commands (any thread) -----
@@ -471,14 +481,19 @@ namespace llaminar2
     {
     public:
         BatchedGenerationLane(ServingBatchDriver &driver, int context_tokens,
-                              std::shared_ptr<ServingRequestCancellation> cancellation)
-            : driver_(driver), context_tokens_(context_tokens), cancellation_(std::move(cancellation))
+                              ServingBatchDriver::RequestContext context)
+            : driver_(driver), context_tokens_(context_tokens),
+              cancellation_(std::move(context.cancellation)), lease_(std::move(context.lease))
         {
         }
 
         /** @brief Retires an unfinished request (cancellation is idempotent). */
         ~BatchedGenerationLane() override
         {
+            // The lane is done executing either way; the response lease itself
+            // stays with the transport until publication completes.
+            if (lease_)
+                lease_->executionFinished();
             if (id_ == 0 || !mailbox_)
                 return;
             {
@@ -622,12 +637,17 @@ namespace llaminar2
             if (mailbox_->tokens.empty() && (mailbox_->finish == ServingFinishReason::Stop ||
                                              mailbox_->finish == ServingFinishReason::Length))
                 result.is_complete = true;
+            // The serving row retired: its execution claim is free for the
+            // next request while this response may still be publishing.
+            if (mailbox_->finish != ServingFinishReason::None && lease_)
+                lease_->executionFinished();
             return result;
         }
 
         ServingBatchDriver &driver_;
         const int context_tokens_;
         std::shared_ptr<ServingRequestCancellation> cancellation_;
+        std::shared_ptr<ServingResponseLeasePool::Lease> lease_;
         SamplingParams sampling_;
         std::vector<int32_t> stop_tokens_;
         std::uint64_t id_ = 0;

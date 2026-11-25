@@ -499,11 +499,13 @@ MoEOverlayMemoryPlanInputs buildMoEOverlayMemoryPlanInputsImpl(
                 contribution.parent_authority < 0
                     ? servingPoolDemandForRank(
                           config.serve_mode, request.execution.continuation_root_rank,
-                          plan.rank, config.servingCapacityRequest())
+                          plan.rank, config.servingCapacityRequest(),
+                          ServingSlotDecisionGeometry::forVocabulary(request.model.vocab_size))
                     : (contribution.contributes
                            ? servingPoolDemandForRank(
                                  config.serve_mode, contribution.parent_authority,
-                                 plan.rank, config.servingCapacityRequest())
+                                 plan.rank, config.servingCapacityRequest(),
+                          ServingSlotDecisionGeometry::forVocabulary(request.model.vocab_size))
                            : std::optional<std::uint64_t>{}),
             .generation_domain = generation.domain(),
             .generation_parent_role = parent_role,

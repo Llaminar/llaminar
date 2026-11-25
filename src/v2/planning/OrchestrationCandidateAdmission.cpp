@@ -235,7 +235,8 @@ namespace llaminar2
                     .serving_pool_demand_bytes = config.serve_mode
                         ? std::optional<std::uint64_t>{servingPoolMemoryDemand(
                               resolveInstalledServingCapacity(config.servingCapacityRequest()),
-                              ServingPoolPerResponseBudget::defaultPolicy())}
+                              ServingPoolPerResponseBudget::defaultPolicy(),
+                              ServingSlotDecisionGeometry::forVocabulary(profile.vocab_size))}
                         : std::nullopt});
                 const auto found=policy.native_context_budgets.find(candidate.membership.discoveryRanks().at(rank.rank));
                 for(auto& cfg:local)if(cfg.device.is_gpu()){

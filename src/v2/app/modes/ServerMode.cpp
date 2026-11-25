@@ -26,6 +26,7 @@
  */
 
 #include "app/modes/ServingBatchDriver.h"
+#include "app/modes/ServingResponseLeasePool.h"
 #include "app/modes/ServerMode.h"
 #include "app/modes/ServerRankMembership.h"
 #include "app/modes/ServerExecutionEvidence.h"
@@ -439,7 +440,12 @@ namespace llaminar2
     void configureInferenceHttpServer(httplib::Server &server,
                                       const SerializedInferenceExecutor &executor)
     {
-        server.new_task_queue = [workers = executor.httpWorkerCount()] {
+        configureInferenceHttpServer(server, executor.httpWorkerCount());
+    }
+
+    void configureInferenceHttpServer(httplib::Server &server, std::size_t workers)
+    {
+        server.new_task_queue = [workers] {
             return std::make_unique<httplib::ThreadPool>(workers).release();
         };
         // A completed connection releases HTTP ownership. Inference thread
@@ -750,17 +756,16 @@ namespace llaminar2
      *
      * Each request runs its chat handler on its own thread; generation goes
      * through the handler's batched lane into the runner-owned serving
-     * session, so concurrent requests share execution. Admission is bounded:
-     * at most @p max_in_flight requests (resident slots plus waiting room)
-     * are accepted; beyond that the server answers 503 without queueing.
+     * session, so concurrent requests share execution. Admission takes a
+     * PMA-backed response lease from @p leases (R responses, S + Q executing);
+     * beyond that the server answers 503 without queueing.
      */
-    std::shared_ptr<std::atomic<std::size_t>> registerBatchedChatCompletionEndpoint(
-        httplib::Server &server, ChatCompletionHandler &handler, std::size_t max_in_flight,
+    void registerBatchedChatCompletionEndpoint(
+        httplib::Server &server, ChatCompletionHandler &handler, ServingResponseLeasePool &leases,
         HttpStreamObserver stream_observer, std::function<std::string()> serving_failure)
     {
-        auto in_flight = std::make_shared<std::atomic<std::size_t>>(0);
         server.Post("/v1/chat/completions",
-                 [&handler, in_flight, max_in_flight, stream_observer = std::move(stream_observer),
+                 [&handler, &leases, stream_observer = std::move(stream_observer),
                   serving_failure = std::move(serving_failure)](
                      const httplib::Request &req, httplib::Response &res)
                  {
@@ -780,22 +785,22 @@ namespace llaminar2
                          res.set_content(parse_error.json_body, "application/json");
                          return;
                      }
-                     if (in_flight->fetch_add(1) >= max_in_flight)
+                     // Response lease (R) + execution claim (S + Q); the last
+                     // owner (handler call or streaming producer) releases it.
+                     auto admitted = leases.tryAcquire();
+                     if (!admitted)
                      {
-                         in_flight->fetch_sub(1);
                          res.status = 503;
                          res.set_content(json{{"error", {{"message", "Inference request capacity is full"},
                              {"type", "server_busy"}, {"code", "inference_queue_full"}}}}.dump(),
                              "application/json");
                          return;
                      }
-                     // One admission token per accepted request; the last owner
-                     // (handler call or streaming producer) releases it once.
-                     auto admitted = std::shared_ptr<void>(
-                         nullptr, [in_flight](void *) { in_flight->fetch_sub(1); });
 
                      if (!parsed_request->stream)
                      {
+                         ServingBatchDriver::RequestScope scope(
+                             std::make_shared<ServingRequestCancellation>(), admitted);
                          const auto response = handler.handleRequest(*parsed_request, arrival);
                          res.status = response.http_status;
                          res.set_content(response.json_body, "application/json");
@@ -819,7 +824,7 @@ namespace llaminar2
                      auto producer = std::make_shared<std::thread>(
                          [&handler, channel, transport_open, admitted, arrival, cancellation,
                           stream_request = std::move(stream_request)]() mutable {
-                             ServingBatchDriver::RequestScope scope(cancellation);
+                             ServingBatchDriver::RequestScope scope(cancellation, admitted);
                              try
                              {
                                  auto enqueue = [channel, transport_open](const std::string &line) -> bool {
@@ -870,7 +875,6 @@ namespace llaminar2
                                  producer->join();
                          });
                  });
-        return in_flight;
     }
 
     int ServerMode::execute(AppContext &ctx)
@@ -982,14 +986,10 @@ namespace llaminar2
         // pool. Automatic intent preserves the existing accepted-response
         // semantics (active + queued <= kDefaultCapacity); authored intent is
         // exact and rejected when the installed envelope cannot serve it.
-        std::size_t executor_capacity = SerializedInferenceExecutor::kDefaultCapacity;
-        std::size_t executor_queue_capacity = SerializedInferenceExecutor::kDefaultQueueCapacity;
         std::optional<ResolvedServingCapacity> resolved_capacity;
         try
         {
             resolved_capacity.emplace(resolveInstalledServingCapacity(config.servingCapacityRequest()));
-            executor_capacity = static_cast<std::size_t>(resolved_capacity->responseLeases());
-            executor_queue_capacity = static_cast<std::size_t>(resolved_capacity->queueCapacity());
         }
         catch (const std::invalid_argument &error)
         {
@@ -1015,17 +1015,43 @@ namespace llaminar2
             flushPerfStatsFromEnv();
             return 1;
         }
-        SerializedInferenceExecutor inference_executor(
-            *resolved_capacity,
-            serving_memory_authority,
-            ServingPoolPerResponseBudget::defaultPolicy());
+        // One response-storage authority per serving mode, both committing the
+        // admitted ServingResponsePool owner line: S = 1 serializes on the
+        // executor's stable worker; S > 1 (continuous batching) admits against
+        // PMA-backed response leases and per-slot decision storage.
+        const int batch_capacity = resolved_capacity->residentSlots();
+        if (batch_capacity > 1 &&
+            (mpi_coordinated || runner->servingBatchCapacity() < batch_capacity))
+        {
+            // Authored S > 1 is exact: never silently serialize requests.
+            LOG_ERROR("--serving-resident-slots " << batch_capacity
+                      << " requests continuous batching, which is unavailable: "
+                      << (mpi_coordinated ? std::string("multi-rank continuous batching is not implemented yet")
+                          : runner->servingBatchCapacity() > 0
+                              ? "the runner admitted " + std::to_string(runner->servingBatchCapacity()) + " request slots"
+                              : runner->servingBatchUnsupportedReason()));
+            if (mpi_coordinated)
+                runner->shutdownMPIWorkers();
+            runner->shutdown();
+            flushPerfStatsFromEnv();
+            return 1;
+        }
+        std::optional<SerializedInferenceExecutor> serialized_executor;
+        std::unique_ptr<ServingResponseLeasePool> response_leases;
+        if (batch_capacity > 1)
+            response_leases = std::make_unique<ServingResponseLeasePool>(
+                *resolved_capacity, serving_memory_authority, ServingPoolPerResponseBudget::defaultPolicy(),
+                ServingSlotDecisionGeometry::forVocabulary(runner->vocabSize()));
+        else
+            serialized_executor.emplace(*resolved_capacity, serving_memory_authority,
+                                        ServingPoolPerResponseBudget::defaultPolicy());
         httplib::Server svr;
         g_server_ptr = &svr;
         RequestLogState request_log_state;
 
         // The dedicated worker retains model/OpenMP ownership. HTTP waiters
         // cannot consume the capacity reserved for passive control requests.
-        configureInferenceHttpServer(svr, inference_executor);
+        configureInferenceHttpServer(svr, static_cast<std::size_t>(servingHttpWorkerCount(*resolved_capacity)));
 
         // Install signal handlers for graceful shutdown
         std::signal(SIGINT, signal_handler);
@@ -1080,7 +1106,9 @@ namespace llaminar2
             runner->executionPlan().runtime.prefix_cache.disk_budget_bytes != 0)
             process_options.filesystems.push_back(runner->executionPlan().runtime.prefix_cache.disk_dir);
         // The serving mode chosen below replaces this source before listening.
-        auto queue_stats = serializedInferenceQueueStats(inference_executor);
+        auto queue_stats = serialized_executor
+            ? serializedInferenceQueueStats(*serialized_executor)
+            : std::make_shared<std::function<json()>>([] { return json::object(); });
         registerRuntimeStatsEndpoint(svr, handler, queue_stats, model_name,
             serverRuntimeDescription(runner->executionPlan(), runner->config(), mpi_ctx->world_size()),
             [&request_log_state](const httplib::Request &req, const httplib::Response &res) {
@@ -1111,23 +1139,6 @@ namespace llaminar2
         // chat request concurrently through the runner-owned serving session;
         // one driver thread owns it. S = 1 keeps the serialized executor.
         std::unique_ptr<ServingBatchDriver> batch_driver;
-        const int batch_capacity = resolved_capacity->residentSlots();
-        if (batch_capacity > 1 &&
-            (mpi_coordinated || runner->servingBatchCapacity() < batch_capacity))
-        {
-            // Authored S > 1 is exact: never silently serialize requests.
-            LOG_ERROR("--serving-resident-slots " << batch_capacity
-                      << " requests continuous batching, which is unavailable: "
-                      << (mpi_coordinated ? std::string("multi-rank continuous batching is not implemented yet")
-                          : runner->servingBatchCapacity() > 0
-                              ? "the runner admitted " + std::to_string(runner->servingBatchCapacity()) + " request slots"
-                              : runner->servingBatchUnsupportedReason()));
-            if (mpi_coordinated)
-                runner->shutdownMPIWorkers();
-            runner->shutdown();
-            flushPerfStatsFromEnv();
-            return 1;
-        }
         auto stream_observer = [&request_log_state](const httplib::Request &request, std::shared_ptr<std::string> body) {
             request_log_state.attachStreamedResponseBody(request, std::move(body));
         };
@@ -1149,26 +1160,29 @@ namespace llaminar2
                 flushPerfStatsFromEnv();
                 return 1;
             }
-            // Admission bound S + Q: at most Q requests wait for a slot. R >= S + Q
-            // (checked at resolution) sizes the HTTP response pool.
-            const std::size_t max_in_flight =
-                static_cast<std::size_t>(batch_capacity) + executor_queue_capacity;
             *serving_failure = [driver = batch_driver.get()] { return driver->failure(); };
-            const auto in_flight =
-                registerBatchedChatCompletionEndpoint(svr, handler, max_in_flight, stream_observer,
-                                                      [driver = batch_driver.get()] { return driver->failure(); });
-            *queue_stats = [in_flight, max_in_flight, driver = batch_driver.get()] {
+            registerBatchedChatCompletionEndpoint(svr, handler, *response_leases, stream_observer,
+                                                  [driver = batch_driver.get()] { return driver->failure(); });
+            *queue_stats = [leases = response_leases.get(), driver = batch_driver.get()] {
+                const auto lease_state = leases->snapshot();
                 const auto occupancy = driver->occupancy();
-                return json{{"mode", "continuous_batching"}, {"capacity", max_in_flight},
-                            {"admitted", in_flight->load()}, {"resident_slots", driver->capacity()},
-                            {"active", occupancy.resident}, {"queued", occupancy.queued}};
+                return json{{"mode", "continuous_batching"},
+                            {"response_leases", lease_state.response_leases},
+                            {"responses", lease_state.responses},
+                            {"execution_capacity", lease_state.execution_capacity},
+                            {"executing", lease_state.executing},
+                            {"resident_slots", driver->capacity()},
+                            {"active", occupancy.resident}, {"queued", occupancy.queued},
+                            {"committed_bytes", lease_state.committed_bytes}};
             };
-            LOG_INFO("Continuous batching: " << batch_capacity << " resident request slots, "
-                                              << max_in_flight << " admitted requests");
+            LOG_INFO("Continuous batching: S=" << batch_capacity << " resident slots, R="
+                     << resolved_capacity->responseLeases() << " response leases, Q="
+                     << resolved_capacity->queueCapacity() << " (PMA serving pool "
+                     << response_leases->snapshot().committed_bytes << " bytes)");
         }
         else
         {
-            registerChatCompletionEndpoint(svr, handler, inference_executor, stream_observer);
+            registerChatCompletionEndpoint(svr, handler, *serialized_executor, stream_observer);
         }
 
         // Bind the socket before announcing readiness. cpp-httplib combines
@@ -1230,7 +1244,10 @@ namespace llaminar2
         // retiring model/MPI owners; no maintenance or GPU cancellation occurs.
         if (batch_driver)
             batch_driver->stop();
-        inference_executor.shutdown();
+        if (response_leases)
+            response_leases->close();
+        if (serialized_executor)
+            serialized_executor->shutdown();
         LOG_INFO("Server shut down.");
         g_server_ptr = nullptr;
 

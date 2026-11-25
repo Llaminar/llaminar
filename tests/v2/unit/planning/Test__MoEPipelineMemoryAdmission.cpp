@@ -341,7 +341,7 @@ TEST(MoEPipelineMemoryAdmission, ServingPoolChargedOnceForParentStage)
     const auto serving_expected = [](const OrchestrationConfig &cfg) {
         return servingPoolMemoryDemand(
             resolveInstalledServingCapacity(cfg.servingCapacityRequest()),
-            ServingPoolPerResponseBudget::defaultPolicy());
+            ServingPoolPerResponseBudget::defaultPolicy(), ServingSlotDecisionGeometry{});
     };
     // SERVING 2-STAGE local pipeline: exactly one owner line, exact demand.
     {
@@ -392,7 +392,7 @@ TEST(MoEPipelineMemoryAdmission, ServingPoolChargedOnceForParentStage)
         // D+D charge — the total must equal the single parent-stage demand).
         const auto wide_expected = servingPoolMemoryDemand(
             resolveInstalledServingCapacity(input.config.servingCapacityRequest()),
-            ServingPoolPerResponseBudget::defaultPolicy());
+            ServingPoolPerResponseBudget::defaultPolicy(), ServingSlotDecisionGeometry{});
         EXPECT_EQ(total, wide_expected);
     }
 }

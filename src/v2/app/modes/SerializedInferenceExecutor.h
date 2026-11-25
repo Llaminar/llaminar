@@ -116,7 +116,9 @@ namespace llaminar2
                                 const ResolvedServingCapacity &serving,
                                 const ServingPoolPerResponseBudget &budget)
             {
-                const std::uint64_t demand = servingPoolMemoryDemand(serving, budget);
+                // S = 1 decides from the runner's logits: no retained slot rows.
+                const std::uint64_t demand =
+                    servingPoolMemoryDemand(serving, budget, ServingSlotDecisionGeometry{});
                 // Declared owner line check FIRST: a zero line means the admitted
                 // plan did not include the serving pool (a precise diagnostics
                 // path, never a deep reserve failure).
