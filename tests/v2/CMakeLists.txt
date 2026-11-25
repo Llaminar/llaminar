@@ -10724,7 +10724,7 @@ if(V2_CPU_TARGET_X86)
         v2_cpu_native_isa_runtime("${V2_X86_LEAF_ISA}" V2_X86_LEAF_RUNTIME_ISA)
         add_v2_test(V2_Integration_CPUX86CodedLeaves_${V2_X86_LEAF_ISA}
             COMMAND $<TARGET_FILE:v2_unit_cpu_x86_coded_leaves>
-                --gtest_filter=-CPUX86CodedLeaves.FusedPrefillMembersStreamPanelsAndRetainSerialBytes
+                --gtest_filter=-CPUX86CodedLeaves.FusedPrefillMembersStreamPanelsAndRetainSerialBytes:CPUX86CodedLeaves.FusedOrderedPartitionNaNsKeepEarlierPartitionAndSerialBytes
             LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;NativeQuantised;${V2_X86_LEAF_ISA};ByteExact;Regression"
             MPI_PROCS 1 NO_MODELS NO_MPI
             ENVIRONMENT "OMP_NUM_THREADS=1;OMP_DYNAMIC=false;LLAMINAR_ISA_LEVEL=${V2_X86_LEAF_RUNTIME_ISA}")
@@ -10741,6 +10741,16 @@ if(V2_CPU_TARGET_X86)
             MPI_PROCS 1 NO_MODELS NO_MPI
             ENVIRONMENT "OMP_NUM_THREADS=3;OMP_DYNAMIC=false;LLAMINAR_ISA_LEVEL=${V2_X86_LEAF_RUNTIME_ISA}")
         list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUX86FusedPrefillPanels_${V2_X86_LEAF_ISA})
+        # GPU-aligned generic compact rows keep the earlier block's or
+        # partition's NaN and serial-row bytes through the fused batched entry
+        # (nonpanel-only and mixed pooled-panel bundles, one and three workers).
+        add_v2_test(V2_Integration_CPUX86FusedOrderedNaN_${V2_X86_LEAF_ISA}
+            COMMAND $<TARGET_FILE:v2_unit_cpu_x86_coded_leaves>
+                --gtest_filter=CPUX86CodedLeaves.FusedOrderedPartitionNaNsKeepEarlierPartitionAndSerialBytes
+            LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;NativeQuantised;MoE;Prefill;${V2_X86_LEAF_ISA};ByteExact;Regression"
+            MPI_PROCS 1 NO_MODELS NO_MPI
+            ENVIRONMENT "OMP_NUM_THREADS=3;OMP_DYNAMIC=false;LLAMINAR_ISA_LEVEL=${V2_X86_LEAF_RUNTIME_ISA}")
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUX86FusedOrderedNaN_${V2_X86_LEAF_ISA})
     endforeach()
 endif()
 

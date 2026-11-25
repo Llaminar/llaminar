@@ -381,8 +381,8 @@ namespace llaminar2::cpu::native_quantised::multi_scale
      * and VADDPS returns its first operand's payload when both are NaN. The
      * earlier partition's NaN therefore always wins. Finite sums are unchanged.
      * Used by the dedicated x86 leaves (CPUNativeQuantisedSingleScaleX86Kernels.h).
-     * rows() keeps its plain `+`: pinning it there moved the IQ1_M AVX-512
-     * one-row ordered accumulator to the stack in GCC 14.
+     * The GPU-aligned rows() program uses accumulateOrdered(), the same operand
+     * order written over the later value's register.
      */
     template <int Lanes>
     [[nodiscard, gnu::always_inline]] inline typename SIMD<Lanes>::F foldOrdered(typename SIMD<Lanes>::F earlier,
@@ -394,6 +394,49 @@ namespace llaminar2::cpu::native_quantised::multi_scale
 #if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
         else
             return std::bit_cast<F>(addOrderedAVX512(std::bit_cast<__m512>(earlier), std::bit_cast<__m512>(later)));
+#endif
+    }
+
+    /**
+     * @brief Add a later contribution to an earlier sum with a fixed VADDPS operand order.
+     * @tparam Lanes Eight AVX2 or sixteen AVX-512 columns.
+     * @param earlier Running sum of the earlier blocks or partitions (VADDPS source one).
+     * @param later This block's contribution or this partition's partial.
+     * @return earlier + later, one rounding; of two NaNs, @p earlier's payload.
+     *
+     * foldOrdered()'s contract for the GPU-aligned program of multi_scale::rows():
+     * its per-block accumulations (contiguous and ordered trees) and its
+     * partition fold were plain `+`, whose NaN operand register allocation
+     * chose differently at each inlining site (serial decode, row tiles, the
+     * fused batched entry), so grouped IQ1_M/IQ2_XS rows could publish another
+     * NaN than serial decode (at 67dac67f7 on AVX2 already for two NaNs inside
+     * one partition).
+     */
+    template <int Lanes>
+    [[nodiscard, gnu::always_inline]] inline typename SIMD<Lanes>::F accumulateOrdered(typename SIMD<Lanes>::F earlier,
+                                                                                      typename SIMD<Lanes>::F later) noexcept
+    {
+        using F = typename SIMD<Lanes>::F;
+        // The sum is written over the later value's register: `earlier`
+        // stays the live accumulator operand, as in `earlier + later`, and
+        // the fresh contribution dies here.
+        if constexpr (Lanes == 8)
+        {
+            auto sum = std::bit_cast<__m256>(later);
+#if defined(__AVX512VL__)
+            asm("vaddps {%0, %1, %0|%0, %1, %0}" : "+v"(sum) : "v"(std::bit_cast<__m256>(earlier)));
+#else
+            asm("vaddps {%0, %1, %0|%0, %1, %0}" : "+x"(sum) : "x"(std::bit_cast<__m256>(earlier)));
+#endif
+            return std::bit_cast<F>(sum);
+        }
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
+        else
+        {
+            auto sum = std::bit_cast<__m512>(later);
+            asm("vaddps {%0, %1, %0|%0, %1, %0}" : "+v"(sum) : "v"(std::bit_cast<__m512>(earlier)));
+            return std::bit_cast<F>(sum);
+        }
 #endif
     }
 #endif
@@ -925,14 +968,17 @@ namespace llaminar2::cpu::native_quantised::multi_scale
      * @param blocks_per_partition Exact K-block span; unused for Contiguous.
      * @param columns Live output span in this chunk; padded x86 callers retain 64.
      * @throws std::invalid_argument For invalid chunk, K, output or partition geometry.
+     * @tparam OrderedNaN x86 GPU-aligned program: every per-block accumulation
+     *         and every partition fold uses accumulateOrdered(), so of two NaNs
+     *         the earlier one wins. False keeps the plain `+` program (all
+     *         backend-native rows, and every non-x86 build) unchanged.
      */
-    template <int Codebook, int Lanes, size_t Rows, Reduction Tree = Reduction::Contiguous,
-              typename Packed, typename Ops = SIMD<Lanes>>
-    LLAMINAR_MULTISCALE_EXACT inline void rows(const Packed &packed,
-                                               const std::array<const Q8_1Block *, Rows> &activation,
-                                               const std::array<float *, Rows> &output, int chunk, int begin,
-                                               int end, bool accumulate, int partitions = 1,
-                                               int blocks_per_partition = 0, int columns = 64)
+    template <bool OrderedNaN, int Codebook, int Lanes, size_t Rows, Reduction Tree, typename Packed, typename Ops>
+    LLAMINAR_MULTISCALE_EXACT inline void rowsProgram(const Packed &packed,
+                                                      const std::array<const Q8_1Block *, Rows> &activation,
+                                                      const std::array<float *, Rows> &output, int chunk, int begin,
+                                                      int end, bool accumulate, int partitions,
+                                                      int blocks_per_partition, int columns)
     {
 #if defined(__clang__)
 #pragma clang fp contract(off)
@@ -1144,7 +1190,12 @@ namespace llaminar2::cpu::native_quantised::multi_scale
                             F contribution = (activation_scale * scale0) * dot;
                             if constexpr (Codebook == 16)
                                 contribution += (activation_scale * scale1) * static_cast<float>(whole_sum);
-                            acc[row] += contribution;
+#if defined(__AVX2__)
+                            if constexpr (OrderedNaN)
+                                acc[row] = accumulateOrdered<Lanes>(acc[row], contribution);
+                            else
+#endif
+                                acc[row] += contribution;
                             continue;
                         }
                         const F dot0 = __builtin_convertvector(low[row] - center * sum0, F);
@@ -1173,7 +1224,14 @@ namespace llaminar2::cpu::native_quantised::multi_scale
                             const F correction1 = (delta(11, sums[2]) + delta(15, sums[3])) * scale1;
                             contribution += activation_scale * (correction0 + correction1);
                         }
-                        acc[row] += contribution;
+                        // x86 GPU-aligned: the earlier blocks' sum is VADDPS source
+                        // one, so of two NaNs the earlier block's wins.
+#if defined(__AVX2__)
+                        if constexpr (OrderedNaN)
+                            acc[row] = accumulateOrdered<Lanes>(acc[row], contribution);
+                        else
+#endif
+                            acc[row] += contribution;
                     }
                 }
 #pragma GCC unroll 4
@@ -1183,8 +1241,17 @@ namespace llaminar2::cpu::native_quantised::multi_scale
                     // Later partials retain the exact device tree's left fold.
                     // Keeping this inside the column loop removes repeated
                     // dispatch/setup and temporary 64-column partial planes.
+                    // x86 GPU-aligned folds with accumulateOrdered(): the
+                    // earlier partitions' total is source one; its NaN wins.
                     if constexpr (Tree == Reduction::OrderedPartitions)
-                        reduced[row] = partition == 0 ? acc[row] : reduced[row] + acc[row];
+                    {
+#if defined(__AVX2__)
+                        if constexpr (OrderedNaN)
+                            reduced[row] = partition == 0 ? acc[row] : accumulateOrdered<Lanes>(reduced[row], acc[row]);
+                        else
+#endif
+                            reduced[row] = partition == 0 ? acc[row] : reduced[row] + acc[row];
+                    }
                     else
                         reduced[row] = acc[row];
                 }
@@ -1198,6 +1265,32 @@ namespace llaminar2::cpu::native_quantised::multi_scale
                     std::memcpy(output[row] + column, &reduced[row], (columns - column) * sizeof(float));
             }
         }
+    }
+
+    /**
+     * @brief Execute a shared-weight tile with the GPU's exact multi-scale expression.
+     * @details Parameters as rowsProgram(). On x86, GPU-aligned matrices run
+     * the program whose per-block accumulations and partition folds have a
+     * fixed VADDPS operand order (accumulateOrdered()), for both the
+     * contiguous and the ordered tree, so the earlier block's or partition's
+     * NaN wins wherever the program is inlined: serial decode, row tiles and
+     * the fused batched entry then publish the same NaN. Backend-native
+     * matrices (and non-x86 builds) keep the unchanged plain `+` program;
+     * finite results of both programs are identical.
+     */
+    template <int Codebook, int Lanes, size_t Rows, Reduction Tree = Reduction::Contiguous,
+              typename Packed, typename Ops = SIMD<Lanes>>
+    inline void rows(const Packed &packed, const std::array<const Q8_1Block *, Rows> &activation,
+                     const std::array<float *, Rows> &output, int chunk, int begin, int end, bool accumulate,
+                     int partitions = 1, int blocks_per_partition = 0, int columns = 64)
+    {
+#if defined(__AVX2__)
+        if (packed.numerical_policy == CPUProjectionNumericalPolicy::GPUAlignedExpert)
+            return rowsProgram<true, Codebook, Lanes, Rows, Tree, Packed, Ops>(
+                packed, activation, output, chunk, begin, end, accumulate, partitions, blocks_per_partition, columns);
+#endif
+        rowsProgram<false, Codebook, Lanes, Rows, Tree, Packed, Ops>(
+            packed, activation, output, chunk, begin, end, accumulate, partitions, blocks_per_partition, columns);
     }
 
 #if defined(__AVX2__)
