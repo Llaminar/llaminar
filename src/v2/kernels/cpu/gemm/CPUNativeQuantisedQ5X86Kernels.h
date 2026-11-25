@@ -8,7 +8,8 @@
  * The surrounding FP32 block program is the existing per-policy contract.
  * Projection walks each chunk row once per register-bounded group of column
  * strips with all K groups unrolled, so the 22-byte-per-32-value stream stays
- * sequential and stride-prefetchable at file density.
+ * sequential and stride-prefetchable at file density. The AVX2 one-row tile
+ * walks L2-sized K tiles per strip (avx2OneRowKTileBlocks()).
  */
 #pragma once
 
@@ -16,8 +17,11 @@
 #include <bit>
 #include <utility>
 
+#include <stdexcept>
+
 #include "CPUNativeQuantisedContributionContract.h"
 #include "CPUNativeQuantisedMultiScaleKernels.h"
+#include "backends/CPUExecutionGeometry.h"
 #include "CPUNativeQuantisedPackedWeights.h"
 
 namespace llaminar2::cpu::native_quantised::q5
@@ -417,8 +421,32 @@ namespace llaminar2::cpu::native_quantised::q5
         }
     }
 
-    /// K blocks per AVX2 one-row cache tile: 16 x 1408 B units stay L1-resident for all eight strips.
-    inline constexpr int kAVX2KTileBlocks = 16;
+    /**
+     * @brief K blocks of one AVX2 one-row Q5 cache tile, derived from the observed private L2.
+     * @param cache The participant's cache geometry (CPUExecutionGeometry::local().cache in production).
+     * @param asymmetric Q5_1 units carry a minimum plane (1536 instead of 1408 bytes).
+     * @return Half of the associativity-safe L2 in whole units, at least 16 blocks.
+     *
+     * The eight strip passes of a tile re-read lines the first pass brought in.
+     * An L1-sized tile (16 blocks) kept those re-reads in L1 but cut each
+     * pass's strided stream to sixteen accesses, which measured slower from
+     * DRAM (AVX2 Q5_0 M1 t1: 15.7 ms with 16-block tiles and 17.4 ms with the
+     * 32-block GPU-aligned partitions, against 13.2 ms for whole-K passes at
+     * 29c6e906a). An L2-resident tile keeps the long streams the hardware
+     * prefetchers track while still bounding the re-read set when a chunk row
+     * exceeds L2. The other half of L2 is left to activations, outputs and
+     * the other strips' lines; an N-way L2 contributes N-1 ways
+     * (associativitySafeBytes). The sixteen-block floor is the L1 tile.
+     */
+    [[nodiscard]] constexpr int avx2OneRowKTileBlocks(const CPUCacheGeometry &cache, bool asymmetric) noexcept
+    {
+        const std::uint64_t ways = cache.private_l2_ways;
+        const std::uint64_t safe = ways > 1 ? cache.private_l2_bytes - cache.private_l2_bytes / ways
+                                            : cache.private_l2_bytes;
+        const std::uint64_t unit = preparedInterleavedBlockStride(CPUNativeQuantisedEncoding::Q5NativeSingleScale,
+            asymmetric, asymmetric ? native_quantised_formats::Q5_1.codebook_id : native_quantised_formats::Q5_0.codebook_id);
+        return static_cast<int>(std::clamp<std::uint64_t>(safe / 2 / unit, 16, 1u << 20));
+    }
 
     /**
      * @brief Run projectRange(), cache-tiling K for the AVX2 one-row decode tile.
@@ -428,50 +456,62 @@ namespace llaminar2::cpu::native_quantised::q5
      * @tparam Policy Prepared FP32 contribution program, fixed before the K traversal.
      * @tparam Rows Number of live activation and output rows.
      * @param packed,input,output,chunk,first,last,accumulate As projectRange().
+     * @param tile_blocks Positive K blocks per AVX2 one-row tile (avx2OneRowKTileBlocks()).
      *
      * AVX-512 one-row tiles already cover all 64 columns of a block in one
      * pass. Sixteen YMM registers cannot hold eight strips' accumulators, so
-     * the AVX2 one-row tile instead visits kAVX2KTileBlocks blocks for each of
-     * its eight strips before moving on: every weight line is fetched once
-     * into L1 and reused by both strips sharing it, and the chunk row streams
-     * from memory in order. Each strip carries its FP32 accumulator across
-     * tiles in its own output columns (an exact binary32 store and reload),
-     * so every column still accumulates the same contributions in ascending
-     * K with unchanged rounding. Paired-sum tiles publish only a row sum and
-     * keep the single walk.
+     * the AVX2 one-row tile instead visits @p tile_blocks blocks for each of
+     * its eight strips before moving on: the first pass streams the tile's
+     * lines in order and the others re-read them from cache. Each strip
+     * carries its FP32 accumulator across tiles in its own output columns (an
+     * exact binary32 store and reload), so every column still accumulates
+     * the same contributions in ascending K with unchanged rounding; the tile
+     * length never changes a byte. Paired-sum tiles publish only a row sum
+     * and keep the single walk.
      */
     template <int Lanes, bool Asymmetric, bool SumPairs, CPUProjectionNumericalPolicy Policy, std::size_t Rows>
     inline void projectPolicy(const CPUNativeQuantisedPackedWeights &packed,
         const std::array<const Q8_1Block *, Rows> &input, const std::array<float *, Rows> &output,
-        int chunk, int first, int last, bool accumulate)
+        int chunk, int first, int last, bool accumulate, int tile_blocks)
     {
         if constexpr (Lanes == 8 && Rows == 1 && !SumPairs)
         {
-            for (int begin = first; begin < last; begin += kAVX2KTileBlocks)
+            if (tile_blocks <= 0)
+                throw std::invalid_argument("AVX2 Q5 K tiles require a positive block count");
+            for (int begin = first; begin < last; begin += tile_blocks)
                 projectRange<Lanes, Asymmetric, SumPairs, Policy>(packed, input, output, chunk, begin,
-                    std::min(last, begin + kAVX2KTileBlocks), accumulate || begin != first);
+                    std::min(last, begin + tile_blocks), accumulate || begin != first);
             if (first < last)
                 return;
         }
         projectRange<Lanes, Asymmetric, SumPairs, Policy>(packed, input, output, chunk, first, last, accumulate);
     }
 
-    /** @brief Select symmetric or asymmetric Q5 and the FP32 policy once before the K traversal. */
+    /**
+     * @brief Select symmetric or asymmetric Q5 and the FP32 policy once before the K traversal.
+     * @param tile_blocks AVX2 one-row K tile; zero derives it from the participant's observed cache.
+     */
     template <int Lanes, bool SumPairs = false, std::size_t Rows>
     inline void dispatch(const CPUNativeQuantisedPackedWeights &packed,
         const std::array<const Q8_1Block *, Rows> &input, const std::array<float *, Rows> &output,
-        int chunk, int first, int last, bool accumulate)
+        int chunk, int first, int last, bool accumulate, int tile_blocks = 0)
     {
         using Policy = CPUProjectionNumericalPolicy;
+        if (Lanes == 8 && Rows == 1 && !SumPairs && tile_blocks == 0)
+            tile_blocks = avx2OneRowKTileBlocks(CPUExecutionGeometry::local().cache, packed.is_asymmetric);
         const bool aligned = packed.numerical_policy == Policy::GPUAlignedExpert;
         if (packed.is_asymmetric)
         {
             if (aligned)
-                return projectPolicy<Lanes, true, SumPairs, Policy::GPUAlignedExpert>(packed, input, output, chunk, first, last, accumulate);
-            return projectPolicy<Lanes, true, SumPairs, Policy::BackendNative>(packed, input, output, chunk, first, last, accumulate);
+                return projectPolicy<Lanes, true, SumPairs, Policy::GPUAlignedExpert>(packed, input, output, chunk,
+                    first, last, accumulate, tile_blocks);
+            return projectPolicy<Lanes, true, SumPairs, Policy::BackendNative>(packed, input, output, chunk, first,
+                last, accumulate, tile_blocks);
         }
         if (aligned)
-            return projectPolicy<Lanes, false, SumPairs, Policy::GPUAlignedExpert>(packed, input, output, chunk, first, last, accumulate);
-        return projectPolicy<Lanes, false, SumPairs, Policy::BackendNative>(packed, input, output, chunk, first, last, accumulate);
+            return projectPolicy<Lanes, false, SumPairs, Policy::GPUAlignedExpert>(packed, input, output, chunk, first,
+                last, accumulate, tile_blocks);
+        return projectPolicy<Lanes, false, SumPairs, Policy::BackendNative>(packed, input, output, chunk, first, last,
+            accumulate, tile_blocks);
     }
 }

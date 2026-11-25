@@ -7,7 +7,8 @@
  * block program but change the physical walk:
  *
  * - ordinary Q5_0/Q5_1 (q5::dispatch): one unrolled pass per register tile,
- *   with 16-block K cache tiles for the AVX2 one-row tile;
+ *   with L2-derived K cache tiles for the AVX2 one-row tile (any tile length,
+ *   including mid-range starts, gives the same bytes);
  * - Q5_K and IQ3_S (multi_scale::x86::singleScaleRows): unrolled groups,
  *   superblock-addressed units and headers, contiguous and ordered K trees;
  * - AVX-512 Q4_K and IQ4_XS (multi_scale::x86::nibbleSingleScaleRows): per
@@ -375,13 +376,19 @@ namespace llaminar2::test
                 {
                     SCOPED_TRACE("first=" + std::to_string(range.first) + " last=" + std::to_string(range.last) +
                                  " chunk=" + std::to_string(chunk));
-                    auto actual = initialRows(Rows, 91u + chunk), expected = actual;
-                    q5::dispatch<Lanes, SumPairs>(packed, tile<Rows>(activation, blocks, actual).input,
-                                                  tile<Rows>(activation, blocks, actual).output, chunk, range.first,
-                                                  range.last, range.accumulate);
+                    auto expected = initialRows(Rows, 91u + chunk);
                     referenceQ5<Lanes, SumPairs>(packed, tile<Rows>(activation, blocks, expected), chunk, range.first,
                                                  range.last, range.accumulate);
-                    ASSERT_TRUE(sameRows(actual, expected));
+                    // The cache-derived AVX2 K tile (0), the L1 floor and a short
+                    // tile that starts mid-range: the tile length never changes a byte.
+                    for (const int tile_blocks : {0, 16, 5})
+                    {
+                        auto actual = initialRows(Rows, 91u + chunk);
+                        q5::dispatch<Lanes, SumPairs>(packed, tile<Rows>(activation, blocks, actual).input,
+                                                      tile<Rows>(activation, blocks, actual).output, chunk,
+                                                      range.first, range.last, range.accumulate, tile_blocks);
+                        ASSERT_TRUE(sameRows(actual, expected)) << "tile_blocks=" << tile_blocks;
+                    }
                 }
         }
 
@@ -691,6 +698,25 @@ namespace llaminar2::test
                     expectQ5Tile<16, true, 4>(packed, activation, blocks);
 #endif
                 }
+    }
+
+    /** @test The AVX2 one-row Q5 K tile is half the associativity-safe private L2, with an L1 floor. */
+    TEST(CPUX86CodedLeaves, Q5AVX2KTileFollowsObservedL2)
+    {
+        // 1 MiB 8-way: 7/8 of 1 MiB = 917504 B, half for the tile.
+        EXPECT_EQ(q5::avx2OneRowKTileBlocks({1u << 20, 32u << 20, 8, 16}, false), 458752 / 1408);
+        EXPECT_EQ(q5::avx2OneRowKTileBlocks({1u << 20, 32u << 20, 8, 16}, true), 458752 / 1536);
+        EXPECT_EQ(q5::avx2OneRowKTileBlocks({512u << 10, 32u << 20, 8, 16}, false), 229376 / 1408);
+        // A one-way cache keeps its full capacity.
+        EXPECT_EQ(q5::avx2OneRowKTileBlocks({256u << 10, 8u << 20, 1, 16}, false), 131072 / 1408);
+        // Small caches keep the sixteen-block L1 tile.
+        EXPECT_EQ(q5::avx2OneRowKTileBlocks({32u << 10, 8u << 20, 8, 16}, false), 16);
+        CPUNativeQuantisedPackedWeights packed;
+        makeWeights(packed, kQ50, 64, 4, Policy::BackendNative, Scales::Finite, 7u);
+        const auto activation = makeActivations(1, 4, 3u);
+        std::vector<std::array<float, 64>> output(1);
+        const auto t = tile<1>(activation, 4, output);
+        EXPECT_THROW(q5::dispatch<8>(packed, t.input, t.output, 0, 0, 4, false, -1), std::invalid_argument);
     }
 
     /** @test Q5_K and IQ3_S leaves equal the generic rows() traversal, contiguous and ordered. */
