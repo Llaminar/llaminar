@@ -1817,6 +1817,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     planning/PageTableAdmission.cpp
     planning/MemoryPlanner.cpp
     kernels/cpu/attention/PagedKVArchive.cpp
+    kernels/cpu/attention/EffectiveUseOrdering.cpp
     planning/ImmutableRowTablePlacementPlanner.cpp
     planning/ImmutableRowTableAdmissionWire.cpp
     planning/PipelineTransferMemory.cpp
