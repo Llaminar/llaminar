@@ -29,6 +29,7 @@
  */
 
 #pragma once
+#include "execution/compute_stages/stages/PooledKVDecodeBinding.h"
 #include "execution/mtp/OrdinaryForwardRetention.h"
 #include "execution/mtp/CPUResidentMTPHidden.h"
 #include "execution/mtp/HostedDeviceGenerationFragment.h"
@@ -700,6 +701,9 @@ namespace llaminar2
         /** @brief Project only original declarative storage owner and host request epoch for complete TP source admission. */
         std::pair<std::shared_ptr<IRetainedGraphStorageBoundary>,std::uint64_t> retainedStorageSourceAdmission() const;
     private:
+        /** Caller-owned pooled decode binding attached for the current serving interval. */
+        PooledKVDecodeBinding *pooled_kv_binding_ = nullptr;
+    private:
         // Only the original Rank can order these phases across every participant.
         /** @brief Join original prior producers and publish this grouped channel's reset close before any TP peer awaits. */
         void prepareGroupedRetainedStorageReset(const InferenceStateResetRequest& request);
@@ -826,7 +830,7 @@ namespace llaminar2
              * a concrete weight-manager downcast because arenas, caches, and
              * workspaces are peer allocation owners rather than weight details.
              */
-            std::shared_ptr<PhysicalMemoryAuthority>
+    std::shared_ptr<PhysicalMemoryAuthority>
                 physical_memory_authority;
         };
 
@@ -862,6 +866,20 @@ namespace llaminar2
          */
         [[nodiscard]] static std::unique_ptr<DeviceGraphOrchestrator>
         createForTest(Dependencies deps);
+
+        /**
+         * @brief Attach one pooled decode binding to this orchestrator.
+         *
+         * The binding is injected into every forward graph this orchestrator
+         * builds while attached. It is owned by the caller (runner serving
+         * state) and must outlive the attached interval; detach with nullptr.
+         * Only a CPU single-row dense decode forward may consume it; the graph
+         * builder refuses other combinations before any ring work.
+         */
+        void setPooledDecodeBinding(PooledKVDecodeBinding *binding) noexcept
+        {
+            pooled_kv_binding_ = binding;
+        }
 
         /**
          * @brief Construct an isolated orchestrator for model-free unit tests.

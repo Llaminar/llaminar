@@ -4933,11 +4933,22 @@ namespace llaminar2
             : nullptr;
         if (pooled)
         {
-            if (!device.is_cpu() || batch_size != 1 || seq_len != 1 ||
+            if (!device.is_cpu() || batch_size != 1 ||
                 kv_cache != nullptr || predictor_layout != nullptr)
             {
-                throw std::invalid_argument(
-                    "Pooled decode binding supports only CPU single-row dense decode without a ring cache");
+                std::ostringstream why;
+                why << "Pooled decode binding supports only CPU single-request dense graphs without a ring cache"
+                    << " (cpu=" << device.is_cpu() << " batch=" << batch_size
+                    << " seq=" << seq_len << " kv_cache=" << (kv_cache != nullptr)
+                    << " predictor=" << (predictor_layout != nullptr) << ")";
+                throw std::invalid_argument(why.str());
+            }
+            if (seq_len > pooled->pageTokens())
+            {
+                std::ostringstream why;
+                why << "Pooled append page is smaller than this request batch (seq=" << seq_len
+                    << " pageTokens=" << pooled->pageTokens() << ")";
+                throw std::invalid_argument(why.str());
             }
             auto *cell = pooled->cellFor(layer_idx);
             if (!cell)
@@ -4956,6 +4967,7 @@ namespace llaminar2
                               .kv_heads = pooled->kvHeads(),
                               .head_dim = pooled->headDim(),
                               .page_tokens = pooled->pageTokens(),
+                              .live_rows = total_tokens,
                               .prior = pooled->priorFor(layer_idx),
                           }),
                           device);
@@ -5396,11 +5408,15 @@ namespace llaminar2
             const auto *pooled = forward_input_construction_
                 ? forward_input_construction_->pooled_kv
                 : nullptr;
-            if (pooled)
+            if (pooled && total_tokens == 1)
             {
+                // Pooled DECODE attention: the pooled append stage publishes
+                // the ref into the cell during graph execution; attention reads
+                // the cell at execute time. The pooled kernel is single-row
+                // decode only — this is the decoded-consumption vertical path.
                 auto *pooled_cell = pooled->cellFor(layer_idx);
-                if (!pooled_cell || !pooled_cell->live())
-                    throw std::invalid_argument("Pooled decode attention has no live publication");
+                if (!pooled_cell)
+                    throw std::invalid_argument("Pooled decode binding has no attention cell");
                 attn_params.kv_cache = nullptr;
                 attn_params.pooled_table = pooled->table();
                 attn_params.pooled_ref = pooled_cell->ref;
@@ -5408,6 +5424,16 @@ namespace llaminar2
                 attn_params.n_kv_heads = pooled->kvHeads();
                 attn_params.head_dim = pooled->headDim();
                 attn_params.active_query_rows_device = nullptr;
+                attn_params.pooled_position_from_publication = true;
+            }
+            else if (pooled)
+            {
+                // Pooled PREFILL: the pooled append stage writes the prompt's
+                // K/V into pooled pages, but attention still consumes the
+                // explicit K/V projections of THIS graph (kv_cache is null in
+                // pooled mode, so the ring path is untouched). The pooled
+                // snapshot becomes the decode-time source after this graph.
+                attn_params.kv_cache = nullptr;
             }
             else
             {

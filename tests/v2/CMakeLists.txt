@@ -16879,7 +16879,8 @@ add_v2_test(V2_Integration_MTPLearnedBlockAccounting
     MPI_PROCS 1 NO_MODELS TIMEOUT 30)
 
 # Test: MTP sidecar graph construction
-add_executable(v2_test_mtp_graph_construction unit/mtp/Test__MTPGraphConstruction.cpp)
+add_executable(v2_test_mtp_graph_construction unit/mtp/Test__MTPGraphConstruction.cpp
+    unit/execution/local_execution/orchestrators/Test__PooledDenseDecode.cpp)
 target_link_libraries(v2_test_mtp_graph_construction llaminar2_core GTest::gtest GTest::gtest_main)
 target_include_directories(v2_test_mtp_graph_construction PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}

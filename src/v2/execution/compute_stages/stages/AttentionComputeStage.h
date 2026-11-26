@@ -145,6 +145,15 @@ namespace llaminar2
              * pooled append stage; a refused resolve still fails closed.
              */
             const PagedKVSnapshotRef *pooled_ref_cell = nullptr;
+            /**
+             * @brief Derive the decode position from the pooled publication rows.
+             *
+             * The pooled runner's host position counter is not the authority:
+             * the publication's row count is. When set, the stage computes
+             * position_offset = live rows - 1 at execute (single-row decode),
+             * so a pooled decode at row N never depends on a host cursor.
+             */
+            bool pooled_position_from_publication = false;
 
             /**
              * @brief Device-owned logical query width for a scalar GPU graph.

@@ -25,6 +25,7 @@
 #include "v2/tensors/Tensors.h"
 #include "kernels/cpu/attention/CPUFlashAttentionKernelT.h"
 #include "kernels/cpu/attention/CPUFP32PagedKVTable.h"
+#include "planning/PagedKVInstance.h"
 #include "kernels/cpu/rotation/ActivationRotation.h"
 #include "planning/PhysicalMemoryAuthority.h"
 #include "planning/PhysicalPagePool.h"
@@ -1610,4 +1611,78 @@ TEST(PooledStageConsumption, PooledAppendAndAttentionMatchContiguousControl)
         previous_publication = std::move(ref_cell);
         (void)rows_per_page;
     }
+}
+
+
+/** @test P2: page_tokens=8 prefill-shaped single appendShared page commits. */
+TEST(PooledStageConsumption, LargePageSharedPrefillAppendCommits)
+{
+    constexpr int heads = 2, kv_heads = 2, dimension = 16, page_tokens = 8;
+    constexpr int tokens = 3;
+    const auto device = DeviceId::cpu();
+    const PhysicalPagePoolGeometry pool_geometry{8,
+        static_cast<std::size_t>(page_tokens) * 2 * heads * dimension * sizeof(float), 2, 8};
+    const CPUFP32PagedKVTableGeometry table_geometry{8, 8, 4, page_tokens, 32, 8};
+    const auto bytes = PhysicalPagePool::physicalBytes(pool_geometry, device) +
+        CPUFP32PagedKVTable::physicalBytes(table_geometry, device);
+    PhysicalMemoryPlanBuilder plan;
+    plan.add({.world_rank=0, .device=device, .total_bytes=bytes, .admission_available_bytes=bytes},
+        PhysicalMemoryOwner::KVCache, bytes);
+    auto authority = std::make_shared<PhysicalMemoryAuthority>(
+        std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()), 0);
+    auto pool = authority->createCPUPagePool(device, pool_geometry, CPUStoragePlacement::local());
+    auto table = CPUFP32PagedKVTable::create(authority, device, table_geometry);
+    const size_t width = static_cast<size_t>(heads * dimension);
+    std::vector<float> kv(static_cast<size_t>(tokens) * width * 2, 0.5f);
+    auto update = table->tryBeginUpdate();
+    ASSERT_TRUE(update);
+    auto grant = pool->tryAdmit(1);
+    ASSERT_TRUE(grant);
+    const auto frame = grant->assignFrame();
+    auto write = grant->prepareAppend(frame, kv.size() * sizeof(float));
+    ASSERT_TRUE(write);
+    write->copyFrom(std::as_bytes(std::span(kv)));
+    auto committed = write->commit();
+    auto shared = committed.share();
+    update->appendShared(std::move(shared), heads, dimension);
+    auto snapshot = update->commit();
+    EXPECT_EQ(static_cast<int>(snapshot.view().rows()), tokens);
+}
+
+
+/** @test P2: plan-shaped page_tokens=8 prefill append commits (frame 4096). */
+TEST(PooledStageConsumption, PlanShapedPrefillAppendCommits)
+{
+    constexpr int heads = 2, kv_heads = 2, dimension = 16, page_tokens = 8;
+    constexpr int tokens = 3;
+    const auto device = DeviceId::cpu();
+    auto plan = planPagedKVInstance(PagedKVTierConfig{},
+        []() { PagedKVPoolBudget b; b.remaining_budget_bytes = 2*1024*1024; b.frame_bytes = 4096;
+            b.request_records = 4; b.max_pages_per_request = 64; return b; }(),
+        PagedKVInstancePolicy{page_tokens, 8, 4, 4}, device);
+    ASSERT_TRUE(plan);
+    PhysicalMemoryPlanBuilder mb;
+    mb.add({.world_rank=0, .device=device, .total_bytes=plan->total_bytes,
+        .admission_available_bytes=plan->total_bytes},
+        PhysicalMemoryOwner::KVCache, plan->total_bytes);
+    auto authority = std::make_shared<PhysicalMemoryAuthority>(
+        std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(mb.build()), 0);
+    auto created = PagedKVInstance::create(authority, *plan, device);
+    ASSERT_TRUE(created);
+    PagedKVInstance instance = std::move(*created);
+    const size_t width = static_cast<size_t>(kv_heads * dimension);
+    std::vector<float> kv(static_cast<size_t>(tokens) * width * 2, 0.5f);
+    auto update = instance.table().tryBeginUpdate();
+    ASSERT_TRUE(update);
+    auto grant = instance.pool().tryAdmit(1);
+    ASSERT_TRUE(grant);
+    const auto frame = grant->assignFrame();
+    auto write = grant->prepareAppend(frame, kv.size() * sizeof(float));
+    ASSERT_TRUE(write);
+    write->copyFrom(std::as_bytes(std::span(kv)));
+    auto committed = write->commit();
+    auto shared = committed.share();
+    update->appendShared(std::move(shared), kv_heads, dimension);
+    auto snapshot = update->commit();
+    EXPECT_EQ(static_cast<int>(snapshot.view().rows()), tokens);
 }

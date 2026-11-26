@@ -2033,10 +2033,16 @@ namespace llaminar2
                     view.heads = params_.n_kv_heads;
                     view.dimension = params_.head_dim;
                     view.page_tokens = params_.pooled_table->tableGeometry().page_tokens;
+                    // Pooled decode position: the publication's row count is
+                    // the authority (the host cursor may not have advanced).
+                    const int pooled_position =
+                        params_.pooled_position_from_publication
+                            ? borrowed_view.rows() - 1
+                            : params_.position_offset;
                     success = kernel->compute_pooled_snapshot_decoder(
                         params_.Q, view, params_.output,
                         params_.n_heads, params_.n_kv_heads, params_.head_dim,
-                        kernel_causal, params_.window_size, params_.position_offset,
+                        kernel_causal, params_.window_size, pooled_position,
                         params_.head_start, params_.gqa_n_rep, params_.execution_policy);
                     if (!success)
                         LOG_ERROR("[AttentionComputeStage] Pooled snapshot decode refused"

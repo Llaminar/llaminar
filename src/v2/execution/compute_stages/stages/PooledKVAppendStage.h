@@ -68,6 +68,8 @@ public:
         int kv_heads = 0;
         int head_dim = 0;
         int page_tokens = 0;
+        /** Live rows this graph appends (decode always 1; buffer capacity is larger). */
+        int live_rows = 1;
         /** Prior publication of the SAME request/layer, or null on the first row.
          * Every prior page is shared into the new bank (immutable sharing);
          * only the new row page is freshly written (private COW tail). */

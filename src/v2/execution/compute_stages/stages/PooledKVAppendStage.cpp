@@ -61,19 +61,18 @@ bool PooledKVAppendStage::execute(IDeviceContext *ctx)
         LOG_ERROR("[PooledKVAppendStage] Pooled append requires positive KV geometry");
         return false;
     }
-    const int rows = static_cast<int>(params_.K->rows());
-    if (rows != 1)
+    const int rows = params_.live_rows > 0 ? params_.live_rows
+                                            : static_cast<int>(params_.K->rows());
+    if (rows <= 0)
     {
-        LOG_ERROR("[PooledKVAppendStage] Pooled append supports exactly one decode row");
+        LOG_ERROR("[PooledKVAppendStage] Pooled append requires positive live rows");
         return false;
     }
-
-    // One page holds page_tokens interleaved K/V rows. A decode step appends
-    // exactly one row into the current page; when the page is full the caller
-    // (graph family) opens the next page. This stage writes the SINGLE row.
     const std::size_t width = static_cast<std::size_t>(params_.kv_heads) *
         static_cast<std::size_t>(params_.head_dim);
-    const std::size_t payload_bytes = width * 2 * sizeof(float); // K then V interleaved.
+    const std::size_t row_bytes = width * 2 * sizeof(float); // K then V interleaved per row.
+    const float *k = params_.K->fp32_data();
+    const float *v = params_.V->fp32_data();
 
     auto update = params_.table->tryBeginUpdate();
     if (!update)
@@ -81,52 +80,108 @@ bool PooledKVAppendStage::execute(IDeviceContext *ctx)
         LOG_ERROR("[PooledKVAppendStage] Pooled table has no available bank (issuance budget or banks exhausted)");
         return false;
     }
-    // Immutable sharing: every page of the prior publication becomes a SHARED
-    // page in the new bank (no bytes are copied; the pool retains one frame
-    // because the shared reference keeps it alive). A request's history is
-    // never regathered into contiguous scratch.
+
+    // Publication-source model (immutable sharing + private COW tail):
+    // - every page of the prior publication is kept;
+    // - the prior LAST page is extended by COW copy only when it is PARTIAL
+    //   (a decode step appending into the current page): the new bank shares
+    //   all FULL prior pages, and one fresh private page holds the prior last
+    //   page's rows + this step's new row(s);
+    // - a new page is started only when the prior last page was FULL.
+    const CPUFP32KVPage *prior_pages = nullptr;
+    int prior_last_rows = 0;
+    int prior_page_count = 0;
     if (params_.prior && params_.prior->live())
     {
         const auto pages = params_.prior->snapshot.view().pages();
+        prior_page_count = static_cast<int>(pages.size());
+        prior_last_rows = pages.empty() ? 0 : pages.back().rows();
+        prior_pages = pages.data();
+    }
+    const int final_page_rows = prior_page_count > 0 ? prior_last_rows : 0;
+    const bool extend_partial = prior_page_count > 0 && final_page_rows < params_.page_tokens;
+
+    if (!extend_partial && prior_pages)
+    {
+        // All prior pages are full: share them verbatim.
+        const auto pages = params_.prior->snapshot.view().pages();
         for (const auto &page : pages)
         {
-            if (page.sharedBacked())
-                update->appendShared(page.share(), page.heads(), page.dimension());
-            else
-            {
-                // Private page from an earlier step: convert once into a shared
-                // ref so the new bank and the old publication both retain it.
-                auto shared = page.share();
-                update->appendShared(std::move(shared), page.heads(), page.dimension());
-            }
+            auto shared = page.share();
+            update->appendShared(std::move(shared), page.heads(), page.dimension());
         }
     }
-    auto grant = params_.pool->tryAdmit(1);
-    if (!grant)
+
+    if (extend_partial)
     {
-        LOG_ERROR("[PooledKVAppendStage] Pool has no free page for the append");
-        return false;
+        // COW the prior last page and append this step's rows after it.
+        const auto &prior_last = params_.prior->snapshot.view().pages().back();
+        auto prior_shared = prior_last.share();
+        const std::size_t source_rows = prior_last.rows();
+        const std::size_t total_rows = static_cast<std::size_t>(source_rows) + rows;
+        if (total_rows > static_cast<std::size_t>(params_.page_tokens))
+        {
+            LOG_ERROR("[PooledKVAppendStage] Pooled decode exceeds the page capacity at this step");
+            return false;
+        }
+        auto grant = params_.pool->tryAdmit(1);
+        if (!grant)
+        {
+            LOG_ERROR("[PooledKVAppendStage] Pool has no free frame for the COW extension");
+            return false;
+        }
+        auto cow = grant->prepareCOW(prior_shared, static_cast<std::size_t>(rows) * row_bytes);
+        if (!cow)
+        {
+            LOG_ERROR("[PooledKVAppendStage] Pooled COW extension preparation refused");
+            return false;
+        }
+        cow->copySource();
+        std::vector<float> fresh(static_cast<std::size_t>(rows) * width * 2);
+        std::memcpy(fresh.data(), k, static_cast<std::size_t>(rows) * width * sizeof(float));
+        std::memcpy(fresh.data() + static_cast<std::size_t>(rows) * width, v,
+            static_cast<std::size_t>(rows) * width * sizeof(float));
+        cow->copyNext(std::as_bytes(std::span(fresh)));
+        auto committed = cow->commit();
+        auto shared = committed.share();
+        update->appendShared(std::move(shared), params_.kv_heads, params_.head_dim);
     }
-    const auto frame = grant->assignFrame();
-    auto write = grant->prepareAppend(frame, payload_bytes);
-    if (!write)
+    else
     {
-        LOG_ERROR("[PooledKVAppendStage] Pooled page append preparation refused");
-        return false;
+        // Fresh page(s): prefill of an empty bank, or a decode step starting a
+        // new full page. Every page except the last is written full; the last
+        // may be partial.
+        int written = 0;
+        while (written < rows)
+        {
+            const int page_rows = std::min(params_.page_tokens, rows - written);
+            const std::size_t page_bytes = static_cast<std::size_t>(page_rows) * row_bytes;
+            auto grant = params_.pool->tryAdmit(1);
+            if (!grant)
+            {
+                LOG_ERROR("[PooledKVAppendStage] Pool has no free page for the append");
+                return false;
+            }
+            const auto frame = grant->assignFrame();
+            auto write = grant->prepareAppend(frame, page_bytes);
+            if (!write)
+            {
+                LOG_ERROR("[PooledKVAppendStage] Pooled page append preparation refused");
+                return false;
+            }
+            std::vector<float> payload(static_cast<std::size_t>(page_rows) * width * 2);
+            std::memcpy(payload.data(), k + static_cast<std::size_t>(written) * width,
+                static_cast<std::size_t>(page_rows) * width * sizeof(float));
+            std::memcpy(payload.data() + static_cast<std::size_t>(page_rows) * width,
+                v + static_cast<std::size_t>(written) * width,
+                static_cast<std::size_t>(page_rows) * width * sizeof(float));
+            write->copyFrom(std::as_bytes(std::span(payload)));
+            auto committed = write->commit();
+            auto shared = committed.share();
+            update->appendShared(std::move(shared), params_.kv_heads, params_.head_dim);
+            written += page_rows;
+        }
     }
-    const float *k = params_.K->fp32_data();
-    const float *v = params_.V->fp32_data();
-    std::vector<float> payload(width * 2);
-    std::memcpy(payload.data(), k, width * sizeof(float));
-    std::memcpy(payload.data() + width, v, width * sizeof(float));
-    write->copyFrom(std::as_bytes(std::span(payload)));
-    auto committed = write->commit();
-    // Convert immediately to an immutable SHARED page: only shared frames
-    // survive the request grant's release, so a private committed page would
-    // be reassigned while the bank still references it. The shared reference
-    // keeps the exact frame incarnation alive for every later step.
-    auto shared = committed.share();
-    update->appendShared(std::move(shared), params_.kv_heads, params_.head_dim);
     auto snapshot = update->commit();
     if (!params_.table->bindPublication(snapshot, params_.request_id, params_.slot))
     {

@@ -14425,6 +14425,11 @@ namespace llaminar2
             !executableForwardSubmissionIntent(input.graph_submission_intent))
             throw std::invalid_argument("DGO has an unknown forward graph construction intent");
         ForwardInput build_input = input;
+        // P2 pooled decode: the runner attached a pooled binding; every forward
+        // graph built while attached consumes pooled pages (the graph builder
+        // refuses combinations it cannot support).
+        if (pooled_kv_binding_)
+            build_input.pooled_kv = pooled_kv_binding_;
         if(build_input.graph_submission_intent!=ForwardGraphSubmissionIntent::WorkspaceDeclaration &&
             build_input.device.is_gpu() && build_input.batch_size==1 &&
             build_input.execution_role==ForwardExecutionRole::MainInference &&
@@ -18368,7 +18373,11 @@ namespace llaminar2
                 "device-state publication stream");
         }
         input.device = state_.device_id;
-        input.kv_cache = state_.kv_cache.get();
+        input.kv_cache = pooled_kv_binding_ ? nullptr : state_.kv_cache.get();
+        // P2 pooled decode: the runner attached a pooled binding; the pooled
+        // graph consumes pooled pages and must NOT use the ring cache (the
+        // graph builder refuses ring+pooled combinations).
+        input.pooled_kv = pooled_kv_binding_;
 
         /*
          * Pipeline prefill binds each non-embedding participant's persistent
