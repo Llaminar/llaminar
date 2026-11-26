@@ -663,6 +663,62 @@ TEST(CPUProjectionWorkspace, MirroredHeadDeclaresSerialTreeForPhysicalOutput)
         true, 1.f, 0.f, nullptr, nullptr, -1, workspace.get()));
 }
 
+/** @test A two-row admission remains sufficient when the actual team narrows. */
+TEST(CPUProjectionWorkspace, TwoRowAdmissionNarrowerTeams)
+{
+    using namespace cpu::native_quantised;
+    WorkerScope restore;
+    constexpr int n = 129, k = 4096;
+    for (const auto &format : quantizedMoEVerifierFormats())
+    for (const auto policy : {CPUProjectionNumericalPolicy::BackendNative,
+                             CPUProjectionNumericalPolicy::GPUAlignedExpert})
+    {
+        SCOPED_TRACE(std::string(format.label) + " policy=" + std::to_string(int(policy)));
+        auto weight = format.create({size_t(n), size_t(k)}, 313);
+        CPUNativeQuantisedGemmKernel kernel(weight.get(), 0, -1, policy);
+        ASSERT_TRUE(kernel.isValid());
+        omp_set_num_threads(8);
+        CPUProjectionTestWorkspace workspace(2, k, kernel.getWorkspaceRequirements(2));
+        auto input = TestTensorFactory::createFP32Random({2u, size_t(k)}, -.6f, .6f, 661);
+        auto output = TestTensorFactory::createFP32({2u, size_t(n)});
+        auto reference = TestTensorFactory::createFP32({2u, size_t(n)});
+        CPUProjectionTestWorkspace short_workspace(1, k);
+        std::fill_n(output->mutable_data(), 2 * n, 12345.f);
+        EXPECT_THROW(kernel.multiply_tensor(input.get(), output.get(), 2, n, k,
+            true, 1.f, 0.f, nullptr, nullptr, -1, short_workspace.get()), std::runtime_error);
+        EXPECT_TRUE(std::all_of(output->data(), output->data() + 2 * n,
+            [](float x) { return x == 12345.f; }));
+        for (int workers = 1; workers <= 8; ++workers)
+        {
+            omp_set_num_threads(workers);
+            for (const int rows : {2, 1, 2})
+            {
+                SCOPED_TRACE("workers=" + std::to_string(workers) + " rows=" + std::to_string(rows));
+                std::fill_n(output->mutable_data(), 2 * n, 12345.f);
+                ASSERT_TRUE(kernel.multiply_tensor(input.get(), reference.get(), rows, n, k,
+                    true, 1.f, 0.f, nullptr, nullptr, -1, workspace.get()));
+                auto q8 = CPUInvocationWorkspace::require<Q8_1Block>(workspace.get(), kCPUProjectionQ8,
+                    2 * k / Q8_1Block::BLOCK_SIZE);
+                auto bytes = std::as_writable_bytes(q8);
+                std::fill(bytes.begin(), bytes.end(), std::byte{0x5a});
+                std::atomic<bool> completed{true};
+#pragma omp parallel
+                {
+                    if (!kernel.multiply_tensor(input.get(), output.get(), rows, n, k,
+                            true, 1.f, 0.f, nullptr, nullptr, -1, workspace.get()))
+                        completed.store(false);
+                }
+                ASSERT_TRUE(completed.load());
+                EXPECT_EQ(std::memcmp(output->data(), reference->data(), rows * n * sizeof(float)), 0);
+                EXPECT_TRUE(std::all_of(output->data() + rows * n, output->data() + 2 * n,
+                    [](float x) { return x == 12345.f; }));
+                EXPECT_TRUE(std::all_of(bytes.begin() + rows * k / Q8_1Block::BLOCK_SIZE * sizeof(Q8_1Block),
+                    bytes.end(), [](std::byte x) { return x == std::byte{0x5a}; }));
+            }
+        }
+    }
+}
+
 /** @test Every NativeQuantised source codebook uses the same admitted transform contract. */
 TEST(CPUProjectionWorkspace, AllQuantizedFormats)
 {

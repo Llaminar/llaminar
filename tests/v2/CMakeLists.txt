@@ -20220,6 +20220,12 @@ foreach(V2_CPU_WORKSPACE_ISA_LABEL IN LISTS V2_CPU_NATIVE_ISA_CELLS)
         MPI_PROCS 1
         NO_MODELS
         ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_CPU_WORKSPACE_ISA}")
+    add_v2_test(${V2_CPU_WORKSPACE_TEST}_TwoRowNarrowerTeams
+        COMMAND $<TARGET_FILE:v2_integration_cpu_projection_workspace>
+            --gtest_filter=CPUProjectionWorkspace.TwoRowAdmissionNarrowerTeams
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;Workspace;Regression"
+        MPI_PROCS 1 NO_MODELS
+        ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_CPU_WORKSPACE_ISA}")
     list(APPEND V2_CPU_PROJECTION_WORKSPACE_PREFLIGHT_TESTS ${V2_CPU_WORKSPACE_TEST})
 endforeach()
 
