@@ -45153,3 +45153,14 @@ list(LENGTH V2_BACKEND_OMITTED_TESTS V2_BACKEND_OMITTED_TEST_COUNT)
 if(V2_BACKEND_OMITTED_TEST_COUNT GREATER 0)
     message(STATUS "V2 Tests: omitted ${V2_BACKEND_OMITTED_TEST_COUNT} registrations whose backend family is not compiled (HAVE_CUDA=${HAVE_CUDA} HAVE_ROCM=${HAVE_ROCM})")
 endif()
+
+add_executable(v2_unit_native_superblock_walk_contract
+    unit/kernels/Test__NativeSuperblockWalkContract.cpp)
+target_include_directories(v2_unit_native_superblock_walk_contract PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(v2_unit_native_superblock_walk_contract PRIVATE GTest::gtest_main)
+add_v2_test(V2_Unit_NativeSuperblockWalkContract
+    COMMAND $<TARGET_FILE:v2_unit_native_superblock_walk_contract>
+    LABELS "V2;Unit;GEMM;Regression" NO_MPI NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_NativeSuperblockWalkContract
+    COMMAND $<TARGET_FILE:v2_unit_native_superblock_walk_contract>
+    LABELS "V2;Integration;ProductionTestPreflight;GEMM;Regression" NO_MPI NO_MODELS TIMEOUT 30)

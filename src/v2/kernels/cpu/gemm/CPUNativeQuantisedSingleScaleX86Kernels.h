@@ -38,6 +38,7 @@
 
 #if defined(__AVX2__)
 
+#include "CPUNativeSuperblockWalkContract.h"
 #include <array>
 #include <bit>
 #include <cstdint>
@@ -326,6 +327,7 @@ namespace llaminar2::cpu::native_quantised::multi_scale::x86
         constexpr int center = Codebook == 11 ? 16 : 0;
         const auto geometry = preparedBlockGeometry(encoding, Layout::affine, Codebook,
                                                     static_cast<std::size_t>(packed.blocks_per_row));
+        requireSuperblockWalk(begin, end, geometry.blocks_per_row, geometry.phase);
         const std::uint8_t *const row_base = packed.interleavedBase() + geometry.blockOffset(chunk, 0);
         for (int pass = 0; pass < 64; pass += Lanes * strips)
         {
@@ -343,8 +345,8 @@ namespace llaminar2::cpu::native_quantised::multi_scale::x86
                     for (int strip = 0; strip < strips; ++strip)
                         acc[row][strip] = Tree == Reduction::Contiguous && accumulate
                             ? load<F>(output[row] + pass + strip * Lanes) : F{};
-                const int first = Tree == Reduction::OrderedPartitions ? begin + partition * blocks_per_partition : begin;
-                const int last = Tree == Reduction::OrderedPartitions ? std::min(first + blocks_per_partition, end) : end;
+                const int first = Tree == Reduction::OrderedPartitions ? static_cast<int>(std::min<std::int64_t>(std::int64_t(begin) + std::int64_t(partition) * blocks_per_partition, end)) : begin;
+                const int last = Tree == Reduction::OrderedPartitions ? static_cast<int>(std::min<std::int64_t>(std::int64_t(first) + blocks_per_partition, end)) : end;
                 for (int kb = first; kb < last;)
                 {
                     // One superblock (or its ragged/partial intersection) at a time:
@@ -480,6 +482,7 @@ namespace llaminar2::cpu::native_quantised::multi_scale::x86
         const int center = Codebook == 4 ? lut_bias : 0;
         const auto geometry = preparedBlockGeometry(encoding, Layout::affine, Codebook,
                                                     static_cast<std::size_t>(packed.blocks_per_row));
+        requireSuperblockWalk(begin, end, geometry.blocks_per_row, geometry.phase);
         const std::uint8_t *const row_base = packed.interleavedBase() + geometry.blockOffset(chunk, 0);
         for (int pass = 0; pass < 64; pass += 16 * strips)
         {
@@ -497,8 +500,8 @@ namespace llaminar2::cpu::native_quantised::multi_scale::x86
                     for (int strip = 0; strip < strips; ++strip)
                         acc[row][strip] = Tree == Reduction::Contiguous && accumulate
                             ? load<F>(output[row] + pass + strip * 16) : F{};
-                const int first = Tree == Reduction::OrderedPartitions ? begin + partition * blocks_per_partition : begin;
-                const int last = Tree == Reduction::OrderedPartitions ? std::min(first + blocks_per_partition, end) : end;
+                const int first = Tree == Reduction::OrderedPartitions ? static_cast<int>(std::min<std::int64_t>(std::int64_t(begin) + std::int64_t(partition) * blocks_per_partition, end)) : begin;
+                const int last = Tree == Reduction::OrderedPartitions ? static_cast<int>(std::min<std::int64_t>(std::int64_t(first) + blocks_per_partition, end)) : end;
                 for (int kb = first; kb < last;)
                 {
                     const int superblock_end = std::min(last, static_cast<int>(geometry.superblockEnd(kb)));

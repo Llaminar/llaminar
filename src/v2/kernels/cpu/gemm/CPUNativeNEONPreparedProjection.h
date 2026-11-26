@@ -11,6 +11,7 @@
  */
 #pragma once
 
+#include "CPUNativeSuperblockWalkContract.h"
 #include "CPUNativeQuantisedMultiScaleKernels.h"
 #include "CPUNativeQuantisedWeightView.h"
 #include "tensors/MXFP4Format.h"
@@ -847,6 +848,7 @@ namespace llaminar2::cpu::native_quantised
         template <Encoding Physical, int Coded, typename Ops, typename Visit>
         [[gnu::always_inline]] void forPartitionBlocks(int first, int last, [[maybe_unused]] int column, Visit &&visit) const noexcept
         {
+            requireSuperblockWalk(first, last, weights_.blocks_per_row);
             if constexpr (Coded == 0 && hoistsSourceHeader<Ops, Physical>())
             {
                 // IQ4_XS: per-block payload and code planes, one source header
@@ -1102,8 +1104,8 @@ namespace llaminar2::cpu::native_quantised
                 for (int partition = 0; partition < (ordered ? partitions_ : 1); ++partition)
                 {
                     float32x4_t partial[Rows][S]{};
-                    const int first = ordered ? partition * blocks_per_partition_ : 0;
-                    const int last = ordered ? std::min(first + blocks_per_partition_, weights_.blocks_per_row)
+                    const int first = ordered ? static_cast<int>(std::min<std::int64_t>(std::int64_t(partition) * blocks_per_partition_, weights_.blocks_per_row)) : 0;
+                    const int last = ordered ? static_cast<int>(std::min<std::int64_t>(std::int64_t(first) + blocks_per_partition_, weights_.blocks_per_row))
                                              : weights_.blocks_per_row;
                     for (int block = first; block < last;)
                     {
@@ -1340,8 +1342,8 @@ namespace llaminar2::cpu::native_quantised
                     for (int partition = 0; partition < (ordered || Coded == 0 ? partitions_ : 1); ++partition)
                     {
                         float32x4_t accumulator[Rows]{};
-                        const int first = ordered || Coded == 0 ? partition * blocks_per_partition_ : 0;
-                        const int last = ordered || Coded == 0 ? std::min(first + blocks_per_partition_, weights_.blocks_per_row)
+                        const int first = ordered || Coded == 0 ? static_cast<int>(std::min<std::int64_t>(std::int64_t(partition) * blocks_per_partition_, weights_.blocks_per_row)) : 0;
+                        const int last = ordered || Coded == 0 ? static_cast<int>(std::min<std::int64_t>(std::int64_t(first) + blocks_per_partition_, weights_.blocks_per_row))
                             : weights_.blocks_per_row;
                         forPartitionBlocks<Physical, Coded, Ops>(first, last, column, [&](int block, const std::uint8_t *unit,
                             [[maybe_unused]] const auto &base) __attribute__((always_inline)) {
@@ -1615,8 +1617,8 @@ namespace llaminar2::cpu::native_quantised
             for (int partition = 0; partition < partitions_; ++partition)
             {
                 float32x4_t accumulator[Rows][S]{};
-                const int first = partition * blocks_per_partition_;
-                const int last = std::min(first + blocks_per_partition_, weights_.blocks_per_row);
+                const int first = static_cast<int>(std::min<std::int64_t>(std::int64_t(partition) * blocks_per_partition_, weights_.blocks_per_row));
+                const int last = static_cast<int>(std::min<std::int64_t>(std::int64_t(first) + blocks_per_partition_, weights_.blocks_per_row));
                 forPartitionBlocks<Physical, 0, Ops>(first, last, column0, [&](int block, const std::uint8_t *unit,
                     [[maybe_unused]] const auto &base) __attribute__((always_inline)) {
                     I low[Rows][S]{}, high[Rows][S]{};

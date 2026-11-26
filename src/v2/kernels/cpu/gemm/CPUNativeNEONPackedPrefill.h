@@ -20,6 +20,7 @@
  */
 #pragma once
 
+#include "CPUNativeSuperblockWalkContract.h"
 #include "CPUNativeNEONPanelWorkspace.h"
 #include "CPUNativeNEONProjectionBatch.h"
 
@@ -259,6 +260,7 @@ namespace llaminar2::cpu::native_quantised
             int chunk, int c, int first, int end, float *buffer) noexcept
         {
             const auto geometry = w.geometry();
+            requireSuperblockWalk(first, end, geometry.blocks_per_row, geometry.phase);
             const auto *root = w.interleavedBase() + std::size_t(chunk) * geometry.rowBytes();
             if constexpr (C != 0)
             {

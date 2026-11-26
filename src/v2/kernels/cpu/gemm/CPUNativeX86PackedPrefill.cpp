@@ -20,6 +20,7 @@
  * calling worker's slot (projectPooledChunk).
  */
 #if defined(__AVX2__)
+#include "CPUNativeSuperblockWalkContract.h"
 #include "CPUNativeX86PackedPrefill.h"
 
 #include <algorithm>
@@ -71,6 +72,7 @@ namespace llaminar2::cpu::native_quantised::x86_panel
             constexpr auto geom = preparedBlockGeometry(encoding<CB>, affine(static_cast<Format>(CB)), CB, 0);
             constexpr auto data = preparedDataStride(encoding<CB>, CB);
             const auto geo = w.geometry();
+            requireSuperblockWalk(begin, end, geo.blocks_per_row, geo.phase);
             const auto *root = w.interleavedBase() + geo.rowBytes() * chunk;
             for (int k = begin; k < end;)
             {
