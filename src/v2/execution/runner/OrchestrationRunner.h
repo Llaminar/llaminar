@@ -329,6 +329,10 @@ namespace llaminar2
             return serving_session_ ? serving_session_->occupancy() : ServingBatchOccupancy{};
         }
         void setServingTraceRecorder(std::shared_ptr<IServingTraceRecorder> recorder) override;
+        std::optional<ServingContinuationManifest> suspendServingRequest(
+            std::uint64_t id, std::string &error) override;
+        bool restoreServingRequest(
+            ServingContinuationManifest &&manifest, std::string &error) override;
         void endServingBatch() override;
         GenerationResult generate(
             const std::vector<int32_t> &prompt_tokens,

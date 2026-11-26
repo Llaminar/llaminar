@@ -23,6 +23,7 @@
 #include "snapshots/SnapshotInfo.h"
 #include "execution/serving/ServingWindowDecode.h"
 #include "execution/serving/ServingBatch.h"
+#include "execution/serving/ServingContinuationManifest.h"
 
 #include "execution/prefix_cache/PrefixCacheTelemetry.h"
 #include "../../backends/DeviceId.h"
@@ -840,6 +841,34 @@ namespace llaminar2
          *        False means every request is waiting for a grant.
          */
         virtual bool servingBatchHasRunnableWork() const { return false; }
+
+        /**
+         * @brief Suspend one resident request at a settled decision boundary.
+         * @param id Resident request id.
+         * @return The sealed single-use continuation (P4), or empty with a
+         * precise refusal (unsupported executor, pending decision, sealed
+         * session, prefix HIT, hybrid/MTP row). The caller owns the manifest
+         * until restore; a suspension the caller drops stays tracked and gets
+         * its defined terminal on end() (never silently lost).
+         */
+        virtual std::optional<ServingContinuationManifest> suspendServingRequest(std::uint64_t /*id*/,
+            std::string & /*error*/)
+        {
+            return std::nullopt;
+        }
+
+        /**
+         * @brief Restore a suspended continuation into a free slot.
+         * @param manifest The continuation returned by suspendServingRequest
+         * (rvalue). On success its single-use seal is consumed; on refusal the
+         * caller keeps it. Foreign-session manifests refuse.
+         * @return True on success; false with @p error and the manifest intact.
+         */
+        virtual bool restoreServingRequest(ServingContinuationManifest && /*manifest*/,
+            std::string & /*error*/)
+        {
+            return false;
+        }
 
         /** @brief Close the session; every resident row must already be retired. */
         virtual void endServingBatch() {}

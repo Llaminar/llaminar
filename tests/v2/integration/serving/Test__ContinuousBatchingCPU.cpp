@@ -165,6 +165,56 @@ namespace llaminar2::test
             std::unique_ptr<IOrchestrationRunner> runner_;
         };
 
+        /** @test P4: production suspend/restore matches an uninterrupted control. */
+        TEST_F(ContinuousBatchingCPU, ProductionSuspendRestoreMatchesControl)
+        {
+            // CONTROL: one stochastic request completes uninterrupted (its own
+            // session, same law/seed as the suspended run).
+            const auto control_request = makeRequest(7, 20, 24, 0.8f, 4242);
+            const auto control = solo(control_request);
+            ASSERT_GT(control.tokens.size(), 0u);
+            ASSERT_EQ(control.finish, ServingFinishReason::Length);
+
+            // SUSPENDED: the same request, suspended at a settled boundary
+            // after its first decode decision, then restored into the SAME
+            // slot, continuing under the same law/seed.
+            ASSERT_TRUE(runner_->beginServingBatch(kCapacity)) << runner_->lastError();
+            ASSERT_TRUE(runner_->submitServingRequest(control_request));
+            std::size_t suspended_at = 0;
+            std::optional<ServingContinuationManifest> manifest;
+            std::string error;
+            for (int step = 0; step < 40 && !manifest; ++step)
+            {
+                for (const auto &event : runner_->stepServingBatch())
+                {
+                    if (event.finished())
+                        ASSERT_TRUE(false) << "request finished before the suspension boundary";
+                    (void)event;
+                }
+                suspended_at = step;
+                manifest = runner_->suspendServingRequest(7, error);
+                if (!manifest && error.find("pending (undecided)") != std::string::npos)
+                    continue; // Settle to the decision boundary first.
+            }
+            ASSERT_TRUE(manifest.has_value()) << error;
+            // Restore into the SAME free slot (its physical slot was retired by
+            // the suspension; the session restores into any free slot).
+            ASSERT_TRUE(runner_->restoreServingRequest(std::move(*manifest), error)) << error;
+            std::vector<int32_t> suspended_tokens;
+            for (int step = 0; step < 400 && !runner_->servingBatchIdle(); ++step)
+                for (const auto &event : runner_->stepServingBatch())
+                {
+                    suspended_tokens.insert(suspended_tokens.end(),
+                        event.tokens.begin(), event.tokens.end());
+                    if (event.finished())
+                        EXPECT_EQ(event.finish, ServingFinishReason::Length);
+                }
+            runner_->endServingBatch();
+            // The restored run's token stream equals the uninterrupted control.
+            EXPECT_EQ(suspended_tokens, control.tokens);
+            EXPECT_EQ(suspended_at > 0, true);
+        }
+
         /** Hybrid recurrent (GDN) model: per-slot recurrent and conv state. */
         class ContinuousBatchingCPUHybrid : public ContinuousBatchingCPU
         {

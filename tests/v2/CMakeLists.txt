@@ -19911,6 +19911,18 @@ add_v2_test(V2_Integration_ContinuousBatchingCPU
     LABELS "V2;Integration;Serving;ContinuousBatching;CPU"
 )
 
+# P4 production continuation: ServingSession -> real CPU runner suspend/restore
+# equivalence (same slot and different slot vs an uninterrupted control) and
+# malformed-header negatives. Model-gated (LLAMINAR_CB_TEST_MODEL): like the
+# canonical CB CPU integration it requires V2_Models and is therefore NOT a
+# device-free preflight entry (a model-free preflight has no runner here).
+add_v2_test(V2_Integration_P4ServingRestoreEquivalence
+    COMMAND $<TARGET_FILE:v2_integration_continuous_batching_cpu>
+        --gtest_filter=ContinuousBatchingCPU.ProductionSuspendRestoreMatchesControl
+    LABELS "V2;Integration;Serving;ContinuousBatching;Continuation;P4;Regression"
+    MPI_PROCS 1
+    FIXTURES_REQUIRED V2_Models)
+
 # Test: Qwen2Pipeline Integration Tests (full pipeline, autoregressive decode, bias validation)
 # Validates end-to-end pipeline functionality including Q/K/V/O bias application
 

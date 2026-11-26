@@ -26887,6 +26887,28 @@ bool OrchestrationRunner::publishPhysicalMemoryAuthority()
         return serving_session_ && serving_session_->hasRunnableWork();
     }
 
+    std::optional<ServingContinuationManifest> OrchestrationRunner::suspendServingRequest(
+        std::uint64_t id, std::string &error)
+    {
+        if (!serving_session_)
+        {
+            error = "Serving batch session is not open";
+            return std::nullopt;
+        }
+        return serving_session_->suspend(id, error);
+    }
+
+    bool OrchestrationRunner::restoreServingRequest(
+        ServingContinuationManifest &&manifest, std::string &error)
+    {
+        if (!serving_session_)
+        {
+            error = "Serving batch session is not open";
+            return false;
+        }
+        return serving_session_->restore(std::move(manifest), error);
+    }
+
     void OrchestrationRunner::endServingBatch()
     {
         if (serving_session_)

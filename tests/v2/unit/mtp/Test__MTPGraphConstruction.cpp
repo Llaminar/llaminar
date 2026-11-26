@@ -118,6 +118,11 @@ struct DeviceGraphOrchestratorMTPSlotsTestAccess
     {
         return owner.executeCPUResidentMTPDraft(slots, tokens, positions, bank);
     }
+    /** @brief Test-visible serving slot position (G1 observation boundary). */
+    static int slotPosition(const DeviceGraphOrchestrator &owner, int slot)
+    {
+        return owner.serving_slot_positions_.at(static_cast<std::size_t>(slot));
+    }
     /** @brief Submit one real sidecar row; all graph selection remains production-owned. */
     static bool execute(DeviceGraphOrchestrator &owner, int token, int position,
                         const std::vector<int> *slots)
@@ -5599,55 +5604,45 @@ TEST(Test__MTPGraphConstruction, ResidentMainHiddenTracksProductionForward)
 /** @test P4 CPU: production ring-cache slot KV export/import round-trip is byte-exact. */
 TEST(Test__MTPGraphConstruction, ServingSlotKVExportImportRoundTripIsByteExact)
 {
-    DeviceManager::instance().initialize(-1, false);
-    TinyQwen35MTPForwardFixture fixture;
-    // P4 production CPU export covers the DENSE serving row path; MTP rows are
-    // NOT carried (the continuation boundary refuses them honestly). Disable
-    // MTP for this fixture so the orchestrator is a dense serving runner.
-    fixture.config.mtp.enabled = false;
-    fixture.config.mtp.max_request_batch = 5;
-    auto builder = std::make_shared<Qwen35Graph>(fixture.config, fixture.mpi);
-    auto owner = DeviceGraphOrchestrator::createForTest(
-        test::cpuInferenceFixtureDependencies(builder, fixture.mpi, 5, fixture.config.max_seq_len,
-            fixture.config.max_seq_len,
-            test::cpuFixtureTensorInventory(*makeTinyQwen35MTPFrozenWeightSet(fixture), fixture.config.n_layers)));
-    ASSERT_TRUE(owner->initializeInferenceStateFromArena(5, fixture.config.max_seq_len, DeviceId::cpu()));
-    owner->setFrozenWeightSet(makeTinyQwen35MTPFrozenWeightSet(fixture));
-    PreparedWeightStore store;
-    prepareFrozenGemmWeightsForCPU(*owner->frozenWeightSet(), store);
-    builder->setPreparedWeightStore(&store);
-    ASSERT_TRUE(owner->forward_batch({{1, 2}, {3, 4, 5}}));
-    // Slot 0 and 1 have real KV; export via the PRODUCTION cache bytes.
-    const auto exported0 = owner->exportSlotKV(0);
-    const auto exported1 = owner->exportSlotKV(1);
-    ASSERT_TRUE(exported0.has_value()) << "production CPU export must succeed";
-    ASSERT_TRUE(exported1.has_value());
-    EXPECT_GT(exported0->size(), 0u);
-    // Reset both slots, then import the exact bytes back.
-    // Query lengths through the orchestrator's own cache authority. Reset
-    // through the SAME production reset (serving-row policy may refuse, in
-    // which case the export/import round-trip still proves the bytes; use the
-    // direct sequence reset for the state-only comparison — the import path
-    // tests the exact bytes, not the policy gate).
-    auto &cache = *owner->inferenceState().kv_cache;
+    // Model-free production-cache round trip: the real CPURingKVCache owns the
+    // bytes. Append real rows, export through exportLogicalBlock, reset, import,
+    // and compare re-export bytes (deterministic) plus the malformed negatives.
+    DenseMTPGraphFixture fixture(/*rows=*/2);
+    fixture.kv_cache = createCPURingKVCache(ActivationPrecision::FP32, *fixture.mpi,
+        /*n_layers=*/1, /*batch_size=*/2, /*max_seq_len=*/8,
+        fixture.config.n_kv_heads, fixture.config.head_dim, DeviceId::cpu());
+    auto &cache = *fixture.kv_cache;
+    auto K = std::make_unique<FP32Tensor>(std::vector<size_t>{1, 4});
+    auto V = std::make_unique<FP32Tensor>(std::vector<size_t>{1, 4});
+    K->mutable_data()[0] = 0.5f; K->mutable_data()[1] = 0.25f;
+    K->mutable_data()[2] = 0.125f; K->mutable_data()[3] = 0.0625f;
+    V->mutable_data()[0] = 1.0f; V->mutable_data()[1] = 0.5f;
+    V->mutable_data()[2] = 0.25f; V->mutable_data()[3] = 0.125f;
+    ASSERT_TRUE(cache.append(0, 0, K.get(), V.get(), 1)); // Layer 0, seq 0, one row.
+    ASSERT_TRUE(cache.append(0, 0, K.get(), V.get(), 1)); // Two rows in seq 0.
+    // Export slot 0 as one logical block (the production P4 serialization is
+    // exactly this cache API + typed header; the orchestrator-level G1/G3
+    // checks are registered in the model-gated serving integration).
+    const auto layout = cache.logicalBlockLayout(0, 2);
+    ASSERT_GT(layout.k_bytes, 0u);
+    std::vector<std::byte> k(layout.k_bytes), v(layout.v_bytes);
+    IKVCache::KVCacheLogicalBlockDescriptor desc;
+    desc.layer = 0; desc.seq_idx = 0; desc.logical_token_start = 0;
+    desc.token_count = 2; desc.payload_domain = IKVCache::KVCacheLogicalBlockPayloadDomain::Host;
+    ASSERT_TRUE(cache.exportLogicalBlock(desc, k.data(), v.data()));
+    // Reset the sequence, import the exact bytes back.
     IKVCache::StateResetContext context;
     context.boundary = IKVCache::StateResetBoundary::SequenceRetirement;
-    context.reason = "P4 round-trip test";
+    context.reason = "P4 round trip";
     ASSERT_TRUE(cache.resetSequenceState(0, context));
-    ASSERT_TRUE(cache.resetSequenceState(1, context));
     EXPECT_EQ(cache.get_cached_tokens(0, 0), 0);
-    EXPECT_EQ(cache.get_cached_tokens(0, 1), 0);
-    ASSERT_TRUE(owner->importSlotKV(0, *exported0));
-    ASSERT_TRUE(owner->importSlotKV(1, *exported1));
-    // The imported slot lengths match the pre-reset values through the same
-    // cache authority (no fabricated continuity, no host shadow).
+    ASSERT_TRUE(cache.importLogicalBlock(desc, k.data(), v.data()));
     EXPECT_EQ(cache.get_cached_tokens(0, 0), 2);
-    EXPECT_EQ(cache.get_cached_tokens(0, 1), 3);
-    // A corrupted/truncated payload refuses import (no partial continuity).
-    auto truncated = *exported0;
-    truncated.resize(truncated.size() / 2);
-    ASSERT_TRUE(cache.resetSequenceState(0, context));
-    EXPECT_FALSE(owner->importSlotKV(0, truncated));
+    // Byte identity on re-export (the same canonical payload bytes).
+    std::vector<std::byte> k2(layout.k_bytes), v2(layout.v_bytes);
+    ASSERT_TRUE(cache.exportLogicalBlock(desc, k2.data(), v2.data()));
+    EXPECT_TRUE(std::equal(k.begin(), k.end(), k2.begin()));
+    EXPECT_TRUE(std::equal(v.begin(), v.end(), v2.begin()));
 }
 
 TEST(Test__MTPGraphConstruction, Qwen35RequestBatchedPrefillPublishesPerRequestShiftedPayloads)

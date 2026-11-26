@@ -163,6 +163,9 @@ namespace llaminar2
             std::uint8_t k_precision = 0; ///< ActivationPrecision as uint8.
             std::uint8_t v_precision = 0;
         };
+        // NOTE: the packer serializes the six fields as explicit uint32 words
+        // (see exportSlotKV), never the struct bytes — no padding leaks into
+        // the manifest (deterministic replay).
         /** @brief Append one byte span to a packed continuation. */
         void appendBytes(std::vector<std::byte> &out, std::span<const std::byte> bytes)
         {
@@ -61751,23 +61754,45 @@ namespace llaminar2
     {
         // Export is a slot-KV authority operation, independent of the serving
         // row policy: the CPU ring cache owns the bytes. MTP draft caches and
-        // hybrid recurrent state are NOT carried (the continuation boundary
-        // refuses those rows at suspension anyway); a non-CPU or uninitialized
-        // runner cannot export.
+        // hybrid recurrent state are NOT carried (G2: recurrent state would be
+        // silently dropped and the restored row numerically wrong — refuse
+        // before mutation); a non-CPU or uninitialized runner cannot export.
         if (!state_.isInitialized() || !state_.kv_cache ||
             !state_.device_id.is_cpu() ||
             slot < 0 || slot >= state_.batch_size)
+        {
+            if (::getenv("LLAMINAR_B4_TRACE"))
+                ::fprintf(stderr, "B4 export refusal: init=%d cache=%d cpu=%d slot=%d/%d\n",
+                    state_.isInitialized(), state_.kv_cache != nullptr,
+                    state_.device_id.is_cpu(), slot, state_.batch_size);
             return std::nullopt;
+        }
+        if (dynamic_cast<const IHybridKVCache *>(state_.kv_cache.get()) != nullptr)
+        {
+            if (::getenv("LLAMINAR_B4_TRACE"))
+                ::fprintf(stderr, "B4 export refusal: hybrid\n");
+            return std::nullopt; // G2: recurrent/checkpoint state not carried.
+        }
         if (!state_.mtp_kv_caches.empty() ||
             (graph_builder_ && graph_builder_->config().mtp.enabled))
+        {
+            if (::getenv("LLAMINAR_B4_TRACE"))
+                ::fprintf(stderr, "B4 export refusal: mtp_caches=%zu mtp_enabled=%d\n",
+                    state_.mtp_kv_caches.size(),
+                    graph_builder_ ? graph_builder_->config().mtp.enabled : -1);
             return std::nullopt; // MTP continuation not carried (honest refusal).
+        }
+        if (dynamic_cast<const IHybridKVCache *>(state_.kv_cache.get()) != nullptr)
+            return std::nullopt; // G2: recurrent/checkpoint state not carried.
         const int layers = state_.kv_cache->n_layers();
         const int first_layer = state_.kv_cache->first_layer_index();
         std::vector<std::byte> packed;
+        std::uint32_t metadata_nonce = 0;
         // Typed per-layer header + native payload bytes. The RING CACHE is the
         // byte authority (exportLogicalBlock reads its canonical storage); no
         // host shadow exists — payloads are copied exactly as the cache exposes
-        // them, then re-imported through the same API.
+        // them, then re-imported through the same API. Header bytes are
+        // serialized FIELD-WISE (no uninitialized padding; deterministic).
         for (int layer = 0; layer < layers; ++layer)
         {
             const int global_layer = first_layer + layer;
@@ -61777,14 +61802,15 @@ namespace llaminar2
             const auto layout = state_.kv_cache->logicalBlockLayout(global_layer, state.cached_tokens);
             if (layout.k_bytes == 0 || layout.v_bytes == 0)
                 return std::nullopt;
-            LayerPackedHeader header;
-            header.global_layer = global_layer;
-            header.token_count = state.cached_tokens;
-            header.k_bytes = layout.k_bytes;
-            header.v_bytes = layout.v_bytes;
-            header.k_precision = static_cast<std::uint8_t>(layout.k_precision);
-            header.v_precision = static_cast<std::uint8_t>(layout.v_precision);
-            appendBytes(packed, std::as_bytes(std::span(&header, 1)));
+            // Deterministic fixed-width fields (no padding bytes serialized).
+            const std::uint32_t header_fields[6] = {
+                static_cast<std::uint32_t>(global_layer),
+                static_cast<std::uint32_t>(state.cached_tokens),
+                static_cast<std::uint32_t>(layout.k_bytes),
+                static_cast<std::uint32_t>(layout.v_bytes),
+                static_cast<std::uint32_t>(layout.k_precision),
+                static_cast<std::uint32_t>(layout.v_precision)};
+            appendBytes(packed, std::as_bytes(std::span(header_fields)));
             const std::size_t k_at = packed.size();
             packed.resize(k_at + layout.k_bytes + layout.v_bytes);
             IKVCache::KVCacheLogicalBlockDescriptor desc;
@@ -61809,35 +61835,103 @@ namespace llaminar2
         if (!state_.mtp_kv_caches.empty() ||
             (graph_builder_ && graph_builder_->config().mtp.enabled))
             return false; // MTP continuation not carried (honest refusal).
-        std::size_t at = 0;
-        const auto byte_view = [&](std::size_t count) -> std::span<const std::byte> {
-            if (at + count > bytes.size())
-                return {};
-            auto out = bytes.subspan(at, count);
-            at += count;
-            return out;
+        if (dynamic_cast<const IHybridKVCache *>(state_.kv_cache.get()) != nullptr)
+            return false; // G2: recurrent/checkpoint state not carried.
+        // G3: VALIDATE THE COMPLETE PAYLOAD BEFORE WRITING ANYTHING. Every
+        // header is checked against the cache's own layout (k_bytes/v_bytes
+        // must equal logicalBlockLayout(layer, token_count) exactly), the
+        // layer set must be the exact owned range in order (no duplicates,
+        // no gaps, no foreign layers), the precision must match, and every
+        // layer must carry the SAME length. A malformed or foreign payload
+        // refuses with the slot untouched.
+        struct ParsedLayer
+        {
+            int global_layer = 0;
+            int token_count = 0;
+            std::size_t k_bytes = 0;
+            std::size_t v_bytes = 0;
+            std::uint8_t k_precision = 0;
+            std::uint8_t v_precision = 0;
+            std::span<const std::byte> k;
+            std::span<const std::byte> v;
         };
+        std::vector<ParsedLayer> parsed;
+        const int layers = state_.kv_cache->n_layers();
+        const int first_layer = state_.kv_cache->first_layer_index();
+        std::size_t at = 0;
+        int expected_length = -1;
+        int next_expected_layer = first_layer;
         while (at < bytes.size())
         {
-            const auto header_view = byte_view(sizeof(LayerPackedHeader));
-            if (header_view.empty())
+            if (at + 6 * sizeof(std::uint32_t) > bytes.size())
+                return false; // Truncated header.
+            ParsedLayer entry;
+            const auto *fields = reinterpret_cast<const std::uint32_t *>(bytes.data() + at);
+            entry.global_layer = static_cast<int>(fields[0]);
+            entry.token_count = static_cast<int>(fields[1]);
+            entry.k_bytes = fields[2];
+            entry.v_bytes = fields[3];
+            entry.k_precision = static_cast<std::uint8_t>(fields[4]);
+            entry.v_precision = static_cast<std::uint8_t>(fields[5]);
+            at += 6 * sizeof(std::uint32_t);
+            // Exact ordered owned layer set: no gap, no duplicate, no foreign.
+            if (entry.global_layer != next_expected_layer)
                 return false;
-            LayerPackedHeader header;
-            std::memcpy(&header, header_view.data(), sizeof(header));
-            const auto k = byte_view(header.k_bytes);
-            const auto v = byte_view(header.v_bytes);
-            if (k.empty() && header.k_bytes != 0) return false;
-            if (v.empty() && header.v_bytes != 0) return false;
-            IKVCache::KVCacheLogicalBlockDescriptor desc;
-            desc.layer = header.global_layer;
-            desc.seq_idx = slot;
-            desc.logical_token_start = 0;
-            desc.token_count = header.token_count;
-            desc.payload_domain = IKVCache::KVCacheLogicalBlockPayloadDomain::Host;
-            if (!state_.kv_cache->importLogicalBlock(desc, k.data(), v.data()))
+            ++next_expected_layer;
+            if (entry.global_layer < first_layer || entry.global_layer >= first_layer + layers)
+                return false;
+            if (entry.token_count <= 0 || (expected_length >= 0 && entry.token_count != expected_length))
+                return false;
+            expected_length = entry.token_count;
+            // Precision must equal the cache's native precision.
+            const auto layout = state_.kv_cache->logicalBlockLayout(entry.global_layer, entry.token_count);
+            if (layout.k_bytes != entry.k_bytes || layout.v_bytes != entry.v_bytes ||
+                static_cast<std::uint8_t>(layout.k_precision) != entry.k_precision ||
+                static_cast<std::uint8_t>(layout.v_precision) != entry.v_precision)
+                return false;
+            if (at + entry.k_bytes + entry.v_bytes > bytes.size())
+                return false; // Payload extent beyond the span: refuse (G3).
+            entry.k = bytes.subspan(at, entry.k_bytes);
+            at += entry.k_bytes;
+            entry.v = bytes.subspan(at, entry.v_bytes);
+            at += entry.v_bytes;
+            parsed.push_back(entry);
+        }
+        if (parsed.empty() || next_expected_layer != first_layer + layers)
+            return false; // Missing layers: the export set must be complete.
+        // G3: the TARGET SLOT must be empty before install (reset first, then
+        // import). A stale slot would silently mix old and new state.
+        for (const auto &entry : parsed)
+        {
+            if (state_.kv_cache->sequenceState(entry.global_layer, slot).cached_tokens != 0)
                 return false;
         }
-        return at == bytes.size() && !bytes.empty();
+        // Commit: install every layer. Each import is the same validated
+        // extent, so a failure here is a backend defect (fail closed, reset).
+        for (const auto &entry : parsed)
+        {
+            IKVCache::KVCacheLogicalBlockDescriptor desc;
+            desc.layer = entry.global_layer;
+            desc.seq_idx = slot;
+            desc.logical_token_start = 0;
+            desc.token_count = entry.token_count;
+            desc.payload_domain = IKVCache::KVCacheLogicalBlockPayloadDomain::Host;
+            if (!state_.kv_cache->importLogicalBlock(desc, entry.k.data(), entry.v.data()))
+            {
+                // Fully validated; a backend refusal resets to keep the slot
+                // empty and honest (no partial install).
+                IKVCache::StateResetContext reset;
+                reset.boundary = IKVCache::StateResetBoundary::SequenceRetirement;
+                reset.reason = "import failure rollback";
+                (void)state_.kv_cache->resetSequenceState(slot, reset);
+                return false;
+            }
+        }
+        // G1: the slot's logical position follows the imported KV length under
+        // the SAME authority (never left at 0 against non-empty KV).
+        serving_slot_positions_.resize(static_cast<std::size_t>(state_.batch_size), 0);
+        serving_slot_positions_[static_cast<std::size_t>(slot)] = expected_length;
+        return true;
     }
 
     bool DeviceGraphOrchestrator::resetServingRow(int slot)
