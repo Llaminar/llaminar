@@ -346,6 +346,30 @@ namespace
     }
 } // namespace
 
+/** @test Engine-only cleanup: a foreign payload-directory entry refuses recovery and survives. */
+TEST(Test__DiskPrefixStorageBackend, ForeignPayloadEntryRefusesRecoveryAndSurvives)
+{
+    const auto dir = tempDir();
+    const auto payload = std::filesystem::path(archivePath(dir).string() + ".blocks");
+    std::filesystem::create_directories(payload);
+    const auto foreign = payload / "user-notes.txt";
+    {
+        std::ofstream out(foreign);
+        out << "not an engine payload";
+    }
+    std::string error;
+    DiskPrefixStorageBackend disk(archivePath(dir), 1024, kModelArtifactIdentity);
+    // A foreign (non-engine) entry must refuse recovery and must NEVER be
+    // unlinked: cleanup is engine-only, the archive never owns this file.
+    EXPECT_FALSE(disk.ready()) << disk.initializationError();
+    EXPECT_NE(disk.initializationError().find(foreign.filename().string()),
+        std::string::npos);
+    EXPECT_TRUE(std::filesystem::exists(foreign)); // Never deleted.
+    EXPECT_EQ(
+        (std::ifstream(foreign).rdbuf()->in_avail()),
+        static_cast<int>(std::string("not an engine payload").size()));
+}
+
 /**
  * @test Produce a retired archive through the actual current writer for the independent audit.
  *

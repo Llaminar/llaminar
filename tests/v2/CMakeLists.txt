@@ -16177,6 +16177,17 @@ add_v2_test(V2_Integration_PrefixCommittedIdentityPreservation
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_PrefixCommittedIdentityPreservation)
 
+# Engine-only cleanup (plan P3): a foreign payload-directory entry must refuse
+# recovery with a precise diagnostic and must NEVER be unlinked by the archive.
+add_v2_test(V2_Integration_PrefixArchiveEngineOnlyCleanup
+    COMMAND $<TARGET_FILE:v2_test_disk_prefix_storage_backend>
+        --gtest_filter=Test__DiskPrefixStorageBackend.ForeignPayloadEntryRefusesRecoveryAndSurvives
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;PrefixCache;Disk;Cleanup;Ownership;Regression"
+    MPI_PROCS 1 NO_MODELS NO_MPI TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+    V2_Integration_PrefixArchiveEngineOnlyCleanup)
+
 
 # Request-thread archive rewrites previously stalled a live ExpertOverlay
 # PREFILL follower. Exercise the actual background storage lifecycle, not a
