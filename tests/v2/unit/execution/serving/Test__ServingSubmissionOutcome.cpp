@@ -76,14 +76,15 @@ public:
         slot_kv_[slot] = {bytes.begin(), bytes.end()};
         return true;
     }
+    int resumed_length_ = -1; ///< -1 = derive from the expected (K3: harness supports mismatch).
+    void setResumedLength(int length) { resumed_length_ = length; }
     bool resumedSlotKVLength(int slot, int expected) const override
     {
-        // The harness tracks the byte extent it imported; its exported length
-        // is whatever the manifest declared (the real orchestrator compares
-        // the exact KV length). For the session contract, an import with
-        // capacity present is consistent.
+        // K3: the harness honors the EXACT expected length so the session's
+        // mismatch branch (rollback of a non-empty slot) is actually exercised.
         const auto it = slot_kv_.find(slot);
-        return it != slot_kv_.end() && !it->second.empty();
+        return it != slot_kv_.end() && !it->second.empty() &&
+            (resumed_length_ < 0 ? expected >= 0 : resumed_length_ == expected);
     }
     void setSlotKV(int slot, std::vector<std::byte> bytes) { slot_kv_[slot] = std::move(bytes); }
 private:
@@ -612,4 +613,27 @@ TEST(ServingSubmissionOutcome, ZeroQueueAcceptsOnlyDirect)
     EXPECT_EQ(session.submit(greedy(1), error), ServingSubmissionOutcome::Direct);
     // A second request has no slot and no queue: refused (backpressure typed).
     EXPECT_EQ(session.submit(greedy(2), error), ServingSubmissionOutcome::Refused);
+}
+
+
+/** @test K3: session length-mismatch rollback refuses restore and keeps the slot empty. */
+TEST(ServingSubmissionOutcome, SessionLengthMismatchRollsBackImport)
+{
+    ScriptedRows rows;
+    ServingSession session(rows, 32, 8);
+    std::string error;
+    ASSERT_TRUE(session.begin(1, 1, error, nullptr, 0));
+    rows.setSlotKV(0, {std::byte{1}, std::byte{2}, std::byte{3}});
+    EXPECT_EQ(session.submit(greedy(1), error), ServingSubmissionOutcome::Direct);
+    session.step();
+    auto manifest = session.suspend(1, error);
+    ASSERT_TRUE(manifest.has_value()) << error;
+    // The harness reports a WRONG imported length: restore must refuse and
+    // roll back the import (the slot stays free; no partial state).
+    rows.setResumedLength(manifest->content().cached_tokens + 5);
+    EXPECT_FALSE(session.restore(std::move(*manifest), error));
+    EXPECT_NE(error.find("length"), std::string::npos) << error;
+    EXPECT_EQ(session.occupancy().resident, 0);
+    // The slot is reusable (rollback reset it).
+    EXPECT_EQ(session.submit(greedy(2), error), ServingSubmissionOutcome::Direct);
 }

@@ -192,14 +192,35 @@ public:
         return next_version_ >= geometry_.issuance_budget;
     }
     /**
-     * @brief Resolve an exact typed pooled reference (P2 stage pool, J3).
-     * @param ref Authenticated reference naming THIS table's authority identity
-     * and a MONOTONIC publication version (never a bank index; banks are
-     * reused and COW publishes into other banks).
-     * @return A borrowed snapshot whose version matches @p ref exactly, or
-     * empty when the reference is foreign, superseded, retired, or the reader
-     * envelope is exhausted. The stage then fails; it never silently reads a
-     * different bank's (or version's) history.
+     * @brief Mint the exact typed reference of one live publication (owner only).
+     * @param snapshot A live Snapshot of THIS table (the owner holds it; the
+     * ref is minted from the publication, never hand-assembled).
+     * @param request_id Request identity that owns the slot binding.
+     * @param slot Request slot (identity metadata, never a bank).
+     * @return A typed ref naming this table's UNIQUE incarnation id, the
+     * snapshot's exact monotonic version and the request binding. A caller can
+     * never forge a ref for a different table or a different version.
+     */
+    PagedKVSnapshotRef refFor(const Snapshot &snapshot, std::uint64_t request_id, int slot) const
+    {
+        PagedKVSnapshotRef ref;
+        ref.authority_id = authority_identity_;
+        ref.publication_version = snapshot.version();
+        ref.request_id = request_id;
+        ref.slot = slot;
+        return ref;
+    }
+
+    /**
+     * @brief Resolve an exact typed pooled reference (P2 stage pool, J3/K1).
+     * @param ref Owner-minted reference naming THIS table's UNIQUE incarnation
+     * id and a MONOTONIC publication version (never a bank index) plus the
+     * request binding.
+     * @return A borrowed snapshot whose version AND request binding match
+     * @p ref exactly, or empty when the reference is foreign, superseded,
+     * retired, request-mismatched, or the reader envelope is exhausted. The
+     * stage then fails; it never silently reads a different bank's (or
+     * version's, or request's) history.
      */
     std::optional<Snapshot> resolveSnapshotRef(const PagedKVSnapshotRef &ref);
 
@@ -280,7 +301,7 @@ private:
     /** @brief Release a published bank only after its final borrower retires. */
     void releaseSnapshot(size_t bank, std::uint64_t version) noexcept;
     std::shared_ptr<PhysicalMemoryAuthority> authority_; ///< Original instance identity, not a separate budget.
-    std::uint64_t authority_identity_ = 0; ///< Authenticated authority id (J3).
+    std::uint64_t authority_identity_ = 0; ///< UNIQUE per-table incarnation id (process atomic, K1).
     CPUFP32PagedKVTableGeometry geometry_;
     std::uint64_t next_version_ = 0; ///< Monotonic across every bank, including aborted preparations.
     std::uint64_t reserved_outstanding_ = 0; ///< Sum of live reservation capacities.

@@ -9369,9 +9369,38 @@ TEST(MTPGraphConstruction, DenseOrchestratorSlotKVExportImportRoundTrip)
     ASSERT_TRUE(reexport.has_value());
     EXPECT_EQ(reexport->size(), exported->size());
     EXPECT_TRUE(std::equal(reexport->begin(), reexport->end(), exported->begin()));
-    // Length check through the session contract: the imported length must match.
+    // Length check through the session contract (BEFORE the next forward,
+    // which appends and grows the KV length).
     EXPECT_TRUE(runner.resumedSlotKVLength(0, 4));
     EXPECT_FALSE(runner.resumedSlotKVLength(0, 3)); // Mismatch refuses.
+    // K3: the NEXT forward after restore equals an UNINTERRUPTED control —
+    // the position (4) drives the RoPE at the same point, so the next logits
+    // are byte-identical to a run that never paused. Run the control first
+    // (the fixture is deterministic: same weights, same prompt/positions).
+    TinyQwenForwardFixture control_fixture(DeviceId::cpu(), KVCachePrecision::FP32);
+    control_fixture.config.mtp.enabled = false;
+    auto control_builder = std::make_shared<QwenStandardGraph>(control_fixture.config, control_fixture.mpi);
+    auto control_deps = cpuInferenceFixtureDependencies(control_builder, control_fixture.mpi, 1,
+        control_fixture.config.max_seq_len, control_fixture.config.max_seq_len,
+        cpuFixtureTensorInventory(control_fixture.modelWeights(), control_fixture.config.n_layers));
+    auto control_owner = DeviceGraphOrchestrator::createForTest(std::move(control_deps));
+    auto &control_runner = *control_owner;
+    ASSERT_TRUE(control_runner.initializeInferenceStateFromArena(1, control_fixture.config.max_seq_len,
+        DeviceId::cpu()));
+    control_runner.setWeights(control_fixture.modelWeights());
+    PreparedWeightStore control_store;
+    prepareDenseForwardWeights(control_runner, *control_builder, control_store, DeviceId::cpu());
+    ASSERT_NE(control_runner.forward(prompt.data(), 3, 1), nullptr);
+    ASSERT_NE(control_runner.forward(prompt.data() + 2, 1, 1), nullptr);
+    // Both runners are now at KV length 4 (the tested one via export/import).
+    const int32_t next_token = 9;
+    const auto *control_next = control_runner.forward(&next_token, 1, 1);
+    const auto *restored_next = runner.forward(&next_token, 1, 1);
+    ASSERT_NE(control_next, nullptr);
+    ASSERT_NE(restored_next, nullptr);
+    const std::size_t vocab = static_cast<std::size_t>(control_fixture.config.vocab_size);
+    EXPECT_EQ(std::memcmp(restored_next, control_next, vocab * sizeof(float)), 0)
+        << "the restored row's next forward must equal the uninterrupted control";
     // Negatives: truncated, foreign layer, precision mismatch, non-empty target.
     auto truncated = *exported;
     truncated.resize(6 * sizeof(std::uint64_t) + 4);
@@ -9390,4 +9419,42 @@ TEST(MTPGraphConstruction, DenseOrchestratorSlotKVExportImportRoundTrip)
     ASSERT_TRUE(runner.resetServingRow(0));
     EXPECT_FALSE(runner.importSlotKV(0, bad_precision));
     EXPECT_EQ(runner.inferenceState().kv_cache->get_cached_tokens(0, 0), 0);
+    // zero k_bytes: an extent of zero must refuse (no OOB read, no install).
+    auto zero_k = *exported;
+    std::memset(zero_k.data() + 2 * sizeof(std::uint64_t), 0, sizeof(std::uint64_t));
+    ASSERT_TRUE(runner.resetServingRow(0));
+    EXPECT_FALSE(runner.importSlotKV(0, zero_k));
+    EXPECT_EQ(runner.inferenceState().kv_cache->get_cached_tokens(0, 0), 0);
+    // short k_bytes (one byte less than the layout expects) must refuse.
+    auto short_k = *exported;
+    std::uint64_t reduced = 1;
+    std::memcpy(short_k.data() + 2 * sizeof(std::uint64_t), &reduced, sizeof(reduced));
+    ASSERT_TRUE(runner.resetServingRow(0));
+    EXPECT_FALSE(runner.importSlotKV(0, short_k));
+    EXPECT_EQ(runner.inferenceState().kv_cache->get_cached_tokens(0, 0), 0);
+    // duplicate layer: export the first entry twice -> the ordered-set check refuses.
+    const std::size_t first_entry = 6 * sizeof(std::uint64_t) +
+        (reexport->size() - 6 * sizeof(std::uint64_t)) / 2; // First layer + payload.
+    std::vector<std::byte> duplicated(exported->begin(), exported->end());
+    duplicated.insert(duplicated.begin() + 6 * sizeof(std::uint64_t),
+        exported->begin() + 6 * sizeof(std::uint64_t),
+        exported->begin() + 6 * sizeof(std::uint64_t) + 6 * sizeof(std::uint64_t));
+    (void)first_entry;
+    ASSERT_TRUE(runner.resetServingRow(0));
+    EXPECT_FALSE(runner.importSlotKV(0, duplicated));
+    EXPECT_EQ(runner.inferenceState().kv_cache->get_cached_tokens(0, 0), 0);
+    // missing layer: drop the trailing layer completely (set its header count to 0)
+    // -> the exact owned-set completeness check refuses.
+    // (The tiny fixture has ONE layer; dropping it means an empty set.)
+    auto missing = *exported;
+    missing.resize(6 * sizeof(std::uint64_t)); // Keep only the header, no payload.
+    ASSERT_TRUE(runner.resetServingRow(0));
+    EXPECT_FALSE(runner.importSlotKV(0, missing));
+    EXPECT_EQ(runner.inferenceState().kv_cache->get_cached_tokens(0, 0), 0);
+    // non-empty target: importing into a slot that still has KV must refuse.
+    ASSERT_TRUE(runner.importSlotKV(0, *exported)); // Slot 0 now non-empty.
+    EXPECT_FALSE(runner.importSlotKV(0, *exported));
+    ASSERT_TRUE(runner.resetServingRow(0));
+    // hybrid refusal: the orchestrator refuses when its cache is IHybridKVCache
+    // (covered by the G2 regression in the hybrid test subclass).
 }

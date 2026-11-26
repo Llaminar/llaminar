@@ -1427,6 +1427,19 @@ namespace llaminar2
                 pooled_ok = false;
                 LOG_ERROR("[AttentionComputeStage] Pooled snapshot reference belongs to another table");
             }
+            else if (params_.kv_rotation != nullptr)
+            {
+                // K2: rotating Q without rotating the pooled K/V pages would
+                // multiply unrotated references and silently corrupt attention.
+                pooled_ok = false;
+                LOG_ERROR("[AttentionComputeStage] Pooled snapshot mode does not support KV rotation");
+            }
+            else if (params_.active_query_rows_device != nullptr)
+            {
+                // Any device-owned row-transform is unsupported for pooled pages.
+                pooled_ok = false;
+                LOG_ERROR("[AttentionComputeStage] Pooled snapshot mode does not support device query-row transforms");
+            }
         }
         const bool gpu_grouped_request_decode =
             !pooled_mode &&

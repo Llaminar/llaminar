@@ -3,6 +3,7 @@
  * @brief Stable PMA table metadata and atomic nonempty CPU snapshot publication.
  */
 #include "CPUFP32PagedKVTable.h"
+#include <atomic>
 #include <limits>
 #include <new>
 #include <utility>
@@ -50,11 +51,20 @@ std::shared_ptr<CPUFP32PagedKVTable> CPUFP32PagedKVTable::create(std::shared_ptr
     if (!authority || !device.is_cpu()) throw std::invalid_argument("CPU page table requires its original PMA CPU allocator");
     return std::shared_ptr<CPUFP32PagedKVTable>(new CPUFP32PagedKVTable(std::move(authority), device, geometry, placement));
 }
+namespace
+{
+    /** @brief Process-wide atomic table incarnation counter (K1: unique, non-zero). */
+    std::atomic<std::uint64_t> &nextTableIncarnation()
+    {
+        static std::atomic<std::uint64_t> counter{0};
+        return counter;
+    }
+} // namespace
+
 CPUFP32PagedKVTable::CPUFP32PagedKVTable(std::shared_ptr<PhysicalMemoryAuthority> authority, DeviceId device,
     CPUFP32PagedKVTableGeometry geometry, CPUStoragePlacement placement)
     : authority_(authority), geometry_(geometry), authority_identity_(
-          reinterpret_cast<std::uintptr_t>(authority.get()) ^
-          static_cast<std::uintptr_t>(device.type))
+          nextTableIncarnation().fetch_add(1, std::memory_order_relaxed) + 1)
 {
     (void)physicalBytes(geometry, device, placement);
     static_assert(alignof(CPUFP32KVPage) <= AlignedVector<std::byte>::ALIGNMENT);
@@ -408,7 +418,9 @@ std::optional<CPUFP32PagedKVTable::Snapshot> CPUFP32PagedKVTable::resolveSnapsho
     const PagedKVSnapshotRef &ref)
 {
     if (!ref.valid() || ref.authority_id != authority_identity_)
-        return std::nullopt; // Foreign authority: refuse (never a different table).
+        return std::nullopt; // Foreign incarnation: refuse (never a different table).
+    if (ref.request_id == 0)
+        return std::nullopt; // K1: request binding is mandatory (never a bare ref).
     for (std::size_t bank = 0; bank < banks_.size(); ++bank)
     {
         auto &state = banks_[bank];
