@@ -16127,6 +16127,12 @@ add_v2_test(V2_Integration_PagedKVInstancePlan
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;PagedKV;Instance;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PagedKVInstancePlan)
+add_v2_test(V2_Integration_PagedKVInstanceContract
+    COMMAND $<TARGET_FILE:v2_test_physical_memory_authority>
+        --gtest_filter=PagedKVInstance.*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;PagedKV;Instance;Admission;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PagedKVInstanceContract)
 add_v2_test(V2_Integration_PagedKVTierConfig
     COMMAND $<TARGET_FILE:v2_test_paged_kv_tier_config>
         --gtest_filter=PagedKVTierConfig.*
@@ -30448,6 +30454,8 @@ add_executable(v2_test_physical_memory_authority
     unit/planning/Test__PhysicalPagePoolSharing.cpp
     unit/planning/Test__PagedKVPoolGeometry.cpp
     unit/planning/Test__PagedKVInstancePlan.cpp
+    unit/planning/Test__PagedKVInstance.cpp
+    unit/planning/Test__PagedKVInstance.cpp
     unit/planning/Test__CompletionWitness.cpp
     unit/planning/Test__PageTableAdmission.cpp
     unit/planning/Test__PhysicalMemoryRankHostPool.cpp

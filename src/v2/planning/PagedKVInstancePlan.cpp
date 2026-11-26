@@ -59,9 +59,13 @@ std::optional<PagedKVInstancePlan> planPagedKVInstance(
     PagedKVInstancePlan plan;
     plan.pool_geometry = pool->geometry;
     plan.table_geometry = table_geometry;
-    if (table_bytes > std::numeric_limits<std::size_t>::max() - pool->budget_bytes)
+    // The complete BOM is priced by the FACTORIES (exact object/allocator
+    // overhead), never by the raw frame-product estimate: PMA charges what
+    // the pool and table actually materialize, and admission must match it.
+    const auto pool_bytes = PhysicalPagePool::physicalBytes(pool->geometry, device, placement);
+    if (table_bytes > std::numeric_limits<std::size_t>::max() - pool_bytes)
         throw std::overflow_error("Paged KV instance complete BOM overflows");
-    plan.total_bytes = pool->budget_bytes + table_bytes;
+    plan.total_bytes = pool_bytes + table_bytes;
     return plan;
 }
 } // namespace llaminar2
