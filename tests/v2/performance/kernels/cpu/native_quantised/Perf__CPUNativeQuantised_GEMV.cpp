@@ -1905,10 +1905,10 @@ namespace
         // Secondary source-factor words are integer metadata, never FP16
         // minima. Construct them through the same codecs as the source packer;
         // their reserved bits must remain zero even for symmetric formats.
-        const uint16_t secondary_word = packed.usesIQ3SExpandedSourceScale()
-            ? native_quantised_iq3s_scale::encodeSourceCoefficient(7)
-            : packed.usesNibbleLUTSourceScale()
-                ? native_quantised_iq4xs_scale::encodeSourceCoefficient(35)
+        const uint16_t secondary_word = packed.usesNibbleLUTSourceScale()
+            ? (packed.codebook_id == 11
+                ? native_quantised_iq3s_scale::encodeSourceCoefficient(7)
+                : native_quantised_iq4xs_scale::encodeSourceCoefficient(35))
                 : packed.usesQ6KNativeDualScale()
                     ? native_quantised_q6_scale::pack(1, -1)
                     : packed.codebook_id == 13 && packed.usesCompactMultiScale()
@@ -1958,7 +1958,6 @@ namespace
                     ? reinterpret_cast<uint16_t *>(
                           block + packed.data_stride + 128)
                     : (packed.is_asymmetric ||
-                       packed.usesIQ3SExpandedSourceScale() ||
                        packed.usesNibbleLUTSourceScale())
                         ? reinterpret_cast<uint16_t *>(
                               block + packed.data_stride + 256)
@@ -2567,7 +2566,6 @@ namespace
                     const uint16_t *minima =
                         (evidence.is_asymmetric ||
                          evidence.usesQ6KNativeDualScale() ||
-                         evidence.usesIQ3SExpandedSourceScale() ||
                          evidence.usesNibbleLUTSourceScale() ||
                          evidence.usesCompactMultiScale())
                         ? evidence.chunkMins(chunk, block)
@@ -2580,10 +2578,10 @@ namespace
                         if (minima)
                         {
                             const uint16_t expected_secondary =
-                                evidence.usesIQ3SExpandedSourceScale()
-                                    ? native_quantised_iq3s_scale::encodeSourceCoefficient(7)
-                                    : evidence.usesNibbleLUTSourceScale()
-                                        ? native_quantised_iq4xs_scale::encodeSourceCoefficient(35)
+                                evidence.usesNibbleLUTSourceScale()
+                                    ? (evidence.codebook_id == 11
+                                        ? native_quantised_iq3s_scale::encodeSourceCoefficient(7)
+                                        : native_quantised_iq4xs_scale::encodeSourceCoefficient(35))
                                         : evidence.usesQ6KNativeDualScale()
                                             ? native_quantised_q6_scale::pack(1, -1)
                                             : evidence.codebook_id == 13 && evidence.usesCompactMultiScale()
@@ -2626,9 +2624,7 @@ namespace
                 [&](const FormatSpec &format) { return format.name == name; });
             ASSERT_NE(found, MTP_SMALL_M_FORMATS.end());
             auto packed = createDispatchEvidencePackedWeightsForFormat(*found, N, K);
-            ASSERT_EQ(packed.encoding, name == "IQ3_S"
-                ? CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale
-                : CPUNativeQuantisedEncoding::NibbleLUTSourceScale);
+            ASSERT_EQ(packed.encoding, CPUNativeQuantisedEncoding::NibbleLUTSourceScale);
             for (int chunk = 0; chunk < packed.N_padded / 64; ++chunk)
                 for (int block = 0; block < packed.blocks_per_row; ++block)
                     for (int column = 0; column < 64; ++column)
@@ -2670,11 +2666,11 @@ namespace
                 secondary[0] |= 0x10u;
                 EXPECT_THROW((void)packed.blockScale(0, 0, 0), std::invalid_argument);
 #if defined(__AVX2__)
-                EXPECT_THROW((void)packed.loadScales256(packed.chunkScales(0, 0)),
+                EXPECT_THROW((void)loadScales256(packed, packed.chunkScales(0, 0)),
                              std::invalid_argument);
 #endif
 #if defined(__AVX512F__)
-                EXPECT_THROW((void)packed.loadScales512(packed.chunkScales(0, 0)),
+                EXPECT_THROW((void)loadScales512(packed, packed.chunkScales(0, 0)),
                              std::invalid_argument);
 #endif
             }

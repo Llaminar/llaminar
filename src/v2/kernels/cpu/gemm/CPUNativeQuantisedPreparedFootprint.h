@@ -32,8 +32,10 @@ namespace llaminar2::cpu::native_quantised
         ExpandedInt8 = 1,       ///< One prepared signed byte per logical weight.
         Q6KNativeDualScale = 2, ///< Six-bit payload, original half base, two int8 coefficients.
         CompactMultiScale = 3, ///< Native payload, two scales, optional two minima.
-        NibbleLUTSourceScale = 4, ///< IQ4_XS nibble payload, original half base, raw coefficient.
-        IQ3SExpandedSourceScale = 5, ///< Original IQ3_S signed grid, base and raw nibble.
+        NibbleLUTSourceScale = 4, ///< IQ4_XS / IQ3_S nibble payload, original half base, raw coefficient.
+        CompactFiveBit = 6, ///< Five-bit low-nibble + high-mask planes, scales, optional minima (Q5_0/Q5_1/Q5_K).
+        UnsignedNibble = 7, ///< Four-bit unsigned nibble payload, scales, optional minima, zero inline comp (Q4_0/Q4_1/Q4_K).
+        UnsignedInt8 = 8, ///< Eight-bit unsigned (w_i8 ^ 0x80) payload, scales, optional minima, zero inline comp (Q8_0/Q8_1/Q8_K).
     };
 
     /**
@@ -50,10 +52,12 @@ namespace llaminar2::cpu::native_quantised
         {
         case CPUNativeQuantisedEncoding::NibbleLUT:
         case CPUNativeQuantisedEncoding::NibbleLUTSourceScale:
-        case CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale:
         case CPUNativeQuantisedEncoding::ExpandedInt8:
         case CPUNativeQuantisedEncoding::Q6KNativeDualScale:
         case CPUNativeQuantisedEncoding::CompactMultiScale:
+        case CPUNativeQuantisedEncoding::CompactFiveBit:
+        case CPUNativeQuantisedEncoding::UnsignedNibble:
+        case CPUNativeQuantisedEncoding::UnsignedInt8:
             return true;
         }
         return false;
@@ -74,12 +78,15 @@ namespace llaminar2::cpu::native_quantised
         case CPUNativeQuantisedEncoding::NibbleLUT:
         case CPUNativeQuantisedEncoding::NibbleLUTSourceScale:
         case CPUNativeQuantisedEncoding::CompactMultiScale:
+        case CPUNativeQuantisedEncoding::UnsignedNibble:
             return 1024;
         case CPUNativeQuantisedEncoding::ExpandedInt8:
-        case CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale:
+        case CPUNativeQuantisedEncoding::UnsignedInt8:
             return 2048;
         case CPUNativeQuantisedEncoding::Q6KNativeDualScale:
             return 1536;
+        case CPUNativeQuantisedEncoding::CompactFiveBit:
+            return 1280;
         }
         return 0;
     }
@@ -98,14 +105,16 @@ namespace llaminar2::cpu::native_quantised
             return 0;
         if (encoding == CPUNativeQuantisedEncoding::NibbleLUTSourceScale)
             return 1408;
-        if (encoding == CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale)
-            return 2432;
         if (encoding == CPUNativeQuantisedEncoding::Q6KNativeDualScale)
             return 1792;
         // A fixed padded native payload plus two scale vectors and one optional
         // effective-minimum vector. Unused bytes are zero, not another ledger.
         if (encoding == CPUNativeQuantisedEncoding::CompactMultiScale)
             return 1536;
+        if (encoding == CPUNativeQuantisedEncoding::CompactFiveBit ||
+            encoding == CPUNativeQuantisedEncoding::UnsignedNibble ||
+            encoding == CPUNativeQuantisedEncoding::UnsignedInt8)
+            return data_stride + 128u + (is_asymmetric ? 128u : 0u);
         return data_stride + 256u + (is_asymmetric ? 128u : 0u);
     }
 

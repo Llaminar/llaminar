@@ -358,28 +358,31 @@ namespace llaminar2
 
     bool ExpertTierGpuPeerTransferLane::start(
         const GpuExpertPackedDescriptor& source,const GpuExpertPackedDescriptor& destination,
-        const ExpertTierSourceReadiness& source_readiness,std::string* error) noexcept
+        const ExpertTierSourceReadiness& source_readiness,std::string* error,
+        ExpertTierDeviceTimingCapture timing_capture) noexcept
     {
         ExpertTierGpuBlobChunkProtocol protocol(std::numeric_limits<std::size_t>::max());
         if(!protocol.begin(source,destination,error))return false;
-        return startRegions(source.ptrs,destination.ptrs,protocol,source_readiness,error);
+        return startRegions(source.ptrs,destination.ptrs,protocol,source_readiness,error,timing_capture);
     }
 
     bool ExpertTierGpuPeerTransferLane::start(
         const GpuExpertPackedDescriptor& source,const GpuExpertPackedDescriptor& destination,
         const ExpertTierWeightProjectionIntersection& intersection,
-        const ExpertTierSourceReadiness& source_readiness,std::string* error) noexcept
+        const ExpertTierSourceReadiness& source_readiness,std::string* error,
+        ExpertTierDeviceTimingCapture timing_capture) noexcept
     {
         ExpertTierGpuBlobChunkProtocol protocol(std::numeric_limits<std::size_t>::max());
         if(!protocol.begin(source,destination,intersection,error))return false;
-        return startRegions(source.ptrs,destination.ptrs,protocol,source_readiness,error);
+        return startRegions(source.ptrs,destination.ptrs,protocol,source_readiness,error,timing_capture);
     }
 
     bool ExpertTierGpuPeerTransferLane::startFloating(
         const ContiguousFloatingPointWeightDescriptor& source,
         const ContiguousFloatingPointWeightDescriptor& destination,
         const ExpertTierWeightProjectionIntersection& intersection,
-        const ExpertTierSourceReadiness& source_readiness,std::string* error) noexcept
+        const ExpertTierSourceReadiness& source_readiness,std::string* error,
+        ExpertTierDeviceTimingCapture timing_capture) noexcept
     {
         ExpertTierGpuBlobChunkProtocol protocol(std::numeric_limits<std::size_t>::max());
         if(!source.valid() || !destination.valid() || source.type!=destination.type ||
@@ -391,12 +394,13 @@ namespace llaminar2
         GPUExpertPointers source_regions,destination_regions;
         source_regions.d_vnni=static_cast<uint8_t*>(const_cast<void*>(source.data));
         destination_regions.d_vnni=static_cast<uint8_t*>(const_cast<void*>(destination.data));
-        return startRegions(source_regions,destination_regions,protocol,source_readiness,error);
+        return startRegions(source_regions,destination_regions,protocol,source_readiness,error,timing_capture);
     }
 
     bool ExpertTierGpuPeerTransferLane::startContiguous(
         const void* source,void* destination,std::size_t bytes,
-        const ExpertTierSourceReadiness& source_readiness,std::string* error) noexcept
+        const ExpertTierSourceReadiness& source_readiness,std::string* error,
+        ExpertTierDeviceTimingCapture timing_capture) noexcept
     {
         ExpertTierGpuBlobChunkProtocol protocol(std::numeric_limits<std::size_t>::max());
         if(!source || !destination || !protocol.beginContiguous(bytes,error)) {
@@ -405,7 +409,7 @@ namespace llaminar2
         GPUExpertPointers source_regions,destination_regions;
         source_regions.d_vnni=static_cast<uint8_t*>(const_cast<void*>(source));
         destination_regions.d_vnni=static_cast<uint8_t*>(destination);
-        return startRegions(source_regions,destination_regions,protocol,source_readiness,error);
+        return startRegions(source_regions,destination_regions,protocol,source_readiness,error,timing_capture);
     }
 
     bool ExpertTierGpuPeerTransferLane::startRegions(
@@ -413,7 +417,8 @@ namespace llaminar2
         const GPUExpertPointers &destination,
         ExpertTierGpuBlobChunkProtocol& protocol,
         const ExpertTierSourceReadiness &source_readiness,
-        std::string *error) noexcept
+        std::string *error,
+        ExpertTierDeviceTimingCapture timing_capture) noexcept
     {
         const AmbientGpuDeviceGuard ambient_device(
             config_.destination_device);
@@ -426,6 +431,18 @@ namespace llaminar2
             progress_ == ExpertTierGpuPeerTransferProgress::Failed)
         {
             assignPeerError(error, "GPU peer tier lane is already occupied");
+            return false;
+        }
+
+        const bool enable_timing =
+            timing_capture == ExpertTierDeviceTimingCapture::Enabled ||
+            (timing_capture == ExpertTierDeviceTimingCapture::LaneDefault &&
+             config_.collect_timing_measurements);
+        if (enable_timing && !config_.collect_timing_measurements)
+        {
+            assignPeerError(
+                error,
+                "GPU peer tier lane was not materialized with device timing events");
             return false;
         }
 
@@ -451,9 +468,10 @@ namespace llaminar2
             ++stats_.published_bank_sources;
         }
 
+        active_timing_enabled_ = enable_timing;
         transfer_started_at_ = std::chrono::steady_clock::now();
         bool timing_started = true;
-        if (config_.collect_timing_measurements)
+        if (active_timing_enabled_)
         {
             timing_started = backend_->recordEvent(
                 timing_start_event_,
@@ -480,7 +498,7 @@ namespace llaminar2
                 config_.source_device,config_.destination_device,chunk->bytes,0,0,0,transfer_stream_);
         }
         bool timing_stopped = true;
-        if (config_.collect_timing_measurements)
+        if (active_timing_enabled_)
         {
             timing_stopped = backend_->recordEvent(
                 timing_stop_event_,
@@ -557,7 +575,7 @@ namespace llaminar2
         const std::uint64_t wall_nanoseconds = static_cast<std::uint64_t>(
             std::max<std::int64_t>(1, elapsed.count()));
         std::uint64_t device_nanoseconds = 0;
-        if (config_.collect_timing_measurements)
+        if (active_timing_enabled_)
         {
             float elapsed_ms = 0.0F;
             if (!backend_->eventElapsedTimeMs(
@@ -609,7 +627,7 @@ namespace llaminar2
             "maintenance",
             config_.perf_device,
             tags);
-        if (config_.collect_timing_measurements)
+        if (active_timing_enabled_)
         {
             PerfStatsCollector::recordTimingNs(
                 "moe_overlay_residency",

@@ -16,6 +16,7 @@
 
 #include "../../../execution/moe/CanonicalMoERouteRecord.h"
 #include "../primitives/VectorPrimitives.h"
+#include "../../../tensors/SIMDHelpers.h"
 #include "../../../utils/OpenMPUtils.h"
 
 #include <algorithm>
@@ -23,18 +24,22 @@
 #include <cstddef>
 #include <limits>
 #include <omp.h>
+#if defined(__AVX512F__)
+#include <immintrin.h>
+#endif
 
 namespace llaminar2::cpu::moe
 {
     namespace
     {
         /**
-         * Keep a tiny fold on the caller when its complete arithmetic fits in
-         * roughly one decode-sized hidden-row transaction. Skipping a parallel
-         * region leaves an existing libgomp pool intact; unlike a bounded team,
-         * it cannot force the next full-socket GEMM to recreate workers.
+         * Keep small decode/MTP folds on the caller thread so we never pay a
+         * ~65 us multi-core OpenMP barrier to add a few tens of kilobytes of
+         * FP32 vectors (which finish in ~1-4 us single-threaded with AVX-512).
+         * Skipping a parallel region also leaves an existing libgomp pool
+         * intact; prefill buckets (M >= 64) still use the full OpenMP team.
          */
-        constexpr size_t kCallerThreadFMAThreshold = 16u * 1024u;
+        constexpr size_t kCallerThreadFMAThreshold = 64u * 1024u;
 
         /**
          * Column boundaries are rounded to the widest compiled FP32 vector.
@@ -379,14 +384,129 @@ namespace llaminar2::cpu::moe
                             primitives::vec_add(destination,destination,
                                 partialRow(participant,slot,static_cast<size_t>(first)),count);
                     }
-                    primitives::vec_add(destination,
-                        last==1?partialRow(0,slot,static_cast<size_t>(first)):destination,
-                        partialRow(last,slot,static_cast<size_t>(first)),count);
-                    float *const weighted=w.values.data()+
-                        static_cast<size_t>(w.destination_slots[entry])*columns+static_cast<size_t>(first);
-                    const float factor=w.weights[entry];
-                    for(int column=0;column<count;++column)
-                        weighted[column]=destination[column]*factor;
+                    const float *const lhs = last == 1
+                        ? partialRow(0, slot, static_cast<size_t>(first))
+                        : destination;
+                    const float *const rhs = partialRow(last, slot, static_cast<size_t>(first));
+                    float *const weighted = w.values.data() +
+                        static_cast<size_t>(w.destination_slots[entry]) * columns + static_cast<size_t>(first);
+                    const float factor = w.weights[entry];
+                    const bool skip_dest = w.skip_combined_store && (last == 1);
+                    int column = 0;
+#if defined(__AVX512F__)
+                    if (activeISALevel() >= ISALevel::AVX512)
+                    {
+                        // Pin lhs as the first AVX-512 operand (src1) and rhs as src2
+                        // matching vec_add_avx512's exact compiled instruction so GCC
+                        // cannot commute operands and reverse NaN+NaN payload selection.
+                        const auto ordered_add = [](const float *a, const float *b) noexcept -> __m512 {
+                            const __m512 va = _mm512_loadu_ps(a);
+                            const __m512 vb = _mm512_loadu_ps(b);
+                            __m512 sum;
+                            asm("vaddps %2, %1, %0" : "=v"(sum) : "v"(va), "v"(vb));
+                            return sum;
+                        };
+                        const __m512 vfactor = _mm512_set1_ps(factor);
+                        // Stream cold unconsumed combined_routes scratch when aligned.
+                        // For preweighted output: keep cacheable stores when same-socket
+                        // so GPU PCIe DMA hits L3 DDIO, and use non-temporal streams when
+                        // targeting a remote NUMA node to avoid cross-UPI L3 HitM snoops.
+                        // Match vec_add_avx512's exact 32-float loop stride and operand order
+                        // so finite and NaN lanes remain bitwise identical to primitives::vec_add.
+                        const bool stream_dest = !skip_dest && (last == 1) &&
+                            ((reinterpret_cast<std::uintptr_t>(destination) & 63u) == 0u);
+                        const bool stream_weighted =
+                            (w.store_locality == PreweightedStoreLocality::CrossSocketStreaming) &&
+                            ((reinterpret_cast<std::uintptr_t>(weighted) & 63u) == 0u);
+                        const int count32 = count & ~31;
+                        if (skip_dest && stream_weighted)
+                        {
+                            for (; column < count32; column += 32)
+                            {
+                                const __m512 sum0 = ordered_add(lhs + column, rhs + column);
+                                const __m512 sum1 = ordered_add(lhs + column + 16, rhs + column + 16);
+                                _mm512_stream_ps(weighted + column, _mm512_mul_ps(sum0, vfactor));
+                                _mm512_stream_ps(weighted + column + 16, _mm512_mul_ps(sum1, vfactor));
+                            }
+                        }
+                        else if (skip_dest)
+                        {
+                            for (; column < count32; column += 32)
+                            {
+                                const __m512 sum0 = ordered_add(lhs + column, rhs + column);
+                                const __m512 sum1 = ordered_add(lhs + column + 16, rhs + column + 16);
+                                _mm512_storeu_ps(weighted + column, _mm512_mul_ps(sum0, vfactor));
+                                _mm512_storeu_ps(weighted + column + 16, _mm512_mul_ps(sum1, vfactor));
+                            }
+                        }
+                        else if (stream_dest && stream_weighted)
+                        {
+                            for (; column < count32; column += 32)
+                            {
+                                const __m512 sum0 = ordered_add(lhs + column, rhs + column);
+                                const __m512 sum1 = ordered_add(lhs + column + 16, rhs + column + 16);
+                                _mm512_stream_ps(destination + column, sum0);
+                                _mm512_stream_ps(destination + column + 16, sum1);
+                                _mm512_stream_ps(weighted + column, _mm512_mul_ps(sum0, vfactor));
+                                _mm512_stream_ps(weighted + column + 16, _mm512_mul_ps(sum1, vfactor));
+                            }
+                        }
+                        else if (stream_dest)
+                        {
+                            for (; column < count32; column += 32)
+                            {
+                                const __m512 sum0 = ordered_add(lhs + column, rhs + column);
+                                const __m512 sum1 = ordered_add(lhs + column + 16, rhs + column + 16);
+                                _mm512_stream_ps(destination + column, sum0);
+                                _mm512_stream_ps(destination + column + 16, sum1);
+                                _mm512_storeu_ps(weighted + column, _mm512_mul_ps(sum0, vfactor));
+                                _mm512_storeu_ps(weighted + column + 16, _mm512_mul_ps(sum1, vfactor));
+                            }
+                        }
+                        else if (stream_weighted)
+                        {
+                            for (; column < count32; column += 32)
+                            {
+                                const __m512 sum0 = ordered_add(lhs + column, rhs + column);
+                                const __m512 sum1 = ordered_add(lhs + column + 16, rhs + column + 16);
+                                _mm512_storeu_ps(destination + column, sum0);
+                                _mm512_storeu_ps(destination + column + 16, sum1);
+                                _mm512_stream_ps(weighted + column, _mm512_mul_ps(sum0, vfactor));
+                                _mm512_stream_ps(weighted + column + 16, _mm512_mul_ps(sum1, vfactor));
+                            }
+                        }
+                        else
+                        {
+                            for (; column < count32; column += 32)
+                            {
+                                const __m512 sum0 = ordered_add(lhs + column, rhs + column);
+                                const __m512 sum1 = ordered_add(lhs + column + 16, rhs + column + 16);
+                                _mm512_storeu_ps(destination + column, sum0);
+                                _mm512_storeu_ps(destination + column + 16, sum1);
+                                _mm512_storeu_ps(weighted + column, _mm512_mul_ps(sum0, vfactor));
+                                _mm512_storeu_ps(weighted + column + 16, _mm512_mul_ps(sum1, vfactor));
+                            }
+                        }
+                    }
+#endif
+                    if (column < count)
+                    {
+                        // Preserve exact primitives::vec_add compiled NaN operand selection
+                        // and ISA dispatch on scalar tails and non-AVX512 tiers.
+                        const int rem = count - column;
+                        if (skip_dest)
+                        {
+                            primitives::vec_add(weighted + column, lhs + column, rhs + column, rem);
+                            for (int i = 0; i < rem; ++i)
+                                weighted[column + i] *= factor;
+                        }
+                        else
+                        {
+                            primitives::vec_add(destination + column, lhs + column, rhs + column, rem);
+                            for (int i = 0; i < rem; ++i)
+                                weighted[column + i] = destination[column + i] * factor;
+                        }
+                    }
                 }
             }
         };
@@ -400,6 +520,10 @@ namespace llaminar2::cpu::moe
             };
             OMP_WORKSHARE_REGION(work);
         }
+#if defined(__AVX512F__)
+        if (args.preweighted_output)
+            _mm_sfence();
+#endif
         return true;
     }
 

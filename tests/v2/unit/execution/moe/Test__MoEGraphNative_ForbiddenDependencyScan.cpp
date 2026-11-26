@@ -12,6 +12,7 @@
  */
 
 #include <gtest/gtest.h>
+#include "../../SourceShardReader.h"
 #include "execution/moe/DeviceMoERebalanceABI.h"
 
 #include <algorithm>
@@ -97,13 +98,7 @@ namespace llaminar2::test
 
         std::string readFile(const fs::path &path)
         {
-            std::ifstream input(path);
-            if (!input)
-                return {};
-
-            std::ostringstream buffer;
-            buffer << input.rdbuf();
-            return buffer.str();
+            return llaminar2::test_support::readSourceFileOrFamily(path);
         }
 
         /**
@@ -1934,9 +1929,9 @@ namespace llaminar2::test
         ASSERT_NE(helper, std::string::npos)
             << "CUDA decode runtime routing should share the block-wide top-k helper.";
 
-        const size_t begin = cuda.find("__global__ void softmax_topk_decode_runtime_kernel(");
+        const size_t begin = cuda.find("void softmax_topk_decode_runtime_body(");
         ASSERT_NE(begin, std::string::npos);
-        const size_t end = cuda.find("__global__ void decode_route_select_runtime_kernel(", begin);
+        const size_t end = cuda.find("void softmax_topk_decode_independent_body(", begin);
         ASSERT_NE(end, std::string::npos);
         const std::string body = cuda.substr(begin, end - begin);
 
@@ -2927,7 +2922,11 @@ namespace llaminar2::test
         ASSERT_NE(ffn_start, std::string::npos);
         const size_t set_terminal = contents.find("graph.setTerminalNode(ffn_terminal)", ffn_start);
         ASSERT_NE(set_terminal, std::string::npos);
-        const std::string ffn_body = contents.substr(ffn_start, set_terminal - ffn_start);
+        const size_t overlay_start = contents.find("void Qwen35MoEGraph::buildFFNExpertOverlayBranch(");
+        ASSERT_NE(overlay_start, std::string::npos);
+        const std::string ffn_body =
+            contents.substr(ffn_start, set_terminal - ffn_start) + "\n" +
+            contents.substr(overlay_start);
 
         EXPECT_NE(ffn_body.find("first_device_rebalance_decode_layer"), std::string::npos);
         EXPECT_NE(ffn_body.find("last_device_rebalance_decode_layer"), std::string::npos);
@@ -6812,9 +6811,9 @@ namespace llaminar2::test
     {
         const fs::path root = findRepoRoot();
         const fs::path decode_path =
-            root / "src/v2/kernels/rocm/gemm/ROCmGemvKernel_native_quantised.hip";
+            root / "src/v2/kernels/rocm/gemm/ROCmMoEGroupedDecodeKernels.hip";
         const fs::path prefill_path =
-            root / "src/v2/kernels/rocm/gemm/ROCmMoEGroupedPrefillKernels.hip";
+            root / "src/v2/kernels/rocm/gemm/ROCmMoEGroupedPrefillShardImpl.hip.inc";
         ASSERT_TRUE(fs::exists(decode_path)) << decode_path;
         ASSERT_TRUE(fs::exists(prefill_path)) << prefill_path;
 
@@ -9036,7 +9035,7 @@ namespace llaminar2::test
             // Inlining/launch annotations are implementation details. Delimit
             // by the next function's name so compiler tuning cannot hide the
             // projected-command invariant checked below.
-            const size_t end = contents.find("void rebalance_copy_bytes(", begin);
+            const size_t end = contents.find("_pack_rebalance_directory(", begin);
             ASSERT_NE(end, std::string::npos) << backend << " compact source descriptor kernel end marker missing";
             const std::string body = contents.substr(begin, end - begin);
 
@@ -9076,7 +9075,7 @@ namespace llaminar2::test
             EXPECT_EQ(contents.find(retired), std::string::npos) << retired;
         const size_t typed_begin = contents.find("bool launchDecodeGateLogitsForGateType(");
         ASSERT_NE(typed_begin, std::string::npos);
-        const size_t typed_end = contents.find("\n}\n\nnamespace llaminar2", typed_begin);
+        const size_t typed_end = contents.find("\n    }\n\n}", typed_begin);
         ASSERT_NE(typed_end, std::string::npos);
         const std::string typed = contents.substr(typed_begin, typed_end - typed_begin);
         const size_t half_begin = typed.find("case llaminar2::TensorType::FP16:");

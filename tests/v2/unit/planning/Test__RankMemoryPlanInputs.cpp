@@ -998,7 +998,7 @@ TEST(RankMemoryPlanInputs, AdmittedAttentionDefaultsKeepMixedParticipantsAndCold
         EXPECT_EQ(copied.arithmetic, input.attention_arithmetic);
         EXPECT_EQ(copied.schedule, input.attention_phase_schedule);
         EXPECT_EQ(copied.arithmetic,
-                  input.device.is_rocm() ? A::TileFP16WithFP32Totals : A::FixedFP32);
+                  (input.device.is_rocm() || input.device.is_cuda()) ? A::TileFP16WithFP32Totals : A::FixedFP32);
     }
     auto duplicate = inputs;
     duplicate.push_back(inputs.back());

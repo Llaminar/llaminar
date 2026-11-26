@@ -13,6 +13,7 @@
 #include "../../utils/CPUPreparedStoreTestAdmission.h"
 
 #include <gtest/gtest.h>
+#include "../SourceShardReader.h"
 #include "utils/CPUOrchestratorTestAdmission.h"
 #include <gmock/gmock.h>
 
@@ -8422,12 +8423,10 @@ TEST(Test__MTPGraphConstruction,
 TEST(Test__MTPGraphConstruction,
      ExpertOverlayEpochBoundariesEncloseCompleteResidentMTPTransactions)
 {
-    std::ifstream in(LLAMINAR_DEVICE_GRAPH_ORCHESTRATOR_SOURCE);
-    ASSERT_TRUE(in.is_open())
+    const std::string source = llaminar2::test_support::readSourceFileOrFamily(
+        LLAMINAR_DEVICE_GRAPH_ORCHESTRATOR_SOURCE);
+    ASSERT_FALSE(source.empty())
         << "Unable to open " << LLAMINAR_DEVICE_GRAPH_ORCHESTRATOR_SOURCE;
-    const std::string source(
-        (std::istreambuf_iterator<char>(in)),
-        std::istreambuf_iterator<char>());
 
     const size_t materialize = source.find(
         "bool DeviceGraphOrchestrator::materializeDeviceResidentGeneration(");
@@ -8530,12 +8529,10 @@ TEST(Test__MTPGraphConstruction,
                                          /*owns_terminal_head=*/true),
         MTPRuntimeTransactionRole::PredictorOwner);
 
-    std::ifstream input(LLAMINAR_DEVICE_GRAPH_ORCHESTRATOR_SOURCE);
-    ASSERT_TRUE(input.is_open())
+    const std::string source = llaminar2::test_support::readSourceFileOrFamily(
+        LLAMINAR_DEVICE_GRAPH_ORCHESTRATOR_SOURCE);
+    ASSERT_FALSE(source.empty())
         << "Unable to open " << LLAMINAR_DEVICE_GRAPH_ORCHESTRATOR_SOURCE;
-    const std::string source(
-        (std::istreambuf_iterator<char>(input)),
-        std::istreambuf_iterator<char>());
     // Bind the source guard to the operation, not to a diagnostic that used
     // to reject all retained bucket families with more than one width.
     const size_t chunked_prefill = source.find(

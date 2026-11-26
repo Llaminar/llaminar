@@ -154,7 +154,29 @@ namespace llaminar2::cpu::native_quantised
                     }
 
                     int8_t b_vals[32];
-                    if (packed.usesNibbleLUT())
+                    if (packed.usesCompactFiveBit())
+                    {
+                        const int z = n_local / 16;
+                        const int lane = n_local % 16;
+                        const int center = packed.is_asymmetric ? 0 : 16;
+                        for (int group = 0; group < 4; ++group)
+                        {
+                            const uint8_t *const source =
+                                packed.interleavedB(chunk, kb, group, z) + lane * 4;
+                            uint64_t lo_mask = 0, hi_mask = 0;
+                            std::memcpy(&lo_mask, packed.fiveBitHighBitplane(chunk, kb, group, z), sizeof(lo_mask));
+                            std::memcpy(&hi_mask, packed.fiveBitHighBitplane(chunk, kb, group + 4, z), sizeof(hi_mask));
+                            for (int idx = 0; idx < 4; ++idx)
+                            {
+                                const int bit = lane * 4 + idx;
+                                const int lo = (source[idx] & 0x0F) | (static_cast<int>((lo_mask >> bit) & 1u) << 4);
+                                const int hi = (source[idx] >> 4) | (static_cast<int>((hi_mask >> bit) & 1u) << 4);
+                                b_vals[group * 4 + idx] = static_cast<int8_t>(lo - center);
+                                b_vals[16 + group * 4 + idx] = static_cast<int8_t>(hi - center);
+                            }
+                        }
+                    }
+                    else if (packed.usesNibbleLUT())
                     {
                         // Four groups contain the original sixteen native
                         // bytes for this column. Reconstruct only this bounded
@@ -168,7 +190,22 @@ namespace llaminar2::cpu::native_quantised
                             const auto *source = packed.interleavedB(chunk, kb, group, z);
                             std::memcpy(payload + group * 4, source + lane * 4, 4);
                         }
-                        decode_native_block(packed.codebook_id, payload, b_vals);
+                        decode_nibble_lut_block(packed.codebook_id, payload, b_vals);
+                    }
+                    else if (packed.usesUnsignedInt8())
+                    {
+                        const int z = n_local / 16;
+                        const int lane = n_local % 16;
+                        for (int group = 0; group < 8; ++group)
+                        {
+                            const auto *group_data = packed.interleavedB(chunk, kb, group, z);
+                            const int src = lane * 4;
+                            const int dst = group * 4;
+                            b_vals[dst + 0] = static_cast<int8_t>(group_data[src + 0] ^ 0x80u);
+                            b_vals[dst + 1] = static_cast<int8_t>(group_data[src + 1] ^ 0x80u);
+                            b_vals[dst + 2] = static_cast<int8_t>(group_data[src + 2] ^ 0x80u);
+                            b_vals[dst + 3] = static_cast<int8_t>(group_data[src + 3] ^ 0x80u);
+                        }
                     }
                     else
                     {

@@ -21,7 +21,7 @@ struct NativePackGroupScratch {
         const auto encoding=preparedEncodingForSource(format);
         const size_t blocks=format.is_superblock?8:1;
         const bool expanded=encoding==CPUNativeQuantisedEncoding::ExpandedInt8 ||
-            encoding==CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale;
+            encoding==CPUNativeQuantisedEncoding::UnsignedInt8;
         const bool packed=!expanded || is_payload_decodable(format.codebook_id);
         if(packed) {
             result.payload=reserve(blocks*size_t(format.payload_bytes),1);
@@ -143,7 +143,7 @@ inline void appendNativeWeightGroups(const IINT8Unpackable& source,const NativeQ
             auto* scales=reinterpret_cast<float*>(memory+layout.scales);
             auto* mins=reinterpret_cast<float*>(memory+layout.mins);
             const int actual_row=source_row+local_row;
-            const bool expanded=out.usesExpandedInt8();
+            const bool expanded=out.usesExpandedInt8() || out.usesUnsignedInt8();
             const bool native_payload=!expanded || is_payload_decodable(format.codebook_id);
             if(native_payload) {
                 const VnniPackContext context{.raw_bytes=nullptr,.N=1,.K=source_k,
@@ -171,6 +171,28 @@ inline void appendNativeWeightGroups(const IINT8Unpackable& source,const NativeQ
                     std::memcpy(target+out.data_stride+column*2,primary+b,2);
                     std::memcpy(target+out.data_stride+128+column*2,secondary+b,2);
                     std::memcpy(target+out.data_stride+256+column*4,emins+b,4);
+                } else if(out.usesCompactFiveBit()) {
+                    for(int g = 0; g < 4; ++g)
+                        std::memcpy(target + g * 256 + column * 4, input + g * 4, 4);
+                    uint32_t qh = 0;
+                    std::memcpy(&qh, input + 16, sizeof(qh));
+                    const int segment = column / 16;
+                    const unsigned shift = static_cast<unsigned>(column % 16) * 4u;
+                    for(unsigned g = 0; g < 8u; ++g)
+                    {
+                        uint64_t mask = 0;
+                        auto *ptr = target + 1024u + g * 32u + segment * 8u;
+                        std::memcpy(&mask, ptr, sizeof(mask));
+                        mask |= static_cast<uint64_t>((qh >> (g * 4u)) & 0xFu) << shift;
+                        std::memcpy(ptr, &mask, sizeof(mask));
+                    }
+                    const uint16_t scale = fp32_to_fp16(fp16_to_fp32(primary[b]));
+                    std::memcpy(target + 1280 + column * 2, &scale, 2);
+                    if(out.is_asymmetric)
+                    {
+                        const uint16_t minimum = fp32_to_fp16(fp16_to_fp32(secondary[b]));
+                        std::memcpy(target + 1408 + column * 2, &minimum, 2);
+                    }
                 } else if(out.usesQ6KNativeDualScale()) {
                     for(int g=0;g<4;++g)std::memcpy(target+g*256+column*4,input+g*4,4);
                     for(int g=0;g<8;++g) {
@@ -185,19 +207,54 @@ inline void appendNativeWeightGroups(const IINT8Unpackable& source,const NativeQ
                     }
                     std::memcpy(target+1536+column*2,primary+b,2);
                     std::memcpy(target+1664+column*2,secondary+b,2);
+                } else if(out.usesUnsignedNibble()) {
+                    for(int g = 0; g < 4; ++g)
+                        std::memcpy(target + g * 256 + column * 4, input + g * 4, 4);
+                    const uint16_t scale = fp32_to_fp16(source.get_block_scale(actual_row, input_first + b));
+                    std::memcpy(target + out.data_stride + column * 2, &scale, 2);
+                    if(out.is_asymmetric)
+                    {
+                        const uint16_t minimum = fp32_to_fp16(source.get_block_min(actual_row, input_first + b));
+                        std::memcpy(target + out.data_stride + 128 + column * 2, &minimum, 2);
+                    }
+                } else if(out.usesUnsignedInt8()) {
+                    const int8_t *values = decoded + b * 32;
+                    for(int g = 0; g < 8; ++g)
+                    {
+                        uint8_t uvals[4];
+                        for(int k = 0; k < 4; ++k)
+                            uvals[k] = static_cast<uint8_t>(values[g * 4 + k]) ^ 0x80u;
+                        std::memcpy(target + g * 256 + column * 4, uvals, 4);
+                    }
+                    const uint16_t scale = native_payload ? primary[b] : fp32_to_fp16(scales[b]);
+                    std::memcpy(target + out.data_stride + column * 2, &scale, 2);
+                    if(out.is_asymmetric)
+                    {
+                        const uint16_t minimum = native_payload ? secondary[b] : fp32_to_fp16(mins[b]);
+                        std::memcpy(target + out.data_stride + 128 + column * 2, &minimum, 2);
+                    }
                 } else {
                     const bool nibble=out.usesNibbleLUT();
                     const int8_t* values=nibble?decoded:decoded+b*32;
                     if(nibble) {
                         decode_native_block(format.codebook_id,input,decoded);values=decoded;
-                        for(int g=0;g<4;++g)std::memcpy(target+g*256+column*4,input+g*4,4);
+                        if(is_repacked_nibble_lut_format(format.codebook_id)) {
+                            uint8_t repacked[16];
+                            encode_nibble_lut_block(format.codebook_id,decoded,repacked);
+                            for(int g=0;g<4;++g)std::memcpy(target+g*256+column*4,repacked+g*4,4);
+                        } else {
+                            for(int g=0;g<4;++g)std::memcpy(target+g*256+column*4,input+g*4,4);
+                        }
                     } else for(int g=0;g<8;++g)std::memcpy(target+g*256+column*4,values+g*4,4);
                     int32_t sum=0;for(int k=0;k<32;++k)sum+=values[k];
                     const auto compensation=static_cast<int16_t>(sum);
                     std::memcpy(target+out.data_stride+column*2,&compensation,2);
                     uint16_t scale=0,minimum=0;
-                    if(out.usesNibbleLUTSourceScale() || out.usesIQ3SExpandedSourceScale()) {
+                    if(out.usesNibbleLUTSourceScale()) {
                         scale=primary[b];minimum=secondary[b];
+                    } else if(is_repacked_nibble_lut_format(format.codebook_id)) {
+                        scale=fp32_to_fp16(fp16_to_fp32(primary[b]));
+                        minimum=fp32_to_fp16(fp16_to_fp32(secondary[b]));
                     } else if(nibble) {
                         scale=fp32_to_fp16(source.get_block_scale(actual_row,input_first+b));
                         minimum=fp32_to_fp16(source.get_block_min(actual_row,input_first+b));
@@ -205,10 +262,10 @@ inline void appendNativeWeightGroups(const IINT8Unpackable& source,const NativeQ
                         scale=fp32_to_fp16(fp16_to_fp32(primary[b]));
                         minimum=fp32_to_fp16(fp16_to_fp32(secondary[b]));
                     } else {scale=fp32_to_fp16(scales[b]);minimum=fp32_to_fp16(mins[b]);}
-                    if(out.usesIQ3SExpandedSourceScale() && !native_quantised_iq3s_scale::valid(minimum))
+                    if(out.usesNibbleLUTSourceScale() && format.codebook_id == 11 && !native_quantised_iq3s_scale::valid(minimum))
                         throw std::invalid_argument("IQ3_S source nibble is invalid");
                     std::memcpy(target+out.data_stride+128+column*2,&scale,2);
-                    if(out.is_asymmetric || out.usesNibbleLUTSourceScale() || out.usesIQ3SExpandedSourceScale())
+                    if(out.is_asymmetric || out.usesNibbleLUTSourceScale())
                         std::memcpy(target+out.data_stride+256+column*2,&minimum,2);
                 }
             }

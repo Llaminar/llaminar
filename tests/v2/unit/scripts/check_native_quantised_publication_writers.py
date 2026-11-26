@@ -31,7 +31,7 @@ ALLOWED_WRITERS = {
     "src/v2/kernels/PackedWeightsSerialization.h": "wire/disk receive; KernelFactory admits before engine publication",
     "src/v2/execution/moe/ExpertTierWeightStream.cpp": "host reference transcoding; seals before returning",
     "src/v2/execution/moe/CpuExpertSlotPool.cpp": "slot storage; acquisition opens a generation, arrival admits",
-    "src/v2/kernels/cpu/gemm/CPUNativeQuantisedGemmKernel.h": "overlay slot rewrite/admission API",
+    "src/v2/kernels/cpu/gemm/CPUNativeQuantisedGemmKernel.cpp": "overlay slot rewrite/admission API",
 }
 
 MUTATION = re.compile(

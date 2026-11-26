@@ -2404,6 +2404,31 @@ namespace llaminar2
          * @param device Exact source GPU and mapped alias address space.
          * @param stream Exact non-null latency-critical compute stream.
          */
+        /** @brief One bounded persistent-device to mapped-host copy segment. */
+        struct MappedHostCopyBatchItem
+        {
+            const void *source = nullptr;
+            size_t source_capacity = 0u;
+            size_t source_offset = 0u;
+            size_t destination_offset = 0u;
+            size_t bytes = 0u;
+        };
+
+        /**
+         * @brief Copy up to six bounded persistent device subregions into one
+         *        mapped host region and release-publish one 64-bit timeline
+         *        word in a single kernel launch.
+         */
+        void enqueuePersistentDeviceRegionsToMappedHostAndPublishByKernel(
+            const MappedHostCopyBatchItem *items,
+            size_t item_count,
+            const MappedHostTransferRegion &destination,
+            const MappedHostTransferRegion &publication_region,
+            size_t publication_offset,
+            uint64_t publication_value,
+            DeviceId device,
+            void *stream) const;
+
         void enqueuePersistentDeviceRegionToMappedHostByKernel(
             const void *source,
             size_t source_capacity,

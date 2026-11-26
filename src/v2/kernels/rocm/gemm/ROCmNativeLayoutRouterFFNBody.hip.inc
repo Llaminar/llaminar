@@ -15,6 +15,7 @@
 #include "ROCmNativeLayoutRouterFFN.h"
 #include "ROCmNativeLayoutDownGeometry.h"
 #include "ROCmNativeLayoutGateUpGeometry.h"
+#include "ROCmPersistentMoEFFNQuantize.h"
 #include "../moe/ROCmOriginalRouterPhase.hip.inc"
 #include "ROCmNativeLayoutPreload.hip.inc"
 #include "../common/ROCmKernargField.h"

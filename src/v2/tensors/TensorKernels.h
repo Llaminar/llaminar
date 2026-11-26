@@ -34,6 +34,7 @@
 #include "TensorType.h"
 #include "BlockStructures.h"
 #include "KernelSnapshotInfo.h"
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <memory>

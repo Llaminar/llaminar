@@ -201,6 +201,13 @@ namespace llaminar2
      * The publication kernel copies a route slot only when that ledger selects
      * this producer.
      */
+    /** @brief Wire element precision for node-local peer route staging. */
+    enum class MoENodeLocalRoutePayloadPrecision : std::uint32_t
+    {
+        FP32 = 0u,                   ///< Canonical FP32 route contributions (Decode / GroupedVerifier / default).
+        FixedPoint32Adaptive16 = 1u, ///< Prefill-only placement-invariant exact fixed-point int32 (adaptive 16/32b wire).
+    };
+
     struct MoENodeLocalRoutePublishLaunch
     {
         MoENodeLocalRoutePeerDeviceBinding lane{};
@@ -208,6 +215,7 @@ namespace llaminar2
         MoEDomainRouteAssignmentLedger domain_assignment{};
         std::uint32_t live_route_slots = 0u;
         MoENodeLocalRouteOwnership ownership = MoENodeLocalRouteOwnership::ExclusiveParticipant;
+        MoENodeLocalRoutePayloadPrecision payload_precision = MoENodeLocalRoutePayloadPrecision::FP32;
 
         /** @return Whether the fixed-capacity producer launch is complete. */
         [[nodiscard]] LLAMINAR_MOE_NODE_LOCAL_ROUTE_HD constexpr bool
@@ -245,6 +253,8 @@ namespace llaminar2
         MoENodeLocalRouteOwnership ownership = MoENodeLocalRouteOwnership::ExclusiveParticipant;
         const float *cohort_route_weights = nullptr; ///< Exact original-slot router factors for raw shard rows.
         std::uint32_t cohort_route_capacity = 0u; ///< Element extent of the router's published factor plane.
+        const float *gated_shared_residual = nullptr; ///< Optional pre-gated shared expert row added after routed fold.
+        MoENodeLocalRoutePayloadPrecision payload_precision = MoENodeLocalRoutePayloadPrecision::FP32;
 
         /** @return Whether the root launch has a complete immutable geometry. */
         [[nodiscard]] LLAMINAR_MOE_NODE_LOCAL_ROUTE_HD constexpr bool

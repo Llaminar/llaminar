@@ -161,7 +161,7 @@ namespace llaminar2::cpu::native_quantised
         uint8_t *workspace)
     {
         if (meta.usesQ6KNativeDualScale() || meta.usesCompactMultiScale() ||
-            meta.usesNibbleLUTSourceScale() || meta.usesIQ3SExpandedSourceScale())
+            meta.usesNibbleLUTSourceScale() || is_repacked_nibble_lut_format(meta.codebook_id))
         {
             throw std::invalid_argument(
                 "Deferred native-block repacking does not own the source "
@@ -244,44 +244,106 @@ namespace llaminar2::cpu::native_quantised
                         }
                     }
 
-                    // --- Compute comp (sum of decoded INT8 values per column) ---
-                    int16_t *inline_comp = reinterpret_cast<int16_t *>(dst + 1024);
-                    for (int col = 0; col < n_cols; ++col)
+                    // --- Compute comp only for signed NibbleLUT encodings ---
+                    if (meta.usesInlineCompensation())
                     {
-                        int8_t decoded[32];
-                        decode_native_block(codebook_id, payload_buf + col * pb, decoded);
+                        int16_t *inline_comp = reinterpret_cast<int16_t *>(dst + 1024);
+                        for (int col = 0; col < n_cols; ++col)
+                        {
+                            int8_t decoded[32];
+                            decode_native_block(codebook_id, payload_buf + col * pb, decoded);
 #ifdef __AVX512F__
-                        // Vectorized sum of 32 signed int8 → int16
-                        __m256i v = _mm256_loadu_si256((const __m256i *)decoded);
-                        __m256i ones = _mm256_set1_epi8(1);
-                        __m256i pair_sums = _mm256_maddubs_epi16(ones, v); // 16 × int16
-                        __m256i ones16 = _mm256_set1_epi16(1);
-                        __m256i quad_sums = _mm256_madd_epi16(pair_sums, ones16); // 8 × int32
-                        __m128i hi = _mm256_extracti128_si256(quad_sums, 1);
-                        __m128i lo = _mm256_castsi256_si128(quad_sums);
-                        __m128i sum128 = _mm_add_epi32(lo, hi);
-                        sum128 = _mm_hadd_epi32(sum128, sum128);
-                        sum128 = _mm_hadd_epi32(sum128, sum128);
-                        inline_comp[col] = static_cast<int16_t>(_mm_cvtsi128_si32(sum128));
+                            // Vectorized sum of 32 signed int8 → int16
+                            __m256i v = _mm256_loadu_si256((const __m256i *)decoded);
+                            __m256i ones = _mm256_set1_epi8(1);
+                            __m256i pair_sums = _mm256_maddubs_epi16(ones, v); // 16 × int16
+                            __m256i ones16 = _mm256_set1_epi16(1);
+                            __m256i quad_sums = _mm256_madd_epi16(pair_sums, ones16); // 8 × int32
+                            __m128i hi = _mm256_extracti128_si256(quad_sums, 1);
+                            __m128i lo = _mm256_castsi256_si128(quad_sums);
+                            __m128i sum128 = _mm_add_epi32(lo, hi);
+                            sum128 = _mm_hadd_epi32(sum128, sum128);
+                            sum128 = _mm_hadd_epi32(sum128, sum128);
+                            inline_comp[col] = static_cast<int16_t>(_mm_cvtsi128_si32(sum128));
 #else
-                        int32_t sum = 0;
-                        for (int i = 0; i < 32; ++i)
-                            sum += decoded[i];
-                        inline_comp[col] = static_cast<int16_t>(sum);
+                            int32_t sum = 0;
+                            for (int i = 0; i < 32; ++i)
+                                sum += decoded[i];
+                            inline_comp[col] = static_cast<int16_t>(sum);
 #endif
+                        }
+                        for (int col = n_cols; col < 64; ++col)
+                            inline_comp[col] = 0;
                     }
-                    for (int col = n_cols; col < 64; ++col)
-                        inline_comp[col] = 0;
 
+                    const size_t comp_bytes = meta.usesInlineCompensation() ? 128u : 0u;
                     // Write scales inline
-                    uint16_t *inline_scales = reinterpret_cast<uint16_t *>(dst + 1024 + 128);
+                    uint16_t *inline_scales = reinterpret_cast<uint16_t *>(dst + 1024u + comp_bytes);
                     std::memcpy(inline_scales, scales_buf, 64 * sizeof(uint16_t));
 
                     // Write mins inline (if asymmetric)
                     if (meta.is_asymmetric)
                     {
-                        uint16_t *inline_mins = reinterpret_cast<uint16_t *>(dst + 1024 + 256);
+                        uint16_t *inline_mins = reinterpret_cast<uint16_t *>(dst + 1024u + comp_bytes + 128u);
                         std::memcpy(inline_mins, mins_buf, 64 * sizeof(uint16_t));
+                    }
+                }
+            }
+        }
+        else if (meta.usesCompactFiveBit())
+        {
+            // ---------------------------------------------------------------
+            // COMPACT FIVE-BIT PATH (Q5_0, Q5_1)
+            // 4 nibble groups (1024B) + 8 high-bit planes (256B) + scales (128B) [+ mins (128B)]
+            // ---------------------------------------------------------------
+#pragma omp parallel for schedule(static) collapse(2)
+            for (int chunk = 0; chunk < N_chunks; ++chunk)
+            {
+                for (int kb = 0; kb < bpr; ++kb)
+                {
+                    const int n_cols = std::min(64, N - chunk * 64);
+                    const size_t block_offset_ws =
+                        ((size_t)chunk * bpr + kb) * meta.interleaved_block_stride;
+                    uint8_t *dst = workspace + block_offset_ws;
+                    std::memset(dst, 0, meta.interleaved_block_stride);
+
+                    uint16_t *inline_scales = reinterpret_cast<uint16_t *>(dst + 1280);
+                    uint16_t *inline_mins = meta.is_asymmetric
+                        ? reinterpret_cast<uint16_t *>(dst + 1408)
+                        : nullptr;
+
+                    for (int col = 0; col < n_cols; ++col)
+                    {
+                        const int row = chunk * 64 + col;
+                        const uint8_t *blk = native_blocks + row * native_row_stride + kb * block_size;
+                        uint32_t qh = 0;
+                        const uint8_t *qs = nullptr;
+                        if (codebook_id == 6) // Q5_0: d(2) + qh(4) + qs(16)
+                        {
+                            std::memcpy(&inline_scales[col], blk, 2);
+                            std::memcpy(&qh, blk + 2, 4);
+                            qs = blk + 6;
+                        }
+                        else // Q5_1: d(2) + m(2) + qh(4) + qs(16)
+                        {
+                            std::memcpy(&inline_scales[col], blk, 2);
+                            if (inline_mins)
+                                std::memcpy(&inline_mins[col], blk + 2, 2);
+                            std::memcpy(&qh, blk + 4, 4);
+                            qs = blk + 8;
+                        }
+                        const int z = col / 16;
+                        const unsigned shift = static_cast<unsigned>(col % 16) * 4u;
+                        for (int group = 0; group < 4; ++group)
+                            std::memcpy(dst + group * 256 + col * 4, qs + group * 4, 4);
+                        for (unsigned g = 0; g < 8u; ++g)
+                        {
+                            uint64_t mask = 0;
+                            uint8_t *ptr = dst + 1024u + g * 32u + z * 8u;
+                            std::memcpy(&mask, ptr, sizeof(mask));
+                            mask |= static_cast<uint64_t>((qh >> (g * 4u)) & 0xFu) << shift;
+                            std::memcpy(ptr, &mask, sizeof(mask));
+                        }
                     }
                 }
             }
@@ -530,18 +592,8 @@ namespace llaminar2::cpu::native_quantised
                                     out.codebook_id,
                                     native_payload + local_kb * out.payload_bytes,
                                     decoded + local_kb * kValuesPerBlock);
-                                if (out.usesIQ3SExpandedSourceScale())
-                                {
-                                    source_bases[local_kb] = native_scales[local_kb];
-                                    source_coefficients[local_kb] = native_mins[local_kb];
-                                    if (!native_quantised_iq3s_scale::valid(source_coefficients[local_kb]))
-                                        throw std::invalid_argument("IQ3_S source nibble is invalid");
-                                }
-                                else
-                                {
-                                    scales[local_kb] = fp16_to_fp32(native_scales[local_kb]);
-                                    mins[local_kb] = fp16_to_fp32(native_mins[local_kb]);
-                                }
+                                scales[local_kb] = fp16_to_fp32(native_scales[local_kb]);
+                                mins[local_kb] = fp16_to_fp32(native_mins[local_kb]);
                             }
                         }
                         else if (use_superblock &&
@@ -636,8 +688,7 @@ namespace llaminar2::cpu::native_quantised
                             }
                             compensation[column] =
                                 static_cast<int16_t>(sum);
-                            inline_scales[column] = out.usesIQ3SExpandedSourceScale()
-                                ? source_bases[local_kb] : fp32_to_fp16(scales[local_kb]);
+                            inline_scales[column] = fp32_to_fp16(scales[local_kb]);
                         }
                         else
                         {
@@ -645,14 +696,13 @@ namespace llaminar2::cpu::native_quantised
                             inline_scales[column] = 0;
                         }
 
-                        if (out.is_asymmetric || out.usesIQ3SExpandedSourceScale())
+                        if (out.is_asymmetric)
                         {
                             auto *const inline_mins =
                                 reinterpret_cast<uint16_t *>(
                                     destination + out.data_stride + 256);
                             inline_mins[column] = source_column_valid
-                                ? (out.usesIQ3SExpandedSourceScale()
-                                    ? source_coefficients[local_kb] : fp32_to_fp16(mins[local_kb])) : 0;
+                                ? fp32_to_fp16(mins[local_kb]) : 0;
                         }
                     }
                 }

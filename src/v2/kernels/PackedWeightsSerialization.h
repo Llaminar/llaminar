@@ -23,7 +23,6 @@
 
 #include "IPackedWeights.h"
 #include "cpu/gemm/CPUPackedWeights.h"
-#include "cpu/gemm/CPUNativeQuantisedWeightPacker.h"
 #include "utils/Logger.h"
 
 #include <array>
@@ -116,8 +115,6 @@ inline cpu::native_quantised::CPUNativeQuantisedEncoding decodePreparedEncoding(
     using Encoding = cpu::native_quantised::CPUNativeQuantisedEncoding;
     switch (value)
     {
-    case static_cast<uint8_t>(Encoding::IQ3SExpandedSourceScale):
-        return Encoding::IQ3SExpandedSourceScale;
     case static_cast<uint8_t>(Encoding::NibbleLUTSourceScale):
         return Encoding::NibbleLUTSourceScale;
     case static_cast<uint8_t>(Encoding::NibbleLUT):
@@ -128,6 +125,12 @@ inline cpu::native_quantised::CPUNativeQuantisedEncoding decodePreparedEncoding(
         return Encoding::Q6KNativeDualScale;
     case static_cast<uint8_t>(Encoding::CompactMultiScale):
         return Encoding::CompactMultiScale;
+    case static_cast<uint8_t>(Encoding::CompactFiveBit):
+        return Encoding::CompactFiveBit;
+    case static_cast<uint8_t>(Encoding::UnsignedNibble):
+        return Encoding::UnsignedNibble;
+    case static_cast<uint8_t>(Encoding::UnsignedInt8):
+        return Encoding::UnsignedInt8;
     default:
         throw std::invalid_argument(
             "Packed-weight transfer received an unknown prepared encoding");
@@ -136,21 +139,17 @@ inline cpu::native_quantised::CPUNativeQuantisedEncoding decodePreparedEncoding(
 
 /** @brief Validate IQ3_S/IQ4_XS source tuples before adopting CPU sections.
  * @param header Archive or direct-transfer scalar header.
- * @return Whether encoding4 identifies exactly the IQ4_XS source tuple, and
+ * @return Whether encoding4 identifies exactly the IQ4_XS or IQ3_S source tuple, and
  *         ordinary IQ4_XS does not claim the retired derived-half nibble encoding.
  */
 inline bool validNativeSourceScaleTupleHeader(const PackedWeightsHeader &header) noexcept
 {
     using Encoding = cpu::native_quantised::CPUNativeQuantisedEncoding;
-    if (header.prepared_encoding == static_cast<uint8_t>(Encoding::IQ3SExpandedSourceScale))
-        return header.codebook_id == 11 && header.is_superblock == 1 &&
-               header.is_asymmetric == 0 && header.payload_bytes == 13 &&
-               header.data_stride == static_cast<int32_t>(cpu::native_quantised::preparedDataStride(Encoding::IQ3SExpandedSourceScale)) &&
-               header.interleaved_block_stride == static_cast<int32_t>(cpu::native_quantised::preparedInterleavedBlockStride(Encoding::IQ3SExpandedSourceScale, false)) &&
-               header.has_native_blocks == 0;
     if (header.prepared_encoding == static_cast<uint8_t>(Encoding::NibbleLUTSourceScale))
-        return header.codebook_id == 4 && header.is_superblock == 1 &&
-               header.is_asymmetric == 0 && header.payload_bytes == 16 &&
+        return ((header.codebook_id == 4 && header.payload_bytes == 16) ||
+                (header.codebook_id == 11 && (header.payload_bytes == 13 || header.payload_bytes == 16))) &&
+               header.is_superblock == 1 &&
+               header.is_asymmetric == 0 &&
                header.data_stride == static_cast<int32_t>(cpu::native_quantised::preparedDataStride(
                    Encoding::NibbleLUTSourceScale)) &&
                header.interleaved_block_stride == static_cast<int32_t>(

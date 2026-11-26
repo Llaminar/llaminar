@@ -11,6 +11,7 @@
  */
 #pragma once
 
+#include "kernels/cpu/gemm/CPUNativeQuantisedDecode.h"
 #include "kernels/cpu/gemm/CPUNativeQuantisedWeightView.h"
 #include "tensors/IQQuantTables.h"
 #include <cstdint>
@@ -80,10 +81,31 @@ public:
                 const auto unit = (std::size_t(column / 64) * layout.blocks_per_row + block) *
                     layout.interleaved_block_stride;
                 const std::uint32_t seed = 0x9e3779b9u * (column + 1u) ^ 0x85ebca6bu * (block + 3u);
-                for (int byte = 0; byte < layout.payload_bytes; ++byte)
+                if (layout.usesCompactFiveBit())
                 {
-                    const auto offset = unit + (byte / 4) * 256 + local * 4 + byte % 4;
-                    bytes[offset] = static_cast<std::uint8_t>((seed >> ((byte % 4) * 8)) + byte * 29u);
+                    for (int byte = 0; byte < 16; ++byte)
+                    {
+                        const auto offset = unit + (byte / 4) * 256 + local * 4 + byte % 4;
+                        bytes[offset] = static_cast<std::uint8_t>((seed >> ((byte % 4) * 8)) + byte * 29u);
+                    }
+                    const int z = local / 16;
+                    const unsigned shift = static_cast<unsigned>(local % 16) * 4u;
+                    for (unsigned g = 0; g < 8u; ++g)
+                    {
+                        std::uint64_t mask = 0;
+                        const auto offset = unit + 1024u + g * 32u + z * 8u;
+                        std::memcpy(&mask, bytes.data() + offset, sizeof(mask));
+                        mask |= static_cast<std::uint64_t>((seed >> (g * 4u)) & 0xFu) << shift;
+                        std::memcpy(bytes.data() + offset, &mask, sizeof(mask));
+                    }
+                }
+                else
+                {
+                    for (int byte = 0; byte < layout.payload_bytes; ++byte)
+                    {
+                        const auto offset = unit + (byte / 4) * 256 + local * 4 + byte % 4;
+                        bytes[offset] = static_cast<std::uint8_t>((seed >> ((byte % 4) * 8)) + byte * 29u);
+                    }
                 }
                 if (layout.usesInlineCompensation())
                 {
@@ -95,6 +117,14 @@ public:
                             sum += value < 128 ? value : int(value) - 256;
                         else if (layout.codebook_id == 4)
                             sum += kvalues_iq4nl_i8[value & 15] + kvalues_iq4nl_i8[value >> 4];
+                        else if (layout.codebook_id == 11)
+                            sum += cpu::native_quantised::kIQ3SDecodeLUT[value & 15] + cpu::native_quantised::kIQ3SDecodeLUT[value >> 4];
+                        else if (layout.codebook_id == 12)
+                            sum += cpu::native_quantised::kIQ3XXSDecodeLUT[value & 15] + cpu::native_quantised::kIQ3XXSDecodeLUT[value >> 4];
+                        else if (layout.codebook_id == 15)
+                            sum += cpu::native_quantised::kIQ2XXSDecodeLUT[value & 15] + cpu::native_quantised::kIQ2XXSDecodeLUT[value >> 4];
+                        else if (layout.codebook_id == 16)
+                            sum += cpu::native_quantised::kIQ1SDecodeLUT[value & 15] + cpu::native_quantised::kIQ1SDecodeLUT[value >> 4];
                         else
                             sum += (value & 15) + (value >> 4) - (layout.codebook_id == 0 ? 16 : 0);
                     }
@@ -104,11 +134,11 @@ public:
                 }
                 const auto primary = unit + layout.data_stride + (layout.usesInlineCompensation() ? 128 : 0) + local * 2;
                 writeWord(primary, static_cast<std::uint16_t>(0x2401u + (seed & 0x1fffu)));
-                if (layout.is_asymmetric || layout.usesNibbleLUTSourceScale() || layout.usesIQ3SExpandedSourceScale() ||
+                if (layout.is_asymmetric || layout.usesNibbleLUTSourceScale() ||
                     layout.usesQ6KNativeDualScale() || layout.usesCompactMultiScale())
                 {
                     const std::uint16_t secondary = layout.usesQ6KNativeDualScale() ? static_cast<std::uint16_t>(seed)
-                        : layout.usesIQ3SExpandedSourceScale() ? static_cast<std::uint16_t>(seed & 15u)
+                        : layout.usesNibbleLUTSourceScale() && layout.codebook_id == 11 ? static_cast<std::uint16_t>(seed & 15u)
                         : layout.usesNibbleLUTSourceScale() ? static_cast<std::uint16_t>(seed & 63u)
                         : layout.usesCompactMultiScale() && layout.codebook_id == 13 ? static_cast<std::uint16_t>(seed & 255u)
                         : static_cast<std::uint16_t>(0xa301u + (seed & 0x0fffu));

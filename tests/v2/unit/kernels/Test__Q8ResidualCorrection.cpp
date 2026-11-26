@@ -13,6 +13,7 @@
  */
 #include <gtest/gtest.h>
 #include "kernels/cpu/gemm/CPUNativeQuantisedGemmKernel.h"
+#include "kernels/cpu/gemm/CPUQ8ResidualCorrection.h"
 #include "loaders/PreparedWeightStore.h"
 #include "kernels/KernelFactory.h"
 #include "tensors/Tensors.h"

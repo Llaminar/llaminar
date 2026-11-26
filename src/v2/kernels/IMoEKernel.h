@@ -1929,6 +1929,23 @@ namespace llaminar2
         }
 
         /**
+         * @brief Acquire, validate, directly fold, and acknowledge single-row
+         *        node-local canonical peer routes in one graph node.
+         *
+         * Preserves exact protocol validation, deterministic route order, and
+         * system-release acknowledgement while avoiding intermediate staging
+         * VRAM traffic and multi-kernel PCIe control round trips.
+         */
+        virtual bool consumeSingleRowNodeLocalCanonicalRoutes(
+            const MoEKernelLaunchContext &launch,
+            const MoENodeLocalRouteConsumeLaunch &consumption)
+        {
+            (void)launch;
+            (void)consumption;
+            return false;
+        }
+
+        /**
          * @brief Gate root payload reuse on device-owned peer acknowledgements.
          *
          * Implementations enqueue exactly one graph-capturable wait kernel on

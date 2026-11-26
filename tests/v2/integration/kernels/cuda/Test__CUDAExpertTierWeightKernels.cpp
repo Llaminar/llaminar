@@ -1636,7 +1636,7 @@ namespace llaminar2
             cpu::native_quantised::CPUNativeQuantisedPackedWeights cpu_weights;
             ASSERT_TRUE(cpu::native_quantised::packWeightsCPUNativeQuantised(
                 tensor.get(), cpu_weights));
-            ASSERT_TRUE(cpu_weights.usesExpandedInt8());
+            ASSERT_TRUE(cpu_weights.usesCompactFiveBit());
             ASSERT_TRUE(cpu_weights.is_asymmetric);
             HostGpuExpertPackedProjection expected_gpu;
             std::string error;
@@ -1645,7 +1645,7 @@ namespace llaminar2
                 << error;
             ASSERT_EQ(
                 expected_gpu.codebook_id,
-                kNativeQuantisedExpandedInt8MinCodebook);
+                native_quantised_formats::Q5_1.codebook_id);
 
             const MoEOverlayRemoteProjectionIdentity promotion_identity{
                 .expected_epoch = promoted_epoch - 1,
@@ -1946,15 +1946,25 @@ namespace llaminar2
             // Original packing coordinates, not observed transfer writes,
             // determine every expected byte, including untouched padding.
             std::vector<std::uint8_t> expected_cpu_bytes(redemoted_cpu_bytes.size(), 0xa5u);
-            size_t live_bytes = 0;
-            for (size_t byte = 0; byte < expected_cpu_bytes.size(); ++byte)
-                if (test::expertTierExpandedCPUByteRow(cpu_weights, byte) < size_t(N))
-                {
-                    expected_cpu_bytes[byte] = cpu_weights.native_interleaved[byte];
-                    ++live_bytes;
-                }
-            EXPECT_EQ(demotion_wire_bytes, live_bytes);
-            EXPECT_LT(live_bytes, expected_cpu_bytes.size());
+            const auto demotion_layout = demotion_stream.deviceLayout();
+            auto gather_layout = demotion_layout;
+            gather_layout.direction = ExpertTierWeightConversionDirection::CpuToGpu;
+            std::size_t expected_wire_bytes = 0;
+            for (std::uint32_t first_unit = 0; first_unit < demotion_layout.unit_count;
+                 first_unit += demotion_layout.maximum_units_per_chunk)
+            {
+                const std::uint32_t units = std::min(
+                    demotion_layout.maximum_units_per_chunk,
+                    demotion_layout.unit_count - first_unit);
+                std::vector<std::uint8_t> chunk_wire(demotion_layout.chunkBytes(units, first_unit));
+                ASSERT_TRUE(gatherExpertTierCPUWeightChunk(
+                    gather_layout, cpu_weights.native_interleaved, first_unit, units, chunk_wire));
+                ASSERT_TRUE(scatterExpertTierCPUWeightChunk(
+                    demotion_layout, chunk_wire, first_unit, units, expected_cpu_bytes));
+                expected_wire_bytes += chunk_wire.size();
+            }
+            EXPECT_EQ(demotion_wire_bytes, expected_wire_bytes);
+            EXPECT_LT(expected_wire_bytes, expected_cpu_bytes.size());
             EXPECT_EQ(redemoted_cpu_bytes, expected_cpu_bytes);
             EXPECT_GT(promotion_chunks, 1u);
             EXPECT_GT(demotion_chunks, 1u);
@@ -2005,7 +2015,7 @@ namespace llaminar2
             cpu::native_quantised::CPUNativeQuantisedPackedWeights cpu_weights;
             ASSERT_TRUE(cpu::native_quantised::packWeightsCPUNativeQuantised(
                 tensor.get(), cpu_weights));
-            ASSERT_TRUE(cpu_weights.usesExpandedInt8());
+            ASSERT_TRUE(cpu_weights.usesCompactFiveBit());
             ASSERT_TRUE(cpu_weights.is_asymmetric);
 
             const auto probe_manifest =
@@ -2038,7 +2048,7 @@ namespace llaminar2
             ASSERT_TRUE(layout.valid());
             ASSERT_EQ(
                 layout.gpu_codebook_id,
-                kNativeQuantisedExpandedInt8MinCodebook);
+                native_quantised_formats::Q5_1.codebook_id);
             const std::size_t blocks =
                 static_cast<std::size_t>(N) * (K / 32);
 
@@ -2184,7 +2194,7 @@ namespace llaminar2
             ASSERT_TRUE(redemotion_layout.valid());
             ASSERT_EQ(
                 redemotion_layout.gpu_codebook_id,
-                kNativeQuantisedExpandedInt8MinCodebook);
+                native_quantised_formats::Q5_1.codebook_id);
             const ExpertTierGpuConstProjectionView promoted_source_view{
                 .payload = promoted_payload.data(),
                 .scales = promoted_scales.data(),
@@ -2495,7 +2505,7 @@ namespace llaminar2
             cpu::native_quantised::CPUNativeQuantisedPackedWeights cpu_weights;
             ASSERT_TRUE(cpu::native_quantised::packWeightsCPUNativeQuantised(
                 tensor.get(), cpu_weights));
-            ASSERT_TRUE(cpu_weights.usesExpandedInt8());
+            ASSERT_TRUE(cpu_weights.usesCompactFiveBit());
             ASSERT_TRUE(cpu_weights.is_asymmetric);
 
             HostGpuExpertPackedProjection expected;
@@ -2505,7 +2515,7 @@ namespace llaminar2
                 << error;
             ASSERT_EQ(
                 expected.codebook_id,
-                kNativeQuantisedExpandedInt8MinCodebook);
+                native_quantised_formats::Q5_K.codebook_id);
 
             const NativeQuantisedSourceIdentity source_identity{
                 .codebook_id = cpu_weights.codebook_id,
@@ -3111,7 +3121,7 @@ namespace llaminar2
             }
             cpu::native_quantised::CPUNativeQuantisedPackedWeights cpu;
             ASSERT_TRUE(cpu::native_quantised::packWeightsCPUNativeQuantised(tensor.get(),cpu));
-            ASSERT_EQ(cpu.encoding,cpu::native_quantised::CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale);
+            ASSERT_EQ(cpu.encoding,cpu::native_quantised::CPUNativeQuantisedEncoding::NibbleLUTSourceScale);
             constexpr std::uint32_t first_unit = 1;
             const auto *format = native_quantised_formats::forSourceIdentity(11,true);
             ASSERT_NE(format,nullptr);
@@ -3119,7 +3129,7 @@ namespace llaminar2
             const auto demotion = probe.deviceLayout();
             const auto promotion = makeCpuToGpuExpertTierWeightStreamManifest(cpu,406,3,7,ExpertTierWeightProjection::Down,capacity_units).deviceLayout();
             ASSERT_TRUE(demotion.valid());ASSERT_TRUE(promotion.valid());
-            ASSERT_EQ(demotion.cpu_block_stride,2432u);ASSERT_EQ(promotion.gpu_codebook_id,11);
+            ASSERT_EQ(demotion.cpu_block_stride,1408u);ASSERT_EQ(promotion.gpu_codebook_id,11);
             const std::uint32_t units = demotion.unit_count - first_unit;
             TestCUDAStream stream;
             TestCUDABuffer<std::uint8_t> input_payload(source.payload.size()),destination_payload(source.payload.size());
@@ -3205,7 +3215,7 @@ namespace llaminar2
             auto tensor=std::make_shared<IQ3_STensor>(std::vector<std::size_t>{N,K},bytes);
             cpu::native_quantised::CPUNativeQuantisedPackedWeights cpu;
             ASSERT_TRUE(cpu::native_quantised::packWeightsCPUNativeQuantised(tensor.get(),cpu));
-            ASSERT_EQ(cpu.encoding,cpu::native_quantised::CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale);
+            ASSERT_EQ(cpu.encoding,cpu::native_quantised::CPUNativeQuantisedEncoding::NibbleLUTSourceScale);
             const auto layout=makeCpuToGpuExpertTierWeightStreamManifest(cpu,407,3,7,ExpertTierWeightProjection::Down,2).deviceLayout();
             ASSERT_TRUE(layout.valid());ASSERT_EQ(layout.gpu_codebook_id,11);
             TestCUDABuffer<std::uint8_t> payload(8*13);

@@ -976,7 +976,8 @@ endif()
 
 add_executable(v2_test_cpu_rope_workshare
     "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/cpu/Test__CPURoPEWorkshare.cpp"
-    "${V2_CPU_ARCHITECTURE_ROOT}/src/v2/kernels/cpu/primitives/RoPEPrimitives.cpp")
+    "${V2_CPU_ARCHITECTURE_ROOT}/src/v2/kernels/cpu/primitives/RoPEPrimitives.cpp"
+    "${V2_CPU_ARCHITECTURE_ROOT}/src/v2/kernels/cpu/primitives/RoPEPrimitivesQ16.cpp")
 target_compile_features(v2_test_cpu_rope_workshare PRIVATE cxx_std_20)
 target_include_directories(v2_test_cpu_rope_workshare PRIVATE
     "${V2_CPU_ARCHITECTURE_ROOT}/src/v2" "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2")
@@ -1149,7 +1150,8 @@ v2_add_core_free_test(V2_Integration_CPUNativeQuantisedMetadataSealLifecycle
 if(LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
     add_executable(v2_test_neon_integer_rope
         "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/cpu/Test__NEONIntegerRoPE.cpp"
-        "${V2_CPU_ARCHITECTURE_ROOT}/src/v2/kernels/cpu/primitives/RoPEPrimitives.cpp")
+        "${V2_CPU_ARCHITECTURE_ROOT}/src/v2/kernels/cpu/primitives/RoPEPrimitives.cpp"
+    "${V2_CPU_ARCHITECTURE_ROOT}/src/v2/kernels/cpu/primitives/RoPEPrimitivesQ16.cpp")
     target_compile_features(v2_test_neon_integer_rope PRIVATE cxx_std_20)
     target_include_directories(v2_test_neon_integer_rope PRIVATE
         "${V2_CPU_ARCHITECTURE_ROOT}/src/v2" "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2")
@@ -1184,7 +1186,8 @@ if(LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
 
     add_executable(v2_test_neon_rope
         "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/cpu/Test__NEONRoPE.cpp"
-        "${V2_CPU_ARCHITECTURE_ROOT}/src/v2/kernels/cpu/primitives/RoPEPrimitives.cpp")
+        "${V2_CPU_ARCHITECTURE_ROOT}/src/v2/kernels/cpu/primitives/RoPEPrimitives.cpp"
+    "${V2_CPU_ARCHITECTURE_ROOT}/src/v2/kernels/cpu/primitives/RoPEPrimitivesQ16.cpp")
     target_compile_features(v2_test_neon_rope PRIVATE cxx_std_20)
     target_include_directories(v2_test_neon_rope PRIVATE
         "${V2_CPU_ARCHITECTURE_ROOT}/src/v2" "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2")

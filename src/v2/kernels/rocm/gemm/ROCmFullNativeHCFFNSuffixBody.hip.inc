@@ -111,47 +111,24 @@ __host__ __device__ constexpr RoutedGridLayout routedGridLayout(std::uint32_t ma
  * require only those records. Shape validation and overflow admission belong
  * to the existing cold owner before this pure helper is called.
  */
+inline constexpr std::size_t kFullNativeCoalescedGUBytes = 2u * 16u * 65u * sizeof(float);
+inline constexpr std::size_t kFullNativeDownMinBatchBytes = 16u * 64u * sizeof(float);
+
 inline FullNativeHCFFNSuffixGeometry fullNativeHCFFNSuffixGeometry(
     const NativeLayoutRouterFFNArgs& args,std::uint32_t mask,std::size_t maximum_dynamic_bytes) noexcept {
+    (void)mask;(void)maximum_dynamic_bytes;
     const auto& a=args.ffn;
     const std::size_t H=std::size_t(a.hidden_columns),F=std::size_t(a.routed_columns),
         S=std::size_t(a.shared_columns),routes=std::size_t(a.top_k);
-    const unsigned blocks=unsigned(H/32);
-    const unsigned wanted_blocks=std::min(80u,((blocks+15u)/16u)*16u);
-    const bool panel=(mask&a.execution.routed_gate&(1u<<unsigned(NATIVE_QUANTISED_Q4_1)))!=0;
     const std::size_t hidden=(H+(H/32)*8+15u)&~std::size_t(15u);
     const std::size_t fixed=2*sizeof(native_layout_ffn::PhaseProjection);
-    const std::size_t available=maximum_dynamic_bytes>hidden+fixed?maximum_dynamic_bytes-hidden-fixed:0;
-    unsigned panel_rows=64,panel_blocks=0;
-    if(panel) {
-        // Preserve the native16-block bank permutation while reducing only
-        // physical window/column capacity. The final one-row linear panel
-        // retains the same counted publication/consume algorithm at minimum LDS.
-        while(panel_rows>=4) {
-            const auto fit=unsigned(std::min<std::size_t>(wanted_blocks,available/(2*panel_rows*sizeof(std::uint32_t))));
-            panel_blocks=(fit/16)*16;
-            if(panel_blocks)break;
-            panel_rows/=2;
-        }
-        if(!panel_blocks) {
-            panel_rows=1;
-            const std::size_t raw_hidden=H+(H/32)*8;
-            const std::size_t linear_available=maximum_dynamic_bytes>raw_hidden+fixed?
-                maximum_dynamic_bytes-raw_hidden-fixed:0;
-            // Returning a real one-block minimum makes insufficient LDS fail
-            // cold admission precisely; it never skips or changes coefficient work.
-            panel_blocks=unsigned(std::max<std::size_t>(1,std::min<std::size_t>(wanted_blocks,
-                linear_available/(2*sizeof(std::uint32_t)))));
-        }
-    }
-    const std::size_t panel_bytes=std::size_t(2)*panel_blocks*panel_rows*sizeof(std::uint32_t);
-    const std::size_t gu=(panel_rows==1||!panel_blocks?H+(H/32)*8:hidden)+panel_bytes+fixed;
+    const std::size_t gu=hidden+kFullNativeCoalescedGUBytes+fixed;
     const std::size_t values=routes*F+S;
-    const std::size_t down=values+(values/32)*8+(routes+1)*64*sizeof(float);
+    const std::size_t down=values+(values/32)*8+(routes+1)*64*sizeof(float)+kFullNativeDownMinBatchBytes;
     const std::uint64_t router=(std::uint64_t(a.experts)+15)/16;
     const std::uint64_t gu_work=(std::uint64_t(a.routed_columns)+3)/4*routes;
     const std::uint64_t outputs=(std::uint64_t(a.hidden_columns)+63)/64;
-    return {std::max(gu,down),panel_blocks,panel_rows,std::max({router,gu_work,outputs,std::uint64_t{1}})};
+    return {std::max(gu,down),0u,64u,std::max({router,gu_work,outputs,std::uint64_t{1}})};
 }
 namespace full_native_ffn {
 using namespace native_layout_ffn;
@@ -543,13 +520,11 @@ struct RoutedGateUpTables : NativeQuantisedGridLookup {
 template<std::uint32_t Mask>
 __device__ __forceinline__ void routedGateUp(const NativeLayoutRouterFFNArgs& args,
     NativeLayoutFFNPhaseScratch& scratch,bool live,const int8_t* codes,const float* scales,
-    const int32_t* sums,unsigned char* arena,unsigned panel_blocks,unsigned panel_rows,unsigned available_after_hidden) {
+    const int32_t* sums,unsigned char* arena,unsigned available_after_hidden) {
     const auto& a=args.ffn;
     const unsigned H=a.hidden_columns,F=a.routed_columns,routes=a.top_k;
-    constexpr bool HasQ4=(Mask&(1u<<unsigned(NATIVE_QUANTISED_Q4_1)))!=0;
-    const std::size_t panel_words=HasQ4?std::size_t(panel_blocks)*panel_rows:0;
-    auto* panel=reinterpret_cast<unsigned*>(arena);
-    auto* records=reinterpret_cast<PhaseProjection*>(panel+2*panel_words);
+    auto* coalesced_lds=reinterpret_cast<float*>(arena);
+    auto* records=reinterpret_cast<PhaseProjection*>(arena+kFullNativeCoalescedGUBytes);
     const unsigned cohorts=min(routes,unsigned(gridDim.x));
     const unsigned bid=blockIdx.x;
     const unsigned cohort=unsigned((std::uint64_t(bid+1)*cohorts-1)/unsigned(gridDim.x));
@@ -561,9 +536,6 @@ __device__ __forceinline__ void routedGateUp(const NativeLayoutRouterFFNArgs& ar
     const unsigned last=min(F,unsigned(std::uint64_t(rank+1)*chunks/owners)*grain);
     const unsigned wave=waveMetadataValue(unsigned(threadIdx.x)/64),lane=phasePhysicalLane64();
     if(first==last)return; // Uniform empty owner still reaches the caller's grid join.
-    // The sealed role mask includes both gate and up across reachable bank epochs.
-    // Empty owners leave before populating LDS. Each remaining CTA will execute
-    // publishRoutedPair's join before a consumer reads the tables.
     using GridPolicy = RoutedGridPolicy<Mask>;
     using Grid = std::conditional_t<GridPolicy::iq2 || GridPolicy::iq3,
         RoutedGateUpTables<GridPolicy::iq2, GridPolicy::iq3>, NativeQuantisedGridLookup>;
@@ -573,13 +545,9 @@ __device__ __forceinline__ void routedGateUp(const NativeLayoutRouterFFNArgs& ar
         constexpr auto cached_formats = (GridPolicy::iq2 ? routedIQ2SBit : 0) |
                                         (GridPolicy::iq3 ? iq3_mask : 0);
         const auto live_formats = cached_formats & LLAMINAR_TUNED_SUFFIX_MASK(routed_gate);
-        const auto occupied = 2 * (panel_words * sizeof(unsigned) + sizeof(PhaseProjection));
+        const auto occupied = kFullNativeCoalescedGUBytes + 2 * sizeof(PhaseProjection);
         const auto available = available_after_hidden > occupied ? available_after_hidden - occupied : 0;
         const auto tables = routedGridLayout(live_formats, available);
-
-        // The original base is 16-byte-aligned. Complete K32 hidden Q8,
-        // both panel planes and the two role records preserve 8-byte alignment.
-        // Every selected span is contained in the already-admitted prefix extent.
         auto* iq2 = currentFormatAddress((CurrentFormatLDSValue<std::uint64_t>*)(records + 2));
         auto* iq3 = (CurrentFormatLDSValue<std::uint32_t>*)(iq2 + tables.iq2_entries);
         if (tables.iq2_entries) {
@@ -599,57 +567,41 @@ __device__ __forceinline__ void routedGateUp(const NativeLayoutRouterFFNArgs& ar
     for(unsigned route=cohort;route<routes;route+=cohorts) {
         publishRoutedPair(args,scratch,route,live,records);
         const auto* current=currentFormatAddress((CurrentFormatLDSValue<const PhaseProjection>*)records);
-        const auto& gate=current[0];const auto& up=current[1];
-        bool paired=false;
-        if constexpr(HasQ4)paired=waveMetadataValue(gate.ready)&&waveMetadataValue(up.ready)&&
-            waveMetadataValue(gate.codebook)==NATIVE_QUANTISED_Q4_1&&waveMetadataValue(up.codebook)==NATIVE_QUANTISED_Q4_1&&
-            waveMetadataValue(gate.numeric_validity)==PhaseProjectionValidation::State::Valid&&
-            waveMetadataValue(up.numeric_validity)==PhaseProjectionValidation::State::Valid&&
-            waveMetadataValue(gate.parts)==waveMetadataValue(up.parts)&&
-            waveMetadataValue(gate.partition_blocks)==waveMetadataValue(up.partition_blocks);
-        for(unsigned tile=first;tile<last;tile+=panel_rows) {
-            const unsigned count=min(panel_rows,last-tile),local=wave*4+(lane&3u),n=tile+local,part=lane>>2;
-            float g=0.f,u=0.f;
-            if(paired&&panel_blocks) {
-                for(unsigned block=0;block<H/32;block+=panel_blocks) {
-                    const unsigned blocks=min(panel_blocks,H/32-block);
-                    publishPanel(gate,F,tile,count,block,blocks,panel_rows,panel);
-                    publishPanel(up,F,tile,count,block,blocks,panel_rows,panel+panel_words);
-                    workgroupJoin<WorkgroupJoinMemory::LDSOnly>();
-                    if(local<count&&part<waveMetadataValue(gate.parts))
-                        consumeQ4Window(gate,up,n,F,H,part,block,blocks,local,panel_rows,panel,panel+panel_words,
-                            codes,scales,sums,g,u);
-                    // A subsequent window overwrites the same raw coefficient words.
-                    if(H/32-block>panel_blocks)workgroupJoin<WorkgroupJoinMemory::LDSOnly>();
-                }
-            } else if(local<count) {
-                bool shared_activation=false;
-#if defined(__gfx906__)
-                using Program=llaminar2::rocm::ResidentMoEFFNDecoderProgram;
-                // Original symmetric gate/up families only share the immutable
-                // K32 activation. Each role retains its own decoder and FP fold.
-                if constexpr(Mask==Program::familyMask<3>())
-                    shared_activation=pairedIndependentRolePartial<NATIVE_QUANTISED_Q4_0,GlobalWeightReader>(
-                        gate,up,n,codes,scales,sums,F,H,part,g,u);
-#endif
-                if(!shared_activation) {
-                    g=phasePartial<Mask,ActivationIssue::GateUpBlockPreload,GlobalWeightReader>(gate,n,codes,scales,sums,F,H,part,lookup);
-                    u=phasePartial<Mask,ActivationIssue::GateUpBlockPreload,GlobalWeightReader>(up,n,codes,scales,sums,F,H,part,lookup);
+        for(unsigned tile=first;tile<last;tile+=64u) {
+            const unsigned count=min(64u,last-tile);
+            const unsigned n=tile+lane;
+            // Single phasePartial<Mask> instantiation handles Gate (role 0) then Up (role 1):
+            // each wave owns one canonical K-partition across up to 64 contiguous output columns,
+            // delivering 100% coalesced loads and zero spills across all 18 codebooks.
+#pragma unroll 1
+            for(unsigned role=0u;role<2u;++role) {
+                const auto& rec=current[role];
+                const unsigned parts_r=waveMetadataValue(rec.parts);
+                if(lane<count&&wave<parts_r) {
+                    const float val=phasePartial<Mask,ActivationIssue::GateUpBlockPreload,GlobalWeightReader>(
+                        rec,n,codes,scales,sums,F,H,wave,lookup);
+                    coalesced_lds[(role*16u+wave)*65u+lane]=val;
                 }
             }
-            const NativeLayoutDownWaveGeometry geometry{16,4};
-            // Only waves owning a real output need the ordered P folds. The
-            // predicate is uniform across all64 peers: a partial final wave
-            // still supplies every original partition lane and publication
-            // mask. Empty waves keep the surrounding CTA publication joins.
-            if(wave*4u<count) {
-                g=orderedWorkerZeroFold(g,waveMetadataValue(gate.parts),geometry,lane&3u,lane);
-                u=orderedWorkerZeroFold(u,waveMetadataValue(up.parts),geometry,lane&3u,lane);
-                if(lane<4&&local<count)
-                    a.gate_partials[std::size_t(route)*F+n]=decode_equivalent::swigluValue(g,u);
+            workgroupJoin<WorkgroupJoinMemory::LDSOnly>();
+            if(threadIdx.x<count) {
+                const unsigned col=threadIdx.x;
+                const unsigned gate_parts=records[0].parts,up_parts=records[1].parts;
+                float gf=(gate_parts==1u)?coalesced_lds[col]:0.f;
+                if(gate_parts>1u) {
+#pragma unroll 1
+                    for(unsigned p=0u;p<gate_parts;++p)
+                        gf=rocm_native_quantised_accumulate_rn(gf,coalesced_lds[p*65u+col]);
+                }
+                float uf=(up_parts==1u)?coalesced_lds[16u*65u+col]:0.f;
+                if(up_parts>1u) {
+#pragma unroll 1
+                    for(unsigned p=0u;p<up_parts;++p)
+                        uf=rocm_native_quantised_accumulate_rn(uf,coalesced_lds[(16u+p)*65u+col]);
+                }
+                a.gate_partials[std::size_t(route)*F+tile+col]=decode_equivalent::swigluValue(gf,uf);
             }
-            // Covers record reuse for a later route as well as a later tile.
-            if(last-tile>panel_rows||routes-route>cohorts)workgroupJoin<WorkgroupJoinMemory::LDSOnly>();
+            if(last-tile>64u||routes-route>cohorts)workgroupJoin<WorkgroupJoinMemory::LDSOnly>();
         }
     }
 }
@@ -773,10 +725,32 @@ __device__ __forceinline__ void sharedItem(const NativeLayoutRouterFFNArgs& args
  * are independent of resident CTA count. There is no extra grid or CTA join
  * inside the wave task loop; empty/partial work still reaches the caller's join.
  */
+/** @brief Evaluate one logical 64-lane bank of the exact 128-lane router dot using LDS-cached FP16 hidden. */
+__device__ __forceinline__ float routerBank64Cached(const __half2* hidden_h2,const __half2* weights2,
+    unsigned pair_count,unsigned bank,unsigned lane) {
+    float sum=0.0f;
+    const unsigned start=lane+64u*bank;
+    for(unsigned i=start;i<pair_count;i+=256u) {
+        const float2 h0=__half22float2(hidden_h2[i]);
+        const float2 w0=__half22float2(weights2[i]);
+        const bool has1=(i+128u)<pair_count;
+        float2 h1{0.f,0.f},w1{0.f,0.f};
+        if(has1) {
+            h1=__half22float2(hidden_h2[i+128u]);
+            w1=__half22float2(weights2[i+128u]);
+        }
+        sum+=h0.x*w0.x+h0.y*w0.y;
+        if(has1)sum+=h1.x*w1.x+h1.y*w1.y;
+    }
+    sum=llaminar2::rocm::moe_wave_contract::rocm_moe_wave_reduce_sum_f32(sum);
+    return __builtin_bit_cast(float,__builtin_amdgcn_readlane(__builtin_bit_cast(int,sum),0));
+}
+
 template<std::uint32_t Mask>
 __device__ __forceinline__ void routerShared(const NativeLayoutRouterFFNArgs& args,
     NativeLayoutFFNPhaseScratch& scratch,bool live,const int8_t* codes,const float* scales,
-    const int32_t* sums,PhaseProjection* records,FullNativeHCFFNOutputDemand output_demand) {
+    const int32_t* sums,PhaseProjection* records,unsigned char* scratch_lds,std::size_t scratch_bytes,
+    FullNativeHCFFNOutputDemand output_demand) {
     const auto& a=args.ffn;
     // Independent wave leaders publish the two original immutable roles.
     // Each active publisher remains wave-uniform; canonical readiness, source
@@ -791,31 +765,103 @@ __device__ __forceinline__ void routerShared(const NativeLayoutRouterFFNArgs& ar
         const auto mask=LLAMINAR_TUNED_SUFFIX_MASK(shared_gate);
         writeProjection(records[role],phaseProjection(projection,policy,mask,a.hidden_columns));
     }
+    const unsigned H=unsigned(a.hidden_columns),S=unsigned(a.shared_columns);
+    const auto router_rows=NativeLayoutDownGeometry::rows(a.experts,blockIdx.x,gridDim.x);
+    const unsigned nl=router_rows.end-router_rows.begin;
+    const std::size_t h2_bytes=((std::size_t(H)*sizeof(__half))+15u)&~std::size_t(15u);
+    const std::size_t bank_bytes=std::size_t(nl)*2u*sizeof(float);
+    const bool use_cached_router=((H&1u)==0u)&&scratch_lds!=nullptr&&(scratch_bytes>=h2_bytes+bank_bytes);
+    __half2* lds_h2=use_cached_router?reinterpret_cast<__half2*>(scratch_lds):nullptr;
+    float* lds_banks=use_cached_router?reinterpret_cast<float*>(scratch_lds+h2_bytes):nullptr;
+    if(use_cached_router) {
+        const unsigned pair_count=H>>1;
+        for(unsigned i=threadIdx.x;i<pair_count;i+=1024u) {
+            const __half x=__float2half_rn(a.hidden[2u*i]);
+            const __half y=__float2half_rn(a.hidden[2u*i+1u]);
+            lds_h2[i]=__halves2half2(x,y);
+        }
+    }
     workgroupJoin<WorkgroupJoinMemory::LDSOnly>();
     const unsigned lane=phasePhysicalLane64(),wave=waveMetadataValue(unsigned(threadIdx.x)/64);
-    const auto router_rows=NativeLayoutDownGeometry::rows(a.experts,blockIdx.x,gridDim.x);
-    const auto shared_rows=NativeLayoutDownGeometry::rows(a.shared_columns,blockIdx.x,gridDim.x);
-    bool joint=false;
-    if constexpr(Mask&(1u<<unsigned(NATIVE_QUANTISED_Q8_0)))
-        joint=waveMetadataValue(records[0].codebook)==NATIVE_QUANTISED_Q8_0&&
-            waveMetadataValue(records[1].codebook)==NATIVE_QUANTISED_Q8_0;
-    const unsigned rows_per_item=joint?2u:4u;
-    const unsigned nl=router_rows.end-router_rows.begin,ns=shared_rows.end-shared_rows.begin;
-    const unsigned shared_tasks=(ns+rows_per_item-1)/rows_per_item;
     const unsigned scalar=blockIdx.x+1u==gridDim.x?1u:0u;
-    for(unsigned task=wave;task<nl+shared_tasks+scalar;task+=16) {
-        if(task<nl) {
-            const unsigned expert=router_rows.begin+task;
-            const float value=router128<true>(a.hidden,static_cast<const uint16_t*>(args.router_weights),
-                a.hidden_columns,a.experts,expert,lane);
-            if(lane==0)args.router_logits[expert]=value;
-        } else if(task<nl+shared_tasks) {
-            const unsigned first=shared_rows.begin+(task-nl)*rows_per_item;
-            sharedItem<Mask>(args,records,first,min(rows_per_item,shared_rows.end-first),joint,lane,codes,scales,sums,output_demand);
-        } else {
-            const float value=live?sharedGate256(a.hidden,a.shared_input_gate,a.hidden_columns,lane):0.f;
-            if(lane==0)a.down_partials[0]=value;
+
+    // 1) Router + Shared Input Gate: 2 waves per expert (bank 0 & bank 1) saturating all 16 waves
+    //    while reading FP16-rounded hidden once from LDS instead of 512x from global memory.
+    if(use_cached_router) {
+        const unsigned pair_count=H>>1;
+        const __half2* w_all=reinterpret_cast<const __half2*>(args.router_weights);
+        const unsigned router_tasks=nl*2u;
+        for(unsigned task=wave;task<router_tasks+scalar;task+=16u) {
+            if(task<router_tasks) {
+                const unsigned e_local=task>>1,bank=task&1u;
+                const unsigned expert=router_rows.begin+e_local;
+                const float val=routerBank64Cached(lds_h2,w_all+std::size_t(expert)*pair_count,pair_count,bank,lane);
+                if(lane==0u)lds_banks[task]=val;
+            } else {
+                const float value=live?sharedGate256(a.hidden,a.shared_input_gate,H,lane):0.f;
+                if(lane==0u)a.down_partials[0]=value;
+            }
         }
+        workgroupJoin<WorkgroupJoinMemory::LDSOnly>();
+        for(unsigned e_local=wave;e_local<nl;e_local+=16u) {
+            const float first=lds_banks[2u*e_local],second=lds_banks[2u*e_local+1u];
+            const float seed=lane==0u?first:(lane==1u?second:0.f);
+            const float logit=llaminar2::rocm::moe_wave_contract::rocm_moe_wave_reduce_sum_f32(seed);
+            if(lane==0u)args.router_logits[router_rows.begin+e_local]=logit;
+        }
+        workgroupJoin<WorkgroupJoinMemory::LDSOnly>();
+    } else {
+        for(unsigned task=wave;task<nl+scalar;task+=16u) {
+            if(task<nl) {
+                const unsigned expert=router_rows.begin+task;
+                const float value=router128<true>(a.hidden,static_cast<const uint16_t*>(args.router_weights),
+                    H,a.experts,expert,lane);
+                if(lane==0u)args.router_logits[expert]=value;
+            } else {
+                const float value=live?sharedGate256(a.hidden,a.shared_input_gate,H,lane):0.f;
+                if(lane==0u)a.down_partials[0]=value;
+            }
+        }
+    }
+
+    // 2) Shared Gate/Up: single phasePartial<Mask> instantiation across Gate then Up (32-col coalesced tiles).
+    const auto* current=currentFormatAddress((CurrentFormatLDSValue<const PhaseProjection>*)records);
+    float* lds_shared=reinterpret_cast<float*>(scratch_lds);
+    const unsigned tiles=(S+31u)/32u;
+    for(unsigned t=blockIdx.x;t<tiles;t+=gridDim.x) {
+        const unsigned first=t*32u,count=min(32u,S-first);
+        const unsigned n=first+lane;
+#pragma unroll 1
+        for(unsigned role=0u;role<2u;++role) {
+            const auto& rec=current[role];
+            const unsigned parts_r=waveMetadataValue(rec.parts);
+            if(lane<count&&wave<parts_r) {
+                const float val=phasePartial<Mask,ActivationIssue::GateUpBlockPreload,GlobalWeightReader>(
+                    rec,n,codes,scales,sums,S,H,wave);
+                lds_shared[(role*16u+wave)*33u+lane]=val;
+            }
+        }
+        workgroupJoin<WorkgroupJoinMemory::LDSOnly>();
+        if(threadIdx.x<count) {
+            const unsigned col=threadIdx.x,col_n=first+col;
+            const unsigned gate_parts=records[0].parts,up_parts=records[1].parts;
+            float gf=(gate_parts==1u)?lds_shared[col]:0.f;
+            if(gate_parts>1u) {
+#pragma unroll 1
+                for(unsigned p=0u;p<gate_parts;++p)
+                    gf=rocm_native_quantised_accumulate_rn(gf,lds_shared[p*33u+col]);
+            }
+            float uf=(up_parts==1u)?lds_shared[16u*33u+col]:0.f;
+            if(up_parts>1u) {
+#pragma unroll 1
+                for(unsigned p=0u;p<up_parts;++p)
+                    uf=rocm_native_quantised_accumulate_rn(uf,lds_shared[(16u+p)*33u+col]);
+            }
+            if(output_demand.contains(FullNativeHCFFNOutputRole::SharedGate))a.shared_gate_output[col_n]=gf;
+            if(output_demand.contains(FullNativeHCFFNOutputRole::SharedUp))a.shared_up_output[col_n]=uf;
+            a.gate_partials[std::size_t(a.top_k)*a.routed_columns+col_n]=decode_equivalent::swigluValue(gf,uf);
+        }
+        if(t+gridDim.x<tiles)workgroupJoin<WorkgroupJoinMemory::LDSOnly>();
     }
 }
 /**
@@ -938,7 +984,7 @@ __device__ __forceinline__ float downRow(const Binding& role,unsigned n,unsigned
 template<std::uint32_t Mask>
 __device__ __forceinline__ void down(const NativeLayoutRouterFFNArgs& args,NativeLayoutFFNPhaseScratch& scratch,
     bool live,const int8_t* codes,const float* scales,const int32_t* sums,float* completed,
-    FullNativeHCFFNOutputDemand output_demand) {
+    std::size_t extra_lds_floats,FullNativeHCFFNOutputDemand output_demand) {
     const auto& a=args.ffn;const unsigned H=a.hidden_columns,F=a.routed_columns,S=a.shared_columns,routes=a.top_k;
     auto owned=NativeLayoutDownGeometry::rows(H,blockIdx.x,gridDim.x);
     if constexpr (RoutedGridPolicy<Mask>::iq2) {
@@ -960,28 +1006,62 @@ __device__ __forceinline__ void down(const NativeLayoutRouterFFNArgs& args,Nativ
     const unsigned wave=waveMetadataValue(unsigned(threadIdx.x)/64),lane=phasePhysicalLane64();
     constexpr unsigned shared_slot=NativeLayoutDownGeometry::maximum_capacity-1;
     const auto* records=currentFormatAddress((CurrentFormatLDSValue<const PhaseProjection>*)bindings);
+    unsigned max_parts=1u;
+    for(unsigned r=0u;r<=routes;++r) {
+        const unsigned slot=(r<routes)?r:shared_slot;
+        const unsigned p=waveMetadataValue(records[slot].parts);
+        if(p>max_parts)max_parts=p;
+    }
+    const unsigned floats_per_route=max_parts*64u;
+    const unsigned batch_routes=max(1u,min(routes+1u,static_cast<unsigned>(extra_lds_floats/floats_per_route)));
+    float* part_lds=completed+std::size_t(routes+1u)*64u;
     for(unsigned first=owned.begin;first<owned.end;first+=64) {
         const unsigned count=min(64u,owned.end-first);
-        for(unsigned route=wave;route<=routes;route+=16) {
-            if(lane<count) {
-                const unsigned n=first+lane;
-                float value;
-                if(route<routes) {
-                    const float raw=downRow<Mask>(records[route],n,H,F,
-                        codes+std::size_t(route)*F,scales+std::size_t(route)*(F/32),sums+std::size_t(route)*(F/32));
-                    value=rocm_native_quantised_weight_route_rn(scratch.route_weights[route],raw);
-                    if(output_demand.contains(FullNativeHCFFNOutputRole::RouteContributions))
-                        a.route_contributions[std::size_t(route)*H+n]=value;
-                } else {
-                    const std::size_t offset=std::size_t(routes)*F;
-                    const float raw=downRow<Mask>(records[shared_slot],n,H,S,
-                        codes+offset,scales+offset/32,sums+offset/32);
-                    value=rocm_native_quantised_accumulate_rn(0.f,rocm_native_quantised_weight_route_rn(1.f,raw));
+        // Single phasePartial<Mask> instantiation distributes all (route, partition) tasks
+        // across all 16 waves in LDS-bounded batches, preserving exact ascending 0..parts-1
+        // FP32 accumulation and 64-col coalescing for every codebook.
+        for(unsigned rb=0u;rb<=routes;rb+=batch_routes) {
+            const unsigned re=min(routes+1u,rb+batch_routes);
+            const unsigned batch_n=re-rb;
+            const unsigned total_tasks=batch_n*max_parts;
+            for(unsigned task=wave;task<total_tasks;task+=16u) {
+                const unsigned lr=task/max_parts,part=task%max_parts,r=rb+lr;
+                const unsigned slot=(r<routes)?r:shared_slot;
+                const unsigned parts_r=waveMetadataValue(records[slot].parts);
+                if(part<parts_r&&lane<count) {
+                    const unsigned n=first+lane;
+                    const std::size_t off=(r<routes)?(std::size_t(r)*F):(std::size_t(routes)*F);
+                    const unsigned r_K=(r<routes)?F:S;
+                    const float val=phasePartial<Mask,ActivationIssue::DownWordsPreload,GlobalWeightReader>(
+                        records[slot],n,codes+off,scales+off/32u,sums+off/32u,H,r_K,part);
+                    part_lds[(lr*max_parts+part)*64u+lane]=device_fp32_contract::multiply(val,1.f);
                 }
-                completed[std::size_t(route)*64+lane]=value;
             }
+            workgroupJoin<WorkgroupJoinMemory::LDSOnly>();
+            for(unsigned item=threadIdx.x;item<batch_n*64u;item+=1024u) {
+                const unsigned lr=item>>6,col=item&63u;
+                if(col<count) {
+                    const unsigned r=rb+lr,slot=(r<routes)?r:shared_slot,n=first+col;
+                    const unsigned parts_r=records[slot].parts;
+                    float raw=(parts_r==1u)?part_lds[lr*max_parts*64u+col]:0.f;
+                    if(parts_r>1u) {
+#pragma unroll 1
+                        for(unsigned p=0u;p<parts_r;++p)
+                            raw=rocm_native_quantised_accumulate_rn(raw,part_lds[(lr*max_parts+p)*64u+col]);
+                    }
+                    float value;
+                    if(r<routes) {
+                        value=rocm_native_quantised_weight_route_rn(scratch.route_weights[r],raw);
+                        if(output_demand.contains(FullNativeHCFFNOutputRole::RouteContributions))
+                            a.route_contributions[std::size_t(r)*H+n]=value;
+                    } else {
+                        value=rocm_native_quantised_accumulate_rn(0.f,rocm_native_quantised_weight_route_rn(1.f,raw));
+                    }
+                    completed[std::size_t(r)*64u+col]=value;
+                }
+            }
+            workgroupJoin<WorkgroupJoinMemory::LDSOnly>();
         }
-        workgroupJoin<WorkgroupJoinMemory::LDSOnly>();
         if(threadIdx.x<count) {
             const unsigned local=threadIdx.x,n=first+local;
             const float routed=device_ordered_route_fold::sum(completed+local,std::size_t(64),routes);
@@ -1026,19 +1106,15 @@ __device__ __forceinline__ void tunedFullNativeHCFFNSuffix(const NativeLayoutRou
     auto* codes=reinterpret_cast<int8_t*>(storage);
     auto* scales=reinterpret_cast<float*>(codes+H);
     auto* sums=reinterpret_cast<int32_t*>(scales+H/32);
-    constexpr bool HasQ4=(Mask&(1u<<unsigned(NATIVE_QUANTISED_Q4_1)))!=0;
-    const bool use_panel=(LLAMINAR_TUNED_SUFFIX_MASK(routed_gate)&(1u<<unsigned(NATIVE_QUANTISED_Q4_1)))!=0;
-    const unsigned panel_blocks=args.full_entry_panel.blocks,panel_rows=args.full_entry_panel.rows;
-    if((panel_rows!=1&&(panel_rows<4||panel_rows>64||(panel_rows&(panel_rows-1))))||
-        panel_blocks>80||(panel_rows!=1&&(panel_blocks&15u))||
-        (use_panel&&(!HasQ4||!panel_blocks))||(!use_panel&&panel_blocks))__builtin_trap();
-    const std::size_t raw_hidden=std::size_t(H)+std::size_t(H/32)*8;
-    const std::size_t hidden_bytes=panel_rows==1||!panel_blocks?raw_hidden:(raw_hidden+15u)&~std::size_t(15u);
+    if(args.full_entry_panel.rows!=64u||args.full_entry_panel.blocks!=0u)__builtin_trap();
+    const std::size_t hidden_bytes=(std::size_t(H)+std::size_t(H/32)*8+15u)&~std::size_t(15u);
     auto* arena=storage+hidden_bytes;
-    const std::size_t panel_words=use_panel?std::size_t(panel_blocks)*panel_rows:0;
-    auto* records=reinterpret_cast<PhaseProjection*>(arena+2*panel_words*sizeof(unsigned));
+    auto* records=reinterpret_cast<PhaseProjection*>(arena+kFullNativeCoalescedGUBytes);
+    const std::size_t gu_admitted=hidden_bytes+kFullNativeCoalescedGUBytes+2u*sizeof(PhaseProjection);
+    const std::size_t dynamic_bound=max(std::size_t(prefix_bytes),gu_admitted);
     full_native_ffn::quantizeRow(a.hidden,H,codes,scales,sums);
-    full_native_ffn::routerShared<Mask>(args,scratch,live,codes,scales,sums,records,output_demand);
+    full_native_ffn::routerShared<Mask>(args,scratch,live,codes,scales,sums,records,
+        arena,kFullNativeCoalescedGUBytes,output_demand);
     grid.sync(); // Original raw logits/shared GU publication; every CTA arrives.
     if(threadIdx.x==0)scratch.gate_state.reduction[0]=live?1.f/(1.f+expf(-a.down_partials[0])):0.f;
     auto& selection=scratch.phase.selection;
@@ -1051,8 +1127,8 @@ __device__ __forceinline__ void tunedFullNativeHCFFNSuffix(const NativeLayoutRou
             RoutedExpertRowExecutionPolicy::IntermediateShardLocal,true>(scratch.gate_state.bank.borrow(),
             selection.selected_ids,selection.selected_weights,a.experts,routes,args.router_indices,
             args.router_weights_output,args.write_router_outputs,a.rows.countOwner(),args.router_publication);
-    full_native_ffn::routedGateUp<Mask>(args,scratch,live,codes,scales,sums,arena,panel_blocks,panel_rows,
-        prefix_bytes > hidden_bytes ? unsigned(prefix_bytes - hidden_bytes) : 0u);
+    full_native_ffn::routedGateUp<Mask>(args,scratch,live,codes,scales,sums,arena,
+        dynamic_bound > hidden_bytes ? unsigned(dynamic_bound - hidden_bytes) : 0u);
     grid.sync(); // Retire every raw-logit selector reader and publish routed activation/descriptors.
     if(output_demand.contains(FullNativeHCFFNOutputRole::RouterProbabilities)&&blockIdx.x==0)
       for(unsigned expert=threadIdx.x;expert<unsigned(a.experts);expert+=1024)
@@ -1064,7 +1140,10 @@ __device__ __forceinline__ void tunedFullNativeHCFFNSuffix(const NativeLayoutRou
     // Quantizer's unchanged all-CTA join retires probability/selection reads;
     // only now may the existing static union be reused for down metadata.
     auto* completed=reinterpret_cast<float*>(sums+values/32);
-    full_native_ffn::down<Mask>(args,scratch,live,codes,scales,sums,completed,output_demand);
+    const std::size_t down_base_bytes=values+(values/32u)*8u+std::size_t(routes+1u)*64u*sizeof(float);
+    const std::size_t down_total_bytes=max(dynamic_bound,down_base_bytes+kFullNativeDownMinBatchBytes);
+    const std::size_t extra_down_floats=(down_total_bytes-down_base_bytes)/sizeof(float);
+    full_native_ffn::down<Mask>(args,scratch,live,codes,scales,sums,completed,extra_down_floats,output_demand);
 }
 } // namespace llaminar2::rocm
 

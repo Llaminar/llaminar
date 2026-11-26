@@ -5867,6 +5867,32 @@ set_tests_properties(V2_Unit_BackendGemmLayoutPolicy PROPERTIES
     TIMEOUT 30
 )
 
+# Keep every compiled translation unit under 7,000 lines for parallel Ninja builds.
+add_test(NAME V2_Unit_TULineLimitPolicySelfTest
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/check_tu_line_limit_policy.py
+            --self-test
+)
+set_tests_properties(V2_Unit_TULineLimitPolicySelfTest PROPERTIES
+    LABELS "V2;Unit;CPU;DeviceFree;SourcePolicy;Regression"
+    TIMEOUT 30
+)
+foreach(tu_limit_gate IN ITEMS Unit Integration)
+    add_test(NAME V2_${tu_limit_gate}_TULineLimitPolicy
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/check_tu_line_limit_policy.py
+                --repo-root ${CMAKE_SOURCE_DIR}/../..
+    )
+    set(tu_limit_labels "V2;${tu_limit_gate};CPU;DeviceFree;SourcePolicy;Regression")
+    if(tu_limit_gate STREQUAL "Integration")
+        list(APPEND tu_limit_labels "ProductionTestPreflight")
+    endif()
+    set_tests_properties(V2_${tu_limit_gate}_TULineLimitPolicy PROPERTIES
+        LABELS "${tu_limit_labels}"
+        TIMEOUT 30
+    )
+endforeach()
+
 add_test(NAME V2_Unit_KVStateLifecyclePolicySelfTest
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_kv_state_lifecycle_policy.py
@@ -12180,6 +12206,11 @@ if(TARGET v2_integration_cuda_retained_hc_ffn)
             --gtest_filter=CUDARetainedHCFFN.RecordedFragmentRouting
         LABELS "V2;Integration;ProductionTestPreflight;CUDA;MoE;Hyperconnection;GraphCapture;Replay;ByteExact;Regression;HardwareOptional;LocalHostDevices;Devices1;NativeISA-sm_86"
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 120)
+    add_v2_test(V2_Integration_CUDA_RetainedHCFFNNativePacketFrontierReplay
+        COMMAND $<TARGET_FILE:v2_integration_cuda_retained_hc_ffn>
+            --gtest_filter=CUDARetainedHCFFN.RecordedNativePacketFrontier
+        LABELS "V2;Integration;ProductionTestPreflight;CUDA;MoE;Hyperconnection;GraphCapture;Replay;ByteExact;Regression;HardwareOptional;LocalHostDevices;Devices1;NativeISA-sm_86"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 120)
     add_v2_test(V2_Integration_CUDA_RetainedHCFFNMappedDmaDispatchReplay
         COMMAND $<TARGET_FILE:v2_integration_cuda_retained_hc_ffn>
             --gtest_filter=CUDARetainedHCFFN.RecordedMappedDmaDispatchPublications
@@ -12195,6 +12226,11 @@ if(TARGET v2_integration_cuda_retained_hc_ffn)
             COMMAND $<TARGET_FILE:v2_integration_cuda_retained_hc_ffn>
                 --gtest_filter=CUDARetainedHCFFN.RecordedGroupedPacketPublications
             LABELS "V2;Integration;ProductionTestPreflight;CUDA;MoE;MTP;GraphCapture;Replay;ByteExact;Regression;HardwareOptional;LocalHostDevices;Devices1;NativeISA-sm_86"
+            MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 120)
+        add_v2_test(V2_Integration_CUDA_RetainedGroupedFFNAllSources
+            COMMAND $<TARGET_FILE:v2_integration_cuda_retained_hc_ffn>
+                --gtest_filter=CUDARetainedHCFFN.GroupedPacketsMatchStagedAllSources
+            LABELS "V2;Integration;ProductionTestPreflight;CUDA;MoE;MTP;GraphCapture;AllFormats;ByteExact;Regression;HardwareOptional;LocalHostDevices;Devices1;NativeISA-sm_86"
             MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 120)
     endif()
 endif()
@@ -15238,6 +15274,23 @@ add_v2_test(V2_Integration_ComputeGraphRetainedStorageMergeLifetime
     ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ComputeGraphRetainedStorageMergeLifetime)
 
+# Test: GraphComposer, HeterogeneousOverlaySection, LocalMegakernelLowering
+# Device-free contract tests proving typed dependencies, heterogeneous ticket
+# invariants, and megakernel region contraction reject miswired edges cold.
+add_executable(v2_test_graph_composer unit/execution/local_execution/graph/Test__GraphComposer.cpp)
+target_link_libraries(v2_test_graph_composer llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_GraphComposer
+    COMMAND $<TARGET_FILE:v2_test_graph_composer>
+    LABELS "V2;Unit;Execution;ComputeGraph;GraphComposer;Contract;DAG"
+    MPI_PROCS 1
+)
+add_v2_test(V2_Contract_GraphComposerDeclarativeInvariants
+    COMMAND $<TARGET_FILE:v2_test_graph_composer>
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Execution;Contract;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Contract_GraphComposerDeclarativeInvariants)
+
 # Test: IGraphBuilder interface and MockGraphBuilder
 # Part of Phase 5: Declarative QwenStandardGraph refactoring - Interface extraction
 add_executable(v2_test_igraph_builder unit/execution/local_execution/graph/Test__IGraphBuilder.cpp)
@@ -17264,6 +17317,15 @@ add_v2_test(V2_Integration_RankLocalGPUOwnership
     ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
 if(TEST V2_Integration_RankLocalGPUOwnership)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_RankLocalGPUOwnership)
+endif()
+add_v2_test(V2_Integration_FlexibleMultiBackendTopologyContract
+    COMMAND $<TARGET_FILE:v2_test_execution_plan_builder>
+        --gtest_filter=ResolvedRankOrchestration.FlexibleMultiBackendTopologyCountsAdmissionContract
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;Topology;Contract;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
+if(TEST V2_Integration_FlexibleMultiBackendTopologyContract)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_FlexibleMultiBackendTopologyContract)
 endif()
 if(TARGET v2_unit_moe_expert_overlay_runtime_plan)
     add_v2_test(V2_Integration_RankLocalGPUOverlayOwnership
@@ -39197,11 +39259,17 @@ endif()
 if(HAVE_CUDA AND TEST V2_Integration_CUDA_RetainedHCFFNFragmentRoutingReplay)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDA_RetainedHCFFNFragmentRoutingReplay)
 endif()
+if(HAVE_CUDA AND TEST V2_Integration_CUDA_RetainedHCFFNNativePacketFrontierReplay)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDA_RetainedHCFFNNativePacketFrontierReplay)
+endif()
 if(HAVE_CUDA AND TEST V2_Integration_CUDA_RetainedHCFFNMappedDmaDispatchReplay)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDA_RetainedHCFFNMappedDmaDispatchReplay)
 endif()
 if(HAVE_CUDA AND TEST V2_Integration_CUDA_GroupedLiveGridContract)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDA_GroupedLiveGridContract)
+endif()
+if(HAVE_CUDA AND TEST V2_Integration_CUDA_RetainedGroupedFFNAllSources)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDA_RetainedGroupedFFNAllSources)
 endif()
 if(HAVE_CUDA AND TEST V2_Integration_CUDA_RetainedGroupedFFNPacketReplay)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDA_RetainedGroupedFFNPacketReplay)
@@ -44378,6 +44446,12 @@ add_v2_test(V2_Integration_MoEGrantedDispatchPublicationReplay
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MoE;MappedHost;Replay;Regression"
     MPI_PROCS 1 NO_MODELS TIMEOUT 30)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEGrantedDispatchPublicationReplay)
+add_v2_test(V2_Integration_PrefillFixedPointAndExactQ8WireReplay
+    COMMAND $<TARGET_FILE:v2_unit_moe_overlay_activation_epoch_protocol>
+        --gtest_filter=Test__MoEOverlayActivationEpochProtocol.PrefillFixedPointAndExactQ8WireReplay
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MoE;MappedHost;Replay;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PrefillFixedPointAndExactQ8WireReplay)
 if(HAVE_CUDA AND HAVE_ROCM AND TARGET v2_integration_captured_transfer_channel)
     foreach(_granted_dispatch_case
         CUDAContinuationDelayedDispatchAfterFreshFollowerGrant

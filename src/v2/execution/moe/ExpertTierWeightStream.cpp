@@ -19,6 +19,7 @@
  */
 
 #include "ExpertTierWeightStream.h"
+#include "../../kernels/cpu/gemm/CPUNativeQuantisedWeightPacker.h"
 
 #include "../../utils/FNV1a.h"
 
@@ -136,12 +137,17 @@ namespace llaminar2
                 has_emins = format->has_emins;
                 return true;
             }
-            case CPUEncoding::IQ3SExpandedSourceScale:
-                if (cpu.codebook_id != 11 || !cpu.is_superblock || cpu.is_asymmetric || cpu.payload_bytes != 13)
-                    return reject(error, "IQ3_S source-tuple CPU stream metadata is invalid");
-                codebook = 11; payload_bytes = 13; is_asymmetric = true;
-                return true;
             case CPUEncoding::NibbleLUTSourceScale:
+                if (cpu.codebook_id == 11)
+                {
+                    if (!cpu.is_superblock || cpu.is_asymmetric ||
+                        (cpu.payload_bytes != 13 && cpu.payload_bytes != 16))
+                        return reject(error, "IQ3_S source-tuple CPU stream metadata is invalid");
+                    codebook = 11;
+                    payload_bytes = 13;
+                    is_asymmetric = true;
+                    return true;
+                }
                 if (cpu.codebook_id != 4 || !cpu.is_superblock ||
                     cpu.is_asymmetric || cpu.payload_bytes != 16)
                     return reject(error, "IQ4_XS source-tuple CPU stream metadata is invalid");
@@ -149,14 +155,45 @@ namespace llaminar2
                 payload_bytes = 16;
                 is_asymmetric = true; // Physical secondary plane, not additive minima.
                 return true;
+            case CPUEncoding::UnsignedNibble:
+                if ((cpu.codebook_id != 0 && cpu.codebook_id != 5) ||
+                    cpu.payload_bytes != 16 ||
+                    cpu.is_asymmetric != (cpu.codebook_id == 5))
+                {
+                    return reject(
+                        error,
+                        "UnsignedNibble CPU stream requires codebook 0 or 5 and a 16-byte payload");
+                }
+                codebook = cpu.codebook_id;
+                payload_bytes = 16;
+                is_asymmetric = cpu.is_asymmetric;
+                return true;
             case CPUEncoding::NibbleLUT:
+                if (cpu.codebook_id == 12 || cpu.codebook_id == 15)
+                {
+                    if (!cpu.is_superblock || cpu.is_asymmetric)
+                        return reject(error, "IQ3_XXS/IQ2_XXS NibbleLUT CPU stream metadata is invalid");
+                    codebook = 19;
+                    payload_bytes = 32;
+                    is_asymmetric = false;
+                    return true;
+                }
+                if (cpu.codebook_id == 16)
+                {
+                    if (!cpu.is_superblock || !cpu.is_asymmetric)
+                        return reject(error, "IQ1_S NibbleLUT CPU stream metadata is invalid");
+                    codebook = kNativeQuantisedExpandedInt8MinCodebook;
+                    payload_bytes = 32;
+                    is_asymmetric = true;
+                    return true;
+                }
                 if ((cpu.codebook_id == 4 && cpu.is_superblock) ||
                     !isNibbleCodebook(cpu.codebook_id) ||
                     cpu.payload_bytes != 16)
                 {
                     return reject(
                         error,
-                        "Nibble CPU stream requires codebook 0, 4, or 5 and a 16-byte payload");
+                        "Nibble CPU stream requires codebook 0, 4, 5, 12, 15, or 16");
                 }
                 codebook = cpu.codebook_id;
                 payload_bytes = 16;
@@ -173,6 +210,31 @@ namespace llaminar2
                 codebook = 8;
                 payload_bytes = 24;
                 is_asymmetric = true;
+                return true;
+            case CPUEncoding::CompactFiveBit:
+                if ((cpu.codebook_id != 6 && cpu.codebook_id != 7) ||
+                    cpu.payload_bytes != 20 ||
+                    cpu.is_asymmetric != (cpu.codebook_id == 7))
+                {
+                    return reject(
+                        error,
+                        "CompactFiveBit CPU stream requires codebook 6/7, 20-byte payload, and matching asymmetry");
+                }
+                codebook = cpu.codebook_id;
+                payload_bytes = 20;
+                is_asymmetric = cpu.is_asymmetric;
+                return true;
+            case CPUEncoding::UnsignedInt8:
+                if ((cpu.codebook_id != 19 && cpu.codebook_id != 20 && cpu.codebook_id != 21) ||
+                    cpu.payload_bytes != 32 || cpu.is_asymmetric)
+                {
+                    return reject(
+                        error,
+                        "UnsignedInt8 CPU stream requires codebook 19/20/21, 32-byte payload, and symmetric scales");
+                }
+                codebook = 19;
+                payload_bytes = 32;
+                is_asymmetric = false;
                 return true;
             case CPUEncoding::ExpandedInt8:
                 // A single scale/minimum cannot express these source families.
@@ -358,13 +420,31 @@ namespace llaminar2
             }
             else if (gpu.codebook_id == 11)
             {
-                cpu.encoding = CPUEncoding::IQ3SExpandedSourceScale;
-                cpu.payload_bytes = 13; cpu.is_asymmetric = false;
+                cpu.encoding = CPUEncoding::NibbleLUTSourceScale;
+                cpu.payload_bytes = 16;
+                cpu.is_asymmetric = false;
+            }
+            else if (gpu.source_codebook_id == 12 || gpu.source_codebook_id == 15 || gpu.source_codebook_id == 16)
+            {
+                cpu.encoding = CPUEncoding::NibbleLUT;
+                cpu.payload_bytes = 16;
+                cpu.is_asymmetric = (gpu.source_codebook_id == 16);
+            }
+            else if (gpu.codebook_id == 0 || gpu.codebook_id == 5)
+            {
+                cpu.encoding = CPUEncoding::UnsignedNibble;
+                cpu.payload_bytes = 16;
             }
             else if (isNibbleCodebook(gpu.codebook_id))
             {
                 cpu.encoding = CPUEncoding::NibbleLUT;
                 cpu.payload_bytes = 16;
+            }
+            else if (gpu.codebook_id == 6 || gpu.codebook_id == 7)
+            {
+                cpu.encoding = CPUEncoding::CompactFiveBit;
+                cpu.payload_bytes = 20;
+                cpu.is_asymmetric = (gpu.codebook_id == 7);
             }
             else if (gpu.codebook_id == 8)
             {
@@ -377,6 +457,14 @@ namespace llaminar2
             {
                 cpu.encoding = CPUEncoding::CompactMultiScale;
                 cpu.payload_bytes = gpu.payload_bytes_per_block;
+            }
+            else if ((gpu.source_codebook_id == 19 || gpu.source_codebook_id == 20 || gpu.source_codebook_id == 21) &&
+                     gpu.codebook_id == 19)
+            {
+                cpu.encoding = CPUEncoding::UnsignedInt8;
+                cpu.payload_bytes = 32;
+                cpu.is_asymmetric = false;
+                cpu.is_superblock = gpu.is_superblock;
             }
             else
             {
@@ -716,12 +804,45 @@ namespace llaminar2
         {
             const size_t payload_per_column = layout.cpu_data_stride / 64;
             const bool q6 = layout.cpu_encoding == cpu::native_quantised::CPUNativeQuantisedEncoding::Q6KNativeDualScale;
+            const bool five_bit = layout.cpu_encoding == cpu::native_quantised::CPUNativeQuantisedEncoding::CompactFiveBit;
             const auto copy = [&](size_t from, size_t to, size_t bytes) {
                 std::memcpy(destination.data() + to, source.data() + from, bytes);
             };
-            for (size_t group = 0; group < (q6 ? 4 : payload_per_column / 4); ++group)
+            for (size_t group = 0; group < ((q6 || five_bit) ? 4 : payload_per_column / 4); ++group)
                 copy(source_base + group * source_columns * 4 + source_column * 4,
                      destination_base + group * destination_columns * 4 + destination_column * 4, 4);
+            if (five_bit)
+                for (size_t byte_idx = 0; byte_idx < 4; ++byte_idx)
+                {
+                    uint8_t value = 0;
+                    if (source_columns == 64)
+                    {
+                        const size_t z = source_column / 16;
+                        const size_t bit = (source_column % 16) * 4;
+                        uint64_t lo = 0, hi = 0;
+                        std::memcpy(&lo, source.data() + source_base + 1024 + (2 * byte_idx) * 32 + z * 8, 8);
+                        std::memcpy(&hi, source.data() + source_base + 1024 + (2 * byte_idx + 1) * 32 + z * 8, 8);
+                        value = static_cast<uint8_t>(((lo >> bit) & 15u) | (((hi >> bit) & 15u) << 4));
+                    }
+                    else value = source[source_base + 16 * source_columns + byte_idx * source_columns + source_column];
+                    if (destination_columns == 64)
+                    {
+                        const size_t z = destination_column / 16;
+                        const size_t bit = (destination_column % 16) * 4;
+                        std::unique_lock<std::mutex> lock;
+                        if (write_mutex) lock = std::unique_lock<std::mutex>(*write_mutex);
+                        uint64_t lo = 0, hi = 0;
+                        uint8_t *lo_ptr = destination.data() + destination_base + 1024 + (2 * byte_idx) * 32 + z * 8;
+                        uint8_t *hi_ptr = destination.data() + destination_base + 1024 + (2 * byte_idx + 1) * 32 + z * 8;
+                        std::memcpy(&lo, lo_ptr, 8);
+                        std::memcpy(&hi, hi_ptr, 8);
+                        lo = (lo & ~(uint64_t(15) << bit)) | (uint64_t(value & 15) << bit);
+                        hi = (hi & ~(uint64_t(15) << bit)) | (uint64_t(value >> 4) << bit);
+                        std::memcpy(lo_ptr, &lo, 8);
+                        std::memcpy(hi_ptr, &hi, 8);
+                    }
+                    else destination[destination_base + 16 * destination_columns + byte_idx * destination_columns + destination_column] = value;
+                }
             if (q6)
                 for (size_t group = 0; group < 8; ++group)
                 {
@@ -1150,7 +1271,9 @@ namespace llaminar2
             gpu_source.is_asymmetric == canonicalDeviceVnniFormat(source_format).is_asymmetric &&
             gpu_source.has_emins == source_format.has_emins;
         const bool normalized_source =
-            manifest.cpu_encoding == CPUEncoding::ExpandedInt8 &&
+            (manifest.cpu_encoding == CPUEncoding::ExpandedInt8 ||
+             (manifest.cpu_encoding == CPUEncoding::NibbleLUT &&
+              (source_format.codebook_id == 12 || source_format.codebook_id == 15 || source_format.codebook_id == 16))) &&
             gpu_source.payload_bytes_per_block == 32 &&
             !gpu_source.has_emins &&
             gpu_source.is_asymmetric == source_format.is_asymmetric &&
@@ -1333,6 +1456,45 @@ namespace llaminar2
 
                 if (cpu.usesNibbleLUT())
                 {
+                    if (cpu::native_quantised::is_repacked_nibble_lut_format(cpu.codebook_id))
+                    {
+                        uint8_t nibbles[16];
+                        for (int value = 0; value < 16; ++value)
+                            nibbles[value] = cpu.native_interleaved[interleavedValueOffset(cpu, n, kb, value)];
+                        int8_t decoded[32];
+                        cpu::native_quantised::decode_nibble_lut_block(cpu.codebook_id, nibbles, decoded);
+                        if (cpu.codebook_id == 11)
+                        {
+                            // Invert exact canonical IQ3_S grid into 13-byte GPU payload.
+                            uint8_t high = 0;
+                            uint8_t signs[4]{};
+                            for (int group = 0; group < 8; ++group)
+                            {
+                                const auto encoded = native_quantised_iq3s_scale::encodeGridQuartet(
+                                    decoded + 4 * group, iq3s_grid);
+                                if (!encoded.valid())
+                                    return reject(error, "IQ3_S CPU payload is outside original grid");
+                                destination[group] = static_cast<uint8_t>(encoded.index);
+                                high |= static_cast<uint8_t>((encoded.index >> 8) << group);
+                                signs[group / 2] |= static_cast<uint8_t>(encoded.signs << (4 * (group % 2)));
+                            }
+                            destination[8] = high;
+                            std::memcpy(destination + 9, signs, sizeof(signs));
+                            output.scales[linear] = cpu.chunkScales(n / 64, kb)[n % 64];
+                            output.mins[linear] = cpu.chunkMins(n / 64, kb)[n % 64];
+                            if (!native_quantised_iq3s_scale::valid(output.mins[linear]))
+                                return reject(error, "IQ3_S source nibble is invalid");
+                        }
+                        else
+                        {
+                            // IQ3_XXS/IQ2_XXS/IQ1_S promote to normalized signed INT8 (codebook 19/23).
+                            std::memcpy(destination, decoded, 32);
+                            output.scales[linear] = cpu.chunkScales(n / 64, kb)[n % 64];
+                            if (cpu.is_asymmetric)
+                                output.mins[linear] = cpu.chunkMins(n / 64, kb)[n % 64];
+                        }
+                        continue;
+                    }
                     // Compact nibbles are only transposed; quantized bits do not change.
                     for (int value = 0; value < 16; ++value)
                     {
@@ -1340,11 +1502,12 @@ namespace llaminar2
                             cpu.native_interleaved[
                                 interleavedValueOffset(cpu, n, kb, value)];
                     }
+                    const size_t comp_bytes = cpu.usesInlineCompensation() ? 128u : 0u;
                     // Compensation is CPU-only derived metadata and is not returned.
                     std::memcpy(
                         &output.scales[linear],
                         cpu.native_interleaved.data() +
-                            unit + cpu.data_stride + 128u +
+                            unit + cpu.data_stride + comp_bytes +
                             static_cast<size_t>(n % 64) * sizeof(uint16_t),
                         sizeof(uint16_t));
                     if (cpu.is_asymmetric || cpu.usesNibbleLUTSourceScale())
@@ -1352,36 +1515,36 @@ namespace llaminar2
                         std::memcpy(
                             &output.mins[linear],
                             cpu.native_interleaved.data() +
-                                unit + cpu.data_stride + 256u +
+                                unit + cpu.data_stride + comp_bytes + 128u +
                                 static_cast<size_t>(n % 64) * sizeof(uint16_t),
                             sizeof(uint16_t));
                     }
                     continue;
                 }
 
-                if (cpu.usesIQ3SExpandedSourceScale())
+                if (cpu.encoding == CPUEncoding::UnsignedInt8)
                 {
-                    // Invert only the exact existing grid; never normalize to19.
-                    uint8_t high = 0;
-                    uint8_t signs[4]{};
-                    for (int group = 0; group < 8; ++group)
+                    for (int value = 0; value < 32; ++value)
                     {
-                        int8_t values[4];
-                        for (int lane = 0; lane < 4; ++lane)
-                            values[lane] = static_cast<int8_t>(cpu.native_interleaved[
-                                interleavedValueOffset(cpu,n,kb,4*group+lane)]);
-                        const auto encoded = native_quantised_iq3s_scale::encodeGridQuartet(values, iq3s_grid);
-                        if (!encoded.valid()) return reject(error, "IQ3_S CPU payload is outside original grid");
-                        destination[group] = static_cast<uint8_t>(encoded.index);
-                        high |= static_cast<uint8_t>((encoded.index >> 8) << group);
-                        signs[group/2] |= static_cast<uint8_t>(encoded.signs << (4*(group%2)));
+                        destination[value] = static_cast<uint8_t>(
+                            cpu.native_interleaved[
+                                interleavedValueOffset(cpu, n, kb, value)] ^ 0x80u);
                     }
-                    destination[8] = high;
-                    std::memcpy(destination+9, signs, sizeof(signs));
-                    output.scales[linear] = cpu.chunkScales(n/64,kb)[n%64];
-                    output.mins[linear] = cpu.chunkMins(n/64,kb)[n%64];
-                    if (!native_quantised_iq3s_scale::valid(output.mins[linear]))
-                        return reject(error, "IQ3_S source nibble is invalid");
+                    std::memcpy(
+                        &output.scales[linear],
+                        cpu.native_interleaved.data() +
+                            unit + cpu.data_stride +
+                            static_cast<size_t>(n % 64) * sizeof(uint16_t),
+                        sizeof(uint16_t));
+                    if (cpu.is_asymmetric)
+                    {
+                        std::memcpy(
+                            &output.mins[linear],
+                            cpu.native_interleaved.data() +
+                                unit + cpu.data_stride + 128u +
+                                static_cast<size_t>(n % 64) * sizeof(uint16_t),
+                            sizeof(uint16_t));
+                    }
                     continue;
                 }
 
@@ -1407,6 +1570,34 @@ namespace llaminar2
                             cpu.native_interleaved.data() +
                                 unit + cpu.data_stride + 256u +
                                 static_cast<size_t>(n % 64) * sizeof(uint16_t),
+                            sizeof(uint16_t));
+                    }
+                    continue;
+                }
+
+                if (cpu.usesCompactFiveBit())
+                {
+                    for (int value = 0; value < 16; ++value)
+                        destination[value] = cpu.native_interleaved[interleavedValueOffset(cpu, n, kb, value)];
+                    const int local_column = n % 64;
+                    const int zmm = local_column / 16;
+                    const uint64_t bit = static_cast<uint64_t>((local_column % 16) * 4);
+                    for (int byte_idx = 0; byte_idx < 4; ++byte_idx)
+                    {
+                        const uint64_t lo = loadU64(cpu.native_interleaved.data() + unit + 1024u +
+                            static_cast<size_t>(2 * byte_idx) * 32u + static_cast<size_t>(zmm) * 8u);
+                        const uint64_t hi = loadU64(cpu.native_interleaved.data() + unit + 1024u +
+                            static_cast<size_t>(2 * byte_idx + 1) * 32u + static_cast<size_t>(zmm) * 8u);
+                        destination[16 + byte_idx] = static_cast<uint8_t>(
+                            ((lo >> bit) & 0xFu) | (((hi >> bit) & 0xFu) << 4));
+                    }
+                    std::memcpy(&output.scales[linear],
+                        cpu.native_interleaved.data() + unit + 1280u + static_cast<size_t>(local_column) * sizeof(uint16_t),
+                        sizeof(uint16_t));
+                    if (cpu.is_asymmetric)
+                    {
+                        std::memcpy(&output.mins[linear],
+                            cpu.native_interleaved.data() + unit + 1408u + static_cast<size_t>(local_column) * sizeof(uint16_t),
                             sizeof(uint16_t));
                     }
                     continue;
@@ -1537,6 +1728,45 @@ namespace llaminar2
 
                 if (output.usesNibbleLUT())
                 {
+                    if (cpu::native_quantised::is_repacked_nibble_lut_format(output.codebook_id))
+                    {
+                        int8_t decoded[32]{};
+                        if (cpu::native_quantised::is_payload_decodable(gpu.codebook_id))
+                            cpu::native_quantised::decode_native_block(gpu.codebook_id, source, decoded);
+                        else
+                            std::memcpy(decoded, source, sizeof(decoded));
+                        uint8_t nibbles[16];
+                        try
+                        {
+                            cpu::native_quantised::encode_nibble_lut_block(output.codebook_id, decoded, nibbles);
+                        }
+                        catch (const std::exception &ex)
+                        {
+                            return reject(error, ex.what());
+                        }
+                        for (int value = 0; value < 16; ++value)
+                            interleaved[interleavedValueOffset(output, n, kb, value)] = nibbles[value];
+                        int32_t sum = 0;
+                        for (int value : decoded)
+                            sum += value;
+                        const int16_t compensation = static_cast<int16_t>(sum);
+                        std::memcpy(
+                            interleaved.data() + unit + output.data_stride +
+                                static_cast<size_t>(local_column) * sizeof(int16_t),
+                            &compensation, sizeof(compensation));
+                        std::memcpy(
+                            interleaved.data() + unit + output.data_stride + 128u +
+                                static_cast<size_t>(local_column) * sizeof(uint16_t),
+                            &gpu.scales[linear], sizeof(uint16_t));
+                        if (output.is_asymmetric || output.usesNibbleLUTSourceScale())
+                        {
+                            std::memcpy(
+                                interleaved.data() + unit + output.data_stride + 256u +
+                                    static_cast<size_t>(local_column) * sizeof(uint16_t),
+                                &gpu.mins[linear], sizeof(uint16_t));
+                        }
+                        continue;
+                    }
                     // Scatter compact bytes into the four-value VNNI lane groups.
                     for (int value = 0; value < 16; ++value)
                     {
@@ -1544,23 +1774,27 @@ namespace llaminar2
                             interleavedValueOffset(output, n, kb, value)] =
                             source[value];
                     }
-                    // CPU dot-product correction consumes the sum of decoded weights.
-                    int8_t decoded[32]{};
-                    cpu::native_quantised::decode_native_block(
-                        output.codebook_id, source, decoded);
-                    int32_t sum = 0;
-                    for (int value : decoded)
-                        sum += value;
-                    const int16_t compensation = static_cast<int16_t>(sum);
+                    const size_t comp_bytes = output.usesInlineCompensation() ? 128u : 0u;
+                    if (output.usesInlineCompensation())
+                    {
+                        // CPU dot-product correction consumes the sum of decoded weights.
+                        int8_t decoded[32]{};
+                        cpu::native_quantised::decode_native_block(
+                            output.codebook_id, source, decoded);
+                        int32_t sum = 0;
+                        for (int value : decoded)
+                            sum += value;
+                        const int16_t compensation = static_cast<int16_t>(sum);
+                        std::memcpy(
+                            interleaved.data() +
+                                unit + output.data_stride +
+                                static_cast<size_t>(local_column) * sizeof(int16_t),
+                            &compensation,
+                            sizeof(compensation));
+                    }
                     std::memcpy(
                         interleaved.data() +
-                            unit + output.data_stride +
-                            static_cast<size_t>(local_column) * sizeof(int16_t),
-                        &compensation,
-                        sizeof(compensation));
-                    std::memcpy(
-                        interleaved.data() +
-                            unit + output.data_stride + 128u +
+                            unit + output.data_stride + comp_bytes +
                             static_cast<size_t>(local_column) * sizeof(uint16_t),
                         &gpu.scales[linear],
                         sizeof(uint16_t));
@@ -1568,7 +1802,38 @@ namespace llaminar2
                     {
                         std::memcpy(
                             interleaved.data() +
-                                unit + output.data_stride + 256u +
+                                unit + output.data_stride + comp_bytes + 128u +
+                                static_cast<size_t>(local_column) * sizeof(uint16_t),
+                            &gpu.mins[linear],
+                            sizeof(uint16_t));
+                    }
+                    continue;
+                }
+
+                if (output.usesUnsignedInt8())
+                {
+                    int8_t decoded[32];
+                    if (cpu::native_quantised::is_payload_decodable(gpu.codebook_id))
+                        cpu::native_quantised::decode_native_block(gpu.codebook_id, source, decoded);
+                    else
+                        std::memcpy(decoded, source, sizeof(decoded));
+                    for (int value = 0; value < 32; ++value)
+                    {
+                        interleaved[
+                            interleavedValueOffset(output, n, kb, value)] =
+                            static_cast<uint8_t>(decoded[value]) ^ 0x80u;
+                    }
+                    std::memcpy(
+                        interleaved.data() +
+                            unit + output.data_stride +
+                            static_cast<size_t>(local_column) * sizeof(uint16_t),
+                        &gpu.scales[linear],
+                        sizeof(uint16_t));
+                    if (output.is_asymmetric)
+                    {
+                        std::memcpy(
+                            interleaved.data() +
+                                unit + output.data_stride + 128u +
                                 static_cast<size_t>(local_column) * sizeof(uint16_t),
                             &gpu.mins[linear],
                             sizeof(uint16_t));
@@ -1607,7 +1872,7 @@ namespace llaminar2
                             static_cast<size_t>(local_column) * sizeof(uint16_t),
                         &gpu.scales[linear],
                         sizeof(uint16_t));
-                    if (output.is_asymmetric || output.usesIQ3SExpandedSourceScale())
+                    if (output.is_asymmetric)
                     {
                         std::memcpy(
                             interleaved.data() +
@@ -1615,6 +1880,32 @@ namespace llaminar2
                                 static_cast<size_t>(local_column) * sizeof(uint16_t),
                             &gpu.mins[linear],
                             sizeof(uint16_t));
+                    }
+                    continue;
+                }
+
+                if (output.usesCompactFiveBit())
+                {
+                    for (int value = 0; value < 16; ++value)
+                        interleaved[interleavedValueOffset(output, n, kb, value)] = source[value];
+                    const int zmm = local_column / 16;
+                    const uint64_t bit = static_cast<uint64_t>((local_column % 16) * 4);
+                    uint32_t qh = 0;
+                    std::memcpy(&qh, source + 16, sizeof(qh));
+                    for (unsigned g = 0; g < 8u; ++g)
+                    {
+                        uint8_t *plane = interleaved.data() + unit + 1024u +
+                            static_cast<size_t>(g) * 32u + static_cast<size_t>(zmm) * 8u;
+                        uint64_t mask = loadU64(plane);
+                        mask |= static_cast<uint64_t>((qh >> (g * 4u)) & 0xFu) << bit;
+                        storeU64(plane, mask);
+                    }
+                    std::memcpy(interleaved.data() + unit + 1280u + static_cast<size_t>(local_column) * sizeof(uint16_t),
+                        &gpu.scales[linear], sizeof(uint16_t));
+                    if (output.is_asymmetric)
+                    {
+                        std::memcpy(interleaved.data() + unit + 1408u + static_cast<size_t>(local_column) * sizeof(uint16_t),
+                            &gpu.mins[linear], sizeof(uint16_t));
                     }
                     continue;
                 }

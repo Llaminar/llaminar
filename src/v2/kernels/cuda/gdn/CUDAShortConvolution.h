@@ -296,6 +296,11 @@ namespace llaminar2
         }
 
         bool supportsPaddedPrefillRealLength() const override { return true; }
+        /** @brief Borrow the already-bound immutable device conv state for an enclosing native megakernel. */
+        float *borrowedLiveDeviceState(int required_state_size) const noexcept
+        {
+            return stateForSize(required_state_size);
+        }
         bool supportsRequestLiveStateBank(int request_count, int state_size) const override
         {
             return device_state_bound_ &&

@@ -1,0 +1,10 @@
+/**
+ * @file ROCmMoEGroupedPrefillShard1.hip
+ * @brief ROCm grouped MoE prefill codebook shard 1 (NATIVE_QUANTISED_PF_Q4_1, NATIVE_QUANTISED_PF_Q5_0, NATIVE_QUANTISED_PF_Q5_1).
+ */
+#define LLAMINAR_ROCM_MOE_PREFILL_SHARD 1
+#define LLAMINAR_ROCM_MOE_PREFILL_FOR_EACH_CODEBOOK(MACRO) \
+    MACRO(NATIVE_QUANTISED_PF_Q4_1); \
+    MACRO(NATIVE_QUANTISED_PF_Q5_0); \
+    MACRO(NATIVE_QUANTISED_PF_Q5_1);
+#include "ROCmMoEGroupedPrefillShardImpl.hip.inc"

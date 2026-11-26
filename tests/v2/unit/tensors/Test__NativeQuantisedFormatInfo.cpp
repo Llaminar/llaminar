@@ -156,7 +156,7 @@ TEST(Test__NativeQuantisedFormatInfo, ExpandedSingleScaleGridsRetainNativeScaleA
     {
         if (!is_payload_decodable(format.codebook_id) ||
             (preparedEncodingForCodebook(format.codebook_id) != CPUNativeQuantisedEncoding::ExpandedInt8 &&
-             preparedEncodingForCodebook(format.codebook_id) != CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale))
+             !is_repacked_nibble_lut_format(format.codebook_id)))
             continue;
         SCOPED_TRACE(format.name);
         auto tensor = format.create();
@@ -185,9 +185,22 @@ TEST(Test__NativeQuantisedFormatInfo, ExpandedSingleScaleGridsRetainNativeScaleA
                     EXPECT_EQ(cpu.chunkMins(0, block)[row], minimum);
                 const auto *unit = cpu.interleavedBase() +
                     block * cpu.interleaved_block_stride;
-                for (int value = 0; value < 32; ++value)
-                    EXPECT_EQ(static_cast<int8_t>(unit[(value / 4) * 256 + row * 4 + value % 4]),
-                              values[value]);
+                if (is_repacked_nibble_lut_format(format.codebook_id))
+                {
+                    std::array<uint8_t, 16> repacked{};
+                    for (int b = 0; b < 16; ++b)
+                        repacked[b] = unit[(b / 4) * 256 + row * 4 + b % 4];
+                    std::array<int8_t, 32> decoded{};
+                    decode_nibble_lut_block(format.codebook_id, repacked.data(), decoded.data());
+                    for (int value = 0; value < 32; ++value)
+                        EXPECT_EQ(decoded[value], values[value]);
+                }
+                else
+                {
+                    for (int value = 0; value < 32; ++value)
+                        EXPECT_EQ(static_cast<int8_t>(unit[(value / 4) * 256 + row * 4 + value % 4]),
+                                  values[value]);
+                }
             }
         }
     }

@@ -10,6 +10,61 @@
  */
 #pragma once
 #include "kernels/common/DeviceRowRange.h"
+#include <cstddef>
+
+namespace llaminar2::rocm
+{
+    /**
+     * @brief A terminal FP32 store owns the prior value of its own output lane.
+     * The multipliers and optional bias are sealed before capture. Split-K
+     * producers retain their raw partials and the ordered reducer owns this fold.
+     */
+    struct ROCmFP32DestinationFold
+    {
+        const float *bias = nullptr; ///< Optional original bias by column.
+        float alpha = 1.0f;           ///< Raw projection multiplier.
+        float beta = 0.0f;            ///< Prior destination multiplier.
+
+        /** @return Whether capture can select the existing raw FP32 destination leaf. */
+        bool isIdentity() const noexcept { return alpha == 1.0f && beta == 0.0f && bias == nullptr; }
+
+#if defined(__HIPCC__)
+        /**
+         * @brief Combine a completed projection with the original output lane.
+         * @param value Completed FP32 product under its original arithmetic.
+         * @param prior Previous output bank, read only for a nonzero beta.
+         * @param index Physical row-major index owned by this lane.
+         * @param column Physical column in the original bias plane.
+         * @return The value that must be published at the final destination.
+         */
+        __device__ __forceinline__ float apply(
+            float value, const float *prior, std::size_t index, int column) const
+        {
+            if (alpha == 1.0f && beta == 0.0f && bias == nullptr)
+                return value;
+            return applyUpdate(value, prior, index, column);
+        }
+
+        /**
+         * @brief Fold a capture-admitted nonidentity store using the original FP32 arithmetic.
+         * @param value Completed original product. @param prior Output lane storage.
+         * @param index Exact row-major destination. @param column Original bias column.
+         * @return Updated final value; only a nonzero beta reads prior storage.
+         */
+        __device__ __forceinline__ float applyUpdate(
+            float value, const float *prior, std::size_t index, int column) const
+        {
+            float result = alpha * value;
+            if (beta != 0.0f)
+                result += beta * prior[index];
+            if (bias)
+                result += bias[column];
+            return result;
+        }
+#endif
+    };
+}
+
 extern "C" {
 /**
  * @brief Apply the original full-active FP32 epilogue.

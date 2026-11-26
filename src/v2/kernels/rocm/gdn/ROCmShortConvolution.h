@@ -144,6 +144,11 @@ namespace llaminar2
         }
 
         bool resetGPUState(void *stream) override { return resetState(stream); }
+        /** @brief Borrow the immutable cache-owned device conv_state pointer for retained megakernel execution. */
+        float *borrowedLiveDeviceState(int required_state_size) const noexcept
+        {
+            return stateForSize(required_state_size);
+        }
         void bindVerifierStateCaptureWorkspace(float *workspace, int rows, int state_size) override
         {
             verifier_state_capture_ = workspace;
@@ -492,7 +497,7 @@ namespace llaminar2
                 verifier_state_capture_,
                 verifier_state_capture_size_,
                 verifier_state_capture_rows_,
-                device_ordinal_, stream_,policy==LocalGPUExpertKernelPolicy::QFNMI50TP4);
+                device_ordinal_, stream_,usesGFX906MI50Kernels(policy));
             if (!ok)
                 return false;
 

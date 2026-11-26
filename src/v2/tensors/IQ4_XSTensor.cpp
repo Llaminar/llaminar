@@ -516,4 +516,51 @@ namespace llaminar2
             static_cast<uint8_t>(ls));
     }
 
+
+    void IQ4_XSTensor::decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const
+    {
+        const size_t super_blocks_per_row = (shape_[1] + IQ4_XSBlock::BLOCK_SIZE - 1) / IQ4_XSBlock::BLOCK_SIZE;
+        const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+        if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
+        const IQ4_XSBlock *blocks = reinterpret_cast<const IQ4_XSBlock *>(data_ptr);
+
+        const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
+        const size_t sub_block_idx = k_block_offset % 8;
+
+        int8_t temp_int8[32];
+        simd::unpack_iq4_xs_to_int8(blocks[super_block_idx], sub_block_idx, temp_int8);
+        float scale = simd::get_iq4_xs_scale(blocks[super_block_idx], sub_block_idx);
+
+        for (int i = 0; i < 32; ++i)
+        {
+            output[i] = temp_int8[i] * scale;
+        }
+    }
+
+    void IQ4_XSTensor::unpack_block_to_int8(size_t row_idx, size_t k_block_offset, int8_t *output) const
+    {
+        const size_t super_blocks_per_row = (shape_[1] + IQ4_XSBlock::BLOCK_SIZE - 1) / IQ4_XSBlock::BLOCK_SIZE;
+        const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+        if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
+        const IQ4_XSBlock *blocks = reinterpret_cast<const IQ4_XSBlock *>(data_ptr);
+
+        const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
+        const size_t sub_block_idx = k_block_offset % 8;
+
+        simd::unpack_iq4_xs_to_int8(blocks[super_block_idx], sub_block_idx, output);
+    }
+
+    float IQ4_XSTensor::get_block_scale(size_t row_idx, size_t k_block_offset) const
+    {
+        const size_t super_blocks_per_row = (shape_[1] + IQ4_XSBlock::BLOCK_SIZE - 1) / IQ4_XSBlock::BLOCK_SIZE;
+        const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+        if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
+        const IQ4_XSBlock *blocks = reinterpret_cast<const IQ4_XSBlock *>(data_ptr);
+
+        const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
+        const size_t sub_block_idx = k_block_offset % 8;
+
+        return simd::get_iq4_xs_scale(blocks[super_block_idx], sub_block_idx);
+    }
+
 } // namespace llaminar2

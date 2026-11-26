@@ -13,6 +13,7 @@
 #include "MoEOverlayActivationPacketStages.h"
 #include "execution/moe/MoEOverlayActivationBatchResources.h"
 #include "backends/GPUCaptureDependencyRoster.h"
+#include "backends/IEarlyPacketPublication.h"
 #include "backends/NativeContextPreparation.h"
 #ifdef HAVE_CUDA
 #include "backends/cuda/CUDAGraphCapture.h"
@@ -545,6 +546,8 @@ namespace llaminar2
             mix(reinterpret_cast<std::uintptr_t>(lane.mapped_region.get()));
             mix(reinterpret_cast<std::uintptr_t>(lane.control_device));
             mix(reinterpret_cast<std::uintptr_t>(lane.grant_device));
+            mix(reinterpret_cast<std::uintptr_t>(lane.shared_dispatch_hidden_rows_fp32));
+            mix(lane.shared_dispatch_consumer_count);
             mix(static_cast<std::uint64_t>(lane.original_invocations.policy));
             mix(reinterpret_cast<std::uintptr_t>(lane.original_invocations.original_slots));
             mix(lane.original_invocations.original_slot_count);
@@ -564,7 +567,20 @@ namespace llaminar2
                 mix(channel.stage_manifest_digest);
                 mix(channel.graph_role_mask);
                 mix(channel.return_role);
+                mix(channel.prefill_wire_policy);
             }
+        }
+
+        /** @return Immutable MainPrefill wire encoding declared by the lane header. */
+        MoEOverlayActivationPrefillWirePolicy lanePrefillWirePolicy(
+            const MoEOverlayMappedActivationDeviceLane &lane) noexcept
+        {
+            if (!lane.control_host)
+                return MoEOverlayActivationPrefillWirePolicy::FP32Canonical;
+            const auto raw_policy = lane.control_host->channel.prefill_wire_policy;
+            return moeOverlayActivationPrefillWirePolicyValid(raw_policy)
+                       ? static_cast<MoEOverlayActivationPrefillWirePolicy>(raw_policy)
+                       : MoEOverlayActivationPrefillWirePolicy::FP32Canonical;
         }
 
         /**
@@ -872,11 +888,16 @@ namespace llaminar2
                 /* Lane ordinals intentionally bound stream count across layers
                  * and graph families. Only outbound publication uses these
                  * streams; the mapped return timeline remains the one
-                 * cross-executable completion authority. */
+                 * cross-executable completion authority. Use LatencyCritical
+                 * priority so dispatch packing and follower doorbells preempt
+                 * large local MoE compute grids immediately instead of starving
+                 * remote peers behind full-SM local projections. */
                 void *const lane_stream =
                     gpu_ctx.getOrCreateAdmittedAuxiliaryStream(
                         "moe_overlay_activation_lane:" +
-                        std::to_string(lane_index),originalContext());
+                            std::to_string(lane_index),
+                        GPUAuxiliaryStreamSchedulingClass::LatencyCritical,
+                        originalContext());
                 if (!lane_stream)
                 {
                     throw std::runtime_error(
@@ -1085,30 +1106,24 @@ namespace llaminar2
 
     bool MoEOverlayActivationDispatchPackStage::execute(IDeviceContext *ctx)
     {
-#ifdef HAVE_CUDA
         if (early_route_publication_)
-            return early_route_publication_->recordDispatchConsumer(requireGPUStream(), 1,
-                [&](const auto* acquire) { return executePacket(ctx, acquire); });
-#endif
+            return early_route_publication_->recordConsumer(requireGPUStream(), [&] { return executePacket(ctx); });
         return executePacket(ctx);
     }
 
-#ifdef HAVE_CUDA
     /** @copydoc MoEOverlayActivationDispatchPackStage::bindEarlyRoutePublication */
     void MoEOverlayActivationDispatchPackStage::bindEarlyRoutePublication(
-        std::shared_ptr<CUDAEarlyPacketPublication> publication, const int32_t* live_rows)
+        std::shared_ptr<IEarlyPacketPublication> publication, const int32_t* live_rows)
     {
-        if (!params_.device_id.is_cuda() || params_.physical_rows != 1 || !publication || early_route_publication_ ||
+        if (!params_.device_id.is_gpu() || params_.physical_rows != 1 || !publication || early_route_publication_ ||
             (params_.active_row_count_device && params_.active_row_count_device != live_rows))
-            throw std::invalid_argument("Early route publication requires the original single-row CUDA activation packet");
+            throw std::invalid_argument("Early route publication requires the original single-row GPU activation packet");
         params_.active_row_count_device = live_rows;
         early_route_publication_ = std::move(publication);
     }
-#endif
 
     /** @copydoc MoEOverlayActivationDispatchPackStage::executePacket */
-    bool MoEOverlayActivationDispatchPackStage::executePacket(IDeviceContext *ctx,
-        [[maybe_unused]] const CUDAResidentPacketAcquire* acquire)
+    bool MoEOverlayActivationDispatchPackStage::executePacket(IDeviceContext *ctx)
     {
         if (!validateExecutionContext(ctx, params_.device_id, name().c_str()) ||
             !hasFixedContract())
@@ -1166,6 +1181,7 @@ namespace llaminar2
             .stage_ordinal = params_.stage_ordinal,
             .model_layer_index = params_.model_layer_index,
             .shared_row_writer = payload.requiresBulkPublication(),
+            .prefill_wire_policy = lanePrefillWirePolicy(params_.lane),
         };
         const std::uint32_t bank =
             moeOverlayActivationBufferIndex(params_.stage_ordinal);
@@ -1191,16 +1207,9 @@ namespace llaminar2
             const MoEOverlayActivationSingleRowDispatchPackLaunch packet{
                 .packet = launch, .publication = publication,
             };
-#ifdef HAVE_CUDA
-            if (early_route_publication_)
-            {
-                if (!resident_dispatch_copy_)
-                    throw std::logic_error("CUDA retained single-row dispatch lost its prepared mapped copy");
-                const cuda_moe_packet::ResidentMappedDispatch lane{packet, *resident_dispatch_copy_};
-                return cuda_moe_packet::recordResidentDispatchPackets(std::span(&lane, 1u),
-                    params_.device_id.ordinal, stream, acquire);
-            }
-#endif
+            // Always use the fused 1-CTA direct kernel even when early_route_publication_
+            // overlaps dispatch with sharedDown: it occupies only 1 SM (~4 us) vs ~33 us
+            // for a CUDA Graph conditional + Copy-Engine DMA node.
             return moe_kernel_->packSingleRowMoEOverlayActivationDispatch(packetLaunchContext(stream), packet);
         }
 
@@ -1292,15 +1301,11 @@ namespace llaminar2
         }
         setGPUStream(stream);
 #ifdef HAVE_CUDA
-        if (early_route_publication_ && !resident_dispatch_copy_)
+        if (early_route_publication_)
         {
             const auto payload = params_.lane.dispatchPayload(params_.physical_rows);
-            if (!useSingleRowDirectPacket(payload) ||
-                !cuda_moe_packet::prepareResidentDispatchPacket(params_.device_id.ordinal))
+            if (!useSingleRowDirectPacket(payload))
                 throw std::logic_error("CUDA early route requires an admitted one-row mapped dispatch");
-            resident_dispatch_copy_ = TransferEngine::instance().prepareDeviceToMappedHostCopy(
-                *params_.hidden, *params_.lane.mapped_region, payload.hidden_payload_offset,
-                static_cast<std::size_t>(payload.packet.d_model) * sizeof(float), params_.device_id);
         }
 #endif
         grant_initialization_joined_ =
@@ -1504,6 +1509,7 @@ namespace llaminar2
             .physical_rows = params_.physical_rows,
             .stage_ordinal = params_.stage_ordinal,
             .model_layer_index = params_.model_layer_index,
+            .prefill_wire_policy = lanePrefillWirePolicy(params_.lane),
         };
 
         bool launched = false;
@@ -1519,12 +1525,22 @@ namespace llaminar2
             {
                 return false;
             }
+            const bool use_shared_single_row_hidden =
+                params_.lane.shared_dispatch_hidden_rows_fp32 != nullptr &&
+                params_.lane.shared_dispatch_consumer_count > 1u &&
+                params_.lane.shared_dispatch_consumer_count <= 32u &&
+                lanePrefillWirePolicy(params_.lane) ==
+                    MoEOverlayActivationPrefillWirePolicy::FixedPoint32Adaptive16;
             launched =
                 moe_kernel_->consumeSingleRowMoEOverlayActivationDispatch(
                     packetLaunchContext(stream),
                     MoEOverlayActivationSingleRowDispatchConsumeLaunch{
                         .packet = launch,
                         .acquire = acquire,
+                        .shared_hidden_rows_fp32 =
+                            use_shared_single_row_hidden
+                                ? params_.lane.shared_dispatch_hidden_rows_fp32
+                                : nullptr,
                     });
         }
         else
@@ -1811,6 +1827,7 @@ namespace llaminar2
             .physical_rows = params_.physical_rows,
             .stage_ordinal = params_.stage_ordinal,
             .model_layer_index = params_.model_layer_index,
+            .prefill_wire_policy = lanePrefillWirePolicy(params_.lane),
         };
         const std::uint32_t bank =
             moeOverlayActivationBufferIndex(params_.stage_ordinal);
@@ -2069,6 +2086,7 @@ namespace llaminar2
             .physical_rows = params_.physical_rows,
             .stage_ordinal = params_.stage_ordinal,
             .model_layer_index = params_.model_layer_index,
+            .prefill_wire_policy = lanePrefillWirePolicy(params_.lane),
         };
 
         bool launched = false;
@@ -2342,10 +2360,6 @@ namespace llaminar2
         }
         if (params_.transaction->usesAsynchronousLanes())
             return params_.transaction->persistentResourcesReady() && shared_row_groups_prepared_;
-#ifdef HAVE_CUDA
-        if (early_route_publication_)
-            return !resident_dispatch_.empty() && resident_dispatch_.size() == params_.transaction->lanes().size();
-#endif
         return
                params_.routing_indices->gpu_data_ptr() &&
                params_.routing_weights->gpu_data_ptr() &&
@@ -2388,13 +2402,6 @@ namespace llaminar2
             return false;
         }
         const auto &lanes = params_.transaction->lanes();
-#ifdef HAVE_CUDA
-        if (!resident_dispatch_.empty())
-            return resident_dispatch_.size() == lanes.size();
-        std::vector<cuda_moe_packet::ResidentMappedDispatch> mapped_dispatch;
-        if (early_route_publication_)
-            mapped_dispatch.reserve(lanes.size());
-#endif
         if (descriptor_storage_)
         {
             return descriptor_storage_->requireInput(stream) &&
@@ -2449,6 +2456,7 @@ namespace llaminar2
                 .physical_rows = 1,
                 .stage_ordinal = params_.transaction->stageOrdinal(),
                 .model_layer_index = params_.transaction->modelLayerIndex(),
+                .prefill_wire_policy = lanePrefillWirePolicy(lane),
             };
             MoEOverlayActivationSingleRowDispatchPackLaunch launch{
                 .packet = packet,
@@ -2456,25 +2464,8 @@ namespace llaminar2
             };
             if (!launch.valid())
                 return false;
-#ifdef HAVE_CUDA
-            if (early_route_publication_)
-            {
-                auto copy = TransferEngine::instance().prepareDeviceToMappedHostCopy(
-                    *params_.hidden, *lane.mapped_region, payload.hidden_payload_offset,
-                    static_cast<std::size_t>(payload.packet.d_model) * sizeof(float), params_.device_id);
-                mapped_dispatch.push_back({launch, copy});
-                continue;
-            }
-#endif
             launches.push_back(launch);
         }
-#ifdef HAVE_CUDA
-        if (early_route_publication_)
-        {
-            resident_dispatch_ = std::move(mapped_dispatch);
-            return !resident_dispatch_.empty();
-        }
-#endif
         return uploadPersistentLaunchArray(
             launches,
             params_.device_id,
@@ -2485,31 +2476,26 @@ namespace llaminar2
 
     bool MoEOverlayActivationDispatchPackBatchStage::execute(IDeviceContext *ctx)
     {
-#ifdef HAVE_CUDA
         if (early_route_publication_)
-            return early_route_publication_->recordDispatchConsumer(requireGPUStream(), resident_dispatch_.size(),
-                [&](const auto* acquire) { return executePacket(ctx, acquire); });
-#endif
+            return early_route_publication_->recordConsumer(requireGPUStream(), [&] { return executePacket(ctx); });
         return executePacket(ctx);
     }
 
-#ifdef HAVE_CUDA
     /** @copydoc MoEOverlayActivationDispatchPackBatchStage::bindEarlyRoutePublication */
     void MoEOverlayActivationDispatchPackBatchStage::bindEarlyRoutePublication(
-        std::shared_ptr<CUDAEarlyPacketPublication> publication, const int32_t* live_rows)
+        std::shared_ptr<IEarlyPacketPublication> publication, const int32_t* live_rows)
     {
-        if (!params_.device_id.is_cuda() || !params_.transaction || params_.transaction->physicalRows() != 1 ||
+        if (!params_.device_id.is_gpu() || !params_.transaction || params_.transaction->physicalRows() != 1 ||
             !publication || early_route_publication_ ||
             (params_.active_row_count_device && params_.active_row_count_device != live_rows))
-            throw std::invalid_argument("Early route publication requires the original single-row CUDA activation batch");
+            throw std::invalid_argument("Early route publication requires the original single-row GPU activation batch");
         params_.active_row_count_device = live_rows;
         early_route_publication_ = std::move(publication);
     }
-#endif
 
     /** @copydoc MoEOverlayActivationDispatchPackBatchStage::executePacket */
     bool MoEOverlayActivationDispatchPackBatchStage::executePacket(
-        IDeviceContext *ctx, [[maybe_unused]] const CUDAResidentPacketAcquire* acquire)
+        IDeviceContext *ctx)
     {
         if (!validateExecutionContext(ctx, params_.device_id, name().c_str()) ||
             !hasFixedContract())
@@ -2622,6 +2608,7 @@ namespace llaminar2
                                         transaction.sharedDispatchPayloadLaneCount(lane_index))
                                   : 0u,
                         .shared_row_writer = group,
+                        .prefill_wire_policy = lanePrefillWirePolicy(lane),
                     };
                     if (!moe_kernel_->packMoEOverlayActivationDispatch(
                             packetLaunchContext(lane_stream), launch) ||
@@ -2720,11 +2707,7 @@ namespace llaminar2
             }
         }
 
-#ifdef HAVE_CUDA
-        if (!early_route_publication_ && !descriptor_storage_->requireInput(stream))
-#else
         if (!descriptor_storage_->requireInput(stream))
-#endif
         {
             LOG_ERROR("[MoEOverlayActivationDispatchPackBatchStage] Descriptor input join failed");
             return false;
@@ -2741,26 +2724,35 @@ namespace llaminar2
                 return false;
             }
         }
-        bool launched = false;
-#ifdef HAVE_CUDA
-        if (early_route_publication_)
+        float *shared_single_row_hidden = nullptr;
+        if (lanes.size() > 1u && lanes.size() <= 32u &&
+            lanes.front().shared_dispatch_hidden_rows_fp32 != nullptr &&
+            lanes.front().shared_dispatch_consumer_count == lanes.size() &&
+            lanePrefillWirePolicy(lanes.front()) ==
+                MoEOverlayActivationPrefillWirePolicy::FixedPoint32Adaptive16)
         {
-            launched = cuda_moe_packet::recordResidentDispatchPackets(resident_dispatch_,
-                params_.device_id.ordinal, stream, acquire);
+            const bool uniform_shared_group = std::all_of(
+                lanes.begin(), lanes.end(),
+                [&](const auto &lane) {
+                    return lane.shared_dispatch_hidden_rows_fp32 ==
+                               lanes.front().shared_dispatch_hidden_rows_fp32 &&
+                           lane.shared_dispatch_consumer_count == lanes.size() &&
+                           lanePrefillWirePolicy(lane) ==
+                               MoEOverlayActivationPrefillWirePolicy::FixedPoint32Adaptive16;
+                });
+            if (uniform_shared_group)
+                shared_single_row_hidden = lanes.front().shared_dispatch_hidden_rows_fp32;
         }
-        else
-#endif
-        {
-            const auto launch =
+        const auto launch =
             MoEOverlayActivationSingleRowDispatchBatchLaunch{
                 .lanes = static_cast<const
                     MoEOverlayActivationSingleRowDispatchPackLaunch *>(
                         descriptor_storage_->deviceData()),
                 .lane_count = static_cast<std::uint32_t>(
                     lanes.size()),
+                .shared_hidden_rows_fp32 = shared_single_row_hidden,
             };
-            launched = moe_kernel_->packSingleRowMoEOverlayActivationDispatchBatch(packetLaunchContext(stream), launch);
-        }
+        const bool launched = moe_kernel_->packSingleRowMoEOverlayActivationDispatchBatch(packetLaunchContext(stream), launch);
         if (launched)
         {
             PerfStatsCollector::addCounter(
@@ -2859,8 +2851,7 @@ namespace llaminar2
         }
         setGPUStream(stream);
 #ifdef HAVE_CUDA
-        if (early_route_publication_ && (params_.transaction->usesAsynchronousLanes() ||
-            !cuda_moe_packet::prepareResidentDispatchPacket(params_.device_id.ordinal)))
+        if (early_route_publication_ && params_.transaction->usesAsynchronousLanes())
             throw std::logic_error("CUDA early route requires an admitted one-row mapped dispatch batch");
 #endif
         if(!params_.transaction->materializePersistentResources())return false;
@@ -3112,6 +3103,7 @@ namespace llaminar2
                     .stage_ordinal = params_.transaction->stageOrdinal(),
                     .model_layer_index =
                         params_.transaction->modelLayerIndex(),
+                    .prefill_wire_policy = lanePrefillWirePolicy(lane),
                 };
                 if (!launch.valid() ||
                     launch.returned.d_model !=
@@ -3197,6 +3189,7 @@ namespace llaminar2
                 .stage_ordinal = params_.transaction->stageOrdinal(),
                 .model_layer_index =
                     params_.transaction->modelLayerIndex(),
+                .prefill_wire_policy = lanePrefillWirePolicy(lane),
             };
             MoEOverlayActivationSingleRowReturnConsumeLaunch launch{
                 .packet = packet,
@@ -3265,27 +3258,94 @@ namespace llaminar2
                     moeOverlayActivationLeasedTimelineValue(
                         moeOverlayActivationBufferVisit(
                             transaction.stageOrdinal()));
+
+                /* Pipeline per-lane return waits and mapped materializations on
+                 * each lane's LatencyCritical auxiliary stream so fast followers
+                 * begin PCIe return copies immediately while slower followers are
+                 * still executing. Disjoint original route slots ensure every
+                 * lane writes unique elements without cross-lane ordering. */
+                auto &gpu_ctx =
+                    GPUDeviceContextPool::instance().getContext(
+                        params_.device_id);
+                auto capture_borrow = gpu_ctx.acquireProjectionSubmission(
+                    stream, GPUProjectionSubmissionKind::Eager, true);
+                auto dependency_borrow =
+                    transaction.captureDependencies()->borrow(lanes.size(), 0u);
+                if (!gpu_ctx.recordEventChecked(
+                        transaction.producerReadyEvent(), stream))
+                {
+                    LOG_ERROR("[MoEOverlayActivationReturnConsumeBatchStage] Failed to record return fork event");
+                    return false;
+                }
                 for (std::size_t lane_index = 0u;
                      lane_index < lanes.size();
                      ++lane_index)
                 {
                     const auto &lane = lanes[lane_index];
+                    void *const lane_stream = transaction.laneStream(lane_index);
+                    if (!gpu_ctx.waitEventChecked(
+                            transaction.producerReadyEvent(), lane_stream))
+                    {
+                        LOG_ERROR("[MoEOverlayActivationReturnConsumeBatchStage] Failed to fork lane return stream");
+                        return false;
+                    }
                     if (!waitForMappedTimeline(
                             lane,
                             lane.return_signal_offsets[bank],
                             timeline,
-                            stream,
-                            "return consumer batch"))
+                            lane_stream,
+                            "return consumer lane"))
                     {
                         LOG_ERROR("[MoEOverlayActivationReturnConsumeBatchStage] Failed to acquire one mapped lane return");
                         return false;
                     }
+                    const auto payload =
+                        lane.dispatchPayload(transaction.physicalRows());
+                    if (!payload.valid())
+                        return false;
+                    const MoEOverlayActivationReturnConsumeLaunch lane_launch{
+                        .dispatch = payload.packet,
+                        .returned = lane.returned,
+                        .control = lane.control_device,
+                        .grant = lane.grant_device,
+                        .canonical_route_contributions_fp32 =
+                            static_cast<float *>(
+                                params_.canonical_route_contributions->
+                                    gpu_data_ptr()),
+                        .original_invocations = lane.original_invocations,
+                        .retained_stage_count = lane.retained_stage_count,
+                        .physical_rows = transaction.physicalRows(),
+                        .stage_ordinal = transaction.stageOrdinal(),
+                        .model_layer_index = transaction.modelLayerIndex(),
+                        .prefill_wire_policy = lanePrefillWirePolicy(lane),
+                    };
+                    if (!moe_kernel_->consumeMoEOverlayActivationReturn(
+                            packetLaunchContext(lane_stream), lane_launch))
+                    {
+                        LOG_ERROR("[MoEOverlayActivationReturnConsumeBatchStage] Per-lane return materialization failed");
+                        return false;
+                    }
+                    if (!gpu_ctx.recordEventChecked(
+                            transaction.captureDependencies()->admission(lane_index),
+                            lane_stream))
+                    {
+                        LOG_ERROR("[MoEOverlayActivationReturnConsumeBatchStage] Failed to record lane return join event");
+                        return false;
+                    }
+                }
+                for (std::size_t lane_index = 0u;
+                     lane_index < lanes.size();
+                     ++lane_index)
+                {
+                    if (!gpu_ctx.waitEventChecked(
+                            transaction.captureDependencies()->admission(lane_index),
+                            stream))
+                    {
+                        LOG_ERROR("[MoEOverlayActivationReturnConsumeBatchStage] Failed to join lane return stream");
+                        return false;
+                    }
                 }
 
-                /* All arrival timing is outside the payload kernel. Each lane
-                 * is authenticated in parallel, then copies only the disjoint
-                 * original route slots that it owns. Arithmetic remains the
-                 * responsibility of the following canonical reducer. */
                 if (!descriptor_storage_->requireInput(stream) ||
                     !lane_valid_->requireOutput(stream))
                 {
@@ -3306,12 +3366,6 @@ namespace llaminar2
                     .d_model = transaction.dModel(),
                     .top_k = transaction.topK(),
                 };
-                if (!moe_kernel_->
-                        consumeMultiRowMoEOverlayActivationReturnBatch(
-                            packetLaunchContext(stream), launch))
-                {
-                    return false;
-                }
                 gpuExecution().publish(
                     params_.canonical_route_contributions);
                 if (std::any_of(lanes.begin(), lanes.end(), [&](const auto &lane) {
@@ -3330,10 +3384,7 @@ namespace llaminar2
                      {"rows", std::to_string(
                           transaction.physicalRows())},
                      {"canonical_materialization", "true"},
-                     {"validation_launches", "1"},
-                     {"materialization_launches", "1"},
-                     {"legacy_lane_reduction_launches_avoided",
-                      std::to_string(lanes.size())},
+                     {"pipelined_per_lane", "true"},
                      {"layer", std::to_string(
                           transaction.modelLayerIndex())}});
                 return true;

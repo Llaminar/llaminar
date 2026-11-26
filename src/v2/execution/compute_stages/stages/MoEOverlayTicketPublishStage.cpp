@@ -4,9 +4,7 @@
  */
 
 #include "MoEOverlayTicketPublishStage.h"
-#ifdef HAVE_CUDA
-#include "backends/cuda/CUDAGraphCapture.h"
-#endif
+#include "backends/IEarlyPacketPublication.h"
 
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/Logger.h"
@@ -76,25 +74,21 @@ namespace llaminar2
 
     bool MoEOverlayTicketPublishStage::execute(IDeviceContext *ctx)
     {
-#ifdef HAVE_CUDA
         if (early_route_publication_)
             return early_route_publication_->recordConsumer(requireGPUStream(), [&] { return executePacket(ctx); });
-#endif
         return executePacket(ctx);
     }
 
-#ifdef HAVE_CUDA
     /** @copydoc MoEOverlayTicketPublishStage::bindEarlyRoutePublication */
     void MoEOverlayTicketPublishStage::bindEarlyRoutePublication(
-        std::shared_ptr<CUDAEarlyPacketPublication> publication, const int32_t* live_rows)
+        std::shared_ptr<IEarlyPacketPublication> publication, const int32_t* live_rows)
     {
-        if (!params_.device_id.is_cuda() || params_.bucket_rows != 1 || !publication || early_route_publication_ ||
+        if (!params_.device_id.is_gpu() || params_.bucket_rows != 1 || !publication || early_route_publication_ ||
             (params_.active_row_count_device && params_.active_row_count_device != live_rows))
-            throw std::invalid_argument("Early route publication requires the original single-row CUDA ticket");
+            throw std::invalid_argument("Early route publication requires the original single-row GPU ticket");
         params_.active_row_count_device = live_rows;
         early_route_publication_ = std::move(publication);
     }
-#endif
 
     bool MoEOverlayTicketPublishStage::executePacket(IDeviceContext *ctx)
     {
@@ -131,24 +125,14 @@ namespace llaminar2
             .hidden_rows = params_.hidden->gpu_data_ptr(),
             .hidden_bytes = hidden_bytes,
         };
-        std::string payload_error;
-        if (!params_.ticket_storage->enqueueCapturedPayload(
-                payload, stream, &payload_error))
+        std::string publish_error;
+        if (!params_.ticket_storage->enqueueCapturedPayloadAndPublication(
+                payload, stream, &publish_error))
         {
             LOG_ERROR(
-                "[MoEOverlayTicketPublishStage] Failed to enqueue mapped "
-                "fixed-capacity ticket payload: "
-                << payload_error);
-            return false;
-        }
-        std::string publication_error;
-        if (!params_.ticket_storage->enqueueCapturedPublication(
-                stream, &publication_error))
-        {
-            LOG_ERROR(
-                "[MoEOverlayTicketPublishStage] Failed to enqueue the exact "
-                "GPU-to-host ticket publication edge: "
-                << publication_error);
+                "[MoEOverlayTicketPublishStage] Failed to enqueue fused mapped "
+                "ticket payload and publication edge: "
+                << publish_error);
             return false;
         }
         return true;

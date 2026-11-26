@@ -282,7 +282,7 @@ template <typename Ops> void verifyTailPadding(const NativeQuantisedFormatInfo &
         NativeQuantisedPreparedByteFixture fixture(source, n, blocks * 32);
         fixture.seedPayloadAndMetadata();
         const auto view = fixture.view();
-        const bool rules = view.usesIQ3SExpandedSourceScale() || view.usesNibbleLUTSourceScale() ||
+        const bool rules = view.usesNibbleLUTSourceScale() ||
             (view.usesCompactMultiScale() && view.codebook_id == 13);
         if (rules)
         {
@@ -650,14 +650,16 @@ template <std::size_t Rows> void verifyI8MMGrouping(const NativeQuantisedFormatI
             return packed.is_asymmetric
                 ? Tile::template panelStrips<SDOTOps, CPUNativeQuantisedEncoding::ExpandedInt8, true>()
                 : Tile::template panelStrips<SDOTOps, CPUNativeQuantisedEncoding::ExpandedInt8, false>();
-        case CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale:
-            return Tile::template panelStrips<SDOTOps, CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale>();
         case CPUNativeQuantisedEncoding::Q6KNativeDualScale:
             return Tile::template panelStrips<SDOTOps, CPUNativeQuantisedEncoding::Q6KNativeDualScale>();
         case CPUNativeQuantisedEncoding::NibbleLUTSourceScale:
             return Tile::template panelStrips<SDOTOps, CPUNativeQuantisedEncoding::NibbleLUTSourceScale>();
         case CPUNativeQuantisedEncoding::NibbleLUT:
             return Tile::template panelStrips<SDOTOps, CPUNativeQuantisedEncoding::NibbleLUT>();
+        case CPUNativeQuantisedEncoding::UnsignedNibble:
+            return Tile::template panelStrips<SDOTOps, CPUNativeQuantisedEncoding::UnsignedNibble>();
+        case CPUNativeQuantisedEncoding::CompactFiveBit:
+            return Tile::template panelStrips<SDOTOps, CPUNativeQuantisedEncoding::CompactFiveBit>();
         case CPUNativeQuantisedEncoding::CompactMultiScale:
             return 1; // Own column walk; no panels.
         }

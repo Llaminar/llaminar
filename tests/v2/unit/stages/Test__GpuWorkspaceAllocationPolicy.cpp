@@ -10,6 +10,7 @@
  */
 
 #include <gtest/gtest.h>
+#include "../SourceShardReader.h"
 #include "../execution/local_execution/orchestrators/PrefixArchiveSourceContract.h"
 
 #include "execution/moe/MoEWorkspaceRequirements.h"
@@ -54,11 +55,9 @@ namespace
 
     std::string readFile(const std::filesystem::path &path)
     {
-        std::ifstream input(path);
-        EXPECT_TRUE(input.good()) << "Could not open " << path;
-        std::ostringstream buffer;
-        buffer << input.rdbuf();
-        return buffer.str();
+        const std::string text = llaminar2::test_support::readSourceFileOrFamily(path);
+        EXPECT_FALSE(text.empty()) << "Could not open " << path;
+        return text;
     }
 
     std::string sliceBetween(const std::string &source,
@@ -378,8 +377,10 @@ TEST(Test__GpuWorkspaceAllocationPolicy, RawGpuMallocCallsStayInSanctionedSource
     const std::unordered_set<std::string> sanctioned = {
         "src/v2/backends/ComputeBackend.cpp",
         "src/v2/backends/cuda/CUDABackend.cu",
+        "src/v2/backends/cuda/CUDABackendSampling.cu",
         "src/v2/backends/cuda/CUDATensorValidation.cu",
         "src/v2/backends/rocm/ROCmBackend.cpp",
+        "src/v2/backends/rocm/ROCmBackendSampling.cpp",
         "src/v2/backends/rocm/ROCmTensorValidation.cpp",
         "src/v2/collective/backends/NCCLBackendCUDA.cu",
         "src/v2/collective/backends/RCCLBackendHIP.cpp",
@@ -8970,10 +8971,16 @@ TEST(Test__GpuWorkspaceAllocationPolicy, DGODeviceLogicalStateMailboxOwnsArenaRo
         "bool OrchestrationRunner::supportsPrefillBatch(int request_batch) const");
     const auto compact_prefill =
         removeAsciiWhitespace(stripCommentsAndStringLiterals(prefill_body));
-    const auto decode_mtp_body = sliceBetween(
-        orchestration_source,
-        "GenerationResult OrchestrationRunner::decodeStepMTP()",
-        "GenerationResult OrchestrationRunner::decodeStep()");
+    const auto decode_mtp_body =
+        sliceBetween(
+            orchestration_source,
+            "std::optional<std::string> OrchestrationRunner::verifyCommittedPrefixReplay(",
+            "GenerationResult OrchestrationRunner::decodeOrdinaryDeviceResidentGeneration()") +
+        "\n" +
+        sliceBetween(
+            orchestration_source,
+            "GenerationResult OrchestrationRunner::decodeStepMTP()",
+            "bool OrchestrationRunner::freezeMoEExpertOverlayPlanForLoadedModel()");
     const auto compact_decode_mtp =
         removeAsciiWhitespace(stripCommentsAndStringLiterals(decode_mtp_body));
     const auto decode_step_body = sliceBetween(
@@ -10907,7 +10914,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
             stripCommentsAndStringLiterals(sliceBetween(
                 runner_source,
                 "GenerationResult OrchestrationRunner::decodeStepMTP(",
-                "GenerationResult OrchestrationRunner::decodeStep(")));
+                "bool OrchestrationRunner::freezeMoEExpertOverlayPlanForLoadedModel(")));
 
     EXPECT_NE(
         compact_snapshot.find(
@@ -11528,10 +11535,16 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPBudgetLimitedDirectEmitUsesCheckpoin
 {
     const auto orchestration_source =
         readFile(repoRoot() / "src/v2/execution/runner/OrchestrationRunner.cpp");
-    const auto decode_mtp_body = sliceBetween(
-        orchestration_source,
-        "GenerationResult OrchestrationRunner::decodeStepMTP()",
-        "GenerationResult OrchestrationRunner::decodeStep()");
+    const auto decode_mtp_body =
+        sliceBetween(
+            orchestration_source,
+            "std::optional<std::string> OrchestrationRunner::verifyCommittedPrefixReplay(",
+            "GenerationResult OrchestrationRunner::decodeOrdinaryDeviceResidentGeneration()") +
+        "\n" +
+        sliceBetween(
+            orchestration_source,
+            "GenerationResult OrchestrationRunner::decodeStepMTP()",
+            "bool OrchestrationRunner::freezeMoEExpertOverlayPlanForLoadedModel()");
     const auto direct_emit_body = sliceBetween(
         decode_mtp_body,
         "if (speculative_draft_count == 0)",
@@ -11571,10 +11584,16 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPConditionForwardPublishesShiftedSide
 {
     const auto orchestration_source =
         readFile(repoRoot() / "src/v2/execution/runner/OrchestrationRunner.cpp");
-    const auto decode_mtp_body = sliceBetween(
-        orchestration_source,
-        "GenerationResult OrchestrationRunner::decodeStepMTP()",
-        "GenerationResult OrchestrationRunner::decodeStep()");
+    const auto decode_mtp_body =
+        sliceBetween(
+            orchestration_source,
+            "std::optional<std::string> OrchestrationRunner::verifyCommittedPrefixReplay(",
+            "GenerationResult OrchestrationRunner::decodeOrdinaryDeviceResidentGeneration()") +
+        "\n" +
+        sliceBetween(
+            orchestration_source,
+            "GenerationResult OrchestrationRunner::decodeStepMTP()",
+            "bool OrchestrationRunner::freezeMoEExpertOverlayPlanForLoadedModel()");
     const auto condition_forward_body = sliceBetween(
         decode_mtp_body,
         "else if (!use_ready_logits)",
@@ -13910,7 +13929,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPVerifierGraphWaitsOnSidecarStreamWit
     const auto decode_body = sliceBetween(
         runner_source,
         "GenerationResult OrchestrationRunner::decodeStepMTP()",
-        "GenerationResult OrchestrationRunner::decodeStep()");
+        "bool OrchestrationRunner::freezeMoEExpertOverlayPlanForLoadedModel()");
     const auto wait_helper = sliceBetween(
         source,
         "bool DeviceGraphOrchestrator::waitForPendingLogitsStream(",
@@ -17141,15 +17160,13 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
     const auto resident_generation_runner_source = sliceBetween(
         runner_source,
         "GenerationResult OrchestrationRunner::completeDeviceResidentGeneration(",
-        "GenerationResult OrchestrationRunner::decodeStepMTP()");
+        "std::optional<std::string> OrchestrationRunner::verifyCommittedPrefixReplay(");
     const auto resident_generation_runner = removeAsciiWhitespace(
         stripCommentsAndStringLiterals(resident_generation_runner_source));
     const auto resident_generation_runner_text = removeAsciiWhitespace(
         resident_generation_runner_source);
-    const auto decode_step_source = sliceBetween(
-        runner_source,
-        "GenerationResult OrchestrationRunner::decodeStepMTP()",
-        "GenerationResult OrchestrationRunner::decodeStep()");
+    const auto decode_step_source = readFile(
+        root / "src/v2/execution/runner/OrchestrationRunnerMTP.cpp");
     const auto decode_step_text = removeAsciiWhitespace(decode_step_source);
     const auto dynamic_parent_admission = removeAsciiWhitespace(
         stripCommentsAndStringLiterals(sliceBetween(
@@ -17725,7 +17742,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
         stripCommentsAndStringLiterals(sliceBetween(
             runner_source,
             "GenerationResult OrchestrationRunner::decodeStepMTP()",
-            "GenerationResult OrchestrationRunner::decodeStep()")));
+            "bool OrchestrationRunner::freezeMoEExpertOverlayPlanForLoadedModel()")));
 
     EXPECT_NE(stage_execute.find("requireGPUStream()"), std::string::npos);
     EXPECT_EQ(

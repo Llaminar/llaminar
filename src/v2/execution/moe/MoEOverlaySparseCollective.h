@@ -270,6 +270,19 @@ namespace llaminar2
             std::string *error = nullptr) noexcept;
 
         /**
+         * @brief Enqueue payload copies and system-release publication together.
+         *
+         * For decode-sized tickets (<= 64 KiB hidden, <= 4 KiB routes), fuses
+         * all header/route/hidden copies and the release signal into one
+         * single-block kernel node on CUDA and ROCm. Larger prefill payloads
+         * use the multi-block payload copy path followed by timeline release.
+         */
+        bool enqueueCapturedPayloadAndPublication(
+            const CapturedDevicePayload &payload,
+            void *stream,
+            std::string *error = nullptr) noexcept;
+
+        /**
          * @brief Acquire the exact captured payload publication on the host.
          *
          * This bounded wait observes only the isolated timeline word. It never

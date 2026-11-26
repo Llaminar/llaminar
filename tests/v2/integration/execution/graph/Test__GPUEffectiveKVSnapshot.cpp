@@ -22,6 +22,7 @@
 #include "kernels/cpu/turboquant/TurboQuantContext.h"
 #include "backends/BackendManager.h"
 #include "tensors/GpuTensorView.h"
+#include "tensors/SIMDHelpers.h"
 #include "kernels/attention/AttentionWorkspaceContract.h"
 #include "planning/PhysicalMemoryAuthority.h"
 #include "planning/MemoryPlanner.h"

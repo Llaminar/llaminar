@@ -14,6 +14,9 @@
 #include "kernels/cuda/moe/CUDAMoEOverlayActivationPacketKernels.h"
 #include "kernels/cuda/moe/CUDARetainedHCFFN.h"
 #include "kernels/cuda/moe/CUDARetainedGroupedFFN.h"
+#include "kernels/cuda/moe/CUDAMoEBatchInvariantPolicy.h"
+#include "../../../utils/GpuPreparedGemmHarness.h"
+#include "../../../utils/QuantizedVerifierFormats.h"
 #include "tensors/NativeQuantisedFormatInfo.h"
 #include "utils/FNV1a.h"
 
@@ -218,8 +221,8 @@ void assertEarlyPacketDependencies(cudaGraph_t graph, const void* hidden, const 
     requireCUDA(cudaGraphGetNodes(graph, nullptr, &count));
     std::vector<cudaGraphNode_t> nodes(count);
     requireCUDA(cudaGraphGetNodes(graph, nodes.data(), &count));
-    cudaGraphNode_t resident = nullptr, hidden_packet = nullptr, route_packet = nullptr,
-        ticket_packet = nullptr, after_join = nullptr;
+    cudaGraphNode_t hc_router = nullptr, prefix = nullptr, gate_up = nullptr, down = nullptr;
+    cudaGraphNode_t hidden_packet = nullptr, route_packet = nullptr, ticket_packet = nullptr, after_join = nullptr;
     for (const auto node : nodes)
     {
         cudaGraphNodeType type{};
@@ -228,8 +231,10 @@ void assertEarlyPacketDependencies(cudaGraph_t graph, const void* hidden, const 
         {
             cudaKernelNodeParams args{};
             requireCUDA(cudaGraphKernelNodeGetParams(node, &args));
-            if (args.blockDim.x == 256)
-                resident = node;
+            if (args.blockDim.x == 256 && args.gridDim.x > 1) hc_router = node;
+            else if (args.blockDim.x == 256 && args.gridDim.x == 1) prefix = node;
+            else if (args.blockDim.x == retained_suffix_gate_up_threads) gate_up = node;
+            else if (args.blockDim.x == retained_suffix_down_threads) down = node;
         }
         if (type != cudaGraphNodeTypeMemcpy)
             continue;
@@ -240,7 +245,8 @@ void assertEarlyPacketDependencies(cudaGraph_t graph, const void* hidden, const 
         if (args.dstPtr.ptr == ticket) ticket_packet = node;
         if (args.dstPtr.ptr == retired) after_join = node;
     }
-    ASSERT_TRUE(resident && hidden_packet && route_packet && after_join);
+    ASSERT_TRUE(hc_router && prefix && gate_up && down);
+    ASSERT_TRUE(hidden_packet && route_packet && after_join);
     const auto dependencies = [](cudaGraphNode_t node) {
         std::size_t size = 0;
         requireCUDA(cudaGraphNodeGetDependencies(node, nullptr, nullptr, &size));
@@ -250,23 +256,27 @@ void assertEarlyPacketDependencies(cudaGraph_t graph, const void* hidden, const 
     };
     const auto first = dependencies(hidden_packet);
     ASSERT_EQ(first.size(), 1u);
-    cudaGraphNodeType acquire_type{};
-    requireCUDA(cudaGraphNodeGetType(first.front(), &acquire_type));
-    EXPECT_EQ(acquire_type, cudaGraphNodeTypeKernel);
-    EXPECT_NE(first.front(), resident);
-    EXPECT_EQ(dependencies(first.front()), dependencies(resident));
+    EXPECT_EQ(first.front(), prefix);
+    EXPECT_EQ(dependencies(prefix), std::vector<cudaGraphNode_t>{hc_router});
+    EXPECT_EQ(dependencies(gate_up), std::vector<cudaGraphNode_t>{prefix});
+    EXPECT_EQ(dependencies(down), std::vector<cudaGraphNode_t>{gate_up});
+    for (const auto dep : dependencies(hc_router))
+    {
+        cudaGraphNodeType dep_type{};
+        requireCUDA(cudaGraphNodeGetType(dep, &dep_type));
+        EXPECT_EQ(dep_type, cudaGraphNodeTypeEmpty);
+    }
     EXPECT_EQ(dependencies(route_packet), std::vector<cudaGraphNode_t>{hidden_packet});
     const auto joined = dependencies(after_join);
     ASSERT_EQ(joined.size(), ticket ? 3u : 2u);
-    EXPECT_NE(std::find(joined.begin(), joined.end(), resident), joined.end());
+    EXPECT_NE(std::find(joined.begin(), joined.end(), down), joined.end());
     EXPECT_NE(std::find(joined.begin(), joined.end(), route_packet), joined.end());
     if (ticket)
     {
         ASSERT_TRUE(ticket_packet);
         const auto ticket_dependencies = dependencies(ticket_packet);
         ASSERT_EQ(ticket_dependencies.size(), 1u);
-        EXPECT_NE(ticket_dependencies.front(), first.front());
-        EXPECT_EQ(dependencies(ticket_dependencies.front()), dependencies(resident));
+        EXPECT_EQ(ticket_dependencies.front(), prefix);
         EXPECT_NE(std::find(joined.begin(), joined.end(), ticket_packet), joined.end());
     }
 }
@@ -321,7 +331,8 @@ DeviceMoEIntermediateShardBinding originalFragmentTrace()
 }
 
 /** @brief Run the retained positive and empty branches through the original serial trace. */
-void replay(const TracePair& trace, int ordinal, unsigned resident_blocks, RetainedReplayRole role)
+void replay(const TracePair& trace, int ordinal, unsigned resident_blocks, RetainedReplayRole role,
+    unsigned launches_per_frame = 1)
 {
     const Stream stream;
     const auto native = stream.value;
@@ -364,8 +375,10 @@ void replay(const TracePair& trace, int ordinal, unsigned resident_blocks, Retai
     Array<DeviceMoELayerRuntime> runtime{1};
     Array<DeviceMoEOverlayEpochTicket> ticket{1};
     Array<RetainedM1Expert> selected{top_k};
-    Array<std::uint64_t> signal{1}, ticket_signal{1};
     Array<float> packet_hidden{hidden}, packet_route{top_k}, ticket_route{top_k}, joined_routed{top_k * hidden};
+    constexpr std::size_t suffix_packets = (top_k + 1) * (width / 32);
+    Array<float> suffix_partials{suffix_packets * 16 * 2 * 32};
+    Array<uint32_t> suffix_done{suffix_packets};
     const bool early = role != RetainedReplayRole::Counted;
     const bool shard = role == RetainedReplayRole::ActiveShardEarlyPacket;
     const auto* active = early ? nullptr : live.data();
@@ -392,73 +405,82 @@ void replay(const TracePair& trace, int ordinal, unsigned resident_blocks, Retai
         .shared_workspace = {shared_codes.data(), shared_scales.data()},
         .hidden_codes = hidden_codes.data(), .hidden_scales = hidden_scales.data(),
         .routed_contributions = routed.data(), .shared_contribution = shared_out.data(),
+        .suffix_partials = suffix_partials.data(), .suffix_done = suffix_done.data(),
+        .suffix_gate_up_node = nullptr, .suffix_down_node = nullptr,
         .route_publication = RetainedM1RoutePublication::Raw,
         .shared_publication = RetainedM1SharedPublication::PartialBeforeCollective,
-        .early_packet_ready = early ? signal.data() : nullptr,
-        .early_ticket_ready = shard ? ticket_signal.data() : nullptr,
     };
     constexpr uint64_t generation = 1;
     if (!early)
-    {
-        auto incomplete = args;
-        incomplete.early_packet_ready = signal.data();
-        EXPECT_THROW(RetainedM1Program::prepare(DeviceId::cuda(ordinal), incomplete, trace.gate.codebook_id,
-            trace.down.codebook_id, FullNativeHCFFNOutputDemand::all(), false, generation), std::invalid_argument);
-    }
-    if (shard)
-    {
-        auto duplicate = args;
-        duplicate.early_ticket_ready = signal.data();
-        EXPECT_THROW(RetainedM1Program::prepare(DeviceId::cuda(ordinal), duplicate, trace.gate.codebook_id,
-            trace.down.codebook_id, FullNativeHCFFNOutputDemand::all(), false, generation), std::invalid_argument);
-    }
+        EXPECT_THROW(RetainedM1Program::prepare(DeviceId::cuda(ordinal), args, trace.gate.codebook_id,
+            trace.down.codebook_id, FullNativeHCFFNOutputDemand::all(), false, generation,
+            RetainedM1PacketOrdering::NativeCompletion), std::invalid_argument);
+    const auto ordering = early ? RetainedM1PacketOrdering::NativeCompletion : RetainedM1PacketOrdering::CompleteProgram;
     const auto program = RetainedM1Program::prepare(DeviceId::cuda(ordinal), args, trace.gate.codebook_id,
-        trace.down.codebook_id, FullNativeHCFFNOutputDemand::all(), false, generation);
+        trace.down.codebook_id, FullNativeHCFFNOutputDemand::all(), false, generation, ordering);
     ASSERT_EQ(program.admission().resources().private_bytes, 0u);
 
     llaminar2::CUDAGraphCapture capture(native, ordinal);
     CUDAEarlyPacketPublication packet, cpu_ticket;
     if (early)
-        packet.prepare(native, signal.data());
+        packet.prepare(native);
     if (shard)
-        cpu_ticket.prepare(native, ticket_signal.data());
-    ASSERT_TRUE(capture.beginCapture());
-    if (early)
-        packet.recordProducer(native, signal.data());
-    if (shard)
-        cpu_ticket.recordProducer(native, ticket_signal.data());
-    program.launch(native, generation);
+        cpu_ticket.prepare(native);
     if (early)
     {
-        if (shard)
+        auto fragment = capture.createOrderedTimelineFragment();
+        ASSERT_TRUE(fragment);
+        ASSERT_TRUE(fragment->beginCapture());
         {
-            ASSERT_TRUE(cpu_ticket.recordConsumer(native, [&] {
-                return cudaMemcpyAsync(ticket_route.data(), route_weights.data(), top_k * sizeof(float),
+            ScopedCUDAFinalTimelineRecording scope(*fragment);
+            EXPECT_THROW(program.launch(native, generation), std::logic_error);
+            program.launch(native, generation, [&] {
+                packet.recordCompletedProducer(native);
+                if (shard)
+                    cpu_ticket.recordCompletedProducer(native);
+            });
+            if (shard)
+            {
+                ASSERT_TRUE(cpu_ticket.recordConsumer(native, [&] {
+                    return cudaMemcpyAsync(ticket_route.data(), route_weights.data(), top_k * sizeof(float),
+                        cudaMemcpyDeviceToDevice, native) == cudaSuccess;
+                }));
+            }
+            ASSERT_TRUE(packet.recordConsumer(native, [&] {
+                return cudaMemcpyAsync(packet_hidden.data(), mixed.data(), hidden * sizeof(float),
                     cudaMemcpyDeviceToDevice, native) == cudaSuccess;
             }));
+            ASSERT_TRUE(packet.recordConsumer(native, [&] {
+                return cudaMemcpyAsync(packet_route.data(), route_indices.data(), top_k * sizeof(float),
+                    cudaMemcpyDeviceToDevice, native) == cudaSuccess;
+            }));
+            requireCUDA(cudaMemcpyAsync(joined_routed.data(), routed.data(), top_k * hidden * sizeof(float),
+                cudaMemcpyDeviceToDevice, native));
         }
-        ASSERT_TRUE(packet.recordConsumer(native, [&] {
-            return cudaMemcpyAsync(packet_hidden.data(), mixed.data(), hidden * sizeof(float),
-                cudaMemcpyDeviceToDevice, native) == cudaSuccess;
-        }));
-        ASSERT_TRUE(packet.recordConsumer(native, [&] {
-            return cudaMemcpyAsync(packet_route.data(), route_indices.data(), top_k * sizeof(float),
-                cudaMemcpyDeviceToDevice, native) == cudaSuccess;
-        }));
-        requireCUDA(cudaMemcpyAsync(joined_routed.data(), routed.data(), top_k * hidden * sizeof(float),
-            cudaMemcpyDeviceToDevice, native));
+        ASSERT_TRUE(fragment->endCapture());
+        const std::array steps{GPUOrderedTimelineStep{.name = "retained_m1_frontier", .capture = fragment.get()}};
+        ASSERT_TRUE(capture.buildOrderedTimelineTransaction(steps));
+        ASSERT_TRUE(capture.instantiate());
     }
-    ASSERT_TRUE(capture.endCapture());
-    ASSERT_TRUE(capture.instantiate());
+    else
+    {
+        ASSERT_TRUE(capture.beginCapture());
+        EXPECT_THROW(program.launch(native, generation, [] {}), std::logic_error);
+        program.launch(native, generation);
+        ASSERT_TRUE(capture.endCapture());
+        ASSERT_TRUE(capture.instantiate());
+    }
     std::vector<GPUGraphKernelNodeInfo> kernels;
     std::string error;
     ASSERT_TRUE(capture.inspectKernelNodes(kernels, &error)) << error;
     if (early)
     {
-        ASSERT_EQ(kernels.size(), shard ? 3u : 2u);
+        ASSERT_EQ(kernels.size(), 4u);
+        std::array<unsigned, 4> actual_blocks{kernels[0].block_x, kernels[1].block_x, kernels[2].block_x, kernels[3].block_x};
+        std::sort(actual_blocks.begin(), actual_blocks.end());
+        EXPECT_EQ(actual_blocks, (std::array{retained_suffix_gate_up_threads, retained_suffix_down_threads, 256u, 256u}));
         assertEarlyPacketDependencies(capture.graph(), packet_hidden.data(), packet_route.data(), joined_routed.data(),
             shard ? ticket_route.data() : nullptr);
-        resident_blocks = std::min(resident_blocks, program.admission().maximumGrid() - 1u);
     }
     else
     {
@@ -473,7 +495,7 @@ void replay(const TracePair& trace, int ordinal, unsigned resident_blocks, Retai
     requireCUDA(cudaGraphDebugDotPrint(capture.graph(), dump.path, cudaGraphDebugDotFlagsKernelNodeParams));
     std::ifstream file(dump.path);
     const std::string graph{std::istreambuf_iterator<char>{file}, {}};
-    const auto resident = graph.find("retainedQFNM1HCFFNKernel");
+    const auto resident = graph.find(early ? "retainedQFNM1HCRouterKernel" : "retainedQFNM1HCFFNKernel");
     ASSERT_NE(resident, std::string::npos);
     EXPECT_NE(graph.find(std::to_string(resident_blocks) + ",256,0", resident), std::string::npos);
 
@@ -544,7 +566,8 @@ void replay(const TracePair& trace, int ordinal, unsigned resident_blocks, Retai
         if (!trace.moved)
             state->banks[1] = bank;
         runtime.set(native, [&](std::size_t) { return *state; });
-        ASSERT_TRUE(capture.launch());
+        for (unsigned launch = 0; launch < launches_per_frame; ++launch)
+            ASSERT_TRUE(capture.launch());
         uint64_t actual = kFNV1a64OffsetBasis;
         for (const auto* publication : {&written, &normalized, &raw, &activated, &up, &mixed,
                 &logits, &route_indices, &route_weights, &routed, &shared_out})
@@ -552,21 +575,16 @@ void replay(const TracePair& trace, int ordinal, unsigned resident_blocks, Retai
         EXPECT_EQ(actual, frame.expected) << "seed=" << frame.seed << " epoch=" << epoch;
         if (shard)
         {
-            constexpr int published = 1;
-            EXPECT_EQ(route_plan_ready.digest(native), fnv1a64(&published, sizeof(published)));
+            constexpr int untouched = 7;
+            EXPECT_EQ(route_plan_ready.digest(native), fnv1a64(&untouched, sizeof(untouched)));
         }
         if (early)
         {
-            constexpr std::uint64_t empty = 0;
-            EXPECT_EQ(signal.digest(native), fnv1a64(&empty, sizeof(empty)));
             EXPECT_EQ(packet_hidden.digest(native), mixed.digest(native));
             EXPECT_EQ(packet_route.digest(native), route_indices.digest(native));
             EXPECT_EQ(joined_routed.digest(native), routed.digest(native));
             if (shard)
-            {
-                EXPECT_EQ(ticket_signal.digest(native), fnv1a64(&empty, sizeof(empty)));
                 EXPECT_EQ(ticket_route.digest(native), route_weights.digest(native));
-            }
         }
     };
 
@@ -602,7 +620,7 @@ TEST(CUDARetainedHCFFN, RecordedCountedPublications)
 {
     const int ordinal = selectVisibleSM86();
     const auto& device = cudaHardwareMetadata().at(ordinal);
-    const auto blocks = std::min(2u * static_cast<unsigned>(device.sm_count), hidden / retained_hc_read_warp_channels);
+    const auto blocks = std::min(2u * static_cast<unsigned>(device.sm_count > 2 ? device.sm_count - 2 : device.sm_count), hidden / retained_hc_read_warp_channels);
     for (const auto& trace : traces)
     {
         SCOPED_TRACE(unsigned(trace.gate.codebook_id));
@@ -616,7 +634,7 @@ TEST(CUDARetainedHCFFN, RecordedEarlyPacketPublications)
 {
     const int ordinal = selectVisibleSM86();
     const auto& device = cudaHardwareMetadata().at(ordinal);
-    const auto blocks = std::min(2u * static_cast<unsigned>(device.sm_count), hidden / retained_hc_read_warp_channels);
+    const auto blocks = std::min(2u * static_cast<unsigned>(device.sm_count > 2 ? device.sm_count - 2 : device.sm_count), hidden / retained_hc_read_warp_channels);
     for (const auto& trace : traces)
         ASSERT_NO_THROW(replay(trace, ordinal, blocks, RetainedReplayRole::ActiveEarlyPacket));
 }
@@ -626,9 +644,247 @@ TEST(CUDARetainedHCFFN, RecordedFragmentRouting)
 {
     const int ordinal = selectVisibleSM86();
     const auto& device = cudaHardwareMetadata().at(ordinal);
-    const auto blocks = std::min(2u * static_cast<unsigned>(device.sm_count), hidden / retained_hc_read_warp_channels);
+    const auto blocks = std::min(2u * static_cast<unsigned>(device.sm_count > 2 ? device.sm_count - 2 : device.sm_count), hidden / retained_hc_read_warp_channels);
     for (const auto& trace : traces)
         ASSERT_NO_THROW(replay(trace, ordinal, blocks, RetainedReplayRole::ActiveShardEarlyPacket));
+}
+
+/** @test Repeated recorded frames complete both readers and the native suffix with no device wait. */
+TEST(CUDARetainedHCFFN, RecordedNativePacketFrontier)
+{
+    const int ordinal = selectVisibleSM86();
+    const auto& device = cudaHardwareMetadata().at(ordinal);
+    const auto blocks = std::min(2u * static_cast<unsigned>(device.sm_count > 2 ? device.sm_count - 2 : device.sm_count), hidden / retained_hc_read_warp_channels);
+    for (const auto role : {RetainedReplayRole::ActiveEarlyPacket, RetainedReplayRole::ActiveShardEarlyPacket})
+        for (const auto& trace : traces)
+            ASSERT_NO_THROW(replay(trace, ordinal, blocks, role, 384));
+}
+
+/** @test Quiet event timing of RoutePrefix + device-sized SuffixGateUp + SuffixDown at 0, 4, and 10 local routes. */
+TEST(CUDARetainedHCFFN, FrontierSuffixRooflineTiming)
+{
+    const int ordinal = selectVisibleSM86();
+    const auto& device = cudaHardwareMetadata().at(ordinal);
+    const auto blocks = std::min(2u * static_cast<unsigned>(device.sm_count > 2 ? device.sm_count - 2 : device.sm_count), hidden / retained_hc_read_warp_channels);
+    const Stream stream;
+    const auto native = stream.value;
+    for (const auto& trace : traces)
+    {
+        std::vector<std::unique_ptr<Weight>> weights;
+        const auto weight = [&](int n, int k, NativeQuantisedFormatInfo format, uint32_t seed, bool hc = false) {
+            weights.push_back(std::make_unique<Weight>(native, n, k, format, seed, false, hc));
+            return weights.back()->view;
+        };
+        const auto hc_down = weight(width, trunk, formats::Q8_0, 73, true);
+        const auto hc_up = weight(trunk, width, formats::Q8_0, 153, true);
+        const RetainedM1Expert shared{weight(width, hidden, formats::Q8_0, 61),
+            weight(width, hidden, formats::Q8_0, 62), weight(hidden, width, formats::Q8_0, 63)};
+        std::array<RetainedM1Expert, top_k> local_experts{};
+        for (int e = 0; e < top_k; ++e)
+            local_experts[e] = {weight(width, hidden, trace.gate, 200 + 3 * e),
+                weight(width, hidden, trace.gate, 201 + 3 * e),
+                weight(hidden, width, trace.down, 202 + 3 * e)};
+
+        Array<int> order{top_k + 2}, route_plan_ready{1}, ledger_ids{top_k}, ledger_participants{top_k};
+        Array<float> residual{trunk}, block{hidden}, write_gate{4}, gain{trunk}, written{trunk},
+            normalized{trunk}, norm_scales{trunk / 32}, partials{width * hc_partitions}, raw{width},
+            activated{width}, primary_scales{width / 32}, secondary_scales{width / 32}, up{trunk}, mixed{hidden},
+            logits{experts}, route_indices{top_k}, route_weights{top_k}, ledger_weights{top_k},
+            routed{top_k * hidden}, shared_out{hidden}, hidden_scales{hidden / 32},
+            routed_scales{top_k * width / 32}, shared_scales{width / 32};
+        Array<int8_t> norm_codes{trunk}, primary{width}, secondary{width}, hidden_codes{hidden},
+            routed_codes{top_k * width}, shared_codes{width};
+        Array<uint16_t> router{experts * hidden};
+        Array<DeviceMoELayerRuntime> runtime{1};
+        Array<RetainedM1Expert> selected{top_k};
+        constexpr std::size_t suffix_packets = (top_k + 1) * (width / 32);
+        Array<float> suffix_partials{suffix_packets * 16 * 2 * 32};
+        Array<uint32_t> suffix_done{suffix_packets};
+        Array<uint64_t> profile_ns{16};
+        const auto rows = DeviceRowRange::fullyActive(1);
+        const RetainedM1HCFFN args{
+            .hc = {
+                .write = {{1, nullptr}, hidden, residual.data(), block.data(), write_gate.data(), written.data()},
+                .norm = {{1, nullptr}, hidden, 1.e-6f, written.data(), gain.data(), normalized.data()},
+                .down = hc_down, .down_partitions = {hc_partitions, (trunk / 32 + hc_partitions - 1) / hc_partitions},
+                .down_fold = HCDownFold::OrderedPartitions,
+                .norm_codes = norm_codes.data(), .norm_scales = norm_scales.data(), .down_partials = partials.data(),
+                .raw_down = raw.data(),
+                .down_publication = {rows, width, activated.data(), primary.data(), secondary.data(),
+                    primary_scales.data(), secondary_scales.data()},
+                .up = {hc_up, rows, Q8ResidualQuantizerPolicy::CUDAFloatScaleNativeReciprocal, raw.data(), up.data(),
+                    primary.data(), secondary.data(), primary_scales.data(), secondary_scales.data()}, .mixed = mixed.data(),
+            },
+            .router = {runtime.data(), router.data(), logits.data(), route_indices.data(), route_weights.data(),
+                nullptr, experts, top_k, RoutedExpertRowExecutionPolicy::IntermediateShardLocal, true},
+            .shared = shared, .selected = selected.data(), .route_order = order.data(),
+            .route_plan_ready = route_plan_ready.data(), .routed_width = width,
+            .routed_workspace = {routed_codes.data(), routed_scales.data()},
+            .shared_workspace = {shared_codes.data(), shared_scales.data()},
+            .hidden_codes = hidden_codes.data(), .hidden_scales = hidden_scales.data(),
+            .routed_contributions = routed.data(), .shared_contribution = shared_out.data(),
+            .suffix_partials = suffix_partials.data(), .suffix_done = suffix_done.data(),
+            .suffix_gate_up_node = nullptr, .suffix_down_node = nullptr,
+            .profile_ns = profile_ns.data(),
+            .route_publication = RetainedM1RoutePublication::Raw,
+            .shared_publication = RetainedM1SharedPublication::PartialBeforeCollective,
+        };
+        const auto program = RetainedM1Program::prepare(DeviceId::cuda(ordinal), args, trace.gate.codebook_id,
+            trace.down.codebook_id, FullNativeHCFFNOutputDemand::all(), false, 1,
+            RetainedM1PacketOrdering::NativeCompletion);
+        cudaEvent_t t0{}, t1{}, t2{};
+        requireCUDA(cudaEventCreate(&t0));
+        requireCUDA(cudaEventCreate(&t1));
+        requireCUDA(cudaEventCreate(&t2));
+        llaminar2::CUDAGraphCapture capture(native, ordinal);
+        auto fragment = capture.createOrderedTimelineFragment();
+        ASSERT_TRUE(fragment && fragment->beginCapture());
+        {
+            ScopedCUDAFinalTimelineRecording scope(*fragment);
+            requireCUDA(cudaEventRecordWithFlags(t0, native, cudaEventRecordExternal));
+            program.launch(native, 1, [&] {
+                requireCUDA(cudaEventRecordWithFlags(t1, native, cudaEventRecordExternal));
+            });
+            requireCUDA(cudaEventRecordWithFlags(t2, native, cudaEventRecordExternal));
+        }
+        ASSERT_TRUE(fragment->endCapture());
+        const std::array steps{GPUOrderedTimelineStep{.name = "roofline_timing", .capture = fragment.get()}};
+        ASSERT_TRUE(capture.buildOrderedTimelineTransaction(steps));
+        ASSERT_TRUE(capture.instantiate());
+
+        residual.set(native, [](std::size_t i) { return signedValue(i, 101); });
+        block.set(native, [](std::size_t i) { return signedValue(i, 102); });
+        write_gate.set(native, [](std::size_t i) { return signedValue(i, 103); });
+        gain.set(native, [](std::size_t i) { return 0.95f + signedValue(i, 104); });
+        router.set(native, [](std::size_t i) { return __half_as_ushort(__float2half(signedValue(i, 761))); });
+        // Eviction buffer (64 MB) to ensure DRAM-resident streaming (cold L2).
+        Array<uint32_t> evict{16 * 1024 * 1024};
+
+        for (int local_routes : {0, 4, 10})
+        {
+            auto state = std::make_unique<DeviceMoELayerRuntime>();
+            state->active_epoch = 2;
+            state->expert_count = experts;
+            state->top_k = top_k;
+            state->route_expert_ids = ledger_ids.data();
+            state->route_participant_ids = ledger_participants.data();
+            state->route_weights = ledger_weights.data();
+            state->prefill_token_capacity = 1;
+            state->prefill_route_capacity = top_k;
+            state->participant_id = 0;
+            state->participant_count = 2;
+            state->intermediate_shard = originalFragmentTrace();
+            auto& bank = state->banks[0];
+            bank.epoch = 2;
+            bank.expert_count = experts;
+            // First run once to find which 10 experts are selected, or make first `local_routes` of all 512 local by modulo.
+            // Better: run 1 warmup with all local, read topk_expert_ids, then enable exact `local_routes` of them!
+            for (int e = 0; e < experts; ++e)
+            {
+                auto& entry = bank.experts[e];
+                entry.owner_participant = -1;
+                entry.logical_expert_id = e;
+                entry.local_slot = e;
+                bank.local_compute_mask[e] = true;
+                bank.overlay_route_participant[e] = MoEOverlayRouteTarget::cohort(0).word();
+                entry.gate = local_experts[e % top_k].gate;
+                entry.up = local_experts[e % top_k].up;
+                entry.down = local_experts[e % top_k].down;
+                entry.flags = toMoEExpertFlags(DeviceMoEExpertFlags::Valid | DeviceMoEExpertFlags::Resident |
+                    DeviceMoEExpertFlags::LocalCompute);
+                entry.projection_set = DeviceMoEProjectionSet::IntermediateShard;
+            }
+            state->banks[1] = bank;
+            runtime.set(native, [&](std::size_t) { return *state; });
+            ASSERT_TRUE(capture.launch());
+            requireCUDA(cudaStreamSynchronize(native));
+            std::vector<float> selected_ids(top_k);
+            requireCUDA(cudaMemcpy(selected_ids.data(), route_indices.data(), top_k * sizeof(float), cudaMemcpyDeviceToHost));
+            for (int e = 0; e < experts; ++e)
+            {
+                bank.local_compute_mask[e] = false;
+                bank.experts[e].local_slot = -1;
+                bank.experts[e].flags = 0;
+                bank.overlay_route_participant[e] = MoEOverlayRouteTarget::cohort(1).word();
+            }
+            for (int r = 0; r < local_routes; ++r)
+            {
+                const int e = static_cast<int>(selected_ids[r]);
+                auto& entry = bank.experts[e];
+                bank.local_compute_mask[e] = true;
+                entry.local_slot = e;
+                bank.overlay_route_participant[e] = MoEOverlayRouteTarget::cohort(0).word();
+                entry.gate = local_experts[r].gate;
+                entry.up = local_experts[r].up;
+                entry.down = local_experts[r].down;
+                entry.flags = toMoEExpertFlags(DeviceMoEExpertFlags::Valid | DeviceMoEExpertFlags::Resident |
+                    DeviceMoEExpertFlags::LocalCompute);
+                entry.projection_set = DeviceMoEProjectionSet::IntermediateShard;
+            }
+            state->banks[1] = bank;
+            runtime.set(native, [&](std::size_t) { return *state; });
+
+            // Warm GPU clocks cleanly into P0 before cold-L2 sampling.
+            for (int w = 0; w < 256; ++w)
+            {
+                requireCUDA(cudaMemsetAsync(evict.data(), w & 0xff, 16 * 1024 * 1024, native));
+                ASSERT_TRUE(capture.launch());
+            }
+            requireCUDA(cudaStreamSynchronize(native));
+
+            std::vector<float> prefix_us, suffix_us, total_us;
+            std::array<std::vector<double>, 13> phase_us;
+            for (int iter = 0; iter < 31; ++iter)
+            {
+                // Flush L2 cache (6 MB) with 64 MB memset before each timed graph replay.
+                requireCUDA(cudaMemsetAsync(profile_ns.data(), 0, 16 * sizeof(uint64_t), native));
+                requireCUDA(cudaMemsetAsync(evict.data(), iter & 0xff, 64 * 1024 * 1024, native));
+                ASSERT_TRUE(capture.launch());
+                requireCUDA(cudaStreamSynchronize(native));
+                std::array<uint64_t, 16> ts{};
+                requireCUDA(cudaMemcpy(ts.data(), profile_ns.data(), 16 * sizeof(uint64_t), cudaMemcpyDeviceToHost));
+                for (int p = 0; p < 10; ++p)
+                    phase_us[p].push_back(static_cast<double>(static_cast<int64_t>(ts[p + 1] - ts[p])) / 1000.0);
+                phase_us[10].push_back(static_cast<double>(static_cast<int64_t>(ts[11] - ts[5])) / 1000.0);
+                phase_us[11].push_back(static_cast<double>(static_cast<int64_t>(ts[12] - ts[11])) / 1000.0);
+                phase_us[12].push_back(static_cast<double>(static_cast<int64_t>(ts[6] - ts[12])) / 1000.0);
+                float ms_p = 0.f, ms_s = 0.f, ms_t = 0.f;
+                requireCUDA(cudaEventElapsedTime(&ms_p, t0, t1));
+                requireCUDA(cudaEventElapsedTime(&ms_s, t1, t2));
+                requireCUDA(cudaEventElapsedTime(&ms_t, t0, t2));
+                prefix_us.push_back(ms_p * 1000.f);
+                suffix_us.push_back(ms_s * 1000.f);
+                total_us.push_back(ms_t * 1000.f);
+            }
+            std::sort(prefix_us.begin(), prefix_us.end());
+            std::sort(suffix_us.begin(), suffix_us.end());
+            std::sort(total_us.begin(), total_us.end());
+            for (auto& v : phase_us) std::sort(v.begin(), v.end());
+            std::cout << "ROOFLINE_TIMING,card=" << ordinal
+                      << ",gate=" << unsigned(trace.gate.codebook_id)
+                      << ",down=" << unsigned(trace.down.codebook_id)
+                      << ",local_routes=" << local_routes
+                      << ",prefix_us=" << prefix_us[15]
+                      << ",suffix_us=" << suffix_us[15]
+                      << ",total_us=" << total_us[15]
+                      << ",norm=" << phase_us[0][15]
+                      << ",hc_down=" << phase_us[1][15]
+                      << ",hc_pub=" << phase_us[2][15]
+                      << ",hc_up=" << phase_us[3][15]
+                      << ",router=" << phase_us[4][15]
+                      << ",topk=" << phase_us[5][15]
+                      << ",tk_sm=" << phase_us[10][15]
+                      << ",tk_sel=" << phase_us[11][15]
+                      << ",tk_gd=" << phase_us[12][15]
+                      << ",gap1=" << phase_us[6][15]
+                      << ",gate_up=" << phase_us[7][15]
+                      << ",gap2=" << phase_us[8][15]
+                      << ",down_k=" << phase_us[9][15] << std::endl;
+        }
+        requireCUDA(cudaEventDestroy(t0));
+        requireCUDA(cudaEventDestroy(t1));
+        requireCUDA(cudaEventDestroy(t2));
+    }
 }
 
 /** @test Replay the recorded serial mapped packet through each original readiness roster. */
@@ -651,8 +907,7 @@ TEST(CUDARetainedHCFFN, RecordedMappedDmaDispatchPublications)
     Array<MoEOverlayActivationSingleRowDispatchPackLaunch> original_batch{lane_capacity};
     const auto input = transfers.allocateDeviceTransferBuffer(hidden * sizeof(float), device);
     Array<float> ids{top_k}, weights{top_k}, resident_ids{top_k}, resident_weights{top_k}, prior_ids{top_k};
-    Array<std::uint64_t> ready{1};
-    Array<int> count_input{1}, row_count{1}, placement{experts};
+    Array<int> count_input{1}, row_count{1}, arithmetic_completion{1}, placement{experts};
     Array<unsigned> epoch{1};
     Array<DeviceMoEOverlayEpochTicket> ticket{1};
     Array<DeviceMoEOverlayEpochStatus> status{1};
@@ -699,19 +954,19 @@ TEST(CUDARetainedHCFFN, RecordedMappedDmaDispatchPublications)
     for (const auto& [lane_count, prior_reader] : scenarios)
     {
         SCOPED_TRACE(::testing::Message() << "lanes=" << lane_count << " prior_reader=" << prior_reader);
-        const bool inline_acquire = lane_count == 1u && !prior_reader;
         const auto publishCount = [&] {
             requireCUDA(cudaMemcpyAsync(row_count.data(), count_input.data(), sizeof(int), cudaMemcpyDeviceToDevice, native));
         };
         CUDAGraphCapture candidate(native, ordinal), control(native, ordinal);
         CUDAEarlyPacketPublication producer;
-        producer.prepare(native, ready.data());
+        producer.prepare(native);
         ASSERT_TRUE(candidate.beginCapture());
         publishCount();
-        producer.recordProducer(native, ready.data());
         requireCUDA(cudaMemcpyAsync(resident_ids.data(), ids.data(), top_k * sizeof(float), cudaMemcpyDeviceToDevice, native));
         requireCUDA(cudaMemcpyAsync(resident_weights.data(), weights.data(), top_k * sizeof(float), cudaMemcpyDeviceToDevice, native));
-        ASSERT_TRUE(appendCUDAActiveCaptureTimelinePublish64(native, ready.data(), 1u));
+        producer.recordCompletedProducer(native);
+        requireCUDA(cudaMemcpyAsync(arithmetic_completion.data(), row_count.data(), sizeof(int),
+            cudaMemcpyDeviceToDevice, native));
         if (prior_reader)
         {
             ASSERT_TRUE(producer.recordConsumer(native, [&] {
@@ -719,29 +974,21 @@ TEST(CUDARetainedHCFFN, RecordedMappedDmaDispatchPublications)
                     cudaMemcpyDeviceToDevice, native) == cudaSuccess;
             }));
         }
-        ASSERT_TRUE(producer.recordDispatchConsumer(native, lane_count, [&](const auto* acquire) {
-            EXPECT_EQ(acquire != nullptr, inline_acquire);
-            if (acquire)
-                EXPECT_THROW(acquire->claimSignal(nullptr), std::logic_error);
-            const bool recorded = recordResidentDispatchPackets(std::span(prepared).first(lane_count),
-                ordinal, native, acquire);
-            if (acquire && recorded)
-                EXPECT_THROW(acquire->claimSignal(native), std::logic_error);
-            return recorded;
+        ASSERT_TRUE(producer.recordConsumer(native, [&] {
+            return recordResidentDispatchPackets(std::span(prepared).first(lane_count), ordinal, native);
         }));
         ASSERT_TRUE(candidate.endCapture());
         ASSERT_TRUE(candidate.instantiate());
         std::vector<GPUGraphKernelNodeInfo> inventory;
         std::string error;
         ASSERT_TRUE(candidate.inspectKernelNodes(inventory, &error)) << error;
-        const unsigned acquire_nodes = inline_acquire ? 0u : 1u;
-        ASSERT_EQ(inventory.size(), 2u * lane_count + acquire_nodes + 1u);
+        ASSERT_EQ(inventory.size(), 2u * lane_count);
         EXPECT_EQ(std::count_if(inventory.begin(), inventory.end(), [](const auto& node) {
             return node.grid_x == 1 && node.block_x == 32;
         }), lane_count);
         EXPECT_EQ(std::count_if(inventory.begin(), inventory.end(), [](const auto& node) {
             return node.grid_x == 1 && node.block_x == 1;
-        }), lane_count + acquire_nodes + 1u);
+        }), lane_count);
 
         const NativeGraphDump dump;
         requireCUDA(cudaGraphDebugDotPrint(candidate.graph(), dump.path,
@@ -750,7 +997,6 @@ TEST(CUDARetainedHCFFN, RecordedMappedDmaDispatchPublications)
         const std::string graph{std::istreambuf_iterator<char>{dot}, {}};
         EXPECT_NE(graph.find("prepareResidentDmaMetadata"), std::string::npos);
         EXPECT_NE(graph.find("publishResidentDmaPacket"), std::string::npos);
-        EXPECT_EQ(graph.find("waitResidentPacketAcquire64") != std::string::npos, !inline_acquire);
 
         ASSERT_TRUE(control.beginCapture());
         publishCount();
@@ -834,8 +1080,7 @@ TEST(CUDARetainedHCFFN, RecordedMappedDmaDispatchPublications)
                 EXPECT_EQ(digest, live_entries ? live_packet : empty_packet);
             }
             requireCUDA(cudaStreamSynchronize(native));
-            constexpr std::uint64_t released = 0;
-            EXPECT_EQ(ready.digest(native), fnv1a64(&released, sizeof(released)));
+            EXPECT_EQ(arithmetic_completion.digest(native), row_count.digest(native));
             if (prior_reader)
                 EXPECT_EQ(prior_ids.digest(native), ids.digest(native));
         }

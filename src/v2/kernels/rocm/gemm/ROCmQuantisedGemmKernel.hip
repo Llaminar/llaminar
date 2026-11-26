@@ -198,25 +198,9 @@ __global__ void applyFp32CombineEpilogue_kernel(
     if constexpr (Counted)
         if (!llaminar2::projectionRowIsActive(work,idx/N)) return;
 
-    // Mapped copy-only publication must preserve bits just like serial DMA,
-    // including subnormals and signed zero, without introducing a multiply.
-    if (alpha == 1.0f && beta == 0.0f && d_bias == nullptr)
-    {
-        d_output[idx] = d_computed[idx];
-        return;
-    }
-
-    const int col = idx % N;
-    float result = alpha * d_computed[idx];
-    if (beta != 0.0f && d_existing != nullptr)
-    {
-        result += beta * d_existing[idx];
-    }
-    if (d_bias != nullptr)
-    {
-        result += d_bias[col];
-    }
-    d_output[idx] = result;
+    // Identity copies preserve signed zeros and subnormals on mapped output.
+    const llaminar2::rocm::ROCmFP32DestinationFold fold{d_bias, alpha, beta};
+    d_output[idx] = fold.apply(d_computed[idx], d_existing, idx, idx % N);
 }
 // ============================================================================
 // Vectorized Scaling Kernel with 1D Flat Grid (M > 1 fast path)

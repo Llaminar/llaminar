@@ -10,6 +10,7 @@
 
 #include "kernels/common/DeviceRowRange.h"
 #include "kernels/common/NativeCooperativeKernel.h"
+#include "kernels/common/NativeEmbeddingIQTables.h"
 #include "kernels/common/ResidentMoEFFNProgramEvidence.h"
 #include <optional>
 #include "kernels/common/DeviceNativeQuantisedMatrixDesc.h"
@@ -307,6 +308,8 @@ private:
         std::optional<NativeCooperativeKernelAdmission> cooperative);
     ResidentMoEFFNProgramEvidence evidence_;
     std::optional<NativeCooperativeKernelAdmission> cooperative_;
+    NativeEmbeddingIQTables iq_tables_{};
+    bool uses_fast_full_entry_=false;
 };
 /**
  * @param program Authenticated original execution envelope, including admitted future representations.

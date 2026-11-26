@@ -46,4 +46,80 @@ inline bool qfnRetainedGDNPreAttentionEnabled(bool qualified)
     }();
     return selected.value_or(qualified);
 }
+
+/**
+ * @brief Select the CUDA full-GDN attention megakernel across all CUDA topologies and MoE placements.
+ * @param selected Resolved cold participant policy.
+ * @param device Actual local CUDA participant.
+ * @param phase Original execution phase.
+ * @param role Original forward role.
+ * @param rows Admitted sequence width.
+ * @param requests Number of concurrent requests in the graph.
+ * @return True when this graph may consume the CUDA retained GDN workspace and lowering.
+ */
+inline bool usesRetainedCUDAGDN(bool selected, DeviceId device,
+    ForwardExecutionPhase phase, ForwardExecutionRole role, int rows, int requests)
+{
+    return device.is_cuda() &&
+        useQwen4ExpRetainedM1HCFFN(selected, phase, role, rows, requests);
+}
+
+/**
+ * @brief Resolve retained CUDA full-GDN at the graph and PMA boundaries.
+ * @param qualified Whether the original GDN layer projection formats qualify.
+ * @return Explicit diagnostic override or the qualified ordinary default.
+ */
+inline bool qfnRetainedCUDAGDNEnabled(bool qualified)
+{
+    static const std::optional<bool> selected = []() -> std::optional<bool> {
+        const char *value = DebugEnv::envValue("LLAMINAR_QFN_RETAINED_CUDA_GDN");
+        if (!value) return std::nullopt;
+        if (std::string_view(value) == "0") return false;
+        if (std::string_view(value) == "1") return true;
+        throw std::invalid_argument("LLAMINAR_QFN_RETAINED_CUDA_GDN requires 0 or 1");
+    }();
+    return selected.value_or(qualified);
+}
+
+/** @brief Select the CUDA retained QSA Pre-/Post-Attention megakernels across all CUDA topologies. */
+inline bool usesRetainedCUDAQSAAttention(bool selected, DeviceId device,
+    ForwardExecutionPhase phase, ForwardExecutionRole role, int rows, int requests)
+{
+    return device.is_cuda() &&
+        useQwen4ExpRetainedM1HCFFN(selected, phase, role, rows, requests);
+}
+
+/** @brief Resolve retained CUDA QSA megakernel selection at the graph and PMA boundaries. */
+inline bool qfnRetainedCUDAQSAAttentionEnabled(bool qualified)
+{
+    static const std::optional<bool> selected = []() -> std::optional<bool> {
+        const char *value = DebugEnv::envValue("LLAMINAR_QFN_RETAINED_CUDA_QSA");
+        if (!value) return std::nullopt;
+        if (std::string_view(value) == "0") return false;
+        if (std::string_view(value) == "1") return true;
+        throw std::invalid_argument("LLAMINAR_QFN_RETAINED_CUDA_QSA requires 0 or 1");
+    }();
+    return selected.value_or(qualified);
+}
+
+/** @brief Select the ROCm retained QSA Pre-/Post-Attention megakernels across all ROCm topologies. */
+inline bool usesRetainedROCmQSAAttention(bool selected, DeviceId device,
+    ForwardExecutionPhase phase, ForwardExecutionRole role, int rows, int requests)
+{
+    return device.is_rocm() &&
+        useQwen4ExpRetainedM1HCFFN(selected, phase, role, rows, requests);
+}
+
+/** @brief Resolve retained ROCm QSA megakernel selection at the graph and PMA boundaries. */
+inline bool qfnRetainedROCmQSAAttentionEnabled(bool qualified)
+{
+    static const std::optional<bool> selected = []() -> std::optional<bool> {
+        const char *value = DebugEnv::envValue("LLAMINAR_QFN_RETAINED_ROCM_QSA");
+        if (!value) return std::nullopt;
+        if (std::string_view(value) == "0") return false;
+        if (std::string_view(value) == "1") return true;
+        throw std::invalid_argument("LLAMINAR_QFN_RETAINED_ROCM_QSA requires 0 or 1");
+    }();
+    return selected.value_or(qualified);
+}
 } // namespace llaminar2

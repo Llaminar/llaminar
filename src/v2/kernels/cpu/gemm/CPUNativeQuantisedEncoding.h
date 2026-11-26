@@ -25,13 +25,32 @@ namespace llaminar2::cpu::native_quantised
     {
         switch (codebook_id)
         {
-        case 0: // Q4_0:  nibble - 8 → [-8, +7]
-        case 4: // IQ4_NL / IQ4_XS: kvalues_iq4nl LUT
-        case 5: // Q4_1:  nibble → [0, 15]
+        case 0:  // Q4_0:  nibble - 8 → [-8, +7]
+        case 4:  // IQ4_NL / IQ4_XS: kvalues_iq4nl LUT
+        case 5:  // Q4_1:  nibble → [0, 15]
+        case 11: // IQ3_S: 16-entry signed odd LUT [-15..+15]
+        case 12: // IQ3_XXS: 16-entry signed LUT [-62..+62]
+        case 15: // IQ2_XXS: 6-entry signed LUT [-43..+43]
+        case 16: // IQ1_S: 3-entry signed LUT {-1, 0, +1}
             return true;
         default:
             return false;
         }
+    }
+
+    /**
+     * @brief Identify compact grid formats repacked into 4-bit nibble LUT payloads.
+     *
+     * Unlike Q4_0/Q4_1/IQ4_NL/IQ4_XS whose native payloads are already 16-byte
+     * 4-bit nibble blocks, IQ3_S/IQ3_XXS/IQ2_XXS/IQ1_S use smaller grid-indexed
+     * source payloads whose exact signed value domains have at most 16 values.
+     * Preparation losslessly repacks them into 16-byte 4-bit nibble blocks for
+     * uniform vpshufb/vtbl decode at 1.73-1.80x lower bandwidth than ExpandedInt8.
+     */
+    inline constexpr bool is_repacked_nibble_lut_format(uint8_t codebook_id) noexcept
+    {
+        return codebook_id == 11 || codebook_id == 12 ||
+               codebook_id == 15 || codebook_id == 16;
     }
 
     /**
@@ -49,11 +68,17 @@ namespace llaminar2::cpu::native_quantised
         if (rotation_enabled)
             return CPUNativeQuantisedEncoding::ExpandedInt8;
         if (codebook_id == 11)
-            return CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale;
+            return CPUNativeQuantisedEncoding::NibbleLUTSourceScale;
+        if (codebook_id == 0 || codebook_id == 5)
+            return CPUNativeQuantisedEncoding::UnsignedNibble;
         if (is_nibble_lut_format(codebook_id))
             return CPUNativeQuantisedEncoding::NibbleLUT;
+        if (codebook_id == 6 || codebook_id == 7)
+            return CPUNativeQuantisedEncoding::CompactFiveBit;
         if (codebook_id == 8)
             return CPUNativeQuantisedEncoding::Q6KNativeDualScale;
+        if (codebook_id == 19 || codebook_id == 20 || codebook_id == 21)
+            return CPUNativeQuantisedEncoding::UnsignedInt8;
         if (hasCompactMultiScaleVnniPayload(codebook_id))
             return CPUNativeQuantisedEncoding::CompactMultiScale;
         return CPUNativeQuantisedEncoding::ExpandedInt8;

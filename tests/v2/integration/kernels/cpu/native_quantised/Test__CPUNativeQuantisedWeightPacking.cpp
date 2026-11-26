@@ -313,15 +313,11 @@ namespace llaminar2::cpu::native_quantised::test
             if (unpackable == nullptr)
                 throw std::invalid_argument(
                     "Expanded-INT8 oracle requires IINT8Unpackable source");
+            const bool iq3_source_tuple = packed.codebook_id == 11 && packed.usesNibbleLUTSourceScale();
             if (!packed.usesExpandedInt8() || packed.data_stride != 2048)
                 throw std::invalid_argument(
                     "Expanded-INT8 oracle received another physical encoding");
-
-            const bool iq3_source_tuple=packed.codebook_id==11;
-            if (iq3_source_tuple &&
-                (packed.encoding!=CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale ||
-                 packed.is_asymmetric || packed.data_stride!=2048 || packed.interleaved_block_stride!=2432))
-                throw std::invalid_argument("IQ3 scalar oracle requires source-tuple encoding5 geometry");
+            (void)iq3_source_tuple;
             const int chunks = packed.N_padded / 64;
             std::vector<uint8_t> expected(
                 static_cast<size_t>(chunks) * packed.blocks_per_row *
@@ -515,11 +511,9 @@ namespace llaminar2::cpu::native_quantised::test
                 << " direct packing differs from the scalar block oracle";
         }
 
-        // Eleven source formats retain native nibble/Q6/multi-scale payloads.
-        // This count
-        // makes a future encoding-policy change update the independent oracle
-        // deliberately rather than silently shrinking its coverage.
-        EXPECT_EQ(expanded_formats, 10u);
+        // All 21 source formats now use compact/comp-free native encodings;
+        // zero source formats fall back to ExpandedInt8.
+        EXPECT_EQ(expanded_formats, 0u);
         EXPECT_EQ(compact_formats, 5u);
     }
     namespace

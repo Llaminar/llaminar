@@ -200,6 +200,20 @@ namespace llaminar2
                     : returned_rows == dispatched_rows && returned_entries == dispatched_entries);
     }
 
+    /** @brief Immutable prefill wire encoding negotiated for one GPU-to-GPU channel. */
+    enum class MoEOverlayActivationPrefillWirePolicy : std::uint32_t
+    {
+        FP32Canonical = 0u,          ///< Default FP32 dispatch and FP32 per-slot return.
+        FixedPoint32Adaptive16 = 1u, ///< MainPrefill only: exact Q8_1 wire dispatch + fixed-point int32 pre-folded return (adaptive 16/32b wire).
+    };
+
+    [[nodiscard]] LLAMINAR_MOE_ACTIVATION_HD constexpr bool
+    moeOverlayActivationPrefillWirePolicyValid(std::uint32_t policy) noexcept
+    {
+        return policy <= static_cast<std::uint32_t>(
+                             MoEOverlayActivationPrefillWirePolicy::FixedPoint32Adaptive16);
+    }
+
     struct alignas(64) MoEOverlayActivationChannelHeader
     {
         std::uint32_t magic = kMoEOverlayActivationMagic;
@@ -224,7 +238,11 @@ namespace llaminar2
         std::uint32_t graph_role_mask = 0u;
         std::uint32_t return_role = 0u; ///< Original logical contribution policy, never live routing state.
         std::int32_t cohort_target = -1; ///< Original fixed CPU cohort tag; no expert membership.
-        std::uint64_t reserved[3] = {};
+        /** Immutable wire encoding used on GPU-to-GPU MainPrefill transactions. */
+        std::uint32_t prefill_wire_policy = static_cast<std::uint32_t>(
+            MoEOverlayActivationPrefillWirePolicy::FP32Canonical);
+        std::uint32_t reserved_pad = 0u;
+        std::uint64_t reserved[2] = {};
     };
 
     /**

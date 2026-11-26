@@ -42,7 +42,7 @@
 #include "kernels/rocm/gemm/ROCmDownLastProducer.h"
 #include "kernels/rocm/gemm/ROCmNativeLayoutRouterFFN.h"
 #include "kernels/rocm/gemm/ROCmFullNativeHCFFN.h"
-#include "kernels/rocm/gemm/retained_hc_ffn/ROCmRetainedM1HCFFNDevice.h"
+#include "kernels/rocm/gemm/ROCmFastFullNativeHCFFN.h"
 #include "planning/TensorParallelSourceDeclaration.h"
 #include "execution/compute_stages/stages/qwen4exp/Qwen4ExpHyperconnectionBuilder.h"
 #include "utils/DebugEnv.h"

@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include "../../SourceShardReader.h"
 
 #include <filesystem>
 #include <fstream>
@@ -41,13 +42,7 @@ namespace llaminar2::test
 
         std::string readFile(const fs::path &path)
         {
-            std::ifstream input(path);
-            if (!input)
-                return {};
-
-            std::ostringstream buffer;
-            buffer << input.rdbuf();
-            return buffer.str();
+            return llaminar2::test_support::readSourceFileOrFamily(path);
         }
 
     } // namespace

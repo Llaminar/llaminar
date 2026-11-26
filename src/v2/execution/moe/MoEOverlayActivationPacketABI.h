@@ -64,8 +64,10 @@ namespace llaminar2
         std::uint64_t published_live_rows = 0u; ///< Published compact rows.
         std::uint64_t published_live_entries = 0u; ///< Published route entries.
         std::uint64_t published_stage_count = 0u; ///< Published descriptors.
-        std::uint64_t live_rows = 0u; ///< Current validated stage row count.
-        std::uint64_t live_entries = 0u; ///< Current validated route count.
+        /** Actual bytes written by the group's sole shared-row publisher. */
+        std::uint64_t published_shared_hidden_bytes = 0u;
+        std::uint32_t live_rows = 0u; ///< Current validated stage row count.
+        std::uint32_t live_entries = 0u; ///< Current validated route count.
         std::uint32_t stage_count = 0u; ///< Immutable retained manifest length.
         std::int32_t physical_rows = 0; ///< Exact captured row geometry.
         std::int32_t last_published_stage = -1; ///< Local publication cursor.
@@ -83,8 +85,10 @@ namespace llaminar2
             MoEOverlayInferenceGraphRole::None;
         /** Same original native slot copied with the generation-authenticated grant. */
         std::uint32_t original_slot_index = kMoEOverlayActivationOriginalNoSlot;
-        /** Actual bytes written by the group's sole shared-row publisher. */
-        std::uint64_t published_shared_hidden_bytes = 0u;
+        /** Immutable channel cohort target cached at stage-0 admission. */
+        std::int32_t channel_cohort_target = -1;
+        /** Immutable channel return role cached at stage-0 admission. */
+        std::uint32_t channel_return_role = 0u;
     };
 
     /**
@@ -172,6 +176,8 @@ namespace llaminar2
         /** Maximum original route slots admitted by model setup. */
         std::size_t route_slot_capacity = 0u;
         std::int32_t d_model = 0; ///< Hidden width of one contribution row.
+        /** Per-participant `[row_capacity]` adaptive 16b/32b fixed-point flags (optional for FP32). */
+        std::int32_t *row_wide_flags = nullptr;
         /** @return Whether all aliases and immutable geometry are complete. */
         [[nodiscard]] LLAMINAR_MOE_PACKET_HD constexpr bool valid()
             const noexcept
@@ -410,6 +416,9 @@ namespace llaminar2
         const MoEOverlayActivationEpochControl* shared_row_controls = nullptr;
         std::uint32_t shared_row_target_count = 0u;
         bool shared_row_writer = false;
+        /** Immutable MainPrefill wire encoding resolved from the channel header. */
+        MoEOverlayActivationPrefillWirePolicy prefill_wire_policy =
+            MoEOverlayActivationPrefillWirePolicy::FP32Canonical;
 
         /** @return Whether setup supplied a complete immutable launch contract. */
         [[nodiscard]] LLAMINAR_MOE_PACKET_HD constexpr bool valid()
@@ -459,6 +468,9 @@ namespace llaminar2
         std::int32_t physical_rows = 0; ///< Captured follower row capacity.
         std::uint32_t stage_ordinal = 0u; ///< Ordered stage in the transaction.
         std::int32_t model_layer_index = -1; ///< Expected layer identity.
+        /** Immutable MainPrefill wire encoding resolved from the channel header. */
+        MoEOverlayActivationPrefillWirePolicy prefill_wire_policy =
+            MoEOverlayActivationPrefillWirePolicy::FP32Canonical;
 
         /** @return Whether every captured destination and geometry is valid. */
         [[nodiscard]] LLAMINAR_MOE_PACKET_HD constexpr bool valid()
@@ -492,6 +504,9 @@ namespace llaminar2
         std::int32_t physical_rows = 0; ///< Captured follower row capacity.
         std::uint32_t stage_ordinal = 0u; ///< Ordered stage in the transaction.
         std::int32_t model_layer_index = -1; ///< Expected layer identity.
+        /** Immutable MainPrefill wire encoding resolved from the channel header. */
+        MoEOverlayActivationPrefillWirePolicy prefill_wire_policy =
+            MoEOverlayActivationPrefillWirePolicy::FP32Canonical;
 
         /** @return Whether setup supplied matching dispatch/return geometry. */
         [[nodiscard]] LLAMINAR_MOE_PACKET_HD constexpr bool valid()
@@ -532,6 +547,9 @@ namespace llaminar2
         std::int32_t physical_rows = 0; ///< Captured destination row capacity.
         std::uint32_t stage_ordinal = 0u; ///< Ordered stage in the transaction.
         std::int32_t model_layer_index = -1; ///< Expected layer identity.
+        /** Immutable MainPrefill wire encoding resolved from the channel header. */
+        MoEOverlayActivationPrefillWirePolicy prefill_wire_policy =
+            MoEOverlayActivationPrefillWirePolicy::FP32Canonical;
 
         /** @return Whether setup supplied complete deterministic fold state. */
         [[nodiscard]] LLAMINAR_MOE_PACKET_HD constexpr bool valid()
@@ -610,6 +628,8 @@ namespace llaminar2
     {
         MoEOverlayActivationDispatchConsumeLaunch packet{}; ///< Packet and destinations.
         MoEOverlayActivationTimelineWaitDeviceBinding acquire{}; ///< Leading acquire.
+        /** Optional shared single-row hidden vector published once for all peers. */
+        const float *shared_hidden_rows_fp32 = nullptr;
 
         /** @return Whether this is an exact one-row direct-mapped launch. */
         [[nodiscard]] LLAMINAR_MOE_PACKET_HD constexpr bool valid()
@@ -664,6 +684,8 @@ namespace llaminar2
         /** Device array in planner-canonical participant order. */
         const MoEOverlayActivationSingleRowDispatchPackLaunch *lanes = nullptr;
         std::uint32_t lane_count = 0u; ///< Positive topology-derived lane count.
+        /** Optional shared single-row hidden vector written once for all lanes. */
+        float *shared_hidden_rows_fp32 = nullptr;
 
         /** @return Whether setup supplied a complete persistent batch view. */
         [[nodiscard]] LLAMINAR_MOE_PACKET_HD constexpr bool valid()
@@ -750,23 +772,25 @@ namespace llaminar2
      * indicates invalid geometry or integer overflow.
      */
     [[nodiscard]] LLAMINAR_MOE_PACKET_HD constexpr std::uint64_t
-    moeOverlayDispatchPayloadBytes(
+    moeOverlayDispatchPayloadBytesWithPolicy(
         std::uint64_t live_rows,
         std::uint64_t live_entries,
-        std::uint32_t d_model) noexcept
+        std::uint32_t d_model,
+        bool fp16_hidden) noexcept
     {
         if (d_model == 0u || (live_rows == 0u && live_entries != 0u) ||
             (live_rows != 0u && live_entries < live_rows))
             return 0u;
         if (live_rows == 0u)
             return 0u;
+        const std::uint64_t elem_bytes =
+            fp16_hidden ? sizeof(std::uint16_t) : sizeof(float);
         constexpr std::uint64_t maximum = ~std::uint64_t{0};
         if (live_rows > (maximum / sizeof(std::int32_t)) - 1u ||
             live_entries > maximum /
                                (3u * sizeof(std::int32_t) + sizeof(float)) ||
             live_rows > maximum /
-                            (static_cast<std::uint64_t>(d_model) *
-                             sizeof(float)))
+                            (static_cast<std::uint64_t>(d_model) * elem_bytes))
         {
             return 0u;
         }
@@ -777,7 +801,7 @@ namespace llaminar2
             live_entries *
             (3u * sizeof(std::int32_t) + sizeof(float));
         const std::uint64_t activations =
-            live_rows * static_cast<std::uint64_t>(d_model) * sizeof(float);
+            live_rows * static_cast<std::uint64_t>(d_model) * elem_bytes;
         if (row_metadata > maximum - entries ||
             row_metadata + entries > maximum - activations)
         {
@@ -786,29 +810,53 @@ namespace llaminar2
         return row_metadata + entries + activations;
     }
 
+    [[nodiscard]] LLAMINAR_MOE_PACKET_HD constexpr std::uint64_t
+    moeOverlayDispatchPayloadBytes(
+        std::uint64_t live_rows,
+        std::uint64_t live_entries,
+        std::uint32_t d_model) noexcept
+    {
+        return moeOverlayDispatchPayloadBytesWithPolicy(
+            live_rows, live_entries, d_model, /*fp16_hidden=*/false);
+    }
+
     /**
      * @brief Compute live canonical route-return bytes without padding.
      * An empty return intentionally has zero bytes and still advances its
      * timeline. For a non-empty return, zero means invalid geometry/overflow.
      */
     [[nodiscard]] LLAMINAR_MOE_PACKET_HD constexpr std::uint64_t
+    moeOverlayReturnPayloadBytesWithPolicy(
+        std::uint64_t live_rows,
+        std::uint64_t live_entries,
+        std::uint32_t d_model,
+        bool fp16_row_folded) noexcept
+    {
+        if (d_model == 0u)
+            return 0u;
+        const std::uint64_t wire_rows = fp16_row_folded ? live_rows : live_entries;
+        if (wire_rows == 0u)
+            return 0u;
+        constexpr std::uint64_t maximum = ~std::uint64_t{0};
+        const std::uint64_t elem_bytes =
+            fp16_row_folded ? sizeof(std::uint16_t) : sizeof(float);
+        const std::uint64_t contribution_bytes =
+            static_cast<std::uint64_t>(d_model) * elem_bytes;
+        if (contribution_bytes == 0u ||
+            wire_rows > maximum / contribution_bytes)
+        {
+            return 0u;
+        }
+        return wire_rows * contribution_bytes;
+    }
+
+    [[nodiscard]] LLAMINAR_MOE_PACKET_HD constexpr std::uint64_t
     moeOverlayReturnPayloadBytes(
         std::uint64_t live_entries,
         std::uint32_t d_model) noexcept
     {
-        if (d_model == 0u)
-            return 0u;
-        if (live_entries == 0u)
-            return 0u;
-        constexpr std::uint64_t maximum = ~std::uint64_t{0};
-        const std::uint64_t contribution_bytes =
-            static_cast<std::uint64_t>(d_model) * sizeof(float);
-        if (contribution_bytes == 0u ||
-            live_entries > maximum / contribution_bytes)
-        {
-            return 0u;
-        }
-        return live_entries * contribution_bytes;
+        return moeOverlayReturnPayloadBytesWithPolicy(
+            live_entries, live_entries, d_model, /*fp16_row_folded=*/false);
     }
 
     static_assert(std::is_trivially_copyable_v<

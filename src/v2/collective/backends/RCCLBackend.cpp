@@ -1629,6 +1629,53 @@ namespace llaminar2
 #endif
     }
 
+    bool RCCLBackend::supportsFusedFP32ViaFP16AllreduceMultiOnStreams() const noexcept
+    {
+#ifdef HAVE_RCCL
+        return initialized_ && coordinator_ && is_multi_gpu_single_process_ &&
+               coordinator_->supportsFusedFP32ViaFP16AllreduceMultiOnStreams();
+#else
+        return false;
+#endif
+    }
+
+    bool RCCLBackend::allreduceFP32ViaFP16MultiOnStreams(
+        const std::vector<void *> &buffers,
+        size_t count,
+        const std::vector<void *> &streams,
+        const std::vector<NativeCollectiveRows> &live_rows)
+    {
+#ifdef HAVE_RCCL
+        if (!initialized_ || !is_multi_gpu_single_process_ || !coordinator_)
+        {
+            last_error_ = "RCCLBackend not ready for fused FP32-via-FP16 allreduce";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+        if (buffers.size() != static_cast<size_t>(num_ranks_) ||
+            streams.size() != static_cast<size_t>(num_ranks_))
+        {
+            last_error_ = "Buffer/stream count does not match GPU count";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+        if (!coordinator_->allreduceFP32ViaFP16MultiOnStreams(buffers, count, streams, live_rows))
+        {
+            last_error_ = "RCCLCoordinator allreduceFP32ViaFP16MultiOnStreams failed: " + coordinator_->lastError();
+            LOG_ERROR(last_error_);
+            return false;
+        }
+        return true;
+#else
+        (void)buffers;
+        (void)count;
+        (void)streams;
+        (void)live_rows;
+        last_error_ = "RCCL not available";
+        return false;
+#endif
+    }
+
     bool RCCLBackend::allreduceWithSidebandsMultiOnStreams(
         const std::vector<void *> &buffers,
         size_t count,

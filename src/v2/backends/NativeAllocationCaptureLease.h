@@ -50,6 +50,10 @@ public:
         if(!identity||identity.use_count()!=1)
             throw std::logic_error("Native allocation is still borrowed by retained capture storage");
     }
+    /** @return Whether this lease currently holds an active native allocation borrow. */
+    [[nodiscard]] bool valid() const noexcept {
+        return identity_ != nullptr && span_ != nullptr && extent_ > 0;
+    }
     /** @return Whether another observation names the same allocation and exact consumed span. */
     bool sameStorage(const NativeAllocationCaptureLease& other) const noexcept {
         return identity_==other.identity_&&span_==other.span_&&extent_==other.extent_&&device_==other.device_;

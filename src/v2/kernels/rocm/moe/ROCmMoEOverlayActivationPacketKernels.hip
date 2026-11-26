@@ -76,13 +76,10 @@ extern "C" bool hipMoEOverlayActivationPackDispatch(
     if (launch->hidden_payload_layout ==
         llaminar2::MoEOverlayActivationHiddenPayloadLayout::CompactRows)
     {
-        const std::size_t hidden_elements =
-            static_cast<std::size_t>(launch->physical_rows) *
-            static_cast<std::size_t>(launch->packet.d_model);
         hipLaunchKernelGGL(
             llaminar2::moe_activation_packet_device::packDispatchHiddenKernel,
-            dim3(blocksFor(hidden_elements)), dim3(kThreads), 0u, hip_stream,
-            *launch);
+            dim3(static_cast<unsigned int>(launch->physical_rows)),
+            dim3(kThreads), 0u, hip_stream, *launch);
     }
     if (launch->shared_row_writer)
         hipLaunchKernelGGL(llaminar2::moe_activation_packet_device::packSharedDispatchUnionKernel,
@@ -104,16 +101,15 @@ extern "C" bool hipMoEOverlayActivationConsumeDispatch(
     hipLaunchKernelGGL(
         llaminar2::moe_activation_packet_device::validateDispatchKernel,
         dim3(1u), dim3(kThreads), 0u, hip_stream, *launch);
-    const std::size_t hidden_elements =
-        static_cast<std::size_t>(launch->physical_rows) *
-        static_cast<std::size_t>(launch->packet.d_model);
     const std::size_t route_elements =
         static_cast<std::size_t>(launch->physical_rows) *
         static_cast<std::size_t>(launch->packet.top_k);
-    const std::size_t elements = std::max(hidden_elements, route_elements);
+    const unsigned int dispatch_blocks = std::max(
+        static_cast<unsigned int>(launch->physical_rows),
+        blocksFor(route_elements));
     hipLaunchKernelGGL(
         llaminar2::moe_activation_packet_device::materializeMappedDispatchKernel,
-        dim3(blocksFor(elements)), dim3(kThreads), 0u, hip_stream, *launch);
+        dim3(dispatch_blocks), dim3(kThreads), 0u, hip_stream, *launch);
     return launchAccepted();
 }
 
@@ -182,6 +178,14 @@ extern "C" bool hipMoEOverlayConsumeCanonicalRouteTicket(
     hipLaunchKernelGGL(
         llaminar2::moe_activation_packet_device::awaitCanonicalRouteTicketKernel,
         dim3(1u), dim3(1u), 0u, hip_stream, *launch);
+    if (!launch->metadataOnly() && launch->route_capacity <= 32u)
+    {
+        hipLaunchKernelGGL(
+            llaminar2::moe_activation_packet_device::
+                materializeAndAcknowledgeSingleRowCanonicalRouteTicketKernel,
+            dim3(1u), dim3(512u), 0u, hip_stream, *launch);
+        return launchAccepted();
+    }
     if (!launch->metadataOnly())
     {
         hipLaunchKernelGGL(
@@ -189,12 +193,11 @@ extern "C" bool hipMoEOverlayConsumeCanonicalRouteTicket(
                 materializeCanonicalRouteTicketKernel,
             dim3(blocks), dim3(kThreads), 0u, hip_stream, *launch);
     }
-    /* A separate one-thread node cannot race the materialization blocks. Its
-     * exact-stream release is the sole authority permitting host payload reuse. */
+    /* A separate wavefront-coalesced node cannot race multi-row materialization blocks. */
     hipLaunchKernelGGL(
         llaminar2::moe_activation_packet_device::
             acknowledgeCanonicalRouteTicketKernel,
-        dim3(1u), dim3(1u), 0u, hip_stream, *launch);
+        dim3(1u), dim3(64u), 0u, hip_stream, *launch);
     return launchAccepted();
 }
 
@@ -277,10 +280,15 @@ extern "C" bool hipMoEOverlayActivationPackSingleRowDispatchBatch(
         return false;
     }
     const auto hip_stream = reinterpret_cast<hipStream_t>(stream);
+    const unsigned int blocks =
+        (launch->shared_hidden_rows_fp32 != nullptr &&
+         launch->lane_count > 1u && launch->lane_count <= 32u)
+            ? 1u
+            : launch->lane_count;
     hipLaunchKernelGGL(
         llaminar2::moe_activation_packet_device::
             packSingleRowDispatchBatchKernel,
-        dim3(launch->lane_count), dim3(kSingleRowThreads), 0u, hip_stream,
+        dim3(blocks), dim3(kSingleRowThreads), 0u, hip_stream,
         *launch);
     return launchAccepted();
 }
@@ -296,16 +304,13 @@ extern "C" bool hipMoEOverlayActivationConsumeSingleRowReturnBatch(
         return false;
     }
     const auto hip_stream = reinterpret_cast<hipStream_t>(stream);
+    // Single-row canonical materialization is fused into each lane's wait/validate
+    // block so fast followers copy over PCIe while slower followers still run.
     hipLaunchKernelGGL(
         llaminar2::moe_activation_packet_device::
             validateSingleRowReturnBatchKernel,
         dim3(launch->lane_count), dim3(kSingleRowThreads), 0u, hip_stream,
         *launch);
-    hipLaunchKernelGGL(
-        llaminar2::moe_activation_packet_device::
-            materializeSingleRowCanonicalReturnBatchKernel,
-        dim3(static_cast<unsigned int>(launch->top_k), launch->lane_count, 1u),
-        dim3(kSingleRowThreads), 0u, hip_stream, *launch);
     return launchAccepted();
 }
 
@@ -352,9 +357,16 @@ extern "C" bool hipMoEOverlayPublishNodeLocalCanonicalRoutes(
         return false;
     }
     const auto hip_stream = reinterpret_cast<hipStream_t>(stream);
+    if (launch->live_route_slots <= 32u)
+    {
+        hipLaunchKernelGGL(
+            llaminar2::moe_node_local_route_device::publishSingleRowSparseRouteKernel,
+            dim3(1u), dim3(512u), 0u, hip_stream, *launch);
+        return launchAccepted();
+    }
     hipLaunchKernelGGL(
         llaminar2::moe_node_local_route_device::beginRoutePublishKernel,
-        dim3(1u), dim3(1u), 0u, hip_stream, *launch);
+        dim3(1u), dim3(64u), 0u, hip_stream, *launch);
     const unsigned int payload_blocks = std::min(
         kSparseRoutePayloadBlocks,
         static_cast<unsigned int>(launch->live_route_slots));
@@ -363,7 +375,7 @@ extern "C" bool hipMoEOverlayPublishNodeLocalCanonicalRoutes(
         dim3(payload_blocks), dim3(kThreads), 0u, hip_stream, *launch);
     hipLaunchKernelGGL(
         llaminar2::moe_node_local_route_device::finishRoutePublishKernel,
-        dim3(1u), dim3(1u), 0u, hip_stream, *launch);
+        dim3(1u), dim3(64u), 0u, hip_stream, *launch);
     return launchAccepted();
 }
 
@@ -380,7 +392,7 @@ extern "C" bool hipMoEOverlayAcquireNodeLocalCanonicalRoutes(
     const auto hip_stream = reinterpret_cast<hipStream_t>(stream);
     hipLaunchKernelGGL(
         llaminar2::moe_node_local_route_device::beginRouteConsumeKernel,
-        dim3(1u), dim3(1u), 0u, hip_stream, *launch);
+        dim3(1u), dim3(64u), 0u, hip_stream, *launch);
     return launchAccepted();
 }
 
@@ -432,6 +444,27 @@ extern "C" bool hipMoEOverlayFoldNodeLocalCanonicalRoutes(
     hipLaunchKernelGGL(
         llaminar2::moe_node_local_route_device::finishRouteConsumeKernel,
         dim3(launch->peer_count), dim3(1u), 0u, hip_stream, *launch);
+    return launchAccepted();
+}
+
+extern "C" bool hipMoEOverlayConsumeSingleRowNodeLocalCanonicalRoutes(
+    const llaminar2::MoENodeLocalRouteConsumeLaunch *launch,
+    int device_ordinal,
+    void *stream)
+{
+    if (!launch || !launch->valid() || launch->physical_rows != 1u ||
+        launch->top_k > 32u || launch->peer_count > 8u ||
+        !selectLaunchContext(device_ordinal, stream))
+    {
+        return false;
+    }
+    const auto hip_stream = reinterpret_cast<hipStream_t>(stream);
+    const unsigned vecs = (launch->d_model + 3u) / 4u;
+    const unsigned rounded = ((vecs + 63u) / 64u) * 64u;
+    const unsigned threads = rounded < 256u ? 256u : (rounded > 1024u ? 1024u : rounded);
+    hipLaunchKernelGGL(
+        llaminar2::moe_node_local_route_device::consumeSingleRowSparseRoutesKernel,
+        dim3(1u), dim3(threads), 0u, hip_stream, *launch);
     return launchAccepted();
 }
 

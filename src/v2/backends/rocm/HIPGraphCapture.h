@@ -14,14 +14,43 @@
 #ifdef HAVE_ROCM
 
 #include "../IGPUGraphCapture.h"
+#include "../IEarlyPacketPublication.h"
 #include "../NativeParallelGraphBranch.h"
 #include "../GPUProjectionSubmission.h"
 #include <hip/hip_runtime.h>
+#include <functional>
 #include <optional>
+#include <vector>
 
 namespace llaminar2
 {
     class AMDDeviceContext;
+
+    /**
+     * @brief Own one early packet's HIP native producer and consumer edges.
+     *
+     * Mirrors @ref CUDAEarlyPacketPublication using HIP stream-capture
+     * dependency queries and updates so mapped remote-lane and host-ticket
+     * packets begin immediately after the retained route prefix retires while
+     * the local FFN suffix executes concurrently on remaining CUs.
+     */
+    class HIPEarlyPacketPublication final : public IEarlyPacketPublication
+    {
+    public:
+        /** @copydoc IEarlyPacketPublication::prepare */
+        void prepare(void *stream) override;
+        /** @copydoc IEarlyPacketPublication::recordCompletedProducer */
+        void recordCompletedProducer(void *stream) override;
+        /** @copydoc IEarlyPacketPublication::recordConsumer */
+        bool recordConsumer(void *stream, const std::function<bool()> &record) override;
+
+    private:
+        hipGraph_t graph_ = nullptr;
+        hipStream_t stream_ = nullptr;
+        unsigned long long capture_id_ = 0;
+        std::vector<hipGraphNode_t> producer_frontier_;
+        std::vector<hipGraphNode_t> packet_frontier_;
+    };
 
     /// HIP Graph capture/replay implementation for AMD ROCm GPUs.
     ///

@@ -779,6 +779,8 @@ namespace llaminar2
             CPUTransportedHiddenRows cpu_transported_hidden;
             /** Exact acquired fixed-family CPU fragment epoch; copied as an RCU reader until GEMM completes. */
             const MoEOverlayParticipantResidencyRegistry::JointLayer* cpu_joint_epoch=nullptr;
+            /** True only when the caller guarantees the immutable bank vectors are unchanged from the prior accepted generation. */
+            bool immutable_bank_binding_reused = false;
         };
 
         /**
@@ -856,6 +858,9 @@ namespace llaminar2
         /// True when this stage can consume dynamic MoE placement without a
         /// graph recapture.
         bool usesGraphStableMoEPlacement() const;
+
+        /** @return Immutable graph-declared parameters for declarative local-region lowering. */
+        [[nodiscard]] const Params &declaration() const noexcept { return params_; }
 
         /**
          * @brief Test whether an ownership publication would change this stage.
@@ -1712,6 +1717,81 @@ namespace llaminar2
         /** @brief Residency generation currently certified by the bound tables. */
         uint64_t sparse_overlay_engine_binding_generation_ = 0;
         MoEOverlayParticipantBankLease cpu_joint_invocation_bank_; ///< One execute-scoped reader, never an idle bank cache.
+        const MoEOverlayParticipantLayerBank *cpu_joint_invocation_layer_ = nullptr; ///< Execute-scoped O(1) view into the leased layer bank.
+        bool cpu_joint_invocation_layer_has_local_ = false; ///< Cached non-empty completeness proof for the bound immutable bank.
+        bool cpu_joint_tables_dirty_ = false; ///< Whether legacy vector tables need clearing on release.
+        const void *last_verified_cpu_joint_bank_ = nullptr;
+        bool last_verified_cpu_joint_has_local_ = false;
+        const std::vector<bool> *last_verified_mask_ptr_ = nullptr;
+        ITensorGemm *const *last_verified_gate_ptr_ = nullptr;
+        ITensorGemm *const *last_verified_up_ptr_ = nullptr;
+        ITensorGemm *const *last_verified_down_ptr_ = nullptr;
+
+        /** @brief Return whether @p expert_id is resident on this participant for the active invocation. */
+        [[nodiscard]] bool activeExpertResident(int expert_id) const noexcept
+        {
+            const size_t idx = static_cast<size_t>(expert_id);
+            if (cpu_joint_invocation_layer_)
+                return idx < cpu_joint_invocation_layer_->resident_mask.size() &&
+                       cpu_joint_invocation_layer_->resident_mask[idx];
+            if (!params_.expert_mask.empty())
+                return idx < params_.expert_mask.size() && params_.expert_mask[idx];
+            const int local_start = params_.local_expert_start;
+            const int local_end = local_start +
+                (params_.local_expert_count < 0 ? params_.num_experts : params_.local_expert_count);
+            return expert_id >= local_start && expert_id < local_end;
+        }
+
+        /** @brief Return the active gate engine for @p expert_id from the leased RCU layer or legacy cache. */
+        [[nodiscard]] ITensorGemm *activeGateGemm(int expert_id) const noexcept
+        {
+            const size_t idx = static_cast<size_t>(expert_id);
+            if (cpu_joint_invocation_layer_)
+            {
+                return cpu_joint_invocation_layer_->fragment_family
+                    ? (idx < cpu_joint_invocation_layer_->fragments.size()
+                           ? cpu_joint_invocation_layer_->fragments[idx].gate().get()
+                           : nullptr)
+                    : (idx < cpu_joint_invocation_layer_->experts.size()
+                           ? cpu_joint_invocation_layer_->experts[idx].gate().get()
+                           : nullptr);
+            }
+            return idx < cached_gate_gemm_.size() ? cached_gate_gemm_[idx] : nullptr;
+        }
+
+        /** @brief Return the active up engine for @p expert_id from the leased RCU layer or legacy cache. */
+        [[nodiscard]] ITensorGemm *activeUpGemm(int expert_id) const noexcept
+        {
+            const size_t idx = static_cast<size_t>(expert_id);
+            if (cpu_joint_invocation_layer_)
+            {
+                return cpu_joint_invocation_layer_->fragment_family
+                    ? (idx < cpu_joint_invocation_layer_->fragments.size()
+                           ? cpu_joint_invocation_layer_->fragments[idx].up().get()
+                           : nullptr)
+                    : (idx < cpu_joint_invocation_layer_->experts.size()
+                           ? cpu_joint_invocation_layer_->experts[idx].up().get()
+                           : nullptr);
+            }
+            return idx < cached_up_gemm_.size() ? cached_up_gemm_[idx] : nullptr;
+        }
+
+        /** @brief Return the active down engine for @p expert_id from the leased RCU layer or legacy cache. */
+        [[nodiscard]] ITensorGemm *activeDownGemm(int expert_id) const noexcept
+        {
+            const size_t idx = static_cast<size_t>(expert_id);
+            if (cpu_joint_invocation_layer_)
+            {
+                return cpu_joint_invocation_layer_->fragment_family
+                    ? (idx < cpu_joint_invocation_layer_->fragments.size()
+                           ? cpu_joint_invocation_layer_->fragments[idx].down().get()
+                           : nullptr)
+                    : (idx < cpu_joint_invocation_layer_->experts.size()
+                           ? cpu_joint_invocation_layer_->experts[idx].down().get()
+                           : nullptr);
+            }
+            return idx < cached_down_gemm_.size() ? cached_down_gemm_[idx] : nullptr;
+        }
 
         /**
          * @brief Whether the next sparse replay must republish placement metadata.
@@ -2606,9 +2686,25 @@ namespace llaminar2
      * share one visible FP32 addition tree without redundant per-device work or
      * host orchestration.
      */
+    /** @brief Optional split execution phase for root node-local sparse route consumption. */
+    enum class MoENodeLocalSparsePhase : std::uint8_t
+    {
+        Complete = 0,   ///< Acquire, stage peer rows, validate, and fold in one stage.
+        StageOnly = 1,  ///< Root-only acquire + sparse staging before external returns finish.
+        FoldStaged = 2, ///< Root-only validation + ordered fold after StageOnly and external returns.
+    };
+
     class MoECanonicalRouteReduceStage final : public IComputeStage
     {
     public:
+        /** @brief Shared prepared bindings/validation status between paired StageOnly and FoldStaged nodes. */
+        struct SharedNodeLocalSparseState
+        {
+            std::shared_ptr<MoEOverlayPersistentGraphStorage> peer_bindings_storage;
+            std::shared_ptr<MoEOverlayPersistentGraphStorage> validation_storage;
+            std::uint32_t peer_count = 0u;
+        };
+
         /** @brief Immutable graph-bound reducer parameters. */
         struct Params
         {
@@ -2668,9 +2764,33 @@ namespace llaminar2
                 BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS;
             BufferId routing_weights_buffer_id = BufferId::MOE_EXPERT_WEIGHTS;
             BufferId output_buffer_id = BufferId::MOE_COMBINED_OUTPUT;
+            /** Optional pre-gated shared-expert row added to the final routed fold on RootOwner. */
+            TensorBase *gated_shared_residual = nullptr;
+            BufferId gated_shared_residual_buffer_id = BufferId::_COUNT;
+            /** Split execution phase for overlapping sparse peer staging with external waits. */
+            MoENodeLocalSparsePhase node_local_sparse_phase =
+                MoENodeLocalSparsePhase::Complete;
+            /** Shared device bindings/validation status when StageOnly and FoldStaged are paired. */
+            std::shared_ptr<SharedNodeLocalSparseState> node_local_sparse_shared_state;
+            /** Wire element precision for node-local peer route staging (FP16 on prefill only). */
+            MoENodeLocalRoutePayloadPrecision node_local_route_precision =
+                MoENodeLocalRoutePayloadPrecision::FP32;
         };
 
         explicit MoECanonicalRouteReduceStage(Params params);
+
+        /**
+         * @brief Bind an already-gated shared-expert row to be folded into the final combined output.
+         * @param shared_output Root-owned pre-gated shared expert tensor [1, d_model].
+         * @param combined_output Final combined output tensor (e.g. ATTN_PROJ).
+         * @param shared_id Buffer identity for shared_output.
+         * @param combined_id Buffer identity for combined_output.
+         */
+        void bindGatedSharedResidual(
+            TensorBase *shared_output,
+            TensorBase *combined_output,
+            BufferId shared_id,
+            BufferId combined_id);
 
         bool execute(IDeviceContext *ctx) override;
         ComputeStageType type() const override

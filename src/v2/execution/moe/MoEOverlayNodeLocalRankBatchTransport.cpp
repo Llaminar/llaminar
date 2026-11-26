@@ -1334,6 +1334,13 @@ namespace llaminar2
                 config.original_cpu_joint_owners.get(), target, family.model_layer_indices);
             nonce = fnv1a(nonce, &cohort_target, sizeof(cohort_target));
             if(return_role!=MoEOverlayActivationReturnRole::Ordinary)nonce=fnv1a(nonce,&return_role,sizeof(return_role));
+            const auto prefill_wire_policy =
+                (config.enable_gpu_prefill_fp16_wire &&
+                 return_role == MoEOverlayActivationReturnRole::Ordinary)
+                    ? MoEOverlayActivationPrefillWirePolicy::FixedPoint32Adaptive16
+                    : MoEOverlayActivationPrefillWirePolicy::FP32Canonical;
+            if (prefill_wire_policy != MoEOverlayActivationPrefillWirePolicy::FP32Canonical)
+                nonce = fnv1a(nonce, &prefill_wire_policy, sizeof(prefill_wire_policy));
             return {
                 .channel_nonce = nonce,
                 .topology_fingerprint_low = config.transaction_topology.topology_fingerprint_low,
@@ -1352,6 +1359,7 @@ namespace llaminar2
                 .model_layer_indices = family.model_layer_indices,
                 .return_role = return_role,
                 .cohort_target = cohort_target,
+                .prefill_wire_policy = prefill_wire_policy,
             };
         }
 
@@ -2090,6 +2098,12 @@ namespace llaminar2
                         return_route_activation_bytes)),
                 .route_slot_capacity = dispatch_rows.entry_capacity,
                 .d_model = return_rows.d_model,
+                .row_wide_flags =
+                    return_rows.row_ids_host && return_rows.row_capacity > 0u
+                        ? static_cast<std::int32_t *>(alias(
+                              return_rows.row_ids_host,
+                              return_rows.row_capacity * sizeof(std::int32_t)))
+                        : nullptr,
             },
             .dispatch_hidden_offset = mappedOffset(
                 dispatch_rows.hidden_rows_fp32, activation_bytes),

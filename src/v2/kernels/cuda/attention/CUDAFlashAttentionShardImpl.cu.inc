@@ -57,6 +57,13 @@
 /** True in the three context-transaction shards. */
 #define LLAMINAR_CUDA_FLASH_ATTENTION_CONTEXT_SHARD \
     (LLAMINAR_CUDA_FLASH_ATTENTION_SHARD >= 3 && LLAMINAR_CUDA_FLASH_ATTENTION_SHARD <= 5)
+#ifndef LLAMINAR_CUDA_FLASH_ATTENTION_SUBSHARD
+#define LLAMINAR_CUDA_FLASH_ATTENTION_SUBSHARD 0
+#endif
+#define LLAMINAR_CUDA_FA2_PUBLIC_OWNER(INDEX) \
+    (LLAMINAR_CUDA_FLASH_ATTENTION_SHARD == (INDEX) && LLAMINAR_CUDA_FLASH_ATTENTION_SUBSHARD == 0)
+#define LLAMINAR_CUDA_FA2_SUB_SYM_IMPL(PREFIX, S, SUB) PREFIX##_shard_##S##_sub_##SUB
+#define LLAMINAR_CUDA_FA2_SUB_SYM(PREFIX, S, SUB) LLAMINAR_CUDA_FA2_SUB_SYM_IMPL(PREFIX, S, SUB)
 
 #include <cuda_runtime.h>
 #include "CUDATensorPrefillKernels.h"
@@ -2839,6 +2846,19 @@ __global__ void dequant_q8_1_to_fp32_dynamic_kernel(
 #endif
 
 #if LLAMINAR_CUDA_FLASH_ATTENTION_PREFILL_SHARD // ordinary prefill shards
+#if LLAMINAR_CUDA_FLASH_ATTENTION_SUBSHARD == 0
+extern "C" int LLAMINAR_CUDA_FA2_SUB_SYM(cudaFlashAttn_prefill_fa2_impl, LLAMINAR_CUDA_FLASH_ATTENTION_SHARD, 1)(
+    const float *Q, const void *K, const void *V, float *O,
+    int batch_size, int seq_len, int kv_len,
+    int n_heads, int n_kv_heads, int head_dim,
+    bool causal, int window_size, int position_offset,
+    const llaminar2::attention::AttentionDeviceParams *device_params,
+    const float *mask,
+    void *stream,
+    int device_idx,
+    int head_start,
+    int gqa_n_rep);
+#endif
 /**
  * @brief Internal templated FA2 launcher — dispatches based on head_dim and native KV storage type.
  * Query groups are selected from every compiled width through 6 (HD64), 4
@@ -3009,6 +3029,7 @@ static int fa2_prefill_launch(
             FA2_LAUNCH(QW, PVW, HD, 32);      \
     } while (0)
 
+#if LLAMINAR_CUDA_FLASH_ATTENTION_SUBSHARD == 0
     if (head_dim <= 64)
     {
         FA2_LAUNCH_SELECTED_TILE(6, 1, 64);
@@ -3017,15 +3038,26 @@ static int fa2_prefill_launch(
     {
         FA2_LAUNCH_SELECTED_TILE(4, 1, 128);
     }
+    else if (cfg.pv_warps_per_q_group == 1)
+    {
+        FA2_LAUNCH_SELECTED_TILE(2, 1, 256);
+    }
     else
     {
-        if (cfg.pv_warps_per_q_group == 1)
-            FA2_LAUNCH_SELECTED_TILE(2, 1, 256);
-        else if (cfg.pv_warps_per_q_group == 2)
+        return LLAMINAR_CUDA_FA2_SUB_SYM(cudaFlashAttn_prefill_fa2_impl, LLAMINAR_CUDA_FLASH_ATTENTION_SHARD, 1)(
+            Q, K, V, O, batch_size, seq_len, kv_len, n_heads, n_kv_heads, head_dim,
+            causal, window_size, position_offset, device_params, mask, cuda_stream,
+            device_idx, head_start, gqa_n_rep);
+    }
+#elif LLAMINAR_CUDA_FLASH_ATTENTION_SUBSHARD == 1
+    if (head_dim > 128)
+    {
+        if (cfg.pv_warps_per_q_group == 2)
             FA2_LAUNCH_SELECTED_TILE(2, 2, 256);
         else if (cfg.pv_warps_per_q_group == 4)
             FA2_LAUNCH_SELECTED_TILE(2, 4, 256);
     }
+#endif
 
 #undef FA2_LAUNCH_SELECTED_TILE
 #undef FA2_LAUNCH
@@ -3685,6 +3717,18 @@ static int launchFA2ContextTransactionSpecialization(
  *
  * @tparam KV_TYPE Physical floating-point K/V storage.
  */
+#if LLAMINAR_CUDA_FLASH_ATTENTION_SUBSHARD == 0
+#define LLAMINAR_DECL_CTX_SUB(SUB) \
+    extern "C" int LLAMINAR_CUDA_FA2_SUB_SYM(cudaFlashAttn_context_impl, LLAMINAR_CUDA_FLASH_ATTENTION_SHARD, SUB)( \
+        const float *, const void *, const void *, float *, float *, float *, float *, \
+        int, int, int, int, int, int, bool, int, int, \
+        const llaminar2::attention::AttentionDeviceParams *, const float *, \
+        int, int, int, int, int, void *, int, void *, int, int, int);
+LLAMINAR_DECL_CTX_SUB(1)
+LLAMINAR_DECL_CTX_SUB(2)
+LLAMINAR_DECL_CTX_SUB(3)
+#undef LLAMINAR_DECL_CTX_SUB
+#endif
 template <NativeKVType KV_TYPE>
 static int fa2_context_transaction_launch(
     const float *Q,
@@ -3859,16 +3903,42 @@ static int fa2_context_transaction_launch(
             FA2_CONTEXT_DISPATCH(QW, PVW, HD, 64); \
     } while (0)
 
+#if LLAMINAR_CUDA_FLASH_ATTENTION_SUBSHARD == 0
     if (head_dim <= 64)
         FA2_CONTEXT_DISPATCH_TILE(6, 1, 64);
     if (head_dim <= 128)
         FA2_CONTEXT_DISPATCH_TILE(4, 1, 128);
     if (config.pv_warps_per_q_group == 1)
-        FA2_CONTEXT_DISPATCH_TILE(2, 1, 256);
+        return LLAMINAR_CUDA_FA2_SUB_SYM(cudaFlashAttn_context_impl, LLAMINAR_CUDA_FLASH_ATTENTION_SHARD, 1)(
+            Q, K, V, O, O_partial, m_partial, l_partial, batch_size, seq_len, kv_capacity,
+            n_heads, n_kv_heads, head_dim, causal, window_size, position_offset, device_params, mask,
+            context_partition_size, max_context_partitions, context_partition_slots,
+            device_direct_partition_limit, reducer_dimension_warps, capture_conditional,
+            static_cast<int>(schedule), stream, device_idx, head_start, gqa_n_rep);
     if (config.pv_warps_per_q_group == 2)
-        FA2_CONTEXT_DISPATCH_TILE(2, 2, 256);
+        return LLAMINAR_CUDA_FA2_SUB_SYM(cudaFlashAttn_context_impl, LLAMINAR_CUDA_FLASH_ATTENTION_SHARD, 2)(
+            Q, K, V, O, O_partial, m_partial, l_partial, batch_size, seq_len, kv_capacity,
+            n_heads, n_kv_heads, head_dim, causal, window_size, position_offset, device_params, mask,
+            context_partition_size, max_context_partitions, context_partition_slots,
+            device_direct_partition_limit, reducer_dimension_warps, capture_conditional,
+            static_cast<int>(schedule), stream, device_idx, head_start, gqa_n_rep);
     if (config.pv_warps_per_q_group == 4)
+        return LLAMINAR_CUDA_FA2_SUB_SYM(cudaFlashAttn_context_impl, LLAMINAR_CUDA_FLASH_ATTENTION_SHARD, 3)(
+            Q, K, V, O, O_partial, m_partial, l_partial, batch_size, seq_len, kv_capacity,
+            n_heads, n_kv_heads, head_dim, causal, window_size, position_offset, device_params, mask,
+            context_partition_size, max_context_partitions, context_partition_slots,
+            device_direct_partition_limit, reducer_dimension_warps, capture_conditional,
+            static_cast<int>(schedule), stream, device_idx, head_start, gqa_n_rep);
+#elif LLAMINAR_CUDA_FLASH_ATTENTION_SUBSHARD == 1
+    if (head_dim > 128 && config.pv_warps_per_q_group == 1)
+        FA2_CONTEXT_DISPATCH_TILE(2, 1, 256);
+#elif LLAMINAR_CUDA_FLASH_ATTENTION_SUBSHARD == 2
+    if (head_dim > 128 && config.pv_warps_per_q_group == 2)
+        FA2_CONTEXT_DISPATCH_TILE(2, 2, 256);
+#elif LLAMINAR_CUDA_FLASH_ATTENTION_SUBSHARD == 3
+    if (head_dim > 128 && config.pv_warps_per_q_group == 4)
         FA2_CONTEXT_DISPATCH_TILE(2, 4, 256);
+#endif
 
 #undef FA2_CONTEXT_DISPATCH_TILE
 #undef FA2_CONTEXT_DISPATCH
@@ -3967,7 +4037,7 @@ static int dispatchNativeKV(llaminar2::TensorType type, Launch launch)
 
 extern "C"
 {
-#if LLAMINAR_CUDA_FLASH_ATTENTION_SHARD_IS(0) // public entrypoint owner
+#if LLAMINAR_CUDA_FA2_PUBLIC_OWNER(0) // public entrypoint owner
     int cudaFlashAttn_prefill_fa2(
         const float *Q, const float *K, const float *V, float *O,
         int batch_size, int seq_len, int kv_len,
@@ -3989,7 +4059,7 @@ extern "C"
     }
 #endif
 
-#if LLAMINAR_CUDA_FLASH_ATTENTION_SHARD_IS(1) // public entrypoint owner
+#if LLAMINAR_CUDA_FA2_PUBLIC_OWNER(1) // public entrypoint owner
     /**
      * @brief Launch FA2 with FP16 K/V inputs (eliminates FP16→FP32→FP16 round-trip)
      *
@@ -4018,7 +4088,7 @@ extern "C"
     }
 #endif
 
-#if LLAMINAR_CUDA_FLASH_ATTENTION_SHARD_IS(2) // public entrypoint owner
+#if LLAMINAR_CUDA_FA2_PUBLIC_OWNER(2) // public entrypoint owner
     /**
      * @brief Native BF16 FA2 transaction using the canonical tiled producer.
      * Storage remains BF16; only on-chip WMMA operands convert to half, just as
@@ -4046,7 +4116,7 @@ extern "C"
     }
 #endif
 
-#if LLAMINAR_CUDA_FLASH_ATTENTION_SHARD_IS(4) // public entrypoint owner
+#if LLAMINAR_CUDA_FA2_PUBLIC_OWNER(4) // public entrypoint owner
     /**
      * @brief Launch canonical fixed-context FA2 as ordered captured graph nodes.
      *
@@ -4119,7 +4189,7 @@ extern "C"
     }
 #endif
 
-#if LLAMINAR_CUDA_FLASH_ATTENTION_SHARD_IS(3) // public entrypoint owner
+#if LLAMINAR_CUDA_FA2_PUBLIC_OWNER(3) // public entrypoint owner
     /**
      * @brief Launch canonical fixed-context FA2 with FP32 K/V storage.
      *
@@ -4191,7 +4261,7 @@ extern "C"
     }
 #endif
 
-#if LLAMINAR_CUDA_FLASH_ATTENTION_SHARD_IS(4) // public entrypoint owner
+#if LLAMINAR_CUDA_FA2_PUBLIC_OWNER(4) // public entrypoint owner
     /**
      * @brief Launch canonical fixed-context FA2 with a parallel partition grid.
      *
@@ -4264,7 +4334,7 @@ extern "C"
     }
 #endif
 
-#if LLAMINAR_CUDA_FLASH_ATTENTION_SHARD_IS(5) // public entrypoint owner
+#if LLAMINAR_CUDA_FA2_PUBLIC_OWNER(5) // public entrypoint owner
     /**
      * @brief Native BF16 FA2 transaction using the canonical tiled producer.
      * Storage remains BF16; only on-chip WMMA operands convert to half, just as
@@ -4951,5 +5021,57 @@ extern "C"
         return 0;
     }
 
+#endif
+
+#if LLAMINAR_CUDA_FLASH_ATTENTION_PREFILL_SHARD && LLAMINAR_CUDA_FLASH_ATTENTION_SUBSHARD == 1
+    int LLAMINAR_CUDA_FA2_SUB_SYM(cudaFlashAttn_prefill_fa2_impl, LLAMINAR_CUDA_FLASH_ATTENTION_SHARD, 1)(
+        const float *Q, const void *K, const void *V, float *O,
+        int batch_size, int seq_len, int kv_len,
+        int n_heads, int n_kv_heads, int head_dim,
+        bool causal, int window_size, int position_offset,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        const float *mask,
+        void *stream,
+        int device_idx,
+        int head_start,
+        int gqa_n_rep)
+    {
+        constexpr NativeKVType kKV =
+            (LLAMINAR_CUDA_FLASH_ATTENTION_SHARD == 0) ? NativeKVType::FP32 :
+            (LLAMINAR_CUDA_FLASH_ATTENTION_SHARD == 1) ? NativeKVType::FP16 :
+                                                         NativeKVType::BF16;
+        return fa2_prefill_launch<kKV>(
+            Q, K, V, O, batch_size, seq_len, kv_len, n_heads, n_kv_heads, head_dim,
+            causal, window_size, position_offset, device_params, mask,
+            static_cast<cudaStream_t>(stream), device_idx, head_start, gqa_n_rep);
+    }
+#endif
+
+#if LLAMINAR_CUDA_FLASH_ATTENTION_CONTEXT_SHARD && LLAMINAR_CUDA_FLASH_ATTENTION_SUBSHARD > 0
+    int LLAMINAR_CUDA_FA2_SUB_SYM(cudaFlashAttn_context_impl, LLAMINAR_CUDA_FLASH_ATTENTION_SHARD, LLAMINAR_CUDA_FLASH_ATTENTION_SUBSHARD)(
+        const float *Q, const void *K, const void *V, float *O,
+        float *O_partial, float *m_partial, float *l_partial,
+        int batch_size, int seq_len, int kv_capacity,
+        int n_heads, int n_kv_heads, int head_dim,
+        bool causal, int window_size, int position_offset,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        const float *mask,
+        int context_partition_size, int max_context_partitions, int context_partition_slots,
+        int device_direct_partition_limit, int reducer_dimension_warps,
+        void *capture_conditional, int schedule_int, void *stream,
+        int device_idx, int head_start, int gqa_n_rep)
+    {
+        constexpr NativeKVType kKV =
+            (LLAMINAR_CUDA_FLASH_ATTENTION_SHARD == 3) ? NativeKVType::FP32 :
+            (LLAMINAR_CUDA_FLASH_ATTENTION_SHARD == 4) ? NativeKVType::FP16 :
+                                                         NativeKVType::BF16;
+        return fa2_context_transaction_launch<kKV>(
+            Q, K, V, O, O_partial, m_partial, l_partial, batch_size, seq_len, kv_capacity,
+            n_heads, n_kv_heads, head_dim, causal, window_size, position_offset,
+            device_params, mask, context_partition_size, max_context_partitions,
+            context_partition_slots, device_direct_partition_limit, reducer_dimension_warps,
+            capture_conditional, static_cast<FA2ContextPartitionSchedule>(schedule_int),
+            static_cast<cudaStream_t>(stream), device_idx, head_start, gqa_n_rep);
+    }
 #endif
 } // extern "C"

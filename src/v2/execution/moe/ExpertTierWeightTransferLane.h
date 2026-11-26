@@ -138,7 +138,9 @@ namespace llaminar2
             const ExpertTierGpuConstProjectionView &source,
             std::span<std::uint8_t> final_cpu_bytes,
             const ExpertTierSourceReadiness &source_readiness,
-            std::string *error = nullptr) noexcept;
+            std::string *error = nullptr,
+            ExpertTierDeviceTimingCapture timing_capture =
+                ExpertTierDeviceTimingCapture::LaneDefault) noexcept;
 
         /**
          * @brief Start asynchronous H2D streaming followed by GPU-side repack.
@@ -146,13 +148,16 @@ namespace llaminar2
          * @param cpu_bytes Immutable final CPU execution storage.
          * @param destination Preallocated inactive separated GPU arrays.
          * @param error Optional exact start failure.
+         * @param timing_capture Per-transfer device timing-event capture policy.
          * @return Whether the first chunk and completion event were enqueued.
          */
         bool startCpuToGpu(
             const ExpertTierWeightDeviceLayout &layout,
             std::span<const std::uint8_t> cpu_bytes,
             const ExpertTierGpuMutableProjectionView &destination,
-            std::string *error = nullptr) noexcept;
+            std::string *error = nullptr,
+            ExpertTierDeviceTimingCapture timing_capture =
+                ExpertTierDeviceTimingCapture::LaneDefault) noexcept;
 
         /**
          * @brief Stream one contiguous floating matrix from GPU to final CPU storage.
@@ -160,25 +165,31 @@ namespace llaminar2
          * @param final_cpu_bytes Inactive CPU slot with exactly @p source bytes.
          * @param source_readiness Exact producer event or installed-bank proof.
          * @param error Optional exact start failure.
+         * @param timing_capture Per-transfer device timing-event capture policy.
          * @return Whether the first D2H chunk and completion event were enqueued.
          */
         bool startGpuToCpuContiguous(
             const ContiguousFloatingPointWeightDescriptor &source,
             std::span<std::uint8_t> final_cpu_bytes,
             const ExpertTierSourceReadiness &source_readiness,
-            std::string *error = nullptr) noexcept;
+            std::string *error = nullptr,
+            ExpertTierDeviceTimingCapture timing_capture =
+                ExpertTierDeviceTimingCapture::LaneDefault) noexcept;
 
         /**
          * @brief Stream final CPU floating bytes into an inactive GPU matrix.
          * @param cpu_bytes Immutable CPU FP16/BF16/FP32 matrix bytes.
          * @param destination Exact inactive GPU floating matrix descriptor.
          * @param error Optional exact start failure.
+         * @param timing_capture Per-transfer device timing-event capture policy.
          * @return Whether the first H2D chunk and completion event were enqueued.
          */
         bool startCpuToGpuContiguous(
             std::span<const std::uint8_t> cpu_bytes,
             const ContiguousFloatingPointWeightDescriptor &destination,
-            std::string *error = nullptr) noexcept;
+            std::string *error = nullptr,
+            ExpertTierDeviceTimingCapture timing_capture =
+                ExpertTierDeviceTimingCapture::LaneDefault) noexcept;
 
         /**
          * @brief Move a floating original-coordinate rectangle through this same event-polled lane.
@@ -187,22 +198,26 @@ namespace llaminar2
          * @param source_readiness Original producer event or installed-bank authority.
          * @param intersection Checked original source/destination overlap; arbitrary floating K cuts are legal.
          * @param error Exact cold validation or submission diagnostic.
+         * @param timing_capture Per-transfer device timing-event capture policy.
          * @return Whether the first live row segment was submitted without conversion.
          */
         bool startGpuToCpuContiguous(const ContiguousFloatingPointWeightDescriptor& source,
             std::span<std::uint8_t> final_cpu_bytes,const ExpertTierSourceReadiness& source_readiness,
-            const ExpertTierWeightProjectionIntersection& intersection,std::string* error=nullptr) noexcept;
+            const ExpertTierWeightProjectionIntersection& intersection,std::string* error=nullptr,
+            ExpertTierDeviceTimingCapture timing_capture=ExpertTierDeviceTimingCapture::LaneDefault) noexcept;
         /**
          * @brief Promote the exact floating rectangle without CPU assembly or a precision change.
          * @param cpu_bytes Complete immutable original CPU local allocation.
          * @param destination Actual inactive GPU local allocation.
          * @param intersection Checked original source/destination overlap.
          * @param error Exact cold validation or submission diagnostic.
+         * @param timing_capture Per-transfer device timing-event capture policy.
          * @return Whether the first live row segment was submitted.
          */
         bool startCpuToGpuContiguous(std::span<const std::uint8_t> cpu_bytes,
             const ContiguousFloatingPointWeightDescriptor& destination,
-            const ExpertTierWeightProjectionIntersection& intersection,std::string* error=nullptr) noexcept;
+            const ExpertTierWeightProjectionIntersection& intersection,std::string* error=nullptr,
+            ExpertTierDeviceTimingCapture timing_capture=ExpertTierDeviceTimingCapture::LaneDefault) noexcept;
 
         /**
          * @brief Bind the actual final-role encoded-word writer before starting a reserved lane.
@@ -370,6 +385,7 @@ namespace llaminar2
         std::size_t in_flight_bytes_ = 0;
         bool work_may_be_in_flight_ = false;
         bool fail_after_in_flight_event_ = false;
+        bool active_timing_enabled_ = false;
         bool in_flight_timing_valid_ = false;
         std::chrono::steady_clock::time_point transfer_started_at_{};
         std::uint64_t transfer_device_nanoseconds_ = 0;

@@ -809,19 +809,19 @@ namespace
 
         EXPECT_EQ(
             nibble_symmetric_footprint.encoding,
-            CPUNativeQuantisedEncoding::NibbleLUT);
+            CPUNativeQuantisedEncoding::UnsignedNibble);
         EXPECT_FALSE(nibble_symmetric_footprint.is_asymmetric);
         EXPECT_EQ(
             nibble_asymmetric_footprint.encoding,
-            CPUNativeQuantisedEncoding::NibbleLUT);
+            CPUNativeQuantisedEncoding::UnsignedNibble);
         EXPECT_TRUE(nibble_asymmetric_footprint.is_asymmetric);
         EXPECT_EQ(
             expanded_symmetric_footprint.encoding,
-            CPUNativeQuantisedEncoding::ExpandedInt8);
+            CPUNativeQuantisedEncoding::CompactFiveBit);
         EXPECT_FALSE(expanded_symmetric_footprint.is_asymmetric);
         EXPECT_EQ(
             expanded_asymmetric_footprint.encoding,
-            CPUNativeQuantisedEncoding::ExpandedInt8);
+            CPUNativeQuantisedEncoding::CompactFiveBit);
         EXPECT_TRUE(expanded_asymmetric_footprint.is_asymmetric);
         EXPECT_EQ(
             q6_footprint.encoding,
@@ -878,10 +878,10 @@ namespace
         const NativeQuantisedTileConfig q6_deep = computeTileConfig(
             N, K, M, q6_footprint, threads, cache);
 
-        EXPECT_EQ(nibble_symmetric.k_tile_blocks, 181);
-        EXPECT_EQ(nibble_asymmetric.k_tile_blocks, 165);
-        EXPECT_EQ(expanded_symmetric.k_tile_blocks, 103);
-        EXPECT_EQ(expanded_asymmetric.k_tile_blocks, 97);
+        EXPECT_EQ(nibble_symmetric.k_tile_blocks, 200);
+        EXPECT_EQ(nibble_asymmetric.k_tile_blocks, 181);
+        EXPECT_EQ(expanded_symmetric.k_tile_blocks, 165);
+        EXPECT_EQ(expanded_asymmetric.k_tile_blocks, 152);
         EXPECT_EQ(q6_shallow.k_tile_blocks, 65);
         EXPECT_EQ(q6_deep.k_tile_blocks, 395);
 

@@ -127,6 +127,20 @@ namespace llaminar2::cpu::moe
     };
 
     /**
+     * @brief Cache-coherence hint for writing the preweighted GPU return bank.
+     *
+     * SameSocketDDIO uses cacheable stores so a GPU on the same NUMA socket
+     * hits Intel DDIO L3 cache on PCIe DMA. CrossSocketStreaming uses
+     * non-temporal streaming stores so a GPU on a remote NUMA socket avoids
+     * cross-UPI L3 HitM snoop stalls and CPU RFO traffic.
+     */
+    enum class PreweightedStoreLocality : uint8_t
+    {
+        SameSocketDDIO = 0,
+        CrossSocketStreaming = 1,
+    };
+
+    /**
      * @brief Borrowed compact weighted copy of the SAME original route sums.
      * The caller retains its publication lease and allocation authority. Sorted
      * original slots name exactly the live sums; weights use that same order.
@@ -139,6 +153,8 @@ namespace llaminar2::cpu::moe
         std::span<const int32_t> original_slots;
         std::span<const int32_t> destination_slots; ///< Actual compact top-k coordinates, including inactive holes.
         std::span<const float> weights;
+        PreweightedStoreLocality store_locality = PreweightedStoreLocality::SameSocketDDIO;
+        bool skip_combined_store = false; ///< When true and degree==2, omit writing unused combined_route_rows scratch.
     };
 
     /** @brief Unweighted fixed-order combine, before any original top-k weighting. */

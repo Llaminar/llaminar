@@ -11,6 +11,7 @@
  * the topology is only forward-declared in the public header.
  */
 #include "utils/MPIContext.h"
+#include "tensors/SIMDHelpers.h"
 #include "collective/GlobalTPContext.h"
 #include "planning/ExecutionRankMembership.h"
 #include "execution/runner/RankInitializationLifecycle.h"
@@ -137,5 +138,68 @@ namespace llaminar2
         });
         if (active) return active;
         return InactiveMPIRank{actual_rank};
+    }
+
+    void MPIContext::allreduce_q8_1_inplace(Q8_1Block *data, size_t n_blocks) const
+    {
+        if (world_size_ == 1) return;
+        const size_t total_bytes = n_blocks * sizeof(Q8_1Block);
+        std::vector<Q8_1Block> gathered(n_blocks * world_size_);
+        MPI_Allgather(data, total_bytes, MPI_BYTE, gathered.data(), total_bytes, MPI_BYTE, comm_);
+        std::vector<const Q8_1Block *> inputs(world_size_);
+        for (int r = 0; r < world_size_; ++r) inputs[r] = gathered.data() + r * n_blocks;
+        simd::q8_1_sum_n(inputs.data(), world_size_, data, n_blocks);
+    }
+
+    void MPIContext::allreduce_q16_1_inplace(Q16_1Block *data, size_t n_blocks) const
+    {
+        if (world_size_ == 1) return;
+        const size_t total_bytes = n_blocks * sizeof(Q16_1Block);
+        std::vector<Q16_1Block> gathered(n_blocks * world_size_);
+        MPI_Allgather(data, total_bytes, MPI_BYTE, gathered.data(), total_bytes, MPI_BYTE, comm_);
+        std::vector<const Q16_1Block *> inputs(world_size_);
+        for (int r = 0; r < world_size_; ++r) inputs[r] = gathered.data() + r * n_blocks;
+        simd::q16_1_sum_n(inputs.data(), world_size_, data, n_blocks);
+    }
+
+    template <typename BlockType>
+    void MPIContext::allreduce_q16_inplace(BlockType *data, size_t n_blocks) const
+    {
+        if (world_size_ == 1) return;
+        const size_t total_bytes = n_blocks * sizeof(BlockType);
+        std::vector<BlockType> gathered(n_blocks * world_size_);
+        MPI_Allgather(data, total_bytes, MPI_BYTE, gathered.data(), total_bytes, MPI_BYTE, comm_);
+        std::vector<const BlockType *> inputs(world_size_);
+        for (size_t b = 0; b < n_blocks; ++b)
+        {
+            for (int r = 0; r < world_size_; ++r) inputs[r] = gathered.data() + r * n_blocks + b;
+            simd::q16_sum_n<BlockType>(inputs.data(), world_size_, data + b);
+        }
+    }
+
+    template void MPIContext::allreduce_q16_inplace<Q16_1Block>(Q16_1Block *, size_t) const;
+    template void MPIContext::allreduce_q16_inplace<Q16_1Block_64>(Q16_1Block_64 *, size_t) const;
+    template void MPIContext::allreduce_q16_inplace<Q16_1Block_128>(Q16_1Block_128 *, size_t) const;
+
+    void MPIContext::allreduce_fp16_inplace(uint16_t *data, size_t count) const
+    {
+        if (world_size_ == 1) return;
+        const size_t total_bytes = count * sizeof(uint16_t);
+        std::vector<uint16_t> gathered(count * world_size_);
+        MPI_Allgather(data, total_bytes, MPI_BYTE, gathered.data(), total_bytes, MPI_BYTE, comm_);
+        std::vector<const uint16_t *> inputs(world_size_);
+        for (int r = 0; r < world_size_; ++r) inputs[r] = gathered.data() + r * count;
+        simd::fp16_sum_n(inputs.data(), world_size_, data, count);
+    }
+
+    void MPIContext::allreduce_bf16_inplace(uint16_t *data, size_t count) const
+    {
+        if (world_size_ == 1) return;
+        const size_t total_bytes = count * sizeof(uint16_t);
+        std::vector<uint16_t> gathered(count * world_size_);
+        MPI_Allgather(data, total_bytes, MPI_BYTE, gathered.data(), total_bytes, MPI_BYTE, comm_);
+        std::vector<const uint16_t *> inputs(world_size_);
+        for (int r = 0; r < world_size_; ++r) inputs[r] = gathered.data() + r * count;
+        simd::bf16_sum_n(inputs.data(), world_size_, data, count);
     }
 }

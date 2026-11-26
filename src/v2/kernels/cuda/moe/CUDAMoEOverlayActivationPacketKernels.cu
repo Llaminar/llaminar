@@ -20,7 +20,6 @@
 #include "../../common/MoEOverlayNativeInvocationDevice.inl"
 #include "../../common/MoEOverlayNodeLocalRouteExchangeDevice.inl"
 #include "backends/cuda/CUDAGraphCapture.h"
-#include "backends/cuda/MappedTransferServiceDevice.cuh"
 
 #include <algorithm>
 #include <cstddef>
@@ -106,15 +105,12 @@ namespace llaminar2::cuda_moe_packet
     constexpr unsigned kDispatchMetadataThreads = 32;
     /**
      * @brief Authenticate the original lane and publish its exact active payload predicate.
-     * @tparam AcquireInMetadata This is the unique consumer of the resident route word.
      * @param launch Original grant, placement and packet operands.
      * @param handle Native condition for the exact live mapped row transfer.
-     * @param ready Original same-device word when this warp owns its acquire.
      */
-    template<bool AcquireInMetadata>
     __global__ __launch_bounds__(32) void prepareResidentDmaMetadata(
         const __grid_constant__ MoEOverlayActivationDispatchPackLaunch launch,
-        cudaGraphConditionalHandle handle, std::uint64_t* ready)
+        cudaGraphConditionalHandle handle)
     {
         // Lane zero authenticates the acquired grant and placement. The warp
         // then compacts one original router slot per lane in canonical order.
@@ -122,15 +118,7 @@ namespace llaminar2::cuda_moe_packet
         const unsigned slot = threadIdx.x;
         DispatchMetadataPreparation preparation{};
         if (slot == 0)
-        {
             preparation = prepareDispatchMetadata(launch);
-            if constexpr (AcquireInMetadata)
-                consumeResidentPacketAcquire64(ready, 1u);
-        }
-        // Grant/placement validation needs no router output. Finish the one
-        // acquire before any lane reads the selected route and its weight.
-        if constexpr (AcquireInMetadata)
-            __syncwarp(warp);
         const auto placement_ptr = __shfl_sync(warp,
             reinterpret_cast<unsigned long long>(preparation.route_participants), 0);
         const auto* placement = reinterpret_cast<const int*>(placement_ptr);
@@ -191,7 +179,7 @@ namespace llaminar2::cuda_moe_packet
                 launch.packet.entry_offsets[1] = static_cast<int>(entries);
                 launch.packet.row_ids[0] = 0;
             }
-            finishDispatchMetadata(launch, entries != 0, entries);
+            finishDispatchMetadata(launch, entries != 0, entries, entries != 0 ? 0 : -1);
             const auto& grant = *launch.grant;
             cudaGraphSetConditional(handle, grant.code == raw(MoEOverlayActivationStatusCode::Success) && entries != 0);
         }
@@ -205,21 +193,17 @@ namespace llaminar2::cuda_moe_packet
 
     /**
      * @brief Record one lane's metadata, live DMA, and ordered lease release.
-     * @tparam AcquireInMetadata Whether the metadata warp acquires the route once.
      * @param lane Original lane and TransferEngine-bound storage.
      * @param stream Exact captured stream with the early router dependency.
-     * @param ready Same-device release word when this warp owns the acquire.
      * @return Whether CUDA accepted the complete publication.
      */
-    template<bool AcquireInMetadata = false>
-    bool recordResidentDispatchLane(const ResidentMappedDispatch& lane, cudaStream_t stream,
-        std::uint64_t* ready = nullptr)
+    bool recordResidentDispatchLane(const ResidentMappedDispatch& lane, cudaStream_t stream)
     {
         const auto& launch = lane.launch;
         CUDAActiveCaptureConditional branch(stream, CUDAActiveCaptureConditionalKind::IfOnly);
         if (!branch.publishPredicate([&](cudaGraphConditionalHandle condition) {
-                prepareResidentDmaMetadata<AcquireInMetadata><<<1, kDispatchMetadataThreads, 0, stream>>>(
-                    launch.packet, condition, ready);
+                prepareResidentDmaMetadata<<<1, kDispatchMetadataThreads, 0, stream>>>(
+                    launch.packet, condition);
                 return launchAccepted();
             }) || !branch.beginBranches() ||
             !branch.appendMappedHostCopy(CUDAActiveCaptureConditionalBranch::IfNonZero, lane.copy) ||
@@ -242,29 +226,16 @@ namespace llaminar2::cuda_moe_packet
             cudaGetDevice(&current) != cudaSuccess || current != device_ordinal)
             return false;
 
-        using Peer = ResidentDispatchPeerBudget;
-        constexpr unsigned peer_registers = Peer::blocks_per_sm * Peer::block_threads * Peer::registers_per_thread;
-        const auto fits = [&](const auto kernel) {
-            cudaFuncAttributes attributes{};
-            if (cudaFuncGetAttributes(&attributes, kernel) != cudaSuccess)
-                return false;
-            const unsigned packet_registers = (unsigned(attributes.numRegs) + 7u) / 8u * 8u;
-            // The device graph conditional API owns a linked call frame.
-            // Register, thread and shared limits determine concurrent residency.
-            return attributes.maxThreadsPerBlock >= int(kDispatchMetadataThreads) &&
-                unsigned(hardware.registers_per_sm) >= peer_registers + kDispatchMetadataThreads * packet_registers &&
-                unsigned(hardware.maximum_threads_per_sm) >= Peer::blocks_per_sm * Peer::block_threads + kDispatchMetadataThreads &&
-                unsigned(hardware.maximum_blocks_per_sm) > Peer::blocks_per_sm &&
-                hardware.shared_memory_per_sm >= Peer::blocks_per_sm * Peer::shared_bytes + attributes.sharedSizeBytes;
-        };
-        return fits(prepareResidentDmaMetadata<false>) && fits(prepareResidentDmaMetadata<true>);
+        cudaFuncAttributes attributes{};
+        return cudaFuncGetAttributes(&attributes, prepareResidentDmaMetadata) == cudaSuccess &&
+            attributes.maxThreadsPerBlock >= int(kDispatchMetadataThreads);
     }
 
     /** @copydoc recordResidentDispatchPackets */
     bool recordResidentDispatchPackets(std::span<const ResidentMappedDispatch> lanes,
-        int device_ordinal, void* stream, const CUDAResidentPacketAcquire* acquire)
+        int device_ordinal, void* stream)
     {
-        if (lanes.empty() || (acquire && lanes.size() != 1) || stream == cudaStreamLegacy || stream == cudaStreamPerThread ||
+        if (lanes.empty() || stream == cudaStreamLegacy || stream == cudaStreamPerThread ||
             !selectLaunchContext(device_ordinal, stream))
             return false;
         for (const auto& lane : lanes)
@@ -280,8 +251,6 @@ namespace llaminar2::cuda_moe_packet
         }
 
         const auto native = static_cast<cudaStream_t>(stream);
-        if (acquire)
-            return recordResidentDispatchLane<true>(lanes.front(), native, acquire->claimSignal(stream));
         if (lanes.size() == 1)
             return recordResidentDispatchLane(lanes.front(), native);
 
@@ -345,11 +314,8 @@ extern "C" bool cudaMoEOverlayActivationPackDispatch(
     if (launch->hidden_payload_layout ==
         llaminar2::MoEOverlayActivationHiddenPayloadLayout::CompactRows)
     {
-        const std::size_t hidden_elements =
-            static_cast<std::size_t>(launch->physical_rows) *
-            static_cast<std::size_t>(launch->packet.d_model);
         llaminar2::moe_activation_packet_device::packDispatchHiddenKernel
-            <<<blocksFor(hidden_elements), kThreads, 0u, cuda_stream>>>(*launch);
+            <<<static_cast<unsigned int>(launch->physical_rows), kThreads, 0u, cuda_stream>>>(*launch);
     }
     if (launch->shared_row_writer)
         llaminar2::moe_activation_packet_device::packSharedDispatchUnionKernel
@@ -370,15 +336,14 @@ extern "C" bool cudaMoEOverlayActivationConsumeDispatch(
     const auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
     llaminar2::moe_activation_packet_device::validateDispatchKernel
         <<<1u, kThreads, 0u, cuda_stream>>>(*launch);
-    const std::size_t hidden_elements =
-        static_cast<std::size_t>(launch->physical_rows) *
-        static_cast<std::size_t>(launch->packet.d_model);
     const std::size_t route_elements =
         static_cast<std::size_t>(launch->physical_rows) *
         static_cast<std::size_t>(launch->packet.top_k);
-    const std::size_t elements = std::max(hidden_elements, route_elements);
+    const unsigned int dispatch_blocks = std::max(
+        static_cast<unsigned int>(launch->physical_rows),
+        blocksFor(route_elements));
     llaminar2::moe_activation_packet_device::materializeMappedDispatchKernel
-        <<<blocksFor(elements), kThreads, 0u, cuda_stream>>>(*launch);
+        <<<dispatch_blocks, kThreads, 0u, cuda_stream>>>(*launch);
     return launchAccepted();
 }
 
@@ -440,17 +405,24 @@ extern "C" bool cudaMoEOverlayConsumeCanonicalRouteTicket(
     const auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
     llaminar2::moe_activation_packet_device::awaitCanonicalRouteTicketKernel
         <<<1u, 1u, 0u, cuda_stream>>>(*launch);
+    if (!launch->metadataOnly() && launch->route_capacity <= 32u)
+    {
+        llaminar2::moe_activation_packet_device::
+            materializeAndAcknowledgeSingleRowCanonicalRouteTicketKernel
+            <<<1u, 1024u, 0u, cuda_stream>>>(*launch);
+        return launchAccepted();
+    }
     if (!launch->metadataOnly())
     {
         llaminar2::moe_activation_packet_device::
             materializeCanonicalRouteTicketKernel
             <<<blocks, kThreads, 0u, cuda_stream>>>(*launch);
     }
-    /* A separate one-thread node cannot race the materialization blocks. Its
-     * exact-stream release is the sole authority permitting host payload reuse. */
+    /* A separate warp-coalesced node cannot race multi-row materialization blocks.
+     * Its exact-stream release is the sole authority permitting host payload reuse. */
     llaminar2::moe_activation_packet_device::
         acknowledgeCanonicalRouteTicketKernel
-        <<<1u, 1u, 0u, cuda_stream>>>(*launch);
+        <<<1u, 32u, 0u, cuda_stream>>>(*launch);
     return launchAccepted();
 }
 
@@ -541,8 +513,13 @@ extern "C" bool cudaMoEOverlayActivationPackSingleRowDispatchBatch(
         llaminar2::moe_activation_packet_device::packSingleRowDispatchBatchKernel);
     if (threads == 0u)
         return false;
+    const unsigned int blocks =
+        (launch->shared_hidden_rows_fp32 != nullptr &&
+         launch->lane_count > 1u && launch->lane_count <= 32u)
+            ? 1u
+            : launch->lane_count;
     llaminar2::moe_activation_packet_device::packSingleRowDispatchBatchKernel
-        <<<launch->lane_count, threads, 0u, cuda_stream>>>(*launch);
+        <<<blocks, threads, 0u, cuda_stream>>>(*launch);
     return launchAccepted();
 }
 
@@ -557,11 +534,10 @@ extern "C" bool cudaMoEOverlayActivationConsumeSingleRowReturnBatch(
         return false;
     }
     const auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    // Single-row canonical materialization is fused into each lane's wait/validate
+    // block so fast followers copy over PCIe while slower followers still run.
     llaminar2::moe_activation_packet_device::validateSingleRowReturnBatchKernel
         <<<launch->lane_count, kSingleRowThreads, 0u, cuda_stream>>>(*launch);
-    llaminar2::moe_activation_packet_device::materializeSingleRowCanonicalReturnBatchKernel
-        <<<dim3(static_cast<unsigned int>(launch->top_k), launch->lane_count, 1u),
-           kThreads, 0u, cuda_stream>>>(*launch);
     return launchAccepted();
 }
 
@@ -605,15 +581,21 @@ extern "C" bool cudaMoEOverlayPublishNodeLocalCanonicalRoutes(
         return false;
     }
     const auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    if (launch->live_route_slots <= 32u)
+    {
+        llaminar2::moe_node_local_route_device::publishSingleRowSparseRouteKernel
+            <<<1u, 512u, 0u, cuda_stream>>>(*launch);
+        return launchAccepted();
+    }
     llaminar2::moe_node_local_route_device::beginRoutePublishKernel
-        <<<1u, 1u, 0u, cuda_stream>>>(*launch);
+        <<<1u, 32u, 0u, cuda_stream>>>(*launch);
     const unsigned int payload_blocks = std::min(
         kSparseRoutePayloadBlocks,
         static_cast<unsigned int>(launch->live_route_slots));
     llaminar2::moe_node_local_route_device::publishSparseRoutePayloadKernel
         <<<payload_blocks, kThreads, 0u, cuda_stream>>>(*launch);
     llaminar2::moe_node_local_route_device::finishRoutePublishKernel
-        <<<1u, 1u, 0u, cuda_stream>>>(*launch);
+        <<<1u, 32u, 0u, cuda_stream>>>(*launch);
     return launchAccepted();
 }
 
@@ -629,7 +611,7 @@ extern "C" bool cudaMoEOverlayAcquireNodeLocalCanonicalRoutes(
     }
     const auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
     llaminar2::moe_node_local_route_device::beginRouteConsumeKernel
-        <<<1u, 1u, 0u, cuda_stream>>>(*launch);
+        <<<1u, 32u, 0u, cuda_stream>>>(*launch);
     return launchAccepted();
 }
 
@@ -677,6 +659,26 @@ extern "C" bool cudaMoEOverlayFoldNodeLocalCanonicalRoutes(
         <<<fold_grid, kThreads, 0u, cuda_stream>>>(*launch);
     llaminar2::moe_node_local_route_device::finishRouteConsumeKernel
         <<<launch->peer_count, 1u, 0u, cuda_stream>>>(*launch);
+    return launchAccepted();
+}
+
+extern "C" bool cudaMoEOverlayConsumeSingleRowNodeLocalCanonicalRoutes(
+    const llaminar2::MoENodeLocalRouteConsumeLaunch *launch,
+    int device_ordinal,
+    void *stream)
+{
+    if (!launch || !launch->valid() || launch->physical_rows != 1u ||
+        launch->top_k > 32u || launch->peer_count > 8u ||
+        !selectLaunchContext(device_ordinal, stream))
+    {
+        return false;
+    }
+    const auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    const unsigned vecs = (launch->d_model + 3u) / 4u;
+    const unsigned rounded = ((vecs + 63u) / 64u) * 64u;
+    const unsigned threads = rounded < 256u ? 256u : (rounded > 1024u ? 1024u : rounded);
+    llaminar2::moe_node_local_route_device::consumeSingleRowSparseRoutesKernel
+        <<<1u, threads, 0u, cuda_stream>>>(*launch);
     return launchAccepted();
 }
 

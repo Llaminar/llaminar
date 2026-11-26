@@ -13,6 +13,22 @@ namespace llaminar2::cuda
     bool cudaQuantGemm_quantizeActivationsBlockwiseScoped(const float*, int8_t*, float*, int, int, int, void*);
 }
 
+extern "C"
+{
+    /** @brief Stage the original fixed-order Gate/Up projection for the independent oracle. */
+    bool cudaMoE_grouped_gate_up_native_quantised_decode_table_kpart(
+        const float*, const llaminar2::DeviceNativeQuantisedMatrixDesc*,
+        const llaminar2::DeviceNativeQuantisedMatrixDesc*, const int*, float* const*, float* const*,
+        int8_t*, float*, bool, float*, float*, int, int, int, int, uint8_t, int, int, void*,
+        llaminar2::CUDAMoESwiGLUPublication);
+
+    /** @brief Run the staged SwiGLU, Q8, and ordered Down publication on one original route. */
+    bool cudaMoE_grouped_swiglu_down_native_quantised_decode_table_kpart(
+        const float* const*, const float* const*, const llaminar2::DeviceNativeQuantisedMatrixDesc*,
+        const int*, const float*, int8_t*, float*, float*, float*, float*,
+        int, int, int, int, uint8_t, int, int, void*, llaminar2::CUDAMoEDecodeDownInput);
+}
+
 namespace
 {
 /** @brief One original QFN physical source range and its staged output observations. */
@@ -136,5 +152,118 @@ TEST(CUDARetainedHCFFN, RecordedGroupedPacketPublications)
         SCOPED_TRACE(unsigned(trace.down));
         SCOPED_TRACE(unsigned(trace.role));
         ASSERT_NO_THROW(replayGroupedPackets(trace, ordinal));
+    }
+}
+
+
+/** @test Every authentic source uses the fused graph and agrees with its staged one-route oracle. */
+TEST(CUDARetainedHCFFN, GroupedPacketsMatchStagedAllSources)
+{
+    const int ordinal = selectVisibleSM86();
+    const auto device = DeviceId::cuda(ordinal);
+    const Stream stream;
+    const auto native = stream.value;
+    constexpr int capacity = 16;
+    constexpr int packets_in = hidden / 32;
+    constexpr int gate_partitions = CUDAMoEBatchInvariantPolicy::gate_up_k_partitions;
+    constexpr int down_partitions = CUDAMoEBatchInvariantPolicy::down_k_partitions;
+    constexpr uint64_t generation = 1;
+
+    for (int projection_width : {320, 640})
+    for (const auto &format : llaminar2::test::quantizedMoEVerifierFormats())
+    {
+        SCOPED_TRACE(projection_width);
+        SCOPED_TRACE(format.label);
+        const int packets_out = projection_width / 32;
+        auto g = format.create({projection_width, hidden}, 401);
+        auto u = format.create({projection_width, hidden}, 403);
+        auto d = format.create({hidden, projection_width}, 407);
+        auto gate = llaminar2::test::makeGpuPreparedGemm(g.get(), device, "grouped.gate", ModelContextId{91881});
+        auto up = llaminar2::test::makeGpuPreparedGemm(u.get(), device, "grouped.up", ModelContextId{91882});
+        auto down = llaminar2::test::makeGpuPreparedGemm(d.get(), device, "grouped.down", ModelContextId{91883});
+        RetainedM1Expert weight{};
+        ASSERT_TRUE(gate.kernel->inspectPreparedNativeQuantisedMatrixDesc(weight.gate));
+        ASSERT_EQ(weight.gate.codebook_id, format.device_execution_codebook_id);
+        ASSERT_TRUE(up.kernel->inspectPreparedNativeQuantisedMatrixDesc(weight.up));
+        ASSERT_EQ(weight.up.codebook_id, format.device_execution_codebook_id);
+        ASSERT_TRUE(down.kernel->inspectPreparedNativeQuantisedMatrixDesc(weight.down));
+        ASSERT_EQ(weight.down.codebook_id, format.device_execution_codebook_id);
+
+        Array<DeviceNativeQuantisedMatrixDesc> gate_table{1}, up_table{1}, down_table{1};
+        gate_table.set(native, [&](auto) { return weight.gate; });
+        up_table.set(native, [&](auto) { return weight.up; });
+        down_table.set(native, [&](auto) { return weight.down; });
+        Array<int> live{1}, id{1};
+        id.set(native, [](auto) { return 0; });
+        Array<float> input{capacity * hidden}, input_scales{capacity * packets_in}, coefficient{1};
+        coefficient.set(native, [](auto) { return 1.f; });
+        Array<int8_t> input_codes{capacity * hidden};
+        Array<int8_t> codes{capacity * projection_width}, serial_codes{capacity * projection_width};
+        Array<float> scales{capacity * packets_out}, serial_scales{capacity * packets_out};
+        Array<float> output{capacity * hidden}, serial_output{capacity * hidden}, discarded_reduction{hidden};
+        Array<float> gate_values{projection_width}, up_values{projection_width}, gate_partial{gate_partitions * projection_width},
+            up_partial{gate_partitions * projection_width}, down_partial{down_partitions * hidden};
+        Array<float*> gate_destination{1}, up_destination{1};
+        gate_destination.set(native, [&](auto) { return gate_values.data(); });
+        up_destination.set(native, [&](auto) { return up_values.data(); });
+        Array<const float*> gate_reader{1}, up_reader{1};
+        gate_reader.set(native, [&](auto) { return gate_values.data(); });
+        up_reader.set(native, [&](auto) { return up_values.data(); });
+        Array<RetainedGroupedFFNRow> work{capacity};
+        work.set(native, [&](std::size_t row) {
+            return RetainedGroupedFFNRow{weight, input_codes.data() + row * hidden,
+                input_scales.data() + row * packets_in, codes.data() + row * projection_width,
+                scales.data() + row * packets_out, output.data() + row * hidden};
+        });
+        for (const auto role : {RetainedGroupedFFNRole::Routed, RetainedGroupedFFNRole::Shared})
+        {
+            SCOPED_TRACE(static_cast<int>(role));
+            const auto program = RetainedGroupedFFNProgram::prepare(device,
+                {work.data(), live.data(), capacity, projection_width, weight.gate.codebook_id,
+                    weight.down.codebook_id, role}, native, generation);
+            CUDAGraphCapture parent(native, ordinal);
+            auto fragment = parent.createOrderedTimelineFragment();
+            ASSERT_TRUE(fragment);
+            ASSERT_TRUE(fragment->beginCapture());
+            {
+                ScopedCUDAFinalTimelineRecording scope(*fragment);
+                program.record(native, generation);
+            }
+            ASSERT_TRUE(fragment->endCapture());
+            const std::array steps{GPUOrderedTimelineStep{.name = "original_grouped_formats", .capture = fragment.get()}};
+            ASSERT_TRUE(parent.buildOrderedTimelineTransaction(steps));
+            ASSERT_TRUE(parent.instantiate());
+
+            for (int rows : {16, 1, 3, 0, 2, 4, 6, 5, 7, 9, 8, 10, 12, 11, 13, 15, 14, 0, 16})
+            {
+                SCOPED_TRACE(rows);
+                live.set(native, [&](auto) { return rows; });
+                input.set(native, [&](std::size_t i) { return signedValue(i, 420 + rows); });
+                ASSERT_TRUE(cuda::cudaQuantGemm_quantizeActivationsBlockwiseScoped(input.data(), input_codes.data(),
+                    input_scales.data(), capacity, hidden, ordinal, native));
+                for (auto *plane : {&codes, &serial_codes})
+                    plane->set(native, [](auto) { return int8_t{-77}; });
+                for (auto *plane : {&scales, &serial_scales, &output, &serial_output})
+                    plane->set(native, [](auto) { return -77.f; });
+                for (int row = 0; row < rows; ++row)
+                {
+                    ASSERT_TRUE(cudaMoE_grouped_gate_up_native_quantised_decode_table_kpart(
+                        input.data() + row * hidden, gate_table.data(), up_table.data(), id.data(),
+                        gate_destination.data(), up_destination.data(), input_codes.data() + row * hidden,
+                        input_scales.data() + row * packets_in, true, gate_partial.data(), up_partial.data(),
+                        1, projection_width, hidden, 1, weight.gate.codebook_id, gate_partitions, ordinal, native, {}));
+                    ASSERT_TRUE(cudaMoE_grouped_swiglu_down_native_quantised_decode_table_kpart(
+                        gate_reader.data(), up_reader.data(), down_table.data(), id.data(), coefficient.data(),
+                        serial_codes.data() + row * projection_width, serial_scales.data() + row * packets_out,
+                        down_partial.data(), discarded_reduction.data(), serial_output.data() + row * hidden,
+                        1, hidden, projection_width, 1, weight.down.codebook_id, down_partitions, ordinal, native,
+                        CUDAMoEDecodeDownInput::FloatGateUp));
+                }
+                ASSERT_TRUE(parent.launch());
+                EXPECT_EQ(codes.digest(native), serial_codes.digest(native));
+                EXPECT_EQ(scales.digest(native), serial_scales.digest(native));
+                EXPECT_EQ(output.digest(native), serial_output.digest(native));
+            }
+        }
     }
 }

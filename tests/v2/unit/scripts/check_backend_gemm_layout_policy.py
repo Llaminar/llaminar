@@ -164,7 +164,7 @@ def find_violations(repo_root: pathlib.Path) -> list[str]:
                     "policy substitution is forbidden; reject an invalid "
                     "physical policy before launch"
                 )
-            if path.name == "CPUNativeQuantisedGemmKernel.h":
+            if path.name in ("CPUNativeQuantisedGemmKernel.h", "CPUNativeQuantisedGemmKernel.cpp"):
                 for token in CPU_NATIVE_QUANTISED_FORBIDDEN_LAUNCHER_TOKENS:
                     if token in source:
                         violations.append(

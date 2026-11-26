@@ -277,4 +277,11 @@ namespace llaminar2
      * @param previous_write_node Original attention residual write joined to the staged FFN read.
      */
     void lowerCUDAMappedRetainedM1HCFFN(ComputeGraph& graph,const std::string& previous_write_node);
+
+    /**
+     * @brief Close one mapped ROCm M1 region into the two-kernel prefix+suffix megakernel.
+     * @param graph Original composed participant graph with explicit ticket and collective nodes.
+     * @param previous_write_node Original attention residual write joined to the staged FFN read.
+     */
+    void lowerROCmMappedRetainedM1HCFFN(ComputeGraph& graph,const std::string& previous_write_node);
 }

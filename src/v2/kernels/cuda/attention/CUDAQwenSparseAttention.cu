@@ -9,6 +9,7 @@
 #include "../../qwen4exp/QwenSparseReplay.h"
 #include "CUDAQwenSparseAttention.h"
 #include "kernels/qwen4exp/QwenSparseGPU.cuh"
+#include "CUDAQwenSparseFP16Attention.cuh"
 #include <stdexcept>
 #include <string>
 namespace llaminar2::qwen4exp
@@ -91,8 +92,14 @@ void cudaQwenSparseSelectPools(const QwenSparseIndexer &p, cudaStream_t stream)
 
 void cudaQwenSparseAttention(const QwenSparseAttention &p, cudaStream_t stream)
 {
-    validateQwenSparseAttentionArithmetic(p.arithmetic,DeviceType::CUDA);
     requireStream(stream);
+    validateQwenSparseAttentionArithmetic(p.arithmetic, DeviceType::CUDA);
+    if (p.arithmetic == QwenSparseAttentionArithmetic::TileFP16WithFP32Totals ||
+        p.arithmetic == QwenSparseAttentionArithmetic::TileFP16WithFP32Totals33)
+    {
+        cudaQwenSparseFP16Attention(p, stream);
+        return;
+    }
     validateQwenSparseAttention(p);
     if (!p.gpu_partials) throw std::invalid_argument("CUDA Qwen sparse attention requires admitted fixed-partition scratch");
     if (detail::isRotated(p.kv.keys))
@@ -109,6 +116,47 @@ void cudaQwenSparseAttention(const QwenSparseAttention &p, cudaStream_t stream)
         checkLaunch();
         cuda_sparse_detail::reduceAttentionPartitions<Value><<<dim3(p.row_capacity, p.query_heads), 256, 0, stream>>>(p);
     });
+    checkLaunch();
+}
+void cudaQwenSparseFP16TilesOnly(const QwenSparseAttention &p, cudaStream_t stream)
+{
+    requireStream(stream);
+    if (p.arithmetic != QwenSparseAttentionArithmetic::TileFP16WithFP32Totals &&
+        p.arithmetic != QwenSparseAttentionArithmetic::TileFP16WithFP32Totals33)
+        throw std::invalid_argument("CUDA FP16 tiled entry requires a sealed FP16 arithmetic program");
+    validateQwenSparseAttention(p);
+    if (!p.gpu_partials || p.kv.keys.codec != TensorType::FP16 || p.kv.values.codec != TensorType::FP16)
+        throw std::invalid_argument("CUDA FP16 tiled attention requires native FP16 KV and admitted program-specific scratch");
+    for (const auto *bank : {&p.kv.keys, &p.kv.values})
+        if (reinterpret_cast<std::uintptr_t>(bank->data) % 16 || bank->token_stride_bytes % 16 || bank->head_stride_bytes % 16)
+            throw std::invalid_argument("CUDA FP16 tiled attention requires 16-byte aligned native bank rows");
+    if (p.kv.key_policy.transformsOnRead() && p.kv.key_rotary_dim != 64)
+        throw std::invalid_argument("CUDA FP16 tiled attention requires the explicit 64-coordinate pre-RoPE policy");
+    const auto launch = [&]<int Parts>() {
+        constexpr int GroupHeads = (Parts == 33) ? 6 : 4;
+        constexpr int Threads = GroupHeads * 32;
+        const dim3 grid(p.row_capacity,
+            (p.query_head_start % GroupHeads + p.query_heads + GroupHeads - 1) / GroupHeads, Parts);
+        if (p.kv.key_policy.transformsOnRead())
+            cuda_sparse_detail::selectedAttentionFP16Tiles<true, Parts><<<grid, Threads, 0, stream>>>(p);
+        else
+            cuda_sparse_detail::selectedAttentionFP16Tiles<false, Parts><<<grid, Threads, 0, stream>>>(p);
+        checkLaunch();
+    };
+    if (p.arithmetic == QwenSparseAttentionArithmetic::TileFP16WithFP32Totals33)
+        launch.template operator()<33>();
+    else
+        launch.template operator()<8>();
+}
+void cudaQwenSparseFP16Attention(const QwenSparseAttention &p, cudaStream_t stream)
+{
+    cudaQwenSparseFP16TilesOnly(p, stream);
+    if (p.arithmetic == QwenSparseAttentionArithmetic::TileFP16WithFP32Totals33)
+        cuda_sparse_detail::reduceAttentionPartitions<TensorType::FP16, 33>
+            <<<dim3(p.row_capacity, p.query_heads), 256, 0, stream>>>(p);
+    else
+        cuda_sparse_detail::reduceAttentionPartitions<TensorType::FP16, 8>
+            <<<dim3(p.row_capacity, p.query_heads), 256, 0, stream>>>(p);
     checkLaunch();
 }
 void cudaQwenSparseSnapshotPrior(const QwenSparsePriorSnapshot& p,void* rawStream)

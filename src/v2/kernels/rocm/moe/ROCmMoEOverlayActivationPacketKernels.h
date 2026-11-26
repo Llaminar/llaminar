@@ -106,6 +106,12 @@ extern "C"
         int device_ordinal,
         void *stream);
 
+    /** @brief Single-row fused acquire, validate, direct-mapped fold, and acknowledge. */
+    bool hipMoEOverlayConsumeSingleRowNodeLocalCanonicalRoutes(
+        const llaminar2::MoENodeLocalRouteConsumeLaunch *launch,
+        int device_ordinal,
+        void *stream);
+
     /** @brief Wait until every peer has released the prior dense payload bank. */
     bool hipMoEOverlayBeginNodeLocalDensePublication(
         const llaminar2::MoENodeLocalDensePublicationLaunch *launch,

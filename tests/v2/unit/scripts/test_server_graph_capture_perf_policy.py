@@ -2150,13 +2150,13 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
             self.assertIn(marker, harness)
 
         runner = (
-            REPO_ROOT / "src/v2/execution/runner/OrchestrationRunner.cpp"
+            REPO_ROOT / "src/v2/execution/runner/OrchestrationRunnerMTPHelpers.cpp"
         ).read_text(encoding="utf-8")
         terminal_ledger_start = runner.index(
             "GenerationResult OrchestrationRunner::completeDeviceResidentGeneration"
         )
         terminal_ledger_end = runner.index(
-            "GenerationResult OrchestrationRunner::decodeStepMTP",
+            "std::optional<std::string> OrchestrationRunner::verifyCommittedPrefixReplay",
             terminal_ledger_start,
         )
         terminal_ledger = runner[terminal_ledger_start:terminal_ledger_end]

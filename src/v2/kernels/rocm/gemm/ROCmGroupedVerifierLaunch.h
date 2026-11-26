@@ -10,6 +10,7 @@
  */
 #pragma once
 
+#include "ROCmQuantisedEpilogues.h"
 #include "kernels/common/DeviceRowRange.h"
 #include "kernels/common/HCDownOutputPublicationArgs.h"
 #include <cstdint>
@@ -36,6 +37,7 @@ extern "C"
      * @param stream Exact non-null execution stream.
      * @param row_range Optional host descriptor copied into launch parameters;
      *        its device count must be published before this stream consumes it.
+     * @param destination_fold Terminal FP32 update of the original device row.
      * @return False for invalid arguments or failed launch, never another route.
      */
     bool rocmGemv_native_quantised_small_m_fp32_with_sums_policy(
@@ -46,7 +48,8 @@ extern "C"
         float *d_partial_fp32, int M, int N, int K,
         uint8_t codebook_id, uint8_t arithmetic_policy_codebook_id,
         int device_id, void *stream,
-        const llaminar2::DeviceRowRange *row_range = nullptr);
+        const llaminar2::DeviceRowRange *row_range = nullptr,
+        llaminar2::rocm::ROCmFP32DestinationFold destination_fold = {});
 
     /**
      * @brief Fused same-format projections sharing quantization and row admission.

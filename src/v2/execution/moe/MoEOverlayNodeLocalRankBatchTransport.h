@@ -401,6 +401,8 @@ namespace llaminar2
         std::vector<MoEOverlayActivationLocalLaneBinding> local_lanes;
         /** Original source-prepared joint map; only cold source geometry selects return roles. */
         std::shared_ptr<const MoEExpertOwnerMap> original_cpu_joint_owners;
+        /** Enable FP16 dispatch + FP16 per-row pre-folded return on GPU-to-GPU MainPrefill. */
+        bool enable_gpu_prefill_fp16_wire = false;
     };
 
     /**

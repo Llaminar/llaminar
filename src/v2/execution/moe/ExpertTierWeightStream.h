@@ -13,7 +13,7 @@
 
 #include "ExpertTierWeightDeviceLayout.h"
 #include "GPUExpertTransfer.h"
-#include "../../kernels/cpu/gemm/CPUNativeQuantisedWeightPacker.h"
+#include "../../kernels/cpu/gemm/CPUNativeQuantisedPackedWeights.h"
 
 #include <cstddef>
 #include <cstdint>

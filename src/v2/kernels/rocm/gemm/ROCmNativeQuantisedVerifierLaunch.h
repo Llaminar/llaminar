@@ -8,6 +8,7 @@
  * they own no inference state and are independent of prefill candidate scopes.
  */
 #pragma once
+#include "ROCmQuantisedEpilogues.h"
 #include "kernels/common/ProjectionRowWork.h"
 #include "kernels/common/CapturedVerifierExtent.h"
 #include "tensors/NativeQuantisedFormatInfo.h"
@@ -193,8 +194,8 @@ private:
  */
 [[nodiscard]] NativeQuantisedVerifierCandidate nativeQuantisedVerifierProducer(
     int device, bool decode_equivalent, const NativeQuantisedVerifierWork &work);
-/** @brief Direct standalone and fused output differ in their required final +0/bias. */
-enum class VerifierWmmaPublication { Standalone, Batched, OrderedPartial };
+/** @brief Original raw, batched, or split destination and the terminal device-local update. */
+enum class VerifierWmmaPublication { Standalone, Batched, OrderedPartial, StandaloneFold };
 /** @brief Complete borrowed producer arguments; the caller retains reducer ownership. */
 struct NativeQuantisedVerifierWmmaArguments {
     const int8_t *activations; ///< Physical row-major quantized input.
@@ -207,6 +208,7 @@ struct NativeQuantisedVerifierWmmaArguments {
     int row_workers; ///< Fixed bounded worker grid; cursors visit original live intervals.
     bool has_request_work; ///< Compile-time ABI choice authenticated before capture.
     VerifierWmmaPublication publication; ///< Exact destination and bias arithmetic.
+    ROCmFP32DestinationFold destination_fold; ///< Prior C owned by standalone terminal stores only.
 };
 /**
  * @brief Submit one native packet preserving the original row and serial arithmetic contracts.

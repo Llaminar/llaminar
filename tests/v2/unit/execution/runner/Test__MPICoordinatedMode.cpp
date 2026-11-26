@@ -16,6 +16,7 @@
  */
 
 #include <gtest/gtest.h>
+#include "../../SourceShardReader.h"
 #include <gmock/gmock.h>
 
 #include "execution/runner/OrchestrationRunner.h"
@@ -1050,11 +1051,9 @@ namespace
          * maintenance Barrier until SHUTDOWN has released that receive. The
          * runtime test above proves wire identity and this source invariant
          * locks down the otherwise unobservable cross-component ordering. */
-        std::ifstream source(LLAMINAR_ORCHESTRATION_RUNNER_SOURCE);
-        ASSERT_TRUE(source.good());
-        const std::string text{
-            std::istreambuf_iterator<char>(source),
-            std::istreambuf_iterator<char>()};
+        const std::string text = llaminar2::test_support::readSourceFileOrFamily(
+            LLAMINAR_ORCHESTRATION_RUNNER_SOURCE);
+        ASSERT_FALSE(text.empty());
         const auto function_begin = text.find(
             "void OrchestrationRunner::shutdownMPIWorkers()");
         ASSERT_NE(function_begin, std::string::npos);
@@ -1090,11 +1089,9 @@ namespace
         /* A one-rank topology has no command wire to observe, so lock down the
          * lifecycle edge structurally. Real device integration independently
          * proves that this drain retires old banks and recycles live slots. */
-        std::ifstream source(LLAMINAR_ORCHESTRATION_RUNNER_SOURCE);
-        ASSERT_TRUE(source.good());
-        const std::string text{
-            std::istreambuf_iterator<char>(source),
-            std::istreambuf_iterator<char>()};
+        const std::string text = llaminar2::test_support::readSourceFileOrFamily(
+            LLAMINAR_ORCHESTRATION_RUNNER_SOURCE);
+        ASSERT_FALSE(text.empty());
         const auto function_begin = text.find(
             "void OrchestrationRunner::shutdownMPIWorkers()");
         ASSERT_NE(function_begin, std::string::npos);
@@ -1744,11 +1741,9 @@ namespace
          * device-free tests, while production parity proves this exact branch
          * with a retained transaction follower and real weights.
          */
-        std::ifstream source(LLAMINAR_ORCHESTRATION_RUNNER_SOURCE);
-        ASSERT_TRUE(source.good());
-        const std::string text{
-            std::istreambuf_iterator<char>(source),
-            std::istreambuf_iterator<char>()};
+        const std::string text = llaminar2::test_support::readSourceFileOrFamily(
+            LLAMINAR_ORCHESTRATION_RUNNER_SOURCE);
+        ASSERT_FALSE(text.empty());
         const auto prefill_case = text.find("case MPICommand::PREFILL:");
         ASSERT_NE(prefill_case, std::string::npos);
         const auto next_case = text.find(

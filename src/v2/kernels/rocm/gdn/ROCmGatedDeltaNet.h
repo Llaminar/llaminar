@@ -156,6 +156,11 @@ namespace llaminar2
         GDNRecurrenceStateLayout recurrenceStateLayout() const noexcept override { return recurrence_layout_; }
 
         bool resetGPUState(void *stream) override { return resetState(stream); }
+        /** @brief Borrow the immutable cache-owned device recurrence state pointer for retained megakernel execution. */
+        float *borrowedLiveDeviceState(int required_state_size) const noexcept
+        {
+            return stateForSize(required_state_size);
+        }
         void bindVerifierStateCaptureWorkspace(float *workspace, int rows, int state_size) override
         {
             verifier_state_capture_ = workspace;
@@ -1336,7 +1341,7 @@ namespace llaminar2
                     publicationDestination(), mirror};
                 rocmGDN_gpu_set_device(owner_.device_ordinal_);
                 if (!gdn::launchROCmDenseCompactAcceptedPrefixWithPolicy(publication,stream,
-                        binding_.verifier_kernel_policy==LocalGPUExpertKernelPolicy::QFNMI50TP4))
+                        usesGFX906MI50Kernels(binding_.verifier_kernel_policy)))
                     return false;
                 return true;
             }

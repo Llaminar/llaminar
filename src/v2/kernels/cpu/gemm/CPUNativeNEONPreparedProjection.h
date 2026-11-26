@@ -43,7 +43,7 @@ namespace llaminar2::cpu::native_quantised
         using Encoding = CPUNativeQuantisedEncoding;
         using Dot = multi_scale::NEONByteDot;
         /** @brief Exact source nibble interpretation, selected outside K traversal. */
-        enum class NibbleMap { Centered, Unsigned, NonLinear };
+        enum class NibbleMap { Centered, Unsigned, NonLinear, IQ3S, IQ3XXS, IQ2XXS, IQ1S };
 
     public:
         /**
@@ -109,13 +109,18 @@ namespace llaminar2::cpu::native_quantised
             switch (weights.encoding)
             {
             case Encoding::ExpandedInt8:
-            case Encoding::IQ3SExpandedSourceScale:
+            case Encoding::UnsignedInt8:
             case Encoding::Q6KNativeDualScale:
+            case Encoding::CompactFiveBit:
             case Encoding::NibbleLUTSourceScale:
                 implemented = true;
                 break;
             case Encoding::NibbleLUT:
-                implemented = weights.codebook_id == 0 || weights.codebook_id == 4 || weights.codebook_id == 5;
+                implemented = weights.codebook_id == 0 || weights.codebook_id == 4 || weights.codebook_id == 5 ||
+                              weights.codebook_id == 12 || weights.codebook_id == 15 || weights.codebook_id == 16;
+                break;
+            case Encoding::UnsignedNibble:
+                implemented = weights.codebook_id == 0 || weights.codebook_id == 5;
                 break;
             case Encoding::CompactMultiScale:
                 switch (weights.codebook_id)
@@ -178,7 +183,7 @@ namespace llaminar2::cpu::native_quantised
          * @tparam WithMinimum Whether the program applies an additive minimum.
          * @return For the single-row SDOT leaf (DotProd, and the I8MM family's
          * lone row): 4 for the symmetric expanded encodings (ExpandedInt8
-         * without a minimum, IQ3SExpandedSourceScale); 2 for ExpandedInt8 with
+         * without a minimum, UnsignedInt8 without a minimum); 2 for ExpandedInt8 with
          * a minimum and for the nibble and Q6_K encodings. 1 (the strip walk)
          * for ASIMD, row-pair (SMMLA) tiles and shared-row tiles.
          * @details Every column keeps its own block/partition FP32 program, so
@@ -197,7 +202,7 @@ namespace llaminar2::cpu::native_quantised
             if constexpr (multi_scale::usesRowPairs<Ops>) return 1;
             else if constexpr (Rows != 1 || Ops::instruction == multi_scale::NEONByteDot::ASIMD) return 1;
             else if constexpr ((Physical == Encoding::ExpandedInt8 && !WithMinimum) ||
-                               Physical == Encoding::IQ3SExpandedSourceScale)
+                               (Physical == Encoding::UnsignedInt8 && !WithMinimum))
                 return 4;
             else return 2;
         }
@@ -310,11 +315,19 @@ namespace llaminar2::cpu::native_quantised
                 if (weights_.is_asymmetric)
                     return run<Ops, Policy, Encoding::ExpandedInt8, NibbleMap::Centered, true, Strips>();
                 return run<Ops, Policy, Encoding::ExpandedInt8, NibbleMap::Centered, false, Strips>();
-            case Encoding::IQ3SExpandedSourceScale:
-                return run<Ops, Policy, Encoding::IQ3SExpandedSourceScale, NibbleMap::Centered, false, Strips>();
+            case Encoding::UnsignedInt8:
+                if (weights_.is_asymmetric)
+                    return run<Ops, Policy, Encoding::UnsignedInt8, NibbleMap::Centered, true, Strips>();
+                return run<Ops, Policy, Encoding::UnsignedInt8, NibbleMap::Centered, false, Strips>();
             case Encoding::Q6KNativeDualScale:
                 return run<Ops, Policy, Encoding::Q6KNativeDualScale, NibbleMap::Centered, false, Strips>();
+            case Encoding::CompactFiveBit:
+                if (weights_.is_asymmetric)
+                    return run<Ops, Policy, Encoding::CompactFiveBit, NibbleMap::Unsigned, true, Strips>();
+                return run<Ops, Policy, Encoding::CompactFiveBit, NibbleMap::Centered, false, Strips>();
             case Encoding::NibbleLUTSourceScale:
+                if (weights_.codebook_id == 11)
+                    return run<Ops, Policy, Encoding::NibbleLUTSourceScale, NibbleMap::IQ3S, false, Strips>();
                 return run<Ops, Policy, Encoding::NibbleLUTSourceScale, NibbleMap::NonLinear, false, Strips>();
             case Encoding::NibbleLUT:
                 switch (weights_.codebook_id)
@@ -322,6 +335,16 @@ namespace llaminar2::cpu::native_quantised
                 case 0: return run<Ops, Policy, Encoding::NibbleLUT, NibbleMap::Centered, false, Strips>();
                 case 4: return run<Ops, Policy, Encoding::NibbleLUT, NibbleMap::NonLinear, false, Strips>();
                 case 5: return run<Ops, Policy, Encoding::NibbleLUT, NibbleMap::Unsigned, true, Strips>();
+                case 12: return run<Ops, Policy, Encoding::NibbleLUT, NibbleMap::IQ3XXS, false, Strips>();
+                case 15: return run<Ops, Policy, Encoding::NibbleLUT, NibbleMap::IQ2XXS, false, Strips>();
+                case 16: return run<Ops, Policy, Encoding::NibbleLUT, NibbleMap::IQ1S, true, Strips>();
+                }
+                break;
+            case Encoding::UnsignedNibble:
+                switch (weights_.codebook_id)
+                {
+                case 0: return run<Ops, Policy, Encoding::UnsignedNibble, NibbleMap::Centered, false, Strips>();
+                case 5: return run<Ops, Policy, Encoding::UnsignedNibble, NibbleMap::Unsigned, true, Strips>();
                 }
                 break;
             case Encoding::CompactMultiScale:
@@ -340,6 +363,14 @@ namespace llaminar2::cpu::native_quantised
         {
             if constexpr (Map == NibbleMap::NonLinear)
                 return vqtbl1q_s8(vld1q_s8(kvalues_iq4nl_i8), index);
+            else if constexpr (Map == NibbleMap::IQ3S)
+                return vqtbl1q_s8(vld1q_s8(kIQ3SDecodeLUT), index);
+            else if constexpr (Map == NibbleMap::IQ3XXS)
+                return vqtbl1q_s8(vld1q_s8(kIQ3XXSDecodeLUT), index);
+            else if constexpr (Map == NibbleMap::IQ2XXS)
+                return vqtbl1q_s8(vld1q_s8(kIQ2XXSDecodeLUT), index);
+            else if constexpr (Map == NibbleMap::IQ1S)
+                return vqtbl1q_s8(vld1q_s8(kIQ1SDecodeLUT), index);
             else if constexpr (Map == NibbleMap::Centered)
                 return vsubq_s8(vreinterpretq_s8_u8(index), vdupq_n_s8(8));
             else
@@ -449,6 +480,23 @@ namespace llaminar2::cpu::native_quantised
             return vsubq_s8(vreinterpretq_s8_u8(values), vdupq_n_s8(32));
         }
 
+        /** @brief Decode one CompactFiveBit group's five-bit source integers for four columns. */
+        template <NibbleMap Map>
+        static int8x16_t fiveBitGroup(const std::uint8_t *unit, int column, int group) noexcept
+        {
+            const auto raw = vld1q_u8(unit + (group % 4) * 256 + column * 4);
+            auto values = group < 4 ? vandq_u8(raw, vdupq_n_u8(15)) : vshrq_n_u8(raw, 4);
+            const auto *plane = unit + 1024 + group * 32 + (column / 16) * 8;
+            std::uint64_t bits = 0;
+            std::memcpy(&bits, plane, sizeof(bits));
+            const int shift = (column % 16) * 4;
+            values = vorrq_u8(values, q6Plane(static_cast<std::uint16_t>(bits >> shift), 16));
+            if constexpr (Map == NibbleMap::Centered)
+                return vsubq_s8(vreinterpretq_s8_u8(values), vdupq_n_s8(16));
+            else
+                return vreinterpretq_s8_u8(values);
+        }
+
         /**
          * @brief Compute one block's exact INT32 dots for every row with row-pair SMMLA.
          * @tparam Ops Admitted I8MM operation set.
@@ -484,7 +532,15 @@ namespace llaminar2::cpu::native_quantised
                 }
                 publishPairs<Ops>(high01, high23, high);
             }
-            else if constexpr (Physical == Encoding::NibbleLUT || Physical == Encoding::NibbleLUTSourceScale)
+            else if constexpr (Physical == Encoding::CompactFiveBit)
+            {
+#pragma GCC unroll 4
+                for (int group = 0; group < 8; group += 2)
+                    consumePair<Ops>(fiveBitGroup<Map>(unit, column, group),
+                        fiveBitGroup<Map>(unit, column, group + 1), block, group, low01, low23, low);
+            }
+            else if constexpr (Physical == Encoding::NibbleLUT || Physical == Encoding::NibbleLUTSourceScale ||
+                               Physical == Encoding::UnsignedNibble)
             {
                 // Low nibbles of byte groups q and q+1 are K groups q and q+1;
                 // their high nibbles are K groups q+4 and q+5.
@@ -498,6 +554,16 @@ namespace llaminar2::cpu::native_quantised
                     consumePair<Ops>(nibbles<Map>(vshrq_n_u8(raw0, 4)),
                         nibbles<Map>(vshrq_n_u8(raw1, 4)), block, group + 4, low01, low23, low);
                 }
+            }
+            else if constexpr (Physical == Encoding::UnsignedInt8)
+            {
+                const auto flip = vdupq_n_u8(0x80u);
+#pragma GCC unroll 4
+                for (int group = 0; group < 8; group += 2)
+                    consumePair<Ops>(
+                        vreinterpretq_s8_u8(veorq_u8(vld1q_u8(unit + group * 256 + column * 4), flip)),
+                        vreinterpretq_s8_u8(veorq_u8(vld1q_u8(unit + (group + 1) * 256 + column * 4), flip)),
+                        block, group, low01, low23, low);
             }
             else
             {
@@ -540,7 +606,8 @@ namespace llaminar2::cpu::native_quantised
 #endif
                 using I = typename Ops::I;
                 using F = typename Ops::F;
-                constexpr bool nibble = Physical == Encoding::NibbleLUT || Physical == Encoding::NibbleLUTSourceScale;
+                constexpr bool nibble = Physical == Encoding::NibbleLUT || Physical == Encoding::NibbleLUTSourceScale ||
+                                        Physical == Encoding::UnsignedNibble;
                 for (int column = 0; column < columns_; column += 4)
                 {
                     float32x4_t reduced[Rows]{};
@@ -579,6 +646,12 @@ namespace llaminar2::cpu::native_quantised
                                     else consume<Ops>(centered, block, group, high);
                                 }
                             }
+                            else if constexpr (Physical == Encoding::CompactFiveBit)
+                            {
+#pragma GCC unroll 8
+                                for (int group = 0; group < 8; ++group)
+                                    consume<Ops>(fiveBitGroup<Map>(unit, column, group), block, group, low);
+                            }
                             else if constexpr (nibble)
                             {
 #pragma GCC unroll 4
@@ -588,6 +661,15 @@ namespace llaminar2::cpu::native_quantised
                                     consume<Ops>(nibbles<Map>(vandq_u8(raw, vdupq_n_u8(15))), block, group, low);
                                     consume<Ops>(nibbles<Map>(vshrq_n_u8(raw, 4)), block, group + 4, low);
                                 }
+                            }
+                            else if constexpr (Physical == Encoding::UnsignedInt8)
+                            {
+                                const auto flip = vdupq_n_u8(0x80u);
+#pragma GCC unroll 8
+                                for (int group = 0; group < 8; ++group)
+                                    consume<Ops>(vreinterpretq_s8_u8(veorq_u8(
+                                        vld1q_u8(unit + group * 256 + column * 4), flip)),
+                                        block, group, low);
                             }
                             else
                             {
@@ -606,11 +688,11 @@ namespace llaminar2::cpu::native_quantised
                                 scale1 = scale0 * __builtin_convertvector(high_coefficient, F);
                                 scale0 = scale0 * __builtin_convertvector(low_coefficient, F);
                             }
-                            else if constexpr (Physical == Encoding::IQ3SExpandedSourceScale || Physical == Encoding::NibbleLUTSourceScale)
+                            else if constexpr (Physical == Encoding::NibbleLUTSourceScale)
                             {
                                 // The publication seal admitted every coefficient word.
                                 const I metadata = Ops::words(weights_.admittedMins(chunk_, block) + column);
-                                const I coefficient = Physical == Encoding::IQ3SExpandedSourceScale ? metadata * 2 + 1 : metadata - 32;
+                                const I coefficient = Map == NibbleMap::IQ3S ? metadata * 2 + 1 : metadata - 32;
                                 scale0 = scale0 * __builtin_convertvector(coefficient, F);
                             }
                             else if constexpr (WithMinimum)
@@ -716,7 +798,8 @@ namespace llaminar2::cpu::native_quantised
 #endif
             using I = typename Ops::I;
             using F = typename Ops::F;
-            constexpr bool nibble = Physical == Encoding::NibbleLUT || Physical == Encoding::NibbleLUTSourceScale;
+            constexpr bool nibble = Physical == Encoding::NibbleLUT || Physical == Encoding::NibbleLUTSourceScale ||
+                                    Physical == Encoding::UnsignedNibble;
             float32x4_t reduced[Rows][S]{};
             for (int partition = 0; partition < partitions_; ++partition)
             {
@@ -751,6 +834,20 @@ namespace llaminar2::cpu::native_quantised
                             }
                         }
                     }
+                    else if constexpr (Physical == Encoding::CompactFiveBit)
+                    {
+                        const auto blocks = activationBlocks<Ops>(block);
+                        forEachGroup<8>([&]<int Group>() __attribute__((always_inline)) {
+#pragma GCC unroll 4
+                            for (int strip = 0; strip < S; ++strip)
+                            {
+                                const auto w = std::bit_cast<I>(fiveBitGroup<Map>(unit, column0 + 4 * strip, Group));
+#pragma GCC unroll 4
+                                for (std::size_t row = 0; row < Rows; ++row)
+                                    low[row][strip] = Ops::template dotLane<Group>(low[row][strip], w, blocks[row]);
+                            }
+                        });
+                    }
                     else if constexpr (nibble)
                     {
                         // Each row's block is loaded once; every strip reads its groups by lane.
@@ -768,6 +865,22 @@ namespace llaminar2::cpu::native_quantised
                                     low[row][strip] = Ops::template dotLane<Group>(low[row][strip], low_nibbles, blocks[row]);
                                     low[row][strip] = Ops::template dotLane<Group + 4>(low[row][strip], high_nibbles, blocks[row]);
                                 }
+                            }
+                        });
+                    }
+                    else if constexpr (Physical == Encoding::UnsignedInt8)
+                    {
+                        const auto blocks = activationBlocks<Ops>(block);
+                        const auto flip = vdupq_n_u8(0x80u);
+                        forEachGroup<8>([&]<int Group>() __attribute__((always_inline)) {
+#pragma GCC unroll 4
+                            for (int strip = 0; strip < S; ++strip)
+                            {
+                                const auto weights = std::bit_cast<I>(vreinterpretq_s8_u8(
+                                    veorq_u8(vld1q_u8(unit + Group * 256 + (column0 + 4 * strip) * 4), flip)));
+#pragma GCC unroll 4
+                                for (std::size_t row = 0; row < Rows; ++row)
+                                    low[row][strip] = Ops::template dotLane<Group>(low[row][strip], weights, blocks[row]);
                             }
                         });
                     }
@@ -804,10 +917,10 @@ namespace llaminar2::cpu::native_quantised
                             scale1 = scale0 * __builtin_convertvector(high_coefficient, F);
                             scale0 = scale0 * __builtin_convertvector(low_coefficient, F);
                         }
-                        else if constexpr (Physical == Encoding::IQ3SExpandedSourceScale || Physical == Encoding::NibbleLUTSourceScale)
+                        else if constexpr (Physical == Encoding::NibbleLUTSourceScale)
                         {
                             const I metadata = Ops::words(weights_.admittedMins(chunk_, block) + column);
-                            const I coefficient = Physical == Encoding::IQ3SExpandedSourceScale ? metadata * 2 + 1 : metadata - 32;
+                            const I coefficient = Map == NibbleMap::IQ3S ? metadata * 2 + 1 : metadata - 32;
                             scale0 = scale0 * __builtin_convertvector(coefficient, F);
                         }
                         else if constexpr (WithMinimum)

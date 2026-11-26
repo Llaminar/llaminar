@@ -354,6 +354,14 @@ namespace llaminar2
         std::vector<RankOrderedNativeResources> rankOrderedResources() const;
         /** @return Whether this original communicator quoted the prepared small-row transport. */
         bool hasRankOrderedPeerPush() const noexcept { return !rank_ordered_resources_.empty(); }
+        /** @return Whether fused FP32-via-FP16 direct peer push is prepared and ready. */
+        bool supportsFusedFP32ViaFP16AllreduceMultiOnStreams() const noexcept;
+        /** @copydoc ICollectiveBackend::allreduceFP32ViaFP16MultiOnStreams */
+        bool allreduceFP32ViaFP16MultiOnStreams(
+            const std::vector<void *> &buffers,
+            size_t count,
+            const std::vector<void *> &streams,
+            const std::vector<NativeCollectiveRows> &live_rows = {});
         /** @copydoc ICollectiveBackend::prepareRankOrderedResources */
         bool prepareRankOrderedResources(const std::shared_ptr<PhysicalMemoryAuthority> &memory);
         /** @brief Retire the original model's peer attachment after its graph owner releases all readers. */

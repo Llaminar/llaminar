@@ -1028,6 +1028,15 @@ namespace llaminar2
         /// one unit; non-capturable stages and manual boundaries split it.
         DeviceGraphExecutor::GraphSegmentCache segment_cache;
 
+        /// Cached ExpertOverlay retained-parent plan keyed on graph topology generation.
+        /// Avoids walking all graph nodes with RTTI dynamic_casts on every steady decode replay.
+        uint64_t cached_retained_parent_topology_generation = 0;
+        const ComputeGraph *cached_retained_parent_graph = nullptr;
+        bool cached_retained_parent_valid = false;
+        bool cached_retained_parent_has_plan = false;
+        DeviceGraphExecutor::GraphReplayPlanPolicy cached_retained_parent_policy{};
+        DeviceGraphExecutor::RetainedParentCompositionHook cached_retained_parent_composer;
+
         /// GPU stream (from IWorkerGPUContext::defaultStream()) for kernel dispatch
         /// Set when gpu_graph is created; used by stages to dispatch on correct stream
         void *gpu_stream = nullptr;

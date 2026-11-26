@@ -13,6 +13,7 @@
 #include <set>
 #include "loaders/PreparedWeightStore.h"
 #include "kernels/cpu/gemm/CPUNativeQuantisedGemmKernel.h"
+#include "kernels/cpu/gemm/CPUNativeQuantisedGemv.h"
 #include "execution/compute_stages/stages/FusedQKVGEMMStage.h"
 #include "tensors/Tensors.h"
 #include "execution/local_execution/device/DeviceContext.h"

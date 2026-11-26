@@ -31,6 +31,17 @@ void cudaQwenSparseSelectPools(const QwenSparseIndexer &params, cudaStream_t str
  * @throws std::invalid_argument For invalid bindings/stream; std::runtime_error on native launch failure.
  */
 void cudaQwenSparseAttention(const QwenSparseAttention &params, cudaStream_t stream);
+/** @brief Enqueue native FP16 tiled selected-KV attention (8-part or 33-part) with FP32 online totals.
+ * @param params Native FP16 KV bindings, sealed arithmetic program, and exclusive partial scratch.
+ * @param stream Exact non-default CUDA producer/consumer stream.
+ * @throws std::invalid_argument For invalid bindings/alignment/stream; std::runtime_error on launch failure.
+ */
+void cudaQwenSparseFP16Attention(const QwenSparseAttention &params, cudaStream_t stream);
+/** @brief Enqueue only the FP16 tiled producer kernel (for fusion with RetainedQSAPostAttention).
+ * @param params Native FP16 KV bindings, sealed arithmetic program, and exclusive partial scratch.
+ * @param stream Exact non-default CUDA producer/consumer stream.
+ */
+void cudaQwenSparseFP16TilesOnly(const QwenSparseAttention &params, cudaStream_t stream);
 /** @brief Enqueue accepted raw-tail publication without changing the canonical frontier.
  * @param params Device-owned acceptance decision and persistent partial-key publication.
  * @param stream Exact non-default CUDA producer/consumer stream.

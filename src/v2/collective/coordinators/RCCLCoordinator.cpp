@@ -69,6 +69,37 @@ namespace llaminar2
     {
         return static_cast<hipError_t>(HipDeviceGuard::forceSetDevice(device_ordinal));
     }
+
+    /**
+     * @brief RAII guard restoring the calling thread's active HIP device.
+     *
+     * Multi-device collective submission loops iterate across all participant
+     * ordinals on the winning rendezvous thread. Restoring the caller's device
+     * prevents subsequent stream-captured kernel nodes on that thread from
+     * inheriting another participant's device ID (which makes the captured HIP
+     * graph multi-device and causes hipGraphInstantiate to fail).
+     */
+    class ScopedHipDeviceRestore final
+    {
+    public:
+        ScopedHipDeviceRestore() noexcept
+        {
+            valid_ = (hipGetDevice(&saved_device_) == hipSuccess && saved_device_ >= 0);
+        }
+        ~ScopedHipDeviceRestore() noexcept
+        {
+            if (valid_)
+            {
+                (void)selectHipDevice(saved_device_);
+            }
+        }
+        ScopedHipDeviceRestore(const ScopedHipDeviceRestore &) = delete;
+        ScopedHipDeviceRestore &operator=(const ScopedHipDeviceRestore &) = delete;
+
+    private:
+        int saved_device_ = -1;
+        bool valid_ = false;
+    };
 #endif
 
     // ============================================================================
@@ -257,16 +288,16 @@ namespace llaminar2
         try
         {
             const auto request = rank_ordered_request_;
-            // TP4 is the measured automatic regime. Explicit diagnostics can also
-            // qualify other widths through the same clique and ISA checks.
+            // Any complete P2P clique of >= 2 qualified gfx906 (60-CU MI50) GPUs
+            // uses the rank-ordered direct peer-push transport automatically.
             rank_ordered_push_selected_ = false;
             if (request == RankOrderedPeerPushRequest::Required ||
-                (request == RankOrderedPeerPushRequest::Automatic && device_ordinals.size() == 4))
+                (request == RankOrderedPeerPushRequest::Automatic && device_ordinals.size() >= 2))
             {
                 std::vector<DeviceId> cohort;
                 cohort.reserve(device_ordinals.size());
                 bool qualified_isa = true;
-                bool measured_cohort = device_ordinals.size() == 4;
+                bool measured_cohort = device_ordinals.size() >= 2;
                 for (const auto ordinal : device_ordinals)
                 {
                     cohort.push_back(DeviceId::rocm(ordinal));
@@ -1078,7 +1109,42 @@ namespace llaminar2
 
         const bool trace_device_state = debugEnv().validation.validate_gpu_ptrs;
         const size_t thread_hash = std::hash<std::thread::id>{}(std::this_thread::get_id());
+        ScopedHipDeviceRestore restore_caller_device;
         std::lock_guard<std::mutex> lock(direct_exec_mutex_);
+
+        if (rank_ordered_state_ == RankOrderedPreparationState::Ready &&
+            rank_ordered_attachment_ &&
+            (dtype == CollectiveDataType::FLOAT32 || dtype == CollectiveDataType::FLOAT16) &&
+            op == CollectiveOp::ALLREDUCE_SUM &&
+            count > 0 && count <= rankOrderedPushMaxElements)
+        {
+            for (int i = 0; i < num_devices_; ++i)
+            {
+                hipError_t err = selectHipDevice(device_ordinals_[i]);
+                if (err != hipSuccess)
+                {
+                    last_error_ = std::string("hipSetDevice failed: ") + hipGetErrorString(err);
+                    return false;
+                }
+                const bool accepted = (dtype == CollectiveDataType::FLOAT32)
+                    ? launchROCmPeerPushFP32(
+                          rank_ordered_attachment_->storage.at(i)->binding(),
+                          static_cast<const float *>(buffers[i]),
+                          static_cast<float *>(buffers[i]),
+                          nullptr, 1, count, nullptr, nullptr, streams[i])
+                    : launchROCmPeerPushFP16(
+                          rank_ordered_attachment_->storage.at(i)->binding(),
+                          buffers[i], buffers[i],
+                          nullptr, 1, count, nullptr, nullptr, streams[i]);
+                if (!accepted)
+                {
+                    last_error_ = "ROCm peer-push multi-stream allreduce enqueue failed";
+                    return false;
+                }
+            }
+            collective_performed_.store(true);
+            return true;
+        }
 
         rccl::ncclResult_t r = rccl::ncclGroupStart();
         if (r != rccl::ncclSuccess)
@@ -1144,6 +1210,90 @@ namespace llaminar2
         (void)dtype;
         (void)op;
         (void)streams;
+        last_error_ = "RCCL not available";
+        return false;
+#endif
+    }
+
+    bool RCCLCoordinator::supportsFusedFP32ViaFP16AllreduceMultiOnStreams() const noexcept
+    {
+#ifdef HAVE_RCCL
+        return initialized_.load() &&
+               rank_ordered_state_ == RankOrderedPreparationState::Ready &&
+               rank_ordered_attachment_ != nullptr;
+#else
+        return false;
+#endif
+    }
+
+    bool RCCLCoordinator::allreduceFP32ViaFP16MultiOnStreams(
+        const std::vector<void *> &buffers,
+        size_t count,
+        const std::vector<void *> &streams,
+        const std::vector<NativeCollectiveRows> &live_rows)
+    {
+#ifdef HAVE_RCCL
+        if (!initialized_.load())
+        {
+            last_error_ = "RCCLCoordinator not initialized";
+            return false;
+        }
+        if (buffers.size() != static_cast<size_t>(num_devices_) ||
+            streams.size() != static_cast<size_t>(num_devices_) ||
+            (!live_rows.empty() && live_rows.size() != static_cast<size_t>(num_devices_)))
+        {
+            last_error_ = "Buffer/stream/rows count does not match device count";
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(direct_exec_mutex_);
+        if (rank_ordered_state_ != RankOrderedPreparationState::Ready || !rank_ordered_attachment_)
+        {
+            last_error_ = "ROCm peer-push resources not ready for fused FP32-via-FP16 allreduce";
+            return false;
+        }
+        if (count == 0 || count > rankOrderedPushMaxElements)
+        {
+            last_error_ = "Fused FP32-via-FP16 peer-push count out of admitted range";
+            return false;
+        }
+        const bool use_rows = !live_rows.empty();
+        ScopedHipDeviceRestore restore_caller_device;
+        for (int i = 0; i < num_devices_; ++i)
+        {
+            if (!buffers[i] || !streams[i])
+            {
+                last_error_ = "Null buffer or stream in fused FP32-via-FP16 allreduce";
+                return false;
+            }
+            hipError_t err = selectHipDevice(device_ordinals_[i]);
+            if (err != hipSuccess)
+            {
+                last_error_ = std::string("hipSetDevice failed: ") + hipGetErrorString(err);
+                return false;
+            }
+            const bool accepted = launchROCmPeerPushFP32ViaFP16(
+                rank_ordered_attachment_->storage.at(i)->binding(),
+                static_cast<const float *>(buffers[i]),
+                static_cast<float *>(buffers[i]),
+                use_rows ? live_rows[i].rows().countOwner() : nullptr,
+                use_rows ? live_rows[i].rows().capacity() : 1,
+                use_rows ? live_rows[i].elementsPerRow() : count,
+                use_rows ? live_rows[i].payloadReceipt() : nullptr,
+                nullptr,
+                streams[i]);
+            if (!accepted)
+            {
+                last_error_ = "ROCm fused FP32-via-FP16 peer-push enqueue failed";
+                return false;
+            }
+        }
+        collective_performed_.store(true);
+        return true;
+#else
+        (void)buffers;
+        (void)count;
+        (void)streams;
+        (void)live_rows;
         last_error_ = "RCCL not available";
         return false;
 #endif
@@ -1250,7 +1400,61 @@ namespace llaminar2
 
         const bool trace_device_state = debugEnv().validation.validate_gpu_ptrs;
         const size_t thread_hash = std::hash<std::thread::id>{}(std::this_thread::get_id());
+        ScopedHipDeviceRestore restore_caller_device;
         std::lock_guard<std::mutex> lock(direct_exec_mutex_);
+
+        if (sidebands.empty() &&
+            rank_ordered_state_ == RankOrderedPreparationState::Ready &&
+            rank_ordered_attachment_ &&
+            (dtype == CollectiveDataType::FLOAT32 || dtype == CollectiveDataType::FLOAT16) &&
+            op == CollectiveOp::ALLREDUCE_SUM &&
+            count > 0 && count <= rankOrderedPushMaxElements)
+        {
+            const bool use_rows = !live_rows.empty();
+            bool rows_ok = !use_rows || live_rows.size() == static_cast<size_t>(num_devices_);
+            for (int i = 0; rows_ok && use_rows && i < num_devices_; ++i)
+                rows_ok = useNativeRankOrderedPush(true, live_rows[i].rows().capacity(), live_rows[i].elementsPerRow());
+            if (rows_ok)
+            {
+                for (int i = 0; i < num_devices_; ++i)
+                {
+                    hipError_t err = selectHipDevice(device_ordinals_[i]);
+                    if (err != hipSuccess)
+                    {
+                        last_error_ = std::string("hipSetDevice failed: ") + hipGetErrorString(err);
+                        return false;
+                    }
+                    const bool accepted = (dtype == CollectiveDataType::FLOAT32)
+                        ? launchROCmPeerPushFP32(
+                              rank_ordered_attachment_->storage.at(i)->binding(),
+                              static_cast<const float *>(buffers[i]),
+                              static_cast<float *>(buffers[i]),
+                              use_rows ? live_rows[i].rows().countOwner() : nullptr,
+                              use_rows ? live_rows[i].rows().capacity() : 1,
+                              use_rows ? live_rows[i].elementsPerRow() : count,
+                              use_rows ? live_rows[i].payloadReceipt() : nullptr,
+                              nullptr,
+                              streams[i])
+                        : launchROCmPeerPushFP16(
+                              rank_ordered_attachment_->storage.at(i)->binding(),
+                              buffers[i],
+                              buffers[i],
+                              use_rows ? live_rows[i].rows().countOwner() : nullptr,
+                              use_rows ? live_rows[i].rows().capacity() : 1,
+                              use_rows ? live_rows[i].elementsPerRow() : count,
+                              use_rows ? live_rows[i].payloadReceipt() : nullptr,
+                              nullptr,
+                              streams[i]);
+                    if (!accepted)
+                    {
+                        last_error_ = "ROCm peer-push sideband-free multi-stream allreduce enqueue failed";
+                        return false;
+                    }
+                }
+                collective_performed_.store(true);
+                return true;
+            }
+        }
 
         rccl::ncclResult_t r = rccl::ncclGroupStart();
         if (r != rccl::ncclSuccess)
@@ -1471,6 +1675,7 @@ namespace llaminar2
             }
         }
 
+        ScopedHipDeviceRestore restore_caller_device;
         std::lock_guard<std::mutex> lock(direct_exec_mutex_);
         rccl::ncclResult_t result = rccl::ncclGroupStart();
         if (result != rccl::ncclSuccess)
@@ -1732,6 +1937,30 @@ namespace llaminar2
                      << " stream=" << stream
                      << " comm=" << comm);
         }
+        if (rank_ordered_state_ == RankOrderedPreparationState::Ready &&
+            rank_ordered_attachment_ &&
+            dtype == CollectiveDataType::FLOAT32 &&
+            op == CollectiveOp::ALLREDUCE_SUM &&
+            count > 0 && count <= rankOrderedPushMaxElements)
+        {
+            const bool accepted = launchROCmPeerPushFP32(
+                rank_ordered_attachment_->storage.at(device_idx)->binding(),
+                static_cast<const float *>(buffer),
+                static_cast<float *>(buffer),
+                nullptr,
+                1,
+                count,
+                nullptr,
+                nullptr,
+                caller_stream);
+            if (!accepted)
+            {
+                last_error_ = "ROCm peer-push allreduce enqueue failed";
+                return false;
+            }
+            collective_performed_.store(true);
+            return true;
+        }
         rccl::ncclResult_t r = rccl::ncclAllReduce(
             buffer, buffer, count,
             toRcclDataTypeInt(toDataTypeInt(dtype)), toRcclRedOpInt(toOpInt(op)),
@@ -1822,6 +2051,27 @@ namespace llaminar2
             return false;
         }
 
+        if (rank_ordered_state_ == RankOrderedPreparationState::Ready &&
+            rank_ordered_attachment_ &&
+            dtype == CollectiveDataType::FLOAT32 &&
+            op == CollectiveOp::ALLREDUCE_SUM &&
+            count > 0 && count <= rankOrderedPushMaxElements)
+        {
+            const bool accepted = launchROCmPeerPushReduceFP32(
+                rank_ordered_attachment_->storage.at(device_idx)->binding(),
+                static_cast<const float *>(send_buf),
+                static_cast<float *>(recv_buf),
+                root,
+                count,
+                caller_stream);
+            if (!accepted)
+            {
+                last_error_ = "ROCm peer-push reduce enqueue failed";
+                return false;
+            }
+            collective_performed_.store(true);
+            return true;
+        }
         const rccl::ncclResult_t result = rccl::ncclReduce(
             send_buf,
             recv_buf,
@@ -2131,6 +2381,31 @@ namespace llaminar2
             last_error_ = std::string("RCCL live-row producer failed: ") + hipGetErrorString(producer_error);
             return false;
         }
+        if (operation == NativeRowCollective::AllReduce &&
+            rank_ordered_state_ == RankOrderedPreparationState::Ready &&
+            rank_ordered_attachment_ &&
+            dtype == CollectiveDataType::FLOAT32 &&
+            reduction == CollectiveOp::ALLREDUCE_SUM &&
+            useNativeRankOrderedPush(true, rows.rows().capacity(), rows.elementsPerRow()))
+        {
+            const bool accepted = launchROCmPeerPushFP32(
+                rank_ordered_attachment_->storage.at(participant)->binding(),
+                static_cast<const float *>(send),
+                static_cast<float *>(receive),
+                rows.rows().countOwner(),
+                rows.rows().capacity(),
+                rows.elementsPerRow(),
+                payload_bytes,
+                nullptr,
+                stream);
+            if (!accepted)
+            {
+                last_error_ = "ROCm peer-push native-rows allreduce enqueue failed";
+                return false;
+            }
+            collective_performed_.store(true);
+            return true;
+        }
         const auto native_op = operation == NativeRowCollective::AllGather ? rccl::ncclSum :
             toRcclRedOpInt(toOpInt(reduction));
         const auto result = rccl::nativeRows(operation, send, receive, rows,
@@ -2394,6 +2669,26 @@ namespace llaminar2
                      << " comm=" << comm);
         }
 
+        if (rank_ordered_state_ == RankOrderedPreparationState::Ready &&
+            rank_ordered_attachment_ &&
+            dtype == CollectiveDataType::FLOAT32 &&
+            count > 0 && count <= rankOrderedPushMaxElements)
+        {
+            const bool accepted = launchROCmPeerPushBroadcastFP32(
+                rank_ordered_attachment_->storage.at(device_idx)->binding(),
+                static_cast<const float *>(send_buf),
+                static_cast<float *>(recv_buf),
+                root,
+                count,
+                caller_stream);
+            if (!accepted)
+            {
+                last_error_ = "ROCm peer-push broadcast enqueue failed";
+                return false;
+            }
+            collective_performed_.store(true);
+            return true;
+        }
         rccl::ncclResult_t r = rccl::ncclBroadcast(
             send_buf,
             recv_buf,
@@ -2596,7 +2891,38 @@ namespace llaminar2
 
         const bool trace_device_state = debugEnv().validation.validate_gpu_ptrs;
         const size_t thread_hash = std::hash<std::thread::id>{}(std::this_thread::get_id());
+        ScopedHipDeviceRestore restore_caller_device;
         std::lock_guard<std::mutex> lock(direct_exec_mutex_);
+
+        if (rank_ordered_state_ == RankOrderedPreparationState::Ready &&
+            rank_ordered_attachment_ &&
+            dtype == CollectiveDataType::FLOAT32 &&
+            count > 0 && count <= rankOrderedPushMaxElements)
+        {
+            for (int i = 0; i < num_devices_; ++i)
+            {
+                hipError_t err = selectHipDevice(device_ordinals_[i]);
+                if (err != hipSuccess)
+                {
+                    last_error_ = std::string("hipSetDevice failed: ") + hipGetErrorString(err);
+                    return false;
+                }
+                const bool accepted = launchROCmPeerPushBroadcastFP32(
+                    rank_ordered_attachment_->storage.at(i)->binding(),
+                    static_cast<const float *>(send_buffers[i]),
+                    static_cast<float *>(recv_buffers[i]),
+                    root,
+                    count,
+                    streams[i]);
+                if (!accepted)
+                {
+                    last_error_ = "ROCm peer-push multi-stream broadcast enqueue failed";
+                    return false;
+                }
+            }
+            collective_performed_.store(true);
+            return true;
+        }
 
         rccl::ncclResult_t r = rccl::ncclGroupStart();
         if (r != rccl::ncclSuccess)

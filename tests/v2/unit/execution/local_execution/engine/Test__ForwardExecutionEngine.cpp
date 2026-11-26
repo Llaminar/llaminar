@@ -8,6 +8,7 @@
  */
 
 #include <gtest/gtest.h>
+#include "../../../SourceShardReader.h"
 #include <type_traits>
 #include <algorithm>
 #include <array>
@@ -88,12 +89,7 @@ namespace
 
     std::string readTextFile(const char *path)
     {
-        std::ifstream input(path);
-        if (!input)
-            return {};
-        std::ostringstream buffer;
-        buffer << input.rdbuf();
-        return buffer.str();
+        return llaminar2::test_support::readSourceFileOrFamily(path);
     }
 
     /**

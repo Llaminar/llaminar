@@ -49,7 +49,8 @@ public:
      */
     static NativeCooperativeKernelAdmission prepare(DeviceId device,const void* function,unsigned threads,
         std::size_t dynamic_shared,std::uint64_t generation,
-        NativeResidentLaunchPolicy policy=NativeResidentLaunchPolicy::Cooperative)
+        NativeResidentLaunchPolicy policy=NativeResidentLaunchPolicy::Cooperative,
+        NativeCoResidencyReservation co_residency=NativeCoResidencyReservation::none())
     {
         if(isGraphCaptureActive())throw std::logic_error("Cooperative program admission is forbidden during capture");
         if(!function||!threads||!generation)throw std::invalid_argument("Cooperative program has incomplete identity");
@@ -66,8 +67,10 @@ public:
 #endif
         if((policy!=NativeResidentLaunchPolicy::Cooperative&&policy!=NativeResidentLaunchPolicy::Ordinary)||
             (policy==NativeResidentLaunchPolicy::Cooperative&&!hardware.can_launch_cooperative)||threads>unsigned(hardware.maximum_threads_per_block)||
-            dynamic_shared>physical_shared||processors<=0)
+            dynamic_shared>physical_shared||processors<=0||
+            co_residency.reserved_processors>=unsigned(processors))
             throw std::invalid_argument("Cooperative program exceeds its admitted native physical capability");
+        const unsigned available_processors=unsigned(processors)-co_residency.reserved_processors;
         int current=-1;
         checked(NCK_RT(GetDevice)(&current),"cooperative program current device");
         if(current!=device.ordinal)throw std::logic_error("Cooperative program admission has a foreign current worker");
@@ -78,11 +81,12 @@ public:
             "cooperative program native occupancy");
         if(blocks<=0||attributes.maxThreadsPerBlock<int(threads)||attributes.localSizeBytes!=0||
             attributes.sharedSizeBytes>physical_shared-dynamic_shared||
-            std::uint64_t(processors)*unsigned(blocks)>std::numeric_limits<unsigned>::max())
+            std::uint64_t(available_processors)*unsigned(blocks)>std::numeric_limits<unsigned>::max())
             throw std::invalid_argument("Cooperative program has invalid residency or private memory");
-        return {device,function,generation,threads,dynamic_shared,unsigned(processors)*unsigned(blocks),
+        return {device,function,generation,threads,dynamic_shared,available_processors,
+            available_processors*unsigned(blocks),
             {unsigned(attributes.numRegs),unsigned(attributes.maxThreadsPerBlock),unsigned(blocks),
-             attributes.localSizeBytes,attributes.sharedSizeBytes},policy};
+             attributes.localSizeBytes,attributes.sharedSizeBytes},policy,co_residency};
     }
     /**
      * @brief Submit one exact native cooperative node, including during parent capture.

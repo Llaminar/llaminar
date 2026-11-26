@@ -2088,7 +2088,7 @@ namespace llaminar2
             cpu::native_quantised::CPUNativeQuantisedPackedWeights cpu_weights;
             ASSERT_TRUE(cpu::native_quantised::packWeightsCPUNativeQuantised(
                 tensor.get(), cpu_weights));
-            ASSERT_TRUE(cpu_weights.usesExpandedInt8());
+            ASSERT_TRUE(cpu_weights.usesCompactFiveBit());
             ASSERT_TRUE(cpu_weights.is_asymmetric);
             HostGpuExpertPackedProjection expected_gpu;
             std::string error;
@@ -2097,7 +2097,7 @@ namespace llaminar2
                 << error;
             ASSERT_EQ(
                 expected_gpu.codebook_id,
-                kNativeQuantisedExpandedInt8MinCodebook);
+                native_quantised_formats::Q5_1.codebook_id);
 
             const MoEOverlayRemoteProjectionIdentity promotion_identity{
                 .expected_epoch = promoted_epoch - 1,
@@ -2395,15 +2395,25 @@ namespace llaminar2
             // Original packing coordinates, not observed transfer writes,
             // determine every expected byte, including untouched padding.
             std::vector<std::uint8_t> expected_cpu_bytes(redemoted_cpu_bytes.size(), 0xa5u);
-            size_t live_bytes = 0;
-            for (size_t byte = 0; byte < expected_cpu_bytes.size(); ++byte)
-                if (test::expertTierExpandedCPUByteRow(cpu_weights, byte) < size_t(N))
-                {
-                    expected_cpu_bytes[byte] = cpu_weights.native_interleaved[byte];
-                    ++live_bytes;
-                }
-            EXPECT_EQ(demotion_wire_bytes, live_bytes);
-            EXPECT_LT(live_bytes, expected_cpu_bytes.size());
+            const auto demotion_layout = demotion_stream.deviceLayout();
+            auto gather_layout = demotion_layout;
+            gather_layout.direction = ExpertTierWeightConversionDirection::CpuToGpu;
+            std::size_t expected_wire_bytes = 0;
+            for (std::uint32_t first_unit = 0; first_unit < demotion_layout.unit_count;
+                 first_unit += demotion_layout.maximum_units_per_chunk)
+            {
+                const std::uint32_t units = std::min(
+                    demotion_layout.maximum_units_per_chunk,
+                    demotion_layout.unit_count - first_unit);
+                std::vector<std::uint8_t> chunk_wire(demotion_layout.chunkBytes(units, first_unit));
+                ASSERT_TRUE(gatherExpertTierCPUWeightChunk(
+                    gather_layout, cpu_weights.native_interleaved, first_unit, units, chunk_wire));
+                ASSERT_TRUE(scatterExpertTierCPUWeightChunk(
+                    demotion_layout, chunk_wire, first_unit, units, expected_cpu_bytes));
+                expected_wire_bytes += chunk_wire.size();
+            }
+            EXPECT_EQ(demotion_wire_bytes, expected_wire_bytes);
+            EXPECT_LT(expected_wire_bytes, expected_cpu_bytes.size());
             EXPECT_EQ(redemoted_cpu_bytes, expected_cpu_bytes);
             EXPECT_GT(promotion_chunks, 1u);
             EXPECT_GT(demotion_chunks, 1u);
@@ -2438,7 +2448,7 @@ namespace llaminar2
             cpu::native_quantised::CPUNativeQuantisedPackedWeights cpu_weights;
             ASSERT_TRUE(cpu::native_quantised::packWeightsCPUNativeQuantised(
                 tensor.get(), cpu_weights));
-            ASSERT_TRUE(cpu_weights.usesExpandedInt8());
+            ASSERT_TRUE(cpu_weights.usesCompactFiveBit());
             ASSERT_TRUE(cpu_weights.is_asymmetric);
 
             const auto manifest = makeCpuToGpuExpertTierWeightStreamManifest(
@@ -2452,7 +2462,7 @@ namespace llaminar2
             ASSERT_TRUE(layout.valid());
             ASSERT_EQ(
                 layout.gpu_codebook_id,
-                kNativeQuantisedExpandedInt8MinCodebook);
+                native_quantised_formats::Q5_1.codebook_id);
             const std::size_t blocks =
                 static_cast<std::size_t>(N) * (K / 32);
 
@@ -2547,7 +2557,7 @@ namespace llaminar2
             ASSERT_TRUE(redemotion_layout.valid());
             ASSERT_EQ(
                 redemotion_layout.gpu_codebook_id,
-                kNativeQuantisedExpandedInt8MinCodebook);
+                native_quantised_formats::Q5_1.codebook_id);
             const ExpertTierGpuConstProjectionView promoted_source_view{
                 .payload = promoted_payload.data(),
                 .scales = promoted_scales.data(),
@@ -3268,7 +3278,7 @@ namespace llaminar2
             }
             cpu::native_quantised::CPUNativeQuantisedPackedWeights cpu;
             ASSERT_TRUE(cpu::native_quantised::packWeightsCPUNativeQuantised(tensor.get(),cpu));
-            ASSERT_EQ(cpu.encoding,cpu::native_quantised::CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale);
+            ASSERT_EQ(cpu.encoding,cpu::native_quantised::CPUNativeQuantisedEncoding::NibbleLUTSourceScale);
             constexpr std::uint32_t first_unit = 1;
             const auto *format = native_quantised_formats::forSourceIdentity(11,true);
             ASSERT_NE(format,nullptr);
@@ -3276,7 +3286,7 @@ namespace llaminar2
             const auto demotion = probe.deviceLayout();
             const auto promotion = makeCpuToGpuExpertTierWeightStreamManifest(cpu,406,3,7,ExpertTierWeightProjection::Down,capacity_units).deviceLayout();
             ASSERT_TRUE(demotion.valid());ASSERT_TRUE(promotion.valid());
-            ASSERT_EQ(demotion.cpu_block_stride,2432u);ASSERT_EQ(promotion.gpu_codebook_id,11);
+            ASSERT_EQ(demotion.cpu_block_stride,1408u);ASSERT_EQ(promotion.gpu_codebook_id,11);
             const std::uint32_t units = demotion.unit_count - first_unit;
             TestHIPStream stream;
             TestHIPBuffer<std::uint8_t> input_payload(source.payload.size()),destination_payload(source.payload.size());
@@ -3362,7 +3372,7 @@ namespace llaminar2
             auto tensor=std::make_shared<IQ3_STensor>(std::vector<std::size_t>{N,K},bytes);
             cpu::native_quantised::CPUNativeQuantisedPackedWeights cpu;
             ASSERT_TRUE(cpu::native_quantised::packWeightsCPUNativeQuantised(tensor.get(),cpu));
-            ASSERT_EQ(cpu.encoding,cpu::native_quantised::CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale);
+            ASSERT_EQ(cpu.encoding,cpu::native_quantised::CPUNativeQuantisedEncoding::NibbleLUTSourceScale);
             const auto layout=makeCpuToGpuExpertTierWeightStreamManifest(cpu,407,3,7,ExpertTierWeightProjection::Down,2).deviceLayout();
             ASSERT_TRUE(layout.valid());ASSERT_EQ(layout.gpu_codebook_id,11);
             TestHIPBuffer<std::uint8_t> payload(8*13);
@@ -3410,6 +3420,90 @@ namespace llaminar2
                 EXPECT_EQ(actual_payload[sub*13+8],original.qh[sub]);
                 EXPECT_EQ(std::memcmp(actual_payload.data()+sub*13+9,original.signs+sub*4,4),0);
             }
+        }
+
+        /**
+         * @test Per-transfer timing capture toggles device timing events cleanly.
+         *
+         * Production PlacementChange waves pass `Disabled` on lanes materialized
+         * with timing events for calibration, avoiding ROCm `hipEventDefault`
+         * stalls while keeping `Enabled` and `LaneDefault` exact for calibration.
+         */
+        TEST_F(
+            ROCmExpertTierWeightKernelsTest,
+            PerTransferTimingCaptureDisabledSkipsDeviceTimingEvents)
+        {
+            constexpr std::size_t bytes = 16384u;
+            constexpr std::size_t staging_bytes = 4096u;
+            const DeviceId device = DeviceId::rocm(0);
+            const auto staging = TransferEngine::instance()
+                                     .allocatePersistentTransferStagingSlices(
+                                         staging_bytes, 2u, device);
+            const auto execution = ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(
+                TransferEngine::instance(), 1u, device,
+                "rocm_per_transfer_timing_capture_contract").front();
+
+            ExpertTierWeightTransferLane timed_lane({
+                .device = device,
+                .staging = staging[0],
+                .execution = execution,
+                .progress = BackgroundTransferProgressBinding::nativeStream(),
+                .lane_name = "rocm_timing_capture_timed",
+                .perf_device = "rocm:0",
+                .collect_timing_measurements = true,
+            });
+            ExpertTierWeightTransferLane untimed_lane({
+                .device = device,
+                .staging = staging[1],
+                .execution = execution,
+                .progress = BackgroundTransferProgressBinding::nativeStream(),
+                .lane_name = "rocm_timing_capture_untimed",
+                .perf_device = "rocm:0",
+                .collect_timing_measurements = false,
+            });
+            std::string error;
+            ASSERT_TRUE(timed_lane.materialize(&error)) << error;
+            ASSERT_TRUE(untimed_lane.materialize(&error)) << error;
+
+            std::vector<std::uint8_t> source(bytes);
+            for (std::size_t i = 0; i < bytes; ++i)
+                source[i] = static_cast<std::uint8_t>((i * 37u + 11u) & 0xffu);
+            TestHIPBuffer<std::uint8_t> destination_buf(bytes);
+            const ContiguousFloatingPointWeightDescriptor destination{
+                .data = destination_buf.data(),
+                .type = TensorType::FP16,
+                .n = 1,
+                .k = static_cast<int>(bytes / sizeof(std::uint16_t)),
+                .bytes = bytes,
+            };
+
+            // 1. Disabled on a timed lane omits device timing events while remaining byte-exact.
+            ASSERT_TRUE(timed_lane.startCpuToGpuContiguous(
+                source, destination, &error, ExpertTierDeviceTimingCapture::Disabled))
+                << error;
+            ASSERT_EQ(pollLaneToCompletion(timed_lane), ExpertTierWeightTransferProgress::Ready);
+            EXPECT_EQ(timed_lane.stats().last_measurement.device_nanoseconds, 0u);
+            EXPECT_GT(timed_lane.stats().last_measurement.wall_nanoseconds, 0u);
+            EXPECT_EQ(timed_lane.stats().timing_measurement_failures, 0u);
+
+            std::vector<std::uint8_t> observed;
+            ASSERT_EQ(destination_buf.download(observed), hipSuccess);
+            EXPECT_EQ(observed, source);
+
+            // 2. Enabled on the same timed lane captures positive device timing.
+            ASSERT_TRUE(timed_lane.startCpuToGpuContiguous(
+                source, destination, &error, ExpertTierDeviceTimingCapture::Enabled))
+                << error;
+            ASSERT_EQ(pollLaneToCompletion(timed_lane), ExpertTierWeightTransferProgress::Ready);
+            EXPECT_GT(timed_lane.stats().last_measurement.device_nanoseconds, 0u);
+            EXPECT_EQ(timed_lane.stats().timing_measurement_failures, 0u);
+
+            // 3. Requesting Enabled on an untimed lane fails fast before submission.
+            error.clear();
+            EXPECT_FALSE(untimed_lane.startCpuToGpuContiguous(
+                source, destination, &error, ExpertTierDeviceTimingCapture::Enabled));
+            EXPECT_FALSE(error.empty());
+            EXPECT_TRUE(untimed_lane.quiescent());
         }
     } // namespace
 } // namespace llaminar2

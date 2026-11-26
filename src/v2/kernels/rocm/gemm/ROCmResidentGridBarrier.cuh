@@ -37,6 +37,49 @@ struct ResidentGridBarrierFor {
         if(!words||phase>=Layout::phases)__builtin_trap();
         auto* arrival=words+Layout::words_per_phase*phase;
         auto* generation=arrival+1;
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__GFX9__)
+        // On gfx906, L1D is write-through to L2 (TCC), while scalar memory
+        // atomics and glc loads/stores execute directly in L2 without L1
+        // vector-atomic traffic. Using the exact two-word sense protocol avoids
+        // counter wraparound and preserves arbitrary gridDim.x reuse across replays.
+        const unsigned grid=__builtin_amdgcn_readfirstlane(gridDim.x);
+        __asm__ volatile("s_waitcnt vmcnt(0) lgkmcnt(0)" ::: "memory");
+        __asm__ volatile("s_barrier" ::: "memory");
+        if(threadIdx.x<64u)
+        {
+            unsigned before=0u;
+            __asm__ volatile("s_load_dword %0, %1, 0x0 glc\n\ts_waitcnt lgkmcnt(0)"
+                             : "=s"(before) : "s"(generation) : "memory");
+            unsigned ticket=1u;
+            __asm__ volatile("s_atomic_add %0, %1, 0x0 glc\n\ts_waitcnt lgkmcnt(0)"
+                             : "+s"(ticket) : "s"(arrival) : "memory");
+            if(ticket>=grid)__builtin_trap();
+            if(ticket+1u==grid)
+            {
+                unsigned zero=0u;
+                unsigned next=before^1u;
+                __asm__ volatile(
+                    "s_store_dword %0, %1, 0x0 glc\n\t"
+                    "s_waitcnt lgkmcnt(0)\n\t"
+                    "s_store_dword %2, %3, 0x0 glc\n\t"
+                    "s_waitcnt lgkmcnt(0)"
+                    :: "s"(zero), "s"(arrival), "s"(next), "s"(generation) : "memory");
+            }
+            else
+            {
+                while(true)
+                {
+                    unsigned cur=0u;
+                    __asm__ volatile("s_load_dword %0, %1, 0x0 glc\n\ts_waitcnt lgkmcnt(0)"
+                                     : "=s"(cur) : "s"(generation) : "memory");
+                    if(cur!=before)break;
+                    __builtin_amdgcn_s_sleep(1);
+                }
+            }
+            __asm__ volatile("buffer_wbinvl1_vol" ::: "memory");
+        }
+        __asm__ volatile("s_barrier" ::: "memory");
+#else
         __builtin_amdgcn_fence(__ATOMIC_RELEASE,"agent");
         __syncthreads();
         if(threadIdx.x==0)
@@ -55,7 +98,7 @@ struct ResidentGridBarrierFor {
             else
             {
                 while(__hip_atomic_load(generation,__ATOMIC_RELAXED,__HIP_MEMORY_SCOPE_AGENT)==before)
-                    __builtin_amdgcn_s_sleep(0);
+                    __builtin_amdgcn_s_sleep(1);
                 // Only waiters acquire the successful sense load. The final
                 // leader already acquired all arrivals before publishing sense.
                 __builtin_amdgcn_fence(__ATOMIC_ACQUIRE,"agent");
@@ -64,6 +107,7 @@ struct ResidentGridBarrierFor {
         // HIP's global+local workgroup release/barrier/acquire distributes
         // the leader's imported payload to every lane without another agent fence.
         __syncthreads();
+#endif
         ++phase;
     }
 };

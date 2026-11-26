@@ -28,7 +28,6 @@
 
 #include "backends/detail/GPUFlatGraphInspection.h"
 #include "CUDAGraphCapture.h"
-#include "MappedTransferServiceDevice.cuh"
 #include "NvidiaDeviceContext.h"
 #include "CUDADriverApi.h"
 #include "CUDABackend.h"
@@ -156,14 +155,6 @@ namespace llaminar2
                 __nanosleep(128u);
         }
 
-        /** @brief Consume a same-device release and reopen the word for the next ordered resident row. */
-        __global__ void waitResidentPacketAcquire64(std::uint64_t* signal, std::uint64_t value)
-        {
-            consumeResidentPacketAcquire64(signal, value);
-        }
-
-        enum class NativeAcquire64 { MappedPeer, ResidentPacket };
-
         /**
          * @brief Append one single-warp system-acquire wait at an exact frontier.
          * @return CUDA validation or graph construction status.
@@ -177,7 +168,7 @@ namespace llaminar2
             const cudaGraphNode_t *dependencies,
             std::size_t dependency_count,
             void *signal,
-            std::uint64_t value, NativeAcquire64 kind = NativeAcquire64::MappedPeer) noexcept
+            std::uint64_t value) noexcept
         {
             if (!node || !graph || !signal || value == 0u ||
                 (dependency_count > 0u && !dependencies) ||
@@ -187,9 +178,7 @@ namespace llaminar2
             auto *signal_argument = static_cast<std::uint64_t *>(signal);
             void *arguments[] = {&signal_argument, &value};
             cudaKernelNodeParams params{};
-            params.func = kind == NativeAcquire64::ResidentPacket
-                ? reinterpret_cast<void *>(waitResidentPacketAcquire64)
-                : reinterpret_cast<void *>(waitSystemAcquireValue64);
+            params.func = reinterpret_cast<void *>(waitSystemAcquireValue64);
             params.gridDim = dim3(1u, 1u, 1u);
             params.blockDim = dim3(1u, 1u, 1u);
             params.kernelParams = arguments;
@@ -364,105 +353,53 @@ namespace llaminar2
     }
 
     /** @copydoc CUDAEarlyPacketPublication::prepare */
-    void CUDAEarlyPacketPublication::prepare(void* stream, std::uint64_t* signal)
+    void CUDAEarlyPacketPublication::prepare(void* stream)
     {
         const auto native = static_cast<cudaStream_t>(stream);
         cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
-        if (!native || native == cudaStreamLegacy || native == cudaStreamPerThread || !signal ||
-            reinterpret_cast<std::uintptr_t>(signal) % alignof(std::uint64_t) != 0u ||
+        if (!native || native == cudaStreamLegacy || native == cudaStreamPerThread ||
             cudaStreamIsCapturing(native, &capture) != cudaSuccess || capture != cudaStreamCaptureStatusNone)
-            throw std::logic_error("CUDA early packet requires cold preparation of its original aligned device signal");
-        const auto reset = cudaMemsetAsync(signal, 0, sizeof(*signal), native);
-        if (reset != cudaSuccess)
-            throw std::runtime_error(std::string("CUDA early packet initialization failed: ") + cudaGetErrorString(reset));
+            throw std::logic_error("CUDA early packet requires cold preparation on its original stream");
         stream_ = native;
-        signal_ = signal;
         graph_ = nullptr;
         capture_id_ = 0;
         producer_frontier_.clear();
         packet_frontier_.clear();
     }
 
-    /** @copydoc CUDAEarlyPacketPublication::recordProducer */
-    void CUDAEarlyPacketPublication::recordProducer(void* stream, std::uint64_t* signal)
+    /** @copydoc CUDAEarlyPacketPublication::recordCompletedProducer */
+    void CUDAEarlyPacketPublication::recordCompletedProducer(void* stream)
     {
         const auto native = static_cast<cudaStream_t>(stream);
         const auto fork = readEarlyPacketFrontier(native);
-        if (!signal_ || signal != signal_ || native != stream_ || (graph_ == fork.graph && capture_id_ == fork.capture_id))
-            throw std::logic_error("CUDA early packet lost its cold-prepared signal or has multiple original producers");
+        if (native != stream_ || fork.nodes.empty() || (graph_ == fork.graph && capture_id_ == fork.capture_id))
+            throw std::logic_error("CUDA early packet requires one completed producer on its prepared capture stream");
         graph_ = fork.graph;
         capture_id_ = fork.capture_id;
-        producer_frontier_.clear();
-        if (!fork.nodes.empty())
-            producer_frontier_.assign(fork.nodes.begin(), fork.nodes.end());
+        producer_frontier_.assign(fork.nodes.begin(), fork.nodes.end());
         packet_frontier_.clear();
-    }
-
-    /** @copydoc CUDAResidentPacketAcquire::claimSignal */
-    std::uint64_t* CUDAResidentPacketAcquire::claimSignal(void* stream) const
-    {
-        if (stream != stream_ || claimed_)
-            throw std::logic_error("CUDA resident packet acquire requires exactly one owner on its original capture stream");
-        claimed_ = true;
-        return signal_;
     }
 
     /** @copydoc CUDAEarlyPacketPublication::recordConsumer */
     bool CUDAEarlyPacketPublication::recordConsumer(void* stream, const std::function<bool()>& record)
     {
-        if (!record)
-            throw std::invalid_argument("CUDA early packet requires its original consumer recorder");
-        return recordPacketConsumer(stream, false, [&](const auto*) { return record(); });
-    }
-
-    /** @copydoc CUDAEarlyPacketPublication::recordDispatchConsumer */
-    bool CUDAEarlyPacketPublication::recordDispatchConsumer(void* stream, std::size_t lane_count,
-        const std::function<bool(const CUDAResidentPacketAcquire*)>& record)
-    {
-        if (lane_count == 0)
-            throw std::invalid_argument("CUDA early packet dispatch requires a prepared lane");
-        return recordPacketConsumer(stream, lane_count == 1, record);
-    }
-
-    /** @copydoc CUDAEarlyPacketPublication::recordPacketConsumer */
-    bool CUDAEarlyPacketPublication::recordPacketConsumer(void* stream, bool inline_acquire,
-        const std::function<bool(const CUDAResidentPacketAcquire*)>& record)
-    {
         const auto native = static_cast<cudaStream_t>(stream);
         const auto primary = readEarlyPacketFrontier(native);
         if (!record || native != stream_ || primary.graph != graph_ || primary.capture_id != capture_id_ ||
-            primary.nodes.empty() || !signal_)
+            primary.nodes.empty() || producer_frontier_.empty())
             throw std::logic_error("CUDA early packet consumer crossed its original producer's native capture unit");
+
+        auto& fork = packet_frontier_.empty() ? producer_frontier_ : packet_frontier_;
         std::vector<cudaGraphNode_t> join(primary.nodes.begin(), primary.nodes.end());
-        const bool first_consumer = packet_frontier_.empty();
-        const bool dispatch_acquires = first_consumer && inline_acquire;
-        if (first_consumer && !dispatch_acquires)
-        {
-            // Keep the exact producer dependency, but append the acquire after the
-            // arithmetic entry has been recorded. CUDA uses node insertion
-            // order as a scheduling hint within a native graph.
-            cudaGraphNode_t acquire = nullptr;
-            const auto added = addSystemWaitValue64Node(&acquire, graph_, producer_frontier_.data(),
-                producer_frontier_.size(), signal_, 1u, NativeAcquire64::ResidentPacket);
-            if (added != cudaSuccess || !acquire)
-                throw std::runtime_error(std::string("CUDA early packet acquire failed: ") + cudaGetErrorString(added));
-            packet_frontier_.assign(1u, acquire);
-        }
         std::erase_if(join, [&](const auto node) {
-            return std::find(packet_frontier_.begin(), packet_frontier_.end(), node) != packet_frontier_.end();
+            return std::find(fork.begin(), fork.end(), node) != fork.end();
         });
         if (join.empty())
-            throw std::logic_error("CUDA early packet consumer lost the independent producer completion");
-        // A single metadata warp may authenticate its packet before the
-        // router releases this row. Multiple lanes and other consumers
-        // share one acquire node before they can read the canonical routes.
-        auto& fork = dispatch_acquires ? producer_frontier_ : packet_frontier_;
+            throw std::logic_error("CUDA early packet consumer lost the independent arithmetic completion");
+
         setEarlyPacketFrontier(native, fork, cudaStreamSetCaptureDependencies);
-        const CUDAResidentPacketAcquire acquire(native, signal_);
-        if (!record(dispatch_acquires ? &acquire : nullptr))
+        if (!record())
             return false;
-        if (dispatch_acquires && !acquire.claimed_)
-            throw std::logic_error("CUDA resident packet dispatch did not consume its readiness binding");
         const auto packet = readEarlyPacketFrontier(native);
         if (packet.graph != graph_ || packet.capture_id != capture_id_ || packet.nodes.empty() ||
             std::equal(packet.nodes.begin(), packet.nodes.end(), fork.begin(), fork.end()))
@@ -470,6 +407,11 @@ namespace llaminar2
         packet_frontier_.assign(packet.nodes.begin(), packet.nodes.end());
         setEarlyPacketFrontier(native, join, cudaStreamAddCaptureDependencies);
         return true;
+    }
+
+    std::shared_ptr<IEarlyPacketPublication> makeCUDAEarlyPacketPublication()
+    {
+        return std::make_shared<CUDAEarlyPacketPublication>();
     }
 
     bool appendCUDAActiveCaptureTimelinePublish64(

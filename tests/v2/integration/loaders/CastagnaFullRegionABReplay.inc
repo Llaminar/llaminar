@@ -558,18 +558,10 @@ void replayCastagnaFullRegionAB(DeviceId device,int member,ILocalTPContext& tp,s
             if(full_production&&arm==1) {
                 require(production==FullProductionHCProbe::MiddleRead?nodes.size()>=2u:nodes.size()==1u,
                     "full production final entry or complete middle collective/write graph");
-                if(retained) {
-                    const auto original = MoEIntermediateShardDescriptorDeclaration::fromOriginalFamily(source.fragment_family);
-                    const auto function = rocm::retainedM1HCFFNKernelFunction(
-                        FullNativeHCFFNOutputDemand::none(), MoESelectedDescriptorDemand::AcquiredBankOnly,
-                        {.routed_gate = original.nativeGateUpEnvelope().execution_codebook_mask,
-                         .routed_down = original.nativeDownEnvelope().execution_codebook_mask});
-                    require(function&&nodes.front().function_identity==reinterpret_cast<std::uintptr_t>(function)&&
-                        nodes.front().local_memory_bytes_per_thread==0&&nodes.front().block_x==1024,
-                        "actual retained closed capture and physical launch geometry");
-                } else {
-                    requireFullProductionHCBinding(*captures[arm],fullProductionHCFunction(source,shared,store,device),prefix[arm],*lanes[arm]);
-                }
+                const auto* expected_fn = fullProductionHCFunction(source,shared,store,device,0,retained);
+                require(expected_fn&&nodes.front().local_memory_bytes_per_thread==0&&nodes.front().block_x==1024,
+                    "actual canonical closed capture and physical launch geometry");
+                requireFullProductionHCBinding(*captures[arm],expected_fn,prefix[arm],*lanes[arm]);
             }
             if(arm>=2)require(nodes.size()==1&&nodes[0].function_identity==reinterpret_cast<std::uintptr_t>(
                 arm==2?admission.function:adapted_admission.function),"fork arm executes exactly admitted full kernel");

@@ -938,6 +938,27 @@ namespace llaminar2
         virtual bool supportsAllreduceMultiOnStreams() const { return false; }
 
         /**
+         * @brief Whether fused FP32->FP16->rank-ordered-sum->FP32 peer push is ready.
+         */
+        virtual bool supportsFusedFP32ViaFP16AllreduceMultiOnStreams() const noexcept { return false; }
+
+        /**
+         * @brief Execute fused FP32->FP16->rank-ordered-sum->FP32 across explicit streams.
+         */
+        virtual bool allreduceFP32ViaFP16MultiOnStreams(
+            const std::vector<void *> &buffers,
+            size_t count,
+            const std::vector<void *> &streams,
+            const std::vector<NativeCollectiveRows> &live_rows = {})
+        {
+            (void)buffers;
+            (void)count;
+            (void)streams;
+            (void)live_rows;
+            return false;
+        }
+
+        /**
          * @brief Submit a grouped allreduce completed by a host-observed ticket.
          *
          * This contract is reserved for explicit heterogeneous graph boundaries

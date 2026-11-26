@@ -90,3 +90,65 @@ __global__ void mappedHostCopyVectorKernel(
 __global__ void mappedHostCopyByteKernel(
     std::uint8_t *__restrict__ destination, const std::uint8_t *__restrict__ source, std::size_t bytes)
 { mappedHostCopyByteBody(destination, source, bytes); }
+
+/** @brief Device-facing descriptor for one fused single-block mapped copy + system release. */
+struct MappedHostCopyBatchPublishLaunch
+{
+    static constexpr std::uint32_t kMaxSegments = 6u;
+    void *dst[kMaxSegments] = {};
+    const void *src[kMaxSegments] = {};
+    std::size_t bytes[kMaxSegments] = {};
+    std::uint32_t segment_count = 0u;
+    std::uint64_t *publication_signal = nullptr;
+    std::uint64_t publication_value = 0u;
+};
+
+/**
+ * @brief Copy up to six bounded device regions to mapped host aliases and
+ *        release-publish one 64-bit timeline signal in a single block.
+ *
+ * Replaces up to six serial graph nodes (small header/route/hidden copies plus
+ * publishSystemReleaseValue64) for decode-sized tickets on both CUDA and ROCm.
+ */
+__global__ void mappedHostCopyBatchPublishKernel(MappedHostCopyBatchPublishLaunch launch)
+{
+    if (blockIdx.x != 0u)
+        return;
+    const std::uint32_t count = launch.segment_count <= MappedHostCopyBatchPublishLaunch::kMaxSegments
+        ? launch.segment_count
+        : MappedHostCopyBatchPublishLaunch::kMaxSegments;
+    for (std::uint32_t i = 0u; i < count; ++i)
+    {
+        void *const dst = launch.dst[i];
+        const void *const src = launch.src[i];
+        const std::size_t bytes = launch.bytes[i];
+        if (!dst || !src || bytes == 0u)
+            continue;
+        const bool vector_aligned =
+            (reinterpret_cast<std::uintptr_t>(dst) % alignof(uint4) == 0u) &&
+            (reinterpret_cast<std::uintptr_t>(src) % alignof(uint4) == 0u);
+        if (vector_aligned && bytes >= sizeof(uint4))
+        {
+            mappedHostCopyVectorBody(
+                static_cast<uint4 *>(dst),
+                static_cast<const uint4 *>(src),
+                bytes, 0u, 1u);
+        }
+        else
+        {
+            mappedHostCopyByteBody(
+                static_cast<std::uint8_t *>(dst),
+                static_cast<const std::uint8_t *>(src),
+                bytes, 0u, 1u);
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0u && launch.publication_signal)
+    {
+        // mappedSystemRelease64 emits a system-scope release store
+        // (st.release.sys on CUDA, __ATOMIC_RELEASE/__HIP_MEMORY_SCOPE_SYSTEM on HIP),
+        // which already orders all CTA writes synchronized by __syncthreads()
+        // without issuing a second redundant membar.sys stall.
+        mappedSystemRelease64(launch.publication_signal, launch.publication_value);
+    }
+}

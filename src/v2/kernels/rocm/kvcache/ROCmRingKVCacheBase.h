@@ -88,6 +88,8 @@ namespace llaminar2
         /** @brief Return the first canonical row, including recurrent-only caches. */
         const int *deviceSequenceCachedTokenCountPtr(int seq_idx = 0) const override;
         const int *deviceRingHeadPtr(int layer, int seq_idx = 0) const override;
+        int *mutableDeviceCachedTokenCountPtr(int layer, int seq_idx = 0) override;
+        int *mutableDeviceRingHeadPtr(int layer, int seq_idx = 0) override;
         /** @brief Exact canonical head/count prefix, excluding model rollback suffixes. */
         size_t deviceSequenceStateMetadataBytes() const override { return sequence_geometry_.checkpointBytes(); }
         size_t deviceSequenceStateCheckpointBytes() const override;

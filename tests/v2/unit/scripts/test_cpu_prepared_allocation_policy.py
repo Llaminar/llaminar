@@ -291,7 +291,7 @@ class CPUPreparedAllocationPolicyTests(unittest.TestCase):
     def test_actual_default_allocator_selectors_are_named_exact_and_count_bound(self):
         root=Path(__file__).resolve().parents[4]
         cases=(
-            ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp",
+            ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestratorRebalance.cpp",
              "DeviceGraphOrchestrator::ensureDeviceWorkspaceAllocated",r"workspace_allocator_\s*=\s*physical_memory_authority_\s*\?[^;]+;",
              "physical_memory_authority_"),
             ("src/v2/execution/local_execution/device/ReusableExecutionWorkspace.h",

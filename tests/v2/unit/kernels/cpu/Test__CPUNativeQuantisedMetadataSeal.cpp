@@ -52,15 +52,14 @@ std::size_t secondaryOffset(const CPUNativeQuantisedWeightView &view, int chunk,
 /** @return Whether the encoding owns a secondary metadata word. */
 bool hasSecondary(const CPUNativeQuantisedWeightView &view)
 {
-    return view.is_asymmetric || view.usesNibbleLUTSourceScale() || view.usesIQ3SExpandedSourceScale() ||
+    return view.is_asymmetric || view.usesNibbleLUTSourceScale() ||
         view.usesQ6KNativeDualScale() || view.usesCompactMultiScale();
 }
 
 /** @return Reserved-bit mask the former in-loop check enforced, or zero where none existed. */
 std::uint16_t reservedMask(const CPUNativeQuantisedWeightView &view)
 {
-    if (view.usesIQ3SExpandedSourceScale()) return 0xfff0u;
-    if (view.usesNibbleLUTSourceScale()) return 0xffc0u;
+    if (view.usesNibbleLUTSourceScale()) return view.codebook_id == 11 ? 0xfff0u : 0xffc0u;
     if (view.usesCompactMultiScale() && view.codebook_id == 13) return 0xff00u;
     return 0;
 }

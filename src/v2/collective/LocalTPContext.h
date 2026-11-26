@@ -554,6 +554,7 @@ namespace llaminar2
         std::vector<NativeCollectiveRows> grouped_onstream_allreduce_rows_;
         std::vector<bool> grouped_onstream_allreduce_seen_;
         bool grouped_onstream_allreduce_graph_capture_active_{false};
+        bool grouped_onstream_allreduce_fused_fp32_via_fp16_{false};
         size_t grouped_onstream_allreduce_sideband_count_{0};
         std::vector<LocalTPCollectiveSidebandBuffer> grouped_onstream_allreduce_reference_sidebands_;
         std::vector<std::vector<LocalTPCollectiveSidebandBuffer>> grouped_onstream_allreduce_sidebands_;
@@ -759,7 +760,8 @@ namespace llaminar2
                                                const std::string &stage_name,
                                                const std::string &precision,
                                                const std::vector<LocalTPCollectiveSidebandBuffer> *sidebands = nullptr,
-                                               const NativeCollectiveRows *live_rows = nullptr);
+                                               const NativeCollectiveRows *live_rows = nullptr,
+                                               bool fused_fp32_via_fp16 = false);
 
         /**
          * @brief Enqueue the required per-device asynchronous GPU allreduce.

@@ -53,6 +53,31 @@ inline bool hasMappedGPUCPUIntermediateShardTopology(const MoERoutedExpertPlacem
 }
 
 /**
+ * @brief Recognize any CUDA TieredOverlay topology eligible for retained M1 HC/FFN.
+ *
+ * Covers both GPU+CPU TensorSharded overlays (e.g. 2xCUDA+2xCPU) and heterogeneous
+ * GPU+GPU Apportioned overlays with a CUDA continuation domain (e.g. 2xCUDA+4xROCm,
+ * 1xCUDA+N*ROCm) where Tier 0 publishes original route slots from its runtime table.
+ */
+inline bool hasCUDAMappedRetainedM1OverlayTopology(const MoERoutedExpertPlacementPlan &plan)
+{
+    if (hasMappedGPUCPUIntermediateShardTopology(plan))
+        return true;
+    if (!plan.usesExpertOverlayAuthority() || plan.routed_tiers.empty() ||
+        plan.shared_expert_domain != plan.continuation_domain ||
+        plan.routed_tiers.front().domain != plan.continuation_domain)
+        return false;
+    const auto gpu = std::find_if(plan.domains.begin(), plan.domains.end(),
+        [&](const auto &domain) { return domain.name == plan.continuation_domain; });
+    if (gpu == plan.domains.end() || gpu->participants.empty() ||
+        gpu->routed_compute_policy != RoutedExpertComputePolicy::Apportioned)
+        return false;
+    return std::all_of(gpu->participants.begin(), gpu->participants.end(), [](const auto &member) {
+        return member.isGPU() && member.device_type == DeviceType::CUDA;
+    });
+}
+
+/**
  * @brief Check maintenance support of a GPU intermediate-shard graph.
  * @param mode Original serving maintenance request.
  * @param mapped_ticket Whether the admitted topology has a mapped GPU/CPU ticket owner.

@@ -388,6 +388,7 @@ if(HAVE_CUDA)
         # Eight independent objects expose real Ninja parallelism; the dispatch
         # TU preserves the single public ABI and contains no device templates.
         kernels/cuda/gemm/CUDANativeQuantisedGemvDispatch.cu
+        kernels/cuda/gemm/CUDANativeQuantisedGemvDispatchHeuristic.cpp
         kernels/cuda/gemm/CUDANativeQuantisedGemvShard0.cu
         kernels/cuda/gemm/CUDANativeQuantisedGemvShard1.cu
         kernels/cuda/gemm/CUDANativeQuantisedGemvShard2.cu
@@ -396,6 +397,16 @@ if(HAVE_CUDA)
         kernels/cuda/gemm/CUDANativeQuantisedGemvShard5.cu
         kernels/cuda/gemm/CUDANativeQuantisedGemvShard6.cu
         kernels/cuda/gemm/CUDANativeQuantisedGemvShard7.cu
+        kernels/cuda/gemm/CUDANativeQuantisedGemvShard8.cu
+        kernels/cuda/gemm/CUDANativeQuantisedGemvShard9.cu
+        kernels/cuda/gemm/CUDANativeQuantisedGemvShard10.cu
+        kernels/cuda/gemm/CUDANativeQuantisedGemvShard11.cu
+        kernels/cuda/gemm/CUDANativeQuantisedGemvShard12.cu
+        kernels/cuda/gemm/CUDANativeQuantisedGemvShard13.cu
+        kernels/cuda/gemm/CUDANativeQuantisedGemvShard14.cu
+        kernels/cuda/gemm/CUDANativeQuantisedGemvShard15.cu
+        kernels/cuda/gemm/CUDANativeQuantisedGemvShard16.cu
+        kernels/cuda/gemm/CUDANativeQuantisedGemvShard17.cu
         kernels/cuda/gemm/CUDATinyFP32ProjectionKernels.cu  # deterministic tiny FP32 M<=4 verifier projections
         # NativeQuantised prefill is physically sharded by codebook pair, like
         # decode: eight complete, deterministic modules behind one host-only
@@ -421,17 +432,31 @@ if(HAVE_CUDA)
         kernels/cuda/ops/CUDARowSelectKernels.cu      # Graph-capturable one-row hidden-state selection
         kernels/cuda/ops/CUDAVectorAddKernels.cu      # Vector add kernels (for collective reductions)
         kernels/cuda/ops/CUDATPRankOrderedReductionKernels.cu # Batch-invariant rank-ordered TP sums
-        kernels/cuda/ops/CUDASamplingKernels.cu        # Argmax + Top-K kernels for GPU-side sampling
+        kernels/cuda/ops/CUDASamplingKernels.cu        # Argmax + Top-K + Logit penalty kernels for GPU-side sampling
+        kernels/cuda/ops/CUDASamplingSpeculativeKernels.cu # Speculative verify + processed-logit sampling kernels
+        kernels/cuda/ops/CUDASamplingGenerationControlKernels.cu # Device generation control, commit boundary, MTP penalties
         kernels/cuda/ops/CUDACastKernels.cu            # FP32↔FP16 cast kernels for mixed-precision allreduce
         kernels/cuda/ops/CUDATPKVStateKernels.cu       # TP-local K/V state deinterleave for phase-split decode caches
         # Flash Attention 2 and Flash Decoding are physically sharded by family
         # and native KV type: seven complete, deterministic modules.
         kernels/cuda/attention/CUDAFlashAttentionShard0.cu
+        kernels/cuda/attention/CUDAFlashAttentionShard0_HighPVW.cu
         kernels/cuda/attention/CUDAFlashAttentionShard1.cu
+        kernels/cuda/attention/CUDAFlashAttentionShard1_HighPVW.cu
         kernels/cuda/attention/CUDAFlashAttentionShard2.cu
+        kernels/cuda/attention/CUDAFlashAttentionShard2_HighPVW.cu
         kernels/cuda/attention/CUDAFlashAttentionShard3.cu
+        kernels/cuda/attention/CUDAFlashAttentionShard3_PVW1.cu
+        kernels/cuda/attention/CUDAFlashAttentionShard3_PVW2.cu
+        kernels/cuda/attention/CUDAFlashAttentionShard3_PVW4.cu
         kernels/cuda/attention/CUDAFlashAttentionShard4.cu
+        kernels/cuda/attention/CUDAFlashAttentionShard4_PVW1.cu
+        kernels/cuda/attention/CUDAFlashAttentionShard4_PVW2.cu
+        kernels/cuda/attention/CUDAFlashAttentionShard4_PVW4.cu
         kernels/cuda/attention/CUDAFlashAttentionShard5.cu
+        kernels/cuda/attention/CUDAFlashAttentionShard5_PVW1.cu
+        kernels/cuda/attention/CUDAFlashAttentionShard5_PVW2.cu
+        kernels/cuda/attention/CUDAFlashAttentionShard5_PVW4.cu
         kernels/cuda/attention/CUDAFlashAttentionShard6.cu
         kernels/cuda/attention/CUDAQwenSparseAttention.cu # Flash Next selected-index attention
         kernels/cuda/kvcache/CUDARingKVCache.cu       # Ring buffer KV cache with O(1) eviction
@@ -442,6 +467,8 @@ if(HAVE_CUDA)
         kernels/cuda/gdn/CUDAGatedDeltaNetKernels.cu  # GDN recurrence, conv1d, GatedRMSNorm, OutputGate
         kernels/cuda/gemm/CUDAQ8ResidualCorrection.cu # Explicit two-term native Q8 activation projection
         kernels/cuda/qwen4exp/CUDAQwen4ExpKernels.cu # Flash Next residual and PLE primitives
+        kernels/cuda/qwen4exp/CUDARetainedGDN.cu     # Cooperative CUDA Full GDN Attention megakernel
+        kernels/cuda/qwen4exp/CUDARetainedQSA.cu     # Cooperative CUDA QSA Pre/Post Attention megakernels
         kernels/cuda/qwen4exp/CUDADiagnosticSnapshotCopy.cu
         kernels/cuda/qwen4exp/CUDAImmutableLookupKernels.cu
         kernels/cuda/qwen4exp/CUDAImmutableFixedHeadLookupKernels.cu
@@ -450,7 +477,15 @@ if(HAVE_CUDA)
         kernels/cuda/attention/CUDAQwen4ExpPLERetained.cu
         kernels/cuda/attention/CUDAQwen4ExpBranchConcat.cu
         # MoE (Mixture of Experts) kernels
-        kernels/cuda/moe/CUDAMoEKernels.cu            # MoE routing, gather, scatter, gate, swiglu
+        kernels/cuda/moe/CUDAMoEKernels.cu            # MoE grouped decode, floating MoE, rank bank, retained HC/FFN
+        kernels/cuda/moe/CUDARetainedHCFFNSuffixShard0.cu # Sharded CUDA retained FFN suffix (K/legacy/ExpandedInt8Min)
+        kernels/cuda/moe/CUDARetainedHCFFNSuffixShard1.cu # Sharded CUDA retained FFN suffix (IQ codebooks)
+        kernels/cuda/moe/CUDAMoEGroupedPrefillLaunchKernels.cu # MoE grouped prefill launch kernels
+        kernels/cuda/moe/CUDAMoERouterAndGatherKernels.cu # MoE router logits, softmax/top-k, gather/scatter, shared gate, swiglu
+        kernels/cuda/moe/CUDAMoEGroupingKernels.cu    # MoE token grouping, compaction, prefill LLEP assignment
+        kernels/cuda/moe/CUDAMoERebalancePlannerKernels.cu # MoE overlay rebalance planner & dynamic ownership controller
+        kernels/cuda/moe/CUDAMoERebalanceProjectionKernels.cu # MoE overlay rebalance command projection & LLEP materialization
+        kernels/cuda/moe/CUDAMoERebalanceApplyKernels.cu # MoE overlay rebalance payload pack/unpack & wave apply
         kernels/cuda/moe/CUDARouterQ8Prefill.cu       # Exact block32 INT8 tensor-core router prefill
         kernels/cuda/moe/CUDAMoEOverlayActivationPacketKernels.cu # Device-owned node-local sparse activation packets
         kernels/cuda/moe/CUDAMoEOverlayDeviceControllerKernels.cu # Node-local sole-controller lifecycle
@@ -486,6 +521,7 @@ if(HAVE_CUDA)
         backends/cuda/CUDADriverApi.cpp
         backends/cuda/CUDADiscoveryAdmission.cpp
         backends/cuda/CUDABackend.cu
+        backends/cuda/CUDABackendSampling.cu
         backends/cuda/CUDAHardwareMetadata.cu
         backends/cuda/CUDATensorValidation.cu
         backends/cuda/NvidiaDeviceContext.cu
@@ -694,8 +730,20 @@ if(HAVE_ROCM)
         kernels/rocm/gemm/ROCmQuantisedGemmKernel.hip           # Common INT8 GEMM utilities (quantization, scaling, memory)
         kernels/rocm/gemm/ROCmQuantisedGemmKernel_INT8_VNNI.hip # INT8 VNNI wide-tile V3+V7 kernels (gfx906)
         kernels/rocm/gemm/ROCmGemvKernel.hip               # GEMV kernel suite documentation index (split into files below)
-        kernels/rocm/gemm/ROCmGemvKernel_INT8_VNNI.hip    # INT8 VNNI GEMV/GEMM kernels for decode + prefill (gfx906)
-        kernels/rocm/gemm/ROCmGemvKernel_native_quantised.hip  # NativeQuantised 4-bit (Q4_0/IQ4_NL) GEMV kernels (gfx906)
+        kernels/rocm/gemm/ROCmGemvKernel_INT8_VNNI.hip    # INT8 VNNI direct/blockwise/LDS/prefill GEMV/GEMM kernels (gfx906)
+        kernels/rocm/gemm/ROCmGemvKernel_INT8_VNNI_fused.hip # INT8 VNNI fused/scatter/self-reduce/batched GEMV kernels (gfx906)
+        kernels/rocm/gemm/ROCmGemvKernel_native_quantised.hip         # NativeQuantised M=1 GEMV + policy/IQ fanout
+        kernels/rocm/gemm/ROCmGemvKernel_native_quantised_small_m.hip # NativeQuantised small-M & batched verifier GEMV
+        kernels/rocm/gemm/ROCmMoEGroupedDecodeKernels.hip             # NativeQuantised grouped MoE decode kernels
+        kernels/rocm/gemm/ROCmResidentMoEFFNShard0.hip                # Resident MoE FFN shard 0 (groups 1..8)
+        kernels/rocm/gemm/ROCmResidentMoEFFNShard1.hip                # Resident MoE FFN shard 1 (groups 9..15)
+        kernels/rocm/gemm/ROCmPersistentHCRead.hip                    # PersistentHCRead & CTA-owned HC read
+        kernels/rocm/gemm/ROCmNativeLayoutRouterFFNShard0.hip         # Native-layout router FFN shard 0 (groups 1..5)
+        kernels/rocm/gemm/ROCmNativeLayoutRouterFFNShard1.hip         # Native-layout router FFN shard 1 (groups 6..10)
+        kernels/rocm/gemm/ROCmNativeLayoutRouterFFNShard2.hip         # Native-layout router FFN shard 2 (groups 11..15)
+        kernels/rocm/gemm/ROCmFullNativeHCFFNShard0.hip               # Full native HC/FFN shard 0 (groups 1..5)
+        kernels/rocm/gemm/ROCmFullNativeHCFFNShard1.hip               # Full native HC/FFN shard 1 (groups 6..10)
+        kernels/rocm/gemm/ROCmFullNativeHCFFNShard2.hip               # Full native HC/FFN shard 2 (groups 11..15)
         # NativeQuantised prefill is physically sharded by codebook pair so LLVM can
         # optimize all format families concurrently instead of serializing one
         # multi-minute translation unit.
@@ -712,7 +760,13 @@ if(HAVE_ROCM)
         kernels/rocm/gemm/ROCmNativeQuantisedVerifierWmma.hip # Native grouped verifier
         kernels/rocm/gemm/ROCmNativeQuantisedWmma.hip # Independent native gfx1100 WMMA compilation
         kernels/rocm/gemm/ROCmSmallNFP32ProjectionKernels.hip # Graph-capturable FP32 small-output projection kernels
-        kernels/rocm/gemm/ROCmMoEGroupedPrefillKernels.hip    # Grouped MoE prefill pipeline (graph-capturable, all experts single launch)
+        kernels/rocm/gemm/ROCmMoEGroupedPrefillKernels.hip    # Grouped MoE prefill pipeline coordinator
+        kernels/rocm/gemm/ROCmMoEGroupedPrefillShard0.hip     # Grouped MoE prefill shard 0 (Q4_0, IQ4_NL, IQ4_XS)
+        kernels/rocm/gemm/ROCmMoEGroupedPrefillShard1.hip     # Grouped MoE prefill shard 1 (Q4_1, Q5_0, Q5_1)
+        kernels/rocm/gemm/ROCmMoEGroupedPrefillShard2.hip     # Grouped MoE prefill shard 2 (Q6_K, Q3_K, Q2_K)
+        kernels/rocm/gemm/ROCmMoEGroupedPrefillShard3.hip     # Grouped MoE prefill shard 3 (IQ3_S, IQ3_XXS, IQ2_S)
+        kernels/rocm/gemm/ROCmMoEGroupedPrefillShard4.hip     # Grouped MoE prefill shard 4 (IQ2_XS, IQ2_XXS, IQ1_S)
+        kernels/rocm/gemm/ROCmMoEGroupedPrefillShard5.hip     # Grouped MoE prefill shard 5 (IQ1_M, Q8_0, EXPANDED_INT8_MIN)
         kernels/rocm/moe/ROCmMoEGroupedIntermediateExchange.hip # lossless SwiGLU/scales exchange boundary
         kernels/rocm/attention/ROCmFlashAttentionKernels.hip  # Flash Attention 2 + Flash Decoding for MI50
         kernels/rocm/attention/ROCmQwenSparseAttention.hip # Flash Next selected-index attention
@@ -727,7 +781,9 @@ if(HAVE_ROCM)
         kernels/rocm/ops/ROCmRowSelectKernels.hip            # Graph-capturable one-row hidden-state selection
         kernels/rocm/ops/ROCmResidualAddKernels.hip          # Residual Add kernels (FP32, BF16, FP16)
         kernels/rocm/ops/ROCmArgmaxKernels.hip               # Argmax kernel for GPU-side greedy sampling
-        kernels/rocm/ops/ROCmSamplingKernels.hip              # Top-K kernel for GPU-side top-k/top-p sampling
+        kernels/rocm/ops/ROCmSamplingKernels.hip              # Top-K + Logit penalty kernels for GPU-side sampling
+        kernels/rocm/ops/ROCmSamplingSpeculativeKernels.hip   # Speculative verify + processed-logit sampling kernels
+        kernels/rocm/ops/ROCmSamplingGenerationControlKernels.hip # Device generation control, commit boundary, rebalance tickets
         kernels/rocm/ops/ROCmFusedOpsKernels.hip              # Fused Residual+RMSNorm, Fused SwiGLU+Quant kernels
         kernels/rocm/ops/ROCmCastKernels.hip                  # FP32↔FP16 cast kernels for mixed-precision allreduce
         kernels/rocm/ops/ROCmTPKVStateKernels.hip             # TP-local K/V state deinterleave for phase-split decode caches
@@ -746,9 +802,20 @@ if(HAVE_ROCM)
         kernels/rocm/ops/ROCmTPRankOrderedReductionKernels.hip # Batch-invariant rank-ordered TP sums
         # MoE (Mixture of Experts) kernels
         kernels/rocm/moe/ROCmRouterQ8Prefill.hip             # Native gfx1100 exact router tiles
-        kernels/rocm/moe/ROCmMoEKernels.hip                  # MoE routing, gather, scatter, gate, swiglu
-        kernels/rocm/gemm/retained_hc_ffn/ROCmRetainedM1HCFFNDevice.hip
+        kernels/rocm/moe/ROCmMoEKernels.hip                  # MoE token grouping, prefill LLEP, floating MoE, pointer staging
+        kernels/rocm/moe/ROCmMoERouterAndGatherKernels.hip   # MoE router logits, softmax/top-k, gather/scatter, shared gate, swiglu
+        kernels/rocm/moe/ROCmMoERebalancePlannerKernels.hip  # MoE overlay rebalance planner & dynamic ownership controller
+        kernels/rocm/moe/ROCmMoERebalanceProjectionKernels.hip # MoE overlay rebalance command projection & LLEP materialization
+        kernels/rocm/moe/ROCmMoERebalanceApplyKernels.hip    # MoE overlay rebalance payload pack/unpack & wave apply
         kernels/rocm/gemm/retained_hc_ffn/RetainedPreAttentionDevice.hip
+        kernels/rocm/qwen4exp/ROCmRetainedQSA.hip
+        kernels/rocm/gemm/ROCmFastFullNativeHCFFNShard0.hip
+        kernels/rocm/gemm/ROCmFastFullNativeHCFFNShard1a.hip
+        kernels/rocm/gemm/ROCmFastFullNativeHCFFNShard1b.hip
+        kernels/rocm/gemm/ROCmFastFullNativeHCFFNShard2.hip
+        kernels/rocm/gemm/ROCmFastMappedHCFFNPrefix.hip
+        kernels/rocm/moe/ROCmMappedFollowerMoEShard0.hip
+        kernels/rocm/moe/ROCmMappedFollowerMoEShard1.hip
         kernels/rocm/moe/ROCmMoEOverlayActivationPacketKernels.hip # Device-owned node-local sparse activation packets
         kernels/rocm/moe/ROCmMoEOverlayDeviceControllerKernels.hip # Node-local sole-controller lifecycle
         backends/rocm/PlanningGPUClockMarker.hip # Bounded startup fixed-clock timing
@@ -776,6 +843,7 @@ if(HAVE_ROCM)
         backends/rocm/ROCmRuntimeStartup.cpp
         backends/rocm/ROCmHardwareMetadata.cpp
         backends/rocm/ROCmBackend.cpp
+        backends/rocm/ROCmBackendSampling.cpp
         backends/rocm/ROCmTensorValidation.cpp
         backends/rocm/AMDDeviceContext.cpp
         backends/rocm/AMDContextFactory.cpp
@@ -850,6 +918,7 @@ if(HAVE_ROCM)
     #   is compiled with HIP to access hip/hip_runtime.h
     set_source_files_properties(
         backends/rocm/ROCmBackend.cpp
+        backends/rocm/ROCmBackendSampling.cpp
         backends/rocm/ROCmTensorValidation.cpp
         backends/ROCmEnumeration.cpp
         collective/backends/HostBackendROCm.cpp
@@ -1468,6 +1537,9 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     backends/CPUExecutionGeometry.cpp
     backends/NativeGraphDependencyReduction.cpp
     kernels/cpu/gemm/CPUProjectionWorkspaceContract.cpp
+    kernels/cpu/gemm/CPUNativeQuantisedDecodePolicyLookup.cpp
+    kernels/cpu/gemm/CPUNativeQuantisedVerifierPolicyLookup.cpp
+    kernels/cpu/gemm/CPUNativeQuantisedGemmKernel.cpp
     kernels/cpu/gemm/CPUNativeQuantisedStandaloneMoE.cpp
     backends/InventoryPrinter.cpp
     backends/PCIeEnumeration.cpp
@@ -1505,6 +1577,8 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/compute_stages/stages/SendActivationsStage.cpp
     execution/compute_stages/stages/ReceiveActivationsStage.cpp
     execution/compute_stages/stages/MoEExpertComputeStage.cpp
+    execution/compute_stages/stages/MoEExpertComputeStagePrefill.cpp
+    execution/compute_stages/stages/MoEExpertComputeStageOverlay.cpp
     execution/compute_stages/stages/MoEIntermediateShardPipeline.cpp
     execution/compute_stages/stages/MoECPUExpertShardRouteStage.cpp
     execution/compute_stages/stages/MoEOverlayPinnedRouteEvidenceViews.cpp
@@ -1525,6 +1599,9 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/compute_stages/stages/GatedRMSNormStage.cpp
     execution/compute_stages/stages/GDNProjectionStage.cpp
     execution/compute_stages/stages/qwen4exp/RetainedGDNPreAttentionStage.cpp
+    execution/compute_stages/stages/qwen4exp/RetainedCUDAGDNStage.cpp
+    execution/compute_stages/stages/qwen4exp/RetainedCUDAQSAAttentionStage.cpp
+    execution/compute_stages/stages/qwen4exp/RetainedROCmQSAAttentionStage.cpp
     execution/compute_stages/stages/ShortConv1dStage.cpp
     execution/compute_stages/stages/GDNRecurrenceStage.cpp
     execution/compute_stages/stages/GDNLiveStateAllGatherStage.cpp
@@ -1598,6 +1675,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/moe/MoEOverlayHostAuthorityDeviceBankPublisher.cpp
     execution/moe/MoEOverlayDeviceControllerGraphService.cpp
     execution/moe/MoEOverlayResidencyAuthority.cpp
+    execution/moe/MoEOverlayResidencyAuthorityPlanning.cpp
     execution/moe/MoEOverlayCPUHostMaintenance.cpp
     execution/moe/MoEOverlayResidencySetup.cpp
     execution/moe/MoEPipelinePreparedPlan.cpp
@@ -1616,6 +1694,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/moe/MoEOverlayTierMigrationTransport.cpp
     execution/moe/MoEOverlayParticipantMigration.cpp
     execution/moe/MoEOverlayPhysicalResidencyFabric.cpp
+    execution/moe/MoEOverlayPhysicalResidencyFabricOperations.cpp
     execution/moe/CpuExpertSlotPool.cpp
     execution/moe/MoEOverlayPreparedWeightSource.cpp
     execution/moe/ExpertTierWeightStream.cpp
@@ -1627,6 +1706,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/moe/MoEExpertOverlayExecutionPlan.cpp
     execution/moe/MoEGraphRoleRunner.cpp
     execution/moe/MoEOverlayParticipantGraphRunner.cpp
+    execution/moe/MoEOverlayParticipantGraphRunnerExecution.cpp
     execution/moe/MoEExpertOverlayPreparationPlan.cpp
     execution/moe/ExpertShardSourceSelection.cpp
     execution/moe/MoEOverlayNoPeerResidency.cpp
@@ -1698,7 +1778,11 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/compute_stages/stages/HiddenStateRowsSelectStage.cpp
     execution/compute_stages/stages/LMHeadStage.cpp
     execution/local_execution/graph/DeviceGraphCaptureController.cpp
+    execution/local_execution/graph/DeviceGraphCaptureControllerPhases.cpp
     execution/local_execution/graph/ComputeGraph.cpp
+    execution/local_execution/graph/GraphComposer.cpp
+    execution/local_execution/graph/HeterogeneousOverlaySection.cpp
+    execution/local_execution/graph/LocalMegakernelLowering.cpp
     execution/local_execution/graph/DeviceExecutionTimeline.cpp
     execution/local_execution/graph/StageVerifier.cpp
     execution/local_execution/graph/DeviceGraphExecutor.cpp
@@ -1715,6 +1799,19 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/local_execution/model/LayerExecutor.cpp
     execution/local_execution/model/ModelExecutor.cpp
     execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp
+    execution/local_execution/orchestrators/DeviceGraphOrchestratorTopology.cpp
+    execution/local_execution/orchestrators/DeviceGraphOrchestratorRebalance.cpp
+    execution/local_execution/orchestrators/DeviceGraphOrchestratorForward.cpp
+    execution/local_execution/orchestrators/DeviceGraphOrchestratorMTPGraph.cpp
+    execution/local_execution/orchestrators/DeviceGraphOrchestratorMTPShifted.cpp
+    execution/local_execution/orchestrators/DeviceGraphOrchestratorMTPCommit.cpp
+    execution/local_execution/orchestrators/DeviceGraphOrchestratorLiveState.cpp
+    execution/local_execution/orchestrators/DeviceGraphOrchestratorPrefixCache.cpp
+    execution/local_execution/orchestrators/DeviceGraphOrchestratorPrefixRestore.cpp
+    execution/local_execution/orchestrators/DeviceGraphOrchestratorSampling.cpp
+    execution/local_execution/orchestrators/DeviceGraphOrchestratorDiagnostics.cpp
+    execution/local_execution/orchestrators/DeviceGraphOrchestratorOverlay.cpp
+    execution/local_execution/orchestrators/DeviceGraphOrchestratorRuntime.cpp
     execution/local_execution/orchestrators/DeviceGraphOrchestratorPLE.cpp
     execution/local_execution/orchestrators/DeviceGraphOrchestratorMovement.cpp
     execution/local_execution/orchestrators/DeviceGraphOrchestratorGeneration.cpp
@@ -1733,6 +1830,9 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/local_execution/orchestrators/LogitsGatherer.cpp
     execution/local_execution/orchestrators/DeviceSampler.cpp
     execution/local_execution/orchestrators/RankOrchestrator.cpp
+    execution/local_execution/orchestrators/RankOrchestratorForward.cpp
+    execution/local_execution/orchestrators/RankOrchestratorMTP.cpp
+    execution/local_execution/orchestrators/RankOrchestratorOverlay.cpp
     execution/local_execution/orchestrators/RankOrchestratorMovement.cpp
     execution/local_execution/orchestrators/RankOrchestratorConfig.cpp
     execution/local_execution/model/HeterogeneousLayerExecutor.cpp
@@ -1907,6 +2007,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     models/ModelGenerationPolicy.cpp
     loaders/ModelContextConfig.cpp
     loaders/WeightManager.cpp
+    loaders/WeightManagerPreloadAndShard.cpp
     loaders/PreparedOverlaySourceRetirement.cpp
     loaders/WeightSlicer.cpp
     loaders/WeightPlacementMap.cpp
@@ -1942,6 +2043,8 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     models/qwen35/Qwen35GraphConfigBuilder.cpp
     # Qwen3.5 MoE (hybrid GDN + Full Attention + Mixture of Experts)
     models/qwen35moe/Qwen35MoEGraph.cpp
+    models/qwen35moe/Qwen35MoEGraphFFN.cpp
+    models/qwen35moe/Qwen35MoEGraphOverlay.cpp
     models/qwen35moe/Qwen35MoEGraphConfigBuilder.cpp
     # Qwen3.8 Flash Next: authenticated geometry and native residual/PLE primitives.
     models/qwen4exp/Qwen4ExpConfig.cpp
@@ -2027,6 +2130,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     kernels/cpu/CPURingKVCache.cpp
     # Vectorized primitives (ported from V1)
     kernels/cpu/primitives/RoPEPrimitives.cpp
+    kernels/cpu/primitives/RoPEPrimitivesQ16.cpp
     kernels/cpu/primitives/RMSNormPrimitives.cpp
     kernels/cpu/primitives/SwiGLUPrimitives.cpp
     kernels/cpu/primitives/VectorPrimitives.cpp
@@ -2133,6 +2237,11 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/runner/ModelContextRetirement.cpp
     execution/runner/ContinuationRequestGroup.cpp
     execution/runner/OrchestrationRunner.cpp
+    execution/runner/OrchestrationRunnerPrefillAndBatch.cpp
+    execution/runner/OrchestrationRunnerMTP.cpp
+    execution/runner/OrchestrationRunnerMTPHelpers.cpp
+    execution/runner/OrchestrationRunnerOverlay.cpp
+    execution/runner/OrchestrationRunnerRuntime.cpp
     execution/runner/MTPStochasticVerificationOwner.cpp
     execution/runner/OrchestrationRunnerFactory.cpp
     execution/global/NamedDomainGraphBuilder.cpp
@@ -2140,6 +2249,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     snapshots/SnapshotCapture.cpp
     # Forward execution engine (Phase 3: extracted from DeviceGraphOrchestrator)
     execution/local_execution/engine/ForwardExecutionEngine.cpp
+    execution/local_execution/engine/ForwardExecutionEngineDecodeCache.cpp
     execution/local_execution/engine/PrefillBucketUtils.cpp
     # Prefill graph cache (Phase 4: persistent prefill graph capture/replay)
     execution/local_execution/engine/PrefillGraphCache.cpp
@@ -2322,7 +2432,9 @@ if(HAVE_CUDA)
         kernels/cuda/gemm/CUDAQuantisedGemmKernel.cpp
         kernels/cuda/ops/CUDAOpsKernels.cpp           # RMSNorm, SwiGLU, RoPE, Embedding ITensor implementations
         kernels/cuda/attention/CUDAFlashAttentionKernelT.cpp  # Flash Attention ITensor implementation
-        kernels/cuda/moe/CUDAMoEKernel.cpp            # MoE kernel adapter (routing, gather, scatter, gate, swiglu)
+        kernels/cuda/moe/CUDAMoEKernel.cpp            # MoE kernel adapter (lifecycle, IQ tables, router gate cache)
+        kernels/cuda/moe/CUDAMoEKernelRouting.cpp     # MoE kernel adapter (routing, rebalance, grouping, descriptors)
+        kernels/cuda/moe/CUDAMoEKernelExecution.cpp   # MoE kernel adapter (grouped decode/prefill, floating, retained HC/FFN)
     )
     
     message(STATUS "V2: Linked CUDA backend library")
@@ -2342,7 +2454,8 @@ if(HAVE_ROCM)
     target_sources(llaminar2_core PRIVATE
         kernels/rocm/gemm/ROCmWeightPacker.cpp               # Weight packing utilities (native-quantised + INT8 conversion)
         kernels/rocm/gemm/ROCmFloatingPointGemmKernel.cpp
-        kernels/rocm/gemm/ROCmQuantisedGemmKernel.cpp  # INT8 GEMM adapter (uses CK via extern "C")
+        kernels/rocm/gemm/ROCmQuantisedGemmKernel.cpp  # INT8/NativeQuantised GEMM lifecycle, conversion, verifier dispatch
+        kernels/rocm/gemm/ROCmQuantisedGemmKernelDispatch.cpp # INT8/NativeQuantised GEMM single & fused-tensor dispatch
         kernels/rocm/gemm/HipBLASGemmKernel.cpp        # hipBLAS GEMM for FP32/FP16 (compiled with g++, linked with hipBLAS)
         kernels/rocm/attention/ROCmFlashAttentionKernelT.cpp  # Flash Attention ITensor implementation
         kernels/rocm/kvcache/ROCmRingKVCache.cpp              # Ring buffer KV cache implementation
@@ -2353,7 +2466,9 @@ if(HAVE_ROCM)
         kernels/rocm/ops/ROCmRoPEKernelT.cpp                  # RoPE ITensor implementation
         kernels/rocm/ops/ROCmRMSNormKernelT.cpp               # RMSNorm ITensor implementation
         kernels/rocm/ops/ROCmEmbeddingKernelT.cpp             # Embedding ITensor implementation
-        kernels/rocm/moe/ROCmMoEKernel.cpp                    # MoE kernel (routing, gather, scatter, gate, swiglu)
+        kernels/rocm/moe/ROCmMoEKernel.cpp                    # MoE kernel (core, policy, dispatch)
+        kernels/rocm/moe/ROCmMoEKernelRouting.cpp             # MoE kernel (routing, topk, grouping, rebalance)
+        kernels/rocm/moe/ROCmMoEKernelExecution.cpp           # MoE kernel (prefill/decode execution & overlay)
     )
     # Only this bridge consumes the compiled choice. Other stages call its
     # immutable function; flipping modes must not rebuild unrelated core TUs.

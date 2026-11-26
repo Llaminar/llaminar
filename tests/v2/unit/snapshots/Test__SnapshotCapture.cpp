@@ -24,6 +24,7 @@
 #include "execution/debug/TPSnapshot.h"
 #include "tensors/BlockStructures.h"
 #include "tensors/FP16Utils.h"
+#include "tensors/SIMDHelpers.h"
 
 using namespace llaminar2;
 using simd::fp32_to_fp16;

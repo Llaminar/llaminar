@@ -10,6 +10,7 @@
 #include "../GEMMStage.h"
 #include "../../../../models/GraphTypes.h"
 #include "../../../local_execution/graph/ComputeGraph.h"
+#include "../../../local_execution/graph/GraphComposer.h"
 #include "../../../local_execution/graph/IGraphBuilder.h"
 #include <algorithm>
 #include <array>
@@ -183,7 +184,7 @@ qwen4exp::QwenSparsePoolSelection Qwen4ExpSparseAttentionBuilder::poolSelectionF
     case DeviceType::Vulkan:
     case DeviceType::Metal:break;
     default:throw std::invalid_argument("QSA pool selection requires a known participant backend");}
-    if(phase==ForwardExecutionPhase::Decode && device.is_rocm() &&
+    if(phase==ForwardExecutionPhase::Decode && (device.is_rocm() || device.is_cuda()) &&
         rowCapacity<=attention::kMaxGroupedVerifierAttentionRows)
         return qwen4exp::QwenSparsePoolSelection::Bounded1024_1024;
     return qwen4exp::QwenSparsePoolSelection::Installed;
@@ -375,9 +376,18 @@ std::vector<std::string> Qwen4ExpSparseAttentionBuilder::appendRequests(ComputeG
         terminals.push_back(terminal);
     }
     validateNodes(graph,nodes);
+    GraphComposer composer(graph);
     for(auto &node:nodes) {
-        graph.addNode(node.name,std::move(node.stage),c.device);
-        for(const auto &dependency:node.dependencies)graph.addDependency(node.name,dependency);
+        std::vector<GraphNodeRef> deps;
+        deps.reserve(node.dependencies.size());
+        for(const auto &dependency:node.dependencies)
+            deps.push_back(composer.ref(dependency));
+        (void)composer.add(GraphNodeDecl{
+            .name = std::move(node.name),
+            .stage = std::move(node.stage),
+            .device = c.device,
+            .data_deps = std::move(deps),
+        });
     }
     return terminals;
 }

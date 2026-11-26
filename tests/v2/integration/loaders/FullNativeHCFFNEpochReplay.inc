@@ -40,7 +40,6 @@ class FullEpochNumericalPair final {
  std::vector<DeviceMoEExpertDescriptor> acquired_;
  std::array<std::vector<DeviceNativeQuantisedMatrixDesc>,3> published_;
  const void* full_function_=nullptr;
- rocm::ResidentMoEFFNExecutionMasks retained_execution_{}; ///< Kernel identity from the original GPU-only format envelope.
  std::array<std::size_t,Planes> widths_;
  DeviceMoEOverlayEpochStatus status_{};int32_t observed_count_=-1;std::array<uint32_t,2> acquired_header_{};
  unsigned member_=0;
@@ -251,12 +250,7 @@ public:
    terminal_event_=getBackendFor(device_)->createEvent(device_.ordinal);require(terminal_event_,"epoch inference boundary event owner");
    context_=IDeviceContext::create(device_,1);
    const auto& bank=initial_->bank->layerForModelLayer(0);
-   full_function_=fullProductionHCFunction(bank,shared,store,device_);
-   if(retained()) {
-    const auto declaration=MoEIntermediateShardDescriptorDeclaration::fromOriginalFamily(bank.fragment_family);
-    retained_execution_.routed_gate=declaration.nativeGateUpEnvelope().execution_codebook_mask;
-    retained_execution_.routed_down=declaration.nativeDownEnvelope().execution_codebook_mask;
-   }
+   full_function_=fullProductionHCFunction(bank,shared,store,device_,0,retained()&&!hasDescriptorReader());
    for(unsigned side=0;side<2;++side) {
     auto& p=prefix_[side];const unsigned H=shape.hidden,K=4*H;
     p.residual=fullProductionHCFloat(K,device_,stream_);p.previous=fullProductionHCFloat(H,device_,stream_);
@@ -351,25 +345,13 @@ private:
     auto& l=*lane_[side];auto& p=prefix_[side];
     require(capture_[side]->instantiate(),"instantiate original retained epoch graph");++captures_built_;
     if(side) {
-#if defined(LLAMINAR_CASTAGNA_FAST_EPOCH)
      if(retained()) {
       std::vector<GPUGraphKernelNodeInfo> nodes;std::string error;
       require(capture_[side]->inspectKernelNodes(nodes,&error),"inspect retained fast source epoch graph: "+error);
       const auto fast_count=std::count_if(nodes.begin(),nodes.end(),[&](const auto& node){
-       return node.function_identity==reinterpret_cast<std::uintptr_t>(rocm::retainedM1HCFFNKernelFunction(FullNativeHCFFNOutputDemand::none(),descriptorDemand(),retained_execution_));});
-      if(fast_count!=1||nodes.size()<3) {
-       std::osyncstream out(std::cerr);
-       out<<"RETAINED_DESCRIPTOR_GRAPH_IDENTITY,reader="<<hasDescriptorReader()<<",matched="<<fast_count<<",actual=";
-       for(const auto& node:nodes)out<<std::hex<<node.function_identity<<'/';
-       for(const auto role:{MoESelectedDescriptorDemand::ExternalTables,MoESelectedDescriptorDemand::AcquiredBankOnly})
-        for(const auto demand:{FullNativeHCFFNOutputDemand::none(),FullNativeHCFFNOutputDemand::all()})
-         out<<",role="<<static_cast<unsigned>(role)<<",observed="<<static_cast<unsigned>(demand.bits())<<",owner="<<std::hex
-            <<reinterpret_cast<std::uintptr_t>(rocm::retainedM1HCFFNKernelFunction(demand,role,retained_execution_));
-       out<<'\n';
-      }
-      require(fast_count==1&&nodes.size()>=3,"actual retained fast kernel and original native epoch boundaries");
-     } else
-#endif
+       return node.function_identity==reinterpret_cast<std::uintptr_t>(full_function_);});
+      require(fast_count==1&&nodes.size()>=3,"actual canonical fast full HC/FFN kernel and original native epoch boundaries");
+     }
      requireFullProductionHCBinding(*capture_[side],full_function_,p,l);
     }
  }

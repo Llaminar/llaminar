@@ -114,22 +114,36 @@ void appendFullProductionHCPrefix(Lane& lane,FullProductionHCPrefix& p,std::map<
  * @return Complete full-entry function, never a standalone HC or FFN function.
  */
 const void* fullProductionHCFunction(const MoEOverlayParticipantLayerBank& source,
-    const FrozenModelWeightSet& shared,PreparedWeightStore& store,DeviceId device,unsigned expected_groups=0) {
+    const FrozenModelWeightSet& shared,PreparedWeightStore& store,DeviceId device,unsigned expected_groups=0,
+    bool allow_fast=false,bool* uses_fast=nullptr) {
+    if(uses_fast)*uses_fast=false;
     const auto declaration=MoEIntermediateShardDescriptorDeclaration::fromOriginalFamily(source.fragment_family);
-    auto mask=declaration.nativeGateUpEnvelope().execution_codebook_mask|declaration.nativeDownEnvelope().execution_codebook_mask;
+    rocm::ResidentMoEFFNExecutionMasks exec{};
+    exec.routed_gate=declaration.nativeGateUpEnvelope().execution_codebook_mask;
+    exec.routed_down=declaration.nativeDownEnvelope().execution_codebook_mask;
+    auto mask=exec.routed_gate|exec.routed_down;
     for(const char* name:{"ffn_gate_shexp.weight","ffn_up_shexp.weight","ffn_down_shexp.weight"}) {
         const auto* binding=shared.optionalLayerForDevice(0,name,device);require(binding,"original shared full-entry source");
         const auto ref=store.preparedRefForBinding(binding->binding_id,device);require(ref.has_value(),"original shared full-entry prepared ref");
         auto* engine=store.gemmKernel(*ref);DeviceNativeQuantisedMatrixDesc descriptor;
         require(engine&&engine->weights_converted()&&engine->inspectPreparedNativeQuantisedMatrixDesc(descriptor)&&descriptor.valid(),
             "full-entry source authentication never performs weight preparation");
-        mask|=std::uint32_t(1)<<descriptor.codebook_id;
+        const auto bit=std::uint32_t(1)<<descriptor.codebook_id;
+        mask|=bit;
+        if(std::string_view(name)=="ffn_down_shexp.weight")exec.shared_down|=bit;
+        else exec.shared_gate|=bit;
     }
     const auto program=rocm::ResidentMoEFFNDecoderProgram::fromExecutionMask(mask);
     if (expected_groups && program.groups() != expected_groups)
         throw std::runtime_error("Prepared decoder group " + std::to_string(program.groups()) +
             " from physical mask " + std::to_string(mask) + " differs from expected group " +
             std::to_string(expected_groups));
+    if(allow_fast) {
+        if(const void* fast=rocm::fastFullNativeHCFFNKernelFunction(exec)) {
+            if(uses_fast)*uses_fast=true;
+            return fast;
+        }
+    }
     return rocm::fullNativeHCFFNKernelFunction(program);
 }
 /**
@@ -334,12 +348,10 @@ void replayFullNativeHCFFN(DeviceId device,int member,ILocalTPContext& tp,std::b
         auto setup=frame->acquireInitialConstruction();require(bool(setup),"original HC/FFN construction lease");
         const auto& source=setup->layerForModelLayer(0);
         const auto declaration=MoEIntermediateShardDescriptorDeclaration::fromOriginalFamily(source.fragment_family);
-        const auto full_function=retained?
-            rocm::retainedM1HCFFNKernelFunction(FullNativeHCFFNOutputDemand::none(),
-                MoESelectedDescriptorDemand::AcquiredBankOnly, {
-                    .routed_gate=declaration.nativeGateUpEnvelope().execution_codebook_mask,
-                    .routed_down=declaration.nativeDownEnvelope().execution_codebook_mask}):
-            fullProductionHCFunction(source,shared,store,device,expected_groups);
+        const bool allow_fast=(observation==FullProductionHCObservation::DemandedOnly||retained);
+        bool uses_fast_full=false;
+        const auto* full_function=fullProductionHCFunction(source,shared,store,device,expected_groups,allow_fast,&uses_fast_full);
+        const bool skip_canonical_binding = retained;
         // All sources, captures and asynchronous destinations precede the guard.
         // Its destructor retires work before any borrowed storage can be released.
         ScopedGPUCompletionEvent completion(backend,device,stream);
@@ -475,7 +487,7 @@ void replayFullNativeHCFFN(DeviceId device,int member,ILocalTPContext& tp,std::b
             if(side) {
                 require(middle?nodes.size()>=2u:nodes.size()==(outside_reader?2u:1u),
                     "one full production entry, plus original collective/next write only for middle correctness");
-                if(!retained)barrier_binding=requireFullProductionHCBinding(*captures[side],full_function,prefix[side],lane);
+                if(!skip_canonical_binding)barrier_binding=requireFullProductionHCBinding(*captures[side],full_function,prefix[side],lane);
                 const auto body=std::find_if(nodes.begin(),nodes.end(),[&](const auto& n){return n.function_identity==reinterpret_cast<std::uintptr_t>(full_function);});
                 require(body!=nodes.end()&&body->local_memory_bytes_per_thread==0&&body->block_x==1024,
                     "actual full production entry retains zero private bytes and admitted physical geometry");
@@ -484,7 +496,7 @@ void replayFullNativeHCFFN(DeviceId device,int member,ILocalTPContext& tp,std::b
                 <<",storage_reuse="<<(storage_reuse==FullProductionHCStorageReuse::ModelReadBeforeWrite)<<",kernels="<<nodes.size()<<",source=original_native,ordinary_rows=1,collective="
                 <<(middle?"inside_middle_correctness_capture":"outside_final_local_capture")<<'\n';
         }
-        if(!retained) {
+        if(!skip_canonical_binding) {
             require(barrier_binding.first&&barrier_binding.second,"full capture retains its actual barrier owner");
             require(backend->deviceToHostOnStream(barrier_expected.data(),barrier_binding.first,sizeof(barrier_expected),
                 device.ordinal,stream),"observe retired full barrier baseline");
@@ -564,7 +576,7 @@ void replayFullNativeHCFFN(DeviceId device,int member,ILocalTPContext& tp,std::b
                 "observe actual local demand");
             require(backend->deviceToHostOnStream(runtime.participants.data(),lane.runtime->hostLayerState(0).route_participant_ids,
                 shape.top_k*sizeof(std::int32_t),device.ordinal,stream),"observe original route participant ledger");
-            if(side&&!retained)require(backend->deviceToHostOnStream(barrier_observed.data(),barrier_binding.first,sizeof(barrier_observed),
+            if(side&&!skip_canonical_binding)require(backend->deviceToHostOnStream(barrier_observed.data(),barrier_binding.first,sizeof(barrier_observed),
                 device.ordinal,stream),"observe actual active and retired full barrier words");
             if(outside_reader)require(backend->deviceToHostOnStream(reader_observed[side].data(),p.reader_mixed->gpu_data_ptr(),
                 H*sizeof(float),device.ordinal,stream),"observe actual outside HC-up reader");
@@ -573,11 +585,18 @@ void replayFullNativeHCFFN(DeviceId device,int member,ILocalTPContext& tp,std::b
                 require(same(observed[side][plane],omitted_poison[plane]),"omitted optional tensor retains authored poison");
             if(outside_reader)require(same(reader_observed[side],observed[side][5]),
                 "actual production outside reader consumes HC-up and reproduces original mixed bytes");
-            if(side&&!retained) {
+            if(side&&!skip_canonical_binding) {
                 for(unsigned phase:{0u,1u,2u,5u,6u}) {
-                    barrier_expected[2*phase+1]^=operations&1u;
-                    require(barrier_observed[2*phase]==0&&barrier_observed[2*phase+1]==barrier_expected[2*phase+1],
-                        "all and only three HC/two FFN joins advance once per captured operation");
+                    if(uses_fast_full) {
+                        const bool phase_active=(phase<3u)||(published_live_count>0);
+                        if(phase_active)barrier_expected[2*phase]+=operations*65536u;
+                        require(barrier_observed[2*phase]==barrier_expected[2*phase]&&barrier_observed[2*phase+1]==0u,
+                            "fast weighted full barrier advances once per active captured operation");
+                    } else {
+                        barrier_expected[2*phase+1]^=operations&1u;
+                        require(barrier_observed[2*phase]==0&&barrier_observed[2*phase+1]==barrier_expected[2*phase+1],
+                            "all and only three HC/two FFN joins advance once per captured operation");
+                    }
                 }
                 for(unsigned word=FullNativeHCFFNBarrierLayout::prefix_words;
                     word<FullNativeHCFFNBarrierLayout::suffix_word_offset;++word)
@@ -589,8 +608,8 @@ void replayFullNativeHCFFN(DeviceId device,int member,ILocalTPContext& tp,std::b
                 runtime.header[0]*sizeof(DeviceMoEPlacementBank);
             copy_runtime(runtime.bank_header.data(),bank_offset+offsetof(DeviceMoEPlacementBank,epoch),
                 sizeof(runtime.bank_header),"observe actual acquired bank identity");
-            const bool closed=side&&retained;
-            if(closed)for(const auto name:table_names) {
+            const bool closed=side&&(retained||uses_fast_full);
+            if(side&&retained)for(const auto name:table_names) {
                 const auto* table=lane.workspace->getBuffer(name);
                 require(backend->deviceToHostOnStream(closed_table.data(),table,closed_table.size(),device.ordinal,stream),
                     "observe entire closed selected descriptor table");

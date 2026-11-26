@@ -8,6 +8,7 @@
  */
 #include "CPUPreparedWeightWriter.h"
 #include "CPUNativeQuantisedGemmKernel.h"
+#include "CPUNativeQuantisedWeightPacker.h"
 #include "FloatingPointGemmKernel.h"
 #include "tensors/TensorFactory.h"
 #include "tensors/NativeQuantisedFormatInfo.h"

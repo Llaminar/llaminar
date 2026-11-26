@@ -998,7 +998,7 @@ template <int STATIC_D_K,
           int STATIC_BLOCK_SIZE = 0,
           bool CACHE_QK_NORMALIZATION = false,
           GdnPrefillSnapshots SNAPSHOTS = GdnPrefillSnapshots::BoundedRows>
-__global__ __launch_bounds__(256, 2)
+__global__ __launch_bounds__(STATIC_BLOCK_SIZE > 0 ? STATIC_BLOCK_SIZE : 256, 2)
 void rocm_gdn_chunk_forward_kernel(
     const float *__restrict__ Q,
     const float *__restrict__ K,
@@ -1023,7 +1023,9 @@ void rocm_gdn_chunk_forward_kernel(
         "ROCm long-prefill GDN requires a capture-time D_K specialization");
     static_assert(
         !CACHE_QK_NORMALIZATION ||
-            (STATIC_D_K == 128 && STATIC_BLOCK_SIZE == 256),
+            (STATIC_D_K == 128 &&
+             (STATIC_BLOCK_SIZE == 64 || STATIC_BLOCK_SIZE == 128 ||
+              STATIC_BLOCK_SIZE == 256)),
         "Wave-owned prefill retains the 128-key, four-part serial decode tree");
     const int kernel_n_heads = n_heads;
     constexpr int kernel_d_k = STATIC_D_K;
@@ -4658,7 +4660,7 @@ template <int STATIC_D_K,
           bool CACHE_QK_NORMALIZATION = false,
           GdnPrefillSnapshots SNAPSHOTS = GdnPrefillSnapshots::BoundedRows,
           GdnRecurrenceEndpointAccess Access = GdnRecurrenceEndpointAccess::ScalarAligned>
-__global__ __launch_bounds__(256, 2)
+__global__ __launch_bounds__(STATIC_BLOCK_SIZE > 0 ? STATIC_BLOCK_SIZE : 256, 2)
 void rocm_gdn_value_major_chunk_forward_kernel(
     const float *__restrict__ Q,
     const float *__restrict__ K,
@@ -4683,7 +4685,9 @@ void rocm_gdn_value_major_chunk_forward_kernel(
         "ROCm long-prefill GDN requires a capture-time D_K specialization");
     static_assert(
         !CACHE_QK_NORMALIZATION ||
-            (STATIC_D_K == 128 && STATIC_BLOCK_SIZE == 256),
+            (STATIC_D_K == 128 &&
+             (STATIC_BLOCK_SIZE == 64 || STATIC_BLOCK_SIZE == 128 ||
+              STATIC_BLOCK_SIZE == 256)),
         "Wave-owned prefill retains the 128-key, four-part serial decode tree");
     const int kernel_n_heads = n_heads;
     constexpr int kernel_d_k = STATIC_D_K;

@@ -154,16 +154,20 @@ namespace llaminar2
             {
             case CpuEncoding::NibbleLUTSourceScale:
             case CpuEncoding::NibbleLUT:
-                packed.payload_bytes = 16;
-                break;
-            case CpuEncoding::IQ3SExpandedSourceScale:
-                packed.payload_bytes = 13;
+                packed.payload_bytes = source->payload_bytes;
                 break;
             case CpuEncoding::ExpandedInt8:
+            case CpuEncoding::UnsignedInt8:
                 packed.payload_bytes = 32;
                 break;
             case CpuEncoding::Q6KNativeDualScale:
                 packed.payload_bytes = 24;
+                break;
+            case CpuEncoding::CompactFiveBit:
+                packed.payload_bytes = 20;
+                break;
+            case CpuEncoding::UnsignedNibble:
+                packed.payload_bytes = 16;
                 break;
             case CpuEncoding::CompactMultiScale:
                 packed.payload_bytes = source->payload_bytes;

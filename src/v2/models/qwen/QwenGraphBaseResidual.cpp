@@ -9,8 +9,16 @@
  */
 #include "QwenGraphBase.h"
 #include "execution/moe/MoERoutedExpertPlacementPlan.h"
+#include "execution/moe/MoEIntermediateShardStaticGraphAdmission.h"
 #include "../qwen4exp/Qwen4ExpConfig.h"
 #include "../qwen4exp/Qwen4ExpHCUpArithmetic.h"
+#include "../qwen4exp/Qwen4ExpRetainedM1HCFFNPolicy.h"
+#ifdef HAVE_ROCM
+#include "../qwen4exp/Qwen4ExpRetainedGDNPreAttentionPolicy.h"
+#endif
+#include "../../loaders/PreparedWeightStore.h"
+#include "../../tensors/NativeQuantisedFormatInfo.h"
+#include "../../utils/DebugEnv.h"
 #include <stdexcept>
 #include <utility>
 
@@ -53,6 +61,16 @@ bool usesHCUpCorrection(const GraphConfig &config,const Qwen4ExpPreparedProjecti
 {
     return resolveQwen4ExpHCUpArithmetic(config.qfn_hc_up_activation,
         tensorTypeName(up.tensor()->native_type()))==Qwen4ExpHCUpArithmetic::QuantizedTwoTermQ8;
+}
+
+/** @brief Return whether a prepared projection is a native signed-Q8 (codebook 19) matrix. */
+bool isOriginalSignedQ8Projection(const Qwen4ExpPreparedProjection &projection)
+{
+    DeviceNativeQuantisedMatrixDesc source{};
+    const auto *engine = projection.store().gemmKernel(projection.ref());
+    return engine && engine->inspectPreparedNativeQuantisedMatrixDesc(source) &&
+           source.codebook_id == 19 && source.source_identity_present &&
+           canonicalDeviceVnniCodebookId(source.source_codebook_id) == 19;
 }
 
 /** @brief Keep projection scratch distinct from both original and normalized branches. */
@@ -222,6 +240,73 @@ Qwen4ExpHyperconnectionBuilder::BlockRead QwenGraphBase::addBranchBlockRead(
         if(config_.qfn_hc_down_lookahead_candidate)
             context.downProducerProgram=HCDownProducerProgram::TwoK32Lookahead;
     }
+    if(!predictor&&device.is_gpu()&&rows==1&&forward_input_construction_&&
+       forward_input_construction_->execution_phase==ForwardExecutionPhase::Decode&&
+       forward_input_construction_->execution_role==ForwardExecutionRole::MainInference&&
+       context.arithmetic==Qwen4ExpProjectionArithmetic::Ordinary&&!context.projectionRows&&
+       usesHCUpCorrection(config_,prepared_read.up)&&
+       context.readExecution==Qwen4ExpHCReadExecution::Staged&&
+       context.branchNormExecution==Qwen4ExpHCBranchNormExecution::Staged&&
+       context.downPublication==Qwen4ExpHCDownPublication::Staged)
+    {
+        const bool rocm_retained_ffn = !attention && device.is_rocm() &&
+            useQwen4ExpRetainedM1HCFFN(
+                qfnRetainedM1HCFFNEnabled(config_.moe.routed_expert_plan &&
+                    config_.moe.routed_expert_plan->usesGFX906MI50Kernels() &&
+                    !hasMappedGPUCPUIntermediateShardTopology(*config_.moe.routed_expert_plan) &&
+                    config_.flash_next->hasRetainedM1HCFFNSources(layer_idx)),
+                forward_input_construction_->execution_phase,
+                forward_input_construction_->execution_role,
+                forward_input_construction_->seq_len,
+                forward_input_construction_->batch_size);
+        const bool rocm_mapped_retained_ffn = !attention && device.is_rocm() &&
+            config_.moe.routed_expert_plan &&
+            config_.moe.routed_expert_plan->usesGFX906MI50Kernels() &&
+            hasMappedGPUCPUIntermediateShardTopology(*config_.moe.routed_expert_plan) &&
+            qfnROCmMappedRetainedM1HCFFNCandidate();
+        const bool cuda_retained_ffn = !attention && device.is_cuda() &&
+            config_.moe.routed_expert_plan &&
+            hasCUDAMappedRetainedM1OverlayTopology(*config_.moe.routed_expert_plan) &&
+            qfnCUDAMappedRetainedM1HCFFNCandidate();
+#ifdef HAVE_ROCM
+        const bool rocm_retained_gdn_pre_attention = attention && device.is_rocm() &&
+            config_.flash_next->mixers().at(static_cast<std::size_t>(layer_idx)) == Qwen4ExpMixer::GatedDeltaNet &&
+            usesRetainedGDNPreAttention(
+                qfnRetainedGDNPreAttentionEnabled(
+                    config_.moe.routed_expert_plan &&
+                    config_.moe.routed_expert_plan->usesGFX906MI50Kernels() &&
+                    config_.flash_next->supportsRetainedGDN(
+                        static_cast<std::size_t>(layer_idx), debugEnv().gemm.gdn_projection_arithmetic)),
+                device, config_.moe.routed_compute_policy,
+                forward_input_construction_->execution_phase,
+                forward_input_construction_->execution_role,
+                forward_input_construction_->seq_len,
+                forward_input_construction_->batch_size);
+        const bool rocm_retained_qsa_pre_attention = attention && device.is_rocm() &&
+            config_.flash_next->mixers().at(static_cast<std::size_t>(layer_idx)) == Qwen4ExpMixer::SparseAttention &&
+            usesRetainedROCmQSAAttention(
+                qfnRetainedROCmQSAAttentionEnabled(
+                    config_.moe.routed_expert_plan &&
+                    config_.moe.routed_expert_plan->usesGFX906MI50Kernels()),
+                device,
+                forward_input_construction_->execution_phase,
+                forward_input_construction_->execution_role,
+                forward_input_construction_->seq_len,
+                forward_input_construction_->batch_size);
+        if(device.is_rocm()&&!rocm_retained_ffn&&!rocm_mapped_retained_ffn&&
+           !rocm_retained_gdn_pre_attention&&!rocm_retained_qsa_pre_attention&&
+           context.hidden%32==0&&context.lowRank>=64&&context.lowRank<=512&&context.lowRank%32==0&&
+           isOriginalSignedQ8Projection(prepared_read.down)&&
+           isOriginalSignedQ8Projection(prepared_read.up)&&
+           weights.inject->tensor&&weights.inject->tensor->native_type()==TensorType::FP32)
+        {
+            // Fuse all five participant-local HC read+inject stages into one
+            // exact resident 1024-thread kernel across all admitted ROCm topologies.
+            context.readExecution=Qwen4ExpHCReadExecution::PersistentOriginalPhases;
+        }
+#endif
+        (void)cuda_retained_ffn;
+    }
     return Qwen4ExpHyperconnectionBuilder::appendRead(graph, context,
         {prepared_read,
          Qwen4ExpPreparedProjection(*weights.inject, *prepared_weight_store_, device)},
@@ -273,6 +358,24 @@ void QwenGraphBase::addBranchAttentionReadOnly(ComputeGraph &graph,
         if(config_.qfn_hc_down_lookahead_candidate)
             context.downProducerProgram=HCDownProducerProgram::TwoK32Lookahead;
     }
+    if(!predictor&&device.is_gpu()&&rows==1&&forward_input_construction_&&
+       forward_input_construction_->execution_phase==ForwardExecutionPhase::Decode&&
+       forward_input_construction_->execution_role==ForwardExecutionRole::MainInference&&
+       context.arithmetic==Qwen4ExpProjectionArithmetic::Ordinary&&!context.projectionRows&&
+       usesHCUpCorrection(config_,prepared_read.up)&&
+       context.readExecution==Qwen4ExpHCReadExecution::Staged&&
+       context.branchNormExecution==Qwen4ExpHCBranchNormExecution::Staged&&
+       context.downPublication==Qwen4ExpHCDownPublication::Staged)
+    {
+        if(device.is_rocm()&&!context.rows.liveRows&&context.hidden%32==0)
+            context.branchNormExecution=Qwen4ExpHCBranchNormExecution::PublishOriginalSingleQ8;
+        if(device.is_rocm()&&context.lowRank>=64&&context.lowRank<=512&&4*context.hidden>=4*context.lowRank&&
+           isOriginalSignedQ8Projection(prepared_read.up))
+            context.readExecution=Qwen4ExpHCReadExecution::ProducerGridShortK;
+        if(device.is_rocm()&&context.lowRank>=64&&context.lowRank<=512&&context.lowRank%32==0&&
+           context.hidden%8==0&&isOriginalSignedQ8Projection(prepared_read.down))
+            context.downPublication=Qwen4ExpHCDownPublication::ReducerEpilogue;
+    }
     Qwen4ExpHyperconnectionBuilder::appendFinalRead(graph,context,
         prepared_read,
         readBuffers(buffers, buffers.current_hidden, buffers.idFor(BufferId::HIDDEN_STATE),
@@ -307,6 +410,24 @@ std::string QwenGraphBase::addBranchHeadRead(ComputeGraph &graph, TensorBase *hi
         context.downPublication=Qwen4ExpHCDownPublication::ReducerEpilogue;
         if(config_.qfn_hc_down_lookahead_candidate)
             context.downProducerProgram=HCDownProducerProgram::TwoK32Lookahead;
+    }
+    if(device.is_gpu()&&rows==1&&forward_input_construction_&&
+       forward_input_construction_->execution_phase==ForwardExecutionPhase::Decode&&
+       forward_input_construction_->execution_role==ForwardExecutionRole::MainInference&&
+       context.arithmetic==Qwen4ExpProjectionArithmetic::Ordinary&&!context.projectionRows&&
+       usesHCUpCorrection(config_,prepared_read.up)&&
+       context.readExecution==Qwen4ExpHCReadExecution::Staged&&
+       context.branchNormExecution==Qwen4ExpHCBranchNormExecution::Staged&&
+       context.downPublication==Qwen4ExpHCDownPublication::Staged)
+    {
+        if(device.is_rocm()&&!context.rows.liveRows&&context.hidden%32==0)
+            context.branchNormExecution=Qwen4ExpHCBranchNormExecution::PublishOriginalSingleQ8;
+        if(device.is_rocm()&&context.lowRank>=64&&context.lowRank<=512&&4*context.hidden>=4*context.lowRank&&
+           isOriginalSignedQ8Projection(prepared_read.up))
+            context.readExecution=Qwen4ExpHCReadExecution::ProducerGridShortK;
+        if(device.is_rocm()&&context.lowRank>=64&&context.lowRank<=512&&context.lowRank%32==0&&
+           context.hidden%8==0&&isOriginalSignedQ8Projection(prepared_read.down))
+            context.downPublication=Qwen4ExpHCDownPublication::ReducerEpilogue;
     }
     return Qwen4ExpHyperconnectionBuilder::appendFinalRead(graph, context,
         prepared_read,

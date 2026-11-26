@@ -681,12 +681,19 @@ namespace
             return;
         }
 
+        // Re-sample published_selector AFTER resolveRequiredEpoch/findEpochBank:
+        // background PublishCandidate can promote the peer bank while this kernel
+        // waited at the admission barrier, advancing generation and published_bank.
+        const std::uint64_t current_selector =
+            atomicLoad64(&control->published_selector);
+        const std::uint32_t current_published_bank = selectorBank(current_selector);
+        const std::uint64_t current_generation = selectorGeneration(current_selector);
         const std::uint64_t ticket_generation =
-            bank == published_bank
-                ? generation
+            bank == current_published_bank
+                ? current_generation
                 : exact_prepared
-                      ? (generation < UINT64_MAX ? generation + 1u : 0u)
-                      : (generation > 1u ? generation - 1u : 0u);
+                      ? (current_generation < UINT64_MAX ? current_generation + 1u : 0u)
+                      : (current_generation > 1u ? current_generation - 1u : 0u);
         if (ticket_generation == 0u)
         {
             atomicAdd(

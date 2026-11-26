@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[4]
 BENCHMARK_MODE = ROOT / "src/v2/app/modes/BenchmarkMode.cpp"
 BENCHMARK_RUNNER = ROOT / "src/v2/utils/BenchmarkRunner.cpp"
 INFERENCE_ADAPTER = ROOT / "src/v2/app/InferenceRunnerAdapter.cpp"
-ORCHESTRATION_RUNNER = ROOT / "src/v2/execution/runner/OrchestrationRunner.cpp"
+ORCHESTRATION_RUNNER_DIR = ROOT / "src/v2/execution/runner"
 
 
 class BenchmarkPrefillProductionPolicyTest(unittest.TestCase):
@@ -30,7 +30,10 @@ class BenchmarkPrefillProductionPolicyTest(unittest.TestCase):
     def test_benchmark_prefill_reaches_production_chunk_scheduler(self) -> None:
         benchmark = BENCHMARK_RUNNER.read_text(encoding="utf-8")
         adapter = INFERENCE_ADAPTER.read_text(encoding="utf-8")
-        production = ORCHESTRATION_RUNNER.read_text(encoding="utf-8")
+        production = "\n".join(
+            p.read_text(encoding="utf-8")
+            for p in sorted(ORCHESTRATION_RUNNER_DIR.glob("OrchestrationRunner*.cpp"))
+        )
         self.assertIn("success = runner_->forward(tokens.data(), tokens.size());", benchmark)
         self.assertIn("orch_runner_->prefill(token_vec)", adapter)
         self.assertIn("runner_->forwardPrefillChunkSchedule(", production)

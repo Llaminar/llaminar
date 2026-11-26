@@ -117,7 +117,7 @@ void rocmQwenSparseAttention(const QwenSparseAttention &p, hipStream_t stream)
     });
     checkLaunch();
 }
-void rocmQwenSparseFP16Attention(const QwenSparseAttention& p, hipStream_t stream)
+void rocmQwenSparseFP16TilesOnly(const QwenSparseAttention& p, hipStream_t stream)
 {
     requireStream(stream);
     if(p.arithmetic!=QwenSparseAttentionArithmetic::TileFP16WithFP32Totals &&
@@ -131,8 +131,6 @@ void rocmQwenSparseFP16Attention(const QwenSparseAttention& p, hipStream_t strea
             throw std::invalid_argument("ROCm FP16 tiled attention requires16-byte aligned native bank rows");
     if (p.kv.key_policy.transformsOnRead() && p.kv.key_rotary_dim != 64)
         throw std::invalid_argument("ROCm FP16 tiled attention requires the explicit64-coordinate pre-RoPE policy");
-    // Graph admission seals the arithmetic and exact partial extent. Both
-    // programs use the same native entry; no test-only execution path remains.
     const auto launch = [&]<int Parts>() {
         constexpr int GroupHeads = Parts == 33 ? 6 : 4;
         constexpr int Threads = GroupHeads * 64;
@@ -142,14 +140,22 @@ void rocmQwenSparseFP16Attention(const QwenSparseAttention& p, hipStream_t strea
             rocm_sparse_detail::selectedAttentionFP16Tiles<true,Parts><<<grid,Threads,0,stream>>>(p);
         else rocm_sparse_detail::selectedAttentionFP16Tiles<false,Parts><<<grid,Threads,0,stream>>>(p);
         checkLaunch();
-        rocm_sparse_detail::reduceAttentionPartitions<TensorType::FP16,Parts>
-            <<<dim3(p.row_capacity,p.query_heads),256,0,stream>>>(p);
-        checkLaunch();
     };
     if(p.arithmetic==QwenSparseAttentionArithmetic::TileFP16WithFP32Totals33)
         launch.template operator()<33>();
     else
         launch.template operator()<8>();
+}
+void rocmQwenSparseFP16Attention(const QwenSparseAttention& p, hipStream_t stream)
+{
+    rocmQwenSparseFP16TilesOnly(p, stream);
+    if(p.arithmetic==QwenSparseAttentionArithmetic::TileFP16WithFP32Totals33)
+        rocm_sparse_detail::reduceAttentionPartitions<TensorType::FP16,33>
+            <<<dim3(p.row_capacity,p.query_heads),256,0,stream>>>(p);
+    else
+        rocm_sparse_detail::reduceAttentionPartitions<TensorType::FP16,8>
+            <<<dim3(p.row_capacity,p.query_heads),256,0,stream>>>(p);
+    checkLaunch();
 }
 
 

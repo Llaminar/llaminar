@@ -209,6 +209,11 @@ namespace llaminar2
             const MoEKernelLaunchContext &launch,
             const MoENodeLocalRouteConsumeLaunch &consumption) override;
 
+        /** @copydoc IMoEKernel::consumeSingleRowNodeLocalCanonicalRoutes */
+        bool consumeSingleRowNodeLocalCanonicalRoutes(
+            const MoEKernelLaunchContext &launch,
+            const MoENodeLocalRouteConsumeLaunch &consumption) override;
+
         /** @copydoc IMoEKernel::beginNodeLocalDensePublication */
         bool beginNodeLocalDensePublication(
             const MoEKernelLaunchContext &launch,

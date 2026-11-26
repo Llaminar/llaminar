@@ -286,6 +286,13 @@ implementation convenience or an untuned candidate does not justify an exception
     unrestricted `--parallel`; split very large generated kernel families into
     persistent translation-unit shards when that improves compile throughput.
     Do not cap ordinary builds/tests to an arbitrary small worker count.
+    **Keep every compiled translation unit under 7,000 lines.** No `.c`, `.cc`,
+    `.cpp`, `.cxx`, `.cu`, or `.hip` translation unit under `src/v2/` may
+    exceed 7,000 lines (aim for `<= 6,000` lines along cohesive responsibility
+    boundaries when growing or splitting a class or kernel family). This limit
+    is enforced as a source-policy unit test with no permanent allowlist; keep
+    giant generated lookup tables isolated in single-owner `.cpp` TUs and keep
+    heavy SIMD/kernel templates out of ubiquitous headers.
 
 ### Code and Documentation
 

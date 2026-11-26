@@ -3120,6 +3120,67 @@ namespace llaminar2
         }
     }
 
+    void TransferEngine::enqueuePersistentDeviceRegionsToMappedHostAndPublishByKernel(
+        const MappedHostCopyBatchItem *items,
+        size_t item_count,
+        const MappedHostTransferRegion &destination,
+        const MappedHostTransferRegion &publication_region,
+        size_t publication_offset,
+        uint64_t publication_value,
+        DeviceId device,
+        void *stream) const
+    {
+        if (!items || item_count == 0u || item_count > 6u ||
+            !destination.isBound() || !publication_region.isBound() ||
+            !device.is_gpu() || !stream)
+        {
+            throw std::invalid_argument(
+                "TransferEngine fused mapped-host batch publish requires 1..6 bounded items, bound regions, GPU, and exact stream");
+        }
+        if (!publication_region.contains(publication_offset, sizeof(uint64_t)) ||
+            (publication_offset % alignof(uint64_t)) != 0u)
+        {
+            throw std::out_of_range(
+                "TransferEngine fused mapped-host batch publish signal exceeds or misaligns publication region");
+        }
+        IBackend *const backend = resolveBackend(device);
+        if (!backend || backend != destination.backendFor(device) ||
+            backend != publication_region.backendFor(device))
+        {
+            throw std::runtime_error(
+                "TransferEngine fused mapped-host batch publish backend identity mismatch");
+        }
+        IBackend::MappedHostCopySegment segments[6]{};
+        for (size_t i = 0u; i < item_count; ++i)
+        {
+            const auto &item = items[i];
+            if (!item.source || item.source_capacity == 0u || item.bytes == 0u)
+                throw std::invalid_argument("TransferEngine fused mapped-host batch item is empty");
+            if (item.source_offset > item.source_capacity ||
+                item.bytes > item.source_capacity - item.source_offset ||
+                !destination.contains(item.destination_offset, item.bytes))
+                throw std::out_of_range("TransferEngine fused mapped-host batch item exceeds region bounds");
+            segments[i] = IBackend::MappedHostCopySegment{
+                .dst = destination.deviceAlias(device, item.destination_offset),
+                .src = static_cast<const std::uint8_t *>(item.source) + item.source_offset,
+                .bytes = item.bytes,
+            };
+        }
+        auto *const signal = static_cast<uint64_t *>(
+            publication_region.deviceAlias(device, publication_offset));
+        if (!backend->copyDeviceVisibleRegionsAndPublishByKernelOnStream(
+                segments,
+                item_count,
+                signal,
+                publication_value,
+                device.gpu_ordinal(),
+                stream))
+        {
+            throw std::runtime_error(
+                "TransferEngine fused mapped-host batch publish launch was rejected");
+        }
+    }
+
     void TransferEngine::enqueuePersistentDeviceRegionToMappedHostByKernel(
         const void *source,
         size_t source_capacity,

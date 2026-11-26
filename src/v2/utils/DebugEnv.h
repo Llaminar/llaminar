@@ -4563,14 +4563,26 @@ namespace llaminar2
         return selected.value_or(qualified_domain);
     }
 
-    /** @return Whether paired runs should select the experimental mapped CUDA M1 program. */
+    /** @return Whether mapped CUDA M1 topologies select the retained HC/FFN program (default: enabled). */
     inline bool qfnCUDAMappedRetainedM1HCFFNCandidate()
     {
         static const bool enabled = [] {
             const char *value = std::getenv("LLAMINAR_QFN_CUDA_MAPPED_RETAINED_M1_HC_FFN_CANDIDATE");
-            if (!value || std::strcmp(value, "0") == 0) return false;
-            if (std::strcmp(value, "1") == 0) return true;
+            if (!value || std::strcmp(value, "1") == 0) return true;
+            if (std::strcmp(value, "0") == 0) return false;
             throw std::invalid_argument("LLAMINAR_QFN_CUDA_MAPPED_RETAINED_M1_HC_FFN_CANDIDATE requires 0 or 1");
+        }();
+        return enabled;
+    }
+
+    /** @return Whether mapped ROCm M1 topologies select the two-kernel retained HC/FFN program (default: enabled). */
+    inline bool qfnROCmMappedRetainedM1HCFFNCandidate()
+    {
+        static const bool enabled = [] {
+            const char *value = std::getenv("LLAMINAR_QFN_ROCM_MAPPED_RETAINED_M1_HC_FFN_CANDIDATE");
+            if (!value || std::strcmp(value, "1") == 0) return true;
+            if (std::strcmp(value, "0") == 0) return false;
+            throw std::invalid_argument("LLAMINAR_QFN_ROCM_MAPPED_RETAINED_M1_HC_FFN_CANDIDATE requires 0 or 1");
         }();
         return enabled;
     }

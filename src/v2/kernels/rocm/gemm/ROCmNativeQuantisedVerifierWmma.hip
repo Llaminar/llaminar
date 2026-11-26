@@ -10,6 +10,7 @@
  * share one LDS bank and the established compact decoder/contribution helpers.
  * No gfx906 device entry is emitted, and capture-time admission requires gfx1100.
  */
+#include <hip/hip_runtime.h>
 #include "ROCmNativeQuantisedVerifierLaunch.h"
 #include "ROCmNativeQuantisedArchitecture.h"
 #include "utils/PerfStatsCollector.h"
@@ -40,6 +41,7 @@ struct Projection {
     const uint32_t *minima; ///< Optional dual-half minima.
     const float *bias; ///< Only direct fused publication uses this pointer.
     float *destination; ///< Exact physical partition/output plane selected before decode.
+    ROCmFP32DestinationFold destination_fold; ///< Only the standalone terminal may consume prior C.
 };
 /**
  * @brief Publish through the original standalone/fused/partial arithmetic contract.
@@ -51,7 +53,10 @@ __device__ __forceinline__ void publish(Projection p,int row,int column,float va
 {
     if constexpr(Publication==VerifierWmmaPublication::Batched)
         value=__fadd_rn(value,p.bias?p.bias[column]:0.0f);
-    p.destination[static_cast<size_t>(row)*p.n+column]=value;
+    const auto index = static_cast<size_t>(row) * p.n + column;
+    if constexpr (Publication == VerifierWmmaPublication::StandaloneFold)
+        value = p.destination_fold.applyUpdate(value, p.destination, index, column);
+    p.destination[index] = value;
 }
 
 /**
@@ -205,11 +210,14 @@ __device__ __forceinline__ bool nextTile(Cursor &cursor,int &first,int &end)
  * @param a Quantized physical input. @param scales Physical activation scales.
  * @param sums Original optional whole-K32 sum plane.
  * @param args Captured bundle. @param k Physical contraction width.
- * @param span Canonical ceil-divided serial partition width. @param storage Native CTA bank.
+ * @param span Canonical ceil-divided serial partition width.
+ * @param destination_fold Terminal update of the original C lane.
+ * @param storage Native CTA bank.
  */
 template<VerifierWmmaPublication Publication,bool HasWork>
 __device__ __forceinline__ void produce(
-    const int8_t *a,const float *scales,const int32_t *sums,NativeQuantisedSmallMBatchedArgs args,int k,int span,Storage *storage)
+    const int8_t *a,const float *scales,const int32_t *sums,NativeQuantisedSmallMBatchedArgs args,int k,int span,
+    ROCmFP32DestinationFold destination_fold, Storage *storage)
 {
 #if defined(__gfx1100__)
     int proj=0;
@@ -226,7 +234,7 @@ __device__ __forceinline__ void produce(
         if constexpr(Publication==VerifierWmmaPublication::Batched)bias=args.bias[proj];
     }
     Projection p{n,static_cast<int>(blockIdx.x-args.grid_offsets[proj])*64,
-        args.payload[proj],args.scales[proj],args.mins[proj],args.emins[proj],bias,dest};
+        args.payload[proj],args.scales[proj],args.mins[proj],args.emins[proj],bias,dest,destination_fold};
     const auto codebook=static_cast<NativeQuantisedGemmFormat>(args.codebook[proj]);
     auto cursor=projectionCursorFor<HasWork>(args.work,args.rows,blockIdx.z,gridDim.z,16);
     const int begin=blockIdx.y*span,end_block=min(k/32,begin+span);
@@ -265,11 +273,12 @@ __device__ __forceinline__ void produce(
 /** @brief Native matrix packet; template parameters and operands follow produce(). */
 template<VerifierWmmaPublication Publication,bool HasWork>
 __global__ __launch_bounds__(128,1) void native_quantised_verifier_wmma_m16n64(
-    const int8_t *a,const float *scales,const int32_t *sums,NativeQuantisedSmallMBatchedArgs args,int k,int span)
+    const int8_t *a,const float *scales,const int32_t *sums,NativeQuantisedSmallMBatchedArgs args,int k,int span,
+    ROCmFP32DestinationFold destination_fold)
 {
 #if defined(__gfx1100__)
     __shared__ Storage storage;
-    produce<Publication,HasWork>(a,scales,sums,args,k,span,&storage);
+    produce<Publication,HasWork>(a,scales,sums,args,k,span,destination_fold,&storage);
 #endif
 }
 
@@ -293,7 +302,9 @@ void submitNativeQuantisedVerifierWmma(const NativeQuantisedVerifierWmmaArgument
     const auto &bundle=args.projections;
     if(bundle.work.physicalRows()!=bundle.rows.physicalRows() ||
         (args.partitions>1 && args.publication!=VerifierWmmaPublication::OrderedPartial) ||
-        (args.publication==VerifierWmmaPublication::Standalone && bundle.num_projections!=1))
+        ((args.publication==VerifierWmmaPublication::Standalone ||
+          args.publication==VerifierWmmaPublication::StandaloneFold) && bundle.num_projections!=1) ||
+        (args.publication==VerifierWmmaPublication::StandaloneFold && args.destination_fold.isIdentity()))
         throw std::invalid_argument("Native verifier WMMA row/publication contract disagrees");
     int64_t tiles=0;
     for(int p=0;p<bundle.num_projections;++p) {
@@ -337,7 +348,7 @@ void submitNativeQuantisedVerifierWmma(const NativeQuantisedVerifierWmmaArgument
         const auto grid=dim3(args.projections.total_grid_n,args.partitions,args.row_workers);
         const int span=(args.k/32+args.partitions-1)/args.partitions;
         verifier_wmma_detail::native_quantised_verifier_wmma_m16n64<Publication,HasWork><<<grid,128,0,hs>>>(
-            args.activations,args.activation_scales,args.activation_sums,args.projections,args.k,span);
+            args.activations,args.activation_scales,args.activation_sums,args.projections,args.k,span,args.destination_fold);
         const auto status=hipGetLastError();
         if(status!=hipSuccess)throw std::runtime_error(hipGetErrorString(status));
         // Construction evidence names the actual submitted native function;
@@ -359,6 +370,7 @@ void submitNativeQuantisedVerifierWmma(const NativeQuantisedVerifierWmmaArgument
     };
     switch(args.publication) {
     case VerifierWmmaPublication::Standalone: work.template operator()<VerifierWmmaPublication::Standalone>();return;
+    case VerifierWmmaPublication::StandaloneFold: work.template operator()<VerifierWmmaPublication::StandaloneFold>();return;
     case VerifierWmmaPublication::Batched: work.template operator()<VerifierWmmaPublication::Batched>();return;
     case VerifierWmmaPublication::OrderedPartial: work.template operator()<VerifierWmmaPublication::OrderedPartial>();return;
     }

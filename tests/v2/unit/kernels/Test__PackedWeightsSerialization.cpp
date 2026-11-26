@@ -724,7 +724,7 @@ TEST(Test__PackedWeightsSerialization, CPUPreparedBankAllocationAndArchiveReplay
         expectCanonicalCPUProjectionAllocation(*imported, *format);
 
         std::shared_ptr<ITensorGemm> legacy_imported;
-        if (packed->usesNibbleLUT())
+        if (packed->usesNibbleLUT() && !is_repacked_nibble_lut_format(packed->codebook_id))
         {
             // The source's native packer is independent of CPU interleaving.
             constexpr int n = 64, k_blocks = 8, bytes = 16;

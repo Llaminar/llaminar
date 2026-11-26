@@ -69,17 +69,17 @@ TEST(IQ3SSourceScale, MandatoryTupleMetadataAndOldGenerationsRejected)
     auto wrong=header;wrong.payload_bytes=32;EXPECT_FALSE(validateGpuPackedHeader(wrong,total));
     PackedWeightsHeader cpu_header{};using Encoding=cpu::native_quantised::CPUNativeQuantisedEncoding;
     cpu_header.codebook_id=11;cpu_header.is_superblock=1;cpu_header.payload_bytes=13;
-    cpu_header.prepared_encoding=static_cast<uint8_t>(Encoding::IQ3SExpandedSourceScale);
-    cpu_header.data_stride=2048;cpu_header.interleaved_block_stride=2432;
+    cpu_header.prepared_encoding=static_cast<uint8_t>(Encoding::NibbleLUTSourceScale);
+    cpu_header.data_stride=1024;cpu_header.interleaved_block_stride=1408;
     ASSERT_TRUE(packed_weights_serialization::validNativeSourceScaleTupleHeader(cpu_header));
-    cpu_header.interleaved_block_stride=2304;EXPECT_FALSE(packed_weights_serialization::validNativeSourceScaleTupleHeader(cpu_header));
-    cpu_header.interleaved_block_stride=2432;cpu_header.codebook_id=12;EXPECT_FALSE(packed_weights_serialization::validNativeSourceScaleTupleHeader(cpu_header));
+    cpu_header.interleaved_block_stride=1280;EXPECT_FALSE(packed_weights_serialization::validNativeSourceScaleTupleHeader(cpu_header));
+    cpu_header.interleaved_block_stride=1408;cpu_header.codebook_id=12;EXPECT_FALSE(packed_weights_serialization::validNativeSourceScaleTupleHeader(cpu_header));
 }
 /** @brief Keep explicit rotation encoding separate from ordinary source-factor preservation. */
 TEST(IQ3SSourceScale, OrdinaryAndExplicitRotationEncodingBoundaries)
 {
     using namespace cpu::native_quantised;
-    EXPECT_EQ(preparedEncodingForCodebook(11,false),CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale);
+    EXPECT_EQ(preparedEncodingForCodebook(11,false),CPUNativeQuantisedEncoding::NibbleLUTSourceScale);
     EXPECT_EQ(preparedEncodingForCodebook(11,true),CPUNativeQuantisedEncoding::ExpandedInt8);
     PackedWeightsHeader header{};header.codebook_id=11;header.is_superblock=1;
     header.prepared_encoding=static_cast<uint8_t>(CPUNativeQuantisedEncoding::ExpandedInt8);
@@ -100,7 +100,7 @@ TEST(IQ3SSourceScale, ArchiveRoundTripRejectsV6BeforeAdoption)
     ASSERT_TRUE(prepared);CPUPackedWeights owner(std::move(packed));
     auto blob=serialize(owner);auto restored=deserialize(blob.data(),blob.size());
     ASSERT_NE(restored,nullptr);const auto *native=dynamic_cast<const CPUPackedWeights*>(restored.get());
-    ASSERT_NE(native,nullptr);EXPECT_TRUE(native->packed().usesIQ3SExpandedSourceScale());
+    ASSERT_NE(native,nullptr);EXPECT_TRUE(native->packed().usesNibbleLUTSourceScale());
     ASSERT_EQ(native->packed().native_interleaved.size(),owner.packed().native_interleaved.size());
     EXPECT_EQ(std::memcmp(native->packed().native_interleaved.data(),owner.packed().native_interleaved.data(),owner.packed().native_interleaved.size()),0);
     const uint32_t old_version=6;

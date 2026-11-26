@@ -19,6 +19,21 @@ enum class NativeResidentLaunchPolicy { Cooperative, Ordinary };
 enum class NativeCooperativeBackend { CUDA, ROCm };
 template<NativeCooperativeBackend> class NativeCooperativeKernelBoundary;
 
+/** @brief Declarative processor reservation for co-resident background services. */
+struct NativeCoResidencyReservation
+{
+    unsigned reserved_processors=0; ///< Physical CUs (ROCm) or SMs (CUDA) held back for co-resident services.
+
+    /** @return Unreserved policy permitting full-device resident grids. */
+    static constexpr NativeCoResidencyReservation none() noexcept {return {};}
+    /** @return Reserve @p processors CUs/SMs for co-resident tier maintenance or transfers. */
+    static constexpr NativeCoResidencyReservation reserveProcessors(unsigned processors) noexcept
+    {
+        return {processors};
+    }
+    constexpr bool operator==(const NativeCoResidencyReservation&) const noexcept = default;
+};
+
 /** @brief Exact loaded-program resources observed outside capture. */
 struct NativeCooperativeKernelResources
 {
@@ -40,7 +55,11 @@ public:
     unsigned threads() const noexcept {return threads_;}
     /** @return Exact dynamic LDS/smem bytes used for the occupancy observation. */
     std::size_t dynamicSharedBytes() const noexcept {return dynamic_shared_;}
-    /** @return Maximum resident grid from cached hardware and actual occupancy. */
+    /** @return Declarative co-residency reservation honored by this admission. */
+    NativeCoResidencyReservation coResidency() const noexcept {return co_residency_;}
+    /** @return Physical processors available to this resident kernel after co-residency reservation. */
+    unsigned availableProcessors() const noexcept {return available_processors_;}
+    /** @return Maximum resident grid from cached hardware, co-residency reservation and actual occupancy. */
     unsigned maximumGrid() const noexcept {return maximum_grid_;}
     /** @return The explicit submission policy whose capability was admitted. */
     NativeResidentLaunchPolicy policy() const noexcept {return policy_;}
@@ -50,17 +69,21 @@ private:
     template<NativeCooperativeBackend> friend class NativeCooperativeKernelBoundary;
     /** @brief Seal validated native observations; ordinary callers cannot forge residency. */
     NativeCooperativeKernelAdmission(DeviceId device,const void* function,std::uint64_t generation,
-        unsigned threads,std::size_t shared,unsigned maximum_grid,NativeCooperativeKernelResources resources,
-        NativeResidentLaunchPolicy policy)
+        unsigned threads,std::size_t shared,unsigned available_processors,unsigned maximum_grid,
+        NativeCooperativeKernelResources resources,NativeResidentLaunchPolicy policy,
+        NativeCoResidencyReservation co_residency=NativeCoResidencyReservation::none())
         :device_(device),function_(function),generation_(generation),threads_(threads),dynamic_shared_(shared),
-         maximum_grid_(maximum_grid),resources_(resources),policy_(policy) {}
+         available_processors_(available_processors),maximum_grid_(maximum_grid),resources_(resources),
+         policy_(policy),co_residency_(co_residency) {}
     DeviceId device_;
     const void* function_;
     std::uint64_t generation_;
     unsigned threads_;
     std::size_t dynamic_shared_;
+    unsigned available_processors_;
     unsigned maximum_grid_;
     NativeCooperativeKernelResources resources_;
     NativeResidentLaunchPolicy policy_;
+    NativeCoResidencyReservation co_residency_;
 };
 }

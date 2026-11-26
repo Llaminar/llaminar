@@ -3375,6 +3375,7 @@ namespace llaminar2
             if (stage_variant_changed || diagnostic_recapture ||
                 snapshot_topology_changed)
             {
+                graph.reset();
                 segment_cache.reset(
                     GraphSegmentCache::StreamResetPolicy::Preserve);
                 if (stage_variant_changed)

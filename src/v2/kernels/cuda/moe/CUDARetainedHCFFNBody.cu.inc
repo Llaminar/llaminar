@@ -315,6 +315,685 @@
     }
 
     /**
+     * @brief Share the rounded input load across two independent half-router dots (256-CTA wave).
+     */
+    __device__ __forceinline__ void retainedRouterTwo(const float* hidden, const __half* weights,
+        float* output, float (*partial)[8])
+    {
+        constexpr int width = kQFNDecodeGateUpK;
+        float sum0 = 0.0f, sum1 = 0.0f;
+#pragma unroll 2
+        for (unsigned i = threadIdx.x; i < width; i += kThreads)
+        {
+            const float value = __half2float(__float2half_rn(hidden[i]));
+            sum0 += value * __half2float(weights[i]);
+            sum1 += value * __half2float(weights[width + i]);
+        }
+        const unsigned lane = threadIdx.x % 32;
+        const unsigned warp = threadIdx.x / 32;
+#pragma unroll
+        for (unsigned offset = 16; offset > 0; offset >>= 1)
+        {
+            sum0 += __shfl_down_sync(0xffffffffu, sum0, offset);
+            sum1 += __shfl_down_sync(0xffffffffu, sum1, offset);
+        }
+        if (lane == 0)
+        {
+            partial[0][warp] = sum0;
+            partial[1][warp] = sum1;
+        }
+        __syncthreads();
+        if (warp < 2u)
+        {
+            float sum = lane < 8 ? partial[warp][lane] : 0.0f;
+#pragma unroll
+            for (unsigned offset = 16; offset > 0; offset >>= 1)
+                sum += __shfl_down_sync(0xffffffffu, sum, offset);
+            if (lane == 0)
+                output[warp] = sum;
+        }
+    }
+
+    /** @brief Native phase ownership fixed at graph construction. */
+    enum class RetainedM1NativePhase { Complete, RoutePrefix, FFNSuffix };
+
+    /** @brief Shared workspace for union-resident 512-expert softmax + top-k selection. */
+    struct RetainedTopKShared
+    {
+        float values[kRetainedQFNExpertCount];
+        float reductions[kThreads];
+        int red_idx[kThreads];
+        int selected[kMaxTopK];
+        float selected_weights[kMaxTopK];
+    };
+
+    /**
+     * @brief Dedicated 4-CTA/SM cooperative HC + Router + HiddenQ8 + SharedGate kernel.
+     *
+     * Decoupled from TopK/descriptor/device-graph planning so ptxas targets <=64
+     * registers with zero spills and launches 296 resident CTAs (4 CTAs/SM on SM86).
+     */
+    template<bool PublishHCActivated, bool PublishHCUp, bool GeneralCodebooks = false>
+    __global__ __launch_bounds__(kThreads, GeneralCodebooks ? 2 : 3) void retainedQFNM1HCRouterKernel(
+        const __grid_constant__ RetainedM1HCFFN args)
+    {
+        using namespace llaminar2::cuda::moe;
+        auto grid = cooperative_groups::this_grid();
+        __shared__ union
+        {
+            RetainedHCPrefixShared<kQFNDecodeGateUpK> hc;
+            float router_tiles[4][8];
+            float shared_factor[kThreads];
+        } workspace;
+
+        const auto& router = args.router;
+        constexpr int hidden = kQFNDecodeGateUpK;
+        const unsigned routed_packets = static_cast<unsigned>(args.routed_width) / 32u;
+        const unsigned shared_packets = static_cast<unsigned>(args.shared.gate.n) / 32u;
+        const unsigned lane = threadIdx.x % 32;
+        const unsigned warp = threadIdx.x / 32;
+
+        if (args.profile_ns && blockIdx.x == 0 && threadIdx.x == 0)
+            args.profile_ns[0] = retainedRouteClock();
+        const unsigned max_packets = static_cast<unsigned>(router.top_k) * routed_packets + shared_packets;
+        if (blockIdx.x == 0)
+        {
+            for (unsigned i = threadIdx.x; i < max_packets; i += blockDim.x)
+                args.suffix_done[i] = 0u;
+        }
+
+        uint32_t* hc_down_done = (args.suffix_done && max_packets >= static_cast<unsigned>(args.hc.down.n / 32))
+            ? args.suffix_done : nullptr;
+        publishRetainedHCPrefix<PublishHCActivated, PublishHCUp, hidden, true, GeneralCodebooks>(
+            args.hc, workspace.hc, grid, args.profile_ns, hc_down_done);
+        if (args.profile_ns && blockIdx.x == 0 && threadIdx.x == 0)
+            args.profile_ns[4] = retainedRouteClock();
+
+        const auto* router_weights = reinterpret_cast<const __half*>(router.weights);
+        if (gridDim.x >= 267u)
+        {
+            // Full-GPU single-wave overlapped Router (256 CTAs x 2 experts) + HiddenQ8 (10 CTAs) + SharedGate (1 CTA).
+            if (blockIdx.x < 256u)
+            {
+                const int first_expert = 2 * static_cast<int>(blockIdx.x);
+                retainedRouterTwo(args.hc.mixed, router_weights + first_expert * hidden,
+                    router.logits + first_expert, workspace.router_tiles);
+            }
+            else if (blockIdx.x < 266u)
+            {
+                const unsigned packet = ((blockIdx.x - 256u) * 8u + warp) * 32u;
+                if (packet < static_cast<unsigned>(hidden))
+                    retainedHiddenQ8(args.hc.mixed[packet + lane], args.hidden_codes + packet,
+                        args.hidden_scales + packet / 32u, lane);
+            }
+            else if (blockIdx.x == 266u && args.shared_publication == RetainedM1SharedPublication::GatedComplete)
+            {
+                const float factor = retainedSharedGateFactor(args.hc.mixed, args.shared_gate_input,
+                    hidden, workspace.shared_factor);
+                if (threadIdx.x == 0)
+                    *args.shared_gate_factor = factor;
+            }
+        }
+        else if (gridDim.x >= 139u)
+        {
+            // Single-wave overlapped Router (128 CTAs x 4 experts) + HiddenQ8 (10 CTAs) + SharedGate (1 CTA).
+            if (blockIdx.x < 128u)
+            {
+                const int first_expert = 4 * static_cast<int>(blockIdx.x);
+                retainedRouterFour(args.hc.mixed, router_weights + first_expert * hidden,
+                    router.logits + first_expert, workspace.router_tiles);
+            }
+            else if (blockIdx.x < 138u)
+            {
+                const unsigned packet = ((blockIdx.x - 128u) * 8u + warp) * 32u;
+                if (packet < static_cast<unsigned>(hidden))
+                    retainedHiddenQ8(args.hc.mixed[packet + lane], args.hidden_codes + packet,
+                        args.hidden_scales + packet / 32u, lane);
+            }
+            else if (blockIdx.x == 138u && args.shared_publication == RetainedM1SharedPublication::GatedComplete)
+            {
+                const float factor = retainedSharedGateFactor(args.hc.mixed, args.shared_gate_input,
+                    hidden, workspace.shared_factor);
+                if (threadIdx.x == 0)
+                    *args.shared_gate_factor = factor;
+            }
+        }
+        else
+        {
+            for (int tile = blockIdx.x; tile < kRetainedQFNExpertCount / 4; tile += gridDim.x)
+            {
+                const int first_expert = 4 * tile;
+                retainedRouterFour(args.hc.mixed, router_weights + first_expert * hidden,
+                    router.logits + first_expert, workspace.router_tiles);
+                __syncthreads();
+            }
+            const unsigned first_thread = blockIdx.x * blockDim.x + threadIdx.x;
+            const unsigned threads = gridDim.x * blockDim.x;
+            for (unsigned packet = first_thread / 32 * 32; packet < static_cast<unsigned>(hidden); packet += threads)
+                retainedHiddenQ8(args.hc.mixed[packet + lane], args.hidden_codes + packet,
+                    args.hidden_scales + packet / 32, lane);
+            if (blockIdx.x == 1 && args.shared_publication == RetainedM1SharedPublication::GatedComplete)
+            {
+                const float factor = retainedSharedGateFactor(args.hc.mixed, args.shared_gate_input,
+                    hidden, workspace.shared_factor);
+                if (threadIdx.x == 0)
+                    *args.shared_gate_factor = factor;
+            }
+        }
+    }
+
+    /** @brief Runtime-parametric codebook + provenance check covering all 18 codebooks and dynamic promotion. */
+    __device__ __forceinline__ bool retainedDescValidRuntime(
+        const DeviceNativeQuantisedMatrixDesc& desc, int expected_n, int expected_k,
+        uint8_t canonical_cb, uint8_t promoted_cb, uint8_t source_superblock, bool moved)
+    {
+        if (!native_quantised_desc_shape_ok_dynamic(desc, expected_n, expected_k))
+            return false;
+        if (moved)
+        {
+            if (desc.codebook_id != promoted_cb)
+                return false;
+            if (promoted_cb == llaminar2::kNativeQuantisedExpandedInt8MinCodebook)
+            {
+                return desc.source_identity_present &&
+                       desc.source_codebook_id == canonical_cb &&
+                       desc.source_is_superblock == source_superblock;
+            }
+            return true;
+        }
+        const auto is_iq4_lut = [](std::uint8_t cb) noexcept {
+            return cb == 4u || cb == llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook;
+        };
+        return desc.codebook_id == canonical_cb ||
+               (is_iq4_lut(canonical_cb) && is_iq4_lut(desc.codebook_id));
+    }
+
+    /**
+     * @brief Dedicated 1-CTA TopK + descriptor binding + device-graph suffix grid planner.
+     *
+     * Codebook-independent (4 instantiations cover all 18 codebooks and arbitrary local widths).
+     * Runs non-cooperatively (grid=1, block=256) after HCRouter completion with zero spills.
+     */
+    template<bool ObserveCollectives, bool IndependentLocalShard>
+    __global__ __launch_bounds__(kThreads, 1) void retainedQFNM1TopKPlanKernel(
+        const __grid_constant__ RetainedM1HCFFN args)
+    {
+        using namespace llaminar2::cuda::moe;
+        const auto& router = args.router;
+        auto* runtime = reinterpret_cast<DeviceMoELayerRuntimeView*>(router.runtime);
+        constexpr int hidden = kQFNDecodeGateUpK;
+        const unsigned routed_packets = static_cast<unsigned>(args.routed_width) / 32u;
+        const unsigned shared_packets = static_cast<unsigned>(args.shared.gate.n) / 32u;
+        const uint8_t gate_cb = args.gate_codebook;
+        const uint8_t down_cb = args.down_codebook;
+        const uint8_t gate_promoted = args.gate_promoted_codebook;
+        const uint8_t down_promoted = args.down_promoted_codebook;
+        const bool can_promote_gate = gate_promoted != 0xffu;
+        const bool can_promote_down = down_promoted != 0xffu;
+
+        if (args.profile_ns && threadIdx.x == 0)
+            args.profile_ns[5] = retainedRouteClock();
+
+        // Re-arm the first col_tiles entries of suffix_done consumed as hc_down_done
+        // during the fused single-sync HC Down inside retainedQFNM1HCRouterKernel.
+        const unsigned max_packets = static_cast<unsigned>(router.top_k) * routed_packets + shared_packets;
+        const unsigned down_tiles = static_cast<unsigned>(args.hc.down.n / 32);
+        if (args.suffix_done && max_packets >= down_tiles && threadIdx.x < down_tiles)
+            args.suffix_done[threadIdx.x] = 0u;
+
+        if constexpr (IndependentLocalShard)
+        {
+            __shared__ RetainedTopKShared tk;
+            __shared__ DeviceMoEExpertDescriptorView preloaded_desc[kMaxTopK];
+            __shared__ uint8_t preloaded_local[kMaxTopK];
+            const unsigned tid = threadIdx.x;
+            const float l0 = router.logits[tid];
+            const float l1 = router.logits[tid + kThreads];
+            tk.reductions[tid] = fmaxf(l0, l1);
+            __syncthreads();
+            if (tid < 32u)
+            {
+                float m = fmaxf(
+                    fmaxf(fmaxf(tk.reductions[tid], tk.reductions[tid + 128u]),
+                          fmaxf(tk.reductions[tid + 64u], tk.reductions[tid + 192u])),
+                    fmaxf(fmaxf(tk.reductions[tid + 32u], tk.reductions[tid + 160u]),
+                          fmaxf(tk.reductions[tid + 96u], tk.reductions[tid + 224u])));
+#pragma unroll
+                for (int s = 16; s > 0; s >>= 1)
+                    m = fmaxf(m, __shfl_down_sync(0xffffffffu, m, s));
+                if (tid == 0)
+                    tk.reductions[0] = m;
+            }
+            __syncthreads();
+            const float max_value = tk.reductions[0];
+
+            const float p0 = expf(l0 - max_value);
+            const float p1 = expf(l1 - max_value);
+            tk.values[tid] = p0;
+            tk.values[tid + kThreads] = p1;
+            tk.reductions[tid] = p0 + p1;
+            __syncthreads();
+            if (tid < 32u)
+            {
+                const float low = __fadd_rn(__fadd_rn(tk.reductions[tid], tk.reductions[tid + 128u]),
+                                            __fadd_rn(tk.reductions[tid + 64u], tk.reductions[tid + 192u]));
+                const float high = __fadd_rn(__fadd_rn(tk.reductions[tid + 32u], tk.reductions[tid + 160u]),
+                                             __fadd_rn(tk.reductions[tid + 96u], tk.reductions[tid + 224u]));
+                float s = __fadd_rn(low, high);
+#pragma unroll
+                for (int d = 16; d > 0; d >>= 1)
+                    s = __fadd_rn(s, __shfl_down_sync(0xffffffffu, s, d));
+                if (tid == 0)
+                    tk.reductions[0] = s;
+            }
+            __syncthreads();
+            const float denom = tk.reductions[0];
+            const float q0 = denom > 0.0f ? p0 / denom : 0.0f;
+            const float q1 = denom > 0.0f ? p1 / denom : 0.0f;
+            tk.values[tid] = q0;
+            tk.values[tid + kThreads] = q1;
+            router.logits[tid] = q0;
+            router.logits[tid + kThreads] = q1;
+            __syncthreads();
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+            retainedTopK512(tk.values, router.top_k, tk.selected, tk.selected_weights, tk.reductions, tk.red_idx);
+#else
+            moe_select_topk_probabilities_block(tk.values, router.experts, router.top_k,
+                tk.selected, tk.selected_weights, tk.reductions, tk.red_idx);
+#endif
+            if (tid == 0)
+            {
+                float topk_sum = 0.0f;
+                for (int slot = 0; slot < router.top_k; ++slot)
+                    topk_sum += tk.selected_weights[slot];
+                if (router.normalize && topk_sum > 0.0f)
+                    for (int slot = 0; slot < router.top_k; ++slot)
+                        tk.selected_weights[slot] = tk.selected_weights[slot] / topk_sum;
+            }
+            __syncthreads();
+            if (args.profile_ns && tid == 0)
+                args.profile_ns[11] = retainedRouteClock();
+
+            {
+                const uint32_t exec_bank = runtime_require_decode_execution_bank(runtime);
+                if (exec_bank > 1u)
+                    __trap();
+                const auto& bank = runtime_placement_banks(runtime)[exec_bank];
+                const unsigned warp = tid / 32u;
+                const unsigned lane = tid % 32u;
+                static_assert(sizeof(DeviceMoEExpertDescriptorView) % sizeof(uint64_t) == 0);
+                constexpr unsigned desc_words = sizeof(DeviceMoEExpertDescriptorView) / sizeof(uint64_t);
+                for (int s = static_cast<int>(warp); s < router.top_k; s += 8)
+                {
+                    const int e = tk.selected[s];
+                    const bool maybe_local = e >= 0 && e < router.experts && bank.local_compute_mask[e] != 0u;
+                    if (lane == 0u)
+                        preloaded_local[s] = maybe_local ? 1u : 0u;
+                    if (maybe_local)
+                    {
+                        const auto* src_words = reinterpret_cast<const uint64_t*>(&bank.experts[e]);
+                        auto* dst_words = reinterpret_cast<uint64_t*>(&preloaded_desc[s]);
+                        for (unsigned w = lane; w < desc_words; w += 32u)
+                            dst_words[w] = src_words[w];
+                    }
+                }
+            }
+            __syncthreads();
+            if (tid < 32u)
+            {
+                const int slot = static_cast<int>(tid);
+                const bool in_route = slot < router.top_k;
+                const uint32_t execution_bank = runtime_require_decode_execution_bank(runtime);
+                if (execution_bank > 1u)
+                    __trap();
+                const bool shape_ok = runtime_shape_ok(runtime, execution_bank, router.experts, router.top_k);
+                if (!runtime_route_assignment_ledger_ok(runtime, router.top_k))
+                    __trap();
+                runtime_require_decode_row_policy(runtime, llaminar2::RoutedExpertRowExecutionPolicy::IntermediateShardLocal);
+                const auto& bank = runtime_placement_banks(runtime)[execution_bank];
+                const bool collect_histogram = ObserveCollectives && runtime_histogram_admits_rows(*runtime);
+                const int expert_id = in_route ? tk.selected[slot] : -1;
+                const float weight = in_route ? tk.selected_weights[slot] : 0.0f;
+                bool local_compute = false;
+                if (in_route)
+                {
+                    int participant = -1;
+                    if (shape_ok)
+                    {
+                        if (expert_id != -1)
+                        {
+                            const auto selection = runtime_intermediate_shard_row(runtime, bank, expert_id);
+                            local_compute = selection.disposition == llaminar2::MoEIntermediateShardRowDisposition::Local;
+                            participant = selection.participant;
+                        }
+                        runtime->topk_expert_ids[slot] = local_compute ? expert_id : -1;
+                        runtime->topk_weights[slot] = local_compute ? weight : 0.0f;
+                        runtime->route_participant_ids[slot] = participant;
+                    }
+                    router.route_indices[slot] = static_cast<float>(expert_id);
+                    router.route_weights[slot] = weight;
+                    if constexpr (ObserveCollectives)
+                    {
+                        if (collect_histogram && expert_id >= 0 && expert_id < router.experts)
+                        {
+                            atomicAdd(reinterpret_cast<unsigned long long*>(
+                                &runtime_selected_histogram(*runtime, 0u)[expert_id]), 1ULL);
+                            if (shape_ok && local_compute)
+                                atomicAdd(reinterpret_cast<unsigned long long*>(
+                                    &runtime_local_histogram(*runtime, 0u)[expert_id]), 1ULL);
+                        }
+                    }
+                }
+                const int local_expert = (in_route && shape_ok && local_compute) ? expert_id : -1;
+                const unsigned present = __ballot_sync(0xffffffffu, local_expert >= 0);
+                const int local_count = __popc(present);
+                const DeviceMoEExpertDescriptorView* descriptor =
+                    (local_expert >= 0 && preloaded_local[slot]) ? &preloaded_desc[slot] : nullptr;
+                unsigned promoted = 0;
+                if (can_promote_gate)
+                    promoted = __ballot_sync(0xffffffffu, descriptor && descriptor->gate.codebook_id == gate_promoted);
+                else if (can_promote_down)
+                    promoted = __ballot_sync(0xffffffffu, descriptor && descriptor->down.codebook_id == down_promoted);
+                const unsigned canonical = present & ~promoted;
+                const int canonical_count = __popc(canonical);
+                const unsigned prefix_mask = (1u << slot) - 1u;
+                if (slot == 0)
+                {
+                    args.route_order[0] = local_count;
+                    args.route_order[1] = canonical_count;
+                }
+                if (descriptor)
+                {
+                    const auto& view = *descriptor;
+                    const bool moved = (promoted & (1u << slot)) != 0;
+                    const bool gate_valid =
+                        retainedDescValidRuntime(view.gate, args.routed_width, hidden, gate_cb, gate_promoted,
+                            args.gate_source_superblock, can_promote_gate && moved) &&
+                        retainedDescValidRuntime(view.up, args.routed_width, hidden, gate_cb, gate_promoted,
+                            args.gate_source_superblock, can_promote_gate && moved);
+                    const bool down_valid =
+                        retainedDescValidRuntime(view.down, hidden, args.routed_width, down_cb, down_promoted,
+                            args.down_source_superblock, can_promote_down && moved);
+                    if (!gate_valid || !down_valid)
+                        __trap();
+                    const int packed = moved ? canonical_count + __popc(promoted & prefix_mask) : __popc(canonical & prefix_mask);
+                    args.route_order[kRetainedRouteCounts + packed] = slot;
+                    preloaded_local[packed] = static_cast<uint8_t>(slot);
+                }
+                else if (in_route)
+                    args.route_order[kRetainedRouteCounts + local_count + slot - __popc(present & prefix_mask)] = slot;
+            }
+            __syncthreads();
+            {
+                const int n_copy = args.route_order[0];
+                const unsigned warp = tid / 32u;
+                const unsigned lane = tid % 32u;
+                static_assert(sizeof(DeviceNativeQuantisedMatrixDesc) % sizeof(uint64_t) == 0);
+                constexpr unsigned words_per_mat = sizeof(DeviceNativeQuantisedMatrixDesc) / sizeof(uint64_t);
+                for (int packed = static_cast<int>(warp); packed < n_copy; packed += 8)
+                {
+                    const auto& view = preloaded_desc[preloaded_local[packed]];
+                    auto& dst = args.selected[packed];
+                    if (lane < words_per_mat)
+                    {
+                        reinterpret_cast<uint64_t*>(&dst.gate)[lane] = reinterpret_cast<const uint64_t*>(&view.gate)[lane];
+                        reinterpret_cast<uint64_t*>(&dst.up)[lane] = reinterpret_cast<const uint64_t*>(&view.up)[lane];
+                        reinterpret_cast<uint64_t*>(&dst.down)[lane] = reinterpret_cast<const uint64_t*>(&view.down)[lane];
+                    }
+                }
+            }
+            __syncthreads();
+            if (tid == 0)
+            {
+                if (args.profile_ns)
+                    args.profile_ns[12] = retainedRouteClock();
+#if CUDART_VERSION >= 12080
+                if (args.suffix_gate_up_node && args.suffix_down_node)
+                {
+                    const unsigned local_active = static_cast<unsigned>(args.route_order[0]);
+                    const unsigned total_gate_up_packets = local_active * routed_packets + shared_packets;
+                    if (cudaGraphKernelNodeSetGridDim(
+                            static_cast<cudaGraphDeviceNode_t>(args.suffix_gate_up_node),
+                            dim3(retained_suffix_gate_up_k_splits, total_gate_up_packets)) != cudaSuccess ||
+                        cudaGraphKernelNodeSetGridDim(
+                            static_cast<cudaGraphDeviceNode_t>(args.suffix_down_node),
+                            dim3(static_cast<unsigned>(hidden / 32), local_active + 1u)) != cudaSuccess)
+                        __trap();
+                }
+#endif
+            }
+        }
+        else
+        {
+            __shared__ RetainedTopKShared tk;
+            __shared__ RuntimeDecodeDispatchScratch dispatch;
+            __shared__ DeviceMoEExpertDescriptorView preloaded_desc[kMaxTopK];
+            __shared__ uint8_t packed_slots[kMaxTopK];
+            __shared__ float shared_topk_sum;
+            __shared__ uint32_t shared_exec_bank;
+            __shared__ uint32_t shared_shape_ok;
+            const unsigned tid = threadIdx.x;
+            const float l0 = router.logits[tid];
+            const float l1 = router.logits[tid + kThreads];
+            tk.reductions[tid] = fmaxf(l0, l1);
+            __syncthreads();
+            if (tid < 32u)
+            {
+                float m = fmaxf(
+                    fmaxf(fmaxf(tk.reductions[tid], tk.reductions[tid + 128u]),
+                          fmaxf(tk.reductions[tid + 64u], tk.reductions[tid + 192u])),
+                    fmaxf(fmaxf(tk.reductions[tid + 32u], tk.reductions[tid + 160u]),
+                          fmaxf(tk.reductions[tid + 96u], tk.reductions[tid + 224u])));
+#pragma unroll
+                for (int s = 16; s > 0; s >>= 1)
+                    m = fmaxf(m, __shfl_down_sync(0xffffffffu, m, s));
+                if (tid == 0u)
+                    tk.reductions[0] = m;
+            }
+            __syncthreads();
+            const float max_value = tk.reductions[0];
+
+            const float p0 = expf(l0 - max_value);
+            const float p1 = expf(l1 - max_value);
+            tk.values[tid] = p0;
+            tk.values[tid + kThreads] = p1;
+            tk.reductions[tid] = p0 + p1;
+            __syncthreads();
+            if (tid < 32u)
+            {
+                const float low = __fadd_rn(__fadd_rn(tk.reductions[tid], tk.reductions[tid + 128u]),
+                                            __fadd_rn(tk.reductions[tid + 64u], tk.reductions[tid + 192u]));
+                const float high = __fadd_rn(__fadd_rn(tk.reductions[tid + 32u], tk.reductions[tid + 160u]),
+                                             __fadd_rn(tk.reductions[tid + 96u], tk.reductions[tid + 224u]));
+                float s = __fadd_rn(low, high);
+#pragma unroll
+                for (int d = 16; d > 0; d >>= 1)
+                    s = __fadd_rn(s, __shfl_down_sync(0xffffffffu, s, d));
+                if (tid == 0u)
+                    tk.reductions[0] = s;
+            }
+            __syncthreads();
+            const float denom = tk.reductions[0];
+            const float q0 = denom > 0.0f ? p0 / denom : 0.0f;
+            const float q1 = denom > 0.0f ? p1 / denom : 0.0f;
+            tk.values[tid] = q0;
+            tk.values[tid + kThreads] = q1;
+            router.logits[tid] = q0;
+            router.logits[tid + kThreads] = q1;
+            __syncthreads();
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+            retainedTopK512(tk.values, router.top_k, tk.selected, tk.selected_weights, tk.reductions, tk.red_idx);
+#else
+            moe_select_topk_probabilities_block(tk.values, router.experts, router.top_k,
+                tk.selected, tk.selected_weights, tk.reductions, tk.red_idx);
+#endif
+            if (tid == 0u)
+            {
+                runtime_require_decode_row_policy(runtime, router.local_policy);
+                const uint32_t execution_bank = runtime_require_decode_execution_bank(runtime);
+                if (execution_bank > 1u)
+                    __trap();
+                const bool shape_ok = runtime_shape_ok(runtime, execution_bank, router.experts, router.top_k);
+                if (!runtime_route_assignment_ledger_ok(runtime, router.top_k))
+                    __trap();
+                float topk_sum = 0.0f;
+                for (int k = 0; k < router.top_k; ++k)
+                    topk_sum += tk.selected_weights[k];
+                if (shape_ok)
+                {
+                    runtime_resolve_decode_dispatch(
+                        runtime, execution_bank, tk.selected, router.experts, router.top_k,
+                        router.position ? router.position[0] : -1,
+                        router.local_policy, ObserveCollectives, dispatch);
+                }
+                shared_topk_sum = topk_sum;
+                shared_exec_bank = execution_bank;
+                shared_shape_ok = shape_ok ? 1u : 0u;
+            }
+            __syncthreads();
+
+            const uint32_t exec_bank = shared_exec_bank;
+            const bool shape_ok = shared_shape_ok != 0u;
+            const auto& bank = runtime_placement_banks(runtime)[exec_bank];
+            const unsigned warp = tid >> 5;
+            const unsigned lane = tid & 31u;
+
+            // Publish all top_k route assignments and histogram atomics in parallel across warp 0,
+            // while warps 0..7 simultaneously preload local expert descriptors into shared memory.
+            if (tid < static_cast<unsigned>(router.top_k))
+            {
+                const int k = static_cast<int>(tid);
+                const int expert = tk.selected[k];
+                const float weight = (router.normalize && shared_topk_sum > 0.0f)
+                    ? (tk.selected_weights[k] / shared_topk_sum) : tk.selected_weights[k];
+                const bool local_compute = shape_ok && dispatch.local_compute_flags[k];
+                if (shape_ok)
+                {
+                    runtime->topk_expert_ids[k] = local_compute ? expert : -1;
+                    runtime->topk_weights[k] = local_compute ? weight : 0.0f;
+                    runtime->route_participant_ids[k] = dispatch.assigned_participants[k];
+                }
+                router.route_indices[k] = static_cast<float>(expert);
+                router.route_weights[k] = weight;
+                if constexpr (ObserveCollectives)
+                {
+                    if (runtime_histogram_admits_rows(*runtime) &&
+                        expert >= 0 && expert < kDeviceMoEMaxExperts)
+                    {
+                        atomicAdd(reinterpret_cast<unsigned long long*>(
+                            &runtime_selected_histogram(*runtime, 0u)[expert]), 1ULL);
+                        if (local_compute)
+                            atomicAdd(reinterpret_cast<unsigned long long*>(
+                                &runtime_local_histogram(*runtime, 0u)[expert]), 1ULL);
+                    }
+                }
+            }
+            if (shape_ok)
+            {
+                static_assert(sizeof(DeviceMoEExpertDescriptorView) % sizeof(uint64_t) == 0);
+                constexpr unsigned desc_words = sizeof(DeviceMoEExpertDescriptorView) / sizeof(uint64_t);
+                for (int s = static_cast<int>(warp); s < router.top_k; s += 8)
+                {
+                    if (dispatch.local_compute_flags[s])
+                    {
+                        const int e = tk.selected[s];
+                        if (e >= 0 && e < router.experts)
+                        {
+                            const auto* src_words = reinterpret_cast<const uint64_t*>(&bank.experts[e]);
+                            auto* dst_words = reinterpret_cast<uint64_t*>(&preloaded_desc[s]);
+                            for (unsigned w = lane; w < desc_words; w += 32u)
+                                dst_words[w] = src_words[w];
+                        }
+                    }
+                }
+            }
+            __syncthreads();
+
+            if (tid < 32u)
+            {
+                const int slot = static_cast<int>(tid);
+                const bool in_route = slot < router.top_k;
+                const bool local_compute = in_route && shape_ok && dispatch.local_compute_flags[slot];
+                const int expert = local_compute ? tk.selected[slot] : -1;
+                if (expert >= router.experts)
+                    __trap();
+                const unsigned present = __ballot_sync(0xffffffffu, expert >= 0);
+                const int local_count = __popc(present);
+                const DeviceMoEExpertDescriptorView* descriptor =
+                    (expert >= 0) ? &preloaded_desc[slot] : nullptr;
+                unsigned promoted = 0;
+                if (can_promote_gate)
+                    promoted = __ballot_sync(0xffffffffu, descriptor && descriptor->gate.codebook_id == gate_promoted);
+                else if (can_promote_down)
+                    promoted = __ballot_sync(0xffffffffu, descriptor && descriptor->down.codebook_id == down_promoted);
+                const unsigned canonical = present & ~promoted;
+                const int canonical_count = __popc(canonical);
+                const unsigned prefix_mask = (1u << slot) - 1u;
+                if (slot == 0)
+                {
+                    args.route_order[0] = local_count;
+                    args.route_order[1] = canonical_count;
+#if CUDART_VERSION >= 12080
+                    if (args.suffix_gate_up_node && args.suffix_down_node)
+                    {
+                        const unsigned local_active = static_cast<unsigned>(local_count);
+                        const unsigned total_gate_up_packets = local_active * routed_packets + shared_packets;
+                        if (cudaGraphKernelNodeSetGridDim(
+                                static_cast<cudaGraphDeviceNode_t>(args.suffix_gate_up_node),
+                                dim3(retained_suffix_gate_up_k_splits, total_gate_up_packets)) != cudaSuccess ||
+                            cudaGraphKernelNodeSetGridDim(
+                                static_cast<cudaGraphDeviceNode_t>(args.suffix_down_node),
+                                dim3(static_cast<unsigned>(hidden / 32), local_active + 1u)) != cudaSuccess)
+                            __trap();
+                    }
+#endif
+                }
+                if (descriptor)
+                {
+                    const auto& view = *descriptor;
+                    const bool moved = (promoted & (1u << slot)) != 0;
+                    const bool gate_valid =
+                        retainedDescValidRuntime(view.gate, args.routed_width, hidden, gate_cb, gate_promoted,
+                            args.gate_source_superblock, can_promote_gate && moved) &&
+                        retainedDescValidRuntime(view.up, args.routed_width, hidden, gate_cb, gate_promoted,
+                            args.gate_source_superblock, can_promote_gate && moved);
+                    const bool down_valid =
+                        retainedDescValidRuntime(view.down, hidden, args.routed_width, down_cb, down_promoted,
+                            args.down_source_superblock, can_promote_down && moved);
+                    if (!gate_valid || !down_valid)
+                        __trap();
+                    const int packed = moved ? canonical_count + __popc(promoted & prefix_mask) : __popc(canonical & prefix_mask);
+                    args.route_order[kRetainedRouteCounts + packed] = slot;
+                    packed_slots[packed] = static_cast<uint8_t>(slot);
+                }
+                else if (in_route)
+                    args.route_order[kRetainedRouteCounts + local_count + slot - __popc(present & prefix_mask)] = slot;
+            }
+            __syncthreads();
+            {
+                const int n_copy = args.route_order[0];
+                static_assert(sizeof(DeviceNativeQuantisedMatrixDesc) % sizeof(uint64_t) == 0);
+                constexpr unsigned words_per_mat = sizeof(DeviceNativeQuantisedMatrixDesc) / sizeof(uint64_t);
+                for (int packed = static_cast<int>(warp); packed < n_copy; packed += 8)
+                {
+                    const auto& view = preloaded_desc[packed_slots[packed]];
+                    auto& dst = args.selected[packed];
+                    if (lane < words_per_mat)
+                    {
+                        reinterpret_cast<uint64_t*>(&dst.gate)[lane] = reinterpret_cast<const uint64_t*>(&view.gate)[lane];
+                        reinterpret_cast<uint64_t*>(&dst.up)[lane] = reinterpret_cast<const uint64_t*>(&view.up)[lane];
+                        reinterpret_cast<uint64_t*>(&dst.down)[lane] = reinterpret_cast<const uint64_t*>(&view.down)[lane];
+                    }
+                }
+            }
+        }
+        if (args.profile_ns && threadIdx.x == 0)
+            args.profile_ns[6] = retainedRouteClock();
+    }
+
+    /**
      * @brief One resident program for the active original CUDA main-model row.
      * @tparam GateCodebook Fixed routed Gate/Up physical layout from original prepared sources.
      * @tparam DownCodebook Fixed routed Down layout from original prepared sources.
@@ -322,12 +1001,14 @@
      * @tparam PublishHCActivated The graph still consumes the original activated HC row.
      * @tparam PublishHCUp The graph still consumes the original HC logits.
      * @tparam IndependentLocalShard Assign each selected local fragment on its own lane.
+     * @tparam Phase Native arithmetic phase owned by this graph node.
      * @param args Complete original launch binding. Capture-selected publication demand is immutable.
      * @pre The native grid is resident and every CTA has real work for the active original row.
      *      The enclosing native capture selects this positive branch from the device count.
      */
     template<uint8_t GateCodebook, uint8_t DownCodebook, bool ObserveCollectives,
-             bool PublishHCActivated, bool PublishHCUp, bool IndependentLocalShard>
+             bool PublishHCActivated, bool PublishHCUp, bool IndependentLocalShard,
+        RetainedM1NativePhase Phase = RetainedM1NativePhase::Complete>
     __global__ __launch_bounds__(kThreads, 2) void retainedQFNM1HCFFNKernel(const __grid_constant__ RetainedM1HCFFN args)
     {
         using namespace llaminar2::cuda::moe;
@@ -339,7 +1020,8 @@
         auto grid = cooperative_groups::this_grid();
         __shared__ union
         {
-            RetainedHCPrefixShared hc;
+            std::conditional_t<Phase == RetainedM1NativePhase::FFNSuffix,
+                uint32_t, RetainedHCPrefixShared<kQFNDecodeGateUpK>> hc;
             float router_tiles[4][8];
             float shared_factor[kThreads];
             float gate_up[2 * llaminar2::CUDAMoEBatchInvariantPolicy::gate_up_k_partitions][32];
@@ -351,35 +1033,196 @@
         const unsigned first_thread = blockIdx.x * blockDim.x + threadIdx.x;
         const unsigned threads = gridDim.x * blockDim.x;
         const unsigned lane = threadIdx.x % 32;
-        // The first HC rendezvous orders this invocation's reset before any
-        // CTA can read the route plan. The word is private to this retained grid.
-        if constexpr (IndependentLocalShard)
-        {
-            if (blockIdx.x == 0 && threadIdx.x == 0)
-                cuda::atomic_ref<int, cuda::thread_scope_device>(*args.route_plan_ready).store(0, cuda::memory_order_relaxed);
-        }
-        publishRetainedHCPrefix<PublishHCActivated, PublishHCUp>(args.hc, workspace.hc, grid);
-
-        const auto* router_weights = reinterpret_cast<const __half*>(router.weights);
-        for (int tile = blockIdx.x; tile < kRetainedQFNExpertCount / 4; tile += gridDim.x)
-        {
-            const int first_expert = 4 * tile;
-            retainedRouterFour(args.hc.mixed, router_weights + first_expert * hidden,
-                router.logits + first_expert, workspace.router_tiles);
-            __syncthreads();
-        }
-        for (unsigned packet = first_thread / 32 * 32; packet < static_cast<unsigned>(hidden); packet += threads)
-            retainedHiddenQ8(args.hc.mixed[packet + lane], args.hidden_codes + packet,
-                args.hidden_scales + packet / 32, lane);
-        grid.sync();
-
         constexpr int output_packets = width / 32;
-        if constexpr (IndependentLocalShard)
+        if constexpr (Phase != RetainedM1NativePhase::FFNSuffix)
         {
-            // Shared Gate/Up depends on the Q8 row alone. Keep its complete
-            // packets on independent CTAs during route and descriptor setup.
-            // Higher CTAs handle shared math. Most routed CTAs can then begin
-            // as soon as the selector publishes the local descriptors.
+            // The first HC rendezvous orders this invocation's reset before any
+            // CTA can read the route plan. The word is private to this retained grid.
+            if constexpr (IndependentLocalShard && Phase == RetainedM1NativePhase::Complete)
+            {
+                if (blockIdx.x == 0 && threadIdx.x == 0)
+                    cuda::atomic_ref<int, cuda::thread_scope_device>(*args.route_plan_ready).store(0, cuda::memory_order_relaxed);
+            }
+            if constexpr (Phase == RetainedM1NativePhase::RoutePrefix)
+            {
+                if (args.profile_ns && blockIdx.x == 0 && threadIdx.x == 0)
+                    args.profile_ns[0] = retainedRouteClock();
+                const unsigned max_packets = static_cast<unsigned>(router.top_k + 1) * static_cast<unsigned>(output_packets);
+                if (first_thread < max_packets)
+                    args.suffix_done[first_thread] = 0u;
+            }
+            publishRetainedHCPrefix<PublishHCActivated, PublishHCUp, hidden, true>(args.hc, workspace.hc, grid, args.profile_ns);
+            if (args.profile_ns && blockIdx.x == 0 && threadIdx.x == 0)
+                args.profile_ns[4] = retainedRouteClock();
+
+            const auto* router_weights = reinterpret_cast<const __half*>(router.weights);
+            for (int tile = blockIdx.x; tile < kRetainedQFNExpertCount / 4; tile += gridDim.x)
+            {
+                const int first_expert = 4 * tile;
+                retainedRouterFour(args.hc.mixed, router_weights + first_expert * hidden,
+                    router.logits + first_expert, workspace.router_tiles);
+                __syncthreads();
+            }
+            for (unsigned packet = first_thread / 32 * 32; packet < static_cast<unsigned>(hidden); packet += threads)
+                retainedHiddenQ8(args.hc.mixed[packet + lane], args.hidden_codes + packet,
+                    args.hidden_scales + packet / 32, lane);
+            grid.sync();
+            if (args.profile_ns && blockIdx.x == 0 && threadIdx.x == 0)
+                args.profile_ns[5] = retainedRouteClock();
+
+            if constexpr (IndependentLocalShard && Phase == RetainedM1NativePhase::Complete)
+            {
+                // Shared Gate/Up depends on the Q8 row alone. Keep its complete
+                // packets on independent CTAs during route and descriptor setup.
+                // Higher CTAs handle shared math. Most routed CTAs can then begin
+                // as soon as the selector publishes the local descriptors.
+                const unsigned shared_start = gridDim.x > output_packets ? gridDim.x - output_packets : 1u;
+                if (blockIdx.x >= shared_start)
+                {
+                    for (unsigned packet = blockIdx.x - shared_start; packet < output_packets;
+                         packet += gridDim.x - shared_start)
+                    {
+                        retainedGateUpPacket<SharedCodebook, width>(args.shared, packet,
+                            args.shared_workspace.down_codes, args.shared_workspace.down_scales,
+                            args.hidden_codes, args.hidden_scales, workspace.gate_up);
+                        __syncthreads();
+                    }
+                }
+            }
+
+            if (blockIdx.x == 1 && args.shared_publication == RetainedM1SharedPublication::GatedComplete)
+            {
+                const float factor = retainedSharedGateFactor(args.hc.mixed, args.shared_gate_input,
+                    hidden, workspace.shared_factor);
+                if (threadIdx.x == 0)
+                    *args.shared_gate_factor = factor;
+            }
+
+            if (blockIdx.x == 0)
+            {
+                if constexpr (IndependentLocalShard)
+                    softmax_topk_decode_independent_body<ObserveCollectives,
+                        llaminar2::RoutedExpertRowExecutionPolicy::IntermediateShardLocal, false, kRetainedQFNExpertCount>(
+                        router.logits, runtime, router.route_indices, router.route_weights, router.experts, router.top_k,
+                        router.normalize, true, nullptr, {});
+                else
+                    softmax_topk_decode_runtime_body<ObserveCollectives, false, kRetainedQFNExpertCount>(router.logits, runtime,
+                        nullptr, router.route_indices, router.route_weights, router.experts, router.top_k, router.normalize, true,
+                        router.local_policy, router.position, nullptr, 0, nullptr, nullptr, 0, {}, nullptr, nullptr, -1, 0, nullptr);
+                __syncthreads();
+                if (threadIdx.x < 32)
+                {
+                    const int slot = threadIdx.x;
+                    const bool in_route = slot < router.top_k;
+                    const int expert = in_route ? runtime->topk_expert_ids[slot] : -1;
+                    const unsigned present = __ballot_sync(0xffffffffu, expert >= 0);
+                    const int local_count = __popc(present);
+                    const auto* descriptor = [&]() -> const DeviceMoEExpertDescriptorView* {
+                        if (expert < 0)
+                            return nullptr;
+                        if (expert >= router.experts)
+                            __trap();
+                        const unsigned bank = runtime_require_decode_execution_bank(runtime);
+                        if (bank > 1)
+                            __trap();
+                        return &runtime_placement_banks(runtime)[bank].experts[expert];
+                    }();
+                    unsigned promoted = 0;
+                    if constexpr (can_promote_gate)
+                        promoted = __ballot_sync(0xffffffffu,
+                            descriptor && descriptor->gate.codebook_id == Promoted);
+                    else if constexpr (can_promote_down)
+                        promoted = __ballot_sync(0xffffffffu,
+                            descriptor && descriptor->down.codebook_id == Promoted);
+                    const unsigned canonical = present & ~promoted;
+                    const int canonical_count = __popc(canonical);
+                    const unsigned prefix = (1u << slot) - 1u;
+                    if (slot == 0)
+                    {
+                        args.route_order[0] = local_count;
+                        args.route_order[1] = canonical_count;
+#if CUDART_VERSION >= 12080
+                        if constexpr (Phase == RetainedM1NativePhase::RoutePrefix)
+                        {
+                            const unsigned experts_active = static_cast<unsigned>(local_count + 1);
+                            if (cudaGraphKernelNodeSetGridDim(
+                                    static_cast<cudaGraphDeviceNode_t>(args.suffix_gate_up_node),
+                                    dim3(retained_suffix_gate_up_k_splits,
+                                        experts_active * static_cast<unsigned>(output_packets))) != cudaSuccess ||
+                                cudaGraphKernelNodeSetGridDim(
+                                    static_cast<cudaGraphDeviceNode_t>(args.suffix_down_node),
+                                    dim3(static_cast<unsigned>(hidden / 32), experts_active)) != cudaSuccess)
+                                __trap();
+                        }
+#endif
+                    }
+                    if (descriptor)
+                    {
+                        const auto& view = *descriptor;
+                        const bool moved = (promoted & (1u << slot)) != 0;
+                        const bool down_valid = can_promote_down && moved
+                            ? native_quantised_desc_shape_ok<Promoted>(view.down, hidden, args.routed_width) &&
+                                view.down.source_identity_present && view.down.source_codebook_id == DownCodebook &&
+                                !view.down.source_is_superblock
+                            : native_quantised_desc_shape_ok<DownCodebook>(view.down, hidden, args.routed_width);
+                        const bool gate_valid = can_promote_gate && moved
+                            ? native_quantised_pair_shape_ok<Promoted>(view.gate, view.up, args.routed_width, hidden) &&
+                                view.gate.source_identity_present && view.gate.source_codebook_id == GateCodebook &&
+                                view.gate.source_is_superblock && view.up.source_identity_present &&
+                                view.up.source_codebook_id == GateCodebook && view.up.source_is_superblock
+                            : native_quantised_pair_shape_ok<GateCodebook>(view.gate, view.up, args.routed_width, hidden);
+                        if (!gate_valid || !down_valid)
+                            __trap();
+                        // Bind physical families before either arithmetic body starts.
+                        // Publication still scatters to the original canonical slots.
+                        const int packed = moved ? canonical_count + __popc(promoted & prefix) : __popc(canonical & prefix);
+                        args.route_order[kRetainedRouteCounts + packed] = slot;
+                        args.selected[packed] = {view.gate, view.up, view.down};
+                    }
+                    else if (in_route)
+                        args.route_order[kRetainedRouteCounts + local_count + slot - __popc(present & prefix)] = slot;
+                }
+            }
+            if constexpr (Phase == RetainedM1NativePhase::Complete)
+            {
+                if constexpr (IndependentLocalShard)
+                {
+                    if (blockIdx.x == 0)
+                    {
+                        __syncthreads();
+                        if (threadIdx.x == 0)
+                            cuda::atomic_ref<int, cuda::thread_scope_device>(*args.route_plan_ready).store(1, cuda::memory_order_release);
+                    }
+                    else if (threadIdx.x == 0)
+                    {
+                        const auto start = retainedRouteClock();
+                        const cuda::atomic_ref<int, cuda::thread_scope_device> publication(*args.route_plan_ready);
+                        while (publication.load(cuda::memory_order_acquire) == 0)
+                        {
+                            if (retainedRouteClock() - start >= 30'000'000'000ULL)
+                                __trap();
+                            __nanosleep(64);
+                        }
+                    }
+                    __syncthreads();
+                }
+                else
+                    grid.sync();
+
+            }
+        }
+        if constexpr (Phase == RetainedM1NativePhase::RoutePrefix)
+        {
+            if (args.profile_ns && blockIdx.x == 0 && threadIdx.x == 0)
+                args.profile_ns[6] = retainedRouteClock();
+            // Native kernel completion orders the whole descriptor bank for
+            // every reader. No resident lane polls for this captured edge.
+            return;
+        }
+        if constexpr (IndependentLocalShard && Phase == RetainedM1NativePhase::FFNSuffix)
+        {
+            // Both source banks have retired at the captured prefix edge.
+            // The shared packets keep their existing disjoint CTA owners.
             const unsigned shared_start = gridDim.x > output_packets ? gridDim.x - output_packets : 1u;
             if (blockIdx.x >= shared_start)
             {
@@ -393,117 +1236,6 @@
                 }
             }
         }
-
-        if (blockIdx.x == 0)
-        {
-            if constexpr (IndependentLocalShard)
-                softmax_topk_decode_independent_body<ObserveCollectives,
-                    llaminar2::RoutedExpertRowExecutionPolicy::IntermediateShardLocal, false, kRetainedQFNExpertCount>(
-                    router.logits, runtime, router.route_indices, router.route_weights, router.experts, router.top_k,
-                    router.normalize, true, nullptr, {}, args.early_packet_ready, args.early_ticket_ready);
-            else
-                softmax_topk_decode_runtime_body<ObserveCollectives, false, kRetainedQFNExpertCount>(router.logits, runtime,
-                    nullptr, router.route_indices, router.route_weights, router.experts, router.top_k, router.normalize, true,
-                    router.local_policy, router.position, nullptr, 0, nullptr, nullptr, 0, {}, nullptr, nullptr, -1, 0, nullptr);
-            __syncthreads();
-            if constexpr (!IndependentLocalShard)
-            {
-                if (threadIdx.x == 0)
-                {
-                    releaseRetainedQFNPacket(args.early_packet_ready);
-                    releaseRetainedQFNPacket(args.early_ticket_ready);
-                }
-            }
-            if (args.shared_publication == RetainedM1SharedPublication::GatedComplete)
-            {
-                const float factor = retainedSharedGateFactor(args.hc.mixed, args.shared_gate_input,
-                    hidden, workspace.shared_factor);
-                if (threadIdx.x == 0)
-                    *args.shared_gate_factor = factor;
-            }
-            if (threadIdx.x < 32)
-            {
-                const int slot = threadIdx.x;
-                const bool in_route = slot < router.top_k;
-                const int expert = in_route ? runtime->topk_expert_ids[slot] : -1;
-                const unsigned present = __ballot_sync(0xffffffffu, expert >= 0);
-                const int local_count = __popc(present);
-                const auto* descriptor = [&]() -> const DeviceMoEExpertDescriptorView* {
-                    if (expert < 0)
-                        return nullptr;
-                    if (expert >= router.experts)
-                        __trap();
-                    const unsigned bank = runtime_require_decode_execution_bank(runtime);
-                    if (bank > 1)
-                        __trap();
-                    return &runtime_placement_banks(runtime)[bank].experts[expert];
-                }();
-                unsigned promoted = 0;
-                if constexpr (can_promote_gate)
-                    promoted = __ballot_sync(0xffffffffu,
-                        descriptor && descriptor->gate.codebook_id == Promoted);
-                else if constexpr (can_promote_down)
-                    promoted = __ballot_sync(0xffffffffu,
-                        descriptor && descriptor->down.codebook_id == Promoted);
-                const unsigned canonical = present & ~promoted;
-                const int canonical_count = __popc(canonical);
-                const unsigned prefix = (1u << slot) - 1u;
-                if (slot == 0)
-                {
-                    args.route_order[0] = local_count;
-                    args.route_order[1] = canonical_count;
-                }
-                if (descriptor)
-                {
-                    const auto& view = *descriptor;
-                    const bool moved = (promoted & (1u << slot)) != 0;
-                    const bool down_valid = can_promote_down && moved
-                        ? native_quantised_desc_shape_ok<Promoted>(view.down, hidden, args.routed_width) &&
-                            view.down.source_identity_present && view.down.source_codebook_id == DownCodebook &&
-                            !view.down.source_is_superblock
-                        : native_quantised_desc_shape_ok<DownCodebook>(view.down, hidden, args.routed_width);
-                    const bool gate_valid = can_promote_gate && moved
-                        ? native_quantised_pair_shape_ok<Promoted>(view.gate, view.up, args.routed_width, hidden) &&
-                            view.gate.source_identity_present && view.gate.source_codebook_id == GateCodebook &&
-                            view.gate.source_is_superblock && view.up.source_identity_present &&
-                            view.up.source_codebook_id == GateCodebook && view.up.source_is_superblock
-                        : native_quantised_pair_shape_ok<GateCodebook>(view.gate, view.up, args.routed_width, hidden);
-                    if (!gate_valid || !down_valid)
-                        __trap();
-                    // Bind physical families before either arithmetic body starts.
-                    // Publication still scatters to the original canonical slots.
-                    const int packed = moved ? canonical_count + __popc(promoted & prefix) : __popc(canonical & prefix);
-                    args.route_order[kRetainedRouteCounts + packed] = slot;
-                    args.selected[packed] = {view.gate, view.up, view.down};
-                }
-                else if (in_route)
-                    args.route_order[kRetainedRouteCounts + local_count + slot - __popc(present & prefix)] = slot;
-            }
-        }
-        if constexpr (IndependentLocalShard)
-        {
-            if (blockIdx.x == 0)
-            {
-                __syncthreads();
-                if (threadIdx.x == 0)
-                    cuda::atomic_ref<int, cuda::thread_scope_device>(*args.route_plan_ready).store(1, cuda::memory_order_release);
-            }
-            else if (threadIdx.x == 0)
-            {
-                const auto start = retainedRouteClock();
-                const cuda::atomic_ref<int, cuda::thread_scope_device> publication(*args.route_plan_ready);
-                while (publication.load(cuda::memory_order_acquire) == 0)
-                {
-                    if (retainedRouteClock() - start >= 30'000'000'000ULL)
-                        __trap();
-                    __nanosleep(64);
-                }
-            }
-            __syncthreads();
-        }
-        else
-            grid.sync();
-
         const int local_count = args.route_order[0];
         if constexpr (can_promote_gate)
         {
@@ -545,7 +1277,17 @@
         const bool gate_shared = args.shared_publication == RetainedM1SharedPublication::GatedComplete;
         const float shared_factor = gate_shared ? *args.shared_gate_factor : 1.0f;
         unsigned first_shared_column = first_thread;
-        if constexpr (IndependentLocalShard)
+        unsigned shared_stride = threads;
+        if constexpr (Phase == RetainedM1NativePhase::FFNSuffix)
+        {
+            // Every launched CTA owns a half warp of real shared columns,
+            // even when this participant has no routed experts in the row.
+            if (threadIdx.x >= retained_shared_down_frontier_columns)
+                return;
+            first_shared_column = blockIdx.x * retained_shared_down_frontier_columns + threadIdx.x;
+            shared_stride = gridDim.x * retained_shared_down_frontier_columns;
+        }
+        else if constexpr (IndependentLocalShard)
         {
             // Keep the shared Down tiles off the lowest CTAs, which own the
             // routed Down prefix for the active original routes.
@@ -555,7 +1297,7 @@
                 : gridDim.x - shared_start + blockIdx.x;
             first_shared_column = tile * blockDim.x + threadIdx.x;
         }
-        for (unsigned column = first_shared_column; column < static_cast<unsigned>(hidden); column += threads)
+        for (unsigned column = first_shared_column; column < static_cast<unsigned>(hidden); column += shared_stride)
         {
             const float raw = retainedDown<SharedCodebook, false>(args.shared.down, column,
                 args.shared_workspace.down_codes, args.shared_workspace.down_scales);

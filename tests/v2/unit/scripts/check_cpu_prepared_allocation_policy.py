@@ -231,7 +231,7 @@ def workspace_fixture_boundary(path: str, caller: str, name: str,
             "(device,budget_bytes,physical_memory_authority_);}"
             "returnstd::make_unique<DeviceWorkspaceManager>(device,budget_bytes);")
     selectors={
-        ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp",
+        ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestratorRebalance.cpp",
          "DeviceGraphOrchestrator::ensureDeviceWorkspaceAllocated"):
             "workspace_allocator_=physical_memory_authority_?std::make_shared<WorkspaceAllocator>"
             "(physical_memory_authority_):std::make_shared<WorkspaceAllocator>();",

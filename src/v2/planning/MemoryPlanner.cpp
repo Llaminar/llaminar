@@ -46,14 +46,18 @@
 #include "planning/ActivationMemoryEstimator.h"
 #include "planning/CollectiveMemoryEstimator.h"
 #include "planning/WorkspaceMemoryEstimator.h"
-#ifdef HAVE_ROCM
-#include "kernels/rocm/gemm/retained_hc_ffn/ROCmRetainedM1HCFFNWorkspace.h"
+#if defined(HAVE_ROCM) || defined(HAVE_CUDA)
 #include "models/qwen4exp/Qwen4ExpRetainedM1HCFFNPolicy.h"
 #include "models/qwen4exp/Qwen4ExpRetainedGDNPreAttentionPolicy.h"
 #include "models/qwen4exp/Qwen4ExpConfig.h"
 #include "planning/PlanningModelMetadata.h"
 #include "execution/compute_stages/stages/qwen4exp/RetainedGDNPreAttentionStage.h"
+#include "execution/compute_stages/stages/qwen4exp/RetainedQSAAttentionStage.h"
 #include "utils/DebugEnv.h"
+#endif
+#ifdef HAVE_ROCM
+#include "execution/moe/MoEWorkspaceRequirements.h"
+#include "kernels/common/FullNativeHCFFNBarrierLayout.h"
 #endif
 #include "planning/PlanningMemoryQuoteReuse.h"
 #include "execution/compute_stages/stages/GDNLiveStateWorkspaceContract.h"
@@ -2562,7 +2566,7 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
             }
         }
 
-#ifdef HAVE_ROCM
+#if defined(HAVE_ROCM) || defined(HAVE_CUDA)
         const auto matches_source = [&](const std::string &name, GGUFTensorType format) {
             const std::string_view expected = tensorTypeName(ggufToTensorType(format));
             const auto matches_format = [&](std::string_view actual) {
@@ -2578,27 +2582,33 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
             });
         };
         const int last_main = std::min(last_layer, profile.mainLayerCount() - 1);
+#endif
+#ifdef HAVE_ROCM
         if (cfg.execution_role == DeviceExecutionMemoryRole::ContinuationGraph &&
             cfg.device.is_rocm() && profile.flash_next && cfg.first_layer <= last_main &&
             cfg.routed_compute_policy == RoutedExpertComputePolicy::TensorSharded &&
-            useQwen4ExpRetainedM1HCFFN(qfnRetainedM1HCFFNEnabled(cfg.usesQFNMI50TP4()), ForwardExecutionPhase::Decode,
+            useQwen4ExpRetainedM1HCFFN(qfnRetainedM1HCFFNEnabled(cfg.usesGFX906MI50Kernels()), ForwardExecutionPhase::Decode,
                 ForwardExecutionRole::MainInference, 1, cfg.batch_size))
         {
             // All serial layers share one slot. Only the owned layers with a
             // matching original source tuple participate in the automatic program.
             for (int layer = cfg.first_layer; layer <= last_main; ++layer)
             {
-                if (!qfnRetainedM1HCFFNEnabled(cfg.usesQFNMI50TP4() &&
+                if (!qfnRetainedM1HCFFNEnabled(cfg.usesGFX906MI50Kernels() &&
                         hasQwen4ExpRetainedM1HCFFNSources(layer, matches_source)))
                     continue;
+                WorkspaceRequirements canonical_barrier;
+                MoEWorkspaceBuffers::add(canonical_barrier, MoEWorkspaceBuffers::NATIVE_LAYOUT_BARRIER,
+                    FullNativeHCFFNBarrierLayout::bytes * MoEWorkspaceBuffers::kGroupedDescriptorTableSlots,
+                    WorkspaceContentLifetime::SerialGraphFamily);
                 workspace_bytes = checkedAdd(workspace_bytes,
-                    rocm::retainedM1HCFFNWorkspace().total_bytes_with_alignment(),
-                    "QFN retained M1 serial-family workspace");
+                    canonical_barrier.total_bytes_with_alignment(),
+                    "QFN canonical full HC/FFN serial-family workspace");
                 break;
             }
         }
         if (profile.flash_next && cfg.execution_role == DeviceExecutionMemoryRole::ContinuationGraph &&
-            usesRetainedGDNPreAttention(qfnRetainedGDNPreAttentionEnabled(cfg.usesQFNMI50TP4()),
+            usesRetainedGDNPreAttention(qfnRetainedGDNPreAttentionEnabled(cfg.usesGFX906MI50Kernels()),
                 cfg.device, cfg.routed_compute_policy, ForwardExecutionPhase::Decode,
                 ForwardExecutionRole::MainInference, 1, cfg.batch_size))
         {
@@ -2608,7 +2618,7 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
             for (int layer = cfg.first_layer; layer <= last_main; ++layer)
             {
                 if (profile.flashNextSparseLayerCount(layer, layer) ||
-                    !qfnRetainedGDNPreAttentionEnabled(cfg.usesQFNMI50TP4() &&
+                    !qfnRetainedGDNPreAttentionEnabled(cfg.usesGFX906MI50Kernels() &&
                         qwen4ExpRetainedGDNSources(layer, matches_source).supports(
                             weight_source_policy.gdn_projection_arithmetic)))
                     continue;
@@ -2616,6 +2626,48 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
                     retainedGDNPreAttentionWorkspace().total_bytes_with_alignment(),
                     "QFN retained GDN serial-family workspace");
                 break;
+            }
+        }
+        if (profile.flash_next && cfg.execution_role == DeviceExecutionMemoryRole::ContinuationGraph &&
+            usesRetainedROCmQSAAttention(qfnRetainedROCmQSAAttentionEnabled(cfg.usesGFX906MI50Kernels()),
+                cfg.device, ForwardExecutionPhase::Decode,
+                ForwardExecutionRole::MainInference, 1, cfg.batch_size))
+        {
+            if (profile.flashNextSparseLayerCount(cfg.first_layer, last_main) > 0)
+            {
+                workspace_bytes = checkedAdd(workspace_bytes,
+                    retainedROCmQSAAttentionWorkspace().total_bytes_with_alignment(),
+                    "QFN retained ROCm QSA serial-family workspace");
+            }
+        }
+#endif
+#ifdef HAVE_CUDA
+        if (profile.flash_next && cfg.execution_role == DeviceExecutionMemoryRole::ContinuationGraph &&
+            usesRetainedCUDAGDN(qfnRetainedCUDAGDNEnabled(true), cfg.device,
+                ForwardExecutionPhase::Decode, ForwardExecutionRole::MainInference, 1, cfg.batch_size))
+        {
+            for (int layer = cfg.first_layer; layer <= last_main; ++layer)
+            {
+                if (profile.flashNextSparseLayerCount(layer, layer) ||
+                    !qfnRetainedCUDAGDNEnabled(
+                        qwen4ExpRetainedGDNSources(layer, matches_source).supports(
+                            weight_source_policy.gdn_projection_arithmetic)))
+                    continue;
+                workspace_bytes = checkedAdd(workspace_bytes,
+                    retainedCUDAGDNWorkspace().total_bytes_with_alignment(),
+                    "QFN retained CUDA GDN serial-family workspace");
+                break;
+            }
+        }
+        if (profile.flash_next && cfg.execution_role == DeviceExecutionMemoryRole::ContinuationGraph &&
+            usesRetainedCUDAQSAAttention(qfnRetainedCUDAQSAAttentionEnabled(true), cfg.device,
+                ForwardExecutionPhase::Decode, ForwardExecutionRole::MainInference, 1, cfg.batch_size))
+        {
+            if (profile.flashNextSparseLayerCount(cfg.first_layer, last_main) > 0)
+            {
+                workspace_bytes = checkedAdd(workspace_bytes,
+                    retainedCUDAQSAAttentionWorkspace().total_bytes_with_alignment(),
+                    "QFN retained CUDA QSA serial-family workspace");
             }
         }
 #endif

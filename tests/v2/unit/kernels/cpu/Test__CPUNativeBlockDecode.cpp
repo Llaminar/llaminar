@@ -89,15 +89,27 @@ TEST(CPUNativeBlockDecode, AllSourceFormatsRetainTheirPreparedEncodingIdentity)
         EXPECT_TRUE(isKnownPreparedEncoding(encoding));
         EXPECT_GT(preparedDataStride(encoding), 0u);
         EXPECT_GE(preparedInterleavedBlockStride(encoding, format.is_asymmetric),
-                  preparedDataStride(encoding) + 256u);
+                  preparedDataStride(encoding) + 128u);
         EXPECT_EQ(native_quantised_formats::forSourceIdentity(format.codebook_id, format.is_superblock),
                   source.metadata);
         EXPECT_EQ(preparedEncodingForSource(format, true), CPUNativeQuantisedEncoding::ExpandedInt8);
         encodings.insert(encoding);
     }
-    EXPECT_EQ(encodings.size(), 6u);
+    EXPECT_EQ(encodings.size(), 7u);
+    EXPECT_EQ(preparedEncodingForSource(native_quantised_formats::Q4_0), CPUNativeQuantisedEncoding::UnsignedNibble);
+    EXPECT_EQ(preparedEncodingForSource(native_quantised_formats::Q4_1), CPUNativeQuantisedEncoding::UnsignedNibble);
+    EXPECT_EQ(preparedEncodingForSource(native_quantised_formats::Q4_K), CPUNativeQuantisedEncoding::UnsignedNibble);
+    EXPECT_EQ(preparedEncodingForSource(native_quantised_formats::Q5_0), CPUNativeQuantisedEncoding::CompactFiveBit);
+    EXPECT_EQ(preparedEncodingForSource(native_quantised_formats::Q5_1), CPUNativeQuantisedEncoding::CompactFiveBit);
+    EXPECT_EQ(preparedEncodingForSource(native_quantised_formats::Q5_K), CPUNativeQuantisedEncoding::CompactFiveBit);
     EXPECT_EQ(preparedEncodingForSource(native_quantised_formats::IQ4_NL), CPUNativeQuantisedEncoding::NibbleLUT);
     EXPECT_EQ(preparedEncodingForSource(native_quantised_formats::IQ4_XS), CPUNativeQuantisedEncoding::NibbleLUTSourceScale);
-    EXPECT_EQ(preparedEncodingForSource(native_quantised_formats::IQ3_S), CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale);
+    EXPECT_EQ(preparedEncodingForSource(native_quantised_formats::IQ3_S), CPUNativeQuantisedEncoding::NibbleLUTSourceScale);
+    EXPECT_EQ(preparedEncodingForSource(native_quantised_formats::IQ3_XXS), CPUNativeQuantisedEncoding::NibbleLUT);
+    EXPECT_EQ(preparedEncodingForSource(native_quantised_formats::IQ2_XXS), CPUNativeQuantisedEncoding::NibbleLUT);
+    EXPECT_EQ(preparedEncodingForSource(native_quantised_formats::IQ1_S), CPUNativeQuantisedEncoding::NibbleLUT);
+    EXPECT_EQ(preparedEncodingForSource(native_quantised_formats::Q8_0), CPUNativeQuantisedEncoding::UnsignedInt8);
+    EXPECT_EQ(preparedEncodingForSource(native_quantised_formats::Q8_1), CPUNativeQuantisedEncoding::UnsignedInt8);
+    EXPECT_EQ(preparedEncodingForSource(native_quantised_formats::Q8_K), CPUNativeQuantisedEncoding::UnsignedInt8);
 }
 } // namespace llaminar2::test

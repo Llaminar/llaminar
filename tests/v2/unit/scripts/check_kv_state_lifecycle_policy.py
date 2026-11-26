@@ -318,7 +318,12 @@ def validate(repo_root: pathlib.Path) -> list[str]:
         repo_root
         / "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
     )
-    orchestrator_source_path = orchestrator_header_path.with_suffix(".cpp")
+    orchestrator_source_paths = sorted(
+        orchestrator_header_path.parent.glob("DeviceGraphOrchestrator*.cpp")
+    )
+    orchestrator_source = "\n".join(
+        path.read_text(encoding="utf-8") for path in orchestrator_source_paths
+    )
 
     failures = validate_interface(interface_path.read_text(encoding="utf-8"))
     for backend, relative_path, class_name in GPU_RESET_SOURCES:
@@ -327,12 +332,12 @@ def validate(repo_root: pathlib.Path) -> list[str]:
     failures.extend(
         validate_orchestrator(
             orchestrator_header_path.read_text(encoding="utf-8"),
-            orchestrator_source_path.read_text(encoding="utf-8"),
+            orchestrator_source,
         )
     )
     failures.extend(
         validate_terminal_hidden_mailbox_lifetime(
-            orchestrator_source_path.read_text(encoding="utf-8")
+            orchestrator_source
         )
     )
     failures.extend(validate_obsolete_symbols(repo_root))

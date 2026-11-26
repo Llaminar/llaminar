@@ -445,6 +445,12 @@ std::string Qwen4ExpHyperconnectionBuilder::appendWrite(ComputeGraph &graph,Bloc
             const auto& params=projection->getParams();
             workspaceRequirements.merge(projection->getWorkspaceRequirements(params.m,params.n,params.k));
         }
+        if(c.readExecution==Qwen4ExpHCReadExecution::PersistentOriginalPhases) {
+            workspaceRequirements.buffers.emplace_back(
+                GemmWorkspaceBuffers::ROCM_PERSISTENT_HC_BARRIER,
+                ResidentGridBarrierLayout<4>::bytes, 16, true,
+                WorkspaceExecutionRegime::Any, WorkspaceContentLifetime::SerialGraphFamily);
+        }
         auto program=std::make_unique<PersistentHCReadStage>(c,*operation,down->getParams(),up->getParams(),
             injection->getParams(),read.buffers_,b.injectionLogits,read.terminal_,std::move(workspaceRequirements));
         const std::array<LocalRegionExport,1> exports{{{.producer=inject,.consumers={write}}}};
@@ -703,5 +709,53 @@ bool Qwen4ExpHyperconnectionBuilder::lowerAdjacentWriteNorm(ComputeGraph &graph,
             write->gateLogits,write->output,norm->gain,norm->output}});
     graph.replaceProducerAndBypassSuccessor(producer,successor,std::move(replacement));
     return true;
+}
+
+bool Qwen4ExpHyperconnectionBuilder::tryFusePreviousWriteIntoPersistentRead(
+    ComputeGraph &graph, const std::string &writeProducer)
+{
+#ifdef HAVE_ROCM
+    if (writeProducer.empty()) return false;
+    using Stage = Qwen4ExpPrimitiveStage;
+    const auto *writeNode = graph.getNode(writeProducer);
+    const auto *writeStage = writeNode ? dynamic_cast<const Stage *>(writeNode->stage.get()) : nullptr;
+    const auto *write = writeStage ? std::get_if<Stage::ResidualWrite>(&writeStage->getParams().operation) : nullptr;
+    if (!write || !writeNode->device.is_rocm()) return false;
+
+    const auto order = graph.getExecutionOrder();
+    const ComputeNode *readNode = nullptr;
+    const PersistentHCReadStage *readStage = nullptr;
+    std::vector<std::string> otherConsumers;
+    for (const auto &name : order)
+    {
+        const auto *node = graph.getNode(name);
+        if (std::find(node->dependencies.begin(), node->dependencies.end(), writeProducer) ==
+            node->dependencies.end())
+            continue;
+        if (const auto *candidate = dynamic_cast<const PersistentHCReadStage *>(node->stage.get());
+            candidate && node->device == writeNode->device && candidate->canAbsorbPreviousWrite(*write))
+        {
+            if (readNode) return false;
+            readNode = node;
+            readStage = candidate;
+        }
+        else
+        {
+            otherConsumers.push_back(name);
+        }
+    }
+    if (!readNode || !readStage) return false;
+    if (readNode->dependencies != std::vector<std::string>{writeProducer}) return false;
+    if (!otherConsumers.empty()) return false;
+
+    auto fused = readStage->cloneWithPreviousWrite(*write);
+    const std::string readName = readNode->name;
+    graph.replaceClosedLocalRegion({writeProducer, readName}, readName, std::move(fused), {});
+    return true;
+#else
+    (void)graph;
+    (void)writeProducer;
+    return false;
+#endif
 }
 } // namespace llaminar2

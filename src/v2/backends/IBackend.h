@@ -4304,6 +4304,44 @@ namespace llaminar2
             return false;
         }
 
+        /** @brief One bounded device-to-mapped-host segment inside a fused batch publication. */
+        struct MappedHostCopySegment
+        {
+            void *dst = nullptr;
+            const void *src = nullptr;
+            size_t bytes = 0u;
+        };
+
+        /**
+         * @brief Copy a small batch of bounded device regions to mapped host
+         *        aliases and publish one system-release timeline word in a
+         *        single kernel node.
+         *
+         * @param segments Exact bounded device->mapped-host segments (1..6).
+         * @param segment_count Number of active entries in @p segments.
+         * @param publication_signal Optional mapped-host 64-bit release word.
+         * @param publication_value Value release-stored after all copies join.
+         * @param device_id Exact source GPU ordinal.
+         * @param stream Exact non-null stream whose event owns publication.
+         * @return True only when the fused kernel launch was accepted.
+         */
+        virtual bool copyDeviceVisibleRegionsAndPublishByKernelOnStream(
+            const MappedHostCopySegment *segments,
+            size_t segment_count,
+            uint64_t *publication_signal,
+            uint64_t publication_value,
+            int device_id,
+            void *stream)
+        {
+            (void)segments;
+            (void)segment_count;
+            (void)publication_signal;
+            (void)publication_value;
+            (void)device_id;
+            (void)stream;
+            return false;
+        }
+
         /**
          * @brief Resolve both mapped-copy kernels before concurrent execution.
          * @param device_id Exact GPU whose module generation must be prepared.

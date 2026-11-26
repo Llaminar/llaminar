@@ -104,7 +104,6 @@
 #include "TensorLayout.h"         // Tensor memory layout contracts
 #include "NativeQuantisedFormatInfo.h" // Format metadata returned by IINT8Unpackable::vnniFormatInfo()
 #include "VnniPackContext.h"      // Packing context for IINT8Unpackable::packVnniBlock()
-#include "SIMDHelpers.h"
 #include "AlignedVector.h"
 #include "CoherenceState.h"       // Explicit coherence state machine
 #include "CoherenceAuditLog.h"    // Per-tensor coherence audit ring buffer
@@ -2837,7 +2836,7 @@ namespace llaminar2
             // Convert block from FP16 to FP32
             for (size_t i = 0; i < elements_to_convert; ++i)
             {
-                output[i] = simd::fp16_to_fp32(fp16_row[i]);
+                output[i] = llaminar2::fp16_to_fp32(fp16_row[i]);
             }
 
             // Zero-pad remainder if K is not multiple of BLOCK_SIZE
@@ -3083,7 +3082,10 @@ namespace llaminar2
             // Convert entire row from BF16 to FP32
             for (size_t i = 0; i < cols; ++i)
             {
-                output[i] = simd::bf16_to_fp32(bf16_row[i]);
+                const uint32_t bits = static_cast<uint32_t>(bf16_row[i]) << 16;
+                float val;
+                std::memcpy(&val, &bits, sizeof(val));
+                output[i] = val;
             }
         }
 
@@ -3629,36 +3631,7 @@ namespace llaminar2
             size_t superblock_idx,
             int8_t *output,
             float *scales = nullptr,
-            float *mins = nullptr) const override
-        {
-            const size_t blocks_per_row = (shape_[1] + IQ4_NLBlock::BLOCK_SIZE - 1) / IQ4_NLBlock::BLOCK_SIZE;
-            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
-            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
-            const IQ4_NLBlock *blocks = reinterpret_cast<const IQ4_NLBlock *>(data_ptr);
-            const size_t base_block = superblock_idx * 8;
-            const IQ4_NLBlock *src = &blocks[row_idx * blocks_per_row + base_block];
-
-            // Unpack 8 consecutive blocks (8 × 32 = 256 elements)
-            for (int i = 0; i < 8; ++i)
-            {
-                simd::unpack_iq4_nl_to_int8(src[i], output + i * 32);
-            }
-
-            if (scales)
-            {
-                for (int i = 0; i < 8; ++i)
-                {
-                    scales[i] = fp16_to_fp32(src[i].d);
-                }
-            }
-            if (mins)
-            {
-                for (int i = 0; i < 8; ++i)
-                {
-                    mins[i] = 0.0f; // IQ4_NL is symmetric
-                }
-            }
-        }
+            float *mins = nullptr) const override;
 
         // Format conversion (TensorBase interface - delegates to decode methods)
         void to_fp32(float *dst) const override { decode_to_fp32(dst); }
@@ -3938,15 +3911,6 @@ namespace llaminar2
 
             // Copy 8 consecutive blocks (8 × 32 = 256 bytes)
             const Q8_0Block *src = &blocks[row_idx * blocks_per_row + base_block];
-#if defined(__AVX512F__)
-            // 4 × 64-byte stores = 256 bytes
-            for (int i = 0; i < 4; ++i)
-            {
-                __m512i data = _mm512_loadu_si512(reinterpret_cast<const char *>(src) + i * 64 + 2); // Skip 2-byte scale per block pair
-                // Note: Q8_0Block is 34 bytes (2 scale + 32 data), so blocks aren't contiguous
-                // Fall back to per-block copy
-            }
-#endif
             // Blocks aren't contiguous in memory (each has a 2-byte scale header)
             // So we copy each block's qs array separately but in one function call
             for (int i = 0; i < 8; ++i)
@@ -5257,36 +5221,7 @@ namespace llaminar2
             size_t superblock_idx,
             int8_t *output,
             float *scales = nullptr,
-            float *mins = nullptr) const override
-        {
-            const size_t blocks_per_row = (shape_[1] + Q4_0Block::BLOCK_SIZE - 1) / Q4_0Block::BLOCK_SIZE;
-            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
-            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
-            const Q4_0Block *blocks = reinterpret_cast<const Q4_0Block *>(data_ptr);
-            const size_t base_block = superblock_idx * 8;
-            const Q4_0Block *src = &blocks[row_idx * blocks_per_row + base_block];
-
-            // Unpack 8 consecutive blocks (8 × 32 = 256 elements)
-            for (int i = 0; i < 8; ++i)
-            {
-                simd::unpack_q4_0_to_int8(src[i], output + i * 32);
-            }
-
-            if (scales)
-            {
-                for (int i = 0; i < 8; ++i)
-                {
-                    scales[i] = fp16_to_fp32(src[i].d);
-                }
-            }
-            if (mins)
-            {
-                for (int i = 0; i < 8; ++i)
-                {
-                    mins[i] = 0.0f; // Q4_0 is symmetric
-                }
-            }
-        }
+            float *mins = nullptr) const override;
 
         // View support (row-slice only due to block alignment)
         std::shared_ptr<TensorBase> create_view(
@@ -5500,36 +5435,7 @@ namespace llaminar2
             size_t superblock_idx,
             int8_t *output,
             float *scales = nullptr,
-            float *mins = nullptr) const override
-        {
-            const size_t blocks_per_row = (shape_[1] + Q4_1Block::BLOCK_SIZE - 1) / Q4_1Block::BLOCK_SIZE;
-            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
-            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
-            const Q4_1Block *blocks = reinterpret_cast<const Q4_1Block *>(data_ptr);
-            const size_t base_block = superblock_idx * 8;
-            const Q4_1Block *src = &blocks[row_idx * blocks_per_row + base_block];
-
-            // Unpack 8 consecutive blocks (8 × 32 = 256 elements)
-            for (int i = 0; i < 8; ++i)
-            {
-                simd::unpack_q4_1_to_int8(src[i], output + i * 32);
-            }
-
-            if (scales)
-            {
-                for (int i = 0; i < 8; ++i)
-                {
-                    scales[i] = fp16_to_fp32(src[i].d);
-                }
-            }
-            if (mins)
-            {
-                for (int i = 0; i < 8; ++i)
-                {
-                    mins[i] = fp16_to_fp32(src[i].m);
-                }
-            }
-        }
+            float *mins = nullptr) const override;
 
         // View support (row-slice only due to block alignment)
         std::shared_ptr<TensorBase> create_view(
@@ -5729,36 +5635,7 @@ namespace llaminar2
             size_t superblock_idx,
             int8_t *output,
             float *scales = nullptr,
-            float *mins = nullptr) const override
-        {
-            const size_t blocks_per_row = (shape_[1] + Q5_0Block::BLOCK_SIZE - 1) / Q5_0Block::BLOCK_SIZE;
-            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
-            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
-            const Q5_0Block *blocks = reinterpret_cast<const Q5_0Block *>(data_ptr);
-            const size_t base_block = superblock_idx * 8;
-            const Q5_0Block *src = &blocks[row_idx * blocks_per_row + base_block];
-
-            // Unpack 8 consecutive blocks (8 × 32 = 256 elements)
-            for (int i = 0; i < 8; ++i)
-            {
-                simd::unpack_q5_0_to_int8(src[i], output + i * 32);
-            }
-
-            if (scales)
-            {
-                for (int i = 0; i < 8; ++i)
-                {
-                    scales[i] = fp16_to_fp32(src[i].d);
-                }
-            }
-            if (mins)
-            {
-                for (int i = 0; i < 8; ++i)
-                {
-                    mins[i] = 0.0f; // Q5_0 is symmetric
-                }
-            }
-        }
+            float *mins = nullptr) const override;
 
         // Per-block decode to Q8_0 (used by Q8_0WeightAccessor)
         void decode_to_q8_0(size_t row_idx, size_t k_block_offset, Q8_0Block *output) const;
@@ -5961,36 +5838,7 @@ namespace llaminar2
             size_t superblock_idx,
             int8_t *output,
             float *scales = nullptr,
-            float *mins = nullptr) const override
-        {
-            const size_t blocks_per_row = (shape_[1] + Q5_1Block::BLOCK_SIZE - 1) / Q5_1Block::BLOCK_SIZE;
-            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
-            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
-            const Q5_1Block *blocks = reinterpret_cast<const Q5_1Block *>(data_ptr);
-            const size_t base_block = superblock_idx * 8;
-            const Q5_1Block *src = &blocks[row_idx * blocks_per_row + base_block];
-
-            // Unpack 8 consecutive blocks (8 × 32 = 256 elements)
-            for (int i = 0; i < 8; ++i)
-            {
-                simd::unpack_q5_1_to_int8(src[i], output + i * 32);
-            }
-
-            if (scales)
-            {
-                for (int i = 0; i < 8; ++i)
-                {
-                    scales[i] = fp16_to_fp32(src[i].d);
-                }
-            }
-            if (mins)
-            {
-                for (int i = 0; i < 8; ++i)
-                {
-                    mins[i] = fp16_to_fp32(src[i].m);
-                }
-            }
-        }
+            float *mins = nullptr) const override;
 
         // Per-block decode to Q8_0 (used by Q8_0WeightAccessor)
         void decode_to_q8_0(size_t row_idx, size_t k_block_offset, Q8_0Block *output) const;
@@ -7374,25 +7222,7 @@ namespace llaminar2
             size_t offset = 0) override;
 
         // ITensorGemmTileDataProvider interface (inline for zero overhead in GEMM hot path)
-        __attribute__((always_inline)) void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override
-        {
-            const size_t super_blocks_per_row = (shape_[1] + IQ4_XSBlock::BLOCK_SIZE - 1) / IQ4_XSBlock::BLOCK_SIZE;
-            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
-            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
-            const IQ4_XSBlock *blocks = reinterpret_cast<const IQ4_XSBlock *>(data_ptr);
-
-            const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
-            const size_t sub_block_idx = k_block_offset % 8;
-
-            int8_t temp_int8[32];
-            simd::unpack_iq4_xs_to_int8(blocks[super_block_idx], sub_block_idx, temp_int8);
-            float scale = simd::get_iq4_xs_scale(blocks[super_block_idx], sub_block_idx);
-
-            for (int i = 0; i < 32; ++i)
-            {
-                output[i] = temp_int8[i] * scale;
-            }
-        }
+        void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override;
 
         __attribute__((always_inline))
         const void *
@@ -7413,31 +7243,9 @@ namespace llaminar2
         size_t block_size() const override { return 32; } // Logical block size (sub-block)
 
         // IINT8Unpackable interface
-        __attribute__((always_inline)) void unpack_block_to_int8(size_t row_idx, size_t k_block_offset, int8_t *output) const override
-        {
-            const size_t super_blocks_per_row = (shape_[1] + IQ4_XSBlock::BLOCK_SIZE - 1) / IQ4_XSBlock::BLOCK_SIZE;
-            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
-            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
-            const IQ4_XSBlock *blocks = reinterpret_cast<const IQ4_XSBlock *>(data_ptr);
+        void unpack_block_to_int8(size_t row_idx, size_t k_block_offset, int8_t *output) const override;
 
-            const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
-            const size_t sub_block_idx = k_block_offset % 8;
-
-            simd::unpack_iq4_xs_to_int8(blocks[super_block_idx], sub_block_idx, output);
-        }
-
-        __attribute__((always_inline)) float get_block_scale(size_t row_idx, size_t k_block_offset) const override
-        {
-            const size_t super_blocks_per_row = (shape_[1] + IQ4_XSBlock::BLOCK_SIZE - 1) / IQ4_XSBlock::BLOCK_SIZE;
-            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
-            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
-            const IQ4_XSBlock *blocks = reinterpret_cast<const IQ4_XSBlock *>(data_ptr);
-
-            const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
-            const size_t sub_block_idx = k_block_offset % 8;
-
-            return simd::get_iq4_xs_scale(blocks[super_block_idx], sub_block_idx);
-        }
+        float get_block_scale(size_t row_idx, size_t k_block_offset) const override;
 
         size_t superblock_size() const override { return 256; }
         const NativeQuantisedFormatInfo *vnniFormatInfo() const override
@@ -7618,31 +7426,9 @@ namespace llaminar2
         }
 
         // IINT8Unpackable interface
-        __attribute__((always_inline)) void unpack_block_to_int8(size_t row_idx, size_t k_block_offset, int8_t *output) const override
-        {
-            const size_t super_blocks_per_row = (shape_[1] + IQ2_XXSBlock::BLOCK_SIZE - 1) / IQ2_XXSBlock::BLOCK_SIZE;
-            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
-            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
-            const IQ2_XXSBlock *blocks = reinterpret_cast<const IQ2_XXSBlock *>(data_ptr);
+        void unpack_block_to_int8(size_t row_idx, size_t k_block_offset, int8_t *output) const override;
 
-            const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
-            const size_t sub_block_idx = k_block_offset % 8;
-
-            simd::unpack_iq2_xxs_to_int8(blocks[super_block_idx], sub_block_idx, output);
-        }
-
-        __attribute__((always_inline)) float get_block_scale(size_t row_idx, size_t k_block_offset) const override
-        {
-            const size_t super_blocks_per_row = (shape_[1] + IQ2_XXSBlock::BLOCK_SIZE - 1) / IQ2_XXSBlock::BLOCK_SIZE;
-            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
-            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
-            const IQ2_XXSBlock *blocks = reinterpret_cast<const IQ2_XXSBlock *>(data_ptr);
-
-            const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
-            const size_t sub_block_idx = k_block_offset % 8;
-
-            return simd::get_iq2_xxs_scale(blocks[super_block_idx], sub_block_idx);
-        }
+        float get_block_scale(size_t row_idx, size_t k_block_offset) const override;
 
         size_t superblock_size() const override { return 256; }
         const NativeQuantisedFormatInfo *vnniFormatInfo() const override
@@ -7827,31 +7613,9 @@ namespace llaminar2
         }
 
         // IINT8Unpackable interface
-        __attribute__((always_inline)) void unpack_block_to_int8(size_t row_idx, size_t k_block_offset, int8_t *output) const override
-        {
-            const size_t super_blocks_per_row = (shape_[1] + IQ2_XSBlock::BLOCK_SIZE - 1) / IQ2_XSBlock::BLOCK_SIZE;
-            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
-            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
-            const IQ2_XSBlock *blocks = reinterpret_cast<const IQ2_XSBlock *>(data_ptr);
+        void unpack_block_to_int8(size_t row_idx, size_t k_block_offset, int8_t *output) const override;
 
-            const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
-            const size_t sub_block_idx = k_block_offset % 8;
-
-            simd::unpack_iq2_xs_to_int8(blocks[super_block_idx], sub_block_idx, output);
-        }
-
-        __attribute__((always_inline)) float get_block_scale(size_t row_idx, size_t k_block_offset) const override
-        {
-            const size_t super_blocks_per_row = (shape_[1] + IQ2_XSBlock::BLOCK_SIZE - 1) / IQ2_XSBlock::BLOCK_SIZE;
-            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
-            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
-            const IQ2_XSBlock *blocks = reinterpret_cast<const IQ2_XSBlock *>(data_ptr);
-
-            const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
-            const size_t sub_block_idx = k_block_offset % 8;
-
-            return simd::get_iq2_xs_scale(blocks[super_block_idx], sub_block_idx);
-        }
+        float get_block_scale(size_t row_idx, size_t k_block_offset) const override;
 
         size_t superblock_size() const override { return 256; }
         const NativeQuantisedFormatInfo *vnniFormatInfo() const override
@@ -8013,18 +7777,7 @@ namespace llaminar2
             size_t offset = 0) override;
 
         // ITensorGemmTileDataProvider interface (inline for zero overhead in GEMM hot path)
-        __attribute__((always_inline)) void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override
-        {
-            const size_t super_blocks_per_row = (shape_[1] + IQ3_XXSBlock::BLOCK_SIZE - 1) / IQ3_XXSBlock::BLOCK_SIZE;
-            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
-            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
-            const IQ3_XXSBlock *blocks = reinterpret_cast<const IQ3_XXSBlock *>(data_ptr);
-
-            const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
-            const size_t sub_block_idx = k_block_offset % 8;
-
-            simd::decode_iq3xxs_subblock_to_fp32(blocks[super_block_idx], sub_block_idx, output);
-        }
+        void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override;
 
         __attribute__((always_inline))
         const void *
@@ -8044,31 +7797,9 @@ namespace llaminar2
         size_t block_size() const override { return 32; } // Logical block size (sub-block)
 
         // IINT8Unpackable interface
-        __attribute__((always_inline)) void unpack_block_to_int8(size_t row_idx, size_t k_block_offset, int8_t *output) const override
-        {
-            const size_t super_blocks_per_row = (shape_[1] + IQ3_XXSBlock::BLOCK_SIZE - 1) / IQ3_XXSBlock::BLOCK_SIZE;
-            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
-            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
-            const IQ3_XXSBlock *blocks = reinterpret_cast<const IQ3_XXSBlock *>(data_ptr);
+        void unpack_block_to_int8(size_t row_idx, size_t k_block_offset, int8_t *output) const override;
 
-            const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
-            const size_t sub_block_idx = k_block_offset % 8;
-
-            simd::unpack_iq3_xxs_to_int8(blocks[super_block_idx], sub_block_idx, output);
-        }
-
-        __attribute__((always_inline)) float get_block_scale(size_t row_idx, size_t k_block_offset) const override
-        {
-            const size_t super_blocks_per_row = (shape_[1] + IQ3_XXSBlock::BLOCK_SIZE - 1) / IQ3_XXSBlock::BLOCK_SIZE;
-            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
-            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
-            const IQ3_XXSBlock *blocks = reinterpret_cast<const IQ3_XXSBlock *>(data_ptr);
-
-            const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
-            const size_t sub_block_idx = k_block_offset % 8;
-
-            return simd::get_iq3_xxs_scale(blocks[super_block_idx], sub_block_idx);
-        }
+        float get_block_scale(size_t row_idx, size_t k_block_offset) const override;
 
         size_t superblock_size() const override { return 256; }
         const NativeQuantisedFormatInfo *vnniFormatInfo() const override
@@ -8249,31 +7980,9 @@ namespace llaminar2
         }
 
         // IINT8Unpackable interface
-        __attribute__((always_inline)) void unpack_block_to_int8(size_t row_idx, size_t k_block_offset, int8_t *output) const override
-        {
-            const size_t super_blocks_per_row = (shape_[1] + IQ2_SBlock::BLOCK_SIZE - 1) / IQ2_SBlock::BLOCK_SIZE;
-            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
-            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
-            const IQ2_SBlock *blocks = reinterpret_cast<const IQ2_SBlock *>(data_ptr);
+        void unpack_block_to_int8(size_t row_idx, size_t k_block_offset, int8_t *output) const override;
 
-            const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
-            const size_t sub_block_idx = k_block_offset % 8;
-
-            simd::unpack_iq2_s_to_int8(blocks[super_block_idx], sub_block_idx, output);
-        }
-
-        __attribute__((always_inline)) float get_block_scale(size_t row_idx, size_t k_block_offset) const override
-        {
-            const size_t super_blocks_per_row = (shape_[1] + IQ2_SBlock::BLOCK_SIZE - 1) / IQ2_SBlock::BLOCK_SIZE;
-            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
-            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
-            const IQ2_SBlock *blocks = reinterpret_cast<const IQ2_SBlock *>(data_ptr);
-
-            const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
-            const size_t sub_block_idx = k_block_offset % 8;
-
-            return simd::get_iq2_s_scale(blocks[super_block_idx], sub_block_idx);
-        }
+        float get_block_scale(size_t row_idx, size_t k_block_offset) const override;
 
         size_t superblock_size() const override { return 256; }
         const NativeQuantisedFormatInfo *vnniFormatInfo() const override
@@ -8435,18 +8144,7 @@ namespace llaminar2
             size_t offset = 0) override;
 
         // ITensorGemmTileDataProvider interface (inline for zero overhead in GEMM hot path)
-        __attribute__((always_inline)) void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override
-        {
-            const size_t super_blocks_per_row = (shape_[1] + IQ3_SBlock::BLOCK_SIZE - 1) / IQ3_SBlock::BLOCK_SIZE;
-            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
-            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
-            const IQ3_SBlock *blocks = reinterpret_cast<const IQ3_SBlock *>(data_ptr);
-
-            const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
-            const size_t sub_block_idx = k_block_offset % 8;
-
-            simd::decode_iq3s_subblock_to_fp32(blocks[super_block_idx], sub_block_idx, output);
-        }
+        void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override;
 
         __attribute__((always_inline))
         const void *
@@ -8462,31 +8160,9 @@ namespace llaminar2
         }
 
         // IINT8Unpackable interface
-        __attribute__((always_inline)) void unpack_block_to_int8(size_t row_idx, size_t k_block_offset, int8_t *output) const override
-        {
-            const size_t super_blocks_per_row = (shape_[1] + IQ3_SBlock::BLOCK_SIZE - 1) / IQ3_SBlock::BLOCK_SIZE;
-            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
-            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
-            const IQ3_SBlock *blocks = reinterpret_cast<const IQ3_SBlock *>(data_ptr);
+        void unpack_block_to_int8(size_t row_idx, size_t k_block_offset, int8_t *output) const override;
 
-            const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
-            const size_t sub_block_idx = k_block_offset % 8;
-
-            simd::unpack_iq3_s_to_int8(blocks[super_block_idx], sub_block_idx, output);
-        }
-
-        __attribute__((always_inline)) float get_block_scale(size_t row_idx, size_t k_block_offset) const override
-        {
-            const size_t super_blocks_per_row = (shape_[1] + IQ3_SBlock::BLOCK_SIZE - 1) / IQ3_SBlock::BLOCK_SIZE;
-            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
-            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
-            const IQ3_SBlock *blocks = reinterpret_cast<const IQ3_SBlock *>(data_ptr);
-
-            const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
-            const size_t sub_block_idx = k_block_offset % 8;
-
-            return simd::get_iq3_s_scale(blocks[super_block_idx], sub_block_idx);
-        }
+        float get_block_scale(size_t row_idx, size_t k_block_offset) const override;
 
         size_t superblock_size() const override { return 256; }
         const NativeQuantisedFormatInfo *vnniFormatInfo() const override
@@ -8671,31 +8347,9 @@ namespace llaminar2
         }
 
         // IINT8Unpackable interface
-        __attribute__((always_inline)) void unpack_block_to_int8(size_t row_idx, size_t k_block_offset, int8_t *output) const override
-        {
-            const size_t super_blocks_per_row = (shape_[1] + IQ1_SBlock::BLOCK_SIZE - 1) / IQ1_SBlock::BLOCK_SIZE;
-            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
-            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
-            const IQ1_SBlock *blocks = reinterpret_cast<const IQ1_SBlock *>(data_ptr);
+        void unpack_block_to_int8(size_t row_idx, size_t k_block_offset, int8_t *output) const override;
 
-            const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
-            const size_t sub_block_idx = k_block_offset % 8;
-
-            simd::unpack_iq1_s_to_int8(blocks[super_block_idx], sub_block_idx, output);
-        }
-
-        __attribute__((always_inline)) float get_block_scale(size_t row_idx, size_t k_block_offset) const override
-        {
-            const size_t super_blocks_per_row = (shape_[1] + IQ1_SBlock::BLOCK_SIZE - 1) / IQ1_SBlock::BLOCK_SIZE;
-            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
-            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
-            const IQ1_SBlock *blocks = reinterpret_cast<const IQ1_SBlock *>(data_ptr);
-
-            const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
-            const size_t sub_block_idx = k_block_offset % 8;
-
-            return simd::get_iq1_s_scale(blocks[super_block_idx], sub_block_idx);
-        }
+        float get_block_scale(size_t row_idx, size_t k_block_offset) const override;
 
         size_t superblock_size() const override { return 256; }
         const NativeQuantisedFormatInfo *vnniFormatInfo() const override
@@ -8880,31 +8534,9 @@ namespace llaminar2
         }
 
         // IINT8Unpackable interface
-        __attribute__((always_inline)) void unpack_block_to_int8(size_t row_idx, size_t k_block_offset, int8_t *output) const override
-        {
-            const size_t super_blocks_per_row = (shape_[1] + IQ1_MBlock::BLOCK_SIZE - 1) / IQ1_MBlock::BLOCK_SIZE;
-            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
-            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
-            const IQ1_MBlock *blocks = reinterpret_cast<const IQ1_MBlock *>(data_ptr);
+        void unpack_block_to_int8(size_t row_idx, size_t k_block_offset, int8_t *output) const override;
 
-            const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
-            const size_t sub_block_idx = k_block_offset % 8;
-
-            simd::unpack_iq1_m_to_int8(blocks[super_block_idx], sub_block_idx, output);
-        }
-
-        __attribute__((always_inline)) float get_block_scale(size_t row_idx, size_t k_block_offset) const override
-        {
-            const size_t super_blocks_per_row = (shape_[1] + IQ1_MBlock::BLOCK_SIZE - 1) / IQ1_MBlock::BLOCK_SIZE;
-            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
-            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
-            const IQ1_MBlock *blocks = reinterpret_cast<const IQ1_MBlock *>(data_ptr);
-
-            const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
-            const size_t sub_block_idx = k_block_offset % 8;
-
-            return simd::get_iq1_m_scale(blocks[super_block_idx], sub_block_idx);
-        }
+        float get_block_scale(size_t row_idx, size_t k_block_offset) const override;
 
         size_t superblock_size() const override { return 256; }
         const NativeQuantisedFormatInfo *vnniFormatInfo() const override

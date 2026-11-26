@@ -23,6 +23,7 @@
 #include "kernels/cpu/ops/CPUEmbeddingKernelT.h"
 #include "tensors/TensorClasses.h"
 #include "tensors/BlockStructures.h"
+#include "tensors/SIMDHelpers.h"
 // Note: FP16Utils.h is already included via CPUTensors.h, provides llaminar2::fp16_to_fp32
 
 using namespace llaminar2;

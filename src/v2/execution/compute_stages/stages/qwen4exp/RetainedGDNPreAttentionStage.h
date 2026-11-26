@@ -33,4 +33,19 @@ namespace llaminar2
      */
     void lowerRetainedQwenGDNPreAttention(ComputeGraph &graph, const std::string &gdnProjectionName,
                                         const std::string &previousInputBoundary);
+
+#ifdef HAVE_CUDA
+    /** @return Shared production workspace quote for CUDA retained full-GDN graph materialization and PMA admission. */
+    [[nodiscard]] WorkspaceRequirements retainedCUDAGDNWorkspace();
+
+    /**
+     * @brief Contract a participant-local CUDA GDN attention block (HC prefix + GDN proj + conv + rec + ssm_out)
+     *        into one single cooperative megakernel across any CUDA topology.
+     * @param graph Merged cold participant DAG.
+     * @param gdnProjectionName Original exact GDN projection node name.
+     * @param previousInputBoundary Name of the merged prefix frontier, or empty at graph entry (Layer 0).
+     */
+    void lowerRetainedCUDAGDN(ComputeGraph &graph, const std::string &gdnProjectionName,
+                              const std::string &previousInputBoundary);
+#endif
 }

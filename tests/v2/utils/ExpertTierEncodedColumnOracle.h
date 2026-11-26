@@ -28,9 +28,16 @@ std::vector<uint8_t> encodedTierColumn(std::span<const uint8_t> root,
 {
     const size_t unit=((n/64)*(layout.cpu_K/32)+kb)*layout.cpu_block_stride,column=n%64;
     const bool q6=layout.cpu_encoding==cpu::native_quantised::CPUNativeQuantisedEncoding::Q6KNativeDualScale;
+    const bool five_bit=layout.cpu_encoding==cpu::native_quantised::CPUNativeQuantisedEncoding::CompactFiveBit;
     std::vector<uint8_t> result;
-    for(size_t byte=0;byte<(q6?16:layout.cpu_data_stride/64);++byte)
+    for(size_t byte=0;byte<((q6||five_bit)?16:layout.cpu_data_stride/64);++byte)
         result.push_back(root[unit+(byte/4)*256+column*4+byte%4]);
+    if(five_bit)for(size_t byte_idx=0;byte_idx<4;++byte_idx) {
+        uint64_t lo=0,hi=0;const size_t z=column/16,bit=(column%16)*4;
+        std::memcpy(&lo,root.data()+unit+1024+(2*byte_idx)*32+z*8,8);
+        std::memcpy(&hi,root.data()+unit+1024+(2*byte_idx+1)*32+z*8,8);
+        result.push_back(static_cast<uint8_t>(((lo>>bit)&15)|(((hi>>bit)&15)<<4)));
+    }
     if(q6)for(size_t group=0;group<8;++group) {
         uint64_t low,high;const size_t offset=unit+1024+group*64+(column/16)*16;
         std::memcpy(&low,root.data()+offset,8);std::memcpy(&high,root.data()+offset+8,8);

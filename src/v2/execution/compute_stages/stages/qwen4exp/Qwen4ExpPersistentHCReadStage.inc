@@ -54,8 +54,9 @@ public:
             up_.quantized_operand_precision==QuantizedActivationOperandPrecision::TwoTermQ8,
             "Persistent HC requires the explicit original ordinary GPU M1 two-term operation");
         if (device().is_cuda())
-            check(previous_write_ && !inject_ && context_.readExecution == Qwen4ExpHCReadExecution::Staged,
-                "CUDA retained HC requires the original preceding write and independent injection stage");
+            check((previous_write_ || trunk_source_ == Qwen4ExpHCTrunkSource::PublishedTrunk) &&
+                  context_.readExecution == Qwen4ExpHCReadExecution::Staged,
+                "CUDA retained HC requires staged ordinary previous-write or published-trunk bindings");
         if(trunk_source_==Qwen4ExpHCTrunkSource::PublishedTrunk)
             check(!previous_write_&&!inject_&&!ctaOwned(),"Published HC trunk requires its original standalone input and injection");
         check(inject_.has_value()==injection_.has_value(),"Original HC injection source and output must be present together");
@@ -111,8 +112,8 @@ public:
                     input.tensor==write.gateLogits.tensor&&input.buffer==write.gateLogits.buffer&&
                     input.tensor==injection_->tensor&&input.buffer==injection_->buffer&&
                     input.byteOffset==injection_->byteOffset&&input.byteOffset==0&&
-                    input.tensor->native_type()==TensorType::FP32&&input.tensor->numel()==4&&
-                    input.tensor->size_bytes()==4*sizeof(float);
+                    input.tensor->native_type()==TensorType::FP32&&input.tensor->cols()==4&&
+                    input.tensor->rows()>=1&&input.tensor->size_bytes()>=4*sizeof(float);
                 check(!exists||(input.tensor==write.residual.tensor&&input.tensor==buffers_.trunk.tensor&&input.buffer==buffers_.trunk.buffer)||
                     gate_injection_reuse,
                     "Full HC write input aliases an unrelated original public value or gain");
@@ -171,6 +172,7 @@ public:
             "Only a complete full-region owner may narrow HC publications");
         check(!bound()||demand==output_demand_,"Prepared HC output demand cannot change");
         output_demand_=demand;
+        cached_signature_=0;
     }
     /** @copydoc Qwen4ExpHCReadPhaseOwner::optionalPhaseOutputs */
     std::array<Qwen4ExpFloatBinding,2> optionalPhaseOutputs() const override
@@ -291,7 +293,8 @@ public:
             const auto& gate=previous_write_->gateLogits;
             check(gate.buffer==injection_->buffer&&gate.byteOffset==0&&injection_->byteOffset==0&&
                 gate.tensor->current_device()==device()&&gate.tensor->gpu_data_ptr()==injection_->tensor->gpu_data_ptr()&&
-                gate.tensor->native_type()==TensorType::FP32&&gate.tensor->numel()==4&&gate.tensor->size_bytes()==4*sizeof(float),
+                gate.tensor->native_type()==TensorType::FP32&&gate.tensor->cols()==4&&
+                gate.tensor->rows()>=1&&gate.tensor->size_bytes()>=4*sizeof(float),
                 "Full HC gate/injection reuse lost its exact original native allocation/range");
         }
         validatePhysicalIntervals(banks);
@@ -343,12 +346,34 @@ public:
                     rocm::PersistentHCGridPolicy::OnePerProcessor:rocm::PersistentHCGridPolicy::MaximumResident};
             rocm::resolvePersistentHCReadSources(args,engine(down_),engine(up_),inject_?&engine(*inject_):nullptr);
             args_=args;
+            barrier_state_=context_.readExecution==Qwen4ExpHCReadExecution::PersistentOriginalPhases
+                ? static_cast<std::uint32_t*>(bank(GemmWorkspaceBuffers::ROCM_PERSISTENT_HC_BARRIER))
+                : nullptr;
 #endif
         }
         counts_=std::move(counts);
         banks_=std::move(banks);workspace_id_=generation;runtime_generation_=runtime;backend_=backend;
+        same_prepared_store_=(up_.prepared_store==down_.prepared_store && (!inject_ || inject_->prepared_store==down_.prepared_store));
+        validated_store_epoch_=0;
         setGPUStream(stream);prepared_stream_=stream;
-        validateStorage(stream);return true;
+        validateStorage(stream);
+        if(same_prepared_store_)validated_store_epoch_=down_.prepared_store->mutationEpoch();
+        return true;
+    }
+    /** @brief Return whether this standalone ROCm persistent read can absorb an immediately preceding write. */
+    bool canAbsorbPreviousWrite(const Qwen4ExpPrimitiveStage::ResidualWrite& write) const noexcept {
+        return device().is_rocm() && !ctaOwned() && !previous_write_.has_value() && !bound() &&
+            write.hidden == context_.hidden &&
+            write.output.tensor == buffers_.trunk.tensor &&
+            write.output.buffer == buffers_.trunk.buffer &&
+            write.output.byteOffset == 0;
+    }
+    /** @brief Build a cold replacement stage that fuses @p write into this persistent HC read. */
+    std::unique_ptr<PersistentHCReadStage> cloneWithPreviousWrite(
+        const Qwen4ExpPrimitiveStage::ResidualWrite& write) const {
+        return std::make_unique<PersistentHCReadStage>(
+            context_, norm_, down_, up_, inject_, buffers_, injection_, terminal_,
+            workspace_requirements_, write, Qwen4ExpHCTrunkSource::PreviousWrite);
     }
     /** @brief Submit only the sealed native program and publish every original public output. @param ctx Exact worker. */
     bool execute(IDeviceContext* ctx) override {
@@ -356,12 +381,20 @@ public:
         if(!ctx||ctx->deviceId()!=device())throw std::logic_error("Persistent HC has a foreign worker");
         check(device().is_rocm() && prepared(),"CUDA or unprepared HC requires its enclosing resident program");
         const auto execution=gpuExecution();validateStorage(execution.nativeStream());
-        execution.requirePreparedInput(ctaOwned()?buffers_.normalized.tensor:buffers_.trunk.tensor);
+        for(const auto& input:phaseInputs())execution.requirePreparedInput(input.tensor);
         if(!ctaOwned())execution.requirePreparedInput(const_cast<TensorBase*>(norm_.gain.tensor));
-        forEachOutput([&](const auto& output){execution.requirePreparedOutput(output.tensor);});
+        for(const auto& output:phaseOutputs())execution.requirePreparedOutput(output.tensor);
+        rocm::PersistentHCWriteInput write_input{};
+        if(previous_write_) {
+            write_input={
+                static_cast<const float*>(previous_write_->residual.tensor->gpu_data_ptr()),
+                static_cast<const float*>(previous_write_->block.tensor->gpu_data_ptr()),
+                static_cast<const float*>(previous_write_->gateLogits.tensor->gpu_data_ptr()),
+                static_cast<float*>(previous_write_->output.tensor->gpu_data_ptr())};
+        }
         if(ctaOwned())rocm::launchCTAOwnedHCRead(*ordinary_,*args_,execution.nativeStream(),workspace_id_);
-        else rocm::launchPersistentHCRead(*admission_,*args_,execution.nativeStream(),workspace_id_);
-        forEachOutput([&](const auto& output){execution.publish(output.tensor);});
+        else rocm::launchPersistentHCRead(*admission_,*args_,barrier_state_,execution.nativeStream(),workspace_id_,write_input);
+        for(const auto& output:phaseOutputs())execution.publish(output.tensor);
         return true;
 #else
         (void)ctx;
@@ -370,7 +403,9 @@ public:
     }
     /** @return Complete declaration identity, stable across cold physical materialization. */
     std::uint64_t graphCaptureVariantSignature() const override {
-        validateDeclaredRoots();if(bound())validateStorage(prepared_stream_);
+        if(bound())validateStorage(prepared_stream_);
+        else validateDeclaredRoots(true);
+        if(cached_signature_!=0)return cached_signature_;
         auto hash=kFNV1a64OffsetBasis;const auto mix=[&](std::uint64_t value){hash=(hash^value)*kFNV1a64Prime;};
         mix(bool(inject_));mix(bool(previous_write_));mix(output_demand_.bits());mix(static_cast<unsigned>(trunk_source_));
         if(previous_write_)for(const auto& v:std::array{previous_write_->residual,previous_write_->block,previous_write_->gateLogits,previous_write_->output}) {mix(reinterpret_cast<std::uintptr_t>(v.tensor));mix(static_cast<unsigned>(v.buffer));mix(v.byteOffset);}
@@ -387,14 +422,16 @@ public:
         for(const auto& root:roots_){mix(reinterpret_cast<std::uintptr_t>(root.tensor));mix(root.bytes);mix(static_cast<unsigned>(root.type));for(auto size:root.shape)mix(size);}
         for(const auto* p:projections()){mix(reinterpret_cast<std::uintptr_t>(p->prepared_store));mix(p->prepared_ref->binding_id);mix(reinterpret_cast<std::uintptr_t>(p->B));}
         for(const auto& source:sources_){mix(reinterpret_cast<std::uintptr_t>(source.tensor));mix(source.bytes);mix(static_cast<unsigned>(source.type));for(auto size:source.shape)mix(size);}
-        return hash?hash:1;
+        cached_signature_=hash?hash:1;
+        return cached_signature_;
     }
     /** @brief Retire the program before physical leases and workspace borrows. */
     void invalidateKernelDynamicState() override {
-        admission_.reset();ordinary_.reset();args_.reset();
+        admission_.reset();ordinary_.reset();args_.reset();barrier_state_=nullptr;
 #ifdef HAVE_CUDA
         cuda_args_.reset();
 #endif
+        validated_store_epoch_=0;
         counts_.clear();banks_.clear();for(auto& root:roots_)root.lease.reset();
     }
     /** @return Inputs remain unchanged; the exact submitted stream authors public outputs. */
@@ -457,11 +494,6 @@ private:
             "CUDA retained HC requires its originally prepared native projections");
         (void)requireQ8ResidualNativeMatrix(down,1,context_.lowRank,4*context_.hidden);
         (void)requireQ8ResidualNativeMatrix(up,1,4*context_.hidden,context_.lowRank);
-        constexpr auto q8 = native_quantised_formats::Q8_0.codebook_id;
-        check(down.codebook_id == q8 && up.codebook_id == q8 && down.source_identity_present &&
-            up.source_identity_present && down.source_codebook_id == q8 && up.source_codebook_id == q8 &&
-            !down.source_is_superblock && !up.source_is_superblock,
-            "CUDA retained HC requires the original Q8_0 source and physical decoder");
         int ordered = 0, partitions = 0;
         const auto& hardware = cudaHardwareMetadata().at(device().ordinal);
         check(cudaNativeQuantisedGemvTuned_queryCanonicalM1Schedule(down.source_codebook_id,
@@ -477,18 +509,40 @@ private:
             publication.primaryScales && publication.residualScales &&
             publication.rows.countOwner() == norm.extent.liveRows,
             "CUDA retained HC requires matching row authority and original activation banks");
-        const auto& w = *previous_write_;
+        const float* injection_weights = nullptr;
+        float* injection_output = nullptr;
+        if (inject_)
+        {
+            ContiguousFloatingPointWeightDescriptor injection{};
+            check(engine(*inject_).exportContiguousFloatingPointWeights(injection) &&
+                  injection.valid() && injection.type == TensorType::FP32 &&
+                  injection.n == 4 && injection.k == 4 * context_.hidden,
+                "CUDA retained HC injection requires original contiguous FP32 [4, 4H] weights");
+            injection_weights = static_cast<const float*>(injection.data);
+            injection_output = static_cast<float*>(injection_->tensor->gpu_data_ptr());
+        }
+        qwen4exp::ResidualWriteArgs write_args{.extent=norm.extent,.hidden=norm.hidden};
+        if (previous_write_)
+        {
+            const auto& w = *previous_write_;
+            write_args = {norm.extent, norm.hidden,
+                static_cast<const float*>(w.residual.tensor->gpu_data_ptr()),
+                static_cast<const float*>(w.block.tensor->gpu_data_ptr()),
+                static_cast<const float*>(w.gateLogits.tensor->gpu_data_ptr()),
+                static_cast<float*>(w.output.tensor->gpu_data_ptr())};
+        }
         return {
-            .write={norm.extent,norm.hidden,static_cast<const float*>(w.residual.tensor->gpu_data_ptr()),
-                static_cast<const float*>(w.block.tensor->gpu_data_ptr()),static_cast<const float*>(w.gateLogits.tensor->gpu_data_ptr()),
-                static_cast<float*>(w.output.tensor->gpu_data_ptr())},
+            .write=write_args,
             .norm=norm,.down=down,.down_partitions={partitions,(down.k/32+partitions-1)/partitions},
             .down_fold=ordered ? cuda::moe::HCDownFold::OrderedPartitions : cuda::moe::HCDownFold::Direct,
             .norm_codes=codes,.norm_scales=scales,.down_partials=partials,.raw_down=raw_down,
             .down_publication=publication,
             .up={up,publication.rows,Q8ResidualQuantizerPolicy::CUDAFloatScaleNativeReciprocal,raw_down,logits,
                 publication.primary,publication.residual,publication.primaryScales,publication.residualScales},
-            .mixed=mixed};
+            .mixed=mixed,
+            .injection_weights=injection_weights,
+            .injection_output=injection_output,
+            .has_previous_write=previous_write_.has_value()};
     }
 #endif
     /** @return Whether this declaration retains original norm/injection graph nodes. */
@@ -553,15 +607,17 @@ private:
         check(result!=nullptr,"Persistent HC source has no original prepared engine");return *result;
     }
     /** @brief Reject same-byte shape/type/view substitution before signature queries and launch. */
-    void validateDeclaredRoots() const {
+    void validateDeclaredRoots(bool check_store = true) const {
         for(const auto& root:roots_)check(root.tensor&&root.tensor->shape()==root.shape&&root.tensor->size_bytes()==root.bytes&&root.tensor->native_type()==root.type,
             "Persistent HC original tensor declaration changed");
-        std::size_t source=0;
-        for(const auto* p:projections()) {
-            const auto& saved=sources_[source++];
-            check(p->B==saved.tensor&&p->B->shape()==saved.shape&&p->B->size_bytes()==saved.bytes&&
-                p->B->native_type()==saved.type && &engine(*p)==saved.engine,
-                "Persistent HC original prepared source declaration or owner changed");
+        if(check_store) {
+            std::size_t source=0;
+            for(const auto* p:projections()) {
+                const auto& saved=sources_[source++];
+                check(p->B==saved.tensor&&p->B->shape()==saved.shape&&p->B->size_bytes()==saved.bytes&&
+                    p->B->native_type()==saved.type && &engine(*p)==saved.engine,
+                    "Persistent HC original prepared source declaration or owner changed");
+            }
         }
         for(std::size_t i=0;i<roots_.size();++i)for(std::size_t j=0;j<i;++j)
             if(roots_[i].tensor==roots_[j].tensor)
@@ -594,7 +650,9 @@ private:
     }
     /** @brief Validate exact original storage/runtime/workspace/source identity without device queries or data transfers. @param stream Original prepared stream. */
     void validateStorage(void* stream) const {
-        validateDeclaredRoots();
+        const bool store_unchanged = same_prepared_store_ && validated_store_epoch_ != 0 &&
+            down_.prepared_store->mutationEpoch() == validated_store_epoch_;
+        validateDeclaredRoots(!store_unchanged);
         if(!bound()||!workspace_||workspace_->id()!=workspace_id_||!workspace_->isAllocated()||
             stream!=prepared_stream_||requireGPUStream()!=prepared_stream_||reinterpret_cast<std::uintptr_t>(stream)<=2||getBackendFor(device())!=backend_||
             backend_->deviceRuntimeGeneration(device().ordinal)!=runtime_generation_)
@@ -610,10 +668,14 @@ private:
             if(root.tensor->gpu_data_ptr()!=root.pointer)throw std::logic_error("Persistent HC public pointer changed");
             TransferEngine{}.requireCapturedDeviceStorage(*root.lease,*root.tensor,device(),root.bytes);
         }
-        for(const auto& bank:banks_)if(workspace_->getBuffer(bank.name)!=bank.pointer||workspace_->getBufferSize(bank.name)!=bank.bytes||bank.lease->data()!=bank.pointer)
+        for(const auto& bank:banks_)if(!bank.lease||bank.lease->data()!=bank.pointer||bank.lease->sizeBytes()!=bank.bytes)
             throw std::logic_error("Persistent HC named scratch binding changed");
-        for(const auto& count:counts_)if(!count.lease.sameStorage(backend_->retainNativeAllocation(count.pointer,sizeof(std::int32_t),device().ordinal)))
+        // Each retained NativeAllocationCaptureLease pins its allocator record
+        // under the backend lifecycle lock; re-calling retainNativeAllocation()
+        // on every replay repeats a contended global registry scan per layer.
+        for(const auto& count:counts_)if(!count.lease.valid())
             throw std::logic_error("Persistent HC original row control allocation changed");
+        if(store_unchanged)return;
         DeviceNativeQuantisedMatrixDesc down{},up{};
         if(!engine(down_).inspectPreparedNativeQuantisedMatrixDesc(down)||!engine(up_).inspectPreparedNativeQuantisedMatrixDesc(up))
             throw std::logic_error("Persistent HC original prepared descriptors changed");
@@ -623,6 +685,14 @@ private:
 #ifdef HAVE_CUDA
         if (cuda_args_) {
             check(descriptorsMatch(cuda_args_->down,cuda_args_->up.weights),"Persistent CUDA HC original prepared descriptors changed");
+            if (inject_) {
+                ContiguousFloatingPointWeightDescriptor injection{};
+                if (!engine(*inject_).exportContiguousFloatingPointWeights(injection) || !injection.valid() ||
+                    injection.type != TensorType::FP32 || injection.n != 4 || injection.k != 4 * context_.hidden ||
+                    injection.data != cuda_args_->injection_weights)
+                    throw std::logic_error("Persistent CUDA HC original injection source changed");
+            }
+            if(same_prepared_store_)validated_store_epoch_=down_.prepared_store->mutationEpoch();
             return;
         }
 #endif
@@ -633,6 +703,7 @@ private:
                 injection.type!=TensorType::FP32||injection.n!=4||injection.k!=4*context_.hidden||injection.data!=args_->injection.weights)
                 throw std::logic_error("Persistent HC original injection source changed");
         }
+        if(same_prepared_store_)validated_store_epoch_=down_.prepared_store->mutationEpoch();
     }
     const Qwen4ExpHyperconnectionContext context_;
     const Qwen4ExpPrimitiveStage::BranchRMSNorm norm_;
@@ -654,9 +725,13 @@ private:
     std::optional<cuda::moe::RetainedHCPrefix> cuda_args_;
 #endif
     std::optional<rocm::PersistentHCReadArgs> args_;
+    std::uint32_t* barrier_state_=nullptr;
     std::optional<NativeCooperativeKernelAdmission> admission_;
     std::optional<rocm::CTAOwnedHCReadProgram> ordinary_;
     std::uint64_t workspace_id_=0,runtime_generation_=0;
+    bool same_prepared_store_=false;
+    mutable std::uint64_t validated_store_epoch_=0;
+    mutable std::uint64_t cached_signature_=0;
     IBackend* backend_=nullptr;
     void* prepared_stream_=nullptr;
 };

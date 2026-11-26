@@ -51,6 +51,7 @@ namespace llaminar2
     {
         Unannotated, ///< Original region and exports own no capture metadata.
         HeterogeneousTicketLocal, ///< Ticket units own segmentation; retire active wave labels and preserve a retained sink's cutpoint.
+        WaveAnnotatedLocal, ///< Single native timeline transaction; retire active wave labels and allow wave-annotated outside readers.
     };
 
     /** @brief Select the complete DAG or only nodes executed by its main native units. */
@@ -225,6 +226,31 @@ namespace llaminar2
     };
 
     /**
+     * @brief Explicit semantic role of one directed graph dependency edge.
+     *
+     * Separating data flow from scratch ordering, manual host submission order,
+     * and cross-participant collective ordering lets declarative builders
+     * reject miswired edges (such as coupling CPU ticket wake-up behind a
+     * GPU-overlap branch) at graph construction time instead of discovering
+     * deadlocks or latency regressions at runtime.
+     */
+    enum class GraphDependencyKind : uint8_t
+    {
+        DataFlow = 0,        ///< Consumer reads tensor or device state published by producer.
+        ScratchOrder,        ///< Same-device scratch/alias ordering without logical data transfer.
+        HostSubmissionOrder, ///< Orders a manual host stage after a captured GPU cutpoint (no GPU wait).
+        CollectiveOrder,     ///< Symmetric cross-participant collective entry ordering.
+    };
+
+    /** @brief Immutable producer edge with its explicit semantic role. */
+    struct GraphDependencyEdge
+    {
+        std::string producer;                                    ///< Upstream node name.
+        GraphDependencyKind kind = GraphDependencyKind::DataFlow; ///< Semantic edge role.
+        bool operator==(const GraphDependencyEdge &) const = default;
+    };
+
+    /**
      * @brief Represents a node in the compute graph
      */
     struct ComputeNode
@@ -232,6 +258,7 @@ namespace llaminar2
         std::string name;                      ///< Node identifier
         std::unique_ptr<IComputeStage> stage;  ///< The compute stage
         std::vector<std::string> dependencies; ///< Names of nodes this depends on
+        std::vector<GraphDependencyKind> dependency_kinds; ///< Semantic kind parallel to @ref dependencies.
         DeviceId device;                       ///< Target device for execution
         bool completed;                        ///< Execution complete flag
         std::optional<GraphCaptureWaveContract> graph_capture_wave; ///< Optional cross-participant capture schedule contract.
@@ -503,6 +530,95 @@ namespace llaminar2
          */
         ComputeGraph &addDependency(const std::string &node_name,
                                     const std::string &depends_on);
+
+        /**
+         * @brief Add a strictly validated typed dependency edge between existing nodes.
+         * @param consumer Existing dependent node name.
+         * @param producer Existing upstream node name.
+         * @param kind Explicit semantic dependency role.
+         * @return Reference to this graph for chaining.
+         * @throws std::out_of_range If @p consumer or @p producer does not exist.
+         * @throws std::invalid_argument On self-loop, cycle creation, conflicting duplicate role,
+         *         or invalid @ref GraphDependencyKind::HostSubmissionOrder endpoints.
+         * @details Validates completely before mutation so a rejected edge leaves the graph intact.
+         */
+        ComputeGraph &addTypedDependency(
+            const std::string &consumer,
+            const std::string &producer,
+            GraphDependencyKind kind = GraphDependencyKind::DataFlow);
+
+        /**
+         * @brief Return all incoming dependency edges and their semantic kinds for @p node_name.
+         * @param node_name Existing node name.
+         * @return Ordered list of typed upstream edges.
+         * @throws std::out_of_range If @p node_name does not exist.
+         */
+        [[nodiscard]] std::vector<GraphDependencyEdge> dependencyEdges(
+            const std::string &node_name) const;
+
+        /**
+         * @brief Return direct consumers of @p producer in topological execution order.
+         * @param producer Existing upstream node name.
+         * @return Names of nodes with a direct dependency on @p producer.
+         * @throws std::out_of_range If @p producer does not exist.
+         */
+        [[nodiscard]] std::vector<std::string> directConsumersOf(
+            const std::string &producer) const;
+
+        /**
+         * @brief Check whether @p consumer directly depends on @p producer.
+         * @param consumer Dependent node name.
+         * @param producer Upstream node name.
+         * @return True iff both exist and @p producer is in @p consumer's dependency list.
+         */
+        [[nodiscard]] bool hasDependency(
+            const std::string &consumer,
+            const std::string &producer) const noexcept;
+
+        /**
+         * @brief Check whether a directed producer-to-consumer path exists from @p from to @p to.
+         * @param from Upstream source node name.
+         * @param to Downstream target node name.
+         * @return True iff @p from reaches @p to through one or more dependency edges.
+         */
+        [[nodiscard]] bool hasPath(
+            const std::string &from,
+            const std::string &to) const;
+
+        /**
+         * @brief Discover all exact outside consumers of non-terminal interior nodes in @p region.
+         * @param region Distinct existing nodes belonging to the region, including @p terminal.
+         * @param terminal Retained region sink whose own outside consumers need no export entry.
+         * @return Exact non-empty @ref LocalRegionExport list in topological order.
+         * @throws std::invalid_argument If @p region is empty, has duplicates, lacks @p terminal,
+         *         or names a missing node.
+         */
+        [[nodiscard]] std::vector<LocalRegionExport> discoverLocalRegionExports(
+            std::span<const std::string> region,
+            const std::string &terminal) const;
+
+        /**
+         * @brief Return the capture policy appropriate for local region contraction under this graph's envelope.
+         * @return @ref LocalRegionCapturePolicy::HeterogeneousTicketLocal when the graph uses a
+         *         heterogeneous ticket envelope, @ref LocalRegionCapturePolicy::WaveAnnotatedLocal when
+         *         it uses a single device-owned timeline transaction, otherwise @ref LocalRegionCapturePolicy::Unannotated.
+         */
+        [[nodiscard]] LocalRegionCapturePolicy defaultLocalRegionCapturePolicy() const noexcept
+        {
+            if (requiresHeterogeneousTicketSegmentation(native_capture_envelope_))
+                return LocalRegionCapturePolicy::HeterogeneousTicketLocal;
+            if (requiresSingleNativeExecutable(native_capture_envelope_))
+                return LocalRegionCapturePolicy::WaveAnnotatedLocal;
+            return LocalRegionCapturePolicy::Unannotated;
+        }
+
+        /**
+         * @brief Validate structural DAG and typed-dependency invariants across the entire graph.
+         * @throws std::logic_error On missing dependency targets, self-loops, cycles, misaligned
+         *         dependency metadata, invalid host-submission edges, or ticket-unit contracts
+         *         outside a heterogeneous ticket envelope.
+         */
+        void validateDeclarativeInvariants() const;
 
         /**
          * @brief Name the whole native transaction without enabling internal segmentation.

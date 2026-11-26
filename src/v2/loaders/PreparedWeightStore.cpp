@@ -399,6 +399,7 @@ namespace llaminar2
             // Allocation failure leaves an existing owner untouched; replacing
             // its Entry is noexcept, so both memberships commit together.
             entries_.insert_or_assign(key, std::move(entry));
+            mutation_epoch_.fetch_add(1u, std::memory_order_release);
         } catch (...) {
             removeGemmMembership(name_added ? name : absent_name,
                 tensor_added ? tensor : AdoptionTensorKey{nullptr, key.device}, key);
@@ -579,6 +580,7 @@ namespace llaminar2
                 std::move(owned),
                 nullptr,
             };
+            mutation_epoch_.fetch_add(1u, std::memory_order_release);
             binding.prepared = ref;
             binding.tensor->publishPreparedDeviceState();
             return true;
@@ -820,6 +822,7 @@ namespace llaminar2
             std::lock_guard<std::mutex> lock(mutex_);
             if(embedding_entries_.contains(keyFor(ref)))throw std::logic_error("CPU embedding final owner already published");
             embedding_entries_.emplace(keyFor(ref),EmbeddingEntry{std::move(stored),ref,std::move(handle),nullptr});
+            mutation_epoch_.fetch_add(1u, std::memory_order_release);
             binding.tensor->publishPreparedDeviceState();
             return ref;
         }
@@ -885,6 +888,7 @@ namespace llaminar2
         std::lock_guard<std::mutex> lock(mutex_);
         embedding_entries_[keyFor(ref)] =
             EmbeddingEntry{std::move(stored), ref, std::move(owned), nullptr};
+        mutation_epoch_.fetch_add(1u, std::memory_order_release);
 
         // Mark tensor as having prepared device state
         binding.tensor->publishPreparedDeviceState();
@@ -912,6 +916,7 @@ namespace llaminar2
         std::lock_guard<std::mutex> lock(mutex_);
         embedding_entries_[keyFor(ref)] =
             EmbeddingEntry{std::move(stored), ref, std::move(owned), handle};
+        mutation_epoch_.fetch_add(1u, std::memory_order_release);
 
         if (binding.tensor)
             binding.tensor->publishPreparedDeviceState();
@@ -1136,6 +1141,7 @@ namespace llaminar2
         embedding_entries_.clear();
         sliced_cache_.clear();
         expert_slabs_.clear();
+        mutation_epoch_.fetch_add(1u, std::memory_order_release);
     }
 
     PreparedWeightStore::~PreparedWeightStore()
@@ -1165,6 +1171,7 @@ namespace llaminar2
         embedding_entries_.clear();
         sliced_cache_.clear();
         expert_slabs_.clear();
+        mutation_epoch_.fetch_add(1u, std::memory_order_release);
     }
 
     // =========================================================================

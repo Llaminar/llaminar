@@ -1297,6 +1297,33 @@ namespace llaminar2
             bool rollback,
             const MTPPublicationWitness &publication);
         GenerationResult decodeStepMTP();
+        /**
+         * @brief Diagnostic host oracle checking committed MTP prefix state against serial replay.
+         * @param verify_commit_replay_check Whether the opt-in replay check is active.
+         * @param use_ready_logits Whether prefill logits were already ready at step entry.
+         * @param mtp Active request MTP runtime configuration.
+         * @param condition_token Leading condition token for mismatch diagnostics.
+         * @param base_sidecar_position Base shifted-sidecar position at transaction entry.
+         * @param verifier_replay_base_checkpoint Captured pre-commit live prefix checkpoint.
+         * @param path Diagnostic verifier path label.
+         * @param tokens_to_replay Committed token sequence to replay serially.
+         * @param expected_next_token Expected ready next token, or negative if deferred.
+         * @param state_advanced_token_count State-advanced row count, or -1 for full prefix.
+         * @param debug_context Optional diagnostic context string.
+         * @return Error message on mismatch/failure, or std::nullopt on match/skip.
+         */
+        std::optional<std::string> verifyCommittedPrefixReplay(
+            bool verify_commit_replay_check,
+            bool use_ready_logits,
+            const MTPRuntimeConfig &mtp,
+            int32_t condition_token,
+            int base_sidecar_position,
+            const std::optional<PrefixStateSnapshot> &verifier_replay_base_checkpoint,
+            const char *path,
+            const std::vector<int32_t> &tokens_to_replay,
+            int32_t expected_next_token,
+            int state_advanced_token_count = -1,
+            const std::string &debug_context = {});
         void clearBatchedDecodeState();
         /**
          * @brief Open this rank's ExpertOverlay demand bank at request admission.

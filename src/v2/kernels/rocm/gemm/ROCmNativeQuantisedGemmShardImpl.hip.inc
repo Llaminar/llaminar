@@ -2092,6 +2092,275 @@ void streaming_lm_head_kernel(
 
 
 // ============================================================================
+// Skinny-N 4-Wave In-CTA Split-K Kernel (Pattern S: Q8_0, Q4_0, IQ4_NL, ...)
+//
+// For skinny-N long-K projections (e.g. QFN hc_down N=320 K=10240, shexp N=160
+// K=2560), N64/MT16 under-utilizes 60-CU MI50 and has 4x1 register tiles.
+// This kernel uses an N32×M16 tile (2x more CTAs in N) with 4 waves per CTA
+// executing 4 consecutive serial_m1_kblocks partitions in parallel:
+//   - Each wave owns 16×32 output (4×2 per thread = 2x arithmetic intensity)
+//   - Wave-local zero-s_barrier LDS (6.9 KB) unioned with 8 KB partition fold
+//   - Exact ascending FP32 partition fold on wave 0 → 100% bitwise identical
+//     to serial M=1 for every K and serial_m1_kblocks >= 4.
+// ============================================================================
+template <NativeQuantisedGemmFormat FMT>
+__global__ __launch_bounds__(256, 1)
+void native_quantised_gemm_skinny_splitk_kernel(
+    const int8_t*   __restrict__ d_A_int8,
+    const uint8_t*  __restrict__ d_payload,
+    const uint16_t* __restrict__ d_block_scales,
+    const uint16_t* __restrict__ d_block_mins,
+    float*          __restrict__ d_output,
+    const float*    __restrict__ d_scales_A,
+    int M, int N, int K,
+    const float*    __restrict__ d_scales_A_blockwise,
+    int serial_m1_kblocks)
+{
+    using Traits = NATIVE_QUANTISEDGemmTraits<FMT>;
+    constexpr int PB = Traits::payload_bytes;
+    constexpr int PD = Traits::payload_dwords;
+
+    const int n_block = blockIdx.x * 32;
+    const int m_block = blockIdx.y * 16;
+    const int wave = threadIdx.x >> 6;
+    const int lane = threadIdx.x & 63;
+    const int t_m = lane & 3;
+    const int t_n = lane >> 2;
+    const int m_base = t_m * 4;
+    const int n_local = t_n * 2;
+
+    const int blocks_per_row = K / 32;
+    const int a_row_stride = K / 4;
+    const int blocks_per_partition =
+        (blocks_per_row + serial_m1_kblocks - 1) / serial_m1_kblocks;
+    const int actual_partitions =
+        (blocks_per_row + blocks_per_partition - 1) / blocks_per_partition;
+    if (actual_partitions <= 0) return;
+
+    union SharedBuf {
+        struct {
+            int32_t a[2][4][16][9];
+            int32_t b[2][4][8][32];
+            float scale[2][4][32];
+        } tile;
+        float part[4][16][32];
+    };
+    __shared__ SharedBuf smem;
+    __shared__ float s_ordered_sum[16][32];
+
+    if (wave == 0)
+    {
+        #pragma unroll
+        for (int mm = 0; mm < 4; ++mm)
+        {
+            s_ordered_sum[m_base + mm][n_local + 0] = 0.0f;
+            s_ordered_sum[m_base + mm][n_local + 1] = 0.0f;
+        }
+    }
+
+    const int32_t* a_global = reinterpret_cast<const int32_t*>(d_A_int8);
+    const bool m_full = (m_block + 16 <= M);
+    const bool n_full = (n_block + 32 <= N);
+
+    const int a_r = lane >> 1;
+    const int a_half = lane & 1;
+    const int a_gm = m_block + a_r;
+    const int b_col = lane - 32;
+    const int b_ncol = n_block + b_col;
+
+    auto prefetch_block = [&](int blk, uint4& a_pref, uint32_t (&b_dw)[PD],
+                              uint16_t& s_bits, uint16_t& aux_bits) {
+        if (lane < 32) {
+            if (m_full || a_gm < M) {
+                a_pref = *reinterpret_cast<const uint4*>(
+                    a_global + static_cast<int64_t>(a_gm) * a_row_stride +
+                    blk * 8 + a_half * 4);
+            } else {
+                a_pref = make_uint4(0u, 0u, 0u, 0u);
+            }
+        } else {
+            if (n_full || b_ncol < N) {
+                const size_t linear = static_cast<size_t>(blk) * N + b_ncol;
+                load_payload<PB>(d_payload + linear * PB, b_dw);
+                s_bits = d_block_scales[linear];
+                if constexpr (Traits::needs_aux_compute)
+                    aux_bits = d_block_mins[linear];
+            } else {
+                s_bits = 0;
+                aux_bits = 0;
+            }
+        }
+    };
+
+    auto stage_block = [&](int buf, const uint4& a_pref, const uint32_t (&b_dw)[PD],
+                           uint16_t s_bits, uint16_t aux_bits) {
+        if (lane < 32) {
+            const int base_kg = a_half * 4;
+            smem.tile.a[buf][wave][a_r][base_kg + 0] = static_cast<int32_t>(a_pref.x);
+            smem.tile.a[buf][wave][a_r][base_kg + 1] = static_cast<int32_t>(a_pref.y);
+            smem.tile.a[buf][wave][a_r][base_kg + 2] = static_cast<int32_t>(a_pref.z);
+            smem.tile.a[buf][wave][a_r][base_kg + 3] = static_cast<int32_t>(a_pref.w);
+        } else {
+            if (n_full || b_ncol < N) {
+                int32_t packed[8];
+                decode_block<FMT>(b_dw, packed);
+                #pragma unroll
+                for (int kg = 0; kg < 8; ++kg)
+                    smem.tile.b[buf][wave][kg][b_col] = packed[kg];
+                smem.tile.scale[buf][wave][b_col] =
+                    rocm_native_quantised_load_single_weight_scale<FMT>(s_bits, aux_bits);
+            } else {
+                #pragma unroll
+                for (int kg = 0; kg < 8; ++kg)
+                    smem.tile.b[buf][wave][kg][b_col] = 0;
+                smem.tile.scale[buf][wave][b_col] = 0.0f;
+            }
+        }
+        asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+    };
+
+    #pragma clang loop unroll(disable)
+    for (int p_base = 0; p_base < actual_partitions; p_base += 4)
+    {
+        const int p = p_base + wave;
+        float acc[4][2];
+        #pragma unroll
+        for (int mm = 0; mm < 4; ++mm)
+            #pragma unroll
+            for (int nn = 0; nn < 2; ++nn)
+                acc[mm][nn] = 0.0f;
+
+        if (p < actual_partitions)
+        {
+            const int b_begin = p * blocks_per_partition;
+            const int b_end = min(b_begin + blocks_per_partition, blocks_per_row);
+            uint4 a_pref{};
+            uint32_t b_dw[PD];
+            uint16_t s_bits = 0, aux_bits = 0;
+            int cur = 0;
+            prefetch_block(b_begin, a_pref, b_dw, s_bits, aux_bits);
+            stage_block(cur, a_pref, b_dw, s_bits, aux_bits);
+
+            #pragma clang loop unroll(disable)
+            for (int blk = b_begin; blk < b_end; ++blk)
+            {
+                const bool has_next = (blk + 1 < b_end);
+                if (has_next)
+                    prefetch_block(blk + 1, a_pref, b_dw, s_bits, aux_bits);
+
+                int32_t block_acc[4][2];
+                #pragma unroll
+                for (int mm = 0; mm < 4; ++mm)
+                    #pragma unroll
+                    for (int nn = 0; nn < 2; ++nn)
+                        block_acc[mm][nn] = 0;
+
+                #pragma unroll 4
+                for (int kg = 0; kg < 8; ++kg)
+                {
+                    const int32_t a0 = smem.tile.a[cur][wave][m_base + 0][kg];
+                    const int32_t a1 = smem.tile.a[cur][wave][m_base + 1][kg];
+                    const int32_t a2 = smem.tile.a[cur][wave][m_base + 2][kg];
+                    const int32_t a3 = smem.tile.a[cur][wave][m_base + 3][kg];
+                    const int32_t b0 = smem.tile.b[cur][wave][kg][n_local + 0];
+                    const int32_t b1 = smem.tile.b[cur][wave][kg][n_local + 1];
+                    block_acc[0][0] = ::llaminar2::rocm_integer_contract::signedDot4(a0, b0, block_acc[0][0]);
+                    block_acc[0][1] = ::llaminar2::rocm_integer_contract::signedDot4(a0, b1, block_acc[0][1]);
+                    block_acc[1][0] = ::llaminar2::rocm_integer_contract::signedDot4(a1, b0, block_acc[1][0]);
+                    block_acc[1][1] = ::llaminar2::rocm_integer_contract::signedDot4(a1, b1, block_acc[1][1]);
+                    block_acc[2][0] = ::llaminar2::rocm_integer_contract::signedDot4(a2, b0, block_acc[2][0]);
+                    block_acc[2][1] = ::llaminar2::rocm_integer_contract::signedDot4(a2, b1, block_acc[2][1]);
+                    block_acc[3][0] = ::llaminar2::rocm_integer_contract::signedDot4(a3, b0, block_acc[3][0]);
+                    block_acc[3][1] = ::llaminar2::rocm_integer_contract::signedDot4(a3, b1, block_acc[3][1]);
+                }
+
+                const float bs0 = smem.tile.scale[cur][wave][n_local + 0];
+                const float bs1 = smem.tile.scale[cur][wave][n_local + 1];
+                #pragma unroll
+                for (int mm = 0; mm < 4; ++mm)
+                {
+                    const int gm = m_block + m_base + mm;
+                    const float sa = d_scales_A_blockwise
+                        ? ((m_full || gm < M)
+                               ? d_scales_A_blockwise[static_cast<int64_t>(gm) * blocks_per_row + blk]
+                               : 0.0f)
+                        : 1.0f;
+                    acc[mm][0] = rocm_native_quantised_commit_single_scale_block(acc[mm][0], block_acc[mm][0], bs0, sa);
+                    acc[mm][1] = rocm_native_quantised_commit_single_scale_block(acc[mm][1], block_acc[mm][1], bs1, sa);
+                }
+
+                if (has_next) {
+                    cur ^= 1;
+                    stage_block(cur, a_pref, b_dw, s_bits, aux_bits);
+                }
+            }
+
+            if (!d_scales_A_blockwise)
+            {
+                #pragma unroll
+                for (int mm = 0; mm < 4; ++mm)
+                {
+                    const int gm = m_block + m_base + mm;
+                    if (m_full || gm < M)
+                    {
+                        const float sa_row = d_scales_A[gm];
+                        acc[mm][0] = __fmul_rn(acc[mm][0], sa_row);
+                        acc[mm][1] = __fmul_rn(acc[mm][1], sa_row);
+                    }
+                }
+            }
+        }
+
+        __syncthreads();
+        #pragma unroll
+        for (int mm = 0; mm < 4; ++mm)
+        {
+            smem.part[wave][m_base + mm][n_local + 0] = acc[mm][0];
+            smem.part[wave][m_base + mm][n_local + 1] = acc[mm][1];
+        }
+        __syncthreads();
+
+        if (wave == 0)
+        {
+            const int count = min(4, actual_partitions - p_base);
+            for (int j = 0; j < count; ++j)
+            {
+                #pragma unroll
+                for (int mm = 0; mm < 4; ++mm)
+                {
+                    s_ordered_sum[m_base + mm][n_local + 0] = __fadd_rn(
+                        s_ordered_sum[m_base + mm][n_local + 0],
+                        smem.part[j][m_base + mm][n_local + 0]);
+                    s_ordered_sum[m_base + mm][n_local + 1] = __fadd_rn(
+                        s_ordered_sum[m_base + mm][n_local + 1],
+                        smem.part[j][m_base + mm][n_local + 1]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    if (wave == 0)
+    {
+        #pragma unroll
+        for (int mm = 0; mm < 4; ++mm)
+        {
+            const int gm = m_block + m_base + mm;
+            if (m_full || gm < M)
+            {
+                const int64_t row_off = static_cast<int64_t>(gm) * N;
+                const int gn0 = n_block + n_local + 0;
+                const int gn1 = n_block + n_local + 1;
+                if (n_full || gn0 < N)
+                    d_output[row_off + gn0] = s_ordered_sum[m_base + mm][n_local + 0];
+                if (n_full || gn1 < N)
+                    d_output[row_off + gn1] = s_ordered_sum[m_base + mm][n_local + 1];
+            }
+        }
+    }
+}
+
+// ============================================================================
 // Tile dispatch: select N_TILE (64 or 128) and M_TILE for minimal waste
 //
 // N_TILE selection mirrors INT8 V3/V7 strategy:
@@ -2574,6 +2843,7 @@ static bool launch_native_quantised_gemm(
     // continues through the same total generic dispatch below; an admitted
     // measured producer that cannot launch is an error, never a second choice.
     const auto actual_hardware = llaminar2::rocm::nativeQuantisedHardwareForDevice(device_id);
+
     const auto measured = [&]() {
         auto exact = llaminar2::rocm::selectDensePrefillExactConfig(
             static_cast<uint8_t>(FMT), M, N, K,
@@ -2675,7 +2945,43 @@ static bool launch_native_quantised_gemm(
         using M16_  = std::integral_constant<int, 16>;
         using M32_  = std::integral_constant<int, 32>;
 
-        // Small-N exception: N≤1024 with few rows → N64 tiles better
+        // Skinny-N long-K projections where N64×M16 under-saturates the device
+        // (< 2 CTAs per compute unit, e.g. QFN hc_down M<=128 N=320 K=10240,
+        // shexp M<=512 N=160 K=2560): 4-wave in-CTA Split-K (N32×M16) over
+        // exact serial_m1_kblocks partitions doubles CTAs and register-tile
+        // intensity (4x2 vs 4x1) with zero extra workspace and bitwise
+        // serial-M1 equivalence.
+        const int n64_mt16_ctas = ((N + 63) / 64) * ((M + 15) / 16);
+        const int cu_saturation_floor = 2 * std::max(1, actual_hardware.compute_units);
+        if (N <= 512 && K >= 2048 && serial_m1_kblocks >= 4 &&
+            n64_mt16_ctas < cu_saturation_floor) {
+            dim3 grid((N + 31) / 32, (M + 15) / 16, 1);
+            dim3 block(BLOCK_SIZE, 1, 1);
+            const void* function = reinterpret_cast<const void*>(HIP_KERNEL_NAME(
+                native_quantised_gemm_skinny_splitk_kernel<FMT>));
+            clear_launch_error();
+            native_quantised_gemm_skinny_splitk_kernel<FMT>
+                <<<grid, block, 0, hip_stream>>>(
+                    d_A_int8, d_payload, d_block_scales, d_block_mins,
+                    d_output, d_scales_A, M, N, K, d_scales_A_blockwise,
+                    serial_m1_kblocks);
+            return complete_launch(
+                llaminar2::rocm::VNNIPrefillProducer::NativeCooperative,
+                "skinny_splitk4_n32_m16",
+                32,
+                16,
+                1,
+                4,
+                /*full_tiles=*/false,
+                function);
+        }
+
+        // Small-N exception: skinny N (<=512) with few rows produces too few WGs
+        // for 60-CU MI50 under N128/MT32 or N64/MT32. Prefer N64/MT16 to double
+        // workgroup count across M (measured: hc_down M=128 -32%, shexp M=512 -27%).
+        if (N <= 512 && (M <= 256 || N <= 256)) {
+            return launch_mb1_ug2(N64_{}, M16_{});
+        }
         if (N <= 1024 && M <= 128) {
             // At small N, N128 tiles produce too few WGs.
             // N64/MT16 or MT32 depending on waste

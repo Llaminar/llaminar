@@ -877,7 +877,7 @@ namespace llaminar2
                     requested.toExecutionDomainDefinition(),
                     found->second->toExecutionDomainDefinition(),
                     config.moe_routed_expert_plan->routed_tiers.size(),
-                    resolved_plan->usesQFNMI50TP4() && requested.name == resolved_plan->continuation_domain))
+                    resolved_plan->usesGFX906MI50Kernels() && requested.name == resolved_plan->continuation_domain))
             {
                 errors.push_back(
                     "Hardware binding changed non-location intent for MoE overlay domain '" +
@@ -910,7 +910,7 @@ namespace llaminar2
                     existing->toExecutionDomainDefinition(),
                     resolved_definition,
                     config.moe_routed_expert_plan->routed_tiers.size(),
-                    resolved_plan->usesQFNMI50TP4() && resolved.name == resolved_plan->continuation_domain))
+                    resolved_plan->usesGFX906MI50Kernels() && resolved.name == resolved_plan->continuation_domain))
             {
                 errors.push_back(
                     "Resolved MoE overlay domain '" + resolved.name +

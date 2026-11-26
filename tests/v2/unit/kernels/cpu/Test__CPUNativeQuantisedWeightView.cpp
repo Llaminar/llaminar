@@ -54,14 +54,16 @@ TEST(CPUNativeQuantisedWeightView, AllSourcesKeepTheirCanonicalRootAndMetadataCo
         EXPECT_EQ(view.blocks_per_row, 3);
         EXPECT_EQ(view.codebook_id, source.metadata->codebook_id);
         EXPECT_EQ(view.source_payload_bytes, source.metadata->payload_bytes);
-        EXPECT_EQ(view.payload_bytes, view.usesExpandedInt8() ? 32 : source.metadata->payload_bytes);
+        EXPECT_EQ(view.payload_bytes,
+            (view.usesExpandedInt8() || view.usesUnsignedInt8()) ? 32
+                : view.usesNibbleLUT() ? 16 : source.metadata->payload_bytes);
         EXPECT_EQ(view.is_superblock, source.metadata->is_superblock);
         EXPECT_EQ(view.interleavedBase(), fixture.bytes.data());
         EXPECT_EQ(view.bytes().size(), fixture.bytes.size());
         const auto *unit = fixture.bytes.data() + 5 * view.interleaved_block_stride;
         const std::size_t metadata = view.usesInlineCompensation() ? 128 : 0;
         EXPECT_EQ(reinterpret_cast<const std::uint8_t *>(view.chunkScales(1, 2)), unit + view.data_stride + metadata);
-        if (view.is_asymmetric || view.usesNibbleLUTSourceScale() || view.usesIQ3SExpandedSourceScale() ||
+        if (view.is_asymmetric || view.usesNibbleLUTSourceScale() ||
             view.usesQ6KNativeDualScale() || view.usesCompactMultiScale())
             EXPECT_EQ(reinterpret_cast<const std::uint8_t *>(view.chunkMins(1, 2)), unit + view.data_stride + metadata + 128);
         else
@@ -133,7 +135,7 @@ TEST(CPUNativeQuantisedWeightView, EverySingleFactorAndRotatedSourceHasBoundedZe
         SCOPED_TRACE(std::string(source.quant_type));
         PreparedBytes fixture(*source.metadata, 64, 32);
         const auto view = fixture.view();
-        const bool zero_minimum = view.usesNibbleLUTSourceScale() || view.usesIQ3SExpandedSourceScale() ||
+        const bool zero_minimum = view.usesNibbleLUTSourceScale() ||
             (!view.is_asymmetric && !view.usesQ6KNativeDualScale() && !view.usesCompactMultiScale());
         if (zero_minimum)
             expectFactor(view.blockMin(0, 0, 0), 0.0f, "single-factor zero");
@@ -144,11 +146,22 @@ TEST(CPUNativeQuantisedWeightView, EverySingleFactorAndRotatedSourceHasBoundedZe
 
         // Rotation's canonical symmetric ExpandedInt8 stream has the same
         // physical span for every original source; provenance stays original.
-        PreparedBytes rotated(native_quantised_formats::Q8_0, 64, 32);
-        rotated.descriptor.source = {
-            .codebook_id = source.metadata->codebook_id,
-            .is_superblock = source.metadata->is_superblock, .present = true};
-        const auto rotated_view = rotated.view();
+        auto rotated_desc = fixture.descriptor;
+        rotated_desc.columns = 64;
+        rotated_desc.reduction_width = 32;
+        rotated_desc.source = {.codebook_id = source.metadata->codebook_id,
+                               .is_superblock = source.metadata->is_superblock, .present = true};
+        rotated_desc.encoding = CPUNativeQuantisedEncoding::ExpandedInt8;
+        rotated_desc.numerical_policy = CPUProjectionNumericalPolicy::GPUAlignedExpert;
+        rotated_desc.is_asymmetric = false;
+        const std::size_t rotated_stride = preparedInterleavedBlockStride(
+            CPUNativeQuantisedEncoding::ExpandedInt8, false);
+        std::vector<std::uint8_t> rotated_storage(rotated_stride + 127u, 0u);
+        const std::size_t rotated_align =
+            (64u - reinterpret_cast<std::uintptr_t>(rotated_storage.data()) % 64u) % 64u;
+        const std::span<const std::uint8_t> rotated_bytes(rotated_storage.data() + rotated_align, rotated_stride);
+        const auto rotated_view = CPUNativeQuantisedWeightView::fromPublished(
+            rotated_desc, rotated_bytes, CPUNativeQuantisedMetadataSeal::validate(rotated_desc, rotated_bytes));
         EXPECT_EQ(rotated_view.payload_bytes, 32);
         EXPECT_EQ(rotated_view.source_payload_bytes, source.metadata->payload_bytes);
         expectFactor(rotated_view.blockMin(0, 0, 63), 0.0f, "rotated zero");

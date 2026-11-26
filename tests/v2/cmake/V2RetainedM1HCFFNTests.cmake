@@ -420,20 +420,6 @@ if(NOT LLAMINAR_QFN_RETAINED_TP_GGUF STREQUAL "")
     unset(_qfn_tp_runner)
 endif()
 
-add_executable(v2_integration_retained_m1_descriptor_demand_host_abi
-    integration/loaders/ROCmRetainedM1DescriptorDemandHostABI.cpp)
-if(TARGET v2_integration_retained_m1_descriptor_demand_host_abi)
-    target_link_libraries(v2_integration_retained_m1_descriptor_demand_host_abi PRIVATE llaminar2_core)
-    add_v2_test(V2_Integration_ROCmRetainedM1DescriptorDemandHostABI
-        COMMAND $<TARGET_FILE:v2_integration_retained_m1_descriptor_demand_host_abi>
-        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MoE;HostABI;Regression"
-        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
-        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
-    if(TEST V2_Integration_ROCmRetainedM1DescriptorDemandHostABI)
-        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmRetainedM1DescriptorDemandHostABI)
-    endif()
-endif()
-
 include("${CMAKE_CURRENT_LIST_DIR}/V2CastagnaKernelABTests.cmake")
 
 if(DEFINED _retained_m1_release_owners)

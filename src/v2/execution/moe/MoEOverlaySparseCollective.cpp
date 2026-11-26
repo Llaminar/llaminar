@@ -529,6 +529,96 @@ namespace llaminar2
         return true;
     }
 
+    bool MoEOverlayDispatchTicketStorage::enqueueCapturedPayloadAndPublication(
+        const CapturedDevicePayload &payload,
+        void *stream,
+        std::string *error) noexcept
+    {
+        if (error)
+            error->clear();
+        if (isWorkspaceDeclaration())
+        {
+            if (error) *error = "Workspace declaration cannot publish a dispatch payload";
+            return false;
+        }
+        if (!source_device_.is_gpu())
+            return true;
+        if (!stream || !hasCapturedPublicationContract() ||
+            !payload.routing_indices || !payload.routing_weights ||
+            !payload.hidden_rows || payload.route_bytes == 0u ||
+            payload.hidden_bytes == 0u)
+        {
+            if (error)
+                *error = "captured ticket payload requires mapped storage, exact stream, and complete positive device geometry";
+            return false;
+        }
+        // Multi-block copy saturates PCIe for large prefill payloads; decode
+        // tickets fit in one fused 512-thread block with release publication.
+        constexpr size_t kFusedHiddenBytesLimit = 65536u;
+        constexpr size_t kFusedRouteBytesLimit = 4096u;
+        if (payload.hidden_bytes > kFusedHiddenBytesLimit ||
+            payload.route_bytes > kFusedRouteBytesLimit)
+        {
+            return enqueueCapturedPayload(payload, stream, error) &&
+                   enqueueCapturedPublication(stream, error);
+        }
+
+        const auto destination_offset = [&](const void *destination, size_t bytes) -> size_t
+        {
+            const std::uintptr_t base = reinterpret_cast<std::uintptr_t>(allocation_);
+            const std::uintptr_t target = reinterpret_cast<std::uintptr_t>(destination);
+            if (target < base || target - base > allocation_bytes_ ||
+                bytes > allocation_bytes_ - static_cast<size_t>(target - base))
+                throw std::out_of_range("captured ticket payload destination exceeds its immutable mapped region");
+            return static_cast<size_t>(target - base);
+        };
+
+        try
+        {
+            TransferEngine::MappedHostCopyBatchItem items[6]{};
+            size_t count = 0u;
+            const auto add = [&](const void *src, const void *dst, size_t bytes)
+            {
+                items[count++] = TransferEngine::MappedHostCopyBatchItem{
+                    .source = src,
+                    .source_capacity = bytes,
+                    .source_offset = 0u,
+                    .destination_offset = destination_offset(dst, bytes),
+                    .bytes = bytes,
+                };
+            };
+            if (payload.logical_row_count)
+                add(payload.logical_row_count, &ticket_.header->logical_row_count, sizeof(ticket_.header->logical_row_count));
+            if (captured_request_epoch_)
+                add(&captured_request_epoch_->epoch, &ticket_.header->residency_epoch, sizeof(ticket_.header->residency_epoch));
+            add(payload.routing_indices, ticket_.routing_indices_fp32, payload.route_bytes);
+            add(payload.routing_weights, ticket_.routing_weights_fp32, payload.route_bytes);
+            add(payload.hidden_rows, ticket_.hidden_rows_fp32, payload.hidden_bytes);
+
+            constexpr std::uint64_t kPublished = 1u;
+            TransferEngine::instance().enqueuePersistentDeviceRegionsToMappedHostAndPublishByKernel(
+                items,
+                count,
+                *payload_region_,
+                *publication_region_,
+                /*publication_offset=*/0u,
+                kPublished,
+                source_device_,
+                stream);
+            return true;
+        }
+        catch (const std::exception &exception)
+        {
+            if (error) *error = exception.what();
+            return false;
+        }
+        catch (...)
+        {
+            if (error) *error = "captured ticket fused publication threw a non-standard exception";
+            return false;
+        }
+    }
+
     bool MoEOverlayDispatchTicketStorage::enqueueCapturedPublication(
         void *stream,
         std::string *error) noexcept
@@ -624,7 +714,8 @@ namespace llaminar2
                 }
                 return false;
             }
-            if (std::chrono::steady_clock::now() >= deadline)
+            if ((polls & 4095u) == 4095u &&
+                std::chrono::steady_clock::now() >= deadline)
             {
                 if (error)
                 {
@@ -640,10 +731,18 @@ namespace llaminar2
             }
             ++polls;
 
-            /* Keep sub-millisecond handoff latency without monopolizing the
-             * controller core if a peer or device stalls pathologically. */
-            if ((polls & 1023u) == 0u)
+            /* Spin with PAUSE across ordinary sub-millisecond inter-layer gaps
+             * to avoid sched_yield preemption jitter; yield only on long stalls. */
+            if (polls < 262144u)
+            {
+#if defined(__x86_64__) || defined(_M_X64)
+                __builtin_ia32_pause();
+#endif
+            }
+            else if ((polls & 1023u) == 0u)
+            {
                 std::this_thread::yield();
+            }
         }
     }
 
@@ -1238,7 +1337,9 @@ namespace llaminar2
         auto args=original;
         args.preweighted_output=cpu::moe::CanonicalRoutePreweightedOutput{
             {ticket.contributionRowsHost(),ticket.routeCapacity()*width},sparse.original_slots,
-            {input.compact_route_slots_host,count},sparse.weights};
+            {input.compact_route_slots_host,count},sparse.weights,
+            cpu::moe::PreweightedStoreLocality::SameSocketDDIO,
+            /*skip_combined_store=*/true};
         if(!cpu::moe::combineCanonicalShardRouteRecords(args))return false;
         // Retain the existing diagnostic: NaN validation is outside normal
         // serving and must still reject before releasing an invalid ticket.

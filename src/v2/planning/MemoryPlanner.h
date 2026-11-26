@@ -406,6 +406,10 @@ struct DevicePlanConfig
     bool usesQFNMI50TP4() const noexcept
     { return local_gpu_expert_kernel_policy == LocalGPUExpertKernelPolicy::QFNMI50TP4; }
 
+    /** @return Whether this arena belongs to any qualified gfx906 MI50 continuation cohort. */
+    bool usesGFX906MI50Kernels() const noexcept
+    { return llaminar2::usesGFX906MI50Kernels(local_gpu_expert_kernel_policy); }
+
 
     /// Immutable original per-edge routes; their canonical quote is the only projection transport BOM.
     std::shared_ptr<const DeviceCountedAllGatherTopology> projection_exchange_topology;

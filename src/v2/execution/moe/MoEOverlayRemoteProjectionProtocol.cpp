@@ -119,8 +119,14 @@ namespace llaminar2
              * destination GPU then executes normalized signed bytes while the
              * source identity remains the mathematical GGUF provenance.
              */
-            if (cpu::native_quantised::preparedEncodingForSource(source) !=
-                cpu::native_quantised::CPUNativeQuantisedEncoding::ExpandedInt8)
+            const auto encoding =
+                cpu::native_quantised::preparedEncodingForSource(source);
+            const bool normalized_cpu_source =
+                encoding == cpu::native_quantised::CPUNativeQuantisedEncoding::ExpandedInt8 ||
+                (encoding == cpu::native_quantised::CPUNativeQuantisedEncoding::NibbleLUT &&
+                 (source.codebook_id == 12 || source.codebook_id == 15 ||
+                  source.codebook_id == 16));
+            if (!normalized_cpu_source)
             {
                 return false;
             }

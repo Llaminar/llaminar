@@ -95,9 +95,12 @@ namespace llaminar2
         };
         const std::unordered_set<std::string> members(region.begin(),region.end());
         const bool ticket_local=capture_policy==LocalRegionCapturePolicy::HeterogeneousTicketLocal;
+        const bool wave_local=ticket_local || capture_policy==LocalRegionCapturePolicy::WaveAnnotatedLocal;
         require(capture_policy==LocalRegionCapturePolicy::Unannotated ||
-            (ticket_local && requiresHeterogeneousTicketSegmentation(nativeCaptureEnvelope())),
-            "Ticket-local fusion requires an explicit heterogeneous ticket envelope");
+            (ticket_local && requiresHeterogeneousTicketSegmentation(nativeCaptureEnvelope())) ||
+            (capture_policy==LocalRegionCapturePolicy::WaveAnnotatedLocal &&
+                requiresSingleNativeExecutable(nativeCaptureEnvelope())),
+            "Ticket-local or wave-annotated fusion requires its matching graph capture envelope");
         auto *sink=getNode(terminal);
         require(region.size()>1 && members.size()==region.size() && members.contains(terminal) &&
             sink && sink->stage && replacement && replacement->device()==sink->device &&
@@ -141,7 +144,7 @@ namespace llaminar2
             const bool retained_cutpoint=ticket_local && node==sink && unit &&
                 unit->disposition==GraphHeterogeneousTicketUnitDisposition::BeforeManualBoundary;
             if(node->completed || node->weights_cohered || node->is_final_output ||
-                (wave && (!ticket_local || wave->participation!=GraphCaptureWaveParticipation::Active ||
+                (wave && (!wave_local || wave->participation!=GraphCaptureWaveParticipation::Active ||
                     !wave->passive_following_identities.empty())) ||
                 (unit && !retained_cutpoint) || name==terminal_node_)
                 throw std::invalid_argument("Local region fusion cannot absorb live or sealed capture node '"+name+"'");
@@ -159,7 +162,8 @@ namespace llaminar2
                 require(!touched(name) && reader && reader->stage &&
                     reader->device==sink->device && reader->stage->device()==sink->device &&
                     !reader->completed && !reader->weights_cohered &&
-                    (ticket_local || (!reader->graph_capture_wave && !reader->heterogeneous_ticket_unit_contract)) &&
+                    (wave_local || !reader->graph_capture_wave) &&
+                    (ticket_local || !reader->heterogeneous_ticket_unit_contract) &&
                     readers.insert(name).second &&
                     std::find(reader->dependencies.begin(),reader->dependencies.end(),output.producer)!=reader->dependencies.end(),
                     "Local region fusion export requires an exact distinct outside reader on this participant");
@@ -189,31 +193,72 @@ namespace llaminar2
         // set; folding must never accidentally turn a broken graph into a valid one.
         (void)getExecutionOrder();
         std::vector<std::string> dependencies;
+        std::vector<GraphDependencyKind> dependency_kinds;
         std::unordered_map<std::string,std::size_t> index;
         index.reserve(nodes_.size()-region.size()+1);
         std::vector<std::unique_ptr<ComputeNode>> retained;
         retained.reserve(nodes_.size()-region.size()+1);
-        std::vector<std::pair<ComputeNode*,std::vector<std::string>>> rewritten;
+        std::vector<std::tuple<ComputeNode*,std::vector<std::string>,std::vector<GraphDependencyKind>>> rewritten;
         rewritten.reserve(nodes_.size()-region.size());
+        const auto kindOf = [](const ComputeNode &node, std::size_t idx) {
+            return idx < node.dependency_kinds.size() ? node.dependency_kinds[idx] : GraphDependencyKind::DataFlow;
+        };
+        const auto mergeKind = [](GraphDependencyKind existing, GraphDependencyKind incoming) {
+            if (existing == incoming) return existing;
+            if (existing == GraphDependencyKind::DataFlow || incoming == GraphDependencyKind::DataFlow)
+                return GraphDependencyKind::DataFlow;
+            if (existing == GraphDependencyKind::CollectiveOrder || incoming == GraphDependencyKind::CollectiveOrder)
+                return GraphDependencyKind::CollectiveOrder;
+            return existing;
+        };
         for(const auto &node:nodes_)
         {
             if(touched(node->name))
-                for(const auto &dependency:node->dependencies)
-                    if(!touched(dependency) &&
-                        std::find(dependencies.begin(),dependencies.end(),dependency)==dependencies.end())
-                        dependencies.push_back(dependency);
+                for(std::size_t di=0; di<node->dependencies.size(); ++di)
+                {
+                    const auto &dependency = node->dependencies[di];
+                    const auto kind = kindOf(*node, di);
+                    if(!touched(dependency))
+                    {
+                        const auto it = std::find(dependencies.begin(),dependencies.end(),dependency);
+                        if(it==dependencies.end())
+                        {
+                            dependencies.push_back(dependency);
+                            dependency_kinds.push_back(kind);
+                        }
+                        else
+                        {
+                            const auto pos = static_cast<std::size_t>(it - dependencies.begin());
+                            dependency_kinds[pos] = mergeKind(dependency_kinds[pos], kind);
+                        }
+                    }
+                }
             if(!touched(node->name) || node.get()==sink)
                 index.emplace(node->name,index.size());
             if(!touched(node->name))
             {
                 std::vector<std::string> edges;
+                std::vector<GraphDependencyKind> kinds;
                 edges.reserve(node->dependencies.size());
-                for(const auto &dependency:node->dependencies)
+                kinds.reserve(node->dependencies.size());
+                for(std::size_t di=0; di<node->dependencies.size(); ++di)
                 {
+                    const auto &dependency = node->dependencies[di];
+                    const auto kind = kindOf(*node, di);
                     const auto &producer=touched(dependency)?terminal:dependency;
-                    if(std::find(edges.begin(),edges.end(),producer)==edges.end())edges.push_back(producer);
+                    const auto it = std::find(edges.begin(),edges.end(),producer);
+                    if(it==edges.end())
+                    {
+                        edges.push_back(producer);
+                        kinds.push_back(kind);
+                    }
+                    else
+                    {
+                        const auto pos = static_cast<std::size_t>(it - edges.begin());
+                        kinds[pos] = mergeKind(kinds[pos], kind);
+                    }
                 }
-                rewritten.emplace_back(node.get(),std::move(edges));
+                rewritten.emplace_back(node.get(),std::move(edges),std::move(kinds));
             }
         }
         // Exact exports alone do not prove safe contraction: an exported
@@ -231,7 +276,11 @@ namespace llaminar2
             }
         };
         addEdges(terminal,dependencies);
-        for(const auto &[node,edges]:rewritten)addEdges(node->name,edges);
+        for(const auto &[node,edges,kinds]:rewritten)
+        {
+            (void)kinds;
+            addEdges(node->name,edges);
+        }
         std::vector<std::size_t> ready;
         ready.reserve(index.size());
         for(std::size_t i=0;i<predecessors.size();++i)if(predecessors[i]==0)ready.push_back(i);
@@ -264,9 +313,14 @@ namespace llaminar2
         // Every potentially throwing validation/allocation is complete. The
         // sink keeps its identity and outside edges while removed stages retire.
         sink->stage=std::move(replacement);
-        if(ticket_local)sink->graph_capture_wave.reset();
+        if(wave_local)sink->graph_capture_wave.reset();
         sink->dependencies.swap(dependencies);
-        for(auto &[node,edges]:rewritten)node->dependencies.swap(edges);
+        sink->dependency_kinds.swap(dependency_kinds);
+        for(auto &[node,edges,kinds]:rewritten)
+        {
+            node->dependencies.swap(edges);
+            node->dependency_kinds.swap(kinds);
+        }
         for(auto &node:nodes_)
             if(!touched(node->name) || node.get()==sink)retained.push_back(std::move(node));
         nodes_.swap(retained);node_index_.swap(index);
@@ -314,22 +368,41 @@ namespace llaminar2
         // Allocate every replacement descriptor first. Any validation/allocation
         // failure leaves the original graph, stage pointers and caches intact.
         std::vector<std::vector<std::string>> rewired;rewired.reserve(nodes_.size());
+        std::vector<std::vector<GraphDependencyKind>> rewired_kinds;rewired_kinds.reserve(nodes_.size());
         std::unordered_map<std::string,std::size_t> index;index.reserve(node_index_.size()-1);
         for(const auto &node:nodes_)
         {
             if(node.get()==last)continue;
-            auto edges=node->dependencies;
-            for(auto &edge:edges)if(edge==successor)edge=producer;
-            std::vector<std::string> unique;unique.reserve(edges.size());
-            for(auto &edge:edges)
-                if(std::find(unique.begin(),unique.end(),edge)==unique.end())unique.push_back(std::move(edge));
-            index.emplace(node->name,rewired.size());rewired.push_back(std::move(unique));
+            std::vector<std::string> unique;unique.reserve(node->dependencies.size());
+            std::vector<GraphDependencyKind> unique_kinds;unique_kinds.reserve(node->dependencies.size());
+            for(std::size_t di=0;di<node->dependencies.size();++di)
+            {
+                std::string edge=node->dependencies[di]==successor?producer:node->dependencies[di];
+                const auto kind=di<node->dependency_kinds.size()?node->dependency_kinds[di]:GraphDependencyKind::DataFlow;
+                const auto it=std::find(unique.begin(),unique.end(),edge);
+                if(it==unique.end())
+                {
+                    unique.push_back(std::move(edge));
+                    unique_kinds.push_back(kind);
+                }
+                else if(kind==GraphDependencyKind::DataFlow)
+                {
+                    unique_kinds[static_cast<std::size_t>(it-unique.begin())]=GraphDependencyKind::DataFlow;
+                }
+            }
+            index.emplace(node->name,rewired.size());
+            rewired.push_back(std::move(unique));
+            rewired_kinds.push_back(std::move(unique_kinds));
         }
         const auto removed=node_index_.at(successor);
         first->stage=std::move(replacement);
         nodes_.erase(nodes_.begin()+static_cast<std::ptrdiff_t>(removed));
         node_index_.swap(index);
-        for(std::size_t i=0;i<nodes_.size();++i)nodes_[i]->dependencies.swap(rewired[i]);
+        for(std::size_t i=0;i<nodes_.size();++i)
+        {
+            nodes_[i]->dependencies.swap(rewired[i]);
+            nodes_[i]->dependency_kinds.swap(rewired_kinds[i]);
+        }
         cached_order_.clear();order_dirty_=true;cached_execution_stages_.clear();execution_stages_dirty_=true;
         fast_schedule_.clear();noteTopologyMutation();
         return *this;
@@ -529,11 +602,294 @@ namespace llaminar2
         }
 
         nodes_[it->second]->dependencies.push_back(depends_on);
+        nodes_[it->second]->dependency_kinds.push_back(GraphDependencyKind::DataFlow);
         order_dirty_ = true;
         execution_stages_dirty_ = true;
         fast_schedule_.clear();
         noteTopologyMutation();
         return *this;
+    }
+
+    ComputeGraph &ComputeGraph::addTypedDependency(
+        const std::string &consumer,
+        const std::string &producer,
+        GraphDependencyKind kind)
+    {
+        const auto consumer_it = node_index_.find(consumer);
+        if (consumer_it == node_index_.end())
+        {
+            throw std::out_of_range(
+                "ComputeGraph::addTypedDependency consumer node '" + consumer + "' not found");
+        }
+        const auto producer_it = node_index_.find(producer);
+        if (producer_it == node_index_.end())
+        {
+            throw std::out_of_range(
+                "ComputeGraph::addTypedDependency producer node '" + producer + "' not found");
+        }
+        if (consumer == producer)
+        {
+            throw std::invalid_argument(
+                "ComputeGraph::addTypedDependency rejects self-dependency on '" + consumer + "'");
+        }
+
+        auto &consumer_node = *nodes_[consumer_it->second];
+        const auto &producer_node = *nodes_[producer_it->second];
+
+        if (kind == GraphDependencyKind::HostSubmissionOrder)
+        {
+            const bool consumer_is_manual =
+                consumer_node.device.is_cpu() ||
+                (consumer_node.stage && consumer_node.stage->isManualGraphBoundary());
+            const bool producer_is_manual =
+                producer_node.stage && producer_node.stage->isManualGraphBoundary();
+            if (!consumer_is_manual)
+            {
+                throw std::invalid_argument(
+                    "ComputeGraph::addTypedDependency HostSubmissionOrder cannot target captured device node '" +
+                    consumer + "' from '" + producer + "'");
+            }
+            if (producer_is_manual)
+            {
+                throw std::invalid_argument(
+                    "ComputeGraph::addTypedDependency HostSubmissionOrder cannot source from manual node '" +
+                    producer + "' to '" + consumer + "'");
+            }
+        }
+
+        if (consumer_node.dependency_kinds.size() < consumer_node.dependencies.size())
+        {
+            consumer_node.dependency_kinds.resize(
+                consumer_node.dependencies.size(), GraphDependencyKind::DataFlow);
+        }
+
+        const auto existing_it = std::find(
+            consumer_node.dependencies.begin(), consumer_node.dependencies.end(), producer);
+        if (existing_it != consumer_node.dependencies.end())
+        {
+            const auto pos = static_cast<std::size_t>(existing_it - consumer_node.dependencies.begin());
+            const auto existing_kind = consumer_node.dependency_kinds[pos];
+            if (existing_kind == kind || existing_kind == GraphDependencyKind::DataFlow)
+                return *this;
+            if (kind == GraphDependencyKind::DataFlow)
+            {
+                consumer_node.dependency_kinds[pos] = GraphDependencyKind::DataFlow;
+                noteTopologyMutation();
+                return *this;
+            }
+            throw std::invalid_argument(
+                "ComputeGraph::addTypedDependency conflicting edge kinds between consumer '" +
+                consumer + "' and producer '" + producer + "'");
+        }
+
+        if (hasPath(consumer, producer))
+        {
+            throw std::invalid_argument(
+                "ComputeGraph::addTypedDependency edge '" + consumer + "' <- '" + producer +
+                "' would introduce a cycle");
+        }
+
+        consumer_node.dependencies.push_back(producer);
+        consumer_node.dependency_kinds.push_back(kind);
+        order_dirty_ = true;
+        execution_stages_dirty_ = true;
+        fast_schedule_.clear();
+        noteTopologyMutation();
+        return *this;
+    }
+
+    std::vector<GraphDependencyEdge> ComputeGraph::dependencyEdges(
+        const std::string &node_name) const
+    {
+        const auto *node = getNode(node_name);
+        if (!node)
+        {
+            throw std::out_of_range(
+                "ComputeGraph::dependencyEdges node '" + node_name + "' not found");
+        }
+        std::vector<GraphDependencyEdge> result;
+        result.reserve(node->dependencies.size());
+        for (std::size_t i = 0; i < node->dependencies.size(); ++i)
+        {
+            const auto kind = i < node->dependency_kinds.size()
+                                  ? node->dependency_kinds[i]
+                                  : GraphDependencyKind::DataFlow;
+            result.push_back({node->dependencies[i], kind});
+        }
+        return result;
+    }
+
+    std::vector<std::string> ComputeGraph::directConsumersOf(
+        const std::string &producer) const
+    {
+        if (!getNode(producer))
+        {
+            throw std::out_of_range(
+                "ComputeGraph::directConsumersOf producer '" + producer + "' not found");
+        }
+        std::vector<std::string> consumers;
+        for (const auto &name : getExecutionOrder())
+        {
+            const auto *node = getNode(name);
+            if (node &&
+                std::find(node->dependencies.begin(), node->dependencies.end(), producer) !=
+                    node->dependencies.end())
+            {
+                consumers.push_back(name);
+            }
+        }
+        return consumers;
+    }
+
+    bool ComputeGraph::hasDependency(
+        const std::string &consumer,
+        const std::string &producer) const noexcept
+    {
+        const auto *node = getNode(consumer);
+        if (!node)
+            return false;
+        return std::find(node->dependencies.begin(), node->dependencies.end(), producer) !=
+               node->dependencies.end();
+    }
+
+    bool ComputeGraph::hasPath(
+        const std::string &from,
+        const std::string &to) const
+    {
+        if (from.empty() || to.empty() || from == to || !getNode(from) || !getNode(to))
+            return false;
+        // Walk backward along producer dependencies from `to` to `from`.
+        std::vector<std::string> frontier{to};
+        std::unordered_set<std::string> visited{to};
+        for (std::size_t idx = 0; idx < frontier.size(); ++idx)
+        {
+            const auto *node = getNode(frontier[idx]);
+            if (!node)
+                continue;
+            for (const auto &dep : node->dependencies)
+            {
+                if (dep == from)
+                    return true;
+                if (visited.insert(dep).second)
+                    frontier.push_back(dep);
+            }
+        }
+        return false;
+    }
+
+    std::vector<LocalRegionExport> ComputeGraph::discoverLocalRegionExports(
+        std::span<const std::string> region,
+        const std::string &terminal) const
+    {
+        if (region.empty())
+            throw std::invalid_argument("discoverLocalRegionExports requires a non-empty region");
+        std::unordered_set<std::string> members;
+        members.reserve(region.size());
+        for (const auto &name : region)
+        {
+            if (!getNode(name) || !members.insert(name).second)
+            {
+                throw std::invalid_argument(
+                    "discoverLocalRegionExports requires distinct existing nodes; invalid '" +
+                    name + "'");
+            }
+        }
+        if (!members.contains(terminal))
+        {
+            throw std::invalid_argument(
+                "discoverLocalRegionExports requires terminal '" + terminal + "' to be a region member");
+        }
+
+        std::unordered_map<std::string, std::vector<std::string>> consumer_lists;
+        for (const auto &name : getExecutionOrder())
+        {
+            if (members.contains(name))
+                continue;
+            const auto *node = getNode(name);
+            if (!node)
+                continue;
+            for (const auto &dep : node->dependencies)
+            {
+                if (dep != terminal && members.contains(dep))
+                {
+                    auto &list = consumer_lists[dep];
+                    if (std::find(list.begin(), list.end(), name) == list.end())
+                        list.push_back(name);
+                }
+            }
+        }
+
+        std::vector<LocalRegionExport> exports;
+        for (const auto &member : region)
+        {
+            if (member == terminal)
+                continue;
+            const auto it = consumer_lists.find(member);
+            if (it != consumer_lists.end() && !it->second.empty())
+                exports.push_back({member, std::move(it->second)});
+        }
+        return exports;
+    }
+
+    void ComputeGraph::validateDeclarativeInvariants() const
+    {
+        for (const auto &node : nodes_)
+        {
+            if (!node->dependency_kinds.empty() &&
+                node->dependency_kinds.size() != node->dependencies.size())
+            {
+                throw std::logic_error(
+                    "ComputeGraph node '" + node->name +
+                    "' has misaligned dependency_kinds metadata");
+            }
+            if (node->heterogeneous_ticket_unit_contract &&
+                !requiresHeterogeneousTicketSegmentation(native_capture_envelope_))
+            {
+                throw std::logic_error(
+                    "ComputeGraph node '" + node->name +
+                    "' declares a heterogeneous ticket-unit contract outside a heterogeneous envelope");
+            }
+            for (std::size_t i = 0; i < node->dependencies.size(); ++i)
+            {
+                const auto &dep = node->dependencies[i];
+                if (dep == node->name)
+                {
+                    throw std::logic_error(
+                        "ComputeGraph node '" + node->name + "' has a self-dependency");
+                }
+                const auto *producer = getNode(dep);
+                if (!producer)
+                {
+                    throw std::logic_error(
+                        "ComputeGraph node '" + node->name +
+                        "' depends on missing producer '" + dep + "'");
+                }
+                const auto kind = i < node->dependency_kinds.size()
+                                      ? node->dependency_kinds[i]
+                                      : GraphDependencyKind::DataFlow;
+                if (kind == GraphDependencyKind::HostSubmissionOrder)
+                {
+                    const bool consumer_is_manual =
+                        node->device.is_cpu() ||
+                        (node->stage && node->stage->isManualGraphBoundary());
+                    const bool producer_is_manual =
+                        producer->stage && producer->stage->isManualGraphBoundary();
+                    if (!consumer_is_manual || producer_is_manual)
+                    {
+                        throw std::logic_error(
+                            "ComputeGraph node '" + node->name +
+                            "' has invalid HostSubmissionOrder edge from '" + dep + "'");
+                    }
+                }
+            }
+        }
+        const auto &order = getExecutionOrder();
+        if (order.size() != nodes_.size())
+        {
+            throw std::logic_error(
+                "ComputeGraph contains a dependency cycle (" + std::to_string(order.size()) +
+                " of " + std::to_string(nodes_.size()) + " nodes topologically ordered)");
+        }
     }
 
     bool ComputeGraph::isRetainedParticipantAuxiliaryNode(const std::string& name) const noexcept
@@ -1112,7 +1468,15 @@ namespace llaminar2
                 auto it = node_index_.find(root_name);
                 if (it != node_index_.end())
                 {
+                    if (nodes_[it->second]->dependency_kinds.size() <
+                        nodes_[it->second]->dependencies.size())
+                    {
+                        nodes_[it->second]->dependency_kinds.resize(
+                            nodes_[it->second]->dependencies.size(),
+                            GraphDependencyKind::DataFlow);
+                    }
                     nodes_[it->second]->dependencies.push_back(connect_from);
+                    nodes_[it->second]->dependency_kinds.push_back(GraphDependencyKind::DataFlow);
                 }
             }
         }

@@ -11,6 +11,7 @@
 #include "CUDARetainedHCPrefix.h"
 #include "kernels/common/DeviceNativeQuantisedContributionContract.h"
 #include "kernels/common/GPUHCDownPublication.cuh"
+#include "kernels/cuda/gemm/CUDANativeQuantisedDecodeCommon.cuh"
 #include "kernels/qwen4exp/GPUBranchRMSNormBody.cuh"
 
 #include <cooperative_groups.h>
@@ -18,11 +19,96 @@
 
 namespace llaminar2::cuda::moe
 {
-    /** @brief Reuse the original CTA-local norm reduction storage in later FFN phases. */
+    /**
+     * @brief CTA-local norm, HC Down and HC Up tiles reused across sequential prefix phases.
+     * @tparam Hidden Physical branch width authenticated by the resident program.
+     */
+    template<unsigned Hidden>
     struct RetainedHCPrefixShared
     {
         float norm[256]; ///< Original fixed 256-lane square reduction.
+        uint32_t down_finished; ///< Atomic partition completion counter for fused HC Down fold.
+        union
+        {
+            alignas(16) float post[Hidden]; ///< Rounded POST reused for the four-channel wave layout.
+            float down_blocks[32][32]; ///< Per-K32-block partials for one coalesced 32-column Down partition.
+            float down_blocks16[32][16]; ///< Per-K32-block partials for one warp-split 16-column Down partition.
+            struct
+            {
+                float primary[4][10][16];
+                float residual[4][10][16];
+                float logit[4][16];
+            } up; ///< Coalesced 16-channel x 4-branch HC Up block partials.
+        };
     };
+
+    /**
+     * @brief Publish four neighboring CUDA norm columns through the original Q8 tree.
+     * @param value The four rounded normalized values for this lane.
+     * @param codes The owned four original Q8 output bytes.
+     * @param scale_word Original scale for this complete 32-column packet.
+     * @param lane Physical lane in a complete width-eight subgroup.
+     */
+    __device__ __forceinline__ void retainedHCNormQ8Quad(float4 value, int8_t *codes,
+        float *scale_word, unsigned lane)
+    {
+        float x = fabsf(value.x);
+        float y = fabsf(value.y);
+        float z = fabsf(value.z);
+        float w = fabsf(value.w);
+#pragma unroll
+        for (int mask = 4; mask > 0; mask >>= 1)
+        {
+            x = fmaxf(x, __shfl_xor_sync(0xffffffffu, x, mask, 8));
+            y = fmaxf(y, __shfl_xor_sync(0xffffffffu, y, mask, 8));
+            z = fmaxf(z, __shfl_xor_sync(0xffffffffu, z, mask, 8));
+            w = fmaxf(w, __shfl_xor_sync(0xffffffffu, w, mask, 8));
+        }
+        const float scale = original_single_q8::cudaScale(fmaxf(fmaxf(x, z), fmaxf(y, w)));
+        const float inverse = 1.0f / scale;
+        if (lane == 0)
+            *scale_word = scale;
+        const uint32_t packed =
+            (static_cast<uint32_t>(original_single_q8::cudaCode(value.x, inverse)) & 255u) |
+            ((static_cast<uint32_t>(original_single_q8::cudaCode(value.y, inverse)) & 255u) << 8) |
+            ((static_cast<uint32_t>(original_single_q8::cudaCode(value.z, inverse)) & 255u) << 16) |
+            ((static_cast<uint32_t>(original_single_q8::cudaCode(value.w, inverse)) & 255u) << 24);
+        __builtin_memcpy(codes, &packed, sizeof(packed));
+    }
+
+    /**
+     * @brief Compute one CUDA Q8_0 packet against both primary and residual Q8 activations with a single weight load.
+     */
+    __device__ __forceinline__ void retainedHCQ8DualContribution(
+        const uint8_t* weights, const int8_t* primary_codes, const int8_t* residual_codes,
+        float weight_scale, float primary_scale, float residual_scale,
+        float& primary_out, float& residual_out)
+    {
+        const auto* w = reinterpret_cast<const int4*>(weights);
+        const auto* p = reinterpret_cast<const int4*>(primary_codes);
+        const auto* r = reinterpret_cast<const int4*>(residual_codes);
+        const int4 wl = w[0], wh = w[1];
+        const int4 pl = p[0], ph = p[1];
+        const int4 rl = r[0], rh = r[1];
+        int plo = __dp4a(wl.x, pl.x, 0);
+        int phi = __dp4a(wh.x, ph.x, 0);
+        int rlo = __dp4a(wl.x, rl.x, 0);
+        int rhi = __dp4a(wh.x, rh.x, 0);
+        plo = __dp4a(wl.y, pl.y, plo);
+        phi = __dp4a(wh.y, ph.y, phi);
+        rlo = __dp4a(wl.y, rl.y, rlo);
+        rhi = __dp4a(wh.y, rh.y, rhi);
+        plo = __dp4a(wl.z, pl.z, plo);
+        phi = __dp4a(wh.z, ph.z, phi);
+        rlo = __dp4a(wl.z, rl.z, rlo);
+        rhi = __dp4a(wh.z, rh.z, rhi);
+        plo = __dp4a(wl.w, pl.w, plo);
+        phi = __dp4a(wh.w, ph.w, phi);
+        rlo = __dp4a(wl.w, rl.w, rlo);
+        rhi = __dp4a(wh.w, rh.w, rhi);
+        primary_out = device_native_quantised_contract::singleScaleBlock(plo + phi, weight_scale, primary_scale);
+        residual_out = device_native_quantised_contract::singleScaleBlock(rlo + rhi, weight_scale, residual_scale);
+    }
 
     /**
      * @brief Compute a CUDA Q8_0 packet contribution using its original FP32 scale order.
@@ -50,6 +136,143 @@ namespace llaminar2::cuda::moe
         return device_native_quantised_contract::singleScaleBlock(lo + hi, weight_scale, activation_scale);
     }
 
+    /** @brief Exact all-18-codebook K32 block dot contribution for one CUDA NativeQuantised matrix. */
+    template<uint8_t CodebookId>
+    __device__ __forceinline__ float retainedNativeQuantisedBlockContribution(
+        const DeviceNativeQuantisedMatrixDesc& desc,
+        unsigned linear,
+        const int8_t* codes,
+        float act_scale)
+    {
+        using Traits = ::llaminar2::cuda_native_quantised::CodebookTraits<CodebookId>;
+        const auto* a4 = reinterpret_cast<const int4*>(codes);
+        const int4 lo = a4[0], hi = a4[1];
+        const int32_t a[8] = {lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
+        const uint8_t* payload = desc.payload + static_cast<std::size_t>(linear) * Traits::payload_bytes;
+        int32_t w[8];
+        ::llaminar2::cuda_native_quantised::decode_groups_vec<CodebookId>(payload, w);
+        const uint16_t primary = static_cast<const uint16_t*>(desc.scales)[linear];
+        const uint16_t secondary = Traits::requires_secondary_metadata
+            ? static_cast<const uint16_t*>(desc.mins)[linear] : 0u;
+        const uint32_t emin = Traits::is_dual_scale_asym
+            ? static_cast<const uint32_t*>(desc.emins)[linear] : 0u;
+
+        if constexpr (Traits::is_dual_scale)
+        {
+            int dot_lo = 0, dot_hi = 0, sum_lo = 0, sum_hi = 0;
+#pragma unroll
+            for (int g = 0; g < 4; ++g)
+            {
+                dot_lo = __dp4a(a[g], w[g], dot_lo);
+                dot_hi = __dp4a(a[g + 4], w[g + 4], dot_hi);
+                sum_lo = __dp4a(a[g], 0x01010101, sum_lo);
+                sum_hi = __dp4a(a[g + 4], 0x01010101, sum_hi);
+            }
+            uint16_t iq1m_qh = 0u;
+            int sg0 = 0, sg1 = 0, sg2 = 0, sg3 = 0;
+            if constexpr (Traits::is_iq1_m)
+            {
+                iq1m_qh = static_cast<uint16_t>(payload[4]) | (static_cast<uint16_t>(payload[5]) << 8u);
+                sg0 = __dp4a(a[0], 0x01010101, 0) + __dp4a(a[1], 0x01010101, 0);
+                sg1 = __dp4a(a[2], 0x01010101, 0) + __dp4a(a[3], 0x01010101, 0);
+                sg2 = __dp4a(a[4], 0x01010101, 0) + __dp4a(a[5], 0x01010101, 0);
+                sg3 = __dp4a(a[6], 0x01010101, 0) + __dp4a(a[7], 0x01010101, 0);
+            }
+            return ::llaminar2::cuda_native_quantised::native_quantised_block_contribution_from_reduced_terms_rn<CodebookId>(
+                dot_lo, dot_hi, act_scale, primary, secondary, emin,
+                sum_lo + sum_hi, sum_lo, sum_hi, iq1m_qh, sg0, sg1, sg2, sg3);
+        }
+        else
+        {
+            int dot = 0, sum_a = 0;
+#pragma unroll
+            for (int g = 0; g < 8; ++g)
+            {
+                dot = __dp4a(a[g], w[g], dot);
+                if constexpr (Traits::is_asymmetric)
+                    sum_a = __dp4a(a[g], 0x01010101, sum_a);
+            }
+            return ::llaminar2::cuda_native_quantised::native_quantised_block_contribution_from_reduced_terms_rn<CodebookId>(
+                dot, 0, act_scale, primary, secondary, 0u, sum_a, 0, 0, 0u, 0, 0, 0, 0);
+        }
+    }
+
+    /** @brief Runtime-dispatched all-18-codebook K32 block dot contribution. */
+    static __device__ __forceinline__ float retainedNativeQuantisedBlockDynamic(
+        const DeviceNativeQuantisedMatrixDesc& desc,
+        unsigned linear,
+        const int8_t* codes,
+        float act_scale)
+    {
+        switch (desc.codebook_id)
+        {
+        case 0:  return retainedNativeQuantisedBlockContribution<0>(desc, linear, codes, act_scale);
+        case 4:  return retainedNativeQuantisedBlockContribution<4>(desc, linear, codes, act_scale);
+        case 5:  return retainedNativeQuantisedBlockContribution<5>(desc, linear, codes, act_scale);
+        case 6:  return retainedNativeQuantisedBlockContribution<6>(desc, linear, codes, act_scale);
+        case 7:  return retainedNativeQuantisedBlockContribution<7>(desc, linear, codes, act_scale);
+        case 8:  return retainedNativeQuantisedBlockContribution<8>(desc, linear, codes, act_scale);
+        case 9:  return retainedNativeQuantisedBlockContribution<9>(desc, linear, codes, act_scale);
+        case 10: return retainedNativeQuantisedBlockContribution<10>(desc, linear, codes, act_scale);
+        case 11: return retainedNativeQuantisedBlockContribution<11>(desc, linear, codes, act_scale);
+        case 12: return retainedNativeQuantisedBlockContribution<12>(desc, linear, codes, act_scale);
+        case 13: return retainedNativeQuantisedBlockContribution<13>(desc, linear, codes, act_scale);
+        case 14: return retainedNativeQuantisedBlockContribution<14>(desc, linear, codes, act_scale);
+        case 15: return retainedNativeQuantisedBlockContribution<15>(desc, linear, codes, act_scale);
+        case 16: return retainedNativeQuantisedBlockContribution<16>(desc, linear, codes, act_scale);
+        case 17: return retainedNativeQuantisedBlockContribution<17>(desc, linear, codes, act_scale);
+        case 19: return retainedNativeQuantisedBlockContribution<19>(desc, linear, codes, act_scale);
+        case ::llaminar2::kNativeQuantisedExpandedInt8MinCodebook:
+            return retainedNativeQuantisedBlockContribution<::llaminar2::kNativeQuantisedExpandedInt8MinCodebook>(
+                desc, linear, codes, act_scale);
+        case ::llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook:
+            return retainedNativeQuantisedBlockContribution<::llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook>(
+                desc, linear, codes, act_scale);
+        default:
+            __trap();
+            return 0.0f;
+        }
+    }
+
+    /** @brief General all-18-codebook HC Down partition fold. */
+    __device__ __forceinline__ float retainedHCDownPartialGeneral(
+        const RetainedHCPrefix& prefix, int column, int partition)
+    {
+        const auto& down = prefix.down;
+        const int first = partition * prefix.down_partitions.blocks_per_partition;
+        const int last = min(static_cast<int>(down.blocks_per_row),
+            first + prefix.down_partitions.blocks_per_partition);
+        float sum = 0.0f;
+#pragma unroll 1
+        for (int group = first; group < last; ++group)
+        {
+            const unsigned linear = static_cast<unsigned>(group * down.n + column);
+            const float value = retainedNativeQuantisedBlockDynamic(
+                down, linear, prefix.norm_codes + group * 32, prefix.norm_scales[group]);
+            sum = __fadd_rn(sum, value);
+        }
+        return sum;
+    }
+
+    /** @brief General all-18-codebook HC Up dual-term column fold. */
+    __device__ __forceinline__ float retainedHCUpColumnGeneral(
+        const GPUQ8ResidualCorrectionArgs& up, int column)
+    {
+        const auto& weight = up.weights;
+        float primary = 0.0f;
+        float residual = 0.0f;
+#pragma unroll 1
+        for (unsigned group = 0; group < weight.blocks_per_row; ++group)
+        {
+            const unsigned linear = group * static_cast<unsigned>(weight.n) + static_cast<unsigned>(column);
+            primary = __fadd_rn(primary, retainedNativeQuantisedBlockDynamic(
+                weight, linear, up.primary + group * 32, up.primaryScales[group]));
+            residual = __fadd_rn(residual, retainedNativeQuantisedBlockDynamic(
+                weight, linear, up.residual + group * 32, up.residualScales[group]));
+        }
+        return __fadd_rn(primary, residual);
+    }
+
     /**
      * @brief Fold one original serial Down partition for one output, without public scratch.
      * @param prefix Sealed original Down and normalized input operands.
@@ -66,6 +289,7 @@ namespace llaminar2::cuda::moe
             first + prefix.down_partitions.blocks_per_partition);
         const auto* weight_scales = static_cast<const uint16_t*>(down.scales);
         float sum = 0.0f;
+#pragma unroll 1
         for (int group = first; group < last; ++group)
         {
             const int linear = group * down.n + column;
@@ -89,6 +313,7 @@ namespace llaminar2::cuda::moe
         const auto* weight_scales = static_cast<const uint16_t*>(weight.scales);
         float primary = 0.0f;
         float residual = 0.0f;
+#pragma unroll 1
         for (unsigned group = 0; group < weight.blocks_per_row; ++group)
         {
             const unsigned linear = group * weight.n + column;
@@ -103,9 +328,46 @@ namespace llaminar2::cuda::moe
     }
 
     /**
+     * @brief Compute one row of the original 4x(4H) FP32 HC injection projection with the exact 128/64/32 tree.
+     * @tparam Hidden Physical branch width authenticated by the resident program.
+     * @param prefix Sealed original HC prefix carrying normalized output and FP32 injection weights.
+     * @param row Output injection row in [0, 4).
+     * @param partials CTA-local 256-float scratch reused after the branch-norm phase.
+     */
+    template<unsigned Hidden>
+    __device__ __forceinline__ void retainedHCInjectionRow(
+        const RetainedHCPrefix& prefix, unsigned row, float* partials)
+    {
+        const unsigned tid = threadIdx.x;
+        constexpr unsigned k = 4u * Hidden;
+        const float* w_row = prefix.injection_weights + static_cast<std::size_t>(row) * k;
+        float sum = 0.0f;
+        for (unsigned j = tid; j < k; j += 256u)
+            sum += prefix.norm.output[j] * w_row[j];
+        partials[tid] = sum;
+        __syncthreads();
+        if (tid < 32u)
+        {
+            const float low = (partials[tid] + partials[tid + 128u]) +
+                              (partials[tid + 64u] + partials[tid + 192u]);
+            const float high = (partials[tid + 32u] + partials[tid + 160u]) +
+                               (partials[tid + 96u] + partials[tid + 224u]);
+            float result = low + high;
+#pragma unroll
+            for (int stride = 16; stride > 0; stride >>= 1)
+                result += __shfl_down_sync(0xffffffffu, result, stride);
+            if (tid == 0u)
+                prefix.injection_output[row] = result;
+        }
+        __syncthreads();
+    }
+
+    /**
      * @brief Publish the original post-attention mixed row inside an enclosing resident program.
      * @tparam PublishActivated The graph reads the original rounded Down activation.
      * @tparam PublishUp The graph reads the original branch logits.
+     * @tparam Hidden Physical branch width authenticated by the resident program.
+     * @tparam SupportOptionalWriteAndInject Enable PublishedTrunk (Layer 0) and overlapped 4-CTA FP32 injection.
      * @param prefix Cold-prepared original HC operands and fold.
      * @param shared Borrowed CTA storage, reusable after the final grid join.
      * @param grid Resident native grid, with one row active for every participant.
@@ -113,14 +375,24 @@ namespace llaminar2::cuda::moe
      *      Both weight sources are original prepared Q8_0. The Down output has
      *      complete K32 quantizer groups, and the Up output width is 4H.
      */
-    template<bool PublishActivated, bool PublishUp>
+    template<bool PublishActivated, bool PublishUp, unsigned Hidden,
+             bool SupportOptionalWriteAndInject = false, bool GeneralCodebooks = false>
     __device__ __forceinline__ void publishRetainedHCPrefix(const RetainedHCPrefix& prefix,
-        RetainedHCPrefixShared& shared, cooperative_groups::grid_group grid)
+        RetainedHCPrefixShared<Hidden>& shared, cooperative_groups::grid_group grid,
+        uint64_t* profile_ns = nullptr, uint32_t* hc_down_done = nullptr)
     {
-        using namespace qwen4exp::branch_norm_native;
+        auto mark = [&](int idx) {
+            if (profile_ns && blockIdx.x == 0 && threadIdx.x == 0) {
+                uint64_t t;
+                asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+                profile_ns[idx] = t;
+            }
+        };
+        using namespace ::llaminar2::qwen4exp::branch_norm_native;
         const unsigned hidden = prefix.norm.hidden;
         const unsigned tid = threadIdx.x;
         const unsigned lane = tid % 32;
+        const unsigned warp = tid / 32;
         const unsigned global_thread = blockIdx.x * blockDim.x + tid;
         const unsigned grid_threads = gridDim.x * blockDim.x;
 
@@ -128,62 +400,340 @@ namespace llaminar2::cuda::moe
         {
             const unsigned branch = blockIdx.x;
             const unsigned offset = branch * hidden;
-            const ResidualBranchInput input{prefix.write.residual + offset, prefix.write.block,
-                prefix.write.output + offset, residualGate(prefix.write.gateLogits[branch])};
-            taskFromInput(input, prefix.norm.gain,
-                CUDAQuantizedPublication{prefix.norm.output, prefix.norm_codes, prefix.norm_scales},
-                prefix.norm.hidden, prefix.norm.epsilon, branch, shared.norm, tid, true);
+            static_assert(Hidden % 128 == 0);
+            float partial = 0.0f;
+            if constexpr (SupportOptionalWriteAndInject)
+            {
+                if (prefix.has_previous_write)
+                {
+                    const ResidualBranchInput input{prefix.write.residual + offset, prefix.write.block,
+                        prefix.write.output + offset, residualGate(prefix.write.gateLogits[branch])};
+#pragma unroll 2
+                    for (unsigned channel = tid; channel < Hidden; channel += 256)
+                    {
+                        const float value = input.publish(channel);
+                        shared.post[channel] = value;
+                        partial = fmaf(value, value, partial);
+                    }
+                }
+                else
+                {
+                    const float* trunk = prefix.norm.input + offset;
+#pragma unroll 2
+                    for (unsigned channel = tid; channel < Hidden; channel += 256)
+                    {
+                        const float value = trunk[channel];
+                        shared.post[channel] = value;
+                        partial = fmaf(value, value, partial);
+                    }
+                }
+            }
+            else
+            {
+                const ResidualBranchInput input{prefix.write.residual + offset, prefix.write.block,
+                    prefix.write.output + offset, residualGate(prefix.write.gateLogits[branch])};
+#pragma unroll 2
+                for (unsigned channel = tid; channel < Hidden; channel += 256)
+                {
+                    const float value = input.publish(channel);
+                    shared.post[channel] = value;
+                    partial = fmaf(value, value, partial);
+                }
+            }
+            const float sum = squareSum(partial, shared.norm, tid, true);
+            const float inverse = normalizationInverse(sum, prefix.norm.hidden, prefix.norm.epsilon);
+            const auto *gain = prefix.norm.gain + offset;
+            auto *normalized = prefix.norm.output + offset;
+            auto *codes = prefix.norm_codes + offset;
+            auto *scales = prefix.norm_scales + offset / 32;
+            const auto *post = reinterpret_cast<const float4 *>(shared.post);
+            for (unsigned quad = tid; quad < Hidden / 4; quad += 256)
+            {
+                const unsigned first = 4 * quad;
+                const float4 value = post[quad];
+                const auto output = make_float4(
+                    normalizedElement(value.x, inverse, gain[first]),
+                    normalizedElement(value.y, inverse, gain[first + 1]),
+                    normalizedElement(value.z, inverse, gain[first + 2]),
+                    normalizedElement(value.w, inverse, gain[first + 3]));
+                normalized[first] = output.x;
+                normalized[first + 1] = output.y;
+                normalized[first + 2] = output.z;
+                normalized[first + 3] = output.w;
+                retainedHCNormQ8Quad(output, codes + first, scales + first / 32, tid % 8);
+            }
         }
         grid.sync();
+        mark(1);
 
         const unsigned partitions = prefix.down_partitions.count;
         const unsigned columns = prefix.down.n;
         const bool ordered = prefix.down_fold == HCDownFold::OrderedPartitions;
         if (ordered)
         {
-            for (unsigned task = global_thread; task < partitions * columns; task += grid_threads)
+            if constexpr (!GeneralCodebooks)
             {
-                const unsigned column = task % columns;
-                const unsigned partition = task / columns;
-                prefix.down_partials[task] = retainedHCDownPartial(prefix, column, partition);
+                if (columns % 32 == 0 && prefix.down_partitions.blocks_per_partition <= 32)
+                {
+                    // 1-wave 160-CTA 100% coalesced warp-split HC Down: each CTA owns 32 contiguous columns
+                    // (two 16-column half-tiles) x 1 partition, loading 512 contiguous bytes per warp in one
+                    // int4 transaction. When hc_down_done is provided, the last partition CTA for each
+                    // 32-column tile immediately folds and publishes Q8, eliminating one full grid.sync().
+                    const unsigned col_tiles = columns / 32u;
+                    const unsigned cta_tasks = partitions * col_tiles;
+                    const bool fuse_down_publish = (hc_down_done != nullptr && col_tiles <= 32u);
+                    const unsigned total_down_tasks =
+                        (SupportOptionalWriteAndInject && prefix.injection_weights != nullptr)
+                            ? (cta_tasks + 4u) : cta_tasks;
+                    const auto& down = prefix.down;
+                    const auto* weight_scales = static_cast<const uint16_t*>(down.scales);
+                    const unsigned half_lane = lane >> 1;
+                    const unsigned half_part = lane & 1u;
+                    for (unsigned cta_task = blockIdx.x; cta_task < total_down_tasks; cta_task += gridDim.x)
+                    {
+                        if constexpr (SupportOptionalWriteAndInject)
+                        {
+                            if (cta_task >= cta_tasks)
+                            {
+                                retainedHCInjectionRow<Hidden>(prefix, cta_task - cta_tasks, shared.norm);
+                                continue;
+                            }
+                        }
+                        const unsigned partition = cta_task / col_tiles;
+                        const unsigned col_tile = cta_task % col_tiles;
+                        const unsigned col_base = col_tile * 32u;
+                        const unsigned first = partition * prefix.down_partitions.blocks_per_partition;
+                        const unsigned last = min(static_cast<unsigned>(down.blocks_per_row),
+                            first + static_cast<unsigned>(prefix.down_partitions.blocks_per_partition));
+                        const unsigned count = last > first ? last - first : 0u;
+                        for (unsigned b = warp; b < count; b += 8u)
+                        {
+                            const unsigned group = first + b;
+                            const unsigned row_base = group * down.n + col_base;
+                            const int4 a4 = reinterpret_cast<const int4*>(
+                                prefix.norm_codes + group * 32u)[half_part];
+                            const float act_scale = prefix.norm_scales[group];
+                            const int4 w0 = reinterpret_cast<const int4*>(down.payload + row_base * 32u)[lane];
+                            const int4 w1 = reinterpret_cast<const int4*>(down.payload + (row_base + 16u) * 32u)[lane];
+                            int d0 = __dp4a(w0.x, a4.x, 0);
+                            int d1 = __dp4a(w1.x, a4.x, 0);
+                            d0 = __dp4a(w0.y, a4.y, d0);
+                            d1 = __dp4a(w1.y, a4.y, d1);
+                            d0 = __dp4a(w0.z, a4.z, d0);
+                            d1 = __dp4a(w1.z, a4.z, d1);
+                            d0 = __dp4a(w0.w, a4.w, d0);
+                            d1 = __dp4a(w1.w, a4.w, d1);
+                            const int full0 = d0 + __shfl_xor_sync(0xffffffffu, d0, 1);
+                            const int full1 = d1 + __shfl_xor_sync(0xffffffffu, d1, 1);
+                            if (half_part == 0u)
+                            {
+                                const float ws0 = __half2float(__ushort_as_half(weight_scales[row_base + half_lane]));
+                                const float ws1 = __half2float(__ushort_as_half(weight_scales[row_base + 16u + half_lane]));
+                                shared.down_blocks[b][half_lane] =
+                                    device_native_quantised_contract::singleScaleBlock(full0, ws0, act_scale);
+                                shared.down_blocks[b][16u + half_lane] =
+                                    device_native_quantised_contract::singleScaleBlock(full1, ws1, act_scale);
+                            }
+                        }
+                        __syncthreads();
+                        if (warp == 0u)
+                        {
+                            float sum = 0.0f;
+                            for (unsigned b = 0; b < count; ++b)
+                                sum = __fadd_rn(sum, shared.down_blocks[b][lane]);
+                            prefix.down_partials[partition * columns + col_base + lane] = sum;
+                            if (fuse_down_publish)
+                                __threadfence();
+                        }
+                        __syncthreads();
+                        if (fuse_down_publish)
+                        {
+                            if (tid == 0u)
+                                shared.down_finished = atomicAdd(hc_down_done + col_tile, 1u) + 1u;
+                            __syncthreads();
+                            if (shared.down_finished == partitions && warp == 0u)
+                            {
+                                const unsigned column = col_base + lane;
+                                float total = 0.0f;
+                                for (unsigned part = 0u; part < partitions; ++part)
+                                    total = __fadd_rn(total, __ldcg(prefix.down_partials + part * columns + column));
+                                prefix.raw_down[column] = total;
+                                hc_down_publication::publish<hc_down_publication::OriginalScalePublication, PublishActivated>(
+                                    total, prefix.down_publication, column);
+                            }
+                            __syncthreads();
+                        }
+                    }
+                }
+                else
+                {
+                    for (unsigned task = global_thread; task < partitions * columns; task += grid_threads)
+                    {
+                        const unsigned column = task % columns;
+                        const unsigned partition = task / columns;
+                        prefix.down_partials[task] = retainedHCDownPartial(prefix, column, partition);
+                    }
+                    if constexpr (SupportOptionalWriteAndInject)
+                    {
+                        if (prefix.injection_weights != nullptr && blockIdx.x < 4u)
+                            retainedHCInjectionRow<Hidden>(prefix, blockIdx.x, shared.norm);
+                    }
+                }
+            }
+            else
+            {
+                for (unsigned task = global_thread; task < partitions * columns; task += grid_threads)
+                {
+                    const unsigned column = task % columns;
+                    const unsigned partition = task / columns;
+                    prefix.down_partials[task] = retainedHCDownPartialGeneral(prefix, column, partition);
+                }
+                if constexpr (SupportOptionalWriteAndInject)
+                {
+                    if (prefix.injection_weights != nullptr && blockIdx.x < 4u)
+                        retainedHCInjectionRow<Hidden>(prefix, blockIdx.x, shared.norm);
+                }
             }
             grid.sync();
         }
-
-        // Every publishing warp owns a complete quantizer packet. It folds
-        // the original partition bank in order, or computes the single admitted
-        // direct partition without materializing a partial or joining the grid.
-        for (unsigned first = (global_thread / 32) * 32; first < columns; first += grid_threads)
+        else if constexpr (SupportOptionalWriteAndInject)
         {
-            const unsigned column = first + lane;
-            float sum = 0.0f;
-            if (ordered)
-            {
-                for (unsigned part = 0; part < partitions; ++part)
-                    sum = __fadd_rn(sum, prefix.down_partials[part * columns + column]);
-            }
-            else
-                sum = retainedHCDownPartial(prefix, column, 0);
-            prefix.raw_down[column] = sum;
-            hc_down_publication::publish<hc_down_publication::OriginalScalePublication, PublishActivated>(
-                sum, prefix.down_publication, column);
+            if (prefix.injection_weights != nullptr && blockIdx.x < 4u)
+                retainedHCInjectionRow<Hidden>(prefix, blockIdx.x, shared.norm);
         }
-        grid.sync();
+        mark(2);
 
-        // A warp owns eight channels from all four branches. Lanes fold
-        // their two Up terms independently, then exchange only final logits.
-        // The first eight lanes retain the original branch order in the read.
+        const bool down_already_published =
+            (!GeneralCodebooks) &&
+            (prefix.down_fold == HCDownFold::OrderedPartitions) &&
+            (prefix.down.n % 32 == 0) &&
+            (prefix.down_partitions.blocks_per_partition <= 32) &&
+            (hc_down_done != nullptr) &&
+            (static_cast<unsigned>(prefix.down.n) <= 1024u);
+        if (!down_already_published)
+        {
+            // Every publishing warp owns a complete quantizer packet. It folds
+            // the original partition bank in order, or computes the single admitted
+            // direct partition without materializing a partial or joining the grid.
+            for (unsigned first = (global_thread / 32) * 32; first < columns; first += grid_threads)
+            {
+                const unsigned column = first + lane;
+                float sum = 0.0f;
+                if (ordered)
+                {
+                    for (unsigned part = 0; part < partitions; ++part)
+                        sum = __fadd_rn(sum, prefix.down_partials[part * columns + column]);
+                }
+                else
+                {
+                    if constexpr (GeneralCodebooks)
+                        sum = retainedHCDownPartialGeneral(prefix, column, 0);
+                    else
+                        sum = retainedHCDownPartial(prefix, column, 0);
+                }
+                prefix.raw_down[column] = sum;
+                hc_down_publication::publish<hc_down_publication::OriginalScalePublication, PublishActivated>(
+                    sum, prefix.down_publication, column);
+            }
+            grid.sync();
+        }
+        mark(3);
+
+        if constexpr (!GeneralCodebooks)
+        {
+        if (prefix.up.weights.blocks_per_row == 10 && hidden % 16 == 0)
+        {
+            // 100% coalesced warp-split 160-CTA HC Up: each CTA owns 16 contiguous channels
+            // across all 4 branches, distributing the 40 (branch, K32-group) pairs evenly
+            // across 8 warps (5 tasks/warp, zero imbalance) with single 512-byte warp loads.
+            const auto& up = prefix.up;
+            const auto& weight = up.weights;
+            const auto* weight_scales = static_cast<const uint16_t*>(weight.scales);
+            const unsigned half_lane = lane >> 1;
+            const unsigned half_part = lane & 1u;
+            const unsigned channel_tiles = hidden / 16u;
+            for (unsigned tile = blockIdx.x; tile < channel_tiles; tile += gridDim.x)
+            {
+                const unsigned first_channel = tile * 16u;
+#pragma unroll
+                for (unsigned step = 0u; step < 5u; ++step)
+                {
+                    const unsigned task = step * 8u + warp;
+                    const unsigned branch = (task * 205u) >> 11;
+                    const unsigned group = task - branch * 10u;
+                    const unsigned col_base = branch * hidden + first_channel;
+                    const int4 w4 = reinterpret_cast<const int4*>(
+                        weight.payload + (group * weight.n + col_base) * 32u)[lane];
+                    const int4 p4 = reinterpret_cast<const int4*>(up.primary + group * 32u)[half_part];
+                    const int4 r4 = reinterpret_cast<const int4*>(up.residual + group * 32u)[half_part];
+                    int pd = __dp4a(w4.x, p4.x, 0);
+                    int rd = __dp4a(w4.x, r4.x, 0);
+                    pd = __dp4a(w4.y, p4.y, pd);
+                    rd = __dp4a(w4.y, r4.y, rd);
+                    pd = __dp4a(w4.z, p4.z, pd);
+                    rd = __dp4a(w4.z, r4.z, rd);
+                    pd = __dp4a(w4.w, p4.w, pd);
+                    rd = __dp4a(w4.w, r4.w, rd);
+                    const int p_full = pd + __shfl_xor_sync(0xffffffffu, pd, 1);
+                    const int r_full = rd + __shfl_xor_sync(0xffffffffu, rd, 1);
+                    if (half_part == 0u)
+                    {
+                        const unsigned linear = group * weight.n + col_base + half_lane;
+                        const float ws = __half2float(__ushort_as_half(weight_scales[linear]));
+                        shared.up.primary[branch][group][half_lane] =
+                            device_native_quantised_contract::singleScaleBlock(p_full, ws, up.primaryScales[group]);
+                        shared.up.residual[branch][group][half_lane] =
+                            device_native_quantised_contract::singleScaleBlock(r_full, ws, up.residualScales[group]);
+                    }
+                }
+                __syncthreads();
+                if (tid < 64u)
+                {
+                    const unsigned branch = tid >> 4;
+                    const unsigned ch = tid & 15u;
+                    float primary = 0.0f, residual = 0.0f;
+#pragma unroll
+                    for (unsigned group = 0; group < 10u; ++group)
+                    {
+                        primary = __fadd_rn(primary, shared.up.primary[branch][group][ch]);
+                        residual = __fadd_rn(residual, shared.up.residual[branch][group][ch]);
+                    }
+                    const float logit = __fadd_rn(primary, residual);
+                    if constexpr (PublishUp)
+                        up.output[branch * hidden + first_channel + ch] = logit;
+                    shared.up.logit[branch][ch] = logit;
+                }
+                __syncthreads();
+                if (tid < 16u)
+                {
+                    float mixed = 0.0f;
+#pragma unroll
+                    for (unsigned branch = 0; branch < 4u; ++branch)
+                        mixed = appendReadBranch(mixed, shared.up.logit[branch][tid],
+                            prefix.norm.output[branch * hidden + first_channel + tid]);
+                    prefix.mixed[first_channel + tid] = mixed * 0.25f;
+                }
+                __syncthreads();
+            }
+            grid.sync();
+            return;
+        }
+        }
+
+        // General fallback geometry for non-10-block HC Up widths or arbitrary codebooks.
         constexpr unsigned branch_width = retained_hc_read_warp_channels;
         const unsigned branch = lane / branch_width;
-        // Assign one packet to each CTA before assigning its second warp. The
-        // admitted grid is bounded by these always-live HC Up packets.
         const unsigned read_warp = tid / 32 * gridDim.x + blockIdx.x;
         for (unsigned first = read_warp * branch_width; first < hidden;
              first += grid_threads / 32 * branch_width)
         {
             const unsigned channel = first + lane % branch_width;
             const unsigned column = branch * hidden + channel;
-            const float logit = retainedHCUpColumn(prefix.up, column);
+            float logit;
+            if constexpr (GeneralCodebooks)
+                logit = retainedHCUpColumnGeneral(prefix.up, column);
+            else
+                logit = retainedHCUpColumn(prefix.up, column);
             if constexpr (PublishUp)
                 prefix.up.output[column] = logit;
             float mixed = 0.0f;

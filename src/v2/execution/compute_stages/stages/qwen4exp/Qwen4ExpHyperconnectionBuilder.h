@@ -241,6 +241,13 @@ public:
      */
     static bool lowerAdjacentWriteNorm(ComputeGraph &graph,const std::string &writeProducer);
     /**
+     * @brief Fuse an immediately preceding residual write into a ROCm persistent HC read stage.
+     * @param graph Cold participant-local graph after adjacent blocks are composed.
+     * @param writeProducer Original residual-write terminal whose sole consumer is a PersistentHCReadStage.
+     * @return True if fused into the successor persistent read; false if not eligible.
+     */
+    static bool tryFusePreviousWriteIntoPersistentRead(ComputeGraph &graph,const std::string &writeProducer);
+    /**
      * @brief Retain exact existing HC declarations for full-region composition only.
      * @param graph Original cold participant-local graph.
      * @param region Explicit write/norm/down/up/read/injection nodes and original context.

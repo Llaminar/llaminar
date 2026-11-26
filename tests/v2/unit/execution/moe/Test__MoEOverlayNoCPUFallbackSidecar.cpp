@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include "../../SourceShardReader.h"
 
 #include <fstream>
 #include <sstream>
@@ -11,12 +12,7 @@ namespace llaminar2::test
     {
         std::string readSourceFile(const std::string &path)
         {
-            std::ifstream file(path);
-            if (!file)
-                return {};
-            std::ostringstream contents;
-            contents << file.rdbuf();
-            return contents.str();
+            return llaminar2::test_support::readSourceFileOrFamily(path);
         }
 
         size_t countOccurrences(const std::string &haystack, const std::string &needle)

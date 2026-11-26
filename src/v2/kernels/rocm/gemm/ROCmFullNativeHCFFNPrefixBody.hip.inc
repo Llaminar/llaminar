@@ -358,6 +358,170 @@ __device__ __forceinline__ void up(const PersistentHCReadArgs& a,
   __syncthreads();
  }
 }
+/**
+ * @brief 1024B coalesced wave64 HC down with simultaneous payload+scale issue and double-buffered LDS.
+ * @param a Original HC binding with aligned K32 blocks and down_partials plane.
+ * @param dynamic_storage Admitted 16-byte-aligned phase LDS storage.
+ * @param words Admitted float capacity.
+ * @details All 16 waves issue contiguous 1024B Q8 payload bursts paired with simultaneous
+ * scale loads while reading Q8 activations from LDS. Partition folds preserve exact ascending
+ * K32 order and terminal multiply-by-1.0f semantics.
+ */
+__device__ __forceinline__ void fastCoalescedDown(const PersistentHCReadArgs& a,
+ unsigned char* dynamic_storage,unsigned words) {
+ (void)words;
+ const unsigned tid=threadIdx.x,wave=tid>>6,lane=tid&63u;
+ const unsigned R=unsigned(a.down_weights.n),down_blocks=unsigned(a.down_weights.k)>>5;
+ const unsigned parts=unsigned(a.partitions),down_per=down_blocks/parts;
+ int4* lds_codes4=reinterpret_cast<int4*>(dynamic_storage);
+ float* lds_scales=reinterpret_cast<float*>(lds_codes4+down_blocks*2u);
+ float* down_lds=lds_scales+down_blocks;
+ {
+  const int4* g_codes4=reinterpret_cast<const int4*>(a.input_codes);
+  for(unsigned i=tid;i<down_blocks*2u;i+=1024u)lds_codes4[i]=g_codes4[i];
+  for(unsigned i=tid;i<down_blocks;i+=1024u)lds_scales[i]=a.input_scales[i];
+ }
+ __syncthreads();
+ const unsigned col_in_wave=lane>>1,half_part=lane&1u;
+ const unsigned col_tiles=R>>5,cta_tasks=parts*col_tiles;
+ const unsigned short* w_scales=static_cast<const unsigned short*>(a.down_weights.scales);
+ const unsigned down_stride=down_per*32u;
+ unsigned buf=0u;
+#pragma unroll 1
+ for(unsigned cta_task=blockIdx.x;cta_task<cta_tasks;cta_task+=gridDim.x) {
+  float* cur_lds=down_lds+(buf&1u)*down_stride;
+  const unsigned partition=cta_task/col_tiles;
+  const unsigned col_base=(cta_task%col_tiles)<<5;
+  const unsigned first=partition*down_per;
+  const bool has0=wave<down_per;
+  const bool has1=(wave+16u)<down_per;
+  int4 w0{},w1{};
+  unsigned short s0=0u,s1=0u;
+  if(has0) {
+   const std::size_t rb0=std::size_t(first+wave)*R+col_base;
+   w0=weightRead<int4>(a.down_weights.payload+rb0*32u+lane*16u);
+   if(half_part==0u)s0=weightRead<unsigned short>(w_scales+rb0+col_in_wave);
+  }
+  if(has1) {
+   const std::size_t rb1=std::size_t(first+wave+16u)*R+col_base;
+   w1=weightRead<int4>(a.down_weights.payload+rb1*32u+lane*16u);
+   if(half_part==0u)s1=weightRead<unsigned short>(w_scales+rb1+col_in_wave);
+  }
+  if(has0) {
+   const unsigned g0=first+wave;
+   const int4 a0=lds_codes4[g0*2u+half_part];
+   int d=0;
+   d=rocm_integer_contract::signedDot4(a0.x,w0.x,d);
+   d=rocm_integer_contract::signedDot4(a0.y,w0.y,d);
+   d=rocm_integer_contract::signedDot4(a0.z,w0.z,d);
+   d=rocm_integer_contract::signedDot4(a0.w,w0.w,d);
+   const int full=d+__shfl_xor(d,1,64);
+   if(half_part==0u) {
+    const float ws=__half2float(__ushort_as_half(s0));
+    cur_lds[wave*32u+col_in_wave]=device_native_quantised_contract::singleScaleBlock(full,ws,lds_scales[g0]);
+   }
+  }
+  if(has1) {
+   const unsigned g1=first+wave+16u;
+   const int4 a1=lds_codes4[g1*2u+half_part];
+   int d=0;
+   d=rocm_integer_contract::signedDot4(a1.x,w1.x,d);
+   d=rocm_integer_contract::signedDot4(a1.y,w1.y,d);
+   d=rocm_integer_contract::signedDot4(a1.z,w1.z,d);
+   d=rocm_integer_contract::signedDot4(a1.w,w1.w,d);
+   const int full=d+__shfl_xor(d,1,64);
+   if(half_part==0u) {
+    const float ws=__half2float(__ushort_as_half(s1));
+    cur_lds[(wave+16u)*32u+col_in_wave]=device_native_quantised_contract::singleScaleBlock(full,ws,lds_scales[g1]);
+   }
+  }
+  __syncthreads();
+  if(tid<32u) {
+   float sum=0.0f;
+   for(unsigned b=0u;b<down_per;++b)sum=device_fp32_contract::add(sum,cur_lds[b*32u+tid]);
+   a.down_partials[std::size_t(partition)*R+col_base+tid]=__fmul_rn(sum,1.0f);
+  }
+  ++buf;
+ }
+}
+
+/**
+ * @brief 1024B coalesced wave64 HC up with simultaneous payload+scale issue and parallel 4-branch fold.
+ * @param a Original immutable source/public output declaration.
+ * @param local Published local TwoTerm activation banks.
+ * @param arena Exclusive dynamic LDS float bank.
+ * @param output_demand Sealed graph/observation demand for public HCUp logits.
+ */
+__device__ __forceinline__ void fastCoalescedUp(const PersistentHCReadArgs& a,
+ const FullNativeHCFFNPrefixScratch& local,float* arena,FullNativeHCFFNOutputDemand output_demand) {
+ const unsigned tid=threadIdx.x,wave=tid>>6,lane=tid&63u;
+ const unsigned H=unsigned(a.norm.hidden),up_groups=unsigned(a.up.weights.blocks_per_row);
+ const unsigned channel_tiles=H>>5,total_tasks=4u*up_groups,up_n=4u*H;
+ const unsigned col_in_wave=lane>>1,half_part=lane&1u;
+ const unsigned short* w_scales=static_cast<const unsigned short*>(a.up.weights.scales);
+ const int4* p_codes4=reinterpret_cast<const int4*>(local.primary);
+ const int4* r_codes4=reinterpret_cast<const int4*>(local.residual);
+ const unsigned plane_floats=total_tasks*32u;
+ unsigned buf=0u;
+#pragma unroll 1
+ for(unsigned tile=blockIdx.x;tile<channel_tiles;tile+=gridDim.x) {
+  const unsigned col_base=tile<<5;
+  float* primary_lds=arena+(buf&1u)*(2u*plane_floats);
+  float* residual_lds=primary_lds+plane_floats;
+  for(unsigned task=wave;task<total_tasks;task+=16u) {
+   const unsigned br=task/up_groups,blk=task%up_groups;
+   const std::size_t rb=std::size_t(blk)*up_n+std::size_t(br)*H+col_base;
+   const int4 wv=weightRead<int4>(a.up.weights.payload+rb*32u+lane*16u);
+   unsigned short sv=0u;
+   if(half_part==0u)sv=weightRead<unsigned short>(w_scales+rb+col_in_wave);
+   int dp=0,dr=0;
+   {
+    const int4 pa=p_codes4[blk*2u+half_part];
+    dp=rocm_integer_contract::signedDot4(pa.x,wv.x,dp);
+    dp=rocm_integer_contract::signedDot4(pa.y,wv.y,dp);
+    dp=rocm_integer_contract::signedDot4(pa.z,wv.z,dp);
+    dp=rocm_integer_contract::signedDot4(pa.w,wv.w,dp);
+   }
+   {
+    const int4 ra=r_codes4[blk*2u+half_part];
+    dr=rocm_integer_contract::signedDot4(ra.x,wv.x,dr);
+    dr=rocm_integer_contract::signedDot4(ra.y,wv.y,dr);
+    dr=rocm_integer_contract::signedDot4(ra.z,wv.z,dr);
+    dr=rocm_integer_contract::signedDot4(ra.w,wv.w,dr);
+   }
+   const int fp=dp+__shfl_xor(dp,1,64),fr=dr+__shfl_xor(dr,1,64);
+   if(half_part==0u) {
+    const float ws=__half2float(__ushort_as_half(sv));
+    primary_lds[task*32u+col_in_wave]=device_native_quantised_contract::singleScaleBlock(fp,ws,local.primary_scales[blk]);
+    residual_lds[task*32u+col_in_wave]=device_native_quantised_contract::singleScaleBlock(fr,ws,local.residual_scales[blk]);
+   }
+  }
+  __syncthreads();
+  if(tid<128u) {
+   const unsigned branch=tid>>5,col=tid&31u;
+   float p=0.0f,q=0.0f;
+   for(unsigned block=0u;block<up_groups;++block) {
+    const unsigned idx=(branch*up_groups+block)*32u+col;
+    p=device_fp32_contract::add(p,primary_lds[idx]);
+    q=device_fp32_contract::add(q,residual_lds[idx]);
+   }
+   const float value=device_fp32_contract::add(p,q);
+   if(output_demand.contains(FullNativeHCFFNOutputRole::HCUp))
+    a.up.output[std::size_t(branch)*H+col_base+col]=value;
+   primary_lds[branch*32u+col]=1.0f/(1.0f+expf(-value));
+   residual_lds[branch*32u+col]=a.norm.output[std::size_t(branch)*H+col_base+col];
+  }
+  __syncthreads();
+  if(tid<32u) {
+   float mixed=0.0f;
+#pragma unroll
+   for(unsigned branch=0u;branch<4u;++branch)
+    mixed=fmaf(primary_lds[branch*32u+tid],residual_lds[branch*32u+tid],mixed);
+   a.mixed[col_base+tid]=mixed*0.25f;
+  }
+  ++buf;
+ }
+}
 } // namespace llaminar2::rocm::full_hc_native
 namespace llaminar2::rocm {
 /**
@@ -387,11 +551,19 @@ __device__ __forceinline__ void fullNativeHCFFNPrefix(const FullNativeHCFFNPrefi
  // every resident CTA; active row counts and all tensor data stay device-owned.
  if(blockDim.x!=1024||!dynamic_bytes||dynamic_bytes>32768||(dynamic_bytes&15u)||!dynamic_storage)__builtin_trap();
  float* arena=reinterpret_cast<float*>(dynamic_storage);const unsigned words=unsigned(dynamic_bytes/4);
+ const unsigned down_blocks=unsigned(a.down_weights.k)>>5;
+ const unsigned parts=unsigned(a.partitions);
+ // Preserve idle-CTA early prefetch of HC-down packets during BranchRMSNorm
+ // and avoid the redundant global down_partials write+reload round-trip.
+ const bool fast_down=false;
+ (void)down_blocks; (void)parts;
+ const unsigned up_groups=unsigned(a.up.weights.blocks_per_row);
+ const bool fast_up=(H&31u)==0u&&up_groups>0u&&words>=2u*4u*up_groups*32u*2u;
  const auto owner=fullHCDownOwnership(blockIdx.x,gridDim.x,R);
  DownPanel panel{};
- if(owner.columns)panel=downPanel(a,owner.columns,words);
  Packet first{},second{};
- const bool early=gridDim.x>4&&blockIdx.x>=4;
+ const bool early=!fast_down&&gridDim.x>4&&blockIdx.x>=4;
+ if(!fast_down&&owner.columns)panel=downPanel(a,owner.columns,words);
  if(early) {first=firstPacket(a,owner,panel,tid);second=firstPacket(a,owner,panel,tid+1024);}
  const int norm_rows=a.norm.extent.liveRows?*a.norm.extent.liveRows:1;
  if(norm_rows<0||norm_rows>1)__builtin_trap();
@@ -403,16 +575,26 @@ __device__ __forceinline__ void fullNativeHCFFNPrefix(const FullNativeHCFFNPrefi
    // their original globally published POST/gain, with exactly the same math.
    const unsigned cache=unsigned(fullHCMin(H,((words-256)/2)/32*32));
    float* post_cache=arena+256;float* gain_cache=post_cache+cache;
-   const auto base=std::size_t(task)*H;
-   const float gate=qwen4exp::branch_norm_native::residualGate(prefix.write.gateLogits[task]);
-   const qwen4exp::branch_norm_native::ResidualBranchInput original{
-    prefix.write.residual+base,prefix.write.block,prefix.write.output+base,gate};
-   for(unsigned channel=tid;channel<H;channel+=1024) {
-    const float gain=a.norm.gain[base+channel],post=original.publish(channel);
-    if(channel<cache){post_cache[channel]=post;gain_cache[channel]=gain;}
-   }
-   __syncthreads();
-   const StagedBranchInput input{post_cache,prefix.write.output+base,cache};
+    const auto base=std::size_t(task)*H;
+    const float* published_post=nullptr;
+    if(prefix.write.residual) {
+     const float gate=qwen4exp::branch_norm_native::residualGate(prefix.write.gateLogits[task]);
+     const qwen4exp::branch_norm_native::ResidualBranchInput original{
+      prefix.write.residual+base,prefix.write.block,prefix.write.output+base,gate};
+     for(unsigned channel=tid;channel<H;channel+=1024) {
+      const float gain=a.norm.gain[base+channel],post=original.publish(channel);
+      if(channel<cache){post_cache[channel]=post;gain_cache[channel]=gain;}
+     }
+     published_post=prefix.write.output+base;
+    } else {
+     for(unsigned channel=tid;channel<H;channel+=1024) {
+      const float gain=a.norm.gain[base+channel],post=a.norm.input[base+channel];
+      if(channel<cache){post_cache[channel]=post;gain_cache[channel]=gain;}
+     }
+     published_post=a.norm.input+base;
+    }
+    __syncthreads();
+    const StagedBranchInput input{post_cache,published_post,cache};
    qwen4exp::branch_norm_native::taskFromBranchInput(input,a.norm.gain+base,a.norm.output,
     H,a.norm.epsilon,task,arena,tid,tid<256,
     RegisterNormQ8Output{gain_cache,a.norm.gain+base,cache,codes,scales});
@@ -431,15 +613,26 @@ __device__ __forceinline__ void fullNativeHCFFNPrefix(const FullNativeHCFFNPrefi
  }
  grid.sync(); // All public normalized/Q8 words; old incoming write gates retired.
  injection(a,arena);
- down(a,owner,panel,first,second,early,arena,words);
+ if(fast_down)fastCoalescedDown(a,dynamic_storage,words);
+ else down(a,owner,panel,first,second,early,arena,words);
  grid.sync(); // All raw outputs; input_codes/scales may now become the shorter up banks.
  const bool publish=a.publication.rows.activeRows()!=0;
  if(tid<R) {
+  float raw_val;
+  if(fast_down) {
+   const float* dp=a.down_partials+tid;
+   if(parts==1u)raw_val=dp[0];
+   else {
+    raw_val=0.0f;
+    for(unsigned p=0u;p<parts;++p)raw_val=device_fp32_contract::add(raw_val,dp[std::size_t(p)*R]);
+   }
+   if(blockIdx.x==0u)a.raw_down[tid]=raw_val;
+  } else raw_val=a.raw_down[tid];
   if(publish) {
    auto output=a.publication;
    output.activated=local.activated;output.primary=local.primary;output.residual=local.residual;
    output.primaryScales=local.primary_scales;output.residualScales=local.residual_scales;
-   hc_down_publication::publish(a.raw_down[tid],output,tid,
+   hc_down_publication::publish(raw_val,output,tid,
     hc_down_publication::NativePositiveHalfScalePublication{});
   } else {local.primary[tid]=a.up.primary[tid];local.residual[tid]=a.up.residual[tid];}
  }
@@ -453,7 +646,10 @@ __device__ __forceinline__ void fullNativeHCFFNPrefix(const FullNativeHCFFNPrefi
   if(tid<R/32){a.publication.primaryScales[tid]=local.primary_scales[tid];
    a.publication.residualScales[tid]=local.residual_scales[tid];}
  }
- if(a.up.rows.activeRows())up(a,local,arena,words,prefix.output_demand);
+ if(a.up.rows.activeRows()) {
+  if(fast_up)fastCoalescedUp(a,local,arena,prefix.output_demand);
+  else up(a,local,arena,words,prefix.output_demand);
+ }
  grid.sync(); // Mixed/injection ready; all replicated raw readers and local up users retired.
  if(prefix.output_demand.contains(FullNativeHCFFNOutputRole::HCActivated)&&publish&&blockIdx.x==0&&tid<R)
   a.publication.activated[tid]=local.activated[tid];

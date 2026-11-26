@@ -1275,6 +1275,18 @@ namespace llaminar2
                     throw std::invalid_argument("Tensor-sharded GPU/CPU routed experts require compact mapped route publication");
                 selected = {.ordinary_prefill = Transport::MappedSparse, .decode = Transport::MappedSparse};
             }
+            else if (bound->topology == RoutedExpertPlacementTopology::TieredOverlay &&
+                     bound->routed_tiers.size() > 1u &&
+                     continuation->routed_compute_policy == RoutedExpertComputePolicy::Apportioned &&
+                     diagnostic != MoEOverlayNodeLocalRouteTransport::NativeCollective)
+            {
+                // Multi-tier Apportioned continuations own only a sparse subset of routed
+                // slots during ordinary prefill; a dense collective across continuation peers
+                // would communicate unowned zero rows for every remote-tier route, violating
+                // Communication Volume. Use compact MappedSparse for ordinary prefill while
+                // preserving NativeCollective for single-row decode.
+                selected.ordinary_prefill = MoEOverlayNodeLocalRouteTransport::MappedSparse;
+            }
             if (plan.observed_route_transport && *plan.observed_route_transport!=selected)
                 throw std::invalid_argument("MoE route hardware binding changed its immutable transport policy");
             bound->observed_route_transport=selected;

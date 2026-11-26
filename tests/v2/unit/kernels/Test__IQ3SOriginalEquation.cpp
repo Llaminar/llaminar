@@ -63,10 +63,19 @@ TEST(IQ3SOriginalEquation, ScalarAndCompiledSIMDOriginalEquation)
 #else
         for(int chunk=0;chunk<packed.N_padded/64;++chunk) {
             alignas(64) std::array<float,64> avx2{},avx512{};
-            gemv_avx2_chunk_non_nibble(packed,input.data(),avx2.data(),chunk,0,eq::k/32);
+            if (packed.usesNibbleLUT()) {
+                const __m256i avx2_lut = build_decode_lut_avx2_for_codebook(packed.codebook_id);
+                gemv_avx2_chunk_native(packed,input.data(),avx2.data(),chunk,0,eq::k/32,avx2_lut);
 #if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
-            gemv_native_quantised_avx512_chunk_non_nibble(packed,input.data(),avx512.data(),chunk,0,eq::k/32);
+                const __m512i avx512_lut = build_decode_lut(packed.codebook_id);
+                gemv_native_quantised_avx512_chunk_native(packed,input.data(),avx512.data(),chunk,0,eq::k/32,avx512_lut);
 #endif
+            } else {
+                gemv_avx2_chunk_non_nibble(packed,input.data(),avx2.data(),chunk,0,eq::k/32);
+#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
+                gemv_native_quantised_avx512_chunk_non_nibble(packed,input.data(),avx512.data(),chunk,0,eq::k/32);
+#endif
+            }
             for(int n=0;n<64 && chunk*64+n<source.n;++n) {
                 const int column=chunk*64+n;const auto expected=std::bit_cast<uint32_t>(eq::expected(source,column,active,sign));
                 EXPECT_EQ(std::bit_cast<uint32_t>(scalar[column]),expected)<<column;

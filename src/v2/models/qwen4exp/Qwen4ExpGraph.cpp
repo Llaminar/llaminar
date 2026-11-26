@@ -34,8 +34,9 @@
 #include "../../tensors/Tensors.h"
 #include "../../transfer/TransferEngine.h"
 #include "../../utils/DebugEnv.h"
-#ifdef HAVE_ROCM
+#if defined(HAVE_ROCM) || defined(HAVE_CUDA)
 #include "execution/compute_stages/stages/qwen4exp/RetainedGDNPreAttentionStage.h"
+#include "execution/compute_stages/stages/qwen4exp/RetainedQSAAttentionStage.h"
 #include "models/qwen4exp/Qwen4ExpRetainedGDNPreAttentionPolicy.h"
 #endif
 #include <algorithm>
@@ -74,11 +75,14 @@ void Qwen4ExpGraph::postLayerComposition(ComputeGraph &graph, const LayerComposi
     const auto &input=*forward_input_construction_;
     if(input.execution_phase!=ForwardExecutionPhase::Decode ||
        input.execution_role!=ForwardExecutionRole::MainInference || input.seq_len!=1 || input.batch_size!=1)return;
-    const bool qualified_domain = config_.moe.routed_expert_plan &&
-        config_.moe.routed_expert_plan->usesQFNMI50TP4();
+    const bool qualified_mi50_gdn = config_.moe.routed_expert_plan &&
+        config_.moe.routed_expert_plan->usesGFX906MI50Kernels();
+    const bool qualified_mi50 = qualified_mi50_gdn &&
+        !hasMappedGPUCPUIntermediateShardTopology(*config_.moe.routed_expert_plan);
+    const bool qualified_domain = qualified_mi50;
 #ifdef HAVE_ROCM
     if (isGDNLayer(composition.layer) && usesRetainedGDNPreAttention(
-            qfnRetainedGDNPreAttentionEnabled(qualified_domain &&
+            qfnRetainedGDNPreAttentionEnabled(qualified_mi50_gdn &&
                 config_.flash_next->supportsRetainedGDN(composition.layer, debugEnv().gemm.gdn_projection_arithmetic)),
             composition.device, config_.moe.routed_compute_policy, input.execution_phase,
             input.execution_role, input.seq_len, input.batch_size))
@@ -86,16 +90,54 @@ void Qwen4ExpGraph::postLayerComposition(ComputeGraph &graph, const LayerComposi
         lowerRetainedQwenGDNPreAttention(graph, "layer" + std::to_string(composition.layer) + "_gdn_proj",
                                          composition.input_boundary);
     }
+    if (!isGDNLayer(composition.layer) && usesRetainedROCmQSAAttention(
+            qfnRetainedROCmQSAAttentionEnabled(qualified_mi50_gdn),
+            composition.device, input.execution_phase, input.execution_role,
+            input.seq_len, input.batch_size))
+    {
+        lowerRetainedROCmQSAAttention(graph, "layer" + std::to_string(composition.layer) + "_",
+                                      composition.input_boundary);
+    }
+#endif
+#ifdef HAVE_CUDA
+    if (composition.device.is_cuda() && isGDNLayer(composition.layer) &&
+        usesRetainedCUDAGDN(
+            qfnRetainedCUDAGDNEnabled(
+                config_.flash_next->supportsRetainedGDN(composition.layer, debugEnv().gemm.gdn_projection_arithmetic)),
+            composition.device, input.execution_phase, input.execution_role,
+            input.seq_len, input.batch_size))
+    {
+        lowerRetainedCUDAGDN(graph, "layer" + std::to_string(composition.layer) + "_gdn_proj",
+                             composition.input_boundary);
+    }
+    if (composition.device.is_cuda() && !isGDNLayer(composition.layer) &&
+        usesRetainedCUDAQSAAttention(
+            qfnRetainedCUDAQSAAttentionEnabled(true),
+            composition.device, input.execution_phase, input.execution_role,
+            input.seq_len, input.batch_size))
+    {
+        lowerRetainedCUDAQSAAttention(graph, "layer" + std::to_string(composition.layer) + "_",
+                                      composition.input_boundary);
+    }
 #endif
     const auto &internalBoundary = composition.attention_terminal;
     const auto *boundary=graph.getNode(internalBoundary);
     if(composition.device.is_cuda() && config_.moe.routed_expert_plan &&
-        hasMappedGPUCPUIntermediateShardTopology(*config_.moe.routed_expert_plan) &&
+        hasCUDAMappedRetainedM1OverlayTopology(*config_.moe.routed_expert_plan) &&
         qfnCUDAMappedRetainedM1HCFFNCandidate())
     {
         lowerCUDAMappedRetainedM1HCFFN(graph,internalBoundary);
         return;
     }
+#ifdef HAVE_ROCM
+    if(composition.device.is_rocm() && config_.moe.routed_expert_plan &&
+        hasMappedGPUCPUIntermediateShardTopology(*config_.moe.routed_expert_plan) &&
+        qualified_mi50_gdn && qfnROCmMappedRetainedM1HCFFNCandidate())
+    {
+        lowerROCmMappedRetainedM1HCFFN(graph,internalBoundary);
+        return;
+    }
+#endif
     if(useQwen4ExpRetainedM1HCFFN(qfnRetainedM1HCFFNEnabled(qualified_domain &&
         config_.flash_next->hasRetainedM1HCFFNSources(composition.layer)),
         input.execution_phase,input.execution_role,input.seq_len,input.batch_size)) {
@@ -108,6 +150,15 @@ void Qwen4ExpGraph::postLayerComposition(ComputeGraph &graph, const LayerComposi
         lowerRetainedM1HCFFNMainInference(graph,internalBoundary);
         return;
     }
+#ifdef HAVE_ROCM
+    if (composition.device.is_rocm())
+    {
+        (void)Qwen4ExpHyperconnectionBuilder::tryFusePreviousWriteIntoPersistentRead(
+            graph, composition.input_boundary);
+        (void)Qwen4ExpHyperconnectionBuilder::tryFusePreviousWriteIntoPersistentRead(
+            graph, internalBoundary);
+    }
+#endif
 }
 void Qwen4ExpGraph::appendPrefixCacheFingerprintMaterial(PrefixFingerprintMaterial &material) const
 {

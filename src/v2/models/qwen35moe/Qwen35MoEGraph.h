@@ -774,6 +774,12 @@ namespace llaminar2
          */
         bool prefix_runtime_device_rehydration_pending_ = false;
 
+        struct FFNBuildContext;
+        /** @brief Lower the heterogeneous/tiered ExpertOverlay branch of buildFFNGraphForLayer. */
+        void buildFFNExpertOverlayBranch(FFNBuildContext &ctx);
+        /** @brief Lower shared-expert FFN, combine, residual, and diagnostics for buildFFNGraphForLayer. */
+        void buildFFNSharedAndFinalizeSection(FFNBuildContext &ctx);
+
         /**
          * @brief Persistent one-row buffers populated by optional graph diagnostics.
          *

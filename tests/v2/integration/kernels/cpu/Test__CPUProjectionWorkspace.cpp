@@ -8,6 +8,7 @@
  * not a replacement for captured model parity or a performance certificate.
  */
 #include "kernels/cpu/gemm/CPUNativeQuantisedGemmKernel.h"
+#include "kernels/cpu/rotation/ActivationRotation.h"
 #include "kernels/cpu/gemm/FloatingPointGemmKernel.h"
 #include "execution/compute_stages/stages/LMHeadStage.h"
 #include "utils/CPUProjectionTestWorkspace.h"

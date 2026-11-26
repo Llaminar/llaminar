@@ -193,7 +193,8 @@ namespace llaminar2
         const ExpertTierGpuConstProjectionView &source,
         std::span<std::uint8_t> final_cpu_bytes,
         const ExpertTierSourceReadiness &source_readiness,
-        std::string *error) noexcept
+        std::string *error,
+        ExpertTierDeviceTimingCapture timing_capture) noexcept
     {
         if (!materialized())
         {
@@ -204,6 +205,12 @@ namespace llaminar2
             progress_ == ExpertTierWeightTransferProgress::Failed)
         {
             assignError(error, "GPU-to-CPU tier transfer lane is already occupied");
+            return false;
+        }
+        if (timing_capture == ExpertTierDeviceTimingCapture::Enabled &&
+            !config_.collect_timing_measurements)
+        {
+            assignError(error, "GPU-to-CPU tier transfer requested device timing on an unmaterialized lane");
             return false;
         }
         if (!layout.valid() ||
@@ -250,6 +257,9 @@ namespace llaminar2
         in_flight_bytes_ = 0;
         work_may_be_in_flight_ = false;
         fail_after_in_flight_event_ = false;
+        active_timing_enabled_ =
+            config_.collect_timing_measurements &&
+            timing_capture != ExpertTierDeviceTimingCapture::Disabled;
         in_flight_timing_valid_ = false;
         transfer_device_nanoseconds_ = 0;
         transfer_host_nanoseconds_ = 0;
@@ -265,7 +275,8 @@ namespace llaminar2
         const ExpertTierWeightDeviceLayout &layout,
         std::span<const std::uint8_t> cpu_bytes,
         const ExpertTierGpuMutableProjectionView &destination,
-        std::string *error) noexcept
+        std::string *error,
+        ExpertTierDeviceTimingCapture timing_capture) noexcept
     {
         if (!materialized())
         {
@@ -276,6 +287,12 @@ namespace llaminar2
             progress_ == ExpertTierWeightTransferProgress::Failed)
         {
             assignError(error, "CPU-to-GPU tier transfer lane is already occupied");
+            return false;
+        }
+        if (timing_capture == ExpertTierDeviceTimingCapture::Enabled &&
+            !config_.collect_timing_measurements)
+        {
+            assignError(error, "CPU-to-GPU tier transfer requested device timing on an unmaterialized lane");
             return false;
         }
         if (!layout.valid() ||
@@ -309,6 +326,9 @@ namespace llaminar2
         in_flight_bytes_ = 0;
         work_may_be_in_flight_ = false;
         fail_after_in_flight_event_ = false;
+        active_timing_enabled_ =
+            config_.collect_timing_measurements &&
+            timing_capture != ExpertTierDeviceTimingCapture::Disabled;
         in_flight_timing_valid_ = false;
         transfer_device_nanoseconds_ = 0;
         transfer_host_nanoseconds_ = 0;
@@ -322,20 +342,22 @@ namespace llaminar2
 
     bool ExpertTierWeightTransferLane::startGpuToCpuContiguous(
         const ContiguousFloatingPointWeightDescriptor& source,std::span<uint8_t> cpu,
-        const ExpertTierSourceReadiness& readiness,std::string* error) noexcept
+        const ExpertTierSourceReadiness& readiness,std::string* error,
+        ExpertTierDeviceTimingCapture timing_capture) noexcept
     {
         if(!source.valid()){assignError(error,"Floating source descriptor is invalid");return false;}
         const MoEExpertProjectionOwnership::Projection whole{MoEProjectionResidence::ExpertOwner,source.n,source.k,0,source.n,0,source.k};
         return startGpuToCpuContiguous(source,cpu,readiness,
-            ExpertTierWeightProjectionIntersection::between(whole,whole),error);
+            ExpertTierWeightProjectionIntersection::between(whole,whole),error,timing_capture);
     }
     bool ExpertTierWeightTransferLane::startCpuToGpuContiguous(
-        std::span<const uint8_t> cpu,const ContiguousFloatingPointWeightDescriptor& destination,std::string* error) noexcept
+        std::span<const uint8_t> cpu,const ContiguousFloatingPointWeightDescriptor& destination,std::string* error,
+        ExpertTierDeviceTimingCapture timing_capture) noexcept
     {
         if(!destination.valid()){assignError(error,"Floating destination descriptor is invalid");return false;}
         const MoEExpertProjectionOwnership::Projection whole{MoEProjectionResidence::ExpertOwner,destination.n,destination.k,0,destination.n,0,destination.k};
         return startCpuToGpuContiguous(cpu,destination,
-            ExpertTierWeightProjectionIntersection::between(whole,whole),error);
+            ExpertTierWeightProjectionIntersection::between(whole,whole),error,timing_capture);
     }
 
     bool ExpertTierWeightTransferLane::startGpuToCpuContiguous(
@@ -343,7 +365,8 @@ namespace llaminar2
         std::span<std::uint8_t> final_cpu_bytes,
         const ExpertTierSourceReadiness &source_readiness,
         const ExpertTierWeightProjectionIntersection& intersection,
-        std::string *error) noexcept
+        std::string *error,
+        ExpertTierDeviceTimingCapture timing_capture) noexcept
     {
         if (!materialized())
         {
@@ -358,6 +381,12 @@ namespace llaminar2
             assignError(
                 error,
                 "GPU-to-CPU contiguous tier transfer lane is already occupied");
+            return false;
+        }
+        if (timing_capture == ExpertTierDeviceTimingCapture::Enabled &&
+            !config_.collect_timing_measurements)
+        {
+            assignError(error, "GPU-to-CPU contiguous tier transfer requested device timing on an unmaterialized lane");
             return false;
         }
         const auto& gpu=intersection.source();const auto& cpu=intersection.destination();
@@ -406,6 +435,9 @@ namespace llaminar2
         in_flight_bytes_ = 0;
         work_may_be_in_flight_ = false;
         fail_after_in_flight_event_ = false;
+        active_timing_enabled_ =
+            config_.collect_timing_measurements &&
+            timing_capture != ExpertTierDeviceTimingCapture::Disabled;
         in_flight_timing_valid_ = false;
         transfer_device_nanoseconds_ = 0;
         transfer_host_nanoseconds_ = 0;
@@ -421,7 +453,8 @@ namespace llaminar2
         std::span<const std::uint8_t> cpu_bytes,
         const ContiguousFloatingPointWeightDescriptor &destination,
         const ExpertTierWeightProjectionIntersection& intersection,
-        std::string *error) noexcept
+        std::string *error,
+        ExpertTierDeviceTimingCapture timing_capture) noexcept
     {
         if (!materialized())
         {
@@ -436,6 +469,12 @@ namespace llaminar2
             assignError(
                 error,
                 "CPU-to-GPU contiguous tier transfer lane is already occupied");
+            return false;
+        }
+        if (timing_capture == ExpertTierDeviceTimingCapture::Enabled &&
+            !config_.collect_timing_measurements)
+        {
+            assignError(error, "CPU-to-GPU contiguous tier transfer requested device timing on an unmaterialized lane");
             return false;
         }
         const auto& gpu=intersection.destination();const auto& cpu=intersection.source();
@@ -472,6 +511,9 @@ namespace llaminar2
         in_flight_bytes_ = 0;
         work_may_be_in_flight_ = false;
         fail_after_in_flight_event_ = false;
+        active_timing_enabled_ =
+            config_.collect_timing_measurements &&
+            timing_capture != ExpertTierDeviceTimingCapture::Disabled;
         in_flight_timing_valid_ = false;
         transfer_device_nanoseconds_ = 0;
         transfer_host_nanoseconds_ = 0;
@@ -623,7 +665,7 @@ namespace llaminar2
             return publishServiceChunk(byte_offset, unit_count, bytes, error);
 
         bool timing_started = true;
-        if (config_.collect_timing_measurements)
+        if (active_timing_enabled_)
         {
             timing_started = backend_->recordEvent(
                 chunk_timing_start_event_,
@@ -689,7 +731,7 @@ namespace llaminar2
         }
 
         bool timing_stopped = true;
-        if (config_.collect_timing_measurements)
+        if (active_timing_enabled_)
         {
             timing_stopped = backend_->recordEvent(
                 chunk_timing_stop_event_,
@@ -726,7 +768,7 @@ namespace llaminar2
                                ? "Tier transfer failed to submit a conversion/copy chunk"
                                : "Tier transfer failed to record exact timing events";
             if (!in_flight_timing_valid_ &&
-                config_.collect_timing_measurements)
+                active_timing_enabled_)
             {
                 ++stats_.timing_measurement_failures;
             }
@@ -820,7 +862,7 @@ namespace llaminar2
                 return fail(failure_, error);
             }
             ready = result == MappedTransferProgress::Ready;
-            if (ready && config_.collect_timing_measurements)
+            if (ready && active_timing_enabled_)
             {
                 const auto elapsed = command->completedDeviceNanoseconds();
                 if (!elapsed)
@@ -841,7 +883,7 @@ namespace llaminar2
         }
 
         work_may_be_in_flight_ = false;
-        if (config_.collect_timing_measurements &&
+        if (active_timing_enabled_ &&
             in_flight_timing_valid_ &&
             !collectCompletedChunkTiming(error))
         {
@@ -952,7 +994,7 @@ namespace llaminar2
             {{"lane", config_.lane_name},
              {"direction", directionName(gpu_to_cpu)},
              {"device", config_.device.to_string()}});
-        if (config_.collect_timing_measurements)
+        if (active_timing_enabled_)
         {
             PerfStatsCollector::recordTimingNs(
                 "moe_overlay_residency",

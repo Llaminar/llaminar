@@ -661,6 +661,22 @@ namespace llaminar2
         return &d_head_params_[idx];
     }
 
+    int *ROCmRingKVCacheBase::mutableDeviceCachedTokenCountPtr(int layer, int seq_idx)
+    {
+        if (!d_count_params_ || !validLayerSeq(layer, seq_idx))
+            return nullptr;
+        const int idx = layer * batch_size_ + seq_idx;
+        return &d_count_params_[idx];
+    }
+
+    int *ROCmRingKVCacheBase::mutableDeviceRingHeadPtr(int layer, int seq_idx)
+    {
+        if (!d_head_params_ || !validLayerSeq(layer, seq_idx))
+            return nullptr;
+        const int idx = layer * batch_size_ + seq_idx;
+        return &d_head_params_[idx];
+    }
+
     const int *ROCmRingKVCacheBase::deviceSequenceCachedTokenCountPtr(int seq_idx) const
     {
         return d_count_params_ && seq_idx >= 0 && seq_idx < batch_size_

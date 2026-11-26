@@ -8,6 +8,7 @@
  */
 #include "PrefixArchiveSourceContract.h"
 #include <gtest/gtest.h>
+#include "../../../SourceShardReader.h"
 #include <string>
 #include <fstream>
 #include <sstream>
@@ -42,9 +43,9 @@ TEST(PrefixArchiveSourceContract, AcceptsTypedCallbackAndPostMutationCommit)
 /** @test The real populate method satisfies the callback/commit contract used by the broader DGO guard. */
 TEST(PrefixArchiveSourceContract, ProductionPopulateRetainsPublicationOrder)
 {
-    std::ifstream input("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
-    ASSERT_TRUE(input.good());
-    std::ostringstream content;content << input.rdbuf();const auto source=content.str();
+    const auto source = llaminar2::test_support::readSourceFileOrFamily(
+        "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+    ASSERT_FALSE(source.empty());
     const auto begin=source.find("bool DeviceGraphOrchestrator::populatePrefix(");
     ASSERT_NE(begin,std::string::npos);
     const auto end=source.find("bool DeviceGraphOrchestrator::restorePrefixTerminalState",begin);
@@ -182,11 +183,9 @@ TEST(PrefixArchiveSourceContract, RejectsDetachedCheckpointRestorePublication)
 /** @test The actual production restore method retains every source and all three ordered commits. */
 TEST(PrefixArchiveSourceContract, ProductionCheckpointRestoreRetainsPublicationOrder)
 {
-    std::ifstream input("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
-    ASSERT_TRUE(input.good());
-    std::ostringstream content;
-    content << input.rdbuf();
-    const auto source = content.str();
+    const auto source = llaminar2::test_support::readSourceFileOrFamily(
+        "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+    ASSERT_FALSE(source.empty());
     const auto begin = source.find("bool DeviceGraphOrchestrator::restoreLivePrefixState(");
     ASSERT_NE(begin, std::string::npos);
     const auto end = source.find("bool DeviceGraphOrchestrator::truncateLivePrefixState(", begin);

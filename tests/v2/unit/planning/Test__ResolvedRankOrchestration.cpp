@@ -361,7 +361,7 @@ TEST(ResolvedRankOrchestration, QFNMI50LocalTPRequiresCompleteMeasuredDomain)
     };
 
     EXPECT_EQ(select(), Policy::QFNMI50TP4);
-    EXPECT_EQ(select(false), Policy::Generic);
+    EXPECT_EQ(select(false), Policy::GFX906MI50);
     plan.domains.front().world_ranks = {0, 0, 0, 0};
     EXPECT_EQ(select(), Policy::Generic);
     plan.domains.front().world_ranks.clear();
@@ -371,7 +371,7 @@ TEST(ResolvedRankOrchestration, QFNMI50LocalTPRequiresCompleteMeasuredDomain)
     EXPECT_EQ(selectLocalGPUExpertKernelPolicy(plan, source, hardware, true,
                   Compute::Automatic), Policy::QFNMI50TP4);
     EXPECT_EQ(selectLocalGPUExpertKernelPolicy(plan, source, hardware, true,
-                  Compute::GateUpOwnedDownColumns), Policy::Generic);
+                  Compute::GateUpOwnedDownColumns), Policy::GFX906MI50);
     plan.domains.front().routed_compute_policy = Compute::TensorSharded;
 
     hardware.ranks[0].gpus.back().native_isa = "gfx1100";
@@ -383,13 +383,13 @@ TEST(ResolvedRankOrchestration, QFNMI50LocalTPRequiresCompleteMeasuredDomain)
     EXPECT_EQ(select(), Policy::QFNMI50TP4);
 
     plan.domains.front().participants.pop_back();
-    EXPECT_EQ(select(), Policy::Generic);
+    EXPECT_EQ(select(), Policy::GFX906MI50);
     plan.domains.front().participants = cohort.participants;
     plan.shared_expert_domain = "remote";
-    EXPECT_EQ(select(), Policy::Generic);
+    EXPECT_EQ(select(), Policy::GFX906MI50);
     plan.shared_expert_domain = "tp";
     source.flash_next.reset();
-    EXPECT_EQ(select(), Policy::Generic);
+    EXPECT_EQ(select(), Policy::GFX906MI50);
 
     // Bind the actual named, stationary single-tier authority before admission.
     source.flash_next.emplace();
@@ -454,8 +454,7 @@ TEST(ResolvedRankOrchestration, QFNMI50LocalTPRequiresCompleteMeasuredDomain)
         EXPECT_EQ(sealed.usesQFNMI50TP4(), intent != Compute::GateUpOwnedDownColumns);
         EXPECT_EQ(sealed.domains.front().routed_compute_policy, intent == Compute::Automatic ? Compute::TensorSharded : intent);
         const char *override = std::getenv("LLAMINAR_GPU_EXPERT_BALANCE_NATIVE_TILES");
-        const bool expected_balanced = override ? std::string_view(override) == "1"
-                                                : intent != Compute::GateUpOwnedDownColumns;
+        const bool expected_balanced = override ? std::string_view(override) == "1" : true;
         EXPECT_EQ(sealed.gpu_expert_intermediate_tiling, expected_balanced
             ? GPUExpertIntermediateTiling::BalancedNativeK32 : GPUExpertIntermediateTiling::Coarse128);
     }
@@ -1569,5 +1568,133 @@ TEST(ResolvedRankOrchestration, CPUPipelineStageOriginalTPValidationUsesDeclared
                 EXPECT_THROW((void)OriginalPipelineStageDomain::borrow(declared,foreign),std::invalid_argument);
             }
         }
+    }
+}
+
+/**
+ * @test Arbitrary valid participant counts (singleton, odd, 2/4/8x GPU, 1/2/3x CPU, mixed CUDA+ROCm+CPU)
+ *       admit cleanly without hardcoded device-count assumptions.
+ */
+TEST(ResolvedRankOrchestration, FlexibleMultiBackendTopologyCountsAdmissionContract)
+{
+    using Policy = LocalGPUExpertKernelPolicy;
+    ModelMemoryProfile profile;
+    profile.flash_next.emplace();
+    profile.d_model = 2560;
+    profile.expert_count = 512;
+    profile.expert_used_count = 10;
+    profile.expert_feed_forward_length = profile.expert_shared_feed_forward_length = 640;
+
+    // 1. Flexible ROCm MI50 counts (1, 2, 3 odd, 4, 8): only exact whole-model 4-card uses QFNMI50TP4;
+    //    all other positive MI50 counts (including odd and >4) receive GFX906MI50 without falling back.
+    for (int rocm_count : {1, 2, 3, 4, 8})
+    {
+        std::vector<DeviceInfo> gpus;
+        RoutedExpertDomain dom;
+        dom.name = "rocm_tp";
+        dom.scope = ExecutionDomainScope::RANK_LOCAL;
+        dom.owner_rank = 0;
+        dom.routed_compute_policy = RoutedExpertComputePolicy::TensorSharded;
+        for (int i = 0; i < rocm_count; ++i)
+        {
+            auto gpu = card(DeviceType::ROCm, i, 0);
+            gpu.native_isa = "gfx906";
+            gpu.compute_units = 60;
+            gpus.push_back(gpu);
+            dom.participants.push_back(GlobalDeviceAddress::fromLocalDeviceId(DeviceId::rocm(i), "node", 0));
+        }
+        const auto hw = inventory(1, gpus);
+        MoERoutedExpertPlacementPlan plan;
+        plan.continuation_domain = plan.base_model_domain = plan.shared_expert_domain = "rocm_tp";
+        plan.domains = {dom};
+        plan.routed_tiers.emplace_back().domain = "rocm_tp";
+        const auto selected = selectLocalGPUExpertKernelPolicy(plan, profile, hw, /*whole_model=*/true);
+        EXPECT_EQ(selected, rocm_count == 4 ? Policy::QFNMI50TP4 : Policy::GFX906MI50) << "rocm_count=" << rocm_count;
+    }
+
+    // 2. Flexible heterogeneous CUDA+ROCm counts: 2xCUDA+2xROCm, 2xCUDA+4xROCm, 2xCUDA+8xROCm, 1xCUDA+3xROCm (odd!).
+    for (const auto [cuda_count, rocm_count] : {std::pair{2, 2}, std::pair{2, 4}, std::pair{2, 8}, std::pair{1, 3}})
+    {
+        SCOPED_TRACE(::testing::Message() << cuda_count << "xCUDA+" << rocm_count << "xROCm");
+        ClusterInventory hw;
+        hw.world_size = 2;
+        hw.ranks.resize(2);
+        hw.ranks[0].rank = hw.ranks[0].local_rank = 0; hw.ranks[0].node_id = 0; hw.ranks[0].hostname = "node"; hw.ranks[0].numa_nodes = 2; hw.ranks[0].cpu.numa_node = 0; hw.ranks[0].cpu_cores = hw.ranks[0].cpu_worker_threads = 8;
+        hw.ranks[1].rank = hw.ranks[1].local_rank = 1; hw.ranks[1].node_id = 0; hw.ranks[1].hostname = "node"; hw.ranks[1].numa_nodes = 2; hw.ranks[1].cpu.numa_node = 1; hw.ranks[1].cpu_cores = hw.ranks[1].cpu_worker_threads = 8;
+        RoutedExpertDomain cuda_dom;
+        cuda_dom.name = "cuda_hot"; cuda_dom.scope = ExecutionDomainScope::RANK_LOCAL; cuda_dom.owner_rank = 0;
+        cuda_dom.backend = CollectiveBackendType::NCCL;
+        cuda_dom.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
+        for (int i = 0; i < cuda_count; ++i)
+        {
+            auto g = card(DeviceType::CUDA, i, 0);
+            g.native_isa = "sm_86";
+            hw.ranks[0].gpus.push_back(g);
+            cuda_dom.participants.push_back(GlobalDeviceAddress::fromLocalDeviceId(DeviceId::cuda(i), "node", 0));
+        }
+        RoutedExpertDomain rocm_dom;
+        rocm_dom.name = "rocm_warm"; rocm_dom.scope = ExecutionDomainScope::RANK_LOCAL; rocm_dom.owner_rank = 1;
+        rocm_dom.backend = CollectiveBackendType::RCCL;
+        rocm_dom.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
+        for (int i = 0; i < rocm_count; ++i)
+        {
+            auto g = card(DeviceType::ROCm, i, 1);
+            g.native_isa = "gfx906"; g.compute_units = 60;
+            hw.ranks[1].gpus.push_back(g);
+            rocm_dom.participants.push_back(GlobalDeviceAddress::fromLocalDeviceId(DeviceId::rocm(i), "node", 1));
+        }
+        declareNoPeerTopology(hw);
+        hw.buildNodeAggregations();
+        MoERoutedExpertPlacementPlan plan;
+        plan.enabled = true;
+        plan.topology = RoutedExpertPlacementTopology::TieredOverlay;
+        plan.continuation_domain = plan.base_model_domain = plan.shared_expert_domain = "cuda_hot";
+        plan.domains = {cuda_dom, rocm_dom};
+        plan.routed_tiers.push_back({.name = "hot", .domain = "cuda_hot", .priority = 0, .max_experts_per_layer = 192});
+        plan.routed_tiers.push_back({.name = "warm", .domain = "rocm_warm", .priority = 1, .max_experts_per_layer = 0, .fallback = true});
+        const auto bound = bindMoEExpertOverlayPlanToClusterInventory(plan, hw);
+        ASSERT_NE(bound, nullptr);
+        EXPECT_EQ(bound->domains[0].participants.size(), static_cast<std::size_t>(cuda_count));
+        EXPECT_EQ(bound->domains[1].participants.size(), static_cast<std::size_t>(rocm_count));
+        EXPECT_EQ(selectLocalGPUExpertKernelPolicy(*bound, profile, hw, true), Policy::Generic);
+    }
+
+    // 3. Flexible pure-CPU counts: 1xCPU (singleton), 2xCPU (TP2 sharded), 3xCPU (odd TP3 sharded).
+    for (int cpu_ranks : {1, 2, 3})
+    {
+        SCOPED_TRACE(::testing::Message() << cpu_ranks << "xCPU");
+        ClusterInventory hw;
+        hw.world_size = cpu_ranks;
+        hw.ranks.resize(static_cast<std::size_t>(cpu_ranks));
+        RoutedExpertDomain cpu_dom;
+        cpu_dom.name = "cpu_tp";
+        cpu_dom.scope = cpu_ranks == 1 ? ExecutionDomainScope::SINGLE : ExecutionDomainScope::NODE_LOCAL;
+        cpu_dom.owner_rank = 0;
+        cpu_dom.backend = cpu_ranks == 1 ? CollectiveBackendType::HOST : CollectiveBackendType::UPI;
+        cpu_dom.routed_compute_policy = RoutedExpertComputePolicy::TensorSharded;
+        for (int r = 0; r < cpu_ranks; ++r)
+        {
+            auto &rk = hw.ranks[static_cast<std::size_t>(r)];
+            rk.rank = rk.local_rank = r;
+            rk.node_id = 0;
+            rk.hostname = "node";
+            rk.numa_nodes = cpu_ranks;
+            rk.cpu.numa_node = r;
+            rk.cpu_cores = rk.cpu_worker_threads = 8;
+            cpu_dom.participants.push_back(GlobalDeviceAddress::cpu(r, "node"));
+            if (cpu_ranks > 1) cpu_dom.world_ranks.push_back(r);
+        }
+        declareNoPeerTopology(hw);
+        hw.buildNodeAggregations();
+        MoERoutedExpertPlacementPlan plan;
+        plan.enabled = true;
+        plan.topology = RoutedExpertPlacementTopology::TieredOverlay;
+        plan.continuation_domain = plan.base_model_domain = plan.shared_expert_domain = "cpu_tp";
+        plan.domains = {cpu_dom};
+        plan.routed_tiers.push_back({.name = "cpu_all", .domain = "cpu_tp", .priority = 0, .max_experts_per_layer = 0, .fallback = true});
+        const auto bound = bindMoEExpertOverlayPlanToClusterInventory(plan, hw);
+        ASSERT_NE(bound, nullptr);
+        EXPECT_EQ(bound->domains[0].participants.size(), static_cast<std::size_t>(cpu_ranks));
+        EXPECT_EQ(selectLocalGPUExpertKernelPolicy(*bound, profile, hw, true), Policy::Generic);
     }
 }

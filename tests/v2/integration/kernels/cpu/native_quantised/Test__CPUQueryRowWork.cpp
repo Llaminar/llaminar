@@ -9,6 +9,7 @@
  * This is a private unexecuted regression draft for root's integration gate.
  */
 #include "kernels/cpu/gemm/CPUNativeQuantisedGemmKernel.h"
+#include "kernels/cpu/rotation/ActivationRotation.h"
 #include "utils/QuantizedVerifierFormats.h"
 #include "utils/CPUProjectionTestWorkspace.h"
 #include <gtest/gtest.h>

@@ -52,7 +52,7 @@ class OriginalOutputSliceSource(unittest.TestCase):
     """Check the actual backend entry/loop closures and seeded missing-edge negatives."""
 
     def test_existing_two_int_direction_is_preserved(self):
-        for backend, name in (("cpu", "CPUNativeQuantisedGemmKernel.h"),
+        for backend, name in (("cpu", "CPUNativeQuantisedGemmKernel.cpp"),
                               ("cuda", "CUDAQuantisedGemmKernel.cpp"),
                               ("rocm", "ROCmQuantisedGemmKernel.cpp")):
             text = source(f"src/v2/kernels/{backend}/gemm/{name}")
@@ -95,7 +95,7 @@ class OriginalOutputSliceSource(unittest.TestCase):
             "mutable PreparedGemmHandle/PreparedGemmWeights publication wrapper.", ""))
 
     def test_cpu_fused_members_keep_explicit_policy_and_physical_extent(self):
-        body = source("src/v2/kernels/cpu/gemm/CPUNativeQuantisedGemmKernel.h")
+        body = source("src/v2/kernels/cpu/gemm/CPUNativeQuantisedGemmKernel.cpp")
         self.assertIn(".policy_n = projections[i].original_output_slice", body)
         self.assertIn("fused_descs[i].policy_n = proj.original_output_slice", body)
         self.assertIn("descriptors[i].policy_n = projection.original_output_slice", body)
@@ -117,7 +117,13 @@ class OriginalOutputSliceSource(unittest.TestCase):
         self.assertIn("proj.name, &proj", text)
 
     def test_rocm_keeps_verifier_grouping_and_rejects_missing_scope_controls(self):
-        text = source("src/v2/kernels/rocm/gemm/ROCmQuantisedGemmKernel.cpp")
+        text = (
+            source("src/v2/kernels/rocm/gemm/ROCmQuantisedGemmKernelInternal.h")
+            + "\n"
+            + source("src/v2/kernels/rocm/gemm/ROCmQuantisedGemmKernel.cpp")
+            + "\n"
+            + source("src/v2/kernels/rocm/gemm/ROCmQuantisedGemmKernelDispatch.cpp")
+        )
         require_rocm_group(self, text)
         for bad in (text.replace("auto original_scope = projections[i].beginOriginalOutputSliceScope();", ""),
                     text.replace("rocmGemv_native_quantised_query_serial_m1_config_with_policy(", "wrong_query("),

@@ -15,7 +15,12 @@
 
 namespace llaminar2::rocm {
 /** @brief Explicit complete-local native program selected by the original graph owner. */
-enum class FullNativeHCFFNImplementation : std::uint8_t { Canonical,RetainedGFX906M1 };
+enum class FullNativeHCFFNImplementation : std::uint8_t { Canonical };
+/** @return Exact barrier slot byte extent for the canonical full HC/FFN implementation. */
+inline constexpr std::size_t fullNativeHCFFNSlotBytes(FullNativeHCFFNImplementation) noexcept
+{
+    return FullNativeHCFFNBarrierLayout::bytes;
+}
 /**
  * @brief Original HC prefix and its distinct instance-owned barrier subregion.
  * @details The backend owner supplies barrier_state at cold preparation. The

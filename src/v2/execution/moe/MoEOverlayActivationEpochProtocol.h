@@ -68,6 +68,8 @@ namespace llaminar2
             MoEOverlayActivationReturnRole::Ordinary; ///< Immutable logical return policy.
         std::int32_t cohort_target =
             -1; ///< Fixed original CPU cohort tag, never expert membership.
+        MoEOverlayActivationPrefillWirePolicy prefill_wire_policy =
+            MoEOverlayActivationPrefillWirePolicy::FP32Canonical; ///< Immutable MainPrefill wire format.
 
         /** @return Whether the rank pair, topology, and stage manifest are usable. */
         [[nodiscard]] bool valid() const noexcept;

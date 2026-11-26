@@ -39,28 +39,11 @@ namespace llaminar2
         bool whole_model, RoutedExpertComputePolicy requested_compute)
     {
         using Policy = LocalGPUExpertKernelPolicy;
-        // With a single complete tensor-sharded tier, every logical expert spans
-        // this same cohort. Enabling the movement controller cannot change its
-        // ownership. A second tier must qualify its own kernels and bank lifetime.
-        if (!whole_model ||
-            !model.flash_next || model.d_model != 2560 || model.expert_count != 512 ||
-            model.expert_used_count != 10 || model.expert_feed_forward_length != 640 ||
-            model.expert_shared_feed_forward_length != 640 ||
-            plan.domains.size() != 1 || plan.routed_tiers.size() != 1 || plan.shared_expert_domain != plan.continuation_domain ||
-            plan.effectiveBaseModelDomain() != plan.continuation_domain ||
-            plan.routed_tiers.front().domain != plan.continuation_domain)
-            return Policy::Generic;
-
         const auto domain = std::find_if(plan.domains.begin(), plan.domains.end(),
             [&](const auto &entry) { return entry.name == plan.continuation_domain; });
-        const bool maySelectTensorSharded = requested_compute == RoutedExpertComputePolicy::TensorSharded ||
-            requested_compute == RoutedExpertComputePolicy::Automatic;
-        if (!maySelectTensorSharded || domain == plan.domains.end() || domain->scope != ExecutionDomainScope::RANK_LOCAL ||
-            (domain->routed_compute_policy != RoutedExpertComputePolicy::TensorSharded &&
-             (requested_compute != RoutedExpertComputePolicy::Automatic ||
-              domain->routed_compute_policy != RoutedExpertComputePolicy::GateUpOwnedDownColumns)) ||
+        if (domain == plan.domains.end() || domain->scope != ExecutionDomainScope::RANK_LOCAL ||
             domain->owner_rank < 0 || static_cast<size_t>(domain->owner_rank) >= inventory.ranks.size() ||
-            domain->participants.size() != 4 || !domain->world_ranks.empty())
+            domain->participants.empty() || !domain->world_ranks.empty())
             return Policy::Generic;
 
         // Binding authenticates the devices of a rank-local domain against
@@ -76,8 +59,29 @@ namespace llaminar2
             const std::string_view target(gpu->native_isa);
             return target.substr(0, target.find(':')) == "gfx906";
         };
-        return std::all_of(domain->participants.begin(), domain->participants.end(), isMeasuredMI50)
-            ? Policy::QFNMI50TP4 : Policy::Generic;
+        if (!std::all_of(domain->participants.begin(), domain->participants.end(), isMeasuredMI50))
+            return Policy::Generic;
+
+        // With a single complete tensor-sharded tier of four MI50s, preserve
+        // the exact TP4 policy for TP4-width-specialized verifier/HC programs.
+        // All other qualified gfx906 MI50 cohorts (e.g. 2xMI50+2xCPU, 1/2/3/8xMI50)
+        // receive the topology-independent GFX906MI50 fast-kernel policy.
+        const bool maySelectTensorSharded = requested_compute == RoutedExpertComputePolicy::TensorSharded ||
+            requested_compute == RoutedExpertComputePolicy::Automatic;
+        const bool isQFNMI50TP4 = whole_model &&
+            model.flash_next && model.d_model == 2560 && model.expert_count == 512 &&
+            model.expert_used_count == 10 && model.expert_feed_forward_length == 640 &&
+            model.expert_shared_feed_forward_length == 640 &&
+            plan.domains.size() == 1 && plan.routed_tiers.size() == 1 &&
+            plan.shared_expert_domain == plan.continuation_domain &&
+            plan.effectiveBaseModelDomain() == plan.continuation_domain &&
+            plan.routed_tiers.front().domain == plan.continuation_domain &&
+            maySelectTensorSharded &&
+            (domain->routed_compute_policy == RoutedExpertComputePolicy::TensorSharded ||
+             (requested_compute == RoutedExpertComputePolicy::Automatic &&
+              domain->routed_compute_policy == RoutedExpertComputePolicy::GateUpOwnedDownColumns)) &&
+            domain->participants.size() == 4;
+        return isQFNMI50TP4 ? Policy::QFNMI50TP4 : Policy::GFX906MI50;
     }
 
     namespace
@@ -129,7 +133,7 @@ namespace llaminar2
         // an expert moves between CPU and GPU. Coarse tiles would change that tree.
         if (hasIdenticalNativeMixedTierCuts(plan, model))
             return GPUExpertIntermediateTiling::BalancedNativeK32;
-        return qfnGPUExpertPreferredIntermediateGrain(plan.usesQFNMI50TP4() ? 32 : 128) == 32
+        return qfnGPUExpertPreferredIntermediateGrain(plan.usesGFX906MI50Kernels() ? 32 : 128) == 32
             ? GPUExpertIntermediateTiling::BalancedNativeK32 : GPUExpertIntermediateTiling::Coarse128;
     }
 
@@ -182,7 +186,7 @@ namespace llaminar2
                     whole_model && config.pp_degree == 1 && config.cpu_layers == 0 &&
                     supportsGPUIntermediateShardMaintenance(config.moe_rebalance.mode, /*mapped_ticket=*/false),
                 compute);
-            if (bound->usesQFNMI50TP4() && compute == Compute::Automatic)
+            if (bound->usesGFX906MI50Kernels() && compute == Compute::Automatic)
             {
                 for (auto &domain : bound->domains)
                     if (domain.name == bound->continuation_domain)

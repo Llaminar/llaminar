@@ -343,6 +343,14 @@ namespace llaminar2
              * static residency leaves timing events unmaterialized.
              */
             bool collect_economy_measurements = false;
+            /**
+             * Control which wave purposes record device timing events when
+             * `collect_economy_measurements` is true. Production sets this to
+             * `EconomyCalibrationOnly` so placement waves avoid ROCm timing-event
+             * synchronization stalls while retaining exact calibration timing.
+             */
+            MoEOverlayMigrationMeasurementScope economy_measurement_scope =
+                MoEOverlayMigrationMeasurementScope::AllWaves;
             /** Stable topology label attached to PerfStats evidence. */
             std::string perf_device;
         };

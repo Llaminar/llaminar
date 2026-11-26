@@ -288,9 +288,9 @@ ALLOWANCES: tuple[Allowance, ...] = (
         # inference, and the one wait site belongs solely to this boundary.
         ("src/v2/execution/local_execution/graph/DeviceGraphExecutor.cpp", "DeviceGraphExecutor::acquireGraphSnapshotArenaOnHost", "backend_event", 1),
         ("src/v2/execution/local_execution/graph/StageTimeline.h", "collect", "worker_event", 1),
-        ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "DeviceGraphOrchestrator::exportCompletedDeviceMoERebalanceMaintenanceStats", "worker_stream", 1),
-        ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "completeMTPDiagnosticObservation", "backend_event", 1),
-        ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "logMTPGraphReuseBoundaryDiagnostics", "backend_event", 1),
+        ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestratorTopology.cpp", "DeviceGraphOrchestrator::exportCompletedDeviceMoERebalanceMaintenanceStats", "worker_stream", 1),
+        ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestratorInternal.h", "completeMTPDiagnosticObservation", "backend_event", 1),
+        ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestratorInternal.h", "logMTPGraphReuseBoundaryDiagnostics", "backend_event", 1),
         ("src/v2/kernels/cuda/gemm/CUDAQuantisedGemmKernel.cpp", "CUDAQuantisedGemmKernel::multiply_fused_tensor_impl", "raw_stream", 2),
         ("src/v2/kernels/cuda/gemm/CUDAQuantisedGemmKernel.cpp", "CUDAQuantisedGemmKernel::multiply_with_fused_swiglu", "raw_stream", 1),
         ("src/v2/kernels/cuda/gemm/CuBLASGemmKernel.cu", "CuBLASGemmKernel::execute_batched_same_a", "raw_stream", 1),
@@ -305,7 +305,7 @@ ALLOWANCES: tuple[Allowance, ...] = (
         "graph_ownership",
         ("src/v2/execution/local_execution/graph/DeviceGraphExecutor_GraphCapture.cpp", "DeviceGraphExecutor::GraphSegmentCache::waitForCaptureStreamFence", "worker_event", 1),
         ("src/v2/execution/local_execution/graph/DeviceGraphExecutor_GraphCapture.cpp", "waitForPublishedCaptureStreamTerminal", "worker_event", 1),
-        ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "initializeMoEOverlayEpochExecutionBinding", "backend_event", 1),
+        ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestratorTopology.cpp", "initializeMoEOverlayEpochExecutionBinding", "backend_event", 1),
     ),
     *reviewed(
         "heterogeneous_staging",
@@ -319,8 +319,8 @@ ALLOWANCES: tuple[Allowance, ...] = (
         ("src/v2/collective/backends/HostBackendROCm.cpp", "hipCopyToHost", "raw_stream", 1),
         ("src/v2/execution/local_execution/coherence/CrossDomainTransfer.cpp", "CrossDomainTransfer::transferCpuToGpuImpl", "backend_sync_copy", 1),
         ("src/v2/execution/local_execution/coherence/CrossDomainTransfer.cpp", "CrossDomainTransfer::transferGpuToCpuImpl", "backend_sync_copy", 1),
-        ("src/v2/execution/local_execution/orchestrators/RankOrchestrator.cpp", "RankOrchestrator::buildRankStochasticDistributionFromLocalTP", "backend_sync_compute", 1),
-        ("src/v2/execution/local_execution/orchestrators/RankOrchestrator.cpp", "RankOrchestrator::buildRankStochasticTargetDistributionsFromLocalTPRows", "backend_sync_compute", 1),
+        ("src/v2/execution/local_execution/orchestrators/RankOrchestratorForward.cpp", "RankOrchestrator::buildRankStochasticDistributionFromLocalTP", "backend_sync_compute", 1),
+        ("src/v2/execution/local_execution/orchestrators/RankOrchestratorMTP.cpp", "RankOrchestrator::buildRankStochasticTargetDistributionsFromLocalTPRows", "backend_sync_compute", 1),
         # Only the explicit cross-vendor/host staging boundary blocks. Local
         # and same-vendor GPU copies acquire/publish exact stream events.
         ("src/v2/transfer/TransferEngine.cpp", "TransferEngine::copyActivation", "backend_sync_copy", 2),
@@ -346,8 +346,8 @@ ALLOWANCES: tuple[Allowance, ...] = (
     ),
     *reviewed(
         "host_dispatch",
-        ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "DeviceGraphOrchestrator::observeDeviceGenerationDispatchTicket", "backend_event", 1),
-        ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "DeviceGraphOrchestrator::observeDeviceMoERebalanceDispatchTicket", "backend_event", 1),
+        ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestratorSampling.cpp", "DeviceGraphOrchestrator::observeDeviceGenerationDispatchTicket", "backend_event", 1),
+        ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestratorTopology.cpp", "DeviceGraphOrchestrator::observeDeviceMoERebalanceDispatchTicket", "backend_event", 1),
     ),
     *reviewed(
         "host_result",
@@ -364,8 +364,8 @@ ALLOWANCES: tuple[Allowance, ...] = (
         # to establish this exact event completion is fatal. This is not a
         # model, command, activation, prefill or request-dispatch wait budget.
         ("src/v2/execution/local_execution/orchestrators/PipelineDeviceGeneration.cpp", "PipelineDeviceGeneration::finishForwardOnly", "backend_event", 1),
-        ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "DeviceGraphOrchestrator::copyDeviceSpeculativeOutcomesToHostForDiagnostics", "worker_stream", 1),
-        ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "DeviceGraphOrchestrator::finishDeviceResidentGenerationImpl", "backend_event", 1),
+        ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestratorDiagnostics.cpp", "DeviceGraphOrchestrator::copyDeviceSpeculativeOutcomesToHostForDiagnostics", "worker_stream", 1),
+        ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestratorSampling.cpp", "DeviceGraphOrchestrator::finishDeviceResidentGenerationImpl", "backend_event", 1),
         # Rank's private final aggregation re-observes the query-only reader's
         # exact published terminal event after ALL participant result bridges.
         # This never authorizes ticket dispatch, transaction or PLE-stage waits.
@@ -373,12 +373,12 @@ ALLOWANCES: tuple[Allowance, ...] = (
         # Explicit bounded diagnostics first authenticate the ordinary terminal
         # controller, then copy only the populated transaction trace. This one
         # additional terminal wait never belongs to generation or dispatch.
-        ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "DeviceGraphOrchestrator::observeMTPDepthTransactionTraceTerminal", "backend_event", 1),
-        ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "DeviceGraphOrchestrator::forwardMTPBatchAndSampleGreedy", "backend_sync_compute", 1),
-        ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "DeviceGraphOrchestrator::forwardMTPBatchFromLastDraftAndSampleGreedy", "backend_sync_compute", 1),
-        ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "sampleGreedyCandidateFromTensor", "backend_sync_compute", 2),
-        ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "DeviceGraphOrchestrator::sampleGreedyFromAllPositionLogitsOnDeviceRows", "backend_sync_compute", 2),
-        ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "DeviceGraphOrchestrator::sampleOnDeviceAtLogicalPosition", "backend_sync_compute", 1),
+        ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestratorSampling.cpp", "DeviceGraphOrchestrator::observeMTPDepthTransactionTraceTerminal", "backend_event", 1),
+        ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestratorMTPShifted.cpp", "DeviceGraphOrchestrator::forwardMTPBatchAndSampleGreedy", "backend_sync_compute", 1),
+        ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestratorMTPShifted.cpp", "DeviceGraphOrchestrator::forwardMTPBatchFromLastDraftAndSampleGreedy", "backend_sync_compute", 1),
+        ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestratorInternal.h", "sampleGreedyCandidateFromTensor", "backend_sync_compute", 2),
+        ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestratorPrefixCache.cpp", "DeviceGraphOrchestrator::sampleGreedyFromAllPositionLogitsOnDeviceRows", "backend_sync_compute", 2),
+        ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestratorSampling.cpp", "DeviceGraphOrchestrator::sampleOnDeviceAtLogicalPosition", "backend_sync_compute", 1),
         ("src/v2/execution/local_execution/orchestrators/LogitsGatherer.cpp", "LogitsGatherer::copyLocalSpanToHost", "backend_sync_copy", 1),
         ("src/v2/execution/local_execution/orchestrators/DeviceSampler.cpp", "DeviceSampler::sample", "backend_sync_compute", 1),
         ("src/v2/execution/local_execution/orchestrators/DeviceSampler.cpp", "DeviceSampler::sampleGreedyFromLocalInfos", "backend_sync_compute", 1),
@@ -407,7 +407,7 @@ ALLOWANCES: tuple[Allowance, ...] = (
         # repeats only an already-empty retirement. The transport remains alive.
         ("src/v2/execution/local_execution/orchestrators/PipelineDeviceGeneration.cpp", "PipelineDeviceGeneration::retireForwardOnlyBeforeStageRelease", "backend_event", 1),
         ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "DeviceGraphOrchestrator::retirePublishedDeviceWorkBeforeArenaRelease", "backend_event", 2),
-        ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "DeviceGraphOrchestrator::retirePendingPrefixPayloadUses", "backend_event", 1),
+        ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestratorLiveState.cpp", "DeviceGraphOrchestrator::retirePendingPrefixPayloadUses", "backend_event", 1),
         # A standalone hosted prefill has no generation parent to close its
         # storage interval. At request reset only, join the already-owned
         # terminal event before authenticating close and retiring the worker.
@@ -427,8 +427,8 @@ ALLOWANCES: tuple[Allowance, ...] = (
         # before allocation borrowers, tensors and original PMA claims retire.
         # Native phase enqueue, capture preparation and healthy replay never wait.
         ("src/v2/kernels/qwen4exp/PooledImmutableNativeStorage.cpp", "retirePooledNativeSetupOwner", "backend_event", 1),
-        ("src/v2/execution/local_execution/orchestrators/RankOrchestrator.cpp", "RankOrchestrator::synchronizeDevices", "backend_device", 2),
-        ("src/v2/execution/local_execution/orchestrators/RankOrchestrator.cpp", "RankOrchestrator::synchronizeDevices", "rank_device", 1),
+        ("src/v2/execution/local_execution/orchestrators/RankOrchestratorOverlay.cpp", "RankOrchestrator::synchronizeDevices", "backend_device", 2),
+        ("src/v2/execution/local_execution/orchestrators/RankOrchestratorOverlay.cpp", "RankOrchestrator::synchronizeDevices", "rank_device", 1),
         ("src/v2/execution/moe/DeviceMoEOverlayEpochArena.cpp", "DeviceMoEOverlayEpochArena::DeviceMoEOverlayEpochArena", "worker_stream", 1),
         ("src/v2/execution/moe/DeviceMoETransferSlotDirectory.cpp", "DeviceMoETransferSlotDirectory::createImpl", "worker_stream", 1),
         ("src/v2/execution/moe/MoEExpertWeightService.cpp", "finish", "worker_stream", 1),

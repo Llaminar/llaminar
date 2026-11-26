@@ -191,17 +191,19 @@ namespace llaminar2
                 return 64 * (16 + 2 * sizeof(uint16_t) + 2 * sizeof(uint16_t));
             if (format.codebook_id == 8)
                 return 1792;
-            if (format.codebook_id == 11)
-                return 2048 + 128 + 128 + 128; // Signed grid + compensation + original d + raw4.
-            if (format.codebook_id == 4 && format.is_superblock)
-                return 1024 + 128 + 128 + 128; // Nibbles + compensation + original d + raw6.
-
-            if (format.codebook_id == 0 ||
-                format.codebook_id == 4 ||
-                format.codebook_id == 5)
-            {
-                return 1024 + 256 + (format.is_asymmetric ? 128 : 0);
-            }
+            if (format.codebook_id == 11 ||
+                (format.codebook_id == 4 && format.is_superblock))
+                return 1024 + 128 + 128 + 128; // Nibbles + compensation + original d + raw source coeff.
+            if (format.codebook_id == 0 || format.codebook_id == 5)
+                return 1024 + 128 + (format.is_asymmetric ? 128 : 0); // UnsignedNibble (no inline comp).
+            if (format.codebook_id == 6 || format.codebook_id == 7)
+                return 1280 + 128 + (format.is_asymmetric ? 128 : 0); // CompactFiveBit (no inline comp).
+            if (format.codebook_id == 4 || format.codebook_id == 12 ||
+                format.codebook_id == 15 || format.codebook_id == 16)
+                return 1024 + 256 + (format.is_asymmetric ? 128 : 0); // NibbleLUT with inline comp.
+            if (format.codebook_id == 19 || format.codebook_id == 20 ||
+                format.codebook_id == 21)
+                return 2048 + 128 + (format.is_asymmetric ? 128 : 0); // UnsignedInt8 (no inline comp).
             return 2048 + 256 + (format.is_asymmetric ? 128 : 0);
         }
 

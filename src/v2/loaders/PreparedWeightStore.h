@@ -24,6 +24,7 @@
 #include "../kernels/KernelFactory.h"
 #include "../kernels/common/PreparedEmbeddingWeights.h"
 
+#include <atomic>
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
@@ -436,6 +437,12 @@ namespace llaminar2
         /// Total number of populated expert engines across all slabs.
         size_t totalPopulatedExperts() const;
 
+        /// Monotonic lock-free epoch incremented on every entry/embedding mutation or clear.
+        [[nodiscard]] uint64_t mutationEpoch() const noexcept
+        {
+            return mutation_epoch_.load(std::memory_order_acquire);
+        }
+
     private:
         /**
          * @brief Device-scoped identity for a frozen model-weight binding.
@@ -574,6 +581,7 @@ namespace llaminar2
 
         ModelContextId model_id_;
         mutable std::mutex mutex_;
+        std::atomic<uint64_t> mutation_epoch_{1u};
         /** Sole admitted authority carried to graph-owned allocation sites. */
         std::shared_ptr<PhysicalMemoryAuthority> physical_memory_authority_;
         std::unordered_map<PreparedBindingKey, Entry, PreparedBindingKeyHash> entries_;

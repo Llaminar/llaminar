@@ -954,9 +954,52 @@ namespace llaminar2
         auto *const my_slot = arena_->epoch_at(my_rank_);
 
         /*
-         * The size publication is a transaction header. Every participant
-         * waits for every header before computing the common chunk count, so
-         * ranks with no local routes still execute exactly the same epoch DAG.
+         * Pre-stage chunk 0 before Epoch 1 for non-root participants. Each
+         * peer's staging slot was retired by the previous collective's final
+         * epoch, so writing it here overlaps cross-socket memory traffic with
+         * slower peers still finishing compute and collapses single-chunk
+         * gathers (all decode / MTP packets) from 5 cross-socket epochs to 2.
+         */
+        const size_t inline_local_elements =
+            std::min(local_elements, ShmemSpinArena::CHUNK_CAPACITY);
+        constexpr size_t kParallelThresholdElements = 64u * 1024u;
+        constexpr size_t kWorkSliceElements = 16u * 1024u;
+        if (my_rank_ != root_rank && inline_local_elements > 0u)
+        {
+            if (inline_local_elements >= kParallelThresholdElements &&
+                omp_in_parallel() == 0 && omp_get_max_threads() > 1)
+            {
+                const size_t slices =
+                    (inline_local_elements + kWorkSliceElements - 1u) / kWorkSliceElements;
+                auto copy_inline = [&]()
+                {
+#pragma omp for schedule(static)
+                    for (size_t slice = 0u; slice < slices; ++slice)
+                    {
+                        const size_t offset = slice * kWorkSliceElements;
+                        const size_t elements =
+                            std::min(kWorkSliceElements, inline_local_elements - offset);
+                        std::memcpy(
+                            arena_->buffer_at(my_rank_) + offset,
+                            local_records + offset,
+                            elements * sizeof(float));
+                    }
+                };
+                OMP_WORKSHARE_REGION(copy_inline);
+            }
+            else
+            {
+                std::memcpy(
+                    arena_->buffer_at(my_rank_),
+                    local_records,
+                    inline_local_elements * sizeof(float));
+            }
+        }
+
+        /*
+         * The size publication is a transaction header (paired with chunk 0).
+         * Every participant waits for every header before validating counts and
+         * consuming chunk 0, so empty ranks follow the exact same epoch DAG.
          */
         my_slot->payload_elements.store(
             static_cast<uint64_t>(local_elements),
@@ -1019,36 +1062,6 @@ namespace llaminar2
                 std::max(maximum_participant_elements, rank_elements);
         }
 
-        /*
-         * Close the transaction-header lifetime before any participant may
-         * return or publish the next header. The first epoch above proves that
-         * every count is available; this second epoch proves that every rank
-         * has consumed every count. Both edges are required because the count
-         * field is a single persistent slot rather than an epoch-indexed ring.
-         *
-         * This is especially important for an all-empty transaction. Such a
-         * transaction has no payload chunk whose ready/consumed handshake could
-         * otherwise delay slot reuse. Without this explicit consumed edge, a
-         * fast participant can publish transaction N+1 while a slower root is
-         * still reading transaction N and the root can observe a stale/future
-         * count under an epoch that it has already acquired.
-         */
-        if (!publishNextEpoch())
-            return false;
-        for (int rank = 0; rank < num_ranks_; ++rank)
-        {
-            if (rank == my_rank_)
-                continue;
-            if (!waitForPeerEpoch(
-                    rank,
-                    my_epoch_,
-                    "retiring rooted packed-record size headers",
-                    total_elements))
-            {
-                return false;
-            }
-        }
-
         /* Root's contribution is always the first packed block. */
         size_t next_offset =
             rooted_publication_element_counts_[
@@ -1082,12 +1095,97 @@ namespace llaminar2
                 local_elements * sizeof(float));
         }
 
-        // Reuse the native allreduce's work granularity. The caller remains
-        // the sole protocol owner; its existing socket OpenMP workers only
-        // copy disjoint live bytes. An unrelated existing team cannot be
-        // conscripted into a workshare entered by just one of its threads.
-        constexpr size_t kParallelThresholdElements = 64u * 1024u;
-        constexpr size_t kWorkSliceElements = 16u * 1024u;
+        // Consume every peer's pre-staged chunk 0 before retiring Epoch 2.
+        if (my_rank_ == root_rank && maximum_participant_elements > 0u)
+        {
+            size_t max_peer_chunk0 = 0u;
+            for (int rank = 0; rank < num_ranks_; ++rank)
+            {
+                if (rank == root_rank)
+                    continue;
+                max_peer_chunk0 = std::max(
+                    max_peer_chunk0,
+                    std::min(
+                        ShmemSpinArena::CHUNK_CAPACITY,
+                        rooted_publication_element_counts_[static_cast<size_t>(rank)]));
+            }
+            if (max_peer_chunk0 >= kParallelThresholdElements &&
+                omp_in_parallel() == 0 && omp_get_max_threads() > 1)
+            {
+                auto consume_chunk0 = [&]()
+                {
+                    for (int rank = 0; rank < num_ranks_; ++rank)
+                    {
+                        if (rank == root_rank)
+                            continue;
+                        const size_t chunk_elements = std::min(
+                            ShmemSpinArena::CHUNK_CAPACITY,
+                            rooted_publication_element_counts_[static_cast<size_t>(rank)]);
+                        if (chunk_elements == 0u)
+                            continue;
+                        const size_t slices =
+                            (chunk_elements + kWorkSliceElements - 1u) / kWorkSliceElements;
+#pragma omp for schedule(static)
+                        for (size_t slice = 0u; slice < slices; ++slice)
+                        {
+                            const size_t offset = slice * kWorkSliceElements;
+                            const size_t elements =
+                                std::min(kWorkSliceElements, chunk_elements - offset);
+                            std::memcpy(
+                                root_records +
+                                    rooted_publication_element_offsets_[static_cast<size_t>(rank)] +
+                                    offset,
+                                arena_->buffer_at(rank) + offset,
+                                elements * sizeof(float));
+                        }
+                    }
+                };
+                OMP_WORKSHARE_REGION(consume_chunk0);
+            }
+            else
+            {
+                for (int rank = 0; rank < num_ranks_; ++rank)
+                {
+                    if (rank == root_rank)
+                        continue;
+                    const size_t chunk_elements = std::min(
+                        ShmemSpinArena::CHUNK_CAPACITY,
+                        rooted_publication_element_counts_[static_cast<size_t>(rank)]);
+                    if (chunk_elements == 0u)
+                        continue;
+                    std::memcpy(
+                        root_records +
+                            rooted_publication_element_offsets_[static_cast<size_t>(rank)],
+                        arena_->buffer_at(rank),
+                        chunk_elements * sizeof(float));
+                }
+            }
+        }
+
+        /*
+         * Epoch 2 retires BOTH every peer's payload_elements header AND every
+         * peer's chunk 0 staging slot (root publishes only after finishing all
+         * chunk-0 reads). Single-chunk transactions are completely retired here.
+         */
+        if (!publishNextEpoch())
+            return false;
+        for (int rank = 0; rank < num_ranks_; ++rank)
+        {
+            if (rank == my_rank_)
+                continue;
+            if (!waitForPeerEpoch(
+                    rank,
+                    my_epoch_,
+                    "retiring rooted packed-record size headers and chunk 0",
+                    total_elements))
+            {
+                return false;
+            }
+        }
+
+        if (maximum_participant_elements > ShmemSpinArena::CHUNK_CAPACITY)
+        {
+        // Reuse the native allreduce's work granularity for overflow chunks.
         bool parallelize = false;
         if (maximum_participant_elements >= kParallelThresholdElements &&
             omp_in_parallel() == 0 && omp_get_max_threads() > 1)
@@ -1110,7 +1208,7 @@ namespace llaminar2
             // every failure is flushed to all workers at the same barrier.
             auto copy_chunks = [&]()
             {
-                for (size_t chunk_offset = 0u;
+                for (size_t chunk_offset = ShmemSpinArena::CHUNK_CAPACITY;
                      chunk_offset < maximum_participant_elements && protocol_ok;
                      chunk_offset += ShmemSpinArena::CHUNK_CAPACITY)
                 {
@@ -1186,7 +1284,7 @@ namespace llaminar2
         }
         else
         {
-            for (size_t chunk_offset = 0u;
+            for (size_t chunk_offset = ShmemSpinArena::CHUNK_CAPACITY;
                  chunk_offset < maximum_participant_elements;
                  chunk_offset += ShmemSpinArena::CHUNK_CAPACITY)
             {
@@ -1265,14 +1363,13 @@ namespace llaminar2
                         return false;
                 }
             }
-
         }
 
         /*
          * Root waits for the final peer acknowledgement so successful return
-         * means the complete transaction, not merely root's local copy, is done.
+         * means the complete multi-chunk transaction is done.
          */
-        if (my_rank_ == root_rank && maximum_participant_elements > 0u)
+        if (my_rank_ == root_rank)
         {
             for (int rank = 0; rank < num_ranks_; ++rank)
             {
@@ -1287,6 +1384,7 @@ namespace llaminar2
                     return false;
                 }
             }
+        }
         }
 
         if (my_rank_ == root_rank) {

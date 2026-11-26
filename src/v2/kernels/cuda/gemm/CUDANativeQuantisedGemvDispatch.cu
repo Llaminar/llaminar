@@ -30,86 +30,73 @@ constexpr int shardIndexForCodebook(uint8_t codebook_id)
 {
     switch (codebook_id)
     {
-    case 0:
-    case 4:
-    case llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook:
-        return 0;
-    case 5:
-    case 6:
-        return 1;
-    case 7:
-    case 8:
-        return 2;
-    case 9:
-    case 10:
-        return 3;
-    case 11:
-    case 12:
-        return 4;
-    case 13:
-    case 14:
-        return 5;
-    case 15:
-    case 16:
-        return 6;
-    case 17:
-    case 19:
-    case llaminar2::kNativeQuantisedExpandedInt8MinCodebook:
-        return 7;
+    case 0: return 0;
+    case 4: return 1;
+    case llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook: return 2;
+    case 5: return 3;
+    case 6: return 4;
+    case 7: return 5;
+    case 8: return 6;
+    case 9: return 7;
+    case 10: return 8;
+    case 11: return 9;
+    case 12: return 10;
+    case 13: return 11;
+    case 14: return 12;
+    case 15: return 13;
+    case 16: return 14;
+    case 17: return 15;
+    case 19: return 16;
+    case 23: return 17;
     default:
         return -1;
     }
 }
 
-/*
- * Keep hot dispatch as a direct call selected by a compact switch.  An array
- * of function pointers would be shorter, but would add an avoidable indirect
- * branch to eager launches and trainer timing. Graph replay does not execute
- * this host code, yet setup and uncaptured diagnostics should remain cheap.
- */
-#define LLAMINAR_ROUTE_CUDA_NATIVE_QUANTISED_SHARD(SYMBOL, FALLBACK, ...)          \
-    do                                                                  \
-    {                                                                   \
-        switch (shardIndexForCodebook(codebook_id))                     \
-        {                                                               \
-        case 0:                                                         \
-            return LLAMINAR_CUDA_NATIVE_QUANTISED_SHARD_SYMBOL(SYMBOL, 0)(         \
-                __VA_ARGS__);                                           \
-        case 1:                                                         \
-            return LLAMINAR_CUDA_NATIVE_QUANTISED_SHARD_SYMBOL(SYMBOL, 1)(         \
-                __VA_ARGS__);                                           \
-        case 2:                                                         \
-            return LLAMINAR_CUDA_NATIVE_QUANTISED_SHARD_SYMBOL(SYMBOL, 2)(         \
-                __VA_ARGS__);                                           \
-        case 3:                                                         \
-            return LLAMINAR_CUDA_NATIVE_QUANTISED_SHARD_SYMBOL(SYMBOL, 3)(         \
-                __VA_ARGS__);                                           \
-        case 4:                                                         \
-            return LLAMINAR_CUDA_NATIVE_QUANTISED_SHARD_SYMBOL(SYMBOL, 4)(         \
-                __VA_ARGS__);                                           \
-        case 5:                                                         \
-            return LLAMINAR_CUDA_NATIVE_QUANTISED_SHARD_SYMBOL(SYMBOL, 5)(         \
-                __VA_ARGS__);                                           \
-        case 6:                                                         \
-            return LLAMINAR_CUDA_NATIVE_QUANTISED_SHARD_SYMBOL(SYMBOL, 6)(         \
-                __VA_ARGS__);                                           \
-        case 7:                                                         \
-            return LLAMINAR_CUDA_NATIVE_QUANTISED_SHARD_SYMBOL(SYMBOL, 7)(         \
-                __VA_ARGS__);                                           \
-        default:                                                        \
-            return FALLBACK;                                            \
-        }                                                               \
+#define LLAMINAR_ROUTE_CUDA_NATIVE_QUANTISED_SHARD(SYMBOL, FALLBACK, ...) \
+    do { \
+        switch (shardIndexForCodebook(codebook_id)) { \
+        case 0: return LLAMINAR_CUDA_NATIVE_QUANTISED_SHARD_SYMBOL(SYMBOL, 0)(__VA_ARGS__); \
+        case 1: return LLAMINAR_CUDA_NATIVE_QUANTISED_SHARD_SYMBOL(SYMBOL, 1)(__VA_ARGS__); \
+        case 2: return LLAMINAR_CUDA_NATIVE_QUANTISED_SHARD_SYMBOL(SYMBOL, 2)(__VA_ARGS__); \
+        case 3: return LLAMINAR_CUDA_NATIVE_QUANTISED_SHARD_SYMBOL(SYMBOL, 3)(__VA_ARGS__); \
+        case 4: return LLAMINAR_CUDA_NATIVE_QUANTISED_SHARD_SYMBOL(SYMBOL, 4)(__VA_ARGS__); \
+        case 5: return LLAMINAR_CUDA_NATIVE_QUANTISED_SHARD_SYMBOL(SYMBOL, 5)(__VA_ARGS__); \
+        case 6: return LLAMINAR_CUDA_NATIVE_QUANTISED_SHARD_SYMBOL(SYMBOL, 6)(__VA_ARGS__); \
+        case 7: return LLAMINAR_CUDA_NATIVE_QUANTISED_SHARD_SYMBOL(SYMBOL, 7)(__VA_ARGS__); \
+        case 8: return LLAMINAR_CUDA_NATIVE_QUANTISED_SHARD_SYMBOL(SYMBOL, 8)(__VA_ARGS__); \
+        case 9: return LLAMINAR_CUDA_NATIVE_QUANTISED_SHARD_SYMBOL(SYMBOL, 9)(__VA_ARGS__); \
+        case 10: return LLAMINAR_CUDA_NATIVE_QUANTISED_SHARD_SYMBOL(SYMBOL, 10)(__VA_ARGS__); \
+        case 11: return LLAMINAR_CUDA_NATIVE_QUANTISED_SHARD_SYMBOL(SYMBOL, 11)(__VA_ARGS__); \
+        case 12: return LLAMINAR_CUDA_NATIVE_QUANTISED_SHARD_SYMBOL(SYMBOL, 12)(__VA_ARGS__); \
+        case 13: return LLAMINAR_CUDA_NATIVE_QUANTISED_SHARD_SYMBOL(SYMBOL, 13)(__VA_ARGS__); \
+        case 14: return LLAMINAR_CUDA_NATIVE_QUANTISED_SHARD_SYMBOL(SYMBOL, 14)(__VA_ARGS__); \
+        case 15: return LLAMINAR_CUDA_NATIVE_QUANTISED_SHARD_SYMBOL(SYMBOL, 15)(__VA_ARGS__); \
+        case 16: return LLAMINAR_CUDA_NATIVE_QUANTISED_SHARD_SYMBOL(SYMBOL, 16)(__VA_ARGS__); \
+        case 17: return LLAMINAR_CUDA_NATIVE_QUANTISED_SHARD_SYMBOL(SYMBOL, 17)(__VA_ARGS__); \
+        default: return FALLBACK; \
+        } \
     } while (false)
 
-#define LLAMINAR_FOR_EACH_CUDA_NATIVE_QUANTISED_SHARD(SYMBOL, ...)                \
-    LLAMINAR_CUDA_NATIVE_QUANTISED_SHARD_SYMBOL(SYMBOL, 0)(__VA_ARGS__);           \
-    LLAMINAR_CUDA_NATIVE_QUANTISED_SHARD_SYMBOL(SYMBOL, 1)(__VA_ARGS__);           \
-    LLAMINAR_CUDA_NATIVE_QUANTISED_SHARD_SYMBOL(SYMBOL, 2)(__VA_ARGS__);           \
-    LLAMINAR_CUDA_NATIVE_QUANTISED_SHARD_SYMBOL(SYMBOL, 3)(__VA_ARGS__);           \
-    LLAMINAR_CUDA_NATIVE_QUANTISED_SHARD_SYMBOL(SYMBOL, 4)(__VA_ARGS__);           \
-    LLAMINAR_CUDA_NATIVE_QUANTISED_SHARD_SYMBOL(SYMBOL, 5)(__VA_ARGS__);           \
-    LLAMINAR_CUDA_NATIVE_QUANTISED_SHARD_SYMBOL(SYMBOL, 6)(__VA_ARGS__);           \
-    LLAMINAR_CUDA_NATIVE_QUANTISED_SHARD_SYMBOL(SYMBOL, 7)(__VA_ARGS__)
+#define LLAMINAR_FOR_EACH_CUDA_NATIVE_QUANTISED_SHARD(SYMBOL, ...) \
+    LLAMINAR_CUDA_NATIVE_QUANTISED_SHARD_SYMBOL(SYMBOL, 0)(__VA_ARGS__); \
+    LLAMINAR_CUDA_NATIVE_QUANTISED_SHARD_SYMBOL(SYMBOL, 1)(__VA_ARGS__); \
+    LLAMINAR_CUDA_NATIVE_QUANTISED_SHARD_SYMBOL(SYMBOL, 2)(__VA_ARGS__); \
+    LLAMINAR_CUDA_NATIVE_QUANTISED_SHARD_SYMBOL(SYMBOL, 3)(__VA_ARGS__); \
+    LLAMINAR_CUDA_NATIVE_QUANTISED_SHARD_SYMBOL(SYMBOL, 4)(__VA_ARGS__); \
+    LLAMINAR_CUDA_NATIVE_QUANTISED_SHARD_SYMBOL(SYMBOL, 5)(__VA_ARGS__); \
+    LLAMINAR_CUDA_NATIVE_QUANTISED_SHARD_SYMBOL(SYMBOL, 6)(__VA_ARGS__); \
+    LLAMINAR_CUDA_NATIVE_QUANTISED_SHARD_SYMBOL(SYMBOL, 7)(__VA_ARGS__); \
+    LLAMINAR_CUDA_NATIVE_QUANTISED_SHARD_SYMBOL(SYMBOL, 8)(__VA_ARGS__); \
+    LLAMINAR_CUDA_NATIVE_QUANTISED_SHARD_SYMBOL(SYMBOL, 9)(__VA_ARGS__); \
+    LLAMINAR_CUDA_NATIVE_QUANTISED_SHARD_SYMBOL(SYMBOL, 10)(__VA_ARGS__); \
+    LLAMINAR_CUDA_NATIVE_QUANTISED_SHARD_SYMBOL(SYMBOL, 11)(__VA_ARGS__); \
+    LLAMINAR_CUDA_NATIVE_QUANTISED_SHARD_SYMBOL(SYMBOL, 12)(__VA_ARGS__); \
+    LLAMINAR_CUDA_NATIVE_QUANTISED_SHARD_SYMBOL(SYMBOL, 13)(__VA_ARGS__); \
+    LLAMINAR_CUDA_NATIVE_QUANTISED_SHARD_SYMBOL(SYMBOL, 14)(__VA_ARGS__); \
+    LLAMINAR_CUDA_NATIVE_QUANTISED_SHARD_SYMBOL(SYMBOL, 15)(__VA_ARGS__); \
+    LLAMINAR_CUDA_NATIVE_QUANTISED_SHARD_SYMBOL(SYMBOL, 16)(__VA_ARGS__); \
+    LLAMINAR_CUDA_NATIVE_QUANTISED_SHARD_SYMBOL(SYMBOL, 17)(__VA_ARGS__);
 } // namespace
 
 extern "C"

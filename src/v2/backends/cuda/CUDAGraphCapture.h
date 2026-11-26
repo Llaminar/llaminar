@@ -16,6 +16,7 @@
 #ifdef HAVE_CUDA
 
 #include "../IGPUGraphCapture.h"
+#include "../IEarlyPacketPublication.h"
 #include "../NativeParallelGraphBranch.h"
 #include "../IWorkerGPUContext.h"
 #include <optional>
@@ -74,81 +75,38 @@ namespace llaminar2
         void *signal,
         std::uint64_t value) noexcept;
 
-    /** @brief Single-dispatch ownership of an early resident route acquire. */
-    class CUDAResidentPacketAcquire final
-    {
-    public:
-        /** @brief Claim the readiness word once while recording the exact stream. */
-        std::uint64_t* claimSignal(void* stream) const;
-
-        CUDAResidentPacketAcquire(const CUDAResidentPacketAcquire&) = delete;
-        CUDAResidentPacketAcquire& operator=(const CUDAResidentPacketAcquire&) = delete;
-
-    private:
-        friend class CUDAEarlyPacketPublication;
-
-        /** @brief Bind the original producer's word to its first packet consumer. */
-        CUDAResidentPacketAcquire(cudaStream_t stream, std::uint64_t* signal) noexcept
-            : stream_(stream), signal_(signal) {}
-
-        cudaStream_t stream_; ///< Original same-device capture stream.
-        std::uint64_t* signal_; ///< Original arena word, reset by the single acquire owner.
-        mutable bool claimed_ = false; ///< Checked before this capture scope can publish its new frontier.
-    };
-
     /**
-     * @brief Record explicit packet stages against a producer's early device publication.
+     * @brief Own one early packet's native producer and consumer dependencies.
      *
-     * The producer and its packet readers record into one native graph on the
-     * admitted stream. The producer release orders only the named early data;
-     * normal graph dependencies continue to own the producer's full retirement.
-     * This object holds capture metadata only. The original stage owns the
-     * device word and each original packet stage continues to own transport.
+     * The original route prefix, its independent packet readers and local FFN
+     * share one native capture. The packet reads after prefix retirement while
+     * the FFN suffix runs. Both completions join at the original graph cut.
+     * This object retains graph construction metadata for one reader chain.
      */
-    class CUDAEarlyPacketPublication final
+    class CUDAEarlyPacketPublication final : public IEarlyPacketPublication
     {
     public:
-        /**
-         * @brief Initialize the original arena word before the executable can record or replay.
-         * @param stream Exact original CUDA setup stream.
-         * @param signal Arena-owned word retained by the producer and consumed by the packet.
-         */
-        void prepare(void* stream, std::uint64_t* signal);
+        /** @brief Bind the original capture stream before recording. @param stream Exact setup stream. */
+        void prepare(void* stream) override;
 
         /**
-         * @brief Borrow the original producer frontier for a same-unit packet fork.
-         * @param stream Exact original native capture stream.
-         * @param signal Arena-owned signal released by the producer after the early data is complete.
+         * @brief Record a fully published route prefix from the current native capture.
+         * @param stream Exact stream immediately after recording the producer node.
          */
-        void recordProducer(void* stream, std::uint64_t* signal);
+        void recordCompletedProducer(void* stream) override;
 
         /**
-         * @brief Record one original packet on the side of the producer and join both completions.
-         * @param stream Same active native capture and stream as the original producer.
-         * @param record Original packet stage submission. Every data input must be an early export.
-         * @return True only when the stage records and both frontiers are joined.
+         * @brief Record an original packet side branch and join its completion with local arithmetic.
+         * @param stream Exact native capture stream bound to the producer.
+         * @param record Construction-only packet submission. Its inputs depend on the recorded producer.
+         * @return True when the packet and arithmetic completion edges are joined.
          */
-        bool recordConsumer(void* stream, const std::function<bool()>& record);
-
-        /**
-         * @brief Record a dispatch whose sole first lane can consume the word in its metadata warp.
-         * @param stream Exact original native capture stream.
-         * @param lane_count Number of prepared dispatch bindings that will record.
-         * @param record Original dispatch submission. A non-null acquire must be consumed once.
-         * @return True only when both the dispatch and arithmetic frontiers are joined.
-         */
-        bool recordDispatchConsumer(void* stream, std::size_t lane_count,
-            const std::function<bool(const CUDAResidentPacketAcquire*)>& record);
+        bool recordConsumer(void* stream, const std::function<bool()>& record) override;
 
     private:
-        /** @brief Fork from the producer and assign exactly one owner to the readiness word. */
-        bool recordPacketConsumer(void* stream, bool inline_acquire,
-            const std::function<bool(const CUDAResidentPacketAcquire*)>& record);
-
         cudaGraph_t graph_ = nullptr;
         cudaStream_t stream_ = nullptr;
         unsigned long long capture_id_ = 0;
-        std::uint64_t* signal_ = nullptr;
         std::vector<cudaGraphNode_t> producer_frontier_;
         std::vector<cudaGraphNode_t> packet_frontier_;
     };

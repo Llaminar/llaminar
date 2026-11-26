@@ -15,6 +15,7 @@
  */
 
 #include <gtest/gtest.h>
+#include "../../SourceShardReader.h"
 #include <cmath>
 #include <filesystem>
 #include <fstream>
@@ -103,11 +104,9 @@ namespace
 
     std::string readTextFile(const std::filesystem::path &path)
     {
-        std::ifstream input(path);
-        EXPECT_TRUE(input.good()) << "Could not open " << path;
-        std::ostringstream buffer;
-        buffer << input.rdbuf();
-        return buffer.str();
+        const std::string text = llaminar2::test_support::readSourceFileOrFamily(path);
+        EXPECT_FALSE(text.empty()) << "Could not open " << path;
+        return text;
     }
 
     // =============================================================================

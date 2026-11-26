@@ -26,8 +26,8 @@ namespace llaminar2::cuda::moe
     /** @brief Original post-attention HC operands sealed before recording the resident kernel. */
     struct RetainedHCPrefix
     {
-        qwen4exp::ResidualWriteArgs write; ///< Original attention output, injection and four-branch residual.
-        qwen4exp::BranchRMSNormArgs norm; ///< Original fixed 256-lane normalization and retained output.
+        ::llaminar2::qwen4exp::ResidualWriteArgs write; ///< Original attention output, injection and four-branch residual.
+        ::llaminar2::qwen4exp::BranchRMSNormArgs norm; ///< Original fixed 256-lane normalization and retained output.
         DeviceNativeQuantisedMatrixDesc down; ///< Original prepared HC Down weight, with K equal to 4H.
         prefill::CanonicalM1PartitionGeometry down_partitions; ///< Exact CUDA serial M1 FP32 fold.
         HCDownFold down_fold; ///< Original CUDA serial publication mode.
@@ -38,6 +38,9 @@ namespace llaminar2::cuda::moe
         GPUHCDownOutputView down_publication; ///< Original activated values and paired Q8 Up input.
         GPUQ8ResidualCorrectionArgs up; ///< Original Up weights and independently rounded Q8 terms.
         float* mixed; ///< Original H-wide read for the local router and shared FFN.
+        const float* injection_weights = nullptr; ///< Optional original FP32 [4, 4H] injection weights.
+        float* injection_output = nullptr; ///< Optional original FP32 [4] injection logits.
+        bool has_previous_write = true; ///< True when write publishes norm.input; false for PublishedTrunk.
     };
 
     static_assert(std::is_trivially_copyable_v<RetainedHCPrefix>);

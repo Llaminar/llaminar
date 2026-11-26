@@ -527,4 +527,31 @@ namespace llaminar2
         ctx.mins_array[linear] = fp32_to_fp16(dl2);
     }
 
+
+    void IQ1_MTensor::unpack_block_to_int8(size_t row_idx, size_t k_block_offset, int8_t *output) const
+    {
+        const size_t super_blocks_per_row = (shape_[1] + IQ1_MBlock::BLOCK_SIZE - 1) / IQ1_MBlock::BLOCK_SIZE;
+        const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+        if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
+        const IQ1_MBlock *blocks = reinterpret_cast<const IQ1_MBlock *>(data_ptr);
+
+        const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
+        const size_t sub_block_idx = k_block_offset % 8;
+
+        simd::unpack_iq1_m_to_int8(blocks[super_block_idx], sub_block_idx, output);
+    }
+
+    float IQ1_MTensor::get_block_scale(size_t row_idx, size_t k_block_offset) const
+    {
+        const size_t super_blocks_per_row = (shape_[1] + IQ1_MBlock::BLOCK_SIZE - 1) / IQ1_MBlock::BLOCK_SIZE;
+        const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+        if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
+        const IQ1_MBlock *blocks = reinterpret_cast<const IQ1_MBlock *>(data_ptr);
+
+        const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
+        const size_t sub_block_idx = k_block_offset % 8;
+
+        return simd::get_iq1_m_scale(blocks[super_block_idx], sub_block_idx);
+    }
+
 } // namespace llaminar2

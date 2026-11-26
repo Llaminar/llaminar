@@ -715,7 +715,8 @@ TEST(QwenSparseAttentionStage, AttentionArithmeticNamesDefaultsAndBackendAdmissi
         EXPECT_THROW(validateQwenSparseAttentionArithmetic(static_cast<SparseArithmetic>(255),backend),std::invalid_argument);
     }
     EXPECT_NO_THROW(validateQwenSparseAttentionArithmetic(SparseArithmetic::TileFP16WithFP32Totals,DeviceType::ROCm));
-    for(const auto backend:{DeviceType::CPU,DeviceType::CUDA,DeviceType::Vulkan,DeviceType::Metal,static_cast<DeviceType>(255)})
+    EXPECT_NO_THROW(validateQwenSparseAttentionArithmetic(SparseArithmetic::TileFP16WithFP32Totals,DeviceType::CUDA));
+    for(const auto backend:{DeviceType::CPU,DeviceType::Vulkan,DeviceType::Metal,static_cast<DeviceType>(255)})
         EXPECT_THROW(validateQwenSparseAttentionArithmetic(SparseArithmetic::TileFP16WithFP32Totals,backend),std::invalid_argument);
     for(const auto backend:{DeviceType::Vulkan,DeviceType::Metal,static_cast<DeviceType>(255)})
         EXPECT_THROW(validateQwenSparseAttentionArithmetic(SparseArithmetic::FixedFP32,backend),std::invalid_argument);
@@ -779,7 +780,8 @@ TEST(QwenSparseAttentionStage, AttentionArithmeticSelectedCaptureSealsStaticIden
     }
     auto cuda=f.params(cache,DeviceId::cuda(0));
     std::get<Stage::SelectedAttention>(cuda.operation).arithmetic=SparseArithmetic::TileFP16WithFP32Totals;
-    EXPECT_THROW((Stage(cuda)),std::invalid_argument); // Rejection precedes any backend factory or device access.
+    EXPECT_NE(sparseArithmeticSignature(cuda),0u);
+    EXPECT_NE(sparseArithmeticSignature(cuda),baseline);
 }
 
 #ifdef HAVE_ROCM
@@ -838,9 +840,10 @@ TEST(QwenSparseAttentionStage, Phase33NamesAndUnsupportedBackends)
     for(const auto text:{"","auto","Prefill8Decode33","prefill8_decode33 "})EXPECT_THROW(parseQwenSparseAttentionPhaseSchedule(text),std::invalid_argument);
     EXPECT_THROW(qwenSparseAttentionPartialCount(static_cast<A>(255)),std::invalid_argument);
     EXPECT_THROW(qwenSparseAttentionPhaseScheduleName(static_cast<S>(255)),std::invalid_argument);
-    for(auto backend:{DeviceType::CPU,DeviceType::CUDA,DeviceType::Vulkan,DeviceType::Metal,static_cast<DeviceType>(255)})
+    for(auto backend:{DeviceType::CPU,DeviceType::Vulkan,DeviceType::Metal,static_cast<DeviceType>(255)})
         EXPECT_THROW(validateQwenSparseAttentionArithmetic(A::TileFP16WithFP32Totals33,backend),std::invalid_argument);
     EXPECT_NO_THROW(validateQwenSparseAttentionArithmetic(A::TileFP16WithFP32Totals33,DeviceType::ROCm));
+    EXPECT_NO_THROW(validateQwenSparseAttentionArithmetic(A::TileFP16WithFP32Totals33,DeviceType::CUDA));
     QwenSparseAttention empty;empty.arithmetic=A::TileFP16WithFP32Totals33;
     EXPECT_THROW(cpuQwenSparseAttention(empty),std::invalid_argument); // No native binding is touched on CPU.
 }
@@ -905,7 +908,7 @@ TEST(QwenSparseAttentionStage, InstalledDefaultSetupResolvesBackendAndExplicitCh
                 const QwenSparseAttentionSetupGeometry geometry{
                     backend, storage, storage, requests, 256, 64};
                 const bool eligible =
-                    backend == DeviceType::ROCm && storage == TensorType::FP16 && requests == 1;
+                    (backend == DeviceType::ROCm || backend == DeviceType::CUDA) && storage == TensorType::FP16 && requests == 1;
                 const auto actual = resolveQwenSparseAttentionSetup({}, geometry);
                 EXPECT_EQ(actual.arithmetic, eligible ? A::TileFP16WithFP32Totals : A::FixedFP32);
                 EXPECT_EQ(actual.schedule, eligible ? S::Prefill8Decode33 : S::Uniform);
@@ -940,13 +943,17 @@ TEST(QwenSparseAttentionStage, InstalledDefaultSetupResolvesBackendAndExplicitCh
                      std::invalid_argument);
     EXPECT_THROW(resolveQwenSparseAttentionSetup({std::nullopt, static_cast<S>(255)}, native),
                  std::invalid_argument);
-    for (const auto backend : {DeviceType::CPU, DeviceType::CUDA})
     {
         auto other = native;
-        other.backend = backend;
+        other.backend = DeviceType::CPU;
         EXPECT_THROW(
             resolveQwenSparseAttentionSetup({A::TileFP16WithFP32Totals, std::nullopt}, other),
             std::invalid_argument);
+        auto cuda_native = native;
+        cuda_native.backend = DeviceType::CUDA;
+        EXPECT_EQ(
+            resolveQwenSparseAttentionSetup({A::TileFP16WithFP32Totals, std::nullopt}, cuda_native).schedule,
+            S::Prefill8Decode33);
     }
     for (const int bad : {0, -1})
     {
@@ -981,8 +988,9 @@ TEST(QwenSparseAttentionStage, AdmittedDefaultProjectionRejectsMissingDuplicateA
     EXPECT_THROW(sealQwenSparseAttentionParticipants(
                      {{DeviceId::rocm(3), half, 0, 0}, {DeviceId::rocm(3), half, 0, 0}}),
                  std::invalid_argument);
-    EXPECT_THROW(sealQwenSparseAttentionParticipants({{DeviceId::cuda(0), half, 0, 0}}),
+    EXPECT_THROW(sealQwenSparseAttentionParticipants({{DeviceId::cpu(), half, 0, 0}}),
                  std::invalid_argument);
+    EXPECT_NO_THROW(sealQwenSparseAttentionParticipants({{DeviceId::cuda(0), half, 0, 0}}));
     EXPECT_THROW(sealQwenSparseAttentionParticipants(
                      {{DeviceId::rocm(0), {A::FixedFP32, S::Prefill8Decode33}, 0, 0}}),
                  std::invalid_argument);
@@ -1144,7 +1152,7 @@ TEST(QwenSparseAttentionStage, AttentionEvidenceCompletedCaptureKeepsPhaseAndSig
             // These are the complete supported immutable programs. The 33-part
             // program belongs only to explicit Decode and needs its admitted R
             // plus a real 33-part scratch extent, even in this metadata fixture.
-            if (!device.is_rocm() && arithmetic != SparseArithmetic::FixedFP32) continue;
+            if (!device.is_rocm() && !device.is_cuda() && arithmetic != SparseArithmetic::FixedFP32) continue;
             if (arithmetic == SparseArithmetic::TileFP16WithFP32Totals33 && phase != ForwardExecutionPhase::Decode) continue;
             SCOPED_TRACE(device.toString() + " " + std::string(qwen4exp::qwenSparseAttentionArithmeticName(arithmetic)));
             PerfStatsCollector::reset();

@@ -12,6 +12,7 @@
  */
 #pragma once
 #include "ROCmPersistentHCRead.h"
+#include "ROCmResidentGridBarrier.cuh"
 #include "kernels/qwen4exp/GPUBranchRMSNormBody.cuh"
 #include "kernels/common/OriginalSingleQ8Block32.cuh"
 #include "kernels/common/GPUHCShortKBlockBody.cuh"
@@ -200,10 +201,11 @@ __device__ __forceinline__ void persistentHCReadPhase(const PersistentHCReadArgs
  if constexpr(PublishNextPhase)grid.sync();
 }
 /** @brief Standalone complete HC operation; all public outputs remain in their original owners. */
-__global__ __launch_bounds__(256) void persistentHCReadKernel(PersistentHCReadArgs args) {
- auto grid=cooperative_groups::this_grid();
- if(!grid.is_valid())__builtin_trap();
+#if defined(LLAMINAR_DEFINE_PERSISTENT_HC_READ_KERNEL)
+__global__ __launch_bounds__(256) void persistentHCReadKernel(PersistentHCReadArgs args,std::uint32_t* barrier_state) {
+ ResidentGridBarrierFor<4> grid{barrier_state};
  __shared__ PersistentHCReadShared shared;
  persistentHCReadPhase<false>(args,shared,grid);
 }
+#endif
 } // namespace llaminar2::rocm

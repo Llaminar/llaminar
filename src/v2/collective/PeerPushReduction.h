@@ -107,4 +107,69 @@ namespace llaminar2
     bool launchROCmPeerPushFP32(const PeerPushBinding &binding, const float *input, float *output,
         const std::int32_t *live_rows, std::size_t rows, std::size_t columns,
         unsigned long long *payload_bytes, unsigned long long *metadata_bytes, void *stream);
+
+    /**
+     * @brief Enqueue one lossless FP32 rooted direct-push sum reduction on its exact stream.
+     * @param binding Prepared original participant and storage identities.
+     * @param input Local FP32 contribution; may alias output on root.
+     * @param output Root destination; untouched on non-root participants.
+     * @param root Original communicator index receiving the rank-ordered sum.
+     * @param count Exact live FP32 element count (must fit admitted bank capacity).
+     * @param stream Exact non-default producer/consumer stream.
+     * @return Whether arguments and the launch were accepted.
+     */
+    bool launchROCmPeerPushReduceFP32(const PeerPushBinding &binding, const float *input,
+        float *output, int root, std::size_t count, void *stream);
+
+    /**
+     * @brief Enqueue one lossless FP32 rooted direct-push broadcast on its exact stream.
+     * @param binding Prepared original participant and storage identities.
+     * @param input Root FP32 source buffer; may alias output.
+     * @param output Participant destination buffer.
+     * @param root Original communicator index broadcasting its buffer.
+     * @param count Exact live FP32 element count (must fit admitted bank capacity).
+     * @param stream Exact non-default producer/consumer stream.
+     * @return Whether arguments and the launch were accepted.
+     */
+    bool launchROCmPeerPushBroadcastFP32(const PeerPushBinding &binding, const float *input,
+        float *output, int root, std::size_t count, void *stream);
+
+    /**
+     * @brief Enqueue one direct-push FP16 allreduce sum in ascending rank order.
+     * @param binding Prepared original participant and storage identities.
+     * @param input Local FP16 contribution; may alias output exactly.
+     * @param output FP16 result; inactive rows remain unchanged.
+     * @param live_rows Ordered device-owned equal row count, or null for fully active rows.
+     * @param rows Exact retained transaction row geometry, not arena capacity.
+     * @param columns FP16 values per row.
+     * @param payload_bytes Optional device-only receipt of useful outgoing bytes.
+     * @param metadata_bytes Optional device-only receipt of readiness writes.
+     * @param stream Exact non-default producer/consumer stream.
+     * @return Whether arguments and the launch were accepted.
+     */
+    bool launchROCmPeerPushFP16(const PeerPushBinding &binding, const void *input, void *output,
+        const std::int32_t *live_rows, std::size_t rows, std::size_t columns,
+        unsigned long long *payload_bytes, unsigned long long *metadata_bytes, void *stream);
+
+    /**
+     * @brief Enqueue one fused FP32->FP16->rank-ordered-sum->FP32 direct-push allreduce.
+     *
+     * Preserves the exact FP16 transport arithmetic (__float2half -> __hadd in
+     * ascending rank order -> __half2float) in one single kernel launch without
+     * separate cast kernels or FP16 scratch staging.
+     *
+     * @param binding Prepared original participant and storage identities.
+     * @param input Local FP32 contribution; may alias output exactly.
+     * @param output FP32 result; inactive rows remain unchanged.
+     * @param live_rows Ordered device-owned equal row count, or null for fully active rows.
+     * @param rows Exact retained transaction row geometry, not arena capacity.
+     * @param columns FP32 values per row.
+     * @param payload_bytes Optional device-only receipt of useful outgoing bytes.
+     * @param metadata_bytes Optional device-only receipt of readiness writes.
+     * @param stream Exact non-default producer/consumer stream.
+     * @return Whether arguments and the launch were accepted.
+     */
+    bool launchROCmPeerPushFP32ViaFP16(const PeerPushBinding &binding, const float *input, float *output,
+        const std::int32_t *live_rows, std::size_t rows, std::size_t columns,
+        unsigned long long *payload_bytes, unsigned long long *metadata_bytes, void *stream);
 }

@@ -223,13 +223,28 @@ cpuWeights(const cpu::native_quantised::CPUNativeQuantisedPackedWeights &p) {
             const int bit = lane * 4 + i % 4;
             value =
                 (low | (((a >> bit) & 1) << 4) | (((c >> bit) & 1) << 5)) - 32;
+          } else if (p.usesCompactFiveBit()) {
+            const auto byte =
+                p.interleavedB(chunk, b, (i % 16) / 4, z)[lane * 4 + i % 4];
+            const int low = (byte >> (i < 16 ? 0 : 4)) & 15;
+            uint64_t mask = 0;
+            std::memcpy(&mask, p.fiveBitHighBitplane(chunk, b, i / 4, z), 8);
+            const int bit = lane * 4 + i % 4;
+            const int raw5 = low | (static_cast<int>((mask >> bit) & 1u) << 4);
+            value = p.is_asymmetric ? raw5 : raw5 - 16;
           } else if (p.usesNibbleLUT()) {
             const auto byte =
                 p.interleavedB(chunk, b, (i % 16) / 4, z)[lane * 4 + i % 4];
             const int q = (byte >> (i < 16 ? 0 : 4)) & 15;
-            value = p.codebook_id == 0   ? q - 8
-                    : p.codebook_id == 5 ? q
-                                         : kvalues_iq4nl[q];
+            value = p.codebook_id == 0    ? q - 8
+                    : p.codebook_id == 5  ? q
+                    : p.codebook_id == 11 ? cpu::native_quantised::kIQ3SDecodeLUT[q]
+                    : p.codebook_id == 12 ? cpu::native_quantised::kIQ3XXSDecodeLUT[q]
+                    : p.codebook_id == 15 ? cpu::native_quantised::kIQ2XXSDecodeLUT[q]
+                    : p.codebook_id == 16 ? cpu::native_quantised::kIQ1SDecodeLUT[q]
+                                          : kvalues_iq4nl[q];
+          } else if (p.usesUnsignedInt8()) {
+            value = int8_t(p.interleavedB(chunk, b, i / 4, z)[lane * 4 + i % 4] ^ 0x80u);
           } else
             value =
                 int8_t(p.interleavedB(chunk, b, i / 4, z)[lane * 4 + i % 4]);

@@ -47,4 +47,22 @@ __global__ __launch_bounds__(1024,1) void fullNativeHCFFNKernel(
     ResidentGridBarrier suffix_grid{suffix.barrier_state};
     tunedFullNativeHCFFNSuffix<Mask>(suffix,suffix_grid,shared.ffn,dynamic_storage,prefix_bytes,prefix.output_demand);
 }
+
+/**
+ * @brief Standalone 1024-thread tuned HC read+injection kernel over ordinary resident grid.
+ *
+ * Reuses the exact production fullNativeHCFFNPrefix body (idle-CTA weight prefetch,
+ * 128-bit AS1 loads, fused norm+SingleQ8, in-LDS down fold + TwoTermQ8, and only
+ * three ResidentGridBarrier joins) across all ROCm topologies.
+ */
+#if defined(LLAMINAR_DEFINE_PERSISTENT_HC_READ_KERNEL)
+__global__ __launch_bounds__(1024,1) void persistentHCReadKernel1024(
+    FullNativeHCFFNPrefixArgs prefix,unsigned prefix_bytes)
+{
+    __shared__ FullNativeHCFFNPrefixScratch local;
+    extern __shared__ __align__(16) unsigned char dynamic_storage[];
+    ResidentGridBarrierFor<FullNativeHCFFNBarrierLayout::prefix_phases> grid{prefix.barrier_state};
+    fullNativeHCFFNPrefix(prefix,grid,local,dynamic_storage,prefix_bytes);
+}
+#endif
 }

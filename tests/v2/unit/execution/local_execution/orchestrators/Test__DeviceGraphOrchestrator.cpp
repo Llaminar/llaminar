@@ -21,6 +21,7 @@
 #include "../../../../utils/CPUOrchestratorTestAdmission.h"
 #include "../../../../utils/CPUPreparedStoreTestAdmission.h"
 #include <gtest/gtest.h>
+#include "../../../SourceShardReader.h"
 #include <type_traits>
 #include "backends/BackendManager.h"
 #include "backends/DeviceId.h"
@@ -569,12 +570,7 @@ namespace
      */
     std::string readSourceFileForDeviceGraphOrchestratorTest(const std::string &path)
     {
-        std::ifstream input(path);
-        if (!input.good())
-            return {};
-        std::ostringstream buffer;
-        buffer << input.rdbuf();
-        return buffer.str();
+        return llaminar2::test_support::readSourceFileOrFamily(path);
     }
 
     /**

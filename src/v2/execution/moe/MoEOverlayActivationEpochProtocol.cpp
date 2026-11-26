@@ -244,6 +244,8 @@ namespace llaminar2
         control.channel.graph_role_mask = config.graph_role_mask;
         control.channel.return_role = static_cast<std::uint32_t>(config.return_role);
         control.channel.cohort_target = config.cohort_target;
+        control.channel.prefill_wire_policy =
+            static_cast<std::uint32_t>(config.prefill_wire_policy);
     }
 
     MoEOverlayActivationEpochProtocol::MoEOverlayActivationEpochProtocol(
@@ -277,7 +279,9 @@ namespace llaminar2
             header.lane_ordinal != config_.lane_ordinal ||
             header.graph_role_mask != config_.graph_role_mask ||
             header.return_role != static_cast<std::uint32_t>(config_.return_role) ||
-            header.cohort_target != config_.cohort_target)
+            header.cohort_target != config_.cohort_target ||
+            header.prefill_wire_policy !=
+                static_cast<std::uint32_t>(config_.prefill_wire_policy))
         {
             throw std::logic_error(
                 "ExpertOverlay activation epoch mapping disagrees with its exact topology or retained stage manifest");

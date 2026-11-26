@@ -175,6 +175,13 @@ std::shared_ptr<MoEOverlayRankBatchTransportRegistry> prepareOriginalMoEOverlayR
 
                         const auto &local_lanes =
                             channel.localLanes(local_world_rank);
+                        const bool gpu_to_gpu_prefill_fp16 =
+                            source && source->device.is_gpu() &&
+                            !channel.target_lanes.empty() &&
+                            std::all_of(
+                                channel.target_lanes.begin(),
+                                channel.target_lanes.end(),
+                                [](const auto &lane) { return lane.device.is_gpu(); });
 
                         auto transport_config = MoEOverlayRankBatchTransportConfig{
                                 .mpi_ctx = overlay_context,
@@ -213,6 +220,7 @@ std::shared_ptr<MoEOverlayRankBatchTransportRegistry> prepareOriginalMoEOverlayR
                                     channel.mapping_layout,
                                 .local_lanes = local_lanes,
                                 .original_cpu_joint_owners=input.original_cpu_joint_owners,
+                                .enable_gpu_prefill_fp16_wire = gpu_to_gpu_prefill_fp16,
                             };
                         auto transport = same_rank ?
                             createMoEOverlayRankLocalGPUActivationTransport(std::move(transport_config)) :

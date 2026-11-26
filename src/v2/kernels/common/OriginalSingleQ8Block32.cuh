@@ -16,6 +16,21 @@
 #include <cuda_runtime.h>
 #endif
 namespace llaminar2::original_single_q8 {
+#if defined(__CUDACC__) && !defined(__HIPCC__)
+/** @brief Bind one original CUDA Q8 scale. @param maximum Rounded absolute maximum. @return Original FP32 scale. */
+__device__ __forceinline__ float cudaScale(float maximum)
+{
+ return maximum>0.f?maximum/127.f:1.f;
+}
+
+/** @brief Quantize one CUDA value. @param value Original FP32 value. @param inverse Original reciprocal. @return Signed Q8 code. */
+__device__ __forceinline__ int cudaCode(float value,float inverse)
+{
+ const float scaled=value*inverse;
+ return static_cast<int>(rintf(fminf(127.f,fmaxf(-127.f,scaled))));
+}
+#endif
+
 /** @brief Publish one original K32 block and optional native integer sum.
  * @param value Exact original FP32 element, or zero for an invalid tail lane.
  * @param valid Whether this original lane owns a physical output byte.
@@ -35,15 +50,14 @@ __device__ __forceinline__ void publish(float value,bool valid,std::int8_t* outp
 #else
 #pragma unroll
  for(int mask=16;mask>0;mask>>=1)maximum=fmaxf(maximum,__shfl_xor_sync(0xffffffffu,maximum,mask,32));
- const float scale=maximum>0.f?maximum/127.f:1.f;
+ const float scale=cudaScale(maximum);
 #endif
  const float inverse=1.0f/scale;
  if(lane==0)*scaleOutput=scale;
 #if defined(__HIPCC__)
  const int q=rocm::decode_equivalent::quantizeQ8(value,inverse);
 #else
- const float qval=value*inverse;
- const int q=static_cast<int>(rintf(fminf(127.f,fmaxf(-127.f,qval))));
+ const int q=cudaCode(value,inverse);
 #endif
  if(valid)output[lane]=static_cast<std::int8_t>(q);
  if(sumOutput) {

@@ -15,6 +15,7 @@
  */
 
 #include <gtest/gtest.h>
+#include "../../SourceShardReader.h"
 
 #include "execution/moe/MoEExpertOverlayRuntimePlan.h"
 #include "execution/moe/MoEOverlayParticipantResidency.h"
@@ -2014,11 +2015,8 @@ TEST(Test__Qwen35MoEGraph, PhaseSplitOverlayApportionsPrefillButReplicatesVerifi
 
 TEST(Test__Qwen35MoEGraph, ReplicatedOverlayPublishesExplicitRuntimeOwnerMetadata)
 {
-    std::ifstream in(LLAMINAR_QWEN35_MOE_GRAPH_SOURCE);
-    ASSERT_TRUE(in.is_open()) << "Unable to open " << LLAMINAR_QWEN35_MOE_GRAPH_SOURCE;
-    const std::string source(
-        (std::istreambuf_iterator<char>(in)),
-        std::istreambuf_iterator<char>());
+    const std::string source = llaminar2::test_support::readSourceFileOrFamily(LLAMINAR_QWEN35_MOE_GRAPH_SOURCE);
+    ASSERT_FALSE(source.empty()) << "Unable to open " << LLAMINAR_QWEN35_MOE_GRAPH_SOURCE;
 
     const size_t assignment = source.find(
         "expert_params.runtime_decode_has_explicit_owner_metadata =");
@@ -5618,11 +5616,8 @@ TEST(Test__Qwen35MoEGraph, RuntimeHistogramProducerPolicyIsSemanticNotPhysicalM)
         MoERuntimeHistogramProducerRole::NotProducer)
         << "Device-resident maintenance must not acquire a host drain";
 
-    std::ifstream in(LLAMINAR_QWEN35_MOE_GRAPH_SOURCE);
-    ASSERT_TRUE(in.is_open()) << "Unable to open " << LLAMINAR_QWEN35_MOE_GRAPH_SOURCE;
-    const std::string source(
-        (std::istreambuf_iterator<char>(in)),
-        std::istreambuf_iterator<char>());
+    const std::string source = llaminar2::test_support::readSourceFileOrFamily(LLAMINAR_QWEN35_MOE_GRAPH_SOURCE);
+    ASSERT_FALSE(source.empty()) << "Unable to open " << LLAMINAR_QWEN35_MOE_GRAPH_SOURCE;
 
     const size_t decode_branch = source.find("if (total_tokens == 1 &&");
     ASSERT_NE(decode_branch, std::string::npos);
@@ -5709,11 +5704,8 @@ TEST(Test__Qwen35MoEGraph, RuntimeHistogramCollectionFollowsMaintenanceMode)
 
 TEST(Test__Qwen35MoEGraph, CurrentBatchLLEPPrefillCannotAliasDurableDecodeRuntime)
 {
-    std::ifstream in(LLAMINAR_QWEN35_MOE_GRAPH_SOURCE);
-    ASSERT_TRUE(in.is_open()) << "Unable to open " << LLAMINAR_QWEN35_MOE_GRAPH_SOURCE;
-    const std::string source(
-        (std::istreambuf_iterator<char>(in)),
-        std::istreambuf_iterator<char>());
+    const std::string source = llaminar2::test_support::readSourceFileOrFamily(LLAMINAR_QWEN35_MOE_GRAPH_SOURCE);
+    ASSERT_FALSE(source.empty()) << "Unable to open " << LLAMINAR_QWEN35_MOE_GRAPH_SOURCE;
 
     const size_t identity_begin = source.find(
         "const MoERuntimeTableIdentity runtime_table_identity");
@@ -5764,11 +5756,8 @@ TEST(Test__Qwen35MoEGraph, CurrentBatchLLEPPrefillCannotAliasDurableDecodeRuntim
 TEST(Test__Qwen35MoEGraph,
      DurableOverlayPlacementSurvivesResetAndIsExcludedFromPrefixPayloads)
 {
-    std::ifstream in(LLAMINAR_QWEN35_MOE_GRAPH_SOURCE);
-    ASSERT_TRUE(in.is_open()) << "Unable to open " << LLAMINAR_QWEN35_MOE_GRAPH_SOURCE;
-    const std::string source(
-        (std::istreambuf_iterator<char>(in)),
-        std::istreambuf_iterator<char>());
+    const std::string source = llaminar2::test_support::readSourceFileOrFamily(LLAMINAR_QWEN35_MOE_GRAPH_SOURCE);
+    ASSERT_FALSE(source.empty()) << "Unable to open " << LLAMINAR_QWEN35_MOE_GRAPH_SOURCE;
 
     const size_t reset_begin =
         source.find("void Qwen35MoEGraph::resetState(void *execution_stream)");
@@ -5824,11 +5813,8 @@ TEST(Test__Qwen35MoEGraph,
 
 TEST(Test__Qwen35MoEGraph, PhaseSplitMTPSidecarDisablesGroupedSharedExpertDecodeShortcut)
 {
-    std::ifstream in(LLAMINAR_QWEN35_MOE_GRAPH_SOURCE);
-    ASSERT_TRUE(in.is_open()) << "Unable to open " << LLAMINAR_QWEN35_MOE_GRAPH_SOURCE;
-    const std::string source(
-        (std::istreambuf_iterator<char>(in)),
-        std::istreambuf_iterator<char>());
+    const std::string source = llaminar2::test_support::readSourceFileOrFamily(LLAMINAR_QWEN35_MOE_GRAPH_SOURCE);
+    ASSERT_FALSE(source.empty()) << "Unable to open " << LLAMINAR_QWEN35_MOE_GRAPH_SOURCE;
 
     const size_t shared_params =
         source.find("SharedExpertFFNStage::Params shared_params;");
@@ -5917,11 +5903,8 @@ TEST(Test__Qwen35MoEGraph, MTPSidecarUsesReplicatedDecodeBindingsForSharedExpert
 
 TEST(Test__Qwen35MoEGraph, DeviceSideRebalanceApplyPiggybacksOnRouting)
 {
-    std::ifstream in(LLAMINAR_QWEN35_MOE_GRAPH_SOURCE);
-    ASSERT_TRUE(in.is_open()) << "Unable to open " << LLAMINAR_QWEN35_MOE_GRAPH_SOURCE;
-    const std::string source(
-        (std::istreambuf_iterator<char>(in)),
-        std::istreambuf_iterator<char>());
+    const std::string source = llaminar2::test_support::readSourceFileOrFamily(LLAMINAR_QWEN35_MOE_GRAPH_SOURCE);
+    ASSERT_FALSE(source.empty()) << "Unable to open " << LLAMINAR_QWEN35_MOE_GRAPH_SOURCE;
     std::string routing_stage_path = LLAMINAR_QWEN35_MOE_GRAPH_SOURCE;
     const std::string graph_suffix = "models/qwen35moe/Qwen35MoEGraph.cpp";
     const size_t graph_suffix_pos = routing_stage_path.find(graph_suffix);
@@ -6005,11 +5988,8 @@ TEST(Test__Qwen35MoEGraph, DeviceSideRebalanceApplyPiggybacksOnRouting)
 
 TEST(Test__Qwen35MoEGraph, DeviceSideRebalanceRejectsFixedPayloadArenas)
 {
-    std::ifstream in(LLAMINAR_QWEN35_MOE_GRAPH_SOURCE);
-    ASSERT_TRUE(in.is_open()) << "Unable to open " << LLAMINAR_QWEN35_MOE_GRAPH_SOURCE;
-    const std::string source(
-        (std::istreambuf_iterator<char>(in)),
-        std::istreambuf_iterator<char>());
+    const std::string source = llaminar2::test_support::readSourceFileOrFamily(LLAMINAR_QWEN35_MOE_GRAPH_SOURCE);
+    ASSERT_FALSE(source.empty()) << "Unable to open " << LLAMINAR_QWEN35_MOE_GRAPH_SOURCE;
 
     const size_t selector = source.find("selectGraphRebalanceTransferMode");
     ASSERT_NE(selector, std::string::npos);
@@ -6050,11 +6030,8 @@ TEST(Test__Qwen35MoEGraph, DeviceSideRebalanceRejectsFixedPayloadArenas)
 
 TEST(Test__Qwen35MoEGraph, DeviceSideRebalanceMaintenanceSkipsDecodeHistogramSideband)
 {
-    std::ifstream in(LLAMINAR_QWEN35_MOE_GRAPH_SOURCE);
-    ASSERT_TRUE(in.is_open()) << "Unable to open " << LLAMINAR_QWEN35_MOE_GRAPH_SOURCE;
-    const std::string source(
-        (std::istreambuf_iterator<char>(in)),
-        std::istreambuf_iterator<char>());
+    const std::string source = llaminar2::test_support::readSourceFileOrFamily(LLAMINAR_QWEN35_MOE_GRAPH_SOURCE);
+    ASSERT_FALSE(source.empty()) << "Unable to open " << LLAMINAR_QWEN35_MOE_GRAPH_SOURCE;
 
     const size_t producer_mode =
         source.find("const bool producer_runs_in_maintenance_graph");
@@ -6078,11 +6055,8 @@ TEST(Test__Qwen35MoEGraph, DeviceSideRebalanceMaintenanceSkipsDecodeHistogramSid
 
 TEST(Test__Qwen35MoEGraph, GroupedMainVerifierCreatesDecodeMaintenanceBinding)
 {
-    std::ifstream in(LLAMINAR_QWEN35_MOE_GRAPH_SOURCE);
-    ASSERT_TRUE(in.is_open()) << "Unable to open " << LLAMINAR_QWEN35_MOE_GRAPH_SOURCE;
-    const std::string source(
-        (std::istreambuf_iterator<char>(in)),
-        std::istreambuf_iterator<char>());
+    const std::string source = llaminar2::test_support::readSourceFileOrFamily(LLAMINAR_QWEN35_MOE_GRAPH_SOURCE);
+    ASSERT_FALSE(source.empty()) << "Unable to open " << LLAMINAR_QWEN35_MOE_GRAPH_SOURCE;
 
     EXPECT_NE(source.find("const bool grouped_main_verifier_layer"),
               std::string::npos)
@@ -6113,11 +6087,8 @@ TEST(Test__Qwen35MoEGraph, GroupedMainVerifierCreatesDecodeMaintenanceBinding)
  */
 TEST(Test__Qwen35MoEGraph, GroupedMainVerifierBindsStandardGpuRuntimeGrouping)
 {
-    std::ifstream in(LLAMINAR_QWEN35_MOE_GRAPH_SOURCE);
-    ASSERT_TRUE(in.is_open()) << "Unable to open " << LLAMINAR_QWEN35_MOE_GRAPH_SOURCE;
-    const std::string source(
-        (std::istreambuf_iterator<char>(in)),
-        std::istreambuf_iterator<char>());
+    const std::string source = llaminar2::test_support::readSourceFileOrFamily(LLAMINAR_QWEN35_MOE_GRAPH_SOURCE);
+    ASSERT_FALSE(source.empty()) << "Unable to open " << LLAMINAR_QWEN35_MOE_GRAPH_SOURCE;
 
     EXPECT_NE(
         source.find(
@@ -6151,12 +6122,8 @@ TEST(Test__Qwen35MoEGraph, GroupedMainVerifierBindsStandardGpuRuntimeGrouping)
  */
 TEST(Test__Qwen35MoEGraph, CapturedOverlayRouteLedgerHasOneTypedProducerLifecycle)
 {
-    std::ifstream in(LLAMINAR_QWEN35_MOE_GRAPH_SOURCE);
-    ASSERT_TRUE(in.is_open())
-        << "Unable to open " << LLAMINAR_QWEN35_MOE_GRAPH_SOURCE;
-    const std::string source(
-        (std::istreambuf_iterator<char>(in)),
-        std::istreambuf_iterator<char>());
+    const std::string source = llaminar2::test_support::readSourceFileOrFamily(LLAMINAR_QWEN35_MOE_GRAPH_SOURCE);
+    ASSERT_FALSE(source.empty()) << "Unable to open " << LLAMINAR_QWEN35_MOE_GRAPH_SOURCE;
 
     const size_t lifecycle = source.find(
         "enum class CapturedOverlayRouteLedgerWorkload");
@@ -6203,12 +6170,8 @@ TEST(Test__Qwen35MoEGraph, CapturedOverlayRouteLedgerHasOneTypedProducerLifecycl
 TEST(Test__Qwen35MoEGraph,
      DistributedOverlayAuthorityPinsRouteEvidenceForEveryTransport)
 {
-    std::ifstream in(LLAMINAR_QWEN35_MOE_GRAPH_SOURCE);
-    ASSERT_TRUE(in.is_open())
-        << "Unable to open " << LLAMINAR_QWEN35_MOE_GRAPH_SOURCE;
-    const std::string source(
-        (std::istreambuf_iterator<char>(in)),
-        std::istreambuf_iterator<char>());
+    const std::string source = llaminar2::test_support::readSourceFileOrFamily(LLAMINAR_QWEN35_MOE_GRAPH_SOURCE);
+    ASSERT_FALSE(source.empty()) << "Unable to open " << LLAMINAR_QWEN35_MOE_GRAPH_SOURCE;
 
     const size_t transport_selection = source.find(
         "use_mapped_activation_parent =");
@@ -6250,11 +6213,8 @@ TEST(Test__Qwen35MoEGraph,
 
 TEST(Test__Qwen35MoEGraph, DeviceSideRebalanceMaintenanceSelectsDecodeBindingByRole)
 {
-    std::ifstream in(LLAMINAR_QWEN35_MOE_GRAPH_SOURCE);
-    ASSERT_TRUE(in.is_open()) << "Unable to open " << LLAMINAR_QWEN35_MOE_GRAPH_SOURCE;
-    const std::string source(
-        (std::istreambuf_iterator<char>(in)),
-        std::istreambuf_iterator<char>());
+    const std::string source = llaminar2::test_support::readSourceFileOrFamily(LLAMINAR_QWEN35_MOE_GRAPH_SOURCE);
+    ASSERT_FALSE(source.empty()) << "Unable to open " << LLAMINAR_QWEN35_MOE_GRAPH_SOURCE;
 
     const size_t finder =
         source.find("Qwen35MoEGraph::findDeviceMoERebalanceMaintenanceBinding");
@@ -6336,11 +6296,8 @@ TEST(Test__Qwen35MoEGraph, DeviceSideRebalanceMaintenanceSelectsDecodeBindingByR
 TEST(Test__Qwen35MoEGraph,
      CurrentBatchLLEPEconomyPolicyIsIndependentOfDurableResidencyMaintenance)
 {
-    std::ifstream in(LLAMINAR_QWEN35_MOE_GRAPH_SOURCE);
-    ASSERT_TRUE(in.is_open()) << "Unable to open " << LLAMINAR_QWEN35_MOE_GRAPH_SOURCE;
-    const std::string source(
-        (std::istreambuf_iterator<char>(in)),
-        std::istreambuf_iterator<char>());
+    const std::string source = llaminar2::test_support::readSourceFileOrFamily(LLAMINAR_QWEN35_MOE_GRAPH_SOURCE);
+    ASSERT_FALSE(source.empty()) << "Unable to open " << LLAMINAR_QWEN35_MOE_GRAPH_SOURCE;
 
     const size_t config_builder = source.find("auto makeGraphRebalanceConfig =");
     ASSERT_NE(config_builder, std::string::npos);

@@ -296,8 +296,8 @@ namespace
                 // Real prepared experts carry admitted source coefficients:
                 // clamp the seeded words into their encoding's domain, then
                 // admit the publication like a producer does.
-                const std::uint16_t permitted = packed->usesIQ3SExpandedSourceScale() ? 15
-                    : packed->usesNibbleLUTSourceScale() ? 63
+                const std::uint16_t permitted = packed->usesNibbleLUTSourceScale()
+                    ? (packed->codebook_id == 11 ? 15 : 63)
                     : packed->usesCompactMultiScale() && packed->codebook_id == 13 ? 255 : 0xffff;
                 if (permitted != 0xffff)
                 {
@@ -2005,8 +2005,12 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric, LiveNativeOracleDistinguishesDirty
         EXPECT_EQ(livePreparedBytes(changed),expected);
         std::vector<size_t> fields;
         const bool q6=packed->encoding==cpu::native_quantised::CPUNativeQuantisedEncoding::Q6KNativeDualScale;
-        for(size_t byte=0;byte<(q6?16:size_t(packed->data_stride)/64);++byte)
+        const bool five_bit=packed->encoding==cpu::native_quantised::CPUNativeQuantisedEncoding::CompactFiveBit;
+        for(size_t byte=0;byte<((q6||five_bit)?16:size_t(packed->data_stride)/64);++byte)
             fields.push_back((byte/4)*256+byte%4);
+        if(five_bit)for(size_t group=0;group<8;++group) {
+            fields.push_back(1024+group*32);
+        }
         if(q6)for(size_t group=0;group<8;++group) {
             fields.push_back(1024+group*64);fields.push_back(1024+group*64+8);
         }

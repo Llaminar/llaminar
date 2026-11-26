@@ -111,6 +111,23 @@ namespace llaminar2
         }
     };
 
+    /** @brief Return whether @p tensor_name matches any NativeQuantised GGUF codebook. */
+    template<class Lookup>
+    bool isQwen4ExpNativeQuantisedSource(const std::string &tensor_name, Lookup &&matches)
+    {
+        using Format = GGUFTensorType;
+        for (const Format fmt : {
+                 Format::Q4_0, Format::Q4_1, Format::Q5_0, Format::Q5_1, Format::Q8_0,
+                 Format::Q2_K, Format::Q3_K, Format::Q4_K, Format::Q5_K, Format::Q6_K,
+                 Format::IQ4_NL, Format::IQ4_XS, Format::IQ3_S, Format::IQ3_XXS,
+                 Format::IQ2_S, Format::IQ2_XS, Format::IQ2_XXS, Format::IQ1_S, Format::IQ1_M})
+        {
+            if (matches(tensor_name, fmt))
+                return true;
+        }
+        return false;
+    }
+
     /**
      * @brief Classify the four original GDN projections in one recurrent layer.
      * @param layer Absolute main model layer.
@@ -127,8 +144,8 @@ namespace llaminar2
             return matches(source, Format::F16) || matches(source, Format::BF16) || matches(source, Format::F32);
         };
         return {
-            .native_q8_pair = matches(prefix + "attn_qkv.weight", Format::Q8_0) &&
-                matches(prefix + "attn_gate.weight", Format::Q8_0),
+            .native_q8_pair = isQwen4ExpNativeQuantisedSource(prefix + "attn_qkv.weight", matches) &&
+                isQwen4ExpNativeQuantisedSource(prefix + "attn_gate.weight", matches),
             .floating_controls = floating("ssm_alpha.weight") && floating("ssm_beta.weight")};
     }
 
@@ -144,18 +161,17 @@ namespace llaminar2
     {
         using Format = GGUFTensorType;
         const std::string prefix = "blk." + std::to_string(layer) + ".";
-        for (const auto *name : {"hc_ffn_down.weight", "hc_ffn_up.weight",
-                                 "ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight"})
+        // HC down/up projections require signed Q8_0 per PersistentHCRead contract.
+        for (const auto *name : {"hc_ffn_down.weight", "hc_ffn_up.weight"})
             if (!matches(prefix + name, Format::Q8_0))
                 return false;
 
-        const auto gate = prefix + "ffn_gate_exps.weight";
-        const auto up = prefix + "ffn_up_exps.weight";
-        const auto down = prefix + "ffn_down_exps.weight";
-        const bool down_q8 = matches(down, Format::Q8_0);
-        return (matches(gate, Format::Q4_K) && matches(up, Format::Q4_K) &&
-                    (down_q8 || matches(down, Format::Q5_1))) ||
-               (matches(gate, Format::Q5_K) && matches(up, Format::Q5_K) && down_q8);
+        // Shared and routed FFN experts may use ANY NativeQuantised GGUF codebook.
+        for (const auto *name : {"ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight",
+                                 "ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight"})
+            if (!isQwen4ExpNativeQuantisedSource(prefix + name, matches))
+                return false;
+        return true;
     }
 
     /** @brief Per-layer mixer identity; predictor blocks always use sparse attention. */

@@ -27,6 +27,7 @@
  */
 
 #include "SnapshotCapture.h"
+#include "../tensors/SIMDHelpers.h"
 
 #include <algorithm>
 #include <charconv>

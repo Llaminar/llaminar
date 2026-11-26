@@ -124,7 +124,7 @@ namespace
             for (int lane = 0; lane < 8; ++lane)
             {
                 words[64 + lane] = std::uint16_t(32 | (1u << bit));
-                EXPECT_THROW((void)source_scale.loadScales256(words.data()), std::invalid_argument);
+                EXPECT_THROW((void)loadScales256(source_scale, words.data()), std::invalid_argument);
                 words[64 + lane] = 32;
             }
 #if defined(__AVX512F__)
@@ -132,7 +132,7 @@ namespace
             for (int lane = 0; lane < 16; ++lane)
             {
                 words[64 + lane] = std::uint16_t(32 | (1u << bit));
-                EXPECT_THROW((void)source_scale.loadScales512(words.data()), std::invalid_argument);
+                EXPECT_THROW((void)loadScales512(source_scale, words.data()), std::invalid_argument);
                 words[64 + lane] = 32;
             }
 #endif
@@ -215,11 +215,11 @@ namespace
                 for (int block = 0; block < layout.blocks_per_row; ++block)
                 {
                     SCOPED_TRACE(block);
-                    EXPECT_THROW((void)raw.loadScales256(raw.chunkScales(last, block) + live / 8 * 8), std::invalid_argument);
-                    EXPECT_NO_THROW((void)normalized.loadScales256(normalized.chunkScales(last, block) + live / 8 * 8));
+                    EXPECT_THROW((void)loadScales256(raw, raw.chunkScales(last, block) + live / 8 * 8), std::invalid_argument);
+                    EXPECT_NO_THROW((void)loadScales256(normalized, normalized.chunkScales(last, block) + live / 8 * 8));
 #if defined(__AVX512F__)
-                    EXPECT_THROW((void)raw.loadScales512(raw.chunkScales(last, block) + live / 16 * 16), std::invalid_argument);
-                    EXPECT_NO_THROW((void)normalized.loadScales512(normalized.chunkScales(last, block) + live / 16 * 16));
+                    EXPECT_THROW((void)loadScales512(raw, raw.chunkScales(last, block) + live / 16 * 16), std::invalid_argument);
+                    EXPECT_NO_THROW((void)loadScales512(normalized, normalized.chunkScales(last, block) + live / 16 * 16));
 #endif
                 }
             }

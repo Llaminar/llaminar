@@ -1026,6 +1026,14 @@ namespace llaminar2
             size_t bytes,
             int device_id,
             void *stream) override;
+        /** @copydoc IBackend::copyDeviceVisibleRegionsAndPublishByKernelOnStream */
+        bool copyDeviceVisibleRegionsAndPublishByKernelOnStream(
+            const MappedHostCopySegment *segments,
+            size_t segment_count,
+            uint64_t *publication_signal,
+            uint64_t publication_value,
+            int device_id,
+            void *stream) override;
         /** @copydoc IBackend::initializeMappedTransferService */
         bool initializeMappedTransferService(
             MappedTransferServiceCursor *cursors, size_t capacity,

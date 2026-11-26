@@ -17,6 +17,22 @@
 namespace llaminar2
 {
     /**
+     * @brief Per-transfer policy controlling GPU device timing-event recording.
+     *
+     * Device timing events are required during economy calibration to quantify
+     * GPU work intervals, but recording timing events after asynchronous DMA on
+     * ROCm triggers synchronous ROCclr/SDMA stalls on production placement waves.
+     * Production waves under `EconomyCalibrationOnly` pass `Disabled` so only
+     * the non-timing completion fence event is recorded.
+     */
+    enum class ExpertTierDeviceTimingCapture : std::uint8_t
+    {
+        LaneDefault, ///< Follow the lane's configured `collect_timing_measurements` flag.
+        Enabled,     ///< Require and record device timing events for this transfer.
+        Disabled,    ///< Omit device timing events; fence completion only.
+    };
+
+    /**
      * @brief Timing and byte evidence for one completed projection transfer.
      *
      * `wall_nanoseconds` is the end-to-end lane latency observed by the real

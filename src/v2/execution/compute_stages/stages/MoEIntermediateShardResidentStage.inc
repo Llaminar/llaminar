@@ -123,20 +123,18 @@ public:
         // tensors or a different output selection on the same prepared owner.
         auto descriptors=MoESelectedDescriptorDemand::ExternalTables;
 #ifdef HAVE_ROCM
-        if(implementation_==rocm::FullNativeHCFFNImplementation::RetainedGFX906M1) {
-            descriptors=MoESelectedDescriptorDemand::AcquiredBankOnly;
-            for(const auto& name:graph.getExecutionOrder()) {
-                const auto* node=graph.getNode(name);
-                const auto* consumer=dynamic_cast<const IMoESelectedDescriptorConsumer*>(node->stage.get());
-                if(!consumer)continue;
-                for(const auto& read:consumer->selectedDescriptorReads()) {
-                    if(read.producer!=name_)continue;
-                    if(read.runtime!=binding_->params.runtime||read.model_layer!=binding_->layer||
-                       node->stage->device()!=device()||
-                       std::find(node->dependencies.begin(),node->dependencies.end(),name_)==node->dependencies.end())
-                        throw std::invalid_argument("Selected MoE descriptor read lost its producer, participant, or layer binding");
-                    descriptors=MoESelectedDescriptorDemand::ExternalTables;
-                }
+        descriptors=MoESelectedDescriptorDemand::AcquiredBankOnly;
+        for(const auto& name:graph.getExecutionOrder()) {
+            const auto* node=graph.getNode(name);
+            const auto* consumer=dynamic_cast<const IMoESelectedDescriptorConsumer*>(node->stage.get());
+            if(!consumer)continue;
+            for(const auto& read:consumer->selectedDescriptorReads()) {
+                if(read.producer!=name_)continue;
+                if(read.runtime!=binding_->params.runtime||read.model_layer!=binding_->layer||
+                   node->stage->device()!=device()||
+                   std::find(node->dependencies.begin(),node->dependencies.end(),name_)==node->dependencies.end())
+                    throw std::invalid_argument("Selected MoE descriptor read lost its producer, participant, or layer binding");
+                descriptors=MoESelectedDescriptorDemand::ExternalTables;
             }
         }
 #endif
@@ -372,12 +370,9 @@ public:
 #ifdef HAVE_ROCM
         if(native_router_)
         {
-            if(full_prefix_&&implementation_==rocm::FullNativeHCFFNImplementation::RetainedGFX906M1)
-                requirements.merge(rocm::retainedM1HCFFNWorkspace());
-            else
-                MoEWorkspaceBuffers::add(requirements,MoEWorkspaceBuffers::NATIVE_LAYOUT_BARRIER,
-                    (full_prefix_?rocm::fullNativeHCFFNSlotBytes(implementation_):NativeLayoutBarrierLayout::bytes)*
-                        MoEWorkspaceBuffers::kGroupedDescriptorTableSlots,WorkspaceContentLifetime::SerialGraphFamily);
+            MoEWorkspaceBuffers::add(requirements,MoEWorkspaceBuffers::NATIVE_LAYOUT_BARRIER,
+                (full_prefix_?rocm::fullNativeHCFFNSlotBytes(implementation_):NativeLayoutBarrierLayout::bytes)*
+                    MoEWorkspaceBuffers::kGroupedDescriptorTableSlots,WorkspaceContentLifetime::SerialGraphFamily);
         }
 #else
         if(native_router_)throw std::logic_error("Native-layout router FFN workspace requires ROCm");

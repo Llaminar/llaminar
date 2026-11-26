@@ -419,6 +419,10 @@ namespace llaminar2
         bool usesQFNMI50TP4() const noexcept
         { return local_gpu_expert_kernel_policy == LocalGPUExpertKernelPolicy::QFNMI50TP4; }
 
+        /** @return Whether the continuation domain is a qualified gfx906 MI50 cohort (any valid width/tier count). */
+        bool usesGFX906MI50Kernels() const noexcept
+        { return llaminar2::usesGFX906MI50Kernels(local_gpu_expert_kernel_policy); }
+
         /** Setup-owned replica geometry; absent before admission or without a directory. */
         std::optional<MoEOverlayReplicaCacheCapacity> replica_cache_capacity;
 

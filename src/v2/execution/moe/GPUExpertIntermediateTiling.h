@@ -9,7 +9,14 @@
 namespace llaminar2
 {
 /** @brief Kernel eligibility derived from the original model and bound hardware inventory. */
-enum class LocalGPUExpertKernelPolicy : std::uint8_t { Generic, QFNMI50TP4 };
+enum class LocalGPUExpertKernelPolicy : std::uint8_t { Generic, QFNMI50TP4, GFX906MI50 };
+
+/** @return Whether the participant domain is a qualified gfx906 (MI50) cohort of any valid width. */
+constexpr bool usesGFX906MI50Kernels(LocalGPUExpertKernelPolicy policy) noexcept
+{
+    return policy == LocalGPUExpertKernelPolicy::QFNMI50TP4 ||
+           policy == LocalGPUExpertKernelPolicy::GFX906MI50;
+}
 
 /** @brief Preferred activation tile for the original source-native intermediate partition. */
 enum class GPUExpertIntermediateTiling : std::uint8_t { Coarse128, BalancedNativeK32 };

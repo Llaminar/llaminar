@@ -49,6 +49,11 @@ void rocmQwenSparseAttention(const QwenSparseAttention &params, hipStream_t stre
  * selects the phase program and admits its exact scratch. Default serving is unchanged.
  */
 void rocmQwenSparseFP16Attention(const QwenSparseAttention &params, hipStream_t stream);
+/** @brief Enqueue only the FP16 tiled producer kernel (for fusion with RetainedQSAPostAttention).
+ * @param params Native FP16 KV bindings, sealed arithmetic program, and exclusive partial scratch.
+ * @param stream Exact non-default HIP producer/consumer stream.
+ */
+void rocmQwenSparseFP16TilesOnly(const QwenSparseAttention &params, hipStream_t stream);
 /** @brief Enqueue accepted raw-tail publication without changing the canonical frontier.
  * @param params Device-owned acceptance decision and persistent partial-key publication.
  * @param stream Exact non-default HIP producer/consumer stream.

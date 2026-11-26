@@ -11,22 +11,8 @@
 
 #include <span>
 
-namespace llaminar2
-{
-    class CUDAResidentPacketAcquire;
-}
-
 namespace llaminar2::cuda_moe_packet
 {
-    /** @brief Per-CTA resource envelope reserved by the co-resident QFN packet geometry on SM86. */
-    struct ResidentDispatchPeerBudget
-    {
-        static constexpr unsigned block_threads = 256;
-        static constexpr unsigned registers_per_thread = 112;
-        static constexpr unsigned shared_bytes = 22528;
-        static constexpr unsigned blocks_per_sm = 2;
-    };
-
     /** @brief Original one-row packet with its registered, conditionally copied payload. */
     struct ResidentMappedDispatch
     {
@@ -35,9 +21,9 @@ namespace llaminar2::cuda_moe_packet
     };
 
     /**
-     * @brief Certify the metadata warp's residency beside the original math grid.
+     * @brief Admit the original lane's native metadata warp before capture.
      * @param device_ordinal Exact prepared CUDA device.
-     * @return Whether its compiled resources fit beside two retained CTAs.
+     * @return Whether the exact device admits the compiled warp launch.
      */
     bool prepareResidentDispatchPacket(int device_ordinal);
 
@@ -46,11 +32,10 @@ namespace llaminar2::cuda_moe_packet
      * @param lanes Prevalidated topology-ordered native packet bindings.
      * @param device_ordinal Exact CUDA device admitted for the program.
      * @param stream Original non-default stream recording the complete parent.
-     * @param acquire First single-lane consumer's optional capture-owned acquire.
      * @return Whether every lease is recorded and the current frontier joins them.
      */
     bool recordResidentDispatchPackets(std::span<const ResidentMappedDispatch> lanes,
-        int device_ordinal, void* stream, const CUDAResidentPacketAcquire* acquire = nullptr);
+        int device_ordinal, void* stream);
 
 }
 
@@ -148,6 +133,12 @@ extern "C"
 
     /** @brief Validate staged peer rows, fold in route order, and acknowledge. */
     bool cudaMoEOverlayFoldNodeLocalCanonicalRoutes(
+        const llaminar2::MoENodeLocalRouteConsumeLaunch *launch,
+        int device_ordinal,
+        void *stream);
+
+    /** @brief Single-row fused acquire, validate, direct-mapped fold, and acknowledge. */
+    bool cudaMoEOverlayConsumeSingleRowNodeLocalCanonicalRoutes(
         const llaminar2::MoENodeLocalRouteConsumeLaunch *launch,
         int device_ordinal,
         void *stream);

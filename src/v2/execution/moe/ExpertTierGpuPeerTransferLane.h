@@ -127,7 +127,9 @@ namespace llaminar2
             const GpuExpertPackedDescriptor &source,
             const GpuExpertPackedDescriptor &destination,
             const ExpertTierSourceReadiness &source_readiness,
-            std::string *error = nullptr) noexcept;
+            std::string *error = nullptr,
+            ExpertTierDeviceTimingCapture timing_capture =
+                ExpertTierDeviceTimingCapture::LaneDefault) noexcept;
 
         /**
          * @brief Copy only original native block intersections on the retained peer stream.
@@ -136,12 +138,14 @@ namespace llaminar2
          * @param intersection Checked original-coordinate overlap.
          * @param source_readiness Exact event or installed-bank authority.
          * @param error Optional exact validation/submission failure.
+         * @param timing_capture Per-transfer device timing-event capture policy.
          * @return Whether compact work has a destination completion fence.
          */
         bool start(const GpuExpertPackedDescriptor& source,
             const GpuExpertPackedDescriptor& destination,
             const ExpertTierWeightProjectionIntersection& intersection,
-            const ExpertTierSourceReadiness& source_readiness,std::string* error = nullptr) noexcept;
+            const ExpertTierSourceReadiness& source_readiness,std::string* error = nullptr,
+            ExpertTierDeviceTimingCapture timing_capture = ExpertTierDeviceTimingCapture::LaneDefault) noexcept;
 
         /**
          * @brief Copy a floating rectangle without transferring unrelated rows or columns.
@@ -150,12 +154,14 @@ namespace llaminar2
          * @param intersection Checked original-coordinate overlap.
          * @param source_readiness Exact event or installed-bank authority.
          * @param error Optional exact validation/submission failure.
+         * @param timing_capture Per-transfer device timing-event capture policy.
          * @return Whether compact work has a destination completion fence.
          */
         bool startFloating(const ContiguousFloatingPointWeightDescriptor& source,
             const ContiguousFloatingPointWeightDescriptor& destination,
             const ExpertTierWeightProjectionIntersection& intersection,
-            const ExpertTierSourceReadiness& source_readiness,std::string* error = nullptr) noexcept;
+            const ExpertTierSourceReadiness& source_readiness,std::string* error = nullptr,
+            ExpertTierDeviceTimingCapture timing_capture = ExpertTierDeviceTimingCapture::LaneDefault) noexcept;
 
         /**
          * @brief Submit one raw FP16/BF16/FP32 projection blob copy.
@@ -164,6 +170,7 @@ namespace llaminar2
          * @param bytes Exact byte-identical projection size.
          * @param source_readiness Exact event or installed-bank authority.
          * @param error Optional exact submission failure.
+         * @param timing_capture Per-transfer device timing-event capture policy.
          * @return True when submitted work has a destination completion fence.
          */
         bool startContiguous(
@@ -171,7 +178,9 @@ namespace llaminar2
             void *destination,
             std::size_t bytes,
             const ExpertTierSourceReadiness &source_readiness,
-            std::string *error = nullptr) noexcept;
+            std::string *error = nullptr,
+            ExpertTierDeviceTimingCapture timing_capture =
+                ExpertTierDeviceTimingCapture::LaneDefault) noexcept;
 
         /** @brief Query the completion event once without blocking. */
         ExpertTierGpuPeerTransferProgress poll(
@@ -240,7 +249,8 @@ namespace llaminar2
             const GPUExpertPointers &destination,
             ExpertTierGpuBlobChunkProtocol& protocol,
             const ExpertTierSourceReadiness &source_readiness,
-            std::string *error) noexcept;
+            std::string *error,
+            ExpertTierDeviceTimingCapture timing_capture) noexcept;
 
         /** Release resources through the destination runtime without waiting. */
         void releaseQuiescentResources() noexcept;
@@ -264,6 +274,7 @@ namespace llaminar2
             ExpertTierGpuPeerTransferProgress::Idle;
         bool work_may_be_in_flight_ = false;
         bool fail_after_event_ = false;
+        bool active_timing_enabled_ = false;
         std::size_t submitted_bytes_ = 0;
         std::string failure_;
         std::chrono::steady_clock::time_point transfer_started_at_{};

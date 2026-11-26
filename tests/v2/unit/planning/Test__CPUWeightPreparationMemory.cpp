@@ -46,8 +46,8 @@ TEST(CPUWeightPreparationMemory, EveryNativeCodebookHasPaddedAllocationGeometry)
 TEST(CPUWeightPreparationMemory, NibbleSetupPayloadsRetireBeforePublication)
 {
     const auto q4 = CPUWeightPreparationMemory::sourceNative("Q4_0", 64, 32);
-    EXPECT_EQ(q4.persistent_bytes,1280u);
-    EXPECT_EQ(q4.persistent_payload_bytes,1280u);
+    EXPECT_EQ(q4.persistent_bytes,1152u);
+    EXPECT_EQ(q4.persistent_payload_bytes,1152u);
     EXPECT_EQ(q4.temporary_bytes,64u*cpu::native_quantised::NativePackGroupScratch::checked(*native_quantised_formats::forQuantType("Q4_0")).bytes);
     const auto q6 = CPUWeightPreparationMemory::sourceNative("Q6_K", 64, 256);
     EXPECT_EQ(q6.persistent_payload_bytes,8u*1792u);

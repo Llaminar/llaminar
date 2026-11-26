@@ -62,16 +62,11 @@ TEST(CPUNativeQuantisedFusedCompletion, UnsignedCoefficientDomainContract)
         const auto decoder=nibbleDecodeKind(source.metadata->codebook_id);
         const bool linear=decoder==NibbleDecodeKind::Q4_0_LINEAR ||
                           decoder==NibbleDecodeKind::Q4_1_IDENTITY;
-        if(linear)EXPECT_EQ(encoding,CPUNativeQuantisedEncoding::NibbleLUT);
+        if(linear)EXPECT_EQ(encoding,CPUNativeQuantisedEncoding::UnsignedNibble);
         if(encoding==CPUNativeQuantisedEncoding::NibbleLUTSourceScale)
             EXPECT_EQ(decoder,NibbleDecodeKind::LUT);
         CPUNativeQuantisedPackedWeights metadata;
         metadata.encoding=encoding;
-        if(encoding==CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale)
-        {
-            EXPECT_FALSE(metadata.usesNibbleLUT());
-            EXPECT_FALSE(linear);
-        }
         // Rotated operands keep their original expanded producer; they cannot
         // enter a nibble-body specialization merely because source codebook0/5.
         metadata.encoding=preparedEncodingForSource(*source.metadata,true);
@@ -134,7 +129,7 @@ TEST(CPUNativeQuantisedFusedCompletion, UnsignedCoefficientDomainContract)
     }
     packed.codebook_id = native_quantised_formats::Q5_1.codebook_id;
     for (auto encoding : {CPUNativeQuantisedEncoding::NibbleLUT,
-                           CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale,
+                           CPUNativeQuantisedEncoding::NibbleLUTSourceScale,
                            CPUNativeQuantisedEncoding::CompactMultiScale,
                            CPUNativeQuantisedEncoding::Q6KNativeDualScale})
     {
@@ -168,6 +163,7 @@ void originalBiasedUnsignedM1(
     const int tiles=nativeQuantisedUsesKPartitions(config.k_tiles)?config.k_tiles:1;
     const int blocks_per_tile=(packed.blocks_per_row+tiles-1)/tiles;
     const bool expanded = packed.coefficientDomain() == CPUNativeQuantisedCoefficientDomain::UnsignedFiveBit;
+    const bool five_bit = packed.usesCompactFiveBit();
     const int groups = expanded ? 8 : 4;
     std::vector<float> partials(size_t(tiles)*64);
     for(int chunk=0;chunk<(packed.N+63)/64;++chunk) {
@@ -180,25 +176,42 @@ void originalBiasedUnsignedM1(
                 alignas(64) int32_t dots[64];
                 for(int column=0;column<64;++column) {
                     int dot=0;
+                    int weight_sum=0;
+                    const int z = column / 16, lane = column % 16;
                     for(int group=0;group<groups;++group) {
                         const auto* bytes=reinterpret_cast<const uint8_t*>(
-                            packed.interleavedB(chunk,kb,group,column/16));
-                        for(int lane=0;lane<4;++lane) {
-                            const uint8_t raw=bytes[(column%16)*4+lane];
-                            if (expanded)
-                                dot+=(int(input.qs[group*4+lane])+128)*raw;
-                            else {
-                                dot+=(int(input.qs[group*4+lane])+128)*(raw&15);
-                                dot+=(int(input.qs[group*4+16+lane])+128)*(raw>>4);
+                            packed.interleavedB(chunk,kb,group,z));
+                        uint64_t hi_lo = 0, hi_hi = 0;
+                        if (five_bit) {
+                            std::memcpy(&hi_lo, packed.fiveBitHighBitplane(chunk, kb, group, z), 8);
+                            std::memcpy(&hi_hi, packed.fiveBitHighBitplane(chunk, kb, group + 4, z), 8);
+                        }
+                        for(int k=0;k<4;++k) {
+                            const uint8_t raw=bytes[lane*4+k];
+                            if (expanded) {
+                                dot+=(int(input.qs[group*4+k])+128)*raw;
+                                weight_sum += raw;
+                            } else if (five_bit) {
+                                const int w_lo = (raw & 15) | (int((hi_lo >> (lane * 4 + k)) & 1u) << 4);
+                                const int w_hi = (raw >> 4) | (int((hi_hi >> (lane * 4 + k)) & 1u) << 4);
+                                dot+=(int(input.qs[group*4+k])+128)*w_lo;
+                                dot+=(int(input.qs[group*4+16+k])+128)*w_hi;
+                                weight_sum += w_lo + w_hi;
+                            } else {
+                                const int w_lo = raw & 15, w_hi = raw >> 4;
+                                dot+=(int(input.qs[group*4+k])+128)*w_lo;
+                                dot+=(int(input.qs[group*4+16+k])+128)*w_hi;
+                                weight_sum += w_lo + w_hi;
                             }
                         }
                     }
-                    dots[column]=dot-128*int(packed.chunkComp(chunk,kb)[column]);
+                    const int comp = packed.usesInlineCompensation() ? int(packed.chunkComp(chunk,kb)[column]) : weight_sum;
+                    dots[column]=dot-128*comp;
                 }
                 for(int segment=0;segment<4;++segment)
                     accum[segment]=accumulateCorrectedSingleScaleBlockAVX512(
                         accum[segment],_mm512_load_si512(dots+segment*16),
-                        packed.loadScales512(packed.chunkScales(chunk,kb)+segment*16),
+                        loadScales512(packed, packed.chunkScales(chunk,kb)+segment*16),
                         input.sum_qs,_mm512_cvtph_ps(_mm256_load_si256(
                             reinterpret_cast<const __m256i*>(packed.chunkMins(chunk,kb)+segment*16))),
                         nativeQuantisedFP16ScaleToFP32(input.d),packed.numerical_policy);
@@ -269,39 +282,25 @@ TEST(CPUNativeQuantisedFusedCompletion, UnsignedWeightDotAllFormatByteLifecycle)
                 const auto &packed = kernel.packedWeights();
                 ASSERT_EQ(packed.N, geometry.n);
                 ASSERT_EQ(packed.K, geometry.k);
-                const auto expected_domain = source_five_bit
-                    ? CPUNativeQuantisedCoefficientDomain::UnsignedFiveBit
-                    : CPUNativeQuantisedCoefficientDomain::SignedInt8;
-                ASSERT_EQ(packed.coefficientDomain(), expected_domain);
                 if (source_five_bit)
                 {
-                    // Authenticate the canonical prepared range itself; the
-                    // optimization may not guess from asymmetric minima.
-                    for (int chunk = 0; chunk < (geometry.n + 63) / 64; ++chunk)
-                        for (int kb = 0; kb < packed.blocks_per_row; ++kb)
-                            for (int group = 0; group < 8; ++group)
-                                for (int z = 0; z < 4; ++z)
-                                {
-                                    const auto *bytes = reinterpret_cast<const int8_t *>(
-                                        packed.interleavedB(chunk, kb, group, z));
-                                    ASSERT_TRUE(std::all_of(bytes, bytes + 64,
-                                        [](int8_t value) { return value >= 0 && value <= 31; }));
-                                }
+                    ASSERT_TRUE(packed.usesCompactFiveBit());
+                    ASSERT_TRUE(packed.is_asymmetric);
+                    ASSERT_FALSE(packed.usesInlineCompensation());
                 }
                 if (source_identity_nibble)
                 {
                     ASSERT_TRUE(packed.usesNibbleLUT());
+                    ASSERT_TRUE(packed.usesUnsignedNibble());
                     ASSERT_TRUE(packed.is_asymmetric);
-                    ASSERT_EQ(packed.encoding, CPUNativeQuantisedEncoding::NibbleLUT);
-                    // Validate actual prepared low/high coefficient placement
-                    // and the old compensation on both runtime ISAs. The dot
-                    // replacement may not infer unsignedness from minima.
+                    ASSERT_FALSE(packed.usesInlineCompensation());
+                    ASSERT_EQ(packed.encoding, CPUNativeQuantisedEncoding::UnsignedNibble);
+                    // Validate actual prepared low/high unsigned nibbles without inline comp.
                     for (int chunk = 0; chunk < (geometry.n + 63) / 64; ++chunk)
                         for (int kb = 0; kb < packed.blocks_per_row; ++kb)
                             for (int column = 0; column < std::min(64, geometry.n - chunk * 64); ++column)
                             {
                                 const int z = column / 16, lane = column % 16;
-                                int sum = 0;
                                 for (int group = 0; group < 4; ++group)
                                 {
                                     const auto *raw = reinterpret_cast<const uint8_t *>(
@@ -312,10 +311,8 @@ TEST(CPUNativeQuantisedFusedCompletion, UnsignedWeightDotAllFormatByteLifecycle)
                                         const int low = bits & 15, high = bits >> 4;
                                         ASSERT_GE(low, 0); ASSERT_LE(low, 15);
                                         ASSERT_GE(high, 0); ASSERT_LE(high, 15);
-                                        sum += low + high;
                                     }
                                 }
-                                EXPECT_EQ(packed.chunkComp(chunk, kb)[column], sum);
                             }
                 }
                 const auto workspace = packed.native_interleaved;
@@ -702,7 +699,7 @@ TEST(CPUNativeQuantisedFusedCompletion, OrderedNibbleSplitDotBoundaryLifecycle)
             }
         }
     }
-    EXPECT_EQ(nibble_sources, 5); // Original canonical Q4_0/Q4_1/Q4_K/IQ4_NL/IQ4_XS factories.
+    EXPECT_EQ(nibble_sources, 9); // Canonical Q4_0/Q4_1/Q4_K/IQ4_NL/IQ4_XS + IQ3_S/IQ3_XXS/IQ2_XXS/IQ1_S factories.
 }
 #endif // !defined(__aarch64__)
 

@@ -345,6 +345,11 @@ namespace llaminar2
         {
             return hasState(required_state_size);
         }
+        /** @brief Borrow the already-bound immutable device recurrence state for an enclosing native megakernel. */
+        float *borrowedLiveDeviceState(int required_state_size) const noexcept
+        {
+            return stateForSize(required_state_size);
+        }
         bool supportsPaddedPrefillRealLength() const override { return true; }
         /** @brief Prepare an immutable retained invocation without allocating or rebinding live state.
          * @param sources Frozen raw merged operands and device live-count owner.

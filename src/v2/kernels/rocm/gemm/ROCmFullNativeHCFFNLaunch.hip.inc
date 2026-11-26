@@ -10,19 +10,21 @@
  */
 #pragma once
 #include "ROCmFullNativeHCFFN.h"
+#include "ROCmFastFullNativeHCFFN.h"
 
 namespace llaminar2::rocm {
 /** @copydoc fullNativeHCFFNKernelFunction */
+const void* fullNativeHCFFNKernelFunctionShard1(ResidentMoEFFNDecoderProgram program);
+const void* fullNativeHCFFNKernelFunctionShard2(ResidentMoEFFNDecoderProgram program);
 const void* fullNativeHCFFNKernelFunction(ResidentMoEFFNDecoderProgram program)
 {
 #define LLAMINAR_FULL_HC_FAMILY(G) case G:return reinterpret_cast<const void*>(&fullNativeHCFFNKernel<ResidentMoEFFNDecoderProgram::familyMask<G>()>);
     switch(program.groups())
     {
         LLAMINAR_FULL_HC_FAMILY(1) LLAMINAR_FULL_HC_FAMILY(2) LLAMINAR_FULL_HC_FAMILY(3)
-        LLAMINAR_FULL_HC_FAMILY(4) LLAMINAR_FULL_HC_FAMILY(5) LLAMINAR_FULL_HC_FAMILY(6)
-        LLAMINAR_FULL_HC_FAMILY(7) LLAMINAR_FULL_HC_FAMILY(8) LLAMINAR_FULL_HC_FAMILY(9)
-        LLAMINAR_FULL_HC_FAMILY(10) LLAMINAR_FULL_HC_FAMILY(11) LLAMINAR_FULL_HC_FAMILY(12)
-        LLAMINAR_FULL_HC_FAMILY(13) LLAMINAR_FULL_HC_FAMILY(14) LLAMINAR_FULL_HC_FAMILY(15)
+        LLAMINAR_FULL_HC_FAMILY(4) LLAMINAR_FULL_HC_FAMILY(5)
+        case 6: case 7: case 8: case 9: case 10: return fullNativeHCFFNKernelFunctionShard1(program);
+        case 11: case 12: case 13: case 14: case 15: return fullNativeHCFFNKernelFunctionShard2(program);
     }
 #undef LLAMINAR_FULL_HC_FAMILY
     throw std::invalid_argument("Full native HC/FFN source envelope is invalid");
@@ -103,8 +105,16 @@ PreparedMoEFFNProgram prepareFullNativeHCFFN(DeviceId device,FullNativeHCFFNArgs
     const auto prefix_bytes=fullNativeHCFFNPrefixDynamicBytes(args.prefix,1);
     if(!prefix_bytes)
         throw std::invalid_argument("Full native HC/FFN has no valid prefix storage geometry");
-    const auto dynamic_bytes=std::max(prefix_bytes,suffix.dynamic_shared_bytes);
-    const void* function=fullNativeHCFFNKernelFunction(original_suffix.decoder);
+    const auto base_dynamic_bytes=std::max(prefix_bytes,suffix.dynamic_shared_bytes);
+    const void* generic_function=fullNativeHCFFNKernelFunction(original_suffix.decoder);
+    const void* function=selectFullNativeHCFFNKernelFunction(args,original_suffix.decoder,prefix_bytes);
+    const bool uses_fast=(function!=generic_function);
+    const auto dynamic_bytes=uses_fast
+        ? fastFullNativeHCFFNDynamicBytes(args,base_dynamic_bytes,hardware.lds_per_block-sizeof(FullNativeHCFFNShared))
+        : base_dynamic_bytes;
+    NativeEmbeddingIQTables iq_tables{};
+    if(uses_fast&&!rocmNativeEmbeddingIQTableView(device.ordinal,&iq_tables))
+        throw std::runtime_error("Full native HC/FFN could not resolve cold IQ grid addresses");
     const auto admission=NativeCooperativeKernelBoundary<NativeCooperativeBackend::ROCm>::prepare(
         device,function,1024,dynamic_bytes,generation,NativeResidentLaunchPolicy::Ordinary);
     const auto& hc=args.prefix.hc;
@@ -125,7 +135,10 @@ PreparedMoEFFNProgram prepareFullNativeHCFFN(DeviceId device,FullNativeHCFFNArgs
     args.prefix.hc.resident_grid=grid;args.suffix.ffn.resident_grid=grid;
     ResidentMoEFFNProgramEvidence evidence{.kind=ResidentMoEFFNLaunchKind::OrdinaryResident,.device=device,.generation=generation};
     evidence.entries[0]={admission.function(),grid,admission.threads(),admission.dynamicSharedBytes(),admission.resources()};
-    return PreparedMoEFFNProgram(evidence,admission);
+    PreparedMoEFFNProgram prepared(evidence,admission);
+    prepared.iq_tables_=iq_tables;
+    prepared.uses_fast_full_entry_=uses_fast;
+    return prepared;
 }
 
 /** @copydoc launchFullNativeHCFFN */
@@ -141,10 +154,14 @@ void launchFullNativeHCFFN(const PreparedMoEFFNProgram& program,const FullNative
         hardware.lds_per_block-sizeof(FullNativeHCFFNShared));
     const FullNativeHCFFNSuffixPanel panel{suffix_geometry.panel_rows,suffix_geometry.panel_blocks};
     const auto prefix_bytes=fullNativeHCFFNPrefixDynamicBytes(args.prefix,1);
-    const auto dynamic_bytes=std::max(prefix_bytes,suffix_geometry.dynamic_shared_bytes);
+    const auto base_dynamic_bytes=std::max(prefix_bytes,suffix_geometry.dynamic_shared_bytes);
+    const void* expected_function=selectFullNativeHCFFNKernelFunction(args,decoder,prefix_bytes);
+    const auto dynamic_bytes=program.uses_fast_full_entry_
+        ? fastFullNativeHCFFNDynamicBytes(args,base_dynamic_bytes,hardware.lds_per_block-sizeof(FullNativeHCFFNShared))
+        : base_dynamic_bytes;
     if(!prefix_bytes||prefix_bytes>32768||(prefix_bytes&15u)||!program.cooperative_||program.cooperative_->policy()!=NativeResidentLaunchPolicy::Ordinary||
         program.evidence_.kind!=ResidentMoEFFNLaunchKind::OrdinaryResident||
-        program.evidence_.entries[0].function!=fullNativeHCFFNKernelFunction(decoder)||
+        program.evidence_.entries[0].function!=expected_function||
         program.evidence_.entries[0].grid!=grid||!grid||args.prefix.hc.resident_grid!=grid||
         args.suffix.full_entry_panel!=panel||program.evidence_.entries[0].dynamic_shared_bytes!=dynamic_bytes||
         grid>program.cooperative_->maximumGrid()||generation!=program.evidence_.generation||
@@ -159,8 +176,12 @@ void launchFullNativeHCFFN(const PreparedMoEFFNProgram& program,const FullNative
     // launch identity above. Capture it after the two original argument records;
     // suffix field offsets and every tensor/state owner remain unchanged.
     unsigned captured_prefix_bytes=static_cast<unsigned>(prefix_bytes);
-    void* parameters[]{&suffix,&prefix,&captured_prefix_bytes};
-    const auto status=hipLaunchKernel(program.evidence_.entries[0].function,dim3(grid),dim3(1024),parameters,
+    unsigned captured_dynamic_bytes=static_cast<unsigned>(dynamic_bytes);
+    NativeEmbeddingIQTables iq_tables=program.iq_tables_;
+    void* fast_parameters[]{&suffix,&prefix,&captured_dynamic_bytes,&iq_tables};
+    void* generic_parameters[]{&suffix,&prefix,&captured_prefix_bytes};
+    const auto status=hipLaunchKernel(program.evidence_.entries[0].function,dim3(grid),dim3(1024),
+        program.uses_fast_full_entry_?fast_parameters:generic_parameters,
         program.evidence_.entries[0].dynamic_shared_bytes,static_cast<hipStream_t>(stream));
     if(status!=hipSuccess)
         throw std::runtime_error(std::string("Full native HC/FFN resident launch: ")+hipGetErrorString(status));

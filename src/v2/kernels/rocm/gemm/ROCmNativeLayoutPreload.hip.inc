@@ -183,7 +183,27 @@ __device__ __forceinline__ void preloadBlockPayload(BlockOperand<FMT>& operand,
 {
     const auto* source=payload+linear*NATIVE_QUANTISEDTraits<FMT>::payload_bytes;
     constexpr unsigned bytes=NATIVE_QUANTISEDTraits<FMT>::payload_bytes;
-    if constexpr(bytes%4==0)
+    if constexpr(bytes%16==0)
+    {
+        const auto* vecs=reinterpret_cast<const int4*>(source);
+        #pragma unroll
+        for(unsigned vec=0;vec<bytes/16;++vec)
+        {
+            const int4 v=Reader::template load<int4>(vecs+vec);
+            __builtin_memcpy(operand.packed+vec*16,&v,sizeof(v));
+        }
+    }
+    else if constexpr(bytes%8==0)
+    {
+        const auto* vecs=reinterpret_cast<const uint2*>(source);
+        #pragma unroll
+        for(unsigned vec=0;vec<bytes/8;++vec)
+        {
+            const uint2 v=Reader::template load<uint2>(vecs+vec);
+            __builtin_memcpy(operand.packed+vec*8,&v,sizeof(v));
+        }
+    }
+    else if constexpr(bytes%4==0)
     {
         auto* destination=reinterpret_cast<uint32_t*>(operand.packed);
         const auto* words=reinterpret_cast<const uint32_t*>(source);

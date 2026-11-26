@@ -24,6 +24,7 @@
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include "../../../SourceShardReader.h"
 #include "execution/local_execution/orchestrators/IInferenceRunner.h"
 #include "execution/local_execution/orchestrators/RankOrchestrator.h"
 #include "execution/debug/TPSnapshot.h"
@@ -139,12 +140,7 @@ struct DeviceMoETicketProtocolProbe
  */
 std::string readSourceFileForRankOrchestratorTest(const std::string &path)
 {
-    std::ifstream input(path);
-    if (!input.good())
-        return {};
-    std::ostringstream buffer;
-    buffer << input.rdbuf();
-    return buffer.str();
+    return llaminar2::test_support::readSourceFileOrFamily(path);
 }
 
 // =============================================================================

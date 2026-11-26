@@ -75,8 +75,8 @@ inline void validateQwenSparseAttentionArithmetic(QwenSparseAttentionArithmetic 
     (void)qwenSparseAttentionArithmeticName(policy);
     if(backend!=DeviceType::CPU && backend!=DeviceType::CUDA && backend!=DeviceType::ROCm)
         throw std::invalid_argument("QSA attention requires an explicit CPU, CUDA or ROCm participant");
-    if(policy!=QwenSparseAttentionArithmetic::FixedFP32 && backend!=DeviceType::ROCm)
-        throw std::invalid_argument("QSA fp16_tile is an explicit ROCm attention experiment; CPU/CUDA are unsupported");
+    if(policy!=QwenSparseAttentionArithmetic::FixedFP32 && backend!=DeviceType::ROCm && backend!=DeviceType::CUDA)
+        throw std::invalid_argument("QSA fp16_tile requires CUDA or ROCm GPU execution; CPU is unsupported");
 }
 
 /** @brief Closed setup schedule, resolved to a concrete program before native submission. */
@@ -121,8 +121,8 @@ inline void validateQwenSparseAttentionPhaseSchedule(QwenSparseAttentionPhaseSch
     (void)qwenSparseAttentionPhaseScheduleName(schedule);
     if(backend!=DeviceType::CPU && backend!=DeviceType::CUDA && backend!=DeviceType::ROCm)
         throw std::invalid_argument("QSA attention schedule requires CPU, CUDA or ROCm");
-    if(schedule==QwenSparseAttentionPhaseSchedule::Prefill8Decode33 && backend!=DeviceType::ROCm)
-        throw std::invalid_argument("QSA prefill8_decode33 is an explicit ROCm attention diagnostic");
+    if(schedule==QwenSparseAttentionPhaseSchedule::Prefill8Decode33 && backend!=DeviceType::ROCm && backend!=DeviceType::CUDA)
+        throw std::invalid_argument("QSA prefill8_decode33 requires CUDA or ROCm GPU execution");
 }
 /**
  * @brief Return the sealed native record count for one resolved program.
@@ -216,7 +216,7 @@ resolveQwenSparseAttentionSetup(const QwenSparseAttentionSetupRequest &request,
     }
     if (request.schedule)
         (void)qwenSparseAttentionPhaseScheduleName(*request.schedule);
-    const bool native_half = geometry.backend == DeviceType::ROCm &&
+    const bool native_half = (geometry.backend == DeviceType::ROCm || geometry.backend == DeviceType::CUDA) &&
                              geometry.key_storage == TensorType::FP16 &&
                              geometry.value_storage == TensorType::FP16 &&
                              geometry.head_dimension == 256 && geometry.rotary_dimension == 64;

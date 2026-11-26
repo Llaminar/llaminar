@@ -44,6 +44,7 @@
 #ifdef HAVE_ROCM
 #include "kernels/rocm/gemm/RetainedPreAttentionDevice.h"
 #include "kernels/rocm/gemm/ROCmFloatingPointGemmKernel.h"
+#include "kernels/gdn/GDNPreparedQK.h"
 #include <iostream>
 #include <filesystem>
 #include <fstream>

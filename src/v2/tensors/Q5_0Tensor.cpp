@@ -668,4 +668,41 @@ namespace llaminar2
         ctx.scales_array[linear] = blk->d;
     }
 
+
+    void Q5_0Tensor::unpack_superblock_to_int8(
+        size_t row_idx,
+        size_t superblock_idx,
+        int8_t *output,
+        float *scales,
+        float *mins) const
+    {
+        const size_t blocks_per_row = (shape_[1] + Q5_0Block::BLOCK_SIZE - 1) / Q5_0Block::BLOCK_SIZE;
+        const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+        if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
+        const Q5_0Block *blocks = reinterpret_cast<const Q5_0Block *>(data_ptr);
+        const size_t base_block = superblock_idx * 8;
+        const Q5_0Block *src = &blocks[row_idx * blocks_per_row + base_block];
+
+        // Unpack 8 consecutive blocks (8 × 32 = 256 elements)
+        for (int i = 0; i < 8; ++i)
+        {
+            simd::unpack_q5_0_to_int8(src[i], output + i * 32);
+        }
+
+        if (scales)
+        {
+            for (int i = 0; i < 8; ++i)
+            {
+                scales[i] = fp16_to_fp32(src[i].d);
+            }
+        }
+        if (mins)
+        {
+            for (int i = 0; i < 8; ++i)
+            {
+                mins[i] = 0.0f; // Q5_0 is symmetric
+            }
+        }
+    }
+
 } // namespace llaminar2

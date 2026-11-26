@@ -68,18 +68,18 @@ struct FixtureStreamDrain
  * @param placement Persistent output storage contract, retained across replays.
  * @param admission Whether a device word owns the current live prefix.
  * @param beta Existing-output contribution, including the mapped-copy case.
- * @tparam M Physical view rows. @tparam RequestRows Original request capacity.
+ * @tparam K Recorded contraction width. @tparam RequestRows Original request capacity.
  * @tparam Origin Original view origin.
  * @param candidate Captured grouped producer; independent M1 oracle is unchanged.
  */
-template<int M = 3, int RequestRows = 3, int Origin = 1>
+template<int M = 3, int RequestRows = 3, int Origin = 1, int K = 32>
 void proveVerifierEpilogue(OutputPlacement placement, RowAdmission admission, float beta,
     rocm::NativeQuantisedVerifierCandidate candidate = rocm::NativeQuantisedVerifierCandidate::Automatic)
 {
     int devices = 0;
     if (hipGetDeviceCount(&devices) != hipSuccess || devices == 0)
         GTEST_SKIP() << "No ROCm device available";
-    constexpr int N = 17, K = 32;
+    constexpr int N = 17;
     constexpr float alpha = 0.75f;
     const auto device = DeviceId::rocm(0);
     ScopedGPUStream stream_owner(device);
@@ -186,13 +186,23 @@ void proveVerifierEpilogue(OutputPlacement placement, RowAdmission admission, fl
                 if(node.name.find("native_quantised_verifier_wmma_m16n64")!=std::string::npos) {
                     ASSERT_TRUE(node.valid()); EXPECT_EQ(node.block_x,128u);
                     EXPECT_EQ(node.block_y,1u); EXPECT_EQ(node.block_z,1u);
-                    EXPECT_EQ(node.grid_x,1u); EXPECT_EQ(node.grid_y,1u); EXPECT_EQ(node.grid_z,1u);
+                    EXPECT_EQ(node.grid_x,1u); EXPECT_EQ(node.grid_z,1u);
+                    if constexpr (K == 32) EXPECT_EQ(node.grid_y, 1u);
+                    else EXPECT_GT(node.grid_y, 1u);
                 }
             }
         EXPECT_EQ(std::count_if(nodes.begin(),nodes.end(),[](const auto &node) {
             return node.name.find("native_quantised_verifier_ordered_m4n64")!=std::string::npos;
         }), 0);
-        if (admission != RowAdmission::Fixed)
+        const auto names = [&](std::string_view name) {
+            return std::count_if(nodes.begin(), nodes.end(), [&](const auto &node) {
+                return node.name.find(name) != std::string::npos;
+            });
+        };
+        EXPECT_EQ(names("applyFp32CombineEpilogue_kernel"),
+            placement == OutputPlacement::Mapped ? 1 : 0);
+        EXPECT_EQ(names("gemv_native_quantised_reduce_small_m_kernel_t"), K == 32 ? 0 : 1);
+        if (placement == OutputPlacement::Mapped && admission != RowAdmission::Fixed)
         {
             auto *native = dynamic_cast<HIPGraphCapture *>(graph.get());
             ASSERT_NE(native, nullptr);
@@ -288,6 +298,14 @@ TEST(ROCmVerifierEpilogueReplay, DeviceOutput)
         ASSERT_NO_FATAL_FAILURE(proveVerifierEpilogue(OutputPlacement::Device, admission, -0.25f));
 }
 
+/** @test The split-K final reducer owns beta for the original live request intervals. */
+TEST(ROCmVerifierEpilogueReplay, OrderedReducerOwnsDeviceOutput)
+{
+    for (float beta : {-0.25f, 0.0f})
+        ASSERT_NO_FATAL_FAILURE((proveVerifierEpilogue<4, 3, 1, 1024>(
+            OutputPlacement::Device, RowAdmission::Requests, beta)));
+}
+
 /** @test Mapped output requires the same grouped arithmetic and live-byte extent. */
 TEST(ROCmVerifierEpilogueReplay, MappedOutput)
 {
@@ -378,6 +396,14 @@ TEST(ROCmVerifierWmmaEpilogueReplay, FixedAndCounted)
                 rocm::NativeQuantisedVerifierCandidate::WmmaM16N64));
 }
 
+
+/** @test WMMA retains raw partials and publishes beta in the ordered reducer. */
+TEST(ROCmVerifierWmmaEpilogueReplay, OrderedReducerOwnsDeviceOutput)
+{
+    ASSERT_NO_FATAL_FAILURE((proveVerifierEpilogue<4, 3, 1, 1024>(
+        OutputPlacement::Device, RowAdmission::Requests, -0.25f,
+        rocm::NativeQuantisedVerifierCandidate::WmmaM16N64)));
+}
 
 /** @brief Native replay preserves four/five-row intervals across independent request origins. */
 TEST(ROCmVerifierWmmaEpilogueReplay, NativeRequestIntervalInterleaving)

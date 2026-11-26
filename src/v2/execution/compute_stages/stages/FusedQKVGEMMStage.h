@@ -125,6 +125,8 @@ namespace llaminar2
 
         explicit FusedQKVGEMMStage(Params params);
 
+        const Params &getParams() const noexcept { return params_; }
+
         bool execute(IDeviceContext *ctx) override;
         bool validatePreparedWeights(std::string *error) const override;
         /** @return Complete immutable source-interval launch identity for this stage. */

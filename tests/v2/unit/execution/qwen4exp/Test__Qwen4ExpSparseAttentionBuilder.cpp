@@ -418,7 +418,7 @@ TEST(Qwen4ExpSparseAttentionBuilder, ProductionPoolSelectionUsesTypedPhaseAndBac
             {
                 SCOPED_TRACE(capacity);
                 EXPECT_EQ(Builder::poolSelectionForInvocation(Phase::Prefill,device,capacity),Selection::Installed);
-                if(type==DeviceType::ROCm)
+                if(type==DeviceType::ROCm || type==DeviceType::CUDA)
                     EXPECT_EQ(Builder::poolSelectionForInvocation(Phase::Decode,device,capacity),Selection::Bounded1024_1024);
                 else
                     EXPECT_EQ(Builder::poolSelectionForInvocation(Phase::Decode,device,capacity),Selection::Installed);
@@ -499,8 +499,9 @@ TEST(Qwen4ExpSparseAttentionBuilder, Phase33ResolvesExactPhaseAndCanonicalRetain
             phase==P::Prefill?A::TileFP16WithFP32Totals:A::TileFP16WithFP32Totals33);
     }
     for(int ordinal:{0,1,2})EXPECT_EQ(Builder::attentionArithmeticForInvocation(P::Decode,DeviceId(DeviceType::CPU,ordinal),1,1,0,A::FixedFP32,S::Uniform),A::FixedFP32);
-    for(const auto device:{DeviceId::cpu(),DeviceId::cuda(0),DeviceId(DeviceType::ROCm,-1),DeviceId::invalid()})
+    for(const auto device:{DeviceId::cpu(),DeviceId(DeviceType::ROCm,-1),DeviceId::invalid()})
         EXPECT_THROW(Builder::attentionArithmeticForInvocation(P::Decode,device,1,1,0,A::TileFP16WithFP32Totals,S::Prefill8Decode33),std::invalid_argument);
+    EXPECT_EQ(Builder::attentionArithmeticForInvocation(P::Decode,DeviceId::cuda(0),1,1,0,A::TileFP16WithFP32Totals,S::Prefill8Decode33),A::TileFP16WithFP32Totals33);
     for(const auto base:{A::FixedFP32,A::TileFP16WithFP32Totals33,static_cast<A>(255)})
         EXPECT_THROW(Builder::attentionArithmeticForInvocation(P::Decode,DeviceId::rocm(0),1,1,0,base,S::Prefill8Decode33),std::invalid_argument);
     EXPECT_THROW(Builder::attentionArithmeticForInvocation(static_cast<P>(255),DeviceId::rocm(0),1,1,0,A::TileFP16WithFP32Totals,S::Prefill8Decode33),std::invalid_argument);

@@ -43,6 +43,7 @@
 #include "backends/BackendManager.h"
 #include "backends/cuda/CUDAHardwareMetadata.h"
 #include "CUDANativeQuantisedArchitecture.h"
+#include "kernels/cuda/gemm/CUDANativeQuantisedGemvDispatchHeuristic.h"
 #include "backends/cuda/CUDAGraphCapture.h"
 #include "utils/DebugEnv.h"
 #include "utils/PerfStatsCollector.h"
@@ -64,8 +65,8 @@
 #endif
 
 #if LLAMINAR_CUDA_NATIVE_QUANTISED_GEMV_SHARD < 0 || \
-    LLAMINAR_CUDA_NATIVE_QUANTISED_GEMV_SHARD > 7
-#error "CUDA NativeQuantised GEMV shard index must be in [0, 7]"
+    LLAMINAR_CUDA_NATIVE_QUANTISED_GEMV_SHARD > 17
+#error "CUDA NativeQuantised GEMV shard index must be in [0, 17]"
 #endif
 
 #ifndef LLAMINAR_CUDA_NATIVE_QUANTISED_GEMV_SHARD_SYMBOL
@@ -330,26 +331,10 @@ namespace
     static thread_local int g_last_effective_kb = 1;
 
     // =====================================================================
-    // Shape classifier — tuned from the native-quantised sweep results.
-    // A slightly stricter wide threshold keeps borderline LM-head TP cases on
-    // the KPAR path, which wins more consistently across compressed formats.
+    // Shape classifier & generated launch policy (compiled out-of-line in
+    // CUDANativeQuantisedGemvDispatchHeuristic.cpp so shards skip 76K lines).
     // =====================================================================
-    enum class NativeGemvShape
-    {
-        WIDE,
-        KPAR,
-        DIRECT,
-        ROWPAR,
-        FUSED_KPAR
-    };
-
-    /** @brief Physical publication may differ while the ordered K tree is identical. */
-    static constexpr bool usesOrderedKpartTree(NativeGemvShape shape)
-    {
-        return shape == NativeGemvShape::KPAR || shape == NativeGemvShape::FUSED_KPAR;
-    }
-
-#include "kernels/cuda/gemm/CUDANativeQuantisedGemvDispatchHeuristicGenerated.inc"
+    using namespace llaminar2::cuda::native_quantised_dispatch;
 
     /** Complete host identity for one generated CUDA decode lookup. */
     using CUDAGeneratedDispatchCacheKey = std::array<uint64_t, 4>;
@@ -1309,6 +1294,70 @@ namespace
                     out += d_bias[n];
                 d_C[n] = out;
             }
+        }
+    }
+
+    /**
+     * @brief 2-lanes-per-column coalesced int4 Q8_0 M=1 GEMV (512B contiguous per warp).
+     *
+     * Adjacent lane pairs (2*c, 2*c+1) load the two 16-byte halves of each 32-byte
+     * Q8_0 payload block in one 100%-sector-efficient LDG.E.128 transaction per warp,
+     * combine their exact INT32 partial dots via one __shfl_xor_sync(1), and commit
+     * FP32 block contributions on the even lane in the exact ascending K-block order.
+     */
+    template <int TILE_N, class Rows = llaminar2::DeviceRowRange>
+    __global__ __launch_bounds__(TILE_N * 2) void nativeQuantisedGemv_wide_q8_pair(
+        const int8_t *__restrict__ d_A_int8,
+        const uint8_t *__restrict__ d_payload,
+        const uint16_t *__restrict__ d_scales,
+        float *__restrict__ d_C,
+        const float *__restrict__ d_scales_A,
+        int N, int K,
+        float alpha, float beta,
+        const float *__restrict__ d_C_existing,
+        const float *__restrict__ d_bias, Rows work)
+    {
+        if constexpr (std::is_same_v<Rows, llaminar2::ProjectionRowWork>)
+            if (!llaminar2::projectionWorkRowIsActiveUniform(work, 0)) return;
+
+        const int col_local = static_cast<int>(threadIdx.x >> 1);
+        const int half = static_cast<int>(threadIdx.x & 1u);
+        const int n = static_cast<int>(blockIdx.x) * TILE_N + col_local;
+        const bool active = (n < N);
+        const int blocks_per_row = K / BLOCK_K;
+
+        float acc = 0.0f;
+        for (int blk = 0; blk < blocks_per_row; ++blk)
+        {
+            const int4 a4 = reinterpret_cast<const int4 *>(d_A_int8 + blk * BLOCK_K)[half];
+            int32_t dot = 0;
+            if (active)
+            {
+                const size_t linear = static_cast<size_t>(blk) * static_cast<size_t>(N) + static_cast<size_t>(n);
+                const int4 w4 = *reinterpret_cast<const int4 *>(d_payload + linear * 32u + half * 16);
+                dot = __dp4a(a4.x, w4.x, 0);
+                dot = __dp4a(a4.y, w4.y, dot);
+                dot = __dp4a(a4.z, w4.z, dot);
+                dot = __dp4a(a4.w, w4.w, dot);
+            }
+            const int32_t peer = __shfl_xor_sync(0xffffffffu, dot, 1);
+            if (active && half == 0)
+            {
+                const size_t linear = static_cast<size_t>(blk) * static_cast<size_t>(N) + static_cast<size_t>(n);
+                const float ws = __half2float(__ushort_as_half(d_scales[linear]));
+                const float contribution = llaminar2::device_native_quantised_contract::singleScaleBlock(
+                    dot + peer, ws, d_scales_A[blk]);
+                acc = __fadd_rn(acc, contribution);
+            }
+        }
+        if (active && half == 0)
+        {
+            float out = alpha * acc;
+            if (beta != 0.0f && d_C_existing)
+                out += beta * d_C_existing[n];
+            if (d_bias)
+                out += d_bias[n];
+            d_C[n] = out;
         }
     }
 
@@ -3185,6 +3234,16 @@ namespace
             {
                 const int grid_n = (N + 64 - 1) / 64;
                 llaminar2::dispatchProjectionRows(1,nullptr,[&](auto work) {
+                if constexpr (CB == 19)
+                {
+                    if (N >= 16384)
+                    {
+                        nativeQuantisedGemv_wide_q8_pair<64><<<grid_n, 128, 0, stream>>>(
+                            d_A_int8, d_payload, d_scales, d_C,
+                            d_scales_A, N, K, alpha, beta, d_C_existing, d_bias, work);
+                        return;
+                    }
+                }
                 nativeQuantisedGemv_wide<64, 1, CB><<<grid_n, 64, 0, stream>>>(
                     d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
                     d_scales_A, N, K, alpha, beta, d_C_existing, d_bias, work);
@@ -3205,6 +3264,16 @@ namespace
             {
                 const int grid_n = (N + 128 - 1) / 128;
                 llaminar2::dispatchProjectionRows(1,nullptr,[&](auto work) {
+                if constexpr (CB == 19)
+                {
+                    if (N >= 16384)
+                    {
+                        nativeQuantisedGemv_wide_q8_pair<128><<<grid_n, 256, 0, stream>>>(
+                            d_A_int8, d_payload, d_scales, d_C,
+                            d_scales_A, N, K, alpha, beta, d_C_existing, d_bias, work);
+                        return;
+                    }
+                }
                 nativeQuantisedGemv_wide<128, 1, CB><<<grid_n, 128, 0, stream>>>(
                     d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
                     d_scales_A, N, K, alpha, beta, d_C_existing, d_bias, work);

@@ -202,6 +202,22 @@ namespace llaminar2
             return Base::deviceRingHeadPtr(kv_idx, seq_idx);
         }
 
+        int *mutableDeviceCachedTokenCountPtr(int layer, int seq_idx = 0) override
+        {
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
+            if (kv_idx < 0)
+                return nullptr;
+            return Base::mutableDeviceCachedTokenCountPtr(kv_idx, seq_idx);
+        }
+
+        int *mutableDeviceRingHeadPtr(int layer, int seq_idx = 0) override
+        {
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
+            if (kv_idx < 0)
+                return nullptr;
+            return Base::mutableDeviceRingHeadPtr(kv_idx, seq_idx);
+        }
+
         bool get_kv(int layer, int seq_idx,
                     ITensor **out_k, ITensor **out_v,
                     int *out_kv_len = nullptr) override

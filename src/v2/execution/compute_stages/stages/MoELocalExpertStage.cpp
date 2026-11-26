@@ -3562,6 +3562,8 @@ namespace llaminar2
                                 compact_hidden_source_rows_,
                         },
                         .cpu_joint_epoch=execution_joint_layer?&*execution_joint_layer:nullptr,
+                        .immutable_bank_binding_reused =
+                            reuse_immutable_engine_binding && static_cast<bool>(execution_joint_layer),
                     }))
             {
                 LOG_ERROR(

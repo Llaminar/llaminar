@@ -312,7 +312,7 @@ namespace llaminar2::test
             packed.blocks_per_row = 2;
             packed.codebook_id = native_quantised_formats::Q4_0.codebook_id;
             packed.payload_bytes = 16;
-            packed.encoding = CPUNativeQuantisedEncoding::NibbleLUT;
+            packed.encoding = preparedEncodingForCodebook(packed.codebook_id);
             packed.is_asymmetric = false;
             packed.is_superblock = false;
             packed.data_stride = static_cast<int>(
@@ -346,7 +346,7 @@ namespace llaminar2::test
             packed.N_padded = 64;
             packed.blocks_per_row = 2;
             packed.codebook_id = native_quantised_formats::Q5_1.codebook_id;
-            packed.payload_bytes = 32;
+            packed.payload_bytes = native_quantised_formats::Q5_1.payload_bytes;
             packed.encoding = preparedEncodingForCodebook(
                 packed.codebook_id);
             packed.is_asymmetric = true;
@@ -400,7 +400,7 @@ namespace llaminar2::test
         const auto manifest = makeMoEOverlayRemoteCpuProjectionManifest(
             identity, cpu_bytes, /*maximum_chunk_bytes=*/73);
         ASSERT_TRUE(manifest.valid());
-        EXPECT_EQ(manifest.region_bytes[0],1280u); // N32/K64 live columns, not2560-byte resident storage.
+        EXPECT_EQ(manifest.region_bytes[0],1152u); // N32/K64 live columns, not 2304-byte resident storage.
         EXPECT_EQ(manifest.region_bytes[1], 0u);
 
         std::array<
@@ -674,9 +674,9 @@ namespace llaminar2::test
         MoEOverlayHostRemoteProjectionSource source(
             manifest, regions, std::make_shared<int>(1));
 
-        EXPECT_EQ(cpu_bytes.native_interleaved.size(),2560u);
-        EXPECT_EQ(manifest.total_bytes,1280u);
-        EXPECT_EQ(manifest.cpu_wire_columns_per_unit,3u);
+        EXPECT_EQ(cpu_bytes.native_interleaved.size(),2304u);
+        EXPECT_EQ(manifest.total_bytes,1152u);
+        EXPECT_EQ(manifest.cpu_wire_columns_per_unit,4u);
         std::vector<uint8_t> staging(manifest.maximum_chunk_bytes,0xa5);
         MoEOverlayRemoteProjectionChunkView first;
         std::string error;
@@ -713,7 +713,7 @@ namespace llaminar2::test
             ++acknowledged_chunks;
         }
         EXPECT_GT(acknowledged_chunks, 1u);
-        EXPECT_EQ(acknowledged_bytes,1280u);
+        EXPECT_EQ(acknowledged_bytes,1152u);
     }
 
     TEST(
@@ -721,7 +721,24 @@ namespace llaminar2::test
         CpuDestinationAcceptsOnlyEquivalentAuthenticatedLiveGpuFormat)
     {
         auto fixture = makeTransaction();
-        const auto cpu_bytes = cpuAsymmetricProjectionBytes();
+        using namespace cpu::native_quantised;
+        CPUNativeQuantisedPackedWeights cpu_bytes;
+        cpu_bytes.N = 32;
+        cpu_bytes.K = 64;
+        cpu_bytes.N_padded = 64;
+        cpu_bytes.blocks_per_row = 2;
+        cpu_bytes.codebook_id = native_quantised_formats::IQ1_S.codebook_id;
+        cpu_bytes.payload_bytes = native_quantised_formats::IQ1_S.payload_bytes;
+        cpu_bytes.is_asymmetric = true;
+        cpu_bytes.is_superblock = true;
+        cpu_bytes.encoding = preparedEncodingForSource(native_quantised_formats::IQ1_S);
+        cpu_bytes.data_stride = static_cast<int>(preparedDataStride(cpu_bytes.encoding));
+        cpu_bytes.interleaved_block_stride = preparedInterleavedBlockStride(
+            cpu_bytes.encoding, cpu_bytes.is_asymmetric);
+        cpu_bytes.native_interleaved.resize_uninitialized(
+            static_cast<std::size_t>(cpu_bytes.N_padded / 64) *
+            static_cast<std::size_t>(cpu_bytes.blocks_per_row) *
+            cpu_bytes.interleaved_block_stride);
         const auto identity = remoteProjectionIdentity(
             fixture.transaction, DeviceId::cuda(0), DeviceId::cpu());
         const NativeQuantisedFormatInfo *source_format =
@@ -741,7 +758,7 @@ namespace llaminar2::test
         const auto expected = makeMoEOverlayRemoteCpuProjectionManifest(
             identity, canonical_stream, /*maximum_chunk_bytes=*/4096);
         auto live = expected;
-        /* Q5_1 demoted through CPU promotes as normalized INT8+minimum. */
+        /* IQ1_S demoted through CPU promotes as normalized INT8+minimum. */
         live.gpu_codebook_id = kNativeQuantisedExpandedInt8MinCodebook;
         live.gpu_payload_bytes_per_block = 32;
         live.gpu_is_asymmetric = 1;

@@ -110,5 +110,6 @@ NativeCooperativeKernelAdmission preparePersistentHCRead(DeviceId device,Persist
  * @param generation Original retained program/workspace generation.
  */
 void launchPersistentHCRead(const NativeCooperativeKernelAdmission& admission,const PersistentHCReadArgs& args,
- void* stream,std::uint64_t generation);
+ std::uint32_t* barrier_state,void* stream,std::uint64_t generation,
+ PersistentHCWriteInput previous_write={});
 }

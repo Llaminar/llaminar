@@ -267,6 +267,13 @@ namespace llaminar2
             const std::vector<void *> &streams) override;
         bool supportsAllreduceMultiOnStreams() const override;
 
+        bool supportsFusedFP32ViaFP16AllreduceMultiOnStreams() const noexcept override;
+        bool allreduceFP32ViaFP16MultiOnStreams(
+            const std::vector<void *> &buffers,
+            size_t count,
+            const std::vector<void *> &streams,
+            const std::vector<NativeCollectiveRows> &live_rows = {}) override;
+
         bool allreduceWithSidebandsMultiOnStreams(
             const std::vector<void *> &buffers,
             size_t count,

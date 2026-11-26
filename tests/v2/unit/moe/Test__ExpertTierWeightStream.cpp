@@ -130,6 +130,20 @@ namespace llaminar2
                     for (std::size_t block = 0; block < gpu.mins.size(); ++block)
                         gpu.mins[block] = static_cast<std::uint16_t>(
                             block & (physical.codebook_id == 11 ? 15u : 255u));
+                if (source.metadata->codebook_id == 12 ||
+                    source.metadata->codebook_id == 15 ||
+                    source.metadata->codebook_id == 16)
+                {
+                    const int8_t *lut = source.metadata->codebook_id == 12
+                        ? cpu::native_quantised::kIQ3XXSDecodeLUT
+                        : source.metadata->codebook_id == 15
+                              ? cpu::native_quantised::kIQ2XXSDecodeLUT
+                              : cpu::native_quantised::kIQ1SDecodeLUT;
+                    const std::size_t mod = source.metadata->codebook_id == 12 ? 16u
+                        : source.metadata->codebook_id == 15 ? 7u : 3u;
+                    for (std::size_t idx = 0; idx < gpu.payload.size(); ++idx)
+                        gpu.payload[idx] = static_cast<std::uint8_t>(lut[(idx * 7u + 1u) % mod]);
+                }
                 if (physical.has_emins)
                     gpu.emins.assign(gpu.scales.size(), 0xac002c00u);
 
@@ -142,7 +156,9 @@ namespace llaminar2
                 EXPECT_EQ(view.N, cpu.N);
                 EXPECT_EQ(view.K, cpu.K);
                 EXPECT_EQ(view.source_payload_bytes, source.metadata->payload_bytes);
-                EXPECT_EQ(view.payload_bytes, view.usesExpandedInt8() ? 32 : source.metadata->payload_bytes);
+                EXPECT_EQ(view.payload_bytes,
+                    (view.usesExpandedInt8() || view.usesUnsignedInt8()) ? 32
+                        : view.usesNibbleLUT() ? 16 : source.metadata->payload_bytes);
                 EXPECT_EQ(view.encoding, cpu.encoding);
                 EXPECT_EQ(view.numerical_policy, cpu.numerical_policy);
             }
@@ -176,8 +192,8 @@ namespace llaminar2
                 EXPECT_EQ(expanded.mins, original.mins);
                 if(codebook == 11)
                 {
-                    EXPECT_TRUE(cpu.usesIQ3SExpandedSourceScale());
-                    EXPECT_EQ(cpu.interleaved_block_stride,2432);
+                    EXPECT_TRUE(cpu.usesNibbleLUTSourceScale());
+                    EXPECT_EQ(cpu.interleaved_block_stride,1408);
                     EXPECT_EQ(expanded.codebook_id,11);
                     ASSERT_EQ(expanded.payload_bytes_per_block,13);
                     EXPECT_EQ(expanded.payload,original.payload);
@@ -330,11 +346,23 @@ namespace llaminar2
          */
         TEST(ExpertTierWeightStream, IQ4XSExplicitExpandedMetadataRemainsAccepted)
         {
-            auto plain = makeProjection(19, 32, false, false);
             cpu::native_quantised::CPUNativeQuantisedPackedWeights expanded;
+            expanded.N = 70;
+            expanded.K = 96;
+            expanded.N_padded = 128;
+            expanded.blocks_per_row = 3;
+            expanded.codebook_id = 4;
+            expanded.is_superblock = true;
+            expanded.is_asymmetric = false;
+            expanded.encoding = cpu::native_quantised::CPUNativeQuantisedEncoding::ExpandedInt8;
+            expanded.payload_bytes = 32;
+            expanded.data_stride = cpu::native_quantised::preparedDataStride(expanded.encoding);
+            expanded.interleaved_block_stride =
+                cpu::native_quantised::preparedInterleavedBlockStride(expanded.encoding, false);
+            expanded.native_interleaved.resize(
+                static_cast<std::size_t>(expanded.N_padded / 64) * expanded.blocks_per_row *
+                    expanded.interleaved_block_stride);
             std::string error;
-            ASSERT_TRUE(gpuToCpuExpertPackedReference(plain, expanded, &error)) << error;
-            expanded.codebook_id = 4; expanded.is_superblock = true;
             const auto manifest = makeCpuToGpuExpertTierWeightStreamManifest(
                 expanded, 101, 2, 7, ExpertTierWeightProjection::Down, 2);
             ASSERT_TRUE(manifest.valid(&error)) << error;
@@ -600,7 +628,7 @@ namespace llaminar2
                 << error;
             EXPECT_EQ(
                 cpu.encoding,
-                cpu::native_quantised::CPUNativeQuantisedEncoding::ExpandedInt8);
+                cpu::native_quantised::CPUNativeQuantisedEncoding::UnsignedInt8);
             EXPECT_EQ(cpu.codebook_id, native_quantised_formats::Q8_K.codebook_id);
             EXPECT_TRUE(cpu.is_superblock);
 
@@ -813,7 +841,9 @@ namespace llaminar2
                     EXPECT_EQ(view.interleavedBase(), projection.destination_bytes.data());
                     EXPECT_EQ(view.bytes().size(), projection.destination_bytes.size());
                     EXPECT_EQ(view.source_payload_bytes, entry.metadata->payload_bytes);
-                    EXPECT_EQ(view.payload_bytes, view.usesExpandedInt8() ? 32 : entry.metadata->payload_bytes);
+                    EXPECT_EQ(view.payload_bytes,
+                        (view.usesExpandedInt8() || view.usesUnsignedInt8()) ? 32
+                            : view.usesNibbleLUT() ? 16 : entry.metadata->payload_bytes);
                 }
                 lease.reset();
                 EXPECT_EQ(pool->usedSlots(), 0u);

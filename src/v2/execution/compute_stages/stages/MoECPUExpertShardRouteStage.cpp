@@ -291,19 +291,65 @@ bool MoECPUExpertShardRouteStage::executeWithBank(IDeviceContext *ctx,MoEOverlay
         publish();return finish();
     }
     std::optional<cpu::moe::CanonicalShardSparseRouteView> sparse_view;
-    if(sparse)sparse_view=cpu::moe::CanonicalShardSparseRouteView{
-        {sparse->original_route_slots_host,sparse->live_entry_count},
-        {sparse->expert_ids_host,sparse->live_entry_count},
-        {sparse->route_weights_host,sparse->live_entry_count}};
+    int active_rows = p.rows;
+    if(sparse) {
+        sparse_view=cpu::moe::CanonicalShardSparseRouteView{
+            {sparse->original_route_slots_host,sparse->live_entry_count},
+            {sparse->expert_ids_host,sparse->live_entry_count},
+            {sparse->route_weights_host,sparse->live_entry_count}};
+        // Bound route-map/combine work to the actual live row prefix instead of
+        // the full prefill arena capacity (e.g. 512 rows during M=1 decode).
+        if (sparse->live_entry_count == 0u) {
+            active_rows = 0;
+        } else {
+            int32_t max_slot = 0;
+            for (size_t e = 0; e < sparse->live_entry_count; ++e) {
+                if (sparse->original_route_slots_host[e] > max_slot)
+                    max_slot = sparse->original_route_slots_host[e];
+            }
+            const int needed_rows = static_cast<int>(max_slot / p.top_k) + 1;
+            if (needed_rows > 0 && needed_rows < active_rows)
+                active_rows = needed_rows;
+        }
+    }
+    const size_t active_slots = static_cast<size_t>(active_rows) * static_cast<size_t>(p.top_k);
     const auto combine_begin=timing_observation_?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
+    std::optional<cpu::moe::CanonicalRoutePreweightedOutput> fused_remote_preweight;
+    if (!publication && sparse && p.original_preweighted_routes &&
+        p.return_publication != OriginalReturnPublication::CanonicalHostRows)
+    {
+        const auto width = static_cast<size_t>(p.columns);
+        bool slots_valid = true;
+        for (size_t entry = 0; entry < sparse->live_entry_count; ++entry)
+        {
+            if (static_cast<size_t>(sparse->original_route_slots_host[entry]) >=
+                p.original_return_route_capacity)
+            {
+                slots_valid = false;
+                break;
+            }
+        }
+        if (slots_valid)
+        {
+            fused_remote_preweight = cpu::moe::CanonicalRoutePreweightedOutput{
+                {p.original_preweighted_routes, p.original_return_route_capacity * width},
+                {sparse->original_route_slots_host, sparse->live_entry_count},
+                {sparse->original_route_slots_host, sparse->live_entry_count},
+                {sparse->route_weights_host, sparse->live_entry_count},
+                cpu::moe::PreweightedStoreLocality::CrossSocketStreaming,
+                /*skip_combined_store=*/true,
+            };
+        }
+    }
     const cpu::moe::CanonicalShardRouteRecordArgs combine_args{
         {records,gathered*canonical_moe_route_record::recordWidth(p.columns)},p.source_ranges,
-        {p.route_indices?p.route_indices->data():nullptr,p.route_indices?slots:0},
-        {p.route_weights?p.route_weights->data():nullptr,p.route_weights?slots:0},
+        {p.route_indices?p.route_indices->data():nullptr,p.route_indices?active_slots:0},
+        {p.route_weights?p.route_weights->data():nullptr,p.route_weights?active_slots:0},
         invocation_bank?std::span<const int>(invocation_bank->layerForModelLayer(p.original_source->layer()).fragment_expert_ids):p.original_source->expertIds(),
         p.participant_route_maps,p.required_route_weights,
-        {p.combined_routes->mutable_data(),slots*static_cast<size_t>(p.columns)},
-        p.original_source->ownership().geometry().experts,p.rows,p.top_k,p.columns,sparse_view};
+        {p.combined_routes->mutable_data(),active_slots*static_cast<size_t>(p.columns)},
+        p.original_source->ownership().geometry().experts,active_rows,p.top_k,p.columns,sparse_view,
+        fused_remote_preweight};
     if(publication) {
         if(!combineAndPublishMoEOverlayCanonicalShardRouteRows(*p.original_canonical_ticket,
             *publication,*sparse,combine_args))return reject("canonical_fused_combine_ticket_publication");
@@ -416,19 +462,24 @@ std::optional<CPUExpertShardRouteCompletion> MoECPUExpertShardRouteStage::execut
         if (expected == MoEOverlayActivationReturnRole::JointRoot)
         {
             const auto publication_begin=timing_observation_?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
-            const auto width=static_cast<size_t>(params_.columns);
             for(size_t entry=0;entry<input.live_entry_count;++entry) {
                 const auto slot=static_cast<size_t>(input.original_route_slots_host[entry]);
                 if(slot>=params_.original_return_route_capacity) {
                     return reject_original("original_return_slot_capacity");
                 }
             }
-            if(!preweightMoEOverlayCanonicalRouteRows(input,
-                {params_.combined_routes->data(),params_.combined_routes->numel()},
-                MoEOverlayCanonicalRouteSourceLayout::originalSlots(),
-                {params_.original_preweighted_routes,params_.original_return_route_capacity*width},
-                MoEOverlayCanonicalRouteSourceIndex::OriginalRouteSlot)) {
-                return reject_original("original_return_preweight");
+            // executeWithBank already fused combine + preweight directly into
+            // original_preweighted_routes when original_preweighted_routes is bound.
+            if (!params_.original_preweighted_routes)
+            {
+                const auto width=static_cast<size_t>(params_.columns);
+                if(!preweightMoEOverlayCanonicalRouteRows(input,
+                    {params_.combined_routes->data(),params_.combined_routes->numel()},
+                    MoEOverlayCanonicalRouteSourceLayout::originalSlots(),
+                    {params_.original_preweighted_routes,params_.original_return_route_capacity*width},
+                    MoEOverlayCanonicalRouteSourceIndex::OriginalRouteSlot)) {
+                    return reject_original("original_return_preweight");
+                }
             }
             for(size_t row=0;row<input.live_row_count;++row)output.row_ids_host[row]=input.row_ids_host[row];
             output.live_row_count=input.live_row_count;

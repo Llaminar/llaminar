@@ -68,6 +68,8 @@ namespace llaminar2
                 "LLAMINAR_GPU_STAGE_TIMING",
                 "LLAMINAR_GPU_STAGE_TIMING_DETAIL",
                 "LLAMINAR_PROFILING",
+                "LLAMINAR_QFN_CUDA_MAPPED_RETAINED_M1_HC_FFN_CANDIDATE",
+                "LLAMINAR_QFN_RETAINED_M1_HC_FFN_CANDIDATE",
             };
             for (const char *name : names)
             {

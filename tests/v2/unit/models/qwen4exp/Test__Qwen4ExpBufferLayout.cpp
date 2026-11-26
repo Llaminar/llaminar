@@ -350,8 +350,13 @@ TEST(Qwen4ExpBufferLayout, Phase33EnvelopeRejectsForeignFamiliesAndOverflow)
     auto d=dimensions(model,std::nullopt);d.attention_phase_schedule=Schedule::Prefill8Decode33;
     const auto geometry=Qwen4ExpMemoryGeometry::fromConfig(*model.flash_next);
     GraphResolverConfig resolver;resolver.seq_len=1;resolver.d_model=model.d_model;resolver.local_n_heads=6;
-    for(const auto device:{DeviceId::cpu(),DeviceId(DeviceType::CPU,1),DeviceId::cuda(0)}) {
+    for(const auto device:{DeviceId::cpu(),DeviceId(DeviceType::CPU,1)}) {
         auto bad=d;bad.device=device;EXPECT_THROW(applyQwen4ExpBufferGeometry(resolver,geometry,bad),std::invalid_argument);
+    }
+    {
+        auto cuda_d=d;cuda_d.device=DeviceId::cuda(0);
+        auto cuda_resolver=resolver;
+        EXPECT_NO_THROW(applyQwen4ExpBufferGeometry(cuda_resolver,geometry,cuda_d));
     }
     auto bad=d;bad.request_capacity=2;EXPECT_THROW(applyQwen4ExpBufferGeometry(resolver,geometry,bad),std::invalid_argument);
     bad=d;bad.attention_phase_schedule=static_cast<Schedule>(255);EXPECT_THROW(applyQwen4ExpBufferGeometry(resolver,geometry,bad),std::invalid_argument);

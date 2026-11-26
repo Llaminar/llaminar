@@ -58,9 +58,11 @@ namespace llaminar2::test
         const Qwen4ExpConfig config(model);
         for (const auto policy : {Arithmetic::FP16MoEAlphaBeta, Arithmetic::FP16AlphaBeta})
         {
-            EXPECT_TRUE(config.supportsRetainedGDN(0, policy));
-            EXPECT_TRUE(config.supportsRetainedGDN(8, policy));
-            for (const int layer : {1, 2, 3, 4, 5, 6})
+            // All NativeQuantised QKV/Z codebooks with floating alpha/beta controls on GDN layers are supported.
+            for (const int layer : {0, 1, 2, 8})
+                EXPECT_TRUE(config.supportsRetainedGDN(layer, policy)) << layer;
+            // SparseAttention layers (layer 3) and quantized or missing alpha/beta controls remain rejected.
+            for (const int layer : {3, 4, 5, 6})
                 EXPECT_FALSE(config.supportsRetainedGDN(layer, policy)) << layer;
         }
         for (const auto policy : {Arithmetic::Native, Arithmetic::FP32, Arithmetic::FP16})
@@ -100,7 +102,10 @@ namespace llaminar2::test
         for (int layer = 0; layer < 9; ++layer)
         {
             SCOPED_TRACE(layer);
-            EXPECT_EQ(config.hasRetainedM1HCFFNSources(layer), layer < 3);
+            // Layers 0..6 all have Q8_0 HC projections and NativeQuantised routed/shared experts
+            // (including mixed IQ2_S/IQ3_S/IQ4_NL/Q6_K and Q4_K/Q5_K/Q5_1). Layer 7 has Q6_K HC up,
+            // layer 8 has no weights, and layer 48 is a predictor block.
+            EXPECT_EQ(config.hasRetainedM1HCFFNSources(layer), layer < 7);
         }
         EXPECT_FALSE(config.hasRetainedM1HCFFNSources(48));
     }

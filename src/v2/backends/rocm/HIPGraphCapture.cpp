@@ -1157,13 +1157,52 @@ namespace llaminar2
         }
 
         const auto instantiate_begin = std::chrono::steady_clock::now();
-        hipError_t err = hipGraphInstantiate(&exec_, graph_, nullptr, nullptr, 0);
+        hipGraphNode_t error_node = nullptr;
+        char instantiate_log[1024] = {};
+        hipError_t err = hipGraphInstantiate(
+            &exec_, graph_, &error_node, instantiate_log, sizeof(instantiate_log));
         const auto instantiate_elapsed =
             std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - instantiate_begin);
         if (err != hipSuccess)
         {
-            LOG_ERROR("[HIPGraphCapture] hipGraphInstantiate failed: " << hipGetErrorString(err));
+            std::string node_diag;
+            if (error_node)
+            {
+                hipGraphNodeType err_type{};
+                if (hipGraphNodeGetType(error_node, &err_type) == hipSuccess)
+                {
+                    node_diag = " error_node_type=" + std::to_string(static_cast<int>(err_type));
+                }
+            }
+            size_t total_nodes = 0;
+            if (hipGraphGetNodes(graph_, nullptr, &total_nodes) == hipSuccess && total_nodes > 0)
+            {
+                std::vector<hipGraphNode_t> all_nodes(total_nodes);
+                if (hipGraphGetNodes(graph_, all_nodes.data(), &total_nodes) == hipSuccess)
+                {
+                    std::map<int, size_t> type_counts;
+                    for (hipGraphNode_t n : all_nodes)
+                    {
+                        hipGraphNodeType t{};
+                        if (hipGraphNodeGetType(n, &t) == hipSuccess)
+                            type_counts[static_cast<int>(t)]++;
+                    }
+                    node_diag += " total_nodes=" + std::to_string(total_nodes) + " types={";
+                    bool first = true;
+                    for (const auto &kv : type_counts)
+                    {
+                        if (!first) node_diag += ",";
+                        first = false;
+                        node_diag += std::to_string(kv.first) + ":" + std::to_string(kv.second);
+                    }
+                    node_diag += "}";
+                }
+            }
+            LOG_ERROR("[HIPGraphCapture] hipGraphInstantiate failed: " << hipGetErrorString(err)
+                      << " device=ROCm:" << device_ordinal_
+                      << node_diag
+                      << (instantiate_log[0] ? std::string(" log=") + instantiate_log : std::string()));
             exec_ = nullptr;
             return false;
         }
@@ -1240,6 +1279,8 @@ namespace llaminar2
         return launchOnStream(static_cast<void *>(stream_));
     }
 
+extern "C" void rocmDebugNotifyGraphLaunch(int device_id) __attribute__((weak));
+
     bool HIPGraphCapture::launchOnStream(void *stream) const
     {
         if (!activateOwner("launchOnStream") || !exec_ || !stream)
@@ -1247,6 +1288,8 @@ namespace llaminar2
             LOG_ERROR("[HIPGraphCapture] Cannot launch: executable or explicit stream is missing");
             return false;
         }
+        if (rocmDebugNotifyGraphLaunch)
+            rocmDebugNotifyGraphLaunch(device_ordinal_);
         hipError_t err = hipGraphLaunch(
             exec_,
             static_cast<hipStream_t>(stream));
@@ -1899,6 +1942,118 @@ namespace llaminar2
                     std::to_string(static_cast<int>(memory_after_status)));
         }
         node_count_ = 0;
+    }
+
+    namespace
+    {
+        /** @brief Active HIP stream-capture dependency frontier snapshot. */
+        struct HIPEarlyPacketFrontier
+        {
+            hipGraph_t graph = nullptr;
+            unsigned long long capture_id = 0;
+            std::span<const hipGraphNode_t> nodes;
+        };
+
+        /** @brief Validate exact HIP capture stream and read its current frontier. */
+        HIPEarlyPacketFrontier readHIPEarlyPacketFrontier(hipStream_t stream)
+        {
+            if (!stream || stream == hipStreamLegacy || stream == hipStreamPerThread)
+                throw std::invalid_argument("HIP early packet requires its original explicit stream");
+            hipStreamCaptureStatus status{};
+            HIPEarlyPacketFrontier result;
+            const hipGraphNode_t *nodes = nullptr;
+            std::size_t count = 0;
+            if (hipStreamGetCaptureInfo_v2(stream, &status, &result.capture_id, &result.graph,
+                                           &nodes, &count) != hipSuccess ||
+                status != hipStreamCaptureStatusActive || !result.graph || !result.capture_id ||
+                (count && !nodes))
+            {
+                throw std::logic_error("HIP early packet lost its active native capture frontier");
+            }
+            result.nodes = std::span(nodes, count);
+            return result;
+        }
+
+        /** @brief Redirect the exact HIP capture stream frontier to checked nodes. */
+        void setHIPEarlyPacketFrontier(hipStream_t stream, std::span<hipGraphNode_t> nodes, unsigned flags)
+        {
+            const hipError_t status =
+                hipStreamUpdateCaptureDependencies(stream, nodes.data(), nodes.size(), flags);
+            if (status != hipSuccess)
+            {
+                throw std::runtime_error(
+                    std::string("HIP early packet frontier update failed: ") + hipGetErrorString(status));
+            }
+        }
+    } // namespace
+
+    void HIPEarlyPacketPublication::prepare(void *stream)
+    {
+        const auto native = static_cast<hipStream_t>(stream);
+        hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
+        if (!native || native == hipStreamLegacy || native == hipStreamPerThread ||
+            hipStreamIsCapturing(native, &capture) != hipSuccess ||
+            capture != hipStreamCaptureStatusNone)
+        {
+            throw std::logic_error("HIP early packet requires cold preparation on its original stream");
+        }
+        stream_ = native;
+        graph_ = nullptr;
+        capture_id_ = 0;
+        producer_frontier_.clear();
+        packet_frontier_.clear();
+    }
+
+    void HIPEarlyPacketPublication::recordCompletedProducer(void *stream)
+    {
+        const auto native = static_cast<hipStream_t>(stream);
+        const auto fork = readHIPEarlyPacketFrontier(native);
+        if (native != stream_ || fork.nodes.empty() ||
+            (graph_ == fork.graph && capture_id_ == fork.capture_id))
+        {
+            throw std::logic_error("HIP early packet requires one completed producer on its prepared capture stream");
+        }
+        graph_ = fork.graph;
+        capture_id_ = fork.capture_id;
+        producer_frontier_.assign(fork.nodes.begin(), fork.nodes.end());
+        packet_frontier_.clear();
+    }
+
+    bool HIPEarlyPacketPublication::recordConsumer(void *stream, const std::function<bool()> &record)
+    {
+        const auto native = static_cast<hipStream_t>(stream);
+        const auto primary = readHIPEarlyPacketFrontier(native);
+        if (!record || native != stream_ || primary.graph != graph_ || primary.capture_id != capture_id_ ||
+            primary.nodes.empty() || producer_frontier_.empty())
+        {
+            throw std::logic_error("HIP early packet consumer crossed its original producer's native capture unit");
+        }
+
+        auto &fork = packet_frontier_.empty() ? producer_frontier_ : packet_frontier_;
+        std::vector<hipGraphNode_t> join(primary.nodes.begin(), primary.nodes.end());
+        std::erase_if(join, [&](const hipGraphNode_t node) {
+            return std::find(fork.begin(), fork.end(), node) != fork.end();
+        });
+        if (join.empty())
+            throw std::logic_error("HIP early packet consumer lost the independent arithmetic completion");
+
+        setHIPEarlyPacketFrontier(native, fork, hipStreamSetCaptureDependencies);
+        if (!record())
+            return false;
+        const auto packet = readHIPEarlyPacketFrontier(native);
+        if (packet.graph != graph_ || packet.capture_id != capture_id_ || packet.nodes.empty() ||
+            std::equal(packet.nodes.begin(), packet.nodes.end(), fork.begin(), fork.end()))
+        {
+            throw std::logic_error("HIP early packet consumer did not record a new native completion");
+        }
+        packet_frontier_.assign(packet.nodes.begin(), packet.nodes.end());
+        setHIPEarlyPacketFrontier(native, join, hipStreamAddCaptureDependencies);
+        return true;
+    }
+
+    std::shared_ptr<IEarlyPacketPublication> makeHIPEarlyPacketPublication()
+    {
+        return std::make_shared<HIPEarlyPacketPublication>();
     }
 
 } // namespace llaminar2

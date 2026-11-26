@@ -53,6 +53,38 @@ namespace llaminar2
         constexpr const char *kNCCLGraphMixingEnvironment =
             "NCCL_GRAPH_MIXING_SUPPORT";
 
+#ifdef HAVE_NCCL
+        /**
+         * @brief RAII guard restoring the calling thread's active CUDA device.
+         *
+         * Multi-device collective submission loops iterate across all participant
+         * ordinals on the winning rendezvous thread. Restoring the caller's device
+         * prevents subsequent captured operations on that thread from inheriting
+         * another participant's active CUDA device.
+         */
+        class ScopedCudaDeviceRestore final
+        {
+        public:
+            ScopedCudaDeviceRestore() noexcept
+            {
+                valid_ = (cudaGetDevice(&saved_device_) == cudaSuccess && saved_device_ >= 0);
+            }
+            ~ScopedCudaDeviceRestore() noexcept
+            {
+                if (valid_)
+                {
+                    (void)cudaSetDevice(saved_device_);
+                }
+            }
+            ScopedCudaDeviceRestore(const ScopedCudaDeviceRestore &) = delete;
+            ScopedCudaDeviceRestore &operator=(const ScopedCudaDeviceRestore &) = delete;
+
+        private:
+            int saved_device_ = -1;
+            bool valid_ = false;
+        };
+#endif
+
         /**
          * @brief Install Llaminar's process-wide NCCL graph ordering policy.
          *
@@ -1068,6 +1100,7 @@ namespace llaminar2
             }
         }
 
+        ScopedCudaDeviceRestore restore_caller_device;
         std::lock_guard<std::mutex> lock(direct_exec_mutex_);
 
         nccl::ncclResult_t r = nccl::ncclGroupStart();
@@ -1221,6 +1254,7 @@ namespace llaminar2
             }
         }
 
+        ScopedCudaDeviceRestore restore_caller_device;
         std::lock_guard<std::mutex> lock(direct_exec_mutex_);
 
         nccl::ncclResult_t r = nccl::ncclGroupStart();
@@ -1426,6 +1460,7 @@ namespace llaminar2
             }
         }
 
+        ScopedCudaDeviceRestore restore_caller_device;
         std::lock_guard<std::mutex> lock(direct_exec_mutex_);
         nccl::ncclResult_t result = nccl::ncclGroupStart();
         if (result != nccl::ncclSuccess)
@@ -2333,6 +2368,7 @@ namespace llaminar2
             }
         }
 
+        ScopedCudaDeviceRestore restore_caller_device;
         std::lock_guard<std::mutex> lock(direct_exec_mutex_);
 
         nccl::ncclResult_t r = nccl::ncclGroupStart();

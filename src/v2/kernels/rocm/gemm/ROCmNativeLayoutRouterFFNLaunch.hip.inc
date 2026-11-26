@@ -6,31 +6,30 @@
 #include "ROCmNativeLayoutGateUpGeometry.h"
 #include "kernels/common/MoEProjectionNumericalContract.h"
 namespace llaminar2::rocm {
+const void* nativeLayoutRouterFFNKernelFunctionShard1(ResidentMoEFFNDecoderProgram program);
+const void* nativeLayoutRouterFFNKernelFunctionShard2(ResidentMoEFFNDecoderProgram program);
 const void* nativeLayoutRouterFFNKernelFunction(ResidentMoEFFNDecoderProgram program)
 {
 #define LLAMINAR_LAYOUT_FAMILY(G) case G:return reinterpret_cast<const void*>(&nativeLayoutRouterFFNKernel<ResidentMoEFFNDecoderProgram::familyMask<G>()>);
     switch(program.groups())
-    {LLAMINAR_LAYOUT_FAMILY(1) LLAMINAR_LAYOUT_FAMILY(2) LLAMINAR_LAYOUT_FAMILY(3)
-     LLAMINAR_LAYOUT_FAMILY(4) LLAMINAR_LAYOUT_FAMILY(5) LLAMINAR_LAYOUT_FAMILY(6)
-     LLAMINAR_LAYOUT_FAMILY(7) LLAMINAR_LAYOUT_FAMILY(8) LLAMINAR_LAYOUT_FAMILY(9)
-     LLAMINAR_LAYOUT_FAMILY(10) LLAMINAR_LAYOUT_FAMILY(11) LLAMINAR_LAYOUT_FAMILY(12)
-     LLAMINAR_LAYOUT_FAMILY(13) LLAMINAR_LAYOUT_FAMILY(14) LLAMINAR_LAYOUT_FAMILY(15)}
+    {
+        LLAMINAR_LAYOUT_FAMILY(1) LLAMINAR_LAYOUT_FAMILY(2) LLAMINAR_LAYOUT_FAMILY(3)
+        LLAMINAR_LAYOUT_FAMILY(4) LLAMINAR_LAYOUT_FAMILY(5)
+        case 6: case 7: case 8: case 9: case 10: return nativeLayoutRouterFFNKernelFunctionShard1(program);
+        case 11: case 12: case 13: case 14: case 15: return nativeLayoutRouterFFNKernelFunctionShard2(program);
+    }
 #undef LLAMINAR_LAYOUT_FAMILY
     throw std::invalid_argument("Native-layout FFN source envelope is invalid");
 }
 /** @brief Original source-resolved suffix work/storage, independent of the composing native entry. */
-struct NativeLayoutRouterFFNLaunchGeometry {
-    ResidentMoEFFNDecoderProgram decoder; ///< Complete original physical source family.
-    std::size_t dynamic_shared_bytes; ///< Exact phase-exclusive suffix LDS extent.
-    std::uint64_t useful_ctas; ///< Maximum live phase work; never an occupancy estimate.
-};
+// NativeLayoutRouterFFNLaunchGeometry declared in ROCmNativeQuantisedDecodeCommon.hip.inc
 /**
  * @brief Resolve canonical suffix policy and live work without admitting another function.
  * @param device Original worker. @param args Existing canonical source/publication bindings.
  * @param masks Complete original policy/decoder envelopes. @param generation Nonzero retained owner generation.
  * @return Exact suffix work and storage reused by standalone and full-entry admission.
  */
-static NativeLayoutRouterFFNLaunchGeometry resolveNativeLayoutRouterFFNGeometry(
+NativeLayoutRouterFFNLaunchGeometry resolveNativeLayoutRouterFFNGeometry(
     DeviceId device,NativeLayoutRouterFFNArgs& args,ResidentMoEFFNPolicyMasks masks,std::uint64_t generation)
 {
     if(!device.is_rocm()||!generation||isGraphCaptureActive()||!args.router_weights||!args.router_logits||

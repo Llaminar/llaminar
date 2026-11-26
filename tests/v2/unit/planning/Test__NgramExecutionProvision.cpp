@@ -28,7 +28,8 @@
 #include "../../utils/CPUExecutionTestGeometry.h"
 #include <gtest/gtest.h>
 #ifdef HAVE_ROCM
-#include "kernels/rocm/gemm/retained_hc_ffn/ROCmRetainedM1HCFFNWorkspace.h"
+#include "kernels/common/FullNativeHCFFNBarrierLayout.h"
+#include "execution/moe/MoEWorkspaceRequirements.h"
 #include "utils/DebugEnv.h"
 #endif
 using namespace llaminar2;
@@ -1188,7 +1189,10 @@ TEST(RetainedM1WorkspaceAdmission, OriginalTP4ContinuationPricesSealedWorkspace)
         config.routed_compute_policy=RoutedExpertComputePolicy::TensorSharded;
         config.ngram_execution_policy->distribution=ImmutableRowTableDistribution::Replicated;
     }
-    const auto requirement=rocm::retainedM1HCFFNWorkspace();
+    WorkspaceRequirements requirement;
+    MoEWorkspaceBuffers::add(requirement, MoEWorkspaceBuffers::NATIVE_LAYOUT_BARRIER,
+        FullNativeHCFFNBarrierLayout::bytes * MoEWorkspaceBuffers::kGroupedDescriptorTableSlots,
+        WorkspaceContentLifetime::SerialGraphFamily);
     ASSERT_NE(requirement.find(MoEWorkspaceBuffers::NATIVE_LAYOUT_BARRIER),nullptr);
     const auto extent=requirement.total_bytes_with_alignment();
     ASSERT_GT(extent,0u);

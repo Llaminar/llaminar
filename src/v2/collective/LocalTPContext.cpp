@@ -1167,6 +1167,49 @@ namespace llaminar2
 
         if (use_fp16_allreduce)
         {
+            const bool can_fused_peer_push =
+                grouped_explicit_streams &&
+                backend_ == CollectiveBackendType::RCCL &&
+                backend_impl_ &&
+                backend_impl_->supportsFusedFP32ViaFP16AllreduceMultiOnStreams() &&
+                effective_count > 0 &&
+                effective_count <= rankOrderedPushMaxElements &&
+                (!live_rows ||
+                 (live_rows->rows().capacity() > 0 &&
+                  live_rows->elementsPerRow() > 0 &&
+                  live_rows->elementsPerRow() <= rankOrderedPushMaxElements / live_rows->rows().capacity()));
+            if (can_fused_peer_push)
+            {
+                const bool ar_ok = allreduceGroupedOnExplicitStreams(
+                    buffer,
+                    effective_count,
+                    CollectiveDataType::FLOAT32,
+                    device_index,
+                    stream,
+                    stage_name,
+                    effective_precision,
+                    nullptr,
+                    live_rows,
+                    /*fused_fp32_via_fp16=*/true);
+                if (!ar_ok)
+                {
+                    LOG_ERROR("LocalTPContext: fused FP32-via-FP16 allreduce failed: "
+                              << (backend_impl_ ? backend_impl_->lastError() : "missing backend")
+                              << " stage=" << (stage_name.empty() ? "(none)" : stage_name));
+                    requestAbort();
+                    return false;
+                }
+                recordLocalTPRuntimeAllreduce(
+                    device_group_, backend_, devices_[device_index].toLocalDeviceId(),
+                    stage_name, static_cast<size_t>(degree()), effective_count,
+                    CollectiveDataType::FLOAT16,
+                    "on_stream_grouped_fused_fp32_via_fp16_peer_push",
+                    effective_precision, live_rows);
+                if (publication == AllreducePublication::ExactProducer)
+                    TransferEngine::publishDeviceWrite(
+                        tensor, devices_[device_index].toLocalDeviceId(), stream);
+                return true;
+            }
             // The graph planner owns capacity. Execution only validates and
             // borrows the persistent device-local scratch reservation.
             void *fp16_buf = requireReservedFp16Scratch(
@@ -3994,7 +4037,8 @@ namespace llaminar2
                                                            const std::string &stage_name,
                                                            const std::string &precision,
                                                            const std::vector<LocalTPCollectiveSidebandBuffer> *sidebands,
-                                                           const NativeCollectiveRows *live_rows)
+                                                           const NativeCollectiveRows *live_rows,
+                                                           bool fused_fp32_via_fp16)
     {
         if (degree() <= 1)
             return true;
@@ -4047,6 +4091,7 @@ namespace llaminar2
             grouped_onstream_allreduce_rows_.clear();
             grouped_onstream_allreduce_seen_.clear();
             grouped_onstream_allreduce_graph_capture_active_ = false;
+            grouped_onstream_allreduce_fused_fp32_via_fp16_ = false;
             grouped_onstream_allreduce_sideband_count_ = 0;
             grouped_onstream_allreduce_reference_sidebands_.clear();
             grouped_onstream_allreduce_sidebands_.clear();
@@ -4117,6 +4162,7 @@ namespace llaminar2
                 grouped_onstream_allreduce_rows_.assign(static_cast<size_t>(degree()), *live_rows);
             grouped_onstream_allreduce_seen_.assign(static_cast<size_t>(degree()), false);
             grouped_onstream_allreduce_graph_capture_active_ = graph_capture_active;
+            grouped_onstream_allreduce_fused_fp32_via_fp16_ = fused_fp32_via_fp16;
             grouped_onstream_allreduce_sideband_count_ = sideband_count;
             grouped_onstream_allreduce_reference_sidebands_ =
                 sidebands ? *sidebands : std::vector<LocalTPCollectiveSidebandBuffer>{};
@@ -4518,14 +4564,18 @@ namespace llaminar2
                     return false;
                 }
 
-                const bool enqueue_ok = live_rows
-                    ? backend_impl_->allreduceWithSidebandsMultiOnStreams(
-                        grouped_onstream_allreduce_buffers_, effective_count, dtype,
-                        CollectiveOp::ALLREDUCE_SUM, backend_sidebands,
+                const bool enqueue_ok = grouped_onstream_allreduce_fused_fp32_via_fp16_
+                    ? backend_impl_->allreduceFP32ViaFP16MultiOnStreams(
+                        grouped_onstream_allreduce_buffers_, effective_count,
                         grouped_onstream_allreduce_streams_, grouped_onstream_allreduce_rows_)
-                    : backend_impl_->allreduceMultiOnStreams(
-                        grouped_onstream_allreduce_buffers_, effective_count, dtype,
-                        CollectiveOp::ALLREDUCE_SUM, grouped_onstream_allreduce_streams_);
+                    : (live_rows
+                        ? backend_impl_->allreduceWithSidebandsMultiOnStreams(
+                            grouped_onstream_allreduce_buffers_, effective_count, dtype,
+                            CollectiveOp::ALLREDUCE_SUM, backend_sidebands,
+                            grouped_onstream_allreduce_streams_, grouped_onstream_allreduce_rows_)
+                        : backend_impl_->allreduceMultiOnStreams(
+                            grouped_onstream_allreduce_buffers_, effective_count, dtype,
+                            CollectiveOp::ALLREDUCE_SUM, grouped_onstream_allreduce_streams_));
                 grouped_onstream_allreduce_result_ = enqueue_ok;
                 grouped_onstream_allreduce_ready_ = true;
                 if (!enqueue_ok)
@@ -4623,20 +4673,26 @@ namespace llaminar2
         else
         {
             success =
-                grouped_onstream_allreduce_sideband_count_ > 0 || live_rows
-                    ? backend_impl_->allreduceWithSidebandsMultiOnStreams(
+                (grouped_onstream_allreduce_fused_fp32_via_fp16_ && grouped_onstream_allreduce_sideband_count_ == 0)
+                    ? backend_impl_->allreduceFP32ViaFP16MultiOnStreams(
                           grouped_onstream_allreduce_buffers_,
                           effective_count,
-                          dtype,
-                          CollectiveOp::ALLREDUCE_SUM,
-                          backend_sidebands,
-                          grouped_onstream_allreduce_streams_, grouped_onstream_allreduce_rows_)
-                    : backend_impl_->allreduceMultiOnStreams(
-                          grouped_onstream_allreduce_buffers_,
-                          effective_count,
-                          dtype,
-                          CollectiveOp::ALLREDUCE_SUM,
-                          grouped_onstream_allreduce_streams_);
+                          grouped_onstream_allreduce_streams_,
+                          grouped_onstream_allreduce_rows_)
+                    : (grouped_onstream_allreduce_sideband_count_ > 0 || live_rows
+                        ? backend_impl_->allreduceWithSidebandsMultiOnStreams(
+                              grouped_onstream_allreduce_buffers_,
+                              effective_count,
+                              dtype,
+                              CollectiveOp::ALLREDUCE_SUM,
+                              backend_sidebands,
+                              grouped_onstream_allreduce_streams_, grouped_onstream_allreduce_rows_)
+                        : backend_impl_->allreduceMultiOnStreams(
+                              grouped_onstream_allreduce_buffers_,
+                              effective_count,
+                              dtype,
+                              CollectiveOp::ALLREDUCE_SUM,
+                              grouped_onstream_allreduce_streams_));
         }
 
         grouped_onstream_allreduce_result_ = success;

@@ -12,6 +12,8 @@
 #include "execution/config/RoutedExpertPolicy.h"
 #include "kernels/common/FullNativeHCFFNOutputDemand.h"
 #include "kernels/common/NativeCooperativeKernel.h"
+#include <functional>
+#include <optional>
 
 namespace llaminar2
 {
@@ -74,10 +76,20 @@ namespace llaminar2::cuda::moe
         float* shared_gate_factor; ///< Original rounded input gate before ordered output publication.
         float* routed_contributions; ///< Original [route][hidden] values for the explicit graph join.
         float* shared_contribution; ///< Original participant-local shared output.
+        float* suffix_partials; ///< L2-resident split-K Gate/Up partition partials for device-sized suffix.
+        uint32_t* suffix_done; ///< Per-packet completion counters reset by RoutePrefix.
+        void* suffix_gate_up_node; ///< Opaque cudaGraphDeviceNode_t for device-sized SuffixGateUp.
+        void* suffix_down_node; ///< Opaque cudaGraphDeviceNode_t for device-sized SuffixDown.
+        uint64_t* profile_ns = nullptr; ///< Optional diagnostic globaltimer slots.
         RetainedM1RoutePublication route_publication;
         RetainedM1SharedPublication shared_publication;
-        std::uint64_t* early_packet_ready = nullptr; ///< Readiness for the original mapped activation dispatch.
-        std::uint64_t* early_ticket_ready = nullptr; ///< Independent readiness for the original CPU dispatch ticket.
+        uint8_t gate_codebook = 0; ///< Admitted canonical Gate/Up physical codebook.
+        uint8_t down_codebook = 0; ///< Admitted canonical Down physical codebook.
+        uint8_t gate_promoted_codebook = 0xffu; ///< Optional dynamic promotion codebook for Gate/Up (0xff = none).
+        uint8_t down_promoted_codebook = 0xffu; ///< Optional dynamic promotion codebook for Down (0xff = none).
+        uint8_t gate_source_superblock = 0; ///< Expected source superblock provenance when promoted.
+        uint8_t down_source_superblock = 0; ///< Expected source superblock provenance when promoted.
+        uint8_t suffix_resident_loop = 0; ///< Non-zero when suffix runs as cloneable resident grid-stride (no device-updatable handles).
     };
 
     static_assert(std::is_trivially_copyable_v<RetainedM1HCFFN>);
@@ -94,6 +106,37 @@ namespace llaminar2::cuda::moe
     const void* retainedQFNM1Function(uint8_t gate, uint8_t down, FullNativeHCFFNOutputDemand demand,
         bool observe, RoutedExpertRowExecutionPolicy role);
 
+    /** @brief Lookup sharded 1D Gate/Up suffix entry in Shard 0 (standard/legacy/K-quant + ExpandedInt8Min). */
+    const void* retainedQFNM1SuffixGateUpShard0(uint8_t codebook) noexcept;
+    /** @brief Lookup sharded 1D Gate/Up suffix entry in Shard 1 (IQ codebooks + IQ4XSSourceScale). */
+    const void* retainedQFNM1SuffixGateUpShard1(uint8_t codebook) noexcept;
+    /** @brief Lookup sharded 1D Down suffix entry in Shard 0 (standard/legacy/K-quant + ExpandedInt8Min). */
+    const void* retainedQFNM1SuffixDownShard0(uint8_t codebook) noexcept;
+    /** @brief Lookup sharded 1D Down suffix entry in Shard 1 (IQ codebooks + IQ4XSSourceScale). */
+    const void* retainedQFNM1SuffixDownShard1(uint8_t codebook) noexcept;
+
+    /** @return Whether the sharded all-codebook NativeCompletion suffix covers both physical codebooks. */
+    [[nodiscard]] inline bool retainedQFNM1NativeCompletionSupported(uint8_t gate, uint8_t down) noexcept
+    {
+        const bool has_gate = retainedQFNM1SuffixGateUpShard0(gate) != nullptr ||
+                              retainedQFNM1SuffixGateUpShard1(gate) != nullptr;
+        const bool has_down = retainedQFNM1SuffixDownShard0(down) != nullptr ||
+                              retainedQFNM1SuffixDownShard1(down) != nullptr;
+        return has_gate && has_down;
+    }
+
+    /** @brief Ordering selected from the original graph's early packet consumers. */
+    enum class RetainedM1PacketOrdering { CompleteProgram, NativeCompletion };
+    /** @brief One always-live half-warp of shared Down columns for each legacy cooperative suffix CTA. */
+    inline constexpr unsigned retained_shared_down_frontier_columns = 16;
+    /** @brief Non-cooperative device-sized Gate/Up suffix launch width (2 warps per CTA). */
+    inline constexpr unsigned retained_suffix_gate_up_threads = 64;
+    /** @brief Split-K CTAs per 32-column Gate/Up packet (16 partitions / 2 warps = 8 CTAs). */
+    inline constexpr unsigned retained_suffix_gate_up_k_splits = 8;
+    /** @brief Non-cooperative device-sized Down suffix launch width (5 warps, 2 K32 blocks each). */
+    inline constexpr unsigned retained_suffix_down_threads = 160;
+
+
     /** @brief Loaded resident entry, sealed geometry and all permanent participant bindings. */
     class RetainedM1Program final
     {
@@ -107,30 +150,42 @@ namespace llaminar2::cuda::moe
          * @param demand Graph's actual external HC observation roles.
          * @param observe Whether the original router publishes selected/local demand.
          * @param workspace_generation Owner generation of every borrowed workspace plane.
+         * @param ordering Whether the original graph declares independent consumers of the completed route prefix.
          * @return A resident program on the measured SM86 geometry.
          */
         static RetainedM1Program prepare(DeviceId device, const RetainedM1HCFFN& arguments,
             uint8_t gate, uint8_t down, FullNativeHCFFNOutputDemand demand, bool observe,
-            uint64_t workspace_generation);
+            uint64_t workspace_generation, RetainedM1PacketOrdering ordering = RetainedM1PacketOrdering::CompleteProgram);
 
         /**
          * @brief Submit the resident program on its exact stream or record its counted positive branch.
          * @param stream Owning stream with the original environment and producer edges.
          * @param workspace_generation Current generation of the original prepared arena.
+         * @param record_ready Construction-only binder called after recording the prefix node.
          * @throws std::exception For changed generation, invalid stream, or incomplete native capture.
          */
-        void launch(void* stream, uint64_t workspace_generation) const;
+        void launch(void* stream, uint64_t workspace_generation,
+            const std::function<void()>& record_ready = {}) const;
 
         /** @return Measured resource admission of the exact loaded entry. */
         const NativeCooperativeKernelAdmission& admission() const noexcept { return admission_; }
 
     private:
         /** @brief Bind a successful native admission to its checked operands and grid. */
-        RetainedM1Program(NativeCooperativeKernelAdmission admission, RetainedM1HCFFN arguments, unsigned blocks)
-            : admission_(admission), arguments_(arguments), blocks_(blocks) {}
+        RetainedM1Program(NativeCooperativeKernelAdmission admission, RetainedM1HCFFN arguments, unsigned blocks,
+            std::optional<NativeCooperativeKernelAdmission> route_prefix, unsigned prefix_blocks,
+            const void* route_plan = nullptr, const void* suffix_gate_up = nullptr, const void* suffix_down = nullptr)
+            : admission_(admission), arguments_(arguments), blocks_(blocks), route_prefix_(route_prefix),
+              prefix_blocks_(prefix_blocks), route_plan_(route_plan),
+              suffix_gate_up_(suffix_gate_up), suffix_down_(suffix_down) {}
 
         NativeCooperativeKernelAdmission admission_;
         RetainedM1HCFFN arguments_;
         unsigned blocks_; ///< Measured resident work width on the owning GPU.
+        std::optional<NativeCooperativeKernelAdmission> route_prefix_; ///< Sealed native HC+Router cooperative phase.
+        unsigned prefix_blocks_; ///< Original always-live HC+Router CTA extent.
+        const void* route_plan_ = nullptr; ///< Spill-free 1-CTA TopK + descriptor + device-grid planner.
+        const void* suffix_gate_up_ = nullptr; ///< Spill-free device-sized SuffixGateUp entry.
+        const void* suffix_down_ = nullptr; ///< Spill-free device-sized SuffixDown entry.
     };
 }

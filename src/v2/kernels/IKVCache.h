@@ -805,6 +805,28 @@ namespace llaminar2
         }
 
         /**
+         * @brief Mutable device pointer to the canonical live cached-token count
+         *        for fused megakernels that perform KV append and metadata advance.
+         */
+        virtual int *mutableDeviceCachedTokenCountPtr(int layer, int seq_idx = 0)
+        {
+            (void)layer;
+            (void)seq_idx;
+            return nullptr;
+        }
+
+        /**
+         * @brief Mutable device pointer to the canonical live ring head
+         *        for fused megakernels that perform KV append and metadata advance.
+         */
+        virtual int *mutableDeviceRingHeadPtr(int layer, int seq_idx = 0)
+        {
+            (void)layer;
+            (void)seq_idx;
+            return nullptr;
+        }
+
+        /**
          * @brief Whether this cache can publish sequence metadata from device buffers.
          *
          * Returning true means the cache can consume

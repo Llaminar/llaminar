@@ -12,7 +12,9 @@
 #include "execution/moe/MoEOverlayRouteTarget.h"
 #include "execution/moe/MoEOverlayInferenceOriginalSlot.h"
 #include "execution/moe/MoEOverlayNativeInvocationABI.h"
+#include "kernels/common/DeviceQ8ActivationNumericalContract.h"
 #include <array>
+#include <cmath>
 
 #include <gtest/gtest.h>
 
@@ -1214,6 +1216,145 @@ TEST(Test__MoEOverlayActivationEpochProtocol, GrantedDispatchResetStartsUnpublis
         ASSERT_TRUE(protocol.reset(*identity,&error))<<error;
         EXPECT_EQ(control.admission.ready_signal,0u);
         for(const auto& bank:control.buffers) { EXPECT_EQ(bank.dispatch_signal.value,0u);EXPECT_EQ(bank.dispatch_descriptor.timeline,0u); }
+    }
+}
+
+/**
+ * @test Replay exact Q8_1 prefill dispatch compaction and associative FixedPoint32Adaptive16 return folding.
+ *
+ * Proves:
+ *  1. MainPrefill exact Q8_1 wire compaction (2,880 B vs 10,240 B FP32 for d_model=2560, 3.56x smaller)
+ *     round-trips bit-identically through device_q8_activation_contract for non-zero and zero blocks.
+ *  2. FixedPoint32Adaptive16 integer accumulation is bitwise invariant under route permutation and
+ *     arbitrary tier-ownership splits across dynamic expert movement epochs, and sets row_wide_flags
+ *     precisely when any accumulated lane exceeds signed int16 range.
+ */
+TEST(Test__MoEOverlayActivationEpochProtocol, PrefillFixedPointAndExactQ8WireReplay)
+{
+    EXPECT_TRUE(moeOverlayActivationPrefillWirePolicyValid(
+        static_cast<std::uint32_t>(MoEOverlayActivationPrefillWirePolicy::FP32Canonical)));
+    EXPECT_TRUE(moeOverlayActivationPrefillWirePolicyValid(
+        static_cast<std::uint32_t>(MoEOverlayActivationPrefillWirePolicy::FixedPoint32Adaptive16)));
+    EXPECT_FALSE(moeOverlayActivationPrefillWirePolicyValid(2u));
+
+    constexpr std::size_t kWidth = 2560u;
+    constexpr std::size_t kBlocks = kWidth / 32u;
+    constexpr std::size_t kWireBytes = kWidth * sizeof(std::int8_t) + kBlocks * sizeof(float);
+    EXPECT_EQ(kWireBytes, 2880u);
+    EXPECT_EQ(kWidth * sizeof(float), 10240u);
+
+    std::vector<float> src(kWidth, 0.0f);
+    std::vector<std::int8_t> wire_qs(kWidth, 0);
+    std::vector<float> wire_scales(kBlocks, 0.0f);
+    std::vector<float> unpacked(kWidth, 0.0f);
+
+    for (int replay = 0; replay < 3; ++replay)
+    {
+        for (std::size_t b = 0; b < kBlocks; ++b)
+        {
+            // Include exact-zero blocks, small magnitudes, mixed signs, and high dynamic range.
+            if (b % 13u == 0u)
+            {
+                for (std::size_t l = 0; l < 32u; ++l) src[b * 32u + l] = 0.0f;
+                continue;
+            }
+            const float amp = (b % 5u == 0u) ? 24.0f : ((b % 5u == 1u) ? 0.025f : 1.75f);
+            for (std::size_t l = 0; l < 32u; ++l)
+            {
+                const float signed_phase = ((b * 31u + l * 7u + static_cast<std::size_t>(replay) * 3u) % 2u == 0u) ? 1.0f : -1.0f;
+                src[b * 32u + l] = signed_phase * amp * (static_cast<float>((l + 1u) * (b % 7u + 1u)) / 224.0f);
+            }
+        }
+        // Pack using the exact device Q8 activation numerical contract.
+        for (std::size_t b = 0; b < kBlocks; ++b)
+        {
+            float abs_max = 0.0f;
+            for (std::size_t l = 0; l < 32u; ++l)
+                abs_max = device_q8_activation_contract::maximumAbsoluteValue(abs_max, src[b * 32u + l]);
+            const float s = device_q8_activation_contract::scale(abs_max);
+            const float inv_s = device_fp32_contract::reciprocalPositive(s);
+            wire_scales[b] = s;
+            for (std::size_t l = 0; l < 32u; ++l)
+            {
+                const std::int32_t q = device_q8_activation_contract::quantizePreparedInverse(src[b * 32u + l], inv_s);
+                wire_qs[b * 32u + l] = static_cast<std::int8_t>(q);
+                unpacked[b * 32u + l] = static_cast<float>(q) * s;
+            }
+        }
+        // Re-quantizing unpacked FP32 rows must produce the EXACT same Q8_1 scale and bytes.
+        for (std::size_t b = 0; b < kBlocks; ++b)
+        {
+            float abs_max2 = 0.0f;
+            for (std::size_t l = 0; l < 32u; ++l)
+                abs_max2 = device_q8_activation_contract::maximumAbsoluteValue(abs_max2, unpacked[b * 32u + l]);
+            const float s2 = device_q8_activation_contract::scale(abs_max2);
+            const float inv_s2 = device_fp32_contract::reciprocalPositive(s2);
+            EXPECT_EQ(s2, wire_scales[b]) << "replay=" << replay << " block=" << b;
+            for (std::size_t l = 0; l < 32u; ++l)
+            {
+                const std::int32_t q2 = device_q8_activation_contract::quantizePreparedInverse(unpacked[b * 32u + l], inv_s2);
+                EXPECT_EQ(static_cast<std::int8_t>(q2), wire_qs[b * 32u + l])
+                    << "replay=" << replay << " block=" << b << " lane=" << l;
+            }
+        }
+    }
+
+    // Associative FixedPoint32Adaptive16 folding across arbitrary dynamic tier placements.
+    constexpr float kScale = 4096.0f;
+    constexpr float kInvScale = 1.0f / 4096.0f;
+    constexpr float kClamp = 16000.0f;
+    const auto quantize_fixed = [](float v) noexcept -> std::int32_t {
+        const float clamped = std::fmax(-kClamp, std::fmin(kClamp, v));
+        return static_cast<std::int32_t>(std::nearbyint(clamped * kScale));
+    };
+    constexpr std::size_t kTopK = 10u;
+    constexpr std::size_t kCols = 64u;
+    std::array<std::array<float, kCols>, kTopK> routes{};
+    for (std::size_t r = 0; r < kTopK; ++r)
+    {
+        for (std::size_t c = 0; c < kCols; ++c)
+        {
+            const float sign = ((r + c) % 2u == 0u) ? 1.0f : -1.0f;
+            // Column 63 intentionally pushes past signed int16 range (32767 / 4096 = 8.0) to exercise wide flag.
+            routes[r][c] = (c == 63u) ? (1.25f * static_cast<float>(r + 1u))
+                                      : (sign * (0.03f * static_cast<float>(r + 1u) + 0.0017f * static_cast<float>(c)));
+        }
+    }
+    // Baseline: all 10 routes summed sequentially in original order.
+    std::array<std::int32_t, kCols> baseline_i32{};
+    std::array<float, kCols> baseline_fp32{};
+    bool needs_wide = false;
+    for (std::size_t c = 0; c < kCols; ++c)
+    {
+        std::int32_t acc = 0;
+        for (std::size_t r = 0; r < kTopK; ++r) acc += quantize_fixed(routes[r][c]);
+        baseline_i32[c] = acc;
+        baseline_fp32[c] = static_cast<float>(acc) * kInvScale;
+        if (acc < -32768 || acc > 32767) needs_wide = true;
+    }
+    EXPECT_TRUE(needs_wide);
+    // Split across 3 tiers (CUDA:0, CUDA:1, ROCm:0..3) in permuted placement epochs.
+    const std::array<std::array<std::size_t, kTopK>, 3> epoch_orders{{
+        {0, 1, 2, 3, 4, 5, 6, 7, 8, 9},
+        {9, 7, 5, 3, 1, 8, 6, 4, 2, 0},
+        {4, 0, 8, 2, 6, 9, 5, 1, 7, 3},
+    }};
+    for (const auto &order : epoch_orders)
+    {
+        std::array<std::int32_t, kCols> tier0{}, tier1{}, tier2{};
+        for (std::size_t i = 0; i < kTopK; ++i)
+        {
+            const std::size_t r = order[i];
+            auto &bucket = (i < 3u) ? tier0 : ((i < 6u) ? tier1 : tier2);
+            for (std::size_t c = 0; c < kCols; ++c)
+                bucket[c] += quantize_fixed(routes[r][c]);
+        }
+        for (std::size_t c = 0; c < kCols; ++c)
+        {
+            const std::int32_t combined = tier0[c] + tier1[c] + tier2[c];
+            EXPECT_EQ(combined, baseline_i32[c]) << "col=" << c;
+            EXPECT_EQ(std::memcmp(&baseline_fp32[c], &(static_cast<const float &>(static_cast<float>(combined) * kInvScale)), sizeof(float)), 0);
+        }
     }
 }
 }

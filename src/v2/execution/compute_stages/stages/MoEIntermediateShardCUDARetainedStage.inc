@@ -7,11 +7,26 @@
  * route slots and the shared FFN output for the existing ticket and TP graph.
  */
 
-/** @brief Independent readers of one original resident router publication. */
-struct CUDARetainedEarlyRouteReaders
+/** @brief Immutable routed-expert binding abstracted across TensorSharded and Apportioned CUDA graphs. */
+struct CUDARetainedRoutedContract
 {
-    std::shared_ptr<CUDAEarlyPacketPublication> mapped_dispatch; ///< Original activation lanes and their ordering.
-    std::shared_ptr<CUDAEarlyPacketPublication> cpu_ticket; ///< Original host dispatch ticket's separate transport.
+    DeviceId device = DeviceId::invalid();
+    int layer = -1;
+    int d_model = 0;
+    int routed_width = 0;
+    int top_k = 0;
+    IMoERuntimeTable* runtime = nullptr;
+    RoutedExpertRowExecutionPolicy row_policy = RoutedExpertRowExecutionPolicy::ParticipantAssigned;
+    MoEIntermediateShardTensorBinding hidden{};
+    MoEIntermediateShardTensorBinding route_partials{};
+    cuda::moe::RetainedM1RoutePublication route_publication = cuda::moe::RetainedM1RoutePublication::Raw;
+    uint8_t gate_codebook = 0;
+    uint8_t down_codebook = 0;
+    uint8_t gate_promoted_codebook = 0xffu;
+    uint8_t down_promoted_codebook = 0xffu;
+    uint8_t gate_source_superblock = 0;
+    uint8_t down_source_superblock = 0;
+    std::uint64_t signature = 0;
 };
 
 /** @brief Preparation and publication of one participant's complete local CUDA region. */
@@ -19,13 +34,7 @@ class CUDARetainedStage final : public IComputeStage, public IWorkspaceConsumer
 {
 public:
     /**
-     * @brief Authenticate the original graph rather than deriving a second FFN placement.
-     * @param binding Original routed stage's placement and descriptor declaration.
-     * @param router Original router, authenticated by the route-slot builder.
-     * @param shared Original prepared shared projections and Down publication.
-     * @param prefix Original staged post-attention HC owner.
-     * @param early_readers Original explicit CPU packet and ticket readers, if present.
-     * @param name Existing terminal of the local routed math.
+     * @brief Authenticate the original TensorSharded graph rather than deriving a second FFN placement.
      */
     CUDARetainedStage(std::shared_ptr<Binding> binding, const MoERoutingStage::Params& router,
         const SharedExpertFFNStage::Params& shared, std::shared_ptr<Qwen4ExpHCReadPhaseOwner> prefix,
@@ -38,24 +47,72 @@ public:
         if (!device().is_cuda() || binding_->local_result != LocalResult::RouteSlots ||
             binding_->route_authority != RouteAuthority::OriginalRouter || binding_->prepared ||
             p.rows != 1 || p.phase != MoEOverlayServicePhaseHint::Decode ||
-            binding_->format != DeviceMoEWeightFormat::NativeQuantised ||
-            !router_.gate_weights || router_.gate_weights->native_type() != TensorType::FP16 ||
-            router_.decode_route_publication != MoEDecodeRoutePublicationPolicy::DeviceRuntimeTable ||
-            shared_.device_id != device() || shared_.input != p.hidden.tensor ||
-            shared_.input_buffer_id != p.hidden.id || !shared_.output ||
-            shared_.seq_len != p.rows || shared_.d_model != int(original.modelColumns()) ||
-            shared_.active_row_count_device != router_.active_row_count_device ||
-            shared_.required_router_q8_publication || shared_.force_decode_equivalent_verifier_prefill ||
-            shared_.force_grouped_verifier_prefill_for_decode || shared_.disable_grouped_decode_shortcut ||
-            !shared_.prepared_store || !shared_.prepared_ref_gate || !shared_.prepared_ref_up ||
-            !shared_.prepared_ref_down || !prefix_)
+            binding_->format != DeviceMoEWeightFormat::NativeQuantised)
             throw std::invalid_argument("CUDA retained QFN requires original native mapped M1 graph operands");
-        resolveCodebooks();
-        (void)sharedDescriptor();
-        prefix_->sealFullOutputDemand(output_demand_);
-        prefix_inputs_ = prefix_->phaseInputs();
-        prefix_outputs_ = prefix_->phaseOutputs();
-        prefix_contract_ = prefix_->phaseDeclaration().bufferContract();
+        routed_ = CUDARetainedRoutedContract{
+            .device = binding_->device(),
+            .layer = binding_->layer,
+            .d_model = static_cast<int>(original.modelColumns()),
+            .routed_width = static_cast<int>(original.localIntermediateColumns()),
+            .top_k = p.top_k,
+            .runtime = p.runtime,
+            .row_policy = p.row_policy,
+            .hidden = p.hidden,
+            .route_partials = p.route_partials,
+            .route_publication = cuda::moe::RetainedM1RoutePublication::Raw,
+            .signature = binding_->signature,
+        };
+        resolveCodebooksFromIntermediateShard();
+        finalizeConstruction();
+    }
+
+    /**
+     * @brief Authenticate an original Apportioned TieredOverlay CUDA graph (e.g. 2xCUDA+4xROCm).
+     */
+    CUDARetainedStage(const MoEExpertComputeStage::Params& compute, const MoERoutingStage::Params& router,
+        const SharedExpertFFNStage::Params& shared, std::shared_ptr<Qwen4ExpHCReadPhaseOwner> prefix,
+        CUDARetainedEarlyRouteReaders early_readers, std::string name)
+        : IComputeStage(compute.device_id), router_(router), shared_(shared),
+          prefix_(std::move(prefix)), early_readers_(std::move(early_readers)), name_(std::move(name))
+    {
+        if (!device().is_cuda() || compute.seq_len != 1 || !compute.moe_runtime_table ||
+            !compute.canonical_route_contributions ||
+            compute.canonical_route_layout != MoECanonicalRoutePublicationLayout::DenseOriginalRouteSlots ||
+            compute.weight_descriptor_source != MoEDecodeDescriptorSource::RuntimePlacementTable ||
+            compute.d_model <= 0 || compute.expert_intermediate <= 0 ||
+            (compute.expert_intermediate % 32) != 0 ||
+            compute.input != router_.input)
+            throw std::invalid_argument("CUDA retained QFN Apportioned requires original native runtime-table M1 operands");
+        const auto route_pub = compute.canonical_route_arithmetic ==
+                MoECanonicalRouteArithmeticPolicy::PreweightedContributionThenOrderedAdd
+            ? cuda::moe::RetainedM1RoutePublication::Preweighted
+            : cuda::moe::RetainedM1RoutePublication::Raw;
+        std::uint64_t sig = kFNV1a64OffsetBasis;
+        const auto mix = [&](std::uint64_t v) { sig = (sig ^ v) * kFNV1a64Prime; };
+        mix(static_cast<std::uint64_t>(compute.device_id.ordinal));
+        mix(static_cast<std::uint64_t>(compute.layer_idx));
+        mix(static_cast<std::uint64_t>(compute.d_model));
+        mix(static_cast<std::uint64_t>(compute.expert_intermediate));
+        mix(static_cast<std::uint64_t>(compute.top_k));
+        mix(static_cast<std::uint64_t>(compute.routed_row_execution_policy));
+        mix(static_cast<std::uint64_t>(route_pub));
+        mix(reinterpret_cast<std::uintptr_t>(compute.moe_runtime_table));
+        mix(reinterpret_cast<std::uintptr_t>(compute.canonical_route_contributions));
+        routed_ = CUDARetainedRoutedContract{
+            .device = compute.device_id,
+            .layer = compute.layer_idx,
+            .d_model = compute.d_model,
+            .routed_width = compute.expert_intermediate,
+            .top_k = compute.top_k,
+            .runtime = compute.moe_runtime_table,
+            .row_policy = compute.routed_row_execution_policy,
+            .hidden = {compute.input, compute.input_buffer_id},
+            .route_partials = {compute.canonical_route_contributions, compute.canonical_route_contributions_buffer_id},
+            .route_publication = route_pub,
+            .signature = sig,
+        };
+        resolveCodebooksFromPreparedEngines(compute);
+        finalizeConstruction();
     }
 
     /** @return Classification of the original local routed computation. */
@@ -96,7 +153,7 @@ public:
         auto requirements = prefix_->phaseDeclaration().getBufferRequirements();
         requirements.addOutput("routing_indices", router_.output_indices->shape(), BufferTensorType::FP32);
         requirements.addOutput("routing_weights", router_.output_weights->shape(), BufferTensorType::FP32);
-        requirements.addOutput("local_routed_slots", binding_->params.route_partials.tensor->shape(), BufferTensorType::FP32);
+        requirements.addOutput("local_routed_slots", routed_.route_partials.tensor->shape(), BufferTensorType::FP32);
         requirements.addOutput("local_shared", shared_.output->shape(), BufferTensorType::FP32);
         return requirements;
     }
@@ -108,7 +165,7 @@ public:
         info.addWeight("router_gate", router_.gate_weights);
         info.addOutput("routing_indices", router_.output_indices, 1, router_.top_k);
         info.addOutput("routing_weights", router_.output_weights, 1, router_.top_k);
-        info.addOutput("local_routed_slots", binding_->params.route_partials.tensor,
+        info.addOutput("local_routed_slots", routed_.route_partials.tensor,
             router_.top_k, router_.d_model);
         info.addOutput("local_shared", shared_.output, 1, router_.d_model);
         return info;
@@ -123,10 +180,6 @@ public:
         auto requirements = prefix_->phaseWorkspaceRequirements();
         for (const auto& bank : banks())
             MoEWorkspaceBuffers::add(requirements, bank.name, bank.bytes);
-        if (early_readers_.mapped_dispatch)
-            MoEWorkspaceBuffers::add(requirements, packet_word_name, sizeof(std::uint64_t));
-        if (early_readers_.cpu_ticket)
-            MoEWorkspaceBuffers::add(requirements, ticket_word_name, sizeof(std::uint64_t));
         return requirements;
     }
 
@@ -161,19 +214,18 @@ public:
             return true;
         }
         if (router_.collect_device_runtime_histogram)
-            binding_->params.runtime->prepareDecodeHistogramProducerStream(stream);
+            routed_.runtime->prepareDecodeHistogramProducerStream(stream);
         prefix_->preparePhaseBindings(ctx, stream);
-        const auto& p = binding_->params;
         const auto pointers = bankAddresses();
         const auto addresses = tensorAddresses();
         const auto prepared_shared = sharedDescriptor();
-        auto* runtime = p.runtime->deviceLayerState(binding_->layer);
+        auto* runtime = routed_.runtime->deviceLayerState(routed_.layer);
         if (!runtime)
             throw std::logic_error("CUDA retained QFN lost its original device runtime table");
         auto* codes = static_cast<int8_t*>(pointers[DownCodes]);
         auto* scales = static_cast<float*>(pointers[DownScales]);
-        const int width = binding_->original.localIntermediateColumns();
-        const int shared_offset = width * p.top_k;
+        const int width = routed_.routed_width;
+        const int shared_offset = width * routed_.top_k;
         const cuda::moe::RetainedM1HCFFN arguments{
             .hc = prefix_->cudaPrefixArguments(),
             .router = {
@@ -181,7 +233,7 @@ public:
                 .logits = static_cast<float*>(pointers[RouterLogits]),
                 .route_indices = static_cast<float*>(addresses[1]), .route_weights = static_cast<float*>(addresses[2]),
                 .position = router_.absolute_position_ids_device, .experts = router_.num_experts, .top_k = router_.top_k,
-                .local_policy = p.row_policy, .normalize = router_.norm_topk_prob,
+                .local_policy = routed_.row_policy, .normalize = router_.norm_topk_prob,
             },
             .shared_gate_input = nullptr,
             .shared = {prepared_shared.gate, prepared_shared.up, prepared_shared.down},
@@ -195,32 +247,45 @@ public:
             .shared_gate_factor = nullptr,
             .routed_contributions = static_cast<float*>(addresses[3]),
             .shared_contribution = static_cast<float*>(addresses[4]),
-            .route_publication = cuda::moe::RetainedM1RoutePublication::Raw,
+            .suffix_partials = static_cast<float*>(pointers[SuffixPartials]),
+            .suffix_done = static_cast<uint32_t*>(pointers[SuffixDone]),
+            .suffix_gate_up_node = nullptr,
+            .suffix_down_node = nullptr,
+            .route_publication = routed_.route_publication,
             .shared_publication = cuda::moe::RetainedM1SharedPublication::PartialBeforeCollective,
-            .early_packet_ready = readyWord(early_readers_.mapped_dispatch, packet_word_name),
-            .early_ticket_ready = readyWord(early_readers_.cpu_ticket, ticket_word_name),
+            .gate_codebook = routed_.gate_codebook,
+            .down_codebook = routed_.down_codebook,
+            .gate_promoted_codebook = routed_.gate_promoted_codebook,
+            .down_promoted_codebook = routed_.down_promoted_codebook,
+            .gate_source_superblock = routed_.gate_source_superblock,
+            .down_source_superblock = routed_.down_source_superblock,
         };
-        auto program = cuda::moe::RetainedM1Program::prepare(device(), arguments, gate_, down_,
-            output_demand_, router_.collect_device_runtime_histogram, workspace_->id());
+        using Ordering = cuda::moe::RetainedM1PacketOrdering;
+        const auto ordering = (!arguments.hc.norm.extent.liveRows ||
+            early_readers_.mapped_dispatch || early_readers_.cpu_ticket)
+            ? Ordering::NativeCompletion : Ordering::CompleteProgram;
+        auto program = cuda::moe::RetainedM1Program::prepare(device(), arguments, routed_.gate_codebook, routed_.down_codebook,
+            output_demand_, router_.collect_device_runtime_histogram, workspace_->id(), ordering);
         if (program.admission().resources().private_bytes)
             throw std::logic_error("CUDA retained QFN requires a spill-free resident entry");
         if (early_readers_.mapped_dispatch)
-            early_readers_.mapped_dispatch->prepare(stream, arguments.early_packet_ready);
+            early_readers_.mapped_dispatch->prepare(stream);
         if (early_readers_.cpu_ticket)
-            early_readers_.cpu_ticket->prepare(stream, arguments.early_ticket_ready);
+            early_readers_.cpu_ticket->prepare(stream);
         prepared_stream_ = stream;
         prepared_workspace_id_ = workspace_->id();
         prepared_banks_ = pointers;
         prepared_tensors_ = addresses;
         prepared_runtime_ = runtime;
         prepared_shared_ = prepared_shared;
-        prepared_packet_word_ = arguments.early_packet_ready;
-        prepared_ticket_word_ = arguments.early_ticket_ready;
+        validated_store_epoch_ = shared_.prepared_store->mutationEpoch();
         program_.emplace(std::move(program));
         setGPUStream(stream);
         const auto& native = program_->admission();
         PerfStatsCollector::addCounter("moe_resident_ffn", "cuda_mapped_prepared_program", 1., "setup",
-            device().toString(), {{"layer", std::to_string(binding_->layer)},
+            device().toString(), {{"layer", std::to_string(routed_.layer)},
+                {"routed_width", std::to_string(routed_.routed_width)},
+                {"shared_width", std::to_string(shared_.intermediate)},
                 {"threads", std::to_string(native.threads())},
                 {"registers_per_thread", std::to_string(native.resources().registers_per_thread)}});
         return true;
@@ -246,19 +311,27 @@ public:
             execution.requirePreparedOutput(output.tensor);
         for (const auto& output : outputs())
             execution.requirePreparedOutput(output.tensor);
-        if (early_readers_.mapped_dispatch)
-            early_readers_.mapped_dispatch->recordProducer(execution.nativeStream(), prepared_packet_word_);
-        if (early_readers_.cpu_ticket)
-            early_readers_.cpu_ticket->recordProducer(execution.nativeStream(), prepared_ticket_word_);
-        program_->launch(execution.nativeStream(), prepared_workspace_id_);
+        if (early_readers_.mapped_dispatch || early_readers_.cpu_ticket)
+        {
+            program_->launch(execution.nativeStream(), prepared_workspace_id_, [&] {
+                if (early_readers_.mapped_dispatch)
+                    early_readers_.mapped_dispatch->recordCompletedProducer(execution.nativeStream());
+                if (early_readers_.cpu_ticket)
+                    early_readers_.cpu_ticket->recordCompletedProducer(execution.nativeStream());
+            });
+        }
+        else
+        {
+            program_->launch(execution.nativeStream(), prepared_workspace_id_);
+        }
         for (const auto& output : prefix_outputs_)
             execution.publish(output.tensor);
         for (const auto& output : outputs())
             execution.publish(output.tensor);
         PerfStatsCollector::addCounter("moe_resident_ffn", "cuda_mapped_local_program_enqueued", 1.,
-            "graph_capture", device().toString(), {{"layer", std::to_string(binding_->layer)},
-                {"early_cpu_packet", prepared_packet_word_ ? "1" : "0"},
-                {"early_cpu_ticket", prepared_ticket_word_ ? "1" : "0"}});
+            "graph_capture", device().toString(), {{"layer", std::to_string(routed_.layer)},
+                {"early_cpu_packet", early_readers_.mapped_dispatch ? "1" : "0"},
+                {"early_cpu_ticket", early_readers_.cpu_ticket ? "1" : "0"}});
         return true;
     }
 
@@ -266,6 +339,7 @@ public:
     void invalidateKernelDynamicState() override
     {
         program_.reset();
+        validated_store_epoch_ = 0;
         prefix_->invalidatePhaseBindings();
     }
 
@@ -273,11 +347,13 @@ public:
     std::uint64_t graphCaptureVariantSignature() const override
     {
         if (program_)
-            validateStorage(prepared_stream_);
-        auto signature = binding_->signature;
+            validateStorage(prepared_stream_, /*validate_prefix=*/false);
+        auto signature = routed_.signature;
         const auto mix = [&](std::uint64_t value) { signature = (signature ^ value) * kFNV1a64Prime; };
         mix(prefix_->phaseDeclaration().graphCaptureVariantSignature());
-        mix(gate_); mix(down_); mix(output_demand_.bits());
+        mix(routed_.gate_codebook); mix(routed_.down_codebook);
+        mix(routed_.gate_promoted_codebook); mix(routed_.down_promoted_codebook);
+        mix(output_demand_.bits());
         mix(router_.norm_topk_prob); mix(router_.collect_device_runtime_histogram);
         mix(reinterpret_cast<std::uintptr_t>(router_.gate_weights));
         mix(reinterpret_cast<std::uintptr_t>(router_.absolute_position_ids_device));
@@ -291,30 +367,32 @@ public:
     }
 
 private:
-    static constexpr const char* packet_word_name = "cuda_retained_qfn_cpu_packet_ready";
-    static constexpr const char* ticket_word_name = "cuda_retained_qfn_cpu_ticket_ready";
-
-    /**
-     * @brief Borrow the named same-device word for an admitted original reader.
-     * @param reader Original capture recorder whose lifetime owns the word's acquire.
-     * @param name Role-specific arena allocation identity.
-     * @return Aligned arena word, or null when the original reader is absent.
-     */
-    std::uint64_t* readyWord(const std::shared_ptr<CUDAEarlyPacketPublication>& reader, const char* name) const
-    {
-        if (!reader)
-            return nullptr;
-        auto* word = static_cast<std::uint64_t*>(workspace_->getBuffer(name));
-        if (!word || workspace_->getBufferSize(name) < sizeof(*word))
-            throw std::logic_error(std::string("CUDA retained QFN has no admitted early signal word ") + name);
-        return word;
-    }
-
     /** @brief Unambiguous index of every admitted scratch plane in the native operands. */
-    enum Bank : std::size_t { RouterLogits, Descriptors, RouteOrder, RoutePlanReady, HiddenCodes, HiddenScales, DownCodes, DownScales, BankCount };
+    enum Bank : std::size_t { RouterLogits, Descriptors, RouteOrder, RoutePlanReady, HiddenCodes, HiddenScales, DownCodes, DownScales, SuffixPartials, SuffixDone, BankCount };
     /** @brief Size of one named workspace plane. */
     struct BankRequirement { const char* name; std::size_t bytes; };
     using Addresses = std::array<void*, 5>;
+
+    /** @brief Common post-contract constructor checks and HC prefix demand seal. */
+    void finalizeConstruction()
+    {
+        if (!router_.gate_weights || router_.gate_weights->native_type() != TensorType::FP16 ||
+            router_.decode_route_publication != MoEDecodeRoutePublicationPolicy::DeviceRuntimeTable ||
+            shared_.device_id != device() || shared_.input != routed_.hidden.tensor ||
+            shared_.input_buffer_id != routed_.hidden.id || !shared_.output ||
+            shared_.seq_len != 1 || shared_.d_model != routed_.d_model ||
+            shared_.active_row_count_device != router_.active_row_count_device ||
+            shared_.required_router_q8_publication || shared_.force_decode_equivalent_verifier_prefill ||
+            shared_.force_grouped_verifier_prefill_for_decode || shared_.disable_grouped_decode_shortcut ||
+            !shared_.prepared_store || !shared_.prepared_ref_gate || !shared_.prepared_ref_up ||
+            !shared_.prepared_ref_down || !prefix_)
+            throw std::invalid_argument("CUDA retained QFN requires original native mapped M1 graph operands");
+        (void)sharedDescriptor();
+        prefix_->sealFullOutputDemand(output_demand_);
+        prefix_inputs_ = prefix_->phaseInputs();
+        prefix_outputs_ = prefix_->phaseOutputs();
+        prefix_contract_ = prefix_->phaseDeclaration().bufferContract();
+    }
 
     /** @return Exact execution scratch by original source width and selected route capacity. */
     std::array<BankRequirement, BankCount> banks() const
@@ -322,20 +400,26 @@ private:
         using namespace MoEWorkspaceBuffers;
         const std::size_t top_k = router_.top_k;
         const std::size_t hidden = router_.d_model;
-        const std::size_t channels = top_k * binding_->original.localIntermediateColumns() + shared_.intermediate;
+        const std::size_t channels = top_k * static_cast<std::size_t>(routed_.routed_width) +
+                                     static_cast<std::size_t>(shared_.intermediate);
+        const std::size_t suffix_packets =
+            top_k * (static_cast<std::size_t>(routed_.routed_width) / 32u) +
+            (static_cast<std::size_t>(shared_.intermediate) / 32u);
         return {{{ROUTE_LOGITS, std::size_t(router_.num_experts) * sizeof(float)},
             {"cuda_retained_qfn_selected_descriptors", top_k * sizeof(cuda::moe::RetainedM1Expert)},
             {"cuda_retained_qfn_route_order", (2 + top_k) * sizeof(int)},
             {"cuda_retained_qfn_route_plan_ready", sizeof(int)},
             {DECODE_HIDDEN_INT8, hidden * sizeof(int8_t)}, {DECODE_HIDDEN_SCALES, hidden / 32 * sizeof(float)},
-            {DECODE_SWIGLU_INT8, channels * sizeof(int8_t)}, {DECODE_SWIGLU_SCALES, channels / 32 * sizeof(float)}}};
+            {DECODE_SWIGLU_INT8, channels * sizeof(int8_t)}, {DECODE_SWIGLU_SCALES, channels / 32 * sizeof(float)},
+            {"cuda_retained_qfn_suffix_partials", suffix_packets * 16 * 2 * 32 * sizeof(float)},
+            {"cuda_retained_qfn_suffix_done", suffix_packets * sizeof(uint32_t)}}};
     }
 
     /** @return Existing graph publications with their original arena identities. */
     std::array<MoEIntermediateShardTensorBinding, 4> outputs() const
     {
         return {{{router_.output_indices, router_.output_indices_buffer_id},
-            {router_.output_weights, router_.output_weights_buffer_id}, binding_->params.route_partials,
+            {router_.output_weights, router_.output_weights_buffer_id}, routed_.route_partials,
             {shared_.output, shared_.output_buffer_id}}};
     }
 
@@ -372,81 +456,124 @@ private:
     {
         auto& store = *shared_.prepared_store;
         DeviceMoEExpertDescriptor descriptor{};
-        const auto q8 = [](const DeviceNativeQuantisedMatrixDesc& matrix) {
-            return matrix.codebook_id == native_quantised_formats::Q8_0.codebook_id &&
-                matrix.source_identity_present == 1 && matrix.source_codebook_id == matrix.codebook_id &&
-                matrix.source_is_superblock == 0;
+        const auto valid_native = [](const DeviceNativeQuantisedMatrixDesc& matrix) {
+            return matrix.valid() && matrix.source_identity_present == 1 &&
+                (cuda::moe::retainedQFNM1SuffixGateUpShard0(matrix.codebook_id) != nullptr ||
+                 cuda::moe::retainedQFNM1SuffixGateUpShard1(matrix.codebook_id) != nullptr);
         };
         if (!exportDeviceMoEExpertWeightDescriptors(store.gemmKernel(*shared_.prepared_ref_gate),
                 store.gemmKernel(*shared_.prepared_ref_up), store.gemmKernel(*shared_.prepared_ref_down),
                 shared_.d_model, shared_.intermediate, descriptor) ||
             descriptor.weight_format != DeviceMoEWeightFormat::NativeQuantised ||
-            !q8(descriptor.gate) || !q8(descriptor.up) || !q8(descriptor.down))
-            throw std::invalid_argument("CUDA retained QFN requires the original prepared Q8_0 shared-expert triple");
+            !valid_native(descriptor.gate) || !valid_native(descriptor.up) || !valid_native(descriptor.down))
+            throw std::invalid_argument("CUDA retained QFN requires a valid NativeQuantised shared-expert triple");
         return descriptor;
     }
 
-    /** @brief Admit only compiled policy pairs covering every legal execution decoder, including movement. */
-    void resolveCodebooks()
+    /** @brief Admit all 18 compiled codebooks + dynamic promotion for TensorSharded overlays. */
+    void resolveCodebooksFromIntermediateShard()
     {
-        namespace formats = native_quantised_formats;
         const auto gate = binding_->descriptor_declaration.nativeGateUpEnvelope();
         const auto down = binding_->descriptor_declaration.nativeDownEnvelope();
         const auto& sources = binding_->descriptor_declaration.sourceFormats();
-        const auto matches = [](const auto& source, uint8_t codebook, bool superblock) {
-            return source.isNativeQuantised() && source.native_quantised.present &&
-                source.native_quantised.codebook_id == codebook && source.native_quantised.is_superblock == superblock;
-        };
-        constexpr std::array gates{formats::Q4_K.codebook_id, formats::Q5_K.codebook_id};
-        constexpr std::array downs{formats::Q5_1.codebook_id, formats::Q8_0.codebook_id};
-        for (const uint8_t g : gates)
+        if (!sources[0].isNativeQuantised() || !sources[1].isNativeQuantised() || !sources[2].isNativeQuantised() ||
+            !sources[0].native_quantised.present || !sources[1].native_quantised.present || !sources[2].native_quantised.present ||
+            sources[0].native_quantised.codebook_id != sources[1].native_quantised.codebook_id)
+            throw std::invalid_argument("CUDA retained QFN requires matching NativeQuantised Gate/Up/Down sources");
+
+        const uint8_t g = sources[0].native_quantised.codebook_id;
+        const uint8_t d = sources[2].native_quantised.codebook_id;
+        const uint8_t g_phys = (g == native_quantised_formats::IQ4_XS.codebook_id && sources[0].native_quantised.is_superblock)
+            ? kNativeQuantisedIQ4XSSourceScaleCodebook : g;
+        const uint8_t d_phys = (d == native_quantised_formats::IQ4_XS.codebook_id && sources[2].native_quantised.is_superblock)
+            ? kNativeQuantisedIQ4XSSourceScaleCodebook : d;
+        const bool can_use_native = !router_.active_row_count_device &&
+            cuda::moe::retainedQFNM1NativeCompletionSupported(g_phys, d_phys);
+        const bool can_use_complete = cuda::moe::retainedQFNM1Function(
+            g_phys, d_phys, output_demand_, router_.collect_device_runtime_histogram, routed_.row_policy) != nullptr;
+        if (!can_use_native && !can_use_complete)
         {
-            const auto gate_bit = nativeQuantisedCodebookMaskBit(g);
-            const auto compiled_gate = gate_bit | (g == formats::Q5_K.codebook_id
-                ? nativeQuantisedCodebookMaskBit(kNativeQuantisedExpandedInt8MinCodebook) : 0u);
-            if (!matches(sources[0], g, true) || !matches(sources[1], g, true) ||
-                gate.policy_codebook_mask != gate_bit || (gate.execution_codebook_mask & ~compiled_gate) != 0u)
+            throw std::invalid_argument("CUDA retained QFN has no entry for layer " + std::to_string(routed_.layer) +
+                " on " + device().toString() + " with gate/down codebooks " +
+                std::to_string(g_phys) + "/" + std::to_string(d_phys));
+        }
+
+        routed_.gate_codebook = g_phys;
+        routed_.down_codebook = d_phys;
+        routed_.gate_source_superblock = sources[0].native_quantised.is_superblock ? 1u : 0u;
+        routed_.down_source_superblock = sources[2].native_quantised.is_superblock ? 1u : 0u;
+        const auto exp_bit = nativeQuantisedCodebookMaskBit(kNativeQuantisedExpandedInt8MinCodebook);
+        if ((gate.execution_codebook_mask & exp_bit) != 0u)
+            routed_.gate_promoted_codebook = kNativeQuantisedExpandedInt8MinCodebook;
+        if ((down.execution_codebook_mask & exp_bit) != 0u)
+            routed_.down_promoted_codebook = kNativeQuantisedExpandedInt8MinCodebook;
+    }
+
+    /** @brief Resolve canonical and dynamic-promoted codebooks from Apportioned prepared experts. */
+    void resolveCodebooksFromPreparedEngines(const MoEExpertComputeStage::Params& compute)
+    {
+        bool found = false;
+        uint8_t g_cb = 0, d_cb = 0;
+        uint8_t g_sb = 0, d_sb = 0;
+        for (std::size_t e = 0; e < compute.prepared_gate_gemm.size(); ++e)
+        {
+            if (!compute.prepared_gate_gemm[e] || !compute.prepared_up_gemm[e] || !compute.prepared_down_gemm[e])
                 continue;
-            for (const uint8_t d : downs)
+            DeviceMoEExpertDescriptor desc{};
+            if (!exportDeviceMoEExpertWeightDescriptors(
+                    compute.prepared_gate_gemm[e], compute.prepared_up_gemm[e], compute.prepared_down_gemm[e],
+                    compute.d_model, compute.expert_intermediate, desc) ||
+                desc.weight_format != DeviceMoEWeightFormat::NativeQuantised)
+                throw std::invalid_argument("CUDA retained QFN Apportioned requires NativeQuantised prepared experts");
+            if (!found)
             {
-                const auto down_bit = nativeQuantisedCodebookMaskBit(d);
-                const auto compiled = down_bit | (d == formats::Q5_1.codebook_id
-                    ? nativeQuantisedCodebookMaskBit(kNativeQuantisedExpandedInt8MinCodebook) : 0u);
-                if (matches(sources[2], d, false) && down.policy_codebook_mask == down_bit &&
-                    (down.execution_codebook_mask & ~compiled) == 0u &&
-                    cuda::moe::retainedQFNM1Function(g, d, output_demand_, router_.collect_device_runtime_histogram,
-                        binding_->params.row_policy))
-                {
-                    gate_ = g;
-                    down_ = d;
-                    return;
-                }
+                g_cb = desc.gate.codebook_id;
+                d_cb = desc.down.codebook_id;
+                g_sb = desc.gate.source_is_superblock;
+                d_sb = desc.down.source_is_superblock;
+                found = true;
+            }
+            else if (!areNativeQuantisedGateUpCodebooksCompatible(desc.gate.codebook_id, g_cb) ||
+                     !areNativeQuantisedGateUpCodebooksCompatible(desc.up.codebook_id, g_cb) ||
+                     !areNativeQuantisedGateUpCodebooksCompatible(desc.down.codebook_id, d_cb))
+            {
+                throw std::invalid_argument("CUDA retained QFN Apportioned layer mixes incompatible routed codebooks");
             }
         }
-        throw std::invalid_argument("CUDA retained QFN has no entry for layer " + std::to_string(binding_->layer) +
-            " on " + device().toString() + " with gate/up execution/policy masks " +
-            std::to_string(gate.execution_codebook_mask) + "/" + std::to_string(gate.policy_codebook_mask) +
-            " and down execution/policy masks " + std::to_string(down.execution_codebook_mask) +
-            "/" + std::to_string(down.policy_codebook_mask));
+        if (!found || !cuda::moe::retainedQFNM1NativeCompletionSupported(g_cb, d_cb))
+            throw std::invalid_argument("CUDA retained QFN Apportioned lacks supported prepared routed experts");
+        routed_.gate_codebook = g_cb;
+        routed_.down_codebook = d_cb;
+        routed_.gate_source_superblock = g_sb;
+        routed_.down_source_superblock = d_sb;
     }
 
     /** @brief Reject any rebound prepared source, workspace, native tensor or stream. */
-    void validateStorage(void* stream) const
+    void validateStorage(void* stream, bool validate_prefix = true) const
     {
-        const auto descriptor = sharedDescriptor();
-        const auto same = [](const auto& a, const auto& b) { return std::memcmp(&a, &b, sizeof(a)) == 0; };
-        if (!workspace_ || stream != prepared_stream_ || workspace_->id() != prepared_workspace_id_ ||
-            tensorAddresses() != prepared_tensors_ || bankAddresses() != prepared_banks_ ||
-            readyWord(early_readers_.mapped_dispatch, packet_word_name) != prepared_packet_word_ ||
-            readyWord(early_readers_.cpu_ticket, ticket_word_name) != prepared_ticket_word_ ||
-            binding_->params.runtime->deviceLayerState(binding_->layer) != prepared_runtime_ ||
-            !same(descriptor.gate, prepared_shared_.gate) || !same(descriptor.up, prepared_shared_.up) ||
-            !same(descriptor.down, prepared_shared_.down))
+        if (!workspace_ || !workspace_->isAllocated() || stream != prepared_stream_ ||
+            workspace_->id() != prepared_workspace_id_ ||
+            tensorAddresses() != prepared_tensors_ ||
+            routed_.runtime->deviceLayerState(routed_.layer) != prepared_runtime_)
             throw std::logic_error("CUDA retained QFN capture storage changed");
-        prefix_->validatePhaseBindings(stream);
+        const bool store_unchanged = validated_store_epoch_ != 0 &&
+            shared_.prepared_store->mutationEpoch() == validated_store_epoch_;
+        if (!store_unchanged)
+        {
+            const auto descriptor = sharedDescriptor();
+            const auto same = [](const auto& a, const auto& b) { return std::memcmp(&a, &b, sizeof(a)) == 0; };
+            if (bankAddresses() != prepared_banks_ ||
+                !same(descriptor.gate, prepared_shared_.gate) || !same(descriptor.up, prepared_shared_.up) ||
+                !same(descriptor.down, prepared_shared_.down))
+                throw std::logic_error("CUDA retained QFN capture storage changed");
+            validated_store_epoch_ = shared_.prepared_store->mutationEpoch();
+        }
+        if (validate_prefix)
+            prefix_->validatePhaseBindings(stream);
     }
 
     const std::shared_ptr<Binding> binding_;
+    CUDARetainedRoutedContract routed_{};
     const MoERoutingStage::Params router_;
     const SharedExpertFFNStage::Params shared_;
     const std::shared_ptr<Qwen4ExpHCReadPhaseOwner> prefix_;
@@ -455,15 +582,13 @@ private:
     const FullNativeHCFFNOutputDemand output_demand_ = FullNativeHCFFNOutputDemand::all();
     std::vector<Qwen4ExpFloatBinding> prefix_inputs_, prefix_outputs_;
     StageBufferContract prefix_contract_;
-    uint8_t gate_ = 0, down_ = 0;
     DeviceWorkspaceManager* workspace_ = nullptr;
     std::optional<cuda::moe::RetainedM1Program> program_;
     std::array<void*, BankCount> prepared_banks_{};
     Addresses prepared_tensors_{};
     DeviceMoELayerRuntime* prepared_runtime_ = nullptr;
-    std::uint64_t* prepared_packet_word_ = nullptr;
-    std::uint64_t* prepared_ticket_word_ = nullptr;
     DeviceMoEExpertDescriptor prepared_shared_{};
     std::uint64_t prepared_workspace_id_ = 0;
+    mutable std::uint64_t validated_store_epoch_ = 0;
     void* prepared_stream_ = nullptr;
 };

@@ -304,7 +304,9 @@ namespace llaminar2
                     gpu_has_emins ==
                         static_cast<std::uint8_t>(source_format->has_emins);
                 const bool normalized_source =
-                    cpu_encoding == Encoding::ExpandedInt8 &&
+                    (cpu_encoding == Encoding::ExpandedInt8 ||
+                     (cpu_encoding == Encoding::NibbleLUT &&
+                      (cpu_codebook_id == 12 || cpu_codebook_id == 15 || cpu_codebook_id == 16))) &&
                     gpu_payload_bytes_per_block == 32 &&
                     gpu_has_emins == 0 &&
                     gpu_is_asymmetric == cpu_is_asymmetric &&
@@ -321,17 +323,22 @@ namespace llaminar2
                 }
 
                 const Encoding expected_encoding =
-                    gpu_codebook_id == kNativeQuantisedIQ4XSSourceScaleCodebook
+                    (gpu_codebook_id == kNativeQuantisedIQ4XSSourceScaleCodebook || gpu_codebook_id == 11)
                         ? Encoding::NibbleLUTSourceScale
-                        : gpu_codebook_id == 11 ? Encoding::IQ3SExpandedSourceScale
-                        : gpu_codebook_id == 0 || gpu_codebook_id == 4 ||
-                            gpu_codebook_id == 5
+                        : (gpu_codebook_id == 4 || cpu_codebook_id == 12 || cpu_codebook_id == 15 || cpu_codebook_id == 16)
                         ? Encoding::NibbleLUT
-                        : (gpu_codebook_id == 8
-                               ? Encoding::Q6KNativeDualScale
-                               : hasCompactMultiScaleVnniPayload(gpu_codebook_id)
-                                     ? Encoding::CompactMultiScale
-                                     : Encoding::ExpandedInt8);
+                        : (gpu_codebook_id == 0 || gpu_codebook_id == 5
+                               ? Encoding::UnsignedNibble
+                        : (gpu_codebook_id == 6 || gpu_codebook_id == 7
+                               ? Encoding::CompactFiveBit
+                               : (gpu_codebook_id == 8
+                                      ? Encoding::Q6KNativeDualScale
+                                      : ((cpu_codebook_id == 19 || cpu_codebook_id == 20 || cpu_codebook_id == 21) &&
+                                         gpu_codebook_id == 19
+                                             ? Encoding::UnsignedInt8
+                                             : hasCompactMultiScaleVnniPayload(gpu_codebook_id)
+                                                   ? Encoding::CompactMultiScale
+                                                   : Encoding::ExpandedInt8))));
                 return cpu_encoding == expected_encoding;
             }
 
@@ -342,21 +349,41 @@ namespace llaminar2
                 return false;
             switch (cpu_encoding)
             {
-            case Encoding::IQ3SExpandedSourceScale:
-                return cpu_codebook_id == 11 && cpu_is_superblock == 1 &&
-                       gpu_codebook_id == 11 && gpu_payload_bytes_per_block == 13 &&
-                       cpu_is_asymmetric == 0 && gpu_is_asymmetric == 1;
+            case Encoding::UnsignedInt8:
+                return (cpu_codebook_id == 19 || cpu_codebook_id == 20 || cpu_codebook_id == 21) &&
+                       gpu_codebook_id == 19 &&
+                       gpu_payload_bytes_per_block == 32 &&
+                       cpu_is_asymmetric == 0 && gpu_is_asymmetric == 0;
+            case Encoding::CompactFiveBit:
+                return (cpu_codebook_id == 6 || cpu_codebook_id == 7) &&
+                       gpu_codebook_id == cpu_codebook_id &&
+                       gpu_payload_bytes_per_block == 20 &&
+                       cpu_is_asymmetric == (cpu_codebook_id == 7 ? 1 : 0) &&
+                       gpu_is_asymmetric == cpu_is_asymmetric;
             case Encoding::NibbleLUTSourceScale:
-                return cpu_codebook_id == 4 && cpu_is_superblock != 0 &&
-                       gpu_codebook_id == kNativeQuantisedIQ4XSSourceScaleCodebook &&
-                       gpu_payload_bytes_per_block == 16 &&
+                return ((cpu_codebook_id == 4 && cpu_is_superblock != 0 &&
+                         gpu_codebook_id == kNativeQuantisedIQ4XSSourceScaleCodebook &&
+                         gpu_payload_bytes_per_block == 16) ||
+                        (cpu_codebook_id == 11 && cpu_is_superblock != 0 &&
+                         gpu_codebook_id == 11 &&
+                         gpu_payload_bytes_per_block == 13)) &&
                        cpu_is_asymmetric == 0 && gpu_is_asymmetric == 1;
-            case Encoding::NibbleLUT:
+            case Encoding::UnsignedNibble:
                 return gpu_payload_bytes_per_block == 16 &&
                        gpu_is_asymmetric == cpu_is_asymmetric &&
-                       (((gpu_codebook_id == 0 || gpu_codebook_id == 4) &&
-                         cpu_is_asymmetric == 0) ||
+                       ((gpu_codebook_id == 0 && cpu_is_asymmetric == 0) ||
                         (gpu_codebook_id == 5 && cpu_is_asymmetric != 0));
+            case Encoding::NibbleLUT:
+                if (cpu_codebook_id == 12 || cpu_codebook_id == 15)
+                    return gpu_codebook_id == 19 && gpu_payload_bytes_per_block == 32 &&
+                           cpu_is_asymmetric == 0 && gpu_is_asymmetric == 0;
+                if (cpu_codebook_id == 16)
+                    return gpu_codebook_id == kNativeQuantisedExpandedInt8MinCodebook &&
+                           gpu_payload_bytes_per_block == 32 &&
+                           cpu_is_asymmetric == 1 && gpu_is_asymmetric == 1;
+                return gpu_payload_bytes_per_block == 16 &&
+                       gpu_is_asymmetric == cpu_is_asymmetric &&
+                       gpu_codebook_id == 4 && cpu_is_asymmetric == 0;
             case Encoding::ExpandedInt8:
                 return gpu_payload_bytes_per_block == 32 &&
                        gpu_codebook_id ==

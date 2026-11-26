@@ -36,6 +36,49 @@ namespace llaminar2
         __device__ __constant__ __align__(16) std::int8_t kTierIQ4ValuesCUDA[16] = {
             -127, -104, -83, -65, -49, -35, -22, -10,
             1, 13, 25, 38, 53, 69, 89, 113};
+        __device__ __constant__ __align__(16) std::int8_t kTierIQ3XXSValuesCUDA[16] = {
+            -62, -52, -44, -36, -28, -20, -12, -4,
+            4, 12, 20, 28, 36, 44, 52, 62};
+        __device__ __constant__ __align__(16) std::int8_t kTierIQ2XXSValuesCUDA[16] = {
+            0, -43, -25, -8, 8, 25, 43, 0,
+            0, 0, 0, 0, 0, 0, 0, 0};
+
+        template <std::uint8_t CpuCodebook>
+        __device__ __forceinline__ std::uint8_t encodeRepackedNibbleCUDA(std::int8_t v)
+        {
+            if constexpr (CpuCodebook == 11)
+                return static_cast<std::uint8_t>((static_cast<int>(v) + 15) >> 1);
+            if constexpr (CpuCodebook == 12)
+            {
+                const int iv = static_cast<int>(v);
+                const int mag = iv < 0 ? -iv : iv;
+                const int idx = (mag == 62) ? 7 : ((mag - 4) >> 3);
+                return static_cast<std::uint8_t>(iv > 0 ? (8 + idx) : (7 - idx));
+            }
+            if constexpr (CpuCodebook == 15)
+            {
+                const int iv = static_cast<int>(v);
+                return static_cast<std::uint8_t>(
+                    iv < -30 ? 1 : iv < -15 ? 2 : iv < 0 ? 3 : iv < 15 ? 4 : iv < 30 ? 5 : 6);
+            }
+            if constexpr (CpuCodebook == 16)
+                return static_cast<std::uint8_t>(v == 0 ? 0 : (v > 0 ? 1 : 2));
+            return 0u;
+        }
+
+        template <std::uint8_t CpuCodebook>
+        __device__ __forceinline__ std::int8_t decodeRepackedNibbleCUDA(std::uint8_t nib)
+        {
+            if constexpr (CpuCodebook == 11)
+                return static_cast<std::int8_t>(static_cast<int>(nib) * 2 - 15);
+            if constexpr (CpuCodebook == 12)
+                return kTierIQ3XXSValuesCUDA[nib & 0x0fu];
+            if constexpr (CpuCodebook == 15)
+                return kTierIQ2XXSValuesCUDA[nib & 0x0fu];
+            if constexpr (CpuCodebook == 16)
+                return static_cast<std::int8_t>(nib == 1u ? 1 : (nib == 2u ? -1 : 0));
+            return 0;
+        }
 
         /**
          * @brief Locate one payload byte using the actual live wire-column stride.
@@ -208,7 +251,11 @@ namespace llaminar2
             }
         }
 
-        /** Native entry retains the existing grid and forwards one complete unit. */
+        /// Cap background dynamic-rebalance repack CTAs so concurrent transfers stay strictly
+        /// inside the co-residency SM reservation and never starve resident decode barriers.
+        constexpr std::uint32_t kMaxBackgroundTierRepackBlocks = 8u;
+
+        /** Native entry loops grid-stride across units within a bounded SM budget. */
         template <bool ToCpu>
         __global__ void compactMultiScaleUnitsCUDA(
             ExpertTierGpuConstProjectionView source,
@@ -216,14 +263,20 @@ namespace llaminar2
             const std::uint8_t *cpu_source,
             std::uint8_t *cpu_destination,
             ExpertTierWeightDeviceLayout layout,
-            std::uint32_t first_unit)
+            std::uint32_t first_unit,
+            std::uint32_t unit_count)
         {
-            compactMultiScaleUnitsCUDAUnit<ToCpu>(
-                source, destination, cpu_source, cpu_destination, layout, first_unit, blockIdx.x);
+            for (std::uint32_t local_unit = blockIdx.x; local_unit < unit_count; local_unit += gridDim.x)
+            {
+                compactMultiScaleUnitsCUDAUnit<ToCpu>(
+                    source, destination, cpu_source, cpu_destination, layout, first_unit, local_unit);
+                if constexpr (ToCpu)
+                    __syncthreads();
+            }
         }
 
         /** GPU-separated nibble projection to final CPU unit bytes. */
-        template <std::uint8_t Codebook, bool Asymmetric>
+        template <std::uint8_t Codebook, bool Asymmetric, bool WithComp = true>
         __device__ __forceinline__ void gpuToCpuNibbleUnitsCUDAUnit(
             const std::uint8_t *__restrict__ payload,
             const std::uint16_t *__restrict__ scales,
@@ -259,34 +312,47 @@ namespace llaminar2
             {
                 const std::uint8_t packed = source[value];
                 unit[interleavedValueOffset(local_column, value, columns)] = packed;
-                compensation += decodeNibbleForCompensation<Codebook>(
-                    static_cast<std::uint8_t>(packed & 0x0fu));
-                compensation += decodeNibbleForCompensation<Codebook>(
-                    static_cast<std::uint8_t>(packed >> 4));
+                if constexpr (WithComp)
+                {
+                    compensation += decodeNibbleForCompensation<Codebook>(
+                        static_cast<std::uint8_t>(packed & 0x0fu));
+                    compensation += decodeNibbleForCompensation<Codebook>(
+                        static_cast<std::uint8_t>(packed >> 4));
+                }
             }
-            reinterpret_cast<std::int16_t *>(unit + (1024u/64)*columns)[local_column] =
-                static_cast<std::int16_t>(compensation);
-            reinterpret_cast<std::uint16_t *>(unit + (1152u/64)*columns)[local_column] =
+            if constexpr (WithComp)
+            {
+                reinterpret_cast<std::int16_t *>(unit + (1024u/64)*columns)[local_column] =
+                    static_cast<std::int16_t>(compensation);
+            }
+            constexpr unsigned scale_base = WithComp ? 1152u : 1024u;
+            constexpr unsigned min_base = WithComp ? 1280u : 1152u;
+            reinterpret_cast<std::uint16_t *>(unit + (scale_base/64)*columns)[local_column] =
                 scales[linear];
             if constexpr (Asymmetric || Codebook == kNativeQuantisedIQ4XSSourceScaleCodebook)
             {
-                reinterpret_cast<std::uint16_t *>(unit + (1280u/64)*columns)[local_column] =
+                reinterpret_cast<std::uint16_t *>(unit + (min_base/64)*columns)[local_column] =
                     mins[linear];
             }
         }
 
-        /** Native entry retains the existing grid and forwards one complete unit. */
-        template <std::uint8_t Codebook, bool Asymmetric>
+        /** Native entry loops grid-stride across units within a bounded SM budget. */
+        template <std::uint8_t Codebook, bool Asymmetric, bool WithComp = true>
         __global__ void gpuToCpuNibbleUnitsCUDA(
             const std::uint8_t *__restrict__ payload,
             const std::uint16_t *__restrict__ scales,
             const std::uint16_t *__restrict__ mins,
             ExpertTierWeightDeviceLayout layout,
             std::uint32_t first_unit,
-            std::uint8_t *__restrict__ cpu_chunk)
+            std::uint8_t *__restrict__ cpu_chunk,
+            std::uint32_t unit_count)
         {
-            gpuToCpuNibbleUnitsCUDAUnit<Codebook, Asymmetric>(
-                payload, scales, mins, layout, first_unit, cpu_chunk, blockIdx.x);
+            for (std::uint32_t local_unit = blockIdx.x; local_unit < unit_count; local_unit += gridDim.x)
+            {
+                gpuToCpuNibbleUnitsCUDAUnit<Codebook, Asymmetric, WithComp>(
+                    payload, scales, mins, layout, first_unit, cpu_chunk, local_unit);
+                __syncthreads();
+            }
         }
 
         /**
@@ -317,7 +383,7 @@ namespace llaminar2
          * and scale/minimum without any floating-point conversion. Padded columns remain
          * deterministic zeros from `initializeCpuUnit`.
          */
-        template <std::uint8_t Codebook>
+        template <std::uint8_t Codebook, bool UnsignedCompFree = false>
         __device__ __forceinline__ void gpuToCpuDecodedUnitsCUDAUnit(
             const std::uint8_t *__restrict__ payload,
             const std::uint16_t *__restrict__ scales,
@@ -362,32 +428,192 @@ namespace llaminar2
             // Multi-scale sources use the native transposition kernel instead.
             for (int group = 0; group < 8; ++group)
             {
-                storeTierWord(unit+interleavedValueOffset(local_column,group*4,columns),
-                    static_cast<uint32_t>(decoded_groups[group]));
+                const uint32_t word = static_cast<uint32_t>(decoded_groups[group]) ^
+                    (UnsignedCompFree ? 0x80808080u : 0u);
+                storeTierWord(unit+interleavedValueOffset(local_column,group*4,columns), word);
             }
 
-            // CPU VNNI kernels shift activations to unsigned and require the
-            // exact signed-weight sum for every expanded block.
-            int compensation = 0;
-            for (int value = 0; value < 32; ++value)
+            if constexpr (UnsignedCompFree)
             {
-                compensation += decodedGroupValue(decoded_groups, value);
+                reinterpret_cast<std::uint16_t *>(unit + (2048u/64)*columns)[local_column] =
+                    scales[linear];
+                if constexpr (
+                    Codebook == 7 || Codebook == 11 || Codebook == 16 ||
+                    Codebook == kNativeQuantisedExpandedInt8MinCodebook)
+                {
+                    reinterpret_cast<std::uint16_t *>(unit + (2176u/64)*columns)[local_column] =
+                        mins[linear];
+                }
             }
-            reinterpret_cast<std::int16_t *>(unit + (2048u/64)*columns)[local_column] =
-                static_cast<std::int16_t>(compensation);
-            reinterpret_cast<std::uint16_t *>(unit + (2176u/64)*columns)[local_column] =
-                scales[linear];
-            if constexpr (
-                Codebook == 7 || Codebook == 11 || Codebook == 16 ||
-                Codebook == kNativeQuantisedExpandedInt8MinCodebook)
+            else
             {
-                reinterpret_cast<std::uint16_t *>(unit + (2304u/64)*columns)[local_column] =
-                    mins[linear];
+                // CPU VNNI kernels shift activations to unsigned and require the
+                // exact signed-weight sum for every expanded block.
+                int compensation = 0;
+                for (int value = 0; value < 32; ++value)
+                {
+                    compensation += decodedGroupValue(decoded_groups, value);
+                }
+                reinterpret_cast<std::int16_t *>(unit + (2048u/64)*columns)[local_column] =
+                    static_cast<std::int16_t>(compensation);
+                reinterpret_cast<std::uint16_t *>(unit + (2176u/64)*columns)[local_column] =
+                    scales[linear];
+                if constexpr (
+                    Codebook == 7 || Codebook == 11 || Codebook == 16 ||
+                    Codebook == kNativeQuantisedExpandedInt8MinCodebook)
+                {
+                    reinterpret_cast<std::uint16_t *>(unit + (2304u/64)*columns)[local_column] =
+                        mins[linear];
+                }
             }
         }
 
-        /** Native entry retains the existing grid and forwards one complete unit. */
-        template <std::uint8_t Codebook>
+        /** GPU-separated IQ3_S/IQ3_XXS/IQ2_XXS/IQ1_S (or normalized 19/23) to compact CPU 4-bit NibbleLUT / NibbleLUTSourceScale. */
+        template <std::uint8_t GpuCodebook, std::uint8_t CpuCodebook>
+        __device__ __forceinline__ void gpuToCpuRepackedNibbleUnitsCUDAUnit(
+            const std::uint8_t *__restrict__ payload,
+            const std::uint16_t *__restrict__ scales,
+            const std::uint16_t *__restrict__ mins,
+            ExpertTierWeightDeviceLayout layout,
+            std::uint32_t first_unit,
+            std::uint8_t *__restrict__ cpu_chunk,
+            std::uint32_t local_unit, bool active = true)
+        {
+            const std::uint32_t global_unit = first_unit + local_unit;
+            const int N = layout.N, blocks_per_row = layout.blocks_per_row;
+            const unsigned columns = expertTierWireColumns(layout, global_unit);
+            const unsigned cpu_stride = (layout.cpu_block_stride / 64) * columns;
+            const int n_chunk = static_cast<int>(global_unit / blocks_per_row);
+            const int kb = static_cast<int>(global_unit % blocks_per_row);
+            const int local_column = static_cast<int>(threadIdx.x % kColumnsPerUnit);
+            std::uint8_t *unit = cpu_chunk + expertTierWireOffset(layout, first_unit, local_unit);
+            if (active) initializeCpuUnit(unit, cpu_stride);
+            __syncthreads();
+            const int n = n_chunk * kColumnsPerUnit + local_column;
+            if (!active || n >= N) return;
+            const std::size_t linear =
+                static_cast<size_t>(kb + layout.gpu_first_column / 32) * layout.gpu_N + n + layout.gpu_first_row;
+            constexpr int payload_bytes = cuda_native_quantised::CodebookTraits<GpuCodebook>::payload_bytes;
+            const std::uint8_t *source = payload + linear * static_cast<std::size_t>(payload_bytes);
+            std::int32_t decoded_groups[8]{};
+            cuda_native_quantised::decode_groups<GpuCodebook>(source, decoded_groups);
+            int compensation = 0;
+#pragma unroll
+            for (int i = 0; i < 16; ++i)
+            {
+                const std::int8_t v0 = static_cast<std::int8_t>(decodedGroupValue(decoded_groups, i));
+                const std::int8_t v1 = static_cast<std::int8_t>(decodedGroupValue(decoded_groups, i + 16));
+                compensation += static_cast<int>(v0) + static_cast<int>(v1);
+                const std::uint8_t packed = static_cast<std::uint8_t>(
+                    encodeRepackedNibbleCUDA<CpuCodebook>(v0) |
+                    (encodeRepackedNibbleCUDA<CpuCodebook>(v1) << 4));
+                unit[interleavedValueOffset(local_column, i, columns)] = packed;
+            }
+            reinterpret_cast<std::int16_t *>(unit + (1024u / 64) * columns)[local_column] =
+                static_cast<std::int16_t>(compensation);
+            reinterpret_cast<std::uint16_t *>(unit + (1152u / 64) * columns)[local_column] = scales[linear];
+            if constexpr (CpuCodebook == 11 || CpuCodebook == 16)
+                reinterpret_cast<std::uint16_t *>(unit + (1280u / 64) * columns)[local_column] = mins[linear];
+        }
+
+        template <std::uint8_t GpuCodebook, std::uint8_t CpuCodebook>
+        __global__ void gpuToCpuRepackedNibbleUnitsCUDA(
+            const std::uint8_t *__restrict__ payload,
+            const std::uint16_t *__restrict__ scales,
+            const std::uint16_t *__restrict__ mins,
+            ExpertTierWeightDeviceLayout layout,
+            std::uint32_t first_unit,
+            std::uint8_t *__restrict__ cpu_chunk,
+            std::uint32_t unit_count)
+        {
+            for (std::uint32_t local_unit = blockIdx.x; local_unit < unit_count; local_unit += gridDim.x)
+            {
+                gpuToCpuRepackedNibbleUnitsCUDAUnit<GpuCodebook, CpuCodebook>(
+                    payload, scales, mins, layout, first_unit, cpu_chunk, local_unit);
+                __syncthreads();
+            }
+        }
+
+        /** CPU compact 4-bit NibbleLUT/NibbleLUTSourceScale (IQ3_S/IQ3_XXS/IQ2_XXS/IQ1_S) to separated GPU projection. */
+        template <std::uint8_t CpuCodebook>
+        __device__ __forceinline__ void cpuToGpuRepackedNibbleUnitsCUDAUnit(
+            const std::uint8_t *__restrict__ cpu_chunk,
+            ExpertTierWeightDeviceLayout layout,
+            std::uint32_t first_unit,
+            std::uint8_t *__restrict__ payload,
+            std::uint16_t *__restrict__ scales,
+            std::uint16_t *__restrict__ mins,
+            std::uint32_t local_unit)
+        {
+            const std::uint32_t global_unit = first_unit + local_unit;
+            const int N = layout.N, blocks_per_row = layout.blocks_per_row;
+            const unsigned columns = expertTierWireColumns(layout, global_unit);
+            const int n_chunk = static_cast<int>(global_unit / blocks_per_row);
+            const int kb = static_cast<int>(global_unit % blocks_per_row);
+            const int local_column = static_cast<int>(threadIdx.x % kColumnsPerUnit);
+            const int n = n_chunk * kColumnsPerUnit + local_column;
+            if (n >= N) return;
+            const std::uint8_t *unit = cpu_chunk + expertTierWireOffset(layout, first_unit, local_unit);
+            const std::size_t linear =
+                static_cast<size_t>(kb + layout.gpu_first_column / 32) * layout.gpu_N + n + layout.gpu_first_row;
+            std::int8_t decoded[32];
+#pragma unroll
+            for (int i = 0; i < 16; ++i)
+            {
+                const std::uint8_t packed = unit[interleavedValueOffset(local_column, i, columns)];
+                decoded[i] = decodeRepackedNibbleCUDA<CpuCodebook>(packed & 0x0fu);
+                decoded[i + 16] = decodeRepackedNibbleCUDA<CpuCodebook>(packed >> 4);
+            }
+            if constexpr (CpuCodebook == 11)
+            {
+                const uint16_t secondary = reinterpret_cast<const uint16_t *>(unit + (1280u / 64) * columns)[local_column];
+                if (!native_quantised_iq3s_scale::valid(secondary)) { __trap(); return; }
+                uint32_t low_words[2]{}, sign_word = 0;
+                uint8_t high = 0;
+                for (int group = 0; group < 8; ++group)
+                {
+                    const auto encoded = native_quantised_iq3s_scale::encodeGridQuartet(
+                        decoded + group * 4, cuda_native_quantised::d_iq3s_grid);
+                    if (!encoded.valid()) { __trap(); return; }
+                    low_words[group / 4] |= uint32_t{static_cast<uint8_t>(encoded.index)} << (8 * (group % 4));
+                    high |= static_cast<uint8_t>((encoded.index >> 8) << group);
+                    sign_word |= uint32_t{encoded.signs} << (4 * group);
+                }
+                std::uint8_t *destination = payload + linear * 13u;
+                for (int i = 0; i < 8; ++i) destination[i] = static_cast<uint8_t>(low_words[i / 4] >> (8 * (i % 4)));
+                destination[8] = high;
+                for (int i = 0; i < 4; ++i) destination[9 + i] = static_cast<uint8_t>(sign_word >> (8 * i));
+                scales[linear] = reinterpret_cast<const uint16_t *>(unit + (1152u / 64) * columns)[local_column];
+                mins[linear] = secondary;
+                return;
+            }
+            std::uint8_t *destination = payload + linear * 32u;
+#pragma unroll
+            for (int i = 0; i < 32; ++i) destination[i] = static_cast<std::uint8_t>(decoded[i]);
+            scales[linear] = reinterpret_cast<const uint16_t *>(unit + (1152u / 64) * columns)[local_column];
+            if constexpr (CpuCodebook == 16)
+                mins[linear] = reinterpret_cast<const uint16_t *>(unit + (1280u / 64) * columns)[local_column];
+        }
+
+        template <std::uint8_t CpuCodebook>
+        __global__ void cpuToGpuRepackedNibbleUnitsCUDA(
+            const std::uint8_t *__restrict__ cpu_chunk,
+            ExpertTierWeightDeviceLayout layout,
+            std::uint32_t first_unit,
+            std::uint8_t *__restrict__ payload,
+            std::uint16_t *__restrict__ scales,
+            std::uint16_t *__restrict__ mins,
+            std::uint32_t unit_count)
+        {
+            for (std::uint32_t local_unit = blockIdx.x; local_unit < unit_count; local_unit += gridDim.x)
+            {
+                cpuToGpuRepackedNibbleUnitsCUDAUnit<CpuCodebook>(
+                    cpu_chunk, layout, first_unit, payload, scales, mins, local_unit);
+            }
+        }
+
+        /** Native entry loops grid-stride across units within a bounded SM budget. */
+        template <std::uint8_t Codebook, bool UnsignedCompFree = false>
         __global__ void gpuToCpuDecodedUnitsCUDA(
             const std::uint8_t *__restrict__ payload,
             const std::uint16_t *__restrict__ scales,
@@ -395,10 +621,15 @@ namespace llaminar2
             const std::uint32_t *__restrict__ emins,
             ExpertTierWeightDeviceLayout layout,
             std::uint32_t first_unit,
-            std::uint8_t *__restrict__ cpu_chunk)
+            std::uint8_t *__restrict__ cpu_chunk,
+            std::uint32_t unit_count)
         {
-            gpuToCpuDecodedUnitsCUDAUnit<Codebook>(
-                payload, scales, mins, emins, layout, first_unit, cpu_chunk, blockIdx.x);
+            for (std::uint32_t local_unit = blockIdx.x; local_unit < unit_count; local_unit += gridDim.x)
+            {
+                gpuToCpuDecodedUnitsCUDAUnit<Codebook, UnsignedCompFree>(
+                    payload, scales, mins, emins, layout, first_unit, cpu_chunk, local_unit);
+                __syncthreads();
+            }
         }
 
         /** GPU-separated native Q6_K projection to CPU dual-scale unit bytes. */
@@ -455,21 +686,152 @@ namespace llaminar2
             reinterpret_cast<uint16_t*>(unit+26*columns)[column]=secondary_scales[linear];
         }
 
-        /** Native entry retains the existing grid and forwards one complete unit. */
+        /** Native entry loops grid-stride across units within a bounded SM budget. */
         __global__ void gpuToCpuQ6UnitsCUDA(
             const std::uint8_t *__restrict__ payload,
             const std::uint16_t *__restrict__ scales,
             const std::uint16_t *__restrict__ secondary_scales,
             ExpertTierWeightDeviceLayout layout,
             std::uint32_t first_unit,
-            std::uint8_t *__restrict__ cpu_chunk)
+            std::uint8_t *__restrict__ cpu_chunk,
+            std::uint32_t unit_count)
         {
-            gpuToCpuQ6UnitsCUDAUnit(
-                payload, scales, secondary_scales, layout, first_unit, cpu_chunk, blockIdx.x);
+            for (std::uint32_t local_unit = blockIdx.x; local_unit < unit_count; local_unit += gridDim.x)
+            {
+                gpuToCpuQ6UnitsCUDAUnit(
+                    payload, scales, secondary_scales, layout, first_unit, cpu_chunk, local_unit);
+                __syncthreads();
+            }
+        }
+
+        /** GPU-separated native Q5_0/Q5_1/Q5_K projection to CPU CompactFiveBit unit bytes. */
+        __device__ __forceinline__ void gpuToCpuFiveBitUnitsCUDAUnit(
+            const std::uint8_t *__restrict__ payload,
+            const std::uint16_t *__restrict__ scales,
+            const std::uint16_t *__restrict__ mins,
+            ExpertTierWeightDeviceLayout layout,
+            std::uint32_t first_unit,
+            std::uint8_t *__restrict__ cpu_chunk,
+            std::uint32_t local_unit, bool active = true)
+        {
+            const unsigned global_unit = first_unit + local_unit;
+            const unsigned columns = expertTierWireColumns(layout, global_unit);
+            const unsigned column = static_cast<unsigned>(threadIdx.x % 64);
+            auto *unit = cpu_chunk + expertTierWireOffset(layout, first_unit, local_unit);
+            if (active) initializeCpuUnit(unit, (layout.cpu_block_stride / 64) * columns);
+            __syncthreads();
+            if (!active || column >= columns) return;
+            const unsigned n = (global_unit / layout.blocks_per_row) * 64 + column;
+            const unsigned kb = global_unit % layout.blocks_per_row;
+            const size_t linear = size_t(kb + layout.gpu_first_column / 32) * layout.gpu_N + n + layout.gpu_first_row;
+            for (unsigned value = 0; value < 16; ++value)
+            {
+                const size_t encoded = (value / 4) * (columns * 4) + column * 4 + value % 4;
+                unit[encoded] = payload[linear * 20 + value];
+            }
+            if (columns == 64)
+            {
+                if (column < 32)
+                {
+                    const unsigned group = column / 4, zmm = column % 4;
+                    uint64_t mask = 0;
+                    for (unsigned lane = 0; lane < 16; ++lane)
+                    {
+                        const unsigned source_n = (global_unit / layout.blocks_per_row) * 64 + zmm * 16 + lane + layout.gpu_first_row;
+                        const size_t source_index = size_t(kb + layout.gpu_first_column / 32) * layout.gpu_N + source_n;
+                        const unsigned qh_byte = payload[source_index * 20 + 16 + group / 2];
+                        const unsigned nib = (qh_byte >> ((group % 2) * 4)) & 0xFu;
+                        mask |= uint64_t(nib) << (lane * 4);
+                    }
+                    *reinterpret_cast<uint64_t *>(unit + 1024 + group * 32 + zmm * 8) = mask;
+                }
+            }
+            else
+            {
+                for (unsigned b = 0; b < 4; ++b)
+                    unit[16 * columns + b * columns + column] = payload[linear * 20 + 16 + b];
+            }
+            reinterpret_cast<uint16_t *>(unit + 20 * columns)[column] = scales[linear];
+            if (layout.cpu_is_asymmetric != 0)
+                reinterpret_cast<uint16_t *>(unit + 22 * columns)[column] = mins[linear];
+        }
+
+        __global__ void gpuToCpuFiveBitUnitsCUDA(
+            const std::uint8_t *__restrict__ payload,
+            const std::uint16_t *__restrict__ scales,
+            const std::uint16_t *__restrict__ mins,
+            ExpertTierWeightDeviceLayout layout,
+            std::uint32_t first_unit,
+            std::uint8_t *__restrict__ cpu_chunk,
+            std::uint32_t unit_count)
+        {
+            for (std::uint32_t local_unit = blockIdx.x; local_unit < unit_count; local_unit += gridDim.x)
+            {
+                gpuToCpuFiveBitUnitsCUDAUnit(payload, scales, mins, layout, first_unit, cpu_chunk, local_unit);
+                __syncthreads();
+            }
+        }
+
+        /** CPU CompactFiveBit units to separated GPU Q5_0/Q5_1/Q5_K projection. */
+        __device__ __forceinline__ void cpuToGpuFiveBitUnitsCUDAUnit(
+            const std::uint8_t *__restrict__ cpu_chunk,
+            ExpertTierWeightDeviceLayout layout,
+            std::uint32_t first_unit,
+            std::uint8_t *__restrict__ payload,
+            std::uint16_t *__restrict__ scales,
+            std::uint16_t *__restrict__ mins,
+            std::uint32_t local_unit)
+        {
+            const unsigned global_unit = first_unit + local_unit;
+            const unsigned columns = expertTierWireColumns(layout, global_unit);
+            const unsigned column = static_cast<unsigned>(threadIdx.x % 64);
+            const auto *unit = cpu_chunk + expertTierWireOffset(layout, first_unit, local_unit);
+            if (column >= columns) return;
+            const unsigned n = (global_unit / layout.blocks_per_row) * 64 + column;
+            const unsigned kb = global_unit % layout.blocks_per_row;
+            const size_t linear = size_t(kb + layout.gpu_first_column / 32) * layout.gpu_N + n + layout.gpu_first_row;
+            for (unsigned value = 0; value < 16; ++value)
+            {
+                const size_t encoded = (value / 4) * (columns * 4) + column * 4 + value % 4;
+                payload[linear * 20 + value] = unit[encoded];
+            }
+            if (columns == 64)
+            {
+                const unsigned zmm = column / 16, bit = (column % 16) * 4;
+                for (unsigned b = 0; b < 4; ++b)
+                {
+                    const uint64_t lo = *reinterpret_cast<const uint64_t *>(unit + 1024 + (2 * b) * 32 + zmm * 8);
+                    const uint64_t hi = *reinterpret_cast<const uint64_t *>(unit + 1024 + (2 * b + 1) * 32 + zmm * 8);
+                    payload[linear * 20 + 16 + b] = static_cast<uint8_t>(((lo >> bit) & 0xFu) | (((hi >> bit) & 0xFu) << 4));
+                }
+            }
+            else
+            {
+                for (unsigned b = 0; b < 4; ++b)
+                    payload[linear * 20 + 16 + b] = unit[16 * columns + b * columns + column];
+            }
+            scales[linear] = reinterpret_cast<const uint16_t *>(unit + 20 * columns)[column];
+            if (layout.cpu_is_asymmetric != 0)
+                mins[linear] = reinterpret_cast<const uint16_t *>(unit + 22 * columns)[column];
+        }
+
+        __global__ void cpuToGpuFiveBitUnitsCUDA(
+            const std::uint8_t *__restrict__ cpu_chunk,
+            ExpertTierWeightDeviceLayout layout,
+            std::uint32_t first_unit,
+            std::uint8_t *__restrict__ payload,
+            std::uint16_t *__restrict__ scales,
+            std::uint16_t *__restrict__ mins,
+            std::uint32_t unit_count)
+        {
+            for (std::uint32_t local_unit = blockIdx.x; local_unit < unit_count; local_unit += gridDim.x)
+            {
+                cpuToGpuFiveBitUnitsCUDAUnit(cpu_chunk, layout, first_unit, payload, scales, mins, local_unit);
+            }
         }
 
         /** CPU nibble units to separated GPU projection. */
-        template <bool Asymmetric>
+        template <bool Asymmetric, bool WithComp = true>
         __device__ __forceinline__ void cpuToGpuNibbleUnitsCUDAUnit(
             const std::uint8_t *__restrict__ cpu_chunk,
             ExpertTierWeightDeviceLayout layout,
@@ -498,31 +860,37 @@ namespace llaminar2
                 static_cast<size_t>(kb+layout.gpu_first_column/32)*layout.gpu_N+n+layout.gpu_first_row;
             std::uint8_t *destination = payload + linear * 16u;
             gatherCpuPayloadVectors<16>(unit, local_column, destination, columns);
+            constexpr unsigned scale_base = WithComp ? 1152u : 1024u;
+            constexpr unsigned min_base = WithComp ? 1280u : 1152u;
             scales[linear] =
-                reinterpret_cast<const std::uint16_t *>(unit + (1152u/64)*columns)[local_column];
+                reinterpret_cast<const std::uint16_t *>(unit + (scale_base/64)*columns)[local_column];
             if constexpr (Asymmetric)
             {
                 mins[linear] = reinterpret_cast<const std::uint16_t *>(
-                    unit + (1280u/64)*columns)[local_column];
+                    unit + (min_base/64)*columns)[local_column];
             }
         }
 
-        /** Native entry retains the existing grid and forwards one complete unit. */
-        template <bool Asymmetric>
+        /** Native entry loops grid-stride across units within a bounded SM budget. */
+        template <bool Asymmetric, bool WithComp = true>
         __global__ void cpuToGpuNibbleUnitsCUDA(
             const std::uint8_t *__restrict__ cpu_chunk,
             ExpertTierWeightDeviceLayout layout,
             std::uint32_t first_unit,
             std::uint8_t *__restrict__ payload,
             std::uint16_t *__restrict__ scales,
-            std::uint16_t *__restrict__ mins)
+            std::uint16_t *__restrict__ mins,
+            std::uint32_t unit_count)
         {
-            cpuToGpuNibbleUnitsCUDAUnit<Asymmetric>(
-                cpu_chunk, layout, first_unit, payload, scales, mins, blockIdx.x);
+            for (std::uint32_t local_unit = blockIdx.x; local_unit < unit_count; local_unit += gridDim.x)
+            {
+                cpuToGpuNibbleUnitsCUDAUnit<Asymmetric, WithComp>(
+                    cpu_chunk, layout, first_unit, payload, scales, mins, local_unit);
+            }
         }
 
         /** CPU expanded INT8 units to separated GPU projection. */
-        template <bool Asymmetric, uint8_t SourceCodebook = 19>
+        template <bool Asymmetric, uint8_t SourceCodebook = 19, bool UnsignedCompFree = false>
         __device__ __forceinline__ void cpuToGpuExpandedUnitsCUDAUnit(
             const std::uint8_t *__restrict__ cpu_chunk,
             ExpertTierWeightDeviceLayout layout,
@@ -577,28 +945,40 @@ namespace llaminar2
                 mins[linear]=secondary;
                 return;
             }
+            else if constexpr (UnsignedCompFree)
+            {
+                for (int value = 0; value < 32; ++value)
+                    destination[value] = static_cast<uint8_t>(
+                        unit[interleavedValueOffset(local_column, value, columns)] ^ 0x80u);
+            }
             else gatherCpuPayloadVectors<32>(unit, local_column, destination, columns);
+            constexpr unsigned scale_unit_offset = UnsignedCompFree ? 2048u : 2176u;
+            constexpr unsigned min_unit_offset = UnsignedCompFree ? 2176u : 2304u;
             scales[linear] =
-                reinterpret_cast<const std::uint16_t *>(unit + (2176u/64)*columns)[local_column];
+                reinterpret_cast<const std::uint16_t *>(unit + (scale_unit_offset/64)*columns)[local_column];
             if constexpr (Asymmetric)
             {
-                const uint16_t secondary = reinterpret_cast<const std::uint16_t *>(unit+(2304u/64)*columns)[local_column];
+                const uint16_t secondary = reinterpret_cast<const std::uint16_t *>(unit+(min_unit_offset/64)*columns)[local_column];
                 mins[linear] = secondary;
             }
         }
 
-        /** Native entry retains the existing grid and forwards one complete unit. */
-        template <bool Asymmetric, uint8_t SourceCodebook = 19>
+        /** Native entry loops grid-stride across units within a bounded SM budget. */
+        template <bool Asymmetric, uint8_t SourceCodebook = 19, bool UnsignedCompFree = false>
         __global__ void cpuToGpuExpandedUnitsCUDA(
             const std::uint8_t *__restrict__ cpu_chunk,
             ExpertTierWeightDeviceLayout layout,
             std::uint32_t first_unit,
             std::uint8_t *__restrict__ payload,
             std::uint16_t *__restrict__ scales,
-            std::uint16_t *__restrict__ mins)
+            std::uint16_t *__restrict__ mins,
+            std::uint32_t unit_count)
         {
-            cpuToGpuExpandedUnitsCUDAUnit<Asymmetric, SourceCodebook>(
-                cpu_chunk, layout, first_unit, payload, scales, mins, blockIdx.x);
+            for (std::uint32_t local_unit = blockIdx.x; local_unit < unit_count; local_unit += gridDim.x)
+            {
+                cpuToGpuExpandedUnitsCUDAUnit<Asymmetric, SourceCodebook, UnsignedCompFree>(
+                    cpu_chunk, layout, first_unit, payload, scales, mins, local_unit);
+            }
         }
 
         /** CPU native Q6_K units to separated GPU projection. */
@@ -641,17 +1021,21 @@ namespace llaminar2
             secondary_scales[linear]=reinterpret_cast<const uint16_t*>(unit+26*columns)[column];
         }
 
-        /** Native entry retains the existing grid and forwards one complete unit. */
+        /** Native entry loops grid-stride across units within a bounded SM budget. */
         __global__ void cpuToGpuQ6UnitsCUDA(
             const std::uint8_t *__restrict__ cpu_chunk,
             ExpertTierWeightDeviceLayout layout,
             std::uint32_t first_unit,
             std::uint8_t *__restrict__ payload,
             std::uint16_t *__restrict__ scales,
-            std::uint16_t *__restrict__ secondary_scales)
+            std::uint16_t *__restrict__ secondary_scales,
+            std::uint32_t unit_count)
         {
-            cpuToGpuQ6UnitsCUDAUnit(
-                cpu_chunk, layout, first_unit, payload, scales, secondary_scales, blockIdx.x);
+            for (std::uint32_t local_unit = blockIdx.x; local_unit < unit_count; local_unit += gridDim.x)
+            {
+                cpuToGpuQ6UnitsCUDAUnit(
+                    cpu_chunk, layout, first_unit, payload, scales, secondary_scales, local_unit);
+            }
         }
 
         /**
@@ -721,15 +1105,26 @@ namespace llaminar2
                 using Encoding = cpu::native_quantised::CPUNativeQuantisedEncoding;
                 switch (layout.cpu_encoding)
                 {
+                case Encoding::UnsignedNibble:
+                    return layout.gpu_codebook_id == 0 || layout.gpu_codebook_id == 5;
                 case Encoding::NibbleLUT:
+                    if (layout.cpu_codebook_id == 12 || layout.cpu_codebook_id == 15)
+                        return layout.gpu_codebook_id == 19 ||
+                               (to_cpu && layout.gpu_codebook_id == layout.cpu_codebook_id);
+                    if (layout.cpu_codebook_id == 16)
+                        return layout.gpu_codebook_id == kNativeQuantisedExpandedInt8MinCodebook ||
+                               (to_cpu && layout.gpu_codebook_id == 16);
                     return layout.gpu_codebook_id == 0 || layout.gpu_codebook_id == 4 ||
                         layout.gpu_codebook_id == 5;
-                case Encoding::IQ3SExpandedSourceScale:
-                    return layout.gpu_codebook_id == 11;
                 case Encoding::NibbleLUTSourceScale:
-                    return layout.gpu_codebook_id == kNativeQuantisedIQ4XSSourceScaleCodebook;
+                    return layout.gpu_codebook_id == kNativeQuantisedIQ4XSSourceScaleCodebook ||
+                           layout.gpu_codebook_id == 11;
                 case Encoding::Q6KNativeDualScale:
                     return layout.gpu_codebook_id == 8;
+                case Encoding::CompactFiveBit:
+                    return layout.gpu_codebook_id == 6 || layout.gpu_codebook_id == 7;
+                case Encoding::UnsignedInt8:
+                    return layout.gpu_codebook_id == 19;
                 case Encoding::CompactMultiScale:
                     return layout.gpu_codebook_id == 9 || layout.gpu_codebook_id == 10 ||
                         layout.gpu_codebook_id == 13 || layout.gpu_codebook_id == 14 ||
@@ -816,9 +1211,37 @@ namespace llaminar2
                 {
 #define LLAMINAR_TRANSFER_DEMOTE_UNIT(FUNCTION, ...) \
     FUNCTION<__VA_ARGS__>(source.payload, source.scales, source.mins, layout, description.first_unit, chunk, unit, active)
-                    if (layout.cpu_encoding == Encoding::NibbleLUT)
+                    if (layout.cpu_encoding == Encoding::UnsignedNibble)
                     {
                         if (layout.gpu_codebook_id == 0)
+                            LLAMINAR_TRANSFER_DEMOTE_UNIT(gpuToCpuNibbleUnitsCUDAUnit, 0, false, false);
+                        else
+                            LLAMINAR_TRANSFER_DEMOTE_UNIT(gpuToCpuNibbleUnitsCUDAUnit, 5, true, false);
+                    }
+                    else if (layout.cpu_encoding == Encoding::NibbleLUT)
+                    {
+                        if (layout.cpu_codebook_id == 12)
+                        {
+                            if (layout.gpu_codebook_id == 12)
+                                LLAMINAR_TRANSFER_DEMOTE_UNIT(gpuToCpuRepackedNibbleUnitsCUDAUnit, 12, 12);
+                            else
+                                LLAMINAR_TRANSFER_DEMOTE_UNIT(gpuToCpuRepackedNibbleUnitsCUDAUnit, 19, 12);
+                        }
+                        else if (layout.cpu_codebook_id == 15)
+                        {
+                            if (layout.gpu_codebook_id == 15)
+                                LLAMINAR_TRANSFER_DEMOTE_UNIT(gpuToCpuRepackedNibbleUnitsCUDAUnit, 15, 15);
+                            else
+                                LLAMINAR_TRANSFER_DEMOTE_UNIT(gpuToCpuRepackedNibbleUnitsCUDAUnit, 19, 15);
+                        }
+                        else if (layout.cpu_codebook_id == 16)
+                        {
+                            if (layout.gpu_codebook_id == 16)
+                                LLAMINAR_TRANSFER_DEMOTE_UNIT(gpuToCpuRepackedNibbleUnitsCUDAUnit, 16, 16);
+                            else
+                                LLAMINAR_TRANSFER_DEMOTE_UNIT(gpuToCpuRepackedNibbleUnitsCUDAUnit, kNativeQuantisedExpandedInt8MinCodebook, 16);
+                        }
+                        else if (layout.gpu_codebook_id == 0)
                             LLAMINAR_TRANSFER_DEMOTE_UNIT(gpuToCpuNibbleUnitsCUDAUnit, 0, false);
                         else if (layout.gpu_codebook_id == 4)
                             LLAMINAR_TRANSFER_DEMOTE_UNIT(gpuToCpuNibbleUnitsCUDAUnit, 4, false);
@@ -827,10 +1250,18 @@ namespace llaminar2
                     }
                     else if (layout.cpu_encoding == Encoding::NibbleLUTSourceScale)
                     {
-                        LLAMINAR_TRANSFER_DEMOTE_UNIT(gpuToCpuNibbleUnitsCUDAUnit,
-                            kNativeQuantisedIQ4XSSourceScaleCodebook, false);
+                        if (layout.gpu_codebook_id == 11)
+                            LLAMINAR_TRANSFER_DEMOTE_UNIT(gpuToCpuRepackedNibbleUnitsCUDAUnit, 11, 11);
+                        else
+                            LLAMINAR_TRANSFER_DEMOTE_UNIT(gpuToCpuNibbleUnitsCUDAUnit,
+                                kNativeQuantisedIQ4XSSourceScaleCodebook, false);
                     }
-                    else if (layout.cpu_encoding == Encoding::ExpandedInt8 || layout.cpu_encoding == Encoding::IQ3SExpandedSourceScale)
+                    else if (layout.cpu_encoding == Encoding::UnsignedInt8)
+                    {
+                        gpuToCpuDecodedUnitsCUDAUnit<19, true>(source.payload, source.scales,
+                            source.mins, source.emins, layout, description.first_unit, chunk, unit, active);
+                    }
+                    else if (layout.cpu_encoding == Encoding::ExpandedInt8)
                     {
 #define LLAMINAR_TRANSFER_DECODED_UNIT(CODEBOOK) \
     case CODEBOOK: gpuToCpuDecodedUnitsCUDAUnit<CODEBOOK>(source.payload, source.scales, \
@@ -848,6 +1279,9 @@ namespace llaminar2
                         }
 #undef LLAMINAR_TRANSFER_DECODED_UNIT
                     }
+                    else if (layout.cpu_encoding == Encoding::CompactFiveBit)
+                        gpuToCpuFiveBitUnitsCUDAUnit(source.payload, source.scales, source.mins,
+                            layout, description.first_unit, chunk, unit, active);
                     else
                         gpuToCpuQ6UnitsCUDAUnit(source.payload, source.scales, source.mins,
                             layout, description.first_unit, chunk, unit, active);
@@ -859,23 +1293,41 @@ namespace llaminar2
                 if (!active) return;
 #define LLAMINAR_TRANSFER_PROMOTE_UNIT(FUNCTION, ASYMMETRIC) \
     FUNCTION<ASYMMETRIC>(chunk, layout, description.first_unit, destination.payload, destination.scales, destination.mins, unit)
-                if (layout.cpu_encoding == Encoding::NibbleLUT)
+                if (layout.cpu_encoding == Encoding::UnsignedNibble)
                 {
                     if (layout.cpu_is_asymmetric)
+                        cpuToGpuNibbleUnitsCUDAUnit<true, false>(chunk, layout, description.first_unit, destination.payload, destination.scales, destination.mins, unit);
+                    else
+                        cpuToGpuNibbleUnitsCUDAUnit<false, false>(chunk, layout, description.first_unit, destination.payload, destination.scales, destination.mins, unit);
+                }
+                else if (layout.cpu_encoding == Encoding::NibbleLUT)
+                {
+                    if (layout.cpu_codebook_id == 12)
+                        cpuToGpuRepackedNibbleUnitsCUDAUnit<12>(chunk, layout, description.first_unit, destination.payload, destination.scales, destination.mins, unit);
+                    else if (layout.cpu_codebook_id == 15)
+                        cpuToGpuRepackedNibbleUnitsCUDAUnit<15>(chunk, layout, description.first_unit, destination.payload, destination.scales, destination.mins, unit);
+                    else if (layout.cpu_codebook_id == 16)
+                        cpuToGpuRepackedNibbleUnitsCUDAUnit<16>(chunk, layout, description.first_unit, destination.payload, destination.scales, destination.mins, unit);
+                    else if (layout.cpu_is_asymmetric)
                         LLAMINAR_TRANSFER_PROMOTE_UNIT(cpuToGpuNibbleUnitsCUDAUnit, true);
                     else
                         LLAMINAR_TRANSFER_PROMOTE_UNIT(cpuToGpuNibbleUnitsCUDAUnit, false);
                 }
                 else if (layout.cpu_encoding == Encoding::NibbleLUTSourceScale)
                 {
-                    // The true parameter means copy the raw secondary word;
-                    // no minimum arithmetic or half conversion occurs here.
-                    LLAMINAR_TRANSFER_PROMOTE_UNIT(cpuToGpuNibbleUnitsCUDAUnit, true);
+                    if (layout.cpu_codebook_id == 11)
+                        cpuToGpuRepackedNibbleUnitsCUDAUnit<11>(chunk, layout, description.first_unit, destination.payload, destination.scales, destination.mins, unit);
+                    else
+                        // The true parameter means copy the raw secondary word;
+                        // no minimum arithmetic or half conversion occurs here.
+                        LLAMINAR_TRANSFER_PROMOTE_UNIT(cpuToGpuNibbleUnitsCUDAUnit, true);
                 }
-                else if (layout.cpu_encoding == Encoding::IQ3SExpandedSourceScale)
+                else if (layout.cpu_encoding == Encoding::UnsignedInt8)
                 {
-                    cpuToGpuExpandedUnitsCUDAUnit<false,11>(chunk,layout, description.first_unit,destination.payload,
-                        destination.scales,destination.mins,unit);
+                    if (layout.cpu_is_asymmetric)
+                        cpuToGpuExpandedUnitsCUDAUnit<true, 19, true>(chunk, layout, description.first_unit, destination.payload, destination.scales, destination.mins, unit);
+                    else
+                        cpuToGpuExpandedUnitsCUDAUnit<false, 19, true>(chunk, layout, description.first_unit, destination.payload, destination.scales, destination.mins, unit);
                 }
                 else if (layout.cpu_encoding == Encoding::ExpandedInt8)
                 {
@@ -884,6 +1336,9 @@ namespace llaminar2
                     else
                         LLAMINAR_TRANSFER_PROMOTE_UNIT(cpuToGpuExpandedUnitsCUDAUnit, false);
                 }
+                else if (layout.cpu_encoding == Encoding::CompactFiveBit)
+                    cpuToGpuFiveBitUnitsCUDAUnit(chunk, layout, description.first_unit,
+                        destination.payload, destination.scales, destination.mins, unit);
                 else
                     cpuToGpuQ6UnitsCUDAUnit(chunk, layout, description.first_unit,
                         destination.payload, destination.scales, destination.mins, unit);
@@ -1012,53 +1467,110 @@ namespace llaminar2
             return false;
         }
 
-        const dim3 grid(unit_count);
+        const dim3 grid(unit_count < kMaxBackgroundTierRepackBlocks ? unit_count : kMaxBackgroundTierRepackBlocks);
         const dim3 block(kColumnsPerUnit);
         auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
         if (layout.cpu_encoding == cpu::native_quantised::CPUNativeQuantisedEncoding::CompactMultiScale)
         {
             compactMultiScaleUnitsCUDA<true><<<grid, block, 0, cuda_stream>>>(
-                source, {}, nullptr, device_cpu_chunk, layout, first_unit);
+                source, {}, nullptr, device_cpu_chunk, layout, first_unit, unit_count);
             return cudaPeekAtLastError() == cudaSuccess;
         }
         if (layout.cpu_encoding ==
-            cpu::native_quantised::CPUNativeQuantisedEncoding::NibbleLUT)
+            cpu::native_quantised::CPUNativeQuantisedEncoding::UnsignedNibble)
         {
             if (layout.gpu_codebook_id == 0)
             {
+                gpuToCpuNibbleUnitsCUDA<0, false, false><<<grid, block, 0, cuda_stream>>>(
+                    source.payload, source.scales, source.mins, layout, first_unit,
+                    device_cpu_chunk, unit_count);
+            }
+            else
+            {
+                gpuToCpuNibbleUnitsCUDA<5, true, false><<<grid, block, 0, cuda_stream>>>(
+                    source.payload, source.scales, source.mins, layout, first_unit,
+                    device_cpu_chunk, unit_count);
+            }
+        }
+        else if (layout.cpu_encoding ==
+            cpu::native_quantised::CPUNativeQuantisedEncoding::NibbleLUT)
+        {
+            if (layout.cpu_codebook_id == 12)
+            {
+                if (layout.gpu_codebook_id == 12)
+                    gpuToCpuRepackedNibbleUnitsCUDA<12, 12><<<grid, block, 0, cuda_stream>>>(
+                        source.payload, source.scales, source.mins, layout, first_unit, device_cpu_chunk, unit_count);
+                else
+                    gpuToCpuRepackedNibbleUnitsCUDA<19, 12><<<grid, block, 0, cuda_stream>>>(
+                        source.payload, source.scales, source.mins, layout, first_unit, device_cpu_chunk, unit_count);
+            }
+            else if (layout.cpu_codebook_id == 15)
+            {
+                if (layout.gpu_codebook_id == 15)
+                    gpuToCpuRepackedNibbleUnitsCUDA<15, 15><<<grid, block, 0, cuda_stream>>>(
+                        source.payload, source.scales, source.mins, layout, first_unit, device_cpu_chunk, unit_count);
+                else
+                    gpuToCpuRepackedNibbleUnitsCUDA<19, 15><<<grid, block, 0, cuda_stream>>>(
+                        source.payload, source.scales, source.mins, layout, first_unit, device_cpu_chunk, unit_count);
+            }
+            else if (layout.cpu_codebook_id == 16)
+            {
+                if (layout.gpu_codebook_id == 16)
+                    gpuToCpuRepackedNibbleUnitsCUDA<16, 16><<<grid, block, 0, cuda_stream>>>(
+                        source.payload, source.scales, source.mins, layout, first_unit, device_cpu_chunk, unit_count);
+                else
+                    gpuToCpuRepackedNibbleUnitsCUDA<kNativeQuantisedExpandedInt8MinCodebook, 16><<<grid, block, 0, cuda_stream>>>(
+                        source.payload, source.scales, source.mins, layout, first_unit, device_cpu_chunk, unit_count);
+            }
+            else if (layout.gpu_codebook_id == 0)
+            {
                 gpuToCpuNibbleUnitsCUDA<0, false><<<grid, block, 0, cuda_stream>>>(
                     source.payload, source.scales, source.mins, layout, first_unit,
-                    device_cpu_chunk);
+                    device_cpu_chunk, unit_count);
             }
             else if (layout.gpu_codebook_id == 4)
             {
                 gpuToCpuNibbleUnitsCUDA<4, false><<<grid, block, 0, cuda_stream>>>(
                     source.payload, source.scales, source.mins, layout, first_unit,
-                    device_cpu_chunk);
+                    device_cpu_chunk, unit_count);
             }
             else
             {
                 gpuToCpuNibbleUnitsCUDA<5, true><<<grid, block, 0, cuda_stream>>>(
                     source.payload, source.scales, source.mins, layout, first_unit,
-                    device_cpu_chunk);
+                    device_cpu_chunk, unit_count);
             }
         }
         else if (layout.cpu_encoding ==
                  cpu::native_quantised::CPUNativeQuantisedEncoding::NibbleLUTSourceScale)
         {
-            gpuToCpuNibbleUnitsCUDA<kNativeQuantisedIQ4XSSourceScaleCodebook, false>
-                <<<grid, block, 0, cuda_stream>>>(
+            if (layout.gpu_codebook_id == 11)
+            {
+                gpuToCpuRepackedNibbleUnitsCUDA<11, 11><<<grid, block, 0, cuda_stream>>>(
                     source.payload, source.scales, source.mins, layout, first_unit,
-                    device_cpu_chunk);
+                    device_cpu_chunk, unit_count);
+            }
+            else
+            {
+                gpuToCpuNibbleUnitsCUDA<kNativeQuantisedIQ4XSSourceScaleCodebook, false>
+                    <<<grid, block, 0, cuda_stream>>>(
+                        source.payload, source.scales, source.mins, layout, first_unit,
+                        device_cpu_chunk, unit_count);
+            }
+        }
+        else if (layout.cpu_encoding == cpu::native_quantised::CPUNativeQuantisedEncoding::UnsignedInt8)
+        {
+            gpuToCpuDecodedUnitsCUDA<19, true><<<grid, block, 0, cuda_stream>>>(
+                source.payload, source.scales, source.mins, source.emins,
+                layout, first_unit, device_cpu_chunk, unit_count);
         }
         else if (layout.cpu_encoding ==
-                 cpu::native_quantised::CPUNativeQuantisedEncoding::ExpandedInt8 ||
-                 layout.cpu_encoding == cpu::native_quantised::CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale)
+                 cpu::native_quantised::CPUNativeQuantisedEncoding::ExpandedInt8)
         {
 #define LLAMINAR_LAUNCH_DECODED_SOURCE(CODEBOOK)                         \
     gpuToCpuDecodedUnitsCUDA<CODEBOOK><<<grid, block, 0, cuda_stream>>>( \
         source.payload, source.scales, source.mins, source.emins,         \
-        layout, first_unit, device_cpu_chunk)
+        layout, first_unit, device_cpu_chunk, unit_count)
             switch (layout.gpu_codebook_id)
             {
             case 6:
@@ -1091,11 +1603,17 @@ namespace llaminar2
             }
 #undef LLAMINAR_LAUNCH_DECODED_SOURCE
         }
+        else if (layout.cpu_encoding == cpu::native_quantised::CPUNativeQuantisedEncoding::CompactFiveBit)
+        {
+            gpuToCpuFiveBitUnitsCUDA<<<grid, block, 0, cuda_stream>>>(
+                source.payload, source.scales, source.mins, layout, first_unit,
+                device_cpu_chunk, unit_count);
+        }
         else
         {
             gpuToCpuQ6UnitsCUDA<<<grid, block, 0, cuda_stream>>>(
                 source.payload, source.scales, source.mins, layout, first_unit,
-                device_cpu_chunk);
+                device_cpu_chunk, unit_count);
         }
         return cudaPeekAtLastError() == cudaSuccess;
     }
@@ -1120,44 +1638,89 @@ namespace llaminar2
             return false;
         }
 
-        const dim3 grid(unit_count);
+        const dim3 grid(unit_count < kMaxBackgroundTierRepackBlocks ? unit_count : kMaxBackgroundTierRepackBlocks);
         const dim3 block(kColumnsPerUnit);
         auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
         if (layout.cpu_encoding ==
             cpu::native_quantised::CPUNativeQuantisedEncoding::CompactMultiScale)
         {
             compactMultiScaleUnitsCUDA<false><<<grid, block, 0, cuda_stream>>>(
-                {}, destination, device_cpu_chunk, nullptr, layout, first_unit);
+                {}, destination, device_cpu_chunk, nullptr, layout, first_unit, unit_count);
             return cudaPeekAtLastError() == cudaSuccess;
         }
         if (layout.cpu_encoding ==
-            cpu::native_quantised::CPUNativeQuantisedEncoding::NibbleLUT)
+            cpu::native_quantised::CPUNativeQuantisedEncoding::UnsignedNibble)
         {
             if (layout.cpu_is_asymmetric != 0)
             {
+                cpuToGpuNibbleUnitsCUDA<true, false><<<grid, block, 0, cuda_stream>>>(
+                    device_cpu_chunk, layout, first_unit, destination.payload,
+                    destination.scales, destination.mins, unit_count);
+            }
+            else
+            {
+                cpuToGpuNibbleUnitsCUDA<false, false><<<grid, block, 0, cuda_stream>>>(
+                    device_cpu_chunk, layout, first_unit, destination.payload,
+                    destination.scales, destination.mins, unit_count);
+            }
+        }
+        else if (layout.cpu_encoding ==
+            cpu::native_quantised::CPUNativeQuantisedEncoding::NibbleLUT)
+        {
+            if (layout.cpu_codebook_id == 12)
+                cpuToGpuRepackedNibbleUnitsCUDA<12><<<grid, block, 0, cuda_stream>>>(
+                    device_cpu_chunk, layout, first_unit, destination.payload, destination.scales, destination.mins, unit_count);
+            else if (layout.cpu_codebook_id == 15)
+                cpuToGpuRepackedNibbleUnitsCUDA<15><<<grid, block, 0, cuda_stream>>>(
+                    device_cpu_chunk, layout, first_unit, destination.payload, destination.scales, destination.mins, unit_count);
+            else if (layout.cpu_codebook_id == 16)
+                cpuToGpuRepackedNibbleUnitsCUDA<16><<<grid, block, 0, cuda_stream>>>(
+                    device_cpu_chunk, layout, first_unit, destination.payload, destination.scales, destination.mins, unit_count);
+            else if (layout.cpu_is_asymmetric != 0)
+            {
                 cpuToGpuNibbleUnitsCUDA<true><<<grid, block, 0, cuda_stream>>>(
                     device_cpu_chunk, layout, first_unit, destination.payload,
-                    destination.scales, destination.mins);
+                    destination.scales, destination.mins, unit_count);
             }
             else
             {
                 cpuToGpuNibbleUnitsCUDA<false><<<grid, block, 0, cuda_stream>>>(
                     device_cpu_chunk, layout, first_unit, destination.payload,
-                    destination.scales, destination.mins);
+                    destination.scales, destination.mins, unit_count);
             }
         }
         else if (layout.cpu_encoding ==
                  cpu::native_quantised::CPUNativeQuantisedEncoding::NibbleLUTSourceScale)
         {
-            // Raw source coefficient words share the existing secondary slot.
-            cpuToGpuNibbleUnitsCUDA<true><<<grid, block, 0, cuda_stream>>>(
-                device_cpu_chunk, layout, first_unit, destination.payload,
-                destination.scales, destination.mins);
+            if (layout.cpu_codebook_id == 11)
+            {
+                cpuToGpuRepackedNibbleUnitsCUDA<11><<<grid, block, 0, cuda_stream>>>(
+                    device_cpu_chunk, layout, first_unit, destination.payload,
+                    destination.scales, destination.mins, unit_count);
+            }
+            else
+            {
+                // Raw source coefficient words share the existing secondary slot.
+                cpuToGpuNibbleUnitsCUDA<true><<<grid, block, 0, cuda_stream>>>(
+                    device_cpu_chunk, layout, first_unit, destination.payload,
+                    destination.scales, destination.mins, unit_count);
+            }
         }
-        else if (layout.cpu_encoding == cpu::native_quantised::CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale)
+        else if (layout.cpu_encoding ==
+                 cpu::native_quantised::CPUNativeQuantisedEncoding::UnsignedInt8)
         {
-            cpuToGpuExpandedUnitsCUDA<false,11><<<grid,block,0,cuda_stream>>>(
-                device_cpu_chunk,layout, first_unit,destination.payload,destination.scales,destination.mins);
+            if (layout.cpu_is_asymmetric != 0)
+            {
+                cpuToGpuExpandedUnitsCUDA<true, 19, true><<<grid, block, 0, cuda_stream>>>(
+                    device_cpu_chunk, layout, first_unit, destination.payload,
+                    destination.scales, destination.mins, unit_count);
+            }
+            else
+            {
+                cpuToGpuExpandedUnitsCUDA<false, 19, true><<<grid, block, 0, cuda_stream>>>(
+                    device_cpu_chunk, layout, first_unit, destination.payload,
+                    destination.scales, destination.mins, unit_count);
+            }
         }
         else if (layout.cpu_encoding ==
                  cpu::native_quantised::CPUNativeQuantisedEncoding::ExpandedInt8)
@@ -1166,20 +1729,26 @@ namespace llaminar2
             {
                 cpuToGpuExpandedUnitsCUDA<true><<<grid, block, 0, cuda_stream>>>(
                     device_cpu_chunk, layout, first_unit, destination.payload,
-                    destination.scales, destination.mins);
+                    destination.scales, destination.mins, unit_count);
             }
             else
             {
                 cpuToGpuExpandedUnitsCUDA<false><<<grid, block, 0, cuda_stream>>>(
                     device_cpu_chunk, layout, first_unit, destination.payload,
-                    destination.scales, destination.mins);
+                    destination.scales, destination.mins, unit_count);
             }
+        }
+        else if (layout.cpu_encoding == cpu::native_quantised::CPUNativeQuantisedEncoding::CompactFiveBit)
+        {
+            cpuToGpuFiveBitUnitsCUDA<<<grid, block, 0, cuda_stream>>>(
+                device_cpu_chunk, layout, first_unit, destination.payload,
+                destination.scales, destination.mins, unit_count);
         }
         else
         {
             cpuToGpuQ6UnitsCUDA<<<grid, block, 0, cuda_stream>>>(
                 device_cpu_chunk, layout, first_unit, destination.payload,
-                destination.scales, destination.mins);
+                destination.scales, destination.mins, unit_count);
         }
         return cudaPeekAtLastError() == cudaSuccess;
     }

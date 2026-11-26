@@ -18,7 +18,7 @@
 #pragma once
 
 #include "kernels/IPackedWeights.h"
-#include "CPUNativeQuantisedWeightPacker.h"
+#include "CPUNativeQuantisedPackedWeights.h"
 #include "utils/Logger.h"
 
 #include <cstring>

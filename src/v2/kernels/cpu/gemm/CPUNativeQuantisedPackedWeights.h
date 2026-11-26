@@ -19,9 +19,6 @@
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
-#if defined(__AVX2__) || defined(__AVX512F__)
-#include <immintrin.h>
-#endif
 
 namespace llaminar2::cpu::native_quantised
 {
@@ -110,10 +107,16 @@ namespace llaminar2::cpu::native_quantised
         /** @brief Return whether this matrix uses native four-bit interleaving. */
         [[nodiscard]] bool usesNibbleLUT() const noexcept
         {
-            return encoding == CPUNativeQuantisedEncoding::NibbleLUT || usesNibbleLUTSourceScale();
+            return encoding == CPUNativeQuantisedEncoding::NibbleLUT || usesNibbleLUTSourceScale() || usesUnsignedNibble();
         }
 
-        /** @brief Whether raw IQ4_XS source factors accompany the nibble payload. */
+        /** @brief Return whether unsigned four-bit nibbles are stored without inline comp (Q4_0/Q4_1/Q4_K). */
+        [[nodiscard]] bool usesUnsignedNibble() const noexcept
+        {
+            return encoding == CPUNativeQuantisedEncoding::UnsignedNibble;
+        }
+
+        /** @brief Whether raw IQ4_XS or IQ3_S source factors accompany the nibble payload. */
         [[nodiscard]] bool usesNibbleLUTSourceScale() const noexcept
         {
             return encoding == CPUNativeQuantisedEncoding::NibbleLUTSourceScale;
@@ -122,7 +125,13 @@ namespace llaminar2::cpu::native_quantised
         /** @brief Return whether this matrix was expanded to signed INT8. */
         [[nodiscard]] bool usesExpandedInt8() const noexcept
         {
-            return encoding == CPUNativeQuantisedEncoding::ExpandedInt8 || usesIQ3SExpandedSourceScale();
+            return encoding == CPUNativeQuantisedEncoding::ExpandedInt8;
+        }
+
+        /** @brief Return whether unsigned 8-bit weights (w_i8 ^ 0x80) are stored without inline comp (Q8_0/Q8_1/Q8_K). */
+        [[nodiscard]] bool usesUnsignedInt8() const noexcept
+        {
+            return encoding == CPUNativeQuantisedEncoding::UnsignedInt8;
         }
 
         /**
@@ -144,12 +153,6 @@ namespace llaminar2::cpu::native_quantised
                 : CPUNativeQuantisedCoefficientDomain::SignedInt8;
         }
 
-        /** @brief Whether decoded IQ3_S grid bytes retain original source factors. */
-        [[nodiscard]] bool usesIQ3SExpandedSourceScale() const noexcept
-        {
-            return encoding == CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale;
-        }
-
         /** @brief Return whether this matrix retains native dual-scale Q6_K. */
         [[nodiscard]] bool usesQ6KNativeDualScale() const noexcept
         {
@@ -162,18 +165,24 @@ namespace llaminar2::cpu::native_quantised
             return encoding == CPUNativeQuantisedEncoding::CompactMultiScale;
         }
 
+        /** @brief Whether five-bit low-nibble and high-bitmask planes are retained (Q5_0/Q5_1/Q5_K). */
+        [[nodiscard]] bool usesCompactFiveBit() const noexcept
+        {
+            return encoding == CPUNativeQuantisedEncoding::CompactFiveBit;
+        }
+
         /**
          * @brief Return whether each prepared block carries weight compensation.
          *
          * Nibble and expanded-INT8 kernels bias signed weights by shifting the
          * activation to unsigned bytes, and therefore need one per-column
-         * weight sum. Q6_K reverses the VNNI operands: unsigned six-bit weights
-         * multiply signed activations, so its centering correction depends only
-         * on the activation half sums and no weight compensation is stored.
+         * weight sum. Q6_K and CompactFiveBit reverse the VNNI operands: unsigned
+         * weights multiply signed activations, so centering depends only on the
+         * activation sum and no weight compensation is stored.
          */
         [[nodiscard]] bool usesInlineCompensation() const noexcept
         {
-            return !usesQ6KNativeDualScale() && !usesCompactMultiScale();
+            return !usesQ6KNativeDualScale() && !usesCompactMultiScale() && !usesCompactFiveBit() && !usesUnsignedNibble() && !usesUnsignedInt8();
         }
 
         /**
@@ -216,7 +225,7 @@ namespace llaminar2::cpu::native_quantised
             // codec width from physical execution width without changing either
             // producer's existing serialization or the resident bytes.
             const bool payload_matches = payload_bytes == view.source_payload_bytes ||
-                (view.usesExpandedInt8() && payload_bytes == view.payload_bytes);
+                ((view.usesExpandedInt8() || view.usesUnsignedInt8() || view.usesNibbleLUT()) && payload_bytes == view.payload_bytes);
             if (view.N_padded != N_padded || view.blocks_per_row != blocks_per_row ||
                 !payload_matches || view.data_stride != data_stride ||
                 view.interleaved_block_stride != interleaved_block_stride)
@@ -311,85 +320,16 @@ namespace llaminar2::cpu::native_quantised
         // Accessors for the kernel inner loop
         // -------------------------------------------------------------------
 
-#if defined(__AVX512F__)
-        /**
-         * @brief Widen sixteen ordinary inline FP16 scale words, without factors.
-         * @param primary Thirty-two-byte-aligned half words from one inline scale plane.
-         * @return The original sixteen half values widened to FP32.
-         *
-         * General source-factor formats still call loadScales512. Direct use
-         * requires a prepared-type proof that the scale plane contains plain
-         * halves: the unsigned-five-bit domain guarantees ordinary ExpandedInt8.
-         * The original nibble dispatcher also proves plain NibbleLUT for its
-         * Q4_0 linear and Q4_1/Q4_K identity decoder kinds. IQ4_XS remains LUT
-         * with source factors; IQ3_S and rotated operands use expanded paths.
-         * Neither asymmetry nor a model name supplies this layout proof.
-         */
-        [[nodiscard]] static inline __m512 loadPlainFP16Scales512(const uint16_t *primary)
-        {
-            return _mm512_cvtph_ps(_mm256_load_si256(
-                reinterpret_cast<const __m256i *>(primary)));
-        }
-
-        /** @brief Load sixteen effective scales without rounding source products to half.
-         * @param primary Aligned inline primary words, within one64-column unit.
-         * @return Widened ordinary scale or exact IQ4_XS base times signed coefficient.
-         */
-        [[nodiscard]] inline __m512 loadScales512(const uint16_t *primary) const
-        {
-            const __m512 base = loadPlainFP16Scales512(primary);
-            if (!usesNibbleLUTSourceScale() && !usesIQ3SExpandedSourceScale()) return base;
-            const __m512i raw = _mm512_cvtepu16_epi32(_mm256_load_si256(
-                reinterpret_cast<const __m256i *>(primary + 64)));
-            if (usesIQ3SExpandedSourceScale())
-            {
-                if (_mm512_test_epi32_mask(raw, _mm512_set1_epi32(~15)) != 0)
-                    throw std::invalid_argument("IQ3_S coefficient contains reserved bits");
-                return _mm512_mul_ps(base, _mm512_cvtepi32_ps(_mm512_add_epi32(
-                    _mm512_slli_epi32(raw, 1), _mm512_set1_epi32(1))));
-            }
-            if (_mm512_test_epi32_mask(raw, _mm512_set1_epi32(~63)) != 0)
-                throw std::invalid_argument("IQ4_XS coefficient contains reserved bits");
-            return _mm512_mul_ps(base, _mm512_cvtepi32_ps(
-                _mm512_sub_epi32(_mm512_and_si512(raw, _mm512_set1_epi32(63)), _mm512_set1_epi32(32))));
-        }
-#endif
-#if defined(__AVX2__)
-        /** @brief Load eight effective scales using the same original source equation.
-         * @param primary Aligned inline primary words, within one64-column unit.
-         * @return Separately rounded FP32 scale vector, shared across grouped rows.
-         */
-        [[nodiscard]] inline __m256 loadScales256(const uint16_t *primary) const
-        {
-            const __m256 base = _mm256_cvtph_ps(_mm_load_si128(
-                reinterpret_cast<const __m128i *>(primary)));
-            if (!usesNibbleLUTSourceScale() && !usesIQ3SExpandedSourceScale()) return base;
-            const __m256i raw = _mm256_cvtepu16_epi32(_mm_load_si128(
-                reinterpret_cast<const __m128i *>(primary + 64)));
-            if (usesIQ3SExpandedSourceScale())
-            {
-                if (!_mm256_testz_si256(raw, _mm256_set1_epi32(~15)))
-                    throw std::invalid_argument("IQ3_S coefficient contains reserved bits");
-                return _mm256_mul_ps(base, _mm256_cvtepi32_ps(_mm256_add_epi32(
-                    _mm256_slli_epi32(raw, 1), _mm256_set1_epi32(1))));
-            }
-            if (!_mm256_testz_si256(raw, _mm256_set1_epi32(~63)))
-                throw std::invalid_argument("IQ4_XS coefficient contains reserved bits");
-            return _mm256_mul_ps(base, _mm256_cvtepi32_ps(
-                _mm256_sub_epi32(_mm256_and_si256(raw, _mm256_set1_epi32(63)), _mm256_set1_epi32(32))));
-        }
-#endif
-
         /**
          * @brief Resolve the first source factor without narrowing its product.
          * @param c Physical64-column chunk index.
          * @param kb Logical32-value K-block index.
          * @param n_local Column0..63 within the chunk.
-         * @return Q6_K/IQ2_S/IQ4_XS original-source factor or the existing widened scale.
+         * @return Q6_K/IQ2_S/IQ4_XS/IQ3_S original-source factor or the existing widened scale.
          */
         inline float blockScale(int c, int kb, int n_local) const
         {
-            const bool source_scale = usesNibbleLUTSourceScale() || usesIQ3SExpandedSourceScale() ||
+            const bool source_scale = usesNibbleLUTSourceScale() ||
                 usesQ6KNativeDualScale() || (usesCompactMultiScale() && codebook_id == 13);
             const auto secondary = source_scale ? chunkMins(c, kb)[n_local] : 0;
             return nativeQuantisedPrimaryScale(encoding, codebook_id, chunkScales(c, kb)[n_local], secondary);
@@ -404,7 +344,7 @@ namespace llaminar2::cpu::native_quantised
          */
         inline float blockMin(int c, int kb, int n_local) const
         {
-            if (usesNibbleLUTSourceScale() || usesIQ3SExpandedSourceScale() ||
+            if (usesNibbleLUTSourceScale() ||
                 (!is_asymmetric && !usesQ6KNativeDualScale() && !usesCompactMultiScale()))
                 return 0.0f;
             return nativeQuantisedSecondaryScale(encoding, codebook_id,
@@ -498,6 +438,37 @@ namespace llaminar2::cpu::native_quantised
                    static_cast<size_t>(z) * 16u;
         }
 
+        /**
+         * @brief Return CompactFiveBit high-bit plane for one VNNI group/ZMM.
+         *
+         * Bytes `0..1023` store native low-4-bit `qs[0..15]` in the standard
+         * 4-group × 4-ZMM × 64-byte nibble layout. Bytes `1024..1279` store
+         * eight 32-byte VNNI-group high-bit planes, where each `(group, z)`
+         * holds one little-endian 64-bit mask whose bit `lane * 4 + offset`
+         * is bit 4 of K-element `group * 4 + offset` for column `z * 16 + lane`.
+         *
+         * @param c Output-column chunk.
+         * @param kb Logical 32-value K block.
+         * @param group VNNI group in [0, 7] (0..3 = low nibbles, 4..7 = high nibbles).
+         * @param z Sixteen-column vector within the chunk in [0, 3].
+         * @return Pointer to the 8-byte little-endian high-bit mask.
+         */
+        inline const uint8_t *fiveBitHighBitplane(
+            int c, int kb, int group, int z) const
+        {
+            if (!usesCompactFiveBit() || group < 0 || group >= 8 ||
+                z < 0 || z >= 4)
+            {
+                throw std::logic_error(
+                    "fiveBitHighBitplane requires CompactFiveBit encoding and valid group/ZMM indices");
+            }
+            const size_t block_offset =
+                ((size_t)c * blocks_per_row + kb) * interleaved_block_stride;
+            return interleavedBase() + block_offset + 1024u +
+                   static_cast<size_t>(group) * 32u +
+                   static_cast<size_t>(z) * 8u;
+        }
+
         /// Flat INT8 values for N-chunk c, K-block kb, column n_local (32 INT8 values)
         /// Only valid for ExpandedInt8 preparation.
         /// Only available if keepDecodedBuffer was true during packing.
@@ -544,6 +515,25 @@ namespace llaminar2::cpu::native_quantised
         bool hasInterleavedData() const
         {
             return workspace_data_ != nullptr || !native_interleaved.empty();
+        }
+
+        /**
+         * @brief Prefetch all 64-byte cache lines of one `(chunk, kb)` unit into L1/L2 (T0).
+         *
+         * Cascade Lake / Skylake hardware stream prefetchers stop at 4 KB page
+         * boundaries, causing compulsory DRAM stalls when stepping across
+         * 1,152–2,432 B interleaved weight units. Issuing T0 software prefetches
+         * one K-block ahead overlaps memory latency across page boundaries and
+         * lifts dual-socket streaming bandwidth to >94% of hardware DRAM roof.
+         */
+        inline void prefetchInterleavedUnitT0(int c, int kb) const noexcept
+        {
+            const size_t stride = static_cast<size_t>(interleaved_block_stride);
+            const uint8_t *const unit = interleavedBase() +
+                (static_cast<size_t>(c) * static_cast<size_t>(blocks_per_row) +
+                 static_cast<size_t>(kb)) * stride;
+            for (size_t off = 0; off < stride; off += 64u)
+                __builtin_prefetch(unit + off, 0, 3);
         }
     };
 

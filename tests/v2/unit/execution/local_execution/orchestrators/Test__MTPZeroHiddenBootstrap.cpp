@@ -39,6 +39,7 @@
 #include "utils/MPIContext.h"
 #include "../../../models/qwen4exp/Qwen4ExpMetadataFixture.h"
 #include <gtest/gtest.h>
+#include "../../../SourceShardReader.h"
 #include <algorithm>
 #include <array>
 #include <cstdlib>
@@ -271,11 +272,9 @@ TEST_F(MTPZeroHiddenBootstrap, RejectsNonFP32MailboxBeforeMutation)
 /** @test Supplement real producer/consumer tests with its exact initial-prefill call edge. */
 TEST_F(MTPZeroHiddenBootstrap, VisibleTokenZeroSidecarUsesTheActualPublicationProducer)
 {
-    std::ifstream input("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
-    ASSERT_TRUE(input.good());
-    std::ostringstream buffer;
-    buffer << input.rdbuf();
-    const auto source = buffer.str();
+    const auto source = llaminar2::test_support::readSourceFileOrFamily(
+        "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+    ASSERT_FALSE(source.empty());
     const auto begin = source.find("bool DeviceGraphOrchestrator::populateCPUMTPShiftedCacheFromPrefill(");
     ASSERT_NE(begin, std::string::npos);
     const auto origin = source.find("if(origin==MTPShiftedCacheOrigin::VisibleZeroHiddenTokenZero)", begin);

@@ -78,7 +78,9 @@ namespace llaminar2
             .maximum_concurrent_cycles = config_.storage.maximum_concurrent_cycles,
             .maximum_execution_streams = config_.storage.maximum_execution_streams,
                                     .maximum_cycles_per_layer = config_.storage.maximum_cycles_per_layer,
-            .collect_economy_measurements = true, .perf_device = config_.perf_device});
+            .collect_economy_measurements = true,
+            .economy_measurement_scope = MoEOverlayMigrationMeasurementScope::EconomyCalibrationOnly,
+            .perf_device = config_.perf_device});
         auto factory = std::make_unique<MoEOverlayParticipantPreparedWaveFactory>(MoEOverlayParticipantPreparedWaveFactory::Config{
             .registry = config_.residency, .transfer_provider = fabric, .perf_device = config_.perf_device});
         const auto count = MoEOverlayRemoteProjectionLaneBudget::fromUniformCycles(snapshot->owner_map.participants().size(), config_.storage.maximum_concurrent_cycles, 1).projectionOperationCount();

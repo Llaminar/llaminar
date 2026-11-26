@@ -63,14 +63,14 @@ namespace llaminar2::cpu::native_quantised
         std::uint8_t codebook, std::uint16_t primary, std::uint16_t secondary)
     {
         const float base = fp16_to_fp32(primary);
-        if (encoding == CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale)
-        {
-            if (!native_quantised_iq3s_scale::valid(secondary))
-                throw std::invalid_argument("IQ3_S coefficient contains reserved bits");
-            return device_fp32_contract::multiply(base, static_cast<float>(native_quantised_iq3s_scale::coefficient(secondary)));
-        }
         if (encoding == CPUNativeQuantisedEncoding::NibbleLUTSourceScale)
         {
+            if (codebook == 11)
+            {
+                if (!native_quantised_iq3s_scale::valid(secondary))
+                    throw std::invalid_argument("IQ3_S coefficient contains reserved bits");
+                return device_fp32_contract::multiply(base, static_cast<float>(native_quantised_iq3s_scale::coefficient(secondary)));
+            }
             if (!native_quantised_iq4xs_scale::valid(secondary))
                 throw std::invalid_argument("IQ4_XS coefficient contains reserved bits");
             return device_fp32_contract::multiply(base, static_cast<float>(native_quantised_iq4xs_scale::coefficient(secondary)));
@@ -99,8 +99,7 @@ namespace llaminar2::cpu::native_quantised
     inline float nativeQuantisedSecondaryScale(CPUNativeQuantisedEncoding encoding,
         std::uint8_t codebook, std::uint16_t primary, std::uint16_t secondary)
     {
-        if (encoding == CPUNativeQuantisedEncoding::NibbleLUTSourceScale ||
-            encoding == CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale)
+        if (encoding == CPUNativeQuantisedEncoding::NibbleLUTSourceScale)
             return 0.0f;
         if (encoding == CPUNativeQuantisedEncoding::Q6KNativeDualScale)
             return device_fp32_contract::multiply(fp16_to_fp32(primary),
@@ -133,8 +132,7 @@ namespace llaminar2::cpu::native_quantised
      * |---|---|
      * | ExpandedInt8 (symmetric or asymmetric) | none; the asymmetric word is an FP16 minimum |
      * | NibbleLUT (any admitted codebook) | none; an FP16 minimum where asymmetric |
-     * | NibbleLUTSourceScale (IQ4_XS) | native_quantised_iq4xs_scale::valid, i.e. <= 63 |
-     * | IQ3SExpandedSourceScale (IQ3_S) | native_quantised_iq3s_scale::valid, i.e. <= 15 |
+     * | NibbleLUTSourceScale (IQ4_XS / IQ3_S) | <= 63 for IQ4_XS, <= 15 for IQ3_S |
      * | Q6KNativeDualScale | none; both bytes are signed coefficients |
      * | CompactMultiScale codebook 13 (IQ2_S) | native_quantised_iq2s_scale::valid, i.e. <= 255 |
      * | CompactMultiScale other codebooks | none; FP16 scales and minima |
@@ -273,7 +271,7 @@ namespace llaminar2::cpu::native_quantised
         {
             const auto view = admitStructure(descriptor, bytes);
             const bool secondary = view.is_asymmetric || view.usesNibbleLUTSourceScale() ||
-                view.usesIQ3SExpandedSourceScale() || view.usesQ6KNativeDualScale() || view.usesCompactMultiScale();
+                view.usesQ6KNativeDualScale() || view.usesCompactMultiScale();
             return {
                 .columns = view.N, .padded_columns = view.N_padded, .blocks_per_row = view.blocks_per_row,
                 .data_stride = view.data_stride, .interleaved_block_stride = view.interleaved_block_stride,
@@ -284,25 +282,31 @@ namespace llaminar2::cpu::native_quantised
 
         /** @return Whether a four-bit payload is retained in the stream. */
         [[nodiscard]] bool usesNibbleLUT() const noexcept
-        { return encoding == CPUNativeQuantisedEncoding::NibbleLUT || usesNibbleLUTSourceScale(); }
-        /** @return Whether the nibble payload retains IQ4_XS original source factors. */
+        { return encoding == CPUNativeQuantisedEncoding::NibbleLUT || usesNibbleLUTSourceScale() || usesUnsignedNibble(); }
+        /** @return Whether unsigned four-bit nibbles are stored without inline comp (Q4_0/Q4_1/Q4_K). */
+        [[nodiscard]] bool usesUnsignedNibble() const noexcept
+        { return encoding == CPUNativeQuantisedEncoding::UnsignedNibble; }
+        /** @return Whether the nibble payload retains IQ4_XS or IQ3_S original source factors. */
         [[nodiscard]] bool usesNibbleLUTSourceScale() const noexcept
         { return encoding == CPUNativeQuantisedEncoding::NibbleLUTSourceScale; }
         /** @return Whether signed INT8 payload bytes are stored directly. */
         [[nodiscard]] bool usesExpandedInt8() const noexcept
-        { return encoding == CPUNativeQuantisedEncoding::ExpandedInt8 || usesIQ3SExpandedSourceScale(); }
-        /** @return Whether IQ3_S original half/nibble factors accompany expanded grid bytes. */
-        [[nodiscard]] bool usesIQ3SExpandedSourceScale() const noexcept
-        { return encoding == CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale; }
+        { return encoding == CPUNativeQuantisedEncoding::ExpandedInt8; }
+        /** @return Whether unsigned 8-bit weights (w_i8 ^ 0x80) are stored without inline comp (Q8_0/Q8_1/Q8_K). */
+        [[nodiscard]] bool usesUnsignedInt8() const noexcept
+        { return encoding == CPUNativeQuantisedEncoding::UnsignedInt8; }
         /** @return Whether the six-bit source bitplanes and coefficients are retained. */
         [[nodiscard]] bool usesQ6KNativeDualScale() const noexcept
         { return encoding == CPUNativeQuantisedEncoding::Q6KNativeDualScale; }
         /** @return Whether a compact multi-scale source payload is retained. */
         [[nodiscard]] bool usesCompactMultiScale() const noexcept
         { return encoding == CPUNativeQuantisedEncoding::CompactMultiScale; }
+        /** @return Whether five-bit low-nibble and high-bitmask planes are retained (Q5_0/Q5_1/Q5_K). */
+        [[nodiscard]] bool usesCompactFiveBit() const noexcept
+        { return encoding == CPUNativeQuantisedEncoding::CompactFiveBit; }
         /** @return Whether inline signed weight-sum compensation precedes primary scales. */
         [[nodiscard]] bool usesInlineCompensation() const noexcept
-        { return !usesQ6KNativeDualScale() && !usesCompactMultiScale(); }
+        { return !usesQ6KNativeDualScale() && !usesCompactMultiScale() && !usesCompactFiveBit() && !usesUnsignedNibble() && !usesUnsignedInt8(); }
         /** @return Borrowed canonical byte root; no source-order mirror exists. */
         [[nodiscard]] const std::uint8_t *interleavedBase() const noexcept { return bytes_.data(); }
         /** @return Exact borrowed publication extent. */
@@ -324,7 +328,7 @@ namespace llaminar2::cpu::native_quantised
          */
         [[nodiscard]] const std::uint16_t *chunkMins(int chunk, int block) const
         {
-            if (!is_asymmetric && !usesNibbleLUTSourceScale() && !usesIQ3SExpandedSourceScale() &&
+            if (!is_asymmetric && !usesNibbleLUTSourceScale() &&
                 !usesQ6KNativeDualScale() && !usesCompactMultiScale())
                 throw std::logic_error("Native CPU weight encoding has no secondary metadata");
             return reinterpret_cast<const std::uint16_t *>(unit(chunk, block) + data_stride + (usesInlineCompensation() ? 256 : 128));
@@ -385,7 +389,7 @@ namespace llaminar2::cpu::native_quantised
         [[nodiscard]] float blockScale(int chunk, int block, int column) const
         {
             validateColumn(column);
-            const bool source_scale = usesNibbleLUTSourceScale() || usesIQ3SExpandedSourceScale() ||
+            const bool source_scale = usesNibbleLUTSourceScale() ||
                 usesQ6KNativeDualScale() || (usesCompactMultiScale() && codebook_id == 13);
             const auto secondary = source_scale ? chunkMins(chunk, block)[column] : 0;
             return nativeQuantisedPrimaryScale(encoding, codebook_id, chunkScales(chunk, block)[column], secondary);
@@ -401,7 +405,7 @@ namespace llaminar2::cpu::native_quantised
         {
             validateColumn(column);
             (void)unit(chunk, block);
-            if (usesNibbleLUTSourceScale() || usesIQ3SExpandedSourceScale() ||
+            if (usesNibbleLUTSourceScale() ||
                 (!is_asymmetric && !usesQ6KNativeDualScale() && !usesCompactMultiScale()))
                 return 0.0f;
             return nativeQuantisedSecondaryScale(encoding, codebook_id,
@@ -466,7 +470,10 @@ namespace llaminar2::cpu::native_quantised
             int padded, int blocks, std::span<const std::uint8_t> bytes)
             : N(d.columns), K(d.reduction_width), N_padded(padded), blocks_per_row(blocks),
               payload_bytes(d.encoding == CPUNativeQuantisedEncoding::ExpandedInt8 ||
-                  d.encoding == CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale ? 32 : source.payload_bytes),
+                  d.encoding == CPUNativeQuantisedEncoding::UnsignedInt8 ? 32
+                  : (d.encoding == CPUNativeQuantisedEncoding::NibbleLUT ||
+                     d.encoding == CPUNativeQuantisedEncoding::NibbleLUTSourceScale ||
+                     d.encoding == CPUNativeQuantisedEncoding::UnsignedNibble ? 16 : source.payload_bytes)),
               source_payload_bytes(source.payload_bytes), codebook_id(source.codebook_id),
               is_asymmetric(d.is_asymmetric), is_superblock(source.is_superblock), encoding(d.encoding),
               numerical_policy(d.numerical_policy), data_stride(preparedDataStride(d.encoding)),
@@ -525,10 +532,13 @@ namespace llaminar2::cpu::native_quantised
         const auto view = CPUNativeQuantisedWeightView::admitStructure(descriptor, bytes);
         bool (*rule)(std::uint16_t) noexcept = nullptr;
         const char *name = nullptr;
-        if (view.usesIQ3SExpandedSourceScale())
-        { rule = native_quantised_iq3s_scale::valid; name = "IQ3_S"; }
-        else if (view.usesNibbleLUTSourceScale())
-        { rule = native_quantised_iq4xs_scale::valid; name = "IQ4_XS"; }
+        if (view.usesNibbleLUTSourceScale())
+        {
+            if (view.codebook_id == 11)
+            { rule = native_quantised_iq3s_scale::valid; name = "IQ3_S"; }
+            else
+            { rule = native_quantised_iq4xs_scale::valid; name = "IQ4_XS"; }
+        }
         else if (view.usesCompactMultiScale() && view.codebook_id == 13)
         { rule = native_quantised_iq2s_scale::valid; name = "IQ2_S"; }
         if (rule)

@@ -504,4 +504,44 @@ namespace llaminar2
             static_cast<uint8_t>(nibble));
     }
 
+
+    void IQ3_STensor::decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const
+    {
+        const size_t super_blocks_per_row = (shape_[1] + IQ3_SBlock::BLOCK_SIZE - 1) / IQ3_SBlock::BLOCK_SIZE;
+        const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+        if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
+        const IQ3_SBlock *blocks = reinterpret_cast<const IQ3_SBlock *>(data_ptr);
+
+        const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
+        const size_t sub_block_idx = k_block_offset % 8;
+
+        simd::decode_iq3s_subblock_to_fp32(blocks[super_block_idx], sub_block_idx, output);
+    }
+
+    void IQ3_STensor::unpack_block_to_int8(size_t row_idx, size_t k_block_offset, int8_t *output) const
+    {
+        const size_t super_blocks_per_row = (shape_[1] + IQ3_SBlock::BLOCK_SIZE - 1) / IQ3_SBlock::BLOCK_SIZE;
+        const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+        if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
+        const IQ3_SBlock *blocks = reinterpret_cast<const IQ3_SBlock *>(data_ptr);
+
+        const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
+        const size_t sub_block_idx = k_block_offset % 8;
+
+        simd::unpack_iq3_s_to_int8(blocks[super_block_idx], sub_block_idx, output);
+    }
+
+    float IQ3_STensor::get_block_scale(size_t row_idx, size_t k_block_offset) const
+    {
+        const size_t super_blocks_per_row = (shape_[1] + IQ3_SBlock::BLOCK_SIZE - 1) / IQ3_SBlock::BLOCK_SIZE;
+        const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+        if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
+        const IQ3_SBlock *blocks = reinterpret_cast<const IQ3_SBlock *>(data_ptr);
+
+        const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
+        const size_t sub_block_idx = k_block_offset % 8;
+
+        return simd::get_iq3_s_scale(blocks[super_block_idx], sub_block_idx);
+    }
+
 } // namespace llaminar2

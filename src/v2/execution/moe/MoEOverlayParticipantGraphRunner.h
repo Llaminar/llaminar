@@ -1151,6 +1151,15 @@ namespace llaminar2
          */
         std::unordered_map<int, std::shared_ptr<TensorBase>>
             participant_canonical_route_buffers_;
+        /**
+         * @brief One ~30 KB serialized resident-follower scratch bank per ROCm GPU follower.
+         *
+         * Holds the 64-byte self-resetting grid barrier, broadcast dispatch header,
+         * single-read L2 Q8 hidden vector, and compact SwiGLU gate partials shared
+         * sequentially across all layers of the single-row follower graph.
+         */
+        std::unordered_map<int, std::shared_ptr<TensorBase>>
+            participant_mapped_follower_scratch_buffers_;
         // This sole protocol/domain precedes ALL native caches, so reverse
         // destruction drains their original tokens before authority withdrawal.
         std::unique_ptr<RankLocalPublicationState> rank_local_publication_state_;
