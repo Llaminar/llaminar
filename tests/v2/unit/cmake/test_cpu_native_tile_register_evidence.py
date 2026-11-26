@@ -3886,11 +3886,16 @@ class ProofBindingTest(unittest.TestCase):
                  "/w/probe.cpp"]
         gnu = [["/usr/libexec/gcc/cc1plus", "-quiet", "-I", "/w/src", "-MD", "/w/out/proof.d", "-MF",
                 "/w/out/proof.deps", "-MT", "probe", "-D_GNU_SOURCE", "-D", "X=1", "/w/probe.cpp", "-march=armv8-a+i8mm",
-                "-g", "-O3", "-dumpdir", "/tmp/", "-dumpbase", "proof.cpp", "-o", "/tmp/ccAb12Cd.s", "-H"],
+                "-g", "-O3", "-dumpdir", "/tmp/", "-dumpbase", "proof.cpp", "-o", "/tmp/ccAb12Cd.s", "-H", "-std=c++20"],
                ["as", "-I", "/w/src", "--gdwarf-5", "-EL", "-march=armv8-a", "-mabi=lp64", "-o", "/w/out/proof.o",
                 "/tmp/ccAb12Cd.s"]]
         CHECKER.validate_plan([clang], "AppleClang-21", paths)
         CHECKER.validate_plan(gnu, "GNU-14", paths)
+        for prior in ("gnu++23", "c++23"):
+            CHECKER.validate_plan([gnu[0][:-1] + ["-std=" + prior, "-std=c++20"], gnu[1]], "GNU-14", paths)
+        for dialects in (("c++20", "gnu++23"), ("gnu++23",), (), ("c++26", "c++20")):
+            with self.subTest(dialects=dialects), self.assertRaises(ValueError):
+                CHECKER.validate_plan([gnu[0][:-1] + ["-std=" + d for d in dialects], gnu[1]], "GNU-14", paths)
         clang_mutations = {
             "remap-file": ["-remap-file", "/w/src/view.h;/outside/actual.h"],
             "vfs overlay": ["-ivfsoverlay", "/x/overlay.yaml"], "vfsoverlay": ["-vfsoverlay", "/x/o.yaml"],

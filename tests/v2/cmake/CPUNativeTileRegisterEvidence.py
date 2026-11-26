@@ -4798,7 +4798,7 @@ GNU_CC1PLUS = {
     "-quiet": "flag", "-mlittle-endian": "flag", "-g": "flag", "-O3": "flag", "-fPIE": "flag", "-fno-lto": "flag",
     "-fasynchronous-unwind-tables": "flag", "-fstack-protector-strong": "flag", "-fstack-clash-protection": "flag",
     "-H": "flag", "-imultiarch": r"aarch64-linux-gnu", "-mcpu=": "generic", "-march=": r"armv8-a(?:\+\w+)*",
-    "-mabi=": "lp64", "-std=": r"(?:gnu|c)\+\+20", "-fno-sanitize=": "all", "-D": r"[A-Za-z_]\w*(?:=[\w.+-]*)?",
+    "-mabi=": "lp64", "-std=": r"(?:gnu|c)\+\+(?:20|23)", "-fno-sanitize=": "all", "-D": r"[A-Za-z_]\w*(?:=[\w.+-]*)?",
     "-MT": "probe", "-MD": "md", "-MF": "deps", "-I": "search", "-dumpdir": "dumpdir",
     "-dumpbase": r"[\w.+-]+", "-dumpbase-ext": r"\.cpp", "-o": "assembly",
 }
@@ -4878,6 +4878,11 @@ def validate_plan(jobs: list[list[str]], identity: str, paths: JobPaths) -> None
     if len(jobs) != 2 or Path(jobs[0][0]).name != "cc1plus" or not os.path.isabs(jobs[0][0]) or jobs[1][0] != "as":
         raise ValueError(f"the GNU driver must run exactly one cc1plus job and one as job: {[job[:1] for job in jobs]}")
     compiler = admit_job(jobs[0], GNU_CC1PLUS, paths, paths.source)
+    # GCC retains earlier dialect switches in -### even when the witness's
+    # final -std=c++20 overrides the production target's C++23 dialect.
+    standards = [arg for arg in jobs[0] if arg.startswith("-std=")]
+    if not standards or standards[-1] != "-std=c++20":
+        raise ValueError("GNU witness requires final effective -std=c++20")
     # GNU passes -MD the object-derived name; -MF selects the file actually written.
     if compiler.get("deps") != [paths.deps] or len(compiler.get("md", [])) != 1 or \
             compiler["md"][0] not in (paths.deps, os.path.splitext(paths.obj)[0] + ".d") or \
