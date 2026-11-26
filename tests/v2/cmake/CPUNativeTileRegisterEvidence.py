@@ -4298,7 +4298,9 @@ def require_chain_counts(witness: dict, identity: str, mode: str, expected: dict
     for part in witness:
         if part not in counts:
             raise ValueError(f"no committed {part} counts for compiler {identity} envelope {mode}")
-        failures = [f"{key}: {witness[part].get(key)} != committed {counts.get(part, {}).get(key)}"
+        # Canonical (sorted-key) values: the detail must be identical whether the witness was just computed or
+        # re-read from a JSON record (the unqualified analysis record re-check compares these strings).
+        failures = [f"{key}: {canonical(witness[part].get(key))} != committed {canonical(counts.get(part, {}).get(key))}"
                     for key in sorted(set(witness[part]) | set(counts.get(part, {})))
                     if witness[part].get(key) != counts.get(part, {}).get(key)]
         if failures:
@@ -4381,7 +4383,8 @@ BOUND_FIELDS = ("signature", "identity", "mode", "checker_sha256", "envelope_sha
                 "ordered_add_sites_sha256", "chain_counts_sha256", "compiler_version", "executed_command",
                 "executed_directory", "target_command_sha256", "driver_plan", "programs", "inputs", "object_file",
                 "object_sha256", "disassembler", "disassembler_version", "disassembler_sha256",
-                "disassembly_command", "disassembly_sha256", "translation_unit_sha256", "assembly_sha256")
+                "disassembly_command", "disassembly_sha256", "translation_unit_sha256", "assembly_sha256",
+                "line_witness")
 
 
 def analysis_path(proof: Path) -> Path:
@@ -4548,6 +4551,128 @@ def executed_command(command: list[str], source: str, obj: Path, dependencies: P
     """The witness compile; -H reports every header and precompiled header the compiler actually read."""
     return command + WITNESS_FLAGS + ["-c", source, "-o", str(obj), "-MD", "-MF", str(dependencies), "-MT", "probe",
                                       "-H"]
+
+
+# Release line witness (L-1..L-4). Loop roles and fused-instruction sites are named by the `.loc` locations of
+# the retained assembly. A compile without debug info (a Release argv: `-O3 -DNDEBUG`) emits none, so every
+# location is "?". Such a compile gets a second, line-table witness compile:
+#   L-1  its argv is the executed Release argv with only the output operands renamed and exactly one appended
+#        LINE_WITNESS_FLAG (`-g`, the debug level of the Integration envelope, whose `.loc` semantics the role
+#        map was qualified on); any other delta fails;
+#   L-2  every SHF_ALLOC section (name, type, flags, alignment, entry size and bytes) and every relocation of an
+#        SHF_ALLOC section (offset, type, addend and the target symbol by name, kind, binding, section and value)
+#        of the witness object must equal the exact Release object's; any difference fails with both digests;
+#   L-3  admission and analysis still read the exact Release object and its disassembly; only the `.loc`
+#        locations come from the witness compile's retained assembly, whose instructions L-2 proves identical;
+#   L-4  an argv that already selects debug info is analysed directly (no witness, flag never doubled); `-g0`
+#        (debug info disabled explicitly) fails closed.
+LINE_WITNESS_FLAG = "-g"
+DEBUG_FLAG = re.compile(r"^-g(?:[0-3]|gdb[0-3]?|dwarf(?:-[2-5])?|line-tables-only|line-directives-only)?$")
+SHF_ALLOC = 0x2
+SHT_RELA, SHT_REL, SHT_NOBITS, SHT_SYMTAB = 4, 9, 8, 2
+
+
+def line_witness_needed(executed: list[str]) -> bool:
+    """Whether the executed argv lacks line tables and needs the Release line witness (L-4)."""
+    flags = [argument for argument in executed if DEBUG_FLAG.match(argument)]
+    if "-g0" in flags:
+        raise ValueError("the witness argv disables debug information (-g0): no line witness is admitted for it")
+    return not flags
+
+
+def line_witness_command(executed: list[str], obj: Path, dependencies: Path, lines_obj: Path,
+                         lines_dependencies: Path) -> list[str]:
+    """The line witness argv: the executed argv, its object and dependency operands renamed, plus `-g` (L-1)."""
+    renamed = {str(obj): str(lines_obj), str(dependencies): str(lines_dependencies)}
+    witness = [renamed.get(argument, argument) for argument in executed] + [LINE_WITNESS_FLAG]
+    require_line_witness_delta(executed, witness, renamed)
+    return witness
+
+
+def require_line_witness_delta(executed: list[str], witness: list[str], renamed: dict[str, str]) -> None:
+    """L-1: the witness argv differs from the executed one only by the renamed outputs and one trailing `-g`."""
+    if len(witness) != len(executed) + 1 or witness[-1] != LINE_WITNESS_FLAG or \
+            any(after != renamed.get(before, before) for before, after in zip(executed, witness)) or \
+            sum(argument in renamed for argument in executed) != len(renamed):
+        raise ValueError(f"the line witness argv is not the executed argv plus exactly {LINE_WITNESS_FLAG!r}: "
+                         f"{sorted(set(witness) ^ set(executed))[:6]}")
+
+
+def allocated_image(data: bytes) -> dict:
+    """L-2: every SHF_ALLOC section of an ELF relocatable object and the relocations applied to it, by name."""
+    if data[:4] != b"\x7fELF" or data[4] != 2 or data[5] != 1:
+        raise ValueError("the line witness needs ELF64 little-endian relocatable objects")
+    shoff, shnum, shstrndx = _field(data, 0x28, 8), _field(data, 0x3C, 2), _field(data, 0x3E, 2)
+    headers = [{"name": _field(data, shoff + 64 * i, 4), "type": _field(data, shoff + 64 * i + 4, 4),
+                "flags": _field(data, shoff + 64 * i + 8, 8), "offset": _field(data, shoff + 64 * i + 24, 8),
+                "size": _field(data, shoff + 64 * i + 32, 8), "link": _field(data, shoff + 64 * i + 40, 4),
+                "info": _field(data, shoff + 64 * i + 44, 4), "align": _field(data, shoff + 64 * i + 48, 8),
+                "entsize": _field(data, shoff + 64 * i + 56, 8)} for i in range(shnum)]
+    if not 0 < shstrndx < shnum:
+        raise ValueError("malformed ELF section header table")
+    names = headers[shstrndx]
+
+    def name(offset: int, table: dict) -> str:
+        return _string(data, table["offset"] + offset, table["offset"] + table["size"])
+
+    for header in headers:
+        header["text"] = name(header["name"], names)
+
+    def content(header: dict) -> bytes:
+        if header["type"] == SHT_NOBITS:
+            return b""
+        if header["offset"] + header["size"] > len(data):
+            raise ValueError("truncated witness object")
+        return data[header["offset"]:header["offset"] + header["size"]]
+
+    sections = {}
+    for header in headers:
+        if header["flags"] & SHF_ALLOC:
+            if header["text"] in sections:
+                raise ValueError(f"duplicate allocated section name {header['text']}")
+            sections[header["text"]] = {"type": header["type"], "flags": header["flags"], "size": header["size"],
+                                        "align": header["align"], "entsize": header["entsize"],
+                                        "sha256": hashlib.sha256(content(header)).hexdigest()}
+    relocations: dict[str, list] = {}
+    for header in headers:
+        if header["type"] not in (SHT_RELA, SHT_REL) or not 0 < header["info"] < shnum or \
+                not headers[header["info"]]["flags"] & SHF_ALLOC:
+            continue
+        symtab = headers[header["link"]]
+        if symtab["type"] != SHT_SYMTAB:
+            raise ValueError("a relocation section does not link a symbol table")
+        strings = headers[symtab["link"]]
+        width = 24 if header["type"] == SHT_RELA else 16
+        entries = []
+        for base in range(header["offset"], header["offset"] + header["size"], width):
+            info = _field(data, base + 8, 8)
+            symbol = symtab["offset"] + (info >> 32) * 24
+            sym_info, shndx = data[symbol + 4], _field(data, symbol + 6, 2)
+            target = headers[shndx]["text"] if 0 < shndx < shnum else str(shndx)
+            label = target if sym_info & 0xF == 3 else name(_field(data, symbol, 4), strings)
+            entries.append((_field(data, base, 8), info & 0xFFFFFFFF,
+                            _field(data, base + 16, 8) if width == 24 else None,
+                            label, sym_info, target, _field(data, symbol + 8, 8)))
+        relocations.setdefault(headers[header["info"]]["text"], []).extend(entries)
+    return {"sections": sections, "relocations": {key: sorted(value) for key, value in sorted(relocations.items())}}
+
+
+def require_code_identity(release: bytes, witness: bytes) -> str:
+    """L-2: fail unless the witness object's allocated image equals the Release object's; returns its digest."""
+    image, other = allocated_image(release), allocated_image(witness)
+    if image != other:
+        moved = sorted(name for name in set(image["sections"]) | set(other["sections"])
+                       if image["sections"].get(name) != other["sections"].get(name))
+        moved += sorted(f"relocations of {name}" for name in set(image["relocations"]) | set(other["relocations"])
+                        if image["relocations"].get(name) != other["relocations"].get(name))
+        raise ValueError(f"the line witness changed code generation: allocated image differs in {moved[:6]} "
+                         f"(Release object {hashlib.sha256(release).hexdigest()}, "
+                         f"witness object {hashlib.sha256(witness).hexdigest()})")
+    return hashlib.sha256(canonical_image(image).encode()).hexdigest()
+
+
+def canonical_image(image: dict) -> str:
+    return json.dumps(image, sort_keys=True, separators=(",", ":"))
 
 
 def require_absolute_source(source: str) -> None:
@@ -5060,6 +5185,87 @@ def replay_plan(plan: dict, directory: str, obj: Path, dependencies: Path, assem
                          "retained assembly")
 
 
+def line_witness_paths(output: Path) -> tuple[Path, Path, Path]:
+    """The Release line witness artifacts next to a proof: object, dependency file and retained assembly."""
+    return output.with_suffix(".lines.o"), output.with_suffix(".lines.deps"), output.with_suffix(".lines.asm")
+
+
+LINE_WITNESS_KEYS = frozenset({"flag_delta", "command", "driver_plan", "object_file", "object_sha256",
+                               "assembly_sha256", "release_object_sha256", "allocated_image_sha256"})
+
+
+def build_line_witness(args: argparse.Namespace, command: list[str], directory: str, identity: str,
+                       executed: list[str], outputs: tuple[Path, Path], output: Path, before: dict,
+                       programs: dict) -> dict:
+    """L-1..L-3: compile the executed argv plus `-g`, retain its assembler input through the same validated GNU
+    plan replay, and prove its allocated image equal to the exact Release object's. Returns the bound record."""
+    obj, dependencies = outputs
+    lines_obj, lines_dependencies, lines_assembly = line_witness_paths(output)
+    witness = line_witness_command(executed, obj, dependencies, lines_obj, lines_dependencies)
+    plan = driver_plan(witness, directory, identity, JobPaths(args.source, str(lines_obj), str(lines_dependencies),
+                                                              directory, None))
+    validate_plan(plan["jobs"], identity, JobPaths(args.source, str(lines_obj), str(lines_dependencies), directory,
+                                                   frozenset(before)))
+    if program_identities(plan, command) != programs:
+        raise ValueError("the line witness compile selects other compiler or assembler programs")
+    compiled = subprocess.run(witness, cwd=directory, capture_output=True, text=True)
+    if compiled.returncode:
+        raise ValueError(f"the line witness compile failed: {compiled.stderr[-2000:]}")
+    if precompiled_headers(compiled.stderr):
+        raise ValueError("the line witness compile read precompiled headers")
+    closure = read_depfile(lines_dependencies, directory)
+    if closure != sorted(before) or bind_inputs(closure) != before:
+        raise ValueError("the line witness compile read another dependency closure or an input changed")
+    replay_plan(plan, directory, lines_obj, lines_dependencies, lines_assembly)
+    if bind_inputs(closure) != before or program_identities(plan, command) != programs:
+        raise ValueError("an input or program changed while the line witness plan was replayed")
+    image = require_code_identity(obj.read_bytes(), lines_obj.read_bytes())
+    return {"flag_delta": [LINE_WITNESS_FLAG], "command": witness, "driver_plan": plan,
+            "object_file": lines_obj.name, "object_sha256": envelope.digest(lines_obj),
+            "assembly_sha256": envelope.digest(lines_assembly), "release_object_sha256": envelope.digest(obj),
+            "allocated_image_sha256": image}
+
+
+def bind_line_witness(args: argparse.Namespace, document: dict, document_path: Path, command: list[str],
+                      paths: "JobPaths") -> Path | None:
+    """Re-check a document's Release line witness without a compiler (L-1..L-4); returns its retained assembly,
+    or None when the executed argv already carries line tables (then no witness may be recorded)."""
+    witness = document.get("line_witness")
+    executed = document["executed_command"]
+    if not line_witness_needed(executed):
+        if witness is not None:
+            raise ValueError("a line witness is recorded for an argv that already carries line tables")
+        return None
+    obj, dependencies = document_path.with_suffix(".o"), document_path.with_suffix(".deps")
+    lines_obj, lines_dependencies, lines_assembly = line_witness_paths(document_path)
+    if not isinstance(witness, dict) or set(witness) != LINE_WITNESS_KEYS or \
+            witness["flag_delta"] != [LINE_WITNESS_FLAG] or witness["object_file"] != lines_obj.name or \
+            witness["command"] != line_witness_command(executed, obj, dependencies, lines_obj, lines_dependencies) or \
+            witness["release_object_sha256"] != document.get("object_sha256"):
+        raise ValueError("the Release argv lacks line tables and the document binds no valid line witness")
+    plan = witness["driver_plan"]
+    if not isinstance(plan, dict) or set(plan) != {"jobs", "program_dirs", "path"}:
+        raise ValueError("the line witness lacks a well-formed driver plan")
+    validate_plan(plan["jobs"], args.identity, JobPaths(paths.source, str(lines_obj), str(lines_dependencies),
+                                                        paths.directory, paths.closure))
+    if program_identities(plan, command) != document.get("programs"):
+        raise ValueError("the line witness plan selects other compiler or assembler programs")
+    if not lines_obj.is_file() or witness["object_sha256"] != envelope.digest(lines_obj) or \
+            not lines_assembly.is_file() or witness["assembly_sha256"] != envelope.digest(lines_assembly):
+        raise ValueError("the line witness object or its retained assembly is missing or changed")
+    if require_code_identity(obj.read_bytes(), lines_obj.read_bytes()) != witness["allocated_image_sha256"]:
+        raise ValueError("the line witness allocated image digest changed")
+    return lines_assembly
+
+
+def located_assembly(proof_path: Path, document: dict) -> tuple[Path, str]:
+    """The retained assembly whose `.loc` locations a document's analysis read, with its bound digest."""
+    witness = document.get("line_witness")
+    if witness:
+        return line_witness_paths(proof_path)[2], witness.get("assembly_sha256")
+    return proof_path.with_suffix(".asm"), document.get("assembly_sha256")
+
+
 def build(args: argparse.Namespace) -> None:
     """Compile the probe object with the target command, disassemble it, audit it, publish the proof last."""
     require_absolute_source(args.source)
@@ -5073,7 +5279,8 @@ def build(args: argparse.Namespace) -> None:
     # The seal and the analysis record are retired before the attempt: nothing of an earlier run survives a
     # failure (DR-1).
     for stale in (output, analysis_path(output), temporary, obj, dependencies, preprocessed, depfile, disassembly_path,
-                  translation_unit, assembly_path, output.with_suffix(".s"), output.with_suffix(".sym")):
+                  translation_unit, assembly_path, output.with_suffix(".s"), output.with_suffix(".sym"),
+                  *line_witness_paths(output)):
         stale.unlink(missing_ok=True)
     command, directory = envelope.target_command(args)
     # Epoch: the driver is bound before any observation the proof consumes; the plan and every job program are
@@ -5122,10 +5329,16 @@ def build(args: argparse.Namespace) -> None:
     replay_plan(plan, directory, obj, dependencies, assembly_path)
     if bind_inputs(closure) != before or program_identities(plan, command) != programs:
         raise ValueError("an input or a compiler or assembler program changed while the witness plan was replayed")
+    line_witness, located = None, assembly_path
+    if line_witness_needed(executed):
+        line_witness = build_line_witness(args, command, directory, identity, executed, (obj, dependencies),
+                                          output, before, programs)
+        located = line_witness_paths(output)[2]
     disassembly, disassembly_command, tool_version = disassemble(args.disassembler, obj)
     disassembly_path.write_text(disassembly)
-    # Structural analysis first (a failure here writes nothing), then the admissions.
-    fields = analysis_fields(obj.read_bytes(), disassembly, assembly_path.read_text(errors="replace"), after, args.mode)
+    # Structural analysis first (a failure here writes nothing), then the admissions. The analysis reads the
+    # exact executed object and its disassembly; a Release line witness supplies only the `.loc` locations (L-3).
+    fields = analysis_fields(obj.read_bytes(), disassembly, located.read_text(errors="replace"), after, args.mode)
     failures = admission_failures(fields, args.identity, args.mode)
     result = {
         "schema": 12, "kind": SEALED_KIND, "admission": {"status": "passed", "failures": []},
@@ -5146,6 +5359,7 @@ def build(args: argparse.Namespace) -> None:
         "disassembly_command": disassembly_command, "disassembly_sha256": envelope.digest(disassembly_path),
         "translation_unit_sha256": envelope.digest(translation_unit),
         "assembly_sha256": envelope.digest(assembly_path),
+        "line_witness": line_witness,
         **fields,
     }
     # Ninja depfile: resolved paths (Ninja canonicalises ".." lexically, which would name another file).
@@ -5294,7 +5508,8 @@ def bind_document(args: argparse.Namespace, document: dict, document_path: Path)
     assembly = document_path.with_suffix(".asm")
     if not assembly.is_file() or document.get("assembly_sha256") != envelope.digest(assembly):
         raise ValueError("retained probe assembly or its ordered-add sites changed")
-    return obj.read_bytes(), disassembly, assembly.read_text(errors="replace")
+    located = bind_line_witness(args, document, document_path, command, paths)
+    return obj.read_bytes(), disassembly, (located or assembly).read_text(errors="replace")
 
 
 def check_analysis_record(args: argparse.Namespace) -> dict:
@@ -5398,11 +5613,14 @@ def fused_stage(args: argparse.Namespace) -> None:
     kind = None
     try:
         kind, document = run_document(proof_path)
+        located, located_sha256 = located_assembly(proof_path, document)
         files = {"object_sha256": proof_path.with_suffix(".o"), "disassembly_sha256": proof_path.with_suffix(".dis"),
                  "assembly_sha256": proof_path.with_suffix(".asm")}
         for field, path in files.items():
             if not path.is_file() or document.get(field) != envelope.digest(path):
                 raise ValueError(f"{path.name} is not the artifact this run's {kind} binds (stale or replaced)")
+        if not located.is_file() or located_sha256 != envelope.digest(located):
+            raise ValueError(f"{located.name} is not the line witness assembly this run's {kind} binds")
         if document.get("checker_sha256") != envelope.digest(Path(__file__)):
             raise ValueError(f"this run's {kind} was written by another checker")
         inputs = document.get("inputs")
@@ -5411,7 +5629,7 @@ def fused_stage(args: argparse.Namespace) -> None:
             raise ValueError("a closure input changed after this run's stage 1")
         witness = fused_witness(args, proof_path.with_suffix(".o").read_bytes(),
                                 proof_path.with_suffix(".dis").read_text(),
-                                proof_path.with_suffix(".asm").read_text(errors="replace"), inputs)
+                                located.read_text(errors="replace"), inputs)
     except (ValueError, OSError) as error:
         receipt.write_text(json.dumps({"stage": "fused", "status": "failed", "input": kind,
                                        "verified": kind == SEALED_KIND, "reason": str(error),

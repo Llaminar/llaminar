@@ -615,6 +615,10 @@ if(LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
         BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/cpu_native_tile_registers/proof.deps"
             "${CMAKE_CURRENT_BINARY_DIR}/cpu_native_tile_registers/proof.pre.deps"
             "${CMAKE_CURRENT_BINARY_DIR}/cpu_native_tile_registers/proof.asm"
+            # Release line witness (argv without -g): the -g object, its dependencies and retained assembly.
+            "${CMAKE_CURRENT_BINARY_DIR}/cpu_native_tile_registers/proof.lines.o"
+            "${CMAKE_CURRENT_BINARY_DIR}/cpu_native_tile_registers/proof.lines.deps"
+            "${CMAKE_CURRENT_BINARY_DIR}/cpu_native_tile_registers/proof.lines.asm"
             "${CMAKE_CURRENT_BINARY_DIR}/cpu_native_tile_registers/stack-gate.json"
             "${CMAKE_CURRENT_BINARY_DIR}/cpu_native_tile_registers/fused-stage.json"
             "${CMAKE_CURRENT_BINARY_DIR}/cpu_native_tile_registers/driver.json"

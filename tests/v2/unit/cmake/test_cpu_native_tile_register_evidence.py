@@ -2222,6 +2222,19 @@ class ChainCountsTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "no committed chain witness"):
             CHECKER.require_chain_counts(witness, "GNU-14", "NEON_I8MM", committed)
 
+    def test_mismatch_detail_does_not_depend_on_key_order(self) -> None:
+        # An unqualified analysis record is re-checked by comparing its stored failure details with the recomputed
+        # ones: a freshly computed witness and its JSON round trip (sorted keys) must yield the same text.
+        committed = chain_counts()
+        fresh = {"tile_chain": {"1:0:1:0:0:0": {"sites": 9, "offchain": 0}}}
+        stored = json.loads(json.dumps(fresh, sort_keys=True))
+        details = []
+        for witness in (fresh, stored):
+            with self.assertRaisesRegex(ValueError, "differs from the committed counts") as raised:
+                CHECKER.require_chain_counts(witness, "GNU-14", "NEON", committed)
+            details.append(str(raised.exception))
+        self.assertEqual(details[0], details[1])
+
     def test_closure_sources_drop_ambiguous_names(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -4112,6 +4125,76 @@ class ProofBindingTest(unittest.TestCase):
         self.real.write_text("// accessor changed\n")
         with self.assertRaisesRegex(ValueError, "closure input changed"):
             CHECKER.fused_stage(self.args)
+
+
+
+class LineWitnessTest(unittest.TestCase):
+    """Release line witness (L-1..L-4): a Release argv without debug information gets a second compile with
+    exactly one appended `-g`, whose object must be byte-identical in every allocated section and relocation."""
+
+    RELEASE = ["/usr/bin/c++", "-O3", "-DNDEBUG", "-std=c++20", "-c", "/p/probe.cpp", "-o", "/w/proof.o",
+               "-MD", "-MF", "/w/proof.deps", "-MT", "probe", "-H"]
+    OUTPUTS = (Path("/w/proof.o"), Path("/w/proof.deps"), Path("/w/proof.lines.o"), Path("/w/proof.lines.deps"))
+    RENAMED = {"/w/proof.o": "/w/proof.lines.o", "/w/proof.deps": "/w/proof.lines.deps"}
+    CALL = [("f", "\tadrp x1, 0x0 <f> !R_AARCH64_ADR_PREL_PG_HI21:.rodata+0x8\n"
+                  "\tadd x1, x1, #0x0 !R_AARCH64_ADD_ABS_LO12_NC:.rodata+0x8\n\tbl helper\n\tret\n")]
+
+    def test_only_an_argv_without_debug_information_needs_the_witness(self) -> None:
+        self.assertTrue(CHECKER.line_witness_needed(self.RELEASE))
+        for flag in ("-g", "-g1", "-g3", "-ggdb", "-gdwarf-5", "-gline-tables-only"):
+            with self.subTest(flag=flag):
+                # A pre-existing debug level is analysed directly: the witness flag is never doubled.
+                self.assertFalse(CHECKER.line_witness_needed(self.RELEASE + [flag]))
+        with self.assertRaisesRegex(ValueError, "disables debug information"):
+            CHECKER.line_witness_needed(self.RELEASE + ["-g", "-g0"])
+
+    def test_witness_argv_is_the_release_argv_plus_exactly_one_g(self) -> None:
+        witness = CHECKER.line_witness_command(self.RELEASE, *self.OUTPUTS)
+        self.assertEqual(witness, [self.RENAMED.get(argument, argument) for argument in self.RELEASE] + ["-g"])
+        self.assertEqual(witness.count("-g"), 1)
+
+    def test_codegen_changing_or_extra_flags_are_rejected(self) -> None:
+        renamed = [self.RENAMED.get(argument, argument) for argument in self.RELEASE]
+        for label, witness in {
+                "extra -fno-inline": renamed + ["-fno-inline", "-g"],
+                "extra -O1": renamed + ["-O1", "-g"],
+                "-O3 replaced": [("-O1" if argument == "-O3" else argument) for argument in renamed] + ["-g"],
+                "-g1 instead of -g": renamed + ["-g1"],
+                "no debug flag": renamed + ["-fno-inline"],
+                "doubled -g": renamed + ["-g", "-g"],
+                "object not renamed": list(self.RELEASE) + ["-g"]}.items():
+            with self.subTest(label=label), self.assertRaisesRegex(ValueError, "exactly '-g'"):
+                CHECKER.require_line_witness_delta(self.RELEASE, witness, self.RENAMED)
+
+    def test_identical_allocated_image_is_admitted_whatever_the_unallocated_sections(self) -> None:
+        release = witness_object(self.CALL)
+        # Extra symbol-table entries (unallocated, as debug sections are) do not change the allocated image.
+        witness = witness_object(self.CALL, symbols=[("debug_only", "notype", "local", None, 0)])
+        self.assertNotEqual(release, witness)
+        self.assertRegex(CHECKER.require_code_identity(release, witness), r"^[0-9a-f]{64}$")
+
+    def test_allocated_section_mismatch_is_rejected_with_both_digests(self) -> None:
+        release, witness = witness_object(self.CALL), witness_object(self.CALL, extra=b"\x01")
+        with self.assertRaisesRegex(ValueError, r"changed code generation: allocated image differs in "
+                                                r"\['\.rodata'\].*Release object [0-9a-f]{64}, witness object "
+                                                r"[0-9a-f]{64}"):
+            CHECKER.require_code_identity(release, witness)
+
+    def test_relocation_mismatch_is_rejected(self) -> None:
+        moved = [("f", self.CALL[0][1].replace(".rodata+0x8\n\tadd", ".rodata+0x10\n\tadd"))]
+        with self.assertRaisesRegex(ValueError, "relocations of .text.f"):
+            CHECKER.require_code_identity(witness_object(self.CALL), witness_object(moved))
+
+    def test_missing_line_information_still_fails_binding(self) -> None:
+        document = {"executed_command": self.RELEASE, "line_witness": None, "object_sha256": "0" * 64}
+        with self.assertRaisesRegex(ValueError, "lacks line tables and the document binds no valid line witness"):
+            CHECKER.bind_line_witness(None, document, Path("/w/proof.json"), [], None)
+        with self.assertRaisesRegex(ValueError, "already carries line tables"):
+            CHECKER.bind_line_witness(None, {"executed_command": self.RELEASE + ["-g"], "line_witness": {}},
+                                      Path("/w/proof.json"), [], None)
+
+    def test_unqualified_records_bind_the_line_witness_field(self) -> None:
+        self.assertIn("line_witness", CHECKER.BOUND_FIELDS)
 
 
 BINDING_SHARDS = 4

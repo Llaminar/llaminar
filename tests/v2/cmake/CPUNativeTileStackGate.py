@@ -553,14 +553,16 @@ def gate_proof(args: argparse.Namespace) -> dict:
                          f"{verified.stderr[-1500:] or verified.stdout[-1500:]}")
     proof = json.loads(document_path.read_text())
     obj, dis, asm = (proof_path.with_suffix(suffix) for suffix in (".o", ".dis", ".asm"))
+    located, located_sha256 = ev.located_assembly(proof_path, proof)  # Release line witness (L-3), else asm.
     if proof.get("schema") != schema or proof.get("kind") != kind or proof.get("mode") != args.mode or \
             proof.get("checker_sha256") != digest(checker.read_bytes()) or \
             proof.get("object_sha256") != digest(obj.read_bytes()) or \
             proof.get("disassembly_sha256") != digest(dis.read_bytes()) or \
-            proof.get("assembly_sha256") != digest(asm.read_bytes()):
+            proof.get("assembly_sha256") != digest(asm.read_bytes()) or \
+            located_sha256 != digest(located.read_bytes()):
         raise ValueError("the gate input is not the verified proof (schema, mode, checker, object, disassembly or "
                          "assembly hash)")
-    data, disassembly, assembly = obj.read_bytes(), dis.read_text(), asm.read_text(errors="replace")
+    data, disassembly, assembly = obj.read_bytes(), dis.read_text(), located.read_text(errors="replace")
     analyses: dict = {}
     traffic: dict = {}
     counts = ev.audit(data, disassembly, args.mode, traffic, analyses=analyses)
