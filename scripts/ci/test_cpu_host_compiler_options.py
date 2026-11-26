@@ -95,7 +95,7 @@ endforeach()
             for extra in (['-Xcompiler=-fopenmp'], ['-Xcompiler=-O3,-Wno-unused,-fvisibility=hidden'], ['-Xcompiler', '-fopenmp'], ['-Xcompiler=-m64']):
                 check(extra)
             for extra in (['-Xcompiler=-march=native'], ['-Xcompiler=-O3,-mavx512f'], ['-Xcompiler', '-mavx512f'], ['--compiler-options=-mgfni'], ['--compiler-options', '-mno-lzcnt'], ['-Xcompiler=-mgeneral-regs-only'], ['-Xarch_device', '-mavx2']):
-                with self.assertRaisesRegex(ValueError, 'contrary'):
+                with self.assertRaisesRegex(ValueError, 'contrary|leaks to device'):
                     check(extra)
             with self.assertRaisesRegex(ValueError, 'empty expected CPU definitions'):
                 verify(database, '-mavx2', [])
@@ -114,5 +114,5 @@ endforeach()
             verify(database, '-mavx2', definitions, compilers)
             row['arguments'] += ['-Xarch_host', '-mno-avx512f']
             database.write_text(json.dumps([row]))
-            with self.assertRaisesRegex(ValueError, 'contrary'):
+            with self.assertRaisesRegex(ValueError, 'contrary|leaks to device'):
                 verify(database, '-mavx2', definitions, compilers)
