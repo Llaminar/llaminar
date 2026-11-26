@@ -12,8 +12,10 @@
 #pragma once
 #include "kernels/cpu/attention/CPUFP32PagedKVTable.h"
 
+#include "planning/AllResourceCompletionWitness.h"
 #include "planning/PhysicalPagePool.h"
 #include <optional>
+#include <vector>
 
 namespace llaminar2
 {
@@ -54,6 +56,18 @@ std::optional<PageTableAdmission> admitPoolTableReserved(
     PhysicalPagePool &pool, CPUFP32PagedKVTable &table, std::size_t pages,
     CPUFP32PagedKVTable::IssuanceReservation &reservation);
 
+/** @brief Caller-owned bounded witness workspace for witnessed admission. */
+struct PageTableAdmissionWorkspace
+{
+    explicit PageTableAdmissionWorkspace(std::size_t membership)
+        : frame_workspace(membership), members(membership) {}
+    // B4: the ADMISSION path must not heap-allocate per call; the caller
+    // allocates this workspace once per owned topology (BOM-priced) and the
+    // composed witness plus class proof consume only these cells.
+    std::vector<planning::WitnessRequest> frame_workspace;
+    std::vector<AllResourceRequest> members;
+};
+
 /**
  * @brief Bounded optimistic admission with the FULL completion witness.
  *
@@ -65,6 +79,8 @@ std::optional<PageTableAdmission> admitPoolTableReserved(
  * refusal leaves every class untouched (the reserved handle is not consumed,
  * no bank is taken, no growth converts).
  *
+ * @param workspace Caller-owned bounded witness cells (membership-sized);
+ * the admission path performs NO per-call allocation (B4).
  * @param declared_peak Complete resident working set at peak (frames).
  * @param initial_grant Frames converted to O immediately (positive, <= peak).
  * @param reservation Accepted-work handle authorizing the table bank.
@@ -73,6 +89,7 @@ std::optional<PageTableAdmission> admitPoolTableReserved(
  */
 std::optional<PageTableAdmission> admitPoolTableWitnessed(
     PhysicalPagePool &pool, CPUFP32PagedKVTable &table,
+    PageTableAdmissionWorkspace &workspace,
     std::size_t declared_peak, std::size_t initial_grant,
     CPUFP32PagedKVTable::IssuanceReservation &reservation);
 } // namespace llaminar2

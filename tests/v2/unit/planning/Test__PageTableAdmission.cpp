@@ -122,11 +122,12 @@ TEST(PageTableAdmission, WitnessedAdmissionProvesBeforeAcquisition)
     fx.table.reset();
     fx.table = CPUFP32PagedKVTable::create(fx.authority, DeviceId::cpu(),
         CPUFP32PagedKVTableGeometry{1, 2, 2, 1, 8, 4});
+    PageTableAdmissionWorkspace workspace(fx.pool->geometry().request_records + 1);
     auto admission = fx.table->reserveAcceptedWork(1);
     ASSERT_TRUE(admission);
     // Peak 2 / initial 2 against 2 frames: the proof holds and both cells
     // are acquired, consuming exactly one reserved issuance.
-    auto admitted = admitPoolTableWitnessed(*fx.pool, *fx.table, 2, 2, *admission);
+    auto admitted = admitPoolTableWitnessed(*fx.pool, *fx.table, workspace, 2, 2, *admission);
     ASSERT_TRUE(admitted);
     EXPECT_EQ(admitted->grant.remainingCommitment(), 2u);
     EXPECT_EQ(admission->remaining(), 0u);
@@ -136,14 +137,52 @@ TEST(PageTableAdmission, WitnessedAdmissionProvesBeforeAcquisition)
     // unconsumed and the table bank available.
     auto second = fx.table->reserveAcceptedWork(1);
     ASSERT_TRUE(second);
-    EXPECT_FALSE(admitPoolTableWitnessed(*fx.pool, *fx.table, 2, 2, *second));
+    EXPECT_FALSE(admitPoolTableWitnessed(*fx.pool, *fx.table, workspace, 2, 2, *second));
     EXPECT_EQ(second->remaining(), 1u);                 // No issuance consumed.
     EXPECT_EQ(fx.table->outstandingReserved(), 1u);     // Still outstanding.
     EXPECT_EQ(fx.table->issuedVersions(), 1u);          // Only the first issued.
     // A witnessed request whose initial grant fits the remaining frame is
     // also refused by the witness (peak 2 on full pool) without mutation.
-    EXPECT_FALSE(admitPoolTableWitnessed(*fx.pool, *fx.table, 1, 1, *second));
+    EXPECT_FALSE(admitPoolTableWitnessed(*fx.pool, *fx.table, workspace, 1, 1, *second));
     EXPECT_EQ(second->remaining(), 1u);
+}
+
+/** @test B4: observed live class demand is part of the witness (no hard-coded per-request 1). */
+TEST(PageTableAdmission, WitnessedAdmissionCountsObservedLiveClassDemand)
+{
+    CombinedFixture fx(/*frames=*/3, /*banks=*/2);
+    fx.table.reset(); // Rebuild the table with a reservation-capable geometry.
+    fx.table = CPUFP32PagedKVTable::create(fx.authority, DeviceId::cpu(),
+        CPUFP32PagedKVTableGeometry{1, 2, 2, 1, 8, 4});
+    PageTableAdmissionWorkspace workspace(fx.pool->geometry().request_records + 1);
+    auto reservation = fx.table->reserveAcceptedWork(1);
+    ASSERT_TRUE(reservation);
+    // Publish one bank (live demand: 1 published bank, 1 live lease after a touch).
+    auto update = fx.table->tryBeginReserved(*reservation);
+    ASSERT_TRUE(update);
+    auto grant = fx.pool->tryAdmit(1);
+    ASSERT_TRUE(grant);
+    const auto frame = grant->assignFrame();
+    std::vector<float> rows(2 * 4, 1.0f);
+    auto write = grant->prepareAppend(frame, rows.size() * sizeof(float));
+    ASSERT_TRUE(write);
+    write->copyFrom(std::as_bytes(std::span(rows)));
+    update->append(CPUFP32KVPage(write->commit(), 1, 4));
+    auto snapshot = update->commit();
+    auto lease = fx.table->touchEffectiveUse(snapshot);
+    ASSERT_TRUE(lease.has_value());
+    // Observe the real demand: 1 published bank + 1 live lease must be counted
+    // before the proposed request's own peak is added.
+    const auto observed = fx.table->liveClassDemand();
+    EXPECT_EQ(observed.published_banks, 1u);
+    EXPECT_EQ(observed.live_leases, 1u);
+    // The composed witness uses the observation: with 2 banks and 1 observed,
+    // one more proposed request fits; a third would exceed the bank class.
+    auto second = fx.table->reserveAcceptedWork(1);
+    ASSERT_TRUE(second);
+    auto admitted = admitPoolTableWitnessed(*fx.pool, *fx.table, workspace, 1, 1, *second);
+    EXPECT_TRUE(admitted) << "observed live bank demand should allow one more";
+    EXPECT_TRUE(lease->acknowledge());
 }
 
 /** @test Reserved all-resource admission consumes exactly one accepted-work issuance. */

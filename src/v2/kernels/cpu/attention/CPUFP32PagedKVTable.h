@@ -223,6 +223,21 @@ public:
     std::size_t bankCount() const noexcept { return banks_.size(); }
     /** @return Admitted effective-use lease-cell count (witness class maximum). */
     std::size_t leaseCellCount() const noexcept { return effective_use_.leaseCapacity(); }
+    /** @brief REAL live class demand (published banks and live lease cells). */
+    struct LiveClassDemand
+    {
+        std::size_t published_banks = 0; ///< Banks in the Published phase right now.
+        std::size_t live_leases = 0;     ///< Live effective-use lease cells right now.
+    };
+    /** @return Observed live class demand; never a hard-coded per-request 1. */
+    LiveClassDemand liveClassDemand() const noexcept
+    {
+        LiveClassDemand demand;
+        for (const auto &bank : banks_)
+            if (bank.phase == Phase::Published) ++demand.published_banks;
+        demand.live_leases = effective_use_.pendingCount();
+        return demand;
+    }
 private:
     enum class Phase : std::uint8_t { Free, Preparing, Published };
     /** @brief Exact CPU ownership state within the charged metadata root. */

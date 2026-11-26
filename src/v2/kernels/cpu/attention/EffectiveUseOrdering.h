@@ -168,6 +168,14 @@ public:
     bool retireReplica(std::uint64_t incarnation) noexcept;
     /** @return Whether any lease cell is live. */
     bool hasPending() const noexcept;
+    /** @return Live lease-cell count (real observed demand, not capacity). */
+    std::size_t pendingCount() const noexcept
+    {
+        std::size_t count = 0;
+        for (std::size_t i = 0; i < cell_capacity_; ++i)
+            if (cells_[i].live) ++count;
+        return count;
+    }
     /** @return Highest accepted ordinal over the retained records. */
     std::uint64_t watermark() const noexcept;
     /** @return Admitted lease-cell capacity (0 when unbound). */

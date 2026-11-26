@@ -53,17 +53,16 @@ namespace
 {
 /** @brief Prove the ALL-CLASS completion order before any acquisition. */
 bool proveAllClassOrder(PhysicalPagePool &pool, CPUFP32PagedKVTable &table,
+    PageTableAdmissionWorkspace &workspace,
     std::size_t declared_peak, std::size_t initial_grant)
 {
-    // Compliance helper is a planning path, not a hot loop; its workspace is
-    // bounded by the pool's admitted membership (the production admission
-    // entry reuses the pool/table's own arrays, never a per-call rebuild). For
-    // the device-free planner we construct the membership-sized frame workspace
-    // once here; the composed witness itself never allocates.
-    std::vector<planning::WitnessRequest> frame_workspace(
-        pool.geometry().request_records + 1);
-    std::vector<AllResourceRequest> members;
-    members.reserve(pool.geometry().request_records + 1);
+    // B4: ZERO per-call allocation. The caller owns the membership-sized
+    // workspace; this admission path never constructs a heap vector. The
+    // workspace is REUSED across calls: refill by index, never append, so
+    // repeated admissions cannot grow the caller-owned cells.
+    auto &frame_workspace = workspace.frame_workspace;
+    auto &members = workspace.members;
+    members.clear(); // Never append across calls; the cells stay caller-owned.
     AllResourceCapacity capacity;
     capacity.frames = pool.geometry().frames;
     capacity.banks = table.bankCount();
@@ -73,11 +72,16 @@ bool proveAllClassOrder(PhysicalPagePool &pool, CPUFP32PagedKVTable &table,
     proposed.generation = 0;
     proposed.peak_frames = declared_peak;
     proposed.occupied_frames = initial_grant;
-    proposed.peak_banks = 1;   // One table bank per admitted request.
-    proposed.peak_leases = 1;  // One effective-use lease per admitted request.
-    // Existing live requests enter at their declared peaks (frames only are
-    // tracked by the pool; the table's live bank/lease demand is admitted by
-    // the table itself, so the composed proof counts the admitted maxima).
+    // B4: real class demand, never hard-coded. The proposed request declares
+    // ONE admitted table bank and ONE effective-use lease at its peak (the
+    // typed per-request contract of the owning table); existing live requests
+    // are OBSERVED through liveClassDemand() (published banks + live lease
+    // cells), so no class assumes a count that the authority does not hold.
+    proposed.peak_banks = 1;   // Declared per-request table contract (one bank).
+    proposed.peak_leases = 1;  // Declared per-request lease contract (one lease).
+    // Existing live requests enter at their declared frame peaks (frames-only
+    // pool records); the table's OWN observed live class demand is supplied
+    // as the base, never fabricated per-request.
     auto live = pool.liveWitnessRequests();
     for (const auto &r : live)
     {
@@ -86,19 +90,21 @@ bool proveAllClassOrder(PhysicalPagePool &pool, CPUFP32PagedKVTable &table,
         existing.record = r.record;
         existing.peak_frames = r.peak_frames;
         existing.occupied_frames = r.occupied_frames;
-        existing.peak_banks = 1;
-        existing.peak_leases = 1;
         existing.preserved = r.preserved;
         members.push_back(existing);
     }
     members.push_back(proposed);
     capacity.requests = members;
+    const auto live_demand = table.liveClassDemand();
+    capacity.live_banks = live_demand.published_banks;
+    capacity.live_leases = live_demand.live_leases;
     return proveAllResourceCompletion(capacity, frame_workspace).valid;
 }
 }
 
 std::optional<PageTableAdmission> admitPoolTableWitnessed(
     PhysicalPagePool &pool, CPUFP32PagedKVTable &table,
+    PageTableAdmissionWorkspace &workspace,
     std::size_t declared_peak, std::size_t initial_grant,
     CPUFP32PagedKVTable::IssuanceReservation &reservation)
 {
@@ -111,7 +117,7 @@ std::optional<PageTableAdmission> admitPoolTableWitnessed(
     // the initial grant, the accepted-work handle authorizes the table bank,
     // or ANY reservation capacity is consumed. On refusal every class is
     // untouched (proof-first, not acquire-then-rollback).
-    if (!proveAllClassOrder(pool, table, declared_peak, initial_grant))
+    if (!proveAllClassOrder(pool, table, workspace, declared_peak, initial_grant))
         return std::nullopt;
     auto grant = pool.tryAdmitWithWitness(declared_peak, initial_grant);
     if (!grant) return std::nullopt; // No conversion: untouched.

@@ -43,6 +43,11 @@ struct AllResourceCapacity
     std::size_t banks = 0;              ///< Admitted table banks.
     std::size_t lease_cells = 0;        ///< Admitted effective-use lease cells.
     planning::WitnessBaseOccupancy base; ///< Physical occupancy outside requests.
+    // B4: live class demand is OBSERVED from the authority (published banks,
+    // live lease cells), never assumed per-request. The proposed request
+    // declares its own peaks; no hard-coded 1 exists anywhere here.
+    std::size_t live_banks = 0;         ///< Observed published banks right now.
+    std::size_t live_leases = 0;        ///< Observed live lease cells right now.
     // Bounded membership: the caller supplies capacity-owned request storage
     // (no per-call heap allocation; the witness follows the same supplied
     // bounded-workspace rule as the frame proof).

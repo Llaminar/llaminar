@@ -34,14 +34,13 @@ AllResourceWitnessResult proveAllResourceCompletion(
         frame_workspace.first(capacity.requests.size()));
     if (!frame_proof.valid())
         return AllResourceWitnessResult{false, frame_proof.refusal};
-    // 2) Table-bank + lease-cell maxima together. At any phase, the requests
-    // that cannot yet be preserved (preserved == false) must fit the admitted
-    // banks and lease cells; a preservation-eligible request may release its
-    // banks/leases only AFTER its frame preservation is proved. We check the
-    // conservative simultaneous demand: the worst case over a completion
-    // order where preserved requests retire first and restored ones re-enter.
-    std::size_t banks_demand = 0;
-    std::size_t leases_demand = 0;
+    // 2) Table-bank + lease-cell maxima together (B4): observed live demand
+    // plus the proposed request's DECLARED peaks must fit the admitted class
+    // maxima. The observation comes from the authority itself (liveClassDemand),
+    // never a per-request assumption; the existing live requests already hold
+    // their own banks/leases and release them through retirement.
+    std::size_t banks_demand = capacity.live_banks;
+    std::size_t leases_demand = capacity.live_leases;
     for (const auto &r : capacity.requests)
     {
         if (r.peak_banks > std::numeric_limits<std::size_t>::max() - banks_demand ||

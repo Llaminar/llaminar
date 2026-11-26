@@ -51,6 +51,8 @@ public:
             std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()), 0);
         pool_ = authority_->createCPUPagePool(device, geometry, CPUStoragePlacement::local());
         if (table_geometry) table_ = CPUFP32PagedKVTable::create(authority_, device, *table_geometry);
+        // Caller-owned witness workspace: membership-sized, BOM-priced by the caller.
+        workspace_ = std::make_unique<PageTableAdmissionWorkspace>(geometry.request_records + 1);
     }
     /** @brief Execute a recorded command, returning only actual observed results. */
     std::string execute(const std::string &command)
@@ -464,7 +466,7 @@ public:
             size_t peak, initial;
             if (!(input >> name >> reservation_name >> peak >> initial) ||
                 combinations_.contains(name) || !reservations_.contains(reservation_name)) fail();
-            auto admitted = admitPoolTableWitnessed(*pool_, *table_, peak, initial,
+            auto admitted = admitPoolTableWitnessed(*pool_, *table_, *workspace_, peak, initial,
                 reservations_.at(reservation_name));
             outcome = admitted ? "accepted" : "refused";
             if (admitted)
@@ -506,6 +508,7 @@ private:
     std::shared_ptr<PhysicalMemoryAuthority> authority_;
     std::shared_ptr<PhysicalPagePool> pool_;
     std::shared_ptr<CPUFP32PagedKVTable> table_;
+    std::unique_ptr<PageTableAdmissionWorkspace> workspace_; ///< Caller-owned witness cells.
     std::map<std::string, PhysicalPagePool::Grant> requests_;
     std::map<std::string, PhysicalPagePool::FramePin> pins_;
     std::map<std::string, PhysicalPagePool::AppendPlan> plans_;
