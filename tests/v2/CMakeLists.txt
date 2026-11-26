@@ -41577,6 +41577,7 @@ if(TEST V2_Integration_MPIBootstrapNativeApplicationBoundary)
 endif()
 
 include("${CMAKE_CURRENT_LIST_DIR}/cmake/V2CPUArchitectureTests.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/cmake/V2ARMEnvelopeWorkflowTests.cmake")
 
 # Inventory finalization must observe later registrations too. The module
 # schedules one end-of-directory pass rather than relying on textual position.

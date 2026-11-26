@@ -25,7 +25,7 @@ class EnvelopeChecks(unittest.TestCase):
                     if failure == 'missing':
                         raise FileNotFoundError('missing tool')
                     return SimpleNamespace(returncode=int(index % 3 == failure))
-                self.assertEqual(run('.', directory, execute), int(failure is not None))
+                self.assertEqual(run('.', directory, execute, test_identity=True), int(failure is not None))
                 attempt, = Path(directory).iterdir()
                 records = json.loads((attempt / 'stages.json').read_text())
                 self.assertEqual(len(records), 12)
@@ -37,3 +37,34 @@ class EnvelopeChecks(unittest.TestCase):
                     if witness.exists():
                         self.assertEqual(witness.read_text(), 'build')
                 self.assertIn('-DCMAKE_MAKE_PROGRAM:FILEPATH=', ' '.join(calls[0]))
+
+    def test_source_and_manifest_tampering(self):
+        import hashlib
+        import os
+        from unittest.mock import patch
+        from arm_envelope_checks import source_identity
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            header = root / 'header.h'
+            header.write_text('original')
+            manifest = root / 'arm-envelope-manifest.json'
+            manifest.write_text(json.dumps(dict(commit='commit', tree='tree', files={'header.h': hashlib.sha256(header.read_bytes()).hexdigest()})))
+            digest = hashlib.sha256(manifest.read_bytes()).hexdigest()
+            with patch.dict(os.environ, ARM_ENVELOPE_MANIFEST_SHA256=digest):
+                self.assertEqual(source_identity(root)['tree'], 'tree')
+                header.write_text('tampered')
+                with self.assertRaisesRegex(ValueError, 'source mismatch'):
+                    source_identity(root)
+                manifest.write_text('{}')
+                with self.assertRaisesRegex(ValueError, 'manifest digest'):
+                    source_identity(root)
+
+    def test_identity_failure_records_every_cell_without_execution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            def execute(*args, **kwargs):
+                self.fail('invalid identity must not execute stages')
+            self.assertEqual(run('.', directory, execute, test_identity=False), 1)
+            attempt, = Path(directory).iterdir()
+            records = json.loads((attempt / 'stages.json').read_text())
+            self.assertEqual(len(records), 12)
+            self.assertTrue(all(r['returncode'] and r['status'] == 'skipped-after-failure' for r in records))

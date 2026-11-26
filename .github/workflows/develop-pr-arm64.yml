@@ -153,13 +153,21 @@ jobs:
           context=$(mktemp -d)
           git archive HEAD | tar -x -C "$context"
           git rev-parse HEAD HEAD^{tree} > "$context/arm-envelope-source.txt"
+          python3 - "$context" <<'PYTHON'
+          import hashlib, json, pathlib, subprocess, sys
+          root = pathlib.Path(sys.argv[1])
+          manifest = dict(commit=subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(), tree=subprocess.check_output(['git', 'rev-parse', 'HEAD^{tree}'], text=True).strip(), files={str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest() for p in root.rglob('*') if p.is_file()})
+          (root / 'arm-envelope-manifest.json').write_text(json.dumps(manifest, sort_keys=True))
+          PYTHON
+          manifest_sha=$(sha256sum "$context/arm-envelope-manifest.json" | cut -d' ' -f1)
+          cp "$context/arm-envelope-manifest.json" "$RUNNER_TEMP/llaminar-arm64-evidence/envelopes/"
           cp "$RUNNER_TEMP/arm-envelope.Dockerfile" "$context/arm-envelope.Dockerfile"
           docker buildx build --platform linux/arm64 --load \
             --build-context "$TOOLCHAIN_CONTEXT" -f "$RUNNER_TEMP/arm-envelope.Dockerfile" \
             -t llaminar-arm-envelopes:pr "$context" 2>&1 | tee "$RUNNER_TEMP/llaminar-arm64-evidence/envelopes-image.log"
           git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/llaminar-arm64-evidence/envelopes/source.txt"
           printf '%s\n' "$TOOLCHAIN_CONTEXT" > "$RUNNER_TEMP/llaminar-arm64-evidence/envelopes/toolchain.txt"
-          docker run --rm --mount "type=bind,source=$RUNNER_TEMP/llaminar-arm64-evidence/envelopes,target=/evidence" llaminar-arm-envelopes:pr
+          docker run --rm --env "ARM_ENVELOPE_MANIFEST_SHA256=$manifest_sha" --mount "type=bind,source=$RUNNER_TEMP/llaminar-arm64-evidence/envelopes,target=/evidence" llaminar-arm-envelopes:pr
       - name: Retain ARM64 build and test evidence
         if: always()
         uses: actions/upload-artifact@v4

@@ -13,7 +13,23 @@ import subprocess
 import sys
 
 
-def run(root, output, execute=subprocess.run):
+def source_identity(root):
+    """Authenticate archived bytes against the externally supplied manifest digest."""
+    root = Path(root)
+    payload = (root / 'arm-envelope-manifest.json').read_bytes()
+    if hashlib.sha256(payload).hexdigest() != os.environ['ARM_ENVELOPE_MANIFEST_SHA256']:
+        raise ValueError('manifest digest mismatch')
+    manifest = json.loads(payload)
+    for name, digest in manifest['files'].items():
+        path = root / name
+        if not path.resolve().is_relative_to(root.resolve()):
+            raise ValueError('source path escapes archive')
+        if hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+            raise ValueError('source mismatch: ' + name)
+    return manifest
+
+
+def run(root, output, execute=subprocess.run, *, test_identity=None):
     """Run all owned CMake stages and retain commands, status and complete output."""
     output = Path(output).resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -23,7 +39,7 @@ def run(root, output, execute=subprocess.run):
                   cxx=os.environ.get('CXX', 'c++')).items()}
     scratch = tempfile.TemporaryDirectory(prefix='arm-envelopes-')
     identity = {'tools': tools, 'source': str(Path(root).resolve()), 'versions': {}}
-    for name, command in [('source', ['git', '-C', str(root), 'rev-parse', 'HEAD', 'HEAD^{tree}'])] + [(n, [p, '--version']) for n, p in tools.items()]:
+    for name, command in [(n, [p, '--version']) for n, p in tools.items()]:
         try:
             result = subprocess.run(command, capture_output=True, text=True)
             identity['versions'][name] = dict(command=command, returncode=result.returncode, output=result.stdout + result.stderr)
@@ -35,13 +51,37 @@ def run(root, output, execute=subprocess.run):
     compiler_bound = all(Path(tools[name]).is_file() and Path('/usr/bin/' + expected).is_file()
                          and Path(tools[name]).resolve() == Path('/usr/bin/' + expected).resolve()
                          for name, expected in [('cc', 'gcc-14'), ('cxx', 'g++-14')])
+    try:
+        identity['manifest'] = source_identity(root)
+        source_bound = True
+    except (OSError, ValueError, KeyError) as error:
+        identity['source_error'] = str(error)
+        source_bound = False
+    discovery = Path(scratch.name) / 'discovery'
+    discovery.mkdir()
+    (discovery / 'CMakeLists.txt').write_text('cmake_minimum_required(VERSION 4.0)\nproject(Identity LANGUAGES C CXX)\n')
+    if execute is subprocess.run:
+        with (output / 'compiler-discovery.log').open('w') as log:
+            try:
+                result = execute(['cmake', '-S', str(discovery), '-B', str(discovery / 'build'), '-G', 'Ninja', f'-DCMAKE_MAKE_PROGRAM:FILEPATH={tools["ninja"]}'], stdout=log, stderr=subprocess.STDOUT)
+                cache = (discovery / 'build/CMakeCache.txt').read_text()
+                for name, variable in [('cc', 'C'), ('cxx', 'CXX')]:
+                    observed = next(line.split('=', 1)[1] for line in cache.splitlines() if line.startswith(f'CMAKE_{variable}_COMPILER:FILEPATH='))
+                    compiler_bound = compiler_bound and Path(observed).resolve() == Path(tools[name]).resolve()
+                    tools[name] = observed
+                compiler_bound = compiler_bound and result.returncode == 0
+                identity['compiler_cache'] = cache
+            except (OSError, StopIteration) as error:
+                compiler_bound = False
+                identity['compiler_error'] = str(error)
+    identity['tools'] = tools.copy()
     identity['compiler_bound'] = compiler_bound
     (output / 'identity.json').write_text(json.dumps(identity, indent=2))
     records = []
     for isa in ('NEON_DOTPROD', 'NEON_I8MM'):
         for config in ('Release', 'Integration'):
             build = Path(scratch.name) / f'{isa}-{config}'
-            failed = not compiler_bound if execute is subprocess.run else False
+            failed = not (compiler_bound and source_bound) if test_identity is None else not test_identity
             stages = [
                 ('configure', ['cmake', '-S', str(Path(root) / 'tests/v2/portability'), '-B', str(build), '-G', 'Ninja', f'-DLLAMINAR_CPU_ISA={isa}', f'-DCMAKE_BUILD_TYPE={config}', '-DCMAKE_EXPORT_COMPILE_COMMANDS=ON', f'-DCMAKE_MAKE_PROGRAM:FILEPATH={tools["ninja"]}', f'-DCMAKE_C_COMPILER={tools["cc"]}', f'-DCMAKE_CXX_COMPILER={tools["cxx"]}']),
                 ('build', ['cmake', '--build', str(build), '--parallel', '--target', 'v2_cpu_native_tile_register_proof']),
