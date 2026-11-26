@@ -70,28 +70,41 @@ class EnvelopeChecks(unittest.TestCase):
             self.assertEqual(len(records), 12)
             self.assertTrue(all(r['returncode'] and r['status'] == 'skipped-after-failure' for r in records))
 
-    def test_unbound_real_identity_combination(self):
+    def test_identity_admission_truth_table(self):
+        from arm_envelope_checks import identity_bound
+        for compiler, source, expected in ((True, True, True), (True, False, False),
+                                           (False, True, False), (False, False, False)):
+            with self.subTest(compiler=compiler, source=source):
+                self.assertIs(identity_bound(compiler, source), expected)
+
+    def test_noncanonical_compiler_with_authenticated_source(self):
+        import hashlib
         import os
         from unittest.mock import patch
-        for mismatch in ('manifest', 'compiler'):
-            with self.subTest(mismatch=mismatch), tempfile.TemporaryDirectory() as directory:
-                root = Path(directory) / 'source'
-                root.mkdir()
-                (root / 'arm-envelope-manifest.json').write_text('{}')
-                calls = []
-                def execute(command, **kwargs):
-                    calls.append(command)
-                    raise FileNotFoundError('diagnostic missing compiler')
-                with patch.dict(os.environ, ARM_ENVELOPE_MANIFEST_SHA256='wrong', CC='/noncanonical/cc', CXX='/noncanonical/cxx'):
-                    self.assertEqual(run(root, Path(directory) / 'out', execute), 1)
-                attempt, = (Path(directory) / 'out').iterdir()
-                identity = json.loads((attempt / 'identity.json').read_text())
-                self.assertFalse(identity['compiler_bound'])
-                self.assertIn('source_error', identity)
-                self.assertEqual(len(calls), 1)
-                records = json.loads((attempt / 'stages.json').read_text())
-                self.assertEqual(len(records), 12)
-                self.assertTrue(all(r['status'] == 'skipped-after-failure' and r['returncode'] for r in records))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / 'source'
+            root.mkdir()
+            (root / 'arm-envelope.Dockerfile').write_text('FROM toolchain')
+            manifest = root / 'arm-envelope-manifest.json'
+            manifest.write_text(json.dumps(dict(commit='a'*40, tree='b'*40, files={})))
+            compiler = Path(directory) / 'noncanonical-compiler'
+            compiler.write_text('#!/bin/sh\necho noncanonical compiler\n')
+            compiler.chmod(0o755)
+            calls = []
+            def execute(command, **kwargs):
+                calls.append(command)
+                raise FileNotFoundError('diagnostic missing compiler')
+            with patch.dict(os.environ, ARM_ENVELOPE_MANIFEST_SHA256=hashlib.sha256(manifest.read_bytes()).hexdigest(), CC=str(compiler), CXX=str(compiler)):
+                self.assertEqual(run(root, Path(directory) / 'out', execute), 1)
+            attempt, = (Path(directory) / 'out').iterdir()
+            identity = json.loads((attempt / 'identity.json').read_text())
+            self.assertTrue(identity['source_bound'])
+            self.assertFalse(identity['compiler_bound'])
+            self.assertNotIn('source_error', identity)
+            self.assertEqual(len(calls), 1)
+            records = json.loads((attempt / 'stages.json').read_text())
+            self.assertEqual(len(records), 12)
+            self.assertTrue(all(r['status'] == 'skipped-after-failure' and r['returncode'] for r in records))
 
     def test_exact_inventory_and_symlink_targets(self):
         import hashlib

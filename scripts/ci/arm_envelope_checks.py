@@ -37,6 +37,11 @@ def source_identity(root):
     return manifest
 
 
+def identity_bound(compiler_bound, source_bound):
+    """Admit an envelope only when both independent identities are authenticated."""
+    return compiler_bound and source_bound
+
+
 def run(root, output, execute=subprocess.run, *, test_identity=None):
     """Run all owned CMake stages and retain commands, status and complete output."""
     output = Path(output).resolve()
@@ -82,6 +87,7 @@ def run(root, output, execute=subprocess.run, *, test_identity=None):
             except (OSError, StopIteration) as error:
                 compiler_bound = False
                 identity['compiler_error'] = str(error)
+    identity['source_bound'] = source_bound
     identity['tools'] = tools.copy()
     identity['compiler_bound'] = compiler_bound
     (output / 'identity.json').write_text(json.dumps(identity, indent=2))
@@ -89,7 +95,7 @@ def run(root, output, execute=subprocess.run, *, test_identity=None):
     for isa in ('NEON_DOTPROD', 'NEON_I8MM'):
         for config in ('Release', 'Integration'):
             build = Path(scratch.name) / f'{isa}-{config}'
-            failed = not (compiler_bound and source_bound) if test_identity is None else not test_identity
+            failed = not identity_bound(compiler_bound, source_bound) if test_identity is None else not test_identity
             stages = [
                 ('configure', ['cmake', '-S', str(Path(root) / 'tests/v2/portability'), '-B', str(build), '-G', 'Ninja', f'-DLLAMINAR_CPU_ISA={isa}', f'-DCMAKE_BUILD_TYPE={config}', '-DCMAKE_EXPORT_COMPILE_COMMANDS=ON', f'-DCMAKE_MAKE_PROGRAM:FILEPATH={tools["ninja"]}', f'-DCMAKE_C_COMPILER={tools["cc"]}', f'-DCMAKE_CXX_COMPILER={tools["cxx"]}']),
                 ('build', ['cmake', '--build', str(build), '--parallel', '--target', 'v2_cpu_native_tile_register_proof']),
