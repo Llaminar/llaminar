@@ -2165,6 +2165,46 @@ class LinkSelectedFusedTest(unittest.TestCase):
         self.assertEqual(evidence, {"helper@tuB": {"fused": {"fmadd": 1}}})
 
 
+class PrelinkFusedScopeTest(unittest.TestCase):
+    """Reviewer 102: the probe has no link authority, so its fused proof is selection-independent and stricter:
+    this object's own copy of every weak/global helper must satisfy the witness; production (post-link) keeps the
+    P2 selected-copy rule."""
+
+    SOURCES = FusedInstructionTest.SOURCES
+
+    def prelink(self, helper: str, binding: str = "weak", **options) -> dict:
+        program = compact_name(ordered=0)
+        functions, text = located([(program, "\tbl\thelper\n\tret\n"), ("helper", helper)])
+        return CHECKER.fused_evidence(witness_object(functions, None, bindings={"helper": binding}),
+                                      disassembly(functions), text, "probe", self.SOURCES, scope="prelink", **options)
+
+    def test_every_weak_copy_is_audited_without_a_selection_record(self) -> None:
+        for binding in ("weak", "global"):
+            with self.subTest(binding=binding):
+                evidence = self.prelink("\tfmul\ts0, s1, s2\n\tret\n", binding)
+                self.assertEqual(evidence["helper@probe"], {"fused": {}})
+                self.assertNotIn("unselected@probe", evidence)
+
+    def test_a_bad_weak_copy_fails_even_when_another_copy_would_be_selected(self) -> None:
+        # A contraction in this object's weak copy fails pre-link whatever copy a link would keep.
+        with self.assertRaisesRegex(ValueError, "helper@probe: fused .* (not an explicit source FMA|no bound source)"):
+            self.prelink("\tfmadd\ts0, s1, s2, s0@@7\n\tret\n")
+        other = other_unit("tuB", {"helper": "\tfmul\ts0, s1, s2\n\tret\n"})
+        with self.assertRaisesRegex(ValueError, "no link authority"):
+            self.prelink("\tfmadd\ts0, s1, s2, s0@@7\n\tret\n", selection={"helper": {"copy": "tuB", **PROCESS}},
+                         units={"tuB": other}, selected={"helper@tuB": {"fused": {}}})
+
+    def test_postlink_selected_bad_copy_still_fails(self) -> None:
+        functions, text = located([("helper", "\tfmadd\ts0, s1, s2, s0@@7\n\tret\n")])
+        with self.assertRaisesRegex(ValueError, "helper@tuB: fused"):
+            CHECKER.fused_evidence(witness_object(functions, None, bindings={"helper": "weak"}),
+                                   disassembly(functions), text, "tuB", self.SOURCES, roots=("helper",))
+
+    def test_unknown_scope_fails(self) -> None:
+        with self.assertRaisesRegex(ValueError, "unknown fused proof scope"):
+            CHECKER.fused_evidence(b"", "", "", "probe", {}, scope="maybe")
+
+
 class ChainCountsTest(unittest.TestCase):
     """The probe's chain witness is bound to exact committed counts per identity and envelope."""
 

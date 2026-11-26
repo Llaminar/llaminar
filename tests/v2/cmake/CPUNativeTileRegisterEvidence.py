@@ -4054,12 +4054,13 @@ FP_ARITHMETIC = frozenset({"fadd", "fsub", "fmul", "fdiv", "fneg", "fabs", "fmax
                            "fcvtn", "scvtf", "ucvtf", "frecpe", "frsqrte", "fsqrt"}) | FUSED
 
 
-def audited_closure(image: ObjectImage, bodies: dict, roots: tuple[str, ...] = ()) \
+def audited_closure(image: ObjectImage, bodies: dict, roots: tuple[str, ...] = (), follow_nonlocal: bool = False) \
         -> tuple[dict[str, str], dict[str, str]]:
     """(local closure {raw name: key}, non-local callees {raw name: binding}) of one object for the fused witness:
     every tile and compact program (by key), plus `roots`, and every TU-local function they reach by direct call,
     transitively. A weak or global callee executes the link-selected copy, so it is not followed here: it is
-    returned for fused_evidence() to resolve (F-2)."""
+    returned for fused_evidence() to resolve (F-2) - unless follow_nonlocal (the pre-link scope): then this object's
+    own copy of every defined weak/global callee is followed like a TU-local one."""
     unit = make_unit("closure", image, bodies)
     roots_ = {name: program_key(name) for name in bodies if TILE_RUN.search(name) and tile_match(name, image.prefix)}
     roots_.update({name: key for key, (name, _) in compact_programs(image).items()})
@@ -4072,7 +4073,8 @@ def audited_closure(image: ObjectImage, bodies: dict, roots: tuple[str, ...] = (
             if not parts or parts[0] != "bl" or parts[-1] not in bodies:
                 continue
             callee = parts[-1]
-            if unit.functions.get(callee) != "local":
+            if unit.functions.get(callee) != "local" and not (follow_nonlocal and
+                                                                unit.functions.get(callee) in ("weak", "global")):
                 external[callee] = unit.functions.get(callee, "unknown")
             elif callee not in closure:
                 closure[callee] = callee
@@ -4082,7 +4084,7 @@ def audited_closure(image: ObjectImage, bodies: dict, roots: tuple[str, ...] = (
 
 def fused_evidence(data: bytes, disassembly: str, assembly: str, copy: str, sources: dict[str, str],
                    selection: dict | None = None, units: dict | None = None, selected: dict | None = None,
-                   roots: tuple[str, ...] = ()) -> dict[str, dict]:
+                   roots: tuple[str, ...] = (), scope: str = "postlink") -> dict[str, dict]:
     """S2-4c: every fused multiply-add of the audited closure of one production copy (fmla, fmls, fmadd, fmsub,
     fnmadd, fnmsub, element forms included) must be an explicit source FMA: its located source line (the executed
     compile's own .loc, see assembly_functions(); arm_neon.h lines included) calls one (vfma*/vfms*, std::fma,
@@ -4095,12 +4097,21 @@ def fused_evidence(data: bytes, disassembly: str, assembly: str, copy: str, sour
     CallModel.select() admits it, with the audited `units`) the selected copy's own fused evidence must be
     supplied (`selected` {"symbol@copy": {"fused": ...}}, from fused_evidence(..., roots=(symbol,)) on that copy's
     object) and is included; without a record, a callee whose copy here holds FP arithmetic leaves the proof
-    incomplete and fails; one without is listed under "unselected" (never followed or assumed)."""
+    incomplete and fails; one without is listed under "unselected" (never followed or assumed).
+
+    scope (reviewer 102): "postlink" is the production P2 rule above (the selected copy). "prelink" - a probe
+    compiled before any link exists, with no link authority - is selection-independent and stricter: no selection
+    record is accepted, and this object's own copy of every weak/global callee is followed into the closure and
+    must satisfy the witness itself, whichever copy a later link selects (no helper exemption)."""
+    if scope not in ("postlink", "prelink"):
+        raise ValueError(f"unknown fused proof scope {scope!r}")
+    if scope == "prelink" and (selection or units or selected):
+        raise ValueError("a pre-link fused proof has no link authority: selection records are not admitted")
     image = read_object(data)
     bodies = normalize_disassembly(disassembly, image)
     locations: dict[str, list[str]] = {}
     functions, _ = assembly_functions(assembly, set(bodies), image.macho, locations)
-    closure, external = audited_closure(image, bodies, roots)
+    closure, external = audited_closure(image, bodies, roots, follow_nonlocal=scope == "prelink")
     result: dict[str, dict] = {}
     unselected = []
     unit = make_unit(copy, image, bodies)
@@ -5325,7 +5336,7 @@ def unqualified_analysis(args: argparse.Namespace, analyses: dict | None = None)
 
 def fused_witness(args: argparse.Namespace, data: bytes, disassembly: str, assembly: str, inputs: dict) -> dict:
     """The fused witness of bound artifacts against the committed counts (raises on any difference)."""
-    fused = fused_evidence(data, disassembly, assembly, PROBE_COPY, closure_sources(inputs))
+    fused = fused_evidence(data, disassembly, assembly, PROBE_COPY, closure_sources(inputs), scope="prelink")
     suffix = f"@{PROBE_COPY}"
     witness = {"fused": {key[:-len(suffix)]: value for key, value in sorted(fused.items())}}
     require_chain_counts(witness, args.identity, args.mode)
@@ -5339,6 +5350,7 @@ def fused_from_analysis(args: argparse.Namespace, verified: VerifiedAnalysis) ->
     receipt.unlink(missing_ok=True)
     document = json.loads(verified.document_text)
     base = {"stage": "fused", "input": verified.kind, "verified": verified.kind == SEALED_KIND,
+            "scope": "prelink-selection-independent (probe: no link authority, every weak copy here audited)",
             "checker_sha256": verified.checker_sha256, "document_sha256": hashlib.sha256(
                 verified.document_text.encode()).hexdigest()}
     try:
