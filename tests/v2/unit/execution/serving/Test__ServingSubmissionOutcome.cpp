@@ -49,8 +49,13 @@ public:
         }
         return prefix_restored_tokens;
     }
-    bool harvestServingRowPrefix(int, const PrefixLookupResult &, const std::vector<int32_t> &) override
+    int harvest_count = 0;
+    PrefixLookupResult last_harvest_admission;
+    bool harvestServingRowPrefix(int, const PrefixLookupResult &admission,
+        const std::vector<int32_t> &) override
     {
+        ++harvest_count;
+        last_harvest_admission = admission; // Record the admission the session passed.
         return true;
     }
     // Typed executor continuation: the harness exports the exact KV payload of
@@ -405,6 +410,38 @@ TEST(ServingSubmissionOutcome, CollidingIdAcrossSessionsRefusesForeign)
     EXPECT_TRUE(b.restore(std::move(*mb), error)) << error;
 }
 
+/** @test R18 E1: a suspended id refuses re-submission; one terminal per suspended request. */
+TEST(ServingSubmissionOutcome, SuspendedIdRefusesResubmitAndTerminalOncePerRequest)
+{
+    ScriptedRows rows;
+    ServingSession session(rows, 32, 8);
+    std::string error;
+    ASSERT_TRUE(session.begin(1, 1, error, nullptr, 0));
+    rows.setSlotKV(0, {std::byte{1}, std::byte{2}, std::byte{3}});
+    EXPECT_EQ(session.submit(greedy(1), error), ServingSubmissionOutcome::Direct);
+    session.step();
+    auto m1 = session.suspend(1, error);
+    ASSERT_TRUE(m1.has_value()) << error;
+    // The suspended id is still OWNED: re-submission refuses (E1), so a
+    // second suspension can never overwrite the first outstanding record.
+    EXPECT_EQ(session.submit(greedy(1), error), ServingSubmissionOutcome::Refused);
+    EXPECT_NE(error.find("suspended"), std::string::npos) << error;
+    // Neither restored: end() emits ONE terminal per request (exactly two:
+    // the suspended id 1 and the admitted id 1? No — the re-submit was refused
+    // so only id 1 exists).
+    session.end();
+    auto events = session.step();
+    std::size_t errors = 0;
+    for (const auto &e : events)
+        if (e.finished())
+        {
+            ++errors;
+            EXPECT_EQ(e.id, 1u);
+            EXPECT_EQ(e.finish, ServingFinishReason::Error);
+        }
+    EXPECT_EQ(errors, 1u); // Exactly one terminal for the one suspended request.
+}
+
 /** @test R17 D1: a manifest minted before end()/begin() refuses the new incarnation. */
 TEST(ServingSubmissionOutcome, PreEndManifestRefusesNewIncarnation)
 {
@@ -427,15 +464,34 @@ TEST(ServingSubmissionOutcome, PreEndManifestRefusesNewIncarnation)
     EXPECT_NE(error.find("another session"), std::string::npos) << error;
 }
 
-/** @test R17: cache-enabled MISS row suspends and restores with the SAME admission. */
+/** @test R17/R18: cache-enabled MISS row suspends/restores with the SAME admission as the control. */
 TEST(ServingSubmissionOutcome, CacheEnabledMissSuspendRestoreKeepsAdmission)
 {
+    // CONTROL: the same request runs uninterrupted.
+    ScriptedRows control_rows;
+    ServingSession control(control_rows, 256, 8);
+    std::string error;
+    ASSERT_TRUE(control.begin(1, 1, error, nullptr, 0));
+    control_rows.setSlotKV(0, {std::byte{1}, std::byte{2}, std::byte{3}});
+    control_rows.prefix_miss_cache_enabled = true;
+    auto control_request = greedy(1);
+    control_request.prompt.assign(ServingSession::kPrefillChunk + 5, 9);
+    control_request.max_new_tokens = 8;
+    EXPECT_EQ(control.submit(control_request, error), ServingSubmissionOutcome::Direct);
+    std::vector<ServingBatchEvent> control_events;
+    for (int i = 0; i < 20 && !control.idle(); ++i)
+        for (const auto &e : control.step())
+            control_events.push_back(e);
+    ASSERT_TRUE(control.idle());
+    const int control_harvests = control_rows.harvest_count;
+    const auto control_admission = control_rows.last_harvest_admission;
+
+    // SUSPENDED: the same request with a suspension at a mid-prefill boundary.
     ScriptedRows rows;
     ServingSession session(rows, 256, 8);
-    std::string error;
     ASSERT_TRUE(session.begin(1, 1, error, nullptr, 0));
     rows.setSlotKV(0, {std::byte{1}, std::byte{2}, std::byte{3}});
-    rows.prefix_miss_cache_enabled = true; // cache-enabled admission, MISS.
+    rows.prefix_miss_cache_enabled = true;
     auto request = greedy(1);
     request.prompt.assign(ServingSession::kPrefillChunk + 5, 9);
     request.max_new_tokens = 8;
@@ -445,12 +501,31 @@ TEST(ServingSubmissionOutcome, CacheEnabledMissSuspendRestoreKeepsAdmission)
     ASSERT_TRUE(manifest.has_value()) << error;
     EXPECT_TRUE(manifest->content().prefix_cache_enabled);
     EXPECT_TRUE(manifest->content().prefix_supported);
-    // The typed admission travels; restore reattaches it.
     ASSERT_TRUE(session.restore(std::move(*manifest), error)) << error;
-    // Harvest/counters see the SAME admission (not a silent default).
+    std::vector<ServingBatchEvent> events;
     for (int i = 0; i < 20 && !session.idle(); ++i)
-        session.step();
+        for (const auto &e : session.step())
+            events.push_back(e);
     ASSERT_TRUE(session.idle());
+    // Same harvest admission as the control (cache_enabled/supported/block
+    // size/fingerprint preserved — never silently defaulted to cache disabled).
+    EXPECT_EQ(rows.harvest_count, control_harvests);
+    EXPECT_EQ(rows.last_harvest_admission.cache_enabled,
+        control_admission.cache_enabled);
+    EXPECT_EQ(rows.last_harvest_admission.supported,
+        control_admission.supported);
+    EXPECT_EQ(rows.last_harvest_admission.block_size,
+        control_admission.block_size);
+    EXPECT_EQ(rows.last_harvest_admission.fingerprint_key,
+        control_admission.fingerprint_key);
+    // Events' prefix fields match the control (counters identical).
+    ASSERT_EQ(events.size(), control_events.size());
+    for (std::size_t i = 0; i < events.size(); ++i)
+    {
+        EXPECT_EQ(events[i].prefix_cache_enabled, control_events[i].prefix_cache_enabled);
+        EXPECT_EQ(events[i].cached_prompt_tokens, control_events[i].cached_prompt_tokens);
+        EXPECT_EQ(events[i].prefix_matched_blocks, control_events[i].prefix_matched_blocks);
+    }
 }
 
 /** @test P4 interleaving: A continues while B suspends and C enters the freed slot. */

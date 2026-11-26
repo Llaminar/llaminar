@@ -7,6 +7,7 @@
 #include "utils/PerfStatsCollector.h"
 
 #include <algorithm>
+#include <atomic>
 #include <random>
 
 namespace llaminar2
@@ -60,15 +61,12 @@ namespace llaminar2
         capacity_ = capacity;
         queue_capacity_ = queue_capacity;
         // D1: a FRESH, NON-ZERO nonce per incarnation — every begin() mints a
-        // unique session identity, so a manifest from a prior incarnation (or
-        // another session) can never restore here.
-        do
-        {
-            std::random_device entropy;
-            session_nonce_ = (static_cast<std::uint64_t>(entropy()) << 32) ^
-                             (static_cast<std::uint64_t>(entropy()) << 1) ^
-                             static_cast<std::uint64_t>(entropy());
-        } while (session_nonce_ == 0);
+        // unique session identity so a manifest from a prior incarnation (or
+        // another session) can never restore here. Deterministic and
+        // allocation-free: a process-wide atomic counter (never probable
+        // uniqueness, never throws, replay-stable).
+        static std::atomic<std::uint64_t> next_nonce{1};
+        session_nonce_ = next_nonce.fetch_add(1, std::memory_order_relaxed) + 1;
         active_ = true;
         return true;
     }
@@ -99,9 +97,13 @@ namespace llaminar2
                 return row.request.id == request.id;
             }) || std::any_of(queue_.begin(), queue_.end(), [&](const ServingBatchRequest &queued) {
                 return queued.id == request.id;
-            }))
+            }) || outstanding_suspensions_.contains(request.id))
         {
-            error = "Serving request id is already live: " + std::to_string(request.id);
+            // E1: a SUSPENDED request still owns its original id (S record); a
+            // re-submission of the same id would let the second suspension
+            // overwrite the first record and silently lose either one. Refuse
+            // until the outstanding continuation is restored or terminated.
+            error = "Serving request id is already live (or suspended): " + std::to_string(request.id);
             return ServingSubmissionOutcome::Refused;
         }
         // Bounded queue Q (design §4.1, exact-or-reject): beyond the admitted
