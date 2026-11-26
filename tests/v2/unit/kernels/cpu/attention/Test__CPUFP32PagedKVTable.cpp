@@ -19,7 +19,7 @@ TEST(CPUFP32PagedKVTable, MetadataGeometryAndPartialConstructionRollback)
     EXPECT_THROW(CPUFP32PagedKVTable::physicalBytes({}, device), std::invalid_argument);
     for (const size_t banks : {1u, 3u, 5u})
     {
-        const CPUFP32PagedKVTableGeometry geometry{3, banks, 2, 16};
+        const CPUFP32PagedKVTableGeometry geometry{3, banks, 2, 16, 64, 0};
         const auto bytes = CPUFP32PagedKVTable::physicalBytes(geometry, device);
         PhysicalMemoryPlanBuilder plan;
         plan.add({.world_rank=0, .device=device, .total_bytes=bytes, .admission_available_bytes=bytes},
@@ -38,7 +38,7 @@ TEST(CPUFP32PagedKVTable, PublishedBanksRetainOriginalNativeOperands)
     constexpr int dimension = 64;
     const auto device = DeviceId::cpu();
     const PhysicalPagePoolGeometry pool_geometry{3, 2 * 2 * dimension * sizeof(float), 3, 1};
-    const CPUFP32PagedKVTableGeometry table_geometry{1, 2, 2, 2};
+    const CPUFP32PagedKVTableGeometry table_geometry{1, 2, 2, 2, 64, 0};
     const auto bytes = PhysicalPagePool::physicalBytes(pool_geometry, device) +
         CPUFP32PagedKVTable::physicalBytes(table_geometry, device);
     PhysicalMemoryPlanBuilder plan;
@@ -129,7 +129,7 @@ TEST(CPUFP32PagedKVTable, VersionIssuanceStopsAndBurnedVersionsNeverRecycle)
     constexpr int dimension = 64;
     const auto device = DeviceId::cpu();
     const PhysicalPagePoolGeometry pool_geometry{2, 2 * 2 * dimension * sizeof(float), 3, 1};
-    const CPUFP32PagedKVTableGeometry table_geometry{1, 2, 2, 2};
+    const CPUFP32PagedKVTableGeometry table_geometry{1, 2, 2, 2, 64, 0};
     const auto bytes = PhysicalPagePool::physicalBytes(pool_geometry, device) +
         CPUFP32PagedKVTable::physicalBytes(table_geometry, device);
     PhysicalMemoryPlanBuilder plan;
@@ -169,4 +169,77 @@ TEST(CPUFP32PagedKVTable, VersionIssuanceStopsAndBurnedVersionsNeverRecycle)
     auto newest = fresh->commit();
     EXPECT_GT(newest.version(), 1u); // Burned version 2 is not reused.
     EXPECT_EQ(newest.version(), 3u); // 1 published, 2 burned, 3 issued now.
+}
+
+/** @test Finite issuance budget refuses normal admission before headroom; accepted work completes. */
+TEST(CPUFP32PagedKVTable, FiniteIssuanceBudgetExhaustionRefusesBeforeHeadroom)
+{
+    constexpr int dimension = 64;
+    const auto device = DeviceId::cpu();
+    // Four banks, but ONLY three issuances: bank exhaustion alone would permit
+    // four begins. Headroom 1 reserves the final issuance for accepted work.
+    const PhysicalPagePoolGeometry pool_geometry{4, 2 * 2 * dimension * sizeof(float), 4, 1};
+    const CPUFP32PagedKVTableGeometry table_geometry{1, 4, 2, 2, 3, 1};
+    const auto bytes = PhysicalPagePool::physicalBytes(pool_geometry, device) +
+        CPUFP32PagedKVTable::physicalBytes(table_geometry, device);
+    PhysicalMemoryPlanBuilder plan;
+    plan.add({.world_rank=0, .device=device, .total_bytes=bytes, .admission_available_bytes=bytes},
+        PhysicalMemoryOwner::KVCache, bytes);
+    auto authority = std::make_shared<PhysicalMemoryAuthority>(
+        std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()), 0);
+    auto pool = authority->createCPUPagePool(device, pool_geometry, CPUStoragePlacement::local());
+    auto table = CPUFP32PagedKVTable::create(authority, device, table_geometry);
+    const auto page = [&](float value) {
+        auto grant = pool->tryAdmit(1);
+        if (!grant) throw std::logic_error("Fixture page grant refused");
+        const auto frame = grant->assignFrame();
+        std::vector<float> input(2 * 2 * dimension, 0.0f);
+        std::fill_n(input.data() + dimension, dimension, value);
+        auto write = grant->prepareAppend(frame, input.size() * sizeof(float));
+        if (!write) throw std::logic_error("Fixture page write refused");
+        write->copyFrom(std::as_bytes(std::span(input)));
+        return CPUFP32KVPage(write->commit(), 1, dimension);
+    };
+    // Normal admission consumes budget-headroom = 2 issuances (versions 1,2).
+    auto first = table->tryBeginUpdate();
+    ASSERT_TRUE(first);
+    first->append(page(1.0f));
+    auto second = table->tryBeginUpdate();
+    ASSERT_TRUE(second);
+    second->append(page(2.0f));
+    // FINITE exhaustion: the third normal begin refuses although a bank is free.
+    EXPECT_FALSE(table->tryBeginUpdate());
+    EXPECT_EQ(table->normalAdmissionRemaining(), 0u);
+    EXPECT_FALSE(table->issuanceBudgetExhausted()); // Headroom remains for accepted work.
+    // Already-accepted work uses the reserved headroom and still completes.
+    auto accepted = table->tryBeginUpdateReserved();
+    ASSERT_TRUE(accepted);
+    accepted->append(page(3.0f));
+    EXPECT_TRUE(table->issuanceBudgetExhausted());
+    EXPECT_FALSE(table->tryBeginUpdateReserved()); // Absolute finite bound.
+    EXPECT_FALSE(table->tryBeginUpdate());
+    // Complete both published and accepted work; versions never recycle.
+    auto s1 = first->commit();
+    auto s2 = second->commit();
+    auto s3 = accepted->commit();
+    EXPECT_EQ(s1.version(), 1u);
+    EXPECT_EQ(s2.version(), 2u);
+    EXPECT_EQ(s3.version(), 3u);
+    // No normal admission remains after finite exhaustion; four free banks.
+    EXPECT_FALSE(table->tryBeginUpdate());
+    EXPECT_FALSE(table->issuanceBudgetExhausted() == false);
+}
+
+/** @test Headroom below budget is typed; equal/zero headroom is rejected before allocation. */
+TEST(CPUFP32PagedKVTable, IssuanceHeadroomValidationIsTyped)
+{
+    // Zero budget, or headroom >= budget, must never admit.
+    EXPECT_THROW(CPUFP32PagedKVTable::physicalBytes({1, 2, 2, 2, 0, 0}, DeviceId::cpu()),
+        std::invalid_argument);
+    EXPECT_THROW(CPUFP32PagedKVTable::physicalBytes({1, 2, 2, 2, 2, 2}, DeviceId::cpu()),
+        std::invalid_argument);
+    EXPECT_THROW(CPUFP32PagedKVTable::physicalBytes({1, 2, 2, 2, 2, 3}, DeviceId::cpu()),
+        std::invalid_argument);
+    // Budget strictly above headroom is legal.
+    EXPECT_GT(CPUFP32PagedKVTable::physicalBytes({1, 2, 2, 2, 5, 1}, DeviceId::cpu()), 0u);
 }

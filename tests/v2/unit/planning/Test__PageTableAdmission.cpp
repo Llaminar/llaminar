@@ -24,7 +24,7 @@ struct CombinedFixture
     {
         const auto device = DeviceId::cpu();
         const PhysicalPagePoolGeometry pool_geometry{frames, 64, 4, frames};
-        const CPUFP32PagedKVTableGeometry table_geometry{1, banks, 2, 1};
+        const CPUFP32PagedKVTableGeometry table_geometry{1, banks, 2, 1, 64, 0};
         const auto bytes = PhysicalPagePool::physicalBytes(pool_geometry, device) +
             CPUFP32PagedKVTable::physicalBytes(table_geometry, device);
         PhysicalMemoryPlanBuilder plan;

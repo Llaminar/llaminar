@@ -16,6 +16,8 @@ void CPUFP32PagedKVTableGeometry::validate() const
     if (bank_count > std::numeric_limits<size_t>::max() / page_capacity ||
         bank_count * page_capacity > std::numeric_limits<size_t>::max() / sizeof(CPUFP32KVPage))
         throw std::overflow_error("CPU page-table object storage overflows");
+    if (!issuance_budget || issuance_headroom >= issuance_budget)
+        throw std::invalid_argument("CPU page-table issuance budget must exceed its reserved headroom");
 }
 size_t CPUFP32PagedKVTable::physicalBytes(CPUFP32PagedKVTableGeometry geometry, DeviceId device, CPUStoragePlacement placement)
 {
@@ -65,14 +67,43 @@ void CPUFP32PagedKVTable::clear(size_t bank) noexcept
     state.accepting_readers = false;
     state.phase = Phase::Free;
 }
+namespace
+{
+/** @brief One preparable bank plus the exact issuance budget admission rule. */
+struct BeginCandidate
+{
+    size_t bank = 0;
+    internal::IssuanceAdmission admission;
+};
+}
+
 std::optional<CPUFP32PagedKVTable::Update> CPUFP32PagedKVTable::tryBeginUpdate()
 {
     for (size_t bank = 0; bank < banks_.size(); ++bank)
     {
         auto &state = banks_[bank];
         if (state.phase != Phase::Free) continue;
-        if (next_version_ == std::numeric_limits<std::uint64_t>::max())
-            throw std::overflow_error("CPU page-table publication generation exhausted");
+        // FINITE issuance admission, not bank exhaustion: normal updates never
+        // consume the reserved headroom reserved for accepted work.
+        if (next_version_ >= geometry_.issuance_budget - geometry_.issuance_headroom)
+            return std::nullopt;
+        auto self = shared_from_this();
+        state.version = ++next_version_;
+        state.phase = Phase::Preparing;
+        return Update(std::move(self), bank, state.version);
+    }
+    return std::nullopt;
+}
+
+std::optional<CPUFP32PagedKVTable::Update> CPUFP32PagedKVTable::tryBeginUpdateReserved()
+{
+    // The reserved headroom exists so accepted work can finish when ordinary
+    // admission is closed. It can never make the finite budget explicit.
+    for (size_t bank = 0; bank < banks_.size(); ++bank)
+    {
+        auto &state = banks_[bank];
+        if (state.phase != Phase::Free) continue;
+        if (next_version_ >= geometry_.issuance_budget) return std::nullopt;
         auto self = shared_from_this();
         state.version = ++next_version_;
         state.phase = Phase::Preparing;

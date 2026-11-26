@@ -140,7 +140,7 @@ TEST(PhysicalPagePoolSharing, SharedPrefixEntersOperationSnapshotAndPeersRemainI
     for (std::size_t i = 0; i < 8; ++i) fresh[i] = static_cast<std::byte>(0x50 + i);
     const auto device = DeviceId::cpu();
     const PhysicalPagePoolGeometry pool_geometry{3, 128, 3, 2};
-    const CPUFP32PagedKVTableGeometry table_geometry{2, 8, 2, 8};
+    const CPUFP32PagedKVTableGeometry table_geometry{2, 8, 2, 8, 64, 0};
     const auto bytes = PhysicalPagePool::physicalBytes(pool_geometry, device) +
         2 * CPUFP32PagedKVTable::physicalBytes(table_geometry, device);
     PhysicalMemoryPlanBuilder plan;

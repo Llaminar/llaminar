@@ -434,8 +434,11 @@ void replay(std::istream &input)
     {
         CPUFP32PagedKVTableGeometry parsed;
         std::string tag, state, codec;
+        // The v2 header records the admitted FINITE issuance budget and its
+        // reserved headroom; a legacy header without them is not compatible.
         if (!(geometry_line >> tag >> parsed.page_capacity >> parsed.bank_count >> parsed.readers_per_bank >>
-            parsed.page_tokens >> state >> codec) || tag != "table" || state != "empty-zero-versions" ||
+            parsed.page_tokens >> parsed.issuance_budget >> parsed.issuance_headroom >>
+            state >> codec) || tag != "table" || state != "empty-zero-versions" ||
             codec != "fp32-le" || std::endian::native != std::endian::little)
             throw std::invalid_argument("Incompatible native table initial state or byte order");
         parsed.validate();
@@ -621,8 +624,8 @@ TEST(PhysicalMemoryAuthority, PagePoolRecordedCombinedAdmissionReplayExactly)
     {
         std::ofstream output(record);
         ASSERT_TRUE(output.good());
-        output << "pma-private-pages-v2 2 64 3 2 empty-zero-generations table 1 2 2 1 empty-zero-versions fp32-le\n";
-        PrivatePageReplay runner({2, 64, 3, 2}, CPUFP32PagedKVTableGeometry{1, 2, 2, 1});
+        output << "pma-private-pages-v2 2 64 3 2 empty-zero-generations table 1 2 2 1 64 0 empty-zero-versions fp32-le\n";
+        PrivatePageReplay runner({2, 64, 3, 2}, CPUFP32PagedKVTableGeometry{1, 2, 2, 1, 8, 0});
         for (const std::string command : {"combined one 1", "combined two 1", "combined three 1",
             "combined-abort one", "combined-abort two", "combined three 1",
             "combined-abort three", "end"})
@@ -661,8 +664,8 @@ TEST(PhysicalMemoryAuthority, PagePoolRecordedTableBanksReplayExactly)
     {
         std::ofstream output(record);
         ASSERT_TRUE(output.good());
-        output << "pma-private-pages-v2 3 128 4 3 empty-zero-generations table 1 2 2 2 empty-zero-versions fp32-le\n";
-        PrivatePageReplay runner({3, 128, 4, 3}, CPUFP32PagedKVTableGeometry{1, 2, 2, 2});
+        output << "pma-private-pages-v2 3 128 4 3 empty-zero-generations table 1 2 2 2 64 0 empty-zero-versions fp32-le\n";
+        PrivatePageReplay runner({3, 128, 4, 3}, CPUFP32PagedKVTableGeometry{1, 2, 2, 2, 8, 0});
         for (const std::string command : {"admit A 2", "assign A", "plan W A 0 32",
             "copy W 0000803f00000040000030410000404100004040000080400000504100006041", "commit W P",
             "table-begin U", "table-append U P 1 2", "table-commit U S", "table-borrow B S",
@@ -725,8 +728,8 @@ TEST(PhysicalMemoryAuthority, PagePoolRecordedPrefixAttachReplayExactly)
     {
         std::ofstream output(record);
         ASSERT_TRUE(output.good());
-        output << "pma-private-pages-v2 3 128 4 3 empty-zero-generations table 2 3 3 4 empty-zero-versions fp32-le\n";
-        PrivatePageReplay runner({3, 128, 4, 3}, CPUFP32PagedKVTableGeometry{2, 3, 3, 4});
+        output << "pma-private-pages-v2 3 128 4 3 empty-zero-generations table 2 3 3 4 64 0 empty-zero-versions fp32-le\n";
+        PrivatePageReplay runner({3, 128, 4, 3}, CPUFP32PagedKVTableGeometry{2, 3, 3, 4, 8, 0});
         // Build an authenticated archive from a real page and record its hex.
         std::vector<float> rows(8 * 2 * 1 * 8, 0.5f);
         auto grant = runner.temporaryRecordingGrant(1);

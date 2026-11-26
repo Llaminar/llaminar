@@ -34,7 +34,7 @@ struct RunnerFixture
         const PhysicalPagePoolGeometry pool_geometry{static_cast<size_t>(max_pages),
             frame_bytes, 2, static_cast<size_t>(max_pages)};
         const CPUFP32PagedKVTableGeometry table_geometry{
-            static_cast<size_t>(max_pages), 4, 4, page_tokens};
+            static_cast<size_t>(max_pages), 4, 4, page_tokens, 64, 0};
         const auto bytes = PhysicalPagePool::physicalBytes(pool_geometry, device) +
             CPUFP32PagedKVTable::physicalBytes(table_geometry, device);
         PhysicalMemoryPlanBuilder plan;

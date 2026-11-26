@@ -25,7 +25,7 @@ struct ArchiveFixture
     {
         const auto device = DeviceId::cpu();
         const PhysicalPagePoolGeometry pool_geometry{3, 4 * 2 * 64 * sizeof(float), 3, 2};
-        const CPUFP32PagedKVTableGeometry table_geometry{1, 3, 3, 8};
+        const CPUFP32PagedKVTableGeometry table_geometry{1, 3, 3, 8, 64, 0};
         const auto bytes = PhysicalPagePool::physicalBytes(pool_geometry, device) +
             CPUFP32PagedKVTable::physicalBytes(table_geometry, device);
         PhysicalMemoryPlanBuilder plan;

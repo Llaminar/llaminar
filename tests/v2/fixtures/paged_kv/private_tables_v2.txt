@@ -1,4 +1,4 @@
-pma-private-pages-v2 3 128 4 3 empty-zero-generations table 1 2 2 2 empty-zero-versions fp32-le
+pma-private-pages-v2 3 128 4 3 empty-zero-generations table 1 2 2 2 64 0 empty-zero-versions fp32-le
 admit A 2 | accepted
 assign A | 0:1
 plan W A 0 32 | ready

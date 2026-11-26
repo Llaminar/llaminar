@@ -17,6 +17,39 @@
 
 namespace llaminar2
 {
+namespace internal
+{
+    /**
+     * @brief Finite nonce issuance admission: budget minus reserved headroom.
+     *
+     * plan P1: finite grants never sum independent maxima. A prepared update
+     * monopolizes one issuance that stays burned through abort; normal
+     * admission refuses before the reserved headroom can be consumed so
+     * already-accepted work always completes. Reserved issuance (accepted
+     * work draining) may consume the remaining headroom but never the next
+     * normal update's protection, and no version is ever recycled.
+     */
+    struct IssuanceAdmission
+    {
+    public:
+        explicit IssuanceAdmission(std::uint64_t budget, std::uint64_t headroom)
+            : budget_(budget), headroom_(headroom)
+        {
+            if (!budget_ || headroom_ >= budget_) throw std::invalid_argument("Issuance budget must exceed its headroom");
+            normal_cap_ = budget_ - headroom_;
+        }
+        /** @return Whether one ordinary begin is allowed. */
+        bool allowsNormal(std::uint64_t issued) const noexcept { return issued < normal_cap_; }
+        /** @return Whether one reserved begin (accepted work) is allowed. */
+        bool allowsReserved(std::uint64_t issued) const noexcept { return issued < budget_; }
+        std::uint64_t budget() const noexcept { return budget_; }
+    private:
+        std::uint64_t budget_ = 0;
+        std::uint64_t headroom_ = 0;
+        std::uint64_t normal_cap_ = 0;
+    };
+}
+
 /** @brief Explicit admitted table metadata and concurrent snapshot envelope. */
 struct CPUFP32PagedKVTableGeometry
 {
@@ -24,6 +57,10 @@ struct CPUFP32PagedKVTableGeometry
     size_t bank_count = 0;
     size_t readers_per_bank = 0;
     int page_tokens = 0;
+    /** @brief Finite nonce issuance budget (metadata). Zero or headroom>=budget is invalid. */
+    std::uint64_t issuance_budget = 0;
+    /** @brief Reserved issuance for already-accepted work/aborts/drain; must be < budget. */
+    std::uint64_t issuance_headroom = 0;
     /** @brief Reject empty, overflowing or unrepresentable metadata geometry before allocation. */
     void validate() const;
 };
@@ -105,6 +142,30 @@ public:
     ~CPUFP32PagedKVTable();
     /** @brief Reserve an unused metadata bank, or defer without changing any published bank. */
     std::optional<Update> tryBeginUpdate();
+    /**
+     * @brief Begin under the reserved headroom for already-accepted work.
+     *
+     * The ordinary admission cap is budget minus headroom; an accepted update
+     * that still needs to complete may consume the reserved headroom even
+     * when normal admission has stopped. It still never exceeds the finite
+     * budget and never exhausts it below a nonnegative remainder.
+     */
+    std::optional<Update> tryBeginUpdateReserved();
+    /** @return Finite admitted issuance budget (never an independent maximum). */
+    std::uint64_t issuanceBudget() const noexcept { return geometry_.issuance_budget; }
+    /** @return Total issued versions, burned and live, monotonic across banks. */
+    std::uint64_t issuedVersions() const noexcept { return next_version_; }
+    /** @return Remaining normal-admission capacity (budget minus headroom minus issued). */
+    std::uint64_t normalAdmissionRemaining() const noexcept
+    {
+        const auto cap = geometry_.issuance_budget - geometry_.issuance_headroom;
+        return next_version_ >= cap ? 0 : cap - next_version_;
+    }
+    /** @return FINITE version exhaustion state: normal admission closed. */
+    bool issuanceBudgetExhausted() const noexcept
+    {
+        return next_version_ >= geometry_.issuance_budget;
+    }
     /** @brief Freeze new borrows of an exact published version before joining its existing readers. */
     void closeBorrowers(const Snapshot &snapshot);
     /** @return Original PMA instance identity for same-authority admission checks. */
