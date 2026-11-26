@@ -22,4 +22,5 @@ inline constexpr const char *privatePagePrefixTrace = R"PMA_TRACE(@PMA_PREFIX_TR
 inline constexpr const char *privatePageReservationTrace = R"PMA_TRACE(@PMA_RESERVATION_TRACE@)PMA_TRACE";
 inline constexpr const char *privatePageEffectiveUseTrace = R"PMA_TRACE(@PMA_EFFECTIVE_USE_TRACE@)PMA_TRACE";
 inline constexpr const char *privatePageEndToEndTrace = R"PMA_TRACE(@PMA_END_TO_END_TRACE@)PMA_TRACE";
+inline constexpr const char *pooledAppendDecodeTrace = R"PMA_TRACE(@POOLED_APPEND_DECODE_TRACE@)PMA_TRACE";
 }

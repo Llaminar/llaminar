@@ -18,6 +18,7 @@
  */
 #include "PooledKVAppendStage.h"
 #include "utils/Assertions.h"
+#include "utils/PerfStatsCollector.h"
 #include "kernels/kvcache/KVStorageLayout.h"
 #include <cstring>
 
@@ -212,6 +213,27 @@ bool PooledKVAppendStage::execute(IDeviceContext *ctx)
         }
         tail_write->copySource();
         writePageRows(*tail_write, k, v, 0, tail_rows, geometry);
+        // R25 economy: the private COW tail copies the prior last page bytes
+        // plus the fresh rows. Record the exact bytes copied per token so the
+        // copy cost is measurable (maxim 21/26) instead of silent. The design
+        // calls for an in-place private tail when the tail is exclusively
+        // owned and its readers retired; the current P2 caller shares every
+        // committed page immediately, so the COW copy is the production path
+        // until an exclusively-owned tail frame is implemented.
+        PerfStatsCollector::addCounter(
+            "pooled_kv_decode", "cow_tail_bytes_per_step",
+            static_cast<double>(prior_last.storage().size()) +
+                static_cast<double>(tail_rows) * geometry.row_stride,
+            "decode", params_.device_id.toString(),
+            {{"layer", std::to_string(params_.layer_idx)},
+             {"rows", std::to_string(rows)}});
+        PerfStatsCollector::addCounter(
+            "pooled_kv_decode", "cow_tail_bytes_per_token",
+            (static_cast<double>(prior_last.storage().size()) +
+                static_cast<double>(tail_rows) * geometry.row_stride) /
+                static_cast<double>(rows),
+            "decode", params_.device_id.toString(),
+            {{"layer", std::to_string(params_.layer_idx)}});
         auto committed = tail_write->commit();
         auto shared = committed.share();
         update->appendShared(std::move(shared), params_.kv_heads, params_.head_dim);

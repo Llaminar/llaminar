@@ -8933,6 +8933,7 @@ add_executable(v2_test_cpu_flash_attention_kernel_t
     unit/kernels/cpu/attention/Test__CPUFlashAttentionPagedReplay.cpp
     unit/kernels/cpu/attention/Test__CPUFlashAttentionPagedRunner.cpp
     unit/kernels/cpu/attention/Test__CPUFP32PagedKVTable.cpp
+    unit/kernels/cpu/attention/Test__PooledAppendReplay.cpp
     unit/kernels/cpu/attention/Test__CPUFP32PagedKVAppend.cpp
     unit/kernels/cpu/attention/Test__PagedKVArchive.cpp
     unit/kernels/cpu/attention/Test__EffectiveUseOrdering.cpp)
@@ -30586,7 +30587,8 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     "${PMA_TRACE_ROOT}/private_sharing_v1.txt"
     "${PMA_TRACE_ROOT}/private_witness_v1.txt"
     "${PMA_TRACE_ROOT}/private_combined_v1.txt"
-    "${PMA_TRACE_ROOT}/private_prefix_v1.txt")
+    "${PMA_TRACE_ROOT}/private_prefix_v1.txt"
+    "${PMA_TRACE_ROOT}/pooled_append_decode_v1.txt")
 file(READ "${PMA_TRACE_ROOT}/private_ownership_v1.txt" PMA_OWNERSHIP_TRACE)
 file(READ "${PMA_TRACE_ROOT}/private_append_v1.txt" PMA_APPEND_TRACE)
 file(READ "${PMA_TRACE_ROOT}/private_readers_v1.txt" PMA_READER_TRACE)
@@ -30600,6 +30602,7 @@ file(READ "${PMA_TRACE_ROOT}/private_prefix_v1.txt" PMA_PREFIX_TRACE)
 file(READ "${PMA_TRACE_ROOT}/private_reservation_v1.txt" PMA_RESERVATION_TRACE)
 file(READ "${PMA_TRACE_ROOT}/private_effective_use_v1.txt" PMA_EFFECTIVE_USE_TRACE)
 file(READ "${PMA_TRACE_ROOT}/private_end_to_end_v1.txt" PMA_END_TO_END_TRACE)
+file(READ "${PMA_TRACE_ROOT}/pooled_append_decode_v1.txt" POOLED_APPEND_DECODE_TRACE)
 configure_file("${PMA_TRACE_ROOT}/PhysicalPagePoolTraceData.h.in"
     "${CMAKE_CURRENT_BINARY_DIR}/PhysicalPagePoolTraceData.h" @ONLY)
 target_include_directories(v2_test_physical_memory_authority PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
