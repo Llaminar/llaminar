@@ -11,7 +11,8 @@ bool ServingContinuationManifest::capture(std::uint64_t request_id, int slot,
     int completion_tokens, int32_t last_token, bool needs_feed, bool has_logits,
     int grant, const std::vector<int32_t> &forced, bool cancelled,
     int cached_prompt_tokens, const std::vector<int32_t> &sampler_history,
-    const std::vector<std::byte> &kv_payload, std::string *error)
+    const std::vector<std::byte> &kv_payload, const Sampler::State *sampler_state,
+    std::string *error)
 {
     if (request_id == 0 || slot < 0 || cached_tokens < 0 || completion_tokens < 0 ||
         (cached_tokens == 0 && (prompt_consumed != 0 || last_token != 0)))
@@ -48,6 +49,8 @@ bool ServingContinuationManifest::capture(std::uint64_t request_id, int slot,
     content_.sampler_prompt.clear();
     content_.sampler_decisions = sampler_history;
     content_.kv_payload = kv_payload;
+    if (sampler_state)
+        content_.sampler_state = *sampler_state; // Exact RNG/penalty/DRY state.
     captured_ = true;
     return true;
 }
@@ -55,13 +58,11 @@ bool ServingContinuationManifest::capture(std::uint64_t request_id, int slot,
 Sampler ServingContinuationManifest::restoreSampler() const
 {
     Sampler sampler(content_.sampling.seed);
-    // Replay the EXACT captured history through the same penalty/RNG path
-    // (no reseed, no invented tokens). Greedy laws advance no RNG, so an
-    // empty history is the exact greedy state.
-    for (const int32_t token : content_.sampler_prompt)
-        sampler.record_prompt_token(token);
-    for (const int32_t token : content_.sampler_decisions)
-        sampler.record_prompt_token(token);
+    // RESTORE THE EXACT TYPED STATE: the original RNG position, generated
+    // token counts and DRY history are imported verbatim. Token replay cannot
+    // reproduce the RNG position or the DRY ring contents (record_prompt_token
+    // only inserts a zero count); the state is the only faithful continuation.
+    sampler.importState(content_.sampler_state);
     return sampler;
 }
 

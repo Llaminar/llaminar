@@ -9,6 +9,7 @@
 #include "kernels/cpu/sampling/CPUSamplerPrimitives.h"
 #include "kernels/common/SamplingMath.h"
 #include <limits>
+#include <sstream>
 #include <stdexcept>
 
 namespace llaminar2
@@ -30,6 +31,39 @@ namespace llaminar2
         {
             rng_.seed(seed);
         }
+    }
+
+    Sampler::State Sampler::exportState() const
+    {
+        State state;
+        // Serialize the exact std::mt19937 engine words (state AND position)
+        // verbatim; restoring through operator>> reproduces the exact draw
+        // position, including any partially-consumed stream.
+        std::stringstream stream;
+        stream << rng_;
+        std::uint32_t word;
+        while (stream >> word)
+            state.engine_words.push_back(word);
+        state.token_counts.reserve(token_counts_.size());
+        for (const auto &[token, count] : token_counts_)
+            state.token_counts.emplace_back(token, count);
+        state.dry_history = dry_token_history_;
+        state.dry_capacity = dry_history_capacity_;
+        return state;
+    }
+
+    void Sampler::importState(const State &state)
+    {
+        // Deserialize the exact engine words back into rng_.
+        std::stringstream stream;
+        for (const std::uint32_t word : state.engine_words)
+            stream << word << ' ';
+        stream >> rng_;
+        token_counts_.clear();
+        for (const auto &[token, count] : state.token_counts)
+            token_counts_[token] = count;
+        dry_token_history_ = state.dry_history;
+        dry_history_capacity_ = state.dry_capacity;
     }
 
     int Sampler::sample(const std::vector<float> &logits, const SamplingParams &params)

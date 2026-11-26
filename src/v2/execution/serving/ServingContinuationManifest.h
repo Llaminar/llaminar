@@ -51,6 +51,11 @@ public:
         // restore regenerates the exact RNG position (never reseeds).
         std::vector<int32_t> sampler_prompt;   ///< Prompt tokens recorded.
         std::vector<int32_t> sampler_decisions; ///< Every committed decision.
+        // EXACT typed sampler state (RNG position + penalty counts + DRY
+        // history). This is the ONLY faithful restoration of a stochastic
+        // continuation: a seeded re-construction plus token replay does NOT
+        // reproduce the RNG position, generated counts or DRY history.
+        Sampler::State sampler_state;
         // ACTUAL executor KV/auxiliary continuation (plan P4: host metadata
         // alone is not a continuation). Empty means the executor could not
         // export its slot state and suspension was refused.
@@ -64,6 +69,7 @@ public:
         const std::vector<int32_t> &forced, bool cancelled, int cached_prompt_tokens,
         const std::vector<int32_t> &sampler_history = {},
         const std::vector<std::byte> &kv_payload = {},
+        const Sampler::State *sampler_state = nullptr,
         std::string *error = nullptr);
 
     /** @brief Validate the manifest is complete and internally consistent. */
@@ -77,14 +83,13 @@ public:
     explicit operator bool() const noexcept { return captured_; }
 
     /**
-     * @brief Restore a sampler from the manifest (no reseed) and replay the
-     *        complete captured history so the next RNG state is exact.
+     * @brief Restore a sampler from the manifest's EXACT typed state.
      *
-     * The sampler is constructed from the ORIGINAL seed, then every captured
-     * history token is replayed through the same penalty/RNG path. Greedy
-     * laws need no history (decision 0 continues). This is the restore-side
-     * contract: a continuation is only restorable when replay yields the exact
-     * same RNG state as the no-movement control.
+     * The original RNG position, generated token counts and DRY history are
+     * restored verbatim — never reseeded, never replayed from tokens (token
+     * replay cannot reproduce the RNG position or the DRY ring contents).
+     * The next stochastic decision is therefore identical to an uninterrupted
+     * control.
      */
     Sampler restoreSampler() const;
 

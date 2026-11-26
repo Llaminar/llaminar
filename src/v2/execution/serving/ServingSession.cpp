@@ -597,11 +597,12 @@ namespace llaminar2
         // Capture the complete continuation including the exact RNG history.
         ServingContinuationManifest manifest;
         std::vector<int32_t> forced(row.forced.begin(), row.forced.end());
+        row.sampler_state = row.sampler.exportState(); // Exact state for the manifest.
         if (!manifest.capture(row.request.id, row.slot, row.request.sampling,
                 row.prompt_consumed, row.cached_tokens, row.completion_tokens,
                 row.last_token, row.needs_feed, row.has_logits, row.grant,
                 forced, row.cancelled, row.cached_prompt_tokens,
-                row.sampler_decisions, *kv, &error))
+                row.sampler_decisions, *kv, &row.sampler_state, &error))
             return std::nullopt;
         // The ORIGINAL request policy (prompt tokens and output budget) is part
         // of the continuation: restore must never invent a cap or lose prefill.
@@ -680,6 +681,7 @@ namespace llaminar2
         row.request.max_new_tokens = content.max_new_tokens;
         row.slot = content.slot;
         row.sampler = manifest.restoreSampler();
+        row.sampler_state = content.sampler_state;
         row.prompt_consumed = content.prompt_consumed;
         row.cached_tokens = content.cached_tokens;
         row.completion_tokens = content.completion_tokens;

@@ -263,6 +263,7 @@ namespace llaminar2
             int cached_prompt_tokens = 0;    ///< Prompt tokens restored from the prefix cache.
             PrefixLookupResult prefix_admission; ///< Immutable identity for the prompt harvest.
             std::vector<int32_t> sampler_decisions; ///< Every committed decision (RNG history).
+            Sampler::State sampler_state;           ///< Exact RNG/penalty/DRY state (P4).
         };
 
         /** @brief Fail all resident and queued requests, seal, and return @p events. */
