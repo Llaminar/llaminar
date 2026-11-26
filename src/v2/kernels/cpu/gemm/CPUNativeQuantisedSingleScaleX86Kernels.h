@@ -345,8 +345,11 @@ namespace llaminar2::cpu::native_quantised::multi_scale::x86
                     for (int strip = 0; strip < strips; ++strip)
                         acc[row][strip] = Tree == Reduction::Contiguous && accumulate
                             ? load<F>(output[row] + pass + strip * Lanes) : F{};
-                const int first = Tree == Reduction::OrderedPartitions ? static_cast<int>(std::min<std::int64_t>(std::int64_t(begin) + std::int64_t(partition) * blocks_per_partition, end)) : begin;
-                const int last = Tree == Reduction::OrderedPartitions ? static_cast<int>(std::min<std::int64_t>(std::int64_t(first) + blocks_per_partition, end)) : end;
+                const auto interval = Tree == Reduction::OrderedPartitions
+                    ? orderedPartitionInterval(begin, end, partition, blocks_per_partition)
+                    : OrderedPartitionInterval{begin, end};
+                const int first = interval.first;
+                const int last = interval.last;
                 for (int kb = first; kb < last;)
                 {
                     // One superblock (or its ragged/partial intersection) at a time:
@@ -500,8 +503,11 @@ namespace llaminar2::cpu::native_quantised::multi_scale::x86
                     for (int strip = 0; strip < strips; ++strip)
                         acc[row][strip] = Tree == Reduction::Contiguous && accumulate
                             ? load<F>(output[row] + pass + strip * 16) : F{};
-                const int first = Tree == Reduction::OrderedPartitions ? static_cast<int>(std::min<std::int64_t>(std::int64_t(begin) + std::int64_t(partition) * blocks_per_partition, end)) : begin;
-                const int last = Tree == Reduction::OrderedPartitions ? static_cast<int>(std::min<std::int64_t>(std::int64_t(first) + blocks_per_partition, end)) : end;
+                const auto interval = Tree == Reduction::OrderedPartitions
+                    ? orderedPartitionInterval(begin, end, partition, blocks_per_partition)
+                    : OrderedPartitionInterval{begin, end};
+                const int first = interval.first;
+                const int last = interval.last;
                 for (int kb = first; kb < last;)
                 {
                     const int superblock_end = std::min(last, static_cast<int>(geometry.superblockEnd(kb)));

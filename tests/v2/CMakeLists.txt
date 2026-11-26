@@ -45160,7 +45160,7 @@ target_include_directories(v2_unit_native_superblock_walk_contract PRIVATE ${CMA
 target_link_libraries(v2_unit_native_superblock_walk_contract PRIVATE GTest::gtest_main)
 add_v2_test(V2_Unit_NativeSuperblockWalkContract
     COMMAND $<TARGET_FILE:v2_unit_native_superblock_walk_contract>
-    LABELS "V2;Unit;GEMM;Regression" NO_MPI NO_MODELS TIMEOUT 30)
+    LABELS "V2;Unit;CPU;DeviceFree;GEMM;Regression" NO_MPI NO_MODELS TIMEOUT 30)
 add_v2_test(V2_Integration_NativeSuperblockWalkContract
     COMMAND $<TARGET_FILE:v2_unit_native_superblock_walk_contract>
-    LABELS "V2;Integration;ProductionTestPreflight;GEMM;Regression" NO_MPI NO_MODELS TIMEOUT 30)
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;GEMM;Regression" NO_MPI NO_MODELS TIMEOUT 30)
