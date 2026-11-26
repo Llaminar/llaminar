@@ -21,6 +21,49 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "scripts/ci"))
 from mpi_session_retirement import require_retired
 
 
+def publish_child_logs(root: Path, stream=sys.stderr) -> None:
+    """Publish bounded owned logs without following directory or file symlinks.
+
+    Each file contributes at most 8 KiB (head and tail); the complete publication
+    is capped at 128 KiB across at most 64 files. File-relative opens bind the
+    inspected directory, and O_NOFOLLOW rejects substituted file symlinks.
+    """
+    remaining, count, observed = 128 * 1024, 0, 0
+    for directory, dirs, files, descriptor in os.fwalk(root, follow_symlinks=False):
+        dirs.sort()
+        if "output.log" not in files:
+            continue
+        observed += 1
+        if count >= 64 or remaining <= 0:
+            continue
+        label = Path(directory).relative_to(root) / "output.log"
+        try:
+            fd = os.open("output.log", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                         dir_fd=descriptor)
+            with os.fdopen(fd, "rb") as log:
+                info = os.fstat(log.fileno())
+                import stat
+                if not stat.S_ISREG(info.st_mode):
+                    print(f"MPI child log rejected non-regular file: {label}", file=stream)
+                    continue
+                budget = min(8192, remaining)
+                head = log.read((budget + 1) // 2)
+                log.seek(max(len(head), info.st_size - budget // 2))
+                tail = log.read(budget // 2)
+            remaining -= len(head) + len(tail)
+            count += 1
+            print(f"--- MPI child output: {label} bytes={info.st_size} published={len(head)+len(tail)} ---", file=stream)
+            print(head.decode(errors="replace"), file=stream)
+            if info.st_size > len(head) + len(tail):
+                print("[MPI child log middle truncated]", file=stream)
+            print(tail.decode(errors="replace"), file=stream)
+        except OSError as error:
+            print(f"MPI child log unavailable: {label}: {error}", file=stream)
+    print(f"MPI child logs: observed={observed} published={count} payload_bytes={128*1024-remaining} omitted={observed-count}", file=stream)
+    if not observed:
+        print("MPI child logs missing: no owned output.log found", file=stream)
+
+
 def _wait(predicate, description: str, seconds: float = 15.0):
     """Bound a test observation; inference has no artificial response deadline."""
     deadline = time.monotonic() + seconds
@@ -639,12 +682,7 @@ def main() -> None:
             # The CI container is ephemeral. Publish each owned child log into
             # CTest's retained output before its private evidence root disappears.
             # Never scan another session's files or infer native retirement here.
-            for log in sorted(root.rglob("output.log")):
-                print(f"--- MPI child output: {log.relative_to(root)} ---", file=sys.stderr)
-                try:
-                    print(log.read_text(errors="replace"), file=sys.stderr)
-                except OSError as error:
-                    print(f"Unable to read owned child log: {error}", file=sys.stderr)
+            publish_child_logs(root)
             print(f"MPI lifetime evidence retained at {root}", file=sys.stderr)
 
 
