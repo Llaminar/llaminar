@@ -31,6 +31,7 @@ namespace
 class PrivatePageReplay
 {
 public:
+    ~PrivatePageReplay() { dischargeTouches(); }
     /** @brief Recording-only temporary grant for generating prefix-attach traces. */
     PhysicalPagePool::Grant temporaryRecordingGrant(size_t pages) { return *pool_->tryAdmit(pages); }
     /** @brief Bind the trace's exact empty initial pool through the production factory. */
@@ -314,6 +315,13 @@ public:
             outcome = lease.acknowledge() ? "acked" : "refused";
             touches_.erase(name);
         }
+        else if (kind == "table-use-abandon")
+        {
+            if (!(input >> name) || !touches_.contains(name)) fail();
+            auto &lease = touches_.at(name);
+            outcome = lease.abandon() ? "abandoned" : "refused";
+            touches_.erase(name);
+        }
         else if (kind == "table-use-may-evict")
         {
             size_t incarnation;
@@ -506,6 +514,22 @@ private:
     std::map<std::string, CPUFP32PagedKVTable::Update> updates_;
     std::map<std::string, CPUFP32PagedKVTable::Snapshot> snapshots_;
     std::map<std::string, EffectiveUseLease> touches_;
+    /**
+     * @brief Test-harness discharge on teardown.
+     *
+     * The runner is a test harness; a corrupted/rejected trace may leave an
+     * outstanding lease when the replay throws mid-command. Production
+     * callers must acknowledge or abandon explicitly (the lease itself
+     * terminates on silent loss), but the harness relinquishes outstanding
+     * obligations so teardown of a failing replay is well-defined.
+     */
+    void dischargeTouches() noexcept
+    {
+        for (auto &[name, lease] : touches_)
+            if (!lease.acknowledged())
+                (void)lease.abandon();
+        touches_.clear();
+    }
     std::map<std::string, CPUFP32PagedKVTable::IssuanceReservation> reservations_;
     std::map<std::string, PhysicalPagePool::SharedPage> shareds_;
     std::map<std::string, PhysicalPagePool::SharedPage> adopted_;
@@ -913,10 +937,13 @@ TEST(PhysicalMemoryAuthority, PagePoolRecordedEffectiveUseLifecycleReplayExactly
             // then releases.
             "table-use-ack S", "table-use-may-evict T 1",
             "table-use-ack B", "table-use-may-evict T 1",
-            // Post-retirement release: ack after drop of the publication still
-            // releases its lease (no orphaned obligation).
+            // Post-retirement release: the lease survives its publication's
+            // drop and acknowledges (no orphaned obligation).
             "table-touch S", "table-drop S", "table-use-ack S",
             "table-use-may-evict T 1",
+            // Explicit abandonment (R12): a live lease relinquished by its
+            // consumer discharges the obligation without fabricating an ack.
+            "table-touch B", "table-use-abandon B", "table-use-may-evict T 1",
             "table-drop B", "table-drop-reserved R", "end"};
         for (const std::string &command : commands)
             output << command << " | " << runner.execute(command) << '\n';

@@ -14,6 +14,12 @@
 using namespace llaminar2;
 namespace
 {
+/** @brief Minimal nonempty executor KV payload for manifest capture. */
+std::vector<std::byte> kvPayload()
+{
+    return {std::byte{1}, std::byte{2}, std::byte{3}};
+}
+
 SamplingParams seededLaw()
 {
     SamplingParams law;
@@ -35,7 +41,7 @@ TEST(ServingContinuationManifest, CompleteContinuationIsValid)
         /*completion_tokens=*/3, /*last_token=*/9, /*needs_feed=*/true,
         /*has_logits=*/false, /*grant=*/5, std::vector<int32_t>{21, 22},
         /*cancelled=*/false, /*cached_prompt_tokens=*/6,
-        std::vector<int32_t>{31, 32, 33}, &error)) << error;
+        std::vector<int32_t>{31, 32, 33}, kvPayload(), &error)) << error;
     ASSERT_TRUE(manifest.valid(&error)) << error;
     const auto &c = manifest.content();
     EXPECT_EQ(c.request_id, 7u);
@@ -59,7 +65,7 @@ TEST(ServingContinuationManifest, GreedyContinuationNeedsNoRngHistory)
     ASSERT_TRUE(manifest.capture(1, 0, greedy, 4, /*cached_tokens=*/10,
         /*completion_tokens=*/2, /*last_token=*/5, /*needs_feed=*/false,
         /*has_logits=*/true, /*grant=*/0, {}, /*cancelled=*/false,
-        /*cached_prompt_tokens=*/0, {}, &error)) << error;
+        /*cached_prompt_tokens=*/0, {}, kvPayload(), &error)) << error;
     EXPECT_TRUE(manifest.valid(&error)) << error;
 }
 
@@ -72,7 +78,7 @@ TEST(ServingContinuationManifest, RngHistoryMustMatchDecisions)
     ASSERT_TRUE(manifest.capture(2, 1, law, 0, /*cached_tokens=*/4,
         /*completion_tokens=*/2, /*last_token=*/3, /*needs_feed=*/false,
         /*has_logits=*/true, /*grant=*/0, {}, /*cancelled=*/false,
-        /*cached_prompt_tokens=*/0, {}, &error)) << error;
+        /*cached_prompt_tokens=*/0, {}, kvPayload(), &error)) << error;
     // Two decisions but an empty RNG history: refused (no invented history).
     EXPECT_FALSE(manifest.valid(&error));
     EXPECT_NE(error.find("history"), std::string::npos) << error;
@@ -87,7 +93,7 @@ TEST(ServingContinuationManifest, ProgressWithoutKvBackingRefuses)
     EXPECT_FALSE(manifest.capture(3, 0, law, 0, /*cached_tokens=*/0,
         /*completion_tokens=*/1, /*last_token=*/4, /*needs_feed=*/false,
         /*has_logits=*/false, /*grant=*/0, {}, /*cancelled=*/false,
-        /*cached_prompt_tokens=*/0, {}, &error));
+        /*cached_prompt_tokens=*/0, {}, {}, &error));
     EXPECT_FALSE(error.empty());
     EXPECT_FALSE(manifest.valid(&error));
 }
@@ -116,7 +122,7 @@ TEST(ServingContinuationManifest, RestoreProducesIdenticalNextDecision)
         /*completion_tokens=*/3, /*last_token=*/103, /*needs_feed=*/false,
         /*has_logits=*/true, /*grant=*/0, {}, /*cancelled=*/false,
         /*cached_prompt_tokens=*/0,
-        std::vector<int32_t>{100, 101, 102}, &error)) << error;
+        std::vector<int32_t>{100, 101, 102}, kvPayload(), &error)) << error;
     auto restored = manifest.restoreSampler();
     // A fixed logits vector; with deterministic (temperature 0) sampling the
     // penalty map is the only variable, so a restored sampler with the same
@@ -128,4 +134,17 @@ TEST(ServingContinuationManifest, RestoreProducesIdenticalNextDecision)
     // Both samplers carry the same history; the penalty map is identical, so
     // the next decision is identical (no reseed, no history loss).
     EXPECT_EQ(restored.sample(logits, greedy), control.sample(logits, greedy));
+}
+
+/** @test A manifest without the executor KV payload is refused (nothing to restore). */
+TEST(ServingContinuationManifest, MissingKvPayloadRefuses)
+{
+    ServingContinuationManifest manifest;
+    std::string error;
+    SamplingParams law = seededLaw();
+    EXPECT_FALSE(manifest.capture(5, 0, law, 0, /*cached_tokens=*/4,
+        /*completion_tokens=*/1, /*last_token=*/3, /*needs_feed=*/false,
+        /*has_logits=*/true, /*grant=*/0, {}, /*cancelled=*/false,
+        /*cached_prompt_tokens=*/0, {}, {}, &error));
+    EXPECT_NE(error.find("KV"), std::string::npos) << error;
 }

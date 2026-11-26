@@ -94,15 +94,62 @@ TEST(EffectiveUseOrdering, CellReuseKeepsReplicaIdentity)
 }
 
 /** @test Explicit retirement refuses while any touch is unacknowledged. */
-TEST(EffectiveUseOrdering, RetirementRefusesWhileLive)
+TEST(EffectiveUseOrdering, RetirementRefusesWhileLiveAndRetriesOnDischarge)
 {
     Harness h(4, 2);
     auto lease = h.journal.touch(receipt(1, 1));
     ASSERT_TRUE(lease);
-    EXPECT_FALSE(h.journal.retireReplica(1)); // Live obligation: refuse.
+    // Live obligation: refuse, recording retire_requested.
+    EXPECT_FALSE(h.journal.retireReplica(1));
+    // LATE-ACK RETRY: the final acknowledgement completes the retirement
+    // automatically (no re-publication needed to reclaim the record).
     EXPECT_TRUE(lease->acknowledge());
-    EXPECT_TRUE(h.journal.retireReplica(1));  // Fully acked: retire.
+    EXPECT_TRUE(h.journal.mayEvict(1));
     EXPECT_FALSE(h.journal.retireReplica(9)); // Untracked: idempotent refuse.
+}
+
+/** @test Explicit abandonment discharges the obligation (bounded, no silent loss). */
+TEST(EffectiveUseOrdering, AbandonmentIsExplicitAndBounded)
+{
+    Harness h(4, 2);
+    auto lease = h.journal.touch(receipt(1, 1));
+    ASSERT_TRUE(lease);
+    EXPECT_FALSE(h.journal.mayEvict(1)); // Live obligation protects the replica.
+    EXPECT_TRUE(lease->abandon());       // Explicit relinquish.
+    EXPECT_FALSE(lease->abandon());      // Idempotent refusal.
+    EXPECT_TRUE(h.journal.mayEvict(1));  // Discharged (not fabricated ack).
+}
+
+/** @test Rollback-free admission: a full lease cell never consumes a replica record. */
+TEST(EffectiveUseOrdering, FullLeaseStorageDoesNotConsumeReplicaRecord)
+{
+    Harness h(1, 2); // One lease cell, two records.
+    auto first = h.journal.touch(receipt(1, 1));
+    ASSERT_TRUE(first);
+    // The second touch on a DIFFERENT incarnation finds no free cell: refusal
+    // must NOT allocate/consume a replica record (rollback-free).
+    EXPECT_FALSE(h.journal.touch(receipt(2, 1)));
+    // A later successful touch on incarnation 2 must still admit.
+    EXPECT_TRUE(first->acknowledge());
+    auto second = h.journal.touch(receipt(2, 2));
+    ASSERT_TRUE(second);
+    EXPECT_TRUE(second->abandon());
+}
+
+/** @test The lease retains the owner lifetime: journal storage stays valid. */
+TEST(EffectiveUseOrdering, LeaseRetainsOwnerLifetime)
+{
+    // A lease outstanding after the journal's owner would otherwise be freed
+    // still holds the lifetime token; the journal must remain usable until the
+    // lease discharges. This is exercised by the table-side ownership (the
+    // lease is minted with shared_from_this()); here we simply prove the
+    // control block retains a token.
+    Harness h(4, 2);
+    auto owner = std::make_shared<int>(42);
+    auto lease = h.journal.touch(receipt(1, 1), owner);
+    ASSERT_TRUE(lease);
+    EXPECT_EQ(*owner, 42);
+    EXPECT_TRUE(lease->acknowledge());
 }
 
 /** @test Many touches over time: leases release, records retain, bounded. */

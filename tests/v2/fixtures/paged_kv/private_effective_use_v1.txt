@@ -16,6 +16,9 @@ table-touch S | accepted
 table-drop S | retired
 table-use-ack S | acked
 table-use-may-evict T 1 | evictable
+table-touch B | accepted
+table-use-abandon B | abandoned
+table-use-may-evict T 1 | evictable
 table-drop B | retired
 table-drop-reserved R | released
 end | idle

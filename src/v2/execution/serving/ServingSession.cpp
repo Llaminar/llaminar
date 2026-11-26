@@ -292,6 +292,16 @@ namespace llaminar2
         {
             if (slot_busy_[static_cast<std::size_t>(slot)])
                 continue;
+            // §5.1 pressure probe: promote only when the all-resource witness
+            // holds with this request added; a refused probe leaves the request
+            // QUEUED (bounded backpressure; the next free-slot boundary
+            // re-evaluates it). No request is dropped and no step is broken.
+            if (pressure_probe_ && !pressure_probe_(queue_.front()))
+            {
+                // Skip this promotion boundary; the step continues with the
+                // current cohort (never admit on a broken proof).
+                break;
+            }
             Row row;
             row.request = std::move(queue_.front());
             queue_.pop_front();
@@ -570,15 +580,18 @@ namespace llaminar2
             return std::nullopt;
         }
         Row &row = *it;
-        // The transaction boundary is the settled DECISION point: the model
-        // forward and its sampling decision are COMPLETE (has_logits=false), so
-        // no unresolved speculative transaction is discarded. The pending KV
-        // feed (needs_feed=true, last_token captured) is deterministic and
-        // resumable: restore re-advertises it and the next step feeds the exact
-        // last token before publishing the next logits.
         if (row.has_logits)
         {
             error = "Serving request has a pending (undecided) forward";
+            return std::nullopt;
+        }
+        // P4: suspension must retain the ACTUAL executor KV/auxiliary referents.
+        // An executor that cannot export them means reset/erase would destroy
+        // state the session cannot restore: REFUSE BEFORE ANY MUTATION.
+        auto kv = executor_.exportSlotKV(row.slot);
+        if (!kv)
+        {
+            error = "Serving executor cannot export slot KV; suspension refused before mutation";
             return std::nullopt;
         }
         // Capture the complete continuation including the exact RNG history.
@@ -588,8 +601,12 @@ namespace llaminar2
                 row.prompt_consumed, row.cached_tokens, row.completion_tokens,
                 row.last_token, row.needs_feed, row.has_logits, row.grant,
                 forced, row.cancelled, row.cached_prompt_tokens,
-                row.sampler_decisions, &error))
+                row.sampler_decisions, *kv, &error))
             return std::nullopt;
+        // The ORIGINAL request policy (prompt tokens and output budget) is part
+        // of the continuation: restore must never invent a cap or lose prefill.
+        manifest.mutableContent().prompt = row.request.prompt;
+        manifest.mutableContent().max_new_tokens = row.request.max_new_tokens;
         // Retire the slot: reset the executor row and release the resident
         // record (the request keeps its original S record/response lease
         // semantics through the manifest; no new Q credit is consumed).
@@ -640,13 +657,27 @@ namespace llaminar2
             error = "Serving continuation id is already resident";
             return false;
         }
+        // The exported KV payload is the ONLY continuation proof the session
+        // has: without it the executor cannot be restored and the request's
+        // KV would be lost (refuse BEFORE touching the slot).
+        if (content.kv_payload.empty())
+        {
+            error = "Serving continuation has no executor KV payload; restore refused";
+            return false;
+        }
+        if (!executor_.importSlotKV(target, content.kv_payload))
+        {
+            error = "Serving executor rejected the continuation KV import";
+            return false;
+        }
         // Restore the complete row: original law/seed (never reseed), exact
-        // progress, output credit, forced instructions and RNG history.
+        // progress, output credit, forced instructions and RNG history. The
+        // ORIGINAL request policy is preserved (never an invented output cap);
+        // the session carries the remaining output budget exactly.
         Row row;
         row.request.id = content.request_id;
-        row.request.prompt = {}; // Progress is captured; prompt identity is the id.
         row.request.sampling = content.sampling;
-        row.request.max_new_tokens = content.completion_tokens + 1; // At least continue.
+        row.request.max_new_tokens = content.max_new_tokens;
         row.slot = content.slot;
         row.sampler = manifest.restoreSampler();
         row.prompt_consumed = content.prompt_consumed;

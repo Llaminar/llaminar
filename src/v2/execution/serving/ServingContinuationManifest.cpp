@@ -11,7 +11,7 @@ bool ServingContinuationManifest::capture(std::uint64_t request_id, int slot,
     int completion_tokens, int32_t last_token, bool needs_feed, bool has_logits,
     int grant, const std::vector<int32_t> &forced, bool cancelled,
     int cached_prompt_tokens, const std::vector<int32_t> &sampler_history,
-    std::string *error)
+    const std::vector<std::byte> &kv_payload, std::string *error)
 {
     if (request_id == 0 || slot < 0 || cached_tokens < 0 || completion_tokens < 0 ||
         (cached_tokens == 0 && (prompt_consumed != 0 || last_token != 0)))
@@ -22,6 +22,13 @@ bool ServingContinuationManifest::capture(std::uint64_t request_id, int slot,
     if (completion_tokens > 0 && last_token == 0 && cached_tokens == 0)
     {
         if (error) *error = "continuation manifest has committed output without KV progress";
+        return false;
+    }
+    if (kv_payload.empty())
+    {
+        // A continuation without the ACTUAL executor KV payload is not a
+        // complete continuation; refuse (the caller must export or defer).
+        if (error) *error = "continuation manifest requires the executor KV payload";
         return false;
     }
     content_ = Content{};
@@ -40,6 +47,7 @@ bool ServingContinuationManifest::capture(std::uint64_t request_id, int slot,
     content_.cached_prompt_tokens = cached_prompt_tokens;
     content_.sampler_prompt.clear();
     content_.sampler_decisions = sampler_history;
+    content_.kv_payload = kv_payload;
     captured_ = true;
     return true;
 }

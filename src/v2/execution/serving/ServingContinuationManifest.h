@@ -34,6 +34,8 @@ public:
     {
         std::uint64_t request_id = 0;
         int slot = -1;
+        std::vector<int32_t> prompt;      ///< ORIGINAL prompt tokens (prefill recoverable).
+        int max_new_tokens = 0;           ///< ORIGINAL requested output budget.
         SamplingParams sampling;          ///< Original law (seed, filters, DRY).
         std::size_t prompt_consumed = 0;  ///< Prompt tokens already in KV.
         int cached_tokens = 0;            ///< KV length of this slot.
@@ -49,6 +51,10 @@ public:
         // restore regenerates the exact RNG position (never reseeds).
         std::vector<int32_t> sampler_prompt;   ///< Prompt tokens recorded.
         std::vector<int32_t> sampler_decisions; ///< Every committed decision.
+        // ACTUAL executor KV/auxiliary continuation (plan P4: host metadata
+        // alone is not a continuation). Empty means the executor could not
+        // export its slot state and suspension was refused.
+        std::vector<std::byte> kv_payload;
     };
 
     /** @brief Capture one continuous row's complete continuation. */
@@ -57,6 +63,7 @@ public:
         int32_t last_token, bool needs_feed, bool has_logits, int grant,
         const std::vector<int32_t> &forced, bool cancelled, int cached_prompt_tokens,
         const std::vector<int32_t> &sampler_history = {},
+        const std::vector<std::byte> &kv_payload = {},
         std::string *error = nullptr);
 
     /** @brief Validate the manifest is complete and internally consistent. */
@@ -64,6 +71,8 @@ public:
 
     /** @return The captured continuation (immutable after capture). */
     const Content &content() const noexcept { return content_; }
+    /** @brief Mutate one field of the captured continuation (session only). */
+    Content &mutableContent() noexcept { return content_; }
     /** @return Whether a manifest was captured. */
     explicit operator bool() const noexcept { return captured_; }
 

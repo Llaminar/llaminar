@@ -2,27 +2,24 @@
  * @file EffectiveUseOrdering.h
  * @brief Per-operation effective-use LEASES with retained replica records.
  *
- * Design §8.2 and R11: effective use is one successful compatible attachment.
- * Each successful touch mints a MOVE-ONLY LEASE that owns its acknowledgement
- * authority (exact full identity: content/table version, replica incarnation,
- * fresh ordinal). A snapshot is NOT a collection of leases: borrowing a
- * snapshot obtains no capability (each consumer must touch and own its lease).
+ * R12/R13 disposition (combined review): every successful touch mints a
+ * MOVE-ONLY lease that owns its acknowledgement authority, and the lease
+ * retains an OWNING CONTROL BLOCK (journal + lifetime token) so journal
+ * storage can never be freed while a lease is outstanding. Admission is
+ * ROLLBACK-FREE: the free lease cell is located BEFORE any replica-record
+ * mutation, so a full journal refuses without consuming a record. Losing the
+ * only capability for an unacknowledged lease is a HARD ERROR unless the
+ * consumer explicitly ABANDONS its obligation (bounded, never a silent leak).
+ * Retirement is retried automatically when the last obligation of a
+ * retire-requested replica discharges.
  *
- * Retained replica lifecycle/recency state is SEPARATE from temporary lease
- * cells: replica records carry the monotonic owner authentication and the
- * acknowledged/unacknowledged counts, so lease-cell reuse can never erase the
- * identity needed to distinguish old/duplicate touches, and eviction
- * eligibility of one replica never depends on another's temporary scratch.
- * Refusals are ROLLBACK-FREE (no state changes before admission).
- *
- * Storage is NON-OWNING and admitted by the owner (PMA); this module never
- * allocates and never keeps a lifetime-unbounded history. Both arrays are
- * sized from admitted membership (lease cells = concurrency, replica records
- * = distinct live incarnations).
+ * Storage is NON-OWNING and admitted by the owner (PMA): cells and records are
+ * owner arrays; the lease's lifetime token keeps that owner alive.
  */
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <span>
 
@@ -44,8 +41,16 @@ enum class EffectiveUseStatus
     Accepted,    ///< A lease was minted (admission succeeded).
     Duplicate,   ///< Exact same ordinal already live: refused, no mutation.
     Obsolete,    ///< Older ordinal/superseded identity: refused, no mutation.
-    JournalFull, ///< All lease cells (concurrency) occupied: refused, no mutation.
+    JournalFull, ///< All lease cells occupied: refused, NO record mutation.
     Sealed,      ///< Ordinal space exhausted: terminal, no mutation.
+};
+
+class EffectiveUseJournal;
+/** @brief Lease control block: journal + lifetime token owning its storage. */
+struct EffectiveUseLeaseControl
+{
+    EffectiveUseJournal *journal = nullptr;
+    std::shared_ptr<void> lifetime; ///< Original owner (table) retained by the lease.
 };
 
 /** @brief Move-only authoritative lease for ONE accepted touch. */
@@ -60,33 +65,36 @@ public:
     EffectiveUseLease &operator=(const EffectiveUseLease &) = delete;
 
     /** @return Whether this handle owns a live lease. */
-    explicit operator bool() const noexcept { return owner_ != nullptr; }
+    explicit operator bool() const noexcept { return static_cast<bool>(control_); }
     /** @return Exact identity this lease acknowledges. */
-    const EffectiveUseReceipt &identity() const noexcept { return identity_; }
-    /**
-     * @brief Ordering point: acknowledge THIS lease exactly once.
-     * @return True when the lease was live and is now acknowledged; false for
-     * a moved-from/empty/already-acknowledged handle (idempotent refusal).
-     */
+    const EffectiveUseReceipt &identity() const noexcept;
+    /** @brief Ordering point: acknowledge THIS lease exactly once. */
     bool acknowledge() noexcept;
-    /** @brief Whether this lease has reached its ordering point. */
+    /**
+     * @brief Explicit abandonment: the consumer gives up its obligation.
+     *
+     * The obligation is recorded as abandoned (never fabricated as
+     * acknowledged); eviction eligibility counts abandoned obligations as
+     * discharged, and the lease's capability is released exactly once.
+     * This is the BOUNDED alternative to a permanent pin: the consumer exists
+     * and expressly relinquishes, so no ordinal is silently lost either way.
+     */
+    bool abandon() noexcept;
+    /** @return Whether this lease has reached its ordering point. */
     bool acknowledged() const noexcept { return acknowledged_; }
 private:
     friend class EffectiveUseJournal;
-    EffectiveUseLease(class EffectiveUseJournal *owner, EffectiveUseReceipt identity);
-    void release() noexcept;
-    class EffectiveUseJournal *owner_ = nullptr;
+    EffectiveUseLease(std::shared_ptr<EffectiveUseLeaseControl> control,
+        EffectiveUseReceipt identity);
+    void release(bool abandoned) noexcept;
+    std::shared_ptr<EffectiveUseLeaseControl> control_;
     EffectiveUseReceipt identity_;
     bool acknowledged_ = false;
+    bool abandoned_ = false;
 };
 
 /**
  * @brief Lease cells + retained replica records (one ownership authority).
- *
- * Lease cells are TEMPORARY (one per live touch); replica records are RETAINED
- * (one per distinct incarnation ever accepted until explicit retirement) and
- * track the per-incarnation touch/ack counts plus the monotonic owner
- * authentication. Reuse of lease cells cannot erase replica identity.
  */
 class EffectiveUseJournal final
 {
@@ -103,8 +111,12 @@ public:
         EffectiveUseReceipt auth;      ///< Monotonic owner authentication.
         std::size_t touches = 0;       ///< Accepted touches on this replica.
         std::size_t acknowledged = 0;  ///< Acknowledged touches on this replica.
+        std::size_t abandoned = 0;     ///< Explicitly abandoned obligations.
         bool live = false;
-        bool retired = false;          ///< Explicitly retired; slot reclaimable.
+        bool retire_requested = false; ///< Retirement pending final discharge.
+        bool retired = false;          ///< Retired; slot reclaimed.
+        /** @return Whether every obligation (acknowledged or abandoned) discharged. */
+        bool discharged() const noexcept { return acknowledged + abandoned == touches; }
     };
     /** @brief Unbound journal: every operation refuses typed. */
     EffectiveUseJournal() noexcept = default;
@@ -120,7 +132,7 @@ public:
     bool bind(std::span<LeaseCell> cells, std::span<ReplicaRecord> records) noexcept
     {
         if (bound() || hasPending())
-            return false; // Already bound or live leases: refuse.
+            return false;
         cells_ = cells.data(); cell_capacity_ = cells.size();
         records_ = records.data(); record_capacity_ = records.size();
         for (std::size_t i = 0; i < cells.size(); ++i) cells[i] = LeaseCell{};
@@ -131,23 +143,27 @@ public:
     EffectiveUseJournal &operator=(const EffectiveUseJournal &) = delete;
 
     /**
-     * @brief Mint one lease for a fresh, authenticated touch (rollback-free).
+     * @brief Mint one lease for a fresh, authenticated touch (ROLLBACK-FREE).
+     * @param lifetime The owner's shared lifetime token so the journal storage
+     * cannot be freed while the lease is outstanding.
      * @return The owned lease on acceptance; empty with NO state change on
-     * duplicate/obsolete/full/sealed refusal.
+     * duplicate/obsolete/full/sealed refusal (a full journal does NOT consume
+     * a replica record).
      */
-    std::optional<EffectiveUseLease> touch(EffectiveUseReceipt receipt);
-    /**
-     * @brief Ordering point for one lease (passes through to the lease).
-     * @return True when THIS lease was live and is now acknowledged.
-     */
+    std::optional<EffectiveUseLease> touch(EffectiveUseReceipt receipt,
+        std::shared_ptr<void> lifetime = {});
+    /** @brief Ordering point for one lease. */
     bool acknowledge(const EffectiveUseLease &lease) noexcept;
-    /** @return Whether @p incarnation may be evicted (fully acknowledged, not retired-lived). */
+    /** @brief Explicit abandonment for one lease. */
+    bool abandon(const EffectiveUseLease &lease) noexcept;
+    /** @return Whether @p incarnation may be evicted (all obligations discharged). */
     bool mayEvict(std::uint64_t incarnation) const noexcept;
     /**
      * @brief Explicit retirement of one retained replica record.
-     * @return True when the record was retired (all touches acknowledged);
-     * false when any touch is still unacknowledged or the incarnation is
-     * untracked (no mutation on refusal).
+     * @return True when the record was retired (all obligations discharged);
+     * false when any touch is still outstanding, in which case retire_requested
+     * is recorded and the retire completes automatically when the last
+     * obligation discharges (late-ack retry).
      */
     bool retireReplica(std::uint64_t incarnation) noexcept;
     /** @return Whether any lease cell is live. */
@@ -173,7 +189,8 @@ public:
     static constexpr std::uint64_t kSealedSequence() noexcept { return 0; }
 private:
     friend class EffectiveUseLease;
-    void releaseLease(const EffectiveUseLease &lease) noexcept;
+    bool releaseLeaseFor(const EffectiveUseLease &lease, bool abandoned) noexcept;
+    bool findFreeCell(std::size_t &out) const noexcept;
     LeaseCell *cells_ = nullptr;
     std::size_t cell_capacity_ = 0;
     ReplicaRecord *records_ = nullptr;

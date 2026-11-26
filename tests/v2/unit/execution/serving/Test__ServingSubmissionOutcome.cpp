@@ -11,6 +11,7 @@
  */
 #include "execution/serving/ServingSession.h"
 #include <gtest/gtest.h>
+#include <map>
 
 using namespace llaminar2;
 namespace
@@ -36,8 +37,24 @@ public:
     {
         return true;
     }
+    // Typed executor continuation: the harness exports the exact KV payload of
+    // one slot and re-imports it on restore (proof the session refuses when
+    // the executor cannot do this, and succeeds when it can).
+    std::optional<std::vector<std::byte>> exportSlotKV(int slot) const override
+    {
+        auto it = slot_kv_.find(slot);
+        if (it == slot_kv_.end()) return std::nullopt;
+        return it->second;
+    }
+    bool importSlotKV(int slot, std::span<const std::byte> bytes) override
+    {
+        slot_kv_[slot] = {bytes.begin(), bytes.end()};
+        return true;
+    }
+    void setSlotKV(int slot, std::vector<std::byte> bytes) { slot_kv_[slot] = std::move(bytes); }
 private:
     std::vector<float> logits_;
+    std::map<int, std::vector<std::byte>> slot_kv_;
 };
 ServingBatchRequest greedy(std::uint64_t id)
 {
@@ -91,13 +108,34 @@ TEST(ServingSubmissionOutcome, FifoAdmissionOrderPreserved)
     EXPECT_EQ(session.occupancy().queued, 1);
 }
 
+/** @test An executor that cannot export KV refuses suspension BEFORE any mutation. */
+TEST(ServingSubmissionOutcome, UnsupportedExecutorRefusesSuspensionPreMutation)
+{
+    // ScriptedRows with no slot KV seeded: exportSlotKV returns nullopt and the
+    // session must refuse WITHOUT resetting or erasing the resident row.
+    ScriptedRows rows;
+    ServingSession session(rows, 32, 8);
+    std::string error;
+    ASSERT_TRUE(session.begin(1, 1, error, nullptr, 0));
+    EXPECT_EQ(session.submit(greedy(1), error), ServingSubmissionOutcome::Direct);
+    session.step();
+    auto manifest = session.suspend(1, error);
+    EXPECT_FALSE(manifest.has_value());
+    EXPECT_NE(error.find("export"), std::string::npos) << error;
+    // The request is still resident (no state was destroyed).
+    EXPECT_EQ(session.occupancy().resident, 1);
+}
+
 /** @test Suspend/restore at a transaction boundary preserves the complete continuation. */
+
 TEST(ServingSubmissionOutcome, SuspendRestoreKeepsExactContinuation)
 {
     ScriptedRows rows;
     ServingSession session(rows, 32, 8);
     std::string error;
     ASSERT_TRUE(session.begin(2, 2, error, nullptr, 1));
+    rows.setSlotKV(0, {std::byte{1}, std::byte{2}, std::byte{3}});
+    rows.setSlotKV(1, {std::byte{4}, std::byte{5}, std::byte{6}});
     auto long_request = greedy(1);
     long_request.max_new_tokens = 500; // Never hit the length boundary in the settle loop.
     EXPECT_EQ(session.submit(long_request, error), ServingSubmissionOutcome::Direct);
@@ -135,6 +173,9 @@ TEST(ServingSubmissionOutcome, InterleavedABCSuspendKeepsPeerProgressExact)
     ServingSession session(rows, 32, 8);
     std::string error;
     ASSERT_TRUE(session.begin(3, 3, error, nullptr, 2));
+    rows.setSlotKV(0, {std::byte{1}, std::byte{2}, std::byte{3}});
+    rows.setSlotKV(1, {std::byte{4}, std::byte{5}, std::byte{6}});
+    rows.setSlotKV(2, {std::byte{7}, std::byte{8}, std::byte{9}});
     auto a = greedy(1);
     a.max_new_tokens = 500;
     auto b = greedy(2);

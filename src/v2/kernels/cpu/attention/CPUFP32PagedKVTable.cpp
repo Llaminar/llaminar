@@ -218,9 +218,12 @@ std::optional<EffectiveUseLease> CPUFP32PagedKVTable::touchEffectiveUse(
     // The replica incarnation is the PUBLISHED VERSION (monotonic, never
     // recycled): the bank INDEX is reused after retirement and can never
     // authenticate an incarnation. Journal refusal leaves no lease.
+    // The lease retains THIS TABLE as its lifetime token, so journal storage
+    // can never be freed while a lease is outstanding.
     return effective_use_.touch(EffectiveUseReceipt{
         .content_version=state.version, .table_version=state.version,
-        .replica_incarnation=state.version, .sequence=sequence});
+        .replica_incarnation=state.version, .sequence=sequence},
+        shared_from_this());
 }
 
 

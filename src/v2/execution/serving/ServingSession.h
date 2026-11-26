@@ -34,8 +34,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <map>
 #include <memory>
+#include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -73,6 +76,33 @@ namespace llaminar2
 
         /** @brief Diagnostic of the last failed forward (may be empty). */
         virtual std::string servingRowError() const { return {}; }
+
+        /**
+         * @brief Export the complete KV continuation of one resident slot.
+         *
+         * plan P4: suspension must retain the ACTUAL executor KV/auxiliary
+         * referents, not host metadata. An executor that cannot export the
+         * exact slot state returns empty; the session then refuses suspension
+         * with a precise pre-mutation diagnostic (never resets/erases state
+         * it cannot restore).
+         */
+        virtual std::optional<std::vector<std::byte>> exportSlotKV(int slot) const
+        {
+            return std::nullopt; // Unsupported: refuse suspension, never lose state.
+        }
+
+        /**
+         * @brief Import an exported KV continuation into its slot.
+         * @return True when the exact exported bytes were reinstalled at the
+         * slot's post-reset position; false when the import is unsupported or
+         * the export identity does not match (restore then refuses, never
+         * fabricates continuity).
+         */
+        virtual bool importSlotKV(int slot, std::span<const std::byte> bytes)
+        {
+            (void)slot; (void)bytes;
+            return false; // Unsupported: restore refuses pre-mutation.
+        }
     };
 
     /**
@@ -195,6 +225,19 @@ namespace llaminar2
 
         void setTraceRecorder(std::shared_ptr<IServingTraceRecorder> recorder) { recorder_ = std::move(recorder); }
 
+        /**
+         * @brief Pressure hook consulted before a queued request is promoted.
+         *
+         * @param request The queued request about to occupy a free slot.
+         * @return True to promote, false to KEEP it queued (bounded
+         * backpressure) so the step continues with the current cohort. The
+         * default admits (no instance); production wiring supplies the
+         * all-resource witness check (design §5.1). No request is dropped.
+         */
+        using PressureProbe =
+            std::function<bool(const ServingBatchRequest &)>;
+        void setPressureProbe(PressureProbe probe) { pressure_probe_ = std::move(probe); }
+
     private:
         /**
          * @brief One resident request; owns slot `slot` for its lifetime, its
@@ -233,6 +276,7 @@ namespace llaminar2
         IServingRowExecutor &executor_;
         const int context_;
         const int vocab_;
+        PressureProbe pressure_probe_; ///< Optional §5.1 all-resource witness probe.
         int capacity_ = 0;
         int queue_capacity_ = 0; ///< Admitted bounded queue depth Q (design §4.1).
         bool active_ = false;
