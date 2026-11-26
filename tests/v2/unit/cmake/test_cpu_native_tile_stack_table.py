@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Compiler-free tests of the stack-traffic table tool: source for-statement parsing, the fail-closed role
 assignment (kernel functions, inlined call sites, unmapped and uncommon loops), repeated-role indexing, role-map
-validation, the panel strip rule and per-geometry dynamic counts, and regeneration against a committed table."""
+validation, the panel strip rule and per-geometry dynamic counts, regeneration against a committed table, and every
+committed compact role-map entry re-derived from its authenticated (worktree or pinned historical) source."""
 from __future__ import annotations
 
 import argparse
@@ -515,6 +516,57 @@ def compact_loop(identity: int, parent: int, line: int, depth: int, induction: b
             "member_sources": [spelled], "empty": False}
 
 
+COMPACT_FIXTURES = Path(__file__).resolve().parent / "fixtures" / "cpu_native_compact_sources"
+
+
+def git_blob_id(data: bytes) -> str:
+    """The git object ID of `data` as a blob, computed without git (installed runners carry none)."""
+    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+
+
+def pinned_compact_sources(directory: Path = COMPACT_FIXTURES) -> dict[str, str]:
+    """{sha256: text} of the historical compact sources pinned in `directory`. Every `<sha256>.txt` must be
+    named by its own SHA256 and must match a manifest pin: the compact source path and the git blob ID of the
+    content at the tree that admitted it. A fixture without a pin, or a pin without a fixture, fails."""
+    manifest = json.loads((directory / "manifest.json").read_text())
+    files = sorted(path.name for path in directory.iterdir() if path.suffix == ".txt")
+    if files != sorted(f"{digest}.txt" for digest in manifest):
+        raise ValueError(f"pinned compact source files {files} differ from their manifest {sorted(manifest)}")
+    sources = {}
+    for digest, pin in sorted(manifest.items()):
+        data = (directory / f"{digest}.txt").read_bytes()
+        if hashlib.sha256(data).hexdigest() != digest:
+            raise ValueError(f"pinned compact source {digest} is not named by its own SHA256")
+        if pin.get("path") != COMPACT_FILE or git_blob_id(data) != pin.get("git_blob"):
+            raise ValueError(f"pinned compact source {digest} is not the git blob its manifest pins")
+        sources[digest] = data.decode()
+    return sources
+
+
+def verify_committed_compact_entries(roles: dict, worktree_text: str, pinned: dict[str, str]) -> dict[str, str]:
+    """Re-derive every role-map tree's compact entry from its authenticated source and require it to be exactly
+    the committed one (source, file hash, kernel function, every loop's role/variable/trip/header/definitions,
+    Reduction values). The source named by an entry's file_sha256 is this worktree's compact header or a pinned
+    historical version; any other hash is an unknown source and fails. The worktree's own source must be mapped,
+    and every pinned source must be used by some entry. Returns {tree: authenticated source sha256}."""
+    sources = {**pinned, TABLE.digest(worktree_text.encode()): worktree_text}
+    resolved = {}
+    for tree, entry in sorted(roles.items()):
+        digest = entry["compact"]["file_sha256"]
+        text = sources.get(digest)
+        if text is None:
+            raise ValueError(f"{tree}: compact source {digest} is neither this worktree's nor a pinned version")
+        if TABLE.compact_entry(text) != entry["compact"]:
+            raise ValueError(f"{tree}: the compact role map entry is not the mechanical entry of its source")
+        resolved[tree] = digest
+    named = set(resolved.values())
+    if TABLE.digest(worktree_text.encode()) not in named:
+        raise ValueError("this worktree's compact source has no role map entry")
+    if set(pinned) - named:
+        raise ValueError(f"pinned compact sources no role map entry uses: {sorted(set(pinned) - named)}")
+    return resolved
+
+
 def checkable(result: dict) -> dict:
     """A fixture table with well-formed hashes (fixture records carry placeholder ones)."""
     for name in ("checker_sha256", "role_map_sha256", "tile_source_sha256"):
@@ -645,19 +697,100 @@ class CompactRoleMapTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "compact trips"):
             TABLE.check(result)
 
-    def test_committed_compact_entries_are_mechanical(self) -> None:
-        # The committed role map's compact entry of the tree whose compact source is this worktree's is exactly the
-        # mechanical one; every tree's entry names its own compact source hash.
+    @staticmethod
+    def committed() -> tuple[dict, str, dict[str, str]]:
         roles = json.loads(TOOL.with_name("CPUNativeTileStackRoles.json").read_text())
-        text = (TOOL.parents[3] / COMPACT_FILE).read_text()
-        current = [tree for tree, entry in roles.items()
-                   if entry["compact"]["file_sha256"] == hashlib.sha256(text.encode()).hexdigest()]
-        self.assertTrue(current)
-        for tree in current:
-            self.assertEqual(roles[tree]["compact"], TABLE.compact_entry(text))
-        self.assertEqual({tree: entry["compact"]["kernel_functions"][0]["signature"] for tree, entry in roles.items()},
-                         {"63b053401": "inline void rows(", "c1bcabd99": "inline void rowsProgram(",
-                          "bb4e67894": "inline void rowsProgram("})
+        return roles, (TOOL.parents[3] / COMPACT_FILE).read_bytes().decode(), pinned_compact_sources()
+
+    def test_committed_compact_entries_are_mechanical(self) -> None:
+        # Every committed tree's compact entry (whatever trees the role map admits) is exactly the mechanical entry
+        # of its own authenticated compact source: this worktree's header or a pinned, blob-verified version.
+        roles, text, pinned = self.committed()
+        resolved = verify_committed_compact_entries(roles, text, pinned)
+        self.assertEqual(set(resolved), set(roles))
+        self.assertEqual({resolved[tree] for tree in roles}, set(pinned) | {TABLE.digest(text.encode())})
+
+    def test_forged_or_unknown_compact_entries_fail(self) -> None:
+        roles, text, pinned = self.committed()
+        current = TABLE.digest(text.encode())
+        for tree in sorted(roles):
+            source = "worktree" if roles[tree]["compact"]["file_sha256"] == current else "pinned"
+            # The right source hash with an altered loop role, kernel function or Reduction value.
+            for field in ("role", "kernel", "reduction"):
+                with self.subTest(tree=tree, source=source, forged=field):
+                    forged = json.loads(json.dumps(roles))
+                    compact = forged[tree]["compact"]
+                    if field == "role":
+                        loop = compact["loops"][sorted(compact["loops"], key=int)[0]]
+                        loop["role"] = "block" if loop["role"] != "block" else "column"
+                    elif field == "kernel":
+                        compact["kernel_functions"][0]["signature"] += " "
+                    else:
+                        compact["reduction"] = {name: 1 - value for name, value in compact["reduction"].items()}
+                    with self.assertRaisesRegex(ValueError, f"{tree}: .* not the mechanical entry"):
+                        verify_committed_compact_entries(forged, text, pinned)
+            # An entry naming a source that is neither the worktree's nor pinned.
+            with self.subTest(tree=tree, source=source, forged="unknown source"):
+                forged = json.loads(json.dumps(roles))
+                forged[tree]["compact"]["file_sha256"] = "0" * 64
+                with self.assertRaisesRegex(ValueError, f"{tree}: compact source 0+ is neither this worktree's nor"):
+                    verify_committed_compact_entries(forged, text, pinned)
+        # A new tree: unknown source fails; a known source with a role that is not the mechanical one fails.
+        reference = next(tree for tree in sorted(roles) if roles[tree]["compact"]["file_sha256"] in pinned)
+        added = {**roles, "fffffffff": {**roles[reference], "compact": {**roles[reference]["compact"],
+                                                                          "file_sha256": "1" * 64}}}
+        with self.assertRaisesRegex(ValueError, "fffffffff: compact source .* neither"):
+            verify_committed_compact_entries(added, text, pinned)
+        wrong = json.loads(json.dumps(roles[reference]))
+        wrong["compact"]["loops"][sorted(wrong["compact"]["loops"], key=int)[-1]]["trip"] = "1"
+        with self.assertRaisesRegex(ValueError, "fffffffff: .* not the mechanical entry"):
+            verify_committed_compact_entries({**roles, "fffffffff": wrong}, text, pinned)
+        # The worktree's own source must be mapped, and every pinned source used.
+        # (The committed worktree source pinned instead, so every entry still resolves.)
+        with self.assertRaisesRegex(ValueError, "worktree's compact source has no role map entry"):
+            verify_committed_compact_entries(roles, text + "\n", {**pinned, current: text})
+        with self.assertRaisesRegex(ValueError, "no role map entry uses"):
+            verify_committed_compact_entries(roles, text, {**pinned, "2" * 64: text})
+
+    def test_pinned_compact_sources_are_authenticated(self) -> None:
+        self.assertTrue(pinned_compact_sources())
+        with tempfile.TemporaryDirectory() as scratch:
+            directory = Path(scratch)
+
+            def copy() -> None:
+                for path in directory.iterdir():
+                    path.unlink()
+                for path in COMPACT_FIXTURES.iterdir():
+                    if path.suffix in (".txt", ".json"):
+                        (directory / path.name).write_bytes(path.read_bytes())
+
+            copy()
+            self.assertEqual(pinned_compact_sources(directory), pinned_compact_sources())
+            fixture = sorted(directory.glob("*.txt"))[0]
+            # One changed byte: the name is no longer its SHA256.
+            data = bytearray(fixture.read_bytes())
+            data[-2] ^= 1
+            fixture.write_bytes(bytes(data))
+            with self.assertRaisesRegex(ValueError, "not named by its own SHA256"):
+                pinned_compact_sources(directory)
+            # Renamed to the changed content's hash: the manifest has no pin for it.
+            renamed = directory / f"{hashlib.sha256(bytes(data)).hexdigest()}.txt"
+            fixture.rename(renamed)
+            with self.assertRaisesRegex(ValueError, "differ from their manifest"):
+                pinned_compact_sources(directory)
+            # Re-pinned under that hash with the original git blob ID: the blob no longer matches.
+            manifest = json.loads((directory / "manifest.json").read_text())
+            manifest[renamed.stem] = manifest.pop(fixture.stem)
+            (directory / "manifest.json").write_text(json.dumps(manifest))
+            with self.assertRaisesRegex(ValueError, "not the git blob its manifest pins"):
+                pinned_compact_sources(directory)
+            # A pin for another path fails too.
+            copy()
+            manifest = json.loads((directory / "manifest.json").read_text())
+            manifest[fixture.stem]["path"] = TABLE.TILE_FILE
+            (directory / "manifest.json").write_text(json.dumps(manifest))
+            with self.assertRaisesRegex(ValueError, "not the git blob its manifest pins"):
+                pinned_compact_sources(directory)
 
 
 class MissingClassTest(unittest.TestCase):

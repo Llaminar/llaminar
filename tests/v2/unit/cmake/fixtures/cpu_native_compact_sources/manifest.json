@@ -1,0 +1,12 @@
+{
+ "33508a01610947ac7a720324db02f39f9bf52872f8baaa8081d7736d60917bfa": {
+  "commit": "c1bcabd99a80050b10d3cf6f0fade594f6a71ad7",
+  "git_blob": "acf7202c83d39fc92a937ec6ee6f9c17dff971fe",
+  "path": "src/v2/kernels/cpu/gemm/CPUNativeQuantisedMultiScaleKernels.h"
+ },
+ "de93dc51f371a407931bca1d95e18ad1ce076b8c8f0cdaf5dd3de3aec64a6929": {
+  "commit": "63b0534010e1253e4194438e28164440fb6e8e24",
+  "git_blob": "447e3bc7977b8970b2423df026363e8fc26ee704",
+  "path": "src/v2/kernels/cpu/gemm/CPUNativeQuantisedMultiScaleKernels.h"
+ }
+}
