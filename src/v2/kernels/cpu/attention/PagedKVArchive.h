@@ -62,6 +62,14 @@ public:
      * sampler/history/placement and does not adopt any shared referent.
      */
     std::vector<CPUFP32KVPage> materialize(PhysicalPagePool::Grant &grant, int page_tokens) const;
+    /**
+     * @brief Exact number of logical pages this archive occupies at @p page_tokens.
+     * @throws std::invalid_argument for empty sections or nonpositive geometry.
+     * @note Geometry/overflow checks match materialize exactly; callers use
+     * this before any mutation so table cells and grant growth can be
+     * validated atomically up front.
+     */
+    std::size_t pageCount(int page_tokens) const;
 private:
     PagedKVArchive(PagedKVArchiveMeta meta, std::vector<std::byte> payload)
         : meta_(meta), payload_(std::move(payload)) {}

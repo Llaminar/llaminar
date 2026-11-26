@@ -67,16 +67,6 @@ void CPUFP32PagedKVTable::clear(size_t bank) noexcept
     state.accepting_readers = false;
     state.phase = Phase::Free;
 }
-namespace
-{
-/** @brief One preparable bank plus the exact issuance budget admission rule. */
-struct BeginCandidate
-{
-    size_t bank = 0;
-    internal::IssuanceAdmission admission;
-};
-}
-
 std::optional<CPUFP32PagedKVTable::Update> CPUFP32PagedKVTable::tryBeginUpdate()
 {
     for (size_t bank = 0; bank < banks_.size(); ++bank)
@@ -84,7 +74,9 @@ std::optional<CPUFP32PagedKVTable::Update> CPUFP32PagedKVTable::tryBeginUpdate()
         auto &state = banks_[bank];
         if (state.phase != Phase::Free) continue;
         // FINITE issuance admission, not bank exhaustion: normal updates never
-        // consume the reserved headroom reserved for accepted work.
+        // consume the reserved headroom reserved for accepted work. The finite
+        // budget and the outstanding reservation capacity are both respected
+        // so accepted work can always complete within its own grant.
         if (next_version_ >= geometry_.issuance_budget - geometry_.issuance_headroom)
             return std::nullopt;
         auto self = shared_from_this();
@@ -95,21 +87,74 @@ std::optional<CPUFP32PagedKVTable::Update> CPUFP32PagedKVTable::tryBeginUpdate()
     return std::nullopt;
 }
 
-std::optional<CPUFP32PagedKVTable::Update> CPUFP32PagedKVTable::tryBeginUpdateReserved()
+std::optional<CPUFP32PagedKVTable::IssuanceReservation>
+CPUFP32PagedKVTable::reserveAcceptedWork(std::size_t capacity)
 {
-    // The reserved headroom exists so accepted work can finish when ordinary
-    // admission is closed. It can never make the finite budget explicit.
+    // Checked finite arithmetic; a capacity above the remaining headroom or
+    // the remaining finite budget refuses without mutation.
+    if (capacity > geometry_.issuance_headroom - reserved_outstanding_)
+        return std::nullopt;
+    const auto remaining_budget = geometry_.issuance_budget - next_version_;
+    if (capacity > remaining_budget)
+        return std::nullopt;
+    auto self = shared_from_this();
+    if (++reservation_serial_ == 0)
+        return std::nullopt; // Nonce wrap: refuse rather than recycle.
+    reserved_outstanding_ += capacity;
+    return IssuanceReservation(std::move(self), capacity, reservation_serial_);
+}
+
+std::optional<CPUFP32PagedKVTable::Update>
+CPUFP32PagedKVTable::tryBeginReserved(IssuanceReservation &reservation)
+{
+    if (!reservation.table_ || reservation.table_.get() != this || !reservation.remaining_)
+        return std::nullopt; // Foreign, moved-from or exhausted handle: refuse.
     for (size_t bank = 0; bank < banks_.size(); ++bank)
     {
         auto &state = banks_[bank];
         if (state.phase != Phase::Free) continue;
-        if (next_version_ >= geometry_.issuance_budget) return std::nullopt;
+        if (next_version_ >= geometry_.issuance_budget)
+            return std::nullopt; // Absolute finite bound.
         auto self = shared_from_this();
         state.version = ++next_version_;
         state.phase = Phase::Preparing;
+        --reservation.remaining_;
+        // Consumed capacity is no longer outstanding (issued already counts
+        // it against the budget), so normal admission remains protected by
+        // the remaining headroom only.
+        --reserved_outstanding_;
         return Update(std::move(self), bank, state.version);
     }
     return std::nullopt;
+}
+CPUFP32PagedKVTable::IssuanceReservation::IssuanceReservation(
+    std::shared_ptr<CPUFP32PagedKVTable> table, std::size_t capacity,
+    std::uint64_t serial)
+    : table_(std::move(table)), remaining_(capacity), serial_(serial) {}
+CPUFP32PagedKVTable::IssuanceReservation::~IssuanceReservation() { release(); }
+CPUFP32PagedKVTable::IssuanceReservation::IssuanceReservation(IssuanceReservation &&other) noexcept
+    : table_(std::move(other.table_)), remaining_(std::exchange(other.remaining_, 0)),
+      serial_(std::exchange(other.serial_, 0)) {}
+CPUFP32PagedKVTable::IssuanceReservation &
+CPUFP32PagedKVTable::IssuanceReservation::operator=(IssuanceReservation &&other) noexcept
+{
+    if (this != &other)
+    {
+        release();
+        table_ = std::move(other.table_);
+        remaining_ = std::exchange(other.remaining_, 0);
+        serial_ = std::exchange(other.serial_, 0);
+    }
+    return *this;
+}
+void CPUFP32PagedKVTable::IssuanceReservation::release() noexcept
+{
+    if (!table_) return;
+    auto &self = *table_;
+    // Return any unconsumed capacity to the outstanding pool (no allocation).
+    if (remaining_)
+        self.reserved_outstanding_ -= remaining_;
+    table_.reset();
 }
 void CPUFP32PagedKVTable::closeBorrowers(const Snapshot &snapshot)
 {
@@ -162,18 +207,54 @@ void CPUFP32PagedKVTable::Update::attachArchivedPrefix(const PagedKVArchive &arc
         if (first.heads() != archive.meta().heads || first.dimension() != archive.meta().dimension)
             throw std::invalid_argument("Archived prefix provenance disagrees with the staged destination geometry");
     }
+    // COMPLETE preflight before a single byte is staged (atomicity across the
+    // table and the caller's grant): the archive's exact page count must fit
+    // the remaining metadata cells and the grant's protected growth, and the
+    // caller's physical authority must be this table's original authority.
+    // materialize() itself rechecks its own grant growth before assignment.
+    const std::size_t pages_needed = archive.pageCount(page_tokens);
+    if (pages_needed > table_->geometry_.page_capacity - state.pages)
+        throw std::invalid_argument("Archived prefix exceeds the admitted table metadata cells");
+    if (grant.issuer() != table_->authority_.get())
+        throw std::invalid_argument("Archived prefix materialization has a foreign physical authority");
+    if (pages_needed > grant.remainingCommitment())
+        throw std::invalid_argument("Archived prefix materialization grant lacks protected growth");
     // Private materialization under the caller grant; the returned pages are
     // moved into this update. No sampler/RNG/history/placement state is
     // restored by this attachment — only native K/V bytes enter the bank.
     auto pages = archive.materialize(grant, page_tokens);
-    for (auto &page : pages)
+    // Infallible insertion: cells were prevalidated and the authority was
+    // checked before materialize, so a page cannot exceed the admitted
+    // capacity or carry a foreign owner here. A throw inside this loop is
+    // still caught to preserve the grant/table refund (defense in depth).
+    try
     {
-        if (state.pages == table_->geometry_.page_capacity)
-            throw std::logic_error("CPU page-table prefix attach exceeds its admitted metadata cells");
-        if (page.issuer() != table_->authority_.get())
-            throw std::invalid_argument("CPU page-table prefix attach has a foreign physical authority");
-        table_->pages_[bank_ * table_->geometry_.page_capacity + state.pages] = std::move(page);
-        ++state.pages;
+        for (auto &page : pages)
+        {
+            if (state.pages == table_->geometry_.page_capacity)
+                throw std::logic_error("CPU page-table prefix attach exceeds its admitted metadata cells");
+            if (page.issuer() != table_->authority_.get())
+                throw std::invalid_argument("CPU page-table prefix attach has a foreign physical authority");
+            table_->pages_[bank_ * table_->geometry_.page_capacity + state.pages] = std::move(page);
+            ++state.pages;
+        }
+    }
+    catch (...)
+    {
+        // Roll back both owners: retire any page already inserted back to the
+        // table cells, then drop the materialized pages (each ref leaves the
+        // grant through its retained publication) and report the refusal.
+        auto &clean = table_->require(bank_, version_, Phase::Preparing);
+        // Retire every page that entered this bank during the attachment. The
+        // state.pages counter is the precise inserted extent; each cell above
+        // it was already empty, and assigning an empty page vend the owner.
+        while (clean.pages)
+        {
+            auto &cell = table_->pages_[bank_ * table_->geometry_.page_capacity + clean.pages - 1];
+            cell = CPUFP32KVPage();
+            --clean.pages;
+        }
+        throw;
     }
 }
 

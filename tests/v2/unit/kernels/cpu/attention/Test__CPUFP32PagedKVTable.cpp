@@ -211,13 +211,22 @@ TEST(CPUFP32PagedKVTable, FiniteIssuanceBudgetExhaustionRefusesBeforeHeadroom)
     EXPECT_FALSE(table->tryBeginUpdate());
     EXPECT_EQ(table->normalAdmissionRemaining(), 0u);
     EXPECT_FALSE(table->issuanceBudgetExhausted()); // Headroom remains for accepted work.
-    // Already-accepted work uses the reserved headroom and still completes.
-    auto accepted = table->tryBeginUpdateReserved();
+    // No caller may consume the headroom without an accepted-work reservation:
+    // the old freely-callable reserved path is gone, so only a minted handle
+    // can complete accepted work.
+    CPUFP32PagedKVTable::IssuanceReservation unminted;
+    EXPECT_FALSE(table->tryBeginReserved(unminted));
+    EXPECT_EQ(table->issuedVersions(), 2u); // Normal begins unaffected by the refusal.
+    auto reservation = table->reserveAcceptedWork(1);
+    ASSERT_TRUE(reservation);
+    EXPECT_EQ(reservation->remaining(), 1u);
+    auto accepted = table->tryBeginReserved(*reservation);
     ASSERT_TRUE(accepted);
     accepted->append(page(3.0f));
     EXPECT_TRUE(table->issuanceBudgetExhausted());
-    EXPECT_FALSE(table->tryBeginUpdateReserved()); // Absolute finite bound.
+    EXPECT_FALSE(table->tryBeginReserved(*reservation)); // Exhausted handle.
     EXPECT_FALSE(table->tryBeginUpdate());
+    EXPECT_EQ(reservation->remaining(), 0u);
     // Complete both published and accepted work; versions never recycle.
     auto s1 = first->commit();
     auto s2 = second->commit();
@@ -227,7 +236,51 @@ TEST(CPUFP32PagedKVTable, FiniteIssuanceBudgetExhaustionRefusesBeforeHeadroom)
     EXPECT_EQ(s3.version(), 3u);
     // No normal admission remains after finite exhaustion; four free banks.
     EXPECT_FALSE(table->tryBeginUpdate());
-    EXPECT_FALSE(table->issuanceBudgetExhausted() == false);
+    EXPECT_EQ(table->outstandingReserved(), 0u);
+}
+
+/** @test Accepted-work reservations are minted, consumable, unshareable and adversarial-safe. */
+TEST(CPUFP32PagedKVTable, AcceptedWorkReservationIsConsumableAndUnshareable)
+{
+    const auto device = DeviceId::cpu();
+    // Budget 5, headroom 3, banks 3: normal admission cap = 2.
+    const CPUFP32PagedKVTableGeometry table_geometry{1, 3, 2, 2, 5, 3};
+    const auto bytes = CPUFP32PagedKVTable::physicalBytes(table_geometry, device);
+    PhysicalMemoryPlanBuilder plan;
+    plan.add({.world_rank=0, .device=device, .total_bytes=bytes, .admission_available_bytes=bytes},
+        PhysicalMemoryOwner::KVCache, bytes);
+    auto authority = std::make_shared<PhysicalMemoryAuthority>(
+        std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()), 0);
+    auto table = CPUFP32PagedKVTable::create(authority, device, table_geometry);
+    // Reservation is minted and consumes headroom from other clients.
+    auto first = table->reserveAcceptedWork(2);
+    ASSERT_TRUE(first);
+    EXPECT_EQ(table->outstandingReserved(), 2u);
+    EXPECT_EQ(table->headroomAvailable(), 1u);
+    // A second client cannot reserve beyond the remaining headroom.
+    EXPECT_FALSE(table->reserveAcceptedWork(2));
+    EXPECT_EQ(table->outstandingReserved(), 2u);
+    // Capacity beyond the finite budget also refuses without mutation.
+    EXPECT_FALSE(table->reserveAcceptedWork(999));
+    // The handle cannot be copied; a moved-from handle is empty.
+    auto second = std::move(first);
+    ASSERT_TRUE(first.has_value());
+    EXPECT_FALSE(static_cast<bool>(*first)); // Moved-from handle cannot consume.
+    EXPECT_EQ(second->remaining(), 2u);
+    // Foreign/exhausted/moved-from handles never issue a version.
+    CPUFP32PagedKVTable::IssuanceReservation moved;
+    EXPECT_FALSE(table->tryBeginReserved(moved));
+    EXPECT_EQ(table->issuedVersions(), 0u);
+    // Consuming one issuance advances the version monotonically and drains.
+    auto update = table->tryBeginReserved(*second);
+    ASSERT_TRUE(update);
+    EXPECT_EQ(table->issuedVersions(), 1u);
+    EXPECT_EQ(table->outstandingReserved(), 1u);
+    EXPECT_EQ(second->remaining(), 1u);
+    // A dropped reserved handle returns unconsumed capacity to the headroom.
+    second = CPUFP32PagedKVTable::IssuanceReservation();
+    EXPECT_EQ(table->outstandingReserved(), 0u);
+    EXPECT_EQ(table->headroomAvailable(), 3u);
 }
 
 /** @test Headroom below budget is typed; equal/zero headroom is rejected before allocation. */

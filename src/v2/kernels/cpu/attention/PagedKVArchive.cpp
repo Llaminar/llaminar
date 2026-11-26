@@ -143,13 +143,12 @@ PagedKVArchive PagedKVArchive::parse(std::span<const std::byte> bytes)
     return PagedKVArchive(meta, std::move(payload));
 }
 
-std::vector<CPUFP32KVPage> PagedKVArchive::materialize(PhysicalPagePool::Grant &grant, int page_tokens) const
+std::size_t PagedKVArchive::pageCount(int page_tokens) const
 {
-    if (empty() || meta_.format != KVStorageFormat::FP32 ||
-        meta_.family != KVCacheFamily::AttentionOnly)
-        throw std::invalid_argument("Paged archive materialization requires a nonempty FP32 attention section");
+    if (empty())
+        throw std::invalid_argument("Paged archive page count requires a nonempty section");
     if (page_tokens <= 0)
-        throw std::invalid_argument("Paged archive materialization requires positive page geometry");
+        throw std::invalid_argument("Paged archive page count requires positive page geometry");
     const auto layout = KVNativeStorageLayout::resolve(meta_.family, meta_.heads,
         meta_.dimension, KVStorageFormatName(meta_.format), DeviceId::cpu());
     const auto stride = layout.pagePayload(1).totalBytes();
@@ -159,10 +158,28 @@ std::vector<CPUFP32KVPage> PagedKVArchive::materialize(PhysicalPagePool::Grant &
     if (meta_.rows > std::numeric_limits<std::size_t>::max() / stride)
         throw std::invalid_argument("Paged archive row geometry overflows");
     const std::size_t total_bytes = meta_.rows * stride;
+    return (total_bytes + page_bytes - 1) / page_bytes;
+}
+
+std::vector<CPUFP32KVPage> PagedKVArchive::materialize(PhysicalPagePool::Grant &grant, int page_tokens) const
+{
+    if (empty() || meta_.format != KVStorageFormat::FP32 ||
+        meta_.family != KVCacheFamily::AttentionOnly)
+        throw std::invalid_argument("Paged archive materialization requires a nonempty FP32 attention section");
+    const auto layout = KVNativeStorageLayout::resolve(meta_.family, meta_.heads,
+        meta_.dimension, KVStorageFormatName(meta_.format), DeviceId::cpu());
+    const auto stride = layout.pagePayload(1).totalBytes();
+    if (page_tokens <= 0)
+        throw std::invalid_argument("Paged archive materialization requires positive page geometry");
+    if (meta_.rows > std::numeric_limits<std::size_t>::max() / stride)
+        throw std::invalid_argument("Paged archive row geometry overflows");
+    const std::size_t total_bytes = meta_.rows * stride;
     if (payload_.size() != total_bytes)
         throw std::logic_error("Paged archive payload does not match its provenance");
-    // Complete geometry/grant preflight BEFORE any mutation: every page count
-    // and final-page extent must fit the caller's protected growth.
+    // Geometry preflight before any mutation, exact same arithmetic as pageCount.
+    if (page_tokens > std::numeric_limits<std::size_t>::max() / stride)
+        throw std::invalid_argument("Paged archive page geometry overflows");
+    const std::size_t page_bytes = static_cast<std::size_t>(page_tokens) * stride;
     const std::size_t pages_needed = (total_bytes + page_bytes - 1) / page_bytes;
     if (pages_needed > grant.remainingCommitment())
         throw std::invalid_argument("Paged archive materialization grant lacks protected growth for every page");

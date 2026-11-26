@@ -17,39 +17,6 @@
 
 namespace llaminar2
 {
-namespace internal
-{
-    /**
-     * @brief Finite nonce issuance admission: budget minus reserved headroom.
-     *
-     * plan P1: finite grants never sum independent maxima. A prepared update
-     * monopolizes one issuance that stays burned through abort; normal
-     * admission refuses before the reserved headroom can be consumed so
-     * already-accepted work always completes. Reserved issuance (accepted
-     * work draining) may consume the remaining headroom but never the next
-     * normal update's protection, and no version is ever recycled.
-     */
-    struct IssuanceAdmission
-    {
-    public:
-        explicit IssuanceAdmission(std::uint64_t budget, std::uint64_t headroom)
-            : budget_(budget), headroom_(headroom)
-        {
-            if (!budget_ || headroom_ >= budget_) throw std::invalid_argument("Issuance budget must exceed its headroom");
-            normal_cap_ = budget_ - headroom_;
-        }
-        /** @return Whether one ordinary begin is allowed. */
-        bool allowsNormal(std::uint64_t issued) const noexcept { return issued < normal_cap_; }
-        /** @return Whether one reserved begin (accepted work) is allowed. */
-        bool allowsReserved(std::uint64_t issued) const noexcept { return issued < budget_; }
-        std::uint64_t budget() const noexcept { return budget_; }
-    private:
-        std::uint64_t budget_ = 0;
-        std::uint64_t headroom_ = 0;
-        std::uint64_t normal_cap_ = 0;
-    };
-}
-
 /** @brief Explicit admitted table metadata and concurrent snapshot envelope. */
 struct CPUFP32PagedKVTableGeometry
 {
@@ -59,7 +26,7 @@ struct CPUFP32PagedKVTableGeometry
     int page_tokens = 0;
     /** @brief Finite nonce issuance budget (metadata). Zero or headroom>=budget is invalid. */
     std::uint64_t issuance_budget = 0;
-    /** @brief Reserved issuance for already-accepted work/aborts/drain; must be < budget. */
+    /** @brief Maximum outstanding reservation capacity; must be < budget. */
     std::uint64_t issuance_headroom = 0;
     /** @brief Reject empty, overflowing or unrepresentable metadata geometry before allocation. */
     void validate() const;
@@ -70,6 +37,38 @@ class CPUFP32PagedKVTable final : public std::enable_shared_from_this<CPUFP32Pag
 {
 public:
     /** @brief One immutable operation snapshot retaining actual page referents, not just a header. */
+    /**
+     * @brief Authority-issued consumable reservation for accepted-model work.
+     *
+     * plan P1 accepted-work completion: only a reservation HOLDER is allowed
+     * to consume the headroom, and only up to its admitted capacity. The
+     * identity is minted by the table under the finite budget and cannot be
+     * copied; foreign, exhausted or revoked handles are refused before any
+     * issuance. Normal admission never counts against outstanding reserved
+     * capacity, so accepted work always completes within its own reservation.
+     */
+    class IssuanceReservation final
+    {
+    public:
+        IssuanceReservation() = default;
+        ~IssuanceReservation();
+        IssuanceReservation(IssuanceReservation &&other) noexcept;
+        IssuanceReservation &operator=(IssuanceReservation &&other) noexcept;
+        IssuanceReservation(const IssuanceReservation &) = delete;
+        IssuanceReservation &operator=(const IssuanceReservation &) = delete;
+        /** @return Whether this handle holds a live reservable grant. */
+        explicit operator bool() const noexcept { return table_ != nullptr; }
+        /** @return Remaining consumable issuances of this reservation. */
+        std::size_t remaining() const noexcept { return remaining_; }
+    private:
+        friend class CPUFP32PagedKVTable;
+        IssuanceReservation(std::shared_ptr<CPUFP32PagedKVTable> table, std::size_t capacity,
+            std::uint64_t serial);
+        void release() noexcept;
+        std::shared_ptr<CPUFP32PagedKVTable> table_;
+        std::size_t remaining_ = 0;
+        std::uint64_t serial_ = 0;
+    };
     class Snapshot final
     {
     public:
@@ -143,18 +142,38 @@ public:
     /** @brief Reserve an unused metadata bank, or defer without changing any published bank. */
     std::optional<Update> tryBeginUpdate();
     /**
-     * @brief Begin under the reserved headroom for already-accepted work.
-     *
-     * The ordinary admission cap is budget minus headroom; an accepted update
-     * that still needs to complete may consume the reserved headroom even
-     * when normal admission has stopped. It still never exceeds the finite
-     * budget and never exhausts it below a nonnegative remainder.
+     * @brief Mint one consumable accepted-work reservation under headroom.
+     * @param capacity Issuances this accepted obligation may consume (or 0 to
+     * probe headroom only).
+     * @return A move-only reservation handle, or empty without mutation when
+     * the finite budget cannot admit the requested capacity (headroom is
+     * shared among live reservations and never exceeds budget minus issued).
      */
-    std::optional<Update> tryBeginUpdateReserved();
+    std::optional<IssuanceReservation> reserveAcceptedWork(std::size_t capacity);
+    /**
+     * @brief Consume one issuance from an accepted-work reservation.
+     * @param reservation Exact minted handle; a foreign/exhausted handle is
+     * refused before any bank or version state changes.
+     * @return A prepared update, or empty when no bank is free or the
+     * reservation is exhausted.
+     * @note Reserved begins never consume normal-admission capacity, and
+     * normal begins never consume reservation capacity: accepted work always
+     * completes within its own finite grant.
+     */
+    std::optional<Update> tryBeginReserved(IssuanceReservation &reservation);
     /** @return Finite admitted issuance budget (never an independent maximum). */
     std::uint64_t issuanceBudget() const noexcept { return geometry_.issuance_budget; }
     /** @return Total issued versions, burned and live, monotonic across banks. */
     std::uint64_t issuedVersions() const noexcept { return next_version_; }
+    /** @return Remaining headroom capacity not already reserved (budget-aware). */
+    std::uint64_t headroomAvailable() const noexcept
+    {
+        const auto rem = geometry_.issuance_budget - next_version_;
+        const auto spare = geometry_.issuance_headroom - reserved_outstanding_;
+        return rem < spare ? rem : spare;
+    }
+    /** @return Outstanding accepted-work capacity currently reserved. */
+    std::uint64_t outstandingReserved() const noexcept { return reserved_outstanding_; }
     /** @return Remaining normal-admission capacity (budget minus headroom minus issued). */
     std::uint64_t normalAdmissionRemaining() const noexcept
     {
@@ -192,6 +211,8 @@ private:
     std::shared_ptr<PhysicalMemoryAuthority> authority_; ///< Original instance identity, not a separate budget.
     CPUFP32PagedKVTableGeometry geometry_;
     std::uint64_t next_version_ = 0; ///< Monotonic across every bank, including aborted preparations.
+    std::uint64_t reserved_outstanding_ = 0; ///< Sum of live reservation capacities.
+    std::uint64_t reservation_serial_ = 0;   ///< Monotonic handle nonce, never recycled.
     AlignedVector<std::byte> cells_;
     AlignedVector<Bank> banks_;
     CPUFP32KVPage *pages_ = nullptr; ///< Constructed stable metadata array, never KV payload.

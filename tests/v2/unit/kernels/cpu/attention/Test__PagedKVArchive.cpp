@@ -252,6 +252,35 @@ TEST(PagedKVArchive, AttachArchivedPrefixStagesPrivatePagesAndGatesProvenance)
     EXPECT_EQ(grant2->remainingCommitment(), 1u);
 }
 
+/** @test Cell-capacity refusal precedes any materialization: G/O stay untouched. */
+TEST(PagedKVArchive, AttachRefusalKeepsGrantAndTableIntactWhenCellsFull)
+{
+    ArchiveFixture fx;
+    constexpr int heads = 1, dimension = 8, tokens = 4;
+    std::vector<float> rows(static_cast<size_t>(tokens) * 2 * static_cast<size_t>(heads) * static_cast<size_t>(dimension), 0.75f);
+    auto snapshot = publishPage(fx, rows, heads, dimension);
+    auto archive = PagedKVArchive::fromView(snapshot.view());
+    EXPECT_EQ(archive.pageCount(4), 1u);
+    auto grant = fx.pool->tryAdmit(1);
+    ASSERT_TRUE(grant);
+    // Fill the single bank to its exact cell capacity with compatible staged
+    // pages (capacity one table: one page per bank). The staging legitimately
+    // consumes the grant's protected growth; capture the post-staging boundary.
+    auto update = fx.table->tryBeginUpdate();
+    ASSERT_TRUE(update);
+    auto staged = archive.materialize(*grant, 4);
+    ASSERT_EQ(staged.size(), 1u);
+    update->append(std::move(staged.front()));
+    const auto g0 = grant->remainingCommitment();
+    // A second attachment into the same now-full update must refuse BEFORE
+    // materializing against the grant: no cell is consumed, no frame converts.
+    EXPECT_THROW(update->attachArchivedPrefix(archive, *grant, 4), std::invalid_argument);
+    EXPECT_EQ(grant->remainingCommitment(), g0);
+    // The bank still holds exactly its one staged page and is committable.
+    auto attached = update->commit();
+    EXPECT_EQ(attached.view().rows(), 4);
+}
+
 /** @test Terminal boundary round-trips and a clamped boundary rejects. */
 TEST(PagedKVArchive, TerminalBoundaryIsAuthenticatedAndClampedRejects)
 {
