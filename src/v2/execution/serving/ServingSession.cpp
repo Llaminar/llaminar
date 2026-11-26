@@ -590,9 +590,15 @@ namespace llaminar2
         // request would restore it with a default admission block and mismatch
         // the retained prefix (events and harvest consult it). REFUSE before
         // any mutation until the typed contract is part of the continuation.
-        if (row.cached_prompt_tokens > 0 || row.prefix_admission.hit())
+        // B2: a prefix-MISS row with a cache_enabled admission still drives
+        // harvest and counters through the typed admission; restoring it with a
+        // default admission would silently skip archiving (cache_enabled=false)
+        // and diverge from the uninterrupted control. Refuse ANY admission with
+        // cache_enabled (hit or miss) until the typed contract is carried.
+        if (row.cached_prompt_tokens > 0 || row.prefix_admission.hit() ||
+            row.prefix_admission.cache_enabled)
         {
-            error = "Serving prefix-backed request suspension requires the typed prefix admission contract; "
+            error = "Serving cache-enabled request suspension requires the typed prefix admission contract; "
                     "refused before mutation";
             return std::nullopt;
         }

@@ -29,9 +29,18 @@ public:
     const float *servingRowLogits(int row) const override { return logits_.data() + row * 8; }
     bool resetServingRow(int) override { return true; }
     int prefix_restored_tokens = 0; // >0 simulates a prefix-cache hit admission.
+    bool prefix_miss_cache_enabled = false; // cache-enabled admission WITHOUT a hit.
     int restoreServingRowPrefix(int, const std::vector<int32_t> &, PrefixLookupResult &admission) override
     {
         admission = {};
+        if (prefix_miss_cache_enabled)
+        {
+            admission.supported = true;
+            admission.cache_enabled = true;
+            admission.cached_tokens = 0; // MISS: no cached tokens.
+            admission.block_size = 64;
+            return 0;
+        }
         if (prefix_restored_tokens > 0)
         {
             admission.supported = true;
@@ -228,6 +237,32 @@ TEST(ServingSubmissionOutcome, PrefixBackedSuspensionRefusesPreMutation)
     EXPECT_FALSE(manifest.has_value());
     EXPECT_NE(error.find("prefix"), std::string::npos) << error;
     // Pre-mutation: the resident row and its slot are untouched.
+    EXPECT_EQ(session.occupancy().resident, 1);
+    EXPECT_EQ(session.occupancy().queued, 0);
+}
+
+/** @test R15 B2: a prefix-MISS row with cache-enabled admission refuses suspension. */
+TEST(ServingSubmissionOutcome, CacheEnabledMissAdmissionRefusesSuspension)
+{
+    ScriptedRows rows;
+    ServingSession session(rows, 256, 8);
+    std::string error;
+    ASSERT_TRUE(session.begin(1, 1, error, nullptr, 0));
+    rows.setSlotKV(0, {std::byte{1}, std::byte{2}, std::byte{3}});
+    // Prefix cache enabled but the admission was a MISS (no cached tokens):
+    // the typed admission still drives harvest and counters. Restoring with a
+    // default admission would skip archiving silently and diverge from the
+    // uninterrupted control, so suspension must refuse pre-mutation.
+    rows.prefix_miss_cache_enabled = true;
+    auto request = greedy(1);
+    request.prompt.assign(ServingSession::kPrefillChunk + 5, 9);
+    request.max_new_tokens = 8;
+    EXPECT_EQ(session.submit(request, error), ServingSubmissionOutcome::Direct);
+    session.step();
+    auto manifest = session.suspend(1, error);
+    EXPECT_FALSE(manifest.has_value());
+    EXPECT_NE(error.find("cache-enabled"), std::string::npos) << error;
+    // Pre-mutation: row and slot untouched.
     EXPECT_EQ(session.occupancy().resident, 1);
     EXPECT_EQ(session.occupancy().queued, 0);
 }
