@@ -17,6 +17,7 @@
 #pragma once
 
 #include "DeviceGraphExecutor.h"
+#include "execution/compute_stages/stages/PooledKVDecodeBinding.h"
 #include "ForwardGraphSubmissionIntent.h"
 #include "execution/mtp/MTPSidecarCaptureLayout.h"
 #include "DeviceDecodePositionBinding.h"
@@ -757,6 +758,16 @@ namespace llaminar2
         void *device_state_publication_stream = nullptr;
         DeviceId device = DeviceId::cpu(); ///< Target device
         IKVCache *kv_cache = nullptr;      ///< KV cache (optional)
+        /**
+         * @brief P2 pooled decode binding (CPU single-row, production caller).
+         *
+         * When non-null the graph uses pooled append+attention pages for this
+         * forward instead of the ring cache. The binding is owned by the
+         * runner and must outlive the graph. It supports only dense CPU
+         * single-row decode; any other combination refuses during
+         * construction (never falls back to the ring).
+         */
+        PooledKVDecodeBinding *pooled_kv = nullptr;
 
         // ----- Pipeline Parallelism -----
 

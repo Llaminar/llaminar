@@ -4924,6 +4924,45 @@ namespace llaminar2
         const int kv_stage_layer = kvCacheLayerForGraphStage(
             kv_cache, layer_idx, config_.pp_layer_offset, layer_idx_is_cache_local);
 
+        // P2 production caller: when the runner supplied a pooled decode
+        // binding, the append and attention use pooled pages (CPU single-row
+        // dense decode only). The pooled branch is decided HERE, before any
+        // ring work, and refuses every other combination (never a fallback).
+        const auto *pooled = forward_input_construction_
+            ? forward_input_construction_->pooled_kv
+            : nullptr;
+        if (pooled)
+        {
+            if (!device.is_cpu() || batch_size != 1 || seq_len != 1 ||
+                kv_cache != nullptr || predictor_layout != nullptr)
+            {
+                throw std::invalid_argument(
+                    "Pooled decode binding supports only CPU single-row dense decode without a ring cache");
+            }
+            auto *cell = pooled->cellFor(layer_idx);
+            if (!cell)
+                throw std::invalid_argument("Pooled decode binding has no cell for the layer");
+            graph.addNode(prefix + "kv_append",
+                          ComputeStageFactory::createPooledKVAppend({
+                              .device_id = device,
+                              .K = buffers.K,
+                              .V = buffers.V,
+                              .pool = pooled->pool(),
+                              .table = pooled->table(),
+                              .ref_out = cell,
+                              .request_id = pooled->requestId(),
+                              .slot = pooled->slot(),
+                              .layer_idx = layer_idx,
+                              .kv_heads = pooled->kvHeads(),
+                              .head_dim = pooled->headDim(),
+                              .page_tokens = pooled->pageTokens(),
+                              .prior = pooled->priorFor(layer_idx),
+                          }),
+                          device);
+            graph.addDependency(prefix + "kv_append", rope_dependency);
+            return prefix + "kv_append";
+        }
+
         if (kv_cache)
         {
             /*
@@ -5351,7 +5390,29 @@ namespace llaminar2
              * null here. Explicit-mask kernel and stage callers retain their
              * separate API contract.
              */
-            attn_params.kv_cache = kv_cache;
+            // P2 pooled decode: the attention consumes the pooled publication
+            // written by the pooled append stage in the same graph. The ref is
+            // read from the cell at execute time; the ring cache is not used.
+            const auto *pooled = forward_input_construction_
+                ? forward_input_construction_->pooled_kv
+                : nullptr;
+            if (pooled)
+            {
+                auto *pooled_cell = pooled->cellFor(layer_idx);
+                if (!pooled_cell || !pooled_cell->live())
+                    throw std::invalid_argument("Pooled decode attention has no live publication");
+                attn_params.kv_cache = nullptr;
+                attn_params.pooled_table = pooled->table();
+                attn_params.pooled_ref = pooled_cell->ref;
+                attn_params.pooled_ref_cell = &pooled_cell->ref;
+                attn_params.n_kv_heads = pooled->kvHeads();
+                attn_params.head_dim = pooled->headDim();
+                attn_params.active_query_rows_device = nullptr;
+            }
+            else
+            {
+                attn_params.kv_cache = kv_cache;
+            }
             attn_params.layer_idx = kv_stage_layer;
             attn_params.active_query_rows_device =
                 device.is_gpu() && batch_size == 1
