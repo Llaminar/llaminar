@@ -27,6 +27,7 @@
 
 #include "execution/prefix_cache/PrefixStateSnapshot.h"
 #include "execution/serving/ServingBatch.h"
+#include "execution/serving/ServingContinuationManifest.h"
 #include "planning/PhysicalMemoryAuthority.h"
 #include "utils/Sampler.h"
 
@@ -142,6 +143,28 @@ namespace llaminar2
         /** @brief One shared execution step (see file comment). */
         std::vector<ServingBatchEvent> step();
 
+        /**
+         * @brief Suspend one resident request at a transaction boundary.
+         *
+         * The row's complete continuation (identity, law, prompt/KV progress,
+         * output credit, forced instructions, cancellation and sampler/RNG
+         * history) is captured into a manifest, the slot is reset and retired
+         * for reuse, and the request keeps its original S record/response
+         * lease semantics (no new Q credit is consumed).
+         * @return The manifest on success; empty with @p error when the id is
+         * not resident, the session is inactive, or the row is mid-forward.
+         */
+        std::optional<ServingContinuationManifest> suspend(std::uint64_t id, std::string &error);
+
+        /**
+         * @brief Restore one suspended request into its original request state.
+         *
+         * @return True when the row was restored (its next decision is the
+         * exact no-movement continuation); false with @p error when the
+         * manifest is incomplete, the slot is busy, or the session is sealed.
+         */
+        bool restore(ServingContinuationManifest manifest, std::string &error);
+
         bool idle() const noexcept { return rows_.empty() && queue_.empty(); }
         bool hasRunnableWork() const;
         ServingBatchOccupancy occupancy() const noexcept
@@ -180,6 +203,7 @@ namespace llaminar2
             bool cancelled = false;
             int cached_prompt_tokens = 0;    ///< Prompt tokens restored from the prefix cache.
             PrefixLookupResult prefix_admission; ///< Immutable identity for the prompt harvest.
+            std::vector<int32_t> sampler_decisions; ///< Every committed decision (RNG history).
         };
 
         /** @brief Fail all resident and queued requests, seal, and return @p events. */

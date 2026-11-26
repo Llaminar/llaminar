@@ -91,6 +91,43 @@ TEST(ServingSubmissionOutcome, FifoAdmissionOrderPreserved)
     EXPECT_EQ(session.occupancy().queued, 1);
 }
 
+/** @test Suspend/restore at a transaction boundary preserves the complete continuation. */
+TEST(ServingSubmissionOutcome, SuspendRestoreKeepsExactContinuation)
+{
+    ScriptedRows rows;
+    ServingSession session(rows, 32, 8);
+    std::string error;
+    ASSERT_TRUE(session.begin(2, 2, error, nullptr, 1));
+    auto long_request = greedy(1);
+    long_request.max_new_tokens = 500; // Never hit the length boundary in the settle loop.
+    EXPECT_EQ(session.submit(long_request, error), ServingSubmissionOutcome::Direct);
+    EXPECT_EQ(session.submit(greedy(2), error), ServingSubmissionOutcome::Direct);
+    // One step: both rows resident, no pending decisions (logits emitted).
+    auto events = session.step();
+    ASSERT_FALSE(events.empty());
+    // A row mid-forward (needs_feed/has_logits) is refused at its transaction
+    // boundary: no speculative state may be dropped. Bounded settle loop.
+    std::optional<ServingContinuationManifest> pendant;
+    for (int attempt = 0; attempt < 8; ++attempt)
+    {
+        pendant = session.suspend(1, error);
+        if (pendant) break;
+        session.step();
+    }
+    if (!pendant)
+        pendant = session.suspend(1, error);
+    ASSERT_TRUE(pendant.has_value()) << error;
+    EXPECT_EQ(pendant->content().request_id, 1u);
+    EXPECT_TRUE(pendant->valid(&error)) << error;
+    // The slot is free again (B continues in the cohort without draining).
+    EXPECT_EQ(session.occupancy().resident, 1);
+    // Restore into the same slot identity with the exact continuation.
+    EXPECT_TRUE(session.restore(std::move(*pendant), error)) << error;
+    EXPECT_EQ(session.occupancy().resident, 2);
+    // The restored row keeps its original identity and law (no reseed).
+    EXPECT_EQ(session.restore(ServingContinuationManifest{}, error), false); // Empty refuses.
+}
+
 /** @test Q=0 refuses queued requests typed; Direct still works with a free slot. */
 TEST(ServingSubmissionOutcome, ZeroQueueAcceptsOnlyDirect)
 {

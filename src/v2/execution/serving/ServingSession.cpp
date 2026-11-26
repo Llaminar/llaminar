@@ -399,6 +399,7 @@ namespace llaminar2
                 return;
             }
             row.sampler.record_token(token);
+            row.sampler_decisions.push_back(token); // Exact RNG history for suspension.
             row.last_token = token;
             row.needs_feed = true;
             ++row.completion_tokens;
@@ -553,5 +554,105 @@ namespace llaminar2
             return sealAll(reset_failure, events);
         }
         return publish();
+    }
+
+    std::optional<ServingContinuationManifest> ServingSession::suspend(std::uint64_t id, std::string &error)
+    {
+        if (!active_ || !failure_.empty())
+        {
+            error = failure_.empty() ? "Serving batch session is not open" : "Serving session failed: " + failure_;
+            return std::nullopt;
+        }
+        auto it = std::find_if(rows_.begin(), rows_.end(), [&](const Row &row) { return row.request.id == id; });
+        if (it == rows_.end())
+        {
+            error = "Serving request is not resident: " + std::to_string(id);
+            return std::nullopt;
+        }
+        Row &row = *it;
+        // The transaction boundary is the settled DECISION point: the model
+        // forward and its sampling decision are COMPLETE (has_logits=false), so
+        // no unresolved speculative transaction is discarded. The pending KV
+        // feed (needs_feed=true, last_token captured) is deterministic and
+        // resumable: restore re-advertises it and the next step feeds the exact
+        // last token before publishing the next logits.
+        if (row.has_logits)
+        {
+            error = "Serving request has a pending (undecided) forward";
+            return std::nullopt;
+        }
+        // Capture the complete continuation including the exact RNG history.
+        ServingContinuationManifest manifest;
+        std::vector<int32_t> forced(row.forced.begin(), row.forced.end());
+        if (!manifest.capture(row.request.id, row.slot, row.request.sampling,
+                row.prompt_consumed, row.cached_tokens, row.completion_tokens,
+                row.last_token, row.needs_feed, row.has_logits, row.grant,
+                forced, row.cancelled, row.cached_prompt_tokens,
+                row.sampler_decisions, &error))
+            return std::nullopt;
+        // Retire the slot: reset the executor row and release the resident
+        // record (the request keeps its original S record/response lease
+        // semantics through the manifest; no new Q credit is consumed).
+        if (!executor_.resetServingRow(row.slot))
+        {
+            error = "Serving slot reset failed during suspension";
+            return std::nullopt;
+        }
+        slot_busy_[static_cast<std::size_t>(row.slot)] = false;
+        rows_.erase(it);
+        return manifest;
+    }
+
+    bool ServingSession::restore(ServingContinuationManifest manifest, std::string &error)
+    {
+        if (!active_ || !failure_.empty())
+        {
+            error = failure_.empty() ? "Serving batch session is not open" : "Serving session failed: " + failure_;
+            return false;
+        }
+        if (!manifest.valid(&error))
+            return false;
+        const auto &content = manifest.content();
+        if (content.slot < 0 || static_cast<std::size_t>(content.slot) >= slot_busy_.size() ||
+            slot_busy_[static_cast<std::size_t>(content.slot)])
+        {
+            error = "Serving continuation slot is busy or invalid";
+            return false;
+        }
+        if (std::any_of(rows_.begin(), rows_.end(), [&](const Row &row) {
+                return row.request.id == content.request_id; }))
+        {
+            error = "Serving continuation id is already resident";
+            return false;
+        }
+        // Restore the complete row: original law/seed (never reseed), exact
+        // progress, output credit, forced instructions and RNG history.
+        Row row;
+        row.request.id = content.request_id;
+        row.request.prompt = {}; // Progress is captured; prompt identity is the id.
+        row.request.sampling = content.sampling;
+        row.request.max_new_tokens = content.completion_tokens + 1; // At least continue.
+        row.slot = content.slot;
+        row.sampler = manifest.restoreSampler();
+        row.prompt_consumed = content.prompt_consumed;
+        row.cached_tokens = content.cached_tokens;
+        row.completion_tokens = content.completion_tokens;
+        row.last_token = content.last_token;
+        // The captured state had a pending deterministic feed after its settled
+        // decision (needs_feed=true); re-advertise exactly that so the next
+        // step feeds the same token before publishing the next logits.
+        row.needs_feed = content.needs_feed;
+        row.has_logits = false;
+        row.grant = content.grant;
+        row.forced.assign(content.forced.begin(), content.forced.end());
+        row.cancelled = content.cancelled;
+        row.cached_prompt_tokens = content.cached_prompt_tokens;
+        row.sampler_decisions = content.sampler_decisions;
+        // Restoring the KV state is the executor's responsibility; the session
+        // advertises the restored KV length so the next forward continues at
+        // the exact position (no duplicate output, no reseed).
+        slot_busy_[static_cast<std::size_t>(content.slot)] = true;
+        rows_.push_back(std::move(row));
+        return true;
     }
 } // namespace llaminar2
