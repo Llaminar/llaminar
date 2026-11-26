@@ -150,9 +150,13 @@ jobs:
           WORKDIR /envelope-source
           ENTRYPOINT ["python3", "scripts/ci/arm_envelope_checks.py", "/envelope-source", "/evidence"]
           EOF
+          context=$(mktemp -d)
+          git archive HEAD | tar -x -C "$context"
+          git rev-parse HEAD HEAD^{tree} > "$context/arm-envelope-source.txt"
+          cp "$RUNNER_TEMP/arm-envelope.Dockerfile" "$context/arm-envelope.Dockerfile"
           docker buildx build --platform linux/arm64 --load \
             --build-context "$TOOLCHAIN_CONTEXT" -f "$RUNNER_TEMP/arm-envelope.Dockerfile" \
-            -t llaminar-arm-envelopes:pr . 2>&1 | tee "$RUNNER_TEMP/llaminar-arm64-evidence/envelopes-image.log"
+            -t llaminar-arm-envelopes:pr "$context" 2>&1 | tee "$RUNNER_TEMP/llaminar-arm64-evidence/envelopes-image.log"
           git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/llaminar-arm64-evidence/envelopes/source.txt"
           printf '%s\n' "$TOOLCHAIN_CONTEXT" > "$RUNNER_TEMP/llaminar-arm64-evidence/envelopes/toolchain.txt"
           docker run --rm --mount "type=bind,source=$RUNNER_TEMP/llaminar-arm64-evidence/envelopes,target=/evidence" llaminar-arm-envelopes:pr

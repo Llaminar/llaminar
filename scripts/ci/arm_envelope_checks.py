@@ -3,6 +3,8 @@
 # @brief Run compile-only ARM envelopes; preserve every stage even after failure.
 """Probe evidence is not production-object qualification. Never run ISA binaries."""
 import json
+import hashlib
+import time
 import os
 import shutil
 import tempfile
@@ -17,8 +19,9 @@ def run(root, output, execute=subprocess.run):
     output.mkdir(parents=True, exist_ok=True)
     output = Path(tempfile.mkdtemp(prefix='attempt-', dir=output))
     tools = {name: shutil.which(value) or value for name, value in
-             dict(ninja='ninja', cc=os.environ.get('CC', 'gcc-14'),
-                  cxx=os.environ.get('CXX', 'g++-14')).items()}
+             dict(ninja='ninja', cc=os.environ.get('CC', 'cc'),
+                  cxx=os.environ.get('CXX', 'c++')).items()}
+    scratch = tempfile.TemporaryDirectory(prefix='arm-envelopes-')
     identity = {'tools': tools, 'source': str(Path(root).resolve()), 'versions': {}}
     for name, command in [('source', ['git', '-C', str(root), 'rev-parse', 'HEAD', 'HEAD^{tree}'])] + [(n, [p, '--version']) for n, p in tools.items()]:
         try:
@@ -27,33 +30,48 @@ def run(root, output, execute=subprocess.run):
         except OSError as error:
             identity['versions'][name] = dict(command=command, returncode=127, error=str(error))
     (output / 'identity.json').write_text(json.dumps(identity, indent=2))
+    identity['sha256'] = {name: hashlib.sha256(Path(path).read_bytes()).hexdigest()
+                          for name, path in tools.items() if Path(path).is_file()}
+    compiler_bound = all(Path(tools[name]).is_file() and Path('/usr/bin/' + expected).is_file()
+                         and Path(tools[name]).resolve() == Path('/usr/bin/' + expected).resolve()
+                         for name, expected in [('cc', 'gcc-14'), ('cxx', 'g++-14')])
+    identity['compiler_bound'] = compiler_bound
+    (output / 'identity.json').write_text(json.dumps(identity, indent=2))
     records = []
     for isa in ('NEON_DOTPROD', 'NEON_I8MM'):
         for config in ('Release', 'Integration'):
-            build = output / f'{isa}-{config}'
+            build = Path(scratch.name) / f'{isa}-{config}'
+            failed = not compiler_bound if execute is subprocess.run else False
             stages = [
                 ('configure', ['cmake', '-S', str(Path(root) / 'tests/v2/portability'), '-B', str(build), '-G', 'Ninja', f'-DLLAMINAR_CPU_ISA={isa}', f'-DCMAKE_BUILD_TYPE={config}', '-DCMAKE_EXPORT_COMPILE_COMMANDS=ON', f'-DCMAKE_MAKE_PROGRAM:FILEPATH={tools["ninja"]}', f'-DCMAKE_C_COMPILER={tools["cc"]}', f'-DCMAKE_CXX_COMPILER={tools["cxx"]}']),
                 ('build', ['cmake', '--build', str(build), '--parallel', '--target', 'v2_cpu_native_tile_register_proof']),
                 ('verify', ['ctest', '--test-dir', str(build), '--output-on-failure', '--no-tests=error', '-R', '^V2_Integration_CPUNativeNEONTileRegisters$'])]
             for stage, command in stages:
+                started = time.monotonic()
+                skipped = failed
                 with (output / f'{isa}-{config}-{stage}.log').open('w') as log:
                     try:
-                        result = execute(command, stdout=log, stderr=subprocess.STDOUT)
-                        code = result.returncode
+                        if skipped:
+                            log.write('skipped-after-failure\n')
+                            code = 1
+                        else:
+                            result = execute(command, stdout=log, stderr=subprocess.STDOUT)
+                            code = result.returncode
                     except OSError as error:
                         log.write(f'{type(error).__name__}: {error}\n')
                         code = 127
-                if stage == 'build' and build.exists():
-                    snapshot = output / f'{isa}-{config}-build-evidence'
+                if build.exists():
+                    snapshot = output / f'{isa}-{config}-{stage}-evidence'
                     snapshot.mkdir()
-                    for name in ('cpu_native_tile_registers', 'CMakeCache.txt', 'compile_commands.json'):
-                        source = build / name
-                        if source.is_dir():
-                            shutil.copytree(source, snapshot / name)
-                        elif source.exists():
-                            shutil.copy2(source, snapshot / name)
-                records.append(dict(isa=isa, configuration=config, stage=stage, command=command, returncode=code))
+                    for source in build.rglob('*'):
+                        if source.is_file() and source.suffix in ('.json', '.csv', '.log', '.txt'):
+                            destination = snapshot / source.relative_to(build)
+                            destination.parent.mkdir(parents=True, exist_ok=True)
+                            shutil.copy2(source, destination)
+                failed = failed or bool(code)
+                records.append(dict(isa=isa, configuration=config, stage=stage, command=command, returncode=code, classification='probe-envelope(non-canonical-for-productionGate7)', status='skipped-after-failure' if skipped else 'executed', seconds=time.monotonic()-started))
                 (output / 'stages.json').write_text(json.dumps(records, indent=2))
+    scratch.cleanup()
     return int(any(r['returncode'] for r in records))
 
 
