@@ -2,8 +2,9 @@
  * @file CPUContractionWitness.cpp
  * @brief Isolated disassembly witnesses of actual x86 contribution helpers.
  *
- * Compile with -O3 -ffp-contract=fast -mfma and either -mavx2 or
- * -mavx512f. Each externally visible function owns one policy, so an FMA in
+ * Compiled by tests/v2/scripts/cpu_contraction_proof.py with the production
+ * core's actual command per x86 envelope, canonically and with an explicit
+ * -ffp-contract=fast setting. Each externally visible function owns one policy, so an FMA in
  * an expert symbol cannot be confused with an intentional backend-native FMA.
  */
 #include "kernels/cpu/gemm/CPUNativeQuantisedContributionContract.h"
