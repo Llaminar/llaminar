@@ -3316,7 +3316,7 @@ if "-###" in args:
     count = int(counter.read_text()) + 1 if counter.exists() else 1
     counter.write_text(str(count))
     temporary = f"/tmp/cc{{count:06d}}.s"
-    default = (f" {{here}}/cc1plus -quiet -MD {{value('-MF')}} -MF {{value('-MF')}} -MT probe -H {{source}} "
+    default = (f" {{here}}/cc1plus -quiet -std=c++20 -MD {{value('-MF')}} -MF {{value('-MF')}} -MT probe -H {{source}} "
                f"-o {{temporary}}\\n as -EL -march=armv8-a -o {{value('-o')}} {{temporary}}\\n")
     jobs = setting("jobs.txt", default).format(here=here, source=source, obj=value("-o"), deps=value("-MF"))
     sys.stderr.write("Using built-in specs.\\nCOMPILER_PATH=" + str(here) + "\\n" + jobs)
@@ -3621,7 +3621,7 @@ class ProofBindingTest(unittest.TestCase):
 
     def test_opaque_routes_are_rejected_before_or_by_the_compile(self) -> None:
         here = self.tool
-        cc1 = f" {here}/cc1plus -quiet -MD {{deps}} -MF {{deps}} -MT probe -H {{source}} -o /tmp/ccTEST01.s"
+        cc1 = f" {here}/cc1plus -quiet -std=c++20 -MD {{deps}} -MF {{deps}} -MT probe -H {{source}} -o /tmp/ccTEST01.s"
         assembler = " as -EL -o {obj} /tmp/ccTEST01.s"
         cases = {
             "PCH marker in the translation unit": ("preprocessed.txt", '#pragma GCC pch_preprocess "p.h.gch"\nint a;\n'),
@@ -3816,7 +3816,7 @@ class ProofBindingTest(unittest.TestCase):
         Path(self.args.proof).write_text(json.dumps(receipt))
         CHECKER.verify(self.args)
         (self.tool / "event-compile.txt").write_text(
-            f"write {self.tool / 'jobs.txt'} replanned\n {{here}}/cc1plus -quiet -g -MD {{deps}} -MF {{deps}} -MT probe -H "
+            f"write {self.tool / 'jobs.txt'} replanned\n {{here}}/cc1plus -quiet -std=c++20 -g -MD {{deps}} -MF {{deps}} -MT probe -H "
             "{source} -o /tmp/ccXXXXXX.s\n as -EL -o {obj} /tmp/ccXXXXXX.s\n")
         with self.assertRaisesRegex(ValueError, "driver plan"):
             CHECKER.build(self.args)
