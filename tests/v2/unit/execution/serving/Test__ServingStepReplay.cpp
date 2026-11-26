@@ -209,6 +209,36 @@ namespace llaminar2::test
         EXPECT_NE(ServingStepTraceReplayer::replay(trace), "");
     }
 
+    TEST(ServingStepReplay, SuspendChangesForwardCompositionAndIsHonestlyNotExact)
+    {
+        // MID-TRANSACTION suspension changes the shared-forward row
+        // composition, so the no-movement control's recorded forward events do
+        // NOT replay unchanged when a suspension cell is injected into an
+        // existing trace. This is the honest P4 boundary: a suspension cell is
+        // only exact against a control recorded WITH the same suspension
+        // schedule. The injected cell must therefore be detected (not silently
+        // accepted), and the balanced-schedule validation still holds.
+        const auto trace = fixture();
+        ASSERT_GT(trace.steps.size(), 1u);
+        auto suspended = trace;
+        if (!suspended.admissions.empty())
+        {
+            const auto id = suspended.admissions.front().id;
+            auto suspend_cmd = suspended.commands.front();
+            suspend_cmd.kind = ServingStepTrace::Command::Kind::Suspend;
+            suspend_cmd.id = id;
+            suspend_cmd.step = 1;
+            suspended.commands.push_back(suspend_cmd);
+            auto restore_cmd = suspend_cmd;
+            restore_cmd.kind = ServingStepTrace::Command::Kind::Restore;
+            suspended.commands.push_back(restore_cmd);
+            EXPECT_NO_THROW(suspended.validateSchedule());
+            // NOT exact: changing the cohort composition changes the recorded
+            // forward; the replay must REFUSE rather than fabricate equality.
+            EXPECT_NE(ServingStepTraceReplayer::replay(suspended), "");
+        }
+    }
+
     TEST(ServingStepReplay, ChangedOutcomeIsDetected)
     {
         auto trace = fixture();

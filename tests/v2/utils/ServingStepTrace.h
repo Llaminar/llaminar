@@ -47,7 +47,7 @@ namespace llaminar2::test
 
         struct Command
         {
-            enum class Kind { Submit, Grant, Force, Cancel } kind = Kind::Submit;
+            enum class Kind { Submit, Grant, Force, Cancel, Suspend, Restore } kind = Kind::Submit;
             int step = 0; ///< Issued before this step.
             ServingBatchRequest request; ///< Submit only.
             std::uint64_t id = 0;
@@ -182,6 +182,8 @@ namespace llaminar2::test
                 case Command::Kind::Grant: out << "grant " << c.step << ' ' << c.id << ' ' << c.value << '\n'; break;
                 case Command::Kind::Force: out << "force " << c.step << ' ' << c.id << ' ' << c.value << '\n'; break;
                 case Command::Kind::Cancel: out << "cancel " << c.step << ' ' << c.id << '\n'; break;
+                case Command::Kind::Suspend: out << "suspend " << c.step << ' ' << c.id << '\n'; break;
+                case Command::Kind::Restore: out << "restore " << c.step << ' ' << c.id << '\n'; break;
                 }
             }
             for (const auto &a : admissions)
@@ -236,10 +238,31 @@ namespace llaminar2::test
                 case Command::Kind::Submit:
                 case Command::Kind::Grant:
                 case Command::Kind::Force:
-                case Command::Kind::Cancel: break;
+                case Command::Kind::Cancel:
+                case Command::Kind::Suspend:
+                case Command::Kind::Restore:
+                    break;
                 default: throw std::runtime_error("unknown recorded command kind");
                 }
             }
+            // Balanced suspension schedule: every suspend has a matching restore
+            // (one manifest per request identity at a time).
+            std::set<std::uint64_t> suspended;
+            for (const auto &command : commands)
+            {
+                if (command.kind == Command::Kind::Suspend)
+                {
+                    if (!suspended.insert(command.id).second)
+                        throw std::runtime_error("recorded double suspension of one request");
+                }
+                else if (command.kind == Command::Kind::Restore)
+                {
+                    if (suspended.erase(command.id) != 1)
+                        throw std::runtime_error("recorded restore without a matching suspend");
+                }
+            }
+            if (!suspended.empty())
+                throw std::runtime_error("recorded suspension without a matching restore");
             std::set<std::uint64_t> admitted_ids;
             for (const auto &admission : admissions)
             {
@@ -381,14 +404,17 @@ namespace llaminar2::test
                     ++laws;
                     needs_law = false;
                 }
-                else if (kind == "grant" || kind == "force" || kind == "cancel")
+                else if (kind == "grant" || kind == "force" || kind == "cancel" ||
+                         kind == "suspend" || kind == "restore")
                 {
                     Command c;
                     c.kind = kind == "grant" ? Command::Kind::Grant
                              : kind == "force" ? Command::Kind::Force
-                                               : Command::Kind::Cancel;
+                             : kind == "cancel" ? Command::Kind::Cancel
+                             : kind == "suspend" ? Command::Kind::Suspend
+                                                  : Command::Kind::Restore;
                     s >> c.step >> c.id;
-                    if (c.kind != Command::Kind::Cancel)
+                    if (c.kind == Command::Kind::Grant || c.kind == Command::Kind::Force)
                         s >> c.value;
                     trace.commands.push_back(c);
                 }
@@ -616,6 +642,7 @@ namespace llaminar2::test
             auto executor = std::make_shared<ServingStepTraceReplayer>(trace);
             ServingSession session(*executor, trace.context, trace.vocab);
             session.setTraceRecorder(executor);
+            std::map<std::uint64_t, ServingContinuationManifest> suspended;
             std::string error;
             // The replay preserves the recorded admission order; the queue
             // bound is the recorded capacity, so any accepted request in the
@@ -649,6 +676,26 @@ namespace llaminar2::test
                         case ServingStepTrace::Command::Kind::Grant: session.grant(c.id, c.value); break;
                         case ServingStepTrace::Command::Kind::Force: session.force(c.id, c.value); break;
                         case ServingStepTrace::Command::Kind::Cancel: session.cancel(c.id); break;
+                        case ServingStepTrace::Command::Kind::Suspend:
+                        {
+                            auto manifest = session.suspend(c.id, error);
+                            if (!manifest)
+                                return "suspend failed: " + error;
+                            suspended.emplace(c.id, std::move(*manifest));
+                            break;
+                        }
+                        case ServingStepTrace::Command::Kind::Restore:
+                        {
+                            auto it = suspended.find(c.id);
+                            if (it == suspended.end())
+                                return "restore failed: no suspended manifest for " +
+                                    std::to_string(c.id);
+                            auto manifest = std::move(it->second);
+                            suspended.erase(it);
+                            if (!session.restore(std::move(manifest), error))
+                                return "restore failed: " + error;
+                            break;
+                        }
                         }
                     }
                     const auto events = session.step();
