@@ -9087,6 +9087,17 @@ add_v2_test(V2_Unit_AttentionComputeStage
     LABELS "V2;Unit;Kernels;Attention;ComputeStage;KernelFactory;CPU"
     MPI_PROCS 1
 )
+
+# P2 stage-level pooled consumption (device-free): the production
+# AttentionComputeStage pooled path is byte-identical to the contiguous
+# control across a two-page pooled publication.
+add_v2_test(V2_Integration_PooledStageConsumption
+    COMMAND $<TARGET_FILE:v2_test_attention_compute_stage>
+            --gtest_filter=PooledStageConsumption.*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;KVCache;PagedKV;Attention;Pooled;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 60
+    ENVIRONMENT "OMP_NUM_THREADS=4;OMP_DYNAMIC=false;LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PooledStageConsumption)
 # These production workspace descriptors query immutable physical-device
 # properties. Keep their proof in both backend preflight lanes, not Unit.
 foreach(V2_ATTENTION_BACKEND CUDA ROCm)
