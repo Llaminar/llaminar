@@ -7,6 +7,8 @@
 # an ARM target mislabeled as scalar/AVX2.
 include("${CMAKE_CURRENT_LIST_DIR}/V2CoreFreeTestRegistration.cmake")
 get_filename_component(V2_NUMERIC_ROOT "${CMAKE_CURRENT_LIST_DIR}/../../.." ABSOLUTE)
+# The NEON projection tests reach CPUNativeOrderedPartitionPlan.h; they link its reporter authority.
+include("${V2_NUMERIC_ROOT}/cmake/NativePartitionPlan.cmake")
 
 # @brief Build one copy of the existing production numerical contract tests.
 # @param target Exact executable identity used by Unit/preflight registration.
@@ -89,7 +91,8 @@ if(LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
     target_include_directories(v2_test_cpu_native_neon_prepared_projection PRIVATE
         "${V2_NUMERIC_ROOT}/src/v2" "${V2_NUMERIC_ROOT}/tests/v2")
     target_compile_features(v2_test_cpu_native_neon_prepared_projection PRIVATE cxx_std_20)
-    target_link_libraries(v2_test_cpu_native_neon_prepared_projection PRIVATE GTest::gtest_main)
+    target_link_libraries(v2_test_cpu_native_neon_prepared_projection PRIVATE GTest::gtest_main
+        llaminar2_native_partition_plan)
     v2_add_core_free_test(V2_Unit_CPUNativeNEONPreparedProjection
         COMMAND $<TARGET_FILE:v2_test_cpu_native_neon_prepared_projection>
         LABELS V2 Unit CPU NEON NativeQuantised Numerics ByteExact)
@@ -125,7 +128,8 @@ if(LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
     target_include_directories(v2_test_cpu_native_neon_packed_prefill PRIVATE
         "${V2_NUMERIC_ROOT}/src/v2" "${V2_NUMERIC_ROOT}/tests/v2")
     target_compile_features(v2_test_cpu_native_neon_packed_prefill PRIVATE cxx_std_20)
-    target_link_libraries(v2_test_cpu_native_neon_packed_prefill PRIVATE GTest::gtest_main OpenMP::OpenMP_CXX)
+    target_link_libraries(v2_test_cpu_native_neon_packed_prefill PRIVATE GTest::gtest_main OpenMP::OpenMP_CXX
+        llaminar2_native_partition_plan)
     v2_add_core_free_test(V2_Unit_CPUNativeNEONPackedPrefill
         COMMAND $<TARGET_FILE:v2_test_cpu_native_neon_packed_prefill>
         LABELS V2 Unit CPU NEON NativeQuantised ByteExact)

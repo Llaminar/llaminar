@@ -1458,6 +1458,11 @@ set(LLAMINAR2_CORE_LIBRARY_TYPE STATIC)
 if(LLAMINAR_SHARED_CORE)
     set(LLAMINAR2_CORE_LIBRARY_TYPE SHARED)
 endif()
+# The ordered-partition plan reporters are one object shared by the core and
+# every core-free consumer of their header. Created here, beside the core, it
+# inherits the core's complete compile flags; the core links it below.
+set(LLAMINAR_NATIVE_PARTITION_PLAN_FLAGS_TARGET llaminar2_core)
+include("${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/NativePartitionPlan.cmake")
 add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     # Interfaces
     interfaces/IMPIContext.cpp
@@ -1469,7 +1474,6 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     backends/NativeGraphDependencyReduction.cpp
     kernels/cpu/gemm/CPUProjectionWorkspaceContract.cpp
     kernels/cpu/gemm/CPUNativeX86PackedPrefill.cpp
-    kernels/cpu/gemm/CPUNativeOrderedPartitionPlan.cpp
     backends/InventoryPrinter.cpp
     backends/PCIeEnumeration.cpp
     backends/BackendManager.cpp
@@ -2280,7 +2284,8 @@ endif()
 
 # Required dependencies
 target_include_directories(llaminar2_core PUBLIC ${NUMA_INCLUDE_DIR})
-target_link_libraries(llaminar2_core PRIVATE llaminar2_text_pre_tokenizer PkgConfig::LLAMINAR_CPU_PLACEMENT_HWLOC)
+target_link_libraries(llaminar2_core PRIVATE llaminar2_text_pre_tokenizer PkgConfig::LLAMINAR_CPU_PLACEMENT_HWLOC
+    llaminar2_native_partition_plan)
 
 target_link_libraries(llaminar2_core PUBLIC
     MPI::MPI_CXX

@@ -20904,14 +20904,14 @@ add_v2_test(V2_Perf_CPUNativeQuantised_ThreadScaling
 # launch over the production batch path. Registered with the other v2_perf_*
 # targets so Release perf-only builds produce it; widths ship after E2E.
 if(LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
-    # Core-free: the NEON tile headers' cold plan/walk reporters are compiled in directly.
+    # Core-free: the NEON tile headers' cold plan/walk reporters come from their link authority.
     add_executable(v2_perf_cpu_native_neon_panel_tournament
-        performance/kernels/cpu/native_quantised/Perf__CPUNativeNEONPanelTournament.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/../../src/v2/kernels/cpu/gemm/CPUNativeOrderedPartitionPlan.cpp)
+        performance/kernels/cpu/native_quantised/Perf__CPUNativeNEONPanelTournament.cpp)
     target_compile_features(v2_perf_cpu_native_neon_panel_tournament PRIVATE cxx_std_20)
     target_include_directories(v2_perf_cpu_native_neon_panel_tournament PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/../../src/v2 ${CMAKE_CURRENT_SOURCE_DIR})
-    target_link_libraries(v2_perf_cpu_native_neon_panel_tournament PRIVATE OpenMP::OpenMP_CXX)
+    target_link_libraries(v2_perf_cpu_native_neon_panel_tournament PRIVATE OpenMP::OpenMP_CXX
+        llaminar2_native_partition_plan)
     add_v2_test(V2_Perf_CPUNativeNEONPanelTournamentSmoke
         COMMAND ${CMAKE_COMMAND} -E env LLAMINAR_PANEL_SHAPES=200x512 LLAMINAR_PANEL_M=1,3
             LLAMINAR_PANEL_WARMUP=1 LLAMINAR_PANEL_ITERS=3 LLAMINAR_PANEL_STRIPS=4
@@ -45163,20 +45163,69 @@ if(V2_BACKEND_OMITTED_TEST_COUNT GREATER 0)
     message(STATUS "V2 Tests: omitted ${V2_BACKEND_OMITTED_TEST_COUNT} registrations whose backend family is not compiled (HAVE_CUDA=${HAVE_CUDA} HAVE_ROCM=${HAVE_ROCM})")
 endif()
 
-# Header-only kernel admission plus its cold reporter translation unit; no core link.
+# Header-only kernel admission; no core link. The cold reporters come only from
+# their link authority, so an authority without them fails this link on every
+# CPU architecture, and the death tests prove both reporters terminate.
 add_executable(v2_unit_native_superblock_walk_contract
-    unit/kernels/Test__NativeSuperblockWalkContract.cpp
-    ${CMAKE_SOURCE_DIR}/kernels/cpu/gemm/CPUNativeOrderedPartitionPlan.cpp)
+    unit/kernels/Test__NativeSuperblockWalkContract.cpp)
+target_compile_features(v2_unit_native_superblock_walk_contract PRIVATE cxx_std_20)
 target_include_directories(v2_unit_native_superblock_walk_contract PRIVATE ${CMAKE_SOURCE_DIR})
-target_link_libraries(v2_unit_native_superblock_walk_contract PRIVATE GTest::gtest_main OpenMP::OpenMP_CXX)
+target_link_libraries(v2_unit_native_superblock_walk_contract PRIVATE GTest::gtest_main OpenMP::OpenMP_CXX
+    llaminar2_native_partition_plan)
 add_v2_test(V2_Unit_NativeSuperblockWalkContract
     COMMAND $<TARGET_FILE:v2_unit_native_superblock_walk_contract>
-    LABELS "V2;Unit;CPU;DeviceFree;GEMM;Regression" NO_MPI NO_MODELS TIMEOUT 30)
+    LABELS "V2;Unit;CPU;DeviceFree;GEMM;Regression" MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 add_v2_test(V2_Integration_NativeSuperblockWalkContract
     COMMAND $<TARGET_FILE:v2_unit_native_superblock_walk_contract>
-    LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;GEMM;Regression" NO_MPI NO_MODELS TIMEOUT 30)
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;GEMM;Regression" MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NativeSuperblockWalkContract)
 
 # Bounded x86 contribution-helper contraction witness on the production core's
 # actual command; see the module for its per-configuration qualification.
 include("${CMAKE_CURRENT_LIST_DIR}/cmake/V2CPUContractionProof.cmake")
+
+# The ordered-partition plan reporters have one link authority
+# (cmake/NativePartitionPlan.cmake). Build work of the Unit and preflight gates
+# observes, with the configured tools, that a header consumer links with that
+# authority and fails on both reporters without it, and that the canonical
+# walk-contract registrations configure as single MPI-free processes while the
+# same registrations without MPI_PROCS are rejected. The tests verify the
+# source- and compiler-bound receipt without invoking any tool.
+set(V2_NATIVE_PARTITION_PLAN_LINK_SCRIPT
+    "${CMAKE_CURRENT_SOURCE_DIR}/scripts/native_partition_plan_link_authority.py")
+set(V2_NATIVE_PARTITION_PLAN_LINK_RECEIPT "${CMAKE_CURRENT_BINARY_DIR}/native_partition_plan/receipt.json")
+add_custom_command(OUTPUT "${V2_NATIVE_PARTITION_PLAN_LINK_RECEIPT}"
+    COMMAND "${Python3_EXECUTABLE}" "${V2_NATIVE_PARTITION_PLAN_LINK_SCRIPT}" build
+        --identity "${V2_CPU_CONTRACTION_IDENTITY}" --report "${V2_NATIVE_PARTITION_PLAN_LINK_RECEIPT}"
+        --cmake "${CMAKE_COMMAND}" --ctest "${CMAKE_CTEST_COMMAND}" --ninja "${CMAKE_MAKE_PROGRAM}"
+        --session-helper "$<TARGET_FILE:llaminar_mpi_session>"
+    DEPENDS "${V2_NATIVE_PARTITION_PLAN_LINK_SCRIPT}" "${V2_CPU_CONTRACTION_IDENTITY}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_cpu_contraction_witness.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/NativePartitionPlan.cmake"
+        "${CMAKE_SOURCE_DIR}/kernels/cpu/gemm/CPUNativeOrderedPartitionPlan.h"
+        "${CMAKE_SOURCE_DIR}/kernels/cpu/gemm/CPUNativeOrderedPartitionPlan.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt"
+        "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/cmake/NativeMPISessionOwner.cmake"
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/V2TestTargetSelection.cmake"
+        "${CMAKE_CXX_COMPILER}" llaminar_mpi_session
+    VERBATIM)
+add_custom_target(v2_native_partition_plan_link_authority DEPENDS "${V2_NATIVE_PARTITION_PLAN_LINK_RECEIPT}")
+set_property(GLOBAL APPEND PROPERTY V2_UNIT_GATE_TARGETS v2_native_partition_plan_link_authority)
+foreach(_plan_link_suite IN ITEMS Unit Integration)
+    set(_plan_link_labels "V2;${_plan_link_suite};DeviceFree;CPU;Build;CMake;Regression")
+    if(_plan_link_suite STREQUAL "Integration")
+        set(_plan_link_labels "${_plan_link_labels};ProductionTestPreflight")
+    endif()
+    add_test(NAME V2_${_plan_link_suite}_NativePartitionPlanLinkAuthority
+        COMMAND "${Python3_EXECUTABLE}" "${V2_NATIVE_PARTITION_PLAN_LINK_SCRIPT}" verify
+            --identity "${V2_CPU_CONTRACTION_IDENTITY}" --report "${V2_NATIVE_PARTITION_PLAN_LINK_RECEIPT}")
+    set_property(GLOBAL PROPERTY V2_TEST_BUILD_TARGETS_V2_${_plan_link_suite}_NativePartitionPlanLinkAuthority
+        v2_native_partition_plan_link_authority)
+    set_tests_properties(V2_${_plan_link_suite}_NativePartitionPlanLinkAuthority PROPERTIES
+        LABELS "${_plan_link_labels}" TIMEOUT 30)
+endforeach()
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NativePartitionPlanLinkAuthority)
+add_test(NAME V2_Unit_NativePartitionPlanLinkAuthorityControls
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/scripts/test_native_partition_plan_link_authority.py")
+set_tests_properties(V2_Unit_NativePartitionPlanLinkAuthorityControls PROPERTIES
+    LABELS "V2;Unit;DeviceFree;CPU;Build;CMake;Regression" TIMEOUT 30)

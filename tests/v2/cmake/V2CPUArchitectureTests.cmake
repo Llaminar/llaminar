@@ -11,6 +11,8 @@ endif()
 get_filename_component(V2_CPU_ARCHITECTURE_ROOT "${CMAKE_CURRENT_LIST_DIR}/../../.." ABSOLUTE)
 
 include("${CMAKE_CURRENT_LIST_DIR}/V2CoreFreeTestRegistration.cmake")
+# Core-free consumers of CPUNativeOrderedPartitionPlan.h link its reporter authority.
+include("${V2_CPU_ARCHITECTURE_ROOT}/cmake/NativePartitionPlan.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/V2CPUImmutableLookupTests.cmake")
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 add_executable(v2_test_cpu_compiler_configuration
@@ -1178,7 +1180,7 @@ add_executable(v2_unit_cpu_native_weight_view
 target_compile_features(v2_unit_cpu_native_weight_view PRIVATE cxx_std_20)
 target_include_directories(v2_unit_cpu_native_weight_view PRIVATE
     "${V2_CPU_ARCHITECTURE_ROOT}/src/v2" "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2")
-target_link_libraries(v2_unit_cpu_native_weight_view PRIVATE GTest::gtest_main)
+target_link_libraries(v2_unit_cpu_native_weight_view PRIVATE GTest::gtest_main llaminar2_native_partition_plan)
 v2_add_core_free_test(V2_Unit_CPUNativeQuantisedWeightView
     COMMAND $<TARGET_FILE:v2_unit_cpu_native_weight_view>
     LABELS V2 Unit CPU DeviceFree NativeQuantised Quantization)
@@ -1195,7 +1197,7 @@ add_executable(v2_unit_cpu_native_metadata_seal
 target_compile_features(v2_unit_cpu_native_metadata_seal PRIVATE cxx_std_20)
 target_include_directories(v2_unit_cpu_native_metadata_seal PRIVATE
     "${V2_CPU_ARCHITECTURE_ROOT}/src/v2" "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2")
-target_link_libraries(v2_unit_cpu_native_metadata_seal PRIVATE GTest::gtest_main)
+target_link_libraries(v2_unit_cpu_native_metadata_seal PRIVATE GTest::gtest_main llaminar2_native_partition_plan)
 v2_add_core_free_test(V2_Unit_CPUNativeQuantisedMetadataSeal
     COMMAND $<TARGET_FILE:v2_unit_cpu_native_metadata_seal>
     LABELS V2 Unit CPU DeviceFree NativeQuantised Metadata)
@@ -1282,15 +1284,15 @@ if(LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
             --gtest_filter=*Q8OutputScaleOverflowIsFatalBeforeBlockPublication
         LABELS V2 Integration ProductionTestPreflight CPU NEON DeviceFree RoPE Quantization Regression)
 
-    # Core-free NEON kernel tests compile the cold plan/walk reporters of the tile headers directly.
+    # Core-free NEON kernel tests link the tile headers' cold plan/walk reporter authority.
     add_executable(v2_test_native_neon_execution
         "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/cpu/Test__CPUNativeNEONExecution.cpp"
-        "${V2_CPU_ARCHITECTURE_ROOT}/src/v2/kernels/cpu/primitives/SwiGLUPrimitives.cpp"
-        "${V2_CPU_ARCHITECTURE_ROOT}/src/v2/kernels/cpu/gemm/CPUNativeOrderedPartitionPlan.cpp")
+        "${V2_CPU_ARCHITECTURE_ROOT}/src/v2/kernels/cpu/primitives/SwiGLUPrimitives.cpp")
     target_compile_features(v2_test_native_neon_execution PRIVATE cxx_std_20)
     target_include_directories(v2_test_native_neon_execution PRIVATE
         "${V2_CPU_ARCHITECTURE_ROOT}/src/v2" "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2")
-    target_link_libraries(v2_test_native_neon_execution PRIVATE GTest::gtest_main OpenMP::OpenMP_CXX)
+    target_link_libraries(v2_test_native_neon_execution PRIVATE GTest::gtest_main OpenMP::OpenMP_CXX
+        llaminar2_native_partition_plan)
     v2_add_core_free_test(V2_Unit_CPUNativeNEONExecution WHOLE_TEAM
         COMMAND $<TARGET_FILE:v2_test_native_neon_execution>
         LABELS V2 Unit CPU NEON DeviceFree NativeQuantised Numerics ByteExact)
@@ -1316,12 +1318,12 @@ if(LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
         LABELS V2 Integration ProductionTestPreflight CPU NEON DeviceFree NativeQuantised SwiGLU ByteExact AllFormats)
 
     add_executable(v2_test_native_neon_projection_batch
-        "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/cpu/Test__CPUNativeNEONProjectionBatch.cpp"
-        "${V2_CPU_ARCHITECTURE_ROOT}/src/v2/kernels/cpu/gemm/CPUNativeOrderedPartitionPlan.cpp")
+        "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/cpu/Test__CPUNativeNEONProjectionBatch.cpp")
     target_compile_features(v2_test_native_neon_projection_batch PRIVATE cxx_std_20)
     target_include_directories(v2_test_native_neon_projection_batch PRIVATE
         "${V2_CPU_ARCHITECTURE_ROOT}/src/v2" "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2")
-    target_link_libraries(v2_test_native_neon_projection_batch PRIVATE GTest::gtest_main OpenMP::OpenMP_CXX)
+    target_link_libraries(v2_test_native_neon_projection_batch PRIVATE GTest::gtest_main OpenMP::OpenMP_CXX
+        llaminar2_native_partition_plan)
     v2_add_core_free_test(V2_Unit_CPUNativeNEONProjectionBatch WHOLE_TEAM
         COMMAND $<TARGET_FILE:v2_test_native_neon_projection_batch>
             --gtest_filter=-*AllPositiveWorkersThroughTen*
