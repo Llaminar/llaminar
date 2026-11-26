@@ -43,6 +43,11 @@ endif()
 # The build type flags are picked up by the compiler setup during project()
 project(llaminar2 LANGUAGES C CXX)
 
+# Repository checkout root: the single authority for repository-relative paths
+# (external/ dependencies and test sources) in this directory and tests/v2, in
+# every backend configuration.
+get_filename_component(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
+
 # Compile the same small semantic source identity into capture and offline replay.
 include("${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/MTPDepthReplayIdentity.cmake")
 
@@ -915,7 +920,6 @@ if(HAVE_ROCM)
     # Discovery must know the local dependency location even when it is
     # already built and nested dependency compilation is disabled. Runtime
     # loading now honors this CMake selection exactly.
-    get_filename_component(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
     set(RCCL_EXTERNAL_DIR "${REPO_ROOT}/external/rccl")
     set(RCCL_BUILD_DIR "${RCCL_EXTERNAL_DIR}/build")
 
@@ -1253,8 +1257,6 @@ if(USE_ONEDNN)
     find_package(Git REQUIRED)
 
     # First, ensure OneDNN exists in external/ and is on the expected revision
-    # Note: Repository root is two levels up from src/v2
-    get_filename_component(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
     set(ONEDNN_EXTERNAL_DIR "${REPO_ROOT}/external/onednn")
     set(ONEDNN_SOURCE_REF_FILE "${ONEDNN_EXTERNAL_DIR}/.llaminar-onednn-source-ref")
     set(ONEDNN_GIT_URL "https://github.com/uxlfoundation/oneDNN.git")

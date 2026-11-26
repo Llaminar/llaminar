@@ -16,6 +16,14 @@ if(HAVE_ROCM)
     find_package(rocprofiler-sdk-roctx CONFIG REQUIRED)
 endif()
 
+# Registrations resolve repository files through REPO_ROOT in every backend
+# configuration. An unset or foreign root would silently turn those paths into
+# filesystem-root paths (for example /external/cnpy), so reject it here.
+get_filename_component(V2_TEST_REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
+if(NOT REPO_ROOT STREQUAL V2_TEST_REPO_ROOT)
+    message(FATAL_ERROR "tests/v2 requires REPO_ROOT='${V2_TEST_REPO_ROOT}' from src/v2; got '${REPO_ROOT}'")
+endif()
+
 # =============================================================================
 # Linker Workaround for Circular Static Library Dependencies
 # =============================================================================
