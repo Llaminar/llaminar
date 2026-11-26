@@ -1814,6 +1814,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     backends/RetainedParticipantGraphExecutable.cpp
     planning/PhysicalMemoryAuthority.cpp
     planning/PagedKVPoolGeometry.cpp
+    planning/PagedKVInstancePlan.cpp
     planning/PhysicalPagePool.cpp
     planning/CompletionWitness.cpp
     planning/PageTableAdmission.cpp
