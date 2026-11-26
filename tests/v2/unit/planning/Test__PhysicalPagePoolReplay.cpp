@@ -244,9 +244,18 @@ public:
         else if (kind == "table-commit")
         {
             std::string snapshot;
-            if (!(input >> name >> snapshot) || !updates_.contains(name) || snapshots_.contains(snapshot)) fail();
-            snapshots_.emplace(snapshot, updates_.at(name).commit());
-            updates_.erase(name);
+            if (!(input >> name >> snapshot) || snapshots_.contains(snapshot)) fail();
+            if (updates_.contains(name))
+            {
+                snapshots_.emplace(snapshot, updates_.at(name).commit());
+                updates_.erase(name);
+            }
+            else if (combinations_.contains(name))
+            {
+                snapshots_.emplace(snapshot, combinations_.at(name).table_update.commit());
+                combinations_.erase(name);
+            }
+            else fail();
             outcome = std::to_string(snapshots_.at(snapshot).version());
         }
         else if (kind == "table-attach-archive")
@@ -255,7 +264,8 @@ public:
             size_t page_tokens;
             std::uint64_t trust, ancestry;
             if (!(input >> name >> update_name >> request >> page_tokens >> trust >> ancestry >> hex) ||
-                !updates_.contains(update_name) || !requests_.contains(request) || hex.size() % 2)
+                (!updates_.contains(update_name) && !combinations_.contains(update_name)) ||
+                (updates_.contains(update_name) && !requests_.contains(request)) || hex.size() % 2)
                 fail();
             std::vector<std::byte> bytes;
             for (size_t i = 0; i < hex.size(); i += 2)
@@ -268,8 +278,12 @@ public:
                 bytes.push_back(static_cast<std::byte>(16 * digit(hex[i]) + digit(hex[i + 1])));
             }
             auto archive = PagedKVArchive::parse(bytes);
-            updates_.at(update_name).attachArchivedPrefix(archive, requests_.at(request),
-                static_cast<int>(page_tokens), trust, ancestry);
+            if (updates_.contains(update_name))
+                updates_.at(update_name).attachArchivedPrefix(archive, requests_.at(request),
+                    static_cast<int>(page_tokens), trust, ancestry);
+            else
+                combinations_.at(update_name).table_update.attachArchivedPrefix(archive,
+                    combinations_.at(update_name).grant, static_cast<int>(page_tokens), trust, ancestry);
             outcome = "attached-prefix";
         }
         else if (kind == "table-borrow")
@@ -390,6 +404,19 @@ public:
         {
             if (!(input >> name) || combinations_.erase(name) != 1) fail();
             outcome = "aborted";
+        }
+        else if (kind == "combined-reserved")
+        {
+            std::string reservation_name;
+            size_t pages;
+            if (!(input >> name >> reservation_name >> pages) || combinations_.contains(name) ||
+                !reservations_.contains(reservation_name)) fail();
+            auto admitted = admitPoolTableReserved(*pool_, *table_, pages,
+                reservations_.at(reservation_name));
+            outcome = admitted ? "accepted" : "refused";
+            if (admitted)
+                combinations_.emplace(name, PageTableAdmission{
+                    std::move(admitted->grant), std::move(admitted->table_update)});
         }
         else if (kind == "admit-witness")
         {
@@ -733,6 +760,66 @@ TEST(PhysicalMemoryAuthority, PagePoolRecordedReservationReplayExactly)
     }
     std::istringstream input(llaminar2::test::privatePageReservationTrace);
     EXPECT_NO_THROW(replay(input));
+}
+
+/** @test Full end-to-end recorded transaction: reserved admission, prefix
+ *  attach, commit, native read, retirement and reservation release. */
+TEST(PhysicalMemoryAuthority, PagePoolRecordedEndToEndTransactionReplayExactly)
+{
+    if (const char *record = std::getenv("LLAMINAR_RECORD_PRIVATE_END_TO_END_TRACE"))
+    {
+        std::ofstream output(record);
+        ASSERT_TRUE(output.good());
+        output << "pma-private-pages-v2 3 128 3 3 empty-zero-generations table 2 3 3 4 16 4 empty-zero-versions fp32-le\n";
+        PrivatePageReplay runner({3, 128, 3, 3}, CPUFP32PagedKVTableGeometry{2, 3, 3, 4, 16, 4});
+        // Build the authenticated archive from a genuine single-token page in a
+        // recording grant (frame_bytes 128 admits one 64-byte interleaved row).
+        std::vector<float> rows(1 * 2 * 1 * 8, 0.25f);
+        auto grant = runner.temporaryRecordingGrant(1);
+        auto frame = grant.assignFrame();
+        auto plan = grant.prepareFreshWrite(frame, rows.size() * sizeof(float));
+        plan->copyFrom(std::as_bytes(std::span(rows)));
+        auto page = CPUFP32KVPage(plan->commit(), 1, 8);
+        auto view = CPUFP32PagedKVView(std::span<const CPUFP32KVPage>(&page, 1), 4);
+        auto archive = PagedKVArchive::fromView(view);
+        auto archive_bytes = archive.serialize();
+        std::string hex;
+        for (auto b : archive_bytes)
+        {
+            const auto value = static_cast<unsigned>(b);
+            hex += "0123456789abcdef"[value >> 4];
+            hex += "0123456789abcdef"[value & 0xf];
+        }
+        const std::vector<std::string> commands{"table-reserve R 1", "combined-reserved X R 1",
+            "table-attach-archive _ X 100 4 0 0 " + hex, "table-commit X S",
+            "table-borrow B S", "table-read B", "table-drop B", "table-drop S",
+            "table-drop-reserved R", "end"};
+        for (const std::string &command : commands)
+            output << command << " | " << runner.execute(command) << '\n';
+        output.close(); ASSERT_TRUE(output.good());
+        std::ifstream captured(record);
+        EXPECT_NO_THROW(replay(captured));
+        return;
+    }
+    std::istringstream input(llaminar2::test::privatePageEndToEndTrace);
+    EXPECT_NO_THROW(replay(input));
+}
+
+/** @test End-to-end transaction replay rejects altered outcomes at every step. */
+TEST(PhysicalMemoryAuthority, PagePoolEndToEndReplayRejectsAlteredObservations)
+{
+    for (const auto &[original, changed] : std::vector<std::pair<std::string, std::string>>{
+        {"combined-reserved X R 1 | accepted", "combined-reserved X R 1 | refused"},
+        {"table-read B | ", "table-read B | corrupt"},
+        {"end | idle\n", ""}})
+    {
+        std::string corrupt(llaminar2::test::privatePageEndToEndTrace);
+        const auto position = corrupt.find(original);
+        ASSERT_NE(position, std::string::npos);
+        corrupt.replace(position, original.size(), changed);
+        std::istringstream input(corrupt);
+        EXPECT_THROW(replay(input), std::exception);
+    }
 }
 
 /** @test Reservation replay rejects oversized reservations and invented outcomes. */
