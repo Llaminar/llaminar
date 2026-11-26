@@ -11,7 +11,8 @@ from cpu_host_compile_contract import verify
 
 ROOT = Path(__file__).resolve().parents[2]
 # GPU compiler metadata is test-only simulation. CMake still owns every
-# language compile rule and runs its ordinary C/CXX try_compile machinery.
+# language compile rule. Forced C/CXX stubs do not qualify compiler behavior
+# or meaningful try_compile execution; this fixture proves generation only.
 PROJECT = r'''
 cmake_minimum_required(VERSION 4.0)
 project(HostEnvelope LANGUAGES C CXX)
