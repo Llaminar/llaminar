@@ -128,6 +128,11 @@ endforeach()
                 database.write_text(json.dumps([dict(file='fixture.cpp', host_language=language, arguments=base + extra)]))
                 verify(database, '-mavx2', [definition])
             check('HIP', ['-mwavefrontsize64', '-Xarch_device', '-mllvm=-amdgpu-spill-cfi-saved-regs=false'])
+            for forwarded in (['-Xarch_host', '-mwavefrontsize64'], ['-Xcompiler=-mwavefrontsize64'], ['--compiler-options', '-mwavefrontsize64']):
+                with self.assertRaisesRegex(ValueError, 'contrary'):
+                    check('HIP', ['-mwavefrontsize64'] + forwarded)
+            with self.assertRaisesRegex(ValueError, 'contrary'):
+                check('HIP', ['-Xarch_device', '-mllvm=-amdgpu-spill-cfi-saved-regs=false', '-Xarch_host', '-mllvm=-amdgpu-spill-cfi-saved-regs=false'])
             for language, extra in [('CXX', ['-mwavefrontsize64']), ('HIP', ['-Xarch_device', '-mavx2']), ('HIP', ['-m32']), ('HIP', ['-Xarch_host', '-mwavefrontsize64']), ('HIP', ['-Xarch_device', '-mllvm=unknown'])]:
                 with self.assertRaises(ValueError):
                     check(language, extra)

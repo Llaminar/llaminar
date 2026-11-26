@@ -55,15 +55,21 @@ def verify(database, flags, definitions=None, compilers=None):
         if language is None:
             raise ValueError('explicit compiler identity required')
         options = []
-        for i, token in enumerate(command):
+        i = 0
+        while i < len(command):
+            token = command[i]
             if token.startswith(('-Xcompiler=', '--compiler-options=')):
-                options.extend(token.split('=', 1)[1].split(','))
-            elif token in ('-Xcompiler', '--compiler-options') and i+1 < len(command):
-                options.extend(command[i+1].split(','))
-            elif token in ('-Xarch_host', '-Xarch_device') and i+1 < len(command):
-                options.append(command[i+1])
+                options.extend((i, 'compiler', option) for option in token.split('=', 1)[1].split(','))
+            elif token in ('-Xcompiler', '--compiler-options', '-Xarch_host', '-Xarch_device'):
+                if i + 1 == len(command):
+                    raise ValueError('missing forwarded compiler option')
+                position = {'-Xarch_host': 'host', '-Xarch_device': 'device'}.get(token, 'compiler')
+                values = command[i+1].split(',') if position == 'compiler' else [command[i+1]]
+                options.extend((i, position, option) for option in values)
+                i += 1
             elif token.startswith('-m'):
-                options.append(token)
+                options.append((i, 'raw', token))
+            i += 1
         def isa_option(option):
             # Address width and code model do not select optional CPU ISA features.
             return option.startswith('-m') and option != '-m64' and not option.startswith('-mcmodel=')
@@ -71,10 +77,12 @@ def verify(database, flags, definitions=None, compilers=None):
         # GpuSpillGuard.cmake owns this exact device-only allocation diagnostic;
         # ROCmArchitectures.cmake owns wave64. Neither is a host ISA option.
         if language == 'HIP':
-            options = [option for option in options if not (option == '-mwavefrontsize64' and any(token == option and (i == 0 or command[i-1] not in ('-Xarch_host', '-Xarch_device', '-Xcompiler', '--compiler-options')) for i, token in enumerate(command))) and not (option == hip_spill_option and any(command[i:i+2] == ['-Xarch_device', hip_spill_option] for i in range(len(command)-1)))]
-        if any(command[i] == '-Xarch_device' and isa_option(command[i+1]) and not (language == 'HIP' and command[i+1] == hip_spill_option) for i in range(len(command)-1)):
+            options = [(index, position, option) for index, position, option in options
+                       if not (position == 'raw' and option == '-mwavefrontsize64')
+                       and not (position == 'device' and option == hip_spill_option)]
+        if any(position == 'device' and isa_option(option) for _, position, option in options):
             raise ValueError('CPU option leaks to device')
-        if any(option not in expected for option in options if isa_option(option)):
+        if any(option not in expected for _, _, option in options if isa_option(option)):
             raise ValueError('contrary CPU compiler option')
         for flag in expected:
             if language == 'CUDA':
