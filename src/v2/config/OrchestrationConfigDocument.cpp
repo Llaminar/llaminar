@@ -147,7 +147,7 @@ namespace
     RECORD(PrefixCacheRuntimeConfig, enabled, MEMBERS)
 #undef MEMBERS
 #define MEMBERS(X) X(pool_cap_bytes) X(host_tier_mode) X(host_cap_bytes) \
-    X(disk_enabled) X(disk_cap_bytes) X(disk_dir)
+    X(disk_enabled) X(disk_cap_bytes) X(disk_journal_membership) X(disk_dir)
     RECORD(PagedKVTierConfig, pool_budget_mode, MEMBERS)
 #undef MEMBERS
 #define MEMBERS(X) X(protected_numerator) X(protected_denominator)

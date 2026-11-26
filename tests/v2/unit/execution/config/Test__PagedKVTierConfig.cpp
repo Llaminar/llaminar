@@ -51,6 +51,8 @@ TEST(PagedKVTierConfig, DiskEnablementRequiresQuotaAndDirectory)
     config.disk_cap_bytes = 1ull << 30;
     EXPECT_FALSE(config.valid()); // Still no directory.
     config.disk_dir = "/var/lib/llaminar/kv";
+    EXPECT_FALSE(config.valid()); // Still no admitted extent membership.
+    config.disk_journal_membership = 128;
     EXPECT_TRUE(config.valid());
     // A directory without a quota still refuses.
     config.disk_cap_bytes = 0;
@@ -79,6 +81,7 @@ TEST(PagedKVTierConfig, CompleteIntentSurvivesResolutionUnchanged)
     intent.host_cap_bytes = 2 * 1024 * 1024;
     intent.disk_enabled = true;
     intent.disk_cap_bytes = 64 * 1024 * 1024;
+    intent.disk_journal_membership = 256;
     intent.disk_dir = "/tmp/llaminar-kv-tier";
     auto runtime = RuntimeConfig::fromOrchestrationConfig(4096, 2, "fp32", "fp32",
         FusedAttentionBackend::JIT, RoutedExpertComputePolicy::Apportioned,
@@ -87,6 +90,7 @@ TEST(PagedKVTierConfig, CompleteIntentSurvivesResolutionUnchanged)
     EXPECT_EQ(runtime.paged_kv_tiers.pool_cap_bytes, 5 * 1024 * 1024u);
     EXPECT_EQ(runtime.paged_kv_tiers.host_cap_bytes, 2 * 1024 * 1024u);
     EXPECT_EQ(runtime.paged_kv_tiers.disk_cap_bytes, 64 * 1024 * 1024u);
+    EXPECT_EQ(runtime.paged_kv_tiers.disk_journal_membership, 256u);
     EXPECT_TRUE(runtime.paged_kv_tiers.disk_enabled);
     EXPECT_EQ(runtime.paged_kv_tiers.disk_dir, std::string("/tmp/llaminar-kv-tier"));
 }

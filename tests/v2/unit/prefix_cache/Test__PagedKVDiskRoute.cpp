@@ -3,9 +3,10 @@
  * @brief Typed disk-tier route admission contracts (plan P3 §11.3).
  *
  * These tests prove an impossible configured tier fails admission with a
- * precise diagnostic before any backend opens (zero quota, missing directory,
- * invalid intent), a disabled tier is a fully qualified off state, and the
- * admitted route yields a checked finite extent quota with the same numbers.
+ * precise diagnostic before any backend opens (zero quota, missing membership,
+ * missing directory, invalid intent), a disabled tier is a fully qualified off
+ * state, and the admitted route yields a checked finite extent quota with the
+ * same numbers.
  */
 #include "execution/prefix_cache/PagedKVDiskRoute.h"
 #include <gtest/gtest.h>
@@ -18,13 +19,18 @@ TEST(PagedKVDiskRoute, CompleteRouteAdmitsExactQuota)
     PagedKVTierConfig config;
     config.disk_enabled = true;
     config.disk_cap_bytes = 4 * 1024 * 1024;
+    config.disk_journal_membership = 64;
     config.disk_dir = "/var/lib/llaminar/cb-kv";
     auto route = validatePagedKVDiskRoute(config);
     EXPECT_TRUE(route.valid) << route.refusal;
     EXPECT_EQ(route.quota_bytes, 4 * 1024 * 1024u);
+    EXPECT_EQ(route.admitted_extent_membership, 64u);
     auto quota = makePagedKVDiskQuota(route);
+    EXPECT_EQ(quota.capacity(), 64u);
     EXPECT_TRUE(quota.admit(DiskExtentKey{1, 1, 0xabc, 1 * 1024 * 1024}));
+    // B1: an extent larger than the admitted quota refuses WITHOUT wrap.
     EXPECT_FALSE(quota.admit(DiskExtentKey{2, 1, 0xdef, 4 * 1024 * 1024}));
+    EXPECT_EQ(quota.bytesAdmitted(), 1 * 1024 * 1024u);
 }
 
 /** @test Disabled tier is a qualified off state (no quota demanded). */
@@ -41,7 +47,7 @@ TEST(PagedKVDiskRoute, DisabledTierIsQualifiedOff)
 /** @test Zero-quota ledger never admits (no underflow admission). */
 TEST(PagedKVDiskRoute, ZeroQuotaNeverAdmits)
 {
-    DiskExtentQuota zero(0);
+    DiskExtentQuota zero(0, 4);
     EXPECT_FALSE(zero.admit(DiskExtentKey{1, 1, 1, 1}));
     EXPECT_EQ(zero.count(), 0u);
     EXPECT_EQ(zero.bytesAdmitted(), 0u);
@@ -59,9 +65,19 @@ TEST(PagedKVDiskRoute, ImpossibleTiersFailWithPreciseDiagnostic)
     EXPECT_FALSE(route.valid);
     EXPECT_NE(route.refusal.find("quota"), std::string::npos) << route.refusal;
 
+    PagedKVTierConfig no_membership;
+    no_membership.disk_enabled = true;
+    no_membership.disk_cap_bytes = 1024;
+    no_membership.disk_dir = "/cache/cb";
+    auto no_membership_route = validatePagedKVDiskRoute(no_membership);
+    EXPECT_FALSE(no_membership_route.valid);
+    EXPECT_NE(no_membership_route.refusal.find("membership"), std::string::npos)
+        << no_membership_route.refusal;
+
     PagedKVTierConfig no_dir;
     no_dir.disk_enabled = true;
     no_dir.disk_cap_bytes = 1024;
+    no_dir.disk_journal_membership = 8;
     auto no_dir_route = validatePagedKVDiskRoute(no_dir);
     EXPECT_FALSE(no_dir_route.valid);
     EXPECT_NE(no_dir_route.refusal.find("directory"), std::string::npos) << no_dir_route.refusal;

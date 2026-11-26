@@ -27,6 +27,14 @@ struct PagedKVDiskRoute
     bool valid = false;
     std::string refusal; ///< Nonempty exactly when invalid.
     std::size_t quota_bytes = 0; ///< Admitted finite quota (rounded, inclusive).
+    /**
+     * @brief Admitted extent-record membership for the route journal.
+     *
+     * Sized from the admitted geometry (per-admitted-page extent + in-flight
+     * write + pending replacement + rounding), never a hard-coded constant:
+     * the quota journal can always hold its own admitted extent set.
+     */
+    std::size_t admitted_extent_membership = 0;
 };
 
 /**

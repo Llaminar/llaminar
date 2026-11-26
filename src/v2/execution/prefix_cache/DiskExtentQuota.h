@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <vector>
 
 namespace llaminar2
 {
@@ -27,15 +28,27 @@ struct DiskExtentKey
     bool operator==(const DiskExtentKey &) const = default;
 };
 
-/** @brief Bounded quota ledger; overflow/subtraction are checked and typed. */
+/**
+ * @brief Bounded quota ledger; overflow/subtraction are checked and typed.
+ *
+ * The journal capacity is an ADMITTED membership value, never an arbitrary
+ * constant: the caller sizes it from its typed disk-extent membership (the
+ * same authority that prices the storage), so an impossible extent set can
+ * never hide behind a silently large record table.
+ */
 class DiskExtentQuota final
 {
 public:
-    explicit DiskExtentQuota(std::size_t quota_bytes) : quota_(quota_bytes) {}
+    /**
+     * @brief Open a quota ledger with the admitted byte bound and journal size.
+     * @param quota_bytes Admitted byte capacity (0 = permanently off: admits nothing).
+     * @param journal_capacity Admitted extent-record membership (must be positive).
+     */
+    DiskExtentQuota(std::size_t quota_bytes, std::size_t journal_capacity);
     /** @return Admitted extent bytes, metadata/rounding inclusive. */
     std::size_t reserved() const noexcept { return reserved_; }
-    /** @return Fixed capacity; journal entries bound here. */
-    static constexpr std::size_t capacity() noexcept { return kCapacity; }
+    /** @return Admitted journal capacity (typed membership, not a constant). */
+    std::size_t capacity() const noexcept { return entries_.size(); }
     /**
      * @brief Admit one extent if quota remains; never exposes partial state.
      * @return True on admission; false without mutating when quota or journal full.
@@ -53,7 +66,6 @@ private:
     std::size_t quota_;
     std::size_t reserved_ = 0;
     std::size_t count_ = 0;
-    static constexpr std::size_t kCapacity = 256;
-    DiskExtentKey entries_[kCapacity] = {};
+    std::vector<DiskExtentKey> entries_; ///< Admitted-membership-sized journal.
 };
 } // namespace llaminar2

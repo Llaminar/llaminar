@@ -3,15 +3,27 @@
  * @brief Finite quota ledger implementation with exact retire semantics.
  */
 #include "DiskExtentQuota.h"
+#include <stdexcept>
 
 namespace llaminar2
 {
+DiskExtentQuota::DiskExtentQuota(std::size_t quota_bytes, std::size_t journal_capacity)
+    : quota_(quota_bytes), entries_(journal_capacity)
+{
+    // A zero-capacity journal could never accept an extent but also silently
+    // change behavior: the admitted membership must be explicit and positive.
+    if (journal_capacity == 0)
+        throw std::invalid_argument("disk extent quota requires a positive admitted journal membership");
+}
+
 bool DiskExtentQuota::admit(DiskExtentKey extent)
 {
-    // A zero quota admits NOTHING. The subtraction below must never run when
-    // the quota is zero: `quota_ - extent.bytes` would underflow to a huge
-    // value and admit extents into a ledger with no capacity.
-    if (!quota_ || !extent.bytes || contains(extent) || reserved_ > quota_ - extent.bytes)
+    // CHECKED finite arithmetic: `quota_ - extent.bytes` must never
+    // underflow, so refuse whenever the extent alone exceeds the quota
+    // BEFORE the subtraction (0 <= quota_ < extent.bytes would otherwise
+    // wrap to a huge value and admit extents beyond the bound).
+    if (!extent.bytes || contains(extent) || extent.bytes > quota_ ||
+        reserved_ > quota_ - extent.bytes)
         return false; // Zero/duplicate admission, or quota exhausted: no mutation.
     if (count_ == capacity()) return false;
     entries_[count_++] = extent;

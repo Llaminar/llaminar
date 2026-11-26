@@ -549,6 +549,7 @@ namespace llaminar2
         size_t host_cap_bytes = 0;        ///< Required with Cap; ignored otherwise.
         bool disk_enabled = false;        ///< Disk is never an implicit fallback.
         size_t disk_cap_bytes = 0;        ///< Required finite quota when enabled.
+        size_t disk_journal_membership = 0; ///< Admitted extent-record membership (typed journal cap).
         std::string disk_dir;             ///< Configured directory, validated nonempty.
 
         /** @return Whether the typed intent is complete and representable. */
@@ -564,9 +565,9 @@ namespace llaminar2
                 if (error) *error = "paged KV host tier cap requires a positive finite byte budget";
                 return false;
             }
-            if (disk_enabled && (disk_cap_bytes == 0 || disk_dir.empty()))
+            if (disk_enabled && (disk_cap_bytes == 0 || disk_journal_membership == 0 || disk_dir.empty()))
             {
-                if (error) *error = "paged KV disk tier requires an explicit finite quota and configured directory";
+                if (error) *error = "paged KV disk tier requires an explicit finite quota, an admitted extent membership and a configured directory";
                 return false;
             }
             return true;
