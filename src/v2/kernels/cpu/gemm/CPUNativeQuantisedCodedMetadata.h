@@ -428,7 +428,7 @@ namespace llaminar2::cpu::native_quantised::coded_metadata
             out.primary = L::staged((d * (0.5f + L::toFloat(code & 15))) * 0.5f);
         else if constexpr (Codebook == 16)
         {
-            const F dl = d * (2.0f * L::toFloat(code & 7) + 1.0f);
+            const F dl = d * L::toFloat(2 * (code & 7) + 1);
             // Code bit 3 is the delta sign: +-0.125 (0x3e000000 with the sign bit).
             using I = typename Ops::I;
             const F delta = std::bit_cast<F>((I{} + 0x3e000000) ^ (((code >> 3) & 1) << 31));
@@ -437,8 +437,8 @@ namespace llaminar2::cpu::native_quantised::coded_metadata
         }
         else if constexpr (Codebook == 17)
         {
-            out.primary = L::staged(d * (2.0f * L::toFloat(code & 7) + 1.0f));
-            out.secondary = L::staged(d * (2.0f * L::toFloat((code >> 3) & 7) + 1.0f));
+            out.primary = L::staged(d * L::toFloat(2 * (code & 7) + 1));
+            out.secondary = L::staged(d * L::toFloat(2 * ((code >> 3) & 7) + 1));
         }
         else if constexpr (Codebook == 9)
         {
