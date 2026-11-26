@@ -18393,7 +18393,7 @@ add_v2_test(V2_Integration_NonNUMAKernelClassification
 
 # Recorded-input replay of the continuous-batching serving step: a real-model
 # trace replayed device-free through the production ServingSession.
-add_executable(v2_test_serving_step_replay unit/execution/serving/Test__ServingStepReplay.cpp unit/execution/serving/Test__ServingSubmissionOutcome.cpp unit/execution/serving/Test__ServingContinuationManifest.cpp)
+add_executable(v2_test_serving_step_replay unit/execution/serving/Test__ServingStepReplay.cpp unit/execution/serving/Test__ServingSubmissionOutcome.cpp unit/execution/serving/Test__ServingContinuationManifest.cpp unit/execution/serving/Test__AdmissionPressureGate.cpp)
 target_include_directories(v2_test_serving_step_replay PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_definitions(v2_test_serving_step_replay PRIVATE
     LLAMINAR_SERVING_TRACE_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/serving_step_replay/qwen2.5-0.5b-instruct-q4_0.cpu.trace")
@@ -18418,6 +18418,12 @@ add_v2_test(V2_Integration_ServingContinuationManifest
     LABELS "V2;Integration;ProductionTestPreflight;Serving;ContinuousBatching;Continuation;Suspension;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ServingContinuationManifest)
+add_v2_test(V2_Integration_AdmissionPressureGate
+    COMMAND $<TARGET_FILE:v2_test_serving_step_replay>
+        --gtest_filter=AdmissionPressureGate.*
+    LABELS "V2;Integration;ProductionTestPreflight;Serving;ContinuousBatching;Admission;Pressure;Witness;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_AdmissionPressureGate)
 
 add_v2_test(V2_Integration_ServingLiveIdentityLifecycle
     COMMAND $<TARGET_FILE:v2_test_serving_step_replay>
