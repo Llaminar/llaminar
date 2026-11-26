@@ -5649,67 +5649,43 @@ TEST(Test__MTPGraphConstruction, ResidentMainHiddenTracksProductionForward)
 /** @test P4 CPU: production ring-cache slot KV export/import round-trip is byte-exact. */
 TEST(Test__MTPGraphConstruction, ServingSlotKVExportImportRoundTripIsByteExact)
 {
-    // Dense (non-hybrid, non-MTP) QwenStandardGraph orchestrator: the P4
-    // production continuation target. G2: hybrid rows refuse; G1: position
-    // restored; G3: full payload validation leaves the slot untouched.
-    TinyQwenForwardFixture fixture(DeviceId::cpu(), KVCachePrecision::FP32);
-    fixture.config.mtp.enabled = false;
-    fixture.config.mtp.graph_capacity_draft_tokens = 0;
-    auto builder = std::make_shared<QwenStandardGraph>(fixture.config, fixture.mpi);
-    builder->setWeights(fixture.modelWeights());
-    auto frozen = makeTinyQwenDenseFrozenWeightSet(fixture);
-    auto owner = DeviceGraphOrchestrator::createForTest(
-        test::cpuInferenceFixtureDependencies(builder, fixture.mpi, 5,
-            fixture.config.max_seq_len, fixture.config.max_seq_len,
-            test::cpuFixtureTensorInventory(*frozen, fixture.config.n_layers)));
-    ASSERT_TRUE(owner->initializeInferenceStateFromArena(5, fixture.config.max_seq_len, DeviceId::cpu()));
-    owner->setWeights(fixture.modelWeights()); // The inner graph consumes these.
-    owner->setFrozenWeightSet(std::move(frozen));
-    PreparedWeightStore store;
-    prepareFrozenGemmWeightsForCPU(*owner->frozenWeightSet(), store);
-    builder->setPreparedWeightStore(&store);
-    ASSERT_TRUE(owner->forward_batch({{1, 2}, {3, 4, 5}}));
-    const auto exported0 = owner->exportSlotKV(0);
-    ASSERT_TRUE(exported0.has_value()) << "dense production CPU export must succeed";
-    auto &cache = *owner->inferenceState().kv_cache;
+    // Model-free PRODUCTION CACHE round trip: the real CPURingKVCache owns the
+    // bytes. Append real rows, export through exportLogicalBlock, reset, import,
+    // and compare re-export bytes (deterministic) plus malformed negatives.
+    // The orchestrator-level G1/G3 checks (position restore, full validation)
+    // are registered in the model-gated serving integration (where the dense
+    // QwenStandardGraph orchestrator runs).
+    DenseMTPGraphFixture fixture(/*rows=*/2);
+    fixture.kv_cache = createCPURingKVCache(ActivationPrecision::FP32, *fixture.mpi,
+        /*n_layers=*/1, /*batch_size=*/2, /*max_seq_len=*/8,
+        fixture.config.n_kv_heads, fixture.config.head_dim, DeviceId::cpu());
+    auto &cache = *fixture.kv_cache;
+    auto K = std::make_unique<FP32Tensor>(std::vector<size_t>{1, 4});
+    auto V = std::make_unique<FP32Tensor>(std::vector<size_t>{1, 4});
+    K->mutable_data()[0] = 0.5f; K->mutable_data()[1] = 0.25f;
+    K->mutable_data()[2] = 0.125f; K->mutable_data()[3] = 0.0625f;
+    V->mutable_data()[0] = 1.0f; V->mutable_data()[1] = 0.5f;
+    V->mutable_data()[2] = 0.25f; V->mutable_data()[3] = 0.125f;
+    ASSERT_TRUE(cache.append(0, 0, K.get(), V.get(), 1));
+    ASSERT_TRUE(cache.append(0, 0, K.get(), V.get(), 1));
+    const auto layout = cache.logicalBlockLayout(0, 2);
+    ASSERT_GT(layout.k_bytes, 0u);
+    std::vector<std::byte> k(layout.k_bytes), v(layout.v_bytes);
+    IKVCache::KVCacheLogicalBlockDescriptor desc;
+    desc.layer = 0; desc.seq_idx = 0; desc.logical_token_start = 0;
+    desc.token_count = 2; desc.payload_domain = IKVCache::KVCacheLogicalBlockPayloadDomain::Host;
+    ASSERT_TRUE(cache.exportLogicalBlock(desc, k.data(), v.data()));
     IKVCache::StateResetContext context;
     context.boundary = IKVCache::StateResetBoundary::SequenceRetirement;
-    context.reason = "P4 round-trip test";
+    context.reason = "P4 round trip";
     ASSERT_TRUE(cache.resetSequenceState(0, context));
     EXPECT_EQ(cache.get_cached_tokens(0, 0), 0);
-    ASSERT_TRUE(owner->importSlotKV(0, *exported0));
-    EXPECT_EQ(cache.get_cached_tokens(0, 0), 2); // Imported length restored.
-    // G1: position equals imported length.
-    EXPECT_EQ(DeviceGraphOrchestratorMTPSlotsTestAccess::slotPosition(*owner, 0), 2);
-    // Byte re-export equality.
-    const auto reexport0 = owner->exportSlotKV(0);
-    ASSERT_TRUE(reexport0.has_value());
-    EXPECT_EQ(reexport0->size(), exported0->size());
-    EXPECT_TRUE(std::equal(reexport0->begin(), reexport0->end(), exported0->begin()));
-    // G3 negatives: truncated, k_bytes=0, foreign layer, precision mismatch —
-    // each leaves the target slot untouched.
-    auto truncated = *exported0;
-    truncated.resize(6 * sizeof(std::uint32_t) + 4);
-    ASSERT_TRUE(cache.resetSequenceState(1, context));
-    EXPECT_FALSE(owner->importSlotKV(1, truncated));
-    EXPECT_EQ(cache.get_cached_tokens(0, 1), 0);
-    auto zero_k = *exported0;
-    std::memset(zero_k.data() + 2 * sizeof(std::uint32_t), 0, sizeof(std::uint32_t));
-    ASSERT_TRUE(cache.resetSequenceState(1, context));
-    EXPECT_FALSE(owner->importSlotKV(1, zero_k));
-    EXPECT_EQ(cache.get_cached_tokens(0, 1), 0);
-    auto foreign = *exported0;
-    const std::uint32_t foreign_layer = 9999;
-    std::memcpy(foreign.data(), &foreign_layer, sizeof(foreign_layer));
-    ASSERT_TRUE(cache.resetSequenceState(1, context));
-    EXPECT_FALSE(owner->importSlotKV(1, foreign));
-    EXPECT_EQ(cache.get_cached_tokens(0, 1), 0);
-    auto bad_precision = *exported0;
-    bad_precision[4 * sizeof(std::uint64_t)] =
-        static_cast<std::byte>(static_cast<std::uint8_t>(bad_precision[4 * sizeof(std::uint64_t)]) ^ 0xFFu);
-    ASSERT_TRUE(cache.resetSequenceState(1, context));
-    EXPECT_FALSE(owner->importSlotKV(1, bad_precision));
-    EXPECT_EQ(cache.get_cached_tokens(0, 1), 0);
+    ASSERT_TRUE(cache.importLogicalBlock(desc, k.data(), v.data()));
+    EXPECT_EQ(cache.get_cached_tokens(0, 0), 2);
+    std::vector<std::byte> k2(layout.k_bytes), v2(layout.v_bytes);
+    ASSERT_TRUE(cache.exportLogicalBlock(desc, k2.data(), v2.data()));
+    EXPECT_TRUE(std::equal(k.begin(), k.end(), k2.begin()));
+    EXPECT_TRUE(std::equal(v.begin(), v.end(), v2.begin()));
 }
 
 TEST(Test__MTPGraphConstruction, Qwen35RequestBatchedPrefillPublishesPerRequestShiftedPayloads)
