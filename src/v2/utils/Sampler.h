@@ -354,6 +354,13 @@ namespace llaminar2
             std::vector<std::pair<int, int>> token_counts; ///< token, count.
             std::vector<int> dry_history;                  ///< Ring buffer contents.
             std::size_t dry_capacity = 0;
+            // DRY breaker multimap (head token -> tail sequences) and its
+            // initialized flag: an initialized breaker set changes penalties,
+            // so a continuation without them would NOT reproduce identical
+            // decisions. These are tokenized values; the tokenizer is not
+            // needed again on restore (no re-tokenization ambiguity).
+            std::vector<std::pair<int, std::vector<int>>> dry_breakers;
+            bool dry_breakers_initialized = false;
         };
         /** @return Exact current sampler state for later restoration. */
         State exportState() const;

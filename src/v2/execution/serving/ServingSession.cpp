@@ -585,6 +585,17 @@ namespace llaminar2
             error = "Serving request has a pending (undecided) forward";
             return std::nullopt;
         }
+        // P4 prefix admission: the row's typed prefix admission contract is
+        // not yet carried by the manifest. Suspending a prefix-cache-backed
+        // request would restore it with a default admission block and mismatch
+        // the retained prefix (events and harvest consult it). REFUSE before
+        // any mutation until the typed contract is part of the continuation.
+        if (row.cached_prompt_tokens > 0 || row.prefix_admission.hit())
+        {
+            error = "Serving prefix-backed request suspension requires the typed prefix admission contract; "
+                    "refused before mutation";
+            return std::nullopt;
+        }
         // P4: suspension must retain the ACTUAL executor KV/auxiliary referents.
         // An executor that cannot export them means reset/erase would destroy
         // state the session cannot restore: REFUSE BEFORE ANY MUTATION.
@@ -666,19 +677,22 @@ namespace llaminar2
             error = "Serving continuation has no executor KV payload; restore refused";
             return false;
         }
-        if (!executor_.importSlotKV(target, content.kv_payload))
-        {
-            error = "Serving executor rejected the continuation KV import";
-            return false;
-        }
-        // Restore the complete row: original law/seed (never reseed), exact
-        // progress, output credit, forced instructions and RNG history. The
-        // ORIGINAL request policy is preserved (never an invented output cap);
-        // the session carries the remaining output budget exactly.
+        // TYPED FAILURE-ATOMIC RESTORE: construct the COMPLETE row locally
+        // (all validation, allocations and sampler restoration below happen
+        // BEFORE the executor sees a single byte) and reserve the row storage
+        // so the final push_back cannot throw. Only then is the KV imported,
+        // and the row + busy state are committed together as one transaction:
+        // a failed import leaves slot_busy_ and rows_ untouched, and no later
+        // failure can strand an imported KV without an owning row.
         Row row;
         row.request.id = content.request_id;
         row.request.sampling = content.sampling;
         row.request.max_new_tokens = content.max_new_tokens;
+        // ORIGINAL prompt reattachment (R14 blocker 1): step() and
+        // prefix/harvest resume from row.request.prompt. Without it a
+        // partial-prefill suspension would restore with an empty prompt and
+        // silently lose the remaining prompt tokens.
+        row.request.prompt = content.prompt;
         row.slot = content.slot;
         row.sampler = manifest.restoreSampler();
         row.sampler_state = content.sampler_state;
@@ -696,10 +710,16 @@ namespace llaminar2
         row.cancelled = content.cancelled;
         row.cached_prompt_tokens = content.cached_prompt_tokens;
         row.sampler_decisions = content.sampler_decisions;
-        // Restoring the KV state is the executor's responsibility; the session
-        // advertises the restored KV length so the next forward continues at
-        // the exact position (no duplicate output, no reseed).
         row.slot = target;
+        // Reserve BEFORE the executor import: push_back below is noexcept
+        // once the capacity is present (Row is fully move-constructed above).
+        rows_.reserve(rows_.size() + 1);
+        if (!executor_.importSlotKV(target, content.kv_payload))
+        {
+            error = "Serving executor rejected the continuation KV import";
+            return false; // No mutation: slot free, rows_ unchanged.
+        }
+        // COMMIT: busy state and the row enter as one typed transaction.
         slot_busy_[static_cast<std::size_t>(target)] = true;
         const std::uint64_t restored_id = row.request.id;
         const int restored_cached = row.cached_tokens;

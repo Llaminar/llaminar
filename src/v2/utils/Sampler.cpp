@@ -49,6 +49,10 @@ namespace llaminar2
             state.token_counts.emplace_back(token, count);
         state.dry_history = dry_token_history_;
         state.dry_capacity = dry_history_capacity_;
+        state.dry_breakers.reserve(dry_breakers_.size());
+        for (const auto &[head, tails] : dry_breakers_)
+            state.dry_breakers.emplace_back(head, tails);
+        state.dry_breakers_initialized = dry_breakers_initialized_;
         return state;
     }
 
@@ -64,6 +68,10 @@ namespace llaminar2
             token_counts_[token] = count;
         dry_token_history_ = state.dry_history;
         dry_history_capacity_ = state.dry_capacity;
+        dry_breakers_.clear();
+        for (const auto &[head, tails] : state.dry_breakers)
+            dry_breakers_.emplace(head, tails);
+        dry_breakers_initialized_ = state.dry_breakers_initialized;
     }
 
     int Sampler::sample(const std::vector<float> &logits, const SamplingParams &params)
