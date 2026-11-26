@@ -81,10 +81,21 @@ bool proveAllClassOrder(PhysicalPagePool &pool, CPUFP32PagedKVTable &table,
     proposed.peak_leases = 1;  // Declared per-request lease contract (one lease).
     // Existing live requests enter at their declared frame peaks (frames-only
     // pool records); the table's OWN observed live class demand is supplied
-    // as the base, never fabricated per-request.
-    auto live = pool.liveWitnessRequests();
-    for (const auto &r : live)
+    // as the base, never fabricated per-request. C3: NO per-call allocation —
+    // the pool fills the caller's witness cells by index (never a new vector),
+    // and every write is checked against the membership capacity so the
+    // caller-owned workspace can never grow on the heap.
+    const std::size_t membership = frame_workspace.size();
+    if (membership < pool.geometry().request_records + 1)
+        return false; // Caller workspace too small: refuse, nothing acquired.
+    pool.fillWitnessRequests(
+        std::span<planning::WitnessRequest>(frame_workspace.data(), membership));
+    for (std::size_t i = 0; i < membership; ++i)
     {
+        const auto &r = frame_workspace[i];
+        if (!r.peak_frames && !r.record && !r.occupied_frames) continue; // Unused cell.
+        if (members.size() >= membership)
+            return false; // Membership short for live+proposed: refuse, never grow.
         AllResourceRequest existing;
         existing.generation = r.generation;
         existing.record = r.record;
@@ -93,10 +104,12 @@ bool proveAllClassOrder(PhysicalPagePool &pool, CPUFP32PagedKVTable &table,
         existing.preserved = r.preserved;
         members.push_back(existing);
     }
+    if (members.size() >= membership)
+        return false; // No room for the proposed request either.
     members.push_back(proposed);
     capacity.requests = members;
     const auto live_demand = table.liveClassDemand();
-    capacity.live_banks = live_demand.published_banks;
+    capacity.live_banks = live_demand.occupied_banks;
     capacity.live_leases = live_demand.live_leases;
     return proveAllResourceCompletion(capacity, frame_workspace).valid;
 }

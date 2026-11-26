@@ -174,7 +174,7 @@ TEST(PageTableAdmission, WitnessedAdmissionCountsObservedLiveClassDemand)
     // Observe the real demand: 1 published bank + 1 live lease must be counted
     // before the proposed request's own peak is added.
     const auto observed = fx.table->liveClassDemand();
-    EXPECT_EQ(observed.published_banks, 1u);
+    EXPECT_EQ(observed.occupied_banks, 1u);
     EXPECT_EQ(observed.live_leases, 1u);
     // The composed witness uses the observation: with 2 banks and 1 observed,
     // one more proposed request fits; a third would exceed the bank class.
@@ -183,6 +183,40 @@ TEST(PageTableAdmission, WitnessedAdmissionCountsObservedLiveClassDemand)
     auto admitted = admitPoolTableWitnessed(*fx.pool, *fx.table, workspace, 1, 1, *second);
     EXPECT_TRUE(admitted) << "observed live bank demand should allow one more";
     EXPECT_TRUE(lease->acknowledge());
+}
+
+/** @test R16 C4: an open (Preparing) Update counts as an occupied bank in the demand. */
+TEST(PageTableAdmission, PreparingBankCountsAsOccupiedDemand)
+{
+    CombinedFixture fx(/*frames=*/3, /*banks=*/2);
+    fx.table.reset();
+    fx.table = CPUFP32PagedKVTable::create(fx.authority, DeviceId::cpu(),
+        CPUFP32PagedKVTableGeometry{1, 2, 2, 1, 8, 4});
+    PageTableAdmissionWorkspace workspace(fx.pool->geometry().request_records + 1);
+    // Reserve and BEGIN an update but do not publish it: the bank is Preparing
+    // and therefore occupied — the observed demand must count it.
+    auto reservation = fx.table->reserveAcceptedWork(1);
+    ASSERT_TRUE(reservation);
+    auto open = fx.table->tryBeginReserved(*reservation);
+    ASSERT_TRUE(open);
+    const auto observed = fx.table->liveClassDemand();
+    EXPECT_EQ(observed.occupied_banks, 1u); // Preparing counts, not only Published.
+    EXPECT_EQ(observed.live_leases, 0u);
+    // With one bank occupied, one more request's declared bank still fits
+    // (2 banks total); the acceptance may proceed, proving the witness sees
+    // the Preparing bank demand rather than undercounting to zero.
+    auto second = fx.table->reserveAcceptedWork(1);
+    ASSERT_TRUE(second);
+    auto admitted = admitPoolTableWitnessed(*fx.pool, *fx.table, workspace, 1, 1, *second);
+    EXPECT_TRUE(admitted) << "one occupied + one proposed still fits 2 banks";
+    // The open Preparing bank must still refuse a third (banks exhausted).
+    auto third = fx.table->reserveAcceptedWork(1);
+    ASSERT_TRUE(third);
+    EXPECT_FALSE(admitPoolTableWitnessed(*fx.pool, *fx.table, workspace, 1, 1, *third))
+        << "two occupied + one proposed exceed 2 banks";
+    open = {};     // Abandon the Preparing update: ITS bank returns free.
+    admitted = {}; // Release the second (witnessed) bank as well.
+    EXPECT_EQ(fx.table->liveClassDemand().occupied_banks, 0u);
 }
 
 /** @test Reserved all-resource admission consumes exactly one accepted-work issuance. */
