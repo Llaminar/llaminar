@@ -16115,6 +16115,12 @@ add_v2_test(V2_Integration_DiskExtentQuota
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;PrefixCache;Storage;Quota;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_DiskExtentQuota)
+add_v2_test(V2_Integration_UMAPhysicalDomain
+    COMMAND $<TARGET_FILE:v2_test_physical_memory_authority>
+        --gtest_filter=UMAPhysicalDomain.*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;UMA;Accounting;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_UMAPhysicalDomain)
 add_v2_test(V2_Integration_PrefixCommittedIdentityPreservation
     COMMAND $<TARGET_FILE:v2_test_disk_prefix_storage_backend>
         --gtest_filter=Test__DiskPrefixStorageBackend.CommittedIdentityCorruptionPreservesArchive:Test__DiskPrefixStorageBackend.CommittedMetadataCorruptionPreservesArchive
@@ -30429,6 +30435,7 @@ add_executable(v2_test_physical_memory_authority
     unit/planning/Test__PhysicalPagePoolReplay.cpp
     unit/planning/Test__PhysicalPagePoolSharing.cpp
     unit/planning/Test__CompletionWitness.cpp
+    unit/planning/Test__UMAPhysicalDomain.cpp
     unit/planning/Test__PageTableAdmission.cpp
     unit/planning/Test__PhysicalMemoryRankHostPool.cpp
     unit/planning/Test__NativeStoragePreparing.cpp
