@@ -156,6 +156,19 @@ void CPUFP32PagedKVTable::IssuanceReservation::release() noexcept
         self.reserved_outstanding_ -= remaining_;
     table_.reset();
 }
+bool CPUFP32PagedKVTable::acknowledgeEffectiveUse(std::uint64_t version,
+    std::uint64_t incarnation)
+{
+    // The receipt is bound to the EXACT published version and bank identity;
+    // a version that was never published here admits no touch (obsolete or
+    // foreign incarnations are refused, not interpreted).
+    if (version == 0 || version > next_version_)
+        return false;
+    return effective_use_.accept(EffectiveUseReceipt{
+        .content_version=version, .table_version=version,
+        .replica_incarnation=incarnation, .sequence=0});
+}
+
 void CPUFP32PagedKVTable::closeBorrowers(const Snapshot &snapshot)
 {
     if (snapshot.table_.get() != this)

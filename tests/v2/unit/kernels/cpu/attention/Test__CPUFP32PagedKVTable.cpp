@@ -295,6 +295,61 @@ TEST(CPUFP32PagedKVTable, AcceptedWorkReservationIsConsumableAndUnshareable)
     EXPECT_EQ(table->outstandingReserved(), 0u);
 }
 
+/** @test Effective use is acknowledged only for a real published version; duplicate/obsolete refuse. */
+TEST(CPUFP32PagedKVTable, EffectiveUseWatermarkFollowsOnlyRealAttachments)
+{
+    constexpr int dimension = 8;
+    const auto device = DeviceId::cpu();
+    const PhysicalPagePoolGeometry pool_geometry{2, 2 * 2 * dimension * sizeof(float), 2, 1};
+    const CPUFP32PagedKVTableGeometry table_geometry{1, 2, 2, 2, 64, 0};
+    const auto bytes = PhysicalPagePool::physicalBytes(pool_geometry, device) +
+        CPUFP32PagedKVTable::physicalBytes(table_geometry, device);
+    PhysicalMemoryPlanBuilder plan;
+    plan.add({.world_rank=0, .device=device, .total_bytes=bytes, .admission_available_bytes=bytes},
+        PhysicalMemoryOwner::KVCache, bytes);
+    auto authority = std::make_shared<PhysicalMemoryAuthority>(
+        std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()), 0);
+    auto pool = authority->createCPUPagePool(device, pool_geometry, CPUStoragePlacement::local());
+    auto table = CPUFP32PagedKVTable::create(authority, device, table_geometry);
+    const auto page = [&](float value) {
+        auto grant = pool->tryAdmit(1);
+        if (!grant) throw std::logic_error("Fixture page grant refused");
+        const auto frame = grant->assignFrame();
+        std::vector<float> input(2 * 2 * dimension, 0.0f);
+        std::fill_n(input.data() + dimension, dimension, value);
+        auto write = grant->prepareAppend(frame, input.size() * sizeof(float));
+        if (!write) throw std::logic_error("Fixture page write refused");
+        write->copyFrom(std::as_bytes(std::span(input)));
+        return CPUFP32KVPage(write->commit(), 1, dimension);
+    };
+    // Nothing published yet: any receipt is refused (no invented touch).
+    EXPECT_FALSE(table->acknowledgeEffectiveUse(1, 0));
+    EXPECT_EQ(table->effectiveUseWatermark(), 0u);
+    // Publish one bank (version 1), then acknowledge the exact touch.
+    auto update = table->tryBeginUpdate();
+    ASSERT_TRUE(update);
+    update->append(page(1.0f));
+    auto snapshot = update->commit();
+    ASSERT_TRUE(snapshot.version() > 0u);
+    const auto version = snapshot.version();
+    EXPECT_TRUE(table->acknowledgeEffectiveUse(version, 0));
+    EXPECT_EQ(table->effectiveUseWatermark(), 1u);
+    // Duplicate touch is idempotent: no double advance.
+    EXPECT_FALSE(table->acknowledgeEffectiveUse(version, 0));
+    EXPECT_EQ(table->effectiveUseWatermark(), 1u);
+    // A second published version advances the watermark monotonically.
+    auto second = table->tryBeginUpdate();
+    ASSERT_TRUE(second);
+    second->append(page(2.0f));
+    auto snapshot2 = second->commit();
+    ASSERT_GT(snapshot2.version(), version);
+    EXPECT_TRUE(table->acknowledgeEffectiveUse(snapshot2.version(), 1));
+    EXPECT_EQ(table->effectiveUseWatermark(), 2u);
+    // Foreign/obsolete touch (never-published version) refuses.
+    EXPECT_FALSE(table->acknowledgeEffectiveUse(version + 1000, 7));
+    EXPECT_EQ(table->effectiveUseWatermark(), 2u);
+}
+
 /** @test Headroom below budget is typed; equal/zero headroom is rejected before allocation. */
 TEST(CPUFP32PagedKVTable, IssuanceHeadroomValidationIsTyped)
 {

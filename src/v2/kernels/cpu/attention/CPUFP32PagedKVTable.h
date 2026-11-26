@@ -11,6 +11,7 @@
  */
 #pragma once
 #include "CPUFP32PagedKVView.h"
+#include "EffectiveUseOrdering.h"
 #include "PagedKVArchive.h"
 #include <memory>
 #include <optional>
@@ -189,6 +190,20 @@ public:
     void closeBorrowers(const Snapshot &snapshot);
     /** @return Original PMA instance identity for same-authority admission checks. */
     const PhysicalMemoryAuthority *issuerForAdmission() const noexcept { return authority_.get(); }
+
+    /**
+     * @brief Acknowledge one successful attachment (§8.2 effective use).
+     * @param version Exact published table content version touched.
+     * @param incarnation Replica incarnation (bank identity) adopted.
+     * @return True when the touch is new (advances the retention watermark),
+     * false for an idempotent duplicate or an obsolete incarnation.
+     * @note A receipt exists only AFTER a committed snapshot; a failed
+     * attachment never produces one, and no eviction may precede the
+     * acknowledged watermark for this incarnation.
+     */
+    bool acknowledgeEffectiveUse(std::uint64_t version, std::uint64_t incarnation);
+    /** @return Highest acknowledged retention watermark (§8.2 ordering point). */
+    std::uint64_t effectiveUseWatermark() const noexcept { return effective_use_.watermark(); }
 private:
     enum class Phase : std::uint8_t { Free, Preparing, Published };
     /** @brief Exact CPU ownership state within the charged metadata root. */
@@ -213,6 +228,7 @@ private:
     std::uint64_t next_version_ = 0; ///< Monotonic across every bank, including aborted preparations.
     std::uint64_t reserved_outstanding_ = 0; ///< Sum of live reservation capacities.
     std::uint64_t reservation_serial_ = 0;   ///< Monotonic handle nonce, never recycled.
+    EffectiveUseTracker effective_use_;       ///< Accepted-touch watermark (§8.2).
     AlignedVector<std::byte> cells_;
     AlignedVector<Bank> banks_;
     CPUFP32KVPage *pages_ = nullptr; ///< Constructed stable metadata array, never KV payload.
