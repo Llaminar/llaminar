@@ -21,3 +21,15 @@ v2_add_core_free_test(V2_Integration_CPUHostCompileContract
         "--compiler-CUDA=${CMAKE_CUDA_COMPILER}"
         "--compiler-HIP=${CMAKE_HIP_COMPILER}"
     LABELS V2 Integration DeviceFree ProductionTestPreflight)
+
+# Simulated compiler identities exercise real CMake generation, not native codegen.
+v2_add_core_free_test(V2_Unit_CPUHostGeneratedCommands
+    COMMAND "${Python3_EXECUTABLE}" -m unittest discover
+        -s "${CMAKE_CURRENT_LIST_DIR}/../../../scripts/ci"
+        -p test_cpu_host_generated_commands.py
+    LABELS V2 Unit DeviceFree CI)
+v2_add_core_free_test(V2_Integration_CPUHostGeneratedCommands
+    COMMAND "${Python3_EXECUTABLE}" -m unittest discover
+        -s "${CMAKE_CURRENT_LIST_DIR}/../../../scripts/ci"
+        -p test_cpu_host_generated_commands.py
+    LABELS V2 Integration DeviceFree ProductionTestPreflight)
