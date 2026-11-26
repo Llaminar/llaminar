@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
-"""Device-free controls for the x86 contraction witness: receipt, identity, commands, matcher.
+"""Tool-free controls for the x86 contraction witness: receipts, identity, commands, matcher.
 
 ContractionProofAdmission replays synthetic plans, compilation databases and
-receipts through the actual builder/verifier helpers. ContractionProofGeneratedCommands
-configures (never builds) small projects with the real CMake module and the
-canonical ISA authority, then audits the commands the proof derives from them.
+receipts through the actual builder/verifier helpers. GeneratedCommandsReceipt
+replays synthetic generated-command receipts through the actual installed
+verifier. No compiler, CMake or disassembler is executed; the fixture compiler
+is a shell stub that only prints a banner.
 """
 import copy
-import hashlib
 import json
-import os
 import pathlib
 import shlex
 import subprocess
@@ -17,12 +16,14 @@ import sys
 import tempfile
 import unittest
 
+import cpu_contraction_generated_commands as generated
 import cpu_contraction_proof as proof
 from check_cpu_contraction_witness import (ENVELOPES, SETTINGS, count_fused, derive_command,
                                            expected_counts, planned_commands, symbol_bodies)
 
 ROOT = pathlib.Path(__file__).resolve().parents[3]
 SCRIPT = pathlib.Path(__file__).with_name('cpu_contraction_proof.py')
+GENERATED = pathlib.Path(__file__).with_name('cpu_contraction_generated_commands.py')
 AVX2_FLAGS = '-msse4.1 -mavx -mavx2 -mfma -mf16c -mbmi -mbmi2 -mpopcnt'
 AVX512_FLAGS = AVX2_FLAGS + ' -mavx512f -mavx512bw -mavx512dq -mavx512vl -mavx512vnni'
 
@@ -39,10 +40,11 @@ ENVELOPE_PLAN = {'AVX2': {'flags': AVX2_FLAGS, 'definitions': definitions(0)},
 CONFIGURED = {'isa': 'AVX512', **ENVELOPE_PLAN['AVX512']}
 
 
-def core_command(compiler, source, extra=()):
-    """Return a representative CMake core compile command under the AVX512 envelope."""
-    return ([compiler] + ['-D' + item for item in definitions(1)] + ['-DCORE_PUBLIC', '-I/include',
-            '-O3', '-g', '-DNDEBUG'] + AVX512_FLAGS.split() + ['-std=gnu++23', '-fPIC', '-fopenmp']
+def core_command(compiler, source, extra=(), isa='AVX512', debug_info=True):
+    """Return a representative CMake core compile command under one configured envelope."""
+    return ([compiler] + ['-D' + item for item in ENVELOPE_PLAN[isa]['definitions']]
+            + ['-DCORE_PUBLIC_DEFINITION', '-I/include', '-O3'] + (['-g'] if debug_info else [])
+            + ['-DNDEBUG'] + ENVELOPE_PLAN[isa]['flags'].split() + ['-std=gnu++23', '-fPIC', '-fopenmp']
             + list(extra) + ['-MD', '-MT', 'core.o', '-MF', 'core.o.d', '-o', 'core.o', '-c', source])
 
 
@@ -210,106 +212,86 @@ class ContractionProofAdmission(unittest.TestCase):
         self.assertEqual(count_fused(bodies['nativeAVX2']), 6)
 
 
-class ContractionProofGeneratedCommands(unittest.TestCase):
-    """Configure the real module and authority; audit the commands it derives."""
+def synthetic_observations(identity):
+    """Observations a correct fixture configure of every generated-command case records."""
+    observations = {}
+    for isa, build_type in generated.QUALIFIED:
+        plan = dict(schema=1, build_type=build_type, compiler=identity,
+                    configured={'isa': isa, **ENVELOPE_PLAN[isa]}, envelopes=ENVELOPE_PLAN,
+                    codegen_source='core.cpp', compile_database='compile_commands.json',
+                    objdump='objdump', stricter_setting='-ffp-contract=fast')
+        core = core_command('g++', 'core.cpp', isa=isa, debug_info=build_type == 'Integration')
+        observations[f'{isa}-{build_type}'] = dict(
+            returncode=0, output='', plan=plan, core_command=core[:core.index('-MD')],
+            tests=sorted((generated.PROOF_TEST,) + generated.UNIT_TESTS))
+    for case, (_, _, status) in generated.UNQUALIFIED.items():
+        observations[case] = dict(returncode=0, output='-- V2: x86 ... ' + status, plan=None,
+                                  core_command=None, tests=sorted(generated.UNIT_TESTS))
+    manual = copy.deepcopy(observations['AVX2-Release'])
+    manual['core_command'].insert(1, '-mavx512f')
+    observations[generated.MANUAL] = manual
+    return observations
 
-    PROJECT = r'''
-cmake_minimum_required(VERSION 3.20)
-project(ContractionFixture LANGUAGES CXX)
-# Generation only: the derived commands are audited, never compiled here.
-set(CMAKE_SYSTEM_PROCESSOR x86_64)
-# A user-supplied manual flag after compiler detection, as an ordinary
-# CMAKE_CXX_FLAGS entry would appear in the production command.
-set(CMAKE_CXX_FLAGS "${MANUAL_FLAGS} ${CMAKE_CXX_FLAGS}")
-include("${AUTHORITY}")
-llaminar_configure_cpu_instruction_set()
-add_library(core SHARED core.cpp)
-target_compile_features(core PUBLIC cxx_std_23)
-# Stand-in for OpenMP::OpenMP_CXX: a target compile option the witness must inherit.
-target_compile_options(core PRIVATE -fopenmp)
-target_compile_definitions(core PUBLIC CORE_PUBLIC_DEFINITION)
-set(V2_CPU_TARGET_X86 ON)
-set(V2_CPU_CONTRACTION_CODEGEN_TARGET core)
-set(V2_CPU_CONTRACTION_CODEGEN_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/core.cpp")
-enable_testing()
-include("${MODULE}")
-'''
 
-    def configure(self, root, name, build_type, isa='AVX512', extra=(), generator='Ninja'):
-        """Configure one fixture tree; return (result, build directory)."""
-        tools = {key: os.environ.get('LLAMINAR_TEST_' + key) for key in ('CXX', 'CMAKE', 'CTEST', 'NINJA')}
-        missing = [key for key, value in tools.items() if not value]
-        self.assertFalse(missing, 'configured tool paths are required: ' + ' '.join(missing))
-        build = root / name
-        command = [tools['CMAKE'], '-S', str(root), '-B', str(build), '-G', generator,
-                   '-DCMAKE_MAKE_PROGRAM=' + tools['NINJA'], '-DCMAKE_CXX_COMPILER=' + tools['CXX'],
-                   '-DLLAMINAR_CPU_ISA=' + isa, '-DPython3_EXECUTABLE=' + sys.executable,
-                   '-DAUTHORITY=' + str(ROOT / 'cmake/CPUInstructionSet.cmake'),
-                   '-DMODULE=' + str(ROOT / 'tests/v2/cmake/V2CPUContractionProof.cmake')]
-        if build_type is not None:
-            command.append('-DCMAKE_BUILD_TYPE=' + build_type)
-        return subprocess.run(command + list(extra), capture_output=True, text=True), build
+class GeneratedCommandsReceipt(unittest.TestCase):
+    """The tool-free verifier admits only a complete, current receipt for the configured compiler."""
 
-    def registered(self, build):
-        """Return the registered CTest names of one configured tree."""
-        listing = subprocess.run([os.environ['LLAMINAR_TEST_CTEST'], '--test-dir', str(build), '-N'], capture_output=True,
-                                 text=True, check=True).stdout
-        return {line.split(': ', 1)[1].strip() for line in listing.splitlines() if 'Test #' in line}
+    def run_verify(self, root, identity, report):
+        """Run the installed verifier; return (accepted, stderr)."""
+        identity_path, report_path = root / 'compiler.json', root / 'generated_commands.json'
+        identity_path.write_text(json.dumps(identity))
+        if report is None:
+            report_path.unlink(missing_ok=True)
+        else:
+            report_path.write_text(json.dumps(report))
+        result = subprocess.run([sys.executable, str(GENERATED), 'verify', '--identity', str(identity_path),
+                                 '--report', str(report_path)], capture_output=True, text=True)
+        return result.returncode == 0, result.stderr
 
-    def test_generated_commands(self):
-        """Qualified configurations derive production commands; others are explicit."""
+    def test_receipt_negative_controls(self):
+        """Replay a valid receipt, then remove, stale or mutate each authenticated part."""
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
-            (root / 'CMakeLists.txt').write_text(self.PROJECT)
-            (root / 'core.cpp').write_text('int core;\n')
-            for isa in ('AVX2', 'AVX512'):
-                for build_type in ('Release', 'Integration'):
-                    with self.subTest(isa=isa, build_type=build_type):
-                        extra = ['-DCMAKE_CXX_FLAGS_INTEGRATION=-O3 -g -DNDEBUG -DLLAMINAR_ENABLE_ASSERTIONS']
-                        result, build = self.configure(root, f'{isa}-{build_type}', build_type, isa, extra)
-                        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                        plan = json.loads((build / 'cpu_contraction/plan.json').read_text())
-                        self.assertEqual(plan['configured']['isa'], isa)
-                        self.assertEqual(plan['compiler']['sha256'], hashlib.sha256(
-                            pathlib.Path(plan['compiler']['realpath']).read_bytes()).hexdigest())
-                        _, _, commands = planned_commands(plan)
-                        self.assertEqual(sorted(commands), sorted(expected_counts()))
-                        for key, command in commands.items():
-                            envelope, setting = key.split('/')
-                            flags = plan['envelopes'][envelope]['flags'].split()
-                            start = command.index(flags[0])
-                            self.assertEqual(command[start:start + len(flags)], flags, key)
-                            for token in ('-std=gnu++23', '-fPIC', '-fopenmp', '-O3',
-                                          '-DCORE_PUBLIC_DEFINITION'):
-                                self.assertIn(token, command, key)
-                            self.assertEqual('-g' in command, build_type == 'Integration', key)
-                            if envelope == 'AVX2':
-                                self.assertFalse([t for t in command if t.startswith('-mavx512')], key)
-                            self.assertEqual(command.count('-ffp-contract=fast'),
-                                             int(setting == 'stricter'), key)
-                        tests = self.registered(build)
-                        self.assertIn('V2_Integration_CPUContributionContraction', tests)
-                        self.assertIn('V2_Unit_CPUContractionProofAdmission', tests)
-            for build_type, label in (('Debug', 'Debug'), (None, '<none>')):
-                with self.subTest(build_type=label):
-                    result, build = self.configure(root, f'unqualified-{label.strip("<>")}', build_type)
-                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                    self.assertIn(f"UNQUALIFIED for build type '{label}'", result.stdout)
-                    self.assertFalse((build / 'cpu_contraction/plan.json').exists())
-                    tests = self.registered(build)
-                    self.assertNotIn('V2_Integration_CPUContributionContraction', tests)
-                    self.assertIn('V2_Unit_CPUContractionProofAdmission', tests)
-            with self.subTest('manual ISA flag'):
-                result, build = self.configure(root, 'manual', 'Release', 'AVX2',
-                                               ['-DMANUAL_FLAGS=-mavx512f'])
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                plan = json.loads((build / 'cpu_contraction/plan.json').read_text())
-                with self.assertRaisesRegex(ValueError, 'ambiguous manual ISA option'):
-                    planned_commands(plan)
-            with self.subTest('multi-config'):
-                result, _ = self.configure(root, 'multi', None, generator='Ninja Multi-Config')
-                self.assertNotEqual(result.returncode, 0)
-                self.assertIn('multi-config generator', result.stderr)
+            identity = dict(path='/usr/bin/g++', realpath='/usr/bin/g++-14', sha256='a' * 64,
+                            version='g++ 14.2.0\n')
+            valid = dict(schema=generated.SCHEMA, sources=generated.sources(), compiler=identity,
+                         tools={}, observations=synthetic_observations(identity))
+            self.assertEqual(self.run_verify(root, identity, valid), (True, ''))
+
+            def mutated(case, field, value):
+                report = copy.deepcopy(valid)
+                report['observations'][case][field] = value
+                return report
+            multi_registered = mutated('multi-config', 'tests', sorted(
+                (generated.PROOF_TEST,) + generated.UNIT_TESTS))
+            multi_fatal = mutated('multi-config', 'returncode', 1)
+            missing_status = mutated('Debug', 'output', '')
+            leaked = copy.deepcopy(valid)
+            leaked['observations']['AVX2-Release']['core_command'].append('-march=native')
+            accepted_manual = mutated(generated.MANUAL, 'core_command',
+                                      valid['observations']['AVX2-Release']['core_command'])
+            no_openmp = copy.deepcopy(valid)
+            no_openmp['observations']['AVX512-Integration']['core_command'].remove('-fopenmp')
+            dropped = copy.deepcopy(valid)
+            del dropped['observations']['none']
+            upgraded = {**identity, 'sha256': 'b' * 64}
+            for name, report, configured, message in [
+                    ('missing receipt', None, identity, 'Missing generated-command receipt'),
+                    ('stale sources', {**valid, 'sources': {}}, identity, 'stale'),
+                    ('old schema', {**valid, 'schema': 0}, identity, 'stale'),
+                    ('same-path compiler upgrade', valid, upgraded, 'compiler identity'),
+                    ('foreign receipt compiler', {**valid, 'compiler': upgraded}, identity, 'compiler identity'),
+                    ('dropped case', dropped, identity, 'incomplete'),
+                    ('multi-config registered proof', multi_registered, identity, 'registered the proof'),
+                    ('multi-config fatal', multi_fatal, identity, 'configure failed'),
+                    ('missing UNQUALIFIED status', missing_status, identity, 'UNQUALIFIED'),
+                    ('manual flag in qualified tree', leaked, identity, 'ambiguous manual ISA'),
+                    ('manual flag accepted', accepted_manual, identity, 'was accepted'),
+                    ('lost OpenMP', no_openmp, identity, '-fopenmp')]:
+                with self.subTest(name):
+                    accepted, error = self.run_verify(root, configured, report)
+                    self.assertFalse(accepted)
+                    self.assertIn(message, error)
 
 
 if __name__ == '__main__':

@@ -15,10 +15,16 @@
 # that recorded identity without executing any tool.
 #
 # Qualification is per configuration. The unguarded negative control can fuse
-# only when the configuration optimises, so only the build types listed in
-# V2_CPU_CONTRACTION_PROOF_BUILD_TYPES register the preflight proof; any other
-# single configuration is reported as explicitly unqualified. Multi-config
-# generators are rejected because one receipt binds one configuration's command.
+# only when the configuration optimises, so only single-config trees whose
+# build type is listed in V2_CPU_CONTRACTION_PROOF_BUILD_TYPES register the
+# preflight proof. Any other single configuration, and every multi-config
+# generator (one receipt binds one configuration's command), is reported as
+# explicitly UNQUALIFIED and registers no proof; configure never fails for it.
+#
+# The generated-command fixtures (fixture projects configured with this module,
+# the canonical ISA authority and the configured compiler) are build work in
+# every configuration: a v2_unit_gate dependency writes a source- and
+# compiler-bound receipt, and the Unit test verifies it without any tool.
 #
 # Inputs owned by the including directory: LLAMINAR_CPU_* from the canonical
 # ISA authority, V2_CPU_TARGET_X86, Python3_EXECUTABLE and CMAKE_OBJDUMP.
@@ -67,27 +73,61 @@ function(v2_cpu_contraction_json_array output)
     set(${output} "[${joined}]" PARENT_SCOPE)
 endfunction()
 
-if(V2_CPU_TARGET_X86)
-    get_property(V2_CPU_CONTRACTION_MULTI_CONFIG GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
-    if(V2_CPU_CONTRACTION_MULTI_CONFIG)
-        message(FATAL_ERROR "The x86 contraction proof binds one configuration's actual compile command; "
-            "multi-config generator '${CMAKE_GENERATOR}' is unsupported. Configure a single-config "
-            "tree with CMAKE_BUILD_TYPE one of: ${V2_CPU_CONTRACTION_PROOF_BUILD_TYPES}")
+# @brief Write a configure artifact only when its content changes, so an
+# unchanged reconfigure does not rebuild the receipts that depend on it.
+# @param path Output file.
+# @param text Complete content.
+function(v2_cpu_contraction_write_if_changed path text)
+    set(previous "")
+    if(EXISTS "${path}")
+        file(READ "${path}" previous)
     endif()
-    if(CMAKE_BUILD_TYPE IN_LIST V2_CPU_CONTRACTION_PROOF_BUILD_TYPES)
-        set(V2_CPU_CONTRACTION_QUALIFIED ON)
-    else()
-        set(V2_CPU_CONTRACTION_QUALIFIED OFF)
-        set(V2_CPU_CONTRACTION_CONFIGURATION "${CMAKE_BUILD_TYPE}")
-        if(NOT V2_CPU_CONTRACTION_CONFIGURATION)
-            set(V2_CPU_CONTRACTION_CONFIGURATION "<none>")
-        endif()
-        message(STATUS "V2: x86 contribution contraction proof UNQUALIFIED for build type "
-            "'${V2_CPU_CONTRACTION_CONFIGURATION}' (non-optimising); registered only for "
-            "${V2_CPU_CONTRACTION_PROOF_BUILD_TYPES}")
+    if(NOT previous STREQUAL text)
+        file(WRITE "${path}" "${text}")
     endif()
+endfunction()
+
+set(V2_CPU_CONTRACTION_DIR "${CMAKE_CURRENT_BINARY_DIR}/cpu_contraction")
+set(V2_CPU_CONTRACTION_IDENTITY "${V2_CPU_CONTRACTION_DIR}/compiler.json")
+set(V2_CPU_CONTRACTION_GENERATED "${V2_CPU_CONTRACTION_DIR}/generated_commands.json")
+
+# Configure-recorded compiler identity. A same-path upgrade changes the SHA256
+# or banner; the builders then refuse it and retained receipts become stale.
+get_filename_component(V2_CPU_CONTRACTION_COMPILER_REAL "${CMAKE_CXX_COMPILER}" REALPATH)
+file(SHA256 "${V2_CPU_CONTRACTION_COMPILER_REAL}" V2_CPU_CONTRACTION_COMPILER_SHA256)
+execute_process(COMMAND "${CMAKE_CXX_COMPILER}" --version
+    RESULT_VARIABLE V2_CPU_CONTRACTION_VERSION_RESULT
+    OUTPUT_VARIABLE V2_CPU_CONTRACTION_COMPILER_VERSION
+    ERROR_VARIABLE V2_CPU_CONTRACTION_VERSION_ERROR)
+if(NOT V2_CPU_CONTRACTION_VERSION_RESULT EQUAL 0)
+    message(FATAL_ERROR "x86 contraction proof cannot record ${CMAKE_CXX_COMPILER} --version: ${V2_CPU_CONTRACTION_VERSION_ERROR}")
+endif()
+v2_cpu_contraction_json_string(V2_CPU_CONTRACTION_J_COMPILER "${CMAKE_CXX_COMPILER}")
+v2_cpu_contraction_json_string(V2_CPU_CONTRACTION_J_REAL "${V2_CPU_CONTRACTION_COMPILER_REAL}")
+v2_cpu_contraction_json_string(V2_CPU_CONTRACTION_J_VERSION "${V2_CPU_CONTRACTION_COMPILER_VERSION}")
+set(V2_CPU_CONTRACTION_J_IDENTITY "{\"path\":${V2_CPU_CONTRACTION_J_COMPILER},\
+\"realpath\":${V2_CPU_CONTRACTION_J_REAL},\"sha256\":\"${V2_CPU_CONTRACTION_COMPILER_SHA256}\",\
+\"version\":${V2_CPU_CONTRACTION_J_VERSION}}")
+v2_cpu_contraction_write_if_changed("${V2_CPU_CONTRACTION_IDENTITY}" "${V2_CPU_CONTRACTION_J_IDENTITY}\n")
+
+get_property(V2_CPU_CONTRACTION_MULTI_CONFIG GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+set(V2_CPU_CONTRACTION_QUALIFIED OFF)
+if(NOT V2_CPU_TARGET_X86)
+    # The witness compiles x86 helpers; other targets have their own proofs.
+elseif(V2_CPU_CONTRACTION_MULTI_CONFIG)
+    message(STATUS "V2: x86 contribution contraction proof UNQUALIFIED for multi-config generator "
+        "'${CMAKE_GENERATOR}' (the proof binds one configuration's command); registered only for "
+        "single-config ${V2_CPU_CONTRACTION_PROOF_BUILD_TYPES}")
+elseif(CMAKE_BUILD_TYPE IN_LIST V2_CPU_CONTRACTION_PROOF_BUILD_TYPES)
+    set(V2_CPU_CONTRACTION_QUALIFIED ON)
 else()
-    set(V2_CPU_CONTRACTION_QUALIFIED OFF)
+    set(V2_CPU_CONTRACTION_CONFIGURATION "${CMAKE_BUILD_TYPE}")
+    if(NOT V2_CPU_CONTRACTION_CONFIGURATION)
+        set(V2_CPU_CONTRACTION_CONFIGURATION "<none>")
+    endif()
+    message(STATUS "V2: x86 contribution contraction proof UNQUALIFIED for build type "
+        "'${V2_CPU_CONTRACTION_CONFIGURATION}' (non-optimising); registered only for "
+        "${V2_CPU_CONTRACTION_PROOF_BUILD_TYPES}")
 endif()
 
 if(V2_CPU_CONTRACTION_QUALIFIED)
@@ -100,27 +140,10 @@ if(V2_CPU_CONTRACTION_QUALIFIED)
     # The witness borrows this target's command from the compilation database;
     # exporting it does not change any compile flag.
     set_property(TARGET ${V2_CPU_CONTRACTION_CODEGEN_TARGET} PROPERTY EXPORT_COMPILE_COMMANDS ON)
-    set(V2_CPU_CONTRACTION_DIR "${CMAKE_CURRENT_BINARY_DIR}/cpu_contraction")
     set(V2_CPU_CONTRACTION_PLAN "${V2_CPU_CONTRACTION_DIR}/plan.json")
     set(V2_CPU_CONTRACTION_PROOF "${V2_CPU_CONTRACTION_DIR}/proof.json")
     set(V2_CPU_CONTRACTION_DATABASE "${CMAKE_BINARY_DIR}/compile_commands.json")
 
-    # Configure-recorded compiler identity. A same-path upgrade changes the
-    # SHA256 or banner; the builder then refuses it and a retained receipt
-    # becomes stale against this plan.
-    get_filename_component(V2_CPU_CONTRACTION_COMPILER_REAL "${CMAKE_CXX_COMPILER}" REALPATH)
-    file(SHA256 "${V2_CPU_CONTRACTION_COMPILER_REAL}" V2_CPU_CONTRACTION_COMPILER_SHA256)
-    execute_process(COMMAND "${CMAKE_CXX_COMPILER}" --version
-        RESULT_VARIABLE V2_CPU_CONTRACTION_VERSION_RESULT
-        OUTPUT_VARIABLE V2_CPU_CONTRACTION_COMPILER_VERSION
-        ERROR_VARIABLE V2_CPU_CONTRACTION_VERSION_ERROR)
-    if(NOT V2_CPU_CONTRACTION_VERSION_RESULT EQUAL 0)
-        message(FATAL_ERROR "x86 contraction proof cannot record ${CMAKE_CXX_COMPILER} --version: ${V2_CPU_CONTRACTION_VERSION_ERROR}")
-    endif()
-
-    v2_cpu_contraction_json_string(V2_CPU_CONTRACTION_J_COMPILER "${CMAKE_CXX_COMPILER}")
-    v2_cpu_contraction_json_string(V2_CPU_CONTRACTION_J_REAL "${V2_CPU_CONTRACTION_COMPILER_REAL}")
-    v2_cpu_contraction_json_string(V2_CPU_CONTRACTION_J_VERSION "${V2_CPU_CONTRACTION_COMPILER_VERSION}")
     v2_cpu_contraction_json_string(V2_CPU_CONTRACTION_J_ISA "${LLAMINAR_CPU_ISA_UPPER}")
     v2_cpu_contraction_json_string(V2_CPU_CONTRACTION_J_FLAGS "${LLAMINAR_CPU_COMPILE_FLAGS}")
     v2_cpu_contraction_json_array(V2_CPU_CONTRACTION_J_DEFINITIONS ${LLAMINAR_CPU_COMPILE_DEFINITIONS})
@@ -140,8 +163,7 @@ if(V2_CPU_CONTRACTION_QUALIFIED)
             "{\"flags\":${V2_CPU_CONTRACTION_J_ENVELOPE_FLAGS},\"definitions\":${V2_CPU_CONTRACTION_J_ENVELOPE_DEFINITIONS}}")
     endforeach()
     set(V2_CPU_CONTRACTION_PLAN_TEXT "{\"schema\":1,\"build_type\":${V2_CPU_CONTRACTION_J_BUILD},\
-\"compiler\":{\"path\":${V2_CPU_CONTRACTION_J_COMPILER},\"realpath\":${V2_CPU_CONTRACTION_J_REAL},\
-\"sha256\":\"${V2_CPU_CONTRACTION_COMPILER_SHA256}\",\"version\":${V2_CPU_CONTRACTION_J_VERSION}},\
+\"compiler\":${V2_CPU_CONTRACTION_J_IDENTITY},\
 \"configured\":{\"isa\":${V2_CPU_CONTRACTION_J_ISA},\"flags\":${V2_CPU_CONTRACTION_J_FLAGS},\
 \"definitions\":${V2_CPU_CONTRACTION_J_DEFINITIONS}},\"envelopes\":${V2_CPU_CONTRACTION_J_ENVELOPES},\
 \"codegen_source\":${V2_CPU_CONTRACTION_J_SOURCE},\"compile_database\":${V2_CPU_CONTRACTION_J_DATABASE},\
@@ -151,14 +173,7 @@ if(V2_CPU_CONTRACTION_QUALIFIED)
     if(V2_CPU_CONTRACTION_PLAN_ERROR)
         message(FATAL_ERROR "x86 contraction proof generated an invalid plan: ${V2_CPU_CONTRACTION_PLAN_ERROR}")
     endif()
-    # Rewrite only on change so an unchanged reconfigure does not rebuild the proof.
-    set(V2_CPU_CONTRACTION_PLAN_PREVIOUS "")
-    if(EXISTS "${V2_CPU_CONTRACTION_PLAN}")
-        file(READ "${V2_CPU_CONTRACTION_PLAN}" V2_CPU_CONTRACTION_PLAN_PREVIOUS)
-    endif()
-    if(NOT V2_CPU_CONTRACTION_PLAN_PREVIOUS STREQUAL V2_CPU_CONTRACTION_PLAN_TEXT)
-        file(WRITE "${V2_CPU_CONTRACTION_PLAN}" "${V2_CPU_CONTRACTION_PLAN_TEXT}")
-    endif()
+    v2_cpu_contraction_write_if_changed("${V2_CPU_CONTRACTION_PLAN}" "${V2_CPU_CONTRACTION_PLAN_TEXT}")
 
     file(GLOB_RECURSE V2_CPU_CONTRACTION_HEADERS CONFIGURE_DEPENDS
         "${V2_CPU_CONTRACTION_ROOT}/src/v2/*.h")
@@ -184,20 +199,34 @@ if(V2_CPU_CONTRACTION_QUALIFIED)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUContributionContraction)
 endif()
 
-# Receipt, identity, command-derivation and matcher controls are device-free
-# and run in every configuration, including the unqualified ones.
+# Receipt, identity, command-derivation and matcher controls are tool-free and
+# device-free and run in every configuration, including the unqualified ones.
 add_test(NAME V2_Unit_CPUContractionProofAdmission
     COMMAND "${Python3_EXECUTABLE}" "${V2_CPU_CONTRACTION_SCRIPTS}/test_cpu_contraction_proof.py"
-        ContractionProofAdmission)
+        ContractionProofAdmission GeneratedCommandsReceipt)
 set_tests_properties(V2_Unit_CPUContractionProofAdmission PROPERTIES
     LABELS "V2;Unit;DeviceFree;CPU;Build;Regression" TIMEOUT 30)
-# Configure (never build) small fixture projects with this module and the
-# canonical ISA authority, then audit the generated commands the proof derives.
+# Configure (never build) fixture projects with this module, the canonical ISA
+# authority and the configured compiler at BUILD time; the Unit test verifies
+# the source- and compiler-bound receipt without invoking any tool.
+set(V2_CPU_CONTRACTION_GENERATED_SCRIPT "${V2_CPU_CONTRACTION_SCRIPTS}/cpu_contraction_generated_commands.py")
+add_custom_command(OUTPUT "${V2_CPU_CONTRACTION_GENERATED}"
+    COMMAND "${Python3_EXECUTABLE}" "${V2_CPU_CONTRACTION_GENERATED_SCRIPT}" build
+        --identity "${V2_CPU_CONTRACTION_IDENTITY}" --report "${V2_CPU_CONTRACTION_GENERATED}"
+        --cmake "${CMAKE_COMMAND}" --ctest "${CMAKE_CTEST_COMMAND}" --ninja "${CMAKE_MAKE_PROGRAM}"
+    DEPENDS "${V2_CPU_CONTRACTION_GENERATED_SCRIPT}" "${V2_CPU_CONTRACTION_IDENTITY}"
+        "${V2_CPU_CONTRACTION_ROOT}/tests/v2/cmake/V2CPUContractionProof.cmake"
+        "${V2_CPU_CONTRACTION_ROOT}/cmake/CPUInstructionSet.cmake"
+        "${V2_CPU_CONTRACTION_SCRIPTS}/check_cpu_contraction_witness.py"
+        "${V2_CPU_CONTRACTION_ROOT}/tests/v2/cmake/CPUCodegenEnvelope.py"
+        "${CMAKE_CXX_COMPILER}"
+    VERBATIM)
+add_custom_target(v2_cpu_contraction_generated_commands DEPENDS "${V2_CPU_CONTRACTION_GENERATED}")
+set_property(GLOBAL APPEND PROPERTY V2_UNIT_GATE_TARGETS v2_cpu_contraction_generated_commands)
 add_test(NAME V2_Unit_CPUContractionProofGeneratedCommands
-    COMMAND "${CMAKE_COMMAND}" -E env "LLAMINAR_TEST_CXX=${CMAKE_CXX_COMPILER}"
-        "LLAMINAR_TEST_CMAKE=${CMAKE_COMMAND}" "LLAMINAR_TEST_CTEST=${CMAKE_CTEST_COMMAND}"
-        "LLAMINAR_TEST_NINJA=${CMAKE_MAKE_PROGRAM}"
-        "${Python3_EXECUTABLE}" "${V2_CPU_CONTRACTION_SCRIPTS}/test_cpu_contraction_proof.py"
-        ContractionProofGeneratedCommands)
+    COMMAND "${Python3_EXECUTABLE}" "${V2_CPU_CONTRACTION_GENERATED_SCRIPT}" verify
+        --identity "${V2_CPU_CONTRACTION_IDENTITY}" --report "${V2_CPU_CONTRACTION_GENERATED}")
+set_property(GLOBAL PROPERTY V2_TEST_BUILD_TARGETS_V2_Unit_CPUContractionProofGeneratedCommands
+    v2_cpu_contraction_generated_commands)
 set_tests_properties(V2_Unit_CPUContractionProofGeneratedCommands PROPERTIES
-    LABELS "V2;Unit;DeviceFree;CPU;Build;CMake;Regression" TIMEOUT 120)
+    LABELS "V2;Unit;DeviceFree;CPU;Build;CMake;Regression" TIMEOUT 30)

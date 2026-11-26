@@ -43,16 +43,29 @@ deliberately unguarded negative control one under the same invocation.
 
 ## Qualification
 
-- **Release and Integration:** register `V2_Integration_CPUContributionContraction` in
-  `ProductionTestPreflight`. These are the only configurations whose flags
-  optimise, so only they can make the negative control fuse.
-- **Debug and an empty build type:** configure reports
-  `UNQUALIFIED` and registers no proof. No `-O3` is fabricated.
-- **Multi-config generators:** rejected at configure.
-- **Device-free Unit controls (every configuration):**
-  `V2_Unit_CPUContractionProofAdmission` covers receipt, identity, derivation and matcher self-test;
-  `V2_Unit_CPUContractionProofGeneratedCommands` configures fixture projects with the real
-  module and authority.
+- **Single-config Release and Integration:** register
+  `V2_Integration_CPUContributionContraction` in `ProductionTestPreflight`.
+  These are the only configurations whose flags optimise, so only they can
+  make the negative control fuse.
+- **Debug, an empty build type and every multi-config generator:** configure
+  reports `UNQUALIFIED` and registers no proof. No `-O3` is fabricated, and
+  configure never fails for this reason. A multi-config tree is unqualified
+  because one receipt binds one configuration's command.
+- **Generated-command fixtures (every configuration):** the
+  `v2_cpu_contraction_generated_commands` build target is a `v2_unit_gate`
+  dependency.
+  - It configures fixture projects with the real module, the ISA authority and
+    the configured compiler.
+  - The cases are AVX2/AVX512 × Release/Integration, Debug, empty, Ninja
+    Multi-Config, and a manual ISA flag.
+  - It writes a receipt bound to the sources and to the configure-recorded
+    compiler identity (`cpu_contraction/compiler.json`).
+  - `V2_Unit_CPUContractionProofGeneratedCommands` re-checks every observation
+    from that receipt and executes no tool.
+- **Tool-free Unit controls (every configuration):**
+  `V2_Unit_CPUContractionProofAdmission` covers the proof receipt, identity,
+  derivation and the matcher self-test. It also covers the generated-command
+  receipt's missing, stale, compiler-upgrade and mutated-observation negatives.
 
 ## Scope
 
@@ -61,6 +74,12 @@ planning copies and all per-TU/post-link production copies remain unwitnessed.
 D0 workspaceFloats COMDAT evidence is unrelated to this contraction proof.
 
 ## Local fixture evidence (2026-11-27)
+
+Builder and installed verification were both exercised on standalone fixture
+trees. The installed run hid every compiler, objdump, CMake and Ninja binary
+(executing them failed). In that run all Release/Integration, Debug and
+multi-config tests passed, and missing or stale generated-command receipts
+failed.
 
 The fixture project linked the real `OpenMP::OpenMP_CXX`. The only run was in
 the `g4-cross-test:avx` ARM container, with
