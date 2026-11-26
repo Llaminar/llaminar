@@ -95,12 +95,28 @@ NativeCPUCollectiveProgram NativeCPUCollectiveProgram::expertShardRoutePartials(
     }
     return NativeCPUCollectiveProgram(domain,backend,std::move(members));
 }
+CollectiveBackendType NativeCPUCollectiveProgram::resolveBoundExpertShardBackend(
+    CollectiveBackendType backend, std::span<const Participant> members)
+{
+    if (backend != CollectiveBackendType::AUTO)
+        return backend;
+    const bool same_node_multi_rank =
+        members.size() > 1u &&
+        !members.front().address.hostname.empty() &&
+        std::all_of(members.begin() + 1, members.end(), [&](const Participant &p) {
+            return p.address.hostname == members.front().address.hostname;
+        });
+    if (same_node_multi_rank)
+        return CollectiveBackendType::UPI;
+    const std::vector<DeviceId> devices(members.size(), DeviceId::cpu());
+    return BackendSelector::resolve(backend, devices);
+}
+
 NativeCPUCollectiveProgram NativeCPUCollectiveProgram::forBoundExpertShardDomain(
     int domain, CollectiveBackendType backend, std::vector<Participant> members)
 {
-    const std::vector<DeviceId> devices(members.size(), DeviceId::cpu());
-    return expertShardRoutePartials(domain, BackendSelector::resolve(backend, devices),
-        std::move(members));
+    const CollectiveBackendType resolved = resolveBoundExpertShardBackend(backend, members);
+    return expertShardRoutePartials(domain, resolved, std::move(members));
 }
 
 void NativeCPUCollectiveProgram::contributeDomainBOM(PhysicalMemoryPlanBuilder& plan,const PhysicalMemoryResource& cpu,int rank) const {

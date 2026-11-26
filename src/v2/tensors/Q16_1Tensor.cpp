@@ -869,7 +869,8 @@ namespace llaminar2
             block.sum_qs = static_cast<int32_t>(sum_i64);
         }
 
-        dequant_cache_.clear();
+        if (!dequant_cache_.empty())
+            OMP_SINGLE([&]() { dequant_cache_.clear(); });
         return true;
     }
 
@@ -1415,7 +1416,8 @@ namespace llaminar2
             block.sum_qs = static_cast<int32_t>(sum_i64);
         }
 
-        dequant_cache_.clear();
+        if (!dequant_cache_.empty())
+            OMP_SINGLE([&]() { dequant_cache_.clear(); });
         return true;
     }
 
@@ -1431,9 +1433,7 @@ namespace llaminar2
             constexpr size_t BLOCK_SIZE = BlockType::BLOCK_SIZE;
             BlockType *blocks = static_cast<BlockType *>(dst_blocks);
 
-::llaminar::v2::noteOpenMPTeamFork();
-#pragma omp parallel for if (n_blocks > 4)
-            for (size_t block_idx = 0; block_idx < n_blocks; ++block_idx)
+            auto quantize_one = [&](size_t block_idx) noexcept
             {
                 const size_t offset = block_idx * BLOCK_SIZE;
                 const size_t count = std::min(BLOCK_SIZE, total_elements - offset);
@@ -1477,7 +1477,22 @@ namespace llaminar2
                 }
 
                 block.sum_qs = static_cast<int32_t>(sum_i64);
+            };
+
+            if (n_blocks <= 4 && !::llaminar::v2::inLexicalWorkshare())
+            {
+                for (size_t block_idx = 0; block_idx < n_blocks; ++block_idx)
+                    quantize_one(block_idx);
+                return;
             }
+
+            auto do_work = [&]()
+            {
+#pragma omp for schedule(static)
+                for (size_t block_idx = 0; block_idx < n_blocks; ++block_idx)
+                    quantize_one(block_idx);
+            };
+            OMP_WORKSHARE_REGION(do_work);
         }
     } // anonymous namespace
 
@@ -1510,7 +1525,8 @@ namespace llaminar2
             return false;
         }
 
-        dequant_cache_.clear();
+        if (!dequant_cache_.empty())
+            OMP_SINGLE([&]() { dequant_cache_.clear(); });
         return true;
     }
 
@@ -1711,7 +1727,8 @@ namespace llaminar2
             return false;
         }
 
-        dequant_cache_.clear();
+        if (!dequant_cache_.empty())
+            OMP_SINGLE([&]() { dequant_cache_.clear(); });
         return true;
     }
 
@@ -1776,7 +1793,8 @@ namespace llaminar2
             return false;
         }
 
-        dequant_cache_.clear();
+        if (!dequant_cache_.empty())
+            OMP_SINGLE([&]() { dequant_cache_.clear(); });
         return true;
     }
 

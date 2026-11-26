@@ -191,6 +191,38 @@ public:
     }
     /** @return Exact original live row/head work, including the zero-work collective case. */
     [[nodiscard]] int rowHeads()const noexcept{return replay_.live_rows*p_.query_heads;}
+    /** @return Exact admitted live row count. */
+    [[nodiscard]] int liveRows()const noexcept{return replay_.live_rows;}
+    /** @return Exact admitted local query-head count. */
+    [[nodiscard]] int queryHeads()const noexcept{return p_.query_heads;}
+    /** @return Global starting query-head ordinal for GQA KV-group mapping. */
+    [[nodiscard]] int queryHeadStart()const noexcept{return p_.query_head_start;}
+    /** @return Cold-admitted execution ISA for register-group sizing. */
+    [[nodiscard]] ISALevel isa()const noexcept{return isa_;}
+    /** @brief Execute one admitted contiguous GQA head group sharing a single KV head.
+     * @param row Original invocation-local live row index.
+     * @param headBegin Starting local query-head index within this row.
+     * @param headCount Number of contiguous query heads (1..12) sharing one KV head.
+     * @details Dispatches compile-time head-group sizes (1, 2, 3, 4, 6, 12) so every
+     * score and value accumulator stays in hardware vector registers with zero stack
+     * spills, streaming each native codec fragment once across all heads in the group.
+     */
+    void executeHeadGroup(int row,int headBegin,int headCount)const noexcept
+    {
+        if(row<0||row>=replay_.live_rows||headBegin<0||headCount<=0||headCount>12||headBegin+headCount>p_.query_heads)native::rejectCodec();
+        switch(headCount)
+        {
+        case 1: return executeHeadGroupFixed<1>(row,headBegin);
+        case 2: return executeHeadGroupFixed<2>(row,headBegin);
+        case 3: return executeHeadGroupFixed<3>(row,headBegin);
+        case 4: return executeHeadGroupFixed<4>(row,headBegin);
+        case 6: return executeHeadGroupFixed<6>(row,headBegin);
+        case 12: return executeHeadGroupFixed<12>(row,headBegin);
+        default:
+            for(int h=0;h<headCount;++h)executeHeadGroupFixed<1>(row,headBegin+h);
+            return;
+        }
+    }
     /** @brief Execute one admitted independent row/head through the native original-storage program.
      * @param rowHead Original invocation-local row/head index, never an inactive capacity row.
      * @details The caller gives each index one worksharing owner and completes
@@ -200,67 +232,256 @@ public:
     void execute(int rowHead)const noexcept
     {
         if(rowHead<0||rowHead>=rowHeads())native::rejectCodec();
-        const int row=rowHead/p_.query_heads,head=rowHead%p_.query_heads;
-        const int kvHead=(p_.query_head_start+head)/12-p_.kv_head_start;
+        executeHeadGroupFixed<1>(rowHead/p_.query_heads,rowHead%p_.query_heads);
+    }
+private:
+    /** @brief Compile-time fixed-group native execution keeping all accumulators in vector registers. */
+    template<int HeadCount>
+    void executeHeadGroupFixed(int row,int headBegin)const noexcept
+    {
+        static_assert(HeadCount>=1&&HeadCount<=12);
+        const int kvHead=(p_.query_head_start+headBegin)/12-p_.kv_head_start;
+        if((p_.query_head_start+headBegin+HeadCount-1)/12-p_.kv_head_start!=kvHead)native::rejectCodec();
         const auto count=p_.selected_count[row];if(count<=0||count>QwenSparseSelected)native::rejectCodec();
         const auto*selected=p_.selected+std::size_t(row)*QwenSparseSelected;
         int origin=0,capacity=0;if(!detail::resolveMapping(p_.kv,replay_,row,p_.token_capacity,origin,capacity))native::rejectCodec();
-        const float*query=p_.query+std::size_t(rowHead)*256;float rotatedQuery[256];
-        if(detail::isRotated(p_.kv.keys))
+
+        const float*queries[HeadCount];
+        float*outputs[HeadCount];
+        float rotatedQueries[HeadCount][256];
+        const bool keyRotated=detail::isRotated(p_.kv.keys);
+        for(int h=0;h<HeadCount;++h)
         {
-            for(int c=0;c<256;++c)
-            {rotatedQuery[c]=native::dot<256>(p_.kv.keys.rotations[kvHead]+c*256,query,isa_);if(!std::isfinite(rotatedQuery[c]))native::rejectCodec();}
-            query=rotatedQuery;
+            const int rowHead=row*p_.query_heads+headBegin+h;
+            const float*q=p_.query+std::size_t(rowHead)*256;
+            if(keyRotated)
+            {
+                for(int c=0;c<256;++c)
+                {
+                    rotatedQueries[h][c]=native::dot<256>(p_.kv.keys.rotations[kvHead]+c*256,q,isa_);
+                    if(!std::isfinite(rotatedQueries[h][c]))native::rejectCodec();
+                }
+                queries[h]=rotatedQueries[h];
+            }
+            else queries[h]=q;
+            outputs[h]=p_.output+std::size_t(rowHead)*256;
         }
-        float logits[QwenSparseSelected];float maximum=-std::numeric_limits<float>::infinity();
+
+        float logits[HeadCount][QwenSparseSelected];
+        float maximum[HeadCount];
+        for(int h=0;h<HeadCount;++h)maximum[h]=-std::numeric_limits<float>::infinity();
+
         withDecoder(keys_,kvHead,[&](const auto&decoder)
         {
             for(int i=0;i<count;++i)
             {
                 const auto nativeRow=decoder.row(detail::physicalRow(selected[i],origin,capacity));
-                logits[i]=score(nativeRow,query,isa_)*0.0625f;if(!std::isfinite(logits[i]))native::rejectCodec();
-                maximum=std::max(maximum,logits[i]);
+#if defined(__AVX512F__)
+                if(isa_==ISALevel::AVX512)
+                {
+                    __m512 totals[HeadCount];
+                    for(int h=0;h<HeadCount;++h)totals[h]=_mm512_setzero_ps();
+                    for(int c=0;c<256;c+=16)
+                    {
+                        const __m512 k=join16(nativeRow.read(c),nativeRow.read(c+8));
+                        for(int h=0;h<HeadCount;++h)
+                            totals[h]=_mm512_fmadd_ps(_mm512_loadu_ps(queries[h]+c),k,totals[h]);
+                    }
+                    for(int h=0;h<HeadCount;++h)
+                    {
+                        const float s=native::fold16(totals[h])*0.0625f;
+                        if(!std::isfinite(s))native::rejectCodec();
+                        logits[h][i]=s;maximum[h]=std::max(maximum[h],s);
+                    }
+                    continue;
+                }
+#endif
+                if constexpr(HeadCount<=6)
+                {
+                    native::Fragment8 totals[HeadCount];
+                    for(int h=0;h<HeadCount;++h)totals[h]=native::zero8();
+                    for(int c=0;c<256;c+=8)
+                    {
+                        const auto k=nativeRow.read(c);
+                        for(int h=0;h<HeadCount;++h)
+                            totals[h]=native::fma8(totals[h],native::load8(queries[h]+c),k);
+                    }
+                    for(int h=0;h<HeadCount;++h)
+                    {
+                        const float s=native::fold8(totals[h])*0.0625f;
+                        if(!std::isfinite(s))native::rejectCodec();
+                        logits[h][i]=s;maximum[h]=std::max(maximum[h],s);
+                    }
+                }
+                else
+                {
+                    // Split into two 6-head register halves on AVX2/NEON to stay spill-free.
+                    for(int half=0;half<HeadCount;half+=6)
+                    {
+                        native::Fragment8 totals[6];
+                        for(int h=0;h<6;++h)totals[h]=native::zero8();
+                        for(int c=0;c<256;c+=8)
+                        {
+                            const auto k=nativeRow.read(c);
+                            for(int h=0;h<6;++h)
+                                totals[h]=native::fma8(totals[h],native::load8(queries[half+h]+c),k);
+                        }
+                        for(int h=0;h<6;++h)
+                        {
+                            const float s=native::fold8(totals[h])*0.0625f;
+                            if(!std::isfinite(s))native::rejectCodec();
+                            logits[half+h][i]=s;maximum[half+h]=std::max(maximum[half+h],s);
+                        }
+                    }
+                }
             }
         });
-        float denominator=0;for(int i=0;i<count;++i){logits[i]=std::exp(logits[i]-maximum);denominator+=logits[i];}
-        if(!std::isfinite(denominator)||denominator<=0)native::rejectCodec();
-        for(int i=0;i<count;++i)logits[i]/=denominator;
-        auto*output=p_.output+std::size_t(rowHead)*256;std::fill_n(output,256,0.0f);
+
+        for(int h=0;h<HeadCount;++h)
+        {
+            float denominator=0.0f;
+            const float m=maximum[h];
+            for(int i=0;i<count;++i){logits[h][i]=std::exp(logits[h][i]-m);denominator+=logits[h][i];}
+            if(!std::isfinite(denominator)||denominator<=0.0f)native::rejectCodec();
+            for(int i=0;i<count;++i)logits[h][i]/=denominator;
+        }
+
         withDecoder(values_,kvHead,[&](const auto&decoder)
         {
             if constexpr(std::remove_cvref_t<decltype(decoder)>::rotatedBasis)
             {
+                for(int h=0;h<HeadCount;++h)std::fill_n(outputs[h],256,0.0f);
                 for(int base=0;base<256;base+=8)
                 {
-                    auto weighted=native::zero8();
+                    native::Fragment8 weighted[HeadCount];
+                    for(int h=0;h<HeadCount;++h)weighted[h]=native::zero8();
                     for(int i=0;i<count;++i)
-                    {const auto source=decoder.row(detail::physicalRow(selected[i],origin,capacity));weighted=native::fma8(weighted,source.read(base),native::broadcast8(logits[i]));}
-                    if(!native::finite8(weighted))native::rejectCodec();
-                    transposeFragment(weighted,p_.kv.values.rotations[kvHead],base,output,isa_,std::make_integer_sequence<unsigned,8>{});
+                    {
+                        const auto frag=decoder.row(detail::physicalRow(selected[i],origin,capacity)).read(base);
+                        for(int h=0;h<HeadCount;++h)
+                            weighted[h]=native::fma8(weighted[h],frag,native::broadcast8(logits[h][i]));
+                    }
+                    for(int h=0;h<HeadCount;++h)
+                    {
+                        if(!native::finite8(weighted[h]))native::rejectCodec();
+                        transposeFragment(weighted[h],p_.kv.values.rotations[kvHead],base,outputs[h],isa_,std::make_integer_sequence<unsigned,8>{});
+                    }
                 }
             }
-            else for(int i=0;i<count;++i)
+            else
             {
-                const auto source=decoder.row(detail::physicalRow(selected[i],origin,capacity));
 #if defined(__AVX512F__)
                 if(isa_==ISALevel::AVX512)
                 {
-                    const auto probability=_mm512_set1_ps(logits[i]);
-                    for(int c=0;c<256;c+=16)_mm512_storeu_ps(output+c,_mm512_fmadd_ps(probability,join16(source.read(c),source.read(c+8)),_mm512_loadu_ps(output+c)));
-                    continue;
+                    if constexpr(HeadCount==1)
+                    {
+                        __m512 acc[16];
+                        for(int t=0;t<16;++t)acc[t]=_mm512_setzero_ps();
+                        for(int i=0;i<count;++i)
+                        {
+                            const auto source=decoder.row(detail::physicalRow(selected[i],origin,capacity));
+                            const __m512 prob=_mm512_set1_ps(logits[0][i]);
+                            for(int t=0;t<16;++t)
+                                acc[t]=_mm512_fmadd_ps(prob,join16(source.read(t*16),source.read(t*16+8)),acc[t]);
+                        }
+                        for(int t=0;t<16;++t)_mm512_storeu_ps(outputs[0]+t*16,acc[t]);
+                    }
+                    else
+                    {
+                        for(int c=0;c<256;c+=32)
+                        {
+                            __m512 acc0[HeadCount],acc1[HeadCount];
+                            for(int h=0;h<HeadCount;++h){acc0[h]=_mm512_setzero_ps();acc1[h]=_mm512_setzero_ps();}
+                            for(int i=0;i<count;++i)
+                            {
+                                const auto source=decoder.row(detail::physicalRow(selected[i],origin,capacity));
+                                const __m512 v0=join16(source.read(c),source.read(c+8));
+                                const __m512 v1=join16(source.read(c+16),source.read(c+24));
+                                for(int h=0;h<HeadCount;++h)
+                                {
+                                    const __m512 prob=_mm512_set1_ps(logits[h][i]);
+                                    acc0[h]=_mm512_fmadd_ps(prob,v0,acc0[h]);
+                                    acc1[h]=_mm512_fmadd_ps(prob,v1,acc1[h]);
+                                }
+                            }
+                            for(int h=0;h<HeadCount;++h)
+                            {
+                                _mm512_storeu_ps(outputs[h]+c,acc0[h]);
+                                _mm512_storeu_ps(outputs[h]+c+16,acc1[h]);
+                            }
+                        }
+                    }
+                    return;
                 }
 #endif
-                const auto probability=native::broadcast8(logits[i]);
-                for(int c=0;c<256;c+=8)native::store8(output+c,native::fma8(native::load8(output+c),probability,source.read(c)));
+                if constexpr(HeadCount<=6)
+                {
+                    for(int c=0;c<256;c+=16)
+                    {
+                        native::Fragment8 acc0[HeadCount],acc1[HeadCount];
+                        for(int h=0;h<HeadCount;++h){acc0[h]=native::zero8();acc1[h]=native::zero8();}
+                        for(int i=0;i<count;++i)
+                        {
+                            const auto source=decoder.row(detail::physicalRow(selected[i],origin,capacity));
+                            const auto v0=source.read(c);
+                            const auto v1=source.read(c+8);
+                            for(int h=0;h<HeadCount;++h)
+                            {
+                                const auto prob=native::broadcast8(logits[h][i]);
+                                acc0[h]=native::fma8(acc0[h],prob,v0);
+                                acc1[h]=native::fma8(acc1[h],prob,v1);
+                            }
+                        }
+                        for(int h=0;h<HeadCount;++h)
+                        {
+                            native::store8(outputs[h]+c,acc0[h]);
+                            native::store8(outputs[h]+c+8,acc1[h]);
+                        }
+                    }
+                }
+                else
+                {
+                    for(int half=0;half<HeadCount;half+=6)
+                    {
+                        for(int c=0;c<256;c+=16)
+                        {
+                            native::Fragment8 acc0[6],acc1[6];
+                            for(int h=0;h<6;++h){acc0[h]=native::zero8();acc1[h]=native::zero8();}
+                            for(int i=0;i<count;++i)
+                            {
+                                const auto source=decoder.row(detail::physicalRow(selected[i],origin,capacity));
+                                const auto v0=source.read(c);
+                                const auto v1=source.read(c+8);
+                                for(int h=0;h<6;++h)
+                                {
+                                    const auto prob=native::broadcast8(logits[half+h][i]);
+                                    acc0[h]=native::fma8(acc0[h],prob,v0);
+                                    acc1[h]=native::fma8(acc1[h],prob,v1);
+                                }
+                            }
+                            for(int h=0;h<6;++h)
+                            {
+                                native::store8(outputs[half+h]+c,acc0[h]);
+                                native::store8(outputs[half+h]+c+8,acc1[h]);
+                            }
+                        }
+                    }
+                }
             }
         });
-        for(int c=0;c<256;++c)
+
+        for(int h=0;h<HeadCount;++h)
         {
-            if(p_.gate)
-            {const auto gate=p_.gate[std::size_t(rowHead)*256+c];if(!std::isfinite(gate))native::rejectCodec();output[c]*=1.0f/(1.0f+std::exp(-gate));}
-            if(!std::isfinite(output[c]))native::rejectCodec();
+            const int rowHead=row*p_.query_heads+headBegin+h;
+            float*output=outputs[h];
+            for(int c=0;c<256;++c)
+            {
+                if(p_.gate)
+                {const auto gate=p_.gate[std::size_t(rowHead)*256+c];if(!std::isfinite(gate))native::rejectCodec();output[c]*=1.0f/(1.0f+std::exp(-gate));}
+                if(!std::isfinite(output[c]))native::rejectCodec();
+            }
+            if(p_.observations)p_.observations[rowHead]={std::uint64_t(count)*256,std::uint64_t(count)*256,std::uint32_t(count)};
         }
-        if(p_.observations)p_.observations[rowHead]={std::uint64_t(count)*256,std::uint64_t(count)*256,std::uint32_t(count)};
     }
 private:
     /** @brief Retain sealed original roots/replay only, with no new allocation/lease authority.

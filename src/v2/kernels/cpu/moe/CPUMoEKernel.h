@@ -179,6 +179,11 @@ namespace llaminar2
             float *shared_output,
             int seq_len, int d_model) override;
 
+        void sharedExpertGateAddFromTensors(
+            ITensor *input, ITensor *gate_inp, ITensor *shared_output,
+            ITensor *routed_residual, ITensor *combined_output,
+            int seq_len, int d_model) override;
+
         void swiGLU(float *gate, const float *up, int count) override;
 
         /**
@@ -320,6 +325,27 @@ namespace llaminar2
                 std::make_shared<AlignedVector<Q8_1Block>>(std::move(storage)));
         }
 
+        /**
+         * @brief Quantize contiguous or indexed rows into an exact Q8_1 target.
+         *
+         * @param source Contiguous FP32 source-row base.
+         * @param source_rows Number of addressable source rows.
+         * @param d_model Logical values per source row.
+         * @param source_row_indices Optional output-to-source row map; null is identity.
+         * @param output_rows Number of Q8_1 rows to write.
+         * @param destination Destination block base.
+         * @param destination_blocks Available destination block count.
+         * @return True when the complete validated publication was written.
+         */
+        bool quantizeRouterQ8Rows(
+            const float *source,
+            int source_rows,
+            int d_model,
+            const int *source_row_indices,
+            int output_rows,
+            Q8_1Block *destination,
+            size_t destination_blocks);
+
 
         // =================================================================
         // ITensorKernel interface
@@ -365,27 +391,6 @@ namespace llaminar2
             const float *source,
             int rows,
             int d_model);
-
-        /**
-         * @brief Quantize contiguous or indexed rows into an exact Q8_1 target.
-         *
-         * @param source Contiguous FP32 source-row base.
-         * @param source_rows Number of addressable source rows.
-         * @param d_model Logical values per source row.
-         * @param source_row_indices Optional output-to-source row map; null is identity.
-         * @param output_rows Number of Q8_1 rows to write.
-         * @param destination Destination block base.
-         * @param destination_blocks Available destination block count.
-         * @return True when the complete validated publication was written.
-         */
-        bool quantizeRouterQ8Rows(
-            const float *source,
-            int source_rows,
-            int d_model,
-            const int *source_row_indices,
-            int output_rows,
-            Q8_1Block *destination,
-            size_t destination_blocks);
 
         std::shared_ptr<AlignedVector<Q8_1Block>> router_q8_hidden_; ///< Actual declared backing; publication metadata remains graph-local.
         const float *router_q8_hidden_source_ = nullptr; ///< FP32 producer identity.

@@ -49,11 +49,10 @@ public:
                 throw std::invalid_argument("CPU pipeline program duplicates an original physical/process owner");
             members.push_back({rank,address});
         }
-        const auto backend=BackendSelector::resolve(stage.backend,std::vector<DeviceId>(members.size(),DeviceId::cpu()));
         return OriginalCPUPipelineProgram(stage.stage_id,
             {.first_layer=stage.first_layer,.last_layer=stage.last_layer+1,.has_embedding=stage.has_embedding,
              .has_lm_head=stage.has_lm_head,.generation_domain=DeviceGenerationExecutionDomain::HostedBoundary},
-            NativeCPUCollectiveProgram::expertShardRoutePartials(stage.stage_id,backend,std::move(members)));
+            NativeCPUCollectiveProgram::forBoundExpertShardDomain(stage.stage_id,stage.backend,std::move(members)));
     }
     /** @return Original global stage key, never a rank or NUMA inference. */
     int stageId() const noexcept {return stage_id_;}

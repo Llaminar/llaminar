@@ -200,7 +200,7 @@ namespace llaminar2
             total_tokens, device, attn_node, "wo_proj",
             projectionVerifierRows(device, seq_len, batch_size, sequence_lengths_device));
         const std::string terminal = addWoAllreduce(
-            graph, prefix, buffers, layer.wo,
+            graph, prefix, buffers, layer.wo, layer_bindings.wo,
             total_tokens, layer_idx, device, wo_projection);
 
         graph.setTerminalNode(terminal);

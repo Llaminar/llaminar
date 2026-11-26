@@ -3233,9 +3233,13 @@ namespace llaminar2
                     }
                     else
                         graph.addDependency(captured_local_expert_compute_node, cpu_packet);
-                    if (mapped_decode_shared_overlap && planned_shared_device == device)
+                    if ((mapped_decode_shared_overlap ||
+                         (total_tokens > 1 && !shared_prefill_cpu_input_fork &&
+                          requiresHeterogeneousTicketSegmentation(graph.nativeCaptureEnvelope()))) &&
+                        planned_shared_device == device)
                         shared_decode_cpu_packet = cpu_packet;
-                    if (total_tokens > 1 && planned_shared_device == device)
+                    if (total_tokens > 1 && planned_shared_device == device &&
+                        !requiresHeterogeneousTicketSegmentation(graph.nativeCaptureEnvelope()))
                         shared_prefill_mapped_dispatch = cpu_packet;
 
                     if (use_lane_batch)
@@ -3900,7 +3904,8 @@ namespace llaminar2
                         prefix +
                         "moe_overlay_continuation_routes_ordered_reduce";
                     std::string early_stage_sparse_name;
-                    if (use_mapped_sparse_routes &&
+                    if (!has_cpu_ticket_boundary &&
+                        use_mapped_sparse_routes &&
                         use_mapped_activation_parent &&
                         !mapped_activation_return_nodes.empty() &&
                         total_tokens > 1 &&
@@ -4003,7 +4008,9 @@ namespace llaminar2
                         std::move(ordered_reduce_capture_wave));
                     if (has_cpu_ticket_boundary)
                     {
-                        if (mapped_decode_shared_overlap && planned_shared_device == device)
+                        if ((mapped_decode_shared_overlap ||
+                             (total_tokens > 1 && !shared_prefill_cpu_input_fork)) &&
+                            planned_shared_device == device)
                             shared_decode_ticket_cutpoint = captured_continuation_terminal;
                         /*
                          * Declaratively seal the pre-CPU captured ticket unit,
@@ -4697,9 +4704,6 @@ namespace llaminar2
                           ComputeStageFactory::createSharedExpertFFN(shared_params),
                           shared_device);
             graph.addDependency(prefix + "shared_expert_ffn", prefix + "ffn_norm");
-            if (shared_decode_cpu_packet || shared_decode_ticket_cutpoint)
-                orderMappedDecodeSharedFFN(graph, prefix + "shared_expert_ffn",
-                    shared_decode_cpu_packet, shared_decode_ticket_cutpoint);
             if (shared_prefill_cpu_input_fork)
             {
                 // FIFO topological order otherwise makes this ffn_norm sibling
@@ -4771,6 +4775,12 @@ namespace llaminar2
                  * distinct persistent workspaces and therefore remain parallel.
                  */
                 graph.addDependency(prefix + "shared_expert_ffn", ffn_terminal);
+            }
+            if (!shared_ffn_serialized_after_ffn_terminal &&
+                (shared_decode_cpu_packet || shared_decode_ticket_cutpoint))
+            {
+                orderMappedDecodeSharedFFN(graph, prefix + "shared_expert_ffn",
+                    shared_decode_cpu_packet, shared_decode_ticket_cutpoint);
             }
             shared_ffn_last = prefix + "shared_expert_ffn";
 

@@ -92,6 +92,20 @@ public:
     [[nodiscard]] static NativeCPUCollectiveProgram expertShardRoutePartials(
         int domain_id, CollectiveBackendType backend, std::vector<Participant> ordered_members);
     /**
+     * @brief Resolve the canonical native backend for a bound CPU collective cohort.
+     *
+     * Same-node multi-rank CPU cohorts resolve `AUTO` to `UPI` (direct shared-memory
+     * ring/allreduce) while cross-node or singleton cohorts defer to
+     * `BackendSelector::resolve()`. Every stage and expert-shard planner shares this
+     * single resolver so backend identity never drifts between stage and overlay BOMs.
+     *
+     * @param authored_backend Original AUTO, UPI, or MPI declaration.
+     * @param ordered_members Exact source cohort in its original reduction order.
+     * @return Resolved concrete collective backend (`UPI` or `MPI`).
+     */
+    [[nodiscard]] static CollectiveBackendType resolveBoundExpertShardBackend(
+        CollectiveBackendType authored_backend, std::span<const Participant> ordered_members);
+    /**
      * @brief Select the native backend for one already bound CPU expert domain.
      * @param domain_id Original authored domain identity.
      * @param authored_backend Original AUTO, UPI, or MPI declaration.

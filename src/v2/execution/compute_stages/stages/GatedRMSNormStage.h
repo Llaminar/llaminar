@@ -83,4 +83,15 @@ namespace llaminar2
         Params params_;
     };
 
+    /**
+     * @brief Apply one CPU Gated RMSNorm group using the active runtime ISA (AVX-512/AVX2/Scalar).
+     * @details Shared by @ref GatedRMSNormStage and single-OMP CPU megakernel stages to guarantee
+     *          bitwise-identical arithmetic with zero duplicate polynomial code.
+     */
+    void applyCPUGatedRMSNormGroup(
+        const float *input_data, const float *gate_data,
+        const float *gamma_data, float *output_data,
+        size_t offset, size_t norm_dim, size_t gamma_period,
+        float eps, bool subtract_one, GatedNormActivation gate_activation);
+
 } // namespace llaminar2

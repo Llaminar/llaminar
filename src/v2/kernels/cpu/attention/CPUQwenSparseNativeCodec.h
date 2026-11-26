@@ -14,6 +14,7 @@
 #pragma once
 #include "CPUQwenSparseFP32Program.h"
 #include "kernels/qwen4exp/QwenSparseNativeBankContract.h"
+#include <bit>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -162,9 +163,10 @@ public:
             }
             else if constexpr(Encoding==TensorType::Q16_1)
             {
-                const auto size=owner_.binding_.original().q16_block_size;
-                const auto*block=bytes_+std::size_t(coordinate/size)*(8+2*size);
-                const auto*input=reinterpret_cast<const std::int16_t*>(block+8)+coordinate%size;
+                const int block_idx=owner_.q16_shift_>=0?(coordinate>>owner_.q16_shift_):(coordinate/owner_.q16_size_);
+                const int block_off=owner_.q16_shift_>=0?(coordinate&owner_.q16_mask_):(coordinate%owner_.q16_size_);
+                const auto*block=bytes_+std::size_t(block_idx)*owner_.q16_block_bytes_;
+                const auto*input=reinterpret_cast<const std::int16_t*>(block+8)+block_off;
 #if LLAMINAR_COMPILED_WITH_NEON
                 const auto codes=vld1q_s16(input);const Fragment8 widened={vcvtq_f32_s32(vmovl_s16(vget_low_s16(codes))),vcvtq_f32_s32(vmovl_s16(vget_high_s16(codes)))};
 #else
@@ -262,7 +264,12 @@ private:
     /** @brief Retain pointer roots and the exact admitted original TQ4 register table only.
      * @param binding Original complete-bank metadata; @param head Original local KV head.
      */
-    Decoder(const Binding&binding,int head)noexcept:binding_(binding),head_(head),table_(table(binding)){}
+    Decoder(const Binding&binding,int head)noexcept
+        :binding_(binding),head_(head),table_(table(binding)),
+         q16_size_(binding.original().q16_block_size),
+         q16_shift_(q16_size_>0&&std::has_single_bit(static_cast<unsigned>(q16_size_))?std::countr_zero(static_cast<unsigned>(q16_size_)):-1),
+         q16_mask_(q16_size_-1),
+         q16_block_bytes_(q16_size_>0?std::size_t(8+2*q16_size_):0u){}
     /** @brief Load a TQ4 table only for its exact original encoding.
      * @param binding Original codebook authority; @return Native original table or no table.
      */
@@ -276,5 +283,6 @@ private:
 #endif
     }
     Binding binding_;int head_;[[no_unique_address]]Table table_;
+    int q16_size_=32;int q16_shift_=5;int q16_mask_=31;std::size_t q16_block_bytes_=72;
 };
 } // namespace llaminar2::cpu::qsa_native

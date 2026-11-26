@@ -9,6 +9,7 @@
 
 #include "AttentionOutputGateStage.h"
 #include "../../../tensors/Tensors.h"
+#include "../../../utils/CPUFeatures.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/OpenMPUtils.h"
 
@@ -125,18 +126,34 @@ namespace llaminar2
     inline void attention_gate_row(const float *gate_row, const float *inp_row,
                                    float *out_row, size_t cols)
     {
+        const ISALevel isa = activeISALevel();
 #if defined(__AVX512F__)
-        attention_gate_row_avx512(gate_row, inp_row, out_row, cols);
-#elif defined(__AVX2__)
-        attention_gate_row_avx2(gate_row, inp_row, out_row, cols);
-#else
-        attention_gate_row_scalar(gate_row, inp_row, out_row, cols);
+        if (isa >= ISALevel::AVX512)
+        {
+            attention_gate_row_avx512(gate_row, inp_row, out_row, cols);
+            return;
+        }
 #endif
+#if defined(__AVX2__)
+        if (isa >= ISALevel::AVX2)
+        {
+            attention_gate_row_avx2(gate_row, inp_row, out_row, cols);
+            return;
+        }
+#endif
+        (void)isa;
+        attention_gate_row_scalar(gate_row, inp_row, out_row, cols);
     }
 
     // ========================================================================
     // End named ISA implementations
     // ========================================================================
+
+    void applyCPUAttentionOutputGateRange(
+        const float *gate_row, const float *inp_row, float *out_row, size_t count)
+    {
+        attention_gate_row(gate_row, inp_row, out_row, count);
+    }
 
     AttentionOutputGateStage::AttentionOutputGateStage(Params params)
         : IComputeStage(params.device_id), params_(std::move(params))

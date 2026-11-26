@@ -295,19 +295,21 @@ namespace llaminar2::cpu::moe
         if (args.preweighted_output) {
             const auto &w=*args.preweighted_output;
             const auto count=w.original_slots.size();
+            const bool identity_dest = w.unweighted_exact_sum && w.destination_slots.empty();
             if (slots>static_cast<size_t>(std::numeric_limits<int32_t>::max()) ||
-                count!=w.weights.size() || count!=w.destination_slots.size() || count>slots || count>maximum/columns ||
+                count!=w.weights.size() || (!identity_dest && count!=w.destination_slots.size()) ||
+                count>slots || count>maximum/columns ||
                 w.values.size()>maximum/sizeof(float) || w.values.size()%columns ||
                 w.values.size()<count*columns || (count && (!w.values.data() ||
-                !w.original_slots.data() || !w.destination_slots.data() || !w.weights.data()))) return false;
+                !w.original_slots.data() || (!identity_dest && !w.destination_slots.data()) || !w.weights.data()))) return false;
             const auto sinkBytes=w.values.size_bytes();
             if (overlap(w.values.data(),sinkBytes,args.combined_route_rows.data(),bytes) ||
                 overlap(w.values.data(),sinkBytes,args.route_weights,weightBytes) ||
                 overlap(w.values.data(),sinkBytes,w.original_slots.data(),w.original_slots.size_bytes()) ||
                 overlap(w.values.data(),sinkBytes,w.weights.data(),w.weights.size_bytes()) ||
-                overlap(w.values.data(),sinkBytes,w.destination_slots.data(),w.destination_slots.size_bytes()) ||
+                (!identity_dest && overlap(w.values.data(),sinkBytes,w.destination_slots.data(),w.destination_slots.size_bytes())) ||
                 overlap(args.combined_route_rows.data(),bytes,w.original_slots.data(),w.original_slots.size_bytes()) ||
-                overlap(args.combined_route_rows.data(),bytes,w.destination_slots.data(),w.destination_slots.size_bytes()) ||
+                (!identity_dest && overlap(args.combined_route_rows.data(),bytes,w.destination_slots.data(),w.destination_slots.size_bytes())) ||
                 overlap(args.combined_route_rows.data(),bytes,w.weights.data(),w.weights.size_bytes())) return false;
             for (size_t participant=0;participant<population;++participant) {
                 const auto bank=bankAt(participant);
@@ -318,7 +320,8 @@ namespace llaminar2::cpu::moe
             }
             int32_t previous=-1,previous_destination=-1;
             for(size_t entry=0;entry<count;++entry) {
-                const auto slot=w.original_slots[entry],destination=w.destination_slots[entry];
+                const auto slot=w.original_slots[entry];
+                const int32_t destination=identity_dest?static_cast<int32_t>(entry):w.destination_slots[entry];
                 if(slot<=previous || static_cast<size_t>(slot)>=slots ||
                    destination<=previous_destination || static_cast<size_t>(destination)>=w.values.size()/columns ||
                    args.route_weights[slot]==0.0f || !std::isfinite(w.weights[entry]) ||
@@ -388,10 +391,14 @@ namespace llaminar2::cpu::moe
                         ? partialRow(0, slot, static_cast<size_t>(first))
                         : destination;
                     const float *const rhs = partialRow(last, slot, static_cast<size_t>(first));
+                    const size_t dst_slot = w.destination_slots.empty()
+                        ? entry
+                        : static_cast<size_t>(w.destination_slots[entry]);
                     float *const weighted = w.values.data() +
-                        static_cast<size_t>(w.destination_slots[entry]) * columns + static_cast<size_t>(first);
+                        dst_slot * columns + static_cast<size_t>(first);
                     const float factor = w.weights[entry];
                     const bool skip_dest = w.skip_combined_store && (last == 1);
+                    const bool unweighted = w.unweighted_exact_sum;
                     int column = 0;
 #if defined(__AVX512F__)
                     if (activeISALevel() >= ISALevel::AVX512)
@@ -406,19 +413,62 @@ namespace llaminar2::cpu::moe
                             asm("vaddps %2, %1, %0" : "=v"(sum) : "v"(va), "v"(vb));
                             return sum;
                         };
-                        const __m512 vfactor = _mm512_set1_ps(factor);
-                        // Stream cold unconsumed combined_routes scratch when aligned.
-                        // For preweighted output: keep cacheable stores when same-socket
-                        // so GPU PCIe DMA hits L3 DDIO, and use non-temporal streams when
-                        // targeting a remote NUMA node to avoid cross-UPI L3 HitM snoops.
-                        // Match vec_add_avx512's exact 32-float loop stride and operand order
-                        // so finite and NaN lanes remain bitwise identical to primitives::vec_add.
                         const bool stream_dest = !skip_dest && (last == 1) &&
                             ((reinterpret_cast<std::uintptr_t>(destination) & 63u) == 0u);
                         const bool stream_weighted =
                             (w.store_locality == PreweightedStoreLocality::CrossSocketStreaming) &&
                             ((reinterpret_cast<std::uintptr_t>(weighted) & 63u) == 0u);
                         const int count32 = count & ~31;
+                        if (unweighted)
+                        {
+                            if (skip_dest && stream_weighted)
+                            {
+                                for (; column < count32; column += 32)
+                                {
+                                    const __m512 sum0 = ordered_add(lhs + column, rhs + column);
+                                    const __m512 sum1 = ordered_add(lhs + column + 16, rhs + column + 16);
+                                    _mm512_stream_ps(weighted + column, sum0);
+                                    _mm512_stream_ps(weighted + column + 16, sum1);
+                                }
+                            }
+                            else if (skip_dest)
+                            {
+                                for (; column < count32; column += 32)
+                                {
+                                    const __m512 sum0 = ordered_add(lhs + column, rhs + column);
+                                    const __m512 sum1 = ordered_add(lhs + column + 16, rhs + column + 16);
+                                    _mm512_storeu_ps(weighted + column, sum0);
+                                    _mm512_storeu_ps(weighted + column + 16, sum1);
+                                }
+                            }
+                            else if (stream_weighted)
+                            {
+                                for (; column < count32; column += 32)
+                                {
+                                    const __m512 sum0 = ordered_add(lhs + column, rhs + column);
+                                    const __m512 sum1 = ordered_add(lhs + column + 16, rhs + column + 16);
+                                    _mm512_storeu_ps(destination + column, sum0);
+                                    _mm512_storeu_ps(destination + column + 16, sum1);
+                                    _mm512_stream_ps(weighted + column, sum0);
+                                    _mm512_stream_ps(weighted + column + 16, sum1);
+                                }
+                            }
+                            else
+                            {
+                                for (; column < count32; column += 32)
+                                {
+                                    const __m512 sum0 = ordered_add(lhs + column, rhs + column);
+                                    const __m512 sum1 = ordered_add(lhs + column + 16, rhs + column + 16);
+                                    _mm512_storeu_ps(destination + column, sum0);
+                                    _mm512_storeu_ps(destination + column + 16, sum1);
+                                    _mm512_storeu_ps(weighted + column, sum0);
+                                    _mm512_storeu_ps(weighted + column + 16, sum1);
+                                }
+                            }
+                        }
+                        else
+                        {
+                        const __m512 vfactor = _mm512_set1_ps(factor);
                         if (skip_dest && stream_weighted)
                         {
                             for (; column < count32; column += 32)
@@ -487,6 +537,7 @@ namespace llaminar2::cpu::moe
                                 _mm512_storeu_ps(weighted + column + 16, _mm512_mul_ps(sum1, vfactor));
                             }
                         }
+                        }
                     }
 #endif
                     if (column < count)
@@ -494,7 +545,19 @@ namespace llaminar2::cpu::moe
                         // Preserve exact primitives::vec_add compiled NaN operand selection
                         // and ISA dispatch on scalar tails and non-AVX512 tiers.
                         const int rem = count - column;
-                        if (skip_dest)
+                        if (unweighted)
+                        {
+                            if (skip_dest)
+                            {
+                                primitives::vec_add(weighted + column, lhs + column, rhs + column, rem);
+                            }
+                            else
+                            {
+                                primitives::vec_add(destination + column, lhs + column, rhs + column, rem);
+                                std::copy_n(destination + column, rem, weighted + column);
+                            }
+                        }
+                        else if (skip_dest)
                         {
                             primitives::vec_add(weighted + column, lhs + column, rhs + column, rem);
                             for (int i = 0; i < rem; ++i)

@@ -203,6 +203,28 @@ namespace llaminar2
             int n_heads, int d_k, int d_v,
             bool use_qk_l2norm) override;
 
+        /**
+         * @brief Pre-size single-token decode scratch on the owner thread before entering an OpenMP team.
+         * @param n_k_heads Key/query head count.
+         * @param n_heads Local value head count.
+         * @param d_k Key/query dimension per head.
+         */
+        void prepareMergedDecodeScratch(int n_k_heads, int n_heads, int d_k);
+
+        /**
+         * @brief Execute one-token merged-QKV GDN recurrence inside the caller's active OpenMP team.
+         * @pre @ref prepareMergedDecodeScratch was called on the owner thread before the team started.
+         * @details Preserves exact bitwise arithmetic of @ref chunkForwardMergedQKV for `seq_len=1`
+         *          with zero extra OpenMP forks and zero per-call heap allocations.
+         */
+        bool executeMergedDecodeInTeam(
+            const float *merged_qkv, int qkv_stride,
+            const float *alpha, const float *beta_raw,
+            const float *A_log, const float *dt_bias,
+            float *output, float *state,
+            int n_k_heads, int n_heads, int d_k, int d_v,
+            int global_v_head_offset, bool use_qk_l2norm);
+
     private:
         /** @brief Same-kernel per-call telemetry, reset/reduced/published by its existing team. */
         CPUFixedEpochObservations epoch_counter_observations_{};

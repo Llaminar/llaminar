@@ -86,6 +86,21 @@ namespace llaminar2::primitives
         float epsilon,
         const RMSNormExecOptions &opts = {});
 
+    /**
+     * @brief Normalize one FP32 row with the exact arithmetic program of @ref rmsnorm_fused_vectorized.
+     *
+     * Uses the identical 4-accumulator FP64 squared-sum tree, FP64 inverse-RMS formula,
+     * and active-ISA row application without opening an OpenMP workshare (caller owns
+     * parallelism). Guarantees bit-for-bit parity with standalone @ref QKNormStage inside
+     * single-OMP fused attention megakernels.
+     */
+    void rmsnorm_fused_vectorized_row(
+        const float *src,
+        const float *gamma,
+        float *dst,
+        std::size_t cols,
+        float epsilon);
+
 
 
     // ========================================================================

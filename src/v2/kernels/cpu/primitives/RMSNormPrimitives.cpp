@@ -691,6 +691,34 @@ namespace llaminar2::primitives
         OMP_WORKSHARE_REGION_IF(work,omp_in_parallel() || (rows>1 && want_parallel(rows,cols,opts)));
     }
 
+    void rmsnorm_fused_vectorized_row(
+        const float *src,
+        const float *gamma,
+        float *dst,
+        std::size_t cols,
+        float epsilon)
+    {
+        const auto bank = rmsnorm_operands::FloatingBorrow<float>::bind(src, gamma, dst, 1, cols, epsilon);
+        if (bank.empty())
+            return;
+        const auto publicationISA = activeISALevel();
+        const auto application = bank.gamma().empty()
+            ? fp32_row_application<FP32Gamma::Identity>(publicationISA)
+            : fp32_row_application<FP32Gamma::Original>(publicationISA);
+        const auto input = bank.sourceRow(0);
+        const auto output = bank.outputRow(0);
+        const double sum = compute_sumsq_dispatch(input.data(), cols);
+        if (!std::isfinite(sum))
+            rms_numeric::rejectNumeric(rms_numeric::NumericFailure::NonfiniteSummary,
+                "CPU RMS observed a nonfinite original-row squared summary");
+        float inverse;
+        rmsnorm_compute_inv(&sum, 1, cols, epsilon, &inverse);
+        if (inverse == 0.0f)
+            std::fill(output.begin(), output.end(), 0.0f);
+        else
+            application(input, bank.gamma(), output, inverse);
+    }
+
     // ========================================================================
     // INT32 RMSNorm Implementation (for full INT8 pipelines)
     // ========================================================================

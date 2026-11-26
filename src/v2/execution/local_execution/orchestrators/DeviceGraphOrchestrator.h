@@ -11649,6 +11649,22 @@ namespace llaminar2
         const FrozenModelWeightSet *selectMTPDecodeWeightSet(const char *caller) const;
 
         /**
+         * @brief Return cached immutable ModelWeightBindings for the active MTP decode weight set.
+         *
+         * Avoids repeating full-model binding scans (`discoverNextNMTPLayers` over tens of
+         * thousands of frozen bindings) on every MTP sidecar / shifted-commit hot-path step.
+         * Invalidated automatically whenever frozen/replicated weight sets are replaced.
+         *
+         * @param caller Short method name used in diagnostics.
+         * @return Cached immutable bindings pointer, or nullptr on configuration error.
+         */
+        const ModelWeightBindings *selectMTPDecodeWeightBindings(const char *caller) const;
+
+        mutable const FrozenModelWeightSet *cached_mtp_weight_bindings_source_ = nullptr;
+        mutable DeviceId cached_mtp_weight_bindings_device_{};
+        mutable std::optional<ModelWeightBindings> cached_mtp_weight_bindings_;
+
+        /**
          * @brief Reject weight publication after an owned graph binds its source addresses.
          * @param caller Exact publication API used for a fail-fast diagnostic.
          * @throws std::logic_error When serving admission or any main/layer/sidecar graph owns the binding lifetime.

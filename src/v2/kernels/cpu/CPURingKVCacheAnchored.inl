@@ -58,14 +58,16 @@ bool CPURingKVCache<KPrecision, VPrecision>::append_anchored(
         // phase. A batch mean depends on capture bucket/prefix boundaries and
         // would change cached bytes for the same sequence when chunks change.
         // Keep the first input basis even if an oversized append evicts its row.
-        for (int head = 0; head < local_n_kv_heads_; ++head)
-            for (int coordinate = 0; coordinate < D; ++coordinate)
-            {
-                const float first = source(keys, k_head_major, 0, head)[coordinate];
-                if (!std::isfinite(first))
-                    throw std::domain_error("CPU AQ8 basis requires finite key projections");
-                anchor[static_cast<size_t>(head) * D + coordinate] = first;
-            }
+        OMP_SINGLE([&]() {
+            for (int head = 0; head < local_n_kv_heads_; ++head)
+                for (int coordinate = 0; coordinate < D; ++coordinate)
+                {
+                    const float first = source(keys, k_head_major, 0, head)[coordinate];
+                    if (!std::isfinite(first))
+                        throw std::domain_error("CPU AQ8 basis requires finite key projections");
+                    anchor[static_cast<size_t>(head) * D + coordinate] = first;
+                }
+        });
     }
 
     std::atomic<bool> invalid{false};
@@ -114,7 +116,9 @@ bool CPURingKVCache<KPrecision, VPrecision>::append_anchored(
     OMP_WORKSHARE_REGION(encode_rows);
     if (invalid.load(std::memory_order_relaxed))
         throw std::domain_error("CPU compressed cache append failed; inference must halt");
-    entry.head = plan.headAfter();
-    entry.size = plan.sizeAfter();
+    OMP_SINGLE([&]() {
+        entry.head = plan.headAfter();
+        entry.size = plan.sizeAfter();
+    });
     return true;
 }

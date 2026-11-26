@@ -15,6 +15,7 @@
 
 #pragma once
 
+#include "../../../loaders/WeightPlan.h"
 #include "../../../tensors/TensorSlice.h"
 #include "../../../utils/Logger.h"
 #include <vector>
@@ -45,6 +46,42 @@ namespace llaminar2
                                                        << " shape1=" << (weight->shape().size() > 1 ? weight->shape()[1] : 1)
                                                        << " is_row_parallel=" << (slice ? slice->is_row_parallel() : false)
                                                        << " result=" << result);
+            return result;
+        }
+
+        /**
+         * @brief Check if a weight tensor or streamed CPU binding is row-parallel sharded.
+         *
+         * Streamed CPU TP weights materialize directly into a prepared CPU weight
+         * tensor rather than wrapping a host matrix in TensorSlice. In that path the
+         * authoritative input-column sharding geometry lives on the immutable
+         * WeightBinding::slice metadata (`col_count < source_cols` with unsharded
+         * output rows). Checking both keeps GPU/TensorSlice and streamed CPU TP graphs
+         * identical.
+         *
+         * @param weight The bound tensor to check.
+         * @param binding Optional immutable weight binding carrying source slice metadata.
+         * @return true if either TensorSlice metadata or WeightBinding::slice proves
+         *         row-parallel (input-column) sharding.
+         */
+        inline bool isRowParallelSharded(const TensorBase *weight, const WeightBinding *binding)
+        {
+            if (isRowParallelSharded(weight))
+                return true;
+            if (!weight || !binding)
+                return false;
+            const auto &slice = binding->slice;
+            const bool cols_sharded =
+                slice.source_cols > 0 && slice.col_count > 0 &&
+                slice.col_count < slice.source_cols;
+            const bool rows_unsharded =
+                slice.source_rows == 0 || slice.row_count == slice.source_rows;
+            const bool result = cols_sharded && rows_unsharded;
+            LOG_TRACE("[isRowParallelSharded] streamed_binding weight=" << weight
+                                                                       << " name=" << binding->identity.canonical_name
+                                                                       << " rows=" << slice.row_count << "/" << slice.source_rows
+                                                                       << " cols=" << slice.col_count << "/" << slice.source_cols
+                                                                       << " result=" << result);
             return result;
         }
 

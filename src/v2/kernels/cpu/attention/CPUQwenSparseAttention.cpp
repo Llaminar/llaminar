@@ -340,10 +340,72 @@ void cpuQwenSparseSelectPools(const QwenSparseIndexer &p)
 void cpuQwenSparseAttention(const QwenSparseAttention &p)
 {
     const auto invocation=cpu_sparse::Invocation::bind(p);
+    const int live_rows=invocation.liveRows();
+    const int query_heads=invocation.queryHeads();
+    const int head_start=invocation.queryHeadStart();
+    // Choose the largest same-KV-head GQA tile (<=12 on AVX-512, <=6 on AVX2/NEON)
+    // that still exposes enough independent tasks to fill all OpenMP workers.
+    const int max_register_group=(invocation.isa()==ISALevel::AVX512)?12:6;
+    const int threads=std::max(1,omp_get_max_threads());
+    int max_group_heads=1;
+    if(live_rows>0&&query_heads>1)
+    {
+        for(int candidate:{12,6,4,3,2})
+        {
+            if(candidate>max_register_group)continue;
+            // Count groups per row respecting KV-head boundaries (12 Q heads per KV head).
+            int groups_per_row=0;
+            for(int h=0;h<query_heads;)
+            {
+                const int kv_end=std::min(query_heads,(((head_start+h)/12)+1)*12-head_start);
+                const int span=kv_end-h;
+                groups_per_row+=(span+candidate-1)/candidate;
+                h=kv_end;
+            }
+            if(live_rows*groups_per_row>=threads)
+            {
+                max_group_heads=candidate;
+                break;
+            }
+        }
+    }
+    // Build the bounded per-row GQA head spans once (O(query_heads), zero heap
+    // allocation for typical <=32 groups, general fallback if >32 groups).
+    struct HeadSpan { int begin; int count; };
+    std::array<HeadSpan,32> fixed_spans{};
+    int span_count=0;
+    for(int h=0;h<query_heads;)
+    {
+        const int kv_end=std::min(query_heads,(((head_start+h)/12)+1)*12-head_start);
+        for(int pos=h;pos<kv_end;pos+=max_group_heads)
+        {
+            if(span_count<static_cast<int>(fixed_spans.size()))
+                fixed_spans[static_cast<size_t>(span_count)]={pos,std::min(max_group_heads,kv_end-pos)};
+            ++span_count;
+        }
+        h=kv_end;
+    }
+    const bool use_grouped=(max_group_heads>1&&span_count<=static_cast<int>(fixed_spans.size()));
+    const int total_tasks=use_grouped?(live_rows*span_count):invocation.rowHeads();
     const auto attention=[&]()
     {
-#pragma omp for schedule(static)
-        for(int rowHead=0;rowHead<invocation.rowHeads();++rowHead)invocation.execute(rowHead);
+        // Cyclic static(1) distributes causal prefill rows (whose selected-token
+        // counts grow linearly from 1 to prefix+live_rows) evenly across every
+        // worker without dynamic scheduling contention.
+#pragma omp for schedule(static, 1)
+        for(int task=0;task<total_tasks;++task)
+        {
+            if(use_grouped)
+            {
+                const int row=task/span_count;
+                const auto &span=fixed_spans[static_cast<size_t>(task%span_count)];
+                invocation.executeHeadGroup(row,span.begin,span.count);
+            }
+            else
+            {
+                invocation.execute(task);
+            }
+        }
     };
     // The empty loop still participates in the retained team's completion edge.
     OMP_WORKSHARE_REGION(attention);

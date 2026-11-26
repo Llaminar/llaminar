@@ -3891,7 +3891,7 @@ namespace llaminar2
                 graph.addDependency(prefix + "down_proj", prefix + "gate_up_proj");
             }
 
-            bool down_is_row_sharded = isRowParallelSharded(layer.down_proj);
+            bool down_is_row_sharded = isRowParallelSharded(layer.down_proj, down_proj_binding);
             bool needs_allreduce = (down_is_row_sharded || config_.ffn_column_parallel);
 
             if (needs_allreduce && needsTPAllreduce() && denseTPAllreduceEnabledForCurrentGraph())
@@ -3938,7 +3938,7 @@ namespace llaminar2
 
             if (has_down_proj)
             {
-                bool down_is_row_sharded = isRowParallelSharded(layer.down_proj);
+                bool down_is_row_sharded = isRowParallelSharded(layer.down_proj, down_proj_binding);
                 bool needs_allreduce = (down_is_row_sharded || config_.ffn_column_parallel);
 
                 if (needs_allreduce && needsTPAllreduce() && denseTPAllreduceEnabledForCurrentGraph())
@@ -5441,6 +5441,7 @@ namespace llaminar2
         const std::string &prefix,
         ActivationBuffers &buffers,
         TensorBase *wo_weight,
+        const WeightBinding *wo_binding,
         int total_tokens,
         int layer_idx,
         DeviceId device,
@@ -5450,7 +5451,7 @@ namespace llaminar2
         std::optional<DeviceRowRange> predictor_rows)
     {
         if (!wo_weight ||
-            !isRowParallelSharded(wo_weight) ||
+            !isRowParallelSharded(wo_weight, wo_binding) ||
             !needsTPAllreduce() ||
             !(predictor_layout ? predictor_layout->attentionNeedsReduction()
                                : attentionTPAllreduceEnabledForCurrentGraph()))

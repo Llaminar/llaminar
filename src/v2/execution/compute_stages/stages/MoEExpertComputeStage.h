@@ -1652,6 +1652,7 @@ namespace llaminar2
 
         /** @brief Gather indices reused for each complete expert batch. */
         mutable std::vector<int> cpu_grouped_token_indices_;
+        mutable std::vector<int> cpu_grouped_router_row_indices_;
 
         /** Borrowed FP32 transport base for the current synchronous CPU packet. */
         const float *sparse_overlay_cpu_hidden_source_ = nullptr;

@@ -1234,17 +1234,15 @@ namespace llaminar2
             stage_params.first_transaction_diagnostic_device =
                 mtp_first_transaction_diagnostic_dev_;
 
-            const FrozenModelWeightSet *diagnostic_weight_set =
-                selectMTPDecodeWeightSet(
+            const ModelWeightBindings *diagnostic_bindings_ptr =
+                selectMTPDecodeWeightBindings(
                     "transaction-zero MTP draft diagnostic");
-            if (!diagnostic_weight_set)
+            if (!diagnostic_bindings_ptr)
             {
                 return fail(
                     "captured MTP draft diagnostics could not resolve the active decode weight set");
             }
-            const ModelWeightBindings diagnostic_bindings =
-                makeModelWeightBindings(
-                    *diagnostic_weight_set, state_.device_id);
+            const ModelWeightBindings &diagnostic_bindings = *diagnostic_bindings_ptr;
             if (diagnostic_bindings.mtp.empty() ||
                 diagnostic_bindings.mtp.depths.empty())
             {

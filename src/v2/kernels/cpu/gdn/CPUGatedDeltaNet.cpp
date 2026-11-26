@@ -1526,4 +1526,88 @@ namespace llaminar2
         return true;
     }
 
+    void CPUGatedDeltaNet::prepareMergedDecodeScratch(int n_k_heads, int n_heads, int d_k)
+    {
+        shared_valid_ = false;
+        const int prepared_qk_heads = std::min(n_k_heads, n_heads);
+        if (prepared_qk_heads > 0 && n_heads > 0 && d_k > 0)
+            ensureScratch(1, prepared_qk_heads, n_heads, d_k);
+    }
+
+    bool CPUGatedDeltaNet::executeMergedDecodeInTeam(
+        const float *merged_qkv, int qkv_stride,
+        const float *alpha, const float *beta_raw,
+        const float *A_log, const float *dt_bias,
+        float *output, float *state,
+        int n_k_heads, int n_heads, int d_k, int d_v,
+        int global_v_head_offset, bool use_qk_l2norm)
+    {
+        const int q_src_dim = n_k_heads * d_k;
+        const int k_src_dim = n_k_heads * d_k;
+        const int v_dim = n_heads * d_v;
+        if (!merged_qkv || !alpha || !beta_raw || !A_log || !dt_bias || !output || !state ||
+            n_k_heads <= 0 || n_heads <= 0 || d_k <= 0 || d_v <= 0 ||
+            d_k > 512 || d_v > 512 || qkv_stride < q_src_dim + k_src_dim + v_dim)
+        {
+            return false;
+        }
+        const CPUGDNStateLayout layout(n_heads, d_k, d_v);
+        if (!layout.valid(state))
+            return false;
+
+        const int prepared_qk_heads = std::min(n_k_heads, n_heads);
+        const int qk_stride = prepared_qk_heads * d_k;
+        const int v_stride = n_heads * d_v;
+        const float scale_val = 1.0f / std::sqrt(static_cast<float>(d_k));
+        constexpr float l2_eps = 1e-6f;
+        const float *const q_base = merged_qkv;
+        const float *const k_base = merged_qkv + q_src_dim;
+        const float *const v_base = merged_qkv + q_src_dim + k_src_dim;
+
+        auto do_work = [&]()
+        {
+#pragma omp for schedule(static)
+            for (int head = 0; head < prepared_qk_heads; ++head)
+            {
+                const size_t qk_off = static_cast<size_t>(head) * static_cast<size_t>(d_k);
+                float *q_dst = q_scratch_.data() + qk_off;
+                float *k_dst = k_scratch_.data() + qk_off;
+                int source_head = static_cast<int>(
+                    (static_cast<int64_t>(head) + global_v_head_offset) % n_k_heads);
+                if (source_head < 0)
+                    source_head += n_k_heads;
+                const float *q_src = q_base + static_cast<size_t>(source_head) * static_cast<size_t>(d_k);
+                const float *k_src = k_base + static_cast<size_t>(source_head) * static_cast<size_t>(d_k);
+                if (use_qk_l2norm)
+                    gdn_preprocess_qk_l2norm(q_src, k_src, q_dst, k_dst, d_k, scale_val, l2_eps);
+                else
+                    gdn_preprocess_qk_scale(q_src, k_src, q_dst, k_dst, d_k, scale_val);
+            }
+            // Implicit barrier publishes normalized Q/K before all V-heads read them.
+
+#pragma omp for schedule(static)
+            for (int head = 0; head < n_heads; ++head)
+            {
+                const float x = alpha[head] + dt_bias[head];
+                const float sp = (x > 20.0f) ? x : std::log1p(std::exp(x));
+                const float g_val = std::exp(A_log[head] * sp);
+                const float beta_val = 1.0f / (1.0f + std::exp(-beta_raw[head]));
+                const size_t offset = static_cast<size_t>(head) * layout.headFloats();
+                const int prepared_offset = (head % prepared_qk_heads) * d_k;
+                const float *prepared_q = q_scratch_.data() + prepared_offset;
+                const float *prepared_k = k_scratch_.data() + prepared_offset;
+                float *initial = state + offset;
+                (void)cpu_gdn_epoch::run(
+                    layout, initial, initial,
+                    prepared_q, prepared_k, v_base + static_cast<size_t>(head) * static_cast<size_t>(d_v),
+                    &g_val, &beta_val,
+                    1, qk_stride, qkv_stride, n_heads,
+                    output + static_cast<size_t>(head) * static_cast<size_t>(d_v), v_stride,
+                    nullptr, 0);
+            }
+        };
+        OMP_WORKSHARE_REGION(do_work);
+        return true;
+    }
+
 } // namespace llaminar2

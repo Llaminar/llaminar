@@ -4083,6 +4083,12 @@ namespace llaminar2
             cpu_grouped_token_indices_.resize(
                 cpu_grouped_route_slots_.size());
         }
+        if (cpu_grouped_router_row_indices_.size() <
+            cpu_grouped_route_slots_.size())
+        {
+            cpu_grouped_router_row_indices_.resize(
+                cpu_grouped_route_slots_.size());
+        }
         for (size_t expert_position = 0;
              expert_position < cpu_grouped_route_slots_.size();
              ++expert_position)
@@ -4092,6 +4098,7 @@ namespace llaminar2
             const int compact_row =
                 cpu_grouped_route_slots_[
                     static_cast<size_t>(local_slot)].row;
+            cpu_grouped_router_row_indices_[expert_position] = compact_row;
             cpu_grouped_token_indices_[expert_position] =
                 borrowed_transport_hidden
                     ? sparse_overlay_cpu_compact_to_source_row_[
@@ -4462,60 +4469,43 @@ namespace llaminar2
         if (all_native_bundles)
         {
             /*
-             * A transported CPU endpoint publishes directly into expert-major
-             * storage because its route schedule is already authoritative.
-             * An ordinary CPU graph instead consumes the row-major Q8_1 bytes
-             * published by its router and performs the required permutation.
-             * Both branches use the same source-row schedule and therefore
-             * produce byte-identical NativeQuantised inputs.
+             * Quantize only the <= seq_len unique live rows once on transported
+             * endpoints (or borrow published_router_q8 directly on ordinary CPU
+             * endpoints) instead of materializing an expert-major Q8 copy. The
+             * single-OMP fused MoE FFN megakernel indexes those unique rows
+             * directly via cpu_grouped_router_row_indices_ and fuses Gate+Up ->
+             * SwiGLU -> Q8_1 -> Down with zero gate/up DRAM round-trip.
              */
             const auto router_q8_prepare_start =
                 record_cpu_moe_phase_timings
                     ? PerfStatsCollector::Clock::now()
                     : PerfStatsCollector::Clock::time_point{};
+            const Q8_1Block *unique_router_q8 = published_router_q8;
             if (direct_transport_publication)
             {
-                const size_t required_router_q8_blocks =
-                    static_cast<size_t>(local_route_rows) *
-                    static_cast<size_t>(router_q8_blocks_per_row);
-                // Source publication retires expert_local_slots_ into unique
-                // representatives. The inverse route map remains authoritative.
-                const auto publication_schedule =
-                    CPUMoEKernel::RouterQ8ExpertMajorSchedule::fromOriginalRoutes(
-                        {cpu_grouped_token_indices_.data(), static_cast<size_t>(local_route_rows)},
-                        {cpu_grouped_expert_local_slots_.data(), static_cast<size_t>(local_route_rows)},
-                        {cpu_grouped_original_to_local_.data(), route_slot_capacity},
-                        {cpu_grouped_local_to_expert_position_.data(), static_cast<size_t>(local_route_rows)},
-                        top_k,
-                        borrowed_transport_hidden
-                            ? std::optional{std::span<const int>{
-                                  sparse_overlay_cpu_compact_to_source_row_.data(),
-                                  static_cast<size_t>(seq_len)}}
-                            : std::nullopt,
-                        borrowed_transport_hidden
-                            ? sparse_overlay_cpu_hidden_source_row_capacity_ : seq_len);
-                if (!publication_schedule)
-                    throw std::logic_error("CPU transported Q8 publication lost its original route/source authority");
-                if (!cpu_moe_kernel->
-                        publishTransportedRouterQ8HiddenExpertMajor(
-                            input_rows,
-                            borrowed_transport_hidden
-                                ? sparse_overlay_cpu_hidden_source_row_capacity_
-                                : seq_len,
-                            d_model,
-                            *publication_schedule,
-                            std::span<Q8_1Block>(
-                                grouped_router_q8.data(),
-                                required_router_q8_blocks)))
+                const int source_rows = borrowed_transport_hidden
+                    ? sparse_overlay_cpu_hidden_source_row_capacity_
+                    : seq_len;
+                const int *source_indices = borrowed_transport_hidden
+                    ? sparse_overlay_cpu_compact_to_source_row_.data()
+                    : nullptr;
+                if (!cpu_moe_kernel->quantizeRouterQ8Rows(
+                        input_rows,
+                        source_rows,
+                        d_model,
+                        source_indices,
+                        seq_len,
+                        grouped_router_q8.data(),
+                        grouped_router_q8.size()))
                 {
                     LOG_ERROR(
                         "[MoEExpertComputeStage] CPU ExpertOverlay transport "
-                        "failed to publish expert-major canonical Q8_1 rows for layer "
+                        "failed to quantize unique canonical Q8_1 rows for layer "
                         << params_.layer_idx << " seq_len=" << seq_len
-                        << " local_route_rows=" << local_route_rows
                         << " d_model=" << d_model);
                     return false;
                 }
+                unique_router_q8 = grouped_router_q8.data();
                 if (PerfStatsCollector::isDomainEnabled("moe_overlay"))
                 {
                     PerfStatsCollector::addCounter(
@@ -4525,47 +4515,15 @@ namespace llaminar2
                         grouped_phase,
                         params_.device_id.toString(),
                         {{"layer", std::to_string(params_.layer_idx)},
-                         {"source_rows",
-                          std::to_string(
-                              sparse_overlay_cpu_hidden_source_row_capacity_)},
+                         {"source_rows", std::to_string(source_rows)},
                          {"route_rows", std::to_string(local_route_rows)},
+                         {"unique_rows", std::to_string(seq_len)},
                          {"d_model", std::to_string(d_model)},
-                         {"layout", "expert_major"},
+                         {"layout", "unique_row_major"},
                          {"source", "fixed_capacity_ticket"}});
                 }
                 record_cpu_moe_phase(
-                    "transported_router_q8_expert_major_publication",
-                    router_q8_prepare_start);
-            }
-            else
-            {
-                auto gather_router_rows = [&]()
-                {
-#pragma omp for schedule(static)
-                    for (int expert_position = 0;
-                         expert_position < local_route_rows;
-                         ++expert_position)
-                    {
-                        const int token_row =
-                            cpu_grouped_token_indices_[
-                            static_cast<size_t>(expert_position)];
-                        const Q8_1Block *source_row =
-                            published_router_q8 +
-                            static_cast<size_t>(token_row) *
-                                static_cast<size_t>(router_q8_blocks_per_row);
-                        Q8_1Block *destination_row =
-                            grouped_router_q8.data() +
-                            static_cast<size_t>(expert_position) *
-                                static_cast<size_t>(router_q8_blocks_per_row);
-                        std::copy_n(
-                            source_row,
-                            router_q8_blocks_per_row,
-                            destination_row);
-                    }
-                };
-                OMP_WORKSHARE_REGION(gather_router_rows);
-                record_cpu_moe_phase(
-                    "router_q8_expert_major_gather",
+                    "transported_router_q8_unique_publication",
                     router_q8_prepare_start);
             }
 
@@ -4718,26 +4676,22 @@ namespace llaminar2
             const auto grouped_ffn_start = record_cpu_moe_phase_timings
                                                ? PerfStatsCollector::Clock::now()
                                                : PerfStatsCollector::Clock::time_point{};
-            if (!CPUNativeQuantisedGemmKernel::
-                    execute_moe_grouped_ffn_transaction_preq_decode_equivalent(
-                        gate_up_projection_descriptors.data(),
-                        gate_up_projection_count,
-                        d_model,
-                        gate_rows,
-                        up_rows,
-                        grouped_swiglu_q8.data(),
-                        local_route_rows,
-                        intermediate,
-                        swiglu_q8_blocks_per_row,
-                        down_projection_descriptors.data(),
-                        down_projection_count, CPUInvocationWorkspace::available<float>(
-                            bound_workspace_, kCPUProjectionPartials),
-                        cpu::native_quantised::FusedOutputJobOwnership::Auto,
-                        cpu::native_quantised::FusedOutputJobOwnership::Auto,
-                        down_route_order))
+            if (!CPUNativeQuantisedGemmKernel::execute_moe_grouped_fused_ffn(
+                    {gate_up_projection_descriptors.data(), static_cast<size_t>(gate_up_projection_count)},
+                    unique_router_q8,
+                    seq_len,
+                    router_q8_blocks_per_row,
+                    {cpu_grouped_router_row_indices_.data(), static_cast<size_t>(local_route_rows)},
+                    d_model,
+                    grouped_swiglu_q8.data(),
+                    local_route_rows,
+                    intermediate,
+                    swiglu_q8_blocks_per_row,
+                    {down_projection_descriptors.data(), static_cast<size_t>(down_projection_count)},
+                    down_route_order))
             {
-                LOG_ERROR("[MoEExpertComputeStage] CPU NativeQuantised layer-batched "
-                          "grouped FFN transaction failed in layer "
+                LOG_ERROR("[MoEExpertComputeStage] CPU NativeQuantised single-OMP "
+                          "fused grouped FFN transaction failed in layer "
                           << params_.layer_idx);
                 return false;
             }

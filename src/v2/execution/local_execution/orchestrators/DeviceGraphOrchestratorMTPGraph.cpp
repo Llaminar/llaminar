@@ -2728,14 +2728,7 @@ namespace llaminar2
             LOG_ERROR("[DeviceGraphOrchestrator] MTP sidecar requires an initialized MTP KV cache");
             return false;
         }
-        const FrozenModelWeightSet *mtp_weight_set =
-            selectMTPDecodeWeightSet("MTP sidecar");
-        if (!mtp_weight_set)
-        {
-            return false;
-        }
-
-        ModelWeightBindings bindings;
+        const ModelWeightBindings *bindings_ptr = nullptr;
         {
             PerfStatsCollector::ScopedTimer timer(
                 "mtp",
@@ -2743,9 +2736,13 @@ namespace llaminar2
                 phase,
                 device_key,
                 {{"depth", "0"}});
-            bindings = makeModelWeightBindings(
-                *mtp_weight_set, state_.device_id);
+            bindings_ptr = selectMTPDecodeWeightBindings("MTP sidecar");
         }
+        if (!bindings_ptr)
+        {
+            return false;
+        }
+        const ModelWeightBindings &bindings = *bindings_ptr;
         if (bindings.mtp.empty() || bindings.mtp.depths.empty())
         {
             LOG_ERROR("[DeviceGraphOrchestrator] MTP sidecar requested without MTP weight bindings");

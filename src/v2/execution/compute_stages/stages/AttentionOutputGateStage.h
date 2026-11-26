@@ -110,4 +110,11 @@ namespace llaminar2
         Params params_;
     };
 
+    /**
+     * @brief Apply CPU sigmoid attention output gating to a contiguous slice using active runtime ISA.
+     * @details Shared by @ref AttentionOutputGateStage and single-OMP CPU megakernel stages.
+     */
+    void applyCPUAttentionOutputGateRange(
+        const float *gate_row, const float *inp_row, float *out_row, size_t count);
+
 } // namespace llaminar2

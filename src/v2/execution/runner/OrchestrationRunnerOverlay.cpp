@@ -1182,6 +1182,7 @@ namespace llaminar2
                 });
         const auto &plan = config_.moe_routed_expert_plan;
         return plan &&
+               plan->usesExpertOverlayAuthority() &&
                MoEOverlayCapacityAdmission::selectMigrationStorage(
                    *plan,
                    MoERebalanceRuntimeMode::Dynamic) ==

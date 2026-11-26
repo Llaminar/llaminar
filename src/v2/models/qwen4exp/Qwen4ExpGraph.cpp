@@ -34,10 +34,11 @@
 #include "../../tensors/Tensors.h"
 #include "../../transfer/TransferEngine.h"
 #include "../../utils/DebugEnv.h"
+#include "execution/compute_stages/stages/qwen4exp/RetainedCPUMegakernelStages.h"
+#include "models/qwen4exp/Qwen4ExpRetainedGDNPreAttentionPolicy.h"
 #if defined(HAVE_ROCM) || defined(HAVE_CUDA)
 #include "execution/compute_stages/stages/qwen4exp/RetainedGDNPreAttentionStage.h"
 #include "execution/compute_stages/stages/qwen4exp/RetainedQSAAttentionStage.h"
-#include "models/qwen4exp/Qwen4ExpRetainedGDNPreAttentionPolicy.h"
 #endif
 #include <algorithm>
 #include <limits>
@@ -80,6 +81,24 @@ void Qwen4ExpGraph::postLayerComposition(ComputeGraph &graph, const LayerComposi
     const bool qualified_mi50 = qualified_mi50_gdn &&
         !hasMappedGPUCPUIntermediateShardTopology(*config_.moe.routed_expert_plan);
     const bool qualified_domain = qualified_mi50;
+    if (composition.device.is_cpu() &&
+        usesRetainedCPUMegakernels(
+            qfnRetainedCPUMegakernelsEnabled(true),
+            composition.device, input.execution_phase, input.execution_role,
+            input.seq_len, input.batch_size))
+    {
+        const std::string layer_prefix = "layer" + std::to_string(composition.layer) + "_";
+        if (isGDNLayer(composition.layer))
+        {
+            lowerRetainedCPUGDN(graph, layer_prefix + "gdn_proj", composition.input_boundary);
+        }
+        else
+        {
+            lowerRetainedCPUQSAAttention(graph, layer_prefix, composition.input_boundary);
+        }
+        lowerRetainedCPUFFN(graph, layer_prefix, composition.attention_terminal);
+        return;
+    }
 #ifdef HAVE_ROCM
     if (isGDNLayer(composition.layer) && usesRetainedGDNPreAttention(
             qfnRetainedGDNPreAttentionEnabled(qualified_mi50_gdn &&

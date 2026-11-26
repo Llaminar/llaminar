@@ -151,10 +151,11 @@ namespace llaminar2::cpu::moe
     struct CanonicalRoutePreweightedOutput {
         std::span<float> values;
         std::span<const int32_t> original_slots;
-        std::span<const int32_t> destination_slots; ///< Actual compact top-k coordinates, including inactive holes.
+        std::span<const int32_t> destination_slots; ///< Actual compact top-k coordinates, including inactive holes (or empty for identity [0, count) when unweighted_exact_sum is true).
         std::span<const float> weights;
         PreweightedStoreLocality store_locality = PreweightedStoreLocality::SameSocketDDIO;
         bool skip_combined_store = false; ///< When true and degree==2, omit writing unused combined_route_rows scratch.
+        bool unweighted_exact_sum = false; ///< When true, write exact participant-order sum without weighting (preserves exact vec_add bits for host canonical return).
     };
 
     /** @brief Unweighted fixed-order combine, before any original top-k weighting. */

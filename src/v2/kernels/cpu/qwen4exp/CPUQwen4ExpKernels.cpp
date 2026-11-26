@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 
 namespace llaminar2::qwen4exp
 {
@@ -172,8 +173,17 @@ public:
     {
         detail::validate(a);
         const auto hidden = static_cast<std::size_t>(a.hidden);
+        const int rows = liveRows(a.extent);
         const int vectorWidth = cpu_detail::vectorWidth();
-        channelBlocks(liveRows(a.extent), a.hidden, [&](std::size_t row, int begin, int end) {
+        // On single-row decode (M=1), mixed[hidden] is immediately broadcast-read
+        // by all threads in the subsequent projection (router, QKV, GDN alpha/beta).
+        // Non-temporal stores keep mixed out of writer-private Modified cache lines
+        // on non-inclusive L3 CPUs, preventing a multi-core HitM snoop convoy.
+        const bool stream512 = (rows == 1) && (vectorWidth == 16) &&
+                               ((reinterpret_cast<std::uintptr_t>(a.output) & 63u) == 0u);
+        const bool stream256 = (rows == 1) && (vectorWidth == 8) &&
+                               ((reinterpret_cast<std::uintptr_t>(a.output) & 31u) == 0u);
+        channelBlocks(rows, a.hidden, [&](std::size_t row, int begin, int end) {
             int channel = begin;
 #if defined(__aarch64__) && defined(__ARM_NEON)
             // Four-lane copy of the AVX2 program: polynomial sigmoid, one FMA
@@ -193,6 +203,7 @@ public:
 #endif
 #if defined(__AVX512F__)
             if (vectorWidth == 16)
+            {
                 for (; channel + 16 <= end; channel += 16)
                 {
                     auto sum = _mm512_setzero_ps();
@@ -202,11 +213,19 @@ public:
                         sum = _mm512_fmadd_ps(cpu_detail::sigmoid(_mm512_loadu_ps(a.gateLogits + offset)),
                                              _mm512_loadu_ps(a.normalized + offset), sum);
                     }
-                    _mm512_storeu_ps(a.output + row * hidden + channel, _mm512_mul_ps(sum, _mm512_set1_ps(0.25f)));
+                    const __m512 out_v = _mm512_mul_ps(sum, _mm512_set1_ps(0.25f));
+                    if (stream512)
+                        _mm512_stream_ps(a.output + row * hidden + channel, out_v);
+                    else
+                        _mm512_storeu_ps(a.output + row * hidden + channel, out_v);
                 }
+                if (stream512)
+                    _mm_sfence();
+            }
 #endif
 #if defined(__AVX2__)
             if (vectorWidth >= 8)
+            {
                 for (; channel + 8 <= end; channel += 8)
                 {
                     auto sum = _mm256_setzero_ps();
@@ -216,8 +235,15 @@ public:
                         sum = _mm256_fmadd_ps(avx2::fast_sigmoid(_mm256_loadu_ps(a.gateLogits + offset)),
                                              _mm256_loadu_ps(a.normalized + offset), sum);
                     }
-                    _mm256_storeu_ps(a.output + row * hidden + channel, _mm256_mul_ps(sum, _mm256_set1_ps(0.25f)));
+                    const __m256 out_v = _mm256_mul_ps(sum, _mm256_set1_ps(0.25f));
+                    if (stream256)
+                        _mm256_stream_ps(a.output + row * hidden + channel, out_v);
+                    else
+                        _mm256_storeu_ps(a.output + row * hidden + channel, out_v);
                 }
+                if (stream256)
+                    _mm_sfence();
+            }
 #endif
             for (; channel < end; ++channel)
             {
@@ -272,15 +298,88 @@ public:
                 const auto base = task * a.hidden;
                 const auto blockBase = (task / 4) * a.hidden;
                 const float gate = 2.0f * sigmoid(a.gateLogits[task] * 0.25f);
-                for (int channel = 0; channel < a.hidden; ++channel)
+                const float *__restrict res = a.residual + base;
+                const float *__restrict blk = a.block + blockBase;
+                const float *__restrict gain = a.gain + (task % 4) * a.hidden;
+                float *__restrict out = a.output + base;
+                float *__restrict norm = a.normalized + base;
+                const int hidden = a.hidden;
+
+                // Fused SIMD write + exact 256-lane sumsq tree in one pass:
+                // _mm*_fmadd_ps(vgate, b, 0) reproduces std::fma(gate, b, 0.0f) bit-for-bit,
+                // followed by separate rounded addition with res[c] and exact 256-lane FMA tree.
+                alignas(64) float partial[256]{};
+#if defined(__AVX512F__)
+                if (vectorWidth == 16 && (hidden % 256) == 0)
                 {
-                    // The original CPU write uses an explicit zero FMA for the
-                    // product, then a separate rounded residual addition.
-                    const float update = std::fma(gate,a.block[blockBase + channel],0.0f);
-                    a.output[base + channel] = a.residual[base + channel] + update;
+                    const __m512 vgate = _mm512_set1_ps(gate);
+                    const __m512 vzero = _mm512_setzero_ps();
+                    __m512 acc[16];
+#pragma GCC unroll 16
+                    for (int b = 0; b < 16; ++b)
+                        acc[b] = _mm512_setzero_ps();
+                    for (int seg = 0; seg < hidden; seg += 256)
+                    {
+#pragma GCC unroll 16
+                        for (int b = 0; b < 16; ++b)
+                        {
+                            const int off = seg + b * 16;
+                            const __m512 upd = _mm512_fmadd_ps(vgate, _mm512_loadu_ps(blk + off), vzero);
+                            const __m512 val = _mm512_add_ps(_mm512_loadu_ps(res + off), upd);
+                            _mm512_storeu_ps(out + off, val);
+                            acc[b] = _mm512_fmadd_ps(val, val, acc[b]);
+                        }
+                    }
+#pragma GCC unroll 8
+                    for (int b = 0; b < 8; ++b)
+                        acc[b] = _mm512_add_ps(acc[b], acc[b + 8]);
+#pragma GCC unroll 4
+                    for (int b = 0; b < 4; ++b)
+                        acc[b] = _mm512_add_ps(acc[b], acc[b + 4]);
+                    acc[0] = _mm512_add_ps(acc[0], acc[2]);
+                    acc[1] = _mm512_add_ps(acc[1], acc[3]);
+                    acc[0] = _mm512_add_ps(acc[0], acc[1]);
+                    _mm512_store_ps(partial, acc[0]);
+                    for (int stride = 8; stride > 0; stride /= 2)
+                        for (int lane = 0; lane < stride; ++lane)
+                            partial[lane] += partial[lane + stride];
+                    const float inverse = 1.0f / std::sqrt(partial[0] / static_cast<float>(hidden) + a.epsilon);
+                    const __m512 vinv = _mm512_set1_ps(inverse);
+                    for (int c = 0; c < hidden; c += 16)
+                    {
+                        _mm512_storeu_ps(norm + c,
+                            _mm512_mul_ps(_mm512_mul_ps(_mm512_loadu_ps(out + c), vinv),
+                                          _mm512_loadu_ps(gain + c)));
+                    }
+                    continue;
                 }
-                normalizeBranch(a.hidden,a.epsilon,a.output + base,a.gain + (task % 4) * a.hidden,
-                                a.normalized + base,vectorWidth);
+#endif
+#if defined(__AVX2__)
+                if (vectorWidth >= 8)
+                {
+                    const __m256 vgate = _mm256_set1_ps(gate);
+                    const __m256 vzero = _mm256_setzero_ps();
+                    int c = 0;
+                    for (; c + 8 <= hidden; c += 8)
+                    {
+                        const __m256 upd = _mm256_fmadd_ps(vgate, _mm256_loadu_ps(blk + c), vzero);
+                        _mm256_storeu_ps(out + c, _mm256_add_ps(_mm256_loadu_ps(res + c), upd));
+                    }
+                    for (; c < hidden; ++c)
+                    {
+                        const float update = std::fma(gate, blk[c], 0.0f);
+                        out[c] = res[c] + update;
+                    }
+                    normalizeBranch(hidden, a.epsilon, out, gain, norm, vectorWidth);
+                    continue;
+                }
+#endif
+                for (int channel = 0; channel < hidden; ++channel)
+                {
+                    const float update = std::fma(gate, blk[channel], 0.0f);
+                    out[channel] = res[channel] + update;
+                }
+                normalizeBranch(hidden, a.epsilon, out, gain, norm, vectorWidth);
             }
         };
         OMP_WORKSHARE_REGION(work);

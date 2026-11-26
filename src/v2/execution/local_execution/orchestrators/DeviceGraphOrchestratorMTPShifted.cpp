@@ -216,16 +216,14 @@ namespace llaminar2
                 ? std::clamp(request_lengths->front(), 1, seq_len)
                 : seq_len;
 
-        const FrozenModelWeightSet *mtp_weight_set =
-            selectMTPDecodeWeightSet(
+        const ModelWeightBindings *bindings_ptr =
+            selectMTPDecodeWeightBindings(
                 "populateCPUMTPShiftedCacheFromPrefill");
-        if (!mtp_weight_set)
+        if (!bindings_ptr)
         {
             return false;
         }
-
-        auto bindings = makeModelWeightBindings(
-            *mtp_weight_set, state_.device_id);
+        const ModelWeightBindings &bindings = *bindings_ptr;
         if (bindings.mtp.empty() || bindings.mtp.depths.empty())
         {
             LOG_ERROR("[DeviceGraphOrchestrator] populateCPUMTPShiftedCacheFromPrefill requested without MTP weight bindings");
@@ -519,15 +517,13 @@ namespace llaminar2
             LOG_ERROR("[DeviceGraphOrchestrator] forwardMTP requires an initialized MTP KV cache");
             return false;
         }
-        const FrozenModelWeightSet *mtp_weight_set =
-            selectMTPDecodeWeightSet("forwardMTP");
-        if (!mtp_weight_set)
+        const ModelWeightBindings *bindings_ptr =
+            selectMTPDecodeWeightBindings("forwardMTP");
+        if (!bindings_ptr)
         {
             return false;
         }
-
-        auto bindings = makeModelWeightBindings(
-            *mtp_weight_set, state_.device_id);
+        const ModelWeightBindings &bindings = *bindings_ptr;
         if (bindings.mtp.empty() || bindings.mtp.depths.empty())
         {
             LOG_ERROR("[DeviceGraphOrchestrator] forwardMTP requested without MTP weight bindings");
@@ -562,15 +558,13 @@ namespace llaminar2
             LOG_ERROR("[DeviceGraphOrchestrator] forwardMTPForDeviceSampling requires an initialized MTP KV cache");
             return false;
         }
-        const FrozenModelWeightSet *mtp_weight_set =
-            selectMTPDecodeWeightSet("forwardMTPForDeviceSampling");
-        if (!mtp_weight_set)
+        const ModelWeightBindings *bindings_ptr =
+            selectMTPDecodeWeightBindings("forwardMTPForDeviceSampling");
+        if (!bindings_ptr)
         {
             return false;
         }
-
-        auto bindings = makeModelWeightBindings(
-            *mtp_weight_set, state_.device_id);
+        const ModelWeightBindings &bindings = *bindings_ptr;
         if (bindings.mtp.empty() || bindings.mtp.depths.empty())
         {
             LOG_ERROR("[DeviceGraphOrchestrator] forwardMTPForDeviceSampling requested without MTP weight bindings");

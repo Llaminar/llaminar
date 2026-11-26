@@ -43,7 +43,7 @@ Qwen4ExpPredictorProjectionLayout Qwen4ExpPredictorProjectionLayout::fromFrozen(
         config.d_model,config.head_dim,config.n_heads,config.n_kv_heads,config.local_n_heads,config.local_n_kv_heads,
         config.head_start,config.moe.shared_intermediate_size,kv_head_start},
         {q.shape(),k.shape(),v.shape(),wo.shape(),gate.shape(),up.shape(),down.shape(),
-         graph_utils::isRowParallelSharded(&wo),graph_utils::isRowParallelSharded(&down)});
+         graph_utils::isRowParallelSharded(&wo,f.wo),graph_utils::isRowParallelSharded(&down,f.shared_expert_down)});
     if ((decision.attention_reduction || decision.shared_reduction) &&
         (!config.tp_ctx || config.tp_ctx->degree()!=participants))
         throw std::invalid_argument("Dense0 row-parallel projection requires its admitted typed TP transport context");

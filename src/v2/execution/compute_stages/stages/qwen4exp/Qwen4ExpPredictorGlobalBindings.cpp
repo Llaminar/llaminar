@@ -35,12 +35,18 @@ Qwen4ExpPredictorGlobalBindings Qwen4ExpPredictorGlobalBindings::fromFrozen(cons
     int offset = 0;
     if (device.is_cpu())
     {
-        // CPU embedding kernels read the original frozen native tensor. The
-        // weight plan owns its vocabulary slice and RequiredForCPUExecution
-        // policy; manufacturing a prepared handle would duplicate that owner.
+        // CPU embedding kernels read the original frozen native tensor (either
+        // raw host-loaded or committed as CPUResidentTensor by streaming load).
+        // The weight plan owns its vocabulary slice and RequiredForCPUExecution
+        // policy; manufacturing a PreparedEmbedding handle would duplicate that owner.
         const auto &slice = embedding->slice;
         const auto &residency = embedding->residency;
-        if (selected.prepared || config.vocab_size <= 0 || config.d_model <= 0 ||
+        const bool valid_cpu_prepared = !selected.prepared ||
+            (selected.prepared->kind == PreparedWeightKind::CPUResidentTensor &&
+             selected.prepared->model_id == selected.identity.model_id &&
+             selected.prepared->binding_id == selected.binding_id &&
+             selected.prepared->device == device);
+        if (!valid_cpu_prepared || config.vocab_size <= 0 || config.d_model <= 0 ||
             residency.home_device != device || residency.resident_device != device ||
             residency.host_policy != WeightHostPolicy::RequiredForCPUExecution ||
             !residency.raw_host_data_available || embedding->tensor->is_raw_data_released() ||

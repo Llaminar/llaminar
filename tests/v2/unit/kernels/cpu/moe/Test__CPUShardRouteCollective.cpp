@@ -710,3 +710,117 @@ TEST(CPUShardRouteCollective, IndexedOriginalRangeMetadataCannotAliasEitherOutpu
     EXPECT_FALSE(combineCanonicalRouteDownPartialsOrderedIndexed(args,indexed));
     EXPECT_EQ(std::memcmp(ranges.data(),before.data(),sizeof(ranges)),0);
 }
+
+/** @test Fused unweighted canonical host return matches separate combine + copy byte-for-byte. */
+TEST(CPUShardRouteCollective, FusedFinalAddUnweightedHostCanonicalMatchesSeparateCopy)
+{
+    for (const int degree : {2, 3, 4})
+    {
+        for (const int H : {7, 35, 128, 2560})
+        {
+            const int rows = 3, top_k = 2;
+            const size_t slots = static_cast<size_t>(rows) * static_cast<size_t>(top_k);
+            const size_t width = static_cast<size_t>(H) + 1u;
+            const std::array<int32_t, 4> original_slots{0, 2, 3, 5};
+            const std::array<int32_t, 4> compact_slots{0, 1, 2, 3};
+            const std::array<int32_t, 4> experts{0, 0, 0, 0};
+            const std::array<float, 4> weights{0.25f, -0.5f, 0.75f, 1.0f};
+            const size_t count = original_slots.size();
+
+            std::vector<float> records(static_cast<size_t>(degree) * count * width, 0.0f);
+            std::vector<RootedFloatRecordRange> ranges;
+            for (int p = 0; p < degree; ++p)
+            {
+                for (size_t e = 0; e < count; ++e)
+                {
+                    float *rec = records.data() + (static_cast<size_t>(p) * count + e) * width;
+                    for (int h = 0; h < H; ++h)
+                    {
+                        if (e == 0 && h == 0)
+                            rec[h] = -0.0f;
+                        else if (e == 1 && h == 1 && H > 1)
+                            rec[h] = std::numeric_limits<float>::quiet_NaN();
+                        else
+                            rec[h] = static_cast<float>((p + 1) * ((h % 19) - 9) + static_cast<int>(e) * 3) * 0.125f;
+                    }
+                    ASSERT_TRUE(canonical_moe_route_record::writeFlatRouteSlot(
+                        rec, H, static_cast<size_t>(original_slots[e])));
+                }
+                ranges.push_back({p, static_cast<size_t>(p) * count, count});
+            }
+
+            std::vector<int32_t> maps(static_cast<size_t>(degree) * slots, -1);
+            std::vector<float> required(slots, 0.0f);
+            std::array<int, 1> selected{0};
+            std::vector<float> ref_combined(slots * static_cast<size_t>(H), -991.0f);
+            CanonicalShardRouteRecordArgs ref_args{
+                records, ranges, {}, {}, selected, maps, required, ref_combined,
+                1, rows, top_k, H,
+                CanonicalShardSparseRouteView{original_slots, experts, weights},
+                std::nullopt};
+            ASSERT_TRUE(combineCanonicalShardRouteRecords(ref_args));
+
+            std::vector<float> ref_out_rows(count * static_cast<size_t>(H), -993.0f);
+            std::vector<int32_t> ref_row_ids(count, -1);
+            MoEOverlaySparseRows sparse_in{};
+            sparse_in.d_model = H;
+            sparse_in.top_k = top_k;
+            sparse_in.row_capacity = static_cast<size_t>(rows);
+            sparse_in.entry_capacity = count;
+            sparse_in.live_row_count = static_cast<size_t>(rows);
+            sparse_in.live_entry_count = count;
+            sparse_in.original_route_slots_host = const_cast<int32_t *>(original_slots.data());
+            sparse_in.compact_route_slots_host = const_cast<int32_t *>(compact_slots.data());
+            sparse_in.route_weights_host = const_cast<float *>(weights.data());
+            MoEOverlayReturnRows ref_ret{};
+            ref_ret.layout = MoEOverlayReturnLayout::CanonicalExpertRoutes;
+            ref_ret.d_model = H;
+            ref_ret.row_capacity = count;
+            ref_ret.output_rows_fp32 = ref_out_rows.data();
+            ref_ret.row_ids_host = ref_row_ids.data();
+            ASSERT_TRUE(copyMoEOverlayCanonicalRouteRowsToHostReturn(sparse_in, ref_combined, ref_ret));
+
+            for (const auto locality : {PreweightedStoreLocality::SameSocketDDIO,
+                                        PreweightedStoreLocality::CrossSocketStreaming})
+            {
+                for (const bool skip_combined : {false, true})
+                {
+                    for (const bool identity_dest : {true, false})
+                    {
+                        std::vector<float> fused_combined(slots * static_cast<size_t>(H), -995.0f);
+                        std::vector<float> fused_out(count * static_cast<size_t>(H), -997.0f);
+                        CanonicalShardRouteRecordArgs fused_args = ref_args;
+                        fused_args.combined_route_rows = fused_combined;
+                        fused_args.preweighted_output = CanonicalRoutePreweightedOutput{
+                            fused_out,
+                            original_slots,
+                            identity_dest ? std::span<const int32_t>{} : std::span<const int32_t>{compact_slots},
+                            weights,
+                            locality,
+                            skip_combined,
+                            /*unweighted_exact_sum=*/true};
+                        ASSERT_TRUE(combineCanonicalShardRouteRecords(fused_args));
+                        EXPECT_EQ(std::memcmp(fused_out.data(), ref_out_rows.data(),
+                                              fused_out.size() * sizeof(float)), 0)
+                            << "degree=" << degree << " H=" << H << " skip=" << skip_combined
+                            << " id=" << identity_dest;
+                        if (degree == 2 && skip_combined)
+                        {
+                            EXPECT_TRUE(std::all_of(fused_combined.begin(), fused_combined.end(),
+                                                    [](float v) { return v == -995.0f; }));
+                        }
+                    }
+                }
+            }
+
+            // Empty destination_slots MUST be rejected when unweighted_exact_sum is false.
+            std::vector<float> bad_out(count * static_cast<size_t>(H), -999.0f);
+            CanonicalShardRouteRecordArgs bad_args = ref_args;
+            bad_args.preweighted_output = CanonicalRoutePreweightedOutput{
+                bad_out, original_slots, {}, weights,
+                PreweightedStoreLocality::SameSocketDDIO, true, /*unweighted_exact_sum=*/false};
+            EXPECT_FALSE(combineCanonicalShardRouteRecords(bad_args));
+            EXPECT_TRUE(std::all_of(bad_out.begin(), bad_out.end(), [](float v) { return v == -999.0f; }));
+        }
+    }
+}

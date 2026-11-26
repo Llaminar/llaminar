@@ -315,7 +315,62 @@ bool MoECPUExpertShardRouteStage::executeWithBank(IDeviceContext *ctx,MoEOverlay
     const size_t active_slots = static_cast<size_t>(active_rows) * static_cast<size_t>(p.top_k);
     const auto combine_begin=timing_observation_?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
     std::optional<cpu::moe::CanonicalRoutePreweightedOutput> fused_remote_preweight;
-    if (!publication && sparse && p.original_preweighted_routes &&
+    bool fused_host_canonical = false;
+    if (!publication && sparse && p.return_publication == OriginalReturnPublication::CanonicalHostRows &&
+        p.original_return_rows)
+    {
+        auto &out = *p.original_return_rows;
+        const size_t count = sparse->live_entry_count;
+        const size_t width = static_cast<size_t>(p.columns);
+        const bool header_ok =
+            sparse->live_row_count <= sparse->row_capacity &&
+            count <= sparse->entry_capacity &&
+            (count == 0u || sparse->live_row_count > 0u) &&
+            out.layout == MoEOverlayReturnLayout::CanonicalExpertRoutes &&
+            out.d_model == p.columns &&
+            count <= out.row_capacity &&
+            (count == 0u || (sparse->original_route_slots_host && sparse->compact_route_slots_host &&
+                             sparse->route_weights_host && out.output_rows_fp32 && out.row_ids_host));
+        bool entries_ok = header_ok;
+        if (entries_ok && count > 0u)
+        {
+            int32_t prev_orig = -1, prev_comp = -1;
+            for (size_t e = 0; e < count; ++e)
+            {
+                const int32_t orig = sparse->original_route_slots_host[e];
+                const int32_t comp = sparse->compact_route_slots_host[e];
+                if (orig <= prev_orig || comp <= prev_comp ||
+                    static_cast<size_t>(orig) >= active_slots ||
+                    !std::isfinite(sparse->route_weights_host[e]))
+                {
+                    entries_ok = false;
+                    break;
+                }
+                prev_orig = orig;
+                prev_comp = comp;
+            }
+        }
+        if (entries_ok)
+        {
+            if (count > 0u)
+            {
+                const size_t payload_bytes = count * width * sizeof(float);
+                fused_remote_preweight = cpu::moe::CanonicalRoutePreweightedOutput{
+                    {out.output_rows_fp32, out.row_capacity * width},
+                    {sparse->original_route_slots_host, count},
+                    {}, // Identity compact [0, count) destination slots
+                    {sparse->route_weights_host, count},
+                    payload_bytes >= (2u * 1024u * 1024u)
+                        ? cpu::moe::PreweightedStoreLocality::CrossSocketStreaming
+                        : cpu::moe::PreweightedStoreLocality::SameSocketDDIO,
+                    /*skip_combined_store=*/true,
+                    /*unweighted_exact_sum=*/true,
+                };
+            }
+            fused_host_canonical = true;
+        }
+    }
+    else if (!publication && sparse && p.original_preweighted_routes &&
         p.return_publication != OriginalReturnPublication::CanonicalHostRows)
     {
         const auto width = static_cast<size_t>(p.columns);
@@ -361,7 +416,17 @@ bool MoECPUExpertShardRouteStage::executeWithBank(IDeviceContext *ctx,MoEOverlay
     } else {
         if(!cpu::moe::combineCanonicalShardRouteRecords(combine_args))return reject("canonical_fixed_order_combine");
         if(timing_observation_)timing_observation_->sample_.combine_ns=rootTimingElapsed(combine_begin);
-        if(p.return_publication==OriginalReturnPublication::CanonicalHostRows &&
+        if(fused_host_canonical) {
+            auto &out = *p.original_return_rows;
+            const size_t count = sparse->live_entry_count;
+            for (size_t e = 0; e < count; ++e)
+                out.row_ids_host[e] = sparse->original_route_slots_host[e];
+            out.key = sparse->key;
+            out.residency_epoch = sparse->residency_epoch;
+            out.source_participant = sparse->target_participant;
+            out.target_participant = sparse->source_participant;
+            out.live_row_count = count;
+        } else if(p.return_publication==OriginalReturnPublication::CanonicalHostRows &&
             !copyMoEOverlayCanonicalRouteRowsToHostReturn(*sparse,
                 {p.combined_routes->data(),slots*static_cast<size_t>(p.columns)},*p.original_return_rows))
             return reject("original_unweighted_host_return");

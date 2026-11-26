@@ -320,7 +320,7 @@ MoEOverlayMemoryPlanInputs buildMoEOverlayMemoryPlanInputs(
             participation.domain_name!=domain.name || plan.global_tp_domain_id!=std::optional{participation.domain_id} ||
             participation.devices!=domain.participants || participation.weights!=domain.weights ||
             participation.backend!=domain.backend || participation.my_index_in_domain!=index ||
-            program.backend()!=BackendSelector::resolve(domain.backend,std::vector<DeviceId>(members.size(),DeviceId::cpu())))
+            program.backend()!=NativeCPUCollectiveProgram::resolveBoundExpertShardBackend(domain.backend,members))
             throw std::invalid_argument("CPU pipeline memory changed its original stage/domain/collective scope");
         for(size_t member=0;member<members.size();++member)
             if(members[member].world_rank!=domain.world_ranks[member] ||

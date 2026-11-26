@@ -417,6 +417,104 @@ namespace llaminar2::cpu::native_quantised
             int hidden, int intermediate);
 
         /**
+         * @brief Check whether a one-token native MoE execution qualifies for in-team execution.
+         * @details Same geometry and numerical contract as @ref standaloneMoEOneRowWorkers without
+         *          rejecting an enclosing @ref OMP_LAYER_PARALLEL team.
+         */
+        static bool supportsStandaloneMoEOneRowInTeam(int hidden, int intermediate, size_t routes) noexcept;
+
+        /**
+         * @brief Minimum float capacity required for split-K scratch passed to @ref executeStandaloneMoEOneRowInTeam.
+         */
+        static constexpr size_t kStandaloneMoESplitKScratchFloats = 160u * 12u * 64u;
+
+        /**
+         * @brief Pre-resolved single-row standalone MoE tile plan prepared once per layer on one thread.
+         *
+         * Allows an enclosing @ref OMP_LAYER_PARALLEL megakernel to prepare the active experts'
+         * packed pointers, K-partition counts, and codebook LUTs once inside an existing
+         * @ref OMP_SINGLE block and then execute Gate/Up/SwiGLU/Q8_1/Down across all workers
+         * with zero redundant per-thread setup or extra barriers.
+         */
+        struct StandaloneMoEOneRowPlan
+        {
+            struct alignas(64) RowEntry
+            {
+                const CPUNativeQuantisedPackedWeights *weights = nullptr;
+                const Q8_1Block *input = nullptr;
+                float *output = nullptr;
+                void (*tile)(const RowEntry &, int) = nullptr;
+                void (*part_range)(const RowEntry &, int, int, int, float *, bool) = nullptr;
+                alignas(64) std::array<std::uint8_t, 64> lut{};
+                int blocks = 0;
+                int partitions = 0;
+                ISALevel isa = ISALevel::Scalar;
+            };
+            static constexpr size_t kMaxRoutes = 16;
+            std::array<RowEntry, 2 * kMaxRoutes> gate_plans{};
+            std::array<RowEntry, kMaxRoutes> down_plans{};
+            size_t route_count = 0;
+            int hidden = 0;
+            int intermediate = 0;
+            int workers = 1;
+            int gate_partitions = 0;
+            int k_split = 1;
+            ISALevel isa = ISALevel::Scalar;
+            bool valid = false;
+        };
+
+        /**
+         * @brief Pre-resolve immutable RowEntry metadata (weights, tile fn, LUT, partitions) once at setup.
+         */
+        static bool prepareStandaloneMoEOneRowEntry(
+            StandaloneMoEOneRowPlan::RowEntry &out,
+            const CPUNativeQuantisedGemmKernel *kernel,
+            int width, int k, int workers, ISALevel isa);
+
+        /**
+         * @brief Finalize a @ref StandaloneMoEOneRowPlan whose `gate_plans`/`down_plans` were populated from cached entries.
+         */
+        static bool finalizeStandaloneMoEOneRowPlan(
+            StandaloneMoEOneRowPlan &plan,
+            size_t route_count,
+            int hidden, int intermediate,
+            int workers, ISALevel isa,
+            size_t splitk_partials_capacity) noexcept;
+
+        /**
+         * @brief Prepare a @ref StandaloneMoEOneRowPlan once on one thread (e.g. inside `OMP_SINGLE`).
+         */
+        static bool prepareStandaloneMoEOneRowPlan(
+            StandaloneMoEOneRowPlan &plan,
+            std::span<const BatchedPrequantizedProjectionDesc> gate,
+            std::span<const BatchedPrequantizedProjectionDesc> down,
+            int hidden, int intermediate,
+            int workers, ISALevel isa,
+            size_t splitk_partials_capacity);
+
+        /**
+         * @brief Execute a pre-built @ref StandaloneMoEOneRowPlan inside an already-active OpenMP team.
+         * @pre Every thread in the active OpenMP team observes the published @p plan identically.
+         */
+        static bool executePreparedStandaloneMoEOneRowInTeam(
+            const StandaloneMoEOneRowPlan &plan,
+            std::span<Q8_1Block> activation,
+            float *splitk_partials, size_t splitk_partials_capacity);
+
+        /**
+         * @brief Execute the prepared one-token native MoE phases inside an already-active OpenMP team.
+         * @pre All threads in the active OpenMP team call this identically; @p splitk_partials is
+         *      shared across all threads with at least @ref kStandaloneMoESplitKScratchFloats floats.
+         * @return True when every Gate/Up/SwiGLU/Q8_1/Down tile completed and synchronized.
+         */
+        static bool executeStandaloneMoEOneRowInTeam(
+            std::span<const BatchedPrequantizedProjectionDesc> gate,
+            std::span<const BatchedPrequantizedProjectionDesc> down,
+            std::span<Q8_1Block> activation,
+            int hidden, int intermediate,
+            float *splitk_partials, size_t splitk_partials_capacity);
+
+        /**
          * @brief Execute unequal-M pre-quantized projections in one CPU team.
          *
          * Every descriptor independently resolves its typed scheduling purpose:
@@ -496,6 +594,47 @@ namespace llaminar2::cpu::native_quantised
             std::optional<GroupedDownRouteOrder> down_route_order = std::nullopt);
 
         /**
+         * @brief Execute a complete grouped MoE FFN (Gate+Up -> SwiGLU -> Q8_1 -> Down)
+         *        inside one persistent OpenMP region with zero expert-major Q8 copy
+         *        and zero gate/up DRAM round-trip.
+         *
+         * Consumes the unique row-major Q8_1 hidden rows directly via
+         * `router_row_indices` (eliminating expert-major Q8 gathers), computes
+         * Gate and Up into L1d-resident strips with exact ascending K-partition
+         * order, immediately fuses SwiGLU and Q8_1 quantization into `activation_q8`,
+         * synchronizes once, and executes weight-stationary Down directly into
+         * `down_descriptors[e].output_rows`. Supports all 18 NativeQuantised
+         * codebooks and runtime Scalar / AVX2 / AVX-512 ISA dispatch.
+         *
+         * @param gate_up_descriptors Gate and Up descriptors (2 per active expert).
+         * @param unique_router_q8 Contiguous unique Q8_1 hidden rows `[unique_router_rows, router_q8_blocks_per_row]`.
+         * @param unique_router_rows Number of unique source rows in `unique_router_q8`.
+         * @param router_q8_blocks_per_row Number of Q8_1 blocks per hidden row.
+         * @param router_row_indices Expert-major map from route row `[0, route_rows)` to unique row `[0, unique_router_rows)`.
+         * @param hidden_width Logical K dimension of Gate/Up matrices (`d_model`).
+         * @param activation_q8 Destination bank for exact Q8_1 SwiGLU publication.
+         * @param route_rows Total expert-major route rows across active experts.
+         * @param intermediate Expert intermediate width.
+         * @param activation_blocks_per_row Number of Q8_1 blocks per intermediate row.
+         * @param down_descriptors Down descriptors (1 per active expert).
+         * @param down_route_order Optional route-partition validation for indexed Down publication.
+         * @return `true` when every phase completes cleanly; `false` on contract violation.
+         */
+        static bool execute_moe_grouped_fused_ffn(
+            std::span<const BatchedPrequantizedProjectionDesc> gate_up_descriptors,
+            const Q8_1Block *unique_router_q8,
+            int unique_router_rows,
+            int router_q8_blocks_per_row,
+            std::span<const int> router_row_indices,
+            int hidden_width,
+            Q8_1Block *activation_q8,
+            int route_rows,
+            int intermediate,
+            int activation_blocks_per_row,
+            std::span<const BatchedPrequantizedProjectionDesc> down_descriptors,
+            std::optional<GroupedDownRouteOrder> down_route_order = std::nullopt);
+
+        /**
          * @brief Project router-published Q8_1 rows without requantizing hidden state.
          *
          * Routed MoE prefill and verifier execution group route slots by expert.
@@ -568,7 +707,6 @@ namespace llaminar2::cpu::native_quantised
          */
         static FusedVerifierRowsDesc fusedPrequantizedDescriptor(const BatchedPrequantizedProjectionDesc &source);
 
-#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
         struct PreparedMoERow; ///< Immutable admitted operands in one invocation-owned tile plan.
         template<bool Nibble>
         static void preparedMoERowTile(const PreparedMoERow &row, int chunk);
@@ -576,17 +714,16 @@ namespace llaminar2::cpu::native_quantised
         static void preparedMoERowPartitionRange(const PreparedMoERow &row, int chunk,
             int p_start, int p_end, float *dst, bool fold_into_dst);
         static bool prepareMoERows(std::span<const BatchedPrequantizedProjectionDesc> original,
-            std::span<PreparedMoERow> prepared, int width, int blocks, int workers);
+            std::span<PreparedMoERow> prepared, int width, int blocks, int workers, ISALevel isa);
         template<bool Join>
         static void executeMoERows(std::span<const PreparedMoERow> rows, int width);
         template<int KSplit>
         static bool runPreparedFixedMoETilesSplitK(std::span<const PreparedMoERow> gate_plans,
             std::span<const PreparedMoERow> down_plans, std::span<Q8_1Block> activation,
-            int hidden, int intermediate, int gate_partitions, int workers);
+            int hidden, int intermediate, int gate_partitions, int workers, ISALevel isa);
         static std::optional<bool> runPreparedFixedMoETiles(std::span<const BatchedPrequantizedProjectionDesc> gate,
             std::span<const BatchedPrequantizedProjectionDesc> down, std::span<Q8_1Block> activation,
             int hidden, int intermediate, int workers);
-#endif
 
         /**
          * @brief Reject an unsupported explicit phase before any FFN payload write.

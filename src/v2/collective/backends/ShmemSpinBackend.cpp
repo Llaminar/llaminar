@@ -1089,10 +1089,40 @@ namespace llaminar2
         if (my_rank_ == root_rank && local_elements > 0u &&
             local_records != root_records)
         {
-            std::memmove(
-                root_records,
-                local_records,
-                local_elements * sizeof(float));
+            const auto src_begin = reinterpret_cast<std::uintptr_t>(local_records);
+            const auto dst_begin = reinterpret_cast<std::uintptr_t>(root_records);
+            const size_t copy_bytes = local_elements * sizeof(float);
+            const bool disjoint =
+                (src_begin + copy_bytes <= dst_begin) ||
+                (dst_begin + copy_bytes <= src_begin);
+            if (disjoint && local_elements >= kParallelThresholdElements &&
+                omp_in_parallel() == 0 && omp_get_max_threads() > 1)
+            {
+                const size_t slices =
+                    (local_elements + kWorkSliceElements - 1u) / kWorkSliceElements;
+                auto copy_local_root = [&]()
+                {
+#pragma omp for schedule(static)
+                    for (size_t slice = 0u; slice < slices; ++slice)
+                    {
+                        const size_t offset = slice * kWorkSliceElements;
+                        const size_t elements =
+                            std::min(kWorkSliceElements, local_elements - offset);
+                        std::memcpy(
+                            root_records + offset,
+                            local_records + offset,
+                            elements * sizeof(float));
+                    }
+                };
+                OMP_WORKSHARE_REGION(copy_local_root);
+            }
+            else
+            {
+                std::memmove(
+                    root_records,
+                    local_records,
+                    copy_bytes);
+            }
         }
 
         // Consume every peer's pre-staged chunk 0 before retiring Epoch 2.
@@ -1428,10 +1458,88 @@ namespace llaminar2
 
         constexpr size_t kArenaBytes =
             ShmemSpinArena::CHUNK_CAPACITY * sizeof(float);
+        constexpr size_t kParallelBroadcastThresholdBytes = 256u * 1024u;
+        constexpr size_t kParallelBroadcastSliceBytes = 64u * 1024u;
         const size_t chunk_capacity_elements = kArenaBytes / element_size;
         auto *const payload = static_cast<std::byte *>(buffer);
         auto *const root_staging = reinterpret_cast<std::byte *>(
             arena_->buffer_at(root_rank));
+        const size_t total_bytes = count * element_size;
+        if (total_bytes >= kParallelBroadcastThresholdBytes &&
+            omp_in_parallel() == 0 && omp_get_max_threads() > 1)
+        {
+            bool protocol_ok = true;
+            auto run_parallel_broadcast = [&]()
+            {
+                for (size_t chunk_offset = 0u; chunk_offset < count && protocol_ok;)
+                {
+                    const size_t chunk_elements = std::min(
+                        chunk_capacity_elements,
+                        count - chunk_offset);
+                    const size_t chunk_bytes = chunk_elements * element_size;
+                    const size_t byte_offset = chunk_offset * element_size;
+                    const uint64_t transaction_epoch = my_epoch_ + 1u;
+                    const size_t slices =
+                        (chunk_bytes + kParallelBroadcastSliceBytes - 1u) /
+                        kParallelBroadcastSliceBytes;
+
+                    if (my_rank_ == root_rank)
+                    {
+#pragma omp for schedule(static)
+                        for (size_t slice = 0u; slice < slices; ++slice)
+                        {
+                            const size_t off = slice * kParallelBroadcastSliceBytes;
+                            const size_t len = std::min(kParallelBroadcastSliceBytes, chunk_bytes - off);
+                            std::memcpy(root_staging + off, payload + byte_offset + off, len);
+                        }
+#pragma omp master
+                        {
+                            protocol_ok = publishNextEpoch();
+                            for (int rank = 0; rank < num_ranks_ && protocol_ok; ++rank)
+                            {
+                                if (rank == root_rank)
+                                    continue;
+                                protocol_ok = waitForPeerEpoch(
+                                    rank,
+                                    transaction_epoch,
+                                    "waiting for shared-memory broadcast consumption",
+                                    chunk_elements);
+                            }
+                        }
+#pragma omp barrier
+                    }
+                    else
+                    {
+#pragma omp master
+                        {
+                            protocol_ok = waitForPeerEpoch(
+                                root_rank,
+                                transaction_epoch,
+                                "waiting for shared-memory broadcast publication",
+                                chunk_elements);
+                        }
+#pragma omp barrier
+                        if (!protocol_ok)
+                            break;
+#pragma omp for schedule(static)
+                        for (size_t slice = 0u; slice < slices; ++slice)
+                        {
+                            const size_t off = slice * kParallelBroadcastSliceBytes;
+                            const size_t len = std::min(kParallelBroadcastSliceBytes, chunk_bytes - off);
+                            std::memcpy(payload + byte_offset + off, root_staging + off, len);
+                        }
+#pragma omp master
+                        {
+                            protocol_ok = publishNextEpoch();
+                        }
+#pragma omp barrier
+                    }
+                    chunk_offset += chunk_elements;
+                }
+            };
+            OMP_WORKSHARE_REGION(run_parallel_broadcast);
+            return protocol_ok;
+        }
         for (size_t chunk_offset = 0u; chunk_offset < count;)
         {
             const size_t chunk_elements = std::min(

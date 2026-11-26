@@ -122,4 +122,38 @@ inline bool qfnRetainedROCmQSAAttentionEnabled(bool qualified)
     }();
     return selected.value_or(qualified);
 }
+
+/**
+ * @brief Select the CPU single-OMP two-megakernel-per-layer lowering across all CPU topologies.
+ * @param selected Resolved cold participant policy.
+ * @param device Actual local CPU participant.
+ * @param phase Original execution phase.
+ * @param role Original forward role.
+ * @param rows Admitted sequence width.
+ * @param requests Number of concurrent requests in the graph.
+ * @return True when this CPU graph may contract local Attention and FFN regions into single-OMP megakernels.
+ */
+inline bool usesRetainedCPUMegakernels(bool selected, DeviceId device,
+    ForwardExecutionPhase phase, ForwardExecutionRole role, int rows, int requests)
+{
+    return device.is_cpu() &&
+        useQwen4ExpRetainedM1HCFFN(selected, phase, role, rows, requests);
+}
+
+/**
+ * @brief Resolve CPU two-megakernel-per-layer selection from diagnostic override or qualified default.
+ * @param qualified Whether the local CPU layer stages qualify for single-OMP contraction.
+ * @return Explicit LLAMINAR_QFN_RETAINED_CPU_MEGAKERNELS override or qualified default.
+ */
+inline bool qfnRetainedCPUMegakernelsEnabled(bool qualified)
+{
+    static const std::optional<bool> selected = []() -> std::optional<bool> {
+        const char *value = DebugEnv::envValue("LLAMINAR_QFN_RETAINED_CPU_MEGAKERNELS");
+        if (!value) return std::nullopt;
+        if (std::string_view(value) == "0") return false;
+        if (std::string_view(value) == "1") return true;
+        throw std::invalid_argument("LLAMINAR_QFN_RETAINED_CPU_MEGAKERNELS requires 0 or 1");
+    }();
+    return selected.value_or(qualified);
+}
 } // namespace llaminar2

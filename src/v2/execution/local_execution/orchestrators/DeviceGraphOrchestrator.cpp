@@ -2455,6 +2455,8 @@ namespace llaminar2
         }
 
         weight_set->validateForGraph();
+        cached_mtp_weight_bindings_.reset();
+        cached_mtp_weight_bindings_source_ = nullptr;
         frozen_weight_set_ = std::move(weight_set);
 
         auto weight_bindings = makeModelWeightBindings(
@@ -2496,9 +2498,29 @@ namespace llaminar2
         return frozen_weight_set_.get();
     }
 
+    const ModelWeightBindings *DeviceGraphOrchestrator::selectMTPDecodeWeightBindings(
+        const char *caller) const
+    {
+        const FrozenModelWeightSet *weight_set = selectMTPDecodeWeightSet(caller);
+        if (!weight_set)
+            return nullptr;
+        if (cached_mtp_weight_bindings_ &&
+            cached_mtp_weight_bindings_source_ == weight_set &&
+            cached_mtp_weight_bindings_device_ == state_.device_id)
+        {
+            return &*cached_mtp_weight_bindings_;
+        }
+        cached_mtp_weight_bindings_ = makeModelWeightBindings(*weight_set, state_.device_id);
+        cached_mtp_weight_bindings_source_ = weight_set;
+        cached_mtp_weight_bindings_device_ = state_.device_id;
+        return &*cached_mtp_weight_bindings_;
+    }
+
     void DeviceGraphOrchestrator::setDecodeReplicatedDenseWeightSet(std::unique_ptr<FrozenModelWeightSet> weight_set)
     {
         requireOpenWeightPublication("setDecodeReplicatedDenseWeightSet");
+        cached_mtp_weight_bindings_.reset();
+        cached_mtp_weight_bindings_source_ = nullptr;
         if (!graph_builder_)
         {
             LOG_ERROR("[DeviceGraphOrchestrator] Cannot set replicated dense decode weights: graph builder not initialized");
@@ -2777,6 +2799,8 @@ namespace llaminar2
             addLayer(lw.shared_expert_gate_inp, "ffn_gate_inp_shexp.weight", WeightRole::SharedExpertInputGate);
         }
 
+        cached_mtp_weight_bindings_.reset();
+        cached_mtp_weight_bindings_source_ = nullptr;
         frozen_weight_set_ = std::make_unique<FrozenModelWeightSet>(
             strategy, builder.freezeBindings());
         frozen_weight_set_->validateForGraph();

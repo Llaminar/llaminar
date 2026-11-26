@@ -341,6 +341,10 @@ namespace llaminar2
          */
         mutable std::vector<std::uint64_t>
             routing_evidence_count_scratch_;
+        /** Reusable dispatch output and per-tier scratch avoiding hot-path heap allocations. */
+        MoEExpertDispatchOutput scratch_output_;
+        std::vector<std::vector<unsigned char>> scratch_seen_token_rows_;
+        std::vector<const MoEExpertShardCohort *> scratch_validated_cohorts_;
     };
 
 } // namespace llaminar2

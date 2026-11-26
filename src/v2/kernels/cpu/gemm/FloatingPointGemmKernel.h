@@ -1026,6 +1026,103 @@ namespace llaminar2
             constexpr int kLanes =
                 floating_expert_numerical_contract::kReductionLanes;
             constexpr int kVectorLanes = 16;
+
+            // Fast M=1 decode path: keep all 16 ZMM lane accumulators live in
+            // registers across the entire K loop, process full 256-element stripes
+            // with zero branches/masks, and run the exact 256-lane binary reduction
+            // tree in registers (zero 1 KiB stack zero-init or reload traffic).
+            if constexpr (Rows == 1)
+            {
+                __m512 acc[16];
+#pragma GCC unroll 16
+                for (int b = 0; b < 16; ++b)
+                    acc[b] = _mm512_setzero_ps();
+
+                auto load_weight_full = [&](std::size_t idx) noexcept -> __m512 {
+                    if constexpr (WeightType == TensorType::FP32)
+                        return _mm512_loadu_ps(static_cast<const float *>(weights) + idx);
+                    else if constexpr (WeightType == TensorType::FP16)
+                        return _mm512_cvtph_ps(_mm256_loadu_si256(
+                            reinterpret_cast<const __m256i *>(static_cast<const std::uint16_t *>(weights) + idx)));
+                    else
+                        return _mm512_castsi512_ps(_mm512_slli_epi32(
+                            _mm512_cvtepu16_epi32(_mm256_loadu_si256(
+                                reinterpret_cast<const __m256i *>(static_cast<const std::uint16_t *>(weights) + idx))),
+                            16));
+                };
+
+                int base = 0;
+                for (; base + kLanes <= k; base += kLanes)
+                {
+#pragma GCC unroll 16
+                    for (int block = 0; block < 16; ++block)
+                    {
+                        const int first_k = base + block * kVectorLanes;
+                        const __m512 w = load_weight_full(weight_row + static_cast<std::size_t>(first_k));
+                        __m512 a;
+                        if constexpr (HalfStorage)
+                        {
+                            a = _mm512_cvtph_ps(_mm256_loadu_si256(
+                                reinterpret_cast<const __m256i *>(activations + first_k)));
+                        }
+                        else
+                        {
+                            a = _mm512_loadu_ps(activations + first_k);
+                            if constexpr (HalfRNE)
+                                a = _mm512_cvtph_ps(_mm512_cvtps_ph(a, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+                        }
+                        acc[block] = _mm512_fmadd_ps(a, w, acc[block]);
+                    }
+                }
+                if (base < k)
+                {
+#pragma GCC unroll 16
+                    for (int block = 0; block < 16; ++block)
+                    {
+                        const int first_k = base + block * kVectorLanes;
+                        if (first_k >= k)
+                            continue;
+                        const int valid = std::min(kVectorLanes, k - first_k);
+                        const __mmask16 mask =
+                            valid == kVectorLanes
+                                ? static_cast<__mmask16>(0xffffu)
+                                : static_cast<__mmask16>((std::uint32_t{1} << valid) - 1u);
+                        const __m512 w = load_gpu_aligned_expert_weight_avx512<WeightType>(
+                            weights, weight_row + static_cast<std::size_t>(first_k), mask);
+                        __m512 a;
+                        if constexpr (HalfStorage)
+                            a = load_gpu_aligned_expert_weight_avx512<TensorType::FP16>(activations + first_k, 0, mask);
+                        else
+                        {
+                            a = _mm512_maskz_loadu_ps(mask, activations + first_k);
+                            if constexpr (HalfRNE)
+                                a = _mm512_cvtph_ps(_mm512_cvtps_ph(a, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+                        }
+                        acc[block] = _mm512_fmadd_ps(a, w, acc[block]);
+                    }
+                }
+
+                // Exact 256-lane binary add tree in registers (identical parenthesization
+                // to reduce_gpu_aligned_expert_partials_avx512).
+#pragma GCC unroll 8
+                for (int i = 0; i < 8; ++i)
+                    acc[i] = _mm512_add_ps(acc[i], acc[i + 8]);
+#pragma GCC unroll 4
+                for (int i = 0; i < 4; ++i)
+                    acc[i] = _mm512_add_ps(acc[i], acc[i + 4]);
+                acc[0] = _mm512_add_ps(acc[0], acc[2]);
+                acc[1] = _mm512_add_ps(acc[1], acc[3]);
+                acc[0] = _mm512_add_ps(acc[0], acc[1]);
+
+                alignas(64) float tail16[16];
+                _mm512_store_ps(tail16, acc[0]);
+                for (int stride = 8; stride > 0; stride >>= 1)
+                    for (int lane = 0; lane < stride; ++lane)
+                        tail16[lane] = device_fp32_contract::add(tail16[lane], tail16[lane + stride]);
+                reduced[0] = tail16[0];
+                return;
+            }
+
             // Bound live accumulators to sixteen, leaving ample registers for
             // the current weights, activation, masks, and address arithmetic.
             constexpr int kLaneBlocksPerTile = 16 / Rows;
@@ -1119,6 +1216,124 @@ namespace llaminar2
                 reduced[row] =
                     reduce_gpu_aligned_expert_partials_avx512(partials[row]);
             }
+        }
+
+        /**
+         * @brief Compute a 4-row x 4-column prefill tile under the exact 256-lane
+         *        GPU-aligned FP32 reduction tree on AVX-512.
+         *
+         * Keeps 16 ZMM accumulators (`4 rows x 4 cols`) live per 16-lane block so
+         * activation loads and `HalfRNE` conversions are amortized 4x across columns
+         * and FP16/BF16 weight conversions are amortized 4x across rows, while
+         * executing the exact same per-lane ascending-K FMA sequence and 256-lane
+         * binary reduction tree as @ref dot_gpu_aligned_expert_rows_avx512.
+         */
+        template <TensorType WeightType, bool HalfRNE = false, bool HalfStorage = false>
+        inline void dot_gpu_aligned_expert_4x4_avx512(
+            const std::conditional_t<HalfStorage, uint16_t, float> *activations,
+            const void *weights,
+            std::size_t first_weight_row,
+            int k,
+            float reduced[4][4]) noexcept
+        {
+            constexpr int kLanes = floating_expert_numerical_contract::kReductionLanes;
+            constexpr int kVectorLanes = 16;
+            alignas(64) float partials[4][4][kLanes];
+
+            auto load_weight_full = [&](std::size_t idx) noexcept -> __m512 {
+                if constexpr (WeightType == TensorType::FP32)
+                    return _mm512_loadu_ps(static_cast<const float *>(weights) + idx);
+                else if constexpr (WeightType == TensorType::FP16)
+                    return _mm512_cvtph_ps(_mm256_loadu_si256(
+                        reinterpret_cast<const __m256i *>(static_cast<const std::uint16_t *>(weights) + idx)));
+                else
+                    return _mm512_castsi512_ps(_mm512_slli_epi32(
+                        _mm512_cvtepu16_epi32(_mm256_loadu_si256(
+                            reinterpret_cast<const __m256i *>(static_cast<const std::uint16_t *>(weights) + idx))),
+                        16));
+            };
+
+            const std::size_t k_stride = static_cast<std::size_t>(k);
+            for (int lane_offset = 0; lane_offset < kLanes; lane_offset += kVectorLanes)
+            {
+                __m512 acc[4][4];
+#pragma GCC unroll 4
+                for (int r = 0; r < 4; ++r)
+#pragma GCC unroll 4
+                    for (int c = 0; c < 4; ++c)
+                        acc[r][c] = _mm512_setzero_ps();
+
+                int base = 0;
+                for (; base + lane_offset + kVectorLanes <= k; base += kLanes)
+                {
+                    const int first_k = base + lane_offset;
+                    __m512 a[4];
+#pragma GCC unroll 4
+                    for (int r = 0; r < 4; ++r)
+                    {
+                        const auto *ap = activations + static_cast<std::size_t>(r) * k_stride + static_cast<std::size_t>(first_k);
+                        if constexpr (HalfStorage)
+                        {
+                            a[r] = _mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(ap)));
+                        }
+                        else
+                        {
+                            a[r] = _mm512_loadu_ps(ap);
+                            if constexpr (HalfRNE)
+                                a[r] = _mm512_cvtph_ps(_mm512_cvtps_ph(a[r], _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+                        }
+                    }
+#pragma GCC unroll 4
+                    for (int c = 0; c < 4; ++c)
+                    {
+                        const __m512 w = load_weight_full(
+                            first_weight_row + static_cast<std::size_t>(c) * k_stride + static_cast<std::size_t>(first_k));
+#pragma GCC unroll 4
+                        for (int r = 0; r < 4; ++r)
+                            acc[r][c] = _mm512_fmadd_ps(a[r], w, acc[r][c]);
+                    }
+                }
+                const int tail_k = base + lane_offset;
+                if (tail_k < k)
+                {
+                    const int valid = k - tail_k;
+                    const __mmask16 mask = static_cast<__mmask16>((std::uint32_t{1} << valid) - 1u);
+                    __m512 a[4];
+#pragma GCC unroll 4
+                    for (int r = 0; r < 4; ++r)
+                    {
+                        const auto *ap = activations + static_cast<std::size_t>(r) * k_stride + static_cast<std::size_t>(tail_k);
+                        if constexpr (HalfStorage)
+                            a[r] = load_gpu_aligned_expert_weight_avx512<TensorType::FP16>(ap, 0, mask);
+                        else
+                        {
+                            a[r] = _mm512_maskz_loadu_ps(mask, ap);
+                            if constexpr (HalfRNE)
+                                a[r] = _mm512_cvtph_ps(_mm512_cvtps_ph(a[r], _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+                        }
+                    }
+#pragma GCC unroll 4
+                    for (int c = 0; c < 4; ++c)
+                    {
+                        const __m512 w = load_gpu_aligned_expert_weight_avx512<WeightType>(
+                            weights,
+                            first_weight_row + static_cast<std::size_t>(c) * k_stride + static_cast<std::size_t>(tail_k),
+                            mask);
+#pragma GCC unroll 4
+                        for (int r = 0; r < 4; ++r)
+                            acc[r][c] = _mm512_fmadd_ps(a[r], w, acc[r][c]);
+                    }
+                }
+#pragma GCC unroll 4
+                for (int r = 0; r < 4; ++r)
+#pragma GCC unroll 4
+                    for (int c = 0; c < 4; ++c)
+                        _mm512_store_ps(partials[r][c] + lane_offset, acc[r][c]);
+            }
+
+            for (int r = 0; r < 4; ++r)
+                for (int c = 0; c < 4; ++c)
+                    reduced[r][c] = reduce_gpu_aligned_expert_partials_avx512(partials[r][c]);
         }
 #endif
 
@@ -1681,18 +1896,13 @@ namespace llaminar2
                 }
             }
 #endif
-            auto work = [&]()
+            auto run_tile_col = [&](int row_tile, int column)
             {
-#pragma omp for collapse(2) schedule(static)
-                for (int row_tile = 0; row_tile < row_tiles; ++row_tile)
-                {
-                    for (int column = 0; column < N; ++column)
-                    {
                         const auto span=selection ? selection->hostTileSpan(row_tile,kRowTile) :
                             ProjectionRowSpan{row_tile*kRowTile,std::min(M,(row_tile+1)*kRowTile)};
                         const int first_row=span.first;
                         const int tile_rows=span.size();
-                        if(tile_rows==0)continue;
+                        if(tile_rows==0)return;
                         std::array<float, kRowTile> reduced{};
 #if defined(__AVX512F__) && defined(__AVX512BW__)
                         if constexpr (ISA == ISALevel::AVX512)
@@ -1896,7 +2106,99 @@ namespace llaminar2
                                 C[output_index] = value;
                             }
                         }
+            };
+
+            // For large M (prefill) and wide N (e.g. 512-expert router), row-outer
+            // evicts the entire multi-MiB weight matrix B from L2 on every 4-row tile.
+            // Blocking 8 columns (40 KiB FP16) in the outer parallel axis keeps B hot
+            // in L1d/L2 across all row_tiles while calling the identical per-cell dot.
+            constexpr int kPrefillColBlock = 8;
+            const int col_blocks = (N + kPrefillColBlock - 1) / kPrefillColBlock;
+            const int workers = std::max(1, omp_in_parallel() ? omp_get_num_threads() : omp_get_max_threads());
+            const bool use_col_block_outer = (row_tiles >= 8 && col_blocks >= workers);
+
+            auto run_tile_col_range = [&](int row_tile, int col_begin, int col_end)
+            {
+                int column = col_begin;
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+                if constexpr (ISA == ISALevel::AVX512)
+                {
+                    const auto span = selection
+                        ? selection->hostTileSpan(row_tile, kRowTile)
+                        : ProjectionRowSpan{row_tile * kRowTile,
+                                            std::min(M, (row_tile + 1) * kRowTile)};
+                    if (span.size() == 4)
+                    {
+                        const int first_row = span.first;
+                        const auto *tile_activations = A + static_cast<std::size_t>(first_row) * K;
+                        for (; column + 4 <= col_end; column += 4)
+                        {
+                            float reduced4x4[4][4];
+                            dot_gpu_aligned_expert_4x4_avx512<WeightType, HalfRNE, HalfStorage>(
+                                tile_activations, B, static_cast<std::size_t>(column) * K, K, reduced4x4);
+                            for (int r = 0; r < 4; ++r)
+                            {
+                                const std::size_t row_out = static_cast<std::size_t>(first_row + r) * N;
+                                for (int c = 0; c < 4; ++c)
+                                {
+                                    const int col = column + c;
+                                    const std::size_t output_index = row_out + static_cast<std::size_t>(col);
+                                    if constexpr (HalfRNE)
+                                    {
+                                        C[output_index] = completeSkinnyMatmulValue(
+                                            reduced4x4[r][c], alpha, beta,
+                                            C + output_index, bias ? bias + col : nullptr);
+                                    }
+                                    else
+                                    {
+                                        float value = alpha * reduced4x4[r][c];
+                                        value += bias ? bias[col] : 0.0f;
+                                        if (beta != 0.0f) value += beta * C[output_index];
+                                        C[output_index] = value;
+                                    }
+                                }
+                            }
+                        }
                     }
+                }
+#endif
+                for (; column < col_end; ++column)
+                    run_tile_col(row_tile, column);
+            };
+
+            auto work = [&]()
+            {
+                if (use_col_block_outer)
+                {
+#pragma omp for schedule(static)
+                    for (int cb = 0; cb < col_blocks; ++cb)
+                    {
+                        const int col_begin = cb * kPrefillColBlock;
+                        const int col_end = std::min(col_begin + kPrefillColBlock, N);
+                        for (int row_tile = 0; row_tile < row_tiles; ++row_tile)
+                            run_tile_col_range(row_tile, col_begin, col_end);
+                    }
+                }
+                else
+                {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+                    if constexpr (ISA == ISALevel::AVX512)
+                    {
+                        const int col_tiles = (N + 3) / 4;
+                        if (row_tiles >= 4 && row_tiles * col_tiles >= workers)
+                        {
+#pragma omp for collapse(2) schedule(static)
+                            for (int row_tile = 0; row_tile < row_tiles; ++row_tile)
+                                for (int ct = 0; ct < col_tiles; ++ct)
+                                    run_tile_col_range(row_tile, ct * 4, std::min(ct * 4 + 4, N));
+                            return;
+                        }
+                    }
+#endif
+#pragma omp for collapse(2) schedule(static)
+                    for (int row_tile = 0; row_tile < row_tiles; ++row_tile)
+                        for (int column = 0; column < N; ++column)
+                            run_tile_col(row_tile, column);
                 }
             };
             OMP_WORKSHARE_REGION(work);
@@ -2057,6 +2359,97 @@ namespace llaminar2
                 return run_gpu_aligned_expert_fp32_matmul_scalar<WeightType, HalfRNE, HalfStorage>(
                     A, B, C, M, N, K, alpha, beta, bias);
             }
+        }
+
+        /**
+         * @brief Round FP32 elements in `[start, end)` to exact binary16-RNE values held in FP32.
+         *
+         * Produces the exact same bit patterns as inline `HalfRNE` conversion inside
+         * @ref dot_gpu_aligned_expert_rows_avx512, @ref dot_gpu_aligned_expert_rows_avx2, and
+         * @ref roundFloatingOperandHalfRNE, allowing multi-column M=1 projections (router,
+         * GDN alpha/beta) to convert the shared activation row once instead of per column.
+         */
+        inline void round_fp32_to_fp16_rne_as_fp32_range(
+            const float *src,
+            float *dst,
+            int start,
+            int end,
+            ISALevel isa) noexcept
+        {
+            int i = start;
+#if defined(__AVX512F__)
+            if (isa >= ISALevel::AVX512)
+            {
+                for (; i + 16 <= end; i += 16)
+                {
+                    const __m512 v = _mm512_loadu_ps(src + i);
+                    _mm512_storeu_ps(
+                        dst + i,
+                        _mm512_cvtph_ps(_mm512_cvtps_ph(v, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC)));
+                }
+            }
+#endif
+#if defined(__AVX2__) && defined(__F16C__)
+            if (isa >= ISALevel::AVX2)
+            {
+                for (; i + 8 <= end; i += 8)
+                {
+                    const __m256 v = _mm256_loadu_ps(src + i);
+                    _mm256_storeu_ps(
+                        dst + i,
+                        _mm256_cvtph_ps(_mm256_cvtps_ph(v, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC)));
+                }
+            }
+#endif
+            (void)isa;
+            for (; i < end; ++i)
+                dst[i] = roundFloatingOperandHalfRNE(src[i]);
+        }
+
+        /**
+         * @brief Evaluate one M=1 column under the exact 256-lane GPU-aligned FP32 tree.
+         *
+         * Callers with `HalfRNE` contract pre-round @p a_fp32 once via
+         * @ref round_fp32_to_fp16_rne_as_fp32_range, keeping every FMA operand and tree edge
+         * bit-for-bit identical to @ref run_gpu_aligned_expert_fp32_matmul while eliminating
+         * per-column activation conversion overhead and OpenMP barrier overhead.
+         */
+        template <TensorType WeightType>
+        inline float dot_gpu_aligned_expert_one_row(
+            const float *a_fp32,
+            const void *weights,
+            std::size_t weight_row,
+            int k,
+            ISALevel isa) noexcept
+        {
+            float out = 0.0f;
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+            if (isa >= ISALevel::AVX512)
+            {
+                dot_gpu_aligned_expert_rows_avx512<WeightType, 1, false, false>(
+                    a_fp32, weights, weight_row, k, &out);
+                return out;
+            }
+#endif
+#if defined(__AVX2__)
+            if (isa >= ISALevel::AVX2)
+            {
+                dot_gpu_aligned_expert_rows_avx2<WeightType, 1, false, false>(
+                    a_fp32, weights, weight_row, k, &out);
+                return out;
+            }
+#endif
+            (void)isa;
+            std::array<float, 1> reduced{};
+            floating_expert_numerical_contract::dotRows<1>(
+                1, k,
+                [&](int, int idx) { return a_fp32[idx]; },
+                [&](int idx) {
+                    return load_gpu_aligned_expert_weight_scalar<WeightType>(
+                        weights, weight_row + static_cast<std::size_t>(idx));
+                },
+                reduced);
+            return reduced[0];
         }
 
         /**
@@ -5322,7 +5715,8 @@ namespace llaminar2
                 const auto *weight = dynamic_cast<const FP16Tensor *>(weight_tensor_);
                 if (!weight) return false;
                 // Disabled CPU statistics must not construct allocating tag maps.
-                if (PerfStatsCollector::isDomainEnabled("kernel"))
+                if ((!omp_in_parallel() || omp_get_thread_num() == 0) &&
+                    PerfStatsCollector::isDomainEnabled("kernel"))
                 {
                     PerfStatsCollector::addCounter("kernel", "cpu_fp16_operand_compute32_calls", 1.0, "gemm", "cpu",
                         {{"m",std::to_string(m)},{"n",std::to_string(n)},{"k",std::to_string(k)},

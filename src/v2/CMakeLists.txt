@@ -1541,6 +1541,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     kernels/cpu/gemm/CPUNativeQuantisedVerifierPolicyLookup.cpp
     kernels/cpu/gemm/CPUNativeQuantisedGemmKernel.cpp
     kernels/cpu/gemm/CPUNativeQuantisedStandaloneMoE.cpp
+    kernels/cpu/gemm/CPUNativeQuantisedGroupedMoE.cpp
     backends/InventoryPrinter.cpp
     backends/PCIeEnumeration.cpp
     backends/BackendManager.cpp
@@ -1599,6 +1600,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/compute_stages/stages/GatedRMSNormStage.cpp
     execution/compute_stages/stages/GDNProjectionStage.cpp
     execution/compute_stages/stages/qwen4exp/RetainedGDNPreAttentionStage.cpp
+    execution/compute_stages/stages/qwen4exp/RetainedCPUMegakernelStages.cpp
     execution/compute_stages/stages/qwen4exp/RetainedCUDAGDNStage.cpp
     execution/compute_stages/stages/qwen4exp/RetainedCUDAQSAAttentionStage.cpp
     execution/compute_stages/stages/qwen4exp/RetainedROCmQSAAttentionStage.cpp

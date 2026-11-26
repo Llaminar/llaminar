@@ -5,6 +5,7 @@
 
 #include "GatedRMSNormStage.h"
 #include "../../../tensors/Tensors.h"
+#include "../../../utils/CPUFeatures.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/OpenMPUtils.h"
 
@@ -206,16 +207,36 @@ namespace llaminar2
                                     size_t offset, size_t norm_dim, size_t gamma_period,
                                     float eps, bool subtract_one, llaminar2::GatedNormActivation gate_activation)
     {
+        const ISALevel isa = activeISALevel();
 #if defined(__AVX512F__)
-        gated_rmsnorm_group_avx512(input_data, gate_data, gamma_data, output_data,
-                                   offset, norm_dim, gamma_period, eps, subtract_one, gate_activation);
-#elif defined(__AVX2__)
-        gated_rmsnorm_group_avx2(input_data, gate_data, gamma_data, output_data,
-                                 offset, norm_dim, gamma_period, eps, subtract_one, gate_activation);
-#else
+        if (isa >= ISALevel::AVX512)
+        {
+            gated_rmsnorm_group_avx512(input_data, gate_data, gamma_data, output_data,
+                                       offset, norm_dim, gamma_period, eps, subtract_one, gate_activation);
+            return;
+        }
+#endif
+#if defined(__AVX2__)
+        if (isa >= ISALevel::AVX2)
+        {
+            gated_rmsnorm_group_avx2(input_data, gate_data, gamma_data, output_data,
+                                     offset, norm_dim, gamma_period, eps, subtract_one, gate_activation);
+            return;
+        }
+#endif
+        (void)isa;
         gated_rmsnorm_group_scalar(input_data, gate_data, gamma_data, output_data,
                                    offset, norm_dim, gamma_period, eps, subtract_one, gate_activation);
-#endif
+    }
+
+    void applyCPUGatedRMSNormGroup(
+        const float *input_data, const float *gate_data,
+        const float *gamma_data, float *output_data,
+        size_t offset, size_t norm_dim, size_t gamma_period,
+        float eps, bool subtract_one, GatedNormActivation gate_activation)
+    {
+        gated_rmsnorm_group(input_data, gate_data, gamma_data, output_data,
+                            offset, norm_dim, gamma_period, eps, subtract_one, gate_activation);
     }
 
     GatedRMSNormStage::GatedRMSNormStage(Params params)

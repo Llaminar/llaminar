@@ -79,9 +79,14 @@ public:
     {
         const auto &id=selected.identity;const auto &main=target.identity;
         const bool embedding=role==WeightRole::Embedding;
-        // A CPU embedding owns its original native source, not a prepared
-        // allocation. Every other consumed role retains its prepared identity.
-        const bool native_cpu_embedding = embedding && device.is_cpu() && !selected.prepared;
+        // A CPU embedding owns either its original native source or its committed
+        // CPUResidentTensor owner (never a GPU PreparedEmbedding handle or packed GEMM).
+        const bool native_cpu_embedding = embedding && device.is_cpu() &&
+            (!selected.prepared ||
+             (selected.prepared->kind == PreparedWeightKind::CPUResidentTensor &&
+              selected.prepared->model_id == id.model_id &&
+              selected.prepared->binding_id == selected.binding_id &&
+              selected.prepared->device == device));
         const bool prepared_identity_valid = selected.prepared &&
             selected.prepared->model_id == id.model_id &&
             selected.prepared->binding_id == selected.binding_id && selected.prepared->device == device &&

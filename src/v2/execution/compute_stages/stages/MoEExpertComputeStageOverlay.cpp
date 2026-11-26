@@ -3019,21 +3019,21 @@ namespace llaminar2
             return false;
         }
 
-        const size_t local_elements =
-            local_record_count *
-            canonical_moe_route_record::recordWidth(params_.d_model);
-        const PerfStatsCollector::Tags tags{
-            {"stage",
-             params_.stage_name.empty() ? "unnamed" : params_.stage_name},
-            {"root", std::to_string(params_.root_participant)},
-            {"participant", std::to_string(global_tp->myIndex())},
-            {"degree", std::to_string(global_tp->degree())},
-            {"local_records", std::to_string(local_record_count)},
-            {"record_width",
-             std::to_string(
-                 canonical_moe_route_record::recordWidth(params_.d_model))}};
         if (gather_timing_enabled)
         {
+            const size_t local_elements =
+                local_record_count *
+                canonical_moe_route_record::recordWidth(params_.d_model);
+            const PerfStatsCollector::Tags tags{
+                {"stage",
+                 params_.stage_name.empty() ? "unnamed" : params_.stage_name},
+                {"root", std::to_string(params_.root_participant)},
+                {"participant", std::to_string(global_tp->myIndex())},
+                {"degree", std::to_string(global_tp->degree())},
+                {"local_records", std::to_string(local_record_count)},
+                {"record_width",
+                 std::to_string(
+                     canonical_moe_route_record::recordWidth(params_.d_model))}};
             const auto gather_finish = PerfStatsCollector::Clock::now();
             const auto gather_ns =
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -3046,21 +3046,21 @@ namespace llaminar2
                 params_.seq_len == 1 ? "decode" : "prefill",
                 params_.device_id.to_string(),
                 tags);
+            PerfStatsCollector::addCounter(
+                "moe_canonical_publication",
+                "cpu_packed_route_gather_calls",
+                1.0,
+                params_.seq_len == 1 ? "decode" : "prefill",
+                params_.device_id.to_string(),
+                tags);
+            PerfStatsCollector::addCounter(
+                "moe_canonical_publication",
+                "cpu_packed_route_gather_local_bytes",
+                static_cast<double>(local_elements * sizeof(float)),
+                params_.seq_len == 1 ? "decode" : "prefill",
+                params_.device_id.to_string(),
+                tags);
         }
-        PerfStatsCollector::addCounter(
-            "moe_canonical_publication",
-            "cpu_packed_route_gather_calls",
-            1.0,
-            params_.seq_len == 1 ? "decode" : "prefill",
-            params_.device_id.to_string(),
-            tags);
-        PerfStatsCollector::addCounter(
-            "moe_canonical_publication",
-            "cpu_packed_route_gather_local_bytes",
-            static_cast<double>(local_elements * sizeof(float)),
-            params_.seq_len == 1 ? "decode" : "prefill",
-            params_.device_id.to_string(),
-            tags);
         return true;
     }
 
@@ -3168,15 +3168,15 @@ namespace llaminar2
                       << " root=" << params_.root_participant);
             return false;
         }
-        const PerfStatsCollector::Tags broadcast_tags{
-            {"stage",
-             params_.stage_name.empty() ? "unnamed" : params_.stage_name},
-            {"root", std::to_string(params_.root_participant)},
-            {"participant", std::to_string(global_tp->myIndex())},
-            {"degree", std::to_string(global_tp->degree())},
-            {"bytes", std::to_string(element_count * sizeof(float))}};
         if (broadcast_timing_enabled)
         {
+            const PerfStatsCollector::Tags broadcast_tags{
+                {"stage",
+                 params_.stage_name.empty() ? "unnamed" : params_.stage_name},
+                {"root", std::to_string(params_.root_participant)},
+                {"participant", std::to_string(global_tp->myIndex())},
+                {"degree", std::to_string(global_tp->degree())},
+                {"bytes", std::to_string(element_count * sizeof(float))}};
             const auto broadcast_finish = PerfStatsCollector::Clock::now();
             const auto broadcast_ns =
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -3191,14 +3191,14 @@ namespace llaminar2
                 params_.seq_len == 1 ? "decode" : "prefill",
                 params_.device_id.to_string(),
                 broadcast_tags);
+            PerfStatsCollector::addCounter(
+                "moe_canonical_publication",
+                "cpu_compact_output_broadcast_calls",
+                1.0,
+                params_.seq_len == 1 ? "decode" : "prefill",
+                params_.device_id.to_string(),
+                broadcast_tags);
         }
-        PerfStatsCollector::addCounter(
-            "moe_canonical_publication",
-            "cpu_compact_output_broadcast_calls",
-            1.0,
-            params_.seq_len == 1 ? "decode" : "prefill",
-            params_.device_id.to_string(),
-            broadcast_tags);
         return true;
     }
 

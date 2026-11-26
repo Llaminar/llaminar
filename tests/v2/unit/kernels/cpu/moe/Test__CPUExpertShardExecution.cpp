@@ -371,17 +371,20 @@ void qfnOriginalClass(TensorType gateType,TensorType downType,size_t fragmentByt
     preparedNativeMatrix({gate.create,gate.create,down.create},{gateFormat,gateFormat,downFormat},2560,640,fragmentBytes,packed);
 }
 }
-/** @test The43-layer original Q4_K/Q5_1 class executes native320+320 fragments. */
+/** @test The43-layer original Q4_K/Q5_1 class executes native320+320 compact nibble/5-bit fragments. */
 TEST(CPUExpertShardExecution, QFNOriginalMixedFormatsAndNative320Cuts) {
-    recordReplayScope();qfnOriginalClass(TensorType::Q4_K,TensorType::Q5_1,2105344);
+    // 2x Q4_K compact nibble-LUT (512,000 B each) + 1x Q5_1 compact 5-bit (614,400 B) = 1,638,400 B.
+    recordReplayScope();qfnOriginalClass(TensorType::Q4_K,TensorType::Q5_1,1638400);
 }
 /** @test The4-layer original Q4_K/Q8_0 class retains its distinct physical representation. */
 TEST(CPUExpertShardExecution, QFNOriginalQ4KQ8_0Native320Cuts) {
-    recordReplayScope();qfnOriginalClass(TensorType::Q4_K,TensorType::Q8_0,2052096);
+    // 2x Q4_K compact nibble-LUT (512,000 B each) + 1x Q8_0 (872,448 B) = 1,896,448 B.
+    recordReplayScope();qfnOriginalClass(TensorType::Q4_K,TensorType::Q8_0,1896448);
 }
 /** @test The1-layer original Q5_K/Q8_0 class cannot borrow the common class byte quote. */
 TEST(CPUExpertShardExecution, QFNOriginalQ5KQ8_0Native320Cuts) {
-    recordReplayScope();qfnOriginalClass(TensorType::Q5_K,TensorType::Q8_0,2871296);
+    // 2x Q5_K compact 5-bit (614,400 B each) + 1x Q8_0 (872,448 B) = 2,101,248 B.
+    recordReplayScope();qfnOriginalClass(TensorType::Q5_K,TensorType::Q8_0,2101248);
 }
 } // namespace llaminar2::test
 
@@ -408,9 +411,9 @@ TEST(CPUExpertShardExecution, PreparedPackedSourceRecordsAllFormatsAndPhases) {
 }
 TEST(CPUExpertShardExecution, PreparedPackedQFNMixedClasses) {
     recordReplayScope();
-    qfnOriginalClass(TensorType::Q4_K,TensorType::Q5_1,2105344,true);
-    qfnOriginalClass(TensorType::Q4_K,TensorType::Q8_0,2052096,true);
-    qfnOriginalClass(TensorType::Q5_K,TensorType::Q8_0,2871296,true);
+    qfnOriginalClass(TensorType::Q4_K,TensorType::Q5_1,1638400,true);
+    qfnOriginalClass(TensorType::Q4_K,TensorType::Q8_0,1896448,true);
+    qfnOriginalClass(TensorType::Q5_K,TensorType::Q8_0,2101248,true);
 }
 } // namespace llaminar2::test
 

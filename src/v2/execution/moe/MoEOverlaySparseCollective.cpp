@@ -9,6 +9,7 @@
  */
 
 #include "execution/moe/MoEOverlaySparseCollective.h"
+#include "execution/moe/MoEOverlayHostRowWork.h"
 #include "../../utils/OpenMPUtils.h"
 #include "execution/moe/MoEOverlayActivationPacketABI.h"
 #include "execution/local_execution/graph/IGraphBuilder.h"
@@ -1230,11 +1231,11 @@ namespace llaminar2
         // Validation precedes all stores. Copy raw FP32 bytes without weighting
         // or reduction, so the original continuation's ordered FMA remains the
         // sole top-k arithmetic authority. Inactive packet tails are untouched.
-        for(size_t entry=0;entry<count;++entry) {
+        forEachMoEOverlayHostRow(count, width * sizeof(float), [&](size_t entry) {
             const auto slot=input.original_route_slots_host[entry];
             output.row_ids_host[entry]=slot;
             std::copy_n(source.data()+static_cast<size_t>(slot)*width,width,output.output_rows_fp32+entry*width);
-        }
+        });
         output.key=input.key;
         output.residency_epoch=input.residency_epoch;
         output.source_participant=input.target_participant;output.target_participant=input.source_participant;

@@ -639,7 +639,16 @@ namespace
             return false;
         }
 
-        MoEExpertDispatchOutput result;
+        MoEExpertDispatchOutput &result = scratch_output_;
+        struct ScratchLeaseGuard
+        {
+            MoEExpertDispatchOutput &buf;
+            ~ScratchLeaseGuard()
+            {
+                buf.residency_lease.reset();
+                buf.ticket_lifetime.reset();
+            }
+        } scratch_lease_guard{result};
         result.seq_len = params_.seq_len;
         result.logical_seq_len = logical_seq_len;
         result.top_k = params_.top_k;
@@ -648,25 +657,33 @@ namespace
         result.ticket_lifetime = params_.ticket_storage;
         result.residency_epoch = residency_epoch;
         result.residency_lease = std::move(residency_lease);
-        result.tiers.reserve(routed_tiers.size());
+        if (result.tiers.size() != routed_tiers.size())
+            result.tiers.resize(routed_tiers.size());
         for (size_t tier_index = 0; tier_index < routed_tiers.size(); ++tier_index)
         {
             const auto &tier = routed_tiers[tier_index];
-            MoEExpertTierDispatch tier_dispatch;
+            auto &tier_dispatch = result.tiers[tier_index];
             tier_dispatch.tier_index = static_cast<int>(tier_index);
             tier_dispatch.tier_name = tier.name;
             tier_dispatch.domain = tier.domain;
             tier_dispatch.fallback = tier.fallback;
-            result.tiers.push_back(std::move(tier_dispatch));
+            tier_dispatch.entries.clear();
+            tier_dispatch.token_rows.clear();
+            tier_dispatch.transfer_required = false;
+            tier_dispatch.transfer_mode = MoEExpertTransferMode::None;
+            tier_dispatch.transfer_volume = {};
         }
 
-        std::vector<std::vector<unsigned char>> seen_token_rows(
-            routed_tiers.size(),
-            std::vector<unsigned char>(static_cast<size_t>(logical_seq_len), 0));
+        if (scratch_seen_token_rows_.size() != routed_tiers.size())
+            scratch_seen_token_rows_.resize(routed_tiers.size());
+        for (auto &seen_vec : scratch_seen_token_rows_)
+            seen_vec.assign(static_cast<size_t>(logical_seq_len), 0);
+        auto &seen_token_rows = scratch_seen_token_rows_;
 
         // One immutable cohort per addressed layer/tier is validated once;
         // route entries retain their original lease rather than a scalar owner.
-        std::vector<const MoEExpertShardCohort*> validated_cohorts(routed_tiers.size(), nullptr);
+        scratch_validated_cohorts_.assign(routed_tiers.size(), nullptr);
+        auto &validated_cohorts = scratch_validated_cohorts_;
         for (int token_row = 0; token_row < logical_seq_len; ++token_row)
         {
             for (int route_slot = 0; route_slot < params_.top_k; ++route_slot)
@@ -941,7 +958,10 @@ namespace
                 tags);
         }
 
-        *params_.output = std::move(result);
+        // Release any stale lease retained in the previous scratch swap, then atomically commit.
+        std::swap(*params_.output, result);
+        result.residency_lease.reset();
+        result.ticket_lifetime.reset();
         return true;
     }
 

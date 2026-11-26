@@ -355,20 +355,51 @@ namespace llaminar2::cpu::native_quantised
             const std::int64_t k_parallel_threshold =
                 static_cast<std::int64_t>(num_threads) *
                 (compute_bound ? 2 : 1);
+            // Severely N-starved long-K shapes (e.g. QFN HC down-projection
+            // 320x10240: N_chunks=5, bpr=320, 6.55M FLOPs) leave most physical
+            // cores idle without K-parallel while their partial reduction buffer
+            // (k_tiles * N floats) is tiny (<16 KiB). Use target_multiplier=1 so
+            // K-tiles only fill the physical team without over-splitting K.
+            const bool severely_n_starved_long_k =
+                (total_n_tasks * 2 <= static_cast<std::int64_t>(num_threads)) &&
+                (blocks_per_row >= DEFAULT_MIN_BPR) &&
+                (total_flops >= 4'000'000LL);
             const std::int64_t target_multiplier =
-                compute_bound ? 8 : 1; // tasks/thread target
+                (total_flops >= MIN_FLOPS_FOR_K_PARALLEL && compute_bound) ? 8 : 1;
 
             if (total_n_tasks < k_parallel_threshold && blocks_per_row >= min_bpr
-                && total_flops >= MIN_FLOPS_FOR_K_PARALLEL)
+                && (total_flops >= MIN_FLOPS_FOR_K_PARALLEL || severely_n_starved_long_k))
             {
                 const std::int64_t desired_total =
                     static_cast<std::int64_t>(num_threads) *
                     target_multiplier;
-                const std::int64_t desired_k_tiles =
+                std::int64_t desired_k_tiles =
                     std::max<std::int64_t>(
                         1,
                         (desired_total + total_n_tasks - 1) /
                             total_n_tasks);
+                // When targeting a single wave (`target_multiplier == 1`, e.g.
+                // severely N-starved long-K projections like HC down [320, 10240]
+                // with 5 N-chunks on 28 threads), ceiling division creates a tiny
+                // second wave (30 tasks -> 28 + 2, 1.69x critical-path slowdown).
+                // Pick floor K-tiles whenever its single-wave peak K-blocks per
+                // worker beats or equals the multi-wave ceiling peak.
+                if (target_multiplier == 1 && total_n_tasks > 0 &&
+                    desired_k_tiles * total_n_tasks > desired_total)
+                {
+                    const std::int64_t floor_k_tiles = desired_total / total_n_tasks;
+                    if (floor_k_tiles >= 1)
+                    {
+                        const std::int64_t ceil_waves =
+                            (desired_k_tiles * total_n_tasks + desired_total - 1) / desired_total;
+                        const std::int64_t ceil_peak =
+                            ceil_waves * ((blocks_per_row + desired_k_tiles - 1) / desired_k_tiles);
+                        const std::int64_t floor_peak =
+                            (blocks_per_row + floor_k_tiles - 1) / floor_k_tiles;
+                        if (floor_peak <= ceil_peak)
+                            desired_k_tiles = floor_k_tiles;
+                    }
+                }
                 const int max_k_tiles =
                     std::max(1, blocks_per_row / MIN_K_BLOCKS_PER_TILE);
                 cfg.k_tiles = static_cast<int>(

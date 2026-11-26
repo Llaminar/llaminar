@@ -186,14 +186,36 @@ inline void cpuQ8ResidualProjectionWorkshare(const CPUNativeQuantisedPackedWeigh
  float*output,int live,std::span<const Q8_1Block>primary,std::span<const Q8_1Block>residual,CPUQ8ResidualISA avx512) {
  const int n=packed.N,bpr=packed.blocks_per_row;
  const std::int64_t tiles=(static_cast<std::int64_t>(live)+1)/2,chunks=(static_cast<std::int64_t>(n)+63)/64;
+ // For single-row M=1 projections (e.g. HC up with bpr=10 = 360B/bank), copy
+ // the freshly published Q8 banks once into thread-private stack storage in
+ // staggered order so all workers read from private L1d instead of contending
+ // on writer-private Modified cache lines across the non-inclusive L3 mesh.
+ constexpr int kMaxLocalBlocks = 128;
+ alignas(64) Q8_1Block local_primary[kMaxLocalBlocks];
+ alignas(64) Q8_1Block local_residual[kMaxLocalBlocks];
+ const Q8_1Block *primary_base = primary.data();
+ const Q8_1Block *residual_base = residual.data();
+ if (live == 1 && bpr > 0 && bpr <= kMaxLocalBlocks && omp_get_num_threads() > 1) {
+  const int tid = omp_get_thread_num();
+  const int nt = omp_get_num_threads();
+  const int start = (tid * bpr) / nt;
+  for (int step = 0; step < bpr; ++step) {
+   int idx = start + step;
+   if (idx >= bpr) idx -= bpr;
+   local_primary[idx] = primary_base[idx];
+   local_residual[idx] = residual_base[idx];
+  }
+  primary_base = local_primary;
+  residual_base = local_residual;
+ }
 #pragma omp for schedule(static)
   for(std::int64_t task=0;task<tiles*chunks;++task) {
    const auto row=task%tiles*2,chunk=task/tiles;
    const int valid=std::min<std::int64_t>(64,n-chunk*64);
 #if defined(__aarch64__) && defined(__ARM_NEON)
    const bool second=row+1<live;
-   cpuNativeResidualChunk(packed,primary.data()+row*bpr,residual.data()+row*bpr,
-     second?primary.data()+(row+1)*bpr:nullptr,second?residual.data()+(row+1)*bpr:nullptr,
+   cpuNativeResidualChunk(packed,primary_base+row*bpr,residual_base+row*bpr,
+     second?primary_base+(row+1)*bpr:nullptr,second?residual_base+(row+1)*bpr:nullptr,
      output+row*n+chunk*64,second?output+(row+1)*n+chunk*64:nullptr,chunk,valid,avx512);
 #else
    // Preserve the original Q8_0 kernel and its register-store fold exactly.
@@ -202,16 +224,16 @@ inline void cpuQ8ResidualProjectionWorkshare(const CPUNativeQuantisedPackedWeigh
       packed.is_asymmetric||!(packed.usesExpandedInt8()||packed.usesUnsignedInt8()))
    {
     const bool second=row+1<live;
-    cpuNativeResidualChunk(packed,primary.data()+row*bpr,residual.data()+row*bpr,
-      second?primary.data()+(row+1)*bpr:nullptr,second?residual.data()+(row+1)*bpr:nullptr,
+    cpuNativeResidualChunk(packed,primary_base+row*bpr,residual_base+row*bpr,
+      second?primary_base+(row+1)*bpr:nullptr,second?residual_base+(row+1)*bpr:nullptr,
       output+row*n+chunk*64,second?output+(row+1)*n+chunk*64:nullptr,chunk,valid,avx512);
     continue;
    }
    float *destination0=output+row*n+chunk*64;
 #if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
    if(avx512&&row+1<live) {
-    gemm_4row_non_nibble_2z_chunk<true>(packed,primary.data()+row*bpr,residual.data()+row*bpr,
-      primary.data()+(row+1)*bpr,residual.data()+(row+1)*bpr,
+    gemm_4row_non_nibble_2z_chunk<true>(packed,primary_base+row*bpr,residual_base+row*bpr,
+      primary_base+(row+1)*bpr,residual_base+(row+1)*bpr,
       destination0,nullptr,destination0+n,nullptr,chunk,0,bpr,false);
     continue;
    }
@@ -219,11 +241,11 @@ inline void cpuQ8ResidualProjectionWorkshare(const CPUNativeQuantisedPackedWeigh
    for(auto current=row;current<std::min<std::int64_t>(row+2,live);++current) {
     float*destination=destination0+(current-row)*n;
 #if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
-    if(avx512)gemm_2row_non_nibble_chunk<true>(packed,primary.data()+current*bpr,residual.data()+current*bpr,
+    if(avx512)gemm_2row_non_nibble_chunk<true>(packed,primary_base+current*bpr,residual_base+current*bpr,
       destination,nullptr,chunk,0,bpr,false);
     else
 #endif
-      gemm_2row_non_nibble_chunk_avx2<true>(packed,primary.data()+current*bpr,residual.data()+current*bpr,
+      gemm_2row_non_nibble_chunk_avx2<true>(packed,primary_base+current*bpr,residual_base+current*bpr,
         destination,nullptr,chunk,0,bpr,false);
    }
 #endif
@@ -289,7 +311,11 @@ inline void cpuQ8ResidualCorrectedProjectionImpl(const CPUNativeQuantisedPackedW
  // contending on the compact36-byte Q8 bank cache lines. Ordinary already-
  // activated publication keeps one task per row and its original block loop.
  constexpr bool hcPublication=std::is_same_v<Publication,HCDownQ8Publication>;
- const std::int64_t publicationTilesPerRow=hcPublication?(static_cast<std::int64_t>(bpr)+7)/8:1;
+ // For single-row M=1 HC decode (e.g. bpr=10, K=320), split across 2-block
+ // (72-byte) pairs so 5 workers quantize in parallel with minimal cache-line
+ // sharing instead of serializing 8+2 blocks onto only 2 cores.
+ const int hcBlocksPerTask=(hcPublication && live==1 && bpr>2)?2:8;
+ const std::int64_t publicationTilesPerRow=hcPublication?(static_cast<std::int64_t>(bpr)+hcBlocksPerTask-1)/hcBlocksPerTask:1;
  // Only completion status is shared here. Validation reads finish before
  // the last team edge; no caller rescans a bank already released for reuse.
  std::atomic<bool> failed{false};
@@ -302,8 +328,8 @@ inline void cpuQ8ResidualCorrectedProjectionImpl(const CPUNativeQuantisedPackedW
 #pragma omp for schedule(static)
   for(std::int64_t task=0;task<static_cast<std::int64_t>(live)*publicationTilesPerRow;++task) {
    const auto row=task/publicationTilesPerRow;
-   const int firstBlock=hcPublication?static_cast<int>(task%publicationTilesPerRow)*8:0;
-   const int lastBlock=hcPublication?std::min(firstBlock+8,bpr):bpr;
+   const int firstBlock=hcPublication?static_cast<int>(task%publicationTilesPerRow)*hcBlocksPerTask:0;
+   const int lastBlock=hcPublication?std::min(firstBlock+hcBlocksPerTask,bpr):bpr;
    if constexpr(std::is_same_v<Publication,HCDownQ8Publication>) {
     //256 and every admitted K are multiples of32, hence each SIMD vector has
     // the same original row/channel boundary. Exact input/activated alias is

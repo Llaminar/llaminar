@@ -997,14 +997,17 @@ namespace llaminar2
             }
             const uint64_t epoch = params_.dispatch_output->residency_epoch;
             params_.dispatch_output->residency_lease.reset();
-            PerfStatsCollector::addCounter(
-                "moe_overlay_residency",
-                "dispatch_epoch_releases",
-                1.0,
-                params_.seq_len == 1 ? "decode" : "prefill",
-                params_.device_id.toString(),
-                {{"epoch", std::to_string(epoch)},
-                 {"layer", std::to_string(params_.key.layer_idx)}});
+            if (PerfStatsCollector::isDomainEnabled("moe_overlay_residency"))
+            {
+                PerfStatsCollector::addCounter(
+                    "moe_overlay_residency",
+                    "dispatch_epoch_releases",
+                    1.0,
+                    params_.seq_len == 1 ? "decode" : "prefill",
+                    params_.device_id.toString(),
+                    {{"epoch", std::to_string(epoch)},
+                     {"layer", std::to_string(params_.key.layer_idx)}});
+            }
         }
         return true;
     }

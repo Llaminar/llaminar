@@ -428,8 +428,17 @@ TEST(CPUJointSerialGeometry, BoundAutoCPUExpertDomainMatchesNativeQuoteInBothRan
             {reverse ? 0 : 1, GlobalDeviceAddress::cpu(1,"original-node")}};
         const auto automatic = NativeCPUCollectiveProgram::forBoundExpertShardDomain(
             1, CollectiveBackendType::AUTO, members);
+        // Same-node multi-rank CPU expert domains resolve AUTO to UPI so the
+        // PMA BOM includes ShmemSpinArena and runtime uses ShmemSpinBackend.
         EXPECT_EQ(automatic, NativeCPUCollectiveProgram::expertShardRoutePartials(
-            1, CollectiveBackendType::MPI, members));
+            1, CollectiveBackendType::UPI, members));
+        const std::vector<NativeCPUCollectiveProgram::Participant> cross_node_members{
+            {reverse ? 1 : 0, GlobalDeviceAddress::cpu(0,"original-node-a")},
+            {reverse ? 0 : 1, GlobalDeviceAddress::cpu(0,"original-node-b")}};
+        EXPECT_EQ(NativeCPUCollectiveProgram::forBoundExpertShardDomain(
+            1, CollectiveBackendType::AUTO, cross_node_members),
+            NativeCPUCollectiveProgram::expertShardRoutePartials(
+                1, CollectiveBackendType::MPI, cross_node_members));
         EXPECT_EQ(automatic.participants().front().world_rank, members.front().world_rank);
         EXPECT_EQ(automatic.participants().front().address.numa_node, 0);
         for (const auto backend : {CollectiveBackendType::UPI,CollectiveBackendType::MPI})

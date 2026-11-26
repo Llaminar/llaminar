@@ -27,6 +27,7 @@
 #include "../../cpu/primitives/VectorPrimitives.h"
 #include "../gemm/CPUNativeQuantisedGemv.h"
 #include "../gemm/FloatingPointGemmKernel.h"
+#include "../../../utils/CPUFeatures.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/OpenMPUtils.h"
 #include "../../../utils/PerfStatsCollector.h"
@@ -35,6 +36,9 @@
 #include <atomic>
 #include <cmath>
 #include <cstring>
+#if defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#endif
 #include <limits>
 #include <numeric>
 #include <stdexcept>
@@ -1372,6 +1376,97 @@ namespace llaminar2
                 float *out = shared_output + t * d_model;
                 primitives::vec_scale(out, gate, d_model);
             }
+        };
+        OMP_WORKSHARE_REGION(do_work);
+    }
+
+    namespace
+    {
+        inline void applySharedExpertGateAddRow(
+            float *shared_row,
+            const float *residual_row,
+            float *combined_row,
+            float gate,
+            int d_model,
+            ISALevel isa) noexcept
+        {
+            int j = 0;
+#if defined(__AVX512F__)
+            if (isa >= ISALevel::AVX512)
+            {
+                const __m512 vgate = _mm512_set1_ps(gate);
+                for (; j + 16 <= d_model; j += 16)
+                {
+                    // Keep multiply and add separate to match the IEEE-754
+                    // two-rounding contract of IMoEKernel::sharedExpertGateAddFromTensors.
+                    const __m512 gated = _mm512_mul_ps(vgate, _mm512_loadu_ps(shared_row + j));
+                    _mm512_storeu_ps(shared_row + j, gated);
+                    _mm512_storeu_ps(combined_row + j,
+                                     _mm512_add_ps(_mm512_loadu_ps(residual_row + j), gated));
+                }
+            }
+#endif
+#if defined(__AVX2__)
+            if (isa >= ISALevel::AVX2)
+            {
+                const __m256 vgate = _mm256_set1_ps(gate);
+                for (; j + 8 <= d_model; j += 8)
+                {
+                    const __m256 gated = _mm256_mul_ps(vgate, _mm256_loadu_ps(shared_row + j));
+                    _mm256_storeu_ps(shared_row + j, gated);
+                    _mm256_storeu_ps(combined_row + j,
+                                     _mm256_add_ps(_mm256_loadu_ps(residual_row + j), gated));
+                }
+            }
+#endif
+            (void)isa;
+            for (; j < d_model; ++j)
+            {
+                const float gated = gate * shared_row[j];
+                shared_row[j] = gated;
+                combined_row[j] = residual_row[j] + gated;
+            }
+        }
+    } // namespace
+
+    void CPUMoEKernel::sharedExpertGateAddFromTensors(
+        ITensor *input, ITensor *gate_inp, ITensor *shared_output,
+        ITensor *routed_residual, ITensor *combined_output,
+        int seq_len, int d_model)
+    {
+        const float *input_data = input->data();
+        const float *gate_data = gate_inp->data();
+        float *shared_data = shared_output->mutable_data();
+        const float *residual_data = routed_residual->data();
+        float *combined_data = combined_output->mutable_data();
+        const ISALevel isa = activeISALevel();
+
+        auto run_row = [=](int t) noexcept
+        {
+            const size_t row_offset = static_cast<size_t>(t) * static_cast<size_t>(d_model);
+            const float dot = primitives::vec_dot(gate_data, input_data + row_offset, d_model);
+            const float gate = 1.0f / (1.0f + std::exp(-dot));
+            applySharedExpertGateAddRow(
+                shared_data + row_offset,
+                residual_data + row_offset,
+                combined_data + row_offset,
+                gate,
+                d_model,
+                isa);
+        };
+
+        if (seq_len <= 2)
+        {
+            for (int t = 0; t < seq_len; ++t)
+                run_row(t);
+            return;
+        }
+
+        auto do_work = [=]()
+        {
+#pragma omp for schedule(static)
+            for (int t = 0; t < seq_len; ++t)
+                run_row(t);
         };
         OMP_WORKSHARE_REGION(do_work);
     }

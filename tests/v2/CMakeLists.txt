@@ -15284,12 +15284,12 @@ add_v2_test(V2_Unit_GraphComposer
     LABELS "V2;Unit;Execution;ComputeGraph;GraphComposer;Contract;DAG"
     MPI_PROCS 1
 )
-add_v2_test(V2_Contract_GraphComposerDeclarativeInvariants
+add_v2_test(V2_Integration_Contract_GraphComposerDeclarativeInvariants
     COMMAND $<TARGET_FILE:v2_test_graph_composer>
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Execution;Contract;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
     ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
-list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Contract_GraphComposerDeclarativeInvariants)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_Contract_GraphComposerDeclarativeInvariants)
 
 # Test: IGraphBuilder interface and MockGraphBuilder
 # Part of Phase 5: Declarative QwenStandardGraph refactoring - Interface extraction
@@ -43098,6 +43098,7 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/V2CUDANativeProgramStackTests.cmake)
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/V2ExpertTierRectangularWeightTests.cmake)
 
 include(cmake/V2CPUShardRouteCollectiveTests.cmake)
+include(cmake/V2RetainedCPUMegakernelTests.cmake)
 
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/V2NativeCPUCollectiveProgramTests.cmake)
 

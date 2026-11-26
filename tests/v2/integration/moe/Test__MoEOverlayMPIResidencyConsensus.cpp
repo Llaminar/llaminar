@@ -1071,7 +1071,7 @@ namespace llaminar2::test
             packed.blocks_per_row = 2;
             packed.codebook_id = native_quantised_formats::Q4_0.codebook_id;
             packed.payload_bytes = 16;
-            packed.encoding = CPUNativeQuantisedEncoding::NibbleLUT;
+            packed.encoding = preparedEncodingForCodebook(packed.codebook_id);
             packed.is_asymmetric = false;
             packed.is_superblock = false;
             packed.data_stride = static_cast<int>(
@@ -1143,7 +1143,7 @@ namespace llaminar2::test
             const cpu::native_quantised::CPUNativeQuantisedPackedWeights& packed,std::span<const uint8_t> initial)
         {
             if(packed.codebook_id!=native_quantised_formats::Q4_0.codebook_id || packed.is_superblock ||
-               packed.encoding!=cpu::native_quantised::CPUNativeQuantisedEncoding::NibbleLUT || initial.size()!=packed.native_interleaved.size())
+               packed.encoding!=cpu::native_quantised::preparedEncodingForCodebook(packed.codebook_id) || initial.size()!=packed.native_interleaved.size())
                 throw std::logic_error("Independent MPI recipient oracle requires its declared Q4_0 fixture");
             std::vector<uint8_t> expected(initial.begin(),initial.end());
             for(int n=0;n<packed.N;++n)for(int kb=0;kb<packed.blocks_per_row;++kb) {
@@ -1509,7 +1509,7 @@ namespace llaminar2::test
                 const auto* packed=engine?engine->exportCPUNativeQuantisedPackedWeights():nullptr;
                 if(!packed || packed->N!=original_specs[role].N || packed->K!=original_specs[role].K ||
                    packed->codebook_id!=native_quantised_formats::Q4_0.codebook_id || packed->is_superblock ||
-                   packed->encoding!=cpu::native_quantised::CPUNativeQuantisedEncoding::NibbleLUT)return false;
+                   packed->encoding!=cpu::native_quantised::preparedEncodingForCodebook(packed->codebook_id))return false;
                 std::vector<uint8_t> original(packed->native_interleaved.size());
                 for(size_t byte=0;byte<original.size();++byte)original[byte]=uint8_t(seed+uint8_t(byte*13u));
                 const auto layout=cpuLiveWireLayout(*packed);
@@ -1826,8 +1826,8 @@ namespace llaminar2::test
             0xa5u);
         const auto initial_recipient=received_from_peer;
         const auto zero_wire=cpuLiveWireOracle(rank_zero_source),one_wire=cpuLiveWireOracle(rank_one_source);
-        ASSERT_EQ(zero_wire.size(),1280u);ASSERT_EQ(one_wire.size(),1280u);
-        ASSERT_EQ(rank_zero_source.native_interleaved.size(),2560u);
+        ASSERT_EQ(zero_wire.size(),1152u);ASSERT_EQ(one_wire.size(),1152u);
+        ASSERT_EQ(rank_zero_source.native_interleaved.size(),2304u);
         EXPECT_EQ(zero_manifest.total_bytes,zero_wire.size());EXPECT_EQ(one_manifest.total_bytes,one_wire.size());
         const auto source_lifetime = std::make_shared<int>(41);
         const auto destination_lifetime = std::make_shared<int>(73);
@@ -2065,10 +2065,10 @@ namespace llaminar2::test
             context->rank() == 0 ? 1u : 2u);
         EXPECT_EQ(stats.operations_completed, 2u);
         EXPECT_EQ(stats.operations_aborted, 1u);
-        //97-byte lane fits one4-column Q4_0 unit (80 bytes);16 units
-        // must each finish the existing send/ACK before the staging slice is reused.
-        EXPECT_EQ(stats.chunks_sent,16u);
-        EXPECT_EQ(stats.chunks_received,16u);
+        // 97-byte lane fits one 5-column UnsignedNibble Q4_0 unit (90 bytes); 14 units
+        // (ceil(32/5)*2 blocks) must each finish the existing send/ACK before staging reuse.
+        EXPECT_EQ(stats.chunks_sent,14u);
+        EXPECT_EQ(stats.chunks_received,14u);
         EXPECT_EQ(stats.bytes_sent,sent_wire.size());
         EXPECT_EQ(stats.bytes_received,received_wire.size());
         EXPECT_EQ(stats.mpi_failures, 0u);
@@ -2328,8 +2328,8 @@ namespace llaminar2::test
         for (const auto &group : seen) for (const bool present : group) EXPECT_TRUE(present);
         const auto stats = transport.stats();
         EXPECT_EQ(stats.operations_completed, epochs);
-        EXPECT_EQ(stats.bytes_sent, epochs / 2u * 1280u);
-        EXPECT_EQ(stats.bytes_received, epochs / 2u * 1280u);
+        EXPECT_EQ(stats.bytes_sent, epochs / 2u * 1152u);
+        EXPECT_EQ(stats.bytes_received, epochs / 2u * 1152u);
         EXPECT_EQ(stats.protocol_failures, 0u);
         EXPECT_EQ(stats.mpi_failures, 0u);
         EXPECT_EQ(stats.inference_stream_waits, 0u);
@@ -2366,7 +2366,7 @@ namespace llaminar2::test
             source_projection.native_interleaved.size(), 0xa5u);
         const auto initial_recipient=destination_bytes;
         const auto source_wire=cpuLiveWireOracle(source_projection);
-        ASSERT_EQ(source_wire.size(),1280u);
+        ASSERT_EQ(source_wire.size(),1152u);
         EXPECT_EQ(manifest.total_bytes,source_wire.size());
         const auto source_lifetime = std::make_shared<int>(19);
         const auto destination_lifetime = std::make_shared<int>(23);
@@ -2413,8 +2413,8 @@ namespace llaminar2::test
         const auto stats = transport.stats();
         EXPECT_EQ(stats.bytes_sent,context->rank()==0?source_wire.size():0u);
         EXPECT_EQ(stats.bytes_received,context->rank()==1?source_wire.size():0u);
-        EXPECT_EQ(stats.chunks_sent,context->rank()==0?16u:0u);
-        EXPECT_EQ(stats.chunks_received,context->rank()==1?16u:0u);
+        EXPECT_EQ(stats.chunks_sent,context->rank()==0?14u:0u);
+        EXPECT_EQ(stats.chunks_received,context->rank()==1?14u:0u);
         EXPECT_EQ(stats.wave_reservations_started, 1u);
         EXPECT_EQ(stats.wave_reservations_failed, 0u);
         EXPECT_EQ(stats.operations_completed, 1u);
@@ -2777,7 +2777,7 @@ namespace llaminar2::test
             const auto* packed=engine->exportCPUNativeQuantisedPackedWeights();ASSERT_NE(packed,nullptr);
             live_expert_bytes+=cpuLiveWireOracle(*packed).size();
         }
-        EXPECT_EQ(live_expert_bytes,3840u); //1280 live bytes per Gate/Up/Down projection.
+        EXPECT_EQ(live_expert_bytes,3456u); //1152 live bytes per UnsignedNibble Q4_0 Gate/Up/Down projection.
         EXPECT_EQ(projection_stats.bytes_sent,live_expert_bytes);
         EXPECT_EQ(
             projection_stats.bytes_sent,

@@ -972,10 +972,11 @@ namespace llaminar2::cpu::native_quantised
                 "CPU NativeQuantised M=1 decode requires AVX2 or AVX512");
 
         generated::CPUNativeQuantisedDecodePolicy generated_policy{};
+        const int workers = nativeQuantisedInvocationWorkerCount();
         if (generated::selectCPUNativeQuantisedDecodeGeneratedPolicy(
                 build_isa,
                 runtime_isa,
-                nativeQuantisedInvocationWorkerCount(),
+                workers,
                 packed.codebook_id,
                 N,
                 K,
@@ -983,14 +984,44 @@ namespace llaminar2::cpu::native_quantised
                 serial_k_tiles,
                 generated_policy))
         {
-            return resolveGeneratedDecodeSchedulePolicy(
-                generated_policy,
-                DecodeScheduleGeometry{
-                    .n = N,
-                    .k = K,
-                    .k_tiles = serial_k_tiles,
-                    .threads = nativeQuantisedInvocationWorkerCount(),
-                });
+            const DecodeScheduleGeometry geom{
+                .n = N,
+                .k = K,
+                .k_tiles = serial_k_tiles,
+                .threads = workers,
+            };
+            DecodeSchedulePolicy effective =
+                resolveGeneratedDecodeSchedulePolicy(generated_policy, geom);
+            // Multi-layer production models stream hundreds of megabytes of
+            // weights per token from cold DRAM. Hot-L3 single-matrix tuning
+            // records can pick Nbc8/Nbc16 on medium matrices (e.g., 320x10240
+            // or 640x2560), serializing cold DRAM reads onto 1-4 cores. For
+            // matrices >= 1M elements (~0.5-1.0 MiB+ weights), narrow Auto
+            // schedules toward Nbc1 until available N*K_tile parallelism fills
+            // the physical worker budget without altering arithmetic order.
+            constexpr std::int64_t kColdDramMinParallelElements = 512LL * 1024LL;
+            if (static_cast<std::int64_t>(N) * static_cast<std::int64_t>(K) >=
+                    kColdDramMinParallelElements &&
+                workers > 1)
+            {
+                const std::int64_t n_chunks =
+                    (static_cast<std::int64_t>(N) + 63) / 64;
+                const std::int64_t physical_k_tiles =
+                    std::max<std::int64_t>(1, serial_k_tiles);
+                const std::int64_t target_tasks = std::min<std::int64_t>(
+                    workers, n_chunks * physical_k_tiles);
+                auto tasks_for = [&](DecodeSchedulePolicy candidate)
+                {
+                    const std::int64_t width = decodeScheduleNBlockChunks(candidate);
+                    return ((n_chunks + width - 1) / width) * physical_k_tiles;
+                };
+                while (tasks_for(effective) < target_tasks &&
+                       effective != DecodeSchedulePolicy::Nbc1)
+                {
+                    effective = narrowerDecodeSchedulePolicy(effective);
+                }
+            }
+            return effective;
         }
         throw std::runtime_error(
             std::string("No certified CPU NativeQuantised M=1 decode policy for build=") +
@@ -4870,6 +4901,8 @@ namespace llaminar2::cpu::native_quantised
         for (int k_tile = 0; k_tile < k_tiles; ++k_tile)
         {
             const int kb_start = k_tile * k_blocks_per_tile;
+            if (kb_start >= K_blocks)
+                break;
             const int kb_end = std::min(
                 kb_start + k_blocks_per_tile, K_blocks);
             gemv_native_quantised_avx512_chunk_non_nibble(

@@ -1760,7 +1760,7 @@ namespace llaminar2
                 device,
                 sequence_lengths_device);
         std::string terminal_node = addWoAllreduce(
-            graph, prefix, buffers, gdn_layer->ssm_out,
+            graph, prefix, buffers, gdn_layer->ssm_out, layer_bindings.ssm_out,
             total_tokens, layer_idx, device,
             local_projection_ready,
             "gdn_wo_allreduce");
@@ -2229,7 +2229,7 @@ namespace llaminar2
                 layer_idx, seq_len, batch_size, device, sequence_lengths_device,
                 prefix + "attn_output_gate");
         std::string terminal = addWoAllreduce(
-            graph, prefix, buffers, layer.wo,
+            graph, prefix, buffers, layer.wo, wo_binding,
             total_tokens, layer_idx, device, wo_projection, "wo_allreduce",
             predictor ? &predictor->layout() : nullptr,
             predictor ? std::optional{predictor->rows().tokens()} : std::nullopt);
