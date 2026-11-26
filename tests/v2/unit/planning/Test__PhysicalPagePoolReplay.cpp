@@ -317,12 +317,12 @@ public:
             if (!(input >> name) || !snapshots_.contains(name)) fail();
             outcome = table_->acknowledgeEffectiveUse(snapshots_.at(name)) ? "acked" : "refused";
         }
+
         else if (kind == "table-use-retire")
         {
             size_t incarnation;
             if (!(input >> name >> incarnation) || !table_) fail();
-            table_->retireEffectiveUse(incarnation);
-            outcome = "reclaimed";
+            outcome = table_->retireEffectiveUse(incarnation) ? "reclaimed" : "refused";
         }
         else if (kind == "table-read")
         {
@@ -898,7 +898,12 @@ TEST(PhysicalMemoryAuthority, PagePoolRecordedEffectiveUseLifecycleReplayExactly
         const std::vector<std::string> commands{"table-reserve R 1",
             "combined-witnessed X R 1 1", "table-attach-archive _ X 100 4 0 0 " + hex,
             "table-commit X S", "table-touch S", "table-use-ack S", "table-touch S",
-            "table-use-ack S", "table-touch S", "table-use-retire T 0",
+            "table-use-ack S", "table-touch S", "table-use-retire T 1",
+            // R9 adversarial through the PRODUCTION path: a fresh touch keeps
+            // an unacked obligation; retire REFUSES; frontier ack releases;
+            // retire then reclaims. Incarnation = published version (1).
+            "table-touch S", "table-use-retire T 1", "table-use-ack S",
+            "table-use-retire T 1",
             "table-drop S", "table-drop-reserved R", "end"};
         for (const std::string &command : commands)
             output << command << " | " << runner.execute(command) << '\n';

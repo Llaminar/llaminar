@@ -8,7 +8,11 @@ table-use-ack S | acked
 table-touch S | refreshed
 table-use-ack S | acked
 table-touch S | refreshed
-table-use-retire T 0 | reclaimed
+table-use-retire T 1 | reclaimed
+table-touch S | accepted
+table-use-retire T 1 | refused
+table-use-ack S | acked
+table-use-retire T 1 | reclaimed
 table-drop S | retired
 table-drop-reserved R | released
 end | idle
