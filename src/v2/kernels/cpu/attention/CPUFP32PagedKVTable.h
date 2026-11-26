@@ -13,6 +13,7 @@
 #include "CPUFP32PagedKVView.h"
 #include "EffectiveUseOrdering.h"
 #include "PagedKVArchive.h"
+#include "kernels/PagedKVSnapshotRef.h"
 #include <memory>
 #include <optional>
 
@@ -191,18 +192,23 @@ public:
         return next_version_ >= geometry_.issuance_budget;
     }
     /**
-     * @brief Borow the published snapshot of one request slot (P2 stage pool).
-     * @param slot Request slot index mapped to a bank (0..bank_count-1).
-     * @return A borrowed snapshot, or empty when the slot has no published
-     * bank or the reader envelope is exhausted (the stage then fails; it never
-     * silently substitutes the ring cache).
+     * @brief Resolve an exact typed pooled reference (P2 stage pool, J3).
+     * @param ref Authenticated reference naming THIS table's authority identity
+     * and a MONOTONIC publication version (never a bank index; banks are
+     * reused and COW publishes into other banks).
+     * @return A borrowed snapshot whose version matches @p ref exactly, or
+     * empty when the reference is foreign, superseded, retired, or the reader
+     * envelope is exhausted. The stage then fails; it never silently reads a
+     * different bank's (or version's) history.
      */
-    std::optional<Snapshot> tryBorrowForStage(int slot);
+    std::optional<Snapshot> resolveSnapshotRef(const PagedKVSnapshotRef &ref);
 
     /** @brief Freeze new borrows of an exact published version before joining its existing readers. */
     void closeBorrowers(const Snapshot &snapshot);
     /** @return Original PMA instance identity for same-authority admission checks. */
     const PhysicalMemoryAuthority *issuerForAdmission() const noexcept { return authority_.get(); }
+    /** @return Authenticated pooled authority identity (J3 ref validation). */
+    std::uint64_t authorityIdentity() const noexcept { return authority_identity_; }
 
     /**
      * @brief Touch one successful attachment (§8.2 effective use).
@@ -228,6 +234,8 @@ public:
     {
         return effective_use_.retireReplica(incarnation);
     }
+    /** @return Read-only table geometry (page tokens for ref resolution). */
+    const CPUFP32PagedKVTableGeometry &tableGeometry() const noexcept { return geometry_; }
     /** @return Admitted bank count (witness class maximum). */
     std::size_t bankCount() const noexcept { return banks_.size(); }
     /** @return Admitted effective-use lease-cell count (witness class maximum). */
@@ -272,6 +280,7 @@ private:
     /** @brief Release a published bank only after its final borrower retires. */
     void releaseSnapshot(size_t bank, std::uint64_t version) noexcept;
     std::shared_ptr<PhysicalMemoryAuthority> authority_; ///< Original instance identity, not a separate budget.
+    std::uint64_t authority_identity_ = 0; ///< Authenticated authority id (J3).
     CPUFP32PagedKVTableGeometry geometry_;
     std::uint64_t next_version_ = 0; ///< Monotonic across every bank, including aborted preparations.
     std::uint64_t reserved_outstanding_ = 0; ///< Sum of live reservation capacities.

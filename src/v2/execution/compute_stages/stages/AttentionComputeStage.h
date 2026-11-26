@@ -15,6 +15,7 @@
 #include "../StageParamsBase.h"
 #include "kernels/IKVCache.h"
 #include "kernels/cpu/attention/CPUFP32PagedKVTable.h"
+#include "kernels/PagedKVSnapshotRef.h"
 #include "../../../kernels/attention/AttentionExecutionPolicy.h"
 #include "../../../memory/BufferId.h"
 
@@ -107,20 +108,25 @@ namespace llaminar2
             int layer_idx = -1;
 
             /**
-             * @brief P2 pooled consumption: the owning pooled table and its
-             * per-request snapshot for THIS layer's CPU decode.
+             * @brief P2 pooled consumption: the owning pooled table and the EXACT
+             * typed reference of this request's pooled publication.
              *
-             * When non-null (and @p pooled_snapshot is set), the CPU decode
-             * path computes through the production pooled attention kernel
-             * (compute_paged_snapshot_fp32) instead of the ring-cache read:
-             * no contiguous adapter, no full-history gather. The snapshot is
-             * borrowed per execute from the table (move-only; the table owns
-             * the pages) and the effective-use lease is acknowledged by the
-             * caller after the forward.
+             * When @p pooled_table is non-null, the CPU decode path resolves
+             * @p pooled_ref (authority identity + MONOTONIC publication
+             * version; never a bank index) against the table and computes
+             * through the production pooled kernel — no contiguous adapter, no
+             * full-history gather, and never another bank's or a superseded
+             * version's history. The reference maps the REQUEST identity; the
+             * table performs the authentication (J3).
+             *
+             * NOTE (effective use): this resolve/borrow path does NOT yet mint
+             * an effective-use lease. When the production caller lands, the
+             * attachment must record effective use (design §8.2) through
+             * touchEffectiveUse; until then no lease claim is made and the
+             * comment is not a claim of one.
              */
-            CPUFP32PagedKVTable *pooled_table = nullptr;   ///< Owning pooled table (borrows execute-time).
-            CPUFP32PagedKVTable *pooled_snapshot_owner = nullptr;
-            int pooled_snapshot_slot = -1; ///< Row index to borrow at execute.
+            CPUFP32PagedKVTable *pooled_table = nullptr; ///< Owning pooled table.
+            PagedKVSnapshotRef pooled_ref;                ///< Exact typed publication reference (J3).
 
             /**
              * @brief Device-owned logical query width for a scalar GPU graph.

@@ -52,7 +52,9 @@ std::shared_ptr<CPUFP32PagedKVTable> CPUFP32PagedKVTable::create(std::shared_ptr
 }
 CPUFP32PagedKVTable::CPUFP32PagedKVTable(std::shared_ptr<PhysicalMemoryAuthority> authority, DeviceId device,
     CPUFP32PagedKVTableGeometry geometry, CPUStoragePlacement placement)
-    : authority_(authority), geometry_(geometry)
+    : authority_(authority), geometry_(geometry), authority_identity_(
+          reinterpret_cast<std::uintptr_t>(authority.get()) ^
+          static_cast<std::uintptr_t>(device.type))
 {
     (void)physicalBytes(geometry, device, placement);
     static_assert(alignof(CPUFP32KVPage) <= AlignedVector<std::byte>::ALIGNMENT);
@@ -402,18 +404,27 @@ CPUFP32PagedKVView CPUFP32PagedKVTable::Snapshot::view() const
     const auto &state = table_->require(bank_, version_, Phase::Published);
     return CPUFP32PagedKVView({table_->pages_ + bank_ * table_->geometry_.page_capacity, state.pages}, table_->geometry_.page_tokens);
 }
-std::optional<CPUFP32PagedKVTable::Snapshot> CPUFP32PagedKVTable::tryBorrowForStage(int slot)
+std::optional<CPUFP32PagedKVTable::Snapshot> CPUFP32PagedKVTable::resolveSnapshotRef(
+    const PagedKVSnapshotRef &ref)
 {
-    if (slot < 0 || static_cast<std::size_t>(slot) >= banks_.size())
-        return std::nullopt;
-    auto &state = banks_[slot];
-    if (state.phase != Phase::Published || !state.pages)
-        return std::nullopt;
-    if (!state.accepting_readers || state.readers == geometry_.readers_per_bank)
-        return std::nullopt;
-    auto self = shared_from_this();
-    ++state.readers;
-    return Snapshot(std::move(self), static_cast<size_t>(slot), state.version);
+    if (!ref.valid() || ref.authority_id != authority_identity_)
+        return std::nullopt; // Foreign authority: refuse (never a different table).
+    for (std::size_t bank = 0; bank < banks_.size(); ++bank)
+    {
+        auto &state = banks_[bank];
+        // EXACT version authentication: a retired/reused bank has a different
+        // monotonic version, so a stale ref can never borrow another request's
+        // history or a superseded publication (J3).
+        if (state.phase != Phase::Published || !state.pages ||
+            state.version != ref.publication_version)
+            continue;
+        if (!state.accepting_readers || state.readers == geometry_.readers_per_bank)
+            return std::nullopt;
+        auto self = shared_from_this();
+        ++state.readers;
+        return Snapshot(std::move(self), bank, state.version);
+    }
+    return std::nullopt; // No live publication with this exact version.
 }
 
 std::optional<CPUFP32PagedKVTable::Snapshot> CPUFP32PagedKVTable::Snapshot::tryBorrow() const

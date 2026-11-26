@@ -15,7 +15,7 @@
 #pragma once
 #include "kernels/FloatingActivationOperandPrecision.h"
 #include "kernels/common/Q8ResidualCorrection.h"
-#include "kernels/cpu/attention/CPUFP32PagedKVTable.h"
+#include "kernels/PagedKVSnapshotRef.h"
 #include "kernels/common/OriginalOutputSlice.h"
 #include "kernels/common/GatedRMSNormProjection.h"
 #include "kernels/CPUSharedGDNSnapshots.h"
@@ -2193,13 +2193,13 @@ namespace llaminar2
          * silent ring-cache substitution).
          */
         virtual bool compute_pooled_snapshot_decoder(
-            const ITensor *Q, const CPUFP32PagedKVTable::Snapshot &snapshot,
+            const ITensor *Q, const PagedKVReadView &paged_view,
             ITensor *output, int n_heads, int n_kv_heads, int head_dim,
             bool causal, int window_size, int position_offset, int head_start,
             int gqa_n_rep, const attention::AttentionExecutionPolicy &policy)
         {
             (void)Q;
-            (void)snapshot;
+            (void)paged_view;
             (void)output;
             (void)n_heads;
             (void)n_kv_heads;

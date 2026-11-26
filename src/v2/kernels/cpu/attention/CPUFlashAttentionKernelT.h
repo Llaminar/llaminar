@@ -1849,25 +1849,34 @@ namespace llaminar2
         }
 
         bool compute_pooled_snapshot_decoder(
-            const ITensor *Q, const CPUFP32PagedKVTable::Snapshot &snapshot,
+            const ITensor *Q, const PagedKVReadView &paged_view,
             ITensor *output, int n_heads, int n_kv_heads, int head_dim,
             bool causal, int window_size, int position_offset, int head_start,
             int gqa_n_rep, const attention::AttentionExecutionPolicy &policy) override
         {
-            // P2 stage entry: the FP32 pooled snapshot path is the production
-            // CPU pooled compute. Q/output are expected FP32 CPU tensors (the
-            // pooled table is FP32); any other precision refuses (never a
-            // silent ring substitution or a precision reinterpretation).
+            // P2 stage entry: the FP32 pooled snapshot path consumes the
+            // backend-neutral paged view the stage resolved from the exact
+            // typed reference. Q/output are expected FP32 CPU tensors; any
+            // other precision refuses (never a silent ring substitution).
             const auto *q = dynamic_cast<const FP32Tensor *>(Q);
             auto *out = dynamic_cast<FP32Tensor *>(output);
-            if (!q || !out || !n_heads || !n_kv_heads || !head_dim)
+            if (!q || !out || !n_heads || !n_kv_heads || !head_dim ||
+                !paged_view.valid())
                 return false;
             const std::size_t rows = q->rows();
             if (rows == 0 || out->rows() < rows)
                 return false;
             std::span<const float> query(q->fp32_data(), rows * q->cols());
             std::span<float> result(out->mutable_data(), rows * out->cols());
-            return compute_paged_snapshot_fp32(query, snapshot, result,
+            // The native handle is the CPU paged KV view the stage resolved by
+            // borrowing the snapshot named by the ref (the stage retains the
+            // Snapshot for the call, so the view's referents stay alive).
+            const auto *native = static_cast<const CPUFP32PagedKVView *>(paged_view.native_handle);
+            if (!native || native->rows() != paged_view.rows ||
+                native->heads() != paged_view.heads ||
+                native->dimension() != paged_view.dimension)
+                return false;
+            return compute_paged_fp32(query, *native, result,
                 static_cast<int>(rows), n_heads, causal, window_size,
                 position_offset, head_start, gqa_n_rep, policy);
         }

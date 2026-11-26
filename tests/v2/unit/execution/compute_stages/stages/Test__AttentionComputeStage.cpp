@@ -1354,8 +1354,10 @@ TEST(PooledStageConsumption, PooledSnapshotDecodeMatchesContiguousControl)
     params.position_offset = tokens - 1; // Decode at the last KV position.
     params.device_id = device;
     params.pooled_table = table.get();
-    params.pooled_snapshot_owner = table.get();
-    params.pooled_snapshot_slot = 0;
+    params.pooled_ref.authority_id = table->authorityIdentity();
+    params.pooled_ref.publication_version = snapshot.version();
+    params.pooled_ref.request_id = 7;
+    params.pooled_ref.slot = 0;
     params.kv_cache = nullptr; // Pooled path: no ring cache.
     MPIContext local_mpi{0, 1, MPI_COMM_WORLD};
     params.mpi_ctx = &local_mpi;
@@ -1364,4 +1366,95 @@ TEST(PooledStageConsumption, PooledSnapshotDecodeMatchesContiguousControl)
     ASSERT_TRUE(stage.execute(&ctx));
     EXPECT_EQ(std::memcmp(output->fp32_data(), expected.data(), sizeof(float) * width), 0);
     snapshot = {};
+}
+
+
+/** @test P2 J2/J3: pooled mode rejects unsupported combos and foreign/stale refs fail closed. */
+TEST(PooledStageConsumption, PooledModeRejectsUnsupportedAndForeignRefs)
+{
+    constexpr int heads = 2, dimension = 8;
+    const auto device = DeviceId::cpu();
+    const PhysicalPagePoolGeometry pool_geometry{4,
+        static_cast<std::size_t>(4) * 2 * heads * dimension * sizeof(float), 2, 4};
+    const CPUFP32PagedKVTableGeometry table_geometry{1, 2, 4, 4, 16, 4};
+    const auto bytes = PhysicalPagePool::physicalBytes(pool_geometry, device) +
+        CPUFP32PagedKVTable::physicalBytes(table_geometry, device);
+    PhysicalMemoryPlanBuilder plan;
+    plan.add({.world_rank=0, .device=device, .total_bytes=bytes, .admission_available_bytes=bytes},
+        PhysicalMemoryOwner::KVCache, bytes);
+    auto authority = std::make_shared<PhysicalMemoryAuthority>(
+        std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()), 0);
+    auto pool = authority->createCPUPagePool(device, pool_geometry, CPUStoragePlacement::local());
+    auto table = CPUFP32PagedKVTable::create(authority, device, table_geometry);
+    auto update = table->tryBeginUpdate();
+    ASSERT_TRUE(update);
+    auto grant = pool->tryAdmit(1);
+    ASSERT_TRUE(grant);
+    const auto frame = grant->assignFrame();
+    std::vector<float> payload(4 * 2 * heads * dimension);
+    auto write = grant->prepareAppend(frame, payload.size() * sizeof(float));
+    ASSERT_TRUE(write);
+    write->copyFrom(std::as_bytes(std::span(payload)));
+    update->append(CPUFP32KVPage(write->commit(), heads, dimension));
+    auto snapshot = update->commit();
+    MPIContext local_mpi{0, 1, MPI_COMM_WORLD};
+    TensorFactory tf(local_mpi);
+    auto Q = tf.createFP32({1, static_cast<size_t>(heads * dimension)}, device);
+    auto output = tf.createFP32({1, static_cast<size_t>(heads * dimension)}, device);
+    AttentionComputeStage::Params params;
+    params.Q = Q.get();
+    params.output = output.get();
+    params.batch_size = 1;
+    params.seq_len = 1;
+    params.kv_len = 4;
+    params.n_heads = heads;
+    params.n_kv_heads = heads;
+    params.head_dim = dimension;
+    params.causal = true;
+    params.window_size = -1;
+    params.position_offset = 3;
+    params.device_id = device;
+    params.kv_cache = nullptr;
+    params.mpi_ctx = &local_mpi;
+    params.pooled_table = table.get();
+    params.pooled_ref.authority_id = table->authorityIdentity();
+    params.pooled_ref.publication_version = snapshot.version();
+    params.pooled_ref.request_id = 7;
+    params.pooled_ref.slot = 0;
+    CPUDeviceContext ctx(device);
+    // Baseline succeeds.
+    AttentionComputeStage ok(params);
+    ASSERT_TRUE(ok.execute(&ctx));
+    // J3 foreign authority: refuses (no other table reads).
+    auto foreign_params = params;
+    foreign_params.pooled_ref.authority_id = table->authorityIdentity() + 99;
+    AttentionComputeStage foreign(foreign_params);
+    EXPECT_FALSE(foreign.execute(&ctx));
+    // J3 superseded version: refuses (stale version).
+    auto stale_params = params;
+    stale_params.pooled_ref.publication_version = snapshot.version() + 1000;
+    AttentionComputeStage stale(stale_params);
+    EXPECT_FALSE(stale.execute(&ctx));
+    // J2 prefill (seq_len > 1): explicitly rejects pooled mode.
+    auto prefill_params = params;
+    prefill_params.seq_len = 2;
+    AttentionComputeStage prefill(prefill_params);
+    EXPECT_FALSE(prefill.execute(&ctx));
+    // J2 non-CPU: the stage requires a backend stream before ANY dispatch, so
+    // a CUDA device in pooled mode must refuse before touching pooled/ring
+    // state. Assert the stage fails (either the explicit-stream precondition
+    // or the pooled device gate — never a pooled compute with ring K/V).
+    auto gpu_params = params;
+    gpu_params.device_id = DeviceId::cuda(0);
+    AttentionComputeStage gpu(gpu_params);
+    bool gpu_refused = false;
+    try
+    {
+        gpu_refused = !gpu.execute(&ctx);
+    }
+    catch (const std::exception &)
+    {
+        gpu_refused = true; // No explicit stream for a GPU stage: refuses.
+    }
+    EXPECT_TRUE(gpu_refused);
 }

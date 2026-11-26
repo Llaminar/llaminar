@@ -1133,7 +1133,7 @@ namespace llaminar2
                         effective_K = const_cast<ITensor *>(cpu_grouped_k_views_.front());
                         effective_V = const_cast<ITensor *>(cpu_grouped_v_views_.front());
                         effective_kv_len = max_request_kv_len;
-                        cpu_grouped_request_cache = true;
+                        cpu_grouped_request_cache = params_.pooled_table == nullptr;
                     }
 
                     else
@@ -1332,11 +1332,11 @@ namespace llaminar2
         // (borrowed below), so only Q/output and the owning table are required
         // there; the ring K/V pointers are undefined and must NOT be validated
         // (the pooled branch fails closed if the snapshot cannot be produced).
-        if (params_.pooled_snapshot_owner != nullptr)
+        if (params_.pooled_table != nullptr)
         {
-            if (!params_.Q || !params_.output || !params_.pooled_table)
+            if (!params_.Q || !params_.output || !params_.pooled_ref.valid())
             {
-                LOG_ERROR("[AttentionComputeStage] Pooled mode requires Q, output and the owning table");
+                LOG_ERROR("[AttentionComputeStage] Pooled mode requires Q, output and an exact typed reference");
                 return false;
             }
         }
@@ -1397,7 +1397,39 @@ namespace llaminar2
          * grown-prefix replay, making the regime choice graph-stable and fully
          * device-owned.
          */
+        // J2: pooled mode is decided FIRST, before ANY ring branch. The pooled
+        // path supports ONLY CPU decode with one query row and an exact typed
+        // ref; every other combination (prefill, grouped, verifier, non-CPU)
+        // is rejected with an explicit diagnostic — it can never fall through
+        // to a ring compute with unvalidated null ring K/V.
+        const bool pooled_mode = params_.pooled_table != nullptr;
+        bool pooled_ok = true;
+        std::optional<CPUFP32PagedKVTable::Snapshot> pooled_borrow;
+        if (pooled_mode)
+        {
+            if (!params_.device_id.is_cpu())
+            {
+                pooled_ok = false;
+                LOG_ERROR("[AttentionComputeStage] Pooled snapshot mode requires a CPU device");
+            }
+            else if (!is_decode_mode || params_.batch_size != 1 || params_.seq_len != 1)
+            {
+                pooled_ok = false;
+                LOG_ERROR("[AttentionComputeStage] Pooled snapshot mode supports only single-row CPU decode");
+            }
+            else if (!params_.pooled_ref.valid())
+            {
+                pooled_ok = false;
+                LOG_ERROR("[AttentionComputeStage] Pooled snapshot mode requires an exact typed reference");
+            }
+            else if (params_.pooled_table->authorityIdentity() != params_.pooled_ref.authority_id)
+            {
+                pooled_ok = false;
+                LOG_ERROR("[AttentionComputeStage] Pooled snapshot reference belongs to another table");
+            }
+        }
         const bool gpu_grouped_request_decode =
+            !pooled_mode &&
             gpu_stage &&
             params_.kv_cache &&
             params_.layer_idx >= 0 &&
@@ -1532,7 +1564,7 @@ namespace llaminar2
 
         // P2 pooled mode: K/V are the pooled snapshot, never ring tensors —
         // skip the ring pointer validation there (the pooled branch fails closed).
-        if (params_.pooled_snapshot_owner == nullptr &&
+        if (params_.pooled_table == nullptr &&
             !ensureRequiredPointers("AttentionComputeStage", {
                                                                  {"Q", params_.Q},
                                                                  {"K", effective_K},
@@ -1802,6 +1834,7 @@ namespace llaminar2
         }
 
         const bool small_verifier_decode =
+            !pooled_mode &&
             is_decode_mode &&
             params_.batch_size == 1 &&
             params_.causal &&
@@ -1928,31 +1961,51 @@ namespace llaminar2
                           << " device=" << params_.device_id.to_string());
             }
         }
-        else if (params_.pooled_snapshot_owner != nullptr && is_decode_mode &&
-                 params_.device_id.is_cpu())
+        else if (pooled_mode)
         {
-            // P2 stage-level pooled consumption: borrow THIS request's snapshot
-            // from the owning pooled table and compute through the production
-            // pooled kernel (no contiguous adapter, no full-history gather).
-            // A borrow refusal fails the step (never a silent ring path).
-            auto borrowed = params_.pooled_snapshot_owner->tryBorrowForStage(
-                params_.pooled_snapshot_slot);
-            if (!borrowed)
+            if (!pooled_ok)
             {
-                success = false;
-                LOG_ERROR("[AttentionComputeStage] Pooled snapshot borrow refused for slot "
-                          << params_.pooled_snapshot_slot);
+                success = false; // J2: an unsupported pooled combination was rejected
+                                 // above BEFORE any ring branch ran (never fall through
+                                 // to a ring compute with null K/V).
             }
             else
             {
-                success = kernel->compute_pooled_snapshot_decoder(
-                    params_.Q, *borrowed, params_.output,
-                    params_.n_heads, params_.n_kv_heads, params_.head_dim,
-                    kernel_causal, params_.window_size, params_.position_offset,
-                    params_.head_start, params_.gqa_n_rep, params_.execution_policy);
-                if (!success)
-                    LOG_ERROR("[AttentionComputeStage] Pooled snapshot decode refused"
-                              << " layer=" << params_.layer_idx);
+                // P2 stage-level pooled consumption: resolve the EXACT typed
+                // reference against the owning table (identity + monotonic
+                // version; a reused bank or superseded version refuses) and
+                // compute through the production pooled kernel. A resolution
+                // refusal fails the step (never a silent ring path).
+                auto borrowed = params_.pooled_table->resolveSnapshotRef(params_.pooled_ref);
+                if (!borrowed)
+                {
+                    success = false;
+                    LOG_ERROR("[AttentionComputeStage] Pooled snapshot resolve refused for version "
+                              << params_.pooled_ref.publication_version);
+                }
+                else
+                {
+                    // Retain the Snapshot for the call; its view() is stable for
+                    // the Snapshot's lifetime (we hold it in pooled_borrow), so
+                    // the native handle is its address and the CPU kernel
+                    // resolves it exactly (backend-neutral seam).
+                    pooled_borrow = std::move(*borrowed);
+                    const auto &borrowed_view = pooled_borrow->view();
+                    PagedKVReadView view;
+                    view.native_handle = &borrowed_view;
+                    view.rows = borrowed_view.rows();
+                    view.heads = params_.n_kv_heads;
+                    view.dimension = params_.head_dim;
+                    view.page_tokens = params_.pooled_table->tableGeometry().page_tokens;
+                    success = kernel->compute_pooled_snapshot_decoder(
+                        params_.Q, view, params_.output,
+                        params_.n_heads, params_.n_kv_heads, params_.head_dim,
+                        kernel_causal, params_.window_size, params_.position_offset,
+                        params_.head_start, params_.gqa_n_rep, params_.execution_policy);
+                    if (!success)
+                        LOG_ERROR("[AttentionComputeStage] Pooled snapshot decode refused"
+                                  << " layer=" << params_.layer_idx);
+                }
             }
         }
         else
