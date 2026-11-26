@@ -90,10 +90,11 @@ jobs:
           mkdir -p "$RUNNER_TEMP/llaminar-arm64-evidence"
           args=()
           while IFS= read -r arg; do [[ -z "$arg" ]] || args+=(--build-arg "$arg"); done <<< "$BUILD_ARGS"
-          docker buildx build "${args[@]}" --build-context "$TOOLCHAIN_CONTEXT" \
+          set -o pipefail
+          { docker buildx build "${args[@]}" --build-context "$TOOLCHAIN_CONTEXT" \
             --platform linux/arm64 --progress rawjson --target arm64-build-evidence \
             --output "type=local,dest=$RUNNER_TEMP/llaminar-arm64-evidence/canonical-integration" . \
-            2> >(tee "$RUNNER_TEMP/llaminar-arm64-evidence/canonical-export.rawjson" >&2)
+            2>&1 1>&3 | tee "$RUNNER_TEMP/llaminar-arm64-evidence/canonical-export.rawjson" >&2; } 3>&1
           nonce=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["nonce"])' "$RUNNER_TEMP/llaminar-arm64-evidence/canonical-integration/status.json")
           echo "nonce=$nonce" >> "$GITHUB_OUTPUT"
           python3 scripts/ci/native_build_cache_receipt.py "$RUNNER_TEMP/llaminar-arm64-evidence/canonical-export.rawjson" "$RUNNER_TEMP/llaminar-arm64-evidence/canonical-integration/status.json" > "$RUNNER_TEMP/llaminar-arm64-evidence/export-cache.json"
@@ -107,13 +108,14 @@ jobs:
           mkdir -p "$RUNNER_TEMP/llaminar-arm64-evidence"
           args=()
           while IFS= read -r arg; do [[ -z "$arg" ]] || args+=(--build-arg "$arg"); done <<< "$BUILD_ARGS"
-          docker buildx build "${args[@]}" --build-arg "LLAMINAR_EXPECTED_BUILD_NONCE=$EXPECTED_NONCE" \
+          set -o pipefail
+          { docker buildx build "${args[@]}" --build-arg "LLAMINAR_EXPECTED_BUILD_NONCE=$EXPECTED_NONCE" \
             --build-context "$TOOLCHAIN_CONTEXT" --platform linux/arm64 --progress rawjson \
             --load --target test-runner --tag llaminar-arm64-test-runner:pr \
             --cache-from type=gha,scope=llaminar-build-neon-pr,version=2 \
             --cache-from type=registry,ref=${{ steps.toolchain.outputs.neon-registry-cache }} \
             --cache-to type=gha,scope=llaminar-build-neon-pr,mode=max,version=2,ignore-error=true . \
-            2> >(tee "$RUNNER_TEMP/llaminar-arm64-evidence/canonical-main.rawjson" >&2) || build_status=$?
+            2>&1 1>&3 | tee "$RUNNER_TEMP/llaminar-arm64-evidence/canonical-main.rawjson" >&2; } 3>&1 || build_status=$?
           python3 scripts/ci/native_build_cache_receipt.py "$RUNNER_TEMP/llaminar-arm64-evidence/canonical-main.rawjson" "$RUNNER_TEMP/llaminar-arm64-evidence/canonical-integration/status.json" > "$RUNNER_TEMP/llaminar-arm64-evidence/main-cache.json"
           exit "${build_status:-0}"
       - name: Export the sibling Release runtime from the same builder
