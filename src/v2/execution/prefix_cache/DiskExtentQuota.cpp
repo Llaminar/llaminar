@@ -8,7 +8,10 @@ namespace llaminar2
 {
 bool DiskExtentQuota::admit(DiskExtentKey extent)
 {
-    if (!extent.bytes || contains(extent) || reserved_ > quota_ - extent.bytes)
+    // A zero quota admits NOTHING. The subtraction below must never run when
+    // the quota is zero: `quota_ - extent.bytes` would underflow to a huge
+    // value and admit extents into a ledger with no capacity.
+    if (!quota_ || !extent.bytes || contains(extent) || reserved_ > quota_ - extent.bytes)
         return false; // Zero/duplicate admission, or quota exhausted: no mutation.
     if (count_ == capacity()) return false;
     entries_[count_++] = extent;

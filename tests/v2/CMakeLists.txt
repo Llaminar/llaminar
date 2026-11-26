@@ -16109,6 +16109,23 @@ add_v2_test(V2_Unit_DiskPrefixStorageBackend
     NO_MODELS
 )
 
+add_executable(v2_test_paged_kv_disk_route unit/prefix_cache/Test__PagedKVDiskRoute.cpp)
+target_link_libraries(v2_test_paged_kv_disk_route llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_PagedKVDiskRoute
+    COMMAND $<TARGET_FILE:v2_test_paged_kv_disk_route>
+    LABELS "V2;Unit;PrefixCache;Storage;Route;Tier"
+    MPI_PROCS 1
+    NO_MODELS
+)
+
+# Focused ProductionTestPreflight regression: zero-quota ledger must never
+# admit extents (checked arithmetic, no underflow admission) and impossible
+# configured disk routes must fail before any backend opens.
+add_v2_test(V2_Integration_PagedKVDiskRoute
+    COMMAND $<TARGET_FILE:v2_test_paged_kv_disk_route>
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;PrefixCache;Storage;Quota;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+
 add_v2_test(V2_Integration_DiskExtentQuota
     COMMAND $<TARGET_FILE:v2_test_disk_prefix_storage_backend>
         --gtest_filter=DiskExtentQuota.*
