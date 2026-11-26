@@ -17,16 +17,18 @@ namespace llaminar2
     }
 
     bool ServingSession::begin(int capacity, int slots_to_reset, std::string &error,
-                               std::shared_ptr<PhysicalMemorySuballocationLease> decision_storage)
+                               std::shared_ptr<PhysicalMemorySuballocationLease> decision_storage,
+                               int queue_capacity)
     {
         if (active_)
         {
             error = "Serving batch session is already open";
             return false;
         }
-        if (capacity <= 0 || slots_to_reset < capacity || vocab_ <= 0 || context_ <= 0)
+        if (capacity <= 0 || slots_to_reset < capacity || vocab_ <= 0 || context_ <= 0 ||
+            queue_capacity < 0)
         {
-            error = "Serving batch capacity, vocabulary or context is invalid";
+            error = "Serving batch capacity, vocabulary, context or queue bound is invalid";
             return false;
         }
         for (int slot = 0; slot < slots_to_reset; ++slot)
@@ -55,34 +57,67 @@ namespace llaminar2
         pending_forced_.clear();
         failure_.clear();
         capacity_ = capacity;
+        queue_capacity_ = queue_capacity;
         active_ = true;
         return true;
     }
 
-    bool ServingSession::submit(ServingBatchRequest request, std::string &error)
+    ServingSubmissionOutcome ServingSession::submit(ServingBatchRequest request, std::string &error)
     {
         if (!active_)
-            error = "Serving batch session is not open";
-        else if (request.prompt.empty() || request.max_new_tokens <= 0)
-            error = "Serving request requires a prompt and a positive output budget";
-        else if (static_cast<int>(request.prompt.size()) >= context_)
-            error = "Serving request prompt exceeds the admitted context";
-        else if (!failure_.empty())
-            error = "Serving session failed: " + failure_;
-        else if (std::any_of(rows_.begin(), rows_.end(), [&](const Row &row) {
-                     return row.request.id == request.id;
-                 }) || std::any_of(queue_.begin(), queue_.end(), [&](const ServingBatchRequest &queued) {
-                     return queued.id == request.id;
-                 }))
-            error = "Serving request id is already live: " + std::to_string(request.id);
-        else
         {
-            // Grants, forces and cancellation address this identity, so accepting
-            // another live owner would make those operations ambiguous.
-            queue_.push_back(std::move(request));
-            return true;
+            error = "Serving batch session is not open";
+            return ServingSubmissionOutcome::Refused;
         }
-        return false;
+        if (request.prompt.empty() || request.max_new_tokens <= 0)
+        {
+            error = "Serving request requires a prompt and a positive output budget";
+            return ServingSubmissionOutcome::Refused;
+        }
+        if (static_cast<int>(request.prompt.size()) >= context_)
+        {
+            error = "Serving request prompt exceeds the admitted context";
+            return ServingSubmissionOutcome::Refused;
+        }
+        if (!failure_.empty())
+        {
+            error = "Serving session failed: " + failure_;
+            return ServingSubmissionOutcome::Refused;
+        }
+        if (std::any_of(rows_.begin(), rows_.end(), [&](const Row &row) {
+                return row.request.id == request.id;
+            }) || std::any_of(queue_.begin(), queue_.end(), [&](const ServingBatchRequest &queued) {
+                return queued.id == request.id;
+            }))
+        {
+            error = "Serving request id is already live: " + std::to_string(request.id);
+            return ServingSubmissionOutcome::Refused;
+        }
+        // Bounded queue Q (design §4.1, exact-or-reject): beyond the admitted
+        // depth the request is REFUSED, never silently accepted. The outcome
+        // reports Direct when a resident slot is free at THIS instant (the
+        // request is promoted at the next step start without gaining a queued
+        // position), Queued otherwise. Both accepted paths use the SAME
+        // queue/slot promotion machinery — no parallel Row construction here.
+        // Exact class accounting (design §4.1): a request is Direct when the
+        // resident slots are not fully claimed (rows_ + queue_ < capacity,
+        // because a Direct request is promoted at the next step without a
+        // queued position). Otherwise it consumes one of the admitted Q queue
+        // positions; a full Q refuses typed.
+        const std::size_t live = rows_.size() + queue_.size();
+        if (live < static_cast<std::size_t>(capacity_))
+        {
+            queue_.push_back(std::move(request));
+            return ServingSubmissionOutcome::Direct;
+        }
+        if (static_cast<int>(queue_.size()) >= queue_capacity_)
+        {
+            error = "Serving queue is full (admitted Q=" +
+                std::to_string(queue_capacity_) + ")";
+            return ServingSubmissionOutcome::Refused;
+        }
+        queue_.push_back(std::move(request));
+        return ServingSubmissionOutcome::Queued;
     }
 
     void ServingSession::cancel(std::uint64_t id) { cancellations_.push_back(id); }

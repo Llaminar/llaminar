@@ -19,6 +19,15 @@
 
 namespace llaminar2
 {
+    /** @brief Typed submission outcome (design §5.4 PKV-05). */
+    enum class ServingSubmissionOutcome : std::uint8_t
+    {
+        Direct,  ///< Admitted into a resident slot immediately (free slot).
+        Queued,  ///< Accepted into the bounded queue; a slot opens later.
+        Refused, ///< Rejected typed (invalid, duplicate id, sealed, full queue);
+                 ///< the caller's response incarnation is never minted.
+    };
+
     /** @brief Immutable prepared request submitted to the serving session. */
     struct ServingBatchRequest
     {

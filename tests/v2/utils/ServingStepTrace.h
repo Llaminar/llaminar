@@ -617,7 +617,10 @@ namespace llaminar2::test
             ServingSession session(*executor, trace.context, trace.vocab);
             session.setTraceRecorder(executor);
             std::string error;
-            if (!session.begin(trace.capacity, trace.capacity, error))
+            // The replay preserves the recorded admission order; the queue
+            // bound is the recorded capacity, so any accepted request in the
+            // recording remains acceptable here (order and outcomes typed).
+            if (!session.begin(trace.capacity, trace.capacity, error, nullptr, trace.capacity))
                 return "begin failed: " + error;
             std::map<std::uint64_t, unsigned int> seeds;
             for (const auto &a : trace.admissions)
@@ -639,7 +642,7 @@ namespace llaminar2::test
                             // The recorded resolved seed (entropy for seed 0).
                             if (auto it = seeds.find(request.id); it != seeds.end() && request.sampling.seed == 0)
                                 request.sampling.seed = it->second;
-                            if (!session.submit(std::move(request), error))
+                            if (session.submit(std::move(request), error) == ServingSubmissionOutcome::Refused)
                                 return "submit failed: " + error;
                             break;
                         }

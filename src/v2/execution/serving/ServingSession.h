@@ -116,13 +116,25 @@ namespace llaminar2
         /**
          * @brief Open with @p capacity resident slots (all reset).
          * @param slots_to_reset Slots owned by the executor (>= capacity).
+         * @param queue_capacity Admitted bounded queue depth Q (design §4.1,
+         * exact-or-reject: requests beyond it are Refused, never silently
+         * accepted). Zero = any queued request is Refused (Q=0).
          */
         bool begin(int capacity, int slots_to_reset, std::string &error,
-                   std::shared_ptr<PhysicalMemorySuballocationLease> decision_storage = nullptr);
+                   std::shared_ptr<PhysicalMemorySuballocationLease> decision_storage = nullptr,
+                   int queue_capacity = 0);
         bool active() const noexcept { return active_; }
 
-        /** @brief Queue a request; false with @p error when invalid or sealed. */
-        bool submit(ServingBatchRequest request, std::string &error);
+        /**
+         * @brief Submit one immutable request with the TYPED outcome.
+         *
+         * Direct when a free resident slot exists, Queued when admitted into
+         * the bounded queue, Refused otherwise (invalid request, duplicate
+         * live id, sealed session, queue full). @p error is populated on
+         * Refused with the precise diagnostic; the caller's response
+         * incarnation is only minted on Direct/Queued.
+         */
+        ServingSubmissionOutcome submit(ServingBatchRequest request, std::string &error);
         void cancel(std::uint64_t id);
         void grant(std::uint64_t id, int tokens);
         void force(std::uint64_t id, int32_t token);
@@ -182,6 +194,7 @@ namespace llaminar2
         const int context_;
         const int vocab_;
         int capacity_ = 0;
+        int queue_capacity_ = 0; ///< Admitted bounded queue depth Q (design §4.1).
         bool active_ = false;
         std::vector<Row> rows_;                 ///< Resident requests (any order).
         std::vector<bool> slot_busy_;

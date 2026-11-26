@@ -18393,7 +18393,7 @@ add_v2_test(V2_Integration_NonNUMAKernelClassification
 
 # Recorded-input replay of the continuous-batching serving step: a real-model
 # trace replayed device-free through the production ServingSession.
-add_executable(v2_test_serving_step_replay unit/execution/serving/Test__ServingStepReplay.cpp)
+add_executable(v2_test_serving_step_replay unit/execution/serving/Test__ServingStepReplay.cpp unit/execution/serving/Test__ServingSubmissionOutcome.cpp)
 target_include_directories(v2_test_serving_step_replay PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_definitions(v2_test_serving_step_replay PRIVATE
     LLAMINAR_SERVING_TRACE_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/serving_step_replay/qwen2.5-0.5b-instruct-q4_0.cpu.trace")
@@ -18406,6 +18406,12 @@ add_v2_test(V2_Integration_ServingStepReplay
     COMMAND $<TARGET_FILE:v2_test_serving_step_replay>
     LABELS "V2;Integration;ProductionTestPreflight;Serving;ContinuousBatching;TraceReplay;DeviceFree;Regression"
     MPI_PROCS 1 NO_MODELS TIMEOUT 60)
+add_v2_test(V2_Integration_ServingSubmissionOutcome
+    COMMAND $<TARGET_FILE:v2_test_serving_step_replay>
+        --gtest_filter=ServingSubmissionOutcome.*
+    LABELS "V2;Integration;ProductionTestPreflight;Serving;ContinuousBatching;Submission;Queue;Fairness;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ServingSubmissionOutcome)
 
 add_v2_test(V2_Integration_ServingLiveIdentityLifecycle
     COMMAND $<TARGET_FILE:v2_test_serving_step_replay>

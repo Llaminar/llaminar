@@ -280,15 +280,15 @@ namespace llaminar2::test
         ServingSession session(rows, 64, ScriptedRows::kVocab);
         std::string error;
         ASSERT_TRUE(session.begin(2, 2, error));
-        ASSERT_TRUE(session.submit(greedy(7, 8), error));
-        EXPECT_FALSE(session.submit(greedy(7, 1), error));
+        ASSERT_TRUE(session.submit(greedy(7, 8), error) != ServingSubmissionOutcome::Refused);
+        EXPECT_EQ(session.submit(greedy(7, 1), error), ServingSubmissionOutcome::Refused);
         EXPECT_NE(error.find("already live"), std::string::npos);
         EXPECT_EQ(session.occupancy().queued, 1);
         (void)session.step();
         EXPECT_EQ(session.occupancy().resident, 1);
-        EXPECT_FALSE(session.submit(greedy(7, 1), error));
+        EXPECT_EQ(session.submit(greedy(7, 1), error), ServingSubmissionOutcome::Refused);
         EXPECT_EQ(session.occupancy().queued, 0);
-        ASSERT_TRUE(session.submit(greedy(9, 3), error));
+        ASSERT_TRUE(session.submit(greedy(9, 3), error) != ServingSubmissionOutcome::Refused);
         session.cancel(7);
         std::vector<ServingBatchEvent> terminal;
         for (int step = 0; step < 10 && !session.idle(); ++step)
@@ -310,8 +310,8 @@ namespace llaminar2::test
         ServingSession session(rows, 64, ScriptedRows::kVocab);
         std::string error;
         ASSERT_TRUE(session.begin(2, 2, error)) << error;
-        ASSERT_TRUE(session.submit(greedy(1, 1), error));
-        ASSERT_TRUE(session.submit(greedy(2, 30), error));
+        ASSERT_TRUE(session.submit(greedy(1, 1), error) != ServingSubmissionOutcome::Refused);
+        ASSERT_TRUE(session.submit(greedy(2, 30), error) != ServingSubmissionOutcome::Refused);
         rows.fail_reset = true; // the finishing slot cannot be emptied
         std::map<std::uint64_t, ServingFinishReason> finished;
         for (int step = 0; step < 4 && finished.size() < 2; ++step)
@@ -321,7 +321,7 @@ namespace llaminar2::test
         EXPECT_EQ(finished[1], ServingFinishReason::Length) << "the finished request keeps its outcome";
         EXPECT_EQ(finished[2], ServingFinishReason::Error) << "co-resident requests fail with the seal";
         EXPECT_NE(session.failure().find("could not be reset"), std::string::npos) << session.failure();
-        EXPECT_FALSE(session.submit(greedy(3, 1), error)) << "nothing is admitted onto stale slot state";
+        EXPECT_EQ(session.submit(greedy(3, 1), error), ServingSubmissionOutcome::Refused) << "nothing is admitted onto stale slot state";
     }
 
     TEST(ServingSessionLifecycle, FinishedPeersKeepTheirOutcomeWhenAResetFails)
@@ -333,9 +333,9 @@ namespace llaminar2::test
         ServingSession session(rows, 64, ScriptedRows::kVocab);
         std::string error;
         ASSERT_TRUE(session.begin(3, 3, error)) << error;
-        ASSERT_TRUE(session.submit(greedy(1, 3), error));
-        ASSERT_TRUE(session.submit(greedy(2, 2), error));
-        ASSERT_TRUE(session.submit(greedy(3, 30), error));
+        ASSERT_TRUE(session.submit(greedy(1, 3), error) != ServingSubmissionOutcome::Refused);
+        ASSERT_TRUE(session.submit(greedy(2, 2), error) != ServingSubmissionOutcome::Refused);
+        ASSERT_TRUE(session.submit(greedy(3, 30), error) != ServingSubmissionOutcome::Refused);
         std::map<std::uint64_t, ServingFinishReason> finished;
         for (int step = 0; step < 2; ++step)
             for (const auto &event : session.step())
@@ -358,7 +358,7 @@ namespace llaminar2::test
         ServingSession session(rows, 64, ScriptedRows::kVocab);
         std::string error;
         ASSERT_TRUE(session.begin(1, 1, error)) << error;
-        ASSERT_TRUE(session.submit(greedy(1, 4), error));
+        ASSERT_TRUE(session.submit(greedy(1, 4), error) != ServingSubmissionOutcome::Refused);
         rows.fail_forward = true;
         const auto events = session.step();
         ASSERT_EQ(events.size(), 1u);

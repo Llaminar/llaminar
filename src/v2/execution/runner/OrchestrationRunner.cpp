@@ -26822,7 +26822,14 @@ bool OrchestrationRunner::publishPhysicalMemoryAuthority()
         serving_session_ = std::make_unique<ServingSession>(*serving_rows_adapter_, context, vocabSize());
         serving_session_->setTraceRecorder(serving_trace_recorder_);
         std::string error;
-        if (!serving_session_->begin(capacity, supported, error, std::move(decision_storage)))
+        // The admitted queue depth Q is the running capacity's authored
+        // preparing-or-queued bound; until the capacity object is threaded
+        // through the runner, the queue remains bounded by the SAME admitted
+        // slot count (the response pool cannot exceed R = S + Q, and the
+        // serving layer imposes its own external intake bound on top).
+        const int queue_depth = capacity;
+        if (!serving_session_->begin(capacity, supported, error, std::move(decision_storage),
+                queue_depth))
         {
             serving_session_.reset();
             serving_rows_adapter_.reset();
@@ -26836,7 +26843,10 @@ bool OrchestrationRunner::publishPhysicalMemoryAuthority()
         if (!serving_session_)
             return setError("Serving batch session is not open");
         std::string error;
-        return serving_session_->submit(std::move(request), error) || setError(error);
+        const auto outcome = serving_session_->submit(std::move(request), error);
+        if (outcome == ServingSubmissionOutcome::Refused)
+            return setError(error);
+        return true; // Direct and Queued both accept the request.
     }
 
     void OrchestrationRunner::cancelServingRequest(std::uint64_t id)
