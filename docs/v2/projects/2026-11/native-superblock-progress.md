@@ -74,9 +74,12 @@ The checks below run once per call or construction. None runs in a hot program.
   publication, not a recoverable request. `requireExecutable` is unchanged.
 - **NEON tile source.** Its diff from `60694357f` is limited to the constructor's
   width initializer and one doc line, both edited in place. The source receives
-  the plan header through `CPUNativeQuantisedPreparedFootprint.h`, the owner of
-  the walked block geometry. Every role-mapped loop line is therefore unchanged,
-  and the tile-stack roles entry differs only in its source hash.
+  the plan header through `CPUNativeQuantisedWeightView.h`, the owner of the
+  admitted `blocks_per_row` extent. Every role-mapped loop line is therefore
+  unchanged, and the tile-stack roles entry differs only in its source hash.
+  Neither the key map's bound headers (`CPUNativeQuantisedEncoding.h`,
+  `CPUNativeQuantisedPreparedFootprint.h`, `NativeQuantisedFormatInfo.h`) nor the
+  bound compact helper source (`CPUNativeQuantisedMultiScaleKernels.h`) changes.
 - **x86 single-scale.** `requireSingleScaleTile` keeps its recoverable rejection
   and now uses the shared exact predicate `admitsOrderedPartitionArithmetic`.
 - **Entry walk admission.** `requireSuperblockWalk` runs at the entry of:

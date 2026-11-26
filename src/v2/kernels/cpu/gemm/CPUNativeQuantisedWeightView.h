@@ -14,9 +14,15 @@
  * Execution readers therefore never test metadata inside a worker team; the
  * owner of the bytes decides when a seal is current (see
  * CPUNativeQuantisedPublishedBytes).
+ *
+ * Kernels that walk a view's blocks_per_row extent also receive the cold walk
+ * and ordered-partition admission authority, CPUNativeOrderedPartitionPlan.h,
+ * through this header. The NEON tile source therefore needs no include line of
+ * its own, which keeps its role-mapped loop lines unchanged.
  */
 #pragma once
 
+#include "CPUNativeOrderedPartitionPlan.h"
 #include "CPUNativeQuantisedCodedMetadata.h"
 #include "CPUNativeQuantisedEncoding.h"
 #include "kernels/common/DeviceFP32NumericalContract.h"
