@@ -20,6 +20,7 @@
 
 #include "backends/DeviceId.h"
 #include "execution/compute_stages/ComputeStages.h"
+#include "execution/compute_stages/stages/PooledKVAppendStage.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "v2/tensors/Tensors.h"
 #include "kernels/cpu/attention/CPUFlashAttentionKernelT.h"
@@ -1505,4 +1506,108 @@ TEST(PooledStageConsumption, PooledModeRejectsUnsupportedAndForeignRefs)
     row_transform_params.active_query_rows_device = &dummy_row;
     AttentionComputeStage row_transform_stage(row_transform_params);
     EXPECT_FALSE(row_transform_stage.execute(&ctx));
+}
+
+
+/** @test P2 production caller: pooled APPEND + pooled ATTENTION, one table, one graph shape. */
+TEST(PooledStageConsumption, PooledAppendAndAttentionMatchContiguousControl)
+{
+    // Decode geometry: one token per page (page_tokens=1) so every decode step
+    // appends exactly one new page and shares every prior immutable page.
+    constexpr int heads = 2, kv_heads = 2, dimension = 8, page_tokens = 1;
+    constexpr int tokens = 6;
+    const auto device = DeviceId::cpu();
+    const PhysicalPagePoolGeometry pool_geometry{8,
+        static_cast<std::size_t>(page_tokens) * 2 * heads * dimension * sizeof(float), 2, 8};
+    const CPUFP32PagedKVTableGeometry table_geometry{8, 8, 4, page_tokens, 32, 8};
+    const auto bytes = PhysicalPagePool::physicalBytes(pool_geometry, device) +
+        CPUFP32PagedKVTable::physicalBytes(table_geometry, device);
+    PhysicalMemoryPlanBuilder plan;
+    plan.add({.world_rank=0, .device=device, .total_bytes=bytes, .admission_available_bytes=bytes},
+        PhysicalMemoryOwner::KVCache, bytes);
+    auto authority = std::make_shared<PhysicalMemoryAuthority>(
+        std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()), 0);
+    auto pool = authority->createCPUPagePool(device, pool_geometry, CPUStoragePlacement::local());
+    auto table = CPUFP32PagedKVTable::create(authority, device, table_geometry);
+
+    std::mt19937 random(101);
+    std::uniform_real_distribution<float> values(-0.5f, 0.5f);
+    const size_t width = static_cast<size_t>(heads * dimension);
+    std::vector<float> k(static_cast<size_t>(tokens) * width), v(k.size());
+    for (auto *bank : {&k, &v}) for (auto &x : *bank) x = values(random);
+    std::vector<float> q(width);
+    for (auto &x : q) x = values(random);
+    CPUFlashAttentionKernelT<ActivationPrecision::FP32> kernel;
+
+    // Graph-shaped sequence: for each decode row, the pooled append stage
+    // publishes one row into the table and mints the ref cell; the attention
+    // stage then resolves the cell. Single readonly thread, one MPIContext.
+    PooledPublicationCell previous_publication;
+    MPIContext stage_mpi{0, 1, MPI_COMM_WORLD};
+    TensorFactory factory(stage_mpi);
+    auto Q = factory.createFP32({1, width}, device);
+    auto output = factory.createFP32({1, width}, device);
+    std::memcpy(Q->mutable_data(), q.data(), sizeof(float) * width);
+    const int rows_per_page = page_tokens;
+    for (int step = 0; step < tokens; ++step)
+    {
+        // K/V row for this step (the append stage appends exactly one row).
+        std::vector<float> k_row(k.data() + step * width, k.data() + (step + 1) * width);
+        std::vector<float> v_row(v.data() + step * width, v.data() + (step + 1) * width);
+        auto kt = factory.createFP32({1, width}, device);
+        auto vt = factory.createFP32({1, width}, device);
+        std::memcpy(kt->mutable_data(), k_row.data(), sizeof(float) * width);
+        std::memcpy(vt->mutable_data(), v_row.data(), sizeof(float) * width);
+        PooledPublicationCell ref_cell;
+        PooledKVAppendStage::Params append_params;
+        append_params.device_id = device;
+        append_params.K = kt.get();
+        append_params.V = vt.get();
+        append_params.pool = pool.get();
+        append_params.table = table.get();
+        append_params.ref_out = &ref_cell;
+        append_params.request_id = 9;
+        append_params.slot = 0;
+        append_params.layer_idx = 0;
+        append_params.kv_heads = kv_heads;
+        append_params.head_dim = dimension;
+        append_params.page_tokens = page_tokens;
+        if (step > 0)
+            append_params.prior = &previous_publication;
+        PooledKVAppendStage append_stage(append_params);
+        ASSERT_TRUE(append_stage.execute(nullptr)) << "append step " << step;
+        ASSERT_TRUE(ref_cell.live());
+        // Attention stage resolves the ref cell (while the cell is live).
+        AttentionComputeStage::Params attn;
+        attn.device_id = device;
+        attn.Q = Q.get();
+        attn.output = output.get();
+        attn.batch_size = 1;
+        attn.seq_len = 1;
+        attn.kv_len = step + 1;
+        attn.n_heads = heads;
+        attn.n_kv_heads = kv_heads;
+        attn.head_dim = dimension;
+        attn.causal = true;
+        attn.window_size = -1;
+        attn.position_offset = step;
+        attn.pooled_table = table.get();
+        attn.pooled_ref_cell = &ref_cell.ref;
+        AttentionComputeStage attn_stage(attn);
+        ASSERT_TRUE(attn_stage.execute(nullptr)) << "attention step " << step;
+        // Oracle: contiguous decode over the tokens visible at this step.
+        std::vector<float> expected(width, -99.0f);
+        ASSERT_TRUE(kernel.compute_decode(q.data(), k.data(), v.data(), expected.data(), 1,
+            step + 1, heads, kv_heads, dimension, true, step));
+        const float *got = output->fp32_data();
+        int first_diff = -1;
+        for (size_t i = 0; i < width; ++i)
+            if (std::fabs(got[i] - expected[i]) > 1e-6f) { first_diff = static_cast<int>(i); break; }
+        ASSERT_EQ(first_diff, -1)
+            << "pooled append+attention diverged at step " << step
+            << " got=" << (first_diff >= 0 ? got[first_diff] : 0.0f)
+            << " expected=" << (first_diff >= 0 ? expected[first_diff] : 0.0f);
+        previous_publication = std::move(ref_cell);
+        (void)rows_per_page;
+    }
 }

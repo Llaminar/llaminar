@@ -126,7 +126,25 @@ namespace llaminar2
              * comment is not a claim of one.
              */
             CPUFP32PagedKVTable *pooled_table = nullptr; ///< Owning pooled table.
-            PagedKVSnapshotRef pooled_ref;                ///< Exact typed publication reference (J3).
+            /**
+             * @brief Exact typed publication reference (J3) for direct stage tests.
+             *
+             * A production caller instead supplies @p pooled_ref_cell: the
+             * pooled append stage writes the ref into a caller-owned cell
+             * during graph execution, and this stage reads that cell at
+             * execute time (a fixed value in Params would be stale because the
+             * publication only exists after the append ran).
+             */
+            PagedKVSnapshotRef pooled_ref;
+            /**
+             * @brief Caller-owned cell holding the CURRENT pooled publication ref.
+             *
+             * When non-null it takes precedence over @p pooled_ref and is read
+             * at execute time. The cell lives as long as the graph family
+             * (per request, per layer) and is written only by the owning
+             * pooled append stage; a refused resolve still fails closed.
+             */
+            const PagedKVSnapshotRef *pooled_ref_cell = nullptr;
 
             /**
              * @brief Device-owned logical query width for a scalar GPU graph.

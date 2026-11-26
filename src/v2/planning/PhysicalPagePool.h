@@ -41,6 +41,11 @@ struct PhysicalPagePoolGeometry
 class PhysicalPagePool final : public std::enable_shared_from_this<PhysicalPagePool>
 {
 public:
+    /** @return Original PMA instance this pool was issued from (same authority as the table). */
+    [[nodiscard]] const std::shared_ptr<PhysicalMemoryAuthority> &admissionAuthority() const noexcept
+    {
+        return authority_;
+    }
     /** @brief Non-reused incarnation of one privately granted frame. */
     struct FrameHandle
     {

@@ -1334,7 +1334,13 @@ namespace llaminar2
         // (the pooled branch fails closed if the snapshot cannot be produced).
         if (params_.pooled_table != nullptr)
         {
-            if (!params_.Q || !params_.output || !params_.pooled_ref.valid())
+            // A production caller reads the ref from the live cell (published by
+            // the pooled append stage during this graph); a direct test supplies
+            // it in Params. Either source must be a valid exact ref.
+            const bool ref_valid = params_.pooled_ref_cell
+                ? params_.pooled_ref_cell->valid()
+                : params_.pooled_ref.valid();
+            if (!params_.Q || !params_.output || !ref_valid)
             {
                 LOG_ERROR("[AttentionComputeStage] Pooled mode requires Q, output and an exact typed reference");
                 return false;
@@ -1403,6 +1409,11 @@ namespace llaminar2
         // is rejected with an explicit diagnostic — it can never fall through
         // to a ring compute with unvalidated null ring K/V.
         const bool pooled_mode = params_.pooled_table != nullptr;
+        // Production caller: the ref is published by the pooled append stage
+        // into a stable cell DURING this graph. Read it at execute time once;
+        // a stale/empty cell fails closed exactly like an invalid Params ref.
+        const PagedKVSnapshotRef current_ref =
+            params_.pooled_ref_cell ? *params_.pooled_ref_cell : params_.pooled_ref;
         bool pooled_ok = true;
         std::optional<CPUFP32PagedKVTable::Snapshot> pooled_borrow;
         if (pooled_mode)
@@ -1417,12 +1428,12 @@ namespace llaminar2
                 pooled_ok = false;
                 LOG_ERROR("[AttentionComputeStage] Pooled snapshot mode supports only single-row CPU decode");
             }
-            else if (!params_.pooled_ref.valid())
+            else if (!current_ref.valid())
             {
                 pooled_ok = false;
                 LOG_ERROR("[AttentionComputeStage] Pooled snapshot mode requires an exact typed reference");
             }
-            else if (params_.pooled_table->authorityIdentity() != params_.pooled_ref.authority_id)
+            else if (params_.pooled_table->authorityIdentity() != current_ref.authority_id)
             {
                 pooled_ok = false;
                 LOG_ERROR("[AttentionComputeStage] Pooled snapshot reference belongs to another table");
@@ -2001,12 +2012,12 @@ namespace llaminar2
                 // version; a reused bank or superseded version refuses) and
                 // compute through the production pooled kernel. A resolution
                 // refusal fails the step (never a silent ring path).
-                auto borrowed = params_.pooled_table->resolveSnapshotRef(params_.pooled_ref);
+                auto borrowed = params_.pooled_table->resolveSnapshotRef(current_ref);
                 if (!borrowed)
                 {
                     success = false;
                     LOG_ERROR("[AttentionComputeStage] Pooled snapshot resolve refused for version "
-                              << params_.pooled_ref.publication_version);
+                              << current_ref.publication_version);
                 }
                 else
                 {
