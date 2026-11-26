@@ -67,6 +67,18 @@ public:
     /** @return Whether a manifest was captured. */
     explicit operator bool() const noexcept { return captured_; }
 
+    /**
+     * @brief Restore a sampler from the manifest (no reseed) and replay the
+     *        complete captured history so the next RNG state is exact.
+     *
+     * The sampler is constructed from the ORIGINAL seed, then every captured
+     * history token is replayed through the same penalty/RNG path. Greedy
+     * laws need no history (decision 0 continues). This is the restore-side
+     * contract: a continuation is only restorable when replay yields the exact
+     * same RNG state as the no-movement control.
+     */
+    Sampler restoreSampler() const;
+
 private:
     Content content_;
     bool captured_ = false;

@@ -44,6 +44,19 @@ bool ServingContinuationManifest::capture(std::uint64_t request_id, int slot,
     return true;
 }
 
+Sampler ServingContinuationManifest::restoreSampler() const
+{
+    Sampler sampler(content_.sampling.seed);
+    // Replay the EXACT captured history through the same penalty/RNG path
+    // (no reseed, no invented tokens). Greedy laws advance no RNG, so an
+    // empty history is the exact greedy state.
+    for (const int32_t token : content_.sampler_prompt)
+        sampler.record_prompt_token(token);
+    for (const int32_t token : content_.sampler_decisions)
+        sampler.record_prompt_token(token);
+    return sampler;
+}
+
 bool ServingContinuationManifest::valid(std::string *error) const noexcept
 {
     if (!captured_)

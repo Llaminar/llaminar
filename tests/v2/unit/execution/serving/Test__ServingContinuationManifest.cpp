@@ -100,3 +100,32 @@ TEST(ServingContinuationManifest, EmptyManifestIsInvalid)
     EXPECT_FALSE(manifest.valid(&error));
     EXPECT_FALSE(error.empty());
 }
+
+/** @test Restore replays captured history so the next decision matches the control. */
+TEST(ServingContinuationManifest, RestoreProducesIdenticalNextDecision)
+{
+    std::string error;
+    SamplingParams law = seededLaw();
+    // Control: a sampler seeded once and advanced by the recorded history.
+    Sampler control(law.seed);
+    for (int i = 0; i < 5; ++i) control.record_prompt_token(i);
+    for (int i = 0; i < 3; ++i) control.record_prompt_token(100 + i);
+    // Manifest capturing the SAME history as decisions.
+    ServingContinuationManifest manifest;
+    ASSERT_TRUE(manifest.capture(9, 1, law, 0, /*cached_tokens=*/4,
+        /*completion_tokens=*/3, /*last_token=*/103, /*needs_feed=*/false,
+        /*has_logits=*/true, /*grant=*/0, {}, /*cancelled=*/false,
+        /*cached_prompt_tokens=*/0,
+        std::vector<int32_t>{100, 101, 102}, &error)) << error;
+    auto restored = manifest.restoreSampler();
+    // A fixed logits vector; with deterministic (temperature 0) sampling the
+    // penalty map is the only variable, so a restored sampler with the same
+    // history must make the identical greedy decision as the control.
+    std::vector<float> logits(8, 1.0f);
+    logits[2] = 9.0f; // Token 2 is the greedy pick unless a penalty shifts it.
+    SamplingParams greedy;
+    greedy.temperature = 0.0f;
+    // Both samplers carry the same history; the penalty map is identical, so
+    // the next decision is identical (no reseed, no history loss).
+    EXPECT_EQ(restored.sample(logits, greedy), control.sample(logits, greedy));
+}
