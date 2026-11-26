@@ -380,6 +380,69 @@ TEST(CPUFP32PagedKVTable, EffectiveUseWatermarkFollowsOnlyRealAttachments)
     EXPECT_TRUE(replay->acknowledge());
 }
 
+/** @test R12/R13: post-clear ack retries retirement; records survive bank reuse. */
+TEST(CPUFP32PagedKVTable, PostClearAcknowledgementRetiresAndRecordsReclaim)
+{
+    constexpr int dimension = 8;
+    const auto device = DeviceId::cpu();
+    const PhysicalPagePoolGeometry pool_geometry{2, 2 * 2 * dimension * sizeof(float), 2, 1};
+    // TWO banks, ONE record: a stale live incarnation must retire so the
+    // next publication can reuse the record slot without being blocked.
+    const CPUFP32PagedKVTableGeometry table_geometry{2, 2, 4, 2, 64, 0};
+    const auto bytes = PhysicalPagePool::physicalBytes(pool_geometry, device) +
+        CPUFP32PagedKVTable::physicalBytes(table_geometry, device);
+    PhysicalMemoryPlanBuilder plan;
+    plan.add({.world_rank=0, .device=device, .total_bytes=bytes, .admission_available_bytes=bytes},
+        PhysicalMemoryOwner::KVCache, bytes);
+    auto authority = std::make_shared<PhysicalMemoryAuthority>(
+        std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()), 0);
+    auto pool = authority->createCPUPagePool(device, pool_geometry, CPUStoragePlacement::local());
+    auto table = CPUFP32PagedKVTable::create(authority, device, table_geometry);
+    const auto page = [&](float value) {
+        auto grant = pool->tryAdmit(1);
+        if (!grant) throw std::logic_error("Fixture page grant refused");
+        const auto frame = grant->assignFrame();
+        std::vector<float> input(2 * 2 * dimension, 0.0f);
+        std::fill_n(input.data() + dimension, dimension, value);
+        auto write = grant->prepareAppend(frame, input.size() * sizeof(float));
+        if (!write) throw std::logic_error("Fixture page write refused");
+        write->copyFrom(std::as_bytes(std::span(input)));
+        return CPUFP32KVPage(write->commit(), 1, dimension);
+    };
+    // Publish v1; touch it; clear the bank WHILE the lease is live: retiring
+    // must refuse (obligation outstanding) and record retire_requested.
+    auto update = table->tryBeginUpdate();
+    ASSERT_TRUE(update);
+    update->append(page(1.0f));
+    auto snapshot = update->commit();
+    const auto first_incarnation = snapshot.version();
+    auto lease = table->touchEffectiveUse(snapshot);
+    ASSERT_TRUE(lease.has_value());
+    EXPECT_FALSE(table->retireEffectiveUseReplica(first_incarnation)); // Live: refuse.
+    // Post-clear acknowledgement: release the snapshot AND the lease; the
+    // late acknowledgement must complete the retirement automatically
+    // (records retire_requested; the final discharge retries it).
+    snapshot = {};
+    EXPECT_TRUE(lease->acknowledge());
+    EXPECT_TRUE(table->effectiveUseMayEvict(first_incarnation));
+    // Already retired by the late-ack retry: a second retire is an idempotent
+    // refusal (no duplicate transition, no live record to retire).
+    EXPECT_FALSE(table->retireEffectiveUseReplica(first_incarnation));
+    // Repeated publication beyond the retained slots: new incarnations reuse
+    // the reclaimed record slot (no reserve of stale live records).
+    for (int generation = 0; generation < 3; ++generation)
+    {
+        auto next = table->tryBeginUpdate();
+        ASSERT_TRUE(next) << "publication " << generation << " refused; record not reclaimed";
+        next->append(page(static_cast<float>(generation + 2)));
+        auto pub = next->commit();
+        auto fresh_lease = table->touchEffectiveUse(pub);
+        ASSERT_TRUE(fresh_lease.has_value());
+        EXPECT_TRUE(fresh_lease->acknowledge());
+        EXPECT_TRUE(table->retireEffectiveUseReplica(pub.version()));
+    }
+}
+
 /** @test Reservation conservation: issued + outstanding + new <= absolute budget always. */
 TEST(CPUFP32PagedKVTable, ReservationConservationHoldsThroughPartialConsumption)
 {
