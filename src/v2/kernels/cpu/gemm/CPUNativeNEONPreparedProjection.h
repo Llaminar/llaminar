@@ -11,7 +11,6 @@
  */
 #pragma once
 
-#include "CPUNativeOrderedPartitionPlan.h"
 #include "CPUNativeQuantisedMultiScaleKernels.h"
 #include "CPUNativeQuantisedWeightView.h"
 #include "tensors/MXFP4Format.h"
@@ -125,23 +124,15 @@ namespace llaminar2::cpu::native_quantised
          * @throws std::invalid_argument For an unknown policy, an encoding/codebook
          *         without a native implementation, or a non-canonical expert K tree.
          * @details After this check every dispatch branch taken by execution is
-         * implemented, so the execution path itself cannot throw. It also admits
-         * the canonical ordered partition plan once per call, before any team:
-         * a sealed row extent whose plan exceeds the tile programs' int
-         * partition arithmetic is a broken invariant and fatal
-         * (requireOrderedPartitionWidth()), not a recoverable request. The
-         * per-partition hot programs then check nothing.
+         * implemented, so the execution path itself cannot throw.
          */
         static void requireExecutable(const CPUNativeQuantisedWeightView &weights)
         {
             if (weights.numerical_policy != CPUProjectionNumericalPolicy::GPUAlignedExpert &&
                 weights.numerical_policy != CPUProjectionNumericalPolicy::BackendNative)
                 throw std::invalid_argument("Native NEON projection requires a known arithmetic policy");
-            const int partitions = partitionsFor(weights);
-            if (partitions <= 0)
+            if (partitionsFor(weights) <= 0)
                 throw std::invalid_argument("Native NEON expert projection requires the canonical aligned K tree");
-            static_cast<void>(requireOrderedPartitionWidth(0, weights.blocks_per_row,
-                                                           static_cast<std::size_t>(weights.blocks_per_row), partitions));
             bool implemented = false;
             switch (weights.encoding)
             {
@@ -319,18 +310,13 @@ namespace llaminar2::cpu::native_quantised
          * @param output Exclusive live output spans.
          * @param chunk Physical output chunk.
          * @param columns Live columns in this chunk.
-         * @param partitions Canonical arithmetic partition count.
-         * @details The partition width is the int64 ceiling admitted by
-         * requireOrderedPartitionWidth() (cold, fatal if it cannot fit the hot
-         * int arithmetic), stored in the existing int field.
+         * @param partitions Canonical partition count; requireOrderedPartitionWidth() admits the plan (cold, fatal).
          */
         CPUNativeNEONProjectionTile(CPUNativeQuantisedWeightView weights,
             const std::array<std::span<const Q8_1Block>, Rows> &activation,
             const std::array<std::span<float>, Rows> &output, int chunk, int columns, int partitions)
             : weights_(weights), activation_(activation), output_(output), chunk_(chunk), columns_(columns),
-              partitions_(partitions),
-              blocks_per_partition_(requireOrderedPartitionWidth(0, weights.blocks_per_row,
-                  static_cast<std::size_t>(weights.blocks_per_row), partitions)) {}
+              partitions_(partitions), blocks_per_partition_(requireOrderedPartitionWidth(0, weights.blocks_per_row, std::size_t(weights.blocks_per_row), partitions)) {}
 
         /** @brief Test byte-range overlap without forming overflowing end addresses.
          * @param a First byte root.

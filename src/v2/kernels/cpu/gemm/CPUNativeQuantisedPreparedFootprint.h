@@ -6,6 +6,11 @@
  * payload.  Cache policy therefore must be expressed in bytes of the prepared
  * interleaved stream and its live activation/output panels. A typed footprint
  * distinguishes each prepared unit from the original source block geometry.
+ *
+ * Kernels that walk this block geometry (superblockEnd()) also receive its
+ * cold walk and ordered-partition admission, CPUNativeOrderedPartitionPlan.h,
+ * through this header. The NEON tile source therefore needs no include line of
+ * its own, which keeps its role-mapped loop lines unchanged.
  */
 
 #pragma once
@@ -13,6 +18,7 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "CPUNativeOrderedPartitionPlan.h"
 #include "tensors/NativeQuantisedFormatInfo.h"
 #include "tensors/NativeQuantisedSuperblockMetadata.h"
 

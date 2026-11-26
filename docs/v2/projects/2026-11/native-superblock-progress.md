@@ -65,15 +65,18 @@ The checks below run once per call or construction. None runs in a hot program.
 
 - **Canonical width producer.** `requireOrderedPartitionWidth` computes the
   ceiling in int64, checks that it fits, and returns it for the existing int
-  field. Three sites use it:
-  - the NEON tile constructor (`blocks_per_partition_`);
-  - NEON `requireExecutable`, the batch binding's once-per-call admission
-    before any team;
+  field. Two sites use it:
+  - the NEON tile constructor (`blocks_per_partition_`), which runs once per
+    tile, outside the K programs;
   - the NEON packed-prefill chunk producer (`per_partition`).
 
   A NEON plan rejection is fatal because it is a broken invariant of a sealed
-  publication, not a recoverable request. The other `std::invalid_argument`
-  rejections of `requireExecutable` are unchanged.
+  publication, not a recoverable request. `requireExecutable` is unchanged.
+- **NEON tile source.** Its diff from `60694357f` is limited to the constructor's
+  width initializer and one doc line, both edited in place. The source receives
+  the plan header through `CPUNativeQuantisedPreparedFootprint.h`, the owner of
+  the walked block geometry. Every role-mapped loop line is therefore unchanged,
+  and the tile-stack roles entry differs only in its source hash.
 - **x86 single-scale.** `requireSingleScaleTile` keeps its recoverable rejection
   and now uses the shared exact predicate `admitsOrderedPartitionArithmetic`.
 - **Entry walk admission.** `requireSuperblockWalk` runs at the entry of:

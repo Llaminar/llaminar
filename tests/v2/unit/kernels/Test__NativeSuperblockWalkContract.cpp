@@ -8,8 +8,7 @@
  * CPUNativeOrderedPartitionPlan.h admits each plan once, in cold code, so that
  * none of those expressions can overflow. These tests call the production
  * predicates and the production producer requireOrderedPartitionWidth() (the
- * NEON tile constructor's, publication admission's and packed prefill's width
- * authority) directly, prove the exact representability boundary (INT_MAX
+ * NEON tile constructor's and packed prefill's width authority) directly, prove the exact representability boundary (INT_MAX
  * admitted, INT_MAX + 1 rejected) and the fatal rejections, including the
  * original stuck range first=8, last=9, blocks=8. On x86 the actual
  * single-scale kernel entry is called with that range as a production-path
