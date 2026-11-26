@@ -402,6 +402,8 @@ if(HAVE_CUDA)
         kernels/cuda/gemm/CUDANativeQuantisedGemvShard6.cu
         kernels/cuda/gemm/CUDANativeQuantisedGemvShard7.cu
         kernels/cuda/gemm/CUDATinyFP32ProjectionKernels.cu  # deterministic tiny FP32 M<=4 verifier projections
+        kernels/cuda/gemm/CUDAFixedKHalfProjection.cu  # fixed-K chunk-invariant half-RNE prefill projections
+        kernels/cuda/gemm/CUDAFixedKScalarProjection.cu  # fixed-K chunk-invariant strict-FP32 prefill projections
         # NativeQuantised prefill is physically sharded by codebook pair, like
         # decode: eight complete, deterministic modules behind one host-only
         # dispatcher that owns the public ABI and the launch-policy state.
@@ -717,6 +719,7 @@ if(HAVE_ROCM)
         kernels/rocm/gemm/ROCmNativeQuantisedVerifierWmma.hip # Native grouped verifier
         kernels/rocm/gemm/ROCmNativeQuantisedWmma.hip # Independent native gfx1100 WMMA compilation
         kernels/rocm/gemm/ROCmSmallNFP32ProjectionKernels.hip # Graph-capturable FP32 small-output projection kernels
+        kernels/rocm/gemm/ROCmFixedKProjection.hip # fixed-K chunk-invariant explicit-operand prefill (gfx1100 WMMA, scalar FMA)
         kernels/rocm/gemm/ROCmMoEGroupedPrefillKernels.hip    # Grouped MoE prefill pipeline (graph-capturable, all experts single launch)
         kernels/rocm/moe/ROCmMoEGroupedIntermediateExchange.hip # lossless SwiGLU/scales exchange boundary
         kernels/rocm/attention/ROCmFlashAttentionKernels.hip  # Flash Attention 2 + Flash Decoding for MI50

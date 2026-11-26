@@ -14,6 +14,7 @@
 #include <mpi.h>
 #include <nlohmann/json.hpp>
 #include <cstdlib>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <stdexcept>
@@ -23,14 +24,26 @@
 /** @brief Run one exact two-rank CPU transaction, then finalize, fail or await interruption. */
 int main(int argc, char **argv)
 {
+    const auto startup = std::chrono::steady_clock::now();
+    const auto phase = [&](const char *name) {
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - startup).count();
+        std::fprintf(stderr, "MPI_PROBE_STARTUP pid=%ld phase=%s elapsed_ms=%lld\n",
+            static_cast<long>(::getpid()), name, static_cast<long long>(elapsed));
+        std::fflush(stderr);
+    };
+    phase("main");
     if (auto terminal=llaminar2::MPISessionOwner::enterProcess(argc,argv))return *terminal;
+    phase("owner-entered");
     if (argc != 3) return 125;
     const std::filesystem::path observations = argv[1];
     const std::string mode = argv[2];
     if (mode != "success" && mode != "failure" && mode != "wait" && mode != "inspect") return 125;
     int provided = 0;
+    phase("mpi-init-begin");
     if (MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided) != MPI_SUCCESS ||
         provided < MPI_THREAD_MULTIPLE) return 126;
+    phase("mpi-init-end");
     int rank = -1, size = 0;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
@@ -38,6 +51,7 @@ int main(int argc, char **argv)
     int sum = 0;
     if (MPI_Allreduce(&value, &sum, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD) != MPI_SUCCESS ||
         sum != size * (size + 1) / 2) MPI_Abort(MPI_COMM_WORLD, 126);
+    phase("collective-end");
     const char *temporary = std::getenv("TMPDIR");
     const char *shared = std::getenv("OMPI_MCA_btl_vader_backing_directory");
     if (!temporary || !shared) MPI_Abort(MPI_COMM_WORLD, 125);

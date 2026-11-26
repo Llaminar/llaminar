@@ -254,7 +254,12 @@ namespace llaminar2
         // hybrid recurrent state and terminal observations under identical
         // model/policy fields. Fence those archives before payload access;
         // storage generations and CPU readout identities do not version this fix.
-        hash = fnvUpdateString(hash, "prefix-cache-v18");
+        // V19 evaluates ordinary explicit-operand (half-RNE) GPU prefill
+        // projections with the fixed-K partition contract instead of vendor
+        // BLAS, whose reduction order followed the chunk's row count. GDN
+        // alpha/beta, and therefore recurrent/KV state, can differ from V18
+        // under identical model/policy fields; reject V18 before payload I/O.
+        hash = fnvUpdateString(hash, "prefix-cache-v19");
 
         const std::array<std::pair<const char *, uint64_t>, 7> ordered_parts{{
             {"model", parts.model},

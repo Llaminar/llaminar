@@ -1713,18 +1713,22 @@ size_t gpuFloatingPointWorkspaceBytes(
         const auto &sharding = schema.get();
         for (const auto &tensor : profile.tensors)
         {
-            if (!WorkspaceMemoryEstimator::ownsProjectionSource(tensor, profile, geometry) ||
-                PreparedWeightRepresentationContract::effectiveGDNArithmetic(
-                    workspaceSourceRole(tensor,profile,geometry), tensor.quant_type, tensor.name, profile.architecture,
-                    geometry.planning_policy.gdn_projection_arithmetic) != GDNProjectionArithmetic::FP16) continue;
+            if (!WorkspaceMemoryEstimator::ownsProjectionSource(tensor, profile, geometry)) continue;
+            const auto arithmetic = PreparedWeightRepresentationContract::effectiveGDNArithmetic(
+                workspaceSourceRole(tensor,profile,geometry), tensor.quant_type, tensor.name, profile.architecture,
+                geometry.planning_policy.gdn_projection_arithmetic);
+            if (arithmetic != GDNProjectionArithmetic::FP16 && arithmetic != GDNProjectionArithmetic::FP32) continue;
+            // Explicit operands declare their fixed-K chain bank; half also its A bank.
+            const auto operand = arithmetic == GDNProjectionArithmetic::FP16
+                ? FloatingActivationOperandPrecision::FP16RNE : FloatingActivationOperandPrecision::FP32;
             const auto shape = localWorkspaceMatrixShape(tensor, profile, geometry, sharding, false);
-            if (!shape.valid()) throw std::invalid_argument("GDN half workspace has no source matrix geometry: " + tensor.name);
+            if (!shape.valid()) throw std::invalid_argument("GDN explicit-operand workspace has no source matrix geometry: " + tensor.name);
             if (geometry.device.is_rocm())
                 scoped_gdn.merge(rocm::floating_gemm_workspace::projectionRequirements(
-                    execution_rows, shape.input_columns, FloatingActivationOperandPrecision::FP16RNE));
+                    execution_rows, shape.input_columns, operand));
             else
                 scoped_gdn.merge(cuda::floating_gemm_workspace::projectionRequirements(
-                    execution_rows, shape.output_columns, shape.input_columns, FloatingActivationOperandPrecision::FP16RNE));
+                    execution_rows, shape.output_columns, shape.input_columns, operand));
         }
     }
 

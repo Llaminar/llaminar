@@ -10,9 +10,10 @@
  * - Wraps CuBLASGemmKernel for actual computation
  * - Handles tensor type dispatch (FP32, FP16, BF16)
  * - All tensor data must be on GPU before calling
- * - Explicit GDN operand modes retain FP32 C: FP32 uses pedantic GemmEx;
- *   FP16RNE casts exactly complete ordinary M*K rows once into named workspace.
- *   Verifier, live-count and fixed-column modes reject before any enqueue.
+ * - Explicit GDN operand modes retain FP32 C and evaluate ordinary multi-row
+ *   prefill with the fixed-K contract (scalar FMA for FP32, tensor-core MMA
+ *   for FP16RNE after one exact half cast into named workspace), so prompt
+ *   rows are independent of chunking and bucket size.
  *
  * **Usage**:
  * ```cpp
@@ -28,6 +29,7 @@
 
 #include "kernels/common/FloatingOutputPartitionScope.h"
 #include "kernels/FloatingActivationOperandPrecision.h"
+#include "kernels/common/FixedHalfProjectionGroup.h"
 
 #include "tensors/TensorKernels.h"
 #include <memory>
@@ -357,13 +359,36 @@ namespace llaminar2
                 DeviceWorkspaceManager *workspace);
 
             /**
-             * @brief Submit ordinary fully-active multi-row BLAS using actual typed operands.
+             * @brief Submit ordinary fully-active multi-row explicit-operand projection.
              * @param input FP32/half A [m,k], selected by immutable policy.
              * @param output FP32 C [m,n]. @param m Fully-active rows.
              * @param n Prepared output width. @param k Prepared reduction width.
-             * @param workspace Retained library scratch. @return Submission success.
+             * @param workspace Retained scratch. @return Submission success.
+             * @details Half operands use submitFixedKHalfGroup(), FP32 submitFixedKFP32Group().
              */
             bool submitOperandProjection(const void *input, float *output, int m, int n, int k,
+                DeviceWorkspaceManager *workspace);
+
+            /**
+             * @brief Submit one ordinary half-RNE group through the fixed-K contract.
+             * @param group Published half bank, persistent half weights and FP32 outputs.
+             * @param m Physical rows. @param k Prepared reduction width.
+             * @param workspace Admitted scratch holding the bounded partition-chain bank.
+             * @return Submission success; emits the schedule as PerfStats evidence.
+             * @throws std::invalid_argument For a missing stream, workspace or bank.
+             */
+            bool submitFixedKHalfGroup(const FixedHalfProjectionGroup &group, int m, int k,
+                DeviceWorkspaceManager *workspace);
+
+            /**
+             * @brief Submit one ordinary strict-FP32 group through the fixed-K scalar contract.
+             * @param group FP32 source rows, persistent FP32 weights and FP32 outputs.
+             * @param m Physical rows. @param k Prepared reduction width.
+             * @param workspace Admitted scratch holding the bounded partition-chain bank.
+             * @return Submission success; emits the schedule as PerfStats evidence.
+             * @throws std::invalid_argument For a missing stream, workspace or bank.
+             */
+            bool submitFixedKFP32Group(const FixedStrictFP32ProjectionGroup &group, int m, int k,
                 DeviceWorkspaceManager *workspace);
 
             bool run_fixed_order_swiglu_down(

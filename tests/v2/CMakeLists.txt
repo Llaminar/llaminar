@@ -5054,6 +5054,11 @@ set_tests_properties(V2_Integration_ReleaseNativeAliasReachability PROPERTIES
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;BuildSystem;RCCL;Regression"
     TIMEOUT 30)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ReleaseNativeAliasReachability)
+add_v2_test(V2_Unit_CPUPublicationAdmissionRegistration
+    COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cpu_publication_admission_registration.py
+    LABELS "V2;Unit;DeviceFree;BuildSystem;CPU;Publication;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS)
 # Actual included modules must obey the same Release/Integration target policy.
 foreach(_native_module_selection_kind Unit Integration)
     set(_native_module_selection_labels "V2;${_native_module_selection_kind};BuildSystem;Regression;DeviceFree")
@@ -5575,6 +5580,31 @@ foreach(V2_MPI_ENTRY_KIND IN ITEMS integration e2e shared original)
         V2_Integration_MPISessionEntryReplay_${V2_MPI_ENTRY_KIND})
 endforeach()
 endif()
+
+
+# PR75/78 MPI startup diagnostic registration (reviewer-94 block 3). The
+# policy half runs in seconds; the lifecycle half uses the real hook and
+# diagnostic with its own bounded identities (TIMEOUT 60, no models, no MPI).
+add_v2_test(V2_Unit_MPIStartupDiagnosticPolicy
+    COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../scripts/ci/mpi_diag/test_mpi_diag_registration.py
+        MPIStartupDiagnosticPolicy
+    LABELS "V2;Unit;CPU;DeviceFree;MPI;Lifecycle;Regression;SourcePolicy"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60)
+add_v2_test(V2_Integration_MPIStartupDiagnosticLifecycle
+    COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../scripts/ci/mpi_diag/test_mpi_diag_registration.py
+        MPIStartupDiagnosticLifecycle
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;MPI;Lifecycle;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MPIStartupDiagnosticLifecycle)
+add_v2_test(V2_Integration_MPIStartupDiagnosticSafety
+    COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../scripts/ci/mpi_diag/test_mpi_diag_registration.py
+        RegisteredSafety
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;MPI;Lifecycle;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MPIStartupDiagnosticSafety)
 
 add_test(NAME V2_Integration_MPICTestSessionIsolation
     COMMAND ${Python3_EXECUTABLE}
@@ -15993,6 +16023,16 @@ add_v2_test(V2_Integration_PrefixCacheCUDAGroupedPhysicalRowsGeneration
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_PrefixCacheCUDAGroupedPhysicalRowsGeneration)
 
+# Fence persisted state from chunk-dependent vendor-BLAS half-operand prefill.
+add_v2_test(V2_Integration_PrefixCacheFixedKHalfPrefillGeneration
+    COMMAND $<TARGET_FILE:v2_test_prefix_cache_fingerprint>
+        --gtest_filter=Test__PrefixCacheFingerprint.FixedKHalfPrefillRejectsV18AndRestartsStably
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;PrefixCache;GatedDeltaNet;CUDA;ROCm;Regression"
+    MPI_PROCS 1 TIMEOUT 30 NO_MODELS NO_MPI
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+    V2_Integration_PrefixCacheFixedKHalfPrefillGeneration)
+
 add_v2_test(V2_Integration_Qwen4ExpHCUpPrefixIdentity
     COMMAND $<TARGET_FILE:v2_test_prefix_cache_fingerprint>
             --gtest_filter=Test__PrefixCacheFingerprint.FlashNextHCUpActivationSeparatesRestarts:Test__PrefixCacheFingerprint.FlashNextHCUpActivationRejectsDuplicateAuthority
@@ -20333,28 +20373,7 @@ if(V2_CPU_TARGET_X86 AND TEST V2_Integration_CPUNativeQuantised_GEMV)
     set_tests_properties(V2_Integration_CPUNativeQuantised_GEMV PROPERTIES
         PROCESSORS ${V2_NATIVE_PAYLOAD_KPART_THREADS})
 endif()
-# Every CPU NativeQuantised entry rejects unsealed or stale publications, on
-# each native runtime ISA of this build (NEON, AVX2, AVX512).
-set(V2_CPU_PUBLICATION_ADMISSION_ISAS ${V2_CPU_BASELINE_RUNTIME_ISA})
-if(LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
-    list(APPEND V2_CPU_PUBLICATION_ADMISSION_ISAS avx2 avx512)
-endif()
-list(REMOVE_DUPLICATES V2_CPU_PUBLICATION_ADMISSION_ISAS)
-foreach(V2_ADMISSION_ISA IN LISTS V2_CPU_PUBLICATION_ADMISSION_ISAS)
-    string(TOUPPER "${V2_ADMISSION_ISA}" V2_ADMISSION_ISA_LABEL)
-    string(REPLACE "-" "_" V2_ADMISSION_ISA_LABEL "${V2_ADMISSION_ISA_LABEL}")
-    add_v2_test(V2_Integration_CPU_NativeQuantisedPublicationAdmission_${V2_ADMISSION_ISA_LABEL}
-        COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_gemv>
-                --gtest_filter=CPUNativeQuantisedPublicationAdmission.*
-                --gtest_brief=1
-        LABELS "V2;Integration;CPU;NativeQuantised;MXFP4;Publication;${V2_ADMISSION_ISA_LABEL};ProductionTestPreflight;Regression"
-        MPI_PROCS 1
-        NO_MPI
-        NO_MODELS
-        ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_ADMISSION_ISA}")
-    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
-        V2_Integration_CPU_NativeQuantisedPublicationAdmission_${V2_ADMISSION_ISA_LABEL})
-endforeach()
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/V2CPUPublicationAdmissionTests.cmake")
 set(V2_CPU_MOVABLE_FLOATING_EXPERT_PREFLIGHT_TESTS)
 foreach(V2_FLOATING_EXPERT_ISA IN ITEMS scalar ${V2_CPU_BASELINE_RUNTIME_ISA})
     if(V2_FLOATING_EXPERT_ISA STREQUAL "scalar")
@@ -29174,6 +29193,54 @@ if(HAVE_CUDA)
         MPI_PROCS 1
         NO_MODELS
         TIMEOUT 120
+    )
+endif()
+# Issue #74: explicit-operand GDN prefill rows must not depend on prefix-cache
+# chunking, bucket or row offset. Each backend proves its fixed-K schedules
+# and replays the real captured GDN stage under the issue's chunkings.
+if(HAVE_CUDA)
+    add_executable(v2_integration_cuda_fixed_k_prefill_projection
+        integration/kernels/Test__FixedKPrefillProjection.cpp)
+    v2_test_device_scope(v2_integration_cuda_fixed_k_prefill_projection FullInventory)
+    target_compile_definitions(v2_integration_cuda_fixed_k_prefill_projection
+        PRIVATE LLAMINAR_FIXED_K_CUDA=1)
+    target_link_libraries(v2_integration_cuda_fixed_k_prefill_projection
+        llaminar2_core GTest::gtest CUDA::cudart)
+    add_v2_test(V2_Integration_CUDAFixedKPrefillProjection
+        COMMAND $<TARGET_FILE:v2_integration_cuda_fixed_k_prefill_projection>
+        LABELS "V2;Integration;ProductionTestPreflight;CUDA;GDN;GEMM;PrefixCache;GraphCapture;Replay;ByteExact;Regression"
+        MPI_PROCS 1
+        NO_MODELS
+        TIMEOUT 120
+    )
+endif()
+if(HAVE_ROCM)
+    add_executable(v2_integration_rocm_fixed_k_prefill_projection
+        integration/kernels/Test__FixedKPrefillProjection.cpp)
+    v2_test_device_scope(v2_integration_rocm_fixed_k_prefill_projection FullInventory)
+    target_compile_definitions(v2_integration_rocm_fixed_k_prefill_projection
+        PRIVATE __HIP_PLATFORM_AMD__=1)
+    target_link_libraries(v2_integration_rocm_fixed_k_prefill_projection
+        llaminar2_core GTest::gtest hip::host)
+    if(NOT LLAMINAR_SHARED_CORE)
+        target_link_libraries(v2_integration_rocm_fixed_k_prefill_projection rocm_backend)
+    endif()
+    add_v2_test(V2_Integration_ROCmFixedKPrefillProjection
+        COMMAND $<TARGET_FILE:v2_integration_rocm_fixed_k_prefill_projection>
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;GDN;GEMM;PrefixCache;GraphCapture;Replay;ByteExact;Regression"
+        MPI_PROCS 1
+        NO_MODELS
+        TIMEOUT 120
+    )
+    # Native gfx1100 qualification of the WMMA schedules (the generic entry
+    # selects them automatically on gfx1100; this one binds the ISA explicitly).
+    add_v2_test(V2_Integration_ROCmFixedKPrefillProjectionWmma
+        COMMAND $<TARGET_FILE:v2_integration_rocm_fixed_k_prefill_projection>
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;GDN;GEMM;WMMA;PrefixCache;GraphCapture;Replay;ByteExact;Regression;NativeISA-gfx1100;HardwareOptional;Devices1"
+        MPI_PROCS 1
+        NO_MODELS
+        TIMEOUT 120
+        RESOURCE_LOCK rocm_gpu_0
     )
 endif()
 if(HAVE_ROCM)
