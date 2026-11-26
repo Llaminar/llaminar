@@ -4795,7 +4795,7 @@ CLANG_CC1 = {
     "-fdebug-compilation-dir=": "directory", "-fcoverage-compilation-dir=": "directory",
 }
 GNU_CC1PLUS = {
-    "-quiet": "flag", "-mlittle-endian": "flag", "-g": "flag", "-O3": "flag", "-fPIE": "flag", "-fno-lto": "flag",
+    "-quiet": "flag", "-mlittle-endian": "flag", "-g": "flag", "-O3": "flag", "-fPIE": "flag", "-fPIC": "flag", "-fopenmp": "flag", "-fno-lto": "flag",
     "-fasynchronous-unwind-tables": "flag", "-fstack-protector-strong": "flag", "-fstack-clash-protection": "flag",
     "-H": "flag", "-imultiarch": r"aarch64-linux-gnu", "-mcpu=": "generic", "-march=": r"armv8-a(?:\+\w+)*",
     "-mabi=": "lp64", "-std=": r"(?:gnu|c)\+\+(?:20|23)", "-fno-sanitize=": "all", "-D": r"[A-Za-z_]\w*(?:=[\w.+-]*)?",

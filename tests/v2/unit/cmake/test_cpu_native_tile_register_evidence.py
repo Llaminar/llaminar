@@ -3891,6 +3891,10 @@ class ProofBindingTest(unittest.TestCase):
                 "/tmp/ccAb12Cd.s"]]
         CHECKER.validate_plan([clang], "AppleClang-21", paths)
         CHECKER.validate_plan(gnu, "GNU-14", paths)
+        CHECKER.validate_plan([gnu[0] + ["-fPIC", "-fopenmp"], gnu[1]], "GNU-14", paths)
+        for unsupported in ("-funknown-witness", "-fPIC=1", "-fopenmp=libomp", "-fno-openmp"):
+            with self.subTest(unsupported=unsupported), self.assertRaises(ValueError):
+                CHECKER.validate_plan([gnu[0] + [unsupported], gnu[1]], "GNU-14", paths)
         for prior in ("gnu++23", "c++23"):
             CHECKER.validate_plan([gnu[0][:-1] + ["-std=" + prior, "-std=c++20"], gnu[1]], "GNU-14", paths)
         for dialects in (("c++20", "gnu++23"), ("gnu++23",), (), ("c++26", "c++20")):
