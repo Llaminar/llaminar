@@ -55,9 +55,20 @@ namespace llaminar2
         cancellations_.clear();
         pending_grants_.clear();
         pending_forced_.clear();
+        outstanding_suspensions_.clear(); // A new incarnation invalidates old manifests (D1).
         failure_.clear();
         capacity_ = capacity;
         queue_capacity_ = queue_capacity;
+        // D1: a FRESH, NON-ZERO nonce per incarnation — every begin() mints a
+        // unique session identity, so a manifest from a prior incarnation (or
+        // another session) can never restore here.
+        do
+        {
+            std::random_device entropy;
+            session_nonce_ = (static_cast<std::uint64_t>(entropy()) << 32) ^
+                             (static_cast<std::uint64_t>(entropy()) << 1) ^
+                             static_cast<std::uint64_t>(entropy());
+        } while (session_nonce_ == 0);
         active_ = true;
         return true;
     }
@@ -610,20 +621,17 @@ namespace llaminar2
             error = "Serving request has a pending (undecided) forward";
             return std::nullopt;
         }
-        // P4 prefix admission: the row's typed prefix admission contract is
-        // not yet carried by the manifest. Suspending a prefix-cache-backed
-        // request would restore it with a default admission block and mismatch
-        // the retained prefix (events and harvest consult it). REFUSE before
-        // any mutation until the typed contract is part of the continuation.
-        // B2: a prefix-MISS row with a cache_enabled admission still drives
-        // harvest and counters through the typed admission; restoring it with a
-        // default admission would silently skip archiving (cache_enabled=false)
-        // and diverge from the uninterrupted control. Refuse ANY admission with
-        // cache_enabled (hit or miss) until the typed contract is carried.
-        if (row.cached_prompt_tokens > 0 || row.prefix_admission.hit() ||
-            row.prefix_admission.cache_enabled)
+        // P4 prefix admission continuation: the typed admission contract IS
+        // carried in the manifest (cache_enabled/supported/block_size/
+        // fingerprint_key + cached_prompt_tokens), so a cache-enabled MISS row
+        // can suspend and restore with the SAME admission (harvest and
+        // counters identical to the uninterrupted control). A FULL HIT row
+        // still refuses: its live blocks/payload_plan referents are not in the
+        // manifest and cannot be re-materialized without the executor's import
+        // contract (documented P4 continuation boundary).
+        if (row.cached_prompt_tokens > 0 || row.prefix_admission.hit())
         {
-            error = "Serving cache-enabled request suspension requires the typed prefix admission contract; "
+            error = "Serving prefix-HIT request suspension requires the executor prefix import contract; "
                     "refused before mutation";
             return std::nullopt;
         }
@@ -774,6 +782,15 @@ namespace llaminar2
         row.forced.assign(content.forced.begin(), content.forced.end());
         row.cancelled = content.cancelled;
         row.cached_prompt_tokens = content.cached_prompt_tokens;
+        // P4 prefix admission continuation: the TYPED admission travels in the
+        // manifest (captured at suspend for cache-enabled MISS rows), so the
+        // restored row drives harvest/counters with the SAME contract as the
+        // uninterrupted control — never a silently defaulted admission.
+        row.prefix_admission.supported = content.prefix_supported;
+        row.prefix_admission.cache_enabled = content.prefix_cache_enabled;
+        row.prefix_admission.block_size = content.prefix_block_size;
+        row.prefix_admission.fingerprint_key = content.prefix_fingerprint_key;
+        row.prefix_admission.cached_tokens = content.cached_prompt_tokens;
         row.sampler_decisions = content.sampler_decisions;
         row.slot = target;
         // Reserve BEFORE the executor import: push_back below is noexcept

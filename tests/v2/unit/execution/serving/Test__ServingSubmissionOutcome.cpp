@@ -242,19 +242,19 @@ TEST(ServingSubmissionOutcome, PrefixBackedSuspensionRefusesPreMutation)
     EXPECT_EQ(session.occupancy().queued, 0);
 }
 
-/** @test R15 B2: a prefix-MISS row with cache-enabled admission refuses suspension. */
-TEST(ServingSubmissionOutcome, CacheEnabledMissAdmissionRefusesSuspension)
+/** @test R15 B2 (superseded by R17): the typed prefix admission is carried, so a MISS row supports suspension. */
+// The typed admission contract (cache_enabled/supported/block_size/fingerprint_key)
+// now travels in the manifest; the cache-enabled MISS case is covered by
+// CacheEnabledMissSuspendRestoreKeepsAdmission. Full HIT rows still refuse.
+TEST(ServingSubmissionOutcome, PrefixHitAdmissionStillRefusesSuspension)
 {
     ScriptedRows rows;
     ServingSession session(rows, 256, 8);
     std::string error;
     ASSERT_TRUE(session.begin(1, 1, error, nullptr, 0));
     rows.setSlotKV(0, {std::byte{1}, std::byte{2}, std::byte{3}});
-    // Prefix cache enabled but the admission was a MISS (no cached tokens):
-    // the typed admission still drives harvest and counters. Restoring with a
-    // default admission would skip archiving silently and diverge from the
-    // uninterrupted control, so suspension must refuse pre-mutation.
-    rows.prefix_miss_cache_enabled = true;
+    // A real HIT (cached tokens + blocks) cannot be carried: still refuses pre-mutation.
+    rows.prefix_restored_tokens = 32;
     auto request = greedy(1);
     request.prompt.assign(ServingSession::kPrefillChunk + 5, 9);
     request.max_new_tokens = 8;
@@ -262,7 +262,7 @@ TEST(ServingSubmissionOutcome, CacheEnabledMissAdmissionRefusesSuspension)
     session.step();
     auto manifest = session.suspend(1, error);
     EXPECT_FALSE(manifest.has_value());
-    EXPECT_NE(error.find("cache-enabled"), std::string::npos) << error;
+    EXPECT_NE(error.find("prefix-HIT"), std::string::npos) << error;
     // Pre-mutation: row and slot untouched.
     EXPECT_EQ(session.occupancy().resident, 1);
     EXPECT_EQ(session.occupancy().queued, 0);
@@ -374,6 +374,83 @@ TEST(ServingSubmissionOutcome, EndWithOutstandingSuspensionEmitsTerminal)
             EXPECT_NE(e.error.find("outstanding suspension"), std::string::npos) << e.error;
         }
     EXPECT_TRUE(errored); // Defined terminal: one Error, no hang, no drop.
+}
+
+/** @test R17 D1: colliding request id across sessions refuses with \"another session\". */
+TEST(ServingSubmissionOutcome, CollidingIdAcrossSessionsRefusesForeign)
+{
+    ScriptedRows rows_a;
+    ServingSession a(rows_a, 32, 8);
+    ScriptedRows rows_b;
+    ServingSession b(rows_b, 32, 8);
+    std::string error;
+    ASSERT_TRUE(a.begin(1, 1, error, nullptr, 0));
+    ASSERT_TRUE(b.begin(1, 1, error, nullptr, 0));
+    ASSERT_NE(a.sessionNonce(), b.sessionNonce()); // Unique per session.
+    rows_a.setSlotKV(0, {std::byte{1}, std::byte{2}, std::byte{3}});
+    rows_b.setSlotKV(0, {std::byte{4}, std::byte{5}, std::byte{6}});
+    EXPECT_EQ(a.submit(greedy(1), error), ServingSubmissionOutcome::Direct);
+    EXPECT_EQ(b.submit(greedy(1), error), ServingSubmissionOutcome::Direct);
+    a.step(); b.step();
+    auto ma = a.suspend(1, error);
+    auto mb = b.suspend(1, error);
+    ASSERT_TRUE(ma.has_value());
+    ASSERT_TRUE(mb.has_value());
+    // A's manifest (id 1) must REFUSE in B with \"another session\" — the
+    // nonce binding, not merely the request-id outstanding lookup.
+    EXPECT_FALSE(b.restore(std::move(*ma), error));
+    EXPECT_NE(error.find("another session"), std::string::npos) << error;
+    // Each manifest restores into its OWN session (its own nonce matches).
+    EXPECT_TRUE(a.restore(std::move(*ma), error)) << error;
+    EXPECT_TRUE(b.restore(std::move(*mb), error)) << error;
+}
+
+/** @test R17 D1: a manifest minted before end()/begin() refuses the new incarnation. */
+TEST(ServingSubmissionOutcome, PreEndManifestRefusesNewIncarnation)
+{
+    ScriptedRows rows;
+    ServingSession session(rows, 32, 8);
+    std::string error;
+    ASSERT_TRUE(session.begin(1, 1, error, nullptr, 0));
+    rows.setSlotKV(0, {std::byte{1}, std::byte{2}, std::byte{3}});
+    EXPECT_EQ(session.submit(greedy(1), error), ServingSubmissionOutcome::Direct);
+    session.step();
+    std::uint64_t first_nonce = session.sessionNonce();
+    auto manifest = session.suspend(1, error);
+    ASSERT_TRUE(manifest.has_value()) << error;
+    session.end();
+    ASSERT_TRUE(session.begin(1, 1, error, nullptr, 0));
+    ASSERT_NE(session.sessionNonce(), first_nonce); // Fresh per incarnation.
+    rows.setSlotKV(0, {std::byte{9}, std::byte{8}, std::byte{7}});
+    // The pre-end manifest must refuse the new incarnation (its nonce is old).
+    EXPECT_FALSE(session.restore(std::move(*manifest), error));
+    EXPECT_NE(error.find("another session"), std::string::npos) << error;
+}
+
+/** @test R17: cache-enabled MISS row suspends and restores with the SAME admission. */
+TEST(ServingSubmissionOutcome, CacheEnabledMissSuspendRestoreKeepsAdmission)
+{
+    ScriptedRows rows;
+    ServingSession session(rows, 256, 8);
+    std::string error;
+    ASSERT_TRUE(session.begin(1, 1, error, nullptr, 0));
+    rows.setSlotKV(0, {std::byte{1}, std::byte{2}, std::byte{3}});
+    rows.prefix_miss_cache_enabled = true; // cache-enabled admission, MISS.
+    auto request = greedy(1);
+    request.prompt.assign(ServingSession::kPrefillChunk + 5, 9);
+    request.max_new_tokens = 8;
+    EXPECT_EQ(session.submit(request, error), ServingSubmissionOutcome::Direct);
+    session.step();
+    auto manifest = session.suspend(1, error);
+    ASSERT_TRUE(manifest.has_value()) << error;
+    EXPECT_TRUE(manifest->content().prefix_cache_enabled);
+    EXPECT_TRUE(manifest->content().prefix_supported);
+    // The typed admission travels; restore reattaches it.
+    ASSERT_TRUE(session.restore(std::move(*manifest), error)) << error;
+    // Harvest/counters see the SAME admission (not a silent default).
+    for (int i = 0; i < 20 && !session.idle(); ++i)
+        session.step();
+    ASSERT_TRUE(session.idle());
 }
 
 /** @test P4 interleaving: A continues while B suspends and C enters the freed slot. */
