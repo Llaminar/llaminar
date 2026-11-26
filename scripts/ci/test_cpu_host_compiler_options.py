@@ -52,3 +52,21 @@ endforeach()
                 verify(database, '-mcpu=generic -march=armv8-a+simd')
             database.write_text(json.dumps([dict(file='test.cu', arguments=base + ['-Xcompiler=-mcpu=generic', '-Xcompiler=-march=armv8-a+simd'])]))
             verify(database, '-mcpu=generic -march=armv8-a+simd')
+
+    def test_host_language_and_declaration_failures(self):
+        import json
+        from cpu_host_compile_contract import verify
+        with tempfile.TemporaryDirectory() as directory:
+            database = pathlib.Path(directory) / 'commands.json'
+            definition = 'LLAMINAR_COMPILED_WITH_NEON=1'
+            for language, options in [('C', ['-mcpu=generic']), ('CXX', ['-mcpu=generic']), ('CUDA', ['-Xcompiler=-mcpu=generic']), ('HIP', ['-Xarch_host', '-mcpu=generic'])]:
+                command = ['custom-wrapper', '-D' + definition] + options
+                row = dict(file='fixture', host_language=language, arguments=command)
+                database.write_text(json.dumps([row]))
+                verify(database, '-mcpu=generic', [definition])
+                for bad in (command[:-1], command + ['-DLLAMINAR_COMPILED_WITH_NEON=0']):
+                    database.write_text(json.dumps([dict(row, arguments=bad)]))
+                    with self.assertRaises(ValueError):
+                        verify(database, '-mcpu=generic', [definition])
+            with self.assertRaisesRegex(ValueError, 'empty expected'):
+                verify(database, '')
