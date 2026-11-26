@@ -79,6 +79,7 @@ jobs:
         continue-on-error: true
         shell: bash
         run: bash scripts/ci/transfer_arm64_ccache.sh restore
+      - uses: crazy-max/ghaction-github-runtime@v3
       - name: Export original canonical Integration attempt evidence
         id: integration-evidence
         shell: bash
@@ -86,6 +87,7 @@ jobs:
           BUILD_ARGS: ${{ steps.build.outputs.args }}
           TOOLCHAIN_CONTEXT: ${{ steps.toolchain.outputs.neon-context }}
         run: |
+          mkdir -p "$RUNNER_TEMP/llaminar-arm64-evidence"
           args=()
           while IFS= read -r arg; do args+=(--build-arg "$arg"); done <<< "$BUILD_ARGS"
           docker buildx build "${args[@]}" --build-context "$TOOLCHAIN_CONTEXT" \
@@ -102,6 +104,7 @@ jobs:
           TOOLCHAIN_CONTEXT: ${{ steps.toolchain.outputs.neon-context }}
           EXPECTED_NONCE: ${{ steps.integration-evidence.outputs.nonce }}
         run: |
+          mkdir -p "$RUNNER_TEMP/llaminar-arm64-evidence"
           args=()
           while IFS= read -r arg; do args+=(--build-arg "$arg"); done <<< "$BUILD_ARGS"
           docker buildx build "${args[@]}" --build-arg "LLAMINAR_EXPECTED_BUILD_NONCE=$EXPECTED_NONCE" \
@@ -119,6 +122,7 @@ jobs:
           BUILD_ARGS: ${{ steps.build.outputs.args }}
           TOOLCHAIN_CONTEXT: ${{ steps.toolchain.outputs.neon-context }}
         run: |
+          mkdir -p "$RUNNER_TEMP/llaminar-arm64-evidence"
           args=()
           while IFS= read -r arg; do
             args+=(--build-arg "$arg")

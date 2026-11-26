@@ -11,11 +11,12 @@ def receipt(progress, status):
     vertices = {}
     for line in Path(progress).read_text().splitlines():
         event = json.loads(line)
-        key = event.get('id')
-        if key:
-            vertices.setdefault(key, {}).update(event)
+        for vertex in event.get('vertexes', [event]):
+            key = vertex.get('digest', vertex.get('id'))
+            if key:
+                vertices.setdefault(key, {}).update(vertex)
     matches = [v for v in vertices.values() if 'arm_native_build_evidence.py capture' in v.get('name', '')]
-    if len(matches) != 1 or not matches[0].get('completed'):
+    if len(matches) != 1 or not matches[0].get('completed') or matches[0].get('error'):
         raise ValueError('missing or ambiguous completed operation vertex')
     origin = json.loads(Path(status).read_text())['nonce']
     return dict(cached=matches[0].get('cached', False), origin=origin)
