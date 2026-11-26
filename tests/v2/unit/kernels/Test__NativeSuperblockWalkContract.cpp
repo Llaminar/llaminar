@@ -4,11 +4,12 @@
  *        and the production ordered-partition interval authority.
  *
  * Every NEON and x86 ordered-partition kernel forms its partition ranges with
- * orderedPartitionInterval() after requireOrderedPartitionPlan() admitted the
- * plan once per call. These tests call those production helpers directly (no
+ * orderedPartitionInterval() after its plan was admitted once per call (NEON
+ * through admitsOrderedPartitionPlan() in requireExecutable, the fatal
+ * wrappers elsewhere). These tests call those production helpers directly (no
  * re-implemented formula) and prove that every interval of an admitted plan is
  * an admitted superblock walk that strictly progresses, that the intervals tile
- * [begin, end) in order, and that invalid plans and ranges are fatal.
+ * [begin, end) in order, and that invalid plans and ranges are rejected.
  */
 #include <gtest/gtest.h>
 #include <climits>
@@ -64,6 +65,7 @@ TEST(NativeSuperblockWalkContract, OrderedPartitionIntervalsTileAdmittedPlans) {
         for (int phase = 0; phase < 8; ++phase) {
             SCOPED_TRACE(::testing::Message() << "begin=" << plan.begin << " end=" << plan.end << " blocks=" << plan.blocks
                                               << " partitions=" << plan.partitions << " width=" << plan.width << " phase=" << phase);
+            ASSERT_TRUE(admitsOrderedPartitionPlan(plan.begin, plan.end, std::size_t(plan.blocks), plan.partitions, plan.width, phase));
             requireOrderedPartitionPlan(plan.begin, plan.end, std::size_t(plan.blocks), plan.partitions, plan.width, phase);
             const CPUNativeQuantisedBlockGeometry geometry{.blocks_per_row = std::size_t(plan.blocks), .phase = std::size_t(phase)};
             int expected_first = plan.begin;
@@ -80,6 +82,7 @@ TEST(NativeSuperblockWalkContract, OrderedPartitionIntervalsTileAdmittedPlans) {
                     EXPECT_EQ(interval.last, std::min<std::int64_t>(unsaturated + plan.width, plan.end));
                 }
                 // Each interval is an admitted walk by construction.
+                ASSERT_TRUE(admitsSuperblockWalk(interval.first, interval.last, std::size_t(plan.blocks), phase));
                 requireSuperblockWalk(interval.first, interval.last, std::size_t(plan.blocks), phase);
                 // Sample both ends, including the ragged final superblock, without walking INT_MAX blocks.
                 for (int block : {interval.first, interval.last - 1}) {
@@ -102,6 +105,15 @@ TEST(NativeSuperblockWalkContract, RejectsOriginalStuckRange) {
 }
 
 TEST(NativeSuperblockWalkContract, RejectsInvalidOrderedPartitionPlans) {
+    // The noexcept predicates NEON's once-per-call admission uses reject the same plans.
+    EXPECT_FALSE(admitsSuperblockWalk(8, 9, 8));
+    EXPECT_FALSE(admitsOrderedPartitionPlan(8, 9, 8, 1, 1));
+    EXPECT_FALSE(admitsOrderedPartitionPlan(0, 8, 8, 1, 8, 8));
+    EXPECT_FALSE(admitsOrderedPartitionPlan(0, 8, 8, 0, 8));
+    EXPECT_FALSE(admitsOrderedPartitionPlan(0, 8, 8, 2, -1));
+    EXPECT_FALSE(admitsOrderedPartitionPlan(0, 9, 9, 2, 4));
+    EXPECT_FALSE(admitsOrderedPartitionPlan(0, 8, std::size_t(INT_MAX) + 1, 1, 8));
+    EXPECT_FALSE(admitsOrderedPartitionPlan(1, INT_MAX, INT_MAX, 37, coveringWidth(1, INT_MAX, 37) - 1));
     EXPECT_DEATH(requireOrderedPartitionPlan(8, 9, 8, 1, 1), "Invalid CPU superblock walk range");
     EXPECT_DEATH(requireOrderedPartitionPlan(0, 8, 8, 1, 8, 8), "Invalid CPU superblock walk range");
     EXPECT_DEATH(requireOrderedPartitionPlan(0, 8, 8, 0, 8), "Invalid CPU ordered partition plan");

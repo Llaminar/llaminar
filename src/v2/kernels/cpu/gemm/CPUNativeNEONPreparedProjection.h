@@ -11,7 +11,7 @@
  */
 #pragma once
 
-#include "CPUNativeSuperblockWalkContract.h"
+#include "CPUNativeOrderedPartitionPlan.h"
 #include "CPUNativeQuantisedMultiScaleKernels.h"
 #include "CPUNativeQuantisedWeightView.h"
 #include "tensors/MXFP4Format.h"
@@ -123,12 +123,13 @@ namespace llaminar2::cpu::native_quantised
          * @brief Reject a publication this tile family cannot execute, before any team exists.
          * @param weights Sealed publication; its metadata was admitted by the seal.
          * @throws std::invalid_argument For an unknown policy, an encoding/codebook
-         *         without a native implementation, or a non-canonical expert K tree.
+         *         without a native implementation, a non-canonical expert K tree,
+         *         or a row extent whose ordered partition plan forms an unbounded walk.
          * @details After this check every dispatch branch taken by execution is
-         * implemented, so the execution path itself cannot throw. It also admits
-         * the whole ordered partition plan once per call (fatal if the sealed
-         * row extent cannot form one), so the per-partition hot programs walk
-         * orderedPartitionInterval() ranges without any check of their own.
+         * implemented, so the execution path itself cannot throw. It admits the
+         * whole ordered partition plan once per call, before any team, so the
+         * per-partition hot programs walk orderedPartitionInterval() ranges
+         * without any check of their own.
          */
         static void requireExecutable(const CPUNativeQuantisedWeightView &weights)
         {
@@ -138,8 +139,9 @@ namespace llaminar2::cpu::native_quantised
             const int partitions = partitionsFor(weights);
             if (partitions <= 0)
                 throw std::invalid_argument("Native NEON expert projection requires the canonical aligned K tree");
-            requireOrderedPartitionPlan(0, weights.blocks_per_row, static_cast<std::size_t>(weights.blocks_per_row),
-                                        partitions, blocksPerPartitionFor(weights, partitions));
+            if (!admitsOrderedPartitionPlan(0, weights.blocks_per_row, static_cast<std::size_t>(weights.blocks_per_row),
+                                            partitions, blocksPerPartitionFor(weights, partitions)))
+                throw std::invalid_argument("Native NEON projection requires a bounded ordered K partition plan");
             bool implemented = false;
             switch (weights.encoding)
             {

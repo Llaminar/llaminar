@@ -7,7 +7,7 @@ clipping it to blocks and last therefore still advances. Size_t intermediate
 arithmetic is bounded by INT_MAX + 15. The resulting end fits int.
 
 Ordered partitions have one interval authority, `orderedPartitionInterval(begin,
-end, partition, width)` in `CPUNativeSuperblockWalkContract.h`. It forms the start
+end, partition, width)` in `CPUNativeOrderedPartitionPlan.h`. It forms the start
 and end in int64 and saturates both at end, so excess partitions become explicit
 empty intervals instead of reversed ranges and nothing overflows. The three NEON
 prepared-projection sites (begin 0, end the weight row extent) and the two x86
@@ -16,21 +16,28 @@ partition count, the ordered fold nor any nonempty interval changes. The
 packed-prefill producers already clip starts: NEON `p * per_partition` at its
 row extent and x86 `kpart * width` in int64.
 
-`requireOrderedPartitionPlan` admits a whole plan: the range is an admitted
-walk, there is at least one partition, the width is nonnegative and the
+`admitsOrderedPartitionPlan` accepts a whole plan only if the range is an
+admitted walk, there is at least one partition, the width is nonnegative and the
 partitions cover the range. Every interval the helper then forms lies inside the
 range, so it is an admitted walk by construction. NEON admits its canonical plan
 once per call in `requireExecutable`, the batch binding's admission before any
-team, using the same `blocksPerPartitionFor` width every tile executes. The
-always-inlined per-partition x column hot programs (`forPartitionBlocks`) carry
-no check. x86 admits its plan in `requireSingleScaleTile` and its walk range at
-kernel entry, once per call. The packed-prefill walk boundaries remain
-authoritative for their caller-provided ranges.
+team, using the same `blocksPerPartitionFor` width every tile executes; a
+rejected plan is a `std::invalid_argument` there, like the other admission
+failures of that function. The always-inlined per-partition x column hot
+programs (`forPartitionBlocks`) carry no check. x86 admits its plan in
+`requireSingleScaleTile` and its walk range at kernel entry, once per call. The
+packed-prefill walk boundaries remain authoritative for their caller-provided
+ranges.
 
-The always-active unreachable assertion is noexcept at these boundaries, making
-invalid geometry fatal in Release as well as Integration; debug-only assertions
-would leave the original production hang possible. No check occurs per block or
-per partition.
+The plan header has no logging or stream dependency, because the NEON tile
+register/stack proof binds the probe's complete dependency closure and rejects
+the iostream initialization assembly that `utils/Assertions.h` brings in. The
+fatal wrappers `requireSuperblockWalk` and `requireOrderedPartitionPlan` live in
+`CPUNativeSuperblockWalkContract.h`, used by the x86 kernels and both
+packed-prefill walks. Their always-active unreachable assertion is noexcept at
+these boundaries, making invalid geometry fatal in Release as well as
+Integration; debug-only assertions would leave the original production hang
+possible. No check occurs per block or per partition.
 
 Focused tests call the production helpers directly over all phases, empty and
 ragged rows, INT_MAX, singleton, odd and 37-partition plans, overpartitioning and
