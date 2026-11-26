@@ -26805,6 +26805,10 @@ bool OrchestrationRunner::publishPhysicalMemoryAuthority()
             {
                 return runner_.importSlotKV(slot, bytes);
             }
+            bool resumedSlotKVLength(int slot, int expected) const override
+            {
+                return runner_.resumedSlotKVLength(slot, expected);
+            }
 
         private:
             IInferenceRunner &runner_;

@@ -3299,6 +3299,16 @@ namespace llaminar2
         }
 
         /**
+         * @brief Verify the imported slot KV length equals the expected value.
+         * @return True on exact match; false (hard refusal) when the runner
+         * cannot report it or the length differs (H2; no fabrication).
+         */
+        virtual bool resumedSlotKVLength(int /*slot*/, int /*expected*/) const
+        {
+            return false;
+        }
+
+        /**
          * @brief Whether this runner can initialize a benchmark request batch.
          *
          * Request-batched MTP decode requires every logical request slot to own

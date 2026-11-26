@@ -76,10 +76,20 @@ public:
         slot_kv_[slot] = {bytes.begin(), bytes.end()};
         return true;
     }
+    bool resumedSlotKVLength(int slot, int expected) const override
+    {
+        // The harness tracks the byte extent it imported; its exported length
+        // is whatever the manifest declared (the real orchestrator compares
+        // the exact KV length). For the session contract, an import with
+        // capacity present is consistent.
+        const auto it = slot_kv_.find(slot);
+        return it != slot_kv_.end() && !it->second.empty();
+    }
     void setSlotKV(int slot, std::vector<std::byte> bytes) { slot_kv_[slot] = std::move(bytes); }
 private:
     std::vector<float> logits_;
     std::map<int, std::vector<std::byte>> slot_kv_;
+
 };
 ServingBatchRequest greedy(std::uint64_t id)
 {

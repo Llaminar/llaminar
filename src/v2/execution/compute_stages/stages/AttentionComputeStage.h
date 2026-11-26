@@ -14,6 +14,7 @@
 #include "../IWorkspaceConsumerStage.h"
 #include "../StageParamsBase.h"
 #include "kernels/IKVCache.h"
+#include "kernels/cpu/attention/CPUFP32PagedKVTable.h"
 #include "../../../kernels/attention/AttentionExecutionPolicy.h"
 #include "../../../memory/BufferId.h"
 
@@ -104,6 +105,22 @@ namespace llaminar2
              */
             IKVCache *kv_cache = nullptr;
             int layer_idx = -1;
+
+            /**
+             * @brief P2 pooled consumption: the owning pooled table and its
+             * per-request snapshot for THIS layer's CPU decode.
+             *
+             * When non-null (and @p pooled_snapshot is set), the CPU decode
+             * path computes through the production pooled attention kernel
+             * (compute_paged_snapshot_fp32) instead of the ring-cache read:
+             * no contiguous adapter, no full-history gather. The snapshot is
+             * borrowed per execute from the table (move-only; the table owns
+             * the pages) and the effective-use lease is acknowledged by the
+             * caller after the forward.
+             */
+            const CPUFP32PagedKVTable *pooled_table = nullptr;
+            const CPUFP32PagedKVTable *pooled_snapshot_owner = nullptr;
+            int pooled_snapshot_slot = -1; ///< Row index to borrow at execute.
 
             /**
              * @brief Device-owned logical query width for a scalar GPU graph.

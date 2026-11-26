@@ -103,6 +103,20 @@ namespace llaminar2
             (void)slot; (void)bytes;
             return false; // Unsupported: restore refuses pre-mutation.
         }
+
+        /**
+         * @brief Verify the imported slot KV length equals the advertised
+         *        continuation length (H2: the session resumes from the
+         *        manifest's cached_tokens; a mismatch would silently diverge
+         *        the next forward).
+         * @return True when the imported slot's KV length is exactly
+         *         @p expected (or the executor cannot report it, which is a
+         *         hard refusal — never an optimistic assumption).
+         */
+        virtual bool resumedSlotKVLength(int /*slot*/, int /*expected*/) const
+        {
+            return false; // Unsupported: restore refuses (no fabrication).
+        }
     };
 
     /**

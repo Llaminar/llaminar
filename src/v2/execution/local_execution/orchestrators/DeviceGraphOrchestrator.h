@@ -4265,6 +4265,8 @@ namespace llaminar2
          * itself; false on refusal (restore then refuses; no fabricated KV).
          */
         bool importSlotKV(int slot, std::span<const std::byte> bytes) override;
+        /** @brief Verify the imported slot KV length (H2 session check). */
+        bool resumedSlotKVLength(int slot, int expected) const override;
 
         /**
          * @brief Get logits for a specific sequence in batch

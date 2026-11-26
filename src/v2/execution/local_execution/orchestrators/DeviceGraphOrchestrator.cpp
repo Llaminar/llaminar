@@ -153,19 +153,9 @@ namespace llaminar2
 
     namespace
     {
-        /** @brief Typed header of one exported per-layer KV block (P4 CPU). */
-        struct LayerPackedHeader
-        {
-            std::int32_t global_layer = 0;
-            std::int32_t token_count = 0;
-            std::uint64_t k_bytes = 0;
-            std::uint64_t v_bytes = 0;
-            std::uint8_t k_precision = 0; ///< ActivationPrecision as uint8.
-            std::uint8_t v_precision = 0;
-        };
-        // NOTE: the packer serializes the six fields as explicit uint32 words
-        // (see exportSlotKV), never the struct bytes — no padding leaks into
-        // the manifest (deterministic replay).
+        // The export packer serializes per-layer fields as explicit uint64/uint32
+        // words (see exportSlotKV/importSlotKV) — never a struct byte copy, so
+        // no padding leaks into the manifest (deterministic replay).
         /** @brief Append one byte span to a packed continuation. */
         void appendBytes(std::vector<std::byte> &out, std::span<const std::byte> bytes)
         {
@@ -61760,34 +61750,17 @@ namespace llaminar2
         if (!state_.isInitialized() || !state_.kv_cache ||
             !state_.device_id.is_cpu() ||
             slot < 0 || slot >= state_.batch_size)
-        {
-            if (::getenv("LLAMINAR_B4_TRACE"))
-                ::fprintf(stderr, "B4 export refusal: init=%d cache=%d cpu=%d slot=%d/%d\n",
-                    state_.isInitialized(), state_.kv_cache != nullptr,
-                    state_.device_id.is_cpu(), slot, state_.batch_size);
             return std::nullopt;
-        }
         if (dynamic_cast<const IHybridKVCache *>(state_.kv_cache.get()) != nullptr)
-        {
-            if (::getenv("LLAMINAR_B4_TRACE"))
-                ::fprintf(stderr, "B4 export refusal: hybrid\n");
             return std::nullopt; // G2: recurrent/checkpoint state not carried.
-        }
         if (!state_.mtp_kv_caches.empty() ||
             (graph_builder_ && graph_builder_->config().mtp.enabled))
-        {
-            if (::getenv("LLAMINAR_B4_TRACE"))
-                ::fprintf(stderr, "B4 export refusal: mtp_caches=%zu mtp_enabled=%d\n",
-                    state_.mtp_kv_caches.size(),
-                    graph_builder_ ? graph_builder_->config().mtp.enabled : -1);
             return std::nullopt; // MTP continuation not carried (honest refusal).
-        }
         if (dynamic_cast<const IHybridKVCache *>(state_.kv_cache.get()) != nullptr)
             return std::nullopt; // G2: recurrent/checkpoint state not carried.
         const int layers = state_.kv_cache->n_layers();
         const int first_layer = state_.kv_cache->first_layer_index();
         std::vector<std::byte> packed;
-        std::uint32_t metadata_nonce = 0;
         // Typed per-layer header + native payload bytes. The RING CACHE is the
         // byte authority (exportLogicalBlock reads its canonical storage); no
         // host shadow exists — payloads are copied exactly as the cache exposes
@@ -61802,14 +61775,15 @@ namespace llaminar2
             const auto layout = state_.kv_cache->logicalBlockLayout(global_layer, state.cached_tokens);
             if (layout.k_bytes == 0 || layout.v_bytes == 0)
                 return std::nullopt;
-            // Deterministic fixed-width fields (no padding bytes serialized).
-            const std::uint32_t header_fields[6] = {
-                static_cast<std::uint32_t>(global_layer),
-                static_cast<std::uint32_t>(state.cached_tokens),
-                static_cast<std::uint32_t>(layout.k_bytes),
-                static_cast<std::uint32_t>(layout.v_bytes),
-                static_cast<std::uint32_t>(layout.k_precision),
-                static_cast<std::uint32_t>(layout.v_precision)};
+            // Deterministic fixed-width fields; uint64 for byte sizes (no
+            // narrowing: a >4GiB layer must never silently wrap).
+            const std::uint64_t header_fields[6] = {
+                static_cast<std::uint64_t>(global_layer),
+                static_cast<std::uint64_t>(state.cached_tokens),
+                layout.k_bytes,
+                layout.v_bytes,
+                static_cast<std::uint64_t>(layout.k_precision),
+                static_cast<std::uint64_t>(layout.v_precision)};
             appendBytes(packed, std::as_bytes(std::span(header_fields)));
             const std::size_t k_at = packed.size();
             packed.resize(k_at + layout.k_bytes + layout.v_bytes);
@@ -61863,17 +61837,18 @@ namespace llaminar2
         int next_expected_layer = first_layer;
         while (at < bytes.size())
         {
-            if (at + 6 * sizeof(std::uint32_t) > bytes.size())
+            if (at + 6 * sizeof(std::uint64_t) > bytes.size())
                 return false; // Truncated header.
             ParsedLayer entry;
-            const auto *fields = reinterpret_cast<const std::uint32_t *>(bytes.data() + at);
+            std::uint64_t fields[6];
+            std::memcpy(fields, bytes.data() + at, sizeof(fields)); // No unaligned read.
+            at += sizeof(fields);
             entry.global_layer = static_cast<int>(fields[0]);
             entry.token_count = static_cast<int>(fields[1]);
-            entry.k_bytes = fields[2];
-            entry.v_bytes = fields[3];
+            entry.k_bytes = static_cast<std::size_t>(fields[2]);
+            entry.v_bytes = static_cast<std::size_t>(fields[3]);
             entry.k_precision = static_cast<std::uint8_t>(fields[4]);
             entry.v_precision = static_cast<std::uint8_t>(fields[5]);
-            at += 6 * sizeof(std::uint32_t);
             // Exact ordered owned layer set: no gap, no duplicate, no foreign.
             if (entry.global_layer != next_expected_layer)
                 return false;
@@ -61885,9 +61860,10 @@ namespace llaminar2
             expected_length = entry.token_count;
             // Precision must equal the cache's native precision.
             const auto layout = state_.kv_cache->logicalBlockLayout(entry.global_layer, entry.token_count);
+            // Full precision comparison (no uint8 truncation of an enum).
             if (layout.k_bytes != entry.k_bytes || layout.v_bytes != entry.v_bytes ||
-                static_cast<std::uint8_t>(layout.k_precision) != entry.k_precision ||
-                static_cast<std::uint8_t>(layout.v_precision) != entry.v_precision)
+                static_cast<std::uint64_t>(layout.k_precision) != fields[4] ||
+                static_cast<std::uint64_t>(layout.v_precision) != fields[5])
                 return false;
             if (at + entry.k_bytes + entry.v_bytes > bytes.size())
                 return false; // Payload extent beyond the span: refuse (G3).
@@ -61931,6 +61907,28 @@ namespace llaminar2
         // the SAME authority (never left at 0 against non-empty KV).
         serving_slot_positions_.resize(static_cast<std::size_t>(state_.batch_size), 0);
         serving_slot_positions_[static_cast<std::size_t>(slot)] = expected_length;
+        return true;
+    }
+
+    bool DeviceGraphOrchestrator::resumedSlotKVLength(int slot, int expected) const
+    {
+        if (!state_.isInitialized() || !state_.kv_cache ||
+            slot < 0 || slot >= state_.batch_size || expected <= 0)
+            return false;
+        if (!state_.mtp_kv_caches.empty() ||
+            (graph_builder_ && graph_builder_->config().mtp.enabled))
+            return false; // MTP rows cannot be resumed (honest refusal).
+        if (dynamic_cast<const IHybridKVCache *>(state_.kv_cache.get()) != nullptr)
+            return false; // Hybrid rows cannot be resumed.
+        // EXACT match across every layer: the imported length is one
+        // authority, the session must resume from the same number.
+        const int layers = state_.kv_cache->n_layers();
+        const int first_layer = state_.kv_cache->first_layer_index();
+        for (int layer = 0; layer < layers; ++layer)
+        {
+            if (state_.kv_cache->sequenceState(first_layer + layer, slot).cached_tokens != expected)
+                return false;
+        }
         return true;
     }
 

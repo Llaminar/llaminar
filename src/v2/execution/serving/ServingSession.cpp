@@ -803,6 +803,17 @@ namespace llaminar2
             error = "Serving executor rejected the continuation KV import";
             return false; // No mutation: slot free, rows_ unchanged.
         }
+        // H2: the imported KV length must equal the manifest's cached_tokens.
+        // The executor owns the slot KV, but the session resumes from the
+        // manifest's advertised length — a mismatch would silently diverge
+        // the row's next forward (and the continuation identity).
+        if (!executor_.resumedSlotKVLength(target, content.cached_tokens))
+        {
+            error = "Serving executor imported a KV length inconsistent with the continuation";
+            // Roll back the import (the slot must stay empty; no partial state).
+            (void)executor_.resetServingRow(target);
+            return false;
+        }
         // COMMIT: busy state and the row enter as one typed transaction; the
         // single-use seal is consumed ONLY on success, so a retained object
         // can never restore twice or after the original finished.
