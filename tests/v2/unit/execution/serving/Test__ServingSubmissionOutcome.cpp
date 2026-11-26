@@ -207,6 +207,29 @@ TEST(ServingSubmissionOutcome, InterleavedABCSuspendKeepsPeerProgressExact)
     (void)a_events;
 }
 
+/** @test §5.1 pressure probe: a refusing probe keeps requests queued; release re-admits. */
+TEST(ServingSubmissionOutcome, PressureProbeHoldsQueuedUntilWitnessHolds)
+{
+    ScriptedRows rows;
+    ServingSession session(rows, 32, 8);
+    std::string error;
+    ASSERT_TRUE(session.begin(2, 2, error, nullptr, 4));
+    // Refuse all promotion until released: bounded backpressure, no drop.
+    bool allow = false;
+    session.setPressureProbe([&](const ServingBatchRequest &) { return allow; });
+    EXPECT_EQ(session.submit(greedy(1), error), ServingSubmissionOutcome::Direct);
+    EXPECT_EQ(session.submit(greedy(2), error), ServingSubmissionOutcome::Direct);
+    // Step with the probe refusing: requests stay queued, cohort not admitted.
+    session.step();
+    EXPECT_EQ(session.occupancy().resident, 0);
+    EXPECT_EQ(session.occupancy().queued, 2);
+    // The probe admits: the next step promotes the FIFO queue.
+    allow = true;
+    session.step();
+    EXPECT_EQ(session.occupancy().resident, 2);
+    EXPECT_EQ(session.occupancy().queued, 0);
+}
+
 /** @test Q=0 refuses queued requests typed; Direct still works with a free slot. */
 TEST(ServingSubmissionOutcome, ZeroQueueAcceptsOnlyDirect)
 {
