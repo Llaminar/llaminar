@@ -44,3 +44,22 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(references, ['FROM toolchain AS builder-integration-operation',
                                     'COPY --from=builder-integration-operation /src/native-build-evidence/ /',
                                     'FROM builder-integration-operation AS builder'])
+
+    def test_fulltree_receipts_and_bounded_log(self):
+        old = Path.cwd()
+        with tempfile.TemporaryDirectory() as directory:
+            try:
+                os.chdir(directory)
+                proof = Path('build_v2_integration/tests/v2/cpu_native_tile_registers')
+                proof.mkdir(parents=True)
+                for name in ('driver.json', 'stack-gate.json', 'fused-stage.json'):
+                    (proof / name).write_text('{}')
+                evidence.capture(['python3', '-c', 'print("x" * 3000000)'])
+                import json
+                status = json.loads((evidence.ROOT / 'status.json').read_text())
+                self.assertFalse(status['missing_stage_evidence'])
+                self.assertTrue(status['operation_log']['truncated'])
+                self.assertEqual(status['binding']['operation_build_type'], 'Integration')
+                self.assertLess((evidence.ROOT / 'operation.log').stat().st_size, 3000000)
+            finally:
+                os.chdir(old)
