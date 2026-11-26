@@ -20,6 +20,7 @@
 #include <optional>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <string>
 #include <vector>
 #include <stdexcept>
@@ -3263,6 +3264,37 @@ namespace llaminar2
         virtual bool resetServingRow(int slot)
         {
             (void)slot;
+            return false;
+        }
+
+        /**
+         * @brief Export the ACTUAL executor KV continuation of one serving slot.
+         * @param slot Slot index below the runner's batch capacity.
+         * @return The exact serialized KV continuation, or empty when this
+         * runner cannot export it (suspension must then refuse; the session
+         * never fabricates a continuation from host metadata).
+         *
+         * Production CPU export serializes the ring cache's native-precision
+         * logical blocks through the cache's own exportLogicalBlock API — the
+         * cache bytes are the single authority; no host shadow is created.
+         */
+        virtual std::optional<std::vector<std::byte>> exportSlotKV(int slot) const
+        {
+            (void)slot;
+            return std::nullopt;
+        }
+
+        /**
+         * @brief Import an exported KV continuation back into its slot.
+         * @param slot Slot index below the runner's batch capacity.
+         * @return True when the exact exported bytes were reinstalled through
+         * the cache's own importLogicalBlock API; false on refusal (the
+         * session then refuses restore; no fabricated continuity).
+         */
+        virtual bool importSlotKV(int slot, std::span<const std::byte> bytes)
+        {
+            (void)slot;
+            (void)bytes;
             return false;
         }
 

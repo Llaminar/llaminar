@@ -4249,6 +4249,24 @@ namespace llaminar2
         bool resetServingRow(int slot) override;
 
         /**
+         * @brief Export one serving slot's ACTUAL KV continuation (P4 CPU).
+         *
+         * The production CPU path serializes the ring cache's native-precision
+         * logical blocks through the cache's own exportLogicalBlock API (one
+         * typed per-layer header + exact payload bytes). The cache is the
+         * single byte authority — no host shadow, no reassembled tensor.
+         * @return Packed continuation, or empty when the runner cannot export
+         * (the session then refuses suspension before mutation).
+         */
+        std::optional<std::vector<std::byte>> exportSlotKV(int slot) const override;
+        /**
+         * @brief Import an exported continuation back into its slot (P4 CPU).
+         * @return True when the exact bytes were reinstalled through the cache
+         * itself; false on refusal (restore then refuses; no fabricated KV).
+         */
+        bool importSlotKV(int slot, std::span<const std::byte> bytes) override;
+
+        /**
          * @brief Get logits for a specific sequence in batch
          *
          * @param seq_idx Sequence index in batch (default=0)

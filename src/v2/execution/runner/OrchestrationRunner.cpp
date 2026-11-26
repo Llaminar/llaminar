@@ -26795,6 +26795,16 @@ bool OrchestrationRunner::publishPhysicalMemoryAuthority()
                 return runner_.harvestServingRowPrefix(slot, admission, prompt);
             }
             std::string servingRowError() const override { return runner_.servingRowError(); }
+            // P4 production continuation: the runner's own cache exports/imports
+            // the slot KV (never a host shadow; the cache bytes are canonical).
+            std::optional<std::vector<std::byte>> exportSlotKV(int slot) const override
+            {
+                return runner_.exportSlotKV(slot);
+            }
+            bool importSlotKV(int slot, std::span<const std::byte> bytes) override
+            {
+                return runner_.importSlotKV(slot, bytes);
+            }
 
         private:
             IInferenceRunner &runner_;

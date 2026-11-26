@@ -153,6 +153,22 @@ namespace llaminar2
 
     namespace
     {
+        /** @brief Typed header of one exported per-layer KV block (P4 CPU). */
+        struct LayerPackedHeader
+        {
+            std::int32_t global_layer = 0;
+            std::int32_t token_count = 0;
+            std::uint64_t k_bytes = 0;
+            std::uint64_t v_bytes = 0;
+            std::uint8_t k_precision = 0; ///< ActivationPrecision as uint8.
+            std::uint8_t v_precision = 0;
+        };
+        /** @brief Append one byte span to a packed continuation. */
+        void appendBytes(std::vector<std::byte> &out, std::span<const std::byte> bytes)
+        {
+            out.insert(out.end(), bytes.begin(), bytes.end());
+        }
+
         /**
          * @brief Persistent backend event closing one calibration sample.
          *
@@ -61729,6 +61745,99 @@ namespace llaminar2
             return nullptr;
         const float *base = getAllPositionLogits();
         return base ? base + static_cast<size_t>(row) * static_cast<size_t>(state_.vocab_size) : nullptr;
+    }
+
+    std::optional<std::vector<std::byte>> DeviceGraphOrchestrator::exportSlotKV(int slot) const
+    {
+        // Export is a slot-KV authority operation, independent of the serving
+        // row policy: the CPU ring cache owns the bytes. MTP draft caches and
+        // hybrid recurrent state are NOT carried (the continuation boundary
+        // refuses those rows at suspension anyway); a non-CPU or uninitialized
+        // runner cannot export.
+        if (!state_.isInitialized() || !state_.kv_cache ||
+            !state_.device_id.is_cpu() ||
+            slot < 0 || slot >= state_.batch_size)
+            return std::nullopt;
+        if (!state_.mtp_kv_caches.empty() ||
+            (graph_builder_ && graph_builder_->config().mtp.enabled))
+            return std::nullopt; // MTP continuation not carried (honest refusal).
+        const int layers = state_.kv_cache->n_layers();
+        const int first_layer = state_.kv_cache->first_layer_index();
+        std::vector<std::byte> packed;
+        // Typed per-layer header + native payload bytes. The RING CACHE is the
+        // byte authority (exportLogicalBlock reads its canonical storage); no
+        // host shadow exists — payloads are copied exactly as the cache exposes
+        // them, then re-imported through the same API.
+        for (int layer = 0; layer < layers; ++layer)
+        {
+            const int global_layer = first_layer + layer;
+            const auto state = state_.kv_cache->sequenceState(global_layer, slot);
+            if (state.cached_tokens <= 0)
+                continue; // No KV for this layer: skipped (not empty-padded).
+            const auto layout = state_.kv_cache->logicalBlockLayout(global_layer, state.cached_tokens);
+            if (layout.k_bytes == 0 || layout.v_bytes == 0)
+                return std::nullopt;
+            LayerPackedHeader header;
+            header.global_layer = global_layer;
+            header.token_count = state.cached_tokens;
+            header.k_bytes = layout.k_bytes;
+            header.v_bytes = layout.v_bytes;
+            header.k_precision = static_cast<std::uint8_t>(layout.k_precision);
+            header.v_precision = static_cast<std::uint8_t>(layout.v_precision);
+            appendBytes(packed, std::as_bytes(std::span(&header, 1)));
+            const std::size_t k_at = packed.size();
+            packed.resize(k_at + layout.k_bytes + layout.v_bytes);
+            IKVCache::KVCacheLogicalBlockDescriptor desc;
+            desc.layer = global_layer;
+            desc.seq_idx = slot;
+            desc.logical_token_start = 0;
+            desc.token_count = state.cached_tokens;
+            desc.payload_domain = IKVCache::KVCacheLogicalBlockPayloadDomain::Host;
+            if (!state_.kv_cache->exportLogicalBlock(desc,
+                    packed.data() + k_at, packed.data() + k_at + layout.k_bytes))
+                return std::nullopt;
+        }
+        return packed;
+    }
+
+    bool DeviceGraphOrchestrator::importSlotKV(int slot, std::span<const std::byte> bytes)
+    {
+        if (!state_.isInitialized() || !state_.kv_cache ||
+            !state_.device_id.is_cpu() ||
+            slot < 0 || slot >= state_.batch_size)
+            return false;
+        if (!state_.mtp_kv_caches.empty() ||
+            (graph_builder_ && graph_builder_->config().mtp.enabled))
+            return false; // MTP continuation not carried (honest refusal).
+        std::size_t at = 0;
+        const auto byte_view = [&](std::size_t count) -> std::span<const std::byte> {
+            if (at + count > bytes.size())
+                return {};
+            auto out = bytes.subspan(at, count);
+            at += count;
+            return out;
+        };
+        while (at < bytes.size())
+        {
+            const auto header_view = byte_view(sizeof(LayerPackedHeader));
+            if (header_view.empty())
+                return false;
+            LayerPackedHeader header;
+            std::memcpy(&header, header_view.data(), sizeof(header));
+            const auto k = byte_view(header.k_bytes);
+            const auto v = byte_view(header.v_bytes);
+            if (k.empty() && header.k_bytes != 0) return false;
+            if (v.empty() && header.v_bytes != 0) return false;
+            IKVCache::KVCacheLogicalBlockDescriptor desc;
+            desc.layer = header.global_layer;
+            desc.seq_idx = slot;
+            desc.logical_token_start = 0;
+            desc.token_count = header.token_count;
+            desc.payload_domain = IKVCache::KVCacheLogicalBlockPayloadDomain::Host;
+            if (!state_.kv_cache->importLogicalBlock(desc, k.data(), v.data()))
+                return false;
+        }
+        return at == bytes.size() && !bytes.empty();
     }
 
     bool DeviceGraphOrchestrator::resetServingRow(int slot)
