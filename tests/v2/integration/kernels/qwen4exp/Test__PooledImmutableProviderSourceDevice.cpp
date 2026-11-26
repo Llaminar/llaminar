@@ -116,8 +116,14 @@ void providerAllFormatsReplay(DeviceId device, bool productionPLE, unsigned slot
         specs.push_back({std::make_shared<ProviderFile>(*original,*format,columns),productionPLE?64u:33u,slots,slots?2u:0u,productionPLE?n::OriginalIdWidth::UInt64:n::OriginalIdWidth::UInt32,productionPLE});
         labels.emplace_back(entry.label);
     }
-    ProviderReplayPrograms programs(specs);programs.prepare(device);
-    for(std::size_t i=0;i<specs.size();++i)programs.run(i,[&](ProviderReplay& replay){auto& file=replay.file;const auto columns=file.columns,slots=std::size_t(replay.slots);const auto& label=labels[i];
+    // Each format is an independent recorded scenario. Finish its complete
+    // native retirement before admitting the next format; retaining every
+    // format's opaque graph population simultaneously is not a sweep invariant.
+    // Repeated requests and reset histories below still share the same original
+    // program, and its full additive graph BOM remains authoritative.
+    for(std::size_t i=0;i<specs.size();++i){
+    ProviderReplayPrograms programs({specs[i]});programs.prepare(device);
+    programs.run(0,[&](ProviderReplay& replay){auto& file=replay.file;const auto columns=file.columns,slots=std::size_t(replay.slots);const auto& label=labels[i];
                     std::cout<<"POOLED_PROVIDER_FORMAT format="<<label<<" columns="<<columns<<" row_bytes="<<file.row_bytes<<" slots="<<slots
                         <<" source_row_key_bits=32 original_id_bits="<<(productionPLE?64:32)<<" production_ple="<<productionPLE<<'\n';
                     if(productionPLE){
@@ -134,6 +140,7 @@ void providerAllFormatsReplay(DeviceId device, bool productionPLE, unsigned slot
                         std::array<std::uint64_t,16> fresh;for(std::size_t i=0;i<fresh.size();++i)fresh[i]=48+i;replay.replay(fresh);replay.replay({});replay.close();
                     }
     });programs.retire();
+    }
     EXPECT_EQ(unsupported,1u);EXPECT_EQ(supported+unsupported,embeddingVerifierFormats().size());
     std::cout<<"POOLED_PROVIDER_FORMAT_INVENTORY supported="<<supported<<" unsupported="<<unsupported<<" source_only_and_positive_owner=1 capture_reset_empty_tail=1\n";
 }
@@ -206,8 +213,11 @@ void pooledACKReadyCancellation(DeviceId device){
 void productionColdArenaSealReplay(DeviceId device, unsigned slots){
     if(!hasCPUBackend())initCPUBackend(-1);std::vector<ProviderReplaySpec> specs;
     for(auto maximum:{16u,64u,256u,1024u})specs.push_back({std::make_shared<ProviderFile>(),maximum,slots,slots?2u:0u,n::OriginalIdWidth::UInt64,true,OwnerAdmission::Original,ACKInterleaving::None,ActivationPreparation::ColdGraph});
-    ProviderReplayPrograms programs(specs);programs.prepare(device);
-    for(std::size_t i=0;i<specs.size();++i)programs.run(i,[&](ProviderReplay& replay){const auto maximum=replay.maximum;
+    // Bucket geometries are independent scenarios, not concurrently retained
+    // graph families. Preserve all three dirty generations within each bucket.
+    for(const auto& spec:specs){
+    ProviderReplayPrograms programs({spec});programs.prepare(device);
+    programs.run(0,[&](ProviderReplay& replay){const auto maximum=replay.maximum;
         std::vector<std::uint64_t> large(maximum,ProviderFile::High),small(16,700);
         for(std::uint64_t generation=1;generation<=3;++generation){
             replay.admit(generation);replay.replay(large);replay.replay(small);replay.replay({});replay.close();
@@ -230,6 +240,7 @@ void productionColdArenaSealReplay(DeviceId device, unsigned slots){
         auto* begin=replay.compute.getNode(replay.compute.getExecutionOrder().front())->stage.get();
         EXPECT_NO_THROW(begin->graphCaptureVariantSignature());
     });programs.retire();
+    }
 }
 /** @brief Reject actual foreign equal-sized owner leases before source roots publish. */
 void productionSourceAuthorityRejection(DeviceId device){

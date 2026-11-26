@@ -636,6 +636,15 @@ def main() -> None:
         if passed:
             shutil.rmtree(root)
         else:
+            # The CI container is ephemeral. Publish each owned child log into
+            # CTest's retained output before its private evidence root disappears.
+            # Never scan another session's files or infer native retirement here.
+            for log in sorted(root.rglob("output.log")):
+                print(f"--- MPI child output: {log.relative_to(root)} ---", file=sys.stderr)
+                try:
+                    print(log.read_text(errors="replace"), file=sys.stderr)
+                except OSError as error:
+                    print(f"Unable to read owned child log: {error}", file=sys.stderr)
             print(f"MPI lifetime evidence retained at {root}", file=sys.stderr)
 
 
