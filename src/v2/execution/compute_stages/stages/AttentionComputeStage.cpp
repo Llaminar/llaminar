@@ -1741,6 +1741,18 @@ namespace llaminar2
         }
 #endif
 
+        // L1: pooled mode with a rejected combination must return NOW, before
+        // ANY transform, dump or ring work — a rejected pooled combination
+        // (rotation, device row transform, wrong device, non-decode) would
+        // otherwise rotate Q in place against unrotated pooled K pages and
+        // dereference NULL ring K/V.
+        if (pooled_mode && !pooled_ok)
+        {
+            LOG_ERROR("[AttentionComputeStage] Pooled snapshot mode rejected an unsupported combination; "
+                      "no transform or ring work ran");
+            return false;
+        }
+
         // =================================================================
         // KV rotation: rotate Q before attention, inverse-rotate output after.
         // When K/V were rotated by ActivationRotation before Q16_1 quantization

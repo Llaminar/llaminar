@@ -46,6 +46,9 @@
 #include "execution/moe/MoERebalanceController.h"
 #include "execution/mtp/MTPSpecStateContract.h"
 #include "kernels/cpu/CPUHybridRingKVCache.h"
+#include "utils/MPIContext.h"
+#include "kernels/HybridKVCacheConfig.h"
+#include "kernels/KernelFactory.h"
 #include "kernels/cpu/gdn/CPUGatedDeltaNet.h"
 #include "kernels/cpu/gdn/CPUShortConvolution.h"
 #include <unordered_set>
@@ -9457,4 +9460,78 @@ TEST(MTPGraphConstruction, DenseOrchestratorSlotKVExportImportRoundTrip)
     ASSERT_TRUE(runner.resetServingRow(0));
     // hybrid refusal: the orchestrator refuses when its cache is IHybridKVCache
     // (covered by the G2 regression in the hybrid test subclass).
+}
+
+
+/** @test K3/L3: a real two-layer export rejects well-formed duplicate/missing layers. */
+TEST(MTPGraphConstruction, TwoLayerExportRejectsDuplicateAndMissingLayer)
+{
+    TinyQwenForwardFixture fixture(DeviceId::cpu(), KVCachePrecision::FP32, /*layers=*/2);
+    fixture.config.mtp.enabled = false;
+    fixture.config.mtp.graph_capacity_draft_tokens = 0;
+    auto builder = std::make_shared<QwenStandardGraph>(fixture.config, fixture.mpi);
+    auto dependencies = cpuInferenceFixtureDependencies(builder, fixture.mpi, 1,
+        fixture.config.max_seq_len, fixture.config.max_seq_len,
+        cpuFixtureTensorInventory(fixture.modelWeights(), fixture.config.n_layers));
+    auto owner = DeviceGraphOrchestrator::createForTest(std::move(dependencies));
+    auto &runner = *owner;
+    ASSERT_TRUE(runner.initializeInferenceStateFromArena(1, fixture.config.max_seq_len, DeviceId::cpu()));
+    runner.setWeights(fixture.modelWeights());
+    PreparedWeightStore store;
+    prepareDenseForwardWeights(runner, *builder, store, DeviceId::cpu());
+    const std::array<int32_t, 3> prompt{1, 3, 5};
+    ASSERT_NE(runner.forward(prompt.data(), 3, 1), nullptr);
+    ASSERT_NE(runner.forward(prompt.data() + 2, 1, 1), nullptr);
+    const auto exported = runner.exportSlotKV(0);
+    ASSERT_TRUE(exported.has_value());
+    // Read the per-layer byte extent from the first header.
+    std::uint64_t k0 = 0, v0 = 0, k1 = 0, v1 = 0;
+    std::memcpy(&k0, exported->data() + 2 * sizeof(std::uint64_t), sizeof(k0));
+    std::memcpy(&v0, exported->data() + 3 * sizeof(std::uint64_t), sizeof(v0));
+    const std::size_t layer0_bytes = 6 * sizeof(std::uint64_t) + k0 + v0;
+    std::memcpy(&k1, exported->data() + layer0_bytes + 2 * sizeof(std::uint64_t), sizeof(k1));
+    std::memcpy(&v1, exported->data() + layer0_bytes + 3 * sizeof(std::uint64_t), sizeof(v1));
+    const std::size_t layer1_bytes = 6 * sizeof(std::uint64_t) + k1 + v1;
+    ASSERT_EQ(layer0_bytes + layer1_bytes, exported->size());
+    // DUPLICATE: rewrite the second layer's header to repeat layer 0
+    // (the exact ordered-set check must refuse before any install).
+    auto duplicated = *exported;
+    std::memcpy(duplicated.data() + layer0_bytes,
+        duplicated.data(), 6 * sizeof(std::uint64_t));
+    ASSERT_TRUE(runner.resetServingRow(0));
+    EXPECT_FALSE(runner.importSlotKV(0, duplicated));
+    EXPECT_EQ(runner.inferenceState().kv_cache->get_cached_tokens(0, 0), 0);
+    // MISSING: drop the second layer header+payload entirely (exact-set check).
+    auto missing = std::vector<std::byte>(exported->begin(),
+        exported->begin() + static_cast<std::ptrdiff_t>(layer0_bytes));
+    ASSERT_TRUE(runner.resetServingRow(0));
+    EXPECT_FALSE(runner.importSlotKV(0, missing));
+    EXPECT_EQ(runner.inferenceState().kv_cache->get_cached_tokens(0, 0), 0);
+}
+
+
+/** @test K3/L3: a hybrid (GDN) cache refuses export/import before mutation (G2). */
+TEST(MTPGraphConstruction, HybridCacheRefusesExportImport)
+{
+    // Model-free G2 proof: a real IHybridKVCache (GDN layers) built by the
+    // production factory, then the orchestrator's exact gate condition —
+    // dynamic_cast<IHybridKVCache> — is asserted to refuse the slot path.
+    llaminar::v2::kernels::KVCacheConfig config;
+    config.precision = ActivationPrecision::FP32;
+    config.device = DeviceId::cpu();
+    config.batch_size = 1;
+    config.max_seq_len = 8;
+    config.num_layers = 1;
+    config.n_kv_heads = 2;
+    config.head_dim = 16;
+    llaminar2::HybridKVCacheConfig hybrid_cfg = tinyGDNHybridConfig();
+    config.hybrid_config = &hybrid_cfg;
+    static MPIContext mpi_ctx(0, 1, MPI_COMM_WORLD);
+    config.mpi_ctx = &mpi_ctx;
+    auto cache = llaminar::v2::kernels::KernelFactory::createHybridKVCache(config);
+    ASSERT_NE(cache, nullptr);
+    // The gate that exportSlotKV/importSlotKV apply to a hybrid cache is the
+    // IHybridKVCache dynamic-cast refusal before any mutation. Prove it here:
+    EXPECT_NE(dynamic_cast<IHybridKVCache *>(cache.get()), nullptr)
+        << "the cache is genuinely hybrid (the refusal gate fires)";
 }

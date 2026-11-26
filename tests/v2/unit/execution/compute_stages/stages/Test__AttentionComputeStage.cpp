@@ -24,6 +24,7 @@
 #include "v2/tensors/Tensors.h"
 #include "kernels/cpu/attention/CPUFlashAttentionKernelT.h"
 #include "kernels/cpu/attention/CPUFP32PagedKVTable.h"
+#include "kernels/cpu/rotation/ActivationRotation.h"
 #include "planning/PhysicalMemoryAuthority.h"
 #include "planning/PhysicalPagePool.h"
 #include "v2/tensors/TensorFactory.h"
@@ -1354,10 +1355,11 @@ TEST(PooledStageConsumption, PooledSnapshotDecodeMatchesContiguousControl)
     params.position_offset = tokens - 1; // Decode at the last KV position.
     params.device_id = device;
     params.pooled_table = table.get();
-    params.pooled_ref.authority_id = table->authorityIdentity();
-    params.pooled_ref.publication_version = snapshot.version();
-    params.pooled_ref.request_id = 7;
-    params.pooled_ref.slot = 0;
+    // L2: refs are OWNER-MINTED from a bound live publication — never
+    // hand-assembled. The owner records the request binding, then mints the ref.
+    ASSERT_TRUE(table->bindPublication(snapshot, /*request_id=*/7, /*slot=*/0));
+    params.pooled_ref = table->refFor(snapshot, 7, 0);
+    ASSERT_TRUE(params.pooled_ref.valid());
     params.kv_cache = nullptr; // Pooled path: no ring cache.
     MPIContext local_mpi{0, 1, MPI_COMM_WORLD};
     params.mpi_ctx = &local_mpi;
@@ -1379,9 +1381,11 @@ TEST(PooledStageConsumption, PooledModeRejectsUnsupportedAndForeignRefs)
     const CPUFP32PagedKVTableGeometry table_geometry{1, 2, 4, 4, 16, 4};
     const auto bytes = PhysicalPagePool::physicalBytes(pool_geometry, device) +
         CPUFP32PagedKVTable::physicalBytes(table_geometry, device);
+    const auto table_bytes = CPUFP32PagedKVTable::physicalBytes(table_geometry, device);
+    const auto total_bytes = bytes + table_bytes; // Two tables (L2 foreign negative).
     PhysicalMemoryPlanBuilder plan;
-    plan.add({.world_rank=0, .device=device, .total_bytes=bytes, .admission_available_bytes=bytes},
-        PhysicalMemoryOwner::KVCache, bytes);
+    plan.add({.world_rank=0, .device=device, .total_bytes=total_bytes, .admission_available_bytes=total_bytes},
+        PhysicalMemoryOwner::KVCache, total_bytes);
     auto authority = std::make_shared<PhysicalMemoryAuthority>(
         std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()), 0);
     auto pool = authority->createCPUPagePool(device, pool_geometry, CPUStoragePlacement::local());
@@ -1417,20 +1421,45 @@ TEST(PooledStageConsumption, PooledModeRejectsUnsupportedAndForeignRefs)
     params.kv_cache = nullptr;
     params.mpi_ctx = &local_mpi;
     params.pooled_table = table.get();
-    params.pooled_ref.authority_id = table->authorityIdentity();
-    params.pooled_ref.publication_version = snapshot.version();
-    params.pooled_ref.request_id = 7;
-    params.pooled_ref.slot = 0;
+    ASSERT_TRUE(table->bindPublication(snapshot, /*request_id=*/7, /*slot=*/0));
+    params.pooled_ref = table->refFor(snapshot, 7, 0);
+    ASSERT_TRUE(params.pooled_ref.valid());
     CPUDeviceContext ctx(device);
     // Baseline succeeds.
     AttentionComputeStage ok(params);
     ASSERT_TRUE(ok.execute(&ctx));
-    // J3 foreign authority: refuses (no other table reads).
+    // J3/K1 foreign table: a second table under the SAME authority has a
+    // DIFFERENT incarnation id — the ref minted against table A never resolves
+    // against table B, even when their versions collide.
+    auto table_b = CPUFP32PagedKVTable::create(authority, device, table_geometry);
+    auto b_update = table_b->tryBeginUpdate();
+    ASSERT_TRUE(b_update);
+    auto b_grant = pool->tryAdmit(1);
+    ASSERT_TRUE(b_grant);
+    const auto b_frame = b_grant->assignFrame();
+    auto b_write = b_grant->prepareAppend(b_frame, payload.size() * sizeof(float));
+    ASSERT_TRUE(b_write);
+    b_write->copyFrom(std::as_bytes(std::span(payload)));
+    b_update->append(CPUFP32KVPage(b_write->commit(), heads, dimension));
+    auto b_snapshot = b_update->commit();
+    ASSERT_TRUE(table_b->bindPublication(b_snapshot, 7, 0));
     auto foreign_params = params;
-    foreign_params.pooled_ref.authority_id = table->authorityIdentity() + 99;
-    AttentionComputeStage foreign(foreign_params);
-    EXPECT_FALSE(foreign.execute(&ctx));
-    // J3 superseded version: refuses (stale version).
+    foreign_params.pooled_table = table_b.get();
+    foreign_params.pooled_ref = table_b->refFor(b_snapshot, 7, 0);
+    // The ref is B's; the stage holds B — must refuse because the ref (B id)
+    // is fine but the rotation gate etc... Actually with B+refB it should
+    // SUCCEED. The foreign case is A's ref held against B:
+    auto cross_params = params;
+    cross_params.pooled_table = table_b.get();
+    cross_params.pooled_ref = table->refFor(snapshot, 7, 0); // A's ref against B.
+    AttentionComputeStage foreign(cross_params);
+    EXPECT_FALSE(foreign.execute(&ctx)); // Foreign incarnation: refuse.
+    // L2 wrong-request: the ref bound to request 8 never resolves for 7.
+    auto wrong_params = params;
+    wrong_params.pooled_ref.request_id = 8;
+    AttentionComputeStage wrong_req(wrong_params);
+    EXPECT_FALSE(wrong_req.execute(&ctx));
+    // J3 superseded version (never existed): refuses.
     auto stale_params = params;
     stale_params.pooled_ref.publication_version = snapshot.version() + 1000;
     AttentionComputeStage stale(stale_params);
@@ -1457,4 +1486,23 @@ TEST(PooledStageConsumption, PooledModeRejectsUnsupportedAndForeignRefs)
         gpu_refused = true; // No explicit stream for a GPU stage: refuses.
     }
     EXPECT_TRUE(gpu_refused);
+    // L1 pooled + rotation: the gate rejects BEFORE any transform — Q is left
+    // unmodified and no ring K/V is dereferenced (the old path would rotate Q
+    // against unrotated pages and dereference NULL effective_K).
+    std::vector<float> q_before(static_cast<std::size_t>(heads * dimension));
+    std::memcpy(q_before.data(), Q->fp32_data(), sizeof(float) * heads * dimension);
+    auto rotation_params = params;
+    ActivationRotation rotation(heads * dimension, 8);
+    rotation_params.kv_rotation = &rotation;
+    rotation_params.device_id = device; // CPU.
+    AttentionComputeStage rotation_stage(rotation_params);
+    EXPECT_FALSE(rotation_stage.execute(&ctx));
+    EXPECT_EQ(std::memcmp(Q->fp32_data(), q_before.data(), sizeof(float) * heads * dimension), 0)
+        << "pooled+rotation must never modify Q";
+    // L1 pooled + active_query_rows_device: rejected before any transform.
+    int32_t dummy_row = 0;
+    auto row_transform_params = params;
+    row_transform_params.active_query_rows_device = &dummy_row;
+    AttentionComputeStage row_transform_stage(row_transform_params);
+    EXPECT_FALSE(row_transform_stage.execute(&ctx));
 }

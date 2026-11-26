@@ -201,13 +201,22 @@ public:
      * snapshot's exact monotonic version and the request binding. A caller can
      * never forge a ref for a different table or a different version.
      */
-    PagedKVSnapshotRef refFor(const Snapshot &snapshot, std::uint64_t request_id, int slot) const
+    PagedKVSnapshotRef refFor(Snapshot &snapshot, std::uint64_t request_id, int slot)
     {
+        // L2: refs are minted from a LIVE, BOUND publication of THIS table (the
+        // owner recorded the binding). A foreign table's snapshot must never
+        // mint this table's id with another table's version.
+        if (snapshot.table_.get() != this)
+            return {}; // Foreign snapshot: no ref (empty = invalid).
+        auto &state = require(snapshot.bank_, snapshot.version_, Phase::Published);
+        if (state.request_id != request_id || state.slot != slot)
+            return {}; // Unbound or mismatched publication: no ref.
         PagedKVSnapshotRef ref;
         ref.authority_id = authority_identity_;
         ref.publication_version = snapshot.version();
         ref.request_id = request_id;
         ref.slot = slot;
+        ref.bank_hint = static_cast<int>(snapshot.bank_);
         return ref;
     }
 
@@ -224,6 +233,15 @@ public:
      */
     std::optional<Snapshot> resolveSnapshotRef(const PagedKVSnapshotRef &ref);
 
+    /**
+     * @brief Record the request binding of one published bank (owner only).
+     * @param snapshot Live published snapshot of THIS table.
+     * @param request_id Request identity that owns the publication.
+     * @param slot Request slot (identity metadata, never a bank).
+     * @return False when the snapshot is foreign or not published (L2: binding
+     * is recorded before any ref is minted; an unbound bank never resolves).
+     */
+    bool bindPublication(Snapshot &snapshot, std::uint64_t request_id, int slot);
     /** @brief Freeze new borrows of an exact published version before joining its existing readers. */
     void closeBorrowers(const Snapshot &snapshot);
     /** @return Original PMA instance identity for same-authority admission checks. */
@@ -291,6 +309,8 @@ private:
         size_t readers = 0;
         Phase phase = Phase::Free;
         bool accepting_readers = false;
+        std::uint64_t request_id = 0; ///< Published request binding (L2: resolve checks it).
+        int slot = -1;                ///< Published request slot binding.
     };
     CPUFP32PagedKVTable(std::shared_ptr<PhysicalMemoryAuthority> authority, DeviceId device,
         CPUFP32PagedKVTableGeometry geometry, CPUStoragePlacement placement);

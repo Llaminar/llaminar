@@ -414,6 +414,19 @@ CPUFP32PagedKVView CPUFP32PagedKVTable::Snapshot::view() const
     const auto &state = table_->require(bank_, version_, Phase::Published);
     return CPUFP32PagedKVView({table_->pages_ + bank_ * table_->geometry_.page_capacity, state.pages}, table_->geometry_.page_tokens);
 }
+bool CPUFP32PagedKVTable::bindPublication(Snapshot &snapshot,
+    std::uint64_t request_id, int slot)
+{
+    // L2: only THIS table's live published snapshot can be bound. A foreign
+    // table's snapshot (or an unpublished version) refuses.
+    if (snapshot.table_.get() != this)
+        return false;
+    auto &state = require(snapshot.bank_, snapshot.version_, Phase::Published);
+    state.request_id = request_id;
+    state.slot = slot;
+    return true;
+}
+
 std::optional<CPUFP32PagedKVTable::Snapshot> CPUFP32PagedKVTable::resolveSnapshotRef(
     const PagedKVSnapshotRef &ref)
 {
@@ -421,6 +434,36 @@ std::optional<CPUFP32PagedKVTable::Snapshot> CPUFP32PagedKVTable::resolveSnapsho
         return std::nullopt; // Foreign incarnation: refuse (never a different table).
     if (ref.request_id == 0)
         return std::nullopt; // K1: request binding is mandatory (never a bare ref).
+    // O(1) resolution: the bank hint is VERIFIED against the exact version
+    // before any borrow (it is a hint, never identity). A hint pointing at a
+    // reused bank with a different version refuses rather than scanning on
+    // (the caller may only fall back to a scan when the hint is invalid).
+    if (ref.bank_hint >= 0 &&
+        static_cast<std::size_t>(ref.bank_hint) < banks_.size())
+    {
+        auto &hinted = banks_[static_cast<std::size_t>(ref.bank_hint)];
+        if (hinted.phase == Phase::Published && hinted.pages &&
+            hinted.version == ref.publication_version)
+        {
+            // L2: exact request and slot binding match (an unbound, or a
+            // differently-bound, publication never resolves).
+            if (hinted.request_id != ref.request_id || hinted.slot != ref.slot)
+                return std::nullopt;
+            if (hinted.accepting_readers &&
+                hinted.readers < geometry_.readers_per_bank)
+            {
+                auto self = shared_from_this();
+                ++hinted.readers;
+                return Snapshot(std::move(self), static_cast<std::size_t>(ref.bank_hint),
+                    hinted.version);
+            }
+            return std::nullopt; // Exact hint, reader envelope exhausted: refuse.
+        }
+        // Hint mismatch: a reused/superseded bank can never serve this version.
+        return std::nullopt; // O(1): never scan a bank that wrongly hints.
+    }
+    // No hint: fall back to the authenticated scan (J3 path, used when the
+    // minted ref predates the hint field or came from a legacy owner).
     for (std::size_t bank = 0; bank < banks_.size(); ++bank)
     {
         auto &state = banks_[bank];
@@ -430,6 +473,8 @@ std::optional<CPUFP32PagedKVTable::Snapshot> CPUFP32PagedKVTable::resolveSnapsho
         if (state.phase != Phase::Published || !state.pages ||
             state.version != ref.publication_version)
             continue;
+        if (state.request_id != ref.request_id || state.slot != ref.slot)
+            continue; // L2: a differently-bound publication never resolves.
         if (!state.accepting_readers || state.readers == geometry_.readers_per_bank)
             return std::nullopt;
         auto self = shared_from_this();

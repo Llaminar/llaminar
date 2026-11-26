@@ -27,6 +27,16 @@ struct PagedKVSnapshotRef
     std::uint64_t publication_version = 0; ///< Monotonic published version (never a bank index).
     std::uint64_t request_id = 0;     ///< Request identity that owns the slot mapping.
     int slot = -1;                    ///< Request slot (identity metadata, never a bank).
+    /**
+     * @brief Untrusted bank HINT for O(1) resolution.
+     *
+     * The production caller resolves one ref per layer per row; scanning every
+     * bank is O(banks). The minted ref carries the bank that published the
+     * version as a hint, and the table VERIFIES it against the exact version
+     * before borrowing (a hint pointing at a reused bank with the wrong
+     * version refuses — it is never trusted as identity).
+     */
+    int bank_hint = -1;
     bool valid() const noexcept { return authority_id != 0 && publication_version != 0; }
 };
 
