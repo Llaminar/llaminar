@@ -92,9 +92,9 @@ endforeach()
             def check(extra):
                 database.write_text(json.dumps([dict(file='fixture.cu', host_language='CUDA', arguments=base + extra)]))
                 verify(database, '-mavx2', [definition])
-            for extra in (['-Xcompiler=-fopenmp'], ['-Xcompiler=-O3,-Wno-unused,-fvisibility=hidden'], ['-Xcompiler', '-fopenmp']):
+            for extra in (['-Xcompiler=-fopenmp'], ['-Xcompiler=-O3,-Wno-unused,-fvisibility=hidden'], ['-Xcompiler', '-fopenmp'], ['-Xcompiler=-m64']):
                 check(extra)
-            for extra in (['-Xcompiler=-march=native'], ['-Xcompiler=-O3,-mavx512f'], ['-Xcompiler', '-mavx512f']):
+            for extra in (['-Xcompiler=-march=native'], ['-Xcompiler=-O3,-mavx512f'], ['-Xcompiler', '-mavx512f'], ['--compiler-options=-mgfni'], ['--compiler-options', '-mno-lzcnt'], ['-Xcompiler=-mgeneral-regs-only'], ['-Xarch_device', '-mavx2']):
                 with self.assertRaisesRegex(ValueError, 'contrary'):
                     check(extra)
             with self.assertRaisesRegex(ValueError, 'empty expected CPU definitions'):

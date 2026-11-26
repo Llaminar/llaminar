@@ -39,13 +39,21 @@ v2_add_core_free_test(V2_Integration_CPUHostGeneratedCommands
         -p test_cpu_host_generated_commands.py
     LABELS V2 Integration DeviceFree ProductionTestPreflight)
 
+# A configure-owned header fixture standard, independent of incidental CXXFLAGS.
+add_library(v2_cpu_host_coherence_contract INTERFACE)
+set_property(TARGET v2_cpu_host_coherence_contract PROPERTY CXX_STANDARD 23)
+get_target_property(V2_CPU_HOST_COHERENCE_STANDARD v2_cpu_host_coherence_contract CXX_STANDARD)
 v2_add_core_free_test(V2_Unit_CPUHostCoherence
-    COMMAND "${Python3_EXECUTABLE}" -m unittest discover
+    COMMAND "${CMAKE_COMMAND}" -E env "LLAMINAR_TEST_CXX=${CMAKE_CXX_COMPILER}"
+        "LLAMINAR_TEST_CXX_STANDARD=${V2_CPU_HOST_COHERENCE_STANDARD}" "LLAMINAR_TEST_CMAKE=${CMAKE_COMMAND}"
+        "${Python3_EXECUTABLE}" -m unittest discover
         -s "${CMAKE_CURRENT_LIST_DIR}/../../../scripts/ci"
         -p test_cpu_host_coherence.py
     LABELS V2 Unit DeviceFree CI)
 v2_add_core_free_test(V2_Integration_CPUHostCoherence
-    COMMAND "${Python3_EXECUTABLE}" -m unittest discover
+    COMMAND "${CMAKE_COMMAND}" -E env "LLAMINAR_TEST_CXX=${CMAKE_CXX_COMPILER}"
+        "LLAMINAR_TEST_CXX_STANDARD=${V2_CPU_HOST_COHERENCE_STANDARD}" "LLAMINAR_TEST_CMAKE=${CMAKE_COMMAND}"
+        "${Python3_EXECUTABLE}" -m unittest discover
         -s "${CMAKE_CURRENT_LIST_DIR}/../../../scripts/ci"
         -p test_cpu_host_coherence.py
     LABELS V2 Integration DeviceFree ProductionTestPreflight)

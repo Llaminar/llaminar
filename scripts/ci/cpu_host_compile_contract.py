@@ -56,16 +56,19 @@ def verify(database, flags, definitions=None, compilers=None):
             raise ValueError('explicit compiler identity required')
         options = []
         for i, token in enumerate(command):
-            if token.startswith('-Xcompiler='):
+            if token.startswith(('-Xcompiler=', '--compiler-options=')):
                 options.extend(token.split('=', 1)[1].split(','))
-            elif token == '-Xcompiler' and i+1 < len(command):
+            elif token in ('-Xcompiler', '--compiler-options') and i+1 < len(command):
                 options.extend(command[i+1].split(','))
-            elif token == '-Xarch_host' and i+1 < len(command):
+            elif token in ('-Xarch_host', '-Xarch_device') and i+1 < len(command):
                 options.append(command[i+1])
-            elif token.startswith(('-march=', '-mcpu=', '-mtune=', '-mno-', '-mavx', '-msse', '-mfma', '-mf16c', '-mbmi', '-mpopcnt')):
+            elif token.startswith('-m'):
                 options.append(token)
         def isa_option(option):
-            return bool(re.match(r'^-m(?:arch=|cpu=|tune=|(?:no-)?(?:avx|sse|fma|f16c|bmi|popcnt|mmx|aes|pclmul|sha|crc|simd|dotprod|i8mm|fp16))', option))
+            # Address width and code model do not select optional CPU ISA features.
+            return option.startswith('-m') and option not in ('-m64', '-m32') and not option.startswith('-mcmodel=')
+        if any(command[i] == '-Xarch_device' and isa_option(command[i+1]) for i in range(len(command)-1)):
+            raise ValueError('CPU option leaks to device')
         if any(option not in expected for option in options if isa_option(option)):
             raise ValueError('contrary CPU compiler option')
         for flag in expected:
