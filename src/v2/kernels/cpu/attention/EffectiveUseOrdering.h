@@ -1,86 +1,93 @@
 /**
  * @file EffectiveUseOrdering.h
- * @brief Bounded effective-use receipts and retention watermark for shared prefixes.
+ * @brief Effective-use receipts, membership-sized journal and eviction gate.
  *
  * Design §8.2: define effective use as successful compatible attachment, bind
  * the accepted touch to sealed content/version and replica incarnation, and
  * watermark accepted touches before any eviction decision. A bounded retention
  * pin/fence protects an unacknowledged accepted touch; once acknowledged,
- * ordinary recency governs. Duplicate touches are idempotent; obsolete touches
- * never refresh a replacement. This is the CPU frame/table subset of the
- * retention-value policy; tier/disk ownership and GPU no-copy receipts remain
- * separate (plan P3/P6).
+ * ordinary recency governs. Obsolete touches never refresh a replacement, and
+ * every fresh successful attachment mints a NEW ordinal (no-copy hits refresh).
+ *
+ * The journal is sized from ADMITTED LIVE MEMBERSHIP (one entry per replica
+ * incarnation), not a magic constant: entries are replaced on refresh and
+ * reclaimed on retirement, so the journal never accumulates an unbounded
+ * lifetime history and never needs to throw as a lifetime limit. Capacity
+ * refusal is TYPED (a status), never a silent drop.
  */
 #pragma once
 #include <cstddef>
 #include <cstdint>
-#include <span>
+#include <string>
 
 namespace llaminar2
 {
-/** @brief One accepted effective-use touch, idempotent and incarnation-bound. */
+/** @brief One accepted effective-use touch, incarnation-bound with a fresh ordinal. */
 struct EffectiveUseReceipt final
 {
     std::uint64_t content_version = 0;
     std::uint64_t table_version = 0;
     std::uint64_t replica_incarnation = 0;
-    std::uint64_t sequence = 0;
+    std::uint64_t sequence = 0; ///< Fresh successful-attachment ordinal, never zero.
     bool operator==(const EffectiveUseReceipt &) const = default;
 };
 
-/** @brief Bounded touch journal with acceptance and watermark state. */
-class EffectiveUseTracker final
+/** @brief Typed touch outcome (never a silent drop). */
+enum class EffectiveUseStatus
 {
-public:
-    /**
-     * @brief Record one idempotent accepted touch for an incarnation.
-     * @param receipt Exact sealed content/version/replica identity.
-     * @return True when the touch is new (advances the watermark), false for a duplicate.
-     * @throws std::logic_error If the tracker exceeded its fixed capacity.
-     */
-    bool accept(EffectiveUseReceipt receipt);
-    /** @return Whether this exact incarnation has been accepted, with its sequence. */
-    std::uint64_t acknowledged(EffectiveUseReceipt receipt) const;
-    /** @return Highest accepted watermark; eviction may not precede it. */
-    std::uint64_t watermark() const noexcept { return watermark_; }
-    /** @return Whether the tracker holds an unacknowledged bounded retention pin. */
-    bool hasPendingPin() const noexcept { return pending_ != 0; }
-    void pinForPendingUse() noexcept { ++pending_; }
-    void releasePendingUse() noexcept { if (pending_) --pending_; }
-    /** @return Fixed capacity; used for the authority BOM. */
-    static constexpr std::size_t capacity() noexcept { return kCapacity; }
-private:
-    static constexpr std::size_t kCapacity = 64;
-    EffectiveUseReceipt entries_[kCapacity] = {};
-    std::size_t count_ = 0;
-    std::uint64_t watermark_ = 0;
-    std::size_t pending_ = 0;
+    Accepted,       ///< New accepted touch (watermark advanced).
+    Refreshed,      ///< Newer touch on an already-live incarnation (watermark advanced).
+    Duplicate,      ///< Exact same ordinal replayed: idempotent, no advance.
+    Obsolete,       ///< Older ordinal on a superseded incarnation: refused.
+    JournalFull,    ///< Bounded journal is full (all live): refused typed.
 };
 
 /**
- * @brief Eviction ordering gate (§8.2): a pending accepted touch pins its
- * backing until acknowledged; after the ordering point ordinary recency
- * governs. Obsolete or foreign touches never refresh a replacement, so a
- * reordered receipt cannot defeat the watermark.
+ * @brief Membership-sized effective-use journal with incarnation reclamation.
+ *
+ * One entry per replica incarnation; a newer touch replaces the older entry
+ * (reclamation by refresh), a retired incarnation releases its entry, and a
+ * full journal is reported typed. The sequence is the fresh attachment
+ * ordinal minted by the owner, so duplicate/obsolete receipts are recognized
+ * by exact ordinal and delayed acknowledgements cannot release a newer pin.
  */
-class EffectiveUseGate final
+class EffectiveUseJournal final
 {
 public:
-    /** @brief Notice a NEW accepted touch (bounded pin) for one incarnation. */
-    void pin(EffectiveUseReceipt receipt) noexcept;
-    /** @brief Ordering point: acknowledge the touch; the pin is released. */
-    void acknowledge(EffectiveUseReceipt receipt) noexcept;
-    /** @return Whether THIS incarnation may be evicted (no pending touch). */
-    bool mayEvict(EffectiveUseReceipt receipt) const noexcept;
-    /** @return Whether any incarnation still holds a bounded pin. */
+    /** @brief Bounded journal admitting exactly @p capacity live incarnations. */
+    explicit EffectiveUseJournal(std::size_t capacity) noexcept
+        : capacity_(capacity ? capacity : 1)
+    {
+        entries_ = new Entry[capacity_]; // Fixed membership; constructed before use.
+    }
+    ~EffectiveUseJournal() { delete[] entries_; }
+    EffectiveUseJournal(const EffectiveUseJournal &) = delete;
+    EffectiveUseJournal &operator=(const EffectiveUseJournal &) = delete;
+
+    /** @brief Touch one incarnation; typed outcome; pins on new/refreshed. */
+    EffectiveUseStatus touch(EffectiveUseReceipt receipt) noexcept;
+    /** @brief Ordering point: release the pin of the EXACT touch ordinal. */
+    bool acknowledge(EffectiveUseReceipt receipt) noexcept;
+    /** @brief Retirement: reclaim the incarnation's entry (update its age). */
+    bool retire(std::uint64_t incarnation) noexcept;
+    /** @return Whether @p incarnation may be evicted (no pending pin). */
+    bool mayEvict(std::uint64_t incarnation) const noexcept;
+    /** @return Highest accepted ordinal; eviction may not precede it. */
+    std::uint64_t watermark() const noexcept { return watermark_; }
+    /** @return Whether any incarnation holds an unacknowledged pin. */
     bool hasPending() const noexcept { return pending_ != 0; }
-    /** @return Bounded journal capacity; one entry per accepted touch. */
-    static constexpr std::size_t capacity() noexcept { return EffectiveUseTracker::capacity(); }
+    /** @return Admitted membership capacity. */
+    std::size_t capacity() const noexcept { return capacity_; }
 private:
-    static constexpr std::size_t kCapacity = EffectiveUseTracker::capacity();
-    struct State { EffectiveUseReceipt receipt; bool pinned = false; };
-    State states_[kCapacity] = {};
-    std::size_t count_ = 0;
+    struct Entry
+    {
+        EffectiveUseReceipt receipt;
+        bool pinned = false;
+        bool live = false;
+    };
+    std::size_t capacity_;
+    Entry *entries_ = nullptr;
     std::size_t pending_ = 0;
+    std::uint64_t watermark_ = 0;
 };
 } // namespace llaminar2

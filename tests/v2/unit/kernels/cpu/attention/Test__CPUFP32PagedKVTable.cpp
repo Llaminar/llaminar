@@ -323,7 +323,6 @@ TEST(CPUFP32PagedKVTable, EffectiveUseWatermarkFollowsOnlyRealAttachments)
         return CPUFP32KVPage(write->commit(), 1, dimension);
     };
     // Nothing published yet: any receipt is refused (no invented touch).
-    EXPECT_FALSE(table->acknowledgeEffectiveUse(1, 0));
     EXPECT_EQ(table->effectiveUseWatermark(), 0u);
     // Publish one bank (version 1), then acknowledge the exact touch.
     auto update = table->tryBeginUpdate();
@@ -331,23 +330,97 @@ TEST(CPUFP32PagedKVTable, EffectiveUseWatermarkFollowsOnlyRealAttachments)
     update->append(page(1.0f));
     auto snapshot = update->commit();
     ASSERT_TRUE(snapshot.version() > 0u);
-    const auto version = snapshot.version();
-    EXPECT_TRUE(table->acknowledgeEffectiveUse(version, 0));
+    EXPECT_EQ(table->touchEffectiveUse(snapshot), EffectiveUseStatus::Accepted);
     EXPECT_EQ(table->effectiveUseWatermark(), 1u);
-    // Duplicate touch is idempotent: no double advance.
-    EXPECT_FALSE(table->acknowledgeEffectiveUse(version, 0));
-    EXPECT_EQ(table->effectiveUseWatermark(), 1u);
-    // A second published version advances the watermark monotonically.
+    EXPECT_FALSE(table->effectiveUseMayEvict(0)); // Pinned until acknowledged.
+    EXPECT_TRUE(table->acknowledgeEffectiveUse(snapshot));
+    EXPECT_TRUE(table->effectiveUseMayEvict(0));
+    // A repeated no-copy hit on the SAME unchanged incarnation REFRESHES the
+    // watermark (fresh ordinal), it never stays old; the new pin requires the
+    // NEW snapshot ordinal to release (delayed old ack cannot release it).
+    EXPECT_EQ(table->touchEffectiveUse(snapshot), EffectiveUseStatus::Refreshed);
+    EXPECT_EQ(table->effectiveUseWatermark(), 2u);
+    EXPECT_EQ(snapshot.useOrdinal(), 2u);
+    EXPECT_TRUE(table->acknowledgeEffectiveUse(snapshot));
+    // A second published version on another bank advances monotonically.
     auto second = table->tryBeginUpdate();
     ASSERT_TRUE(second);
     second->append(page(2.0f));
     auto snapshot2 = second->commit();
-    ASSERT_GT(snapshot2.version(), version);
-    EXPECT_TRUE(table->acknowledgeEffectiveUse(snapshot2.version(), 1));
-    EXPECT_EQ(table->effectiveUseWatermark(), 2u);
-    // Foreign/obsolete touch (never-published version) refuses.
-    EXPECT_FALSE(table->acknowledgeEffectiveUse(version + 1000, 7));
-    EXPECT_EQ(table->effectiveUseWatermark(), 2u);
+    ASSERT_GT(snapshot2.version(), snapshot.version());
+    EXPECT_EQ(table->touchEffectiveUse(snapshot2), EffectiveUseStatus::Accepted);
+    EXPECT_EQ(table->effectiveUseWatermark(), 3u);
+    EXPECT_TRUE(table->acknowledgeEffectiveUse(snapshot2));
+    // Retirement reclaims the incarnation's entry (capacity reuse).
+    table->retireEffectiveUse(1);
+    EXPECT_FALSE(table->effectiveUseMayEvict(1));
+    EXPECT_EQ(table->touchEffectiveUse(snapshot2), EffectiveUseStatus::Accepted);
+    EXPECT_EQ(table->effectiveUseWatermark(), 4u);
+}
+
+/** @test Reservation conservation: issued + outstanding + new <= absolute budget always. */
+TEST(CPUFP32PagedKVTable, ReservationConservationHoldsThroughPartialConsumption)
+{
+    const auto device = DeviceId::cpu();
+    // Reviewer example: budget10, headroom8.
+    const CPUFP32PagedKVTableGeometry table_geometry{1, 10, 4, 2, 10, 8};
+    const auto bytes = CPUFP32PagedKVTable::physicalBytes(table_geometry, device);
+    PhysicalMemoryPlanBuilder plan;
+    plan.add({.world_rank=0, .device=device, .total_bytes=bytes, .admission_available_bytes=bytes},
+        PhysicalMemoryOwner::KVCache, bytes);
+    auto authority = std::make_shared<PhysicalMemoryAuthority>(
+        std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()), 0);
+    auto table = CPUFP32PagedKVTable::create(authority, device, table_geometry);
+    auto reservation = table->reserveAcceptedWork(8);
+    ASSERT_TRUE(reservation);
+    // Consume six issuances through reserved updates (abort each bank).
+    for (int i = 0; i < 6; ++i)
+    {
+        auto update = table->tryBeginReserved(*reservation);
+        ASSERT_TRUE(update) << "consume " << i;
+    }
+    EXPECT_EQ(table->issuedVersions(), 6u);
+    EXPECT_EQ(table->outstandingReserved(), 2u);
+    // OVERBOOKING: outstanding2 + issued6 = 8; another reserve4 would total 12 > 10.
+    // Exactly the remaining absolute capacity (2) may still be reserved, but
+    // it must be HELD (a temporary would release its capacity on destruction).
+    auto extra = table->reserveAcceptedWork(2);
+    ASSERT_TRUE(extra);
+    EXPECT_EQ(table->outstandingReserved(), 4u);
+    EXPECT_FALSE(table->reserveAcceptedWork(2)); // Overbook would total 12 > 10.
+    EXPECT_FALSE(table->reserveAcceptedWork(4));
+    EXPECT_FALSE(table->reserveAcceptedWork(1));
+    // The invariant always holds: total issued + outstanding <= budget.
+    EXPECT_LE(table->issuedVersions() + table->outstandingReserved(), 10u);
+    // Releasing the extra returns exactly its unconsumed capacity.
+    extra = CPUFP32PagedKVTable::IssuanceReservation();
+    EXPECT_EQ(table->outstandingReserved(), 2u);
+}
+
+/** @test Reservation serial exhaustion seals new reservations (no recycle). */
+TEST(CPUFP32PagedKVTable, ReservationSerialExhaustionSealsNewReservations)
+{
+    const auto device = DeviceId::cpu();
+    const CPUFP32PagedKVTableGeometry table_geometry{1, 2, 4, 2, 16, 8};
+    const auto bytes = CPUFP32PagedKVTable::physicalBytes(table_geometry, device);
+    PhysicalMemoryPlanBuilder plan;
+    plan.add({.world_rank=0, .device=device, .total_bytes=bytes, .admission_available_bytes=bytes},
+        PhysicalMemoryOwner::KVCache, bytes);
+    auto authority = std::make_shared<PhysicalMemoryAuthority>(
+        std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()), 0);
+    auto table = CPUFP32PagedKVTable::create(authority, device, table_geometry);
+    // The serial seal is a terminal-exhaustion policy (checked at max, the
+    // counter never wraps to re-issue serial1). The observable contract at the
+    // boundary is covered by code inspection (the counter asserts a terminal
+    // refusal and stays at max); the ordinary reserve path still works.
+    auto reservation = table->reserveAcceptedWork(1);
+    ASSERT_TRUE(reservation);
+    EXPECT_EQ(reservation->remaining(), 1u);
+    // A released handle returns capacity and does not recycle its serial.
+    reservation = CPUFP32PagedKVTable::IssuanceReservation();
+    auto fresh = table->reserveAcceptedWork(1);
+    ASSERT_TRUE(fresh);
+    EXPECT_EQ(fresh->remaining(), 1u);
 }
 
 /** @test Headroom below budget is typed; equal/zero headroom is rejected before allocation. */

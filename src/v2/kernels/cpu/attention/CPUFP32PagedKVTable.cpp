@@ -36,7 +36,9 @@ std::shared_ptr<CPUFP32PagedKVTable> CPUFP32PagedKVTable::create(std::shared_ptr
     return std::shared_ptr<CPUFP32PagedKVTable>(new CPUFP32PagedKVTable(std::move(authority), device, geometry, placement));
 }
 CPUFP32PagedKVTable::CPUFP32PagedKVTable(std::shared_ptr<PhysicalMemoryAuthority> authority, DeviceId device,
-    CPUFP32PagedKVTableGeometry geometry, CPUStoragePlacement placement) : authority_(authority), geometry_(geometry)
+    CPUFP32PagedKVTableGeometry geometry, CPUStoragePlacement placement)
+    : authority_(authority), geometry_(geometry),
+      effective_use_(geometry.bank_count ? geometry.bank_count : 1)
 {
     (void)physicalBytes(geometry, device, placement);
     static_assert(alignof(CPUFP32KVPage) <= AlignedVector<std::byte>::ALIGNMENT);
@@ -90,16 +92,26 @@ std::optional<CPUFP32PagedKVTable::Update> CPUFP32PagedKVTable::tryBeginUpdate()
 std::optional<CPUFP32PagedKVTable::IssuanceReservation>
 CPUFP32PagedKVTable::reserveAcceptedWork(std::size_t capacity)
 {
-    // Checked finite arithmetic; a capacity above the remaining headroom or
-    // the remaining finite budget refuses without mutation.
+    // Checked finite arithmetic with the COMPLETE reservation conservation
+    // rule: issued versions (next_version_) PLUS every unconsumed outstanding
+    // reservation PLUS the new capacity may never exceed the finite budget.
+    // The headroom bound alone is insufficient (issued + outstanding can still
+    // overbook the absolute budget after partial consumption).
     if (capacity > geometry_.issuance_headroom - reserved_outstanding_)
         return std::nullopt;
-    const auto remaining_budget = geometry_.issuance_budget - next_version_;
-    if (capacity > remaining_budget)
+    if (reserved_outstanding_ > geometry_.issuance_budget - next_version_)
+        return std::nullopt; // Invariant violation would already overbook.
+    const auto absolute_remaining =
+        geometry_.issuance_budget - next_version_ - reserved_outstanding_;
+    if (capacity > absolute_remaining)
         return std::nullopt;
     auto self = shared_from_this();
-    if (++reservation_serial_ == 0)
-        return std::nullopt; // Nonce wrap: refuse rather than recycle.
+    if (reservation_serial_ == std::numeric_limits<std::uint64_t>::max())
+        return std::nullopt; // Nonce EXHAUSTION terminal: the counter stays at
+                             // max, so no wrap can re-issue serial1 and an
+                             // old handle can never replay. New reservations
+                             // are permanently refused (sealed).
+    ++reservation_serial_;
     reserved_outstanding_ += capacity;
     return IssuanceReservation(std::move(self), capacity, reservation_serial_);
 }
@@ -156,17 +168,46 @@ void CPUFP32PagedKVTable::IssuanceReservation::release() noexcept
         self.reserved_outstanding_ -= remaining_;
     table_.reset();
 }
-bool CPUFP32PagedKVTable::acknowledgeEffectiveUse(std::uint64_t version,
-    std::uint64_t incarnation)
+EffectiveUseStatus CPUFP32PagedKVTable::touchEffectiveUse(
+    const Snapshot &snapshot)
 {
-    // The receipt is bound to the EXACT published version and bank identity;
-    // a version that was never published here admits no touch (obsolete or
-    // foreign incarnations are refused, not interpreted).
-    if (version == 0 || version > next_version_)
+    // AUTHENTICATE the touch against the actual published bank: a burned or
+    // unpublished version is not a successful attachment, and a foreign bank
+    // (incarnation mismatch) is refused before any journal mutation. The
+    // caller's incarnation is never trusted without this proof.
+    if (snapshot.table_.get() != this || snapshot.bank_ >= banks_.size())
+        return EffectiveUseStatus::Obsolete;
+    auto &state = banks_[snapshot.bank_];
+    if (state.phase != Phase::Published ||
+        state.version != snapshot.version_ || !state.pages)
+        return EffectiveUseStatus::Obsolete;
+    // Every successful attachment mints a FRESH ordinal: a repeated no-copy
+    // hit on the same unchanged incarnation REFRESHES the watermark rather
+    // than deduplicating into a stale touch.
+    if (++effective_use_sequence_ == 0)
+        return EffectiveUseStatus::Obsolete; // Ordinal exhaustion: seal.
+    // Record the fresh ordinal ON the snapshot: the acknowledgment must carry
+    // the exact touch identity, not the table's current sequence (a later
+    // touch on another incarnation would otherwise release the wrong pin).
+    snapshot.touch_ordinal_ = effective_use_sequence_;
+    return effective_use_.touch(EffectiveUseReceipt{
+        .content_version=state.version, .table_version=state.version,
+        .replica_incarnation=snapshot.bank_, .sequence=effective_use_sequence_});
+}
+
+bool CPUFP32PagedKVTable::acknowledgeEffectiveUse(const Snapshot &snapshot)
+{
+    // Acknowledgment carries the snapshot's OWN touch ordinal (set at touch
+    // and preserved across borrows): a delayed acknowledgement can never
+    // release a newer re-pin of the same incarnation.
+    if (snapshot.table_.get() != this || snapshot.bank_ >= banks_.size())
         return false;
-    return effective_use_.accept(EffectiveUseReceipt{
-        .content_version=version, .table_version=version,
-        .replica_incarnation=incarnation, .sequence=0});
+    auto &state = banks_[snapshot.bank_];
+    if (state.phase != Phase::Published || state.version != snapshot.version_)
+        return false;
+    return effective_use_.acknowledge(EffectiveUseReceipt{
+        .content_version=state.version, .table_version=state.version,
+        .replica_incarnation=snapshot.bank_, .sequence=snapshot.touch_ordinal_});
 }
 
 void CPUFP32PagedKVTable::closeBorrowers(const Snapshot &snapshot)
@@ -317,10 +358,18 @@ CPUFP32PagedKVTable::Snapshot::Snapshot(std::shared_ptr<CPUFP32PagedKVTable> tab
     : table_(std::move(table)), bank_(bank), version_(version) {}
 CPUFP32PagedKVTable::Snapshot::~Snapshot() { release(); }
 CPUFP32PagedKVTable::Snapshot::Snapshot(Snapshot &&other) noexcept
-    : table_(std::move(other.table_)), bank_(other.bank_), version_(other.version_) {}
+    : table_(std::move(other.table_)), bank_(other.bank_), version_(other.version_),
+      touch_ordinal_(other.touch_ordinal_) {}
 CPUFP32PagedKVTable::Snapshot &CPUFP32PagedKVTable::Snapshot::operator=(Snapshot &&other) noexcept
 {
-    if (this != &other) { release(); table_ = std::move(other.table_); bank_ = other.bank_; version_ = other.version_; }
+    if (this != &other)
+    {
+        release();
+        table_ = std::move(other.table_);
+        bank_ = other.bank_;
+        version_ = other.version_;
+        touch_ordinal_ = other.touch_ordinal_;
+    }
     return *this;
 }
 CPUFP32PagedKVView CPUFP32PagedKVTable::Snapshot::view() const
@@ -336,7 +385,9 @@ std::optional<CPUFP32PagedKVTable::Snapshot> CPUFP32PagedKVTable::Snapshot::tryB
     if (!state.accepting_readers || state.readers == table_->geometry_.readers_per_bank) return std::nullopt;
     auto self = table_;
     ++state.readers;
-    return Snapshot(std::move(self), bank_, version_);
+    auto borrowed = Snapshot(std::move(self), bank_, version_);
+    borrowed.touch_ordinal_ = touch_ordinal_; // A borrow is the same touch ordinal.
+    return borrowed;
 }
 void CPUFP32PagedKVTable::Snapshot::release() noexcept
 {

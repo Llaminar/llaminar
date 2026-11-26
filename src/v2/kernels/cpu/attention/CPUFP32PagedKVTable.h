@@ -85,6 +85,8 @@ public:
         std::optional<Snapshot> tryBorrow() const;
         /** @return Non-reused bank incarnation for identity checks and evidence. */
         std::uint64_t version() const noexcept { return version_; }
+        /** @return Exact current touch ordinal, or 0 when never touched. */
+        std::uint64_t useOrdinal() const noexcept { return touch_ordinal_; }
     private:
         friend class CPUFP32PagedKVTable;
         Snapshot(std::shared_ptr<CPUFP32PagedKVTable> table, size_t bank, std::uint64_t version);
@@ -92,6 +94,11 @@ public:
         std::shared_ptr<CPUFP32PagedKVTable> table_;
         size_t bank_ = 0;
         std::uint64_t version_ = 0;
+        /** Touch identity: set by the table when the snapshot is touched and
+         *  preserved across borrows. Mutable so a touch on a const snapshot
+         *  records the exact ordinal without changing the snapshot's content
+         *  identity (the bank/version are immutable). */
+        mutable std::uint64_t touch_ordinal_ = 0;
     };
     /** @brief Exclusive unpublished bank preparation; abandonment retires its original page owners. */
     class Update final
@@ -192,18 +199,35 @@ public:
     const PhysicalMemoryAuthority *issuerForAdmission() const noexcept { return authority_.get(); }
 
     /**
-     * @brief Acknowledge one successful attachment (§8.2 effective use).
-     * @param version Exact published table content version touched.
-     * @param incarnation Replica incarnation (bank identity) adopted.
-     * @return True when the touch is new (advances the retention watermark),
-     * false for an idempotent duplicate or an obsolete incarnation.
-     * @note A receipt exists only AFTER a committed snapshot; a failed
-     * attachment never produces one, and no eviction may precede the
-     * acknowledged watermark for this incarnation.
+     * @brief Touch one successful attachment (§8.2 effective use).
+     * @param snapshot EXACT published snapshot the touch adopted (the table
+     * authenticates its bank, version and incarnation against live state;
+     * a burned/unpublished version or foreign bank refuses).
+     * @return Typed outcome; Accepted/Refreshed advance the watermark and
+     * pin the incarnation until its exact ordinal is acknowledged. Every
+     * fresh successful attachment mints a NEW sequence ordinal so a repeated
+     * no-copy hit refreshes instead of staying old.
      */
-    bool acknowledgeEffectiveUse(std::uint64_t version, std::uint64_t incarnation);
+    EffectiveUseStatus touchEffectiveUse(const Snapshot &snapshot);
+    /**
+     * @brief Ordering point (§8.2): acknowledge the exact touch ordinal.
+     * @param snapshot The publication whose touch the caller acknowledges.
+     * @return True when the exact ordinal's pin was released; a delayed ack
+     * of an older ordinal never releases a newer re-pin (idempotent false).
+     */
+    bool acknowledgeEffectiveUse(const Snapshot &snapshot);
     /** @return Highest acknowledged retention watermark (§8.2 ordering point). */
     std::uint64_t effectiveUseWatermark() const noexcept { return effective_use_.watermark(); }
+    /** @return Whether @p bank/incarnation may be evicted (no pending touch). */
+    bool effectiveUseMayEvict(std::uint64_t incarnation) const noexcept
+    {
+        return effective_use_.mayEvict(incarnation);
+    }
+    /** @brief Reclaim a retired incarnation's effective-use entry. */
+    void retireEffectiveUse(std::uint64_t incarnation) noexcept
+    {
+        effective_use_.retire(incarnation);
+    }
 private:
     enum class Phase : std::uint8_t { Free, Preparing, Published };
     /** @brief Exact CPU ownership state within the charged metadata root. */
@@ -228,7 +252,8 @@ private:
     std::uint64_t next_version_ = 0; ///< Monotonic across every bank, including aborted preparations.
     std::uint64_t reserved_outstanding_ = 0; ///< Sum of live reservation capacities.
     std::uint64_t reservation_serial_ = 0;   ///< Monotonic handle nonce, never recycled.
-    EffectiveUseTracker effective_use_;       ///< Accepted-touch watermark (§8.2).
+    std::uint64_t effective_use_sequence_ = 0; ///< Fresh touch ordinal (§8.2).
+    EffectiveUseJournal effective_use_;       ///< Membership-sized touch journal.
     AlignedVector<std::byte> cells_;
     AlignedVector<Bank> banks_;
     CPUFP32KVPage *pages_ = nullptr; ///< Constructed stable metadata array, never KV payload.

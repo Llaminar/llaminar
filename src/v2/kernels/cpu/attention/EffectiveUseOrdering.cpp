@@ -1,74 +1,94 @@
 /**
  * @file EffectiveUseOrdering.cpp
- * @brief Bounded idempotent touch journal implementation.
+ * @brief Membership-sized effective-use journal implementation.
  */
 #include "EffectiveUseOrdering.h"
-#include <stdexcept>
 
 namespace llaminar2
 {
-void EffectiveUseGate::pin(EffectiveUseReceipt receipt) noexcept
+EffectiveUseStatus EffectiveUseJournal::touch(EffectiveUseReceipt receipt) noexcept
 {
-    // A pin accompanies a NEW accepted touch. A duplicate while still pinned
-    // is idempotent; a touch on the same incarnation AFTER its ordering point
-    // is a fresh accepted use and re-pins (obsolete/foreign keys never match
-    // because the receipt identity is exact).
-    for (std::size_t i = 0; i < count_; ++i)
-        if (states_[i].receipt == receipt)
-        {
-            if (!states_[i].pinned)
-            {
-                states_[i].pinned = true;
-                ++pending_;
-            }
-            return;
-        }
-    if (count_ == kCapacity) return; // Fixed journal full: refuse (bounded).
-    states_[count_++] = {receipt, true};
-    ++pending_;
-}
-
-void EffectiveUseGate::acknowledge(EffectiveUseReceipt receipt) noexcept
-{
-    // Ordering point: release exactly one bounded pin for the accepted touch.
-    for (std::size_t i = 0; i < count_; ++i)
-        if (states_[i].receipt == receipt && states_[i].pinned)
-        {
-            states_[i].pinned = false;
-            --pending_;
-            return;
-        }
-    // Unknown/foreign/duplicate acknowledgment is idempotent.
-}
-
-bool EffectiveUseGate::mayEvict(EffectiveUseReceipt receipt) const noexcept
-{
-    // Ordained rule: no eviction may race ahead of an accepted touch. A
-    // receipt is evictable only when it was accepted AND acknowledged; any
-    // still-pinned incarnation blocks the gate (bounded fence).
-    if (pending_ != 0) return false;
-    for (std::size_t i = 0; i < count_; ++i)
-        if (states_[i].receipt == receipt) return !states_[i].pinned;
-    return false; // Foreign/obsolete receipt: not evictable through this gate.
-}
-
-bool EffectiveUseTracker::accept(EffectiveUseReceipt receipt)
-{
-    if (acknowledged(receipt) != 0) return false; // Idempotent duplicate.
-    if (count_ == capacity()) throw std::logic_error("Effective-use journal exceeded its fixed capacity");
-    entries_[count_++] = receipt;
-    ++watermark_;
-    return true;
-}
-
-std::uint64_t EffectiveUseTracker::acknowledged(EffectiveUseReceipt receipt) const
-{
-    std::uint64_t ordinal = 0;
-    for (std::size_t i = 0; i < count_; ++i)
+    if (receipt.sequence == 0)
+        return EffectiveUseStatus::Obsolete; // Fresh ordinals are nonzero.
+    std::size_t free_slot = capacity_;
+    for (std::size_t i = 0; i < capacity_; ++i)
     {
-        ++ordinal;
-        if (entries_[i] == receipt) return ordinal;
+        auto &entry = entries_[i];
+        if (!entry.live)
+        {
+            if (free_slot == capacity_) free_slot = i;
+            continue;
+        }
+        if (entry.receipt.replica_incarnation != receipt.replica_incarnation)
+            continue;
+        // Same incarnation: an EXACT duplicate replays idempotently; a newer
+        // ordinal refreshes (reclaims the older entry in place); an older
+        // ordinal is obsolete and never refreshes a replacement.
+        if (entry.receipt.sequence == receipt.sequence)
+            return EffectiveUseStatus::Duplicate;
+        if (entry.receipt.sequence > receipt.sequence)
+            return EffectiveUseStatus::Obsolete;
+        // Refresh: replace the entry in place.
+        const bool was_pinned = entry.pinned;
+        entry.receipt = receipt;
+        entry.pinned = true;
+        if (!was_pinned) ++pending_;
+        if (receipt.sequence > watermark_) watermark_ = receipt.sequence;
+        return EffectiveUseStatus::Refreshed;
     }
-    return 0;
+    if (free_slot == capacity_)
+        return EffectiveUseStatus::JournalFull; // All live incarnations.
+    entries_[free_slot] = Entry{receipt, true, true};
+    ++pending_;
+    if (receipt.sequence > watermark_) watermark_ = receipt.sequence;
+    return EffectiveUseStatus::Accepted;
+}
+
+bool EffectiveUseJournal::acknowledge(EffectiveUseReceipt receipt) noexcept
+{
+    for (std::size_t i = 0; i < capacity_; ++i)
+    {
+        auto &entry = entries_[i];
+        if (!entry.live || entry.receipt.replica_incarnation != receipt.replica_incarnation)
+            continue;
+        // Exact-ordinal match only: a delayed acknowledgement for an OLD
+        // ordinal must never release a NEWER re-pinned touch.
+        if (entry.receipt.sequence != receipt.sequence)
+            return false;
+        if (entry.pinned)
+        {
+            entry.pinned = false;
+            --pending_;
+            return true;
+        }
+        return true; // Already acknowledged: idempotent.
+    }
+    return false; // Unknown/foreign incarnation.
+}
+
+bool EffectiveUseJournal::retire(std::uint64_t incarnation) noexcept
+{
+    for (std::size_t i = 0; i < capacity_; ++i)
+    {
+        auto &entry = entries_[i];
+        if (!entry.live || entry.receipt.replica_incarnation != incarnation)
+            continue;
+        if (entry.pinned) --pending_;
+        entry = Entry{}; // Reclaim: capacity returns for the next incarnation.
+        return true;
+    }
+    return false; // Nothing live for this incarnation (idempotent retire).
+}
+
+bool EffectiveUseJournal::mayEvict(std::uint64_t incarnation) const noexcept
+{
+    for (std::size_t i = 0; i < capacity_; ++i)
+    {
+        const auto &entry = entries_[i];
+        if (!entry.live || entry.receipt.replica_incarnation != incarnation)
+            continue;
+        return !entry.pinned; // Accepted and acknowledged: evictable.
+    }
+    return false; // Unaccepted incarnation: never evictable through here.
 }
 } // namespace llaminar2

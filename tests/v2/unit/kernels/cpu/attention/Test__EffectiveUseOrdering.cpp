@@ -1,93 +1,85 @@
 /**
  * @file Test__EffectiveUseOrdering.cpp
- * @brief Effective-use receipt, idempotence, watermark and pending-pin contracts.
+ * @brief Effective-use receipt, membership-sized journal and eviction gate contracts.
  */
 #include "kernels/cpu/attention/EffectiveUseOrdering.h"
 #include <gtest/gtest.h>
 
 using namespace llaminar2;
 
-/** @test Accepted touches advance a watermark; duplicates are idempotent. */
-TEST(EffectiveUseOrdering, AcceptanceAndWatermarkContracts)
+/** @test Touches accept, refresh, duplicate and retire with typed outcomes. */
+TEST(EffectiveUseOrdering, MembershipJournalAcceptsRefreshesAndReclaims)
 {
-    EffectiveUseTracker tracker;
-    EffectiveUseReceipt first{1, 1, 1, 0};
-    EffectiveUseReceipt second{1, 2, 1, 0};
-    EXPECT_TRUE(tracker.accept(first));
-    EXPECT_EQ(tracker.watermark(), 1u);
-    EXPECT_EQ(tracker.acknowledged(first), 1u);
-    EXPECT_FALSE(tracker.accept(first)); // Idempotent duplicate.
-    EXPECT_EQ(tracker.watermark(), 1u);
-    EXPECT_TRUE(tracker.accept(second));
-    EXPECT_EQ(tracker.watermark(), 2u);
-    EXPECT_EQ(tracker.acknowledged(second), 2u);
+    EffectiveUseJournal journal(2); // Two live incarnations.
+    EffectiveUseReceipt first{1, 1, 0, 1};
+    EffectiveUseReceipt refresh{1, 1, 0, 2};      // Newer touch, same incarnation.
+    EffectiveUseReceipt obsolete{1, 1, 0, 0};     // Zero ordinal: obsolete.
+    EffectiveUseReceipt second{1, 1, 1, 3};       // Another incarnation.
+    EXPECT_EQ(journal.touch(first), EffectiveUseStatus::Accepted);
+    EXPECT_EQ(journal.watermark(), 1u);
+    EXPECT_EQ(journal.touch(first), EffectiveUseStatus::Duplicate); // Idempotent.
+    EXPECT_EQ(journal.watermark(), 1u);
+    EXPECT_EQ(journal.touch(refresh), EffectiveUseStatus::Refreshed); // No-copy refresh.
+    EXPECT_EQ(journal.watermark(), 2u);
+    EXPECT_EQ(journal.touch(obsolete), EffectiveUseStatus::Obsolete); // Zero ordinal.
+    EXPECT_EQ(journal.touch(second), EffectiveUseStatus::Accepted);
+    EXPECT_EQ(journal.watermark(), 3u);
+    // Retirement reclaims capacity: a full journal can accept again after retire.
+    EXPECT_TRUE(journal.retire(0));
+    EffectiveUseReceipt third{1, 1, 2, 4};
+    EXPECT_EQ(journal.touch(third), EffectiveUseStatus::Accepted);
+    EXPECT_EQ(journal.touch(third), EffectiveUseStatus::Duplicate);
+    // Retiring an unknown incarnation is idempotent.
+    EXPECT_FALSE(journal.retire(9));
 }
 
-/** @test Obsolete incarnation cannot refresh under the same content version. */
-TEST(EffectiveUseOrdering, ObsoleteIncarnationDoesNotRefreshReplacement)
+/** @test Typed journal-full refusal; bounded by live membership, never silent. */
+TEST(EffectiveUseOrdering, JournalFullIsTypedNotSilent)
 {
-    EffectiveUseTracker tracker;
-    EffectiveUseReceipt old_incarnation{1, 1, 7, 0};
-    EffectiveUseReceipt replacement{1, 1, 9, 0};
-    EXPECT_TRUE(tracker.accept(old_incarnation));
-    EXPECT_TRUE(tracker.accept(replacement));
-    EXPECT_EQ(tracker.acknowledged(old_incarnation), 1u);
-    EXPECT_EQ(tracker.acknowledged(replacement), 2u);
-    // A touch for an even older incarnation is a distinct entry, never a refresh.
-    EffectiveUseReceipt ancient{1, 1, 3, 0};
-    EXPECT_TRUE(tracker.accept(ancient));
-    EXPECT_EQ(tracker.acknowledged(ancient), 3u);
-    EXPECT_EQ(tracker.watermark(), 3u);
+    EffectiveUseJournal journal(2);
+    EXPECT_EQ(journal.touch({1, 1, 0, 1}), EffectiveUseStatus::Accepted);
+    EXPECT_EQ(journal.touch({1, 1, 1, 2}), EffectiveUseStatus::Accepted);
+    EXPECT_EQ(journal.touch({1, 1, 2, 3}), EffectiveUseStatus::JournalFull);
+    // Refresh still works on a live incarnation (reclamation by refresh).
+    EXPECT_EQ(journal.touch({1, 1, 0, 4}), EffectiveUseStatus::Refreshed);
 }
 
-/** @test Eviction gate: pending touch pins; acknowledgement releases; reordered receipts never defeat it. */
-TEST(EffectiveUseOrdering, EvictionGatePinsThenAcknowledgesOrderly)
+/** @test Acknowledgment is ordinal-exact; delayed acks never release newer pins. */
+TEST(EffectiveUseOrdering, AcknowledgementIsOrdinalExact)
 {
-    EffectiveUseGate gate;
-    EffectiveUseReceipt first{1, 1, 1, 0};
-    EffectiveUseReceipt second{1, 2, 1, 0};
-    EffectiveUseReceipt obsolete{0, 1, 7, 0};
-    // A new accepted touch pins its backing: eviction is blocked.
-    gate.pin(first);
-    EXPECT_TRUE(gate.hasPending());
-    EXPECT_FALSE(gate.mayEvict(first));
-    // Acknowledgment is the ordering point: the pin releases and the exact
-    // incarnation becomes evictable while ordinary recency governs.
-    gate.acknowledge(first);
-    EXPECT_FALSE(gate.hasPending());
-    EXPECT_TRUE(gate.mayEvict(first));
-    // Reordered receipts: a second accepted touch still blocks the gate;
-    // acknowledging the first again is idempotent and cannot release it.
-    gate.pin(second);
-    gate.acknowledge(first); // Obsolete acknowledgement: idempotent.
-    EXPECT_TRUE(gate.hasPending());
-    EXPECT_FALSE(gate.mayEvict(second));
-    gate.acknowledge(second);
-    EXPECT_TRUE(gate.mayEvict(second));
-    // Foreign/obsolete receipts are never evictable through this gate.
-    EXPECT_FALSE(gate.mayEvict(obsolete));
-    // Duplicate pin of an already-pinned touch keeps exactly one pin.
-    gate.pin(first);
-    gate.pin(first);
-    EXPECT_TRUE(gate.hasPending());
-    gate.acknowledge(first);
-    EXPECT_FALSE(gate.hasPending());
-    EXPECT_TRUE(gate.mayEvict(first));
+    EffectiveUseJournal journal(3);
+    EffectiveUseReceipt old_touch{1, 1, 0, 1};
+    EffectiveUseReceipt fresh_touch{1, 1, 0, 2};
+    EXPECT_EQ(journal.touch(old_touch), EffectiveUseStatus::Accepted);
+    EXPECT_FALSE(journal.mayEvict(0)); // Pending pin.
+    // A DELAYED acknowledgement of an older ordinal cannot release a newer
+    // re-pinned touch (it releases nothing).
+    EXPECT_EQ(journal.touch(fresh_touch), EffectiveUseStatus::Refreshed);
+    // A DELAYED acknowledgement of an OLD ordinal cannot release the NEW pin.
+    EXPECT_FALSE(journal.acknowledge(old_touch));
+    EXPECT_FALSE(journal.mayEvict(0));            // new pin still protected.
+    EXPECT_TRUE(journal.acknowledge(fresh_touch));
+    EXPECT_TRUE(journal.mayEvict(0));
+    // Duplicate/foreign acks are idempotent.
+    EXPECT_FALSE(journal.acknowledge({9, 9, 7, 99}));
+    EXPECT_TRUE(journal.acknowledge(fresh_touch));
 }
 
-/** @test Bounded pending pin guards unacknowledged accepted use; capacity refuses overflow. */
-TEST(EffectiveUseOrdering, PendingPinAndBoundedCapacity)
+/** @test Long-lifetime behavior: many successful touches reuse reclaimed slots. */
+TEST(EffectiveUseOrdering, ManyTouchesOverTimeReclaimAndStayBounded)
 {
-    EffectiveUseTracker tracker;
-    tracker.pinForPendingUse();
-    EXPECT_TRUE(tracker.hasPendingPin());
-    tracker.releasePendingUse();
-    EXPECT_FALSE(tracker.hasPendingPin());
-    tracker.releasePendingUse(); // Idempotent release.
-    EXPECT_FALSE(tracker.hasPendingPin());
-    // Capacity: accept up to the fixed limit, then refuse (typed).
-    for (std::size_t i = 0; i < EffectiveUseTracker::capacity(); ++i)
-        EXPECT_TRUE(tracker.accept({1, 1, static_cast<std::uint64_t>(i + 1), 0}));
-    EXPECT_THROW(tracker.accept({1, 1, 9999, 0}), std::logic_error);
-    EXPECT_EQ(tracker.watermark(), EffectiveUseTracker::capacity());
+    EffectiveUseJournal journal(2);
+    std::uint64_t ordinal = 0;
+    for (std::size_t generation = 0; generation < 40; ++generation)
+    {
+        const auto incarnation = generation % 2;
+        const auto status = journal.touch(
+            EffectiveUseReceipt{1, 1, incarnation, ++ordinal});
+        EXPECT_EQ(status, EffectiveUseStatus::Accepted);
+        EXPECT_TRUE(journal.acknowledge(
+            EffectiveUseReceipt{1, 1, incarnation, ordinal}));
+        EXPECT_TRUE(journal.mayEvict(incarnation));
+        // The other incarnation still occupies its slot.
+        journal.retire(static_cast<std::uint64_t>(1 - incarnation));
+    }
 }
