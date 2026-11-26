@@ -1280,7 +1280,7 @@ TEST(PooledStageConsumption, PooledSnapshotDecodeMatchesContiguousControl)
     // Own a real pooled table + pool under one PMA authority (device-free).
     const PhysicalPagePoolGeometry pool_geometry{4,
         static_cast<std::size_t>(page_tokens) * 2 * heads * dimension * sizeof(float), 2, 4};
-    const CPUFP32PagedKVTableGeometry table_geometry{1, 2, 4, page_tokens, 16, 4};
+    const CPUFP32PagedKVTableGeometry table_geometry{2, 2, 4, page_tokens, 16, 4};
     const auto bytes = PhysicalPagePool::physicalBytes(pool_geometry, device) +
         CPUFP32PagedKVTable::physicalBytes(table_geometry, device);
     PhysicalMemoryPlanBuilder plan;
@@ -1311,6 +1311,22 @@ TEST(PooledStageConsumption, PooledSnapshotDecodeMatchesContiguousControl)
     ASSERT_TRUE(write);
     write->copyFrom(std::as_bytes(std::span(payload)));
     update->append(CPUFP32KVPage(write->commit(), heads, dimension));
+    // Second page: the remaining tokens (2 rows).
+    payload.resize(static_cast<std::size_t>(tokens - page_tokens) * 2 * width);
+    for (size_t row = 0; row < static_cast<size_t>(tokens - page_tokens); ++row)
+    {
+        std::copy_n(k.data() + (page_tokens + row) * width, width,
+            payload.data() + row * 2 * width);
+        std::copy_n(v.data() + (page_tokens + row) * width, width,
+            payload.data() + row * 2 * width + width);
+    }
+    auto grant2 = pool->tryAdmit(1);
+    ASSERT_TRUE(grant2);
+    const auto frame2 = grant2->assignFrame();
+    auto write2 = grant2->prepareAppend(frame2, payload.size() * sizeof(float));
+    ASSERT_TRUE(write2);
+    write2->copyFrom(std::as_bytes(std::span(payload)));
+    update->append(CPUFP32KVPage(write2->commit(), heads, dimension));
     auto snapshot = update->commit();
     // CONTIGUOUS attention through the raw k/v buffers (the kernel's oracle).
     std::vector<float> q(width), expected(width, -99.0f);
