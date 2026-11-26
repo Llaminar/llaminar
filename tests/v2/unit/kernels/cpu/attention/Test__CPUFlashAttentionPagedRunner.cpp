@@ -10,6 +10,7 @@
  * permutation. No contiguous adapter or full-history gather exists here.
  */
 #include "v2/kernels/cpu/attention/CPUFlashAttentionKernelT.h"
+#include "v2/kernels/cpu/attention/PagedKVArchive.h"
 #include <gtest/gtest.h>
 #include <algorithm>
 #include <cstring>
@@ -196,4 +197,42 @@ TEST(CPUFlashAttentionPagedRunner, MixedLengthsAndLongOverEqualShareRemainByteEx
     ASSERT_TRUE(kernel.compute_paged_snapshot_fp32(q_long, long_snapshot, actual_long, 1, heads,
         true, -1, long_tokens - 1));
     EXPECT_EQ(std::memcmp(expected_long.data(), actual_long.data(), actual_long.size() * sizeof(float)), 0);
+}
+
+/** @test Truncate -> export -> re-attach import stays byte-exact vs contiguous. */
+TEST(CPUFlashAttentionPagedRunner, TruncateExportReattachStaysByteExact)
+{
+    constexpr int page_tokens = 16;
+    constexpr int heads = 1, dimension = 64;
+    constexpr int source_tokens = 80, visible = 33; // Truncated mid-page.
+    RunnerFixture fx(page_tokens, 8, dimension);
+    std::mt19937 random(31);
+    std::uniform_real_distribution<float> values(-0.7f, 0.7f);
+    const size_t width = static_cast<size_t>(heads * dimension);
+    std::vector<float> k(static_cast<size_t>(source_tokens) * width), v(k.size());
+    for (auto *bank : {&k, &v}) for (auto &value : *bank) value = values(random);
+    std::vector<float> q(static_cast<size_t>(width));
+    for (auto &value : q) value = values(random);
+    // Publish the full 80-token set, then truncate to the first 33 tokens.
+    auto snapshot = publishRunnerSet(fx, k, v, page_tokens, heads, dimension);
+    auto clipped = snapshot.view().prefix(static_cast<std::size_t>(visible));
+    EXPECT_EQ(clipped.rows(), visible);
+    // Export the truncated view to an archive, then import it into a fresh
+    // request on the SAME table through the production attach path.
+    auto archive = PagedKVArchive::fromView(clipped);
+    auto grant = fx.pool->tryAdmit(3);
+    ASSERT_TRUE(grant);
+    auto update = fx.table->tryBeginUpdate();
+    ASSERT_TRUE(update);
+    update->attachArchivedPrefix(archive, *grant, page_tokens);
+    auto reattached = update->commit();
+    fx.pool.reset();
+    fx.table.reset();
+    CPUFlashAttentionKernelT<ActivationPrecision::FP32> kernel;
+    std::vector<float> expected(q.size(), -99.0f), actual(q.size(), -88.0f);
+    ASSERT_TRUE(kernel.compute_decode(q.data(), k.data(), v.data(), expected.data(), 1,
+        visible, heads, heads, dimension, true, visible - 1));
+    ASSERT_TRUE(kernel.compute_paged_snapshot_fp32(q, reattached, actual, 1, heads,
+        true, -1, visible - 1));
+    EXPECT_EQ(std::memcmp(expected.data(), actual.data(), actual.size() * sizeof(float)), 0);
 }
