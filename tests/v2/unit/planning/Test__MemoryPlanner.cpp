@@ -2882,6 +2882,47 @@ TEST(Test__MemoryPlanner, RecurrentOnlyPipelinePrefixAdmission)
     }
 }
 
+/** @brief RAM-off disk staging (plan P3): zero RAM budget with tiered disk admits staging but no host tier. */
+TEST(Test__MemoryPlanner, TieredDiskWithoutRamAdmitsOnlyStaging)
+{
+    auto profile = createQwen36HybridMTPStateProfile();
+    for (const auto device : {DeviceId::cpu(), DeviceId::cuda(0), DeviceId::rocm(0)})
+    {
+        SCOPED_TRACE(device.toString());
+        DevicePlanConfig cfg;
+        cfg.world_rank = 0;
+        cfg.device = device;
+        cfg.device_compute_units = 60;
+        cfg.device_total_bytes = cfg.device_free_bytes = 64ULL << 30;
+        if (device.is_cpu()) cfg.cpu_execution = test::kSyntheticCPUExecutionGeometry;
+        cfg.max_seq_len = 64;
+        cfg.kv_precision = "fp16";
+        cfg.first_layer = 0;
+        cfg.last_layer = 1;
+        cfg.owns_embedding = true;
+        cfg.prefix_cache = PrefixCacheRuntimeConfig{};
+        cfg.prefix_cache.storage_mode = PrefixCacheStorageMode::Tiered;
+        cfg.prefix_cache.ram_budget_bytes = 0;     // RAM tier OFF.
+        cfg.prefix_cache.device_budget_bytes = 0;
+        cfg.prefix_cache.disk_budget_bytes = 8ULL << 30; // Disk tier ON.
+        cfg.prefix_cache.disk_dir = "/cache/ram-off";
+        if (device.is_gpu()) cfg.associated_host_memory = PhysicalMemoryResource{
+            .world_rank = 0, .device = DeviceId::cpu(),
+            .total_bytes = 64ULL << 30, .admission_available_bytes = 64ULL << 30};
+        const auto plan = MemoryPlanner::plan(profile, {cfg});
+        ASSERT_TRUE(plan.fits());
+        // No RAM tier anywhere: the host tier is zero for every owner.
+        for (const auto &bom : plan.physicalPlan().resources())
+            EXPECT_EQ(bom.bytes(PhysicalMemoryOwner::PrefixHostTier), 0u);
+        // The disk route still stages its durable I/O exactly once.
+        const auto host = std::find_if(plan.devices.begin(), plan.devices.end(),
+            [](const auto &candidate) { return candidate.device().is_cpu(); });
+        ASSERT_NE(host, plan.devices.end());
+        EXPECT_EQ(host->bom().bytes(PhysicalMemoryOwner::PrefixArchiveStaging),
+            PrefixArchiveIOGeometry::scratchBytes());
+    }
+}
+
 /**
  * @brief PP followers retain main rollback state, never another shifted predictor.
  *

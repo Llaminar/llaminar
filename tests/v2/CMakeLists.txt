@@ -30071,6 +30071,14 @@ add_v2_test(V2_Integration_GraphFamilyObservationScope
     LABELS "V2;Integration;ProductionTestPreflight;Memory;PhysicalMemoryAuthority;GraphCapture;DeviceFree;Regression"
     MPI_PROCS 1 NO_MODELS)
 
+# Plan P3: a tiered disk route with a zero RAM budget admits its durable I/O
+# staging but never invents a RAM host tier (RAM-off disk staging).
+add_v2_test(V2_Integration_PrefixTieredRamOffDiskStaging
+    COMMAND $<TARGET_FILE:v2_test_memory_planner>
+        --gtest_filter=Test__MemoryPlanner.TieredDiskWithoutRamAdmitsOnlyStaging
+    LABELS "V2;Integration;ProductionTestPreflight;Memory;PrefixCache;Tiers;Staging;DeviceFree;Regression"
+    MPI_PROCS 1 NO_MODELS)
+
 add_v2_test(V2_Integration_MoEProjectionTransportAccounting
     COMMAND $<TARGET_FILE:v2_test_memory_planner>
         --gtest_filter=Test__MemoryPlanner.CountedProjectionTransportHasOneCanonicalPhysicalBOM
