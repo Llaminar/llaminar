@@ -281,6 +281,16 @@ TEST(CPUFP32PagedKVTable, AcceptedWorkReservationIsConsumableAndUnshareable)
     second = CPUFP32PagedKVTable::IssuanceReservation();
     EXPECT_EQ(table->outstandingReserved(), 0u);
     EXPECT_EQ(table->headroomAvailable(), 3u);
+    // A reservation minted by a DIFFERENT table is foreign: it cannot consume
+    // this table's headroom even when capacity is available, and consumes the
+    // other table's budget only.
+    auto other_table = CPUFP32PagedKVTable::create(authority, device, table_geometry);
+    auto foreign = other_table->reserveAcceptedWork(1);
+    ASSERT_TRUE(foreign);
+    EXPECT_FALSE(table->tryBeginReserved(*foreign));
+    EXPECT_EQ(table->issuedVersions(), 1u);
+    EXPECT_EQ(other_table->issuedVersions(), 0u);
+    EXPECT_EQ(table->outstandingReserved(), 0u);
 }
 
 /** @test Headroom below budget is typed; equal/zero headroom is rejected before allocation. */

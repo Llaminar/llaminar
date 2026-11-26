@@ -211,6 +211,28 @@ public:
             outcome = update ? "ready" : "busy";
             if (update) updates_.emplace(name, std::move(*update));
         }
+        else if (kind == "table-reserve")
+        {
+            size_t capacity;
+            if (!(input >> name >> capacity) || !table_ || reservations_.contains(name)) fail();
+            auto reservation = table_->reserveAcceptedWork(capacity);
+            outcome = reservation ? "ready" : "refused";
+            if (reservation) reservations_.emplace(name, std::move(*reservation));
+        }
+        else if (kind == "table-begin-reserved")
+        {
+            std::string reservation_name;
+            if (!(input >> name >> reservation_name) || !reservations_.contains(reservation_name) ||
+                updates_.contains(name)) fail();
+            auto update = table_->tryBeginReserved(reservations_.at(reservation_name));
+            outcome = update ? "ready" : "busy";
+            if (update) updates_.emplace(name, std::move(*update));
+        }
+        else if (kind == "table-drop-reserved")
+        {
+            if (!(input >> name) || reservations_.erase(name) != 1) fail();
+            outcome = "released";
+        }
         else if (kind == "table-append")
         {
             std::string page; int heads, dimension;
@@ -390,7 +412,7 @@ public:
         {
             if (!requests_.empty() || !pins_.empty() || !plans_.empty() || !pages_.empty() || !reads_.empty() ||
                 !updates_.empty() || !snapshots_.empty() || !shareds_.empty() || !adopted_.empty() || !cowplans_.empty() ||
-                !combinations_.empty()) fail();
+                !combinations_.empty() || !reservations_.empty()) fail();
             outcome = "idle";
         }
         else fail();
@@ -411,6 +433,7 @@ private:
     std::map<std::string, PhysicalPagePool::ReadAccess> reads_;
     std::map<std::string, CPUFP32PagedKVTable::Update> updates_;
     std::map<std::string, CPUFP32PagedKVTable::Snapshot> snapshots_;
+    std::map<std::string, CPUFP32PagedKVTable::IssuanceReservation> reservations_;
     std::map<std::string, PhysicalPagePool::SharedPage> shareds_;
     std::map<std::string, PhysicalPagePool::SharedPage> adopted_;
     std::map<std::string, PhysicalPagePool::COWPlan> cowplans_;
@@ -687,6 +710,46 @@ TEST(PhysicalMemoryAuthority, PagePoolRecordedTableBanksReplayExactly)
     }
     std::istringstream input(llaminar2::test::privatePageTableTrace);
     EXPECT_NO_THROW(replay(input));
+}
+
+/** @test Recorded accepted-work reservation: minting, consumption and release during exhaustion. */
+TEST(PhysicalMemoryAuthority, PagePoolRecordedReservationReplayExactly)
+{
+    if (const char *record = std::getenv("LLAMINAR_RECORD_PRIVATE_RESERVATION_TRACE"))
+    {
+        std::ofstream output(record);
+        ASSERT_TRUE(output.good());
+        output << "pma-private-pages-v2 2 64 3 2 empty-zero-generations table 1 2 2 2 32 4 empty-zero-versions fp32-le\n";
+        // Budget 32, headroom 4: normal admission cap 28. Reserve 2 accepted
+        // work units, exhaust normal admission, consume reserved, release.
+        PrivatePageReplay runner({2, 64, 3, 2}, CPUFP32PagedKVTableGeometry{1, 2, 2, 2, 32, 4});
+        for (const std::string command : {"table-reserve A 2", "table-reserve B 3", "table-begin-reserved U A",
+            "table-abort U", "table-begin-reserved U2 A", "table-abort U2", "table-drop-reserved A", "end"})
+            output << command << " | " << runner.execute(command) << '\n';
+        output.close(); ASSERT_TRUE(output.good());
+        std::ifstream captured(record);
+        EXPECT_NO_THROW(replay(captured));
+        return;
+    }
+    std::istringstream input(llaminar2::test::privatePageReservationTrace);
+    EXPECT_NO_THROW(replay(input));
+}
+
+/** @test Reservation replay rejects oversized reservations and invented outcomes. */
+TEST(PhysicalMemoryAuthority, PagePoolReservationReplayRejectsAlteredObservations)
+{
+    for (const auto &[original, changed] : std::vector<std::pair<std::string, std::string>>{
+        {"table-reserve A 2 | ready", "table-reserve A 2 | refused"},
+        {"table-reserve B 3 | refused", "table-reserve B 3 | ready"},
+        {"end | idle\n", ""}})
+    {
+        std::string corrupt(llaminar2::test::privatePageReservationTrace);
+        const auto position = corrupt.find(original);
+        ASSERT_NE(position, std::string::npos);
+        corrupt.replace(position, original.size(), changed);
+        std::istringstream input(corrupt);
+        EXPECT_THROW(replay(input), std::exception);
+    }
 }
 
 /** @test Table replay rejects invented version/credit observations and absent initial/terminal state. */

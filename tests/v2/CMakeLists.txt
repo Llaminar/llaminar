@@ -30465,6 +30465,7 @@ file(READ "${PMA_TRACE_ROOT}/private_sharing_v1.txt" PMA_SHARING_TRACE)
 file(READ "${PMA_TRACE_ROOT}/private_witness_v1.txt" PMA_WITNESS_TRACE)
 file(READ "${PMA_TRACE_ROOT}/private_combined_v1.txt" PMA_COMBINED_TRACE)
 file(READ "${PMA_TRACE_ROOT}/private_prefix_v1.txt" PMA_PREFIX_TRACE)
+file(READ "${PMA_TRACE_ROOT}/private_reservation_v1.txt" PMA_RESERVATION_TRACE)
 configure_file("${PMA_TRACE_ROOT}/PhysicalPagePoolTraceData.h.in"
     "${CMAKE_CURRENT_BINARY_DIR}/PhysicalPagePoolTraceData.h" @ONLY)
 target_include_directories(v2_test_physical_memory_authority PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
