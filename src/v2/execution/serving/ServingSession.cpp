@@ -615,16 +615,16 @@ namespace llaminar2
         ServingContinuationManifest manifest;
         std::vector<int32_t> forced(row.forced.begin(), row.forced.end());
         row.sampler_state = row.sampler.exportState(); // Exact state for the manifest.
+        // The ORIGINAL request policy (prompt tokens and output budget) is part
+        // of the continuation AT MINT: restore must never invent a cap or lose
+        // prefill, and a sealed manifest exposes no post-capture mutation.
         if (!manifest.capture(row.request.id, row.slot, row.request.sampling,
+                row.request.prompt, row.request.max_new_tokens,
                 row.prompt_consumed, row.cached_tokens, row.completion_tokens,
                 row.last_token, row.needs_feed, row.has_logits, row.grant,
                 forced, row.cancelled, row.cached_prompt_tokens,
                 row.sampler_decisions, *kv, &row.sampler_state, &error))
             return std::nullopt;
-        // The ORIGINAL request policy (prompt tokens and output budget) is part
-        // of the continuation: restore must never invent a cap or lose prefill.
-        manifest.mutableContent().prompt = row.request.prompt;
-        manifest.mutableContent().max_new_tokens = row.request.max_new_tokens;
         // Retire the slot: reset the executor row and release the resident
         // record (the request keeps its original S record/response lease
         // semantics through the manifest; no new Q credit is consumed).
@@ -725,11 +725,14 @@ namespace llaminar2
             error = "Serving executor rejected the continuation KV import";
             return false; // No mutation: slot free, rows_ unchanged.
         }
-        // COMMIT: busy state and the row enter as one typed transaction.
+        // COMMIT: busy state and the row enter as one typed transaction; the
+        // single-use seal is consumed ONLY on success, so a retained object
+        // can never restore twice or after the original finished.
         slot_busy_[static_cast<std::size_t>(target)] = true;
         const std::uint64_t restored_id = row.request.id;
         const int restored_cached = row.cached_tokens;
         rows_.push_back(std::move(row));
+        manifest.consume();
         if (recorder_)
             recorder_->restored(restored_id, target, restored_cached);
         return true;

@@ -9,11 +9,34 @@
  * history, never accepting a continuation without KV backing.
  */
 #include "execution/serving/ServingContinuationManifest.h"
+#include <type_traits>
 #include <gtest/gtest.h>
 
 using namespace llaminar2;
-namespace
+using llaminar2::test::ServingContinuationManifestTestAccess;
+namespace llaminar2::test
 {
+/** @brief Unit-test access to the session-sealed capture (production path stays private). */
+struct ServingContinuationManifestTestAccess
+{
+    static bool capture(ServingContinuationManifest &m, std::uint64_t id, int slot,
+        const SamplingParams &law, std::vector<int32_t> prompt, int max_new_tokens,
+        std::size_t prompt_consumed, int cached_tokens, int completion_tokens,
+        int32_t last_token, bool needs_feed, bool has_logits, int grant,
+        const std::vector<int32_t> &forced, bool cancelled, int cached_prompt_tokens,
+        const std::vector<int32_t> &history = {},
+        const std::vector<std::byte> &kv = {},
+        const Sampler::State *state = nullptr, std::string *error = nullptr)
+    {
+        return m.capture(id, slot, law, std::move(prompt), max_new_tokens,
+            prompt_consumed, cached_tokens, completion_tokens, last_token, needs_feed,
+            has_logits, grant, forced, cancelled, cached_prompt_tokens, history, kv,
+            state, error);
+    }
+    static void consume(ServingContinuationManifest &m) { m.consume(); }
+};
+
+} // namespace llaminar2::test
 /** @brief Minimal nonempty executor KV payload for manifest capture. */
 std::vector<std::byte> kvPayload()
 {
@@ -37,7 +60,6 @@ SamplingParams seededLaw()
     law.seed = 42;
     return law;
 }
-}
 
 /** @test A complete RNG-bound continuation captures and validates. */
 TEST(ServingContinuationManifest, CompleteContinuationIsValid)
@@ -46,7 +68,8 @@ TEST(ServingContinuationManifest, CompleteContinuationIsValid)
     std::string error;
     SamplingParams law = seededLaw();
     const auto state = samplerState();
-    ASSERT_TRUE(manifest.capture(7, 2, law, 8, /*cached_tokens=*/12,
+    ASSERT_TRUE(ServingContinuationManifestTestAccess::capture(manifest, 7, 2, law, std::vector<int32_t>{1, 2, 3, 4, 5, 6, 7, 8}, 40,
+        8, /*cached_tokens=*/12,
         /*completion_tokens=*/3, /*last_token=*/9, /*needs_feed=*/true,
         /*has_logits=*/false, /*grant=*/5, std::vector<int32_t>{21, 22},
         /*cancelled=*/false, /*cached_prompt_tokens=*/6,
@@ -72,7 +95,8 @@ TEST(ServingContinuationManifest, GreedyContinuationNeedsNoRngHistory)
     greedy.temperature = 0.0f;
     greedy.seed = 1;
     const auto state = samplerState();
-    ASSERT_TRUE(manifest.capture(1, 0, greedy, 4, /*cached_tokens=*/10,
+    ASSERT_TRUE(ServingContinuationManifestTestAccess::capture(manifest, 1, 0, greedy,
+        std::vector<int32_t>{1, 2, 3, 4}, 20, 4, /*cached_tokens=*/10,
         /*completion_tokens=*/2, /*last_token=*/5, /*needs_feed=*/false,
         /*has_logits=*/true, /*grant=*/0, {}, /*cancelled=*/false,
         /*cached_prompt_tokens=*/0, {}, kvPayload(), &state, &error)) << error;
@@ -86,7 +110,7 @@ TEST(ServingContinuationManifest, RngHistoryMustMatchDecisions)
     std::string error;
     SamplingParams law = seededLaw();
     const auto state = samplerState();
-    ASSERT_TRUE(manifest.capture(2, 1, law, 0, /*cached_tokens=*/4,
+    ASSERT_TRUE(ServingContinuationManifestTestAccess::capture(manifest, 2, 1, law, std::vector<int32_t>{5, 6}, 20, 0, /*cached_tokens=*/4,
         /*completion_tokens=*/2, /*last_token=*/3, /*needs_feed=*/false,
         /*has_logits=*/true, /*grant=*/0, {}, /*cancelled=*/false,
         /*cached_prompt_tokens=*/0, {}, kvPayload(), &state, &error)) << error;
@@ -102,7 +126,7 @@ TEST(ServingContinuationManifest, ProgressWithoutKvBackingRefuses)
     std::string error;
     SamplingParams law = seededLaw();
     const auto state = samplerState();
-    EXPECT_FALSE(manifest.capture(3, 0, law, 0, /*cached_tokens=*/0,
+    EXPECT_FALSE(ServingContinuationManifestTestAccess::capture(manifest, 3, 0, law, std::vector<int32_t>{5, 6}, 20, 0, /*cached_tokens=*/0,
         /*completion_tokens=*/1, /*last_token=*/4, /*needs_feed=*/false,
         /*has_logits=*/false, /*grant=*/0, {}, /*cancelled=*/false,
 /*cached_prompt_tokens=*/0, {}, {}, nullptr, &error));
@@ -131,7 +155,7 @@ TEST(ServingContinuationManifest, RestoreProducesIdenticalNextDecision)
     for (int i = 0; i < 3; ++i) control.record_prompt_token(100 + i);
     // Manifest capturing the SAME history as decisions.
     ServingContinuationManifest manifest;
-    ASSERT_TRUE(manifest.capture(9, 1, law, 0, /*cached_tokens=*/4,
+    ASSERT_TRUE(ServingContinuationManifestTestAccess::capture(manifest, 9, 1, law, std::vector<int32_t>{5, 6}, 20, 0, /*cached_tokens=*/4,
         /*completion_tokens=*/3, /*last_token=*/103, /*needs_feed=*/false,
         /*has_logits=*/true, /*grant=*/0, {}, /*cancelled=*/false,
         /*cached_prompt_tokens=*/0,
@@ -175,7 +199,7 @@ TEST(ServingContinuationManifest, StochasticContinuationMatchesUninterruptedCont
     ServingContinuationManifest manifest;
     std::string error;
     auto state = control.exportState();
-    ASSERT_TRUE(manifest.capture(7, 2, law, 0, /*cached_tokens=*/8,
+    ASSERT_TRUE(ServingContinuationManifestTestAccess::capture(manifest, 7, 2, law, std::vector<int32_t>{5, 6}, 20, 0, /*cached_tokens=*/8,
         /*completion_tokens=*/4, /*last_token=*/control_decisions.back(),
         /*needs_feed=*/false, /*has_logits=*/true, /*grant=*/0,
         /*forced=*/{}, /*cancelled=*/false, /*cached_prompt_tokens=*/0,
@@ -198,9 +222,82 @@ TEST(ServingContinuationManifest, MissingKvPayloadRefuses)
     std::string error;
     SamplingParams law = seededLaw();
     const auto state = samplerState();
-    EXPECT_FALSE(manifest.capture(5, 0, law, 0, /*cached_tokens=*/4,
+    EXPECT_FALSE(ServingContinuationManifestTestAccess::capture(manifest, 5, 0, law, std::vector<int32_t>{5, 6}, 20, 0, /*cached_tokens=*/4,
         /*completion_tokens=*/1, /*last_token=*/3, /*needs_feed=*/false,
         /*has_logits=*/true, /*grant=*/0, {}, /*cancelled=*/false,
 /*cached_prompt_tokens=*/0, {}, {}, nullptr, &error));
     EXPECT_NE(error.find("KV"), std::string::npos) << error;
+}
+
+/** @test R15 B3: full invariant set — inconsistent progress/budget refuses. */
+TEST(ServingContinuationManifest, FullInvariantSetRefusesInconsistency)
+{
+    std::string error;
+    SamplingParams law = seededLaw();
+    const auto state = samplerState();
+    // Prompt progress beyond the original prompt.
+    {
+        ServingContinuationManifest m;
+        EXPECT_FALSE(ServingContinuationManifestTestAccess::capture(m, 1, 0, law,
+            std::vector<int32_t>{5, 6}, 20, 99, /*cached_tokens=*/99,
+            /*completion_tokens=*/0, /*last_token=*/0, false, false, 0,
+            {}, false, 0, {}, kvPayload(), &state, &error));
+        EXPECT_NE(error.find("bounds"), std::string::npos) << error;
+    }
+    // Output beyond the original budget.
+    {
+        ServingContinuationManifest m;
+        EXPECT_FALSE(ServingContinuationManifestTestAccess::capture(m, 1, 0, law,
+            std::vector<int32_t>{5, 6}, 20, 0, /*cached_tokens=*/4,
+            /*completion_tokens=*/21, /*last_token=*/3, false, false, 0,
+            {}, false, 0, {}, kvPayload(), &state, &error));
+        EXPECT_NE(error.find("bounds"), std::string::npos) << error;
+    }
+    // Empty prompt or nonpositive budget.
+    {
+        ServingContinuationManifest m;
+        EXPECT_FALSE(ServingContinuationManifestTestAccess::capture(m, 1, 0, law,
+            std::vector<int32_t>{}, 20, 0, /*cached_tokens=*/4,
+            /*completion_tokens=*/0, /*last_token=*/0, false, false, 0,
+            {}, false, 0, {}, kvPayload(), &state, &error));
+        EXPECT_NE(error.find("prompt"), std::string::npos) << error;
+    }
+}
+
+/** @test R15 B3: single-use seal — consumed manifests refuse valid()/restore. */
+TEST(ServingContinuationManifest, ConsumedManifestRefusesDoubleRestore)
+{
+    std::string error;
+    SamplingParams law = seededLaw();
+    const auto state = samplerState();
+    ServingContinuationManifest m;
+    ASSERT_TRUE(ServingContinuationManifestTestAccess::capture(m, 7, 0, law,
+        std::vector<int32_t>{5, 6}, 20, 0, /*cached_tokens=*/4,
+        /*completion_tokens=*/1, /*last_token=*/3, false, true, 0,
+        {}, false, 0, std::vector<int32_t>{3}, kvPayload(), &state, &error)) << error;
+    ASSERT_TRUE(m.valid(&error)) << error;
+    ServingContinuationManifestTestAccess::consume(m); // Session consumes on successful restore.
+    EXPECT_FALSE(m.valid(&error));
+    EXPECT_NE(error.find("single-use"), std::string::npos) << error;
+    EXPECT_FALSE(static_cast<bool>(m)); // No re-usable capability remains.
+}
+
+/** @test R15 B3: A retained manifest copy is impossible (move-only); no editing. */
+TEST(ServingContinuationManifest, ManifestIsMoveOnlyAndImmutableAfterCapture)
+{
+    static_assert(!std::is_copy_constructible_v<ServingContinuationManifest>,
+        "a retained copy would allow replay after completion");
+    static_assert(!std::is_copy_assignable_v<ServingContinuationManifest>,
+        "copy assignment would allow a forged continuation");
+    std::string error;
+    SamplingParams law = seededLaw();
+    const auto state = samplerState();
+    ServingContinuationManifest m;
+    ASSERT_TRUE(ServingContinuationManifestTestAccess::capture(m, 7, 0, law,
+        std::vector<int32_t>{5, 6}, 20, 0, /*cached_tokens=*/4,
+        /*completion_tokens=*/1, /*last_token=*/3, false, true, 0,
+        {}, false, 0, std::vector<int32_t>{3}, kvPayload(), &state, &error)) << error;
+    ServingContinuationManifest moved(std::move(m));
+    EXPECT_FALSE(static_cast<bool>(m)); // Moved-from: no capability.
+    ASSERT_TRUE(moved.valid(&error)) << error;
 }

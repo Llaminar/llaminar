@@ -1,23 +1,31 @@
 /**
  * @file ServingContinuationManifest.cpp
- * @brief Continuation manifest implementation.
+ * @brief Continuation manifest implementation (session-sealed, single-use).
  */
 #include "ServingContinuationManifest.h"
 
 namespace llaminar2
 {
 bool ServingContinuationManifest::capture(std::uint64_t request_id, int slot,
-    const SamplingParams &sampling, std::size_t prompt_consumed, int cached_tokens,
-    int completion_tokens, int32_t last_token, bool needs_feed, bool has_logits,
-    int grant, const std::vector<int32_t> &forced, bool cancelled,
-    int cached_prompt_tokens, const std::vector<int32_t> &sampler_history,
+    const SamplingParams &sampling, std::vector<int32_t> prompt, int max_new_tokens,
+    std::size_t prompt_consumed, int cached_tokens, int completion_tokens,
+    int32_t last_token, bool needs_feed, bool has_logits, int grant,
+    const std::vector<int32_t> &forced, bool cancelled, int cached_prompt_tokens,
+    const std::vector<int32_t> &sampler_history,
     const std::vector<std::byte> &kv_payload, const Sampler::State *sampler_state,
     std::string *error)
 {
-    if (request_id == 0 || slot < 0 || cached_tokens < 0 || completion_tokens < 0 ||
-        (cached_tokens == 0 && (prompt_consumed != 0 || last_token != 0)))
+    // Capture is the SOLE mint: full identity + the ORIGINAL policy are part
+    // of the continuation at mint time, never patched later.
+    if (request_id == 0 || slot < 0 || prompt.empty() || max_new_tokens <= 0)
     {
-        if (error) *error = "continuation manifest requires a live request identity and nonnegative state";
+        if (error) *error = "continuation manifest requires a live request identity, a nonempty prompt and a positive output budget";
+        return false;
+    }
+    if (cached_tokens < 0 || completion_tokens < 0 || completion_tokens > max_new_tokens ||
+        prompt_consumed > prompt.size() || cached_prompt_tokens > prompt.size())
+    {
+        if (error) *error = "continuation manifest progress violates the admitted prompt/budget bounds";
         return false;
     }
     if (completion_tokens > 0 && last_token == 0 && cached_tokens == 0)
@@ -35,6 +43,8 @@ bool ServingContinuationManifest::capture(std::uint64_t request_id, int slot,
     content_ = Content{};
     content_.request_id = request_id;
     content_.slot = slot;
+    content_.prompt = std::move(prompt);
+    content_.max_new_tokens = max_new_tokens;
     content_.sampling = sampling;
     content_.prompt_consumed = prompt_consumed;
     content_.cached_tokens = cached_tokens;
@@ -52,6 +62,7 @@ bool ServingContinuationManifest::capture(std::uint64_t request_id, int slot,
     if (sampler_state)
         content_.sampler_state = *sampler_state; // Exact RNG/penalty/DRY state.
     captured_ = true;
+    used_ = false;
     return true;
 }
 
@@ -68,15 +79,34 @@ Sampler ServingContinuationManifest::restoreSampler() const
 
 bool ServingContinuationManifest::valid(std::string *error) const noexcept
 {
-    if (!captured_)
+    if (!captured_ || moved_from_)
     {
-        if (error) *error = "continuation manifest has no captured content";
+        if (error) *error = "continuation manifest has no captured content (moved-from or empty)";
+        return false;
+    }
+    if (used_)
+    {
+        if (error) *error = "continuation manifest single-use seal is consumed; restore refused";
         return false;
     }
     if (content_.request_id == 0 || content_.slot < 0 ||
-        content_.cached_tokens < 0 || content_.completion_tokens < 0)
+        content_.cached_tokens < 0 || content_.completion_tokens < 0 ||
+        content_.max_new_tokens <= 0 || content_.prompt.empty())
     {
         if (error) *error = "continuation manifest fields violate their invariants";
+        return false;
+    }
+    // Full progress/budget consistency: prompt progress never exceeds the ORIGINAL
+    // prompt, the output never exceeds the ORIGINAL budget, and KV progress
+    // cannot be zero behind committed output (no fabricated continuation).
+    if (content_.prompt_consumed > content_.prompt.size() ||
+        content_.completion_tokens > content_.max_new_tokens ||
+        content_.cached_prompt_tokens > content_.prompt.size() ||
+        content_.cached_tokens + content_.completion_tokens >
+            static_cast<int>(content_.prompt.size() + content_.max_new_tokens) ||
+        (content_.completion_tokens > 0 && content_.cached_tokens == 0))
+    {
+        if (error) *error = "continuation manifest progress exceeds the original prompt/budget or lacks KV backing";
         return false;
     }
     // The sampler/RNG history is authoritative as captured: it is never
@@ -95,6 +125,13 @@ bool ServingContinuationManifest::valid(std::string *error) const noexcept
          content_.completion_tokens != 0))
     {
         if (error) *error = "continuation manifest has physical progress without KV backing";
+        return false;
+    }
+    // The exported KV payload is the ONLY continuation proof: without it the
+    // executor cannot restore the request's KV (no host-metadata fabrication).
+    if (content_.kv_payload.empty())
+    {
+        if (error) *error = "continuation manifest has no executor KV payload";
         return false;
     }
     return true;
