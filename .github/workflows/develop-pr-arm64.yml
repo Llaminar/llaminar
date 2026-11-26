@@ -94,6 +94,7 @@ jobs:
             2> "$RUNNER_TEMP/llaminar-arm64-evidence/canonical-export.rawjson"
           nonce=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["nonce"])' "$RUNNER_TEMP/llaminar-arm64-evidence/canonical-integration/status.json")
           echo "nonce=$nonce" >> "$GITHUB_OUTPUT"
+          python3 scripts/ci/native_build_cache_receipt.py "$RUNNER_TEMP/llaminar-arm64-evidence/canonical-export.rawjson" "$RUNNER_TEMP/llaminar-arm64-evidence/canonical-integration/status.json" > "$RUNNER_TEMP/llaminar-arm64-evidence/export-cache.json"
       - name: Build the sealed ARM64 test-runner
         shell: bash
         env:
@@ -109,7 +110,9 @@ jobs:
             --cache-from type=gha,scope=llaminar-build-neon-pr,version=2 \
             --cache-from type=registry,ref=${{ steps.toolchain.outputs.neon-registry-cache }} \
             --cache-to type=gha,scope=llaminar-build-neon-pr,mode=max,version=2,ignore-error=true . \
-            2> "$RUNNER_TEMP/llaminar-arm64-evidence/canonical-main.rawjson"
+            2> "$RUNNER_TEMP/llaminar-arm64-evidence/canonical-main.rawjson" || build_status=$?
+          python3 scripts/ci/native_build_cache_receipt.py "$RUNNER_TEMP/llaminar-arm64-evidence/canonical-main.rawjson" "$RUNNER_TEMP/llaminar-arm64-evidence/canonical-integration/status.json" > "$RUNNER_TEMP/llaminar-arm64-evidence/main-cache.json"
+          exit "${build_status:-0}"
       - name: Export the sibling Release runtime from the same builder
         shell: bash
         env:
