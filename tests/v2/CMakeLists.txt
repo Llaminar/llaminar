@@ -20897,8 +20897,10 @@ add_v2_test(V2_Perf_CPUNativeQuantised_ThreadScaling
 # launch over the production batch path. Registered with the other v2_perf_*
 # targets so Release perf-only builds produce it; widths ship after E2E.
 if(LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
+    # Core-free: the NEON tile headers' cold plan/walk reporters are compiled in directly.
     add_executable(v2_perf_cpu_native_neon_panel_tournament
-        performance/kernels/cpu/native_quantised/Perf__CPUNativeNEONPanelTournament.cpp)
+        performance/kernels/cpu/native_quantised/Perf__CPUNativeNEONPanelTournament.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../src/v2/kernels/cpu/gemm/CPUNativeOrderedPartitionPlan.cpp)
     target_compile_features(v2_perf_cpu_native_neon_panel_tournament PRIVATE cxx_std_20)
     target_include_directories(v2_perf_cpu_native_neon_panel_tournament PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/../../src/v2 ${CMAKE_CURRENT_SOURCE_DIR})
@@ -45154,13 +45156,16 @@ if(V2_BACKEND_OMITTED_TEST_COUNT GREATER 0)
     message(STATUS "V2 Tests: omitted ${V2_BACKEND_OMITTED_TEST_COUNT} registrations whose backend family is not compiled (HAVE_CUDA=${HAVE_CUDA} HAVE_ROCM=${HAVE_ROCM})")
 endif()
 
+# Header-only kernel admission plus its cold reporter translation unit; no core link.
 add_executable(v2_unit_native_superblock_walk_contract
-    unit/kernels/Test__NativeSuperblockWalkContract.cpp)
+    unit/kernels/Test__NativeSuperblockWalkContract.cpp
+    ${CMAKE_SOURCE_DIR}/kernels/cpu/gemm/CPUNativeOrderedPartitionPlan.cpp)
 target_include_directories(v2_unit_native_superblock_walk_contract PRIVATE ${CMAKE_SOURCE_DIR})
-target_link_libraries(v2_unit_native_superblock_walk_contract PRIVATE GTest::gtest_main)
+target_link_libraries(v2_unit_native_superblock_walk_contract PRIVATE GTest::gtest_main OpenMP::OpenMP_CXX)
 add_v2_test(V2_Unit_NativeSuperblockWalkContract
     COMMAND $<TARGET_FILE:v2_unit_native_superblock_walk_contract>
     LABELS "V2;Unit;CPU;DeviceFree;GEMM;Regression" NO_MPI NO_MODELS TIMEOUT 30)
 add_v2_test(V2_Integration_NativeSuperblockWalkContract
     COMMAND $<TARGET_FILE:v2_unit_native_superblock_walk_contract>
     LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;GEMM;Regression" NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NativeSuperblockWalkContract)

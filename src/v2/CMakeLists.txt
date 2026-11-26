@@ -1469,6 +1469,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     backends/NativeGraphDependencyReduction.cpp
     kernels/cpu/gemm/CPUProjectionWorkspaceContract.cpp
     kernels/cpu/gemm/CPUNativeX86PackedPrefill.cpp
+    kernels/cpu/gemm/CPUNativeOrderedPartitionPlan.cpp
     backends/InventoryPrinter.cpp
     backends/PCIeEnumeration.cpp
     backends/BackendManager.cpp

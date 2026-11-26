@@ -1,49 +1,112 @@
 # Native CPU superblock progress repair
 
-The host walk boundary requires `0 <= first <= last <= blocks <= INT_MAX`
-and phase in `[0,7]`. For any entered iteration, `block < last <= blocks`.
-The untruncated source-superblock end is strictly greater than block;
-clipping it to blocks and last therefore still advances. Size_t intermediate
-arithmetic is bounded by INT_MAX + 15. The resulting end fits int.
+## Walk progress
 
-Ordered partitions have one interval authority, `orderedPartitionInterval(begin,
-end, partition, width)` in `CPUNativeOrderedPartitionPlan.h`. It forms the start
-and end in int64 and saturates both at end, so excess partitions become explicit
-empty intervals instead of reversed ranges and nothing overflows. The three NEON
-prepared-projection sites (begin 0, end the weight row extent) and the two x86
-single-scale sites (the admitted tile's begin and end) all use it. Neither the
-partition count, the ordered fold nor any nonempty interval changes. The
-packed-prefill producers already clip starts: NEON `p * per_partition` at its
-row extent and x86 `kpart * width` in int64.
+A superblock walk over `[first, last)` advances whenever
+`0 <= first <= last <= blocks <= INT_MAX` and the phase is in `[0,7]`. Any
+iteration it enters has `block < last <= blocks`. The untruncated
+source-superblock end is strictly greater than `block`, so clipping it to
+`last` still advances. The size_t intermediate is bounded by INT_MAX + 15, and
+the clipped end fits in an int.
 
-`admitsOrderedPartitionPlan` accepts a whole plan only if the range is an
-admitted walk, there is at least one partition, the width is nonnegative and the
-partitions cover the range. Every interval the helper then forms lies inside the
-range, so it is an admitted walk by construction. NEON admits its canonical plan
-once per call in `requireExecutable`, the batch binding's admission before any
-team, using the same `blocksPerPartitionFor` width every tile executes; a
-rejected plan is a `std::invalid_argument` there, like the other admission
-failures of that function. The always-inlined per-partition x column hot
-programs (`forPartitionBlocks`) carry no check. x86 admits its plan in
-`requireSingleScaleTile` and its walk range at kernel entry, once per call. The
-packed-prefill walk boundaries remain authoritative for their caller-provided
-ranges.
+## Ordered partition arithmetic
 
-The plan header has no logging or stream dependency, because the NEON tile
-register/stack proof binds the probe's complete dependency closure and rejects
-the iostream initialization assembly that `utils/Assertions.h` brings in. The
-fatal wrappers `requireSuperblockWalk` and `requireOrderedPartitionPlan` live in
-`CPUNativeSuperblockWalkContract.h`, used by the x86 kernels and both
-packed-prefill walks. Their always-active unreachable assertion is noexcept at
-these boundaries, making invalid geometry fatal in Release as well as
-Integration; debug-only assertions would leave the original production hang
-possible. No check occurs per block or per partition.
+The hot programs keep their original int expressions unchanged:
 
-Focused tests call the production helpers directly over all phases, empty and
-ragged rows, INT_MAX, singleton, odd and 37-partition plans, overpartitioning and
-nonzero begin. They prove the intervals are ordered, contiguous, cover the range
-and equal the unsaturated form whenever nonempty. Fatal controls include the
-original stuck range first=8,last=9,blocks=8, plus negative, reversed, oversized
-and invalid phase inputs, and zero-partition, negative-width and non-covering
-plans. Full kernel, stack, numerical and backend qualification is not claimed by
-these device-free contract tests.
+    first = begin + p * width
+    last  = min(first + width, end)
+
+NEON uses `begin` = 0 and `end` = blocks_per_row. x86 single-scale uses the
+admitted tile range. For p < partitions, the widest intermediate is
+`begin + p * width + width <= begin + partitions * width`. Every expression is
+therefore representable in int exactly when
+`int64(begin) + int64(partitions) * width <= INT_MAX`.
+
+- **NEON bound.** With `begin` = 0, the bound is `partitions * width <= INT_MAX`.
+- **x86 bound.** The bound is `begin + partitions * width <= INT_MAX`, together
+  with `0 <= begin <= end <= blocks_per_row`.
+
+This is a typed API-representability constraint. It is not a capacity cap or a
+topology whitelist:
+
+- One partition of INT_MAX blocks is admitted.
+- INT_MAX blocks in two partitions are rejected: the width is 2^30, so the
+  product is 2^31. That plan genuinely exceeds the existing hot int arithmetic.
+
+The NEON view derives `blocks_per_row = ceil(K / 32) <= 2^26` and uses at most
+sixteen partitions. An admitted NEON publication therefore never reaches the
+rejection. The check guards the invariant; it does not limit real geometry.
+
+An excess partition has `first >= last`, an empty (possibly reversed) interval.
+Every walk, including the IQ4_XS hoisted-header path, loads only inside
+`block < last`. Such a partition therefore reads nothing and terminates at once.
+
+## One cold admission authority
+
+`CPUNativeOrderedPartitionPlan.h` owns the noexcept predicates
+`admitsSuperblockWalk`, `admitsOrderedPartitionArithmetic` and
+`admitsOrderedPartitionPlan`. It also owns the fatal admissions
+`requireSuperblockWalk` and `requireOrderedPartitionWidth`. The rejection
+reporters `failSuperblockWalk` and `failOrderedPartitionPlan` are declared
+`[[noreturn, gnu::cold, gnu::noinline]] noexcept` and are defined in
+`CPUNativeOrderedPartitionPlan.cpp`, which owns the logging.
+
+The header has no logging or stream dependency. The NEON tile register/stack
+proof binds the probe's complete dependency closure, and that closure rejects
+the iostream initialization assembly `utils/Assertions.h` brings in. A
+`.globl _ZSt21ios_base_library_initv` structural failure on the retained GNU 14
+NEON build demonstrated this. The reporters' always-active unreachable
+assertion throws under noexcept, so a rejection is fatal in Release as well as
+Integration.
+
+### Producers and entries
+
+The checks below run once per call or construction. None runs in a hot program.
+
+- **Canonical width producer.** `requireOrderedPartitionWidth` computes the
+  ceiling in int64, checks that it fits, and returns it for the existing int
+  field. Three sites use it:
+  - the NEON tile constructor (`blocks_per_partition_`);
+  - NEON `requireExecutable`, the batch binding's once-per-call admission
+    before any team;
+  - the NEON packed-prefill chunk producer (`per_partition`).
+
+  A NEON plan rejection is fatal because it is a broken invariant of a sealed
+  publication, not a recoverable request. The other `std::invalid_argument`
+  rejections of `requireExecutable` are unchanged.
+- **x86 single-scale.** `requireSingleScaleTile` keeps its recoverable rejection
+  and now uses the shared exact predicate `admitsOrderedPartitionArithmetic`.
+- **Entry walk admission.** `requireSuperblockWalk` runs at the entry of:
+  - the two x86 single-scale kernels;
+  - the NEON packed-prefill `pack`;
+  - the x86 packed-prefill walk.
+
+  The original stuck range first=8, last=9, blocks=8 can reach these entries
+  through their `begin`/`end` arguments.
+
+There is no check inside `forPartitionBlocks` or in any per-partition or
+per-column code.
+
+## Tests
+
+`V2_Unit_NativeSuperblockWalkContract` and the preflight
+`V2_Integration_NativeSuperblockWalkContract` are registered in the explicit
+preflight inventory. Both call the production predicates and producer directly.
+
+- **Admitted plans.** These cover singleton, odd, sixteen-, seventeen- and
+  37-partition plans, overpartitioning, empty rows, nonzero begin and all
+  phases.
+- **Exact boundary.** At the boundary, MAX passes and MAX + 1 fails, at begin 0
+  and at nonzero begin.
+- **Fatal controls.** These cover:
+  - the original stuck range first=8, last=9, blocks=8;
+  - the producer rejecting the two-partition INT_MAX plan, with its actual
+    product in the diagnostic;
+  - zero partitions and an invalid phase;
+  - on x86, the actual single-scale kernel entry called with the stuck range.
+
+Core-free NEON test and perf targets that include the tile headers compile the
+reporter translation unit directly.
+
+These device-free contract tests claim no kernel, stack, numerical or backend
+qualification.

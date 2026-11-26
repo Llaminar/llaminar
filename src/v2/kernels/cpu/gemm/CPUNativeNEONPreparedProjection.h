@@ -123,13 +123,14 @@ namespace llaminar2::cpu::native_quantised
          * @brief Reject a publication this tile family cannot execute, before any team exists.
          * @param weights Sealed publication; its metadata was admitted by the seal.
          * @throws std::invalid_argument For an unknown policy, an encoding/codebook
-         *         without a native implementation, a non-canonical expert K tree,
-         *         or a row extent whose ordered partition plan forms an unbounded walk.
+         *         without a native implementation, or a non-canonical expert K tree.
          * @details After this check every dispatch branch taken by execution is
-         * implemented, so the execution path itself cannot throw. It admits the
-         * whole ordered partition plan once per call, before any team, so the
-         * per-partition hot programs walk orderedPartitionInterval() ranges
-         * without any check of their own.
+         * implemented, so the execution path itself cannot throw. It also admits
+         * the canonical ordered partition plan once per call, before any team:
+         * a sealed row extent whose plan exceeds the tile programs' int
+         * partition arithmetic is a broken invariant and fatal
+         * (requireOrderedPartitionWidth()), not a recoverable request. The
+         * per-partition hot programs then check nothing.
          */
         static void requireExecutable(const CPUNativeQuantisedWeightView &weights)
         {
@@ -139,9 +140,8 @@ namespace llaminar2::cpu::native_quantised
             const int partitions = partitionsFor(weights);
             if (partitions <= 0)
                 throw std::invalid_argument("Native NEON expert projection requires the canonical aligned K tree");
-            if (!admitsOrderedPartitionPlan(0, weights.blocks_per_row, static_cast<std::size_t>(weights.blocks_per_row),
-                                            partitions, blocksPerPartitionFor(weights, partitions)))
-                throw std::invalid_argument("Native NEON projection requires a bounded ordered K partition plan");
+            static_cast<void>(requireOrderedPartitionWidth(0, weights.blocks_per_row,
+                                                           static_cast<std::size_t>(weights.blocks_per_row), partitions));
             bool implemented = false;
             switch (weights.encoding)
             {
@@ -287,18 +287,6 @@ namespace llaminar2::cpu::native_quantised
                 ? MoEProjectionNumericalContract::orderedKPartitionsForWidth(weights.K) : 1;
         }
 
-        /**
-         * @brief Blocks per partition of the canonical ordered tree.
-         * @param weights Sealed publication.
-         * @param partitions Positive partitionsFor() count.
-         * @return ceil(blocks_per_row / partitions); the plan requireExecutable() admits
-         *         and every tile executes.
-         */
-        static constexpr int blocksPerPartitionFor(const CPUNativeQuantisedWeightView &weights, int partitions) noexcept
-        {
-            return (weights.blocks_per_row + partitions - 1) / partitions;
-        }
-
         /** @brief Run one admitted tile with an explicit operation set; cannot fail. */
         template <typename Ops, int Strips = 0> void executeWithAdmitted() const noexcept
         {
@@ -332,12 +320,17 @@ namespace llaminar2::cpu::native_quantised
          * @param chunk Physical output chunk.
          * @param columns Live columns in this chunk.
          * @param partitions Canonical arithmetic partition count.
+         * @details The partition width is the int64 ceiling admitted by
+         * requireOrderedPartitionWidth() (cold, fatal if it cannot fit the hot
+         * int arithmetic), stored in the existing int field.
          */
         CPUNativeNEONProjectionTile(CPUNativeQuantisedWeightView weights,
             const std::array<std::span<const Q8_1Block>, Rows> &activation,
             const std::array<std::span<float>, Rows> &output, int chunk, int columns, int partitions)
             : weights_(weights), activation_(activation), output_(output), chunk_(chunk), columns_(columns),
-              partitions_(partitions), blocks_per_partition_(blocksPerPartitionFor(weights, partitions)) {}
+              partitions_(partitions),
+              blocks_per_partition_(requireOrderedPartitionWidth(0, weights.blocks_per_row,
+                  static_cast<std::size_t>(weights.blocks_per_row), partitions)) {}
 
         /** @brief Test byte-range overlap without forming overflowing end addresses.
          * @param a First byte root.
@@ -864,9 +857,6 @@ namespace llaminar2::cpu::native_quantised
          * @param visit Always-inlined consumer of (block, unit, base): widened header
          *        factors for compact coded sources, the superblock header address when
          *        hoistsSourceHeader(), or nullptr (the visitor addresses any header per block).
-         * @pre [first, last) is an orderedPartitionInterval() of the plan
-         *      requireExecutable() admitted once per call, or the whole row; it is
-         *      therefore an admitted superblock walk and this hot path checks nothing.
          */
         template <Encoding Physical, int Coded, typename Ops, typename Visit>
         [[gnu::always_inline]] void forPartitionBlocks(int first, int last, [[maybe_unused]] int column, Visit &&visit) const noexcept
@@ -1126,11 +1116,9 @@ namespace llaminar2::cpu::native_quantised
                 for (int partition = 0; partition < (ordered ? partitions_ : 1); ++partition)
                 {
                     float32x4_t partial[Rows][S]{};
-                    const auto interval = ordered
-                        ? orderedPartitionInterval(0, weights_.blocks_per_row, partition, blocks_per_partition_)
-                        : OrderedPartitionInterval{0, weights_.blocks_per_row};
-                    const int first = interval.first;
-                    const int last = interval.last;
+                    const int first = ordered ? partition * blocks_per_partition_ : 0;
+                    const int last = ordered ? std::min(first + blocks_per_partition_, weights_.blocks_per_row)
+                                             : weights_.blocks_per_row;
                     for (int block = first; block < last;)
                     {
                         const int end = std::min(last, (block / superblock_blocks + 1) * superblock_blocks);
@@ -1366,11 +1354,9 @@ namespace llaminar2::cpu::native_quantised
                     for (int partition = 0; partition < (ordered || Coded == 0 ? partitions_ : 1); ++partition)
                     {
                         float32x4_t accumulator[Rows]{};
-                        const auto interval = ordered || Coded == 0
-                            ? orderedPartitionInterval(0, weights_.blocks_per_row, partition, blocks_per_partition_)
-                            : OrderedPartitionInterval{0, weights_.blocks_per_row};
-                        const int first = interval.first;
-                        const int last = interval.last;
+                        const int first = ordered || Coded == 0 ? partition * blocks_per_partition_ : 0;
+                        const int last = ordered || Coded == 0 ? std::min(first + blocks_per_partition_, weights_.blocks_per_row)
+                            : weights_.blocks_per_row;
                         forPartitionBlocks<Physical, Coded, Ops>(first, last, column, [&](int block, const std::uint8_t *unit,
                             [[maybe_unused]] const auto &base) __attribute__((always_inline)) {
                             I low[Rows]{}, high[Rows]{};
@@ -1643,9 +1629,8 @@ namespace llaminar2::cpu::native_quantised
             for (int partition = 0; partition < partitions_; ++partition)
             {
                 float32x4_t accumulator[Rows][S]{};
-                const auto interval = orderedPartitionInterval(0, weights_.blocks_per_row, partition, blocks_per_partition_);
-                const int first = interval.first;
-                const int last = interval.last;
+                const int first = partition * blocks_per_partition_;
+                const int last = std::min(first + blocks_per_partition_, weights_.blocks_per_row);
                 forPartitionBlocks<Physical, 0, Ops>(first, last, column0, [&](int block, const std::uint8_t *unit,
                     [[maybe_unused]] const auto &base) __attribute__((always_inline)) {
                     I low[Rows][S]{}, high[Rows][S]{};

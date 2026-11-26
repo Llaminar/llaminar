@@ -38,7 +38,7 @@
 
 #if defined(__AVX2__)
 
-#include "CPUNativeSuperblockWalkContract.h"
+#include "CPUNativeOrderedPartitionPlan.h"
 #include <array>
 #include <bit>
 #include <cstdint>
@@ -327,6 +327,9 @@ namespace llaminar2::cpu::native_quantised::multi_scale::x86
         constexpr int center = Codebook == 11 ? 16 : 0;
         const auto geometry = preparedBlockGeometry(encoding, Layout::affine, Codebook,
                                                     static_cast<std::size_t>(packed.blocks_per_row));
+        // Once per call, cold: the walk range is admitted, so every superblock
+        // step below advances; requireSingleScaleTile() admitted the ordered
+        // plan's int arithmetic.
         requireSuperblockWalk(begin, end, geometry.blocks_per_row, geometry.phase);
         const std::uint8_t *const row_base = packed.interleavedBase() + geometry.blockOffset(chunk, 0);
         for (int pass = 0; pass < 64; pass += Lanes * strips)
@@ -345,11 +348,8 @@ namespace llaminar2::cpu::native_quantised::multi_scale::x86
                     for (int strip = 0; strip < strips; ++strip)
                         acc[row][strip] = Tree == Reduction::Contiguous && accumulate
                             ? load<F>(output[row] + pass + strip * Lanes) : F{};
-                const auto interval = Tree == Reduction::OrderedPartitions
-                    ? orderedPartitionInterval(begin, end, partition, blocks_per_partition)
-                    : OrderedPartitionInterval{begin, end};
-                const int first = interval.first;
-                const int last = interval.last;
+                const int first = Tree == Reduction::OrderedPartitions ? begin + partition * blocks_per_partition : begin;
+                const int last = Tree == Reduction::OrderedPartitions ? std::min(first + blocks_per_partition, end) : end;
                 for (int kb = first; kb < last;)
                 {
                     // One superblock (or its ragged/partial intersection) at a time:
@@ -485,6 +485,9 @@ namespace llaminar2::cpu::native_quantised::multi_scale::x86
         const int center = Codebook == 4 ? lut_bias : 0;
         const auto geometry = preparedBlockGeometry(encoding, Layout::affine, Codebook,
                                                     static_cast<std::size_t>(packed.blocks_per_row));
+        // Once per call, cold: the walk range is admitted, so every superblock
+        // step below advances; requireSingleScaleTile() admitted the ordered
+        // plan's int arithmetic.
         requireSuperblockWalk(begin, end, geometry.blocks_per_row, geometry.phase);
         const std::uint8_t *const row_base = packed.interleavedBase() + geometry.blockOffset(chunk, 0);
         for (int pass = 0; pass < 64; pass += 16 * strips)
@@ -503,11 +506,8 @@ namespace llaminar2::cpu::native_quantised::multi_scale::x86
                     for (int strip = 0; strip < strips; ++strip)
                         acc[row][strip] = Tree == Reduction::Contiguous && accumulate
                             ? load<F>(output[row] + pass + strip * 16) : F{};
-                const auto interval = Tree == Reduction::OrderedPartitions
-                    ? orderedPartitionInterval(begin, end, partition, blocks_per_partition)
-                    : OrderedPartitionInterval{begin, end};
-                const int first = interval.first;
-                const int last = interval.last;
+                const int first = Tree == Reduction::OrderedPartitions ? begin + partition * blocks_per_partition : begin;
+                const int last = Tree == Reduction::OrderedPartitions ? std::min(first + blocks_per_partition, end) : end;
                 for (int kb = first; kb < last;)
                 {
                     const int superblock_end = std::min(last, static_cast<int>(geometry.superblockEnd(kb)));
@@ -609,9 +609,10 @@ namespace llaminar2::cpu::native_quantised::multi_scale::x86
         if (chunk < 0 || chunk >= packed.N_padded / 64 || (end > begin && (begin < 0 || end > packed.blocks_per_row)))
             throw std::invalid_argument("Multi-scale CPU tile is outside its admitted geometry");
         if constexpr (Tree == Reduction::OrderedPartitions)
-            if (partitions <= 0 || blocks_per_partition <= 0 ||
-                static_cast<std::int64_t>(partitions) * blocks_per_partition < end - begin ||
-                static_cast<std::int64_t>(begin) + static_cast<std::int64_t>(partitions) * blocks_per_partition > INT32_MAX)
+            // The shared authority's exact int arithmetic bound (begin + partitions
+            // * width <= INT_MAX), keeping this API's recoverable rejection.
+            if (blocks_per_partition <= 0 ||
+                !admitsOrderedPartitionArithmetic(begin, end, partitions, blocks_per_partition))
                 throw std::invalid_argument("Multi-scale CPU tile requires an exact bounded ordered K tree");
     }
 

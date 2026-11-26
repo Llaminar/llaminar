@@ -20,7 +20,7 @@
  */
 #pragma once
 
-#include "CPUNativeSuperblockWalkContract.h"
+#include "CPUNativeOrderedPartitionPlan.h"
 #include "CPUNativeNEONPanelWorkspace.h"
 #include "CPUNativeNEONProjectionBatch.h"
 
@@ -544,7 +544,9 @@ namespace llaminar2::cpu::native_quantised
             const int stride = batch_.stride_;
             const int pairs = batch_.grid_.tiles(2);
             const int partitions = Tile::partitionsFor(w);
-            const int per_partition = (w.blocks_per_row + partitions - 1) / partitions;
+            // The tile constructor's admitted width: the same int64 ceiling and fit check.
+            const int per_partition = requireOrderedPartitionWidth(0, w.blocks_per_row,
+                static_cast<std::size_t>(w.blocks_per_row), partitions);
             auto *carry = neon_panel::needsCarry(w.K, P) ? panel + neon_panel::panel_floats : nullptr;
             for (int c = 0; c < std::min(64, w.N - 64 * chunk); c += 4)
             {

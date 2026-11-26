@@ -20,7 +20,7 @@
  * calling worker's slot (projectPooledChunk).
  */
 #if defined(__AVX2__)
-#include "CPUNativeSuperblockWalkContract.h"
+#include "CPUNativeOrderedPartitionPlan.h"
 #include "CPUNativeX86PackedPrefill.h"
 
 #include <algorithm>

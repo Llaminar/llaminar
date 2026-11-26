@@ -1282,9 +1282,11 @@ if(LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
             --gtest_filter=*Q8OutputScaleOverflowIsFatalBeforeBlockPublication
         LABELS V2 Integration ProductionTestPreflight CPU NEON DeviceFree RoPE Quantization Regression)
 
+    # Core-free NEON kernel tests compile the cold plan/walk reporters of the tile headers directly.
     add_executable(v2_test_native_neon_execution
         "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/cpu/Test__CPUNativeNEONExecution.cpp"
-        "${V2_CPU_ARCHITECTURE_ROOT}/src/v2/kernels/cpu/primitives/SwiGLUPrimitives.cpp")
+        "${V2_CPU_ARCHITECTURE_ROOT}/src/v2/kernels/cpu/primitives/SwiGLUPrimitives.cpp"
+        "${V2_CPU_ARCHITECTURE_ROOT}/src/v2/kernels/cpu/gemm/CPUNativeOrderedPartitionPlan.cpp")
     target_compile_features(v2_test_native_neon_execution PRIVATE cxx_std_20)
     target_include_directories(v2_test_native_neon_execution PRIVATE
         "${V2_CPU_ARCHITECTURE_ROOT}/src/v2" "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2")
@@ -1314,7 +1316,8 @@ if(LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
         LABELS V2 Integration ProductionTestPreflight CPU NEON DeviceFree NativeQuantised SwiGLU ByteExact AllFormats)
 
     add_executable(v2_test_native_neon_projection_batch
-        "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/cpu/Test__CPUNativeNEONProjectionBatch.cpp")
+        "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/cpu/Test__CPUNativeNEONProjectionBatch.cpp"
+        "${V2_CPU_ARCHITECTURE_ROOT}/src/v2/kernels/cpu/gemm/CPUNativeOrderedPartitionPlan.cpp")
     target_compile_features(v2_test_native_neon_projection_batch PRIVATE cxx_std_20)
     target_include_directories(v2_test_native_neon_projection_batch PRIVATE
         "${V2_CPU_ARCHITECTURE_ROOT}/src/v2" "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2")
