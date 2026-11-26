@@ -627,10 +627,25 @@ namespace llaminar2
             return std::nullopt;
         // Retire the slot: reset the executor row and release the resident
         // record (the request keeps its original S record/response lease
-        // semantics through the manifest; no new Q credit is consumed).
+        // semantics through the manifest; no new Q credit is consumed). A
+        // failed reset leaves the executor slot in an AMBIGUOUS state (export
+        // already happened, KV may be partially retained): a recoverable
+        // error would resume with wrong state, so SEAL the session (R15
+        // custody): no further admission, the row is failed and retired.
         if (!executor_.resetServingRow(row.slot))
         {
-            error = "Serving slot reset failed during suspension";
+            const std::string reset_error =
+                "Serving slot reset failed during suspension; session sealed";
+            std::vector<ServingBatchEvent> events;
+            ServingBatchEvent event;
+            event.id = row.request.id;
+            event.finish = ServingFinishReason::Error;
+            event.error = reset_error;
+            event.prompt_tokens = static_cast<int>(row.request.prompt.size());
+            event.completion_tokens = row.completion_tokens;
+            events.push_back(std::move(event));
+            error = reset_error; // The caller sees the sealing diagnostic.
+            (void)sealAll(reset_error, std::move(events));
             return std::nullopt;
         }
         slot_busy_[static_cast<std::size_t>(row.slot)] = false;

@@ -333,9 +333,24 @@ namespace llaminar2::test
                 return true;
             }
             std::string servingRowError() const override { return fail_forward ? "scripted forward failure" : ""; }
+            // Typed executor continuation: harness KV export/import so suspension
+            // passes its export gate and the reset-failure path is reachable.
+            std::optional<std::vector<std::byte>> exportSlotKV(int slot) const override
+            {
+                auto it = slot_kv_.find(slot);
+                if (it == slot_kv_.end()) return std::nullopt;
+                return it->second;
+            }
+            bool importSlotKV(int slot, std::span<const std::byte> bytes) override
+            {
+                slot_kv_[slot] = {bytes.begin(), bytes.end()};
+                return true;
+            }
+            void setSlotKV(int slot, std::vector<std::byte> bytes) { slot_kv_[slot] = std::move(bytes); }
 
         private:
             std::vector<float> logits_;
+            std::map<int, std::vector<std::byte>> slot_kv_;
         };
 
         ServingBatchRequest greedy(std::uint64_t id, int max_new)
@@ -400,6 +415,32 @@ namespace llaminar2::test
         EXPECT_EQ(finished[2], ServingFinishReason::Error) << "co-resident requests fail with the seal";
         EXPECT_NE(session.failure().find("could not be reset"), std::string::npos) << session.failure();
         EXPECT_EQ(session.submit(greedy(3, 1), error), ServingSubmissionOutcome::Refused) << "nothing is admitted onto stale slot state";
+    }
+
+    TEST(ServingSessionLifecycle, ResetFailureDuringSuspensionSealsTheSession)
+    {
+        // Suspension exported+captured the KV, then the executor reset FAILED:
+        // the slot is ambiguous (export may be partially retained). A
+        // recoverable error would resume wrong state, so the session must SEAL
+        // (R15 custody nit): the resident row is failed, nothing is admitted
+        // onto stale slot state, and the manifest is not returned as usable.
+        ScriptedRows rows;
+        ServingSession session(rows, 64, ScriptedRows::kVocab);
+        std::string error;
+        ASSERT_TRUE(session.begin(1, 1, error)) << error;
+        rows.setSlotKV(0, {std::byte{1}, std::byte{2}, std::byte{3}});
+        ASSERT_TRUE(session.submit(greedy(1, 30), error) != ServingSubmissionOutcome::Refused);
+        // One step admits the row and settles its first decision
+        // (has_logits == false after decide).
+        session.step();
+        // NOW fail the reset: suspend exports+captures, then reset fails: SEAL.
+        rows.fail_reset = true;
+        auto manifest = session.suspend(1, error);
+        EXPECT_FALSE(manifest.has_value());
+        EXPECT_NE(error.find("sealed"), std::string::npos) << "error=" << error;
+        EXPECT_NE(session.failure().find("reset"), std::string::npos) << session.failure();
+        EXPECT_EQ(session.occupancy().resident, 0);
+        EXPECT_EQ(session.submit(greedy(2, 1), error), ServingSubmissionOutcome::Refused);
     }
 
     TEST(ServingSessionLifecycle, FinishedPeersKeepTheirOutcomeWhenAResetFails)
