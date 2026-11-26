@@ -16115,6 +16115,12 @@ add_v2_test(V2_Integration_DiskExtentQuota
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;PrefixCache;Storage;Quota;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_DiskExtentQuota)
+add_v2_test(V2_Integration_PagedKVTierConfig
+    COMMAND $<TARGET_FILE:v2_test_paged_kv_tier_config>
+        --gtest_filter=PagedKVTierConfig.*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;PagedKV;Tiers;Config;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PagedKVTierConfig)
 add_v2_test(V2_Integration_PrefixCommittedIdentityPreservation
     COMMAND $<TARGET_FILE:v2_test_disk_prefix_storage_backend>
         --gtest_filter=Test__DiskPrefixStorageBackend.CommittedIdentityCorruptionPreservesArchive:Test__DiskPrefixStorageBackend.CommittedMetadataCorruptionPreservesArchive
@@ -45265,6 +45271,13 @@ target_link_libraries(v2_test_serving_capacity_intent llaminar2_core GTest::gtes
 add_v2_test(V2_Unit_ServingCapacityIntent
     COMMAND $<TARGET_FILE:v2_test_serving_capacity_intent>
     LABELS "V2;Unit;Serving;ContinuousBatching;Config;Knobs;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+
+add_executable(v2_test_paged_kv_tier_config unit/execution/config/Test__PagedKVTierConfig.cpp)
+target_link_libraries(v2_test_paged_kv_tier_config llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_PagedKVTierConfig
+    COMMAND $<TARGET_FILE:v2_test_paged_kv_tier_config>
+    LABELS "V2;Unit;Serving;ContinuousBatching;PagedKV;Tiers;Config;Regression"
     MPI_PROCS 1 NO_MODELS TIMEOUT 30)
 
 add_executable(v2_test_serving_http_pool_contract unit/execution/config/Test__ServingHttpPoolContract.cpp)

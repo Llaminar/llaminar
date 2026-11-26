@@ -1189,6 +1189,7 @@ namespace llaminar2
             config.moe_routed_prefill,
             config.moe_rebalance,
             config.prefix_cache,
+            config.paged_kv_tiers,
             config.mtp,
             config.tp_allreduce_precision_override,
             config.ngram_table_policy);
@@ -1469,6 +1470,7 @@ namespace llaminar2
             config.moe_routed_prefill,
             config.moe_rebalance,
             config.prefix_cache,
+            config.paged_kv_tiers,
             config.mtp,
             config.tp_allreduce_precision_override,
             config.ngram_table_policy);

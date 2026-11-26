@@ -564,6 +564,7 @@ namespace llaminar2
         // =========================================================================
 
         PrefixCacheRuntimeConfig prefix_cache; ///< Enabled bounded tiered prefix-state cache settings
+        PagedKVTierConfig paged_kv_tiers; ///< Typed pooled paged-KV tier intents (design §4.3).
         ImmutableRowTablePolicy ngram_table_policy; ///< Requested native PLE storage preference and bounded mmap windows; resolved only by final PMA admission.
         /**
          * @brief GGUF-selected dynamic MTP with an explicit serial opt-out.

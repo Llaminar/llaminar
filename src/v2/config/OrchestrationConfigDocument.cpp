@@ -63,6 +63,8 @@ namespace
     ENUM(MoEHotExpertCacheConfig::Kind, VALUE(Percent), VALUE(Count), VALUE(Off))
     ENUM(MoERebalanceRuntimeMode, VALUE(Off), VALUE(Observe), VALUE(Dynamic))
     ENUM(PrefixCacheStorageMode, VALUE(Disabled), VALUE(Ram), VALUE(Device), VALUE(Tiered))
+    ENUM(PagedKVPoolBudgetMode, VALUE(Auto), VALUE(Cap))
+    ENUM(PagedKVHostTierMode, VALUE(Off), VALUE(Auto), VALUE(Cap))
     ENUM(AdaptiveGPUCachePlacementMode, VALUE(ConsumerLocal), VALUE(DeclaredRankLocal))
     ENUM(ImmutableRowTableDistribution, VALUE(Replicated), VALUE(FixedHeadSharded))
     ENUM(AdaptiveImmutableRowBacking, VALUE(SSD), VALUE(RAM))
@@ -143,6 +145,10 @@ namespace
 #define MEMBERS(X) X(storage_mode) X(block_size) X(ram_budget_bytes) X(device_budget_bytes) \
     X(disk_budget_bytes) X(disk_dir) X(terminal_state) X(moe_policy)
     RECORD(PrefixCacheRuntimeConfig, enabled, MEMBERS)
+#undef MEMBERS
+#define MEMBERS(X) X(pool_cap_bytes) X(host_tier_mode) X(host_cap_bytes) \
+    X(disk_enabled) X(disk_cap_bytes) X(disk_dir)
+    RECORD(PagedKVTierConfig, pool_budget_mode, MEMBERS)
 #undef MEMBERS
 #define MEMBERS(X) X(protected_numerator) X(protected_denominator)
     RECORD(CpuImmutableRowCachePolicy, aging_accesses, MEMBERS)
@@ -242,7 +248,7 @@ namespace
     X(max_cpu_memory_mb) X(moe_shared_experts_gpu) X(moe_sparse_experts_cpu) X(routed_expert_compute_policy) \
     X(routed_expert_owner_order) X(moe_hot_expert_cache) X(moe_routed_prefill) X(moe_rebalance) \
     X(moe_routed_expert_plan) X(activation_precision) X(kv_cache_precision) X(tp_allreduce_precision_override) \
-    X(prefix_cache) X(ngram_table_policy) X(mtp_activation_policy) X(mtp) X(shard_weights) X(disable_weight_sharding) X(heterogeneous_mode) \
+    X(prefix_cache) X(paged_kv_tiers) X(ngram_table_policy) X(mtp_activation_policy) X(mtp) X(shard_weights) X(disable_weight_sharding) X(heterogeneous_mode) \
     X(cpu_compute_fraction) X(disable_gpu_tp) X(disable_cpu_tp) X(min_layers_per_domain)
     RECORD(OrchestrationConfig, planning_mode, MEMBERS)
 #undef MEMBERS
