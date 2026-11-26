@@ -402,6 +402,20 @@ CPUFP32PagedKVView CPUFP32PagedKVTable::Snapshot::view() const
     const auto &state = table_->require(bank_, version_, Phase::Published);
     return CPUFP32PagedKVView({table_->pages_ + bank_ * table_->geometry_.page_capacity, state.pages}, table_->geometry_.page_tokens);
 }
+std::optional<CPUFP32PagedKVTable::Snapshot> CPUFP32PagedKVTable::tryBorrowForStage(int slot)
+{
+    if (slot < 0 || static_cast<std::size_t>(slot) >= banks_.size())
+        return std::nullopt;
+    auto &state = banks_[slot];
+    if (state.phase != Phase::Published || !state.pages)
+        return std::nullopt;
+    if (!state.accepting_readers || state.readers == geometry_.readers_per_bank)
+        return std::nullopt;
+    auto self = shared_from_this();
+    ++state.readers;
+    return Snapshot(std::move(self), static_cast<size_t>(slot), state.version);
+}
+
 std::optional<CPUFP32PagedKVTable::Snapshot> CPUFP32PagedKVTable::Snapshot::tryBorrow() const
 {
     if (!table_) throw std::logic_error("CPU page-table borrow uses an empty snapshot");

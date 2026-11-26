@@ -118,8 +118,8 @@ namespace llaminar2
              * the pages) and the effective-use lease is acknowledged by the
              * caller after the forward.
              */
-            const CPUFP32PagedKVTable *pooled_table = nullptr;
-            const CPUFP32PagedKVTable *pooled_snapshot_owner = nullptr;
+            CPUFP32PagedKVTable *pooled_table = nullptr;   ///< Owning pooled table (borrows execute-time).
+            CPUFP32PagedKVTable *pooled_snapshot_owner = nullptr;
             int pooled_snapshot_slot = -1; ///< Row index to borrow at execute.
 
             /**

@@ -1848,6 +1848,30 @@ namespace llaminar2
                 window_size, position_offset, head_start, gqa_n_rep, policy);
         }
 
+        bool compute_pooled_snapshot_decoder(
+            const ITensor *Q, const CPUFP32PagedKVTable::Snapshot &snapshot,
+            ITensor *output, int n_heads, int n_kv_heads, int head_dim,
+            bool causal, int window_size, int position_offset, int head_start,
+            int gqa_n_rep, const attention::AttentionExecutionPolicy &policy) override
+        {
+            // P2 stage entry: the FP32 pooled snapshot path is the production
+            // CPU pooled compute. Q/output are expected FP32 CPU tensors (the
+            // pooled table is FP32); any other precision refuses (never a
+            // silent ring substitution or a precision reinterpretation).
+            const auto *q = dynamic_cast<const FP32Tensor *>(Q);
+            auto *out = dynamic_cast<FP32Tensor *>(output);
+            if (!q || !out || !n_heads || !n_kv_heads || !head_dim)
+                return false;
+            const std::size_t rows = q->rows();
+            if (rows == 0 || out->rows() < rows)
+                return false;
+            std::span<const float> query(q->fp32_data(), rows * q->cols());
+            std::span<float> result(out->mutable_data(), rows * out->cols());
+            return compute_paged_snapshot_fp32(query, snapshot, result,
+                static_cast<int>(rows), n_heads, causal, window_size,
+                position_offset, head_start, gqa_n_rep, policy);
+        }
+
         // Allow parity tests to call private static helpers directly
         friend class ::AVX2Q16DotParityTest;
 

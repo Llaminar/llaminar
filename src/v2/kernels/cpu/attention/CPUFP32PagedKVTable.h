@@ -190,6 +190,15 @@ public:
     {
         return next_version_ >= geometry_.issuance_budget;
     }
+    /**
+     * @brief Borow the published snapshot of one request slot (P2 stage pool).
+     * @param slot Request slot index mapped to a bank (0..bank_count-1).
+     * @return A borrowed snapshot, or empty when the slot has no published
+     * bank or the reader envelope is exhausted (the stage then fails; it never
+     * silently substitutes the ring cache).
+     */
+    std::optional<Snapshot> tryBorrowForStage(int slot);
+
     /** @brief Freeze new borrows of an exact published version before joining its existing readers. */
     void closeBorrowers(const Snapshot &snapshot);
     /** @return Original PMA instance identity for same-authority admission checks. */

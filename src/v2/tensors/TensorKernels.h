@@ -15,6 +15,7 @@
 #pragma once
 #include "kernels/FloatingActivationOperandPrecision.h"
 #include "kernels/common/Q8ResidualCorrection.h"
+#include "kernels/cpu/attention/CPUFP32PagedKVTable.h"
 #include "kernels/common/OriginalOutputSlice.h"
 #include "kernels/common/GatedRMSNormProjection.h"
 #include "kernels/CPUSharedGDNSnapshots.h"
@@ -2177,6 +2178,38 @@ namespace llaminar2
             (void)gqa_n_rep;
             (void)kv_logical_view;
             (void)execution_policy;
+            return false;
+        }
+
+        /**
+         * @brief Compute one CPU decode row through a POOLED paged snapshot (P2).
+         *
+         * The pooled snapshot is the table's immutable publication for one
+         * request; this entry computes attention against the snapshot pages
+         * directly (no contiguous adapter, no full-history gather). Default
+         * fails closed: a backend without the pooled entry refuses rather than
+         * silently substituting another path (plan P2 exit).
+         * @return True on success; false on unsupported backend (never a
+         * silent ring-cache substitution).
+         */
+        virtual bool compute_pooled_snapshot_decoder(
+            const ITensor *Q, const CPUFP32PagedKVTable::Snapshot &snapshot,
+            ITensor *output, int n_heads, int n_kv_heads, int head_dim,
+            bool causal, int window_size, int position_offset, int head_start,
+            int gqa_n_rep, const attention::AttentionExecutionPolicy &policy)
+        {
+            (void)Q;
+            (void)snapshot;
+            (void)output;
+            (void)n_heads;
+            (void)n_kv_heads;
+            (void)head_dim;
+            (void)causal;
+            (void)window_size;
+            (void)position_offset;
+            (void)head_start;
+            (void)gqa_n_rep;
+            (void)policy;
             return false;
         }
 

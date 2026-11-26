@@ -22,6 +22,10 @@
 #include "execution/compute_stages/ComputeStages.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "v2/tensors/Tensors.h"
+#include "kernels/cpu/attention/CPUFlashAttentionKernelT.h"
+#include "kernels/cpu/attention/CPUFP32PagedKVTable.h"
+#include "planning/PhysicalMemoryAuthority.h"
+#include "planning/PhysicalPagePool.h"
 #include "v2/tensors/TensorFactory.h"
 #include "v2/utils/DebugEnv.h"
 #include "v2/utils/MPIContext.h"
@@ -1266,3 +1270,82 @@ namespace
 #endif
 
 } // namespace
+
+/** @test P2: stage-level pooled consumption matches the contiguous control bytes. */
+TEST(PooledStageConsumption, PooledSnapshotDecodeMatchesContiguousControl)
+{
+    constexpr int heads = 2, kv_heads = 2, dimension = 8, page_tokens = 4;
+    constexpr int tokens = 6; // Two pages (4 + 2).
+    const auto device = DeviceId::cpu();
+    // Own a real pooled table + pool under one PMA authority (device-free).
+    const PhysicalPagePoolGeometry pool_geometry{4,
+        static_cast<std::size_t>(page_tokens) * 2 * heads * dimension * sizeof(float), 2, 4};
+    const CPUFP32PagedKVTableGeometry table_geometry{1, 2, 4, page_tokens, 16, 4};
+    const auto bytes = PhysicalPagePool::physicalBytes(pool_geometry, device) +
+        CPUFP32PagedKVTable::physicalBytes(table_geometry, device);
+    PhysicalMemoryPlanBuilder plan;
+    plan.add({.world_rank=0, .device=device, .total_bytes=bytes, .admission_available_bytes=bytes},
+        PhysicalMemoryOwner::KVCache, bytes);
+    auto authority = std::make_shared<PhysicalMemoryAuthority>(
+        std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()), 0);
+    auto pool = authority->createCPUPagePool(device, pool_geometry, CPUStoragePlacement::local());
+    auto table = CPUFP32PagedKVTable::create(authority, device, table_geometry);
+    // Publish deterministic K/V pages.
+    std::mt19937 random(99);
+    std::uniform_real_distribution<float> values(-0.5f, 0.5f);
+    const size_t width = static_cast<size_t>(heads * dimension);
+    std::vector<float> k(static_cast<size_t>(tokens) * width), v(k.size());
+    for (auto *bank : {&k, &v}) for (auto &x : *bank) x = values(random);
+    auto update = table->tryBeginUpdate();
+    ASSERT_TRUE(update);
+    auto grant = pool->tryAdmit(1);
+    ASSERT_TRUE(grant);
+    const auto frame = grant->assignFrame();
+    std::vector<float> payload(static_cast<size_t>(page_tokens) * 2 * width);
+    for (size_t row = 0; row < static_cast<size_t>(page_tokens); ++row)
+    {
+        std::copy_n(k.data() + row * width, width, payload.data() + row * 2 * width);
+        std::copy_n(v.data() + row * width, width, payload.data() + row * 2 * width + width);
+    }
+    auto write = grant->prepareAppend(frame, payload.size() * sizeof(float));
+    ASSERT_TRUE(write);
+    write->copyFrom(std::as_bytes(std::span(payload)));
+    update->append(CPUFP32KVPage(write->commit(), heads, dimension));
+    auto snapshot = update->commit();
+    // CONTIGUOUS attention through the raw k/v buffers (the kernel's oracle).
+    std::vector<float> q(width), expected(width, -99.0f);
+    for (auto &x : q) x = values(random);
+    CPUFlashAttentionKernelT<ActivationPrecision::FP32> kernel;
+    ASSERT_TRUE(kernel.compute_decode(q.data(), k.data(), v.data(), expected.data(), 1,
+        tokens, heads, kv_heads, dimension, true, tokens - 1));
+    // STAGE: run AttentionComputeStage with the pooled snapshot input.
+    MPIContext stage_mpi{0, 1, MPI_COMM_WORLD};
+    TensorFactory factory(stage_mpi);
+    auto Q = factory.createFP32({1, width}, device);
+    auto output = factory.createFP32({1, width}, device);
+    std::memcpy(Q->mutable_data(), q.data(), sizeof(float) * width);
+    AttentionComputeStage::Params params;
+    params.Q = Q.get();
+    params.output = output.get();
+    params.batch_size = 1;
+    params.seq_len = 1;
+    params.kv_len = tokens;
+    params.n_heads = heads;
+    params.n_kv_heads = kv_heads;
+    params.head_dim = dimension;
+    params.causal = true;
+    params.window_size = -1;
+    params.position_offset = tokens - 1; // Decode at the last KV position.
+    params.device_id = device;
+    params.pooled_table = table.get();
+    params.pooled_snapshot_owner = table.get();
+    params.pooled_snapshot_slot = 0;
+    params.kv_cache = nullptr; // Pooled path: no ring cache.
+    MPIContext local_mpi{0, 1, MPI_COMM_WORLD};
+    params.mpi_ctx = &local_mpi;
+    AttentionComputeStage stage(params);
+    CPUDeviceContext ctx(device);
+    ASSERT_TRUE(stage.execute(&ctx));
+    EXPECT_EQ(std::memcmp(output->fp32_data(), expected.data(), sizeof(float) * width), 0);
+    snapshot = {};
+}

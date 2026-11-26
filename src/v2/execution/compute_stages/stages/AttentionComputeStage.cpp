@@ -1328,8 +1328,19 @@ namespace llaminar2
                                                             << " V_type=" << (effective_V ? effective_V->dtype_name() : "null")
                                                             << " output=" << (void *)params_.output);
 
-        // Validate inputs
-        if (!ensureRequiredPointers("AttentionComputeStage", {
+        // Validate inputs. P2 pooled mode: K/V come from the pooled snapshot
+        // (borrowed below), so only Q/output and the owning table are required
+        // there; the ring K/V pointers are undefined and must NOT be validated
+        // (the pooled branch fails closed if the snapshot cannot be produced).
+        if (params_.pooled_snapshot_owner != nullptr)
+        {
+            if (!params_.Q || !params_.output || !params_.pooled_table)
+            {
+                LOG_ERROR("[AttentionComputeStage] Pooled mode requires Q, output and the owning table");
+                return false;
+            }
+        }
+        else if (!ensureRequiredPointers("AttentionComputeStage", {
                                                                  {"Q", params_.Q},
                                                                  {"K", effective_K},
                                                                  {"V", effective_V},
@@ -1519,7 +1530,10 @@ namespace llaminar2
         // Since compute_tensor() now takes ITensor*, we can pass Q/K/V directly without casting.
         // This allows GPU tensor wrappers (like GpuTensorView from CUDA KV cache) to work.
 
-        if (!ensureRequiredPointers("AttentionComputeStage", {
+        // P2 pooled mode: K/V are the pooled snapshot, never ring tensors —
+        // skip the ring pointer validation there (the pooled branch fails closed).
+        if (params_.pooled_snapshot_owner == nullptr &&
+            !ensureRequiredPointers("AttentionComputeStage", {
                                                                  {"Q", params_.Q},
                                                                  {"K", effective_K},
                                                                  {"V", effective_V},
@@ -1912,6 +1926,33 @@ namespace llaminar2
                           << " rows=" << params_.seq_len
                           << " effective_kv_len=" << effective_kv_len
                           << " device=" << params_.device_id.to_string());
+            }
+        }
+        else if (params_.pooled_snapshot_owner != nullptr && is_decode_mode &&
+                 params_.device_id.is_cpu())
+        {
+            // P2 stage-level pooled consumption: borrow THIS request's snapshot
+            // from the owning pooled table and compute through the production
+            // pooled kernel (no contiguous adapter, no full-history gather).
+            // A borrow refusal fails the step (never a silent ring path).
+            auto borrowed = params_.pooled_snapshot_owner->tryBorrowForStage(
+                params_.pooled_snapshot_slot);
+            if (!borrowed)
+            {
+                success = false;
+                LOG_ERROR("[AttentionComputeStage] Pooled snapshot borrow refused for slot "
+                          << params_.pooled_snapshot_slot);
+            }
+            else
+            {
+                success = kernel->compute_pooled_snapshot_decoder(
+                    params_.Q, *borrowed, params_.output,
+                    params_.n_heads, params_.n_kv_heads, params_.head_dim,
+                    kernel_causal, params_.window_size, params_.position_offset,
+                    params_.head_start, params_.gqa_n_rep, params_.execution_policy);
+                if (!success)
+                    LOG_ERROR("[AttentionComputeStage] Pooled snapshot decode refused"
+                              << " layer=" << params_.layer_idx);
             }
         }
         else
