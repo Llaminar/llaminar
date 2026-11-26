@@ -40,6 +40,41 @@ TEST(EffectiveUseOrdering, ObsoleteIncarnationDoesNotRefreshReplacement)
     EXPECT_EQ(tracker.watermark(), 3u);
 }
 
+/** @test Eviction gate: pending touch pins; acknowledgement releases; reordered receipts never defeat it. */
+TEST(EffectiveUseOrdering, EvictionGatePinsThenAcknowledgesOrderly)
+{
+    EffectiveUseGate gate;
+    EffectiveUseReceipt first{1, 1, 1, 0};
+    EffectiveUseReceipt second{1, 2, 1, 0};
+    EffectiveUseReceipt obsolete{0, 1, 7, 0};
+    // A new accepted touch pins its backing: eviction is blocked.
+    gate.pin(first);
+    EXPECT_TRUE(gate.hasPending());
+    EXPECT_FALSE(gate.mayEvict(first));
+    // Acknowledgment is the ordering point: the pin releases and the exact
+    // incarnation becomes evictable while ordinary recency governs.
+    gate.acknowledge(first);
+    EXPECT_FALSE(gate.hasPending());
+    EXPECT_TRUE(gate.mayEvict(first));
+    // Reordered receipts: a second accepted touch still blocks the gate;
+    // acknowledging the first again is idempotent and cannot release it.
+    gate.pin(second);
+    gate.acknowledge(first); // Obsolete acknowledgement: idempotent.
+    EXPECT_TRUE(gate.hasPending());
+    EXPECT_FALSE(gate.mayEvict(second));
+    gate.acknowledge(second);
+    EXPECT_TRUE(gate.mayEvict(second));
+    // Foreign/obsolete receipts are never evictable through this gate.
+    EXPECT_FALSE(gate.mayEvict(obsolete));
+    // Duplicate pin of an already-pinned touch keeps exactly one pin.
+    gate.pin(first);
+    gate.pin(first);
+    EXPECT_TRUE(gate.hasPending());
+    gate.acknowledge(first);
+    EXPECT_FALSE(gate.hasPending());
+    EXPECT_TRUE(gate.mayEvict(first));
+}
+
 /** @test Bounded pending pin guards unacknowledged accepted use; capacity refuses overflow. */
 TEST(EffectiveUseOrdering, PendingPinAndBoundedCapacity)
 {

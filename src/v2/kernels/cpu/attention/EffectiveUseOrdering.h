@@ -56,4 +56,31 @@ private:
     std::uint64_t watermark_ = 0;
     std::size_t pending_ = 0;
 };
+
+/**
+ * @brief Eviction ordering gate (§8.2): a pending accepted touch pins its
+ * backing until acknowledged; after the ordering point ordinary recency
+ * governs. Obsolete or foreign touches never refresh a replacement, so a
+ * reordered receipt cannot defeat the watermark.
+ */
+class EffectiveUseGate final
+{
+public:
+    /** @brief Notice a NEW accepted touch (bounded pin) for one incarnation. */
+    void pin(EffectiveUseReceipt receipt) noexcept;
+    /** @brief Ordering point: acknowledge the touch; the pin is released. */
+    void acknowledge(EffectiveUseReceipt receipt) noexcept;
+    /** @return Whether THIS incarnation may be evicted (no pending touch). */
+    bool mayEvict(EffectiveUseReceipt receipt) const noexcept;
+    /** @return Whether any incarnation still holds a bounded pin. */
+    bool hasPending() const noexcept { return pending_ != 0; }
+    /** @return Bounded journal capacity; one entry per accepted touch. */
+    static constexpr std::size_t capacity() noexcept { return EffectiveUseTracker::capacity(); }
+private:
+    static constexpr std::size_t kCapacity = EffectiveUseTracker::capacity();
+    struct State { EffectiveUseReceipt receipt; bool pinned = false; };
+    State states_[kCapacity] = {};
+    std::size_t count_ = 0;
+    std::size_t pending_ = 0;
+};
 } // namespace llaminar2
