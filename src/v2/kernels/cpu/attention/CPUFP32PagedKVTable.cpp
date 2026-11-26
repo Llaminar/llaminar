@@ -214,16 +214,24 @@ std::optional<EffectiveUseLease> CPUFP32PagedKVTable::touchEffectiveUse(
     // re-issue; the counter is never mutated on the sealed path).
     if (effective_use_sequence_ >= std::numeric_limits<std::uint64_t>::max() - 1)
         return std::nullopt;
-    const auto sequence = ++effective_use_sequence_;
+    // The ordinal is minted ONLY when the journal admits the touch: a
+    // refused attempt (journal full, foreign, obsolete) consumes NO ordinal,
+    // so the identity space is never burned by failed proposals (R14 note).
+    // The candidate is the strictly next value; the assignment below happens
+    // only on admission, and the serving session is the single table owner.
+    const auto sequence = effective_use_sequence_ + 1;
     // The replica incarnation is the PUBLISHED VERSION (monotonic, never
     // recycled): the bank INDEX is reused after retirement and can never
     // authenticate an incarnation. Journal refusal leaves no lease.
     // The lease retains THIS TABLE as its lifetime token, so journal storage
     // can never be freed while a lease is outstanding.
-    return effective_use_.touch(EffectiveUseReceipt{
+    auto lease = effective_use_.touch(EffectiveUseReceipt{
         .content_version=state.version, .table_version=state.version,
         .replica_incarnation=state.version, .sequence=sequence},
         shared_from_this());
+    if (lease)
+        effective_use_sequence_ = sequence; // Admitted: consume the ordinal.
+    return lease;
 }
 
 

@@ -443,6 +443,53 @@ TEST(CPUFP32PagedKVTable, PostClearAcknowledgementRetiresAndRecordsReclaim)
     }
 }
 
+/** @test R14 note: refused touches consume NO ordinal; admission mints exact next values. */
+TEST(CPUFP32PagedKVTable, RefusedTouchConsumesNoOrdinal)
+{
+    constexpr int dimension = 8;
+    const auto device = DeviceId::cpu();
+    const PhysicalPagePoolGeometry pool_geometry{2, 2 * 2 * dimension * sizeof(float), 2, 1};
+    // bank_count * readers_per_bank = 1 lease cell: the second touch refuses.
+    const CPUFP32PagedKVTableGeometry table_geometry{1, 1, 1, 2, 64, 0};
+    const auto bytes = PhysicalPagePool::physicalBytes(pool_geometry, device) +
+        CPUFP32PagedKVTable::physicalBytes(table_geometry, device);
+    PhysicalMemoryPlanBuilder plan;
+    plan.add({.world_rank=0, .device=device, .total_bytes=bytes, .admission_available_bytes=bytes},
+        PhysicalMemoryOwner::KVCache, bytes);
+    auto authority = std::make_shared<PhysicalMemoryAuthority>(
+        std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()), 0);
+    auto pool = authority->createCPUPagePool(device, pool_geometry, CPUStoragePlacement::local());
+    auto table = CPUFP32PagedKVTable::create(authority, device, table_geometry);
+    const auto page = [&](float value) {
+        auto grant = pool->tryAdmit(1);
+        if (!grant) throw std::logic_error("Fixture page grant refused");
+        const auto frame = grant->assignFrame();
+        std::vector<float> input(2 * 2 * dimension, 0.0f);
+        std::fill_n(input.data() + dimension, dimension, value);
+        auto write = grant->prepareAppend(frame, input.size() * sizeof(float));
+        if (!write) throw std::logic_error("Fixture page write refused");
+        write->copyFrom(std::as_bytes(std::span(input)));
+        return CPUFP32KVPage(write->commit(), 1, dimension);
+    };
+    auto update = table->tryBeginUpdate();
+    ASSERT_TRUE(update);
+    update->append(page(1.0f));
+    auto snapshot = update->commit();
+    // First touch admits: ordinal 1.
+    auto first = table->touchEffectiveUse(snapshot);
+    ASSERT_TRUE(first.has_value());
+    EXPECT_EQ(table->effectiveUseWatermark(), 1u);
+    // The single lease cell is full: the next touch REFUSES. It must NOT burn
+    // an ordinal (the following admitted touch gets 2, not 3).
+    EXPECT_FALSE(table->touchEffectiveUse(snapshot).has_value());
+    EXPECT_FALSE(table->touchEffectiveUse(snapshot).has_value());
+    EXPECT_TRUE(first->acknowledge());
+    auto next = table->touchEffectiveUse(snapshot);
+    ASSERT_TRUE(next.has_value());
+    EXPECT_EQ(table->effectiveUseWatermark(), 2u); // No burn from refusals.
+    EXPECT_TRUE(next->acknowledge());
+}
+
 /** @test Reservation conservation: issued + outstanding + new <= absolute budget always. */
 TEST(CPUFP32PagedKVTable, ReservationConservationHoldsThroughPartialConsumption)
 {
