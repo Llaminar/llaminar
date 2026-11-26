@@ -28,10 +28,18 @@ public:
     }
     const float *servingRowLogits(int row) const override { return logits_.data() + row * 8; }
     bool resetServingRow(int) override { return true; }
+    int prefix_restored_tokens = 0; // >0 simulates a prefix-cache hit admission.
     int restoreServingRowPrefix(int, const std::vector<int32_t> &, PrefixLookupResult &admission) override
     {
         admission = {};
-        return 0;
+        if (prefix_restored_tokens > 0)
+        {
+            admission.supported = true;
+            admission.cache_enabled = true;
+            admission.cached_tokens = prefix_restored_tokens;
+            admission.block_size = 64;
+        }
+        return prefix_restored_tokens;
     }
     bool harvestServingRowPrefix(int, const PrefixLookupResult &, const std::vector<int32_t> &) override
     {
@@ -46,8 +54,10 @@ public:
         if (it == slot_kv_.end()) return std::nullopt;
         return it->second;
     }
+    bool fail_import = false;
     bool importSlotKV(int slot, std::span<const std::byte> bytes) override
     {
+        if (fail_import) return false;
         slot_kv_[slot] = {bytes.begin(), bytes.end()};
         return true;
     }
@@ -164,6 +174,85 @@ TEST(ServingSubmissionOutcome, SuspendRestoreKeepsExactContinuation)
     EXPECT_EQ(session.occupancy().resident, 2);
     // The restored row keeps its original identity and law (no reseed).
     EXPECT_EQ(session.restore(ServingContinuationManifest{}, error), false); // Empty refuses.
+}
+
+/** @test R14 blocker 1: partial-prefill suspension restores the ORIGINAL prompt (no lost prefill). */
+TEST(ServingSubmissionOutcome, PartialPrefillSuspendRestoreReattachesPromptAndMatchesControl)
+{
+    ScriptedRows rows;
+    ServingSession session(rows, 256, 8);
+    std::string error;
+    ASSERT_TRUE(session.begin(1, 1, error, nullptr, 0));
+    rows.setSlotKV(0, {std::byte{1}, std::byte{2}, std::byte{3}});
+    auto request = greedy(1);
+    // Prompt larger than the chunk so the first step leaves a partial prefill
+    // boundary (prompt_consumed < prompt.size()).
+    request.prompt.assign(static_cast<std::size_t>(ServingSession::kPrefillChunk) + 5, 9);
+    request.max_new_tokens = 8;
+    EXPECT_EQ(session.submit(request, error), ServingSubmissionOutcome::Direct);
+    session.step(); // Consumes the first chunk; mid-prefill now.
+    auto manifest = session.suspend(1, error);
+    ASSERT_TRUE(manifest.has_value()) << error;
+    EXPECT_EQ(manifest->content().prompt.size(), request.prompt.size());
+    EXPECT_LT(manifest->content().prompt_consumed, request.prompt.size());
+    // Restore must reattach the ORIGINAL prompt so the remaining prefill chunk
+    // is processed (no lost prompt, no skip to decode).
+    ASSERT_TRUE(session.restore(std::move(*manifest), error)) << error;
+    auto events = session.step();
+    ASSERT_FALSE(events.empty());
+    EXPECT_EQ(events.front().prompt_tokens, static_cast<int>(request.prompt.size()));
+    // The rest of the prompt and the granted decode complete normally.
+    for (int i = 0; i < 20 && !session.idle(); ++i)
+        session.step();
+    ASSERT_TRUE(session.idle());
+}
+
+/** @test R14 blocker 2: prefix-backed suspension is refused before any mutation. */
+TEST(ServingSubmissionOutcome, PrefixBackedSuspensionRefusesPreMutation)
+{
+    ScriptedRows rows;
+    ServingSession session(rows, 256, 8);
+    std::string error;
+    ASSERT_TRUE(session.begin(1, 1, error, nullptr, 0));
+    rows.setSlotKV(0, {std::byte{1}, std::byte{2}, std::byte{3}});
+    // No typed prefix admission contract in the manifest yet: a prefix-backed
+    // LIVE row (cached_prompt_tokens > 0 or prefix_admission.hit()) must
+    // refuse suspension BEFORE reset/erase (R14 blocker 2).
+    rows.prefix_restored_tokens = 32; // simulate a prefix-cache hit admission.
+    auto request = greedy(1);
+    request.prompt.assign(ServingSession::kPrefillChunk + 5, 9);
+    request.max_new_tokens = 8;
+    EXPECT_EQ(session.submit(request, error), ServingSubmissionOutcome::Direct);
+    session.step();
+    auto manifest = session.suspend(1, error);
+    EXPECT_FALSE(manifest.has_value());
+    EXPECT_NE(error.find("prefix"), std::string::npos) << error;
+    // Pre-mutation: the resident row and its slot are untouched.
+    EXPECT_EQ(session.occupancy().resident, 1);
+    EXPECT_EQ(session.occupancy().queued, 0);
+}
+
+/** @test R14 blocker 3: failed KV import leaves slot and rows untouched (atomic). */
+TEST(ServingSubmissionOutcome, FailedImportLeavesNoMutation)
+{
+    ScriptedRows rows;
+    ServingSession session(rows, 32, 8);
+    std::string error;
+    ASSERT_TRUE(session.begin(1, 1, error, nullptr, 0));
+    rows.setSlotKV(0, {std::byte{1}, std::byte{2}, std::byte{3}});
+    EXPECT_EQ(session.submit(greedy(1), error), ServingSubmissionOutcome::Direct);
+    session.step();
+    auto manifest = session.suspend(1, error);
+    ASSERT_TRUE(manifest.has_value()) << error;
+    rows.fail_import = true;
+    // The import is the ONLY executor mutation; its failure must leave the
+    // free slot free and the follower set unchanged (no row sans state).
+    EXPECT_FALSE(session.restore(std::move(*manifest), error));
+    EXPECT_NE(error.find("import"), std::string::npos) << error;
+    EXPECT_EQ(session.occupancy().resident, 0);
+    // The slot is reusable: a fresh request is admitted immediately.
+    EXPECT_EQ(session.submit(greedy(2), error), ServingSubmissionOutcome::Direct);
+    EXPECT_EQ(session.occupancy().queued, 1); // Direct, not refused.
 }
 
 /** @test P4 interleaving: A continues while B suspends and C enters the freed slot. */
