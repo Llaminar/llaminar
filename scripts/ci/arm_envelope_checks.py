@@ -6,6 +6,7 @@ import json
 import hashlib
 import time
 import os
+import re
 import shutil
 import tempfile
 from pathlib import Path
@@ -20,11 +21,18 @@ def source_identity(root):
     if hashlib.sha256(payload).hexdigest() != os.environ['ARM_ENVELOPE_MANIFEST_SHA256']:
         raise ValueError('manifest digest mismatch')
     manifest = json.loads(payload)
+    for field in ('commit', 'tree'):
+        if not re.fullmatch('[0-9a-f]{40}', manifest[field]):
+            raise ValueError('malformed ' + field)
+    inventory = {str(p.relative_to(root)) for p in root.rglob('*') if p.is_file() or p.is_symlink()}
+    if inventory != set(manifest['files']) | {'arm-envelope-manifest.json', 'arm-envelope.Dockerfile'}:
+        raise ValueError('source inventory mismatch')
     for name, digest in manifest['files'].items():
         path = root / name
         if not path.resolve().is_relative_to(root.resolve()):
             raise ValueError('source path escapes archive')
-        if hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+        actual = {'symlink': os.readlink(path)} if path.is_symlink() else {'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
+        if actual != digest:
             raise ValueError('source mismatch: ' + name)
     return manifest
 
@@ -60,7 +68,7 @@ def run(root, output, execute=subprocess.run, *, test_identity=None):
     discovery = Path(scratch.name) / 'discovery'
     discovery.mkdir()
     (discovery / 'CMakeLists.txt').write_text('cmake_minimum_required(VERSION 4.0)\nproject(Identity LANGUAGES C CXX)\n')
-    if execute is subprocess.run:
+    if test_identity is None:
         with (output / 'compiler-discovery.log').open('w') as log:
             try:
                 result = execute(['cmake', '-S', str(discovery), '-B', str(discovery / 'build'), '-G', 'Ninja', f'-DCMAKE_MAKE_PROGRAM:FILEPATH={tools["ninja"]}'], stdout=log, stderr=subprocess.STDOUT)
@@ -109,7 +117,7 @@ def run(root, output, execute=subprocess.run, *, test_identity=None):
                             destination.parent.mkdir(parents=True, exist_ok=True)
                             shutil.copy2(source, destination)
                 failed = failed or bool(code)
-                records.append(dict(isa=isa, configuration=config, stage=stage, command=command, returncode=code, classification='probe-envelope(non-canonical-for-productionGate7)', status='skipped-after-failure' if skipped else 'executed', seconds=time.monotonic()-started))
+                records.append(dict(isa=isa, configuration=config, stage=stage, commit=identity.get('manifest', {}).get('commit'), tree=identity.get('manifest', {}).get('tree'), command=command, returncode=code, classification='probe-envelope(non-canonical-for-productionGate7)', status='skipped-after-failure' if skipped else 'executed', seconds=time.monotonic()-started))
                 (output / 'stages.json').write_text(json.dumps(records, indent=2))
     scratch.cleanup()
     return int(any(r['returncode'] for r in records))

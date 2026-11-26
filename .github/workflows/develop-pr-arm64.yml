@@ -154,9 +154,9 @@ jobs:
           git archive HEAD | tar -x -C "$context"
           git rev-parse HEAD HEAD^{tree} > "$context/arm-envelope-source.txt"
           python3 - "$context" <<'PYTHON'
-          import hashlib, json, pathlib, subprocess, sys
+          import hashlib, json, os, pathlib, subprocess, sys
           root = pathlib.Path(sys.argv[1])
-          manifest = dict(commit=subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(), tree=subprocess.check_output(['git', 'rev-parse', 'HEAD^{tree}'], text=True).strip(), files={str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest() for p in root.rglob('*') if p.is_file()})
+          manifest = dict(commit=subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(), tree=subprocess.check_output(['git', 'rev-parse', 'HEAD^{tree}'], text=True).strip(), files={str(p.relative_to(root)): ({'symlink': os.readlink(p)} if p.is_symlink() else {'sha256': hashlib.sha256(p.read_bytes()).hexdigest()}) for p in root.rglob('*') if p.is_file() or p.is_symlink()})
           (root / 'arm-envelope-manifest.json').write_text(json.dumps(manifest, sort_keys=True))
           PYTHON
           manifest_sha=$(sha256sum "$context/arm-envelope-manifest.json" | cut -d' ' -f1)
