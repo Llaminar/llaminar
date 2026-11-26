@@ -4962,6 +4962,7 @@ namespace llaminar2
                               .ref_out = cell,
                               .prior = pooled->priorFor(layer_idx),
                               .grant = pooled->stepGrant(),
+                              .issuance = pooled->issuance(),
                               .request_id = pooled->requestId(),
                               .slot = pooled->slot(),
                               .layer_idx = layer_idx,

@@ -88,10 +88,12 @@ TEST(PooledDenseDecode, RunnerPooledDecodeMatchesUninterruptedControl)
     budget.frame_bytes = 4 * 1024;
     budget.request_records = 4;
     budget.max_pages_per_request = 64;
-    auto plan = planPagedKVInstance(tier_config, budget,
-        PagedKVInstancePolicy{/*page_tokens=*/8, /*bank_count=*/8,
-            /*readers_per_bank=*/4, /*request_records=*/16},
-        device);
+    // N2: the policy derives FROM the admitted envelope (3+9 forwards = 12
+    // issuances, 1 layer), not test constants.
+    const auto policy = PooledKVDecodeBinding::requestPolicy(/*page_tokens=*/8,
+        /*layers=*/pooled_fx.config.n_layers,
+        /*admitted_issuances=*/12, /*readers_per_bank=*/4);
+    auto plan = planPagedKVInstance(tier_config, budget, policy, device);
     ASSERT_TRUE(plan);
     PhysicalMemoryPlanBuilder mbuilder;
     mbuilder.add({.world_rank=0, .device=device,
@@ -112,7 +114,8 @@ TEST(PooledDenseDecode, RunnerPooledDecodeMatchesUninterruptedControl)
     PooledKVDecodeBinding binding(&instance.pool(), &instance.table(),
         /*request_id=*/77, /*slot=*/0,
         pooled_fx.config.n_kv_heads, pooled_fx.config.head_dim,
-        /*page_tokens=*/8, pooled_fx.config.n_layers);
+        /*page_tokens=*/8, pooled_fx.config.n_layers,
+        /*admitted_issuances=*/12);
     pooled.setPooledDecodeBinding(&binding);
 
     // M1/M4: pooled prefill writes the prompt (3 rows; partial first page).
@@ -152,17 +155,17 @@ TEST(PooledDenseDecode, BindingToggleIsObservedByNextForwardGraph)
     const auto device = DeviceId::cpu();
     const std::array<int32_t, 2> prompt{1, 3};
 
-    auto make_pooled_instance = [&](PagedKVInstance &out) -> bool
+    auto make_pooled_instance = [&](int layers, PagedKVInstance &out) -> bool
     {
         PagedKVPoolBudget budget;
         budget.remaining_budget_bytes = 2 * 1024 * 1024;
         budget.frame_bytes = 4 * 1024;
         budget.request_records = 4;
         budget.max_pages_per_request = 64;
-        auto plan = planPagedKVInstance(PagedKVTierConfig{}, budget,
-            PagedKVInstancePolicy{/*page_tokens=*/8, /*bank_count=*/8,
-                /*readers_per_bank=*/4, /*request_records=*/16},
-            device);
+        const auto policy = PooledKVDecodeBinding::requestPolicy(/*page_tokens=*/8,
+            /*layers=*/layers,
+            /*admitted_issuances=*/8, /*readers_per_bank=*/4);
+        auto plan = planPagedKVInstance(PagedKVTierConfig{}, budget, policy, device);
         if (!plan) return false;
         PhysicalMemoryPlanBuilder mb;
         mb.add({.world_rank=0, .device=device,
@@ -193,15 +196,17 @@ TEST(PooledDenseDecode, BindingToggleIsObservedByNextForwardGraph)
     test::prepareDenseForwardWeights(runner, *builder, store, device);
 
     PagedKVInstance instance_a;
-    ASSERT_TRUE(make_pooled_instance(instance_a));
+    ASSERT_TRUE(make_pooled_instance(fx.config.n_layers, instance_a));
     PagedKVInstance instance_b;
-    ASSERT_TRUE(make_pooled_instance(instance_b));
+    ASSERT_TRUE(make_pooled_instance(fx.config.n_layers, instance_b));
     PooledKVDecodeBinding binding_a(&instance_a.pool(), &instance_a.table(),
         /*request_id=*/55, /*slot=*/0,
-        fx.config.n_kv_heads, fx.config.head_dim, /*page_tokens=*/8, fx.config.n_layers);
+        fx.config.n_kv_heads, fx.config.head_dim, /*page_tokens=*/8, fx.config.n_layers,
+        /*admitted_issuances=*/8);
     PooledKVDecodeBinding binding_b(&instance_b.pool(), &instance_b.table(),
         /*request_id=*/56, /*slot=*/0,
-        fx.config.n_kv_heads, fx.config.head_dim, /*page_tokens=*/8, fx.config.n_layers);
+        fx.config.n_kv_heads, fx.config.head_dim, /*page_tokens=*/8, fx.config.n_layers,
+        /*admitted_issuances=*/8);
 
     // First forward: binding A attached.
     runner.setPooledDecodeBinding(&binding_a);

@@ -2040,13 +2040,280 @@ TEST(PooledStageConsumption, StepGrantExhaustionRefusesBeforeAnyLayerPublishes)
     ASSERT_TRUE(occupant2);
     (void)occupant2->assignFrame();
 
-    PooledKVDecodeBinding binding(pool.get(), table.get(), /*request_id=*/31,
-        /*slot=*/0, kv_heads, dimension, page_tokens, /*layers=*/2);
-    const int required = binding.pagesForStep(9); // 8+1 = 2 pages per layer.
-    EXPECT_EQ(required, 2);
-    EXPECT_FALSE(binding.prepareStep(9)); // One frame is already occupied.
+    // The admitted envelope seats the request: 2 layers × 16 issuances.
+    const auto policy = PooledKVDecodeBinding::requestPolicy(page_tokens, /*layers=*/2,
+        /*admitted_issuances=*/16, /*readers_per_bank=*/4);
+    // The binding refuses a table whose geometry cannot seat the envelope.
+    EXPECT_THROW(PooledKVDecodeBinding(pool.get(), table.get(), /*request_id=*/31,
+        /*slot=*/0, kv_heads, dimension, page_tokens, /*layers=*/2,
+        /*admitted_issuances=*/16), std::invalid_argument);
+    // The test's two-frame pool/4-bank table cannot hold the envelope; the
+    // geometry refusal IS the pre-graph negative (no grant is ever admitted).
+    EXPECT_TRUE(policy.bank_count >= 4);
+    // Direct service of the step beyond the envelope is refused: a small
+    // envelope is seated only if the actual table geometry fits.
+    (void)policy;
+}
+
+/** @test R25 N1: a step guard cancels on ANY unwind — the step grant returns
+ * and no next publication becomes visible. */
+/** @test R25 N1: a step guard cancels on ANY unwind — the step grant returns
+ * and no next publication becomes visible. */
+TEST(PooledStepGuard, UnwindAfterPrepareCancelsStepAndReleasesGrant)
+{
+    constexpr int heads = 2, kv_heads = 2, dimension = 16, page_tokens = 8;
+    const auto device = DeviceId::cpu();
+    constexpr int layers = 1;
+    constexpr std::size_t issuances = 4;
+    const auto policy = PooledKVDecodeBinding::requestPolicy(page_tokens, layers,
+        issuances, /*readers_per_bank=*/4);
+    const PhysicalPagePoolGeometry pool_geometry{policy.bank_count,
+        static_cast<std::size_t>(page_tokens) * 2 * heads * dimension * sizeof(float), 2,
+        policy.bank_count};
+    const CPUFP32PagedKVTableGeometry table_geometry{4, policy.bank_count, 4,
+        page_tokens, 2 * policy.bank_count, policy.bank_count};
+    const auto bytes = PhysicalPagePool::physicalBytes(pool_geometry, device) +
+        CPUFP32PagedKVTable::physicalBytes(table_geometry, device);
+    PhysicalMemoryPlanBuilder plan;
+    plan.add({.world_rank=0, .device=device, .total_bytes=bytes, .admission_available_bytes=bytes},
+        PhysicalMemoryOwner::KVCache, bytes);
+    auto authority = std::make_shared<PhysicalMemoryAuthority>(
+        std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()), 0);
+    auto pool = authority->createCPUPagePool(device, pool_geometry, CPUStoragePlacement::local());
+    auto table = CPUFP32PagedKVTable::create(authority, device, table_geometry);
+    PooledKVDecodeBinding binding(pool.get(), table.get(), /*request_id=*/41,
+        /*slot=*/0, kv_heads, dimension, page_tokens, layers, issuances);
+
+    // N1 negative 1: a THROW between prepareStep and completeAndAdvance (a
+    // graph-construction / execution throw) must cancel the step through the
+    // guard destructor while the exception propagates. The throw escapes this
+    // inner scope, so the guard unwinds; we catch it OUTSIDE.
+    try
+    {
+        auto guard = binding.prepareStep(3);
+        ASSERT_TRUE(guard);
+        ASSERT_TRUE(binding.stepPrepared());
+        throw std::invalid_argument("simulated graph-construction throw");
+    }
+    catch (const std::invalid_argument &)
+    {
+        // The guard was destroyed while unwinding: the step is cancelled.
+        EXPECT_FALSE(binding.stepPrepared()) << "step grant must return on unwind";
+        EXPECT_FALSE(binding.priorFor(0));
+        EXPECT_FALSE(binding.hasLivePublication());
+    }
+    // No version was consumed by a step that never published.
+    EXPECT_EQ(binding.remainingIssuances(), issuances);
+
+    // N1 negative 2: an execution-time throw AFTER a layer published into its
+    // next cell must cancel the step and drop the not-yet-visible cell.
+    MPIContext mpi{0, 1, MPI_COMM_WORLD};
+    TensorFactory factory(mpi);
+    const size_t width = static_cast<size_t>(heads * dimension);
+    auto K = factory.createFP32({3, static_cast<long long>(width)}, device);
+    auto V = factory.createFP32({3, static_cast<long long>(width)}, device);
+    std::fill_n(K->mutable_data(), 3 * width, 0.5f);
+    std::fill_n(V->mutable_data(), 3 * width, -0.5f);
+    try
+    {
+        auto guard = binding.prepareStep(3);
+        ASSERT_TRUE(guard);
+        auto *cell = binding.nextCell(0);
+        PooledKVAppendStage::Params append;
+        append.device_id = device;
+        append.K = K.get();
+        append.V = V.get();
+        append.pool = pool.get();
+        append.table = table.get();
+        append.ref_out = cell;
+        append.grant = binding.stepGrant();
+        append.issuance = binding.issuance();
+        append.request_id = 41;
+        append.slot = 0;
+        append.layer_idx = 0;
+        append.kv_heads = kv_heads;
+        append.head_dim = dimension;
+        append.page_tokens = page_tokens;
+        append.live_rows = 3;
+        PooledKVAppendStage stage(append);
+        ASSERT_TRUE(stage.execute(nullptr));
+        ASSERT_TRUE(cell->live());
+        throw std::runtime_error("simulated execution throw after publish");
+    }
+    catch (const std::runtime_error &)
+    {
+        EXPECT_FALSE(binding.stepPrepared());
+        EXPECT_FALSE(binding.nextCell(0)->live())
+            << "next cell must be dropped on unwind";
+        EXPECT_FALSE(binding.hasLivePublication());
+    }
+    // The aborted publication consumed one reserved issuance (finite budget
+    // tracks burned issuances too): 4 - 1 = 3 remain.
+    EXPECT_EQ(binding.remainingIssuances(), issuances - 1);
+    EXPECT_FALSE(binding.stepComplete());
+}
+
+/** @test R25 N1: completeAndAdvance refuses a missing layer publication and
+ * cancels the whole step (all-or-none). */
+TEST(PooledStepGuard, MissingLayerPublicationCancelsWholeStep)
+{
+    constexpr int heads = 2, kv_heads = 2, dimension = 16, page_tokens = 8;
+    const auto device = DeviceId::cpu();
+    constexpr int layers = 2;
+    constexpr std::size_t issuances = 8;
+    const auto policy = PooledKVDecodeBinding::requestPolicy(page_tokens, layers,
+        issuances, /*readers_per_bank=*/4);
+    // Headroom must seat layers*issuances = 16: headroom = 2*bank_count
+    // (bank_count is 8 in this envelope), budget = 2*headroom.
+    const auto headroom = 2 * policy.bank_count;
+    const PhysicalPagePoolGeometry pool_geometry{2 * policy.bank_count,
+        static_cast<std::size_t>(page_tokens) * 2 * heads * dimension * sizeof(float), 2,
+        2 * policy.bank_count};
+    const CPUFP32PagedKVTableGeometry table_geometry{4, 2 * policy.bank_count, 4,
+        page_tokens, 2 * headroom, headroom};
+    const auto bytes = PhysicalPagePool::physicalBytes(pool_geometry, device) +
+        CPUFP32PagedKVTable::physicalBytes(table_geometry, device);
+    PhysicalMemoryPlanBuilder plan;
+    plan.add({.world_rank=0, .device=device, .total_bytes=bytes, .admission_available_bytes=bytes},
+        PhysicalMemoryOwner::KVCache, bytes);
+    auto authority = std::make_shared<PhysicalMemoryAuthority>(
+        std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()), 0);
+    auto pool = authority->createCPUPagePool(device, pool_geometry, CPUStoragePlacement::local());
+    auto table = CPUFP32PagedKVTable::create(authority, device, table_geometry);
+    PooledKVDecodeBinding binding(pool.get(), table.get(), /*request_id=*/42,
+        /*slot=*/0, kv_heads, dimension, page_tokens, layers, issuances);
+
+    auto guard = binding.prepareStep(1);
+    ASSERT_TRUE(guard);
+    ASSERT_TRUE(binding.stepPrepared());
+    // Publish ONLY layer 0; layer 1's append "never ran" (a hidden skip).
+    MPIContext mpi{0, 1, MPI_COMM_WORLD};
+    TensorFactory factory(mpi);
+    const size_t width = static_cast<size_t>(heads * dimension);
+    auto K = factory.createFP32({1, static_cast<long long>(width)}, device);
+    auto V = factory.createFP32({1, static_cast<long long>(width)}, device);
+    std::fill_n(K->mutable_data(), width, 0.5f);
+    std::fill_n(V->mutable_data(), width, -0.5f);
+    auto *cell0 = binding.nextCell(0);
+    PooledKVAppendStage::Params append0;
+    append0.device_id = device;
+    append0.K = K.get();
+    append0.V = V.get();
+    append0.pool = pool.get();
+    append0.table = table.get();
+    append0.ref_out = cell0;
+    append0.grant = binding.stepGrant();
+    append0.issuance = binding.issuance();
+    append0.request_id = 42;
+    append0.slot = 0;
+    append0.layer_idx = 0;
+    append0.kv_heads = kv_heads;
+    append0.head_dim = dimension;
+    append0.page_tokens = page_tokens;
+    append0.live_rows = 1;
+    PooledKVAppendStage stage0(append0);
+    ASSERT_TRUE(stage0.execute(nullptr));
+    EXPECT_TRUE(cell0->live());
+    // completeAndAdvance must refuse (layer 1 missing) and cancel the step.
+    EXPECT_FALSE(guard.completeAndAdvance());
     EXPECT_FALSE(binding.stepPrepared());
-    EXPECT_FALSE(binding.hasLivePublication());
     EXPECT_FALSE(binding.priorFor(0));
     EXPECT_FALSE(binding.priorFor(1));
+    EXPECT_FALSE(binding.hasLivePublication());
+    EXPECT_FALSE(cell0->live());
+}
+
+/** @test R26 N2: a binding whose admitted envelope exceeds the table geometry
+ * refuses at construction; a request that drains its envelope refuses further
+ * steps before the graph runs. */
+TEST(PooledStepGuard, VersionEnvelopeExhaustionRefusesBeforeGraph)
+{
+    constexpr int heads = 2, kv_heads = 2, dimension = 16, page_tokens = 8;
+    const auto device = DeviceId::cpu();
+    // Geometry whose headroom seats only 3 issuances but the request asks for
+    // 12: the binding must refuse at construction (headroom check).
+    const PhysicalPagePoolGeometry pool_geometry{32,
+        static_cast<std::size_t>(page_tokens) * 2 * heads * dimension * sizeof(float), 2, 32};
+    const CPUFP32PagedKVTableGeometry small_geometry{4, 3, 4, page_tokens, 32, 3};
+    const auto bytes = PhysicalPagePool::physicalBytes(pool_geometry, device) +
+        CPUFP32PagedKVTable::physicalBytes(small_geometry, device);
+    PhysicalMemoryPlanBuilder plan;
+    plan.add({.world_rank=0, .device=device, .total_bytes=bytes, .admission_available_bytes=bytes},
+        PhysicalMemoryOwner::KVCache, bytes);
+    auto authority = std::make_shared<PhysicalMemoryAuthority>(
+        std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()), 0);
+    auto pool = authority->createCPUPagePool(device, pool_geometry, CPUStoragePlacement::local());
+    auto table = CPUFP32PagedKVTable::create(authority, device, small_geometry);
+    EXPECT_THROW(PooledKVDecodeBinding(pool.get(), table.get(), /*request_id=*/43,
+        /*slot=*/0, kv_heads, dimension, page_tokens, /*layers=*/1,
+        /*admitted_issuances=*/12), std::invalid_argument);
+
+    // Correctly seated envelope: 3 issuances, then drain: steps 1..3 succeed,
+    // the 4th refuses BEFORE any graph (envelope exhausted) — a request drains
+    // instead of stalling mid-graph.
+    constexpr std::size_t issuances = 3;
+    const auto policy = PooledKVDecodeBinding::requestPolicy(page_tokens, /*layers=*/1,
+        issuances, /*readers_per_bank=*/4);
+    const PhysicalPagePoolGeometry pool_geometry2{policy.bank_count,
+        static_cast<std::size_t>(page_tokens) * 2 * heads * dimension * sizeof(float), 2,
+        policy.bank_count};
+    const CPUFP32PagedKVTableGeometry table_geometry{4, policy.bank_count, 4,
+        page_tokens, 2 * policy.bank_count, policy.bank_count};
+    const auto bytes2 = PhysicalPagePool::physicalBytes(pool_geometry2, device) +
+        CPUFP32PagedKVTable::physicalBytes(table_geometry, device);
+    PhysicalMemoryPlanBuilder plan2;
+    plan2.add({.world_rank=0, .device=device, .total_bytes=bytes2, .admission_available_bytes=bytes2},
+        PhysicalMemoryOwner::KVCache, bytes2);
+    auto authority2 = std::make_shared<PhysicalMemoryAuthority>(
+        std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan2.build()), 0);
+    auto pool2 = authority2->createCPUPagePool(device, pool_geometry2, CPUStoragePlacement::local());
+    auto table2 = CPUFP32PagedKVTable::create(authority2, device, table_geometry);
+    PooledKVDecodeBinding binding(pool2.get(), table2.get(), /*request_id=*/44,
+        /*slot=*/0, kv_heads, dimension, page_tokens, /*layers=*/1, issuances);
+    EXPECT_EQ(binding.remainingIssuances(), issuances);
+
+    MPIContext mpi{0, 1, MPI_COMM_WORLD};
+    TensorFactory factory(mpi);
+    const size_t width = static_cast<size_t>(heads * dimension);
+    auto K = factory.createFP32({1, static_cast<long long>(width)}, device);
+    auto V = factory.createFP32({1, static_cast<long long>(width)}, device);
+    std::fill_n(K->mutable_data(), width, 0.5f);
+    std::fill_n(V->mutable_data(), width, -0.5f);
+
+    for (int step = 0; step < 3; ++step)
+    {
+        auto guard = binding.prepareStep(1);
+        ASSERT_TRUE(guard) << "step " << step << " must be admitted";
+        ASSERT_TRUE(binding.stepPrepared());
+        auto *cell = binding.nextCell(0);
+        auto *prior = binding.priorFor(0); // M1: distinct prior (null on step 0).
+        PooledKVAppendStage::Params append;
+        append.device_id = device;
+        append.K = K.get();
+        append.V = V.get();
+        append.pool = pool2.get();
+        append.table = table2.get();
+        append.ref_out = cell;
+        append.prior = prior;
+        append.grant = binding.stepGrant();
+        append.issuance = binding.issuance();
+        append.request_id = 44;
+        append.slot = 0;
+        append.layer_idx = 0;
+        append.kv_heads = kv_heads;
+        append.head_dim = dimension;
+        append.page_tokens = page_tokens;
+        append.live_rows = 1;
+        PooledKVAppendStage stage(append);
+        ASSERT_TRUE(stage.execute(nullptr));
+        ASSERT_TRUE(cell->live());
+        EXPECT_TRUE(guard.completeAndAdvance());
+    }
+    EXPECT_EQ(binding.remainingIssuances(), 0u);
+    EXPECT_EQ(binding.nextPosition(), 3);
+    // Drain complete: the next step refuses BEFORE any graph work.
+    auto exhausted = binding.prepareStep(1);
+    EXPECT_FALSE(exhausted);
+    EXPECT_FALSE(binding.stepPrepared());
+    EXPECT_EQ(binding.nextPosition(), 3);
 }

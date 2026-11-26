@@ -84,6 +84,15 @@ public:
          * `tryAdmit`. Null or an exhausted grant refuses before mutation.
          */
         PhysicalPagePool::Grant *grant = nullptr;
+        /**
+         * @brief Accepted-work issuance reservation of this request (N2).
+         *
+         * The stage consumes ONE table issuance per layer publication through
+         * `tryBeginReserved`, so the request lives inside its admitted version
+         * envelope (P1). Null falls back to normal admission (test-only);
+         * the production caller always supplies the reservation.
+         */
+        CPUFP32PagedKVTable::IssuanceReservation *issuance = nullptr;
         /** Per-request release level: request record identity for binding. */
         std::uint64_t request_id = 0;
         /** Per-request slot (identity metadata, never a page). */

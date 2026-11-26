@@ -148,7 +148,14 @@ bool PooledKVAppendStage::execute(IDeviceContext *ctx)
     const float *k = params_.K->fp32_data();
     const float *v = params_.V->fp32_data();
 
-    auto update = params_.table->tryBeginUpdate();
+    // N2: the request's accepted-work envelope owns the version. Each layer
+    // publication consumes one reserved issuance; normal-admission fallback
+    // exists only for direct stage tests.
+    std::optional<CPUFP32PagedKVTable::Update> update;
+    if (params_.issuance)
+        update = params_.table->tryBeginReserved(*params_.issuance);
+    else
+        update = params_.table->tryBeginUpdate();
     if (!update)
     {
         LOG_ERROR("[PooledKVAppendStage] Pooled table has no available bank (issuance budget or banks exhausted)");

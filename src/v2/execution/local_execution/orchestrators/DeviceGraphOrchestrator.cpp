@@ -18415,11 +18415,17 @@ namespace llaminar2
                 input.execution_phase == ForwardExecutionPhase::Prefill
                     ? seq_len
                     : 1;
-            if (!pooled_kv_binding_->prepareStep(live_rows))
+            // N1: the StepGuard owns the step. Any throw after this point
+            // (graph construction, stage execution) unwinds through the guard
+            // and cancels the step: the grant returns and no layer publication
+            // becomes visible. Only a complete, successful forward may
+            // completeAndAdvance.
+            pooled_step_guard_ = pooled_kv_binding_->prepareStep(live_rows);
+            if (!pooled_step_guard_)
             {
                 LOG_ERROR(
-                    "[DeviceGraphOrchestrator] Pooled decode step grant admission "
-                    "refused (page pressure); refusing forward before graph execution");
+                    "[DeviceGraphOrchestrator] Pooled decode step admission "
+                    "refused (page/version/bank headroom); refusing forward before graph execution");
                 return std::nullopt;
             }
         }
@@ -18733,16 +18739,21 @@ namespace llaminar2
         // Execute forward pass
         bool success = executeForward(input, output);
 
-        // R24 M1/M6: pooled step publication. Only a completely successful
-        // forward advances next→current for every layer; any failure cancels
-        // every not-yet-visible publication, so layers never disagree.
-        if (pooled_kv_binding_)
+        // R25 N1: pooled step publication. Only a completely successful
+        // forward advances next→current for EVERY layer (row-count check);
+        // any failure or missing layer cancels every not-yet-visible
+        // publication, so layers never disagree or lose history.
+        if (success && pooled_step_guard_)
         {
-            if (success)
-                pooled_kv_binding_->advanceStep();
-            else
-                pooled_kv_binding_->cancelStep();
+            if (!pooled_step_guard_.completeAndAdvance())
+            {
+                LOG_ERROR(
+                    "[DeviceGraphOrchestrator] Pooled forward succeeded but the "
+                    "step publication is incomplete; cancelling the step");
+                success = false;
+            }
         }
+        pooled_step_guard_ = PooledKVDecodeBinding::StepGuard{};
 
         std::string overlay_finish_error;
         if (!overlay_graph_scope.finish(

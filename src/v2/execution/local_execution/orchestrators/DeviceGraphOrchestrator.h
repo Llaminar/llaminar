@@ -703,6 +703,8 @@ namespace llaminar2
     private:
         /** Caller-owned pooled decode binding attached for the current serving interval. */
         PooledKVDecodeBinding *pooled_kv_binding_ = nullptr;
+        /** N1: RAII owner of the current pooled step (cancels on unwind). */
+        PooledKVDecodeBinding::StepGuard pooled_step_guard_;
     private:
         // Only the original Rank can order these phases across every participant.
         /** @brief Join original prior producers and publish this grouped channel's reset close before any TP peer awaits. */
