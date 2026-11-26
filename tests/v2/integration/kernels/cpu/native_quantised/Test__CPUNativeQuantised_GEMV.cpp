@@ -212,8 +212,10 @@ namespace
         return std::filesystem::path("/opt/llaminar-models/Qwen3.6-27B-Q4_K_S.gguf");
     }
 
-    // ==================================================================    // MPI global environment: init once, finalize on exit, abort on crash
-    // ==================================================================    void mpi_abort_signal_handler(int sig)
+    // =========================================================================
+    // MPI global environment: init once, finalize on exit, abort on crash
+    // =========================================================================
+    void mpi_abort_signal_handler(int sig)
     {
         const char *msg = "\n[FATAL] Signal caught in integration test — calling MPI_Abort\n";
         [[maybe_unused]] auto _ = write(STDERR_FILENO, msg, strlen(msg));
@@ -390,8 +392,10 @@ namespace
         return result;
     }
 
-    // ==================================================================    // FP32 CPU reference GEMV (double-precision accumulation)
-    // ==================================================================
+    // =========================================================================
+    // FP32 CPU reference GEMV (double-precision accumulation)
+    // =========================================================================
+
     /**
      * @brief Ground-truth GEMV: C[N] = dequant(B)[N×K] @ A[K]
      *
@@ -443,8 +447,10 @@ namespace
         }
     }
 
-    // ==================================================================    // Metrics
-    // ==================================================================
+    // =========================================================================
+    // Metrics
+    // =========================================================================
+
     float cosineSimilarity(const float *a, const float *b, size_t n)
     {
         double dot = 0, norm_a = 0, norm_b = 0;
@@ -534,8 +540,10 @@ namespace
         return ok;
     }
 
-    // ==================================================================    // Shape definitions (Qwen2.5 models)
-    // ==================================================================
+    // =========================================================================
+    // Shape definitions (Qwen2.5 models)
+    // =========================================================================
+
     struct GEMVShape
     {
         std::string name;
@@ -576,8 +584,10 @@ namespace
         {"3B_LM_Head", "LM_Head", 151936, 2048},
     };
 
-    // ==================================================================    // Format definitions
-    // ==================================================================
+    // =========================================================================
+    // Format definitions
+    // =========================================================================
+
     struct FormatSpec
     {
         std::string name;
@@ -590,8 +600,10 @@ namespace
         {"IQ4_NL", 0.985f},
     };
 
-    // ==================================================================    // Test fixture
-    // ==================================================================
+    // =========================================================================
+    // Test fixture
+    // =========================================================================
+
 #if defined(__aarch64__)
     constexpr int kCompactLanes = 4; ///< One NEON quad per compact multi-scale step.
 #else
@@ -603,8 +615,10 @@ namespace
     protected:
     };
 
-    // ==================================================================    // Correctness test: Q4_0 small matrix
-    // ==================================================================
+    // =========================================================================
+    // Correctness test: Q4_0 small matrix
+    // =========================================================================
+
 #if defined(__aarch64__)
     /** Exhaust the signed-byte dot domain for each compiled NEON instruction family. */
     template <class Ops>
@@ -813,8 +827,10 @@ namespace
             << "IQ4_NL SmallMatrix: cosine=" << cos_sim << " max_err=" << max_err;
     }
 
-    // ==================================================================    // Correctness test: M>1 GEMM
-    // ==================================================================
+    // =========================================================================
+    // Correctness test: M>1 GEMM
+    // =========================================================================
+
     TEST_F(CPUNativeQuantisedGemvTest, Q4_0_GEMM_M4)
     {
         const int M = 4;
@@ -847,8 +863,10 @@ namespace
         }
     }
 
-    // ==================================================================    // Full shape sweep (all Qwen shapes × all formats)
-    // ==================================================================
+    // =========================================================================
+    // Full shape sweep (all Qwen shapes × all formats)
+    // =========================================================================
+
     TEST_F(CPUNativeQuantisedGemvTest, AccuracySweep_Q4_0_AllShapes)
     {
         const FormatSpec &fmt = PHASE1_FORMATS[0]; // Q4_0
@@ -1014,8 +1032,10 @@ namespace
         std::cout << table.to_string() << std::endl;
     }
 
-    // ==================================================================    // Comparison vs existing CPUNativeQuantisedGemmKernel (INT8 requantize path)
-    // ==================================================================
+    // =========================================================================
+    // Comparison vs existing CPUNativeQuantisedGemmKernel (INT8 requantize path)
+    // =========================================================================
+
     TEST_F(CPUNativeQuantisedGemvTest, CompareVsQuantisedGemmKernel_Q4_0)
     {
         // Compare NativeQuantised vs existing CPUNativeQuantisedGemmKernel on a medium shape
@@ -1217,8 +1237,10 @@ namespace
         }
     }
 
-    // ==================================================================    // All-format support: factory dispatch + threshold table
-    // ==================================================================
+    // =========================================================================
+    // All-format support: factory dispatch + threshold table
+    // =========================================================================
+
     /**
      * @brief Create random quantized weights for a given format name.
      * Returns nullptr if format is not supported.
@@ -1783,8 +1805,10 @@ namespace
         unsetenv("LLAMINAR_PERF_STATS_JSON");
     }
 
-    // ==================================================================    // Smoke tests for each newly supported format (small matrix)
-    // ==================================================================
+    // =========================================================================
+    // Smoke tests for each newly supported format (small matrix)
+    // =========================================================================
+
     /**
      * @brief Shared smoke-test logic: pack + GEMV + compare against FP32 ref.
      */
@@ -5625,8 +5649,10 @@ namespace
         }
     }
 
-    // ==================================================================    // Full shape sweep across ALL formats
-    // ==================================================================
+    // =========================================================================
+    // Full shape sweep across ALL formats
+    // =========================================================================
+
     TEST_F(CPUNativeQuantisedGemvTest, AccuracySweep_AllFormats)
     {
         // Subset of shapes for efficiency: 0.5B attention + FFN
@@ -5727,8 +5753,10 @@ namespace
         std::cout << table.to_string() << std::endl;
     }
 
-    // ==================================================================    // GEMM correctness for asymmetric formats (M>1)
-    // ==================================================================
+    // =========================================================================
+    // GEMM correctness for asymmetric formats (M>1)
+    // =========================================================================
+
     TEST_F(CPUNativeQuantisedGemvTest, Q4_1_GEMM_M4)
     {
         const int M = 4;
