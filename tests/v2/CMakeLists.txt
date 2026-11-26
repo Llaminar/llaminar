@@ -16115,6 +16115,12 @@ add_v2_test(V2_Integration_DiskExtentQuota
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;PrefixCache;Storage;Quota;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_DiskExtentQuota)
+add_v2_test(V2_Integration_PagedKVPoolGeometry
+    COMMAND $<TARGET_FILE:v2_test_physical_memory_authority>
+        --gtest_filter=PagedKVPoolGeometry.*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;PagedKV;Geometry;Budget;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PagedKVPoolGeometry)
 add_v2_test(V2_Integration_PagedKVTierConfig
     COMMAND $<TARGET_FILE:v2_test_paged_kv_tier_config>
         --gtest_filter=PagedKVTierConfig.*
@@ -30434,6 +30440,7 @@ add_executable(v2_test_physical_memory_authority
     unit/planning/Test__PhysicalMemoryAuthority.cpp
     unit/planning/Test__PhysicalPagePoolReplay.cpp
     unit/planning/Test__PhysicalPagePoolSharing.cpp
+    unit/planning/Test__PagedKVPoolGeometry.cpp
     unit/planning/Test__CompletionWitness.cpp
     unit/planning/Test__PageTableAdmission.cpp
     unit/planning/Test__PhysicalMemoryRankHostPool.cpp

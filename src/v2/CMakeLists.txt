@@ -1813,6 +1813,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     backends/GPUFlatGraphStructure.cpp
     backends/RetainedParticipantGraphExecutable.cpp
     planning/PhysicalMemoryAuthority.cpp
+    planning/PagedKVPoolGeometry.cpp
     planning/PhysicalPagePool.cpp
     planning/CompletionWitness.cpp
     planning/PageTableAdmission.cpp
