@@ -6,6 +6,9 @@ v2_add_core_free_test(V2_Unit_CPUHostCompilerOptions
         -s "${CMAKE_CURRENT_LIST_DIR}/../../../scripts/ci"
         -p test_cpu_host_compiler_options.py
     LABELS V2 Unit DeviceFree CI)
+if(NOT LLAMINAR_CPU_COMPILE_DEFINITIONS)
+    message(FATAL_ERROR "CPU host contract requires canonical definitions")
+endif()
 set(V2_CPU_HOST_DEFINITION_ARGS)
 foreach(definition IN LISTS LLAMINAR_CPU_COMPILE_DEFINITIONS)
     list(APPEND V2_CPU_HOST_DEFINITION_ARGS "--definition=${definition}")
@@ -23,6 +26,8 @@ v2_add_core_free_test(V2_Integration_CPUHostCompileContract
     LABELS V2 Integration DeviceFree ProductionTestPreflight)
 
 # Simulated compiler identities exercise real CMake generation, not native codegen.
+# Unit owns fast feedback; the separately named Integration entry explicitly
+# retains the original-code regression in the canonical production preflight.
 v2_add_core_free_test(V2_Unit_CPUHostGeneratedCommands
     COMMAND "${Python3_EXECUTABLE}" -m unittest discover
         -s "${CMAKE_CURRENT_LIST_DIR}/../../../scripts/ci"

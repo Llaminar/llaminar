@@ -13,6 +13,8 @@ def verify(database, flags, definitions=None, compilers=None):
     expected = shlex.split(flags)
     if not expected:
         raise ValueError('empty expected CPU flags')
+    if not definitions:
+        raise ValueError('empty expected CPU definitions')
     expected_definitions = dict(token.split('=', 1) for token in definitions or [])
     checked = 0
     for row in json.loads(Path(database).read_text()):
@@ -28,13 +30,25 @@ def verify(database, flags, definitions=None, compilers=None):
         if not declared:
             raise ValueError('missing CPU envelope declarations')
         checked += 1
-        if expected_definitions and declared != expected_definitions:
+        if declared != expected_definitions:
             raise ValueError('mismatched CPU envelope declarations')
         language = row.get('host_language') if compilers is None else None
         if compilers is not None:
             matches = {name for name, compiler in compilers.items() if compiler and any(Path(token).resolve() == Path(compiler).resolve() for token in command if not token.startswith('-'))}
-            if matches == {'C', 'CXX'}:
-                raise ValueError('ambiguous compiler identity')
+            if len(matches) > 1:
+                explicit = None
+                if '--offload-arch' in ' '.join(command) or any(command[i:i+2] == ['-x', 'hip'] for i in range(len(command)-1)):
+                    explicit = 'HIP'
+                elif any(command[i:i+2] == ['-x', 'c'] for i in range(len(command)-1)) or '-xc' in command:
+                    explicit = 'C'
+                elif any(command[i:i+2] == ['-x', 'c++'] for i in range(len(command)-1)) or '-xc++' in command:
+                    explicit = 'CXX'
+                elif row['file'].endswith('.c'):
+                    explicit = 'C'
+                elif row['file'].endswith(('.cpp', '.cc', '.cxx')):
+                    explicit = 'CXX'
+                if explicit in matches:
+                    matches = {explicit}
             if len(matches) != 1:
                 raise ValueError('unidentified host compiler executable')
             language = matches.pop()
@@ -44,11 +58,15 @@ def verify(database, flags, definitions=None, compilers=None):
         for i, token in enumerate(command):
             if token.startswith('-Xcompiler='):
                 options.extend(token.split('=', 1)[1].split(','))
+            elif token == '-Xcompiler' and i+1 < len(command):
+                options.extend(command[i+1].split(','))
             elif token == '-Xarch_host' and i+1 < len(command):
                 options.append(command[i+1])
-            elif token.startswith(('-march=', '-mcpu=', '-mno-', '-mavx', '-msse', '-mfma', '-mf16c', '-mbmi', '-mpopcnt')):
+            elif token.startswith(('-march=', '-mcpu=', '-mtune=', '-mno-', '-mavx', '-msse', '-mfma', '-mf16c', '-mbmi', '-mpopcnt')):
                 options.append(token)
-        if any(option not in expected for option in options if option != '-fPIC'):
+        def isa_option(option):
+            return bool(re.match(r'^-m(?:arch=|cpu=|tune=|(?:no-)?(?:avx|sse|fma|f16c|bmi|popcnt|mmx|aes|pclmul|sha|crc|simd|dotprod|i8mm|fp16))', option))
+        if any(option not in expected for option in options if isa_option(option)):
             raise ValueError('contrary CPU compiler option')
         for flag in expected:
             if language == 'CUDA':
@@ -71,7 +89,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--database', required=True)
     parser.add_argument('--flags', required=True)
-    parser.add_argument('--definition', action='append')
+    parser.add_argument('--definition', action='append', required=True)
     for language in ('C', 'CXX', 'CUDA', 'HIP'):
         parser.add_argument('--compiler-' + language, default='')
     args = parser.parse_args()

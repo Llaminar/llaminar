@@ -49,9 +49,9 @@ endforeach()
             base = ['nvcc', '-DLLAMINAR_COMPILED_WITH_NEON=1', '-c', 'test.cu']
             database.write_text(json.dumps([dict(file='test.cu', host_language='CUDA', arguments=base)]))
             with self.assertRaisesRegex(ValueError, 'missing host option'):
-                verify(database, '-mcpu=generic -march=armv8-a+simd')
+                verify(database, '-mcpu=generic -march=armv8-a+simd', ['LLAMINAR_COMPILED_WITH_NEON=1'])
             database.write_text(json.dumps([dict(file='test.cu', host_language='CUDA', arguments=base + ['-Xcompiler=-mcpu=generic', '-Xcompiler=-march=armv8-a+simd'])]))
-            verify(database, '-mcpu=generic -march=armv8-a+simd')
+            verify(database, '-mcpu=generic -march=armv8-a+simd', ['LLAMINAR_COMPILED_WITH_NEON=1'])
 
     def test_host_language_and_declaration_failures(self):
         import json
@@ -81,3 +81,38 @@ endforeach()
         self.assertIn('LLAMINAR_COMPILED_WITH_NEON_I8MM', block)
         self.assertNotIn('__CUDA_ARCH__', block)
         self.assertNotIn('__HIP_DEVICE_COMPILE__', block)
+
+    def test_forwarded_non_isa_options_and_contrary_isa(self):
+        import json
+        from cpu_host_compile_contract import verify
+        with tempfile.TemporaryDirectory() as directory:
+            database = pathlib.Path(directory) / 'commands.json'
+            definition = 'LLAMINAR_COMPILED_WITH_AVX2=1'
+            base = ['nvcc', '-D' + definition, '-Xcompiler=-mavx2']
+            def check(extra):
+                database.write_text(json.dumps([dict(file='fixture.cu', host_language='CUDA', arguments=base + extra)]))
+                verify(database, '-mavx2', [definition])
+            for extra in (['-Xcompiler=-fopenmp'], ['-Xcompiler=-O3,-Wno-unused,-fvisibility=hidden'], ['-Xcompiler', '-fopenmp']):
+                check(extra)
+            for extra in (['-Xcompiler=-march=native'], ['-Xcompiler=-O3,-mavx512f'], ['-Xcompiler', '-mavx512f']):
+                with self.assertRaisesRegex(ValueError, 'contrary'):
+                    check(extra)
+            with self.assertRaisesRegex(ValueError, 'empty expected CPU definitions'):
+                verify(database, '-mavx2', [])
+
+    def test_shared_clang_identity_and_hip_contrary_option(self):
+        import json
+        from cpu_host_compile_contract import verify
+        with tempfile.TemporaryDirectory() as directory:
+            database = pathlib.Path(directory) / 'commands.json'
+            compiler = '/usr/bin/clang'
+            definitions = ['LLAMINAR_COMPILED_WITH_AVX2=1']
+            command = [compiler, '-x', 'hip', '-D' + definitions[0], '-Xarch_host', '-mavx2']
+            row = dict(file='LANGUAGEHIP.cpp', arguments=command)
+            compilers = dict(C=compiler, CXX=compiler, HIP=compiler)
+            database.write_text(json.dumps([row]))
+            verify(database, '-mavx2', definitions, compilers)
+            row['arguments'] += ['-Xarch_host', '-mno-avx512f']
+            database.write_text(json.dumps([row]))
+            with self.assertRaisesRegex(ValueError, 'contrary'):
+                verify(database, '-mavx2', definitions, compilers)
