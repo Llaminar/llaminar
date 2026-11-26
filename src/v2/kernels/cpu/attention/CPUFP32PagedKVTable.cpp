@@ -25,9 +25,17 @@ size_t CPUFP32PagedKVTable::physicalBytes(CPUFP32PagedKVTableGeometry geometry, 
     const auto cells = CPUStorageRoot<std::byte>(geometry.bank_count * geometry.page_capacity * sizeof(CPUFP32KVPage),
         PhysicalMemoryOwner::KVCache, device, placement).physicalBytes();
     const auto banks = CPUStorageRoot<Bank>(geometry.bank_count, PhysicalMemoryOwner::KVCache, device, placement).physicalBytes();
+    // The effective-use journal is admitted metadata of THIS instance: one
+    // slot per live incarnation, priced by the same authority so the instance
+    // plan BOM stays exact (no hidden heap allocation outside PMA).
+    const auto journal = CPUStorageRoot<EffectiveUseJournal::Entry>(geometry.bank_count,
+        PhysicalMemoryOwner::KVCache, device, placement).physicalBytes();
     if (banks > std::numeric_limits<size_t>::max() - cells)
         throw std::overflow_error("CPU page-table physical BOM overflows");
-    return cells + banks;
+    const auto cells_and_banks = cells + banks;
+    if (journal > std::numeric_limits<size_t>::max() - cells_and_banks)
+        throw std::overflow_error("CPU page-table physical BOM overflows");
+    return cells_and_banks + journal;
 }
 std::shared_ptr<CPUFP32PagedKVTable> CPUFP32PagedKVTable::create(std::shared_ptr<PhysicalMemoryAuthority> authority,
     DeviceId device, CPUFP32PagedKVTableGeometry geometry, CPUStoragePlacement placement)
@@ -37,14 +45,19 @@ std::shared_ptr<CPUFP32PagedKVTable> CPUFP32PagedKVTable::create(std::shared_ptr
 }
 CPUFP32PagedKVTable::CPUFP32PagedKVTable(std::shared_ptr<PhysicalMemoryAuthority> authority, DeviceId device,
     CPUFP32PagedKVTableGeometry geometry, CPUStoragePlacement placement)
-    : authority_(authority), geometry_(geometry),
-      effective_use_(geometry.bank_count ? geometry.bank_count : 1)
+    : authority_(authority), geometry_(geometry)
 {
     (void)physicalBytes(geometry, device, placement);
     static_assert(alignof(CPUFP32KVPage) <= AlignedVector<std::byte>::ALIGNMENT);
     cells_ = CPUStorageRoot<std::byte>(geometry.bank_count * geometry.page_capacity * sizeof(CPUFP32KVPage),
         PhysicalMemoryOwner::KVCache, device, placement, CPUStorageInitialization::Uninitialized).allocate(authority);
     banks_ = CPUStorageRoot<Bank>(geometry.bank_count, PhysicalMemoryOwner::KVCache, device, placement).allocate(authority);
+    // Journal storage is admitted by the same authority (priced in
+    // physicalBytes above) and bound as non-owning storage, so no heap
+    // allocation exists outside PMA. Inactive entries own no touch.
+    use_entries_ = CPUStorageRoot<EffectiveUseJournal::Entry>(geometry.bank_count,
+        PhysicalMemoryOwner::KVCache, device, placement).allocate(authority);
+    effective_use_.rebind(use_entries_);
     // Placement array construction starts real object lifetimes in the exact
     // admitted root; inactive cells own no pages and allocate no payload.
     pages_ = new (cells_.data()) CPUFP32KVPage[geometry.bank_count * geometry.page_capacity];
@@ -68,6 +81,12 @@ void CPUFP32PagedKVTable::clear(size_t bank) noexcept
     state.pages = state.readers = 0;
     state.accepting_readers = false;
     state.phase = Phase::Free;
+    // TRUE retirement of the touch obligation: only a fully acknowledged
+    // incarnation may be reclaimed. A pending touch keeps its journal slot
+    // (the retired bank index is reusable, but the incarnation identity is
+    // the published version and never reuses; the obligation outlives the bank
+    // until acknowledged, exactly as §8.2 requires).
+    (void)effective_use_.retire(state.version);
 }
 std::optional<CPUFP32PagedKVTable::Update> CPUFP32PagedKVTable::tryBeginUpdate()
 {
@@ -185,14 +204,23 @@ EffectiveUseStatus CPUFP32PagedKVTable::touchEffectiveUse(
     // hit on the same unchanged incarnation REFRESHES the watermark rather
     // than deduplicating into a stale touch.
     if (++effective_use_sequence_ == 0)
-        return EffectiveUseStatus::Obsolete; // Ordinal exhaustion: seal.
+        return EffectiveUseStatus::JournalFull; // Ordinal exhaustion: TERMINAL
+                                                 // seal. The counter stays 0
+                                                 // and refuses every later
+                                                 // touch (no wrap can re-issue
+                                                 // ordinal1).
+    if (effective_use_sequence_ == std::numeric_limits<std::uint64_t>::max())
+        return EffectiveUseStatus::Obsolete; // Refuse and stay at max: seal.
     // Record the fresh ordinal ON the snapshot: the acknowledgment must carry
     // the exact touch identity, not the table's current sequence (a later
     // touch on another incarnation would otherwise release the wrong pin).
     snapshot.touch_ordinal_ = effective_use_sequence_;
+    // The replica incarnation is the PUBLISHED VERSION (monotonic, never
+    // recycled): the bank INDEX is reused after retirement, so it can never
+    // authenticate an incarnation. A burned/unpublished version refuses.
     return effective_use_.touch(EffectiveUseReceipt{
         .content_version=state.version, .table_version=state.version,
-        .replica_incarnation=snapshot.bank_, .sequence=effective_use_sequence_});
+        .replica_incarnation=state.version, .sequence=effective_use_sequence_});
 }
 
 bool CPUFP32PagedKVTable::acknowledgeEffectiveUse(const Snapshot &snapshot)
@@ -207,7 +235,7 @@ bool CPUFP32PagedKVTable::acknowledgeEffectiveUse(const Snapshot &snapshot)
         return false;
     return effective_use_.acknowledge(EffectiveUseReceipt{
         .content_version=state.version, .table_version=state.version,
-        .replica_incarnation=snapshot.bank_, .sequence=snapshot.touch_ordinal_});
+        .replica_incarnation=state.version, .sequence=snapshot.touch_ordinal_});
 }
 
 void CPUFP32PagedKVTable::closeBorrowers(const Snapshot &snapshot)

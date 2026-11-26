@@ -223,10 +223,12 @@ public:
     {
         return effective_use_.mayEvict(incarnation);
     }
-    /** @brief Reclaim a retired incarnation's effective-use entry. */
-    void retireEffectiveUse(std::uint64_t incarnation) noexcept
+    /** @brief Reclaim a retired incarnation's effective-use entry.
+     *  @return True when reclaimed; false when a pending touch remains (the
+     *  obligation is preserved and the entry stays live). */
+    bool retireEffectiveUse(std::uint64_t incarnation) noexcept
     {
-        effective_use_.retire(incarnation);
+        return effective_use_.retire(incarnation);
     }
 private:
     enum class Phase : std::uint8_t { Free, Preparing, Published };
@@ -253,9 +255,10 @@ private:
     std::uint64_t reserved_outstanding_ = 0; ///< Sum of live reservation capacities.
     std::uint64_t reservation_serial_ = 0;   ///< Monotonic handle nonce, never recycled.
     std::uint64_t effective_use_sequence_ = 0; ///< Fresh touch ordinal (§8.2).
-    EffectiveUseJournal effective_use_;       ///< Membership-sized touch journal.
     AlignedVector<std::byte> cells_;
     AlignedVector<Bank> banks_;
+    AlignedVector<EffectiveUseJournal::Entry> use_entries_; ///< PMA-admitted journal slots.
+    EffectiveUseJournal effective_use_;       ///< Membership-sized touch journal (non-owning).
     CPUFP32KVPage *pages_ = nullptr; ///< Constructed stable metadata array, never KV payload.
 };
 }

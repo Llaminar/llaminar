@@ -330,19 +330,20 @@ TEST(CPUFP32PagedKVTable, EffectiveUseWatermarkFollowsOnlyRealAttachments)
     update->append(page(1.0f));
     auto snapshot = update->commit();
     ASSERT_TRUE(snapshot.version() > 0u);
+    const auto incarnation = snapshot.version();
     EXPECT_EQ(table->touchEffectiveUse(snapshot), EffectiveUseStatus::Accepted);
     EXPECT_EQ(table->effectiveUseWatermark(), 1u);
-    EXPECT_FALSE(table->effectiveUseMayEvict(0)); // Pinned until acknowledged.
-    EXPECT_TRUE(table->acknowledgeEffectiveUse(snapshot));
-    EXPECT_TRUE(table->effectiveUseMayEvict(0));
-    // A repeated no-copy hit on the SAME unchanged incarnation REFRESHES the
-    // watermark (fresh ordinal), it never stays old; the new pin requires the
-    // NEW snapshot ordinal to release (delayed old ack cannot release it).
+    EXPECT_FALSE(table->effectiveUseMayEvict(incarnation)); // Pinned until ack.
+    // R9: a second touch on the same incarnation before the first ack keeps
+    // BOTH obligations pending; acking the SECOND with the FULL identity
+    // (content/table versions are the same here) releases the whole frontier.
     EXPECT_EQ(table->touchEffectiveUse(snapshot), EffectiveUseStatus::Refreshed);
     EXPECT_EQ(table->effectiveUseWatermark(), 2u);
-    EXPECT_EQ(snapshot.useOrdinal(), 2u);
-    EXPECT_TRUE(table->acknowledgeEffectiveUse(snapshot));
-    // A second published version on another bank advances monotonically.
+    EXPECT_FALSE(table->effectiveUseMayEvict(incarnation)); // touch1 + touch2 pending.
+    EXPECT_TRUE(table->acknowledgeEffectiveUse(snapshot));   // Frontier released.
+    EXPECT_TRUE(table->effectiveUseMayEvict(incarnation));
+    // A wrong FULL identity (a different published version / its own bank)
+    // never acknowledges the first incarnation's obligations.
     auto second = table->tryBeginUpdate();
     ASSERT_TRUE(second);
     second->append(page(2.0f));
@@ -350,12 +351,20 @@ TEST(CPUFP32PagedKVTable, EffectiveUseWatermarkFollowsOnlyRealAttachments)
     ASSERT_GT(snapshot2.version(), snapshot.version());
     EXPECT_EQ(table->touchEffectiveUse(snapshot2), EffectiveUseStatus::Accepted);
     EXPECT_EQ(table->effectiveUseWatermark(), 3u);
+    // The wrong-identity case is exercised at the journal level (a forged
+    // content/table at the same incarnation+ordinal must never ack); here the
+    // second incarnation's own identity acknowledges cleanly.
+    EXPECT_TRUE(table->acknowledgeEffectiveUse(snapshot));
+    EXPECT_TRUE(table->effectiveUseMayEvict(snapshot.version()));
     EXPECT_TRUE(table->acknowledgeEffectiveUse(snapshot2));
-    // Retirement reclaims the incarnation's entry (capacity reuse).
-    table->retireEffectiveUse(1);
-    EXPECT_FALSE(table->effectiveUseMayEvict(1));
+    // TRUE retirement: acknowledging first, then retiring reclaims the slot.
+    EXPECT_TRUE(table->retireEffectiveUse(snapshot2.version()));
+    EXPECT_FALSE(table->effectiveUseMayEvict(snapshot2.version()));
+    // A pending touch refuses retirement (obligation preserved).
     EXPECT_EQ(table->touchEffectiveUse(snapshot2), EffectiveUseStatus::Accepted);
-    EXPECT_EQ(table->effectiveUseWatermark(), 4u);
+    EXPECT_FALSE(table->retireEffectiveUse(snapshot2.version()));
+    EXPECT_TRUE(table->acknowledgeEffectiveUse(snapshot2));
+    EXPECT_TRUE(table->retireEffectiveUse(snapshot2.version()));
 }
 
 /** @test Reservation conservation: issued + outstanding + new <= absolute budget always. */

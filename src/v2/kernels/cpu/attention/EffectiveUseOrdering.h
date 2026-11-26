@@ -18,6 +18,7 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include <span>
 #include <string>
 
 namespace llaminar2
@@ -50,19 +51,40 @@ enum class EffectiveUseStatus
  * full journal is reported typed. The sequence is the fresh attachment
  * ordinal minted by the owner, so duplicate/obsolete receipts are recognized
  * by exact ordinal and delayed acknowledgements cannot release a newer pin.
+ *
+ * The journal is NON-OWNING: its entry storage is admitted by the owner
+ * through PhysicalMemoryAuthority (the same authority prices the table's
+ * other metadata), so no hot-start allocation and no second accounting
+ * ledger exist here.
  */
 class EffectiveUseJournal final
 {
 public:
-    /** @brief Bounded journal admitting exactly @p capacity live incarnations. */
-    explicit EffectiveUseJournal(std::size_t capacity) noexcept
-        : capacity_(capacity ? capacity : 1)
+    /** @brief One journal slot; storage is owner-admitted. */
+    struct Entry
     {
-        entries_ = new Entry[capacity_]; // Fixed membership; constructed before use.
+        EffectiveUseReceipt receipt;  ///< Full identity of the newest touch.
+        std::size_t pinned_ = 0;      ///< Unacknowledged touches in the frontier.
+        std::size_t obligations_ = 0; ///< Total obligations effectively released once.
+        bool live = false;
+    };
+    /** @brief Empty journal; the owner must bind admitted storage before use. */
+    EffectiveUseJournal() noexcept = default;
+    /** @brief Bind journal storage admitted by the owner (@p entries, exact capacity). */
+    explicit EffectiveUseJournal(std::span<Entry> entries) noexcept
+        : entries_(entries.data()), capacity_(entries.size() ? entries.size() : 1)
+    {
     }
-    ~EffectiveUseJournal() { delete[] entries_; }
     EffectiveUseJournal(const EffectiveUseJournal &) = delete;
     EffectiveUseJournal &operator=(const EffectiveUseJournal &) = delete;
+    /** @brief Rebind admitted storage (owner-two-phase construction only). */
+    void rebind(std::span<Entry> entries) noexcept
+    {
+        entries_ = entries.data();
+        capacity_ = entries.size() ? entries.size() : 1;
+        pending_ = 0;
+        watermark_ = 0;
+    }
 
     /** @brief Touch one incarnation; typed outcome; pins on new/refreshed. */
     EffectiveUseStatus touch(EffectiveUseReceipt receipt) noexcept;
@@ -79,14 +101,8 @@ public:
     /** @return Admitted membership capacity. */
     std::size_t capacity() const noexcept { return capacity_; }
 private:
-    struct Entry
-    {
-        EffectiveUseReceipt receipt;
-        bool pinned = false;
-        bool live = false;
-    };
-    std::size_t capacity_;
     Entry *entries_ = nullptr;
+    std::size_t capacity_;
     std::size_t pending_ = 0;
     std::uint64_t watermark_ = 0;
 };
