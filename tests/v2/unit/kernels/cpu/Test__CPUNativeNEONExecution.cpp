@@ -5,7 +5,8 @@
  * Small canonical byte fixtures are copied once into the real prepared-owner
  * backing before invocation. No tensor preparer is substituted in production.
  * Tests cover the owner/entrypoint/workspace ABI, not full graph, slot/migration,
- * model-serving or performance certification. Serial M1 calls are test oracles.
+ * model-serving or performance certification. Serial M1 calls are test oracles;
+ * the GPU-aligned NaN-order case also checks an analytic earlier-NaN oracle.
  */
 #include "kernels/cpu/gemm/CPUNativeQuantisedGemv.h"
 #include "kernels/cpu/gemm/CPUQ8ResidualCorrection.h"
@@ -485,6 +486,121 @@ TEST_F(CPUNativeNEONExecution, FusedPrefillMembersStreamPanelsAndRetainSerialByt
                         packed[0].blocks_per_row));
                     check();
                 }
+}
+
+/**
+ * @test GPU-aligned experts of every source keep the earlier of two NaN payloads, serial and fused.
+ *
+ * The GPU-aligned contract adds each block contribution to the running K sum,
+ * and each later partition to the earlier partitions' total, with the earlier
+ * value first, so of two NaNs the earlier payload wins (the CPU contract, as on
+ * x86; device NaN payloads are not part of it). A plain vaddq_f32 leaves that operand order to the compiler: GCC 14
+ * swapped it in the IQ4_XS block accumulation under armv8-a+simd+dotprod, so
+ * serial decode published the later NaN and grouped rows another one.
+ * Rows r % 3 == 1 carry differently signed, different-payload NaN activation
+ * scales in blocks 1 and K - 2 (different partitions); rows r % 3 == 2 in
+ * blocks width and width + 1 (one partition when it holds two or more blocks,
+ * adjacent one-block partitions otherwise). K of 9 and 16 blocks gives
+ * one-block partitions, 17 and 40 multi-block ones with empty trailing
+ * partitions. Every NaN row must publish the analytic earlier NaN in every
+ * live lane (an oracle independent of any CPU program), through serial M=1
+ * decode and through the fused batched entry on every compiled ISA path,
+ * standalone and inside a retained team, and every fused row must equal
+ * serial bytes. Weights and other scales are
+ * finite; competing nonfinite factors inside one block are outside this
+ * contract.
+ */
+TEST_F(CPUNativeNEONExecution, GPUAlignedOrderedNaNsKeepEarlierBlockAndPartitionAllFormats)
+{
+    const Budget budget;
+    constexpr auto policy = CPUProjectionNumericalPolicy::GPUAlignedExpert;
+    constexpr std::array<int, 6> member_rows{2, 1, 5, 17, 3, 4};
+    constexpr int members = static_cast<int>(member_rows.size());
+    for (const auto &source : native_quantised_formats::kAllSourceFormats)
+        for (const int blocks : {9, 16, 17, 40})
+            for (const int workers : {1, 3})
+            {
+                SCOPED_TRACE(::testing::Message() << source.quant_type << " blocks=" << blocks << " workers=" << workers);
+                const int width = (blocks - 1) / MoEProjectionNumericalContract::ordered_k_partitions + 1;
+                std::array<CPUNativeQuantisedPackedWeights, members> packed;
+                std::array<std::vector<Q8_1Block>, members> input;
+                std::array<std::vector<float>, members> actual, expected;
+                std::array<std::vector<std::uint32_t>, members> earlier;
+                std::array<FusedVerifierRowsDesc, members> descriptors;
+                for (int p = 0; p < members; ++p)
+                {
+                    packed[p] = owner(*source.metadata, 67, blocks * 32, policy);
+                    const int m = member_rows[p], stride = packed[p].N + 3;
+                    input[p] = q8Rows(m, blocks, 41 * p + blocks);
+                    earlier[p].assign(m, 0);
+                    for (int row = 0; row < m; ++row)
+                    {
+                        const auto nan = [&](int block, std::uint16_t half) { input[p][std::size_t(row) * blocks + block].d = half; };
+                        std::uint16_t first = 0;
+                        if (row % 3 == 1)
+                        {
+                            first = std::uint16_t(0x7E00u | (1u + row));
+                            nan(1, first);
+                            nan(blocks - 2, std::uint16_t(0xFE00u | (0x1F0u - row)));
+                        }
+                        else if (row % 3 == 2)
+                        {
+                            first = std::uint16_t(0xFE00u | (3u + row));
+                            nan(width, first);
+                            nan(width + 1, std::uint16_t(0x7E00u | (0x1E0u - row)));
+                        }
+                        if (first) earlier[p][row] = std::bit_cast<std::uint32_t>(nativeQuantisedFP16ScaleToFP32(first));
+                    }
+                    expected[p].assign(std::size_t(m - 1) * stride + packed[p].N + 4, 123456.0f);
+                    serial(packed[p], input[p], expected[p], m, stride, m);
+                    actual[p].assign(expected[p].size(), 123456.0f);
+                    descriptors[p] = {.packed = &packed[p], .output = actual[p].data(), .N = packed[p].N, .ldc = stride,
+                        .rows = m, .input = input[p].data(), .purpose = ProjectionRowsPurpose::Prefill};
+                }
+                const auto oracle = [&](const char *mode, const std::array<std::vector<float>, members> &banks) {
+                    for (int p = 0; p < members; ++p)
+                        for (int row = 0; row < member_rows[p]; ++row)
+                            if (earlier[p][row])
+                                for (int n = 0; n < packed[p].N; ++n)
+                                {
+                                    const auto got = std::bit_cast<std::uint32_t>(banks[p][std::size_t(row) * (packed[p].N + 3) + n]);
+                                    ASSERT_EQ(got, earlier[p][row]) << mode << " member=" << p << " rows=" << member_rows[p]
+                                        << " row=" << row << " column=" << n << std::hex << " got=0x" << got
+                                        << " earlier=0x" << earlier[p][row];
+                                }
+                };
+                oracle("serial", expected);
+                // The test's Budget restores the caller's team width and dynamic policy on exit.
+                omp_set_num_threads(workers);
+                const auto plan = planNativeQuantisedFusedRows(descriptors, 1, workers);
+                AlignedVector<float> slab;
+                slab.resize_uninitialized(std::max<std::size_t>(plan.sharedPartialFloats(), 1));
+                const std::span<float> exact(slab.data(), plan.sharedPartialFloats());
+                const auto run = [&](const char *mode, ISAPath path) {
+                    for (auto &bank : actual) std::fill(bank.begin(), bank.end(), 123456.0f);
+                    ASSERT_TRUE(gemm_native_quantised_fused_verifier_rows_preq(nullptr, descriptors.data(), exact,
+                        members, 1, blocks, path));
+                    oracle(mode, actual);
+                    for (int p = 0; p < members; ++p) bytes(actual[p], expected[p]);
+                };
+                run("fused auto", ISAPath::AUTO);
+                run("fused neon", ISAPath::NEON);
+#if defined(__ARM_FEATURE_DOTPROD)
+                run("fused dotprod", ISAPath::NEON_DOTPROD);
+#endif
+#if LLAMINAR_COMPILED_WITH_NEON_I8MM
+                run("fused i8mm", ISAPath::NEON_I8MM);
+#endif
+                // A retained team indexes the same work by its member ids.
+                for (auto &bank : actual) std::fill(bank.begin(), bank.end(), 123456.0f);
+#pragma omp parallel
+                {
+                    (void)gemm_native_quantised_fused_verifier_rows_preq(nullptr, descriptors.data(), exact, members, 1,
+                        blocks);
+                }
+                oracle("fused retained", actual);
+                for (int p = 0; p < members; ++p) bytes(actual[p], expected[p]);
+            }
 }
 
 /** @test FP32 publication/BLAS and paired-Q8 operation use real owner bindings for every format. */

@@ -36,6 +36,23 @@ namespace llaminar2::cpu::native_quantised
 
     class CPUNativeNEONProjectionBatch;
 
+    /**
+     * @brief Running-sum addition of one numerical policy.
+     * @tparam Policy GPU-aligned experts add with addOrderedNEON() (earlier NaN wins);
+     *         backend-native programs keep their unchanged plain addition.
+     * @param earlier Running sum of the earlier blocks or partitions.
+     * @param later This block's contribution or this partition's partial.
+     * @return earlier + later with one rounding.
+     */
+    template <CPUProjectionNumericalPolicy Policy>
+    [[gnu::always_inline]] inline float32x4_t foldNEON(float32x4_t earlier, float32x4_t later) noexcept
+    {
+        if constexpr (Policy == CPUProjectionNumericalPolicy::GPUAlignedExpert)
+            return addOrderedNEON(earlier, later);
+        else
+            return vaddq_f32(earlier, later);
+    }
+
     /** @brief Closed synchronous binding for up to four independently accumulated rows.
      * @tparam Rows Physical row tile in [1,4], independent of logical request depth.
      */
@@ -198,9 +215,15 @@ namespace llaminar2::cpu::native_quantised
          * @tparam WithMinimum Whether the program applies an additive minimum.
          * @return For the single-row SDOT leaf (DotProd, and the I8MM family's
          * lone row): four for signed Q8, whose native byte payload needs no
-         * inline decode, and two for the remaining formats. Wider panels are
-         * profitable only when their live vectors fit the register budget.
-         * Entries were measured in the GB10 panel tournament.
+         * inline decode; one (the strip walk) for native Q5 and IQ4_XS; two for
+         * the remaining formats. Wider panels are profitable only when their
+         * live vectors fit the register budget: the native Q5 fifth-bit decode
+         * and the IQ4_XS non-linear table plus its source-scale reconstruction
+         * keep too many vectors live for two strips, so GCC 14 spilled the
+         * panel's partition totals (a decode program must not spill). The strip
+         * walk evaluates the same per-column decode, INT32 group order, FP32
+         * block program and partition tree, so the bytes are unchanged. The
+         * remaining entries were measured in the GB10 panel tournament.
          */
         template <typename Ops, Encoding Physical, bool WithMinimum = false> static constexpr int panelStrips() noexcept
         {
@@ -208,6 +231,9 @@ namespace llaminar2::cpu::native_quantised
             else if constexpr (Rows != 1 || Ops::instruction == multi_scale::NEONByteDot::ASIMD) return 1;
             else if constexpr (Physical == Encoding::SignedInt8SingleScale)
                 return 4;
+            else if constexpr (Physical == Encoding::Q5NativeSingleScale || Physical == Encoding::NibbleLUTSourceScale ||
+                               Physical == Encoding::Q4KSuperblockCoded)
+                return 1;
             else return 2;
         }
 
@@ -1171,7 +1197,7 @@ namespace llaminar2::cpu::native_quantised
 #pragma GCC unroll 4
                         for (int strip = 0; strip < S; ++strip)
                             reduced[row][strip] = !ordered || partition == 0 ? partial[row][strip]
-                                                                             : vaddq_f32(reduced[row][strip], partial[row][strip]);
+                                                                             : addOrderedNEON(reduced[row][strip], partial[row][strip]);
                 }
 #pragma GCC unroll 4
                 for (int strip = 0; strip < S; ++strip)
@@ -1492,7 +1518,7 @@ namespace llaminar2::cpu::native_quantised
                                     const F term0 = scale0 * __builtin_convertvector(low[row], F);
                                     const F term1 = scale1 * __builtin_convertvector(high[row], F);
                                     const F contribution = std::bit_cast<F>(vdupq_n_f32(activation_scale)) * (term0 + term1);
-                                    accumulator[row] = vaddq_f32(accumulator[row], std::bit_cast<float32x4_t>(contribution));
+                                    accumulator[row] = foldNEON<Policy>(accumulator[row], std::bit_cast<float32x4_t>(contribution));
                                 }
                                 else if constexpr (WithMinimum)
                                     accumulator[row] = accumulateCorrectedSingleScaleBlockNEON(accumulator[row],
@@ -1506,7 +1532,7 @@ namespace llaminar2::cpu::native_quantised
 #pragma GCC unroll 4
                         for (std::size_t row = 0; row < Rows; ++row)
                             reduced[row] = (!ordered && Coded != 0) || partition == 0
-                                ? accumulator[row] : vaddq_f32(reduced[row], accumulator[row]);
+                                ? accumulator[row] : foldNEON<Policy>(reduced[row], accumulator[row]);
                     }
 #pragma GCC unroll 4
                     for (std::size_t row = 0; row < Rows; ++row)
@@ -1708,7 +1734,7 @@ namespace llaminar2::cpu::native_quantised
                                 const F term0 = scale0 * __builtin_convertvector(low[row][strip], F);
                                 const F term1 = scale1 * __builtin_convertvector(high[row][strip], F);
                                 const F contribution = std::bit_cast<F>(vdupq_n_f32(activation_scale[row])) * (term0 + term1);
-                                partial = vaddq_f32(partial, std::bit_cast<float32x4_t>(contribution));
+                                partial = foldNEON<Policy>(partial, std::bit_cast<float32x4_t>(contribution));
                             }
                             else if constexpr (WithMinimum)
                                 partial = accumulateCorrectedSingleScaleBlockNEON(partial,
@@ -1727,7 +1753,7 @@ namespace llaminar2::cpu::native_quantised
 #pragma GCC unroll 4
                     for (int strip = 0; strip < S; ++strip)
                         reduced[row][strip] = partition == 0 ? accumulator[row][strip]
-                                                             : vaddq_f32(reduced[row][strip], accumulator[row][strip]);
+                                                             : foldNEON<Policy>(reduced[row][strip], accumulator[row][strip]);
             }
 #pragma GCC unroll 4
             for (int strip = 0; strip < S; ++strip)

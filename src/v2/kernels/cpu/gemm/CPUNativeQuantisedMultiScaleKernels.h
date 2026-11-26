@@ -1009,11 +1009,12 @@ namespace llaminar2::cpu::native_quantised::multi_scale
      * @param blocks_per_partition Exact K-block span; unused for Contiguous.
      * @param columns Live output span in this chunk; padded x86 callers retain 64.
      * @throws std::invalid_argument For invalid chunk, K, output or partition geometry.
-     * @tparam OrderedNaN x86 GPU-aligned program: every per-block accumulation
-     *         (accumulateBlockOrdered()) and every partition fold
-     *         (accumulateOrdered()) has a fixed VADDPS operand order, so of two NaNs
-     *         the earlier one wins. False keeps the plain `+` program (all
-     *         backend-native rows, and every non-x86 build) unchanged.
+     * @tparam OrderedNaN GPU-aligned program: every per-block accumulation
+     *         and every partition fold has a fixed operand order (x86
+     *         accumulateBlockOrdered()/accumulateOrdered() VADDPS, AArch64
+     *         addOrderedNEON() FADD), so of two NaNs the earlier one wins.
+     *         False keeps the plain `+` program (all backend-native rows)
+     *         unchanged.
      */
     template <bool OrderedNaN, int Codebook, int Lanes, size_t Rows, Reduction Tree, typename Packed, typename Ops>
     LLAMINAR_MULTISCALE_EXACT inline void rowsProgram(const Packed &packed,
@@ -1260,6 +1261,11 @@ namespace llaminar2::cpu::native_quantised::multi_scale
                             if constexpr (OrderedNaN)
                                 acc[row] = accumulateBlockOrdered<Lanes>(acc[row], contribution);
                             else
+#elif defined(__aarch64__) && defined(__ARM_NEON)
+                            if constexpr (OrderedNaN)
+                                acc[row] = std::bit_cast<F>(addOrderedNEON(std::bit_cast<float32x4_t>(acc[row]),
+                                                                           std::bit_cast<float32x4_t>(contribution)));
+                            else
 #endif
                                 acc[row] += contribution;
                             continue;
@@ -1296,6 +1302,11 @@ namespace llaminar2::cpu::native_quantised::multi_scale
                         if constexpr (OrderedNaN)
                             acc[row] = accumulateBlockOrdered<Lanes>(acc[row], contribution);
                         else
+#elif defined(__aarch64__) && defined(__ARM_NEON)
+                        if constexpr (OrderedNaN)
+                            acc[row] = std::bit_cast<F>(addOrderedNEON(std::bit_cast<float32x4_t>(acc[row]),
+                                                                       std::bit_cast<float32x4_t>(contribution)));
+                        else
 #endif
                             acc[row] += contribution;
                     }
@@ -1320,6 +1331,12 @@ namespace llaminar2::cpu::native_quantised::multi_scale
                             else
                                 reduced[row] = partition == 0 ? acc[row] : accumulateOrdered<Lanes>(reduced[row], acc[row]);
                         }
+                        else
+#elif defined(__aarch64__) && defined(__ARM_NEON)
+                        if constexpr (OrderedNaN)
+                            reduced[row] = partition == 0 ? acc[row]
+                                : std::bit_cast<F>(addOrderedNEON(std::bit_cast<float32x4_t>(reduced[row]),
+                                                                  std::bit_cast<float32x4_t>(acc[row])));
                         else
 #endif
                             reduced[row] = partition == 0 ? acc[row] : reduced[row] + acc[row];
@@ -1346,9 +1363,10 @@ namespace llaminar2::cpu::native_quantised::multi_scale
      * fixed VADDPS operand order (accumulateBlockOrdered(), accumulateOrdered()), for both the
      * contiguous and the ordered tree, so the earlier block's or partition's
      * NaN wins wherever the program is inlined: serial decode, row tiles and
-     * the fused batched entry then publish the same NaN. Backend-native
-     * matrices (and non-x86 builds) keep the unchanged plain `+` program;
-     * finite results of both programs are identical.
+     * the fused batched entry then publish the same NaN. AArch64 GPU-aligned
+     * matrices take the same program with addOrderedNEON(). Backend-native
+     * matrices keep the unchanged plain `+` program; finite results of both
+     * programs are identical.
      */
     template <int Codebook, int Lanes, size_t Rows, Reduction Tree = Reduction::Contiguous,
               typename Packed, typename Ops = SIMD<Lanes>>
@@ -1356,7 +1374,7 @@ namespace llaminar2::cpu::native_quantised::multi_scale
                      const std::array<float *, Rows> &output, int chunk, int begin, int end, bool accumulate,
                      int partitions = 1, int blocks_per_partition = 0, int columns = 64)
     {
-#if defined(__AVX2__)
+#if defined(__AVX2__) || (defined(__aarch64__) && defined(__ARM_NEON))
         if (packed.numerical_policy == CPUProjectionNumericalPolicy::GPUAlignedExpert)
             return rowsProgram<true, Codebook, Lanes, Rows, Tree, Packed, Ops>(
                 packed, activation, output, chunk, begin, end, accumulate, partitions, blocks_per_partition, columns);

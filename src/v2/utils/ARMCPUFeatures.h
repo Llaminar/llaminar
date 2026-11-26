@@ -271,8 +271,14 @@ namespace llaminar2::cpu
      * replace NaNs under these controls, so a kernel that uses them produces
      * its contract bytes only under this profile. DN = 1 would replace every
      * NaN result (including a widening of a NaN half) by the positive default
-     * NaN, losing the sign and payload the software codecs preserve. The admission is per thread because FPCR is per thread; it never
-     * changes FPCR (silently overwriting a caller's mode is forbidden).
+     * NaN, losing the sign and payload the software codecs preserve. The
+     * FEAT_AFP controls must also be clear: FIZ = 1 flushes subnormal inputs,
+     * AH = 1 selects the alternative handling (other NaN propagation and
+     * flush rules for FADD, FMLA and the conversions), and NEP = 1 changes
+     * what scalar SIMD&FP instructions write to the rest of the vector
+     * register. On a CPU without FEAT_AFP these bits read as zero. The
+     * admission is per thread because FPCR is per thread; it never changes
+     * FPCR (silently overwriting a caller's mode is forbidden).
      */
     struct ARMFloatingPointProfile
     {
@@ -281,10 +287,15 @@ namespace llaminar2::cpu
         static constexpr std::uint64_t kFZ16 = 0x1ull << 19;      ///< Binary16 flush to zero.
         static constexpr std::uint64_t kAHP = 0x1ull << 26;       ///< Alternative half-precision format.
         static constexpr std::uint64_t kDN = 0x1ull << 25;        ///< Default-NaN mode.
+        static constexpr std::uint64_t kFIZ = 0x1ull << 0;        ///< FEAT_AFP flush inputs to zero.
+        static constexpr std::uint64_t kAH = 0x1ull << 1;         ///< FEAT_AFP alternate floating-point handling.
+        static constexpr std::uint64_t kNEP = 0x1ull << 2;        ///< FEAT_AFP scalar results preserve upper lanes.
+        /** Every control the admitted profile requires clear. */
+        static constexpr std::uint64_t kControls = kRModeMask | kFZ | kFZ16 | kAHP | kDN | kFIZ | kAH | kNEP;
 
-        /** @return Whether @p fpcr carries the admitted rounding, flush, NaN and half-format controls. */
+        /** @return Whether @p fpcr carries the admitted rounding, flush, NaN, half-format and AFP controls. */
         [[nodiscard]] static constexpr bool admitted(std::uint64_t fpcr) noexcept
-        { return (fpcr & (kRModeMask | kFZ | kFZ16 | kAHP | kDN)) == 0; }
+        { return (fpcr & kControls) == 0; }
 
         /**
          * @return The calling thread's FPCR.
@@ -318,7 +329,8 @@ namespace llaminar2::cpu
         /** @brief Fatal diagnostic naming the entry and the observed FPCR. */
         [[noreturn, gnu::cold, gnu::noinline]] static void reject(const char *consumer, std::uint64_t fpcr) noexcept
         {
-            std::fprintf(stderr, "ERROR: %s requires the process FP profile FPCR.RMode=RNE, FZ=0, FZ16=0, AHP=0, DN=0; "
+            std::fprintf(stderr, "ERROR: %s requires the process FP profile FPCR.RMode=RNE, FZ=0, FZ16=0, AHP=0, DN=0, "
+                                 "FIZ=0, AH=0, NEP=0; "
                                  "observed FPCR=0x%llx\n", consumer, static_cast<unsigned long long>(fpcr));
             std::abort();
         }

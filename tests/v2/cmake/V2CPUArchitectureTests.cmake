@@ -419,6 +419,17 @@ foreach(v2_tile_register_shard IN ITEMS analysis binding-0 binding-1 binding-2 b
             --shard "${v2_tile_register_shard}"
         LABELS V2 Integration ProductionTestPreflight CPU DeviceFree ISA Build Regression)
 endforeach()
+# The stack-traffic table, key map, role map, gate and driver-receipt controls (compiler-free, a few seconds).
+foreach(scope IN ITEMS Unit Integration)
+    set(labels V2 ${scope} CPU DeviceFree ISA Build Regression)
+    if(scope STREQUAL "Integration")
+        list(APPEND labels ProductionTestPreflight)
+    endif()
+    v2_add_core_free_test(V2_${scope}_CPUNativeTileStackTable
+        COMMAND "${Python3_EXECUTABLE}" -B
+            "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/cmake/test_cpu_native_tile_stack_table.py"
+        LABELS ${labels})
+endforeach()
 v2_add_core_free_test(V2_Integration_CPUCodegenFailedRebuildInvalidation
     COMMAND "${Python3_EXECUTABLE}" -B
         "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/cmake/test_cpu_codegen_envelope.py"
@@ -563,6 +574,13 @@ if(LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
     set(V2_CPU_TILE_REGISTER_SOURCE "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/portability/CPUNativeNEONTileRegisterProbe.cpp")
     set(V2_CPU_TILE_REGISTER_CHECKER "${CMAKE_CURRENT_LIST_DIR}/CPUNativeTileRegisterEvidence.py")
     set(V2_CPU_TILE_REGISTER_BUDGET "${CMAKE_CURRENT_LIST_DIR}/CPUNativeTileRegisterBudget.json")
+    # Gate7 stack-traffic gate (no new hot stack traffic against develop's own path): runs in the same build
+    # command and CTest as the proof, after the checker's verify, against the committed develop table.
+    set(V2_CPU_TILE_STACK_GATE "${CMAKE_CURRENT_LIST_DIR}/CPUNativeTileStackGate.py")
+    set(V2_CPU_TILE_STACK_INPUTS "${V2_CPU_TILE_STACK_GATE}"
+        "${CMAKE_CURRENT_LIST_DIR}/CPUNativeTileStackTable.py" "${CMAKE_CURRENT_LIST_DIR}/CPUNativeTileStackBaseline.py"
+        "${CMAKE_CURRENT_LIST_DIR}/CPUNativeTileStackTable.json" "${CMAKE_CURRENT_LIST_DIR}/CPUNativeTileStackRoles.json"
+        "${CMAKE_CURRENT_LIST_DIR}/CPUNativeTileStackKeyMap.json")
     set(V2_CPU_TILE_REGISTER_PROOF "${CMAKE_CURRENT_BINARY_DIR}/cpu_native_tile_registers/proof.json")
     string(REGEX MATCH "^[0-9]+" V2_CPU_TILE_REGISTER_MAJOR "${CMAKE_CXX_COMPILER_VERSION}")
     set(V2_CPU_TILE_REGISTER_IDENTITY "${CMAKE_CXX_COMPILER_ID}-${V2_CPU_TILE_REGISTER_MAJOR}")
@@ -572,6 +590,13 @@ if(LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
         "--signature=${V2_CPU_CODEGEN_SIGNATURE}" "--proof=${V2_CPU_TILE_REGISTER_PROOF}"
         "--identity=${V2_CPU_TILE_REGISTER_IDENTITY}" "--mode=${LLAMINAR_CPU_ISA_UPPER}"
         "--disassembler=${CMAKE_OBJDUMP}")
+    # One driver runs proof -> stack gate -> fused witness, every stage with its receipt even after an earlier
+    # failure, and fails when any stage failed: the build step and both CTests run exactly this driver.
+    set(V2_CPU_TILE_PROOF_DRIVER "${CMAKE_CURRENT_LIST_DIR}/CPUNativeTileProofDriver.py")
+    set(V2_CPU_TILE_PROOF_DRIVER_ARGS "--proof=${V2_CPU_TILE_REGISTER_PROOF}" "--mode=${LLAMINAR_CPU_ISA_UPPER}"
+        "--baseline=${CMAKE_CURRENT_LIST_DIR}/CPUNativeTileStackTable.json"
+        "--roles=${CMAKE_CURRENT_LIST_DIR}/CPUNativeTileStackRoles.json"
+        "--keymap=${CMAKE_CURRENT_LIST_DIR}/CPUNativeTileStackKeyMap.json")
     # Ninja depfile targets are relative to the current binary directory under
     # CMP0116 NEW and to the top binary directory otherwise.
     cmake_policy(GET CMP0116 V2_CPU_TILE_REGISTER_DEPFILE_POLICY)
@@ -587,27 +612,75 @@ if(LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
     add_custom_command(OUTPUT "${V2_CPU_TILE_REGISTER_PROOF}" ${V2_CPU_TILE_REGISTER_ARTIFACTS}
         BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/cpu_native_tile_registers/proof.deps"
             "${CMAKE_CURRENT_BINARY_DIR}/cpu_native_tile_registers/proof.pre.deps"
-        COMMAND "${Python3_EXECUTABLE}" "${V2_CPU_TILE_REGISTER_CHECKER}" build ${V2_CPU_TILE_REGISTER_ARGS}
-            "--depfile-target=${V2_CPU_TILE_REGISTER_DEPFILE_TARGET}"
+            "${CMAKE_CURRENT_BINARY_DIR}/cpu_native_tile_registers/proof.asm"
+            "${CMAKE_CURRENT_BINARY_DIR}/cpu_native_tile_registers/stack-gate.json"
+            "${CMAKE_CURRENT_BINARY_DIR}/cpu_native_tile_registers/fused-stage.json"
+            "${CMAKE_CURRENT_BINARY_DIR}/cpu_native_tile_registers/driver.json"
+            "${CMAKE_CURRENT_BINARY_DIR}/cpu_native_tile_registers/proof.analysis.json"
+            "${CMAKE_CURRENT_BINARY_DIR}/cpu_native_tile_registers/stage-proof.log"
+            "${CMAKE_CURRENT_BINARY_DIR}/cpu_native_tile_registers/stage-stack_gate.log"
+            "${CMAKE_CURRENT_BINARY_DIR}/cpu_native_tile_registers/stage-fused.log"
+        COMMAND "${Python3_EXECUTABLE}" "${V2_CPU_TILE_PROOF_DRIVER}" build ${V2_CPU_TILE_PROOF_DRIVER_ARGS}
+            -- ${V2_CPU_TILE_REGISTER_ARGS} "--depfile-target=${V2_CPU_TILE_REGISTER_DEPFILE_TARGET}"
         DEPENDS "${V2_CPU_TILE_REGISTER_SOURCE}" "${V2_CPU_TILE_REGISTER_CHECKER}" "${V2_CPU_CODEGEN_CHECKER}"
-            "${V2_CPU_TILE_REGISTER_BUDGET}" "${CMAKE_CXX_COMPILER}" "${V2_CPU_CODEGEN_DATABASE}" "${CMAKE_OBJDUMP}"
+            "${V2_CPU_TILE_PROOF_DRIVER}"
+            ${V2_CPU_TILE_STACK_INPUTS}
+            "${V2_CPU_TILE_REGISTER_BUDGET}" "${CMAKE_CURRENT_LIST_DIR}/CPUNativeTileOrderedAddSites.json"
+            "${CMAKE_CURRENT_LIST_DIR}/CPUNativeTileChainCounts.json"
+            "${CMAKE_CURRENT_LIST_DIR}/CPUNativeTileBoundedMemcpy.json"
+            "${CMAKE_CXX_COMPILER}" "${V2_CPU_CODEGEN_DATABASE}" "${CMAKE_OBJDUMP}"
         DEPFILE "${CMAKE_CURRENT_BINARY_DIR}/cpu_native_tile_registers/proof.d"
         VERBATIM)
     add_custom_target(v2_cpu_native_tile_register_proof
         DEPENDS "${V2_CPU_TILE_REGISTER_PROOF}" ${V2_CPU_TILE_REGISTER_ARTIFACTS})
     add_dependencies(v2_unit_cpu_isa_profile v2_cpu_native_tile_register_proof)
-    foreach(scope IN ITEMS Unit Integration)
-        set(labels V2 ${scope} CPU ARM DeviceFree ISA Build Regression)
-        if(scope STREQUAL "Integration")
-            list(APPEND labels ProductionTestPreflight)
+    # The driver: one verified analysis of the bound proof, then the stack gate and the fused witness (all stages
+    # always run). A 10-40 s proof analysis is not a fast Unit test: it is registered once, as an Integration
+    # ProductionTestPreflight test (ARM label: the ARM64 PR gate builds its proof target and runs it). The
+    # proof target itself stays a build dependency of the Unit ISA profile (above) and of both gates, and the
+    # checker's own fast controls stay sharded Unit tests.
+    v2_add_core_free_test(V2_Integration_CPUNativeNEONTileRegisters
+        COMMAND "${Python3_EXECUTABLE}" "${V2_CPU_TILE_PROOF_DRIVER}" verify ${V2_CPU_TILE_PROOF_DRIVER_ARGS}
+            -- ${V2_CPU_TILE_REGISTER_ARGS}
+        LABELS V2 Integration ProductionTestPreflight CPU ARM DeviceFree ISA Build Regression
+        # The analysis runs one worker per admitted physical core: the test occupies the whole team's slots.
+        WHOLE_TEAM)
+    set_property(GLOBAL APPEND PROPERTY
+        V2_TEST_BUILD_TARGETS_V2_Integration_CPUNativeNEONTileRegisters
+        v2_cpu_native_tile_register_proof)
+    # Configure-time regression of that selection (RC-1): after the directory's gate finalization (a deferred
+    # call re-deferred to run after it), the proof driver must be the Integration test only, labelled ARM64PR on
+    # the ARM64 PR configuration, with its proof target a dependency of the ARM64 PR and preflight gates.
+    function(v2_check_tile_proof_gate_selection)
+        if(NOT TEST V2_Integration_CPUNativeNEONTileRegisters)
+            if(V2_PERF_TESTS_ONLY OR NOT COMMAND v2_finalize_test_gates)
+                return()
+            endif()
+            message(FATAL_ERROR "the native NEON tile proof driver test is not registered")
         endif()
-        v2_add_core_free_test(V2_${scope}_CPUNativeNEONTileRegisters
-            COMMAND "${Python3_EXECUTABLE}" "${V2_CPU_TILE_REGISTER_CHECKER}" verify ${V2_CPU_TILE_REGISTER_ARGS}
-            LABELS ${labels})
-        set_property(GLOBAL APPEND PROPERTY
-            V2_TEST_BUILD_TARGETS_V2_${scope}_CPUNativeNEONTileRegisters
-            v2_cpu_native_tile_register_proof)
-    endforeach()
+        if(TEST V2_Unit_CPUNativeNEONTileRegisters)
+            message(FATAL_ERROR "the heavy native NEON tile proof must not be a Unit test")
+        endif()
+        # The gates are add_custom_target(DEPENDS) of the build targets their finalization collects from each
+        # selected test's V2_TEST_BUILD_TARGETS_<test> (custom-target DEPENDS expose no queryable property): the
+        # proof target must be that property, the test must carry the preflight label (preflight gate) and, on
+        # the ARM64 PR configuration, the ARM64PR label its finalization adds exactly when it collects them.
+        get_property(build_targets GLOBAL PROPERTY V2_TEST_BUILD_TARGETS_V2_Integration_CPUNativeNEONTileRegisters)
+        if(NOT "v2_cpu_native_tile_register_proof" IN_LIST build_targets)
+            message(FATAL_ERROR "the native NEON tile proof driver test does not own the proof target build")
+        endif()
+        get_property(labels TEST V2_Integration_CPUNativeNEONTileRegisters PROPERTY LABELS)
+        if(NOT "ProductionTestPreflight" IN_LIST labels OR NOT "ARM" IN_LIST labels)
+            message(FATAL_ERROR "the native NEON tile proof driver test is not an ARM preflight test")
+        endif()
+        if(TARGET v2_arm64_pr_gate AND NOT "ARM64PR" IN_LIST labels)
+            message(FATAL_ERROR "the ARM64 PR gate does not run the native NEON tile proof driver")
+        endif()
+    endfunction()
+    function(v2_defer_tile_proof_gate_selection)
+        cmake_language(DEFER CALL v2_check_tile_proof_gate_selection)
+    endfunction()
+    cmake_language(DEFER CALL v2_defer_tile_proof_gate_selection)
     foreach(scope IN ITEMS Unit Integration)
         set(labels V2 ${scope} CPU ARM DeviceFree ISA Build Regression)
         if(scope STREQUAL "Integration")

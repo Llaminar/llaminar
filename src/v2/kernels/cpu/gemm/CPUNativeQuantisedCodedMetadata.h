@@ -339,8 +339,16 @@ namespace llaminar2::cpu::native_quantised::coded_metadata
         F dmin;
     };
 
-    /** @return Q4_K's original d and dmin, widened exactly for one lane vector. */
+    /** @return Q4_K's original d and dmin, widened exactly for one lane vector.
+     * @details Always inlined on AArch64: the native NEON tile register witness
+     * admits no call inside a tile program, and GCC 14's translation-unit
+     * inlining budget otherwise left this helper out of line in the
+     * backend-native Q4_K tiles once the GPU-aligned programs grew.
+     */
     template <typename Ops>
+#if defined(__aarch64__)
+    [[gnu::always_inline]]
+#endif
     inline Q4KBaseFactors<typename Ops::F> q4KBase(typename Ops::I word)
     {
         using L = Lanes<Ops>;

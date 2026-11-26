@@ -972,7 +972,7 @@ template <typename Body> void underFpcrProfile(std::uint64_t profile, Body &&bod
 {
     using P = cpu::ARMFloatingPointProfile;
     const auto saved = readFpcr();
-    writeFpcr((saved & ~(P::kRModeMask | P::kFZ | P::kFZ16 | P::kAHP | P::kDN)) | profile);
+    writeFpcr((saved & ~P::kControls) | profile);
     body();
     writeFpcr(saved);
 }
@@ -1014,15 +1014,21 @@ struct Q4KEntryWorkload
 };
 } // namespace
 
-/** @test The shared profile predicate admits exactly RNE with FZ, FZ16, AHP and DN clear. */
+/**
+ * @test The shared profile predicate admits exactly RNE with FZ, FZ16, AHP, DN and the FEAT_AFP controls
+ * (FIZ, AH, NEP) clear. AH changes NaN propagation of FADD and FMLA, which the GPU-aligned earlier-NaN
+ * contract depends on; CPUs without FEAT_AFP read these bits as zero, so the predicate is the witness there.
+ */
 TEST(CPUNativeNEONFloatingPointProfile, AdmitsOnlyTheContractProfile)
 {
     using P = cpu::ARMFloatingPointProfile;
     EXPECT_TRUE(P::admitted(0));
     EXPECT_TRUE(P::admitted(1ull << 21)); // FPCR.IDE, an exception-trap enable outside the numeric controls.
     for (const std::uint64_t foreign :
-         std::initializer_list<std::uint64_t>{1ull << 22, 2ull << 22, 3ull << 22, P::kFZ, P::kFZ16, P::kAHP, P::kDN})
+         std::initializer_list<std::uint64_t>{1ull << 22, 2ull << 22, 3ull << 22, P::kFZ, P::kFZ16, P::kAHP, P::kDN,
+             P::kFIZ, P::kAH, P::kNEP})
         EXPECT_FALSE(P::admitted(foreign)) << std::hex << foreign;
+    EXPECT_EQ(P::kControls, (3ull << 22) | (1ull << 24) | (1ull << 19) | (1ull << 26) | (1ull << 25) | 0x7ull);
     EXPECT_TRUE(P::admitted(readFpcr())) << "the test process must start in the contract profile";
 }
 

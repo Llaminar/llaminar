@@ -36,6 +36,35 @@ namespace llaminar2::cpu::native_quantised
     }
 
     /**
+     * @brief Add a later FP32 vector to the earlier accumulator with a fixed FADD operand order.
+     * @param earlier Running sum of the earlier blocks or partitions (FADD first source and destination).
+     * @param later This block's contribution or this partition's partial (FADD second source).
+     * @return earlier + later with one rounding; of two NaNs, @p earlier's payload.
+     *
+     * The CPU GPU-aligned expert contract lets the earlier NaN payload win,
+     * as the x86 addOrderedAVX2()/addOrderedAVX512() do (a CPU-side contract
+     * for all 22 source formats; it claims nothing about device NaN payloads,
+     * which CUDA generally canonicalizes): AArch64 FADD
+     * returns its first source's payload when both sources are NaNs (a
+     * signalling NaN first, quieted). `vaddq_f32(a, b)` is commutative to the
+     * compiler, which may emit `fadd d, b, a`, so the instruction is written
+     * literally, in place: the destination is tied to @p earlier and is the
+     * first source, so no temporary register is needed. Not volatile, no
+     * memory operand, no clobber: the compiler still schedules and allocates
+     * it like the plain addition. This is the only non-empty inline-assembly
+     * template the native NEON tile register witness admits
+     * (CPUNativeTileRegisterEvidence.py: ordered_add_definition() and
+     * ordered_add_evidence()), and only
+     * in exactly this form; the witness also checks every emitted instance in
+     * the object. Backend-native programs keep their plain additions.
+     */
+    [[gnu::always_inline]] inline float32x4_t addOrderedNEON(float32x4_t earlier, float32x4_t later) noexcept
+    {
+        asm("fadd %0.4s, %0.4s, %1.4s" : "+w"(earlier) : "w"(later));
+        return earlier;
+    }
+
+    /**
      * @brief Add four independent four-byte signed dots without saturation.
      * @param accumulator Four existing INT32 column sums with sufficient headroom.
      * @param activation Four consecutive activation bytes repeated in each column group.
@@ -133,7 +162,7 @@ namespace llaminar2::cpu::native_quantised
         {
             const float32x4_t contribution = persistRoundedNEON(
                 vmulq_f32(combined_scale, dot_fp32));
-            return vaddq_f32(accumulator, contribution);
+            return addOrderedNEON(accumulator, contribution);
         }
         case CPUProjectionNumericalPolicy::BackendNative:
             return vfmaq_f32(accumulator, dot_fp32, combined_scale);
@@ -169,8 +198,10 @@ namespace llaminar2::cpu::native_quantised
             const float32x4_t scaled_min = persistRoundedNEON(vmulq_f32(activation, weight_min));
             const float32x4_t correction = persistRoundedNEON(vmulq_f32(
                 scaled_min, vdupq_n_f32(static_cast<float>(activation_sum))));
+            // Within-block dot + correction stays a plain addition (its
+            // nonfinite precedence is outside the ordered K contract).
             const float32x4_t completed_block = persistRoundedNEON(vaddq_f32(dot_contribution, correction));
-            return vaddq_f32(accumulator, completed_block);
+            return addOrderedNEON(accumulator, completed_block);
         }
         case CPUProjectionNumericalPolicy::BackendNative:
         {
