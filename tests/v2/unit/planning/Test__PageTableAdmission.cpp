@@ -114,6 +114,38 @@ TEST(PageTableAdmission, AbortedCombinedAdmissionLeavesBothClassesAvailable)
     EXPECT_EQ(again->grant.remainingCommitment(), 1u);
 }
 
+/** @test Witnessed admission proves completion order before acquiring anything. */
+TEST(PageTableAdmission, WitnessedAdmissionProvesBeforeAcquisition)
+{
+    // 2 frames, 2 banks, budget 8/headroom 4: one honored request fits.
+    CombinedFixture fx(/*frames=*/2, /*banks=*/2);
+    fx.table.reset();
+    fx.table = CPUFP32PagedKVTable::create(fx.authority, DeviceId::cpu(),
+        CPUFP32PagedKVTableGeometry{1, 2, 2, 1, 8, 4});
+    auto admission = fx.table->reserveAcceptedWork(1);
+    ASSERT_TRUE(admission);
+    // Peak 2 / initial 2 against 2 frames: the proof holds and both cells
+    // are acquired, consuming exactly one reserved issuance.
+    auto admitted = admitPoolTableWitnessed(*fx.pool, *fx.table, 2, 2, *admission);
+    ASSERT_TRUE(admitted);
+    EXPECT_EQ(admitted->grant.remainingCommitment(), 2u);
+    EXPECT_EQ(admission->remaining(), 0u);
+    // Now the pool is full: a second witnessed request with a fresh
+    // reservation must be REFUSED by the proof (no completion order for a
+    // second 2-frame peak on 2 frames), leaving the second reservation
+    // unconsumed and the table bank available.
+    auto second = fx.table->reserveAcceptedWork(1);
+    ASSERT_TRUE(second);
+    EXPECT_FALSE(admitPoolTableWitnessed(*fx.pool, *fx.table, 2, 2, *second));
+    EXPECT_EQ(second->remaining(), 1u);                 // No issuance consumed.
+    EXPECT_EQ(fx.table->outstandingReserved(), 1u);     // Still outstanding.
+    EXPECT_EQ(fx.table->issuedVersions(), 1u);          // Only the first issued.
+    // A witnessed request whose initial grant fits the remaining frame is
+    // also refused by the witness (peak 2 on full pool) without mutation.
+    EXPECT_FALSE(admitPoolTableWitnessed(*fx.pool, *fx.table, 1, 1, *second));
+    EXPECT_EQ(second->remaining(), 1u);
+}
+
 /** @test Reserved all-resource admission consumes exactly one accepted-work issuance. */
 TEST(PageTableAdmission, ReservedAdmissionConsumesOneIssuanceAndRollsBackTogether)
 {

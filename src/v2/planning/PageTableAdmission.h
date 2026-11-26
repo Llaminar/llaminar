@@ -11,6 +11,7 @@
  */
 #pragma once
 #include "kernels/cpu/attention/CPUFP32PagedKVTable.h"
+
 #include "planning/PhysicalPagePool.h"
 #include <optional>
 
@@ -51,5 +52,27 @@ std::optional<PageTableAdmission> admitPoolAndTable(
  */
 std::optional<PageTableAdmission> admitPoolTableReserved(
     PhysicalPagePool &pool, CPUFP32PagedKVTable &table, std::size_t pages,
+    CPUFP32PagedKVTable::IssuanceReservation &reservation);
+
+/**
+ * @brief Bounded optimistic admission with the FULL completion witness.
+ *
+ * Plan §4.1/P1: a request is admitted only when the completion witness PROVES
+ * a finite completion order for its proposed live set (peak declared, initial
+ * grant occupied) against the pool's admitted frame capacity and physical
+ * base occupancy BEFORE any resource is acquired, and the table can supply a
+ * bank under the accepted-work reservation. Proof precedes mutation, so a
+ * refusal leaves every class untouched (the reserved handle is not consumed,
+ * no bank is taken, no growth converts).
+ *
+ * @param declared_peak Complete resident working set at peak (frames).
+ * @param initial_grant Frames converted to O immediately (positive, <= peak).
+ * @param reservation Accepted-work handle authorizing the table bank.
+ * @return Both cells plus the proved total on success; empty otherwise.
+ * @throws std::invalid_argument For misuse of the admission contract parameters.
+ */
+std::optional<PageTableAdmission> admitPoolTableWitnessed(
+    PhysicalPagePool &pool, CPUFP32PagedKVTable &table,
+    std::size_t declared_peak, std::size_t initial_grant,
     CPUFP32PagedKVTable::IssuanceReservation &reservation);
 } // namespace llaminar2

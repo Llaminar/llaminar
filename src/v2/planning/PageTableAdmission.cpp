@@ -46,4 +46,27 @@ std::optional<PageTableAdmission> admitPoolTableReserved(
     if (!update) return std::nullopt; // Grant RAII rolls back; no capacity consumed.
     return PageTableAdmission{std::move(*grant), std::move(*update)};
 }
+
+std::optional<PageTableAdmission> admitPoolTableWitnessed(
+    PhysicalPagePool &pool, CPUFP32PagedKVTable &table,
+    std::size_t declared_peak, std::size_t initial_grant,
+    CPUFP32PagedKVTable::IssuanceReservation &reservation)
+{
+    if (table.issuerForAdmission() != pool.issuerForAdmission())
+        throw std::invalid_argument("Witnessed pool/table admission requires one original PMA authority");
+    // The completion witness is proved BEFORE ANY ACQUISITION by the pool's
+    // own witness admission (proof precedes mutation; a refused invocation
+    // leaves every class untouched, including the reservation handle). Only
+    // when the proof holds does the pool convert the initial grant, and only
+    // then does the accepted-work handle authorize the table bank. If the
+    // table cannot supply the bank, the grant's RAII rolls back and the
+    // reservation capacity is NOT consumed.
+    if (!reservation || !reservation.remaining())
+        return std::nullopt;
+    auto grant = pool.tryAdmitWithWitness(declared_peak, initial_grant);
+    if (!grant) return std::nullopt; // No completion order or no growth: untouched.
+    auto update = table.tryBeginReserved(reservation);
+    if (!update) return std::nullopt; // Grant RAII rolls back; no issuance consumed.
+    return PageTableAdmission{std::move(*grant), std::move(*update)};
+}
 } // namespace llaminar2
