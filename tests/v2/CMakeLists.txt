@@ -12603,6 +12603,14 @@ add_v2_test(V2_Integration_CUDAMoEKernel
     LABELS "V2;Integration;CUDA;MoE;Routing;Gather;Scatter;SwiGLU;KernelFactory"
     MPI_PROCS 1
 )
+# Every CUDA router comparison against the CPU router, whose Q8_1 publication
+# root is declared and bound exactly as the CPU routing stage does it.
+add_v2_test(V2_Integration_CUDA_MoERouterMatchesDeclaredCPUReference
+    COMMAND $<TARGET_FILE:v2_integration_cuda_moe_kernel>
+            --gtest_filter=Test__CUDAMoEKernel.DecodeRouteSelectRuntimeTableMatchesCPU:Test__CUDAMoEKernel.DecodeRouteSelectBF16GateMatchesCPU:Test__CUDAMoEKernel.DecodeRouteSelectRuntimeOnlyDoesNotRequireLegacyOutputs:Test__CUDAMoEKernel.DecodeRouteSelectQwenScaleRuntimeTopKMatchesCPU:Test__CUDAMoEKernel.DecodeRouteSelectUsesWorkspaceAcrossRebind:Test__CUDAMoEKernel.RouteWithTensorsMatchesCPU:Test__CUDAMoEKernel.RouteWithTensorsAcceptsMappedActivationBuffers:Test__CUDAMoEKernel.RouteWithTensorsTiledPrefillMatchesCPU:Test__CUDAMoEKernel.RouteWithTensorsTiledPrefillCapturesAfterWarmup:Test__CUDAMoEKernel.RouteWithTensorsEffectiveSeqLenMasksPaddedRowsAcrossGraphReplay:Test__CUDAMoEKernel.RouteWithTensorsSingleTokenQwenScaleKeepsOutputsDeviceOwned:Test__CUDAMoEKernel.RouteWithTensorsSingleTokenIsCudaGraphCapturableDeviceOnly:Test__CUDAMoEKernel.RouteVerifierRowsDecodeEquivalentUsesDecodeKernelAndCaptures:Test__CUDAMoEKernel.RouteWithTensorsBF16GateMatchesCPU
+            --gtest_brief=1
+    LABELS "V2;Integration;ProductionTestPreflight;CUDA;MoE;Routing;GraphCapture;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 120)
 add_v2_test(V2_Integration_CUDA_MoEColdGroupedVerifierPublisherReplay
     COMMAND $<TARGET_FILE:v2_integration_cuda_moe_kernel>
             --gtest_filter=Test__CUDAMoEKernel.ColdGroupedVerifierPublisherCapturesWithoutComputeStream
