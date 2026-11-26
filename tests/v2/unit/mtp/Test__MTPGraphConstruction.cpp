@@ -9335,3 +9335,59 @@ INSTANTIATE_TEST_SUITE_P(CUDA,MTPNativeGraphConstruction,::testing::Values(Devic
 #ifdef HAVE_ROCM
 INSTANTIATE_TEST_SUITE_P(ROCm,MTPNativeGraphConstruction,::testing::Values(DeviceId::rocm(0)));
 #endif
+
+
+/** @test J1 (R20 H2): model-free real-orchestrator KV export/import round trip. */
+TEST(MTPGraphConstruction, DenseOrchestratorSlotKVExportImportRoundTrip)
+{
+    TinyQwenForwardFixture fixture(DeviceId::cpu(), KVCachePrecision::FP32);
+    fixture.config.mtp.enabled = false;
+    fixture.config.mtp.graph_capacity_draft_tokens = 0;
+    auto builder = std::make_shared<QwenStandardGraph>(fixture.config, fixture.mpi);
+    auto dependencies = cpuInferenceFixtureDependencies(builder, fixture.mpi, 1,
+        fixture.config.max_seq_len, fixture.config.max_seq_len,
+        cpuFixtureTensorInventory(fixture.modelWeights(), fixture.config.n_layers));
+    auto owner = DeviceGraphOrchestrator::createForTest(std::move(dependencies));
+    auto &runner = *owner;
+    ASSERT_TRUE(runner.initializeInferenceStateFromArena(1, fixture.config.max_seq_len, DeviceId::cpu()));
+    runner.setWeights(fixture.modelWeights());
+    PreparedWeightStore store;
+    prepareDenseForwardWeights(runner, *builder, store, DeviceId::cpu());
+    const std::array<int32_t, 3> prompt{1, 3, 5};
+    ASSERT_NE(runner.forward(prompt.data(), 3, 1), nullptr);
+    ASSERT_NE(runner.forward(prompt.data() + 2, 1, 1), nullptr); // KV length 4 (one forward each).
+    const auto exported = runner.exportSlotKV(0);
+    ASSERT_TRUE(exported.has_value()) << "dense CPU export must succeed";
+    ASSERT_EQ(runner.inferenceState().kv_cache->get_cached_tokens(0, 0), 4);
+    // Reset (position back to 0), import, verify position + byte re-export.
+    ASSERT_TRUE(runner.resetServingRow(0));
+    ASSERT_EQ(runner.inferenceState().kv_cache->get_cached_tokens(0, 0), 0);
+    ASSERT_TRUE(runner.importSlotKV(0, *exported));
+    ASSERT_EQ(runner.inferenceState().kv_cache->get_cached_tokens(0, 0), 4);
+    ASSERT_EQ(DeviceGraphOrchestratorMTPSlotsTestAccess::slotPosition(runner, 0), 4);
+    const auto reexport = runner.exportSlotKV(0);
+    ASSERT_TRUE(reexport.has_value());
+    EXPECT_EQ(reexport->size(), exported->size());
+    EXPECT_TRUE(std::equal(reexport->begin(), reexport->end(), exported->begin()));
+    // Length check through the session contract: the imported length must match.
+    EXPECT_TRUE(runner.resumedSlotKVLength(0, 4));
+    EXPECT_FALSE(runner.resumedSlotKVLength(0, 3)); // Mismatch refuses.
+    // Negatives: truncated, foreign layer, precision mismatch, non-empty target.
+    auto truncated = *exported;
+    truncated.resize(6 * sizeof(std::uint64_t) + 4);
+    ASSERT_TRUE(runner.resetServingRow(0));
+    EXPECT_FALSE(runner.importSlotKV(0, truncated));
+    EXPECT_EQ(runner.inferenceState().kv_cache->get_cached_tokens(0, 0), 0);
+    auto foreign = *exported;
+    const std::uint64_t foreign_layer = 9999;
+    std::memcpy(foreign.data(), &foreign_layer, sizeof(foreign_layer));
+    ASSERT_TRUE(runner.resetServingRow(0));
+    EXPECT_FALSE(runner.importSlotKV(0, foreign));
+    EXPECT_EQ(runner.inferenceState().kv_cache->get_cached_tokens(0, 0), 0);
+    auto bad_precision = *exported;
+    bad_precision[4 * sizeof(std::uint64_t)] =
+        static_cast<std::byte>(static_cast<std::uint8_t>(bad_precision[4 * sizeof(std::uint64_t)]) ^ 0xFFu);
+    ASSERT_TRUE(runner.resetServingRow(0));
+    EXPECT_FALSE(runner.importSlotKV(0, bad_precision));
+    EXPECT_EQ(runner.inferenceState().kv_cache->get_cached_tokens(0, 0), 0);
+}

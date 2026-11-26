@@ -183,13 +183,19 @@ namespace llaminar2::test
             std::size_t suspended_at = 0;
             std::optional<ServingContinuationManifest> manifest;
             std::string error;
+            std::vector<int32_t> before_suspend;
             for (int step = 0; step < 40 && !manifest; ++step)
             {
                 for (const auto &event : runner_->stepServingBatch())
                 {
                     if (event.finished())
                         ASSERT_TRUE(false) << "request finished before the suspension boundary";
-                    (void)event;
+                    // ACCUMULATE every token emitted before the suspension (the
+                    // control stream is the full uninterrupted one; the restored
+                    // stream is composed of before_suspend + after_restore and
+                    // must equal it exactly).
+                    before_suspend.insert(before_suspend.end(),
+                        event.tokens.begin(), event.tokens.end());
                 }
                 suspended_at = step;
                 manifest = runner_->suspendServingRequest(7, error);
@@ -210,8 +216,12 @@ namespace llaminar2::test
                         EXPECT_EQ(event.finish, ServingFinishReason::Length);
                 }
             runner_->endServingBatch();
-            // The restored run's token stream equals the uninterrupted control.
-            EXPECT_EQ(suspended_tokens, control.tokens);
+            // The restored run's COMPLETE stream (before + after) equals the
+            // uninterrupted control (J1: nothing discarded).
+            std::vector<int32_t> full_suspended = before_suspend;
+            full_suspended.insert(full_suspended.end(),
+                suspended_tokens.begin(), suspended_tokens.end());
+            EXPECT_EQ(full_suspended, control.tokens);
             EXPECT_EQ(suspended_at > 0, true);
         }
 
