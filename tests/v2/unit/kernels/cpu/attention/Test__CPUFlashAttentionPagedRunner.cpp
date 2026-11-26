@@ -199,6 +199,61 @@ TEST(CPUFlashAttentionPagedRunner, MixedLengthsAndLongOverEqualShareRemainByteEx
     EXPECT_EQ(std::memcmp(expected_long.data(), actual_long.data(), actual_long.size() * sizeof(float)), 0);
 }
 
+/** @test Effective-use ordering on a REAL attachment (plan P3): reordered receipts, eviction after final ack. */
+TEST(CPUFlashAttentionPagedRunner, EffectiveUseNoCopyHitOrdersEvictionAfterFinalAck)
+{
+    constexpr int page_tokens = 16;
+    constexpr int heads = 1, dimension = 64;
+    RunnerFixture fx(page_tokens, 4, dimension);
+    std::mt19937 random(11);
+    std::uniform_real_distribution<float> values(-0.9f, 0.9f);
+    const size_t width = static_cast<size_t>(heads * dimension);
+    std::vector<float> k(static_cast<size_t>(64) * width), v(k.size());
+    for (auto *bank : {&k, &v}) for (auto &value : *bank) value = values(random);
+    std::vector<float> q(width);
+    for (auto &value : q) value = values(random);
+    auto snapshot = publishRunnerSet(fx, k, v, page_tokens, heads, dimension);
+    const auto incarnation = snapshot.version();
+    // Two consumers attach to the SAME immutable publication (no-copy hit);
+    // each touch mints its own owned lease and ordinal.
+    auto first = fx.table->touchEffectiveUse(snapshot);
+    auto second = fx.table->touchEffectiveUse(snapshot);
+    ASSERT_TRUE(first.has_value());
+    ASSERT_TRUE(second.has_value());
+    // A live incarnation cannot be retired early: refuses and records the
+    // retirement request (completed by the final discharge).
+    EXPECT_FALSE(fx.table->retireEffectiveUseReplica(incarnation)); // Live: refuse.
+    // Reordered acknowledgement: acking the NEWER lease first must not evict
+    // while the FIRST is still live.
+    EXPECT_TRUE(second->acknowledge());
+    EXPECT_FALSE(fx.table->effectiveUseMayEvict(incarnation));
+    EXPECT_TRUE(first->acknowledge());
+    EXPECT_TRUE(fx.table->effectiveUseMayEvict(incarnation));
+    // Late-ack retry: the final discharge already completed the retirement,
+    // so a second retire is an idempotent refusal (no duplicate transition).
+    EXPECT_FALSE(fx.table->retireEffectiveUseReplica(incarnation));
+    // Release the publication so its frames can be reused by the next
+    // publication; the retired record slot was already reclaimed.
+    snapshot = {};
+    auto grant = fx.pool->tryAdmit(1);
+    ASSERT_TRUE(grant);
+    auto next = fx.table->tryBeginUpdate();
+    ASSERT_TRUE(next);
+    std::vector<float> fixture(static_cast<size_t>(page_tokens) * 2 * width);
+    for (size_t row = 0; row < static_cast<size_t>(page_tokens); ++row)
+    {
+        std::copy_n(k.data() + row * width, width, fixture.data() + row * 2 * width);
+        std::copy_n(v.data() + row * width, width, fixture.data() + row * 2 * width + width);
+    }
+    const auto frame = grant->assignFrame();
+    auto write = grant->prepareAppend(frame, fixture.size() * sizeof(float));
+    ASSERT_TRUE(write);
+    write->copyFrom(std::as_bytes(std::span(fixture)));
+    next->append(CPUFP32KVPage(write->commit(), heads, dimension));
+    auto fresh = next->commit();
+    EXPECT_GT(fresh.version(), snapshot.version());
+}
+
 /** @test A shared forward of two independent pooled requests matches per-request oracles. */
 TEST(CPUFlashAttentionPagedRunner, TwoPooledRequestsShareOneForwardByteExactPerRequest)
 {
