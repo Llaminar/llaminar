@@ -31,87 +31,83 @@ from __future__ import annotations
 
 from pathlib import Path
 import os
-import shutil
 
-CTEST_CANDIDATES = (
-    "/opt/cmake4/bin/ctest",
-    # pip-installed cmake (pinned Kitware 4.0.3) keeps ctest inside the
-    # interpreter package data, never on PATH:
-    "/opt/cmake4/lib/python*/site-packages/cmake/data/bin/ctest",
-    "/usr/lib/python*/site-packages/cmake/data/bin/ctest",
-    "/usr/local/lib/python*/site-packages/cmake/data/bin/ctest",
-    "/usr/bin/ctest",
-    "/usr/local/bin/ctest",
-    "/usr/lib/llvm*/bin/ctest",
-)
-
-
+#: Cache entry naming the ctest that configured the build tree. It is the sole
+#: ctest authority for the diagnostic: CI test-runner images keep the pinned
+#: ctest inside the pip CMake package, never on PATH, and a ctest found by
+#: searching could belong to a different CMake than the inventory it reads.
 CTEST_CACHE_KEY = "CMAKE_CTEST_COMMAND"
 
+#: Optional caller assertion. When present it must name exactly the configured
+#: ctest; it can never select a different executable.
+CTEST_OVERRIDE_ENV = "LLAMINAR_CTEST"
 
-def _ctest_from_cache(build_dir) -> str | None:
-    """Read CMAKE_CTEST_COMMAND from the build tree's CMakeCache.txt.
 
-    This is the exact ctest that configured the build, which is authoritative
-    and works even when the runner's PATH lacks ctest entirely (the CI
-    test-runner image ships cmake as a pip package whose ctest lives under
-    /opt/cmake4/lib/python3.12/site-packages/cmake/data/bin/, never on PATH).
+class CTestAuthorityError(RuntimeError):
+    """Fatal: the configured build tree does not prove one exact ctest."""
+
+
+def configured_ctest(build_dir) -> str:
+    """Return the exact CMAKE_CTEST_COMMAND recorded by the build tree.
+
+    @param build_dir Configured CMake build directory owning CMakeCache.txt.
+    @return The recorded absolute path, verified to be an executable file.
+    @raise CTestAuthorityError when the cache is unreadable, the entry is absent
+           or duplicated, or the recorded path is not an existing absolute
+           executable. There is no PATH, glob or install-prefix search.
     """
     if build_dir is None:
-        return None
+        raise CTestAuthorityError(
+            "ctest authority requires the configured build directory")
     cache = Path(build_dir) / "CMakeCache.txt"
     try:
-        for line in cache.read_text(errors="replace").splitlines():
-            line = line.strip()
-            if line.startswith(CTEST_CACHE_KEY + ":"):
-                value = line.split("=", 1)[1].strip("\"'\"")
-                if value and Path(value).is_file():
-                    return value
-    except OSError:
-        return None
-    return None
+        lines = cache.read_text(errors="replace").splitlines()
+    except OSError as error:
+        raise CTestAuthorityError(
+            f"build tree has no readable CMakeCache.txt: {cache}: {error}"
+        ) from error
+    # Cache entries are NAME:TYPE=VALUE; the value is verbatim to end of line.
+    values = [line.split("=", 1)[1] for line in lines
+              if line.startswith(CTEST_CACHE_KEY + ":") and "=" in line]
+    if len(values) != 1:
+        raise CTestAuthorityError(
+            f"{cache} must record exactly one {CTEST_CACHE_KEY} entry; "
+            f"found {len(values)}")
+    recorded = values[0]
+    path = Path(recorded)
+    # access(X_OK) alone is insufficient: for root, some filesystems (e.g.
+    # container bind mounts) report it for a file with no execute bit, which
+    # execve would still reject. Require an execute mode bit as well.
+    if not path.is_absolute() or not path.is_file() \
+            or not path.stat().st_mode & 0o111 \
+            or not os.access(path, os.X_OK):
+        raise CTestAuthorityError(
+            f"{CTEST_CACHE_KEY} in {cache} is not an existing absolute "
+            f"executable: {recorded!r}")
+    return recorded
 
 
-def find_ctest(build_dir=None) -> str:
-    """Locate the ctest executable that matches the configured build.
+def find_ctest(build_dir) -> str:
+    """Return the ctest that configured build_dir, validating any override.
 
-    The CMake 4 kitware bundle (used by this project) installs ctest under the
-    interpreter package directory (/opt/cmake4/lib/python3.12/site-packages/
-    cmake/data/bin/ctest), which is NOT on the runner PATH; a bare
-    subprocess.run(["ctest", ...]) fails with FileNotFoundError on the CI
-    runner even though it works on hosts where ctest happens to be on PATH.
-    Resolution order: explicit env, the build tree's CMakeCache.txt
-    (CMAKE_CTEST_COMMAND), shutil.which, known install prefixes.
+    The build tree's CMAKE_CTEST_COMMAND is the only source. A present
+    LLAMINAR_CTEST must equal that recorded path exactly; any other value
+    (including an empty one) is fatal rather than a second selection route.
+    The process environment is read, never modified.
+
+    @param build_dir Configured CMake build directory owning CMakeCache.txt.
+    @return The configured ctest executable path.
+    @raise CTestAuthorityError as configured_ctest(), or when LLAMINAR_CTEST
+           names anything other than the configured ctest.
     """
-    explicit = os.environ.get("LLAMINAR_CTEST")
-    if explicit:
-        if Path(explicit).is_file():
-            return explicit
-        raise FileNotFoundError(
-            f"LLAMINAR_CTEST names a missing executable: {explicit}")
-    # The build tree's CMAKE_CTEST_COMMAND is authoritative: it is the ctest
-    # that configured this build, and it exists even when the runner PATH
-    # lacks any ctest (CI test-runner images expose only the pip wrapper).
-    from_cache = _ctest_from_cache(build_dir)
-    if from_cache:
-        return from_cache
-    resolved = shutil.which("ctest")
-    if resolved:
-        return resolved
-    for candidate in CTEST_CANDIDATES:
-        if "*" not in candidate:
-            if Path(candidate).is_file():
-                return candidate
-    import glob
-    for pattern in CTEST_CANDIDATES:
-        if "*" in pattern:
-            matches = sorted(glob.glob(pattern))
-            for match in matches:
-                if Path(match).is_file():
-                    return match
-    raise FileNotFoundError(
-        "ctest executable not found; set LLAMINAR_CTEST or install the "
-        "repository-pinned CMake toolchain")
+    recorded = configured_ctest(build_dir)
+    override = os.environ.get(CTEST_OVERRIDE_ENV)
+    if override is not None and override != recorded:
+        raise CTestAuthorityError(
+            f"{CTEST_OVERRIDE_ENV}={override!r} differs from the build "
+            f"tree's {CTEST_CACHE_KEY}={recorded!r}; the configured ctest "
+            "is the only authority")
+    return recorded
 
 
 SUPPORTED_OPS = ("set", "unset", "string_append", "string_prepend")

@@ -2,11 +2,15 @@
 """Registered focused controls for the PR75/78 MPI startup diagnostic.
 
 Reviewer-94 block 3: the diagnostic/hook code must have REGISTERED tests (not
-an orphan unit script). Two registrations:
+an orphan unit script). Registrations:
 
   V2_Unit_MPIStartupDiagnosticPolicy (FAST, seconds):
       env_policy exact ops + 125; JUnit selection ONE/skip/missing;
       source binding valid/missing/malformed; A==B contrast refused.
+  V2_Integration_MPIStartupDiagnosticCTestAuthority (FAST, preflight):
+      the build tree's CMAKE_CTEST_COMMAND is the only ctest; PATH decoys,
+      missing/invalid caches and foreign LLAMINAR_CTEST values are rejected;
+      the hook never mutates os.environ.
   V2_Integration_MPIStartupDiagnosticLifecycle (TIMEOUT 60, identity self-clean):
       REAL forced backstop (fired=true, survivors empty, structured retired);
       real-hook cap-drain (fixture exits 0, marker + bounded size, pump never
@@ -30,6 +34,7 @@ HERE = Path(__file__).resolve().parent
 HOOK = HERE / "ci_mpi_hook.py"
 DIAG = HERE / "run_mpi_startup_trace.py"
 POLICY = HERE / "env_policy.py"
+CONTROLS = HERE / "test_mpi_diag_controls.py"
 
 
 def _load(name: str, path: Path):
@@ -97,6 +102,7 @@ class MPIStartupDiagnosticPolicy(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp(prefix="mpi-diag-reg-fast-"))
         self.build = self.tmp / "build"
         self.build.mkdir()
+        _load("test_mpi_diag_controls", CONTROLS).record_configured_ctest(self.build)
         self.out = self.tmp / "out"
         self.out.mkdir()
 
@@ -174,61 +180,6 @@ class MPIStartupDiagnosticPolicy(unittest.TestCase):
             self.assertEqual(mod.source_identity(malformed)["source_note"],
                              "UNBOUND")
 
-    def test_find_ctest_resolves_without_path(self):
-        """Reproduce the CI condition: ctest NOT on PATH. find_ctest must
-        still return an executable (candidates / LLAMINAR_CTEST)."""
-        import subprocess
-        env = dict(os.environ)
-        env["LLAMINAR_CTEST"] = "/does/not/exist"
-        result = subprocess.run(
-            [sys.executable, "-c",
-             "import sys; sys.path.insert(0, sys.argv[1]);"
-             "from env_policy import find_ctest;"
-             "print(find_ctest())",
-             str(HERE)], capture_output=True, text=True, env=env)
-        self.assertNotEqual(result.returncode, 0,
-                            "missing LLAMINAR_CTEST must fail closed")
-        # Without the env var, resolution must succeed even if PATH lacks ctest.
-        env2 = dict(os.environ)
-        env2["PATH"] = "/usr/bin:/bin"  # no cmake4 bin
-        env2.pop("LLAMINAR_CTEST", None)
-        result = subprocess.run(
-            [sys.executable, "-c",
-             "import sys; sys.path.insert(0, sys.argv[1]);"
-             "from env_policy import find_ctest;"
-             "import os;"
-             "p = find_ctest();"
-             "print(p) if os.path.exists(p) else print('MISSING')",
-             str(HERE)], capture_output=True, text=True, env=env2)
-        self.assertEqual(result.returncode, 0, result.stderr[-300:])
-        self.assertNotIn("MISSING", result.stdout)
-
-    def test_find_ctest_resolves_from_build_cache(self):
-        """The CI runner condition: ctest NOT on PATH, but the build tree's
-        CMakeCache.txt records CMAKE_CTEST_COMMAND. find_ctest(build_dir)
-        must resolve to that exact executable."""
-        import subprocess
-        env = dict(os.environ)
-        env["PATH"] = "/usr/bin:/bin"
-        env.pop("LLAMINAR_CTEST", None)
-        script = (
-            "import sys, tempfile, pathlib, os;"
-            "sys.path.insert(0, sys.argv[1]);"
-            "from env_policy import find_ctest;"
-            "d = tempfile.mkdtemp();"
-            "p = pathlib.Path(d)/'CMakeCache.txt';"
-            "p.write_text('CMAKE_CTEST_COMMAND:INTERNAL=' + sys.executable);"
-            "print(find_ctest(d))")
-        result = subprocess.run(
-            [sys.executable, "-c", script, str(HERE)],
-            capture_output=True, text=True, env=env)
-        self.assertEqual(result.returncode, 0, result.stderr[-300:])
-        # sys.executable is an existing file, so it is the resolved value.
-        self.assertTrue(
-            result.stdout.strip().endswith("python3.12")
-            or result.stdout.strip().endswith("python3")
-            or result.stdout.strip().endswith("python"), result.stdout)
-
     def test_runner_propagates_failing_result(self):
         """Runner exit code is checked (reviewer-95 block 1): a failing test
         class (never registered) must make CTest red, not always-pass."""
@@ -290,6 +241,135 @@ class MPIStartupDiagnosticPolicy(unittest.TestCase):
         self.assertNotIn("B-outer-hwloc-export", result["arms"])
 
 
+class MPIStartupDiagnosticCTestAuthority(unittest.TestCase):
+    """The build tree's CMAKE_CTEST_COMMAND is the diagnostic's only ctest.
+
+    Regressions for the retired PATH/glob/install-prefix search: resolution
+    must not depend on PATH, must reject a missing or invalid cache, must
+    reject a foreign LLAMINAR_CTEST, and the hook must not publish the
+    resolved ctest into the process environment.
+    """
+
+    def setUp(self):
+        import tempfile
+        self.tmp = Path(tempfile.mkdtemp(prefix="mpi-diag-reg-ctest-"))
+        self.build = self.tmp / "build"
+        self.build.mkdir()
+        self.ctest = _load("test_mpi_diag_controls", CONTROLS) \
+            .record_configured_ctest(self.build)
+        self.out = self.tmp / "out"
+        self.out.mkdir()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _junit(self, failed: list[str]) -> None:
+        tests = "".join(
+            '<testcase classname="x" name="%s" time="1">'
+            '<failure message="boom"/></testcase>' % name for name in failed)
+        (self.out / "host.xml").write_text(
+            '<testsuite name="host" tests="%d" failures="%d">%s</testsuite>'
+            % (len(failed), len(failed), tests))
+
+    def _resolve_ctest(self, environment: dict[str, str]) -> subprocess.CompletedProcess:
+        """Resolve the fixture tree's ctest in a fresh process and environment."""
+        script = ("import sys; sys.path.insert(0, sys.argv[1]);"
+                  "from env_policy import find_ctest;"
+                  "print(find_ctest(sys.argv[2]))")
+        return subprocess.run(
+            [sys.executable, "-c", script, str(HERE), str(self.build)],
+            capture_output=True, text=True, env=environment)
+
+    def _environment_without_ctest_on_path(self) -> dict[str, str]:
+        """Current environment with no override and a PATH containing ctest
+        decoys only: an authority that searched PATH would select them."""
+        decoys = self.tmp / "path-decoy"
+        decoys.mkdir(exist_ok=True)
+        decoy = decoys / "ctest"
+        decoy.write_text("#!/bin/sh\nexit 99\n")
+        os.chmod(decoy, 0o755)
+        environment = dict(os.environ)
+        environment.pop("LLAMINAR_CTEST", None)
+        environment["PATH"] = str(decoys)
+        return environment
+
+    def test_find_ctest_returns_configured_cache_entry_not_path(self):
+        """Regression: only CMAKE_CTEST_COMMAND selects ctest, even when the
+        configured ctest is not on PATH and a different ctest is."""
+        result = self._resolve_ctest(self._environment_without_ctest_on_path())
+        self.assertEqual(result.returncode, 0, result.stderr[-600:])
+        self.assertEqual(result.stdout.strip(), self.ctest)
+
+    def test_find_ctest_rejects_missing_or_invalid_cache(self):
+        """Regression: an absent, empty, duplicated or non-executable cache
+        entry is fatal; PATH, globs and install prefixes are never consulted."""
+        environment = self._environment_without_ctest_on_path()
+        not_executable = self.tmp / "ctest-not-executable"
+        not_executable.write_text("")
+        os.chmod(not_executable, 0o644)
+        cases = {
+            "missing cache": None,
+            "missing entry": "CMAKE_COMMAND:INTERNAL=/usr/bin/cmake\n",
+            "empty entry": "CMAKE_CTEST_COMMAND:INTERNAL=\n",
+            "duplicate entry": ("CMAKE_CTEST_COMMAND:INTERNAL=%s\n" % self.ctest) * 2,
+            "missing executable": "CMAKE_CTEST_COMMAND:INTERNAL=%s\n"
+                                  % (self.tmp / "no-such-ctest"),
+            "relative path": "CMAKE_CTEST_COMMAND:INTERNAL=ctest\n",
+            "not executable": "CMAKE_CTEST_COMMAND:INTERNAL=%s\n" % not_executable,
+        }
+        cache = self.build / "CMakeCache.txt"
+        for label, contents in cases.items():
+            with self.subTest(label):
+                if contents is None:
+                    cache.unlink(missing_ok=True)
+                else:
+                    cache.write_text(contents)
+                result = self._resolve_ctest(environment)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("CTestAuthorityError", result.stderr)
+                self.assertNotIn("path-decoy", result.stdout)
+
+    def test_find_ctest_override_must_equal_configured(self):
+        """Regression: LLAMINAR_CTEST may only restate the configured ctest; a
+        foreign existing executable or an empty value is fatal."""
+        environment = self._environment_without_ctest_on_path()
+        environment["LLAMINAR_CTEST"] = self.ctest
+        result = self._resolve_ctest(environment)
+        self.assertEqual(result.returncode, 0, result.stderr[-600:])
+        self.assertEqual(result.stdout.strip(), self.ctest)
+        for foreign in (sys.executable,
+                        str(self.tmp / "path-decoy" / "ctest"), ""):
+            with self.subTest(foreign=foreign):
+                environment["LLAMINAR_CTEST"] = foreign
+                result = self._resolve_ctest(environment)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("differs from the build tree", result.stderr)
+
+    def test_hook_reads_ctest_authority_without_mutating_environment(self):
+        """Regression: the hook resolves the configured ctest without
+        publishing it into os.environ, and fails before writing evidence when
+        the build tree proves no ctest."""
+        from unittest import mock
+        mod = _load("ci_mpi_hook", HOOK)
+        self._junit(["V2_Unit_Unrelated"])
+        with mock.patch.dict(os.environ, clear=False):
+            os.environ.pop("LLAMINAR_CTEST", None)
+            before = dict(os.environ)
+            mod.run_after_failed_host_lane(
+                self.out / "host.xml", self.out, self.build, {}, deadline_s=60)
+            self.assertEqual(dict(os.environ), before)
+            (self.build / "CMakeCache.txt").unlink()
+            empty_output = self.tmp / "out-missing-cache"
+            empty_output.mkdir()
+            with self.assertRaises(RuntimeError):
+                mod.run_after_failed_host_lane(
+                    self.out / "host.xml", empty_output, self.build, {},
+                    deadline_s=60)
+            self.assertEqual(list(empty_output.iterdir()), [])
+            self.assertEqual(dict(os.environ), before)
+
+
 class MPIStartupDiagnosticLifecycle(unittest.TestCase):
     """Registered lifecycle controls: REAL hook + REAL diagnostic (TIMEOUT 60)."""
 
@@ -298,6 +378,7 @@ class MPIStartupDiagnosticLifecycle(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp(prefix="mpi-diag-reg-life-"))
         self.build = self.tmp / "build"
         self.build.mkdir()
+        _load("test_mpi_diag_controls", CONTROLS).record_configured_ctest(self.build)
         self.out = self.tmp / "out"
         self.out.mkdir()
 

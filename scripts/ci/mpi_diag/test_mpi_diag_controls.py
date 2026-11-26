@@ -20,6 +20,29 @@ from pathlib import Path
 SCRIPT = Path(__file__).resolve().parent / "run_mpi_startup_trace.py"
 BIN = Path(sys.executable)
 
+#: CMake registration supplies its own ${CMAKE_CTEST_COMMAND} here, exactly as
+#: LLAMINAR_TEST_MPI_SESSION_HELPER supplies a built tool path.
+CONFIGURED_CTEST_ENV = "LLAMINAR_TEST_CONFIGURED_CTEST"
+
+
+def record_configured_ctest(build_dir: Path) -> str:
+    """Give a synthetic fixture build tree the real configured ctest.
+
+    The diagnostic accepts only the build tree's CMAKE_CTEST_COMMAND, so each
+    fixture tree records the ctest that configured the enclosing test build.
+    @param build_dir Synthetic fixture build directory.
+    @return The recorded ctest path.
+    @raise RuntimeError when the registration did not supply the configured ctest.
+    """
+    ctest = os.environ.get(CONFIGURED_CTEST_ENV)
+    if not ctest:
+        raise RuntimeError(
+            f"{CONFIGURED_CTEST_ENV} must name the configured ctest; run through "
+            "the CMake registration")
+    (Path(build_dir) / "CMakeCache.txt").write_text(
+        f"CMAKE_CTEST_COMMAND:INTERNAL={ctest}\n")
+    return ctest
+
 
 class DiagnosticControls(unittest.TestCase):
     maxDiff = None
@@ -48,6 +71,7 @@ set_tests_properties(%s PROPERTIES
         import tempfile
         self._tmp = Path(tempfile.mkdtemp(prefix="mpi-diag-controls-"))
         self._build_dir().mkdir(parents=True, exist_ok=True)
+        record_configured_ctest(self._build_dir())
 
     def tearDown(self):
         import shutil
@@ -213,6 +237,7 @@ class HookControls(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp(prefix="mpi-diag-hook-"))
         self.build = self.tmp / "build"
         self.build.mkdir()
+        record_configured_ctest(self.build)
         self.out = self.tmp / "out"
         self.out.mkdir()
 
@@ -401,6 +426,7 @@ class RealHookControls(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp(prefix="mpi-diag-real-hook-"))
         self.build = self.tmp / "build"
         self.build.mkdir()
+        record_configured_ctest(self.build)
         self.out = self.tmp / "out"
         self.out.mkdir()
 
@@ -581,6 +607,7 @@ class BackstopControls(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp(prefix="mpi-diag-backstop-"))
         self.build = self.tmp / "build"
         self.build.mkdir()
+        record_configured_ctest(self.build)
         self.out = self.tmp / "out"
         self.out.mkdir()
 

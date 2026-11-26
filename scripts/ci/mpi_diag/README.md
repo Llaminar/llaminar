@@ -33,6 +33,11 @@ changed by this diagnostic; the CI hook runs only after a host-lane failure.
   supported (reviewer-93); reset/path_list_*/cmakelist are deliberately
   unsupported and fail clean with 125. FIXTURES_REQUIRED is ALWAYS unsupported
   (125) - this diagnostic never executes arbitrary setup.
+  ctest authority: find_ctest(build_dir) returns exactly the build tree's
+  CMakeCache.txt CMAKE_CTEST_COMMAND (one entry, absolute, executable). There
+  is no PATH, glob or install-prefix search; a missing or invalid entry is
+  fatal. LLAMINAR_CTEST, when set, must equal that recorded path or the run
+  fails. The hook never writes the resolved path into os.environ.
   Source binding: requires --image-revision, the exact 40-lower-hex
   org.opencontainers.image.revision from `docker image inspect` (VCS_REF),
   passed by the CI launcher (run_develop_image_gate.py reads the test-runner
@@ -84,6 +89,11 @@ changed by this diagnostic; the CI hook runs only after a host-lane failure.
           - selection ONE + success skip + missing JUnit
           - source binding valid/missing/malformed
           - A==B contrast refused
+      V2_Integration_MPIStartupDiagnosticCTestAuthority (ProductionTestPreflight)
+          - configured CMAKE_CTEST_COMMAND wins over PATH decoys
+          - missing/empty/duplicate/relative/non-executable cache entry fatal
+          - foreign or empty LLAMINAR_CTEST fatal; equal value accepted
+          - hook leaves os.environ untouched and fails before evidence
       V2_Integration_MPIStartupDiagnosticLifecycle (TIMEOUT 60, identity
           self-cleanup, ProductionTestPreflight)
           - REAL forced backstop structured record

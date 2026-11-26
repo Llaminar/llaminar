@@ -5585,25 +5585,38 @@ endif()
 # PR75/78 MPI startup diagnostic registration (reviewer-94 block 3). The
 # policy half runs in seconds; the lifecycle half uses the real hook and
 # diagnostic with its own bounded identities (TIMEOUT 60, no models, no MPI).
+# Fixture build trees record this build's configured ctest, the diagnostic's
+# sole ctest authority.
 add_v2_test(V2_Unit_MPIStartupDiagnosticPolicy
     COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/../../scripts/ci/mpi_diag/test_mpi_diag_registration.py
         MPIStartupDiagnosticPolicy
     LABELS "V2;Unit;CPU;DeviceFree;MPI;Lifecycle;Regression;SourcePolicy"
-    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60)
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60
+    ENVIRONMENT "LLAMINAR_TEST_CONFIGURED_CTEST=${CMAKE_CTEST_COMMAND}")
 add_v2_test(V2_Integration_MPIStartupDiagnosticLifecycle
     COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/../../scripts/ci/mpi_diag/test_mpi_diag_registration.py
         MPIStartupDiagnosticLifecycle
     LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;MPI;Lifecycle;Regression"
-    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60)
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60
+    ENVIRONMENT "LLAMINAR_TEST_CONFIGURED_CTEST=${CMAKE_CTEST_COMMAND}")
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MPIStartupDiagnosticLifecycle)
+add_v2_test(V2_Integration_MPIStartupDiagnosticCTestAuthority
+    COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../scripts/ci/mpi_diag/test_mpi_diag_registration.py
+        MPIStartupDiagnosticCTestAuthority
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;MPI;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60
+    ENVIRONMENT "LLAMINAR_TEST_CONFIGURED_CTEST=${CMAKE_CTEST_COMMAND}")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MPIStartupDiagnosticCTestAuthority)
 add_v2_test(V2_Integration_MPIStartupDiagnosticSafety
     COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/../../scripts/ci/mpi_diag/test_mpi_diag_registration.py
         RegisteredSafety
     LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;MPI;Lifecycle;Regression"
-    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60)
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60
+    ENVIRONMENT "LLAMINAR_TEST_CONFIGURED_CTEST=${CMAKE_CTEST_COMMAND}")
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MPIStartupDiagnosticSafety)
 
 add_test(NAME V2_Integration_MPICTestSessionIsolation
