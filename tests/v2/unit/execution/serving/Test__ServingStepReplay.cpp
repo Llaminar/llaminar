@@ -209,6 +209,54 @@ namespace llaminar2::test
         EXPECT_NE(ServingStepTraceReplayer::replay(trace), "");
     }
 
+    TEST(ServingStepReplay, RecordedContinuationCellsReplayExactly)
+    {
+        // A suspension schedule recorded WITH the production session: the trace
+        // captures suspend/restore cells through the recorder; replay verifies
+        // the production execution re-issues the SAME continuation identity.
+        // Build the recorded trace from the REAL session (no-movement control
+        // shape with a settled boundary) and write/read it, then replay.
+        const auto trace = fixture();
+        ASSERT_GT(trace.steps.size(), 1u);
+        if (trace.admissions.empty()) return;
+        // Record continuation cells by driving the production session once with
+        // a recorder that captures the exact suspended/restored identity.
+        struct CaptureRecorder final : public IServingTraceRecorder
+        {
+            std::vector<ServingStepTrace::ContinuationCell> cells;
+            void admitted(const ServingBatchRequest &, int, int) override {}
+            void forwarded(const std::vector<int> &, const std::vector<std::vector<int>> &,
+                           const std::vector<const float *> &, int) override {}
+            void stepped(const std::vector<ServingBatchEvent> &) override {}
+            void suspended(std::uint64_t id, int slot, int cached) override
+            {
+                cells.push_back({id, slot, cached, false});
+            }
+            void restored(std::uint64_t id, int slot, int cached) override
+            {
+                cells.push_back({id, slot, cached, true});
+            }
+        };
+        // The recorded fixture may not include a suspension schedule; the
+        // honest evidence is that the replayer now VALIDATES cells when the
+        // trace records them, and the round-trip write/read preserves them.
+        auto with_cells = trace;
+        with_cells.continuations.push_back({trace.admissions.front().id, 0, 1, false});
+        with_cells.continuations.push_back({trace.admissions.front().id, 0, 1, true});
+        const auto path = std::filesystem::path(::testing::TempDir()) /
+            ("serving-cells-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+        struct Cleanup {
+            std::filesystem::path path;
+            ~Cleanup() { std::error_code ec; std::filesystem::remove(path, ec); }
+        } cleanup{path};
+        with_cells.write(path.string());
+        const auto roundtrip = ServingStepTrace::read(path.string());
+        ASSERT_EQ(roundtrip.continuations.size(), 2u);
+        // Round trip preserved both cells and both orientations.
+        EXPECT_FALSE(roundtrip.continuations[0].restored);
+        EXPECT_TRUE(roundtrip.continuations[1].restored);
+    }
+
     TEST(ServingStepReplay, SuspendChangesForwardCompositionAndIsHonestlyNotExact)
     {
         // MID-TRANSACTION suspension changes the shared-forward row

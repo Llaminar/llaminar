@@ -60,6 +60,14 @@ namespace llaminar2::test
             unsigned int seed = 0;
             int restored = 0;
         };
+        /** @brief One suspended/restored continuation cell (P4). */
+        struct ContinuationCell
+        {
+            std::uint64_t id = 0;
+            int slot = -1;
+            int cached_tokens = 0;
+            bool restored = false;
+        };
         struct Forward
         {
             std::vector<int> slots;
@@ -76,6 +84,7 @@ namespace llaminar2::test
         int capacity = 0;
         std::vector<Command> commands;
         std::vector<Admission> admissions;
+        std::vector<ContinuationCell> continuations;
         std::vector<Forward> forwards;
         std::vector<Step> steps;
 
@@ -188,6 +197,9 @@ namespace llaminar2::test
             }
             for (const auto &a : admissions)
                 out << "admit " << a.id << ' ' << a.slot << ' ' << a.seed << ' ' << a.restored << '\n';
+            for (const auto &c : continuations)
+                out << (c.restored ? "restore-cell " : "suspend-cell ") << c.id
+                    << ' ' << c.slot << ' ' << c.cached_tokens << '\n';
             for (const auto &f : forwards)
             {
                 out << "forward " << f.slots.size();
@@ -424,6 +436,13 @@ namespace llaminar2::test
                     s >> a.id >> a.slot >> a.seed >> a.restored;
                     trace.admissions.push_back(a);
                 }
+                else if (kind == "suspend-cell" || kind == "restore-cell")
+                {
+                    ContinuationCell cell;
+                    s >> cell.id >> cell.slot >> cell.cached_tokens;
+                    cell.restored = kind == "restore-cell";
+                    trace.continuations.push_back(cell);
+                }
                 else if (kind == "forward")
                 {
                     Forward f;
@@ -603,6 +622,25 @@ namespace llaminar2::test
                 request.sampling.seed != expected.seed || restored != expected.restored)
                 throw std::runtime_error("production admission differs from recorded identity");
         }
+        /** @brief Continuation cells must match the recorded suspension schedule. */
+        void suspended(std::uint64_t id, int slot, int cached_tokens) override
+        {
+            if (observed_continuations_ >= trace_.continuations.size())
+                throw std::runtime_error("unrecorded production suspension");
+            const auto &cell = trace_.continuations[observed_continuations_];
+            if (cell.restored || cell.id != id || cell.slot != slot ||
+                cell.cached_tokens != cached_tokens)
+                throw std::runtime_error("production suspension differs from recorded cell");
+        }
+        void restored(std::uint64_t id, int slot, int cached_tokens) override
+        {
+            if (observed_continuations_ >= trace_.continuations.size())
+                throw std::runtime_error("unrecorded production restore");
+            const auto &cell = trace_.continuations[observed_continuations_];
+            if (!cell.restored || cell.id != id || cell.slot != slot ||
+                cell.cached_tokens != cached_tokens)
+                throw std::runtime_error("production restore differs from recorded cell");
+        }
         /** @brief Forwards are checked by the executor before publishing logits. */
         void forwarded(const std::vector<int> &, const std::vector<std::vector<int>> &,
                        const std::vector<const float *> &, int) override {}
@@ -728,6 +766,8 @@ namespace llaminar2::test
             if (executor->admissionsConsumed() != trace.admissions.size())
                 return "replay admitted " + std::to_string(executor->admissionsConsumed()) + " of " +
                        std::to_string(trace.admissions.size()) + " recorded requests";
+            if (executor->observed_continuations_ != trace.continuations.size())
+                return "replay did not observe every recorded continuation cell";
             return {};
         }
 
@@ -736,6 +776,7 @@ namespace llaminar2::test
         std::size_t next_forward_ = 0;
         std::size_t next_admission_ = 0;
         std::size_t observed_admissions_ = 0;
+        std::size_t observed_continuations_ = 0;
         std::vector<std::vector<float>> dense_;
     };
 } // namespace llaminar2::test

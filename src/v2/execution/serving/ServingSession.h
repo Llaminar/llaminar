@@ -89,6 +89,22 @@ namespace llaminar2
         /** @brief A request entered slot @p slot with its resolved (nonzero) seed. */
         virtual void admitted(const ServingBatchRequest &request, int slot, int restored_prompt_tokens) = 0;
 
+        /**
+         * @brief A RESIDENT request was suspended at a transaction boundary.
+         * @param id The request whose complete continuation was captured.
+         * @param slot The physical slot retired for reuse.
+         * @param cached_tokens KV length at the settlement boundary.
+         */
+        virtual void suspended(std::uint64_t id, int slot, int cached_tokens) {}
+
+        /**
+         * @brief A suspended request was restored with its complete continuation.
+         * @param id The restored request identity (original S record).
+         * @param slot The physical slot the continuation now occupies.
+         * @param cached_tokens KV length advertised at restore.
+         */
+        virtual void restored(std::uint64_t id, int slot, int cached_tokens) {}
+
         /** @brief A shared forward returned these per-row logits (vocab floats each). */
         virtual void forwarded(const std::vector<int> &slots, const std::vector<std::vector<int>> &rows,
                                const std::vector<const float *> &row_logits, int vocab) = 0;

@@ -599,7 +599,11 @@ namespace llaminar2
             return std::nullopt;
         }
         slot_busy_[static_cast<std::size_t>(row.slot)] = false;
+        const int suspended_slot = row.slot;
+        const int suspended_cached = row.cached_tokens;
         rows_.erase(it);
+        if (recorder_)
+            recorder_->suspended(id, suspended_slot, suspended_cached);
         return manifest;
     }
 
@@ -664,7 +668,11 @@ namespace llaminar2
         // the exact position (no duplicate output, no reseed).
         row.slot = target;
         slot_busy_[static_cast<std::size_t>(target)] = true;
+        const std::uint64_t restored_id = row.request.id;
+        const int restored_cached = row.cached_tokens;
         rows_.push_back(std::move(row));
+        if (recorder_)
+            recorder_->restored(restored_id, target, restored_cached);
         return true;
     }
 } // namespace llaminar2
