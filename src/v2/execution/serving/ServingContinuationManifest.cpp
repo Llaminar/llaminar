@@ -6,11 +6,14 @@
 
 namespace llaminar2
 {
-bool ServingContinuationManifest::capture(std::uint64_t request_id, int slot,
+bool ServingContinuationManifest::capture(std::uint64_t issuer_session_nonce,
+    std::uint64_t request_id, int slot,
     const SamplingParams &sampling, std::vector<int32_t> prompt, int max_new_tokens,
     std::size_t prompt_consumed, int cached_tokens, int completion_tokens,
     int32_t last_token, bool needs_feed, bool has_logits, int grant,
     const std::vector<int32_t> &forced, bool cancelled, int cached_prompt_tokens,
+    bool prefix_cache_enabled, bool prefix_supported, int prefix_block_size,
+    std::uint64_t prefix_fingerprint_key,
     const std::vector<int32_t> &sampler_history,
     const std::vector<std::byte> &kv_payload, const Sampler::State *sampler_state,
     std::string *error)
@@ -41,6 +44,7 @@ bool ServingContinuationManifest::capture(std::uint64_t request_id, int slot,
         return false;
     }
     content_ = Content{};
+    content_.issuer_session_nonce = issuer_session_nonce;
     content_.request_id = request_id;
     content_.slot = slot;
     content_.prompt = std::move(prompt);
@@ -56,6 +60,10 @@ bool ServingContinuationManifest::capture(std::uint64_t request_id, int slot,
     content_.forced = forced;
     content_.cancelled = cancelled;
     content_.cached_prompt_tokens = cached_prompt_tokens;
+    content_.prefix_cache_enabled = prefix_cache_enabled;
+    content_.prefix_supported = prefix_supported;
+    content_.prefix_block_size = prefix_block_size;
+    content_.prefix_fingerprint_key = prefix_fingerprint_key;
     content_.sampler_prompt.clear();
     content_.sampler_decisions = sampler_history;
     content_.kv_payload = kv_payload;

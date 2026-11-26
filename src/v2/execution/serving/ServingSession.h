@@ -171,6 +171,8 @@ namespace llaminar2
                    std::shared_ptr<PhysicalMemorySuballocationLease> decision_storage = nullptr,
                    int queue_capacity = 0);
         bool active() const noexcept { return active_; }
+        /** @brief Fresh per-session issue nonce (C2: manifest session binding). */
+        std::uint64_t sessionNonce() const noexcept { return session_nonce_; }
 
         /**
          * @brief Submit one immutable request with the TYPED outcome.
@@ -204,12 +206,15 @@ namespace llaminar2
 
         /**
          * @brief Restore one suspended request into its original request state.
-         *
+         * @param manifest Continuation captured by suspend() (rvalue; C2).
          * @return True when the row was restored (its next decision is the
          * exact no-movement continuation); false with @p error when the
-         * manifest is incomplete, the slot is busy, or the session is sealed.
+         * manifest is incomplete, foreign, the slot is busy, or the session is
+         * sealed. On ANY refusal the manifest is NOT consumed (the caller
+         * keeps the continuation; no silent loss), and the request stays
+         * tracked as an outstanding suspension until a defined terminal.
          */
-        bool restore(ServingContinuationManifest manifest, std::string &error);
+        bool restore(ServingContinuationManifest &&manifest, std::string &error);
 
         bool idle() const noexcept { return rows_.empty() && queue_.empty(); }
         bool hasRunnableWork() const;
@@ -266,8 +271,19 @@ namespace llaminar2
             Sampler::State sampler_state;           ///< Exact RNG/penalty/DRY state (P4).
         };
 
-        /** @brief Fail all resident and queued requests, seal, and return @p events. */
+        /**
+         * @brief Fail all resident and queued requests, seal, and return @p events.
+         *
+         * The returned vector is the NORMAL terminal channel: every resident
+         * and queued request receives exactly one Error event. Callers that
+         * seal from outside a step (suspension reset failure) must PUBLISH
+         * this vector through pending_events_ (drained by the next step),
+         * never discard it — a dropped vector leaves response owners without
+         * their terminal event.
+         */
         std::vector<ServingBatchEvent> sealAll(const std::string &reason, std::vector<ServingBatchEvent> events);
+        /** @brief Terminal events produced outside a step (suspension seal), drained once by step(). */
+        std::vector<ServingBatchEvent> pending_events_;
 
         float *decisionLogits(int slot)
         {
@@ -281,6 +297,15 @@ namespace llaminar2
         int capacity_ = 0;
         int queue_capacity_ = 0; ///< Admitted bounded queue depth Q (design §4.1).
         bool active_ = false;
+        std::uint64_t session_nonce_ = 0;       ///< Fresh per-session issue nonce (C2).
+        /** @brief Terminal metadata of one outstanding suspension (C2). */
+        struct OutstandingSuspension
+        {
+            int prompt_tokens = 0;
+            int completion_tokens = 0;
+        };
+        /** @brief Outstanding suspended requests NOT yet restored (C2). */
+        std::map<std::uint64_t, OutstandingSuspension> outstanding_suspensions_;
         std::vector<Row> rows_;                 ///< Resident requests (any order).
         std::vector<bool> slot_busy_;
         std::deque<ServingBatchRequest> queue_; ///< Waiting for a free slot (FIFO).

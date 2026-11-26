@@ -45,6 +45,10 @@ public:
     {
         std::uint64_t request_id = 0;
         int slot = -1;
+        // C2: the manifest is bound to the SESSION that issued it (a fresh
+        // per-session incarnation nonce). Another session — or a different
+        // model/executor — cannot restore a continuation it did not mint.
+        std::uint64_t issuer_session_nonce = 0;
         std::vector<int32_t> prompt;      ///< ORIGINAL prompt tokens (prefill recoverable).
         int max_new_tokens = 0;           ///< ORIGINAL requested output budget.
         SamplingParams sampling;          ///< Original law (seed, filters, DRY).
@@ -58,6 +62,16 @@ public:
         std::vector<int32_t> forced;      ///< Tokens committed instead of sampling.
         bool cancelled = false;
         int cached_prompt_tokens = 0;     ///< Restored prefix-cache tokens.
+        // R16/B2 deep fix: the typed prefix ADMISSION contract travels with the
+        // continuation so a cache-enabled MISS row restores with the SAME
+        // admission (harvest/counters identical to the uninterrupted control).
+        // A full HIT's live blocks/payload plan are NOT carried: those rows
+        // still refuse (typed admission with live referents cannot be
+        // re-materialized without the executor's import contract).
+        bool prefix_cache_enabled = false;
+        bool prefix_supported = false;
+        int prefix_block_size = 0;
+        std::uint64_t prefix_fingerprint_key = 0;
         // Sampler/RNG history: prompt tokens + every committed decision, so
         // restore regenerates the exact RNG position (never reseeds).
         std::vector<int32_t> sampler_prompt;   ///< Prompt tokens recorded.
@@ -130,11 +144,14 @@ private:
      * @param prompt ORIGINAL prompt tokens (required; never invented on restore).
      * @param max_new_tokens ORIGINAL requested output budget (never a cap change).
      */
-    bool capture(std::uint64_t request_id, int slot, const SamplingParams &sampling,
+    bool capture(std::uint64_t issuer_session_nonce, std::uint64_t request_id, int slot,
+        const SamplingParams &sampling,
         std::vector<int32_t> prompt, int max_new_tokens,
         std::size_t prompt_consumed, int cached_tokens, int completion_tokens,
         int32_t last_token, bool needs_feed, bool has_logits, int grant,
         const std::vector<int32_t> &forced, bool cancelled, int cached_prompt_tokens,
+        bool prefix_cache_enabled, bool prefix_supported, int prefix_block_size,
+        std::uint64_t prefix_fingerprint_key,
         const std::vector<int32_t> &sampler_history = {},
         const std::vector<std::byte> &kv_payload = {},
         const Sampler::State *sampler_state = nullptr,

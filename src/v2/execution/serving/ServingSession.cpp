@@ -179,6 +179,21 @@ namespace llaminar2
 
     void ServingSession::end()
     {
+        // C2: a session end with outstanding suspensions is a DEFINED terminal
+        // outcome — every suspended request receives its Error event through
+        // pending_events_ (drained by the next step) so no response owner
+        // hangs. The continuation is never silently dropped.
+        for (const auto &[id, suspended] : outstanding_suspensions_)
+        {
+            ServingBatchEvent event;
+            event.id = id;
+            event.finish = ServingFinishReason::Error;
+            event.error = "Serving session ended with an outstanding suspension";
+            event.prompt_tokens = suspended.prompt_tokens;
+            event.completion_tokens = suspended.completion_tokens;
+            pending_events_.push_back(std::move(event));
+        }
+        outstanding_suspensions_.clear();
         // Closing retires every slot; the next begin() resets all slots again
         // and fails if any reset fails, so no stale state can be admitted.
         for (const auto &row : rows_)
@@ -235,6 +250,16 @@ namespace llaminar2
     std::vector<ServingBatchEvent> ServingSession::step()
     {
         std::vector<ServingBatchEvent> events;
+        // Drain terminal events produced outside a step (suspension seal or
+        // end() with outstanding suspensions) FIRST, even when the session is
+        // no longer active: every request must receive its terminal event.
+        if (!pending_events_.empty())
+        {
+            events.swap(pending_events_);
+            if (recorder_)
+                recorder_->stepped(events);
+            return events;
+        }
         if (!active_)
             return events;
         PerfStatsCollector::addCounter("serving", "steps", 1.0, "serving_rows", "cpu");
@@ -618,11 +643,16 @@ namespace llaminar2
         // The ORIGINAL request policy (prompt tokens and output budget) is part
         // of the continuation AT MINT: restore must never invent a cap or lose
         // prefill, and a sealed manifest exposes no post-capture mutation.
-        if (!manifest.capture(row.request.id, row.slot, row.request.sampling,
+        if (!manifest.capture(session_nonce_, row.request.id, row.slot,
+                row.request.sampling,
                 row.request.prompt, row.request.max_new_tokens,
                 row.prompt_consumed, row.cached_tokens, row.completion_tokens,
                 row.last_token, row.needs_feed, row.has_logits, row.grant,
                 forced, row.cancelled, row.cached_prompt_tokens,
+                row.prefix_admission.cache_enabled,
+                row.prefix_admission.supported,
+                row.prefix_admission.block_size,
+                row.prefix_admission.fingerprint_key,
                 row.sampler_decisions, *kv, &row.sampler_state, &error))
             return std::nullopt;
         // Retire the slot: reset the executor row and release the resident
@@ -636,28 +666,29 @@ namespace llaminar2
         {
             const std::string reset_error =
                 "Serving slot reset failed during suspension; session sealed";
-            std::vector<ServingBatchEvent> events;
-            ServingBatchEvent event;
-            event.id = row.request.id;
-            event.finish = ServingFinishReason::Error;
-            event.error = reset_error;
-            event.prompt_tokens = static_cast<int>(row.request.prompt.size());
-            event.completion_tokens = row.completion_tokens;
-            events.push_back(std::move(event));
+            // C1: every resident and queued request must receive its terminal
+            // event EXACTLY once through the normal channel. sealAll fails and
+            // resets every row (including the still-resident suspended one) and
+            // returns the complete event vector; nothing is discarded. The
+            // failed row is NOT pre-failed here (sealAll owns that), so no
+            // duplicate event and no double reset exist.
             error = reset_error; // The caller sees the sealing diagnostic.
-            (void)sealAll(reset_error, std::move(events));
+            auto sealed = sealAll(reset_error, {});
+            pending_events_.insert(pending_events_.end(), sealed.begin(), sealed.end());
             return std::nullopt;
         }
         slot_busy_[static_cast<std::size_t>(row.slot)] = false;
         const int suspended_slot = row.slot;
         const int suspended_cached = row.cached_tokens;
         rows_.erase(it);
+        outstanding_suspensions_[id] = {static_cast<int>(row.request.prompt.size()),
+            row.completion_tokens};
         if (recorder_)
             recorder_->suspended(id, suspended_slot, suspended_cached);
         return manifest;
     }
 
-    bool ServingSession::restore(ServingContinuationManifest manifest, std::string &error)
+    bool ServingSession::restore(ServingContinuationManifest &&manifest, std::string &error)
     {
         if (!active_ || !failure_.empty())
         {
@@ -666,6 +697,19 @@ namespace llaminar2
         }
         if (!manifest.valid(&error))
             return false;
+        // C2: the continuation is bound to the ISSUING session: a manifest
+        // minted by another session (different nonce/executor/model) refuses
+        // before any mutation — the caller keeps the capability.
+        if (manifest.content().issuer_session_nonce != session_nonce_)
+        {
+            error = "Serving continuation was issued by another session; restore refused";
+            return false;
+        }
+        if (!outstanding_suspensions_.contains(manifest.content().request_id))
+        {
+            error = "Serving continuation is not an outstanding suspension of this session";
+            return false;
+        }
         // The request identity keeps its original S record; the PHYSICAL slot
         // may have been reused while suspended, so the session restores into
         // any free slot (preferring the original identity) rather than failing
@@ -748,6 +792,7 @@ namespace llaminar2
         const int restored_cached = row.cached_tokens;
         rows_.push_back(std::move(row));
         manifest.consume();
+        outstanding_suspensions_.erase(restored_id);
         if (recorder_)
             recorder_->restored(restored_id, target, restored_cached);
         return true;

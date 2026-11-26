@@ -27,7 +27,6 @@ public:
         return true;
     }
     const float *servingRowLogits(int row) const override { return logits_.data() + row * 8; }
-    bool resetServingRow(int) override { return true; }
     int prefix_restored_tokens = 0; // >0 simulates a prefix-cache hit admission.
     bool prefix_miss_cache_enabled = false; // cache-enabled admission WITHOUT a hit.
     int restoreServingRowPrefix(int, const std::vector<int32_t> &, PrefixLookupResult &admission) override
@@ -64,6 +63,8 @@ public:
         return it->second;
     }
     bool fail_import = false;
+    bool fail_reset = false;
+    bool resetServingRow(int) override { return !fail_reset; }
     bool importSlotKV(int slot, std::span<const std::byte> bytes) override
     {
         if (fail_import) return false;
@@ -288,6 +289,91 @@ TEST(ServingSubmissionOutcome, FailedImportLeavesNoMutation)
     // The slot is reusable: a fresh request is admitted immediately.
     EXPECT_EQ(session.submit(greedy(2), error), ServingSubmissionOutcome::Direct);
     EXPECT_EQ(session.occupancy().queued, 1); // Direct, not refused.
+}
+
+/** @test R16 C1: suspension reset failure publishes terminal events through the normal channel. */
+TEST(ServingSubmissionOutcome, SuspensionResetFailurePublishesTerminalEvents)
+{
+    ScriptedRows rows;
+    ServingSession session(rows, 32, 8);
+    std::string error;
+    ASSERT_TRUE(session.begin(1, 1, error, nullptr, 0));
+    rows.setSlotKV(0, {std::byte{1}, std::byte{2}, std::byte{3}});
+    EXPECT_EQ(session.submit(greedy(1), error), ServingSubmissionOutcome::Direct);
+    session.step();
+    rows.fail_reset = true;
+    EXPECT_FALSE(session.suspend(1, error).has_value());
+    // The next step drains the terminal events exactly once (no discard, no
+    // duplicate): the sealed row gets its single Error event.
+    auto events = session.step();
+    ASSERT_FALSE(events.empty());
+    std::size_t errors = 0;
+    for (const auto &e : events)
+        if (e.finished())
+        {
+            ++errors;
+            EXPECT_EQ(e.finish, ServingFinishReason::Error);
+            EXPECT_EQ(e.id, 1u);
+        }
+    EXPECT_EQ(errors, 1u); // Exactly once.
+    EXPECT_TRUE(session.step().empty()); // Nothing left.
+    EXPECT_NE(error.find("sealed"), std::string::npos) << error;
+}
+
+/** @test R16 C2: a refused restore preserves the continuation; foreign session refuses. */
+TEST(ServingSubmissionOutcome, RefusedRestoreKeepsCapabilityAndForeignSessionRefuses)
+{
+    ScriptedRows rows;
+    ServingSession session(rows, 32, 8);
+    std::string error;
+    ASSERT_TRUE(session.begin(1, 1, error, nullptr, 0));
+    rows.setSlotKV(0, {std::byte{1}, std::byte{2}, std::byte{3}});
+    EXPECT_EQ(session.submit(greedy(1), error), ServingSubmissionOutcome::Direct);
+    session.step();
+    auto manifest = session.suspend(1, error);
+    ASSERT_TRUE(manifest.has_value()) << error;
+    EXPECT_EQ(manifest->content().issuer_session_nonce, session.sessionNonce());
+    // A foreign session (different issuer nonce) cannot restore it.
+    ScriptedRows other_rows;
+    ServingSession other(other_rows, 32, 8);
+    ASSERT_TRUE(other.begin(1, 1, error, nullptr, 0));
+    other_rows.setSlotKV(0, {std::byte{9}, std::byte{8}, std::byte{7}});
+    EXPECT_FALSE(other.restore(std::move(*manifest), error));
+    // Binding refusal: the continuation is either foreign OR not outstanding
+    // in the other session; both diagnostics prove the same binding contract.
+    EXPECT_TRUE(error.find("another session") != std::string::npos ||
+                error.find("not an outstanding suspension") != std::string::npos) << error;
+    // The capability survived the refusal (manifest still usable): the ORIGINAL
+    // session restores it into its free slot.
+    ASSERT_TRUE(session.restore(std::move(*manifest), error)) << error;
+    EXPECT_EQ(session.occupancy().resident, 1);
+}
+
+/** @test R16 C2: end() with outstanding suspension emits one terminal Error. */
+TEST(ServingSubmissionOutcome, EndWithOutstandingSuspensionEmitsTerminal)
+{
+    ScriptedRows rows;
+    ServingSession session(rows, 32, 8);
+    std::string error;
+    ASSERT_TRUE(session.begin(1, 1, error, nullptr, 0));
+    rows.setSlotKV(0, {std::byte{1}, std::byte{2}, std::byte{3}});
+    EXPECT_EQ(session.submit(greedy(1), error), ServingSubmissionOutcome::Direct);
+    session.step();
+    auto manifest = session.suspend(1, error);
+    ASSERT_TRUE(manifest.has_value()) << error;
+    // The defined terminal: never silently dropped.
+    session.end();
+    auto final_events = session.step();
+    ASSERT_FALSE(final_events.empty());
+    bool errored = false;
+    for (const auto &e : final_events)
+        if (e.id == 1u && e.finished())
+        {
+            errored = true;
+            EXPECT_EQ(e.finish, ServingFinishReason::Error);
+            EXPECT_NE(e.error.find("outstanding suspension"), std::string::npos) << e.error;
+        }
+    EXPECT_TRUE(errored); // Defined terminal: one Error, no hang, no drop.
 }
 
 /** @test P4 interleaving: A continues while B suspends and C enters the freed slot. */
