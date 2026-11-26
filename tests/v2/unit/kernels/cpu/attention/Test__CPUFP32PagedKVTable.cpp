@@ -243,9 +243,11 @@ TEST(CPUFP32PagedKVTable, FiniteIssuanceBudgetExhaustionRefusesBeforeHeadroom)
 TEST(CPUFP32PagedKVTable, AcceptedWorkReservationIsConsumableAndUnshareable)
 {
     const auto device = DeviceId::cpu();
-    // Budget 5, headroom 3, banks 3: normal admission cap = 2.
+    // Budget 5, headroom 3, banks 3: normal admission cap = 2. A second table
+    // is created on the SAME authority for the foreign-handle case, so the
+    // plan admits both exact table BOMs.
     const CPUFP32PagedKVTableGeometry table_geometry{1, 3, 2, 2, 5, 3};
-    const auto bytes = CPUFP32PagedKVTable::physicalBytes(table_geometry, device);
+    const auto bytes = 2 * CPUFP32PagedKVTable::physicalBytes(table_geometry, device);
     PhysicalMemoryPlanBuilder plan;
     plan.add({.world_rank=0, .device=device, .total_bytes=bytes, .admission_available_bytes=bytes},
         PhysicalMemoryOwner::KVCache, bytes);
